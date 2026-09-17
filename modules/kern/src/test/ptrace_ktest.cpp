@@ -2,7 +2,49 @@
 #include <cstddef>
 #include <cstdint>
 #include <platform/debug/ptrace.hpp>
+#include <platform/sched/task.hpp>
 #include <test/ktest.hpp>
+
+KTEST(PtraceSignals, FatalAdmissionBeforeAndAfterStop) {
+    ker::mod::sched::task::Task task{};
+    constexpr uint64_t KILL = uint64_t{1} << 8;
+    for (bool stop_first : {false, true}) {
+        task.ptrace_stopped = stop_first;
+        task.signal_pending_store(0);
+        task.exit_in_progress = false;
+        KEXPECT_EQ(task.ptrace_stop_blocks_execution(), stop_first);
+        task.signal_add_pending_mask(KILL);
+        task.ptrace_stopped = true;
+        KEXPECT_FALSE(task.ptrace_stop_blocks_execution());
+        // Exit cleanup clears signals only after publishing exit_in_progress.
+        task.exit_in_progress = true;
+        task.signal_pending_store(0);
+        KEXPECT_FALSE(task.ptrace_stop_blocks_execution());
+    }
+    task.exit_in_progress = false;
+    task.process_exit_requested = true;
+    KEXPECT_FALSE(task.ptrace_stop_blocks_execution());
+}
+
+KTEST(PtraceSignals, FatalReleasePreservesClaimedStopAndExit) {
+    KEXPECT_TRUE(ker::mod::debug::ptrace::ptrace_selftest_fatal_release_preserves_claims());
+}
+
+KTEST(PtraceObservation, ChangedCredentialsPreserveOutputsAndClaimsAreRetryable) {
+    KEXPECT_TRUE(ker::mod::debug::ptrace::ptrace_selftest_observation_snapshot_and_claims());
+}
+
+KTEST(PtraceRegisters, ChangedCredentialsPreserveRegistersAndHardwareState) {
+    KEXPECT_TRUE(ker::mod::debug::ptrace::ptrace_selftest_register_snapshot_rejects_changed_credentials());
+}
+
+KTEST(PtraceMemory, ChangedCredentialsPreserveDeniedCopyAndWord) {
+    KEXPECT_TRUE(ker::mod::debug::ptrace::ptrace_selftest_memory_snapshot_rejects_changed_credentials());
+}
+
+KTEST(PtraceImages, ChangedCredentialsPreserveDeniedSnapshot) {
+    KEXPECT_TRUE(ker::mod::debug::ptrace::ptrace_selftest_image_snapshot_rejects_changed_credentials());
+}
 
 KTEST(PtraceAbi, RequestNumbers) {
     KEXPECT_EQ(static_cast<uint64_t>(ker::abi::ptrace::request::TRACEME), static_cast<uint64_t>(0));
@@ -49,4 +91,8 @@ KTEST(PtraceSyscallStop, SuppressesDeferredExitStop) {
 
 KTEST(PtraceDetach, PreservesWkiExecveProxyWait) {
     KEXPECT_TRUE(ker::mod::debug::ptrace::ptrace_selftest_detach_preserves_wki_execve_proxy_wait());
+}
+
+KTEST(PtraceRegisters, RejectionPreservesState) {
+    KEXPECT_TRUE(ker::mod::debug::ptrace::ptrace_selftest_register_rejection_preserves_state());
 }

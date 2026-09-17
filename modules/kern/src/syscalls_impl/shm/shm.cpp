@@ -8,7 +8,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <filesystem>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/page_alloc.hpp>
@@ -19,6 +18,7 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sched/threading.hpp>
+#include <platform/security/authorization.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <platform/sys/usercopy.hpp>
 #include <syscalls_impl/vmem/sys_vmem.hpp>
@@ -40,7 +40,7 @@ struct ShmSegment {
     void* backing = nullptr;
     uint64_t size = 0;
     uint64_t page_count = 0;
-    uint32_t mode = 0;
+    ker::mod::security::IpcOwnership ownership{};
     uint64_t creator_pid = 0;
     uint64_t owner_pid = 0;
     uint64_t last_pid = 0;
@@ -277,7 +277,8 @@ void detach_attachments_for_pid_locked(uint64_t pid) {
     }
 }
 
-auto create_segment(int key, uint64_t size, int shmflg, ker::mod::sched::task::Task* task) -> uint64_t {
+auto create_segment(int key, uint64_t size, int shmflg, ker::mod::sched::task::Task* task, const ker::mod::security::Snapshot& credentials)
+    -> uint64_t {
     uint64_t aligned_size = 0;
     if (!align_shm_size(size, aligned_size)) {
         return to_errno(EINVAL);
@@ -309,7 +310,11 @@ auto create_segment(int key, uint64_t size, int shmflg, ker::mod::sched::task::T
         .backing = backing,
         .size = size,
         .page_count = size / ker::mod::mm::paging::PAGE_SIZE,
-        .mode = static_cast<uint32_t>(shmflg & static_cast<int>(std::filesystem::perms::mask)),
+        .ownership = {.uid = credentials.user().effective,
+                      .gid = credentials.group().effective,
+                      .creator_uid = credentials.user().effective,
+                      .creator_gid = credentials.group().effective,
+                      .mode = static_cast<uint32_t>(shmflg) & 0777U},
         .creator_pid = PROCESS_PID,
         .owner_pid = PROCESS_PID,
         .last_pid = PROCESS_PID,
@@ -326,6 +331,7 @@ auto shmget_impl(int key, uint64_t size, int shmflg) -> uint64_t {
         return to_errno(ESRCH);
     }
 
+    auto const CREDENTIALS = task->credentials();
     uint64_t aligned_size = 0;
     if (size != 0) {
         if (!align_shm_size(size, aligned_size)) {
@@ -346,6 +352,12 @@ auto shmget_impl(int key, uint64_t size, int shmflg) -> uint64_t {
                 g_lock.unlock_irqrestore(FLAGS);
                 return to_errno(EINVAL);
             }
+            uint32_t const REQUESTED =
+                (static_cast<uint32_t>(shmflg) | (static_cast<uint32_t>(shmflg) >> 3U) | (static_cast<uint32_t>(shmflg) >> 6U)) & 6U;
+            if (!ker::mod::security::may_access_ipc(CREDENTIALS, existing->ownership, REQUESTED)) {
+                g_lock.unlock_irqrestore(FLAGS);
+                return to_errno(EACCES);
+            }
             int const ID = existing->id;
             g_lock.unlock_irqrestore(FLAGS);
             return static_cast<uint64_t>(ID);
@@ -357,7 +369,7 @@ auto shmget_impl(int key, uint64_t size, int shmflg) -> uint64_t {
         }
     }
 
-    uint64_t const RESULT = create_segment(key, size, shmflg, task);
+    uint64_t const RESULT = create_segment(key, size, shmflg, task, CREDENTIALS);
     g_lock.unlock_irqrestore(FLAGS);
     return RESULT;
 }
@@ -371,12 +383,19 @@ auto shmat_impl(int shmid, uint64_t shmaddr, int shmflg) -> uint64_t {
     // This sleepable publication mutex must precede g_lock. Page-table
     // construction may reclaim/yield, so g_lock is released before mapping.
     ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+    auto const CREDENTIALS = task->credentials();
     ker::mod::sched::resource::AddressSpaceObservation observation(task);
     uint64_t const FLAGS = g_lock.lock_irqsave();
     auto* segment = find_segment_by_id(shmid);
     if (segment == nullptr || segment->marked_destroy) {
         g_lock.unlock_irqrestore(FLAGS);
         return to_errno(EINVAL);
+    }
+
+    uint32_t const REQUIRED = (shmflg & ker::abi::shm::SHM_RDONLY) != 0 ? 4U : 6U;
+    if (!ker::mod::security::may_access_ipc(CREDENTIALS, segment->ownership, REQUIRED)) {
+        g_lock.unlock_irqrestore(FLAGS);
+        return to_errno(EACCES);
     }
 
     auto* attachment = find_free_attachment();
@@ -416,6 +435,8 @@ auto shmat_impl(int shmid, uint64_t shmaddr, int shmflg) -> uint64_t {
     uint64_t page_flags = ker::mod::mm::paging::PAGE_PRESENT | ker::mod::mm::paging::PAGE_USER | ker::mod::mm::paging::PAGE_SHARED;
     if ((shmflg & ker::abi::shm::SHM_RDONLY) == 0) {
         page_flags |= ker::mod::mm::paging::PAGE_WRITE;
+    } else {
+        page_flags |= ker::mod::mm::paging::PAGE_WRITE_RESTRICTED;
     }
 
     uint64_t mapped_pages = 0;
@@ -494,11 +515,11 @@ auto shmdt_impl(uint64_t shmaddr) -> uint64_t {
 void fill_stat(const ShmSegment& segment, ker::abi::shm::ShmidDs& out) {
     out = {};
     out.shm_perm.key = segment.key;
-    out.shm_perm.uid = 0;
-    out.shm_perm.gid = 0;
-    out.shm_perm.cuid = 0;
-    out.shm_perm.cgid = 0;
-    out.shm_perm.mode = segment.mode;
+    out.shm_perm.uid = segment.ownership.uid;
+    out.shm_perm.gid = segment.ownership.gid;
+    out.shm_perm.cuid = segment.ownership.creator_uid;
+    out.shm_perm.cgid = segment.ownership.creator_gid;
+    out.shm_perm.mode = segment.ownership.mode;
     out.shm_perm.seq = segment.id;
     out.shm_segsz = segment.size;
     out.shm_atime = 0;
@@ -510,6 +531,11 @@ void fill_stat(const ShmSegment& segment, ker::abi::shm::ShmidDs& out) {
 }
 
 auto shmctl_impl(int shmid, int cmd, uint64_t buf_addr) -> uint64_t {
+    auto* task = current_task();
+    if (task == nullptr) {
+        return to_errno(ESRCH);
+    }
+    auto const CREDENTIALS = task->credentials();
     uint64_t const FLAGS = g_lock.lock_irqsave();
     auto* segment = find_segment_by_id(shmid);
     if (segment == nullptr) {
@@ -519,16 +545,23 @@ auto shmctl_impl(int shmid, int cmd, uint64_t buf_addr) -> uint64_t {
 
     switch (cmd) {
         case ker::abi::shm::IPC_RMID:
+            if (!ker::mod::security::may_control_ipc(CREDENTIALS, segment->ownership)) {
+                g_lock.unlock_irqrestore(FLAGS);
+                return to_errno(EPERM);
+            }
             segment->marked_destroy = true;
             maybe_release_destroyed_segment(*segment);
             g_lock.unlock_irqrestore(FLAGS);
             return 0;
         case ker::abi::shm::IPC_STAT: {
+            if (!ker::mod::security::may_access_ipc(CREDENTIALS, segment->ownership, 4)) {
+                g_lock.unlock_irqrestore(FLAGS);
+                return to_errno(EACCES);
+            }
             ker::abi::shm::ShmidDs stat{};
             fill_stat(*segment, stat);
             g_lock.unlock_irqrestore(FLAGS);
-            auto* task = current_task();
-            if (task == nullptr || buf_addr == 0) {
+            if (buf_addr == 0) {
                 return to_errno(EFAULT);
             }
             return ker::mod::sys::usercopy::copy_value_to_task(*task, buf_addr, stat) ? 0 : to_errno(EFAULT);

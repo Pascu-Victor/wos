@@ -26,6 +26,9 @@ using ker::mod::sched::task::Task;
 }  // namespace
 
 KTEST(Resource, PersistentServiceLifecycleAndThreadCpu) { KEXPECT_TRUE(ker::mod::sched::resource::selftest_service_lifecycle()); }
+KTEST(Resource, ServiceManagementRequiresRoleAndRetainedCredentialAuthority) {
+    KEXPECT_TRUE(ker::mod::sched::resource::selftest_service_management_authority());
+}
 KTEST(Resource, RemoteServiceAccountingOutlivesRootProcess) {
     KEXPECT_TRUE(ker::mod::sched::resource::selftest_remote_service_accounting_lifecycle());
 }
@@ -56,7 +59,7 @@ KTEST(Resource, ReceiverPopulationAdmissionBeforeTaskConstruction) {
         resource::ProcessReservation denied(policy, UID);
         KEXPECT_EQ(denied.result(), -EAGAIN);
         Task child{};
-        child.uid = UID;
+        KEXPECT_EQ(ker::mod::sched::resource::initialize_real_uid(child, UID), 0);
         child.resources = policy;
         KEXPECT_TRUE(first.attach(child));
         KEXPECT_EQ(child.resources.entries[NPROC].current, 1);
@@ -216,6 +219,138 @@ KTEST(Resource, FileGrowthSnapshotAndDenialTelemetry) {
 }
 
 KTEST(Resource, CoreDumpAdmissionAndOwnerLifetime) { KEXPECT_TRUE(ker::mod::dbg::coredump::selftest_budget_admission()); }
+
+KTEST(Resource, OwnerRetainsCanonicalIdentityWithoutPidSelection) {
+    namespace resource = ker::mod::sched::resource;
+    using ker::mod::sched::task::TaskState;
+    Task process{};
+    process.pid = 424260;
+    process.type = ker::mod::sched::task::TaskType::PROCESS;
+    auto const INITIAL_REFS = process.ref_count.load();
+    {
+        resource::Owner absent(nullptr);
+        KEXPECT_TRUE(absent.get() == nullptr);
+        Task thread{};
+        thread.is_thread = true;
+        thread.pid = process.pid + 1;
+        // Numeric metadata alone cannot supply policy to an unbound thread.
+        for (uint64_t owner_pid : {uint64_t{0}, thread.pid, process.pid}) {
+            thread.owner_pid = owner_pid;
+            resource::Owner unbound(&thread);
+            KEXPECT_TRUE(unbound.get() == nullptr);
+        }
+        KREQUIRE_TRUE(resource::bind_thread_owner(thread, process));
+        KEXPECT_EQ(process.ref_count.load(), INITIAL_REFS + 1);
+        // Both objects are private/unregistered. Path/PID bookkeeping cannot
+        // replace the immutable process binding once that binding exists.
+        for (uint64_t owner_pid : {uint64_t{0}, thread.pid, process.pid, process.pid + 2}) {
+            thread.owner_pid = owner_pid;
+            {
+                resource::Owner owner(&thread);
+                KEXPECT_TRUE(owner.get() == &process);
+                KEXPECT_TRUE(owner.get() == thread.credential_owner());
+                KEXPECT_EQ(process.ref_count.load(), INITIAL_REFS + 2);
+            }
+            KEXPECT_EQ(process.ref_count.load(), INITIAL_REFS + 1);
+        }
+        for (auto state : {TaskState::EXITING, TaskState::DEAD}) {
+            process.state.store(state);
+            resource::Owner retired(&thread);
+            KEXPECT_TRUE(retired.get() == nullptr);
+            KEXPECT_EQ(process.ref_count.load(), INITIAL_REFS + 1);
+            // Existing nonthread borrow semantics also serve teardown callers.
+            resource::Owner direct(&process);
+            KEXPECT_TRUE(direct.get() == &process);
+        }
+        process.state.store(TaskState::ACTIVE);
+    }
+    KEXPECT_EQ(process.ref_count.load(), INITIAL_REFS);
+    KEXPECT_EQ(process.resource_thread_owners.load(), 0);
+}
+
+KTEST(Resource, UnpublishedThreadUsesCanonicalLimitsForInheritanceAndReservations) {
+    namespace resource = ker::mod::sched::resource;
+    constexpr unsigned FSIZE = static_cast<unsigned>(resource::Id::FSIZE);
+    constexpr unsigned NPROC = static_cast<unsigned>(resource::Id::NPROC);
+    constexpr uint32_t UID = 0xffffff70;
+    Task process{};
+    process.pid = 424270;
+    process.type = ker::mod::sched::task::TaskType::PROCESS;
+    KREQUIRE_EQ(resource::initialize_real_uid(process, UID), 0);
+    KREQUIRE_EQ(process.resources.set(FSIZE, {8, 16}, true, 256), 0);
+    KREQUIRE_EQ(process.resources.set(NOFILE, {1, 2}, true, 256), 0);
+    KREQUIRE_EQ(process.resources.set(NPROC, {0, 2}, true, 256), 0);
+    auto const INITIAL_REFS = process.ref_count.load();
+    {
+        Task thread{};
+        thread.pid = process.pid + 1;
+        thread.owner_pid = process.pid;
+        thread.is_thread = true;
+        thread.type = process.type;
+        KREQUIRE_TRUE(resource::bind_thread_owner(thread, process));
+        KREQUIRE_EQ(thread.resources.set(FSIZE, {1024, 2048}, true, 256), 0);
+        Task child{};
+        KREQUIRE_TRUE(resource::inherit(child, thread));
+        KEXPECT_EQ(child.resources.entries[FSIZE].limit.soft, 8);
+        KEXPECT_EQ(child.resources.entries[NOFILE].limit.soft, 1);
+        Task grandchild{};
+        grandchild.pid = process.pid + 2;
+        grandchild.is_thread = true;
+        grandchild.owner_pid = process.pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(grandchild, thread));
+        KEXPECT_TRUE(grandchild.credential_owner() == &process);
+        {
+            ker::vfs::FdReservation first(&thread);
+            KEXPECT_EQ(first.result(), 0);
+            KEXPECT_EQ(process.fd_table.reserved_count(), 1);
+            KEXPECT_EQ(thread.fd_table.reserved_count(), 0);
+            ker::vfs::FdReservation second(&grandchild);
+            KEXPECT_EQ(second.result(), -EMFILE);
+            KEXPECT_EQ(process.fd_table.reserved_count(), 1);
+        }
+        KEXPECT_EQ(process.fd_table.reserved_count(), 0);
+        {
+            resource::ProcessReservation denied(&thread, UID);
+            KEXPECT_EQ(denied.result(), -EAGAIN);
+        }
+        KREQUIRE_EQ(process.resources.set(NPROC, {1, 2}, true, 256), 0);
+        {
+            resource::ProcessReservation first(&thread, UID);
+            KEXPECT_EQ(first.result(), 0);
+            resource::ProcessReservation second(&grandchild, UID);
+            KEXPECT_EQ(second.result(), -EAGAIN);
+        }
+        {
+            resource::FileGrowth growth(&thread);
+            size_t count = 4;
+            KEXPECT_TRUE(growth.bound_write(6, count));
+            KEXPECT_EQ(count, 2);
+            growth.committed(8);
+        }
+        KEXPECT_EQ(process.resources.entries[FSIZE].current, 8);
+        KEXPECT_EQ(process.resources.entries[FSIZE].denied, 1);
+        KEXPECT_EQ(thread.resources.entries[FSIZE].current, 0);
+        KEXPECT_EQ(thread.resources.entries[FSIZE].denied, 0);
+        {
+            resource::FileGrowth growth(&grandchild);
+            KEXPECT_FALSE(growth.allow_resize(9));
+        }
+        KEXPECT_EQ(process.resources.entries[FSIZE].denied, 2);
+        KEXPECT_TRUE((grandchild.signal_pending_bits() & (uint64_t{1} << 24)) != 0);
+        Task unbound{};
+        unbound.is_thread = true;
+        ker::vfs::FdReservation missing_fd(&unbound);
+        resource::ProcessReservation missing_process(&unbound, UID);
+        resource::FileGrowth missing_growth(&unbound);
+        KEXPECT_EQ(missing_fd.result(), -ESRCH);
+        KEXPECT_EQ(missing_process.result(), -ESRCH);
+        KEXPECT_FALSE(resource::inherit(child, unbound));
+        KEXPECT_FALSE(missing_growth.allow_resize(1));
+    }
+    KEXPECT_EQ(process.ref_count.load(), INITIAL_REFS);
+    KEXPECT_EQ(process.fd_table.reserved_count(), 0);
+    KEXPECT_EQ(process.resource_thread_owners.load(), 0);
+}
 
 KTEST(Resource, StackAdmissionAndAllocationRollback) {
     namespace threading = ker::mod::sched::threading;
@@ -399,7 +534,7 @@ KTEST(Resource, ProcessReservationLifecycleAndFatalCancellation) {
     constexpr unsigned NPROC = static_cast<unsigned>(resource::Id::NPROC);
     constexpr uint32_t UID = 0xfffffff0;
     Task parent{};
-    parent.uid = UID;
+    KEXPECT_EQ(ker::mod::sched::resource::initialize_real_uid(parent, UID), 0);
     resource::ProcessReservation seed(nullptr, UID);
     KREQUIRE_TRUE(seed.attach(parent));
     KEXPECT_EQ(parent.resources.entries[NPROC].current, 1);
@@ -413,7 +548,7 @@ KTEST(Resource, ProcessReservationLifecycleAndFatalCancellation) {
         KEXPECT_EQ(parent.resources.entries[NPROC].denied, 1);
         KEXPECT_EQ(parent.resources.set(NPROC, {0, UINT64_MAX}, true, 256), 0);
         Task child{};
-        child.uid = UID;
+        KEXPECT_EQ(ker::mod::sched::resource::initialize_real_uid(child, UID), 0);
         KREQUIRE_TRUE(first.attach(child));
         KEXPECT_FALSE(first.attach(child));
         KEXPECT_EQ(child.resources.entries[NPROC].current, 2);
@@ -441,33 +576,33 @@ KTEST(Resource, ProcessChargeUnpublishedDestructionAndUidTransfer) {
     constexpr uint32_t SOURCE = 0xfffffff0;
     constexpr uint32_t DESTINATION = 0xfffffff1;
     Task parent{};
-    parent.uid = SOURCE;
+    KEXPECT_EQ(ker::mod::sched::resource::initialize_real_uid(parent, SOURCE), 0);
     Task peer{};
-    peer.uid = DESTINATION;
+    KEXPECT_EQ(ker::mod::sched::resource::initialize_real_uid(peer, DESTINATION), 0);
     resource::ProcessReservation seed(nullptr, SOURCE);
     resource::ProcessReservation peer_seed(nullptr, DESTINATION);
     KREQUIRE_TRUE(seed.attach(parent));
     KREQUIRE_TRUE(peer_seed.attach(peer));
     {
         Task unpublished{};
-        unpublished.uid = SOURCE;
+        KEXPECT_EQ(ker::mod::sched::resource::initialize_real_uid(unpublished, SOURCE), 0);
         resource::ProcessReservation pending(&parent, SOURCE);
         KREQUIRE_TRUE(pending.attach(unpublished));
         KEXPECT_EQ(parent.resources.entries[NPROC].current, 2);
     }
     KEXPECT_EQ(parent.resources.entries[NPROC].current, 1);
     KEXPECT_EQ(parent.resources.set(NPROC, {1, UINT64_MAX}, true, 256), 0);
-    KEXPECT_EQ(resource::change_real_uid(parent, DESTINATION), -EAGAIN);
-    KEXPECT_EQ(parent.uid, SOURCE);
+    KEXPECT_EQ(resource::change_credentials(parent, {.change = ker::mod::security::Change::SET_RESUID, .real = DESTINATION}), -EAGAIN);
+    KEXPECT_EQ(parent.credentials().user().real, SOURCE);
     KEXPECT_EQ(parent.process_charge.uid, SOURCE);
     KEXPECT_EQ(peer.resources.entries[NPROC].current, 1);
     KEXPECT_EQ(parent.resources.entries[NPROC].denied, 1);
     KEXPECT_EQ(parent.resources.set(NPROC, {2, UINT64_MAX}, true, 256), 0);
-    KEXPECT_EQ(resource::change_real_uid(parent, DESTINATION), 0);
-    KEXPECT_EQ(parent.uid, DESTINATION);
+    KEXPECT_EQ(resource::change_credentials(parent, {.change = ker::mod::security::Change::SET_RESUID, .real = DESTINATION}), 0);
+    KEXPECT_EQ(parent.credentials().user().real, DESTINATION);
     KEXPECT_EQ(peer.resources.entries[NPROC].current, 2);
     KEXPECT_EQ(parent.resources.set(NPROC, {0, UINT64_MAX}, true, 256), 0);
-    KEXPECT_EQ(resource::change_real_uid(parent, DESTINATION), 0);
+    KEXPECT_EQ(resource::change_credentials(parent, {.change = ker::mod::security::Change::SET_RESUID, .real = DESTINATION}), 0);
     parent.process_charge.release();
     KEXPECT_EQ(peer.resources.entries[NPROC].current, 1);
 }
@@ -520,6 +655,144 @@ KTEST(ResourceCpuObservation, RetiredSiblingAndImportedHistory) {
     KEXPECT_FALSE(resource::copy_cpu_observation(unbound, observed));
     KEXPECT_EQ(observed.user_time_us, 220);
     KEXPECT_EQ(observed.child_system_time_us, UINT64_MAX);
+}
+
+KTEST(ResourceCpuObservation, MainRetirementClosesOnlyIdleAdmission) {
+    namespace resource = ker::mod::sched::resource;
+    Task process{};
+    process.pid = 0x7B52;
+    process.type = ker::mod::sched::task::TaskType::PROCESS;
+    Task worker{};
+    worker.type = process.type;
+    worker.is_thread = true;
+    worker.owner_pid = process.pid;
+    KEXPECT_TRUE(resource::bind_thread_owner(worker, process));
+    KEXPECT_FALSE(resource::close_idle_thread_cpu_admission(process));
+    KEXPECT_FALSE(process.resource_cpu_admission_closed);
+    worker.resource_owner.finish_cpu();
+    KEXPECT_EQ(process.resource_thread_owners.load(), 1);
+    KEXPECT_TRUE(resource::close_idle_thread_cpu_admission(process));
+    KEXPECT_TRUE(process.resource_cpu_admission_closed);
+    Task late{};
+    late.type = process.type;
+    late.is_thread = true;
+    late.owner_pid = process.pid;
+    KEXPECT_FALSE(resource::bind_thread_owner(late, process));
+    KEXPECT_EQ(process.resource_cpu_threads.load(), 0);
+}
+
+KTEST(ResourceExecAdmission, QuiescenceCountsOnlySafeLiveCpuContributorsAndRollsBack) {
+    namespace resource = ker::mod::sched::resource;
+    Task process{};
+    process.pid = 0x7B54;
+    Task worker{}, observer{};
+    worker.is_thread = true;
+    observer.is_thread = true;
+    worker.owner_pid = process.pid;
+    observer.owner_pid = process.pid;
+    KEXPECT_TRUE(resource::bind_thread_owner(worker, process));
+    KEXPECT_TRUE(resource::bind_thread_owner(observer, process));
+    resource::ExecAdmission admission;
+    KEXPECT_TRUE(admission.begin(process));
+    KEXPECT_FALSE(admission.quiesce(worker, 0));
+    {
+        resource::ExecSafeWait waiting_worker(worker);
+        KEXPECT_TRUE(waiting_worker.active());
+        KEXPECT_FALSE(admission.quiesce(process, 0));
+        auto const FIRST = process.resource_exec_quiescence_epoch.load();
+        KEXPECT_NE(FIRST, 0);
+        KEXPECT_TRUE(observer.has_interrupting_signal_pending());
+        KEXPECT_EQ(process.resource_exec_quiescent_threads, 1);
+        {
+            resource::ExecSafeWait waiting_observer(observer);
+            resource::ExecSafeWait duplicate(observer);
+            KEXPECT_TRUE(waiting_observer.active());
+            KEXPECT_FALSE(duplicate.active());
+            KEXPECT_TRUE(admission.quiesced(process));
+            KEXPECT_EQ(process.resource_exec_quiescent_threads, 2);
+            // A previous wait may have observed rollback, but a new exec can
+            // start before it withdraws. It must acknowledge the new epoch.
+            admission.finish();
+            KEXPECT_TRUE(admission.begin(process));
+            KEXPECT_TRUE(admission.quiesce(process, 0));
+            KEXPECT_FALSE(waiting_observer.finish_if_released());
+            KEXPECT_TRUE(waiting_observer.active());
+            KEXPECT_EQ(process.resource_exec_quiescent_threads, 2);
+            admission.finish();
+            KEXPECT_TRUE(waiting_observer.finish_if_released());
+            KEXPECT_FALSE(waiting_observer.active());
+            KEXPECT_EQ(process.resource_exec_quiescent_threads, 1);
+        }
+        KEXPECT_FALSE(admission.quiesced(process));
+        admission.finish();
+        KEXPECT_FALSE(observer.exec_quiescence_requested());
+        KEXPECT_FALSE(admission.quiesced(process));
+        KEXPECT_TRUE(admission.begin(process));
+        KEXPECT_FALSE(admission.quiesce(process, 0));
+        KEXPECT_TRUE(process.resource_exec_quiescence_epoch.load() > FIRST);
+        admission.finish();
+    }
+    KEXPECT_EQ(process.resource_exec_quiescent_threads, 0);
+    observer.resource_owner.finish_cpu();
+    resource::ExecSafeWait retired_observer(observer);
+    KEXPECT_FALSE(retired_observer.active());
+    KEXPECT_EQ(process.resource_thread_owners.load(), 2);
+    KEXPECT_EQ(process.resource_cpu_threads.load(), 1);
+    {
+        resource::ExecSafeWait waiting_worker(worker);
+        KEXPECT_TRUE(admission.begin(process));
+        KEXPECT_TRUE(admission.quiesce(process, 0));
+        KEXPECT_TRUE(admission.quiesced(process));
+        admission.finish();
+    }
+    KEXPECT_EQ(process.resource_exec_quiescent_threads, 0);
+    KEXPECT_FALSE(process.resource_exec_admission_closed);
+}
+
+KTEST(ResourceExecAdmission, ExcludesNewThreadsAndCompetingCommitsWithoutReopeningExit) {
+    namespace resource = ker::mod::sched::resource;
+    Task process{};
+    process.pid = 0x7B53;
+    Task worker{};
+    worker.is_thread = true;
+    worker.owner_pid = process.pid;
+    resource::ExecAdmission unbound;
+    KEXPECT_FALSE(unbound.begin(worker));
+    KEXPECT_TRUE(resource::bind_thread_owner(worker, process));
+    {
+        resource::ExecAdmission first;
+        KEXPECT_TRUE(first.begin(worker));
+        KEXPECT_FALSE(first.begin(process));
+        resource::ExecAdmission competing;
+        KEXPECT_FALSE(competing.begin(process));
+        Task late{};
+        late.is_thread = true;
+        late.owner_pid = process.pid;
+        KEXPECT_FALSE(resource::bind_thread_owner(late, process));
+        KEXPECT_EQ(process.resource_cpu_threads.load(), 1);
+        worker.resource_owner.finish_cpu();
+        KEXPECT_EQ(process.resource_cpu_threads.load(), 0);
+        KEXPECT_EQ(process.resource_thread_owners.load(), 1);
+    }
+    KEXPECT_FALSE(process.resource_exec_admission_closed);
+    {
+        Task fresh{};
+        fresh.is_thread = true;
+        fresh.owner_pid = process.pid;
+        KEXPECT_TRUE(resource::bind_thread_owner(fresh, process));
+    }
+    resource::ExecAdmission final;
+    KEXPECT_TRUE(final.begin(process));
+    KEXPECT_TRUE(resource::close_thread_cpu_admission(process));
+    final.finish();
+    final.finish();
+    KEXPECT_TRUE(process.resource_cpu_admission_closed);
+    KEXPECT_FALSE(process.resource_exec_admission_closed);
+    KEXPECT_FALSE(final.begin(process));
+    Task denied{};
+    denied.is_thread = true;
+    denied.owner_pid = process.pid;
+    KEXPECT_FALSE(resource::bind_thread_owner(denied, process));
 }
 
 KTEST(ResourceCpuObservation, ExitContributorsRetireBeforeMetadata) {

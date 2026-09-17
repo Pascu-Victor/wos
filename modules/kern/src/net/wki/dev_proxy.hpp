@@ -8,6 +8,7 @@
 #include <net/wki/blk_ring.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
+#include <net/wki/zone.hpp>
 #include <platform/sys/mutex.hpp>
 #include <platform/sys/spinlock.hpp>
 
@@ -110,6 +111,7 @@ struct ProxyBlockState {
     bool rdma_disabled = false;
     uint32_t rdma_zone_id = 0;
     uint32_t rdma_zone_size = 0;
+    WkiZoneRef rdma_zone_ref{};  // Exact local grant; cleanup drains users before release.
     void* rdma_zone_ptr = nullptr;
     uint64_t data_slot_bitmap = 0;  // 1 = slot in use (max 64 slots)
 
@@ -210,6 +212,12 @@ void wki_dev_proxy_init();
 // Attach to a remote block device. Sends DEV_ATTACH_REQ and blocks until ACK.
 // On success, registers a proxy BlockDevice and returns a pointer to it.
 // On failure, returns nullptr.
+// Compare an existing borrowed provider against the selected observation.
+// Caller validates observation liveness; I/O admission still revalidates peer
+// and resource lifecycle. This allocation-free check performs no attach/I/O.
+auto wki_dev_proxy_block_matches_observation(ker::dev::BlockDevice* bdev, uint16_t owner_node, uint32_t resource_id,
+                                             uint64_t resource_generation, const ResourceIncarnationToken& owner_incarnation) -> bool;
+
 auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, uint64_t expected_resource_generation,
                                 const ResourceIncarnationToken& expected_owner_incarnation, const char* local_name,
                                 WkiBlockAttachRdmaPolicy rdma_policy = WkiBlockAttachRdmaPolicy::ALLOW) -> dev::BlockDevice*;
@@ -287,8 +295,12 @@ auto wki_dev_proxy_bulk_write(dev::BlockDevice* bdev, uint64_t lba, uint32_t blo
 
 auto wki_dev_proxy_selftest_attach_ack_cookie_fences_stale_completion() -> bool;
 auto wki_dev_proxy_selftest_failed_attach_erases_exact_proxy() -> bool;
+#ifdef WOS_SELFTEST
+auto wki_dev_proxy_selftest_existing_block_identity() -> bool;
+auto wki_dev_proxy_selftest_zone_retention() -> bool;
 auto wki_dev_proxy_selftest_rdma_sq_wait_stops_on_fence() -> bool;
 auto wki_dev_proxy_selftest_batch_validation_is_atomic() -> bool;
+#endif
 auto wki_dev_proxy_selftest_old_rdma_tag_cannot_match_successor() -> bool;
 
 // -----------------------------------------------------------------------------

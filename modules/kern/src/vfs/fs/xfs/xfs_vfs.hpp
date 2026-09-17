@@ -1,5 +1,7 @@
 #pragma once
 
+#include <vfs/timestamps.hpp>
+
 // XFS VFS Integration - connects the XFS native implementation to the
 // WOS Virtual Filesystem layer via FileOperations function pointers.
 //
@@ -22,7 +24,15 @@
 #include <vfs/fs/xfs/xfs_mount.hpp>
 #include <vfs/stat.hpp>
 
+namespace ker::mod::security {
+class Snapshot;
+}
+
 namespace ker::vfs::xfs {
+
+// Global directory UID/GID/mode authority epoch, distinct from each mount's
+// namespace lookup sequence. Capture before searching any path component.
+auto xfs_search_authority_generation() -> uint64_t;
 
 constexpr size_t UNKNOWN_XFS_PATH_LEN = static_cast<size_t>(-1);
 constexpr size_t XFS_LOOKUP_LEAF_CAPACITY = 256;
@@ -49,14 +59,21 @@ class XfsLookupHandle {
     auto path() const -> const char* { return path_.data(); }
     auto path_length() const -> size_t { return path_length_; }
     auto expected_parent_generation() const -> uint64_t { return expected_parent_generation_; }
-    auto expected_mutation_sequence() const -> uint64_t { return expected_mutation_sequence_; }
+    auto expected_lookup_sequence() const -> uint64_t { return expected_lookup_sequence_; }
     auto target_existed() const -> bool { return target_existed_; }
     auto root_target() const -> bool { return root_target_; }
     void reset();
 
    private:
-    friend auto xfs_acquire_lookup(const char* fs_path, XfsMountContext* ctx, XfsLookupHandle* out, size_t known_fs_path_len) -> int;
-    friend auto xfs_acquire_lookup_at_file(File* directory, const char* relative_path, XfsLookupHandle* out) -> int;
+    friend auto xfs_acquire_lookup(const ker::mod::security::Snapshot& credentials, const char* fs_path, XfsMountContext* ctx,
+                                   XfsLookupHandle* out, size_t known_fs_path_len) -> int;
+    friend auto xfs_acquire_lookup_at_file(const ker::mod::security::Snapshot& credentials, File* directory, const char* relative_path,
+                                           XfsLookupHandle* out) -> int;
+    friend auto xfs_acquire_lookup_at_inode(const ker::mod::security::Snapshot& credentials, XfsMountContext* ctx, XfsInode* anchor,
+                                            const char* relative_path, XfsLookupHandle* out) -> int;
+    // Recover a current path from the retained directory inode, verifying indexed parent bindings.
+    // Failure leaves output unchanged.
+    auto xfs_directory_path(File* directory, char* out, size_t capacity) -> int;
     friend auto xfs_validate_lookup_locked(const XfsLookupHandle& handle) -> int;
 
     XfsMountContext* mount_ = nullptr;
@@ -67,19 +84,36 @@ class XfsLookupHandle {
     uint16_t leaf_length_ = 0;
     size_t path_length_ = 0;
     uint64_t expected_parent_generation_ = 0;
-    uint64_t expected_mutation_sequence_ = 0;
+    uint64_t expected_lookup_sequence_ = 0;
     bool target_existed_ = false;
     bool root_target_ = false;
 };
 
 // Resolve and retain a parent/final pair atomically under metadata_lock. A
 // missing final component is a successful lookup with target_existed() false.
-auto xfs_acquire_lookup(const char* fs_path, XfsMountContext* ctx, XfsLookupHandle* out, size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN)
-    -> int;
+auto xfs_acquire_lookup(const ker::mod::security::Snapshot& credentials, const char* fs_path, XfsMountContext* ctx, XfsLookupHandle* out,
+                        size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
 
 // Resolve a relative component path from an open XFS directory inode. This
 // deliberately does not consult File::vfs_path or the XFS path caches.
-auto xfs_acquire_lookup_at_file(File* directory, const char* relative_path, XfsLookupHandle* out) -> int;
+auto xfs_acquire_lookup_at_file(const ker::mod::security::Snapshot& credentials, File* directory, const char* relative_path,
+                                XfsLookupHandle* out) -> int;
+// The caller retains anchor and mount across this call. An empty path acquires
+// the directory itself; otherwise search starts at that inode, not its pathname.
+auto xfs_acquire_lookup_at_inode(const ker::mod::security::Snapshot& credentials, XfsMountContext* ctx, XfsInode* anchor,
+                                 const char* relative_path, XfsLookupHandle* out) -> int;
+// Recover a current path from the retained directory inode, verifying indexed parent bindings.
+// Failure leaves output unchanged.
+auto xfs_directory_path(File* directory, char* out, size_t capacity) -> int;
+// Caller retains inode and mount; output is published only on success.
+auto xfs_directory_path_at_inode(XfsMountContext* ctx, XfsInode* anchor, char* out, size_t capacity) -> int;
+// Both Files retain live directories on the same filesystem; output is staged.
+// Optional snapshot admits current directory search under the same metadata lock.
+auto xfs_directory_path_beneath(File* root, File* directory, char* out, size_t capacity,
+                                const ker::mod::security::Snapshot* credentials = nullptr) -> int;
+// Metadata-only membership of the directory target, or parent for other targets.
+// Null root selects the native mount root. Caller serializes publication.
+auto xfs_lookup_directory_path_beneath(File* root, const XfsLookupHandle& lookup, char* out, size_t capacity) -> int;
 
 // Validate a retained lookup immediately before a commit. The locked form
 // requires ctx->metadata_lock; 0 means valid, -EAGAIN requests a fresh lookup,
@@ -87,32 +121,50 @@ auto xfs_acquire_lookup_at_file(File* directory, const char* relative_path, XfsL
 auto xfs_validate_lookup_locked(const XfsLookupHandle& handle) -> int;
 auto xfs_validate_lookup(const XfsLookupHandle& handle) -> int;
 
-auto xfs_open_lookup(const XfsLookupHandle& handle, int flags, int mode, bool require_directory, int* result_out = nullptr) -> File*;
+auto xfs_open_lookup(const ker::mod::security::Snapshot& credentials, const XfsLookupHandle& handle, int flags, int mode,
+                     bool require_directory, int* result_out = nullptr) -> File*;
+// Identity-only retention still checks parent search and target type; it grants
+// no data access. VFS checks target search again before child traversal.
+auto xfs_pin_directory_lookup(const ker::mod::security::Snapshot& credentials, const XfsLookupHandle& handle, int* result_out = nullptr,
+                              bool require_target_search = true) -> File*;
 auto xfs_stat_lookup(const XfsLookupHandle& handle, bool require_directory, ker::vfs::Stat* statbuf) -> int;
 auto xfs_readlink_lookup(const XfsLookupHandle& handle, char* buf, size_t bufsize) -> ssize_t;
-auto xfs_chmod_lookup(const XfsLookupHandle& handle, int mode, ker::vfs::Stat* statbuf = nullptr) -> int;
-auto xfs_utimens_lookup(const XfsLookupHandle& handle, const Timespec& atime, const Timespec& mtime, bool set_atime, bool set_mtime,
-                        ker::vfs::Stat* statbuf = nullptr) -> int;
-auto xfs_setxattr_lookup(const XfsLookupHandle& handle, const char* name, const void* value, size_t size, int flags) -> int;
-auto xfs_getxattr_lookup(const XfsLookupHandle& handle, const char* name, void* value, size_t size) -> ssize_t;
-auto xfs_listxattr_lookup(const XfsLookupHandle& handle, char* list, size_t size) -> ssize_t;
-auto xfs_removexattr_lookup(const XfsLookupHandle& handle, const char* name) -> int;
-auto xfs_mkdir_lookup(const XfsLookupHandle& handle, int mode, ker::vfs::Stat* statbuf = nullptr) -> int;
-auto xfs_symlink_lookup(const XfsLookupHandle& handle, const char* target, ker::vfs::Stat* statbuf = nullptr) -> int;
-auto xfs_unlink_lookup(const XfsLookupHandle& handle) -> int;
-auto xfs_rmdir_lookup(const XfsLookupHandle& handle) -> int;
-auto xfs_link_lookup(const XfsLookupHandle& source, const XfsLookupHandle& destination, ker::vfs::Stat* statbuf = nullptr) -> int;
-auto xfs_rename_lookup(const XfsLookupHandle& source, const XfsLookupHandle& destination, ker::vfs::Stat* statbuf = nullptr) -> int;
+auto xfs_chmod_lookup(const XfsLookupHandle& handle, const ker::mod::security::Snapshot& credentials, int mode,
+                      ker::vfs::Stat* statbuf = nullptr, bool read_only = false) -> int;
+auto xfs_chown_lookup(const XfsLookupHandle& handle, const ker::mod::security::Snapshot& credentials, uint32_t uid, uint32_t gid,
+                      ker::vfs::Stat* statbuf = nullptr, bool read_only = false) -> int;
+auto xfs_utimens_lookup(const XfsLookupHandle& handle, const ker::mod::security::Snapshot& credentials, const TimestampUpdate& times,
+                        Stat* statbuf = nullptr, bool read_only = false) -> int;
+auto xfs_setxattr_lookup(const ker::mod::security::Snapshot& credentials, const XfsLookupHandle& handle, const char* name,
+                         const void* value, size_t size, int flags, bool read_only = false) -> int;
+auto xfs_getxattr_lookup(const ker::mod::security::Snapshot& credentials, const XfsLookupHandle& handle, const char* name, void* value,
+                         size_t size) -> ssize_t;
+auto xfs_listxattr_lookup(const ker::mod::security::Snapshot& credentials, const XfsLookupHandle& handle, char* list, size_t size)
+    -> ssize_t;
+auto xfs_removexattr_lookup(const ker::mod::security::Snapshot& credentials, const XfsLookupHandle& handle, const char* name,
+                            bool read_only = false) -> int;
+auto xfs_mkdir_lookup(const ker::mod::security::Snapshot& credentials, const XfsLookupHandle& handle, int mode,
+                      ker::vfs::Stat* statbuf = nullptr, bool read_only = false) -> int;
+auto xfs_symlink_lookup(const ker::mod::security::Snapshot& credentials, const XfsLookupHandle& handle, const char* target,
+                        ker::vfs::Stat* statbuf = nullptr, bool require_directory = false, bool read_only = false) -> int;
+auto xfs_unlink_lookup(const ker::mod::security::Snapshot& credentials, const XfsLookupHandle& handle, bool read_only = false) -> int;
+auto xfs_rmdir_lookup(const ker::mod::security::Snapshot& credentials, const XfsLookupHandle& handle, bool read_only = false) -> int;
+auto xfs_link_lookup(const ker::mod::security::Snapshot& credentials, const XfsLookupHandle& source, const XfsLookupHandle& destination,
+                     ker::vfs::Stat* statbuf = nullptr, bool source_requires_directory = false, bool destination_requires_directory = false,
+                     bool read_only = false) -> int;
+auto xfs_rename_lookup(const ker::mod::security::Snapshot& credentials, const XfsLookupHandle& source, const XfsLookupHandle& destination,
+                       Stat* statbuf = nullptr, bool source_requires_directory = false, bool destination_requires_directory = false,
+                       bool* namespace_changed = nullptr, bool* displaced_hardlink_count_changed = nullptr, bool read_only = false) -> int;
 
 // Initialize an XFS filesystem on the given block device.
 // Returns a heap-allocated XfsMountContext on success, nullptr on failure.
-auto xfs_vfs_init_device(dev::BlockDevice* device) -> XfsMountContext*;
+auto xfs_vfs_init_device(dev::BlockDevice* device, bool read_only = false) -> XfsMountContext*;
 
 // Open a file or directory by filesystem-relative path. Returns a heap-allocated
 // File* on success, nullptr on error. When result_out is non-null, it receives
 // the backend status for cache-safe callers that need to distinguish misses.
-auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ctx, int* result_out = nullptr,
-                   size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN, bool require_directory = false) -> File*;
+auto xfs_open_path(const ker::mod::security::Snapshot& credentials, const char* fs_path, int flags, int mode, XfsMountContext* ctx,
+                   int* result_out = nullptr, size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN, bool require_directory = false) -> File*;
 
 // Stat a file by filesystem-relative path.
 auto xfs_stat(const char* fs_path, ker::vfs::Stat* statbuf, XfsMountContext* ctx, size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN,
@@ -128,23 +180,26 @@ auto xfs_path_exists(const char* fs_path, bool require_directory, XfsMountContex
 auto xfs_readlink_path(const char* fs_path, char* buf, size_t bufsize, XfsMountContext* ctx,
                        size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> ssize_t;
 
+// Clone an independent, stable execution view of an owned inode reference.
+auto xfs_clone_exec_file(File* source, File** output) -> int;
 // Fstat an open file descriptor.
 auto xfs_fstat(File* f, ker::vfs::Stat* statbuf) -> int;
 
 // Extended attributes. Names use the public qualified namespace form
 // (user.*, trusted.*, security.*); internal XFS namespaces are never exposed.
-auto xfs_setxattr_path(const char* fs_path, const char* name, const void* value, size_t size, int flags, XfsMountContext* ctx,
-                       size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
-auto xfs_fsetxattr(File* f, const char* name, const void* value, size_t size, int flags) -> int;
-auto xfs_getxattr_path(const char* fs_path, const char* name, void* value, size_t size, XfsMountContext* ctx,
-                       size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> ssize_t;
-auto xfs_fgetxattr(File* f, const char* name, void* value, size_t size) -> ssize_t;
-auto xfs_listxattr_path(const char* fs_path, char* list, size_t size, XfsMountContext* ctx, size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN)
-    -> ssize_t;
-auto xfs_flistxattr(File* f, char* list, size_t size) -> ssize_t;
-auto xfs_removexattr_path(const char* fs_path, const char* name, XfsMountContext* ctx, size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN)
+auto xfs_setxattr_path(const ker::mod::security::Snapshot& credentials, const char* fs_path, const char* name, const void* value,
+                       size_t size, int flags, XfsMountContext* ctx, size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
+auto xfs_fsetxattr(const ker::mod::security::Snapshot& credentials, File* f, const char* name, const void* value, size_t size, int flags)
     -> int;
-auto xfs_fremovexattr(File* f, const char* name) -> int;
+auto xfs_getxattr_path(const ker::mod::security::Snapshot& credentials, const char* fs_path, const char* name, void* value, size_t size,
+                       XfsMountContext* ctx, size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> ssize_t;
+auto xfs_fgetxattr(const ker::mod::security::Snapshot& credentials, File* f, const char* name, void* value, size_t size) -> ssize_t;
+auto xfs_listxattr_path(const ker::mod::security::Snapshot& credentials, const char* fs_path, char* list, size_t size, XfsMountContext* ctx,
+                        size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> ssize_t;
+auto xfs_flistxattr(const ker::mod::security::Snapshot& credentials, File* f, char* list, size_t size) -> ssize_t;
+auto xfs_removexattr_path(const ker::mod::security::Snapshot& credentials, const char* fs_path, const char* name, XfsMountContext* ctx,
+                          size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
+auto xfs_fremovexattr(const ker::mod::security::Snapshot& credentials, File* f, const char* name) -> int;
 
 // Fill stat data from an open XFS file's inode without resolving its path.
 auto xfs_snapshot_file_stat(File* f, ker::vfs::Stat* statbuf) -> int;
@@ -176,6 +231,8 @@ void xfs_parent_path_cache_purge_mount(XfsMountContext* ctx);
 auto xfs_collect_swap_extents(File* f, ker::mod::mm::swap::SwapExtent** extents_out, size_t* extent_count_out) -> int;
 
 #ifdef WOS_SELFTEST
+auto xfs_selftest_xattr_snapshot_denials() -> bool;
+auto xfs_selftest_open_snapshot_denials() -> bool;
 auto xfs_selftest_hole_write_alloc_blocks(size_t block_off, size_t remaining_bytes, xfs_filblks_t hole_blocks, size_t block_size,
                                           uint32_t block_log, size_t write_pos = 0, bool sequential_append = false) -> xfs_extlen_t;
 auto xfs_selftest_write_alloc_min_blocks(xfs_extlen_t max_blocks, bool extent_pressure = false, bool sequential_append = false)
@@ -211,47 +268,57 @@ auto xfs_statvfs(XfsMountContext* ctx, ker::vfs::Statvfs* buf) -> int;
 // Change the permission bits of a file by filesystem-relative path. When
 // statbuf is non-null and the change succeeds, it receives the updated inode's
 // stat data.
-auto xfs_chmod_path(const char* fs_path, int mode, XfsMountContext* ctx, ker::vfs::Stat* statbuf = nullptr,
-                    size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
+auto xfs_chmod_path(const char* fs_path, const ker::mod::security::Snapshot& credentials, int mode, XfsMountContext* ctx,
+                    ker::vfs::Stat* statbuf = nullptr, size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
+auto xfs_chown_path(const char* fs_path, const ker::mod::security::Snapshot& credentials, uint32_t uid, uint32_t gid, XfsMountContext* ctx,
+                    ker::vfs::Stat* statbuf = nullptr, size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
 
 // Change the permission bits of an open file descriptor. When statbuf is
 // non-null and the change succeeds, it receives the updated inode's stat data.
-auto xfs_fchmod(File* f, int mode, ker::vfs::Stat* statbuf = nullptr) -> int;
+auto xfs_fchmod(File* f, const ker::mod::security::Snapshot& credentials, int mode, ker::vfs::Stat* statbuf = nullptr) -> int;
+auto xfs_fchown(File* f, const ker::mod::security::Snapshot& credentials, uint32_t uid, uint32_t gid, ker::vfs::Stat* statbuf = nullptr)
+    -> int;
 
 // Update atime/mtime by filesystem-relative path or open file.
-auto xfs_set_times_path(const char* fs_path, const Timespec& atime, const Timespec& mtime, bool set_atime, bool set_mtime,
-                        XfsMountContext* ctx, ker::vfs::Stat* statbuf = nullptr, size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
-auto xfs_set_times_file(File* f, const Timespec& atime, const Timespec& mtime, bool set_atime, bool set_mtime,
-                        ker::vfs::Stat* statbuf = nullptr) -> int;
+auto xfs_set_times_path(const char* fs_path, const ker::mod::security::Snapshot& credentials, const TimestampUpdate& times,
+                        XfsMountContext* ctx, Stat* statbuf = nullptr, size_t known_fs_path_len = static_cast<size_t>(-1)) -> int;
+auto xfs_set_times_file(File* file, const ker::mod::security::Snapshot& credentials, const TimestampUpdate& times, Stat* statbuf = nullptr)
+    -> int;
 
 // Create a directory by filesystem-relative path.  When statbuf is non-null
 // and a new directory is created, it receives the created inode's stat data.
-auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx, ker::vfs::Stat* statbuf = nullptr,
-                    size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
+auto xfs_mkdir_path(const ker::mod::security::Snapshot& credentials, const char* fs_path, int mode, XfsMountContext* ctx,
+                    ker::vfs::Stat* statbuf = nullptr, size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
 
 // Create an inline symlink by filesystem-relative path. When statbuf is
 // non-null and the symlink is created, it receives the new link's stat data.
-auto xfs_symlink_path(const char* target, const char* fs_path, XfsMountContext* ctx, ker::vfs::Stat* statbuf = nullptr,
-                      size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
+auto xfs_symlink_path(const ker::mod::security::Snapshot& credentials, const char* target, const char* fs_path, XfsMountContext* ctx,
+                      ker::vfs::Stat* statbuf = nullptr, size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
 
 // Create a hardlink from new_fs_path to old_fs_path within one XFS mount. When
 // statbuf is non-null and the link is created, it receives the linked inode's
 // updated stat data.
-auto xfs_link_path(const char* old_fs_path, const char* new_fs_path, XfsMountContext* ctx, ker::vfs::Stat* statbuf = nullptr,
-                   size_t known_old_fs_path_len = UNKNOWN_XFS_PATH_LEN, size_t known_new_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
+auto xfs_link_path(const ker::mod::security::Snapshot& credentials, const char* old_fs_path, const char* new_fs_path, XfsMountContext* ctx,
+                   ker::vfs::Stat* statbuf = nullptr, size_t known_old_fs_path_len = UNKNOWN_XFS_PATH_LEN,
+                   size_t known_new_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
 
 // Remove a file by filesystem-relative path.
 // Returns 0 on success, negative errno on failure.
 // Cannot be used to remove directories (use xfs_rmdir_path for that).
-auto xfs_unlink_path(const char* fs_path, XfsMountContext* ctx, size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
+auto xfs_unlink_path(const ker::mod::security::Snapshot& credentials, const char* fs_path, XfsMountContext* ctx,
+                     size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
 
 // Remove an empty directory by filesystem-relative path.
-auto xfs_rmdir_path(const char* fs_path, XfsMountContext* ctx, size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
+auto xfs_rmdir_path(const ker::mod::security::Snapshot& credentials, const char* fs_path, XfsMountContext* ctx,
+                    size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
 
 // Rename/move a file or directory within the same XFS mount.  When statbuf is
 // non-null and the rename succeeds, it receives the moved inode's stat data.
-auto xfs_rename_path(const char* old_fs_path, const char* new_fs_path, XfsMountContext* ctx, ker::vfs::Stat* statbuf = nullptr,
-                     size_t known_old_fs_path_len = UNKNOWN_XFS_PATH_LEN, size_t known_new_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
+auto xfs_rename_path(const ker::mod::security::Snapshot& credentials, const char* old_fs_path, const char* new_fs_path,
+                     XfsMountContext* ctx, Stat* statbuf = nullptr, size_t known_old_fs_path_len = UNKNOWN_XFS_PATH_LEN,
+                     size_t known_new_fs_path_len = UNKNOWN_XFS_PATH_LEN, bool source_requires_directory = false,
+                     bool destination_requires_directory = false, bool* namespace_changed = nullptr,
+                     bool* displaced_hardlink_count_changed = nullptr) -> int;
 
 // Return the global XFS FileOperations vtable.
 auto get_xfs_fops() -> FileOperations*;

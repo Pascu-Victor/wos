@@ -55,4 +55,10 @@ auto clone_file_mmap_ranges_for_pagemap_locked(ker::mod::mm::paging::PageTable* 
 // completed usercopy quiescence before teardown starts.
 void release_file_mmap_ranges_for_pagemap(ker::mod::mm::paging::PageTable* pagemap);
 
+#ifdef WOS_SELFTEST
+auto selftest_file_mmap_sync_preflight(ker::mod::mm::paging::PageTable* pagemap) -> bool;
+auto selftest_file_mapping_admission(ker::mod::mm::paging::PageTable* pagemap) -> bool;
+auto selftest_file_writeback_policy() -> bool;
+#endif
+
 }  // namespace ker::syscall::vmem

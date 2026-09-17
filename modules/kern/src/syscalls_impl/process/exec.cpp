@@ -7,6 +7,8 @@
 
 #include <platform/sched/resource.hpp>
 #include <platform/sched/resource_as.hpp>
+#include <platform/sched/resource_process.hpp>
+#include <platform/sched/session.hpp>
 
 // #define EXEC_DEBUG
 
@@ -19,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <memory>
 #include <net/wki/remote_compute.hpp>
 #include <new>
 #include <platform/dbg/dbg.hpp>
@@ -35,16 +38,22 @@
 #include <platform/sched/frame_class.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/security/exec_policy.hpp>
+#include <platform/security/file_policy.hpp>
 #include <platform/sys/context_switch.hpp>
+#include <platform/sys/mutex.hpp>
 #include <platform/sys/signal.hpp>
 #include <platform/sys/usercopy.hpp>
+#include <platform/sys/userspace.hpp>
 #include <string_view>
+#include <syscalls_impl/multiproc/threadControl.hpp>
 #include <util/hcf.hpp>
 #include <util/smallvec.hpp>
 #include <utility>
 #include <vfs/fd_reservation.hpp>
 #include <vfs/file.hpp>
 #include <vfs/fs/devfs.hpp>
+#include <vfs/mount.hpp>
 #include <vfs/vfs.hpp>
 
 #include "net/wki/wki.hpp"
@@ -55,6 +64,8 @@
 #include "platform/mm/virt.hpp"
 #include "platform/sched/threading.hpp"
 #include "syscalls_impl/process/child_events.hpp"
+#include "syscalls_impl/process/exit.hpp"
+#include "syscalls_impl/process/process.hpp"
 #include "syscalls_impl/shm/shm.hpp"
 #include "syscalls_impl/vmem/sys_vmem.hpp"
 #include "vfs/stat.hpp"
@@ -62,7 +73,8 @@ namespace ker::syscall::process {
 
 namespace {
 auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* const* envp,
-                        const ker::abi::process::SpawnOptions* spawn_options, int shebang_depth) -> uint64_t;
+                        const ker::abi::process::SpawnOptions* spawn_options, int shebang_depth,
+                        const ker::mod::security::Snapshot& admitted_credentials) -> uint64_t;
 auto wos_proc_execve_impl(const char* path, const char* const* argv, const char* const* envp, ker::mod::cpu::GPRegs& gpr, int shebang_depth)
     -> uint64_t;
 
@@ -125,23 +137,27 @@ auto exec_lazy_file_segments_enabled() -> bool {
     return expected != 0;
 }
 
-void consume_successful_one_shot_wki_target(ker::mod::sched::task::Task* task, ker::net::wki::WkiRemoteSpawnResult result) {
-    if (task == nullptr || result == ker::net::wki::WkiRemoteSpawnResult::FAILED ||
-        (task->wki_target_flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_ONESHOT) == 0) {
-        return;
-    }
-
-    task->wki_target_hostname.front() = '\0';
+void pin_completed_exec_locally(ker::mod::sched::task::Task& task) {
+    task.wki_target_hostname.front() = '\0';
     // One-shot placement selects the system for the payload process tree, not
     // merely for the first executable in a wrapper chain.  Clearing to
     // automatic here lets a locally selected payload's fork/exec descendants
     // move independently, while remotely selected payloads stay receiver-local.
     // Keep both outcomes symmetric by pinning the successful payload locally.
     // A later explicit setwkitarget() call can still opt back into fan-out.
-    task->wki_target_flags = ker::mod::sched::task::Task::WKI_TARGET_FLAG_LOCAL;
+    task.wki_target_flags = ker::mod::sched::task::Task::WKI_TARGET_FLAG_LOCAL;
     // The rich exec path already made this task's placement decision. Prevent
     // scheduler publication from attempting the same placement again.
-    task->wki_skip_legacy_placement = true;
+    task.wki_skip_legacy_placement = true;
+}
+
+void consume_successful_one_shot_wki_target(ker::mod::sched::task::Task* task, ker::net::wki::WkiRemoteSpawnResult result) {
+    if (task == nullptr || result == ker::net::wki::WkiRemoteSpawnResult::FAILED ||
+        (task->wki_target_flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_ONESHOT) == 0) {
+        return;
+    }
+
+    pin_completed_exec_locally(*task);
 }
 
 using FdSnapshot = std::array<uint64_t, ker::mod::sched::task::Task::FD_TABLE_SIZE>;
@@ -153,9 +169,23 @@ using LazyVmemRangeVec = ker::mod::sched::task::LazyVmemRangeVec;
 std::atomic<bool> g_exec_selftest_force_fd_clone_insert_failure{false};
 std::atomic<bool> g_exec_selftest_force_stdio_insert_failure{false};
 std::atomic<int> g_exec_selftest_close_count{0};
+ker::mod::sched::task::Task* g_exec_selftest_cleanup_owner{};
+bool g_exec_selftest_cleanup_observed{};
+bool g_exec_selftest_expect_admission_closed{};
 
 auto exec_selftest_close(vfs::File*) -> int {
     g_exec_selftest_close_count.fetch_add(1, std::memory_order_relaxed);
+    if (auto* owner = g_exec_selftest_cleanup_owner; owner != nullptr) {
+        auto* prepared = owner->owned_exec_preparation.load(std::memory_order_acquire);
+        bool const GUARDED = owner->exec_preparation_teardown_in_progress.load(std::memory_order_acquire);
+        cleanup_exec_preparation(*owner);
+        g_exec_selftest_cleanup_observed =
+            GUARDED && prepared != nullptr && owner->owned_exec_preparation.load(std::memory_order_acquire) == prepared &&
+            owner->exec_preparation_teardown_in_progress.load(std::memory_order_acquire) &&
+            owner->process_exit_requested.load(std::memory_order_acquire) &&
+            (!g_exec_selftest_expect_admission_closed ||
+             (owner->credential_owner() != nullptr && owner->credential_owner()->resource_exec_admission_closed));
+    }
     return 0;
 }
 
@@ -198,31 +228,23 @@ void record_local_proc_event(ker::mod::sched::task::Task* task, ker::mod::perf::
 
 auto clamp_perf_aux(uint64_t value) -> uint32_t { return value > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(value); }
 
-auto check_exec_permission_from_stat(const ker::mod::sched::task::Task* task, const vfs::Stat& statbuf) -> int {
-    if (task == nullptr) {
-        return -ESRCH;
-    }
-
-    auto const FILE_MODE = static_cast<uint32_t>(statbuf.st_mode & 07777);
-    if (task->euid == 0) {
-        return (FILE_MODE & 0111U) != 0 ? 0 : -EACCES;
-    }
-
-    uint32_t perm_bits = 0;
-    if (task->euid == statbuf.st_uid) {
-        perm_bits = (FILE_MODE >> 6U) & 7U;
-    } else if (task->has_group(statbuf.st_gid)) {
-        perm_bits = (FILE_MODE >> 3U) & 7U;
-    } else {
-        perm_bits = FILE_MODE & 7U;
-    }
-
-    return (perm_bits & 1U) != 0 ? 0 : -EACCES;
+auto check_exec_permission_from_stat(const ker::mod::security::Snapshot& credentials, const vfs::Stat& statbuf) -> int {
+    // Retain exec's requirement for at least one execute bit even for a caller
+    // with DAC override; directory search has different central semantics.
+    return ker::mod::security::authorize_file_access(credentials,
+                                                     {statbuf.st_uid, statbuf.st_gid, static_cast<uint32_t>(statbuf.st_mode & 07777)}, 1);
 }
 
 struct LocalProcStage {
     uint32_t correlation;
     uint64_t started_us;
+};
+
+struct NativeExecCompletion {
+    LocalProcStage commit_stage{};
+    uint32_t correlation{};
+    uint64_t started_us{};
+    uint64_t source_file_size{};
 };
 
 auto begin_local_proc_stage(ker::mod::sched::task::Task* task, ker::mod::perf::WkiPerfLocalProcOp op, uint32_t aux, uint64_t callsite)
@@ -343,31 +365,6 @@ auto spawn_put_file(vfs::File* file) -> void {
     }
 }
 
-auto spawn_replace_fd_file(ker::mod::sched::task::Task* task, int32_t fd, vfs::File* file) -> bool {
-    if (task == nullptr || file == nullptr || !spawn_fd_valid(fd)) {
-        spawn_put_file(file);
-        return false;
-    }
-
-    auto* existing = static_cast<vfs::File*>(nullptr);
-    bool inserted = false;
-    uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
-    existing = static_cast<vfs::File*>(task->fd_table.lookup(static_cast<uint64_t>(fd)));
-    inserted = task->fd_table.insert(static_cast<uint64_t>(fd), file);
-    if (inserted) {
-        file->fd = fd;
-        task->clear_fd_cloexec(static_cast<unsigned>(fd));
-    }
-    task->fd_table_lock.unlock_irqrestore(IRQF);
-
-    if (!inserted) {
-        spawn_put_file(file);
-        return false;
-    }
-    spawn_put_file(existing);
-    return true;
-}
-
 auto spawn_close_fd(ker::mod::sched::task::Task* task, int32_t fd) -> bool {
     if (task == nullptr || !spawn_fd_valid(fd)) {
         return true;
@@ -378,6 +375,7 @@ auto spawn_close_fd(ker::mod::sched::task::Task* task, int32_t fd) -> bool {
     if (existing != nullptr) {
         task->fd_table.remove(static_cast<uint64_t>(fd));
         task->clear_fd_cloexec(static_cast<unsigned>(fd));
+        vfs::fd_usage_changed_locked(*task);
     }
     task->fd_table_lock.unlock_irqrestore(IRQF);
 
@@ -385,72 +383,94 @@ auto spawn_close_fd(ker::mod::sched::task::Task* task, int32_t fd) -> bool {
     return true;
 }
 
-auto spawn_dup2_fd(ker::mod::sched::task::Task* task, int32_t srcfd, int32_t dstfd) -> bool {
-    if (task == nullptr || !spawn_fd_valid(srcfd) || !spawn_fd_valid(dstfd)) {
-        return false;
-    }
+auto spawn_dup2_fd(ker::mod::sched::task::Task* task, int32_t srcfd, int32_t dstfd) -> int {
+    if (task == nullptr) return -ESRCH;
+    if (!spawn_fd_valid(srcfd) || !spawn_fd_valid(dstfd)) return -EBADF;
 
     auto* displaced = static_cast<vfs::File*>(nullptr);
-    bool ok = false;
+    int result = -EBADF;
     uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
     if (srcfd != dstfd && static_cast<uint64_t>(dstfd) >= vfs::fd_limit_locked(*task)) {
         vfs::fd_limit_denied_locked(*task);
         task->fd_table_lock.unlock_irqrestore(IRQF);
-        return false;
+        return -EBADF;
     }
     auto* src = static_cast<vfs::File*>(task->fd_table.lookup(static_cast<uint64_t>(srcfd)));
     if (src != nullptr) {
         if (srcfd == dstfd) {
             task->clear_fd_cloexec(static_cast<unsigned>(dstfd));
-            ok = true;
+            result = 0;
         } else {
             src->refcount.fetch_add(1, std::memory_order_acq_rel);
             displaced = static_cast<vfs::File*>(task->fd_table.lookup(static_cast<uint64_t>(dstfd)));
-            ok = task->fd_table.insert(static_cast<uint64_t>(dstfd), src);
-            if (ok) {
+            bool const INSERTED = task->fd_table.insert(static_cast<uint64_t>(dstfd), src);
+            if (INSERTED) {
+                result = 0;
+                vfs::fd_usage_changed_locked(*task);
                 task->clear_fd_cloexec(static_cast<unsigned>(dstfd));
             } else {
                 src->refcount.fetch_sub(1, std::memory_order_acq_rel);
                 displaced = nullptr;
+                result = -EBUSY;  // A bounded fixed-table slot can only reject a reservation.
             }
         }
     }
     task->fd_table_lock.unlock_irqrestore(IRQF);
 
     spawn_put_file(displaced);
-    return ok;
+    return result;
 }
 
-auto spawn_open_fd(ker::mod::sched::task::Task* task, const ker::abi::process::SpawnFdAction& action) -> bool {
-    if (task == nullptr || !spawn_fd_valid(action.fd) || action.path == nullptr) {
-        return false;
-    }
-
+// Only called for an exclusively owned, unpublished child. Ordered OPEN closes
+// its destination before resolving the path, so a full table can reuse that slot.
+// Failed construction discards this private table; parent descriptions survive.
+auto spawn_open_fd(ker::mod::sched::task::Task* task, const ker::abi::process::SpawnFdAction& action) -> int {
+    if (task == nullptr) return -ESRCH;
+    if (!spawn_fd_valid(action.fd)) return -EBADF;
+    if (action.path == nullptr) return -EINVAL;
     {
         uint64_t const FLAGS = task->fd_table_lock.lock_irqsave();
         bool const ALLOWED = static_cast<uint64_t>(action.fd) < vfs::fd_limit_locked(*task);
-        if (!ALLOWED) {
-            vfs::fd_limit_denied_locked(*task);
-        }
+        if (!ALLOWED) vfs::fd_limit_denied_locked(*task);
         task->fd_table_lock.unlock_irqrestore(FLAGS);
-        if (!ALLOWED) {
-            return false;
-        }
+        if (!ALLOWED) return -EBADF;
     }
+    spawn_close_fd(task, action.fd);
+    int const OPENED = vfs::vfs_openat(task, vfs::AT_FDCWD, action.path, action.oflag, static_cast<int>(action.mode));
+    if (OPENED < 0) return OPENED;
+    if (OPENED == action.fd) return 0;
 
-    int mode = static_cast<int>(action.mode);
-    if ((action.oflag & vfs::O_CREAT) != 0 && task != nullptr) {
-        mode &= ~static_cast<int>(task->umask);
+    // VFS reserved and installed OPENED before returning. The destination is
+    // empty, bounded and unreserved in this private fixed table. Moving the
+    // description cannot allocate, block or fail after create/truncate succeeds.
+    uint64_t const FLAGS = task->fd_table_lock.lock_irqsave();
+    auto* file = static_cast<vfs::File*>(task->fd_table.lookup(static_cast<uint64_t>(OPENED)));
+    bool const CLOEXEC = task->get_fd_cloexec(static_cast<unsigned>(OPENED));
+    bool const MOVED = file != nullptr && task->fd_table.lookup(static_cast<uint64_t>(action.fd)) == nullptr &&
+                       task->fd_table.insert(static_cast<uint64_t>(action.fd), file);
+    if (MOVED) {
+        task->fd_table.remove(static_cast<uint64_t>(OPENED));
+        task->clear_fd_cloexec(static_cast<unsigned>(OPENED));
+        if (CLOEXEC)
+            task->set_fd_cloexec(static_cast<unsigned>(action.fd));
+        else
+            task->clear_fd_cloexec(static_cast<unsigned>(action.fd));
+        file->fd = action.fd;
+        vfs::fd_usage_changed_locked(*task);
     }
-
-    auto* file = vfs::vfs_open_file(action.path, action.oflag, mode);
-    if (file == nullptr) {
-        return false;
+    task->fd_table_lock.unlock_irqrestore(FLAGS);
+    if (!MOVED) {
+        ker::mod::dbg::panic_handler("spawn_open_fd: unpublished descriptor transfer lost ownership");
+        hcf();
     }
-    return spawn_replace_fd_file(task, action.fd, file);
+    return 0;
 }
 
-auto apply_spawn_options(ker::mod::sched::task::Task* task, const ker::abi::process::SpawnOptions* options) -> bool {
+auto apply_spawn_options(ker::mod::sched::task::Task* task, const ker::abi::process::SpawnOptions* options, int* error_out = nullptr)
+    -> bool {
+    if (error_out != nullptr) {
+        *error_out = 0;
+    }
     if (options == nullptr) {
         return true;
     }
@@ -466,6 +486,18 @@ auto apply_spawn_options(ker::mod::sched::task::Task* task, const ker::abi::proc
         return false;
     }
 
+    // Reject a foreign/nonexistent group before OPEN actions can create or
+    // truncate paths. The unpublished task owns any successful group change.
+    if ((options->flags & ker::abi::process::SPAWN_FLAG_SETPGROUP) != 0) {
+        int const GROUP_RESULT = ker::mod::sched::session::prepare_spawn_group(*task, options->pgroup);
+        if (GROUP_RESULT != 0) {
+            if (error_out != nullptr) {
+                *error_out = GROUP_RESULT;
+            }
+            return false;
+        }
+    }
+
     for (uint64_t i = 0; i < options->action_count; ++i) {
         auto const& action = options->actions[i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
         bool ok = false;
@@ -473,12 +505,18 @@ auto apply_spawn_options(ker::mod::sched::task::Task* task, const ker::abi::proc
             case ker::abi::process::SpawnFdActionType::CLOSE:
                 ok = spawn_close_fd(task, action.fd);
                 break;
-            case ker::abi::process::SpawnFdActionType::DUP2:
-                ok = spawn_dup2_fd(task, action.srcfd, action.fd);
+            case ker::abi::process::SpawnFdActionType::DUP2: {
+                int const RESULT = spawn_dup2_fd(task, action.srcfd, action.fd);
+                if (RESULT != 0 && error_out != nullptr) *error_out = RESULT;
+                ok = RESULT == 0;
                 break;
-            case ker::abi::process::SpawnFdActionType::OPEN:
-                ok = spawn_open_fd(task, action);
+            }
+            case ker::abi::process::SpawnFdActionType::OPEN: {
+                int const RESULT = spawn_open_fd(task, action);
+                if (RESULT != 0 && error_out != nullptr) *error_out = RESULT;
+                ok = RESULT == 0;
                 break;
+            }
             default:
                 ok = false;
                 break;
@@ -494,16 +532,13 @@ auto apply_spawn_options(ker::mod::sched::task::Task* task, const ker::abi::proc
         ker::mod::sys::signal::sync_task_signal_mask_cache(task);
     }
 
-    if ((options->flags & ker::abi::process::SPAWN_FLAG_SETPGROUP) != 0) {
-        if (options->pgroup < 0) {
-            return false;
-        }
-        task->pgid = options->pgroup == 0 ? task->pid : static_cast<uint64_t>(options->pgroup);
-    }
     return true;
 }
 
 auto ensure_exec_stdio_fallbacks(ker::mod::sched::task::Task* task) -> bool {
+    // User threads retain their process owner; only that table is visible to
+    // VFS. Unpublished process construction continues to use its own table.
+    task = task != nullptr ? task->credential_owner() : nullptr;
     if (task == nullptr) {
         return false;
     }
@@ -511,6 +546,7 @@ auto ensure_exec_stdio_fallbacks(ker::mod::sched::task::Task* task) -> bool {
     constexpr int STDIN_OPEN_FLAGS = 0;   // O_RDONLY
     constexpr int STDOUT_OPEN_FLAGS = 1;  // O_WRONLY
 
+    auto const CREDENTIALS = task->credentials();
     for (unsigned fd = 0; fd < 3; ++fd) {
         {
             uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
@@ -522,7 +558,7 @@ auto ensure_exec_stdio_fallbacks(ker::mod::sched::task::Task* task) -> bool {
         }
 
         int const OPEN_FLAGS = fd == 0 ? STDIN_OPEN_FLAGS : STDOUT_OPEN_FLAGS;
-        vfs::File* new_file = vfs::devfs::devfs_open_path("/dev/console", OPEN_FLAGS, 0);
+        vfs::File* new_file = vfs::devfs::devfs_open_path(CREDENTIALS, "/dev/console", OPEN_FLAGS, 0);
         if (new_file == nullptr) {
             continue;
         }
@@ -536,6 +572,8 @@ auto ensure_exec_stdio_fallbacks(ker::mod::sched::task::Task* task) -> bool {
 }
 
 auto collect_cloexec_fds_locked(ker::mod::sched::task::Task* task, FdSnapshot& fds) -> size_t {
+    // Match vfs_close's process table, including a retired main-thread owner.
+    task = task != nullptr ? task->credential_owner() : nullptr;
     if (task == nullptr) {
         return 0;
     }
@@ -588,6 +626,7 @@ struct ExecArgumentsSnapshot {
     char* strings{};
     const char** argv{};
     const char** envp{};
+    ker::util::SmallVec<uint64_t, 16> input_string_addrs;
     size_t strings_used{};
     size_t budget_used{};
 
@@ -613,7 +652,8 @@ auto snapshot_exec_vector(ker::mod::sched::task::Task& task, uint64_t vector_add
         return 0;
     }
 
-    ker::util::SmallVec<uint64_t, 16> string_addrs;
+    auto& string_addrs = snapshot.input_string_addrs;
+    string_addrs.clear();
     for (size_t index = 0;; ++index) {
         if (snapshot.budget_used > EXEC_ARG_BYTES_MAX - sizeof(uint64_t)) {
             return -E2BIG;
@@ -1160,6 +1200,897 @@ void swap_exec_lazy_ranges(ker::mod::sched::task::Task* task, LazyVmemRangeVec& 
     task->lazy_vmem_lock.unlock_irqrestore(IRQF);
 }
 
+// A synchronous, borrowed view of a fully prepared native image. It contains
+// no process identity, kernel stack, syscall scratch, or scheduler ownership.
+// The preparation owner retains every pointer until commit returns.
+// This view is intentionally non-assignable; its ownership slots cannot be reseated.
+// NOLINTBEGIN(cppcoreguidelines-avoid-const-or-ref-data-members)
+struct NativeExecImage {
+    uint64_t entry;
+    uint64_t program_header_addr;
+    uint64_t elf_header_addr;
+    uint64_t image_load_base;
+    uint64_t image_vaddr_start;
+    uint64_t image_vaddr_end;
+    uint16_t program_header_count;
+    uint16_t program_header_ent_size;
+    uint8_t* elf_buffer;
+    size_t elf_buffer_size;
+    bool elf_buffer_complete;
+    vfs::File* exec_image_file;
+    uint64_t exec_image_size;
+    uint64_t interp_base;
+    uint64_t interp_vaddr_start;
+    uint64_t interp_vaddr_end;
+    uint64_t at_random_addr;
+    uint64_t mmap_next;
+    char*& name;
+    const char* path;
+    uint64_t debug_staging_pid;
+    uint64_t initial_rip;
+    uint64_t initial_rsp;
+    const ker::mod::cpu::GPRegs& registers;
+    ker::mod::mm::paging::PageTable* pagemap;
+    ker::mod::sched::threading::Thread* thread;
+    LazyVmemRangeVec& lazy_ranges;
+    const vfs::Stat& stat;
+    bool nosuid{};
+    bool one_shot_wki_target{};
+    ker::mod::security::Snapshot admitted_credentials{};
+    ker::mod::security::Snapshot stack_credentials{};
+};
+// NOLINTEND(cppcoreguidelines-avoid-const-or-ref-data-members)
+
+// Detached old storage stays in the task-owned exec transaction until cleanup.
+// Its pagemap cannot be reclaimed before activation of the replacement root.
+struct RetiredExecImage {
+    uint8_t* elf_buffer{};
+    vfs::File* exec_image_file{};
+    ker::mod::sched::threading::Thread* thread{};
+    const char* name{};
+    ker::mod::mm::paging::PageTable* pagemap{};
+    bool pagemap_has_other_publishers{};
+    LazyVmemRangeVec lazy_ranges;
+};
+
+}  // namespace
+
+// Candidate input outlives the preparing syscall stack without replacing the
+// current Task image. Only the canonical owner executes and commits this plan.
+struct RemoteExecPlan {
+    using Task = ker::mod::sched::task::Task;
+    ker::mod::sched::resource::ExecAdmission admission;
+    ker::mod::security::Snapshot credentials;
+    ker::mod::security::Snapshot replacement_credentials;
+    ker::mod::security::ExecIdentity image_identity;
+    ker::net::wki::TaskExecCredentialTransition credential_transition;
+    ker::net::wki::TaskExecSignals signals{};
+    Task* actor{};
+    WorkerExecHandoff* handoff{};
+    uint8_t* bytes{};
+    size_t size{};
+    bool complete{};
+    const char** argv{};
+    const char** envp{};
+    char* strings{};
+    std::array<char, Task::EXE_PATH_MAX> path{};
+    Task::FilesystemContext filesystem;
+    std::array<char, Task::WKI_TARGET_HOSTNAME_MAX> target{};
+    uint32_t target_flags{};
+    bool committed{};
+
+    ~RemoteExecPlan() {
+        admission.finish();
+        filesystem.root_anchor = {};
+        filesystem.cwd_anchor = {};
+        if (actor != nullptr) actor->release();
+        delete[] bytes;
+        delete[] argv;
+        delete[] envp;
+        delete[] strings;
+    }
+
+    auto copy_arguments(const char* const* input_argv, const char* const* input_envp) -> bool {
+        size_t argc = 0, envc = 0, total = 0;
+        auto measure = [&](const char* const* input, size_t& count) {
+            if (input == nullptr) return true;
+            while (input[count] != nullptr) {
+                size_t const LENGTH = strnlen(input[count], EXEC_ARG_BYTES_MAX);
+                if (LENGTH == EXEC_ARG_BYTES_MAX || total > EXEC_ARG_BYTES_MAX - LENGTH - 1 || count == EXEC_ARG_BYTES_MAX / sizeof(char*))
+                    return false;
+                total += LENGTH + 1;
+                ++count;
+            }
+            return true;
+        };
+        if (!measure(input_argv, argc) || !measure(input_envp, envc) || (argc + envc + 2) > (EXEC_ARG_BYTES_MAX - total) / sizeof(char*))
+            return false;
+        argv = new (std::nothrow) const char*[argc + 1]{};
+        envp = new (std::nothrow) const char*[envc + 1]{};
+        strings = new (std::nothrow) char[total != 0 ? total : 1];
+        if (argv == nullptr || envp == nullptr || strings == nullptr) return false;
+        char* cursor = strings;
+        auto copy = [&](const char* const* input, const char** output, size_t count) {
+            for (size_t i = 0; i < count; ++i) {
+                size_t const LENGTH = std::strlen(input[i]) + 1;
+                std::memcpy(cursor, input[i], LENGTH);
+                output[i] = cursor;
+                cursor += LENGTH;
+            }
+        };
+        copy(input_argv, argv, argc);
+        copy(input_envp, envp, envc);
+        return true;
+    }
+
+    auto candidate() const -> ker::net::wki::WkiRemoteExecCandidate {
+        return {.path = path.data(), .bytes = {bytes, size}, .complete = complete, .target = target.data(), .target_flags = target_flags};
+    }
+
+    // Caller has passed every rejecting cutover check under the VM publication
+    // guard. Publish text/routing alongside the replacement credentials.
+    void publish_metadata(Task& owner) const {
+        uint64_t const FLAGS = owner.path_metadata_lock.lock_irqsave();
+        owner.exe_path = path;
+        owner.wki_target_hostname = target;
+        owner.wki_target_flags = target_flags;
+        owner.wki_skip_legacy_placement = true;
+        consume_successful_one_shot_wki_target(&owner, ker::net::wki::WkiRemoteSpawnResult::REMOTE);
+        owner.path_metadata_lock.unlock_irqrestore(FLAGS);
+    }
+};
+
+// The waiting worker retains its request and CPU contribution until result is
+// published. After acknowledgement the owner must never dereference this row.
+struct WorkerExecHandoff {
+    ~WorkerExecHandoff();
+    bool remote{};
+    ExecRequestArguments* remote_request{};
+    ker::mod::sched::task::Task* worker{};
+    NativeExecCompletion completion{};
+    uint64_t signal_mask{};
+    std::atomic<int> result{-EINPROGRESS};
+};
+
+// Native exec publishes this owner before faulting usercopy. Recursion never
+// owns a forwarded vector or its inline strings only on an abandoned stack.
+class ExecRequestArguments {
+   public:
+    ExecArgumentsSnapshot snapshot;
+    ker::mod::security::Snapshot admitted_credentials;
+    NativeExecCompletion completion;
+    WorkerExecHandoff handoff;
+    std::unique_ptr<RemoteExecPlan> remote;
+    uint32_t remote_proxy_id{};
+    bool remote_worker_committed{};
+
+    // Memory-only scratch for each recursive native loader invocation. Persistent
+    // executable bytes leave prepared_elf through take_task_metadata(); File,
+    // pagemap and Thread ownership belong to the image transaction separately.
+    struct NativeScratch {
+        PreparedFileBackedElf prepared_elf;
+        loader::elf::ElfLazyLoadRangeVec main_lazy_ranges;
+        loader::elf::ElfLazyLoadRangeVec interp_lazy_ranges;
+        uint64_t* argv_addrs{};
+        uint64_t* envp_addrs{};
+        ~NativeScratch() {
+            delete[] argv_addrs;
+            delete[] envp_addrs;
+        }
+    };
+
+    auto native_scratch(int depth) -> NativeScratch* {
+        if (depth < 0 || depth > MAX_SHEBANG_DEPTH) return nullptr;
+        return &m_native_scratch.at(static_cast<size_t>(depth));
+    }
+
+    auto prepare_shebang(const char* script_path, const char* const* argv, size_t argv_count, const ShebangInfo& shebang, int depth,
+                         const char*& interpreter, const char**& forwarded) -> int {
+        if (depth < 0 || depth >= MAX_SHEBANG_DEPTH) return -ELOOP;
+        auto& frame = m_frames.at(static_cast<size_t>(depth));
+        if (frame.argv != nullptr) return -EBUSY;
+        int const PATH_RESULT = copy_exec_path(script_path, frame.script_path);
+        if (PATH_RESULT < 0) return PATH_RESULT;
+        frame.shebang = shebang;
+        size_t const COUNT = 2 + (argv_count > 0 ? argv_count - 1 : 0) + (shebang.has_argument ? 1 : 0);
+        frame.argv = new (std::nothrow) const char*[COUNT + 1];
+        if (frame.argv == nullptr) return -ENOMEM;
+        size_t index = 0;
+        frame.argv[index++] = frame.shebang.interpreter.data();
+        if (frame.shebang.has_argument) frame.argv[index++] = frame.shebang.argument.data();
+        frame.argv[index++] = frame.script_path.data();
+        for (size_t i = 1; i < argv_count; ++i) frame.argv[index++] = argv[i];
+        frame.argv[index] = nullptr;
+        interpreter = frame.shebang.interpreter.data();
+        forwarded = frame.argv;
+        return 0;
+    }
+
+#ifdef WOS_SELFTEST
+    uint32_t* selftest_destructions = nullptr;
+    ~ExecRequestArguments() {
+        if (selftest_destructions != nullptr) ++*selftest_destructions;
+    }
+#endif
+
+   private:
+    struct ShebangFrame {
+        ShebangInfo shebang;
+        std::array<char, EXEC_PATH_MAX> script_path{};
+        const char** argv{};
+        ~ShebangFrame() { delete[] argv; }
+    };
+    std::array<ShebangFrame, MAX_SHEBANG_DEPTH> m_frames;
+    std::array<NativeScratch, MAX_SHEBANG_DEPTH + 1> m_native_scratch;
+};
+
+WorkerExecHandoff::~WorkerExecHandoff() { delete remote_request; }
+
+// Owns prepared/retired storage and temporary admission independently of the
+// preparing stack. The Task slot survives publication through final cleanup.
+// VFS/MM releases may block during normal cleanup or ACTIVE executor exit.
+// This is not a cross-task handoff protocol.
+class PreparedNativeExecImage {
+   public:
+    PreparedNativeExecImage(const NativeExecImage& image, uint64_t origin_pid)
+        : m_name(std::exchange(image.name, nullptr)),
+          m_registers(image.registers),
+          m_stat(image.stat),
+          m_lazy_ranges(std::move(image.lazy_ranges)),
+          m_origin_pid(origin_pid),
+          m_image{
+              .entry = image.entry,
+              .program_header_addr = image.program_header_addr,
+              .elf_header_addr = image.elf_header_addr,
+              .image_load_base = image.image_load_base,
+              .image_vaddr_start = image.image_vaddr_start,
+              .image_vaddr_end = image.image_vaddr_end,
+              .program_header_count = image.program_header_count,
+              .program_header_ent_size = image.program_header_ent_size,
+              .elf_buffer = image.elf_buffer,
+              .elf_buffer_size = image.elf_buffer_size,
+              .elf_buffer_complete = image.elf_buffer_complete,
+              .exec_image_file = image.exec_image_file,
+              .exec_image_size = image.exec_image_size,
+              .interp_base = image.interp_base,
+              .interp_vaddr_start = image.interp_vaddr_start,
+              .interp_vaddr_end = image.interp_vaddr_end,
+              .at_random_addr = image.at_random_addr,
+              .mmap_next = image.mmap_next,
+              .name = m_name,
+              .path = m_path.data(),
+              .debug_staging_pid = image.debug_staging_pid,
+              .initial_rip = image.initial_rip,
+              .initial_rsp = image.initial_rsp,
+              .registers = m_registers,
+              .pagemap = image.pagemap,
+              .thread = image.thread,
+              .lazy_ranges = m_lazy_ranges,
+              .stat = m_stat,
+              .nosuid = image.nosuid,
+              .one_shot_wki_target = image.one_shot_wki_target,
+              .admitted_credentials = image.admitted_credentials,
+              .stack_credentials = image.stack_credentials,
+          } {
+        // Native staging has already validated the complete bounded path.
+        std::memcpy(m_path.data(), image.path, std::strlen(image.path) + 1);
+    }
+    ~PreparedNativeExecImage() { discard(); }
+    PreparedNativeExecImage(const PreparedNativeExecImage&) = delete;
+    auto operator=(const PreparedNativeExecImage&) -> PreparedNativeExecImage& = delete;
+
+    [[nodiscard]] auto view() const -> const NativeExecImage& { return m_image; }
+    [[nodiscard]] auto admission() -> ker::mod::sched::resource::ExecAdmission& { return m_admission; }
+    [[nodiscard]] auto retired() -> RetiredExecImage& { return m_retired; }
+    void release_after_commit() {
+        if (m_phase != Phase::PREPARED) {
+            ker::mod::dbg::panic_handler("exec image publication repeated");
+            hcf();
+        }
+        m_phase = Phase::PUBLISHED;
+    }
+    // Called only after the replacement CR3/FPU/TLS state is active. Fatal
+    // recovery stays deferred between publication and this transition.
+    void mark_activated() {
+        if (m_phase != Phase::PUBLISHED) {
+            ker::mod::dbg::panic_handler("exec activation without image publication");
+            hcf();
+        }
+        m_phase = Phase::ACTIVE;
+    }
+    void discard() {
+        if (m_phase == Phase::DISCARDED) {
+            return;
+        }
+        if (m_phase == Phase::PUBLISHED) {
+            ker::mod::dbg::panic_handler("exec cleanup before replacement root activation");
+            hcf();
+        }
+        auto const PHASE = std::exchange(m_phase, Phase::DISCARDED);
+        if (PHASE == Phase::ACTIVE) {
+            discard_retired();
+            // Final shared state and old-image cleanup finish before reopening
+            // temporary admission. Permanent process exit admission is separate.
+            m_admission.finish();
+            return;
+        }
+        // Failed publication leaves the original image intact and can admit
+        // new workers while private preparation cleanup blocks.
+        m_admission.finish();
+        if (m_image.debug_staging_pid != 0) {
+            loader::debug::unregister_process(m_image.debug_staging_pid);
+        }
+        if (m_image.exec_image_file != nullptr) {
+            vfs::vfs_put_file(m_image.exec_image_file);
+        }
+        release_lazy_file_refs(m_lazy_ranges);
+        if (m_image.pagemap != nullptr) {
+            ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(m_image.pagemap);
+            ker::mod::mm::virt::destroy_user_space(m_image.pagemap, m_origin_pid, m_name != nullptr ? m_name : m_path.data(),
+                                                   "exec-prepared-image-abort");
+            ker::mod::mm::virt::release_pagemap(m_image.pagemap, m_origin_pid);
+        }
+        if (m_image.thread != nullptr) {
+            m_image.thread->tls_phys_ptr = 0;
+            m_image.thread->stack_phys_ptr = 0;
+            ker::mod::sched::threading::destroy_thread(m_image.thread);
+        }
+        delete[] m_name;
+        m_name = nullptr;
+        delete[] m_image.elf_buffer;
+    }
+
+   private:
+    enum class Phase : uint8_t { PREPARED, PUBLISHED, ACTIVE, DISCARDED };
+
+    void discard_retired() {
+        delete[] m_retired.name;
+        release_lazy_file_refs(m_retired.lazy_ranges);
+        if (m_retired.elf_buffer != nullptr) {
+            if (!ker::net::wki::wki_remote_compute_release_elf_buffer(m_retired.elf_buffer)) {
+                delete[] m_retired.elf_buffer;
+            }
+        }
+        if (m_retired.exec_image_file != nullptr) {
+            vfs::vfs_put_file(m_retired.exec_image_file);
+        }
+        // Preserve last-publisher GC ownership of an old shared root. The
+        // private replacement is already active and is never freed here.
+        if (m_retired.pagemap != nullptr && m_retired.pagemap != m_image.pagemap && !m_retired.pagemap_has_other_publishers) {
+            ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(m_retired.pagemap);
+            ker::mod::mm::virt::destroy_user_space(m_retired.pagemap, m_origin_pid, m_path.data(), "exec-old-image");
+            ker::mod::mm::virt::release_pagemap(m_retired.pagemap, m_origin_pid);
+        }
+        if (m_retired.thread != nullptr && m_retired.thread != m_image.thread) {
+            m_retired.thread->tls_phys_ptr = 0;
+            m_retired.thread->stack_phys_ptr = 0;
+            ker::mod::sched::threading::destroy_thread(m_retired.thread);
+        }
+    }
+
+    std::array<char, EXEC_PATH_MAX> m_path{};
+    char* m_name{};
+    ker::mod::cpu::GPRegs m_registers{};
+    vfs::Stat m_stat{};
+    LazyVmemRangeVec m_lazy_ranges;
+    uint64_t m_origin_pid{};
+    Phase m_phase = Phase::PREPARED;
+    NativeExecImage m_image;
+    RetiredExecImage m_retired;
+    ker::mod::sched::resource::ExecAdmission m_admission;
+};
+
+void cleanup_exec_preparation(ker::mod::sched::task::Task& task) {
+    bool expected = false;
+    if (!task.exec_preparation_teardown_in_progress.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        return;
+    }
+    auto* prepared = task.owned_exec_preparation.load(std::memory_order_acquire);
+    if (prepared != nullptr) {
+        // Keep recovery ownership published until every potentially blocking
+        // release has finished. Reentrant fatal/group exits must stay pending.
+        prepared->discard();
+        if (task.owned_exec_preparation.exchange(nullptr, std::memory_order_acq_rel) != prepared) {
+            ker::mod::dbg::panic_handler("exec preparation owner changed during teardown");
+            hcf();
+        }
+        delete prepared;
+    }
+    auto* arguments = task.owned_exec_arguments.load(std::memory_order_acquire);
+    if (arguments != nullptr) {
+        delete arguments;
+        if (task.owned_exec_arguments.exchange(nullptr, std::memory_order_acq_rel) != arguments) {
+            ker::mod::dbg::panic_handler("exec argument owner changed during teardown");
+            hcf();
+        }
+    }
+    task.exec_preparation_teardown_in_progress.store(false, std::memory_order_release);
+}
+
+namespace {
+auto adopt_exec_arguments(ker::mod::sched::task::Task& task, std::unique_ptr<ExecRequestArguments>& arguments) -> bool {
+    if (!arguments || task.exit_in_progress.load(std::memory_order_acquire) || task.has_exited ||
+        task.state.load(std::memory_order_acquire) != ker::mod::sched::task::TaskState::ACTIVE ||
+        task.exec_preparation_teardown_in_progress.load(std::memory_order_acquire))
+        return false;
+    ExecRequestArguments* expected = nullptr;
+    if (!task.owned_exec_arguments.compare_exchange_strong(expected, arguments.get(), std::memory_order_acq_rel)) return false;
+    static_cast<void>(arguments.release());
+    return true;
+}
+
+auto adopt_exec_preparation(ker::mod::sched::task::Task& task, std::unique_ptr<PreparedNativeExecImage>& prepared) -> bool {
+    if (!prepared || task.exit_in_progress.load(std::memory_order_acquire) || task.has_exited ||
+        task.state.load(std::memory_order_acquire) != ker::mod::sched::task::TaskState::ACTIVE ||
+        task.exec_preparation_teardown_in_progress.load(std::memory_order_acquire)) {
+        return false;
+    }
+    PreparedNativeExecImage* expected = nullptr;
+    if (!task.owned_exec_preparation.compare_exchange_strong(expected, prepared.get(), std::memory_order_acq_rel)) {
+        return false;
+    }
+    // No blocking or cross-task access between publication and stack disarm.
+    static_cast<void>(prepared.release());
+    return true;
+}
+
+auto finish_native_exec_image(ker::mod::sched::task::Task* task, PreparedNativeExecImage* PREPARED, NativeExecCompletion completion,
+                              WorkerExecHandoff* handoff = nullptr) -> uint64_t;
+
+void acknowledge_worker_exec(ker::mod::sched::task::Task& owner, WorkerExecHandoff& handoff, int result) {
+    uint64_t const FLAGS = owner.resource_lock.lock_irqsave();
+    owner.active_exec_handoff.store(nullptr, std::memory_order_release);
+    handoff.result.store(result, std::memory_order_release);
+    owner.resource_lock.unlock_irqrestore(FLAGS);
+}
+
+struct RemoteExecOutcome {
+    ker::net::wki::WkiRemoteSpawnResult result = ker::net::wki::WkiRemoteSpawnResult::FAILED;
+    int error = -EAGAIN;
+    WorkerExecHandoff* pending{};
+};
+
+auto prepare_remote_exec_owner(ker::mod::sched::task::Task& owner, void* context) -> int {
+    auto& plan = *static_cast<RemoteExecPlan*>(context);
+    {
+        ker::syscall::vmem::SharedVmemPublicationGuard publication;
+        if (owner.credentials() != plan.credentials) return -EAGAIN;
+        if (!plan.admission.owns(owner) && !plan.admission.begin(owner)) return -EAGAIN;
+        plan.image_identity.traced = owner.ptrace_traced;
+        ker::mod::security::Snapshot before;
+        int const ERROR = ker::mod::sched::resource::prepare_exec_credentials(owner, plan.image_identity, before,
+                                                                              plan.replacement_credentials, &plan.credentials);
+        if (ERROR != 0) return ERROR;
+        plan.credential_transition = {
+            .flags = static_cast<uint16_t>((plan.image_identity.nosuid ? ker::net::wki::WKI_EXEC_CREDENTIAL_NOSUID : 0) |
+                                           (plan.image_identity.traced ? ker::net::wki::WKI_EXEC_CREDENTIAL_TRACED : 0)),
+            .uid = plan.image_identity.uid,
+            .gid = plan.image_identity.gid,
+            .mode = plan.image_identity.mode & 07777U,
+        };
+    }
+    if (!plan.admission.quiesce(owner)) return -EAGAIN;
+    // Detached wait commits must publish their observation before the exec snapshot.
+    if (!ker::net::wki::wki_child_wait_quiesce(owner)) return -EAGAIN;
+    // An already-entered credential syscall may have finished during quiesce.
+    // The submission must still carry the executable's admitted snapshot.
+    if (owner.credentials() != plan.credentials) return -EAGAIN;
+    plan.signals = ker::net::wki::wki_exec_signal_snapshot(*plan.actor);
+    // The retained process owns the parent/child relationship, including when
+    // a native worker supplies the replacement image's thread signal state.
+    plan.signals.parent_death_signal = owner.parent_death_signal.load(std::memory_order_acquire);
+    if (plan.actor != &owner) plan.signals.pending |= owner.signal_delivery_pending_bits();
+    return 0;
+}
+
+void accept_remote_exec_owner(ker::mod::sched::task::Task& owner, void* context) {
+    auto& plan = *static_cast<RemoteExecPlan*>(context);
+    plan.committed = true;
+    owner.main_thread_retired.store(false, std::memory_order_release);
+    if (auto* handoff = std::exchange(plan.handoff, nullptr); handoff != nullptr) {
+        // The original worker still owns loader/File cleanup. Let it unwind
+        // and retire before waiting for all old-image CPU contributions.
+        acknowledge_worker_exec(owner, *handoff, 1);
+    }
+    retire_exec_siblings(owner);
+}
+
+template <typename Wait>
+void capture_remote_exec_cutover_signals(ker::mod::sched::task::Task& owner, ker::mod::sched::task::Task& actor, uint32_t task_id,
+                                         uint64_t remote_pid, ker::net::wki::TaskExecSignals& signals, Wait&& wait) {
+    owner.publish_accepted_signal_route(task_id, remote_pid);
+    // Positive-PID signal admission belongs to the exact target Task. The
+    // execing worker's in-flight effects must also finish before its snapshot.
+    // Its old TID retires here: only the owner matches SubmittedTask::local_task
+    // and can forward signals to the replacement process.
+    if (&actor != &owner) actor.publish_accepted_signal_route(task_id, remote_pid);
+    while (!owner.local_signal_admissions_drained() || !actor.local_signal_admissions_drained()) wait();
+    signals = ker::net::wki::wki_exec_signal_snapshot(actor);
+    signals.parent_death_signal = owner.parent_death_signal.load(std::memory_order_acquire);
+    if (&actor != &owner) signals.pending |= owner.signal_delivery_pending_bits();
+}
+
+auto cutover_remote_exec_owner(ker::mod::sched::task::Task& owner, uint32_t task_id, uint64_t remote_pid,
+                               ker::net::wki::TaskExecSignals& signals, void* context) -> int {
+    auto& plan = *static_cast<RemoteExecPlan*>(context);
+    {
+        ker::syscall::vmem::SharedVmemPublicationGuard publication;
+        if (!plan.admission.owns(owner) || !plan.admission.quiesced(owner) || owner.ptrace_traced != plan.image_identity.traced)
+            return -EAGAIN;
+        int const ERROR = ker::mod::sched::resource::publish_exec_credentials(owner, plan.credentials, plan.replacement_credentials);
+        if (ERROR != 0) return ERROR;
+        plan.publish_metadata(owner);
+    }
+    plan.committed = true;
+    capture_remote_exec_cutover_signals(owner, *plan.actor, task_id, remote_pid, signals, [] { ker::mod::sched::kern_yield(); });
+    accept_remote_exec_owner(owner, context);
+    return 0;
+}
+
+auto run_remote_exec_owner(ker::mod::sched::task::Task& owner, ExecRequestArguments& request, WorkerExecHandoff* handoff)
+    -> RemoteExecOutcome {
+    auto& plan = *request.remote;
+    plan.handoff = handoff;
+    auto const CANDIDATE = plan.candidate();
+    RemoteExecOutcome outcome;
+    ker::net::wki::WkiRemoteSpawnSpec const SPEC{
+        .argv = plan.argv,
+        .envp = plan.envp,
+        .cwd = plan.filesystem.cwd.data(),
+        .error_out = &outcome.error,
+        .prepare = prepare_remote_exec_owner,
+        .accepted = accept_remote_exec_owner,
+        .cutover = cutover_remote_exec_owner,
+        .context = &plan,
+        .exec_signals = &plan.signals,
+        .deferred_proxy_id = &request.remote_proxy_id,
+        .filesystem = &plan.filesystem,
+        .exec_credentials = &plan.credential_transition,
+        .exec_candidate = &CANDIDATE,
+    };
+    outcome.result = ker::net::wki::wki_try_remote_spawn(&owner, SPEC);
+    outcome.pending = plan.handoff;
+    // No scheduler proxy identity yet: rollback/argument/actor ownership can
+    // safely finish even if a cleanup later gains a blocking release.
+    request.remote.reset();
+    return outcome;
+}
+
+void publish_remote_exec_proxy(ker::mod::sched::task::Task& owner, uint32_t id) {
+    owner.set_wki_proxy_task_id(id);
+    owner.wki_proxy_task = true;
+    owner.deferred_task_switch = true;
+    owner.yield_switch = false;
+    owner.set_wait_channel("wki_execve_proxy", ker::mod::sched::task::WaitChannelKind::WKI_EXECVE_PROXY);
+}
+
+auto try_process_remote_exec(ker::mod::sched::task::Task& actor, const uint8_t* elf, size_t elf_size, bool complete, const char* path,
+                             const char* const* argv, const char* const* envp, const ker::vfs::Stat& stat, bool nosuid, int& error)
+    -> ker::net::wki::WkiRemoteSpawnResult {
+    using ker::net::wki::WkiRemoteSpawnResult;
+    using namespace ker::mod;
+    error = 0;
+    if ((actor.wki_target_flags & sched::task::Task::WKI_TARGET_FLAG_LOCAL) != 0) return WkiRemoteSpawnResult::LOCAL;
+    auto* request = actor.owned_exec_arguments.load(std::memory_order_acquire);
+    auto* owner = actor.credential_owner();
+    if (request == nullptr || owner == nullptr) {
+        error = -ESRCH;
+        return WkiRemoteSpawnResult::FAILED;
+    }
+    auto plan = std::unique_ptr<RemoteExecPlan>(new (std::nothrow) RemoteExecPlan);
+    if (!plan || !plan->copy_arguments(argv, envp)) {
+        error = -ENOMEM;
+        return WkiRemoteSpawnResult::FAILED;
+    }
+    plan->bytes = new (std::nothrow) uint8_t[elf_size];
+    if (plan->bytes == nullptr || !actor.try_acquire()) {
+        error = -ENOMEM;
+        return WkiRemoteSpawnResult::FAILED;
+    }
+    plan->actor = &actor;
+    plan->credentials = request->admitted_credentials;
+    plan->image_identity = {.uid = stat.st_uid,
+                            .gid = stat.st_gid,
+                            .set_uid = (stat.st_mode & 04000) != 0,
+                            .set_gid = (stat.st_mode & 02000) != 0,
+                            .nosuid = nosuid,
+                            .mode = stat.st_mode};
+    plan->size = elf_size;
+    plan->complete = complete;
+    std::memcpy(plan->bytes, elf, elf_size);
+    std::memcpy(plan->path.data(), path, std::min(std::strlen(path), plan->path.size() - 1));
+    if (!actor.capture_filesystem_context(plan->filesystem)) {
+        error = -ESRCH;
+        return WkiRemoteSpawnResult::FAILED;
+    }
+    plan->target = actor.wki_target_hostname;
+    plan->target_flags = actor.wki_target_flags;
+    if (&actor == owner) {
+        request->remote = std::move(plan);
+        auto const OUTCOME = run_remote_exec_owner(actor, *request, nullptr);
+        error = OUTCOME.error;
+        return OUTCOME.result;
+    }
+    auto holder = std::unique_ptr<ExecRequestArguments>(new (std::nothrow) ExecRequestArguments);
+    if (!holder) {
+        error = -ENOMEM;
+        return WkiRemoteSpawnResult::FAILED;
+    }
+    holder->remote = std::move(plan);
+    auto& handoff = request->handoff;
+    {
+        ker::syscall::vmem::SharedVmemPublicationGuard publication;
+        if (!holder->remote->admission.begin(actor)) {
+            error = -EAGAIN;
+            return WkiRemoteSpawnResult::FAILED;
+        }
+        uint64_t const LOCK = owner->resource_lock.lock_irqsave();
+        bool const AVAILABLE = !owner->exit_in_progress.load(std::memory_order_acquire) && !owner->resource_cpu_admission_closed &&
+                               owner->pending_exec_handoff.load(std::memory_order_relaxed) == nullptr &&
+                               owner->active_exec_handoff.load(std::memory_order_relaxed) == nullptr &&
+                               owner->owned_exec_arguments.load(std::memory_order_acquire) == nullptr &&
+                               owner->state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE;
+        if (AVAILABLE) {
+            handoff.remote = true;
+            handoff.worker = &actor;
+            handoff.remote_request = holder.release();
+            owner->pending_exec_handoff.store(&handoff, std::memory_order_release);
+        }
+        owner->resource_lock.unlock_irqrestore(LOCK);
+        if (!AVAILABLE) {
+            error = -EAGAIN;
+            return WkiRemoteSpawnResult::FAILED;
+        }
+    }
+    sched::wake_task_for_signal(owner);
+    sched::wake_task_from_event(owner);
+    int result;
+    {
+        sched::resource::ExecSafeWait safe_wait(actor);
+        while ((result = handoff.result.load(std::memory_order_acquire)) == -EINPROGRESS) sched::kern_yield();
+        if (result != 1) safe_wait.wait_for_release();
+    }
+    request->remote_worker_committed = result == 1;
+    // Optional remote placement can fall through to the existing native
+    // preparation/handoff in this same request. Its waiter starts afresh.
+    handoff.remote = false;
+    handoff.result.store(-EINPROGRESS, std::memory_order_release);
+    if (result < 0) {
+        error = result;
+        return WkiRemoteSpawnResult::FAILED;
+    }
+    return result == 1 ? WkiRemoteSpawnResult::REMOTE : WkiRemoteSpawnResult::LOCAL;
+}
+
+auto claim_pending_exec_handoff(ker::mod::sched::task::Task& owner) -> WorkerExecHandoff* {
+    uint64_t const FLAGS = owner.resource_lock.lock_irqsave();
+    auto* handoff = owner.pending_exec_handoff.load(std::memory_order_acquire);
+    if (handoff == nullptr || owner.owned_exec_preparation.load(std::memory_order_acquire) != nullptr) {
+        owner.resource_lock.unlock_irqrestore(FLAGS);
+        return nullptr;
+    }
+    if (handoff->remote) {
+        if (owner.owned_exec_arguments.load(std::memory_order_acquire) != nullptr) {
+            owner.resource_lock.unlock_irqrestore(FLAGS);
+            return nullptr;
+        }
+        owner.owned_exec_arguments.store(std::exchange(handoff->remote_request, nullptr), std::memory_order_release);
+    } else {
+        auto* prepared = handoff->worker->owned_exec_preparation.exchange(nullptr, std::memory_order_acq_rel);
+        owner.owned_exec_preparation.store(prepared, std::memory_order_release);
+    }
+    owner.pending_exec_handoff.store(nullptr, std::memory_order_release);
+    owner.active_exec_handoff.store(handoff, std::memory_order_release);
+    owner.resource_lock.unlock_irqrestore(FLAGS);
+    return handoff;
+}
+
+auto handoff_worker_exec(ker::mod::sched::task::Task& worker, PreparedNativeExecImage& prepared, ExecRequestArguments& request)
+    -> uint64_t {
+    using namespace ker::mod;
+    auto* owner = worker.credential_owner();
+    if (owner == nullptr || owner == &worker) return static_cast<uint64_t>(-ESRCH);
+    auto& handoff = request.handoff;
+    {
+        ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+        security::Snapshot before, after;
+        auto const& image = prepared.view();
+        int const ERROR = sched::resource::prepare_exec_credentials(worker,
+                                                                    {.uid = image.stat.st_uid,
+                                                                     .gid = image.stat.st_gid,
+                                                                     .set_uid = (image.stat.st_mode & 04000) != 0,
+                                                                     .set_gid = (image.stat.st_mode & 02000) != 0,
+                                                                     .nosuid = image.nosuid,
+                                                                     .traced = owner->ptrace_traced,
+                                                                     .mode = image.stat.st_mode},
+                                                                    before, after, &image.admitted_credentials);
+        if (ERROR != 0) return static_cast<uint64_t>(ERROR);
+        // The canonical owner rendezvous excludes all old-image contributors
+        // before any authority change, including this explicit waiting worker.
+        if (!prepared.admission().begin(worker)) return static_cast<uint64_t>(-EAGAIN);
+        uint64_t const FLAGS = owner->resource_lock.lock_irqsave();
+        bool const AVAILABLE = !owner->exit_in_progress.load(std::memory_order_acquire) && !owner->resource_cpu_admission_closed &&
+                               owner->pending_exec_handoff.load(std::memory_order_relaxed) == nullptr &&
+                               owner->state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE;
+        if (AVAILABLE) {
+            handoff.worker = &worker;
+            handoff.completion = request.completion;
+            handoff.signal_mask = worker.signal_mask_bits();
+            owner->pending_exec_handoff.store(&handoff, std::memory_order_release);
+        }
+        owner->resource_lock.unlock_irqrestore(FLAGS);
+        if (!AVAILABLE) return static_cast<uint64_t>(-EAGAIN);
+    }
+    sched::wake_task_for_signal(owner);
+    sched::wake_task_from_event(owner);
+    int result;
+    {
+        sched::resource::ExecSafeWait safe_wait(worker);
+        while ((result = handoff.result.load(std::memory_order_acquire)) == -EINPROGRESS) {
+            // Kernel wait frames defer fatal delivery. Owner exit cancels this row
+            // before waiting for our CPU contribution; successful acceptance wakes
+            // this explicit retirement path before owner sibling cleanup waits.
+            sched::kern_yield();
+        }
+        // A later exec may start after this request was rejected. Withdraw
+        // atomically with observing its rendezvous release before unwinding.
+        if (result != 0) safe_wait.wait_for_release();
+    }
+    if (result == 0) {
+        ker::syscall::multiproc::wos_thread_exit_current();
+    }
+    return static_cast<uint64_t>(result);
+}
+
+auto prepare_native_exec_quiescence(ker::mod::sched::task::Task& task, PreparedNativeExecImage& prepared) -> int {
+    using namespace ker::mod;
+    bool change = false;
+    {
+        ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+        auto const& image = prepared.view();
+        security::Snapshot before, after;
+        int const ERROR = sched::resource::prepare_exec_credentials(task,
+                                                                    {.uid = image.stat.st_uid,
+                                                                     .gid = image.stat.st_gid,
+                                                                     .set_uid = (image.stat.st_mode & 04000) != 0,
+                                                                     .set_gid = (image.stat.st_mode & 02000) != 0,
+                                                                     .nosuid = image.nosuid,
+                                                                     .traced = task.ptrace_traced,
+                                                                     .mode = image.stat.st_mode},
+                                                                    before, after, &image.admitted_credentials);
+        if (ERROR != 0) return ERROR;
+        change = before.user().effective != after.user().effective || before.group().effective != after.group().effective;
+        if (change && !prepared.admission().owns(task) && !prepared.admission().begin(task)) return -EAGAIN;
+    }
+    // Siblings may be unwinding syscalls that need the VM/action locks.
+    if (change && !prepared.admission().quiesce(task)) return -EAGAIN;
+    return 0;
+}
+
+// The subject is the current executor. This is image publication only: no
+// CR3/TLS activation, sibling retirement, descriptor close, or user return.
+// An asynchronous owner handoff also requires executor quiescence and tracked
+// cancellation/fatal-exit ownership; prepared storage alone is insufficient.
+auto commit_native_exec_image(ker::mod::sched::task::Task* task, PreparedNativeExecImage& prepared) -> int {
+    using namespace ker::mod;
+    auto const& image = prepared.view();
+    auto& retired = prepared.retired();
+    auto& exec_admission = prepared.admission();
+    bool commit_published = false;
+    int credential_error = 0;
+    // Same lock order as sigaction's potentially faulting output copy.
+    mod::sys::MutexGuard action_guard(task->signal_action_mutex());
+    // Prevent a new CLONE_VM/thread publisher from appearing between the
+    // sibling snapshot and the root swap. Existing siblings keep the old
+    // address space alive; exec must never tear a shared root out from
+    // under their execution or stable usercopy pins.
+    ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+    retired.pagemap_has_other_publishers = mod::sched::task_has_live_pagemap_sibling(task);
+    security::Snapshot before_credentials;
+    security::Snapshot after_credentials;
+    credential_error = sched::resource::prepare_exec_credentials(*task,
+                                                                 {.uid = image.stat.st_uid,
+                                                                  .gid = image.stat.st_gid,
+                                                                  .set_uid = (image.stat.st_mode & 04000) != 0,
+                                                                  .set_gid = (image.stat.st_mode & 02000) != 0,
+                                                                  .nosuid = image.nosuid,
+                                                                  .traced = task->ptrace_traced,
+                                                                  .mode = image.stat.st_mode},
+                                                                 before_credentials, after_credentials, &image.admitted_credentials);
+    // The loader must see the same credentials that commit publishes. Tracing
+    // can change set-ID suppression while the private stack is being built.
+    if (credential_error == 0 && after_credentials != image.stack_credentials) credential_error = -EAGAIN;
+    // Live credential-owner executors must remain in safe waits. Retained
+    // non-CPU Task refs and separate CLONE_VM credential stores do not gain IDs.
+    if (credential_error == 0 &&
+        (task->is_thread || (task->resource_cpu_threads.load(std::memory_order_acquire) != 0 && !exec_admission.quiesced(*task))) &&
+        (before_credentials.user().effective != after_credentials.user().effective ||
+         before_credentials.group().effective != after_credentials.group().effective)) {
+        credential_error = -EAGAIN;
+    }
+    if (credential_error == 0 && !exec_admission.owns(*task) && !exec_admission.begin(*task)) {
+        credential_error = -EAGAIN;
+    }
+    if (credential_error == 0) {
+        commit_published = loader::debug::publish_staged_process(image.debug_staging_pid, task->pid, image.name);
+    }
+    if (commit_published) {
+        retired.elf_buffer = task->elf_buffer;
+        retired.exec_image_file = task->exec_image_file;
+        retired.thread = task->thread;
+        task->mark_exec_completed();
+        task->entry = image.entry;
+        task->program_header_addr = image.program_header_addr;
+        task->elf_header_addr = image.elf_header_addr;
+        task->image_load_base = image.image_load_base;
+        task->image_vaddr_start = image.image_vaddr_start;
+        task->image_vaddr_end = image.image_vaddr_end;
+        task->program_header_count = image.program_header_count;
+        task->program_header_ent_size = image.program_header_ent_size;
+        task->elf_buffer = image.elf_buffer;
+        task->elf_buffer_size = image.elf_buffer_size;
+        task->is_elf_buffer_shared = false;
+        task->elf_buffer_complete = image.elf_buffer_complete;
+        task->exec_image_file = image.exec_image_file;
+        task->exec_image_size = image.exec_image_size;
+        task->interp_base = image.interp_base;
+        task->interp_vaddr_start = image.interp_vaddr_start;
+        task->interp_vaddr_end = image.interp_vaddr_end;
+        task->at_random_addr = image.at_random_addr;
+        task->mmap_next.store(image.mmap_next, std::memory_order_relaxed);
+
+        size_t path_len = std::strlen(image.path);
+        if (path_len >= sched::task::Task::EXE_PATH_MAX) {
+            path_len = sched::task::Task::EXE_PATH_MAX - 1;
+        }
+        {
+            uint64_t const PATH_IRQF = task->path_metadata_lock.lock_irqsave();
+            task->exe_path.fill('\0');
+            std::memcpy(task->exe_path.data(), image.path, path_len);
+            retired.name = task->name;
+            task->name = std::exchange(image.name, nullptr);
+
+            int const PUBLISH_RESULT = sched::resource::publish_exec_credentials(*task, before_credentials, after_credentials);
+            // Local placement is only a proposal until the image commits. Apply
+            // the preparing actor's one-shot choice to the canonical payload,
+            // including worker exec; every earlier refusal preserves routing.
+            if (PUBLISH_RESULT == 0 && image.one_shot_wki_target) pin_completed_exec_locally(*task);
+            task->path_metadata_lock.unlock_irqrestore(PATH_IRQF);
+            if (PUBLISH_RESULT != 0) {
+                dbg::panic_handler("exec credential publication changed under the VM publication guard");
+                hcf();
+            }
+        }
+
+        task->context.frame.rip = image.initial_rip;
+        task->context.frame.rsp = image.initial_rsp;
+        task->context.frame.ss = 0x1b;
+        task->context.frame.cs = 0x23;
+        task->context.frame.flags = 0x202;
+        task->context.frame.int_num = 0;
+        task->context.frame.err_code = 0;
+        ker::mod::sys::context_switch::record_saved_frame_class(task, task->context.frame,
+                                                                ker::mod::sched::task::SavedFrameOrigin::SYNTHETIC_USER_RETURN);
+
+        // Match the fresh-process entry contract used by wos_asm_enter_usermode:
+        // startup code consumes argc/argv/envp from the initial stack, not GPRs.
+        task->context.regs = image.registers;
+
+        retired.pagemap = task->replace_pagemap_after_usercopy_quiescence(image.pagemap);
+        task->thread = image.thread;
+        mod::sched::threading::record_stack_usage(*task);
+        swap_exec_lazy_ranges(task, image.lazy_ranges, retired.lazy_ranges);
+        // The Task owns every new-image resource before commit locks release.
+        // Exit recovery may remove the wrapper but must never discard this image.
+        prepared.release_after_commit();
+        (void)mod::sched::resource::observe_address_space(*task);
+    }
+    if (commit_published) {
+        return 0;
+    }
+    return credential_error != 0 ? credential_error : -EIO;
+}
+
 auto read_file_range_fully(vfs::File* fd, uint8_t* dst, size_t file_size, uint64_t offset, uint64_t size, const char* path,
                            size_t& bytes_read) -> int {
     if (dst == nullptr || !exec_range_in_file(file_size, offset, size)) {
@@ -1393,7 +2324,17 @@ auto parse_shebang_line(const uint8_t* file_data, size_t file_size, ShebangInfo*
 
 template <typename ExecFn>
 auto exec_shebang_script(const char* script_path, const char* const* argv, const char* const* envp, size_t argv_count,
-                         const ShebangInfo& shebang, int shebang_depth, ExecFn exec_fn) -> uint64_t {
+                         const ShebangInfo& shebang, int shebang_depth, ExecFn exec_fn, ExecRequestArguments* request = nullptr)
+    -> uint64_t {
+    if (request != nullptr) {
+        const char* interpreter = nullptr;
+        const char** forwarded = nullptr;
+        int const RESULT = request->prepare_shebang(script_path, argv, argv_count, shebang, shebang_depth, interpreter, forwarded);
+        if (RESULT < 0) return static_cast<uint64_t>(RESULT);
+        // The recursive native commit can destroy request before returning.
+        // Nothing in this frame may dereference it or free forwarded afterward.
+        return exec_fn(interpreter, forwarded, envp, shebang_depth + 1);
+    }
     size_t const FORWARDED_ARGS = argv_count > 0 ? (argv_count - 1) : 0;
     size_t const NEW_ARGC = 2 + FORWARDED_ARGS + (shebang.has_argument ? 1 : 0);
     auto** shebang_argv = new const char*[NEW_ARGC + 1];
@@ -1420,6 +2361,404 @@ auto exec_shebang_script(const char* script_path, const char* const* argv, const
 }  // namespace
 
 #ifdef WOS_SELFTEST
+namespace {
+auto make_exec_selftest_owned_image(bool& consumed) -> std::unique_ptr<PreparedNativeExecImage> {
+    std::unique_ptr<PreparedNativeExecImage> prepared;
+    {
+        auto* file = exec_selftest_make_file();
+        auto* buffer = new (std::nothrow) uint8_t[8]{};
+        char* name = new (std::nothrow) char[8]{};
+        if (file == nullptr || buffer == nullptr || name == nullptr) {
+            if (file != nullptr) vfs::vfs_put_file(file);
+            delete[] buffer;
+            delete[] name;
+            return nullptr;
+        }
+        std::memcpy(name, "owned", 6);
+        std::array<char, EXEC_PATH_MAX> path{};
+        std::memcpy(path.data(), "/owned/image", 13);
+        ker::mod::cpu::GPRegs registers{};
+        registers.rdi = 0x123456;
+        vfs::Stat stat{};
+        stat.st_uid = 37;
+        LazyVmemRangeVec ranges;
+        LazyVmemRange range{};
+        range.kind = LazyVmemKind::FILE_BACKED;
+        range.file = file;
+        if (!ranges.push_back(range)) {
+            vfs::vfs_put_file(file);
+            delete[] buffer;
+            delete[] name;
+            return nullptr;
+        }
+        vfs::vfs_retain_file(file);
+        NativeExecImage const IMAGE{
+            .entry = 0,
+            .program_header_addr = 0,
+            .elf_header_addr = 0,
+            .image_load_base = 0,
+            .image_vaddr_start = 0,
+            .image_vaddr_end = 0,
+            .program_header_count = 0,
+            .program_header_ent_size = 0,
+            .elf_buffer = buffer,
+            .elf_buffer_size = 8,
+            .elf_buffer_complete = true,
+            .exec_image_file = file,
+            .exec_image_size = 8,
+            .interp_base = 0,
+            .interp_vaddr_start = 0,
+            .interp_vaddr_end = 0,
+            .at_random_addr = 0,
+            .mmap_next = 0,
+            .name = name,
+            .path = path.data(),
+            .debug_staging_pid = 0,
+            .initial_rip = 0,
+            .initial_rsp = 0,
+            .registers = registers,
+            .pagemap = nullptr,
+            .thread = nullptr,
+            .lazy_ranges = ranges,
+            .stat = stat,
+            .nosuid = true,
+            .admitted_credentials = ker::mod::security::Snapshot::bootstrap_root(),
+        };
+        prepared.reset(new (std::nothrow) PreparedNativeExecImage(IMAGE, 0x7B60));
+        if (!prepared) {
+            release_lazy_file_refs(ranges);
+            vfs::vfs_put_file(file);
+            delete[] buffer;
+            delete[] name;
+            return nullptr;
+        }
+        consumed = name == nullptr && ranges.empty();
+        // Destroy/overwrite all borrowed staging metadata before inspection.
+        path.fill('x');
+        registers.rdi = 0;
+        stat.st_uid = 0;
+    }
+    return prepared;
+}
+}  // namespace
+
+namespace {
+ker::mod::sched::task::Task exec_arguments_selftest_owner;  // NOLINT
+ker::mod::sched::task::Task exec_handoff_selftest_worker;   // NOLINT
+}  // namespace
+
+auto exec_selftest_request_arguments_recover_partial_and_recursive_storage() -> bool {
+    auto& owner = exec_arguments_selftest_owner;
+    owner.state.store(ker::mod::sched::task::TaskState::ACTIVE);
+    owner.exit_in_progress.store(false);
+    owner.has_exited = false;
+    uint32_t destructions = 0;
+    std::unique_ptr<ExecRequestArguments> pending(new (std::nothrow) ExecRequestArguments);
+    std::unique_ptr<ExecRequestArguments> rejected(new (std::nothrow) ExecRequestArguments);
+    if (!pending || !rejected) return false;
+    pending->selftest_destructions = &destructions;
+    auto* arguments = pending.get();
+    if (!adopt_exec_arguments(owner, pending)) return false;
+    bool ok = !pending && owner.owned_exec_arguments.load() == arguments && !adopt_exec_arguments(owner, rejected) && rejected != nullptr;
+    auto& snapshot = arguments->snapshot;
+    snapshot.argv = new (std::nothrow) const char*[3]{};
+    snapshot.envp = new (std::nothrow) const char*[1]{};
+    snapshot.strings = new (std::nothrow) char[16]{};
+    if (!snapshot.argv || !snapshot.envp || !snapshot.strings) {
+        cleanup_exec_preparation(owner);
+        return false;
+    }
+    std::memcpy(snapshot.strings, "tail", 5);
+    snapshot.argv[0] = snapshot.path.data();
+    snapshot.argv[1] = snapshot.strings;
+    for (uint64_t i = 0; i < 40; ++i) ok &= snapshot.input_string_addrs.push_back(i + 1);
+    const char* interpreter = nullptr;
+    const char** forwarded = nullptr;
+    {
+        ShebangInfo shebang{};
+        std::memcpy(shebang.interpreter.data(), "/interp", 8);
+        std::memcpy(shebang.argument.data(), "option", 7);
+        shebang.has_argument = true;
+        std::array<char, EXEC_PATH_MAX> script{};
+        std::memcpy(script.data(), "/script", 8);
+        ok &= arguments->prepare_shebang(script.data(), snapshot.argv, 2, shebang, 0, interpreter, forwarded) == 0;
+        shebang.interpreter.fill('x');
+        shebang.argument.fill('x');
+        script.fill('x');
+    }
+    ok &= interpreter != nullptr && std::strcmp(interpreter, "/interp") == 0 && forwarded != nullptr;
+    if (forwarded != nullptr) {
+        ok &= std::strcmp(forwarded[0], "/interp") == 0 && std::strcmp(forwarded[1], "option") == 0 &&
+              std::strcmp(forwarded[2], "/script") == 0 && std::strcmp(forwarded[3], "tail") == 0 && forwarded[4] == nullptr;
+    }
+    owner.process_exit_requested.store(true);
+    owner.exec_preparation_teardown_in_progress.store(true);
+    cleanup_exec_preparation(owner);
+    ok &= destructions == 0 && owner.owned_exec_arguments.load() == arguments && !adopt_exec_arguments(owner, rejected);
+    owner.exec_preparation_teardown_in_progress.store(false);
+    ShebangInfo nested{};
+    std::memcpy(nested.interpreter.data(), "/nested", 8);
+    bool called = false;
+    if (forwarded != nullptr) {
+        uint64_t const RESULT = exec_shebang_script(
+            "/outer", forwarded, snapshot.envp, 4, nested, 1,
+            [&owner, &called](const char* path, const char* const* argv, const char* const*, int depth) -> uint64_t {
+                called = depth == 2 && std::strcmp(path, "/nested") == 0 && std::strcmp(argv[1], "/outer") == 0 &&
+                         std::strcmp(argv[2], "option") == 0 && std::strcmp(argv[3], "/script") == 0 && std::strcmp(argv[4], "tail") == 0 &&
+                         argv[5] == nullptr;
+                cleanup_exec_preparation(owner);
+                return 42;
+            },
+            arguments);
+        ok &= RESULT == 42 && called;
+    }
+    cleanup_exec_preparation(owner);
+    ok &= destructions == 1 && owner.owned_exec_arguments.load() == nullptr && owner.process_exit_requested.load();
+    // Recover an incomplete second snapshot, including a spilled input-address
+    // vector, without ever constructing a native image or env/string storage.
+    rejected->selftest_destructions = &destructions;
+    arguments = rejected.get();
+    if (!adopt_exec_arguments(owner, rejected)) return false;
+    arguments->snapshot.argv = new (std::nothrow) const char*[2]{};
+    ok &= arguments->snapshot.argv != nullptr;
+    for (uint64_t i = 0; i < 40; ++i) ok &= arguments->snapshot.input_string_addrs.push_back(i + 1);
+    cleanup_exec_preparation(owner);
+    cleanup_exec_preparation(owner);
+    ok &= destructions == 2 && !owner.owned_exec_arguments.load() && !owner.exec_preparation_teardown_in_progress.load();
+    owner.process_exit_requested.store(false);
+    return ok;
+}
+
+auto exec_selftest_request_scratch_preserves_transferred_metadata() -> bool {
+    auto& owner = exec_arguments_selftest_owner;
+    owner.state.store(ker::mod::sched::task::TaskState::ACTIVE);
+    owner.exit_in_progress.store(false);
+    owner.has_exited = false;
+    uint32_t destructions = 0;
+    std::unique_ptr<ExecRequestArguments> pending(new (std::nothrow) ExecRequestArguments);
+    if (!pending) return false;
+    pending->selftest_destructions = &destructions;
+    auto* request = pending.get();
+    if (!adopt_exec_arguments(owner, pending)) return false;
+    bool ok = request->native_scratch(-1) == nullptr && request->native_scratch(MAX_SHEBANG_DEPTH + 1) == nullptr;
+    for (int depth = 0; depth <= MAX_SHEBANG_DEPTH; ++depth) {
+        auto* scratch = request->native_scratch(depth);
+        auto& elf = scratch->prepared_elf;
+        elf.program_headers = new (std::nothrow) Elf64_Phdr[2]{};
+        elf.section_headers = new (std::nothrow) Elf64_Shdr[2]{};
+        elf.section_names = new (std::nothrow) char[16]{};
+        elf.task_metadata = new (std::nothrow) uint8_t[64]{};
+        scratch->argv_addrs = new (std::nothrow) uint64_t[40]{};
+        // The first frame deliberately has a partially built address vector pair.
+        if (depth != 0) scratch->envp_addrs = new (std::nothrow) uint64_t[40]{};
+        if (!elf.program_headers || !elf.section_headers || !elf.section_names || !elf.task_metadata || !scratch->argv_addrs ||
+            (depth != 0 && !scratch->envp_addrs)) {
+            cleanup_exec_preparation(owner);
+            return false;
+        }
+        elf.task_metadata[0] = static_cast<uint8_t>(depth + 1);
+        elf.view.program_headers = elf.program_headers;
+        elf.view.read_context = &elf.read_context;
+        for (uint64_t index = 0; index < 40; ++index) {
+            loader::elf::ElfLazyLoadRange const RANGE{.vaddr = index + static_cast<uint64_t>(depth) * 100};
+            ok &= scratch->main_lazy_ranges.push_back(RANGE);
+            ok &= scratch->interp_lazy_ranges.push_back(RANGE);
+        }
+        if (depth != 0) ok &= scratch != request->native_scratch(depth - 1);
+    }
+    for (int depth = 0; depth <= MAX_SHEBANG_DEPTH; ++depth) {
+        auto* scratch = request->native_scratch(depth);
+        auto const& elf = scratch->prepared_elf;
+        ok &= elf.task_metadata[0] == depth + 1 && elf.view.program_headers == elf.program_headers &&
+              elf.view.read_context == &elf.read_context && scratch->main_lazy_ranges.size() == 40 &&
+              scratch->interp_lazy_ranges.size() == 40;
+    }
+    auto& transferred = request->native_scratch(MAX_SHEBANG_DEPTH)->prepared_elf;
+    std::unique_ptr<uint8_t[]> image_metadata(transferred.take_task_metadata());
+    ok &= transferred.task_metadata == nullptr;
+    owner.exec_preparation_teardown_in_progress.store(true);
+    cleanup_exec_preparation(owner);
+    ok &= destructions == 0 && owner.owned_exec_arguments.load() == request;
+    owner.exec_preparation_teardown_in_progress.store(false);
+    cleanup_exec_preparation(owner);
+    cleanup_exec_preparation(owner);
+    return ok && destructions == 1 && owner.owned_exec_arguments.load() == nullptr && !owner.exec_preparation_teardown_in_progress.load() &&
+           image_metadata[0] == MAX_SHEBANG_DEPTH + 1;
+}
+
+auto exec_selftest_worker_handoff_claim_and_cancel() -> bool {
+    auto& owner = exec_arguments_selftest_owner;
+    auto& worker = exec_handoff_selftest_worker;
+    owner.state.store(ker::mod::sched::task::TaskState::ACTIVE);
+    worker.state.store(ker::mod::sched::task::TaskState::ACTIVE);
+    owner.exit_in_progress.store(false);
+    worker.exit_in_progress.store(false);
+    owner.has_exited = worker.has_exited = false;
+    owner.resource_cpu_admission_closed = false;
+    g_exec_selftest_close_count.store(0);
+    bool consumed = false;
+    bool ok = true;
+    for (bool const CLAIM : {false, true}) {
+        auto image = make_exec_selftest_owned_image(consumed);
+        if (!image) return false;
+        auto* raw = image.get();
+        if (!image->admission().begin(owner)) return false;
+        ok &= image->admission().owns(owner) && !image->admission().owns(worker) &&
+              !ker::mod::sched::resource::close_idle_thread_cpu_admission(owner);
+        if (!adopt_exec_preparation(worker, image)) return false;
+        WorkerExecHandoff handoff;
+        handoff.worker = &worker;
+        owner.pending_exec_handoff.store(&handoff);
+        if (CLAIM) {
+            ok &= claim_pending_exec_handoff(owner) == &handoff && !worker.owned_exec_preparation.load() &&
+                  owner.owned_exec_preparation.load() == raw && owner.active_exec_handoff.load() == &handoff &&
+                  !owner.pending_exec_handoff.load();
+        }
+        cancel_pending_exec_handoff(owner);
+        ok &= handoff.result.load() == -ECANCELED && !owner.pending_exec_handoff.load() && !owner.active_exec_handoff.load();
+        // Pending cancellation keeps worker ownership; claimed cancellation
+        // keeps owner ownership. Exit cleans only the corresponding Task slot.
+        ok &= (CLAIM ? owner.owned_exec_preparation.load() : worker.owned_exec_preparation.load()) == raw;
+        cleanup_exec_preparation(owner);
+        cleanup_exec_preparation(worker);
+        ok &= !owner.resource_exec_admission_closed;
+    }
+    ok &= g_exec_selftest_close_count.load() == 2 && ker::mod::sched::resource::close_idle_thread_cpu_admission(owner);
+    owner.resource_cpu_admission_closed = false;
+    return ok;
+}
+
+auto exec_selftest_owned_image_outlives_staging_and_discards_once() -> bool {
+    g_exec_selftest_close_count.store(0, std::memory_order_relaxed);
+    bool consumed = false;
+    auto prepared = make_exec_selftest_owned_image(consumed);
+    if (!prepared) return false;
+    auto const& IMAGE = prepared->view();
+    bool const SNAPSHOT_OK = consumed && std::strcmp(IMAGE.path, "/owned/image") == 0 && std::strcmp(IMAGE.name, "owned") == 0 &&
+                             IMAGE.registers.rdi == 0x123456 && IMAGE.stat.st_uid == 37 && IMAGE.lazy_ranges.size() == 1 &&
+                             IMAGE.exec_image_file->refcount.load() == 2 && IMAGE.nosuid &&
+                             IMAGE.admitted_credentials == ker::mod::security::Snapshot::bootstrap_root();
+    prepared->discard();
+    prepared->discard();
+    prepared.reset();
+    return SNAPSHOT_OK && g_exec_selftest_close_count.load(std::memory_order_relaxed) == 1;
+}
+
+auto exec_selftest_tracked_image_cleanup_is_reentrant_and_exclusive() -> bool {
+    g_exec_selftest_close_count.store(0, std::memory_order_relaxed);
+    bool consumed = false;
+    auto first = make_exec_selftest_owned_image(consumed);
+    auto second = make_exec_selftest_owned_image(consumed);
+    if (!first || !second) return false;
+    ker::mod::sched::task::Task owner{};
+    auto* const FIRST = first.get();
+    auto* const SECOND = second.get();
+    bool ok = adopt_exec_preparation(owner, first) && !first && owner.owned_exec_preparation.load() == FIRST;
+    ok = !adopt_exec_preparation(owner, second) && second.get() == SECOND && owner.owned_exec_preparation.load() == FIRST && ok;
+    owner.process_exit_requested.store(true, std::memory_order_release);
+    g_exec_selftest_cleanup_observed = false;
+    g_exec_selftest_cleanup_owner = &owner;
+    cleanup_exec_preparation(owner);
+    g_exec_selftest_cleanup_owner = nullptr;
+    ok = g_exec_selftest_cleanup_observed && !owner.owned_exec_preparation.load() && !owner.exec_preparation_teardown_in_progress.load() &&
+         g_exec_selftest_close_count.load() == 1 && ok;
+    cleanup_exec_preparation(owner);
+    ok = g_exec_selftest_close_count.load() == 1 && ok;
+    owner.exit_in_progress.store(true, std::memory_order_release);
+    ok = !adopt_exec_preparation(owner, second) && second.get() == SECOND && ok;
+    owner.exit_in_progress.store(false, std::memory_order_release);
+    owner.exec_preparation_teardown_in_progress.store(true, std::memory_order_release);
+    ok = !adopt_exec_preparation(owner, second) && second.get() == SECOND && ok;
+    owner.exec_preparation_teardown_in_progress.store(false, std::memory_order_release);
+    ok = adopt_exec_preparation(owner, second) && !second && ok;
+    cleanup_exec_preparation(owner);
+    cleanup_exec_preparation(owner);
+    return ok && !owner.owned_exec_preparation.load() && !owner.exec_preparation_teardown_in_progress.load() &&
+           owner.process_exit_requested.load() && g_exec_selftest_close_count.load() == 2;
+}
+
+auto exec_selftest_transaction_recovers_admission_and_retired_storage() -> bool {
+    namespace resource = ker::mod::sched::resource;
+    using ker::mod::sched::task::Task;
+    g_exec_selftest_close_count.store(0, std::memory_order_relaxed);
+    Task process{};
+    process.pid = 0x7B63;
+    Task worker{};
+    worker.is_thread = true;
+    worker.owner_pid = process.pid;
+    if (!resource::bind_thread_owner(worker, process)) {
+        return false;
+    }
+    bool consumed = false;
+    auto aborted = make_exec_selftest_owned_image(consumed);
+    if (!aborted) {
+        return false;
+    }
+    auto* const ABORTED = aborted.get();
+    if (!adopt_exec_preparation(worker, aborted)) {
+        return false;
+    }
+    bool ok = ABORTED->admission().begin(worker) && process.resource_exec_admission_closed;
+    worker.exit_in_progress.store(true, std::memory_order_release);
+    cleanup_exec_preparation(worker);
+    cleanup_exec_preparation(worker);
+    ok = !process.resource_exec_admission_closed && !worker.owned_exec_preparation.load() && g_exec_selftest_close_count.load() == 1 && ok;
+    worker.exit_in_progress.store(false, std::memory_order_release);
+    {
+        Task fresh{};
+        fresh.is_thread = true;
+        fresh.owner_pid = process.pid;
+        ok = resource::bind_thread_owner(fresh, process) && ok;
+    }
+
+    auto transaction = make_exec_selftest_owned_image(consumed);
+    auto old_image = make_exec_selftest_owned_image(consumed);
+    if (!transaction || !old_image) {
+        return false;
+    }
+    // Transfer the replacement resources to an independent image owner, as
+    // publication does to Task. Only the detached old resources may be freed.
+    std::unique_ptr<PreparedNativeExecImage> published(new (std::nothrow) PreparedNativeExecImage(transaction->view(), process.pid));
+    if (!published) {
+        return false;
+    }
+    transaction->release_after_commit();
+    transaction->mark_activated();
+    auto& retired = transaction->retired();
+    auto const& OLD = old_image->view();
+    retired.name = std::exchange(OLD.name, nullptr);
+    retired.elf_buffer = OLD.elf_buffer;
+    retired.exec_image_file = OLD.exec_image_file;
+    retired.lazy_ranges = std::move(OLD.lazy_ranges);
+    old_image->release_after_commit();
+    old_image->mark_activated();
+    old_image.reset();
+    auto* const TRANSACTION = transaction.get();
+    if (!adopt_exec_preparation(worker, transaction)) {
+        return false;
+    }
+    ok = TRANSACTION->admission().begin(worker) && ok;
+    ok = resource::close_thread_cpu_admission(worker) && ok;
+    worker.exit_in_progress.store(true, std::memory_order_release);
+    worker.process_exit_requested.store(true, std::memory_order_release);
+    g_exec_selftest_cleanup_observed = false;
+    g_exec_selftest_expect_admission_closed = true;
+    g_exec_selftest_cleanup_owner = &worker;
+    cleanup_exec_preparation(worker);
+    g_exec_selftest_cleanup_owner = nullptr;
+    g_exec_selftest_expect_admission_closed = false;
+    ok = g_exec_selftest_cleanup_observed && !worker.owned_exec_preparation.load() &&
+         !worker.exec_preparation_teardown_in_progress.load() && !process.resource_exec_admission_closed &&
+         process.resource_cpu_admission_closed && worker.process_exit_requested.load() && g_exec_selftest_close_count.load() == 2 && ok;
+    auto const& IMAGE = published->view();
+    ok = IMAGE.exec_image_file->refcount.load() == 2 && IMAGE.elf_buffer_size == 8 && std::strcmp(IMAGE.name, "owned") == 0 &&
+         IMAGE.lazy_ranges.size() == 1 && ok;
+    cleanup_exec_preparation(worker);
+    ok = g_exec_selftest_close_count.load() == 2 && ok;
+    published.reset();
+    return ok && g_exec_selftest_close_count.load() == 3;
+}
+
 auto exec_selftest_fd_clone_skips_cloexec_and_rolls_back_failure() -> bool {
     ker::mod::sched::task::Task parent{};
     ker::mod::sched::task::Task child{};
@@ -1483,11 +2822,14 @@ auto exec_selftest_stdio_insert_failure_closes_file() -> bool {
 
 auto exec_selftest_cloexec_snapshot_collects_marked_fds() -> bool {
     ker::mod::sched::task::Task task{};
+    task.pid = 0x7B90;
     ker::vfs::File fd0{};
     ker::vfs::File fd1{};
+    ker::vfs::File fd2{};
     ker::vfs::File fd255{};
 
-    bool ok = task.fd_table.insert(0, &fd0) && task.fd_table.insert(1, &fd1) && task.fd_table.insert(255, &fd255);
+    bool ok = task.fd_table.insert(0, &fd0) && task.fd_table.insert(1, &fd1) && task.fd_table.insert(2, &fd2) &&
+              task.fd_table.insert(255, &fd255);
     task.set_fd_cloexec(0);
     task.set_fd_cloexec(255);
 
@@ -1500,8 +2842,30 @@ auto exec_selftest_cloexec_snapshot_collects_marked_fds() -> bool {
         saw255 = saw255 || fixed_slot(snapshot, i) == 255;
     }
 
+    ker::mod::sched::task::Task worker{};
+    worker.is_thread = true;
+    worker.pid = task.pid + 1;
+    worker.owner_pid = task.pid;
+    ok &= collect_cloexec_fds_locked(&worker, snapshot) == 0 && !ensure_exec_stdio_fallbacks(&worker);
+    ok &= ker::mod::sched::resource::bind_thread_owner(worker, task);
+    // Poison the obsolete per-thread table/bitmap. Exec must use only the
+    // retained owner, including after the main thread has retired.
+    ok &= worker.fd_table.insert(7, &fd1);
+    worker.set_fd_cloexec(7);
+    task.main_thread_retired.store(true);
+    size_t const WORKER_COUNT = collect_cloexec_fds_locked(&worker, snapshot);
+    bool worker_saw0 = false;
+    bool worker_saw255 = false;
+    for (size_t i = 0; i < WORKER_COUNT; ++i) {
+        worker_saw0 |= fixed_slot(snapshot, i) == 0;
+        worker_saw255 |= fixed_slot(snapshot, i) == 255;
+    }
+    ok &= WORKER_COUNT == 2 && worker_saw0 && worker_saw255 && ensure_exec_stdio_fallbacks(&worker) && worker.fd_table.size() == 1;
+    worker.fd_table.remove(7);
+
     task.fd_table.remove(0);
     task.fd_table.remove(1);
+    task.fd_table.remove(2);
     task.fd_table.remove(255);
     return ok && COUNT == 2 && saw0 && saw255;
 }
@@ -1534,16 +2898,119 @@ auto exec_selftest_spawn_dup2_consumes_cloexec_source() -> bool {
         .actions = &action,
         .action_count = 1,
     };
+    options.pgroup = 0x7fffffff;
+    int error = 0;
+    ok = ok && !apply_spawn_options(&child, &options, &error) && error == -EPERM && child.fd_table.lookup(DESTINATION_FD) == &displaced &&
+         child.fd_table.lookup(SOURCE_FD) == &source && child.get_fd_cloexec(SOURCE_FD) &&
+         source.refcount.load(std::memory_order_relaxed) == 2;
+    options.pgroup = 0;
+    options.flags = 0;
+    auto const BEFORE = child.credentials();
+    action.srcfd = 31;
+    ok &= !apply_spawn_options(&child, &options, &error) && error == -EBADF && child.fd_table.lookup(DESTINATION_FD) == &displaced &&
+          child.get_fd_cloexec(SOURCE_FD) && source.refcount.load(std::memory_order_relaxed) == 2 &&
+          displaced.refcount.load(std::memory_order_relaxed) == 2;
+    action.fd = 31;
+    ok &= !apply_spawn_options(&child, &options, &error) && error == -EBADF && child.fd_table.size() == 2;
+    action.srcfd = SOURCE_FD;
+    constexpr unsigned NOFILE = static_cast<unsigned>(ker::abi::resource::Id::NOFILE);
+    if (child.resources.set(NOFILE, {16, 16}, true, 256) != 0) ok = false;
+    ok &= !apply_spawn_options(&child, &options, &error) && error == -EBADF && child.fd_table.size() == 2;
+    // Same-descriptor actions preserve inherited handles above a lowered limit,
+    // but clear CLOEXEC as posix_spawn DUP2 requires.
+    if (child.resources.set(NOFILE, {4, 16}, true, 256) != 0) ok = false;
+    action.fd = SOURCE_FD;
+    ok &= apply_spawn_options(&child, &options, &error) && error == 0 && !child.get_fd_cloexec(SOURCE_FD) &&
+          source.refcount.load(std::memory_order_relaxed) == 2;
+    child.set_fd_cloexec(SOURCE_FD);
+    int reservation_owner{};
+    uint64_t const RESERVED = child.fd_table.reserve(2, 4, &reservation_owner);
+    action.fd = 2;
+    ok &= RESERVED == 2 && !apply_spawn_options(&child, &options, &error) && error == -EBUSY && child.fd_table.lookup(2) == nullptr &&
+          child.fd_table.reserved(2) && child.get_fd_cloexec(SOURCE_FD) && source.refcount.load(std::memory_order_relaxed) == 2;
+    ok &= child.fd_table.cancel(RESERVED, &reservation_owner);
+    action.fd = DESTINATION_FD;
+    ok &= child.credentials() == BEFORE && child.fd_table.reserved_count() == 0;
+    options.flags = ker::abi::process::SPAWN_FLAG_SETPGROUP;
     ok = ok && apply_spawn_options(&child, &options);
     close_spawn_cloexec_fds(&child);
     ok = ok && child.fd_table.lookup(SOURCE_FD) == nullptr && child.fd_table.lookup(DESTINATION_FD) == &source &&
-         !child.get_fd_cloexec(DESTINATION_FD) && child.pgid == child.pid && source.refcount.load(std::memory_order_relaxed) == 2 &&
-         displaced.refcount.load(std::memory_order_relaxed) == 1;
+         !child.get_fd_cloexec(DESTINATION_FD) && child.job_identity().pgid == child.pid &&
+         source.refcount.load(std::memory_order_relaxed) == 2 && displaced.refcount.load(std::memory_order_relaxed) == 1;
 
     release_task_fd_table_files(&child);
     ok = ok && source.refcount.load(std::memory_order_relaxed) == 1;
     parent.fd_table.remove(SOURCE_FD);
     parent.fd_table.remove(DESTINATION_FD);
+    return ok;
+}
+
+auto exec_selftest_spawn_open_uses_private_child_authority() -> bool {
+    using namespace ker::mod;
+    constexpr const char* DIR = "/tmp/ktest_spawn_open";
+    constexpr const char* PATH = "/tmp/ktest_spawn_open/file";
+    sched::task::Task child{};
+    child.pid = 0x7B91;
+    std::strcpy(child.root.data(), "/");
+    std::strcpy(child.cwd.data(), DIR);
+    struct Cleanup {
+        sched::task::Task& task;
+        vfs::File* source{};
+        ~Cleanup() {
+            release_task_fd_table_files(&task);
+            if (source) vfs::vfs_put_file(source);
+            vfs::vfs_unlink("/tmp/ktest_spawn_open/file");
+            vfs::vfs_rmdir("/tmp/ktest_spawn_open/private");
+            vfs::vfs_rmdir("/tmp/ktest_spawn_open");
+        }
+    } cleanup{child};
+    vfs::vfs_mkdir("/tmp", 0755);
+    if (vfs::vfs_mkdir(DIR, 0755) != 0 || vfs::vfs_mkdir("/tmp/ktest_spawn_open/private", 0700) != 0) return false;
+    cleanup.source = vfs::vfs_open_file(PATH, vfs::O_CREAT | vfs::O_EXCL | 2, 0600);
+    if (!cleanup.source) return false;
+    auto user = security::Snapshot::bootstrap_root();
+    if (user.prepare({.change = security::Change::SET_UID, .real = 1000}, user) != 0 ||
+        sched::resource::initialize_credentials(child, user) != 0)
+        return false;
+    ker::abi::process::SpawnFdAction action{.type = static_cast<uint32_t>(ker::abi::process::SpawnFdActionType::OPEN),
+                                            .fd = 8,
+                                            .oflag = vfs::O_LOCAL | vfs::O_TRUNC | 1,
+                                            .path = "file"};
+    bool ok = spawn_open_fd(&child, action) == -EACCES && child.fd_table.empty();
+    if (vfs::vfs_chmod(PATH, 0666) != 0) return false;
+    action.path = "private/../file";
+    ok &= spawn_open_fd(&child, action) == -EACCES && child.fd_table.empty();
+    action.path = "file";
+    action.oflag = vfs::O_LOCAL | vfs::O_CLOEXEC;
+    ok &=
+        spawn_open_fd(&child, action) == 0 && child.fd_table.size() == 1 && child.fd_table.lookup(8) != nullptr && child.get_fd_cloexec(8);
+    action.fd = 9;
+    action.path = "/proc/self/fd/8";
+    action.oflag = vfs::O_LOCAL;
+    ok &= spawn_open_fd(&child, action) == 0 && child.fd_table.lookup(9) == child.fd_table.lookup(8);
+    spawn_close_fd(&child, 9);
+    close_spawn_cloexec_fds(&child);
+    ok &= child.fd_table.empty() && child.credentials() == user;
+    ok &= spawn_open_fd(&child, action) == -ENOENT && child.fd_table.empty();
+    action.path = "file";
+    // Full table replacement must reserve the destination released by OPEN,
+    // rather than fail after a successful create/truncate needing another slot.
+    constexpr unsigned NOFILE = static_cast<unsigned>(ker::abi::resource::Id::NOFILE);
+    if (child.resources.set(NOFILE, {4, 4}, true, 256) != 0) return false;
+    for (unsigned fd = 0; fd < 4; ++fd) {
+        vfs::vfs_retain_file(cleanup.source);
+        if (!child.fd_table.insert(fd, cleanup.source)) {
+            vfs::vfs_put_file(cleanup.source);
+            return false;
+        }
+    }
+    action.fd = 4;
+    ok &= spawn_open_fd(&child, action) == -EBADF && child.fd_table.size() == 4;
+    action.fd = 3;
+    action.oflag = vfs::O_LOCAL;
+    ok &= spawn_open_fd(&child, action) == 0 && child.fd_table.size() == 4 && child.fd_table.lookup(3) != cleanup.source &&
+          !child.get_fd_cloexec(3);
+    ok &= child.fd_table.reserved_count() == 0 && child.credentials() == user;
     return ok;
 }
 
@@ -1575,9 +3042,10 @@ auto supports_file_backed_process(vfs::File* file, size_t file_size) -> bool {
 }
 
 auto create_file_backed_process_task(const char* name, vfs::File* owned_file, size_t file_size, const vfs::Stat& file_stat,
-                                     uint64_t kernel_rsp, const mod::sched::resource::State& resources, uint32_t real_uid,
-                                     mod::sched::resource::ProcessReservation& reservation,
-                                     mod::sched::resource::State* failure_observations) -> mod::sched::task::Task* {
+                                     uint64_t kernel_rsp, const mod::sched::resource::State& resources,
+                                     const mod::security::Snapshot& credentials, mod::sched::resource::ProcessReservation& reservation,
+                                     mod::sched::resource::State* failure_observations, int* interpreter_error) -> mod::sched::task::Task* {
+    if (interpreter_error != nullptr) *interpreter_error = 0;
     auto release_inputs = [&]() {
         if (owned_file != nullptr) {
             vfs::vfs_put_file(owned_file);
@@ -1618,14 +3086,13 @@ auto create_file_backed_process_task(const char* name, vfs::File* owned_file, si
     }
 
     new_task->resources = resources;
-    new_task->uid = real_uid;
     auto preserve_failure_observations = [&]() {
         if (failure_observations == nullptr) return;
         uint64_t const FLAGS = new_task->resource_lock.lock_irqsave();
         *failure_observations = new_task->resources;
         new_task->resource_lock.unlock_irqrestore(FLAGS);
     };
-    if (!reservation.attach(*new_task)) {
+    if (mod::sched::resource::initialize_credentials(*new_task, credentials) != 0 || !reservation.attach(*new_task)) {
         preserve_failure_observations();
         if (!mod::sched::task::destroy_owned_unpublished_process(OWNER, new_task)) [[unlikely]] {
             mod::dbg::panic_handler("file-backed exec: lost child ownership after process admission failure");
@@ -1642,7 +3109,7 @@ auto create_file_backed_process_task(const char* name, vfs::File* owned_file, si
     };
     if (!new_task->initialize_process_image(prepared_elf.view, LOAD_OPTIONS) ||
         !append_exec_lazy_file_ranges(new_task->lazy_vmem_ranges, loader_lazy_ranges, new_task->exec_image_file, file_stat) ||
-        !mod::sched::task::complete_unpublished_process_construction(new_task)) {
+        !mod::sched::task::complete_unpublished_process_construction(new_task, interpreter_error)) {
         preserve_failure_observations();
         if (!mod::sched::task::destroy_owned_unpublished_process(OWNER, new_task)) [[unlikely]] {
             mod::dbg::panic_handler("file-backed exec: lost child recovery ownership during teardown");
@@ -1662,12 +3129,13 @@ auto wos_proc_exec(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr) -
         return static_cast<uint64_t>(-ESRCH);
     }
 
+    auto const ADMITTED_CREDENTIALS = parent->credentials();
     ExecArgumentsSnapshot snapshot;
     int const SNAPSHOT_RESULT = snapshot_exec_arguments(*parent, path_addr, argv_addr, envp_addr, snapshot);
     if (SNAPSHOT_RESULT < 0) {
         return static_cast<uint64_t>(SNAPSHOT_RESULT);
     }
-    return wos_proc_exec_impl(snapshot.path.data(), snapshot.argv, snapshot.envp, nullptr, 0);
+    return wos_proc_exec_impl(snapshot.path.data(), snapshot.argv, snapshot.envp, nullptr, 0, ADMITTED_CREDENTIALS);
 }
 
 auto wos_proc_spawn(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr, uint64_t options_addr) -> uint64_t {
@@ -1679,13 +3147,14 @@ auto wos_proc_spawn(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr, 
         return static_cast<uint64_t>(-ESRCH);
     }
 
+    auto const ADMITTED_CREDENTIALS = parent->credentials();
     ExecArgumentsSnapshot arguments;
     int const ARGUMENT_RESULT = snapshot_exec_arguments(*parent, path_addr, argv_addr, envp_addr, arguments);
     if (ARGUMENT_RESULT < 0) {
         return static_cast<uint64_t>(ARGUMENT_RESULT);
     }
     if (options_addr == 0) {
-        return wos_proc_exec_impl(arguments.path.data(), arguments.argv, arguments.envp, nullptr, 0);
+        return wos_proc_exec_impl(arguments.path.data(), arguments.argv, arguments.envp, nullptr, 0, ADMITTED_CREDENTIALS);
     }
 
     auto* snapshot = new (std::nothrow) SpawnOptionsSnapshot;
@@ -1697,14 +3166,16 @@ auto wos_proc_spawn(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr, 
         delete snapshot;
         return static_cast<uint64_t>(OPTIONS_RESULT);
     }
-    uint64_t const RESULT = wos_proc_exec_impl(arguments.path.data(), arguments.argv, arguments.envp, &snapshot->options, 0);
+    uint64_t const RESULT =
+        wos_proc_exec_impl(arguments.path.data(), arguments.argv, arguments.envp, &snapshot->options, 0, ADMITTED_CREDENTIALS);
     delete snapshot;
     return RESULT;
 }
 
 namespace {
 auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* const* envp,
-                        const ker::abi::process::SpawnOptions* spawn_options, int shebang_depth) -> uint64_t {
+                        const ker::abi::process::SpawnOptions* spawn_options, int shebang_depth,
+                        const ker::mod::security::Snapshot& admitted_credentials) -> uint64_t {
     if (ker::mod::power::shutdown_in_progress()) {
         return static_cast<uint64_t>(-ESHUTDOWN);
     }
@@ -1730,31 +3201,35 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         dbg::log("wos_proc_exec: No current task");
         return 0;
     }
+    auto const PARENT_CREDENTIALS = admitted_credentials;
     uint64_t const PARENT_PID = sched::task::process_pid(*parent_task);
 
 #ifdef EXEC_DEBUG
     dbg::log("wos_proc_exec: Loading '%.*s'", static_cast<int>(STR.size()), STR.data());
 #endif
 
-    vfs::File* exec_file = vfs::vfs_open_file(path, 0, 0);
-    if (exec_file == nullptr) {
+    vfs::File* exec_file = nullptr;
+    int const OPEN_RESULT = vfs::vfs_open_file_as(*parent_task, PARENT_CREDENTIALS, path, 0, &exec_file);
+    if (OPEN_RESULT != 0) {
         dbg::log("wos_proc_exec: Failed to open file '%.*s'", static_cast<int>(STR.size()), STR.data());
-        return 0;
+        return static_cast<uint64_t>(OPEN_RESULT);
     }
 
+    bool const EXEC_NOSUID = vfs::file_mount_nosuid(*exec_file);
     vfs::Stat exec_stat{};
-    int const STAT_RET = vfs::vfs_fstat_file(exec_file, &exec_stat);
+    int const PIN_RET = vfs::vfs_stabilize_exec_file(&exec_file);
+    int const STAT_RET = PIN_RET == 0 ? vfs::vfs_fstat_file(exec_file, &exec_stat) : PIN_RET;
     if (STAT_RET < 0) {
         dbg::log("wos_proc_exec: Failed to stat file '%.*s'", static_cast<int>(STR.size()), STR.data());
         vfs::vfs_put_file(exec_file);
-        return 0;
+        return static_cast<uint64_t>(STAT_RET);
     }
 
-    int const ACCESS_RET = check_exec_permission_from_stat(parent_task, exec_stat);
+    int const ACCESS_RET = check_exec_permission_from_stat(PARENT_CREDENTIALS, exec_stat);
     if (ACCESS_RET < 0) {
         dbg::log("wos_proc_exec: Execute permission denied for '%.*s'", static_cast<int>(STR.size()), STR.data());
         vfs::vfs_put_file(exec_file);
-        return 0;
+        return static_cast<uint64_t>(ACCESS_RET);
     }
 
     ssize_t const FILE_SIZE = exec_stat.st_size;
@@ -1825,11 +3300,11 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         if (shebang_depth >= MAX_SHEBANG_DEPTH) {
             return 0;
         }
-        return exec_shebang_script(
-            path, argv, envp, argv_count, shebang, shebang_depth,
-            [spawn_options](const char* interp, const char* const* argv2, const char* const* envp2, int depth) -> uint64_t {
-                return wos_proc_exec_impl(interp, argv2, envp2, spawn_options, depth);
-            });
+        return exec_shebang_script(path, argv, envp, argv_count, shebang, shebang_depth,
+                                   [spawn_options, &PARENT_CREDENTIALS](const char* interp, const char* const* argv2,
+                                                                        const char* const* envp2, int depth) -> uint64_t {
+                                       return wos_proc_exec_impl(interp, argv2, envp2, spawn_options, depth, PARENT_CREDENTIALS);
+                                   });
     }
 
     auto* elf_header = reinterpret_cast<Elf64_Ehdr*>(elf_buffer);
@@ -1865,7 +3340,7 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         return 0;
     }
 
-    sched::resource::ProcessReservation process_reservation(parent_task, parent_task->uid);
+    sched::resource::ProcessReservation process_reservation(parent_task, PARENT_CREDENTIALS.user().real);
     if (process_reservation.result() < 0) {
         release_exec_file_once();
         delete[] elf_buffer;
@@ -1944,8 +3419,7 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         cleanup_unpublished_task();
         return static_cast<uint64_t>(-ESRCH);
     }
-    new_task->uid = parent_task->uid;
-    if (!process_reservation.attach(*new_task)) {
+    if (sched::resource::initialize_credentials(*new_task, PARENT_CREDENTIALS) != 0 || !process_reservation.attach(*new_task)) {
         cleanup_unpublished_task();
         return static_cast<uint64_t>(-EAGAIN);
     }
@@ -1976,9 +3450,10 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         cleanup_unpublished_task();
         return 0;
     }
-    if (!sched::task::complete_unpublished_process_construction(new_task)) {
+    int interpreter_error = 0;
+    if (!sched::task::complete_unpublished_process_construction(new_task, &interpreter_error)) {
         cleanup_unpublished_task();
-        return 0;
+        return static_cast<uint64_t>(interpreter_error);
     }
 
 #ifdef EXEC_DEBUG
@@ -1988,30 +3463,29 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
 
     // Inherit process execution context from the parent before applying
     // executable-specific overrides such as setuid/setgid.
-    new_task->cwd = parent_task->cwd;
-    new_task->cwd_len = parent_task->cwd_len;
-    new_task->root = parent_task->root;
-    new_task->root_len = parent_task->root_len;
-    new_task->uid = parent_task->uid;
-    new_task->gid = parent_task->gid;
-    new_task->euid = parent_task->euid;
-    new_task->egid = parent_task->egid;
-    new_task->suid = parent_task->suid;
-    new_task->sgid = parent_task->sgid;
-    new_task->umask = parent_task->umask;
-    if (!new_task->supplementary_groups.clone_from(parent_task->supplementary_groups)) {
-        cleanup_unpublished_task();
-        return 0;
+    {
+        ker::mod::sched::task::Task::FilesystemContext filesystem;
+        if (!parent_task->capture_filesystem_context(filesystem)) {
+            cleanup_unpublished_task();
+            return 0;
+        }
+        new_task->cwd = filesystem.cwd;
+        new_task->cwd_len = filesystem.cwd_len;
+        new_task->root = filesystem.root;
+        new_task->root_len = filesystem.root_len;
+        new_task->root_anchor = std::move(filesystem.root_anchor);
+        new_task->cwd_anchor = std::move(filesystem.cwd_anchor);
     }
-    new_task->session_id = parent_task->session_id;
-    new_task->pgid = (parent_task->pgid != 0) ? parent_task->pgid : PARENT_PID;
-    new_task->controlling_tty = parent_task->controlling_tty;
+    (void)new_task->exchange_creation_mask(parent_task->creation_mask());
+    auto child_job = parent_task->job_identity();
+    child_job.exec_completed = false;
+    new_task->initialize_job_identity(child_job);
     new_task->signal_mask_store(parent_task->signal_mask_bits(), std::memory_order_relaxed);
     ker::mod::sys::signal::sync_task_signal_mask_cache(new_task);
     new_task->wki_prefer_inline = parent_task->wki_prefer_inline;
     new_task->wki_target_hostname = parent_task->wki_target_hostname;
     new_task->wki_target_flags = parent_task->wki_target_flags;
-    new_task->wki_submitter_hostname = parent_task->wki_submitter_hostname;
+    new_task->wki_submitter_hostname = parent_task->wki_execution_identity().submitter_hostname;
     new_task->wki_remote_pid = (new_task->wki_submitter_hostname.front() != '\0' &&
                                 std::strcmp(new_task->wki_submitter_hostname.data(), local_wki_hostname()) != 0)
                                    ? new_task->pid
@@ -2028,9 +3502,10 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         return 0;
     }
 
-    if (!apply_spawn_options(new_task, spawn_options)) {
+    int options_error = 0;
+    if (!apply_spawn_options(new_task, spawn_options, &options_error)) {
         cleanup_unpublished_task();
-        return 0;
+        return static_cast<uint64_t>(options_error);
     }
     if (spawn_options != nullptr) {
         close_spawn_cloexec_fds(new_task);
@@ -2054,19 +3529,20 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         fixed_slot(new_task->exe_path, path_len) = '\0';
     }
 
-    // Handle setuid/setgid bits from the executable
-    {
-        vfs::Stat exec_st{};
-        if (vfs::vfs_stat(path, &exec_st) == 0) {
-            if ((exec_st.st_mode & 04000) != 0U) {  // S_ISUID
-                new_task->euid = exec_st.st_uid;
-                new_task->suid = exec_st.st_uid;
-            }
-            if ((exec_st.st_mode & 02000) != 0U) {  // S_ISGID
-                new_task->egid = exec_st.st_gid;
-                new_task->sgid = exec_st.st_gid;
-            }
-        }
+    // Use the retained executable's metadata; pathname re-stat could select a
+    // different inode after rename. Ordinary exec also refreshes saved IDs.
+    security::Snapshot EXEC_CREDENTIALS;
+    security::ExecIdentity const EXEC_IDENTITY{.uid = exec_stat.st_uid,
+                                               .gid = exec_stat.st_gid,
+                                               .set_uid = (exec_stat.st_mode & 04000) != 0,
+                                               .set_gid = (exec_stat.st_mode & 02000) != 0,
+                                               .nosuid = EXEC_NOSUID,
+                                               .traced = parent_task->ptrace_traced,
+                                               .mode = exec_stat.st_mode};
+    if (PARENT_CREDENTIALS.prepare_exec(EXEC_IDENTITY, EXEC_CREDENTIALS) != 0 ||
+        sched::resource::initialize_credentials(*new_task, EXEC_CREDENTIALS) != 0) {
+        cleanup_unpublished_task();
+        return 0;
     }
 
 #ifdef EXEC_DEBUG
@@ -2203,15 +3679,14 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
 
     // Align to 16 bytes after string data, accounting for structured data parity.
     // Structured data: auxv (variable) + envp array + argv array + argc.
-    // auxv: 7 core pairs (including AT_RANDOM and EXECFN), optional
-    // AT_BASE pair, and the AT_NULL pair.
+    // auxv: 7 core pairs, 5 identity pairs, optional AT_BASE, and AT_NULL.
     {
         constexpr uint64_t ALIGNMENT = 16;
         uint64_t const CURRENT_ADDR = user_stack_virt - current_virt_offset;
         uint64_t const ALIGNED = CURRENT_ADDR & ~(ALIGNMENT - 1);
         current_virt_offset += (CURRENT_ADDR - ALIGNED);
 
-        constexpr size_t AUXV_QWORDS_BASE = 16;
+        constexpr size_t AUXV_QWORDS_BASE = 16 + security::exec_policy::IDENTITY_AUXV_WORDS;
         const size_t AUXV_QWORDS = AUXV_QWORDS_BASE + (new_task->interp_base != 0 ? 2 : 0);
         size_t const STRUCTURED_QWORDS = AUXV_QWORDS + (envp_count + 1) + (argv_count + 1) + 1;
         if (STRUCTURED_QWORDS % 2 != 0) {
@@ -2235,7 +3710,7 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
 
         // Build auxv dynamically: always include core entries, conditionally add AT_BASE
         bool built_correct_auxv = true;
-        ker::util::SmallVec<uint64_t, 20> auxv;
+        ker::util::SmallVec<uint64_t, 30> auxv;
         built_correct_auxv &= auxv.push_back(AT_PAGESZ);
         built_correct_auxv &= auxv.push_back(mod::mm::paging::PAGE_SIZE);
         built_correct_auxv &= auxv.push_back(AT_ENTRY);
@@ -2254,6 +3729,7 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         built_correct_auxv &= auxv.push_back(AT_RANDOM_ADDR);
         built_correct_auxv &= auxv.push_back(AT_EXECFN);
         built_correct_auxv &= auxv.push_back(EXECFN_ADDR);
+        for (auto value : security::exec_policy::identity_auxv(EXEC_CREDENTIALS)) built_correct_auxv &= auxv.push_back(value);
         built_correct_auxv &= auxv.push_back(AT_NULL);
         built_correct_auxv &= auxv.push_back(0);
 
@@ -2290,12 +3766,22 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     new_task->context.regs.rdx = ENVP_PTR;
 
     int remote_error = 0;
+    ker::net::wki::TaskExecCredentialTransition const SPAWN_TRANSITION{
+        .flags = static_cast<uint16_t>((EXEC_IDENTITY.nosuid ? ker::net::wki::WKI_EXEC_CREDENTIAL_NOSUID : 0) |
+                                       (EXEC_IDENTITY.traced ? ker::net::wki::WKI_EXEC_CREDENTIAL_TRACED : 0)),
+        .uid = EXEC_IDENTITY.uid,
+        .gid = EXEC_IDENTITY.gid,
+        .mode = EXEC_IDENTITY.mode & 07777U,
+    };
     ker::net::wki::WkiRemoteSpawnSpec const REMOTE_SPAWN = {
         .argv = argv,
         .envp = envp,
-        .cwd = parent_task->cwd.data(),
+        .cwd = new_task->cwd.data(),
         .error_out = &remote_error,
+        .exec_credentials = &SPAWN_TRANSITION,
+        .image_credentials = &PARENT_CREDENTIALS,
     };
+    new_task->mark_exec_completed();
     if (!child_events::begin_publication(*parent_task, *new_task)) {
         cleanup_unpublished_task();
         return 0;
@@ -2361,12 +3847,34 @@ auto wos_proc_execve(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr,
         return static_cast<uint64_t>(-ESRCH);
     }
 
-    ExecArgumentsSnapshot snapshot;
-    int const SNAPSHOT_RESULT = snapshot_exec_arguments(*task, path_addr, argv_addr, envp_addr, snapshot);
-    if (SNAPSHOT_RESULT < 0) {
-        return static_cast<uint64_t>(SNAPSHOT_RESULT);
+    ExecRequestArguments* request = nullptr;
+    {
+        std::unique_ptr<ExecRequestArguments> pending(new (std::nothrow) ExecRequestArguments);
+        if (!pending) return static_cast<uint64_t>(-ENOMEM);
+        pending->admitted_credentials = task->credentials();
+        request = pending.get();
+        if (!adopt_exec_arguments(*task, pending)) return static_cast<uint64_t>(-EAGAIN);
     }
-    return wos_proc_execve_impl(snapshot.path.data(), snapshot.argv, snapshot.envp, gpr, 0);
+    auto& snapshot = request->snapshot;
+    int const SNAPSHOT_RESULT = snapshot_exec_arguments(*task, path_addr, argv_addr, envp_addr, snapshot);
+    uint64_t const RESULT = SNAPSHOT_RESULT < 0 ? static_cast<uint64_t>(SNAPSHOT_RESULT)
+                                                : wos_proc_execve_impl(snapshot.path.data(), snapshot.argv, snapshot.envp, gpr, 0);
+    // Preparation has returned through every recursive loader frame. Only a
+    // native success owns a completed image; remote success has already consumed
+    // its submitted ELF and has no local image to activate.
+    auto* prepared = task->owned_exec_preparation.load(std::memory_order_acquire);
+    if (RESULT == 0 && prepared != nullptr) {
+        if (!task->is_thread) return finish_native_exec_image(task, prepared, request->completion);
+        uint64_t const HANDOFF_RESULT = handoff_worker_exec(*task, *prepared, *request);
+        cleanup_exec_preparation(*task);
+        return HANDOFF_RESULT;
+    }
+    uint32_t const REMOTE_ID = request->remote_proxy_id;
+    bool const REMOTE_WORKER = request->remote_worker_committed;
+    if (task->owned_exec_arguments.load(std::memory_order_acquire) != nullptr) cleanup_exec_preparation(*task);
+    if (RESULT == 0 && REMOTE_WORKER) ker::syscall::multiproc::wos_thread_exit_current();
+    if (RESULT == 0 && REMOTE_ID != 0) publish_remote_exec_proxy(*task, REMOTE_ID);
+    return RESULT;
 }
 
 namespace {
@@ -2389,12 +3897,17 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
 #endif
         return static_cast<uint64_t>(-ESRCH);
     }
+    auto* const PROCESS_OWNER = task->credential_owner();
+    if (PROCESS_OWNER == nullptr) return static_cast<uint64_t>(-ESRCH);
+    auto* request = task->owned_exec_arguments.load(std::memory_order_acquire);
+    auto* scratch = request != nullptr ? request->native_scratch(shebang_depth) : nullptr;
+    if (scratch == nullptr) return static_cast<uint64_t>(-EAGAIN);
     uint32_t const EXEC_CORR = perf::next_wki_trace_correlation();
     uint64_t const EXEC_STARTED_US = time::get_us();
     record_local_proc_event(task, perf::WkiPerfLocalProcOp::EXECVE, perf::WkiPerfPhase::BEGIN, EXEC_CORR, 0,
                             static_cast<uint32_t>(shebang_depth), WOS_PERF_CALLSITE());
 
-    // --- Copy argv/envp strings into kernel memory (before we destroy user mappings) ---
+    // --- Inspect the immutable kernel argument snapshot before image preparation ---
     LocalProcStage const ARG_COPY_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::ARG_COPY, 0, WOS_PERF_CALLSITE());
     std::array<char, EXEC_PATH_MAX> k_path{};
     int const PATH_COPY_RET = copy_exec_path(path, k_path);
@@ -2417,71 +3930,45 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         }
     }
 
-    // Deep-copy strings to kernel heap
-    auto** k_argv = new char*[argv_count + 1];
-    for (size_t i = 0; i < argv_count; i++) {
-        size_t const LEN = std::strlen(argv[i]);
-        k_argv[i] = new char[LEN + 1];
-        std::memcpy(k_argv[i], argv[i], LEN + 1);
-    }
-    k_argv[argv_count] = nullptr;
-
-    auto** k_envp = new char*[envp_count + 1];
-    for (size_t i = 0; i < envp_count; i++) {
-        size_t const LEN = std::strlen(envp[i]);
-        k_envp[i] = new char[LEN + 1];
-        std::memcpy(k_envp[i], envp[i], LEN + 1);
-    }
-    k_envp[envp_count] = nullptr;
-
-    auto free_kernel_arg_env = [&]() {
-        for (size_t i = 0; i < argv_count; i++) {
-            delete[] k_argv[i];
-        }
-        delete[] k_argv;
-        for (size_t i = 0; i < envp_count; i++) {
-            delete[] k_envp[i];
-        }
-        delete[] k_envp;
-    };
-    bool kernel_arg_env_freed = false;
-    auto free_kernel_arg_env_once = [&]() {
-        if (!kernel_arg_env_freed) {
-            free_kernel_arg_env();
-            kernel_arg_env_freed = true;
-        }
-    };
+    // The syscall wrapper already owns every argument byte in a bounded
+    // kernel snapshot. Shebang recursion borrows that storage and enclosing
+    // kernel frames; all consumers below finish before those owners return.
+    // Keep null vectors nonnull/empty for the existing remote direct-submit
+    // classification, without a second set of fallible heap copies.
+    std::array<const char*, 1> empty_vector{};
+    const char* const* const K_ARGV = argv != nullptr ? argv : empty_vector.data();
+    const char* const* const K_ENVP = envp != nullptr ? envp : empty_vector.data();
     end_local_proc_stage(task, perf::WkiPerfLocalProcOp::ARG_COPY, ARG_COPY_STAGE, 0, argv_count + envp_count, WOS_PERF_CALLSITE());
 
     // --- Read the ELF file ---
     LocalProcStage const OPEN_ACCESS_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, 0, WOS_PERF_CALLSITE());
-    vfs::File* exec_file = vfs::vfs_open_file(exec_path, 0, 0);
-    if (exec_file == nullptr) {
+    vfs::File* exec_file = nullptr;
+    int const OPEN_RESULT = vfs::vfs_open_file_as(*task, request->admitted_credentials, exec_path, 0, &exec_file);
+    if (OPEN_RESULT != 0) {
 #ifdef EXEC_DEBUG
         dbg::log("wos_proc_execve: Failed to open '%s'", exec_path);
 #endif
-        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, OPEN_ACCESS_STAGE, -ENOENT, 0, WOS_PERF_CALLSITE());
-        free_kernel_arg_env();
-        return static_cast<uint64_t>(-ENOENT);
+        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, OPEN_ACCESS_STAGE, OPEN_RESULT, 0, WOS_PERF_CALLSITE());
+        return static_cast<uint64_t>(OPEN_RESULT);
     }
 
+    bool const EXEC_NOSUID = vfs::file_mount_nosuid(*exec_file);
     vfs::Stat exec_stat{};
-    int const STAT_RET = vfs::vfs_fstat_file(exec_file, &exec_stat);
+    int const PIN_RET = vfs::vfs_stabilize_exec_file(&exec_file);
+    int const STAT_RET = PIN_RET == 0 ? vfs::vfs_fstat_file(exec_file, &exec_stat) : PIN_RET;
     if (STAT_RET < 0) {
         end_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, OPEN_ACCESS_STAGE, STAT_RET, 0, WOS_PERF_CALLSITE());
         vfs::vfs_put_file(exec_file);
-        free_kernel_arg_env();
         return static_cast<uint64_t>(STAT_RET);
     }
 
-    int const ACCESS_RET = check_exec_permission_from_stat(task, exec_stat);
+    int const ACCESS_RET = check_exec_permission_from_stat(request->admitted_credentials, exec_stat);
     if (ACCESS_RET < 0) {
 #ifdef EXEC_DEBUG
         dbg::log("wos_proc_execve: vfs_access X_OK failed for '%s' (ret=%d)", exec_path, access_ret);
 #endif
         end_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, OPEN_ACCESS_STAGE, -EACCES, 0, WOS_PERF_CALLSITE());
         vfs::vfs_put_file(exec_file);
-        free_kernel_arg_env();
         return static_cast<uint64_t>(-EACCES);
     }
 
@@ -2490,7 +3977,6 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         dbg::log("wos_proc_execve: empty file '%s'", exec_path);
         end_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, OPEN_ACCESS_STAGE, -ENOEXEC, 0, WOS_PERF_CALLSITE());
         vfs::vfs_put_file(exec_file);
-        free_kernel_arg_env();
         return static_cast<uint64_t>(-ENOEXEC);
     }
 
@@ -2501,7 +3987,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         }
     };
 
-    PreparedFileBackedElf prepared_elf;
+    auto& prepared_elf = scratch->prepared_elf;
     PrepareFileBackedElfResult const PREPARED_RESULT = prepare_file_backed_elf(exec_file, static_cast<size_t>(FILE_SIZE), prepared_elf);
     bool const FILE_BACKED_ELF = PREPARED_RESULT == PrepareFileBackedElfResult::READY;
     if (PREPARED_RESULT == PrepareFileBackedElfResult::INVALID || PREPARED_RESULT == PrepareFileBackedElfResult::IO_ERROR ||
@@ -2514,7 +4000,6 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         }
         end_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, OPEN_ACCESS_STAGE, error, 0, WOS_PERF_CALLSITE());
         release_exec_file_once();
-        free_kernel_arg_env();
         return static_cast<uint64_t>(error);
     }
 
@@ -2527,7 +4012,6 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
 #endif
         end_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, OPEN_ACCESS_STAGE, -ENOMEM, 0, WOS_PERF_CALLSITE());
         release_exec_file_once();
-        free_kernel_arg_env();
         return static_cast<uint64_t>(-ENOMEM);
     }
     end_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, OPEN_ACCESS_STAGE, 0, static_cast<uint64_t>(FILE_SIZE),
@@ -2559,7 +4043,6 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
 #endif
         release_exec_file_once();
         delete[] elf_buffer;
-        free_kernel_arg_env();
         return static_cast<uint64_t>(READ_RESULT.status);
     }
 
@@ -2570,14 +4053,15 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     if (parse_shebang_line(elf_buffer, SHEBANG_BYTES, &shebang)) {
         release_exec_file_once();
         delete[] elf_buffer;
-        free_kernel_arg_env_once();
         if (shebang_depth >= MAX_SHEBANG_DEPTH) {
             return static_cast<uint64_t>(-ELOOP);
         }
-        return exec_shebang_script(exec_path, argv, envp, argv_count, shebang, shebang_depth,
-                                   [&gpr](const char* interp, const char* const* argv2, const char* const* envp2, int depth) -> uint64_t {
-                                       return wos_proc_execve_impl(interp, argv2, envp2, gpr, depth);
-                                   });
+        return exec_shebang_script(
+            exec_path, argv, envp, argv_count, shebang, shebang_depth,
+            [&gpr](const char* interp, const char* const* argv2, const char* const* envp2, int depth) -> uint64_t {
+                return wos_proc_execve_impl(interp, argv2, envp2, gpr, depth);
+            },
+            task->owned_exec_arguments.load(std::memory_order_acquire));
     }
 
     auto* elf_header = reinterpret_cast<Elf64_Ehdr*>(elf_buffer);
@@ -2589,69 +4073,22 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
 #endif
         delete[] elf_buffer;
         release_exec_file_once();
-        free_kernel_arg_env();
         return static_cast<uint64_t>(-ENOEXEC);
     }
 
     {
         LocalProcStage const REMOTE_SPAWN_STAGE =
             begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::REMOTE_SPAWN, 0, WOS_PERF_CALLSITE());
-        uint8_t* saved_elf_buffer = task->elf_buffer;
-        size_t const SAVED_ELF_BUFFER_SIZE = task->elf_buffer_size;
-        bool const SAVED_IS_ELF_BUFFER_SHARED = task->is_elf_buffer_shared;
-        bool const SAVED_ELF_BUFFER_COMPLETE = task->elf_buffer_complete;
-        bool const SAVED_WKI_SKIP_LEGACY_PLACEMENT = task->wki_skip_legacy_placement;
-        uint64_t const SAVED_WKI_REMOTE_PID = task->wki_remote_pid;
-        std::array<char, sched::task::Task::EXE_PATH_MAX> saved_exe_path = {};
-        std::memcpy(saved_exe_path.data(), task->exe_path.data(), saved_exe_path.size());
-
-        size_t path_len = std::strlen(exec_path);
-        if (path_len >= sched::task::Task::EXE_PATH_MAX) {
-            path_len = sched::task::Task::EXE_PATH_MAX - 1;
-        }
-
-        task->elf_buffer = elf_buffer;
-        task->elf_buffer_size = ELF_BUFFER_SIZE;
-        task->is_elf_buffer_shared = false;
-        task->elf_buffer_complete = ELF_BUFFER_COMPLETE;
-        std::memcpy(task->exe_path.data(), exec_path, path_len);
-        fixed_slot(task->exe_path, path_len) = '\0';
-
         int remote_error = 0;
-        ker::net::wki::WkiRemoteSpawnSpec const REMOTE_SPAWN = {
-            .argv = k_argv,
-            .envp = k_envp,
-            .cwd = task->cwd.data(),
-            .error_out = &remote_error,
-        };
-        auto remote_result = ker::net::wki::wki_try_remote_spawn(task, REMOTE_SPAWN);
-        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::REMOTE_SPAWN, REMOTE_SPAWN_STAGE, static_cast<int32_t>(remote_result),
+        auto const REMOTE = try_process_remote_exec(*task, elf_buffer, ELF_BUFFER_SIZE, ELF_BUFFER_COMPLETE, exec_path, K_ARGV, K_ENVP,
+                                                    exec_stat, EXEC_NOSUID, remote_error);
+        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::REMOTE_SPAWN, REMOTE_SPAWN_STAGE, static_cast<int32_t>(REMOTE),
                              static_cast<uint64_t>(FILE_SIZE), WOS_PERF_CALLSITE());
-        consume_successful_one_shot_wki_target(task, remote_result);
-
-        task->elf_buffer = saved_elf_buffer;
-        task->elf_buffer_size = SAVED_ELF_BUFFER_SIZE;
-        task->is_elf_buffer_shared = SAVED_IS_ELF_BUFFER_SHARED;
-        task->elf_buffer_complete = SAVED_ELF_BUFFER_COMPLETE;
-
-        if (remote_result == ker::net::wki::WkiRemoteSpawnResult::REMOTE) {
-            task->deferred_task_switch = true;
-            task->yield_switch = false;
-            task->set_wait_channel("wki_execve_proxy", ker::mod::sched::task::WaitChannelKind::WKI_EXECVE_PROXY);
-            release_exec_file_once();
-            free_kernel_arg_env_once();
-            return 0;
-        }
-
-        std::memcpy(task->exe_path.data(), saved_exe_path.data(), saved_exe_path.size());
-        task->wki_skip_legacy_placement = SAVED_WKI_SKIP_LEGACY_PLACEMENT;
-        task->wki_remote_pid = SAVED_WKI_REMOTE_PID;
-
-        if (remote_result == ker::net::wki::WkiRemoteSpawnResult::FAILED) {
+        if (REMOTE != ker::net::wki::WkiRemoteSpawnResult::LOCAL) {
+            consume_successful_one_shot_wki_target(task, REMOTE);
             release_exec_file_once();
             delete[] elf_buffer;
-            free_kernel_arg_env_once();
-            return static_cast<uint64_t>(remote_error);
+            return REMOTE == ker::net::wki::WkiRemoteSpawnResult::REMOTE ? 0 : static_cast<uint64_t>(remote_error);
         }
     }
 
@@ -2659,14 +4096,10 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     // Note: We are executing in kernel context (syscall handler) so our
     // kernel mappings are active. We'll create a new user pagemap.
     LocalProcStage const NEW_IMAGE_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::NEW_IMAGE, 0, WOS_PERF_CALLSITE());
-    uint8_t* old_elf_buffer = task->elf_buffer;
-    vfs::File* old_exec_image_file = task->exec_image_file;
-    auto* old_thread = task->thread;
     uint64_t const DEBUG_STAGING_PID = task->pid | EXEC_DEBUG_STAGING_BIT;
     if (DEBUG_STAGING_PID == task->pid) {
         release_exec_file_once();
         delete[] elf_buffer;
-        free_kernel_arg_env_once();
         return static_cast<uint64_t>(-EOVERFLOW);
     }
     loader::debug::unregister_process(DEBUG_STAGING_PID);
@@ -2675,7 +4108,6 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         end_local_proc_stage(task, perf::WkiPerfLocalProcOp::NEW_IMAGE, NEW_IMAGE_STAGE, -ENOMEM, 0, WOS_PERF_CALLSITE());
         release_exec_file_once();
         delete[] elf_buffer;
-        free_kernel_arg_env_once();
         return static_cast<uint64_t>(-ENOMEM);
     }
     {
@@ -2689,22 +4121,19 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     bool const ELF_CONTRACT_VALID = FILE_BACKED_ELF ? loader::elf::inspect_tls(prepared_elf.view, tls_info)
                                                     : loader::elf::inspect_tls(elf_buffer, static_cast<size_t>(FILE_SIZE), tls_info);
     auto* new_thread = ELF_CONTRACT_VALID ? mod::sched::threading::create_thread(ker::mod::mm::USER_STACK_SIZE, tls_info.tls_size,
-                                                                                 new_pagemap, task->pid, tls_info, task)
+                                                                                 new_pagemap, PROCESS_OWNER->pid, tls_info, task)
                                           : nullptr;
     uint64_t new_mmap_cursor = 0;
     char* new_name = nullptr;
     LazyVmemRangeVec new_lazy_ranges;
-    bool new_lazy_ranges_published = false;
     auto cleanup_new_image = [&]() {
         loader::debug::unregister_process(DEBUG_STAGING_PID);
         release_exec_file_once();
-        if (!new_lazy_ranges_published) {
-            release_lazy_file_refs(new_lazy_ranges);
-        }
+        release_lazy_file_refs(new_lazy_ranges);
         if (new_pagemap != nullptr) {
             ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(new_pagemap);
             mm::virt::destroy_user_space(new_pagemap, task->pid, new_name != nullptr ? new_name : task->name, "exec-new-image-cleanup");
-            mm::virt::release_pagemap(new_pagemap);
+            mm::virt::release_pagemap(new_pagemap, task->pid);
             new_pagemap = nullptr;
         }
         if (new_thread != nullptr) {
@@ -2725,19 +4154,16 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     if (!ELF_CONTRACT_VALID) {
         end_local_proc_stage(task, perf::WkiPerfLocalProcOp::NEW_IMAGE, NEW_IMAGE_STAGE, -ENOEXEC, 0, WOS_PERF_CALLSITE());
         cleanup_new_image();
-        free_kernel_arg_env_once();
         return static_cast<uint64_t>(-ENOEXEC);
     }
     if (new_thread == nullptr) {
         end_local_proc_stage(task, perf::WkiPerfLocalProcOp::NEW_IMAGE, NEW_IMAGE_STAGE, -ENOMEM, 0, WOS_PERF_CALLSITE());
         cleanup_new_image();
-        free_kernel_arg_env_once();
         return static_cast<uint64_t>(-ENOMEM);
     }
     if (!mod::mm::user_layout::choose_mmap_cursor(new_mmap_cursor)) {
         end_local_proc_stage(task, perf::WkiPerfLocalProcOp::NEW_IMAGE, NEW_IMAGE_STAGE, -EIO, 0, WOS_PERF_CALLSITE());
         cleanup_new_image();
-        free_kernel_arg_env_once();
         return static_cast<uint64_t>(-EIO);
     }
     end_local_proc_stage(task, perf::WkiPerfLocalProcOp::NEW_IMAGE, NEW_IMAGE_STAGE, 0, 0, WOS_PERF_CALLSITE());
@@ -2745,7 +4171,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     // --- Load ELF into new pagemap ---
     LocalProcStage const LOAD_ELF_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_ELF,
                                                                  clamp_perf_aux(static_cast<uint64_t>(FILE_SIZE)), WOS_PERF_CALLSITE());
-    loader::elf::ElfLazyLoadRangeVec main_loader_lazy_ranges;
+    auto& main_loader_lazy_ranges = scratch->main_lazy_ranges;
     loader::elf::ElfLoadOptions const MAIN_LOAD_OPTIONS{
         .register_special_symbols = true,
         .base_address = 0,
@@ -2765,14 +4191,12 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_ELF, LOAD_ELF_STAGE,
                              (elf_result.error != 0 ? elf_result.error : -ENOEXEC), static_cast<uint64_t>(FILE_SIZE), WOS_PERF_CALLSITE());
         cleanup_new_image();
-        free_kernel_arg_env_once();
         return static_cast<uint64_t>((elf_result.error != 0 ? elf_result.error : -ENOEXEC));
     }
     if (!append_exec_lazy_file_ranges(new_lazy_ranges, main_loader_lazy_ranges, exec_file, exec_stat)) {
         end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_ELF, LOAD_ELF_STAGE, -ENOMEM, static_cast<uint64_t>(FILE_SIZE),
                              WOS_PERF_CALLSITE());
         cleanup_new_image();
-        free_kernel_arg_env_once();
         return static_cast<uint64_t>(-ENOMEM);
     }
     if (!FILE_BACKED_ELF) {
@@ -2803,23 +4227,31 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         if (task->wki_submitter_hostname.front() == '\0') {
             interp_open_flags |= vfs::O_LOCAL;
         }
-        vfs::File* interp_file = vfs::vfs_open_file(INTERP_PATH, interp_open_flags, 0);
-        if (interp_file == nullptr) {
+        vfs::File* interp_file = nullptr;
+        int const INTERP_OPEN_RESULT =
+            vfs::vfs_open_file_as(*task, request->admitted_credentials, INTERP_PATH, interp_open_flags, &interp_file);
+        if (INTERP_OPEN_RESULT != 0) {
             dbg::log("wos_proc_execve: Failed to open interpreter '%s'", INTERP_PATH);
             end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE, -ENOEXEC, 0, WOS_PERF_CALLSITE());
             cleanup_new_image();
-            free_kernel_arg_env_once();
             return static_cast<uint64_t>(-ENOEXEC);
         }
 
         vfs::Stat interp_stat{};
-        int const INTERP_STAT_RET = vfs::vfs_fstat_file(interp_file, &interp_stat);
+        int const INTERP_PIN_RET = vfs::vfs_stabilize_exec_file(&interp_file);
+        int const INTERP_STAT_RET = INTERP_PIN_RET == 0 ? vfs::vfs_fstat_file(interp_file, &interp_stat) : INTERP_PIN_RET;
+        int const INTERP_ACCESS = INTERP_STAT_RET == 0 ? check_exec_permission_from_stat(request->admitted_credentials, interp_stat) : 0;
+        if (INTERP_ACCESS != 0) {
+            vfs::vfs_put_file(interp_file);
+            end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE, INTERP_ACCESS, 0, WOS_PERF_CALLSITE());
+            cleanup_new_image();
+            return static_cast<uint64_t>(INTERP_ACCESS);
+        }
         ssize_t const INTERP_SIZE = INTERP_STAT_RET == 0 ? interp_stat.st_size : -1;
         if (INTERP_SIZE <= 0) {
             vfs::vfs_put_file(interp_file);
             end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE, -ENOEXEC, 0, WOS_PERF_CALLSITE());
             cleanup_new_image();
-            free_kernel_arg_env_once();
             return static_cast<uint64_t>(-ENOEXEC);
         }
 
@@ -2835,7 +4267,6 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
             release_interp_file_once();
             end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE, -ENOMEM, 0, WOS_PERF_CALLSITE());
             cleanup_new_image();
-            free_kernel_arg_env_once();
             return static_cast<uint64_t>(-ENOMEM);
         }
         bool const INTERP_LAZY_FILE_SEGMENTS = interp_file != nullptr && exec_lazy_file_segments_enabled();
@@ -2848,11 +4279,10 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
             end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE, INTERP_READ.status, 0,
                                  WOS_PERF_CALLSITE());
             cleanup_new_image();
-            free_kernel_arg_env_once();
             return static_cast<uint64_t>(INTERP_READ.status);
         }
 
-        loader::elf::ElfLazyLoadRangeVec interp_loader_lazy_ranges;
+        auto& interp_loader_lazy_ranges = scratch->interp_lazy_ranges;
         loader::elf::ElfLoadOptions const INTERP_LOAD_OPTIONS{
             .register_special_symbols = false,
             .base_address = 0,
@@ -2871,7 +4301,6 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
                                  (INTERP_RESULT.error != 0 ? INTERP_RESULT.error : -ENOEXEC), static_cast<uint64_t>(INTERP_SIZE),
                                  WOS_PERF_CALLSITE());
             cleanup_new_image();
-            free_kernel_arg_env_once();
             return static_cast<uint64_t>((INTERP_RESULT.error != 0 ? INTERP_RESULT.error : -ENOEXEC));
         }
         if (!append_exec_lazy_file_ranges(new_lazy_ranges, interp_loader_lazy_ranges, interp_file, interp_stat)) {
@@ -2880,7 +4309,6 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
             end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE, -ENOMEM,
                                  static_cast<uint64_t>(INTERP_SIZE), WOS_PERF_CALLSITE());
             cleanup_new_image();
-            free_kernel_arg_env_once();
             return static_cast<uint64_t>(-ENOMEM);
         }
         release_interp_file_once();
@@ -2908,7 +4336,6 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         new_name = new char[BASE_LEN + 1];
         if (new_name == nullptr) {
             cleanup_new_image();
-            free_kernel_arg_env_once();
             return static_cast<uint64_t>(-ENOMEM);
         }
         std::memcpy(new_name, base_name, BASE_LEN + 1);
@@ -2977,37 +4404,31 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         return VIRT_ADDR;
     };
 
-    auto* argv_addrs = new uint64_t[argv_count + 1];
+    auto*& argv_addrs = scratch->argv_addrs;
+    argv_addrs = new uint64_t[argv_count + 1];
     if (argv_addrs == nullptr) {
         cleanup_new_image();
-        free_kernel_arg_env_once();
         return static_cast<uint64_t>(-ENOMEM);
     }
     for (size_t i = 0; i < argv_count; i++) {
-        argv_addrs[i] = push_string(k_argv[i]);
+        argv_addrs[i] = push_string(K_ARGV[i]);
         if (argv_addrs[i] == 0) {
-            delete[] argv_addrs;
             cleanup_new_image();
-            free_kernel_arg_env_once();
             return static_cast<uint64_t>(-E2BIG);
         }
     }
     argv_addrs[argv_count] = 0;
 
-    auto* envp_addrs = new uint64_t[envp_count + 1];
+    auto*& envp_addrs = scratch->envp_addrs;
+    envp_addrs = new uint64_t[envp_count + 1];
     if (envp_addrs == nullptr) {
-        delete[] argv_addrs;
         cleanup_new_image();
-        free_kernel_arg_env_once();
         return static_cast<uint64_t>(-ENOMEM);
     }
     for (size_t i = 0; i < envp_count; i++) {
-        envp_addrs[i] = push_string(k_envp[i]);
+        envp_addrs[i] = push_string(K_ENVP[i]);
         if (envp_addrs[i] == 0) {
-            delete[] envp_addrs;
-            delete[] argv_addrs;
             cleanup_new_image();
-            free_kernel_arg_env_once();
             return static_cast<uint64_t>(-E2BIG);
         }
     }
@@ -3017,33 +4438,42 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     // back into the old address space destroyed by a successful execve().
     uint64_t const EXECFN_ADDR = push_string(exec_path);
     if (EXECFN_ADDR == 0) {
-        delete[] envp_addrs;
-        delete[] argv_addrs;
         cleanup_new_image();
-        free_kernel_arg_env_once();
         return static_cast<uint64_t>(-E2BIG);
     }
 
     std::array<uint8_t, AT_RANDOM_BYTES> at_random{};
     if (!mod::random::entropy::get_bytes(at_random.data(), at_random.size())) {
-        delete[] envp_addrs;
-        delete[] argv_addrs;
         cleanup_new_image();
-        free_kernel_arg_env_once();
         return static_cast<uint64_t>(-EIO);
     }
     uint64_t const NEW_AT_RANDOM_ADDR = push_to_stack(at_random.data(), at_random.size());
     std::memset(at_random.data(), 0, at_random.size());
     if (NEW_AT_RANDOM_ADDR == 0) {
-        delete[] envp_addrs;
-        delete[] argv_addrs;
         cleanup_new_image();
-        free_kernel_arg_env_once();
         return static_cast<uint64_t>(-E2BIG);
     }
 
-    // Free kernel copies of argv/envp strings
-    free_kernel_arg_env_once();
+    security::Snapshot stack_credentials;
+    int stack_credential_error = 0;
+    {
+        ker::syscall::vmem::SharedVmemPublicationGuard publication;
+        auto* owner = task->credential_owner();
+        security::Snapshot before;
+        stack_credential_error = sched::resource::prepare_exec_credentials(*task,
+                                                                           {.uid = exec_stat.st_uid,
+                                                                            .gid = exec_stat.st_gid,
+                                                                            .set_uid = (exec_stat.st_mode & 04000) != 0,
+                                                                            .set_gid = (exec_stat.st_mode & 02000) != 0,
+                                                                            .nosuid = EXEC_NOSUID,
+                                                                            .traced = owner != nullptr && owner->ptrace_traced,
+                                                                            .mode = exec_stat.st_mode},
+                                                                           before, stack_credentials, &request->admitted_credentials);
+    }
+    if (stack_credential_error != 0) {
+        cleanup_new_image();
+        return static_cast<uint64_t>(stack_credential_error);
+    }
 
     // Alignment
     {
@@ -3052,7 +4482,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         uint64_t const ALIGNED = CURRENT_ADDR & ~(ALIGNMENT - 1);
         current_virt_offset += (CURRENT_ADDR - ALIGNED);
 
-        constexpr size_t AUXV_BASE_QWORDS = 16;
+        constexpr size_t AUXV_BASE_QWORDS = 16 + security::exec_policy::IDENTITY_AUXV_WORDS;
         size_t const AUXV_QWORDS = AUXV_BASE_QWORDS + (new_interp_base != 0 ? 2 : 0);
         size_t const STRUCTURED_QWORDS = AUXV_QWORDS + (envp_count + 1) + (argv_count + 1) + 1;
         if (STRUCTURED_QWORDS % 2 != 0) {
@@ -3073,7 +4503,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         constexpr uint64_t AT_RANDOM = 25;
         constexpr uint64_t AT_EXECFN = 31;
         bool built_correct_auxv = true;
-        ker::util::SmallVec<uint64_t, 20> auxv;
+        ker::util::SmallVec<uint64_t, 30> auxv;
         built_correct_auxv &= auxv.push_back(AT_PAGESZ);
         built_correct_auxv &= auxv.push_back(mm::paging::PAGE_SIZE);
         built_correct_auxv &= auxv.push_back(AT_ENTRY);
@@ -3092,13 +4522,12 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         built_correct_auxv &= auxv.push_back(NEW_AT_RANDOM_ADDR);
         built_correct_auxv &= auxv.push_back(AT_EXECFN);
         built_correct_auxv &= auxv.push_back(EXECFN_ADDR);
+        for (auto value : security::exec_policy::identity_auxv(stack_credentials)) built_correct_auxv &= auxv.push_back(value);
         built_correct_auxv &= auxv.push_back(AT_NULL);
         built_correct_auxv &= auxv.push_back(0);
 
         if (!built_correct_auxv) {
             dbg::log("wos_proc_execve: Failed to build auxv");
-            delete[] envp_addrs;
-            delete[] argv_addrs;
             cleanup_new_image();
             return static_cast<uint64_t>(-ENOMEM);
         }
@@ -3111,20 +4540,15 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
 
     uint64_t const ENVP_PTR = push_to_stack(envp_addrs, (envp_count + 1) * sizeof(uint64_t));
     if (ENVP_PTR == 0) {
-        delete[] envp_addrs;
-        delete[] argv_addrs;
         cleanup_new_image();
         return static_cast<uint64_t>(-E2BIG);
     }
-    delete[] envp_addrs;
 
     uint64_t const ARGV_PTR = push_to_stack(argv_addrs, (argv_count + 1) * sizeof(uint64_t));
     if (ARGV_PTR == 0) {
-        delete[] argv_addrs;
         cleanup_new_image();
         return static_cast<uint64_t>(-E2BIG);
     }
-    delete[] argv_addrs;
 
     uint64_t argc = argv_count;
     if (push_to_stack(&argc, sizeof(uint64_t)) == 0) {
@@ -3163,165 +4587,177 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
 
     LocalProcStage const COMMIT_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::COMMIT, 0, WOS_PERF_CALLSITE());
     uint64_t const NEW_RSP = user_stack_virt - current_virt_offset;
-    auto* old_thread_to_destroy = old_thread;
-    const char* old_name_to_destroy = nullptr;
-    LazyVmemRangeVec old_lazy_ranges;
-
+    auto const INITIAL_REGS = [&]() {
+        cpu::GPRegs regs{};
+        regs.rdi = new_initial_rip;
+        regs.rsi = NEW_RSP;
+        return regs;
+    }();
     // Publish the pagemap, all mapping metadata, and the execution context as
     // one shared-VM transaction. Procfs, ptrace, mmap, fork, and thread
     // creation take the same guard and therefore cannot observe a mixed image.
     // No old-image storage is released until after the guard is dropped.
-    mm::paging::PageTable* old_pagemap_to_destroy = nullptr;
-    bool old_pagemap_has_other_publishers = false;
-    bool commit_published = false;
     {
-        // Prevent a new CLONE_VM/thread publisher from appearing between the
-        // sibling snapshot and the root swap. Existing siblings keep the old
-        // address space alive; exec must never tear a shared root out from
-        // under their execution or stable usercopy pins.
-        ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
-        old_pagemap_has_other_publishers = mod::sched::task_has_live_pagemap_sibling(task);
-        commit_published = loader::debug::publish_staged_process(DEBUG_STAGING_PID, task->pid, new_name);
-        if (commit_published) {
-            task->entry = NEW_EXEC_ENTRY;
-            task->program_header_addr = NEW_PROGRAM_HEADER_ADDR;
-            task->elf_header_addr = NEW_ELF_HEADER_ADDR;
-            task->image_load_base = elf_result.load_base;
-            task->image_vaddr_start = NEW_IMAGE_VADDR_START;
-            task->image_vaddr_end = NEW_IMAGE_VADDR_END;
-            task->program_header_count = NEW_PROGRAM_HEADER_COUNT;
-            task->program_header_ent_size = NEW_PROGRAM_HEADER_ENT_SIZE;
-            task->elf_buffer = elf_buffer;
-            task->elf_buffer_size = ELF_BUFFER_SIZE;
-            task->is_elf_buffer_shared = false;
-            task->elf_buffer_complete = ELF_BUFFER_COMPLETE;
-            task->exec_image_file = FILE_BACKED_ELF ? exec_file : nullptr;
-            task->exec_image_size = FILE_BACKED_ELF ? static_cast<uint64_t>(FILE_SIZE) : 0;
-            task->interp_base = new_interp_base;
-            task->interp_vaddr_start = new_interp_vaddr_start;
-            task->interp_vaddr_end = new_interp_vaddr_end;
-            task->at_random_addr = NEW_AT_RANDOM_ADDR;
-            task->mmap_next.store(new_mmap_cursor, std::memory_order_relaxed);
-
-            size_t path_len = std::strlen(exec_path);
-            if (path_len >= sched::task::Task::EXE_PATH_MAX) {
-                path_len = sched::task::Task::EXE_PATH_MAX - 1;
-            }
-            task->exe_path.fill('\0');
-            std::memcpy(task->exe_path.data(), exec_path, path_len);
-
-            old_name_to_destroy = task->name;
-            task->name = new_name;
-            new_name = nullptr;
-
-            if ((exec_stat.st_mode & 04000) != 0U) {
-                task->euid = exec_stat.st_uid;
-                task->suid = exec_stat.st_uid;
-            }
-            if ((exec_stat.st_mode & 02000) != 0U) {
-                task->egid = exec_stat.st_gid;
-                task->sgid = exec_stat.st_gid;
-            }
-
-            task->signal_pending_store(0, std::memory_order_relaxed);
-            task->in_signal_handler = false;
-            task->do_sigreturn = false;
-            for (auto& sh : task->sig_handlers) {
-                sh = {.handler = 0, .flags = 0, .restorer = 0, .mask = 0};
-            }
-
-            task->context.frame.rip = new_initial_rip;
-            task->context.frame.rsp = NEW_RSP;
-            task->context.frame.ss = 0x1b;
-            task->context.frame.cs = 0x23;
-            task->context.frame.flags = 0x202;
-            task->context.frame.int_num = 0;
-            task->context.frame.err_code = 0;
-            ker::mod::sys::context_switch::record_saved_frame_class(task, task->context.frame,
-                                                                    ker::mod::sched::task::SavedFrameOrigin::SYNTHETIC_USER_RETURN);
-
-            // Match the fresh-process entry contract used by wos_asm_enter_usermode:
-            // startup code consumes argc/argv/envp from the initial stack, not GPRs.
-            task->context.regs = cpu::GPRegs();
-            task->context.regs.rdi = new_initial_rip;
-            task->context.regs.rsi = NEW_RSP;
-
-            old_pagemap_to_destroy = task->replace_pagemap_after_usercopy_quiescence(new_pagemap);
-            task->thread = new_thread;
-            mod::sched::threading::record_stack_usage(*task);
-            swap_exec_lazy_ranges(task, new_lazy_ranges, old_lazy_ranges);
-            new_lazy_ranges_published = true;
-            (void)mod::sched::resource::observe_address_space(*task);
+        NativeExecImage const IMAGE{
+            .entry = NEW_EXEC_ENTRY,
+            .program_header_addr = NEW_PROGRAM_HEADER_ADDR,
+            .elf_header_addr = NEW_ELF_HEADER_ADDR,
+            .image_load_base = elf_result.load_base,
+            .image_vaddr_start = NEW_IMAGE_VADDR_START,
+            .image_vaddr_end = NEW_IMAGE_VADDR_END,
+            .program_header_count = NEW_PROGRAM_HEADER_COUNT,
+            .program_header_ent_size = NEW_PROGRAM_HEADER_ENT_SIZE,
+            .elf_buffer = elf_buffer,
+            .elf_buffer_size = ELF_BUFFER_SIZE,
+            .elf_buffer_complete = ELF_BUFFER_COMPLETE,
+            .exec_image_file = FILE_BACKED_ELF ? exec_file : nullptr,
+            .exec_image_size = FILE_BACKED_ELF ? static_cast<uint64_t>(FILE_SIZE) : 0,
+            .interp_base = new_interp_base,
+            .interp_vaddr_start = new_interp_vaddr_start,
+            .interp_vaddr_end = new_interp_vaddr_end,
+            .at_random_addr = NEW_AT_RANDOM_ADDR,
+            .mmap_next = new_mmap_cursor,
+            .name = new_name,
+            .path = exec_path,
+            .debug_staging_pid = DEBUG_STAGING_PID,
+            .initial_rip = new_initial_rip,
+            .initial_rsp = NEW_RSP,
+            .registers = INITIAL_REGS,
+            .pagemap = new_pagemap,
+            .thread = new_thread,
+            .lazy_ranges = new_lazy_ranges,
+            .stat = exec_stat,
+            .nosuid = EXEC_NOSUID,
+            .one_shot_wki_target = (task->wki_target_flags & sched::task::Task::WKI_TARGET_FLAG_ONESHOT) != 0,
+            .admitted_credentials = request->admitted_credentials,
+            .stack_credentials = stack_credentials,
+        };
+        std::unique_ptr<PreparedNativeExecImage> prepared(new (std::nothrow) PreparedNativeExecImage(IMAGE, task->pid));
+        if (!prepared) {
+            end_local_proc_stage(task, perf::WkiPerfLocalProcOp::COMMIT, COMMIT_STAGE, -ENOMEM, 0, WOS_PERF_CALLSITE());
+            cleanup_new_image();
+            return static_cast<uint64_t>(-ENOMEM);
         }
-    }
-    if (!commit_published) {
-        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::COMMIT, COMMIT_STAGE, -EIO, 0, WOS_PERF_CALLSITE());
-        cleanup_new_image();
-        return static_cast<uint64_t>(-EIO);
-    }
-
-    elf_buffer = nullptr;
-    if (FILE_BACKED_ELF) {
+        // The owner has consumed name/lazy storage and owns these backing refs.
+        // Completion will read pagemap/thread only from the adopted image.
+        elf_buffer = nullptr;
         exec_file = nullptr;
-    }
-    delete[] old_name_to_destroy;
-    release_lazy_file_refs(old_lazy_ranges);
-
-    // exec only closes FD_CLOEXEC descriptors after the replacement image is
-    // committed; failed execve() therefore leaves the original descriptor
-    // table intact. Snapshot first because vfs_close() mutates fd_table.
-    for (;;) {
-        FdSnapshot fds{};
-        size_t const FD_COUNT = collect_cloexec_fds_locked(task, fds);
-        if (FD_COUNT == 0) {
-            break;
+        if (!adopt_exec_preparation(*task, prepared)) {
+            // A rejected candidate must not replace the existing recovery slot.
+            // Protect its synchronous destruction too, preserving an outer guard.
+            bool const WAS_CLEANING = task->exec_preparation_teardown_in_progress.exchange(true, std::memory_order_acq_rel);
+            prepared.reset();
+            if (!WAS_CLEANING) {
+                task->exec_preparation_teardown_in_progress.store(false, std::memory_order_release);
+            }
+            end_local_proc_stage(task, perf::WkiPerfLocalProcOp::COMMIT, COMMIT_STAGE, -EAGAIN, 0, WOS_PERF_CALLSITE());
+            return static_cast<uint64_t>(-EAGAIN);
         }
-        for (size_t i = 0; i < FD_COUNT; ++i) {
-            vfs::vfs_close(static_cast<int>(fixed_slot(fds, i)));
+        request->completion = {.commit_stage = COMMIT_STAGE,
+                               .correlation = EXEC_CORR,
+                               .started_us = EXEC_STARTED_US,
+                               .source_file_size = static_cast<uint64_t>(FILE_SIZE)};
+        return 0;
+    }
+}
+
+template <typename Wait>
+void transfer_native_worker_signals(ker::mod::sched::task::Task& owner, ker::mod::sched::task::Task& worker, uint64_t mask, Wait&& wait) {
+    // Root publication has already closed new old-image worker admissions in
+    // signal_local_as. Finish every earlier authorized effect before taking
+    // the worker's pending bits and acknowledging its retirement.
+    while (!worker.local_signal_admissions_drained()) wait();
+    owner.signal_mask_store(mask);
+    owner.signal_add_pending_mask(worker.signal_take_pending_mask(~uint64_t{0}));
+}
+
+// Called after all recursive preparation frames have returned. This executor
+// still owns the adopted image; no loader-local pointer or destructor survives.
+auto finish_native_exec_image(ker::mod::sched::task::Task* task, PreparedNativeExecImage* PREPARED, NativeExecCompletion completion,
+                              WorkerExecHandoff* handoff) -> uint64_t {
+    using namespace ker::mod;
+    bool const OWNER_HANDOFF = handoff != nullptr;
+    auto const INITIAL_REGS = PREPARED->view().registers;
+    uint64_t const NEW_RSP = PREPARED->view().initial_rsp;
+    uint64_t const new_initial_rip = PREPARED->view().initial_rip;
+    auto* const new_thread = PREPARED->view().thread;
+    auto const phys_pagemap = reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(PREPARED->view().pagemap)));
+    auto const COMMIT_STAGE = completion.commit_stage;
+    uint32_t const EXEC_CORR = completion.correlation;
+    uint64_t const EXEC_STARTED_US = completion.started_us;
+    uint64_t const FILE_SIZE = completion.source_file_size;
+    {
+        // Publication can block after some Task fields have changed. Defer
+        // fatal recovery until failure or complete replacement-root activation.
+        task->exec_preparation_teardown_in_progress.store(true, std::memory_order_release);
+        int COMMIT_RESULT = prepare_native_exec_quiescence(*task, *PREPARED);
+        if (COMMIT_RESULT == 0) COMMIT_RESULT = commit_native_exec_image(task, *PREPARED);
+        if (COMMIT_RESULT < 0) {
+            task->exec_preparation_teardown_in_progress.store(false, std::memory_order_release);
+            end_local_proc_stage(task, perf::WkiPerfLocalProcOp::COMMIT, COMMIT_STAGE, -EIO, 0, WOS_PERF_CALLSITE());
+            cleanup_exec_preparation(*task);
+            if (handoff != nullptr) acknowledge_worker_exec(*task, *handoff, COMMIT_RESULT);
+            return static_cast<uint64_t>(COMMIT_RESULT);
         }
-    }
-    static_cast<void>(ensure_exec_stdio_fallbacks(task));
 
-    if (old_elf_buffer != nullptr) {
-        if (!ker::net::wki::wki_remote_compute_release_elf_buffer(old_elf_buffer)) {
-            delete[] old_elf_buffer;
+        asm volatile("mov %0, %%cr3" : : "r"(phys_pagemap) : "memory");
+        ker::mod::sys::context_switch::reset_fpu_state(task);
+
+        // execve() returns directly via sysret instead of re-entering through the
+        // scheduler, so refresh the live CPU's user TLS bases after the new CR3 is
+        // active and before any new-image TLS access in userspace.
+        cpu::wrfsbase(new_thread->fsbase);
+        cpu_set_msr(IA32_KERNEL_GS_BASE, new_thread->gsbase);
+        PREPARED->mark_activated();
+        if (handoff != nullptr) {
+            transfer_native_worker_signals(*task, *handoff->worker, handoff->signal_mask, [] { sched::kern_yield(); });
+            task->main_thread_retired.store(false, std::memory_order_release);
+            // Do not touch handoff after this store: the worker can retire and
+            // destroy its argument request immediately. Sibling SIGKILL is later.
+            acknowledge_worker_exec(*task, *handoff, 0);
+            handoff = nullptr;
         }
-    }
-    if (old_exec_image_file != nullptr) {
-        vfs::vfs_put_file(old_exec_image_file);
-    }
+        task->exec_preparation_teardown_in_progress.store(false, std::memory_order_release);
+        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::COMMIT, COMMIT_STAGE, 0, 0, WOS_PERF_CALLSITE());
 
-    (void)argc;
-    (void)ARGV_PTR;
-    (void)ENVP_PTR;
+        // The replacement root/TLS are active before siblings can become the last
+        // old-root GC owners. Wait without the publication/action mutexes so their
+        // blocked syscalls and task-owned cleanup can complete cooperatively.
+        retire_exec_siblings(*task);
 
-    auto phys_pagemap = reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(new_pagemap)));
-    asm volatile("mov %0, %%cr3" : : "r"(phys_pagemap) : "memory");
-    ker::mod::sys::context_switch::reset_fpu_state(task);
+        // Old-image siblings could publish sigaction or descriptor changes after
+        // the image commit. Finalize shared state only after their cooperative
+        // cleanup, while exec admission still excludes new workers.
+        {
+            mod::sys::MutexGuard action_guard(task->signal_action_mutex());
+            task->reset_signal_state_for_exec();
+        }
 
-    // execve() returns directly via sysret instead of re-entering through the
-    // scheduler, so refresh the live CPU's user TLS bases after the new CR3 is
-    // active and before any new-image TLS access in userspace.
-    cpu::wrfsbase(new_thread->fsbase);
-    cpu_set_msr(IA32_KERNEL_GS_BASE, new_thread->gsbase);
-    end_local_proc_stage(task, perf::WkiPerfLocalProcOp::COMMIT, COMMIT_STAGE, 0, 0, WOS_PERF_CALLSITE());
+        // exec only closes FD_CLOEXEC descriptors after the replacement image is
+        // committed; failed execve() therefore leaves the original descriptor
+        // table intact. Snapshot first because vfs_close() mutates fd_table.
+        for (;;) {
+            FdSnapshot fds{};
+            size_t const FD_COUNT = collect_cloexec_fds_locked(task, fds);
+            if (FD_COUNT == 0) {
+                break;
+            }
+            for (size_t i = 0; i < FD_COUNT; ++i) {
+                vfs::vfs_close(static_cast<int>(fixed_slot(fds, i)));
+            }
+        }
+        static_cast<void>(ensure_exec_stdio_fallbacks(task));
 
-    // execve() replaces the current image in-place. Reclaim an exclusive old
-    // address space now; if CLONE_VM/thread publishers still exist, their
-    // last-publisher GC owns that shared root instead.
-    LocalProcStage const DESTROY_OLD_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::DESTROY_OLD, 0, WOS_PERF_CALLSITE());
-    ker::syscall::shm::shm_cleanup_for_task(task);
-    if (old_pagemap_to_destroy != nullptr && old_pagemap_to_destroy != new_pagemap && !old_pagemap_has_other_publishers) {
-        ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(old_pagemap_to_destroy);
-        mm::virt::destroy_user_space(old_pagemap_to_destroy, task->pid, task->name, "exec-old-image");
-        mm::virt::release_pagemap(old_pagemap_to_destroy);
-    }
-    if (old_thread_to_destroy != nullptr && old_thread_to_destroy != new_thread) {
-        old_thread_to_destroy->tls_phys_ptr = 0;
-        old_thread_to_destroy->stack_phys_ptr = 0;
-        mod::sched::threading::destroy_thread(old_thread_to_destroy);
-    }
-    end_local_proc_stage(task, perf::WkiPerfLocalProcOp::DESTROY_OLD, DESTROY_OLD_STAGE, 0, 0, WOS_PERF_CALLSITE());
+        // execve() replaces the current image in-place. Reclaim an exclusive old
+        // address space now; if CLONE_VM/thread publishers still exist, their
+        // last-publisher GC owns that shared root instead.
+        LocalProcStage const DESTROY_OLD_STAGE =
+            begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::DESTROY_OLD, 0, WOS_PERF_CALLSITE());
+        ker::syscall::shm::shm_cleanup_for_task(task);
+        cleanup_exec_preparation(*task);
+        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::DESTROY_OLD, DESTROY_OLD_STAGE, 0, 0, WOS_PERF_CALLSITE());
+
+    }  // Exec admission and owned storage are gone before the on-stack return patch.
 
     // --- Update the sysret return path so it lands at the new binary ---
     //
@@ -3351,13 +4787,30 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
 #ifdef EXEC_DEBUG
     // Log BEFORE patching the stack - dbg::log uses the stack and would
     // clobber the patched register slots if called after.
-    dbg::log("wos_proc_execve: PID %x now running '%s' (entry 0x%lx, rsp 0x%lx)", task->pid, task->exe_path.data(), elf_result.entryPoint,
-             new_rsp);
+    dbg::log("wos_proc_execve: PID %x now running '%s' (entry 0x%lx, rsp 0x%lx)", task->pid, task->exe_path.data(), new_initial_rip,
+             NEW_RSP);
 #endif
     uint32_t const EXEC_US = clamp_perf_aux(time::get_us() - EXEC_STARTED_US);
     record_local_proc_event(task, perf::WkiPerfLocalProcOp::EXECVE, perf::WkiPerfPhase::END, EXEC_CORR, 0, EXEC_US, WOS_PERF_CALLSITE());
     perf::record_wki_summary(perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(perf::WkiPerfLocalProcOp::EXECVE), 0, 0, 0, EXEC_US, true,
                              0, static_cast<uint64_t>(FILE_SIZE));
+
+    if (OWNER_HANDOFF) {
+        asm volatile("cli" ::: "memory");
+        task->deferred_task_switch = false;
+        task->yield_switch = false;
+        task->set_voluntary_blocked(false);
+        task->context.regs = INITIAL_REGS;
+        task->context.frame.rip = new_initial_rip;
+        task->context.frame.rsp = NEW_RSP;
+        task->context.frame.cs = 0x23;
+        task->context.frame.ss = 0x1b;
+        task->context.frame.flags = 0x202;
+        task->context.frame.int_num = 0;
+        task->context.frame.err_code = 0;
+        sys::context_switch::record_saved_frame_class(task, task->context.frame, sched::task::SavedFrameOrigin::SYNTHETIC_USER_RETURN);
+        wos_asm_enter_exec_owner(new_initial_rip, NEW_RSP, task->context.syscall_kernel_stack);
+    }
 
     // === CRITICAL SECTION: No function calls below this point! ===
     // Any function call (including dbg::log) would use the kernel stack
@@ -3366,7 +4819,10 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     // 2. Patch the full on-stack GPRegs block so the new image gets the same
     // clean register state as a freshly spawned task instead of inheriting the
     // old syscall call-site's scratch values.
-    *reinterpret_cast<cpu::GPRegs*>(stack_base) = task->context.regs;
+    // Retirement/cleanup can be preempted in kernel context, overwriting the
+    // scheduler's saved registers. Only the private startup snapshot belongs
+    // to this new user image.
+    *reinterpret_cast<cpu::GPRegs*>(stack_base) = INITIAL_REGS;
     reinterpret_cast<cpu::GPRegs*>(stack_base)->rcx = new_initial_rip;
     reinterpret_cast<cpu::GPRegs*>(stack_base)->r11 = 0x202;  // IF set
 
@@ -3384,5 +4840,373 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     return 0;
 }
 }  // namespace
+
+void cancel_pending_exec_handoff(ker::mod::sched::task::Task& owner) {
+    uint64_t const FLAGS = owner.resource_lock.lock_irqsave();
+    auto* handoff = owner.pending_exec_handoff.exchange(nullptr, std::memory_order_acq_rel);
+    if (handoff != nullptr) handoff->result.store(-ECANCELED, std::memory_order_release);
+    auto* active = owner.active_exec_handoff.exchange(nullptr, std::memory_order_acq_rel);
+    if (active != nullptr) active->result.store(-ECANCELED, std::memory_order_release);
+    owner.resource_lock.unlock_irqrestore(FLAGS);
+}
+
+#ifdef WOS_SELFTEST
+auto exec_selftest_native_signal_cutover_drains_worker() -> bool {
+    using namespace ker::mod;
+    using Task = sched::task::Task;
+    constexpr uint64_t OWNER_PENDING = uint64_t{1} << (10 - 1);
+    constexpr uint64_t WORKER_PENDING = uint64_t{1} << (12 - 1);
+    constexpr uint64_t WORKER_LATE = uint64_t{1} << (14 - 1);
+    constexpr uint64_t OWNER_LATE = uint64_t{1} << (15 - 1);
+    auto const ROOT = security::Snapshot::bootstrap_root();
+    security::Snapshot unrelated;
+    if (ROOT.prepare({.change = security::Change::SET_UID, .real = 100}, unrelated) != 0) return false;
+    bool ok = true;
+    for (bool retired_main : {false, true}) {
+        for (unsigned leases = 0; leases <= 2; ++leases) {
+            auto owner = std::unique_ptr<Task>(new (std::nothrow) Task);
+            auto worker = std::unique_ptr<Task>(new (std::nothrow) Task);
+            if (!owner || !worker) return false;
+            owner->type = worker->type = sched::task::TaskType::PROCESS;
+            owner->pid = 0x7B7300;
+            worker->pid = owner->pid + 1;
+            worker->owner_pid = owner->pid;
+            worker->is_thread = true;
+            if (!sched::resource::bind_thread_owner(*worker, *owner)) return false;
+            std::array<mm::paging::PageTable, 2> roots{};
+            owner->pagemap = worker->pagemap = &roots.at(0);
+            owner->main_thread_retired.store(retired_main);
+            owner->signal_mask_store(OWNER_PENDING);
+            worker->signal_mask_store(WORKER_PENDING);
+            owner->signal_pending_store(OWNER_PENDING);
+            worker->signal_pending_store(WORKER_PENDING);
+            auto signal = [&](Task& target, const security::Snapshot& caller, int signum) -> int {
+                if (!target.try_acquire()) return -ESRCH;
+                return signal_as(target, caller, owner->job_identity(), signum);
+            };
+            // Uncommitted/rejected preparation leaves the old TID and state.
+            ok &=
+                signal(*worker, ROOT, 0) == 0 && signal(*worker, unrelated, 0) == -EPERM && worker->signal_pending_bits() == WORKER_PENDING;
+            unsigned admitted = 0;
+            for (unsigned i = 0; i < leases; ++i) {
+                auto const ADMISSION = worker->begin_local_signal_admission();
+                ok &= ADMISSION.local_lease;
+                admitted += ADMISSION.local_lease ? 1U : 0U;
+            }
+            {
+                ker::syscall::vmem::SharedVmemPublicationGuard publication;
+                owner->pagemap = &roots.at(1);
+            }
+            // Public signal routing must refuse the replaced TID even while
+            // its Task and an earlier admission are still alive.
+            ok &= signal(*worker, ROOT, 0) == -ESRCH && signal(*worker, ROOT, 12) == -ESRCH && signal(*worker, unrelated, 0) == -ESRCH &&
+                  signal(*owner, ROOT, 0) == 0 && worker->signal_pending_bits() == WORKER_PENDING;
+            unsigned waits = 0;
+            transfer_native_worker_signals(*owner, *worker, WORKER_PENDING, [&] {
+                ++waits;
+                ok &= signal(*worker, ROOT, 0) == -ESRCH;
+                worker->signal_generate_pending_mask(WORKER_LATE);
+                // Owner-targeted occurrences need no transfer and must survive.
+                owner->signal_generate_pending_mask(OWNER_LATE);
+                while (admitted != 0) {
+                    --admitted;
+                    worker->end_local_signal_admission();
+                }
+            });
+            uint64_t const EXPECTED = OWNER_PENDING | WORKER_PENDING | (leases != 0 ? WORKER_LATE | OWNER_LATE : 0);
+            ok &= waits == (leases != 0 ? 1U : 0U) && admitted == 0 && owner->signal_pending_bits() == EXPECTED &&
+                  worker->signal_pending_bits() == 0 && owner->signal_mask_bits() == WORKER_PENDING &&
+                  worker->local_signal_admissions_drained() && owner->ref_count.load() == 2 && worker->ref_count.load() == 1 &&
+                  owner->main_thread_retired.load() == retired_main;
+            while (admitted != 0) {
+                --admitted;
+                worker->end_local_signal_admission();
+            }
+            owner->pagemap = worker->pagemap = nullptr;
+        }
+    }
+    return ok;
+}
+
+auto exec_selftest_remote_signal_cutover_drains_actor() -> bool {
+    using namespace ker::mod::sched;
+    using Task = task::Task;
+    constexpr uint64_t OWNER_PENDING = uint64_t{1} << (10 - 1);
+    constexpr uint64_t WORKER_PENDING = uint64_t{1} << (12 - 1);
+    constexpr uint64_t OWNER_LATE = uint64_t{1} << (15 - 1);
+    constexpr uint64_t ACTOR_LATE = uint64_t{1} << (14 - 1);
+    constexpr uint32_t ROUTE = 0x7B720001;
+    bool ok = true;
+    for (bool worker_exec : {false, true}) {
+        for (unsigned leases = 0; leases < 4; ++leases) {
+            auto owner = std::unique_ptr<Task>(new (std::nothrow) Task);
+            auto worker = std::unique_ptr<Task>(new (std::nothrow) Task);
+            auto sibling = std::unique_ptr<Task>(new (std::nothrow) Task);
+            if (!owner || !worker || !sibling) return false;
+            owner->type = worker->type = sibling->type = task::TaskType::PROCESS;
+            owner->pid = 0x7B7200;
+            worker->pid = owner->pid + 1;
+            sibling->pid = owner->pid + 2;
+            worker->owner_pid = sibling->owner_pid = owner->pid;
+            worker->is_thread = sibling->is_thread = true;
+            if (!resource::bind_thread_owner(*worker, *owner) || !resource::bind_thread_owner(*sibling, *owner)) return false;
+            Task& actor = worker_exec ? *worker : *owner;
+            Task::SignalHandlerTable handlers{};
+            handlers.at(0).handler = 1;
+            owner->initialize_signal_handlers(handlers);
+            owner->signal_pending_store(OWNER_PENDING);
+            worker->signal_pending_store(WORKER_PENDING);
+            actor.signal_mask_store(WORKER_PENDING);
+            owner->parent_death_signal.store(10);
+            worker->parent_death_signal.store(12);
+            bool owner_lease = (leases & 1) != 0;
+            bool actor_lease = (leases & 2) != 0;
+            if (owner_lease) ok &= owner->begin_local_signal_admission().local_lease;
+            if (actor_lease) ok &= actor.begin_local_signal_admission().local_lease;
+            unsigned waits = 0;
+            auto finish_admitted_effects = [&] {
+                ++waits;
+                auto const OWNER = owner->begin_local_signal_admission();
+                auto const ACTOR = actor.begin_local_signal_admission();
+                ok &= OWNER.remote && !OWNER.local_lease && ACTOR.remote && !ACTOR.local_lease;
+                if (OWNER.local_lease) owner->end_local_signal_admission();
+                if (ACTOR.local_lease) actor.end_local_signal_admission();
+                if (std::exchange(owner_lease, false)) {
+                    owner->signal_generate_pending_mask(OWNER_LATE);
+                    owner->end_local_signal_admission();
+                }
+                if (std::exchange(actor_lease, false)) {
+                    actor.signal_generate_pending_mask(ACTOR_LATE);
+                    actor.end_local_signal_admission();
+                }
+            };
+            ker::net::wki::TaskExecSignals signals;
+            capture_remote_exec_cutover_signals(*owner, actor, ROUTE, 77, signals, finish_admitted_effects);
+            uint64_t const EXPECTED = OWNER_PENDING | (worker_exec ? WORKER_PENDING : 0) | ((leases & 1) != 0 ? OWNER_LATE : 0) |
+                                      ((leases & 2) != 0 ? ACTOR_LATE : 0);
+            ok &= waits == (leases != 0 ? 1U : 0U) && signals.pending == EXPECTED && signals.blocked == WORKER_PENDING &&
+                  signals.ignored == 1 && signals.parent_death_signal == 10 && !owner_lease && !actor_lease;
+            // A broken drain must fail without leaking the synthetic lease.
+            if (std::exchange(owner_lease, false)) owner->end_local_signal_admission();
+            if (std::exchange(actor_lease, false)) actor.end_local_signal_admission();
+            auto const AFTER = actor.begin_local_signal_admission();
+            ok &= AFTER.remote && !AFTER.local_lease && owner->local_signal_admissions_drained() && actor.local_signal_admissions_drained();
+            if (AFTER.local_lease) actor.end_local_signal_admission();
+            ok &= actor.wki_execution_identity().signal_task_id == ROUTE && actor.wki_execution_identity().proxy_task_id == 0 &&
+                  !actor.wki_proxy_task && owner->ref_count.load() == 3;
+            auto const OTHER = sibling->begin_local_signal_admission();
+            ok &= !OTHER.remote && OTHER.local_lease;
+            if (OTHER.local_lease) sibling->end_local_signal_admission();
+        }
+    }
+    return ok;
+}
+
+auto exec_selftest_remote_cutover_refusal_is_atomic() -> bool {
+    using namespace ker::mod;
+    using Task = sched::task::Task;
+    enum class Scenario { NO_ADMISSION, NOT_QUIESCED, IDS_CHANGED, TRACE_CHANGED, ADMISSION_RELEASED, NNP_CHANGED, COMMIT };
+    constexpr uint64_t PID = 0x7B7400;
+    if (auto* existing = sched::find_task_by_pid_safe(PID); existing != nullptr) {
+        existing->release();
+        return false;
+    }
+    bool ok = true;
+    for (auto scenario : {Scenario::NO_ADMISSION, Scenario::NOT_QUIESCED, Scenario::IDS_CHANGED, Scenario::TRACE_CHANGED,
+                          Scenario::ADMISSION_RELEASED, Scenario::NNP_CHANGED, Scenario::COMMIT}) {
+        Task owner{};
+        owner.type = sched::task::TaskType::PROCESS;
+        owner.pid = PID;
+        auto initial = security::Snapshot::bootstrap_root();
+        if (initial.prepare({.change = security::Change::SET_RESGID, .real = 2002, .effective = 2002, .saved = 2000}, initial) != 0 ||
+            initial.prepare({.change = security::Change::SET_RESUID, .real = 1002, .effective = 1002, .saved = 1000}, initial) != 0 ||
+            sched::resource::initialize_credentials(owner, initial) != 0)
+            return false;
+        std::memcpy(owner.exe_path.data(), "/old", 5);
+        std::memcpy(owner.wki_target_hostname.data(), "old-peer", 9);
+        owner.wki_target_flags = Task::WKI_TARGET_FLAG_STRICT | Task::WKI_TARGET_FLAG_ONESHOT;
+        auto const OLD_PATH = owner.exe_path;
+        auto const OLD_TARGET = owner.wki_target_hostname;
+        auto const OLD_FLAGS = owner.wki_target_flags;
+        Task::FilesystemContext old_filesystem;
+        if (!owner.capture_filesystem_context(old_filesystem)) return false;
+        auto* const OLD_IMAGE = owner.elf_buffer;
+        constexpr uint64_t PENDING = uint64_t{1} << (10 - 1);
+        owner.signal_pending_store(PENDING);
+        {
+            RemoteExecPlan plan;
+            if (!owner.try_acquire()) return false;
+            plan.actor = &owner;
+            plan.credentials = owner.credentials();
+            plan.image_identity = {.uid = 0, .gid = 0, .set_uid = true, .set_gid = true, .mode = 06755};
+            std::memcpy(plan.path.data(), "/candidate", 11);
+            std::memcpy(plan.target.data(), "new-peer", 9);
+            plan.target_flags = OLD_FLAGS;
+            if (scenario == Scenario::NOT_QUIESCED) {
+                ker::syscall::vmem::SharedVmemPublicationGuard publication;
+                if (!plan.admission.begin(owner)) return false;
+            } else if (scenario != Scenario::NO_ADMISSION) {
+                if (prepare_remote_exec_owner(owner, &plan) != 0) return false;
+            }
+            if (scenario == Scenario::ADMISSION_RELEASED) plan.admission.finish();
+            {
+                ker::syscall::vmem::SharedVmemPublicationGuard publication;
+                if (scenario == Scenario::TRACE_CHANGED) owner.ptrace_traced = true;
+                if (scenario == Scenario::IDS_CHANGED &&
+                    sched::resource::change_credentials(owner, {.change = security::Change::SET_EUID, .effective = 1000}) != 0)
+                    return false;
+                if (scenario == Scenario::NNP_CHANGED &&
+                    sched::resource::change_credentials(owner, {.change = security::Change::NO_NEW_PRIVILEGES}) != 0)
+                    return false;
+            }
+            auto const BEFORE = owner.credentials();
+            ker::net::wki::TaskExecSignals signals{.ignored = 1, .blocked = 2, .pending = 4};
+            constexpr uint32_t ROUTE = 0x7B740001;
+            int const RESULT = cutover_remote_exec_owner(owner, ROUTE, 77, signals, &plan);
+            bool const COMMITTED = scenario == Scenario::COMMIT;
+            ok &= RESULT == (COMMITTED ? 0 : -EAGAIN) && plan.committed == COMMITTED;
+            if (COMMITTED) {
+                ok &= owner.credentials() == plan.replacement_credentials && owner.credentials().user() == security::Ids{1002, 0, 0} &&
+                      std::strcmp(owner.exe_path.data(), "/candidate") == 0 && owner.wki_target_hostname.front() == '\0' &&
+                      owner.wki_target_flags == Task::WKI_TARGET_FLAG_LOCAL && owner.wki_skip_legacy_placement &&
+                      owner.wki_execution_identity().signal_task_id == ROUTE && signals.pending == PENDING;
+            } else {
+                ok &= owner.credentials() == BEFORE && owner.exe_path == OLD_PATH && owner.wki_target_hostname == OLD_TARGET &&
+                      owner.wki_target_flags == OLD_FLAGS && !owner.wki_skip_legacy_placement &&
+                      owner.wki_execution_identity().signal_task_id == 0 && owner.signal_pending_bits() == PENDING &&
+                      signals.ignored == 1 && signals.blocked == 2 && signals.pending == 4;
+            }
+            Task::FilesystemContext filesystem;
+            ok &= owner.capture_filesystem_context(filesystem) && filesystem.root == old_filesystem.root &&
+                  filesystem.cwd == old_filesystem.cwd && owner.elf_buffer == OLD_IMAGE &&
+                  owner.wki_execution_identity().proxy_task_id == 0 && !owner.wki_proxy_task && !owner.scheduler_published.load();
+        }
+        ok &= !owner.resource_exec_admission_closed && owner.resource_exec_quiescence_epoch.load() == 0 && owner.ref_count.load() == 1;
+    }
+    return ok;
+}
+
+auto exec_selftest_remote_plan_binding_and_rollback() -> bool {
+    using Task = ker::mod::sched::task::Task;
+    bool ok = true;
+    for (bool accepted : {false, true}) {
+        Task owner{};
+        owner.type = ker::mod::sched::task::TaskType::PROCESS;
+        std::array<uint8_t, 8> old{};
+        owner.elf_buffer = old.data();
+        owner.elf_buffer_size = old.size();
+        owner.elf_buffer_complete = true;
+        owner.is_elf_buffer_shared = true;
+        std::memcpy(owner.exe_path.data(), "/old", 5);
+        owner.set_wki_remote_pid(7);
+        {
+            RemoteExecPlan plan;
+            char arg[] = "argument";
+            char env[] = "KEY=value";
+            const char* args[] = {arg, nullptr};
+            const char* envs[] = {env, nullptr};
+            if (!plan.copy_arguments(args, envs)) return false;
+            arg[0] = 'X';
+            env[0] = 'Y';
+            ok &= std::strcmp(plan.argv[0], "argument") == 0 && std::strcmp(plan.envp[0], "KEY=value") == 0 && plan.argv[1] == nullptr &&
+                  plan.envp[1] == nullptr;
+            plan.bytes = new (std::nothrow) uint8_t[16];
+            if (plan.bytes == nullptr) return false;
+            plan.size = 16;
+            std::memcpy(plan.path.data(), "/new", 5);
+            std::memcpy(plan.target.data(), "peer", 5);
+            plan.target_flags = Task::WKI_TARGET_FLAG_STRICT;
+            {
+                ker::syscall::vmem::SharedVmemPublicationGuard publication;
+                if (!plan.admission.begin(owner)) return false;
+            }
+            auto const candidate = plan.candidate();
+            ok &= candidate.bytes.data() == plan.bytes && candidate.bytes.size() == 16 && !candidate.complete &&
+                  std::strcmp(candidate.path, "/new") == 0 && std::strcmp(candidate.target, "peer") == 0 &&
+                  candidate.target_flags == Task::WKI_TARGET_FLAG_STRICT;
+            ok &= owner.elf_buffer == old.data() && owner.elf_buffer_size == old.size() && owner.is_elf_buffer_shared &&
+                  owner.elf_buffer_complete && std::strcmp(owner.exe_path.data(), "/old") == 0 &&
+                  owner.wki_execution_identity().remote_pid == 7 && owner.wki_target_hostname[0] == '\0' &&
+                  !owner.wki_skip_legacy_placement && owner.resource_exec_admission_closed;
+            if (accepted) {
+                ker::syscall::vmem::SharedVmemPublicationGuard publication;
+                plan.publish_metadata(owner);
+                plan.committed = true;
+            }
+            ok &= plan.bytes == candidate.bytes.data() && owner.elf_buffer == old.data() &&
+                  owner.wki_execution_identity().remote_pid == 7 && std::strcmp(owner.exe_path.data(), accepted ? "/new" : "/old") == 0 &&
+                  std::strcmp(owner.wki_target_hostname.data(), accepted ? "peer" : "") == 0 && owner.wki_skip_legacy_placement == accepted;
+        }
+        ok &= !owner.resource_exec_admission_closed && owner.ref_count.load() == 1;
+        owner.elf_buffer = nullptr;
+    }
+    RemoteExecPlan empty;
+    ok &= empty.copy_arguments(nullptr, nullptr) && empty.argv != nullptr && empty.envp != nullptr && empty.argv[0] == nullptr &&
+          empty.envp[0] == nullptr;
+    return ok;
+}
+
+auto exec_selftest_remote_request_claim_and_cancel() -> bool {
+    using Task = ker::mod::sched::task::Task;
+    Task owner{};
+    owner.type = ker::mod::sched::task::TaskType::PROCESS;
+    bool ok = true;
+    for (bool cancel : {false, true}) {
+        WorkerExecHandoff handoff;
+        handoff.remote = true;
+        handoff.remote_request = new (std::nothrow) ExecRequestArguments;
+        if (handoff.remote_request == nullptr) return false;
+        auto* request = handoff.remote_request;
+        request->remote.reset(new (std::nothrow) RemoteExecPlan);
+        if (!request->remote) return false;
+        owner.pending_exec_handoff.store(&handoff);
+        if (cancel) {
+            cancel_pending_exec_handoff(owner);
+            ok &= owner.pending_exec_handoff.load() == nullptr && handoff.remote_request == request && handoff.result.load() == -ECANCELED;
+        } else {
+            ok &= claim_pending_exec_handoff(owner) == &handoff && handoff.remote_request == nullptr &&
+                  owner.owned_exec_arguments.load() == request && owner.active_exec_handoff.load() == &handoff;
+            cleanup_exec_preparation(owner);
+            acknowledge_worker_exec(owner, handoff, -EAGAIN);
+            ok &= owner.owned_exec_arguments.load() == nullptr && owner.active_exec_handoff.load() == nullptr &&
+                  handoff.result.load() == -EAGAIN;
+        }
+    }
+    return ok;
+}
+#endif
+
+void service_pending_exec_handoff() {
+    using namespace ker::mod;
+    auto* owner = sched::get_current_task();
+    if (owner == nullptr || owner->is_thread || owner->exit_in_progress.load(std::memory_order_acquire) ||
+        owner->exec_preparation_teardown_in_progress.load(std::memory_order_acquire))
+        return;
+    auto* handoff = claim_pending_exec_handoff(*owner);
+    if (handoff == nullptr) return;
+    if (handoff->remote) {
+        auto* request = owner->owned_exec_arguments.load(std::memory_order_acquire);
+        auto const OUTCOME = run_remote_exec_owner(*owner, *request, handoff);
+        uint32_t const ID = request->remote_proxy_id;
+        cleanup_exec_preparation(*owner);
+        if (OUTCOME.pending != nullptr) {
+            acknowledge_worker_exec(*owner, *OUTCOME.pending,
+                                    OUTCOME.result == ker::net::wki::WkiRemoteSpawnResult::LOCAL ? 0 : OUTCOME.error);
+        }
+        if (OUTCOME.result == ker::net::wki::WkiRemoteSpawnResult::REMOTE) {
+            publish_remote_exec_proxy(*owner, ID);
+            wos_asm_park_exec_owner(owner->context.syscall_kernel_stack);
+        }
+        return;
+    }
+    auto* prepared = owner->owned_exec_preparation.load(std::memory_order_acquire);
+    if (prepared == nullptr) {
+        acknowledge_worker_exec(*owner, *handoff, -EAGAIN);
+        return;
+    }
+    // Success abandons this already-unwound owner return/retirement stack.
+    // Failure preserves the old image and acknowledges the waiting worker.
+    static_cast<void>(finish_native_exec_image(owner, prepared, handoff->completion, handoff));
+}
 
 }  // namespace ker::syscall::process

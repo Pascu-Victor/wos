@@ -15,6 +15,7 @@
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/resource.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <platform/sched/session.hpp>
 #include <platform/sys/context_switch.hpp>
 #include <platform/sys/signal.hpp>
 #include <util/hcf.hpp>
@@ -26,6 +27,7 @@
 #include "syscalls_impl/futex/futex.hpp"
 #include "syscalls_impl/log/sys_log.hpp"
 #include "syscalls_impl/multiproc/threadControl.hpp"
+#include "syscalls_impl/process/exec.hpp"
 #include "syscalls_impl/shm/shm.hpp"
 #include "syscalls_impl/vmem/sys_vmem.hpp"
 
@@ -71,9 +73,8 @@ void release_exiting_user_address_space(ker::mod::sched::task::Task* task) {
     if (pagemap == nullptr) {
         return;
     }
-    ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(pagemap);
     ker::mod::mm::virt::destroy_user_space(pagemap, task->pid, task->name, "process-exit");
-    ker::mod::mm::virt::release_pagemap(pagemap);
+    ker::mod::mm::virt::release_pagemap(pagemap, task->pid);
 }
 
 void cleanup_signal_handlers_for_exit(ker::mod::sched::task::Task* task) {
@@ -90,9 +91,7 @@ void cleanup_signal_handlers_for_exit(ker::mod::sched::task::Task* task) {
     task->sigsuspend_active = false;
     task->in_signal_handler = false;
     task->do_sigreturn = false;
-    for (auto& handler : task->sig_handlers) {
-        handler = {};
-    }
+    task->initialize_signal_handlers({});
 }
 
 auto task_alive_for_group_exit_request(ker::mod::sched::task::Task* task) -> bool {
@@ -109,6 +108,34 @@ auto store_process_exit_request(ker::mod::sched::task::Task* task, int status, i
     task->requested_process_exit_wait_status.store(wait_status, std::memory_order_relaxed);
     task->process_exit_requested.store(true, std::memory_order_release);
     return true;
+}
+
+struct ProcessExitDisposition {
+    int status = 0;
+    int wait_status = 0;
+    bool thread_only = false;
+};
+
+auto take_requested_process_exit(sched_task::Task* task, ProcessExitDisposition& disposition) -> bool {
+    if (!task_alive_for_group_exit_request(task) || task->unpublished_teardown_in_progress.load(std::memory_order_acquire) ||
+        task->exec_preparation_teardown_in_progress.load(std::memory_order_acquire) ||
+        !task->process_exit_requested.load(std::memory_order_acquire)) {
+        return false;
+    }
+    disposition = {.status = task->requested_process_exit_status.load(std::memory_order_relaxed),
+                   .wait_status = task->requested_process_exit_wait_status.load(std::memory_order_relaxed),
+                   .thread_only = task->is_thread};
+    task->process_exit_requested.store(false, std::memory_order_release);
+    return true;
+}
+
+auto prepare_signal_exit(sched_task::Task* task, int signo) -> ProcessExitDisposition {
+    ProcessExitDisposition disposition{.status = 128 + signo, .wait_status = signo & 0x7f};
+    // A retirement request publishes its state before the SIGKILL wake bit.
+    // It can arrive after the user-return path's earlier request check. Recheck
+    // after signal selection so an old exec sibling cannot kill the new image.
+    if (signo == 9) static_cast<void>(take_requested_process_exit(task, disposition));
+    return disposition;
 }
 
 auto copy_pending_process_exit_request(ker::mod::sched::task::Task* source, ker::mod::sched::task::Task* new_sibling) -> bool {
@@ -144,6 +171,7 @@ ker::mod::sched::task::Task group_exit_selftest_initiator;      // NOLINT
 ker::mod::sched::task::Task group_exit_selftest_candidate;      // NOLINT
 ker::mod::sched::task::Task exit_inheritance_selftest_source;   // NOLINT
 ker::mod::sched::task::Task exit_inheritance_selftest_sibling;  // NOLINT
+ker::mod::sched::task::Task signal_exit_selftest_subject;       // NOLINT
 #endif
 
 auto thread_group_exit_request_candidate(ker::mod::sched::task::Task* task, void* context) -> bool {
@@ -195,6 +223,7 @@ namespace {
     if (current_task->is_thread) {
         ker::syscall::multiproc::wos_thread_exit_current();
     }
+    current_task->jobctl_membership.detach();
 
     uint32_t const EXIT_CORR = ker::mod::perf::next_wki_trace_correlation();
     uint64_t const EXIT_STARTED_US = ker::mod::time::get_us();
@@ -216,6 +245,7 @@ namespace {
         }
     }
     current_task->exit_in_progress = true;
+    cancel_pending_exec_handoff(*current_task);
     ker::vfs::cancel_fd_reservations(*current_task);
     ker::mod::sched::resource::cancel_process_reservations(*current_task);
     ker::syscall::log::sys_log_cleanup_for_task(current_task);
@@ -240,6 +270,8 @@ namespace {
     while (current_task->resource_cpu_threads.load(std::memory_order_acquire) != 0) {
         ker::mod::sched::kern_yield();
     }
+
+    ker::mod::sched::session::process_exit(*current_task);
 
     // Close all open file descriptors and free ELF buffer before waking waiters.
     // This ensures files written by the exiting process are fully committed to
@@ -286,13 +318,38 @@ namespace {
     ker::net::wki::wki_remote_compute_cleanup_for_task(current_task);
     static_cast<void>(sched_task::destroy_unpublished_process(sched_task::take_unpublished_process(current_task)));
 
+    // Release native directory/mount pins while exit can still block. Threads
+    // use the process owner's state and must not clear a sibling's cwd.
+    if (!current_task->is_thread) {
+        ker::vfs::DirectoryAnchorRef retired_root, retired;
+        uint64_t const IRQF = current_task->path_metadata_lock.lock_irqsave();
+        current_task->root_anchor.swap(retired_root);
+        current_task->cwd_anchor.swap(retired);
+        current_task->path_metadata_lock.unlock_irqrestore(IRQF);
+    }
+
+    // Both attachment retirement and file-mapping writeback acquire sleeping
+    // mutexes. Keep the pagemap attached and the executor ACTIVE until they
+    // finish; a parked EXITING task cannot resume its cleanup stack.
+    ker::syscall::shm::shm_cleanup_for_task(current_task);
+    current_task->quiesce_usercopy_pagemap();
+    // Lazy executable views can close backend files and block. Drop this
+    // executor's references before waitpid can observe its exit, not in GC.
+    sched_task::release_lazy_vmem_ranges(*current_task);
+    ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(current_task->pagemap);
+
     // Child teardown and ordinary descriptor close may themselves have used
     // WKI. Quiesce the complete task-owned wait/VFS surface before EXITING.
+    ker::syscall::process::cleanup_exec_preparation(*current_task);
     ker::net::wki::wki_wait_cleanup_for_task(current_task);
 
     // From this point forward the task must not block or return to userspace:
     // user address-space teardown, waiter notification, and final GC handoff all
     // assume it has left the ordinary ACTIVE scheduling domain.
+    // Cleanup and main-thread retirement may have parked with IF enabled. A
+    // timer must not switch away after EXITING and abandon this stack halfway
+    // through a parent wake (including its reschedule-leader ownership).
+    asm volatile("cli" ::: "memory");
     if (!current_task->transition_state(ker::mod::sched::task::TaskState::ACTIVE, ker::mod::sched::task::TaskState::EXITING)) {
         for (;;) {
             asm volatile("hlt");
@@ -335,8 +392,6 @@ namespace {
     // futex_wake() can target a DEAD task and keep stale 64-byte wait nodes alive.
     ker::syscall::futex::futex_wait_cleanup_for_task(current_task);
 
-    ker::syscall::shm::shm_cleanup_for_task(current_task);
-
     cleanup_signal_handlers_for_exit(current_task);
 
     uint32_t const EXIT_US = clamp_perf_aux(ker::mod::time::get_us() - EXIT_STARTED_US);
@@ -361,6 +416,11 @@ namespace {
     __builtin_unreachable();
 }
 
+[[noreturn]] void execute_process_exit(const ProcessExitDisposition& disposition) {
+    if (disposition.thread_only) ker::syscall::multiproc::wos_thread_exit_current();
+    wos_proc_exit_with_wait_status(disposition.status, disposition.wait_status);
+}
+
 }  // namespace
 
 auto inherit_pending_process_exit_request(ker::mod::sched::task::Task* source, ker::mod::sched::task::Task* new_sibling) -> bool {
@@ -374,22 +434,32 @@ auto inherit_pending_process_exit_request(ker::mod::sched::task::Task* source, k
     return true;
 }
 
+auto request_replaced_exec_thread_retirement(ker::mod::sched::task::Task& subject) -> bool {
+    if (!subject.is_thread) return false;
+    auto* owner = subject.credential_owner();
+    if (owner == nullptr || subject.pagemap == owner->pagemap) return false;
+    // Root replacement and the caller's credential publication are serialized
+    // by the VM publication guard. Do not let an old executor mutate the new
+    // image's process state while it waits for cooperative sibling retirement.
+    // This only queues exit: safe user return consumes it after locks unwind.
+    if (!subject.process_exit_requested.load(std::memory_order_acquire)) static_cast<void>(store_process_exit_request(&subject, 0, 0));
+    return true;
+}
+
 void exit_current_if_process_exit_requested() {
     auto* task = ker::mod::sched::get_current_task();
-    if (!task_alive_for_group_exit_request(task) || task->unpublished_teardown_in_progress.load(std::memory_order_acquire) ||
-        !task->process_exit_requested.load(std::memory_order_acquire)) {
-        return;
+    ProcessExitDisposition disposition;
+    if (take_requested_process_exit(task, disposition)) execute_process_exit(disposition);
+}
+
+void retire_exec_siblings(ker::mod::sched::task::Task& executor) {
+    // Worker exec needs a separate process-owner handoff. A process exit
+    // request to its retained owner would terminate the replacement as well.
+    if (executor.is_thread) return;
+    request_thread_group_exit(&executor, 0, 0);
+    while (executor.resource_cpu_threads.load(std::memory_order_acquire) != 0) {
+        ker::mod::sched::kern_yield();
     }
-
-    int const STATUS = task->requested_process_exit_status.load(std::memory_order_relaxed);
-    int const WAIT_STATUS = task->requested_process_exit_wait_status.load(std::memory_order_relaxed);
-    task->process_exit_requested.store(false, std::memory_order_release);
-
-    if (task->is_thread) {
-        ker::syscall::multiproc::wos_thread_exit_current();
-    }
-
-    wos_proc_exit_with_wait_status(STATUS, WAIT_STATUS);
 }
 
 [[noreturn]] void wos_proc_exit(int status) {
@@ -399,10 +469,85 @@ void exit_current_if_process_exit_requested() {
 
 [[noreturn]] void wos_proc_exit_signal(int signo) {
     // A shell turns WIFSIGNALED(status)/WTERMSIG(status) into "$? = 128 + signo".
-    wos_proc_exit_with_wait_status(128 + signo, signo & 0x7f);
+    execute_process_exit(prepare_signal_exit(ker::mod::sched::get_current_task(), signo));
+}
+
+[[noreturn]] void retire_main_thread() {
+    auto* owner = ker::mod::sched::get_current_task();
+    // pthread_exit has finished its userspace destructors. Preserve the process
+    // store and this cleanup stack until the last admitted sibling retires.
+    // No scoped resource owners may span the noreturn signal/exit checks here.
+    ker::mod::sched::finalize_current_task_cpu_accounting();
+    // Ordinary pending process signals are dispatched explicitly below. They
+    // must not make syscall park immediately cancel while every worker blocks
+    // them; that would spin this retired executor with syscall IRQ state.
+    // No return to this thread's userspace mask/cache is possible anymore.
+    owner->signal_mask_store(~((uint64_t{1} << (9 - 1)) | (uint64_t{1} << (19 - 1))));
+    owner->main_thread_retired.store(true, std::memory_order_release);
+    for (;;) {
+        exit_current_if_process_exit_requested();
+        service_pending_exec_handoff();
+        ker::mod::sys::signal::service_retired_main_signals();
+        exit_current_if_process_exit_requested();
+        if (ker::mod::sched::resource::close_idle_thread_cpu_admission(*owner)) {
+            wos_proc_exit(0);
+        }
+        ker::mod::sched::preemptible_syscall_park("thread_exit", ker::mod::time::get_us() + 10000);
+    }
 }
 
 #ifdef WOS_SELFTEST
+auto process_selftest_signal_exit_preserves_late_retirement() -> bool {
+    auto& subject = signal_exit_selftest_subject;
+    subject.type = sched_task::TaskType::PROCESS;
+    subject.state.store(sched_task::TaskState::ACTIVE, std::memory_order_relaxed);
+    subject.has_exited = false;
+    auto const CREDENTIALS = subject.credentials();
+    bool okay = true;
+    for (bool thread : {true, false}) {
+        subject.is_thread = thread;
+        subject.process_exit_requested.store(false, std::memory_order_release);
+        ProcessExitDisposition initial{.status = -1, .wait_status = -1};
+        okay &= !take_requested_process_exit(&subject, initial) && initial.status == -1 && initial.wait_status == -1;
+        // Publish in the gap after the first safe-boundary check, then select
+        // and consume the wake just as the fatal-signal path does. The actual
+        // production selector must retain thread-only retirement or the exact
+        // requested process status, without converting either into group kill.
+        int const STATUS = thread ? 0 : 73;
+        okay &= store_process_exit_request(&subject, STATUS, STATUS << 8);
+        subject.signal_add_pending_mask(SIGKILL_MASK);
+        okay &= (subject.signal_pending_bits() & SIGKILL_MASK) != 0;
+        subject.signal_clear_pending_mask(SIGKILL_MASK);
+        auto const SELECTED = prepare_signal_exit(&subject, 9);
+        okay &= SELECTED.thread_only == thread && SELECTED.status == STATUS && SELECTED.wait_status == (STATUS << 8) &&
+                !subject.process_exit_requested.load(std::memory_order_acquire);
+        auto const GENUINE_KILL = prepare_signal_exit(&subject, 9);
+        okay &= !GENUINE_KILL.thread_only && GENUINE_KILL.status == 137 && GENUINE_KILL.wait_status == 9;
+    }
+    subject.is_thread = true;
+    okay &= store_process_exit_request(&subject, 0, 0);
+    auto const OTHER_SIGNAL = prepare_signal_exit(&subject, 15);
+    okay &= !OTHER_SIGNAL.thread_only && OTHER_SIGNAL.status == 143 && OTHER_SIGNAL.wait_status == 15 &&
+            subject.process_exit_requested.load(std::memory_order_acquire);
+    ProcessExitDisposition deferred{.status = -1, .wait_status = -1};
+    subject.exec_preparation_teardown_in_progress.store(true, std::memory_order_release);
+    okay &= !take_requested_process_exit(&subject, deferred);
+    subject.exec_preparation_teardown_in_progress.store(false, std::memory_order_release);
+    subject.unpublished_teardown_in_progress.store(true, std::memory_order_release);
+    okay &= !take_requested_process_exit(&subject, deferred);
+    subject.unpublished_teardown_in_progress.store(false, std::memory_order_release);
+    okay &= deferred.status == -1 && deferred.wait_status == -1 && subject.process_exit_requested.load(std::memory_order_acquire);
+    auto const RETIREMENT = prepare_signal_exit(&subject, 9);
+    okay &= RETIREMENT.thread_only && RETIREMENT.status == 0 && RETIREMENT.wait_status == 0 &&
+            !subject.process_exit_requested.load(std::memory_order_acquire);
+    // Restore the private process view before inspecting its credential store;
+    // this selector fixture does not attach a canonical owner to the fake thread.
+    subject.is_thread = false;
+    okay &= subject.credentials() == CREDENTIALS;
+    subject.state.store(sched_task::TaskState::DEAD, std::memory_order_release);
+    return okay;
+}
+
 auto process_selftest_group_exit_candidate_filter() -> bool {
     auto& initiator = group_exit_selftest_initiator;
     auto& candidate = group_exit_selftest_candidate;

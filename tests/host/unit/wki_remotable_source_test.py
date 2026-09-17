@@ -289,22 +289,21 @@ def test_pending_vfs_mount_waits_for_detach_ack_without_spending_retries() -> No
     )
 
 
-def test_pending_vfs_mount_prepares_only_the_local_host_directory() -> None:
+def test_pending_vfs_mount_publishes_without_remote_directory_creation() -> None:
     source = REMOTABLE_CPP.read_text()
     process = function_body(source, "wki_remotable_process_pending_mounts")
-
-    if "vfs_mkdir(pending.mount_path.data()" in process:
-        fail("nested VFS auto-mount preparation must not recurse through an existing remote host root")
-
+    if "vfs_mkdir(" in process:
+        fail("auto-mount worker must not enter a remote mkdir while it also owns withdrawal processing")
     require_order(
         process,
         [
-            "std::copy_n(mount_path, host_dir_len, host_dir.data())",
-            "ker::vfs::vfs_mkdir(host_dir.data(), 0755)",
+            "pending_vfs_mount_is_live_locked(pending)",
+            "wki_remote_vfs_detach_pending_for_resource(pending.node_id, pending.resource_id)",
             "wki_remote_vfs_mount(pending.node_id, pending.resource_id, pending.mount_path.data(), pending.resource_generation)",
         ],
-        "local host directory preparation before mount-table publication",
+        "direct mount publication retains resource identity and detach admission",
     )
+
 
 
 def test_vfs_withdrawal_rearms_live_successor_mounts_after_teardown() -> None:
@@ -384,6 +383,29 @@ def test_same_incarnation_block_advert_revives_exact_generation() -> None:
     )
 
 
+def test_auto_mount_waits_for_retired_ancestors_without_spending_retries():
+    source = (ROOT / "modules/kern/src/net/wki/remotable.cpp").read_text()
+    process = function_body(source, "wki_remotable_process_pending_mounts")
+    require_order(process, ["pending_vfs_mount_is_live_locked(pending)",
+                           "wki_remote_vfs_has_mount_for_resource_generation",
+                           "wki_remote_vfs_auto_mount_waits_for_retired_path(pending.mount_path.data())",
+                           "defer_vfs_mount_for_detach(pending)",
+                           "wki_remote_vfs_mount(pending.node_id"],
+                  "retired ancestor deferral precedes new auto-mount publication")
+    gate = process[process.index("if (wki_remote_vfs_auto_mount_waits_for_retired_path("):]
+    gate = gate[:gate.index("// Publish host")]
+    if "continue;" not in gate or "retry_count" in gate:
+        fail("retired ancestor deferral must preserve the mount failure budget")
+    vfs = (ROOT / "modules/kern/src/net/wki/remote_vfs.cpp").read_text()
+    query = function_body(vfs, "wki_remote_vfs_auto_mount_waits_for_retired_path")
+    require_order(query, ["s_vfs_lock.lock()", "proxy->lane_anchor", "proxy->mount_configured",
+                          "proxy->destroy_when_idle", "proxy->mount_released", "s_vfs_lock.unlock()"],
+                  "retired path observation uses the exact anchored lifecycle under lock")
+    for forbidden in ["unmount_filesystem", "wki_send", "new ", "release_vfs_proxy"]:
+        if forbidden in query:
+            fail("retired path observation must not perform teardown or allocation")
+
+
 def main() -> None:
     test_deferred_retry_deadlines_are_saturating()
     test_resource_snapshots_are_coalesced_after_control_stream_drain()
@@ -391,8 +413,9 @@ def main() -> None:
     test_net_ipv6_advert_admission_bypasses_incarnation_and_is_exact()
     test_pending_net_attach_is_generation_and_epoch_fenced()
     test_pending_vfs_mount_waits_for_detach_ack_without_spending_retries()
-    test_pending_vfs_mount_prepares_only_the_local_host_directory()
+    test_pending_vfs_mount_publishes_without_remote_directory_creation()
     test_vfs_withdrawal_rearms_live_successor_mounts_after_teardown()
+    test_auto_mount_waits_for_retired_ancestors_without_spending_retries()
     test_same_incarnation_block_advert_revives_exact_generation()
     print("WKI remotable source invariants hold")
 

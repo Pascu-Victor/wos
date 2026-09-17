@@ -424,7 +424,79 @@ def test_zone_create_backing_setup_is_bounded_out_of_rx_context() -> None:
     )
 
 
+def test_zone_authority_keeps_the_admitted_channel() -> None:
+    source = ZONE_CPP.read_text()
+    header = ZONE_HPP.read_text()
+    core = WKI_CPP.read_text()
+    peer = (ROOT / "modules/kern/src/net/wki/peer.cpp").read_text()
+    require_tokens(header, ["WkiChannelIdentity channel_identity{}"], "retained zone channel")
+    require_tokens(source, ["WkiChannelIdentity channel_identity{}"], "queued setup channel")
+    require_tokens(function_body(source, "same_zone_channel"),
+                   ["left.channel == right.channel", "left.peer_node_id == right.peer_node_id",
+                    "left.channel_id == right.channel_id", "left.generation == right.generation"], "allocation identity")
+    work = function_body(source, "process_zone_create_work")
+    require_order(work, "lifecycle.acquire(work.header.src_node)", "process_zone_create_request(", "setup lifecycle before effects")
+    require_order(work, "!zone_channel_live(work.channel_identity)", "process_zone_create_ack(", "retired ACK before waiter claim")
+    create = function_body(source, "wki_zone_create")
+    require_order(create, "lifecycle.try_acquire(peer)", "wki_channel_get(peer, WKI_CHAN_ZONE_MGMT)", "initiator capture lease")
+    require_order(create, "zone->channel_identity = identity", "wki_send_on_channel_identity(identity,", "initiator retained identity")
+    require_order(create, "lifecycle.release()", "wki_wait_for_op(&create_wait", "no ACK wait under lifecycle lease")
+    for name in ["create_req", "create_ack", "destroy", "notify_pre", "notify_post", "read_req", "read_resp", "write_req", "write_ack"]:
+        body = function_body(source, "handle_zone_" + name)
+        require_tokens(body, ["!zone_channel_live(identity)", "identity.peer_node_id != hdr->src_node"], name + " ingress token")
+        require_tokens(core, ["detail::handle_zone_" + name + "(hdr, payload, payload_len, RX_CHANNEL_IDENTITY)"], name + " dispatch identity")
+        if name in ["create_req", "create_ack"]:
+            require_order(body, "work.channel_identity = identity", "enqueue_zone_create_work(work)", name + " copied queue ownership")
+        else:
+            require_tokens(body, ["!same_zone_channel(zone->channel_identity, identity)"], name + " retained owner identity")
+    require_tokens(function_body(source, "process_zone_create_ack"),
+                   ["!same_zone_channel(zone->channel_identity, identity)"], "ACK matches original initiating allocation")
+    reject_tokens(source, ["wki_send("], "zone sends cannot select numeric replacement channels")
+    reset = function_body(core, "message_is_epoch_reset_sensitive")
+    for name in ["CREATE_REQ", "CREATE_ACK", "DESTROY", "NOTIFY_PRE", "NOTIFY_POST", "READ_REQ", "READ_RESP", "WRITE_REQ", "WRITE_ACK"]:
+        require_tokens(reset, ["MsgType::ZONE_" + name], "zone reset admission")
+    cleanup = function_body(peer, "drain_pending_epoch_reset_cleanups")
+    require_order(cleanup, "wki_dev_proxy_cleanup_epoch_reset_for_peer", "wki_zones_destroy_for_peer", "drain backing users first")
+    require_order(cleanup, "wki_zones_destroy_for_peer", "peer.vfs_reset_rebind_pending.store(false", "retire zones before admission reopens")
+    require_tokens(WKI_WAIT_KTEST.read_text(), ["DeferredSetupAndMessagesKeepOriginalChannel", "wki_zone_selftest_deferred_channel_retirement"], "actual lifecycle coverage")
+
+
+def test_local_backing_uses_retained_grants() -> None:
+    source = ZONE_CPP.read_text()
+    server = (ROOT / "modules/kern/src/net/wki/dev_server.cpp").read_text()
+    reject_tokens(source + ZONE_HPP.read_text(), ["wki_zone_get_ptr"], "no unpinned local backing API")
+    reject_tokens(server, ["wki_zone_find(", "wki_zone_destroy(item.blk_zone_id)"], "server keeps exact zone ownership")
+    create = function_body(source, "wki_zone_create")
+    require_tokens(create, ["WkiZoneRef::retain(zone, peer, LOCAL_ACCESS)"], "create transfers original slot")
+    require_tokens(server, ["while (!binding->retiring.load(std::memory_order_acquire) && binding->blk_zone_ref.live())", "retire_binding_zone(item.binding)"], "retirement admission and release")
+    cleanup = function_body(server, "retire_binding_zone")
+    require_order(cleanup, "binding->blk_zone_ptr = nullptr", "s_server_lock.unlock_irqrestore(FLAGS)", "withdraw diagnostic pointer before unlock")
+    require_order(cleanup, "s_server_lock.unlock_irqrestore(FLAGS)", "zone_ref.reset()", "release backing outside registry lock")
+    pending = function_body(server, "wki_dev_server_process_pending_zones")
+    require_order(pending, "ring_hdr->server_ready = 1", "binding->blk_zone_ref = std::move(zone_ref)", "initialize before publication")
+    require_tokens(WKI_WAIT_KTEST.read_text(), ["LocalBackingAndBlockRingRetainExactGrant", "wki_zone_selftest_local_backing_retention"], "actual retained grant coverage")
+
+
+def test_device_notifications_keep_retained_zone_identity() -> None:
+    source = ZONE_CPP.read_text()
+    proxy = (ROOT / "modules/kern/src/net/wki/dev_proxy.cpp").read_text()
+    server = (ROOT / "modules/kern/src/net/wki/dev_server.cpp").read_text()
+    prepare = function_body(source, "prepare_zone_post_notification")
+    require_tokens(prepare, ["prepared.channel = zone->channel_identity", "prepared.payload.zone_id = zone->zone_id",
+                             "zone_channel_live(zone->channel_identity)", "op_type > 1"], "retained wake envelope")
+    for text, name, call in [(proxy, "rdma_signal_server_unchecked", "state->rdma_zone_ref.notify_post(1)"),
+                             (server, "blk_ring_signal_consumer_unchecked", "binding->blk_zone_ref.notify_post(0)")]:
+        body = function_body(text, name)
+        reject_tokens(body, ["wki_send(", "ZoneNotifyPayload"], "device wake cannot reselect numeric channels")
+        require_tokens(body, [call], "wake through retained zone")
+    require_tokens(function_body(server, "blk_ring_signal_consumer_unchecked"), ["!binding->blk_zone_ref.live()"], "raw completion admission")
+    require_tokens(WKI_WAIT_KTEST.read_text(), ["NotificationsKeepOriginalGrantThroughRetirement"], "actual notification lifetime coverage")
+
+
 def main() -> None:
+    test_device_notifications_keep_retained_zone_identity()
+    test_local_backing_uses_retained_grants()
+    test_zone_authority_keeps_the_admitted_channel()
     test_timeout_retirement_helper_marks_inactive_under_table_lock()
     test_timeout_cleanup_clears_pending_waiters()
     test_message_read_write_timeouts_retire_zone_before_release()

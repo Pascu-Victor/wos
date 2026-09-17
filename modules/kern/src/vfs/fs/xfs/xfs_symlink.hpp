@@ -12,8 +12,9 @@
 namespace ker::vfs::xfs {
 
 // Read the symlink target into the provided buffer.
-// buf must be at least buflen bytes.  The target is null-terminated.
-// Returns the length of the target (excluding null), or negative errno.
+// Copy up to buflen bytes without a null terminator, as required by readlink.
+// Returns the number of copied bytes, or negative errno. String consumers must
+// reserve space and append their own terminator after a successful read.
 auto xfs_readlink(XfsInode* ip, char* buf, size_t buflen) -> int;
 
 }  // namespace ker::vfs::xfs

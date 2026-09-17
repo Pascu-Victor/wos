@@ -25,6 +25,7 @@
 #include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/sys/mutex.hpp>
+#include <string_view>
 #include <vfs/fs/devfs.hpp>
 #include <vfs/mount.hpp>
 #include <vfs/vfs.hpp>
@@ -44,7 +45,6 @@ std::deque<DiscoveredResource> g_discovered;  // NOLINT(cppcoreguidelines-avoid-
 bool g_remotable_initialized = false;         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 constexpr size_t VFS_MOUNT_PATH_LEN = 384;
 constexpr size_t NET_AUTO_ATTACH_NAME_LEN = 64;
-constexpr size_t VFS_HOST_DIR_LEN = 256;
 
 // Resource RX is first deferred into task context. Keep mount handshakes on
 // that worker as a second stage because they wait for an attach ACK and may
@@ -182,14 +182,10 @@ auto has_local_subnet_overlap(uint32_t remote_ip, uint32_t remote_mask) -> bool 
             continue;
         }
 
-        auto* nif = ker::net::netif_find_by_dev(dev.get());
-        if (nif == nullptr) {
-            continue;
-        }
-
-        for (size_t j = 0; j < nif->ipv4_addr_count; j++) {
-            auto const LOCAL_ADDR = nif->ipv4_addrs.at(j).addr.to_host_order();
-            auto const LOCAL_MASK = nif->ipv4_addrs.at(j).netmask.to_host_order();
+        auto const IPV4 = ker::net::netif_ipv4_snapshot(dev.get());
+        for (size_t j = 0; j < IPV4.count; j++) {
+            auto const LOCAL_ADDR = IPV4.entries.at(j).addr.to_host_order();
+            auto const LOCAL_MASK = IPV4.entries.at(j).netmask.to_host_order();
             uint32_t const LOCAL_SUBNET = LOCAL_ADDR & LOCAL_MASK;
             if (LOCAL_SUBNET == REMOTE_SUBNET && LOCAL_MASK == remote_mask) {
                 return true;
@@ -203,10 +199,11 @@ auto is_local_l3_candidate(ker::net::NetDevice const* dev) -> bool {
     if (dev == nullptr || dev->wki_transport) {
         return false;
     }
-    if (std::strncmp(dev->name.data(), "lo", ker::net::NETDEV_NAME_LEN) == 0) {
+    auto const CONFIG = ker::net::netdev_config_snapshot(dev);
+    if (std::strncmp(CONFIG.name.data(), "lo", ker::net::NETDEV_NAME_LEN) == 0) {
         return false;
     }
-    return std::strncmp(dev->name.data(), "wki-", 4) != 0;
+    return std::strncmp(CONFIG.name.data(), "wki-", 4) != 0;
 }
 
 auto local_ipv4_configuration_pending() -> bool {
@@ -219,8 +216,8 @@ auto local_ipv4_configuration_pending() -> bool {
         }
 
         found_candidate = true;
-        auto* nif = ker::net::netif_find_by_dev(dev.get());
-        if (nif != nullptr && nif->ipv4_addr_count != 0) {
+        auto const IPV4 = ker::net::netif_ipv4_snapshot(dev.get());
+        if (IPV4.count != 0) {
             return false;
         }
     }
@@ -231,19 +228,50 @@ auto local_ipv4_configuration_pending() -> bool {
 //   export "/"      -> "/wki/<hostname>"
 //   export "/proc"  -> "/wki/<hostname>/proc"
 //   export "data"   -> "/wki/<hostname>/data"
-void build_vfs_mount_path(char* out, size_t out_size, const char* hostname, const char* export_name) {
-    // Strip leading '/' from export name
-    const char* stripped = export_name;
-    while (*stripped == '/') {
-        stripped++;
+auto valid_vfs_export_name(std::string_view name) -> bool {
+    if (name.size() >= DISCOVERED_RESOURCE_NAME_LEN || name.find('\0') != std::string_view::npos) return false;
+    while (!name.empty()) {
+        size_t const SEPARATOR = name.find('/');
+        auto const COMPONENT = name.substr(0, SEPARATOR);
+        if (COMPONENT == "." || COMPONENT == "..") return false;
+        if (SEPARATOR == std::string_view::npos) break;
+        name.remove_prefix(SEPARATOR + 1);
     }
+    return true;
+}
 
-    if (*stripped == '\0') {
-        // Root export - mount directly at /wki/<hostname>
-        snprintf(out, out_size, "/wki/%s", hostname);
-    } else {
-        snprintf(out, out_size, "/wki/%s/%s", hostname, stripped);
-    }
+auto build_vfs_mount_path(char* out, size_t out_size, const char* hostname, const char* export_name) -> bool {
+    if (out == nullptr || out_size == 0) return false;
+    // Validate owned bounded copies: the peer's hostname storage can change,
+    // and the path formatter must consume the exact bytes that were checked.
+    auto copy_name = [](const char* source, auto& destination, size_t& length) {
+        if (source == nullptr) return false;
+        for (size_t i = 0; i < destination.size(); ++i) {
+            char const BYTE = source[i];
+            destination[i] = BYTE;
+            if (BYTE == '\0') {
+                length = i;
+                return true;
+            }
+        }
+        return false;
+    };
+    std::array<char, WKI_HOSTNAME_MAX> host{};
+    std::array<char, DISCOVERED_RESOURCE_NAME_LEN> name{};
+    size_t host_length = 0, name_length = 0;
+    if (!copy_name(hostname, host, host_length) || !copy_name(export_name, name, name_length)) return false;
+    std::string_view const HOST(host.data(), host_length);
+    if (HOST.empty() || HOST == "." || HOST == ".." || HOST.find('/') != std::string_view::npos) return false;
+    if (!valid_vfs_export_name(std::string_view(name.data(), name_length))) return false;
+
+    const char* stripped = name.data();
+    while (*stripped == '/') ++stripped;
+    std::array<char, VFS_MOUNT_PATH_LEN> candidate{};
+    int const LENGTH = *stripped == '\0' ? std::snprintf(candidate.data(), candidate.size(), "/wki/%s", host.data())
+                                         : std::snprintf(candidate.data(), candidate.size(), "/wki/%s/%s", host.data(), stripped);
+    if (LENGTH < 0 || static_cast<size_t>(LENGTH) >= candidate.size() || static_cast<size_t>(LENGTH) >= out_size) return false;
+    std::memcpy(out, candidate.data(), static_cast<size_t>(LENGTH) + 1);
+    return true;
 }
 
 auto pending_vfs_mount_is_live_locked(const PendingVfsMount& pending) -> bool {
@@ -261,7 +289,8 @@ auto pending_vfs_mount_matches_resource_locked(const PendingVfsMount& pending, c
     }
 
     std::array<char, VFS_MOUNT_PATH_LEN> expected_mount_path{};
-    build_vfs_mount_path(expected_mount_path.data(), expected_mount_path.size(), hostname, static_cast<const char*>(res.name));
+    if (!build_vfs_mount_path(expected_mount_path.data(), expected_mount_path.size(), hostname, static_cast<const char*>(res.name)))
+        return false;
     return std::strncmp(expected_mount_path.data(), pending.mount_path.data(), expected_mount_path.size()) == 0;
 }
 
@@ -325,16 +354,17 @@ void sync_vfs_devfs_resource(uint16_t node_id, uint32_t resource_id, uint64_t re
     }
 }
 
-auto capture_net_advert_state(ker::net::NetDevice* dev) -> NetAdvertState {
+auto capture_net_advert_state(ker::net::NetDevice* dev, const ker::net::NetDeviceConfigSnapshot& config) -> NetAdvertState {
     NetAdvertState state = {};
     if (dev == nullptr) {
         return state;
     }
 
     auto* nif = ker::net::netif_find_by_dev(dev);
-    if (nif != nullptr && nif->ipv4_addr_count != 0) {
-        state.ipv4_addr = nif->ipv4_addrs.front().addr;
-        state.ipv4_mask = nif->ipv4_addrs.front().netmask;
+    auto const IPV4 = ker::net::netif_ipv4_snapshot(dev);
+    if (IPV4.count != 0) {
+        state.ipv4_addr = IPV4.entries.front().addr;
+        state.ipv4_mask = IPV4.entries.front().netmask;
     }
     if (nif != nullptr) {
         std::array<ker::net::IPv6Addr, WKI_NET_IPV6_STATE_MAX_ADDRS> addresses{};
@@ -364,9 +394,9 @@ auto capture_net_advert_state(ker::net::NetDevice* dev) -> NetAdvertState {
         }
     }
 
-    state.real_mac = dev->mac;
-    state.link_state = static_cast<uint16_t>(dev->state != 0 ? 1 : 0);
-    state.mtu = dev->mtu != 0 ? dev->mtu : 1500;
+    state.real_mac = config.mac;
+    state.link_state = static_cast<uint16_t>(config.state != 0 ? 1 : 0);
+    state.mtu = config.mtu != 0 ? config.mtu : 1500;
     return state;
 }
 
@@ -461,7 +491,7 @@ auto rearm_live_vfs_mounts_after_withdrawal_locked() -> size_t {
         }
 
         std::array<char, VFS_MOUNT_PATH_LEN> mount_path{};
-        build_vfs_mount_path(mount_path.data(), mount_path.size(), hostname, static_cast<const char*>(resource.name));
+        if (!build_vfs_mount_path(mount_path.data(), mount_path.size(), hostname, static_cast<const char*>(resource.name))) continue;
         queue_vfs_mount_locked(resource.node_id, resource.resource_id, resource.generation, mount_path.data(), true);
         queued++;
     }
@@ -657,8 +687,9 @@ auto send_resource_advert_to_peer(uint16_t peer_node, ker::dev::BlockDevice* bde
 }
 
 auto send_net_resource_advert_to_peer(uint16_t peer_node, ker::net::NetDevice* ndev, uint32_t resource_id) -> int {
+    auto const CONFIG = ker::net::netdev_config_snapshot(ndev);
     uint8_t name_len = 0;
-    while (name_len < DISCOVERED_RESOURCE_NAME_LEN - 1 && ndev->name.at(name_len) != '\0') {
+    while (name_len < DISCOVERED_RESOURCE_NAME_LEN - 1 && CONFIG.name.at(name_len) != '\0') {
         name_len++;
     }
 
@@ -682,7 +713,7 @@ auto send_net_resource_advert_to_peer(uint16_t peer_node, ker::net::NetDevice* n
         }
     }
 
-    NetAdvertState const STATE = capture_net_advert_state(ndev);
+    NetAdvertState const STATE = capture_net_advert_state(ndev, CONFIG);
     adv->ipv4_addr = STATE.ipv4_addr;
     adv->ipv4_mask = STATE.ipv4_mask;
     adv->real_mac = STATE.real_mac;
@@ -690,7 +721,7 @@ auto send_net_resource_advert_to_peer(uint16_t peer_node, ker::net::NetDevice* n
     adv->mtu = STATE.mtu;
 
     adv->name_len = name_len;
-    memcpy(buf.data() + sizeof(ResourceAdvertNetPayload), ndev->name.data(), name_len);
+    memcpy(buf.data() + sizeof(ResourceAdvertNetPayload), CONFIG.name.data(), name_len);
     if (WITH_IPV6) {
         memcpy(buf.data() + sizeof(ResourceAdvertNetPayload) + name_len, &STATE.ipv6, sizeof(STATE.ipv6));
     }
@@ -700,11 +731,178 @@ auto send_net_resource_advert_to_peer(uint16_t peer_node, ker::net::NetDevice* n
 
 enum class ResourceAdvertStage : uint8_t {
     WAIT_FOR_IDLE,
+    GROUP_SIGNAL,
+    EXEC_HANDOFF,
+    GROUP_ROUTE,
+    GROUP_RECEIVERS,
+    TERMINAL_SIGNALS,
+    PARENT_DEATH,
+    CHILD_SIGNAL,
+    CHILD_QUERY,
+    CHILD_CLAIM,
+    CHILD_CPU,
+    RETURN_OWNER_CWD,
+    ROOTED_RETURN_OWNER_CWD,
     VFS,
     BLOCK,
     NET,
     COMPLETE,
 };
+
+auto send_group_signal_advert(uint16_t peer_node) -> int {
+    constexpr size_t NAME_SIZE = sizeof(WKI_GROUP_SIGNAL_RESOURCE_NAME) - 1;
+    std::array<uint8_t, sizeof(ResourceAdvertPayload) + NAME_SIZE> bytes{};
+    ResourceAdvertPayload const HEADER{.node_id = g_wki.my_node_id,
+                                       .resource_type = static_cast<uint16_t>(ResourceType::COMPUTE),
+                                       .resource_id = WKI_GROUP_SIGNAL_RESOURCE_ID,
+                                       .flags = 0,
+                                       .name_len = static_cast<uint8_t>(NAME_SIZE)};
+    std::memcpy(bytes.data(), &HEADER, sizeof(HEADER));
+    std::memcpy(bytes.data() + sizeof(HEADER), WKI_GROUP_SIGNAL_RESOURCE_NAME, NAME_SIZE);
+    return wki_send(peer_node, WKI_CHAN_CONTROL, MsgType::RESOURCE_ADVERT, bytes.data(), bytes.size());
+}
+
+auto send_group_route_advert(uint16_t peer_node) -> int {
+    constexpr size_t NAME_SIZE = sizeof(WKI_GROUP_ROUTE_RESOURCE_NAME) - 1;
+    std::array<uint8_t, sizeof(ResourceAdvertPayload) + NAME_SIZE> bytes{};
+    ResourceAdvertPayload const HEADER{.node_id = g_wki.my_node_id,
+                                       .resource_type = static_cast<uint16_t>(ResourceType::COMPUTE),
+                                       .resource_id = WKI_GROUP_ROUTE_RESOURCE_ID,
+                                       .flags = 0,
+                                       .name_len = static_cast<uint8_t>(NAME_SIZE)};
+    std::memcpy(bytes.data(), &HEADER, sizeof(HEADER));
+    std::memcpy(bytes.data() + sizeof(HEADER), WKI_GROUP_ROUTE_RESOURCE_NAME, NAME_SIZE);
+    return wki_send(peer_node, WKI_CHAN_CONTROL, MsgType::RESOURCE_ADVERT, bytes.data(), bytes.size());
+}
+
+auto send_group_receiver_advert(uint16_t peer_node) -> int {
+    constexpr size_t NAME_SIZE = sizeof(WKI_GROUP_RECEIVER_RESOURCE_NAME) - 1;
+    std::array<uint8_t, sizeof(ResourceAdvertPayload) + NAME_SIZE> bytes{};
+    ResourceAdvertPayload const HEADER{.node_id = g_wki.my_node_id,
+                                       .resource_type = static_cast<uint16_t>(ResourceType::COMPUTE),
+                                       .resource_id = WKI_GROUP_RECEIVER_RESOURCE_ID,
+                                       .flags = 0,
+                                       .name_len = static_cast<uint8_t>(NAME_SIZE)};
+    std::memcpy(bytes.data(), &HEADER, sizeof(HEADER));
+    std::memcpy(bytes.data() + sizeof(HEADER), WKI_GROUP_RECEIVER_RESOURCE_NAME, NAME_SIZE);
+    return wki_send(peer_node, WKI_CHAN_CONTROL, MsgType::RESOURCE_ADVERT, bytes.data(), bytes.size());
+}
+
+auto send_child_signal_advert(uint16_t peer_node) -> int {
+    constexpr size_t NAME_SIZE = sizeof(WKI_CHILD_SIGNAL_RESOURCE_NAME) - 1;
+    std::array<uint8_t, sizeof(ResourceAdvertPayload) + NAME_SIZE> bytes{};
+    ResourceAdvertPayload const HEADER{.node_id = g_wki.my_node_id,
+                                       .resource_type = static_cast<uint16_t>(ResourceType::COMPUTE),
+                                       .resource_id = WKI_CHILD_SIGNAL_RESOURCE_ID,
+                                       .flags = 0,
+                                       .name_len = static_cast<uint8_t>(NAME_SIZE)};
+    std::memcpy(bytes.data(), &HEADER, sizeof(HEADER));
+    std::memcpy(bytes.data() + sizeof(HEADER), WKI_CHILD_SIGNAL_RESOURCE_NAME, NAME_SIZE);
+    return wki_send(peer_node, WKI_CHAN_CONTROL, MsgType::RESOURCE_ADVERT, bytes.data(), bytes.size());
+}
+
+auto send_child_query_advert(uint16_t peer_node) -> int {
+    constexpr size_t NAME_SIZE = sizeof(WKI_CHILD_QUERY_RESOURCE_NAME) - 1;
+    std::array<uint8_t, sizeof(ResourceAdvertPayload) + NAME_SIZE> bytes{};
+    ResourceAdvertPayload const HEADER{.node_id = g_wki.my_node_id,
+                                       .resource_type = static_cast<uint16_t>(ResourceType::COMPUTE),
+                                       .resource_id = WKI_CHILD_QUERY_RESOURCE_ID,
+                                       .flags = 0,
+                                       .name_len = static_cast<uint8_t>(NAME_SIZE)};
+    std::memcpy(bytes.data(), &HEADER, sizeof(HEADER));
+    std::memcpy(bytes.data() + sizeof(HEADER), WKI_CHILD_QUERY_RESOURCE_NAME, NAME_SIZE);
+    return wki_send(peer_node, WKI_CHAN_CONTROL, MsgType::RESOURCE_ADVERT, bytes.data(), bytes.size());
+}
+
+auto send_child_claim_advert(uint16_t peer_node) -> int {
+    constexpr size_t NAME_SIZE = sizeof(WKI_CHILD_CLAIM_RESOURCE_NAME) - 1;
+    std::array<uint8_t, sizeof(ResourceAdvertPayload) + NAME_SIZE> bytes{};
+    ResourceAdvertPayload const HEADER{.node_id = g_wki.my_node_id,
+                                       .resource_type = static_cast<uint16_t>(ResourceType::COMPUTE),
+                                       .resource_id = WKI_CHILD_CLAIM_RESOURCE_ID,
+                                       .flags = 0,
+                                       .name_len = static_cast<uint8_t>(NAME_SIZE)};
+    std::memcpy(bytes.data(), &HEADER, sizeof(HEADER));
+    std::memcpy(bytes.data() + sizeof(HEADER), WKI_CHILD_CLAIM_RESOURCE_NAME, NAME_SIZE);
+    return wki_send(peer_node, WKI_CHAN_CONTROL, MsgType::RESOURCE_ADVERT, bytes.data(), bytes.size());
+}
+auto send_child_cpu_advert(uint16_t peer_node) -> int {
+    constexpr size_t NAME_SIZE = sizeof(WKI_CHILD_CPU_RESOURCE_NAME) - 1;
+    std::array<uint8_t, sizeof(ResourceAdvertPayload) + NAME_SIZE> bytes{};
+    ResourceAdvertPayload const HEADER{.node_id = g_wki.my_node_id,
+                                       .resource_type = static_cast<uint16_t>(ResourceType::COMPUTE),
+                                       .resource_id = WKI_CHILD_CPU_RESOURCE_ID,
+                                       .flags = 0,
+                                       .name_len = static_cast<uint8_t>(NAME_SIZE)};
+    std::memcpy(bytes.data(), &HEADER, sizeof(HEADER));
+    std::memcpy(bytes.data() + sizeof(HEADER), WKI_CHILD_CPU_RESOURCE_NAME, NAME_SIZE);
+    return wki_send(peer_node, WKI_CHAN_CONTROL, MsgType::RESOURCE_ADVERT, bytes.data(), bytes.size());
+}
+
+auto send_parent_death_advert(uint16_t peer_node) -> int {
+    constexpr size_t NAME_SIZE = sizeof(WKI_PARENT_DEATH_RESOURCE_NAME) - 1;
+    std::array<uint8_t, sizeof(ResourceAdvertPayload) + NAME_SIZE> bytes{};
+    ResourceAdvertPayload const HEADER{.node_id = g_wki.my_node_id,
+                                       .resource_type = static_cast<uint16_t>(ResourceType::COMPUTE),
+                                       .resource_id = WKI_PARENT_DEATH_RESOURCE_ID,
+                                       .flags = 0,
+                                       .name_len = static_cast<uint8_t>(NAME_SIZE)};
+    std::memcpy(bytes.data(), &HEADER, sizeof(HEADER));
+    std::memcpy(bytes.data() + sizeof(HEADER), WKI_PARENT_DEATH_RESOURCE_NAME, NAME_SIZE);
+    return wki_send(peer_node, WKI_CHAN_CONTROL, MsgType::RESOURCE_ADVERT, bytes.data(), bytes.size());
+}
+
+auto send_terminal_signal_advert(uint16_t peer_node) -> int {
+    constexpr size_t NAME_SIZE = sizeof(WKI_TERMINAL_SIGNAL_RESOURCE_NAME) - 1;
+    std::array<uint8_t, sizeof(ResourceAdvertPayload) + NAME_SIZE> bytes{};
+    ResourceAdvertPayload const HEADER{.node_id = g_wki.my_node_id,
+                                       .resource_type = static_cast<uint16_t>(ResourceType::COMPUTE),
+                                       .resource_id = WKI_TERMINAL_SIGNAL_RESOURCE_ID,
+                                       .flags = 0,
+                                       .name_len = static_cast<uint8_t>(NAME_SIZE)};
+    std::memcpy(bytes.data(), &HEADER, sizeof(HEADER));
+    std::memcpy(bytes.data() + sizeof(HEADER), WKI_TERMINAL_SIGNAL_RESOURCE_NAME, NAME_SIZE);
+    return wki_send(peer_node, WKI_CHAN_CONTROL, MsgType::RESOURCE_ADVERT, bytes.data(), bytes.size());
+}
+
+auto send_exec_handoff_advert(uint16_t peer_node) -> int {
+    constexpr size_t NAME_SIZE = sizeof(WKI_EXEC_HANDOFF_RESOURCE_NAME) - 1;
+    std::array<uint8_t, sizeof(ResourceAdvertPayload) + NAME_SIZE> bytes{};
+    ResourceAdvertPayload const HEADER{.node_id = g_wki.my_node_id,
+                                       .resource_type = static_cast<uint16_t>(ResourceType::COMPUTE),
+                                       .resource_id = WKI_EXEC_HANDOFF_RESOURCE_ID,
+                                       .flags = 0,
+                                       .name_len = static_cast<uint8_t>(NAME_SIZE)};
+    std::memcpy(bytes.data(), &HEADER, sizeof(HEADER));
+    std::memcpy(bytes.data() + sizeof(HEADER), WKI_EXEC_HANDOFF_RESOURCE_NAME, NAME_SIZE);
+    return wki_send(peer_node, WKI_CHAN_CONTROL, MsgType::RESOURCE_ADVERT, bytes.data(), bytes.size());
+}
+
+auto send_return_owner_cwd_advert(uint16_t peer_node) -> int {
+    constexpr size_t NAME_SIZE = sizeof(WKI_RETURN_OWNER_CWD_RESOURCE_NAME) - 1;
+    std::array<uint8_t, sizeof(ResourceAdvertPayload) + NAME_SIZE> bytes{};
+    ResourceAdvertPayload const HEADER{.node_id = g_wki.my_node_id,
+                                       .resource_type = static_cast<uint16_t>(ResourceType::COMPUTE),
+                                       .resource_id = WKI_RETURN_OWNER_CWD_RESOURCE_ID,
+                                       .flags = 0,
+                                       .name_len = static_cast<uint8_t>(NAME_SIZE)};
+    std::memcpy(bytes.data(), &HEADER, sizeof(HEADER));
+    std::memcpy(bytes.data() + sizeof(HEADER), WKI_RETURN_OWNER_CWD_RESOURCE_NAME, NAME_SIZE);
+    return wki_send(peer_node, WKI_CHAN_CONTROL, MsgType::RESOURCE_ADVERT, bytes.data(), bytes.size());
+}
+
+auto send_rooted_return_owner_cwd_advert(uint16_t peer_node) -> int {
+    constexpr size_t NAME_SIZE = sizeof(WKI_ROOTED_RETURN_OWNER_CWD_RESOURCE_NAME) - 1;
+    std::array<uint8_t, sizeof(ResourceAdvertPayload) + NAME_SIZE> bytes{};
+    ResourceAdvertPayload const HEADER{.node_id = g_wki.my_node_id,
+                                       .resource_type = static_cast<uint16_t>(ResourceType::COMPUTE),
+                                       .resource_id = WKI_ROOTED_RETURN_OWNER_CWD_RESOURCE_ID,
+                                       .flags = 0,
+                                       .name_len = static_cast<uint8_t>(NAME_SIZE)};
+    std::memcpy(bytes.data(), &HEADER, sizeof(HEADER));
+    std::memcpy(bytes.data() + sizeof(HEADER), WKI_ROOTED_RETURN_OWNER_CWD_RESOURCE_NAME, NAME_SIZE);
+    return wki_send(peer_node, WKI_CHAN_CONTROL, MsgType::RESOURCE_ADVERT, bytes.data(), bytes.size());
+}
 
 auto control_stream_is_idle(WkiPeer* peer) -> bool {
     WkiChannel* channel = wki_channel_lookup_in_peer(peer, peer->node_id, WKI_CHAN_CONTROL);
@@ -755,6 +953,10 @@ void wki_resource_process_pending_adverts() {
     bool refreshed_exports = false;
 
     for (auto& peer : g_wki.peers) {
+        if (peer.node_id == WKI_NODE_INVALID || peer.state != PeerState::CONNECTED) continue;
+        // The outbox owns its tracked-send lease. Drain revocations even when
+        // the last advertisement request completed, and before taking ours.
+        if (!wki_remote_vfs_publish_withdrawals(peer.node_id)) continue;
         uint64_t const REQUEST = peer.resource_advert_request.load(std::memory_order_acquire);
         if (peer.node_id == WKI_NODE_INVALID || peer.state != PeerState::CONNECTED || REQUEST == 0 ||
             (peer.resource_advert_active_request == REQUEST &&
@@ -783,6 +985,68 @@ void wki_resource_process_pending_adverts() {
                 wki_remote_vfs_refresh_exports();
                 refreshed_exports = true;
             }
+            stage = ResourceAdvertStage::GROUP_SIGNAL;
+            peer.resource_advert_stage = static_cast<uint8_t>(stage);
+        }
+
+        if (stage == ResourceAdvertStage::GROUP_SIGNAL) {
+            if (send_group_signal_advert(peer.node_id) != WKI_OK) continue;
+            stage = ResourceAdvertStage::EXEC_HANDOFF;
+            peer.resource_advert_stage = static_cast<uint8_t>(stage);
+        }
+
+        if (stage == ResourceAdvertStage::EXEC_HANDOFF) {
+            if (send_exec_handoff_advert(peer.node_id) != WKI_OK) continue;
+            stage = ResourceAdvertStage::GROUP_ROUTE;
+            peer.resource_advert_stage = static_cast<uint8_t>(stage);
+        }
+        if (stage == ResourceAdvertStage::GROUP_ROUTE) {
+            if (send_group_route_advert(peer.node_id) != WKI_OK) continue;
+            stage = ResourceAdvertStage::GROUP_RECEIVERS;
+            peer.resource_advert_stage = static_cast<uint8_t>(stage);
+        }
+        if (stage == ResourceAdvertStage::GROUP_RECEIVERS) {
+            if (send_group_receiver_advert(peer.node_id) != WKI_OK) continue;
+            stage = ResourceAdvertStage::TERMINAL_SIGNALS;
+            peer.resource_advert_stage = static_cast<uint8_t>(stage);
+        }
+        if (stage == ResourceAdvertStage::TERMINAL_SIGNALS) {
+            if (send_terminal_signal_advert(peer.node_id) != WKI_OK) continue;
+            stage = ResourceAdvertStage::PARENT_DEATH;
+            peer.resource_advert_stage = static_cast<uint8_t>(stage);
+        }
+        if (stage == ResourceAdvertStage::PARENT_DEATH) {
+            if (send_parent_death_advert(peer.node_id) != WKI_OK) continue;
+            stage = ResourceAdvertStage::CHILD_SIGNAL;
+            peer.resource_advert_stage = static_cast<uint8_t>(stage);
+        }
+        if (stage == ResourceAdvertStage::CHILD_SIGNAL) {
+            if (send_child_signal_advert(peer.node_id) != WKI_OK) continue;
+            stage = ResourceAdvertStage::CHILD_QUERY;
+            peer.resource_advert_stage = static_cast<uint8_t>(stage);
+        }
+        if (stage == ResourceAdvertStage::CHILD_QUERY) {
+            if (send_child_query_advert(peer.node_id) != WKI_OK) continue;
+            stage = ResourceAdvertStage::CHILD_CLAIM;
+            peer.resource_advert_stage = static_cast<uint8_t>(stage);
+        }
+        if (stage == ResourceAdvertStage::CHILD_CLAIM) {
+            if (send_child_claim_advert(peer.node_id) != WKI_OK) continue;
+            stage = ResourceAdvertStage::CHILD_CPU;
+            peer.resource_advert_stage = static_cast<uint8_t>(stage);
+        }
+        if (stage == ResourceAdvertStage::CHILD_CPU) {
+            if (send_child_cpu_advert(peer.node_id) != WKI_OK) continue;
+            stage = ResourceAdvertStage::RETURN_OWNER_CWD;
+            peer.resource_advert_stage = static_cast<uint8_t>(stage);
+        }
+        if (stage == ResourceAdvertStage::RETURN_OWNER_CWD) {
+            if (send_return_owner_cwd_advert(peer.node_id) != WKI_OK) continue;
+            stage = ResourceAdvertStage::ROOTED_RETURN_OWNER_CWD;
+            peer.resource_advert_stage = static_cast<uint8_t>(stage);
+        }
+        if (stage == ResourceAdvertStage::ROOTED_RETURN_OWNER_CWD) {
+            if (send_rooted_return_owner_cwd_advert(peer.node_id) != WKI_OK) continue;
             stage = ResourceAdvertStage::VFS;
             peer.resource_advert_stage = static_cast<uint8_t>(stage);
         }
@@ -838,6 +1102,7 @@ void wki_remotable_notify_net_changed(ker::net::NetDevice* dev) {
     if (!g_remotable_initialized || dev == nullptr || dev->remotable == nullptr || !dev->remotable->can_remote()) {
         return;
     }
+    if (ker::net::netdev_defer_control_notify(dev, ker::net::NetDeviceControlNotify::RESOURCE_ADVERT)) return;
 
     for (size_t p = 0; p < WKI_MAX_PEERS; p++) {
         WkiPeer* peer = &g_wki.peers.at(p);
@@ -906,6 +1171,140 @@ auto wki_resource_observation_is_live(uint16_t node_id, ResourceType type, uint3
     return wki_resource_observation_snapshot(node_id, type, resource_id, generation, &current) &&
            wki_resource_incarnation_equal(current, owner_incarnation);
 }
+
+auto wki_resource_observation_require_flags(uint16_t node_id, ResourceType type, uint32_t resource_id, uint64_t generation,
+                                            const ResourceIncarnationToken& owner_incarnation, uint8_t required_flags) -> int {
+    if (generation == 0) return -ENOTCONN;
+    s_remotable_lock.lock();
+    auto const* resource = find_resource_unlocked(node_id, type, resource_id);
+    int result = -ENOTCONN;
+    if (resource != nullptr && resource->generation == generation &&
+        wki_resource_incarnation_equal(resource->owner_incarnation, owner_incarnation)) {
+        result = (resource->flags & required_flags) == required_flags ? 0 : -ENOTSUP;
+    }
+    s_remotable_lock.unlock();
+    return result;
+}
+
+#ifdef WOS_SELFTEST
+auto wki_remotable_selftest_vfs_mount_path() -> bool {
+    struct ValidCase {
+        const char* host;
+        const char* name;
+        const char* expected;
+    };
+    constexpr std::array VALID{
+        ValidCase{"peer", "/", "/wki/peer"},
+        ValidCase{"peer", "", "/wki/peer"},
+        ValidCase{"peer", "///", "/wki/peer"},
+        ValidCase{"peer", "tmp/.cache/a..b", "/wki/peer/tmp/.cache/a..b"},
+        ValidCase{"peer", "/tmp//leaf", "/wki/peer/tmp//leaf"},
+        ValidCase{"node.example", "a/.../b", "/wki/node.example/a/.../b"},
+    };
+    std::array<char, VFS_MOUNT_PATH_LEN> output{};
+    for (auto const& row : VALID) {
+        size_t const CAPACITY = std::strlen(row.expected) + 1;
+        if (!build_vfs_mount_path(output.data(), CAPACITY, row.host, row.name) || std::strcmp(output.data(), row.expected) != 0)
+            return false;
+        output.fill('!');
+        auto const BEFORE = output;
+        if (build_vfs_mount_path(output.data(), CAPACITY - 1, row.host, row.name) || output != BEFORE) return false;
+    }
+    auto refused = [&](const char* host, const char* name, size_t capacity = VFS_MOUNT_PATH_LEN) {
+        output.fill('!');
+        auto const BEFORE = output;
+        return !build_vfs_mount_path(output.data(), capacity, host, name) && output == BEFORE;
+    };
+    for (auto const* name : {".", "..", "/../tmp", "tmp/./leaf", "tmp/../leaf", "////..////"}) {
+        if (valid_vfs_export_name(name) || !refused("peer", name)) return false;
+    }
+    for (auto const* host : {"", ".", "..", "a/b", "/"}) {
+        if (!refused(host, "tmp")) return false;
+    }
+    constexpr char EMBEDDED_NUL[] = "tmp\0/leaf";
+    if (valid_vfs_export_name(std::string_view(EMBEDDED_NUL, sizeof(EMBEDDED_NUL) - 1))) return false;
+    std::array<char, WKI_HOSTNAME_MAX> host{};
+    std::array<char, DISCOVERED_RESOURCE_NAME_LEN> name{};
+    host.fill('h');
+    name.fill('e');
+    if (!refused(host.data(), "tmp") || !refused("peer", name.data()) || valid_vfs_export_name(std::string_view(name.data(), name.size())))
+        return false;
+    host.back() = '\0';
+    name.back() = '\0';
+    if (!build_vfs_mount_path(output.data(), output.size(), host.data(), name.data()) ||
+        std::strlen(output.data()) != 5 + host.size() - 1 + 1 + name.size() - 1 || std::strncmp(output.data(), "/wki/", 5) != 0 ||
+        std::strncmp(output.data() + 5, host.data(), host.size() - 1) != 0 || output[5 + host.size() - 1] != '/' ||
+        std::strcmp(output.data() + 5 + host.size(), name.data()) != 0)
+        return false;
+    return refused(nullptr, "tmp") && refused("peer", nullptr) && refused("peer", "tmp", 0) &&
+           !build_vfs_mount_path(nullptr, output.size(), "peer", "tmp");
+}
+
+auto wki_remotable_selftest_exec_view_support() -> bool {
+    // A real registry observation, without discovery/auto-attach side effects.
+    constexpr uint16_t NODE = 0x7FFE;
+    constexpr uint32_t ID = 0xFFFFFFFE;
+    constexpr uint64_t GENERATION = 0xFFFFFFFE;
+    ResourceIncarnationToken const OWNER{.owner_boot_epoch = 17, .resource_incarnation = 23};
+    s_remotable_lock.lock();
+    if (std::any_of(g_discovered.begin(), g_discovered.end(), [](const auto& row) {
+            return row.node_id == NODE && row.resource_type == ResourceType::VFS && row.resource_id == ID;
+        })) {
+        s_remotable_lock.unlock();
+        return false;
+    }
+    g_discovered.push_back(DiscoveredResource{.node_id = NODE,
+                                              .resource_type = ResourceType::VFS,
+                                              .resource_id = ID,
+                                              .generation = GENERATION,
+                                              .owner_incarnation = OWNER,
+                                              .valid = true});
+    s_remotable_lock.unlock();
+    struct Cleanup {
+        ~Cleanup() {
+            s_remotable_lock.lock();
+            std::erase_if(g_discovered, [](const auto& row) {
+                return row.node_id == NODE && row.resource_type == ResourceType::VFS && row.resource_id == ID &&
+                       row.generation == GENERATION;
+            });
+            s_remotable_lock.unlock();
+        }
+    } cleanup;
+    auto check = [&](int expected, uint64_t generation = GENERATION) {
+        return wki_resource_observation_require_flags(NODE, ResourceType::VFS, ID, generation, OWNER, RESOURCE_FLAG_VFS_EXEC_VIEW) ==
+               expected;
+    };
+    auto update = [&](uint8_t flags, bool valid = true, const ResourceIncarnationToken* owner = nullptr) {
+        s_remotable_lock.lock();
+        for (auto& row : g_discovered) {
+            if (row.node_id == NODE && row.resource_type == ResourceType::VFS && row.resource_id == ID && row.generation == GENERATION) {
+                row.flags = flags;
+                row.valid = valid;
+                row.owner_incarnation = owner != nullptr ? *owner : OWNER;
+            }
+        }
+        s_remotable_lock.unlock();
+    };
+    bool ok = check(-ENOTSUP);  // Old VFS adverts carry zero flags.
+    update(RESOURCE_FLAG_READABLE | RESOURCE_FLAG_WRITABLE);
+    ok = check(-ENOTSUP) && ok;
+    update(RESOURCE_FLAG_VFS_EXEC_VIEW);
+    ok = check(0) && check(-ENOTCONN, 0) && check(-ENOTCONN, GENERATION + 1) && ok;
+    ok = wki_resource_observation_require_flags(NODE, ResourceType::BLOCK, ID, GENERATION, OWNER, RESOURCE_FLAG_VFS_EXEC_VIEW) ==
+             -ENOTCONN &&
+         ok;
+    update(0);  // In-place feature withdrawal must not require a remount.
+    ok = check(-ENOTSUP) && ok;
+    ResourceIncarnationToken replacement{.owner_boot_epoch = 18, .resource_incarnation = 23};
+    update(RESOURCE_FLAG_VFS_EXEC_VIEW, true, &replacement);
+    ok = check(-ENOTCONN) && ok;
+    replacement = {.owner_boot_epoch = 17, .resource_incarnation = 24};
+    update(RESOURCE_FLAG_VFS_EXEC_VIEW, true, &replacement);
+    ok = check(-ENOTCONN) && ok;
+    update(RESOURCE_FLAG_VFS_EXEC_VIEW, false);
+    return check(-ENOTCONN) && ok;
+}
+#endif
 
 auto wki_resource_resolve_unique(uint16_t node_id, ResourceType type, const char* exact_name, DiscoveredResource* out) -> int {
     if (out == nullptr || node_id == WKI_NODE_INVALID || node_id == WKI_NODE_BROADCAST ||
@@ -1099,12 +1498,11 @@ void wki_resources_rebind_vfs_for_peer(uint16_t node_id) {
             continue;
         }
 
+        std::array<char, VFS_MOUNT_PATH_LEN> mount_path{};
+        if (!build_vfs_mount_path(mount_path.data(), mount_path.size(), hostname, static_cast<const char*>(resource.name))) continue;
         DiscoveredResource superseded = resource;
         superseded.valid = false;
         resource.generation = next_resource_generation_locked();
-
-        std::array<char, VFS_MOUNT_PATH_LEN> mount_path{};
-        build_vfs_mount_path(mount_path.data(), mount_path.size(), hostname, static_cast<const char*>(resource.name));
         queue_vfs_mount_locked(node_id, resource.resource_id, resource.generation, mount_path.data(), true);
 
         // Push only after all accesses through resource for this iteration;
@@ -1226,6 +1624,11 @@ void handle_resource_advert(const WkiHeader* hdr, const uint8_t* payload, uint16
     } else if (!decode_resource_incarnation(hdr->src_node, type, payload, payload_len, BASE_AND_NAME_SIZE, &owner_incarnation)) {
         return;
     }
+
+    // Automatic VFS mount names are paths within the peer's subtree, not
+    // instructions to traverse its parents. Refuse before discovery changes;
+    // truncating an overlong name would also change the selected export.
+    if (type == ResourceType::VFS && !valid_vfs_export_name(std::string_view(resource_advert_name(adv), adv->name_len))) return;
 
     // Build the resource entry on-stack before locking
     DiscoveredResource res;
@@ -1359,9 +1762,11 @@ void handle_resource_advert(const WkiHeader* hdr, const uint8_t* payload, uint16
         if (type == ResourceType::VFS && REPLACEMENT_GENERATION) {
             const char* hostname = wki_peer_get_hostname(adv->node_id);
             if (hostname != nullptr && hostname[0] != '\0') {
-                build_vfs_mount_path(desired_mount_path.data(), desired_mount_path.size(), hostname, static_cast<const char*>(res.name));
-                queue_vfs_mount_locked(adv->node_id, adv->resource_id, existing->generation, desired_mount_path.data(), true);
-                queue_vfs_mount = true;
+                if (build_vfs_mount_path(desired_mount_path.data(), desired_mount_path.size(), hostname,
+                                         static_cast<const char*>(res.name))) {
+                    queue_vfs_mount_locked(adv->node_id, adv->resource_id, existing->generation, desired_mount_path.data(), true);
+                    queue_vfs_mount = true;
+                }
             }
         } else if (type == ResourceType::NET && g_wki.nic_policy != WkiNicPolicy::MANUAL) {
             const char* hostname = wki_peer_get_hostname(adv->node_id);
@@ -1418,8 +1823,9 @@ void handle_resource_advert(const WkiHeader* hdr, const uint8_t* payload, uint16
     if (type == ResourceType::VFS) {
         const char* hostname = wki_peer_get_hostname(adv->node_id);
         if (hostname != nullptr && hostname[0] != '\0') {
-            build_vfs_mount_path(desired_mount_path.data(), desired_mount_path.size(), hostname, static_cast<const char*>(res.name));
-            queue_vfs_mount_locked(adv->node_id, adv->resource_id, res.generation, desired_mount_path.data(), false);
+            if (build_vfs_mount_path(desired_mount_path.data(), desired_mount_path.size(), hostname, static_cast<const char*>(res.name))) {
+                queue_vfs_mount_locked(adv->node_id, adv->resource_id, res.generation, desired_mount_path.data(), false);
+            }
         }
     }
 
@@ -1822,28 +2228,18 @@ void wki_remotable_process_pending_mounts() {
                 continue;
             }
 
-            // Create intermediate directories (/wki/<hostname>)
-            // Find the second '/' after "/wki/" to get host dir
-            std::array<char, VFS_HOST_DIR_LEN> host_dir{};
-            const char* mount_path = pending.mount_path.data();
-            const char* p = mount_path + 5;  // skip "/wki/"
-            const char* slash = p;
-            while (*slash != '\0' && *slash != '/') {
-                slash++;
-            }
-            auto host_dir_len = static_cast<size_t>(slash - mount_path);
-            if (host_dir_len < host_dir.size()) {
-                std::copy_n(mount_path, host_dir_len, host_dir.data());
-                host_dir.at(host_dir_len) = '\0';
-                ker::vfs::vfs_mkdir(host_dir.data(), 0755);
+            // New children of a retained withdrawn root would keep that root
+            // permanently busy. Preserve this live observation and its retry
+            // budget while the existing exact-owner retirement drains.
+            if (wki_remote_vfs_auto_mount_waits_for_retired_path(pending.mount_path.data())) {
+                defer_vfs_mount_for_detach(pending);
+                continue;
             }
 
-            // Do not create nested export paths here. Once the host root is
-            // mounted, vfs_mkdir() would route through that remote mount. A
-            // stale root can then block this sole deferred worker while the
-            // withdrawal needed to replace it is still queued behind us.
-            // mount_filesystem() publishes nested mounts directly, and VFS
-            // readdir synthesizes their mount-table children.
+            // Publish host and nested mounts directly. A mkdir on an existing
+            // or stale host root can enter a remote RPC while this same worker
+            // must process the queued withdrawal that would let it complete.
+            // Mount-table children provide the visible directory entries.
 
             int const RET =
                 wki_remote_vfs_mount(pending.node_id, pending.resource_id, pending.mount_path.data(), pending.resource_generation);
@@ -2032,20 +2428,23 @@ void wki_remotable_process_pending_net_attaches() {
                 continue;
             }
 
-            auto* proxy_state = static_cast<ProxyNetState*>(proxy_dev->private_data);
+            auto const OWNER_L3 = wki_remote_net_owner_l3_snapshot(proxy_dev);
+            if (!OWNER_L3.valid) {
+                wki_remote_net_detach(proxy_dev);
+                continue;
+            }
 
             // V2: ATTACH_SPARSE post-attach subnet overlap check
             if (g_wki.nic_policy == WkiNicPolicy::ATTACH_SPARSE) {
-                if (proxy_state == nullptr || ((proxy_state->owner_ipv4_addr == 0 || proxy_state->owner_ipv4_mask == 0) &&
-                                               !wki_net_ipv6_state_has_usable_address(proxy_state->owner_ipv6))) {
+                if ((OWNER_L3.ipv4_addr == 0 || OWNER_L3.ipv4_mask == 0) && !wki_net_ipv6_state_has_usable_address(OWNER_L3.ipv6)) {
                     wki_remote_net_detach(proxy_dev);
                     log::debug("Dropping stale NET auto-attach: %s from %s/%s is still missing L3 state after ready advert",
                                pending.nic_name.data(), pending.hostname.data(), pending.remote_name.data());
                     continue;
                 }
 
-                if (proxy_state->owner_ipv4_addr != 0 && proxy_state->owner_ipv4_mask != 0 &&
-                    has_local_subnet_overlap(proxy_state->owner_ipv4_addr, proxy_state->owner_ipv4_mask)) {
+                if (OWNER_L3.ipv4_addr != 0 && OWNER_L3.ipv4_mask != 0 &&
+                    has_local_subnet_overlap(OWNER_L3.ipv4_addr, OWNER_L3.ipv4_mask)) {
                     ker::mod::dbg::log("[WKI] Skipping remote NIC %s from %s: subnet overlap", pending.nic_name.data(),
                                        pending.hostname.data());
                     wki_remote_net_detach(proxy_dev);
@@ -2060,14 +2459,12 @@ void wki_remotable_process_pending_net_attaches() {
             // is necessarily complete, so eagerly adding a same-subnet route can
             // steal local traffic (e.g. SSH/NTP) until the real NIC is configured.
             // ATTACH_ALL keeps the old behavior and auto-routes every remote NIC.
-            if (g_wki.nic_policy == WkiNicPolicy::ATTACH_ALL && proxy_state != nullptr && proxy_state->owner_ipv4_addr != 0 &&
-                proxy_state->owner_ipv4_mask != 0) {
-                uint32_t const REMOTE_SUBNET = proxy_state->owner_ipv4_addr & proxy_state->owner_ipv4_mask;
-                int const ROUTE_RET =
-                    ker::net::route_add(REMOTE_SUBNET, proxy_state->owner_ipv4_mask, 0 /*gateway*/, 100 /*metric*/, proxy_dev);
+            if (g_wki.nic_policy == WkiNicPolicy::ATTACH_ALL && OWNER_L3.ipv4_addr != 0 && OWNER_L3.ipv4_mask != 0) {
+                uint32_t const REMOTE_SUBNET = OWNER_L3.ipv4_addr & OWNER_L3.ipv4_mask;
+                int const ROUTE_RET = ker::net::route_add(REMOTE_SUBNET, OWNER_L3.ipv4_mask, 0 /*gateway*/, 100 /*metric*/, proxy_dev);
                 if (ROUTE_RET == 0) {
-                    ker::mod::dbg::log("[WKI] Route installed: subnet=0x%08x mask=0x%08x via %s", REMOTE_SUBNET,
-                                       proxy_state->owner_ipv4_mask, pending.nic_name.data());
+                    ker::mod::dbg::log("[WKI] Route installed: subnet=0x%08x mask=0x%08x via %s", REMOTE_SUBNET, OWNER_L3.ipv4_mask,
+                                       pending.nic_name.data());
                 }
             }
         }

@@ -171,6 +171,17 @@ auto reliable_message_type(uint8_t raw_type) -> bool {
         case MsgType::LOAD_REPORT:
         case MsgType::TASK_SUBMIT_FRAGMENT:
         case MsgType::TASK_SERVICE_REPORT:
+        case MsgType::TASK_TERMINAL_SIGNAL:
+        case MsgType::TASK_SIGNAL_REQ:
+        case MsgType::TASK_SIGNAL_RESP:
+        case MsgType::TASK_EXEC_READY:
+        case MsgType::TASK_EXEC_COMMIT:
+        case MsgType::GROUP_ROUTE_REQ:
+        case MsgType::GROUP_RECEIVER_REQ:
+        case MsgType::GROUP_RECEIVER_RESP:
+        case MsgType::GROUP_ROUTE_RESP:
+        case MsgType::GROUP_SIGNAL_REQ:
+        case MsgType::GROUP_SIGNAL_RESP:
             return true;
     }
     return false;

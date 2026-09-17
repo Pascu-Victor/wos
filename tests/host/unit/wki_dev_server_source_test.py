@@ -288,7 +288,8 @@ def test_duplicate_net_attach_does_not_rewrite_binding_cookie() -> None:
 
 
 def test_net_binding_state_mutation_revalidates_under_server_lock() -> None:
-    body = function_body(REMOTE_NET_CPP.read_text(), "handle_net_op")
+    source = REMOTE_NET_CPP.read_text()
+    body = "".join(function_body(source, name) for name in ["handle_net_op", "handle_net_open_as", "handle_net_close_as"])
     required = [
         "wki_dev_server_mark_net_opened(channel_identity, net_dev, true)",
         "wki_dev_server_mark_net_opened(channel_identity, net_dev, false)",
@@ -331,11 +332,11 @@ def test_net_rx_credit_accounting_uses_proxy_lock() -> None:
         source_without_helpers = source_without_helpers.replace(function_body(source, helper_name), "")
     helper = function_body(source, "consume_net_rx_credit_locked")
     rx_body = function_body(source, "handle_net_rx_notify")
-    open_body = function_body(source, "proxy_net_open")
+    open_body = function_body(source, "open_retained_net_proxy")
 
     if "state->rx_credits_remaining--" not in helper:
         fail("consume_net_rx_credit_locked() must be the only RX credit decrement site")
-    if re.search(r"rx_credits_remaining\s*=", source_without_helpers):
+    if re.search(r"rx_credits_remaining\s*=(?!=)", source_without_helpers):
         fail("RX credits must be assigned through the proxy-lock helper")
     for body_name, body in (("handle_net_rx_notify", rx_body), ("proxy_net_open", open_body)):
         if "rx_credits_remaining--" in body:
@@ -471,7 +472,7 @@ def test_detach_admission_is_napi_safe_and_cleanup_is_deferred() -> None:
         "wait_for_binding_refs_to_drain(item.binding)",
         "wki_remote_vfs_cleanup_server_fds_for_channel(item.channel_identity)",
         "release_vfs_rdma_buffers(&item.vfs_rdma_buffers)",
-        "wki_zone_destroy(item.blk_zone_id)",
+        "retire_binding_zone(item.binding)",
         "item.block_dev->remotable->on_remote_detach(item.consumer_node)",
         "item.net_dev->remotable->on_remote_detach(item.consumer_node)",
         "wki_channel_close_generation(item.channel_identity.channel",
@@ -847,7 +848,7 @@ def test_block_ring_binding_lifetime_is_retained_outside_server_lock() -> None:
 
     require_order(pending_body, "retain_binding_locked(&b)", "wki_zone_create", "pending zone retain before blocking create")
     require_order(pending_body, "wki_zone_create", "binding_still_active", "pending zone revalidation after blocking create")
-    if "if (!binding_still_active)" not in pending_body or "wki_zone_destroy(item.blk_zone_id);" not in pending_body:
+    if "if (!binding_still_active)" not in pending_body or "zone_ref.destroy()" not in pending_body:
         fail("deferred zone creation must destroy a zone created for a retired binding")
 
     require_order(poll_body, "retain_binding_locked(&b)", "rings.at(ring_count++) = &b;", "ring poll retain")
@@ -888,7 +889,7 @@ def test_block_message_ops_use_fixed_rx_admission_and_task_context_io() -> None:
         if token not in worker:
             fail(f"block task-context worker is missing {token!r}")
     require_order(run, "if (op->fixed_block_op)", "run_deferred_block_op(op)", "fixed block worker dispatch")
-    require_order(run, "run_deferred_block_op(op)", "release_binding(RETAINED_BINDING)", "block binding lifetime")
+    require_order(block_body_after(run, "if (op->fixed_block_op)"), "run_deferred_block_op(op)", "release_binding(RETAINED_BINDING)", "block binding lifetime")
 
     if "wki_dev_server_selftest_block_ops_use_fixed_admission()" not in header:
         fail("fixed block admission selftest must be declared")
@@ -1016,8 +1017,8 @@ def test_path_utimens_is_deferred_without_reclassifying_invalidate() -> None:
         if token not in rx_admission:
             fail(f"VFS reliable pre-ACK admission is missing {token}")
 
-    if admission.count("op_id <= OP_VFS_XATTR") != 2:
-        fail("VFS request and response admission must include path utimens during export rebuild/drain")
+    if admission.count("op_id <= OP_VFS_DIRECTORY_REFERENCE") != 2:
+        fail("VFS request and response admission must include the feature query during export rebuild/drain")
 
 
 def test_metadata_batch_is_capability_gated_preflighted_and_worker_executed() -> None:
@@ -1044,12 +1045,12 @@ def test_metadata_batch_is_capability_gated_preflighted_and_worker_executed() ->
     if "op_id == OP_VFS_METADATA_BATCH" not in classifier or "OP_VFS_INVALIDATE" in classifier:
         fail("metadata batch must be deferred without classifying invalidation notifications as requests")
     admission = function_body(wki_source, "message_uses_vfs_export_admission")
-    if admission.count("op_id <= OP_VFS_XATTR") != 2:
+    if admission.count("op_id <= OP_VFS_DIRECTORY_REFERENCE") != 2:
         fail("metadata batch requests and responses must participate in VFS export admission")
     if "WKI_CAP_VFS_METADATA_BATCH" not in function_body(wki_source, "wki_init"):
         fail("metadata batch capability must be advertised in HELLO")
 
-    capability_pos = worker.find("wki_peer_capability_negotiated(op->hdr.src_node, WKI_CAP_VFS_METADATA_BATCH)")
+    capability_pos = worker.find("(op->identity_capabilities & WKI_CAP_VFS_METADATA_BATCH) == 0")
     unsupported_pos = worker.find("-EOPNOTSUPP", capability_pos)
     execute_pos = worker.find("handle_vfs_metadata_batch_op", unsupported_pos)
     if min(capability_pos, unsupported_pos, execute_pos) < 0 or not capability_pos < unsupported_pos < execute_pos:
@@ -1060,7 +1061,7 @@ def test_metadata_batch_is_capability_gated_preflighted_and_worker_executed() ->
     if "if (op->op_id == OP_VFS_METADATA_BATCH)" not in worker or "handle_vfs_metadata_batch_op" not in worker:
         fail("metadata batch must execute only from the deferred VFS worker")
     for token in [
-        "header.version != VFS_METADATA_BATCH_VERSION",
+        "header.version != VFS_METADATA_BATCH_MUTATION_VERSION",
         "header.count == 0",
         "header.count > VFS_METADATA_BATCH_MAX_ITEMS",
         "header.mode != 0",
@@ -1119,8 +1120,8 @@ def test_detach_waits_for_binding_refs_before_cleanup_and_erase() -> None:
         "release_vfs_rdma_buffers(&item.vfs_rdma_buffers);",
         "fence wait before VFS RDMA unregister/free",
     )
-    require_order(detach_all_body, "wait_for_binding_refs_to_drain(item.binding);", "wki_zone_destroy(item.blk_zone_id);", "fence wait before zone destroy")
-    require_order(detach_all_body, "wki_zone_destroy(item.blk_zone_id);", "erase_retired_binding_locked(work.at(i).binding);", "fence erase after cleanup")
+    require_order(detach_all_body, "wait_for_binding_refs_to_drain(item.binding);", "retire_binding_zone(item.binding);", "fence wait before zone destroy")
+    require_order(detach_all_body, "retire_binding_zone(item.binding);", "erase_retired_binding_locked(work.at(i).binding);", "fence erase after cleanup")
 
     require_order(
         detach_body,
@@ -1137,12 +1138,12 @@ def test_detach_waits_for_binding_refs_before_cleanup_and_erase() -> None:
     require_order(
         detach_body,
         "wait_for_binding_refs_to_drain(item.binding);",
-        "wki_zone_destroy(item.blk_zone_id);",
+        "retire_binding_zone(item.binding);",
         "detach wait before zone destroy",
     )
     require_order(
         detach_body,
-        "wki_zone_destroy(item.blk_zone_id);",
+        "retire_binding_zone(item.binding);",
         "erase_retired_binding_locked(item.binding);",
         "detach erase after cleanup",
     )
@@ -1507,6 +1508,32 @@ def test_vfs_two_lane_rdma_keeps_anchor_identity_independent_and_tears_down_regi
         fail("ivshmem must keep raw RDMA offset keys pinned without a remote-revocation protocol")
 
 
+def test_mapped_net_open_uses_authenticated_fixed_worker() -> None:
+    source = DEV_SERVER_CPP.read_text()
+    queue = function_body(source, "try_queue_pre_admitted_vfs_op")
+    for token in ["(op_id == OP_NET_OPEN_AS || op_id == OP_NET_CLOSE_AS || op_id == OP_NET_LINK_AS) ? ResourceType::NET : ResourceType::VFS", "retained_binding->resource_type != EXPECTED_TYPE",
+                  "op->identity_policy = identity_policy", "op->retained_binding = retained_binding", "std::memcpy(op->req_data"]:
+        if "".join(token.split()) not in "".join(queue.split()):
+            fail(f"mapped NET pre-ACK queue missing {token}")
+    worker = function_body(source, "run_deferred_vfs_op")
+    branch = block_body_after(worker, "if (op->op_id == OP_NET_OPEN_AS || op->op_id == OP_NET_CLOSE_AS || op->op_id == OP_NET_LINK_AS)")
+    for token in ["RETAINED_BINDING->resource_type == ResourceType::NET", "channel_identity_matches", "detail::handle_net_open_as", "detail::handle_net_close_as", "detail::handle_net_link_as",
+                  "op->identity_policy", "release_binding(RETAINED_BINDING)", "deferred_vfs_op_release(op)"]:
+        if token not in branch:
+            fail(f"mapped NET worker missing {token}")
+    if "wki_peer_find" in branch or "auth_session" in branch:
+        fail("mapped NET worker must retain the admitted policy snapshot")
+    core = WKI_CPP.read_text()
+    for name in ["admit_vfs_op", "message_uses_vfs_export_admission"]:
+        if any(op not in function_body(core, name) for op in ["OP_NET_OPEN_AS", "OP_NET_CLOSE_AS", "OP_NET_LINK_AS"]):
+            fail(f"shared fixed worker admission missing from {name}")
+    if any(op not in function_body(source, "wki_dev_server_admit_vfs_op_rx") for op in ["OP_NET_OPEN_AS", "OP_NET_CLOSE_AS", "OP_NET_LINK_AS"]):
+        fail("NET OPEN must enter bounded pre-ACK admission")
+    denial = function_body(core, "send_policy_denial")
+    if "response.op_id == OP_NET_LINK_AS" not in denial or "response.op_id == OP_NET_CLOSE_AS" not in denial or "response.op_id == OP_NET_OPEN_AS" not in denial or "std::memcpy(&response.reserved" not in denial:
+        fail("NET identity policy denial must echo the operation cookie")
+
+
 def main() -> None:
     test_rx_forward_does_not_spend_credits_before_delivery_is_possible()
     test_rx_forward_sends_notify_cookie_envelope()
@@ -1515,6 +1542,7 @@ def main() -> None:
     test_vfs_attach_uses_export_snapshot_not_unlocked_pointer()
     test_vfs_notify_coalesces_by_mount_anchor_with_conservative_fallback()
     test_duplicate_net_attach_does_not_rewrite_binding_cookie()
+    test_mapped_net_open_uses_authenticated_fixed_worker()
     test_net_binding_state_mutation_revalidates_under_server_lock()
     test_net_notify_handlers_validate_cookie_envelope()
     test_net_rx_credit_accounting_uses_proxy_lock()

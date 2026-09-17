@@ -10,8 +10,13 @@ struct File;  // Forward declaration from VFS
 }
 
 namespace ker::mod::sched::task {
+struct Task;
 enum class WaitChannelKind : uint8_t;
 }  // namespace ker::mod::sched::task
+
+namespace ker::mod::security {
+class Snapshot;
+}
 
 namespace ker::dev {
 
@@ -27,6 +32,11 @@ struct CharDeviceOps {
     bool (*poll_register_waiter)(ker::vfs::File* file, uint64_t pid) = nullptr;           // nullptr = no explicit wake registration
     mod::sched::task::WaitChannelKind (*poll_wait_kind)(ker::vfs::File* file) = nullptr;  // nullptr = generic poll wait
     off_t (*lseek)(ker::vfs::File* file, off_t offset, int whence) = nullptr;             // nullptr = not seekable
+    // Optional replacement for open, using the snapshot that authorized devfs
+    // access. opener supplies process-specific authority, or is null for
+    // credential/path-only requests. Neither borrowed input may be retained;
+    // callbacks must not substitute the current task for an absent opener.
+    int (*open_with_credentials)(ker::vfs::File* file, const mod::security::Snapshot& caller, mod::sched::task::Task* opener) = nullptr;
 };
 
 enum class DeviceType : uint8_t {
@@ -43,7 +53,12 @@ struct Device {
     CharDeviceOps* char_ops = nullptr;  // For character devices
 };
 
-// Device registration and management
+// Registry operations serialize publication, selection and removal. Callers
+// keep Device storage and identity fields alive/immutable while registered.
+// Returned pointers remain borrowed: users must independently protect their
+// lifetime after lookup returns. A count/index sequence is not a snapshot.
+// Registration may allocate; no allocation, callbacks or logging occur under
+// the registry IRQ guard. Duplicate keys/entries retain first-match behavior.
 auto dev_register(Device* device) -> int;
 auto dev_unregister(Device* device) -> int;
 auto dev_find(unsigned major, unsigned minor) -> Device*;

@@ -11,8 +11,10 @@
 #include <platform/sched/migration_guard.hpp>
 #include <platform/sched/run_heap.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/security/terminal.hpp>
 #include <platform/sys/context_switch.hpp>
 #include <platform/sys/spinlock.hpp>
+#include <span>
 
 namespace ker::mod::sched {
 
@@ -430,6 +432,15 @@ auto current_cpu_for_task(task::Task* task) -> uint64_t;
 auto owner_cpu_for_task(task::Task* task) -> uint64_t;
 auto migrate_task_to_cpu(task::Task* task, uint64_t target_cpu) -> bool;
 auto pin_task_to_cpu(task::Task* task, uint64_t target_cpu) -> bool;
+
+struct KernelWorkerCpuPin {
+    task::Task* worker{};
+    uint64_t cpu{};
+};
+inline constexpr size_t MAX_KERNEL_WORKER_CPU_PINS = 8;
+// Caller retains every worker for the entire call. A failed batch changes none
+// of their scheduler state. For DAEMON workers only, from task context.
+auto pin_kernel_workers_to_cpus(std::span<const KernelWorkerCpuPin> requests) -> bool;
 bool can_query_current_task();
 void remove_current_task();                               // Remove current task from runqueue (for exit)
 auto find_task_by_pid(uint64_t pid) -> task::Task*;       // Find a task by PID (O(1) via PID registry)
@@ -440,10 +451,12 @@ auto task_has_live_pagemap_sibling(task::Task* subject) -> bool;
 // Shared-VM publication is serialized by the caller. Update each publisher's
 // logical AS current/peak without allocating a task snapshot.
 void record_address_space_usage(task::Task* subject, mm::paging::PageTable* root, uint64_t bytes);
-void set_task_nice(task::Task* task, int nice);               // Update task weight safely on its run queue
-auto signal_process_group(uint64_t pgid, int sig) -> size_t;  // Send signal to all live tasks in a process group
-auto signal_controlling_tty(int controlling_tty, int sig) -> size_t;
-auto signal_controlling_tty_wki_proxies(int controlling_tty, int sig) -> size_t;
+void set_task_nice(task::Task* task, int nice);  // Update task weight safely on its run queue
+void revoke_terminal_attachment(security::TerminalIdentity terminal, uint64_t session_id, uint64_t generation, uint64_t foreground,
+                                session::Origin foreground_origin);
+auto signal_terminal_process_group(security::TerminalIdentity terminal, uint64_t session_id, uint64_t generation, uint64_t pgid,
+                                   session::Origin group_origin, int sig)
+    -> size_t;  // Signals stay within the originating terminal allocation
 auto signal_visible_processes_except(uint64_t excluded_pid, uint64_t excluded_owner_pid, int sig) -> size_t;
 void wake_task_for_signal(task::Task* task);  // Make a signaled blocked task runnable so signal delivery can occur
 [[nodiscard]] auto kernel_threads_shutdown_requested() -> bool;
@@ -505,8 +518,9 @@ enum class ExceptionWaitResult : uint8_t {
 [[nodiscard]] auto place_task_in_wait_queue_if_pending(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& frame,
                                                        const std::atomic<uint64_t>& completion_token, uint64_t expected_generation)
     -> ExceptionWaitResult;
-void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr,
-                              ker::mod::gates::InterruptFrame& frame);  // Move current task to wait queue with context saved
+// on_parked runs after saving context and publishing the wait, outside the
+// runqueue lock and before the possibly nonreturning handoff. It must not wait.
+void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& frame, void (*on_parked)(task::Task&));
 extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr,
                                      ker::mod::gates::InterruptFrame* frame_ptr);  // Called from syscall.asm to switch tasks after syscall
 void start_scheduler();

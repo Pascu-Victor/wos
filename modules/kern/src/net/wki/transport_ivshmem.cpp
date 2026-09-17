@@ -7,10 +7,12 @@
 #include <cstring>
 #include <dev/ivshmem/ivshmem_net.hpp>
 #include <dev/pci.hpp>
+#include <memory>
 #include <net/packet.hpp>
 #include <net/wki/irq_fwd.hpp>
 #include <net/wki/timer_math.hpp>
 #include <net/wki/wki.hpp>
+#include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/fw/qemu_fw_cfg.hpp>
 #include <platform/interrupt/gates.hpp>
@@ -37,6 +39,11 @@ constexpr uint32_t WKI_IVSHMEM_VERSION = 1;
 constexpr size_t WKI_IVSHMEM_HEADER_SIZE = 64;
 constexpr size_t WKI_IVSHMEM_RING_SIZE = static_cast<const size_t>(64 * 1024);  // 64KB per ring
 constexpr size_t WKI_IVSHMEM_RING_AREA = 2 * WKI_IVSHMEM_RING_SIZE;
+// Message frames include the WKI header and authentication trailer. VFS can
+// use the complete common frame capacity even when direct RDMA is disabled.
+using IvshmemFrame = std::array<uint8_t, WKI_MAX_FRAME_SIZE>;
+static_assert(WKI_MAX_FRAME_SIZE <= UINT16_MAX);
+static_assert(WKI_MAX_FRAME_SIZE + 8 < WKI_IVSHMEM_RING_SIZE);
 constexpr size_t WKI_IVSHMEM_RDMA_OFFSET = WKI_IVSHMEM_HEADER_SIZE + WKI_IVSHMEM_RING_AREA;
 
 constexpr size_t IVSHMEM_SHMEM_SIZE = static_cast<const size_t>(16 * 1024 * 1024);  // 16MB default
@@ -399,7 +406,7 @@ auto drain_rx_ring(IvshmemTransportPrivate* priv, uint16_t budget) -> uint16_t {
     }
 
     // Drain RX ring
-    std::array<uint8_t, 8192> buf{};
+    IvshmemFrame buf{};
     while (processed < budget) {
         uint16_t const LEN = ring_read(&priv->rx_ring, buf.data(), static_cast<uint16_t>(buf.size()));
         if (LEN == 0) {
@@ -641,7 +648,7 @@ void wki_ivshmem_transport_init() {
 
     // Fill in transport struct
     s_ivshmem_transport.name = "wki-ivshmem";
-    s_ivshmem_transport.mtu = 8192;
+    s_ivshmem_transport.mtu = static_cast<uint16_t>(WKI_MAX_FRAME_SIZE - WKI_HEADER_SIZE);
     s_ivshmem_transport.rdma_capable = true;
     s_ivshmem_transport.private_data = &s_ivshmem_priv;
     s_ivshmem_transport.tx = ivshmem_wki_tx;
@@ -667,5 +674,30 @@ void wki_ivshmem_transport_init() {
 }
 
 auto wki_ivshmem_transport_poll(uint16_t budget) -> uint16_t { return s_ivshmem_initialized ? drain_rx_ring(&s_ivshmem_priv, budget) : 0; }
+
+#ifdef WOS_SELFTEST
+auto wki_ivshmem_selftest_complete_frames() -> bool {
+    std::unique_ptr<std::array<uint8_t, WKI_IVSHMEM_RING_SIZE>> storage(new (std::nothrow) std::array<uint8_t, WKI_IVSHMEM_RING_SIZE>{});
+    std::unique_ptr<IvshmemFrame> sent(new (std::nothrow) IvshmemFrame{});
+    std::unique_ptr<IvshmemFrame> received(new (std::nothrow) IvshmemFrame{});
+    if (storage == nullptr || sent == nullptr || received == nullptr) return false;
+    for (size_t i = 0; i < sent->size(); ++i) sent->at(i) = static_cast<uint8_t>((i * 37U + 19U) & 0xFFU);
+    uint32_t head = 0, tail = 0;
+    WkiRing ring{.head_ptr = &head, .tail_ptr = &tail, .data = storage->data(), .size = WKI_IVSHMEM_RING_SIZE - 8};
+    // Exercise payload wrap as well as frames crossing the old 8192-byte cap.
+    for (uint32_t start : {0U, ring.size - 4U, ring.size - 8192U}) {
+        for (uint16_t length : {uint16_t{1}, uint16_t{8192}, uint16_t{8193}, static_cast<uint16_t>(WKI_MAX_FRAME_SIZE)}) {
+            head = start;
+            tail = start;
+            received->fill(0);
+            if (ring_write(&ring, sent->data(), length) != 0 || ring_read(&ring, received->data(), received->size()) != length ||
+                std::memcmp(sent->data(), received->data(), length) != 0 || head != tail ||
+                ring_read(&ring, received->data(), received->size()) != 0)
+                return false;
+        }
+    }
+    return true;
+}
+#endif
 
 }  // namespace ker::net::wki

@@ -73,6 +73,8 @@ KTEST(WkiDevServerBlockValidation, RejectsOverflowAndOutOfRangeBeforeIo) {
     KEXPECT_FALSE(result.valid);
 }
 
+KTEST(WkiDevServerBlockAccess, IssuedRightsPrecedeDeviceCallbacks) { KEXPECT_TRUE(ker::net::wki::wki_dev_server_selftest_block_access()); }
+
 KTEST(WkiDevServerBlockValidation, RejectsCorruptRingGeometryAndIndices) {
     using namespace ker::net::wki;
 
@@ -116,4 +118,12 @@ KTEST(WkiDevServerBlockValidation, BoundsStandardSlotsAndBulkStaging) {
     entry.block_count = 1;
     entry.data_slot = 0;
     KEXPECT_FALSE(blk_validate_sq_entry(entry, GEOMETRY).valid);
+}
+
+KTEST(WkiDevServerBinding, RenameSiblingRequiresExactLiveExportBinding) {
+    KEXPECT_TRUE(ker::net::wki::wki_dev_server_selftest_vfs_sibling_binding());
+}
+
+KTEST(WkiDevServerBinding, MappedMutationBatchPreflightsEveryInput) {
+    KEXPECT_TRUE(ker::net::wki::wki_dev_server_selftest_mapped_mutation_batch_admission());
 }

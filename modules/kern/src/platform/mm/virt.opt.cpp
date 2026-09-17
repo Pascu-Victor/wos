@@ -1543,9 +1543,16 @@ void selftest_require_mutable_pagemap_root(PageTable const* root, const char* ph
 
 constexpr size_t PAGE_TABLE_POOL_CAPACITY = 64;
 
+struct PageTableReleaseOrigin {
+    void* caller = nullptr;
+    uint64_t owner_pid = 0;
+};
+
 struct PageTablePool {
     mod::sys::Spinlock lock;
     std::array<PageTable*, PAGE_TABLE_POOL_CAPACITY> pages{};
+    // Each record lives exactly as long as its resident pool entry.
+    std::array<PageTableReleaseOrigin, PAGE_TABLE_POOL_CAPACITY> origins{};
     size_t count = 0;
 };
 
@@ -2064,6 +2071,7 @@ auto try_alloc_page_table_from_pool() -> PageTable* {
     --pool.count;
     auto* table = pool.pages[pool.count];
     pool.pages[pool.count] = nullptr;
+    pool.origins[pool.count] = {};
     pool.lock.unlock_irqrestore(FLAGS);
 
 #ifdef WOS_SELFTEST
@@ -2083,7 +2091,7 @@ auto try_alloc_page_table_from_pool() -> PageTable* {
     return table;
 }
 
-auto try_release_page_table_to_pool(PageTable* table) -> bool {
+auto try_release_page_table_to_pool(PageTable* table, PageTableReleaseOrigin origin) -> bool {
     if (table == nullptr) {
         return true;
     }
@@ -2097,9 +2105,11 @@ auto try_release_page_table_to_pool(PageTable* table) -> bool {
     uint64_t const FLAGS = pool.lock.lock_irqsave();
     for (size_t i = 0; i < pool.count; ++i) {
         if (pool.pages.at(i) == table) {
+            auto const PREVIOUS = pool.origins.at(i);
             pool.lock.unlock_irqrestore(FLAGS);
             page_table_pool_rejects.fetch_add(1, std::memory_order_relaxed);
-            log::critical("duplicate page-table pool release page=%p", table);
+            log::critical("duplicate page-table pool release page=%p previous_pid=%lu previous_caller=%p owner_pid=%lu caller=%p", table,
+                          PREVIOUS.owner_pid, PREVIOUS.caller, origin.owner_pid, origin.caller);
             return true;
         }
     }
@@ -2120,9 +2130,11 @@ auto try_release_page_table_to_pool(PageTable* table) -> bool {
     uint64_t const INSERT_FLAGS = pool.lock.lock_irqsave();
     for (size_t i = 0; i < pool.count; ++i) {
         if (pool.pages.at(i) == table) {
+            auto const PREVIOUS = pool.origins.at(i);
             pool.lock.unlock_irqrestore(INSERT_FLAGS);
             page_table_pool_rejects.fetch_add(1, std::memory_order_relaxed);
-            log::critical("raced duplicate page-table pool release page=%p", table);
+            log::critical("raced duplicate page-table pool release page=%p previous_pid=%lu previous_caller=%p owner_pid=%lu caller=%p",
+                          table, PREVIOUS.owner_pid, PREVIOUS.caller, origin.owner_pid, origin.caller);
             return true;
         }
     }
@@ -2136,6 +2148,7 @@ auto try_release_page_table_to_pool(PageTable* table) -> bool {
         return false;
     }
     pool.pages[pool.count] = table;
+    pool.origins[pool.count] = origin;
     ++pool.count;
     pool.lock.unlock_irqrestore(INSERT_FLAGS);
     page_table_pool_releases.fetch_add(1, std::memory_order_relaxed);
@@ -2665,6 +2678,11 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
                                          writable_anonymous_range_contains(task, VADDR);
         uint64_t const PIN_LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
         raw = pte_raw(pte);
+        if (paging::shared_write_restricted(raw)) {
+            user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
+            cow_pte_lock.unlock_irqrestore(LOCK_FLAGS);
+            return UserWriteFaultStatus::NOT_WRITABLE;
+        }
         bool const SYNTHETIC_ANON_COW =
             (raw & (paging::PAGE_COW | paging::PAGE_WRITE)) == 0U && (raw & paging::PAGE_USER) != 0U && WRITABLE_ANON_RANGE;
         if (SYNTHETIC_ANON_COW) {
@@ -3363,7 +3381,7 @@ auto get_kernel_pagemap() -> PageTable* { return kernel_pagemap; }
 
 auto create_pagemap() -> PageTable* { return alloc_zeroed_page_table(); }
 
-void release_pagemap(PageTable* pagemap) {
+void release_pagemap(PageTable* pagemap, uint64_t owner_pid) {
     if (pagemap == nullptr) {
         return;
     }
@@ -3389,7 +3407,7 @@ void release_pagemap(PageTable* pagemap) {
 
     owned_frame_purge_pagemap(pagemap);
 
-    if (try_release_page_table_to_pool(pagemap)) {
+    if (try_release_page_table_to_pool(pagemap, {__builtin_return_address(0), owner_pid})) {
         return;
     }
 
@@ -4623,6 +4641,14 @@ auto is_page_mapped_or_reserved(PageTable* page_table, vaddr_t vaddr) -> bool {
     return entry != nullptr && (entry->present != 0 || is_reserved_leaf(*entry));
 }
 
+auto is_page_write_restricted(PageTable* page_table, vaddr_t vaddr) -> bool {
+    uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
+    auto const* entry = present_mapping_entry(page_table, vaddr);
+    bool const RESTRICTED = entry != nullptr && paging::shared_write_restricted(pte_raw(*entry));
+    user_mapping_pin_lock.unlock_irqrestore(FLAGS);
+    return RESTRICTED;
+}
+
 void unify_page_flags(PageTable* page_table, vaddr_t vaddr, uint64_t flags) {
     if (page_table == nullptr) {
         // PANIC!
@@ -4662,7 +4688,7 @@ void unify_page_flags(PageTable* page_table, vaddr_t vaddr, uint64_t flags) {
     entry.present = (flags & paging::PAGE_PRESENT) != 0U ? 1 : 0;
     // COW pages must stay read-only even when mprotect(PROT_WRITE) runs; the
     // write fault is what creates the private writable page.
-    entry.writable = ((flags & paging::PAGE_WRITE) != 0U && !IS_COW) ? 1 : 0;
+    entry.writable = ((flags & paging::PAGE_WRITE) != 0U && !IS_COW && !paging::shared_write_restricted(OLD_RAW)) ? 1 : 0;
     entry.user = (flags & paging::PAGE_USER) != 0U ? 1 : 0;
     entry.no_execute = (flags & paging::PAGE_NX) != 0U ? 1 : 0;
 

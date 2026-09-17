@@ -69,6 +69,8 @@ def main() -> None:
         "struct XfsTransPerAgUndo",
         "struct XfsTransInodeUndo",
         "uint32_t nlink{};",
+        "uint32_t uid{};",
+        "uint32_t gid{};",
         "uint64_t ctime{};",
         "XfsIfork attr_fork{};",
         "bool owns_attr_fork{};",
@@ -98,6 +100,16 @@ def main() -> None:
     )
     if "undo->ip->nlink = undo->nlink;" not in restore:
         fail("inode cancellation must restore link count")
+    for field in ["uid", "gid", "mode", "ctime", "dirty"]:
+        if f"undo->{field} = ip->{field};" not in function_body(trans, "xfs_trans_capture_inode"):
+            fail(f"inode capture must snapshot {field}")
+        if f"undo->ip->{field} = undo->{field};" not in restore:
+            fail(f"inode cancellation must restore {field}")
+    require_order(
+        function_body(vfs, "commit_file_identity_locked"),
+        ["xfs_trans_alloc(ip->mount)", "xfs_trans_capture_inode(tp, ip)", "ip->mode =", "ip->uid =", "ip->gid =", "xfs_trans_commit(tp)"],
+        "ownership metadata must be captured before mutation",
+    )
     for token in [
         "xfs_trans_free_ifork(&undo->ip->attr_fork);",
         "undo->ip->attr_fork = undo->attr_fork;",
@@ -150,8 +162,9 @@ def main() -> None:
         if token not in attr:
             fail(f"copy-on-write attr fork contract missing {token!r}")
     permission = function_body(vfs, "check_public_xattr_permission")
-    if "write && (ip->mode & XFS_IFMT) == XFS_IFLNK" not in permission or "return -EPERM;" not in permission:
-        fail("user namespace xattr mutation must reject symlinks")
+    policy = (ROOT / "modules/kern/src/platform/security/file_policy.hpp").read_text()
+    if "authorize_file_xattr(credentials," not in permission or "write && (object.mode & 0170000U) == 0120000U" not in policy:
+        fail("user namespace xattr mutation must use central symlink policy")
     set_public = function_body(vfs, "set_public_xattr_locked")
     if "size > PUBLIC_XATTR_SIZE_MAX" not in set_public or "return -E2BIG;" not in set_public:
         fail("public xattr values larger than 64KiB must return E2BIG")
@@ -309,20 +322,21 @@ def main() -> None:
         "rmdir snapshots the removed directory link count",
     )
     require_order(
-        function_body(vfs, "xfs_rename_path"),
+        function_body(vfs, "xfs_rename_lookup"),
         [
-            "int const NEW_LOOKUP_RC = xfs_dir_lookup(new_parent",
-            "if (NEW_LOOKUP_RC == 0 && new_de.ino == old_de.ino)",
+            "authorize_file_rename(",
+            "if (DISPLACED == MOVED)",
             "return 0;",
-            "XfsTransaction* tp = xfs_trans_alloc(ctx);",
-            "displaced = xfs_inode_read_known_allocated",
-            "xfs_trans_capture_inode(tp, displaced)",
-            "xfs_dir_removename(new_parent",
-            "displaced->nlink--",
-            "xfs_dir_addname(new_parent",
-            "xfs_dir_removename(old_parent",
+            "XfsTransaction* tp = xfs_trans_alloc(MOUNT);",
+            "xfs_trans_capture_inode(tp, inode)",
+            "xfs_dir_removename(destination.parent()",
+            "DISPLACED->nlink--",
+            "xfs_dir_addname(destination.parent()",
+            "xfs_dir_removename(source.parent()",
+            "xfs_dir_reparent(MOVED",
+            "xfs_trans_commit(tp)",
         ],
-        "same-inode rename is a no-op before overwrite rename mutates the namespace",
+        "authorized same-inode rename is a no-op; captures precede entry and parent changes",
     )
 
     for function_name, add_token in [

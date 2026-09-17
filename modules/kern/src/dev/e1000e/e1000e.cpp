@@ -374,6 +374,7 @@ ker::net::NetDeviceOps e1000_netdev_ops = {
     .start_xmit = e1000_start_xmit,
     .set_mac = e1000_set_mac,
     .set_queue_cpu = nullptr,
+    .check_mac = ker::net::netdev_check_fixed_mac,
 };
 
 // -- Check if PCI device is supported ------------------------------------

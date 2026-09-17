@@ -90,7 +90,7 @@ def test_pipe_pump_reuses_worker_stack_frame() -> None:
         "file->fops->vfs_read(file, msg.data() + HEADER_SIZE, BUF_SIZE, 0)",
         "reinterpret_cast<DevOpReqPayload*>(msg.data())",
         "std::memcpy(msg.data() + sizeof(DevOpReqPayload), &resource_id, sizeof(uint32_t))",
-        "wki_send(target, WKI_CHAN_IPC_DATA, MsgType::DEV_OP_REQ, msg.data()",
+        "wki_send_on_channel_identity(data_channel, MsgType::DEV_OP_REQ, msg.data()",
         "static_cast<uint16_t>(HEADER_SIZE + n)",
         "static_cast<uint16_t>(HEADER_SIZE)",
     ]
@@ -98,7 +98,7 @@ def test_pipe_pump_reuses_worker_stack_frame() -> None:
     if missing:
         fail("pipe pump must reuse one worker-private stack frame: " + ", ".join(missing))
     require_order(body, required[0], "for (;;)", "pipe pump frame lifetime")
-    if body.count("wki_send(target, WKI_CHAN_IPC_DATA, MsgType::DEV_OP_REQ, msg.data()") != 2:
+    if body.count("wki_send_on_channel_identity(data_channel, MsgType::DEV_OP_REQ, msg.data()") != 2:
         fail("pipe pump must send exact DATA and EOF prefixes from its stack frame")
     for forbidden in ["new (std::nothrow) uint8_t[HEADER_SIZE + BUF_SIZE]", "delete[] msg", "IPC pump: malloc failed"]:
         if forbidden in body:
@@ -130,7 +130,7 @@ def test_stopped_pipe_pump_publishes_discard_fence() -> None:
     for token in [
         "free_retired_exports(retirement.retired_exports)",
         "if (retirement.discard_pending)",
-        "schedule_pending_pipe_discard(retirement.target, retirement.resource_id)",
+        "schedule_pending_pipe_discard(retirement.data_channel, retirement.resource_id)",
     ]:
         if token not in finish:
             fail(f"stopped pump finisher is missing {token!r}")
@@ -140,11 +140,11 @@ def test_stopped_pipe_pump_publishes_discard_fence() -> None:
     flush = function_body(remote_ipc, "export_pipe_write_flush_thread_loop")
     for token in [
         "bool const DIRECT_DISCARD = pump_task == nullptr",
-        "schedule_pending_pipe_discard(CONSUMER_NODE, resource_id)",
+        "schedule_pending_pipe_discard(DATA_CHANNEL, resource_id)",
     ]:
         if token not in flush:
             fail(f"no-pump close retirement is missing {token!r}")
-    require_order(flush, "s_ipc_lock.unlock_irqrestore(irqf)", "schedule_pending_pipe_discard(CONSUMER_NODE, resource_id)", "close discard fence")
+    require_order(flush, "s_ipc_lock.unlock_irqrestore(irqf)", "schedule_pending_pipe_discard(DATA_CHANNEL, resource_id)", "close discard fence")
 
 
 def test_inactive_proxy_poll_reports_terminal_readiness() -> None:
@@ -178,7 +178,7 @@ def test_epoll_close_releases_lookup_ref_after_detach() -> None:
 def test_proxy_lookup_is_peer_scoped() -> None:
     remote_ipc = REMOTE_IPC_CPP.read_text()
     lookup_body = function_body(remote_ipc, "find_proxy_by_endpoint_locked")
-    if "find_proxy_by_endpoint_locked(uint16_t home_node, uint32_t resource_id)" not in remote_ipc:
+    if "find_proxy_by_endpoint_locked(uint16_t home_node, uint32_t resource_id, bool receipt = false)" not in remote_ipc:
         fail("IPC proxy lookup helper must accept home_node and resource_id")
     lookup_required = [
         "proxy->home_node == home_node",
@@ -235,6 +235,8 @@ def test_export_pipe_write_uses_nonmutating_nonblocking_view() -> None:
         fail("nonblocking pipe write view must preserve backend-facing file fields: " + ", ".join(missing))
 
     write_required = [
+        "bool const IS_PROXY_PIPE = is_proxy_pipe_file(file)",
+        "if (IS_PIPE || IS_PROXY_PIPE || ker::vfs::vfs_is_socket_file(file))",
         "ker::vfs::File pipe_write_view{}",
         "ker::vfs::File* write_file = file",
         "init_nonblocking_pipe_write_view(pipe_write_view, *file)",
@@ -283,10 +285,10 @@ def test_proxy_pipe_write_reuses_bounded_stack_frame() -> None:
     for forbidden in ["new (std::nothrow) uint8_t[MSG_SIZE]", "delete[] msg"]:
         if forbidden in body:
             fail(f"proxy pipe writes must not allocate their reusable wire frame: {forbidden}")
-    require_order(body, "req->op_id =", "wki_send(", "proxy pipe frame operation")
-    require_order(body, "&proxy->resource_id", "wki_send(", "proxy pipe frame resource")
-    require_order(body, "req->data_len =", "wki_send(", "proxy pipe frame length")
-    require_order(body, "std::memcpy(msg.data() + HEADER_SIZE", "wki_send(", "proxy pipe frame payload")
+    require_order(body, "req->op_id =", "wki_send_accounted(", "proxy pipe frame operation")
+    require_order(body, "&proxy->resource_id", "wki_send_accounted(", "proxy pipe frame resource")
+    require_order(body, "req->data_len =", "wki_send_accounted(", "proxy pipe frame length")
+    require_order(body, "std::memcpy(msg.data() + HEADER_SIZE", "wki_send_accounted(", "proxy pipe frame payload")
     for assertion in [
         "WKI_IPC_PIPE_DATA_HEADER_SIZE + WKI_IPC_PIPE_DATA_MAX_CHUNK == WKI_ETH_MAX_PAYLOAD",
         "WKI_ETH_MAX_PAYLOAD <= ker::mod::mm::KERNEL_STACK_SIZE / 16",
@@ -506,7 +508,7 @@ def test_write_only_pipe_proxy_omits_receive_ring() -> None:
     dispatch_body = function_body(remote_ipc, "handle_ipc_dev_op_req")
     dispatch_required = [
         "if (req.op_id != OP_EPOLL_CTL)",
-        "handle_ipc_dev_op_req_inline(hdr, payload, payload_len, nullptr)",
+        "handle_ipc_dev_op_req_inline(hdr, payload, payload_len, nullptr, nullptr, response_channel)",
     ]
     missing = [token for token in dispatch_required if token not in dispatch_body]
     if missing:
@@ -619,7 +621,7 @@ def test_submission_guard_covers_preparation_and_failure_transfer() -> None:
     end = source.index("void wki_ipc_cancel_submission_guards(", begin)
     cancel = source[begin:end]
     require_order(cancel, "entry = {}", "ipc_release_file_ref(file)", "clear ownership before reentrant File put")
-    require_order(cancel, "export_cursor++", "wki_ipc_cleanup_exported_fds(&entry, 1, consumer)", "drain one tracked export per cleanup")
+    require_order(cancel, "export_cursor++", "wki_ipc_cleanup_exported_fds(&entry, 1, consumer, original_channels)", "drain one tracked export per cleanup")
     require_order(cancel, "wki_ipc_cleanup_exported_fds(", "disarm()", "remain linked through blocking cleanup")
     cleanup = function_body(source, "wki_ipc_cleanup_exported_fds")
     require_order(cleanup, "free_retired_exports(retired_exports)", "ipc_release_file_ref(file)", "free detached object before last File put")
@@ -691,9 +693,9 @@ def test_export_admission_precedes_side_effects() -> None:
     if "new " in plan or "s_ipc_lock" in plan or "start_pipe_pump" in plan:
         fail("FD admission must not publish or allocate exports")
     export = function_body(source, "wki_ipc_export_task_fds")
-    for effect in ["allocate_ipc_resource_id()"]:
+    for effect in ["reserve_ipc_resource_ids("]:
         require_order(export, "if (ADMISSION != 0) return ADMISSION", effect, "all FD admission before side effects")
-    require_order(export, "snapshot.prepare_exports(plan.count)", "s_ipc_lock.lock_irqsave()", "prepare all heap objects before publication")
+    require_order(export, "snapshot.prepare_exports(plan.count)", "reserve_ipc_resource_ids(", "prepare all heap objects before ID reservation/publication")
     require_order(export, "if (PREPARATION != 0) return PREPARATION", "g_ipc_exports.push_back(exp)", "allocation failure cannot leave registry entries")
     if "new " in export:
         fail("export publication must transfer already prepared objects")
@@ -736,6 +738,26 @@ def test_pumps_activate_only_after_accepted_handoff() -> None:
 
 
 
+def test_import_provenance_precedes_all_side_effects() -> None:
+    source = REMOTE_IPC_CPP.read_text()
+    validate = function_body(source, "wki_ipc_validate_task_fds")
+    for token in ["count > MAX_SUBMIT_IPC_FDS", "source_node == WKI_NODE_INVALID", "source_node == WKI_NODE_BROADCAST",
+                  "entry.home_node != source_node", "entry.resource_id == 0", "map[j].resource_id == entry.resource_id",
+                  "map[j].local_fd == entry.local_fd"]:
+        if token not in validate:
+            fail("descriptor import validation missing: " + token)
+    for token in ["new ", "s_ipc_lock", "fd_table.insert", "get_current_task", "wki_send"]:
+        if token in validate:
+            fail("descriptor validation cannot act on objects: " + token)
+    receiver = function_body(REMOTE_COMPUTE_CPP.read_text(), "handle_task_submit_work")
+    admission = "wki_ipc_validate_task_fds(entries, submit->ipc_fd_count, src_node)"
+    require_order(receiver, "prepare_submitted_resources(", admission, "decode lengths before map read")
+    for token in ["prepare_submitted_identity(", "ScopedSubmitVfsIdentity submit_vfs_identity", "load_elf_from_vfs_path"]:
+        require_order(receiver, admission, token, "map provenance before construction side effects")
+    if not re.search(r"wki_ipc_attach_task_fds\(new_task,\s*ipc_entries,\s*submit->ipc_fd_count,\s*src_node,\s*IPC_CONTROL_CHANNEL,\s*IPC_DATA_CHANNEL,\s*output_completion.get\(\)\)", receiver):
+        fail("final import must use the same authenticated submitter")
+
+
 def test_attach_fd_install_is_transactional() -> None:
     remote_ipc = REMOTE_IPC_CPP.read_text()
     install_body = function_body(remote_ipc, "install_ipc_proxy_files")
@@ -748,13 +770,13 @@ def test_attach_fd_install_is_transactional() -> None:
             fail("IPC batch installation or rollback missing: " + token)
     if "new " in install_body or "vfs_put_file(" in install_body or "s_ipc_lock" in install_body:
         fail("IPC descriptor commit must not allocate, close files, or nest the IPC lock")
-    for token in ["count > MAX_IMPORTS", "map[j].local_fd == entry.local_fd",
+    for token in ["wki_ipc_validate_task_fds(map, count, source_node)",
                   "free_uninstalled_ipc_proxy_file(prepared[i].file, prepared[i].proxy)",
                   "if (!install_ipc_proxy_files(", "return abandon()",
                   "ker::vfs::vfs_put_file(prepared[i].existing)", "g_ipc_proxies.push_back(proxy)"]:
         if token not in attach_body:
             fail("IPC batch preparation/publication missing: " + token)
-    require_order(attach_body, "map[j].local_fd == entry.local_fd", "new (std::nothrow) ProxyIpcState",
+    require_order(attach_body, "wki_ipc_validate_task_fds(map, count, source_node)", "new (std::nothrow) ProxyIpcState",
                   "validate all inherited descriptors before allocation")
     require_order(attach_body, "install_ipc_proxy_files(", "g_ipc_proxies.push_back(proxy)", "batch before proxy registration")
     require_order(attach_body, "g_ipc_proxies.push_back(proxy)", "vfs_put_file(prepared[i].existing)",
@@ -777,10 +799,32 @@ def test_dev_op_response_cookies_fence_stale_waiters() -> None:
         fail("proxy control waiters must carry nonzero response cookies: " + ", ".join(missing))
 
     response_body = function_body(remote_ipc, "wki_ipc_socket_handle_dev_op_resp")
+    envelope = function_body(remote_ipc, "read_ipc_control_response")
+    for token in ["channel != WKI_CHAN_RESOURCE", "payload == nullptr", "len < sizeof(response)",
+                  "response.data_len >= sizeof(uint32_t)", "sizeof(response) + response.data_len <= len"]:
+        if token not in envelope:
+            fail("IPC control response must validate channel and bounded envelope: " + token)
+    for name in ["wki_ipc_handle_dev_op_resp", "wki_ipc_socket_handle_dev_op_resp"]:
+        body = function_body(remote_ipc, name)
+        require_order(body, "read_ipc_control_response(channel, payload, len, resp)", "s_ipc_lock.lock_irqsave()",
+                      "validate response before proxy lookup or completion effects")
     if "wki_ipc_response_matches_pending(resp.op_id, resp.reserved, *target_proxy)" not in response_body:
         fail("DEV_OP_RESP handler must match both op id and echoed response cookie")
     if "target_proxy->pending_wait_op = 0" in response_body or "target_proxy->pending_wait_cookie = 0" in response_body:
         fail("DEV_OP_RESP handler must keep the busy slot occupied until the waiter consumes the response")
+    if "wki_ipc_retire_wait_cookie_locked(target_proxy, resp.op_id, resp.reserved)" not in response_body:
+        fail("exact response must retire the unanswered identity even after waiter timeout")
+    allocator = function_body(header, "wki_ipc_allocate_wait_cookie_locked")
+    for token in ["proxy->unanswered_controls", "available == nullptr", "identity.cookie == cookie", ".op = op, .cookie = cookie"]:
+        if token not in allocator:
+            fail("cookie allocation must reserve bounded unanswered identities: " + token)
+    cancellation = function_body(remote_ipc, "wki_ipc_cancel_pending_wait")
+    if "if (!request_sent)" not in cancellation:
+        fail("timeouts must preserve unanswered control identities")
+    send = function_body(WKI_CPP.read_text(), "wki_send_impl")
+    after_tx = send[send.index("route.send_pkt(pkt)"):]
+    if re.findall(r"\breturn\s+([^;]+);", after_tx) != ["WKI_OK"]:
+        fail("cookie release on send failure requires every accepted reliable send to return WKI_OK")
     if "wki_ipc_consume_pending_wait_response" not in remote_ipc:
         fail("proxy control waiters must consume and clear side-band responses through the shared helper")
 
@@ -793,8 +837,8 @@ def test_dev_op_response_cookies_fence_stale_waiters() -> None:
         "ipc_op_uses_response_cookie(OP_ID)",
         "std::memcpy(&request_cookie, op_data, WKI_IPC_OP_COOKIE_BYTES)",
         "resp->reserved = request_cookie",
-        "ctl_resp.reserved = request_cookie",
-        "wake_resp.reserved = request_cookie",
+        "unsupported_ipc_control_reply(OP_ID, resource_id, request_cookie)",
+        "response.reserved = cookie",
         "pty_resp.reserved = request_cookie",
     ]
     missing = [token for token in server_required if token not in remote_ipc]
@@ -835,6 +879,10 @@ def test_dev_op_response_cookies_fence_stale_waiters() -> None:
     for body, token, context in sender_required:
         if token not in body:
             fail(f"{context}: missing {token!r}")
+    for body in [socket_body, pty_body, epoll_body]:
+        require_order(body, "if (op_cookie == 0)", "proxy->pending_wait = &wait", "reserve response identity before publishing waiter")
+        if "return finish(-EAGAIN)" not in body or "wki_ipc_cancel_pending_wait(proxy, &wait, WKI_ERR_TX_FAILED, false)" not in body:
+            fail("control sender must reject saturated identities and release definitive unsent requests")
 
 
 def test_peer_cleanup_drains_deferred_dev_op_work() -> None:
@@ -858,11 +906,11 @@ def test_peer_cleanup_drains_deferred_dev_op_work() -> None:
     worker_body = function_body(remote_ipc, "ipc_dev_op_worker_thread_fn")
     require_order(
         worker_body,
-        "claimed = work != nullptr && claim_ipc_dev_op_worker_locked(work)",
-        "handle_ipc_dev_op_req_inline(&work->hdr, work->payload, work->payload_len, &work, &retry)",
+        "claimed = claim_ipc_dev_op_worker_locked(work)",
+        "handle_ipc_dev_op_req_inline(&work->hdr, work->payload, work->payload_len, &work, &retry, work->channel_identity)",
         "worker stale work check",
     )
-    if "free_ipc_dev_op_work(work);" not in worker_body[worker_body.find("claimed = work != nullptr") :]:
+    if "free_ipc_dev_op_work(work);" not in worker_body[worker_body.find("claimed = claim_ipc_dev_op_worker_locked(work)") :]:
         fail("deferred IPC DEV_OP worker must free stale work without handling it")
     for token in ["release_ipc_dev_op_worker_locked(SRC_NODE)", "ipc_dev_op_queue_push_front_locked", "kern_sleep_us"]:
         if token not in worker_body:
@@ -1011,7 +1059,7 @@ def test_large_deferred_dev_op_payloads_are_coallocated() -> None:
             fail(f"deferred IPC DEV_OP release is missing {snippet!r}")
 
     enqueue_body = function_body(remote_ipc, "try_enqueue_ipc_dev_op_work_rx")
-    for snippet in ["s_ipc_lock.try_lock()", "s_ipc_dev_op_pool_lock.try_lock()", "take_ipc_dev_op_work_locked(payload_len)"]:
+    for snippet in ["s_ipc_lock.try_lock()", "s_ipc_dev_op_pool_lock.try_lock()", "take_ipc_dev_op_work_locked(payload_len, delivery_group)"]:
         if snippet not in enqueue_body:
             fail(f"deferred IPC RX enqueue is missing {snippet!r}")
 
@@ -1046,7 +1094,7 @@ def test_large_deferred_dev_op_payloads_transfer_to_export_backlog() -> None:
         "free_pending_pipe_delivery",
         "free_export_pipe_write_backlog",
         "export_pipe_write_flush_thread_loop",
-        "drain_pending_pipe_data",
+        "proxy_pipe_read",
     ]:
         body = function_body(remote_ipc, name)
         if "release_pending_pipe_chunk(chunk)" not in body:
@@ -1076,14 +1124,14 @@ def test_large_deferred_dev_op_payloads_transfer_to_export_backlog() -> None:
         fail("export backlog owner publication must complete before releasing s_ipc_lock")
 
     worker_body = function_body(remote_ipc, "ipc_dev_op_worker_thread_fn")
-    worker_call = "handle_ipc_dev_op_req_inline(&work->hdr, work->payload, work->payload_len, &work, &retry)"
+    worker_call = "handle_ipc_dev_op_req_inline(&work->hdr, work->payload, work->payload_len, &work, &retry, work->channel_identity)"
     worker_call_pos = worker_body.find(worker_call)
     if worker_call_pos < 0:
         fail("deferred IPC worker must offer its work item to the inline handler")
     if "work->" in worker_body[worker_call_pos + len(worker_call) :]:
         fail("deferred IPC worker must not dereference work after ownership can transfer")
     dispatch_body = function_body(remote_ipc, "handle_ipc_dev_op_req")
-    if "handle_ipc_dev_op_req_inline(hdr, payload, payload_len, nullptr)" not in dispatch_body:
+    if "handle_ipc_dev_op_req_inline(hdr, payload, payload_len, nullptr, nullptr, response_channel)" not in dispatch_body:
         fail("immediate IPC RX dispatch must not transfer non-owned payload storage")
     handler_body = function_body(remote_ipc, "handle_ipc_dev_op_req_inline")
     queue_marker = "queue_export_pipe_write_data("
@@ -1119,17 +1167,36 @@ def test_large_deferred_dev_op_payloads_transfer_to_export_backlog() -> None:
             fail("handler dereferences transferred storage after queue publication: " + ", ".join(forbidden))
 
 
-def test_futex_dev_op_preserves_broadcast_wake_count() -> None:
-    remote_ipc = REMOTE_IPC_CPP.read_text()
-    for snippet in [
-        "OP_ID == OP_FUTEX_WAKE",
-        "op_data layout: [phys_addr:u64]",
-        "futex_wake_by_phys(phys_addr, INT32_MAX)",
-    ]:
-        if snippet not in remote_ipc:
-            fail(f"remote IPC futex wake bridge is missing broadcast-count snippet: {snippet}")
-    if "futex_wake_by_phys(phys_addr));" in remote_ipc:
-        fail("remote IPC futex wake bridge must pass an explicit wake count")
+def test_legacy_ipc_controls_require_issued_objects() -> None:
+    source = REMOTE_IPC_CPP.read_text()
+    handler = function_body(source, "handle_ipc_dev_op_req_inline")
+    start = handler.index("if (OP_ID == OP_EPOLL_CTL || OP_ID == OP_FUTEX_WAKE)")
+    refusal = handler[start:handler.index("if (OP_ID == OP_PTY_IOCTL)", start)]
+    for token in ["unsupported_ipc_control_reply(OP_ID, resource_id, request_cookie)", "send_response(REPLY.data()", "return;"]:
+        if token not in refusal:
+            fail("legacy control refusal must preserve completion identity: " + token)
+    for token in ["futex_wake_by_phys(", "ker::vfs::epoll_ctl("]:
+        if token in source:
+            fail("legacy IPC must not invoke ambient local object callbacks: " + token)
+    reply = function_body(source, "unsupported_ipc_control_reply")
+    if "response.status = -ENOTSUP" not in reply:
+        fail("ungranted legacy controls must report unsupported operation")
+    for token in ["new ", "lock", "find_", "get_current_task"]:
+        if token in reply:
+            fail("legacy refusal must build only bounded reply bytes: " + token)
+
+
+def test_export_resource_ids_cannot_wrap_or_partially_publish() -> None:
+    source = REMOTE_IPC_CPP.read_text()
+    reserve = function_body(source, "reserve_ipc_resource_ids")
+    require_order(reserve, "next == 0", "first = next", "exhaustion before output mutation")
+    require_order(reserve, "UINT32_MAX - next", "first = next", "range check before output mutation")
+    if "LAST == UINT32_MAX ? 0 : LAST + 1" not in reserve:
+        fail("resource ID exhaustion must stay permanent")
+    export = function_body(source, "wki_ipc_export_task_fds")
+    require_order(export, "reserve_ipc_resource_ids(", "if (!IDS_RESERVED) return -EOVERFLOW", "check full reservation")
+    for token in ["prepare_export_pipe_rdma(", "g_ipc_exports.push_back(exp)"]:
+        require_order(export, "if (!IDS_RESERVED) return -EOVERFLOW", token, "exhaustion before side effects")
 
 
 def test_ipc_send_retry_backpressure_sleeps_without_yield_livelock() -> None:
@@ -1160,7 +1227,7 @@ def test_retired_exports_fence_and_discard_unattached_deliveries() -> None:
     for snippet in [
         "direct_discards",
         "stop_pipe_pump_locked(exp)",
-        "schedule_pending_pipe_discard(consumer_node, resource_id)",
+        "schedule_pending_pipe_discard(discard.channel, discard.resource_id)",
     ]:
         if snippet not in cleanup:
             fail(f"export cleanup is missing ordered pending-delivery retirement {snippet!r}")
@@ -1182,7 +1249,7 @@ def test_retired_exports_fence_and_discard_unattached_deliveries() -> None:
     close_read = handler[close_begin:close_end]
     for snippet in [
         "bool const DIRECT_DISCARD = pump_task == nullptr",
-        "schedule_pending_pipe_discard(hdr->src_node, resource_id)",
+        "schedule_pending_pipe_discard(response_channel, resource_id)",
     ]:
         if snippet not in close_read:
             fail(f"pipe read-close retirement must fence late EOF state: {snippet!r}")
@@ -1277,7 +1344,190 @@ def test_ipc_selftests_are_declared_and_registered() -> None:
             fail(f"missing KTEST coverage for {token}")
 
 
+def test_output_receipts_follow_commit_and_survive_only_for_completion() -> None:
+    source = REMOTE_IPC_CPP.read_text()
+    send = function_body(WKI_CPP.read_text(), "wki_send_impl")
+    require_order(send, "ch->retransmit_count++", "accepted_bytes->fetch_add", "account only recoverable frames")
+    require_order(send, "ch->tx_seq++", "accepted_bytes->fetch_add", "counter follows sequence commit")
+    counter = send.index("accepted_bytes->fetch_add")
+    if "ch->lock.unlock()" in send[send.index("ch->tx_seq++"):counter]:
+        fail("accepted prefix must be counted before releasing channel serialization")
+    write = function_body(source, "proxy_pipe_write")
+    if "wki_send_accounted(" not in write or "bytes_written.fetch_add" in write:
+        fail("proxy writes must account at enqueue, not in return order")
+    lookup = function_body(source, "find_proxy_by_endpoint_locked")
+    if "receipt && proxy->completion_refs != 0" not in lookup:
+        fail("closed proxies may be found only by retained receipt lookup")
+    if source.count("find_proxy_by_endpoint_locked(hdr->src_node, resource_id, true)") != 1:
+        fail("only the flow receipt handler may request closed-proxy lookup")
+    detach = function_body(source, "wki_ipc_detach_proxy_file")
+    if "if (proxy->completion_refs == 0) dropped_registry_ref = proxy_unregister_locked(proxy)" not in detach:
+        fail("File close must preserve completion-owned receipt registry membership")
+    refunds = function_body(source, "proxy_grant_message_write_credits")
+    if "bytes_delivered" in refunds:
+        fail("local credit refunds are not evidence of delivery")
+    scan = function_body(REMOTE_COMPUTE_CPP.read_text(), "wki_remote_compute_check_completions")
+    require_order(scan, "!rt.output_completion->ready()", "queue_pending_completion_locked(", "delivery before child completion")
+    if "PeerLifecycleLease" in scan:
+        fail("receipt progress must not wait behind the scanner's exclusive lifecycle lease")
+    receipt = function_body(source, "complete_export_pipe_flow_receipt_locked")
+    require_order(receipt, "if (!accepted) return false", "release_pending_pipe_chunk", "retain credit on failed enqueue")
+    flush = function_body(source, "export_pipe_write_flush_thread_loop")
+    require_order(flush, "bool const ACCEPTED = send_export_pipe_write_flow", "complete_export_pipe_flow_receipt_locked(backlog, ACCEPTED)",
+                  "receipt acceptance before credit retirement")
+    require_order(flush, "complete_export_pipe_flow_receipt_locked(backlog, ACCEPTED)", "retire_failed_export_pipe_write_locked",
+                  "terminal error receipt before export retirement")
+    if "chunk.offset == chunk.len && chunk.flow_credit == 0" not in flush:
+        fail("completed flow chunks must remain owned until their receipt is enqueued")
+    handler = function_body(source, "handle_ipc_dev_op_req_inline")
+    if "if (!send_export_pipe_write_flow(CONTROL, resource_id, 0, -EPIPE)) retry_owned_work()" not in handler:
+        fail("missing exports must retain deferred DATA until the terminal receipt is enqueued")
+
+
+def test_pipe_eof_rechecks_data_under_registration_locks() -> None:
+    body = function_body(REMOTE_IPC_CPP.read_text(), "proxy_pipe_read")
+    serialized = body[body.index("for (;;) {"):]
+    require_order(serialized, "s_ipc_lock.lock_irqsave()", "proxy->lock.lock_irqsave()", "read lock order")
+    for token in ["if (HEAD != TAIL)", "pending != nullptr && !pending->chunks.empty()"]:
+        require_order(serialized, token, "result = 0;", "EOF follows final data recheck")
+    require_order(serialized, "s_ipc_lock.unlock_irqrestore", "release_pending_pipe_chunk(chunk)", "release outside locks")
+
+
+def test_exported_controls_bind_the_issued_consumer() -> None:
+    source = REMOTE_IPC_CPP.read_text()
+    match = function_body(source, "ipc_export_matches_consumer")
+    for token in ("consumer_node != WKI_NODE_INVALID", "consumer_node != WKI_NODE_BROADCAST", "exp->consumer_node == consumer_node", "exp->res_type == expected_type"):
+        assert token in match
+    pin = function_body(source, "ipc_acquire_export_file_locked")
+    assert pin.index("ipc_export_matches_consumer(") < pin.index("refcount.fetch_add(")
+    close = function_body(source, "mark_export_pipe_write_closed")
+    assert close.index("ipc_export_matches_consumer(") < close.index("ensure_export_pipe_write_backlog_locked(")
+    handler = function_body(source, "handle_ipc_dev_op_req_inline")
+    calls = re.findall(r"ipc_acquire_export_file_locked\(([^)]*)\)", handler)
+    assert len(calls) == 6 and all("hdr->src_node" in call for call in calls)
+    assert sum("ResourceType::IPC_SOCKET" in call for call in calls) == 4
+    assert sum("ResourceType::IPC_PTY" in call for call in calls) == 1
+    read_close = handler[handler.index("if (OP_ID == OP_PIPE_CLOSE_READ)"):handler.index("if (OP_ID >= OP_SOCK_ACCEPT")]
+    assert read_close.index("ipc_export_matches_consumer(") < read_close.index("stop_pipe_pump_locked(")
+    assert "if (WRONG_CONSUMER) return;" in read_close
+    pty_close = function_body(source, "mark_ipc_pty_write_closed_or_pending")
+    assert "ipc_export_matches_consumer(exp, resource_id, peer_node, ResourceType::IPC_PTY)" in pty_close
+    assert pty_close.index("if (denied) return true;") < pty_close.index("mark_pending_pipe_write_closed(")
+
+
+def test_ipc_epoch_control_identities() -> None:
+    source = REMOTE_IPC_CPP.read_text()
+    peer = (ROOT / "modules/kern/src/net/wki/peer.cpp").read_text()
+    for name in ["handle_hello", "handle_hello_ack"]:
+        body = function_body(peer, name)
+        require_order(body, "wki_ipc_mark_epoch_reset(peer_node)", "wki_channels_close_for_peer(peer_node)",
+                      "retire IPC endpoints before connected epoch channel reset")
+    drain = function_body(peer, "drain_pending_epoch_reset_cleanups")
+    require_order(drain, "wki_remote_compute_cleanup_retired_for_peer", "wki_ipc_cleanup_for_peer", "compute before IPC drain")
+    require_order(drain, "wki_ipc_cleanup_for_peer", "vfs_reset_rebind_pending.store(false", "IPC drain before admission reopens")
+    mark = function_body(source, "wki_ipc_mark_epoch_reset")
+    for token in ["begin_ipc_peer_dev_op_cleanup_locked(node_id)", "exp->active = false", "proxy->active.store(false",
+                  "proxy->message_write_error.store(-EIO"]:
+        if token not in mark:
+            fail("IPC epoch marker missing " + token)
+    for token in ["new ", "delete ", "kern_yield", "proxy_release", "ipc_release_file_ref", "wki_finish_claimed_op"]:
+        if token in mark:
+            fail("IPC HELLO marker must not allocate, free, block or wake: " + token)
+    attach = function_body(source, "wki_ipc_attach_task_fds")
+    require_order(attach, "wki_channel_generation_is_live(control_channel.channel", "new (std::nothrow) ProxyIpcState",
+                  "validate admitted channel before import allocation")
+    require_order(attach, "proxy->control_channel = control_channel", "g_ipc_proxies.push_back(proxy)", "retain immutable channel before publication")
+    send = function_body(source, "wki_ipc_send_control")
+    if "wki_send_on_channel_identity(identity, MsgType::DEV_OP_REQ" not in send or "wki_send(" in send:
+        fail("control requests must not resolve a replacement numeric channel")
+    handler = function_body(source, "handle_ipc_dev_op_req_inline")
+    if "wki_send_on_channel_identity(response_channel, MsgType::DEV_OP_RESP" not in handler or "wki_send(" in handler:
+        fail("deferred IPC replies must retain their RX allocation across callbacks")
+    worker = function_body(source, "ipc_dev_op_worker_thread_fn")
+    if "&work, &retry, work->channel_identity" not in worker:
+        fail("worker must pass the admitted reply channel by value")
+    server = (ROOT / "modules/kern/src/net/wki/dev_server.cpp").read_text()
+    if "handle_ipc_dev_op_req(hdr, payload, payload_len, CHANNEL_IDENTITY)" not in server:
+        fail("inline IPC refusal must retain the RX channel identity")
+
+
+def test_data_and_queued_close_channel_retirement() -> None:
+    source = REMOTE_IPC_CPP.read_text()
+    capture = function_body(source, "wki_ipc_capture_data_channel")
+    require_order(capture, "if (!control_live())", "capture_ipc_channel(", "admitted control before DATA capture")
+    require_order(capture, "capture_ipc_channel(", "return control_live()", "control retirement after DATA capture")
+    attach = function_body(source, "wki_ipc_attach_task_fds")
+    for token in ["data_channel.peer_node_id != source_node", "data_channel.channel_id != WKI_CHAN_IPC_DATA",
+                  "wki_channel_generation_is_live(data_channel.channel"]:
+        require_order(attach, token, "new (std::nothrow) ProxyIpcState", "DATA token before import allocation")
+    require_order(attach, "proxy->data_channel = data_channel", "g_ipc_proxies.push_back(proxy)", "immutable DATA before publication")
+    write = function_body(source, "proxy_pipe_write")
+    if "wki_send_accounted(proxy->data_channel," not in write or "if (ret == WKI_ERR_NOT_FOUND)" not in write:
+        fail("pipe writes must retain DATA allocation and terminate retired-channel waits")
+    accounted = function_body(WKI_CPP.read_text(), "wki_send_accounted")
+    if not re.search(r"wki_send_impl\(identity.peer_node_id,\s*identity.channel_id,.*identity.channel,\s*identity.generation", accounted, re.S):
+        fail("accounted send must carry exact generation into reliable commit")
+    for name in ["send_proxy_pipe_close", "send_pending_proxy_pipe_close"]:
+        body = function_body(source, name)
+        if "wki_send_on_channel_identity(" not in body or "wki_send(" in body or "wki_channel_get(" in body:
+            fail(name + " must use captured allocation without replacement lookup")
+    queue = function_body(source, "enqueue_proxy_pipe_close_tx")
+    require_order(queue, "pending->channel_identity = identity", "g_pending_proxy_pipe_closes.push_back", "queue owns copied channel identity")
+    worker = function_body(source, "proxy_pipe_close_tx_thread_fn")
+    if "send_pending_proxy_pipe_close(*pending)" not in worker or "wki_send(" in worker:
+        fail("popped close work cannot select a replacement channel")
+    socket = function_body(REMOTE_IPC_SOCKET_CPP.read_text(), "proxy_socket_write")
+    if "wki_send_on_channel_identity(proxy->data_channel," not in socket or "wki_send(" in socket:
+        fail("socket data must use the imported allocation")
+
+
+def test_original_export_channels_survive_submission_and_cleanup() -> None:
+    from exec_source_test import function_body as multiline_body
+    source = REMOTE_IPC_CPP.read_text()
+    compute = REMOTE_COMPUTE_CPP.read_text()
+    export = function_body(source, "wki_ipc_export_task_fds")
+    require_order(export, "ipc_channels_live(channels, target_node)", "snapshot.prepare_exports(", "export identity before allocation")
+    require_order(export, "exp->channels = channels", "g_ipc_exports.push_back(exp)", "original pair before publication")
+    require_order(export, "ipc_peer_cleanup_epoch_locked(target_node) != EXPORT_EPOCH", "g_ipc_exports.push_back(exp)", "epoch before publication")
+    match = function_body(source, "wki_ipc_exports_match_submit")
+    for token in ["ipc_channels_live(channels, node)", "ipc_channel_identity_equal(channels.control, submit)",
+                  "exp->active", "exp->consumer_node == node", "ipc_channel_identity_equal(exp->channels.data, channels.data)"]:
+        if token not in match: fail("prepared export matching missing " + token)
+    for name in ["wki_task_submit_inline", "wki_task_submit_vfs_ref"]:
+        body = multiline_body(compute, name)
+        require_order(body, "wki_ipc_exports_match_submit(", "publish_submitted_task_locked(", "same session before submitted-task publication")
+        require_order(body, "st.ipc_channels = ipc_guard.channels()", "publish_submitted_task_locked(", "durable pair before publication")
+    cleanup = function_body(source, "wki_ipc_cleanup_exported_fds")
+    for token in ["{entry.resource_id, channels.data}", "{entry.resource_id, exp->channels.data}",
+                  "schedule_pending_pipe_discard(discard.channel, discard.resource_id)"]:
+        if token not in cleanup: fail("cleanup lost original DATA identity: " + token)
+    if "capture_ipc" in cleanup: fail("missing-export cleanup cannot capture a replacement")
+    discard = function_body(source, "schedule_pending_pipe_discard")
+    if "capture_ipc" in discard or "wki_channel_get" in discard:
+        fail("discard scheduling must receive the original token")
+    if "DATA_CHANNEL.channel_id != WKI_CHAN_IPC_DATA" not in discard:
+        fail("legacy RESOURCE close cannot invent a DATA identity")
+    pump = function_body(source, "pipe_pump_thread_fn")
+    require_order(pump, "data_channel = exp->channels.data", "file->fops->vfs_read(", "retain original DATA before read")
+    if pump.count("wki_send_on_channel_identity(data_channel,") != 2: fail("both pump DATA/EOF use retained identity")
+    receipt = function_body(source, "send_export_pipe_write_flow")
+    if "wki_send_on_channel_identity(control," not in receipt: fail("receipts require original RESOURCE")
+    handler = function_body(source, "handle_ipc_dev_op_req_inline")
+    require_order(handler, "capture_ipc_companion_channel(response_channel, WKI_CHAN_IPC_DATA, WKI_CHAN_RESOURCE)",
+                  "send_export_pipe_write_flow(CONTROL,", "missing-export receipt bound to admitted DATA")
+    companion = function_body(source, "capture_ipc_companion_channel")
+    require_order(companion, "if (!live())", "capture_ipc_channel(", "admitted generation before companion")
+    require_order(companion, "capture_ipc_channel(", "return live()", "same generation after companion")
+    if re.search(r"\bwki_send\(", source): fail("IPC must not send through numeric replacement lookup")
+
+
 def main() -> None:
+    test_original_export_channels_survive_submission_and_cleanup()
+    test_data_and_queued_close_channel_retirement()
+    test_ipc_epoch_control_identities()
+    test_exported_controls_bind_the_issued_consumer()
+    test_pipe_eof_rechecks_data_under_registration_locks()
+    test_output_receipts_follow_commit_and_survive_only_for_completion()
     test_poll_wake_drains_all_batches()
     test_proxy_poll_wake_cancels_deferred_switch_without_losing_wake_token()
     test_pipe_pump_read_waiter_uses_event_block_fast_path()
@@ -1299,13 +1549,15 @@ def main() -> None:
     test_submission_guard_covers_preparation_and_failure_transfer()
     test_export_admission_precedes_side_effects()
     test_pumps_activate_only_after_accepted_handoff()
+    test_import_provenance_precedes_all_side_effects()
     test_attach_fd_install_is_transactional()
     test_dev_op_response_cookies_fence_stale_waiters()
     test_peer_cleanup_drains_deferred_dev_op_work()
     test_ipc_dev_ops_are_reserved_before_reliable_ack()
     test_large_deferred_dev_op_payloads_are_coallocated()
     test_large_deferred_dev_op_payloads_transfer_to_export_backlog()
-    test_futex_dev_op_preserves_broadcast_wake_count()
+    test_legacy_ipc_controls_require_issued_objects()
+    test_export_resource_ids_cannot_wrap_or_partially_publish()
     test_ipc_send_retry_backpressure_sleeps_without_yield_livelock()
     test_retired_exports_fence_and_discard_unattached_deliveries()
     test_socket_close_uses_reliable_proxy_close_queue()

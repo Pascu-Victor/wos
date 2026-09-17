@@ -4,8 +4,10 @@
 
 #include <array>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <platform/fw/qemu_fw_cfg.hpp>
+#include <platform/sys/spinlock.hpp>
 #include <vfs/file.hpp>
 #include <vfs/vfs.hpp>
 
@@ -15,7 +17,8 @@ namespace ker::util::hostname {
 
 namespace {
 
-std::array<char, HOSTNAME_MAX> s_hostname{'w', 'o', 's', '\0'};
+Name s_hostname{'w', 'o', 's', '\0'};
+ker::mod::sys::Spinlock s_hostname_lock;
 
 auto is_valid_char(char c) -> bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-'; }
 
@@ -47,9 +50,11 @@ auto try_set_hostname(const char* src, size_t max_len, const char* source_label)
         }
     }
 
-    std::memcpy(s_hostname.data(), start, len);
-    s_hostname.at(len) = '\0';
-    ker::mod::dbg::log("[hostname] Loaded '%s' from %s", s_hostname.data(), source_label);
+    if (set(start, len) != 0) {
+        return false;
+    }
+    auto const NAME = snapshot();
+    ker::mod::dbg::log("[hostname] Loaded '%s' from %s", NAME.data(), source_label);
     return true;
 }
 
@@ -72,7 +77,8 @@ void init() {
         if (f != nullptr) {
             static_cast<void>(ker::vfs::vfs_close_file(f));
         }
-        ker::mod::dbg::log("[hostname] No /etc/hostname, using default '%s'", s_hostname.data());
+        auto const NAME = snapshot();
+        ker::mod::dbg::log("[hostname] No /etc/hostname, using default '%s'", NAME.data());
         return;
     }
 
@@ -85,11 +91,17 @@ void init() {
     buf.at(static_cast<size_t>(N)) = '\0';
 
     if (!try_set_hostname(buf.data(), static_cast<size_t>(N), "/etc/hostname")) {
-        ker::mod::dbg::log("[hostname] Invalid /etc/hostname content, using default '%s'", s_hostname.data());
+        auto const NAME = snapshot();
+        ker::mod::dbg::log("[hostname] Invalid /etc/hostname content, using default '%s'", NAME.data());
     }
 }
 
-auto get() -> const char* { return s_hostname.data(); }
+auto snapshot() -> Name {
+    uint64_t const FLAGS = s_hostname_lock.lock_irqsave();
+    auto const NAME = s_hostname;
+    s_hostname_lock.unlock_irqrestore(FLAGS);
+    return NAME;
+}
 
 auto set(const char* name, size_t len) -> int {
     if (name == nullptr || len == 0 || len >= HOSTNAME_MAX) {
@@ -103,8 +115,11 @@ auto set(const char* name, size_t len) -> int {
             return -EINVAL;
         }
     }
-    std::memcpy(s_hostname.data(), name, len);
-    s_hostname.at(len) = '\0';
+    Name replacement{};
+    std::memcpy(replacement.data(), name, len);
+    uint64_t const FLAGS = s_hostname_lock.lock_irqsave();
+    s_hostname = replacement;
+    s_hostname_lock.unlock_irqrestore(FLAGS);
     return 0;
 }
 

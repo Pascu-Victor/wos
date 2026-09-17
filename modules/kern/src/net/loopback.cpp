@@ -54,6 +54,7 @@ NetDeviceOps lo_ops = {
     .start_xmit = lo_xmit,
     .set_mac = lo_set_mac,
     .set_queue_cpu = nullptr,
+    .check_mac = ker::net::netdev_check_fixed_mac,
 };
 }  // namespace
 

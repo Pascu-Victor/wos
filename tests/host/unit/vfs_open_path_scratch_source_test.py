@@ -189,10 +189,14 @@ def test_dirfd_visible_scratch_is_initialized_by_root_strip() -> None:
         ],
         "fallback dirfd visible path production",
     )
+    require_order(slow, ["else if (retained_dirfd_path != nullptr)",
+                         "strip_task_root_prefix(task, retained_dirfd_path, visible.data(), visible.size(), nullptr)",
+                         "if (STRIP_RET != 0) return STRIP_RET", "base = visible.data()"],
+                  "identity-derived fallback base still produces bounded root-relative text before use")
     strip_failure = block_body_after(slow[slow.find("if (STRIP_RET < 0)") :], "if (STRIP_RET < 0)")
     if strip_failure.strip() != "return STRIP_RET;":
         fail("fallback dirfd resolution must return before consuming failed root-strip output")
-    if slow.count("visible.data()") != 2 or slow.count("visible.size()") != 1 or "visible[" in slow:
+    if slow.count("visible.data()") != 6 or slow.count("visible.size()") != 3 or "visible[" in slow:
         fail("fallback dirfd visible scratch has an unexpected producer or consumer")
 
     require_order(
@@ -376,7 +380,8 @@ def test_prefix_symlink_scratch_is_initialized_by_its_producers() -> None:
 
     link_len_production = (
         "ssize_t const LINK_LEN = "
-        "readlink_resolved_on_mount(path, linkbuf.data(), linkbuf.size() - 1, prefix_mount, end);"
+        "readlink_resolved_on_mount(path, linkbuf.data(), linkbuf.size() - 1, prefix_mount, end, UNKNOWN_PATH_HASH,\n"
+        "                                                            admitted_credentials);"
     )
     link_len_pos = resolve_prefix.find(link_len_production)
     restore_path = "path[end] = CH;"
@@ -398,7 +403,7 @@ def test_prefix_symlink_scratch_is_initialized_by_its_producers() -> None:
         [
             linkbuf_declaration,
             "path[end] = '\\0'",
-            "readlink_resolved_on_mount(path, linkbuf.data(), linkbuf.size() - 1, prefix_mount, end)",
+            link_len_production,
             "path[end] = CH",
             "if (LINK_LEN > 0)",
             "if (static_cast<size_t>(LINK_LEN) >= linkbuf.size())",
@@ -1203,7 +1208,7 @@ def test_stat_impl_path_buffer_is_initialized_by_its_producers() -> None:
     if return_types != ["int"]:
         fail("make_absolute must preserve its signed integer result domain")
     make_returns = [" ".join(value.split()) for value in re.findall(r"\breturn\s+([^;]+);", make_absolute)]
-    if make_returns != ["-EINVAL", "-EINVAL", "-ENAMETOOLONG", "0", "-ESRCH", "-ENAMETOOLONG", "0"]:
+    if make_returns != ["-EINVAL", "-EINVAL", "-ENAMETOOLONG", "0", "-ESRCH", "CWD", "-ENAMETOOLONG", "0"]:
         fail("make_absolute return topology changed; re-audit complete-production success semantics")
     if make_absolute.count("size_t const PLEN = std::strlen(path);") != 1:
         fail("make_absolute must derive its complete input length exactly once")
@@ -1220,7 +1225,10 @@ def test_stat_impl_path_buffer_is_initialized_by_its_producers() -> None:
         ],
         "absolute path complete production",
     )
-    relative_setup = """size_t const CWDLEN = task_cached_cwd_len(task);
+    require_order(make_absolute, ["vfs_getcwd_for_task(task, cwd.data(), cwd.size(), &cwd_len)",
+                                  "if (CWD != 0) return CWD", "size_t const CWDLEN = cwd_len", "std::memcpy(out, cwd.data(), CWDLEN)"],
+                  "retained cwd is completely produced before the caller destination is written")
+    relative_setup = """size_t const CWDLEN = cwd_len;
     // Need: cwd + "/" + path + '\\0'
     bool const NEED_SEP = (CWDLEN > 1);  // Root "/" doesn't need extra /
     size_t const TOTAL = CWDLEN + (NEED_SEP ? 1 : 0) + PLEN + 1;
@@ -1228,10 +1236,10 @@ def test_stat_impl_path_buffer_is_initialized_by_its_producers() -> None:
         return -ENAMETOOLONG;
     }"""
     relative_setup_pos = make_absolute.find(relative_setup)
-    relative_copy = "std::memcpy(out, task->cwd.data(), CWDLEN);"
+    relative_copy = "std::memcpy(out, cwd.data(), CWDLEN);"
     relative_copy_pos = make_absolute.find(relative_copy, relative_setup_pos + len(relative_setup))
     relative_success = make_absolute[relative_copy_pos:].strip()
-    expected_relative_success = """std::memcpy(out, task->cwd.data(), CWDLEN);
+    expected_relative_success = """std::memcpy(out, cwd.data(), CWDLEN);
     if (NEED_SEP) {
         out[CWDLEN] = '/';
         std::memcpy(out + CWDLEN + 1, path, PLEN + 1);
@@ -1585,6 +1593,12 @@ def test_stat_impl_symlink_scratch_is_initialized_by_resolver() -> None:
     effective_task_setup = """const ker::mod::sched::task::Task* effective_task_policy = task_policy;
     if (effective_task_policy == nullptr && ker::mod::sched::can_query_current_task()) {
         effective_task_policy = ker::mod::sched::get_current_task();
+    }
+
+    std::optional<ker::mod::security::Snapshot> captured_credentials;
+    if (admitted_credentials == nullptr && effective_task_policy != nullptr) {
+        captured_credentials.emplace(effective_task_policy->credentials());
+        admitted_credentials = &*captured_credentials;
     }"""
     initial_policy_normalization = """int const NORMALIZE = normalize_task_path_inplace_for_task(effective_task_policy, resolved_buf, bufsize);
         if (NORMALIZE < 0) {
@@ -1699,7 +1713,8 @@ def test_stat_impl_symlink_scratch_is_initialized_by_resolver() -> None:
         "int const PREFIX_RESULT = resolve_prefix_symlink_once(resolved_buf, bufsize, apply_task_policy, follow_final_symlink, "
         "mount,\n"
         "                                                              path_len_known ? path_len : UNKNOWN_PATH_LEN, policy, "
-        "effective_task_policy);"
+        "effective_task_policy,\n"
+        "                                                              preserve_procfs_fd_links, admitted_credentials);"
     )
     prefix_gates = (
         "if (PREFIX_RESULT < 0) {\n"
@@ -1731,11 +1746,14 @@ def test_stat_impl_symlink_scratch_is_initialized_by_resolver() -> None:
         "-EPERM",
         "-EPERM",
         "-EPERM",
+        "finish_success()",  # Preserve the complete raw remote remainder for owner authorization.
         "PREFIX_RESULT",
         "finish_success()",
         "finish_success()",
+        "finish_success()",  # Open intent preserves a complete final procfs FD path.
         "finish_success()",
         "finish_success()",
+        "static_cast<int>(LINK_LEN)",  # Recognized procfs links propagate denial before any successful output.
         "finish_success()",
         "-ENAMETOOLONG",
         "RR",
@@ -1743,7 +1761,8 @@ def test_stat_impl_symlink_scratch_is_initialized_by_resolver() -> None:
         "NORMALIZE",
         "CANONICAL",
         "-EPERM",
-        "finish_success()",
+        "-ESRCH",  # Remote readlink requires an admitted snapshot.
+        "static_cast<int>(LINK_LEN)",  # Remote denial cannot become successful path output.
         "finish_success()",
         "-ENAMETOOLONG",
         "RR",
@@ -1772,7 +1791,7 @@ def test_stat_impl_symlink_scratch_is_initialized_by_resolver() -> None:
         or len(re.findall(r"\bresolved_len_out\b", resolver)) != 2
         or len(re.findall(r"\bpath_len\b", resolver)) != 22
         or len(re.findall(r"\bpath_len_known\b", resolver)) != 23
-        or resolver.count("return finish_success();") != 12
+        or resolver.count("return finish_success();") != 13
         or resolver.count("return 0;") != 1
     ):
         fail("resolve_symlinks destination or success flow changed; re-audit complete initialization")
@@ -1878,7 +1897,10 @@ def test_f_ok_access_scratch_is_initialized_by_its_producers() -> None:
     require_only_uninitialized_array(f_ok, "symlink_resolved", symlink_declaration, "F_OK symlink scratch")
 
     path_buffer_pos = f_ok.find(path_buffer_declaration)
-    f_ok_null_prelude = """if (resolved_path == nullptr) {
+    f_ok_null_prelude = """auto* metadata_task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    std::optional<ker::mod::security::Snapshot> request_credentials;
+    if (metadata_task != nullptr) request_credentials = metadata_task->credentials();
+    if (resolved_path == nullptr) {
         return -EINVAL;
     }
 
@@ -2226,7 +2248,7 @@ def test_statat_scratch_is_initialized_by_dirfd_resolver() -> None:
             "LookupFollowPolicy const policy = FOLLOW_FINAL_SYMLINK ? LookupFollowPolicy::FOLLOW_FINAL : LookupFollowPolicy::NOFOLLOW_FINAL;",
             "for (unsigned attempt = 0; attempt < 4; ++attempt)",
             "LookupHandle lookup{};",
-            "vfs_acquire_lookup(task, dirfd, pathname, LookupIntent::STAT, policy, false, true, &lookup, 0)",
+            "vfs_acquire_lookup(task, dirfd, pathname, LookupIntent::STAT, policy, false, true, &lookup, 0, false, &REQUEST_CREDENTIALS)",
             "lookup.mount()->fs_type == FSType::REMOTE ? consume_stat(lookup, &context)",
             "vfs_consume_lookup(lookup, false, consume_stat, &context)",
             "if (result != -EAGAIN || attempt == 3)",
@@ -2267,7 +2289,7 @@ def test_statat_scratch_is_initialized_by_dirfd_resolver() -> None:
         fail("fast dirfd resolver must not clear its complete destination before bounded production")
 
     fast_producer_flows = {
-        "copy_common_local_dirfd_relative_path": (4, 4, 4, 0),
+        "copy_common_local_dirfd_relative_path": (4, 4, 5, 0),
         "copy_common_local_visible_absolute_path_fast_path": (5, 3, 7, 0),
         "copy_task_visible_absolute_path_with_root": (5, 3, 6, 2),
         "copy_simple_relative_path_from_base": (9, 4, 6, 1),
@@ -2277,8 +2299,8 @@ def test_statat_scratch_is_initialized_by_dirfd_resolver() -> None:
     fast_producer_returns = {
         "copy_common_local_dirfd_relative_path": [
             "-EINVAL",
-            "copy_simple_relative_path_from_base(task->cwd.data(), pathname, scan, out, outsize, out_len, "
-            "task_cached_cwd_len(task), out_hash)",
+            "CWD",
+            "copy_simple_relative_path_from_base(cwd.data(), pathname, scan, out, outsize, out_len, cwd_len, out_hash)",
             "-EBADF",
             "result",
         ],
@@ -2439,17 +2461,21 @@ def test_open_path_scratch_is_initialized_by_its_producers() -> None:
         "vfs_open redundant scratch initialization",
     )
 
-    openat_body = function_body(core, "vfs_openat")
+    public_openat = function_body(core, "vfs_openat")
+    if public_openat.strip() != "return open_at_for_task(task, dirfd, pathname, flags, mode, nullptr, true);":
+        fail("vfs_openat must delegate to the shared task open helper")
+    openat_body = function_body(core, "open_at_for_task")
     require_order(
-        openat_body,
+        " ".join(openat_body.split()),
         [
             "LookupFollowPolicy const FOLLOW_POLICY",
             "LookupHandle lookup{};",
-            "vfs_acquire_lookup(task, dirfd, pathname, LookupIntent::OPEN, FOLLOW_POLICY, FLAGS_REQUIRE_DIRECTORY, !OPEN_LOCAL, &lookup, 0)",
+            "vfs_acquire_lookup(task, dirfd, pathname, LookupIntent::OPEN, FOLLOW_POLICY, FLAGS_REQUIRE_DIRECTORY, !OPEN_LOCAL, &lookup, 0, false, &REQUEST_CREDENTIALS)",
             "if (lookup.mount()->fs_type == FSType::REMOTE)",
             "return consume_open(lookup, &context);",
-            "vfs_consume_lookup(lookup, (flags & (ker::vfs::O_CREAT | ker::vfs::O_TRUNC)) != 0, consume_open, &context)",
-            "if (RESULT != -EAGAIN || attempt == 3)",
+            "consume_lookup_locked(lookup, false, consume_open, &context, task, &REQUEST_CREDENTIALS)",
+            "if (RESULT != -EAGAIN) return RESULT;",
+            "return open_local_serialized(task, dirfd, pathname",
         ],
         "vfs_openat retained lookup and bounded consume ordering",
     )
@@ -2459,7 +2485,8 @@ def test_open_path_scratch_is_initialized_by_its_producers() -> None:
             "std::array<char, MAX_PATH_LEN> resolved{};",
             "std::memcpy(resolved.data(), handle.path(), handle.path_length() + 1);",
             "vfs_open_resolved_for_task(args.task, args.raw_path, resolved",
-            "&handle)",
+            "&handle, args.output,",
+            "true, &args.directory_view)",
         ],
         "vfs_openat retained handle path consumption",
     )
@@ -2678,7 +2705,7 @@ def test_create_remove_path_scratch_is_initialized_by_task_resolver() -> None:
             "uint64_t abs_path_hash = UNKNOWN_PATH_HASH;",
             "if (resolve_task_path_raw_impl(path, abs_path.data(), abs_path.size(), true, &abs_path_len, &abs_path_hash) < 0)",
             "return -ENOENT;",
-            "return vfs_mkdir_resolved_path(abs_path.data(), mode, abs_path_len, abs_path_hash);",
+            "return vfs_mkdir_resolved_path(current_metadata_credentials(), abs_path.data(), mode, abs_path_len, abs_path_hash);",
         ),
         (
             "vfs_unlink",
@@ -2689,7 +2716,7 @@ def test_create_remove_path_scratch_is_initialized_by_task_resolver() -> None:
             "uint64_t path_buf_hash = UNKNOWN_PATH_HASH;",
             "if (resolve_task_path_raw_impl(path, path_buf.data(), MAX_PATH_LEN, true, &path_buf_len, &path_buf_hash) < 0)",
             "return -ENAMETOOLONG;",
-            "return vfs_unlink_resolved_path(path_buf.data(), path_buf_len, path_buf_hash);",
+            "return vfs_unlink_resolved_path(current_metadata_credentials(), path_buf.data(), path_buf_len, path_buf_hash);",
         ),
         (
             "vfs_rmdir",
@@ -2700,7 +2727,7 @@ def test_create_remove_path_scratch_is_initialized_by_task_resolver() -> None:
             "uint64_t path_buf_hash = UNKNOWN_PATH_HASH;",
             "if (resolve_task_path_raw_impl(path, path_buf.data(), path_buf.size(), true, &path_buf_len, &path_buf_hash) < 0)",
             "return -ENAMETOOLONG;",
-            "return vfs_rmdir_resolved_path(path_buf.data(), path_buf_len, path_buf_hash);",
+            "return vfs_rmdir_resolved_path(current_metadata_credentials(), path_buf.data(), path_buf_len, path_buf_hash);",
         ),
     ]
     expected_scratch_uses = {"vfs_mkdir": 4, "vfs_unlink": 3, "vfs_rmdir": 4}
@@ -2819,8 +2846,10 @@ def test_link_path_scratch_is_initialized_by_its_producers() -> None:
     ):
         fail("linkat dirfd resolver wrapper must fall through from direct production to the complete raw resolver")
 
-    dirfd_fast_call = """int const FAST_RET = resolve_dirfd_task_path_raw_common_local_fast_path(
-        task, dirfd, pathname, PATH_SCAN, out, outsize, apply_task_route, resolved_len_out, resolved_hash_out, &trusted_dirfd_parent);"""
+    dirfd_fast_call = """int const FAST_RET = retained_dirfd_path != nullptr ? RESOLVE_FAST_PATH_DECLINED
+                                                        : resolve_dirfd_task_path_raw_common_local_fast_path(
+                                                              task, dirfd, pathname, PATH_SCAN, out, outsize, apply_task_route,
+                                                              resolved_len_out, resolved_hash_out, &trusted_dirfd_parent);"""
     dirfd_fast_success = "if (FAST_RET == 0)"
     dirfd_fast_failure = "if (FAST_RET < 0)"
     dirfd_fallback = "bool const needs_canonicalize = PATH_SCAN.needs_canonicalize;"
@@ -2881,7 +2910,7 @@ def test_link_path_scratch_is_initialized_by_its_producers() -> None:
             "int const COPY_RET = copy_path_string(newpath, new_buf.data(), new_buf.size());",
             new_slow_header,
             "return -ENAMETOOLONG;",
-            "return vfs_link_resolved_paths(old_buf.data(), new_buf.data());",
+            "return vfs_link_resolved_paths(current_metadata_credentials(), old_buf.data(), new_buf.data());",
         ],
         "link scratch producer, failure gate, and consumer ordering",
     )
@@ -2925,7 +2954,7 @@ def test_link_path_scratch_is_initialized_by_its_producers() -> None:
         [
             "ker::vfs::tmpfs::tmpfs_link_lookup(",
             "ker::vfs::xfs::xfs_link_lookup(",
-            "vfs_link_resolved_paths(source.path(), destination.path(), true)",
+            "vfs_link_resolved_paths(source.authorization().credentials, source.path(), destination.path(), true)",
         ],
         "linkat retained backend identities and compatibility consumer",
     )

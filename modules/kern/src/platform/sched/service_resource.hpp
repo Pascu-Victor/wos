@@ -115,6 +115,7 @@ auto syscall_service_configure(uint64_t address) -> uint64_t;
 auto syscall_service_select(uint64_t slot) -> uint64_t;
 auto syscall_service_read(uint64_t slot, uint64_t address, uint64_t version) -> uint64_t;
 #ifdef WOS_SELFTEST
+auto selftest_service_management_authority() -> bool;
 auto selftest_service_lifecycle() -> bool;
 auto selftest_remote_service_accounting_lifecycle() -> bool;
 auto selftest_service_report_targets() -> bool;

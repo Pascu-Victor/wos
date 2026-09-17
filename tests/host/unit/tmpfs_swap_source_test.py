@@ -243,7 +243,7 @@ def test_init_fstab_and_proc_meminfo_consume_swap_stats() -> None:
         [
             'std::strcmp(fstype.data(), "swap") == 0',
             "ker::vmem::swapon(device.data(), 0)",
-            "ker::abi::vfs::mount(device.data(), mountpoint.data(), fstype.data(), 0, mount_options)",
+            "mount_with_retry(CPUNO, device.data(), mountpoint.data(), fstype.data(), mount_options)",
         ],
         "init fstab swap and mount option handling",
     )

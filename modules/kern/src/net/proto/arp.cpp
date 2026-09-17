@@ -195,10 +195,10 @@ auto arp_resolve(NetDevice* dev, IPv4Address ip, MacAddress& dst_mac, PacketBuff
     // If the target IP is one of our own addresses, return our own MAC directly.
     // This avoids sending gratuitous ARP announcements (sender_ip == target_ip).
     {
-        auto* nif = netif_find_by_dev(dev);
-        if (nif != nullptr) {
-            for (size_t i = 0; i < nif->ipv4_addr_count; i++) {
-                if (nif->ipv4_addrs.at(i).addr == ip) {
+        auto const IPV4 = netif_ipv4_snapshot(dev);
+        if (IPV4.count != 0) {
+            for (size_t i = 0; i < IPV4.count; i++) {
+                if (IPV4.entries.at(i).addr == ip) {
                     dst_mac = dev->mac;
                     if (pending_pkt != nullptr) {
                         pkt_free(pending_pkt);
@@ -280,9 +280,9 @@ auto arp_resolve(NetDevice* dev, IPv4Address ip, MacAddress& dst_mac, PacketBuff
 
     pkt_free(dropped);
 
-    auto* nif = netif_find_by_dev(dev);
-    if (nif != nullptr && nif->ipv4_addr_count > 0) {
-        send_arp_request(dev, ip, nif->ipv4_addrs.front().addr);
+    auto const IPV4 = netif_ipv4_snapshot(dev);
+    if (IPV4.count > 0) {
+        send_arp_request(dev, ip, IPV4.entries.front().addr);
     }
 
     return -1;

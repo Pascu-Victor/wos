@@ -130,6 +130,17 @@ auto wki_resource_observation_snapshot(uint16_t node_id, ResourceType type, uint
 auto wki_resource_observation_is_live(uint16_t node_id, ResourceType type, uint32_t resource_id, uint64_t generation,
                                       const ResourceIncarnationToken& owner_incarnation) -> bool;
 
+// Check identity and feature flags in one live observation under the registry
+// lock. Stale/missing observations return -ENOTCONN; absent flags -ENOTSUP.
+// No diagnostic table bound, allocation, attach or network side effects.
+auto wki_resource_observation_require_flags(uint16_t node_id, ResourceType type, uint32_t resource_id, uint64_t generation,
+                                            const ResourceIncarnationToken& owner_incarnation, uint8_t required_flags) -> int;
+
+#ifdef WOS_SELFTEST
+auto wki_remotable_selftest_vfs_mount_path() -> bool;
+auto wki_remotable_selftest_exec_view_support() -> bool;
+#endif
+
 // Resolve exactly one live bounded observation by owner/type and optional
 // exact advertised name. This copies the complete identity under the registry
 // lock and fails closed if the retained table exceeds the diagnostic bound.

@@ -21,6 +21,12 @@ auto report_syscall_stop(ker::mod::cpu::GPRegs& gpr, uint64_t callnum, bool exit
 auto report_signal_stop(ker::mod::sched::task::Task& task, uint32_t signal) -> bool;
 
 #ifdef WOS_SELFTEST
+auto ptrace_selftest_fatal_release_preserves_claims() -> bool;
+auto ptrace_selftest_observation_snapshot_and_claims() -> bool;
+auto ptrace_selftest_register_snapshot_rejects_changed_credentials() -> bool;
+auto ptrace_selftest_memory_snapshot_rejects_changed_credentials() -> bool;
+auto ptrace_selftest_image_snapshot_rejects_changed_credentials() -> bool;
+auto ptrace_selftest_register_rejection_preserves_state() -> bool;
 auto ptrace_selftest_syscall_snapshot_patches_live_sysret_state() -> bool;
 auto ptrace_selftest_deferred_syscall_exit_stop_suppression() -> bool;
 auto ptrace_selftest_detach_preserves_wki_execve_proxy_wait() -> bool;

@@ -25,6 +25,7 @@
 #include <platform/mm/page_alloc.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
+#include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/smt/smt.hpp>
 
@@ -865,7 +866,48 @@ auto virtio_net_set_queue_cpu(ker::net::NetDevice* net, uint32_t pair_idx, uint6
     return 0;
 }
 
+template <typename PinWorkers, typename SetInterruptCpu>
+auto apply_queue_cpu_mask(VirtIONetDevice& dev, uint64_t mask, PinWorkers&& pin_workers, SetInterruptCpu&& set_interrupt_cpu) -> int {
+    using ker::mod::sched::KernelWorkerCpuPin;
+    std::array<KernelWorkerCpuPin, ker::mod::sched::MAX_KERNEL_WORKER_CPU_PINS> requests{};
+    size_t count = 0;
+    for (uint64_t remaining = mask; remaining != 0 && count < requests.size(); remaining &= remaining - 1) {
+        if (count >= dev.num_queue_pairs) return -EINVAL;
+        requests[count] = {.worker = dev.queue_pairs.at(count).napi.worker, .cpu = static_cast<uint64_t>(__builtin_ctzll(remaining))};
+        ++count;
+    }
+    if (count == 0) return 0;
+    for (auto const& request : std::span(requests).first(count)) {
+        if (request.worker == nullptr) return -EBUSY;
+    }
+    if (!pin_workers(std::span<const KernelWorkerCpuPin>(requests).first(count))) return -EBUSY;
+    for (size_t i = 0; i < count; ++i) {
+        auto const& pair = dev.queue_pairs.at(i);
+        if (dev.msix_enabled && pair.irq_vector != 0) set_interrupt_cpu(static_cast<uint32_t>(i), pair.irq_vector, requests[i].cpu);
+    }
+    return 0;
+}
+
+auto virtio_net_set_queue_cpu_mask(ker::net::NetDevice* net, uint64_t mask) -> int {
+    auto* dev = static_cast<VirtIONetDevice*>(net->private_data);
+    if (dev == nullptr) return -ENODEV;
+    return apply_queue_cpu_mask(
+        *dev, mask, ker::mod::sched::pin_kernel_workers_to_cpus,
+        [dev](uint32_t pair, uint8_t vector, uint64_t cpu) { ker::dev::pci::pci_configure_msix_entry(dev->pci, pair, vector, cpu); });
+}
+
+auto virtio_net_check_mac(ker::net::NetDevice* netdev, const uint8_t* mac) -> int {
+    if (netdev == nullptr || mac == nullptr) return -EINVAL;
+    if (std::equal(netdev->mac.bytes.begin(), netdev->mac.bytes.end(), mac)) return 0;
+    auto* dev = static_cast<VirtIONetDevice*>(netdev->private_data);
+    if (dev == nullptr) return -ENODEV;
+    // Modern config is read-only; runtime CTRL_MAC_ADDR is not negotiated yet.
+    if (dev->modern_cfg != nullptr || dev->io_base == 0 || (dev->negotiated_features & VIRTIO_NET_F_MAC) == 0) return -ENOTSUP;
+    return 0;
+}
+
 void virtio_net_set_mac(ker::net::NetDevice* netdev, const uint8_t* mac) {
+    if (virtio_net_check_mac(netdev, mac) != 0 || std::equal(netdev->mac.bytes.begin(), netdev->mac.bytes.end(), mac)) return;
     auto* dev = static_cast<VirtIONetDevice*>(netdev->private_data);
     if (dev == nullptr || mac == nullptr) {
         return;
@@ -890,6 +932,8 @@ ker::net::NetDeviceOps virtio_net_ops = {
     .start_xmit = virtio_net_start_xmit,
     .set_mac = virtio_net_set_mac,
     .set_queue_cpu = virtio_net_set_queue_cpu,
+    .check_mac = virtio_net_check_mac,
+    .set_queue_cpu_mask = virtio_net_set_queue_cpu_mask,
 };
 
 // Walk the PCI vendor capability list (cap_id=9) for a virtio cfg_type entry.
@@ -1564,5 +1608,44 @@ auto virtio_net_init() -> int {
 
     return found;
 }
+
+#ifdef WOS_SELFTEST
+auto virtio_selftest_queue_affinity_batch() -> bool {
+    auto* dev = new VirtIONetDevice{};
+    auto* first = new ker::mod::sched::task::Task{};
+    auto* second = new ker::mod::sched::task::Task{};
+    dev->num_queue_pairs = 1;
+    dev->msix_enabled = true;
+    dev->queue_pairs[0].napi.worker = first;
+    dev->queue_pairs[0].irq_vector = 40;
+    dev->queue_pairs[1].irq_vector = 41;
+    unsigned admissions = 0;
+    unsigned interrupts = 0;
+    bool accept = false;
+    bool mapping_ok = true;
+    auto pin = [&](std::span<const ker::mod::sched::KernelWorkerCpuPin> requests) {
+        ++admissions;
+        mapping_ok = requests.size() == 2 && requests[0].worker == first && requests[0].cpu == 0 && requests[1].worker == second &&
+                     requests[1].cpu == 2 && mapping_ok;
+        return accept;
+    };
+    auto irq = [&](uint32_t pair, uint8_t vector, uint64_t cpu) {
+        mapping_ok = pair == interrupts && vector == 40 + pair && cpu == pair * 2 && mapping_ok;
+        ++interrupts;
+    };
+    bool ok = apply_queue_cpu_mask(*dev, 5, pin, irq) == -EINVAL && admissions == 0 && interrupts == 0;
+    dev->num_queue_pairs = 2;
+    ok = apply_queue_cpu_mask(*dev, 5, pin, irq) == -EBUSY && admissions == 0 && interrupts == 0 && ok;
+    dev->queue_pairs[1].napi.worker = second;
+    ok = apply_queue_cpu_mask(*dev, 5, pin, irq) == -EBUSY && admissions == 1 && interrupts == 0 && ok;
+    accept = true;
+    ok = apply_queue_cpu_mask(*dev, 5, pin, irq) == 0 && admissions == 2 && interrupts == 2 && mapping_ok && ok;
+    ok = apply_queue_cpu_mask(*dev, 0, pin, irq) == 0 && admissions == 2 && interrupts == 2 && ok;
+    delete second;
+    delete first;
+    delete dev;
+    return ok;
+}
+#endif
 
 }  // namespace ker::dev::virtio

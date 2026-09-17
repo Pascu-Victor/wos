@@ -1,9 +1,14 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <net/wki/auth_policy.hpp>
+#include <net/wki/transport_ivshmem.hpp>
 #include <net/wki/wire.hpp>
 #include <test/ktest.hpp>
 #include <vfs/stat.hpp>
+
+KTEST(WkiIvshmem, CompleteAuthenticatedFramesSurviveRingWrap) { KEXPECT_TRUE(ker::net::wki::wki_ivshmem_selftest_complete_frames()); }
 
 KTEST(WkiWire, NetIpv6CapabilityUsesExactAdditiveSuffix) {
     using namespace ker::net::wki;
@@ -235,7 +240,9 @@ KTEST(WkiWire, VfsXattrUsesVersionedBoundedReplayIdentity) {
 
     KEXPECT_EQ(WKI_CAP_VFS_XATTR, static_cast<uint16_t>(0x0040));
     KEXPECT_EQ(OP_VFS_XATTR, static_cast<uint16_t>(0x0417));
-    KEXPECT_EQ(WKI_VFS_XATTR_VERSION, static_cast<uint8_t>(1));
+    KEXPECT_EQ(WKI_VFS_XATTR_VERSION, static_cast<uint8_t>(2));
+    KEXPECT_EQ(WKI_VFS_XATTR_CALLER_SIZE, static_cast<size_t>(80));
+    KEXPECT_EQ(WKI_VFS_FEATURE_XATTR_IDENTITY, static_cast<uint64_t>(32));
     KEXPECT_EQ(WKI_VFS_XATTR_NAME_MAX, static_cast<uint16_t>(255));
     KEXPECT_EQ(WKI_VFS_XATTR_DATA_MAX, static_cast<uint32_t>(65536));
     KEXPECT_EQ(sizeof(VfsXattrPhaseHeader), static_cast<size_t>(20));
@@ -262,6 +269,18 @@ KTEST(WkiWire, VfsXattrUsesVersionedBoundedReplayIdentity) {
     begin.name_len = WKI_VFS_XATTR_NAME_MAX + 1;
     KEXPECT_FALSE(wki_vfs_xattr_begin_valid(begin));
     begin.name_len = 1;
+    begin.require_directory = 1;
+    KEXPECT_FALSE(wki_vfs_xattr_begin_valid(begin));
+    begin.header.target = VfsXattrTarget::PATH;
+    begin.path_len = 1;
+    KEXPECT_TRUE(wki_vfs_xattr_begin_valid(begin));
+    begin.path_len = 0;
+    KEXPECT_FALSE(wki_vfs_xattr_begin_valid(begin));
+    begin.remote_fd = -1;
+    KEXPECT_TRUE(wki_vfs_xattr_begin_valid(begin));
+    begin.header.version = 1;
+    KEXPECT_FALSE(wki_vfs_xattr_begin_valid(begin));
+    begin.header.version = WKI_VFS_XATTR_VERSION;
     begin.reserved[1] = 1;
     KEXPECT_FALSE(wki_vfs_xattr_begin_valid(begin));
 }
@@ -288,4 +307,188 @@ KTEST(WkiWire, NetNotifyHeaderMatchesExpectedCookieAndLength) {
 
     notify.magic = 0;
     KEXPECT_FALSE(ker::net::wki::wki_net_notify_header_matches_expected(0x2A, notify));
+}
+
+KTEST(WkiWireDirectoryGrant, ExactLayoutIdentityAndRequestVariants) {
+    using namespace ker::net::wki;
+    KEXPECT_EQ(sizeof(VfsDirectoryGrant), static_cast<size_t>(48));
+    KEXPECT_EQ(sizeof(VfsDirectoryGrantRequest), static_cast<size_t>(88));
+    KEXPECT_EQ(sizeof(VfsDirectoryGrantResponse), static_cast<size_t>(72));
+    KEXPECT_EQ(WKI_VFS_FEATURE_DIRECTORY_GRANT & (WKI_VFS_FEATURE_DIRECTORY_GRANT - 1), 0ULL);
+    KEXPECT_EQ(WKI_VFS_FEATURE_DIRECTORY_GRANT & (WKI_VFS_FEATURE_CHOWN_IDENTITY | WKI_VFS_FEATURE_FILE_METADATA_IDENTITY |
+                                                  WKI_VFS_FEATURE_DIRECTORY_REFERENCE | WKI_VFS_FEATURE_REALPATH_AT),
+               0ULL);
+    VfsDirectoryGrant const GRANT{.version = 1,
+                                  .policy = 3,
+                                  .owner_node = 1,
+                                  .source_node = 2,
+                                  .target_node = 3,
+                                  .resource_id = 4,
+                                  .owner_incarnation = {5, 6},
+                                  .source_boot_epoch = 7,
+                                  .target_boot_epoch = 8,
+                                  .owner_grant_id = 9,
+                                  .submission_id = 10};
+    KEXPECT_TRUE(wki_vfs_directory_grant_valid(GRANT));
+    KEXPECT_FALSE(wki_vfs_directory_grant_valid({}));
+    // Equality binds every wire byte, even fields that remain individually valid.
+    for (size_t i = 0; i < sizeof(GRANT); ++i) {
+        auto changed = GRANT;
+        auto* bytes = reinterpret_cast<uint8_t*>(&changed);
+        bytes[i] ^= 1;
+        KEXPECT_FALSE(wki_vfs_directory_grant_equal(GRANT, changed));
+    }
+    for (unsigned field = 0; field < 14; ++field) {
+        auto invalid = GRANT;
+        switch (field) {
+            case 0:
+                invalid.version = 0;
+                break;
+            case 1:
+                invalid.policy = 4;
+                break;
+            case 2:
+                invalid.owner_node = 0;
+                break;
+            case 3:
+                invalid.source_node = UINT16_MAX;
+                break;
+            case 4:
+                invalid.target_node = 0;
+                break;
+            case 5:
+                invalid.reserved = 1;
+                break;
+            case 6:
+                invalid.resource_id = 0;
+                break;
+            case 7:
+                invalid.owner_incarnation.owner_boot_epoch = 0;
+                break;
+            case 8:
+                invalid.owner_incarnation.resource_incarnation = 0;
+                break;
+            case 9:
+                invalid.source_boot_epoch = 0;
+                break;
+            case 10:
+                invalid.target_boot_epoch = 0;
+                break;
+            case 11:
+                invalid.owner_grant_id = 0;
+                break;
+            case 12:
+                invalid.submission_id = 0;
+                break;
+            default:
+                invalid.target_node = UINT16_MAX;
+                break;
+        }
+        KEXPECT_FALSE(wki_vfs_directory_grant_valid(invalid));
+    }
+    constexpr size_t LENGTH = sizeof(VfsDirectoryGrantRequest) + WKI_VFS_DIRECTORY_CALLER_SIZE;
+    VfsDirectoryGrantRequest const ISSUE{.policy = 3,
+                                         .target_node = 3,
+                                         .directory_fd = 42,
+                                         .target_boot_epoch = 8,
+                                         .source_pin_token = 11,
+                                         .pin_token = 12,
+                                         .submission_id = 10};
+    VfsDirectoryGrantRequest const ADOPT{.operation = VfsDirectoryGrantOperation::ADOPT, .pin_token = 13, .grant = GRANT};
+    KEXPECT_TRUE(wki_vfs_directory_grant_request_valid(ISSUE, LENGTH));
+    KEXPECT_TRUE(wki_vfs_directory_grant_request_valid(ADOPT, LENGTH));
+    for (auto request : {ISSUE, ADOPT}) {
+        for (size_t length : {size_t{0}, LENGTH - 1, LENGTH + 1}) KEXPECT_FALSE(wki_vfs_directory_grant_request_valid(request, length));
+        request.pin_token = 0;
+        KEXPECT_FALSE(wki_vfs_directory_grant_request_valid(request, LENGTH));
+    }
+    for (unsigned field = 0; field < 10; ++field) {
+        auto request = ISSUE;
+        switch (field) {
+            case 0:
+                request.version = 0;
+                break;
+            case 1:
+                request.operation = static_cast<VfsDirectoryGrantOperation>(0);
+                break;
+            case 2:
+                request.policy = 4;
+                break;
+            case 3:
+                request.target_node = 0;
+                break;
+            case 4:
+                request.directory_fd = -1;
+                break;
+            case 5:
+                request.target_boot_epoch = 0;
+                break;
+            case 6:
+                request.source_pin_token = 0;
+                break;
+            case 7:
+                request.source_pin_token = request.pin_token;
+                break;
+            case 8:
+                request.submission_id = 0;
+                break;
+            default:
+                request.grant = GRANT;
+                break;
+        }
+        KEXPECT_FALSE(wki_vfs_directory_grant_request_valid(request, LENGTH));
+    }
+    for (unsigned field = 0; field < 7; ++field) {
+        auto request = ADOPT;
+        switch (field) {
+            case 0:
+                request.policy = 1;
+                break;
+            case 1:
+                request.target_node = 3;
+                break;
+            case 2:
+                request.directory_fd = 0;
+                break;
+            case 3:
+                request.target_boot_epoch = 8;
+                break;
+            case 4:
+                request.source_pin_token = 1;
+                break;
+            case 5:
+                request.submission_id = 10;
+                break;
+            default:
+                request.grant = {};
+                break;
+        }
+        KEXPECT_FALSE(wki_vfs_directory_grant_request_valid(request, LENGTH));
+    }
+    constexpr std::array<uint8_t, 4> PATH{'/', 'd', 'i', 'r'};
+    VfsDirectoryGrantResponse response{.directory = {.fd = 43, .token = 12, .path_length = 4}, .grant = GRANT};
+    constexpr size_t RESPONSE_LENGTH = sizeof(response) + PATH.size();
+    KEXPECT_TRUE(wki_vfs_directory_grant_response_valid(response, 12, PATH.data(), RESPONSE_LENGTH));
+    KEXPECT_FALSE(wki_vfs_directory_grant_response_valid(response, 13, PATH.data(), RESPONSE_LENGTH));
+    KEXPECT_FALSE(wki_vfs_directory_grant_response_valid(response, 12, PATH.data(), RESPONSE_LENGTH + 1));
+    KEXPECT_FALSE(wki_vfs_directory_grant_response_valid(response, 12, nullptr, RESPONSE_LENGTH));
+    response.directory.reserved3 = 1;
+    KEXPECT_FALSE(wki_vfs_directory_grant_response_valid(response, 12, PATH.data(), RESPONSE_LENGTH));
+    KEXPECT_TRUE(wki_vfs_directory_grant_reply_size_valid(0, RESPONSE_LENGTH, RESPONSE_LENGTH));
+    KEXPECT_TRUE(wki_vfs_directory_grant_reply_size_valid(-1, 0, RESPONSE_LENGTH));
+    KEXPECT_FALSE(wki_vfs_directory_grant_reply_size_valid(-1, RESPONSE_LENGTH, RESPONSE_LENGTH));
+    KEXPECT_FALSE(wki_vfs_directory_grant_reply_size_valid(1, 0, RESPONSE_LENGTH));
+    KEXPECT_FALSE(wki_vfs_directory_grant_reply_size_valid(0, sizeof(response), RESPONSE_LENGTH));
+    KEXPECT_FALSE(wki_vfs_directory_grant_reply_size_valid(0, RESPONSE_LENGTH, RESPONSE_LENGTH - 1));
+    std::array<uint8_t, sizeof(DevOpReqPayload) + LENGTH> bytes{};
+    DevOpReqPayload const HEADER{.op_id = OP_VFS_DIRECTORY_GRANT, .data_len = LENGTH};
+    std::memcpy(bytes.data(), &HEADER, sizeof(HEADER));
+    constexpr auto REQUIRED = wki_policy_bits(WkiPolicy::VFS_READ) | wki_policy_bits(WkiPolicy::IDENTITY_SAME_DOMAIN);
+    for (auto const& request : {ISSUE, ADOPT}) {
+        std::memcpy(bytes.data() + sizeof(HEADER), &request, sizeof(request));
+        KEXPECT_EQ(auth_policy::required_permissions(MsgType::DEV_OP_REQ, bytes.data(), bytes.size()), REQUIRED);
+        KEXPECT_EQ(auth_policy::required_permissions(MsgType::DEV_OP_REQ, bytes.data(), bytes.size() - 1), auth_policy::INVALID);
+    }
+    bytes[sizeof(HEADER)] = 0;
+    KEXPECT_EQ(auth_policy::required_permissions(MsgType::DEV_OP_REQ, bytes.data(), bytes.size()), auth_policy::INVALID);
 }

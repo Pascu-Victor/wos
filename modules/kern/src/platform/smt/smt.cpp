@@ -11,6 +11,7 @@
 #include <cstring>
 #include <iterator>
 #include <new>
+#include <platform/dbg/journal.hpp>
 
 #include "mod/io/serial/serial.hpp"
 #include "net/proto/ndp.hpp"
@@ -358,9 +359,12 @@ void create_init_tasks(boot::HandoverModules& mod_struct) {
 
         // Setup stdin/stdout/stderr for init process
         // Open /dev/console as fd 0, 1, 2
-        ker::vfs::File* console_stdin = ker::vfs::devfs::devfs_open_path("/dev/console", STDIN_OPEN_FLAGS, 0);
-        ker::vfs::File* console_stdout = ker::vfs::devfs::devfs_open_path("/dev/console", STDOUT_OPEN_FLAGS, 0);
-        ker::vfs::File* console_stderr = ker::vfs::devfs::devfs_open_path("/dev/console", STDOUT_OPEN_FLAGS, 0);
+        ker::vfs::File* console_stdin =
+            ker::vfs::devfs::devfs_open_path(ker::mod::security::Snapshot::bootstrap_root(), "/dev/console", STDIN_OPEN_FLAGS, 0);
+        ker::vfs::File* console_stdout =
+            ker::vfs::devfs::devfs_open_path(ker::mod::security::Snapshot::bootstrap_root(), "/dev/console", STDOUT_OPEN_FLAGS, 0);
+        ker::vfs::File* console_stderr =
+            ker::vfs::devfs::devfs_open_path(ker::mod::security::Snapshot::bootstrap_root(), "/dev/console", STDOUT_OPEN_FLAGS, 0);
 
         if (console_stdin != nullptr && console_stdout != nullptr && console_stderr != nullptr) {
             console_stdin->fops = ker::vfs::devfs::get_devfs_fops();
@@ -870,6 +874,9 @@ void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
     sched::percpu_init();
     dbg::log("Creating init task(s) from handover modules");
     create_init_tasks(modules);
+    if (!dbg::journal::start_module_publisher()) {
+        dbg::panic_handler("unable to start journal module publisher");
+    }
     sched::start_gc_worker();
     mm::reclaim::start_worker();
     mm::virt::start_anonymous_swap_worker();

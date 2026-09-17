@@ -52,6 +52,8 @@ void init();
 void enable_time();
 void register_devices();
 void mark_devfs_ready();
+// Start after init task creation. Runtime module publication never runs in emit.
+auto start_module_publisher() -> bool;
 void set_serial_threshold(LogLevel level);
 auto get_serial_threshold() -> LogLevel;
 void set_module_output_devices(const char* module, uint32_t devices);
@@ -61,5 +63,11 @@ void emit_v(LogLevel level, const char* module, const char* format, va_list args
 auto read_records(ker::vfs::File* file, void* buf, size_t count, const char* module_filter) -> ssize_t;
 auto poll_check(ker::vfs::File* file, int events, const char* module_filter) -> int;
 auto poll_register_waiter(ker::vfs::File* file, uint64_t pid) -> bool;
+
+#ifdef WOS_SELFTEST
+auto selftest_module_publication() -> bool;
+auto selftest_open_admission() -> bool;
+auto selftest_read_authorization() -> bool;
+#endif
 
 }  // namespace ker::mod::dbg::journal

@@ -7,7 +7,15 @@
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
 
+namespace ker::mod::security {
+class Snapshot;
+}
+
 namespace ker::vfs {
+
+// Existing mount syscall flag ABI (MS_NOSUID).
+constexpr unsigned long MOUNT_FLAG_RDONLY = 1;
+constexpr unsigned long MOUNT_FLAG_NOSUID = 2;
 
 // Mount point structure
 struct MountPoint {
@@ -17,14 +25,29 @@ struct MountPoint {
     FSType fs_type{};                 // Filesystem type enum
     ker::dev::BlockDevice* device{};  // Associated block device
     ker::dev::BlockWriterLease block_writer_lease{};
-    FileOperations* fops{};               // Filesystem operations
-    void* private_data{};                 // Filesystem-specific data
-    uint32_t dev_id{};                    // Unique synthetic st_dev for this mount
-    bool read_only{};                     // True when this mount must reject filesystem mutations
+    FileOperations* fops{};  // Filesystem operations
+    void* private_data{};    // Filesystem-specific data
+    uint32_t dev_id{};       // Unique synthetic st_dev for this mount
+    bool read_only{};        // True when this mount must reject filesystem mutations
+    bool nosuid{};           // Immutable after publication; suppress set-ID exec on this mount
+    // Table-owned native identity pin. Access only under mount_lock or through
+    // capture_mount_covered_directory(); pivot invalidates this relationship.
+    File* covered_directory{};
     std::atomic<uint32_t> refs{0};        // Active users that outlive mount_lock
     std::atomic<uint32_t> open_files{0};  // File objects whose backend state belongs to this mount
     std::atomic<bool> retiring{false};
 };
+
+// File owns a mount pin through backend close. Both policies are immutable
+// while shared; a native owner must not weaken a retained client's view.
+inline auto file_mount_policy(const File& file) -> MountPolicy {
+    return file.mount_owner == nullptr
+               ? file.mount_policy
+               : file.mount_policy.restricted_by({.read_only = file.mount_owner->read_only, .nosuid = file.mount_owner->nosuid});
+}
+
+inline auto file_mount_read_only(const File& file) -> bool { return file_mount_policy(file).read_only; }
+inline auto file_mount_nosuid(const File& file) -> bool { return file_mount_policy(file).nosuid; }
 
 constexpr size_t MOUNT_PATH_MAX = 512;
 constexpr size_t MOUNT_FSTYPE_MAX = 32;
@@ -35,6 +58,7 @@ struct MountSnapshot {
     FSType fs_type{};
     uint32_t dev_id{};
     bool read_only{};
+    bool nosuid{};
     char fstype[MOUNT_FSTYPE_MAX]{};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
 };
 
@@ -69,10 +93,16 @@ struct PreparedMount {
     void* state{};
 };
 
+enum class MountPathKind { TASK_VISIBLE, RETAINED_PHYSICAL };
+
 // Mount point management
+// RETAINED_PHYSICAL copies an admitted LookupHandle path without consulting
+// the ambient task. Its caller must revalidate that lookup before publication.
 auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device, unsigned long flags, const char* data,
-                              void* initial_private_data, FileOperations* initial_fops, PreparedMount* out) -> int;
-auto publish_prepared_mount(PreparedMount* prepared) -> int;
+                              void* initial_private_data, FileOperations* initial_fops, PreparedMount* out,
+                              MountPathKind path_kind = MountPathKind::TASK_VISIBLE) -> int;
+auto publish_prepared_mount(PreparedMount* prepared, const char* expected_physical_path = nullptr, File* covered_directory = nullptr)
+    -> int;
 void finish_prepared_mount(PreparedMount* prepared);
 auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device, unsigned long flags = 0,
                       const char* data = nullptr, void* initial_private_data = nullptr, FileOperations* initial_fops = nullptr) -> int;
@@ -91,10 +121,33 @@ auto find_mount_point(const char* path, size_t known_path_len = UNKNOWN_MOUNT_PA
 // Used by dirfd-relative lookup, where the directory's historical VFS path may
 // have been renamed since the File was opened.
 auto retain_mount_point(MountPoint* mount) -> MountRef;
+// Caller retains the exact mount. Returns an owned search-only File and its
+// table epoch, not cached traversal authority. Output must start empty; errors
+// preserve outputs. Put the returned File outside publication/path locks.
+// Unknown, synthetic and non-native covered relationships return ENOTSUP.
+auto capture_mount_covered_directory(MountPoint* mount, File** output, uint64_t* generation) -> int;
 auto mount_table_generation_snapshot() -> uint64_t;
+// Copy the current path of an exact retained mount; failure leaves output unchanged.
+auto copy_mount_path_exact(const MountPoint* mount, char* out, size_t capacity) -> int;
 auto mounted_block_device_overlaps(const ker::dev::BlockDevice* device) -> bool;
 auto configure_mount_point_exact(const char* path, FSType expected_type, void* private_data, FileOperations* fops) -> bool;
-auto remap_mounts_for_pivot(const char* new_root, const char* put_old) -> int;
+// Candidate and retired native references must outlive the namespace-locked
+// pivot, including the task-root update and reopening of the mount epoch.
+class PivotMountReferences {
+   public:
+    PivotMountReferences() = default;
+    ~PivotMountReferences();
+    PivotMountReferences(const PivotMountReferences&) = delete;
+    auto operator=(const PivotMountReferences&) -> PivotMountReferences& = delete;
+
+   private:
+    friend auto remap_mounts_for_pivot(const char*, const char*, const ker::mod::security::Snapshot*, PivotMountReferences*) -> int;
+    void* state_ = nullptr;
+};
+// Credentials/references are supplied together by the namespace-locked VFS
+// transaction. The legacy two-argument caller does not prepare new covers.
+auto remap_mounts_for_pivot(const char* new_root, const char* put_old, const ker::mod::security::Snapshot* credentials = nullptr,
+                            PivotMountReferences* references = nullptr) -> int;
 void rebase_wki_mounts_for_new_root(const char* new_root);
 
 // Resolve path through the current task's root prefix (same as mount_filesystem
@@ -114,6 +167,11 @@ auto retain_mount_for_open_file(MountPoint* mount) -> bool;
 void release_mount_from_open_file(MountPoint* mount);
 
 #ifdef WOS_SELFTEST
+auto mount_point_pivot_busy_for_test(MountPoint* mount) -> bool;
+auto mount_lock_available_for_test() -> bool;
+auto mount_selftest_descendant_lifetime(bool disk) -> bool;
+auto mount_selftest_pivot_covers(bool disk) -> bool;
+auto mount_selftest_identity_exhaustion() -> bool;
 auto mount_point_ref_count_for_test(const MountPoint* mount) -> uint32_t;
 auto mount_point_open_file_count_for_test(const MountPoint* mount) -> uint32_t;
 void mount_lookup_cache_reset_for_test();

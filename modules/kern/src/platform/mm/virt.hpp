@@ -161,6 +161,9 @@ void reserve_page_range(PageTable* page_table, vaddr_t vaddr, uint64_t page_coun
 bool is_page_mapped(PageTable* page_table, vaddr_t vaddr);
 bool is_page_reserved(PageTable* page_table, vaddr_t vaddr);
 bool is_page_mapped_or_reserved(PageTable* page_table, vaddr_t vaddr);
+// Caller retains the pagemap and serializes mapping publication. No allocation
+// or page-table promotion; includes present PROT_NONE shared leaves.
+[[nodiscard]] auto is_page_write_restricted(PageTable* page_table, vaddr_t vaddr) -> bool;
 void unify_page_flags(PageTable* page_table, vaddr_t vaddr, uint64_t flags);
 void map_range(PageTable* page_table, Range range, uint64_t flags, uint64_t offset = 0);
 void unmap_page(PageTable* page_table, vaddr_t vaddr);
@@ -192,7 +195,8 @@ void drain_kernel_vmap_frees();
 // that queue frees under an IRQ lock should retry this after releasing it.
 void drain_kernel_vmap_frees_if_over_limit();
 PageTable* create_pagemap();
-void release_pagemap(PageTable* pagemap);
+// owner_pid is diagnostic provenance only; it grants no teardown authority.
+void release_pagemap(PageTable* pagemap, uint64_t owner_pid = 0);
 void get_page_table_pool_stats_snapshot(PageTablePoolStatsSnapshot& out);
 void get_owned_frame_stats_snapshot(OwnedFrameStatsSnapshot& out);
 void copy_kernel_mappings(sched::task::Task* t);

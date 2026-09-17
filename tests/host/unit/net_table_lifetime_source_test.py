@@ -369,7 +369,30 @@ def test_loopback_reconstructs_nonassignable_atomic_netdevice() -> None:
         fail("loopback_init must not assign a NetDevice containing an atomic RX hook")
 
 
+def test_ipv4_access_is_owned_and_writer_notifications_follow_unlock() -> None:
+    source = NETIF_CPP.read_text()
+    copy = function_body(source, "copy_ipv4_config")
+    require_order(copy, "ipv4_addr_lock.lock_irqsave()", "nif->ipv4_addrs", "address copy acquires lock")
+    require_order(copy, "nif->ipv4_addr_count", "unlock_irqrestore", "whole table copied under lock")
+    for name in ("netif_add_ipv4", "netif_set_ipv4", "netif_del_ipv4", "netif_set_primary_ipv4_address", "netif_set_primary_ipv4_netmask"):
+        body = function_body(source, name)
+        require_order(body, "netif_get(dev)", "ipv4_addr_lock.lock_irqsave()", "allocation before address lock")
+        require_order(body, "ipv4_addr_lock.lock_irqsave()", "unlock_irqrestore", "writer serialized")
+        require_order(body, "unlock_irqrestore", "notify_ipv4_change", "notification outside address lock")
+    require_tokens(function_body(source, "netif_find_by_ipv4"), ["copy_ipv4_config(nif)"], "lookup uses owned records")
+    # Catch consumers added anywhere, including devfs and packet paths.
+    for path in (ROOT / "modules/kern/src").rglob("*"):
+        if path.suffix not in (".cpp", ".hpp") or path.name in ("netif.cpp", "netif.hpp"):
+            continue
+        text = path.read_text()
+        if "ipv4_addr_count" in text or "ipv4_addrs" in text:
+            fail(f"raw IPv4 configuration access outside netif: {path.relative_to(ROOT)}")
+    syscall = (ROOT / "modules/kern/src/syscalls_impl/net/sys_net.cpp").read_text()
+    require_tokens(syscall, ["netif_set_primary_ipv4_address(dev, ADDR)", "netif_set_primary_ipv4_netmask(dev, MASK)"], "legacy writers share table serialization")
+
+
 def main() -> None:
+    test_ipv4_access_is_owned_and_writer_notifications_follow_unlock()
     test_tables_use_permanent_backing_and_bounded_live_indexes()
     test_live_caps_and_hot_path_scans_remain_lock_free_and_bounded()
     test_add_allocates_outside_writer_lock_and_rechecks_publication()

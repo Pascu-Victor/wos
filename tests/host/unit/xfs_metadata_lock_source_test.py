@@ -157,18 +157,29 @@ def test_inode_io_lock_precedes_metadata_lock() -> None:
 def test_metadata_mutators_are_serialized() -> None:
     source = XFS_VFS_CPP.read_text()
     checks = {
-        "xfs_chmod_path": "XfsMetadataGuard metadata_guard(ctx",
+        "xfs_chmod_lookup": "XfsMetadataGuard metadata_guard(MOUNT",
+        "xfs_chown_lookup": "XfsMetadataGuard metadata_guard(MOUNT",
         "xfs_fchmod": "XfsMetadataGuard metadata_guard(xfd->mount",
+        "xfs_fchown": "XfsMetadataGuard metadata_guard(xfd->mount",
         "xfs_mkdir_path": "XfsMetadataGuard metadata_guard(ctx",
         "xfs_symlink_path": "XfsMetadataGuard metadata_guard(ctx",
         "xfs_open_path": "XfsMetadataGuard metadata_guard(ctx",
         "xfs_rmdir_path": "XfsMetadataGuard metadata_guard(ctx",
-        "xfs_rename_path": "XfsMetadataGuard metadata_guard(ctx",
+        "xfs_rename_lookup": "XfsMetadataGuard metadata_guard(MOUNT",
         "xfs_unlink_path": "XfsMetadataGuard metadata_guard(ctx",
     }
     for name, token in checks.items():
         if token not in function_body(source, name):
             fail(f"{name} must serialize XFS metadata mutations")
+    for operation in ["chmod", "chown"]:
+        require_order(function_body(source, f"xfs_{operation}_path"),
+                      ["xfs_acquire_lookup(", f"xfs_{operation}_lookup("], "path metadata uses retained consumer")
+        require_order(function_body(source, f"xfs_{operation}_lookup"),
+                      ["io_guard.emplace(handle.target()->io_lock)", "XfsMetadataGuard metadata_guard(MOUNT",
+                       "xfs_lookup_target_locked(", f"{operation}_inode_locked("], "retained metadata inode/mount lock order")
+        require_order(function_body(source, f"xfs_f{operation}"),
+                      ["MutexGuard io_guard(xfd->inode->io_lock)", "XfsMetadataGuard metadata_guard(xfd->mount",
+                       f"{operation}_inode_locked("], "descriptor metadata inode/mount lock order")
 
 
 def test_sync_flush_is_serialized_after_inode_writeback() -> None:
@@ -285,11 +296,16 @@ def test_xfs_namespace_cache_publication_is_ordered() -> None:
         "retained XFS lookup acquisition and publication snapshot",
     )
 
-    consume = function_body(source, "vfs_consume_lookup")
+    require_order(
+        function_body(source, "vfs_consume_lookup"),
+        ["ker::mod::sys::MutexGuard publication_guard(g_vfs_namespace_publication_mutex);",
+         "return consume_lookup_locked(handle, namespace_mutation, consumer, context);"],
+        "public retained consumer owns publication",
+    )
+    consume = function_body(source, "consume_lookup_locked")
     require_order(
         consume,
         [
-            "ker::mod::sys::MutexGuard publication_guard(g_vfs_namespace_publication_mutex);",
             "handle.mount()->retiring.load(std::memory_order_acquire)",
             "find_mount_point(handle.path(), handle.path_length())",
             "ker::vfs::xfs::xfs_validate_lookup(*backend)",
@@ -484,11 +500,17 @@ def test_zero_link_vfs_releases_use_metadata_locked_api() -> None:
     source = XFS_VFS_CPP.read_text()
     checks = {
         "xfs_rmdir_path": ["dir_ip->nlink = 0;", "xfs_inode_release_metadata_locked(dir_ip);"],
-        "xfs_rename_path": ["displaced->nlink--;", "xfs_inode_release_metadata_locked(displaced);"],
         "xfs_unlink_path": ["target_ip->nlink--;", "xfs_inode_release_metadata_locked(target_ip);"],
     }
     for name, tokens in checks.items():
         require_order(function_body(source, name), tokens, f"{name} zero-link inode release")
+    require_order(function_body(source, "xfs_rename_path"),
+                  ["XfsLookupHandle source{}, destination{}", "xfs_acquire_lookup(", "xfs_rename_lookup("],
+                  "pathname rename retains both inode handles until transaction completion")
+    require_order(function_body(source, "xfs_rename_lookup"),
+                  ["XfsMetadataGuard metadata_guard(MOUNT", "DISPLACED->nlink--", "xfs_trans_commit(tp)"],
+                  "retained rename decrements links under metadata lock before commit")
+
 
 
 def test_rmdir_reclaims_only_authoritatively_unindexed_records() -> None:

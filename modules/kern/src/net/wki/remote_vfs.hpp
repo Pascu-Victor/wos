@@ -13,6 +13,10 @@
 #include <vfs/file_operations.hpp>
 #include <vfs/stat.hpp>
 
+namespace ker::mod::security {
+class Snapshot;
+}
+
 namespace ker::vfs {
 enum class MetadataBatchOperation : uint8_t;
 struct MetadataBatchEntry;
@@ -20,6 +24,8 @@ struct MetadataBatchResult;
 }  // namespace ker::vfs
 
 namespace ker::net::wki {
+
+struct DevServerBinding;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -86,7 +92,18 @@ struct RemoteVfsFd {
     WkiChannelIdentity channel_identity{};
     int32_t fd_id = -1;
     ker::vfs::File* file = nullptr;
-    uint64_t last_activity_us = 0;  // D10: for stale FD garbage collection
+    uint64_t last_activity_us = 0;     // D10: for stale FD garbage collection
+    uint64_t exec_view_token = 0;      // Exact-channel PIN/CANCEL identity; zero for ordinary opens.
+    uint64_t directory_pin_token = 0;  // Separate purpose from executable content views.
+    uint64_t ordinary_open_token = 0;  // Exact-binding ordinary OPEN/CANCEL namespace.
+    uint64_t ordinary_open_binding_id = 0;
+    int32_t exec_view_source_fd = 0;
+    // Only a separately prepared transfer PIN has an owner-issued grant.
+    VfsDirectoryGrant directory_grant{};
+    std::array<uint8_t, WKI_VFS_DIRECTORY_CALLER_SIZE> directory_grant_credentials{};
+    uint64_t directory_grant_publication_revision = 0;
+    bool directory_grant_claimed = false;
+    bool directory_grant_local_source = false;
 };
 
 // -----------------------------------------------------------------------------
@@ -135,6 +152,11 @@ struct ProxyVfsState {
     std::atomic<bool> op_pending{false};
     uint16_t op_expected_id = 0;
     uint16_t op_expected_seq = 0;
+    uint16_t op_lifetime_inner = 0;
+    uint64_t op_lifetime_challenge = 0;
+    uint64_t ordinary_next_token = 1;       // Protected by lock; assigned in operation-slot order, never wraps.
+    uint64_t ordinary_open_binding_id = 0;  // Protected by s_vfs_lock; immutable after query.
+    uint32_t ordinary_owner_boot_epoch = 0;
     int16_t op_status = 0;
     void* op_resp_buf = nullptr;
     uint16_t op_resp_len = 0;
@@ -162,8 +184,11 @@ struct ProxyVfsState {
 
     // Exact server idempotence tuple retained until DEV_DETACH is ACKed or the
     // peer boot epoch proves it obsolete.
-    bool detach_pending = false;            // Protected by s_vfs_lock.
-    bool detach_retry_in_progress = false;  // Protected by s_vfs_lock.
+    // Exact binding retirement is durably admitted by the owner (or obsolete).
+    // This is not a promise that its blocking File cleanup has already finished.
+    bool binding_retirement_confirmed = false;  // Protected by s_vfs_lock.
+    bool detach_pending = false;                // Protected by s_vfs_lock.
+    bool detach_retry_in_progress = false;      // Protected by s_vfs_lock.
     uint16_t detach_owner_node = WKI_NODE_INVALID;
     uint32_t detach_resource_id = 0;
     uint8_t detach_attach_cookie = 0;
@@ -244,9 +269,14 @@ struct WriteBehindBuffer {
 // RemoteFileContext (consumer side) - stored in File::private_data
 // -----------------------------------------------------------------------------
 
+constexpr uint16_t VFS_EXEC_CANCEL_SLOT_NONE = UINT16_MAX;
+
 struct RemoteFileContext {
     ProxyVfsState* proxy = nullptr;
     int32_t remote_fd = -1;
+    uint16_t exec_cancel_slot = VFS_EXEC_CANCEL_SLOT_NONE;
+    uint16_t ordinary_cancel_slot = VFS_EXEC_CANCEL_SLOT_NONE;
+    bool directory_pin = false;
 
     // When browsing a remote host's /wki directory through its root export,
     // suppress entries that would recurse back into that same exported root.
@@ -329,6 +359,61 @@ struct WkiRemoteVfsServerDiag {
     uint64_t async_close_misses = 0;
 };
 
+struct WkiRemoteVfsExecDiag {
+    uint64_t capacity = 0;
+    uint64_t owned = 0;
+    uint64_t pending = 0;
+    uint64_t retrying = 0;
+    uint64_t owner_views = 0;
+    uint64_t attempts = 0;
+    uint64_t failed_attempts = 0;
+    uint64_t cancelled = 0;
+    uint64_t retirement_handoffs = 0;
+};
+void wki_remote_vfs_exec_diag_snapshot(WkiRemoteVfsExecDiag* out);
+void wki_remote_vfs_directory_diag_snapshot(WkiRemoteVfsExecDiag* out);
+// Native owner path is returned relative to the export, with a leading slash.
+// Caller supplies a retained mount or directory; no VFS/Task locks across calls.
+// Successful PIN transfers one File; every failure preserves caller outputs.
+auto wki_remote_vfs_pin_directory(const char* path, void* mount_private_data, const ker::mod::security::Snapshot& credentials,
+                                  ker::vfs::File** output, char* name, size_t capacity, ker::vfs::File* directory = nullptr) -> int;
+auto wki_remote_vfs_directory_path(ker::vfs::File* directory, const ker::mod::security::Snapshot& credentials, char* name, size_t capacity)
+    -> int;
+
+// A prepared transfer owns a distinct search-only PIN. Its normal File close
+// uses durable directory cancellation, including failed/lost ISSUE replies.
+// Client REMOTE mount restrictions are inherited on return to the native owner.
+auto wki_remote_vfs_issue_directory_grant(ker::vfs::File* directory, const ker::mod::security::Snapshot& credentials, uint16_t target_node,
+                                          uint32_t target_boot_epoch, uint64_t submission_id, ker::vfs::MountPolicy additional_policy,
+                                          ker::vfs::File** staging_pin, VfsDirectoryGrant& output) -> int;
+// Borrowed immutable binding metadata; caller retains the directory File.
+auto wki_remote_vfs_directory_owner(ker::vfs::File* directory) -> uint16_t;
+// Native-source staging owns a close-only kernel File; never install it in an
+// FD table or treat it as directory/data access. Closing revokes an unclaimed
+// transfer. Caller retains source and releases staging outside all locks.
+auto wki_remote_vfs_issue_native_directory_grant(ker::mod::sched::task::Task& task, const ker::mod::security::Snapshot& credentials,
+                                                 uint32_t resource_id, const ker::vfs::DirectoryViewRef& source, uint16_t target_node,
+                                                 uint32_t target_boot_epoch, uint64_t submission_id,
+                                                 ker::vfs::MountPolicy additional_policy, ker::vfs::File** staging,
+                                                 VfsDirectoryGrant& output) -> int;
+auto wki_remote_vfs_import_directory_grant(void* mount_private_data, const ker::mod::security::Snapshot& credentials,
+                                           const VfsDirectoryGrant& grant, ker::vfs::File** output, char* name, size_t capacity) -> int;
+
+// Trusted caller supplies captured authenticated compute admission and must
+// revalidate that exact session after waits, before installing any Task state.
+// The helper maps credentials itself, checks the exact source/transaction and
+// retained owner binding, and claims one independent private native view.
+// It does not publish a Task or cwd. Do not hold a peer lifecycle writer across
+// this call: native storage can itself be backed by a remote block device.
+struct WkiDirectoryGrantSource {
+    uint16_t node = WKI_NODE_INVALID;
+    uint32_t boot_epoch = 0;
+    uint64_t submission_id = 0;
+    uint64_t identity_policy = 0;
+};
+auto wki_remote_vfs_adopt_directory_grant_native(const ker::mod::security::Snapshot& supplied, const WkiDirectoryGrantSource& source,
+                                                 const VfsDirectoryGrant& grant, ker::vfs::DirectoryViewRef& output) -> int;
+
 // -----------------------------------------------------------------------------
 // Public API
 // -----------------------------------------------------------------------------
@@ -352,10 +437,15 @@ void wki_remote_vfs_advertise_exports();
 
 // Server side: advertise all VFS exports to one connected peer. Returns false
 // if the reliable stream could not accept the complete current export set.
+// Task-context publisher: call before acquiring a peer lifecycle lease.
+// Returns true only after every queued withdrawal for this peer is ACKed.
+auto wki_remote_vfs_publish_withdrawals(uint16_t peer_node) -> bool;
 auto wki_remote_vfs_advertise_exports_to_peer(uint16_t peer_node) -> bool;
 
 // Consumer side: mount a remote VFS at local_mount_path. Automatic mounts pass
 // the exact observed generation; manual callers snapshot the current one.
+// Commit callback: success publishes one row; failure must publish nothing.
+// All remote lane preparation precedes this call; it runs outside registry locks.
 using RemoteVfsMountPublisher = int (*)(const char* local_mount_path, void* private_data, ker::vfs::FileOperations* fops, void* context);
 auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char* local_mount_path,
                           uint64_t expected_resource_generation = 0, RemoteVfsMountPublisher publisher = nullptr,
@@ -364,8 +454,35 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
 auto wki_remote_vfs_selftest_attach_ack_cookie_fences_stale_completion() -> bool;
 
 #ifdef WOS_SELFTEST
+auto wki_remote_vfs_selftest_exec_view_lifetime() -> bool;
+auto wki_remote_vfs_selftest_directory_reference_lifetime() -> bool;
+auto wki_remote_vfs_selftest_directory_grant_lifetime() -> bool;
+auto wki_remote_vfs_selftest_native_directory_grant() -> bool;
+auto wki_remote_vfs_selftest_completed_read_reply_retry() -> bool;
+auto wki_remote_vfs_selftest_owner_write_policy() -> bool;
+auto wki_remote_vfs_selftest_file_retirement() -> bool;
+auto wki_remote_vfs_selftest_file_metadata_decoder() -> bool;
+auto wki_remote_vfs_selftest_directory_grant_preparation() -> bool;
+auto wki_remote_vfs_selftest_pin_preparation_purpose() -> bool;
+auto wki_remote_vfs_selftest_scalar_open_preparation() -> bool;
+auto wki_remote_vfs_selftest_open_at_preparation() -> bool;
+auto wki_remote_vfs_selftest_open_reply_admission() -> bool;
+auto wki_remote_vfs_selftest_pin_close_lifetime() -> bool;
+auto wki_remote_vfs_selftest_exec_cancellation_ownership() -> bool;
+auto wki_remote_vfs_selftest_retired_mount_retry() -> bool;
+auto wki_remote_vfs_selftest_retired_ancestor_admission() -> bool;
+auto wki_remote_vfs_selftest_withdrawal_outbox() -> bool;
+auto wki_remote_vfs_selftest_manual_mount_teardown() -> bool;
+auto wki_remote_vfs_selftest_mount_candidate_isolation() -> bool;
+auto wki_remote_vfs_selftest_native_unmount_exports() -> bool;
 auto wki_remote_vfs_selftest_utimens_wire_path_validation() -> bool;
 auto wki_remote_vfs_selftest_legacy_scalar_wire_path_admission() -> bool;
+auto wki_remote_vfs_selftest_mapped_component_path_admission() -> bool;
+auto wki_remote_vfs_selftest_directory_path_admission() -> bool;
+auto wki_remote_vfs_selftest_directory_open_admission() -> bool;
+auto wki_remote_vfs_selftest_open_lifetime_owner() -> bool;
+auto wki_remote_vfs_selftest_open_lifetime_client() -> bool;
+auto wki_remote_vfs_selftest_directory_open_reservation() -> bool;
 auto wki_remote_vfs_selftest_xattr_replay_fencing() -> bool;
 auto wki_remote_vfs_selftest_slot_waiter_fifo() -> bool;
 auto wki_remote_vfs_selftest_stale_cancel_preserves_successor() -> bool;
@@ -397,6 +514,12 @@ void wki_remote_vfs_server_diag_snapshot(WkiRemoteVfsServerDiag* out);
 // Consumer side: unmount a remote VFS
 void wki_remote_vfs_unmount(const char* local_mount_path);
 
+// VFS retirement holds the exact retiring row, with private_data still set,
+// while pinning its registered anchor. Call outside mount_lock. Finish consumes
+// the pin after removal (true), or releases it without retirement on failure.
+auto wki_remote_vfs_pin_mount_teardown(const void* private_data) -> ProxyVfsState*;
+void wki_remote_vfs_finish_mount_teardown(ProxyVfsState* owner, bool mount_removed);
+
 // Unmount every proxy created for one exact locally observed resource
 // generation, including a proxy already deactivated by peer fencing.
 void wki_remote_vfs_unmount_resource_generation(uint16_t owner_node, uint32_t resource_id, uint64_t resource_generation);
@@ -411,17 +534,23 @@ auto wki_remote_vfs_find_mount_for_resource(uint16_t owner_node, uint32_t resour
 auto wki_remote_vfs_find_resource_for_mount(uint16_t owner_node, const char* local_mount_path, uint32_t* resource_id_out) -> bool;
 
 // Consumer side: called from vfs_open() for FSType::REMOTE mounts
-auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode, void* mount_private_data) -> ker::vfs::File*;
+// Every open carries explicit caller credentials. regular_only selects the
+// strict regular-read operation; neither operation falls back to legacy OPEN.
+// Optional error receives the owner errno.
+auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode, void* mount_private_data,
+                              const ker::mod::security::Snapshot* credentials, int* error = nullptr, bool regular_only = false)
+    -> ker::vfs::File*;
 
 // Consumer side: called from vfs_stat() for FSType::REMOTE mounts
-auto wki_remote_vfs_stat(void* mount_private_data, const char* fs_relative_path, ker::vfs::Stat* statbuf) -> int;
+auto wki_remote_vfs_stat(void* mount_private_data, const char* fs_relative_path, ker::vfs::Stat* statbuf,
+                         const ker::mod::security::Snapshot& credentials, bool follow_final_symlink, bool require_directory) -> int;
 
 // Consumer side: execute one uniform, ordered metadata batch on a single
 // negotiated remote mount. Mutations are sent as one fully preflighted wire
 // request. EOPNOTSUPP is returned only before any request send.
 auto wki_remote_vfs_metadata_batch(void* mount_private_data, ker::vfs::MetadataBatchOperation operation, uint32_t mode,
                                    const ker::vfs::MetadataBatchEntry* entries, size_t count, ker::vfs::MetadataBatchResult* results,
-                                   bool* mutation_request_attempted) -> int;
+                                   bool* mutation_request_attempted, const ker::mod::security::Snapshot* credentials) -> int;
 
 // Consumer side: cached metadata lookup for an already-open remote file.
 auto wki_remote_vfs_fstat(ker::vfs::File* file, ker::vfs::Stat* statbuf) -> int;
@@ -430,43 +559,91 @@ auto wki_remote_vfs_fstat(ker::vfs::File* file, ker::vfs::Stat* statbuf) -> int;
 auto wki_remote_vfs_fsync(ker::vfs::File* file) -> int;
 
 // Consumer side: called from vfs_mkdir() for FSType::REMOTE mounts
-auto wki_remote_vfs_mkdir(void* mount_private_data, const char* fs_relative_path, int mode) -> int;
+auto wki_remote_vfs_mkdir(void* mount_private_data, const char* fs_relative_path, int mode, const ker::mod::security::Snapshot& credentials,
+                          ker::vfs::File* directory = nullptr) -> int;
+
+// Caller retains File and supplies one captured Snapshot. These operations
+// negotiate support and submit once using that File's exact channel binding.
+auto wki_remote_vfs_fchmod(ker::vfs::File* file, const ker::mod::security::Snapshot& credentials, int mode) -> int;
+auto wki_remote_vfs_fchown(ker::vfs::File* file, const ker::mod::security::Snapshot& credentials, uint32_t owner, uint32_t group) -> int;
+auto wki_remote_vfs_futimens(ker::vfs::File* file, const ker::mod::security::Snapshot& credentials, const ker::vfs::Timespec* times) -> int;
 
 // Consumer side: called from vfs_chmod() for FSType::REMOTE mounts
-auto wki_remote_vfs_chmod(void* mount_private_data, const char* fs_relative_path, int mode, bool follow_final_symlink) -> int;
+auto wki_remote_vfs_chmod(void* mount_private_data, const char* fs_relative_path, int mode, bool follow_final_symlink,
+                          const ker::mod::security::Snapshot& credentials, bool require_directory = false,
+                          ker::vfs::File* directory = nullptr) -> int;
+auto wki_remote_vfs_chown(void* mount_private_data, const char* fs_relative_path, uint32_t owner, uint32_t group, bool follow_final_symlink,
+                          const ker::mod::security::Snapshot& credentials, bool require_directory = false,
+                          ker::vfs::File* directory = nullptr) -> int;
 
 // Consumer side: called from vfs_utimensat() for FSType::REMOTE mounts
 auto wki_remote_vfs_utimens(void* mount_private_data, const char* fs_relative_path, const ker::vfs::Timespec* times,
-                            bool follow_final_symlink) -> int;
+                            bool follow_final_symlink, const ker::mod::security::Snapshot& credentials, bool require_directory = false,
+                            ker::vfs::File* directory = nullptr) -> int;
 
 // Consumer side: called from vfs_symlink() for FSType::REMOTE mounts
-auto wki_remote_vfs_symlink(void* mount_private_data, const char* target, const char* fs_relative_path) -> int;
+auto wki_remote_vfs_symlink(void* mount_private_data, const char* target, const char* fs_relative_path,
+                            const ker::mod::security::Snapshot& credentials, bool require_directory = false,
+                            ker::vfs::File* directory = nullptr) -> int;
 
 // Consumer side: called from vfs_unlink() for FSType::REMOTE mounts [V2 A9]
-auto wki_remote_vfs_unlink(void* mount_private_data, const char* fs_relative_path) -> int;
+auto wki_remote_vfs_unlink(void* mount_private_data, const char* fs_relative_path, const ker::mod::security::Snapshot& credentials,
+                           bool require_directory = false, ker::vfs::File* directory = nullptr) -> int;
 
 // Consumer side: called from vfs_rmdir() for FSType::REMOTE mounts [V2 A9]
-auto wki_remote_vfs_rmdir(void* mount_private_data, const char* fs_relative_path) -> int;
+auto wki_remote_vfs_rmdir(void* mount_private_data, const char* fs_relative_path, const ker::mod::security::Snapshot& credentials,
+                          ker::vfs::File* directory = nullptr) -> int;
 
 // Consumer side: called from vfs_rename() for FSType::REMOTE mounts [V2 A9]
-auto wki_remote_vfs_rename(void* mount_private_data, const char* old_fs_path, const char* new_fs_path) -> int;
+auto wki_remote_vfs_rename(void* mount_private_data, const char* old_fs_path, const char* new_fs_path,
+                           const ker::mod::security::Snapshot& credentials, bool source_requires_directory = false,
+                           bool destination_requires_directory = false, ker::vfs::File* source_directory = nullptr,
+                           ker::vfs::File* destination_directory = nullptr) -> int;
 
 // Consumer side: readlink on a remote path (for vfs_readlink / resolve_symlinks)
-auto wki_remote_vfs_readlink_path(void* mount_private_data, const char* fs_relative_path, char* buf, size_t bufsize) -> ssize_t;
+// Caller retains directory. These operations keep its exact proxy/channel grant.
+// OPEN fills an unpublished File whose mount/path/FD storage the caller prepared.
+// prepared is the caller's unique, heap-allocated unpublished File (one ref).
+// Normal failure preserves caller ownership; fatal task cleanup takes over its
+// path/mount release because the caller's stack will never resume.
+auto wki_remote_vfs_open_at(ker::vfs::File* directory, const char* relative_path, int flags, int mode, bool require_directory,
+                            const ker::mod::security::Snapshot& credentials, ker::vfs::File& prepared) -> int;
+auto wki_remote_vfs_stat_at(ker::vfs::File* directory, const char* relative_path, ker::vfs::Stat* output,
+                            const ker::mod::security::Snapshot& credentials, bool follow_final, bool require_directory) -> int;
+auto wki_remote_vfs_readlink_at(ker::vfs::File* directory, const char* relative_path, char* output, size_t capacity,
+                                const ker::mod::security::Snapshot& credentials, bool require_directory) -> ssize_t;
+auto wki_remote_vfs_readlink_path(void* mount_private_data, const char* fs_relative_path, char* buf, size_t bufsize,
+                                  const ker::mod::security::Snapshot& credentials, bool require_directory = false) -> ssize_t;
 
-auto wki_remote_vfs_setxattr(void* mount_private_data, const char* fs_relative_path, const char* name, const void* value, size_t size,
-                             int flags, bool follow_final_symlink) -> int;
-auto wki_remote_vfs_getxattr(void* mount_private_data, const char* fs_relative_path, const char* name, void* value, size_t size,
-                             bool follow_final_symlink) -> ssize_t;
-auto wki_remote_vfs_listxattr(void* mount_private_data, const char* fs_relative_path, char* list, size_t size, bool follow_final_symlink)
-    -> ssize_t;
-auto wki_remote_vfs_removexattr(void* mount_private_data, const char* fs_relative_path, const char* name, bool follow_final_symlink) -> int;
-auto wki_remote_vfs_fsetxattr(ker::vfs::File* file, const char* name, const void* value, size_t size, int flags) -> int;
-auto wki_remote_vfs_fgetxattr(ker::vfs::File* file, const char* name, void* value, size_t size) -> ssize_t;
-auto wki_remote_vfs_flistxattr(ker::vfs::File* file, char* list, size_t size) -> ssize_t;
-auto wki_remote_vfs_fremovexattr(ker::vfs::File* file, const char* name) -> int;
+// Resolve raw relative components on the retained directory's exact binding.
+auto wki_remote_vfs_realpath_at(ker::vfs::File* directory, const char* relative_path, char* output, size_t capacity,
+                                const ker::mod::security::Snapshot& credentials, bool require_directory = false) -> ssize_t;
+auto wki_remote_vfs_realpath_path(void* mount_private_data, const char* relative_path, char* output, size_t capacity,
+                                  const ker::mod::security::Snapshot& credentials, bool require_directory) -> ssize_t;
+
+auto wki_remote_vfs_setxattr(void* mount_private_data, const ker::mod::security::Snapshot& credentials, const char* fs_relative_path,
+                             const char* name, const void* value, size_t size, int flags, bool follow_final_symlink,
+                             bool require_directory = false, ker::vfs::File* directory = nullptr) -> int;
+auto wki_remote_vfs_getxattr(void* mount_private_data, const ker::mod::security::Snapshot& credentials, const char* fs_relative_path,
+                             const char* name, void* value, size_t size, bool follow_final_symlink, bool require_directory = false,
+                             ker::vfs::File* directory = nullptr) -> ssize_t;
+auto wki_remote_vfs_listxattr(void* mount_private_data, const ker::mod::security::Snapshot& credentials, const char* fs_relative_path,
+                              char* list, size_t size, bool follow_final_symlink, bool require_directory = false,
+                              ker::vfs::File* directory = nullptr) -> ssize_t;
+auto wki_remote_vfs_removexattr(void* mount_private_data, const ker::mod::security::Snapshot& credentials, const char* fs_relative_path,
+                                const char* name, bool follow_final_symlink, bool require_directory = false,
+                                ker::vfs::File* directory = nullptr) -> int;
+auto wki_remote_vfs_fsetxattr(const ker::mod::security::Snapshot& credentials, ker::vfs::File* file, const char* name, const void* value,
+                              size_t size, int flags) -> int;
+auto wki_remote_vfs_fgetxattr(const ker::mod::security::Snapshot& credentials, ker::vfs::File* file, const char* name, void* value,
+                              size_t size) -> ssize_t;
+auto wki_remote_vfs_flistxattr(const ker::mod::security::Snapshot& credentials, ker::vfs::File* file, char* list, size_t size) -> ssize_t;
+auto wki_remote_vfs_fremovexattr(const ker::mod::security::Snapshot& credentials, ker::vfs::File* file, const char* name) -> int;
 
 // Consumer side: get the FileOperations for remote VFS files
+// Caller retains source. Success returns an independent owner-held execution
+// view; failure leaves output unchanged and cancels by the request token.
+auto wki_remote_vfs_clone_exec_file(ker::vfs::File* source, ker::vfs::File** output) -> int;
 auto wki_remote_vfs_get_fops() -> ker::vfs::FileOperations*;
 
 // Invalidate per-open remote caches for an already-open remote file.
@@ -482,14 +659,18 @@ void wki_remote_vfs_auto_discover();
 void wki_remote_vfs_refresh_exports();
 
 // Rebuild and re-advertise VFS exports after mount topology changes such as
-// pivot_root(). Sends withdraws for stale exports before advertising the new set.
+// pivot_root(). Retains stale withdrawals for acknowledged deferred delivery
+// before advertising the replacement set.
 void wki_remote_vfs_rebuild_exports();
 
-// Pivot split phase: close VFS server admission and drain binding workers
-// before mount paths/task roots are remapped. A failed remap must cancel;
-// successful callers finish through wki_remote_vfs_rebuild_exports().
+// Native unmount/pivot split phase: close VFS server admission and drain binding
+// workers before backing mounts or task roots change. A failed commit must cancel;
+// success finishes through rebuild_exports() or commit_export_unmount().
 auto wki_remote_vfs_prepare_export_rebuild() -> bool;
 void wki_remote_vfs_cancel_export_rebuild();
+// Finish a prepared native unmount by retiring only this backing mount's
+// exports. Other names remain independent of the unmount caller's root.
+void wki_remote_vfs_commit_export_unmount(uint32_t backing_dev_id);
 
 // Fencing cleanup - remove all state for a fenced peer
 void wki_remote_vfs_cleanup_for_peer(uint16_t node_id, bool owner_reboot_proven);
@@ -503,6 +684,16 @@ void wki_remote_vfs_process_pending_server_fd_cleanup();
 
 // Retry a bounded, rotating batch of detach frames from task context.
 void wki_remote_vfs_process_pending_detaches();
+// Bounded client RPC retries; never invoke from RX or the protocol-service worker.
+void wki_remote_vfs_process_pending_exec_cancellations();
+void wki_remote_vfs_process_pending_open_cancellations();
+// Retry exact retired mount owners after EBUSY; task/auto-attach context only.
+void wki_remote_vfs_process_pending_unmounts();
+
+// Observation for the serialized automatic mount worker, not a publication
+// lease for manual mounts. Wait for exact-path or ancestor retired rows before
+// adding successors that would themselves prevent the old row's retirement.
+auto wki_remote_vfs_auto_mount_waits_for_retired_path(const char* path) -> bool;
 // Read-only admission gate for deferred auto-mount scheduling.
 auto wki_remote_vfs_detach_pending_for_resource(uint16_t owner_node, uint32_t resource_id) -> bool;
 // RX-safe first phase of a connected channel-epoch reset. It only marks
@@ -523,7 +714,8 @@ void handle_vfs_invalidate_notify(const WkiHeader* hdr, const uint8_t* payload, 
 
 // Server side: handle VFS operations (called from dev_server handle_dev_op_req)
 void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_identity, const char* export_path, const char* export_name,
-                   uint16_t op_id, const uint8_t* data, uint16_t data_len);
+                   uint16_t op_id, const uint8_t* data, uint16_t data_len, uint64_t identity_policy = 0, uint16_t identity_capabilities = 0,
+                   const std::atomic<bool>* binding_retiring = nullptr, DevServerBinding* grant_binding = nullptr);
 
 // Consumer side: handle DEV_OP_RESP for VFS proxy
 void handle_vfs_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, const WkiChannelIdentity& channel_identity);

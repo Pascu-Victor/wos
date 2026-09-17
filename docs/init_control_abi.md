@@ -8,7 +8,7 @@ kernel and installed for userspace as `<sys/init_control.h>`.
 
 | Process operation | Caller | Result |
 | --- | --- | --- |
-| `INIT_CONTROL_SUBMIT` | Effective UID 0 | Enqueue one `Request` |
+| `INIT_CONTROL_SUBMIT` | Effective UID 0 with retained `INIT_CONTROL` authority | Enqueue one `Request` |
 | `INIT_CONTROL_RECEIVE` | Process ID 1 | Receive the oldest request |
 | `INIT_STATUS_PUBLISH` | Process ID 1 | Atomically replace the status snapshot |
 | `INIT_STATUS_READ` | Any process | Read the latest complete snapshot |
@@ -18,6 +18,14 @@ read before PID 1 publishes the first snapshot returns `-EAGAIN`. A failed PID
 1 request copyout leaves the request queued. Mutating requests are authenticated
 from kernel task credentials; the kernel overwrites `sender_pid` and
 `sender_euid`, so requesters cannot forge them.
+
+Submission uses one immutable credential snapshot for both authorization and
+the stamped effective UID. Dropping `INIT_CONTROL` from the authority ceiling
+denies submission even for root; nonroot service privilege grants do not confer
+this authority. Authorization precedes request copying and validation. Receipt
+and publication use kernel process identity, including PID 1's own threads;
+another root process cannot receive requests or publish status. Concurrent
+receipt while a copyout is in progress returns `-EBUSY`.
 
 Version 1 uses exact fixed sizes and requires unused flags and reserved fields
 to be zero. Names are nonempty, NUL-terminated, and limited to ASCII letters,

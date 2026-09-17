@@ -136,7 +136,7 @@ def test_pts_open_publishes_lifetime_under_namespace_pin() -> None:
     remove_body = function_body(devfs_source, "devfs_remove_node")
     readdir_body = function_body(devfs_source, "devfs_readdir")
     slave_open_body = function_body(pty_source, "slave_open")
-    indexed_open_body = function_body(pty_source, "pty_open_slave_by_index")
+    indexed_open_body = function_body(pty_source, "pty_open_controlling_slave")
     allocate_body = function_body(pty_source, "pty_alloc")
     master_open_body = function_body(pty_source, "ptmx_open")
     tty_open_body = function_body(CONSOLE_CPP.read_text(), "tty_open")
@@ -147,21 +147,41 @@ def test_pts_open_publishes_lifetime_under_namespace_pin() -> None:
             "bool const PTS_PATH = is_pts_devfs_path(rel_path);",
             "OptionalPtsLock const PTS_GUARD(PTS_PATH);",
             "node = walk_path(rel_path);",
-            "node->device->char_ops->open(file)",
+            "OPS->open_with_credentials(file, credentials, opener)",
         ],
         "/dev/pts open namespace pin",
     )
     require_order(open_body, "OptionalPtsLock const PTS_GUARD", "node = walk_path", "pin before /dev/pts lookup")
-    require_order(open_body, "node = walk_path", "node->device->char_ops->open(file)", "pin through device open")
+    require_order(open_body, "node = walk_path", "OPS->open_with_credentials(file, credentials, opener)", "pin through device open")
     require_tokens(
         remove_body,
         [
-            "OptionalPtsLock const PTS_GUARD(is_pts_devfs_path(path));",
+            "OptionalPtsLock const PTS_GUARD(PTS_PATH);",
             "remove_child(node->parent, node);",
-            "delete node;",
+            "if (PTS_PATH)",
+            "pts_release_node_ref(node);",
         ],
         "/dev/pts removal namespace pin",
     )
+    require_order(remove_body, "remove_child(node->parent, node)", "pts_release_node_ref(node)", "unlink before dropping tree pin")
+    acquire_body = function_body(devfs_source, "devfs_acquire_path")
+    require_order(acquire_body, "OptionalPtsLock const PTS_GUARD", "walk_path(path, false)", "path lookup under namespace lock")
+    require_order(acquire_body, "walk_path(path, false)", "node->pts_refs.fetch_add", "path pin after lookup")
+    require_order(open_body, "node->pts_refs.fetch_add", "OPS->open_with_credentials(file, credentials, opener)", "node pin before device callback")
+    reset_body = function_body(devfs_source, "DevFSNodeRef::reset")
+    require_tokens(reset_body, ["if (owns_pts_node_ref_)", "pts_release_node_ref(node_)"], "path node release")
+    close_body = function_body(devfs_source, "devfs_close")
+    require_order(close_body, "char_ops->close(f)", "pts_release_node_ref", "device close before node release")
+    release_body = function_body(devfs_source, "pts_release_node_ref")
+    require_tokens(release_body, ["fetch_sub(1, std::memory_order_acq_rel) == 1", "delete[] node->children", "delete node"], "final node release")
+    if "node->device" in release_body:
+        fail("PTY node release must not access its independently owned Device")
+    core = VFS_CORE_CPP.read_text()
+    if "node->device->type" in core:
+        fail("devfs metadata must use the cached device kind, not a potentially retired PTY Device")
+    if core.count("ker::vfs::devfs::devfs_stat_node(") != 3:
+        fail("devfs component, path and descriptor stat must use the locked backend snapshot")
+    require_tokens(function_body(devfs_source, "node_mode_locked"), ["node.is_block_device"], "cached device kind")
     require_tokens(
         slave_open_body,
         [
@@ -191,7 +211,8 @@ def test_pts_open_publishes_lifetime_under_namespace_pin() -> None:
         [
             "pty_tree_lock.lock_irqsave();",
             "pair->lock.lock_irqsave();",
-            "if (pair->freeing || !pair->allocated)",
+            "pair->identity != identity || session_id == 0 || pair->session_id != session_id",
+            "pair->master_opened <= 0 || generation == 0 || pair->attachment_generation != generation",
             "pty_pair_acquire(pair);",
             "pair->slave_opened++;",
         ],
@@ -202,7 +223,7 @@ def test_pts_open_publishes_lifetime_under_namespace_pin() -> None:
     require_tokens(
         tty_open_body,
         [
-            "pty_open_slave_by_index(task->controlling_tty)",
+            "pty_open_controlling_slave(TERMINAL, JOB.session_id, JOB.terminal_generation)",
             "dff->device = &pair->slave_dev;",
         ],
         "/dev/tty retirement-safe slave open",
@@ -214,7 +235,7 @@ def test_pts_open_publishes_lifetime_under_namespace_pin() -> None:
         [
             "pair->allocated = false;",
             "pty_tree.insert(SLOT, pair)",
-            "vfs::devfs::devfs_add_device_node(pts_path, &pair->slave_dev)",
+            "vfs::devfs::devfs_add_device_node(pts_path, &pair->slave_dev, &caller)",
         ],
         "PTY publication after tree and devfs registration",
     )
@@ -402,17 +423,17 @@ def test_procfs_fd_links_open_by_retaining_referenced_files() -> None:
     require_tokens(
         procfs_header,
         [
-            "auto procfs_open_fd_link_path(const char* path) -> File*;",
+            "auto procfs_open_fd_link_path(const ker::mod::security::Snapshot& credentials,",
         ],
         "procfs fd-link open helper declaration",
     )
     require_tokens(
         procfs_body,
         [
-            'std::strncmp(path, "self/fd/", 8) == 0',
-            "parse_fd_component(fd_text, fd)",
-            "ker::mod::sched::find_task_by_pid_safe(pid)",
-            "task_fd_file_retain(task, fd)",
+            "parse_proc_fd_path(path, parsed)",
+            "ker::mod::sched::find_task_by_pid_safe(parsed.pid)",
+            "ker::mod::sched::task::same_thread_group(*task, parsed.group_pid)",
+            "authorized_task_fd_retain(credentials, caller_pid, *task, parsed.fd, *result_out)",
             "task->release();",
         ],
         "procfs fd-link open helper",
@@ -423,13 +444,13 @@ def test_procfs_fd_links_open_by_retaining_referenced_files() -> None:
             "resolve_symlinks(path, prefix_resolved.data(), prefix_resolved.size(), apply_task_policy, false, known_path_len)",
             "mount->fs_type != FSType::PROCFS",
             "strip_mount_prefix(mount, prefix_resolved.data())",
-            "procfs_open_fd_link_path(fs_relative_path)",
+            "procfs_open_fd_link_path(credentials, caller_pid, fs_relative_path, &result)",
         ],
         "VFS procfs fd-link prefix resolver",
     )
     require_order(
         vfs_open_body,
-        "vfs_try_open_procfs_fd_link(path_buffer.data(), !open_local, mount, path_buffer_len)",
+        "vfs_try_open_procfs_fd_link(CREDENTIALS, ker::mod::sched::task::process_pid(*task), path_buffer.data(),",
         "resolve_symlinks(path_buffer.data(), resolved.data(), resolved.size(), !open_local",
         "vfs_open should retain fd links before final symlink resolution",
     )
@@ -437,14 +458,13 @@ def test_procfs_fd_links_open_by_retaining_referenced_files() -> None:
         vfs_open_body,
         [
             "vfs_put_file(fd_link_file);",
-            "vfs_install_open_file(task, fd_link_file)",
-            "vfs_set_fd_cloexec_for_task(task, FD, true)",
+            "descriptor->install(fd_link_file, (flags & ker::vfs::O_CLOEXEC) != 0)",
         ],
         "vfs_open direct fd-link install",
     )
     require_order(
         vfs_open_file_body,
-        "vfs_try_open_procfs_fd_link(pathBuffer, apply_task_policy && !OPEN_LOCAL, mount, path_buffer_len)",
+        "vfs_try_open_procfs_fd_link(CREDENTIALS, CALLER_PID, pathBuffer,",
         "resolve_symlinks(pathBuffer, resolved, sizeof(resolved), apply_task_policy && !OPEN_LOCAL",
         "vfs_open_file_impl should retain fd links before final symlink resolution",
     )
@@ -458,7 +478,32 @@ def test_procfs_fd_links_open_by_retaining_referenced_files() -> None:
     )
 
 
+def test_foreground_origin_is_retained_without_broader_fallback() -> None:
+    pty = PTY_CPP.read_text()
+    session = (ROOT / "modules/kern/src/platform/sched/session.cpp").read_text()
+    scheduler = (ROOT / "modules/kern/src/platform/sched/scheduler.cpp").read_text()
+    for name, assignment in [("claim_terminal", "identity.group_origin"), ("set_foreground", "group_origin")]:
+        body = function_body(session, name)
+        require_order(body, "pair.foreground_pgrp =", f"pair.foreground_origin = {assignment};", name)
+        publication = body[body.index("pair.foreground_pgrp ="):]
+        require_order(publication, f"pair.foreground_origin = {assignment};", "pair.lock.unlock_irqrestore", name + " snapshot lock")
+    for name in ["revoke_terminal", "pty_alloc"]:
+        body = function_body(session if name == "revoke_terminal" else pty, name)
+        require_tokens(body, ["foreground_origin = {};"], name)
+    master = function_body(pty, "master_write")
+    assert master.count("auto const SIGNAL_ORIGIN = pair->foreground_origin;") == 3
+    assert master.count("SIGNAL_GENERATION, SIGNAL_PGRP, SIGNAL_ORIGIN,") == 3
+    dispatch = function_body(pty, "pty_signal_pgrp")
+    assert "signal_controlling_tty" not in pty + scheduler
+    require_tokens(dispatch, ["signal_terminal_process_group", "foreground_origin, sig"], "exact foreground dispatch")
+    for name in ["signal_terminal_process_group", "revoke_terminal_attachment"]:
+        body = function_body(scheduler, name)
+        require_order(body, "session::terminal_foreground_matches", "signal_terminal_source_as", name)
+        assert "signal_generate_pending_mask" not in body
+
+
 def main() -> None:
+    test_foreground_origin_is_retained_without_broader_fallback()
     test_detached_pty_device_is_not_logged_as_pointer_corruption()
     test_devfs_and_pty_pointer_validation_accept_kernel_vmap()
     test_pty_pair_retires_only_after_both_sides_close()

@@ -2,6 +2,48 @@
 #include <cstdint>
 
 namespace ker::abi::process {
+// Fixed WOS authority ceiling: bits alone do not grant nonroot authority.
+// Explicit service privileges below are also bounded by matching ceiling bits.
+enum class CredentialAuthority : uint8_t {
+    SET_UID = 0,
+    SET_GID = 1,
+    DAC_OVERRIDE = 2,
+    FILE_OWNER = 3,
+    SIGNAL = 4,
+    PTRACE = 5,
+    PRIORITY = 6,
+    POWER = 7,
+    INIT_CONTROL = 8,
+    RESOURCE_LIMIT = 9,
+    MOUNT = 10,
+    DEVICE_CONTROL = 11,
+    NETWORK_ADMIN = 12,
+    HOSTNAME = 13,
+    KERNEL_DEBUG = 14,
+    WKI_ADMIN = 15,
+    COUNT = 16,
+};
+inline constexpr uint64_t CREDENTIAL_AUTHORITY_ALL = (uint64_t{1} << 16) - 1;
+
+enum class ServicePrivilege : uint8_t { JOURNAL_READ = 0, NETWORK_ADMIN = 1, COUNT = 2 };
+inline constexpr uint64_t SERVICE_PRIVILEGE_ALL = 3;
+inline constexpr uint64_t SERVICE_PRIVILEGES_LOCKED = 1U << 8;
+// Only the two declared operations can be delegated; this is not a general
+// nonroot version of CredentialAuthority. Validate unknown mask bits first.
+constexpr auto service_privilege_ceiling(uint64_t mask) -> uint64_t {
+    return ((mask & 1U) != 0 ? uint64_t{1} << static_cast<unsigned>(CredentialAuthority::KERNEL_DEBUG) : 0) |
+           ((mask & 2U) != 0 ? uint64_t{1} << static_cast<unsigned>(CredentialAuthority::NETWORK_ADMIN) : 0);
+}
+
+enum class CredentialControl : uint32_t {
+    SET_NO_NEW_PRIVILEGES = 38,
+    GET_NO_NEW_PRIVILEGES = 39,
+    GET_AUTHORITY_CEILING = 0x574f5301,
+    DROP_AUTHORITY_CEILING = 0x574f5302,
+    SET_SERVICE_PRIVILEGES = 0x574f5303,
+    GET_SERVICE_PRIVILEGES = 0x574f5304,
+};
+
 // Syscall operation selectors are carried in 64-bit registers.
 // NOLINTNEXTLINE(performance-enum-size)
 enum class procmgmt_ops : uint64_t {

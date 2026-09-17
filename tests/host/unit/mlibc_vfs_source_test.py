@@ -446,10 +446,18 @@ def test_kernel_vfs_syscalls_accept_the_flags_mlibc_forwards() -> None:
             "int const READ_OPEN_FLAGS = (flags & O_NONBLOCK) != 0 ? O_NONBLOCK : 0;",
             "int const WRITE_OPEN_FLAGS = 1 | ((flags & O_NONBLOCK) != 0 ? O_NONBLOCK : 0);",
             "if ((flags & ker::vfs::O_CLOEXEC) != 0)",
-            "vfs_set_fd_cloexec_for_task(task, RFD, true)",
-            "vfs_set_fd_cloexec_for_task(task, WFD, true)",
+            "read_descriptor.install_pair(write_descriptor, rf, wf, (flags & ker::vfs::O_CLOEXEC) != 0)",
         ],
         "kernel vfs pipe flag handling",
+    )
+    reservation = (ROOT / "modules/kern/src/vfs/fd_reservation.cpp").read_text()
+    pair = function_body(reservation, r"auto\s+FdReservation::install_pair\([^)]*\)\s*->\s*int")
+    require_order(
+        pair,
+        ["fd_table_lock.lock_irqsave()", "fd_table.commit(FIRST", "fd_table.commit(SECOND",
+         "for (uint64_t slot : {FIRST, SECOND})", "if (cloexec)",
+         "table->set_fd_cloexec(static_cast<unsigned>(slot))", "fd_table_lock.unlock_irqrestore(FLAGS)"],
+        "pipe pair publishes both close-on-exec bits under the descriptor table lock",
     )
 
     dup2_body = function_body(vfs_core, r"auto\s+vfs_dup2\(int\s+oldfd,\s*int\s+newfd,\s*int\s+flags\)\s*->\s*int")
@@ -536,32 +544,25 @@ def test_utimensat_reaches_real_vfs_timestamp_updates() -> None:
     )
 
     vfs_core = KERNEL_VFS_CORE_CPP.read_text()
-    resolve_body = function_body(
-        vfs_core,
-        r"auto\s+resolve_one_utimens_time\(const\s+Timespec&\s+requested,\s*const\s+Timespec&\s+now,\s*Timespec\*\s+out,\s*bool\*\s+should_set\)\s*->\s*int",
-    )
-    require_tokens(
-        resolve_body,
-        [
-            "if (requested.tv_nsec == VFS_UTIME_NOW)",
-            "if (requested.tv_nsec == VFS_UTIME_OMIT)",
-            "if (requested.tv_nsec < 0 || requested.tv_nsec >= VFS_NSEC_PER_SEC)",
-        ],
-        "kernel vfs utimensat timestamp resolver",
-    )
+    resolve_body = function_body(vfs_core, r"auto\s+resolve_utimens_times\([^)]*\)\s*->\s*int")
+    require_tokens(resolve_body, ["TimestampUpdate::prepare(times, current_vfs_timespec(), *resolved)"], "immutable timestamp preparation")
+    update = (ROOT / "modules/kern/src/vfs/timestamps.hpp").read_text()
+    require_tokens(update, ["requested[i].tv_nsec == NOW", "requested[i].tv_nsec == OMIT",
+                           "requested[i].tv_nsec < 0 || requested[i].tv_nsec >= 1000000000",
+                           "out = next;", "FileTimestampIntent", "private:"], "validated timestamp intent")
 
     path_body = function_body(
         vfs_core,
-        r"auto\s+vfs_apply_utimens_to_resolved_path\(const\s+char\*\s+resolved_path,\s*const\s+Timespec\*\s+times,\s*bool\s+follow_final_symlink,\s*size_t\s+known_resolved_path_len\s*=\s*UNKNOWN_PATH_LEN,\s*bool\s+allow_remote_backend\s*=\s*true,\s*const\s+SymlinkResolvePolicy\*\s+resolve_policy\s*=\s*nullptr,\s*bool\s+lookup_symlinks_resolved\s*=\s*false\)\s*->\s*int",
+        r"auto\s+vfs_apply_utimens_to_resolved_path\([^)]*\)\s*->\s*int",
     )
     require_tokens(
         path_body,
         [
             "case FSType::TMPFS:",
-            "apply_tmpfs_utimens(node, resolved_times)",
+            "tmpfs_utimens_lookup(lookup, CREDENTIALS, resolved_times",
             "case FSType::XFS:",
             "ker::vfs::xfs::xfs_set_times_path(",
-            "fs_path, resolved_times.atime, resolved_times.mtime",
+            "fs_path, CREDENTIALS, resolved_times",
             "case FSType::FAT32:",
             "changed = false;",
             "if (!REMOTE_MOUNT && !lookup_symlinks_resolved)",
@@ -584,23 +585,23 @@ def test_utimensat_reaches_real_vfs_timestamp_updates() -> None:
             "VfsResolvedTimes resolved_times{};",
             "int const times_result = resolve_utimens_times(times, &resolved_times);",
             "LookupHandle lookup{};",
-            "vfs_acquire_lookup(task, dirfd, pathname, LookupIntent::METADATA, policy, false, true, &lookup, 0)",
+            "vfs_acquire_lookup(task, dirfd, pathname, LookupIntent::CHANGE_TIMES, policy, false, true, &lookup, 0, false,",
             "ker::vfs::tmpfs::tmpfs_utimens_lookup(",
             "ker::vfs::xfs::xfs_utimens_lookup(",
-            "lookup.mount()->fs_type == FSType::REMOTE ? consume_utimens(lookup, &context)",
-            "vfs_consume_lookup(lookup, false, consume_utimens, &context)",
+            "if (lookup.mount()->fs_type == FSType::REMOTE) return consume_utimens(lookup, &context)",
+            "consume_lookup_locked(lookup, false, consume_utimens, &context, task, &REQUEST_CREDENTIALS)",
             "if (result != -EAGAIN || attempt == 3)",
         ],
         "kernel vfs utimensat retained lookup, backend commit, and empty-path handling",
     )
 
-    futimens_body = function_body(vfs_core, r"auto\s+vfs_futimens\(int\s+fd,\s*const\s+Timespec\*\s+times\)\s*->\s*int")
+    futimens_body = function_body(vfs_core, r"auto\s+vfs_futimens_file_as\(File\*\s+f,\s*const\s+ker::mod::security::Snapshot&\s+CREDENTIALS,\s*const\s+Timespec\*\s+times\)\s*->\s*int")
     require_tokens(
         futimens_body,
         [
             "case FSType::TMPFS:",
             "case FSType::XFS:",
-            "xfs_set_times_file(f, resolved_times.atime, resolved_times.mtime",
+            "xfs_set_times_file(f, CREDENTIALS, resolved_times",
             "cache_notify_file_metadata_changed_impl(f)",
         ],
         "kernel vfs futimens file backend updates",
@@ -610,9 +611,9 @@ def test_utimensat_reaches_real_vfs_timestamp_updates() -> None:
     require_tokens(
         xfs_hpp,
         [
-            "auto xfs_set_times_path(const char* fs_path, const Timespec& atime, const Timespec& mtime, bool set_atime, bool set_mtime,",
-            "auto xfs_set_times_file(File* f, const Timespec& atime, const Timespec& mtime, bool set_atime, bool set_mtime,",
-            "ker::vfs::Stat* statbuf = nullptr) -> int;",
+            "auto xfs_set_times_path(const char* fs_path, const ker::mod::security::Snapshot& credentials, const TimestampUpdate& times,",
+            "auto xfs_set_times_file(File* file, const ker::mod::security::Snapshot& credentials, const TimestampUpdate& times,",
+            "Stat* statbuf = nullptr) -> int;",
         ],
         "kernel xfs utimensat declarations",
     )
@@ -683,7 +684,8 @@ def test_kernel_dirfd_resolution_returns_task_visible_paths() -> None:
         [
             "if (pathname[0] == '/')",
             "if (dirfd == AT_FDCWD)",
-            "base = task->cwd.data();",
+            "vfs_getcwd_for_task(task, cwd.data(), cwd.size(), &known_base_len)",
+            "base = cwd.data();",
             "auto* file = vfs_get_file_retain(task, dirfd);",
             "strip_task_root_prefix(task, file->vfs_path, resolved, resolved_size, nullptr)",
             "base = resolved;",
@@ -750,7 +752,7 @@ def test_open_create_uses_central_cache_notify_path() -> None:
     for pattern, context in [
         (r"auto\s+vfs_open_resolved_for_task\([^{}]*\)\s*->\s*int", "vfs_open_resolved_for_task"),
         (
-            r"static\s+auto\s+vfs_open_file_impl\(const\s+char\*\s+path,\s*int\s+flags,\s*int\s+mode,\s*bool\s+resolve_task_path,\s*bool\s+apply_task_policy,\s*bool\s+lookup_symlinks_resolved\s*=\s*false,\s*bool\s+namespace_already_locked\s*=\s*false\)\s*->\s*File\*",
+            r"static\s+auto\s+vfs_open_file_impl\([^{}]*\)\s*->\s*File\*",
             "vfs_open_file_impl",
         ),
     ]:
@@ -769,68 +771,31 @@ def test_open_create_uses_central_cache_notify_path() -> None:
         if "metadata_cache_note_path_changed" in create_block:
             fail(f"{context} must not bypass central cache notify for O_CREAT")
 
-    tmpfs_open = function_body(
-        tmpfs,
-        r"auto\s+tmpfs_open_path\(TmpNode\*\s+root,\s*const\s+char\*\s+path,\s*int\s+flags,\s*int\s+mode,\s*int\*\s+result_out\)\s*->\s*ker::vfs::File\*",
-    )
-    tmpfs_open_node = function_body(
-        tmpfs,
-        r"auto\s+tmpfs_open_node_locked\(TmpNode\*\s+entry,\s*int\s+flags,\s*bool\s+require_directory,\s*bool\s+created_by_open,\s*int\*\s+result_out\)\s*->\s*ker::vfs::File\*",
-    )
-    require_tokens(
-        tmpfs_open,
-        [
-            "bool created_by_open = false;",
-            "created_by_open = node != nullptr;",
-            "tmpfs_open_node_locked(node, flags, false, created_by_open, result_out)",
-        ],
-        "tmpfs compatibility open-create result production",
-    )
-    require_tokens(
-        tmpfs_open_node,
-        [
-            "file->open_create_result_known = (flags & O_CREAT) != 0;",
-            "file->created_by_open = created_by_open;",
-        ],
-        "tmpfs shared retained-node open-create result hints",
-    )
+    tmpfs_open = function_body(tmpfs, r"auto\s+tmpfs_open_path\([^{}]*\)\s*->\s*ker::vfs::File\*")
+    tmpfs_lookup = function_body(tmpfs, r"auto\s+tmpfs_open_lookup\([^{}]*\)\s*->\s*ker::vfs::File\*")
+    require_tokens(tmpfs_open, ["tmpfs_acquire_lookup(credentials, root, path, &lookup)",
+                               "tmpfs_open_lookup(credentials, lookup, flags, mode, REQUIRE_DIRECTORY, &result)"],
+                   "tmpfs path shares retained open")
+    require_tokens(tmpfs_lookup, ["bool const CREATED = !handle.target_existed()",
+                                 "file->open_create_result_known = (flags & O_CREAT) != 0;",
+                                 "file->created_by_open = CREATED;"], "tmpfs create result hints")
 
 
-def test_tmpfs_permission_denied_open_runs_close_hook() -> None:
-    vfs_core = KERNEL_VFS_CORE_CPP.read_text()
-    tmpfs = (ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "tmpfs.cpp").read_text()
-
-    open_body = function_body(vfs_core, r"auto\s+vfs_open_resolved_for_task\([^{}]*\)\s*->\s*int")
-    require_order(
-        open_body,
-        [
-            "int const PERM_RET = vfs_check_permission_for_task(task, node->mode, node->uid, node->gid, required_access)",
-            "if (PERM_RET < 0)",
-            "vfs_destroy_file(f)",
-            "return PERM_RET",
-        ],
-        "tmpfs permission-denied open cleanup",
-    )
-    denied_cleanup = open_body[open_body.find("int const PERM_RET = vfs_check_permission_for_task") :]
-    denied_cleanup = denied_cleanup[: denied_cleanup.find("int const TRUNCATE_RET = apply_open_truncation")]
-    if "delete f" in denied_cleanup or "vfs_file_clear_path(f)" in denied_cleanup:
-        fail("permission-denied tmpfs open must use vfs_destroy_file so tmpfs close decrements open_count")
-
-    tmpfs_open = function_body(
-        tmpfs,
-        r"auto\s+tmpfs_open_node_locked\(TmpNode\*\s+entry,\s*int\s+flags,\s*bool\s+require_directory,\s*bool\s+created_by_open,\s*int\*\s+result_out\)\s*->\s*ker::vfs::File\*",
-    )
-    tmpfs_close = function_body(tmpfs, r"auto\s+tmpfs_fops_close\(ker::vfs::File\*\s+f\)\s*->\s*int")
-    require_tokens(
-        tmpfs_open,
-        ["NODE->open_count.fetch_add(1, std::memory_order_relaxed)"],
-        "tmpfs retained canonical-node open count increment",
-    )
-    require_tokens(
-        tmpfs_close,
-        ["node->open_count.fetch_sub(1, std::memory_order_acq_rel)", "f->private_data = nullptr"],
-        "tmpfs close count decrement",
-    )
+def test_tmpfs_open_authorizes_before_side_effects() -> None:
+    core = KERNEL_VFS_CORE_CPP.read_text()
+    tmpfs = (ROOT / "modules/kern/src/vfs/fs/tmpfs.cpp").read_text()
+    backend = function_body(tmpfs, r"auto\s+tmpfs_open_lookup\([^{}]*\)\s*->\s*ker::vfs::File\*")
+    require_order(backend, ["prepare_file_create(credentials,", "authorize_file_open(credentials,", "auto* file = new File;",
+                            "tmpfs_create_file_with_identity(", "tmpfs_resize_locked(node, 0)",
+                            "node->open_count.fetch_add(1, std::memory_order_relaxed)"],
+                  "tmpfs authorizes before creation, truncation and open-count publication")
+    open_body = function_body(core, r"auto\s+vfs_open_resolved_for_task\([^{}]*\)\s*->\s*int")
+    require_tokens(open_body, ["stable_lookup->authorization().credentials", "tmpfs_open_lookup(CREDENTIALS,"],
+                   "tmpfs consumes original snapshot")
+    if "vfs_check_permission_for_task(" in open_body:
+        fail("tmpfs must not reauthorize after publishing or truncating")
+    close = function_body(tmpfs, r"auto\s+tmpfs_fops_close\([^{}]*\)\s*->\s*int")
+    require_tokens(close, ["node->open_count.fetch_sub(1, std::memory_order_acq_rel)", "f->private_data = nullptr"], "tmpfs close")
 
 
 def test_open_exclusive_create_reports_existing_paths() -> None:
@@ -848,34 +813,10 @@ def test_open_exclusive_create_reports_existing_paths() -> None:
         "backend open errno propagation",
     )
 
-    tmpfs_open = function_body(
-        tmpfs,
-        r"auto\s+tmpfs_open_path\(TmpNode\*\s+root,\s*const\s+char\*\s+path,\s*int\s+flags,\s*int\s+mode,\s*int\*\s+result_out\)\s*->\s*ker::vfs::File\*",
-    )
-    tmpfs_open_node = function_body(
-        tmpfs,
-        r"auto\s+tmpfs_open_node_locked\(TmpNode\*\s+entry,\s*int\s+flags,\s*bool\s+require_directory,\s*bool\s+created_by_open,\s*int\*\s+result_out\)\s*->\s*ker::vfs::File\*",
-    )
-    require_order(
-        tmpfs_open,
-        [
-            "tmpfs_lock.lock();",
-            "node != nullptr && !created_by_open && (flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)",
-            "tmpfs_lock.unlock();",
-            "tmpfs_set_open_result(result_out, -EEXIST);",
-            "tmpfs_open_node_locked(node, flags, false, created_by_open, result_out)",
-        ],
-        "tmpfs atomic exclusive create",
-    )
-    require_order(
-        tmpfs_open_node,
-        [
-            "TmpNode* const NODE = tmpfs_canonical_node(entry);",
-            "NODE->open_count.fetch_add(1, std::memory_order_relaxed);",
-            "file->private_data = NODE;",
-        ],
-        "tmpfs exclusive open publishes the validated canonical node",
-    )
+    backend = function_body(tmpfs, r"auto\s+tmpfs_open_lookup\([^{}]*\)\s*->\s*ker::vfs::File\*")
+    require_order(backend, ["MutexGuard guard(tmpfs_lock)", "tmpfs_validate_lookup_locked(handle)",
+                            "(flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)", "return fail(-EEXIST)",
+                            "auto* file = new File;", "file->private_data = node;"], "exclusive create precedes publication")
 
 
 def test_wos_xattr_abi_usercopy_and_export_confinement() -> None:
@@ -983,6 +924,21 @@ def test_wos_xattr_abi_usercopy_and_export_confinement() -> None:
         "syzkaller xattr selector coverage",
     )
 
+def test_directory_refill_errors_reach_callers_without_publishing_indices() -> None:
+    source = (ROOT / "toolchain/src/mlibc/options/posix/generic/dirent.cpp").read_text()
+    ordinary = source[source.index("struct dirent *readdir(DIR *dir)"):source.index("ssize_t posix_getdents(")]
+    reentrant = source[source.index("int readdir_r(DIR *dir"):source.index("void rewinddir(")]
+    for body in (ordinary, reentrant):
+        assert 'mlibc::sys_read_entries() failed' not in body
+        assert 'size_t bytes_read = 0;' in body and '&bytes_read' in body
+        assert '&dir->__ent_limit' not in body
+        assert body.index('ReadEntries>') < body.index('dir->__ent_limit = bytes_read;') < body.index('dir->__ent_next = 0;')
+    assert ordinary.index('errno = e;') < ordinary.index('dir->__ent_limit = bytes_read;')
+    assert ordinary.index('return nullptr;') < ordinary.index('dir->__ent_limit = bytes_read;')
+    assert reentrant.index('*result = nullptr;') < reentrant.index('return e;') < reentrant.index('dir->__ent_limit = bytes_read;')
+    assert 'errno =' not in reentrant
+
+
 if __name__ == "__main__":
     test_kernel_dirent_types_match_mlibc_public_abi()
     test_git_helper_pipe_cloexec_support_is_preserved_by_mlibc()
@@ -997,7 +953,8 @@ if __name__ == "__main__":
     test_kernel_dirfd_resolution_returns_task_visible_paths()
     test_metadata_cache_store_uses_pre_backend_stat_generation()
     test_open_create_uses_central_cache_notify_path()
-    test_tmpfs_permission_denied_open_runs_close_hook()
+    test_tmpfs_open_authorizes_before_side_effects()
     test_open_exclusive_create_reports_existing_paths()
     test_wos_xattr_abi_usercopy_and_export_confinement()
+    test_directory_refill_errors_reach_callers_without_publishing_indices()
     print("WOS mlibc VFS source invariants hold")

@@ -1446,6 +1446,67 @@ def test_wki_auth_provisioning_is_private_pairwise_and_file_backed(module) -> No
                 raise AssertionError("credential bytes leaked into QEMU argv")
 
 
+def test_wki_identity_trust_is_explicit_receiver_policy(module) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        nodes = {
+            node: {"effective": {"vm": {"overlay_dir": str(root / str(node))}}}
+            for node in range(3)
+        }
+        nodes[0]["effective"]["wki_auth"] = {
+            "peer_identity": {"1": "same-domain", "2": "same-domain-root"}
+        }
+        nodes[2]["effective"]["wki_auth"] = {
+            "peer_policy": {"0": 4},
+            "peer_identity": {"0": "same-domain", "1": "deny"},
+        }
+        paths = module.provision_wki_auth(nodes)
+        policies = {}
+        for node, path in paths.items():
+            blob = path.read_bytes()
+            for offset in range(16, len(blob), 44):
+                peer, _key_id, policy = struct.unpack_from("<HHQ", blob, offset)
+                policies[node, peer - 1] = policy
+        assert_equal(policies[0, 1], 1023 | (1 << 10), "explicit nonroot shared namespace")
+        assert_equal(policies[0, 2], 1023 | (1 << 10) | (1 << 11), "explicit root shared namespace")
+        assert_equal(policies[1, 0], 1023, "reverse direction defaults to no identity trust")
+        assert_equal(policies[1, 2], 1023, "missing policy does not grant identity trust")
+        assert_equal(policies[2, 0], 4 | (1 << 10), "identity trust does not grant compute permission")
+        assert_equal(policies[2, 1], 1023, "explicit identity denial")
+
+
+def test_wki_invalid_identity_policy_cannot_partially_replace_credentials(module) -> None:
+    invalid = [
+        None, [], {"unknown": {}}, {"peer_identity": None}, {"peer_identity": []},
+        {"peer_identity": {"0": True}}, {"peer_identity": {"0": []}},
+        {"peer_identity": {"0": "same_domain"}}, {"peer_identity": {"2": "same-domain"}},
+        {"peer_identity": {"99": "same-domain"}}, {"peer_identity": {0: "same-domain"}},
+        {"peer_identity": {"00": "same-domain"}}, {"peer_policy": {"0": True}},
+        {"peer_policy": {"0": 1024}}, {"peer_policy": {"0": 0}}, {"peer_policy": []},
+        {"peer_policy": {"99": 1}},
+    ]
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        first = root / "0" / "wki-auth-vm0.bin"
+        first.parent.mkdir()
+        first.write_bytes(b"unchanged-test-credential")
+        for auth in invalid:
+            nodes = {
+                node: {"effective": {"vm": {"overlay_dir": str(root / str(node))}}}
+                for node in range(3)
+            }
+            nodes[2]["effective"]["wki_auth"] = auth
+            try:
+                module.provision_wki_auth(nodes)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("invalid identity policy was accepted")
+            assert_equal(first.read_bytes(), b"unchanged-test-credential", "prevalidation leaves existing credentials unchanged")
+            if (root / "1").exists() or (root / "2").exists():
+                raise AssertionError("invalid configuration created partial credentials")
+
+
 def main() -> None:
     module = load_module()
     tests = [
@@ -1476,6 +1537,8 @@ def main() -> None:
         test_wait_for_launched_vms_reaps_and_reports_nonzero_nodes,
         test_cluster_main_preserves_vm_exit_error_for_incident,
         test_wki_auth_provisioning_is_private_pairwise_and_file_backed,
+        test_wki_identity_trust_is_explicit_receiver_policy,
+        test_wki_invalid_identity_policy_cannot_partially_replace_credentials,
     ]
     for test in tests:
         test(module)

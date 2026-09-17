@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -11,6 +12,7 @@
 #include <net/netif.hpp>
 #include <net/packet.hpp>
 #include <net/route.hpp>
+#include <net/wki/auth_policy.hpp>
 #include <net/wki/dev_proxy.hpp>
 #include <net/wki/dev_server.hpp>
 #include <net/wki/remotable.hpp>
@@ -20,6 +22,8 @@
 #include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <platform/security/authorization.hpp>
+#include <platform/security/credential_record.hpp>
 #include <util/hcf.hpp>
 
 #include "platform/sys/spinlock.hpp"
@@ -155,6 +159,7 @@ auto net_stats_poll_owns_slot(ProxyNetState const* state) -> bool {
 
 void clear_net_op_state_locked(ProxyNetState* state, int status) {
     state->op_status = static_cast<int16_t>(status);
+    state->op_completion = nullptr;
     state->op_expected_id = 0;
     state->op_expected_seq = 0;
     state->op_deadline_us = 0;
@@ -307,6 +312,10 @@ auto acquire_net_proxy_by_attach(uint16_t owner_node, uint32_t resource_id, uint
     return state;
 }
 
+// The caller has already fenced new proxy operations. An in-flight control
+// owns its field writes until finish_control; its completion must publish DOWN.
+void publish_retiring_net_state(ProxyNetState* state) { ker::net::netdev_mark_control_retiring(&state->netdev); }
+
 auto try_retire_net_proxy_locked(ProxyNetState* state) -> bool {
     if (state == nullptr || state->retiring.exchange(true, std::memory_order_acq_rel)) {
         return false;
@@ -314,7 +323,7 @@ auto try_retire_net_proxy_locked(ProxyNetState* state) -> bool {
     state->active = false;
     state->attaching = false;
     state->cleanup_started = true;
-    state->netdev.state = 0;
+    publish_retiring_net_state(state);
     return true;
 }
 
@@ -420,8 +429,8 @@ void finish_or_wait_for_cancelled_waiter(WkiWaitEntry& wait, bool claimed, int r
     }
 }
 
-auto prepare_net_op_wait(ProxyNetState* state, uint16_t op_id, WkiWaitEntry& wait, void* resp_buf, uint16_t resp_max, uint64_t timeout_us,
-                         uint16_t* cookie_out) -> int {
+auto prepare_net_op_wait(ProxyNetState* state, uint16_t op_id, NetOpCompletion& completion, void* resp_buf, uint16_t resp_max,
+                         uint64_t timeout_us, uint16_t* cookie_out) -> int {
     int const SLOT_RET = acquire_net_op_slot_locked(state, wki_now_us());
     if (SLOT_RET != WKI_OK) {
         return SLOT_RET;
@@ -429,6 +438,10 @@ auto prepare_net_op_wait(ProxyNetState* state, uint16_t op_id, WkiWaitEntry& wai
 
     uint16_t const COOKIE = allocate_net_op_cookie_locked(state);
 
+    auto& wait = completion.wait;
+    completion.status = 0;
+    completion.response_length = 0;
+    state->op_completion = &completion;
     state->op_wait_entry = &wait;
     state->op_expected_id = op_id;
     state->op_expected_seq = COOKIE;
@@ -445,14 +458,39 @@ auto prepare_net_op_wait(ProxyNetState* state, uint16_t op_id, WkiWaitEntry& wai
     return WKI_OK;
 }
 
-void consume_net_op_result(ProxyNetState* state, WkiWaitEntry& wait, int* status_out, uint16_t* resp_len_out) {
-    state->lock.lock();
-    if (state->op_wait_entry == &wait) {
-        state->op_wait_entry = nullptr;
+// Caller holds ProxyNetState::lock; wake the returned waiter after unlocking.
+auto publish_net_op_response_locked(ProxyNetState* state, const DevOpRespPayload& response, const uint8_t* data) -> WkiWaitEntry* {
+    auto* completion = state->op_completion;
+    // A duplicate reply after the first writer detached the waiter cannot
+    // replace its result or release the still-owned operation slot.
+    if (completion == nullptr || state->op_wait_entry != &completion->wait) return nullptr;
+    auto* wait_entry = claim_and_clear_waiter_locked(state->op_wait_entry);
+    if (wait_entry == nullptr) {
+        clear_net_op_state_locked(state, response.status);
+        return nullptr;
     }
-    int const STATUS = static_cast<int>(state->op_status);
-    uint16_t const RESP_LEN = state->op_resp_len;
-    clear_net_op_state_locked(state, STATUS);
+    completion->status = response.status;
+    state->op_status = response.status;
+    if (response.data_len > 0 && state->op_resp_buf != nullptr) {
+        uint16_t const COPY_LEN = (response.data_len > state->op_resp_max) ? state->op_resp_max : response.data_len;
+        memcpy(state->op_resp_buf, data, COPY_LEN);
+        state->op_resp_len = COPY_LEN;
+    } else {
+        state->op_resp_len = 0;
+    }
+    completion->response_length = state->op_resp_len;
+    return wait_entry;
+}
+
+// Caller has observed successful wait completion (acquire of wait.DONE).
+void consume_net_op_result(ProxyNetState* state, NetOpCompletion& completion, int* status_out, uint16_t* resp_len_out) {
+    int const STATUS = completion.status;
+    uint16_t const RESP_LEN = completion.response_length;
+    state->lock.lock();
+    if (state->op_completion == &completion) {
+        state->op_wait_entry = nullptr;
+        clear_net_op_state_locked(state, STATUS);
+    }
     state->lock.unlock();
 
     if (status_out != nullptr) {
@@ -466,7 +504,7 @@ void consume_net_op_result(ProxyNetState* state, WkiWaitEntry& wait, int* status
 void cancel_op_waiter(ProxyNetState* state, WkiWaitEntry& wait, int result) {
     bool claimed = false;
     state->lock.lock();
-    if (state->op_wait_entry == &wait) {
+    if (state->op_wait_entry == &wait || (state->op_completion != nullptr && &state->op_completion->wait == &wait)) {
         state->op_wait_entry = nullptr;
         clear_net_op_state_locked(state, result);
     }
@@ -625,22 +663,53 @@ auto send_or_defer_net_detach(ProxyNetState* state, uint16_t owner_node, uint32_
     return STAGED ? WKI_OK : WKI_ERR_BUSY;
 }
 
-void apply_owner_net_state(ProxyNetState* state, const NetStateNotifyPayload& notify, const NetIpv6StateSuffix& ipv6) {
-    if (state == nullptr) {
-        return;
-    }
+// Caller holds control_publication_lock, then ProxyNetState::lock.
+void publish_owner_link_state_locked(ProxyNetState* state) {
+    state->netdev.state = static_cast<uint8_t>(state->owner_link_state != 0 ? 1 : 0);
+    if (state->owner_mtu_pending) state->netdev.mtu = state->owner_mtu;
+    state->owner_state_pending = false;
+    state->owner_mtu_pending = false;
+}
 
+void apply_owner_net_state(ProxyNetState* state, const NetStateNotifyPayload& notify, const NetIpv6StateSuffix& ipv6) {
+    if (state == nullptr || state->retiring.load(std::memory_order_acquire)) return;
     state->owner_ipv4_addr = notify.ipv4_addr;
     state->owner_ipv4_mask = notify.ipv4_mask;
     state->owner_real_mac = notify.real_mac;
     state->owner_link_state = notify.link_state;
     state->owner_mtu = notify.mtu != 0 ? notify.mtu : state->owner_mtu;
     state->owner_ipv6 = ipv6;
+    state->owner_state_pending = true;
+    state->owner_mtu_pending |= notify.mtu != 0;
+    if (!state->netdev.control_busy.load(std::memory_order_acquire)) publish_owner_link_state_locked(state);
+}
 
-    state->netdev.state = static_cast<uint8_t>(state->owner_link_state != 0 ? 1 : 0);
-    if (notify.mtu != 0) {
-        state->netdev.mtu = notify.mtu;
+// The caller owns a proxy reference or unpublished test storage.
+auto snapshot_owner_l3(ProxyNetState* state) -> WkiRemoteNetOwnerL3Snapshot {
+    if (state == nullptr) return {};
+    WkiRemoteNetOwnerL3Snapshot snapshot{};
+    uint64_t const FLAGS = state->lock.lock_irqsave();
+    if (!state->retiring.load(std::memory_order_acquire)) {
+        snapshot = {.valid = true, .ipv4_addr = state->owner_ipv4_addr, .ipv4_mask = state->owner_ipv4_mask, .ipv6 = state->owner_ipv6};
     }
+    state->lock.unlock_irqrestore(FLAGS);
+    return snapshot;
+}
+
+// NetDeviceControlGuard holds control_publication_lock. No notification can
+// enter between this flush and release of control_busy, or across acquisition.
+void proxy_net_finish_control(ker::net::NetDevice* dev) {
+    auto* state = static_cast<ProxyNetState*>(dev->private_data);
+    if (state == nullptr) return;
+    state->lock.lock();
+    if (state->retiring.load(std::memory_order_acquire)) {
+        dev->state = 0;
+        state->owner_state_pending = false;
+        state->owner_mtu_pending = false;
+    } else if (state->owner_state_pending) {
+        publish_owner_link_state_locked(state);
+    }
+    state->lock.unlock();
 }
 
 // Caller must hold ProxyNetState::lock.
@@ -675,32 +744,95 @@ auto consume_net_rx_credit_locked(ProxyNetState* state) -> uint16_t {
 // Consumer-side NetDeviceOps
 // -----------------------------------------------------------------------------
 
-auto proxy_net_open(ker::net::NetDevice* dev) -> int {
-    auto* state = acquire_net_proxy_by_dev(dev);
-    if (state == nullptr) {
-        return -1;
+// WKI transport codes overlap POSIX errno values. Only transport-domain
+// preparation/send/wait results enter here; an owner's errno passes through.
+auto net_open_transport_errno(int status) -> int {
+    switch (status) {
+        case WKI_OK:
+            return 0;
+        case WKI_ERR_NO_MEM:
+            return -ENOMEM;
+        case WKI_ERR_NO_ROUTE:
+        case WKI_ERR_NOT_FOUND:
+            return -EHOSTUNREACH;
+        case WKI_ERR_PEER_FENCED:
+            return -ENOTCONN;
+        case WKI_ERR_NO_CREDITS:
+        case WKI_ERR_BUSY:
+            return -EAGAIN;
+        case WKI_ERR_TIMEOUT:
+            return -ETIMEDOUT;
+        case WKI_ERR_INVALID:
+            return -EINVAL;
+        case WKI_ERR_TX_FAILED:
+        default:
+            return -EIO;
     }
+}
 
-    WkiWaitEntry wait = {};
+// Retry only failures before reliable sequence publication. WKI_OK transfers
+// retransmit ownership even when the initial transport attempt failed.
+constexpr uint64_t NET_CONTROL_SEND_RETRY_US = 100'000;
+
+auto net_control_send_retryable(int status) -> bool {
+    return status == WKI_ERR_NO_ROUTE || status == WKI_ERR_NO_CREDITS || status == WKI_ERR_NO_MEM || status == WKI_ERR_NOT_FOUND ||
+           status == WKI_ERR_BUSY;
+}
+
+template <typename Send, typename Live, typename Pause, typename Now>
+auto retry_net_control_send(uint64_t deadline, Send&& send, Live&& live, Pause&& pause, Now&& now) -> int {
+    int status = send();
+    while (net_control_send_retryable(status) && now() < deadline && live()) {
+        pause();
+        // Retirement can wait for our retained reference. Do not wait for its
+        // lifecycle writer, nor send on a replacement after dropping ownership.
+        if (now() >= deadline || !live()) break;
+        status = send();
+    }
+    return status;
+}
+
+// Task context only. The caller retains the proxy/binding and the complete
+// request or completed response bytes until this bounded admission finishes.
+auto send_net_control(const WkiChannelIdentity& identity, MsgType type, const void* bytes, uint16_t size, const std::atomic<bool>* retiring)
+    -> int {
+    uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us(), NET_CONTROL_SEND_RETRY_US);
+    return retry_net_control_send(
+        DEADLINE, [&] { return wki_send_on_channel_identity(identity, type, bytes, size); },
+        [&] {
+            return retiring != nullptr && !retiring->load(std::memory_order_acquire) &&
+                   wki_channel_generation_is_live(identity.channel, identity.peer_node_id, identity.channel_id, identity.generation);
+        },
+        [] { ker::mod::sched::kern_sleep_us(NET_PROXY_CONTENTION_SLEEP_US); }, [] { return wki_now_us(); });
+}
+
+// The caller retains this proxy for the entire synchronous operation.
+auto open_retained_net_proxy(ProxyNetState* state, const ker::mod::security::Snapshot& caller) -> int {
+    if (!state->open_identity_supported || state->max_op_size < WKI_NET_OPEN_IDENTITY_SIZE) return -ENOTSUP;
+    auto* dev = &state->netdev;
+    NetOpCompletion completion{};
+    auto& wait = completion.wait;
     uint16_t op_cookie = 0;
-    int const PREP_RET = prepare_net_op_wait(state, OP_NET_OPEN, wait, nullptr, 0, WKI_OP_TIMEOUT_US, &op_cookie);
+    int const PREP_RET = prepare_net_op_wait(state, OP_NET_OPEN_AS, completion, nullptr, 0, WKI_OP_TIMEOUT_US, &op_cookie);
     if (PREP_RET != WKI_OK) {
-        release_net_proxy(state);
-        return -1;
+        return net_open_transport_errno(PREP_RET);
     }
 
-    std::array<uint8_t, sizeof(DevOpReqPayload) + NET_OP_COOKIE_BYTES> req_buf{};
+    static_assert(WKI_NET_OPEN_CALLER_SIZE == ker::mod::security::credential_record::SIZE);
+    std::array<uint8_t, sizeof(DevOpReqPayload) + WKI_NET_OPEN_IDENTITY_SIZE> req_buf{};
     auto* req = reinterpret_cast<DevOpReqPayload*>(req_buf.data());
-    req->op_id = OP_NET_OPEN;
-    req->data_len = NET_OP_COOKIE_BYTES;
-    write_net_op_cookie(req_buf.data() + sizeof(DevOpReqPayload), op_cookie);
+    req->op_id = OP_NET_OPEN_AS;
+    req->data_len = WKI_NET_OPEN_IDENTITY_SIZE;
+    NetOpenIdentityHeader const HEADER{.cookie = op_cookie, .version = WKI_NET_OPEN_IDENTITY_VERSION};
+    auto const RECORD = ker::mod::security::credential_record::encode(caller);
+    std::memcpy(req_buf.data() + sizeof(DevOpReqPayload), &HEADER, sizeof(HEADER));
+    std::memcpy(req_buf.data() + sizeof(DevOpReqPayload) + sizeof(HEADER), RECORD.data(), RECORD.size());
 
-    int const SEND_RET =
-        wki_send_on_channel_identity(state->channel_identity, MsgType::DEV_OP_REQ, req_buf.data(), static_cast<uint16_t>(req_buf.size()));
+    int const SEND_RET = send_net_control(state->channel_identity, MsgType::DEV_OP_REQ, req_buf.data(),
+                                          static_cast<uint16_t>(req_buf.size()), &state->retiring);
     if (SEND_RET != WKI_OK) {
         cancel_op_waiter(state, wait, SEND_RET);
-        release_net_proxy(state);
-        return -1;
+        return net_open_transport_errno(SEND_RET);
     }
 
     int const WAIT_RC = wki_wait_for_op(&wait, WKI_OP_TIMEOUT_US);
@@ -711,12 +843,11 @@ auto proxy_net_open(ker::net::NetDevice* dev) -> int {
         } else {
             ker::mod::dbg::log("[WKI] proxy_net_open aborted: node=0x%04x err=%d", state->owner_node, WAIT_RC);
         }
-        release_net_proxy(state);
-        return -1;
+        return net_open_transport_errno(WAIT_RC);
     }
 
     int op_status = 0;
-    consume_net_op_result(state, wait, &op_status, nullptr);
+    consume_net_op_result(state, completion, &op_status, nullptr);
     if (op_status == 0) {
         dev->state = 1;
 
@@ -734,55 +865,67 @@ auto proxy_net_open(ker::net::NetDevice* dev) -> int {
 
         ker::mod::dbg::log("[WKI] proxy_net_open success: %s", dev->name.data());
     }
-    release_net_proxy(state);
     return op_status;
 }
 
-void proxy_net_close(ker::net::NetDevice* dev) {
+auto proxy_net_open(ker::net::NetDevice*) -> int { return -ENOTSUP; }
+
+auto proxy_net_open_as(ker::net::NetDevice* dev, const ker::mod::security::Snapshot& caller) -> int {
+    int const AUTHORIZATION = ker::mod::security::authorize_network_administration(caller);
+    if (AUTHORIZATION != 0) return AUTHORIZATION;
     auto* state = acquire_net_proxy_by_dev(dev);
     if (state == nullptr) {
-        return;
+        return -ENODEV;
     }
+    int const STATUS = open_retained_net_proxy(state, caller);
+    release_net_proxy(state);
+    return STATUS;
+}
 
-    WkiWaitEntry wait = {};
+// Callerless remote control cannot acquire owner device authority.
+void proxy_net_close(ker::net::NetDevice*) {}
+
+auto close_retained_net_proxy(ProxyNetState* state, const ker::mod::security::Snapshot& caller) -> int {
+    if (!state->close_identity_supported || state->max_op_size < WKI_NET_CLOSE_IDENTITY_SIZE) return -ENOTSUP;
+    NetOpCompletion completion{};
+    auto& wait = completion.wait;
     uint16_t op_cookie = 0;
-    int const PREP_RET = prepare_net_op_wait(state, OP_NET_CLOSE, wait, nullptr, 0, WKI_OP_TIMEOUT_US, &op_cookie);
-    if (PREP_RET != WKI_OK) {
-        dev->state = 0;
-        release_net_proxy(state);
-        return;
-    }
+    int const PREP_RET = prepare_net_op_wait(state, OP_NET_CLOSE_AS, completion, nullptr, 0, WKI_OP_TIMEOUT_US, &op_cookie);
+    if (PREP_RET != WKI_OK) return net_open_transport_errno(PREP_RET);
 
-    std::array<uint8_t, sizeof(DevOpReqPayload) + NET_OP_COOKIE_BYTES> req_buf{};
+    std::array<uint8_t, sizeof(DevOpReqPayload) + WKI_NET_CLOSE_IDENTITY_SIZE> req_buf{};
     auto* req = reinterpret_cast<DevOpReqPayload*>(req_buf.data());
-    req->op_id = OP_NET_CLOSE;
-    req->data_len = NET_OP_COOKIE_BYTES;
-    write_net_op_cookie(req_buf.data() + sizeof(DevOpReqPayload), op_cookie);
-
-    int const SEND_RET =
-        wki_send_on_channel_identity(state->channel_identity, MsgType::DEV_OP_REQ, req_buf.data(), static_cast<uint16_t>(req_buf.size()));
+    req->op_id = OP_NET_CLOSE_AS;
+    req->data_len = WKI_NET_CLOSE_IDENTITY_SIZE;
+    NetCloseIdentityHeader const HEADER{.cookie = op_cookie, .version = WKI_NET_CLOSE_IDENTITY_VERSION};
+    auto const RECORD = ker::mod::security::credential_record::encode(caller);
+    std::memcpy(req_buf.data() + sizeof(DevOpReqPayload), &HEADER, sizeof(HEADER));
+    std::memcpy(req_buf.data() + sizeof(DevOpReqPayload) + sizeof(HEADER), RECORD.data(), RECORD.size());
+    int const SEND_RET = send_net_control(state->channel_identity, MsgType::DEV_OP_REQ, req_buf.data(),
+                                          static_cast<uint16_t>(req_buf.size()), &state->retiring);
     if (SEND_RET != WKI_OK) {
         cancel_op_waiter(state, wait, SEND_RET);
-        dev->state = 0;
-        release_net_proxy(state);
-        return;
+        return net_open_transport_errno(SEND_RET);
     }
-
     int const WAIT_RC = wki_wait_for_op(&wait, WKI_OP_TIMEOUT_US);
     if (WAIT_RC != 0) {
         cancel_op_waiter(state, wait, WAIT_RC);
-        if (WAIT_RC == WKI_ERR_TIMEOUT) {
-            ker::mod::dbg::log("[WKI] proxy_net_close timeout: node=0x%04x", state->owner_node);
-        } else {
-            ker::mod::dbg::log("[WKI] proxy_net_close aborted: node=0x%04x err=%d", state->owner_node, WAIT_RC);
-        }
-    } else {
-        consume_net_op_result(state, wait, nullptr, nullptr);
+        return net_open_transport_errno(WAIT_RC);
     }
+    int op_status = 0;
+    consume_net_op_result(state, completion, &op_status, nullptr);
+    if (op_status == 0) state->netdev.state = 0;
+    return op_status;
+}
 
-    dev->state = 0;
-    ker::mod::dbg::log("[WKI] proxy_net_close: %s", dev->name.data());
+auto proxy_net_close_as(ker::net::NetDevice* dev, const ker::mod::security::Snapshot& caller) -> int {
+    int const AUTHORIZATION = ker::mod::security::authorize_network_administration(caller);
+    if (AUTHORIZATION != 0) return AUTHORIZATION;
+    auto* state = acquire_net_proxy_by_dev(dev);
+    if (state == nullptr) return -ENODEV;
+    int const STATUS = close_retained_net_proxy(state, caller);
     release_net_proxy(state);
+    return STATUS;
 }
 
 auto proxy_net_xmit(ker::net::NetDevice* dev, ker::net::PacketBuffer* pkt) -> int {
@@ -835,59 +978,70 @@ auto proxy_net_xmit(ker::net::NetDevice* dev, ker::net::PacketBuffer* pkt) -> in
     return (SEND_RET == WKI_OK) ? 0 : -1;
 }
 
-void proxy_net_set_mac(ker::net::NetDevice* dev, const uint8_t* mac) {
-    auto* state = acquire_net_proxy_by_dev(dev);
-    if (state == nullptr || mac == nullptr) {
-        release_net_proxy(state);
-        return;
-    }
+void proxy_net_set_mac(ker::net::NetDevice*, const uint8_t*) {}
 
-    WkiWaitEntry wait = {};
-    uint16_t op_cookie = 0;
-    int const PREP_RET = prepare_net_op_wait(state, OP_NET_SET_MAC, wait, nullptr, 0, WKI_DEV_PROXY_TIMEOUT_US, &op_cookie);
-    if (PREP_RET != WKI_OK) {
-        release_net_proxy(state);
-        return;
-    }
-
-    constexpr uint16_t MAC_LEN = 6;
-    auto req_total = static_cast<uint16_t>(sizeof(DevOpReqPayload) + NET_OP_COOKIE_BYTES + MAC_LEN);
-    std::array<uint8_t, sizeof(DevOpReqPayload) + NET_OP_COOKIE_BYTES + MAC_LEN> req_buf{};
-
-    auto* req = reinterpret_cast<DevOpReqPayload*>(req_buf.data());
-    req->op_id = OP_NET_SET_MAC;
-    req->data_len = NET_OP_COOKIE_BYTES + MAC_LEN;
-    write_net_op_cookie(req_buf.data() + sizeof(DevOpReqPayload), op_cookie);
-    memcpy(req_buf.data() + sizeof(DevOpReqPayload) + NET_OP_COOKIE_BYTES, mac, MAC_LEN);
-
-    int const SEND_RET = wki_send_on_channel_identity(state->channel_identity, MsgType::DEV_OP_REQ, req_buf.data(), req_total);
-
+auto apply_retained_net_link(ProxyNetState* state, const ker::net::NetDeviceLinkControl& control,
+                             const ker::mod::security::Snapshot& caller) -> int {
+    if (!state->link_identity_supported || state->max_op_size < WKI_NET_LINK_IDENTITY_SIZE) return -ENOTSUP;
+    NetOpCompletion completion{};
+    auto& wait = completion.wait;
+    uint16_t cookie = 0;
+    int const PREP_RET = prepare_net_op_wait(state, OP_NET_LINK_AS, completion, nullptr, 0, WKI_OP_TIMEOUT_US, &cookie);
+    if (PREP_RET != WKI_OK) return net_open_transport_errno(PREP_RET);
+    std::array<uint8_t, sizeof(DevOpReqPayload) + WKI_NET_LINK_IDENTITY_SIZE> bytes{};
+    DevOpReqPayload const REQUEST{.op_id = OP_NET_LINK_AS, .data_len = WKI_NET_LINK_IDENTITY_SIZE};
+    NetOpenIdentityHeader const HEADER{.cookie = cookie, .version = WKI_NET_OPEN_IDENTITY_VERSION};
+    auto const RECORD = ker::mod::security::credential_record::encode(caller);
+    NetLinkControlPayload payload{};
+    payload.fields = (control.change_state ? WKI_NET_LINK_STATE : 0) | (control.change_mac ? WKI_NET_LINK_MAC : 0);
+    payload.up = control.change_state && control.up ? 1 : 0;
+    if (control.change_mac) std::copy(control.mac.begin(), control.mac.end(), payload.mac);
+    std::memcpy(bytes.data(), &REQUEST, sizeof(REQUEST));
+    std::memcpy(bytes.data() + sizeof(REQUEST), &HEADER, sizeof(HEADER));
+    std::memcpy(bytes.data() + sizeof(REQUEST) + sizeof(HEADER), RECORD.data(), RECORD.size());
+    std::memcpy(bytes.data() + sizeof(REQUEST) + WKI_NET_OPEN_IDENTITY_SIZE, &payload, sizeof(payload));
+    int const SEND_RET = send_net_control(state->channel_identity, MsgType::DEV_OP_REQ, bytes.data(), bytes.size(), &state->retiring);
     if (SEND_RET != WKI_OK) {
         cancel_op_waiter(state, wait, SEND_RET);
-        release_net_proxy(state);
-        return;
+        return net_open_transport_errno(SEND_RET);
     }
-
-    int const WAIT_RC = wki_wait_for_op(&wait, WKI_DEV_PROXY_TIMEOUT_US);
+    int const WAIT_RC = wki_wait_for_op(&wait, WKI_OP_TIMEOUT_US);
     if (WAIT_RC != 0) {
         cancel_op_waiter(state, wait, WAIT_RC);
-        if (WAIT_RC == WKI_ERR_TIMEOUT) {
-            ker::mod::dbg::log("[WKI] proxy_net_set_mac timeout: node=0x%04x", state->owner_node);
-        } else {
-            ker::mod::dbg::log("[WKI] proxy_net_set_mac aborted: node=0x%04x err=%d", state->owner_node, WAIT_RC);
+        return net_open_transport_errno(WAIT_RC);
+    }
+    int status = 0;
+    consume_net_op_result(state, completion, &status, nullptr);
+    if (status == 0) {
+        if (control.change_state) state->netdev.state = control.up ? 1 : 0;
+        if (control.change_mac) std::copy(control.mac.begin(), control.mac.end(), state->netdev.mac.bytes.begin());
+        if (control.change_state && control.up) {
+            // V2: Send initial RX credit grant to server
+            state->lock.lock();
+            uint16_t const INITIAL_CREDITS = set_net_rx_credits_locked(state, WKI_NET_RX_CREDITS);
+            state->lock.unlock();
+            std::array<uint8_t, sizeof(DevOpReqPayload) + sizeof(uint16_t)> credit_buf{};
+            auto* credit_req = reinterpret_cast<DevOpReqPayload*>(credit_buf.data());
+            credit_req->op_id = OP_NET_RX_CREDIT;
+            credit_req->data_len = sizeof(uint16_t);
+            memcpy(credit_buf.data() + sizeof(DevOpReqPayload), &INITIAL_CREDITS, sizeof(uint16_t));
+            static_cast<void>(wki_send_on_channel_identity(state->channel_identity, MsgType::DEV_OP_REQ, credit_buf.data(),
+                                                           static_cast<uint16_t>(sizeof(DevOpReqPayload) + sizeof(uint16_t))));
         }
-        release_net_proxy(state);
-        return;
     }
+    return status;
+}
 
-    int op_status = 0;
-    consume_net_op_result(state, wait, &op_status, nullptr);
-
-    // Update local MAC on success
-    if (op_status == 0) {
-        memcpy(dev->mac.data(), mac, 6);
-    }
+auto proxy_net_apply_link_as(ker::net::NetDevice* dev, const ker::net::NetDeviceLinkControl& control,
+                             const ker::mod::security::Snapshot& caller) -> int {
+    int const AUTHORIZATION = ker::mod::security::authorize_network_administration(caller);
+    if (AUTHORIZATION != 0) return AUTHORIZATION;
+    if (!control.change_state && !control.change_mac) return -EINVAL;
+    auto* state = acquire_net_proxy_by_dev(dev);
+    if (state == nullptr) return -ENODEV;
+    int const STATUS = apply_retained_net_link(state, control, caller);
     release_net_proxy(state);
+    return STATUS;
 }
 
 // Static NetDeviceOps for proxy NIC
@@ -897,13 +1051,102 @@ const ker::net::NetDeviceOps G_PROXY_NET_OPS = {
     .start_xmit = proxy_net_xmit,
     .set_mac = proxy_net_set_mac,
     .set_queue_cpu = nullptr,
+    .open_as = proxy_net_open_as,
+    .close_as = proxy_net_close_as,
+    .apply_link_as = proxy_net_apply_link_as,
+    .finish_control = proxy_net_finish_control,
 };
 
+}  // namespace
+
+namespace {
+auto net_control_caller_status(const uint8_t* data, uint16_t data_len, uint64_t identity_policy) -> int {
+    using namespace ker::mod::security;
+    if (data == nullptr || data_len != WKI_NET_OPEN_IDENTITY_SIZE) return -EINVAL;
+    NetOpenIdentityHeader header{};
+    std::memcpy(&header, data, sizeof(header));
+    if (header.version != WKI_NET_OPEN_IDENTITY_VERSION) return -ENOTSUP;
+    if (header.cookie == 0 || header.reserved != 0) return -EINVAL;
+    Snapshot supplied, mapped;
+    int status = credential_record::decode({data + sizeof(header), credential_record::SIZE}, supplied);
+    if (status == 0) status = auth_policy::map_net_control_identity(identity_policy, supplied, mapped);
+    if (status == 0) status = authorize_network_administration(mapped);
+    return status;
+}
+
+auto apply_net_link_as(ker::net::NetDevice* dev, const uint8_t* data, uint16_t data_len, uint64_t policy,
+                       ker::net::NetDeviceControlGuard& control_guard) -> int {
+    if (data == nullptr || data_len != WKI_NET_LINK_IDENTITY_SIZE) return -EINVAL;
+    NetLinkControlPayload control{};
+    std::memcpy(&control, data + WKI_NET_OPEN_IDENTITY_SIZE, sizeof(control));
+    bool const HAS_STATE = (control.fields & WKI_NET_LINK_STATE) != 0;
+    bool const HAS_MAC = (control.fields & WKI_NET_LINK_MAC) != 0;
+    if (control.fields == 0 || (control.fields & ~(WKI_NET_LINK_STATE | WKI_NET_LINK_MAC)) != 0 || control.reserved != 0 ||
+        control.reserved_tail != 0 || control.up > 1 || (!HAS_STATE && control.up != 0))
+        return -EINVAL;
+    if (!HAS_MAC && std::any_of(std::begin(control.mac), std::end(control.mac), [](uint8_t byte) { return byte != 0; })) return -EINVAL;
+    int status = net_control_caller_status(data, WKI_NET_OPEN_IDENTITY_SIZE, policy);
+    if (status != 0) return status;
+    if (dev == nullptr) return -ENOTCONN;
+    int const CONTROL_ADMISSION = control_guard.try_acquire(dev);
+    if (CONTROL_ADMISSION != 0) return CONTROL_ADMISSION;
+    if (HAS_MAC) {
+        status = ker::net::netdev_check_mac(dev, control.mac);
+        if (status != 0) return status;
+    }
+    // Native MAC commit cannot refuse after admission. Perform the only
+    // fallible driver phase first, before state or MAC publication.
+    if (HAS_STATE) {
+        if (control.up != 0) {
+            if (dev->ops != nullptr && dev->ops->open != nullptr) status = dev->ops->open(dev);
+            if (status != 0) return status < 0 ? status : -EIO;
+        } else if (dev->ops != nullptr && dev->ops->close != nullptr)
+            dev->ops->close(dev);
+        dev->state = control.up != 0 ? 1 : 0;
+    }
+    if (HAS_MAC && !std::equal(dev->mac.bytes.begin(), dev->mac.bytes.end(), control.mac)) {
+        if (dev->ops != nullptr && dev->ops->set_mac != nullptr)
+            dev->ops->set_mac(dev, control.mac);
+        else
+            std::copy_n(control.mac, 6, dev->mac.data());
+    }
+    return 0;
+}
+
+auto close_net_device_as(ker::net::NetDevice* dev, const uint8_t* data, uint16_t data_len, uint64_t identity_policy,
+                         ker::net::NetDeviceControlGuard& control_guard) -> int {
+    int const STATUS = net_control_caller_status(data, data_len, identity_policy);
+    if (STATUS != 0) return STATUS;
+    if (dev == nullptr) return -ENOTCONN;
+    int const CONTROL_ADMISSION = control_guard.try_acquire(dev);
+    if (CONTROL_ADMISSION != 0) return CONTROL_ADMISSION;
+    if (dev->ops != nullptr && dev->ops->close != nullptr) dev->ops->close(dev);
+    dev->state = 0;
+    return 0;
+}
+
+auto open_net_device_as(ker::net::NetDevice* dev, const uint8_t* data, uint16_t data_len, uint64_t identity_policy,
+                        ker::net::NetDeviceControlGuard& control_guard) -> int {
+    int status = net_control_caller_status(data, data_len, identity_policy);
+    if (status != 0) return status;
+    if (dev == nullptr) return -ENOTCONN;
+    int const CONTROL_ADMISSION = control_guard.try_acquire(dev);
+    if (CONTROL_ADMISSION != 0) return CONTROL_ADMISSION;
+    if (dev->ops != nullptr && dev->ops->open != nullptr) status = dev->ops->open(dev);
+    return status <= 0 ? status : -EIO;
+}
 }  // namespace
 
 // -------------------------------------------------------------------------------
 // Init
 // -------------------------------------------------------------------------------
+
+auto wki_remote_net_owner_l3_snapshot(net::NetDevice* proxy_dev) -> WkiRemoteNetOwnerL3Snapshot {
+    auto* state = acquire_net_proxy_by_dev(proxy_dev);
+    auto const SNAPSHOT = snapshot_owner_l3(state);
+    release_net_proxy(state);
+    return SNAPSHOT;
+}
 
 void wki_remote_net_init() {
     if (g_remote_net_initialized) {
@@ -968,6 +1211,56 @@ void wki_remote_net_process_pending_detaches() {
 
 namespace detail {
 
+void handle_net_link_as(const WkiChannelIdentity& channel_identity, ker::net::NetDevice* net_dev, const uint8_t* data, uint16_t data_len,
+                        uint64_t identity_policy, const std::atomic<bool>* binding_retiring) {
+    ker::net::NetDeviceControlGuard control_guard;
+    int const STATUS = apply_net_link_as(net_dev, data, data_len, identity_policy, control_guard);
+    if (STATUS == 0) {
+        NetLinkControlPayload control{};
+        std::memcpy(&control, data + WKI_NET_OPEN_IDENTITY_SIZE, sizeof(control));
+        if ((control.fields & WKI_NET_LINK_STATE) != 0) wki_dev_server_mark_net_opened(channel_identity, net_dev, control.up != 0);
+        wki_dev_server_notify_net_changed(net_dev);
+    }
+    control_guard.finish();
+    DevOpRespPayload response{};
+    response.op_id = OP_NET_LINK_AS;
+    response.status = static_cast<int16_t>(STATUS);
+    response.reserved = read_net_op_cookie(data, data_len, 0);
+    static_cast<void>(send_net_control(channel_identity, MsgType::DEV_OP_RESP, &response, sizeof(response), binding_retiring));
+}
+
+void handle_net_close_as(const WkiChannelIdentity& channel_identity, ker::net::NetDevice* net_dev, const uint8_t* data, uint16_t data_len,
+                         uint64_t identity_policy, const std::atomic<bool>* binding_retiring) {
+    ker::net::NetDeviceControlGuard control_guard;
+    int const STATUS = close_net_device_as(net_dev, data, data_len, identity_policy, control_guard);
+    if (STATUS == 0) {
+        wki_dev_server_mark_net_opened(channel_identity, net_dev, false);
+        wki_dev_server_notify_net_changed(net_dev);
+    }
+    control_guard.finish();
+    DevOpRespPayload response{};
+    response.op_id = OP_NET_CLOSE_AS;
+    response.status = static_cast<int16_t>(STATUS);
+    response.reserved = read_net_op_cookie(data, data_len, 0);
+    static_cast<void>(send_net_control(channel_identity, MsgType::DEV_OP_RESP, &response, sizeof(response), binding_retiring));
+}
+
+void handle_net_open_as(const WkiChannelIdentity& channel_identity, ker::net::NetDevice* net_dev, const uint8_t* data, uint16_t data_len,
+                        uint64_t identity_policy, const std::atomic<bool>* binding_retiring) {
+    ker::net::NetDeviceControlGuard control_guard;
+    int const STATUS = open_net_device_as(net_dev, data, data_len, identity_policy, control_guard);
+    if (STATUS == 0) {
+        wki_dev_server_mark_net_opened(channel_identity, net_dev, true);
+        wki_dev_server_notify_net_changed(net_dev);
+    }
+    control_guard.finish();
+    DevOpRespPayload response{};
+    response.op_id = OP_NET_OPEN_AS;
+    response.status = static_cast<int16_t>(STATUS);
+    response.reserved = read_net_op_cookie(data, data_len, 0);
+    static_cast<void>(send_net_control(channel_identity, MsgType::DEV_OP_RESP, &response, sizeof(response), binding_retiring));
+}
+
 void handle_net_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_identity, ker::net::NetDevice* net_dev, uint16_t op_id,
                    const uint8_t* data, uint16_t data_len) {
     if (net_dev == nullptr || !net_channel_identity_matches_header(hdr, channel_identity)) {
@@ -1007,43 +1300,11 @@ void handle_net_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
         }
 
         case OP_NET_SET_MAC: {
-            // Request: legacy {mac:u8[6]} or {cookie:u16, mac:u8[6]}.
-            uint16_t const RESPONSE_COOKIE =
-                (data_len >= NET_OP_COOKIE_BYTES + 6U) ? read_net_op_cookie(data, data_len, REQUEST_COOKIE) : REQUEST_COOKIE;
-            const uint8_t* mac_data = data;
-            uint16_t mac_len = data_len;
-            if (data_len >= NET_OP_COOKIE_BYTES + 6U) {
-                mac_data = data + NET_OP_COOKIE_BYTES;
-                mac_len = static_cast<uint16_t>(data_len - NET_OP_COOKIE_BYTES);
-            }
-            if (mac_len < 6) {
-                DevOpRespPayload resp = {};
-                resp.op_id = OP_NET_SET_MAC;
-                resp.status = -1;
-                resp.data_len = 0;
-                resp.reserved = RESPONSE_COOKIE;
-                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
-                break;
-            }
-
-            if (net_dev->ops != nullptr && net_dev->ops->set_mac != nullptr) {
-                net_dev->ops->set_mac(net_dev, mac_data);
-            }
-            wki_dev_server_notify_net_changed(net_dev);
-
-            DevOpRespPayload resp = {};
-            resp.op_id = OP_NET_SET_MAC;
-            resp.status = 0;
-            resp.data_len = 0;
-            resp.reserved = RESPONSE_COOKIE;
-            static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
-            break;
-        }
-
-        case OP_NET_RX_NOTIFY:
-        case OP_NET_STATE_NOTIFY: {
-            // D11: This op is sent by the server (owner) to the consumer.
-            // Owner-pushed state updates should also only reach the consumer.
+            DevOpRespPayload response{};
+            response.op_id = OP_NET_SET_MAC;
+            response.status = -ENOTSUP;
+            response.reserved = data_len >= NET_OP_COOKIE_BYTES + 6U ? read_net_op_cookie(data, data_len, REQUEST_COOKIE) : REQUEST_COOKIE;
+            static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &response, sizeof(response)));
             break;
         }
 
@@ -1073,43 +1334,21 @@ void handle_net_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
         }
 
         case OP_NET_OPEN: {
-            uint16_t const RESPONSE_COOKIE = read_net_op_cookie(data, data_len, REQUEST_COOKIE);
-            // V2: Bring up the NIC and subscribe consumer to RX forwarding
-            int status = 0;
-            if (net_dev->ops != nullptr && net_dev->ops->open != nullptr) {
-                status = net_dev->ops->open(net_dev);
-            }
-
-            if (status == 0) {
-                wki_dev_server_mark_net_opened(channel_identity, net_dev, true);
-            }
-            wki_dev_server_notify_net_changed(net_dev);
-
-            DevOpRespPayload resp = {};
-            resp.op_id = OP_NET_OPEN;
-            resp.status = static_cast<int16_t>(status);
-            resp.data_len = 0;
-            resp.reserved = RESPONSE_COOKIE;
-            static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
+            // Credentialless control cannot acquire native device authority.
+            DevOpRespPayload response{};
+            response.op_id = OP_NET_OPEN;
+            response.status = -ENOTSUP;
+            response.reserved = read_net_op_cookie(data, data_len, REQUEST_COOKIE);
+            static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &response, sizeof(response)));
             break;
         }
 
         case OP_NET_CLOSE: {
-            uint16_t const RESPONSE_COOKIE = read_net_op_cookie(data, data_len, REQUEST_COOKIE);
-            // V2: Shut down NIC and unsubscribe consumer from RX forwarding
-            if (net_dev->ops != nullptr && net_dev->ops->close != nullptr) {
-                net_dev->ops->close(net_dev);
-            }
-
-            wki_dev_server_mark_net_opened(channel_identity, net_dev, false);
-            wki_dev_server_notify_net_changed(net_dev);
-
-            DevOpRespPayload resp = {};
-            resp.op_id = OP_NET_CLOSE;
-            resp.status = 0;
-            resp.data_len = 0;
-            resp.reserved = RESPONSE_COOKIE;
-            static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
+            DevOpRespPayload response{};
+            response.op_id = OP_NET_CLOSE;
+            response.status = -ENOTSUP;
+            response.reserved = read_net_op_cookie(data, data_len, REQUEST_COOKIE);
+            static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &response, sizeof(response)));
             break;
         }
 
@@ -1353,13 +1592,17 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
 
     state->netdev.ops = &G_PROXY_NET_OPS;
     state->netdev.private_data = state;
+    // Attach ACK/notifications may update the owner cache before registration.
+    // Consume it under the same publication order as later control completion.
+    uint64_t const PUBLICATION_FLAGS = state->netdev.control_publication_lock.lock_irqsave();
+    state->lock.lock();
     state->netdev.mtu = state->owner_mtu != 0 ? state->owner_mtu : 1500;
-    state->netdev.state = static_cast<uint8_t>(state->owner_link_state != 0 ? 1 : 0);
+    state->netdev.state = static_cast<uint8_t>(!state->retiring.load(std::memory_order_acquire) && state->owner_link_state != 0 ? 1 : 0);
 
     // V2: Initialize RX backpressure credits
-    state->lock.lock();
     set_net_rx_credits_locked(state, WKI_NET_RX_CREDITS);
     state->lock.unlock();
+    state->netdev.control_publication_lock.unlock_irqrestore(PUBLICATION_FLAGS);
 
     // The publication lifecycle lease serializes this final publication with HELLO
     // reconciliation. Resource replacement/withdrawal is generation-qualified
@@ -1586,7 +1829,7 @@ void wki_remote_net_detach_resource_generation(uint16_t owner_node, uint32_t res
         state->attaching = false;
         state->epoch_reset_pending = false;
         state->cleanup_started = true;
-        state->netdev.state = 0;
+        publish_retiring_net_state(state);
         unregister_netdev = state->netdev_registered;
         state->netdev_registered = false;
         attach_cookie = state->attach_cookie;
@@ -1677,6 +1920,9 @@ void handle_net_attach_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_
     // an exact capability-gated suffix and never mutates local address state.
     if (ack->status == static_cast<uint8_t>(DevAttachStatus::OK)) {
         const auto* net_ack = reinterpret_cast<const DevAttachAckNetPayload*>(payload);
+        state->open_identity_supported = (net_ack->rdma_flags & DEV_ATTACH_NET_OPEN_IDENTITY) != 0;
+        state->close_identity_supported = (net_ack->rdma_flags & DEV_ATTACH_NET_CLOSE_IDENTITY) != 0;
+        state->link_identity_supported = (net_ack->rdma_flags & DEV_ATTACH_NET_LINK_IDENTITY) != 0;
         state->owner_ipv4_addr = net_ack->ipv4_addr;
         state->owner_ipv4_mask = net_ack->ipv4_mask;
         state->owner_real_mac = net_ack->real_mac;
@@ -1744,22 +1990,7 @@ void handle_net_op_resp(const WkiHeader* hdr, const WkiChannelIdentity& channel_
         return;
     }
 
-    wait_entry = claim_and_clear_waiter_locked(state->op_wait_entry);
-    if (wait_entry == nullptr) {
-        clear_net_op_state_locked(state, resp->status);
-        state->lock.unlock();
-        release_net_proxy(state);
-        return;
-    }
-
-    state->op_status = resp->status;
-    if (RESP_DATA_LEN > 0 && state->op_resp_buf != nullptr) {
-        uint16_t const COPY_LEN = (RESP_DATA_LEN > state->op_resp_max) ? state->op_resp_max : RESP_DATA_LEN;
-        memcpy(state->op_resp_buf, resp_data, COPY_LEN);
-        state->op_resp_len = COPY_LEN;
-    } else {
-        state->op_resp_len = 0;
-    }
+    wait_entry = publish_net_op_response_locked(state, *resp, resp_data);
     state->lock.unlock();
 
     finish_claimed_waiter(wait_entry, 0);
@@ -1843,11 +2074,13 @@ void handle_net_state_notify(const WkiHeader* hdr, const WkiChannelIdentity& cha
     uint16_t const EXPECTED_STATE_SIZE =
         static_cast<uint16_t>(sizeof(NetStateNotifyPayload) + (WITH_IPV6 ? sizeof(NetIpv6StateSuffix) : 0));
     NetIpv6StateSuffix ipv6 = wki_net_ipv6_state_empty();
+    uint64_t const PUBLICATION_FLAGS = state->netdev.control_publication_lock.lock_irqsave();
     state->lock.lock();
     if (!wki_net_notify_header_matches_expected(state->attach_cookie, *notify) || !wki_net_notify_payload_fits(data_len, *notify) ||
         notify->data_len != EXPECTED_STATE_SIZE ||
         !wki_net_ipv6_extended_length_valid(WITH_IPV6, data_len, sizeof(NetNotifyHeader) + sizeof(NetStateNotifyPayload))) {
         state->lock.unlock();
+        state->netdev.control_publication_lock.unlock_irqrestore(PUBLICATION_FLAGS);
         release_net_proxy(state);
         return;
     }
@@ -1855,12 +2088,14 @@ void handle_net_state_notify(const WkiHeader* hdr, const WkiChannelIdentity& cha
         std::memcpy(&ipv6, data + sizeof(NetNotifyHeader) + sizeof(NetStateNotifyPayload), sizeof(ipv6));
         if (!wki_net_ipv6_state_valid(ipv6)) {
             state->lock.unlock();
+            state->netdev.control_publication_lock.unlock_irqrestore(PUBLICATION_FLAGS);
             release_net_proxy(state);
             return;
         }
     }
     apply_owner_net_state(state, *state_payload, ipv6);
     state->lock.unlock();
+    state->netdev.control_publication_lock.unlock_irqrestore(PUBLICATION_FLAGS);
     release_net_proxy(state);
 }
 
@@ -1922,6 +2157,7 @@ void wki_remote_net_poll_stats() {
         }
         uint16_t const EXPECTED_COOKIE = allocate_net_op_cookie_locked(st);
         st->op_wait_entry = nullptr;
+        st->op_completion = nullptr;
         st->op_expected_id = OP_NET_GET_STATS;
         st->op_expected_seq = EXPECTED_COOKIE;
         st->op_deadline_us = wki_future_deadline_us(NOW_US, WKI_DEV_PROXY_TIMEOUT_US);
@@ -1970,7 +2206,7 @@ void wki_remote_net_mark_epoch_reset(uint16_t node_id) {
         state->active = false;
         state->epoch_reset_pending = true;
         state->retiring.store(true, std::memory_order_release);
-        state->netdev.state = 0;
+        publish_retiring_net_state(state);
     }
     s_net_proxy_lock.unlock();
 }
@@ -2014,7 +2250,7 @@ void cleanup_net_proxies_for_peer(uint16_t node_id, NetProxyCleanupScope scope, 
             p->attaching = false;
             p->epoch_reset_pending = false;
             p->cleanup_started = true;
-            p->netdev.state = 0;
+            publish_retiring_net_state(p);
 
             WkiWaitEntry* op_waiter = nullptr;
             WkiWaitEntry* attach_waiter = nullptr;
@@ -2080,6 +2316,631 @@ void wki_remote_net_cleanup_for_peer(uint16_t node_id, bool owner_reboot_proven)
 
 void wki_remote_net_cleanup_epoch_reset_for_peer(uint16_t node_id, bool owner_reboot_proven) {
     cleanup_net_proxies_for_peer(node_id, NetProxyCleanupScope::EPOCH_MARKED_ONLY, owner_reboot_proven);
+}
+
+auto wki_remote_net_selftest_completed_result_survives_retirement() -> bool {
+    constexpr std::array STATUSES{0, -EPERM, -EACCES, -EIO, -EINVAL, -ENODEV, -ETIMEDOUT};
+    constexpr std::array OPERATIONS{OP_NET_OPEN_AS, OP_NET_CLOSE_AS, OP_NET_LINK_AS};
+    constexpr std::array<uint8_t, 3> DATA{0x19, 0x27, 0x35};
+    for (auto operation : OPERATIONS) {
+        for (int status : STATUSES) {
+            for (bool wake_first : {false, true}) {
+                ProxyNetState state{};
+                NetOpCompletion completion{};
+                auto& wait = completion.wait;
+                std::array<uint8_t, DATA.size()> output{};
+                uint16_t cookie = 0;
+                if (prepare_net_op_wait(&state, operation, completion, output.data(), output.size(), WKI_OP_TIMEOUT_US, &cookie) != WKI_OK)
+                    return false;
+                DevOpRespPayload response{};
+                response.op_id = operation;
+                response.status = static_cast<int16_t>(status);
+                response.data_len = DATA.size();
+                response.reserved = cookie;
+                state.lock.lock();
+                auto* writer = publish_net_op_response_locked(&state, response, DATA.data());
+                state.lock.unlock();
+                if (wake_first) finish_claimed_waiter(writer, 0);
+
+                // Exact operation-side ordering used by peer cleanup after a
+                // response writer wins, while the caller still owns its proxy pin.
+                state.lock.lock();
+                auto* retirement_writer = claim_and_clear_waiter_locked(state.op_wait_entry);
+                clear_net_op_state_locked(&state, WKI_ERR_PEER_FENCED);
+                state.lock.unlock();
+                finish_claimed_waiter(retirement_writer, WKI_ERR_PEER_FENCED);
+                if (!wake_first) finish_claimed_waiter(writer, 0);
+
+                int actual = 123;
+                uint16_t length = 0;
+                consume_net_op_result(&state, completion, &actual, &length);
+                if (writer != &wait || retirement_writer != nullptr || wait.result != 0 || actual != status || length != DATA.size() ||
+                    output != DATA || state.op_pending.load(std::memory_order_acquire))
+                    return false;
+            }
+        }
+    }
+    return true;
+}
+
+namespace {
+struct NetOpenOwnerTestContext {
+    unsigned calls = 0;
+    int error = 0;
+    unsigned mac_calls = 0;
+    unsigned checks = 0;
+    int check_error = 0;
+};
+auto net_open_owner_test_driver(ker::net::NetDevice* dev) -> int {
+    auto& context = *static_cast<NetOpenOwnerTestContext*>(dev->private_data);
+    ++context.calls;
+    if (context.error != 0) return context.error;
+    dev->state = 1;
+    return 0;
+}
+void net_close_owner_test_driver(ker::net::NetDevice* dev) {
+    auto& context = *static_cast<NetOpenOwnerTestContext*>(dev->private_data);
+    ++context.calls;
+    dev->state = 0;
+}
+}  // namespace
+
+namespace {
+auto net_link_owner_test_check(ker::net::NetDevice* dev, const uint8_t*) -> int {
+    auto& context = *static_cast<NetOpenOwnerTestContext*>(dev->private_data);
+    ++context.checks;
+    return context.check_error;
+}
+void net_link_owner_test_mac(ker::net::NetDevice* dev, const uint8_t* mac) {
+    auto& context = *static_cast<NetOpenOwnerTestContext*>(dev->private_data);
+    ++context.mac_calls;
+    std::copy_n(mac, 6, dev->mac.data());
+}
+}  // namespace
+
+auto wki_remote_net_selftest_owner_l3_snapshot() -> bool {
+    ProxyNetState state{};
+    state.netdev.ops = &G_PROXY_NET_OPS;
+    state.netdev.private_data = &state;
+    auto const EMPTY = snapshot_owner_l3(&state);
+    if (!EMPTY.valid || EMPTY.ipv4_addr != 0 || EMPTY.ipv4_mask != 0 || EMPTY.ipv6.count != 0) return false;
+    if (snapshot_owner_l3(nullptr).valid || wki_remote_net_owner_l3_snapshot(nullptr).valid ||
+        wki_remote_net_owner_l3_snapshot(&state.netdev).valid)
+        return false;
+
+    auto notify = [&](uint32_t address, uint32_t mask, const NetIpv6StateSuffix& ipv6) {
+        NetStateNotifyPayload payload{};
+        payload.ipv4_addr = address;
+        payload.ipv4_mask = mask;
+        uint64_t const FLAGS = state.netdev.control_publication_lock.lock_irqsave();
+        state.lock.lock();
+        apply_owner_net_state(&state, payload, ipv6);
+        state.lock.unlock();
+        state.netdev.control_publication_lock.unlock_irqrestore(FLAGS);
+    };
+    auto ipv6 = wki_net_ipv6_state_empty();
+    ipv6.count = 1;
+    ipv6.entries.front().address = {0x20, 0x01, 0x0d, 0xb8};
+    ipv6.entries.front().prefix_len = 64;
+    ipv6.entries.front().scope = wki_net_ipv6_address_scope(ipv6.entries.front().address);
+    if (!wki_net_ipv6_state_valid(ipv6)) return false;
+    notify(0x0a000001, 0xffffff00, ipv6);
+    auto const BEFORE = snapshot_owner_l3(&state);
+    if (!BEFORE.valid || BEFORE.ipv4_addr != 0x0a000001 || BEFORE.ipv4_mask != 0xffffff00 ||
+        std::memcmp(&BEFORE.ipv6, &ipv6, sizeof(ipv6)) != 0)
+        return false;
+
+    // Link projection may be deferred by a control. L3 policy must still copy
+    // the latest complete received record without changing local addresses.
+    ker::net::NetDeviceControlGuard control;
+    if (control.try_acquire(&state.netdev) != 0) return false;
+    auto replacement = ipv6;
+    replacement.entries.front().address.back() = 2;
+    replacement.entries.front().prefix_len = 80;
+    notify(0xc0000202, 0xffff0000, replacement);
+    auto const AFTER = snapshot_owner_l3(&state);
+    if (!AFTER.valid || AFTER.ipv4_addr != 0xc0000202 || AFTER.ipv4_mask != 0xffff0000 ||
+        std::memcmp(&AFTER.ipv6, &replacement, sizeof(replacement)) != 0 || BEFORE.ipv4_addr != 0x0a000001 ||
+        BEFORE.ipv4_mask != 0xffffff00 || std::memcmp(&BEFORE.ipv6, &ipv6, sizeof(ipv6)) != 0 ||
+        ker::net::netif_find_by_dev(&state.netdev) != nullptr)
+        return false;
+    state.retiring.store(true, std::memory_order_release);
+    auto const RETIRED = snapshot_owner_l3(&state);
+    return !RETIRED.valid && RETIRED.ipv4_addr == 0 && RETIRED.ipv4_mask == 0 && RETIRED.ipv6.count == 0;
+}
+
+auto wki_remote_net_selftest_control_state_publication() -> bool {
+    ProxyNetState state{};
+    state.netdev.ops = &G_PROXY_NET_OPS;
+    state.netdev.private_data = &state;
+    auto notify = [&](uint16_t link, uint32_t mtu) {
+        NetStateNotifyPayload payload{};
+        payload.link_state = link;
+        payload.mtu = mtu;
+        uint64_t const FLAGS = state.netdev.control_publication_lock.lock_irqsave();
+        state.lock.lock();
+        apply_owner_net_state(&state, payload, wki_net_ipv6_state_empty());
+        state.lock.unlock();
+        state.netdev.control_publication_lock.unlock_irqrestore(FLAGS);
+    };
+    // Idle notifications publish before the next writer is admitted.
+    notify(1, 9000);
+    if (state.netdev.state != 1 || state.netdev.mtu != 9000 || state.owner_state_pending) return false;
+    {
+        ker::net::NetDeviceControlGuard control;
+        if (control.try_acquire(&state.netdev) != 0) return false;
+        notify(0, 1400);
+        notify(1, 1300);
+        if (state.netdev.state != 1 || state.netdev.mtu != 9000 || !state.owner_state_pending || !state.owner_mtu_pending) return false;
+        // Represent the admitted request's final local field commit.
+        state.netdev.state = 0;
+        state.netdev.mtu = 1200;
+        {
+            ker::net::NetDeviceControlGuard competing;
+            if (competing.try_acquire(&state.netdev) != -EBUSY) return false;
+        }
+        if (state.netdev.state != 0 || state.netdev.mtu != 1200 || !state.owner_state_pending) return false;
+    }
+    if (state.netdev.state != 1 || state.netdev.mtu != 1300 || state.owner_state_pending || state.owner_mtu_pending ||
+        state.netdev.control_busy.load(std::memory_order_acquire))
+        return false;
+    // A later notification cannot be stranded behind the completed guard.
+    notify(0, 1250);
+    if (state.netdev.state != 0 || state.netdev.mtu != 1250 || state.owner_state_pending) return false;
+    notify(1, 0);
+    if (state.netdev.state != 1 || state.netdev.mtu != 1250) return false;
+    {
+        ker::net::NetDeviceControlGuard control;
+        if (control.try_acquire(&state.netdev) != 0) return false;
+        notify(0, 0);
+        state.netdev.mtu = 1100;
+    }
+    if (state.netdev.state != 0 || state.netdev.mtu != 1100) return false;
+    {
+        ker::net::NetDeviceControlGuard control;
+        if (control.try_acquire(&state.netdev) != 0) return false;
+        notify(1, 1400);
+        notify(0, 0);
+    }
+    if (state.netdev.state != 0 || state.netdev.mtu != 1400) return false;
+    for (bool pending : {false, true}) {
+        // Reset this unregistered fixture for the next independent scenario.
+        state.netdev.control_retiring = false;
+        state.retiring.store(false, std::memory_order_release);
+        state.netdev.state = 1;
+        auto const OWNER_STATE = state.owner_link_state;
+        {
+            ker::net::NetDeviceControlGuard control;
+            if (control.try_acquire(&state.netdev) != 0) return false;
+            if (pending) notify(1, 1500);
+            state.retiring.store(true, std::memory_order_release);
+            publish_retiring_net_state(&state);
+            // Retirement must not race the admitted writer's field stores.
+            if (state.netdev.state != 1) return false;
+            state.netdev.state = 1;
+            notify(1, 1600);  // A handler retained before fencing arrives late.
+            if (state.owner_link_state != (pending ? 1 : OWNER_STATE)) return false;
+        }
+        if (state.netdev.state != 0 || state.owner_state_pending || state.owner_mtu_pending ||
+            state.netdev.control_busy.load(std::memory_order_acquire))
+            return false;
+        notify(1, 1700);
+        if (state.netdev.state != 0) return false;
+    }
+    state.netdev.state = 1;
+    publish_retiring_net_state(&state);
+    return state.netdev.state == 0;
+}
+
+auto wki_remote_net_selftest_link_identity_owner() -> bool {
+    using namespace ker::mod::security;
+    constexpr uint64_t BASE = wki_policy_bits(WkiPolicy::REMOTE_NET) | wki_policy_bits(WkiPolicy::IDENTITY_SAME_DOMAIN);
+    constexpr uint64_t ROOT_POLICY = BASE | wki_policy_bits(WkiPolicy::IDENTITY_ROOT);
+    struct Case {
+        uint32_t uid;
+        uint64_t ceiling;
+        uint64_t grants;
+        int same;
+        int root;
+    };
+    constexpr std::array CASES{
+        Case{0, ALL_AUTHORITY, 0, -EACCES, 0},   Case{0, 0, 0, -EACCES, -EPERM},  Case{1000, ALL_AUTHORITY, 0, -EPERM, -EPERM},
+        Case{102, ALL_AUTHORITY, 2, -EACCES, 0}, Case{102, 0, 2, -EPERM, -EPERM}, Case{101, ALL_AUTHORITY, 1, -EACCES, -EPERM}};
+    ker::net::NetDevice dev{};
+    NetOpenOwnerTestContext context{};
+    ker::net::NetDeviceOps const OPS{.open = net_open_owner_test_driver,
+                                     .close = net_close_owner_test_driver,
+                                     .set_mac = net_link_owner_test_mac,
+                                     .check_mac = net_link_owner_test_check};
+    dev.ops = &OPS;
+    dev.private_data = &context;
+    std::array<uint8_t, WKI_NET_LINK_IDENTITY_SIZE> bytes{};
+    NetOpenIdentityHeader const HEADER{.cookie = 37, .version = WKI_NET_OPEN_IDENTITY_VERSION};
+    std::memcpy(bytes.data(), &HEADER, sizeof(HEADER));
+    NetLinkControlPayload control{.fields = WKI_NET_LINK_STATE | WKI_NET_LINK_MAC, .up = 1, .mac = {2, 0, 0, 0, 0, 37}};
+    auto invoke = [&](const uint8_t* data, uint16_t length, uint64_t policy) {
+        ker::net::NetDeviceControlGuard control_guard;
+        return apply_net_link_as(&dev, data, length, policy, control_guard);
+    };
+    auto prepare = [&](const Snapshot& caller) {
+        auto const RECORD = credential_record::encode(caller);
+        std::memcpy(bytes.data() + sizeof(HEADER), RECORD.data(), RECORD.size());
+        std::memcpy(bytes.data() + WKI_NET_OPEN_IDENTITY_SIZE, &control, sizeof(control));
+        dev.state = control.up ? 0 : 1;
+        dev.mac.bytes = {2, 0, 0, 0, 0, 11};
+        context = {};
+    };
+    for (auto const& item : CASES) {
+        Snapshot caller;
+        if (Snapshot::restore_fields({.user = {item.uid, item.uid, item.uid},
+                                      .group = {item.uid, item.uid, item.uid},
+                                      .authority_ceiling = item.ceiling,
+                                      .service_privileges = item.grants,
+                                      .no_new_privileges = true,
+                                      .dumpable = false,
+                                      .service_privileges_locked = true},
+                                     caller) != 0)
+            return false;
+        for (uint64_t policy : {uint64_t{0}, wki_policy_bits(WkiPolicy::REMOTE_NET), BASE, ROOT_POLICY}) {
+            for (uint32_t up : {0U, 1U}) {
+                control.up = up;
+                prepare(caller);
+                int const EXPECTED = policy == ROOT_POLICY ? item.root : policy == BASE ? item.same : -EACCES;
+                int const STATUS = invoke(bytes.data(), bytes.size(), policy);
+                {
+                    ker::net::NetDeviceControlGuard competing;
+                    if (competing.try_acquire(&dev) != 0) return false;
+                    unsigned const BEFORE = context.calls;
+                    unsigned const CHECKS = context.checks;
+                    unsigned const MAC_CALLS = context.mac_calls;
+                    if (invoke(bytes.data(), bytes.size(), policy) != (EXPECTED == 0 ? -EBUSY : EXPECTED) || context.calls != BEFORE ||
+                        context.checks != CHECKS || context.mac_calls != MAC_CALLS)
+                        return false;
+                }
+                unsigned const CALLS = EXPECTED == 0 ? 1U : 0U;
+                if (STATUS != EXPECTED || context.calls != CALLS || context.mac_calls != CALLS || context.checks != CALLS ||
+                    dev.state != (EXPECTED == 0 ? up : 1U - up) || dev.mac[5] != (EXPECTED == 0 ? 37 : 11))
+                    return false;
+            }
+        }
+    }
+    auto const ROOT = Snapshot::bootstrap_root();
+    control.up = 1;
+    for (int error : {-EPERM, -ENOTSUP, -EIO, 7}) {
+        prepare(ROOT);
+        context.check_error = error;
+        if (invoke(bytes.data(), bytes.size(), ROOT_POLICY) != (error < 0 ? error : -EIO) || context.checks != 1 || context.calls != 0 ||
+            context.mac_calls != 0 || dev.state != 0 || dev.mac[5] != 11)
+            return false;
+    }
+    for (int error : {-EACCES, -EIO, -ENODEV, 7}) {
+        prepare(ROOT);
+        context.error = error;
+        if (invoke(bytes.data(), bytes.size(), ROOT_POLICY) != (error < 0 ? error : -EIO) || context.checks != 1 || context.calls != 1 ||
+            context.mac_calls != 0 || dev.state != 0 || dev.mac[5] != 11)
+            return false;
+    }
+    prepare(ROOT);
+    for (uint16_t size = 0; size < bytes.size(); ++size)
+        if (invoke(bytes.data(), size, ROOT_POLICY) != -EINVAL || context.calls != 0 || context.checks != 0) return false;
+    auto const VALID = control;
+    for (unsigned kind = 0; kind < 6; ++kind) {
+        control = VALID;
+        if (kind == 0) control.fields = 0;
+        if (kind == 1) control.fields = 4;
+        if (kind == 2) control.reserved = 1;
+        if (kind == 3) control.reserved_tail = 1;
+        if (kind == 4) control.up = 2;
+        if (kind == 5) control.fields = WKI_NET_LINK_MAC;
+        prepare(ROOT);
+        if (invoke(bytes.data(), bytes.size(), ROOT_POLICY) != -EINVAL || context.calls != 0 || context.checks != 0) return false;
+    }
+    return true;
+}
+
+auto net_control_selftest_identity_owner(bool closing) -> bool {
+    using namespace ker::mod::security;
+    constexpr uint64_t BASE = wki_policy_bits(WkiPolicy::REMOTE_NET) | wki_policy_bits(WkiPolicy::IDENTITY_SAME_DOMAIN);
+    constexpr uint64_t ROOT_POLICY = BASE | wki_policy_bits(WkiPolicy::IDENTITY_ROOT);
+    constexpr std::array<uint32_t, 2> GROUPS{117, 119};
+    struct Case {
+        uint32_t uid;
+        uint64_t ceiling;
+        uint64_t grant;
+        int same_domain;
+        int root_domain;
+    };
+    constexpr std::array CASES{
+        Case{0, ALL_AUTHORITY, 0, -EACCES, 0},   Case{0, 0, 0, -EACCES, -EPERM},  Case{1000, ALL_AUTHORITY, 0, -EPERM, -EPERM},
+        Case{102, ALL_AUTHORITY, 2, -EACCES, 0}, Case{102, 0, 2, -EPERM, -EPERM}, Case{101, ALL_AUTHORITY, 1, -EACCES, -EPERM},
+    };
+    ker::net::NetDevice dev{};
+    NetOpenOwnerTestContext context{};
+    ker::net::NetDeviceOps const OPS{.open = net_open_owner_test_driver, .close = net_close_owner_test_driver};
+    dev.ops = &OPS;
+    dev.private_data = &context;
+    std::array<uint8_t, WKI_NET_OPEN_IDENTITY_SIZE> bytes{};
+    NetOpenIdentityHeader header{.cookie = 17, .version = WKI_NET_OPEN_IDENTITY_VERSION};
+    std::memcpy(bytes.data(), &header, sizeof(header));
+    auto invoke = [&](const uint8_t* data, uint16_t length, uint64_t policy) {
+        ker::net::NetDeviceControlGuard control_guard;
+        return closing ? close_net_device_as(&dev, data, length, policy, control_guard)
+                       : open_net_device_as(&dev, data, length, policy, control_guard);
+    };
+    for (auto const& item : CASES) {
+        Snapshot supplied;
+        SnapshotFields const FIELDS{.user = {item.uid, item.uid, item.uid},
+                                    .group = {item.uid, item.uid, item.uid},
+                                    .groups = GROUPS,
+                                    .authority_ceiling = item.ceiling,
+                                    .service_privileges = item.grant,
+                                    .no_new_privileges = true,
+                                    .dumpable = false,
+                                    .service_privileges_locked = true};
+        if (Snapshot::restore_fields(FIELDS, supplied) != 0) return false;
+        auto const RECORD = credential_record::encode(supplied);
+        std::memcpy(bytes.data() + sizeof(header), RECORD.data(), RECORD.size());
+        for (uint64_t policy : {uint64_t{0}, wki_policy_bits(WkiPolicy::REMOTE_NET), BASE, ROOT_POLICY}) {
+            int const EXPECTED = policy == ROOT_POLICY ? item.root_domain : policy == BASE ? item.same_domain : -EACCES;
+            dev.state = closing ? 1 : 0;
+            context = {};
+            {
+                ker::net::NetDeviceControlGuard competing;
+                if (competing.try_acquire(&dev) != 0) return false;
+                if (invoke(bytes.data(), bytes.size(), policy) != (EXPECTED == 0 ? -EBUSY : EXPECTED) || context.calls != 0) return false;
+            }
+            int const RESULT = invoke(bytes.data(), bytes.size(), policy);
+            if (RESULT != EXPECTED || context.calls != (EXPECTED == 0 ? 1U : 0U) ||
+                dev.state != (closing ? (EXPECTED == 0 ? 0 : 1) : (EXPECTED == 0 ? 1 : 0)))
+                return false;
+        }
+    }
+    auto const ROOT_RECORD = credential_record::encode(Snapshot::bootstrap_root());
+    std::memcpy(bytes.data() + sizeof(header), ROOT_RECORD.data(), ROOT_RECORD.size());
+    if (!closing)
+        for (int error : {-EPERM, -EACCES, -EIO, -ENODEV, -ETIMEDOUT, 7}) {
+            dev.state = closing ? 1 : 0;
+            context = {.error = error};
+            if (invoke(bytes.data(), bytes.size(), ROOT_POLICY) != (error < 0 ? error : -EIO) || context.calls != 1 || dev.state != 0)
+                return false;
+        }
+    context = {};
+    for (uint16_t size = 0; size < bytes.size(); ++size) {
+        if (invoke(bytes.data(), size, ROOT_POLICY) != -EINVAL || context.calls != 0) return false;
+    }
+    header.version = 2;
+    std::memcpy(bytes.data(), &header, sizeof(header));
+    if (invoke(bytes.data(), bytes.size(), ROOT_POLICY) != -ENOTSUP || context.calls != 0) return false;
+    header.version = WKI_NET_OPEN_IDENTITY_VERSION;
+    header.reserved = 1;
+    std::memcpy(bytes.data(), &header, sizeof(header));
+    if (invoke(bytes.data(), bytes.size(), ROOT_POLICY) != -EINVAL || context.calls != 0) return false;
+    header.reserved = 0;
+    header.cookie = 0;
+    std::memcpy(bytes.data(), &header, sizeof(header));
+    return invoke(bytes.data(), bytes.size(), ROOT_POLICY) == -EINVAL && context.calls == 0;
+}
+
+auto wki_remote_net_selftest_open_identity_owner() -> bool { return net_control_selftest_identity_owner(false); }
+auto wki_remote_net_selftest_close_identity_owner() -> bool { return net_control_selftest_identity_owner(true); }
+
+auto wki_remote_net_selftest_completion_ownership() -> bool {
+    ProxyNetState state{};
+    NetOpCompletion first{};
+    constexpr std::array<uint8_t, 3> DATA{0x18, 0x29, 0x3a};
+    std::array<uint8_t, 3> output{0x55, 0x55, 0x55};
+    uint16_t first_cookie = 0;
+    if (prepare_net_op_wait(&state, OP_NET_OPEN, first, output.data(), 2, WKI_OP_TIMEOUT_US, &first_cookie) != WKI_OK) return false;
+    DevOpRespPayload response{};
+    response.op_id = OP_NET_OPEN;
+    response.status = -EACCES;
+    response.data_len = DATA.size();
+    response.reserved = first_cookie;
+    state.lock.lock();
+    auto* writer = publish_net_op_response_locked(&state, response, DATA.data());
+    auto* duplicate = publish_net_op_response_locked(&state, response, DATA.data());
+    bool const DUPLICATE_PRESERVED = duplicate == nullptr && state.op_completion == &first &&
+                                     state.op_pending.load(std::memory_order_acquire) && first.status == -EACCES &&
+                                     first.response_length == 2 && output[0] == DATA[0] && output[1] == DATA[1] && output[2] == 0x55;
+    state.lock.unlock();
+    finish_claimed_waiter(writer, 0);
+
+    // A cancellation arriving after response claim still releases its slot.
+    // Its completed owner result remains immutable even when another operation
+    // takes the slot before the old caller consumes or cancels again.
+    cancel_op_waiter(&state, first.wait, WKI_ERR_TIMEOUT);
+    NetOpCompletion next{};
+    uint16_t next_cookie = 0;
+    if (prepare_net_op_wait(&state, OP_NET_SET_MAC, next, nullptr, 0, WKI_OP_TIMEOUT_US, &next_cookie) != WKI_OK) return false;
+    int first_status = 0;
+    uint16_t first_length = 0;
+    consume_net_op_result(&state, first, &first_status, &first_length);
+    cancel_op_waiter(&state, first.wait, WKI_ERR_TIMEOUT);
+    bool const SUCCESSOR_PRESERVED = state.op_completion == &next && state.op_wait_entry == &next.wait &&
+                                     state.op_expected_id == OP_NET_SET_MAC && state.op_expected_seq == next_cookie &&
+                                     state.op_pending.load(std::memory_order_acquire) && first_status == -EACCES && first_length == 2;
+    response.op_id = OP_NET_SET_MAC;
+    response.status = -EIO;
+    response.data_len = 0;
+    response.reserved = next_cookie;
+    state.lock.lock();
+    auto* next_writer = publish_net_op_response_locked(&state, response, nullptr);
+    state.lock.unlock();
+    finish_claimed_waiter(next_writer, 0);
+    int next_status = 0;
+    consume_net_op_result(&state, next, &next_status, nullptr);
+    bool const NEXT_FINISHED = next_writer == &next.wait && next_status == -EIO && state.op_completion == nullptr &&
+                               !state.op_pending.load(std::memory_order_acquire);
+
+    NetOpCompletion timed_out{};
+    output.fill(0x55);
+    uint16_t timeout_cookie = 0;
+    if (prepare_net_op_wait(&state, OP_NET_OPEN, timed_out, output.data(), output.size(), WKI_OP_TIMEOUT_US, &timeout_cookie) != WKI_OK)
+        return false;
+    bool const TIMEOUT_CLAIMED = wki_claim_op(&timed_out.wait);
+    if (TIMEOUT_CLAIMED) wki_finish_claimed_op(&timed_out.wait, WKI_ERR_TIMEOUT);
+    response.op_id = OP_NET_OPEN;
+    response.status = 0;
+    response.data_len = DATA.size();
+    response.reserved = timeout_cookie;
+    state.lock.lock();
+    auto* late_writer = publish_net_op_response_locked(&state, response, DATA.data());
+    state.lock.unlock();
+    cancel_op_waiter(&state, timed_out.wait, WKI_ERR_TIMEOUT);
+    bool const TIMEOUT_PRESERVED = TIMEOUT_CLAIMED && late_writer == nullptr && timed_out.wait.result == WKI_ERR_TIMEOUT &&
+                                   timed_out.response_length == 0 && output == std::array<uint8_t, 3>{0x55, 0x55, 0x55} &&
+                                   state.op_completion == nullptr && state.op_wait_entry == nullptr &&
+                                   !state.op_pending.load(std::memory_order_acquire);
+    return writer == &first.wait && DUPLICATE_PRESERVED && SUCCESSOR_PRESERVED && NEXT_FINISHED && TIMEOUT_PRESERVED;
+}
+
+auto wki_remote_net_selftest_control_send_retry() -> bool {
+    constexpr std::array PRESSURE{WKI_ERR_NO_ROUTE, WKI_ERR_NO_CREDITS, WKI_ERR_NO_MEM, WKI_ERR_NOT_FOUND, WKI_ERR_BUSY, WKI_OK};
+    uint64_t now = 0;
+    size_t sends = 0;
+    size_t pauses = 0;
+    int const ACCEPTED = retry_net_control_send(
+        10, [&] { return sends < PRESSURE.size() ? PRESSURE.at(sends++) : WKI_ERR_INVALID; }, [] { return true; },
+        [&] {
+            ++now;
+            ++pauses;
+        },
+        [&] { return now; });
+    if (ACCEPTED != WKI_OK || sends != PRESSURE.size() || pauses != PRESSURE.size() - 1) return false;
+
+    // A successful enqueue is terminal even if the caller has time remaining.
+    // Permanent errors are also terminal; do not convert them into success.
+    constexpr std::array TERMINAL{WKI_OK, WKI_ERR_INVALID, WKI_ERR_PEER_FENCED, WKI_ERR_TIMEOUT, WKI_ERR_TX_FAILED};
+    for (int const STATUS : TERMINAL) {
+        sends = pauses = 0;
+        int const RESULT = retry_net_control_send(
+            10,
+            [&] {
+                ++sends;
+                return STATUS;
+            },
+            [] { return true; }, [&] { ++pauses; }, [] { return uint64_t{0}; });
+        if (RESULT != STATUS || sends != 1 || pauses != 0) return false;
+    }
+
+    // The deadline never restarts. A pause reaching it must not send again.
+    now = sends = pauses = 0;
+    int const EXPIRED = retry_net_control_send(
+        3,
+        [&] {
+            ++sends;
+            return WKI_ERR_NO_ROUTE;
+        },
+        [] { return true; },
+        [&] {
+            ++now;
+            ++pauses;
+        },
+        [&] { return now; });
+    if (EXPIRED != WKI_ERR_NO_ROUTE || sends != 3 || pauses != 3) return false;
+
+    // A teardown that needs our retained reference must end the retry both
+    // before parking and when it begins while the worker is asleep.
+    for (bool const RETIRE_DURING_PAUSE : {false, true}) {
+        bool live = RETIRE_DURING_PAUSE;
+        sends = pauses = 0;
+        int const RETIRED = retry_net_control_send(
+            10,
+            [&] {
+                ++sends;
+                return WKI_ERR_NO_CREDITS;
+            },
+            [&] { return live; },
+            [&] {
+                live = false;
+                ++pauses;
+            },
+            [] { return uint64_t{0}; });
+        if (RETIRED != WKI_ERR_NO_CREDITS || sends != 1 || pauses != static_cast<size_t>(RETIRE_DURING_PAUSE)) return false;
+    }
+    return true;
+}
+
+auto wki_remote_net_selftest_open_error_mapping() -> bool {
+    struct Case {
+        int transport;
+        int error;
+    };
+    constexpr std::array CASES{
+        Case{WKI_OK, 0},
+        Case{WKI_ERR_NO_MEM, -ENOMEM},
+        Case{WKI_ERR_NO_ROUTE, -EHOSTUNREACH},
+        Case{WKI_ERR_PEER_FENCED, -ENOTCONN},
+        Case{WKI_ERR_NO_CREDITS, -EAGAIN},
+        Case{WKI_ERR_TIMEOUT, -ETIMEDOUT},
+        Case{WKI_ERR_INVALID, -EINVAL},
+        Case{WKI_ERR_NOT_FOUND, -EHOSTUNREACH},
+        Case{WKI_ERR_BUSY, -EAGAIN},
+        Case{WKI_ERR_TX_FAILED, -EIO},
+        Case{-100, -EIO},
+        Case{100, -EIO},
+    };
+    for (auto const& item : CASES) {
+        if (net_open_transport_errno(item.transport) != item.error) return false;
+    }
+    // Exercise an actual bounded wait timeout rather than sleeping through an
+    // entire network operation timeout or requiring a live peer.
+    WkiWaitEntry wait{};
+    int const RESULT = wki_wait_for_op(&wait, 1);
+    return RESULT == WKI_ERR_TIMEOUT && net_open_transport_errno(RESULT) == -ETIMEDOUT &&
+           wait.state.load(std::memory_order_acquire) == WkiWaitEntry::DONE;
+}
+
+auto wki_remote_net_selftest_open_transport_failures() -> bool {
+    ProxyNetState state{};
+    auto const ROOT = ker::mod::security::Snapshot::bootstrap_root();
+    bool const UNSUPPORTED = open_retained_net_proxy(&state, ROOT) == -ENOTSUP;
+    state.open_identity_supported = true;
+    state.max_op_size = WKI_NET_OPEN_IDENTITY_SIZE;
+    state.netdev.state = 0;
+    state.netdev.link_flags = 0x100;
+    state.lock.lock();
+    static_cast<void>(set_net_rx_credits_locked(&state, 17));
+    state.lock.unlock();
+    bool const MISSING = proxy_net_open_as(&state.netdev, ROOT) == -ENODEV;
+
+    state.retiring.store(true, std::memory_order_release);
+    bool const FENCED = open_retained_net_proxy(&state, ROOT) == -ENOTCONN;
+    state.retiring.store(false, std::memory_order_release);
+    // A null exact-channel identity fails inside the real send entrypoint,
+    // before lookup, allocation or transmission. Cancellation must drain the
+    // stack waiter and release the operation slot.
+    bool const INVALID_CHANNEL = open_retained_net_proxy(&state, ROOT) == -EINVAL;
+    bool const UNCHANGED = state.netdev.state == 0 && state.netdev.link_flags == 0x100 && state.rx_credits_remaining == 17 &&
+                           state.op_wait_entry == nullptr && !state.op_pending.load(std::memory_order_acquire) &&
+                           state.op_expected_id == 0 && state.op_expected_seq == 0;
+    return UNSUPPORTED && MISSING && FENCED && INVALID_CHANNEL && UNCHANGED;
+}
+
+auto wki_remote_net_selftest_close_transport_failures() -> bool {
+    ProxyNetState state{};
+    auto const ROOT = ker::mod::security::Snapshot::bootstrap_root();
+    bool const UNSUPPORTED = close_retained_net_proxy(&state, ROOT) == -ENOTSUP;
+    state.close_identity_supported = true;
+    state.max_op_size = WKI_NET_CLOSE_IDENTITY_SIZE;
+    state.netdev.state = 1;
+    state.netdev.link_flags = 0x100;
+    state.lock.lock();
+    static_cast<void>(set_net_rx_credits_locked(&state, 17));
+    state.lock.unlock();
+    bool const MISSING = proxy_net_close_as(&state.netdev, ROOT) == -ENODEV;
+
+    state.retiring.store(true, std::memory_order_release);
+    bool const FENCED = close_retained_net_proxy(&state, ROOT) == -ENOTCONN;
+    state.retiring.store(false, std::memory_order_release);
+    // A null exact-channel identity fails inside the real send entrypoint,
+    // before lookup, allocation or transmission. Cancellation must drain the
+    // stack waiter and release the operation slot.
+    bool const INVALID_CHANNEL = close_retained_net_proxy(&state, ROOT) == -EINVAL;
+    bool const UNCHANGED = state.netdev.state == 1 && state.netdev.link_flags == 0x100 && state.rx_credits_remaining == 17 &&
+                           state.op_wait_entry == nullptr && !state.op_pending.load(std::memory_order_acquire) &&
+                           state.op_expected_id == 0 && state.op_expected_seq == 0;
+    return UNSUPPORTED && MISSING && FENCED && INVALID_CHANNEL && UNCHANGED;
 }
 
 auto wki_remote_net_selftest_cancel_preserves_successor_op() -> bool {

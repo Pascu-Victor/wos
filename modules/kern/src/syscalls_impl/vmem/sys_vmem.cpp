@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <new>
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
@@ -29,11 +30,13 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sched/threading.hpp>
+#include <platform/security/file_policy.hpp>
 #include <platform/sys/mutex.hpp>
 #include <platform/sys/usercopy.hpp>
 #include <util/smallvec.hpp>
 #include <utility>
 #include <vfs/file.hpp>
+#include <vfs/mount.hpp>
 #include <vfs/stat.hpp>
 #include <vfs/vfs.hpp>
 
@@ -112,6 +115,7 @@ void record_local_vmem_cache_event(ker::mod::sched::task::Task* task, ker::mod::
 std::atomic<void*> g_anon_zero_page{nullptr};
 
 struct FileMmapPageKey {
+    uint64_t exec_content_id{};
     ker::vfs::dev_t dev{};
     ker::vfs::ino_t ino{};
     uint64_t size{};
@@ -132,12 +136,14 @@ struct FileMmapPageCacheSet {
     std::array<FileMmapPageCacheEntry, 4> ways{};
 };
 
+// Shared file mappings retain policy even when their backend has no writeback.
 struct FileMmapRange {
     ker::mod::mm::paging::PageTable* pagemap = nullptr;
     uint64_t start = 0;
     uint64_t length = 0;
     uint64_t file_offset = 0;
     ker::vfs::File* file = nullptr;
+    bool writeback = false;
 };
 
 struct FileMmapSyncRange {
@@ -146,6 +152,7 @@ struct FileMmapSyncRange {
     uint64_t sync_end = 0;
     uint64_t file_offset = 0;
     ker::vfs::File* file = nullptr;
+    bool skip_writeback = false;
 };
 
 enum class FileMmapCacheInsertResult : uint8_t {
@@ -180,13 +187,13 @@ ker::util::SmallVec<FileMmapRange, 32> g_file_mmap_ranges;
 ker::mod::sys::Mutex g_file_mmap_ranges_lock;
 
 auto file_mmap_key_equal(const FileMmapPageKey& lhs, const FileMmapPageKey& rhs) -> bool {
-    return lhs.dev == rhs.dev && lhs.ino == rhs.ino && lhs.size == rhs.size && lhs.mtime_sec == rhs.mtime_sec &&
-           lhs.mtime_nsec == rhs.mtime_nsec && lhs.ctime_sec == rhs.ctime_sec && lhs.ctime_nsec == rhs.ctime_nsec &&
-           lhs.offset == rhs.offset;
+    return lhs.exec_content_id == rhs.exec_content_id && lhs.dev == rhs.dev && lhs.ino == rhs.ino && lhs.size == rhs.size &&
+           lhs.mtime_sec == rhs.mtime_sec && lhs.mtime_nsec == rhs.mtime_nsec && lhs.ctime_sec == rhs.ctime_sec &&
+           lhs.ctime_nsec == rhs.ctime_nsec && lhs.offset == rhs.offset;
 }
 
 auto file_mmap_key_hash(const FileMmapPageKey& key) -> uint64_t {
-    uint64_t hash = key.dev ^ (key.ino << 7U) ^ (key.ino >> 3U) ^ key.size ^ key.offset;
+    uint64_t hash = key.exec_content_id ^ key.dev ^ (key.ino << 7U) ^ (key.ino >> 3U) ^ key.size ^ key.offset;
     hash ^= static_cast<uint64_t>(key.mtime_sec) + 0x9e3779b97f4a7c15ULL + (hash << 6U) + (hash >> 2U);
     hash ^= static_cast<uint64_t>(key.mtime_nsec) + 0xbf58476d1ce4e5b9ULL + (hash << 6U) + (hash >> 2U);
     hash ^= static_cast<uint64_t>(key.ctime_sec) + 0x94d049bb133111ebULL + (hash << 6U) + (hash >> 2U);
@@ -309,10 +316,6 @@ auto file_mmap_can_share(const ker::vfs::Stat& st, uint64_t prot) -> bool {
         return false;
     }
     return (prot & ker::abi::vmem::PROT_WRITE) == 0 && (st.st_mode & ker::vfs::S_IFMT) == ker::vfs::S_IFREG && st.st_ino != 0;
-}
-
-auto file_mmap_should_track(const ker::vfs::Stat& st, uint64_t flags) -> bool {
-    return (flags & ker::abi::vmem::MAP_SHARED) != 0 && (st.st_mode & ker::vfs::S_IFMT) == ker::vfs::S_IFREG;
 }
 
 auto is_prot_none(uint64_t prot) -> bool { return prot == ker::abi::vmem::PROT_NONE; }
@@ -588,6 +591,13 @@ auto add_lazy_vmem_range_entry(ker::mod::sched::task::Task* task, const LazyVmem
     LazyVmemRangeVec ranges_to_release;
     bool ok = true;
     uint64_t const IRQF = task->lazy_vmem_lock.lock_irqsave();
+    // Shared-VM updates can still find an exiting ACTIVE executor. Serialize
+    // this check with range retirement so a sibling cannot repopulate its
+    // lazy-file references after usercopy has quiesced.
+    if (task->usercopy_pagemap_closing.load(std::memory_order_acquire)) {
+        task->lazy_vmem_lock.unlock_irqrestore(IRQF);
+        return true;
+    }
     for (const auto& range : task->lazy_vmem_ranges) {
         if (!ranges_overlap(new_range.start, new_range.end, range.start, range.end)) {
             ok = push_lazy_vmem_range_copy(rewritten, range);
@@ -932,7 +942,9 @@ auto file_mmap_cached_page_for_file(ker::vfs::File* file, const ker::vfs::Stat& 
     }
 
     auto* task = get_current_task();
-    FileMmapPageKey const KEY = file_mmap_page_key(st, file_offset);
+    FileMmapPageKey key = file_mmap_page_key(st, file_offset);
+    if (file->exec_read_view != nullptr) key.exec_content_id = file->exec_read_view->content_id;
+    FileMmapPageKey const KEY = key;
     uint64_t const LOOKUP_STARTED_US = ker::mod::time::get_us();
     if (void* const CACHED_PAGE = file_mmap_cache_lookup(KEY); CACHED_PAGE != nullptr) {
         *page_out = CACHED_PAGE;
@@ -984,17 +996,6 @@ auto file_mmap_cached_page_for_file(ker::vfs::File* file, const ker::vfs::Stat& 
     return true;
 }
 
-auto file_mmap_cached_page(int fd, const ker::vfs::Stat& st, uint64_t file_offset, void** page_out) -> bool {
-    auto* task = get_current_task();
-    auto* file = ker::vfs::vfs_get_file_retain(task, fd);
-    if (file == nullptr) {
-        return false;
-    }
-    bool const OK = file_mmap_cached_page_for_file(file, st, file_offset, page_out);
-    ker::vfs::vfs_put_file(file);
-    return OK;
-}
-
 auto collect_file_mmap_sync_ranges(ker::mod::mm::paging::PageTable* pagemap, uint64_t start, uint64_t length,
                                    ker::util::SmallVec<FileMmapSyncRange, 8>& out) -> int {
     uint64_t end = 0;
@@ -1004,7 +1005,7 @@ auto collect_file_mmap_sync_ranges(ker::mod::mm::paging::PageTable* pagemap, uin
 
     g_file_mmap_ranges_lock.lock();
     for (const auto& range : g_file_mmap_ranges) {
-        if (range.pagemap != pagemap || range.file == nullptr || range.length == 0) {
+        if (range.pagemap != pagemap || range.file == nullptr || range.length == 0 || !range.writeback) {
             continue;
         }
 
@@ -1031,19 +1032,29 @@ auto collect_file_mmap_sync_ranges(ker::mod::mm::paging::PageTable* pagemap, uin
     return 0;
 }
 
-auto write_file_mapping_bytes(ker::vfs::File* file, const uint8_t* data, size_t count, uint64_t offset) -> int {
+auto authorize_file_mapping_writeback(ker::vfs::File* file, size_t count, uint64_t offset) -> int {
     if (file == nullptr || file->fops == nullptr || file->fops->vfs_write == nullptr) {
         return -ENOSYS;
     }
 
+    if (count == 0) return 0;
+    constexpr uint64_t MAX_OFFSET = static_cast<uint64_t>(std::numeric_limits<off_t>::max());
+    // Validate the whole range before a short first write can commit a prefix.
+    if (offset > MAX_OFFSET || count - 1 > MAX_OFFSET - offset) return -EOVERFLOW;
+
+    int const ACCESS_RET = ker::mod::security::authorize_file_description_access(static_cast<unsigned>(file->open_flags & 3), true);
+    if (ACCESS_RET != 0) return ACCESS_RET;
+    return ker::vfs::file_mount_read_only(*file) ? -EROFS : 0;
+}
+
+auto write_file_mapping_bytes(ker::vfs::File* file, const uint8_t* data, size_t count, uint64_t offset) -> int {
+    int const ADMISSION_RET = authorize_file_mapping_writeback(file, count, offset);
+    if (ADMISSION_RET != 0) return ADMISSION_RET;
+
     size_t written = 0;
     while (written < count) {
         uint64_t const CURRENT_OFFSET = offset + written;
-        if (CURRENT_OFFSET < offset) {
-            return -EOVERFLOW;
-        }
-
-        ssize_t const RET = file->fops->vfs_write(file, data + written, count - written, static_cast<size_t>(CURRENT_OFFSET));
+        ssize_t const RET = ker::vfs::vfs_pwrite_file(file, data + written, count - written, static_cast<off_t>(CURRENT_OFFSET));
         if (RET < 0) {
             return static_cast<int>(RET);
         }
@@ -1053,7 +1064,6 @@ auto write_file_mapping_bytes(ker::vfs::File* file, const uint8_t* data, size_t 
         written += std::min<size_t>(static_cast<size_t>(RET), count - written);
     }
 
-    ker::vfs::vfs_cache_notify_file_data_changed(file);
     return 0;
 }
 
@@ -1077,7 +1087,9 @@ auto snapshot_file_mmap_page(ker::mod::mm::paging::PageTable* pagemap, ker::mod:
         if (!ker::mod::sys::usercopy::pin_task_user_page(*live_task, page_start, false, false, pin) || !pin.was_dirty()) {
             return FileMmapPageSnapshot::SKIP;
         }
-        std::memcpy(snapshot.data(), static_cast<const uint8_t*>(pin.kernel_address()) + page_delta, size);
+        // Zero bytes probes dirty state without copying, with the same pin
+        // lifetime and mapping revalidation as an actual data snapshot.
+        if (size != 0) std::memcpy(snapshot.data(), static_cast<const uint8_t*>(pin.kernel_address()) + page_delta, size);
         return pin.still_mapped() ? FileMmapPageSnapshot::READY : FileMmapPageSnapshot::FAULT;
     }
 
@@ -1092,10 +1104,39 @@ auto snapshot_file_mmap_page(ker::mod::mm::paging::PageTable* pagemap, ker::mod:
         ker::mod::mm::virt::unpin_user_page(pin);
         return FileMmapPageSnapshot::SKIP;
     }
-    std::memcpy(snapshot.data(), static_cast<const uint8_t*>(pin.hhdm_page) + page_delta, size);
+    if (size != 0) std::memcpy(snapshot.data(), static_cast<const uint8_t*>(pin.hhdm_page) + page_delta, size);
     bool const STILL_MAPPED = ker::mod::mm::virt::user_page_pin_still_mapped(pin);
     ker::mod::mm::virt::unpin_user_page(pin);
     return STILL_MAPPED ? FileMmapPageSnapshot::READY : FileMmapPageSnapshot::FAULT;
+}
+
+// All caller-visible mappings are stable under shared VM publication, or the
+// root is unpublished/quiesced. File grants and effective view policy are
+// immutable. Validate complete intervals before any backend write. A rejected
+// range with no dirty work is a no-op and remains excluded from this operation,
+// even if a concurrent data writer dirties it after the probe.
+auto preflight_file_mmap_sync_ranges(ker::mod::mm::paging::PageTable* pagemap, ker::mod::sched::task::Task* live_task,
+                                     ker::util::SmallVec<FileMmapSyncRange, 8>& ranges) -> int {
+    std::array<uint8_t, ker::mod::mm::paging::PAGE_SIZE> unused_snapshot{};
+    for (auto& range : ranges) {
+        if (range.sync_start < range.mapping_start || range.sync_end <= range.sync_start) return -EINVAL;
+        uint64_t const FILE_DELTA = range.sync_start - range.mapping_start;
+        int const ADMISSION_RET = FILE_DELTA > UINT64_MAX - range.file_offset
+                                      ? -EOVERFLOW
+                                      : authorize_file_mapping_writeback(range.file, static_cast<size_t>(range.sync_end - range.sync_start),
+                                                                         range.file_offset + FILE_DELTA);
+        if (ADMISSION_RET == 0) continue;
+
+        for (uint64_t page = page_align_down(range.sync_start); page < range.sync_end;) {
+            auto const STATE = snapshot_file_mmap_page(pagemap, live_task, page, 0, 0, unused_snapshot);
+            if (STATE == FileMmapPageSnapshot::FAULT) return -EFAULT;
+            if (STATE == FileMmapPageSnapshot::READY) return ADMISSION_RET;
+            if (page > UINT64_MAX - ker::mod::mm::paging::PAGE_SIZE) return -EOVERFLOW;
+            page += ker::mod::mm::paging::PAGE_SIZE;
+        }
+        range.skip_writeback = true;
+    }
+    return 0;
 }
 
 auto sync_file_mmap_range_impl(ker::mod::mm::paging::PageTable* pagemap, ker::mod::sched::task::Task* live_task, uint64_t start,
@@ -1107,9 +1148,19 @@ auto sync_file_mmap_range_impl(ker::mod::mm::paging::PageTable* pagemap, ker::mo
         return COLLECT_RET;
     }
 
+    int const PREFLIGHT_RET = preflight_file_mmap_sync_ranges(pagemap, live_task, ranges);
+    if (PREFLIGHT_RET != 0) {
+        release_file_mmap_sync_ranges(ranges);
+        return PREFLIGHT_RET;
+    }
+
     int result = 0;
     for (size_t range_index = 0; range_index < ranges.size(); ++range_index) {
         const auto& range = ranges.at(range_index);
+        if (range.skip_writeback) {
+            ker::vfs::vfs_put_file(range.file);
+            continue;
+        }
         uint64_t page_vaddr = page_align_down(range.sync_start);
         while (page_vaddr < range.sync_end) {
             uint64_t const PAGE_END = page_vaddr + ker::mod::mm::paging::PAGE_SIZE;
@@ -1167,42 +1218,44 @@ auto sync_file_mmap_range_quiesced(ker::mod::mm::paging::PageTable* pagemap, uin
     return sync_file_mmap_range_impl(pagemap, nullptr, start, length);
 }
 
+// The caller lends an independently retained File. Only successful registry
+// publication acquires a new reference; no final close can run under its lock.
 auto register_file_mmap_range(ker::mod::mm::paging::PageTable* pagemap, uint64_t start, uint64_t length, uint64_t file_offset,
-                              ker::vfs::File* file) -> bool {
-    if (pagemap == nullptr || file == nullptr || length == 0 || start > UINT64_MAX - length) {
-        return false;
-    }
-
+                              ker::vfs::File* file, bool writeback) -> int {
+    if (pagemap == nullptr || file == nullptr || length == 0 || start > UINT64_MAX - length) return -EINVAL;
     FileMmapRange const RANGE{
         .pagemap = pagemap,
         .start = start,
         .length = length,
         .file_offset = file_offset,
         .file = file,
+        .writeback = writeback,
     };
-
     g_file_mmap_ranges_lock.lock();
     bool const OK = g_file_mmap_ranges.push_back(RANGE);
+    if (OK) ker::vfs::vfs_retain_file(file);
     g_file_mmap_ranges_lock.unlock();
-    return OK;
+    return OK ? 0 : -ENOMEM;
 }
 
-auto register_file_mmap_range_from_fd(ker::mod::sched::task::Task* task, int fd, uint64_t start, uint64_t length, uint64_t file_offset)
+// Caller holds SharedVmemPublicationGuard. Registry ownership pins every File
+// while this allocation-free preflight reads its immutable admitted policy.
+auto authorize_shared_file_protection_locked(ker::mod::mm::paging::PageTable* pagemap, uint64_t start, uint64_t length, uint64_t prot)
     -> int {
-    if (task == nullptr || task->pagemap == nullptr) {
-        return -ESRCH;
+    if ((prot & ker::abi::vmem::PROT_WRITE) == 0) return 0;
+    g_file_mmap_ranges_lock.lock();
+    int result = 0;
+    for (const auto& range : g_file_mmap_ranges) {
+        if (range.pagemap != pagemap || !ranges_overlap(start, start + length, range.start, file_mmap_range_end(range))) continue;
+        auto* file = range.file;
+        if (file == nullptr || ker::mod::security::authorize_file_mapping(static_cast<unsigned>(file->open_flags & 3), true, true,
+                                                                          ker::vfs::file_mount_read_only(*file)) != 0) {
+            result = -EACCES;
+            break;
+        }
     }
-
-    auto* file = ker::vfs::vfs_get_file_retain(task, fd);
-    if (file == nullptr) {
-        return -EBADF;
-    }
-
-    if (!register_file_mmap_range(task->pagemap, start, length, file_offset, file)) {
-        ker::vfs::vfs_put_file(file);
-        return -ENOMEM;
-    }
-    return 0;
+    g_file_mmap_ranges_lock.unlock();
+    return result;
 }
 
 auto unregister_one_file_mmap_overlap(ker::mod::mm::paging::PageTable* pagemap, uint64_t start, uint64_t end, bool* removed_any) -> int {
@@ -1927,9 +1980,9 @@ auto anon_free(uint64_t addr, uint64_t size) -> uint64_t {
     return 0;  // Success
 }
 
-// Allocate file-backed (MAP_PRIVATE) memory
-auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, int fd, uint64_t offset) -> uint64_t {
-    auto* task = get_current_task();
+// Allocate file-backed memory with one admitted open description.
+auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, int fd, uint64_t offset)
+    -> uint64_t {
     if (task == nullptr || task->pagemap == nullptr) {
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
     }
@@ -1940,14 +1993,24 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
     }
 
+    // Declared before publication_guard so even rollback's last File close
+    // happens after shared VM publication unlocks. FD reuse cannot retarget us.
+    auto release_file = [](ker::vfs::File* file) { ker::vfs::vfs_put_file(file); };
+    std::unique_ptr<ker::vfs::File, decltype(release_file)> retained_file(ker::vfs::vfs_get_file_retain(task, fd), release_file);
+    auto* file = retained_file.get();
     ker::vfs::Stat st{};
-    int const STAT_RET = ker::vfs::vfs_fstat(fd, &st);
+    int const STAT_RET = ker::vfs::vfs_fstat_file(file, &st);
     if (STAT_RET < 0) {
         log::warn("file mmap fstat failed: fd=%d ret=%d hint=0x%llx size=0x%llx flags=0x%llx prot=0x%llx off=0x%llx", fd, STAT_RET,
                   static_cast<unsigned long long>(hint), static_cast<unsigned long long>(size), static_cast<unsigned long long>(flags),
                   static_cast<unsigned long long>(prot), static_cast<unsigned long long>(offset));
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
     }
+
+    int const POLICY_RET =
+        ker::mod::security::authorize_file_mapping(static_cast<unsigned>(file->open_flags & 3), (flags & ker::abi::vmem::MAP_SHARED) != 0,
+                                                   (prot & ker::abi::vmem::PROT_WRITE) != 0, ker::vfs::file_mount_read_only(*file));
+    if (POLICY_RET != 0) return static_cast<uint64_t>(POLICY_RET);
 
     uint64_t const REQUESTED_SIZE = size;
     size = page_align_up(size);
@@ -1989,34 +2052,26 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
     bool const HAS_ADDRESS_RESERVATION = !IS_FIXED;
     auto const PAGE_FLAGS = file_mapping_page_flags(prot, flags);
     auto const NUM_PAGES = size / ker::mod::mm::paging::PAGE_SIZE;
-    bool const TRACK_FILE_MAPPING = file_mmap_should_track(st, flags);
+    bool const TRACK_FILE_MAPPING = (flags & ker::abi::vmem::MAP_SHARED) != 0;
+    bool const WRITEBACK = (st.st_mode & ker::vfs::S_IFMT) == ker::vfs::S_IFREG;
     if (IS_FIXED) {
         release_fixed_mmap_range_locked(task, vaddr, size);
     }
 
     if ((st.st_mode & ker::vfs::S_IFMT) == ker::vfs::S_IFREG && lazy_file_mmap_enabled()) {
-        auto* file = ker::vfs::vfs_get_file_retain(task, fd);
-        if (file == nullptr) {
-            release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
-            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
-        }
-
         if (!add_shared_lazy_file_vmem_range_locked(task, vaddr, size, prot, flags, file, offset, st)) {
-            ker::vfs::vfs_put_file(file);
             (void)remove_shared_vmem_range_locked(task, vaddr, size);
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
         }
 
         if (TRACK_FILE_MAPPING) {
-            int const REGISTER_RET = register_file_mmap_range_from_fd(task, fd, vaddr, REQUESTED_SIZE, offset);
+            int const REGISTER_RET = register_file_mmap_range(task->pagemap, vaddr, REQUESTED_SIZE, offset, file, WRITEBACK);
             if (REGISTER_RET < 0) {
                 (void)remove_shared_vmem_range_locked(task, vaddr, size);
-                ker::vfs::vfs_put_file(file);
                 return static_cast<uint64_t>(REGISTER_RET);
             }
         }
 
-        ker::vfs::vfs_put_file(file);
         advance_shared_mmap_cursor_locked(task, vaddr, size);
         record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::FILE_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES, 0, 0,
                                 vmem_latency_since(PERF_STARTED_US), vaddr, size, true);
@@ -2037,7 +2092,7 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
             uint64_t const CURRENT_VADDR = vaddr + (i * ker::mod::mm::paging::PAGE_SIZE);
             uint64_t const FILE_OFFSET = offset + (i * ker::mod::mm::paging::PAGE_SIZE);
             void* page = nullptr;
-            if (!file_mmap_cached_page(fd, st, FILE_OFFSET, &page)) {
+            if (!file_mmap_cached_page_for_file(file, st, FILE_OFFSET, &page)) {
                 cache_ok = false;
                 break;
             }
@@ -2060,7 +2115,7 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
         if (cache_ok) {
             ker::mod::mm::virt::flush_page_map_batch(&map_batch);
             if (TRACK_FILE_MAPPING) {
-                int const REGISTER_RET = register_file_mmap_range_from_fd(task, fd, vaddr, REQUESTED_SIZE, offset);
+                int const REGISTER_RET = register_file_mmap_range(task->pagemap, vaddr, REQUESTED_SIZE, offset, file, WRITEBACK);
                 if (REGISTER_RET < 0) {
                     rollback_mapped_pages(task, vaddr, mapped_pages);
                     release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
@@ -2082,19 +2137,12 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
     // mutate the descriptor offset, and positional reads avoid remote VFS
     // sequential read-ahead while materializing ELF segments.
     auto const FILE_SIZE = static_cast<uint64_t>(st.st_size);
-    auto* eager_file = ker::vfs::vfs_get_file_retain(task, fd);
-    if (eager_file == nullptr) {
-        release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
-        return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
-    }
-
     uint64_t mapped_pages = 0;
     for (uint64_t i = 0; i < NUM_PAGES; i++) {
         auto current_vaddr = vaddr + (i * ker::mod::mm::paging::PAGE_SIZE);
         void* const PHYS_PAGE = ker::mod::mm::phys::page_alloc_with_reclaim_may_fail(ker::mod::mm::PhysicalPageOwner::USER_FILE_MAPPING,
                                                                                      ker::mod::mm::paging::PAGE_SIZE, "vmem-file");
         if (PHYS_PAGE == nullptr) {
-            ker::vfs::vfs_put_file(eager_file);
             rollback_mapped_pages(task, vaddr, mapped_pages);
             release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
@@ -2103,7 +2151,6 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
 
         if (i > (std::numeric_limits<uint64_t>::max() - offset) / ker::mod::mm::paging::PAGE_SIZE) {
             ker::mod::mm::phys::page_ref_dec(PHYS_PAGE);
-            ker::vfs::vfs_put_file(eager_file);
             rollback_mapped_pages(task, vaddr, mapped_pages);
             release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EOVERFLOW);
@@ -2114,15 +2161,13 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
             uint64_t const READ_SIZE = std::min<uint64_t>(ker::mod::mm::paging::PAGE_SIZE, FILE_SIZE - FILE_OFFSET);
             if (FILE_OFFSET > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
                 ker::mod::mm::phys::page_ref_dec(PHYS_PAGE);
-                ker::vfs::vfs_put_file(eager_file);
                 rollback_mapped_pages(task, vaddr, mapped_pages);
                 release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
                 return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EOVERFLOW);
             }
 
-            if (!read_file_mapping_exact(eager_file, PHYS_PAGE, static_cast<size_t>(READ_SIZE), FILE_OFFSET)) {
+            if (!read_file_mapping_exact(file, PHYS_PAGE, static_cast<size_t>(READ_SIZE), FILE_OFFSET)) {
                 ker::mod::mm::phys::page_ref_dec(PHYS_PAGE);
-                ker::vfs::vfs_put_file(eager_file);
                 rollback_mapped_pages(task, vaddr, mapped_pages);
                 release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
                 return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
@@ -2144,16 +2189,14 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
     }
 
     if (TRACK_FILE_MAPPING && REQUESTED_SIZE > 0) {
-        int const REGISTER_RET = register_file_mmap_range_from_fd(task, fd, vaddr, REQUESTED_SIZE, offset);
+        int const REGISTER_RET = register_file_mmap_range(task->pagemap, vaddr, REQUESTED_SIZE, offset, file, WRITEBACK);
         if (REGISTER_RET < 0) {
-            ker::vfs::vfs_put_file(eager_file);
             rollback_mapped_pages(task, vaddr, mapped_pages);
             release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
             return static_cast<uint64_t>(REGISTER_RET);
         }
     }
 
-    ker::vfs::vfs_put_file(eager_file);
     release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
     advance_shared_mmap_cursor_locked(task, vaddr, size);
     record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::FILE_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES, 0, 0,
@@ -2162,6 +2205,460 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
 }
 
 }  // anonymous namespace
+
+#ifdef WOS_SELFTEST
+auto selftest_file_mapping_admission(ker::mod::mm::paging::PageTable* pagemap) -> bool {
+    namespace vfs = ker::vfs;
+    namespace vm = ker::abi::vmem;
+    namespace virt = ker::mod::mm::virt;
+    namespace phys = ker::mod::mm::phys;
+    namespace paging = ker::mod::mm::paging;
+    constexpr uint64_t BASE = USER_SPACE_START;
+    constexpr uint64_t SIZE = paging::PAGE_SIZE;
+    struct State {
+        unsigned reads{};
+        unsigned closes{};
+        bool close_unlocked = true;
+        ker::mod::sched::task::Task* replace_task{};
+        vfs::File* replacement{};
+        int fd{};
+        bool replaced{};
+    };
+    vfs::FileOperations operations{};
+    operations.vfs_read = [](vfs::File* file, void* out, size_t count, size_t) -> ssize_t {
+        auto& state = *static_cast<State*>(file->private_data);
+        ++state.reads;
+        if (state.replace_task != nullptr && !state.replaced) {
+            state.replaced = true;
+            vfs::vfs_release_fd(state.replace_task, state.fd);
+            vfs::vfs_put_file(file);
+            state.replaced = vfs::vfs_alloc_fd(state.replace_task, state.replacement) == state.fd;
+        }
+        std::memset(out, 0x41, count);
+        return static_cast<ssize_t>(count);
+    };
+    operations.vfs_close = [](vfs::File* file) -> int {
+        auto& state = *static_cast<State*>(file->private_data);
+        ++state.closes;
+        bool const UNLOCKED = g_shared_vmem_publication_lock.try_lock();
+        if (UNLOCKED) g_shared_vmem_publication_lock.unlock();
+        state.close_unlocked = state.close_unlocked && UNLOCKED;
+        return 0;
+    };
+    auto make_file = [&](State& state, unsigned mode, bool readonly, bool regular) -> vfs::File* {
+        auto* file = new (std::nothrow) vfs::File{};
+        if (file == nullptr) return nullptr;
+        file->fs_type = vfs::FSType::SOCKET;
+        file->fops = &operations;
+        file->private_data = &state;
+        file->open_flags = static_cast<int>(mode);
+        file->mount_policy.read_only = readonly;
+        file->pos = 17;
+        file->refcount.store(1);
+        file->exec_read_view.reset(new (std::nothrow) vfs::ExecReadView{});
+        if (file->exec_read_view == nullptr) {
+            vfs::vfs_put_file(file);
+            return nullptr;
+        }
+        file->exec_read_view->content_id = vfs::ExecContentState::allocate_identity();
+        file->exec_read_view->metadata.st_mode = regular ? vfs::S_IFREG : vfs::S_IFSOCK;
+        file->exec_read_view->metadata.st_size = static_cast<off_t>(SIZE);
+        return file;
+    };
+    for (unsigned mode = 0; mode <= vfs::FILE_ACCESS_SEARCH_ONLY; ++mode) {
+        for (bool readonly : {false, true}) {
+            for (bool shared : {false, true}) {
+                for (uint64_t prot : {vm::PROT_NONE, vm::PROT_READ, vm::PROT_READ | vm::PROT_WRITE}) {
+                    ker::mod::sched::task::Task task;
+                    task.pagemap = pagemap;
+                    State state;
+                    auto* file = make_file(state, mode, readonly, true);
+                    if (file == nullptr) return false;
+                    int const FD = vfs::vfs_alloc_fd(&task, file);
+                    if (FD < 0) {
+                        vfs::vfs_put_file(file);
+                        return false;
+                    }
+                    auto* marker = phys::page_alloc(ker::mod::mm::PhysicalPageOwner::SELFTEST, SIZE, "mmap-policy-marker");
+                    if (marker == nullptr) {
+                        vfs::vfs_release_fd(&task, FD);
+                        vfs::vfs_put_file(file);
+                        return false;
+                    }
+                    std::memset(marker, 0x5a, SIZE);
+                    auto const MARKER_PHYS =
+                        reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(marker)));
+                    virt::map_page(pagemap, BASE, MARKER_PHYS, paging::page_types::USER);
+                    uint64_t const CURSOR = task.mmap_next.load(std::memory_order_relaxed);
+                    bool const DENIED = mode == 1 || mode == vfs::FILE_ACCESS_SEARCH_ONLY ||
+                                        (shared && (prot & vm::PROT_WRITE) != 0 && (mode != 2 || readonly));
+                    uint64_t const RESULT =
+                        file_allocate(&task, BASE, SIZE - 1, prot, vm::MAP_FIXED | (shared ? vm::MAP_SHARED : vm::MAP_PRIVATE), FD, 0);
+                    bool ok = RESULT == (DENIED ? static_cast<uint64_t>(-EACCES) : BASE) && file->pos == 17;
+                    if (DENIED) {
+                        ok = ok && virt::translate(pagemap, BASE) == MARKER_PHYS && static_cast<uint8_t*>(marker)[0] == 0x5a &&
+                             file->refcount.load() == 1 && state.reads == 0 && state.closes == 0 && task.lazy_vmem_ranges.empty() &&
+                             task.mmap_next.load(std::memory_order_relaxed) == CURSOR;
+                    } else if (shared) {
+                        // The descriptor can disappear or be reused without changing
+                        // the File selected by stat, faulting, or mprotect admission.
+                        State replacement_state;
+                        auto* replacement = make_file(replacement_state, 2, false, false);
+                        if (replacement == nullptr) ok = false;
+                        vfs::vfs_release_fd(&task, FD);
+                        vfs::vfs_put_file(file);
+                        int const NEW_FD = replacement == nullptr ? -1 : vfs::vfs_alloc_fd(&task, replacement);
+                        ok = ok && NEW_FD == FD && state.closes == 0;
+                        {
+                            SharedVmemPublicationGuard guard;
+                            ok = ok && authorize_shared_file_protection_locked(pagemap, BASE, SIZE, vm::PROT_WRITE) ==
+                                           (mode != 2 || readonly ? -EACCES : 0);
+                            ok = ok && authorize_shared_file_protection_locked(pagemap, BASE, SIZE, vm::PROT_READ) == 0;
+                            for (const auto& range : task.lazy_vmem_ranges) {
+                                ok = ok && range.file == file && range.prot == prot;
+                                if (prot != vm::PROT_NONE) {
+                                    paging::PageFault fault{};
+                                    ok = materialize_lazy_file_page_impl(&task, range, BASE, fault) && ok;
+                                }
+                            }
+                        }
+                        if (prot != vm::PROT_NONE) {
+                            auto const PADDR = virt::translate(pagemap, BASE);
+                            ok = ok && PADDR != virt::PADDR_INVALID;
+                            if (PADDR != virt::PADDR_INVALID) {
+                                auto* data = reinterpret_cast<uint8_t*>(ker::mod::mm::addr::get_virt_pointer(PADDR));
+                                ok = ok && data[0] == 0x41 && state.reads != 0 && replacement_state.reads == 0;
+                            }
+                        }
+                        remove_lazy_vmem_range(&task, BASE, SIZE);
+                        unregister_file_mmap_range(pagemap, BASE, SIZE);
+                        rollback_mapped_pages(&task, BASE, 1);
+                        if (NEW_FD >= 0) vfs::vfs_release_fd(&task, NEW_FD);
+                        if (replacement != nullptr) vfs::vfs_put_file(replacement);
+                        if (!ok || state.closes != 1 || !state.close_unlocked) return false;
+                        continue;
+                    }
+                    remove_lazy_vmem_range(&task, BASE, SIZE);
+                    unregister_file_mmap_range(pagemap, BASE, SIZE);
+                    rollback_mapped_pages(&task, BASE, 1);
+                    vfs::vfs_release_fd(&task, FD);
+                    vfs::vfs_put_file(file);
+                    if (!ok || state.closes != 1 || !state.close_unlocked) return false;
+                }
+            }
+        }
+    }
+    // Non-regular files force eager materialization. Replace the FD from its
+    // read callback; MAP_PRIVATE has no registry reference to mask final close.
+    for (bool shared : {false, true}) {
+        ker::mod::sched::task::Task task;
+        task.pagemap = pagemap;
+        State state, replacement_state;
+        auto* file = make_file(state, 0, true, false);
+        auto* replacement = make_file(replacement_state, 2, false, false);
+        if (file == nullptr || replacement == nullptr) {
+            vfs::vfs_put_file(file);
+            vfs::vfs_put_file(replacement);
+            return false;
+        }
+        int const FD = vfs::vfs_alloc_fd(&task, file);
+        if (FD < 0) {
+            vfs::vfs_put_file(file);
+            vfs::vfs_put_file(replacement);
+            return false;
+        }
+        state.replace_task = &task;
+        state.replacement = replacement;
+        state.fd = FD;
+        uint64_t const RESULT =
+            file_allocate(&task, BASE, SIZE, vm::PROT_READ, vm::MAP_FIXED | (shared ? vm::MAP_SHARED : vm::MAP_PRIVATE), FD, 0);
+        bool ok = RESULT == BASE && state.replaced && state.reads == 1 && replacement_state.reads == 0 && state.close_unlocked;
+        {
+            SharedVmemPublicationGuard guard;
+            ok = ok && authorize_shared_file_protection_locked(pagemap, BASE, SIZE, vm::PROT_WRITE) == (shared ? -EACCES : 0);
+            ker::util::SmallVec<FileMmapSyncRange, 8> sync;
+            ok = ok && collect_file_mmap_sync_ranges(pagemap, BASE, SIZE, sync) == 0 && sync.empty();
+        }
+        unregister_file_mmap_range(pagemap, BASE, SIZE);
+        remove_lazy_vmem_range(&task, BASE, SIZE);
+        rollback_mapped_pages(&task, BASE, 1);
+        auto* remaining = vfs::vfs_get_file(&task, FD);
+        vfs::vfs_release_fd(&task, FD);
+        vfs::vfs_put_file(remaining);
+        if (!state.replaced) vfs::vfs_put_file(replacement);
+        if (!ok || state.closes != 1 || !state.close_unlocked) return false;
+    }
+    // Clone and split keep the original policy, including a request that
+    // starts in an allowed range and ends in a denied, unmaterialized page.
+    State denied_state, allowed_state;
+    auto* denied = make_file(denied_state, 0, true, true);
+    auto* allowed = make_file(allowed_state, 2, false, true);
+    if (denied == nullptr || allowed == nullptr) {
+        vfs::vfs_put_file(denied);
+        vfs::vfs_put_file(allowed);
+        return false;
+    }
+    paging::PageTable clone{};
+    bool ok = true;
+    {
+        SharedVmemPublicationGuard guard;
+        ok = register_file_mmap_range(pagemap, BASE, SIZE, 0, allowed, true) == 0 && ok;
+        ok = register_file_mmap_range(pagemap, BASE + SIZE, 3 * SIZE - 1, 0, denied, true) == 0 && ok;
+        ok = ok && authorize_shared_file_protection_locked(pagemap, BASE, 4 * SIZE, vm::PROT_WRITE) == -EACCES;
+        ok = clone_file_mmap_ranges_for_pagemap_locked(pagemap, &clone) && ok;
+        ok = unregister_file_mmap_range(&clone, BASE + 2 * SIZE, SIZE) == 0 && ok;
+        ok = ok && authorize_shared_file_protection_locked(&clone, BASE + 3 * SIZE, SIZE, vm::PROT_WRITE) == -EACCES &&
+             authorize_shared_file_protection_locked(&clone, BASE, SIZE, vm::PROT_WRITE) == 0 &&
+             authorize_shared_file_protection_locked(&clone, BASE + 2 * SIZE, SIZE, vm::PROT_WRITE) == 0;
+        ok = unregister_file_mmap_range(pagemap, BASE, 4 * SIZE) == 0 && ok;
+        ok = unregister_file_mmap_range(&clone, BASE, 4 * SIZE) == 0 && ok;
+    }
+    ok = ok && denied->refcount.load() == 1 && allowed->refcount.load() == 1 && denied_state.reads == 0 && allowed_state.reads == 0;
+    vfs::vfs_put_file(denied);
+    vfs::vfs_put_file(allowed);
+    return ok && denied_state.closes == 1 && allowed_state.closes == 1 && denied_state.close_unlocked && allowed_state.close_unlocked;
+}
+
+auto selftest_file_mmap_sync_preflight(ker::mod::mm::paging::PageTable* pagemap) -> bool {
+    namespace vfs = ker::vfs;
+    namespace virt = ker::mod::mm::virt;
+    namespace phys = ker::mod::mm::phys;
+    namespace paging = ker::mod::mm::paging;
+    constexpr uint64_t BASE = USER_SPACE_START;
+    constexpr uint64_t PAGE = paging::PAGE_SIZE;
+    constexpr size_t COUNT = 16;
+    constexpr uint64_t MAX_OFFSET = static_cast<uint64_t>(std::numeric_limits<off_t>::max());
+    struct State {
+        std::array<uint8_t, COUNT> bytes{};
+        unsigned writes{};
+        unsigned closes{};
+        int backend_error{};
+        bool callback_safe = true;
+        bool dirty_later{};
+        ker::mod::sched::task::Task* task{};
+        void* first_page{};
+        void* second_page{};
+    };
+    vfs::FileOperations operations{};
+    operations.vfs_write = [](vfs::File* file, const void* bytes, size_t count, size_t offset) -> ssize_t {
+        auto& state = *static_cast<State*>(file->private_data);
+        ++state.writes;
+        bool const REGISTRY_UNLOCKED = g_file_mmap_ranges_lock.try_lock();
+        if (REGISTRY_UNLOCKED) g_file_mmap_ranges_lock.unlock();
+        state.callback_safe = state.callback_safe && REGISTRY_UNLOCKED && state.task->usercopy_pagemap_accesses.load() == 0 &&
+                              phys::page_ref_get(state.first_page) == 1 && phys::page_ref_get(state.second_page) == 1 &&
+                              file->refcount.load() == 3;
+        if (state.dirty_later) {
+            state.dirty_later = false;
+            virt::UserPagePin pin{};
+            bool const PINNED = virt::pin_user_page(state.task->pagemap, BASE + PAGE, true, pin);
+            state.callback_safe = PINNED && state.callback_safe;
+            if (PINNED) {
+                state.callback_safe = virt::user_page_pin_commit_write(pin) && state.callback_safe;
+                virt::unpin_user_page(pin);
+            }
+        }
+        if (state.backend_error != 0) return state.backend_error;
+        size_t const SHORT_COUNT = std::min(count, size_t{7});
+        if (offset > state.bytes.size() || SHORT_COUNT > state.bytes.size() - offset) return -EFBIG;
+        std::memcpy(state.bytes.data() + offset, bytes, SHORT_COUNT);
+        return static_cast<ssize_t>(SHORT_COUNT);
+    };
+    operations.vfs_close = [](vfs::File* file) -> int {
+        auto& state = *static_cast<State*>(file->private_data);
+        ++state.closes;
+        bool const REGISTRY_UNLOCKED = g_file_mmap_ranges_lock.try_lock();
+        if (REGISTRY_UNLOCKED) g_file_mmap_ranges_lock.unlock();
+        bool const PUBLICATION_UNLOCKED = g_shared_vmem_publication_lock.try_lock();
+        if (PUBLICATION_UNLOCKED) g_shared_vmem_publication_lock.unlock();
+        state.callback_safe = state.callback_safe && REGISTRY_UNLOCKED && PUBLICATION_UNLOCKED;
+        return 0;
+    };
+    auto run = [&](unsigned mode, bool readonly, bool dirty, uint64_t offset, uint64_t length, int expected, bool quiesced, bool teardown,
+                   bool dirty_later, int backend_error) -> bool {
+        ker::mod::sched::task::Task task;
+        task.pagemap = pagemap;
+        State first{.dirty_later = dirty_later, .task = &task};
+        State second{.backend_error = backend_error, .task = &task};
+        auto* first_file = new (std::nothrow) vfs::File{};
+        auto* second_file = new (std::nothrow) vfs::File{};
+        if (first_file == nullptr || second_file == nullptr) {
+            delete first_file;
+            delete second_file;
+            return false;
+        }
+        for (auto* file : {first_file, second_file}) {
+            file->fs_type = vfs::FSType::SOCKET;
+            file->fops = &operations;
+            file->refcount.store(1);
+            file->open_flags = 2;
+            file->pos = 19;
+        }
+        first_file->private_data = &first;
+        second_file->private_data = &second;
+        second_file->open_flags = static_cast<int>(mode);
+        second_file->mount_policy.read_only = readonly;
+        first.first_page = phys::page_alloc(ker::mod::mm::PhysicalPageOwner::SELFTEST, PAGE, "msync-first");
+        first.second_page = phys::page_alloc(ker::mod::mm::PhysicalPageOwner::SELFTEST, PAGE, "msync-second");
+        second.first_page = first.first_page;
+        second.second_page = first.second_page;
+        if (first.first_page == nullptr || first.second_page == nullptr) {
+            if (first.first_page != nullptr) phys::page_free(first.first_page);
+            if (first.second_page != nullptr) phys::page_free(first.second_page);
+            vfs::vfs_put_file(first_file);
+            vfs::vfs_put_file(second_file);
+            return false;
+        }
+        auto phys_address = [](void* page) -> uint64_t {
+            return reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(page)));
+        };
+        std::memset(first.first_page, 0x41, PAGE);
+        std::memset(first.second_page, 0x42, PAGE);
+        virt::map_page(pagemap, BASE, phys_address(first.first_page), paging::page_types::USER);
+        virt::map_page(pagemap, BASE + PAGE, phys_address(first.second_page), paging::page_types::USER);
+        bool ok = true;
+        auto mark_dirty = [&](uint64_t address) {
+            virt::UserPagePin pin{};
+            if (!virt::pin_user_page(pagemap, address, true, pin)) {
+                ok = false;
+                return;
+            }
+            ok = virt::user_page_pin_commit_write(pin) && ok;
+            virt::unpin_user_page(pin);
+        };
+        mark_dirty(BASE);
+        if (dirty) mark_dirty(BASE + PAGE);
+        int result = 0;
+        {
+            SharedVmemPublicationGuard guard;
+            ok = register_file_mmap_range(pagemap, BASE, COUNT, 0, first_file, true) == 0 && ok;
+            ok = register_file_mmap_range(pagemap, BASE + PAGE, length, offset, second_file, true) == 0 && ok;
+            if (!teardown) result = sync_file_mmap_range_impl(pagemap, quiesced ? nullptr : &task, BASE, PAGE + length);
+        }
+        if (teardown) {
+            release_file_mmap_ranges_for_pagemap(pagemap);
+            result = expected;  // The teardown API logs admission failures and returns void.
+        }
+        bool const PREFLIGHT_DENIAL = expected != 0 && backend_error == 0;
+        ok = ok && result == expected && first_file->pos == 19 && second_file->pos == 19 && first.callback_safe && second.callback_safe &&
+             first_file->refcount.load() == (teardown ? 1 : 2) && second_file->refcount.load() == (teardown ? 1 : 2);
+        if (PREFLIGHT_DENIAL) {
+            ok = ok && first.writes == 0 && second.writes == 0 && first.bytes == std::array<uint8_t, COUNT>{} &&
+                 second.bytes == std::array<uint8_t, COUNT>{};
+        } else {
+            std::array<uint8_t, COUNT> expected_first{};
+            expected_first.fill(0x41);
+            ok = ok && first.writes == 3 && first.bytes == expected_first;
+            if (backend_error != 0)
+                ok = ok && second.writes == 1 && second.bytes == std::array<uint8_t, COUNT>{};
+            else if (dirty) {
+                std::array<uint8_t, COUNT> expected_second{};
+                expected_second.fill(0x42);
+                ok = ok && second.writes == 3 && second.bytes == expected_second;
+            } else
+                ok = ok && second.writes == 0 && second.bytes == std::array<uint8_t, COUNT>{};
+        }
+        if (dirty_later) {
+            // A newly dirty invalid interval is excluded from this completed
+            // operation. A subsequent call rejects before repeating any write.
+            unsigned const WRITES = first.writes;
+            SharedVmemPublicationGuard guard;
+            ok = ok && sync_file_mmap_range_impl(pagemap, quiesced ? nullptr : &task, BASE, PAGE + length) == -EOVERFLOW &&
+                 first.writes == WRITES && second.writes == 0;
+        }
+        for (uint64_t address : {BASE, BASE + PAGE}) {
+            virt::UserPagePin pin{};
+            bool const PINNED = virt::pin_user_page(pagemap, address, false, pin);
+            ok = PINNED && ok;
+            if (PINNED) {
+                ok = ok && pin.dirty == (address == BASE || dirty || dirty_later);
+                virt::unpin_user_page(pin);
+            }
+        }
+        ok = ok && static_cast<uint8_t*>(first.first_page)[0] == 0x41 && static_cast<uint8_t*>(first.second_page)[0] == 0x42 &&
+             phys::page_ref_get(first.first_page) == 1 && phys::page_ref_get(first.second_page) == 1;
+        unregister_file_mmap_range(pagemap, BASE, PAGE + length);
+        rollback_mapped_pages(&task, BASE, 2);
+        ok = ok && first_file->refcount.load() == 1 && second_file->refcount.load() == 1;
+        vfs::vfs_put_file(first_file);
+        vfs::vfs_put_file(second_file);
+        return ok && first.closes == 1 && second.closes == 1 && first.callback_safe && second.callback_safe;
+    };
+    for (bool quiesced : {false, true}) {
+        for (unsigned mode = 0; mode <= vfs::FILE_ACCESS_SEARCH_ONLY; ++mode) {
+            for (bool readonly : {false, true}) {
+                for (bool dirty : {false, true}) {
+                    int const EXPECTED = !dirty ? 0 : mode == 0 || mode == vfs::FILE_ACCESS_SEARCH_ONLY ? -EBADF : readonly ? -EROFS : 0;
+                    if (!run(mode, readonly, dirty, 0, COUNT, EXPECTED, quiesced, false, false, 0)) return false;
+                }
+            }
+        }
+        if (!run(2, false, true, MAX_OFFSET - 7, COUNT, -EOVERFLOW, quiesced, false, false, 0) ||
+            !run(2, false, true, UINT64_MAX, COUNT, -EOVERFLOW, quiesced, false, false, 0) ||
+            !run(2, false, true, MAX_OFFSET - PAGE + 1, PAGE + COUNT, -EOVERFLOW, quiesced, false, false, 0) ||
+            !run(2, false, false, MAX_OFFSET - 7, COUNT, 0, quiesced, false, true, 0) ||
+            !run(2, false, true, 0, COUNT, -EIO, quiesced, false, false, -EIO))
+            return false;
+    }
+    return run(2, true, true, 0, COUNT, -EROFS, true, true, false, 0);
+}
+
+auto selftest_file_writeback_policy() -> bool {
+    namespace vfs = ker::vfs;
+    struct State {
+        std::array<uint8_t, 8> bytes{};
+        unsigned writes{};
+        unsigned fail_call{};
+    };
+    vfs::FileOperations operations{};
+    operations.vfs_write = [](vfs::File* file, const void* data, size_t count, size_t offset) -> ssize_t {
+        auto& state = *static_cast<State*>(file->private_data);
+        ++state.writes;
+        if (state.writes == state.fail_call) return -EIO;
+        size_t const SHORT_COUNT = std::min(count, size_t{2});
+        if (offset > state.bytes.size() || SHORT_COUNT > state.bytes.size() - offset) return -EFBIG;
+        std::memcpy(state.bytes.data() + offset, data, SHORT_COUNT);
+        return static_cast<ssize_t>(SHORT_COUNT);
+    };
+    constexpr std::array<uint8_t, 4> DATA{'k', 'e', 'e', 'p'};
+    constexpr uint64_t MAX_OFFSET = static_cast<uint64_t>(std::numeric_limits<off_t>::max());
+    for (unsigned mode = 0; mode <= vfs::FILE_ACCESS_SEARCH_ONLY; ++mode) {
+        for (bool readonly : {false, true}) {
+            State state;
+            vfs::File file;
+            file.fs_type = vfs::FSType::SOCKET;
+            file.fops = &operations;
+            file.private_data = &state;
+            file.open_flags = static_cast<int>(mode);
+            file.mount_policy.read_only = readonly;
+            file.refcount.store(1, std::memory_order_relaxed);
+            file.pos = 9;
+            int const EXPECTED = mode == 0 || mode == vfs::FILE_ACCESS_SEARCH_ONLY ? -EBADF : readonly ? -EROFS : 0;
+            if (write_file_mapping_bytes(&file, DATA.data(), DATA.size(), 1) != EXPECTED || file.pos != 9 || file.refcount.load() != 1)
+                return false;
+            if (EXPECTED != 0) {
+                if (state.writes != 0 || state.bytes != std::array<uint8_t, 8>{}) return false;
+            } else if (state.writes != 2 || std::memcmp(state.bytes.data() + 1, DATA.data(), DATA.size()) != 0)
+                return false;
+            auto const BEFORE = state;
+            if (write_file_mapping_bytes(&file, DATA.data(), DATA.size(), MAX_OFFSET - 1) != -EOVERFLOW ||
+                write_file_mapping_bytes(&file, DATA.data(), 1, UINT64_MAX) != -EOVERFLOW ||
+                write_file_mapping_bytes(&file, DATA.data(), 0, 0) != 0 || state.writes != BEFORE.writes || state.bytes != BEFORE.bytes)
+                return false;
+        }
+    }
+    State state{.fail_call = 2};
+    vfs::File file;
+    file.fs_type = vfs::FSType::SOCKET;
+    file.fops = &operations;
+    file.private_data = &state;
+    file.open_flags = 2;
+    if (write_file_mapping_bytes(&file, DATA.data(), DATA.size(), 1) != -EIO || state.writes != 2 || state.bytes[1] != DATA[0] ||
+        state.bytes[2] != DATA[1] || state.bytes[3] != 0 || file.pos != 0)
+        return false;
+    return write_file_mapping_bytes(nullptr, DATA.data(), DATA.size(), 0) == -ENOSYS;
+}
+#endif
 
 SharedVmemPublicationGuard::SharedVmemPublicationGuard() { g_shared_vmem_publication_lock.lock(); }
 
@@ -2343,6 +2840,13 @@ void release_file_mmap_ranges_for_pagemap(ker::mod::mm::paging::PageTable* pagem
         return;
     }
 
+    // Teardown is one writeback operation: a later denied range must not be
+    // discovered only after an earlier registry row has already been flushed.
+    int const SYNC_RET = sync_file_mmap_range_quiesced(pagemap, 0, USER_SPACE_END + 1);
+    if (SYNC_RET < 0) {
+        log::warn("file mmap release sync failed: pagemap=%p ret=%d", static_cast<void*>(pagemap), SYNC_RET);
+    }
+
     for (;;) {
         FileMmapRange range{};
         bool found = false;
@@ -2358,12 +2862,6 @@ void release_file_mmap_ranges_for_pagemap(ker::mod::mm::paging::PageTable* pagem
 
         if (!found) {
             return;
-        }
-
-        int const SYNC_RET = sync_file_mmap_range_quiesced(pagemap, range.start, range.length);
-        if (SYNC_RET < 0) {
-            log::warn("file mmap release sync failed: pagemap=%p start=0x%llx length=0x%llx ret=%d", static_cast<void*>(pagemap),
-                      static_cast<unsigned long long>(range.start), static_cast<unsigned long long>(range.length), SYNC_RET);
         }
 
         int const UNREGISTER_RET = unregister_file_mmap_range(pagemap, range.start, range.length);
@@ -2464,6 +2962,9 @@ auto mmap_msync(uint64_t addr, uint64_t size, uint64_t /*flags*/) -> uint64_t {
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
     }
 
+    // Keep the collected File identity bound to its pages until snapshots and
+    // writes finish, matching munmap and MAP_FIXED's existing serialization.
+    SharedVmemPublicationGuard publication_guard;
     int const RET = sync_file_mmap_range(*task, addr, size);
     return RET < 0 ? static_cast<uint64_t>(RET) : 0;
 }
@@ -2514,6 +3015,32 @@ auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -
             SharedVmemPublicationGuard publication_guard;
             if (overlaps_kernel_managed_user_layout_locked(task, ADDR, size)) {
                 return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
+            }
+
+            int const FILE_POLICY_RET = authorize_shared_file_protection_locked(task->pagemap, ADDR, size, PROT);
+            if (FILE_POLICY_RET != 0) return static_cast<uint64_t>(FILE_POLICY_RET);
+
+            // Validate the entire request before either lazy-range metadata or
+            // leaf permissions change. SHM publication uses this same guard.
+            if ((PROT & ker::abi::vmem::PROT_WRITE) != 0) {
+                uint64_t const END = ADDR + size;
+                uint64_t cursor = ADDR;
+                while (cursor < END) {
+                    auto const OCCUPIED = first_pagemap_occupied_range(task->pagemap, cursor, END);
+                    if (!OCCUPIED.found) {
+                        break;
+                    }
+                    for (uint64_t page = OCCUPIED.start; page < OCCUPIED.end; page += ker::mod::mm::paging::PAGE_SIZE) {
+                        if (ker::mod::mm::virt::is_page_write_restricted(task->pagemap, page)) {
+                            return static_cast<uint64_t>(-EACCES);
+                        }
+                    }
+                    uint64_t const NEXT = page_align_up(OCCUPIED.end);
+                    if (NEXT <= cursor) {
+                        break;
+                    }
+                    cursor = NEXT;
+                }
             }
 
             if (!protect_shared_vmem_range_locked(task, ADDR, size, PROT)) {
@@ -2609,7 +3136,7 @@ auto sys_vmem_map(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, u
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
     }
 
-    uint64_t const RESULT = file_allocate(hint, size, prot, flags, static_cast<int>(fd), offset);
+    uint64_t const RESULT = file_allocate(get_current_task(), hint, size, prot, flags, static_cast<int>(fd), offset);
     if (static_cast<int64_t>(RESULT) < 0) {
         log::warn("file mmap failed: ret=%ld fd=%llu hint=0x%llx size=0x%llx flags=0x%llx prot=0x%llx off=0x%llx",
                   static_cast<long>(static_cast<int64_t>(RESULT)), static_cast<unsigned long long>(fd),

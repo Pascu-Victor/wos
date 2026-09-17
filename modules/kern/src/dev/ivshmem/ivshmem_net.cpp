@@ -164,6 +164,7 @@ ker::net::NetDeviceOps ivshmem_ops = {
     .start_xmit = ivshmem_start_xmit,
     .set_mac = ivshmem_set_mac,
     .set_queue_cpu = nullptr,
+    .check_mac = ker::net::netdev_check_fixed_mac,
 };
 
 // -- IRQ handler (minimal - just schedule NAPI) --

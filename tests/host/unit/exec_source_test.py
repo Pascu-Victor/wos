@@ -173,15 +173,15 @@ def require_callers_use_sparse_reader(source: str) -> None:
         fail("ELF_READ perf summary must report actual bytes read")
 
     for snippet in [
-        "vfs::File* exec_file = vfs::vfs_open_file(exec_path, 0, 0)",
+        "vfs::vfs_open_file_as(*task, request->admitted_credentials, exec_path, 0, &exec_file)",
         "release_exec_file_once",
         "ElfLoadOptions const MAIN_LOAD_OPTIONS",
         ".lazy_file_ranges = EXEC_LAZY_FILE_SEGMENTS ? &main_loader_lazy_ranges : nullptr",
         "append_exec_lazy_file_ranges(new_lazy_ranges, main_loader_lazy_ranges, exec_file, exec_stat)",
-        "vfs::File* interp_file = vfs::vfs_open_file(INTERP_PATH, interp_open_flags, 0)",
+        "vfs::vfs_open_file_as(*task, request->admitted_credentials, INTERP_PATH, interp_open_flags,",
         "append_exec_lazy_file_ranges(new_lazy_ranges, interp_loader_lazy_ranges, interp_file, interp_stat)",
-        "swap_exec_lazy_ranges(task, new_lazy_ranges, old_lazy_ranges)",
-        "new_lazy_ranges_published = true",
+        "swap_exec_lazy_ranges(task, image.lazy_ranges, retired.lazy_ranges)",
+        "prepared.release_after_commit()",
     ]:
         if snippet not in source:
             fail(f"execve lazy ELF range lifetime invariant missing: {snippet}")
@@ -196,7 +196,8 @@ def require_large_dynamic_elf_is_file_backed(source: str) -> None:
         "loader::elf::load_elf(prepared_elf.view",
         "new_task->initialize_process_image(prepared_elf.view",
         "new_task->exec_image_file = exec_file",
-        "task->exec_image_file = FILE_BACKED_ELF ? exec_file : nullptr",
+        ".exec_image_file = FILE_BACKED_ELF ? exec_file : nullptr",
+        "task->exec_image_file = image.exec_image_file",
     ]:
         if snippet not in source:
             fail(f"large dynamic ELF file-backed invariant missing: {snippet}")
@@ -231,17 +232,22 @@ def require_large_dynamic_elf_is_file_backed(source: str) -> None:
             fail(f"coredump must preserve full file-backed ELF payload: {snippet}")
 
     remote_source = REMOTE_COMPUTE_CPP.read_text()
-    if "task->elf_buffer_complete && task->elf_buffer != nullptr" not in remote_source:
+    if "BINARY_COMPLETE && BINARY != nullptr" not in remote_source:
         fail("WKI must not transmit compact ELF metadata as a complete inline executable")
 
 
 def require_stdio_fallback_access_modes(source: str) -> None:
     body = function_body(source, "ensure_exec_stdio_fallbacks")
+    for name in ["ensure_exec_stdio_fallbacks", "collect_cloexec_fds_locked"]:
+        owner_body = function_body(source, name)
+        owner = "task = task != nullptr ? task->credential_owner() : nullptr;"
+        if owner not in owner_body or owner_body.index(owner) > owner_body.index("task->fd_table_lock.lock_irqsave()"):
+            fail(f"{name} must resolve the retained process FD owner before table access")
     for snippet in [
         "constexpr int STDIN_OPEN_FLAGS = 0;",
         "constexpr int STDOUT_OPEN_FLAGS = 1;",
         "int const OPEN_FLAGS = fd == 0 ? STDIN_OPEN_FLAGS : STDOUT_OPEN_FLAGS;",
-        'vfs::devfs::devfs_open_path("/dev/console", OPEN_FLAGS, 0)',
+        'vfs::devfs::devfs_open_path(CREDENTIALS, "/dev/console", OPEN_FLAGS, 0)',
         "install_exec_fd_file_checked(task, fd, new_file)",
     ]:
         if snippet not in body:
@@ -274,7 +280,7 @@ def require_spawn_actions_snapshot_user_memory_and_preserve_cloexec_sources(sour
         "snapshot_exec_arguments(*parent, path_addr, argv_addr, envp_addr, arguments)",
         "new (std::nothrow) SpawnOptionsSnapshot",
         "snapshot_spawn_options(*parent, options_addr, *snapshot)",
-        "wos_proc_exec_impl(arguments.path.data(), arguments.argv, arguments.envp, &snapshot->options, 0)",
+        "wos_proc_exec_impl(arguments.path.data(), arguments.argv, arguments.envp, &snapshot->options, 0, ADMITTED_CREDENTIALS)",
         "delete snapshot",
     ]:
         if snippet not in spawn:
@@ -283,14 +289,14 @@ def require_spawn_actions_snapshot_user_memory_and_preserve_cloexec_sources(sour
     exec_entry = function_body(source, "wos_proc_exec")
     for snippet in [
         "snapshot_exec_arguments(*parent, path_addr, argv_addr, envp_addr, snapshot)",
-        "wos_proc_exec_impl(snapshot.path.data(), snapshot.argv, snapshot.envp, nullptr, 0)",
+        "wos_proc_exec_impl(snapshot.path.data(), snapshot.argv, snapshot.envp, nullptr, 0, ADMITTED_CREDENTIALS)",
     ]:
         if snippet not in exec_entry:
             fail(f"exec syscall must deep-snapshot user path/vector memory: {snippet}")
 
     exec_impl = function_body(source, "wos_proc_exec_impl")
     clone_pos = exec_impl.find("clone_exec_fd_table_checked(parent_task, new_task, spawn_options != nullptr)")
-    apply_pos = exec_impl.find("apply_spawn_options(new_task, spawn_options)")
+    apply_pos = exec_impl.find("apply_spawn_options(new_task, spawn_options, &options_error)")
     close_pos = exec_impl.find("close_spawn_cloexec_fds(new_task)")
     if clone_pos < 0 or apply_pos <= clone_pos or close_pos <= apply_pos:
         fail("spawn must clone CLOEXEC sources, apply ordered actions, then close remaining CLOEXEC descriptors")
@@ -298,8 +304,10 @@ def require_spawn_actions_snapshot_user_memory_and_preserve_cloexec_sources(sour
         fail("option-aware spawn must not reopen descriptors intentionally closed by file actions")
 
     apply = function_body(source, "apply_spawn_options")
-    if "task->pgid = options->pgroup == 0 ? task->pid : static_cast<uint64_t>(options->pgroup)" not in apply:
-        fail("spawn SETPGROUP must create Ninja's requested child process group")
+    group_admission = apply.find("session::prepare_spawn_group(*task, options->pgroup)")
+    file_actions = apply.find("for (uint64_t i = 0; i < options->action_count;")
+    if group_admission < 0 or file_actions <= group_admission:
+        fail("spawn must admit the requested process group before destructive file actions")
 
     if source.count("publication lost child ownership for PID %x") != 2:
         fail("spawn publication ownership diagnostics must cover local and remote children")
@@ -372,7 +380,7 @@ def require_bounded_contiguous_loader(loader_source: str) -> None:
             fail(f"bounded ELF length propagation missing: {snippet}")
     file_body = function_body(EXEC_CPP.read_text(), "create_file_backed_process_task")
     ordered = ["claim_unpublished_process(OWNER, new_task)", "new_task->resources = resources",
-               "new_task->uid = real_uid", "reservation.attach(*new_task)", "initialize_process_image(prepared_elf.view"]
+               "initialize_credentials(*new_task, credentials)", "reservation.attach(*new_task)", "initialize_process_image(prepared_elf.view"]
     positions = [file_body.find(token) for token in ordered]
     if any(position < 0 for position in positions) or positions != sorted(positions):
         fail("file-backed receiver must own the child and apply policy/population before image initialization")
@@ -384,7 +392,7 @@ def require_remote_execfn_auxv() -> None:
         "AT_EXECFN_ADDR = push_string(new_task->exe_path.data())",
         "constexpr uint64_t AT_EXECFN = 31",
         "append_auxv(AT_EXECFN, AT_EXECFN_ADDR)",
-        "size_t const AUXV_QWORDS = 18 + (new_task->interp_base != 0 ? 2 : 0)",
+        "size_t const AUXV_QWORDS = 18 + ker::mod::security::exec_policy::IDENTITY_AUXV_WORDS + (new_task->interp_base != 0 ? 2 : 0)",
     ]:
         if snippet not in source:
             fail(f"WKI receiver AT_EXECFN invariant missing: {snippet}")
@@ -448,9 +456,404 @@ def require_rtld_self_relocation_is_single_pass() -> None:
             fail(f"initial ld.so must be older than the first normal relocation transaction: {snippet}")
 
 
+def require_main_exec_retirement_order(source: str) -> None:
+    body = function_body(source, "finish_native_exec_image")
+    commit = function_body(source, "commit_native_exec_image")
+    tokens = ["MutexGuard action_guard", "SharedVmemPublicationGuard publication_guard",
+              "prepare_exec_credentials(", "exec_admission.begin(*task)", "publish_staged_process(",
+              "if (commit_published)", "retired.elf_buffer = task->elf_buffer", "task->mark_exec_completed()",
+              "publish_exec_credentials(", "replace_pagemap_after_usercopy_quiescence(", "swap_exec_lazy_ranges(", "prepared.release_after_commit()"]
+    positions = [commit.index(token) for token in tokens]
+    if positions != sorted(positions):
+        fail("native image commit must validate authorization and admission before publishing or detaching old storage")
+    for token in ["get_current_task(", "syscall_kernel_stack", "syscall_scratch_area", "retire_exec_siblings(", "vfs_close("]:
+        if token in commit:
+            fail("image publication must not infer its subject or change executor ownership/cleanup")
+    tokens = ["commit_native_exec_image(task, *PREPARED)", "if (COMMIT_RESULT < 0)",
+              "cleanup_exec_preparation(*task)", "retire_exec_siblings(*task)",
+              "task->reset_signal_state_for_exec()", "collect_cloexec_fds_locked(task, fds)",
+              "ensure_exec_stdio_fallbacks(task)", "Exec admission and owned storage are gone", "// === CRITICAL SECTION"]
+    positions = [body.index(token) for token in tokens]
+    if positions != sorted(positions):
+        fail("exec retirement must follow validated commit and precede userspace return")
+    failure_start = body.index("if (COMMIT_RESULT < 0)")
+    failure = body[failure_start:body.index("return static_cast<uint64_t>(COMMIT_RESULT)", failure_start)]
+    if "cleanup_exec_preparation(*task)" not in failure or "retire_exec_siblings" in failure:
+        fail("failed exec must recover owned admission/storage without retiring siblings")
+    if body.rindex("cleanup_exec_preparation(*task)") < body.index("ensure_exec_stdio_fallbacks(task)"):
+        fail("successful exec must retain recovery ownership and admission through final shared state")
+    if body.index('asm volatile("mov %0, %%cr3"') > body.index("retire_exec_siblings(*task)"):
+        fail("retirement must wait only after replacement CR3 is active")
+    if "*reinterpret_cast<cpu::GPRegs*>(stack_base) = INITIAL_REGS;" not in body:
+        fail("exec user entry must use private startup registers across retirement/preemption")
+    resource = (ROOT / "modules/kern/src/platform/sched/resource.cpp").read_text()
+    if "owner->resource_cpu_admission_closed || owner->resource_exec_admission_closed" not in resource:
+        fail("thread binding must observe temporary exec admission")
+    finish = function_body(resource, "ExecAdmission::finish")
+    if "resource_cpu_admission_closed" in finish:
+        fail("exec token must not reopen permanent exit admission")
+    exit_source = (ROOT / "modules/kern/src/syscalls_impl/process/exit.cpp").read_text()
+    retirement = function_body(exit_source, "retire_exec_siblings")
+    if not (retirement.index("executor.is_thread") < retirement.index("request_thread_group_exit") <
+            retirement.index("resource_cpu_threads.load") < retirement.index("kern_yield")):
+        fail("main exec must use same-group cooperative requests and wait for CPU cleanup")
+
+
+def require_tracked_exec_cleanup(source: str) -> None:
+    cleanup = function_body(source, "cleanup_exec_preparation")
+    order = ["compare_exchange_strong", "owned_exec_preparation.load", "prepared->discard()",
+             "owned_exec_preparation.exchange(nullptr", "delete prepared", "teardown_in_progress.store(false"]
+    positions = [cleanup.index(token) for token in order]
+    if positions != sorted(positions):
+        fail("exec recovery must stay registered and guarded through blocking discard")
+    if "process_exit_requested.store" in cleanup:
+        fail("exec cleanup must preserve pending group exit")
+    adoption = function_body(source, "adopt_exec_preparation")
+    if adoption.index("compare_exchange_strong") > adoption.index("prepared.release()"):
+        fail("only successful slot adoption may consume preparation ownership")
+    body = function_body(source, "finish_native_exec_image")
+    begin = body.index("int COMMIT_RESULT = prepare_native_exec_quiescence")
+    guard = "task->exec_preparation_teardown_in_progress.store(true"
+    unguard = "task->exec_preparation_teardown_in_progress.store(false"
+    failed_return = body.index("return static_cast<uint64_t>(COMMIT_RESULT)", begin)
+    active = body.index("PREPARED->mark_activated()", failed_return)
+    if not (body.rfind(guard, 0, begin) >= 0 and
+            body.index(unguard, begin) < failed_return and
+            body.index(unguard, failed_return) > active and
+            body.index('asm volatile("mov %0, %%cr3"', failed_return) < active and
+            body.index("cpu_set_msr(IA32_KERNEL_GS_BASE", failed_return) < active):
+        fail("fatal recovery must remain deferred from partial publication through CR3/TLS activation")
+    for forbidden in ["ExecAdmission exec_admission;", "RetiredExecImage retired;", "exec_admission.finish()"]:
+        if forbidden in body:
+            fail("noreturn exec resources must not be owned only by the caller stack")
+    prepared = source[source.index("class PreparedNativeExecImage {"):]
+    discard = function_body(prepared, "discard")
+    if not (discard.index("m_phase == Phase::PUBLISHED") < discard.index("std::exchange(m_phase, Phase::DISCARDED)") <
+            discard.index("discard_retired()") < discard.index("m_admission.finish()")):
+        fail("active cleanup must protect activation and release old storage before admission")
+    if discard.rindex("m_admission.finish()") > discard.index("loader::debug::unregister_process"):
+        fail("failed publication must reopen temporary admission before private VFS/MM cleanup")
+    retired = function_body(prepared, "discard_retired")
+    for token in ["m_retired.pagemap != m_image.pagemap", "!m_retired.pagemap_has_other_publishers",
+                  "release_file_mmap_ranges_for_pagemap(m_retired.pagemap)", "release_pagemap(m_retired.pagemap, m_origin_pid)",
+                  "m_retired.thread != m_image.thread", "destroy_thread(m_retired.thread)"]:
+        if token not in retired:
+            fail("retired cleanup must preserve replacement and last-publisher ownership")
+    exit_source = (ROOT / "modules/kern/src/syscalls_impl/process/exit.cpp").read_text()
+    thread_source = (ROOT / "modules/kern/src/syscalls_impl/multiproc/threadControl.cpp").read_text()
+    signal_source = (ROOT / "modules/kern/src/platform/sys/signal.cpp").read_text()
+    for text, function, task in [(exit_source, "wos_proc_exit_with_wait_status", "current_task"),
+                                  (thread_source, "wos_thread_exit_current", "task")]:
+        code = function_body(text, function)
+        tokens = [f"{task}->exit_in_progress = true", f"{task}->quiesce_usercopy_pagemap()",
+                  f"release_lazy_vmem_ranges(*{task})", f"cleanup_exec_preparation(*{task})",
+                  f"wki_wait_cleanup_for_task({task})", f"{task}->has_exited = true"]
+        positions = [code.index(token) for token in tokens]
+        if positions != sorted(positions):
+            fail("process/thread exit must recover exec storage before waiter teardown and death")
+        if function == "wos_thread_exit_current" and code.index(f"release_lazy_vmem_ranges(*{task})") > code.index("finish_cpu()"):
+            fail("worker executable references must retire before the owner can publish group exit")
+    vmem_source = (ROOT / "modules/kern/src/syscalls_impl/vmem/sys_vmem.cpp").read_text()
+    add_range = function_body(vmem_source, "add_lazy_vmem_range_entry")
+    if not (add_range.index("lazy_vmem_lock.lock_irqsave()") < add_range.index("usercopy_pagemap_closing.load") <
+            add_range.index("for (const auto& range")):
+        fail("shared mmap must not refill a closing task's lazy references")
+    for text, function in [(exit_source, "take_requested_process_exit"),
+                           (signal_source, "exit_current_on_pending_fatal_default_signal")]:
+        code = function_body(text, function)
+        if "exec_preparation_teardown_in_progress.load" not in code[:code.index("return")]:
+            fail("both fatal/group exit entrypoints must defer during exec preparation cleanup")
+
+
+def require_native_exec_borrows_kernel_argument_snapshot(source: str) -> None:
+    wrapper = function_body(source, "wos_proc_execve")
+    if wrapper.index("snapshot_exec_arguments(*task") >= wrapper.index("wos_proc_execve_impl(snapshot.path.data(), snapshot.argv, snapshot.envp"):
+        fail("native exec must snapshot user arguments before borrowing")
+    body = function_body(source, "wos_proc_execve_impl")
+    for token in ["K_ARGV = argv != nullptr ? argv : empty_vector.data()",
+                  "K_ENVP = envp != nullptr ? envp : empty_vector.data()",
+                  "try_process_remote_exec(*task", "exec_stat, EXEC_NOSUID, remote_error", "push_string(K_ARGV[i])", "push_string(K_ENVP[i])"]:
+        if token not in body:
+            fail("native exec must use snapshotted argument storage and preserve empty-vector remote classification")
+    for forbidden in ["new char*[argv_count", "new char*[envp_count", "free_kernel_arg_env", "delete[] K_ARGV", "delete[] K_ENVP"]:
+        if forbidden in body:
+            fail("native exec must not duplicate or release borrowed argument ownership")
+
+
+def require_request_arguments_are_published_before_usercopy(source: str) -> None:
+    wrapper = function_body(source, "wos_proc_execve")
+    if wrapper.index("adopt_exec_arguments(*task, pending)") > wrapper.index("snapshot_exec_arguments(*task"):
+        fail("root argument storage must be recoverable before faulting usercopy")
+    vector = function_body(source, "snapshot_exec_vector")
+    if "auto& string_addrs = snapshot.input_string_addrs" not in vector:
+        fail("input-address spill must belong to snapshot recovery")
+    cleanup = function_body(source, "cleanup_exec_preparation")
+    order = ["compare_exchange_strong", "prepared->discard()", "owned_exec_arguments.load", "delete arguments",
+             "owned_exec_arguments.exchange", "exec_preparation_teardown_in_progress.store(false"]
+    if [cleanup.index(token) for token in order] != sorted(cleanup.index(token) for token in order):
+        fail("shared guard must protect image and argument recovery through final disposal")
+    shebang = function_body(source, "exec_shebang_script")
+    if "request->prepare_shebang" not in shebang or "return static_cast<uint64_t>(RESULT)" not in shebang:
+        fail("native shebang must own forwarded bytes and preserve preparation errno")
+    native = function_body(source, "wos_proc_execve_impl")
+    if "task->owned_exec_arguments.load" not in native:
+        fail("native recursion must use its task-owned argument request")
+
+
+def require_native_loader_scratch_is_request_owned(source: str) -> None:
+    native = function_body(source, "wos_proc_execve_impl")
+    if native.index("request->native_scratch(shebang_depth)") > native.index("vfs::vfs_open_file_as(*task"):
+        fail("native scratch must be retained before potentially blocking loader work")
+    for snippet in ["auto& prepared_elf = scratch->prepared_elf",
+                    "auto& main_loader_lazy_ranges = scratch->main_lazy_ranges",
+                    "auto& interp_loader_lazy_ranges = scratch->interp_lazy_ranges",
+                    "auto*& argv_addrs = scratch->argv_addrs",
+                    "auto*& envp_addrs = scratch->envp_addrs"]:
+        if snippet not in native:
+            fail(f"native temporary storage must belong to the request: {snippet}")
+    for snippet in ["PreparedFileBackedElf prepared_elf;", "ElfLazyLoadRangeVec main_loader_lazy_ranges;",
+                    "ElfLazyLoadRangeVec interp_loader_lazy_ranges;", "delete[] argv_addrs", "delete[] envp_addrs"]:
+        if snippet in native:
+            fail(f"native scratch must not retain independent lexical ownership: {snippet}")
+    owner_start = source.index("class ExecRequestArguments {")
+    owner = source[owner_start:source.index("// Owns prepared/retired storage", owner_start)]
+    for snippet in ["std::array<NativeScratch, MAX_SHEBANG_DEPTH + 1>", "~NativeScratch()",
+                    "delete[] argv_addrs", "delete[] envp_addrs"]:
+        if snippet not in owner:
+            fail("every allowed recursion depth must have scratch with one cleanup owner")
+
+
+def require_preparation_unwinds_before_completion(source: str) -> None:
+    prepare = function_body(source, "wos_proc_execve_impl")
+    wrapper = function_body(source, "wos_proc_execve")
+    finish = function_body(source, "finish_native_exec_image")
+    for forbidden in ["commit_native_exec_image(", "retire_exec_siblings(", "mark_activated(", "mov %0, %%cr3"]:
+        if forbidden in prepare:
+            fail("recursive loader must return its owned preparation before image completion")
+    if prepare.index("adopt_exec_preparation(*task, prepared)") > prepare.index("request->completion ="):
+        fail("only an adopted preparation may publish completion metadata")
+    order = ["wos_proc_execve_impl(snapshot.path.data()", "owned_exec_preparation.load",
+             "if (RESULT == 0 && prepared != nullptr)", "return finish_native_exec_image(task, prepared, request->completion)"]
+    if [wrapper.index(t) for t in order] != sorted(wrapper.index(t) for t in order):
+        fail("wrapper must complete only successful native preparation after recursive unwind")
+    if "auto const INITIAL_REGS = PREPARED->view().registers" not in finish:
+        fail("completion must copy startup registers before destroying the image owner")
+    after_cleanup = finish[finish.rindex("cleanup_exec_preparation(*task)"):]
+    for forbidden in ["PREPARED->", "request->", "completion."]:
+        if forbidden in after_cleanup:
+            fail("return-frame patch must not borrow disposed preparation/request data")
+
+
+def require_worker_handoff_ownership_and_exit_order(source: str) -> None:
+    submit = function_body(source, "handoff_worker_exec")
+    order = ["SharedVmemPublicationGuard", "prepare_exec_credentials", "prepared.admission().begin(worker)",
+             "resource_lock.lock_irqsave", "pending_exec_handoff.store", "resource_lock.unlock_irqrestore",
+             "wake_task_for_signal", "handoff.result.load", "wos_thread_exit_current"]
+    if [submit.index(t) for t in order] != sorted(submit.index(t) for t in order):
+        fail("worker admission/publication/wait/retirement must follow single-owner protocol")
+    claim = function_body(source, "claim_pending_exec_handoff")
+    order = ["resource_lock.lock_irqsave", "owned_exec_preparation.exchange(nullptr", "owned_exec_preparation.store(prepared",
+             "pending_exec_handoff.store(nullptr", "active_exec_handoff.store(handoff"]
+    if [claim.index(t) for t in order] != sorted(claim.index(t) for t in order):
+        fail("owner claim must atomically transfer the parked worker image slot")
+    ack = function_body(source, "acknowledge_worker_exec")
+    if ack.index("active_exec_handoff.store(nullptr") > ack.index("handoff.result.store"):
+        fail("owner must detach the request before allowing worker destruction")
+    exit_source = (ROOT / "modules/kern/src/syscalls_impl/process/exit.cpp").read_text()
+    exiting = function_body(exit_source, "wos_proc_exit_with_wait_status")
+    if exiting.index("cancel_pending_exec_handoff(*current_task)") > exiting.index("while (current_task->resource_cpu_threads"):
+        fail("owner exit must cancel handoff before waiting for worker CPU cleanup")
+    cancel = function_body(source, "cancel_pending_exec_handoff")
+    for token in ["pending_exec_handoff.exchange(nullptr", "active_exec_handoff.exchange(nullptr", "-ECANCELED"]:
+        if token not in cancel:
+            fail("exit must cancel both queued and claimed worker waits")
+    prepare = function_body(source, "wos_proc_execve_impl")
+    if prepare.index("if (PROCESS_OWNER == nullptr)") > prepare.index("PROCESS_OWNER->pid"):
+        fail("native initial TCB identity requires a validated process owner")
+    finish = function_body(source, "finish_native_exec_image")
+    entry_start = finish.index("if (OWNER_HANDOFF)")
+    entry = finish[entry_start:]
+    order = ['asm volatile("cli"', "set_voluntary_blocked(false)", "context.frame.rip = new_initial_rip",
+             "SYNTHETIC_USER_RETURN", "wos_asm_enter_exec_owner"]
+    if [entry.index(t) for t in order] != sorted(entry.index(t) for t in order):
+        fail("owner entry must rebuild user provenance after blocking cleanup")
+    assembly = (ROOT / "modules/kern/src/platform/sys/context_switch.asm").read_text()
+    entry = assembly[assembly.index("wos_asm_enter_exec_owner:"):assembly.index("global wos_asm_enter_usermode")]
+    if not (entry.index("cli") < entry.index("mov rsp, rdx") < entry.index("call wos_discard_abandoned_return_fpu_state") < entry.index("jmp wos_asm_enter_usermode")):
+        fail("owner entry must reset the canonical kernel stack before userspace entry")
+
+
+def require_spawn_open_child_context(source: str) -> None:
+    body = function_body(source, "spawn_open_fd")
+    assert "vfs::vfs_openat(task, vfs::AT_FDCWD, action.path, action.oflag" in body
+    assert "vfs::vfs_open_file(" not in body
+    assert body.index("vfs::fd_limit_locked(*task)") < body.index("spawn_close_fd(task") < body.index("vfs::vfs_openat(")
+    assert "if (OPENED < 0) return OPENED" in body
+    assert "task->get_fd_cloexec" in body and "task->set_fd_cloexec" in body
+    assert "vfs::fd_usage_changed_locked(*task)" in body
+    duplicate = function_body(source, "spawn_dup2_fd")
+    assert "return -EBADF" in duplicate and "int result = -EBADF" in duplicate
+    assert "vfs::fd_usage_changed_locked(*task)" in duplicate
+    assert duplicate.index("unlock_irqrestore(IRQF)", duplicate.index("int result")) < duplicate.index("spawn_put_file(displaced)")
+    apply = function_body(source, "apply_spawn_options")
+    assert "*error_out = RESULT" in apply
+    implementation = function_body(source, "wos_proc_exec_impl")
+    assert implementation.index("initialize_credentials(*new_task, PARENT_CREDENTIALS)") < implementation.index("apply_spawn_options(new_task")
+    assert implementation.index("parent_task->capture_filesystem_context(filesystem)") < implementation.index("new_task->cwd = filesystem.cwd") < implementation.index("apply_spawn_options(new_task")
+    assert ".cwd = new_task->cwd.data()" in implementation
+    assert ".cwd = parent_task->cwd.data()" not in implementation
+    core = (ROOT / "modules/kern/src/vfs/core.cpp").read_text()
+    opening = function_body(core, "vfs_openat")
+    assert "open_at_for_task(task, dirfd, pathname, flags, mode, nullptr, true)" in opening
+    implementation = function_body(core, "open_at_for_task")
+    assert "consume_lookup_locked(lookup, false, consume_open, &context, task, &REQUEST_CREDENTIALS)" in implementation
+
+
+def require_local_exec_content_views(source: str) -> None:
+    for name in ("wos_proc_exec_impl", "wos_proc_execve_impl"):
+        body = function_body(source, name)
+        assert body.index("vfs_stabilize_exec_file(&exec_file)") < body.index("vfs_fstat_file(exec_file")
+    native = function_body(source, "wos_proc_execve_impl")
+    assert native.index("vfs_stabilize_exec_file(&interp_file)") < native.index("vfs_fstat_file(interp_file")
+    core = (ROOT / "modules/kern/src/vfs/core.cpp").read_text()
+    stable = function_body(core, "vfs_stabilize_exec_file")
+    assert "tmpfs_clone_exec_file" in stable and "xfs_clone_exec_file" in stable
+    assert "MountOpenFileReservation reservation(SOURCE->mount_owner)" in stable
+    assert stable.index("*owned = view.release()") < stable.index("vfs_put_file(SOURCE)")
+    stat = function_body(core, "vfs_fstat_file")
+    assert stat.index("exec_read_view->metadata") < stat.index("file_stat_snapshot_lookup")
+    task = (ROOT / "modules/kern/src/platform/sched/task.cpp").read_text()
+    boot = function_body(task, "read_boot_file_fully")
+    assert boot.index("vfs_stabilize_exec_file(&file)") < boot.index("ker::vfs::Stat freshness")
+    tmpfs = (ROOT / "modules/kern/src/vfs/fs/tmpfs.cpp").read_text()
+    for name in ("tmpfs_write_locked", "tmpfs_resize_locked"):
+        assert "!n->exec_content.can_mutate()" in function_body(tmpfs, name)
+    xfs = (ROOT / "modules/kern/src/vfs/fs/xfs/xfs_vfs.cpp").read_text()
+    for name in ("xfs_vfs_write_locked", "xfs_vfs_truncate_impl", "xfs_collect_swap_extents"):
+        assert "!ip->exec_content.can_mutate()" in function_body(xfs, name)
+    vm = (ROOT / "modules/kern/src/syscalls_impl/vmem/sys_vmem.cpp").read_text()
+    for name in ("file_mmap_key_equal", "file_mmap_key_hash", "file_mmap_cached_page_for_file"):
+        assert "exec_content_id" in function_body(vm, name)
+
+
+def require_one_shot_routing_commit(source: str) -> None:
+    native = function_body(source, "wos_proc_execve_impl")
+    assert native.index("if (REMOTE != ker::net::wki::WkiRemoteSpawnResult::LOCAL)") < native.index("consume_successful_one_shot_wki_target(task, REMOTE)")
+    compact = "".join(native.split())
+    assert ".one_shot_wki_target=(task->wki_target_flags&sched::task::Task::WKI_TARGET_FLAG_ONESHOT)!=0" in compact
+    prepared = source[source.index("class PreparedNativeExecImage {"):]
+    assert ".one_shot_wki_target = image.one_shot_wki_target" in prepared
+    commit = "".join(function_body(source, "commit_native_exec_image").split())
+    assert commit.index("if(commit_published)") < commit.index("publish_exec_credentials(*task") < commit.index("if(PUBLISH_RESULT==0&&image.one_shot_wki_target)") < commit.index("pin_completed_exec_locally(*task)") < commit.index("path_metadata_lock.unlock_irqrestore(PATH_IRQF)")
+
+
+def require_interpreter_execute_admission(source: str) -> None:
+    native = function_body(source, "wos_proc_execve_impl")
+    assert native.index("vfs_fstat_file(interp_file") < native.index("check_exec_permission_from_stat(request->admitted_credentials, interp_stat)") < native.index("new uint8_t[INTERP_SIZE]")
+    task = (ROOT / "modules/kern/src/platform/sched/task.cpp").read_text()
+    boot = function_body(task, "read_boot_file_fully")
+    compact_boot = "".join(boot.split())
+    assert compact_boot.index("vfs_fstat_file(file,&freshness)") < compact_boot.index("authorize_file_access(CREDENTIALS,") < compact_boot.index("boot_file_cache_lookup_copy")
+    assert "*interpreter_error = ACCESS_RESULT" in boot
+    complete = function_body(task, "complete_unpublished_process_construction")
+    assert "&interp_size, interpreter_error" in complete
+    spawn = function_body(source, "wos_proc_exec_impl")
+    assert "complete_unpublished_process_construction(new_task, &interpreter_error)" in spawn
+    assert "return static_cast<uint64_t>(interpreter_error)" in spawn
+    remote = REMOTE_COMPUTE_CPP.read_text()
+    for name in ("exec_elf_buffer", "exec_elf_file"):
+        body = function_body(remote, name)
+        assert "interpreter_error" in body and "TaskRejectReason::UNAUTHORIZED" in body
+
+
+def require_exec_credential_admission(source: str) -> None:
+    require_one_shot_routing_commit(source)
+    require_interpreter_execute_admission(source)
+    finish = function_body(source, "finish_native_exec_image")
+    assert finish.index("prepare_native_exec_quiescence") < finish.index("commit_native_exec_image") < finish.index("retire_exec_siblings")
+    commit = function_body(source, "commit_native_exec_image")
+    assert commit.index("exec_admission.quiesced(*task)") < commit.index("publish_staged_process") < commit.index("publish_exec_credentials")
+    handoff = function_body(source, "handoff_worker_exec")
+    assert handoff.index("ExecSafeWait") < handoff.index("handoff.result.load") < handoff.index("wos_thread_exit_current")
+    assert handoff.index("if (result != 0) safe_wait.wait_for_release()") < handoff.index("wos_thread_exit_current")
+    wrapper = function_body(source, "wos_proc_execve")
+    assert wrapper.index("pending->admitted_credentials = task->credentials()") < wrapper.index("snapshot_exec_arguments(*task")
+    for name in ("wos_proc_exec", "wos_proc_spawn"):
+        body = function_body(source, name)
+        assert body.index("ADMITTED_CREDENTIALS = parent->credentials()") < body.index("snapshot_exec_arguments(*parent")
+    for name in ("handoff_worker_exec", "commit_native_exec_image"):
+        assert "&image.admitted_credentials" in function_body(source, name)
+    assert ".admitted_credentials = image.admitted_credentials" in source
+    assert ".admitted_credentials = request->admitted_credentials" in source
+    assert "check_exec_permission_from_stat(request->admitted_credentials, exec_stat)" in source
+    assert "check_exec_permission_from_stat(PARENT_CREDENTIALS, exec_stat)" in source
+    for name in ("wos_proc_exec_impl", "wos_proc_execve_impl"):
+        assert "vfs::vfs_open_file(" not in function_body(source, name)
+    resource = (ROOT / "modules/kern/src/platform/sched/resource_process.cpp").read_text()
+    prepare = function_body(resource, "prepare_exec_credentials")
+    assert prepare.index("before != *admitted") < prepare.index("before.prepare_exec")
+
+
+def require_remote_exec_uses_canonical_owned_request(source: str) -> None:
+    prepare = function_body(source, "prepare_remote_exec_owner")
+    order = ["SharedVmemPublicationGuard", "owner.credentials() != plan.credentials", "plan.admission.begin(owner)",
+             "plan.admission.quiesce(owner)", "wki_exec_signal_snapshot(*plan.actor)"]
+    if [prepare.index(t) for t in order] != sorted(prepare.index(t) for t in order):
+        fail("remote exec must revalidate/quiesce canonical authority before copying actor signal state")
+    accepted = function_body(source, "accept_remote_exec_owner")
+    if accepted.index("acknowledge_worker_exec") > accepted.index("retire_exec_siblings"):
+        fail("accepted worker must be released before owner waits for its retirement")
+    run = function_body(source, "run_remote_exec_owner")
+    for token in ["CANDIDATE = plan.candidate()", ".exec_candidate = &CANDIDATE", ".prepare = prepare_remote_exec_owner", ".accepted = accept_remote_exec_owner",
+                  ".deferred_proxy_id = &request.remote_proxy_id", "plan.handoff", "request.remote.reset()"]:
+        if token not in run:
+            fail("remote owner needs private candidate input and deferred scheduler identity")
+    plan = source[source.index("struct RemoteExecPlan {"):source.index("struct WorkerExecHandoff {", source.index("struct RemoteExecPlan {"))]
+    assert "void bind(" not in plan and "void restore(" not in plan
+    assert "owner.elf_buffer =" not in plan
+    assert "consume_successful_one_shot_wki_target" not in run
+    cutover = function_body(source, "cutover_remote_exec_owner")
+    assert cutover.index("publish_exec_credentials") < cutover.index("if (ERROR != 0) return ERROR") < cutover.index("plan.publish_metadata(owner)")
+    wrapper = function_body(source, "wos_proc_execve")
+    if wrapper.rindex("cleanup_exec_preparation(*task)") > wrapper.index("publish_remote_exec_proxy(*task"):
+        fail("scheduler proxy identity cannot precede outer exec cleanup")
+    service = function_body(source, "service_pending_exec_handoff")
+    order = ["run_remote_exec_owner", "cleanup_exec_preparation(*owner)", "publish_remote_exec_proxy", "wos_asm_park_exec_owner"]
+    if [service.index(t) for t in order] != sorted(service.index(t) for t in order):
+        fail("canonical remote success must clean ownership and abandon the old owner continuation")
+    remote = function_body(source, "try_process_remote_exec")
+    for token in ["copy_arguments(argv, envp)", "std::memcpy(plan->bytes, elf, elf_size)", "ExecSafeWait safe_wait(actor)",
+                  "handoff.remote = false", "handoff.result.store(-EINPROGRESS"]:
+        if token not in remote:
+            fail("remote handoff input and optional native fallback must keep distinct ownership")
+    wki = (ROOT / "modules/kern/src/net/wki/remote_compute.cpp").read_text()
+    placement = function_body(wki, "wki_try_remote_spawn")
+    if placement.index("spec.prepare(*task") > placement.index("wki_ipc_export_task_fds"):
+        fail("canonical quiescence must precede FD export")
+    if placement.index("spec.accepted(*task") > placement.index("close_proxy_fd_table(task, true)"):
+        fail("accepted old-worker retirement must precede CLOEXEC cleanup")
+    if "!NEEDS_PROXY_PUBLICATION && spec.deferred_proxy_id == nullptr" not in placement:
+        fail("current exec needs to defer scheduler identity until all ownership is restored")
+
+
+def require_exec_auxv_matches_committed_snapshot() -> None:
+    source = (ROOT / "modules/kern/src/syscalls_impl/process/exec.cpp").read_text()
+    native = function_body(source, "commit_native_exec_image")
+    assert native.index("after_credentials != image.stack_credentials") < native.index("publish_staged_process")
+    assert ".stack_credentials = image.stack_credentials" in source
+    assert ".stack_credentials = stack_credentials" in source
+    assert "identity_auxv(EXEC_CREDENTIALS)" in source and "identity_auxv(stack_credentials)" in source
+    remote = function_body(REMOTE_COMPUTE_CPP.read_text(), "handle_task_submit_work")
+    assert remote.index("identity_auxv(CREDENTIAL_TRANSITION ? replacement_credentials : mapped_credentials)") < remote.index("publish_exec_credentials(*new_task")
+
+
 def main() -> None:
+    require_exec_auxv_matches_committed_snapshot()
     source = EXEC_CPP.read_text()
     loader_source = ELF_LOADER_CPP.read_text()
+    require_spawn_open_child_context(source)
+    require_exec_credential_admission(source)
+    require_local_exec_content_views(source)
     require_sparse_exec_reads(source)
     require_callers_use_sparse_reader(source)
     require_large_dynamic_elf_is_file_backed(source)
@@ -463,6 +866,14 @@ def main() -> None:
     require_loader_lazy_file_ranges(loader_source)
     require_coredump_entropy_redaction()
     require_rtld_self_relocation_is_single_pass()
+    require_main_exec_retirement_order(source)
+    require_tracked_exec_cleanup(source)
+    require_native_exec_borrows_kernel_argument_snapshot(source)
+    require_request_arguments_are_published_before_usercopy(source)
+    require_native_loader_scratch_is_request_owned(source)
+    require_preparation_unwinds_before_completion(source)
+    require_worker_handoff_ownership_and_exit_order(source)
+    require_remote_exec_uses_canonical_owned_request(source)
     print("exec sparse-read source invariants hold")
 
 

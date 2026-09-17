@@ -55,7 +55,7 @@ assert "if (INDEXED_ENTRY)" in leaf_remove
 assert "if (leaf_bh != nullptr)" in leaf_remove
 assert "dir2_make_data_free" in leaf_remove
 
-for caller in ("xfs_unlink_path", "xfs_rmdir_path", "xfs_rename_path"):
+for caller in ("xfs_unlink_path", "xfs_rmdir_path", "xfs_rename_lookup"):
     assert "xfs_dir_removename(" in function_body(VFS, f"auto {caller}(")
 
 single = function_body(VFS, "auto readdir_callback(")

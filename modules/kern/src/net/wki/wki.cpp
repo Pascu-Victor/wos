@@ -278,6 +278,9 @@ void process_deferred_auto_attach_work() {
     // These client operations may synchronously wait for a peer's owner-side
     // DEV_ATTACH handling. Keep them off the protocol-service worker so two
     // peers auto-mounting each other cannot deadlock both service paths.
+    wki_remote_vfs_process_pending_exec_cancellations();
+    wki_remote_vfs_process_pending_open_cancellations();
+    wki_remote_vfs_process_pending_unmounts();
     wki_remotable_process_pending_mounts();
     wki_remotable_process_pending_net_attaches();
 }
@@ -459,6 +462,8 @@ auto message_uses_compute_lifecycle(MsgType type) -> bool {
     switch (type) {
         case MsgType::TASK_SUBMIT:
         case MsgType::TASK_SUBMIT_FRAGMENT:
+        case MsgType::TASK_EXEC_READY:
+        case MsgType::TASK_EXEC_COMMIT:
         case MsgType::TASK_ACCEPT:
         case MsgType::TASK_REJECT:
             return true;
@@ -468,7 +473,11 @@ auto message_uses_compute_lifecycle(MsgType type) -> bool {
 }
 
 auto message_uses_deferred_compute_rx(MsgType type) -> bool {
-    return type == MsgType::TASK_COMPLETE || type == MsgType::TASK_CANCEL || type == MsgType::TASK_SUBMIT_FRAGMENT;
+    return type == MsgType::TASK_COMPLETE || type == MsgType::TASK_CANCEL || type == MsgType::TASK_SUBMIT_FRAGMENT ||
+           type == MsgType::TASK_CHILD_CLAIM_REQ || type == MsgType::TASK_CHILD_CLAIM_RESP || type == MsgType::TASK_CHILD_QUERY_REQ ||
+           type == MsgType::TASK_CHILD_QUERY_RESP || type == MsgType::TASK_CHILD_SIGNAL || type == MsgType::TASK_PARENT_DEATH ||
+           type == MsgType::TASK_TERMINAL_SIGNAL || type == MsgType::TASK_SIGNAL_REQ || type == MsgType::GROUP_SIGNAL_REQ ||
+           type == MsgType::GROUP_ROUTE_REQ || type == MsgType::GROUP_RECEIVER_REQ;
 }
 
 auto message_uses_deferred_remotable_rx(MsgType type) -> bool {
@@ -535,6 +544,18 @@ auto message_allows_shared_rx_peer_lifecycle(uint16_t channel_id, MsgType type, 
 
 auto message_is_epoch_reset_sensitive(MsgType type) -> bool {
     switch (type) {
+        case MsgType::ZONE_CREATE_REQ:
+        case MsgType::ZONE_CREATE_ACK:
+        case MsgType::ZONE_DESTROY:
+        case MsgType::ZONE_NOTIFY_PRE:
+        case MsgType::ZONE_NOTIFY_POST:
+        case MsgType::ZONE_NOTIFY_PRE_ACK:
+        case MsgType::ZONE_NOTIFY_POST_ACK:
+        case MsgType::ZONE_READ_REQ:
+        case MsgType::ZONE_READ_RESP:
+        case MsgType::ZONE_WRITE_REQ:
+        case MsgType::ZONE_WRITE_ACK:
+
         case MsgType::DEV_ATTACH_REQ:
         case MsgType::DEV_ATTACH_ACK:
         case MsgType::DEV_DETACH:
@@ -578,14 +599,17 @@ auto message_uses_vfs_export_admission(MsgType type, const uint8_t* payload, uin
                 return false;
             }
             auto const* req = reinterpret_cast<const DevOpReqPayload*>(payload);
-            return req->op_id >= OP_VFS_OPEN && req->op_id <= OP_VFS_XATTR;
+            return (req->op_id == OP_NET_OPEN_AS || req->op_id == OP_NET_CLOSE_AS || req->op_id == OP_NET_LINK_AS) ||
+                   (req->op_id >= OP_VFS_OPEN && req->op_id <= OP_VFS_DIRECTORY_REFERENCE) ||
+                   (req->op_id == OP_VFS_DIRECTORY_GRANT || req->op_id == OP_VFS_OPEN_LIFETIME);
         }
         case MsgType::DEV_OP_RESP: {
             if (payload_len < sizeof(DevOpRespPayload)) {
                 return false;
             }
             auto const* resp = reinterpret_cast<const DevOpRespPayload*>(payload);
-            return resp->op_id >= OP_VFS_OPEN && resp->op_id <= OP_VFS_XATTR;
+            return (resp->op_id >= OP_VFS_OPEN && resp->op_id <= OP_VFS_DIRECTORY_REFERENCE) ||
+                   (resp->op_id == OP_VFS_DIRECTORY_GRANT || resp->op_id == OP_VFS_OPEN_LIFETIME);
         }
         default:
             return false;
@@ -593,17 +617,27 @@ auto message_uses_vfs_export_admission(MsgType type, const uint8_t* payload, uin
 }
 
 auto admit_vfs_op(MsgType type, const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* channel,
-                  uint32_t channel_generation) -> WkiVfsOpRxAdmission {
+                  uint32_t channel_generation, uint64_t identity_policy, uint16_t identity_capabilities) -> WkiVfsOpRxAdmission {
     if (type != MsgType::DEV_OP_REQ || hdr == nullptr || payload == nullptr || channel == nullptr || channel_generation == 0 ||
         payload_len < sizeof(DevOpReqPayload)) {
         return WkiVfsOpRxAdmission::NOT_APPLICABLE;
     }
 
     auto const* req = reinterpret_cast<const DevOpReqPayload*>(payload);
-    bool const IS_VFS_OP = (req->op_id >= OP_VFS_OPEN && req->op_id <= OP_VFS_READ_BULK) || req->op_id == OP_VFS_UTIMENS ||
-                           req->op_id == OP_VFS_METADATA_BATCH || req->op_id == OP_VFS_XATTR;
+    bool const IS_VFS_OP = (req->op_id == OP_NET_OPEN_AS || req->op_id == OP_NET_CLOSE_AS || req->op_id == OP_NET_LINK_AS) ||
+                           (req->op_id >= OP_VFS_OPEN && req->op_id <= OP_VFS_READ_BULK) || req->op_id == OP_VFS_UTIMENS ||
+                           req->op_id == OP_VFS_METADATA_BATCH || req->op_id == OP_VFS_XATTR || req->op_id == OP_VFS_OPEN_READ_AS ||
+                           req->op_id == OP_VFS_OPEN_AS || req->op_id == OP_VFS_FSTAT || req->op_id == OP_VFS_STAT_AS ||
+                           req->op_id == OP_VFS_PATH_AS || req->op_id == OP_VFS_EXEC_VIEW || req->op_id == OP_VFS_DIRECTORY_REFERENCE ||
+                           (req->op_id == OP_VFS_DIRECTORY_GRANT || req->op_id == OP_VFS_OPEN_LIFETIME) || req->op_id == OP_VFS_FEATURES;
     size_t const EXPECTED_LEN = sizeof(DevOpReqPayload) + req->data_len;
-    if (!IS_VFS_OP || (req->op_id == OP_VFS_XATTR ? EXPECTED_LEN != payload_len : EXPECTED_LEN > payload_len)) {
+    if (!IS_VFS_OP ||
+        (((req->op_id == OP_NET_OPEN_AS || req->op_id == OP_NET_CLOSE_AS || req->op_id == OP_NET_LINK_AS) || req->op_id == OP_VFS_XATTR ||
+          req->op_id == OP_VFS_FSTAT || req->op_id == OP_VFS_STAT_AS || req->op_id == OP_VFS_PATH_AS || req->op_id == OP_VFS_EXEC_VIEW ||
+          req->op_id == OP_VFS_DIRECTORY_REFERENCE || (req->op_id == OP_VFS_DIRECTORY_GRANT || req->op_id == OP_VFS_OPEN_LIFETIME) ||
+          req->op_id == OP_VFS_FEATURES || req->op_id == OP_VFS_METADATA_BATCH)
+             ? EXPECTED_LEN != payload_len
+             : EXPECTED_LEN > payload_len)) {
         return WkiVfsOpRxAdmission::NOT_APPLICABLE;
     }
     if (channel->rx_dispatch_seq != hdr->seq_num) {
@@ -612,7 +646,7 @@ auto admit_vfs_op(MsgType type, const WkiHeader* hdr, const uint8_t* payload, ui
         // overtake that operation in the server queue.
         return WkiVfsOpRxAdmission::RETRY;
     }
-    return wki_dev_server_admit_vfs_op_rx(hdr, payload, payload_len, channel, channel_generation);
+    return wki_dev_server_admit_vfs_op_rx(hdr, payload, payload_len, channel, channel_generation, identity_policy, identity_capabilities);
 }
 
 auto admit_ipc_dev_op(MsgType type, const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* channel,
@@ -1367,12 +1401,15 @@ namespace {
 
 void resolve_local_hostname() {
     // Use the kernel-wide hostname cache (populated from /etc/hostname at boot)
-    const char* cached = ker::util::hostname::get();
-    size_t len = strlen(cached);
+    auto const CACHED = ker::util::hostname::snapshot();
+    size_t len = strlen(CACHED.data());
     if (len >= WKI_HOSTNAME_MAX) {
         len = WKI_HOSTNAME_MAX - 1;
     }
-    memcpy(local_hostname_data(), cached, len + 1);
+    uint64_t const FLAGS = g_wki.peer_lock.lock_irqsave();
+    memcpy(local_hostname_data(), CACHED.data(), len);
+    local_hostname_data()[len] = '\0';
+    g_wki.peer_lock.unlock_irqrestore(FLAGS);
 }
 
 }  // namespace
@@ -1422,11 +1459,33 @@ void wki_init() {
     g_wki.transport_count = 0;
     g_wki.my_lsa_seq = 0;
     g_wki.capabilities = WKI_CAP_RESOURCE_INCARNATION | WKI_CAP_VFS_MULTI_RDMA_LANES | WKI_CAP_VFS_METADATA_BATCH | WKI_CAP_NET_IPV6_STATE |
-                         WKI_CAP_VFS_XATTR | WKI_CAP_RESOURCE_LIMITS;
+                         WKI_CAP_VFS_XATTR | WKI_CAP_RESOURCE_LIMITS | WKI_CAP_VFS_READ_IDENTITY | WKI_CAP_COMPUTE_CREDENTIALS |
+                         WKI_CAP_VFS_OPEN_IDENTITY | WKI_CAP_VFS_FD_METADATA | WKI_CAP_VFS_STAT_IDENTITY | WKI_CAP_VFS_PATH_IDENTITY |
+                         WKI_CAP_VFS_COMPONENT_PATHS;
     // Mixed-version diagnostic profile: local enforcement remains enabled,
     // and compute admission still refuses execution without negotiation.
     if (cmdline_has_token(ker::init::get_kernel_cmdline(), "wki.resource_limits_off")) {
         g_wki.capabilities &= static_cast<uint16_t>(~WKI_CAP_RESOURCE_LIMITS);
+    }
+    if (cmdline_has_token(ker::init::get_kernel_cmdline(), "wki.compute_credentials_off")) {
+        g_wki.capabilities &= static_cast<uint16_t>(~WKI_CAP_COMPUTE_CREDENTIALS);
+    }
+    if (cmdline_has_token(ker::init::get_kernel_cmdline(), "wki.vfs_open_identity_off")) {
+        g_wki.capabilities &= static_cast<uint16_t>(~WKI_CAP_VFS_OPEN_IDENTITY);
+    }
+    if (cmdline_has_token(ker::init::get_kernel_cmdline(), "wki.vfs_stat_identity_off")) {
+        g_wki.capabilities &= static_cast<uint16_t>(~WKI_CAP_VFS_STAT_IDENTITY);
+    }
+    if (cmdline_has_token(ker::init::get_kernel_cmdline(), "wki.vfs_path_identity_off")) {
+        g_wki.capabilities &= static_cast<uint16_t>(~WKI_CAP_VFS_PATH_IDENTITY);
+    }
+    if (cmdline_has_token(ker::init::get_kernel_cmdline(), "wki.vfs_component_paths_off")) {
+        g_wki.capabilities &= static_cast<uint16_t>(~WKI_CAP_VFS_COMPONENT_PATHS);
+    }
+    g_wki.vfs_directory_paths_enabled = !cmdline_has_token(ker::init::get_kernel_cmdline(), "wki.vfs_directory_paths_off");
+    g_wki.vfs_realpath_enabled = !cmdline_has_token(ker::init::get_kernel_cmdline(), "wki.vfs_realpath_off");
+    if (cmdline_has_token(ker::init::get_kernel_cmdline(), "wki.vfs_fd_metadata_off")) {
+        g_wki.capabilities &= static_cast<uint16_t>(~WKI_CAP_VFS_FD_METADATA);
     }
     // Keep the new receiver-challenged routing lease protocol opt-in until
     // mixed-version convergence has been exercised on a live mesh.
@@ -2812,7 +2871,8 @@ void copy_wki_payload_segments(uint8_t* dest, const void* payload, uint16_t payl
 
 auto wki_send_impl(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const void* payload, uint16_t payload_len,
                    WkiChannel* expected_channel, uint32_t expected_generation, WkiReliableTxToken* tx_token_out,
-                   const void* payload_tail = nullptr, uint16_t payload_tail_len = 0) -> int {
+                   const void* payload_tail = nullptr, uint16_t payload_tail_len = 0, std::atomic<uint64_t>* accepted_bytes = nullptr,
+                   uint16_t application_bytes = 0) -> int {
     uint16_t wire_payload_len = 0;
     if (!wki_payload_segments_total_len(payload, payload_len, payload_tail, payload_tail_len, &wire_payload_len)) {
         return WKI_ERR_INVALID;
@@ -3071,6 +3131,9 @@ auto wki_send_impl(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, con
     // pressure, but the retry timer can still deliver this sequence.
     ch->tx_seq++;
     ch->tx_credits--;
+    if (accepted_bytes != nullptr) {
+        accepted_bytes->fetch_add(application_bytes, std::memory_order_release);
+    }
     if (tx_token_out != nullptr) {
         *tx_token_out = {
             .channel_identity =
@@ -3122,6 +3185,17 @@ auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const vo
     return wki_send_impl(dst_node, channel_id, msg_type, payload, payload_len, nullptr, 0, nullptr);
 }
 
+auto wki_send_accounted(const WkiChannelIdentity& identity, MsgType msg_type, const void* payload, uint16_t payload_len,
+                        std::atomic<uint64_t>& accepted_bytes, uint16_t application_bytes) -> int {
+    if (application_bytes > payload_len || identity.channel == nullptr || identity.peer_node_id == WKI_NODE_INVALID ||
+        identity.generation == 0)
+        return WKI_ERR_INVALID;
+    if (!wki_channel_generation_is_live(identity.channel, identity.peer_node_id, identity.channel_id, identity.generation))
+        return WKI_ERR_NOT_FOUND;
+    return wki_send_impl(identity.peer_node_id, identity.channel_id, msg_type, payload, payload_len, identity.channel, identity.generation,
+                         nullptr, nullptr, 0, &accepted_bytes, application_bytes);
+}
+
 auto wki_send_tracked(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const void* payload, uint16_t payload_len,
                       WkiReliableTxToken* token_out) -> int {
     if (token_out == nullptr) {
@@ -3136,7 +3210,8 @@ auto wki_send_tracked(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, 
     if (peer == nullptr) {
         return WKI_ERR_NOT_FOUND;
     }
-    if (!wki_peer_lifecycle_acquire(peer)) {
+    bool const BORROWED_LIFECYCLE = wki_peer_lifecycle_owned_by_current_task(peer);
+    if (!BORROWED_LIFECYCLE && !wki_peer_lifecycle_acquire(peer)) {
         return WKI_ERR_NOT_FOUND;
     }
 
@@ -3147,7 +3222,7 @@ auto wki_send_tracked(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, 
         ret = wki_send_impl(dst_node, channel_id, msg_type, payload, payload_len, nullptr, 0, token_out);
     }
 
-    wki_peer_lifecycle_release(peer);
+    if (!BORROWED_LIFECYCLE) wki_peer_lifecycle_release(peer);
     return ret;
 }
 
@@ -3253,35 +3328,35 @@ void wki_dispatch_reliable_msg(WkiChannel* rx_channel, uint32_t rx_channel_gener
             detail::handle_fence_notify(hdr, payload, payload_len);
             break;
         case MsgType::ZONE_CREATE_REQ:
-            detail::handle_zone_create_req(hdr, payload, payload_len);
+            detail::handle_zone_create_req(hdr, payload, payload_len, RX_CHANNEL_IDENTITY);
             break;
         case MsgType::ZONE_CREATE_ACK:
-            detail::handle_zone_create_ack(hdr, payload, payload_len);
+            detail::handle_zone_create_ack(hdr, payload, payload_len, RX_CHANNEL_IDENTITY);
             break;
         case MsgType::ZONE_DESTROY:
-            detail::handle_zone_destroy(hdr, payload, payload_len);
+            detail::handle_zone_destroy(hdr, payload, payload_len, RX_CHANNEL_IDENTITY);
             break;
         case MsgType::ZONE_NOTIFY_PRE:
-            detail::handle_zone_notify_pre(hdr, payload, payload_len);
+            detail::handle_zone_notify_pre(hdr, payload, payload_len, RX_CHANNEL_IDENTITY);
             break;
         case MsgType::ZONE_NOTIFY_POST:
-            detail::handle_zone_notify_post(hdr, payload, payload_len);
+            detail::handle_zone_notify_post(hdr, payload, payload_len, RX_CHANNEL_IDENTITY);
             break;
         case MsgType::ZONE_NOTIFY_PRE_ACK:
         case MsgType::ZONE_NOTIFY_POST_ACK:
             // ACKs for zone notifications - currently informational only
             break;
         case MsgType::ZONE_READ_REQ:
-            detail::handle_zone_read_req(hdr, payload, payload_len);
+            detail::handle_zone_read_req(hdr, payload, payload_len, RX_CHANNEL_IDENTITY);
             break;
         case MsgType::ZONE_READ_RESP:
-            detail::handle_zone_read_resp(hdr, payload, payload_len);
+            detail::handle_zone_read_resp(hdr, payload, payload_len, RX_CHANNEL_IDENTITY);
             break;
         case MsgType::ZONE_WRITE_REQ:
-            detail::handle_zone_write_req(hdr, payload, payload_len);
+            detail::handle_zone_write_req(hdr, payload, payload_len, RX_CHANNEL_IDENTITY);
             break;
         case MsgType::ZONE_WRITE_ACK:
-            detail::handle_zone_write_ack(hdr, payload, payload_len);
+            detail::handle_zone_write_ack(hdr, payload, payload_len, RX_CHANNEL_IDENTITY);
             break;
         case MsgType::RESOURCE_ADVERT:
             detail::handle_resource_advert(hdr, payload, payload_len);
@@ -3335,6 +3410,37 @@ void wki_dispatch_reliable_msg(WkiChannel* rx_channel, uint32_t rx_channel_gener
         case MsgType::TASK_SUBMIT_FRAGMENT:
             // Fragment frames are admitted to the deferred compute RX workers.
             break;
+        case MsgType::TASK_CHILD_CLAIM_REQ:
+        case MsgType::TASK_CHILD_CLAIM_RESP:
+        case MsgType::TASK_CHILD_QUERY_REQ:
+        case MsgType::TASK_CHILD_QUERY_RESP:
+        case MsgType::TASK_CHILD_SIGNAL:
+        case MsgType::TASK_PARENT_DEATH:
+        case MsgType::TASK_TERMINAL_SIGNAL:
+        case MsgType::TASK_SIGNAL_REQ:
+        case MsgType::GROUP_ROUTE_REQ:
+        case MsgType::GROUP_RECEIVER_REQ:
+        case MsgType::GROUP_SIGNAL_REQ:
+            // Signal decisions run on the retained deferred compute slot.
+            break;
+        case MsgType::GROUP_RECEIVER_RESP:
+            detail::handle_group_receiver_response(hdr, payload, payload_len, rx_channel, rx_channel_generation);
+            break;
+        case MsgType::GROUP_ROUTE_RESP:
+            detail::handle_group_route_response(hdr, payload, payload_len, rx_channel, rx_channel_generation);
+            break;
+        case MsgType::GROUP_SIGNAL_RESP:
+            detail::handle_group_signal_response(hdr, payload, payload_len, rx_channel, rx_channel_generation);
+            break;
+        case MsgType::TASK_SIGNAL_RESP:
+            detail::handle_task_signal_response(hdr, payload, payload_len, rx_channel, rx_channel_generation);
+            break;
+        case MsgType::TASK_EXEC_READY:
+            detail::handle_task_exec_ready(hdr, payload, payload_len, rx_channel, rx_channel_generation);
+            break;
+        case MsgType::TASK_EXEC_COMMIT:
+            detail::handle_task_exec_commit(hdr, payload, payload_len, rx_channel, rx_channel_generation);
+            break;
         case MsgType::TASK_ACCEPT:
             detail::handle_task_accept(hdr, payload, payload_len, rx_channel, rx_channel_generation);
             break;
@@ -3360,6 +3466,26 @@ void wki_dispatch_reliable_msg(WkiChannel* rx_channel, uint32_t rx_channel_gener
 
 auto reliable_dispatch_needs_serial_order(const WkiChannel* ch) -> bool {
     return ch != nullptr && (ch->channel_id == WKI_CHAN_IPC_DATA || channel_requires_existing_rx_reservation(ch->channel_id));
+}
+
+auto try_consume_policy_denial_locked(WkiChannel& channel, uint32_t sequence, uint16_t payload_length, DispatchWaiterList& waiters)
+    -> bool {
+    bool const ORDERED = reliable_dispatch_needs_serial_order(&channel);
+    // A denial still occupies a dispatch turn. Do not consume it ahead of an
+    // earlier handler or wait in RX: ordinary retransmission retries admission.
+    if (sequence != channel.rx_seq || (ORDERED && sequence != channel.rx_dispatch_seq)) {
+        return false;
+    }
+    channel.rx_seq++;
+    channel.rx_ack_pending = sequence;
+    channel.ack_pending = true;
+    channel.ack_pending_since_us = 0;
+    channel.bytes_received += payload_length;
+    if (ORDERED) {
+        channel.rx_dispatch_seq++;
+        drain_reliable_dispatch_waiters_locked(&channel, waiters);
+    }
+    return true;
 }
 
 auto wait_for_reliable_dispatch_turn(WkiChannel* ch, uint32_t generation, uint32_t seq) -> bool {
@@ -3426,9 +3552,64 @@ void finish_pre_admitted_reliable_msg_ordered(WkiChannel* ch, uint32_t generatio
     finish_reliable_dispatch_turn(ch, generation, SEQ);
 }
 
+template <typename Send>
+void send_signal_policy_denial_with(const WkiHeader& header, const uint8_t* payload, uint16_t payload_length, WkiChannel* channel,
+                                    uint32_t generation, uint32_t local_boot, Send&& send) {
+    WkiChannelIdentity const IDENTITY{
+        .channel = channel, .peer_node_id = header.src_node, .channel_id = header.channel_id, .generation = generation};
+    switch (static_cast<MsgType>(header.msg_type)) {
+        case MsgType::TASK_SIGNAL_REQ: {
+            if (payload == nullptr || payload_length != sizeof(TaskSignalRequest)) return;
+            TaskSignalRequest request{};
+            std::memcpy(&request, payload, sizeof(request));
+            if (request.request_id == 0 || request.task_id == 0) return;
+            TaskSignalResponse response{.request_id = request.request_id, .task_id = request.task_id, .result = -EACCES};
+            static_cast<void>(send(IDENTITY, MsgType::TASK_SIGNAL_RESP, &response, sizeof(response)));
+            return;
+        }
+        case MsgType::GROUP_SIGNAL_REQ: {
+            if (payload == nullptr || payload_length != sizeof(GroupSignalRequest)) return;
+            GroupSignalRequest request{};
+            std::memcpy(&request, payload, sizeof(request));
+            if (request.request_id == 0 || request.version != WKI_GROUP_SIGNAL_VERSION) return;
+            GroupSignalResponse response{.request_id = request.request_id, .result = -EACCES, .version = WKI_GROUP_SIGNAL_VERSION};
+            static_cast<void>(send(IDENTITY, MsgType::GROUP_SIGNAL_RESP, &response, sizeof(response)));
+            return;
+        }
+        case MsgType::GROUP_ROUTE_REQ:
+        case MsgType::GROUP_RECEIVER_REQ: {
+            if (payload == nullptr || payload_length != sizeof(GroupRouteRequest) || local_boot == 0) return;
+            GroupRouteRequest request{};
+            std::memcpy(&request, payload, sizeof(request));
+            if (request.request_id == 0 || request.version != WKI_GROUP_ROUTE_VERSION) return;
+            if (static_cast<MsgType>(header.msg_type) == MsgType::GROUP_ROUTE_REQ) {
+                GroupRouteResponse response{.request_id = request.request_id, .result = -EACCES, .boot = local_boot};
+                static_cast<void>(send(IDENTITY, MsgType::GROUP_ROUTE_RESP, &response, sizeof(response)));
+            } else {
+                GroupReceiverResponse response{.request_id = request.request_id, .result = -EACCES, .boot = local_boot};
+                static_cast<void>(send(IDENTITY, MsgType::GROUP_RECEIVER_RESP, &response, sizeof(response)));
+            }
+            return;
+        }
+        default:
+            return;
+    }
+}
+
 void send_policy_denial(const WkiHeader& header, const uint8_t* payload, uint16_t payload_length, WkiChannel* channel,
                         uint32_t generation) {
+    WkiChannelIdentity const IDENTITY{
+        .channel = channel, .peer_node_id = header.src_node, .channel_id = header.channel_id, .generation = generation};
     switch (static_cast<MsgType>(header.msg_type)) {
+        case MsgType::TASK_SIGNAL_REQ:
+        case MsgType::GROUP_SIGNAL_REQ:
+        case MsgType::GROUP_ROUTE_REQ:
+        case MsgType::GROUP_RECEIVER_REQ:
+            send_signal_policy_denial_with(header, payload, payload_length, channel, generation, g_wki.local_boot_epoch,
+                                           [](const WkiChannelIdentity& identity, MsgType type, const void* data, uint16_t length) {
+                                               return wki_send_on_channel_identity(identity, type, data, length);
+                                           });
+            return;
         case MsgType::TASK_SUBMIT:
         case MsgType::TASK_SUBMIT_FRAGMENT: {
             uint32_t task_id = 0;
@@ -3438,8 +3619,7 @@ void send_policy_denial(const WkiHeader& header, const uint8_t* payload, uint16_
             TaskResponsePayload response{};
             response.task_id = task_id;
             response.status = static_cast<uint8_t>(TaskRejectReason::UNAUTHORIZED);
-            static_cast<void>(
-                wki_send_on_channel_generation(header.src_node, channel, generation, MsgType::TASK_REJECT, &response, sizeof(response)));
+            static_cast<void>(wki_send_on_channel_identity(IDENTITY, MsgType::TASK_REJECT, &response, sizeof(response)));
             return;
         }
         case MsgType::DEV_ATTACH_REQ: {
@@ -3449,8 +3629,7 @@ void send_policy_denial(const WkiHeader& header, const uint8_t* payload, uint16_
                 auto const* request = reinterpret_cast<const DevAttachReqPayload*>(payload);
                 response.resource_id = request->resource_id;
             }
-            static_cast<void>(
-                wki_send_on_channel_generation(header.src_node, channel, generation, MsgType::DEV_ATTACH_ACK, &response, sizeof(response)));
+            static_cast<void>(wki_send_on_channel_identity(IDENTITY, MsgType::DEV_ATTACH_ACK, &response, sizeof(response)));
             return;
         }
         case MsgType::DEV_OP_REQ: {
@@ -3459,9 +3638,12 @@ void send_policy_denial(const WkiHeader& header, const uint8_t* payload, uint16_
             response.reserved = static_cast<uint16_t>(header.seq_num);
             if (payload != nullptr && payload_length >= sizeof(DevOpReqPayload)) {
                 response.op_id = reinterpret_cast<const DevOpReqPayload*>(payload)->op_id;
+                if ((response.op_id == OP_NET_OPEN_AS || response.op_id == OP_NET_CLOSE_AS || response.op_id == OP_NET_LINK_AS) &&
+                    payload_length >= sizeof(DevOpReqPayload) + sizeof(uint16_t)) {
+                    std::memcpy(&response.reserved, payload + sizeof(DevOpReqPayload), sizeof(response.reserved));
+                }
             }
-            static_cast<void>(
-                wki_send_on_channel_generation(header.src_node, channel, generation, MsgType::DEV_OP_RESP, &response, sizeof(response)));
+            static_cast<void>(wki_send_on_channel_identity(IDENTITY, MsgType::DEV_OP_RESP, &response, sizeof(response)));
             return;
         }
         case MsgType::ZONE_CREATE_REQ: {
@@ -3470,8 +3652,7 @@ void send_policy_denial(const WkiHeader& header, const uint8_t* payload, uint16_
             if (payload != nullptr && payload_length >= sizeof(ZoneCreateReqPayload)) {
                 response.zone_id = reinterpret_cast<const ZoneCreateReqPayload*>(payload)->zone_id;
             }
-            static_cast<void>(wki_send_on_channel_generation(header.src_node, channel, generation, MsgType::ZONE_CREATE_ACK, &response,
-                                                             sizeof(response)));
+            static_cast<void>(wki_send_on_channel_identity(IDENTITY, MsgType::ZONE_CREATE_ACK, &response, sizeof(response)));
             return;
         }
         default:
@@ -3480,6 +3661,104 @@ void send_policy_denial(const WkiHeader& header, const uint8_t* payload, uint16_
 }
 
 }  // namespace
+
+#ifdef WOS_SELFTEST
+auto wki_selftest_policy_denial_dispatch() -> bool {
+    ker::mod::sched::task::Task waiter{};
+    for (uint16_t channel_id : {WKI_CHAN_DYNAMIC_BASE, WKI_CHAN_IPC_DATA, WKI_CHAN_RESOURCE}) {
+        for (uint32_t sequence : {uint32_t{1}, UINT32_MAX}) {
+            WkiChannel channel{};
+            channel.active = true;
+            channel.generation = 13;
+            channel.channel_id = channel_id;
+            channel.rx_seq = sequence;
+            channel.rx_dispatch_seq = sequence - 1;
+            channel.rx_ack_pending = sequence - 1;
+            channel.ack_pending_since_us = 91;
+            channel.bytes_received = 7;
+            auto* const WAITER = &waiter;
+            channel.rx_dispatch_waiters.at(0) = WAITER;
+            DispatchWaiterList waiters{};
+            bool const ORDERED = reliable_dispatch_needs_serial_order(&channel);
+            bool consumed = try_consume_policy_denial_locked(channel, sequence, 19, waiters);
+            if (ORDERED) {
+                if (consumed || channel.rx_seq != sequence || channel.rx_dispatch_seq != sequence - 1 ||
+                    channel.rx_ack_pending != sequence - 1 || channel.ack_pending || channel.ack_pending_since_us != 91 ||
+                    channel.bytes_received != 7 || channel.rx_dispatch_waiters.at(0) != WAITER || waiters.at(0) != nullptr)
+                    return false;
+                // The earlier handler finishes before the same request retries.
+                channel.rx_dispatch_seq = sequence;
+                consumed = try_consume_policy_denial_locked(channel, sequence, 19, waiters);
+            }
+            if (!consumed || channel.rx_seq != sequence + 1 || channel.rx_ack_pending != sequence || !channel.ack_pending ||
+                channel.ack_pending_since_us != 0 || channel.bytes_received != 26)
+                return false;
+            if (ORDERED) {
+                if (channel.rx_dispatch_seq != sequence + 1 || channel.rx_dispatch_waiters.at(0) != nullptr || waiters.at(0) != WAITER ||
+                    !wait_for_reliable_dispatch_turn(&channel, 13, sequence + 1))
+                    return false;
+            } else if (channel.rx_dispatch_seq != sequence - 1 || channel.rx_dispatch_waiters.at(0) != WAITER || waiters.at(0) != nullptr) {
+                return false;
+            }
+            if (try_consume_policy_denial_locked(channel, sequence, 19, waiters) || channel.bytes_received != 26) return false;
+        }
+    }
+    return true;
+}
+
+auto wki_selftest_signal_policy_denials() -> bool {
+    constexpr uint32_t BOOT = 91;
+    auto check = []<typename Request, typename Response>(MsgType input, MsgType output, Request request, const Response& expected) {
+        WkiHeader header{};
+        header.msg_type = static_cast<uint8_t>(input);
+        header.src_node = 7;
+        header.channel_id = WKI_CHAN_RESOURCE;
+        unsigned calls = 0;
+        bool valid = true;
+        auto send = [&](const WkiChannelIdentity& identity, MsgType type, const void* data, uint16_t length) {
+            ++calls;
+            valid &= identity.channel == nullptr && identity.peer_node_id == header.src_node && identity.channel_id == header.channel_id &&
+                     identity.generation == 13 && type == output && length == sizeof(expected) &&
+                     std::memcmp(data, &expected, sizeof(expected)) == 0;
+            return WKI_OK;
+        };
+        auto invoke = [&](const uint8_t* data, uint16_t length, uint32_t boot) {
+            send_signal_policy_denial_with(header, data, length, nullptr, 13, boot, send);
+        };
+        auto const* bytes = reinterpret_cast<const uint8_t*>(&request);
+        invoke(bytes, sizeof(request), BOOT);
+        if (calls != 1 || !valid) return false;
+        invoke(nullptr, sizeof(request), BOOT);
+        invoke(bytes, sizeof(request) - 1, BOOT);
+        invoke(bytes, sizeof(request) + 1, BOOT);
+        request.request_id = 0;
+        invoke(bytes, sizeof(request), BOOT);
+        request.request_id = expected.request_id;
+        if constexpr (requires { request.version; }) {
+            request.version = 0;
+            invoke(bytes, sizeof(request), BOOT);
+        }
+        if constexpr (std::is_same_v<Request, TaskSignalRequest>) {
+            request.task_id = 0;
+            invoke(bytes, sizeof(request), BOOT);
+        }
+        if constexpr (std::is_same_v<Request, GroupRouteRequest>) {
+            request.version = WKI_GROUP_ROUTE_VERSION;
+            invoke(bytes, sizeof(request), 0);
+        }
+        return calls == 1 && valid;
+    };
+    return check(MsgType::TASK_SIGNAL_REQ, MsgType::TASK_SIGNAL_RESP, TaskSignalRequest{.request_id = 41, .task_id = 17},
+                 TaskSignalResponse{.request_id = 41, .task_id = 17, .result = -EACCES}) &&
+           check(MsgType::GROUP_SIGNAL_REQ, MsgType::GROUP_SIGNAL_RESP,
+                 GroupSignalRequest{.request_id = 42, .version = WKI_GROUP_SIGNAL_VERSION},
+                 GroupSignalResponse{.request_id = 42, .result = -EACCES, .version = WKI_GROUP_SIGNAL_VERSION}) &&
+           check(MsgType::GROUP_ROUTE_REQ, MsgType::GROUP_ROUTE_RESP, GroupRouteRequest{.request_id = 43},
+                 GroupRouteResponse{.request_id = 43, .result = -EACCES, .boot = BOOT}) &&
+           check(MsgType::GROUP_RECEIVER_REQ, MsgType::GROUP_RECEIVER_RESP, GroupRouteRequest{.request_id = 44},
+                 GroupReceiverResponse{.request_id = 44, .result = -EACCES, .boot = BOOT});
+}
+#endif
 
 void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRxMetadata* metadata) {
     if (len < WKI_HEADER_SIZE) {
@@ -3613,9 +3892,18 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
         return;
     }
     bool authorized = true;
+    uint64_t admitted_identity_policy = 0;
+    uint16_t admitted_identity_capabilities = 0;
     if (msg != MsgType::HELLO && msg != MsgType::HELLO_ACK && msg != MsgType::HELLO_CONFIRM) {
         WkiPeer const* authenticated_peer = wki_peer_find(hdr->src_node);
         authorized = wki_auth_policy_allows(authenticated_peer, msg, payload, PAYLOAD_LEN);
+        // The RX lifecycle lease pins this authenticated session until queued
+        // operations have copied its policy. Workers must not re-read a peer
+        // slot that could already belong to a replacement session.
+        if (authorized && authenticated_peer != nullptr && authenticated_peer->auth_session.active) {
+            admitted_identity_policy = authenticated_peer->auth_session.policy;
+            admitted_identity_capabilities = g_wki.capabilities & authenticated_peer->capabilities;
+        }
     }
 
     // Inline TASK handlers publish scheduler-visible state, while deferred
@@ -3857,8 +4145,10 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
             }
             bool confirmed = AUTH_RESULT == WkiAuthFrameResult::ACCEPTED;
             if (AUTH_RESULT == WkiAuthFrameResult::PENDING_CONFIRMATION) {
+                WkiAuthTrailer verified_trailer{};
+                std::memcpy(&verified_trailer, payload + PAYLOAD_LEN, sizeof(verified_trailer));
                 PeerLifecycleTryLease confirm_lifecycle;
-                confirmed = confirm_lifecycle.try_acquire(peer->node_id, false) && wki_auth_confirm_peer_session(peer);
+                confirmed = confirm_lifecycle.try_acquire(peer->node_id, false) && wki_auth_confirm_peer_session(peer, verified_trailer);
                 if (confirmed) {
                     wki_routing_peer_session_changed(peer->node_id);
                 }
@@ -3919,11 +4209,28 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
         // Compute messages
         case MsgType::TASK_SUBMIT:
         case MsgType::TASK_SUBMIT_FRAGMENT:
+        case MsgType::TASK_EXEC_READY:
+        case MsgType::TASK_EXEC_COMMIT:
         case MsgType::TASK_ACCEPT:
         case MsgType::TASK_REJECT:
         case MsgType::TASK_COMPLETE:
         case MsgType::TASK_CANCEL:
+        case MsgType::TASK_CHILD_CLAIM_REQ:
+        case MsgType::TASK_CHILD_CLAIM_RESP:
+        case MsgType::TASK_CHILD_QUERY_REQ:
+        case MsgType::TASK_CHILD_QUERY_RESP:
+        case MsgType::TASK_CHILD_SIGNAL:
+        case MsgType::TASK_PARENT_DEATH:
+        case MsgType::TASK_TERMINAL_SIGNAL:
+        case MsgType::TASK_SIGNAL_REQ:
+        case MsgType::TASK_SIGNAL_RESP:
         case MsgType::TASK_SERVICE_REPORT:
+        case MsgType::GROUP_ROUTE_REQ:
+        case MsgType::GROUP_RECEIVER_REQ:
+        case MsgType::GROUP_ROUTE_RESP:
+        case MsgType::GROUP_RECEIVER_RESP:
+        case MsgType::GROUP_SIGNAL_REQ:
+        case MsgType::GROUP_SIGNAL_RESP:
         case MsgType::LOAD_REPORT: {
             if (!RELIABLE_RX_ACCEPTED) {
                 return;
@@ -3953,13 +4260,14 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
 
             if (hdr->seq_num == ch->rx_seq) {
                 if (!authorized) {
-                    ch->rx_seq++;
-                    ch->rx_ack_pending = hdr->seq_num;
-                    ch->ack_pending = true;
-                    ch->ack_pending_since_us = 0;
-                    ch->bytes_received += PAYLOAD_LEN;
+                    DispatchWaiterList waiters{};
+                    if (!try_consume_policy_denial_locked(*ch, hdr->seq_num, PAYLOAD_LEN, waiters)) {
+                        ch->lock.unlock();
+                        return;
+                    }
                     uint32_t const RX_CHANNEL_GENERATION = ch->generation;
                     ch->lock.unlock();
+                    wake_reliable_dispatch_waiters(waiters);
                     mark_peer_rx_progress(hdr->src_node);
                     send_policy_denial(*hdr, payload, PAYLOAD_LEN, ch, RX_CHANNEL_GENERATION);
                     wki_timer_notify();
@@ -3990,7 +4298,8 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
                         return;
                     }
                 }
-                WkiVfsOpRxAdmission const VFS_OP_ADMISSION = admit_vfs_op(msg, hdr, payload, PAYLOAD_LEN, ch, ch->generation);
+                WkiVfsOpRxAdmission const VFS_OP_ADMISSION = admit_vfs_op(msg, hdr, payload, PAYLOAD_LEN, ch, ch->generation,
+                                                                          admitted_identity_policy, admitted_identity_capabilities);
                 if (VFS_OP_ADMISSION == WkiVfsOpRxAdmission::RETRY) {
                     ch->lock.unlock();
                     return;
@@ -4106,7 +4415,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
                     }
                     WkiVfsOpRxAdmission const RO_VFS_OP_ADMISSION =
                         admit_vfs_op(RO_MSG, &ch->reorder_head->hdr, ch->reorder_head->data, ch->reorder_head->len, ch,
-                                     ch->reorder_head->channel_generation);
+                                     ch->reorder_head->channel_generation, admitted_identity_policy, admitted_identity_capabilities);
                     if (RO_VFS_OP_ADMISSION == WkiVfsOpRxAdmission::RETRY) {
                         break;
                     }

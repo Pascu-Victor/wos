@@ -4,6 +4,8 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <platform/sched/session.hpp>
+#include <platform/security/terminal.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <util/smallvec.hpp>
 
@@ -142,13 +144,17 @@ struct PtyPair {
     // This prevents the embedded waiter SmallVecs from being freed while a
     // devfs File wrapper can still reach the pair during poll/retry paths.
     std::atomic<uint32_t> refcount{1};
-    int index;                     // PTY number (for /dev/pts/N)
-    bool allocated;                // In use
-    bool slave_locked;             // TIOCSPTLCK lock (must be unlocked before slave can be opened)
-    bool freeing = false;          // Set under lock by first closer to prevent double-free
-    int slave_opened;              // Slave open refcount (0 = closed)
-    int master_opened;             // Master open refcount (0 = closed)
-    Winsize winsize;               // Terminal dimensions
+    ker::mod::security::TerminalIdentity identity{};  // Immutable after tree publication.
+    int index;                                        // PTY number (for /dev/pts/N)
+    bool allocated;                                   // In use
+    bool slave_locked;                                // TIOCSPTLCK lock (must be unlocked before slave can be opened)
+    bool freeing = false;                             // Set under lock by first closer to prevent double-free
+    int slave_opened;                                 // Slave open refcount (0 = closed)
+    int master_opened;                                // Master open refcount (0 = closed)
+    Winsize winsize;                                  // Terminal dimensions
+    uint64_t attachment_generation = 0;               // Monotonic per allocation; new first claims never wrap.
+    uint64_t session_id = 0;                          // Controlling session, under pair lock; zero is unclaimed.
+    ker::mod::sched::session::Origin foreground_origin{};
     uint64_t foreground_pgrp = 0;  // Foreground process group (TIOCGPGRP/TIOCSPGRP)
 
     KTermios termios;         // Terminal attributes (line discipline settings)
@@ -184,14 +190,15 @@ void pty_init();
 
 // Allocate a new PTY pair, register the slave device at /dev/pts/<N>.
 // Returns the PtyPair index, or -1 on failure.
-auto pty_alloc() -> int;
+auto pty_alloc(const ker::mod::security::Snapshot& caller) -> int;
 
 // Get PtyPair by index (nullptr if invalid/unallocated)
 auto pty_get(int index) -> PtyPair*;
 
-// Acquire a slave endpoint reference by PTY index. The pair reference and
-// slave open count are published atomically against final retirement.
-auto pty_open_slave_by_index(int index) -> PtyPair*;
+// Acquire the exact controlling-terminal allocation, rejecting reused slots.
+// Pair reference and slave open count publish atomically against retirement.
+auto pty_open_controlling_slave(ker::mod::security::TerminalIdentity identity, uint64_t session_id, uint64_t generation) -> PtyPair*;
+auto pty_binding_is_live(ker::mod::security::TerminalIdentity identity, uint64_t session_id, uint64_t generation) -> bool;
 
 // Release a PtyPair reference previously obtained from pty_get().
 void pty_put(PtyPair* pair);

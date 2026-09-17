@@ -29,7 +29,7 @@ struct NetInterfaceStorageEntry {
 // NetInterface pointers escape every lookup. Keep each published interface at
 // a permanent address. Readers scan a fixed atomic live index without locking;
 // the writer lock serializes slot publication/removal and permanent storage.
-// Address-list mutation remains governed by its pre-existing caller contract.
+// Each address family serializes its mutable configuration separately.
 NetInterfaceStorageEntry* interface_storage = nullptr;
 std::array<std::atomic<NetInterface*>, MAX_NET_INTERFACES> live_interfaces = {};
 std::atomic<size_t> interface_scan_limit{0};
@@ -170,74 +170,112 @@ auto netif_del_for_dev(NetDevice* dev) -> bool {
     return false;
 }
 
-auto netif_add_ipv4(NetDevice* dev, proto::IPv4Address addr, proto::IPv4Address mask) -> int {
-    auto* nif = netif_get(dev);
-    if (nif == nullptr) {
-        return -1;
-    }
+namespace {
+// Caller holds ipv4_addr_lock. No address pointer escapes the critical section.
+auto add_ipv4_locked(NetInterface& nif, proto::IPv4Address addr, proto::IPv4Address mask) -> int {
+    if (nif.ipv4_addr_count >= MAX_ADDRS_PER_IF) return -1;
+    nif.ipv4_addrs.at(nif.ipv4_addr_count++) = {.addr = addr, .netmask = mask};
+    return 0;
+}
 
-    if (nif->ipv4_addr_count >= MAX_ADDRS_PER_IF) {
-        return -1;
-    }
-
-    auto& slot = nif->ipv4_addrs.at(nif->ipv4_addr_count);
-    slot.addr = addr;
-    slot.netmask = mask;
-    nif->ipv4_addr_count++;
+void notify_ipv4_change(NetDevice* dev) {
     ker::net::wki::wki_dev_server_notify_net_changed(dev);
     ker::net::wki::wki_remotable_notify_net_changed(dev);
+}
 
+auto copy_ipv4_config(NetInterface* nif) -> IPv4ConfigSnapshot {
+    if (nif == nullptr) return {};
+    uint64_t const FLAGS = nif->ipv4_addr_lock.lock_irqsave();
+    IPv4ConfigSnapshot const SNAPSHOT{.entries = nif->ipv4_addrs, .count = nif->ipv4_addr_count};
+    nif->ipv4_addr_lock.unlock_irqrestore(FLAGS);
+    return SNAPSHOT;
+}
+}  // namespace
+
+auto netif_ipv4_snapshot(NetDevice* dev) -> IPv4ConfigSnapshot { return copy_ipv4_config(netif_find_by_dev(dev)); }
+
+auto netif_add_ipv4(NetDevice* dev, proto::IPv4Address addr, proto::IPv4Address mask) -> int {
+    auto* nif = netif_get(dev);
+    if (nif == nullptr) return -1;
+    uint64_t const FLAGS = nif->ipv4_addr_lock.lock_irqsave();
+    int const RESULT = add_ipv4_locked(*nif, addr, mask);
+    nif->ipv4_addr_lock.unlock_irqrestore(FLAGS);
+    if (RESULT == 0) notify_ipv4_change(dev);
 #ifdef DEBUG_NETIF
-    log::debug("%s: added IPv4 %d.%d.%d.%d/%d.%d.%d.%d", dev->name.data(), (addr >> 24) & 0xFF, (addr >> 16) & 0xFF, (addr >> 8) & 0xFF,
-               addr & 0xFF, (mask >> 24) & 0xFF, (mask >> 16) & 0xFF, (mask >> 8) & 0xFF, mask & 0xFF);
+    if (RESULT == 0) {
+        log::debug("%s: added IPv4 %d.%d.%d.%d/%d.%d.%d.%d", dev->name.data(), (addr >> 24) & 0xFF, (addr >> 16) & 0xFF, (addr >> 8) & 0xFF,
+                   addr & 0xFF, (mask >> 24) & 0xFF, (mask >> 16) & 0xFF, (mask >> 8) & 0xFF, mask & 0xFF);
+    }
 #endif
-
-    return 0;
+    return RESULT;
 }
 
 auto netif_set_ipv4(NetDevice* dev, proto::IPv4Address addr, proto::IPv4Address mask, bool replace) -> int {
     auto* nif = netif_get(dev);
-    if (nif == nullptr) {
-        return -1;
-    }
-
-    for (size_t i = 0; i < nif->ipv4_addr_count; i++) {
+    if (nif == nullptr) return -1;
+    uint64_t const FLAGS = nif->ipv4_addr_lock.lock_irqsave();
+    int result = 0;
+    bool found = false;
+    for (size_t i = 0; i < nif->ipv4_addr_count; ++i) {
         auto& slot = nif->ipv4_addrs.at(i);
-        if (slot.addr == addr) {
-            if (!replace && slot.netmask == mask) {
-                return -EEXIST;
-            }
+        if (slot.addr != addr) continue;
+        found = true;
+        if (!replace && slot.netmask == mask)
+            result = -EEXIST;
+        else
             slot.netmask = mask;
-            ker::net::wki::wki_dev_server_notify_net_changed(dev);
-            ker::net::wki::wki_remotable_notify_net_changed(dev);
-            return 0;
-        }
+        break;
     }
-
-    return netif_add_ipv4(dev, addr, mask);
+    if (!found) result = add_ipv4_locked(*nif, addr, mask);
+    nif->ipv4_addr_lock.unlock_irqrestore(FLAGS);
+    if (result == 0) notify_ipv4_change(dev);
+    return result;
 }
 
 auto netif_del_ipv4(NetDevice* dev, proto::IPv4Address addr, proto::IPv4Address mask) -> int {
     auto* nif = netif_get(dev);
-    if (nif == nullptr) {
-        return -1;
+    if (nif == nullptr) return -1;
+    uint64_t const FLAGS = nif->ipv4_addr_lock.lock_irqsave();
+    int result = -EADDRNOTAVAIL;
+    for (size_t i = 0; i < nif->ipv4_addr_count; ++i) {
+        auto const& slot = nif->ipv4_addrs.at(i);
+        if (slot.addr != addr || slot.netmask != mask) continue;
+        for (size_t j = i + 1; j < nif->ipv4_addr_count; ++j) nif->ipv4_addrs.at(j - 1) = nif->ipv4_addrs.at(j);
+        nif->ipv4_addrs.at(--nif->ipv4_addr_count) = {};
+        result = 0;
+        break;
     }
+    nif->ipv4_addr_lock.unlock_irqrestore(FLAGS);
+    if (result == 0) notify_ipv4_change(dev);
+    return result;
+}
 
-    for (size_t i = 0; i < nif->ipv4_addr_count; i++) {
-        if (auto& slot = nif->ipv4_addrs.at(i); slot.addr != addr || slot.netmask != mask) {
-            continue;
-        }
-        for (size_t j = i + 1; j < nif->ipv4_addr_count; j++) {
-            nif->ipv4_addrs.at(j - 1) = nif->ipv4_addrs.at(j);
-        }
-        nif->ipv4_addr_count--;
-        nif->ipv4_addrs.at(nif->ipv4_addr_count) = {};
-        ker::net::wki::wki_dev_server_notify_net_changed(dev);
-        ker::net::wki::wki_remotable_notify_net_changed(dev);
-        return 0;
+auto netif_set_primary_ipv4_address(NetDevice* dev, proto::IPv4Address addr) -> int {
+    auto* nif = netif_get(dev);
+    if (nif == nullptr) return -ENOMEM;
+    uint64_t const FLAGS = nif->ipv4_addr_lock.lock_irqsave();
+    int result = 0;
+    if (nif->ipv4_addr_count != 0)
+        nif->ipv4_addrs.front().addr = addr;
+    else
+        result = add_ipv4_locked(*nif, addr, 0xFFFFFF00);  // Legacy default /24.
+    nif->ipv4_addr_lock.unlock_irqrestore(FLAGS);
+    if (result == 0) notify_ipv4_change(dev);
+    return result;
+}
+
+auto netif_set_primary_ipv4_netmask(NetDevice* dev, proto::IPv4Address mask) -> int {
+    auto* nif = netif_get(dev);
+    if (nif == nullptr) return -ENOMEM;
+    uint64_t const FLAGS = nif->ipv4_addr_lock.lock_irqsave();
+    int result = -EADDRNOTAVAIL;
+    if (nif->ipv4_addr_count != 0) {
+        nif->ipv4_addrs.front().netmask = mask;
+        result = 0;
     }
-
-    return -EADDRNOTAVAIL;
+    nif->ipv4_addr_lock.unlock_irqrestore(FLAGS);
+    if (result == 0) notify_ipv4_change(dev);
+    return result;
 }
 
 auto netif_add_ipv6(NetDevice* dev, const proto::IPv6Address& addr, uint8_t prefix) -> int {
@@ -711,8 +749,9 @@ auto netif_find_by_ipv4(proto::IPv4Address addr) -> NetInterface* {
         if (nif == nullptr) {
             continue;
         }
-        for (size_t j = 0; j < nif->ipv4_addr_count; j++) {
-            if (nif->ipv4_addrs.at(j).addr == addr) {
+        auto const IPV4 = copy_ipv4_config(nif);
+        for (size_t j = 0; j < IPV4.count; j++) {
+            if (IPV4.entries.at(j).addr == addr) {
                 return nif;
             }
         }

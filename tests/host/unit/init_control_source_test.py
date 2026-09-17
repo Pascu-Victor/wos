@@ -85,14 +85,24 @@ def test_broker_authenticates_and_keeps_usercopy_outside_lock() -> None:
     publish = function_body(source, "wos_proc_init_status_publish")
     read = function_body(source, "wos_proc_init_status_read")
 
-    require(submit, "task->euid != 0", "root-only request submission")
+    require(submit, "!CREDENTIALS.allows(ker::mod::security::Authority::INIT_CONTROL)", "central INIT_CONTROL authority for request submission")
     require(submit, "request.sender_pid = ker::mod::sched::task::process_pid(*task);", "authenticated sender PID")
-    require(submit, "request.sender_euid = task->euid;", "authenticated sender euid")
+    require(submit, "request.sender_euid = CREDENTIALS.user().effective;", "authenticated sender euid")
     require(receive, "!is_init_process(*task)", "PID 1 request receive")
     require(publish, "!is_init_process(*task)", "PID 1 status publish")
     require(source, "std::array<init_abi::Request, init_abi::MAILBOX_CAPACITY>", "fixed mailbox")
-    require(source, "return static_cast<uint64_t>(-EAGAIN);", "nonblocking empty/full result")
-    require(receive, "if (COPIED)", "copyout failure preserves request")
+    require(source, "if (mailbox.count == init_abi::MAILBOX_CAPACITY) return -EAGAIN;", "nonblocking full result")
+    require(source, "if (mailbox.count == 0) return -EAGAIN;", "nonblocking empty result")
+    require(receive, "finish_request_copy(g_mailbox, COPIED)", "copyout failure preserves request")
+    require(submit, "enqueue_request(g_mailbox, request)", "validated queue admission")
+    require(receive, "claim_request(g_mailbox, request)", "exclusive receive claim")
+    if not (submit.index("auto const CREDENTIALS = task->credentials()") <
+            submit.index("!CREDENTIALS.allows(") < submit.index("copy_value_from_task") <
+            submit.index("validate_request(request)") < submit.index("request.sender_pid =") <
+            submit.index("g_init_control_lock.lock()") < submit.index("enqueue_request(g_mailbox, request)")):
+        fail("submission must authorize one snapshot and stamp identity before mailbox publication")
+    if submit.count("task->credentials()") != 1:
+        fail("one submission must use one credential snapshot")
     require(source, "status.services[index] = {};", "unused status slot sanitization")
     require(source, "service.history_count > init_abi::MAX_TRANSITION_HISTORY", "bounded transition history")
     require(source, "transition_reason_valid(transition.reason)", "transition reason validation")
@@ -155,18 +165,25 @@ def test_service_resources_preserve_privilege_lock_and_restart_boundaries() -> N
     source = (ROOT / "modules/kern/src/platform/sched/service_resource.cpp").read_text()
     resource = (ROOT / "modules/kern/src/platform/sched/resource.cpp").read_text()
     init = (ROOT / "modules/init/src/services.cpp").read_text()
-    configure = function_body(source, "syscall_service_configure")
-    select = function_body(source, "syscall_service_select")
+    configure = function_body(source, "configure_service_for")
+    select = function_body(source, "select_service_for")
     read = function_body(source, "syscall_service_read")
-    if not (configure.index("if (!is_init(caller))") < configure.index("copy_value_from_task") <
+    if not (configure.index("if (AUTHORIZATION != 0)") < configure.index("copy_value_from_task") <
             configure.index("validate_configuration(config)") < configure.index("service_lock.lock_irqsave()")):
         fail("service configuration must authenticate, snapshot and validate before locking")
     require(configure, "if (service.configured)", "immutable service configuration")
     require(configure, "result = -EEXIST", "service configuration cannot reset CPU accounting")
-    require(select, "if (!is_init(caller))", "PID1-only service selection")
+    require(select, "if (AUTHORIZATION != 0)", "service selection authorizes before effects")
+    status = any_body(source, "service_management_status")
+    require(status, "auto const CREDENTIALS = caller->credentials()", "one caller snapshot")
+    require(status, "authorize_service_resource_management(CREDENTIALS, is_init(caller))", "role and credential authority")
+    if select.index("if (AUTHORIZATION != 0)") > select.index("caller->selected_child_service ="):
+        fail("authorization denial must preserve pending service selection")
+    require(function_body(source, "syscall_service_configure"), "configure_service_for(get_current_task(), address)", "configure syscall delegates to tested adapter")
+    require(function_body(source, "syscall_service_select"), "select_service_for(get_current_task(), slot)", "select syscall delegates to tested adapter")
     require(select, "caller->selected_child_service = service_abi::NO_SELECTION", "failed selection clears stale policy")
     require(select, "state.admit_start()", "restart admission retains cumulative CPU usage")
-    if not (read.index("caller->euid != 0") < read.index("service_lock.lock_irqsave()") <
+    if not (read.index("!caller->credentials().allows(ker::mod::security::Authority::RESOURCE_LIMIT)") < read.index("service_lock.lock_irqsave()") <
             read.rindex("service_lock.unlock_irqrestore(FLAGS)") < read.index("copy_value_to_task")):
         fail("service status must check privilege and release every lock before usercopy")
     for body in [configure[configure.index("service_lock.lock_irqsave()"):], select,

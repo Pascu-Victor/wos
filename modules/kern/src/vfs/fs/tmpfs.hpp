@@ -6,11 +6,17 @@
 #include <cstdint>
 #include <platform/mm/swap.hpp>
 #include <platform/sys/mutex.hpp>
+#include <vfs/exec_content.hpp>
+#include <vfs/timestamps.hpp>
 
 #include "../file_operations.hpp"
 #include "../stat.hpp"
 #include "../vfs.hpp"
 #include "bits/ssize_t.h"
+
+namespace ker::mod::security {
+class Snapshot;
+}
 
 namespace ker::vfs::tmpfs {
 
@@ -59,6 +65,7 @@ struct TmpNode {
 
     // Serializes file data/size updates for regular file I/O.
     ker::mod::sys::Mutex io_lock;
+    ker::vfs::ExecContentState exec_content;
 
     // Reference counting for POSIX unlink semantics
     std::atomic<uint32_t> open_count{0};
@@ -91,7 +98,8 @@ class TmpfsNodeRef {
    private:
     friend class TmpfsLookupHandle;
     friend auto tmpfs_acquire_node(TmpNode* node) -> TmpfsNodeRef;
-    friend auto tmpfs_acquire_lookup(TmpNode* root, const char* path, TmpfsLookupHandle* out) -> int;
+    friend auto tmpfs_acquire_lookup(const ker::mod::security::Snapshot& credentials, TmpNode* root, const char* path,
+                                     TmpfsLookupHandle* out) -> int;
 
     TmpfsNodeRef(TmpNode* node, TmpNode* canonical) : node_(node), canonical_(canonical) {}
     static auto acquire_locked(TmpNode* node) -> TmpfsNodeRef;
@@ -119,7 +127,8 @@ class TmpfsLookupHandle {
     auto root_target() const -> bool { return root_target_; }
 
    private:
-    friend auto tmpfs_acquire_lookup(TmpNode* root, const char* path, TmpfsLookupHandle* out) -> int;
+    friend auto tmpfs_acquire_lookup(const ker::mod::security::Snapshot& credentials, TmpNode* root, const char* path,
+                                     TmpfsLookupHandle* out) -> int;
     friend auto tmpfs_validate_lookup_locked(const TmpfsLookupHandle& handle) -> bool;
 
     TmpfsNodeRef parent_{};
@@ -148,13 +157,7 @@ struct TmpfsObjectMetadata {
     Timespec ctime{};
 };
 
-struct TmpfsTimesUpdate {
-    Timespec atime{};
-    Timespec mtime{};
-    Timespec ctime{};
-    bool set_atime = false;
-    bool set_mtime = false;
-};
+using TmpfsTimesUpdate = TimestampUpdate;
 
 struct TmpfsMount {
     TmpNode* root = nullptr;
@@ -205,11 +208,25 @@ auto tmpfs_directory_is_empty(const TmpNode* dir) -> bool;
 // lock. Callers may later lock the tree, validate with
 // tmpfs_validate_lookup_locked(), and commit without a lookup/commit gap.
 auto tmpfs_acquire_node(TmpNode* node) -> TmpfsNodeRef;
-auto tmpfs_acquire_lookup(TmpNode* root, const char* path, TmpfsLookupHandle* out) -> int;
+auto tmpfs_acquire_lookup(const ker::mod::security::Snapshot& credentials, TmpNode* root, const char* path, TmpfsLookupHandle* out) -> int;
+// Copy a current filesystem-relative directory path under the tree lock.
+// Caller retains the node and root; failure leaves output unchanged.
+auto tmpfs_directory_path(TmpNode* root, TmpNode* directory, char* out, size_t capacity) -> int;
+// Strict retained-root membership; no search authority is granted by recovery.
+// Optional snapshot admits current directory search under the same metadata lock.
+auto tmpfs_directory_path_beneath(TmpNode* root, TmpNode* directory, char* out, size_t capacity,
+                                  const ker::mod::security::Snapshot* credentials = nullptr) -> int;
+// Metadata-only membership of the directory target, or parent for other targets.
+// The caller retains root and lookup and serializes namespace publication.
+auto tmpfs_lookup_directory_path_beneath(TmpNode* root, const TmpfsLookupHandle& lookup, char* out, size_t capacity) -> int;
 auto tmpfs_validate_lookup_locked(const TmpfsLookupHandle& handle) -> bool;
 auto tmpfs_validate_lookup(const TmpfsLookupHandle& handle) -> bool;
 auto tmpfs_namespace_generation_locked() -> uint64_t;
 auto tmpfs_namespace_generation() -> uint64_t;
+// VFS path-search admission epoch, separate from backend handle membership.
+// Directory authority changes invalidate a prior multi-component search while
+// retained backend handles can still perform their own current DAC decisions.
+auto tmpfs_search_authority_generation() -> uint64_t;
 
 // Handle consumers validate and perform their operation under one acquisition
 // of the tmpfs namespace lock. A stale dentry/namespace snapshot is always
@@ -217,21 +234,47 @@ auto tmpfs_namespace_generation() -> uint64_t;
 auto tmpfs_lookup_metadata(const TmpfsLookupHandle& handle, bool require_directory, TmpfsObjectMetadata* out) -> int;
 void tmpfs_metadata_to_stat(const TmpfsObjectMetadata& metadata, uint32_t dev_id, ker::vfs::Stat* out);
 auto tmpfs_stat_lookup(const TmpfsLookupHandle& handle, bool require_directory, uint32_t dev_id, ker::vfs::Stat* out) -> int;
+// Caller retains the node through a File or TmpfsNodeRef. The tree lock keeps
+// owner/group/mode coherent with metadata policy publication.
+auto tmpfs_stat_node(const TmpNode* node, uint32_t dev_id, ker::vfs::Stat* out) -> int;
 auto tmpfs_readlink_lookup(const TmpfsLookupHandle& handle, char* buf, size_t bufsize) -> ssize_t;
-auto tmpfs_open_lookup(const TmpfsLookupHandle& handle, int flags, int mode, bool require_directory, int* result_out = nullptr)
-    -> ker::vfs::File*;
+auto tmpfs_open_lookup(const ker::mod::security::Snapshot& credentials, const TmpfsLookupHandle& handle, int flags, int mode,
+                       bool require_directory, int* result_out = nullptr) -> ker::vfs::File*;
+// Identity-only retention still checks parent search and target type; it grants
+// no data access. VFS checks target search again before child traversal.
+auto tmpfs_pin_directory_lookup(const ker::mod::security::Snapshot& credentials, const TmpfsLookupHandle& handle, int* result_out = nullptr,
+                                bool require_target_search = true) -> ker::vfs::File*;
 auto tmpfs_create_lookup(const TmpfsLookupHandle& handle, uint32_t mode, TmpfsObjectMetadata* out = nullptr) -> int;
-auto tmpfs_mkdir_lookup(const TmpfsLookupHandle& handle, uint32_t mode, TmpfsObjectMetadata* out = nullptr) -> int;
-auto tmpfs_symlink_lookup(const TmpfsLookupHandle& handle, const char* target, TmpfsObjectMetadata* out = nullptr) -> int;
-auto tmpfs_unlink_lookup(const TmpfsLookupHandle& handle, bool* hardlink_count_changed = nullptr) -> int;
-auto tmpfs_rmdir_lookup(const TmpfsLookupHandle& handle) -> int;
-auto tmpfs_chmod_lookup(const TmpfsLookupHandle& handle, uint32_t mode, TmpfsObjectMetadata* out = nullptr) -> int;
-auto tmpfs_chown_lookup(const TmpfsLookupHandle& handle, uint32_t owner, uint32_t group, TmpfsObjectMetadata* out = nullptr) -> int;
-auto tmpfs_utimens_lookup(const TmpfsLookupHandle& handle, const TmpfsTimesUpdate& times, TmpfsObjectMetadata* out = nullptr) -> int;
-auto tmpfs_link_lookup(const TmpfsLookupHandle& source, const TmpfsLookupHandle& destination, TmpfsObjectMetadata* out = nullptr) -> int;
-auto tmpfs_rename_lookup(const TmpfsLookupHandle& source, const TmpfsLookupHandle& destination, bool source_requires_directory,
-                         bool destination_requires_directory, TmpfsObjectMetadata* out = nullptr,
-                         bool* replaced_hardlink_count_changed = nullptr) -> int;
+// VFS callers pass the retained mount policy. Checks run after semantic and
+// credential validation, before allocation or namespace changes. Direct kernel
+// tree construction defaults to writable. Readonly is per mount, not per tree.
+auto tmpfs_mkdir_lookup(const ker::mod::security::Snapshot& credentials, const TmpfsLookupHandle& handle, uint32_t mode,
+                        TmpfsObjectMetadata* out = nullptr, bool read_only = false) -> int;
+auto tmpfs_symlink_lookup(const ker::mod::security::Snapshot& credentials, const TmpfsLookupHandle& handle, const char* target,
+                          TmpfsObjectMetadata* out = nullptr, bool require_directory = false, bool read_only = false) -> int;
+auto tmpfs_unlink_lookup(const ker::mod::security::Snapshot& credentials, const TmpfsLookupHandle& handle,
+                         bool* hardlink_count_changed = nullptr, bool read_only = false) -> int;
+auto tmpfs_rmdir_lookup(const ker::mod::security::Snapshot& credentials, const TmpfsLookupHandle& handle, bool read_only = false) -> int;
+auto tmpfs_chmod_lookup(const TmpfsLookupHandle& handle, const ker::mod::security::Snapshot& credentials, uint32_t mode,
+                        TmpfsObjectMetadata* out = nullptr, bool read_only = false) -> int;
+auto tmpfs_chown_lookup(const TmpfsLookupHandle& handle, const ker::mod::security::Snapshot& credentials, uint32_t owner, uint32_t group,
+                        TmpfsObjectMetadata* out = nullptr) -> int;
+// The caller must retain the node through a File or TmpfsNodeRef.
+auto tmpfs_chmod_node(TmpNode* node, const ker::mod::security::Snapshot& credentials, uint32_t mode, TmpfsObjectMetadata* out = nullptr)
+    -> int;
+auto tmpfs_chown_node(TmpNode* node, const ker::mod::security::Snapshot& credentials, uint32_t owner, uint32_t group,
+                      TmpfsObjectMetadata* out = nullptr) -> int;
+auto tmpfs_utimens_lookup(const TmpfsLookupHandle& handle, const ker::mod::security::Snapshot& credentials, const TmpfsTimesUpdate& times,
+                          TmpfsObjectMetadata* out = nullptr, bool read_only = false) -> int;
+auto tmpfs_utimens_node(TmpNode* node, const ker::mod::security::Snapshot& credentials, const TmpfsTimesUpdate& times,
+                        TmpfsObjectMetadata* out = nullptr) -> int;
+auto tmpfs_link_lookup(const ker::mod::security::Snapshot& credentials, const TmpfsLookupHandle& source,
+                       const TmpfsLookupHandle& destination, TmpfsObjectMetadata* out = nullptr, bool source_requires_directory = false,
+                       bool destination_requires_directory = false, bool read_only = false) -> int;
+auto tmpfs_rename_lookup(const ker::mod::security::Snapshot& credentials, const TmpfsLookupHandle& source,
+                         const TmpfsLookupHandle& destination, bool source_requires_directory, bool destination_requires_directory,
+                         TmpfsObjectMetadata* out = nullptr, bool* replaced_hardlink_count_changed = nullptr,
+                         bool* namespace_changed = nullptr, bool read_only = false) -> int;
 
 // Walk a multi-component path relative to root.
 // If create_intermediate is true, missing directory components are created.
@@ -240,14 +283,18 @@ auto tmpfs_walk_path(TmpNode* root, const char* path, bool create_intermediate) 
 auto tmpfs_walk_path(const char* path, bool create_intermediate) -> TmpNode*;
 // Create exactly the final path component without creating missing parents.
 // Returns -EEXIST when the final component already exists.
-auto tmpfs_mkdir_path(TmpNode* root, const char* path, uint32_t mode) -> int;
+auto tmpfs_mkdir_path(const ker::mod::security::Snapshot& credentials, TmpNode* root, const char* path, uint32_t mode,
+                      bool read_only = false) -> int;
 
 // File-level operations
 auto create_root_file(TmpNode* root) -> ker::vfs::File*;
 auto create_root_file() -> ker::vfs::File*;
-auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode, int* result_out = nullptr) -> ker::vfs::File*;
-auto tmpfs_open_path(const char* path, int flags, int mode, int* result_out = nullptr) -> ker::vfs::File*;
+auto tmpfs_open_path(const ker::mod::security::Snapshot& credentials, TmpNode* root, const char* path, int flags, int mode,
+                     int* result_out = nullptr) -> ker::vfs::File*;
+auto tmpfs_open_path(const ker::mod::security::Snapshot& credentials, const char* path, int flags, int mode, int* result_out = nullptr)
+    -> ker::vfs::File*;
 auto tmpfs_read(ker::vfs::File* f, void* buf, std::size_t count, std::size_t offset) -> ssize_t;
+auto tmpfs_clone_exec_file(File* source, File** output) -> int;
 auto tmpfs_write(ker::vfs::File* f, const void* buf, std::size_t count, std::size_t offset) -> ssize_t;
 auto tmpfs_write_append(ker::vfs::File* f, const void* buf, std::size_t count, std::size_t* offset_out) -> ssize_t;
 auto tmpfs_get_size(ker::vfs::File* f) -> std::size_t;

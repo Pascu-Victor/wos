@@ -1,6 +1,8 @@
 #include "syscall.hpp"
 
+#include <cerrno>
 #include <cstdint>
+#include <platform/security/credentials.hpp>
 #include <syscalls_impl/futex/futex.hpp>
 #include <syscalls_impl/multiproc/threadControl.hpp>
 #include <syscalls_impl/net/sys_net.hpp>
@@ -111,7 +113,17 @@ extern "C" auto syscall_handler(cpu::GPRegs* regs) -> uint64_t {
         case abi::callnums::POWER:
             result = ker::syscall::power::sys_power(A1, A2);
             break;
-        case abi::callnums::DEBUG:
+        case abi::callnums::DEBUG: {
+            auto* task = sched::get_current_task();
+            if (task == nullptr) {
+                result = static_cast<uint64_t>(-ESRCH);
+                break;
+            }
+            auto const CREDENTIALS = task->credentials();
+            if (!CREDENTIALS.allows(security::Authority::KERNEL_DEBUG)) {
+                result = static_cast<uint64_t>(-EPERM);
+                break;
+            }
             // a1=0: disable interrupts on this CPU; a1=1: re-enable
             // clang-tidy treats distinct inline asm branches as identical.
             // NOLINTBEGIN(bugprone-branch-clone)
@@ -127,6 +139,7 @@ extern "C" auto syscall_handler(cpu::GPRegs* regs) -> uint64_t {
             // NOLINTEND(bugprone-branch-clone)
             result = 0;
             break;
+        }
 
         default:
             if (ker::mod::debug::ptrace::report_fatal_syscall_stop(*regs, callnum_raw)) {

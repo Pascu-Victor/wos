@@ -12,11 +12,13 @@ namespace ker::net::wki {
 struct WkiTransport;
 
 // Initialize the RoCE RDMA transport (L2, MAC-based GIDs, EtherType 0x88B8).
-// Called from wki_init(). The RoCE transport is an RDMA-only overlay - it does
+// Secure WKI deliberately does not call this until authenticated RDMA records
+// are implemented. The RoCE transport is an RDMA-only overlay - it does
 // not carry WKI control messages (those go over transport_eth or transport_ivshmem).
 void wki_roce_transport_init();
 
 // RX entry point - called from ethernet.cpp's eth_rx() for EtherType 0x88B8.
+// Consumes the packet without dispatch when the transport is uninitialized.
 void roce_rx(ker::net::NetDevice* dev, ker::net::PacketBuffer* pkt);
 
 // Get the singleton RoCE transport (nullptr if not initialized).
@@ -38,5 +40,9 @@ auto wki_roce_region_wait_tagged_write(uint32_t rkey, uint16_t cookie, uint32_t 
 void wki_roce_region_finish_tagged_write(uint32_t rkey, uint16_t cookie);
 auto wki_roce_rdma_write_tagged(uint16_t neighbor_id, uint32_t rkey, uint64_t remote_offset, const void* local_buf, uint32_t len,
                                 uint16_t cookie) -> int;
+
+#ifdef WOS_SELFTEST
+auto wki_roce_selftest_uninitialized_receive_preserves_region() -> bool;
+#endif
 
 }  // namespace ker::net::wki

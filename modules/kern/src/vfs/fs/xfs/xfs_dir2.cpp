@@ -4777,6 +4777,41 @@ auto xfs_dir_removename(XfsInode* dp, const char* name, uint16_t namelen, XfsTra
     return rc;
 }
 
+auto xfs_dir_reparent(XfsInode* dp, xfs_ino_t expected_parent, xfs_ino_t new_parent, XfsTransaction* tp) -> int {
+    if (dp == nullptr || tp == nullptr || expected_parent == NULLFSINO || new_parent == NULLFSINO) return -EINVAL;
+    if (!xfs_inode_isdir(dp)) return -ENOTDIR;
+    XfsDirEntry parent{};
+    int rc = xfs_dir_lookup_authoritative(dp, "..", 2, &parent);
+    if (rc != 0) return rc;
+    if (parent.ino != expected_parent) return -EIO;
+    if (expected_parent == new_parent) return 0;
+    rc = xfs_trans_capture_inode(tp, dp);
+    if (rc != 0) return rc;
+    if (dp->data_fork.format == XFS_DINODE_FMT_LOCAL) {
+        // Preserve the shortform i8count and entry widths. A change in the
+        // parent's high-inode classification uses the existing conversion.
+        if ((expected_parent > UINT32_MAX) != (new_parent > UINT32_MAX)) {
+            rc = dir2_sf_to_block(dp, tp);
+            if (rc != 0) return rc;
+        } else {
+            auto* hdr = reinterpret_cast<XfsDir2SfHdr*>(dp->data_fork.local.data);
+            size_t const WIDTH = xfs_dir2_sf_inumber_size(hdr);
+            for (size_t i = 0; i < WIDTH; ++i) hdr->parent[i] = static_cast<uint8_t>(new_parent >> (8 * (WIDTH - i - 1)));
+            dp->dir_generation++;
+            dir2_leaf_index_note_unknown(dp);
+            xfs_dentry_cache_invalidate_dir(dp);
+            dp->dirty = true;
+            xfs_trans_log_inode(tp, dp);
+            return 0;
+        }
+    }
+    // These helpers capture data/index buffers and update checksums, caches
+    // and directory generations within the caller's transaction.
+    rc = xfs_dir_removename(dp, "..", 2, tp, expected_parent);
+    if (rc != 0) return rc;
+    return xfs_dir_addname(dp, "..", 2, new_parent, XFS_DIR3_FT_DIR, tp, true);
+}
+
 void xfs_dentry_cache_stats(XfsDentryCacheStats& out) {
     out.hits = g_xfs_dentry_hits.load(std::memory_order_relaxed);
     out.misses = g_xfs_dentry_misses.load(std::memory_order_relaxed);

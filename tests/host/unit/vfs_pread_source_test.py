@@ -118,7 +118,7 @@ def test_vfs_fd_access_modes_gate_io_before_backend_dispatch() -> None:
         "vfs_write_file_direct access gating",
     )
 
-    for name in ("vfs_pread", "vfs_pwrite"):
+    for name in ("vfs_pread",):
         body = function_body(source, name)
         helper = "vfs_file_can_read" if name == "vfs_pread" else "vfs_file_can_write"
         fop = "vfs_read" if name == "vfs_pread" else "vfs_write"
@@ -132,6 +132,17 @@ def test_vfs_fd_access_modes_gate_io_before_backend_dispatch() -> None:
             ],
             f"{name} access gating",
         )
+
+    positional_write = function_body(source, "vfs_pwrite_file")
+    require_order(positional_write, ["if (!vfs_file_can_write(f))", "return -EBADF", "f->fops->vfs_write"],
+                  "retained positional write access gating")
+    require_order(positional_write, ["validate_positional_offset(offset, &positional_offset)", "return OFFSET_RET",
+                                    "vfs_pwrite_user_bounced("], "retained positional write offset gating")
+    if "vfs_put_file(" in positional_write:
+        fail("retained positional write must not release the caller's reference")
+    require_order(function_body(source, "vfs_pwrite"), ["vfs_get_file_retain(task, fd)", "if (file == nullptr)",
+                  "vfs_pwrite_file(file, buf, count, offset)", "vfs_put_file(file)", "return RESULT"],
+                  "positional write descriptor lifetime")
 
     for name in ("vfs_pread_file", "vfs_pread_file_direct"):
         body = function_body(source, name)
@@ -159,7 +170,7 @@ def test_positional_io_rejects_negative_offsets_before_unsigned_conversion() -> 
         "positional offset validator",
     )
 
-    for name in ("vfs_pread", "vfs_pread_file", "vfs_pread_file_direct", "vfs_pwrite"):
+    for name in ("vfs_pread", "vfs_pread_file", "vfs_pread_file_direct", "vfs_pwrite_file"):
         body = function_body(source, name)
         if "static_cast<size_t>(offset)" in body:
             fail(f"{name} must not convert a signed offset directly")
@@ -168,7 +179,7 @@ def test_positional_io_rejects_negative_offsets_before_unsigned_conversion() -> 
         if "positional_offset" not in body:
             fail(f"{name} must pass the validated positional offset to backend file ops")
 
-    for name in ("vfs_pread", "vfs_pwrite"):
+    for name in ("vfs_pread",):
         body = function_body(source, name)
         require_order(
             body,

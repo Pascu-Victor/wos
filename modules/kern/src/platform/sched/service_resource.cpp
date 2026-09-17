@@ -7,6 +7,7 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/service_resource_model.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/security/authorization.hpp>
 #include <platform/sys/usercopy.hpp>
 #include <utility>
 
@@ -25,6 +26,12 @@ std::array<ServiceSlot, service_abi::MAX_SERVICES> services{};
 sys::Spinlock service_lock;
 
 auto is_init(task::Task* subject) -> bool { return subject != nullptr && subject->pid == 1 && !subject->is_thread; }
+
+auto service_management_status(task::Task* caller) -> int {
+    if (caller == nullptr) return -EPERM;
+    auto const CREDENTIALS = caller->credentials();
+    return security::authorize_service_resource_management(CREDENTIALS, is_init(caller));
+}
 
 auto validate_configuration(service_abi::Configuration& config) -> bool {
     if (config.size != sizeof(config) || config.version != service_abi::VERSION || config.slot >= services.size() || config.flags != 0 ||
@@ -377,9 +384,10 @@ auto charge_service_cpu(task::Task& process, uint64_t elapsed_us) -> CpuAction {
     return ACTION;
 }
 
-auto syscall_service_configure(uint64_t address) -> uint64_t {
-    auto* caller = get_current_task();
-    if (!is_init(caller)) return static_cast<uint64_t>(-EPERM);
+namespace {
+auto configure_service_for(task::Task* caller, uint64_t address) -> uint64_t {
+    int const AUTHORIZATION = service_management_status(caller);
+    if (AUTHORIZATION != 0) return static_cast<uint64_t>(AUTHORIZATION);
     service_abi::Configuration config{};
     if (!sys::usercopy::copy_value_from_task(*caller, address, config)) return static_cast<uint64_t>(-EFAULT);
     ServiceState candidate{};
@@ -398,9 +406,9 @@ auto syscall_service_configure(uint64_t address) -> uint64_t {
     return static_cast<uint64_t>(result);
 }
 
-auto syscall_service_select(uint64_t slot) -> uint64_t {
-    auto* caller = get_current_task();
-    if (!is_init(caller)) return static_cast<uint64_t>(-EPERM);
+auto select_service_for(task::Task* caller, uint64_t slot) -> uint64_t {
+    int const AUTHORIZATION = service_management_status(caller);
+    if (AUTHORIZATION != 0) return static_cast<uint64_t>(AUTHORIZATION);
     uint64_t const FLAGS = service_lock.lock_irqsave();
     int result = 0;
     // A failed selection also clears any previous pending selection.
@@ -416,11 +424,16 @@ auto syscall_service_select(uint64_t slot) -> uint64_t {
     service_lock.unlock_irqrestore(FLAGS);
     return static_cast<uint64_t>(result);
 }
+}  // namespace
+
+auto syscall_service_configure(uint64_t address) -> uint64_t { return configure_service_for(get_current_task(), address); }
+
+auto syscall_service_select(uint64_t slot) -> uint64_t { return select_service_for(get_current_task(), slot); }
 
 auto syscall_service_read(uint64_t slot, uint64_t address, uint64_t version) -> uint64_t {
     auto* caller = get_current_task();
     if (caller == nullptr) return static_cast<uint64_t>(-ESRCH);
-    if (caller->euid != 0) return static_cast<uint64_t>(-EACCES);
+    if (!caller->credentials().allows(ker::mod::security::Authority::RESOURCE_LIMIT)) return static_cast<uint64_t>(-EACCES);
     if (slot >= services.size() || version != service_abi::VERSION) return static_cast<uint64_t>(-EINVAL);
     service_abi::Snapshot snapshot{};
     snapshot.size = sizeof(snapshot);
@@ -462,6 +475,43 @@ auto syscall_service_read(uint64_t slot, uint64_t address, uint64_t version) -> 
 }
 
 #ifdef WOS_SELFTEST
+auto selftest_service_management_authority() -> bool {
+    using namespace security;
+    constexpr uint64_t DENIED = static_cast<uint64_t>(-EPERM);
+    if (configure_service_for(nullptr, UINT64_MAX) != DENIED || select_service_for(nullptr, 0) != DENIED) return false;
+    auto const ROOT = Snapshot::bootstrap_root();
+    std::array<Snapshot, 4> credentials{ROOT, ROOT, ROOT, ROOT};
+    if (ROOT.prepare({.change = Change::SET_EUID, .effective = 1000}, credentials.at(1)) != 0 ||
+        ROOT.prepare({.change = Change::DROP_AUTHORITY,
+                      .authority_ceiling = ALL_AUTHORITY & ~(uint64_t{1} << static_cast<unsigned>(Authority::INIT_CONTROL))},
+                     credentials.at(2)) != 0 ||
+        ROOT.prepare({.change = Change::DROP_AUTHORITY,
+                      .authority_ceiling = ALL_AUTHORITY & ~(uint64_t{1} << static_cast<unsigned>(Authority::RESOURCE_LIMIT))},
+                     credentials.at(3)) != 0)
+        return false;
+    for (auto const& value : credentials) {
+        for (uint64_t pid : {uint64_t{1}, uint64_t{2}}) {
+            task::Task caller{};
+            caller.pid = pid;
+            if (initialize_credentials(caller, value) != 0) return false;
+            caller.selected_child_service = 7;
+            bool const ALLOWED = pid == 1 && value == ROOT;
+            if (configure_service_for(&caller, UINT64_MAX) != static_cast<uint64_t>(ALLOWED ? -EFAULT : -EPERM) ||
+                caller.selected_child_service != 7)
+                return false;
+            if (select_service_for(&caller, service_abi::NO_SELECTION) != (ALLOWED ? 0 : DENIED) ||
+                caller.selected_child_service != (ALLOWED ? service_abi::NO_SELECTION : 7))
+                return false;
+        }
+    }
+    task::Task thread{};
+    thread.pid = 1;
+    thread.is_thread = true;
+    thread.selected_child_service = 7;
+    return configure_service_for(&thread, UINT64_MAX) == DENIED && select_service_for(&thread, service_abi::NO_SELECTION) == DENIED &&
+           thread.selected_child_service == 7;
+}
+
 auto selftest_service_observation_merge() -> bool {
     constexpr unsigned AS = static_cast<unsigned>(Id::AS);
     constexpr unsigned AS_ROW = service_abi::RESOURCE_COUNT - 1;

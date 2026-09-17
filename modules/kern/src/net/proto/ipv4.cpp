@@ -284,8 +284,8 @@ auto ipv4_tx_auto(PacketBuffer* pkt, IPv4Address dst, uint8_t proto) -> int {
         return -1;
     }
     // Get the first IPv4 address on the outgoing interface
-    auto* nif = netif_find_by_dev(route_ref.get());
-    if (nif == nullptr || nif->ipv4_addr_count == 0) {
+    auto const IPV4 = netif_ipv4_snapshot(route_ref.get());
+    if (IPV4.count == 0) {
         // Broadcast fallback: no address configured yet (e.g. pre-DHCP)
         if (dst.is_broadcast()) {
             return ipv4_tx(pkt, IPv4Address::any(), dst, proto, IPV4_DEFAULT_TTL);
@@ -297,7 +297,7 @@ auto ipv4_tx_auto(PacketBuffer* pkt, IPv4Address dst, uint8_t proto) -> int {
         return -1;
     }
 
-    return ipv4_tx(pkt, nif->ipv4_addrs.front().addr, dst, proto, IPV4_DEFAULT_TTL);
+    return ipv4_tx(pkt, IPV4.entries.front().addr, dst, proto, IPV4_DEFAULT_TTL);
 }
 
 }  // namespace ker::net::proto

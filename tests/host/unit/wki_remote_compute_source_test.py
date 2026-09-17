@@ -84,17 +84,30 @@ def test_peer_cleanup_marks_all_targeted_submits_terminal_failure() -> None:
 
 def test_proxy_wait_completion_respects_waitpid_publish_fence() -> None:
     source = REMOTE_COMPUTE_CPP.read_text()
-    finalize_body = function_body(source, "finalize_proxy_task")
+    prepare = function_body(source, "prepare_proxy_finalization")
+    finish = function_body(source, "finish_proxy_exit")
+    worker = function_body(source, "run_one_proxy_exit")
+    finalize_body = prepare + finish + worker
+    require_order(prepare, "cleanup_proxy_resources(proxy)", "enqueue(*proxy)", "stable resources before deferred ownership")
+    require_order(finish, "child_events::prepare_process_exit(*proxy)", "proxy->has_exited = true", "child retirement before exit visibility")
+    require_order(worker, "s_proxy_exit_lock.unlock_irqrestore", "finish_proxy_exit", "no queue lock across blocking retirement")
+    loop = function_body(source, "compute_rx_worker_loop")
+    require_order(loop, "run_one_proxy_exit()", "PeerLifecycleLease lifecycle", "retirement outside peer lease")
+    require_order(loop, "run_one_child_query_send()", "PeerLifecycleLease lifecycle", "query sends outside incoming peer lease")
+    require_order(loop, "run_one_child_claim_send()", "PeerLifecycleLease lifecycle", "claim sends outside incoming peer lease")
+    require_tokens(loop, ["if (NATIVE_WORK || QUERY_WORK || CLAIM_WORK)"], "retry query and claim continuations before parking")
+    require_tokens(" ".join(loop.split()), ["if (!RETIRED && !SIGNALED && !CLAIM_RETIRED && !QUERY_RETIRED) ker::mod::sched::kern_block()"], "drain retained work before parking")
+    require_tokens(loop, ["run_one_child_signal()"], "deferred child notification progress before RX lease")
     require_order(
         finalize_body,
         "cleanup_proxy_resources(proxy)",
-        "ker::syscall::process::child_events::publish_exit(*proxy)",
+        "ker::syscall::process::child_events::publish_exit(task)",
         "proxy resources must be stable before the immutable exit event",
     )
     require_order(
         finalize_body,
-        "ker::syscall::process::child_events::publish_exit(*proxy)",
-        "ker::mod::sched::insert_into_dead_list(proxy)",
+        "ker::syscall::process::child_events::publish_exit(task)",
+        "ker::mod::sched::insert_into_dead_list(&task)",
         "proxy exit event must precede dead-list insertion",
     )
     require_tokens(
@@ -479,7 +492,7 @@ def test_placement_controllers_run_before_payload_distribution() -> None:
         spawn,
         [
             "is_placement_control_helper(task->name)",
-            "is_placement_control_helper(task->exe_path.data())",
+            "is_placement_control_helper(EXE_PATH)",
             'log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "placement-control-helper")',
         ],
         "placement controller local execution",
@@ -804,7 +817,7 @@ def test_task_exit_retires_remote_compute_wait_owners() -> None:
             "take_unpublished_process(Task* owner)",
             "destroy_unpublished_process(Task* task)",
             "destroy_owned_unpublished_process(Task* owner, Task* child)",
-            "complete_unpublished_process_construction(Task* task)",
+            "complete_unpublished_process_construction(Task* task, int* interpreter_error",
             "std::atomic<bool> unpublished_teardown_in_progress{false}",
         ],
         "persistent unpublished-process owner API",
@@ -942,7 +955,7 @@ def test_task_exit_retires_remote_compute_wait_owners() -> None:
         complete_construction,
         [
             "task->pending_interp_path.front() == '\\0'",
-            "read_boot_file_fully(task->pending_interp_path.data(), &interp_buf, &interp_size)",
+            "read_boot_file_fully(*task, task->pending_interp_path.data(), &interp_buf, &interp_size, interpreter_error)",
             "loader::elf::load_elf",
             "task->context.frame.rip = INTERP_RESULT.entry_point",
             "task->interp_base = INTERP_RESULT.load_base",
@@ -960,12 +973,12 @@ def test_task_exit_retires_remote_compute_wait_owners() -> None:
     require_order(
         exec_body,
         "claim_unpublished_process(parent_task, new_task)",
-        "complete_unpublished_process_construction(new_task)",
+        "complete_unpublished_process_construction(new_task",
         "exec must claim fatal-exit ownership before PT_INTERP VFS I/O",
     )
     require_order(
         exec_body,
-        "complete_unpublished_process_construction(new_task)",
+        "complete_unpublished_process_construction(new_task",
         "wki_try_remote_spawn(new_task, REMOTE_SPAWN)",
         "exec must finish PT_INTERP before remote submission",
     )
@@ -981,7 +994,7 @@ def test_task_exit_retires_remote_compute_wait_owners() -> None:
 
     require_tokens(
         SMT_CPP.read_text(),
-        ["complete_unpublished_process_construction(new_task)"],
+        ["complete_unpublished_process_construction(new_task"],
         "pre-scheduler init PT_INTERP completion",
     )
     require_tokens(
@@ -989,7 +1002,9 @@ def test_task_exit_retires_remote_compute_wait_owners() -> None:
         ["unpublished_teardown_in_progress.load(std::memory_order_acquire)"],
         "fatal-signal handoff deferral during unpublished teardown",
     )
-    requested_exit = function_body(process_exit, "exit_current_if_process_exit_requested")
+    requested_exit = function_body(process_exit, "take_requested_process_exit")
+    require_tokens(function_body(process_exit, "exit_current_if_process_exit_requested"),
+                   ["take_requested_process_exit"], "early exit uses the shared guarded request consumer")
     require_order(
         requested_exit,
         "unpublished_teardown_in_progress.load(std::memory_order_acquire)",
@@ -1031,7 +1046,7 @@ def test_task_exit_retires_remote_compute_wait_owners() -> None:
     spawn = function_body(source, "wki_try_remote_spawn")
     require_order(
         spawn,
-        "task->wki_proxy_task_id = tid",
+        "task->set_wki_proxy_task_id(tid)",
         "post_task_waiting(task)",
         "proxy identity must be visible before scheduler publication",
     )
@@ -1058,7 +1073,7 @@ def test_task_exit_retires_remote_compute_wait_owners() -> None:
         [
             "task->clear_wait_channel()",
             "task->wki_proxy_task = false",
-            "task->wki_proxy_task_id = 0",
+            "task->set_wki_proxy_task_id(0)",
             "abandon_submitted_task_after_proxy_publish_failure(tid)",
             '"proxy-publication-failed"',
             "(STRICT_TARGET || STRICT_REMOTE) ? WkiRemoteSpawnResult::FAILED : WkiRemoteSpawnResult::LOCAL",
@@ -1274,7 +1289,7 @@ def test_completion_queue_allocation_and_retry_preserve_ownership() -> None:
     require_tokens(collector, ["if (!queue_pending_completion_locked(PendingTaskCompletion", "std::unique_ptr<PendingTaskCompletion> pending(pop_pending_completion_locked())", "append_pending_completion_locked(pending.release())"], "completion ownership")
     failure = collector[collector.index("if (!queue_pending_completion_locked"):collector.index("release_running_root_locked(rt)")]
     require_tokens(failure, ["continue;"], "allocation failure retains running ownership")
-    for forbidden in ["rt.task->release()", "delete rt.output", "rt.output = nullptr", "rt.active = false"]:
+    for forbidden in ["rt.task->release()", "release_output_capture(rt.output)", "rt.output = nullptr", "rt.active = false"]:
         if forbidden in failure:
             raise AssertionError("failed completion allocation consumed receiver ownership")
     require_order(collector, "queue_pending_completion_locked", "release_running_root_locked(rt)", "durable completion before monitor release")
@@ -1297,14 +1312,15 @@ def test_task_completion_uses_bounded_stack_storage() -> None:
     require_tokens(
         completion,
         [
-            "std::min<uint16_t>(info.output->len, WKI_TASK_MAX_OUTPUT)",
+            "info.output->freeze()",
+            "static_cast<uint16_t>(OUTPUT.size())",
             "std::array<uint8_t, WKI_COMPUTE_RX_PAYLOAD_MAX> buf __attribute__((uninitialized));",
             "reinterpret_cast<TaskCompletePayload*>(buf.data())",
             "complete->task_id = info.task_id",
             "complete->exit_status = info.exit_status",
             "complete->output_len = OUT_LEN",
             "complete->reserved = RESOURCE_LEN",
-            "memcpy(buf.data() + sizeof(TaskCompletePayload), info.output->data.data(), OUT_LEN)",
+            "memcpy(buf.data() + sizeof(TaskCompletePayload), OUTPUT.data(), OUT_LEN)",
             "MsgType::TASK_COMPLETE, buf.data(), MSG_LEN",
         ],
         "stack-backed TASK_COMPLETE frame",
@@ -1480,7 +1496,7 @@ def test_vfs_ref_loader_rejects_null_or_empty_path_before_vfs_use() -> None:
     for later in [
         "localize_receiver_logical_path(path",
         "fallback_to_local_path_for_disconnected_wki_host(resolved_path",
-        "ker::vfs::vfs_stat(resolved_path",
+        "ker::vfs::vfs_open_read_file_as(*CURRENT_TASK",
         "std::strncpy(pending.path.data(), cache_path.data()",
     ]:
         require_order(body, guard, later, "VFS_REF loader must reject null/empty path before VFS/cache use")
@@ -1514,7 +1530,8 @@ def test_vfs_ref_loader_deadlines_are_saturating() -> None:
         "if (wki_now_us() >= inflight_deadline_us || !request_is_current())",
         "inflight wait timeout must be checked after dropping compute lock",
     )
-    if body.count("sleep_until_us(WAIT_UNTIL_US, WKI_VFS_LOAD_BACKOFF_POLL_US)") < 3:
+    # Open and fstat now share one retained-file retry branch; short reads keep the other backoff.
+    if body.count("sleep_until_us(WAIT_UNTIL_US, WKI_VFS_LOAD_BACKOFF_POLL_US)") < 2:
         fail("VFS_REF loader must keep retry backoff sleeps on every retry path")
 
 
@@ -1602,8 +1619,8 @@ def test_large_vfs_ref_exec_keeps_a_file_backed_source() -> None:
         loader_body,
         [
             "std::cmp_greater_equal(statbuf.st_size, WKI_FILE_BACKED_ELF_MIN_SIZE)",
-            "result.file = ker::vfs::vfs_get_file_retain(CURRENT_TASK, FD)",
-            "ker::syscall::process::supports_file_backed_process(result.file",
+            "result.file = source.release()",
+            "ker::syscall::process::supports_file_backed_process(source.get()",
             "result.file_stat = statbuf",
             "return result;",
             "buf = new uint8_t[file_size]",
@@ -1623,7 +1640,7 @@ def test_large_vfs_ref_exec_keeps_a_file_backed_source() -> None:
         [
             "vfs_result.buffer == nullptr && vfs_result.file == nullptr",
             "elf_file = vfs_result.file",
-            "exec_elf_file(elf_file, binary_len, elf_file_stat, submitted_resources, SUBMITTED_UID, stdio_mask)",
+            "exec_elf_file(elf_file, binary_len, elf_file_stat, submitted_resources, mapped_credentials, stdio_mask)",
         ],
         "large VFS_REF file-backed execution",
     )
@@ -1648,7 +1665,7 @@ def test_submitted_vfs_policy_is_active_during_elf_construction() -> None:
     require_order(body, "policy_cursor =", "ScopedSubmitVfsIdentity submit_vfs_identity", "policy cursor before scoped install")
     require_order(
         body,
-        "if (!submit_vfs_identity.policy_valid())",
+        "if (reject_reason != TaskRejectReason::ACCEPTED || !submit_vfs_identity.policy_valid())",
         "ExecResult const EXEC =",
         "submitted policy validation before ELF construction",
     )
@@ -1673,7 +1690,7 @@ def test_controller_descendants_default_to_local_placement() -> None:
 
     require_order(
         body,
-        "apply_submitted_task_identity(new_task, submitted_identity)",
+        "apply_submitted_task_identity(",
         "new_task->wki_target_hostname.front() = '\\0'",
         "receiver placement must override inherited submitter targeting",
     )
@@ -1696,7 +1713,7 @@ def test_controller_descendants_default_to_local_placement() -> None:
     require_tokens(
         explicit_body,
         [
-            "const char* const TARGET_HOSTNAME = task->wki_target_hostname.data()",
+            "const char* const TARGET_HOSTNAME = TARGET",
             "uint16_t node_id = wki_peer_find_by_hostname(TARGET_HOSTNAME)",
             'constexpr std::string_view WOS_DOMAIN_SUFFIX = ".wos"',
             "node_id = wki_peer_find_by_hostname(short_target.data())",
@@ -1737,23 +1754,30 @@ def test_submission_errors_and_ipc_suffix_framing() -> None:
     exec_source = PROCESS_EXEC_CPP.read_text()
     for name in ["wos_proc_exec_impl", "wos_proc_execve_impl"]:
         body = multiline_function_body(exec_source, name)
-        require_tokens(body, [".error_out = &remote_error", "return static_cast<uint64_t>(remote_error)"], "raw syscall preserves negative errno")
+        tokens = ([".error_out = &remote_error", "return static_cast<uint64_t>(remote_error)"] if name == "wos_proc_exec_impl" else
+                  ["try_process_remote_exec(*task", "exec_stat, EXEC_NOSUID, remote_error", "static_cast<uint64_t>(remote_error)"])
+        require_tokens(body, tokens, "raw syscall preserves negative errno")
 
 
 def test_resource_contract_preserves_baseline_and_completion_ownership() -> None:
     source = REMOTE_COMPUTE_CPP.read_text()
     for name in ["wki_task_submit_inline", "wki_task_submit_vfs_ref"]:
         body = multiline_function_body(source, name)
-        require_tokens(body, ["wki_peer_capability_negotiated(target_node, WKI_CAP_RESOURCE_LIMITS)",
-                              "snapshot_task_resources(local_task, *resources)", "st.resource_baseline = resources",
-                              "copy_submit_identity_data(cursor, local_task, resources)"],
+        require_tokens(" ".join(body.split()), ["wki_peer_capability_negotiated(target_node, WKI_CAP_RESOURCE_LIMITS)",
+                              "snapshot_task_resources(local_task, *resources, transfer != nullptr && transfer->cutover != nullptr)", "WKI_CHILD_CPU_RESOURCE_ID", "st.resource_baseline = resources",
+                              "copy_submit_identity_data(cursor, local_task, resources, SUBMIT_CREDENTIALS, submit_filesystem.root, FULL_CREDENTIALS, exec_signals, ROUTED_HOME, FILESYSTEM)"],
                        "negotiated submission uses one retained resource baseline")
         require_order(body, "snapshot_task_resources(", "s_compute_lock.lock()", "snapshot outside compute lock")
+    snapshot = function_body(source, "snapshot_task_resources")
+    require_order(snapshot, "resource_lock.unlock_irqrestore", "child_events::read_reaped_cpu_times", "no resource lock across lifecycle observation")
+    receiver = function_body(source, "handle_task_submit_work")
+    require_order(receiver, "prepare_submitted_resources(", "child_events::import_reaped_cpu_times(*new_task", "validated observations before receiver installation")
     complete = function_body(source, "handle_task_complete")
     require_order(complete, "resource_contract::decode(", "s_compute_lock.lock()", "aligned decode before compute lock")
     require_order(complete, "resource_contract::valid_completion(", "take_local_task_ref()", "validate baseline before ownership transfer")
     require_tokens(complete, ["task->resource_completion = resource_completion", "task->active = false"], "retain terminal resource record")
-    finalize = function_body(source, "finalize_proxy_task")
+    finalize = (function_body(source, "prepare_proxy_finalization") + function_body(source, "finish_proxy_exit")
+                + function_body(source, "run_one_proxy_exit"))
     require_order(finalize, "transition_state(", "merge_proxy_resource_completion(", "one winning finalizer merges usage")
     service_source = (ROOT / "modules/kern/src/platform/sched/service_resource.cpp").read_text()
     guard_release = re.search(r"ServiceResourceMerge::~ServiceResourceMerge\(\)\s*\{([^}]*)\}", service_source)
@@ -1841,12 +1865,12 @@ def test_receiver_child_owner_spans_interpreter_output_and_publication() -> None
     require_order(
         exec_body,
         "claim_unpublished_process(OWNER, new_task)",
-        "complete_unpublished_process_construction(new_task)",
+        "complete_unpublished_process_construction(new_task",
         "receiver must publish child ownership before blocking PT_INTERP loading",
     )
     require_order(
         exec_body,
-        "complete_unpublished_process_construction(new_task)",
+        "complete_unpublished_process_construction(new_task",
         "finish_remote_exec_task(new_task, stdio_mask, resources)",
         "receiver must finish the owned interpreter stage before output setup",
     )
@@ -1862,7 +1886,7 @@ def test_receiver_child_owner_spans_interpreter_output_and_publication() -> None
     )
     if "release_unpublished_process(" in exec_body:
         fail("exec_elf_buffer must return with the receiver child owner slot intact")
-    require_order(exec_body, "ProcessReservation process_reservation(resources, real_uid)",
+    require_order(exec_body, "ProcessReservation process_reservation(resources, credentials.user().real)",
                   'kernel_stack_alloc("wki_exec_kstack")', "receiver NPROC admission before kernel stack")
     require_order(exec_body, "new_task->resources = resources", "initialize_process_image(elf_buffer, binary_len)",
                   "receiver policy before image/stack allocation")
@@ -1872,16 +1896,18 @@ def test_receiver_child_owner_spans_interpreter_output_and_publication() -> None
     boot_read = function_body(TASK_CPP.read_text(), "read_boot_file_fully")
     require_order(
         boot_read,
-        "ker::vfs::vfs_stat(path, &preopen_freshness)",
-        "ker::vfs::vfs_open_file(path, OPEN_FLAGS, 0)",
-        "interpreter cache must be consulted before remote open prefetch",
+        "ker::vfs::vfs_open_read_file_as(path_context, CREDENTIALS, path,",
+        "boot_file_cache_lookup_copy(cache_key.data(), freshness",
+        "interpreter cache bytes require successful read admission",
     )
     require_order(
         boot_read,
-        "boot_file_cache_lookup_copy(cache_key.data(), preopen_freshness",
-        "ker::vfs::vfs_open_file(path, OPEN_FLAGS, 0)",
-        "preopen freshness hit must avoid fetching cached remote interpreter bytes",
+        "ker::vfs::vfs_fstat_file(file, &freshness)",
+        "boot_file_cache_lookup_copy(cache_key.data(), freshness",
+        "interpreter cache freshness comes from the admitted open object",
     )
+    if "preopen_freshness" in boot_read or boot_read.count("boot_file_cache_lookup_copy(") != 1:
+        fail("interpreter cache must not bypass open authorization")
 
     work_body = function_body(source, "handle_task_submit_work")
     require_order(
@@ -1892,7 +1918,7 @@ def test_receiver_child_owner_spans_interpreter_output_and_publication() -> None
     )
     require_order(
         work_body,
-        "bool const POSTED = ker::mod::sched::post_task_balanced(new_task)",
+        "bool const POSTED = post_admitted_remote_process(",
         "release_unpublished_process(current_task, new_task)",
         "receiver may release child recovery ownership only after scheduler publication",
     )
@@ -2024,7 +2050,7 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
         [
             "dequeue_compute_rx(worker_index, &slot_index)",
             "PeerLifecycleLease lifecycle",
-            "peer->state == PeerState::CONNECTED",
+            "compute_rx_identity_matches(work, *peer, g_wki.capabilities)",
             "compute_submit_channel_token_matches(",
             "detail::handle_task_complete(",
             "detail::handle_task_cancel(",
@@ -2035,10 +2061,12 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
     require_tokens(smt, ["wki_remote_compute_start_rx_threads()"], "compute RX startup after scheduler initialization")
 
     handler_body = function_body(source, "handle_task_submit")
+    require_tokens(handler_body, ["queue_admitted_task_submit(hdr, payload, payload_len, SESSION)"], "captured session passed to queue")
+    handler_body += function_body(source, "queue_admitted_task_submit")
     require_tokens(
         handler_body,
         [
-            "capture_compute_submit_session_locked(hdr->src_node, rx_channel, rx_channel_generation)",
+            "capture_compute_submit_session_locked(hdr->src_node, rx_channel, rx_channel_generation, IDENTITY)",
             "wki_send_on_channel_generation(hdr->src_node, SESSION.rx_channel, SESSION.rx_channel_generation",
             "s_compute_submit_task_count.load(std::memory_order_acquire) == 0",
             "new (std::nothrow) uint8_t[payload_len]",
@@ -2101,7 +2129,7 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
     require_tokens(
         work_body,
         [
-            "compute_submit_session_is_current_locked(session)",
+            "compute_submit_admission_is_current_locked(session)",
             "take_cancelled_task_submit_locked(session, submit->task_id)",
             "wki_send_on_channel_generation(src_node, session.rx_channel, session.rx_channel_generation",
             "Task submit expired before post",
@@ -2110,7 +2138,7 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
             "rt.accept_pending = false",
             "rt.submit_session_epoch = session.epoch",
             "publish_running_task_locked(rt)",
-            "bool const POSTED = ker::mod::sched::post_task_balanced(new_task)",
+            "bool const POSTED = post_admitted_remote_process(",
             "published_row->published = true",
             "published_row->accept_pending = send_accept",
             "worker_task_ref = new_task",
@@ -2128,7 +2156,7 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
     require_order(
         publication_block,
         "s_compute_lock.unlock()",
-        "bool const POSTED = ker::mod::sched::post_task_balanced(new_task)",
+        "bool const POSTED = post_admitted_remote_process(",
         "scheduler publication must not run under the compute spinlock",
     )
     successful_publication = work_body[
@@ -2151,7 +2179,7 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
     require_order(
         destroy_process_body,
         "destroy_owned_unpublished_process(owner, task)",
-        "delete output",
+        "release_output_capture(output)",
         "remote output may be released only after child fd teardown is complete",
     )
     require_tokens(
@@ -2169,7 +2197,6 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
         "wki-submit-cancel",
         "wki-submit-session",
         "wki-submit-ref",
-        "wki-submit-post",
     ]:
         require_tokens(
             work_body,
@@ -2178,6 +2205,10 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
         )
         if reason not in work_body:
             fail(f"{reason} rejection must use complete unpublished-process cleanup")
+
+    refused_post = function_body(source, "discard_unposted_remote_process")
+    require_tokens(refused_post, ['destroy_unpublished_remote_process(owner, child, output, "wki-submit-post"'],
+                   "post refusal uses complete owner-linked cleanup")
 
     cleanup_body = function_body(source, "wki_remote_compute_cleanup_for_peer")
     require_tokens(
@@ -2221,7 +2252,7 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
             "wki_send_on_channel_generation(",
             "info.submitter_node, info.submit_rx_channel, info.submit_rx_channel_generation, MsgType::TASK_COMPLETE",
             "append_pending_completion_locked(pending.release())",
-            "delete rt.output",
+            "release_output_capture(rt.output)",
             "release_running_root_locked(rt)",
         ],
         "retired peer output capture release after task exit",
@@ -2231,7 +2262,7 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
     require_tokens(
         cancel_body,
         [
-            "capture_compute_submit_session_locked(hdr->src_node, rx_channel, rx_channel_generation)",
+            "capture_compute_submit_session_locked(hdr->src_node, rx_channel, rx_channel_generation, IDENTITY)",
             "find_running_task(cancel->task_id, SESSION)",
             "record_cancelled_task_submit_locked(SESSION, cancel->task_id, SIGNUM)",
             "rt->accept_pending = false",
@@ -2260,7 +2291,7 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
         [
             "uint64_t const TOTAL =",
             "if (TOTAL > UINT16_MAX)",
-            "capture_submitter_channel(target_node)",
+            "capture_exec_submit_channel(target_node, SUBMIT_CHANNEL)",
             "send_task_submit_payload(target_node, SUBMIT_CHANNEL, TASK_ID, BUF, MSG_LEN)",
         ],
         "INLINE sender overflow and channel-generation guards",
@@ -2274,7 +2305,7 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
             "size_t const PATH_LEN = std::strlen(vfs_path)",
             "PATH_LEN >= 512",
             "PATH_LEN > UINT16_MAX",
-            "capture_submitter_channel(target_node)",
+            "capture_exec_submit_channel(target_node, SUBMIT_CHANNEL)",
         ],
         "VFS_REF sender path and channel-generation guards",
     )
@@ -2469,18 +2500,35 @@ def test_remote_proxy_signals_never_make_the_local_frame_runnable() -> None:
     source = REMOTE_COMPUTE_CPP.read_text()
     scheduler = SCHEDULER_CPP.read_text()
 
-    forward_body = function_body(source, "wki_proxy_task_forward_signal")
-    require_tokens(
-        forward_body,
-        [
-            "signum <= 0",
-            "ker::mod::sched::task::Task::MAX_SIGNALS",
-            "return wki_task_cancel(PROXY_TID, signum)",
-        ],
-        "all valid proxy signals must be owned by the remote task",
-    )
-    if "signum != WKI_SIGINT_NUM" in forward_body:
-        fail("proxy signal forwarding must not fall back to local execution for non-INT/KILL/TERM signals")
+    forward_body = function_body(source, "wki_proxy_task_terminal_signal")
+    require_tokens(forward_body, ["ROUTE.signal_task_id != 0 ? ROUTE.signal_task_id : ROUTE.proxy_task_id",
+        "if (TASK_ID == 0) return std::nullopt", "submitted->local_task != &target", "return -ENOTSUP",
+        "WKI_TERMINAL_SIGNAL_RESOURCE_ID", "MsgType::TASK_TERMINAL_SIGNAL", "concrete_signal_origin(expected.origin)",
+        "concrete_signal_origin(expected.group_origin)", "wki_send_on_channel_generation"], "terminal event route ownership")
+    if "wki_task_cancel" in forward_body:
+        fail("terminal events must not use lifecycle cancellation")
+    for name in ["signal_terminal_process_group", "revoke_terminal_attachment"]:
+        body = function_body(scheduler, name)
+        require_tokens(body, ["signal_terminal_source_as"], "source terminal delivery participates in cutover admission")
+        assert "signal_generate_pending_mask" not in body
+    producer = function_body((ROOT / "modules/kern/src/syscalls_impl/process/process.cpp").read_text(), "terminal_source_signal")
+    require_tokens(producer, ["PendingSignalTarget admission", "admission.admit_local(target)",
+        "if (ADMISSION.remote)", "wki_proxy_task_terminal_signal", "value_or(-ESRCH)",
+        "if (!ADMISSION.local_lease)", "same_session(expected, ADMISSION.job)", "same_group(expected, ADMISSION.job)",
+        "expected.terminal_generation != ADMISSION.job.terminal_generation", "generate_group_signal"], "source terminal admission")
+    require_order(producer, "admission.admit_local(target)", "if (ADMISSION.remote)", "admit before routing")
+    require_order(producer, "if (ADMISSION.remote)", "generate_group_signal", "remote refusal cannot fall through")
+    assert "SharedVmemPublicationGuard" not in producer
+    receiver = function_body(source, "deliver_terminal_signal")
+    require_tokens(receiver, ["capture_compute_submit_session_locked", "find_running_task", "root_completion_queued",
+        "running->task->try_acquire()", "signal_terminal_as", "resolve_session_origin"], "exact accepted terminal target")
+    if "find_task_by_pid" in receiver:
+        fail("terminal events must not substitute a receiver PID lookup")
+    local = function_body((ROOT / "modules/kern/src/syscalls_impl/process/process.cpp").read_text(), "signal_terminal_as")
+    require_tokens(local, ["SharedVmemPublicationGuard", "admission.admit_local(target)",
+        "same_session(expected, ADMISSION.job)", "same_group(expected, ADMISSION.job)",
+        "generate_group_signal", "PendingSignalTarget retained(target)"], "receiver terminal membership and cutover admission")
+    require_order(local, "same_session(expected, ADMISSION.job)", "generate(target)", "membership before terminal effects")
 
     reschedule_body = function_body(scheduler, "reschedule_task_for_cpu_once")
     require_order(
@@ -2673,6 +2721,47 @@ def test_receiver_tracking_failure_unwinds_before_scheduler_publication() -> Non
     require_order(discard, "child->release()", "destroy_unpublished_remote_process(", "drop unpublished monitor ref before exclusive teardown")
 
 
+def test_receiver_rejection_releases_peer_lease_before_vfs_teardown() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    body = function_body(source, "handle_task_submit_work")
+    branches = [
+        ("if (!FINAL_SESSION_CURRENT || FINAL_CANCEL_SIGNAL != 0 || FINAL_DEADLINE_EXPIRED)",
+         "destroy_unpublished_remote_process("),
+        ("if (!publish_running_task_locked(rt))", "discard_unpublished_running_task("),
+    ]
+    for marker, teardown in branches:
+        start = body.index(marker)
+        branch = body[start:body.index("return;", start)]
+        require_order(branch, "s_compute_lock.unlock()", "publication_lease.release()", marker)
+        require_order(branch, "publication_lease.release()", teardown, marker)
+    post_failure = function_body(source, "discard_unposted_remote_process")
+    require_order(post_failure, "running.active = false", "s_compute_lock.unlock()",
+                  "retire private monitor under compute lock")
+    require_order(post_failure, "s_compute_lock.unlock()", "publication_lease.release()",
+                  "drop compute lock before peer lease")
+    require_order(post_failure, "publication_lease.release()", "delete completion",
+                  "drop peer lease before output receipt teardown")
+    require_order(post_failure, "completion_ref->release()", "destroy_unpublished_remote_process(",
+                  "release extra references before owner-linked teardown")
+    require_tokens(body, ["discard_unposted_remote_process(current_task, new_task, worker_task_ref, completion_task_ref"],
+                   "production refusal uses the qualified cleanup helper")
+    final_gate = function_body(source, "post_admitted_remote_process")
+    require_tokens(final_gate, ["lease.owns(session.node_id)", "compute_submit_admission_is_current_locked(session)",
+                               "take_cancelled_task_submit_locked(session, task_id)", "wki_now_us() >= deadline_us",
+                               "return CURRENT && CANCEL == 0 && !EXPIRED && post()"],
+                   "final admission guards actual scheduler posting")
+    require_order(final_gate, "s_compute_lock.unlock()", "&& post()", "scheduler posting outside compute lock")
+    require_tokens(body, ["post_admitted_remote_process(session, submit->task_id, deadline_us, publication_lease, handoff_ready"],
+                   "both ordinary spawn and exec use final admission")
+    # The normal path must retain the publication guard. Every earlier release
+    # belongs to a returning failure branch or the explicit READY/COMMIT wait.
+    before_post = body[:body.index("bool const POSTED =")]
+    assert before_post.count("publication_lease.release()") == 3
+    commit = before_post[before_post.index("ComputePublishStage::COMMIT"):]
+    require_order(commit, "ComputePublishStage::COMMIT", "publication_lease.acquire(src_node)",
+                  "reacquire peer gate after the remote cutover wait")
+
+
 def test_submit_wire_buffers_are_cancelled_with_executor() -> None:
     source = REMOTE_COMPUTE_CPP.read_text()
     begin = source.index("class TaskSubmitBuffer {")
@@ -2717,7 +2806,7 @@ def test_accepted_remote_spawn_commits_ipc_fd_ownership() -> None:
         body,
         [
             "std::array<WkiIpcTaskFdHandoff, 16> ipc_fd_handoff",
-            "wki_ipc_export_task_fds(task, best_node, ipc_fd_map.data(), &ipc_fd_count, ipc_fd_handoff.data(), &stdio_mask)",
+            "wki_ipc_export_task_fds(task, best_node, IPC_CHANNELS, ipc_fd_map.data(), &ipc_fd_count, ipc_fd_handoff.data(), &stdio_mask)",
             "ipc_guard.cancel()",
             "ipc_fd_count, ipc_fd_handoff.data()",
         ],
@@ -2747,7 +2836,7 @@ def test_accepted_remote_spawn_commits_ipc_fd_ownership() -> None:
             [
                 "remember_submitted_ipc_handoff(*published, ipc_fd_handoff, ipc_fd_count)",
                 "publish_submitted_task_locked(std::move(st), &publication_error)",
-                "wki_wait_for_op(&wait",
+                "wait_for_exec_submit(wait",
                 "take_submitted_ipc_handoff_locked(task_ptr)",
                 "wki_ipc_commit_task_fd_handoff(local_task, handoff_cleanup.handoff.data(), handoff_cleanup.count)",
                 "restore_submitted_ipc_preparation_locked(*task_ptr, ipc_fd_handoff, ipc_fd_count, ipc_guard)",
@@ -2757,7 +2846,7 @@ def test_accepted_remote_spawn_commits_ipc_fd_ownership() -> None:
         require_order(
             submit,
             "remember_submitted_ipc_handoff(*published, ipc_fd_handoff, ipc_fd_count)",
-            "wki_wait_for_op(&wait",
+            "wait_for_exec_submit(wait",
             f"{mode} identity pins must move to the submitted row before the interruptible wait",
         )
 
@@ -2805,7 +2894,270 @@ def test_service_report_transport_retains_only_reporting_state() -> None:
     require_tokens(sender, ["rt.service_report_inflight", "rt.service_report_sequence", "OBSERVATION.pending_remote_children == 0", "MsgType::TASK_SERVICE_REPORT", "RESULT == WKI_OK", "find_running_task(report.task_id, session)"], "bounded report retry with session revalidation")
     require_tokens(function_body(source, "wki_remote_compute_selftest_service_report_transport"), ["handle_task_accept", "handle_task_reject", "handle_task_service_report", "fail_submitted_tasks_for_peer", "release_running_root_locked"], "real handler and lifetime regression coverage")
 
+def test_complete_credentials_bind_format_to_admitted_session() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    capture = multiline_function_body(source, "capture_compute_submit_session_locked")
+    require_tokens(capture, ["return peer_session->current", ".identity = identity"], "immutable admitted capability selection")
+    for name in ["handle_task_submit", "handle_task_cancel"]:
+        body = function_body(source, name)
+        require_order(body, "capture_compute_peer_identity(hdr->src_node)", "s_compute_lock.lock()", "capabilities copied under RX lease before compute lock")
+    receiver = function_body(source, "handle_task_submit_work")
+    require_order(receiver, "session.identity.capabilities & WKI_CAP_COMPUTE_CREDENTIALS", "prepare_submitted_resources", "admitted format before parsing")
+    require_order(receiver, "prepare_submitted_identity", "load_elf_from_vfs_path", "complete identity mapped before source read")
+    if "wki_peer_capability_negotiated" in receiver:
+        fail("deferred receiver must not select credential format from a reusable peer slot")
+    sender = multiline_function_body(source, "copy_submit_identity_data")
+    require_tokens(sender, ["fill_task_identity_context(task, &identity, credentials, JOB, root)", "credential_record::encode(credentials)", "dest + WKI_TASK_RESOURCE_IDENTITY_SIZE"], "same snapshot and stable resource offset")
+    spawn = function_body(source, "wki_try_remote_spawn")
+    require_order(spawn, "WKI_CAP_COMPUTE_CREDENTIALS", "wki_ipc_export_task_fds", "legacy representability before exports")
+
+
+def test_capture_file_and_monitor_ownership_are_independent() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    append = multiline_function_body(source, "TaskOutputCapture::append")
+    require_order(append, "lock.lock_irqsave()", "if (!frozen)", "append/freeze serialization")
+    require_order(append, "std::min(bytes.size(), data.size() - len)", "std::memcpy", "bounded capture append")
+    require_order(append, "len =", "lock.unlock_irqrestore", "publish capture bytes and length together")
+    freeze = multiline_function_body(source, "TaskOutputCapture::freeze")
+    require_order(freeze, "lock.lock_irqsave()", "frozen = true", "freeze under capture lock")
+    require_order(freeze, "frozen = true", "lock.unlock_irqrestore", "seal snapshot before exposing its view")
+    install = multiline_function_body(source, "install_remote_stdio")
+    require_order(install, "task.fd_table.insert", "capture->retain()", "no File ownership before all inserts succeed")
+    require_order(install, "capture->retain()", "files[fd].release()", "File pins capture before publication")
+    close = function_body(source, "capture_close")
+    require_order(close, "file->private_data = nullptr", "release_output_capture(capture)", "detach before last capture release")
+    collector = function_body(source, "wki_remote_compute_check_completions")
+    require_order(collector, "if (!completed)", "rt.output->freeze()", "freeze only after root exit/accounting readiness")
+    require_order(collector, "rt.output->freeze()", "queue_pending_completion_locked", "immutable completion payload")
+    for forbidden in ("delete output;", "delete rt.output;", "delete info.output;", "delete completion.output;", "output->len", "output->data"):
+        if forbidden in source:
+            fail("capture ownership or mutable storage bypass: " + forbidden)
+
+
+def test_user_signal_owns_reply_and_target_lifetimes() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    sender = multiline_function_body(source, "wki_proxy_task_signal_as")
+    require_order(sender, "signal_version != WKI_TASK_SIGNAL_VERSION", "s_next_user_signal", "support before request publication")
+    require_tokens(sender, ["credential_record::encode(caller)", ".consumer_wait = &wait", "MsgType::TASK_SIGNAL_REQ", "wki_wait_for_op", "pending->result"], "bounded owned signal request")
+    if "wki_task_cancel(" in sender:
+        fail("user signal must not fall back to lifecycle cancel")
+    receiver = function_body(source, "authorize_user_signal")
+    require_order(receiver, "credential_record::decode", "auth_policy::map_compute_identity", "decode before mapped authorization")
+    require_tokens(receiver, ["find_running_task(request.task_id, SESSION)", "!running->root_completion_queued", "running->task->try_acquire()", "resolve_session_origin", "signal_as(*target, caller, job, request.signum)"], "exact receiver target and mapped caller")
+    if "find_task_by_pid" in receiver:
+        fail("user signal must not reuse a numeric target PID")
+    worker = function_body(source, "compute_rx_worker_loop")
+    signal_branch = worker[worker.index("else if (WORK_TYPE == MsgType::TASK_SIGNAL_REQ ||"):worker.index("else if (WORK_TYPE == MsgType::GROUP_RECEIVER_REQ ||")]
+    require_order(signal_branch, "work.type = static_cast<uint8_t>(MsgType::TASK_SIGNAL_RESP)", "wki_send_on_channel_generation(work.hdr.src_node", "persist signal decision before its send attempt")
+    require_tokens(worker, ["requeue_compute_rx_slot", "if (WORK_TYPE == MsgType::TASK_SIGNAL_REQ)"], "retry reply without repeating decision")
+    cleanup = function_body(source, "retire_user_signals_for_task")
+    require_order(cleanup, "slot.response_wait = nullptr", "wki_quiesce_claimed_op", "unpublish response before quiescing")
+    require_order(cleanup, "wki_quiesce_claimed_op", "*found = {}", "consumer slot lives until final claimant access")
+    cleanup = function_body(source, "wki_remote_compute_cleanup_for_task")
+    require_order(cleanup, "retire_user_signals_for_task", "cleanup_signal_targets", "retire operation before releasing target ownership")
+
+
+def test_group_signal_selects_receiver_members_and_owns_replies() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    sender = multiline_function_body(source, "group_route_rpc")
+    require_order(sender, "wki_resource_generation_snapshot", "s_next_user_signal", "support before group request publication")
+    require_tokens(sender, [".consumer_wait = &wait", ".route_operation = !RECEIVERS", ".receiver_operation = RECEIVERS", "MsgType::GROUP_RECEIVER_REQ", "MsgType::GROUP_ROUTE_REQ", "wki_wait_for_op", "expected_boot"], "owned route operation")
+    wrapper = multiline_function_body(source, "wki_group_signal_as")
+    require_tokens(wrapper, ["with_local_signal_targets", "group_signal_with_local_targets"], "fixed fatal-cleanup-owned local cohort")
+    driver = multiline_function_body(source, "group_signal_with_local_targets")
+    require_tokens(driver, ["g_wki.peers", "GroupRouteOperation::ENUMERATE", "GroupRouteOperation::QUERY", "candidates.resolve", "GroupRouteOperation::DELIVER", "request.ceiling = ceiling", "SELF_HOME.serial", "deferred_target", "credential_record::encode(caller)"], "one home incarnation per logical process with original caller")
+    require_tokens(driver, ["local_home(*target)", "targets.insert", "request.home = target.home"], "local and home routes enter one owned selection")
+    selection = source[source.index("class GroupRouteTargets"):source.index("auto group_signal_with_local_targets")]
+    require_tokens(selection, ["selected.home.serial == target.home.serial", "selected.home.origin.node == target.home.origin.node", "selected.home.origin.boot == target.home.origin.boot", "std::nothrow", "-ENOMEM"], "deduplicate full immutable home with checked storage")
+    require_tokens(wrapper, ["GroupRouteTargets targets", "INPUT.targets", "targets.clear()"], "route storage belongs to fatal callback cleanup")
+    require_order(driver, "int const ENUM_ERROR = collect()", "auto follow =", "complete collection before query or delivery")
+    if driver.count("collect()") != 1 or driver.count("for (auto const& target : targets.view())") != 2:
+        fail("group resolution and delivery must share a single collected route set")
+    require_order(driver, "for (auto* target : local_targets)", "for (size_t i = 0; i < count; ++i)", "local discovery before remote home enumeration")
+    if "g_submitted_tasks" in driver or "wki_proxy_task_forward_signal" in driver:
+        fail("group discovery must not depend on surviving per-task proxies")
+    mapper = multiline_function_body(source, "map_group_caller")
+    require_order(mapper, "credential_record::decode", "auth_policy::map_compute_identity", "route credentials decode before mapping")
+    require_tokens(mapper, ["capture_compute_submit_session_locked", "SESSION.epoch == 0"], "mapped caller retains exact receive session")
+    receiver = function_body(source, "authorize_group_route")
+    require_order(receiver, "map_group_caller", "execute_group_route", "map original caller before receiver admission")
+    discovery = function_body(source, "authorize_group_receivers")
+    require_order(discovery, "map_group_caller", "collect_group_receivers", "current discovery maps original caller")
+    require_order(driver, "GroupReceiverResponse page", "GroupRouteResponse page", "current remote receivers precede historical anchors")
+    require_tokens(driver, ["WKI_GROUP_RECEIVER_RESOURCE_ID", "CURRENT.home", "CURRENT.pid"], "negotiated full-home current receiver routes")
+    collector = function_body(source, "collect_group_receivers")
+    require_tokens(collector, ["enumerate_signal_receivers", "append_running_signal_receiver"], "registry and running-import views share pagination")
+    running = multiline_function_body(source, "append_running_signal_receiver")
+    require_tokens(running, ["!running.published && !running.group_signal_ready", "signal_admission_identity().remote", "TaskType::PROCESS", "running.task->is_thread", "append_signal_receiver"], "committed current canonical imports only")
+    receiver_response = function_body(source, "handle_group_receiver_response")
+    require_tokens(receiver_response, ["!slot.receiver_operation", "slot.channel != rx_channel", "slot.generation != rx_channel_generation", "slot.source_boot != response.boot", "entry.serial > previous", "entry.home.serial != 0", "claim_and_clear_waiter_locked"], "bounded typed current receiver response binding")
+    executor = function_body(source, "execute_group_route")
+    require_tokens(executor, ["signal_home_matches", "group_signal_ready", "GroupRouteResult::RETRY", "GroupRouteResult::REDIRECT", "signal_group_target_as"], "exact incarnation and effect-free routing")
+    if "group_route_rpc" in executor:
+        fail("receiver workers cannot wait for another receiver")
+    response = function_body(source, "handle_group_route_response")
+    require_tokens(response, ["!slot.route_operation", "slot.generation != rx_channel_generation", "slot.channel != rx_channel", "claim_and_clear_waiter_locked", "slot.source_boot"], "typed route response binding")
+    receiver = function_body(source, "authorize_group_signal")
+    require_order(receiver, "credential_record::decode", "auth_policy::map_compute_identity", "group credentials decode before mapping")
+    require_order(receiver, "auth_policy::map_compute_identity", "signal_group_local_as", "map group caller before effects")
+    require_tokens(receiver, ["capture_compute_submit_session_locked", "SESSION.epoch == 0", "resolve_session_origin", "query_group_local"], "exact group session and origin")
+    worker = function_body(source, "compute_rx_worker_loop")
+    require_order(worker, "work.type = static_cast<uint8_t>(MsgType::GROUP_SIGNAL_RESP)", "MsgType::GROUP_SIGNAL_RESP, work.payload.data()", "cache group result before reply enqueue")
+    response = function_body(source, "handle_group_signal_response")
+    require_tokens(response, ["!slot.group_operation", "slot.group_query", "slot.group_own_allowed", "slot.generation != rx_channel_generation", "slot.channel != rx_channel", "claim_and_clear_waiter_locked", "slot.source_boot"], "typed group response binding")
+
+
+def test_exec_signal_context_is_validated_and_installed_before_publication() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    capture = function_body(source, "snapshot_exec_signals")
+    require_tokens(capture, ["signal_handlers_snapshot", "signal_mask_bits", "signal_delivery_pending_bits", "WKI_EXEC_UNBLOCKABLE_SIGNALS"], "exec signal value capture")
+    if "signal_take_pending_mask" in capture or "signal_pending_store" in capture:
+        fail("exec preparation must not consume old-image pending signals before acceptance")
+    encode = multiline_function_body(source, "copy_submit_identity_data")
+    require_order(encode, "&ORIGINS, sizeof(ORIGINS)", "snapshot_exec_signals", "signal suffix follows existing origins")
+    decode = multiline_function_body(source, "prepare_submitted_resources")
+    require_tokens(decode, ["WKI_EXEC_SIGNALS_VERSION", "valid_exec_signals(signals)", "*exec_signals = signals"], "bounded signal context validation")
+    require_order(decode, "valid_exec_signals(signals)", "*exec_signals = signals", "validate before publishing decoded signal state")
+    receiver = multiline_function_body(source, "handle_task_submit_work")
+    require_order(receiver, "prepare_submitted_resources", "install_exec_signals", "validate before installing signal values")
+    require_order(receiver, "apply_submitted_task_identity", "install_exec_signals", "map credentials before signal installation")
+    require_order(receiver, "install_exec_signals", "post_task_balanced", "install signal values before receiver can run")
+    install = function_body(source, "install_exec_signals")
+    require_tokens(install, ["handlers{}", "initialize_signal_handlers", "signal_mask_store(state.blocked)", "signal_pending_store(state.pending)"], "unpublished signal initialization")
+    if "wake_task" in install or "signal_generate_pending_mask" in install:
+        fail("imported pending bits must not replay signal generation or wake unpublished tasks")
+
+
+def test_accepted_signal_route_is_independent_of_scheduler_readiness() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    accept = multiline_function_body(source, "handle_task_accept")
+    require_order(accept, "claim_and_clear_waiter_locked", "publish_accepted_signal_route", "only claimed acceptance owns signal routing")
+    require_order(accept, "publish_accepted_signal_route", "wki_finish_claimed_op", "publish routing before executor cleanup resumes")
+    require_tokens(accept, ["task->target_node != hdr->src_node", "task->submit_channel != rx_channel", "task->submit_channel_generation != rx_channel_generation"], "exact accepted route session")
+    complete = multiline_function_body(source, "handle_task_complete")
+    require_order(complete, "if (response_waiter != nullptr)", "publish_accepted_signal_route", "implicit acceptance also owns routing")
+    sender = multiline_function_body(source, "wki_proxy_task_signal_as")
+    require_tokens(sender, ["ROUTE.signal_task_id != 0 ? ROUTE.signal_task_id : ROUTE.proxy_task_id", "submitted->local_task != &target", "submitted->signal_version != WKI_TASK_SIGNAL_VERSION"], "accepted receiver signal lookup")
+    task = TASK_CPP.read_text()
+    publish = multiline_function_body(task, "Task::publish_accepted_signal_route")
+    require_tokens(publish, ["path_metadata_lock.lock_irqsave", "m_accepted_signal_task_id", "wki_remote_pid = remote_pid"], "atomic accepted route identity")
+    if "wki_proxy_task_id =" in publish or "wki_proxy_task =" in publish or "wki_proxy_task_blocked" in publish:
+        fail("signal routing must not advance scheduler proxy readiness")
+    admission = multiline_function_body(task, "Task::signal_admission_identity")
+    require_order(admission, "path_metadata_lock.lock_irqsave", "credentials()", "route and credentials share capture")
+    require_order(admission, "job_identity()", "path_metadata_lock.unlock_irqrestore", "route and group share capture")
+    clear = multiline_function_body(task, "Task::set_wki_proxy_task_id")
+    if "m_accepted_signal_task_id" in clear:
+        fail("clearing scheduler proxy state must not revive old local signal authority")
+
+
+def test_filesystem_preparation_remains_discoverable_during_reentrant_close():
+    source = REMOTE_COMPUTE_CPP.read_text()
+    owner = source.split("class TaskFilesystemPreparation {", 1)[1].split("// Storage", 1)[0]
+    cancel = function_body(owner, "cancel")
+    require_order(cancel, "std::exchange(staging_.at(index), nullptr)", "vfs_put_file(file)", "one consumed staging File")
+    require_order(cancel, "vfs_put_file(file)", "executor_->pending_wki_filesystems = next_", "remaining staging stays discoverable")
+    require_tokens(owner, ["std::array<ker::vfs::File*, 2>", "grant.submission_id != transaction_", "target_boot_",
+                           "std::unique_ptr<char[]> heap_cwd_", "Task::FilesystemContext filesystem_"], "bounded complete preparation")
+    require_tokens(REMOTE_COMPUTE_KTEST.read_text(), ["PreparationOwnsTextTransactionAndReentrantCleanup",
+                    "ker::net::wki::wki_remote_compute_selftest_filesystem_preparation()"], "production preparation fixture must run")
+
+
+def test_filesystem_wire_fragment_and_full_validation_agree():
+    source = REMOTE_COMPUTE_CPP.read_text()
+    queue = function_body(source, "queue_admitted_task_submit")
+    require_order(queue, "valid_submit_filesystem_identity(*submit)", "new (std::nothrow) uint8_t[payload_len]", "full prefix before allocation")
+    require_tokens(source, ["submit.task_id != fragment.task_id || !valid_submit_filesystem_identity(submit)",
+                           "if (resource_reject == TaskRejectReason::ACCEPTED && HAS_FILESYSTEM) *filesystem_output = filesystem_candidate"],
+                   "fragment header agreement and staged filesystem decode")
+    require_tokens(REMOTE_COMPUTE_KTEST.read_text(), ["WireBindsTransactionGrantsAndCompleteIdentity",
+                    "ker::net::wki::wki_remote_compute_selftest_filesystem_wire()"], "filesystem wire fixture must run")
+
+
+def test_exec_transition_preserves_original_fetch_authority():
+    source = REMOTE_COMPUTE_CPP.read_text()
+    receiver = function_body(source, "handle_task_submit_work")
+    order = ["decode_submit_credential_transition(*submit", "prepare_submitted_resources(submit", "prepare_submitted_identity(submitted_identity",
+             "prepare_submitted_exec_credentials(submitted_credentials", "ScopedSubmitVfsIdentity submit_vfs_identity",
+             "load_elf_from_vfs_path(*current_task", "apply_submitted_task_identity(new_task",
+             "publish_exec_credentials(*new_task", "RunningRemoteTask rt"]
+    positions = [receiver.index(token) for token in order]
+    assert positions == sorted(positions), "exec mapping and original read authority must precede replacement publication"
+    for name in ["wki_task_submit_inline", "wki_task_submit_vfs_ref"]:
+        body = multiline_function_body(source, name)
+        assert "transfer->exec_credentials == nullptr" in body
+        assert "WKI_EXEC_HANDOFF_RESOURCE_ID" in body
+        assert "filesystem_preparation.credentials()" in body
+        assert "cursor + IPC_DATA_LEN, transfer->exec_credentials" in body
+        require_order(body, "select_submit_read_credentials", "TaskFilesystemPreparation filesystem_preparation",
+                      "validate original/final spawn identity before filesystem preparation")
+        assert "st.exec_handoff = transfer != nullptr && transfer->cutover != nullptr" in body
+        assert "WKI_TASK_SUBMIT_SPAWN_TRANSITION" in body
+    wait = function_body(source, "wait_for_exec_submit")
+    require_order(wait, "transfer->cutover == nullptr", "TaskExecCommit commit",
+                  "ordinary spawn cannot enter old-process cutover")
+    select = function_body(source, "select_submit_read_credentials")
+    assert "transfer->image_credentials == nullptr" in select
+    assert "prepare_spawn_read_credentials(*transfer->image_credentials" in select
+    check = function_body(source, "prepare_spawn_read_credentials")
+    require_order(check, "prepared != final", "output = original", "failed validation leaves read identity untouched")
+    rollback = wait[wait.index("if (cutover_error != 0)"):wait.index("unsigned attempts")]
+    assert rollback.index("finish_or_wait_for_cancelled_waiter") < rollback.index("row->response_consumer_wait_entry = nullptr")
+    assert "row->exec_cutover = false" in rollback and "return WKI_ERR_BUSY" in rollback
+    assert "selftest_exec_credential_transition()" in function_body(source, "wki_remote_compute_selftest_full_credential_context")
+    native = function_body(source, "wki_remote_compute_selftest_exec_cutover_retirement")
+    require_tokens(native, ["wait_for_exec_submit(initial", "fail_submitted_tasks_for_peer", "publish_exec_credentials",
+                            "response_consumer_wait_entry", "source.ref_count.load() == 1"],
+                   "native cutover retirement fixture exercises actual waits, cleanup and credential publication")
+    require_tokens(REMOTE_COMPUTE_KTEST.read_text(), ["ExecCutoverRetirementPreservesCredentialAndWaitOwnership",
+                   "wki_remote_compute_selftest_exec_cutover_retirement()"], "native cutover fixture is registered")
+
+
+def test_secure_exec_capability_binds_the_actual_submission_generation():
+    source = REMOTE_COMPUTE_CPP.read_text()
+    capture = function_body(source, "capture_exec_submit_channel")
+    order = ["PeerLifecycleLease", "lifecycle.acquire(node)", "WKI_EXEC_HANDOFF_RESOURCE_ID", "capture_submitter_channel(node)", "output = CHANNEL"]
+    positions = [capture.index(token) for token in order]
+    assert positions == sorted(positions)
+    for name in ["wki_task_submit_inline", "wki_task_submit_vfs_ref"]:
+        body = multiline_function_body(source, name)
+        order = ["capture_exec_submit_channel(target_node, SUBMIT_CHANNEL)", "filesystem_admission.channel.generation != SUBMIT_CHANNEL.generation",
+                 "wki_ipc_exports_match_submit", "allocate_submitted_task_id_locked", "send_task_submit_payload"]
+        positions = [body.index(token) for token in order]
+        assert positions == sorted(positions)
+        assert "return fail_submit(EXEC_CHANNEL_ADMISSION)" in body
+
+
+def test_exec_candidate_stays_private_until_cutover() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    spawn = function_body(source, "wki_try_remote_spawn")
+    for field, fallback in [("path", "exe_path.data()"), ("bytes.data()", "elf_buffer"),
+                            ("bytes.size()", "elf_buffer_size"), ("complete", "elf_buffer_complete"),
+                            ("target", "wki_target_hostname.data()"), ("target_flags", "wki_target_flags")]:
+        assert f"CANDIDATE->{field} : task->{fallback}" in spawn
+    assert "if (CANDIDATE == nullptr) task->wki_skip_legacy_placement = true" in spawn
+    cleanup = spawn[spawn.index("if (CANDIDATE == nullptr) {"):]
+    cleanup = cleanup[:cleanup.index("if (task->exec_image_file")]
+    assert "delete[] task->elf_buffer" in cleanup and "release_cached_elf_buffer(task->elf_buffer)" in cleanup
+    assert "wki_task_submit_inline(best_node, BINARY, static_cast<uint32_t>(BINARY_SIZE)" in spawn
+    assert "const char* local_path = EXE_PATH" in spawn
+    reject = function_body(source, "handle_task_reject")
+    assert "if (task->local_task != nullptr && !task->exec_handoff)" in reject
+    native = function_body(source, "wki_remote_compute_selftest_exec_handoff_ownership")
+    assert "detail::handle_task_reject" in native and "remote_pid == (exec ? 7 : 0)" in native
+
+
 def main() -> None:
+    test_exec_candidate_stays_private_until_cutover()
+    test_secure_exec_capability_binds_the_actual_submission_generation()
+    test_exec_transition_preserves_original_fetch_authority()
+    test_filesystem_wire_fragment_and_full_validation_agree()
+    test_filesystem_preparation_remains_discoverable_during_reentrant_close()
+    test_accepted_signal_route_is_independent_of_scheduler_readiness()
+    test_exec_signal_context_is_validated_and_installed_before_publication()
+    test_group_signal_selects_receiver_members_and_owns_replies()
+    test_capture_file_and_monitor_ownership_are_independent()
+    test_complete_credentials_bind_format_to_admitted_session()
     test_peer_cleanup_marks_all_targeted_submits_terminal_failure()
     test_proxy_wait_completion_respects_waitpid_publish_fence()
     test_task_wait_consumes_completed_submitted_row()
@@ -2842,7 +3194,9 @@ def main() -> None:
     test_publication_reports_checked_allocation_failure()
     test_submit_wire_buffers_are_cancelled_with_executor()
     test_receiver_tracking_failure_unwinds_before_scheduler_publication()
+    test_receiver_rejection_releases_peer_lease_before_vfs_teardown()
     test_service_report_transport_retains_only_reporting_state()
+    test_user_signal_owns_reply_and_target_lifetimes()
     print("WKI remote compute source invariants hold")
 
 

@@ -11,6 +11,7 @@
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
 #include <vfs/fs/tmpfs.hpp>
+#include <vfs/lookup.hpp>
 #include <vfs/mount.hpp>
 #include <vfs/stat.hpp>
 #include <vfs/vfs.hpp>
@@ -235,7 +236,74 @@ auto symlink_rename_replacement_publishes_whole_binding() -> bool {
     return ok && (NEXT_CLEANUP == 0 || NEXT_CLEANUP == -ENOENT) && LIVE_CLEANUP == 0 && TARGET_B_CLEANUP == 0 && TARGET_A_CLEANUP == 0;
 }
 
+// A retained lookup must survive data-only opens on an unrelated file, but
+// must be rejected after a real name publication. Exercise both public open
+// entrypoints so fd and kernel File users share the same namespace contract.
+auto existing_open_preserves_unrelated_lookup(bool use_fd) -> bool {
+    using namespace ker::vfs;
+    constexpr const char* OBSERVED = "/tmp/ktest_open_epoch_observed";
+    constexpr const char* WRITTEN = "/tmp/ktest_open_epoch_written";
+    constexpr const char* CREATED = "/tmp/ktest_open_epoch_created";
+    vfs_mkdir("/tmp", 0755);
+    vfs_unlink(OBSERVED);
+    vfs_unlink(WRITTEN);
+    vfs_unlink(CREATED);
+    bool ok = create_empty_vfs_file(OBSERVED) && create_empty_vfs_file(WRITTEN);
+    ker::mod::sched::task::Task task{};
+    std::memcpy(task.root.data(), "/", 2);
+    std::memcpy(task.cwd.data(), "/", 2);
+    auto consume = [](const LookupHandle&, void* opaque) -> int {
+        ++*static_cast<unsigned*>(opaque);
+        return 0;
+    };
+    auto acquire = [&](LookupHandle& lookup) -> int {
+        return vfs_acquire_lookup(&task, AT_FDCWD, OBSERVED, LookupIntent::STAT, LookupFollowPolicy::FOLLOW_FINAL, false, false, &lookup);
+    };
+    auto open_and_close = [&](const char* path, int flags, bool expect_created) -> bool {
+        int const FD = use_fd ? vfs_openat(&task, AT_FDCWD, path, flags, 0600) : -1;
+        File* file = use_fd ? (FD >= 0 ? vfs_get_file(&task, FD) : nullptr) : vfs_open_file(path, flags, 0600);
+        if (file == nullptr) return false;
+        LookupHandle current{};
+        bool const VALID = file->created_by_open == expect_created && acquire(current) == 0 &&
+                           file->vfs_path_namespace_generation == current.namespace_generation();
+        bool const CLOSED = use_fd ? close_task_vfs_fd(task, FD) : vfs_close_file(file) == 0;
+        return VALID && CLOSED;
+    };
+    for (int const FLAGS : {O_CREAT | 2, O_TRUNC | 2, O_CREAT | O_TRUNC | 2}) {
+        LookupHandle retained{};
+        unsigned calls = 0;
+        if (!ok || acquire(retained) != 0) {
+            ok = false;
+            break;
+        }
+        bool const OPENED = open_and_close(WRITTEN, FLAGS, false);
+        int const CONSUMED = vfs_consume_lookup(retained, false, consume, &calls);
+        ok = OPENED && CONSUMED == 0 && calls == 1;
+    }
+    {
+        LookupHandle retained{};
+        unsigned calls = 0;
+        if (ok && acquire(retained) == 0) {
+            bool const OPENED = open_and_close(CREATED, O_CREAT | O_EXCL | 2, true);
+            int const CONSUMED = vfs_consume_lookup(retained, false, consume, &calls);
+            ok = OPENED && CONSUMED == -EAGAIN && calls == 0;
+        } else {
+            ok = false;
+        }
+    }
+    int const CREATED_CLEANUP = vfs_unlink(CREATED);
+    int const WRITTEN_CLEANUP = vfs_unlink(WRITTEN);
+    int const OBSERVED_CLEANUP = vfs_unlink(OBSERVED);
+    return ok && CREATED_CLEANUP == 0 && WRITTEN_CLEANUP == 0 && OBSERVED_CLEANUP == 0;
+}
+
 }  // namespace
+
+KTEST(VFS, SerializedLocalLookup) { KEXPECT_TRUE(ker::vfs::vfs_selftest_serialized_local_lookup()); }
+
+KTEST(VFS, ExistingFileOpenPreservesLookup) { KEXPECT_TRUE(existing_open_preserves_unrelated_lookup(false)); }
+
+KTEST(VFS, ExistingFdOpenPreservesLookup) { KEXPECT_TRUE(existing_open_preserves_unrelated_lookup(true)); }
 
 KTEST(VFS, OpenFdInstallFailureClosesFile) { KEXPECT_TRUE(ker::vfs::vfs_selftest_fd_install_failure_closes_file()); }
 
@@ -251,7 +319,7 @@ KTEST(VFS, FstatSnapshotFastPathHits) { KEXPECT_TRUE(ker::vfs::vfs_selftest_fsta
 
 KTEST(VFS, FstatCloseCombinesFdRemoval) { KEXPECT_TRUE(ker::vfs::vfs_selftest_fstat_close_combines_fd_removal()); }
 
-KTEST(VFS, RemoteFstatSnapshotCacheable) { KEXPECT_TRUE(ker::vfs::vfs_selftest_remote_fstat_snapshot_cacheable()); }
+KTEST(VFS, RemoteFstatRejectsPathSnapshot) { KEXPECT_TRUE(ker::vfs::vfs_selftest_remote_fstat_rejects_path_snapshot()); }
 
 KTEST(VFS, FstatSeedsPathMetadataCache) { KEXPECT_TRUE(ker::vfs::vfs_selftest_fstat_seeds_path_metadata_cache()); }
 
@@ -292,6 +360,30 @@ KTEST(VFS, OpenatDirfdInstallsOpenFile) { KEXPECT_TRUE(ker::vfs::vfs_selftest_op
 KTEST(VFS, OpenatAtFdcwdUsesSuppliedTask) { KEXPECT_TRUE(ker::vfs::vfs_selftest_openat_at_fdcwd_uses_supplied_task()); }
 
 KTEST(VFS, FchdirChangesSuppliedTaskCwd) { KEXPECT_TRUE(ker::vfs::vfs_selftest_fchdir_changes_supplied_task_cwd()); }
+
+KTEST(VFS, TmpfsLookupRejectsSameTextCwdReplacement) { KEXPECT_TRUE(ker::vfs::vfs_selftest_lookup_cwd_identity(false)); }
+
+KTEST(VFS, XfsLookupRejectsSameTextCwdReplacement) { KEXPECT_TRUE(ker::vfs::vfs_selftest_lookup_cwd_identity(true)); }
+
+KTEST(VFS, TmpfsLookupRejectsSameTextRootReplacement) { KEXPECT_TRUE(ker::vfs::vfs_selftest_lookup_cwd_identity(false, true)); }
+
+KTEST(VFS, XfsLookupRejectsSameTextRootReplacement) { KEXPECT_TRUE(ker::vfs::vfs_selftest_lookup_cwd_identity(true, true)); }
+
+KTEST(VFS, TmpfsAbsoluteLookupRetainsRenamedRoot) { KEXPECT_TRUE(ker::vfs::vfs_selftest_owned_root_absolute_walk(false)); }
+
+KTEST(VFS, XfsAbsoluteLookupRetainsRenamedRoot) { KEXPECT_TRUE(ker::vfs::vfs_selftest_owned_root_absolute_walk(true)); }
+
+KTEST(VFS, TmpfsRelativeLookupIntersectsOwnedRootAndDirectoryViews) {
+    KEXPECT_TRUE(ker::vfs::vfs_selftest_owned_root_absolute_walk(false, true));
+}
+
+KTEST(VFS, XfsRelativeLookupIntersectsOwnedRootAndDirectoryViews) {
+    KEXPECT_TRUE(ker::vfs::vfs_selftest_owned_root_absolute_walk(true, true));
+}
+
+KTEST(VFS, FilesystemContextRetainsCanonicalOwnerAndClosesOutsideLocks) {
+    KEXPECT_TRUE(ker::vfs::vfs_selftest_filesystem_context_snapshot());
+}
 
 KTEST(VFS, UnlinkatRenameatDirfdMutations) { KEXPECT_TRUE(ker::vfs::vfs_selftest_unlinkat_renameat_dirfd_mutations()); }
 
@@ -639,10 +731,9 @@ KTEST(VFS, OpenFileFstatSnapshotHitsAndInvalidates) {
 }
 
 KTEST(VFS, DevfsFstatSnapshotHits) {
-    constexpr const char PATH[] = "/dev/ktest-devfs";
-    ker::vfs::File file{};
-    file.fs_type = ker::vfs::FSType::DEVFS;
-    file.vfs_path = PATH;
+    auto* file = ker::vfs::vfs_open_file("/dev/null", 0, 0);
+    KREQUIRE_TRUE(file != nullptr);
+    ker::vfs::vfs_cache_notify_invalidate_path("/dev/null");
 
     ker::vfs::VfsCachePerfSnapshot before{};
     ker::vfs::VfsCachePerfSnapshot after_first{};
@@ -650,16 +741,24 @@ KTEST(VFS, DevfsFstatSnapshotHits) {
     ker::vfs::Stat st{};
     ker::vfs::vfs_get_cache_perf_snapshot(before);
 
-    KEXPECT_EQ(ker::vfs::vfs_fstat_file(&file, &st), 0);
+    KEXPECT_EQ(ker::vfs::vfs_fstat_file(file, &st), 0);
     KEXPECT_EQ(st.st_mode & static_cast<mode_t>(ker::vfs::S_IFMT), static_cast<mode_t>(ker::vfs::S_IFCHR));
     ker::vfs::vfs_get_cache_perf_snapshot(after_first);
 
-    KEXPECT_EQ(ker::vfs::vfs_fstat_file(&file, &st), 0);
+    KEXPECT_EQ(ker::vfs::vfs_fstat_file(file, &st), 0);
     ker::vfs::vfs_get_cache_perf_snapshot(after_second);
 
     KEXPECT_TRUE(after_first.fstat_snapshot_stores > before.fstat_snapshot_stores);
     KEXPECT_EQ(after_second.fstat_snapshot_miss_uncacheable, before.fstat_snapshot_miss_uncacheable);
     KEXPECT_TRUE(after_second.fstat_snapshot_hits > after_first.fstat_snapshot_hits);
+    ker::vfs::vfs_put_file(file);
+}
+
+KTEST(VFS, DevfsFstatRejectsMissingBackingNode) {
+    ker::vfs::File file{};
+    file.fs_type = ker::vfs::FSType::DEVFS;
+    ker::vfs::Stat stat{};
+    KEXPECT_EQ(ker::vfs::vfs_fstat_file(&file, &stat), -EBADF);
 }
 
 KTEST(VFS, PreadBypassesStreamCacheAndPreservesOffset) {
@@ -962,6 +1061,12 @@ KTEST(VFS, LstatTrailingSlashFollowsTmpfsSymlinkToDirectory) {
     KEXPECT_EQ(ker::vfs::vfs_unlink(LINK), 0);
     KEXPECT_EQ(ker::vfs::vfs_rmdir(TARGET), 0);
 }
+
+KTEST(VFS, RealpathUsesAdmittedCredentialsAndPreservesDeniedOutput) { KEXPECT_TRUE(ker::vfs::vfs_selftest_realpath_native_credentials()); }
+
+KTEST(VFS, RealpathProcfsRetainsRequestAndPreservesDeniedOutput) { KEXPECT_TRUE(ker::vfs::vfs_selftest_realpath_procfs_credentials()); }
+
+KTEST(VFS, RealpathOwnerUsesAdmittedSnapshotAndConfinesOutput) { KEXPECT_TRUE(ker::vfs::vfs_selftest_realpath_owner_credentials()); }
 
 KTEST(VFS, RealpathFastPathFollowsSimpleSymlink) {
     ker::vfs::vfs_mkdir("/tmp", 0755);
@@ -1277,3 +1382,117 @@ KTEST(VFS, WriteReadAligned4K) {
     static_cast<void>(ker::vfs::vfs_close_file(f));
     ker::vfs::vfs_unlink("/tmp/ktest_aligned4k");
 }
+
+KTEST(VFS, MkdirOwnerUsesMappedSnapshotAndInheritsParentGroup) { KEXPECT_TRUE(ker::vfs::vfs_selftest_mkdir_owner_credentials()); }
+
+KTEST(VFS, SymlinkOwnerUsesMappedSnapshotAndLiteralTarget) { KEXPECT_TRUE(ker::vfs::vfs_selftest_symlink_owner_credentials()); }
+
+KTEST(VFS, UtimensOwnerUsesMappedSnapshotAndPreservesTimeIntent) { KEXPECT_TRUE(ker::vfs::vfs_selftest_utimens_owner_credentials()); }
+
+KTEST(VFS, ChmodOwnerUsesMappedSnapshotAndPreservesDeniedMetadata) { KEXPECT_TRUE(ker::vfs::vfs_selftest_chmod_owner_credentials()); }
+
+KTEST(VFS, RemoveOwnerUsesMappedSnapshotAndStickyPolicy) { KEXPECT_TRUE(ker::vfs::vfs_selftest_remove_owner_credentials()); }
+
+KTEST(VFS, RenameOwnerUsesOneSnapshotForBothParents) { KEXPECT_TRUE(ker::vfs::vfs_selftest_rename_owner_credentials()); }
+KTEST(VFS, RenamePairKeepsAdmittedCredentialsAcrossPublication) {
+    KEXPECT_TRUE(ker::vfs::vfs_selftest_pair_preserves_admitted_credentials());
+}
+
+KTEST(VFS, TruncateRequiresWritableDescriptionBeforeCallback) {
+    struct Probe {
+        unsigned calls{};
+        off_t length{};
+        int result{};
+    } probe;
+    ker::vfs::FileOperations operations{};
+    operations.vfs_truncate = [](ker::vfs::File* file, off_t length) -> int {
+        auto& state = *static_cast<Probe*>(file->private_data);
+        ++state.calls;
+        state.length = length;
+        return state.result;
+    };
+    ker::vfs::File file{};
+    file.fs_type = ker::vfs::FSType::DEVFS;
+    file.fops = &operations;
+    file.private_data = &probe;
+    file.pos = 17;
+    KEXPECT_EQ(ker::vfs::vfs_ftruncate_file(nullptr, 0), -EBADF);
+    for (int flags : {0, 3, ker::vfs::O_TRUNC}) {
+        file.open_flags = flags;
+        KEXPECT_EQ(ker::vfs::vfs_ftruncate_file(&file, 0), -EBADF);
+        KEXPECT_EQ(probe.calls, 0U);
+    }
+    file.open_flags = 2;
+    KEXPECT_EQ(ker::vfs::vfs_ftruncate_file(&file, -1), -EINVAL);
+    file.is_directory = true;
+    KEXPECT_EQ(ker::vfs::vfs_ftruncate_file(&file, 0), -EISDIR);
+    file.is_directory = false;
+    ker::vfs::MountPoint mount{};
+    mount.read_only = true;
+    file.mount_owner = &mount;
+    KEXPECT_EQ(ker::vfs::vfs_ftruncate_file(&file, 0), -EROFS);
+    file.mount_owner = nullptr;
+    file.fops = nullptr;
+    KEXPECT_EQ(ker::vfs::vfs_ftruncate_file(&file, 0), -ENOSYS);
+    file.fops = &operations;
+    KEXPECT_EQ(probe.calls, 0U);
+    probe.result = -ETXTBSY;
+    KEXPECT_EQ(ker::vfs::vfs_ftruncate_file(&file, 9), -ETXTBSY);
+    KEXPECT_EQ(probe.calls, 1U);
+    KEXPECT_EQ(probe.length, 9);
+    probe.result = 0;
+    for (int flags : {1, 2}) {
+        file.open_flags = flags;
+        KEXPECT_EQ(ker::vfs::vfs_ftruncate_file(&file, 3), 0);
+        KEXPECT_EQ(file.pos, 17U);
+    }
+    KEXPECT_EQ(probe.calls, 3U);
+}
+
+KTEST(VFS, MetadataRetryKeepsCallerAcrossCredentialPublication) {
+    KEXPECT_TRUE(ker::vfs::vfs_selftest_metadata_retry_preserves_credentials());
+}
+
+KTEST(VFS, TmpfsGetcwdUsesOwnedProcessRoot) { KEXPECT_TRUE(ker::vfs::vfs_selftest_owned_root_absolute_walk(false, false, true)); }
+
+KTEST(VFS, XfsGetcwdUsesOwnedProcessRoot) { KEXPECT_TRUE(ker::vfs::vfs_selftest_owned_root_absolute_walk(true, false, true)); }
+
+KTEST(VFS, TmpfsRealpathAndChdirUseOwnedRoot) { KEXPECT_TRUE(ker::vfs::vfs_selftest_owned_root_absolute_walk(false, false, false, true)); }
+
+KTEST(VFS, XfsRealpathAndChdirUseOwnedRoot) { KEXPECT_TRUE(ker::vfs::vfs_selftest_owned_root_absolute_walk(true, false, false, true)); }
+
+KTEST(VFS, TmpfsProcfsRootAndFdViewsRespectOwnedRoot) {
+    KEXPECT_TRUE(ker::vfs::vfs_selftest_owned_root_absolute_walk(false, false, false, false, true));
+}
+
+KTEST(VFS, XfsProcfsRootAndFdViewsRespectOwnedRoot) {
+    KEXPECT_TRUE(ker::vfs::vfs_selftest_owned_root_absolute_walk(true, false, false, false, true));
+}
+
+KTEST(VFS, TmpfsProcfsPlainDirectoryUsesRetainedInode) {
+    KEXPECT_TRUE(ker::vfs::vfs_selftest_owned_root_absolute_walk(false, false, false, false, false, true));
+}
+
+KTEST(VFS, XfsProcfsPlainDirectoryUsesRetainedInode) {
+    KEXPECT_TRUE(ker::vfs::vfs_selftest_owned_root_absolute_walk(true, false, false, false, false, true));
+}
+
+KTEST(VFS, TmpfsProcfsDirectoryTextUsesRetainedInode) {
+    KEXPECT_TRUE(ker::vfs::vfs_selftest_owned_root_absolute_walk(false, false, false, false, false, true, true));
+}
+
+KTEST(VFS, XfsProcfsDirectoryTextUsesRetainedInode) {
+    KEXPECT_TRUE(ker::vfs::vfs_selftest_owned_root_absolute_walk(true, false, false, false, false, true, true));
+}
+
+KTEST(VFS, TmpfsProcfsMountsUseCurrentRootAndReader) {
+    KEXPECT_TRUE(ker::vfs::vfs_selftest_owned_root_absolute_walk(false, false, false, false, false, false, false, true));
+}
+
+KTEST(VFS, XfsProcfsMountsUseCurrentRootAndReader) {
+    KEXPECT_TRUE(ker::vfs::vfs_selftest_owned_root_absolute_walk(true, false, false, false, false, false, false, true));
+}
+
+KTEST(VFS, TmpfsPivotCoverPinsNativeParentAndPreservesBusy) { KEXPECT_TRUE(ker::vfs::mount_selftest_pivot_covers(false)); }
+
+KTEST(VFS, XfsPivotCoverPinsNativeParentAndPreservesBusy) { KEXPECT_TRUE(ker::vfs::mount_selftest_pivot_covers(true)); }

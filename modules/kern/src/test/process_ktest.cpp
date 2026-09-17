@@ -19,6 +19,22 @@ KTEST(ProcessGroupExit, NewlyPublishedSiblingInheritsPendingRequest) {
     KEXPECT_TRUE(ker::syscall::process::process_selftest_pending_exit_request_inheritance());
 }
 
+KTEST(ProcessGroupExit, SignalDispatchPreservesRetirementPublishedAfterFirstCheck) {
+    KEXPECT_TRUE(ker::syscall::process::process_selftest_signal_exit_preserves_late_retirement());
+}
+
+KTEST(ExecPreparedImage, OutlivesStagingAndDiscardsReferencesOnce) {
+    KEXPECT_TRUE(ker::syscall::process::exec_selftest_owned_image_outlives_staging_and_discards_once());
+}
+
+KTEST(ExecPreparedImage, TaskCleanupIsReentrantAndExclusive) {
+    KEXPECT_TRUE(ker::syscall::process::exec_selftest_tracked_image_cleanup_is_reentrant_and_exclusive());
+}
+
+KTEST(ExecPreparedImage, RecoversWorkerAdmissionAndRetiredStorage) {
+    KEXPECT_TRUE(ker::syscall::process::exec_selftest_transaction_recovers_admission_and_retired_storage());
+}
+
 KTEST(ExecFdClone, SkipsCloexecAndRollsBackFailure) {
     KEXPECT_TRUE(ker::syscall::process::exec_selftest_fd_clone_skips_cloexec_and_rolls_back_failure());
 }
@@ -37,4 +53,40 @@ KTEST(ExecSpawnFdActions, Dup2ConsumesCloexecSourceBeforeFinalClose) {
 
 KTEST(ExecWkiTarget, OneShotConsumesOnlyOnSuccessfulPlacement) {
     KEXPECT_TRUE(ker::syscall::process::exec_selftest_one_shot_wki_target_consumes_only_on_success());
+}
+
+KTEST(ExecRequestArguments, RecoversPartialAndRecursiveStorage) {
+    KEXPECT_TRUE(ker::syscall::process::exec_selftest_request_arguments_recover_partial_and_recursive_storage());
+}
+
+KTEST(ExecRequestArguments, ScratchPreservesTransferredMetadata) {
+    KEXPECT_TRUE(ker::syscall::process::exec_selftest_request_scratch_preserves_transferred_metadata());
+}
+
+KTEST(RemoteExecRequest, MetadataBindingAndRollbackOwnAllStorage) {
+    KEXPECT_TRUE(ker::syscall::process::exec_selftest_remote_plan_binding_and_rollback());
+}
+
+KTEST(RemoteExecRequest, ProductionCutoverRefusesStalePreparationWithoutPartialState) {
+    KEXPECT_TRUE(ker::syscall::process::exec_selftest_remote_cutover_refusal_is_atomic());
+}
+
+KTEST(RemoteExecRequest, SignalCutoverDrainsOwnerAndExecingWorker) {
+    KEXPECT_TRUE(ker::syscall::process::exec_selftest_remote_signal_cutover_drains_actor());
+}
+
+KTEST(RemoteExecRequest, ClaimAndCancelPreserveCanonicalOwnership) {
+    KEXPECT_TRUE(ker::syscall::process::exec_selftest_remote_request_claim_and_cancel());
+}
+
+KTEST(WorkerExecHandoff, ClaimAndCancelPreserveSingleOwnership) {
+    KEXPECT_TRUE(ker::syscall::process::exec_selftest_worker_handoff_claim_and_cancel());
+}
+
+KTEST(WorkerExecHandoff, SignalTransferDrainsAdmissionsAfterRootPublication) {
+    KEXPECT_TRUE(ker::syscall::process::exec_selftest_native_signal_cutover_drains_worker());
+}
+
+KTEST(ExecSpawnFdActions, OpenUsesPrivateChildAuthorityAndReservedDescriptor) {
+    KEXPECT_TRUE(ker::syscall::process::exec_selftest_spawn_open_uses_private_child_authority());
 }

@@ -10,6 +10,7 @@
 #include <net/wki/remotable.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
+#include <net/wki/zone.hpp>
 #include <utility>
 
 namespace ker::net {
@@ -41,6 +42,8 @@ struct DevServerBinding {
     bool detach_cleanup_pending = false;
     bool detach_cleanup_claimed = false;
     uint16_t consumer_node = WKI_NODE_INVALID;
+    // Immutable authenticated consumer incarnation captured before VFS publication.
+    uint32_t consumer_boot_epoch = 0;
     uint16_t assigned_channel = 0;
     WkiChannelIdentity channel_identity{};
     ResourceType resource_type = ResourceType::BLOCK;
@@ -49,6 +52,7 @@ struct DevServerBinding {
     uint8_t attach_cookie = 0;
     DevAttachAckPayload attach_ack = {};
     dev::BlockDevice* block_dev = nullptr;
+    bool block_read_allowed = false;  // Immutable issued access, independent of writer arbitration.
     bool block_read_only = false;
     dev::BlockWriterLease block_writer_lease{};
     char vfs_export_path[256] = {};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
@@ -56,6 +60,10 @@ struct DevServerBinding {
     uint64_t vfs_export_dev_id = 0;
     uint64_t vfs_export_publication_revision = 0;
     uint64_t vfs_export_revision_seen = 0;
+    // Protected by remote VFS s_vfs_lock, retained for this exact binding's
+    // entire lifetime. Never reset after publication, including after CANCEL.
+    uint64_t vfs_open_binding_id = 0;
+    uint64_t vfs_open_token_high_water = 0;
     // One logical remote mount has one anchor binding and may have several
     // auxiliary RPC bindings. This is local server state, not a wire field.
     bool vfs_lane_anchor = true;
@@ -77,6 +85,7 @@ struct DevServerBinding {
 
     // RDMA block ring state (Phase 2: shared memory SQ/CQ for block I/O)
     uint32_t blk_zone_id = 0;
+    WkiZoneRef blk_zone_ref{};  // Released outside server lock after binding users drain.
     void* blk_zone_ptr = nullptr;
     bool blk_rdma_active = false;
     bool blk_zone_pending = false;               // deferred zone creation (runs outside RX handler)
@@ -123,6 +132,7 @@ struct DevServerBinding {
           detach_cleanup_pending(o.detach_cleanup_pending),
           detach_cleanup_claimed(o.detach_cleanup_claimed),
           consumer_node(o.consumer_node),
+          consumer_boot_epoch(o.consumer_boot_epoch),
           assigned_channel(o.assigned_channel),
           channel_identity(o.channel_identity),
           resource_type(o.resource_type),
@@ -131,6 +141,7 @@ struct DevServerBinding {
           attach_cookie(o.attach_cookie),
           attach_ack(o.attach_ack),
           block_dev(o.block_dev),
+          block_read_allowed(o.block_read_allowed),
           block_read_only(o.block_read_only),
           block_writer_lease(std::move(o.block_writer_lease)),
           vfs_export_dev_id(o.vfs_export_dev_id),
@@ -150,7 +161,8 @@ struct DevServerBinding {
           net_last_mtu(o.net_last_mtu),
           net_last_ipv6(o.net_last_ipv6),
           blk_zone_id(o.blk_zone_id),
-          blk_zone_ptr(o.blk_zone_ptr),
+          blk_zone_ref(std::move(o.blk_zone_ref)),
+          blk_zone_ptr(std::exchange(o.blk_zone_ptr, nullptr)),
           blk_rdma_active(o.blk_rdma_active),
           blk_zone_pending(o.blk_zone_pending),
           blk_attach_ack_pending(o.blk_attach_ack_pending),
@@ -193,6 +205,7 @@ struct DevServerBinding {
             detach_cleanup_pending = o.detach_cleanup_pending;
             detach_cleanup_claimed = o.detach_cleanup_claimed;
             consumer_node = o.consumer_node;
+            consumer_boot_epoch = o.consumer_boot_epoch;
             assigned_channel = o.assigned_channel;
             channel_identity = o.channel_identity;
             resource_type = o.resource_type;
@@ -201,6 +214,7 @@ struct DevServerBinding {
             attach_cookie = o.attach_cookie;
             attach_ack = o.attach_ack;
             block_dev = o.block_dev;
+            block_read_allowed = o.block_read_allowed;
             block_read_only = o.block_read_only;
             block_writer_lease = std::move(o.block_writer_lease);
             vfs_export_dev_id = o.vfs_export_dev_id;
@@ -224,7 +238,8 @@ struct DevServerBinding {
             net_last_mtu = o.net_last_mtu;
             net_last_ipv6 = o.net_last_ipv6;
             blk_zone_id = o.blk_zone_id;
-            blk_zone_ptr = o.blk_zone_ptr;
+            blk_zone_ref = std::move(o.blk_zone_ref);
+            blk_zone_ptr = std::exchange(o.blk_zone_ptr, nullptr);
             blk_rdma_active = o.blk_rdma_active;
             blk_zone_pending = o.blk_zone_pending;
             blk_attach_ack_pending = o.blk_attach_ack_pending;
@@ -308,6 +323,19 @@ void wki_dev_server_init();
 
 // Bounded diagnostic copy of server-side attachment ownership and RDMA-ring
 // state. Rows are copied under the registry lock and never retain pointers.
+// Retain a same-consumer/export/incarnation sibling for a two-directory VFS
+// operation. Caller is an accepted deferred worker retaining origin. Never call
+// under the remote VFS lock. Release after the last use; release never waits.
+auto wki_dev_server_retain_vfs_sibling(const WkiChannelIdentity& origin, uint16_t channel_id, uint32_t generation,
+                                       WkiChannelIdentity* identity) -> DevServerBinding*;
+void wki_dev_server_release_vfs_sibling(DevServerBinding* binding);
+// New admission for an owner-issued directory grant. The source channel
+// identity is owner-local; the grant carries only peer/resource incarnations.
+// Caller releases outside VFS/path/publication locks.
+auto wki_dev_server_retain_vfs_grant_source(const WkiChannelIdentity& origin, const VfsDirectoryGrant& grant, uint64_t publication_revision)
+    -> DevServerBinding*;
+void wki_dev_server_release_vfs_grant_source(DevServerBinding* binding);
+
 auto wki_dev_server_diag_snapshot(WkiDevServerDiagRow* rows, size_t capacity, size_t* total) -> size_t;
 
 // Deferred test-only block notification delivery. Re-resolves and retains the
@@ -349,11 +377,12 @@ enum class WkiVfsOpRxAdmission : uint8_t {
     RETRY,
 };
 
-// Admit every VFS request into bounded fixed storage and the exact per-channel
+// Admit VFS and identity-aware NET OPEN into bounded fixed storage and the exact per-channel
 // worker FIFO before reliable RX publishes its ACK. RETRY leaves the frame
 // unconsumed when fixed capacity or an admission lock is busy.
 auto wki_dev_server_admit_vfs_op_rx(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
-                                    uint32_t rx_channel_generation) -> WkiVfsOpRxAdmission;
+                                    uint32_t rx_channel_generation, uint64_t identity_policy, uint16_t identity_capabilities)
+    -> WkiVfsOpRxAdmission;
 void wki_dev_server_notify_deferred_vfs_op(const WkiHeader* hdr);
 
 // Pre-ACK VFS transition admission. Reliable RX acquires this before sequence
@@ -427,15 +456,21 @@ auto wki_dev_server_block_has_remote_writer(const dev::BlockDevice* dev) -> bool
 // pivot_root() rebuilds the export table).
 
 #ifdef WOS_SELFTEST
+auto wki_dev_server_selftest_zone_retention(WkiZoneRef& zone_ref) -> bool;
 auto wki_dev_server_selftest_deferred_vfs_storage_is_coallocated() -> bool;
+auto wki_dev_server_selftest_component_batch_admission() -> bool;
+auto wki_dev_server_selftest_mapped_mutation_batch_admission() -> bool;
 auto wki_dev_server_selftest_retirement_ownership_guards() -> bool;
+auto wki_dev_server_selftest_vfs_sibling_binding() -> bool;
 auto wki_dev_server_selftest_binding_lifecycle_flags() -> bool;
+auto wki_dev_server_selftest_with_directory_grant_bindings(bool (*exercise)(DevServerBinding&, DevServerBinding&)) -> bool;
 auto wki_dev_server_selftest_attach_ack_failure_defers_cleanup() -> bool;
 auto wki_dev_server_selftest_detach_admission_lifecycle() -> bool;
 auto wki_dev_server_selftest_block_writer_lease_transfer() -> bool;
 auto wki_dev_server_selftest_block_attach_honors_disable_rdma() -> bool;
 auto wki_dev_server_selftest_async_vfs_close_uses_fixed_admission() -> bool;
 auto wki_dev_server_selftest_block_ops_use_fixed_admission() -> bool;
+auto wki_dev_server_selftest_block_access() -> bool;
 #endif
 
 // -----------------------------------------------------------------------------

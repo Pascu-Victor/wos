@@ -92,8 +92,8 @@ uint32_t s_next_rkey = 1;                                         // NOLINT(cppc
 // Transport state
 // -----------------------------------------------------------------------------
 
-WkiTransport s_roce_transport;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-bool s_roce_initialized = false;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+WkiTransport s_roce_transport;                // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<bool> s_roce_initialized{false};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 // -----------------------------------------------------------------------------
 // Region management
@@ -704,7 +704,10 @@ auto wki_roce_rdma_write_tagged(uint16_t neighbor_id, uint32_t rkey, uint64_t re
 // -----------------------------------------------------------------------------
 
 void roce_rx(ker::net::NetDevice* /*dev*/, ker::net::PacketBuffer* pkt) {
-    if (roce_disabled()) {
+    // Ethernet dispatch exists even when secure WKI deliberately withholds
+    // RoCE initialization. Refuse every opcode before any region or callback
+    // access until the transport has actually been published.
+    if (!s_roce_initialized.load(std::memory_order_acquire) || roce_disabled()) {
         pkt_free(pkt);
         return;
     }
@@ -833,7 +836,7 @@ void roce_rx(ker::net::NetDevice* /*dev*/, ker::net::PacketBuffer* pkt) {
 // -----------------------------------------------------------------------------
 
 void wki_roce_transport_init() {
-    if (s_roce_initialized) {
+    if (s_roce_initialized.load(std::memory_order_acquire)) {
         return;
     }
     if (roce_disabled()) {
@@ -862,10 +865,66 @@ void wki_roce_transport_init() {
     // Do NOT register with wki_transport_register - RoCE is not a message transport.
     // Peers discover it via wki_roce_transport_get() during HELLO completion.
 
-    s_roce_initialized = true;
+    s_roce_initialized.store(true, std::memory_order_release);
     ker::mod::dbg::log("[WKI] RoCE RDMA transport initialized (L2, EtherType 0x%04x)", WKI_ETHERTYPE_ROCE);
 }
 
-auto wki_roce_transport_get() -> WkiTransport* { return s_roce_initialized && !roce_disabled() ? &s_roce_transport : nullptr; }
+auto wki_roce_transport_get() -> WkiTransport* {
+    return s_roce_initialized.load(std::memory_order_acquire) && !roce_disabled() ? &s_roce_transport : nullptr;
+}
+
+#ifdef WOS_SELFTEST
+auto wki_roce_selftest_uninitialized_receive_preserves_region() -> bool {
+    if (g_wki.initialized || s_roce_initialized.load(std::memory_order_acquire) || roce_disabled()) {
+        return false;
+    }
+
+    std::array<uint8_t, 4> backing{1, 2, 3, 4};
+    std::array<uint8_t, 4> const ORIGINAL = backing;
+    std::array<uint8_t, 4> const DATA{5, 6, 7, 8};
+    uint32_t rkey = 0;
+    if (region_register(reinterpret_cast<uint64_t>(backing.data()), backing.size(), false, &rkey) != WKI_OK) {
+        return false;
+    }
+
+    bool valid = wki_roce_transport_get() == nullptr;
+    unsigned releases = 0;
+    for (auto opcode : {RoceOpcode::RDMA_WRITE, RoceOpcode::DOORBELL, RoceOpcode::RDMA_READ_REQ, RoceOpcode::RDMA_READ_RESP}) {
+        auto* pkt = pkt_alloc();
+        if (pkt == nullptr) {
+            valid = false;
+            break;
+        }
+        RoceHeader header{};
+        header.version = ROCE_VERSION;
+        header.opcode = static_cast<uint8_t>(opcode);
+        header.src_node = 0x7A41;
+        header.rkey = rkey;
+        header.length = DATA.size();
+        header.doorbell_val = rkey;
+        memcpy(pkt->data, &header, sizeof(header));
+        memcpy(pkt->data + sizeof(header), DATA.data(), DATA.size());
+        pkt->len = sizeof(header) + DATA.size();
+        pkt->lifetime_ctx = &releases;
+        pkt->lifetime_release = [](void* context) { ++*static_cast<unsigned*>(context); };
+        roce_rx(nullptr, pkt);
+
+        uint64_t const FLAGS = s_region_lock.lock_irqsave();
+        RoceRegion const* region = region_find_locked(rkey);
+        valid = valid && region != nullptr && region->received_bytes == 0 && !region->write_complete && !region->tagged_receive &&
+                backing == ORIGINAL;
+        s_region_lock.unlock_irqrestore(FLAGS);
+    }
+
+    // Positive controls use the same registered backing and completion helpers;
+    // no live transport is enabled and no network TX is performed by the test.
+    valid = valid && releases == 4;
+    bool const WRITE_OK = region_write(rkey, 0, DATA.data(), DATA.size(), DATA.size(), 0);
+    bool const COMPLETE_OK = region_mark_write_complete(rkey);
+    valid = valid && WRITE_OK && COMPLETE_OK && backing == DATA && region_received_at_least(rkey, DATA.size());
+    bool const REMOVED = region_unregister(rkey);
+    return valid && REMOVED && !region_is_registered(rkey) && wki_roce_transport_get() == nullptr;
+}
+#endif
 
 }  // namespace ker::net::wki

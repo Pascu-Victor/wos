@@ -13,6 +13,10 @@ namespace ker::net::wki {
 struct RemotableOps;
 }
 
+namespace ker::mod::security {
+class Snapshot;
+}
+
 namespace ker::net {
 
 constexpr size_t MAX_NET_DEVICES = 16;
@@ -23,7 +27,35 @@ using WkiRxForwardHook = void (*)(NetDevice* dev, PacketBuffer* pkt);
 
 static_assert(std::atomic<WkiRxForwardHook>::is_always_lock_free, "WKI RX forward hook must stay lock-free");
 
+struct NetDeviceLinkControl {
+    bool change_state = false;
+    bool up = false;
+    bool change_mac = false;
+    std::array<uint8_t, 6> mac{};
+};
+
+// Owned link configuration; statistics and L3 address tables have separate
+// lifetimes. Readers see the pre-control record until a request finishes.
+struct NetDeviceConfigSnapshot {
+    std::array<char, NETDEV_NAME_LEN> name{};
+    proto::MacAddress mac{};
+    uint32_t mtu = 0;
+    uint32_t tx_queue_len = 0;
+    uint32_t link_flags = 0;
+    uint32_t ifindex = 0;
+    uint8_t state = 0;
+    auto operator==(const NetDeviceConfigSnapshot&) const -> bool = default;
+};
+
+enum class NetDeviceControlNotify : uint8_t { OWNER_STATE = 1, RESOURCE_ADVERT = 2 };
+
+// Pure admission. Zero guarantees the native set_mac commit cannot refuse
+// while this retained device and its immutable driver configuration remain live.
+auto netdev_check_mac(NetDevice* dev, const uint8_t* mac) -> int;
+auto netdev_check_fixed_mac(NetDevice* dev, const uint8_t* mac) -> int;
+
 struct NetDeviceOps {
+    // Return zero on success. On failure, return a negative errno and leave state unchanged.
     int (*open)(NetDevice* dev);
     void (*close)(NetDevice* dev);
     int (*start_xmit)(NetDevice* dev, PacketBuffer* pkt);
@@ -31,6 +63,18 @@ struct NetDeviceOps {
     // Optional: pin NAPI worker for queue pair `pair_idx` to `cpu` and steer its MSI-X entry.
     // Returns 0 on success, -EINVAL if pair_idx is out of range, -ENOSYS if unsupported.
     int (*set_queue_cpu)(NetDevice* dev, uint32_t pair_idx, uint64_t cpu);
+    // Optional remote admission using the syscall's already captured identity.
+    int (*open_as)(NetDevice* dev, const ker::mod::security::Snapshot& caller) = nullptr;
+    // Same caller contract; failure leaves device state unchanged.
+    int (*close_as)(NetDevice* dev, const ker::mod::security::Snapshot& caller) = nullptr;
+    int (*check_mac)(NetDevice* dev, const uint8_t* mac) = nullptr;
+    // One remote decision/commit for the driver effects in a combined request.
+    int (*apply_link_as)(NetDevice* dev, const NetDeviceLinkControl& control, const ker::mod::security::Snapshot& caller) = nullptr;
+    // Bounded metadata publication under control_publication_lock, before
+    // releasing control_busy. Must not allocate, wait, send or invoke hardware.
+    void (*finish_control)(NetDevice* dev) = nullptr;
+    // Whole-request admission: errors must leave all queues and IRQs unchanged.
+    int (*set_queue_cpu_mask)(NetDevice* dev, uint64_t cpu_mask) = nullptr;
 };
 
 struct NetDevice {
@@ -67,10 +111,47 @@ struct NetDevice {
     // other users can retain a device without taking the registry lock.
     std::atomic<uint64_t> lifetime_generation{0};
     std::atomic<uint32_t> lifetime_readers{uint32_t{1} << 31U};
+
+    // The short lock coordinates admission/release with asynchronous metadata
+    // publication. Never hold it across a driver callback or remote wait.
+    mutable mod::sys::Spinlock control_publication_lock;
+    std::atomic<bool> control_busy{false};
+    bool control_retiring = false;  // Protected by control_publication_lock.
+    NetDeviceConfigSnapshot control_before{};
+    uint8_t control_notifications = 0;  // Requested notification kinds, under publication lock.
 };
+
+// Caller retains the registration or otherwise owns this device's storage.
+auto netdev_config_snapshot(const NetDevice* dev) -> NetDeviceConfigSnapshot;
+// Fence future controls and publish DOWN without racing an admitted writer.
+// Does not unregister or wait; successful fresh registration resets the fence.
+void netdev_mark_control_retiring(NetDevice* dev);
+// Preserve each caller's notification scope while delaying publication until
+// its complete configuration is visible. False means publish normally now.
+auto netdev_defer_control_notify(NetDevice* dev, NetDeviceControlNotify kind) -> bool;
 
 static_assert(std::atomic<uint64_t>::is_always_lock_free, "NetDevice generations must stay lock-free");
 static_assert(std::atomic<uint32_t>::is_always_lock_free, "NetDevice retention must stay lock-free");
+static_assert(std::atomic<bool>::is_always_lock_free, "NetDevice control admission must stay lock-free");
+
+// Caller retains the device (or its owner binding) until after destruction.
+// One ownership try only: an active request returns EBUSY. The publication
+// lock covers only admission/release, never the lifetime of this guard.
+// Keep this guard across admission, callbacks, commit and control notifications.
+class NetDeviceControlGuard {
+   public:
+    NetDeviceControlGuard() = default;
+    ~NetDeviceControlGuard();
+    NetDeviceControlGuard(const NetDeviceControlGuard&) = delete;
+    auto operator=(const NetDeviceControlGuard&) -> NetDeviceControlGuard& = delete;
+
+    auto try_acquire(NetDevice* dev) -> int;
+    // Finish and flush before an owner response; destruction is idempotent.
+    void finish();
+
+   private:
+    NetDevice* device_ = nullptr;
+};
 
 class NetDeviceRef {
    public:
@@ -101,6 +182,26 @@ struct NetDeviceRetireToken {
     NetDeviceIdentity identity{};
 
     [[nodiscard]] auto valid() const -> bool { return identity.valid(); }
+};
+
+// Bounded namespace admission held across a potentially failing driver call.
+// The old name stays visible until commit. Destruction releases an uncommitted
+// claim; the retained registration keeps storage alive through retirement.
+class NetDeviceNameChange {
+   public:
+    NetDeviceNameChange() = default;
+    ~NetDeviceNameChange();
+    NetDeviceNameChange(const NetDeviceNameChange&) = delete;
+    auto operator=(const NetDeviceNameChange&) -> NetDeviceNameChange& = delete;
+
+    auto prepare(NetDeviceIdentity identity, std::string_view name) -> int;
+    void commit();
+    void cancel();
+
+   private:
+    void finish(bool publish);
+    NetDeviceRef retained_{};
+    size_t slot_ = MAX_NET_DEVICES;
 };
 
 struct NetDeviceSnapshot {
@@ -143,6 +244,10 @@ class NetDeviceRegistryLease {
 
 // Register a new network device (assigns ifindex, auto-names "ethN" if name is empty)
 auto netdev_register(NetDevice* dev) -> int;
+
+// Caller retains the registration. Collision admission and publication share
+// the registry lock with register/lookup/retirement; callbacks run elsewhere.
+auto netdev_rename(NetDeviceIdentity identity, std::string_view name) -> int;
 
 // Unregister and drain retained users. This is a task-context operation.
 auto netdev_unregister(NetDevice* dev) -> int;

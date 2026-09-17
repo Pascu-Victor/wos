@@ -1011,6 +1011,7 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
         wki_dev_proxy_mark_epoch_reset(peer_node);
         wki_remote_vfs_mark_epoch_reset(peer_node);
         wki_remote_net_mark_epoch_reset(peer_node);
+        wki_ipc_mark_epoch_reset(peer_node);
         wki_timer_notify();
     }
     if (remote_session_epoch_reset) {
@@ -1224,6 +1225,7 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* hdr, const uint8
         wki_dev_proxy_mark_epoch_reset(peer_node);
         wki_remote_vfs_mark_epoch_reset(peer_node);
         wki_remote_net_mark_epoch_reset(peer_node);
+        wki_ipc_mark_epoch_reset(peer_node);
         wki_timer_notify();
     }
 
@@ -2074,6 +2076,9 @@ void drain_pending_epoch_reset_cleanups() {
                 wki_remote_compute_cleanup_retired_for_peer(peer.node_id);
             }
             if (VFS_PENDING) {
+                // IPC grants have no epoch-rebind protocol. Retire their
+                // marked endpoints before reliable admission opens again.
+                wki_ipc_cleanup_for_peer(peer.node_id);
                 // Owner bindings drain first. Admission remains closed while
                 // consumer sessions and discovery are reconciled.
                 wki_dev_server_cleanup_epoch_reset_for_peer(peer.node_id);
@@ -2089,6 +2094,9 @@ void drain_pending_epoch_reset_cleanups() {
                 wki_dev_proxy_cleanup_epoch_reset_for_peer(peer.node_id, INVALIDATE_DISCOVERY || !CONNECTED, OWNER_REBOOT_PROVEN);
                 wki_remote_net_cleanup_epoch_reset_for_peer(peer.node_id, OWNER_REBOOT_PROVEN);
                 wki_remote_vfs_cleanup_for_peer(peer.node_id, OWNER_REBOOT_PROVEN);
+                // Device users have drained their raw zone backing references.
+                // Standalone grants also end with the retired channel epoch.
+                wki_zones_destroy_for_peer(peer.node_id);
 
                 if (CONNECTED && !INVALIDATE_DISCOVERY) {
                     wki_resources_rebind_vfs_for_peer(peer.node_id);
@@ -2305,6 +2313,20 @@ auto wki_peer_find_by_hostname(const char* hostname) -> uint16_t {
     }
     g_wki.peer_lock.unlock();
     return WKI_NODE_INVALID;
+}
+
+auto wki_peer_copy_hostname(uint16_t node_id, std::array<char, WKI_HOSTNAME_MAX>& hostname) -> bool {
+    uint64_t const FLAGS = g_wki.peer_lock.lock_irqsave();
+    const std::array<char, WKI_HOSTNAME_MAX>* source = nullptr;
+    if (node_id == g_wki.my_node_id)
+        source = &g_wki.local_hostname;
+    else if (auto* peer = wki_peer_find(node_id); peer != nullptr)
+        source = &peer->hostname;
+    bool const FOUND = source != nullptr && source->front() != '\0';
+    if (FOUND) hostname = *source;
+    g_wki.peer_lock.unlock_irqrestore(FLAGS);
+    if (FOUND) hostname.back() = '\0';
+    return FOUND;
 }
 
 auto wki_peer_get_hostname(uint16_t node_id) -> const char* {

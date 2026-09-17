@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <dev/block_device.hpp>
@@ -470,6 +471,59 @@ auto send_or_defer_block_detach(ProxyBlockState* state, uint16_t owner_node, uin
     return STAGED ? WKI_OK : WKI_ERR_BUSY;
 }
 
+// Registry and state locks held; caller owns construction/resume or has
+// fenced the proxy and drained I/O plus delayed doorbells.
+auto take_proxy_zone_locked(ProxyBlockState* state) -> WkiZoneRef {
+    WkiZoneRef ref = std::move(state->rdma_zone_ref);
+    state->rdma_attached = false;
+    state->rdma_zone_ptr = nullptr;
+    state->rdma_zone_id = 0;
+    state->rdma_zone_size = 0;
+    state->rdma_roce = false;
+    state->rdma_transport = nullptr;
+    state->rdma_remote_rkey = 0;
+    return ref;
+}
+
+void retire_proxy_zone(ProxyBlockState* state) {
+    s_proxy_lock.lock();
+    state->lock.lock();
+    WkiZoneRef ref = take_proxy_zone_locked(state);
+    state->lock.unlock();
+    s_proxy_lock.unlock();
+    static_cast<void>(ref.destroy());
+    ref.reset();
+}
+
+// Setup owns the state until initial publication or resume-claim release.
+auto install_proxy_zone(ProxyBlockState* state, WkiZoneRef& ref) -> bool {
+    WkiZoneMemory memory{};
+    if (!ref.snapshot_memory(memory) || memory.size < blk_ring_default_zone_size()) return false;
+    s_proxy_lock.lock();
+    state->lock.lock();
+    bool const EMPTY = !state->rdma_zone_ref;
+    if (EMPTY) {
+        state->rdma_zone_ref = std::move(ref);
+        state->rdma_zone_ptr = memory.data;
+        state->rdma_zone_size = memory.size;
+        state->rdma_roce = memory.is_roce;
+        state->rdma_transport = memory.transport;
+        state->rdma_remote_rkey = memory.remote_rkey;
+    }
+    state->lock.unlock();
+    s_proxy_lock.unlock();
+    return EMPTY;
+}
+
+auto refresh_proxy_zone_key(ProxyBlockState* state) -> bool {
+    WkiZoneMemory memory{};
+    if (!state->rdma_zone_ref.snapshot_memory(memory)) return false;
+    state->lock.lock();
+    state->rdma_remote_rkey = memory.remote_rkey;
+    state->lock.unlock();
+    return true;
+}
+
 void cleanup_failed_block_attach(ProxyBlockState* state, const WkiChannelIdentity& channel_to_close, bool send_detach) {
     if (state == nullptr) {
         return;
@@ -477,7 +531,7 @@ void cleanup_failed_block_attach(ProxyBlockState* state, const WkiChannelIdentit
 
     uint16_t owner_node = WKI_NODE_INVALID;
     uint32_t resource_id = 0;
-    uint32_t rdma_zone_id = 0;
+    WkiZoneRef retired_zone;
     uint8_t attach_cookie = 0;
     ResourceIncarnationToken detach_incarnation = {};
     uint8_t* ra_buf = nullptr;
@@ -488,7 +542,6 @@ void cleanup_failed_block_attach(ProxyBlockState* state, const WkiChannelIdentit
     state->lock.lock();
     owner_node = state->owner_node;
     resource_id = state->resource_id;
-    rdma_zone_id = state->rdma_zone_id;
     attach_cookie = state->binding_attach_cookie;
     detach_incarnation =
         wki_resource_incarnation_valid(state->binding_incarnation) ? state->binding_incarnation : state->attach_expected_incarnation;
@@ -518,13 +571,7 @@ void cleanup_failed_block_attach(ProxyBlockState* state, const WkiChannelIdentit
     state->bulk_staging_rkey = 0;
     state->bulk_staging_size = 0;
     state->bulk_max_transfer = 0;
-    state->rdma_attached = false;
-    state->rdma_zone_ptr = nullptr;
-    state->rdma_zone_id = 0;
-    state->rdma_zone_size = 0;
-    state->rdma_roce = false;
-    state->rdma_transport = nullptr;
-    state->rdma_remote_rkey = 0;
+    retired_zone = take_proxy_zone_locked(state);
     ker::dev::block_device_set_read_only(&state->bdev, false);
     set_proxy_block_active(state, false);
     state->lock.unlock();
@@ -532,9 +579,8 @@ void cleanup_failed_block_attach(ProxyBlockState* state, const WkiChannelIdentit
 
     static_cast<void>(wki_channel_close_generation(channel_to_close.channel, channel_to_close.peer_node_id, channel_to_close.channel_id,
                                                    channel_to_close.generation));
-    if (rdma_zone_id != 0) {
-        wki_zone_destroy(rdma_zone_id);
-    }
+    static_cast<void>(retired_zone.destroy());
+    retired_zone.reset();
     delete[] ra_buf;
     delete[] bulk_buf;
 
@@ -765,7 +811,8 @@ void clear_attach_waiter_after_wait(ProxyBlockState* state, WkiWaitEntry& wait) 
 
 auto proxy_ring_snapshot_valid(const ProxyBlockState* state, BlkRingGeometry* geometry_out = nullptr, BlkRingIndices* indices_out = nullptr)
     -> bool {
-    if (state == nullptr || state->rdma_zone_ptr == nullptr || state->rdma_zone_size < blk_ring_default_zone_size()) {
+    if (state == nullptr || state->rdma_zone_ptr == nullptr || state->rdma_zone_size < blk_ring_default_zone_size() ||
+        !state->rdma_zone_ref.live()) {
         return false;
     }
 
@@ -786,7 +833,8 @@ auto proxy_ring_snapshot_valid(const ProxyBlockState* state, BlkRingGeometry* ge
 }
 
 auto proxy_ring_initial_snapshot_valid(const ProxyBlockState* state, BlkRingGeometry* geometry_out = nullptr) -> bool {
-    if (state == nullptr || state->rdma_zone_ptr == nullptr || state->rdma_zone_size < blk_ring_default_zone_size()) {
+    if (state == nullptr || state->rdma_zone_ptr == nullptr || state->rdma_zone_size < blk_ring_default_zone_size() ||
+        !state->rdma_zone_ref.live()) {
         return false;
     }
     auto const* hdr = blk_ring_header(state->rdma_zone_ptr);
@@ -1177,13 +1225,9 @@ void rdma_signal_server_unchecked(ProxyBlockState* state) {
         return;
     }
 
-    // Tier 1: ivshmem doorbell (near-zero latency)
+    // Primary shared-memory peers use a reliable zone wake after publishing SQ.
     if (peer->transport != nullptr && peer->transport->rdma_capable) {
-        // ivshmem transport has native doorbell - zone post handler will fire
-        ZoneNotifyPayload notify = {};
-        notify.zone_id = state->rdma_zone_id;
-        notify.op_type = 1;  // WRITE (new SQ entries available)
-        wki_send(state->owner_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_NOTIFY_POST, &notify, sizeof(notify));
+        static_cast<void>(state->rdma_zone_ref.notify_post(1));
         return;
     }
 
@@ -1194,10 +1238,7 @@ void rdma_signal_server_unchecked(ProxyBlockState* state) {
 
     // Reliable notify as fallback/backup for RoCE doorbell loss. The server
     // poll path is idempotent, so duplicate raw + reliable signals are okay.
-    ZoneNotifyPayload notify = {};
-    notify.zone_id = state->rdma_zone_id;
-    notify.op_type = 1;  // WRITE (new SQ entries available)
-    wki_send(state->owner_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_NOTIFY_POST, &notify, sizeof(notify));
+    static_cast<void>(state->rdma_zone_ref.notify_post(1));
 }
 
 void rdma_signal_server(ProxyBlockState* state, uint32_t ring_index, uint32_t operation_cookie, uint8_t block_opcode,
@@ -1261,7 +1302,7 @@ class BlockIoLease {
             return false;
         }
         state->io_lock.lock();
-        if (!proxy_block_active(state) || proxy_block_fenced(state)) {
+        if (!proxy_block_active(state) || proxy_block_fenced(state) || (state->rdma_attached && !state->rdma_zone_ref.live())) {
             state->io_lock.unlock();
             return false;
         }
@@ -3038,6 +3079,28 @@ void wki_dev_proxy_process_pending_detaches() {
 // Attach / Detach
 // -----------------------------------------------------------------------------
 
+auto wki_dev_proxy_block_matches_observation(ker::dev::BlockDevice* bdev, uint16_t owner_node, uint32_t resource_id,
+                                             uint64_t resource_generation, const ResourceIncarnationToken& owner_incarnation) -> bool {
+    if (bdev == nullptr || resource_generation == 0) {
+        return false;
+    }
+    s_proxy_lock.lock();
+    auto* state = find_proxy_by_bdev(bdev);
+    bool matches = false;
+    if (state != nullptr) {
+        state->lock.lock();
+        matches = state->ever_published && proxy_block_active(state) && !proxy_block_fenced(state) && !state->epoch_reset_pending &&
+                  !state->cleanup_in_progress && !state->resume_pending && !state->resume_in_progress && !state->detach_pending &&
+                  state->owner_node == owner_node && state->resource_id == resource_id &&
+                  state->resource_generation == resource_generation &&
+                  wki_resource_incarnation_equal(state->binding_incarnation, owner_incarnation) &&
+                  ker::dev::block_device_find_by_name(state->bdev.name.data()) == bdev;
+        state->lock.unlock();
+    }
+    s_proxy_lock.unlock();
+    return matches;
+}
+
 auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, uint64_t expected_resource_generation,
                                 const ResourceIncarnationToken& expected_owner_incarnation, const char* local_name,
                                 WkiBlockAttachRdmaPolicy rdma_policy) -> ker::dev::BlockDevice* {
@@ -3233,36 +3296,27 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, uint6
         mod::dbg::log("[WKI] Dev proxy attach ACK received, waiting for RDMA zone: node=0x%04x res_id=%u zone_id=0x%08x", owner_node,
                       resource_id, state->rdma_zone_id);
         uint64_t const ZONE_DEADLINE = wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US);
-        WkiZone const* zone = nullptr;
+        WkiZoneRef zone;
 
         // Wait for the RDMA zone to appear (server creates it, zone negotiation completes)
         while (wki_now_us() < ZONE_DEADLINE) {
-            zone = wki_zone_find(state->rdma_zone_id);
-            if (zone != nullptr && zone->state == ZoneState::ACTIVE) {
+            zone = WkiZoneRef::acquire(state->rdma_zone_id, owner_node, ZONE_ACCESS_LOCAL_READ | ZONE_ACCESS_LOCAL_WRITE);
+            if (zone) {
                 break;
             }
-            zone = nullptr;
             asm volatile("pause" ::: "memory");
             WkiChannel* res_ch = wki_channel_get(owner_node, WKI_CHAN_RESOURCE);
             wki_spin_yield_channel(res_ch);
         }
 
-        if (zone != nullptr && zone->local_vaddr != nullptr && zone->size >= blk_ring_default_zone_size()) {
-            state->rdma_zone_ptr = zone->local_vaddr;
-            state->rdma_zone_size = zone->size;
-
-            // Populate RoCE state from zone (must be done before server_ready check
-            // so that roce_pull_cq etc. work correctly once we start using the ring)
-            state->rdma_roce = zone->is_roce;
-            state->rdma_transport = zone->rdma_transport;
-
+        if (install_proxy_zone(state, zone)) {
             // For RoCE zones: the initiator (server) sends its rkey via a
             // ZONE_NOTIFY_POST (op_type=0xFE) after confirming the zone.  We must
-            // wait for zone->remote_rkey to become non-zero before we can do any
+            // wait for the retained zone remote_rkey to become non-zero before we can do any
             // RDMA operations targeting the server's zone memory.
             if (state->rdma_roce) {
                 uint64_t const RKEY_DEADLINE = wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US);
-                while (zone->remote_rkey == 0 && wki_now_us() < RKEY_DEADLINE) {
+                while (refresh_proxy_zone_key(state) && state->rdma_remote_rkey == 0 && wki_now_us() < RKEY_DEADLINE) {
                     asm volatile("pause" ::: "memory");
                     // Drive NIC + WKI RX so the rkey-exchange notification can be processed
                     net::NetDevice* net_dev = wki_eth_get_netdev();
@@ -3272,15 +3326,15 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, uint6
                     }
                 }
             }
-            state->rdma_remote_rkey = zone->remote_rkey;
+            static_cast<void>(refresh_proxy_zone_key(state));
 
             // For RoCE zones: pull the ring header from server to get server_ready.
             // Even if rdma_remote_rkey is still 0 (rkey-exchange notification was
             // late), the server may have pushed the header via rdma_write to our
             // local zone memory.  We must poll the NIC so those RDMA_WRITE frames
             // are received and copied into our zone backing.
-            if (state->rdma_roce && state->rdma_transport != nullptr && state->rdma_transport->rdma_read != nullptr &&
-                state->rdma_remote_rkey != 0) {
+            if (state->rdma_zone_ref.live() && state->rdma_roce && state->rdma_transport != nullptr &&
+                state->rdma_transport->rdma_read != nullptr && state->rdma_remote_rkey != 0) {
                 state->rdma_transport->rdma_read(state->rdma_transport, state->owner_node, state->rdma_remote_rkey, 0, state->rdma_zone_ptr,
                                                  BLK_RING_HEADER_SIZE);
             }
@@ -3288,7 +3342,7 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, uint6
             // Wait for server_ready flag in ring header
             auto* ring_hdr = blk_ring_header(state->rdma_zone_ptr);
             uint64_t const READY_DEADLINE = wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US);
-            while (blk_ring_geometry_snapshot(ring_hdr).server_ready == 0 && wki_now_us() < READY_DEADLINE) {
+            while (state->rdma_zone_ref.live() && blk_ring_geometry_snapshot(ring_hdr).server_ready == 0 && wki_now_us() < READY_DEADLINE) {
                 asm volatile("pause" ::: "memory");
 
                 // Always poll NIC: the server pushes the ring header via
@@ -3303,13 +3357,11 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, uint6
 
                 // Also re-check rkey - the 0xFE notification may arrive
                 // during the NIC poll above.
-                if (state->rdma_remote_rkey == 0 && zone->remote_rkey != 0) {
-                    state->rdma_remote_rkey = zone->remote_rkey;
-                }
+                static_cast<void>(refresh_proxy_zone_key(state));
 
                 // For RoCE with valid rkey: also actively pull the header
-                if (state->rdma_roce && state->rdma_transport != nullptr && state->rdma_transport->rdma_read != nullptr &&
-                    state->rdma_remote_rkey != 0) {
+                if (state->rdma_zone_ref.live() && state->rdma_roce && state->rdma_transport != nullptr &&
+                    state->rdma_transport->rdma_read != nullptr && state->rdma_remote_rkey != 0) {
                     state->rdma_transport->rdma_read(state->rdma_transport, state->owner_node, state->rdma_remote_rkey, 0,
                                                      state->rdma_zone_ptr, BLK_RING_HEADER_SIZE);
                 }
@@ -3343,22 +3395,14 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, uint6
                 ker::mod::dbg::log("[WKI] Dev proxy RDMA ring not ready or invalid - falling back to msg path");
                 state->bdev.block_size = 0;
                 state->bdev.total_blocks = 0;
-                state->rdma_zone_id = 0;
-                state->rdma_zone_size = 0;
-                state->rdma_zone_ptr = nullptr;
-                state->rdma_roce = false;
-                state->rdma_transport = nullptr;
-                state->rdma_remote_rkey = 0;
+                retire_proxy_zone(state);
             }
         } else {
             ker::mod::dbg::log("[WKI] Dev proxy RDMA zone unavailable or undersized (0x%08x) - falling back to msg path",
                                state->rdma_zone_id);
-            state->rdma_zone_id = 0;
-            state->rdma_zone_size = 0;
-            state->rdma_zone_ptr = nullptr;
-            state->rdma_roce = false;
-            state->rdma_transport = nullptr;
-            state->rdma_remote_rkey = 0;
+            static_cast<void>(zone.destroy());
+            zone.reset();
+            retire_proxy_zone(state);
         }
     }
 
@@ -3447,7 +3491,9 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, uint6
                 // publish proxy activity before making the bdev visible.
                 set_proxy_block_active(state, true);
                 if (ker::dev::block_device_register(&state->bdev) == 0) {
+                    s_proxy_lock.lock();
                     state->ever_published = true;
+                    s_proxy_lock.unlock();
                     registered = true;
                 } else {
                     set_proxy_block_active(state, false);
@@ -3508,8 +3554,7 @@ void wki_dev_proxy_detach_block(ker::dev::BlockDevice* proxy_bdev) {
     uint16_t const ASSIGNED_CHANNEL = ASSIGNED_CHANNEL_IDENTITY.channel_id;
     uint8_t const BINDING_ATTACH_COOKIE = state->binding_attach_cookie;
     ResourceIncarnationToken const BINDING_INCARNATION = state->binding_incarnation;
-    bool const HAD_RDMA = state->rdma_attached;
-    uint32_t const RDMA_ZONE_ID = state->rdma_zone_id;
+    WkiZoneRef retired_zone;
     uint8_t const* ra_buf = state->ra_buffer;
     uint8_t const* bulk_buf = state->bulk_staging_buf;
 
@@ -3532,15 +3577,7 @@ void wki_dev_proxy_detach_block(ker::dev::BlockDevice* proxy_bdev) {
     ra_invalidate(state);
     set_proxy_block_active(state, false);
     unindex_proxy_locked(state);
-    if (HAD_RDMA) {
-        state->rdma_attached = false;
-        state->rdma_zone_ptr = nullptr;
-        state->rdma_zone_id = 0;
-        state->rdma_zone_size = 0;
-        state->rdma_roce = false;
-        state->rdma_transport = nullptr;
-        state->rdma_remote_rkey = 0;
-    }
+    retired_zone = take_proxy_zone_locked(state);
     state->lock.unlock();
     s_proxy_lock.unlock();
 
@@ -3555,9 +3592,8 @@ void wki_dev_proxy_detach_block(ker::dev::BlockDevice* proxy_bdev) {
     delete[] bulk_buf;
 
     // Destroy RDMA zone before sending detach
-    if (HAD_RDMA && RDMA_ZONE_ID != 0) {
-        wki_zone_destroy(RDMA_ZONE_ID);
-    }
+    static_cast<void>(retired_zone.destroy());
+    retired_zone.reset();
 
     // Unregister from block device subsystem
     ker::dev::block_device_unregister(proxy_bdev);
@@ -3631,7 +3667,7 @@ void wki_dev_proxy_cleanup_epoch_reset_for_peer(uint16_t node_id, bool retire_pr
     while (true) {
         ProxyBlockState* state = nullptr;
         WkiChannelIdentity channel_identity = {};
-        uint32_t rdma_zone_id = 0;
+        WkiZoneRef retired_zone;
         uint8_t* ra_buf = nullptr;
         uint8_t* bulk_buf = nullptr;
         WkiWaitEntry* op_waiter = nullptr;
@@ -3671,7 +3707,6 @@ void wki_dev_proxy_cleanup_epoch_reset_for_peer(uint16_t node_id, bool retire_pr
         s_proxy_lock.lock();
         state->lock.lock();
         channel_identity = state->assigned_channel_identity;
-        rdma_zone_id = state->rdma_zone_id;
         ra_buf = state->ra_buffer;
         bulk_buf = state->bulk_staging_buf;
         state->ra_buffer = nullptr;
@@ -3688,15 +3723,9 @@ void wki_dev_proxy_cleanup_epoch_reset_for_peer(uint16_t node_id, bool retire_pr
         state->attach_pending.store(false, std::memory_order_release);
         state->attach_expected_cookie = 0;
         state->assigned_channel_identity = {};
-        state->rdma_attached = false;
-        state->rdma_zone_ptr = nullptr;
-        state->rdma_zone_id = 0;
-        state->rdma_zone_size = 0;
+        retired_zone = take_proxy_zone_locked(state);
         state->data_slot_bitmap = 0;
         reset_rdma_tag_state(state);
-        state->rdma_roce = false;
-        state->rdma_transport = nullptr;
-        state->rdma_remote_rkey = 0;
         if (retire_proxy) {
             // Disconnect and fence timeout require terminal local teardown but
             // do not prove the server forgot this binding. Reserve the exact
@@ -3724,9 +3753,8 @@ void wki_dev_proxy_cleanup_epoch_reset_for_peer(uint16_t node_id, bool retire_pr
         finish_claimed_waiter(attach_waiter, WKI_ERR_PEER_FENCED);
         static_cast<void>(wki_channel_close_generation(channel_identity.channel, channel_identity.peer_node_id, channel_identity.channel_id,
                                                        channel_identity.generation));
-        if (rdma_zone_id != 0) {
-            wki_zone_destroy(rdma_zone_id);
-        }
+        static_cast<void>(retired_zone.destroy());
+        retired_zone.reset();
         delete[] ra_buf;
         delete[] bulk_buf;
         if (unregister_bdev) {
@@ -3841,6 +3869,12 @@ void wki_dev_proxy_resume_for_peer(uint16_t node_id) {
                     send_or_defer_block_detach(p, node_id, p->resource_id, previous_attach_cookie, previous_binding_incarnation));
                 continue;
             }
+
+            // The old exact detach is complete. Fence/claim ownership excludes
+            // new I/O and cleanup while old local users drain before replacement.
+            wait_for_block_io_quiescence(p);
+            wait_for_block_chaos_doorbell_quiescence(p);
+            retire_proxy_zone(p);
 
             // Re-attach: send DEV_ATTACH_REQ to get a fresh dynamic channel
             DevAttachReqPayload attach_req = {};
@@ -4000,18 +4034,11 @@ void wki_dev_proxy_resume_for_peer(uint16_t node_id) {
 
             // Re-attach RDMA zone if the new attach ACK provided one (RDMA ops outside lock)
             if (p->rdma_zone_id != 0 && !p->rdma_attached) {
-                WkiZone const* zone = wki_zone_find(p->rdma_zone_id);
-                if (zone != nullptr && zone->state == ZoneState::ACTIVE && zone->local_vaddr != nullptr &&
-                    zone->size >= blk_ring_default_zone_size()) {
-                    p->rdma_zone_ptr = zone->local_vaddr;
-                    p->rdma_zone_size = zone->size;
-                    p->rdma_roce = zone->is_roce;
-                    p->rdma_transport = zone->rdma_transport;
-                    p->rdma_remote_rkey = zone->remote_rkey;
-
+                WkiZoneRef zone = WkiZoneRef::acquire(p->rdma_zone_id, p->owner_node, ZONE_ACCESS_LOCAL_READ | ZONE_ACCESS_LOCAL_WRITE);
+                if (install_proxy_zone(p, zone)) {
                     // For RoCE: pull ring header from server to check server_ready
-                    if (p->rdma_roce && p->rdma_transport != nullptr && p->rdma_transport->rdma_read != nullptr &&
-                        p->rdma_remote_rkey != 0) {
+                    if (p->rdma_zone_ref.live() && p->rdma_roce && p->rdma_transport != nullptr &&
+                        p->rdma_transport->rdma_read != nullptr && p->rdma_remote_rkey != 0) {
                         p->rdma_transport->rdma_read(p->rdma_transport, p->owner_node, p->rdma_remote_rkey, 0, p->rdma_zone_ptr,
                                                      BLK_RING_HEADER_SIZE);
                     }
@@ -4019,7 +4046,7 @@ void wki_dev_proxy_resume_for_peer(uint16_t node_id) {
                     auto* ring_hdr = blk_ring_header(p->rdma_zone_ptr);
                     BlkRingGeometry const GEOMETRY = blk_ring_geometry_snapshot(ring_hdr);
                     BlkRingIndices const INDICES = blk_ring_indices_snapshot(ring_hdr);
-                    if (blk_ring_geometry_valid(GEOMETRY, p->bdev.block_size, p->bdev.total_blocks) &&
+                    if (p->rdma_zone_ref.live() && blk_ring_geometry_valid(GEOMETRY, p->bdev.block_size, p->bdev.total_blocks) &&
                         blk_ring_indices_valid(INDICES, GEOMETRY)) {
                         p->rdma_attached = true;
                         p->data_slot_bitmap = 0;
@@ -4037,6 +4064,11 @@ void wki_dev_proxy_resume_for_peer(uint16_t node_id) {
                         ker::mod::dbg::log("[WKI] Dev proxy RDMA ring re-attached on resume: zone=0x%08x roce=%d", p->rdma_zone_id,
                                            p->rdma_roce ? 1 : 0);
                     }
+                }
+                if (!p->rdma_attached) {
+                    static_cast<void>(zone.destroy());
+                    zone.reset();
+                    retire_proxy_zone(p);
                 }
             }
 
@@ -4306,79 +4338,223 @@ auto wki_dev_proxy_selftest_failed_attach_erases_exact_proxy() -> bool {
     return ERASED_FIRST && second_still_present && ONE_PROXY_REMOVED && ERASED_SECOND && SIZE_RESTORED;
 }
 
+#ifdef WOS_SELFTEST
+auto wki_dev_proxy_selftest_existing_block_identity() -> bool {
+    constexpr uint16_t OWNER = 0x7ffe;
+    constexpr uint32_t RESOURCE = 0xffffffe1;
+    constexpr uint64_t GENERATION = 0xffffffe2;
+    ResourceIncarnationToken const INCARNATION{.owner_boot_epoch = 17, .resource_incarnation = 23};
+    auto state = std::make_unique<ProxyBlockState>();
+    if (!state) {
+        return false;
+    }
+    auto& bdev = state->bdev;
+    std::snprintf(bdev.name.data(), bdev.name.size(), "ktest-selected-wki-provider");
+    state->owner_node = OWNER;
+    state->resource_id = RESOURCE;
+    state->resource_generation = GENERATION;
+    state->binding_incarnation = INCARNATION;
+    state->ever_published = true;
+    set_proxy_block_active(state.get(), true);
+    if (ker::dev::block_device_register(&bdev) != 0) {
+        return false;
+    }
+    bool registered = true;
+    // Only this synchronous test can retain the synthetic provider. Production
+    // published proxy storage remains permanent; no g_proxies entry is erased.
+    s_proxy_lock.lock();
+    g_routable_proxies.push_back(state.get());
+    s_proxy_lock.unlock();
+    struct Cleanup {
+        ProxyBlockState* state;
+        bool& registered;
+        ~Cleanup() {
+            s_proxy_lock.lock();
+            unindex_proxy_locked(state);
+            s_proxy_lock.unlock();
+            if (registered) {
+                static_cast<void>(ker::dev::block_device_unregister(&state->bdev));
+            }
+        }
+    } cleanup{state.get(), registered};
+    auto match = [&](uint16_t owner, uint32_t resource, uint64_t generation, const ResourceIncarnationToken& incarnation) {
+        return wki_dev_proxy_block_matches_observation(&bdev, owner, resource, generation, incarnation);
+    };
+    auto exact = [&] { return match(OWNER, RESOURCE, GENERATION, INCARNATION); };
+    auto update = [&](auto change) {
+        s_proxy_lock.lock();
+        state->lock.lock();
+        change();
+        state->lock.unlock();
+        s_proxy_lock.unlock();
+    };
+    if (!exact() || match(OWNER + 1, RESOURCE, GENERATION, INCARNATION) || match(OWNER, RESOURCE + 1, GENERATION, INCARNATION) ||
+        match(OWNER, RESOURCE, GENERATION + 1, INCARNATION) || match(OWNER, RESOURCE, 0, INCARNATION) ||
+        match(OWNER, RESOURCE, GENERATION, {.owner_boot_epoch = 18, .resource_incarnation = 23}) ||
+        match(OWNER, RESOURCE, GENERATION, {.owner_boot_epoch = 17, .resource_incarnation = 24}))
+        return false;
+    for (bool* flag : {&state->epoch_reset_pending, &state->cleanup_in_progress, &state->resume_pending, &state->resume_in_progress,
+                       &state->detach_pending}) {
+        update([&] { *flag = true; });
+        bool const REJECTED = !exact();
+        update([&] { *flag = false; });
+        if (!REJECTED) {
+            return false;
+        }
+    }
+    update([&] { state->ever_published = false; });
+    if (exact()) {
+        return false;
+    }
+    update([&] { state->ever_published = true; });
+    set_proxy_block_fenced(state.get(), true);
+    if (exact()) {
+        return false;
+    }
+    set_proxy_block_fenced(state.get(), false);
+    set_proxy_block_active(state.get(), false);
+    if (exact()) {
+        return false;
+    }
+    set_proxy_block_active(state.get(), true);
+    update([&] { state->binding_incarnation = {}; });
+    if (exact() || !match(OWNER, RESOURCE, GENERATION, {})) {
+        return false;
+    }
+    update([&] { state->binding_incarnation = INCARNATION; });
+    if (!exact()) {
+        return false;
+    }
+    if (ker::dev::block_device_unregister(&bdev) != 0) {
+        return false;
+    }
+    registered = false;
+    if (exact()) {
+        return false;
+    }
+    ker::dev::BlockDevice local{};
+    return !wki_dev_proxy_block_matches_observation(&local, OWNER, RESOURCE, GENERATION, INCARNATION) &&
+           !wki_dev_proxy_block_matches_observation(nullptr, OWNER, RESOURCE, GENERATION, INCARNATION);
+}
+
+auto wki_dev_proxy_selftest_zone_retention() -> bool {
+    return wki_zone_selftest_with_local_backing(blk_ring_default_zone_size(), [](WkiZoneRef& ref) -> bool {
+        ProxyBlockState state{};
+        // Cleanup must use the retained allocation, not this unrelated numeric ID.
+        state.rdma_zone_id = 77;
+        if (!install_proxy_zone(&state, ref)) return false;
+        auto* ring = blk_ring_header(state.rdma_zone_ptr);
+        ring->sq_depth = BLK_RING_DEFAULT_SQ_DEPTH;
+        ring->cq_depth = BLK_RING_DEFAULT_CQ_DEPTH;
+        ring->data_slot_count = BLK_RING_DEFAULT_DATA_SLOTS;
+        ring->data_slot_size = BLK_RING_DEFAULT_DATA_SLOT_SIZE;
+        ring->block_size = 512;
+        ring->total_blocks = 8192;
+        ring->server_ready = 1;
+        state.bdev.block_size = 512;
+        state.bdev.total_blocks = 8192;
+        state.rdma_attached = true;
+        state.active.store(true, std::memory_order_release);
+        bool admitted = false;
+        {
+            BlockIoLease lease;
+            admitted = lease.acquire(&state);
+        }
+        bool valid = admitted && proxy_ring_snapshot_valid(&state) && refresh_proxy_zone_key(&state) && state.rdma_remote_rkey == 123;
+        valid = state.rdma_zone_ref.destroy() == WKI_OK && valid;
+        {
+            BlockIoLease lease;
+            valid = !lease.acquire(&state) && valid;
+        }
+        valid = valid && !proxy_ring_snapshot_valid(&state) && !refresh_proxy_zone_key(&state) && state.rdma_remote_rkey == 123 &&
+                ring->sq_head == 0 && state.tag_bitmap == 0 && state.data_slot_bitmap == 0;
+        retire_proxy_zone(&state);
+        return valid && !state.rdma_zone_ref && state.rdma_zone_ptr == nullptr && state.rdma_zone_id == 0 && state.rdma_zone_size == 0 &&
+               !state.rdma_attached && state.rdma_remote_rkey == 0;
+    });
+}
+
 auto wki_dev_proxy_selftest_rdma_sq_wait_stops_on_fence() -> bool {
-    ProxyBlockState state = {};
-    BlkRingHeader ring = {};
-    ring.sq_depth = BLK_RING_DEFAULT_SQ_DEPTH;
-    ring.cq_depth = BLK_RING_DEFAULT_CQ_DEPTH;
-    ring.data_slot_count = BLK_RING_DEFAULT_DATA_SLOTS;
-    ring.data_slot_size = BLK_RING_DEFAULT_DATA_SLOT_SIZE;
-    ring.block_size = 512;
-    ring.total_blocks = 8192;
-    ring.server_ready = 1;
-    state.bdev.block_size = ring.block_size;
-    state.bdev.total_blocks = ring.total_blocks;
-    state.rdma_zone_ptr = &ring;
-    state.rdma_zone_size = blk_ring_default_zone_size();
+    return wki_zone_selftest_with_local_backing(blk_ring_default_zone_size(), [](WkiZoneRef& zone_ref) -> bool {
+        ProxyBlockState state = {};
+        state.rdma_zone_ref = std::move(zone_ref);
+        auto& ring = *blk_ring_header(state.rdma_zone_ref.memory().data);
+        ring.sq_depth = BLK_RING_DEFAULT_SQ_DEPTH;
+        ring.cq_depth = BLK_RING_DEFAULT_CQ_DEPTH;
+        ring.data_slot_count = BLK_RING_DEFAULT_DATA_SLOTS;
+        ring.data_slot_size = BLK_RING_DEFAULT_DATA_SLOT_SIZE;
+        ring.block_size = 512;
+        ring.total_blocks = 8192;
+        ring.server_ready = 1;
+        state.bdev.block_size = ring.block_size;
+        state.bdev.total_blocks = ring.total_blocks;
+        state.rdma_zone_ptr = &ring;
+        state.rdma_zone_size = blk_ring_default_zone_size();
 
-    ring.sq_head = BLK_RING_DEFAULT_SQ_DEPTH - 1;
-    ring.sq_tail = 0;
-    state.active.store(true, std::memory_order_release);
-    state.fenced.store(true, std::memory_order_release);
-    WkiChannelIdentity const NO_CHANNEL = {};
-    bool const FENCED_FULL_RING_STOPS =
-        !wait_for_rdma_sq_space(&state, NO_CHANNEL, wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US));
+        ring.sq_head = BLK_RING_DEFAULT_SQ_DEPTH - 1;
+        ring.sq_tail = 0;
+        state.active.store(true, std::memory_order_release);
+        state.fenced.store(true, std::memory_order_release);
+        WkiChannelIdentity const NO_CHANNEL = {};
+        bool const FENCED_FULL_RING_STOPS =
+            !wait_for_rdma_sq_space(&state, NO_CHANNEL, wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US));
 
-    state.fenced.store(false, std::memory_order_release);
-    state.active.store(false, std::memory_order_release);
-    bool const INACTIVE_FULL_RING_STOPS =
-        !wait_for_rdma_sq_space(&state, NO_CHANNEL, wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US));
+        state.fenced.store(false, std::memory_order_release);
+        state.active.store(false, std::memory_order_release);
+        bool const INACTIVE_FULL_RING_STOPS =
+            !wait_for_rdma_sq_space(&state, NO_CHANNEL, wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US));
 
-    ring.sq_head = 0;
-    ring.sq_tail = 0;
-    state.active.store(true, std::memory_order_release);
-    bool const AVAILABLE_RING_PROCEEDS =
-        wait_for_rdma_sq_space(&state, NO_CHANNEL, wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US));
+        ring.sq_head = 0;
+        ring.sq_tail = 0;
+        state.active.store(true, std::memory_order_release);
+        bool const AVAILABLE_RING_PROCEEDS =
+            wait_for_rdma_sq_space(&state, NO_CHANNEL, wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US));
 
-    ring.sq_depth = 0;
-    bool const CORRUPT_RING_STOPS =
-        !wait_for_rdma_sq_space(&state, NO_CHANNEL, wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US));
+        ring.sq_depth = 0;
+        bool const CORRUPT_RING_STOPS =
+            !wait_for_rdma_sq_space(&state, NO_CHANNEL, wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US));
 
-    ring.sq_depth = BLK_RING_DEFAULT_SQ_DEPTH;
-    state.rdma_zone_size = BLK_RING_HEADER_SIZE;
-    bool const UNDERSIZED_ZONE_STOPS =
-        !wait_for_rdma_sq_space(&state, NO_CHANNEL, wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US));
+        ring.sq_depth = BLK_RING_DEFAULT_SQ_DEPTH;
+        state.rdma_zone_size = BLK_RING_HEADER_SIZE;
+        bool const UNDERSIZED_ZONE_STOPS =
+            !wait_for_rdma_sq_space(&state, NO_CHANNEL, wki_future_deadline_us(wki_now_us(), WKI_DEV_PROXY_TIMEOUT_US));
 
-    return FENCED_FULL_RING_STOPS && INACTIVE_FULL_RING_STOPS && AVAILABLE_RING_PROCEEDS && CORRUPT_RING_STOPS && UNDERSIZED_ZONE_STOPS;
+        return FENCED_FULL_RING_STOPS && INACTIVE_FULL_RING_STOPS && AVAILABLE_RING_PROCEEDS && CORRUPT_RING_STOPS && UNDERSIZED_ZONE_STOPS;
+    });
 }
 
 auto wki_dev_proxy_selftest_batch_validation_is_atomic() -> bool {
-    ProxyBlockState state = {};
-    BlkRingHeader ring = {};
-    ring.sq_depth = BLK_RING_DEFAULT_SQ_DEPTH;
-    ring.cq_depth = BLK_RING_DEFAULT_CQ_DEPTH;
-    ring.data_slot_count = BLK_RING_DEFAULT_DATA_SLOTS;
-    ring.data_slot_size = BLK_RING_DEFAULT_DATA_SLOT_SIZE;
-    ring.block_size = 512;
-    ring.total_blocks = 8192;
-    ring.server_ready = 1;
-    state.bdev.block_size = ring.block_size;
-    state.bdev.total_blocks = ring.total_blocks;
-    state.rdma_zone_ptr = &ring;
-    state.rdma_zone_size = blk_ring_default_zone_size();
-    state.active.store(true, std::memory_order_release);
+    return wki_zone_selftest_with_local_backing(blk_ring_default_zone_size(), [](WkiZoneRef& zone_ref) -> bool {
+        ProxyBlockState state = {};
+        state.rdma_zone_ref = std::move(zone_ref);
+        auto& ring = *blk_ring_header(state.rdma_zone_ref.memory().data);
+        ring.sq_depth = BLK_RING_DEFAULT_SQ_DEPTH;
+        ring.cq_depth = BLK_RING_DEFAULT_CQ_DEPTH;
+        ring.data_slot_count = BLK_RING_DEFAULT_DATA_SLOTS;
+        ring.data_slot_size = BLK_RING_DEFAULT_DATA_SLOT_SIZE;
+        ring.block_size = 512;
+        ring.total_blocks = 8192;
+        ring.server_ready = 1;
+        state.bdev.block_size = ring.block_size;
+        state.bdev.total_blocks = ring.total_blocks;
+        state.rdma_zone_ptr = &ring;
+        state.rdma_zone_size = blk_ring_default_zone_size();
+        state.active.store(true, std::memory_order_release);
 
-    std::array<uint8_t, 512> first_buffer = {};
-    std::array<uint8_t, 512> second_buffer = {};
-    std::array<BlockRange, 2> ranges = {
-        BlockRange{.lba = 0, .block_count = 1, .buffer = first_buffer.data()},
-        BlockRange{.lba = ring.total_blocks, .block_count = 1, .buffer = second_buffer.data()},
-    };
-    std::array<BatchEntry, WKI_DEV_PROXY_MAX_BATCH> entries = {};
+        std::array<uint8_t, 512> first_buffer = {};
+        std::array<uint8_t, 512> second_buffer = {};
+        std::array<BlockRange, 2> ranges = {
+            BlockRange{.lba = 0, .block_count = 1, .buffer = first_buffer.data()},
+            BlockRange{.lba = ring.total_blocks, .block_count = 1, .buffer = second_buffer.data()},
+        };
+        std::array<BatchEntry, WKI_DEV_PROXY_MAX_BATCH> entries = {};
 
-    int const RET = rdma_batch_submit(&state, BlkOpcode::WRITE, ranges.data(), ranges.size(), entries);
-    return RET == -EINVAL && ring.sq_head == 0 && state.data_slot_bitmap == 0 && state.tag_bitmap == 0;
+        int const RET = rdma_batch_submit(&state, BlkOpcode::WRITE, ranges.data(), ranges.size(), entries);
+        return RET == -EINVAL && ring.sq_head == 0 && state.data_slot_bitmap == 0 && state.tag_bitmap == 0;
+    });
 }
+
+#endif
 
 auto wki_dev_proxy_selftest_old_rdma_tag_cannot_match_successor() -> bool {
     ProxyBlockState state = {};

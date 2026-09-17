@@ -29,3 +29,46 @@ KTEST(WkiRemoteNetXmit, RejectsOversizeBeforeUint16Truncation) {
 KTEST(WkiRemoteNetOpCancel, PreservesSuccessorSlot) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_net_selftest_cancel_preserves_successor_op());
 }
+
+KTEST(WkiRemoteNetOpen, TransportFailuresPreserveStateAndReturnDistinctErrors) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_net_selftest_open_transport_failures());
+}
+
+KTEST(WkiRemoteNetOpen, TransportErrorMappingAndActualTimeout) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_net_selftest_open_error_mapping());
+}
+
+KTEST(WkiRemoteNetCompletion, OwnerResultsSurviveRetirementBeforeConsumption) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_net_selftest_completed_result_survives_retirement());
+}
+
+KTEST(WkiRemoteNetCompletion, DuplicateCancelAndLateConsumerPreserveOperationOwnership) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_net_selftest_completion_ownership());
+}
+
+KTEST(WkiRemoteNetIdentity, OwnerMapsCallerBeforeDriverAndPreservesDenials) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_net_selftest_open_identity_owner());
+}
+
+KTEST(WkiRemoteNetIdentity, CloseMapsCallerBeforeDriverAndPreservesDenials) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_net_selftest_close_identity_owner());
+}
+KTEST(WkiRemoteNetIdentity, CloseTransportFailuresPreserveUpStateAndDrainWaiter) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_net_selftest_close_transport_failures());
+}
+
+KTEST(WkiRemoteNetIdentity, CombinedLinkAdmitsAllDriverEffectsBeforeMutation) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_net_selftest_link_identity_owner());
+}
+
+KTEST(WkiRemoteNetState, NotificationsAndRetirementRespectControlPublication) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_net_selftest_control_state_publication());
+}
+
+KTEST(WkiRemoteNetState, OwnerL3SnapshotSurvivesNotificationAndRefusesRetirement) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_net_selftest_owner_l3_snapshot());
+}
+
+KTEST(WkiRemoteNetControl, RetriesOnlyUnacceptedFramesWithinDeadlineAndLifetime) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_net_selftest_control_send_retry());
+}

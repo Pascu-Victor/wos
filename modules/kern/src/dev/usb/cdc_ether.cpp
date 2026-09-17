@@ -129,6 +129,7 @@ const net::NetDeviceOps CDC_OPS = {
     .start_xmit = cdc_start_xmit,
     .set_mac = cdc_set_mac,
     .set_queue_cpu = nullptr,
+    .check_mac = ker::net::netdev_check_fixed_mac,
 };
 
 struct BulkEndpointPair {
@@ -330,10 +331,11 @@ auto cdc_publish(UsbDevice* dev) -> int {
         log::warn("QEMU usb-net rejected SET_ETHERNET_PACKET_FILTER; continuing with its default filter");
     }
 
+    cdc->netdev.state = 1;
     if (net::netdev_register(&cdc->netdev) != 0) {
+        cdc->netdev.state = 0;
         return -ENOSPC;
     }
-    cdc->netdev.state = 1;
     cdc->state.store(CdcEtherState::LIVE, std::memory_order_release);
     wake_cdc_rx(cdc_index(*cdc));
     log::info("%s MAC=%02x:%02x:%02x:%02x:%02x:%02x ready", cdc->netdev.name.data(), cdc->netdev.mac.at(0), cdc->netdev.mac.at(1),
@@ -355,7 +357,7 @@ auto cdc_quiesce(UsbDevice* dev) -> bool {
         return true;
     }
 
-    cdc->netdev.state = 0;
+    net::netdev_mark_control_retiring(&cdc->netdev);
     if (cdc->netdev.wki_transport) {
         log::error("%s is an active WKI transport; quarantining its USB slot", cdc->netdev.name.data());
         return false;
@@ -368,7 +370,6 @@ auto cdc_quiesce(UsbDevice* dev) -> bool {
     net::wki::wki_remotable_withdraw_net(IFINDEX);
     net::wki::wki_dev_server_detach_all_for_netdev(&cdc->netdev);
     cdc->netdev.wki_rx_forward.store(nullptr, std::memory_order_release);
-    cdc->netdev.remotable = nullptr;
     static_cast<void>(net::route_del_for_dev(&cdc->netdev));
     static_cast<void>(net::netif_del_for_dev(&cdc->netdev));
     net::proto::arp_forget_device(cdc->retire_token.identity);
@@ -387,6 +388,9 @@ void cdc_detach(UsbDevice* dev) {
     if (cdc->retire_token.valid()) {
         net::netdev_unregister_wait(cdc->retire_token);
     }
+    // Retained control callers may publish their final metadata after quiesce.
+    // Keep the immutable operations table available until those users drain.
+    cdc->netdev.remotable = nullptr;
 
     log::info("%s detached", cdc->netdev.name.data());
     dev->driver_data = nullptr;

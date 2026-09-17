@@ -260,7 +260,7 @@ def require_mapping_stable_pin_contract() -> None:
 
     if "detach_pagemap_after_usercopy_quiescence()" not in exit_cpp:
         fail("process exit must detach its pagemap after quiescing usercopy")
-    if "replace_pagemap_after_usercopy_quiescence(new_pagemap)" not in exec_cpp:
+    if "replace_pagemap_after_usercopy_quiescence(image.pagemap)" not in exec_cpp:
         fail("exec must publish its new pagemap after quiescing usercopy")
     if "quiesce_usercopy_pagemap()" not in scheduler_cpp:
         fail("deferred scheduler teardown must quiesce usercopy before pagemap destruction")
@@ -309,13 +309,14 @@ def require_process_syscalls_use_usercopy(source: str) -> None:
 
     process_body = function_body(source, "process")
     for snippet in [
-        "copy_value_to_task(*task, a2, task->uid)",
-        "copy_value_to_task(*task, a3, task->euid)",
-        "copy_value_to_task(*task, a4, task->suid)",
-        "copy_value_to_task(*task, a2, task->gid)",
-        "copy_value_to_task(*task, a3, task->egid)",
-        "copy_value_to_task(*task, a4, task->sgid)",
-        "copy_to_task(*task, a2, name, LEN + 1)",
+        "copy_value_to_task(*task, a2, IDS.real)",
+        "copy_value_to_task(*task, a3, IDS.effective)",
+        "copy_value_to_task(*task, a4, IDS.saved)",
+        "copy_value_to_task(*task, a2, IDS.real)",
+        "copy_value_to_task(*task, a3, IDS.effective)",
+        "copy_value_to_task(*task, a4, IDS.saved)",
+        "auto const NAME = ker::util::hostname::snapshot()",
+        "copy_to_task(*task, a2, NAME.data(), LEN + 1)",
         "copy_from_task(*task, a2, name.data(), len)",
     ]:
         if snippet not in process_body:
@@ -371,8 +372,8 @@ def require_deferred_waiters_use_usercopy() -> None:
         if forbidden in combined:
             fail(f"waitpid output must not be copied by an asynchronous producer: {forbidden}")
 
-    ptrace_exit = function_body(PTRACE_CPP.read_text(), "consume_exit_for_tracer")
-    copy = ptrace_exit.find("fill_stop_info(tracer, target, data)")
+    ptrace_exit = function_body(PTRACE_CPP.read_text(), "publish_wait_event")
+    copy = ptrace_exit.find("copy_value_to_task(tracer, data, out)")
     commit = ptrace_exit.find("child_events::commit_claim", copy)
     release = ptrace_exit.find("child_events::release_claim(tracer, claimed)", copy)
     if min(copy, commit, release) < 0 or copy > commit or copy > release:
@@ -470,7 +471,7 @@ def require_vfs_byte_io_uses_bounded_usercopy() -> None:
 
 def require_ptrace_and_mremap_use_stable_pages() -> None:
     ptrace = PTRACE_CPP.read_text()
-    copy_memory = function_body(ptrace, "copy_task_memory")
+    copy_memory = function_body(ptrace, "copy_prepared_task_memory")
     for snippet in [
         "write_target ? pin.commit_write() : pin.still_mapped()",
         "if (!COMMITTED)",
@@ -478,11 +479,15 @@ def require_ptrace_and_mremap_use_stable_pages() -> None:
         if snippet not in copy_memory:
             fail(f"ptrace WRITE_MEM must commit HHDM writes through the stable pin: {snippet}")
 
-    write_word = function_body(ptrace, "write_task_word")
+    for name, prepared in [("copy_task_memory", "copy_prepared_task_memory"), ("write_task_word", "write_prepared_task_word")]:
+        wrapper = function_body(ptrace, name)
+        if not 0 <= wrapper.find("prepare_target_memory(") < wrapper.find(prepared + "("):
+            fail("ptrace memory must prepare faults before entering the guarded nonfaulting copy")
+    write_word = function_body(ptrace, "write_prepared_task_word")
     for snippet in [
         "usercopy::range_valid(target_addr, sizeof(word))",
-        "pin_task_user_page(target, target_addr, true, true, first_page)",
-        "pin_task_user_page(target, target_addr + FIRST_SIZE, true, true, second_page)",
+        "pin_task_user_page(target, target_addr, true, false, first_page)",
+        "pin_task_user_page(target, target_addr + FIRST_SIZE, true, false, second_page)",
         "first_page.still_mapped()",
         "second_page.still_mapped()",
         "std::memcpy(first_page.kernel_address(), bytes, FIRST_SIZE)",
@@ -492,7 +497,7 @@ def require_ptrace_and_mremap_use_stable_pages() -> None:
     ]:
         if snippet not in write_word:
             fail(f"ptrace POKEDATA must preflight and pin an entire cross-page word: {snippet}")
-    if "ret = write_task_word(*target, addr, data);" not in ptrace:
+    if "ret = write_task_word(*target, addr, data, admitted_target);" not in ptrace:
         fail("ptrace POKEDATA must use the all-pages-pinned word writer")
 
     mremap = function_body(VMEM_CPP.read_text(), "anon_mremap")

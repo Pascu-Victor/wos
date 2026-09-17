@@ -13,6 +13,7 @@
 #include <new>  // NOLINT(misc-include-cleaner): placement new declares the RunQueue selftest storage lifetime.
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/resource.hpp>
+#include <platform/security/terminal.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <platform/sys/usercopy.hpp>
 #include <platform/sys/userspace.hpp>
@@ -53,6 +54,7 @@
 #include "syscalls_impl/futex/futex.hpp"
 #include "syscalls_impl/process/child_events.hpp"
 #include "syscalls_impl/process/exit.hpp"
+#include "syscalls_impl/process/process.hpp"
 #include "syscalls_impl/vmem/sys_vmem.hpp"
 #include "util/hcf.hpp"
 
@@ -487,8 +489,6 @@ inline bool is_low_latency_handoff_wait_channel(task::WaitChannelKind wait_chann
 }
 
 inline bool is_futex_wait_channel(task::WaitChannelKind wait_channel) { return wait_channel == task::WaitChannelKind::FUTEX; }
-
-inline auto effective_process_group_id(const task::Task& task) -> uint64_t { return task.pgid != 0 ? task.pgid : task::process_pid(task); }
 
 inline void note_task_wakeup(task::Task* task, uint64_t now_us, task::WaitChannelKind wait_channel) {
     if (task->last_sleep_start_us != 0 && now_us > task->last_sleep_start_us) {
@@ -1748,6 +1748,8 @@ inline auto pick_best_daemon_eligible_for_switch_locked(RunQueue* rq, int64_t av
     return best_eligible != nullptr ? best_eligible : best_any;
 }
 
+inline auto park_job_control_stopped_task_locked(RunQueue* rq, task::Task* task) -> bool;
+
 inline auto pick_best_eligible_for_switch_locked(RunQueue* rq, int64_t avg_vruntime, task::Task const* current_task) -> task::Task* {
     if (rq == nullptr || rq->runnable_heap.size == 0) {
         return nullptr;
@@ -1760,6 +1762,9 @@ inline auto pick_best_eligible_for_switch_locked(RunQueue* rq, int64_t avg_vrunt
             if (alternate != nullptr) {
                 next = alternate;
             }
+        }
+        if (park_job_control_stopped_task_locked(rq, next)) {
+            continue;
         }
         if (is_publishable_runnable_task(next) && !next->has_exited) {
             return next;
@@ -1783,6 +1788,9 @@ inline auto pick_exit_switch_candidate_locked(RunQueue* rq, task::Task* exiting_
     while (rq->runnable_heap.size != 0) {
         int64_t const AVG = compute_avg_vruntime(rq);
         auto* candidate = rq->runnable_heap.pick_best_eligible(AVG);
+        if (park_job_control_stopped_task_locked(rq, candidate)) {
+            continue;
+        }
         if (valid_exit_switch_candidate(candidate, exiting_task)) {
             return candidate;
         }
@@ -1913,6 +1921,27 @@ inline void transition_make_waiting_locked(RunQueue* rq, task::Task* t, Transiti
     t->sched_queue = task::Task::sched_queue::WAITING;
     transition_attach_wait_locked(rq, t);
     validate_transition_boundary_locked(rq, phase, t);
+}
+
+// A readiness wake may requeue a stopped task. Selection must retire that
+// runnable membership again; wake tokens alone cannot grant user execution.
+inline auto runqueue_task_is_reserved_locked(RunQueue* rq, task::Task const* task) -> bool;
+inline auto park_job_control_stopped_task_locked(RunQueue* rq, task::Task* task) -> bool {
+    if (task == nullptr || task->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE ||
+        !task->jobctl_stopped.load(std::memory_order_acquire)) {
+        return false;
+    }
+    static_cast<void>(transition_detach_runnable_locked(rq, task));
+    transition_detach_all_wait_locked(rq, task);
+    task->wants_block = false;
+    task->wake_at_us = 0;
+    task->set_voluntary_blocked(true);
+    task->set_wait_channel("job_stop", task::WaitChannelKind::GENERIC);
+    transition_make_waiting_locked(rq, task);
+    if (!runqueue_task_is_reserved_locked(rq, task)) {
+        job_control::acknowledge_stopped(*task);
+    }
+    return true;
 }
 
 inline void repair_stale_wait_membership_locked(RunQueue* rq, task::Task* t) {
@@ -2141,6 +2170,11 @@ void commit_handoff_task_at_return_boundary() {
     if (task == nullptr) {
         return;
     }
+
+    if (outgoing != nullptr && outgoing != task) {
+        job_control::acknowledge_stopped(*outgoing);
+    }
+    job_control::drain();
 
     if (is_dead_gc_candidate_task(outgoing) && outgoing != task &&
         outgoing->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE &&
@@ -2947,14 +2981,22 @@ bool post_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, bool release_rese
 
     __atomic_thread_fence(__ATOMIC_RELEASE);
 
+    if (task->type == task::TaskType::PROCESS && !task->jobctl_membership.bind(*task)) {
+        log_rejected_task_publication("job-control membership failed", cpu_no, task);
+        release_reservation_if_needed();
+        return false;
+    }
+
     if (task->pid > 0) {
         if (!pid_table_insert(task)) {
+            task->jobctl_membership.rollback_publication(*task);
             log_rejected_task_publication("pid registry full", cpu_no, task);
             release_reservation_if_needed();
             return false;
         }
         if (!active_list_insert(task)) {
             pid_table_remove(task->pid);
+            task->jobctl_membership.rollback_publication(*task);
             log_rejected_task_publication("active registry full", cpu_no, task);
             release_reservation_if_needed();
             return false;
@@ -2976,9 +3018,12 @@ bool post_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, bool release_rese
             active_list_remove(task);
             pid_table_remove(task->pid);
         }
+        task->jobctl_membership.rollback_publication(*task);
         log_rejected_task_publication("runnable heap insert failed", cpu_no, task);
         return false;
     }
+
+    task->jobctl_membership.finish_publication(*task);
 
     if (cpu_no == cpu::current_cpu()) {
         request_local_reschedule();
@@ -3545,6 +3590,10 @@ auto post_task_waiting(task::Task* task) -> bool {
         task->start_time_us = time::get_us();
     }
 
+    if (task->type == task::TaskType::PROCESS && !task->jobctl_membership.bind(*task)) {
+        return false;
+    }
+
     bool published = false;
     run_queues->with_lock_void(target_cpu, [task, &published](RunQueue* rq) {
         // This API is deliberately narrower than ordinary wake/repark paths:
@@ -3579,6 +3628,11 @@ auto post_task_waiting(task::Task* task) -> bool {
         task->last_sleep_start_us = 0;
     });
 
+    if (!published) {
+        task->jobctl_membership.rollback_publication(*task);
+    } else {
+        task->jobctl_membership.finish_publication(*task);
+    }
     return published;
 }
 
@@ -3803,6 +3857,136 @@ auto move_task_owner_to_cpu(task::Task* task, uint64_t target_cpu, bool pin_to_t
 auto migrate_task_to_cpu(task::Task* task, uint64_t target_cpu) -> bool { return move_task_owner_to_cpu(task, target_cpu, false).moved; }
 
 auto pin_task_to_cpu(task::Task* task, uint64_t target_cpu) -> bool { return move_task_owner_to_cpu(task, target_cpu, true).moved; }
+
+namespace {
+struct KernelWorkerPinPlan {
+    KernelWorkerCpuPin request{};
+    uint64_t owner_cpu{};
+    RunQueue* owner{};
+    RunQueue* target{};
+    bool runnable{};
+};
+
+// All affected queues are locked. Admission is read-only, including failures
+// caused by a later request. No fallible operation remains after admission.
+auto commit_kernel_worker_pins_locked(std::span<KernelWorkerPinPlan> plans, uint64_t core_count) -> bool {
+    if (plans.size() > MAX_KERNEL_WORKER_CPU_PINS) return false;
+    for (size_t i = 0; i < plans.size(); ++i) {
+        auto& plan = plans[i];
+        auto* worker = plan.request.worker;
+        if (worker == nullptr || plan.owner == nullptr || plan.target == nullptr || plan.owner_cpu >= core_count ||
+            plan.request.cpu >= core_count || worker->cpu != plan.owner_cpu || worker->type != task::TaskType::DAEMON ||
+            worker->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE || worker->gc_queued.load(std::memory_order_acquire))
+            return false;
+        for (size_t j = 0; j < i; ++j) {
+            if (plans[j].request.worker == worker) return false;
+        }
+        bool const RESERVED = runqueue_task_is_reserved_locked(plan.owner, worker);
+        if (RESERVED && plan.owner != plan.target) return false;
+        if (!task_cross_cpu_migration_decision(worker, plan.owner_cpu, plan.request.cpu, core_count, true).can_migrate) return false;
+        plan.runnable = plan.owner->runnable_heap.contains(worker);
+        bool const WAITING = wait_list_contains_locked(plan.owner, worker);
+        if (plan.runnable && WAITING) return false;
+        if (!RESERVED && !plan.runnable && !WAITING) return false;
+        if (!plan.runnable && worker->heap_index >= 0) return false;
+    }
+    for (auto const& plan : plans) {
+        int64_t size = plan.target->runnable_heap.size;
+        for (auto const& other : plans) {
+            if (!other.runnable || other.owner == other.target) continue;
+            if (other.owner == plan.target) --size;
+            if (other.target == plan.target) ++size;
+        }
+        if (size < 0 || size > PER_CPU_HEAP_CAP) return false;
+    }
+
+    // Detach the whole batch first so a swap can use capacity freed by another
+    // admitted move, even when either target heap starts full.
+    for (auto const& plan : plans) {
+        if (plan.owner == plan.target) continue;
+        bool const DETACHED = plan.runnable ? transition_detach_runnable_locked(plan.owner, plan.request.worker)
+                                            : transition_detach_wait_locked(plan.owner, plan.request.worker);
+        if (!DETACHED) dbg::panic_handler("scheduler: admitted worker pin lost owner");
+    }
+    for (auto const& plan : plans) {
+        auto* worker = plan.request.worker;
+        worker->cpu = plan.request.cpu;
+        worker->cpu_pinned = true;
+        if (plan.owner == plan.target) continue;
+        if (!plan.runnable) {
+            transition_make_waiting_locked(plan.target, worker);
+            continue;
+        }
+        int64_t const FAIR_VRUNTIME = std::max(plan.target->min_vruntime, compute_avg_vruntime(plan.target));
+        worker->vruntime = std::max(worker->vruntime, FAIR_VRUNTIME);
+        worker->vdeadline = vdeadline_from_slice(worker->vruntime, worker->slice_ns, worker->sched_weight);
+        if (transition_make_runnable_locked(plan.target, worker) != RunnableTransitionResult::PUBLISHED) {
+            dbg::panic_handler("scheduler: admitted worker pin could not publish");
+        }
+    }
+    return true;
+}
+
+// Bounded recursion (at most sixteen locks) preserves the same ascending CPU
+// order as with_two_locks_void; nested IRQ restoration stays disabled until
+// the outermost lock is released. Queue pointers are used only at the leaf.
+auto lock_and_pin_kernel_workers(std::span<KernelWorkerPinPlan> plans, std::span<const uint64_t> cpus, uint64_t core_count) -> bool {
+    if (cpus.empty()) return commit_kernel_worker_pins_locked(plans, core_count);
+    bool committed = false;
+    run_queues->with_lock_void(cpus.front(), [&](RunQueue* rq) {
+        for (auto& plan : plans) {
+            if (plan.owner_cpu == cpus.front()) plan.owner = rq;
+            if (plan.request.cpu == cpus.front()) plan.target = rq;
+        }
+        committed = lock_and_pin_kernel_workers(plans, cpus.subspan(1), core_count);
+    });
+    return committed;
+}
+}  // namespace
+
+auto pin_kernel_workers_to_cpus(std::span<const KernelWorkerCpuPin> requests) -> bool {
+    if (requests.empty()) return true;
+    if (run_queues == nullptr || requests.size() > MAX_KERNEL_WORKER_CPU_PINS) return false;
+    uint64_t const CORE_COUNT = smt::get_core_count();
+    std::array<KernelWorkerPinPlan, MAX_KERNEL_WORKER_CPU_PINS> storage{};
+    std::array<uint64_t, 2 * MAX_KERNEL_WORKER_CPU_PINS> cpus{};
+    size_t cpu_count = 0;
+    for (size_t i = 0; i < requests.size(); ++i) {
+        auto const& request = requests[i];
+        if (request.worker == nullptr || request.cpu >= CORE_COUNT) return false;
+        uint64_t const OWNER = hinted_or_scanned_owner_cpu(request.worker);
+        if (OWNER >= CORE_COUNT) return false;
+        storage[i] = {.request = request, .owner_cpu = OWNER};
+        cpus[cpu_count++] = OWNER;
+        cpus[cpu_count++] = request.cpu;
+    }
+    // The freestanding kernel does not link libc++'s scalar sort instantiation.
+    // This bounded insertion sort handles at most sixteen CPU identifiers.
+    for (size_t i = 1; i < cpu_count; ++i) {
+        uint64_t const VALUE = cpus[i];
+        size_t pos = i;
+        while (pos != 0 && cpus[pos - 1] > VALUE) {
+            cpus[pos] = cpus[pos - 1];
+            --pos;
+        }
+        cpus[pos] = VALUE;
+    }
+    auto const END = std::unique(cpus.begin(), cpus.begin() + cpu_count);
+    auto plans = std::span(storage).first(requests.size());
+    if (!lock_and_pin_kernel_workers(plans, std::span(cpus.begin(), END), CORE_COUNT)) return false;
+    for (auto const& plan : plans) {
+        if (plan.owner_cpu != plan.request.cpu) {
+            record_migration_outcome(plan.request.worker, plan.owner_cpu, plan.request.cpu, MigrationRejectionReason::NONE);
+        }
+        if (plan.runnable) {
+            if (plan.request.cpu == cpu::current_cpu())
+                request_local_reschedule();
+            else
+                wake_cpu(plan.request.cpu);
+        }
+    }
+    return true;
+}
 
 [[clang::no_sanitize("kernel-address")]] auto can_query_current_task() -> bool {
     if (run_queues == nullptr) {
@@ -4434,7 +4618,7 @@ auto debug_stop_task(task::Task* task) -> bool {
 
     auto try_stop_on_cpu = [task, &found, &current_on_cpu, &current_cpu_of_task](uint64_t cpu_no) {
         run_queues->with_lock_void(cpu_no, [task, &found, &current_on_cpu, &current_cpu_of_task, cpu_no](RunQueue* rq) {
-            if (found || current_on_cpu) {
+            if (found || current_on_cpu || task->ptrace_termination_pending()) {
                 return;
             }
             if (runqueue_task_is_reserved_locked(rq, task)) {
@@ -4608,7 +4792,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             if (t->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE) {
                 return nullptr;
             }
-            if (t->ptrace_stopped) {
+            if (t->ptrace_stop_blocks_execution()) {
                 (void)transition_detach_runnable_locked(rq, t);
                 t->set_wait_channel("ptrace", task::WaitChannelKind::PTRACE);
                 transition_make_waiting_locked(rq, t);
@@ -4808,6 +4992,9 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
         // handoff/current-task repair path left the live task current but not
         // heap-contained, it still must be parked; otherwise it can keep
         // halting with wants_block set until an unrelated wake happens.
+        if (current_task->wait_channel_is(task::WaitChannelKind::PTRACE) && current_task->ptrace_termination_pending()) {
+            current_task->wants_block = false;
+        }
         if (current_task->wants_block) {
             current_task->wants_block = false;
             current_task->last_run_us = current_task->slice_used_ns / 1000U;
@@ -4825,7 +5012,11 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             blocked_current_task = true;
         }
 
-        if (current_task->ptrace_stopped && rq->runnable_heap.contains(current_task)) {
+        if (park_job_control_stopped_task_locked(rq, current_task)) {
+            blocked_current_task = true;
+        }
+
+        if (current_task->ptrace_stop_blocks_execution() && rq->runnable_heap.contains(current_task)) {
             current_task->last_run_us = current_task->slice_used_ns / 1000U;
             note_perf_wait_callsite(current_task, current_task->context.frame.rip);
             current_task->last_sleep_start_us = NOW_US;
@@ -4857,7 +5048,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
         if (next == nullptr || next == current_task) {
             return nullptr;
         }
-        if (next->ptrace_stopped) {
+        if (next->ptrace_stop_blocks_execution()) {
             (void)transition_detach_runnable_locked(rq, next);
             next->set_wait_channel("ptrace", task::WaitChannelKind::PTRACE);
             transition_make_waiting_locked(rq, next);
@@ -5175,7 +5366,7 @@ void start_scheduler() {
             return nullptr;
         }
         int64_t const AVG = compute_avg_vruntime(rq);
-        auto* t = rq->runnable_heap.pick_best_eligible(AVG);
+        auto* t = pick_best_eligible_for_switch_locked(rq, AVG, nullptr);
         if (t != nullptr && t->type != task::TaskType::IDLE && (t->type == task::TaskType::DAEMON || t->thread != nullptr)) {
             t->cpu = cpu::current_cpu();
             transition_publish_current_locked(rq, t);
@@ -5204,7 +5395,7 @@ void start_scheduler() {
 
                 // Scan heap for a non-idle, ready task
                 int64_t const AVG = compute_avg_vruntime(rq);
-                task::Task* candidate = rq->runnable_heap.pick_best_eligible(AVG);
+                task::Task* candidate = pick_best_eligible_for_switch_locked(rq, AVG, nullptr);
                 if (candidate == nullptr) {
                     return nullptr;
                 }
@@ -5537,7 +5728,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
                 rq->total_weighted_vruntime -= DELTA_MIN * rq->total_weight;
             }
 
-            task::Task* next = rq->runnable_heap.pick_best_eligible(AVG);
+            task::Task* next = pick_best_eligible_for_switch_locked(rq, AVG, nullptr);
             if (next == nullptr || next->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE ||
                 (next->type == task::TaskType::PROCESS && (next->thread == nullptr || next->pagemap == nullptr)) ||
                 next->type == task::TaskType::IDLE) {
@@ -5699,7 +5890,7 @@ auto place_task_in_wait_queue_if_pending(ker::mod::cpu::GPRegs& gpr, ker::mod::g
             return nullptr;
         }
         int64_t const AVG = compute_avg_vruntime(rq);
-        task::Task* next = rq->runnable_heap.pick_best_eligible(AVG);
+        task::Task* next = pick_best_eligible_for_switch_locked(rq, AVG, nullptr);
         reserve_handoff_task_locked(rq, next, NOW_US);
         return next;
     });
@@ -5741,7 +5932,7 @@ auto place_task_in_wait_queue_if_pending(ker::mod::cpu::GPRegs& gpr, ker::mod::g
     return ExceptionWaitResult::PARKED;
 }
 
-void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& frame) {
+void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& frame, void (*on_parked)(task::Task&)) {
     auto* current_task = get_current_task();
     if (current_task == nullptr) {
         return;
@@ -5772,14 +5963,16 @@ void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::Inter
             return nullptr;
         }
         int64_t const AVG = compute_avg_vruntime(rq);
-        task::Task* next = rq->runnable_heap.pick_best_eligible(AVG);
+        task::Task* next = pick_best_eligible_for_switch_locked(rq, AVG, nullptr);
         reserve_handoff_task_locked(rq, next, NOW_US);
         return next;
     });
 #ifdef SCHED_DEBUG
     dbg::log("placeTaskInWaitQueue: Moved PID %x to wait queue", current_task->pid);
 #endif
+    on_parked(*current_task);
     if (next_task != nullptr && next_task->type != task::TaskType::IDLE) {
+        bool const FIRST_RUN_DAEMON = next_task->type == task::TaskType::DAEMON && !next_task->has_run;
         prepare_first_run_daemon(next_task, "waitqueue-switch");
         if (!sys::context_switch::switch_to(gpr, frame, next_task)) {
             dbg::log("placeTaskInWaitQueue: switchTo failed, entering idle");
@@ -5789,6 +5982,15 @@ void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::Inter
         } else {
             record_local_proc_first_run(next_task, WOS_PERF_CALLSITE());
             next_task->has_run = true;
+            // A debug exception has the same stack-restoration requirements
+            // as the conditional exception wait above. The generic IDT
+            // epilogue cannot resume a kernel task on its saved stack.
+            if (FIRST_RUN_DAEMON) {
+                wos_start_kernel_thread(next_task->context.frame.rsp, next_task->kthread_entry);
+                __builtin_unreachable();
+            }
+            wos_deferred_task_switch_return(&gpr, &frame);
+            __builtin_unreachable();
         }
     } else {
         // Only idle or no tasks - enter idle on the per-CPU idle task stack.
@@ -6199,7 +6401,8 @@ __attribute__((no_sanitize("address"))) auto find_task_by_pid_safe(uint64_t pid)
     return pid_table_find_internal(pid, true);
 }
 
-auto task_has_live_pagemap_sibling(task::Task* subject) -> bool {
+namespace {
+auto task_has_registered_pagemap_sibling(task::Task* subject) -> bool {
     if (subject == nullptr || subject->pagemap == nullptr) {
         return false;
     }
@@ -6216,6 +6419,14 @@ auto task_has_live_pagemap_sibling(task::Task* subject) -> bool {
     }
     global_task_registry_lock.unlock_irqrestore(FLAGS);
 
+    return false;
+}
+}  // namespace
+
+auto task_has_live_pagemap_sibling(task::Task* subject) -> bool {
+    if (subject == nullptr || subject->pagemap == nullptr) return false;
+    if (task_has_registered_pagemap_sibling(subject)) return true;
+    auto* const PAGEMAP = subject->pagemap;
     if (run_queues == nullptr) {
         return false;
     }
@@ -6508,80 +6719,65 @@ void wake_task_for_signal(task::Task* task) {
     }
 }
 
-auto signal_process_group(uint64_t pgid, int sig) -> size_t {
-    if (pgid == 0 || sig < 0 || std::cmp_greater(sig, task::Task::MAX_SIGNALS)) {
+void revoke_terminal_attachment(security::TerminalIdentity terminal, uint64_t session_id, uint64_t generation, uint64_t foreground,
+                                session::Origin foreground_origin) {
+    struct Revocation {
+        security::TerminalIdentity terminal{};
+        uint64_t session = 0;
+        uint64_t generation = 0;
+    } context{.terminal = terminal, .session = session_id, .generation = generation};
+    auto matches = [](task::Task* candidate, void* opaque) -> bool {
+        auto const& request = *static_cast<Revocation*>(opaque);
+        if (candidate->type != task::TaskType::PROCESS || candidate->is_thread) {
+            return false;
+        }
+        auto const JOB = candidate->job_identity();
+        return JOB.session_id == request.session &&
+               security::may_receive_terminal_signal(request.terminal, request.generation, JOB.terminal, JOB.terminal_generation);
+    };
+    // Clearing the selected binding removes it from the predicate. Restarting
+    // selection tolerates concurrent registry compaction without a task array.
+    for (;;) {
+        auto* target = find_active_task_lifetime_ref_if(matches, &context);
+        if (target == nullptr) {
+            break;
+        }
+        auto const JOB = target->job_identity();
+        bool const CLEARED = target->clear_controlling_terminal_if(terminal, generation);
+        bool const ALIVE =
+            target->state.load(std::memory_order_acquire) == task::TaskState::ACTIVE && !target->has_exited && !target->exit_in_progress;
+        if (CLEARED && ALIVE &&
+            session::terminal_foreground_matches(JOB, terminal, session_id, generation, foreground, foreground_origin)) {
+            for (int const SIGNAL : {1, 18}) {
+                static_cast<void>(ker::syscall::process::signal_terminal_source_as(*target, JOB, SIGNAL, true));
+            }
+        }
+        target->release();
+    }
+}
+
+auto signal_terminal_process_group(security::TerminalIdentity terminal, uint64_t session_id, uint64_t generation, uint64_t pgid,
+                                   session::Origin group_origin, int sig) -> size_t {
+    if (terminal.value == 0 || session_id == 0 || generation == 0 || pgid == 0 || sig < 0 ||
+        std::cmp_greater(sig, task::Task::MAX_SIGNALS)) {
         return 0;
     }
-    uint64_t const MASK = sig > 0 ? (1ULL << (sig - 1)) : 0;
     size_t matched = 0;
     uint32_t const COUNT = get_active_task_count();
     for (uint32_t i = 0; i < COUNT; i++) {
         auto* t = get_active_task_at_safe(i);
         if (t != nullptr) {
+            auto const JOB = t->job_identity();
             bool const ALIVE = t->state.load(std::memory_order_acquire) == task::TaskState::ACTIVE && !t->has_exited;
-            if (effective_process_group_id(*t) == pgid && ALIVE) {
+            if (session::terminal_foreground_matches(JOB, terminal, session_id, generation, pgid, group_origin) && ALIVE &&
+                t->type == task::TaskType::PROCESS && (!t->is_thread || (sig < 18 || sig > 22))) {
                 ++matched;
                 if (sig != 0) {
-                    bool const FORWARDED = ker::net::wki::wki_proxy_task_forward_signal(t, sig);
-                    if (!FORWARDED) {
-                        t->signal_add_pending_mask(MASK);
-                        wake_task_for_signal(t);
-                    }
+                    static_cast<void>(ker::syscall::process::signal_terminal_source_as(*t, JOB, sig, false));
                 }
             }
             t->release();
         }
-    }
-    return matched;
-}
-
-auto signal_controlling_tty(int controlling_tty, int sig) -> size_t {
-    if (controlling_tty < 0 || sig < 0 || std::cmp_greater(sig, task::Task::MAX_SIGNALS)) {
-        return 0;
-    }
-    uint64_t const MASK = sig > 0 ? (1ULL << (sig - 1)) : 0;
-    size_t matched = 0;
-    uint32_t const COUNT = get_active_task_count();
-    for (uint32_t i = 0; i < COUNT; i++) {
-        auto* t = get_active_task_at_safe(i);
-        if (t == nullptr) {
-            continue;
-        }
-        bool const ALIVE = t->state.load(std::memory_order_acquire) == task::TaskState::ACTIVE && !t->has_exited;
-        if (ALIVE && t->type == task::TaskType::PROCESS && t->controlling_tty == controlling_tty) {
-            ++matched;
-            if (sig != 0) {
-                bool const FORWARDED = ker::net::wki::wki_proxy_task_forward_signal(t, sig);
-                if (!FORWARDED) {
-                    t->signal_add_pending_mask(MASK);
-                    wake_task_for_signal(t);
-                }
-            }
-        }
-        t->release();
-    }
-    return matched;
-}
-
-auto signal_controlling_tty_wki_proxies(int controlling_tty, int sig) -> size_t {
-    if (controlling_tty < 0 || sig < 0 || std::cmp_greater(sig, task::Task::MAX_SIGNALS)) {
-        return 0;
-    }
-
-    size_t matched = 0;
-    uint32_t const COUNT = get_active_task_count();
-    for (uint32_t i = 0; i < COUNT; i++) {
-        auto* t = get_active_task_at_safe(i);
-        if (t == nullptr) {
-            continue;
-        }
-        bool const ALIVE = t->state.load(std::memory_order_acquire) == task::TaskState::ACTIVE && !t->has_exited;
-        if (ALIVE && t->type == task::TaskType::PROCESS && t->controlling_tty == controlling_tty && t->wki_proxy_task_id != 0) {
-            if (sig == 0 || ker::net::wki::wki_proxy_task_forward_signal(t, sig)) {
-                ++matched;
-            }
-        }
-        t->release();
     }
     return matched;
 }
@@ -6604,7 +6800,7 @@ auto signal_visible_processes_except(uint64_t excluded_pid, uint64_t excluded_ow
         if (ALIVE && t->type == task::TaskType::PROCESS && task::process_visible(*t) && !EXCLUDED) {
             ++matched;
             if (sig != 0) {
-                t->signal_add_pending_mask(MASK);
+                t->signal_generate_pending_mask(MASK);
                 wake_task_for_signal(t);
             }
         }
@@ -6846,16 +7042,11 @@ auto gc_task_has_pagemap_sibling_locked(task::Task* cur) -> bool {
         return false;
     }
 
-    uint32_t const ACTIVE_COUNT = get_active_task_count();
-    for (uint32_t ai = 0; ai < ACTIVE_COUNT; ai++) {
-        auto* other = get_active_task_at_safe(ai);
-        if (other != nullptr) {
-            if (other != cur && other->pagemap == cur->pagemap && other->state.load(std::memory_order_acquire) != task::TaskState::DEAD) {
-                other->release();
-                return true;
-            }
-            other->release();
-        }
+    // EXITING and DEAD tasks can still publish a root until their cleanup
+    // detaches it. An execution-eligible reference lookup would hide them and
+    // let GC race the exiting owner's synchronous address-space teardown.
+    if (task_has_registered_pagemap_sibling(cur)) {
+        return true;
     }
 
     // This mirrors the existing conservative shared-pagemap check: a sibling
@@ -7187,11 +7378,13 @@ void cleanup_waitable_zombie_resources(GcDetachedTask const& detached, GcTaskTim
     uint64_t const CLEANUP_START_US = time::get_us();
     if (cur->pagemap != nullptr) {
         uint64_t const START_US = time::get_us();
+        // Retaining zombie status must not retain a non-owning publication
+        // after another task has become responsible for this shared root.
+        auto* pagemap = cur->detach_pagemap_after_usercopy_quiescence();
         if (detached.should_free_pagemap) {
-            auto* pagemap = cur->detach_pagemap_after_usercopy_quiescence();
             ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(pagemap);
             mm::virt::destroy_user_space(pagemap, cur->pid, cur->name, "task-zombie-gc");
-            mm::virt::release_pagemap(pagemap);
+            mm::virt::release_pagemap(pagemap, cur->pid);
         }
         timing.pagemap_us = elapsed_us_since(START_US, time::get_us());
     }
@@ -7258,7 +7451,7 @@ auto process_deferred_gc_cleanup_slice(GcTaskTiming& timing, uint32_t pagemap_st
 
         mm::virt::destroy_user_space_budget_state_destroy(item->pagemap_state);
         item->pagemap_state = nullptr;
-        mm::virt::release_pagemap(cur->pagemap);
+        mm::virt::release_pagemap(cur->pagemap, cur->pid);
         cur->pagemap = nullptr;
         timing.pagemap_us = elapsed_us_since(START_US, time::get_us());
     } else {
@@ -7296,7 +7489,7 @@ void cleanup_detached_gc_task(GcDetachedTask const& detached, GcTaskTiming& timi
         if (detached.should_free_pagemap) {
             ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(pagemap);
             mm::virt::destroy_user_space(pagemap, cur->pid, cur->name, "task-exit-gc");
-            mm::virt::release_pagemap(pagemap);
+            mm::virt::release_pagemap(pagemap, cur->pid);
         }
         timing.pagemap_us = elapsed_us_since(START_US, time::get_us());
     }
@@ -8559,6 +8752,42 @@ task::Task scheduler_transition_validator_selftest_waiting;                     
 #endif
 }  // namespace
 
+namespace {
+task::Task gc_publisher_selftest_subject;          // NOLINT
+task::Task gc_publisher_selftest_publisher;        // NOLINT
+mm::paging::PageTable gc_publisher_selftest_root;  // NOLINT
+}  // namespace
+
+auto scheduler_selftest_gc_counts_exiting_pagemap_publishers() -> bool {
+    auto& subject = gc_publisher_selftest_subject;
+    auto& publisher = gc_publisher_selftest_publisher;
+    subject.pagemap = &gc_publisher_selftest_root;
+    subject.shares_user_pagemap.store(true, std::memory_order_release);
+    publisher.pagemap = subject.pagemap;
+    publisher.type = task::TaskType::DAEMON;
+    publisher.state.store(task::TaskState::EXITING, std::memory_order_release);
+    if (!active_list_insert(&publisher)) {
+        subject.pagemap = nullptr;
+        publisher.pagemap = nullptr;
+        return false;
+    }
+    bool const EXITING_VISIBLE = gc_task_has_pagemap_sibling_locked(&subject);
+    publisher.state.store(task::TaskState::DEAD, std::memory_order_release);
+    bool const DEAD_VISIBLE = gc_task_has_pagemap_sibling_locked(&subject);
+    publisher.state.store(task::TaskState::ACTIVE, std::memory_order_release);
+    bool const ACTIVE_VISIBLE = gc_task_has_pagemap_sibling_locked(&subject);
+    publisher.state.store(task::TaskState::DEAD, std::memory_order_release);
+    GcTaskTiming timing{};
+    cleanup_waitable_zombie_resources({.task = &publisher, .should_free_pagemap = false, .zombie_resources_only = true}, timing);
+    bool const DETACHED = publisher.pagemap == nullptr && publisher.usercopy_pagemap_closing.load(std::memory_order_acquire) &&
+                          publisher.zombie_resources_reclaimed.load(std::memory_order_acquire);
+    bool const NO_PUBLISHER = !gc_task_has_pagemap_sibling_locked(&subject);
+    active_list_remove(&publisher);
+    subject.pagemap = nullptr;
+    publisher.pagemap = nullptr;
+    return EXITING_VISIBLE && DEAD_VISIBLE && ACTIVE_VISIBLE && DETACHED && NO_PUBLISHER;
+}
+
 auto scheduler_selftest_transition_validator_detects_corruption() -> bool {
 #ifdef WOS_SCHED_TRANSITION_VALIDATION
     if (scheduler_transition_validator_selftest_rq == nullptr) {
@@ -9148,6 +9377,127 @@ auto scheduler_selftest_lazy_executable_resume_range_policy() -> bool {
     return START_ACCEPTED && INTERIOR_ACCEPTED && END_REJECTED && BELOW_REJECTED && NON_EXEC_REJECTED && ANONYMOUS_REJECTED &&
            RELEASED_FILE_REJECTED;
 }
+
+namespace {
+void init_pin_test_worker(task::Task& worker, uint64_t cpu_no) {
+    worker.type = task::TaskType::DAEMON;
+    worker.state.store(task::TaskState::ACTIVE, std::memory_order_relaxed);
+    worker.cpu = cpu_no;
+    worker.heap_index = -1;
+    worker.sched_weight = 1024;
+    worker.slice_ns = 10'000'000;
+    worker.vruntime = 1;
+    worker.vdeadline = 2;
+    worker.context.syscall_kernel_stack = 0xffff800000100000ULL;
+    worker.context.syscall_scratch_area = 0xffff800000200000ULL;
+    worker.context.frame.cs = desc::gdt::GDT_KERN_CS;
+    worker.context.frame.ss = desc::gdt::GDT_KERN_DS;
+    worker.context.frame.rip = reinterpret_cast<uint64_t>(&init_pin_test_worker);
+    worker.context.frame.rsp = worker.context.syscall_kernel_stack - 128;
+    worker.context.frame.flags = 0x202;
+    sys::context_switch::record_saved_frame_class(&worker, worker.context.frame, task::SavedFrameOrigin::DAEMON_START);
+}
+}  // namespace
+
+auto scheduler_selftest_worker_pin_refusals() -> bool {
+    bool ok = true;
+    for (unsigned scenario = 0; scenario < 12; ++scenario) {
+        auto* source = new RunQueue{};
+        auto* target = new RunQueue{};
+        auto* first = new task::Task{};
+        auto* later = new task::Task{};
+        init_pin_test_worker(*first, 0);
+        init_pin_test_worker(*later, 0);
+        ok = (transition_make_runnable_locked(source, first) == RunnableTransitionResult::PUBLISHED) && ok;
+        transition_make_waiting_locked(source, later);
+        std::array<KernelWorkerPinPlan, 2> plans{{
+            {.request = {first, 1}, .owner_cpu = 0, .owner = source, .target = target},
+            {.request = {later, 1}, .owner_cpu = 0, .owner = source, .target = target},
+        }};
+        switch (scenario) {
+            case 0:
+                source->current_task = later;
+                break;
+            case 1:
+                source->handoff_task = later;
+                break;
+            case 2:
+                later->preempt_disable_depth = 1;
+                break;
+            case 3:
+                later->migration_guard_state.store(encode_migration_guard_state({.depth = 1, .owner_cpu = 0}), std::memory_order_relaxed);
+                break;
+            case 4:
+                plans[1].request.worker = first;
+                break;
+            case 5:
+                plans[1].request.worker = nullptr;
+                break;
+            case 6:
+                plans[1].request.cpu = 2;
+                break;
+            case 7:
+                later->cpu = 1;
+                break;
+            case 8:
+                later->gc_queued.store(true, std::memory_order_relaxed);
+                break;
+            case 9:
+                later->heap_index = 7;
+                break;
+            case 10:
+                target->runnable_heap.size = PER_CPU_HEAP_CAP;
+                break;
+            case 11:
+                later->scheduler_transition_active.store(true, std::memory_order_relaxed);
+                break;
+        }
+        // The capacity case only changes the count: admission must refuse
+        // before any heap operation can inspect the synthetic full target.
+        uint32_t const TARGET_SIZE = target->runnable_heap.size;
+        uint64_t const LATER_CPU = later->cpu;
+        ok = !commit_kernel_worker_pins_locked(plans, 2) && ok;
+        ok = first->cpu == 0 && !first->cpu_pinned && first->vruntime == 1 && first->vdeadline == 2 && first->heap_index == 0 &&
+             source->runnable_heap.contains(first) && source->runnable_heap.size == 1 && source->total_weight == 1024 &&
+             source->wait_list.head == later && source->wait_list.count == 1 && later->cpu == LATER_CPU && !later->cpu_pinned &&
+             target->runnable_heap.size == TARGET_SIZE && target->wait_list.count == 0 && target->total_weight == 0 && ok;
+        // These private objects were never published to the live scheduler.
+        delete later;
+        delete first;
+        delete target;
+        delete source;
+    }
+    return ok;
+}
+
+auto scheduler_selftest_worker_pin_commit() -> bool {
+    auto* source = new RunQueue{};
+    auto* target = new RunQueue{};
+    auto* runnable = new task::Task{};
+    auto* waiting = new task::Task{};
+    init_pin_test_worker(*runnable, 0);
+    init_pin_test_worker(*waiting, 1);
+    bool ok = transition_make_runnable_locked(source, runnable) == RunnableTransitionResult::PUBLISHED;
+    transition_make_waiting_locked(target, waiting);
+    std::array<KernelWorkerPinPlan, 2> plans{{
+        {.request = {runnable, 1}, .owner_cpu = 0, .owner = source, .target = target},
+        {.request = {waiting, 0}, .owner_cpu = 1, .owner = target, .target = source},
+    }};
+    ok = commit_kernel_worker_pins_locked(plans, 2) && ok;
+    ok = runnable->cpu == 1 && waiting->cpu == 0 && runnable->cpu_pinned && waiting->cpu_pinned &&
+         target->runnable_heap.contains(runnable) && source->runnable_heap.size == 0 && source->wait_list.head == waiting &&
+         source->wait_list.count == 1 && target->wait_list.count == 0 && source->total_weight == 0 && target->total_weight == 1024 && ok;
+    // A current worker already at the requested CPU is legal and needs no move.
+    target->current_task = runnable;
+    plans[0] = {.request = {runnable, 1}, .owner_cpu = 1, .owner = target, .target = target};
+    ok = commit_kernel_worker_pins_locked(std::span(plans).first(1), 2) && target->runnable_heap.contains(runnable) && ok;
+    delete waiting;
+    delete runnable;
+    delete target;
+    delete source;
+    return ok;
+}
+
 #endif
 
 }  // namespace ker::mod::sched

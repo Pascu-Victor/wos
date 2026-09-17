@@ -3,7 +3,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <platform/dbg/dbg.hpp>
-#include <platform/sys/spinlock.hpp>
+#include <platform/security/credentials.hpp>
+#include <platform/sys/mutex.hpp>
+#include <vfs/timestamps.hpp>
 
 #include "../file_operations.hpp"
 #include "../vfs.hpp"
@@ -15,6 +17,8 @@ struct BlockDevice;
 }
 
 namespace ker::vfs::fat32 {
+
+struct FAT32Node;
 
 // FAT32 Mount Context - stores per-mount filesystem information
 struct FAT32MountContext {
@@ -36,7 +40,8 @@ struct FAT32MountContext {
     uint16_t root_modify_time;
     uint16_t root_modify_date;
     bool read_only;
-    ker::mod::sys::Spinlock lock;  // Protects concurrent access to this mount
+    FAT32Node* open_nodes{};    // Shared linked nodes and retryable zero-reference orphans
+    ker::mod::sys::Mutex lock;  // Serializes metadata and I/O; these paths may sleep
 };
 
 // FAT32 Boot Sector Structure (simplified)
@@ -106,6 +111,13 @@ constexpr uint8_t FAT32_ATTR_ARCHIVE = 0x20;
 constexpr uint8_t FAT32_ATTR_DEVICE = 0x40;
 constexpr uint8_t FAT32_ATTR_LONG_NAME = 0x0F;
 
+constexpr auto fat32_posix_mode(uint8_t attributes) -> uint32_t {
+    if ((attributes & FAT32_ATTR_DIRECTORY) != 0) {
+        return S_IFDIR | 0755;
+    }
+    return S_IFREG | ((attributes & FAT32_ATTR_READ_ONLY) != 0 ? 0444 : 0644);
+}
+
 // FAT32 specific end-of-chain marker
 constexpr uint32_t FAT32_CLUSTER_MASK = 0x0FFFFFFF;
 constexpr uint32_t FAT32_EOC_MIN = 0x0FFFFFF8;
@@ -116,11 +128,14 @@ constexpr uint32_t FAT32_BAD_CLUSTER = 0x0FFFFFF7;
 auto fat32_init(void* disk_buffer, size_t disk_size) -> int;
 
 // Initialize FAT32 with a block device - returns mount context
-auto fat32_init_device(ker::dev::BlockDevice* device, uint64_t partition_start_lba = 0) -> FAT32MountContext*;
-void fat32_unmount(FAT32MountContext* ctx);
+auto fat32_init_device(ker::dev::BlockDevice* device, uint64_t partition_start_lba = 0, bool read_only = false) -> FAT32MountContext*;
+auto fat32_unmount(FAT32MountContext* ctx) -> int;
 
 // FAT32 filesystem operations
-auto fat32_open_path(const char* path, int flags, int mode, FAT32MountContext* ctx) -> File*;
+// require_regular is a read-only internal mode (flags == 0), checked under
+// the mount lock before allocating or publishing a directory File.
+auto fat32_open_path(const ker::mod::security::Snapshot& credentials, const char* path, int flags, int mode, FAT32MountContext* ctx,
+                     int* result_out = nullptr, bool require_directory = false, bool require_regular = false) -> File*;
 
 // FAT32 I/O operations
 auto fat32_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t;
@@ -132,12 +147,24 @@ constexpr auto fat32_isatty(ker::vfs::File* f) -> bool;
 // FAT32 stat operations
 auto fat32_stat(const char* path, ker::vfs::Stat* statbuf, FAT32MountContext* ctx) -> int;
 auto fat32_fstat(File* f, ker::vfs::Stat* statbuf) -> int;
+// Fixed root ownership and attribute-derived modes: authorize exact no-ops,
+// reject unrepresentable changes without altering runtime or disk metadata.
+auto fat32_chmod_path(const char* path, const ker::mod::security::Snapshot& caller, uint32_t mode, FAT32MountContext* ctx) -> int;
+auto fat32_chown_path(const char* path, const ker::mod::security::Snapshot& caller, uint32_t uid, uint32_t gid, FAT32MountContext* ctx)
+    -> int;
+auto fat32_fchmod(File* file, const ker::mod::security::Snapshot& caller, uint32_t mode) -> int;
+auto fat32_fchown(File* file, const ker::mod::security::Snapshot& caller, uint32_t uid, uint32_t gid) -> int;
+auto fat32_utimens_path(const char* path, const ker::mod::security::Snapshot& caller, const TimestampUpdate& times, FAT32MountContext* ctx)
+    -> int;
+auto fat32_futimens(File* file, const ker::mod::security::Snapshot& caller, const TimestampUpdate& times) -> int;
 auto fat32_statvfs(FAT32MountContext* ctx, ker::vfs::Statvfs* buf) -> int;
 
 // FAT32 directory modification operations
-auto fat32_unlink_path(FAT32MountContext* ctx, const char* path) -> int;
-auto fat32_rmdir_path(FAT32MountContext* ctx, const char* path) -> int;
-auto fat32_rename_path(FAT32MountContext* ctx, const char* oldpath, const char* newpath) -> int;
+auto fat32_unlink_path(const ker::mod::security::Snapshot& credentials, FAT32MountContext* ctx, const char* path) -> int;
+auto fat32_rmdir_path(const ker::mod::security::Snapshot& credentials, FAT32MountContext* ctx, const char* path) -> int;
+auto fat32_rename_path(const ker::mod::security::Snapshot& credentials, FAT32MountContext* ctx, const char* oldpath, const char* newpath,
+                       bool source_requires_directory = false, bool destination_requires_directory = false,
+                       bool* namespace_changed = nullptr) -> int;
 
 // FAT32 sync - flush FAT table and block device for the whole mount.
 auto fat32_sync_mount(FAT32MountContext* ctx) -> int;

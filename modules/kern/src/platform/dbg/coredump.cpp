@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -21,8 +22,11 @@
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/resource.hpp>
+#include <platform/sched/resource_process.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <utility>
+#include <vfs/file.hpp>
 #include <vfs/vfs.hpp>
 
 namespace ker::mod::dbg::coredump {
@@ -47,8 +51,6 @@ constexpr uint64_t CANONICAL_KERNEL_UPPER = 0x1ffffULL;
 
 // Keep these in sync with the VFS/userspace Linux-compatible open flags.
 constexpr int O_WRONLY = 01;
-constexpr int O_CREAT = 0100;  // octal = 64 decimal = 0x40 hex
-constexpr int O_TRUNC = 01000;
 constexpr uint32_t RING_SIZE = 4;
 
 auto page_table_entry_at(ker::mod::mm::paging::PageTable* table, size_t index) -> ker::mod::mm::paging::PageTableEntry& {
@@ -298,6 +300,13 @@ void append_cstr(char* out, size_t out_size, size_t& pos, const char* src) {
     if (out_size != 0) {
         out[pos] = '\0';
     }
+}
+
+// The worker must never reuse an existing inode: creation mode does not change
+// its owner/permissions, and truncation could disclose private bytes through it.
+auto open_output_for_task(ker::mod::sched::task::Task* writer, const char* path) -> int {
+    return ker::vfs::vfs_openat(writer, ker::vfs::AT_FDCWD, path, O_WRONLY | ker::vfs::O_CREAT | ker::vfs::O_EXCL | ker::vfs::O_NOFOLLOW,
+                                0600);
 }
 
 auto write_all(int fd, const void* buf, size_t count) -> bool {
@@ -746,7 +755,7 @@ auto perform_coredump(const CoreDumpRequest& req) -> bool {
     append_cstr(path.data(), path.size(), pos, SUFFIX);
     path.at(pos) = '\0';
 
-    int const FD = ker::vfs::vfs_open(path.data(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    int const FD = open_output_for_task(ker::mod::sched::get_current_task(), path.data());
     if (FD < 0) {
         log::error("failed to open %s", path.data());
         return false;
@@ -950,8 +959,9 @@ auto perform_coredump(const CoreDumpRequest& req) -> bool {
     if (ok) {
         log::info("wrote %s", path.data());
     } else {
-        log::error("failed while writing %s", path.data());
-        static_cast<void>(ker::vfs::vfs_unlink(path.data()));
+        // The name can have been replaced after open. Keep the private partial
+        // artifact; pathname cleanup here could unlink an unrelated inode.
+        log::error("failed while writing %s; private partial output retained", path.data());
     }
     return ok;
 }
@@ -970,10 +980,14 @@ void init() {
 
 void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::GPRegs& gpr, const ker::mod::gates::InterruptFrame& frame,
                         uint64_t cr2, uint64_t cr3, uint64_t cpu_id) {
-    if (task == nullptr || g_coredump_task == nullptr || task->dumpable == 0) {
+    if (task == nullptr || g_coredump_task == nullptr) {
         return;
     }
 
+    auto const CREDENTIALS = task->credentials();
+    if (!CREDENTIALS.dumpable()) {
+        return;
+    }
     if (!admit_dump(*task, 1, true, nullptr)) {
         return;
     }
@@ -1044,8 +1058,9 @@ void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::
     req.parent_pid = task->parent_pid;
     req.owner_pid = task->owner_pid;
     req.wki_remote_pid = task->wki_remote_pid;
-    req.session_id = task->session_id;
-    req.pgid = task->pgid;
+    auto const JOB = task->job_identity();
+    req.session_id = JOB.session_id;
+    req.pgid = JOB.pgid;
     req.task_type = static_cast<uint64_t>(task->type);
     req.task_state = static_cast<uint64_t>(task->state.load(std::memory_order_acquire));
     req.sched_queue = static_cast<uint64_t>(task->sched_queue);
@@ -1074,10 +1089,10 @@ void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::
     req.sig_pending = task->signal_pending_bits();
     req.sig_mask = task->signal_mask_bits();
     req.ptrace_tracer_pid = task->ptrace_tracer_pid;
-    req.uid = task->uid;
-    req.gid = task->gid;
-    req.euid = task->euid;
-    req.egid = task->egid;
+    req.uid = CREDENTIALS.user().real;
+    req.gid = CREDENTIALS.group().real;
+    req.euid = CREDENTIALS.user().effective;
+    req.egid = CREDENTIALS.group().effective;
     req.task_flags = 0;
     req.task_flags |= task->is_thread ? TASK_FLAG_IS_THREAD : 0;
     req.task_flags |= task->is_elf_buffer_shared ? TASK_FLAG_IS_ELF_BUFFER_SHARED : 0;
@@ -1171,6 +1186,80 @@ void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::
 }
 
 #ifdef WOS_SELFTEST
+auto selftest_private_output_creation() -> bool {
+    using namespace ker::vfs;
+    constexpr const char* TARGET = "/tmp/ktest_core_private_target";
+    constexpr const char* PATH = "/tmp/ktest_core_private_output";
+    constexpr const char* MISSING = "/tmp/ktest_core_private_missing";
+    constexpr char SENTINEL[] = "attacker inode must survive";
+    (void)vfs_mkdir("/tmp", 0755);
+    (void)vfs_unlink(PATH);
+    (void)vfs_rmdir(PATH);
+    (void)vfs_unlink(TARGET);
+    (void)vfs_unlink(MISSING);
+    ker::mod::sched::task::Task writer{};
+    bool ok = ker::mod::sched::resource::initialize_credentials(writer, ker::mod::security::Snapshot::bootstrap_root()) == 0;
+    auto close_fd = [&](int fd) {
+        auto* file = vfs_get_file(&writer, fd);
+        if (file == nullptr || vfs_release_fd(&writer, fd) != 0) return false;
+        vfs_put_file(file);
+        return true;
+    };
+    auto denied = [&](const char* path) {
+        size_t const RESERVED = writer.fd_table.reserved_count();
+        int const FD = open_output_for_task(&writer, path);
+        bool const DENIED = FD == -EEXIST || FD == -ELOOP;
+        if (FD >= 0) (void)close_fd(FD);
+        return DENIED && writer.fd_table.reserved_count() == RESERVED;
+    };
+    auto* target = vfs_open_file(TARGET, O_CREAT | O_EXCL | 2, 0666);
+    ok &= target != nullptr;
+    if (target != nullptr) {
+        ok &= vfs_write_file(target, SENTINEL, sizeof(SENTINEL)) == static_cast<ssize_t>(sizeof(SENTINEL));
+        ok &= vfs_fchownat(&writer, AT_FDCWD, TARGET, 1000, 2000, 0) == 0;
+        auto unchanged = [&](const char* collision) {
+            Stat before{}, after{};
+            bool passed = vfs_fstat_file(target, &before) == 0 && denied(collision) && vfs_fstat_file(target, &after) == 0;
+            passed &= before.st_ino == after.st_ino && before.st_uid == after.st_uid && before.st_gid == after.st_gid &&
+                      before.st_mode == after.st_mode && before.st_size == after.st_size && before.st_nlink == after.st_nlink;
+            for (auto pair : {std::pair{before.st_atim, after.st_atim}, std::pair{before.st_mtim, after.st_mtim},
+                              std::pair{before.st_ctim, after.st_ctim}})
+                passed &= pair.first.tv_sec == pair.second.tv_sec && pair.first.tv_nsec == pair.second.tv_nsec;
+            std::array<char, sizeof(SENTINEL)> bytes{};
+            passed &= vfs_pread_file(target, bytes.data(), bytes.size(), 0) == static_cast<ssize_t>(sizeof(SENTINEL)) &&
+                      std::memcmp(bytes.data(), SENTINEL, bytes.size()) == 0;
+            return passed;
+        };
+        ok &= unchanged(TARGET);
+        ok &= vfs_link(TARGET, PATH) == 0 && unchanged(PATH);
+        (void)vfs_unlink(PATH);
+        ok &= vfs_symlink(TARGET, PATH) == 0 && unchanged(PATH);
+        (void)vfs_unlink(PATH);
+        ok &= vfs_symlink(MISSING, PATH) == 0 && denied(PATH);
+        Stat missing{};
+        ok &= vfs_lstat(MISSING, &missing) == -ENOENT;
+        (void)vfs_unlink(PATH);
+        ok &= vfs_mkdir(PATH, 0700) == 0 && denied(PATH);
+        (void)vfs_rmdir(PATH);
+        ok &= vfs_close_file(target) == 0;
+    }
+    int const FD = open_output_for_task(&writer, PATH);
+    ok &= FD >= 0;
+    if (FD >= 0) {
+        auto* file = vfs_get_file(&writer, FD);
+        Stat created{};
+        ok &= file != nullptr && vfs_fstat_file(file, &created) == 0 && (created.st_mode & S_IFMT) == S_IFREG &&
+              (created.st_mode & 0777) == 0600 && created.st_uid == writer.credentials().user().effective &&
+              created.st_gid == writer.credentials().group().effective && created.st_size == 0;
+        ok &= vfs_write_file(file, SENTINEL, sizeof(SENTINEL)) == static_cast<ssize_t>(sizeof(SENTINEL)) && denied(PATH);
+        ok &= vfs_fstat_file(file, &created) == 0 && created.st_size == static_cast<off_t>(sizeof(SENTINEL));
+        ok &= close_fd(FD);
+    }
+    (void)vfs_unlink(PATH);
+    (void)vfs_unlink(TARGET);
+    return ok;
+}
+
 auto selftest_budget_admission() -> bool {
     using namespace ker::mod::sched::resource;
     constexpr unsigned CORE = static_cast<unsigned>(Id::CORE);

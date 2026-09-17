@@ -18,8 +18,11 @@
 #include <platform/mm/virt.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/security/authorization.hpp>
+#include <platform/security/debug_state.hpp>
 #include <platform/sys/usercopy.hpp>
 #include <syscalls_impl/process/child_events.hpp>
+#include <syscalls_impl/process/exit.hpp>
 #include <syscalls_impl/vmem/sys_vmem.hpp>
 #ifdef WOS_SELFTEST
 #include <platform/mm/phys.hpp>
@@ -65,7 +68,23 @@ auto stop_signal(const Task& task) -> uint32_t {
 
 auto stop_wait_status(const Task& task) -> int32_t { return static_cast<int32_t>((stop_signal(task) << 8U) | STOP_STATUS_LOW); }
 
-[[nodiscard]] auto publish_stop_event(Task& task) -> bool { return child_events::publish_ptrace_stop(task, stop_wait_status(task)); }
+[[nodiscard]] auto publish_stop_event(Task& task) -> bool {
+    bool const PUBLISHED = child_events::publish_ptrace_stop(task, stop_wait_status(task));
+    // Exception publication runs after parking. Recheck here so a fatal wake
+    // which won before the park cannot be lost. Later arrivals wake normally.
+    // Neither a queued nor a claimed stop event may hold up termination.
+    if (task.ptrace_termination_pending()) ker::mod::sched::wake_task_for_signal(&task);
+    return PUBLISHED;
+}
+
+// Only syscall entry/exit stop boundaries call this: no operation-owned scoped
+// resources remain on the current kernel stack. Preserve internal retirement
+// requests (including a request arriving after the first check) through exit's
+// existing disposition selection.
+void exit_pending_syscall_stop(Task& task) {
+    ker::syscall::process::exit_current_if_process_exit_requested();
+    if ((task.signal_pending_bits() & (uint64_t{1} << 8)) != 0) ker::syscall::process::wos_proc_exit_signal(SIGKILL);
+}
 
 auto target_exited(const Task& target) -> bool { return target.exit_notify_ready.load(std::memory_order_acquire) && target.has_exited; }
 
@@ -90,17 +109,18 @@ auto should_wake_after_trace_clear(const Task& target, bool was_stopped, bool wa
 
 auto process_id(const Task& task) -> uint64_t { return ker::mod::sched::task::process_pid(task); }
 
-auto can_trace(const Task& tracer, const Task& target) -> bool {
+auto can_trace(const Task& tracer, const Task& target, ker::mod::security::Snapshot* admitted_target = nullptr) -> bool {
     if (target.type != ker::mod::sched::task::TaskType::PROCESS) {
         return false;
     }
     if (tracer.pid == target.pid) {
         return false;
     }
-    if (tracer.euid == 0) {
-        return true;
-    }
-    return tracer.euid == target.euid && tracer.uid == target.uid;
+    auto const TRACER = tracer.credentials();
+    auto const TARGET = target.credentials();
+    if (!ker::mod::security::may_trace(TRACER, TARGET)) return false;
+    if (admitted_target != nullptr) *admitted_target = TARGET;
+    return true;
 }
 
 auto get_target(uint64_t pid, Task& tracer) -> Task* {
@@ -120,14 +140,32 @@ void release_target(Task* target, Task& tracer) {
     }
 }
 
-auto copy_task_memory(Task& target, uint64_t target_addr, void* kernel_buffer, size_t len, bool write_target, size_t* transferred)
+auto prepare_target_memory(Task& target, uint64_t address, size_t size, bool writable, const ker::mod::security::Snapshot& admitted_target)
     -> uint64_t {
+    if (!ker::mod::sys::usercopy::range_valid(address, size)) return as_error(EFAULT);
+    if (target.credentials() != admitted_target) return as_error(EPERM);
+    // Faults may allocate or wait. Drop every temporary pin before taking the
+    // image mutex: exec holds that mutex while waiting for page-access pins.
+    for (size_t done = 0; done < size;) {
+        uint64_t const CURRENT = address + done;
+        ker::mod::sys::usercopy::StableUserPage pin;
+        if (!ker::mod::sys::usercopy::pin_task_user_page(target, CURRENT, writable, true, pin)) return as_error(EFAULT);
+        done += std::min(size - done, ker::mod::mm::paging::PAGE_SIZE - (CURRENT & (ker::mod::mm::paging::PAGE_SIZE - 1)));
+    }
+    return 0;
+}
+
+auto copy_prepared_task_memory(Task& target, uint64_t target_addr, void* kernel_buffer, size_t len, bool write_target, size_t* transferred,
+                               const ker::mod::security::Snapshot& admitted_target) -> uint64_t {
     if (transferred != nullptr) {
         *transferred = 0;
     }
     if (kernel_buffer == nullptr || !ker::mod::sys::usercopy::range_valid(target_addr, len)) {
         return as_error(EFAULT);
     }
+
+    ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+    if (target.credentials() != admitted_target) return as_error(EPERM);
 
     auto* bytes = static_cast<uint8_t*>(kernel_buffer);
     size_t done = 0;
@@ -136,7 +174,7 @@ auto copy_task_memory(Task& target, uint64_t target_addr, void* kernel_buffer, s
         size_t const PAGE_LEFT = ker::mod::mm::paging::PAGE_SIZE - (CUR & (ker::mod::mm::paging::PAGE_SIZE - 1));
         size_t const CHUNK = std::min(PAGE_LEFT, len - done);
         ker::mod::sys::usercopy::StableUserPage pin;
-        if (!ker::mod::sys::usercopy::pin_task_user_page(target, CUR, write_target, true, pin)) {
+        if (!ker::mod::sys::usercopy::pin_task_user_page(target, CUR, write_target, false, pin)) {
             break;
         }
         auto* hhdm = static_cast<uint8_t*>(pin.kernel_address());
@@ -158,21 +196,36 @@ auto copy_task_memory(Task& target, uint64_t target_addr, void* kernel_buffer, s
     return done == len ? 0 : as_error(EFAULT);
 }
 
-auto write_task_word(Task& target, uint64_t target_addr, uint64_t word) -> uint64_t {
+auto copy_task_memory(Task& target, uint64_t target_addr, void* kernel_buffer, size_t len, bool write_target, size_t* transferred,
+                      const ker::mod::security::Snapshot& admitted_target) -> uint64_t {
+    if (transferred != nullptr) *transferred = 0;
+    if (kernel_buffer == nullptr) return as_error(EFAULT);
+    uint64_t const PREPARED = prepare_target_memory(target, target_addr, len, write_target, admitted_target);
+    if (PREPARED != 0 && PREPARED != as_error(EFAULT)) return PREPARED;
+    // A later unmapped page must not discard the valid prefix promised by the
+    // bulk fault ABI. The no-fault copy stops at that page and reports progress.
+    return copy_prepared_task_memory(target, target_addr, kernel_buffer, len, write_target, transferred, admitted_target);
+}
+
+auto write_prepared_task_word(Task& target, uint64_t target_addr, uint64_t word, const ker::mod::security::Snapshot& admitted_target)
+    -> uint64_t {
     if (!ker::mod::sys::usercopy::range_valid(target_addr, sizeof(word))) {
         return as_error(EFAULT);
     }
 
+    ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+    if (target.credentials() != admitted_target) return as_error(EPERM);
+
     size_t const FIRST_SIZE =
         std::min<size_t>(sizeof(word), ker::mod::mm::paging::PAGE_SIZE - (target_addr & (ker::mod::mm::paging::PAGE_SIZE - 1)));
     ker::mod::sys::usercopy::StableUserPage first_page;
-    if (!ker::mod::sys::usercopy::pin_task_user_page(target, target_addr, true, true, first_page)) {
+    if (!ker::mod::sys::usercopy::pin_task_user_page(target, target_addr, true, false, first_page)) {
         return as_error(EFAULT);
     }
 
     ker::mod::sys::usercopy::StableUserPage second_page;
     if (FIRST_SIZE != sizeof(word) &&
-        !ker::mod::sys::usercopy::pin_task_user_page(target, target_addr + FIRST_SIZE, true, true, second_page)) {
+        !ker::mod::sys::usercopy::pin_task_user_page(target, target_addr + FIRST_SIZE, true, false, second_page)) {
         return as_error(EFAULT);
     }
     if (!first_page.still_mapped() || (second_page.valid() && !second_page.still_mapped())) {
@@ -190,6 +243,11 @@ auto write_task_word(Task& target, uint64_t target_addr, uint64_t word) -> uint6
     bool const FIRST_COMMITTED = first_page.commit_write();
     bool const SECOND_COMMITTED = !second_page.valid() || second_page.commit_write();
     return FIRST_COMMITTED && SECOND_COMMITTED ? 0 : as_error(EFAULT);
+}
+
+auto write_task_word(Task& target, uint64_t target_addr, uint64_t word, const ker::mod::security::Snapshot& admitted_target) -> uint64_t {
+    uint64_t const PREPARED = prepare_target_memory(target, target_addr, sizeof(word), true, admitted_target);
+    return PREPARED != 0 ? PREPARED : write_prepared_task_word(target, target_addr, word, admitted_target);
 }
 
 auto is_user_canonical(uint64_t value) -> bool { return value != 0 && value < 0x0000'8000'0000'0000ULL; }
@@ -258,13 +316,20 @@ auto capture_async_syscall_return_snapshot(Task& target) -> bool {
         return false;
     }
 
+    if (ker::mod::sched::current_cpu_for_task(&target) != UINT64_MAX) {
+        return false;
+    }
     auto* scratch = syscall_scratch(target);
     if (scratch == nullptr || !is_user_canonical(scratch->syscall_ret_rip) || !is_user_canonical(scratch->user_rsp) ||
         (scratch->syscall_ret_flags & 0x2ULL) == 0) {
         return false;
     }
 
-    target.ptrace_syscall_regs = target.context.regs;
+    auto* saved_regs = live_syscall_saved_regs(target, *scratch);
+    if (saved_regs == nullptr) {
+        return false;
+    }
+    target.ptrace_syscall_regs = *saved_regs;
     target.ptrace_syscall_regs.rcx = scratch->syscall_ret_rip;
     target.ptrace_syscall_regs.r11 = scratch->syscall_ret_flags;
     target.ptrace_syscall_frame.int_num = 0;
@@ -278,7 +343,30 @@ auto capture_async_syscall_return_snapshot(Task& target) -> bool {
     return true;
 }
 
-auto fill_gprs(Task& target, abi::ptrace::X86_64GprState& out) -> void {
+auto stopped_user_frame(Task& target) -> ker::mod::gates::InterruptFrame* {
+    if (!target.ptrace_stop_blocks_execution()) {
+        return nullptr;
+    }
+    if (!uses_stop_snapshot(target)) {
+        if (ker::mod::sched::current_cpu_for_task(&target) != UINT64_MAX) {
+            return nullptr;
+        }
+        if ((target.context.frame.cs & 3U) != 3) {
+            (void)capture_async_syscall_return_snapshot(target);
+        }
+    }
+    auto* frame = uses_stop_snapshot(target) ? &target.ptrace_syscall_frame : &target.context.frame;
+    if (frame->cs != ker::mod::desc::gdt::GDT_USER_CS || frame->ss != ker::mod::desc::gdt::GDT_USER_DS || !is_user_canonical(frame->rip) ||
+        !is_user_canonical(frame->rsp)) {
+        return nullptr;
+    }
+    return frame;
+}
+
+auto fill_gprs(Task& target, abi::ptrace::X86_64GprState& out) -> bool {
+    if (stopped_user_frame(target) == nullptr) {
+        return false;
+    }
     bool const USE_SYSCALL_SNAPSHOT = uses_stop_snapshot(target);
     const auto& regs = USE_SYSCALL_SNAPSHOT ? target.ptrace_syscall_regs : target.context.regs;
     const auto& frame = USE_SYSCALL_SNAPSHOT ? target.ptrace_syscall_frame : target.context.frame;
@@ -304,9 +392,16 @@ auto fill_gprs(Task& target, abi::ptrace::X86_64GprState& out) -> void {
     out.ss = frame.ss;
     out.fs_base = target.thread != nullptr ? target.thread->fsbase : 0;
     out.gs_base = target.thread != nullptr ? target.thread->gsbase : 0;
+    return true;
 }
 
-auto set_gprs(Task& target, const abi::ptrace::X86_64GprState& in) -> void {
+auto set_gprs(Task& target, const abi::ptrace::X86_64GprState& in) -> uint64_t {
+    if (!ker::mod::security::valid_debug_gprs(in, ker::mod::desc::gdt::GDT_USER_CS, ker::mod::desc::gdt::GDT_USER_DS)) {
+        return as_error(EINVAL);
+    }
+    if (stopped_user_frame(target) == nullptr || (uses_stop_snapshot(target) && syscall_scratch(target) == nullptr)) {
+        return as_error(EIO);
+    }
     bool const USE_SYSCALL_SNAPSHOT = uses_stop_snapshot(target);
     auto& regs = USE_SYSCALL_SNAPSHOT ? target.ptrace_syscall_regs : target.context.regs;
     auto& frame = USE_SYSCALL_SNAPSHOT ? target.ptrace_syscall_frame : target.context.frame;
@@ -335,15 +430,10 @@ auto set_gprs(Task& target, const abi::ptrace::X86_64GprState& in) -> void {
     if (USE_SYSCALL_SNAPSHOT) {
         (void)publish_stop_snapshot_to_syscall_scratch(target);
     }
+    return 0;
 }
 
-auto user_resume_frame_for_step(Task& target) -> ker::mod::gates::InterruptFrame* {
-    if (!target.ptrace_stopped) {
-        return nullptr;
-    }
-    auto* frame = uses_stop_snapshot(target) ? &target.ptrace_syscall_frame : &target.context.frame;
-    return (frame->cs & 0x3U) == 3 ? frame : nullptr;
-}
+auto user_resume_frame_for_step(Task& target) -> ker::mod::gates::InterruptFrame* { return stopped_user_frame(target); }
 
 void clear_task_trap_flags(Task& target) {
     target.context.frame.flags &= ~X86_RFLAGS_TF;
@@ -388,8 +478,8 @@ __attribute__((noinline, no_sanitize("address", "undefined", "coverage"))) void 
         : "memory", "cc");
 }
 
-auto require_traced(Task& tracer, Task& target) -> uint64_t {
-    if (!target.ptrace_traced || target.ptrace_tracer_pid != tracer.pid) {
+auto require_traced(Task& tracer, Task& target, ker::mod::security::Snapshot* admitted_target = nullptr) -> uint64_t {
+    if (!target.ptrace_traced || target.ptrace_tracer_pid != tracer.pid || !can_trace(tracer, target, admitted_target)) {
         return as_error(EPERM);
     }
     return 0;
@@ -438,6 +528,7 @@ void clear_trace_state_and_wake(Task& target) {
 }
 
 auto attach(Task& tracer, Task& target, bool seize) -> uint64_t {
+    ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
     if (!can_trace(tracer, target)) {
         return as_error(EPERM);
     }
@@ -466,9 +557,10 @@ auto attach(Task& tracer, Task& target, bool seize) -> uint64_t {
 }
 
 auto detach(Task& tracer, Task& target) -> uint64_t {
-    uint64_t const ERR = require_traced(tracer, target);
-    if (ERR != 0) {
-        return ERR;
+    ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+    // Losing inspection authority must not prevent releasing an attachment.
+    if (!target.ptrace_traced || target.ptrace_tracer_pid != tracer.pid) {
+        return as_error(EPERM);
     }
     if (!acknowledge_stop_for_resume(tracer, target)) {
         return as_error(EBUSY);
@@ -519,22 +611,16 @@ void fill_exit_stop_info(Task& target, abi::ptrace::StopInfo& out) {
     out.wait_status = target.exit_status;
 }
 
-auto fill_stop_info(Task& tracer, Task& target, uint64_t data) -> uint64_t {
-    if (data == 0) {
-        return as_error(EFAULT);
-    }
-    abi::ptrace::StopInfo out{};
-    if (target_exited(target)) {
+void fill_stop_info(Task& target, const child_events::ClaimedEvent& claimed, abi::ptrace::StopInfo& out) {
+    out = {};
+    if (claimed.kind == ker::mod::sched::task::ChildEventKind::EXIT) {
         fill_exit_stop_info(target, out);
+        out.event.message = static_cast<uint64_t>(claimed.status);
     } else {
         fill_event(target, out.event);
-        out.wait_status = stop_wait_status(target);
-        if (target.ptrace_stopped) {
-            fill_gprs(target, out.regs);
-            out.flags |= abi::ptrace::STOP_INFO_REGS_VALID;
-        }
+        if (target.ptrace_stopped && fill_gprs(target, out.regs)) out.flags |= abi::ptrace::STOP_INFO_REGS_VALID;
     }
-    return ker::mod::sys::usercopy::copy_value_to_task(tracer, data, out) ? 0 : as_error(EFAULT);
+    out.wait_status = claimed.status;
 }
 
 void clear_tracer_wait_state(Task& tracer) {
@@ -544,30 +630,52 @@ void clear_tracer_wait_state(Task& tracer) {
 
 void publish_tracer_wait(Task& tracer) { tracer.set_wait_channel("ptrace_wait", ker::mod::sched::task::WaitChannelKind::PTRACE); }
 
-auto consume_exit_for_tracer(Task& tracer, Task& target, uint64_t data) -> uint64_t {
-    // SIGKILL can take a stopped tracee directly to exit without an explicit
-    // ptrace resume. Rich wait historically reports the exit in that case, so
-    // retire an unclaimed older stop before selecting the exit event.
-    if (!acknowledge_stop_for_resume(tracer, target)) {
-        clear_tracer_wait_state(tracer);
+auto begin_syscall_wait(Task& tracer, Task& target, const ker::mod::security::Snapshot& admitted_target, bool& exited) -> uint64_t {
+    ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+    if (target.credentials() != admitted_target || !target.ptrace_traced || target.ptrace_tracer_pid != tracer.pid) return as_error(EPERM);
+    exited = target_exited(target);
+    if (exited) return 0;
+    publish_tracer_wait(tracer);
+    return resume_syscall_after_require(tracer, target) ? 0 : as_error(EBUSY);
+}
+
+// A stop reached after an authorized resume may follow exec or a credential
+// change. Make its own current decision while capturing the owned result. The
+// optional admitted value binds the initial, already-exited case to preflight.
+auto capture_wait_event(Task& tracer, Task& target, const ker::mod::security::Snapshot* admitted_target,
+                        child_events::ClaimedEvent& claimed, abi::ptrace::StopInfo& out, bool& ready) -> uint64_t {
+    ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+    if (admitted_target != nullptr) {
+        if (target.credentials() != *admitted_target || !target.ptrace_traced || target.ptrace_tracer_pid != tracer.pid)
+            return as_error(EPERM);
+    } else {
+        uint64_t const AUTH = require_traced(tracer, target);
+        if (AUTH != 0) return AUTH;
+    }
+    bool const EXITED = target_exited(target);
+    if (!EXITED && !target.ptrace_stopped) {
+        ready = false;
+        return 0;
+    }
+    // An unclaimed older stop may precede an exit produced by SIGKILL.
+    if (EXITED && !acknowledge_stop_for_resume(tracer, target)) return as_error(EBUSY);
+    auto const PROBE = child_events::claim_or_register(tracer, tracer, target.pid, child_events::OPTION_STOPPED, false, claimed);
+    auto const EXPECTED = EXITED ? ker::mod::sched::task::ChildEventKind::EXIT : ker::mod::sched::task::ChildEventKind::PTRACE_STOP;
+    if (PROBE != child_events::ProbeResult::CLAIMED || claimed.kind != EXPECTED) {
+        if (PROBE == child_events::ProbeResult::CLAIMED) child_events::release_claim(tracer, claimed);
         return as_error(EBUSY);
     }
+    fill_stop_info(target, claimed, out);
+    ready = true;
+    return 0;
+}
 
-    child_events::ClaimedEvent claimed{};
-    auto const PROBE = child_events::claim_or_register(tracer, tracer, target.pid, 0, false, claimed);
-    if (PROBE != child_events::ProbeResult::CLAIMED || claimed.kind != ker::mod::sched::task::ChildEventKind::EXIT) {
-        if (PROBE == child_events::ProbeResult::CLAIMED) {
-            child_events::release_claim(tracer, claimed);
-        }
-        clear_tracer_wait_state(tracer);
-        return as_error(EBUSY);
-    }
-
-    uint64_t const RET = fill_stop_info(tracer, target, data);
-    if (RET != 0) {
+auto publish_wait_event(Task& tracer, uint64_t data, const child_events::ClaimedEvent& claimed, const abi::ptrace::StopInfo& out)
+    -> uint64_t {
+    if (!ker::mod::sys::usercopy::copy_value_to_task(tracer, data, out)) {
         child_events::release_claim(tracer, claimed);
         clear_tracer_wait_state(tracer);
-        return RET;
+        return as_error(EFAULT);
     }
     if (!child_events::commit_claim(tracer, tracer, claimed, false)) {
         child_events::release_claim(tracer, claimed);
@@ -578,51 +686,69 @@ auto consume_exit_for_tracer(Task& tracer, Task& target, uint64_t data) -> uint6
     return 0;
 }
 
-auto syscall_wait(Task& tracer, Task& target, uint64_t data) -> uint64_t {
-    if (data == 0) {
-        return as_error(EFAULT);
+auto consume_exit_for_tracer(Task& tracer, Task& target, uint64_t data, const ker::mod::security::Snapshot& admitted_target) -> uint64_t {
+    child_events::ClaimedEvent claimed{};
+    abi::ptrace::StopInfo out{};
+    bool ready = false;
+    uint64_t const CAPTURE = capture_wait_event(tracer, target, &admitted_target, claimed, out, ready);
+    if (CAPTURE != 0 || !ready) {
+        clear_tracer_wait_state(tracer);
+        return CAPTURE != 0 ? CAPTURE : as_error(EBUSY);
     }
+    return publish_wait_event(tracer, data, claimed, out);
+}
 
-    uint64_t ret = require_traced(tracer, target);
+auto syscall_wait(Task& tracer, Task& target, uint64_t data) -> uint64_t {
+    if (data == 0) return as_error(EFAULT);
+    ker::mod::security::Snapshot admitted_target;
+    uint64_t ret = require_traced(tracer, target, &admitted_target);
+    if (ret != 0) return ret;
+    if (!ker::mod::sys::usercopy::ensure_writable(tracer, data, sizeof(abi::ptrace::StopInfo))) return as_error(EFAULT);
+    bool exited = false;
+    ret = begin_syscall_wait(tracer, target, admitted_target, exited);
     if (ret != 0) {
+        clear_tracer_wait_state(tracer);
         return ret;
     }
-    if (!ker::mod::sys::usercopy::ensure_writable(tracer, data, sizeof(abi::ptrace::StopInfo))) {
-        return as_error(EFAULT);
-    }
-    if (target_exited(target)) {
-        return consume_exit_for_tracer(tracer, target, data);
-    }
-
-    publish_tracer_wait(tracer);
-    if (!resume_syscall_after_require(tracer, target)) {
-        clear_tracer_wait_state(tracer);
-        return as_error(EBUSY);
-    }
-
+    if (exited) return consume_exit_for_tracer(tracer, target, data, admitted_target);
     for (;;) {
-        if (target_exited(target)) {
-            return consume_exit_for_tracer(tracer, target, data);
-        }
-        if (target.ptrace_stopped) {
-            ret = fill_stop_info(tracer, target, data);
-            if (ret == 0 && child_events::acknowledge_ptrace_stop(target, tracer)) {
-                target.ptrace_stop_pending = false;
-            } else if (ret == 0) {
-                ret = as_error(EBUSY);
-            }
+        child_events::ClaimedEvent claimed{};
+        abi::ptrace::StopInfo out{};
+        bool ready = false;
+        ret = capture_wait_event(tracer, target, nullptr, claimed, out, ready);
+        if (ret != 0) {
             clear_tracer_wait_state(tracer);
             return ret;
         }
-        if (!target.ptrace_traced || target.ptrace_tracer_pid != tracer.pid) {
-            clear_tracer_wait_state(tracer);
-            return as_error(EPERM);
-        }
+        if (ready) return publish_wait_event(tracer, data, claimed, out);
         ker::mod::sched::preemptible_syscall_park("ptrace_wait", ker::mod::sched::task::WaitChannelKind::PTRACE);
     }
 }
 
-auto read_regset(Task& tracer, Task& target, uint64_t data) -> uint64_t {
+using XStateBuffer = std::array<uint8_t, ker::mod::sched::task::FxState::XSAVE_AREA_SIZE>;
+
+auto capture_gprs(Task& target, abi::ptrace::X86_64GprState& out, const ker::mod::security::Snapshot& admitted_target) -> uint64_t {
+    ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+    if (target.credentials() != admitted_target) return as_error(EPERM);
+    return fill_gprs(target, out) ? 0 : as_error(EIO);
+}
+
+auto apply_gprs(Task& target, const abi::ptrace::X86_64GprState& input, const ker::mod::security::Snapshot& admitted_target) -> uint64_t {
+    ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+    if (target.credentials() != admitted_target) return as_error(EPERM);
+    return set_gprs(target, input);
+}
+
+auto capture_xstate(Task& target, XStateBuffer& out, const ker::mod::security::Snapshot& admitted_target) -> uint64_t {
+    ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+    if (target.credentials() != admitted_target) return as_error(EPERM);
+    if (ker::mod::sched::current_cpu_for_task(&target) != UINT64_MAX) return as_error(EBUSY);
+    if (stopped_user_frame(target) == nullptr) return as_error(EIO);
+    std::memcpy(out.data(), target.fx_state.aligned(), out.size());
+    return 0;
+}
+
+auto read_regset(Task& tracer, Task& target, uint64_t data, const ker::mod::security::Snapshot& admitted_target) -> uint64_t {
     abi::ptrace::RegsetIo io{};
     if (!ker::mod::sys::usercopy::copy_value_from_task(tracer, data, io) || io.buffer == nullptr) {
         return as_error(EFAULT);
@@ -637,7 +763,8 @@ auto read_regset(Task& tracer, Task& target, uint64_t data) -> uint64_t {
             return as_error(EFAULT);
         }
         abi::ptrace::X86_64GprState out{};
-        fill_gprs(target, out);
+        uint64_t const RESULT = capture_gprs(target, out, admitted_target);
+        if (RESULT != 0) return RESULT;
         if (!ker::mod::sys::usercopy::copy_value_to_task(tracer, BUFFER_ADDR, out)) {
             return as_error(EFAULT);
         }
@@ -646,10 +773,12 @@ auto read_regset(Task& tracer, Task& target, uint64_t data) -> uint64_t {
         if (io.size < ker::mod::sched::task::FxState::XSAVE_AREA_SIZE) {
             return as_error(EINVAL);
         }
+        XStateBuffer out{};
+        uint64_t const RESULT = capture_xstate(target, out, admitted_target);
+        if (RESULT != 0) return RESULT;
         if (!ker::mod::sys::usercopy::ensure_writable(tracer, BUFFER_ADDR, ker::mod::sched::task::FxState::XSAVE_AREA_SIZE) ||
             !ker::mod::sys::usercopy::ensure_writable(tracer, data, sizeof(io)) ||
-            !ker::mod::sys::usercopy::copy_to_task(tracer, BUFFER_ADDR, target.fx_state.aligned(),
-                                                   ker::mod::sched::task::FxState::XSAVE_AREA_SIZE)) {
+            !ker::mod::sys::usercopy::copy_to_task(tracer, BUFFER_ADDR, out.data(), out.size())) {
             return as_error(EFAULT);
         }
         io.size = ker::mod::sched::task::FxState::XSAVE_AREA_SIZE;
@@ -659,7 +788,30 @@ auto read_regset(Task& tracer, Task& target, uint64_t data) -> uint64_t {
     return ker::mod::sys::usercopy::copy_value_to_task(tracer, data, io) ? 0 : as_error(EFAULT);
 }
 
-auto write_regset(Task& tracer, Task& target, uint64_t data) -> uint64_t {
+auto supported_mxcsr_mask() -> uint32_t {
+    alignas(16) std::array<uint8_t, 512> trusted{};
+    asm volatile("fxsave64 %0" : "=m"(trusted) : : "memory");
+    uint32_t mask = 0;
+    std::memcpy(&mask, trusted.data() + 28, sizeof(mask));
+    return mask != 0 ? mask : 0x0000ffbfU;
+}
+
+auto apply_xstate(Task& target, const XStateBuffer& state, const ker::mod::security::Snapshot& admitted_target) -> uint64_t {
+    ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+    if (target.credentials() != admitted_target) return as_error(EPERM);
+    if (!ker::mod::security::valid_debug_xstate(state, ker::mod::cpu::xsave_feature_mask, supported_mxcsr_mask())) {
+        return as_error(EINVAL);
+    }
+    if (ker::mod::sched::current_cpu_for_task(&target) != UINT64_MAX) return as_error(EBUSY);
+    if (stopped_user_frame(target) == nullptr) return as_error(EIO);
+    std::memcpy(target.fx_state.aligned(), state.data(), state.size());
+    target.fx_state.saved = true;
+    target.fx_state.live_saved = true;
+    target.fx_state.initialized = true;
+    return 0;
+}
+
+auto write_regset(Task& tracer, Task& target, uint64_t data, const ker::mod::security::Snapshot& admitted_target) -> uint64_t {
     abi::ptrace::RegsetIo io{};
     if (!ker::mod::sys::usercopy::copy_value_from_task(tracer, data, io) || io.buffer == nullptr) {
         return as_error(EFAULT);
@@ -673,27 +825,37 @@ auto write_regset(Task& tracer, Task& target, uint64_t data) -> uint64_t {
         if (!ker::mod::sys::usercopy::copy_value_from_task(tracer, BUFFER_ADDR, in)) {
             return as_error(EFAULT);
         }
-        set_gprs(target, in);
-        return 0;
+        return apply_gprs(target, in, admitted_target);
     }
     if (io.kind == abi::ptrace::regset::X86_64_XSAVE) {
         if (io.size < ker::mod::sched::task::FxState::XSAVE_AREA_SIZE) {
             return as_error(EINVAL);
         }
-        std::array<uint8_t, ker::mod::sched::task::FxState::XSAVE_AREA_SIZE> state{};
+        XStateBuffer state{};
         if (!ker::mod::sys::usercopy::copy_from_task(tracer, BUFFER_ADDR, state.data(), state.size())) {
             return as_error(EFAULT);
         }
-        std::memcpy(target.fx_state.aligned(), state.data(), state.size());
-        target.fx_state.saved = true;
-        target.fx_state.live_saved = true;
-        target.fx_state.initialized = true;
-        return 0;
+        return apply_xstate(target, state, admitted_target);
     }
     return as_error(EINVAL);
 }
 
-auto list_threads(Task& tracer, Task& target, uint64_t data) -> uint64_t {
+auto capture_threads(Task& target, const ker::mod::security::Snapshot& admitted_target, uint64_t* tids, size_t capacity, size_t& count)
+    -> uint64_t {
+    ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+    if (target.credentials() != admitted_target) return as_error(EPERM);
+    uint64_t const GROUP = process_id(target);
+    count = 0;
+    for (size_t idx = 0; idx < capacity; ++idx) {
+        auto* candidate = ker::mod::sched::get_active_task_at_safe(static_cast<uint32_t>(idx));
+        if (candidate == nullptr) continue;
+        if (process_id(*candidate) == GROUP) tids[count++] = candidate->pid;
+        candidate->release();
+    }
+    return 0;
+}
+
+auto list_threads(Task& tracer, Task& target, uint64_t data, const ker::mod::security::Snapshot& admitted_target) -> uint64_t {
     abi::ptrace::ThreadList list{};
     if (!ker::mod::sys::usercopy::copy_value_from_task(tracer, data, list) || (list.capacity != 0 && list.tids == nullptr) ||
         !ker::mod::sys::usercopy::ensure_writable(tracer, data, sizeof(list))) {
@@ -701,22 +863,15 @@ auto list_threads(Task& tracer, Task& target, uint64_t data) -> uint64_t {
     }
 
     size_t count = 0;
-    uint64_t const GROUP = process_id(target);
     uint64_t const ACTIVE_COUNT = ker::mod::sched::get_active_task_count();
     auto* tids = ACTIVE_COUNT != 0 ? new (std::nothrow) uint64_t[ACTIVE_COUNT] : nullptr;
     if (ACTIVE_COUNT != 0 && tids == nullptr) {
         return as_error(ENOMEM);
     }
-    for (uint64_t idx = 0; idx < ACTIVE_COUNT; ++idx) {
-        auto* candidate = ker::mod::sched::get_active_task_at_safe(idx);
-        if (candidate == nullptr) {
-            continue;
-        }
-        bool const SAME_GROUP = process_id(*candidate) == GROUP;
-        if (SAME_GROUP) {
-            tids[count++] = candidate->pid;
-        }
-        candidate->release();
+    uint64_t const CAPTURE = capture_threads(target, admitted_target, tids, ACTIVE_COUNT, count);
+    if (CAPTURE != 0) {
+        delete[] tids;
+        return CAPTURE;
     }
 
     size_t const COPY_COUNT = std::min(count, list.capacity);
@@ -752,11 +907,15 @@ auto read_runtime_image_memory(void* opaque, uint64_t address, void* destination
     return target != nullptr && ker::mod::sys::usercopy::copy_from_task_mapped(*target, address, destination, size);
 }
 
-auto snapshot_target_images(Task& target, std::array<ker::loader::runtime::RuntimeImage, ker::loader::runtime::MAX_IMAGES>& runtime_images,
-                            size_t& needed) -> ker::loader::runtime::SnapshotStatus {
+auto snapshot_target_images(Task& target, const ker::mod::security::Snapshot& admitted_target,
+                            std::array<ker::loader::runtime::RuntimeImage, ker::loader::runtime::MAX_IMAGES>& runtime_images,
+                            size_t& needed, ker::loader::runtime::SnapshotStatus& status) -> bool {
     // Match exec/fork/mmap publication so the kernel-owned extents and every
     // target-memory read describe one address space.
     ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+    // Credential publication uses this same guard. Do not read a replacement
+    // image with a decision made before its dumpability/identity changed.
+    if (target.credentials() != admitted_target) return false;
     ker::loader::runtime::SnapshotSource const SOURCE{
         .program_header_addr = target.program_header_addr,
         .program_header_count = target.program_header_count,
@@ -772,10 +931,11 @@ auto snapshot_target_images(Task& target, std::array<ker::loader::runtime::Runti
         .main_path = target.exe_path.data(),
         .interpreter_path = "/lib/ld.so",
     };
-    return ker::loader::runtime::snapshot_images(read_runtime_image_memory, &target, SOURCE, runtime_images, needed);
+    status = ker::loader::runtime::snapshot_images(read_runtime_image_memory, &target, SOURCE, runtime_images, needed);
+    return true;
 }
 
-auto list_images(Task& tracer, Task& target, uint64_t data) -> uint64_t {
+auto list_images(Task& tracer, Task& target, uint64_t data, const ker::mod::security::Snapshot& admitted_target) -> uint64_t {
     abi::ptrace::ImageList list{};
     if (!ker::mod::sys::usercopy::copy_value_from_task(tracer, data, list) || (list.capacity != 0 && list.images == nullptr) ||
         !ker::mod::sys::usercopy::ensure_writable(tracer, data, sizeof(list))) {
@@ -787,7 +947,11 @@ auto list_images(Task& tracer, Task& target, uint64_t data) -> uint64_t {
         return as_error(ENOMEM);
     }
     size_t needed = 0;
-    (void)snapshot_target_images(target, *runtime_images, needed);
+    auto status = ker::loader::runtime::SnapshotStatus::UNAVAILABLE;
+    if (!snapshot_target_images(target, admitted_target, *runtime_images, needed, status)) {
+        delete runtime_images;
+        return as_error(EPERM);
+    }
     if (needed == 0) {
         delete runtime_images;
         return as_error(EIO);
@@ -830,7 +994,7 @@ auto list_images(Task& tracer, Task& target, uint64_t data) -> uint64_t {
     return 0;
 }
 
-auto list_image_catalog(Task& tracer, Task& target, uint64_t data) -> uint64_t {
+auto list_image_catalog(Task& tracer, Task& target, uint64_t data, const ker::mod::security::Snapshot& admitted_target) -> uint64_t {
     abi::ptrace::ImageCatalogList list{};
     if (!ker::mod::sys::usercopy::copy_value_from_task(tracer, data, list) ||
         !ker::mod::sys::usercopy::ensure_writable(tracer, data, sizeof(list))) {
@@ -846,9 +1010,13 @@ auto list_image_catalog(Task& tracer, Task& target, uint64_t data) -> uint64_t {
         return as_error(ENOMEM);
     }
     size_t needed = 0;
-    auto const STATUS = snapshot_target_images(target, *runtime_images, needed);
+    auto status = ker::loader::runtime::SnapshotStatus::UNAVAILABLE;
+    if (!snapshot_target_images(target, admitted_target, *runtime_images, needed, status)) {
+        delete runtime_images;
+        return as_error(EPERM);
+    }
     list.count = needed;
-    list.snapshot_status = static_cast<abi::ptrace::image_snapshot_status>(STATUS);
+    list.snapshot_status = static_cast<abi::ptrace::image_snapshot_status>(status);
     list.reserved = 0;
     if (needed == 0) {
         delete runtime_images;
@@ -897,40 +1065,51 @@ auto list_image_catalog(Task& tracer, Task& target, uint64_t data) -> uint64_t {
     return 0;
 }
 
-auto remote_info(Task& tracer, Task& target, uint64_t data) -> uint64_t {
-    if (data == 0) {
-        return as_error(EFAULT);
-    }
-    abi::ptrace::RemoteInfo out{};
-    out.is_proxy = target.wki_proxy_task || target.wki_proxy_task_id != 0 ? 1U : 0U;
-    if (target.has_exited) {
-        out.state = 2U;
-    } else {
-        out.state = target.wki_remote_pid != 0 ? 1U : 0U;
-    }
+auto capture_remote_info(Task& target, const ker::mod::security::Snapshot& admitted_target, abi::ptrace::RemoteInfo& out) -> uint64_t {
+    ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+    if (target.credentials() != admitted_target) return as_error(EPERM);
+    auto const IDENTITY = target.wki_execution_identity();
+    out = {};
+    out.is_proxy = target.wki_proxy_task || IDENTITY.proxy_task_id != 0 ? 1U : 0U;
+    out.state = target.has_exited ? 2U : (IDENTITY.remote_pid != 0 ? 1U : 0U);
     out.proxy_pid = target.pid;
-    out.task_id = target.wki_proxy_task_id;
+    out.task_id = IDENTITY.proxy_task_id;
     out.target_node = PTRACE_REMOTE_NODE_INVALID;
-    out.remote_pid = target.wki_remote_pid;
-    uint16_t proxy_target_node = 0;
-    if (ker::net::wki::wki_proxy_task_remote_info(&target, &proxy_target_node, out.target_hostname.data(), out.target_hostname.size())) {
-        out.target_node = proxy_target_node;
+    out.remote_pid = IDENTITY.remote_pid;
+    std::strncpy(out.target_hostname.data(), target.wki_target_hostname.data(), out.target_hostname.size() - 1);
+    if (out.target_hostname.front() == '\0') {
+        std::strncpy(out.target_hostname.data(), IDENTITY.submitter_hostname.data(), out.target_hostname.size() - 1);
     }
-    if (out.target_hostname.at(0) == '\0') {
-        std::strncpy(out.target_hostname.data(), target.wki_target_hostname.data(), out.target_hostname.size() - 1);
+    return 0;
+}
+
+auto remote_info(Task& tracer, Task& target, uint64_t data) -> uint64_t {
+    ker::mod::security::Snapshot admitted_target;
+    if (&tracer == &target) {
+        admitted_target = target.credentials();
+    } else if (!can_trace(tracer, target, &admitted_target)) {
+        return as_error(EPERM);
     }
-    if (out.target_hostname.at(0) == '\0') {
-        std::strncpy(out.target_hostname.data(), target.wki_submitter_hostname.data(), out.target_hostname.size() - 1);
+    if (data == 0) return as_error(EFAULT);
+    abi::ptrace::RemoteInfo out{};
+    uint64_t const CAPTURE = capture_remote_info(target, admitted_target, out);
+    if (CAPTURE != 0) return CAPTURE;
+    // Routing may change independently of credentials. Resolve only the owned
+    // execution ID; neither WKI locks nor tracer usercopy run under SharedVM.
+    uint16_t node = 0;
+    decltype(out.target_hostname) hostname{};
+    if (ker::net::wki::wki_submitted_task_remote_info(static_cast<uint32_t>(out.task_id), &node, hostname.data(), hostname.size())) {
+        out.target_node = node;
+        if (hostname.front() != '\0') out.target_hostname = hostname;
     }
     return ker::mod::sys::usercopy::copy_value_to_task(tracer, data, out) ? 0 : as_error(EFAULT);
 }
 
-auto set_hw_break(Task& tracer, Task& target, uint64_t data, bool enable) -> uint64_t {
-    abi::ptrace::HwBreak desc{};
-    if (!ker::mod::sys::usercopy::copy_value_from_task(tracer, data, desc)) {
-        return as_error(EFAULT);
-    }
-    if (desc.slot >= target.ptrace_dr_addr.size()) {
+auto apply_hw_break(Task& target, const abi::ptrace::HwBreak& desc, bool enable, const ker::mod::security::Snapshot& admitted_target)
+    -> uint64_t {
+    ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+    if (target.credentials() != admitted_target) return as_error(EPERM);
+    if (!ker::mod::security::valid_debug_breakpoint(desc, enable)) {
         return as_error(EINVAL);
     }
     uint64_t length_code = 0;
@@ -959,6 +1138,9 @@ auto set_hw_break(Task& tracer, Task& target, uint64_t data, bool enable) -> uin
         }
     }
 
+    if (stopped_user_frame(target) == nullptr) {
+        return as_error(EIO);
+    }
     target.ptrace_dr_addr.at(desc.slot) = enable ? desc.address : 0;
     uint64_t const LOCAL_ENABLE = X86_DR7_LOCAL_ENABLE_MASK << (desc.slot * X86_DR7_SLOT_ENABLE_STRIDE);
     uint64_t const CONTROL_SHIFT = X86_DR7_SLOT_CONTROL_BASE + (desc.slot * X86_DR7_SLOT_CONTROL_STRIDE);
@@ -972,7 +1154,14 @@ auto set_hw_break(Task& tracer, Task& target, uint64_t data, bool enable) -> uin
     return 0;
 }
 
-auto transfer_memory(Task& tracer, Task& target, uint64_t data, bool write_target) -> uint64_t {
+auto set_hw_break(Task& tracer, Task& target, uint64_t data, bool enable, const ker::mod::security::Snapshot& admitted_target) -> uint64_t {
+    abi::ptrace::HwBreak desc{};
+    if (!ker::mod::sys::usercopy::copy_value_from_task(tracer, data, desc)) return as_error(EFAULT);
+    return apply_hw_break(target, desc, enable, admitted_target);
+}
+
+auto transfer_memory(Task& tracer, Task& target, uint64_t data, bool write_target, const ker::mod::security::Snapshot& admitted_target)
+    -> uint64_t {
     abi::ptrace::MemIo io{};
     if (!ker::mod::sys::usercopy::copy_value_from_task(tracer, data, io) || io.buffer == nullptr ||
         !ker::mod::sys::usercopy::range_valid(io.address, io.size) ||
@@ -994,7 +1183,7 @@ auto transfer_memory(Task& tracer, Task& target, uint64_t data, bool write_targe
             if (INPUT.bytes_copied != 0) {
                 size_t target_done = 0;
                 uint64_t const TARGET_RESULT =
-                    copy_task_memory(target, io.address + done, bounce.data(), INPUT.bytes_copied, true, &target_done);
+                    copy_task_memory(target, io.address + done, bounce.data(), INPUT.bytes_copied, true, &target_done, admitted_target);
                 done += target_done;
                 if (TARGET_RESULT != 0 || target_done != INPUT.bytes_copied) {
                     result = TARGET_RESULT != 0 ? TARGET_RESULT : as_error(EFAULT);
@@ -1007,7 +1196,8 @@ auto transfer_memory(Task& tracer, Task& target, uint64_t data, bool write_targe
             }
         } else {
             size_t target_done = 0;
-            uint64_t const TARGET_RESULT = copy_task_memory(target, io.address + done, bounce.data(), CHUNK, false, &target_done);
+            uint64_t const TARGET_RESULT =
+                copy_task_memory(target, io.address + done, bounce.data(), CHUNK, false, &target_done, admitted_target);
             if (target_done != 0) {
                 auto const OUTPUT = ker::mod::sys::usercopy::copy_to_task_partial(tracer, BUFFER_ADDR + done, bounce.data(), target_done);
                 done += OUTPUT.bytes_copied;
@@ -1023,6 +1213,12 @@ auto transfer_memory(Task& tracer, Task& target, uint64_t data, bool write_targe
         }
     }
 
+    // Initial credential denial publishes nothing. A later invalidated view
+    // ends an already-authorized partial transfer with its existing fault ABI.
+    if (result == as_error(EPERM)) {
+        if (done == 0) return result;
+        result = as_error(EFAULT);
+    }
     io.transferred = done;
     if (!ker::mod::sys::usercopy::copy_value_to_task(tracer, data, io)) {
         return as_error(EFAULT);
@@ -1100,13 +1296,17 @@ auto sys_ptrace(abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t 
         if (parent == nullptr) {
             return as_error(ESRCH);
         }
-        uint64_t ret = can_trace(*parent, *tracer) ? 0 : as_error(EPERM);
-        if (ret == 0 && !child_events::attach_tracer(*tracer, *parent)) {
-            ret = as_error(EBUSY);
-        }
-        if (ret == 0) {
-            tracer->ptrace_traced = true;
-            tracer->ptrace_tracer_pid = parent->pid;
+        uint64_t ret = 0;
+        {
+            ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+            ret = can_trace(*parent, *tracer) ? 0 : as_error(EPERM);
+            if (ret == 0 && !child_events::attach_tracer(*tracer, *parent)) {
+                ret = as_error(EBUSY);
+            }
+            if (ret == 0) {
+                tracer->ptrace_traced = true;
+                tracer->ptrace_tracer_pid = parent->pid;
+            }
         }
         parent->release();
         return ret;
@@ -1128,7 +1328,8 @@ auto sys_ptrace(abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t 
         case abi::ptrace::request::DETACH:
             ret = detach(*tracer, *target);
             break;
-        case abi::ptrace::request::KILL:
+        case abi::ptrace::request::KILL: {
+            ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
             ret = require_traced(*tracer, *target);
             if (ret == 0 && !acknowledge_stop_for_resume(*tracer, *target)) {
                 ret = as_error(EBUSY);
@@ -1144,7 +1345,9 @@ auto sys_ptrace(abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t 
                 ker::mod::sched::reschedule_task_for_cpu(target->cpu, target);
             }
             break;
-        case abi::ptrace::request::CONT:
+        }
+        case abi::ptrace::request::CONT: {
+            ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
             ret = require_traced(*tracer, *target);
             if (ret == 0 && !acknowledge_stop_for_resume(*tracer, *target)) {
                 ret = as_error(EBUSY);
@@ -1166,7 +1369,9 @@ auto sys_ptrace(abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t 
                 }
             }
             break;
-        case abi::ptrace::request::SINGLESTEP:
+        }
+        case abi::ptrace::request::SINGLESTEP: {
+            ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
             ret = require_traced(*tracer, *target);
             if (ret == 0) {
                 auto* step_frame = user_resume_frame_for_step(*target);
@@ -1196,13 +1401,17 @@ auto sys_ptrace(abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t 
                 }
             }
             break;
-        case abi::ptrace::request::SYSCALL:
+        }
+        case abi::ptrace::request::SYSCALL: {
+            ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
             ret = require_traced(*tracer, *target);
             if (ret == 0 && !resume_syscall_after_require(*tracer, *target)) {
                 ret = as_error(EBUSY);
             }
             break;
-        case abi::ptrace::request::INTERRUPT:
+        }
+        case abi::ptrace::request::INTERRUPT: {
+            ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
             ret = require_traced(*tracer, *target);
             if (ret == 0 && (target->ptrace_stopped || target->ptrace_stop_pending)) {
                 ret = as_error(EBUSY);
@@ -1220,23 +1429,29 @@ auto sys_ptrace(abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t 
                 }
             }
             break;
-        case abi::ptrace::request::GETREGSET:
-            ret = require_traced(*tracer, *target);
+        }
+        case abi::ptrace::request::GETREGSET: {
+            ker::mod::security::Snapshot admitted_target;
+            ret = require_traced(*tracer, *target, &admitted_target);
             if (ret == 0) {
-                ret = read_regset(*tracer, *target, data);
+                ret = read_regset(*tracer, *target, data, admitted_target);
             }
             break;
-        case abi::ptrace::request::SETREGSET:
-            ret = require_traced(*tracer, *target);
+        }
+        case abi::ptrace::request::SETREGSET: {
+            ker::mod::security::Snapshot admitted_target;
+            ret = require_traced(*tracer, *target, &admitted_target);
             if (ret == 0) {
-                ret = write_regset(*tracer, *target, data);
+                ret = write_regset(*tracer, *target, data, admitted_target);
             }
             break;
+        }
         case abi::ptrace::request::PEEKDATA: {
-            ret = require_traced(*tracer, *target);
+            ker::mod::security::Snapshot admitted_target;
+            ret = require_traced(*tracer, *target, &admitted_target);
             if (ret == 0) {
                 uint64_t word = 0;
-                ret = copy_task_memory(*target, addr, &word, sizeof(word), false, nullptr);
+                ret = copy_task_memory(*target, addr, &word, sizeof(word), false, nullptr, admitted_target);
                 if (ret == 0) {
                     if (data == 0 || !ker::mod::sys::usercopy::copy_value_to_task(*tracer, data, word)) {
                         ret = as_error(EFAULT);
@@ -1246,78 +1461,91 @@ auto sys_ptrace(abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t 
             break;
         }
         case abi::ptrace::request::POKEDATA: {
-            ret = require_traced(*tracer, *target);
+            ker::mod::security::Snapshot admitted_target;
+            ret = require_traced(*tracer, *target, &admitted_target);
             if (ret == 0) {
-                ret = write_task_word(*target, addr, data);
+                ret = write_task_word(*target, addr, data, admitted_target);
             }
             break;
         }
         case abi::ptrace::request::READ_MEM: {
-            ret = require_traced(*tracer, *target);
+            ker::mod::security::Snapshot admitted_target;
+            ret = require_traced(*tracer, *target, &admitted_target);
             if (ret == 0) {
-                ret = transfer_memory(*tracer, *target, data, false);
+                ret = transfer_memory(*tracer, *target, data, false, admitted_target);
             }
             break;
         }
         case abi::ptrace::request::WRITE_MEM: {
-            ret = require_traced(*tracer, *target);
+            ker::mod::security::Snapshot admitted_target;
+            ret = require_traced(*tracer, *target, &admitted_target);
             if (ret == 0) {
-                ret = transfer_memory(*tracer, *target, data, true);
+                ret = transfer_memory(*tracer, *target, data, true, admitted_target);
             }
             break;
         }
-        case abi::ptrace::request::LIST_THREADS:
-            ret = require_traced(*tracer, *target);
-            if (ret == 0) {
-                ret = list_threads(*tracer, *target, data);
-            }
+        case abi::ptrace::request::LIST_THREADS: {
+            ker::mod::security::Snapshot admitted_target;
+            ret = require_traced(*tracer, *target, &admitted_target);
+            if (ret == 0) ret = list_threads(*tracer, *target, data, admitted_target);
             break;
-        case abi::ptrace::request::GETEVENTMSG:
-            ret = require_traced(*tracer, *target);
-            if (ret == 0) {
-                abi::ptrace::Event event{};
-                fill_event(*target, event);
-                if (data == 0 || !ker::mod::sys::usercopy::copy_value_to_task(*tracer, data, event)) {
-                    ret = as_error(EFAULT);
-                }
+        }
+        case abi::ptrace::request::GETEVENTMSG: {
+            abi::ptrace::Event event{};
+            {
+                ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+                ret = require_traced(*tracer, *target);
+                if (ret == 0) fill_event(*target, event);
             }
+            if (ret == 0 && (data == 0 || !ker::mod::sys::usercopy::copy_value_to_task(*tracer, data, event))) ret = as_error(EFAULT);
             break;
-        case abi::ptrace::request::SETOPTIONS:
+        }
+        case abi::ptrace::request::SETOPTIONS: {
+            ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
             ret = require_traced(*tracer, *target);
             if (ret == 0) {
                 target->ptrace_options = data;
             }
             break;
+        }
         case abi::ptrace::request::GET_REMOTE_INFO:
             ret = remote_info(*tracer, *target, data);
             break;
-        case abi::ptrace::request::SET_HW_BREAK:
-            ret = require_traced(*tracer, *target);
+        case abi::ptrace::request::SET_HW_BREAK: {
+            ker::mod::security::Snapshot admitted_target;
+            ret = require_traced(*tracer, *target, &admitted_target);
             if (ret == 0) {
-                ret = set_hw_break(*tracer, *target, data, true);
+                ret = set_hw_break(*tracer, *target, data, true, admitted_target);
             }
             break;
-        case abi::ptrace::request::DEL_HW_BREAK:
-            ret = require_traced(*tracer, *target);
+        }
+        case abi::ptrace::request::DEL_HW_BREAK: {
+            ker::mod::security::Snapshot admitted_target;
+            ret = require_traced(*tracer, *target, &admitted_target);
             if (ret == 0) {
-                ret = set_hw_break(*tracer, *target, data, false);
+                ret = set_hw_break(*tracer, *target, data, false, admitted_target);
             }
             break;
+        }
         case abi::ptrace::request::SYSCALL_WAIT:
             ret = syscall_wait(*tracer, *target, data);
             break;
-        case abi::ptrace::request::GET_IMAGES:
-            ret = require_traced(*tracer, *target);
+        case abi::ptrace::request::GET_IMAGES: {
+            ker::mod::security::Snapshot admitted_target;
+            ret = require_traced(*tracer, *target, &admitted_target);
             if (ret == 0) {
-                ret = list_images(*tracer, *target, data);
+                ret = list_images(*tracer, *target, data, admitted_target);
             }
             break;
-        case abi::ptrace::request::GET_IMAGE_CATALOG:
-            ret = require_traced(*tracer, *target);
+        }
+        case abi::ptrace::request::GET_IMAGE_CATALOG: {
+            ker::mod::security::Snapshot admitted_target;
+            ret = require_traced(*tracer, *target, &admitted_target);
             if (ret == 0) {
-                ret = list_image_catalog(*tracer, *target, data);
+                ret = list_image_catalog(*tracer, *target, data, admitted_target);
             }
             break;
+        }
         case abi::ptrace::request::GET_MAPS:
             ret = as_error(ENOSYS);
             break;
@@ -1351,6 +1579,7 @@ auto report_user_stop_common(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::Interr
     }
 
     clear_local_trap_flag();
+    frame.flags &= ~X86_RFLAGS_TF;
     task->context.regs = gpr;
     task->context.frame = frame;
     task->ptrace_stop_reason = reason;
@@ -1363,8 +1592,7 @@ auto report_user_stop_common(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::Interr
     task->ptrace_stop_uses_syscall_snapshot = false;
     clear_task_trap_flags(*task);
     task->set_wait_channel("ptrace", ker::mod::sched::task::WaitChannelKind::PTRACE);
-    ker::mod::sched::place_task_in_wait_queue(gpr, frame);
-    static_cast<void>(publish_stop_event(*task));
+    ker::mod::sched::place_task_in_wait_queue(gpr, frame, [](Task& stopped) { static_cast<void>(publish_stop_event(stopped)); });
     return true;
 }
 
@@ -1385,6 +1613,7 @@ auto report_syscall_stop(ker::mod::cpu::GPRegs& gpr, uint64_t callnum, bool exit
     if (task == nullptr || !task->ptrace_traced || !task->ptrace_syscall_trace) {
         return false;
     }
+    exit_pending_syscall_stop(*task);
 
     if (exiting) {
         if (!task->ptrace_syscall_in_stop) {
@@ -1414,10 +1643,11 @@ auto report_syscall_stop(ker::mod::cpu::GPRegs& gpr, uint64_t callnum, bool exit
     task->set_wait_channel("ptrace", ker::mod::sched::task::WaitChannelKind::PTRACE);
     static_cast<void>(publish_stop_event(*task));
 
-    while (task->ptrace_stopped) {
+    while (task->ptrace_stop_blocks_execution()) {
         ker::mod::sched::preemptible_syscall_park("ptrace", ker::mod::sched::task::WaitChannelKind::PTRACE);
     }
     restore_syscall_stop_context(*task, gpr);
+    exit_pending_syscall_stop(*task);
     return true;
 }
 
@@ -1426,6 +1656,7 @@ auto report_fatal_syscall_stop(ker::mod::cpu::GPRegs& gpr, uint64_t callnum) -> 
     if (task == nullptr || !task->ptrace_traced) {
         return false;
     }
+    exit_pending_syscall_stop(*task);
 
     capture_syscall_stop_context(*task, gpr);
     task->ptrace_stop_reason = abi::ptrace::stop_reason::EXCEPTION;
@@ -1440,16 +1671,292 @@ auto report_fatal_syscall_stop(ker::mod::cpu::GPRegs& gpr, uint64_t callnum) -> 
     task->set_wait_channel("ptrace", ker::mod::sched::task::WaitChannelKind::PTRACE);
     static_cast<void>(publish_stop_event(*task));
 
-    while (task->ptrace_stopped) {
+    while (task->ptrace_stop_blocks_execution()) {
         ker::mod::sched::preemptible_syscall_park("ptrace", ker::mod::sched::task::WaitChannelKind::PTRACE);
     }
     restore_syscall_stop_context(*task, gpr);
+    exit_pending_syscall_stop(*task);
     return true;
 }
 
 auto report_signal_stop(ker::mod::sched::task::Task& task, uint32_t signal) -> bool { return record_signal_stop(task, signal); }
 
 #ifdef WOS_SELFTEST
+auto ptrace_selftest_fatal_release_preserves_claims() -> bool {
+    Task tracer{};
+    Task target{};
+    tracer.pid = 0x9F001;
+    target.pid = 0x9F002;
+    tracer.type = target.type = ker::mod::sched::task::TaskType::PROCESS;
+    auto const CREDENTIALS = ker::mod::security::Snapshot::bootstrap_root();
+    if (ker::mod::sched::resource::initialize_credentials(tracer, CREDENTIALS) != 0 ||
+        ker::mod::sched::resource::initialize_credentials(target, CREDENTIALS) != 0)
+        return false;
+    // Hidden objects must not be admitted to a runqueue by event wakeups.
+    tracer.state.store(ker::mod::sched::task::TaskState::EXITING);
+    target.state.store(ker::mod::sched::task::TaskState::EXITING);
+    target.ptrace_traced = true;
+    target.ptrace_tracer_pid = tracer.pid;
+    target.ptrace_stopped = true;
+    target.ptrace_stop_pending = true;
+    target.ptrace_stop_reason = abi::ptrace::stop_reason::INTERRUPT;
+    target.ptrace_stop_signal = SIGSTOP;
+    if (!child_events::attach_tracer(target, tracer)) return false;
+    bool ok = publish_stop_event(target) && target.ptrace_stop_blocks_execution();
+    target.signal_add_pending_mask((uint64_t{1} << (SIGUSR1 - 1)) | (uint64_t{1} << (SIGCONT - 1)));
+    ok &= target.ptrace_stop_blocks_execution();
+    child_events::ClaimedEvent claimed{};
+    abi::ptrace::StopInfo stop{};
+    bool ready = false;
+    ok &= capture_wait_event(tracer, target, nullptr, claimed, stop, ready) == 0 && ready;
+    auto const COOKIE = claimed.claim_cookie;
+    // A tracer-owned claim prevents CONT's acknowledgment but not fatal
+    // execution admission, and exit uses an independent retained event slot.
+    ok &= !acknowledge_stop_for_resume(tracer, target);
+    target.signal_add_pending_mask(uint64_t{1} << (SIGKILL - 1));
+    ok &= !target.ptrace_stop_blocks_execution() && target.ptrace_stop_pending && claimed.claim_cookie == COOKIE;
+    target.exit_status = SIGKILL;
+    target.has_exited = true;
+    target.exit_notify_ready.store(true);
+    ok &= child_events::publish_exit(target) && !target.ptrace_stop_blocks_execution();
+    ok &= child_events::commit_claim(tracer, tracer, claimed, false);
+    child_events::release_claim(tracer, claimed);
+    ready = false;
+    ok &= capture_wait_event(tracer, target, nullptr, claimed, stop, ready) == 0 && ready && stop.wait_status == SIGKILL;
+    ok &= child_events::commit_claim(tracer, tracer, claimed, false);
+    child_events::release_claim(tracer, claimed);
+    child_events::detach_tracer(target);
+    return ok && tracer.ref_count.load() == 1 && target.ref_count.load() == 1;
+}
+
+auto ptrace_selftest_observation_snapshot_and_claims() -> bool {
+    using ker::mod::security::Change;
+    using ker::mod::security::Snapshot;
+    Task tracer{};
+    Task target{};
+    tracer.pid = 0x9E001;
+    target.pid = 0x9E002;
+    tracer.type = target.type = ker::mod::sched::task::TaskType::PROCESS;
+    auto const ADMITTED = Snapshot::bootstrap_root();
+    Snapshot changed;
+    if (ADMITTED.prepare({.change = Change::SET_DUMPABLE, .dumpable = !ADMITTED.dumpable()}, changed) != 0 ||
+        ker::mod::sched::resource::initialize_credentials(tracer, ADMITTED) != 0 ||
+        ker::mod::sched::resource::initialize_credentials(target, changed) != 0)
+        return false;
+    // Private fixtures must never be published by a lifecycle wake.
+    tracer.state.store(ker::mod::sched::task::TaskState::EXITING, std::memory_order_release);
+    target.state.store(ker::mod::sched::task::TaskState::EXITING, std::memory_order_release);
+    target.ptrace_traced = true;
+    target.ptrace_tracer_pid = tracer.pid;
+    target.ptrace_stopped = true;
+    target.ptrace_stop_pending = true;
+    target.ptrace_stop_reason = abi::ptrace::stop_reason::INTERRUPT;
+    target.ptrace_stop_signal = SIGSTOP;
+    std::array<uint64_t, 2> tids{11, 22};
+    size_t count = 17;
+    abi::ptrace::RemoteInfo remote{};
+    std::memset(&remote, 0xa5, sizeof(remote));
+    auto const REMOTE_BEFORE = remote;
+    abi::ptrace::StopInfo stop{};
+    std::memset(&stop, 0xa5, sizeof(stop));
+    auto const STOP_BEFORE = stop;
+    child_events::ClaimedEvent claimed{};
+    bool exited = true;
+    bool ready = true;
+    if (capture_threads(target, ADMITTED, tids.data(), tids.size(), count) != as_error(EPERM) || count != 17 ||
+        tids != std::array<uint64_t, 2>{11, 22} || capture_remote_info(target, ADMITTED, remote) != as_error(EPERM) ||
+        std::memcmp(&remote, &REMOTE_BEFORE, sizeof(remote)) != 0 ||
+        begin_syscall_wait(tracer, target, ADMITTED, exited) != as_error(EPERM) || !exited || !target.ptrace_stopped ||
+        target.ptrace_syscall_trace || capture_wait_event(tracer, target, &ADMITTED, claimed, stop, ready) != as_error(EPERM) || !ready ||
+        claimed.node != nullptr || std::memcmp(&stop, &STOP_BEFORE, sizeof(stop)) != 0)
+        return false;
+    if (capture_threads(target, changed, nullptr, 0, count) != 0 || count != 0 || capture_remote_info(target, changed, remote) != 0 ||
+        remote.proxy_pid != target.pid || remote.task_id != 0 || remote.state != 0 || remote.target_node != PTRACE_REMOTE_NODE_INVALID)
+        return false;
+    target.has_exited = true;
+    target.exit_notify_ready.store(true, std::memory_order_release);
+    exited = false;
+    bool ok = begin_syscall_wait(tracer, target, changed, exited) == 0 && exited && target.ptrace_stopped && !target.ptrace_syscall_trace;
+    target.has_exited = false;
+    target.exit_notify_ready.store(false, std::memory_order_release);
+    if (!child_events::attach_tracer(target, tracer)) return false;
+    ok = ok && publish_stop_event(target);
+    ready = false;
+    ok = ok && capture_wait_event(tracer, target, nullptr, claimed, stop, ready) == 0 && ready && stop.event.tid == target.pid &&
+         stop.event.reason == abi::ptrace::stop_reason::INTERRUPT && stop.wait_status == stop_wait_status(target);
+    auto const COOKIE = claimed.claim_cookie;
+    auto const CLAIMED_STOP = stop;
+    child_events::ClaimedEvent competing{};
+    bool competing_ready = false;
+    ok = ok && capture_wait_event(tracer, target, nullptr, competing, stop, competing_ready) == as_error(EBUSY) && !competing_ready &&
+         std::memcmp(&stop, &CLAIMED_STOP, sizeof(stop)) == 0;
+    child_events::release_claim(tracer, claimed);
+    ready = false;
+    ok = ok && capture_wait_event(tracer, target, nullptr, claimed, stop, ready) == 0 && ready && claimed.claim_cookie != COOKIE;
+    ok = ok && child_events::commit_claim(tracer, tracer, claimed, false) && !target.ptrace_stop_pending;
+    child_events::release_claim(tracer, claimed);
+    child_events::detach_tracer(target);
+    return ok && tracer.ref_count.load(std::memory_order_acquire) == 1 && target.ref_count.load(std::memory_order_acquire) == 1;
+}
+
+auto ptrace_selftest_register_snapshot_rejects_changed_credentials() -> bool {
+    using namespace ker::mod::security;
+    Task target{};
+    target.type = ker::mod::sched::task::TaskType::PROCESS;
+    target.ptrace_stopped = true;
+    target.context.frame.rip = 0x401000;
+    target.context.frame.rsp = 0x7fff0000;
+    target.context.frame.cs = ker::mod::desc::gdt::GDT_USER_CS;
+    target.context.frame.ss = ker::mod::desc::gdt::GDT_USER_DS;
+    target.context.frame.flags = 0x202;
+    target.context.regs.rax = 123;
+    target.fx_state.raw.fill(0x37);
+    target.ptrace_dr_addr.at(0) = 0x1111;
+    target.ptrace_dr7 = X86_DR7_RESERVED_ONES;
+    auto const ADMITTED = Snapshot::bootstrap_root();
+    Snapshot changed;
+    if (ADMITTED.prepare({.change = Change::SET_DUMPABLE, .dumpable = !ADMITTED.dumpable()}, changed) != 0 ||
+        ker::mod::sched::resource::initialize_credentials(target, changed) != 0)
+        return false;
+    abi::ptrace::X86_64GprState before{};
+    if (!fill_gprs(target, before)) return false;
+    auto input = before;
+    input.rax = 456;
+    abi::ptrace::X86_64GprState output{};
+    std::memset(&output, 0xa5, sizeof(output));
+    auto const SENTINEL = output;
+    auto const FPU_BEFORE = target.fx_state.raw;
+    XStateBuffer xstate{};
+    xstate.fill(0xa5);
+    auto const XSTATE_SENTINEL = xstate;
+    XStateBuffer valid_xstate{};
+    valid_xstate.at(0) = 0x7f;
+    valid_xstate.at(1) = 0x03;
+    valid_xstate.at(24) = 0x80;
+    valid_xstate.at(25) = 0x1f;
+    abi::ptrace::HwBreak const POINT{.address = 0x401000, .length = 1, .type = abi::ptrace::hw_break_type::EXECUTE, .slot = 0};
+    if (capture_gprs(target, output, ADMITTED) != as_error(EPERM) || std::memcmp(&output, &SENTINEL, sizeof(output)) != 0 ||
+        apply_gprs(target, input, ADMITTED) != as_error(EPERM) || target.context.regs.rax != before.rax ||
+        capture_xstate(target, xstate, ADMITTED) != as_error(EPERM) || xstate != XSTATE_SENTINEL ||
+        apply_xstate(target, valid_xstate, ADMITTED) != as_error(EPERM) || target.fx_state.raw != FPU_BEFORE || target.fx_state.saved ||
+        target.fx_state.live_saved || target.fx_state.initialized || apply_hw_break(target, POINT, true, ADMITTED) != as_error(EPERM) ||
+        apply_hw_break(target, POINT, false, ADMITTED) != as_error(EPERM) || target.ptrace_dr_addr.at(0) != 0x1111 ||
+        target.ptrace_dr7 != X86_DR7_RESERVED_ONES)
+        return false;
+    if (capture_gprs(target, output, changed) != 0 || std::memcmp(&output, &before, sizeof(output)) != 0 ||
+        apply_gprs(target, input, changed) != 0 || target.context.regs.rax != input.rax || apply_gprs(target, before, changed) != 0 ||
+        capture_xstate(target, xstate, changed) != 0 || std::memcmp(xstate.data(), target.fx_state.aligned(), xstate.size()) != 0 ||
+        apply_xstate(target, valid_xstate, changed) != 0 ||
+        std::memcmp(valid_xstate.data(), target.fx_state.aligned(), valid_xstate.size()) != 0 || !target.fx_state.saved ||
+        !target.fx_state.live_saved || !target.fx_state.initialized)
+        return false;
+    return apply_hw_break(target, POINT, true, changed) == 0 && target.ptrace_dr_addr.at(0) == POINT.address &&
+           apply_hw_break(target, POINT, false, changed) == 0 && target.ptrace_dr_addr.at(0) == 0;
+}
+
+auto ptrace_selftest_memory_snapshot_rejects_changed_credentials() -> bool {
+    using namespace ker::mod::security;
+    Task target{};
+    target.type = ker::mod::sched::task::TaskType::PROCESS;
+    auto const ADMITTED = Snapshot::bootstrap_root();
+    Snapshot changed;
+    if (ADMITTED.prepare({.change = Change::SET_DUMPABLE, .dumpable = !ADMITTED.dumpable()}, changed) != 0 ||
+        ker::mod::sched::resource::initialize_credentials(target, changed) != 0)
+        return false;
+    std::array<uint8_t, 8> bytes{1, 2, 3, 4, 5, 6, 7, 8};
+    auto const BEFORE = bytes;
+    for (bool write : {false, true}) {
+        size_t transferred = 19;
+        if (copy_prepared_task_memory(target, 1, bytes.data(), bytes.size(), write, &transferred, ADMITTED) != as_error(EPERM) ||
+            transferred != 0 || bytes != BEFORE)
+            return false;
+        transferred = 19;
+        if (copy_task_memory(target, 1, bytes.data(), bytes.size(), write, &transferred, ADMITTED) != as_error(EPERM) || transferred != 0 ||
+            bytes != BEFORE)
+            return false;
+        if (copy_prepared_task_memory(target, 1, bytes.data(), bytes.size(), write, &transferred, changed) != as_error(EFAULT) ||
+            transferred != 0 || bytes != BEFORE)
+            return false;
+    }
+    return write_prepared_task_word(target, 1, 0x1234, ADMITTED) == as_error(EPERM) &&
+           write_task_word(target, 1, 0x1234, ADMITTED) == as_error(EPERM) &&
+           write_prepared_task_word(target, 1, 0x1234, changed) == as_error(EFAULT) && target.credentials() == changed &&
+           target.pagemap == nullptr && target.usercopy_pagemap_accesses.load() == 0;
+}
+
+auto ptrace_selftest_image_snapshot_rejects_changed_credentials() -> bool {
+    using namespace ker::mod::security;
+    namespace runtime = ker::loader::runtime;
+    Task tracer{}, target{};
+    tracer.pid = 71;
+    target.pid = 72;
+    target.type = ker::mod::sched::task::TaskType::PROCESS;
+    auto const ROOT = Snapshot::bootstrap_root();
+    if (ker::mod::sched::resource::initialize_credentials(tracer, ROOT) != 0 ||
+        ker::mod::sched::resource::initialize_credentials(target, ROOT) != 0)
+        return false;
+    target.ptrace_traced = true;
+    target.ptrace_tracer_pid = tracer.pid;
+    Snapshot admitted;
+    if (require_traced(tracer, target, &admitted) != 0 || admitted != ROOT) return false;
+    auto* images = new (std::nothrow) std::array<runtime::RuntimeImage, runtime::MAX_IMAGES>{};
+    if (images == nullptr) return false;
+    images->front().entry = 0x1234;
+    images->back().entry = 0x5678;
+    size_t needed = 17;
+    auto status = runtime::SnapshotStatus::TRUNCATED;
+    Snapshot changed;
+    bool ok = ROOT.prepare({.change = Change::SET_DUMPABLE, .dumpable = !ROOT.dumpable()}, changed) == 0 &&
+              ker::mod::sched::resource::initialize_credentials(target, changed) == 0;
+    ok = ok && !snapshot_target_images(target, admitted, *images, needed, status) && needed == 17 &&
+         status == runtime::SnapshotStatus::TRUNCATED && images->front().entry == 0x1234 && images->back().entry == 0x5678;
+    // A fresh permitted decision may capture the current image. An empty
+    // private Task has no interpreter or image extents: an empty static result.
+    ok = ok && require_traced(tracer, target, &admitted) == 0 && snapshot_target_images(target, admitted, *images, needed, status) &&
+         needed == 0 && status == runtime::SnapshotStatus::STATIC_IMAGE;
+    delete images;
+    return ok;
+}
+
+auto ptrace_selftest_register_rejection_preserves_state() -> bool {
+    Task target{};
+    target.type = ker::mod::sched::task::TaskType::PROCESS;
+    target.ptrace_stopped = true;
+    target.context.frame.rip = 0x401000;
+    target.context.frame.rsp = 0x7fff0000;
+    target.context.frame.cs = ker::mod::desc::gdt::GDT_USER_CS;
+    target.context.frame.ss = ker::mod::desc::gdt::GDT_USER_DS;
+    target.context.frame.flags = 0x202;
+    target.context.regs.rax = 123;
+    abi::ptrace::X86_64GprState before{};
+    if (!fill_gprs(target, before)) {
+        return false;
+    }
+    for (unsigned bit = 12; bit < 16; ++bit) {
+        auto input = before;
+        input.rax = 456;
+        input.rflags |= 1ULL << bit;
+        abi::ptrace::X86_64GprState after{};
+        if (set_gprs(target, input) != as_error(EINVAL) || !fill_gprs(target, after) || std::memcmp(&before, &after, sizeof(before)) != 0) {
+            return false;
+        }
+    }
+    auto input = before;
+    input.rax = 789;
+    if (set_gprs(target, input) != 0 || target.context.regs.rax != input.rax) {
+        return false;
+    }
+    target.context.frame.cs = ker::mod::desc::gdt::GDT_KERN_CS;
+    auto const REGS = target.context.regs;
+    auto const FRAME = target.context.frame;
+    abi::ptrace::X86_64GprState rejected{};
+    std::memset(&rejected, 0xa5, sizeof(rejected));
+    auto const OUTPUT = rejected;
+    return !fill_gprs(target, rejected) && std::memcmp(&rejected, &OUTPUT, sizeof(OUTPUT)) == 0 &&
+           set_gprs(target, input) == as_error(EIO) && std::memcmp(&REGS, &target.context.regs, sizeof(REGS)) == 0 &&
+           std::memcmp(&FRAME, &target.context.frame, sizeof(FRAME)) == 0;
+}
+
 auto ptrace_selftest_syscall_snapshot_patches_live_sysret_state() -> bool {
     auto* stack = static_cast<uint8_t*>(ker::mod::mm::phys::kernel_stack_alloc("ptrace_sysret_state_ktest"));
     if (stack == nullptr) {

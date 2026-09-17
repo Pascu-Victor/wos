@@ -24,6 +24,7 @@
 #include <new>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/security/authorization.hpp>
 #include <platform/sys/usercopy.hpp>
 #include <span>
 #include <string_view>
@@ -573,6 +574,9 @@ ssize_t socket_fops_read(ker::vfs::File* f, void* buf, size_t count, size_t /*un
     if (sock->proto_ops == nullptr || sock->proto_ops->recv == nullptr) {
         return -ENOSYS;
     }
+    // Match recv()'s user-bounce entry: an empty read must not enter a
+    // protocol receive wait, even when the connected peer has sent no data.
+    if (count == 0) return 0;
     return clamp_io_count(run_socket_call<ssize_t>(f, sock, 0, [&](int flags) { return sock->proto_ops->recv(sock, buf, count, flags); }),
                           count);
 }
@@ -1014,36 +1018,13 @@ auto socket_protocol_supported(int type, int protocol) -> bool {
     }
 }
 
-auto effective_ifflags(ker::net::NetDevice* dev) -> uint32_t {
-    if (dev == nullptr) {
-        return 0;
-    }
-    uint32_t flags = dev->link_flags;
-    if (dev->state != 0) {
-        flags |= IFF_UP | IFF_RUNNING | IFF_LOWER_UP;
-    }
+auto effective_ifflags(const ker::net::NetDeviceConfigSnapshot& config) -> uint32_t {
+    uint32_t flags = config.link_flags;
+    if (config.state != 0) flags |= IFF_UP | IFF_RUNNING | IFF_LOWER_UP;
     return flags;
 }
 
-void apply_ifflags(ker::net::NetDevice* dev, uint32_t flags, uint32_t mask) {
-    if (dev == nullptr) {
-        return;
-    }
-
-    if ((mask & IFF_UP) != 0) {
-        if ((flags & IFF_UP) != 0) {
-            dev->state = 1;
-            if (dev->ops != nullptr && dev->ops->open != nullptr) {
-                dev->ops->open(dev);
-            }
-        } else {
-            dev->state = 0;
-            if (dev->ops != nullptr && dev->ops->close != nullptr) {
-                dev->ops->close(dev);
-            }
-        }
-    }
-
+void publish_ifflags(ker::net::NetDevice* dev, uint32_t flags, uint32_t mask) {
     constexpr uint32_t STORED_MASK = IFF_BROADCAST | IFF_LOOPBACK | IFF_NOARP | IFF_PROMISC | IFF_MULTICAST;
     uint32_t const STORE = mask & STORED_MASK;
     dev->link_flags &= ~STORE;
@@ -1052,20 +1033,51 @@ void apply_ifflags(ker::net::NetDevice* dev, uint32_t flags, uint32_t mask) {
     ker::net::wki::wki_remotable_notify_net_changed(dev);
 }
 
+auto apply_ifflags(ker::net::NetDevice* dev, uint32_t flags, uint32_t mask, const ker::mod::security::Snapshot& CREDENTIALS) -> int {
+    if (dev == nullptr) {
+        return -ENODEV;
+    }
+
+    if ((mask & IFF_UP) != 0) {
+        if ((flags & IFF_UP) != 0) {
+            int status = 0;
+            if (dev->ops != nullptr && dev->ops->open_as != nullptr) {
+                status = dev->ops->open_as(dev, CREDENTIALS);
+            } else if (dev->ops != nullptr && dev->ops->open != nullptr) {
+                status = dev->ops->open(dev);
+            }
+            if (status != 0) return status < 0 ? status : -EIO;
+            dev->state = 1;
+        } else {
+            if (dev->ops != nullptr && dev->ops->close_as != nullptr) {
+                int const STATUS = dev->ops->close_as(dev, CREDENTIALS);
+                if (STATUS != 0) return STATUS < 0 ? STATUS : -EIO;
+            } else if (dev->ops != nullptr && dev->ops->close != nullptr) {
+                dev->ops->close(dev);
+            }
+            dev->state = 0;
+        }
+    }
+
+    publish_ifflags(dev, flags, mask);
+    return 0;
+}
+
 void fill_if_info(WosNetIfInfo& out, ker::net::NetDevice* dev) {
     out = {};
     if (dev == nullptr) {
         return;
     }
-    out.ifindex = dev->ifindex;
-    copy_cstr_trunc(std::span<char, WOS_NET_IF_NAME_LEN>{out.name}, dev->name.data());
-    out.flags = effective_ifflags(dev);
-    out.mtu = dev->mtu;
-    out.tx_queue_len = dev->tx_queue_len;
+    auto const CONFIG = ker::net::netdev_config_snapshot(dev);
+    out.ifindex = CONFIG.ifindex;
+    copy_cstr_trunc(std::span<char, WOS_NET_IF_NAME_LEN>{out.name}, CONFIG.name.data());
+    out.flags = effective_ifflags(CONFIG);
+    out.mtu = CONFIG.mtu;
+    out.tx_queue_len = CONFIG.tx_queue_len;
     out.type = ((out.flags & IFF_LOOPBACK) != 0) ? WOS_ARPHRD_LOOPBACK : WOS_ARPHRD_ETHER;
     out.addr_len = 6;
-    out.operstate = dev->state != 0 ? 6 : 2;  // Linux IF_OPER_UP / IF_OPER_DOWN
-    std::copy_n(dev->mac.data(), 6, out.addr);
+    out.operstate = CONFIG.state != 0 ? 6 : 2;  // Linux IF_OPER_UP / IF_OPER_DOWN
+    std::copy_n(CONFIG.mac.data(), 6, out.addr);
     std::fill_n(out.broadcast, 6, 0xff);
 }
 
@@ -1089,39 +1101,505 @@ auto find_dev_for_link_req(const WosNetLinkSetReq* req) -> ker::net::NetDeviceRe
     return ker::net::netdev_find_by_name_ref(std::string_view(req->ifname, strnlen(req->ifname, WOS_NET_IF_NAME_LEN)));
 }
 
-auto rename_netdev(ker::net::NetDevice* dev, const char* new_name) -> int {
+auto rename_netdev(const ker::net::NetDeviceRef& dev, const char* new_name) -> int {
     size_t const LEN = strnlen(new_name, WOS_NET_IF_NAME_LEN);
-    if (dev == nullptr || LEN == 0 || LEN >= WOS_NET_IF_NAME_LEN) {
-        return -EINVAL;
-    }
-    auto existing_ref = ker::net::netdev_find_by_name_ref(std::string_view(new_name, LEN));
-    if (existing_ref && existing_ref.get() != dev) {
-        return -EEXIST;
-    }
-    dev->name.fill('\0');
-    std::copy_n(new_name, LEN, dev->name.data());
-    return 0;
+    if (!dev || LEN == 0 || LEN >= WOS_NET_IF_NAME_LEN) return -EINVAL;
+    return ker::net::netdev_rename(dev.identity(), std::string_view(new_name, LEN));
 }
 
-auto set_netdev_hwaddr(ker::net::NetDevice* dev, const uint8_t* hwaddr, uint8_t len) -> int {
-    if (dev == nullptr || hwaddr == nullptr || len != 6) {
-        return -EINVAL;
+void commit_netdev_hwaddr(ker::net::NetDevice* dev, const uint8_t* hwaddr) {
+    if (!std::equal(dev->mac.bytes.begin(), dev->mac.bytes.end(), hwaddr)) {
+        if (dev->ops != nullptr && dev->ops->set_mac != nullptr)
+            dev->ops->set_mac(dev, hwaddr);
+        else
+            std::copy_n(hwaddr, 6, dev->mac.data());
     }
-    if (dev->ops != nullptr && dev->ops->set_mac != nullptr) {
-        dev->ops->set_mac(dev, hwaddr);
+    ker::net::wki::wki_dev_server_notify_net_changed(dev);
+    ker::net::wki::wki_remotable_notify_net_changed(dev);
+}
+
+auto set_netdev_hwaddr(ker::net::NetDevice* dev, const uint8_t* hwaddr, uint8_t len, const ker::mod::security::Snapshot& caller) -> int {
+    if (dev == nullptr || hwaddr == nullptr || len != 6) return -EINVAL;
+    if (dev->ops != nullptr && dev->ops->apply_link_as != nullptr) {
+        ker::net::NetDeviceLinkControl control{.change_mac = true};
+        std::copy_n(hwaddr, 6, control.mac.data());
+        int const STATUS = dev->ops->apply_link_as(dev, control, caller);
+        if (STATUS != 0) return STATUS < 0 ? STATUS : -EIO;
     } else {
-        std::copy_n(hwaddr, 6, dev->mac.data());
+        int const STATUS = ker::net::netdev_check_mac(dev, hwaddr);
+        if (STATUS != 0) return STATUS;
+        commit_netdev_hwaddr(dev, hwaddr);
     }
-    ker::net::wki::wki_dev_server_notify_net_changed(dev);
-    ker::net::wki::wki_remotable_notify_net_changed(dev);
     return 0;
 }
 
-void notify_netdev_l3_changed(ker::net::NetDevice* dev) {
-    ker::net::wki::wki_dev_server_notify_net_changed(dev);
-    ker::net::wki::wki_remotable_notify_net_changed(dev);
+auto apply_link_request(const WosNetLinkSetReq& req, const ker::mod::security::Snapshot& CREDENTIALS) -> uint64_t {
+    int const AUTHORIZATION = ker::mod::security::authorize_network_administration(CREDENTIALS);
+    if (AUTHORIZATION != 0) return static_cast<uint64_t>(AUTHORIZATION);
+    auto dev_ref = find_dev_for_link_req(&req);
+    if (!dev_ref) {
+        return static_cast<uint64_t>(-ENODEV);
+    }
+    auto* dev = dev_ref.get();
+
+    if ((req.fields & WOS_NET_LINK_SET_MTU) != 0 && req.mtu == 0) {
+        return static_cast<uint64_t>(-EINVAL);
+    }
+    if ((req.fields & WOS_NET_LINK_SET_HWADDR) != 0 && req.hwaddr_len != 6) {
+        return static_cast<uint64_t>(-EINVAL);
+    }
+    ker::net::NetDeviceControlGuard control_guard;
+    int const CONTROL_ADMISSION = control_guard.try_acquire(dev);
+    if (CONTROL_ADMISSION != 0) return static_cast<uint64_t>(CONTROL_ADMISSION);
+    // Hold namespace admission across driver open without exposing the new
+    // name. A refusal cancels the claim before any other field is changed.
+    ker::net::NetDeviceNameChange name_change;
+    if ((req.fields & WOS_NET_LINK_SET_NAME) != 0) {
+        size_t const NAME_LEN = strnlen(req.new_name, WOS_NET_IF_NAME_LEN);
+        int const RET = name_change.prepare(dev_ref.identity(), std::string_view(req.new_name, NAME_LEN));
+        if (RET < 0) return static_cast<uint64_t>(RET);
+    }
+
+    bool const HAS_MAC = (req.fields & WOS_NET_LINK_SET_HWADDR) != 0;
+    bool const REMOTE_LINK = HAS_MAC && dev->ops != nullptr && dev->ops->apply_link_as != nullptr;
+    if (REMOTE_LINK) {
+        ker::net::NetDeviceLinkControl control{
+            .change_state = (req.fields & WOS_NET_LINK_SET_FLAGS) != 0 && (req.flag_mask & IFF_UP) != 0,
+            .up = (req.flags & IFF_UP) != 0,
+            .change_mac = true,
+        };
+        std::copy_n(req.hwaddr, 6, control.mac.data());
+        int const STATUS = dev->ops->apply_link_as(dev, control, CREDENTIALS);
+        if (STATUS != 0) return static_cast<uint64_t>(STATUS < 0 ? STATUS : -EIO);
+        if ((req.fields & WOS_NET_LINK_SET_FLAGS) != 0) publish_ifflags(dev, req.flags, req.flag_mask);
+    } else {
+        // MAC admission precedes every driver and local field effect. Native
+        // commit cannot refuse an admitted value while this device is retained.
+        if (HAS_MAC) {
+            int const STATUS = ker::net::netdev_check_mac(dev, req.hwaddr);
+            if (STATUS != 0) return static_cast<uint64_t>(STATUS);
+        }
+        if ((req.fields & WOS_NET_LINK_SET_FLAGS) != 0) {
+            int const RET = apply_ifflags(dev, req.flags, req.flag_mask, CREDENTIALS);
+            if (RET != 0) return static_cast<uint64_t>(RET);
+        }
+        if (HAS_MAC) commit_netdev_hwaddr(dev, req.hwaddr);
+    }
+    if ((req.fields & WOS_NET_LINK_SET_MTU) != 0) {
+        dev->mtu = req.mtu;
+    }
+    if ((req.fields & WOS_NET_LINK_SET_TXQLEN) != 0) {
+        dev->tx_queue_len = req.tx_queue_len;
+    }
+    name_change.commit();
+    if ((req.fields & (WOS_NET_LINK_SET_MTU | WOS_NET_LINK_SET_NAME)) != 0) {
+        ker::net::wki::wki_dev_server_notify_net_changed(dev);
+        ker::net::wki::wki_remotable_notify_net_changed(dev);
+    }
+    return 0;
+}
+
+}  // namespace
+
+#if defined(WOS_SELFTEST) && WOS_SELFTEST
+namespace {
+struct LinkPolicyTestContext {
+    ker::net::NetDevice* competitor = nullptr;
+    unsigned opens = 0;
+    unsigned mac_changes = 0;
+    int competing_rename = 0;
+    int open_error = 0;
+    ker::mod::security::Snapshot expected;
+    unsigned mapped_opens = 0;
+    bool identity_matches = false;
+    int mac_error = 0;
+    unsigned mac_checks = 0;
+};
+
+auto link_policy_test_open(ker::net::NetDevice* dev) -> int {
+    auto* context = static_cast<LinkPolicyTestContext*>(dev->private_data);
+    ++context->opens;
+    if (context->open_error != 0) return context->open_error;
+    auto competitor = ker::net::netdev_retain_registered(context->competitor);
+    context->competing_rename = rename_netdev(competitor, "kt-link-new");
+    return 0;
+}
+
+auto link_policy_test_open_as(ker::net::NetDevice* dev, const ker::mod::security::Snapshot& caller) -> int {
+    auto* context = static_cast<LinkPolicyTestContext*>(dev->private_data);
+    ++context->mapped_opens;
+    context->identity_matches = caller == context->expected;
+    return context->open_error;
+}
+
+auto link_policy_test_check_mac(ker::net::NetDevice* dev, const uint8_t*) -> int {
+    auto* context = static_cast<LinkPolicyTestContext*>(dev->private_data);
+    ++context->mac_checks;
+    return context->mac_error;
+}
+
+auto link_policy_test_apply_link(ker::net::NetDevice* dev, const ker::net::NetDeviceLinkControl& control,
+                                 const ker::mod::security::Snapshot& caller) -> int {
+    auto* context = static_cast<LinkPolicyTestContext*>(dev->private_data);
+    ++context->mapped_opens;
+    context->identity_matches = caller == context->expected && control.change_mac && control.change_state && control.up &&
+                                control.mac[0] == 2 && control.mac[5] == 37;
+    if (context->open_error != 0) return context->open_error;
+    dev->state = control.up ? 1 : 0;
+    dev->mac = control.mac;
+    return 0;
+}
+
+void link_policy_test_mac(ker::net::NetDevice* dev, const uint8_t* mac) {
+    auto* context = static_cast<LinkPolicyTestContext*>(dev->private_data);
+    ++context->mac_changes;
+    std::copy_n(mac, dev->mac.size(), dev->mac.data());
 }
 }  // namespace
+
+namespace {
+struct LinkWriterTestContext {
+    ker::mod::security::Snapshot denied;
+    unsigned calls = 0;
+    int error = 0;
+    bool overlaps_rejected = true;
+};
+auto link_writer_test_open(ker::net::NetDevice* dev) -> int {
+    auto& context = *static_cast<LinkWriterTestContext*>(dev->private_data);
+    ++context.calls;
+    // Enter another complete control request at the driver's suspension point.
+    // It must fail before claiming a name or publishing even unrelated fields.
+    WosNetLinkSetReq competing{};
+    competing.ifindex = dev->ifindex;
+    competing.fields = WOS_NET_LINK_SET_MTU | WOS_NET_LINK_SET_TXQLEN | WOS_NET_LINK_SET_NAME;
+    competing.mtu = 777;
+    competing.tx_queue_len = 19;
+    std::strcpy(competing.new_name, "kt-writer-other");
+    auto const ROOT = ker::mod::security::Snapshot::bootstrap_root();
+    context.overlaps_rejected &= static_cast<int64_t>(apply_link_request(competing, ROOT)) == -EBUSY;
+    context.overlaps_rejected &= static_cast<int64_t>(apply_link_request(competing, context.denied)) == -EPERM;
+    context.overlaps_rejected &= dev->mtu == 1500 && dev->tx_queue_len == 1000 && !ker::net::netdev_find_by_name_ref("kt-writer-other");
+    return context.error;
+}
+}  // namespace
+
+auto net_selftest_socket_zero_read_does_not_receive() -> bool {
+    int calls = 0;
+    ker::net::SocketProtoOps ops{};
+    ops.recv = [](ker::net::Socket* sock, void*, size_t, int) -> ssize_t {
+        ++*static_cast<int*>(sock->proto_data);
+        return -EIO;
+    };
+    ker::net::Socket sock{};
+    sock.proto_ops = &ops;
+    sock.proto_data = &calls;
+    ker::vfs::File file{};
+    file.private_data = &sock;
+    uint8_t byte = 0;
+    bool ok = socket_fops_read(&file, &byte, 0, 0) == 0 && socket_fops_read(&file, nullptr, 0, 0) == 0 && calls == 0;
+    ok = socket_fops_read(&file, &byte, 1, 0) == -EIO && calls == 1 && ok;
+    sock.proto_ops = nullptr;
+    return socket_fops_read(&file, &byte, 0, 0) == -ENOSYS && socket_fops_read(nullptr, &byte, 0, 0) == -EINVAL && ok;
+}
+
+auto net_selftest_link_writer_admission() -> bool {
+    using namespace ker::mod::security;
+    LinkWriterTestContext context;
+    if (Snapshot::restore_fields({.user = {1000, 1000, 1000}, .group = {1000, 1000, 1000}}, context.denied) != 0) return false;
+    ker::net::NetDevice dev{};
+    dev.name = {'k', 't', '-', 'w', 'r', 'i', 't', 'e', 'r'};
+    ker::net::NetDeviceOps const OPS{.open = link_writer_test_open};
+    dev.ops = &OPS;
+    dev.private_data = &context;
+    if (ker::net::netdev_register(&dev) != 0) return false;
+    WosNetLinkSetReq req{};
+    req.ifindex = dev.ifindex;
+    req.fields = WOS_NET_LINK_SET_FLAGS | WOS_NET_LINK_SET_MTU | WOS_NET_LINK_SET_TXQLEN;
+    req.flags = IFF_UP;
+    req.flag_mask = IFF_UP;
+    req.mtu = 1400;
+    req.tx_queue_len = 23;
+    auto const ROOT = Snapshot::bootstrap_root();
+    bool ok = true;
+    for (int error : {-EIO, 7, 0}) {
+        context.error = error;
+        auto const RESULT = static_cast<int64_t>(apply_link_request(req, ROOT));
+        ok &= RESULT == (error > 0 ? -EIO : error) && context.overlaps_rejected;
+        ok &= !dev.control_busy.load(std::memory_order_acquire);
+        ok &= dev.mtu == (error == 0 ? 1400U : 1500U) && dev.tx_queue_len == (error == 0 ? 23U : 1000U);
+    }
+    ok &= context.calls == 3;
+    // Successful and refused callbacks both release admission for a successor.
+    req.fields = WOS_NET_LINK_SET_MTU;
+    req.mtu = 1300;
+    ok &= apply_link_request(req, ROOT) == 0 && dev.mtu == 1300;
+    ok &= ker::net::netdev_unregister(&dev) == 0;
+    return ok;
+}
+
+auto net_selftest_link_open_uses_admitted_snapshot() -> bool {
+    using namespace ker::mod::security;
+    Snapshot caller;
+    constexpr std::array<uint32_t, 2> GROUPS{112, 114};
+    if (Snapshot::restore_fields({.user = {102, 102, 102},
+                                  .group = {102, 102, 102},
+                                  .groups = GROUPS,
+                                  .authority_ceiling = ALL_AUTHORITY,
+                                  .service_privileges = 2,
+                                  .no_new_privileges = true,
+                                  .dumpable = false,
+                                  .service_privileges_locked = true},
+                                 caller) != 0)
+        return false;
+    ker::net::NetDevice dev{};
+    LinkPolicyTestContext context{.open_error = -EACCES, .expected = caller};
+    ker::net::NetDeviceOps const OPS{.open = link_policy_test_open, .open_as = link_policy_test_open_as};
+    dev.ops = &OPS;
+    dev.private_data = &context;
+    std::strcpy(dev.name.data(), "kt-open-actor");
+    if (ker::net::netdev_register(&dev) != 0) return false;
+    uint32_t const ORIGINAL_LINK_FLAGS = dev.link_flags;
+    WosNetLinkSetReq req{};
+    req.ifindex = dev.ifindex;
+    req.fields = WOS_NET_LINK_SET_NAME | WOS_NET_LINK_SET_FLAGS | WOS_NET_LINK_SET_MTU;
+    std::strcpy(req.new_name, "kt-open-new");
+    req.flags = IFF_UP | IFF_PROMISC;
+    req.flag_mask = IFF_UP | IFF_PROMISC;
+    req.mtu = 1400;
+    bool const DENIED = static_cast<int64_t>(apply_link_request(req, caller)) == -EACCES && context.mapped_opens == 1 &&
+                        context.opens == 0 && context.identity_matches && dev.state == 0 && dev.link_flags == ORIGINAL_LINK_FLAGS &&
+                        dev.mtu == 1500 && std::strcmp(dev.name.data(), "kt-open-actor") == 0;
+    context.open_error = 0;
+    bool const ALLOWED = apply_link_request(req, caller) == 0 && context.mapped_opens == 2 && context.opens == 0 &&
+                         context.identity_matches && dev.state == 1 && dev.link_flags == (ORIGINAL_LINK_FLAGS | IFF_PROMISC) &&
+                         dev.mtu == 1400 && std::strcmp(dev.name.data(), "kt-open-new") == 0;
+    static_cast<void>(ker::net::netdev_unregister(&dev));
+    return DENIED && ALLOWED;
+}
+
+auto net_selftest_link_close_uses_admitted_snapshot() -> bool {
+    using namespace ker::mod::security;
+    Snapshot caller;
+    constexpr std::array<uint32_t, 2> GROUPS{112, 114};
+    if (Snapshot::restore_fields({.user = {102, 102, 102},
+                                  .group = {102, 102, 102},
+                                  .groups = GROUPS,
+                                  .authority_ceiling = ALL_AUTHORITY,
+                                  .service_privileges = 2,
+                                  .no_new_privileges = true,
+                                  .dumpable = false,
+                                  .service_privileges_locked = true},
+                                 caller) != 0)
+        return false;
+    ker::net::NetDevice dev{};
+    LinkPolicyTestContext context{.expected = caller};
+    // The shared fake callback records exactly the supplied identity and returns
+    // configured errors without changing hardware. No real NIC is affected.
+    ker::net::NetDeviceOps const OPS{.close_as = link_policy_test_open_as};
+    dev.ops = &OPS;
+    dev.private_data = &context;
+    dev.state = 1;
+    std::strcpy(dev.name.data(), "kt-close-actor");
+    if (ker::net::netdev_register(&dev) != 0) return false;
+    uint32_t const FLAGS = dev.link_flags;
+    WosNetLinkSetReq req{};
+    req.ifindex = dev.ifindex;
+    req.fields = WOS_NET_LINK_SET_NAME | WOS_NET_LINK_SET_FLAGS | WOS_NET_LINK_SET_MTU;
+    std::strcpy(req.new_name, "kt-close-new");
+    req.flags = IFF_PROMISC;
+    req.flag_mask = IFF_UP | IFF_PROMISC;
+    req.mtu = 1400;
+    bool ok = true;
+    unsigned calls = 0;
+    for (int error : {-EPERM, -EACCES, -EIO, -ENODEV, -ETIMEDOUT, 7}) {
+        context.open_error = error;
+        int const EXPECTED = error < 0 ? error : -EIO;
+        ok &= static_cast<int64_t>(apply_link_request(req, caller)) == EXPECTED;
+        ++calls;
+        ok &= context.mapped_opens == calls && context.identity_matches && dev.state == 1 && dev.link_flags == FLAGS && dev.mtu == 1500 &&
+              std::strcmp(dev.name.data(), "kt-close-actor") == 0;
+    }
+    context.open_error = 0;
+    ok &= apply_link_request(req, caller) == 0 && context.mapped_opens == calls + 1 && context.identity_matches && dev.state == 0 &&
+          dev.link_flags == (FLAGS | IFF_PROMISC) && dev.mtu == 1400 && std::strcmp(dev.name.data(), "kt-close-new") == 0;
+    static_cast<void>(ker::net::netdev_unregister(&dev));
+    return ok;
+}
+
+auto net_selftest_link_combined_admission_precedes_all_effects() -> bool {
+    using namespace ker::mod::security;
+    auto caller = Snapshot::bootstrap_root();
+    if (caller.prepare({.change = Change::NO_NEW_PRIVILEGES}, caller) != 0 ||
+        caller.prepare({.change = Change::SET_SERVICE_PRIVILEGES, .service_privileges = 2}, caller) != 0 ||
+        caller.prepare({.change = Change::SET_UID, .real = 102}, caller) != 0)
+        return false;
+    ker::net::NetDevice dev{};
+    LinkPolicyTestContext context{.expected = caller};
+    ker::net::NetDeviceOps const REMOTE_OPS{
+        .open = link_policy_test_open, .set_mac = link_policy_test_mac, .apply_link_as = link_policy_test_apply_link};
+    ker::net::NetDeviceOps const NATIVE_OPS{
+        .open = link_policy_test_open, .set_mac = link_policy_test_mac, .check_mac = link_policy_test_check_mac};
+    dev.ops = &REMOTE_OPS;
+    dev.private_data = &context;
+    std::strcpy(dev.name.data(), "kt-txn-old");
+    if (ker::net::netdev_register(&dev) != 0) return false;
+    uint32_t const FLAGS = dev.link_flags;
+    auto const MAC = dev.mac;
+    WosNetLinkSetReq req{};
+    req.ifindex = dev.ifindex;
+    req.fields = WOS_NET_LINK_SET_NAME | WOS_NET_LINK_SET_FLAGS | WOS_NET_LINK_SET_MTU | WOS_NET_LINK_SET_TXQLEN | WOS_NET_LINK_SET_HWADDR;
+    req.flags = IFF_UP | IFF_PROMISC;
+    req.flag_mask = IFF_UP | IFF_PROMISC;
+    req.mtu = 1400;
+    req.tx_queue_len = 27;
+    req.hwaddr_len = 6;
+    req.hwaddr[0] = 2;
+    req.hwaddr[5] = 37;
+    std::strcpy(req.new_name, "kt-txn-new");
+    auto unchanged = [&] {
+        return dev.state == 0 && dev.link_flags == FLAGS && dev.mac == MAC && dev.mtu == 1500 && dev.tx_queue_len == 1000 &&
+               std::strcmp(dev.name.data(), "kt-txn-old") == 0 && context.opens == 0 && context.mac_changes == 0;
+    };
+    bool ok = true;
+    unsigned calls = 0;
+    for (int error : {-EACCES, -EPERM, -ENOTSUP, -ETIMEDOUT, 7}) {
+        context.open_error = error;
+        ok &= static_cast<int64_t>(apply_link_request(req, caller)) == (error < 0 ? error : -EIO);
+        ok &= context.mapped_opens == ++calls && context.identity_matches && unchanged();
+    }
+    dev.ops = &NATIVE_OPS;
+    for (int error : {-EPERM, -ENOTSUP, -EIO, 7}) {
+        context.mac_error = error;
+        ok &= static_cast<int64_t>(apply_link_request(req, caller)) == (error < 0 ? error : -EIO) && unchanged();
+    }
+    ok &= context.mac_checks == 4;
+    dev.ops = &REMOTE_OPS;
+    context.open_error = 0;
+    ok &= apply_link_request(req, caller) == 0 && context.mapped_opens == calls + 1 && context.identity_matches && dev.state == 1 &&
+          dev.link_flags == (FLAGS | IFF_PROMISC) && dev.mtu == 1400 && dev.tx_queue_len == 27 && dev.mac[5] == 37 &&
+          std::strcmp(dev.name.data(), "kt-txn-new") == 0 && context.opens == 0 && context.mac_changes == 0;
+    static_cast<void>(ker::net::netdev_unregister(&dev));
+    return ok;
+}
+
+auto net_selftest_link_rename_admission_precedes_effects() -> bool {
+    using namespace ker::mod::security;
+    ker::net::NetDevice subject{}, competitor{};
+    std::strcpy(subject.name.data(), "kt-link-old");
+    std::strcpy(competitor.name.data(), "kt-link-peer");
+    LinkPolicyTestContext context{.competitor = &competitor};
+    ker::net::NetDeviceOps const OPS{.open = link_policy_test_open,
+                                     .close = nullptr,
+                                     .start_xmit = nullptr,
+                                     .set_mac = link_policy_test_mac,
+                                     .set_queue_cpu = nullptr,
+                                     .check_mac = link_policy_test_check_mac};
+    subject.ops = &OPS;
+    subject.private_data = &context;
+    if (ker::net::netdev_register(&subject) != 0) return false;
+    if (ker::net::netdev_register(&competitor) != 0) {
+        static_cast<void>(ker::net::netdev_unregister(&subject));
+        return false;
+    }
+    WosNetLinkSetReq req{};
+    req.ifindex = subject.ifindex;
+    req.fields = WOS_NET_LINK_SET_FLAGS | WOS_NET_LINK_SET_MTU | WOS_NET_LINK_SET_TXQLEN | WOS_NET_LINK_SET_NAME | WOS_NET_LINK_SET_HWADDR;
+    req.flags = IFF_UP | IFF_PROMISC;
+    req.flag_mask = IFF_UP | IFF_PROMISC;
+    req.mtu = 1400;
+    req.tx_queue_len = 23;
+    std::strcpy(req.new_name, "kt-link-new");
+    req.hwaddr_len = 6;
+    req.hwaddr[0] = 2;
+    req.hwaddr[5] = 17;
+    auto root = Snapshot::bootstrap_root();
+    auto unchanged = [&]() {
+        return std::strcmp(subject.name.data(), "kt-link-old") == 0 && subject.mtu == 1500 && subject.tx_queue_len == 1000 &&
+               subject.state == 0 && (subject.link_flags & IFF_PROMISC) == 0 && context.opens == 0 && context.mac_changes == 0;
+    };
+    bool ok = true;
+    for (unsigned profile = 0; profile < 3; ++profile) {
+        auto denied = root;
+        if (profile == 0) ok &= denied.prepare({.change = Change::SET_UID, .real = 1000}, denied) == 0;
+        if (profile == 1) ok &= denied.prepare({.change = Change::DROP_AUTHORITY}, denied) == 0;
+        if (profile == 2) {
+            ok &= denied.prepare({.change = Change::NO_NEW_PRIVILEGES}, denied) == 0;
+            ok &= denied.prepare({.change = Change::SET_SERVICE_PRIVILEGES, .service_privileges = 1}, denied) == 0;
+            ok &= denied.prepare({.change = Change::SET_UID, .real = 101}, denied) == 0;
+        }
+        ok &= static_cast<int64_t>(apply_link_request(req, denied)) == -EPERM && unchanged();
+    }
+    req.hwaddr_len = 5;
+    ok &= static_cast<int64_t>(apply_link_request(req, root)) == -EINVAL && unchanged();
+    req.hwaddr_len = 6;
+    std::strcpy(req.new_name, "kt-link-peer");
+    ok &= static_cast<int64_t>(apply_link_request(req, root)) == -EEXIST && unchanged();
+    std::strcpy(req.new_name, "kt-link-new");
+    // The driver's callback attempts to claim the requested name between the
+    // old preliminary lookup and final rename. The admitted subject must own
+    // the name before this callback can run, without holding the registry lock.
+    auto const RESULT = static_cast<int64_t>(apply_link_request(req, root));
+    ok &= RESULT == 0 && context.competing_rename == -EEXIST && context.opens == 1 && context.mac_changes == 1 &&
+          std::strcmp(subject.name.data(), "kt-link-new") == 0 && std::strcmp(competitor.name.data(), "kt-link-peer") == 0 &&
+          subject.mtu == 1400 && subject.tx_queue_len == 23 && subject.state == 1 && (subject.link_flags & IFF_PROMISC) != 0 &&
+          subject.mac[0] == 2 && subject.mac[5] == 17;
+    auto service = root;
+    ok &= service.prepare({.change = Change::NO_NEW_PRIVILEGES}, service) == 0;
+    ok &= service.prepare({.change = Change::SET_SERVICE_PRIVILEGES, .service_privileges = 2}, service) == 0;
+    ok &= service.prepare({.change = Change::SET_UID, .real = 102}, service) == 0;
+    req.fields = WOS_NET_LINK_SET_MTU;
+    req.mtu = 1300;
+    ok &= apply_link_request(req, service) == 0 && subject.mtu == 1300;
+    ok &= ker::net::netdev_unregister(&competitor) == 0;
+    ok &= ker::net::netdev_unregister(&subject) == 0;
+    return ok;
+}
+
+auto net_selftest_open_error_preserves_link_request() -> bool {
+    bool ok = true;
+    for (int error : {EPERM, EACCES, EIO, ENODEV, ETIMEDOUT}) {
+        ker::net::NetDevice subject{};
+        std::strcpy(subject.name.data(), "kt-open-old");
+        LinkPolicyTestContext context{.open_error = -error};
+        ker::net::NetDeviceOps const OPS{.open = link_policy_test_open,
+                                         .close = nullptr,
+                                         .start_xmit = nullptr,
+                                         .set_mac = link_policy_test_mac,
+                                         .set_queue_cpu = nullptr,
+                                         .check_mac = link_policy_test_check_mac};
+        subject.ops = &OPS;
+        subject.private_data = &context;
+        if (ker::net::netdev_register(&subject) != 0) return false;
+        auto const NAME = subject.name;
+        auto const MAC = subject.mac;
+        auto const FLAGS = subject.link_flags;
+        WosNetLinkSetReq req{};
+        req.ifindex = subject.ifindex;
+        req.fields =
+            WOS_NET_LINK_SET_FLAGS | WOS_NET_LINK_SET_MTU | WOS_NET_LINK_SET_TXQLEN | WOS_NET_LINK_SET_NAME | WOS_NET_LINK_SET_HWADDR;
+        req.flags = IFF_UP | IFF_PROMISC;
+        req.flag_mask = IFF_UP | IFF_PROMISC;
+        req.mtu = 1300;
+        req.tx_queue_len = 17;
+        std::strcpy(req.new_name, "kt-open-new");
+        req.hwaddr_len = 6;
+        req.hwaddr[0] = 2;
+        auto const RESULT = static_cast<int64_t>(apply_link_request(req, ker::mod::security::Snapshot::bootstrap_root()));
+        ok &= RESULT == -error && subject.name == NAME && subject.mac == MAC && subject.link_flags == FLAGS && subject.state == 0 &&
+              subject.mtu == 1500 && subject.tx_queue_len == 1000 && context.opens == 1 && context.mac_changes == 0;
+        // Legacy SIOCSIFFLAGS returns this same helper's status directly.
+        ok &=
+            apply_ifflags(&subject, IFF_UP | IFF_PROMISC, IFF_UP | IFF_PROMISC, ker::mod::security::Snapshot::bootstrap_root()) == -error &&
+            subject.state == 0 && subject.link_flags == FLAGS && context.opens == 2 && context.mac_changes == 0;
+        // A failed request must release its namespace reservation.
+        auto retained = ker::net::netdev_retain_registered(&subject);
+        ok &= rename_netdev(retained, "kt-open-new") == 0;
+        retained.reset();
+        ok &= ker::net::netdev_unregister(&subject) == 0;
+    }
+    return ok;
+}
+#endif
 
 uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     auto net_op = static_cast<ker::abi::net::ops>(op);
@@ -1140,7 +1618,14 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return static_cast<uint64_t>(-EPROTONOSUPPORT);
             }
 
-            ker::vfs::FdReservation descriptor(ker::mod::sched::get_current_task());
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) return static_cast<uint64_t>(-ESRCH);
+            if ((TYPE & ker::net::SOCK_TYPE_MASK) == 3) {
+                auto const CREDENTIALS = task->credentials();
+                int const AUTHORIZATION = ker::mod::security::authorize_network_administration(CREDENTIALS);
+                if (AUTHORIZATION != 0) return static_cast<uint64_t>(AUTHORIZATION);
+            }
+            ker::vfs::FdReservation descriptor(task);
             if (descriptor.result() < 0) {
                 return static_cast<uint64_t>(descriptor.result());
             }
@@ -1150,7 +1635,6 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             }
 
             // Set owner PID so wake_socket() can find and wake this task
-            auto* task = ker::mod::sched::get_current_task();
             if (task != nullptr) {
                 sock->owner_pid = task->pid;
             }
@@ -1691,6 +2175,15 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (!ker::mod::sys::usercopy::copy_from_task(*task, a2, arg_storage.data(), ARG_BYTES)) {
                 return static_cast<uint64_t>(-EFAULT);
             }
+            bool const MUTATES = request == SIOC_SIFFLAGS || request == SIOC_SIFADDR || request == SIOC_SIFNETMASK ||
+                                 request == SIOC_SIFMTU || request == SIOC_SIFNAME || request == SIOC_SIFHWADDR ||
+                                 request == SIOC_SIFHWBROADCAST || request == SIOC_SIFTXQLEN || request == SIOC_ADDRT ||
+                                 request == SIOC_DELRT;
+            auto const CREDENTIALS = task->credentials();
+            if (MUTATES) {
+                int const AUTHORIZATION = ker::mod::security::authorize_network_administration(CREDENTIALS);
+                if (AUTHORIZATION != 0) return static_cast<uint64_t>(AUTHORIZATION);
+            }
             bool const COPIES_OUT = request == SIOC_GIFFLAGS || request == SIOC_GIFADDR || request == SIOC_GIFNETMASK ||
                                     request == SIOC_GIFHWADDR || request == SIOC_GIFMTU || request == SIOC_GIFINDEX ||
                                     request == SIOC_GIFTXQLEN;
@@ -1734,10 +2227,10 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                             if (d == nullptr || d->state != 1 || std::strcmp(d->name.data(), "lo") == 0) {
                                 continue;
                             }
-                            auto* nif = ker::net::netif_find_by_dev(d);
-                            if (nif != nullptr && nif->ipv4_addr_count > 0) {
-                                uint32_t const DEV_IP = nif->ipv4_addrs[0].addr;
-                                uint32_t const DEV_MASK = nif->ipv4_addrs[0].netmask;
+                            auto const IPV4 = ker::net::netif_ipv4_snapshot(d);
+                            if (IPV4.count > 0) {
+                                uint32_t const DEV_IP = IPV4.entries[0].addr;
+                                uint32_t const DEV_MASK = IPV4.entries[0].netmask;
                                 if ((DEV_IP & DEV_MASK) == (gw & DEV_MASK)) {
                                     rdev_ref = std::move(candidate);
                                     break;
@@ -1751,12 +2244,12 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                             if (d == nullptr || d->state != 1 || std::strcmp(d->name.data(), "lo") == 0) {
                                 continue;
                             }
-                            auto* nif = ker::net::netif_find_by_dev(d);
-                            if (nif == nullptr || nif->ipv4_addr_count == 0) {
+                            auto const IPV4 = ker::net::netif_ipv4_snapshot(d);
+                            if (IPV4.count == 0) {
                                 continue;
                             }
-                            for (size_t j = 0; j < nif->ipv4_addr_count; j++) {
-                                uint32_t const DEV_IP = nif->ipv4_addrs[j].addr;
+                            for (size_t j = 0; j < IPV4.count; j++) {
+                                uint32_t const DEV_IP = IPV4.entries[j].addr;
                                 if ((DEV_IP & mask) == (dst & mask)) {
                                     rdev_ref = std::move(candidate);
                                     break;
@@ -1800,74 +2293,62 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             }
             auto* dev = dev_ref.get();
 
+            ker::net::NetDeviceControlGuard control_guard;
+            bool const LINK_MUTATION = request == SIOC_SIFFLAGS || request == SIOC_SIFMTU || request == SIOC_SIFTXQLEN ||
+                                       request == SIOC_SIFHWADDR || request == SIOC_SIFNAME;
+            if (LINK_MUTATION) {
+                int const CONTROL_ADMISSION = control_guard.try_acquire(dev);
+                if (CONTROL_ADMISSION != 0) return static_cast<uint64_t>(CONTROL_ADMISSION);
+            }
+
             switch (request) {
                 case SIOC_GIFFLAGS: {
-                    store_unaligned<int16_t>(arg + 16, static_cast<int16_t>(effective_ifflags(dev)));
+                    store_unaligned<int16_t>(arg + 16, static_cast<int16_t>(effective_ifflags(ker::net::netdev_config_snapshot(dev))));
                     return copy_ifreq_out();
                 }
                 case SIOC_SIFFLAGS: {
                     auto flags = static_cast<uint32_t>(load_unaligned<uint16_t>(arg + 16));
-                    apply_ifflags(dev, flags, IFF_UP | IFF_NOARP | IFF_PROMISC | IFF_MULTICAST);
-                    return 0;
+                    return static_cast<uint64_t>(apply_ifflags(dev, flags, IFF_UP | IFF_NOARP | IFF_PROMISC | IFF_MULTICAST, CREDENTIALS));
                 }
                 case SIOC_GIFADDR: {
-                    auto* nif = ker::net::netif_find_by_dev(dev);
-                    if (nif == nullptr || nif->ipv4_addr_count == 0) {
+                    auto const IPV4 = ker::net::netif_ipv4_snapshot(dev);
+                    if (IPV4.count == 0) {
                         return static_cast<uint64_t>(-EADDRNOTAVAIL);
                     }
                     // Fill sockaddr_in at offset 16
                     std::memset(arg + 16, 0, 16);
                     store_unaligned<uint16_t>(arg + 16, 2);  // AF_INET
-                    store_unaligned<uint32_t>(arg + 20, ker::net::htonl(nif->ipv4_addrs[0].addr));
+                    store_unaligned<uint32_t>(arg + 20, ker::net::htonl(IPV4.entries[0].addr));
                     return copy_ifreq_out();
                 }
                 case SIOC_SIFADDR: {
                     uint32_t const ADDR = ker::net::ntohl(load_unaligned<uint32_t>(arg + 20));
-                    // Check if interface already has addresses; if so, update first one
-                    auto* nif = ker::net::netif_get(dev);
-                    if (nif == nullptr) {
-                        return static_cast<uint64_t>(-ENOMEM);
-                    }
-                    if (nif->ipv4_addr_count > 0) {
-                        nif->ipv4_addrs[0].addr = ADDR;
-                        notify_netdev_l3_changed(dev);
-                    } else {
-                        return static_cast<uint64_t>(ker::net::netif_add_ipv4(dev, ADDR, 0xFFFFFF00));  // default /24
-                    }
-                    return 0;
+                    return static_cast<uint64_t>(ker::net::netif_set_primary_ipv4_address(dev, ADDR));
                 }
                 case SIOC_GIFNETMASK: {
-                    auto* nif = ker::net::netif_find_by_dev(dev);
-                    if (nif == nullptr || nif->ipv4_addr_count == 0) {
+                    auto const IPV4 = ker::net::netif_ipv4_snapshot(dev);
+                    if (IPV4.count == 0) {
                         return static_cast<uint64_t>(-EADDRNOTAVAIL);
                     }
                     std::memset(arg + 16, 0, 16);
                     store_unaligned<uint16_t>(arg + 16, 2);  // AF_INET
-                    store_unaligned<uint32_t>(arg + 20, ker::net::htonl(nif->ipv4_addrs[0].netmask));
+                    store_unaligned<uint32_t>(arg + 20, ker::net::htonl(IPV4.entries[0].netmask));
                     return copy_ifreq_out();
                 }
                 case SIOC_SIFNETMASK: {
                     uint32_t const MASK = ker::net::ntohl(load_unaligned<uint32_t>(arg + 20));
-                    auto* nif = ker::net::netif_get(dev);
-                    if (nif == nullptr) {
-                        return static_cast<uint64_t>(-ENOMEM);
-                    }
-                    if (nif->ipv4_addr_count == 0) {
-                        return static_cast<uint64_t>(-EADDRNOTAVAIL);
-                    }
-                    nif->ipv4_addrs[0].netmask = MASK;
-                    notify_netdev_l3_changed(dev);
-                    return 0;
+                    return static_cast<uint64_t>(ker::net::netif_set_primary_ipv4_netmask(dev, MASK));
                 }
                 case SIOC_GIFHWADDR: {
+                    auto const CONFIG = ker::net::netdev_config_snapshot(dev);
                     // sa_family = ARPHRD_ETHER (1), then 6 bytes of MAC
                     std::memset(arg + 16, 0, 16);
-                    store_unaligned<uint16_t>(arg + 16, (dev->link_flags & IFF_LOOPBACK) != 0 ? WOS_ARPHRD_LOOPBACK : WOS_ARPHRD_ETHER);
-                    std::memcpy(arg + 18, dev->mac.data(), 6);
+                    store_unaligned<uint16_t>(arg + 16, (CONFIG.link_flags & IFF_LOOPBACK) != 0 ? WOS_ARPHRD_LOOPBACK : WOS_ARPHRD_ETHER);
+                    std::memcpy(arg + 18, CONFIG.mac.data(), 6);
                     return copy_ifreq_out();
                 }
                 case SIOC_GIFMTU: {
-                    store_unaligned<int32_t>(arg + 16, static_cast<int32_t>(dev->mtu));
+                    store_unaligned<int32_t>(arg + 16, static_cast<int32_t>(ker::net::netdev_config_snapshot(dev).mtu));
                     return copy_ifreq_out();
                 }
                 case SIOC_SIFMTU: {
@@ -1879,7 +2360,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     return 0;
                 }
                 case SIOC_GIFTXQLEN: {
-                    store_unaligned<int32_t>(arg + 16, static_cast<int32_t>(dev->tx_queue_len));
+                    store_unaligned<int32_t>(arg + 16, static_cast<int32_t>(ker::net::netdev_config_snapshot(dev).tx_queue_len));
                     return copy_ifreq_out();
                 }
                 case SIOC_SIFTXQLEN: {
@@ -1892,13 +2373,13 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 }
                 case SIOC_SIFHWADDR: {
                     auto* sa = arg + 16;
-                    return static_cast<uint64_t>(set_netdev_hwaddr(dev, sa + 2, 6));
+                    return static_cast<uint64_t>(set_netdev_hwaddr(dev, sa + 2, 6, CREDENTIALS));
                 }
                 case SIOC_SIFHWBROADCAST: {
                     return 0;
                 }
                 case SIOC_SIFNAME: {
-                    return static_cast<uint64_t>(rename_netdev(dev, reinterpret_cast<const char*>(arg + 16)));
+                    return static_cast<uint64_t>(rename_netdev(dev_ref, reinterpret_cast<const char*>(arg + 16)));
                 }
                 case SIOC_GIFINDEX: {
                     store_unaligned<int32_t>(arg + 16, static_cast<int32_t>(dev->ifindex));
@@ -1921,6 +2402,9 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (!ker::mod::sys::usercopy::copy_from_task(*task, a1, request.data(), request.size())) {
                 return static_cast<uint64_t>(-EFAULT);
             }
+            auto const CREDENTIALS = task->credentials();
+            int const AUTHORIZATION = ker::mod::security::authorize_network_administration(CREDENTIALS);
+            if (AUTHORIZATION != 0) return static_cast<uint64_t>(AUTHORIZATION);
             std::string_view const IFNAME(reinterpret_cast<char*>(request.data()), strnlen(reinterpret_cast<char*>(request.data()), 16));
             auto const CPU_MASK = load_unaligned<uint64_t>(request.data() + 16);
             auto dev_ref = ker::net::netdev_find_by_name_ref(IFNAME);
@@ -1928,18 +2412,14 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return static_cast<uint64_t>(-ENODEV);
             }
             auto* dev = dev_ref.get();
-            if (dev->ops == nullptr || dev->ops->set_queue_cpu == nullptr) {
+            if (dev->ops == nullptr || dev->ops->set_queue_cpu_mask == nullptr) {
                 return static_cast<uint64_t>(-ENOSYS);
             }
-            uint32_t pair_idx = 0;
-            for (uint64_t tmp = CPU_MASK; tmp != 0 && pair_idx < 8; tmp &= tmp - 1, ++pair_idx) {
-                auto const CPU = static_cast<uint64_t>(__builtin_ctzll(tmp));
-                int const RET = dev->ops->set_queue_cpu(dev, pair_idx, CPU);
-                if (RET != 0) {
-                    return static_cast<uint64_t>(RET);
-                }
-            }
-            return 0;
+            if (CPU_MASK == 0) return 0;
+            ker::net::NetDeviceControlGuard control;
+            int const ADMISSION = control.try_acquire(dev);
+            if (ADMISSION != 0) return static_cast<uint64_t>(ADMISSION);
+            return static_cast<uint64_t>(dev->ops->set_queue_cpu_mask(dev, CPU_MASK));
         }
 
         case ker::abi::net::ops::NETCTL_IF_LIST: {
@@ -1986,20 +2466,20 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             for (size_t i = 0; i < ker::net::netdev_count(); i++) {
                 auto dev_ref = ker::net::netdev_at_ref(i);
                 auto* dev = dev_ref.get();
-                auto* nif = ker::net::netif_find_by_dev(dev);
-                if (dev == nullptr || nif == nullptr) {
+                auto const IPV4 = ker::net::netif_ipv4_snapshot(dev);
+                if (dev == nullptr) {
                     continue;
                 }
-                for (size_t j = 0; j < nif->ipv4_addr_count; j++) {
+                for (size_t j = 0; j < IPV4.count; j++) {
                     auto& info = output.at(total);
                     info.ifindex = dev->ifindex;
                     info.family = WOS_AF_INET;
-                    info.prefix_len = mask_to_prefix(nif->ipv4_addrs[j].netmask);
-                    info.scope = (nif->ipv4_addrs[j].addr >> 24) == 127 ? 254 : 0;  // RT_SCOPE_HOST/global
+                    info.prefix_len = mask_to_prefix(IPV4.entries[j].netmask);
+                    info.scope = (IPV4.entries[j].addr >> 24) == 127 ? 254 : 0;  // RT_SCOPE_HOST/global
                     info.flags = WOS_IFA_F_PERMANENT;
                     copy_cstr_trunc(std::span<char, WOS_NET_IF_NAME_LEN>{info.label}, dev->name.data());
-                    uint32_t addr_be = ker::net::htonl(nif->ipv4_addrs[j].addr);
-                    uint32_t brd_be = ker::net::htonl(nif->ipv4_addrs[j].addr | ~nif->ipv4_addrs[j].netmask);
+                    uint32_t addr_be = ker::net::htonl(IPV4.entries[j].addr);
+                    uint32_t brd_be = ker::net::htonl(IPV4.entries[j].addr | ~IPV4.entries[j].netmask);
                     std::memcpy(info.address, &addr_be, sizeof(addr_be));
                     std::memcpy(info.local, &addr_be, sizeof(addr_be));
                     std::memcpy(info.broadcast, &brd_be, sizeof(brd_be));
@@ -2042,6 +2522,9 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (!ker::mod::sys::usercopy::copy_value_from_task(*task, a1, req)) {
                 return static_cast<uint64_t>(-EFAULT);
             }
+            auto const CREDENTIALS = task->credentials();
+            int const AUTHORIZATION = ker::mod::security::authorize_network_administration(CREDENTIALS);
+            if (AUTHORIZATION != 0) return static_cast<uint64_t>(AUTHORIZATION);
             auto dev_ref = find_dev_by_ifindex(req.ifindex);
             if (!dev_ref) {
                 return static_cast<uint64_t>(-ENODEV);
@@ -2083,6 +2566,9 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (!ker::mod::sys::usercopy::copy_value_from_task(*task, a1, req)) {
                 return static_cast<uint64_t>(-EFAULT);
             }
+            auto const CREDENTIALS = task->credentials();
+            int const AUTHORIZATION = ker::mod::security::authorize_network_administration(CREDENTIALS);
+            if (AUTHORIZATION != 0) return static_cast<uint64_t>(AUTHORIZATION);
             auto dev_ref = find_dev_by_ifindex(req.ifindex);
             if (!dev_ref) {
                 return static_cast<uint64_t>(-ENODEV);
@@ -2120,6 +2606,9 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (!ker::mod::sys::usercopy::copy_value_from_task(*task, a1, req)) {
                 return static_cast<uint64_t>(-EFAULT);
             }
+            auto const CREDENTIALS = task->credentials();
+            int const AUTHORIZATION = ker::mod::security::authorize_network_administration(CREDENTIALS);
+            if (AUTHORIZATION != 0) return static_cast<uint64_t>(AUTHORIZATION);
             if (req.size != sizeof(req) || req.version != WOS_NETCTL_VERSION_1 || req.reserved != 0 || req.address.family != WOS_AF_INET6 ||
                 req.address.prefix_len > 128 || req.preferred_lifetime_s > req.valid_lifetime_s) {
                 return static_cast<uint64_t>(-EINVAL);
@@ -2193,6 +2682,9 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (!ker::mod::sys::usercopy::copy_value_from_task(*task, a1, req)) {
                 return static_cast<uint64_t>(-EFAULT);
             }
+            auto const CREDENTIALS = task->credentials();
+            int const AUTHORIZATION = ker::mod::security::authorize_network_administration(CREDENTIALS);
+            if (AUTHORIZATION != 0) return static_cast<uint64_t>(AUTHORIZATION);
             constexpr uint32_t ALLOWED_FLAGS = WOS_NET_ROUTE_F_GATEWAY | WOS_NET_ROUTE_F_AUTOCONF;
             if (req.size != sizeof(req) || req.version != WOS_NETCTL_VERSION_1 || req.family != WOS_AF_INET6 || req.prefix_len > 128 ||
                 req.reserved != 0 || req.reserved2 != 0 || (req.flags & ~ALLOWED_FLAGS) != 0) {
@@ -2232,55 +2724,8 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (!ker::mod::sys::usercopy::copy_value_from_task(*task, a1, req)) {
                 return static_cast<uint64_t>(-EFAULT);
             }
-            auto dev_ref = find_dev_for_link_req(&req);
-            if (!dev_ref) {
-                return static_cast<uint64_t>(-ENODEV);
-            }
-            auto* dev = dev_ref.get();
-
-            if ((req.fields & WOS_NET_LINK_SET_MTU) != 0 && req.mtu == 0) {
-                return static_cast<uint64_t>(-EINVAL);
-            }
-            if ((req.fields & WOS_NET_LINK_SET_HWADDR) != 0 && req.hwaddr_len != 6) {
-                return static_cast<uint64_t>(-EINVAL);
-            }
-            if ((req.fields & WOS_NET_LINK_SET_NAME) != 0) {
-                size_t const NAME_LEN = strnlen(req.new_name, WOS_NET_IF_NAME_LEN);
-                if (NAME_LEN == 0 || NAME_LEN >= WOS_NET_IF_NAME_LEN) {
-                    return static_cast<uint64_t>(-EINVAL);
-                }
-                auto existing_ref = ker::net::netdev_find_by_name_ref(std::string_view(req.new_name, NAME_LEN));
-                if (existing_ref && existing_ref.get() != dev) {
-                    return static_cast<uint64_t>(-EEXIST);
-                }
-            }
-
-            if ((req.fields & WOS_NET_LINK_SET_FLAGS) != 0) {
-                apply_ifflags(dev, req.flags, req.flag_mask);
-            }
-            if ((req.fields & WOS_NET_LINK_SET_MTU) != 0) {
-                dev->mtu = req.mtu;
-            }
-            if ((req.fields & WOS_NET_LINK_SET_TXQLEN) != 0) {
-                dev->tx_queue_len = req.tx_queue_len;
-            }
-            if ((req.fields & WOS_NET_LINK_SET_HWADDR) != 0) {
-                int const RET = set_netdev_hwaddr(dev, req.hwaddr, req.hwaddr_len);
-                if (RET < 0) {
-                    return static_cast<uint64_t>(RET);
-                }
-            }
-            if ((req.fields & WOS_NET_LINK_SET_NAME) != 0) {
-                int const RET = rename_netdev(dev, req.new_name);
-                if (RET < 0) {
-                    return static_cast<uint64_t>(RET);
-                }
-            }
-            if ((req.fields & (WOS_NET_LINK_SET_MTU | WOS_NET_LINK_SET_NAME)) != 0) {
-                ker::net::wki::wki_dev_server_notify_net_changed(dev);
-                ker::net::wki::wki_remotable_notify_net_changed(dev);
-            }
-            return 0;
+            auto const CREDENTIALS = task->credentials();
+            return apply_link_request(req, CREDENTIALS);
         }
 
         case ker::abi::net::ops::SELECT: {

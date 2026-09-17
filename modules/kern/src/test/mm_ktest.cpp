@@ -12,6 +12,7 @@
 #include <platform/smt/smt.hpp>
 #include <platform/sys/usercopy.hpp>
 #include <span>
+#include <syscalls_impl/vmem/sys_vmem.hpp>
 #include <test/ktest.hpp>
 
 namespace addr = ker::mod::mm::addr;
@@ -1298,4 +1299,81 @@ KTEST(MM, PerCpuPageCacheRevivalOrder0FreeResetsMetadata) {
     KEXPECT_EQ(phys::page_ref_get(fresh_page), 1U);
     KEXPECT_EQ(phys::page_kind_get(fresh_page), mm::PageKind::NORMAL);
     phys::page_free(fresh_page);
+}
+
+KTEST(MM, SharedWriteRestrictionSurvivesForkAndProtectionChanges) {
+    constexpr uint64_t TEST_VADDR = 0x49000000ULL;
+    constexpr uint64_t FLAGS = paging::page_types::USER | paging::PAGE_SHARED | paging::PAGE_WRITE_RESTRICTED;
+    auto const ENTRY = paging::create_page_table_entry(0x1000, FLAGS);
+    KEXPECT_EQ(ENTRY.writable, 0);
+    auto* parent = virt::create_pagemap();
+    auto* child = virt::create_pagemap();
+    KREQUIRE_NE(parent, nullptr);
+    KREQUIRE_NE(child, nullptr);
+    auto* original = static_cast<uint8_t*>(alloc_test_pages());
+    KREQUIRE_NE(original, nullptr);
+    original[0] = 0x39;
+    virt::map_page(parent, TEST_VADDR, phys_addr_of(original), FLAGS);
+    virt::reserve_page_range(parent, TEST_VADDR + paging::PAGE_SIZE, 1);
+    KEXPECT_TRUE(virt::is_page_write_restricted(parent, TEST_VADDR));
+    KEXPECT_FALSE(virt::is_page_reserved(parent, TEST_VADDR));
+    KEXPECT_FALSE(virt::is_page_write_restricted(parent, TEST_VADDR + paging::PAGE_SIZE));
+    KEXPECT_TRUE(virt::is_page_reserved(parent, TEST_VADDR + paging::PAGE_SIZE));
+    virt::unify_page_flags(parent, TEST_VADDR, paging::PAGE_PRESENT | paging::PAGE_NX);
+    KEXPECT_TRUE(virt::is_page_write_restricted(parent, TEST_VADDR));
+    KREQUIRE_TRUE(virt::deep_copy_user_pagemap_cow(parent, child));
+    KEXPECT_TRUE(virt::is_page_write_restricted(child, TEST_VADDR));
+    KEXPECT_TRUE(virt::is_page_reserved(child, TEST_VADDR + paging::PAGE_SIZE));
+    virt::unify_page_flags(child, TEST_VADDR, paging::page_types::USER);
+    KEXPECT_FALSE(virt::user_page_writable_now(child, TEST_VADDR));
+    KEXPECT_TRUE(virt::is_page_write_restricted(child, TEST_VADDR));
+    KEXPECT_EQ(virt::translate(child, TEST_VADDR), phys_addr_of(original));
+
+    ker::mod::sched::task::Task task{};
+    task.type = ker::mod::sched::task::TaskType::PROCESS;
+    task.pagemap = child;
+    // Even conflicting lazy-anon metadata cannot synthesize COW permission.
+    ker::mod::sched::task::LazyVmemRange const RANGE{.start = TEST_VADDR, .end = TEST_VADDR + paging::PAGE_SIZE, .prot = 3, .flags = 0x20};
+    KREQUIRE_TRUE(task.lazy_vmem_ranges.push_back(RANGE));
+    uint8_t const REPLACEMENT = 0xff;
+    KEXPECT_FALSE(usercopy::copy_value_to_task(task, TEST_VADDR, REPLACEMENT));
+    KEXPECT_EQ(original[0], 0x39);
+    KEXPECT_EQ(virt::translate(child, TEST_VADDR), phys_addr_of(original));
+    ker::mod::sched::task::release_lazy_vmem_ranges(task);
+    KEXPECT_EQ(task.detach_pagemap_after_usercopy_quiescence(), child);
+
+    virt::destroy_user_space(parent, 0, "mm_ktest", "shared-restriction-parent");
+    virt::release_pagemap(parent);
+    KEXPECT_EQ(phys::page_ref_get(original), 1U);
+    KEXPECT_TRUE(virt::is_page_write_restricted(child, TEST_VADDR));
+    auto* replacement = alloc_test_pages();
+    KREQUIRE_NE(replacement, nullptr);
+    virt::map_page(child, TEST_VADDR, phys_addr_of(replacement), paging::page_types::USER);
+    KEXPECT_FALSE(virt::is_page_write_restricted(child, TEST_VADDR));
+    KEXPECT_TRUE(virt::user_page_writable_now(child, TEST_VADDR));
+    KEXPECT_EQ(phys::page_ref_get(original), 0U);
+    virt::unmap_page(child, TEST_VADDR);
+    KEXPECT_FALSE(virt::is_page_write_restricted(child, TEST_VADDR));
+    virt::destroy_user_space(child, 0, "mm_ktest", "shared-restriction-child");
+    virt::release_pagemap(child);
+}
+
+KTEST(MM, FileWritebackUsesRetainedPolicyAndChecksWholeOffsetRange) { KEXPECT_TRUE(ker::syscall::vmem::selftest_file_writeback_policy()); }
+
+KTEST(MM, FileMappingAdmissionPreservesDenialsAndRetainsOneDescription) {
+    TestUserTree tree;
+    KREQUIRE_TRUE(init_test_user_tree(tree));
+    tree.pml2->entries.at(0) = {};
+    tree.pml2->entries.at(2) = entry_for_page(tree.pml1);
+    KEXPECT_TRUE(ker::syscall::vmem::selftest_file_mapping_admission(tree.root));
+    cleanup_test_user_tree(tree);
+}
+
+KTEST(MM, FileSyncPreflightsEveryRangeBeforeWriting) {
+    TestUserTree tree;
+    KREQUIRE_TRUE(init_test_user_tree(tree));
+    tree.pml2->entries.at(0) = {};
+    tree.pml2->entries.at(2) = entry_for_page(tree.pml1);
+    KEXPECT_TRUE(ker::syscall::vmem::selftest_file_mmap_sync_preflight(tree.root));
+    cleanup_test_user_tree(tree);
 }

@@ -8,6 +8,7 @@
 #include <dev/pty.hpp>
 #include <mod/io/serial/serial.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <platform/sched/session.hpp>
 #include <vfs/file.hpp>
 
 #include "dev/device.hpp"
@@ -127,9 +128,10 @@ Device console_device = {
 // /dev/tty - controlling terminal (major 5, minor 0)
 // Opens the calling process's controlling PTY slave, or fails with ENXIO if none.
 
-int tty_open(ker::vfs::File* file) {
-    auto* task = ker::mod::sched::get_current_task();
-    if (task == nullptr || task->controlling_tty < 0) {
+int tty_open(ker::vfs::File* file, const ker::mod::security::Snapshot& /*credentials*/, ker::mod::sched::task::Task* task) {
+    auto const JOB = task != nullptr ? task->job_identity() : ker::mod::sched::session::Identity{};
+    auto const TERMINAL = JOB.terminal;
+    if (task == nullptr || TERMINAL.value == 0) {
 #ifdef CONSOLE_DEBUG
         log::debug("tty_open: no controlling terminal");
 #endif
@@ -140,12 +142,12 @@ int tty_open(ker::vfs::File* file) {
         return -ENOMEM;
     }
 
-    auto* pair = ker::dev::pty::pty_open_slave_by_index(task->controlling_tty);
+    auto* pair = ker::dev::pty::pty_open_controlling_slave(TERMINAL, JOB.session_id, JOB.terminal_generation);
     if (pair == nullptr) {
 #ifdef CONSOLE_DEBUG
         log::debug("tty_open: invalid controlling_tty index");
 #endif
-        task->controlling_tty = -1;
+        task->clear_controlling_terminal_if(TERMINAL, JOB.terminal_generation);
         return -ENXIO;
     }
 
@@ -166,7 +168,6 @@ int tty_open(ker::vfs::File* file) {
 }
 
 CharDeviceOps tty_ops = {
-    .open = tty_open,
     .close = nullptr,  // After redirect, slave_ops.close is used
     .read = nullptr,
     .write = nullptr,
@@ -174,6 +175,7 @@ CharDeviceOps tty_ops = {
     .ioctl = nullptr,
     .poll_check = nullptr,
     .poll_register_waiter = nullptr,
+    .open_with_credentials = tty_open,
 };
 
 Device tty_device = {

@@ -13,8 +13,15 @@ inline constexpr uint8_t WKI_RESOURCE_STDIO_ALL = 7;
 inline constexpr uint16_t WKI_RESOURCE_STDIO_FLAGS = WKI_RESOURCE_STDIO_ALL << WKI_RESOURCE_STDIO_SHIFT;
 // Submission-only: independent service reports account for remote subtree work.
 inline constexpr uint16_t WKI_RESOURCE_SERVICE_REPORTS = 1U << 4;
+// Submission-only, negotiated separately: reaped fields are visible inherited
+// observations, never completion deltas.
+inline constexpr uint16_t WKI_RESOURCE_CHILD_OBSERVATIONS = 1U << 5;
+struct TaskChildCpuObservation {
+    uint64_t user_time_us{};
+    uint64_t system_time_us{};
+};
 inline constexpr uint16_t WKI_RESOURCE_KNOWN_FLAGS =
-    WKI_RESOURCE_CPU_HARD_NOTIFIED | WKI_RESOURCE_STDIO_FLAGS | WKI_RESOURCE_SERVICE_REPORTS;
+    WKI_RESOURCE_CPU_HARD_NOTIFIED | WKI_RESOURCE_STDIO_FLAGS | WKI_RESOURCE_SERVICE_REPORTS | WKI_RESOURCE_CHILD_OBSERVATIONS;
 
 // Capability-gated suffix. This preserves exec's lifetime observations as
 // well as policy: migrating again must not reset an exhausted CPU budget.
@@ -27,8 +34,8 @@ struct TaskResourceSnapshot {
     std::array<abi::resource::Usage, abi::resource::COUNT> entries{};
     uint64_t cpu_user_time_us = 0;
     uint64_t cpu_system_time_us = 0;
-    // Completion-only deltas: children reaped during this remote execution
-    // segment. Submission records must keep these zero.
+    // Completion deltas, or inherited observations in explicitly flagged
+    // submissions. Unflagged submission records must keep these zero.
     uint64_t reaped_user_time_us = 0;
     uint64_t reaped_system_time_us = 0;
     uint64_t reserved = 0;

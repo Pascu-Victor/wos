@@ -124,14 +124,14 @@ auto raw_sendto_endpoint(Socket* sock, const void* buf, size_t len, const Socket
                 pkt_free(pkt);
                 return -ENODEV;
             }
-            auto* nif = netif_find_by_dev(raw_device);
+            auto const IPV4 = netif_ipv4_snapshot(raw_device);
             IPv4Address source = sock->local.ipv4_address();
             if (source.is_any()) {
-                if (nif == nullptr || nif->ipv4_addr_count == 0) {
+                if (IPV4.count == 0) {
                     pkt_free(pkt);
                     return -EADDRNOTAVAIL;
                 }
-                source = nif->ipv4_addrs.front().addr;
+                source = IPV4.entries.front().addr;
             }
             result =
                 ipv4_tx_on_dev(pkt, raw_device, source, destination.ipv4_address(), static_cast<uint8_t>(sock->protocol), IPV4_DEFAULT_TTL);

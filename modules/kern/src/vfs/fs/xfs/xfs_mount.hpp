@@ -117,6 +117,11 @@ struct XfsMountContext {
     // checkpoint boundary rather than missing an inode dirtied mid-scan.
     std::atomic<uint64_t> mutation_sequence;
 
+    // Namespace and authorization mutations invalidate retained lookups.
+    // Ordinary regular-file data writes still advance mutation_sequence for
+    // sync, but do not change pathname bindings or search authorization.
+    std::atomic<uint64_t> lookup_sequence{0};
+
     // Filesystem UUIDs
     XfsUuidT uuid;
     XfsUuidT meta_uuid;

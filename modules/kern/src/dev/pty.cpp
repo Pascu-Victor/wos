@@ -13,6 +13,8 @@
 #include <platform/mm/virt.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <platform/sched/session.hpp>
+#include <platform/security/terminal.hpp>
 #include <span>
 #include <util/radix_tree.hpp>
 #include <utility>
@@ -352,17 +354,18 @@ auto pty_poll_wait_kind(ker::vfs::File* /*file*/) -> WaitChannelKind { return Wa
 
 ker::util::RadixTree<PtyPair*> pty_tree;
 ker::mod::sys::Spinlock pty_tree_lock;
+uint64_t pty_generation = 0;  // Issued under pty_tree_lock; never wraps.
 bool pty_initialized = false;
 
 // --- Master-side device operations ---
 
-int ptmx_open(ker::vfs::File* file) {
+int ptmx_open(ker::vfs::File* file, const ker::mod::security::Snapshot& caller, ker::mod::sched::task::Task* /*opener*/) {
     if (file == nullptr || file->private_data == nullptr) {
         return -ENOMEM;
     }
 
     // Allocate a new PTY pair
-    int const IDX = pty_alloc();
+    int const IDX = pty_alloc(caller);
     if (IDX < 0) {
         return -ENOMEM;
     }
@@ -409,8 +412,10 @@ int master_close(ker::vfs::File* file) {
     }
 
     uint64_t const IRQF = pair->lock.lock_irqsave();
+    bool last_master = false;
     if (pair->master_opened > 0) {
         pair->master_opened--;
+        last_master = pair->master_opened == 0;
     }
 
     bool should_free = false;
@@ -421,6 +426,10 @@ int master_close(ker::vfs::File* file) {
         should_free = true;
     }
     pair->lock.unlock_irqrestore(IRQF);
+
+    if (last_master) {
+        ker::mod::sched::session::hangup_terminal(*pair);
+    }
 
     wake_slave_readers(pair);
     wake_slave_writers(pair);
@@ -508,21 +517,12 @@ ssize_t master_read(ker::vfs::File* file, void* buf, size_t count) {
 // --- Line discipline helpers ---
 
 // Send signal to a foreground process group snapshot.
-void pty_signal_pgrp(int controlling_tty, uint64_t foreground_pgrp, int sig) {
-    if (foreground_pgrp != 0) {
-        if (ker::mod::sched::signal_process_group(foreground_pgrp, sig) != 0) {
-            return;
-        }
-
-        // A WKI-forwarded terminal can proxy TIOCSPGRP from the remote node,
-        // leaving the local PTY with a remote pgid that has no local task
-        // match.  In that case, only forward to local WKI proxy tasks; do not
-        // signal the whole local SSH/dropbear controlling-tty session.
-        static_cast<void>(ker::mod::sched::signal_controlling_tty_wki_proxies(controlling_tty, sig));
-        return;
-    }
-
-    static_cast<void>(ker::mod::sched::signal_controlling_tty(controlling_tty, sig));
+void pty_signal_pgrp(ker::mod::security::TerminalIdentity terminal, uint64_t session_id, uint64_t generation, uint64_t foreground_pgrp,
+                     ker::mod::sched::session::Origin foreground_origin, int sig) {
+    // No matching foreground member means no recipient. Never broaden a
+    // terminal event to other groups or substitute a numeric group alias.
+    static_cast<void>(
+        ker::mod::sched::signal_terminal_process_group(terminal, session_id, generation, foreground_pgrp, foreground_origin, sig));
 }
 
 // Echo a single byte to s2m, applying output post-processing
@@ -602,7 +602,10 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
         if ((pair->termios.c_lflag & TIOS_ISIG) != 0U) {
             if (ch == pair->termios.c_cc[CC_VINTR] && pair->termios.c_cc[CC_VINTR] != 0) {
                 uint64_t const SIGNAL_PGRP = pair->foreground_pgrp;
-                int const SIGNAL_TTY = pair->index;
+                auto const SIGNAL_ORIGIN = pair->foreground_origin;
+                auto const SIGNAL_TTY = pair->identity;
+                uint64_t const SIGNAL_SESSION = pair->session_id;
+                uint64_t const SIGNAL_GENERATION = pair->attachment_generation;
                 if ((pair->termios.c_lflag & TIOS_ECHO) != 0U) {
                     pty_echo_ctrl(pair, ch);
                     pty_echo_byte(pair, '\n');
@@ -612,13 +615,16 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                     pair->canon_len = 0;
                 }
                 pair->lock.unlock_irqrestore(IRQF);
-                pty_signal_pgrp(SIGNAL_TTY, SIGNAL_PGRP, SIG_INT);
+                pty_signal_pgrp(SIGNAL_TTY, SIGNAL_SESSION, SIGNAL_GENERATION, SIGNAL_PGRP, SIGNAL_ORIGIN, SIG_INT);
                 processed++;
                 continue;
             }
             if (ch == pair->termios.c_cc[CC_VQUIT] && pair->termios.c_cc[CC_VQUIT] != 0) {
                 uint64_t const SIGNAL_PGRP = pair->foreground_pgrp;
-                int const SIGNAL_TTY = pair->index;
+                auto const SIGNAL_ORIGIN = pair->foreground_origin;
+                auto const SIGNAL_TTY = pair->identity;
+                uint64_t const SIGNAL_SESSION = pair->session_id;
+                uint64_t const SIGNAL_GENERATION = pair->attachment_generation;
                 if ((pair->termios.c_lflag & TIOS_ECHO) != 0U) {
                     pty_echo_ctrl(pair, ch);
                     pty_echo_byte(pair, '\n');
@@ -628,19 +634,22 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                     pair->canon_len = 0;
                 }
                 pair->lock.unlock_irqrestore(IRQF);
-                pty_signal_pgrp(SIGNAL_TTY, SIGNAL_PGRP, SIG_QUIT);
+                pty_signal_pgrp(SIGNAL_TTY, SIGNAL_SESSION, SIGNAL_GENERATION, SIGNAL_PGRP, SIGNAL_ORIGIN, SIG_QUIT);
                 processed++;
                 continue;
             }
             if (ch == pair->termios.c_cc[CC_VSUSP] && pair->termios.c_cc[CC_VSUSP] != 0) {
                 uint64_t const SIGNAL_PGRP = pair->foreground_pgrp;
-                int const SIGNAL_TTY = pair->index;
+                auto const SIGNAL_ORIGIN = pair->foreground_origin;
+                auto const SIGNAL_TTY = pair->identity;
+                uint64_t const SIGNAL_SESSION = pair->session_id;
+                uint64_t const SIGNAL_GENERATION = pair->attachment_generation;
                 if ((pair->termios.c_lflag & TIOS_ECHO) != 0U) {
                     pty_echo_ctrl(pair, ch);
                     pty_echo_byte(pair, '\n');
                 }
                 pair->lock.unlock_irqrestore(IRQF);
-                pty_signal_pgrp(SIGNAL_TTY, SIGNAL_PGRP, SIG_TSTP);
+                pty_signal_pgrp(SIGNAL_TTY, SIGNAL_SESSION, SIGNAL_GENERATION, SIGNAL_PGRP, SIGNAL_ORIGIN, SIG_TSTP);
                 processed++;
                 continue;
             }
@@ -914,7 +923,6 @@ int master_poll_check(ker::vfs::File* file, int events) {
 }
 
 CharDeviceOps master_ops = {
-    .open = ptmx_open,
     .close = master_close,
     .read = master_read,
     .write = master_write,
@@ -923,6 +931,7 @@ CharDeviceOps master_ops = {
     .poll_check = master_poll_check,
     .poll_register_waiter = pty_poll_register_waiter,
     .poll_wait_kind = pty_poll_wait_kind,
+    .open_with_credentials = ptmx_open,
 };
 
 // --- Slave-side device operations ---
@@ -945,13 +954,6 @@ int slave_open(ker::vfs::File* file) {
     pty_pair_acquire(pair);
     pair->slave_opened++;
 
-    // Set initial foreground process group to the opener's pgid (only on first open)
-    if (pair->foreground_pgrp == 0) {
-        auto* task = ker::mod::sched::get_current_task();
-        if (task != nullptr) {
-            pair->foreground_pgrp = (task->pgid != 0) ? task->pgid : task->pid;
-        }
-    }
     pair->lock.unlock_irqrestore(IRQF);
 
     wake_master_pollers(pair);
@@ -1244,18 +1246,11 @@ int slave_ioctl(ker::vfs::File* file, unsigned long cmd, unsigned long arg) {
         }
         case TIOCSCTTY: {
             auto* task = ker::mod::sched::get_current_task();
-            if (task != nullptr) {
-                task->controlling_tty = pair->index;
-                pair->foreground_pgrp = (task->pgid != 0) ? task->pgid : task->pid;
-            }
-            return 0;
+            return task != nullptr ? ker::mod::sched::session::claim_terminal(*task, *pair) : -ENOTTY;
         }
         case TIOCNOTTY: {
             auto* task = ker::mod::sched::get_current_task();
-            if (task != nullptr) {
-                task->controlling_tty = -1;
-            }
-            return 0;
+            return task != nullptr ? ker::mod::sched::session::detach_terminal(*task, *pair) : -ENOTTY;
         }
         case TIOCGPGRP: {
             if (arg == 0) {
@@ -1271,11 +1266,9 @@ int slave_ioctl(ker::vfs::File* file, unsigned long cmd, unsigned long arg) {
             if (arg == 0) {
                 return -EFAULT;
             }
-            const auto* in = reinterpret_cast<const int64_t*>(arg);
-            uint64_t const IRQF = pair->lock.lock_irqsave();
-            pair->foreground_pgrp = *in > 0 ? static_cast<uint64_t>(*in) : 0;
-            pair->lock.unlock_irqrestore(IRQF);
-            return 0;
+            auto* task = ker::mod::sched::get_current_task();
+            int64_t const PGID = *reinterpret_cast<const int64_t*>(arg);
+            return task != nullptr ? ker::mod::sched::session::set_foreground(*task, *pair, PGID) : -ENOTTY;
         }
         case TCGETS: {
             if (arg == 0) {
@@ -1404,7 +1397,7 @@ void pty_init() {
     log::info("initialized (dynamic allocation)");
 }
 
-auto pty_alloc() -> int {
+auto pty_alloc(const ker::mod::security::Snapshot& caller) -> int {
     // Find next available PTY index
     uint64_t irqf = pty_tree_lock.lock_irqsave();
     uint64_t const SLOT = pty_tree.find_first_unset(0);
@@ -1433,6 +1426,7 @@ auto pty_alloc() -> int {
     pair->termios = default_termios();
     pair->canon_len = 0;
     pair->foreground_pgrp = 0;
+    pair->foreground_origin = {};
 
     // Build the slave name: "N" (e.g., "0", "12")
     if (N < 10) {
@@ -1471,6 +1465,12 @@ auto pty_alloc() -> int {
 
     // Insert into radix tree
     irqf = pty_tree_lock.lock_irqsave();
+    if (pty_generation == ker::mod::security::TerminalIdentity::MAX_GENERATION) {
+        pty_tree_lock.unlock_irqrestore(irqf);
+        delete pair;
+        return -1;
+    }
+    pair->identity = ker::mod::security::TerminalIdentity::create(++pty_generation, static_cast<unsigned>(N));
     bool const INSERTED = pty_tree.insert(SLOT, pair);
     size_t const PTY_COUNT = pty_tree.size();
     pty_tree_lock.unlock_irqrestore(irqf);
@@ -1483,7 +1483,7 @@ auto pty_alloc() -> int {
     auto pts_path = make_pts_path(pair->slave_name);
 
     dev_register(&pair->slave_dev);
-    if (vfs::devfs::devfs_add_device_node(pts_path, &pair->slave_dev) == nullptr) {
+    if (vfs::devfs::devfs_add_device_node(pts_path, &pair->slave_dev, &caller) == nullptr) {
         dev_unregister(&pair->slave_dev);
         irqf = pty_tree_lock.lock_irqsave();
         pty_tree.remove(SLOT);
@@ -1512,13 +1512,14 @@ auto pty_get(int index) -> PtyPair* {
     return ptr;
 }
 
-auto pty_open_slave_by_index(int index) -> PtyPair* {
-    if (index < 0 || std::cmp_greater_equal(index, PTY_MAX)) {
+auto pty_open_controlling_slave(ker::mod::security::TerminalIdentity identity, uint64_t session_id, uint64_t generation) -> PtyPair* {
+    int const INDEX = identity.index();
+    if (INDEX < 0 || std::cmp_greater_equal(INDEX, PTY_MAX)) {
         return nullptr;
     }
 
     uint64_t const TREE_IRQF = pty_tree_lock.lock_irqsave();
-    auto* pair = pty_tree.lookup(static_cast<uint64_t>(index));
+    auto* pair = pty_tree.lookup(static_cast<uint64_t>(INDEX));
     if (pair == nullptr) {
         pty_tree_lock.unlock_irqrestore(TREE_IRQF);
         return nullptr;
@@ -1528,7 +1529,8 @@ auto pty_open_slave_by_index(int index) -> PtyPair* {
     // tree -> pair is the only nested lock order. Publish both lifetime facts
     // before allowing retirement to observe the endpoint counts again.
     uint64_t const PAIR_IRQF = pair->lock.lock_irqsave();
-    if (pair->freeing || !pair->allocated) {
+    if (pair->freeing || !pair->allocated || pair->identity != identity || session_id == 0 || pair->session_id != session_id ||
+        pair->master_opened <= 0 || generation == 0 || pair->attachment_generation != generation) {
         pair->lock.unlock_irqrestore(PAIR_IRQF);
         pty_tree_lock.unlock_irqrestore(TREE_IRQF);
         return nullptr;
@@ -1538,6 +1540,20 @@ auto pty_open_slave_by_index(int index) -> PtyPair* {
     pair->lock.unlock_irqrestore(PAIR_IRQF);
     pty_tree_lock.unlock_irqrestore(TREE_IRQF);
     return pair;
+}
+
+auto pty_binding_is_live(ker::mod::security::TerminalIdentity identity, uint64_t session_id, uint64_t generation) -> bool {
+    auto* pair = pty_get(identity.index());
+    if (pair == nullptr) {
+        return false;
+    }
+    uint64_t const IRQF = pair->lock.lock_irqsave();
+    bool const LIVE = pair->allocated && !pair->freeing && pair->identity == identity && session_id != 0 &&
+                      pair->session_id == session_id && pair->master_opened > 0 && generation != 0 &&
+                      pair->attachment_generation == generation;
+    pair->lock.unlock_irqrestore(IRQF);
+    pty_pair_release(pair);
+    return LIVE;
 }
 
 void pty_put(PtyPair* pair) { pty_pair_release(pair); }

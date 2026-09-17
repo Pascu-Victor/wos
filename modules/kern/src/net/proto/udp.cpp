@@ -188,11 +188,11 @@ auto netdev_find_by_ifindex(uint32_t ifindex) -> NetDeviceRef {
 }
 
 auto first_ipv4_or_any(NetDevice* dev) -> IPv4Address {
-    auto* nif = netif_find_by_dev(dev);
-    if (nif == nullptr || nif->ipv4_addr_count == 0) {
+    auto const IPV4 = netif_ipv4_snapshot(dev);
+    if (IPV4.count == 0) {
         return IPv4Address::any();
     }
-    return nif->ipv4_addrs.front().addr;
+    return IPV4.entries.front().addr;
 }
 
 auto udp_payload_too_large(size_t len) -> bool { return len > UDP_MAX_PACKET_PAYLOAD; }
@@ -363,11 +363,11 @@ int udp_connect(Socket* sock, const void* addr_raw, size_t addr_len, int /*unuse
         if (!route_ref) {
             return -EHOSTUNREACH;
         }
-        auto* nif = netif_find_by_dev(route_ref.get());
-        if (nif == nullptr || nif->ipv4_addr_count == 0) {
+        auto const IPV4 = netif_ipv4_snapshot(route_ref.get());
+        if (IPV4.count == 0) {
             return -EADDRNOTAVAIL;
         }
-        sock->local = SocketEndpoint::mapped_ipv4(nif->ipv4_addrs.front().addr, sock->local.port);
+        sock->local = SocketEndpoint::mapped_ipv4(IPV4.entries.front().addr, sock->local.port);
     }
 
     if (remote.is_ipv6() && !remote.is_v4_mapped()) {

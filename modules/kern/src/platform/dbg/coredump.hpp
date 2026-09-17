@@ -27,6 +27,7 @@ void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::
 
 #ifdef WOS_SELFTEST
 auto selftest_budget_admission() -> bool;
+auto selftest_private_output_creation() -> bool;
 #endif
 
 }  // namespace ker::mod::dbg::coredump

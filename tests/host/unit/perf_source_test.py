@@ -144,7 +144,7 @@ def test_runtime_image_observability_is_authoritative_and_append_only() -> None:
             'strcmp(path, "self/images")',
             'strcmp(task_sub, "images")',
             'strcmp(sub, "images")',
-            "generate_images(pfd->node.pid",
+            "generate_images(data.target",
         ],
         "procfs runtime image surface",
     )
@@ -197,7 +197,7 @@ def test_runtime_image_observability_is_authoritative_and_append_only() -> None:
     for caller in ("collect_memacc_process_totals", "generate_memacc_procs"):
         require_tokens(
             function_body(procfs, caller),
-            ["SharedVmemPublicationGuard", "task_memacc_layout_locked", "collect_user_memory_breakdown(task->pagemap, LAYOUT)"],
+            ["SharedVmemPublicationGuard", "task_memacc_layout_locked", "collect_user_memory_breakdown(pin.pagemap, LAYOUT)"],
             f"{caller} publication snapshot",
         )
     memacc_layout_body = function_body(procfs, "task_memacc_layout_locked")

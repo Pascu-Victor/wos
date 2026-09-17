@@ -215,11 +215,14 @@ def require_preemptible_parking_rechecks_signals() -> None:
 
 def require_sigchld_wakes_interruptible_waits() -> None:
     notify_body = body_after_marker(CHILD_EVENTS_CPP.read_text(), "void deliver_wake")
-    require_order(
-        notify_body,
-        "wake.signal_owner->signal_add_pending_mask(1ULL << (SIGCHLD_NUMBER - 1U))",
-        "ker::mod::sched::wake_task_from_event(wake.signal_owner)",
-    )
+    if "signal_child_event(*wake.signal_owner, ker::net::wki::WKI_CHILD_SIGNAL_HOPS)" not in notify_body:
+        fail("SIGCHLD must enter local admission or deferred forwarding")
+    process_cpp = CHILD_EVENTS_CPP.with_name("process.cpp").read_text()
+    admitted = function_body(process_cpp, "child_event_signal_local")
+    require_order(admitted, "target.begin_local_signal_admission()",
+                  "target.signal_add_pending_mask(uint64_t{1} << 16)",
+                  "ker::mod::sched::wake_task_from_event(&target)",
+                  "target.end_local_signal_admission()")
     if "g_lifecycle_lock" in notify_body:
         fail("SIGCHLD event delivery must run after dropping the lifecycle lock")
 

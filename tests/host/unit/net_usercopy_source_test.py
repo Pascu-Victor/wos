@@ -26,6 +26,8 @@ def find_matching_brace(source: str, brace: int) -> int:
 def function_body(source: str, name: str) -> str:
     start = source.find(f"auto {name}(")
     if start < 0:
+        start = source.find(f"void {name}(")
+    if start < 0:
         fail(f"{name} function not found")
     brace = source.find("{", start)
     return source[brace + 1 : find_matching_brace(source, brace)]
@@ -142,11 +144,91 @@ def require_fixed_abi_records_and_wait_sets(source: str) -> None:
             fail(f"poll must bound and bounce its array: {snippet}")
 
 
+def ordered(body: str, tokens: list[str]) -> None:
+    previous = -1
+    for token in tokens:
+        position = body.find(token, previous + 1)
+        if position < 0:
+            fail(f"network authority ordering missing {token}")
+        previous = position
+
+def require_network_authority_before_side_effects(source: str) -> None:
+    if "case ker::abi::net::ops::NETCTL_ROUTE_SET:\n        case ker::abi::net::ops::NETCTL_ROUTE_DEL: {" not in source:
+        fail("route add and delete must share the checked admission block")
+    gate = ["task->credentials()", "authorize_network_administration(CREDENTIALS)", "if (AUTHORIZATION != 0)"]
+    ordered(case_body(source, "SOCKET"), ["socket_protocol_supported", "SOCK_TYPE_MASK", *gate,
+                                          "FdReservation descriptor", "socket_create"])
+    ioctl = case_body(source, "IOCTL_NET")
+    ordered(ioctl, ["usercopy::copy_from_task", "bool const MUTATES", *gate, "if (request == SIOC_ADDRT", "netdev_find_by_name_ref"])
+    classification = ioctl.split("bool const MUTATES", 1)[1].split(";", 1)[0]
+    for name in ["SIFFLAGS", "SIFADDR", "SIFNETMASK", "SIFMTU", "SIFNAME", "SIFHWADDR", "SIFHWBROADCAST", "SIFTXQLEN", "ADDRT", "DELRT"]:
+        if "request == SIOC_" + name not in classification:
+            fail(f"legacy network writer {name} has no authority admission")
+    for name in ["SET_DEV_CPU_AFFINITY", "NETCTL_ADDR_SET", "NETCTL_ADDR_DEL", "NETCTL_ADDR_SET_V2", "NETCTL_ROUTE_DEL", "NETCTL_LINK_SET"]:
+        body = case_body(source, name)
+        if body.count("task->credentials()") != 1:
+            fail(f"{name} must take one credential snapshot")
+        if name == "NETCTL_LINK_SET":
+            ordered(body, ["usercopy::copy_", "task->credentials()", "apply_link_request(req, CREDENTIALS)"])
+            helper = function_body(source, "apply_link_request")
+            ordered(helper, [*gate[1:], "dev_ref", "name_change.prepare(dev_ref.identity()", "apply_ifflags(",
+                             "if (RET != 0) return", "dev->mtu =", "name_change.commit()"])
+            if "task->credentials()" in helper:
+                fail("link commit must retain the syscall's admitted snapshot")
+        else:
+            ordered(body, ["usercopy::copy_", *gate, "dev_ref"])
+    flags = function_body(source, "apply_ifflags")
+    ordered(flags, ["dev->ops->open_as(dev, CREDENTIALS)", "status = dev->ops->open(dev)", "if (status != 0) return", "dev->state = 1", "publish_ifflags"])
+    ordered(flags, ["dev->ops->close_as(dev, CREDENTIALS)", "if (STATUS != 0) return", "dev->ops->close(dev)", "dev->state = 0", "publish_ifflags"])
+
+    if "return static_cast<uint64_t>(apply_ifflags(dev, flags," not in ioctl:
+        fail("legacy interface flags must return the driver's refusal")
+    for name in ["NETCTL_IF_LIST", "NETCTL_ADDR_LIST", "NETCTL_ROUTE_LIST", "BIND", "CONNECT", "LISTEN"]:
+        if "authorize_network_administration" in case_body(source, name):
+            fail(f"public network operation {name} must retain its existing admission")
+
+
+def require_combined_link_admission(source: str) -> None:
+    body = function_body(source, "apply_link_request")
+    ordered(body, ["authorize_network_administration(CREDENTIALS)", "control_guard.try_acquire(dev)",
+                   "if (CONTROL_ADMISSION != 0) return", "name_change.prepare"])
+    ioctl = case_body(source, "IOCTL_NET")
+    ordered(ioctl, ["authorize_network_administration(CREDENTIALS)", "netdev_find_by_name_ref", "bool const LINK_MUTATION",
+                    "control_guard.try_acquire(dev)", "if (CONTROL_ADMISSION != 0) return", "switch (request)"])
+    classification = ioctl.split("bool const LINK_MUTATION", 1)[1].split(";", 1)[0]
+    for name in ["SIFFLAGS", "SIFMTU", "SIFTXQLEN", "SIFHWADDR", "SIFNAME"]:
+        if "request == SIOC_" + name not in classification:
+            fail(f"legacy link writer {name} can bypass device control admission")
+    ordered(body, ["name_change.prepare", "dev->ops->apply_link_as(dev, control, CREDENTIALS)", "if (STATUS != 0) return", "publish_ifflags", "dev->mtu =", "name_change.commit"])
+    ordered(body, ["netdev_check_mac(dev, req.hwaddr)", "apply_ifflags(dev, req.flags", "commit_netdev_hwaddr", "dev->mtu ="])
+    if body.count("apply_link_as(dev, control, CREDENTIALS)") != 1 or "set_netdev_hwaddr(" in body:
+        fail("combined remote driver effects must use one admitted operation")
+    ordered(function_body(source, "set_netdev_hwaddr"), ["apply_link_as(dev, control, caller)", "if (STATUS != 0) return"])
+    if "set_netdev_hwaddr(dev, sa + 2, 6, CREDENTIALS)" not in source:
+        fail("legacy MAC control must retain admitted caller")
+
+
+def require_owned_interface_configuration(source: str) -> None:
+    fill = function_body(source, "fill_if_info")
+    if fill.count("netdev_config_snapshot(dev)") != 1:
+        fail("one interface record must consume one owned configuration")
+    for field in ["name", "mac", "mtu", "tx_queue_len", "link_flags", "state"]:
+        if "dev->" + field in fill:
+            fail(f"interface list reads live {field} during control commit")
+    ioctl = case_body(source, "IOCTL_NET")
+    for field in ["dev->mac", "effective_ifflags(dev)", "static_cast<int32_t>(dev->mtu)", "static_cast<int32_t>(dev->tx_queue_len)"]:
+        if field in ioctl:
+            fail("legacy interface query bypasses the owned configuration")
+
+
 def main() -> None:
+    require_owned_interface_configuration(NET_CPP.read_text())
     source = NET_CPP.read_text()
     require_bounded_socket_io(source)
     require_address_and_option_snapshots(source)
     require_fixed_abi_records_and_wait_sets(source)
+    require_network_authority_before_side_effects(source)
+    require_combined_link_admission(source)
     print("network syscall usercopy invariants hold")
 
 

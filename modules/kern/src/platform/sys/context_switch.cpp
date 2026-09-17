@@ -1015,6 +1015,66 @@ extern "C" void wos_restore_return_task_fpu() {
     restore_or_init_fpu_state(task);
 }
 
+UserReturnFpuAuthorization::UserReturnFpuAuthorization(sched::task::Task& task) {
+    if (task.type == sched::task::TaskType::PROCESS && task.context.saved_frame_class == sched::task::SavedFrameClass::USER_RETURN &&
+        saved_frame_class_is_valid(&task, task.context.frame)) {
+        task_ = &task;
+    }
+}
+
+UserReturnFpuAuthorization::~UserReturnFpuAuthorization() {
+    if (task_ == nullptr) return;
+    // A nested yield may consume the CPU-local authorization and replace the
+    // durable Task context with its kernel continuation. The outer assembly
+    // user frame is still intact on this stack. Reauthorize that exact task;
+    // do not relabel the durable kernel frame or reuse same-CPU suppression.
+    set_timer_fpu_return_authorization(task_, sched::task::SavedFrameClass::USER_RETURN);
+    set_timer_fpu_restore_suppressed(false);
+}
+
+#ifdef WOS_SELFTEST
+auto context_switch_selftest_user_return_fpu_authorization() -> bool {
+    uint64_t flags;
+    asm volatile("pushfq; popq %0; cli" : "=r"(flags)::"memory");
+    auto const ORIGINAL = consume_timer_fpu_return_authorization();
+    bool const SUPPRESSED = consume_timer_fpu_restore_suppressed();
+    sched::task::Task task{};
+    task.type = sched::task::TaskType::PROCESS;
+    task.context.saved_frame_class = sched::task::SavedFrameClass::USER_RETURN;
+    task.context.frame.cs = desc::gdt::GDT_USER_CS;
+    task.context.frame.ss = desc::gdt::GDT_USER_DS;
+    task.context.frame.rip = 0x400000;
+    task.context.frame.rsp = 0x700000;
+    task.context.frame.flags = 0x202;
+    bool ok = saved_frame_class_is_valid(&task, task.context.frame);
+    {
+        UserReturnFpuAuthorization continuation(task);
+        clear_timer_fpu_return_authorization();
+        set_timer_fpu_restore_suppressed(true);
+        task.context.saved_frame_class = sched::task::SavedFrameClass::VOLUNTARY_PARKED_KERNEL;
+    }
+    auto const RESUMED = consume_timer_fpu_return_authorization();
+    ok &= RESUMED.task == &task && RESUMED.frame_class == sched::task::SavedFrameClass::USER_RETURN &&
+          !consume_timer_fpu_restore_suppressed() &&
+          task.context.saved_frame_class == sched::task::SavedFrameClass::VOLUNTARY_PARKED_KERNEL;
+    {
+        UserReturnFpuAuthorization kernel(task);
+    }
+    auto const KERNEL = consume_timer_fpu_return_authorization();
+    ok &= KERNEL.task == nullptr && KERNEL.frame_class == sched::task::SavedFrameClass::INVALID;
+    task.context.saved_frame_class = sched::task::SavedFrameClass::USER_RETURN;
+    task.context.frame.cs = desc::gdt::GDT_KERN_CS;
+    {
+        UserReturnFpuAuthorization invalid(task);
+    }
+    ok &= consume_timer_fpu_return_authorization().task == nullptr;
+    set_timer_fpu_return_authorization(ORIGINAL.task, ORIGINAL.frame_class);
+    set_timer_fpu_restore_suppressed(SUPPRESSED);
+    asm volatile("pushq %0; popfq" : : "r"(flags) : "memory", "cc");
+    return ok;
+}
+#endif
+
 namespace {
 struct DebugRegisterCpuState {
     bool initialized{false};
@@ -1547,6 +1607,7 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
 
     sched::process_tasks(*gpr_ptr, *frame_ptr);
 
+    sched::job_control::drain();
     check_pending_signals_for_return(*gpr_ptr, *frame_ptr);
     auto* return_task = sched::get_return_task();
     debug_validate_clang_return("timer", return_task, *gpr_ptr, *frame_ptr);
@@ -1706,6 +1767,7 @@ extern "C" void wos_jump_to_next_task_no_save(void* stack_ptr) {
     auto* frame_ptr = reinterpret_cast<gates::InterruptFrame*>(reinterpret_cast<uint8_t*>(stack_ptr) + sizeof(cpu::GPRegs));
 
     sched::jump_to_next_task(*gpr_ptr, *frame_ptr);
+    sched::job_control::drain();
     check_pending_signals_for_return(*gpr_ptr, *frame_ptr);
     auto* return_task = sched::get_return_task();
     validate_saved_frame_for_restore(return_task, *frame_ptr, "exit-return");

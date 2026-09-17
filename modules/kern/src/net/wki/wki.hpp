@@ -526,6 +526,8 @@ struct WkiState {
     uint16_t my_node_id = WKI_NODE_INVALID;
     proto::MacAddress my_mac;
     bool initialized = false;
+    bool vfs_directory_paths_enabled = true;
+    bool vfs_realpath_enabled = true;
 
     // V2: Local hostname identity [V2 A1.6]
     std::array<char, WKI_HOSTNAME_MAX> local_hostname = {};
@@ -624,9 +626,18 @@ auto wki_peer_lifecycle_owned_by_current_task(const WkiPeer* peer) -> bool;
 // Send a message on a specific channel (handles reliability, credits, routing)
 auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const void* payload, uint16_t payload_len) -> int;
 
+// Count application bytes at reliable enqueue, under the channel lock. Unlike
+// counting after return, this preserves stream-prefix order between writers.
+// The caller pins the counter for the call; failures leave it unchanged.
+// The exact channel allocation is mandatory; retirement cannot select a replacement.
+auto wki_send_accounted(const WkiChannelIdentity& identity, MsgType msg_type, const void* payload, uint16_t payload_len,
+                        std::atomic<uint64_t>& accepted_bytes, uint16_t application_bytes) -> int;
+
 // Task-context reliable send that serializes token capture with peer/channel
 // reset. WKI_OK means the frame is recoverably enqueued; callers must poll the
 // returned token to distinguish acknowledgement from channel retirement.
+// Borrows an existing lifecycle gate only when owned by this exact task;
+// the outer owner remains responsible for releasing that gate.
 auto wki_send_tracked(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const void* payload, uint16_t payload_len,
                       WkiReliableTxToken* token_out) -> int;
 
@@ -757,6 +768,9 @@ auto wki_peer_find_by_hostname(const char* hostname) -> uint16_t;
 
 // Get hostname for a node_id. Returns nullptr if unknown.
 auto wki_peer_get_hostname(uint16_t node_id) -> const char*;
+// Stable bounded copy. Caller must not already hold peer_lock. Unknown/empty
+// names return false without changing output; no pointer escapes peer storage.
+auto wki_peer_copy_hostname(uint16_t node_id, std::array<char, WKI_HOSTNAME_MAX>& hostname) -> bool;
 
 // -----------------------------------------------------------------------------
 // V2: Async Wait Queue API [V2 A8]
@@ -857,6 +871,8 @@ auto wki_selftest_wait_list_contains(WkiWaitEntry const* entry) -> bool;
 auto wki_selftest_reliable_rx_peer_state_accepts(PeerState state) -> bool;
 auto wki_selftest_peer_lifecycle_owned_by_task(const WkiPeer* peer, const mod::sched::task::Task* task) -> bool;
 auto wki_selftest_split_payload_validation_and_copy() -> bool;
+auto wki_selftest_signal_policy_denials() -> bool;
+auto wki_selftest_policy_denial_dispatch() -> bool;
 #endif
 
 // -----------------------------------------------------------------------------

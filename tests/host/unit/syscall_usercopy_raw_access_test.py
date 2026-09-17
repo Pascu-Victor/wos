@@ -158,7 +158,8 @@ def test_transitive_address_consumers_do_not_raw_access_userspace() -> None:
         "auto vfs_read(": "vfs_read_user_bounced(*t, f, buf, count",
         "auto vfs_write(": "vfs_write_file(f, buf, count, actual_size)",
         "auto vfs_pread(": "vfs_read_user_bounced(*task, f, buf, count",
-        "auto vfs_pwrite(": "vfs_pwrite_user_bounced(*task, f, buf, count",
+        "auto vfs_pwrite(": "vfs_pwrite_file(file, buf, count, offset)",
+        "auto vfs_pwrite_file(": "vfs_pwrite_user_bounced(*task, f, buf, count",
     }
     for function, bounce in expected_vfs_bounces.items():
         if bounce not in function_body(vfs, function):

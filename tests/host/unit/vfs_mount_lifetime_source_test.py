@@ -214,14 +214,24 @@ def test_mount_path_scratch_is_fully_produced_before_use() -> None:
         ("mount_filesystem", mount, "std::strlen(resolved.data())"),
         ("unmount_filesystem_impl", unmount, "std::strcmp(resolved.data(), mp->path)"),
     ):
-        producer = "int const PATH_RET = resolve_mount_path(path, resolved.data(), resolved.size());"
+        producer = ("int const PATH_RET = path_kind == MountPathKind::RETAINED_PHYSICAL"
+                    if name == "mount_filesystem" else
+                    "int const PATH_RET = resolve_mount_path(path, resolved.data(), resolved.size());")
         gate = "if (PATH_RET < 0)"
         require_order(body, resolved_decl, producer, f"{name} resolver output")
         require_order(body, producer, gate, f"{name} resolver failure gate")
         require_order(body, gate, first_consumer, f"{name} consume only after success")
         before_gate = body[: body.find(gate)]
-        if before_gate.count("resolved.data()") != 1 or before_gate.count("resolved.size()") != 1:
+        producers = 2 if name == "mount_filesystem" else 1
+        if before_gate.count("resolved.data()") != producers or before_gate.count("resolved.size()") != producers:
             fail(f"{name} must not inspect resolver output before its failure gate")
+        if name == "mount_filesystem":
+            require_sequence(before_gate, [
+                "if (path_kind == MountPathKind::RETAINED_PHYSICAL && path[0] != '/')",
+                producer,
+                "? copy_mount_path_string(path, resolved.data(), resolved.size())",
+                ": resolve_mount_path(path, resolved.data(), resolved.size());",
+            ], "physical copy or legacy resolution must fully produce mount scratch")
         failure = block_body_after(body, gate)
         if not failure.rstrip().endswith("return PATH_RET;") or failure.count("return PATH_RET;") != 1 or "resolved" in failure:
             fail(f"{name} must return without consuming resolver output on failure")
@@ -268,15 +278,18 @@ def test_open_files_pin_mount_through_backend_close() -> None:
         ["mount_lock.lock()", "mount->open_files.load(std::memory_order_acquire)", "mount->open_files.store(OPEN_FILES - 1", "mount_lock.unlock()"],
         "open-file mount release",
     )
-    require_sequence(
-        destroy,
-        ["f->fops->vfs_close(f)", "MountPoint* const MOUNT_OWNER = f->mount_owner", "release_mount_from_open_file(MOUNT_OWNER)", "delete f"],
-        "backend close before mount ownership release",
-    )
+    require_sequence(destroy, ["f->fops->vfs_close(f)", "finish_file_close(f, CLOSE_MAY_CHANGE_METADATA, close_result)"],
+                     "backend close before shared finalization")
+    finish = function_body(core, "finish_file_close")
+    require_sequence(finish, ["MountPoint* const MOUNT_OWNER = f->mount_owner", "f->mount_owner = nullptr",
+                             "release_mount_from_open_file(MOUNT_OWNER)", "delete f"],
+                     "shared finalization releases mount once before File destruction")
+    if "return finish_file_close(file, close_may_change_metadata, close_result)" not in function_body(core, "vfs_finish_file_close"):
+        fail("abandoned close must use the same post-backend finalizer")
 
     for name in ("vfs_open_resolved_for_task", "vfs_open_file_impl"):
         body = function_body(core, name)
-        require_order(body, "MountOpenFileReservation mount_file_reservation{mount}", "switch (mount->fs_type)", f"{name} reserve before backend open")
+        require_order(body, "MountOpenFileReservation mount_file_reservation{mount, OPEN_POLICY}", "switch (mount->fs_type)", f"{name} reserve before backend open")
         require_order(body, "switch (mount->fs_type)", "mount_file_reservation.attach(f)", f"{name} attach backend result")
 
 
@@ -333,7 +346,7 @@ def test_unmount_retires_in_table_then_drains_before_destroy() -> None:
 def test_mount_initialization_reserves_exact_path() -> None:
     source = MOUNT_CPP.read_text()
     prepare_body = function_body(source, "prepare_mount_filesystem")
-    publish_body = function_body(source, "publish_prepared_mount")
+    publish_body = function_body(source, "publish_prepared_mount_with_identity")
     required = [
         "std::array<MountInitialization, MAX_MOUNT_INITIALIZATIONS> mount_initializations{}",
         "mount_path_initializing_locked",
@@ -353,7 +366,7 @@ def test_mount_initialization_reserves_exact_path() -> None:
 def test_remote_mount_is_configured_atomically() -> None:
     source = MOUNT_CPP.read_text()
     prepare_body = function_body(source, "prepare_mount_filesystem")
-    publish_body = function_body(source, "publish_prepared_mount")
+    publish_body = function_body(source, "publish_prepared_mount_with_identity")
     prepare_required = ["mount->private_data = initial_private_data", "mount->fops = initial_fops"]
     publish_required = ["state->reservation.active_locked()", "mount_path_occupied_locked(mount->path)", "mounts.push_back(mount)"]
     missing = [token for token in prepare_required if token not in prepare_body]
@@ -374,7 +387,7 @@ def test_writable_block_mount_holds_lease_until_destroy() -> None:
     header = MOUNT_HPP.read_text()
     source = MOUNT_CPP.read_text()
     prepare_body = function_body(source, "prepare_mount_filesystem")
-    publish_body = function_body(source, "publish_prepared_mount")
+    publish_body = function_body(source, "publish_prepared_mount_with_identity")
     destroy_body = function_body(source, "destroy_mount")
 
     if "ker::dev::BlockWriterLease block_writer_lease{};" not in header:
@@ -401,7 +414,7 @@ def test_writable_block_mount_holds_lease_until_destroy() -> None:
 def test_pivot_rewrites_are_transactional_and_gate_publication() -> None:
     source = MOUNT_CPP.read_text()
     prepare_body = function_body(source, "prepare_mount_filesystem")
-    publish_body = function_body(source, "publish_prepared_mount")
+    publish_body = function_body(source, "publish_prepared_mount_with_identity")
     wait_body = function_body(source, "wait_for_stable_mount_pivot_epoch")
     remap_body = function_body(source, "remap_mounts_for_pivot")
     rebase_body = function_body(source, "rebase_wki_mounts_for_new_root")
@@ -444,7 +457,7 @@ def test_pivot_rewrites_are_transactional_and_gate_publication() -> None:
         fail("pivot remap transaction is missing: " + ", ".join(missing))
     require_order(remap_body, "mp->retiring.load(std::memory_order_acquire)", "path_is_under_root", "retirement fences every pivot path")
     require_order(remap_body, "ker::util::SmallVec<PivotMountReplacement, 8> replacements", "bump_mount_generation_locked()", "allocate before commit")
-    require_order(remap_body, "mount_has_active_refs_locked(replacement.mount)", "delete[] mp->path", "final ref check before commit")
+    require_order(remap_body, "mount_has_active_refs_locked(replacement.mount, cover_state)", "delete[] mp->path", "final ref check before commit")
     collision_pos = remap_body.find("bool target_collision = false;")
     final_lock_pos = remap_body.find("mount_lock.lock();", collision_pos)
     if collision_pos < 0 or final_lock_pos < collision_pos:
@@ -488,7 +501,7 @@ def test_pivot_prepares_wki_before_mount_remap() -> None:
         "snapshot_bounded_path_string(new_root",
         "snapshot_bounded_path_string(put_old",
         "wki_remote_vfs_prepare_export_rebuild()",
-        "remap_mounts_for_pivot(stable_new_root.data(), stable_put_old.data())",
+        "remap_mounts_for_pivot(stable_new_root.data(), stable_put_old.data(), &CREDENTIALS, &references)",
         "wki_remote_vfs_cancel_export_rebuild()",
         "rebase_wki_mounts_for_new_root(stable_new_root.data())",
         "wki_remote_vfs_rebuild_exports()",
@@ -497,8 +510,8 @@ def test_pivot_prepares_wki_before_mount_remap() -> None:
     if missing:
         fail("pivot/WKI split-phase barrier is missing: " + ", ".join(missing))
     require_order(body, "snapshot_bounded_path_string(put_old", "wki_remote_vfs_prepare_export_rebuild()", "snapshot paths before prepare")
-    require_order(body, "wki_remote_vfs_prepare_export_rebuild()", "remap_mounts_for_pivot(stable_new_root.data(), stable_put_old.data())", "prepare before remap")
-    require_order(body, "remap_mounts_for_pivot(stable_new_root.data(), stable_put_old.data())", "rebase_wki_mounts_for_new_root(stable_new_root.data())", "remap before final rebase")
+    require_order(body, "wki_remote_vfs_prepare_export_rebuild()", "remap_mounts_for_pivot(stable_new_root.data(), stable_put_old.data(), &CREDENTIALS, &references)", "prepare before remap")
+    require_order(body, "remap_mounts_for_pivot(stable_new_root.data(), stable_put_old.data(), &CREDENTIALS, &references)", "rebase_wki_mounts_for_new_root(stable_new_root.data())", "remap before final rebase")
     require_order(body, "rebase_wki_mounts_for_new_root(stable_new_root.data())", "wki_remote_vfs_rebuild_exports()", "rebase before export rebuild")
 
     snapshot_body = function_body(CORE_CPP.read_text(), "snapshot_bounded_path_string")
@@ -514,44 +527,31 @@ def test_vfs_umount_invalidates_only_exact_mount() -> None:
         "std::strcmp(mount->path, resolved.data()) == 0",
         "expected_dev_id = mount->dev_id;",
         "stream_invalidate_mount_scope(mount->fs_type, stream_scope_key_for_mount(mount));",
-        "unmount_filesystem_if_dev_id(target, expected_dev_id)",
+        "unmount_filesystem_if_dev_id(stable_target.data(), expected_dev_id)",
     ]
     missing = [token for token in required if token not in body]
     if missing:
         fail("vfs_umount() must invalidate stream scope only for exact mount targets: " + ", ".join(missing))
     require_order(body, "std::strcmp(mount->path, resolved.data()) == 0", "stream_invalidate_mount_scope", "exact umount invalidation")
-    require_order(body, "expected_dev_id = mount->dev_id;", "unmount_filesystem_if_dev_id(target, expected_dev_id)", "stable unmount identity")
+    require_order(body, "expected_dev_id = mount->dev_id;", "unmount_filesystem_if_dev_id(stable_target.data(), expected_dev_id)", "stable unmount identity")
     if "return unmount_filesystem(target);" in body:
         fail("vfs_umount() must not retire a replacement mount by pathname alone")
 
 
 def test_vfs_mount_resolves_dev_source_symlinks() -> None:
     source = CORE_CPP.read_text()
-    helper_body = function_body(source, "resolve_mount_source_path")
-    helper_required = [
-        "resolve_task_path_raw(source, abs_source.data(), abs_source.size())",
-        "resolve_symlinks(abs_source.data(), resolved_source.data(), resolved_source.size(), true)",
-        "strip_current_task_root_prefix(resolved_source.data(), out, outsize)",
-    ]
-    missing = [token for token in helper_required if token not in helper_body]
-    if missing:
-        fail("resolve_mount_source_path() must use normal VFS symlink resolution: " + ", ".join(missing))
-
     body = function_body(source, "vfs_mount")
-    required = [
-        "std::array<char, MAX_PATH_LEN> resolved_source{};",
-        "int const SOURCE_RET = resolve_mount_source_path(source, resolved_source.data(), resolved_source.size());",
-        "const char* block_source = resolved_source.data();",
-        "ker::dev::block_device_find_by_name(block_source + 5)",
-        "ker::vfs::devfs::devfs_resolve_block_device(block_source + 5)",
-    ]
-    missing = [token for token in required if token not in body]
-    if missing:
-        fail("vfs_mount() must resolve /dev source symlinks before block lookup: " + ", ".join(missing))
-    require_order(body, "wki://<hostname>/<export>", "resolve_mount_source_path", "WKI URI mount before dev source resolution")
-    require_order(body, "if (IS_PARTUUID)", "resolve_mount_source_path", "PARTUUID before dev source resolution")
-    require_order(body, "resolve_mount_source_path", "block_device_find_by_name(block_source + 5)", "source symlink before name lookup")
-    require_order(body, "block_device_find_by_name(block_source + 5)", "devfs_resolve_block_device(block_source + 5)", "direct lookup before devfs walk")
+    normalized = " ".join(body.split())
+    for token in ["LookupIntent::MOUNT_SOURCE", "LookupFollowPolicy::FOLLOW_FINAL, false, true, &source_lookup, 3, false, &CREDENTIALS",
+                  "consume_mount_source(source_lookup, *authorization_task, CREDENTIALS, selected)",
+                  "devfs::devfs_resolve_block_source(selected)"]:
+        if token not in normalized:
+            fail("mount must retain its admitted source: " + token)
+    require_order(body, "vfs_acquire_lookup(authorization_task, AT_FDCWD, source", "consume_mount_source", "source acquisition")
+    require_order(body, "consume_mount_source", "devfs_resolve_block_source", "source admission before resolution")
+    require_order(body, "devfs_resolve_block_source", "probe_block_device_fstype", "selected provider before I/O")
+    if "block_device_find_by_name" in body or "resolve_mount_source_path" in source:
+        fail("mount must not recapture ambient source authority or reselect a global name")
 
 
 def test_pipe_wake_preserves_prepark_wake_token() -> None:
@@ -579,7 +579,10 @@ def test_no_raw_mount_lookup_assignments_outside_owner() -> None:
 
 def test_iteration_users_use_snapshots_when_possible() -> None:
     remote = function_body(REMOTE_VFS_CPP.read_text(), "wki_remote_vfs_auto_discover_internal")
-    procfs = function_body(PROCFS_CPP.read_text(), "generate_mounts")
+    wrapper = function_body(PROCFS_CPP.read_text(), "procfs_read_mounts_as")
+    if "generate_mounts_for_task(task, staged.data(), staged.size())" not in wrapper:
+        fail("/proc/mounts must pass its retained caller to the staged root-aware generator")
+    procfs = function_body(PROCFS_CPP.read_text(), "generate_mounts_for_task")
     for name, body in (("remote VFS auto-discovery", remote), ("/proc/mounts", procfs)):
         if "get_mount_snapshot_at" not in body:
             fail(f"{name} must iterate mount snapshots rather than raw mount pointers")
@@ -587,7 +590,77 @@ def test_iteration_users_use_snapshots_when_possible() -> None:
             fail(f"{name} must not use get_mount_at() for read-only mount metadata")
 
 
+def test_mount_descendants_and_retiring_ancestors_share_publication_lock() -> None:
+    source = MOUNT_CPP.read_text()
+    descendants = function_body(source, "mount_path_has_descendants_locked")
+    assert "for (auto* mount : mounts)" in descendants
+    assert "mount_initializations" in descendants and "initialization.active" in descendants
+    assert "retiring" not in descendants  # Retiring descendants still own their position.
+    relation = function_body(source, "mount_path_is_descendant")
+    assert "parent[0] == '/' && parent[1] == '\\0'" in relation and "child[LENGTH] == '/'" in relation
+    for name, subject in (("unmount_filesystem_impl", "mp"), ("unmount_filesystem_by_private_data", "MP")):
+        body = function_body(source, name)
+        require_order(body, f"mount_path_has_descendants_locked({subject}->path)",
+                      f"{subject}->retiring.store(true", name)
+    teardown = function_body(source, "complete_retired_mount_teardown")
+    require_order(teardown, "mount_path_has_descendants_locked(mount->path)", "destroy_mount_private_data", "shutdown parent guard")
+    for name, after in (("prepare_mount_filesystem", "new (std::nothrow) PreparedMountState"),
+                        ("publish_prepared_mount_with_identity", "mounts.push_back(mount)")):
+        body = function_body(source, name)
+        require_order(body, "mount_lock.lock()", "mount_path_has_retiring_ancestor_locked", name)
+        require_order(body, "mount_path_has_retiring_ancestor_locked", after, name)
+    reservation = function_body(source[source.index("class MountInitializationReservation"):], "acquire")
+    require_order(reservation, "mount_path_has_retiring_ancestor_locked(path)", "initialization.active = true", "reservation race")
+    fixture = function_body(source, "mount_selftest_descendant_lifetime")
+    for token in ("deny_parent()", "RETIRING_GENERATION", "raced.acquire", "complete_retired_mount_teardown(cleanup.parent",
+                  "unmount_filesystem(CHILD)", "std::memcmp(read.data(), \"seed\", 4)"):
+        assert token in fixture
+
+
+def test_native_mount_cover_is_owned_and_pivot_retires_after_unlock() -> None:
+    source = MOUNT_CPP.read_text()
+    core = CORE_CPP.read_text()
+    assert "File* covered_directory" in MOUNT_HPP.read_text()
+    consume = function_body(core, "consume_mount_target")
+    require_order(consume, "std::unique_ptr<File, LocalWalkFileRelease> covered", "MutexGuard publication_guard", "outer cover owner")
+    require_order(consume, "validate_mount_target_lookup(target, nullptr)", "pin_directory_view_lookup(target, false, state.covered)", "admit before pin")
+    require_order(consume, "pin_directory_view_lookup(target, false, state.covered)", "publish_prepared_mount(state.prepared, target.path(), state.covered.get())", "pin before publication")
+    publish = function_body(source, "publish_prepared_mount_with_identity")
+    require_order(publish, "covered_directory->refcount.load(std::memory_order_acquire) != 1", "mounts.push_back(mount)", "independent native pin")
+    require_order(publish, "mounts.push_back(mount)", "vfs_retain_file(covered_directory)", "failed publication retains nothing")
+    for token in ("covered_directory->directory_view", "covered_directory->vfs_path != nullptr", "FILE_ACCESS_SEARCH_ONLY"):
+        assert token in publish
+    capture = function_body(source, "capture_mount_covered_directory")
+    require_order(capture, "mount_lock.lock()", "vfs_retain_file(mount->covered_directory)", "capture under table lock")
+    assert "mount_pivot_epoch" in capture and "mount->retiring" in capture and "-ENOTSUP" in capture
+    assert "vfs_put_file" not in capture
+    busy = function_body(source, "mount_has_active_refs_locked")
+    assert "pin->refcount.load(std::memory_order_acquire) == 1" in busy
+    assert "mount->open_files.load(std::memory_order_acquire) != internal_pins" in busy
+    pivot = function_body(source, "remap_mounts_for_pivot")
+    require_order(pivot, "mount_has_active_refs_locked(replacement.mount, cover_state)", "mount->covered_directory = std::exchange(entry.candidate, nullptr)", "abort preserves cover")
+    require_order(pivot, "mount->covered_directory = std::exchange(entry.candidate, nullptr)", "mp->path = replacement.path", "retire stale edges before remap")
+    assert "reference_owner.state_ = cover_state" in pivot and "new (std::nothrow) PivotCoverEntry[MOUNT_COUNT]" in pivot
+    destroy = function_body(source, "destroy_mount_storage")
+    assert "vfs_put_file(mount->covered_directory)" in destroy and "mount_lock.lock" not in destroy
+
+
+def test_mount_identity_exhaustion_precedes_publication() -> None:
+    source = MOUNT_CPP.read_text()
+    wrapper = function_body(source, "publish_prepared_mount")
+    assert "publish_prepared_mount_with_identity(prepared, expected_physical_path, covered_directory, next_dev_id)" in wrapper
+    body = function_body(source, "publish_prepared_mount_with_identity")
+    require_order(body, "mount_lock.lock()", "if (next_identity == 0)", "cursor serialized with publication")
+    require_order(body, "return -EOVERFLOW", "mounts.push_back(mount)", "exhaustion leaves table and cover unchanged")
+    require_order(body, "mounts.push_back(mount)", "mount->dev_id = next_identity", "failed table insertion consumes no ID")
+    assert "next_identity = next_identity == UINT32_MAX ? 0 : next_identity + 1;" in body
+    assert "next_dev_id++" not in source
+
+
 def main() -> None:
+    test_mount_identity_exhaustion_precedes_publication()
+    test_native_mount_cover_is_owned_and_pivot_retires_after_unlock()
+    test_mount_descendants_and_retiring_ancestors_share_publication_lock()
     test_mount_path_scratch_is_fully_produced_before_use()
     test_mount_lookup_returns_raii_refs()
     test_open_files_pin_mount_through_backend_close()

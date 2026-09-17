@@ -281,7 +281,9 @@ auto wki_auth_verify_frame(const WkiHeader* header, const uint8_t* frame, size_t
         if (peer->auth_session.active && trailer.session_id == peer->auth_session.session_id) {
             session_key = peer->auth_session.rx_key;
         } else if (static_cast<MsgType>(header->msg_type) == MsgType::HELLO_CONFIRM && peer->auth_session.pending &&
-                   trailer.session_id == peer->auth_session.pending_session_id && trailer.counter == 1) {
+                   trailer.session_id == peer->auth_session.pending_session_id && trailer.counter != 0) {
+            // Confirmation can be retried after loss or race with another TX.
+            // Its counter need not be the first one reserved in this session.
             session_key = peer->auth_session.pending_rx_key;
             pending_confirmation = true;
         } else {
@@ -418,12 +420,12 @@ auto wki_auth_prepare_peer_session(WkiPeer* peer, uint32_t remote_boot_epoch) ->
     return true;
 }
 
-auto wki_auth_confirm_peer_session(WkiPeer* peer) -> bool {
-    if (peer == nullptr) {
+auto wki_auth_confirm_peer_session(WkiPeer* peer, const WkiAuthTrailer& verified_trailer) -> bool {
+    if (peer == nullptr || verified_trailer.counter == 0) {
         return false;
     }
     peer->auth_session.replay_lock.lock();
-    if (!peer->auth_session.pending) {
+    if (!peer->auth_session.pending || peer->auth_session.pending_session_id != verified_trailer.session_id) {
         peer->auth_session.replay_lock.unlock();
         return false;
     }
@@ -437,7 +439,7 @@ auto wki_auth_confirm_peer_session(WkiPeer* peer) -> bool {
     peer->auth_session.tx_key = peer->auth_session.pending_tx_key;
     peer->auth_session.rx_key = peer->auth_session.pending_rx_key;
     peer->auth_session.tx_counter.store(1, std::memory_order_relaxed);
-    peer->auth_session.rx_counter_high = 1;
+    peer->auth_session.rx_counter_high = verified_trailer.counter;
     peer->auth_session.rx_counter_bitmap = 1;
     peer->auth_session.key_id = wki_auth_peer_key_id(peer->node_id);
     Credential const* credential = credential_for(peer->node_id);

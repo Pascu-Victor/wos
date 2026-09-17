@@ -4,8 +4,39 @@
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+wos_add_unit_test(device_registry_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/device_registry_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/dev/device.cpp
+)
+target_include_directories(device_registry_test BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit/device_registry_shim)
+set_tests_properties(device_registry_test PROPERTIES TIMEOUT 60)
+
+wos_add_unit_test(block_device_registry_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/block_device_registry_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/dev/block_device.cpp ${WOS_KERN_SRC}/dev/device.cpp ${WOS_KERN_SRC}/dev/gpt.cpp
+)
+target_include_directories(block_device_registry_test BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit/block_device_registry_shim
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit/device_registry_shim
+)
+set_tests_properties(block_device_registry_test PROPERTIES TIMEOUT 60)
+
+wos_add_unit_test(file_content_match_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/file_content_match_test.cpp
+)
+
+wos_add_unit_test(credential_model_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/credential_model_test.cpp
+)
+
 wos_add_unit_test(resource_model_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/resource_model_test.cpp
+)
+wos_add_unit_test(job_control_model_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/job_control_model_test.cpp
+)
+wos_add_unit_test(signal_pending_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/signal_pending_test.cpp
 )
 wos_add_unit_test(wki_resource_contract_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_resource_contract_test.cpp

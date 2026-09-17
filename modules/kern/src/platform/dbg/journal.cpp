@@ -15,11 +15,15 @@
 #include <mod/io/serial/serial.hpp>
 #include <platform/asm/cpu.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <platform/security/authorization.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <span>
 #include <util/smallvec.hpp>
 #include <vfs/file.hpp>
 #include <vfs/fs/devfs.hpp>
+#ifdef WOS_SELFTEST
+#include <vfs/vfs.hpp>
+#endif
 
 #include "platform/asm/msr.hpp"
 #include "platform/dbg/dbg.hpp"
@@ -36,6 +40,14 @@ constexpr size_t MAX_POLL_WAKEUPS = 64;
 constexpr uint64_t NO_SEQUENCE = 0;
 constexpr int EPOLLIN_VALUE = 0x001;
 constexpr int EPOLLOUT_VALUE = 0x004;
+constexpr int EPOLLERR_VALUE = 0x008;
+
+auto caller_credentials() -> security::Snapshot {
+    auto* task = sched::can_query_current_task() ? sched::get_current_task() : nullptr;
+    return task != nullptr ? task->credentials() : security::Snapshot{};
+}
+
+auto authorize_read(const security::Snapshot& caller) -> int { return security::authorize_journal_read(caller); }
 
 struct ModuleOutputRoute {
     const char* module;
@@ -52,6 +64,7 @@ constexpr std::array<ModuleOutputRoute, 2> DEFAULT_MODULE_OUTPUT_ROUTES{{
 struct ModuleDevice {
     bool used = false;
     bool device_registered = false;
+    bool devfs_registered = false;
     bool output_devices_overridden = false;
     uint32_t output_devices = JOURNAL_OUTPUT_NONE;
     std::array<char, JOURNAL_MODULE_MAX> module{};
@@ -75,6 +88,9 @@ std::atomic<uint64_t> s_latest_sequence{0};
 std::atomic<bool> s_time_available{false};
 std::atomic<bool> s_devices_registered{false};
 std::atomic<bool> s_devfs_ready{false};
+std::atomic<bool> s_registration_pending{false};
+std::atomic_flag s_registration_publishing{};
+std::atomic<bool> s_publisher_started{false};
 std::atomic<uint8_t> s_serial_threshold{static_cast<uint8_t>(LogLevel::TRACE)};
 uint64_t s_boot_id = 0x574f530000000001ULL;
 
@@ -317,7 +333,9 @@ void wake_waiters() {
     }
 }
 
-int journal_open(ker::vfs::File* file) {
+auto journal_open_with_credentials(ker::vfs::File* file, const security::Snapshot& caller, sched::task::Task* /*opener*/) -> int {
+    if (file == nullptr) return -EINVAL;
+    if ((file->open_flags & 3) != 1 && authorize_read(caller) != 0) return -EACCES;
     if (file != nullptr) {
         file->pos = NO_SEQUENCE;
     }
@@ -364,7 +382,6 @@ auto journal_poll_register_waiter(ker::vfs::File* file, uint64_t pid) -> bool {
 }
 
 ker::dev::CharDeviceOps s_journal_ops = {
-    .open = journal_open,
     .close = journal_close,
     .read = journal_read,
     .write = journal_write,
@@ -372,6 +389,7 @@ ker::dev::CharDeviceOps s_journal_ops = {
     .ioctl = nullptr,
     .poll_check = journal_poll_check,
     .poll_register_waiter = journal_poll_register_waiter,
+    .open_with_credentials = journal_open_with_credentials,
 };
 
 ker::dev::Device s_journal_device = {
@@ -383,16 +401,46 @@ ker::dev::Device s_journal_device = {
     .char_ops = &s_journal_ops,
 };
 
-void maybe_register_module_device(ModuleDevice& entry) {
-    if (!s_devices_registered.load(std::memory_order_acquire) || entry.device_registered) {
-        return;
+// Called with s_lock held, including IRQ and allocator logging paths. Queue
+// only: registry/devfs publication can allocate, log, and take namespace locks.
+void note_module_registration_locked(const ModuleDevice& entry) {
+    if (entry.used && s_devices_registered.load(std::memory_order_acquire) &&
+        (!entry.device_registered || (s_devfs_ready.load(std::memory_order_acquire) && !entry.devfs_registered))) {
+        s_registration_pending.store(true, std::memory_order_release);
     }
-    entry.device.char_ops = &s_journal_ops;
-    if (ker::dev::dev_register(&entry.device) == 0) {
-        entry.device_registered = true;
-        if (s_devfs_ready.load(std::memory_order_acquire)) {
-            ker::vfs::devfs::devfs_add_device_node(entry.dev_name, &entry.device);
-        }
+}
+
+void publish_pending_modules() {
+    if (!s_registration_pending.load(std::memory_order_acquire) || s_registration_publishing.test_and_set(std::memory_order_acquire))
+        return;
+    struct Release {
+        ~Release() { s_registration_publishing.clear(std::memory_order_release); }
+    } release;
+    s_registration_pending.store(false, std::memory_order_release);
+    for (auto& entry : s_modules) {
+        uint64_t flags = s_lock.lock_irqsave();
+        bool const REGISTER_DEVICE = entry.used && !entry.device_registered && s_devices_registered.load(std::memory_order_acquire);
+        bool const REGISTER_NODE = entry.used && !entry.devfs_registered && (entry.device_registered || REGISTER_DEVICE) &&
+                                   s_devfs_ready.load(std::memory_order_acquire);
+        if (REGISTER_DEVICE) entry.device.char_ops = &s_journal_ops;
+        s_lock.unlock_irqrestore(flags);
+        // Entries have static lifetime; identity is immutable after used=true.
+        // The single-flight publisher alone updates their registration flags.
+        bool const DEVICE_OK = !REGISTER_DEVICE || ker::dev::dev_register(&entry.device) == 0;
+        bool const NODE_OK =
+            !REGISTER_NODE || (DEVICE_OK && ker::vfs::devfs::devfs_add_device_node(entry.dev_name, &entry.device) != nullptr);
+        flags = s_lock.lock_irqsave();
+        if (REGISTER_DEVICE && DEVICE_OK) entry.device_registered = true;
+        if (REGISTER_NODE && NODE_OK) entry.devfs_registered = true;
+        note_module_registration_locked(entry);
+        s_lock.unlock_irqrestore(flags);
+    }
+}
+
+void module_publisher_main() {
+    for (;;) {
+        publish_pending_modules();
+        ker::mod::sched::kern_sleep_us(100000);
     }
 }
 
@@ -434,10 +482,11 @@ void register_devices() {
     uint64_t const FLAGS = s_lock.lock_irqsave();
     for (auto& entry : s_modules) {
         if (entry.used) {
-            maybe_register_module_device(entry);
+            note_module_registration_locked(entry);
         }
     }
     s_lock.unlock_irqrestore(FLAGS);
+    publish_pending_modules();
 }
 
 void mark_devfs_ready() {
@@ -445,11 +494,22 @@ void mark_devfs_ready() {
     ker::vfs::devfs::devfs_create_directory("journal/modules");
     uint64_t const FLAGS = s_lock.lock_irqsave();
     for (auto& entry : s_modules) {
-        if (entry.used && entry.device_registered) {
-            ker::vfs::devfs::devfs_add_device_node(entry.dev_name, &entry.device);
-        }
+        if (entry.used) note_module_registration_locked(entry);
     }
     s_lock.unlock_irqrestore(FLAGS);
+    publish_pending_modules();
+}
+
+auto start_module_publisher() -> bool {
+    bool expected = false;
+    if (!s_publisher_started.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return true;
+    auto* worker = sched::task::Task::create_kernel_thread("journal_publish", module_publisher_main);
+    if (worker == nullptr) {
+        s_publisher_started.store(false, std::memory_order_release);
+        return false;
+    }
+    static_cast<void>(sched::post_task_balanced(worker));
+    return true;
 }
 
 void set_serial_threshold(LogLevel level) { s_serial_threshold.store(static_cast<uint8_t>(level), std::memory_order_release); }
@@ -465,7 +525,7 @@ void set_module_output_devices(const char* module, uint32_t devices) {
     if (module_entry != nullptr) {
         module_entry->output_devices_overridden = true;
         module_entry->output_devices = devices;
-        maybe_register_module_device(*module_entry);
+        note_module_registration_locked(*module_entry);
     }
     s_lock.unlock_irqrestore(FLAGS);
 }
@@ -561,7 +621,7 @@ void emit(LogLevel level, const char* module, const char* message, uint32_t flag
         output_devices = module_entry->output_devices;
     }
     if (module_entry != nullptr) {
-        maybe_register_module_device(*module_entry);
+        note_module_registration_locked(*module_entry);
     }
     rec.sequence = s_next_sequence.fetch_add(1, std::memory_order_relaxed);
     s_ring.at((rec.sequence - 1) % JOURNAL_RING_SIZE) = rec;
@@ -593,7 +653,10 @@ void emit_v(LogLevel level, const char* module, const char* format, va_list args
     emit(level, module, buf.data(), rec_flags);
 }
 
-auto read_records(ker::vfs::File* file, void* buf, size_t count, const char* module_filter) -> ssize_t {
+namespace {
+auto read_records_with_credentials(const security::Snapshot& caller, ker::vfs::File* file, void* buf, size_t count,
+                                   const char* module_filter) -> ssize_t {
+    if (authorize_read(caller) != 0) return -EACCES;
     if (file == nullptr || buf == nullptr) {
         return -EINVAL;
     }
@@ -632,7 +695,8 @@ auto read_records(ker::vfs::File* file, void* buf, size_t count, const char* mod
     return static_cast<ssize_t>(copied * sizeof(JournalRecord));
 }
 
-auto poll_check(ker::vfs::File* file, int events, const char* module_filter) -> int {
+auto poll_check_with_credentials(const security::Snapshot& caller, ker::vfs::File* file, int events, const char* module_filter) -> int {
+    if ((events & EPOLLIN_VALUE) != 0 && authorize_read(caller) != 0) return EPOLLERR_VALUE | (events & EPOLLOUT_VALUE);
     if ((events & EPOLLIN_VALUE) == 0) {
         return events & EPOLLOUT_VALUE;
     }
@@ -657,7 +721,8 @@ auto poll_check(ker::vfs::File* file, int events, const char* module_filter) -> 
     return 0;
 }
 
-auto poll_register_waiter(ker::vfs::File* /*file*/, uint64_t pid) -> bool {
+auto poll_register_waiter_with_credentials(const security::Snapshot& caller, uint64_t pid) -> bool {
+    if (authorize_read(caller) != 0) return false;
     uint64_t const FLAGS = s_lock.lock_irqsave();
     for (uint64_t const WAITER_PID : s_poll_waiters) {
         if (WAITER_PID == pid) {
@@ -669,5 +734,126 @@ auto poll_register_waiter(ker::vfs::File* /*file*/, uint64_t pid) -> bool {
     s_lock.unlock_irqrestore(FLAGS);
     return OK;
 }
+
+}  // namespace
+
+auto read_records(ker::vfs::File* file, void* buf, size_t count, const char* module_filter) -> ssize_t {
+    return read_records_with_credentials(caller_credentials(), file, buf, count, module_filter);
+}
+
+auto poll_check(ker::vfs::File* file, int events, const char* module_filter) -> int {
+    return poll_check_with_credentials(caller_credentials(), file, events, module_filter);
+}
+
+auto poll_register_waiter(ker::vfs::File* /*file*/, uint64_t pid) -> bool {
+    return poll_register_waiter_with_credentials(caller_credentials(), pid);
+}
+
+#ifdef WOS_SELFTEST
+auto selftest_module_publication() -> bool {
+    constexpr const char* MODULE = "goal19-publisher";
+    constexpr const char* PATH = "journal/modules/goal19-publisher";
+    publish_pending_modules();
+    if (vfs::devfs::devfs_acquire_path(PATH)) return false;
+    size_t const BEFORE = ker::dev::dev_get_count();
+    emit(LogLevel::INFO, MODULE, "deferred publication test", JOURNAL_FLAG_KERNEL);
+    if (ker::dev::dev_get_count() != BEFORE || vfs::devfs::devfs_acquire_path(PATH)) return false;
+    // The record is immediately readable even though its alias is still queued.
+    vfs::File file{};
+    JournalRecord record{};
+    auto const ROOT = security::Snapshot::bootstrap_root();
+    if (read_records_with_credentials(ROOT, &file, &record, sizeof(record), MODULE) != sizeof(record) ||
+        std::strcmp(record.module, MODULE) != 0 || std::strcmp(record.message, "deferred publication test") != 0)
+        return false;
+    publish_pending_modules();
+    auto retained = vfs::devfs::devfs_acquire_path(PATH);
+    if (!retained || ker::dev::dev_get_count() != BEFORE + 1 || retained->device == nullptr || retained->device->char_ops != &s_journal_ops)
+        return false;
+    if (vfs::devfs::devfs_chmod_node(retained.get(), ROOT, 0600, 0) != 0) return false;
+    emit(LogLevel::INFO, MODULE, "already published", JOURNAL_FLAG_KERNEL);
+    publish_pending_modules();
+    vfs::Stat stat{};
+    bool const OKAY = ker::dev::dev_get_count() == BEFORE + 1 && vfs::devfs::devfs_stat_node(retained.get(), 0, &stat) == 0 &&
+                      (stat.st_mode & 07777) == 0600 && vfs::devfs::devfs_acquire_path(PATH).get() == retained.get();
+    static_cast<void>(vfs::devfs::devfs_chmod_node(retained.get(), ROOT, 0666, 0));
+    return OKAY;
+}
+
+auto selftest_open_admission() -> bool {
+    namespace devfs = ker::vfs::devfs;
+    auto const ROOT = security::Snapshot::bootstrap_root();
+    security::Snapshot user, restricted_root, reader, retired_reader;
+    if (ROOT.prepare({.change = security::Change::SET_UID, .real = 1000}, user) != 0 ||
+        ROOT.prepare({.change = security::Change::DROP_AUTHORITY, .authority_ceiling = 0}, restricted_root) != 0 ||
+        ROOT.prepare({.change = security::Change::NO_NEW_PRIVILEGES}, reader) != 0 ||
+        reader.prepare({.change = security::Change::SET_SERVICE_PRIVILEGES, .service_privileges = 1}, reader) != 0 ||
+        reader.prepare({.change = security::Change::SET_UID, .real = 101}, reader) != 0 ||
+        reader.prepare({.change = security::Change::DROP_AUTHORITY, .authority_ceiling = 0}, retired_reader) != 0)
+        return false;
+    // Use the real shared journal operation table through the devfs dispatcher.
+    // No current-task credential publication or journal record mutation occurs.
+    constexpr const char* PATH = "pts/ktest_journal_admission";
+    auto* node = devfs::devfs_add_device_node(PATH, &s_journal_device);
+    if (node == nullptr) return false;
+    auto const REFS = node->pts_refs.load();
+    bool passed = s_journal_ops.open == nullptr && s_journal_ops.open_with_credentials != nullptr;
+    for (auto const& caller : {ROOT, user, restricted_root, reader, retired_reader}) {
+        for (int flags : {0, 1, 2}) {
+            int error = 0;
+            auto* file = devfs::devfs_open_path(caller, PATH, flags, 0, &error);
+            bool const ALLOWED = flags == 1 || caller == ROOT || caller == reader;
+            passed &= ALLOWED ? file != nullptr && error == 0 : file == nullptr && error == -EACCES;
+            if (file != nullptr) {
+                passed &= file->pos == NO_SEQUENCE;
+                ker::vfs::vfs_put_file(file);
+            }
+            passed &= node->pts_refs.load() == REFS;
+        }
+    }
+    passed &= devfs::devfs_remove_node(PATH);
+    return passed;
+}
+
+auto selftest_read_authorization() -> bool {
+    if (s_journal_ops.open != nullptr || s_journal_ops.open_with_credentials == nullptr) return false;
+    auto const ROOT = security::Snapshot::bootstrap_root();
+    auto user = ROOT;
+    auto limited = ROOT;
+    bool ok = ROOT.prepare({.change = security::Change::SET_UID, .real = 1000}, user) == 0 &&
+              ROOT.prepare({.change = security::Change::DROP_AUTHORITY, .authority_ceiling = 0}, limited) == 0;
+    ker::vfs::File file{};
+    std::array<uint8_t, sizeof(JournalRecord)> output{};
+    for (auto const& denied : {security::Snapshot{}, user, limited}) {
+        for (int flags : {0, 2}) {
+            file.open_flags = flags;
+            file.pos = 123;
+            ok &= s_journal_ops.open_with_credentials(&file, denied, nullptr) == -EACCES && file.pos == 123;
+        }
+        for (const char* filter : {static_cast<const char*>(nullptr), "kernel", "userspace"}) {
+            for (size_t count : {size_t{0}, size_t{1}, output.size()}) {
+                output.fill(0xA5);
+                file.pos = 123;
+                ok &= read_records_with_credentials(denied, &file, output.data(), count, filter) == -EACCES && file.pos == 123;
+                ok &= std::all_of(output.begin(), output.end(), [](uint8_t byte) { return byte == 0xA5; });
+            }
+            ok &= poll_check_with_credentials(denied, &file, EPOLLIN_VALUE, filter) == EPOLLERR_VALUE;
+            ok &= poll_check_with_credentials(denied, &file, EPOLLIN_VALUE | EPOLLOUT_VALUE, filter) == (EPOLLERR_VALUE | EPOLLOUT_VALUE);
+            ok &= poll_check_with_credentials(denied, &file, EPOLLOUT_VALUE, filter) == EPOLLOUT_VALUE;
+        }
+        size_t const WAITERS = s_poll_waiters.size();
+        ok &= !poll_register_waiter_with_credentials(denied, UINT64_MAX - 12) && s_poll_waiters.size() == WAITERS;
+        file.open_flags = 1;
+        ok &= s_journal_ops.open_with_credentials(&file, denied, nullptr) == 0 && file.pos == NO_SEQUENCE;
+    }
+    emit(LogLevel::INFO, "credential_journal", "credential journal fixture", 0);
+    file.open_flags = 0;
+    ok &= s_journal_ops.open_with_credentials(&file, ROOT, nullptr) == 0;
+    ok &= poll_check_with_credentials(ROOT, &file, EPOLLIN_VALUE, "credential_journal") == EPOLLIN_VALUE;
+    JournalRecord record{};
+    ok &= read_records_with_credentials(ROOT, &file, &record, sizeof(record), "credential_journal") == sizeof(record) &&
+          record.magic == JOURNAL_RECORD_MAGIC && std::strcmp(record.message, "credential journal fixture") == 0;
+    return ok;
+}
+#endif
 
 }  // namespace ker::mod::dbg::journal

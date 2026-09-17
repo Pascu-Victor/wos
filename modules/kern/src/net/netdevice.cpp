@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
+#include <charconv>
 #include <cstdint>
 #include <cstring>
 #include <net/backlog.hpp>
@@ -15,6 +17,8 @@
 #include <net/proto/ndp.hpp>
 #include <net/route.hpp>
 #include <net/route6.hpp>
+#include <net/wki/dev_server.hpp>
+#include <net/wki/remotable.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/smt/smt.hpp>
@@ -24,6 +28,20 @@
 #include "platform/sys/spinlock.hpp"
 
 namespace ker::net {
+
+auto netdev_check_fixed_mac(NetDevice* dev, const uint8_t* mac) -> int {
+    if (dev == nullptr || mac == nullptr) return -EINVAL;
+    return std::equal(dev->mac.bytes.begin(), dev->mac.bytes.end(), mac) ? 0 : -ENOTSUP;
+}
+
+auto netdev_check_mac(NetDevice* dev, const uint8_t* mac) -> int {
+    if (dev == nullptr || mac == nullptr) return -EINVAL;
+    if (std::equal(dev->mac.bytes.begin(), dev->mac.bytes.end(), mac)) return 0;
+    if (dev->ops == nullptr || dev->ops->set_mac == nullptr) return 0;
+    if (dev->ops->check_mac == nullptr) return -ENOTSUP;
+    int const STATUS = dev->ops->check_mac(dev, mac);
+    return STATUS <= 0 ? STATUS : -EIO;
+}
 
 using log = ker::mod::dbg::logger<"netdev">;
 
@@ -35,6 +53,12 @@ uint32_t next_eth_index = 0;
 uint64_t next_lifetime_generation = 1;
 mod::sys::Spinlock devices_lock;
 
+struct PendingNameChange {
+    NetDeviceIdentity identity{};
+    std::array<char, NETDEV_NAME_LEN> name{};
+};
+std::array<PendingNameChange, MAX_NET_DEVICES> pending_names{};
+
 constexpr uint32_t NETDEV_LIFETIME_RETIRING = uint32_t{1} << 31U;
 constexpr uint32_t NETDEV_LIFETIME_READER_MASK = NETDEV_LIFETIME_RETIRING - 1U;
 
@@ -43,6 +67,17 @@ constexpr uint32_t IFF_LOOPBACK = 0x0008;
 constexpr uint32_t IFF_MULTICAST = 0x1000;
 
 auto is_loopback_name(const std::array<char, NETDEV_NAME_LEN>& name) -> bool { return std::string_view(name.data()) == "lo"; }
+
+auto name_in_use_locked(std::string_view name, const NetDevice* exclude = nullptr) -> bool {
+    for (size_t i = 0; i < device_count; ++i) {
+        auto const* dev = devices.at(i);
+        if (dev != exclude && std::string_view(dev->name.data()) == name) return true;
+    }
+    for (auto const& pending : pending_names) {
+        if (pending.identity.valid() && pending.identity.device != exclude && std::string_view(pending.name.data()) == name) return true;
+    }
+    return false;
+}
 
 auto next_registration_generation_locked() -> uint64_t {
     uint64_t const GENERATION = next_lifetime_generation++;
@@ -83,6 +118,80 @@ void retire_network_state(const NetDeviceRetireToken& token) {
 
 NetDeviceRef::~NetDeviceRef() { reset(); }
 
+namespace {
+auto copy_netdev_config_locked(const NetDevice* dev) -> NetDeviceConfigSnapshot {
+    return {.name = dev->name,
+            .mac = dev->mac,
+            .mtu = dev->mtu,
+            .tx_queue_len = dev->tx_queue_len,
+            .link_flags = dev->link_flags,
+            .ifindex = dev->ifindex,
+            .state = dev->state};
+}
+}  // namespace
+
+auto netdev_config_snapshot(const NetDevice* dev) -> NetDeviceConfigSnapshot {
+    if (dev == nullptr) return {};
+    uint64_t const FLAGS = dev->control_publication_lock.lock_irqsave();
+    auto const SNAPSHOT = dev->control_busy.load(std::memory_order_acquire) ? dev->control_before : copy_netdev_config_locked(dev);
+    dev->control_publication_lock.unlock_irqrestore(FLAGS);
+    return SNAPSHOT;
+}
+
+void netdev_mark_control_retiring(NetDevice* dev) {
+    if (dev == nullptr) return;
+    uint64_t const FLAGS = dev->control_publication_lock.lock_irqsave();
+    dev->control_retiring = true;
+    if (dev->control_busy.load(std::memory_order_acquire))
+        dev->control_before.state = 0;
+    else
+        dev->state = 0;
+    dev->control_publication_lock.unlock_irqrestore(FLAGS);
+}
+
+auto netdev_defer_control_notify(NetDevice* dev, NetDeviceControlNotify kind) -> bool {
+    if (dev == nullptr) return false;
+    uint64_t const FLAGS = dev->control_publication_lock.lock_irqsave();
+    bool const DEFERRED = dev->control_busy.load(std::memory_order_acquire);
+    if (DEFERRED) dev->control_notifications |= static_cast<uint8_t>(kind);
+    dev->control_publication_lock.unlock_irqrestore(FLAGS);
+    return DEFERRED;
+}
+
+NetDeviceControlGuard::~NetDeviceControlGuard() { finish(); }
+
+void NetDeviceControlGuard::finish() {
+    if (device_ == nullptr) return;
+    NetDevice* const DEV = device_;
+    uint64_t const FLAGS = DEV->control_publication_lock.lock_irqsave();
+    if (DEV->ops != nullptr && DEV->ops->finish_control != nullptr) DEV->ops->finish_control(DEV);
+    if (DEV->control_retiring) DEV->state = 0;
+    uint8_t const NOTIFICATIONS = DEV->control_notifications;
+    DEV->control_notifications = 0;
+    device_ = nullptr;
+    DEV->control_busy.store(false, std::memory_order_release);
+    DEV->control_publication_lock.unlock_irqrestore(FLAGS);
+    if ((NOTIFICATIONS & static_cast<uint8_t>(NetDeviceControlNotify::OWNER_STATE)) != 0) wki::wki_dev_server_notify_net_changed(DEV);
+    if ((NOTIFICATIONS & static_cast<uint8_t>(NetDeviceControlNotify::RESOURCE_ADVERT)) != 0) wki::wki_remotable_notify_net_changed(DEV);
+}
+
+auto NetDeviceControlGuard::try_acquire(NetDevice* dev) -> int {
+    if (device_ != nullptr) return -EBUSY;
+    if (dev == nullptr) return -ENODEV;
+    uint64_t const FLAGS = dev->control_publication_lock.lock_irqsave();
+    if (dev->control_retiring) {
+        dev->control_publication_lock.unlock_irqrestore(FLAGS);
+        return -ENODEV;
+    }
+    bool expected = false;
+    bool const ACQUIRED = dev->control_busy.compare_exchange_strong(expected, true, std::memory_order_acquire, std::memory_order_relaxed);
+    if (ACQUIRED) dev->control_before = copy_netdev_config_locked(dev);
+    dev->control_publication_lock.unlock_irqrestore(FLAGS);
+    if (!ACQUIRED) return -EBUSY;
+    device_ = dev;
+    return 0;
+}
+
 NetDeviceRef::NetDeviceRef(NetDeviceRef&& other) noexcept : identity_(other.take_identity()) {}
 
 auto NetDeviceRef::operator=(NetDeviceRef&& other) noexcept -> NetDeviceRef& {
@@ -116,27 +225,27 @@ auto netdev_register(NetDevice* dev) -> int {
         return -1;
     }
 
-    dev->ifindex = next_ifindex++;
-
-    // Auto-name if the device name is empty
-    if (dev->name.front() == '\0') {
-        // Name format: "ethN"
-        std::array<char, NETDEV_NAME_LEN> buf = {};
-        buf.at(0) = 'e';
-        buf.at(1) = 't';
-        buf.at(2) = 'h';
-        uint32_t const IDX = next_eth_index++;
-        // Simple integer-to-string for index
-        if (IDX < 10) {
-            buf.at(3) = static_cast<char>('0' + static_cast<char>(IDX));
-            buf.at(4) = '\0';
-        } else {
-            buf.at(3) = static_cast<char>('0' + static_cast<char>(IDX / 10));
-            buf.at(4) = static_cast<char>('0' + static_cast<char>(IDX % 10));
-            buf.at(5) = '\0';
-        }
-        dev->name = buf;
+    auto name = dev->name;
+    size_t const NAME_LEN = strnlen(name.data(), name.size());
+    if (NAME_LEN == name.size()) {
+        devices_lock.unlock();
+        return -EINVAL;
     }
+    if (NAME_LEN == 0) {
+        // Live names plus bounded in-flight claims (including retired owners).
+        // Consecutive uint32 indices, including wrap, find a free name here.
+        for (size_t attempt = 0; attempt < MAX_NET_DEVICES + pending_names.size(); ++attempt) {
+            name = {'e', 't', 'h'};
+            static_cast<void>(std::to_chars(name.data() + 3, name.data() + name.size() - 1, next_eth_index++));
+            if (!name_in_use_locked(name.data())) break;
+        }
+    } else if (name_in_use_locked(std::string_view(name.data(), NAME_LEN))) {
+        devices_lock.unlock();
+        return -EEXIST;
+    }
+
+    dev->name = name;
+    dev->ifindex = next_ifindex++;
 
     if (dev->tx_queue_len == 0) {
         dev->tx_queue_len = 1000;
@@ -150,6 +259,9 @@ auto netdev_register(NetDevice* dev) -> int {
     }
 
     uint64_t const GENERATION = next_registration_generation_locked();
+    uint64_t const PUBLICATION_FLAGS = dev->control_publication_lock.lock_irqsave();
+    dev->control_retiring = false;
+    dev->control_publication_lock.unlock_irqrestore(PUBLICATION_FLAGS);
     dev->lifetime_generation.store(GENERATION, std::memory_order_relaxed);
     dev->lifetime_readers.store(0, std::memory_order_release);
     devices.at(device_count) = dev;
@@ -162,6 +274,66 @@ auto netdev_register(NetDevice* dev) -> int {
 #endif
 
     return 0;
+}
+
+NetDeviceNameChange::~NetDeviceNameChange() { cancel(); }
+
+auto NetDeviceNameChange::prepare(NetDeviceIdentity identity, std::string_view name) -> int {
+    if (slot_ != pending_names.size()) return -EBUSY;
+    if (name.empty() || name.size() >= NETDEV_NAME_LEN || name.find('\0') != std::string_view::npos) return -EINVAL;
+    std::array<char, NETDEV_NAME_LEN> replacement{};
+    std::copy(name.begin(), name.end(), replacement.begin());
+    auto retained = netdev_try_retain(identity);
+    if (!retained) return -ENODEV;
+    uint64_t const FLAGS = devices_lock.lock_irqsave();
+    int result = 0;
+    size_t free_slot = pending_names.size();
+    for (size_t i = 0; i < pending_names.size(); ++i) {
+        auto const& pending = pending_names.at(i);
+        if (pending.identity == identity) result = -EBUSY;
+        if (!pending.identity.valid()) free_slot = i;
+    }
+    if (registered_identity_locked(identity.device) != identity) {
+        result = -ENODEV;
+    } else if (result == 0 && name_in_use_locked(name, identity.device)) {
+        result = -EEXIST;
+    } else if (result == 0 && free_slot == pending_names.size()) {
+        result = -EBUSY;
+    }
+    if (result == 0) {
+        pending_names.at(free_slot) = {.identity = identity, .name = replacement};
+        slot_ = free_slot;
+        retained_ = std::move(retained);
+    }
+    devices_lock.unlock_irqrestore(FLAGS);
+    return result;
+}
+
+void NetDeviceNameChange::finish(bool publish) {
+    if (slot_ == pending_names.size()) return;
+    uint64_t const FLAGS = devices_lock.lock_irqsave();
+    auto& pending = pending_names.at(slot_);
+    // Retirement may win while the driver callback runs. It does not revoke
+    // this claim or pin, and completion must never republish registry membership.
+    if (publish && registered_identity_locked(pending.identity.device) == pending.identity) {
+        uint64_t const PUBLICATION_FLAGS = pending.identity.device->control_publication_lock.lock_irqsave();
+        pending.identity.device->name = pending.name;
+        pending.identity.device->control_publication_lock.unlock_irqrestore(PUBLICATION_FLAGS);
+    }
+    pending = {};
+    slot_ = pending_names.size();
+    devices_lock.unlock_irqrestore(FLAGS);
+    retained_.reset();
+}
+
+void NetDeviceNameChange::commit() { finish(true); }
+void NetDeviceNameChange::cancel() { finish(false); }
+
+auto netdev_rename(NetDeviceIdentity identity, std::string_view name) -> int {
+    NetDeviceNameChange change;
+    int const RESULT = change.prepare(identity, name);
+    if (RESULT == 0) change.commit();
+    return RESULT;
 }
 
 auto netdev_unregister(NetDevice* dev) -> int {
@@ -193,6 +365,7 @@ auto netdev_unregister_begin(NetDevice* dev, NetDeviceRetireToken& token) -> int
             return -1;
         }
         token.identity = {.device = dev, .generation = GENERATION};
+        netdev_mark_control_retiring(dev);
 
         for (size_t j = i + 1; j < device_count; j++) {
             devices.at(j - 1) = devices.at(j);
@@ -376,13 +549,14 @@ auto netdev_snapshot(NetDeviceSnapshot* out, size_t max) -> size_t {
             continue;
         }
         auto& row = out[i];
-        row.name = dev->name;
-        row.mac = dev->mac;
-        row.mtu = dev->mtu;
-        row.tx_queue_len = dev->tx_queue_len;
-        row.link_flags = dev->link_flags;
-        row.ifindex = dev->ifindex;
-        row.state = dev->state;
+        auto const CONFIG = netdev_config_snapshot(dev);
+        row.name = CONFIG.name;
+        row.mac = CONFIG.mac;
+        row.mtu = CONFIG.mtu;
+        row.tx_queue_len = CONFIG.tx_queue_len;
+        row.link_flags = CONFIG.link_flags;
+        row.ifindex = CONFIG.ifindex;
+        row.state = CONFIG.state;
         row.remotable = dev->remotable != nullptr;
         row.wki_rx_forward = dev->wki_rx_forward.load(std::memory_order_acquire) != nullptr;
         row.wki_transport = dev->wki_transport;

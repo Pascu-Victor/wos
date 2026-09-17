@@ -21,6 +21,9 @@ static constexpr uint32_t WEIGHT_NICE_P5 = 335;   // nice=+5 (lower prio)
 static constexpr uint32_t WEIGHT_NICE_N5 = 3121;  // nice=-5 (higher prio)
 
 namespace ker::mod::sched {
+auto scheduler_selftest_worker_pin_refusals() -> bool;
+auto scheduler_selftest_worker_pin_commit() -> bool;
+auto scheduler_selftest_gc_counts_exiting_pagemap_publishers() -> bool;
 auto scheduler_selftest_transition_validator_detects_corruption() -> bool;
 auto scheduler_selftest_handoff_preserves_runnable_event_token() -> bool;
 auto scheduler_selftest_exception_wait_token_closes_prepark_race() -> bool;
@@ -139,6 +142,10 @@ KTEST(SchedulerFrameClass, RestorePolicyKeepsKernelFramesOffUserReturnPaths) {
     KEXPECT_FALSE(KERNEL.restore_user_fpu);
 
     KEXPECT_EQ(saved_frame_restore_policy(SavedFrameClass::INVALID).kind, SavedFrameRestoreKind::REJECT);
+}
+
+KTEST(SchedulerFrameClass, UserReturnFpuAuthorizationSurvivesNestedPark) {
+    KEXPECT_TRUE(ker::mod::sys::context_switch::context_switch_selftest_user_return_fpu_authorization());
 }
 
 KTEST(SchedulerPreemption, OrdinaryKernelEligibilityAndRollback) {
@@ -560,3 +567,15 @@ KTEST(SchedulerRuntime, ResourceCpuSplitMatchesTask) {
 KTEST(SchedulerRuntime, FinalCpuSliceFreezesAccounting) {
     KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_final_cpu_slice_freezes_accounting());
 }
+
+KTEST(SchedulerRuntime, GcCountsExitingPagemapPublishers) {
+    KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_gc_counts_exiting_pagemap_publishers());
+}
+
+KTEST(Sched, WorkerPinBatchRefusalIsAtomic) { KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_worker_pin_refusals()); }
+KTEST(Sched, WorkerPinBatchCommitPreservesQueues) { KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_worker_pin_commit()); }
+
+namespace ker::dev::virtio {
+auto virtio_selftest_queue_affinity_batch() -> bool;
+}
+KTEST(Net, QueueAffinityAdmitsBeforeInterruptChanges) { KEXPECT_TRUE(ker::dev::virtio::virtio_selftest_queue_affinity_batch()); }

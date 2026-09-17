@@ -11,7 +11,6 @@
 #include <platform/perf/perf_events.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <span>
-#include <util/smallvec.hpp>
 
 #include "device.hpp"
 #include "util/string.hpp"
@@ -22,10 +21,30 @@ using log = ker::mod::dbg::logger<"bdev">;
 
 // Block device registry
 namespace {
-constexpr auto BDEV_INLINE_ALLOC_COUNT = 8;
 constexpr size_t MAX_BLOCK_IO_BYTES = size_t{16} * 1024 * 1024;
-ker::util::SmallVec<BlockDevice*, BDEV_INLINE_ALLOC_COUNT> block_devices;
-ker::util::SmallVec<Device*, BDEV_INLINE_ALLOC_COUNT> block_dev_nodes;
+enum class RegistryPhase : uint8_t { PREPARING, PUBLISHED, RETIRING };
+struct BlockRegistryEntry {
+    BlockDevice* device = nullptr;
+    Device node{};
+    BlockRegistryEntry* next = nullptr;
+    RegistryPhase phase = RegistryPhase::PREPARING;
+};
+
+ker::mod::sys::Spinlock block_registry_lock;
+BlockRegistryEntry* registry_head = nullptr;
+BlockRegistryEntry* registry_tail = nullptr;
+size_t registry_count = 0;
+
+class BlockRegistryGuard {
+   public:
+    BlockRegistryGuard() : flags(block_registry_lock.lock_irqsave()) {}
+    ~BlockRegistryGuard() { block_registry_lock.unlock_irqrestore(flags); }
+    BlockRegistryGuard(const BlockRegistryGuard&) = delete;
+    auto operator=(const BlockRegistryGuard&) -> BlockRegistryGuard& = delete;
+
+   private:
+    uint64_t flags;
+};
 ker::mod::sys::Spinlock block_writer_lease_lock;
 BlockWriterLease* block_writer_leases = nullptr;
 
@@ -67,26 +86,24 @@ auto normalize_io_result(int rc) -> int {
     return (rc < 0) ? rc : -rc;
 }
 
-auto find_block_dev_node_index(BlockDevice const* bdev) -> size_t {
-    for (size_t i = 0; i < block_dev_nodes.size(); ++i) {
-        Device* dev_node = block_dev_nodes.at(i);
-        if (dev_node != nullptr && dev_node->private_data == bdev) {
-            return i;
+// Caller holds the registry guard. Published count is changed separately at
+// the visibility transition, not when a preparing/retiring entry is unlinked.
+void unlink_entry_locked(BlockRegistryEntry* target) {
+    BlockRegistryEntry* previous = nullptr;
+    for (auto* entry = registry_head; entry != nullptr; entry = entry->next) {
+        if (entry == target) {
+            if (previous != nullptr) {
+                previous->next = entry->next;
+            } else {
+                registry_head = entry->next;
+            }
+            if (registry_tail == entry) {
+                registry_tail = previous;
+            }
+            return;
         }
+        previous = entry;
     }
-    return block_dev_nodes.size();
-}
-
-void remove_block_dev_node(BlockDevice const* bdev) {
-    size_t const NODE_INDEX = find_block_dev_node_index(bdev);
-    if (NODE_INDEX >= block_dev_nodes.size()) {
-        return;
-    }
-
-    Device* dev_node = block_dev_nodes.at(NODE_INDEX);
-    static_cast<void>(dev_unregister(dev_node));
-    block_dev_nodes.remove_at(NODE_INDEX);
-    delete dev_node;
 }
 }  // namespace
 
@@ -95,51 +112,60 @@ auto block_device_register(BlockDevice* bdev) -> int {
         log::warn("block_device_register: invalid device");
         return -1;
     }
+    auto* entry = new (std::nothrow) BlockRegistryEntry;
+    if (entry == nullptr) {
+        return -1;
+    }
+    entry->device = bdev;
+    entry->node.major = bdev->major;
+    entry->node.minor = bdev->minor;
+    entry->node.name = bdev->name.data();
+    entry->node.type = DeviceType::BLOCK;
+    entry->node.private_data = bdev;
 
-    if (!block_devices.push_back(bdev)) {
-        log::warn("block_device_register: device table full (OOM)");
+    bool reserved = true;
+    {
+        BlockRegistryGuard const GUARD;
+        for (auto* existing = registry_head; existing != nullptr; existing = existing->next) {
+            if (existing->device == bdev || std::strcmp(existing->device->name.data(), bdev->name.data()) == 0) {
+                reserved = false;
+                break;
+            }
+        }
+        if (reserved) {
+            if (registry_tail != nullptr) {
+                registry_tail->next = entry;
+            } else {
+                registry_head = entry;
+            }
+            registry_tail = entry;
+        }
+    }
+    if (!reserved) {
+        delete entry;
         return -1;
     }
 
-    log::debug("block_device_register: registered %s", bdev->name.data());
-
-    // Also register as a device node in /dev
-    // Create a Device wrapper for this block device
-    auto* dev_node = new (std::nothrow) Device{};
-    if (dev_node == nullptr) {
-        // Undo block_devices push
-        block_devices.remove_at(block_devices.size() - 1);
-        log::warn("block_device_register: dev node alloc failed (OOM)");
-        return -1;
-    }
-
-    dev_node->major = bdev->major;
-    dev_node->minor = bdev->minor;
-    dev_node->name = bdev->name.data();
-    dev_node->type = DeviceType::BLOCK;
-    dev_node->private_data = bdev;
-    dev_node->char_ops = nullptr;  // Block devices don't use char ops
-
-    if (!block_dev_nodes.push_back(dev_node)) {
-        delete dev_node;
-        // Undo block_devices push
-        block_devices.remove_at(block_devices.size() - 1);
-        log::warn("block_device_register: dev node table full (OOM)");
-        return -1;
-    }
-
-    if (dev_register(dev_node) != 0) {
-        block_dev_nodes.remove_at(block_dev_nodes.size() - 1);
-        delete dev_node;
-        // Undo block_devices push
-        block_devices.remove_at(block_devices.size() - 1);
+    // This can allocate, log and reenter either registry. The hidden entry
+    // reserves its key, but no block reader can select it before success.
+    if (dev_register(&entry->node) != 0) {
+        {
+            BlockRegistryGuard const GUARD;
+            unlink_entry_locked(entry);
+        }
+        delete entry;
         log::warn("block_device_register: /dev registration failed");
         return -1;
     }
-
+    size_t count = 0;
+    {
+        BlockRegistryGuard const GUARD;
+        entry->phase = RegistryPhase::PUBLISHED;
+        count = ++registry_count;
+    }
     mod::perf::record_container_stat(0, 0, mod::perf::PerfSubsystem::BLOCK_DEV, 0, mod::perf::PERF_FLAG_CT_INSERT,
-                                     static_cast<int64_t>(block_devices.size()), 0, 0);
-
+                                     static_cast<int64_t>(count), 0, 0);
+    log::debug("block_device_register: registered %s", bdev->name.data());
     return 0;
 }
 
@@ -147,27 +173,42 @@ auto block_device_unregister(BlockDevice* bdev) -> int {
     if (bdev == nullptr) {
         return -1;
     }
-    for (auto& i : block_devices) {
-        if (i == bdev) {
-            block_devices.remove(i);
-
-            // Also remove the corresponding /dev node
-            remove_block_dev_node(bdev);
-
-            mod::perf::record_container_stat(0, 0, mod::perf::PerfSubsystem::BLOCK_DEV, 0, mod::perf::PERF_FLAG_CT_REMOVE,
-                                             static_cast<int64_t>(block_devices.size()), 0, 0);
-
-            log::debug("block_device_unregister: removed %s", bdev->name.data());
-            return 0;
+    BlockRegistryEntry* retired = nullptr;
+    size_t count = 0;
+    {
+        BlockRegistryGuard const GUARD;
+        for (auto* entry = registry_head; entry != nullptr; entry = entry->next) {
+            if (entry->device == bdev && entry->phase == RegistryPhase::PUBLISHED) {
+                entry->phase = RegistryPhase::RETIRING;
+                retired = entry;
+                count = --registry_count;
+                break;
+            }
         }
     }
-    return -1;
+    if (retired == nullptr) {
+        return -1;
+    }
+    // Keep the name reserved until wrapper removal finishes. Neither registry
+    // guard spans the other registry's callbacks or entry reclamation.
+    static_cast<void>(dev_unregister(&retired->node));
+    {
+        BlockRegistryGuard const GUARD;
+        unlink_entry_locked(retired);
+    }
+    delete retired;
+    mod::perf::record_container_stat(0, 0, mod::perf::PerfSubsystem::BLOCK_DEV, 0, mod::perf::PERF_FLAG_CT_REMOVE,
+                                     static_cast<int64_t>(count), 0, 0);
+    log::debug("block_device_unregister: removed %s", bdev->name.data());
+    return 0;
 }
 
 auto block_device_find(unsigned major, unsigned minor) -> BlockDevice* {
-    for (auto* block_device : block_devices) {
-        if (block_device != nullptr && block_device->major == major && block_device->minor == minor) {
-            return block_device;
+    BlockRegistryGuard const GUARD;
+    for (auto* entry = registry_head; entry != nullptr; entry = entry->next) {
+        auto* device = entry->device;
+        if (entry->phase == RegistryPhase::PUBLISHED && device->major == major && device->minor == minor) {
+            return device;
         }
     }
     return nullptr;
@@ -177,13 +218,33 @@ auto block_device_find_by_name(const char* name) -> BlockDevice* {
     if (name == nullptr) {
         return nullptr;
     }
-
-    for (auto* block_device : block_devices) {
-        if (block_device != nullptr && std::strcmp(block_device->name.data(), name) == 0) {
-            return block_device;
+    BlockRegistryGuard const GUARD;
+    for (auto* entry = registry_head; entry != nullptr; entry = entry->next) {
+        if (entry->phase == RegistryPhase::PUBLISHED && std::strcmp(entry->device->name.data(), name) == 0) {
+            return entry->device;
         }
     }
     return nullptr;
+}
+
+auto block_device_find_by_wrapper(const Device* wrapper) -> BlockDevice* {
+    BlockRegistryGuard const GUARD;
+    for (auto* entry = registry_head; entry != nullptr; entry = entry->next) {
+        if (entry->phase == RegistryPhase::PUBLISHED && &entry->node == wrapper) {
+            return entry->device;
+        }
+    }
+    return nullptr;
+}
+
+auto block_device_is_registered(const BlockDevice* device) -> bool {
+    BlockRegistryGuard const GUARD;
+    for (auto* entry = registry_head; entry != nullptr; entry = entry->next) {
+        if (entry->phase == RegistryPhase::PUBLISHED && entry->device == device) {
+            return true;
+        }
+    }
+    return false;
 }
 
 auto block_read(BlockDevice* bdev, uint64_t block, size_t count, void* buffer) -> int {
@@ -295,22 +356,34 @@ auto block_flush(BlockDevice* bdev) -> int {
     return normalize_io_result(bdev->flush(bdev));
 }
 
-auto block_device_count() -> size_t { return block_devices.size(); }
+auto block_device_count() -> size_t {
+    BlockRegistryGuard const GUARD;
+    return registry_count;
+}
 
 auto block_device_at(size_t index) -> BlockDevice* {
-    if (index >= block_devices.size()) {
-        return nullptr;
+    BlockRegistryGuard const GUARD;
+    for (auto* entry = registry_head; entry != nullptr; entry = entry->next) {
+        if (entry->phase != RegistryPhase::PUBLISHED) {
+            continue;
+        }
+        if (index == 0) {
+            return entry->device;
+        }
+        --index;
     }
-    return block_devices.at(index);
+    return nullptr;
 }
 
 auto block_device_find_by_partuuid(const char* uuid_str) -> BlockDevice* {
     if (uuid_str == nullptr) {
         return nullptr;
     }
-    for (auto* block_device : block_devices) {
-        if (block_device != nullptr && block_device->is_partition && std::strcmp(block_device->partuuid_str.data(), uuid_str) == 0) {
-            return block_device;
+    BlockRegistryGuard const GUARD;
+    for (auto* entry = registry_head; entry != nullptr; entry = entry->next) {
+        auto* device = entry->device;
+        if (entry->phase == RegistryPhase::PUBLISHED && device->is_partition && std::strcmp(device->partuuid_str.data(), uuid_str) == 0) {
+            return device;
         }
     }
     return nullptr;
@@ -348,7 +421,10 @@ auto block_device_create_partition(BlockDevice* parent_disk, uint64_t start_lba,
         return nullptr;
     }
 
-    auto* part = new BlockDevice;
+    auto* part = new (std::nothrow) BlockDevice;
+    if (part == nullptr) {
+        return nullptr;
+    }
     part->major = parent_disk->major;
     part->minor = static_cast<unsigned>(partition_index + 1);
 
@@ -371,7 +447,7 @@ auto block_device_create_partition(BlockDevice* parent_disk, uint64_t start_lba,
     part->flush = partition_flush;
     part->private_data = nullptr;
     part->remotable = parent_disk->remotable;
-    part->read_only = parent_disk->read_only;
+    part->read_only = block_device_is_read_only(parent_disk);
 
     part->is_partition = true;
     std::copy_n(partuuid, part->partuuid.size(), part->partuuid.begin());
@@ -380,7 +456,10 @@ auto block_device_create_partition(BlockDevice* parent_disk, uint64_t start_lba,
     part->partition_start_lba = start_lba;
     part->partition_end_lba = end_lba;
 
-    block_device_register(part);
+    if (block_device_register(part) != 0) {
+        delete part;
+        return nullptr;
+    }
 
     log::debug("Created partition %s PARTUUID=%s", part->name.data(), part->partuuid_str.data());
 
@@ -393,9 +472,9 @@ auto block_device_init() -> void {
 
     // Enumerate GPT partitions on all registered whole-disk block devices
     // We snapshot the current count since enumeration will register new partition devices
-    size_t const DISK_COUNT = block_devices.size();
+    size_t const DISK_COUNT = block_device_count();
     for (size_t i = 0; i < DISK_COUNT; ++i) {
-        BlockDevice* disk = block_devices.at(i);
+        BlockDevice* disk = block_device_at(i);
         if (disk == nullptr || disk->is_partition) {
             continue;
         }
@@ -414,7 +493,7 @@ auto block_device_init() -> void {
         }
     }
 
-    log::debug("Block device init complete: %d devices registered", static_cast<unsigned>(block_devices.size()));
+    log::debug("Block device init complete: %d devices registered", static_cast<unsigned>(block_device_count()));
 }
 
 auto block_devices_overlap(const BlockDevice* lhs, const BlockDevice* rhs) -> bool {
@@ -531,8 +610,10 @@ auto block_device_set_read_only(BlockDevice* bdev, bool read_only) -> void {
         return;
     }
 
-    for (auto* dev : block_devices) {
-        if (dev != nullptr && block_devices_overlap(dev, bdev)) {
+    BlockRegistryGuard const GUARD;
+    for (auto* entry = registry_head; entry != nullptr; entry = entry->next) {
+        auto* dev = entry->device;
+        if (block_devices_overlap(dev, bdev)) {
             dev->read_only = read_only;
         }
     }
@@ -540,6 +621,7 @@ auto block_device_set_read_only(BlockDevice* bdev, bool read_only) -> void {
 }
 
 auto block_device_is_read_only(const BlockDevice* bdev) -> bool {
+    BlockRegistryGuard const GUARD;
     return bdev != nullptr && (bdev->read_only || (bdev->is_partition && bdev->parent_disk != nullptr && bdev->parent_disk->read_only));
 }
 

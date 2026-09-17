@@ -26,11 +26,14 @@ auto wki_chaos_workload_configure(const char* command, size_t len) -> int;
 // Copy the current single-row schema-v1 result into caller-owned storage.
 auto wki_chaos_workload_snapshot(char* out, size_t capacity) -> size_t;
 
+enum class ComputePublishStage : uint8_t { NONE, PREPARE, COMMIT };
+
 // Receiver-side TASK_SUBMIT hook. This is called only from the task-context
-// submit worker before exec construction and never from RX/NAPI. It is a
+// submit worker before exec construction or after COMMIT, never from RX/NAPI. It is a
 // no-op unless the boot-gated hold is active, and cannot wait past the
 // caller's existing absolute operation deadline.
-auto wki_chaos_workload_compute_publish_wait(uint64_t absolute_deadline_us) -> int;
+auto wki_chaos_workload_compute_publish_wait(uint64_t absolute_deadline_us, ComputePublishStage stage = ComputePublishStage::PREPARE)
+    -> int;
 
 #ifdef WOS_SELFTEST
 auto wki_chaos_workload_selftest_parser_and_bounds() -> bool;

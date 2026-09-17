@@ -64,6 +64,7 @@ struct WorkloadCommand {
     uint16_t blocks = 0;
     uint64_t pattern = 0;
     bool hold = false;
+    ComputePublishStage stage = ComputePublishStage::PREPARE;
     std::array<char, net::NETDEV_NAME_LEN> name{};
 };
 
@@ -114,6 +115,7 @@ struct WorkloadResult {
     bool ring_indices_valid = false;
     bool ring_quiescent = false;
     bool compute_hold = false;
+    ComputePublishStage compute_stage = ComputePublishStage::NONE;
     uint32_t compute_waiters = 0;
     uint64_t compute_wait_count = 0;
     uint64_t compute_release_generation = 0;
@@ -153,11 +155,12 @@ struct ManagedNetAttachment {
 
 // All mutable adapter state is serialized by s_workload_lock. The atomics are
 // only the cheap gate read used by advertisement callbacks and procfs stat/read.
-mod::sys::Mutex s_workload_lock;                                // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-mod::sys::Mutex s_scratch_lock;                                 // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<bool> s_workload_boot_allowed{false};               // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<bool> s_scratch_registered{false};                  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<bool> s_compute_publish_hold{false};                // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+mod::sys::Mutex s_workload_lock;                   // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+mod::sys::Mutex s_scratch_lock;                    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<bool> s_workload_boot_allowed{false};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<bool> s_scratch_registered{false};     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<ComputePublishStage> s_compute_publish_stage{
+    ComputePublishStage::NONE};                                 // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<uint32_t> s_compute_publish_waiters{0};             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<uint64_t> s_compute_publish_wait_count{0};          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<uint64_t> s_compute_publish_release_generation{0};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -181,7 +184,7 @@ auto runtime_control_allowed() -> bool {
 auto gates_allowed() -> bool { return s_workload_boot_allowed.load(std::memory_order_acquire) && runtime_control_allowed(); }
 
 void release_compute_publish_hold() {
-    s_compute_publish_hold.store(false, std::memory_order_release);
+    s_compute_publish_stage.store(ComputePublishStage::NONE, std::memory_order_release);
     s_compute_publish_release_generation.fetch_add(1, std::memory_order_acq_rel);
     // Submit workers are fixed-lifetime daemon tasks. A slot is published only
     // while its task is sleeping/yielding in the hook, and event wakeups retain
@@ -195,7 +198,8 @@ void release_compute_publish_hold() {
 }
 
 void copy_compute_state_to_result() {
-    s_result.compute_hold = s_compute_publish_hold.load(std::memory_order_acquire);
+    s_result.compute_stage = s_compute_publish_stage.load(std::memory_order_acquire);
+    s_result.compute_hold = s_result.compute_stage != ComputePublishStage::NONE;
     s_result.compute_waiters = s_compute_publish_waiters.load(std::memory_order_acquire);
     s_result.compute_wait_count = s_compute_publish_wait_count.load(std::memory_order_acquire);
     s_result.compute_release_generation = s_compute_publish_release_generation.load(std::memory_order_acquire);
@@ -440,11 +444,17 @@ auto parse_command(const char* command, size_t len, WorkloadCommand* out) -> boo
     if (std::strcmp(verb, "compute-publish") == 0) {
         out->op = WorkloadOp::COMPUTE_PUBLISH_SET;
         uint64_t hold = 0;
-        if (!parse_key_decimal(tokens.next(), "hold", 1, &hold) || tokens.next() != nullptr) {
+        if (!parse_key_decimal(tokens.next(), "hold", 1, &hold)) {
             return false;
         }
         out->hold = hold != 0;
-        return true;
+        if (auto* stage = tokens.next(); stage != nullptr) {
+            if (std::strcmp(stage, "stage=commit") == 0)
+                out->stage = ComputePublishStage::COMMIT;
+            else if (std::strcmp(stage, "stage=prepare") != 0)
+                return false;
+        }
+        return tokens.next() == nullptr;
     }
     if (std::strcmp(verb, "compute-publish-query") == 0) {
         out->op = WorkloadOp::COMPUTE_PUBLISH_QUERY;
@@ -1172,7 +1182,13 @@ auto run_compute_publish(const WorkloadCommand& command) -> int {
     s_result.op = command.op;
     if (command.op == WorkloadOp::COMPUTE_PUBLISH_SET) {
         if (command.hold) {
-            s_compute_publish_hold.store(true, std::memory_order_release);
+            auto const CURRENT = s_compute_publish_stage.load(std::memory_order_acquire);
+            if ((CURRENT != ComputePublishStage::NONE && CURRENT != command.stage) ||
+                (CURRENT == ComputePublishStage::NONE && s_compute_publish_waiters.load(std::memory_order_acquire) != 0)) {
+                copy_compute_state_to_result();
+                return -EBUSY;
+            }
+            s_compute_publish_stage.store(command.stage, std::memory_order_release);
         } else {
             release_compute_publish_hold();
         }
@@ -1223,7 +1239,7 @@ void wki_chaos_workload_init(bool workload_boot_allowed) {
     mod::sys::MutexGuard const GUARD(s_workload_lock);
     bool const ENABLED = workload_boot_allowed && runtime_control_allowed();
     s_workload_boot_allowed.store(ENABLED, std::memory_order_release);
-    s_compute_publish_hold.store(false, std::memory_order_release);
+    s_compute_publish_stage.store(ComputePublishStage::NONE, std::memory_order_release);
     s_compute_publish_waiters.store(0, std::memory_order_release);
     s_compute_publish_wait_count.store(0, std::memory_order_release);
     s_compute_publish_release_generation.store(0, std::memory_order_release);
@@ -1273,8 +1289,9 @@ void wki_chaos_workload_shutdown() {
 
 auto wki_chaos_workload_allowed() -> bool { return gates_allowed() && s_scratch_registered.load(std::memory_order_acquire); }
 
-auto wki_chaos_workload_compute_publish_wait(uint64_t absolute_deadline_us) -> int {
-    if (!s_workload_boot_allowed.load(std::memory_order_acquire) || !s_compute_publish_hold.load(std::memory_order_acquire)) {
+auto wki_chaos_workload_compute_publish_wait(uint64_t absolute_deadline_us, ComputePublishStage stage) -> int {
+    if (stage == ComputePublishStage::NONE) return -EINVAL;
+    if (!s_workload_boot_allowed.load(std::memory_order_acquire) || s_compute_publish_stage.load(std::memory_order_acquire) != stage) {
         return 0;
     }
     if (absolute_deadline_us == 0) {
@@ -1307,7 +1324,7 @@ auto wki_chaos_workload_compute_publish_wait(uint64_t absolute_deadline_us) -> i
             status = -ECANCELED;
             break;
         }
-        if (!s_compute_publish_hold.load(std::memory_order_acquire) ||
+        if (s_compute_publish_stage.load(std::memory_order_acquire) != stage ||
             s_compute_publish_release_generation.load(std::memory_order_acquire) != RELEASE_GENERATION) {
             break;
         }
@@ -1423,7 +1440,8 @@ auto wki_chaos_workload_snapshot(char* out, size_t capacity) -> size_t {
         result.detach_pending = vfs_detach_pending(command, &result.detach_peer_boot_epoch);
         result.detach_status = result.detach_pending ? -EINPROGRESS : 0;
     }
-    result.compute_hold = s_compute_publish_hold.load(std::memory_order_acquire);
+    result.compute_stage = s_compute_publish_stage.load(std::memory_order_acquire);
+    result.compute_hold = result.compute_stage != ComputePublishStage::NONE;
     result.compute_waiters = s_compute_publish_waiters.load(std::memory_order_acquire);
     result.compute_wait_count = s_compute_publish_wait_count.load(std::memory_order_acquire);
     result.compute_release_generation = s_compute_publish_release_generation.load(std::memory_order_acquire);
@@ -1439,7 +1457,8 @@ auto wki_chaos_workload_snapshot(char* out, size_t capacity) -> size_t {
         "ifindex=%u name=%s lane_index=%u lane_count=%u "
         "detach_peer_boot_epoch=%u detach_status=%d read_status=%d write_status=%d flush_status=%d verify_status=%d "
         "restore_status=%d exact_binding=%u rdma=%u verified=%u restored=%u detached=%u detach_pending=%u compute_hold=%u "
-        "compute_waiters=%u compute_wait_count=%llu compute_release_generation=%llu compute_last_wait_status=%d rdma_lane=%s "
+        "compute_stage=%u compute_waiters=%u compute_wait_count=%llu compute_release_generation=%llu compute_last_wait_status=%d "
+        "rdma_lane=%s "
         "rdma_zone=%u data_slots_before=%llu data_slots_after=%llu tags_before=%llu tags_after=%llu ring_ready=%u sq_depth=%u "
         "cq_depth=%u data_slot_count=%u data_slot_size=%u ring_block_size=%u ring_total_blocks=%llu sq_head_before=%u "
         "sq_tail_before=%u cq_head_before=%u cq_tail_before=%u sq_head_after=%u sq_tail_after=%u cq_head_after=%u "
@@ -1452,9 +1471,10 @@ auto wki_chaos_workload_snapshot(char* out, size_t capacity) -> size_t {
         NAME, static_cast<unsigned>(result.lane_index), static_cast<unsigned>(result.lane_count), result.detach_peer_boot_epoch,
         result.detach_status, result.read_status, result.write_status, result.flush_status, result.verify_status, result.restore_status,
         result.exact_binding ? 1U : 0U, result.rdma ? 1U : 0U, result.verified ? 1U : 0U, result.restored ? 1U : 0U,
-        result.detached ? 1U : 0U, result.detach_pending ? 1U : 0U, result.compute_hold ? 1U : 0U, result.compute_waiters,
-        static_cast<unsigned long long>(result.compute_wait_count), static_cast<unsigned long long>(result.compute_release_generation),
-        result.compute_last_wait_status, result.rdma ? (result.rdma_roce ? "roce" : "ivshmem") : "none", result.rdma_zone,
+        result.detached ? 1U : 0U, result.detach_pending ? 1U : 0U, result.compute_hold ? 1U : 0U,
+        static_cast<unsigned>(result.compute_stage), result.compute_waiters, static_cast<unsigned long long>(result.compute_wait_count),
+        static_cast<unsigned long long>(result.compute_release_generation), result.compute_last_wait_status,
+        result.rdma ? (result.rdma_roce ? "roce" : "ivshmem") : "none", result.rdma_zone,
         static_cast<unsigned long long>(result.data_slots_before), static_cast<unsigned long long>(result.data_slots_after),
         static_cast<unsigned long long>(result.tags_before), static_cast<unsigned long long>(result.tags_after),
         static_cast<unsigned>(result.ring_geometry.server_ready), result.ring_geometry.sq_depth, result.ring_geometry.cq_depth,
@@ -1516,6 +1536,9 @@ auto wki_chaos_workload_selftest_parser_and_bounds() -> bool {
     constexpr char VALID_VFS[] = "vfs-unmount owner=1 resource=2 generation=3";
     constexpr char INVALID_VFS_PATH[] = "vfs-unmount owner=1 resource=2 generation=3 path=/wki/wos-2/tmp";
     constexpr char VALID_COMPUTE_HOLD[] = "compute-publish hold=1";
+    constexpr char VALID_COMPUTE_COMMIT[] = "compute-publish hold=1 stage=commit";
+    constexpr char INVALID_COMPUTE_STAGE[] = "compute-publish hold=1 stage=unknown";
+    constexpr char DUPLICATE_COMPUTE_STAGE[] = "compute-publish hold=1 stage=commit stage=prepare";
     constexpr char VALID_COMPUTE_QUERY[] = "compute-publish-query";
     constexpr char INVALID_COMPUTE_HOLD[] = "compute-publish hold=2";
     constexpr char VALID_BLOCK_DISCOVERED[] = "block-discovered owner=1 lba=4 blocks=8 pattern=5";
@@ -1539,7 +1562,12 @@ auto wki_chaos_workload_selftest_parser_and_bounds() -> bool {
            parse_command(VALID_VFS, sizeof(VALID_VFS) - 1, &command) && command.op == WorkloadOp::VFS_UNMOUNT &&
            !parse_command(INVALID_VFS_PATH, sizeof(INVALID_VFS_PATH) - 1, &command) &&
            parse_command(VALID_COMPUTE_HOLD, sizeof(VALID_COMPUTE_HOLD) - 1, &command) && command.op == WorkloadOp::COMPUTE_PUBLISH_SET &&
-           command.hold && parse_command(VALID_COMPUTE_QUERY, sizeof(VALID_COMPUTE_QUERY) - 1, &command) &&
+           command.hold && command.stage == ComputePublishStage::PREPARE &&
+           parse_command(VALID_COMPUTE_COMMIT, sizeof(VALID_COMPUTE_COMMIT) - 1, &command) && command.hold &&
+           command.stage == ComputePublishStage::COMMIT &&
+           !parse_command(INVALID_COMPUTE_STAGE, sizeof(INVALID_COMPUTE_STAGE) - 1, &command) &&
+           !parse_command(DUPLICATE_COMPUTE_STAGE, sizeof(DUPLICATE_COMPUTE_STAGE) - 1, &command) &&
+           parse_command(VALID_COMPUTE_QUERY, sizeof(VALID_COMPUTE_QUERY) - 1, &command) &&
            command.op == WorkloadOp::COMPUTE_PUBLISH_QUERY &&
            !parse_command(INVALID_COMPUTE_HOLD, sizeof(INVALID_COMPUTE_HOLD) - 1, &command) &&
            parse_command(VALID_BLOCK_DISCOVERED, sizeof(VALID_BLOCK_DISCOVERED) - 1, &command) &&

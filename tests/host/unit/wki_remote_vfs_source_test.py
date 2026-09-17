@@ -5,6 +5,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[3]
+REMOTABLE_CPP = ROOT / "modules/kern/src/net/wki/remotable.cpp"
 REMOTE_VFS_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_vfs.cpp"
 REMOTE_VFS_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_vfs.hpp"
 WKI_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.cpp"
@@ -252,37 +253,25 @@ def test_vfs_route_scratch_is_initialized_by_its_producer() -> None:
             fail(f"route scratch must not retain redundant value initialization: {legacy}")
 
 
-def test_remote_chown_matches_xfs_noop_semantics() -> None:
+def test_remote_chown_reports_missing_owner_operation() -> None:
     core = VFS_CORE_CPP.read_text()
     path_chown = function_body(core, "vfs_chown_resolved_path")
-    file_chown = function_body(core, "vfs_fchown_for_task")
-
-    require_order(
-        path_chown,
-        [
-            "case FSType::FAT32:",
-            "case FSType::XFS:",
-            "case FSType::REMOTE:",
-            "return 0;  // Accept silently",
-        ],
-        "remote path chown follows XFS ownership semantics",
-    )
-    require_order(
-        file_chown,
-        [
-            "case FSType::FAT32:",
-            "case FSType::XFS:",
-            "case FSType::REMOTE:",
-            "vfs_put_file(f);",
-            "return 0;  // Accept silently",
-        ],
-        "remote file chown follows XFS ownership semantics",
-    )
+    file_chown = function_body(core, "vfs_fchown_file_as")
+    require_order(path_chown, ["case FSType::REMOTE:", "return -EOPNOTSUPP;"],
+                  "remote path chown must report missing wire operation")
+    require_order(file_chown, ["case FSType::REMOTE:", "return -EOPNOTSUPP;"],
+                  "remote fd chown reports missing wire operation without consuming its caller reference")
+    if "xfs_chown_path(" not in path_chown or "xfs_fchown(" not in file_chown:
+        fail("local XFS ownership must use implemented backend policy")
 
 
 def test_wki_host_mount_scratch_is_initialized_by_its_producers() -> None:
     core = VFS_CORE_CPP.read_text()
     mount = function_body(core, "ensure_wki_host_root_mount")
+    if "vfs_mkdir(mount_root.data()" in mount:
+        fail("host-root attach must not recurse through mapped mkdir before mount publication")
+    if "wki_remote_vfs_mount(NODE_ID, find_ctx.result.resource_id, mount_root.data(), find_ctx.result.generation)" not in mount:
+        fail("host-root attach must directly publish the observed resource generation")
 
     for failure_gate in [
         "if (STRIP_RET < 0)",
@@ -332,7 +321,6 @@ def test_wki_host_mount_scratch_is_initialized_by_its_producers() -> None:
             "if (MOUNT_PATH_RET <= 0 || static_cast<size_t>(MOUNT_PATH_RET) >= mount_root.size())",
             "std::array<char, MAX_PATH_LEN> resolved_mount_root __attribute__((uninitialized));",
             "resolve_mount_path(mount_root.data(), resolved_mount_root.data(), resolved_mount_root.size()) == 0",
-            "vfs_mkdir(mount_root.data(), 0755)",
             "wki_remote_vfs_mount(NODE_ID, find_ctx.result.resource_id, mount_root.data(), find_ctx.result.generation)",
             "log::info(\"auto-mounted WKI host root %s for path %s\", mount_root.data(), logical.data())",
         ],
@@ -429,7 +417,7 @@ def test_vfs_rename_scratch_is_initialized_by_its_producers() -> None:
             "else if (resolve_task_path_raw_impl(oldpath, old_buf.data(), old_buf.size(), true, &old_buf_len, &old_buf_hash) < 0)",
             "if (task_absolute_local_path_fast_path_allowed(task, newpath, &new_scan))",
             "else if (resolve_task_path_raw_impl(newpath, new_buf.data(), new_buf.size(), true, &new_buf_len, &new_buf_hash) < 0)",
-            "vfs_rename_resolved_paths(old_buf.data(), new_buf.data(), path_requires_directory(oldpath), path_requires_directory(newpath),",
+            "vfs_rename_resolved_paths(current_metadata_credentials(), old_buf.data(), new_buf.data(), path_requires_directory(oldpath),",
             "old_buf_len, new_buf_len, old_buf_hash, new_buf_hash)",
         ],
         "vfs_rename producer-before-consumer ordering",
@@ -447,7 +435,8 @@ def test_vfs_rename_scratch_is_initialized_by_its_producers() -> None:
             "return -EXDEV;",
             "if (source.mount()->fs_type == FSType::REMOTE)",
             "return consume_rename(source, destination, nullptr);",
-            "vfs_consume_lookup_pair(source, destination, true, consume_rename, nullptr)",
+            "ker::mod::sys::MutexGuard publication_guard(g_vfs_namespace_publication_mutex)",
+            "consume_lookup_pair_locked(source, destination, true, consume_rename, nullptr, task, &REQUEST_CREDENTIALS)",
             "if (result != -EAGAIN || attempt == 3)",
         ],
         "vfs_renameat retained source/destination acquisition and bounded commit",
@@ -456,9 +445,9 @@ def test_vfs_rename_scratch_is_initialized_by_its_producers() -> None:
         renameat,
         [
             "ker::vfs::tmpfs::tmpfs_rename_lookup(",
-            "ker::vfs::xfs::xfs_rename_lookup(source_lookup, destination_lookup, &renamed)",
+            "ker::vfs::xfs::xfs_rename_lookup(source.authorization().credentials, source_lookup, destination_lookup, &renamed,",
             "vfs_cache_notify_path_changed(source.path(), destination.path())",
-            "vfs_rename_resolved_paths(source.path(), destination.path(), source.requires_directory(), destination.requires_directory()",
+            "vfs_rename_resolved_paths(source.authorization().credentials, source.path(), destination.path(),",
         ],
         "vfs_renameat retained backend and compatibility consumers",
     )
@@ -581,7 +570,7 @@ def test_proxy_operations_fail_before_setup_when_slot_wait_times_out() -> None:
     require_order(
         send_body,
         [
-            "int const SLOT_RET = acquire_proxy_op_slot_locked(state, PROXY_WAIT_START)",
+            "try_slot_only ? try_acquire_proxy_op_slot_locked(state) : acquire_proxy_op_slot_locked(state, PROXY_WAIT_START)",
             "if (SLOT_RET != WKI_OK)",
             "return encode_proxy_wki_status(SLOT_RET)",
             "peek_channel_tx_seq16",
@@ -618,6 +607,21 @@ def test_proxy_operations_fail_before_setup_when_slot_wait_times_out() -> None:
 
 def test_proxy_sends_retry_only_pre_enqueue_pressure() -> None:
     source = REMOTE_VFS_CPP.read_text()
+    send_body = function_body(WKI_CPP.read_text(), "wki_send_impl")
+    require_order(
+        send_body,
+        [
+            "return WKI_ERR_NO_ROUTE;",
+            "net::pkt_alloc_tx()",
+            "int const RET = route.send_pkt(pkt)",
+            "ch->tx_seq++",
+            "return WKI_OK;",
+        ],
+        "route admission failure must precede reliable sequence ownership",
+    )
+    published_send = send_body[send_body.index("int const RET = route.send_pkt(pkt)"):]
+    if re.search(r"\breturn\s+(?!WKI_OK\s*;)", published_send):
+        fail("a queued reliable frame must not return a retryable send failure")
     retryable_body = function_body(source, "vfs_proxy_send_status_is_retryable")
     tracked_body = function_body(source, "vfs_proxy_send_and_wait")
     untracked_body = function_body(source, "vfs_proxy_send_untracked")
@@ -628,11 +632,11 @@ def test_proxy_sends_retry_only_pre_enqueue_pressure() -> None:
         [
             "status == WKI_ERR_NO_CREDITS",
             "status == WKI_ERR_NO_MEM",
+            "status == WKI_ERR_NO_ROUTE",
         ],
         "proxy retryable pre-enqueue statuses",
     )
     for terminal_status in [
-        "WKI_ERR_NO_ROUTE",
         "WKI_ERR_PEER_FENCED",
         "WKI_ERR_TIMEOUT",
         "WKI_ERR_INVALID",
@@ -655,7 +659,7 @@ def test_proxy_sends_retry_only_pre_enqueue_pressure() -> None:
             "wki_send_on_channel_identity",
             "send_ret == WKI_OK || !vfs_proxy_send_status_is_retryable(send_ret)",
             "wki_now_us() >= SEND_DEADLINE_US",
-            "send_ret = WKI_ERR_TIMEOUT",
+            "send_ret = send_ret == WKI_ERR_NO_ROUTE ? WKI_ERR_NO_ROUTE : WKI_ERR_TIMEOUT",
             "park_proxy_slot_caller(SEND_CALLER, SEND_DEADLINE_US, false)",
             "int const SEND_RET = send_ret",
             "cancel_proxy_op_wait(state, wait, OP_GENERATION, SEND_RET)",
@@ -675,7 +679,7 @@ def test_proxy_sends_retry_only_pre_enqueue_pressure() -> None:
             "wki_send_on_channel_identity(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ",
             "send_ret == WKI_OK || !vfs_proxy_send_status_is_retryable(send_ret)",
             "wki_now_us() >= SEND_DEADLINE_US",
-            "send_ret = WKI_ERR_TIMEOUT",
+            "send_ret = send_ret == WKI_ERR_NO_ROUTE ? WKI_ERR_NO_ROUTE : WKI_ERR_TIMEOUT",
             "park_proxy_slot_caller(SEND_CALLER, SEND_DEADLINE_US, false)",
             "int const SEND_RET = send_ret",
             "state->lock.lock()",
@@ -698,7 +702,7 @@ def test_proxy_sends_retry_only_pre_enqueue_pressure() -> None:
             "wki_send_on_channel_identity",
             "send_ret == WKI_OK || !vfs_proxy_send_status_is_retryable(send_ret)",
             "wki_now_us() >= SEND_DEADLINE_US",
-            "send_ret = WKI_ERR_TIMEOUT",
+            "send_ret = send_ret == WKI_ERR_NO_ROUTE ? WKI_ERR_NO_ROUTE : WKI_ERR_TIMEOUT",
             "park_proxy_slot_caller(SEND_CALLER, SEND_DEADLINE_US, false)",
             "int const SEND_RET = send_ret",
             "if (CONTROL_FIRST)",
@@ -726,18 +730,18 @@ def test_proxy_request_envelopes_use_stack_storage() -> None:
         body = function_body(source, function_name)
         if function_name == "vfs_proxy_send_and_wait":
             envelope_tokens = [
-                "constexpr size_t MAX_REQ_DATA_LEN = WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload)",
+                "size_t const MAX_REQ_DATA_LEN = WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload) - WRAPPER",
                 "req_data_len > MAX_REQ_DATA_LEN",
                 "req_tail_len > MAX_REQ_DATA_LEN - req_data_len",
                 "return -EMSGSIZE",
                 "req_data_len > 0 && req_data == nullptr",
                 "req_tail_len > 0 && req_tail == nullptr",
                 "return -EINVAL",
-                "auto const REQ_DATA_LEN = static_cast<uint16_t>(req_data_len + req_tail_len)",
-                "size_t const REQ_PREFIX_TOTAL = sizeof(DevOpReqPayload) + req_data_len",
+                "auto const REQ_DATA_LEN = static_cast<uint16_t>(WRAPPER + req_data_len + req_tail_len)",
+                "size_t const REQ_PREFIX_TOTAL = sizeof(DevOpReqPayload) + WRAPPER + req_data_len",
                 "std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> req_buf __attribute__((uninitialized))",
                 "reinterpret_cast<DevOpReqPayload*>(req_buf.data())",
-                "memcpy(req_buf.data() + sizeof(DevOpReqPayload), req_data, req_data_len)",
+                "memcpy(req_buf.data() + sizeof(DevOpReqPayload) + WRAPPER, req_data, req_data_len)",
                 "if (req_tail_len == 0)",
                 "wki_send_on_channel_identity(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ, req_buf.data()",
                 "static_cast<uint16_t>(REQ_PREFIX_TOTAL)",
@@ -798,21 +802,18 @@ def test_proxy_request_envelopes_use_stack_storage() -> None:
     require_order(
         open_body,
         [
-            "size_t const REQ_FIXED_LEN = OPEN_REQ_BASE_LEN + (send_open_prefetch ? OPEN_PREFETCH_REQ_LEN : 0)",
+            "size_t const REQ_FIXED_LEN = RECORD_SIZE + OPEN_REQ_BASE_LEN + (send_open_prefetch ? OPEN_PREFETCH_REQ_LEN : 0)",
             "REQ_FIXED_LEN > WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload)",
             "PATH_LEN > WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload) - REQ_FIXED_LEN",
             "return nullptr",
             "auto path_len = static_cast<uint16_t>(PATH_LEN)",
             "size_t const REQ_DATA_LEN = REQ_FIXED_LEN + PATH_LEN",
             "std::array<uint8_t, OPEN_REQ_INLINE_CAPACITY> inline_req_data",
-            "std::unique_ptr<uint8_t[]> heap_req_data",
             "uint8_t* req_data = inline_req_data.data()",
             "if (REQ_DATA_LEN > inline_req_data.size())",
-            "heap_req_data.reset(new (std::nothrow) uint8_t[REQ_DATA_LEN])",
-            "if (heap_req_data == nullptr)",
-            "return nullptr",
-            "req_data = heap_req_data.get()",
-            "vfs_proxy_send_and_wait(state, OP_VFS_OPEN, req_data, REQ_DATA_LEN",
+            "req_data = preparation.allocate_request(REQ_DATA_LEN)",
+            "if (req_data == nullptr) return nullptr",
+            "vfs_proxy_send_and_wait(state, OPEN_OPERATION, req_data, REQ_DATA_LEN",
         ],
         "open request validates its wire size before narrowing",
     )
@@ -1105,16 +1106,16 @@ def test_shared_io_callers_timeout_or_fallback() -> None:
             "OptionalSharedIoSlotGuard const OPEN_PREFETCH_GUARD(state, send_open_prefetch, wki_now_us())",
             "if (send_open_prefetch && !OPEN_PREFETCH_GUARD.acquired())",
             "send_open_prefetch = false",
-            "size_t const REQ_FIXED_LEN = OPEN_REQ_BASE_LEN + (send_open_prefetch ? OPEN_PREFETCH_REQ_LEN : 0)",
+            "size_t const REQ_FIXED_LEN = RECORD_SIZE + OPEN_REQ_BASE_LEN + (send_open_prefetch ? OPEN_PREFETCH_REQ_LEN : 0)",
             "if (send_open_prefetch)",
             "tagged_receive.rkey = state->rdma_bulk_rkey",
-            "vfs_proxy_send_and_wait(state, OP_VFS_OPEN",
+            "vfs_proxy_send_and_wait(state, OPEN_OPERATION",
             "wki_roce_region_tagged_write_complete(state->rdma_bulk_rkey, tagged_receive.cookie, open_resp.prefetched_bytes)",
         ],
         "open prefetch shared-slot fallback",
     )
     open_prefetch_completion = open_body[
-        open_body.index("uint32_t valid_prefetched_bytes = 0") : open_body.index("// Allocate File + RemoteFileContext")
+        open_body.index("uint32_t valid_prefetched_bytes = 0") : open_body.index("// Required private storage was allocated before sending OPEN.")
     ]
     if "wki_roce_region_wait_tagged_write" in open_prefetch_completion or "VFS_PROXY_OP_TIMEOUT_US" in open_prefetch_completion:
         fail("post-response optional open prefetch must fall back causally without another timed wait")
@@ -1189,7 +1190,7 @@ def test_message_fallback_readahead_targets_small_sequential_reads() -> None:
     require_order(
         response_body,
         [
-            "resp->op_id == OP_VFS_XATTR ? EXPECTED_LEN != payload_len : EXPECTED_LEN > payload_len",
+            "EXPECTED_LEN != payload_len",
             "resp->op_id == OP_VFS_XATTR && RESP_DATA_LEN > state->op_resp_max",
             "state->op_status = -EMSGSIZE",
             "copy_len = (RESP_DATA_LEN > state->op_resp_max) ? state->op_resp_max : RESP_DATA_LEN",
@@ -1218,21 +1219,22 @@ def test_server_open_reuses_the_open_file_stat_snapshot() -> None:
         [
             "std::array<char, 512> full_path __attribute__((uninitialized));",
             "std::array<char, 512> full_visible_path __attribute__((uninitialized));",
-            "prepare_legacy_scalar_path(export_path, export_name",
+            "prepare_mapped_scalar_path(export_path, export_name",
             "if (PATH_RET != 0)",
             "reject_request(static_cast<int16_t>(PATH_RET))",
             "path_crosses_recursive_wki_boundary_direct(full_path.data(), full_visible_path.data())",
-            "ker::vfs::vfs_open_file_resolved_beneath(export_path, full_path.data()",
+            "RemoteFdReservation reservation(channel_identity)",
+            "if (reservation.result() < 0)",
+            "ker::vfs::vfs_open_file_resolved_beneath_as(*worker, mapped_credentials, export_path, full_path.data()",
         ],
         "remote VFS server open full-path production before resolved-open consumption",
     )
     direct_open_path_tokens = [
         "std::array<char, 512> full_path __attribute__((uninitialized));",
         "std::array<char, 512> full_visible_path __attribute__((uninitialized));",
-        "prepare_legacy_scalar_path(export_path, export_name",
+        "prepare_mapped_scalar_path(export_path, export_name",
         "if (PATH_RET != 0)",
         "path_crosses_recursive_wki_boundary_direct(full_path.data(), full_visible_path.data())",
-        "ker::vfs::vfs_open_file_resolved_beneath(export_path, full_path.data()",
     ]
     for token in direct_open_path_tokens:
         token_pos = open_case.find(token)
@@ -1241,12 +1243,12 @@ def test_server_open_reuses_the_open_file_stat_snapshot() -> None:
     require_order(
         open_case,
         [
-            "ker::vfs::vfs_open_file_resolved_beneath(export_path, full_path.data()",
+            "ker::vfs::vfs_open_file_resolved_beneath_as(*worker, mapped_credentials, export_path, full_path.data()",
             "ker::vfs::vfs_fstat_file(file, &open_stat)",
             "open_resp.has_stat = 1",
             "open_resp.stat = open_stat",
             "if (prefetch_rkey != 0",
-            "alloc_remote_fd(channel_identity, file)",
+            "reservation.publish(file, 0, 0, 0, ordinary_token, ordinary_binding_id)",
             "open_resp.fd = fd_id",
             "int const SEND_RET = wki_send_on_channel_identity(channel_identity",
             "if (SEND_RET != WKI_OK)",
@@ -1257,13 +1259,13 @@ def test_server_open_reuses_the_open_file_stat_snapshot() -> None:
             "rfd->retiring = true",
             "rfd->active = false",
             "s_vfs_lock.unlock()",
-            "ker::vfs::vfs_close_file(orphan)",
+            "release_server_file(orphan)",
         ],
         "remote VFS server open metadata snapshot reuse",
     )
     if "vfs_stat_resolved(full_path.data(), &open_stat)" in open_case:
         fail("remote VFS server open must not repeat path resolution for metadata")
-    published_file = open_case.find("alloc_remote_fd(channel_identity, file)")
+    published_file = open_case.find("reservation.publish(file, 0, 0, 0, ordinary_token, ordinary_binding_id)")
     if re.search(r"\bfile->", open_case[published_file:]):
         fail("remote VFS server open must not dereference a file after publishing it to peer cleanup")
 
@@ -1284,49 +1286,20 @@ def test_server_backing_path_mutations_bypass_worker_task_root() -> None:
         fail("remote VFS server mutation opcode cases must remain present")
 
     symlink_case = handler_body[symlink_start:unlink_start]
-    require_order(
-        symlink_case,
-        [
-            "prepare_legacy_scalar_path(export_path, export_name, LINK_PATH, link_len",
-            "if (PATH_RET != 0)",
-            "reject_request(static_cast<int16_t>(PATH_RET))",
-            "path_crosses_recursive_wki_boundary_direct(full_link.data(), full_visible_link.data())",
-            "ker::vfs::vfs_symlink_resolved_beneath(export_path, target_str.data(), full_link.data())",
-        ],
-        "server symlink uses its export backing path without worker-root resolution",
-    )
-    if "ker::vfs::vfs_symlink(target_str.data(), full_link.data())" in symlink_case:
-        fail("server symlink must not re-resolve an export backing path against the worker root")
+    if "reject_request(-ENOTSUP)" not in symlink_case or "vfs_symlink_resolved_beneath(" in symlink_case:
+        fail("legacy symlink must refuse callerless owner authority")
 
     rename_case = handler_body[rename_start:chmod_start]
-    require_order(
-        rename_case,
-        [
-            "prepare_legacy_scalar_path(export_path, export_name, OLD_PATH, old_len",
-            "prepare_legacy_scalar_path(export_path, export_name, NEW_PATH, new_len",
-            "if (OLD_PATH_RET != 0 || NEW_PATH_RET != 0)",
-            "path_crosses_recursive_wki_boundary_direct(old_full.data(), old_visible.data())",
-            "ker::vfs::vfs_rename_resolved_beneath(export_path, old_full.data(), new_full.data())",
-        ],
-        "server rename uses export backing paths without worker-root resolution",
-    )
-    if "ker::vfs::vfs_rename(old_full.data(), new_full.data())" in rename_case:
-        fail("server rename must not re-resolve export backing paths against the worker root")
+    if "reject_request(-ENOTSUP)" not in rename_case or "vfs_rename_resolved_beneath(" in rename_case:
+        fail("legacy rename must refuse callerless authority")
 
-    chmod_case = handler_body[chmod_start:fsync_start]
-    require_order(
-        chmod_case,
-        [
-            "prepare_legacy_scalar_path(export_path, export_name, PATH, path_len",
-            "if (PATH_RET != 0)",
-            "path_crosses_recursive_wki_boundary_direct(full_path.data(), full_visible_path.data())",
-            "ker::vfs::vfs_chmod_resolved_beneath(export_path, full_path.data(), static_cast<int>(mode),",
-            "(flags & WKI_VFS_CHMOD_FLAG_FOLLOW_FINAL_SYMLINK) != 0",
-        ],
-        "server chmod uses its export backing path without worker-root resolution",
-    )
-    if "ker::vfs::vfs_chmod(full_path.data(), static_cast<int>(mode)," in chmod_case:
-        fail("server chmod must not re-resolve an export backing path against the worker root")
+    chmod_case = handler_body[chmod_start:handler_body.index("case OP_VFS_UTIMENS:", chmod_start)]
+    if "reject_request(-ENOTSUP)" not in chmod_case or "vfs_chmod_resolved_beneath(" in chmod_case:
+        fail("legacy chmod must refuse ambient worker authorization")
+    mapped = handler_body[handler_body.index("if (request.operation == VfsPathOperation::CHMOD)"):]
+    require_order(mapped, ["wki_vfs_chmod_request_valid", "credential_record::decode", "map_vfs_mutation_identity",
+                          "find_remote_fd(channel_identity, prefix.directory_fd)", "vfs_chmod_resolved_beneath_as(*task, mapped"],
+                  "mapped chmod authorizes one snapshot before retained-directory and inode effects")
 
     require_tokens(
         header,
@@ -1342,17 +1315,17 @@ def test_server_backing_path_mutations_bypass_worker_task_root() -> None:
     )
     require_tokens(
         function_body(core, "vfs_symlink_resolved"),
-        ["return vfs_symlink_resolved_linkpath(target, linkpath);"],
+        ["return vfs_symlink_resolved_linkpath(current_metadata_credentials(), target, linkpath);"],
         "resolved symlink backing-path implementation",
     )
     require_tokens(
         function_body(core, "vfs_rename_resolved"),
-        ["vfs_rename_resolved_paths(oldpath, newpath, path_requires_directory(oldpath), path_requires_directory(newpath))"],
+        ["vfs_rename_resolved_paths(current_metadata_credentials(), oldpath, newpath, path_requires_directory(oldpath),"],
         "resolved rename backing-path implementation",
     )
     require_tokens(
         function_body(core, "vfs_chmod_resolved"),
-        ["return vfs_chmod_resolved_path(path, mode, follow_final_symlink);"],
+        ["return vfs_chmod_resolved_path(current_metadata_credentials(), path, mode, follow_final_symlink);"],
         "resolved chmod backing-path implementation",
     )
     require_tokens(
@@ -1367,7 +1340,7 @@ def test_server_backing_path_mutations_bypass_worker_task_root() -> None:
         function_body(core, "vfs_chmod_resolved_path"),
         [
             "case FSType::REMOTE:",
-            "wki_remote_vfs_chmod(mount->private_data, fs_path, mode, follow_final_symlink)",
+            "wki_remote_vfs_chmod(mount->private_data, fs_path, mode, follow_final_symlink, CREDENTIALS)",
             "cache_notify_path_data_changed_impl(path_buffer.data(), mount->fs_type)",
         ],
         "remote chmod dispatch preserves final-symlink and cache semantics",
@@ -1412,48 +1385,33 @@ def test_remote_path_utimens_preserves_owner_time_and_routing() -> None:
         "confined resolved utimens owner declaration",
     )
 
-    client = function_body(source, "wki_remote_vfs_utimens")
-    require_order(
-        client,
-        [
-            "auto* state = acquire_vfs_proxy_lane(anchor)",
-            "ProxyLifecycleRefGuard lane_ref_guard(state)",
-            "VfsUtimensReqPrefix prefix{}",
-            "prefix.flags = follow_final_symlink ? WKI_VFS_UTIMENS_FLAG_FOLLOW_FINAL_SYMLINK : 0",
-            "if (times != nullptr)",
-            "prefix.atime_sec = times[0].tv_sec",
-            "prefix.mtime_nsec = times[1].tv_nsec",
-            "prefix.flags |= WKI_VFS_UTIMENS_FLAG_TIMES_PRESENT",
-            "memcpy(req_stack.data(), &prefix, sizeof(prefix))",
-            "memcpy(req_stack.data() + sizeof(prefix), fs_relative_path, PATH_LEN)",
-            "vfs_proxy_send_and_wait(state, OP_VFS_UTIMENS",
-        ],
-        "remote utimens client preserves raw timestamp markers and lane lifetime",
-    )
-
-    require_order(
-        utimens_case,
-        [
-            "data_len < sizeof(VfsUtimensReqPrefix)",
-            "memcpy(&prefix, data, sizeof(prefix))",
-            "(prefix.flags & ~KNOWN_FLAGS) != 0",
-            "prefix.reserved != 0",
-            "EXPECTED_DATA_LEN != data_len",
-            "relative_wire_path_has_safe_components(PATH_DATA, prefix.path_len)",
-            "prepare_legacy_scalar_path(export_path, export_name, PATH_DATA, prefix.path_len",
-            "if (PATH_RET != 0)",
-            "reject_request(static_cast<int16_t>(PATH_RET))",
-            "path_crosses_recursive_wki_boundary_direct(full_path.data(), full_visible_path.data())",
-            "ker::vfs::Timespec{.tv_sec = prefix.atime_sec, .tv_nsec = prefix.atime_nsec}",
-            "(prefix.flags & WKI_VFS_UTIMENS_FLAG_TIMES_PRESENT) != 0 ? request_times.data() : nullptr",
-            "ker::vfs::vfs_utimens_resolved_beneath(",
-            "export_path, full_path.data(), TIMES",
-            "(prefix.flags & WKI_VFS_UTIMENS_FLAG_FOLLOW_FINAL_SYMLINK) != 0",
-        ],
-        "remote utimens server validates before resolved owner-side mutation",
-    )
-    if "ker::vfs::vfs_utimensat(" in utimens_case:
-        fail("remote utimens server must not route an export backing path through worker task state")
+    client = " ".join(function_body(source, "wki_remote_vfs_utimens").split())
+    require_order(client, ["REQUEST_CREDENTIALS = credentials", "TIMES = times != nullptr", "TimestampUpdate::prepare",
+        "wki_resource_observation_require_flags", "RESOURCE_FLAG_VFS_UTIMENS_IDENTITY", "credential_record::encode(REQUEST_CREDENTIALS)",
+        "VfsPathUtimensPrefix const PREFIX", ".atime_sec = TIMES[0].tv_sec", ".mtime_nsec = TIMES[1].tv_nsec",
+        "vfs_proxy_send_and_wait", "wki_vfs_path_response_valid"], "mapped timestamp request preserves snapshot and time intent")
+    require_order(client, ["if (directory != nullptr)", "io_guard(context->io_lock)", "send(context->proxy, context->remote_fd)"],
+        "timestamp directory operation keeps the retained exact lane")
+    if "vfs_proxy_read_with_retry" in client or "OP_VFS_UTIMENS," in client or client.count("vfs_proxy_send_and_wait(") != 1:
+        fail("timestamp mutation cannot use a read retry or legacy callerless fallback")
+    if "reject_request(-ENOTSUP)" not in utimens_case or "vfs_utimens_resolved_beneath(" in utimens_case:
+        fail("legacy timestamp operation must refuse before local mutation")
+    mapped = handler[handler.index("if (request.operation == VfsPathOperation::UTIMENS)"):]
+    mapped = mapped[:mapped.index("if (request.operation == VfsPathOperation::READLINK_AT")]
+    require_order(mapped, ["wki_vfs_utimens_request_valid", "mapped_wire_path_status", "credential_record::decode",
+        "map_vfs_mutation_identity", "find_remote_fd(channel_identity", "prepare_mapped_scalar_path", "vfs_utimens_resolved_beneath_as"],
+        "owner timestamp handler maps and confines before committing")
+    mapped_owner = function_body(core, "vfs_utimens_resolved_beneath_as")
+    require_order(mapped_owner, ["REQUEST_CREDENTIALS = credentials", "resolve_utimens_times", "for (unsigned attempt",
+        "acquire_confined_owner_lookup", "lookup_is_beneath_export", "consume_lookup_locked"],
+        "owner retains one timestamp value and caller snapshot across precommit retries")
+    if "current_metadata_credentials" in mapped_owner or "task.credentials()" in mapped_owner:
+        fail("mapped timestamp owner cannot borrow ambient credentials")
+    entry = " ".join(function_body(core, "vfs_utimensat").split())
+    require_order(entry, ["REQUEST_CREDENTIALS = task->credentials()", "REQUEST_TIMES =", "times = REQUEST_TIMES.data()",
+        "resolve_utimens_times", "for (unsigned attempt", "LookupIntent::CHANGE_TIMES"], "public timestamp request captures once")
+    require_tokens(entry, ["handle.remote_relative_path()", "handle.dirfd_anchor()", "&REQUEST_CREDENTIALS",
+        "if (lookup.mount()->fs_type == FSType::REMOTE) return consume_utimens(lookup, &context)"], "timestamp retained path and no remote replay")
 
     validation = function_body(source, "relative_wire_path_has_safe_components")
     require_tokens(
@@ -1480,7 +1438,8 @@ def test_remote_path_utimens_preserves_owner_time_and_routing() -> None:
             "path_prefix_matches(canonical_path.data(), canonical_root.data(), canonical_root_len)",
             ".reject_remote_mounts = true",
             ".reapply_task_root = false",
-            "vfs_apply_utimens_to_resolved_path(canonical_path.data(), times, follow_final_symlink, canonical_path_len, false, &POLICY)",
+            "vfs_apply_utimens_to_resolved_path(CREDENTIALS, canonical_path.data(), times, follow_final_symlink, canonical_path_len, false,",
+            "&POLICY)",
         ],
         "owner canonicalizes and confines before local-only resolution",
     )
@@ -1498,7 +1457,7 @@ def test_remote_path_utimens_preserves_owner_time_and_routing() -> None:
             "mount_ref = find_mount_point(path_buffer.data(), resolved_len)",
             "if (!allow_remote_backend && mount->fs_type == FSType::REMOTE)",
             "case FSType::REMOTE:",
-            "wki_remote_vfs_utimens(mount->private_data, fs_path, times, follow_final_symlink)",
+            "wki_remote_vfs_utimens(mount->private_data, fs_path, times, follow_final_symlink, CREDENTIALS)",
             "cache_notify_path_data_changed_impl(path_buffer.data(), mount->fs_type)",
             "cache_notify_path_data_changed_impl(requested_path.data(), REQUESTED_FS_TYPE, true)",
         ],
@@ -1512,7 +1471,7 @@ def test_remote_path_utimens_preserves_owner_time_and_routing() -> None:
             "symlink_resolve_path_is_confined(resolved_buf, policy)",
             "find_mount_point(resolved_buf",
             "policy->reject_remote_mounts && mount != nullptr && mount->fs_type == FSType::REMOTE",
-            "resolve_prefix_symlink_once(resolved_buf",
+            "resolve_prefix_symlink_once(",
         ],
         "confined resolver rejects a final REMOTE mount before prefix probing",
     )
@@ -1579,7 +1538,7 @@ def test_server_message_read_uses_bounded_stack_response() -> None:
             "resp->reserved = REQ_COOKIE",
             "uint16_t const SEND_LEN = (BYTES_READ > 0) ? static_cast<uint16_t>(sizeof(DevOpRespPayload) + BYTES_READ)",
             ": static_cast<uint16_t>(sizeof(DevOpRespPayload))",
-            "wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, resp_buf.data(), SEND_LEN)",
+            "send_completed_vfs_read_reply(channel_identity, resp_buf.data(), SEND_LEN, binding_retiring)",
         ],
         "server message-read bounded stack response",
     )
@@ -1680,17 +1639,13 @@ def test_readlink_cache_invalidation_is_generation_based() -> None:
     )
 
     readlink_body = function_body(source, "wki_remote_vfs_readlink_path")
-    require_order(
-        readlink_body,
-        [
-            "uint32_t cache_generation = 0",
-            "try_readlink_cache_lookup(state, fs_relative_path, buf, bufsize, &cached_result, &cache_generation)",
-            "vfs_proxy_read_with_retry(state, OP_VFS_READLINK",
-            "cache_readlink_result(state, cache_generation, fs_relative_path, STATUS, nullptr, 0)",
-            "cache_readlink_result(state, cache_generation, fs_relative_path, 0",
-        ],
-        "readlink miss generation carried across RPC",
-    )
+    require_order(readlink_body,
+                  ["WKI_CAP_VFS_PATH_IDENTITY", "credential_record::encode", "vfs_proxy_read_with_retry(state, OP_VFS_PATH_AS",
+                   "wki_vfs_path_response_valid", "std::memcpy(buf,"],
+                  "mapped readlink validates authority and staged reply before publication")
+    for token in ("try_readlink_cache_lookup", "cache_readlink_result", "readlink_unsupported"):
+        if token in readlink_body:
+            fail("mapped READLINK must bypass credentialless cache state")
 
     require_tokens(
         source,
@@ -1783,22 +1738,22 @@ def test_remote_metadata_scratch_initializes_only_consumed_prefix() -> None:
     source = REMOTE_VFS_CPP.read_text()
 
     handler = function_body(source, "handle_vfs_op")
-    if handler.count("prepare_legacy_scalar_path(") != 11:
+    if handler.count("prepare_legacy_scalar_path(") != 0 or handler.count("prepare_mapped_scalar_path(") != 10:
         fail("every scalar pathname output must use centralized checked preparation")
     if "build_full_path(" in handler:
         fail("scalar opcode cases must not bypass centralized component and dual-path admission")
     declaration_counts = {
-        "std::array<char, 512> full_path __attribute__((uninitialized));": 9,
-        "std::array<char, 512> full_visible_path __attribute__((uninitialized));": 8,
-        "std::array<char, 512> full_link __attribute__((uninitialized));": 1,
-        "std::array<char, 512> full_visible_link __attribute__((uninitialized));": 1,
-        "std::array<char, 512> old_full __attribute__((uninitialized));": 1,
-        "std::array<char, 512> new_full __attribute__((uninitialized));": 1,
-        "std::array<uint8_t, 514> req_stack __attribute__((uninitialized));": 4,
-        "std::array<uint8_t, 518> req_stack __attribute__((uninitialized));": 1,
-        "std::array<uint8_t, 519> req_stack __attribute__((uninitialized));": 1,
-        "std::array<uint8_t, 1028> req_stack __attribute__((uninitialized));": 2,
-        "std::array<uint8_t, 514> resp_buf __attribute__((uninitialized));": 1,
+        "std::array<char, 512> full_path __attribute__((uninitialized));": 2,
+        "std::array<char, 512> full_visible_path __attribute__((uninitialized));": 1,
+        "std::array<char, 512> full_link __attribute__((uninitialized));": 0,
+        "std::array<char, 512> full_visible_link __attribute__((uninitialized));": 0,
+        "std::array<char, 512> old_full __attribute__((uninitialized));": 0,
+        "std::array<char, 512> new_full __attribute__((uninitialized));": 0,
+        "std::array<uint8_t, 514> req_stack __attribute__((uninitialized));": 0,
+        "std::array<uint8_t, 518> req_stack __attribute__((uninitialized));": 0,
+        "std::array<uint8_t, 519> req_stack __attribute__((uninitialized));": 0,
+        "std::array<uint8_t, 1028> req_stack __attribute__((uninitialized));": 0,
+        "std::array<uint8_t, 514> resp_buf __attribute__((uninitialized));": 0,
     }
     for declaration, expected_count in declaration_counts.items():
         actual_count = source.count(declaration)
@@ -1844,123 +1799,14 @@ def test_remote_metadata_scratch_initializes_only_consumed_prefix() -> None:
     if "resolve_mount_path(" in boundary:
         fail("owner recursive-mount boundary must not re-resolve admitted paths through worker task state")
 
-    path_request = [
-        "memcpy(req_data, &path_len, sizeof(uint16_t))",
-        "if (path_len > 0)",
-        "memcpy(req_data + 2, fs_relative_path, path_len)",
-    ]
-    request_specs = {
-        "remote_vfs_stat_on_proxy": (
-            "std::array<uint8_t, 514> req_stack __attribute__((uninitialized));",
-            "auto req_data_len = static_cast<uint16_t>(2 + path_len)",
-            path_request + ["vfs_proxy_send_and_wait(state, OP_VFS_STAT, req_data, req_data_len"],
-        ),
-        "wki_remote_vfs_mkdir": (
-            "std::array<uint8_t, 518> req_stack __attribute__((uninitialized));",
-            "auto req_data_len = static_cast<uint16_t>(6 + path_len)",
-            [
-                "memcpy(req_data, &u_mode, sizeof(uint32_t))",
-                "memcpy(req_data + 4, &path_len, sizeof(uint16_t))",
-                "if (path_len > 0)",
-                "memcpy(req_data + 6, fs_relative_path, path_len)",
-                "vfs_proxy_send_and_wait(state, OP_VFS_MKDIR, req_data, req_data_len",
-            ],
-        ),
-        "wki_remote_vfs_chmod": (
-            "std::array<uint8_t, 519> req_stack __attribute__((uninitialized));",
-            "auto req_data_len = static_cast<uint16_t>(7 + path_len)",
-            [
-                "memcpy(req_data, &u_mode, sizeof(uint32_t))",
-                "memcpy(req_data + 4, &FLAGS, sizeof(uint8_t))",
-                "memcpy(req_data + 5, &path_len, sizeof(uint16_t))",
-                "if (path_len > 0)",
-                "memcpy(req_data + 7, fs_relative_path, path_len)",
-                "vfs_proxy_send_and_wait(state, OP_VFS_CHMOD, req_data, req_data_len",
-            ],
-        ),
-        "wki_remote_vfs_symlink": (
-            "std::array<uint8_t, 1028> req_stack __attribute__((uninitialized));",
-            "auto req_data_len = static_cast<uint16_t>(4 + target_len + link_len)",
-            [
-                "memcpy(req_data, &target_len, sizeof(uint16_t))",
-                "if (target_len > 0)",
-                "memcpy(req_data + 2, target, target_len)",
-                "memcpy(req_data + 2 + target_len, &link_len, sizeof(uint16_t))",
-                "if (link_len > 0)",
-                "memcpy(req_data + 4 + target_len, fs_relative_path, link_len)",
-                "vfs_proxy_send_and_wait(state, OP_VFS_SYMLINK, req_data, req_data_len",
-            ],
-        ),
-        "wki_remote_vfs_unlink": (
-            "std::array<uint8_t, 514> req_stack __attribute__((uninitialized));",
-            "auto req_data_len = static_cast<uint16_t>(2 + path_len)",
-            path_request + ["vfs_proxy_send_and_wait(state, OP_VFS_UNLINK, req_data, req_data_len"],
-        ),
-        "wki_remote_vfs_rmdir": (
-            "std::array<uint8_t, 514> req_stack __attribute__((uninitialized));",
-            "auto req_data_len = static_cast<uint16_t>(2 + path_len)",
-            path_request + ["vfs_proxy_send_and_wait(state, OP_VFS_RMDIR, req_data, req_data_len"],
-        ),
-        "wki_remote_vfs_rename": (
-            "std::array<uint8_t, 1028> req_stack __attribute__((uninitialized));",
-            "auto req_data_len = static_cast<uint16_t>(4 + old_len + new_len)",
-            [
-                "memcpy(req_data, &old_len, sizeof(uint16_t))",
-                "if (old_len > 0)",
-                "memcpy(req_data + 2, old_fs_path, old_len)",
-                "memcpy(req_data + 2 + old_len, &new_len, sizeof(uint16_t))",
-                "if (new_len > 0)",
-                "memcpy(req_data + 4 + old_len, new_fs_path, new_len)",
-                "vfs_proxy_send_and_wait(state, OP_VFS_RENAME, req_data, req_data_len",
-            ],
-        ),
-        "wki_remote_vfs_readlink_path": (
-            "std::array<uint8_t, 514> req_stack __attribute__((uninitialized));",
-            "auto req_data_len = static_cast<uint16_t>(2 + path_len)",
-            path_request + ["vfs_proxy_read_with_retry(state, OP_VFS_READLINK, req_data, req_data_len"],
-        ),
-    }
-    for function_name, (declaration, length_assignment, encoding) in request_specs.items():
-        body = function_body(source, function_name)
-        require_tokens(
-            body,
-            [declaration, "req_data_len", "uint8_t* req_data = req_stack.data()", "memcpy(req_data"],
-            f"{function_name} exact-prefix request scratch",
-        )
-        require_order(
-            body,
-            [declaration, length_assignment, "uint8_t* req_data = req_stack.data()"] + encoding,
-            f"{function_name} exact-prefix request encoding",
-        )
-        if re.search(r"std::array<uint8_t,\s*(?:514|518|519|1028)>\s+req_stack\s*(?:\{\}|=\s*\{\})", body):
-            fail(f"{function_name} must not initialize an unused request tail")
-
     readlink = function_body(source, "wki_remote_vfs_readlink_path")
-    require_tokens(
-        readlink,
-        [
-            "std::array<uint8_t, 514> resp_buf __attribute__((uninitialized));",
-            "uint16_t resp_len = 0",
-            "if (resp_len < 2)",
-            "if (target_len == 0 || target_len + 2 > resp_len)",
-        ],
-        "readlink exact-response scratch",
-    )
-    require_order(readlink, ["vfs_proxy_read_with_retry", "if (resp_len < 2)"], "readlink response fill before header read")
-    require_order(
-        readlink,
-        ["if (target_len == 0 || target_len + 2 > resp_len)", "memcpy(buf, resp_buf.data() + 2"],
-        "readlink bounds before payload read",
-    )
-
-    require_tokens(
-        source,
-        [
-            "std::array<char, 512> target_str{};",
-            "ker::vfs::Stat kernel_buf{};",
-        ],
-        "metadata buffers whose initialized tails remain observable",
-    )
+    require_order(readlink,
+                  ["std::array<uint8_t, DATA_OFFSET + 511> request", "credential_record::encode", "std::memcpy(request.data(), RECORD.data()",
+                   "std::memcpy(request.data() + RECORD_SIZE, &HEADER", "std::memcpy(request.data() + DATA_OFFSET, fs_relative_path, PATH_LEN)",
+                   "vfs_proxy_read_with_retry(state, OP_VFS_PATH_AS", "wki_vfs_path_response_valid"],
+                  "mapped READLINK exact request encoding and staged response")
+    require_tokens(readlink, ["DATA_OFFSET + PATH_LEN", "std::array<uint8_t, sizeof(VfsPathIdentityHeader) + 512> response"],
+                   "bounded mapped READLINK scratch")
 
 
 def test_write_behind_storage_grows_in_allocator_shaped_classes() -> None:
@@ -2243,10 +2089,10 @@ def test_message_write_flush_uses_split_send_and_retains_tail() -> None:
             "req_data_len > MAX_REQ_DATA_LEN",
             "req_tail_len > MAX_REQ_DATA_LEN - req_data_len",
             "req_tail_len > 0 && req_tail == nullptr",
-            "static_cast<uint16_t>(req_data_len + req_tail_len)",
-            "size_t const REQ_PREFIX_TOTAL = sizeof(DevOpReqPayload) + req_data_len",
+            "static_cast<uint16_t>(WRAPPER + req_data_len + req_tail_len)",
+            "size_t const REQ_PREFIX_TOTAL = sizeof(DevOpReqPayload) + WRAPPER + req_data_len",
             "std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> req_buf __attribute__((uninitialized))",
-            "memcpy(req_buf.data() + sizeof(DevOpReqPayload), req_data, req_data_len)",
+            "memcpy(req_buf.data() + sizeof(DevOpReqPayload) + WRAPPER, req_data, req_data_len)",
             "if (req_tail_len == 0)",
             "wki_send_on_channel_identity(",
             "wki_send_on_channel_identity_split(",
@@ -2278,46 +2124,34 @@ def test_message_write_flush_uses_split_send_and_retains_tail() -> None:
         fail("both RDMA and message write-behind flushes must reject oversized write responses")
 
 
-def test_remote_open_closes_server_fd_on_local_allocation_failure() -> None:
+def test_remote_open_prepares_storage_before_mutation_request() -> None:
     source = REMOTE_VFS_CPP.read_text()
-    helper_body = function_body(source, "remote_vfs_close_remote_fd_best_effort")
     open_body = function_body(source, "wki_remote_vfs_open_path")
-
-    require_order(
-        helper_body,
-        [
-            "if (state == nullptr || remote_fd < 0)",
-            "return",
-            "vfs_proxy_send_and_wait(state, OP_VFS_CLOSE",
-            "reinterpret_cast<const uint8_t*>(&remote_fd)",
-            "sizeof(remote_fd)",
-            "nullptr, 0",
-        ],
-        "remote open cleanup close helper",
-    )
+    if "remote_vfs_close_remote_fd_best_effort" in source:
+        fail("ordinary OPEN cleanup must use its exact token, not a returned numeric FD")
     require_order(
         open_body,
         [
-            "auto* file = new (std::nothrow) ker::vfs::File{}",
-            "if (file == nullptr)",
-            "remote_vfs_close_remote_fd_best_effort(state, open_resp.fd)",
-            "return nullptr",
-            "auto* ctx = new (std::nothrow) RemoteFileContext{}",
-        ],
-        "remote open closes fd when File allocation fails",
-    )
-    require_order(
-        open_body,
-        [
-            "auto* ctx = new (std::nothrow) RemoteFileContext{}",
-            "if (ctx == nullptr)",
-            "delete file",
-            "remote_vfs_close_remote_fd_best_effort(state, open_resp.fd)",
-            "return nullptr",
+            "PinPreparation preparation(state, PinPurpose::ORDINARY_OPEN)",
+            "if (preparation.status() != 0) return nullptr",
+            "lane_ref_guard.reset()",
+            "auto* file = preparation.file()",
+            "auto* ctx = preparation.context()",
+            "req_data = preparation.allocate_request(REQ_DATA_LEN)",
+            "if (req_data == nullptr) return nullptr",
+            "vfs_proxy_send_and_wait(state, OPEN_OPERATION",
             "ctx->proxy = state",
+            "return preparation.publish()",
         ],
-        "remote open closes fd when context allocation fails",
+        "required private storage and task-exit ownership precede a scalar OPEN request",
     )
+    if "new (std::nothrow) ker::vfs::File" in open_body or "new (std::nothrow) RemoteFileContext" in open_body:
+        fail("scalar OPEN must use its tracked preparation for required storage")
+    if "remote_vfs_close_remote_fd_best_effort" in open_body:
+        fail("scalar OPEN must not replace preflight allocation with a post-mutation close")
+    drain = function_body(source, "drain")
+    require_tokens(drain, ["delete retired.file", "delete retired.context", "delete[] retired.request",
+                           "release_vfs_proxy_open_ref(retired.proxy)"], "private preparation owns all abandoned storage")
 
 
 def test_remote_close_waits_only_for_writable_output_publication() -> None:
@@ -2394,7 +2228,7 @@ def test_remote_close_waits_only_for_writable_output_publication() -> None:
             "wki_vfs_close_no_success_response_requested(data, data_len)",
             "rfd->file = nullptr",
             "s_vfs_lock.unlock()",
-            "ker::vfs::vfs_close_file(close_file)",
+            "release_server_file(close_file)",
             "status = static_cast<int16_t>",
             "perf_record_vfs_server_end",
             "if (status != 0 || !NO_SUCCESS_RESPONSE)",
@@ -2714,15 +2548,21 @@ def test_vfs_detach_uses_exact_negotiated_incarnation_form() -> None:
             "create_vfs_proxy_state_locked(owner_node, resource_id, RESOURCE_GENERATION",
             "state->lanes.fill(nullptr)",
             "state->lanes_ready = ANCHOR_READY",
-            'ker::vfs::mount_filesystem(local_mount_path, "remote"',
-            "state->mount_configured = true",
             "wki_peer_lifecycle_acquire(final_peer)",
             "wki_resource_observation_is_live",
-            "wki_remote_vfs_unmount_resource_generation",
+            "int const POST_AUX_VALIDATION = validate_mount_binding()",
+            'ker::vfs::mount_filesystem(local_mount_path, "remote"',
+            "state->mount_configured = true",
+            "retire_constructed_vfs_mount_group(state, false)",
             "release_vfs_proxy_lifecycle_ref(state)",
         ],
-        "mount publication must stay pinned through exact resource-generation validation and rollback",
+        "private mount admission precedes publication; concurrent retirement preserves commit",
     )
+    if "wki_remote_vfs_unmount_resource_generation" in mount_body:
+        fail("failed candidate must not retire other mounts of the same resource")
+    committed_tail = mount_body[mount_body.index("state->mount_configured = true"):]
+    if re.findall(r"return\s+([^;]+);", committed_tail) != ["0"]:
+        fail("successful mount publication must not return a later transport failure")
     MOUNT_CALL = 'ker::vfs::mount_filesystem(local_mount_path, "remote"'
     if mount_body.find("state->lanes_ready = ANCHOR_READY") > mount_body.find(MOUNT_CALL):
         fail("remote VFS lane zero must be ready before its VFS row is published")
@@ -2860,11 +2700,11 @@ def test_remote_open_refs_delay_proxy_destroy_until_close() -> None:
     require_order(
         open_body,
         [
-            "if (!acquire_vfs_proxy_open_ref(state))",
-            "ProxyOpenRefGuard open_ref_guard(state)",
+            "PinPreparation preparation(state, PinPurpose::ORDINARY_OPEN)",
+            "if (preparation.status() != 0) return nullptr",
+            "lane_ref_guard.reset()",
             "ctx->proxy = state",
-            "open_ref_guard.disarm()",
-            "return file",
+            "return preparation.publish()",
         ],
         "remote VFS open ref transfer to file context",
     )
@@ -3147,30 +2987,22 @@ def test_server_bounded_metadata_responses_use_stack_storage() -> None:
     require_order(
         stat_case,
         [
-            "ker::vfs::Stat statbuf = {}",
-            "int const RET = ker::vfs::vfs_stat_resolved_beneath(export_path, full_path.data(), &statbuf)",
-            "std::array<uint8_t, sizeof(DevOpRespPayload) + sizeof(ker::vfs::Stat)> resp_buf",
-            "reinterpret_cast<DevOpRespPayload*>(resp_buf.data())",
-            "memcpy(resp_buf.data() + sizeof(DevOpRespPayload), &statbuf, sizeof(ker::vfs::Stat))",
-            "send_buffered_resp(resp_buf.data(), static_cast<uint16_t>(resp_buf.size()))",
+            "ker::vfs::Stat statbuf{}",
+            "ker::vfs::vfs_stat_resolved_beneath_as(",
+            "std::array<uint8_t, sizeof(DevOpRespPayload) + sizeof(ker::vfs::Stat)> response",
+            "reinterpret_cast<DevOpRespPayload*>(response.data())",
+            "memcpy(response.data() + sizeof(*header), &statbuf, sizeof(statbuf))",
+            "send_buffered_resp(response.data(), static_cast<uint16_t>(response.size()))",
         ],
         "fixed-size stat response storage",
     )
 
     readlink_case = handler_body[readlink_start:symlink_start]
-    require_order(
-        readlink_case,
-        [
-            "std::array<char, 512> target_buf{}",
-            "vfs_readlink_resolved_beneath(export_path, full_path.data(), target_buf.data(), target_buf.size() - 1)",
-            "std::array<uint8_t, sizeof(DevOpRespPayload) + sizeof(uint16_t) + 512> resp_buf",
-            "reinterpret_cast<DevOpRespPayload*>(resp_buf.data())",
-            "memcpy(resp_buf.data() + sizeof(DevOpRespPayload), &tlen, sizeof(uint16_t))",
-            "memcpy(resp_buf.data() + sizeof(DevOpRespPayload) + 2, target_buf.data(), TARGET_LEN)",
-            "wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, resp_buf.data(), resp_total)",
-        ],
-        "bounded readlink response storage",
-    )
+    require_order(readlink_case,
+                  ["WKI_CAP_VFS_PATH_IDENTITY", "credential_record::decode", "map_vfs_read_identity", "vfs_readlink_resolved_beneath_as",
+                   "std::array<uint8_t, sizeof(DevOpRespPayload) + sizeof(VfsPathIdentityHeader) + 512> response",
+                   "std::memcpy(response.data() + sizeof(*header), &REPLY", "send_buffered_resp(response.data(),"],
+                  "mapped READLINK bounded owner response")
 
     for name, case in [("stat", stat_case), ("readlink", readlink_case)]:
         if "new (std::nothrow)" in case or "delete[]" in case:
@@ -3193,7 +3025,7 @@ def test_stale_fd_gc_drains_binding_users_before_file_close() -> None:
             "server FD",
             "files_to_close.push_back(rfd.file)",
             "rfd.file = nullptr",
-            "ker::vfs::vfs_close_file(file)",
+            "release_server_file(file)",
             "wki_peer_lifecycle_release(peer)",
         ],
         "stale RemoteVfsFd GC ownership transfer",
@@ -3205,13 +3037,13 @@ def test_stale_fd_gc_drains_binding_users_before_file_close() -> None:
             "wki_dev_server_detach_all_for_peer(NODE_ID)",
             "uint64_t const CHECK_NOW = wki_now_us()",
             "files_to_close.push_back(rfd.file)",
-            "ker::vfs::vfs_close_file(file)",
+            "release_server_file(file)",
             "wki_peer_lifecycle_release(peer)",
         ],
         "GC must drain deferred VFS binding refs before detaching and closing File",
     )
-    if REMOTE_VFS_CPP.read_text().count("alloc_remote_fd(") != 2:
-        fail("RemoteVfsFd creation must remain confined to the reliable server VFS OPEN path")
+    if "alloc_remote_fd(" in REMOTE_VFS_CPP.read_text():
+        fail("scalar OPEN must not allocate registry storage after the backend operation")
     require_tokens(
         WKI_HPP.read_text(),
         ["std::array<WkiPeer, WKI_MAX_PEERS> peers"],
@@ -3248,14 +3080,16 @@ def test_server_fd_and_consumer_rx_use_exact_channel_identity() -> None:
         ],
         "server FD exact-generation lookup",
     )
-    allocate = function_body(source, "alloc_remote_fd")
+    allocate = block_body_after(source, "explicit RemoteFdReservation(const WkiChannelIdentity& identity) : identity_(identity)")
     require_order(
         allocate,
         [
-            "rfd.consumer_node = channel_identity.peer_node_id",
-            "rfd.channel_identity = channel_identity",
-            "rfd.fd_id = fd_id",
-            "g_remote_fds.emplace(fd_id, rfd)",
+            "row.consumer_node = identity.peer_node_id",
+            "row.channel_identity = identity",
+            "prepared.emplace(0, row)",
+            "s_vfs_lock.lock()",
+            "node.mapped().fd_id = fd_",
+            "g_remote_fds.insert(std::move(node))",
         ],
         "server FD exact-generation publication",
     )
@@ -3325,9 +3159,9 @@ def test_server_fd_and_consumer_rx_use_exact_channel_identity() -> None:
         "ordinary dynamic resource channels publish handlers in reliable receive order",
     )
     require_order(
-        rx,
+        " ".join(rx.split()),
         [
-            "admit_vfs_op(msg, hdr, payload, PAYLOAD_LEN, ch, ch->generation)",
+            "admit_vfs_op(msg, hdr, payload, PAYLOAD_LEN, ch, ch->generation, admitted_identity_policy, admitted_identity_capabilities)",
             "VFS_OP_ADMISSION == WkiVfsOpRxAdmission::RETRY",
             "ch->rx_seq++",
         ],
@@ -3346,7 +3180,7 @@ def test_server_fd_and_consumer_rx_use_exact_channel_identity() -> None:
             "rfd.file = nullptr",
             "std::erase_if(g_remote_fds",
             "s_vfs_lock.unlock()",
-            "ker::vfs::vfs_close_file(files_to_close.at(i))",
+            "release_server_file(files_to_close.at(i))",
         ],
         "deferred exact binding FD close",
     )
@@ -3606,7 +3440,8 @@ def test_export_rebuild_is_revisioned_and_backing_mount_exact() -> None:
     require_tokens(
         advertise,
         [
-            "if ((PUBLICATION_REVISION & 1U) != 0)",
+            "(PUBLICATION_REVISION & 1U) != 0",
+            "g_vfs_withdrawals.pending(PEER_SLOT)",
             "g_vfs_export_revision != PUBLICATION_REVISION",
             "EXP.publication_revision != PUBLICATION_REVISION",
         ],
@@ -3654,14 +3489,56 @@ def test_export_rebuild_is_revisioned_and_backing_mount_exact() -> None:
             "g_vfs_exports.clear()",
             "g_vfs_export_rebuild_accepting_entries = true",
             "wki_remote_vfs_auto_discover_internal(&stale_exports)",
+            "g_vfs_withdrawals.append(exp.resource_id, INCARNATION, peers)",
             "reconcile_and_publish_vfs_exports()",
-            "MsgType::RESOURCE_WITHDRAW",
             "wki_remote_vfs_advertise_exports()",
         ],
-        "new export table and bindings publish before stale-token withdrawal/advertisement",
+        "reserved stale-token outbox publishes before replacement table and advertisements",
+    )
+    require_order(
+        prepare,
+        ["g_vfs_withdrawals.reserve(g_vfs_exports.size())", "g_vfs_export_target_revision = TARGET_REVISION",
+         "wki_dev_server_begin_vfs_export_reconciliation(TARGET_REVISION)"],
+        "withdrawal capacity is reserved before destructive pivot admission",
+    )
+    require_tokens(reconcile, ["g_vfs_withdrawals.cancel_reservation()"], "commit/cancel releases unused withdrawal capacity")
+    publish = function_body(source, "wki_remote_vfs_publish_withdrawals")
+    require_order(
+        publish,
+        ["g_vfs_withdrawals.claim(PEER_SLOT, attempt)", "s_vfs_lock.unlock()", "wki_reliable_tx_status(attempt.tx)",
+         "wki_peer_lifecycle_acquire(peer)", "wki_resource_incarnation_negotiated(peer_node, ResourceType::VFS)",
+         "wki_send_tracked(peer_node, WKI_CHAN_CONTROL, MsgType::RESOURCE_WITHDRAW", "wki_peer_lifecycle_release(peer)",
+         "g_vfs_withdrawals.finish(PEER_SLOT, attempt, STATUS, result, replacement)"],
+        "tracked withdrawal send occurs outside VFS mutex with stable peer wire shape",
     )
     if "wki_dev_server_refresh_vfs_binding" in source:
         fail("export insertion must not mutate one binding before full-table reconciliation")
+
+    unmount = function_body(core, "vfs_umount")
+    require_order(unmount, [
+        "authorize_mount_administration(CREDENTIALS)",
+        "snapshot_bounded_path_string(target",
+        "expected_dev_id = mount->dev_id",
+        "mount->fs_type != FSType::REMOTE",
+        "if (expected_dev_id == 0) return -ENOENT",
+        "wki_remote_vfs_prepare_export_rebuild()",
+        "unmount_filesystem_if_dev_id(stable_target.data(), expected_dev_id)",
+        "if (RESULT == 0)",
+        "wki_remote_vfs_commit_export_unmount(expected_dev_id)",
+        "wki_remote_vfs_cancel_export_rebuild()",
+        "return RESULT",
+    ], "native unmount drains before exact commit and preserves failed bindings")
+
+    commit_unmount = function_body(source, "wki_remote_vfs_commit_export_unmount")
+    require_order(commit_unmount, [
+        "g_wki.peer_lock.unlock()", "s_vfs_lock.lock()",
+        "it->backing_dev_id != backing_dev_id",
+        "g_vfs_withdrawals.append(it->resource_id, INCARNATION, peers)",
+        "g_vfs_exports.erase(it)", "reconcile_and_publish_vfs_exports()",
+        "wki_remote_vfs_advertise_exports()",
+    ], "native unmount retires exact backing exports before reopening admission")
+    if "wki_remote_vfs_auto_discover_internal" in commit_unmount or "build_export_name" in commit_unmount:
+        fail("native unmount must not rename unrelated exports through caller root")
 
     pivot = function_body(core, "vfs_pivot_root")
     require_order(
@@ -3670,10 +3547,11 @@ def test_export_rebuild_is_revisioned_and_backing_mount_exact() -> None:
             "snapshot_bounded_path_string(new_root",
             "snapshot_bounded_path_string(put_old",
             "wki_remote_vfs_prepare_export_rebuild()",
-            "remap_mounts_for_pivot(stable_new_root.data(), stable_put_old.data())",
+            "remap_mounts_for_pivot(stable_new_root.data(), stable_put_old.data(), &CREDENTIALS, &references)",
+            "if (remap_result == 0)",
+            "rebase_wki_mounts_for_new_root(stable_new_root.data())",
             "if (REMAP_RET != 0)",
             "wki_remote_vfs_cancel_export_rebuild()",
-            "rebase_wki_mounts_for_new_root(stable_new_root.data())",
             "wki_remote_vfs_rebuild_exports()",
         ],
         "pivot gates/drains VFS before remap and cancels or publishes on every outcome",
@@ -3818,14 +3696,15 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
             "state->lanes.at(0) = state",
             "state->lane_count = 1",
             "state->lanes_ready = ANCHOR_READY",
-            'ker::vfs::mount_filesystem(local_mount_path, "remote"',
-            "if (MOUNT_RET != 0)",
-            "state->mount_configured = true",
             "uint8_t const TARGET_LANE_COUNT = vfs_proxy_lane_count_for_mount(local_mount_path)",
             "for (uint8_t lane_index = 1; lane_index < TARGET_LANE_COUNT; ++lane_index)",
             "mount_vfs_proxy_lane(owner_node, resource_id, local_mount_path, RESOURCE_GENERATION",
+            "int const POST_AUX_VALIDATION = validate_mount_binding()",
+            'ker::vfs::mount_filesystem(local_mount_path, "remote"',
+            "if (MOUNT_RET != 0)",
+            "state->mount_configured = true",
         ],
-        "mount publishes a ready lane zero before auxiliary lanes are attached",
+        "mount publishes the prepared group only after auxiliary admission",
     )
     MOUNT_CALL = 'ker::vfs::mount_filesystem(local_mount_path, "remote"'
     ready_at = lane_mount.find("state->lanes_ready = ANCHOR_READY")
@@ -3848,11 +3727,11 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
         aux_publish,
         [
             "s_vfs_lock.lock()",
-            "anchor->mount_configured",
+            "anchor->lanes_ready",
             "anchor->lane_count == lane_index",
             "anchor->lanes.at(lane_index) = state",
         ],
-        "auxiliary lane publication remains serialized and contiguous after anchor publication",
+        "auxiliary lane publication remains serialized and contiguous in the private ready group",
     )
     require_order(
         lane_mount,
@@ -3861,11 +3740,11 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
             "uint8_t const TARGET_LANE_COUNT = vfs_proxy_lane_count_for_mount(local_mount_path)",
             "for (uint8_t lane_index = 1; lane_index < TARGET_LANE_COUNT; ++lane_index)",
             "if (LANE_RET == -ENOENT || LANE_RET == -ESTALE)",
-            "wki_remote_vfs_unmount_resource_generation(owner_node, resource_id, RESOURCE_GENERATION)",
+            "retire_constructed_vfs_mount_group(state, true)",
             "release_vfs_proxy_lifecycle_ref(state)",
             "return LANE_RET",
             "int const POST_AUX_VALIDATION = validate_mount_binding()",
-            "wki_remote_vfs_unmount_resource_generation(owner_node, resource_id, RESOURCE_GENERATION)",
+            "retire_constructed_vfs_mount_group(state, true)",
         ],
         "definitive auxiliary rejection rolls back before final binding/resource revalidation",
     )
@@ -3874,10 +3753,10 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
         post_aux,
         [
             "state->lanes_ready",
-            "wki_remote_vfs_unmount_resource_generation",
+            "retire_constructed_vfs_mount_group(state, true)",
             "release_vfs_proxy_lifecycle_ref(state)",
         ],
-        "post-aux peer cleanup unmounts the exact configured group before dropping its construction pin",
+        "post-aux refusal retires only the exact private candidate before dropping its construction pin",
     )
 
     for function_name in [
@@ -3886,8 +3765,7 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
         "wki_remote_vfs_chmod",
         "wki_remote_vfs_utimens",
         "wki_remote_vfs_symlink",
-        "wki_remote_vfs_unlink",
-        "wki_remote_vfs_rmdir",
+        "remote_vfs_remove_path",
         "wki_remote_vfs_rename",
         "wki_remote_vfs_readlink_path",
     ]:
@@ -3910,7 +3788,9 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
             "NON_DIRECTORY_OPEN && (ACCESS_MODE == OPEN_WRONLY || ACCESS_MODE == OPEN_RDWR)",
             "auto* state = acquire_vfs_proxy_lane(anchor, PREFER_RDMA_READ_ANCHOR, PREFER_RDMA_WRITE_ANCHOR)",
             "ProxyLifecycleRefGuard lane_ref_guard(state)",
-            "if (!acquire_vfs_proxy_open_ref(state))",
+            "PinPreparation preparation(state, PinPurpose::ORDINARY_OPEN)",
+            "if (preparation.status() != 0) return nullptr",
+            "lane_ref_guard.reset()",
             "ctx->proxy = state",
         ],
         "data-oriented open selects a direction-capable RDMA lane and transfers its ownership to the file context",
@@ -3918,7 +3798,7 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
     if source.count("acquire_vfs_proxy_lane(anchor,") != 1:
         fail("only data-oriented open may request RDMA-anchor lane selection")
     fstat_body = function_body(source, "wki_remote_vfs_fstat")
-    require_tokens(fstat_body, ["remote_vfs_stat_on_proxy(ctx->proxy"], "fstat keeps its FD lane")
+    require_tokens(fstat_body, ["ctx->proxy, OP_VFS_FSTAT", "&ctx->remote_fd"], "fstat keeps its FD lane and descriptor")
     if "wki_remote_vfs_stat(mount->private_data" in fstat_body:
         fail("fstat must not reselect a lane for an existing remote FD")
 
@@ -3938,8 +3818,7 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
     for function_name in [
         "wki_remote_vfs_mkdir",
         "wki_remote_vfs_symlink",
-        "wki_remote_vfs_unlink",
-        "wki_remote_vfs_rmdir",
+        "remote_vfs_remove_path",
         "wki_remote_vfs_rename",
     ]:
         require_tokens(
@@ -4163,7 +4042,7 @@ def test_metadata_batch_never_replays_after_a_send_attempt() -> None:
         batch,
         [
             "results[index].status = -EINPROGRESS",
-            "relative_wire_path_has_safe_components",
+            "mapped_wire_path_status",
             "item_size > MAX_REQUEST_DATA - mutation_request_len",
             "return -EOPNOTSUPP",
             "wki_peer_capability_negotiated(anchor->owner_node, WKI_CAP_VFS_METADATA_BATCH)",
@@ -4172,13 +4051,21 @@ def test_metadata_batch_never_replays_after_a_send_attempt() -> None:
             "mutation_attempted = true",
             "*mutation_request_attempted = true",
             "vfs_proxy_send_and_wait(state, OP_VFS_METADATA_BATCH",
-            "STATUS == -EOPNOTSUPP ? -EPROTO : STATUS",
+            "STATUS == -EOPNOTSUPP ? -EPROTO : normalize_proxy_status_for_errno(STATUS)",
         ],
         "metadata batch validates and negotiates before its first send and never exposes replayable EOPNOTSUPP afterwards",
     )
-    acquire_pos = batch.find("acquire_vfs_proxy_lane(anchor)")
-    if acquire_pos < 0 or batch.rfind("return -EOPNOTSUPP") >= acquire_pos:
-        fail("metadata batch may expose EOPNOTSUPP only before lane acquisition and a possible send")
+    attempt_pos = batch.find("mutation_attempted = true")
+    if attempt_pos < 0 or batch.rfind("return -EOPNOTSUPP") >= attempt_pos:
+        fail("metadata batch may expose EOPNOTSUPP only before a mutation attempt")
+    require_order(batch, ["credential_record::encode(*credentials)", "REQUEST_PREFIX", "mutation_request_len = REQUEST_PREFIX",
+        "IDENTITY = proxy_channel_identity_locked", "std::memcpy(request.data() + sizeof(VfsMetadataBatchHeader)",
+        "std::memcpy(request.data(), &REQUEST_HEADER", "OP_VFS_FEATURES", "WKI_VFS_FEATURE_BATCH_MUTATION_IDENTITY",
+        "mutation_attempted = true", "OP_VFS_METADATA_BATCH"], "mapped batch copies complete envelope before exact-binding query and one commit")
+    if batch.count("false, &IDENTITY") != 2:
+        fail("feature query and batch submission must both require captured channel identity")
+    if "if (READ_ONLY) credential_record" in batch or "if (READ_ONLY) std::memcpy" in batch:
+        fail("mutation batches must carry the same immutable record as read batches")
     require_tokens(
         batch,
         [
@@ -4235,7 +4122,7 @@ def test_remote_xattr_is_bounded_replay_safe_and_export_confined() -> None:
         [
             "req->op_id == OP_VFS_XATTR",
             "g_wki.capabilities = WKI_CAP_RESOURCE_INCARNATION",
-            "WKI_CAP_VFS_XATTR | WKI_CAP_RESOURCE_LIMITS;",
+            "WKI_CAP_VFS_XATTR | WKI_CAP_RESOURCE_LIMITS | WKI_CAP_VFS_READ_IDENTITY | WKI_CAP_COMPUTE_CREDENTIALS |",
         ],
         "remote xattr fixed-pool RX admission and advertisement",
     )
@@ -4256,13 +4143,15 @@ def test_remote_xattr_is_bounded_replay_safe_and_export_confined() -> None:
             "std::map<VfsXattrStageKey, VfsXattrServerStage*>",
             "retain_vfs_xattr_stage(stage)",
             "VfsXattrStageRefGuard const STAGE_GUARD",
-            "vfs_setxattr_beneath(stage.export_root.data(), stage.path.data()",
-            "vfs_getxattr_beneath(stage.export_root.data(), stage.path.data()",
-            "vfs_listxattr_beneath(stage.export_root.data(), stage.path.data()",
-            "vfs_removexattr_beneath(stage.export_root.data(), stage.path.data()",
+
+
+
+
             "remote_xattr_name_allowed",
             'USER_PREFIX = "user."',
             "vfs_xattr_data_is_exact_replay",
+            "vfs_xattr_resolved_beneath_as(*worker, stage.credentials",
+            "vfs_xattr_file_as(stage.credentials, stage.file",
             "incoming.operation_id <= old.identity.operation_id",
             "old.identity.session_id != incoming.session_id",
             "begin.flags == 0 || begin.flags == 1 || begin.flags == 2",
@@ -4277,6 +4166,30 @@ def test_remote_xattr_is_bounded_replay_safe_and_export_confined() -> None:
         ],
         "remote xattr bounded staging, exact replay, namespace restriction, confinement, and invalidation",
     )
+    owner = function_body(remote, "handle_vfs_xattr_op")
+    require_order(owner, ["identity.version != WKI_VFS_XATTR_VERSION", "credential_record::decode(caller_record, supplied)",
+                          "if (ADMISSION != 0)", "VfsXattrServerStage* prior_stage", "stage->credentials = mapped"],
+                  "xattr version and explicit identity admission precede stage replacement")
+    require_order(owner, ["capture_vfs_xattr_export(", "VfsXattrServerStage* prior_stage", "stage->export_root = captured_root",
+                          "stage->export_name = captured_name"], "capture both export values before prior-stage cancellation")
+    capture = function_body(remote, "capture_vfs_xattr_export")
+    require_order(capture, ["strnlen(path", "strnlen(name", "return -ENAMETOOLONG", "root.fill", "std::memcpy"],
+                  "bounded capture validates both names before either output changes")
+    call = function_body(remote, "vfs_xattr_stage_call")
+    require_tokens(call, ["vfs_xattr_file_as(stage.credentials", "vfs_xattr_resolved_beneath_as(*worker, stage.credentials",
+                          "stage.require_directory", "stage.file"], "both xattr targets consume staged caller identity")
+    require_tokens(call, ["stage.export_name[0] == '/' ? stage.export_name.data() : nullptr"],
+                   "path xattr consumes captured namespace while named exports preserve defaults")
+    native = function_body(remote, "selftest_xattr_staged_namespace")
+    require_tokens(native, ["capture_vfs_xattr_export", "root.fill('x')", "visible.fill('y')", "vfs_xattr_stage_apply_mutation(stage, &worker)",
+                           "vfs_xattr_stage_call(stage", "vfs::XattrOperation::LIST", "-EOPNOTSUPP", "-EROFS"],
+                   "native stage fixture covers lifetime, mutation, read and unsupported/refusal paths")
+    if "->credentials()" in call:
+        fail("xattr owner dispatch cannot borrow worker credentials")
+    replay = function_body(remote, "vfs_xattr_begin_is_exact_replay")
+    require_tokens(replay, ["old.remote_fd == begin.remote_fd", "old.caller_record == caller_record",
+                            "old.require_directory ==", "old.path == path", "old.name == name", "old.export_root == export_root", "old.export_name == export_name"],
+                   "duplicate xattr BEGIN must identify the original request")
     stage = block_body_after(remote, "struct VfsXattrServerStage")
     require_tokens(
         stage,
@@ -4291,8 +4204,10 @@ def test_remote_xattr_is_bounded_replay_safe_and_export_confined() -> None:
         [
             "wki_peer_capability_negotiated(state->owner_node, WKI_CAP_VFS_XATTR)",
             "state->xattr_transfer_lock.lock()",
+            "invoke(OP_VFS_FEATURES",
+            "features.features & WKI_VFS_FEATURE_XATTR_IDENTITY",
             "operation_id = ++state->xattr_next_operation_id",
-            "vfs_proxy_send_and_wait(state, OP_VFS_XATTR",
+            "invoke(OP_VFS_XATTR",
         ],
         "remote xattr rejects unsupported peers before identity allocation and transmission",
     )
@@ -4300,6 +4215,8 @@ def test_remote_xattr_is_bounded_replay_safe_and_export_confined() -> None:
         client,
         [
             "vfs_xattr_transfer_total(READ_OPERATION, size, TOTAL)",
+            "false, &IDENTITY)",
+            "credential_record::encode(REQUEST_CREDENTIALS)",
             "offset < TRANSFER_TOTAL",
             "normalize_proxy_status_for_errno(status)",
         ],
@@ -4313,19 +4230,477 @@ def test_remote_xattr_is_bounded_replay_safe_and_export_confined() -> None:
             "wki_remote_vfs_getxattr(mount->private_data",
             "wki_remote_vfs_listxattr(mount->private_data",
             "wki_remote_vfs_removexattr(mount->private_data",
-            "wki_remote_vfs_fsetxattr(file",
-            "wki_remote_vfs_fgetxattr(file",
-            "wki_remote_vfs_flistxattr(file",
-            "wki_remote_vfs_fremovexattr(file",
+            "wki_remote_vfs_fsetxattr(credentials, file",
+            "wki_remote_vfs_fgetxattr(credentials, file",
+            "wki_remote_vfs_flistxattr(credentials, file",
+            "wki_remote_vfs_fremovexattr(credentials, file",
         ],
         "VFS core remote xattr path and retained File dispatch",
     )
 
 
+def test_exec_view_preserves_owner_grant_and_complete_reply() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+    owner = function_body(source, "pin_exec_view")
+    if not (owner.index("find_remote_fd(identity, request.source_fd)") < owner.index("authorize_file_description_access") <
+            owner.index("vfs_stabilize_exec_file") < owner.index("reservation.publish")):
+        fail("remote executable views must pin the retained read grant before publication")
+    if "open_path" in owner or "get_current_task" in owner:
+        fail("remote executable pinning must not reopen a path or borrow worker credentials")
+    client = function_body(source, "wki_remote_vfs_clone_exec_file")
+    if not (client.index("wki_resource_observation_require_flags") < client.index("if (SUPPORT != 0) return SUPPORT;") <
+            client.index("new (std::nothrow)") < client.index("allocate_identity()") <
+            client.index("reserve_exec_cancellation(STATE, TOKEN)")):
+        fail("unsupported executable views must fail before allocation, token, cancellation ownership or RPC")
+    for field in ("STATE->owner_node", "ResourceType::VFS", "STATE->resource_id", "STATE->resource_generation",
+                  "STATE->owner_incarnation", "RESOURCE_FLAG_VFS_EXEC_VIEW"):
+        if field not in client[:client.index("if (SUPPORT != 0) return SUPPORT;")]:
+            fail("executable support admission must check the retained source's complete resource identity")
+    if "adv->flags = RESOURCE_FLAG_VFS_EXEC_VIEW | RESOURCE_FLAG_VFS_CHMOD_IDENTITY | RESOURCE_FLAG_VFS_UTIMENS_IDENTITY;" not in function_body(source, "advertise_exports_to_peer"):
+        fail("VFS owners must advertise executable-view v1 support in the existing resource flags")
+    if not (client.index("allocate_identity()") < client.index("vfs_proxy_send_and_wait") <
+            client.index("wki_vfs_exec_view_response_valid") < client.index("*output = preparation.publish()")):
+        fail("only a validated versioned owner reply may publish an executable view")
+    if "cancel_remote_exec_view(CANCEL_SLOT)" not in client:
+        fail("failed PIN must cancel with its known token rather than an untrusted reply FD")
+    close = function_body(source, "remote_vfs_close")
+    if not (close.index("f->exec_read_view != nullptr") < close.index("close_status = cancel_remote_exec_view") < close.index("else if (NEEDS_CLOSE_STATUS)")):
+        fail("executable views require acknowledged owner retirement even though read-only")
+    if not (client.index("reserve_exec_cancellation(STATE, TOKEN)") < client.index("vfs_proxy_send_and_wait")):
+        fail("PIN requires durable cancellation storage before any owner side effect")
+    if "context->exec_cancel_slot = CANCEL_SLOT" not in client:
+        fail("a published execution view must own its reserved cancellation record")
+    finish = function_body(source, "finish_exec_cancellation")
+    if "ExecCancellationPhase::PENDING" not in finish or "release_vfs_proxy_open_ref(released)" not in finish:
+        fail("failed cancellation must retain ownership, successful cancellation releases its independent proxy ref")
+    cancel = function_body(source, "cancel_remote_exec_view")
+    if "&record.identity" not in cancel or "finish_exec_cancellation" not in cancel:
+        fail("every cancellation outcome must retain or release its exact original identity")
+    core = WKI_CPP.read_text()
+    if "wki_remote_vfs_process_pending_exec_cancellations" in function_body(core, "process_deferred_blocking_work"):
+        fail("client cancellation waits cannot occupy the protocol-service worker")
+    if "wki_remote_vfs_process_pending_exec_cancellations" not in function_body(core, "process_deferred_auto_attach_work"):
+        fail("durable cancellation retry needs the separate client worker")
+    reply = function_body(source, "handle_vfs_op_resp")
+    if "wki_vfs_exec_view_reply_size_valid" not in reply or "INVALID_EXEC" not in reply:
+        fail("RX must reject malformed PIN/CANCEL replies before generic response truncation")
+
+
+def test_scalar_metadata_keeps_snapshot_and_binding_through_retries() -> None:
+    core = VFS_CORE_CPP.read_text()
+    for name, intent, consume in [("vfs_fchmodat", "CHANGE_MODE", "consume_chmod"), ("vfs_fchownat", "CHANGE_OWNER", "consume_chown_lookup"), ("vfs_utimensat", "CHANGE_TIMES", "consume_utimens")]:
+        public = function_body(core, name)
+        require_order(public, ["REQUEST_CREDENTIALS = task->credentials()", "for (unsigned attempt", "LookupIntent::" + intent, "&REQUEST_CREDENTIALS", "return " + consume + "(lookup, &context)", "publication_guard", "consume_lookup_locked"], "scalar metadata preserves one caller and never replays a remote result")
+        if public.count("task->credentials()") != 1 or "vfs_consume_lookup(" in public: fail("metadata retries recapture ambient authority")
+        require_tokens(public, ["consume_lookup_locked(lookup, false, " + consume + ", &context, task, &REQUEST_CREDENTIALS)"], "native commit must use explicit request identity")
+    source = REMOTE_VFS_CPP.read_text()
+    for name in ("wki_remote_vfs_chmod", "wki_remote_vfs_utimens"):
+        client = function_body(source, name)
+        require_order(client, ["REQUEST_CREDENTIALS = credentials", "proxy_channel_identity_locked(state)", "s_vfs_lock.unlock()", "wki_resource_observation_require_flags", "vfs_proxy_send_and_wait", "&IDENTITY"], "metadata support and send must retain one complete binding")
+        if client.count("vfs_proxy_send_and_wait(") != 1 or "with_retry" in client: fail("scalar metadata must submit exactly once")
+
+
+def test_mapped_chmod_retains_snapshot_and_exact_directory_lane() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+    client = function_body(source, "wki_remote_vfs_chmod")
+    require_order(client, ["REQUEST_CREDENTIALS = credentials", "wki_resource_observation_require_flags", "RESOURCE_FLAG_VFS_CHMOD_IDENTITY",
+                           "credential_record::encode(REQUEST_CREDENTIALS)", "vfs_proxy_send_and_wait", "wki_vfs_path_response_valid"],
+                  "chmod binds support and a snapshot before one mutation request")
+    if "vfs_proxy_read_with_retry" in client or "OP_VFS_CHMOD," in client:
+        fail("chmod must not retry a mutation as a read or use the legacy callerless request")
+    require_order(client, ["if (directory != nullptr)", "io_guard(context->io_lock)", "send(context->proxy, context->remote_fd)"],
+                  "directory chmod keeps the exact retained proxy lane")
+    core = VFS_CORE_CPP.read_text()
+    entry = function_body(core, "vfs_fchmodat")
+    for token in ("LookupIntent::CHANGE_MODE", "handle.remote_relative_path()", "handle.dirfd_anchor()", "handle.authorization().credentials"):
+        if token not in entry: fail("chmod lost mapped path/descriptor admission: " + token)
+    owner = function_body(core, "vfs_chmod_resolved_beneath_as")
+    require_order(owner, ["REQUEST_CREDENTIALS = credentials", "acquire_confined_owner_lookup", "lookup_is_beneath_export",
+                          "consume_lookup_locked"], "owner chmod commits only the admitted confined lookup")
+    if "current_metadata_credentials()" in owner or "task.credentials()" in owner:
+        fail("mapped owner chmod cannot borrow serving credentials")
+
+
+def test_mapped_removal_preserves_caller_and_never_replays() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+    client = function_body(source, "remote_vfs_remove_path")
+    require_order(client, ["REQUEST_CREDENTIALS = credentials", "wki_resource_observation_is_live",
+        "s_vfs_lock.lock()", "IDENTITY = proxy_channel_identity_locked(state)", "s_vfs_lock.unlock()",
+        "vfs_proxy_send_and_wait", "&IDENTITY", "credential_record::encode(REQUEST_CREDENTIALS)",
+        "invoke(OP_VFS_FEATURES", "wki_vfs_features_response_valid", "WKI_VFS_FEATURE_REMOVE_IDENTITY",
+        "invoke(OP_VFS_PATH_AS", "wki_vfs_path_response_valid", "invalidate_readlink_cache_group(state)"],
+        "removal queries support and commits once on one exact live channel binding")
+    require_tokens(client, ["std::array<uint8_t, OFFSET + 511> request{}", "VfsPathRemovePrefix const PREFIX",
+        "io_guard(context->io_lock)", "send(context->proxy, context->remote_fd)", "ProxyLifecycleRefGuard lane_ref_guard(state)"],
+        "removal retains bounded framing and exact directory or mount lane")
+    if client.count("invoke(OP_VFS_PATH_AS") != 1 or "OP_VFS_UNLINK," in client or "vfs_proxy_read_with_retry" in client:
+        fail("removal cannot retry an uncertain mutation or use callerless fallback")
+    handler = function_body(source, "handle_vfs_op")
+    mapped = handler[handler.index("if (request.operation == VfsPathOperation::REMOVE)"):]
+    mapped = mapped[:mapped.index("if (request.operation == VfsPathOperation::UTIMENS)")]
+    require_order(mapped, ["wki_vfs_remove_request_valid", "mapped_wire_path_status", "credential_record::decode",
+        "map_vfs_mutation_identity", "find_remote_fd(channel_identity", "prepare_mapped_scalar_path",
+        "vfs_unlink_resolved_beneath_as"], "removal owner maps identity before confined parent mutation")
+    reply = function_body(source, "handle_vfs_op_resp")
+    require_tokens(reply, ["INVALID_FEATURES", "!INVALID_RESPONSE", "sizeof(VfsFeaturesResponse)"],
+        "feature reply framing must be checked before truncation and status publication")
+    core = VFS_CORE_CPP.read_text()
+    owner = function_body(core, "vfs_unlink_resolved_beneath_as")
+    require_order(owner, ["REQUEST_CREDENTIALS = credentials", "acquire_confined_owner_lookup",
+        "lookup_is_beneath_export", "consume_lookup_locked"], "removal uses one admitted owner snapshot")
+    if "current_metadata_credentials()" in owner or "task.credentials()" in owner:
+        fail("mapped removal cannot borrow worker credentials")
+    entry = function_body(core, "vfs_unlinkat")
+    require_order(entry, ["REQUEST_CREDENTIALS = task->credentials()", "for (unsigned attempt", "vfs_acquire_lookup"],
+        "public removal holds one snapshot across precommit lookup retries")
+    require_tokens(entry, ["handle.remote_relative_path()", "handle.dirfd_anchor()", "&REQUEST_CREDENTIALS",
+        "if (lookup.mount()->fs_type == FSType::REMOTE) return consume_unlink(lookup, &context)"],
+        "removal preserves raw components, retained directory and no remote replay")
+
+    for name, expression in [("wki_remote_vfs_unlink", "false, credentials, require_directory, directory"),
+                             ("wki_remote_vfs_rmdir", "true, credentials, true, directory")]:
+        require_tokens(function_body(source, name), ["remote_vfs_remove_path", expression], "removal wrappers retain operation semantics")
+    legacy = handler[handler.index("case OP_VFS_UNLINK:"):handler.index("case OP_VFS_RENAME:")]
+    require_tokens(legacy, ["case OP_VFS_RMDIR:", "reject_request(-ENOTSUP)"], "callerless scalar removal is unsupported")
+    if "vfs_unlink_resolved_beneath" in legacy:
+        fail("legacy scalar removal must not commit")
+
+def test_mapped_mkdir_queries_exact_binding_before_one_commit() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+    client = function_body(source, "wki_remote_vfs_mkdir")
+    require_order(client, ["REQUEST_CREDENTIALS = credentials", "wki_resource_observation_is_live",
+        "s_vfs_lock.lock()", "IDENTITY = proxy_channel_identity_locked(state)", "s_vfs_lock.unlock()",
+        "vfs_proxy_send_and_wait", "&IDENTITY", "credential_record::encode(REQUEST_CREDENTIALS)",
+        "invoke(OP_VFS_FEATURES", "wki_vfs_features_response_valid", "WKI_VFS_FEATURE_MKDIR_IDENTITY",
+        "invoke(OP_VFS_PATH_AS", "wki_vfs_path_response_valid", "invalidate_readlink_cache_group(state)"],
+        "mkdir queries support and commits once on one exact live channel binding")
+    require_tokens(client, ["std::array<uint8_t, OFFSET + 511> request{}", "VfsPathMkdirPrefix const PREFIX",
+        "io_guard(context->io_lock)", "send(context->proxy, context->remote_fd)", "ProxyLifecycleRefGuard lane_ref_guard(state)"],
+        "mkdir retains bounded framing and exact directory or mount lane")
+    if client.count("invoke(OP_VFS_PATH_AS") != 1 or "OP_VFS_MKDIR," in client or "vfs_proxy_read_with_retry" in client:
+        fail("mkdir cannot retry an uncertain mutation or use callerless fallback")
+    handler = function_body(source, "handle_vfs_op")
+    mapped = handler[handler.index("if (request.operation == VfsPathOperation::MKDIR)"):]
+    mapped = mapped[:mapped.index("if (request.operation == VfsPathOperation::UTIMENS)")]
+    require_order(mapped, ["wki_vfs_mkdir_request_valid", "mapped_wire_path_status", "credential_record::decode",
+        "map_vfs_mutation_identity", "find_remote_fd(channel_identity", "prepare_mapped_scalar_path",
+        "vfs_mkdir_resolved_beneath_as"], "mkdir owner maps identity before confined parent mutation")
+    reply = function_body(source, "handle_vfs_op_resp")
+    require_tokens(reply, ["INVALID_FEATURES", "!INVALID_RESPONSE", "sizeof(VfsFeaturesResponse)"],
+        "feature reply framing must be checked before truncation and status publication")
+    core = VFS_CORE_CPP.read_text()
+    owner = function_body(core, "vfs_mkdir_resolved_beneath_as")
+    require_order(owner, ["REQUEST_CREDENTIALS = credentials", "acquire_confined_owner_lookup",
+        "lookup_is_beneath_export", "consume_lookup_locked"], "mkdir uses one admitted owner snapshot")
+    if "current_metadata_credentials()" in owner or "task.credentials()" in owner:
+        fail("mapped mkdir cannot borrow worker credentials")
+    entry = function_body(core, "vfs_mkdirat")
+    require_order(entry, ["REQUEST_CREDENTIALS = task->credentials()", "for (unsigned attempt", "vfs_acquire_lookup"],
+        "public mkdir holds one snapshot across precommit lookup retries")
+    require_tokens(entry, ["handle.remote_relative_path()", "handle.dirfd_anchor()", "&REQUEST_CREDENTIALS",
+        "if (lookup.mount()->fs_type == FSType::REMOTE) return consume_mkdir(lookup, &context)"],
+        "mkdir preserves raw components, retained directory and no remote replay")
+
+
+def test_mapped_symlink_preserves_literal_target_and_one_identity() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+    client = function_body(source, "wki_remote_vfs_symlink")
+    require_order(client, ["REQUEST_CREDENTIALS = credentials", "wki_resource_observation_is_live",
+        "IDENTITY = proxy_channel_identity_locked(state)", "&IDENTITY", "credential_record::encode(REQUEST_CREDENTIALS)",
+        "std::memcpy(request.data() + OFFSET, target, TARGET_LENGTH)", "invoke(OP_VFS_FEATURES",
+        "wki_vfs_features_response_valid", "WKI_VFS_FEATURE_SYMLINK_IDENTITY", "invoke(OP_VFS_PATH_AS",
+        "wki_vfs_path_response_valid", "invalidate_readlink_cache_group(state)"],
+        "symlink copies caller and literal bytes before support query on exact binding")
+    require_tokens(client, ["TARGET_LENGTH > 511", "VfsPathSymlinkPrefix", "OFFSET + 2 * 511",
+        "io_guard(context->io_lock)", "send(context->proxy, context->remote_fd)", "ProxyLifecycleRefGuard lane_ref_guard(state)"],
+        "symlink bounds independent data/path and retains its exact directory/lane")
+    if client.count("invoke(OP_VFS_PATH_AS") != 1 or "vfs_proxy_read_with_retry" in client or "OP_VFS_SYMLINK," in client:
+        fail("symlink cannot replay a mutation or use callerless fallback")
+    handler = function_body(source, "handle_vfs_op")
+    mapped = handler[handler.index("if (request.operation == VfsPathOperation::SYMLINK)"):]
+    mapped = mapped[:mapped.index("if (request.operation == VfsPathOperation::UTIMENS)")]
+    require_order(mapped, ["wki_vfs_symlink_request_valid", "wire_symlink_target_is_representable", "mapped_wire_path_status",
+        "credential_record::decode", "map_vfs_mutation_identity", "find_remote_fd(channel_identity",
+        "prepare_mapped_scalar_path", "vfs_symlink_resolved_beneath_as"], "owner symlink maps before retained parent commit")
+    core = VFS_CORE_CPP.read_text()
+    entry = function_body(core, "vfs_symlinkat")
+    require_order(entry, ["REQUEST_CREDENTIALS = task->credentials()", "for (unsigned attempt", "vfs_acquire_lookup"],
+        "public symlink captures once across precommit retries")
+    require_tokens(entry, ["handle.remote_relative_path()", "handle.dirfd_anchor()", "&REQUEST_CREDENTIALS",
+        "if (lookup.mount()->fs_type == FSType::REMOTE) return consume_symlink(lookup, &context)"],
+        "symlink keeps raw ancestor checks and cannot replay a remote result")
+    owner = function_body(core, "vfs_symlink_resolved_beneath_as")
+    require_order(owner, ["REQUEST_CREDENTIALS = credentials", "acquire_confined_owner_lookup", "lookup_is_beneath_export",
+        "consume_lookup_locked"], "owner consumes only admitted confined identity")
+    if "current_metadata_credentials()" in owner or "task.credentials()" in owner:
+        fail("mapped symlink cannot borrow worker credentials")
+    pending = function_body(REMOTABLE_CPP.read_text(), "wki_remotable_process_pending_mounts")
+    if "vfs_mkdir(" in pending:
+        fail("autoattach must not wait in mkdir while its own withdrawal is queued")
+
+
+def test_mapped_rename_uses_exact_directory_bindings_and_one_commit():
+    source = REMOTE_VFS_CPP.read_text()
+    client = function_body(source, "wki_remote_vfs_rename")
+    require_order(client, ["REQUEST_CREDENTIALS = credentials", "credential_record::encode", "std::memcpy(request.data() + OFFSET",
+        "first_guard.emplace", "acquire_vfs_proxy_lane", "IDENTITY = proxy_channel_identity_locked", "OP_VFS_FEATURES",
+        "WKI_VFS_FEATURE_RENAME_IDENTITY", "binding(source", "binding(destination", "// Exactly one namespace mutation",
+        "invoke(state, IDENTITY, OP_VFS_PATH_AS", "invalidate_readlink_cache_group"], "rename copies input and queries exact directory bindings before one commit")
+    require_tokens(client, ["second != first", "std::swap(first, second)", "proxy->mount_group_id != state->mount_group_id",
+        "VfsPathOperation::DIRECTORY_BINDING", "reference.channel_id == identity.channel_id", "&identity"], "rename keeps lock order, mount group and binding identity")
+    if "OP_VFS_RENAME," in client or "vfs_proxy_read_with_retry" in client:
+        fail("rename must not fall back or replay an uncertain mutation")
+    handler = function_body(source, "handle_vfs_op")
+    mapped = handler[handler.index("if (request.operation == VfsPathOperation::RENAME)"):]
+    mapped = mapped[:mapped.index("if (request.operation == VfsPathOperation::REMOVE)")]
+    require_order(mapped, ["wki_vfs_rename_request_valid", "credential_record::decode", "map_vfs_mutation_identity",
+        "wki_dev_server_retain_vfs_sibling", "s_vfs_lock.lock()", "find_remote_fd(identity", "s_vfs_lock.unlock()",
+        "prepare(prefix.source", "prepare(prefix.destination", "vfs_rename_resolved_beneath_as"], "owner pins exact sibling bindings before confined rename")
+    server = DEV_SERVER_CPP.read_text()
+    sibling = function_body(server, "wki_dev_server_retain_vfs_sibling")
+    require_order(sibling,["s_server_lock.lock_irqsave", "find_retained_binding_by_channel_identity", "vfs_sibling_binding_matches",
+        "retain_binding_locked", "candidate.channel_identity", "s_server_lock.unlock_irqrestore"], "sibling acquisition pins a validated binding under one short lock")
+    match = function_body(server,"vfs_sibling_binding_matches")
+    require_tokens(match,["!candidate.epoch_reset_pending", "!candidate.detach_cleanup_pending", "candidate.retiring.load",
+        "origin.consumer_node == candidate.consumer_node", "candidate.channel_identity.generation == generation", "origin.resource_id == candidate.resource_id",
+        "wki_resource_incarnation_equal", "vfs_export_publication_revision", "vfs_export_dev_id", "std::strcmp"], "sibling authority includes peer, incarnation, export and lifecycle")
+
+
+def test_remote_descriptor_metadata_maps_one_caller_and_never_replays() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+    core = VFS_CORE_CPP.read_text()
+    client = function_body(source, "remote_file_metadata_request")
+    require_order(client, ["REQUEST_CREDENTIALS = credentials", "io_guard(context->io_lock)",
+        "proxy_channel_identity_locked(state)", "invoke(OP_VFS_FEATURES", "WKI_VFS_FEATURE_FILE_METADATA_IDENTITY",
+        "invoke(OP_VFS_PATH_AS", "wki_vfs_path_response_valid", "wki_remote_vfs_invalidate_open_file_caches"],
+        "descriptor mutation must admit an exact feature binding before one mutation and invalidation")
+    require_tokens(client, ["&IDENTITY", "file->fops != &g_remote_vfs_fops", "context->remote_fd <= 0",
+        "VfsFileChmodRequest", "VfsFileChownRequest", "VfsFileUtimensRequest", "TimestampUpdate::prepare"],
+        "descriptor metadata validates file identity and preserves bounded typed payloads")
+    if client.count("invoke(OP_VFS_PATH_AS") != 1 or "acquire_vfs_proxy_lane" in client or "vfs_path" in client.replace("wki_vfs_path_response_valid", ""):
+        fail("descriptor metadata must not replay, reselect a lane, or reconstruct a pathname")
+    handler = function_body(source, "handle_vfs_op")
+    owner = handler.split("if (wki_vfs_is_file_metadata(request.operation))", 1)[1].split("if (request.operation == VfsPathOperation::CHMOD)", 1)[0]
+    require_order(owner, ["decode_file_metadata_request", "map_vfs_mutation_identity", "find_remote_fd(channel_identity, metadata.fd)",
+        "vfs_retain_file", "s_vfs_lock.unlock()", "file->fs_type == ker::vfs::FSType::REMOTE", "file->exec_read_view != nullptr",
+        "vfs_fchmod_file_as(file.get(), mapped", "vfs_fchown_file_as(file.get(), mapped", "vfs_futimens_file_as(file.get(), mapped"],
+        "owner maps caller before retaining exact File and commits outside registry lock")
+    if "get_current_task" in owner or "credentials()" in owner or "prepare_mapped_scalar_path" in owner:
+        fail("owner file metadata cannot borrow worker identity or resolve a cached path")
+    for operation, entry in [("chmod", "vfs_fchmod_for_task"), ("chown", "vfs_fchown_for_task"), ("utimens", "vfs_futimens")]:
+        wrapper = function_body(core, entry)
+        require_order(wrapper, ["task->credentials()", "vfs_get_file_retain", "wki_remote_vfs_f" + operation,
+            "cache_notify_file_metadata_changed_impl", "vfs_put_file"], "public wrapper retains one caller and file through remote commit")
+        if "publication_guard" in wrapper or wrapper.count("task->credentials()") != 1:
+            fail("remote metadata wrapper cannot wait under publication or resnapshot the caller")
+
+
+def test_path_chown_keeps_one_caller_and_exact_binding() -> None:
+    core = VFS_CORE_CPP.read_text()
+    source = REMOTE_VFS_CPP.read_text()
+    public = function_body(core, "vfs_fchownat")
+    require_order(public, ["REQUEST_CREDENTIALS = task->credentials()", "for (unsigned attempt", "LookupIntent::CHANGE_OWNER", "&REQUEST_CREDENTIALS", "consume_chown_lookup", "publication_guard", "consume_lookup_locked"], "chown request survives lookup retries with one Snapshot")
+    if public.count("task->credentials()") != 1: fail("chown recaptures current caller")
+    owner = function_body(core, "vfs_chown_resolved_beneath_as")
+    require_order(owner, ["REQUEST_CREDENTIALS = credentials", "acquire_confined_owner_lookup", "LookupIntent::CHANGE_OWNER", "publication_guard", "lookup_is_beneath_export", "consume_lookup_locked"], "owner chown must confine and commit with supplied caller")
+    consume = function_body(core, "consume_chown_lookup")
+    require_tokens(consume, ["handle.remote_relative_path()", "handle.dirfd_anchor()", "handle.authorization().credentials", "handle.requires_directory()", "handle.mount_policy().read_only", "tmpfs_chown_lookup", "xfs_chown_lookup", "devfs_chown_lookup"], "chown retains ancestry, directory, mount and native policy")
+    client = function_body(source, "wki_remote_vfs_chown")
+    require_order(client, ["REQUEST_CREDENTIALS = credentials", "proxy_channel_identity_locked", "&IDENTITY", "invoke(OP_VFS_FEATURES", "WKI_VFS_FEATURE_CHOWN_IDENTITY", "invoke(OP_VFS_PATH_AS", "wki_vfs_path_response_valid"], "exact feature binding before one chown")
+    if client.count("invoke(OP_VFS_PATH_AS") != 1 or "with_retry" in client: fail("chown cannot replay a mutation")
+    handler = function_body(source, "handle_vfs_op")
+    dispatch = handler.split("if (request.operation == VfsPathOperation::CHOWN)", 1)[1].split("if (request.operation == VfsPathOperation::MKDIR)", 1)[0]
+    require_order(dispatch, ["wki_vfs_chown_request_valid", "credential_record::decode", "map_vfs_mutation_identity", "find_remote_fd(channel_identity", "vfs_retain_file", "s_vfs_lock.unlock()", "vfs_chown_resolved_beneath_as(*task, mapped"], "owner maps before retaining exact directory and native call")
+    if "task->credentials()" in dispatch: fail("owner chown borrows worker authority")
+
+
+def test_native_directory_grants_have_separate_close_only_staging():
+    source = REMOTE_VFS_CPP.read_text()
+    retain = function_body(source, "retain_directory_grant")
+    require_order(retain, ["local = row->directory_grant_local_source", "s_vfs_lock.unlock()", "if (!local)",
+                           "wki_dev_server_retain_vfs_grant_source", "directory_grant_source_current_locked",
+                           "directory_grant_credentials != RECORD", "vfs_retain_file"],
+                  "native and remote grant admission retain exact source authority")
+    close = function_body(source, "close_native_directory_grant")
+    require_tokens(close, ["NativeDirectoryGrantCleanup", "file->private_data = nullptr", "cancel_native_directory_grant"],
+                   "close-only local staging must own cancellation")
+    ops = source.split("g_native_directory_grant_cleanup_ops{", 1)[1].split("};", 1)[0]
+    if ".vfs_close = close_native_directory_grant" not in ops or any(name in ops for name in ("vfs_read", "vfs_write", "vfs_readdir")):
+        fail("native grant staging must not grant file data access")
+    require_tokens(WKI_DEV_PROXY_KTEST.read_text(), ["NativeOwnerRetainsScopeAndCancelsWithoutPeerBinding",
+                   "wki_remote_vfs_selftest_native_directory_grant()"], "native owner fixture must be registered")
+
+
+def test_grant_rpc_exit_cleanup_transfers_exact_reserved_cancellation():
+    source = REMOTE_VFS_CPP.read_text()
+    guard = source.split("class PinPreparation {", 1)[1].split("auto vfs_proxy_send_untracked", 1)[0]
+    publish = function_body(guard, "publish")
+    require_order(publish, ["s_vfs_lock.lock()", "unlink_locked()", "std::exchange(file_, nullptr)",
+                           "std::exchange(context_, nullptr)", "slot_ = VFS_EXEC_CANCEL_SLOT_NONE", "s_vfs_lock.unlock()"],
+                  "successful grant transfers private File/context and outbox ownership atomically")
+    cleanup = function_body(guard, "cleanup_for_task")
+    require_order(cleanup, ["candidate->pid_ != pid", "candidate->detach_locked(true)", "s_vfs_lock.unlock()", "drain(retired)"],
+                  "task cleanup detaches exact PID before releasing allocations")
+    drain = function_body(guard, "drain")
+    require_tokens(drain, ["delete retired.file", "delete retired.context", "release_vfs_proxy_open_ref", "wki_deferred_work_notify"],
+                   "private preparation drains while durable cancellation keeps its proxy")
+    if "s_vfs_lock.lock()" in drain or "vfs_proxy_send_and_wait" in drain:
+        fail("private cleanup must not release under registry lock or wait for cancellation")
+    require_tokens(WKI_DEV_PROXY_KTEST.read_text(), ["AbandonedPreparationQueuesCancellationAndReleasesPrivateState",
+                   "wki_remote_vfs_selftest_directory_grant_preparation()"], "production lifetime fixture must run")
+
+
+def test_directory_lane_and_executable_pin_ownership_do_not_depend_on_unwinding():
+    source = REMOTE_VFS_CPP.read_text()
+    directory = function_body(source, "wki_remote_vfs_pin_directory")
+    require_order(directory, ["ProxyLifecycleRefGuard lane_guard", "PinPreparation preparation", "lane_guard.reset()",
+                              "vfs_proxy_send_and_wait", "preparation.own_cancellation", "OP_VFS_DIRECTORY_REFERENCE",
+                              "preparation.publish()"], "directory lane lifetime must transfer before either wait")
+    execution = function_body(source, "wki_remote_vfs_clone_exec_file")
+    require_order(execution, ["PinPurpose::EXECUTABLE", "exec_read_view.reset", "allocate_identity", "preparation.retain_proxy",
+                              "preparation.own_cancellation", "vfs_proxy_send_and_wait", "wki_vfs_exec_view_response_valid",
+                              "cancel_remote_exec_view(CANCEL_SLOT)", "return CANCELED != 0 ? CANCELED : result",
+                              "preparation.publish()"], "exec preparation owns both PIN and cancellation waits without changing errno precedence")
+    require_tokens(WKI_DEV_PROXY_KTEST.read_text(), ["DirectoryAndExecutableLifetimesKeepCancellationPurpose",
+                   "wki_remote_vfs_selftest_pin_preparation_purpose()"], "shared purpose lifetime fixture must run")
+
+
+def test_pin_close_continuation_is_registered_and_preserves_writable_close():
+    source = REMOTE_VFS_CPP.read_text()
+    close = function_body(source, "remote_vfs_close")
+    require_order(close, ["immutable_pin_close(*f, *ctx)", "close_immutable_pin(f)", "flush_write_behind(ctx)",
+                          "NEEDS_CLOSE_STATUS", "OP_VFS_CLOSE", "return flush_status != 0 ? flush_status : close_status"],
+                  "specialized immutable close must preserve general writable completion and errno")
+    backend = function_body(source, "finish_pin_close_backend")
+    require_order(backend, ["clear_remote_file_open_prefetch", "delete context->read_cache", "delete context->write_buf",
+                            "delete context;", "file->private_data = nullptr", "release_vfs_proxy_open_ref(proxy)"],
+                  "backend cleanup retires allocations before releasing proxy")
+    if "MutexGuard" in backend or "s_vfs_lock.lock()" in backend:
+        fail("immutable backend release must run without a held per-file or registry lock")
+    require_tokens(WKI_DEV_PROXY_KTEST.read_text(), ["AbandonedCloseReleasesFilePathMountAndExactCancellation",
+                   "ker::net::wki::wki_remote_vfs_selftest_pin_close_lifetime()"], "actual pin close fixture must run")
+
+
+def test_mapped_open_carries_captured_export_symlink_namespace() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+    body = function_body(source, "handle_vfs_op")
+    start = body.index("case OP_VFS_OPEN_AS:")
+    end = body.index("case ", start + len("case OP_VFS_OPEN_AS:"))
+    opened = body[start:end]
+    assert "export_name[0] == '/' ? export_name : nullptr" in body
+    for name in ("vfs_open_read_file_resolved_beneath_as", "vfs_open_file_resolved_beneath_as"):
+        call = re.search(rf"{name}\([^;]+;", opened).group(0)
+        assert "mapped_credentials" in call and "export_path" in call and "absolute_symlink_root" in call
+    assert "worker->root" not in opened
+    for name in ("vfs_stat_resolved_beneath_as", "vfs_readlink_resolved_beneath_as", "vfs_realpath_resolved_beneath_as"):
+        calls = re.findall(rf"{name}\([^;]+;", body)
+        assert len(calls) == 2
+        assert all("mapped" in call and "export_path" in call and "absolute_symlink_root" in call for call in calls)
+    for operation in ("mkdir", "symlink", "unlink", "rename", "chmod", "chown", "utimens"):
+        calls = re.findall(r"vfs_" + operation + r"_resolved_beneath_as\((.*?)\);", body, re.S)
+        assert len(calls) == 1
+        assert "mapped" in calls[0] and "export_path" in calls[0] and "absolute_symlink_root" in calls[0]
+
+
+
+def test_open_reply_admission_preserves_rejection_status() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+    reply = function_body(source, "handle_vfs_op_resp")
+    require_order(reply, ["EXPECTED_LEN != payload_len", "find_vfs_proxy_for_response_locked",
+                         "scalar_open_response_valid", "if (INVALID_RESPONSE)",
+                         "state->op_status = -EPROTO", "memcpy(state->op_resp_buf, resp_data, copy_len)",
+                         "if (!INVALID_RESPONSE", "state->op_status = resp->status"],
+                  "reply validation must precede copying and preserve all protocol errors")
+    rejection = reply[reply.index("bool const INVALID_RESPONSE"):reply.index("if (INVALID_RESPONSE)")]
+    require_tokens(rejection, ["INVALID_STAT", "INVALID_BATCH", "INVALID_PATH", "INVALID_EXEC",
+                               "INVALID_FEATURES", "INVALID_DIRECTORY", "INVALID_GRANT", "INVALID_OPEN"],
+                   "all reply rejection reasons share one status-publication gate")
+    validator = function_body(source, "scalar_open_response_valid")
+    require_order(validator, ["length > capacity", "length != OPEN_RESP_NO_STAT_LEN",
+                             "std::memcpy(&reply, data, length)", "reply.fd < 0"],
+                  "scalar reply validation bounds the copy and rejects invalid descriptors")
+
+
+def test_ordinary_open_lifetime_owner_uses_ordered_exact_binding() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+    owner = function_body(source, "handle_vfs_op")
+    require_order(owner, ["op_id == OP_VFS_OPEN_LIFETIME", "wki_vfs_open_lifetime_request_valid",
+                          "grant_binding == nullptr", "cancel_ordinary_open", "admit_ordinary_open_token",
+                          "switch (effective_op)", "reservation.publish(file, 0, 0, 0, ordinary_token, ordinary_binding_id)",
+                          "reservation.publish(opened, 0, 0, 0, ordinary_token, ordinary_binding_id)"],
+                  "versioned ordinary lifetime wraps both existing open publication paths")
+    cancellation = function_body(source, "cancel_ordinary_open")
+    require_order(cancellation, ["s_vfs_lock.lock()", "ordinary_open_binding_matches_locked", "vfs_open_token_high_water = std::max",
+                                "row.ordinary_open_token != request.token", "row.ordinary_open_binding_id != request.binding_id",
+                                "vfs_channel_identity_matches(row.channel_identity, identity)",
+                                "g_remote_fds.extract(it)", "s_vfs_lock.unlock()", "ker::vfs::vfs_put_file_result(file)"],
+                  "exact token cancellation extracts before releasing outside the lock")
+    admission = function_body(source, "admit_ordinary_open_token")
+    require_order(admission, ["ordinary_open_binding_matches_locked", "request.token == 0", "request.token <= binding.vfs_open_token_high_water",
+                             "status = -EALREADY", "binding.vfs_open_token_high_water = request.token"],
+                  "consumed tokens cannot replay mutation")
+    wki = WKI_CPP.read_text()
+    dispatch = function_body(wki, "admit_vfs_op")
+    require_order(dispatch, ["OP_VFS_OPEN_LIFETIME", "EXPECTED_LEN != payload_len",
+                            "channel->rx_dispatch_seq != hdr->seq_num", "WkiVfsOpRxAdmission::RETRY",
+                            "wki_dev_server_admit_vfs_op_rx"], "new operation enters ordered pre-ACK admission")
+    server = DEV_SERVER_CPP.read_text()
+    for name in ["is_vfs_op", "wki_dev_server_admit_vfs_op_rx"]:
+        require_tokens(function_body(server, name), ["OP_VFS_OPEN_LIFETIME"], "new operation retains its exact worker binding")
+    require_tokens(WKI_DEV_PROXY_KTEST.read_text(), ["OwnerTokenCancellationCannotRepeatOrReachSuccessor"],
+                   "actual owner lifetime regression remains registered")
+
+
+def test_ordinary_open_lifetime_client_ownership() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+    sender = function_body(source, "vfs_proxy_send_and_wait")
+    require_order(sender, ["acquire_proxy_op_slot_locked(state, PROXY_WAIT_START)", "take_ordinary_open_token_locked(state)",
+                           "state->op_lifetime_inner = lifetime.inner_op", "state->lock.unlock()",
+                           "ordinary->request.token = lifetime.token", "wki_send_on_channel_identity"],
+                  "token allocation follows the operation gate and publication precedes transport")
+    binding = function_body(source, "prepare_ordinary_open_binding")
+    require_order(binding, ["WKI_CAP_RESOURCE_INCARNATION", "OP_VFS_FEATURES", "WKI_VFS_FEATURE_OPEN_LIFETIME",
+                            "OP_VFS_OPEN_LIFETIME", "wki_vfs_open_binding_response_valid", "response.owner_boot_epoch != EPOCH",
+                            "state->ordinary_open_binding_id = response.binding_id"], "feature and exact challenged owner binding")
+    for function in ("wki_remote_vfs_open_path", "wki_remote_vfs_open_at"):
+        body = function_body(source, function)
+        require_order(body, ["preparation.prepare_ordinary_open()", "vfs_proxy_send_and_wait", "preparation.ordinary_slot()",
+                             "preparation.publish()"], "ordinary open reserves durable cleanup before mutation")
+    cleanup = function_body(source, "wki_remote_vfs_cleanup_for_task")
+    require_order(cleanup, ["finish_or_quiesce_waiter", "SharedIoTaskOwner::cleanup_for_task(pid)",
+                            "PinPreparation::cleanup_for_task(pid)", "OrdinaryCloseOwner::cleanup_for_task(pid)"],
+                  "waiters and shared slots drain before File storage")
+    close = function_body(source, "close_ordinary_file")
+    require_order(close, ["OrdinaryCloseOwner owner(file)", "flush_write_behind(context)",
+                          "cancel_remote_ordinary_open", "FLUSH_STATUS != 0 ? FLUSH_STATUS : close_status"],
+                  "durable close ownership and flush errno precedence")
+    if "io_lock" in close or "OP_VFS_CLOSE" in close:
+        fail("ordinary close must use the exact token without a mutex spanning waits")
+    finish = function_body(source, "finish_ordinary_cancellation")
+    require_tokens(finish, ["status == 0 || retirement_proven", "ExecCancellationPhase::PENDING",
+                            "release_vfs_proxy_open_ref(released)"], "unknown outcomes retain the independent proxy ref")
+    require_tokens(source, ["VFS_OPEN_CANCEL_CAPACITY = 1024", "wki_remote_vfs_selftest_open_lifetime_client",
+                            "g_shared_io_owners"], "separate bounded task-owned ordinary outbox")
+
+
 def main() -> None:
+    test_ordinary_open_lifetime_client_ownership()
+    test_ordinary_open_lifetime_owner_uses_ordered_exact_binding()
+    test_open_reply_admission_preserves_rejection_status()
+    test_pin_close_continuation_is_registered_and_preserves_writable_close()
+    test_directory_lane_and_executable_pin_ownership_do_not_depend_on_unwinding()
+    test_grant_rpc_exit_cleanup_transfers_exact_reserved_cancellation()
+    test_native_directory_grants_have_separate_close_only_staging()
+    test_scalar_metadata_keeps_snapshot_and_binding_through_retries()
+    test_path_chown_keeps_one_caller_and_exact_binding()
+    test_remote_descriptor_metadata_maps_one_caller_and_never_replays()
+    test_mapped_rename_uses_exact_directory_bindings_and_one_commit()
+    test_mapped_removal_preserves_caller_and_never_replays()
+    test_mapped_symlink_preserves_literal_target_and_one_identity()
+    test_mapped_mkdir_queries_exact_binding_before_one_commit()
     test_vfs_host_alias_rewrite_is_overlap_safe()
     test_vfs_route_scratch_is_initialized_by_its_producer()
-    test_remote_chown_matches_xfs_noop_semantics()
+    test_remote_chown_reports_missing_owner_operation()
     test_wki_host_mount_scratch_is_initialized_by_its_producers()
     test_vfs_rename_scratch_is_initialized_by_its_producers()
     test_proxy_op_slot_waits_are_bounded()
@@ -4346,7 +4721,7 @@ def main() -> None:
     test_remote_metadata_scratch_initializes_only_consumed_prefix()
     test_write_behind_storage_grows_in_allocator_shaped_classes()
     test_message_write_flush_uses_split_send_and_retains_tail()
-    test_remote_open_closes_server_fd_on_local_allocation_failure()
+    test_remote_open_prepares_storage_before_mutation_request()
     test_remote_close_waits_only_for_writable_output_publication()
     test_export_lookup_returns_locked_snapshot()
     test_rdma_retry_cooldowns_are_saturating()
@@ -4366,6 +4741,9 @@ def main() -> None:
     test_export_rebuild_is_revisioned_and_backing_mount_exact()
     test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity()
     test_remote_xattr_is_bounded_replay_safe_and_export_confined()
+    test_exec_view_preserves_owner_grant_and_complete_reply()
+    test_mapped_chmod_retains_snapshot_and_exact_directory_lane()
+    test_mapped_open_carries_captured_export_symlink_namespace()
     print("WKI remote VFS source invariants hold")
 
 

@@ -49,6 +49,7 @@ using ZoneNotifyHandler = void (*)(uint32_t zone_id, uint32_t offset, uint32_t l
 struct WkiZone {
     uint32_t zone_id = 0;
     uint16_t peer_node_id = WKI_NODE_INVALID;
+    WkiChannelIdentity channel_identity{};  // Immutable until the retained zone is retired.
     ZoneState state = ZoneState::NONE;
 
     // Local memory backing
@@ -100,6 +101,45 @@ struct WkiZone {
     mod::sys::Spinlock lock;
 };
 
+struct WkiZoneMemory {
+    void* data = nullptr;
+    uint32_t size = 0;
+    bool is_roce = false;
+    uint32_t remote_rkey = 0;
+    WkiTransport* transport = nullptr;
+};
+
+// Owns exact local backing, including after retirement. Call live() before
+// admitting new work; a pin alone does not extend the zone's authorization.
+// The owner must drain users before reset/move/destruction. Memory and transport
+// metadata are captured under the zone lock; this is not a mutable slot borrow.
+class WkiZoneRef {
+   public:
+    WkiZoneRef() = default;
+    WkiZoneRef(const WkiZoneRef&) = delete;
+    auto operator=(const WkiZoneRef&) -> WkiZoneRef& = delete;
+    WkiZoneRef(WkiZoneRef&& other) noexcept;
+    auto operator=(WkiZoneRef&& other) noexcept -> WkiZoneRef&;
+    ~WkiZoneRef();
+    explicit operator bool() const { return zone_ != nullptr; }
+    auto memory() const -> WkiZoneMemory { return memory_; }
+    auto live() const -> bool;
+    // Refresh late transport metadata from this pinned slot; preserve output on refusal.
+    auto snapshot_memory(WkiZoneMemory& output) const -> bool;
+    void reset();
+    auto destroy() const -> int;
+    // Zero-range READ(0)/WRITE(1) wake on this zone's original management channel.
+    auto notify_post(uint8_t op_type) const -> int;
+    auto set_handlers(ZoneNotifyHandler pre, ZoneNotifyHandler post) const -> bool;
+    static auto acquire(uint32_t zone_id, uint16_t peer, uint8_t local_access) -> WkiZoneRef;
+
+   private:
+    friend auto wki_zone_create(uint16_t, uint32_t, uint32_t, uint8_t, ZoneNotifyMode, ZoneTypeHint, WkiZoneRef*) -> int;
+    static auto retain(WkiZone* zone, uint16_t peer, uint8_t local_access) -> WkiZoneRef;
+    WkiZone* zone_ = nullptr;
+    WkiZoneMemory memory_{};
+};
+
 // -----------------------------------------------------------------------------
 // Public API
 // -----------------------------------------------------------------------------
@@ -115,7 +155,7 @@ void wki_zone_worker_start();
 // Sends ZONE_CREATE_REQ and blocks until ACK (or timeout).
 // Returns WKI_OK on success, negative error code on failure.
 auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t access_policy, ZoneNotifyMode notify,
-                     ZoneTypeHint hint = ZoneTypeHint::BUFFER) -> int;
+                     ZoneTypeHint hint = ZoneTypeHint::BUFFER, WkiZoneRef* local_ref = nullptr) -> int;
 
 // Destroy a shared memory zone. Sends ZONE_DESTROY to peer.
 auto wki_zone_destroy(uint32_t zone_id) -> int;
@@ -124,16 +164,12 @@ auto wki_zone_destroy(uint32_t zone_id) -> int;
 auto wki_zone_find(uint32_t zone_id) -> WkiZone*;
 
 // Read from a zone (message-based). Blocks until response.
-// For RDMA zones, use wki_zone_get_ptr() and memcpy directly.
+// Direct local users must retain a WkiZoneRef with the required local access.
 auto wki_zone_read(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len) -> int;
 
 // Write to a zone (message-based). Blocks until ACK.
-// For RDMA zones, use wki_zone_get_ptr() and memcpy directly.
+// Direct local users must retain a WkiZoneRef with the required local access.
 auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t len) -> int;
-
-// Get the local virtual address pointer for a zone (for RDMA direct access).
-// Returns nullptr if zone not found or not active.
-auto wki_zone_get_ptr(uint32_t zone_id) -> void*;
 
 // Set PRE/POST notification handlers on a zone.
 void wki_zone_set_handlers(uint32_t zone_id, ZoneNotifyHandler pre, ZoneNotifyHandler post);
@@ -144,6 +180,10 @@ void wki_zones_destroy_for_peer(uint16_t node_id);
 auto wki_zones_list() -> auto;
 
 #ifdef WOS_SELFTEST
+auto wki_zone_selftest_post_notification_authority() -> bool;
+auto wki_zone_selftest_with_local_backing(uint32_t size, bool (*test)(WkiZoneRef&)) -> bool;
+auto wki_zone_selftest_local_backing_retention() -> bool;
+auto wki_zone_selftest_deferred_channel_retirement() -> bool;
 auto wki_zone_selftest_timeout_retirement_fences_stale_completion() -> bool;
 auto wki_zone_selftest_range_and_read_response_validation() -> bool;
 auto wki_zone_selftest_waiter_slots_and_cookies() -> bool;
@@ -155,15 +195,15 @@ auto wki_zone_selftest_waiter_slots_and_cookies() -> bool;
 
 namespace detail {
 
-void handle_zone_create_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
-void handle_zone_create_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
-void handle_zone_destroy(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
-void handle_zone_notify_pre(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
-void handle_zone_notify_post(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
-void handle_zone_read_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
-void handle_zone_read_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
-void handle_zone_write_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
-void handle_zone_write_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
+void handle_zone_create_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, const WkiChannelIdentity& identity);
+void handle_zone_create_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, const WkiChannelIdentity& identity);
+void handle_zone_destroy(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, const WkiChannelIdentity& identity);
+void handle_zone_notify_pre(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, const WkiChannelIdentity& identity);
+void handle_zone_notify_post(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, const WkiChannelIdentity& identity);
+void handle_zone_read_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, const WkiChannelIdentity& identity);
+void handle_zone_read_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, const WkiChannelIdentity& identity);
+void handle_zone_write_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, const WkiChannelIdentity& identity);
+void handle_zone_write_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, const WkiChannelIdentity& identity);
 
 }  // namespace detail
 

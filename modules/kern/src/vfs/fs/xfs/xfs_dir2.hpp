@@ -119,6 +119,10 @@ auto xfs_dir_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_ino_t
 // Supports shortform, block-format, and leaf/node directories.
 auto xfs_dir_removename(XfsInode* dp, const char* name, uint16_t namelen, XfsTransaction* tp, xfs_ino_t expected_ino = NULLFSINO) -> int;
 
+// Requires the mount metadata lock and a live transaction. The caller cancels
+// that transaction on failure; parent bytes, indexes and caches are captured.
+auto xfs_dir_reparent(XfsInode* dp, xfs_ino_t expected_parent, xfs_ino_t new_parent, XfsTransaction* tp) -> int;
+
 struct XfsDentryCacheStats {
     uint64_t hits{};
     uint64_t misses{};

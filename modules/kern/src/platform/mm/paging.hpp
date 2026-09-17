@@ -94,6 +94,16 @@ const static uint64_t PAGE_SHARED = (1ULL << 10);
 // anonymous mmap). This occupies address space without backing physical pages.
 const static uint64_t PAGE_RESERVED = (1ULL << 11);
 
+// On present shared leaves bit 11 retains a read-only attachment's maximum
+// write permission. PROT_NONE keeps the leaf present, so the restriction lasts
+// until replacement/unmap and is copied with the translation on fork.
+inline constexpr uint64_t PAGE_WRITE_RESTRICTED = (1ULL << 11);
+
+[[nodiscard]] constexpr auto shared_write_restricted(uint64_t flags) -> bool {
+    constexpr uint64_t TAG = PAGE_PRESENT | PAGE_SHARED | PAGE_WRITE_RESTRICTED;
+    return (flags & TAG) == TAG;
+}
+
 namespace page_types {
 const static uint64_t READONLY = PAGE_PRESENT;
 const static uint64_t KERNEL = PAGE_PRESENT | PAGE_WRITE;

@@ -76,6 +76,8 @@ void check_pending_signals_handoff(sched::task::Task* task, cpu::GPRegs& gpr, ga
 void check_pending_signals_deferred(sched::task::Task* task, DeferredSignalDelivery delivery);
 auto restore_deferred_sigreturn(sched::task::Task* task) -> DeferredSigreturnResult;
 void exit_current_on_pending_fatal_default_signal();
+// Only the main THREAD_EXIT cleanup loop: no userspace return or scoped owners.
+void service_retired_main_signals();
 // Only for an incoming handoff after assembly moved onto its kernel stack.
 // Saved USER_RETURN validation excludes blocked syscall/kernel resumes.
 void exit_current_on_cpu_limit_user_handoff();

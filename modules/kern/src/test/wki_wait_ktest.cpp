@@ -1,9 +1,25 @@
 #include <atomic>
 #include <cstdint>
+#include <net/wki/remote_compute.hpp>
 #include <net/wki/remote_ipc.hpp>
+#include <net/wki/transport_roce.hpp>
 #include <net/wki/wki.hpp>
 #include <net/wki/zone.hpp>
 #include <test/ktest.hpp>
+
+KTEST(WkiZone, NotificationsKeepOriginalGrantThroughRetirement) {
+    KEXPECT_TRUE(ker::net::wki::wki_zone_selftest_post_notification_authority());
+}
+
+KTEST(WkiZone, LocalBackingAndBlockRingRetainExactGrant) { KEXPECT_TRUE(ker::net::wki::wki_zone_selftest_local_backing_retention()); }
+
+KTEST(WkiZone, DeferredSetupAndMessagesKeepOriginalChannel) {
+    KEXPECT_TRUE(ker::net::wki::wki_zone_selftest_deferred_channel_retirement());
+}
+
+KTEST(WkiRoce, UninitializedReceivePreservesRegionAndReleasesPackets) {
+    KEXPECT_TRUE(ker::net::wki::wki_roce_selftest_uninitialized_receive_preserves_region());
+}
 
 KTEST(WkiWaitEntry, ClaimHasSingleWinnerAndFinishPublishesResult) {
     ker::net::wki::WkiWaitEntry wait{};
@@ -184,6 +200,22 @@ KTEST(WkiIpcProxyRef, PollStateResponseReleasesLookupReference) {
     KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_poll_state_response_refs(), 1);
 }
 
+KTEST(WkiIpcExportAuthority, ControlPinsAndCloseRequireIssuedConsumer) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_export_consumer_authority(), 0);
+}
+
+KTEST(WkiIpcImportAuthority, WrongProvenanceLeavesDescriptorsAndRegistriesUnchanged) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_import_provenance_preserves_state(), 0);
+}
+
+KTEST(WkiIpcExportAuthority, ResourceIdsNeverWrapOrPartiallyReserve) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_resource_id_exhaustion(), 0);
+}
+
+KTEST(WkiIpcExportAuthority, UnsupportedControlsCompleteOnlyTheirWaiter) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_unsupported_control_completion(), 0);
+}
+
 KTEST(WkiIpcExportLifetime, CompactionWaitsForBacklogThenFreesExport) {
     KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_export_compaction_frees(), 1);
 }
@@ -201,6 +233,26 @@ KTEST(WkiIpcExportLifetime, FatalWriteReleasesWorkerAndExportFileReferences) {
 
 KTEST(WkiIpcMessagePipeFlow, CreditAndErrorNotificationsUpdateWriter) {
     KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_message_pipe_flow_updates_proxy(), 0);
+}
+
+KTEST(WkiIpcOutputCompletion, ClosePreservesFiniteReceiptsAndPeerRetirementReclaims) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_output_completion_survives_close(), 0);
+}
+
+KTEST(WkiIpcOutputCompletion, PtyAliasesRetainAdmissionOrderThroughDelivery) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_pty_delivery_order(), 0);
+}
+
+KTEST(WkiIpcOutputCompletion, SocketShutdownPrefixExcludesLaterWritesAndStaleChannels) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_socket_delivery_fence(), 0);
+}
+
+KTEST(WkiIpcOutputCompletion, SocketFlowImportAccountsCreditsAndNonblockingPoll) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_socket_flow_import(), 0);
+}
+
+KTEST(WkiIpcOutputCompletion, PtyFlowImportPreservesLegacyAndNonblockingFlags) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_pty_flow_import(), 0);
 }
 
 KTEST(WkiIpcPeerCleanup, FenceCleanupDrainsMoreThanOneFixedBatch) {
@@ -281,6 +333,33 @@ KTEST(WkiIpcDevOpResp, ResponseUsesHomeNodeIdentity) {
     KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_dev_op_response_uses_home_node_identity(), 0);
 }
 
+KTEST(WkiIpcDevOpResp, ControlResponseAdmissionPreservesWaiter) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_control_response_admission_preserves_waiter(), 0);
+}
+
+KTEST(WkiIpcDevOpResp, CookieRetirementPreservesCurrentWaiter) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_cookie_retirement_preserves_current_waiter(), 0);
+}
+
+KTEST(WkiIpcDevOpResp, HealthyControlsCrossCookieWrap) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_healthy_controls_cross_cookie_wrap(), 0);
+}
+
+KTEST(WkiIpcEpoch, ExportRetirementAndMissingCleanupKeepOriginalChannels) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_export_channel_retirement(), 0);
+}
+KTEST(WkiIpcEpoch, SubmittedCleanupKeepsChannelsAcrossMoves) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_ipc_cleanup_keeps_channels());
+}
+
+KTEST(WkiIpcEpoch, DataAndPoppedCloseRetirementPreserveAccounting) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_data_channel_retirement(), 0);
+}
+
+KTEST(WkiIpcEpoch, ControlChannelRetirementDoesNotRebind) { KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_control_channel_retirement(), 0); }
+
+KTEST(WkiIpcEpoch, MarkPreservesReferencesUntilDeferredDrain) { KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_epoch_mark_and_drain(), 0); }
+
 KTEST(WkiIpcExportLifetime, AdmissionRejectsWithoutSideEffects) {
     KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_export_admission_is_atomic(), 0);
 }
@@ -309,4 +388,9 @@ KTEST(WkiIpcExportLifetime, PipeGrowthWaitsForWrite) { KEXPECT_EQ(ker::net::wki:
 
 KTEST(WkiIpcExportLifetime, RdmaWriteSurvivesDetachment) {
     KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_rdma_write_survives_detachment(), 0);
+}
+
+KTEST(WkiIpcStreamRead, WrappedRingAndPendingDataPrecedeEof) { KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_stream_read_contract(), 0); }
+KTEST(WkiIpcStreamRead, WaiterCapacityPreservesExistingReaders) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_stream_reader_waiters_are_bounded(), 0);
 }

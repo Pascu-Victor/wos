@@ -293,7 +293,7 @@ def test_new_session_replays_current_lsa_after_key_install() -> None:
         rx,
         [
             "AUTH_RESULT == WkiAuthFrameResult::PENDING_CONFIRMATION",
-            "wki_auth_confirm_peer_session(peer)",
+            "wki_auth_confirm_peer_session(peer, verified_trailer)",
             "detail::handle_hello(transport, hdr, payload, PAYLOAD_LEN, true)",
             "wki_lsa_replay_to_peer(peer->node_id)",
             "wki_resource_advertise_to_peer(peer->node_id)",

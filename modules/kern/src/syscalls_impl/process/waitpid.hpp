@@ -32,4 +32,8 @@ static_assert(sizeof(KernRusage) == 144);
 
 auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t rusage_vaddr, ker::mod::cpu::GPRegs& gpr) -> uint64_t;
 
+#ifdef WOS_SELFTEST
+auto selftest_remote_wait_commit_interruption() -> bool;
+#endif
+
 }  // namespace ker::syscall::process

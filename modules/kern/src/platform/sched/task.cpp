@@ -10,6 +10,7 @@
 #include <cstring>
 #include <deque>
 #include <iterator>
+#include <memory>
 #include <net/wki/remote_compute.hpp>
 #include <new>
 #include <platform/loader/debug_info.hpp>
@@ -25,10 +26,12 @@
 #include <platform/sched/resource.hpp>
 #include <platform/sched/resource_as.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <platform/security/file_policy.hpp>
 #include <platform/sys/context_switch.hpp>
 #include <platform/sys/mutex.hpp>
 #include <syscalls_impl/vmem/sys_vmem.hpp>
 #include <utility>
+#include <vfs/content_match.hpp>
 #include <vfs/file.hpp>
 #include <vfs/stat.hpp>
 #include <vfs/vfs.hpp>
@@ -62,9 +65,8 @@ std::atomic<bool> g_task_selftest_force_fd_clone_insert_failure{false};
 #endif
 
 auto boot_file_stat_has_freshness(const ker::vfs::Stat& st) -> bool {
-    // Some remote VFS stat paths do not provide a rich freshness tuple on
-    // every mount/backend combination. Allow caching as long as size is known;
-    // the full observed stat tuple still participates in equality checks.
+    // Size selects a candidate only. The admitted File must validate every
+    // candidate byte and exact EOF before the interpreter can reuse it.
     return st.st_size > 0;
 }
 
@@ -270,7 +272,7 @@ auto clone_user_thread_fds_checked(Task* parent, Task* child) -> bool {
 }
 #endif
 
-auto read_boot_file_fully(const char* path, uint8_t** out_buf, size_t* out_size) -> bool {
+auto read_boot_file_fully(Task& image_task, const char* path, uint8_t** out_buf, size_t* out_size, int* interpreter_error) -> bool {
     if (path == nullptr || out_buf == nullptr || out_size == nullptr) {
         return false;
     }
@@ -289,31 +291,20 @@ auto read_boot_file_fully(const char* path, uint8_t** out_buf, size_t* out_size)
     std::array<char, 512> cache_key = {};
     build_boot_file_cache_key(submitter, path, cache_key.data(), cache_key.size());
 
-    // Probe freshness before opening the file. Remote VFS open can eagerly
-    // prefetch the complete object, so opening before consulting this cache
-    // defeats it even when immutable ld.so bytes are already resident.
-    ker::vfs::Stat preopen_freshness = {};
-    bool const HAVE_PREOPEN_FRESHNESS =
-        ALLOW_BOOT_FILE_CACHE && ker::vfs::vfs_stat(path, &preopen_freshness) == 0 && boot_file_stat_has_freshness(preopen_freshness);
-    if (HAVE_PREOPEN_FRESHNESS) {
-        size_t cached_size = 0;
-        if (boot_file_cache_lookup_copy(cache_key.data(), preopen_freshness, out_buf, &cached_size)) {
-            *out_size = cached_size;
-            if constexpr (TRACE_INTERP) {
-                dbg::log("read_boot_file_fully: preopen cache hit key='%s' task=%s pid=0x%lx size=%zu", cache_key.data(), task_name,
-                         static_cast<unsigned long>(current_task != nullptr ? current_task->pid : 0), cached_size);
-            }
-            return true;
-        }
-    }
-
+    // A cache hit supplies bytes, not authority. Open the interpreter first
+    // so traversal and read admission apply even when another caller warmed
+    // this path. Probe the retained object's freshness below, after admission.
     // Keep the kernel-side loader open local for ordinary exec paths, but
     // still honor the submitter's temporary VFS identity during remote task
     // construction so cross-node launches continue to resolve against the
     // submitter when required.
     int const OPEN_FLAGS = boot_file_open_flags(path, HAS_REMOTE_SUBMITTER_IDENTITY);
-    auto* file = ker::vfs::vfs_open_file(path, OPEN_FLAGS, 0);
-    if (file == nullptr || file->fops == nullptr || file->fops->vfs_read == nullptr || file->fops->vfs_lseek == nullptr) {
+    auto const CREDENTIALS = image_task.credentials();
+    auto& path_context = current_task != nullptr ? *current_task : image_task;
+    ker::vfs::File* file = nullptr;
+    int const OPEN_RESULT = ker::vfs::vfs_open_read_file_as(path_context, CREDENTIALS, path, (OPEN_FLAGS & ker::vfs::O_LOCAL) == 0, &file);
+    if (OPEN_RESULT != 0 || file == nullptr || file->fops == nullptr || file->fops->vfs_read == nullptr ||
+        file->fops->vfs_lseek == nullptr) {
         if constexpr (TRACE_INTERP) {
             ker::vfs::Stat statbuf = {};
             int const STAT_RET = ker::vfs::vfs_stat(path, &statbuf);
@@ -338,19 +329,46 @@ auto read_boot_file_fully(const char* path, uint8_t** out_buf, size_t* out_size)
                  task_name, PID, task_root, task_cwd, submitter, vfs_path, static_cast<int>(file->fs_type));
     }
 
+    if (ker::vfs::vfs_stabilize_exec_file(&file) != 0) {
+        release_boot_file(file);
+        return false;
+    }
+
     ker::vfs::Stat freshness = {};
-    bool const HAVE_FRESHNESS =
-        ALLOW_BOOT_FILE_CACHE && ker::vfs::vfs_fstat_file(file, &freshness) == 0 && boot_file_stat_has_freshness(freshness);
+    if (ker::vfs::vfs_fstat_file(file, &freshness) != 0) {
+        release_boot_file(file);
+        return false;
+    }
+    // PT_INTERP supplies executable code. A cached byte copy grants neither
+    // read nor execute authority; both use the original admitted identity.
+    int const ACCESS_RESULT = security::authorize_file_access(
+        CREDENTIALS, {freshness.st_uid, freshness.st_gid, static_cast<uint32_t>(freshness.st_mode & 07777)}, 1);
+    if (ACCESS_RESULT != 0) {
+        if (interpreter_error != nullptr) *interpreter_error = ACCESS_RESULT;
+        release_boot_file(file);
+        return false;
+    }
+    bool const HAVE_FRESHNESS = ALLOW_BOOT_FILE_CACHE && boot_file_stat_has_freshness(freshness);
     if (HAVE_FRESHNESS) {
         size_t cached_size = 0;
-        if (boot_file_cache_lookup_copy(cache_key.data(), freshness, out_buf, &cached_size)) {
-            *out_size = cached_size;
-            release_boot_file(file);
-            if constexpr (TRACE_INTERP) {
-                dbg::log("read_boot_file_fully: cache hit key='%s' task=%s pid=0x%lx size=%zu", cache_key.data(), task_name,
-                         static_cast<unsigned long>(current_task != nullptr ? current_task->pid : 0), cached_size);
+        uint8_t* cached = nullptr;
+        if (boot_file_cache_lookup_copy(cache_key.data(), freshness, &cached, &cached_size)) {
+            constexpr size_t SCRATCH_SIZE = 64 * 1024;
+            std::unique_ptr<uint8_t[]> scratch(new (std::nothrow) uint8_t[SCRATCH_SIZE]);
+            bool const MATCH =
+                scratch && ker::vfs::content_matches(
+                               std::span<const uint8_t>(cached, cached_size), std::span<uint8_t>(scratch.get(), SCRATCH_SIZE),
+                               [file](uint8_t* bytes, size_t count, size_t offset) {
+                                   return ker::vfs::vfs_pread_file(file, bytes, count, static_cast<off_t>(offset));
+                               },
+                               [] { return true; });
+            if (MATCH) {
+                *out_buf = cached;
+                *out_size = cached_size;
+                release_boot_file(file);
+                return true;
             }
-            return true;
+            delete[] cached;
         }
         if constexpr (TRACE_INTERP) {
             dbg::log("read_boot_file_fully: cache miss key='%s' task=%s pid=0x%lx stat_size=%ld", cache_key.data(), task_name,
@@ -485,6 +503,8 @@ auto unpublished_process_is_exclusively_owned(Task* task) -> bool {
 }
 
 void teardown_unpublished_process_resources(Task* task) {
+    task->root_anchor = {};
+    task->cwd_anchor = {};
     loader::debug::unregister_process(task->pid);
     loader::debug::remove_gdb_debug_info(task->pid);
     release_lazy_vmem_ranges(*task);
@@ -590,7 +610,8 @@ auto destroy_owned_unpublished_process(Task* owner, Task* child) -> bool {
     return true;
 }
 
-auto complete_unpublished_process_construction(Task* task) -> bool {
+auto complete_unpublished_process_construction(Task* task, int* interpreter_error) -> bool {
+    if (interpreter_error != nullptr) *interpreter_error = 0;
     if (task == nullptr || task->type != TaskType::PROCESS || task->thread == nullptr || task->pagemap == nullptr) {
         return false;
     }
@@ -600,7 +621,7 @@ auto complete_unpublished_process_construction(Task* task) -> bool {
 
     uint8_t* interp_buf = nullptr;
     size_t interp_size = 0;
-    if (!read_boot_file_fully(task->pending_interp_path.data(), &interp_buf, &interp_size)) {
+    if (!read_boot_file_fully(*task, task->pending_interp_path.data(), &interp_buf, &interp_size, interpreter_error)) {
         dbg::log("Failed to open interpreter '%s' for task %s", task->pending_interp_path.data(), task->name);
         return false;
     }
@@ -780,6 +801,198 @@ auto task_selftest_published_process_refuses_unpublished_teardown() -> bool {
 
 #endif
 
+auto Task::wki_execution_identity() const -> WkiExecutionIdentity {
+    uint64_t const FLAGS = path_metadata_lock.lock_irqsave();
+    WkiExecutionIdentity identity{.submitter_hostname = wki_submitter_hostname,
+                                  .remote_pid = wki_remote_pid,
+                                  .proxy_task_id = wki_proxy_task_id,
+                                  .signal_task_id = m_accepted_signal_task_id};
+    path_metadata_lock.unlock_irqrestore(FLAGS);
+    identity.submitter_hostname.back() = '\0';
+    return identity;
+}
+
+void Task::set_wki_remote_pid(uint64_t remote_pid) {
+    uint64_t const FLAGS = path_metadata_lock.lock_irqsave();
+    wki_remote_pid = remote_pid;
+    path_metadata_lock.unlock_irqrestore(FLAGS);
+}
+
+void Task::set_wki_proxy_task_id(uint32_t proxy_task_id) {
+    uint64_t const FLAGS = path_metadata_lock.lock_irqsave();
+    wki_proxy_task_id = proxy_task_id;
+    path_metadata_lock.unlock_irqrestore(FLAGS);
+}
+
+auto Task::capture_filesystem_context(FilesystemContext& output) const -> bool {
+    auto const* owner = filesystem_owner();
+    if (owner == nullptr) return false;
+    FilesystemContext candidate;
+    uint64_t const FLAGS = owner->path_metadata_lock.lock_irqsave();
+    candidate.root_anchor = owner->root_anchor;
+    candidate.root = owner->root;
+    candidate.root_len = owner->root_len;
+    candidate.cwd = owner->cwd;
+    candidate.cwd_len = owner->cwd_len;
+    candidate.cwd_anchor = owner->cwd_anchor;
+    owner->path_metadata_lock.unlock_irqrestore(FLAGS);
+    output = std::move(candidate);
+    return true;
+}
+
+void Task::publish_accepted_signal_route(uint32_t task_id, uint64_t remote_pid) {
+    uint64_t const FLAGS = path_metadata_lock.lock_irqsave();
+    if (task_id != 0 && (m_accepted_signal_task_id == 0 || m_accepted_signal_task_id == task_id)) {
+        m_accepted_signal_task_id = task_id;
+        wki_remote_pid = remote_pid;
+    }
+    path_metadata_lock.unlock_irqrestore(FLAGS);
+}
+
+namespace {
+auto allocate_signal_home_serial(std::atomic<uint64_t>& counter) -> uint64_t {
+    uint64_t next = counter.load(std::memory_order_relaxed);
+    while (next != UINT64_MAX) {
+        if (counter.compare_exchange_weak(next, next + 1, std::memory_order_relaxed)) return next;
+    }
+    return 0;
+}
+}  // namespace
+
+auto Task::signal_home_identity(bool initialize) const -> SignalHomeIdentity {
+    auto* owner = credential_owner();
+    if (owner == nullptr) return {};
+    if (owner != this) return owner->signal_home_identity(initialize);
+    static std::atomic<uint64_t> next_serial{1};
+    uint64_t const FLAGS = path_metadata_lock.lock_irqsave();
+    if (initialize && m_signal_home_serial == 0 && m_signal_home_anchor) {
+        m_signal_home_serial = allocate_signal_home_serial(next_serial);
+    }
+    SignalHomeIdentity const RESULT{.origin = m_signal_home_origin, .serial = m_signal_home_serial};
+    path_metadata_lock.unlock_irqrestore(FLAGS);
+    return RESULT;
+}
+
+auto Task::is_signal_home_anchor() const -> bool {
+    if (is_thread) return false;
+    uint64_t const FLAGS = path_metadata_lock.lock_irqsave();
+    bool const RESULT = m_signal_home_anchor;
+    path_metadata_lock.unlock_irqrestore(FLAGS);
+    return RESULT;
+}
+
+auto Task::signal_receiver_serial() const -> uint64_t {
+    auto* owner = credential_owner();
+    if (owner == nullptr) return 0;
+    if (owner != this) return owner->signal_receiver_serial();
+    static std::atomic<uint64_t> next_serial{1};
+    uint64_t const FLAGS = path_metadata_lock.lock_irqsave();
+    if (m_signal_receiver_serial == 0) m_signal_receiver_serial = allocate_signal_home_serial(next_serial);
+    uint64_t const SERIAL = m_signal_receiver_serial;
+    path_metadata_lock.unlock_irqrestore(FLAGS);
+    return SERIAL;
+}
+
+auto Task::adopt_signal_home(SignalHomeIdentity identity) -> bool {
+    if (is_thread || scheduler_published.load(std::memory_order_acquire) || identity.serial == 0 || identity.origin.node == 0 ||
+        identity.origin.boot == 0 || identity.origin.node == UINT16_MAX)
+        return false;
+    uint64_t const FLAGS = path_metadata_lock.lock_irqsave();
+    bool const ALLOWED = m_signal_home_anchor && m_signal_home_serial == 0;
+    if (ALLOWED) {
+        m_signal_home_serial = identity.serial;
+        m_signal_home_origin = identity.origin;
+        m_signal_home_anchor = false;
+    }
+    path_metadata_lock.unlock_irqrestore(FLAGS);
+    return ALLOWED;
+}
+
+void Task::hide_group_signals_until_publication() {
+    uint64_t const FLAGS = path_metadata_lock.lock_irqsave();
+    m_group_signal_visible = false;
+    path_metadata_lock.unlock_irqrestore(FLAGS);
+}
+void Task::publish_group_signal_visibility() {
+    uint64_t const FLAGS = path_metadata_lock.lock_irqsave();
+    m_group_signal_visible = true;
+    path_metadata_lock.unlock_irqrestore(FLAGS);
+}
+auto Task::group_signal_visible() const -> bool {
+    uint64_t const FLAGS = path_metadata_lock.lock_irqsave();
+    bool const VISIBLE = m_group_signal_visible;
+    path_metadata_lock.unlock_irqrestore(FLAGS);
+    return VISIBLE;
+}
+auto Task::generate_group_signal(uint64_t mask) -> bool {
+    signal_generate_pending_mask(mask);
+    uint64_t const FLAGS = path_metadata_lock.lock_irqsave();
+    bool const VISIBLE = m_group_signal_visible;
+    path_metadata_lock.unlock_irqrestore(FLAGS);
+    return VISIBLE;
+}
+
+#ifdef WOS_SELFTEST
+auto task_selftest_signal_home_and_visibility() -> bool {
+    std::atomic<uint64_t> counter{UINT64_MAX - 1};
+    bool ok =
+        allocate_signal_home_serial(counter) == UINT64_MAX - 1 && allocate_signal_home_serial(counter) == 0 && counter.load() == UINT64_MAX;
+    Task first{}, reused{}, receiver{}, local_child{};
+    first.pid = reused.pid = 77;
+    ok &= first.signal_home_identity(false).serial == 0;
+    auto const FIRST = first.signal_home_identity();
+    auto const REUSED = reused.signal_home_identity();
+    ok &= FIRST.serial != 0 && REUSED.serial != 0 && FIRST.serial != REUSED.serial && first.signal_home_identity().serial == FIRST.serial;
+    ok &= first.is_signal_home_anchor() && !first.adopt_signal_home({.origin = {.node = 7, .boot = 8}, .serial = 44});
+    ok &= !receiver.adopt_signal_home({}) && receiver.adopt_signal_home({.origin = {.node = 7, .boot = 8}, .serial = FIRST.serial});
+    ok &= !receiver.is_signal_home_anchor() && receiver.signal_home_identity().serial == FIRST.serial &&
+          !receiver.adopt_signal_home({.origin = {.node = 9, .boot = 10}, .serial = REUSED.serial});
+    ok &= local_child.is_signal_home_anchor() && local_child.signal_home_identity().serial != FIRST.serial;
+    auto const FIRST_RECEIVER = first.signal_receiver_serial();
+    auto const IMPORTED_RECEIVER = receiver.signal_receiver_serial();
+    ok &= FIRST_RECEIVER != 0 && IMPORTED_RECEIVER != 0 && FIRST_RECEIVER != IMPORTED_RECEIVER &&
+          first.signal_receiver_serial() == FIRST_RECEIVER && reused.signal_receiver_serial() != FIRST_RECEIVER;
+    {
+        Task thread{};
+        thread.is_thread = true;
+        ok &= thread.signal_home_identity().serial == 0;
+        ok &= thread.resource_owner.attach(&receiver);
+        ok &= thread.signal_home_identity().serial == FIRST.serial && !thread.is_signal_home_anchor();
+        ok &= thread.signal_receiver_serial() == IMPORTED_RECEIVER;
+    }
+    constexpr uint64_t SIGNAL = uint64_t{1} << 11;
+    receiver.hide_group_signals_until_publication();
+    ok &= !receiver.generate_group_signal(SIGNAL) && receiver.signal_pending_bits() == SIGNAL;
+    receiver.publish_group_signal_visibility();
+    ok &= receiver.group_signal_visible() && receiver.generate_group_signal(SIGNAL) && receiver.signal_pending_bits() == SIGNAL;
+    return ok && first.ref_count.load() == 1 && receiver.ref_count.load() == 1;
+}
+#endif
+
+auto Task::signal_admission_identity() const -> SignalAdmissionIdentity {
+    uint64_t const FLAGS = path_metadata_lock.lock_irqsave();
+    SignalAdmissionIdentity identity{
+        .credentials = credentials(), .job = job_identity(), .remote = m_accepted_signal_task_id != 0 || wki_proxy_task_id != 0};
+    path_metadata_lock.unlock_irqrestore(FLAGS);
+    return identity;
+}
+
+auto Task::begin_local_signal_admission() -> SignalAdmissionIdentity {
+    uint64_t const FLAGS = path_metadata_lock.lock_irqsave();
+    SignalAdmissionIdentity identity{
+        .credentials = credentials(), .job = job_identity(), .remote = m_accepted_signal_task_id != 0 || wki_proxy_task_id != 0};
+    if (!identity.remote && m_local_signal_admissions.load(std::memory_order_relaxed) != UINT32_MAX) {
+        m_local_signal_admissions.fetch_add(1, std::memory_order_relaxed);
+        identity.local_lease = true;
+    }
+    path_metadata_lock.unlock_irqrestore(FLAGS);
+    return identity;
+}
+
+void Task::end_local_signal_admission() { m_local_signal_admissions.fetch_sub(1, std::memory_order_release); }
+
+auto Task::local_signal_admissions_drained() const -> bool { return m_local_signal_admissions.load(std::memory_order_acquire) == 0; }
+
 auto Task::try_acquire_usercopy_pagemap(mm::paging::PageTable*& out) -> bool {
     out = nullptr;
     if (state.load(std::memory_order_acquire) != TaskState::ACTIVE || usercopy_pagemap_closing.load(std::memory_order_acquire)) {
@@ -828,6 +1041,34 @@ auto Task::replace_pagemap_after_usercopy_quiescence(mm::paging::PageTable* repl
     pagemap = replacement;
     usercopy_pagemap_closing.store(false, std::memory_order_release);
     return replaced;
+}
+
+void Task::signal_generate_pending_mask(uint64_t mask) {
+    if (job_control::generate(*this, mask)) return;
+    signal_generate_pending_mask_local(mask);
+}
+
+void Task::signal_generate_pending_mask_local(uint64_t mask, bool enqueue) {
+    constexpr uint64_t CONT_MASK = uint64_t{1} << (18 - 1);
+    constexpr uint64_t STOP_MASK =
+        (uint64_t{1} << (19 - 1)) | (uint64_t{1} << (20 - 1)) | (uint64_t{1} << (21 - 1)) | (uint64_t{1} << (22 - 1));
+    uint64_t const DISCARD = ((mask & CONT_MASK) != 0 ? STOP_MASK : 0) | ((mask & STOP_MASK) != 0 ? CONT_MASK : 0);
+    if (DISCARD == 0) {
+        if (enqueue) signal_add_pending_mask(mask);
+        return;
+    }
+    uint64_t pending = sig_pending.load(std::memory_order_relaxed);
+    while (!sig_pending.compare_exchange_weak(pending, (pending & ~DISCARD) | (enqueue ? mask : 0), std::memory_order_acq_rel,
+                                              std::memory_order_relaxed)) {
+    }
+}
+
+void Task::signal_restore_job_control_pending(uint64_t bits) {
+    constexpr uint64_t JOB_MASK = ((uint64_t{1} << 22) - 1) & ~((uint64_t{1} << 17) - 1);
+    uint64_t pending = sig_pending.load(std::memory_order_relaxed);
+    while (!sig_pending.compare_exchange_weak(pending, (pending & ~JOB_MASK) | (bits & JOB_MASK), std::memory_order_acq_rel,
+                                              std::memory_order_relaxed)) {
+    }
 }
 
 Task::Task(const char* name, uint64_t elf_start, size_t elf_size, uint64_t kernel_rsp, TaskType type) {
@@ -897,9 +1138,6 @@ Task::Task(const char* name, uint64_t elf_start, size_t elf_size, uint64_t kerne
     this->sigsuspend_active = false;
     this->in_signal_handler = false;
     this->do_sigreturn = false;
-    for (auto& sig_handler : this->sig_handlers) {
-        sig_handler = {.handler = 0, .flags = 0, .restorer = 0, .mask = 0};  // SIG_DFL for all
-    }
 
     // fd_table is initialized by RadixTree default constructor (empty)
 
@@ -974,10 +1212,7 @@ Task::Task(const char* name, uint64_t elf_start, size_t elf_size, uint64_t kerne
     this->context.syscall_kernel_stack = kernel_rsp;
 
     this->pid = sched::task::get_next_pid();
-    // POSIX: default process group = own pid (processes start in their own group)
-    if (this->pgid == 0) {
-        this->pgid = this->pid;
-    }
+    // Uninitialized job identity resolves SID/PGID to this new PID.
 
     // CRITICAL: Copy kernel mappings FIRST so we can access kernel memory (like elfBuffer)
     // The elfStart pointer points to kernel heap memory allocated by the parent process
@@ -1287,30 +1522,23 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     // table empty; VFS fd helpers resolve user threads through owner_pid.
     // Copy fixed per-process storage inherited by userspace threads.
     t->fd_cloexec = parent->fd_cloexec;
-    t->cwd = parent->cwd;
-    t->cwd_len = parent->cwd_len;
-    t->root = parent->root;
-    t->root_len = parent->root_len;
-    t->exe_path = parent->exe_path;
-    t->uid = parent->uid;
-    t->gid = parent->gid;
-    t->euid = parent->euid;
-    t->egid = parent->egid;
-    t->suid = parent->suid;
-    t->sgid = parent->sgid;
-    t->umask = parent->umask;
-    t->personality = parent->personality;
-    if (!t->supplementary_groups.clone_from(parent->supplementary_groups)) {
-        cleanup_constructed_thread_task();
-        return nullptr;
+    {
+        auto* filesystem_parent = parent->filesystem_owner();
+        uint64_t const PATH_IRQF = filesystem_parent->path_metadata_lock.lock_irqsave();
+        t->cwd = filesystem_parent->cwd;
+        t->cwd_len = filesystem_parent->cwd_len;
+        t->root = filesystem_parent->root;
+        t->root_len = filesystem_parent->root_len;
+        filesystem_parent->path_metadata_lock.unlock_irqrestore(PATH_IRQF);
     }
-    t->session_id = parent->session_id;
-    t->pgid = parent->pgid;
-    t->controlling_tty = parent->controlling_tty;
+    t->exe_path = parent->exe_path;
+    t->personality = parent->personality;
+    t->initialize_job_identity(parent->job_identity());
     t->wki_target_hostname = parent->wki_target_hostname;
     t->wki_target_flags = parent->wki_target_flags;
-    t->wki_submitter_hostname = parent->wki_submitter_hostname;
-    t->wki_remote_pid = parent->wki_remote_pid;
+    auto const PARENT_WKI = parent->wki_execution_identity();
+    t->wki_submitter_hostname = PARENT_WKI.submitter_hostname;
+    t->wki_remote_pid = PARENT_WKI.remote_pid;
     if (!t->wki_vfs_rules.clone_from(parent->wki_vfs_rules)) {
         cleanup_constructed_thread_task();
         return nullptr;
@@ -1348,14 +1576,13 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     t->sched_queue = sched_queue::NONE;
     t->sched_next = nullptr;
 
-    // Signals: inherit mask and handlers from parent (POSIX  2.4)
+    // Signals: inherit the private mask; dispositions resolve the retained process owner.
     t->signal_pending_store(0, std::memory_order_relaxed);
     t->signal_mask_store(parent->signal_mask_bits(), std::memory_order_relaxed);
     t->sigsuspend_saved_mask = 0;
     t->sigsuspend_active = false;
     t->in_signal_handler = false;
     t->do_sigreturn = false;
-    t->sig_handlers = parent->sig_handlers;
 
     // Time accounting
     t->start_time_us = 0;

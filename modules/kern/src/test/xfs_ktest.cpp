@@ -27,6 +27,7 @@
 #include <vfs/fs/xfs/xfs_inode.hpp>
 #include <vfs/fs/xfs/xfs_log.hpp>
 #include <vfs/fs/xfs/xfs_mount.hpp>
+#include <vfs/fs/xfs/xfs_symlink.hpp>
 #include <vfs/fs/xfs/xfs_trans.hpp>
 #include <vfs/fs/xfs/xfs_vfs.hpp>
 #include <vfs/vfs.hpp>
@@ -340,10 +341,10 @@ void cleanup_dual_mount_paths(ker::vfs::xfs::XfsMountContext* mount) {
     if (mount == nullptr) {
         return;
     }
-    static_cast<void>(ker::vfs::xfs::xfs_unlink_path(DUAL_AFTER_UNMOUNT_PATH, mount));
-    static_cast<void>(ker::vfs::xfs::xfs_unlink_path(DUAL_LINK_PATH, mount));
-    static_cast<void>(ker::vfs::xfs::xfs_unlink_path(DUAL_SOURCE_PATH, mount));
-    static_cast<void>(ker::vfs::xfs::xfs_unlink_path(DUAL_REPLACEMENT_PATH, mount));
+    static_cast<void>(ker::vfs::xfs::xfs_unlink_path(ker::mod::security::Snapshot::bootstrap_root(), DUAL_AFTER_UNMOUNT_PATH, mount));
+    static_cast<void>(ker::vfs::xfs::xfs_unlink_path(ker::mod::security::Snapshot::bootstrap_root(), DUAL_LINK_PATH, mount));
+    static_cast<void>(ker::vfs::xfs::xfs_unlink_path(ker::mod::security::Snapshot::bootstrap_root(), DUAL_SOURCE_PATH, mount));
+    static_cast<void>(ker::vfs::xfs::xfs_unlink_path(ker::mod::security::Snapshot::bootstrap_root(), DUAL_REPLACEMENT_PATH, mount));
 }
 
 auto close_xfs_test_file(ker::vfs::File*& file) -> int {
@@ -355,15 +356,114 @@ auto close_xfs_test_file(ker::vfs::File*& file) -> int {
     return RC;
 }
 
+auto exercise_reparent_width_rollback(ker::vfs::xfs::XfsMountContext* mount, const char* path) -> bool {
+    namespace xfs = ker::vfs::xfs;
+    xfs::XfsLookupHandle lookup;
+    if (xfs::xfs_acquire_lookup(ker::mod::security::Snapshot::bootstrap_root(), path, mount, &lookup) != 0 || lookup.target() == nullptr)
+        return false;
+    ker::mod::sys::MutexGuard guard(mount->metadata_lock);
+    auto* inode = lookup.target();
+    auto const FORMAT = inode->data_fork.format;
+    auto const BLOCKS = inode->nblocks;
+    auto const GENERATION = inode->dir_generation;
+    xfs::XfsDirEntry parent{};
+    if (xfs::xfs_dir_lookup_authoritative(inode, "..", 2, &parent) != 0) return false;
+    auto const OLD_PARENT = parent.ino;
+    auto* tp = xfs::xfs_trans_alloc(mount);
+    if (tp == nullptr) return false;
+    constexpr xfs::xfs_ino_t WIDE_PARENT = 0x100000007ULL;
+    bool ok = xfs::xfs_dir_reparent(inode, OLD_PARENT, WIDE_PARENT, tp) == 0 &&
+              xfs::xfs_dir_lookup_authoritative(inode, "..", 2, &parent) == 0 && parent.ino == WIDE_PARENT &&
+              inode->data_fork.format != xfs::XFS_DINODE_FMT_LOCAL;
+    xfs::xfs_trans_cancel(tp);
+    ok = inode->data_fork.format == FORMAT && inode->nblocks == BLOCKS && inode->dir_generation == GENERATION &&
+         xfs::xfs_dir_lookup(inode, "..", 2, &parent) == 0 && parent.ino == OLD_PARENT && ok;
+    return ok;
+}
+
+auto exercise_directory_path_recovery(ker::vfs::xfs::XfsMountContext* mount) -> bool {
+    namespace xfs = ker::vfs::xfs;
+    auto const ROOT = ker::mod::security::Snapshot::bootstrap_root();
+    constexpr const char* BASE = "goal19-dirpath";
+    constexpr const char* CHILD = "goal19-dirpath/child";
+    constexpr const char* MOVED = "goal19-dirpath-moved";
+    constexpr const char* MOVED_CHILD = "goal19-dirpath-moved/child";
+    bool ok = xfs::xfs_mkdir_path(ROOT, BASE, 0755, mount) == 0 && xfs::xfs_mkdir_path(ROOT, CHILD, 0755, mount) == 0;
+    int result = 0;
+    auto* directory = ok ? xfs::xfs_open_path(ROOT, CHILD, ker::vfs::O_DIRECTORY, 0, mount, &result) : nullptr;
+    ok = ok && directory != nullptr && result == 0;
+    std::array<char, 128> path{};
+    std::array<char, 2> sentinel{'o', 'k'};
+    if (ok) {
+        auto caller = ROOT;
+        ok = caller.prepare({.change = ker::mod::security::Change::SET_UID, .real = 1000}, caller) == 0 && ok;
+        constexpr const char* ENTRY = "goal19-dirpath/child/entry";
+        auto* entry = xfs::xfs_open_path(ROOT, ENTRY, ker::vfs::O_CREAT | ker::vfs::O_EXCL | 2, 0644, mount, &result);
+        ok = entry != nullptr && result == 0 && ok;
+        if (entry != nullptr) ok = close_xfs_test_file(entry) == 0 && ok;
+        ok = xfs::xfs_chmod_path(BASE, ROOT, 0700, mount) == 0 && ok;
+        xfs::XfsLookupHandle denied, anchored;
+        auto const SEQUENCE = mount->mutation_sequence.load(std::memory_order_acquire);
+        ok = xfs::xfs_acquire_lookup(caller, ENTRY, mount, &denied) == -EACCES && denied.parent() == nullptr && ok;
+        ok = xfs::xfs_acquire_lookup(caller, "goal19-dirpath/child/missing", mount, &denied) == -EACCES && ok;
+        ok = xfs::xfs_acquire_lookup(caller, "goal19-dirpath/../missing", mount, &denied) == -EACCES && ok;
+        ok = mount->mutation_sequence.load(std::memory_order_acquire) == SEQUENCE && ok;
+        ok = xfs::xfs_acquire_lookup_at_file(caller, directory, "entry", &anchored) == 0 && anchored.target_existed() && ok;
+        anchored = {};
+        xfs::XfsLookupHandle self, child;
+        ok = xfs::xfs_acquire_lookup_at_file(caller, directory, "", &self) == 0 && self.root_target() &&
+             xfs::xfs_validate_lookup(self) == 0 && ok;
+        ok = xfs::xfs_acquire_lookup_at_inode(caller, mount, self.target(), "entry", &child) == 0 && child.target_existed() && ok;
+        child = {};
+        ok = xfs::xfs_acquire_lookup_at_inode(caller, mount, self.target(), "../child/entry", &child) == -EACCES && ok;
+        self = {};
+        ok = xfs::xfs_chmod_path(CHILD, ROOT, 0700, mount) == 0 && ok;
+        ok = xfs::xfs_acquire_lookup_at_file(caller, directory, "entry", &denied) == -EACCES && denied.parent() == nullptr && ok;
+        ok = xfs::xfs_chmod_path(CHILD, ROOT, 0000, mount) == 0 && ok;
+        ok = xfs::xfs_acquire_lookup(ROOT, ENTRY, mount, &anchored) == 0 && anchored.target_existed() && ok;
+        anchored = {};
+        ok = xfs::xfs_chmod_path(CHILD, ROOT, 0755, mount) == 0 && xfs::xfs_chmod_path(BASE, ROOT, 0755, mount) == 0 && ok;
+        ok = xfs::xfs_unlink_path(ROOT, ENTRY, mount) == 0 && ok;
+        ok = exercise_reparent_width_rollback(mount, CHILD) && ok;
+        ok = xfs::xfs_directory_path(directory, path.data(), path.size()) == 0 && std::strcmp(path.data(), "/goal19-dirpath/child") == 0 &&
+             xfs::xfs_directory_path(directory, sentinel.data(), sentinel.size()) == -ENAMETOOLONG &&
+             sentinel == std::array<char, 2>{'o', 'k'};
+        ok = xfs::xfs_rename_path(ROOT, BASE, MOVED, mount) == 0 && ok;
+        ok = xfs::xfs_mkdir_path(ROOT, BASE, 0755, mount) == 0 && ok;
+        ok = xfs::xfs_directory_path(directory, path.data(), path.size()) == 0 &&
+             std::strcmp(path.data(), "/goal19-dirpath-moved/child") == 0 && ok;
+        ker::vfs::Stat original_parent{}, new_parent{}, after{};
+        ok = xfs::xfs_stat(MOVED, &original_parent, mount) == 0 && xfs::xfs_stat(BASE, &new_parent, mount) == 0 && ok;
+        ok = xfs::xfs_rename_path(ROOT, MOVED_CHILD, CHILD, mount) == 0 && ok;
+        ok = xfs::xfs_directory_path(directory, path.data(), path.size()) == 0 && std::strcmp(path.data(), "/goal19-dirpath/child") == 0 &&
+             ok;
+        ok = xfs::xfs_stat(MOVED, &after, mount) == 0 && after.st_nlink + 1 == original_parent.st_nlink && ok;
+        ok = xfs::xfs_stat(BASE, &after, mount) == 0 && after.st_nlink == new_parent.st_nlink + 1 && ok;
+        ok = xfs::xfs_rename_path(ROOT, CHILD, MOVED_CHILD, mount) == 0 && ok;
+        ok = xfs::xfs_stat(MOVED, &after, mount) == 0 && after.st_nlink == original_parent.st_nlink && ok;
+        ok = xfs::xfs_stat(BASE, &after, mount) == 0 && after.st_nlink == new_parent.st_nlink && ok;
+        ok = xfs::xfs_rmdir_path(ROOT, MOVED_CHILD, mount) == 0 && ok;
+        ok = xfs::xfs_directory_path(directory, sentinel.data(), sentinel.size()) == -ENOENT && sentinel == std::array<char, 2>{'o', 'k'} &&
+             ok;
+    }
+    if (directory != nullptr) ok = close_xfs_test_file(directory) == 0 && ok;
+    static_cast<void>(xfs::xfs_rmdir_path(ROOT, CHILD, mount));
+    static_cast<void>(xfs::xfs_rmdir_path(ROOT, MOVED_CHILD, mount));
+    static_cast<void>(xfs::xfs_rmdir_path(ROOT, BASE, mount));
+    static_cast<void>(xfs::xfs_rmdir_path(ROOT, MOVED, mount));
+    return ok;
+}
+
 auto exercise_dual_mount_namespace(ker::vfs::xfs::XfsMountContext* mount, uint8_t marker) -> bool {
     if (mount == nullptr) {
         return false;
     }
     cleanup_dual_mount_paths(mount);
+    if (!exercise_directory_path_recovery(mount)) return false;
 
     int open_result = 0;
-    ker::vfs::File* source =
-        ker::vfs::xfs::xfs_open_path(DUAL_SOURCE_PATH, ker::vfs::O_CREAT | ker::vfs::O_EXCL | 1, 0644, mount, &open_result);
+    ker::vfs::File* source = ker::vfs::xfs::xfs_open_path(ker::mod::security::Snapshot::bootstrap_root(), DUAL_SOURCE_PATH,
+                                                          ker::vfs::O_CREAT | ker::vfs::O_EXCL | 1, 0644, mount, &open_result);
     if (source == nullptr || open_result != 0 || source->fops == nullptr || source->fops->vfs_write == nullptr ||
         source->fops->vfs_truncate == nullptr) {
         close_xfs_test_file(source);
@@ -372,22 +472,39 @@ auto exercise_dual_mount_namespace(ker::vfs::xfs::XfsMountContext* mount, uint8_
 
     std::array<uint8_t, 8192> payload{};
     payload.fill(marker);
-    bool ok = source->fops->vfs_write(source, payload.data(), payload.size(), 0) == static_cast<ssize_t>(payload.size());
+    auto const ROOT = ker::mod::security::Snapshot::bootstrap_root();
+    ker::vfs::xfs::XfsLookupHandle retained;
+    bool ok = ker::vfs::xfs::xfs_acquire_lookup(ROOT, DUAL_SOURCE_PATH, mount, &retained) == 0;
+    auto const DIRTY_SEQUENCE = mount->mutation_sequence.load(std::memory_order_acquire);
+    ok = source->fops->vfs_write(source, payload.data(), payload.size(), 0) == static_cast<ssize_t>(payload.size()) && ok;
+    ok = ker::vfs::xfs::xfs_validate_lookup(retained) == 0 && ok;
+    ok = source->fops->vfs_write(source, payload.data(), 1, 0) == 1 && ok;
+    ok = ker::vfs::xfs::xfs_validate_lookup(retained) == 0 && ok;
+    ok = mount->mutation_sequence.load(std::memory_order_acquire) != DIRTY_SEQUENCE && ok;
     ok = ok && ker::vfs::xfs::xfs_fsync(source) == 0;
     ok = ok && source->fops->vfs_truncate(source, 1024) == 0;
     ok = ok && ker::vfs::xfs::xfs_fsync(source) == 0;
     ok = close_xfs_test_file(source) == 0 && ok;
+    ok = ker::vfs::xfs::xfs_validate_lookup(retained) == 0 && ok;
+    ok = ker::vfs::xfs::xfs_chmod_path(DUAL_SOURCE_PATH, ROOT, 0600, mount) == 0 && ok;
+    ok = ker::vfs::xfs::xfs_validate_lookup(retained) == -EAGAIN && ok;
+    retained = {};
     if (!ok) {
         cleanup_dual_mount_paths(mount);
         return false;
     }
 
-    ok = ker::vfs::xfs::xfs_link_path(DUAL_SOURCE_PATH, DUAL_LINK_PATH, mount) == 0;
-    ker::vfs::File* replacement =
-        ker::vfs::xfs::xfs_open_path(DUAL_REPLACEMENT_PATH, ker::vfs::O_CREAT | ker::vfs::O_EXCL | 1, 0644, mount, &open_result);
+    ok = ker::vfs::xfs::xfs_acquire_lookup(ROOT, DUAL_SOURCE_PATH, mount, &retained) == 0;
+    ok = ker::vfs::xfs::xfs_link_path(ROOT, DUAL_SOURCE_PATH, DUAL_LINK_PATH, mount) == 0 && ok;
+    ok = ker::vfs::xfs::xfs_validate_lookup(retained) == -EAGAIN && ok;
+    retained = {};
+    ker::vfs::File* replacement = ker::vfs::xfs::xfs_open_path(ker::mod::security::Snapshot::bootstrap_root(), DUAL_REPLACEMENT_PATH,
+                                                               ker::vfs::O_CREAT | ker::vfs::O_EXCL | 1, 0644, mount, &open_result);
     ok = replacement != nullptr && open_result == 0 && ok;
     ok = close_xfs_test_file(replacement) == 0 && ok;
-    ok = ker::vfs::xfs::xfs_rename_path(DUAL_SOURCE_PATH, DUAL_REPLACEMENT_PATH, mount) == 0 && ok;
+    ok = ker::vfs::xfs::xfs_rename_path(ker::mod::security::Snapshot::bootstrap_root(), DUAL_SOURCE_PATH, DUAL_REPLACEMENT_PATH, mount) ==
+             0 &&
+         ok;
 
     ker::vfs::Stat replacement_stat{};
     ker::vfs::Stat link_stat{};
@@ -400,8 +517,8 @@ auto exercise_dual_mount_namespace(ker::vfs::xfs::XfsMountContext* mount, uint8_
 
 auto mutate_after_peer_unmount(ker::vfs::xfs::XfsMountContext* mount) -> bool {
     int open_result = 0;
-    ker::vfs::File* file =
-        ker::vfs::xfs::xfs_open_path(DUAL_AFTER_UNMOUNT_PATH, ker::vfs::O_CREAT | ker::vfs::O_EXCL | 1, 0644, mount, &open_result);
+    ker::vfs::File* file = ker::vfs::xfs::xfs_open_path(ker::mod::security::Snapshot::bootstrap_root(), DUAL_AFTER_UNMOUNT_PATH,
+                                                        ker::vfs::O_CREAT | ker::vfs::O_EXCL | 1, 0644, mount, &open_result);
     if (file == nullptr || open_result != 0 || file->fops == nullptr || file->fops->vfs_write == nullptr) {
         close_xfs_test_file(file);
         return false;
@@ -410,7 +527,7 @@ auto mutate_after_peer_unmount(ker::vfs::xfs::XfsMountContext* mount) -> bool {
     bool ok = file->fops->vfs_write(file, &VALUE, 1, 0) == 1;
     ok = ker::vfs::xfs::xfs_fsync(file) == 0 && ok;
     ok = close_xfs_test_file(file) == 0 && ok;
-    ok = ker::vfs::xfs::xfs_unlink_path(DUAL_AFTER_UNMOUNT_PATH, mount) == 0 && ok;
+    ok = ker::vfs::xfs::xfs_unlink_path(ker::mod::security::Snapshot::bootstrap_root(), DUAL_AFTER_UNMOUNT_PATH, mount) == 0 && ok;
     return ker::vfs::xfs::xfs_sync_mount(mount) == 0 && ok;
 }
 
@@ -505,7 +622,8 @@ auto xattr_read_matches(ker::vfs::xfs::XfsMountContext* mount, const char* path,
     if (size != 0 && value == nullptr) {
         return false;
     }
-    ssize_t const RESULT = ker::vfs::xfs::xfs_getxattr_path(path, name, value.get(), size, mount);
+    ssize_t const RESULT =
+        ker::vfs::xfs::xfs_getxattr_path(ker::mod::security::Snapshot::bootstrap_root(), path, name, value.get(), size, mount);
     return RESULT == static_cast<ssize_t>(size) && (size == 0 || std::memcmp(value.get(), expected, size) == 0);
 }
 
@@ -514,7 +632,8 @@ auto populate_xattr_growth(ker::vfs::xfs::XfsMountContext* mount) -> bool {
     for (size_t i = 0; i < XATTR_GROWTH_COUNT; ++i) {
         value.fill(static_cast<uint8_t>(i));
         auto const NAME = xattr_growth_name(i);
-        if (ker::vfs::xfs::xfs_setxattr_path(XATTR_MUTATION_PATH, NAME.data(), value.data(), value.size(), 0, mount) != 0) {
+        if (ker::vfs::xfs::xfs_setxattr_path(ker::mod::security::Snapshot::bootstrap_root(), XATTR_MUTATION_PATH, NAME.data(), value.data(),
+                                             value.size(), 0, mount) != 0) {
             return false;
         }
     }
@@ -546,12 +665,12 @@ auto disposable_xattr_growth_remote_shrink_and_teardown() -> bool {
     constexpr std::array<uint8_t, 3> WOS_FIXTURE_VALUE{'w', 'o', 's'};
     constexpr std::array<uint8_t, 4> SF_VALUE{0x53, 0x46, 0x31, 0x30};
     std::array<uint8_t, LINUX_VALUE.size()> linux_readback{};
-    ssize_t const LINUX_READ_RC =
-        ker::vfs::xfs::xfs_getxattr_path(XATTR_FIXTURE_PATH, "user.linux", linux_readback.data(), linux_readback.size(), mount);
-    int const WOS_SET_RC =
-        LINUX_READ_RC == static_cast<ssize_t>(LINUX_VALUE.size()) && linux_readback == LINUX_VALUE
-            ? ker::vfs::xfs::xfs_setxattr_path(XATTR_FIXTURE_PATH, "user.wos", WOS_FIXTURE_VALUE.data(), WOS_FIXTURE_VALUE.size(), 0, mount)
-            : -ECANCELED;
+    ssize_t const LINUX_READ_RC = ker::vfs::xfs::xfs_getxattr_path(ker::mod::security::Snapshot::bootstrap_root(), XATTR_FIXTURE_PATH,
+                                                                   "user.linux", linux_readback.data(), linux_readback.size(), mount);
+    int const WOS_SET_RC = LINUX_READ_RC == static_cast<ssize_t>(LINUX_VALUE.size()) && linux_readback == LINUX_VALUE
+                               ? ker::vfs::xfs::xfs_setxattr_path(ker::mod::security::Snapshot::bootstrap_root(), XATTR_FIXTURE_PATH,
+                                                                  "user.wos", WOS_FIXTURE_VALUE.data(), WOS_FIXTURE_VALUE.size(), 0, mount)
+                               : -ECANCELED;
     bool const LINUX_REREAD =
         WOS_SET_RC == 0 && xattr_read_matches(mount, XATTR_FIXTURE_PATH, "user.linux", LINUX_VALUE.data(), LINUX_VALUE.size());
     if (LINUX_READ_RC != static_cast<ssize_t>(LINUX_VALUE.size()) || linux_readback != LINUX_VALUE || WOS_SET_RC != 0 || !LINUX_REREAD) {
@@ -561,10 +680,10 @@ auto disposable_xattr_growth_remote_shrink_and_teardown() -> bool {
         return false;
     }
 
-    static_cast<void>(ker::vfs::xfs::xfs_unlink_path(XATTR_MUTATION_PATH, mount));
+    static_cast<void>(ker::vfs::xfs::xfs_unlink_path(ker::mod::security::Snapshot::bootstrap_root(), XATTR_MUTATION_PATH, mount));
     int open_result = 0;
-    ker::vfs::File* file =
-        ker::vfs::xfs::xfs_open_path(XATTR_MUTATION_PATH, ker::vfs::O_CREAT | ker::vfs::O_EXCL | 1, 0644, mount, &open_result);
+    ker::vfs::File* file = ker::vfs::xfs::xfs_open_path(ker::mod::security::Snapshot::bootstrap_root(), XATTR_MUTATION_PATH,
+                                                        ker::vfs::O_CREAT | ker::vfs::O_EXCL | 1, 0644, mount, &open_result);
     if (file == nullptr || open_result != 0) {
         ker::mod::dbg::log("[xfs ktest] mutation create failure: file=%p rc=%d", file, open_result);
         close_xfs_test_file(file);
@@ -573,7 +692,8 @@ auto disposable_xattr_growth_remote_shrink_and_teardown() -> bool {
     }
     int const CLOSE_RC = close_xfs_test_file(file);
     int const SF_SET_RC = CLOSE_RC == 0
-                              ? ker::vfs::xfs::xfs_setxattr_path(XATTR_MUTATION_PATH, "user.sf", SF_VALUE.data(), SF_VALUE.size(), 0, mount)
+                              ? ker::vfs::xfs::xfs_setxattr_path(ker::mod::security::Snapshot::bootstrap_root(), XATTR_MUTATION_PATH,
+                                                                 "user.sf", SF_VALUE.data(), SF_VALUE.size(), 0, mount)
                               : -ECANCELED;
     bool const POPULATED = SF_SET_RC == 0 && populate_xattr_growth(mount);
     if (CLOSE_RC != 0 || SF_SET_RC != 0 || !POPULATED) {
@@ -591,8 +711,8 @@ auto disposable_xattr_growth_remote_shrink_and_teardown() -> bool {
         remote_value[i] = static_cast<uint8_t>((i * 37U) ^ (i >> 8U));
     }
     ker::vfs::xfs::xfs_selftest_attr_fragment_mappings(true);
-    int const REMOTE_SET_RC =
-        ker::vfs::xfs::xfs_setxattr_path(XATTR_MUTATION_PATH, "user.remote64k", remote_value.get(), XATTR_REMOTE_VALUE_SIZE, 0, mount);
+    int const REMOTE_SET_RC = ker::vfs::xfs::xfs_setxattr_path(ker::mod::security::Snapshot::bootstrap_root(), XATTR_MUTATION_PATH,
+                                                               "user.remote64k", remote_value.get(), XATTR_REMOTE_VALUE_SIZE, 0, mount);
     if (REMOTE_SET_RC != 0) {
         ker::mod::dbg::log("[xfs ktest] remote value set failure: rc=%d", REMOTE_SET_RC);
         unmount();
@@ -618,7 +738,8 @@ auto disposable_xattr_growth_remote_shrink_and_teardown() -> bool {
     int const CANCEL_RC =
         ker::vfs::xfs::xfs_selftest_cancel_setxattr_path(XATTR_MUTATION_PATH, "user.k000", cancelled.data(), cancelled.size(), mount);
     bool const ROLLBACK_MATCHED = xattr_read_matches(mount, XATTR_MUTATION_PATH, "user.k000", original.data(), original.size());
-    int const REMOTE_REMOVE_RC = ker::vfs::xfs::xfs_removexattr_path(XATTR_MUTATION_PATH, "user.remote64k", mount);
+    int const REMOTE_REMOVE_RC =
+        ker::vfs::xfs::xfs_removexattr_path(ker::mod::security::Snapshot::bootstrap_root(), XATTR_MUTATION_PATH, "user.remote64k", mount);
     bool const REMOVE_FORMAT_QUERIED = ker::vfs::xfs::xfs_selftest_attr_fork_format(XATTR_MUTATION_PATH, mount, &format, &extent_count);
     if (CANCEL_RC != 0 || !ROLLBACK_MATCHED || REMOTE_REMOVE_RC != 0 || !REMOVE_FORMAT_QUERIED ||
         format != ker::vfs::xfs::XFS_DINODE_FMT_EXTENTS) {
@@ -629,7 +750,8 @@ auto disposable_xattr_growth_remote_shrink_and_teardown() -> bool {
     }
     for (size_t i = 0; i < XATTR_GROWTH_COUNT; ++i) {
         auto const NAME = xattr_growth_name(i);
-        int const REMOVE_RC = ker::vfs::xfs::xfs_removexattr_path(XATTR_MUTATION_PATH, NAME.data(), mount);
+        int const REMOVE_RC =
+            ker::vfs::xfs::xfs_removexattr_path(ker::mod::security::Snapshot::bootstrap_root(), XATTR_MUTATION_PATH, NAME.data(), mount);
         if (REMOVE_RC != 0) {
             ker::mod::dbg::log("[xfs ktest] growth remove failure: index=%lu rc=%d", static_cast<unsigned long>(i), REMOVE_RC);
             unmount();
@@ -660,13 +782,14 @@ auto disposable_xattr_growth_remote_shrink_and_teardown() -> bool {
         return false;
     }
     ker::vfs::xfs::xfs_selftest_attr_fragment_mappings(true);
-    bool const REGREW = ker::vfs::xfs::xfs_setxattr_path(XATTR_MUTATION_PATH, "user.remote64k", remote_value.get(), XATTR_REMOTE_VALUE_SIZE,
-                                                         0, mount) == 0 &&
+    bool const REGREW = ker::vfs::xfs::xfs_setxattr_path(ker::mod::security::Snapshot::bootstrap_root(), XATTR_MUTATION_PATH,
+                                                         "user.remote64k", remote_value.get(), XATTR_REMOTE_VALUE_SIZE, 0, mount) == 0 &&
                         ker::vfs::xfs::xfs_selftest_attr_fork_format(XATTR_MUTATION_PATH, mount, &format, &extent_count) &&
                         format == ker::vfs::xfs::XFS_DINODE_FMT_BTREE;
     ker::vfs::xfs::xfs_selftest_attr_fragment_mappings(false);
     bool const TORN_DOWN =
-        REGREW && ker::vfs::xfs::xfs_unlink_path(XATTR_MUTATION_PATH, mount) == 0 && ker::vfs::xfs::xfs_sync_mount(mount) == 0;
+        REGREW && ker::vfs::xfs::xfs_unlink_path(ker::mod::security::Snapshot::bootstrap_root(), XATTR_MUTATION_PATH, mount) == 0 &&
+        ker::vfs::xfs::xfs_sync_mount(mount) == 0;
     bool const SECOND_UNMOUNTED = unmount();
     int const READ_ONLY_MOUNT_RC = TORN_DOWN && SECOND_UNMOUNTED ? ker::vfs::xfs::xfs_mount(DEVICE, true, &mount) : -ECANCELED;
     if (!SECOND_UNMOUNTED || !TORN_DOWN || READ_ONLY_MOUNT_RC != 0 || mount == nullptr) {
@@ -676,9 +799,10 @@ auto disposable_xattr_growth_remote_shrink_and_teardown() -> bool {
         return false;
     }
     uint8_t const DENIED_VALUE = 0x7A;
-    bool const READ_ONLY_DENIED =
-        ker::vfs::xfs::xfs_setxattr_path(XATTR_FIXTURE_PATH, "user.denied", &DENIED_VALUE, 1, 0, mount) == -EROFS &&
-        ker::vfs::xfs::xfs_removexattr_path(XATTR_FIXTURE_PATH, "user.linux", mount) == -EROFS;
+    bool const READ_ONLY_DENIED = ker::vfs::xfs::xfs_setxattr_path(ker::mod::security::Snapshot::bootstrap_root(), XATTR_FIXTURE_PATH,
+                                                                   "user.denied", &DENIED_VALUE, 1, 0, mount) == -EROFS &&
+                                  ker::vfs::xfs::xfs_removexattr_path(ker::mod::security::Snapshot::bootstrap_root(), XATTR_FIXTURE_PATH,
+                                                                      "user.linux", mount) == -EROFS;
     bool const READ_ONLY_UNMOUNTED = unmount();
     if (!READ_ONLY_DENIED || !READ_ONLY_UNMOUNTED) {
         ker::mod::dbg::log("[xfs ktest] read-only failure: denied=%d unmount=%d", READ_ONLY_DENIED, READ_ONLY_UNMOUNTED);
@@ -692,6 +816,8 @@ auto disposable_xattr_growth_remote_shrink_and_teardown() -> bool {
 // Struct-level checks
 // ---------------------------------------------------------------------------
 
+KTEST(XFS, XattrAuthorizationUsesSuppliedSnapshot) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_xattr_snapshot_denials()); }
+
 KTEST(XFS, MagicConstant) {
     // 'XFSB' stored big-endian = 0x58 0x46 0x53 0x42 = 0x58465342
     KEXPECT_EQ(ker::vfs::xfs::XFS_SB_MAGIC, 0x58465342U);
@@ -704,6 +830,8 @@ KTEST(XFS, InodeStructSize) { KEXPECT_EQ(sizeof(ker::vfs::xfs::XfsDinode), stati
 KTEST(XFS, InodeCacheRetentionBoundsHashLoadAndReclaim) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_inode_cache_reclaim_hysteresis()); }
 
 KTEST(XFS, TransactionCancelRestoresLinkCount) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_transaction_cancel_restores_nlink()); }
+
+KTEST(XFS, TransactionCancelRestoresOwnership) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_transaction_cancel_restores_ownership()); }
 
 KTEST(XFS, TransactionCancelRestoresAttrFork) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_transaction_cancel_restores_attr_fork()); }
 
@@ -1454,6 +1582,7 @@ KTEST(XFS, TruncateZeroResetsStaleDataFork) {
 KTEST(XFS, SameSizeTruncateStampsMetadata) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_same_size_truncate_stamps_metadata()); }
 
 KTEST(XFS, ReadOnlyCloseSkipsPreallocTrim) {
+    KEXPECT_FALSE(ker::vfs::xfs::xfs_selftest_close_should_trim_prealloc(ker::vfs::FILE_ACCESS_SEARCH_ONLY));
     KEXPECT_FALSE(ker::vfs::xfs::xfs_selftest_close_should_trim_prealloc(0));
     KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_close_should_trim_prealloc(ker::vfs::O_CREAT));
     KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_close_should_trim_prealloc(ker::vfs::O_TRUNC));
@@ -1470,6 +1599,7 @@ KTEST(XFS, CleanFreshCreateCloseSkipsCommit) {
     KEXPECT_FALSE(ker::vfs::xfs::xfs_selftest_close_should_commit_inode(false, ker::vfs::O_CREAT | 1, true, true));
     KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_close_should_commit_inode(false, ker::vfs::O_CREAT | 1, false, true));
     KEXPECT_FALSE(ker::vfs::xfs::xfs_selftest_close_should_commit_inode(false, 0, false, false));
+    KEXPECT_FALSE(ker::vfs::xfs::xfs_selftest_close_should_commit_inode(false, ker::vfs::FILE_ACCESS_SEARCH_ONLY, false, false));
 }
 
 KTEST(XFS, CloseTrimDetectsActualEofPrealloc) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_inode_has_eof_prealloc()); }
@@ -1524,6 +1654,39 @@ KTEST(XFS, NamespaceMutationLookupRepairsStaleNegative) {
 
 KTEST(XFS, ReaddirCacheBatchesSequentialScan) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_readdir_cache_batches_sequential_scan()); }
 
+KTEST(XFS, ReadlinkCopiesExactCapacityWithoutTerminator) {
+    namespace xfs = ker::vfs::xfs;
+    std::array<uint8_t, 4> target{'f', 'i', 'l', 'e'};
+    xfs::XfsInode inode{};
+    inode.mode = ker::vfs::S_IFLNK | 0777;
+    inode.size = target.size();
+    inode.data_fork.format = xfs::XFS_DINODE_FMT_LOCAL;
+    inode.data_fork.local = {.data = target.data(), .size = target.size()};
+    std::array<char, 16> output{};
+    output.fill('Z');
+    auto const SENTINEL = output;
+    for (size_t size : {1UL, 2UL, 4UL, 16UL}) {
+        output = SENTINEL;
+        size_t const COPIED = size < target.size() ? size : target.size();
+        KEXPECT_EQ(xfs::xfs_readlink(&inode, output.data(), size), static_cast<int>(COPIED));
+        KEXPECT_TRUE(std::memcmp(output.data(), target.data(), COPIED) == 0);
+        for (size_t i = COPIED; i < output.size(); ++i) KEXPECT_EQ(output[i], 'Z');
+    }
+    output = SENTINEL;
+    KEXPECT_EQ(xfs::xfs_readlink(&inode, output.data(), 0), -EINVAL);
+    KEXPECT_TRUE(output == SENTINEL);
+    inode.mode = ker::vfs::S_IFREG;
+    KEXPECT_EQ(xfs::xfs_readlink(&inode, output.data(), output.size()), -EINVAL);
+    KEXPECT_TRUE(output == SENTINEL);
+    inode.mode = ker::vfs::S_IFLNK;
+    inode.data_fork.local.data = nullptr;
+    KEXPECT_EQ(xfs::xfs_readlink(&inode, output.data(), output.size()), -EIO);
+    KEXPECT_TRUE(output == SENTINEL);
+    inode.size = 0;
+    KEXPECT_EQ(xfs::xfs_readlink(&inode, output.data(), output.size()), 0);
+    KEXPECT_TRUE(output == SENTINEL);
+}
+
 KTEST(XFS, ReadlinkPathUsesDentryType) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_readlink_path_uses_dentry_type()); }
 
 KTEST(XFS, PathExistsUsesDentryType) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_path_exists_uses_dentry_type()); }
@@ -1531,6 +1694,7 @@ KTEST(XFS, PathExistsUsesDentryType) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_
 KTEST(XFS, StatRequireDirectoryUsesDentryType) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_stat_require_directory_uses_dentry_type()); }
 
 KTEST(XFS, OpenRequireDirectoryUsesDentryType) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_open_require_directory_uses_dentry_type()); }
+KTEST(XFS, OpenSnapshotDenialPrecedesMutation) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_open_snapshot_denials()); }
 
 KTEST(XFS, ShortformReaddirCookiesProgressAcrossDuplicateOffsets) {
     KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_shortform_readdir_cookies_are_monotonic());
@@ -1590,3 +1754,107 @@ KTEST(XFS, BtreeLookupRejectsOverMaxDepth) {
 KTEST(XFS, BtreeCollapsesSingleChildRoot) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_btree_collapses_single_child_root()); }
 
 KTEST(XFS, BtreeDeleteRebalances) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_btree_delete_rebalances()); }
+
+KTEST(XFS, ReparentShortformRollbackPreservesParentWidthAndCache) {
+    namespace xfs = ker::vfs::xfs;
+    for (size_t width : {size_t{4}, size_t{8}}) {
+        xfs::XfsMountContext mount{};
+        mount.inode_size = 512;
+        xfs::XfsInode inode{};
+        inode.ino = 100;
+        inode.mount = &mount;
+        inode.mode = 0040755;
+        inode.nlink = 2;
+        inode.dir_generation = 17;
+        inode.data_fork.format = xfs::XFS_DINODE_FMT_LOCAL;
+        inode.data_fork.local.size = width + 2;
+        inode.data_fork.local.data = new uint8_t[width + 2]{};
+        inode.size = width + 2;
+        auto* header = reinterpret_cast<xfs::XfsDir2SfHdr*>(inode.data_fork.local.data);
+        header->i8count = width == 8 ? 1 : 0;
+        xfs::xfs_ino_t const OLD = width == 8 ? 0x100000007ULL : 7;
+        xfs::xfs_ino_t const NEW = width == 8 ? 0x200000009ULL : 9;
+        for (size_t i = 0; i < width; ++i) header->parent[i] = static_cast<uint8_t>(OLD >> (8 * (width - i - 1)));
+        xfs::XfsDirEntry entry{};
+        KEXPECT_EQ(xfs::xfs_dir_lookup(&inode, "..", 2, &entry), 0);
+        KEXPECT_EQ(entry.ino, OLD);
+        auto* tp = xfs::xfs_trans_alloc(&mount);
+        KREQUIRE_TRUE(tp != nullptr);
+        KEXPECT_EQ(xfs::xfs_dir_reparent(&inode, OLD + 1, NEW, tp), -EIO);
+        KEXPECT_EQ(inode.dir_generation, 17);
+        KEXPECT_EQ(xfs::xfs_dir_reparent(&inode, OLD, NEW, tp), 0);
+        KEXPECT_EQ(xfs::xfs_dir_lookup(&inode, "..", 2, &entry), 0);
+        KEXPECT_EQ(entry.ino, NEW);
+        KEXPECT_EQ(inode.data_fork.format, xfs::XFS_DINODE_FMT_LOCAL);
+        xfs::xfs_trans_cancel(tp);
+        KEXPECT_EQ(xfs::xfs_dir_lookup(&inode, "..", 2, &entry), 0);
+        KEXPECT_EQ(entry.ino, OLD);
+        KEXPECT_EQ(inode.dir_generation, 17);
+        KEXPECT_EQ(inode.nlink, 2);
+        KEXPECT_TRUE(!inode.dirty);
+        xfs::xfs_dentry_cache_purge_mount(&mount);
+        delete[] inode.data_fork.local.data;
+    }
+}
+
+KTEST(XFS, RequestedReadonlyInitializationDoesNotWriteWritableMedia) {
+    namespace vfs = ker::vfs;
+    namespace xfs = ker::vfs::xfs;
+    struct Observer {
+        ker::dev::BlockDevice* backing{};
+        unsigned writes{};
+        unsigned flushes{};
+    } observer;
+    observer.backing = ker::dev::block_device_find_by_name("sdb2");
+    KREQUIRE_TRUE(observer.backing != nullptr);
+    // The wrapper has private cache identity. Its callbacks count prohibited
+    // effects without forwarding a write to the disposable scratch filesystem.
+    ker::dev::BlockDevice wrapper{};
+    wrapper.block_size = observer.backing->block_size;
+    wrapper.total_blocks = observer.backing->total_blocks;
+    wrapper.is_partition = true;
+    wrapper.private_data = &observer;
+    wrapper.read_blocks = [](ker::dev::BlockDevice* device, uint64_t block, size_t count, void* out) -> int {
+        return ker::dev::block_read(static_cast<Observer*>(device->private_data)->backing, block, count, out);
+    };
+    wrapper.write_blocks = [](ker::dev::BlockDevice* device, uint64_t, size_t, const void*) -> int {
+        ++static_cast<Observer*>(device->private_data)->writes;
+        return -EROFS;
+    };
+    wrapper.flush = [](ker::dev::BlockDevice* device) -> int {
+        ++static_cast<Observer*>(device->private_data)->flushes;
+        return -EROFS;
+    };
+    xfs::XfsMountContext* context = nullptr;
+    struct Cleanup {
+        ker::dev::BlockDevice& wrapper;
+        xfs::XfsMountContext*& context;
+        ~Cleanup() {
+            if (context != nullptr) xfs::xfs_unmount_force(context);
+            vfs::invalidate_bdev(&wrapper);
+        }
+    } cleanup{wrapper, context};
+    context = xfs::xfs_vfs_init_device(&wrapper, true);
+    KREQUIRE_TRUE(context != nullptr);
+    KEXPECT_TRUE(context->read_only && !wrapper.read_only && !ker::dev::block_device_is_read_only(&wrapper));
+    int result = 0;
+    auto* file =
+        xfs::xfs_open_path(ker::mod::security::Snapshot::bootstrap_root(), "readonly-refused", vfs::O_CREAT | 1, 0600, context, &result);
+    KEXPECT_TRUE(file == nullptr);
+    KEXPECT_EQ(result, -ENOENT);  // Preserve missing-path backend precedence.
+    if (file != nullptr) close_xfs_test_file(file);
+    file = xfs::xfs_open_path(ker::mod::security::Snapshot::bootstrap_root(), XATTR_FIXTURE_PATH, 1, 0, context, &result);
+    KEXPECT_TRUE(file == nullptr);
+    KEXPECT_EQ(result, -EROFS);
+    if (file != nullptr) close_xfs_test_file(file);
+    vfs::Statvfs policy{};
+    KEXPECT_EQ(xfs::xfs_statvfs(context, &policy), 0);
+    KEXPECT_TRUE((policy.f_flag & vfs::ST_RDONLY) != 0);
+    KEXPECT_EQ(xfs::xfs_sync_mount(context), 0);
+    int const UNMOUNT = xfs::xfs_unmount(context);
+    KEXPECT_EQ(UNMOUNT, 0);
+    if (UNMOUNT == 0) context = nullptr;
+    vfs::invalidate_bdev(&wrapper);
+    KEXPECT_EQ(observer.writes, 0U);
+    KEXPECT_EQ(observer.flushes, 0U);
+}

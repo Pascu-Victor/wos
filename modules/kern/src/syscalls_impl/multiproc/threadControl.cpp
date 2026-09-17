@@ -24,6 +24,7 @@
 #include "syscalls_impl/futex/futex.hpp"
 #include "syscalls_impl/log/sys_log.hpp"
 #include "syscalls_impl/process/child_events.hpp"
+#include "syscalls_impl/process/exec.hpp"
 #include "syscalls_impl/process/exit.hpp"
 #include "syscalls_impl/vmem/sys_vmem.hpp"
 
@@ -115,12 +116,16 @@ auto publish_thread_tid_to_tcb(mod::sched::task::Task* parent, uint64_t tcb_va, 
         jump_to_next_task_no_save();
         __builtin_unreachable();
     }
+    if (!task->is_thread && task->type == mod::sched::task::TaskType::PROCESS) {
+        ker::syscall::process::retire_main_thread();
+    }
     if (task->exit_in_progress) {
         for (;;) {
             asm volatile("hlt");
         }
     }
     task->exit_in_progress = true;
+    task->jobctl_membership.detach();
     ker::vfs::cancel_fd_reservations(*task);
     mod::sched::resource::cancel_process_reservations(*task);
     ker::syscall::log::sys_log_cleanup_for_task(task);
@@ -129,8 +134,13 @@ auto publish_thread_tid_to_tcb(mod::sched::task::Task* parent, uint64_t tcb_va, 
     // before reclaiming a child whose creator was interrupted in submission.
     ker::net::wki::wki_remote_compute_cleanup_for_task(task);
     static_cast<void>(mod::sched::task::destroy_unpublished_process(mod::sched::task::take_unpublished_process(task)));
+    // Each worker owns cloned lazy-file references. Retire them while ACTIVE
+    // and before finish_cpu allows the process owner to publish group exit.
+    task->quiesce_usercopy_pagemap();
+    mod::sched::task::release_lazy_vmem_ranges(*task);
     // Retire any stack-backed waiters created by descriptor/child teardown
     // before the thread becomes DEAD and its kernel stack enters reclamation.
+    ker::syscall::process::cleanup_exec_preparation(*task);
     ker::net::wki::wki_wait_cleanup_for_task(task);
     ker::syscall::futex::futex_wait_cleanup_for_task(task);
     ker::syscall::process::child_events::cancel_wait(*task);
@@ -186,7 +196,7 @@ auto thread_control(abi::multiproc::threadControlOps op, uint64_t arg1, uint64_t
                 return static_cast<uint64_t>(-EINVAL);
             }
             ker::syscall::process::exit_current_if_process_exit_requested();
-            mod::sched::resource::ProcessReservation process_reservation(parent, parent->uid);
+            mod::sched::resource::ProcessReservation process_reservation(parent, parent->credentials().user().real);
             if (process_reservation.result() < 0) {
                 return static_cast<uint64_t>(process_reservation.result());
             }

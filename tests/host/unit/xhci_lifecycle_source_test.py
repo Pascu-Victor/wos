@@ -201,6 +201,10 @@ def test_cdc_and_wki_readers_are_retired_before_slot_reuse() -> None:
     cdc = CDC_CPP.read_text()
     quiesce = function_body(cdc, "cdc_quiesce")
     detach = function_body(cdc, "cdc_detach")
+    require_order(quiesce, ["state.exchange(CdcEtherState::RETIRING", "netdev_mark_control_retiring", "netdev_unregister_begin"], "CDC fences control before unpublication")
+    if "netdev.remotable = nullptr" in quiesce:
+        fail("CDC must keep immutable operations through retained control completion")
+    require_order(detach, ["netdev_unregister_wait", "netdev.remotable = nullptr", "state.store(CdcEtherState::FREE"], "CDC clears operations after retained readers drain")
     require_order(
         quiesce,
         [

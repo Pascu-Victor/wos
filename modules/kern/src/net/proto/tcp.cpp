@@ -468,12 +468,12 @@ int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len, int flags) 
         if (!route_ref) {
             return -EHOSTUNREACH;
         }
-        auto* nif = netif_find_by_dev(route_ref.get());
-        if (nif == nullptr || nif->ipv4_addr_count == 0) {
+        auto const IPV4 = netif_ipv4_snapshot(route_ref.get());
+        if (IPV4.count == 0) {
             return -EADDRNOTAVAIL;
         }
-        cb->local = sock->domain == SOCKADDR_V6_FAMILY ? SocketEndpoint::mapped_ipv4(nif->ipv4_addrs.front().addr, cb->local.port)
-                                                       : SocketEndpoint::ipv4(nif->ipv4_addrs.front().addr, cb->local.port);
+        cb->local = sock->domain == SOCKADDR_V6_FAMILY ? SocketEndpoint::mapped_ipv4(IPV4.entries.front().addr, cb->local.port)
+                                                       : SocketEndpoint::ipv4(IPV4.entries.front().addr, cb->local.port);
         sock->local = cb->local;
     }
     if (remote.is_ipv6() && !remote.is_v4_mapped()) {

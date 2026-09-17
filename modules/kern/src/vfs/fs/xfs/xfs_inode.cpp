@@ -1873,9 +1873,13 @@ auto xfs_inode_stat_cached(XfsMountContext* mount, xfs_ino_t ino, ker::vfs::Stat
         return unavailable ? -ENOENT : -EAGAIN;
     }
 
-    int const RET = (ip->nlink != 0) ? xfs_inode_fill_stat(ip, statbuf) : -ENOENT;
+    int result;
+    {
+        ker::mod::sys::MutexGuard metadata_guard(mount->metadata_lock);
+        result = (ip->nlink != 0) ? xfs_inode_fill_stat(ip, statbuf) : -ENOENT;
+    }
     xfs_inode_release(ip);
-    return RET;
+    return result;
 }
 
 auto xfs_inode_write(XfsInode* ip, XfsTransaction* tp) -> int {

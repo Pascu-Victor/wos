@@ -15,6 +15,7 @@
 #include <net/netif.hpp>
 #include <net/packet.hpp>
 #include <net/proto/ethernet.hpp>
+#include <net/wki/auth_policy.hpp>
 #include <net/wki/blk_ring.hpp>
 #include <net/wki/chaos.hpp>
 #include <net/wki/remotable.hpp>
@@ -30,6 +31,7 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/security/credential_record.hpp>
 #include <string_view>
 #include <utility>
 #include <vfs/file.hpp>
@@ -82,6 +84,8 @@ std::atomic<uint64_t> s_vfs_export_rebuild_revision{0};  // NOLINT(cppcoreguidel
 struct DeferredVfsOp {
     WkiHeader hdr{};
     WkiChannelIdentity channel_identity{};
+    uint64_t identity_policy = 0;
+    uint16_t identity_capabilities = 0;
     uint16_t op_id = 0;
     uint16_t req_data_len = 0;
     uint8_t* req_data = nullptr;
@@ -325,6 +329,22 @@ auto find_binding_by_zone_id(uint32_t zone_id) -> DevServerBinding* {
     return nullptr;
 }
 
+// Caller holds s_server_lock. An accepted origin is retained by its worker;
+// borrowing a second binding is new admission and must exclude retirement.
+auto vfs_sibling_binding_matches(const DevServerBinding& origin, const DevServerBinding& candidate, uint16_t channel_id,
+                                 uint32_t generation) -> bool {
+    return origin.resource_type == ResourceType::VFS && candidate.resource_type == ResourceType::VFS && candidate.active &&
+           !candidate.retiring.load(std::memory_order_acquire) && !candidate.epoch_reset_pending && !candidate.detach_cleanup_pending &&
+           origin.consumer_node == candidate.consumer_node && candidate.channel_identity.peer_node_id == origin.consumer_node &&
+           candidate.channel_identity.channel != nullptr && candidate.channel_identity.channel_id == channel_id && generation != 0 &&
+           candidate.channel_identity.generation == generation && origin.resource_id == candidate.resource_id &&
+           wki_resource_incarnation_valid(origin.resource_incarnation) &&
+           wki_resource_incarnation_equal(origin.resource_incarnation, candidate.resource_incarnation) &&
+           origin.vfs_export_dev_id == candidate.vfs_export_dev_id &&
+           origin.vfs_export_publication_revision == candidate.vfs_export_publication_revision &&
+           std::strcmp(origin.vfs_export_path, candidate.vfs_export_path) == 0;
+}
+
 // s_server_lock must be held by caller
 auto retain_binding_locked(DevServerBinding* binding) -> bool {
     if (binding == nullptr || !binding->active || binding->retiring.load(std::memory_order_acquire)) {
@@ -427,6 +447,24 @@ void release_vfs_rdma_buffers(VfsRdmaBuffers* buffers) {
     delete[] buffers->read_staging_buf;
     delete[] buffers->bulk_staging_buf;
     *buffers = {};
+}
+
+// Caller has retired the binding and drained all retained users. Diagnostics
+// still enumerate retired rows under s_server_lock, so withdraw their borrowed
+// pointer under that lock before releasing backing outside it.
+void retire_binding_zone(DevServerBinding* binding) {
+    WkiZoneRef zone_ref;
+    uint64_t const FLAGS = s_server_lock.lock_irqsave();
+    zone_ref = std::move(binding->blk_zone_ref);
+    binding->blk_zone_ptr = nullptr;
+    binding->blk_zone_id = 0;
+    binding->blk_rdma_active = false;
+    binding->blk_roce = false;
+    binding->blk_remote_rkey = 0;
+    binding->blk_rdma_transport = nullptr;
+    s_server_lock.unlock_irqrestore(FLAGS);
+    static_cast<void>(zone_ref.destroy());
+    zone_ref.reset();
 }
 
 // s_server_lock must be held by caller
@@ -536,7 +574,9 @@ auto detach_all_may_claim_binding(const DevServerBinding& binding, uint16_t node
 
 auto is_vfs_op(uint16_t op_id) -> bool {
     return (op_id >= OP_VFS_OPEN && op_id <= OP_VFS_READ_BULK) || op_id == OP_VFS_UTIMENS || op_id == OP_VFS_METADATA_BATCH ||
-           op_id == OP_VFS_XATTR;
+           op_id == OP_VFS_XATTR || op_id == OP_VFS_OPEN_READ_AS || op_id == OP_VFS_OPEN_AS || op_id == OP_VFS_FSTAT ||
+           op_id == OP_VFS_STAT_AS || op_id == OP_VFS_PATH_AS || op_id == OP_VFS_EXEC_VIEW || op_id == OP_VFS_DIRECTORY_REFERENCE ||
+           op_id == OP_VFS_DIRECTORY_GRANT || op_id == OP_VFS_OPEN_LIFETIME || op_id == OP_VFS_FEATURES;
 }
 
 auto transport_is_roce(const WkiTransport* transport) -> bool {
@@ -576,7 +616,7 @@ struct VfsMetadataBatchEntryView {
     size_t second_len = 0;
 };
 
-auto vfs_metadata_batch_relative_path_is_safe(const uint8_t* path, size_t path_len) -> bool {
+auto vfs_metadata_batch_relative_path_is_safe(const uint8_t* path, size_t path_len, bool allow_dot_components = false) -> bool {
     if (path_len == 0) {
         return true;
     }
@@ -592,7 +632,7 @@ auto vfs_metadata_batch_relative_path_is_safe(const uint8_t* path, size_t path_l
         size_t const COMPONENT_LEN = pos - component_start;
         bool const DOT = COMPONENT_LEN == 1 && path[component_start] == '.';
         bool const DOT_DOT = COMPONENT_LEN == 2 && path[component_start] == '.' && path[component_start + 1] == '.';
-        if (DOT || DOT_DOT) {
+        if ((DOT || DOT_DOT) && !allow_dot_components) {
             return false;
         }
         component_start = pos + 1;
@@ -679,11 +719,11 @@ auto vfs_metadata_batch_operation_is_valid(VfsMetadataBatchOperation operation) 
 }
 
 auto vfs_metadata_batch_validate_path(const uint8_t* data, const VfsMetadataBatchEntryView& view, bool second_path, const char* export_path,
-                                      const char* export_name) -> int {
+                                      const char* export_name, bool component_paths = false) -> int {
     size_t const OFFSET = second_path ? view.second_offset : view.first_offset;
     size_t const PATH_LEN = second_path ? view.second_len : view.first_len;
     const uint8_t* path = data + OFFSET;
-    if (!vfs_metadata_batch_relative_path_is_safe(path, PATH_LEN)) {
+    if (!vfs_metadata_batch_relative_path_is_safe(path, PATH_LEN, component_paths)) {
         return -EINVAL;
     }
 
@@ -702,7 +742,8 @@ auto vfs_metadata_batch_validate_path(const uint8_t* data, const VfsMetadataBatc
 auto vfs_metadata_batch_preflight(const uint8_t* data, uint16_t data_len, const char* export_path, const char* export_name,
                                   VfsMetadataBatchHeader* header_out,
                                   std::array<VfsMetadataBatchEntryView, VFS_METADATA_BATCH_MAX_ITEMS>* entries_out,
-                                  size_t* response_data_len_out) -> int {
+                                  size_t* response_data_len_out, ker::mod::security::Snapshot* credentials_out = nullptr,
+                                  bool component_paths = false) -> int {
     if (data == nullptr || export_path == nullptr || export_name == nullptr || header_out == nullptr || entries_out == nullptr ||
         response_data_len_out == nullptr || data_len < sizeof(VfsMetadataBatchHeader)) {
         return -EINVAL;
@@ -710,8 +751,12 @@ auto vfs_metadata_batch_preflight(const uint8_t* data, uint16_t data_len, const 
 
     VfsMetadataBatchHeader header{};
     std::memcpy(&header, data, sizeof(header));
-    if (header.version != VFS_METADATA_BATCH_VERSION || !vfs_metadata_batch_operation_is_valid(header.operation) || header.count == 0 ||
-        header.count > VFS_METADATA_BATCH_MAX_ITEMS || (header.operation != VfsMetadataBatchOperation::CREATE_CLOSE && header.mode != 0)) {
+    bool const STAT = header.operation == VfsMetadataBatchOperation::STAT_FOLLOW;
+    if (!vfs_metadata_batch_operation_is_valid(header.operation)) return -EINVAL;
+    if (header.version == VFS_METADATA_BATCH_VERSION) return -ENOTSUP;
+    if ((STAT ? header.version != VFS_METADATA_BATCH_STAT_VERSION : header.version != VFS_METADATA_BATCH_MUTATION_VERSION) ||
+        !vfs_metadata_batch_operation_is_valid(header.operation) || header.count == 0 || header.count > VFS_METADATA_BATCH_MAX_ITEMS ||
+        (header.operation != VfsMetadataBatchOperation::CREATE_CLOSE && header.mode != 0)) {
         return -EINVAL;
     }
     if (header.operation == VfsMetadataBatchOperation::STAT_FOLLOW && header.count > VFS_METADATA_BATCH_MAX_STAT_ITEMS) {
@@ -726,6 +771,14 @@ auto vfs_metadata_batch_preflight(const uint8_t* data, uint16_t data_len, const 
     }
 
     size_t cursor = sizeof(VfsMetadataBatchHeader);
+    ker::mod::security::Snapshot supplied;
+    {
+        constexpr size_t RECORD_SIZE = ker::mod::security::credential_record::SIZE;
+        if (data_len - cursor < RECORD_SIZE || credentials_out == nullptr) return -EINVAL;
+        int const DECODE = ker::mod::security::credential_record::decode({data + cursor, RECORD_SIZE}, supplied);
+        if (DECODE != 0) return DECODE;
+        cursor += RECORD_SIZE;
+    }
     auto parse_path = [&](size_t* offset_out, size_t* length_out) -> bool {
         if (cursor > data_len || data_len - cursor < sizeof(uint16_t)) {
             return false;
@@ -779,34 +832,50 @@ auto vfs_metadata_batch_preflight(const uint8_t* data, uint16_t data_len, const 
 
     for (size_t index = 0; index < header.count; ++index) {
         auto const& entry = entries_out->at(index);
-        int const FIRST_RET = vfs_metadata_batch_validate_path(data, entry, false, export_path, export_name);
+        int const FIRST_RET = vfs_metadata_batch_validate_path(data, entry, false, export_path, export_name, component_paths);
         if (FIRST_RET < 0) {
             return FIRST_RET;
         }
         if (header.operation == VfsMetadataBatchOperation::RENAME) {
-            int const SECOND_RET = vfs_metadata_batch_validate_path(data, entry, true, export_path, export_name);
+            int const SECOND_RET = vfs_metadata_batch_validate_path(data, entry, true, export_path, export_name, component_paths);
             if (SECOND_RET < 0) {
                 return SECOND_RET;
             }
         }
     }
 
+    *credentials_out = supplied;
     *header_out = header;
     *response_data_len_out = RESPONSE_DATA_LEN;
     return 0;
 }
 
 void handle_vfs_metadata_batch_op(const WkiHeader* hdr, const WkiChannelIdentity& identity, const char* export_path,
-                                  const char* export_name, const uint8_t* data, uint16_t data_len) {
+                                  const char* export_name, const uint8_t* data, uint16_t data_len, uint64_t identity_policy,
+                                  uint16_t identity_capabilities) {
     uint16_t const REQ_COOKIE = req_cookie_from_header(hdr);
     uint64_t const PREFLIGHT_MOUNT_GENERATION = ker::vfs::mount_table_generation_snapshot();
     VfsMetadataBatchHeader batch_header{};
     std::array<VfsMetadataBatchEntryView, VFS_METADATA_BATCH_MAX_ITEMS> entries{};
     size_t response_data_len = 0;
+    ker::mod::security::Snapshot supplied;
+    ker::mod::security::Snapshot mapped;
     int const PREFLIGHT_RET =
-        vfs_metadata_batch_preflight(data, data_len, export_path, export_name, &batch_header, &entries, &response_data_len);
+        vfs_metadata_batch_preflight(data, data_len, export_path, export_name, &batch_header, &entries, &response_data_len, &supplied,
+                                     (identity_capabilities & WKI_CAP_VFS_COMPONENT_PATHS) != 0);
     if (PREFLIGHT_RET < 0) {
         send_vfs_error_response(identity, OP_VFS_METADATA_BATCH, static_cast<int16_t>(PREFLIGHT_RET), REQ_COOKIE);
+        return;
+    }
+    auto* task = ker::mod::sched::get_current_task();
+    bool const READ_ONLY = batch_header.operation == VfsMetadataBatchOperation::STAT_FOLLOW;
+    uint16_t const REQUIRED = READ_ONLY ? WKI_CAP_VFS_STAT_IDENTITY : WKI_CAP_VFS_PATH_IDENTITY;
+    int const ADMISSION = (identity_capabilities & REQUIRED) == 0 ? -ENOTSUP
+                          : task == nullptr                       ? -ESRCH
+                          : READ_ONLY ? auth_policy::map_vfs_read_identity(identity_policy, supplied, mapped)
+                                      : auth_policy::map_vfs_mutation_identity(identity_policy, supplied, mapped);
+    if (ADMISSION != 0) {
+        send_vfs_error_response(identity, OP_VFS_METADATA_BATCH, static_cast<int16_t>(ADMISSION), REQ_COOKIE);
         return;
     }
     if (ker::vfs::mount_table_generation_snapshot() != PREFLIGHT_MOUNT_GENERATION) {
@@ -841,24 +910,27 @@ void handle_vfs_metadata_batch_op(const WkiHeader* hdr, const WkiChannelIdentity
                     break;
                 case VfsMetadataBatchOperation::CREATE_CLOSE: {
                     constexpr int OPEN_WRONLY = 1;
-                    ker::vfs::File* file = ker::vfs::vfs_open_file_resolved_beneath(export_path, first_backing.data(),
-                                                                                    OPEN_WRONLY | ker::vfs::O_CREAT | ker::vfs::O_EXCL,
-                                                                                    static_cast<int>(batch_header.mode));
-                    item_status = file != nullptr ? static_cast<int32_t>(ker::vfs::vfs_close_file(file)) : -ENOENT;
+                    ker::vfs::File* file = nullptr;
+                    item_status = ker::vfs::vfs_open_file_resolved_beneath_as(*task, mapped, export_path, first_backing.data(),
+                                                                              OPEN_WRONLY | ker::vfs::O_CREAT | ker::vfs::O_EXCL,
+                                                                              static_cast<int>(batch_header.mode), &file);
+                    if (item_status == 0) item_status = static_cast<int32_t>(ker::vfs::vfs_close_file(file));
                     break;
                 }
                 case VfsMetadataBatchOperation::STAT_FOLLOW:
-                    item_status = static_cast<int32_t>(ker::vfs::vfs_stat_resolved_beneath(export_path, first_backing.data(), &statbuf));
+                    item_status = static_cast<int32_t>(
+                        ker::vfs::vfs_stat_resolved_beneath_as(*task, mapped, export_path, first_backing.data(), &statbuf));
                     break;
                 case VfsMetadataBatchOperation::UNLINK:
-                    item_status = static_cast<int32_t>(ker::vfs::vfs_unlink_resolved_beneath(export_path, first_backing.data(), false));
+                    item_status = static_cast<int32_t>(
+                        ker::vfs::vfs_unlink_resolved_beneath_as(*task, mapped, export_path, first_backing.data(), false, false));
                     break;
                 case VfsMetadataBatchOperation::RENAME: {
                     std::array<char, VFS_METADATA_BATCH_PATH_BUFFER_SIZE> second_backing{};
                     static_cast<void>(vfs_metadata_batch_build_full_path(second_backing.data(), second_backing.size(), export_path,
                                                                          data + entry.second_offset, entry.second_len));
-                    item_status = static_cast<int32_t>(
-                        ker::vfs::vfs_rename_resolved_beneath(export_path, first_backing.data(), second_backing.data()));
+                    item_status = static_cast<int32_t>(ker::vfs::vfs_rename_resolved_beneath_as(
+                        *task, mapped, export_path, first_backing.data(), second_backing.data(), false, false));
                     break;
                 }
             }
@@ -970,6 +1042,10 @@ void run_deferred_block_op(DeferredVfsOp* op) {
             }
 
             auto const RESP_TOTAL = static_cast<uint16_t>(sizeof(DevOpRespPayload) + TRANSFER.bytes);
+            if (!BINDING->block_read_allowed) {
+                send_block_status_response(op->channel_identity, op->op_id, -EACCES, REQUEST_COOKIE);
+                break;
+            }
             auto* buf = new (std::nothrow) uint8_t[RESP_TOTAL];
             if (buf == nullptr) {
                 send_block_status_response(op->channel_identity, op->op_id, -ENOMEM, REQUEST_COOKIE);
@@ -1020,6 +1096,10 @@ void run_deferred_block_op(DeferredVfsOp* op) {
                 send_block_status_response(op->channel_identity, op->op_id, -EINVAL, REQUEST_COOKIE);
                 break;
             }
+            if (BINDING->block_read_only) {
+                send_block_status_response(op->channel_identity, op->op_id, -EROFS, REQUEST_COOKIE);
+                break;
+            }
             int const RET = ker::dev::block_flush(BDEV);
             send_block_status_response(op->channel_identity, op->op_id, RET, REQUEST_COOKIE);
             break;
@@ -1038,6 +1118,26 @@ void run_deferred_vfs_op(void* arg) {
     }
 
     DevServerBinding* const RETAINED_BINDING = op->retained_binding;
+
+    if (op->op_id == OP_NET_OPEN_AS || op->op_id == OP_NET_CLOSE_AS || op->op_id == OP_NET_LINK_AS) {
+        // The shared fixed device worker owns the pre-ACK binding and policy
+        // snapshot. Native driver work must never execute in reliable RX.
+        auto* dev = RETAINED_BINDING != nullptr && RETAINED_BINDING->resource_type == ResourceType::NET &&
+                            channel_identity_matches(RETAINED_BINDING->channel_identity, op->channel_identity)
+                        ? RETAINED_BINDING->net_dev
+                        : nullptr;
+        auto* binding_retiring = RETAINED_BINDING != nullptr ? &RETAINED_BINDING->retiring : nullptr;
+        if (op->op_id == OP_NET_OPEN_AS) {
+            detail::handle_net_open_as(op->channel_identity, dev, op->req_data, op->req_data_len, op->identity_policy, binding_retiring);
+        } else if (op->op_id == OP_NET_CLOSE_AS) {
+            detail::handle_net_close_as(op->channel_identity, dev, op->req_data, op->req_data_len, op->identity_policy, binding_retiring);
+        } else {
+            detail::handle_net_link_as(op->channel_identity, dev, op->req_data, op->req_data_len, op->identity_policy, binding_retiring);
+        }
+        release_binding(RETAINED_BINDING);
+        deferred_vfs_op_release(op);
+        return;
+    }
 
     if (op->fixed_block_op) {
         // RX admitted this request from a fixed pool and copied it before the
@@ -1066,7 +1166,7 @@ void run_deferred_vfs_op(void* arg) {
             deferred_vfs_op_release(op);
             return;
         }
-        if (op->op_id == OP_VFS_METADATA_BATCH && !wki_peer_capability_negotiated(op->hdr.src_node, WKI_CAP_VFS_METADATA_BATCH)) {
+        if (op->op_id == OP_VFS_METADATA_BATCH && (op->identity_capabilities & WKI_CAP_VFS_METADATA_BATCH) == 0) {
             send_vfs_error_response(op->channel_identity, op->op_id, -EOPNOTSUPP, req_cookie_from_header(&op->hdr));
             release_binding(RETAINED_BINDING);
             deferred_vfs_op_release(op);
@@ -1128,10 +1228,12 @@ void run_deferred_vfs_op(void* arg) {
         channel_identity_matches(RETAINED_BINDING->channel_identity, op->channel_identity)) {
         if (op->op_id == OP_VFS_METADATA_BATCH) {
             handle_vfs_metadata_batch_op(&op->hdr, op->channel_identity, static_cast<const char*>(RETAINED_BINDING->vfs_export_path),
-                                         static_cast<const char*>(RETAINED_BINDING->vfs_export_name), op->req_data, op->req_data_len);
+                                         static_cast<const char*>(RETAINED_BINDING->vfs_export_name), op->req_data, op->req_data_len,
+                                         op->identity_policy, op->identity_capabilities);
         } else {
             detail::handle_vfs_op(&op->hdr, op->channel_identity, static_cast<const char*>(RETAINED_BINDING->vfs_export_path),
-                                  static_cast<const char*>(RETAINED_BINDING->vfs_export_name), op->op_id, op->req_data, op->req_data_len);
+                                  static_cast<const char*>(RETAINED_BINDING->vfs_export_name), op->op_id, op->req_data, op->req_data_len,
+                                  op->identity_policy, op->identity_capabilities, &RETAINED_BINDING->retiring, RETAINED_BINDING);
         }
     } else {
         send_vfs_error_response(op->channel_identity, op->op_id, -ENOTCONN, req_cookie_from_header(&op->hdr));
@@ -1308,7 +1410,8 @@ auto queue_block_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_iden
 }
 
 auto try_queue_pre_admitted_vfs_op(VfsOpWorkerShard* shard, const WkiHeader* hdr, const WkiChannelIdentity& channel_identity,
-                                   uint16_t op_id, const uint8_t* req_data, uint16_t req_data_len) -> bool {
+                                   uint16_t op_id, const uint8_t* req_data, uint16_t req_data_len, uint64_t identity_policy,
+                                   uint16_t identity_capabilities) -> bool {
     if (shard == nullptr || hdr == nullptr || (req_data_len != 0 && req_data == nullptr) || req_data_len > WKI_ETH_MAX_PAYLOAD ||
         !s_vfs_op_pool_lock.try_lock()) {
         return false;
@@ -1331,8 +1434,10 @@ auto try_queue_pre_admitted_vfs_op(VfsOpWorkerShard* shard, const WkiHeader* hdr
         return false;
     }
 
+    ResourceType const EXPECTED_TYPE =
+        (op_id == OP_NET_OPEN_AS || op_id == OP_NET_CLOSE_AS || op_id == OP_NET_LINK_AS) ? ResourceType::NET : ResourceType::VFS;
     DevServerBinding* retained_binding = find_binding_by_channel_identity(channel_identity);
-    if (retained_binding == nullptr || retained_binding->resource_type != ResourceType::VFS || !retain_binding_locked(retained_binding)) {
+    if (retained_binding == nullptr || retained_binding->resource_type != EXPECTED_TYPE || !retain_binding_locked(retained_binding)) {
         retained_binding = nullptr;
     }
 
@@ -1343,6 +1448,8 @@ auto try_queue_pre_admitted_vfs_op(VfsOpWorkerShard* shard, const WkiHeader* hdr
     op->req_data = storage->request.data();
     op->hdr = *hdr;
     op->channel_identity = channel_identity;
+    op->identity_policy = identity_policy;
+    op->identity_capabilities = identity_capabilities;
     op->op_id = op_id;
     op->req_data_len = req_data_len;
     op->retained_binding = retained_binding;
@@ -1446,13 +1553,15 @@ auto capture_net_state(ker::net::NetDevice* ndev) -> NetStateSnapshot {
         return snap;
     }
 
-    snap.real_mac = ndev->mac;
-    snap.link_state = ndev->state;
-    snap.mtu = ndev->mtu;
+    auto const CONFIG = ker::net::netdev_config_snapshot(ndev);
+    snap.real_mac = CONFIG.mac;
+    snap.link_state = CONFIG.state;
+    snap.mtu = CONFIG.mtu;
 
     auto* nif = ker::net::netif_find_by_dev(ndev);
-    if (nif != nullptr && nif->ipv4_addr_count > 0) {
-        const auto& primary_ipv4 = nif->ipv4_addrs.front();
+    auto const IPV4 = ker::net::netif_ipv4_snapshot(ndev);
+    if (IPV4.count > 0) {
+        const auto& primary_ipv4 = IPV4.entries.front();
         snap.ipv4_addr = primary_ipv4.addr;
         snap.ipv4_mask = primary_ipv4.netmask;
     }
@@ -1508,6 +1617,7 @@ void record_binding_net_state(DevServerBinding& binding, const NetStateSnapshot&
 void build_net_attach_ack(DevAttachAckNetPayload& ack, NetIpv6StateSuffix& ipv6, ker::net::NetDevice* ndev, uint32_t resource_id,
                           uint16_t assigned_channel) {
     ack.status = static_cast<uint8_t>(DevAttachStatus::OK);
+    ack.rdma_flags = DEV_ATTACH_NET_OPEN_IDENTITY | DEV_ATTACH_NET_CLOSE_IDENTITY | DEV_ATTACH_NET_LINK_IDENTITY;
     ack.assigned_channel = assigned_channel;
     ack.resource_id = resource_id;
     ack.max_op_size = static_cast<uint16_t>(WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload));
@@ -1677,6 +1787,45 @@ void wki_dev_server_init() {
     ker::mod::dbg::log("[WKI] Dev server subsystem initialized");
 }
 
+auto wki_dev_server_retain_vfs_sibling(const WkiChannelIdentity& origin, uint16_t channel_id, uint32_t generation,
+                                       WkiChannelIdentity* identity) -> DevServerBinding* {
+    if (identity == nullptr) return nullptr;
+    *identity = {};
+    uint64_t const FLAGS = s_server_lock.lock_irqsave();
+    DevServerBinding* result = nullptr;
+    auto* source = find_retained_binding_by_channel_identity(origin);
+    if (source != nullptr) {
+        for (auto& candidate : g_bindings) {
+            if (vfs_sibling_binding_matches(*source, candidate, channel_id, generation) && retain_binding_locked(&candidate)) {
+                result = &candidate;
+                *identity = candidate.channel_identity;
+                break;
+            }
+        }
+    }
+    s_server_lock.unlock_irqrestore(FLAGS);
+    return result;
+}
+
+void wki_dev_server_release_vfs_sibling(DevServerBinding* binding) { release_binding(binding); }
+
+auto wki_dev_server_retain_vfs_grant_source(const WkiChannelIdentity& origin, const VfsDirectoryGrant& grant, uint64_t publication_revision)
+    -> DevServerBinding* {
+    if (!wki_vfs_directory_grant_valid(grant) || publication_revision == 0) return nullptr;
+    uint64_t const FLAGS = s_server_lock.lock_irqsave();
+    auto* binding = find_binding_by_channel_identity(origin);
+    if (binding == nullptr || binding->resource_type != ResourceType::VFS || binding->consumer_node != grant.source_node ||
+        binding->consumer_boot_epoch != grant.source_boot_epoch || binding->resource_id != grant.resource_id ||
+        !wki_resource_incarnation_equal(binding->resource_incarnation, grant.owner_incarnation) ||
+        binding->vfs_export_publication_revision != publication_revision || binding->epoch_reset_pending ||
+        binding->detach_cleanup_pending || !retain_binding_locked(binding))
+        binding = nullptr;
+    s_server_lock.unlock_irqrestore(FLAGS);
+    return binding;
+}
+
+void wki_dev_server_release_vfs_grant_source(DevServerBinding* binding) { release_binding(binding); }
+
 auto wki_dev_server_diag_snapshot(WkiDevServerDiagRow* rows, size_t capacity, size_t* total) -> size_t {
     size_t row_count = 0;
     size_t total_rows = 0;
@@ -1749,7 +1898,8 @@ auto wki_dev_server_diag_snapshot(WkiDevServerDiagRow* rows, size_t capacity, si
 }
 
 auto wki_dev_server_admit_vfs_op_rx(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
-                                    uint32_t rx_channel_generation) -> WkiVfsOpRxAdmission {
+                                    uint32_t rx_channel_generation, uint64_t identity_policy, uint16_t identity_capabilities)
+    -> WkiVfsOpRxAdmission {
     if (hdr == nullptr || payload == nullptr || rx_channel == nullptr || rx_channel_generation == 0 ||
         payload_len < sizeof(DevOpReqPayload)) {
         return WkiVfsOpRxAdmission::NOT_APPLICABLE;
@@ -1757,7 +1907,13 @@ auto wki_dev_server_admit_vfs_op_rx(const WkiHeader* hdr, const uint8_t* payload
 
     auto const* req = reinterpret_cast<const DevOpReqPayload*>(payload);
     size_t const EXPECTED_LEN = sizeof(DevOpReqPayload) + req->data_len;
-    if (!is_vfs_op(req->op_id) || (req->op_id == OP_VFS_XATTR ? EXPECTED_LEN != payload_len : EXPECTED_LEN > payload_len)) {
+    if ((!is_vfs_op(req->op_id) && req->op_id != OP_NET_OPEN_AS && req->op_id != OP_NET_CLOSE_AS && req->op_id != OP_NET_LINK_AS) ||
+        (((req->op_id == OP_NET_OPEN_AS || req->op_id == OP_NET_CLOSE_AS || req->op_id == OP_NET_LINK_AS) || req->op_id == OP_VFS_XATTR ||
+          req->op_id == OP_VFS_FSTAT || req->op_id == OP_VFS_STAT_AS || req->op_id == OP_VFS_PATH_AS || req->op_id == OP_VFS_EXEC_VIEW ||
+          req->op_id == OP_VFS_DIRECTORY_REFERENCE || (req->op_id == OP_VFS_DIRECTORY_GRANT || req->op_id == OP_VFS_OPEN_LIFETIME) ||
+          req->op_id == OP_VFS_FEATURES || req->op_id == OP_VFS_METADATA_BATCH)
+             ? EXPECTED_LEN != payload_len
+             : EXPECTED_LEN > payload_len)) {
         return WkiVfsOpRxAdmission::NOT_APPLICABLE;
     }
     const uint8_t* req_data = payload + sizeof(DevOpReqPayload);
@@ -1774,7 +1930,8 @@ auto wki_dev_server_admit_vfs_op_rx(const WkiHeader* hdr, const uint8_t* payload
         wki_vfs_close_no_success_response_requested(req_data, req->data_len)) {
         admitted = try_queue_pre_admitted_async_close(SHARD, hdr, CHANNEL_IDENTITY, req_data);
     } else {
-        admitted = try_queue_pre_admitted_vfs_op(SHARD, hdr, CHANNEL_IDENTITY, req->op_id, req_data, req->data_len);
+        admitted = try_queue_pre_admitted_vfs_op(SHARD, hdr, CHANNEL_IDENTITY, req->op_id, req_data, req->data_len, identity_policy,
+                                                 identity_capabilities);
     }
     return admitted ? WkiVfsOpRxAdmission::DEFERRED : WkiVfsOpRxAdmission::RETRY;
 }
@@ -2147,9 +2304,7 @@ void wki_dev_server_process_pending_detaches() {
                 wki_remote_vfs_cleanup_server_fds_for_channel(item.channel_identity);
             }
             release_vfs_rdma_buffers(&item.vfs_rdma_buffers);
-            if (item.blk_rdma_active && item.blk_zone_id != 0) {
-                wki_zone_destroy(item.blk_zone_id);
-            }
+            retire_binding_zone(item.binding);
             if (item.block_dev != nullptr && item.block_dev->remotable != nullptr) {
                 item.block_dev->remotable->on_remote_detach(item.consumer_node);
             }
@@ -2300,6 +2455,7 @@ void wki_dev_server_notify_net_changed(ker::net::NetDevice* dev) {
     if (dev == nullptr) {
         return;
     }
+    if (ker::net::netdev_defer_control_notify(dev, ker::net::NetDeviceControlNotify::OWNER_STATE)) return;
 
     struct NotifyTarget {
         WkiChannelIdentity channel_identity{};
@@ -2423,9 +2579,7 @@ void wki_dev_server_cleanup_epoch_reset_for_peer(uint16_t node_id) {
             auto& item = work.at(i);
             wait_for_binding_refs_to_drain(item.binding);
             release_vfs_rdma_buffers(&item.vfs_rdma_buffers);
-            if (item.blk_rdma_active && item.blk_zone_id != 0) {
-                wki_zone_destroy(item.blk_zone_id);
-            }
+            retire_binding_zone(item.binding);
             if (item.block_dev != nullptr && item.block_dev->remotable != nullptr) {
                 item.block_dev->remotable->on_remote_fault(node_id);
             }
@@ -2528,9 +2682,7 @@ void wki_dev_server_detach_all_for_peer(uint16_t node_id) {
             auto& item = work.at(i);
             wait_for_binding_refs_to_drain(item.binding);
             release_vfs_rdma_buffers(&item.vfs_rdma_buffers);
-            if (item.blk_rdma_active && item.blk_zone_id != 0) {
-                wki_zone_destroy(item.blk_zone_id);
-            }
+            retire_binding_zone(item.binding);
             if (item.block_dev != nullptr && item.block_dev->remotable != nullptr) {
                 item.block_dev->remotable->on_remote_fault(node_id);
             }
@@ -2701,6 +2853,7 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         binding.resource_incarnation = ack_incarnation;
         binding.attach_cookie = req->attach_cookie;
         binding.block_dev = bdev;
+        binding.block_read_allowed = REQUEST_READ;
         binding.block_read_only = read_only_attach;
         binding.block_writer_lease = std::move(block_writer_lease);
 
@@ -2806,6 +2959,7 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         // inactive list node is provisional and cannot accept DEV_OP traffic.
         binding.active = false;
         binding.consumer_node = hdr->src_node;
+        binding.consumer_boot_epoch = wki_peer_remote_boot_epoch_snapshot(hdr->src_node);
         binding.assigned_channel = ch->channel_id;
         binding.channel_identity = channel_identity;
         binding.resource_type = ResourceType::VFS;
@@ -3107,11 +3261,24 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
 
     // Verify data fits
     size_t const EXPECTED_LEN = sizeof(DevOpReqPayload) + REQ_DATA_LEN;
-    if (req->op_id == OP_VFS_XATTR ? EXPECTED_LEN != payload_len : EXPECTED_LEN > payload_len) {
+    if (((req->op_id == OP_NET_OPEN_AS || req->op_id == OP_NET_CLOSE_AS || req->op_id == OP_NET_LINK_AS) || req->op_id == OP_VFS_XATTR ||
+         req->op_id == OP_VFS_FSTAT || req->op_id == OP_VFS_STAT_AS || req->op_id == OP_VFS_PATH_AS || req->op_id == OP_VFS_EXEC_VIEW ||
+         req->op_id == OP_VFS_DIRECTORY_REFERENCE || (req->op_id == OP_VFS_DIRECTORY_GRANT || req->op_id == OP_VFS_OPEN_LIFETIME) ||
+         req->op_id == OP_VFS_FEATURES || req->op_id == OP_VFS_METADATA_BATCH)
+            ? EXPECTED_LEN != payload_len
+            : EXPECTED_LEN > payload_len) {
         return;
     }
 
     uint16_t const REQUEST_COOKIE = req_cookie_from_header(hdr);
+    if (req->op_id == OP_NET_OPEN_AS || req->op_id == OP_NET_CLOSE_AS || req->op_id == OP_NET_LINK_AS) {
+        // Normal reliable delivery is queued before ACK. Reject a bypass of
+        // that worker contract instead of invoking a driver from RX.
+        send_vfs_error_response(CHANNEL_IDENTITY, req->op_id, -EAGAIN,
+                                net_request_cookie_from_payload(req_data, REQ_DATA_LEN, REQUEST_COOKIE));
+        return;
+    }
+
     bool const IS_VFS_OP = is_vfs_op(req->op_id);
 
     // IPC resources use their own peer/resource ownership and were already
@@ -3119,7 +3286,7 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
     // the device-binding lock path; all other IPC operations are consumed by
     // the fixed task-context worker before this dispatcher can be reached.
     if (req->op_id >= 0x0700 && req->op_id <= 0x07FF) {
-        detail::handle_ipc_dev_op_req(hdr, payload, payload_len);
+        detail::handle_ipc_dev_op_req(hdr, payload, payload_len, CHANNEL_IDENTITY);
         return;
     }
 
@@ -3257,6 +3424,7 @@ auto server_block_chaos_key(const DevServerBinding* binding, WkiChaosSurface sur
 }
 
 void blk_ring_signal_consumer_unchecked(DevServerBinding* binding) {
+    if (!binding->blk_zone_ref.live()) return;
     WkiPeer const* peer = wki_peer_find(binding->consumer_node);
     if (peer == nullptr) {
         return;
@@ -3275,10 +3443,7 @@ void blk_ring_signal_consumer_unchecked(DevServerBinding* binding) {
 
     // Reliable notify as fallback/backup for RoCE doorbell loss. The consumer
     // watches the pushed CQ state directly, so duplicate notifications are fine.
-    ZoneNotifyPayload notify = {};
-    notify.zone_id = binding->blk_zone_id;
-    notify.op_type = 0;  // completion notification
-    wki_send(binding->consumer_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_NOTIFY_POST, &notify, sizeof(notify));
+    static_cast<void>(binding->blk_zone_ref.notify_post(0));
 }
 
 void blk_ring_signal_consumer(DevServerBinding* binding, uint32_t ring_index, uint32_t operation_cookie, uint8_t block_opcode) {
@@ -3328,7 +3493,7 @@ auto wki_dev_server_chaos_deliver_doorbell(const WkiChaosBlockKey& key) -> bool 
 
     WkiChaosBlockKey const CURRENT =
         server_block_chaos_key(retained, WkiChaosSurface::BLOCK_DOORBELL, key.ring_index, key.operation_cookie, key.block_opcode);
-    bool const VALID = retained->blk_rdma_active && retained->blk_zone_ptr != nullptr &&
+    bool const VALID = retained->blk_rdma_active && retained->blk_zone_ref.live() && retained->blk_zone_ptr != nullptr &&
                        blk_ring_geometry_valid(blk_ring_geometry_snapshot(blk_ring_header(retained->blk_zone_ptr)),
                                                retained->block_dev != nullptr ? retained->block_dev->block_size : 0,
                                                retained->block_dev != nullptr ? retained->block_dev->total_blocks : 0) &&
@@ -3473,7 +3638,8 @@ void roce_push_completions_batch(DevServerBinding* binding, const BatchCqPush* e
 }
 
 void blk_ring_server_poll(DevServerBinding* binding) {
-    if (!binding->blk_rdma_active || binding->blk_zone_ptr == nullptr) {
+    if (!binding->blk_rdma_active || binding->blk_zone_ptr == nullptr || binding->retiring.load(std::memory_order_acquire) ||
+        !binding->blk_zone_ref.live()) {
         return;
     }
 
@@ -3504,7 +3670,7 @@ void blk_ring_server_poll(DevServerBinding* binding) {
     std::array<BatchCqPush, MAX_BATCH_CQ> batch_pushes = {};
     uint32_t batch_count = 0;
 
-    while (true) {
+    while (!binding->retiring.load(std::memory_order_acquire) && binding->blk_zone_ref.live()) {
         BlkRingGeometry const GEOMETRY = blk_ring_geometry_snapshot(hdr);
         BlkRingIndices const INDICES = blk_ring_indices_snapshot(hdr);
         if (!blk_ring_server_geometry_valid(binding, GEOMETRY) || !blk_ring_indices_valid(INDICES, GEOMETRY)) {
@@ -3533,6 +3699,10 @@ void blk_ring_server_poll(DevServerBinding* binding) {
         } else {
             switch (static_cast<BlkOpcode>(SQE.opcode)) {
                 case BlkOpcode::READ: {
+                    if (!binding->block_read_allowed) {
+                        cqe.status = -EACCES;
+                        break;
+                    }
                     uint8_t* dest = blk_data_slot(binding->blk_zone_ptr, BLK_RING_DEFAULT_SQ_DEPTH, BLK_RING_DEFAULT_CQ_DEPTH,
                                                   SQE.data_slot, BLK_RING_DEFAULT_DATA_SLOT_SIZE);
                     int const RET = ker::dev::block_read(binding->block_dev, SQE.lba, SQE.block_count, dest);
@@ -3568,9 +3738,13 @@ void blk_ring_server_poll(DevServerBinding* binding) {
                     break;
                 }
                 case BlkOpcode::FLUSH:
-                    cqe.status = ker::dev::block_flush(binding->block_dev);
+                    cqe.status = binding->block_read_only ? -EROFS : ker::dev::block_flush(binding->block_dev);
                     break;
                 case BlkOpcode::BULK_READ: {
+                    if (!binding->block_read_allowed) {
+                        cqe.status = -EACCES;
+                        break;
+                    }
                     // Streaming bulk read: read blocks into a bounded temporary
                     // buffer, then RDMA-write it to the registered consumer buffer.
                     if (!binding->blk_roce || binding->blk_rdma_transport == nullptr ||
@@ -3744,8 +3918,9 @@ void wki_dev_server_process_pending_zones() {
         uint32_t const ZONE_SZ = blk_ring_default_zone_size();
         uint8_t const ZONE_ACCESS = ZONE_ACCESS_LOCAL_READ | ZONE_ACCESS_LOCAL_WRITE | ZONE_ACCESS_REMOTE_READ | ZONE_ACCESS_REMOTE_WRITE;
 
-        int const ZONE_RET =
-            wki_zone_create(item.consumer_node, item.blk_zone_id, ZONE_SZ, ZONE_ACCESS, ZoneNotifyMode::POST_ONLY, ZoneTypeHint::MSG_QUEUE);
+        WkiZoneRef zone_ref;
+        int const ZONE_RET = wki_zone_create(item.consumer_node, item.blk_zone_id, ZONE_SZ, ZONE_ACCESS, ZoneNotifyMode::POST_ONLY,
+                                             ZoneTypeHint::MSG_QUEUE, &zone_ref);
         if (ZONE_RET != WKI_OK) {
             ker::mod::dbg::log("[WKI] Deferred block RDMA ring creation failed (err=%d) for zone 0x%08x - consumer falls back to msg path",
                                ZONE_RET, item.blk_zone_id);
@@ -3754,47 +3929,11 @@ void wki_dev_server_process_pending_zones() {
             continue;
         }
 
-        void* zone_ptr = wki_zone_get_ptr(item.blk_zone_id);
-        bool blk_rdma_active = (zone_ptr != nullptr);
-
-        if (!blk_rdma_active) {
-            ker::mod::dbg::log("[WKI] Deferred block RDMA zone ptr null for zone 0x%08x", item.blk_zone_id);
-            publish_deferred_block_attach_ack(binding, false);
-            wki_zone_destroy(item.blk_zone_id);
-            release_binding(binding);
-            continue;
-        }
-
-        // Check if the zone is RoCE-backed (needs explicit rdma_write/read sync)
-        WkiZone const* blk_zone = wki_zone_find(item.blk_zone_id);
-        bool blk_roce = false;
-        uint32_t blk_remote_rkey = 0;
-        WkiTransport* blk_rdma_transport = nullptr;
-        if (blk_zone != nullptr && blk_zone->is_roce) {
-            blk_roce = true;
-            blk_remote_rkey = blk_zone->remote_rkey;
-            blk_rdma_transport = blk_zone->rdma_transport;
-        }
-
-        bool binding_still_active = false;
-        {
-            uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
-            if (binding->active && !binding->retiring.load(std::memory_order_acquire) && binding->blk_zone_id == item.blk_zone_id) {
-                binding->blk_zone_ptr = zone_ptr;
-                binding->blk_rdma_active = true;
-                binding->blk_roce = blk_roce;
-                binding->blk_remote_rkey = blk_remote_rkey;
-                binding->blk_rdma_transport = blk_rdma_transport;
-                binding_still_active = true;
-            }
-            s_server_lock.unlock_irqrestore(SRV_FLAGS);
-        }
-
-        if (!binding_still_active) {
-            wki_zone_destroy(item.blk_zone_id);
-            release_binding(binding);
-            continue;
-        }
+        WkiZoneMemory const MEMORY = zone_ref.memory();
+        void* zone_ptr = MEMORY.data;
+        bool const BLK_ROCE = MEMORY.is_roce;
+        uint32_t const BLK_REMOTE_RKEY = MEMORY.remote_rkey;
+        WkiTransport* const BLK_RDMA_TRANSPORT = MEMORY.transport;
 
         // Initialize the ring header in local memory
         auto* ring_hdr = blk_ring_header(zone_ptr);
@@ -3814,18 +3953,41 @@ void wki_dev_server_process_pending_zones() {
 
         // For RoCE zones: push the entire ring header to the proxy so it
         // can see server_ready and device parameters
-        if (blk_roce && blk_rdma_transport != nullptr && blk_rdma_transport->rdma_write != nullptr && blk_remote_rkey != 0 &&
+        if (BLK_ROCE && BLK_RDMA_TRANSPORT != nullptr && BLK_RDMA_TRANSPORT->rdma_write != nullptr && BLK_REMOTE_RKEY != 0 &&
             blk_ring_server_geometry_valid(binding, blk_ring_geometry_snapshot(ring_hdr))) {
-            static_cast<void>(blk_rdma_transport->rdma_write(blk_rdma_transport, item.consumer_node, blk_remote_rkey, 0, ring_hdr,
+            static_cast<void>(BLK_RDMA_TRANSPORT->rdma_write(BLK_RDMA_TRANSPORT, item.consumer_node, BLK_REMOTE_RKEY, 0, ring_hdr,
                                                              sizeof(BlkRingHeader)));
         }
 
-        ker::mod::dbg::log("[WKI] Deferred block RDMA ring created: zone=0x%08x size=%u roce=%d", item.blk_zone_id, ZONE_SZ,
-                           blk_roce ? 1 : 0);
+        // Install the callback on this exact retained zone before making the
+        // initialized ring visible to pollers. Retirement refuses publication.
+        bool const ZONE_LIVE = zone_ref.set_handlers(nullptr, blk_zone_post_handler);
+        bool binding_still_active = false;
+        {
+            uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
+            if (ZONE_LIVE && binding->active && !binding->retiring.load(std::memory_order_acquire) &&
+                binding->blk_zone_id == item.blk_zone_id) {
+                binding->blk_zone_ref = std::move(zone_ref);
+                binding->blk_zone_ptr = zone_ptr;
+                binding->blk_rdma_active = true;
+                binding->blk_roce = BLK_ROCE;
+                binding->blk_remote_rkey = BLK_REMOTE_RKEY;
+                binding->blk_rdma_transport = BLK_RDMA_TRANSPORT;
+                binding_still_active = true;
+            }
+            s_server_lock.unlock_irqrestore(SRV_FLAGS);
+        }
+        if (!binding_still_active) {
+            static_cast<void>(zone_ref.destroy());
+            zone_ref.reset();
+            publish_deferred_block_attach_ack(binding, false);
+            release_binding(binding);
+            continue;
+        }
 
-        // Register a zone post_handler so that ZONE_NOTIFY_POST from the consumer
-        // triggers immediate ring polling instead of waiting for the ~10ms timer tick.
-        wki_zone_set_handlers(item.blk_zone_id, nullptr, blk_zone_post_handler);
+        ker::mod::dbg::log("[WKI] Deferred block RDMA ring created: zone=0x%08x size=%u roce=%d", item.blk_zone_id, ZONE_SZ,
+                           BLK_ROCE ? 1 : 0);
+
         publish_deferred_block_attach_ack(binding, true);
         release_binding(binding);
     }
@@ -4007,6 +4169,258 @@ void wki_dev_server_poll_rings() {
 }
 
 #ifdef WOS_SELFTEST
+auto wki_dev_server_selftest_zone_retention(WkiZoneRef& zone_ref) -> bool {
+    if (!zone_ref.live() || zone_ref.memory().size < blk_ring_default_zone_size()) return false;
+    DevServerBinding source;
+    source.blk_zone_ref = std::move(zone_ref);
+    source.blk_zone_ptr = source.blk_zone_ref.memory().data;
+    source.blk_rdma_active = true;
+    DevServerBinding moved(std::move(source));
+    DevServerBinding binding;
+    binding = std::move(moved);
+    bool valid = !source.blk_zone_ref && source.blk_zone_ptr == nullptr && !moved.blk_zone_ref && moved.blk_zone_ptr == nullptr &&
+                 binding.blk_zone_ref.live();
+    dev::BlockDevice device{};
+    unsigned flush_count = 0;
+    device.private_data = &flush_count;
+    device.flush = [](dev::BlockDevice* bdev) -> int {
+        ++*static_cast<unsigned*>(bdev->private_data);
+        return 0;
+    };
+    device.block_size = 512;
+    device.total_blocks = 16;
+    binding.block_dev = &device;
+    auto* header = blk_ring_header(binding.blk_zone_ptr);
+    header->sq_depth = BLK_RING_DEFAULT_SQ_DEPTH;
+    header->cq_depth = BLK_RING_DEFAULT_CQ_DEPTH;
+    header->data_slot_count = BLK_RING_DEFAULT_DATA_SLOTS;
+    header->data_slot_size = BLK_RING_DEFAULT_DATA_SLOT_SIZE;
+    header->block_size = device.block_size;
+    header->total_blocks = device.total_blocks;
+    header->server_ready = 1;
+    auto* sq = blk_sq_entries(binding.blk_zone_ptr);
+    auto* cq = blk_cq_entries(binding.blk_zone_ptr, BLK_RING_DEFAULT_SQ_DEPTH);
+    // Exercise the actual ring consumer with an issued write-only grant.
+    // Both ordinary and bulk reads must leave the data slot untouched and
+    // report no bytes, even when no bulk transport is installed.
+    auto* data =
+        blk_data_slot(binding.blk_zone_ptr, BLK_RING_DEFAULT_SQ_DEPTH, BLK_RING_DEFAULT_CQ_DEPTH, 0, BLK_RING_DEFAULT_DATA_SLOT_SIZE);
+    std::memset(data, 0x6D, 512);
+    unsigned reads = 0;
+    device.private_data = &reads;
+    device.read_blocks = [](dev::BlockDevice* bdev, uint64_t, size_t count, void* buffer) -> int {
+        ++*static_cast<unsigned*>(bdev->private_data);
+        std::memset(buffer, 0xA5, count * bdev->block_size);
+        return 0;
+    };
+    auto exercise_read = [&](BlkOpcode opcode, int expected, bool allowed) {
+        binding.block_read_allowed = allowed;
+        header->sq_head = header->sq_tail = header->cq_head = header->cq_tail = 0;
+        sq[0] = {};
+        sq[0].tag = 19;
+        sq[0].opcode = static_cast<uint8_t>(opcode);
+        sq[0].block_count = 1;
+        sq[0].data_slot = opcode == BlkOpcode::BULK_READ ? 1 : 0;
+        header->sq_head = 1;
+        blk_ring_server_poll(&binding);
+        return header->sq_tail == 1 && header->cq_head == 1 && cq[0].tag == 19 && cq[0].status == expected &&
+               cq[0].bytes_transferred == (expected == 0 ? 512U : 0U);
+    };
+    valid = exercise_read(BlkOpcode::READ, -EACCES, false) && valid;
+    valid = exercise_read(BlkOpcode::BULK_READ, -EACCES, false) && reads == 0 &&
+            std::all_of(data, data + 512, [](uint8_t byte) { return byte == 0x6D; }) && valid;
+    valid = exercise_read(BlkOpcode::READ, 0, true) && reads == 1 &&
+            std::all_of(data, data + 512, [](uint8_t byte) { return byte == 0xA5; }) && valid;
+    device.private_data = &flush_count;
+    header->sq_head = header->sq_tail = header->cq_head = header->cq_tail = 0;
+    sq[0] = {};
+    sq[0].opcode = static_cast<uint8_t>(BlkOpcode::FLUSH);
+    binding.block_read_only = true;
+    header->sq_head = 1;
+    blk_ring_server_poll(&binding);
+    valid = cq[0].status == -EROFS && cq[0].bytes_transferred == 0 && flush_count == 0 && valid;
+    binding.block_read_only = false;
+    header->sq_head = header->sq_tail = header->cq_head = header->cq_tail = 0;
+    cq[0] = cq[1] = {};
+    sq[0].tag = 1;
+    sq[0].opcode = static_cast<uint8_t>(BlkOpcode::FLUSH);
+    header->sq_head = 1;
+    blk_ring_server_poll(&binding);
+    valid = valid && flush_count == 1 && header->sq_tail == 1 && header->cq_head == 1 && cq[0].tag == 1 && cq[0].status == 0;
+    sq[1].tag = 2;
+    sq[1].opcode = static_cast<uint8_t>(BlkOpcode::FLUSH);
+    header->sq_head = 2;
+    binding.retiring.store(true, std::memory_order_release);
+    blk_ring_server_poll(&binding);
+    valid = valid && flush_count == 1 && header->sq_tail == 1 && header->cq_head == 1;
+    binding.retiring.store(false, std::memory_order_release);
+    valid = binding.blk_zone_ref.destroy() == WKI_OK && valid;
+    blk_ring_server_poll(&binding);
+    valid = valid && flush_count == 1 && header->sq_tail == 1 && header->cq_head == 1 && cq[1].tag == 0 && !binding.blk_poll_active.load();
+    zone_ref = std::move(binding.blk_zone_ref);
+    binding.blk_zone_ptr = nullptr;
+    return valid;
+}
+
+auto wki_dev_server_selftest_block_access() -> bool {
+    if (g_wki.initialized) return false;
+    std::array<unsigned, 3> calls{};
+    dev::BlockDevice device{};
+    device.block_size = 512;
+    device.total_blocks = 16;
+    device.private_data = &calls;
+    device.read_blocks = [](dev::BlockDevice* bdev, uint64_t, size_t count, void* buffer) -> int {
+        ++static_cast<std::array<unsigned, 3>*>(bdev->private_data)->at(0);
+        std::memset(buffer, 0xA5, count * bdev->block_size);
+        return 0;
+    };
+    device.write_blocks = [](dev::BlockDevice* bdev, uint64_t, size_t, const void*) -> int {
+        ++static_cast<std::array<unsigned, 3>*>(bdev->private_data)->at(1);
+        return 0;
+    };
+    device.flush = [](dev::BlockDevice* bdev) -> int {
+        ++static_cast<std::array<unsigned, 3>*>(bdev->private_data)->at(2);
+        return 0;
+    };
+    WkiChannel channel{};
+    DevServerBinding source;
+    source.resource_type = ResourceType::BLOCK;
+    source.block_dev = &device;
+    source.block_read_allowed = true;
+    source.block_read_only = true;
+    source.channel_identity = {&channel, 0x7D01, 41, 3};
+    DevServerBinding moved(std::move(source));
+    DevServerBinding binding;
+    binding = std::move(moved);
+    bool valid = binding.block_read_allowed && binding.block_read_only;
+    std::array<uint8_t, sizeof(uint64_t) + sizeof(uint32_t) + 512> bytes{};
+    uint32_t const COUNT = 1;
+    std::memcpy(bytes.data() + sizeof(uint64_t), &COUNT, sizeof(COUNT));
+    DeferredVfsOp op{};
+    op.retained_binding = &binding;
+    op.channel_identity = binding.channel_identity;
+    op.req_data = bytes.data();
+    op.op_id = OP_BLOCK_WRITE;
+    op.req_data_len = bytes.size();
+    run_deferred_block_op(&op);
+    op.op_id = OP_BLOCK_FLUSH;
+    op.req_data_len = 0;
+    run_deferred_block_op(&op);
+    valid = calls == std::array<unsigned, 3>{} && valid;
+    binding.block_read_allowed = false;
+    binding.block_read_only = false;
+    op.op_id = OP_BLOCK_READ;
+    op.req_data_len = sizeof(uint64_t) + sizeof(uint32_t);
+    run_deferred_block_op(&op);
+    valid = calls == std::array<unsigned, 3>{} && valid;
+    binding.block_read_allowed = true;
+    run_deferred_block_op(&op);
+    op.op_id = OP_BLOCK_WRITE;
+    op.req_data_len = bytes.size();
+    run_deferred_block_op(&op);
+    op.op_id = OP_BLOCK_FLUSH;
+    op.req_data_len = 0;
+    run_deferred_block_op(&op);
+    return calls == std::array<unsigned, 3>{1, 1, 1} && valid;
+}
+
+auto wki_dev_server_selftest_component_batch_admission() -> bool {
+    constexpr std::array<uint8_t, 6> PATH = {'a', '/', '.', '.', '/', 'b'};
+    auto const RECORD = ker::mod::security::credential_record::encode(ker::mod::security::Snapshot::bootstrap_root());
+    std::array<uint8_t, sizeof(VfsMetadataBatchHeader) + ker::mod::security::credential_record::SIZE + sizeof(uint16_t) + PATH.size()>
+        request{};
+    VfsMetadataBatchHeader header{
+        .version = VFS_METADATA_BATCH_STAT_VERSION, .operation = VfsMetadataBatchOperation::STAT_FOLLOW, .count = 1, .mode = 0};
+    std::memcpy(request.data(), &header, sizeof(header));
+    std::memcpy(request.data() + sizeof(header), RECORD.data(), RECORD.size());
+    auto const LENGTH = static_cast<uint16_t>(PATH.size());
+    size_t const OFFSET = sizeof(header) + RECORD.size();
+    std::memcpy(request.data() + OFFSET, &LENGTH, sizeof(LENGTH));
+    std::memcpy(request.data() + OFFSET + sizeof(LENGTH), PATH.data(), PATH.size());
+    VfsMetadataBatchHeader decoded{};
+    std::array<VfsMetadataBatchEntryView, VFS_METADATA_BATCH_MAX_ITEMS> entries{};
+    size_t response_length = 0;
+    ker::mod::security::Snapshot credentials;
+    auto parse = [&](bool component_paths, size_t length) {
+        return vfs_metadata_batch_preflight(request.data(), static_cast<uint16_t>(length), "/tmp", "/tmp", &decoded, &entries,
+                                            &response_length, &credentials, component_paths);
+    };
+    if (parse(false, request.size()) != -EINVAL || parse(true, request.size()) != 0 ||
+        credentials != ker::mod::security::Snapshot::bootstrap_root() || entries[0].first_len != PATH.size() ||
+        std::memcmp(request.data() + entries[0].first_offset, PATH.data(), PATH.size()) != 0 || parse(true, request.size() - 1) != -EINVAL)
+        return false;
+    request[OFFSET + sizeof(LENGTH)] = '/';
+    if (parse(true, request.size()) != -EINVAL) return false;
+    request[OFFSET + sizeof(LENGTH)] = '\0';
+    if (parse(true, request.size()) != -EINVAL) return false;
+    // Even negotiated peers cannot use dot paths in legacy mutation batches.
+    header.version = VFS_METADATA_BATCH_VERSION;
+    header.operation = VfsMetadataBatchOperation::UNLINK;
+    std::memcpy(request.data(), &header, sizeof(header));
+    std::memcpy(request.data() + sizeof(header), &LENGTH, sizeof(LENGTH));
+    std::memcpy(request.data() + sizeof(header) + sizeof(LENGTH), PATH.data(), PATH.size());
+    return parse(true, sizeof(header) + sizeof(LENGTH) + PATH.size()) == -ENOTSUP;
+}
+
+auto wki_dev_server_selftest_mapped_mutation_batch_admission() -> bool {
+    constexpr std::array<uint8_t, 6> PATH = {'a', '/', '.', '.', '/', 'b'};
+    auto const RECORD = ker::mod::security::credential_record::encode(ker::mod::security::Snapshot::bootstrap_root());
+    for (auto operation : {VfsMetadataBatchOperation::CREATE_CLOSE, VfsMetadataBatchOperation::UNLINK, VfsMetadataBatchOperation::RENAME}) {
+        std::array<uint8_t, 256> request{};
+        VfsMetadataBatchHeader header{.version = VFS_METADATA_BATCH_MUTATION_VERSION,
+                                      .operation = operation,
+                                      .count = 2,
+                                      .mode = operation == VfsMetadataBatchOperation::CREATE_CLOSE ? 0600U : 0U};
+        std::memcpy(request.data(), &header, sizeof(header));
+        std::memcpy(request.data() + sizeof(header), RECORD.data(), RECORD.size());
+        size_t length = sizeof(header) + RECORD.size();
+        auto const PATH_LENGTH = static_cast<uint16_t>(PATH.size());
+        for (unsigned item = 0; item < header.count; ++item) {
+            std::memcpy(request.data() + length, &PATH_LENGTH, sizeof(PATH_LENGTH));
+            length += sizeof(PATH_LENGTH);
+            if (operation == VfsMetadataBatchOperation::RENAME) {
+                std::memcpy(request.data() + length, &PATH_LENGTH, sizeof(PATH_LENGTH));
+                length += sizeof(PATH_LENGTH);
+            }
+            std::memcpy(request.data() + length, PATH.data(), PATH.size());
+            length += PATH.size();
+            if (operation == VfsMetadataBatchOperation::RENAME) {
+                std::memcpy(request.data() + length, PATH.data(), PATH.size());
+                length += PATH.size();
+            }
+        }
+        VfsMetadataBatchHeader decoded{};
+        std::array<VfsMetadataBatchEntryView, VFS_METADATA_BATCH_MAX_ITEMS> entries{};
+        size_t response_length = 0;
+        ker::mod::security::Snapshot credentials;
+        auto parse = [&](bool components, size_t size) {
+            return vfs_metadata_batch_preflight(request.data(), static_cast<uint16_t>(size), "/tmp", "/tmp", &decoded, &entries,
+                                                &response_length, &credentials, components);
+        };
+        if (parse(false, length) != -EINVAL || parse(true, length) != 0 || decoded.version != VFS_METADATA_BATCH_MUTATION_VERSION ||
+            credentials != ker::mod::security::Snapshot::bootstrap_root() || response_length != sizeof(header) + 2 * sizeof(int32_t))
+            return false;
+        // Malformed last input rejects the whole envelope before publication.
+        decoded = {};
+        response_length = 777;
+        if (parse(true, length - 1) != -EINVAL || decoded.count != 0 || response_length != 777) return false;
+        request[length - 1] = 0;
+        if (parse(true, length) != -EINVAL || decoded.count != 0 || response_length != 777) return false;
+        request[length - 1] = 'b';
+        header.version = VFS_METADATA_BATCH_VERSION;
+        std::memcpy(request.data(), &header, sizeof(header));
+        if (parse(true, length) != -ENOTSUP) return false;
+        header.version = VFS_METADATA_BATCH_STAT_VERSION;
+        std::memcpy(request.data(), &header, sizeof(header));
+        if (parse(true, length) != -EINVAL) return false;
+        header.version = VFS_METADATA_BATCH_MUTATION_VERSION;
+        std::memcpy(request.data(), &header, sizeof(header));
+        request[sizeof(header)] = 0xff;
+        if (parse(true, length) == 0) return false;
+    }
+    return true;
+}
+
 auto wki_dev_server_selftest_deferred_vfs_storage_is_coallocated() -> bool {
     constexpr std::array<uint8_t, 5> REQUEST = {0x11, 0x22, 0x33, 0x44, 0x55};
     init_vfs_op_work_pool();
@@ -4020,6 +4434,8 @@ auto wki_dev_server_selftest_deferred_vfs_storage_is_coallocated() -> bool {
             break;
         }
         auto* storage = reinterpret_cast<DeferredVfsStorage*>(op);
+        op->identity_policy = 0x1234;
+        op->identity_capabilities = 0x5678;
         op->req_data_len = static_cast<uint16_t>(REQUEST.size());
         std::memcpy(op->req_data, REQUEST.data(), REQUEST.size());
         fixed_storage = fixed_storage && op->fixed_vfs_op && !op->fixed_async_close && !op->fixed_block_op &&
@@ -4032,9 +4448,31 @@ auto wki_dev_server_selftest_deferred_vfs_storage_is_coallocated() -> bool {
     }
 
     DeferredVfsOp* recycled = try_alloc_vfs_op_work();
-    bool const RECYCLED = recycled != nullptr && recycled->fixed_vfs_op && recycled->req_data != nullptr;
+    bool const RECYCLED = recycled != nullptr && recycled->fixed_vfs_op && recycled->req_data != nullptr &&
+                          recycled->identity_policy == 0 && recycled->identity_capabilities == 0;
     deferred_vfs_op_release(recycled);
-    return EXHAUSTION_IS_BOUNDED && RECYCLED;
+    VfsOpWorkerShard shard{};
+    WkiHeader header{};
+    header.src_node = 0xFFFE;
+    header.channel_id = 42;
+    WkiChannel channel{};
+    WkiChannelIdentity identity{.channel = &channel, .peer_node_id = header.src_node, .channel_id = header.channel_id, .generation = 123};
+    uint64_t policy = 0xFEDC;
+    uint16_t capabilities = WKI_CAP_VFS_OPEN_IDENTITY;
+    if (!try_queue_pre_admitted_vfs_op(&shard, &header, identity, OP_VFS_OPEN_READ_AS, REQUEST.data(), REQUEST.size(), policy,
+                                       capabilities))
+        return false;
+    policy = 0;
+    capabilities = 0;
+    auto* queued = shard.head;
+    bool const CAPTURED = queued != nullptr && queued == shard.tail && shard.pending.load(std::memory_order_relaxed) == 1 &&
+                          queued->identity_policy == 0xFEDC && queued->identity_policy != policy &&
+                          queued->identity_capabilities == WKI_CAP_VFS_OPEN_IDENTITY && queued->identity_capabilities != capabilities &&
+                          channel_identity_matches(queued->channel_identity, identity) &&
+                          std::memcmp(queued->req_data, REQUEST.data(), REQUEST.size()) == 0;
+    if (queued != nullptr) release_binding(queued->retained_binding);
+    deferred_vfs_op_release(queued);
+    return EXHAUSTION_IS_BOUNDED && RECYCLED && CAPTURED;
 }
 
 auto wki_dev_server_selftest_async_vfs_close_uses_fixed_admission() -> bool {
@@ -4146,9 +4584,70 @@ auto wki_dev_server_selftest_retirement_ownership_guards() -> bool {
            OTHER_PEER_EXCLUDED;
 }
 
+auto wki_dev_server_selftest_vfs_sibling_binding() -> bool {
+    WkiChannel channel{};
+    DevServerBinding origin{}, sibling{};
+    origin.resource_type = sibling.resource_type = ResourceType::VFS;
+    origin.consumer_node = sibling.consumer_node = 7;
+    origin.resource_id = sibling.resource_id = 9;
+    origin.resource_incarnation = sibling.resource_incarnation = {.owner_boot_epoch = 11, .resource_incarnation = 13};
+    origin.vfs_export_dev_id = sibling.vfs_export_dev_id = 17;
+    origin.vfs_export_publication_revision = sibling.vfs_export_publication_revision = 20;
+    std::strcpy(origin.vfs_export_path, "/export");
+    std::strcpy(sibling.vfs_export_path, "/export");
+    sibling.active = true;
+    sibling.channel_identity = {.channel = &channel, .peer_node_id = 7, .channel_id = 42, .generation = 23};
+    auto matches = [&] { return vfs_sibling_binding_matches(origin, sibling, 42, 23); };
+    bool ok = matches() && !vfs_sibling_binding_matches(origin, sibling, 42, 24) && !vfs_sibling_binding_matches(origin, sibling, 43, 23);
+    sibling.consumer_node = 8;
+    ok = !matches() && ok;
+    sibling.consumer_node = 7;
+    sibling.channel_identity.peer_node_id = 8;
+    ok = !matches() && ok;
+    sibling.channel_identity.peer_node_id = 7;
+    sibling.resource_id = 10;
+    ok = !matches() && ok;
+    sibling.resource_id = 9;
+    sibling.resource_incarnation.owner_boot_epoch = 12;
+    ok = !matches() && ok;
+    sibling.resource_incarnation.owner_boot_epoch = 11;
+    sibling.resource_incarnation.resource_incarnation = 14;
+    ok = !matches() && ok;
+    sibling.resource_incarnation.resource_incarnation = 13;
+    sibling.vfs_export_publication_revision = 22;
+    ok = !matches() && ok;
+    sibling.vfs_export_publication_revision = 20;
+    sibling.vfs_export_dev_id = 18;
+    ok = !matches() && ok;
+    sibling.vfs_export_dev_id = 17;
+    sibling.vfs_export_path[1] = 'x';
+    ok = !matches() && ok;
+    sibling.vfs_export_path[1] = 'e';
+    sibling.active = false;
+    ok = !matches() && ok;
+    sibling.active = true;
+    sibling.epoch_reset_pending = true;
+    ok = !matches() && ok;
+    sibling.epoch_reset_pending = false;
+    sibling.detach_cleanup_pending = true;
+    ok = !matches() && ok;
+    sibling.detach_cleanup_pending = false;
+    // Accepted work can finish using its pin; retirement forbids new pins.
+    ok = matches() && retain_binding_locked(&sibling) && sibling.refs.load() == 1 && ok;
+    sibling.retiring.store(true);
+    ok = !matches() && !retain_binding_locked(&sibling) && sibling.refs.load() == 1 && ok;
+    release_binding(&sibling);
+    ok = sibling.refs.load() == 0 && ok;
+    sibling.retiring.store(false);
+    origin.retiring.store(true);
+    origin.active = false;
+    return matches() && ok;
+}
+
 auto wki_dev_server_selftest_binding_lifecycle_flags() -> bool {
     DevServerBinding binding;
     binding.active = true;
+    binding.consumer_boot_epoch = 42;
     binding.refs.store(2, std::memory_order_relaxed);
     binding.retiring.store(true, std::memory_order_relaxed);
     binding.detach_cleanup_pending = true;
@@ -4156,8 +4655,52 @@ auto wki_dev_server_selftest_binding_lifecycle_flags() -> bool {
     binding.blk_attach_ack_pending = true;
 
     DevServerBinding moved(std::move(binding));
-    return moved.active && moved.refs.load(std::memory_order_relaxed) == 2 && moved.retiring.load(std::memory_order_relaxed) &&
-           moved.detach_cleanup_pending && moved.detach_cleanup_claimed && moved.blk_attach_ack_pending;
+    DevServerBinding assigned;
+    assigned = std::move(moved);
+    return assigned.consumer_boot_epoch == 42 && assigned.active && assigned.refs.load(std::memory_order_relaxed) == 2 &&
+           assigned.retiring.load(std::memory_order_relaxed) && assigned.detach_cleanup_pending && assigned.detach_cleanup_claimed &&
+           assigned.blk_attach_ack_pending;
+}
+
+auto wki_dev_server_selftest_with_directory_grant_bindings(bool (*exercise)(DevServerBinding&, DevServerBinding&)) -> bool {
+    // These selftests run before wki_init: no transport, peer or cleanup worker
+    // can observe the temporary node identity or mutate these fixture bindings.
+    if (g_wki.initialized || exercise == nullptr) return false;
+    auto const SAVED_NODE = g_wki.my_node_id;
+    auto const SAVED_BOOT = g_wki.local_boot_epoch;
+    g_wki.my_node_id = 0x701;
+    g_wki.local_boot_epoch = 101;
+    WkiChannel source_channel{}, destination_channel{};
+    std::list<DevServerBinding> prepared;
+    for (auto* channel : {&source_channel, &destination_channel}) {
+        auto& binding = prepared.emplace_back();
+        binding.active = true;
+        binding.consumer_node = channel == &source_channel ? 0x702 : 0x703;
+        binding.consumer_boot_epoch = channel == &source_channel ? 102 : 103;
+        binding.assigned_channel = 37;
+        binding.channel_identity = {channel, binding.consumer_node, 37, 4};
+        binding.resource_type = ResourceType::VFS;
+        binding.resource_id = 77;
+        binding.resource_incarnation = {101, 9};
+        binding.vfs_export_publication_revision = 23;
+        binding.refs.store(1);
+    }
+    auto* source = &prepared.front();
+    auto* destination = &prepared.back();
+    uint64_t flags = s_server_lock.lock_irqsave();
+    g_bindings.splice(g_bindings.end(), prepared);
+    s_server_lock.unlock_irqrestore(flags);
+    bool const RESULT = exercise(*source, *destination);
+    flags = s_server_lock.lock_irqsave();
+    bool const DRAINED = source->refs.load() == 1 && destination->refs.load() == 1;
+    for (auto it = g_bindings.begin(); it != g_bindings.end();) {
+        auto current = it++;
+        if (&*current == source || &*current == destination) prepared.splice(prepared.end(), g_bindings, current);
+    }
+    s_server_lock.unlock_irqrestore(flags);
+    g_wki.my_node_id = SAVED_NODE;
+    g_wki.local_boot_epoch = SAVED_BOOT;
+    return RESULT && DRAINED;
 }
 
 auto wki_dev_server_selftest_block_writer_lease_transfer() -> bool {

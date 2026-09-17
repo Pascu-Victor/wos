@@ -49,7 +49,7 @@ def main() -> None:
         [
             "WKI_CHAOS_WORKLOAD_COMMAND_MAX = 256",
             "WKI_CHAOS_WORKLOAD_SCRATCH_BYTES",
-            "wki_chaos_workload_compute_publish_wait(uint64_t absolute_deadline_us)",
+            "wki_chaos_workload_compute_publish_wait(uint64_t absolute_deadline_us,",
         ],
         "bounded adapter header",
     )

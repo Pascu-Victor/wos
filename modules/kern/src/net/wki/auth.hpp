@@ -9,6 +9,7 @@
 namespace ker::net::wki {
 
 struct WkiHeader;
+struct WkiAuthTrailer;
 struct WkiPeer;
 enum class MsgType : uint8_t;
 
@@ -28,7 +29,11 @@ enum class WkiPolicy : uint64_t {
     DEVICE_ATTACH = 1ULL << 7U,
     BLOCK_READ = 1ULL << 8U,
     BLOCK_WRITE = 1ULL << 9U,
-    ALL = (1ULL << 10U) - 1U,
+    // Identity trust is separately provisioned; operation permission alone
+    // never authorizes a submitted local UID/GID namespace.
+    IDENTITY_SAME_DOMAIN = 1ULL << 10U,
+    IDENTITY_ROOT = 1ULL << 11U,
+    ALL = (1ULL << 12U) - 1U,
 };
 
 constexpr auto wki_policy_bits(WkiPolicy policy) -> uint64_t { return static_cast<uint64_t>(policy); }
@@ -80,7 +85,9 @@ auto wki_auth_verify_frame(const WkiHeader* header, const uint8_t* frame, size_t
 // supplied both boot epochs. Teardown erases the active keys exactly once.
 auto wki_auth_install_peer_session(WkiPeer* peer, uint32_t remote_boot_epoch) -> bool;
 auto wki_auth_prepare_peer_session(WkiPeer* peer, uint32_t remote_boot_epoch) -> bool;
-auto wki_auth_confirm_peer_session(WkiPeer* peer) -> bool;
+// Caller holds exclusive peer lifecycle after verifying this trailer and the
+// HELLO_CONFIRM payload. Bind promotion to that exact pending session/counter.
+auto wki_auth_confirm_peer_session(WkiPeer* peer, const WkiAuthTrailer& verified_trailer) -> bool;
 void wki_auth_retire_peer_session(WkiPeer* peer);
 
 // Central policy classifier. Responses and lifecycle controls required to

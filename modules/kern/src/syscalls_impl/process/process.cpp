@@ -8,7 +8,12 @@
 #include <cstdint>
 #include <cstring>
 #include <iterator>
+#include <memory>
+#include <new>
 #include <platform/sched/resource_as.hpp>
+#include <platform/sched/session.hpp>
+#include <platform/security/authorization.hpp>
+#include <platform/sys/mutex.hpp>
 #include <utility>
 
 #include "abi/callnums/process.h"
@@ -81,6 +86,274 @@ static constexpr size_t WOS_MINSIGSTKSZ = 2048;
 
 namespace ker::syscall::process {
 
+// Owns lookup/snapshot references through ordinary return and fatal syscall
+// cleanup. A group keeps the unvisited cohort alive across each remote wait.
+class PendingSignalTarget {
+   public:
+    explicit PendingSignalTarget(ker::mod::sched::task::Task* registration_owner = ker::mod::sched::get_current_task())
+        : owner(registration_owner) {
+        if (owner != nullptr) {
+            next = owner->pending_signal_targets;
+            owner->pending_signal_targets = this;
+        }
+    }
+    explicit PendingSignalTarget(ker::mod::sched::task::Task& target,
+                                 ker::mod::sched::task::Task* registration_owner = ker::mod::sched::get_current_task())
+        : PendingSignalTarget(registration_owner) {
+        targets[0] = &target;
+        count = 1;
+    }
+    PendingSignalTarget(const PendingSignalTarget&) = delete;
+    auto operator=(const PendingSignalTarget&) -> PendingSignalTarget& = delete;
+    ~PendingSignalTarget() { cancel(); }
+    void set_cleanup(LocalSignalCleanup cleanup, void* context) {
+        callback_cleanup = cleanup;
+        callback_context = context;
+    }
+    auto capture(ker::mod::sched::ActiveTaskPredicate predicate, void* context) -> int {
+        return capture_with(predicate, context, ker::mod::sched::snapshot_active_task_lifetime_refs_if);
+    }
+    void retain_if(ker::mod::sched::ActiveTaskPredicate predicate, void* context) {
+        size_t i = 0;
+        while (i < count) {
+            auto* target = targets[cursor + i];
+            // The predicate may wait for publication. Keep every remaining
+            // reference in a dense registered array at each such wait.
+            if (predicate(target, context))
+                ++i;
+            else {
+                --count;
+                targets[cursor + i] = targets[cursor + count];
+                targets[cursor + count] = nullptr;
+                target->release();
+            }
+        }
+    }
+    auto view() const -> std::span<ker::mod::sched::task::Task* const> { return {targets + cursor, count}; }
+    // Transfer one reference immediately into signal_as's nested owner. No
+    // blocking or allocation may separate this transfer from its adoption.
+    auto take() -> ker::mod::sched::task::Task* {
+        if (count == 0) return nullptr;
+        auto* target = targets[cursor];
+        targets[cursor++] = nullptr;
+        --count;
+        return target;
+    }
+    auto admit_local(ker::mod::sched::task::Task& target) -> ker::mod::sched::task::Task::SignalAdmissionIdentity {
+        auto identity = target.begin_local_signal_admission();
+        if (identity.local_lease) local_admission = &target;
+        return identity;
+    }
+    void cancel() {
+        if (owner != nullptr) {
+            owner->pending_signal_targets = next;
+            owner = nullptr;
+        }
+        auto cleanup = std::exchange(callback_cleanup, nullptr);
+        auto* context = std::exchange(callback_context, nullptr);
+        if (cleanup != nullptr) cleanup(context);
+        // Fatal syscall cleanup owns this registration too. A transfer must
+        // not wait forever for a lease left on an abandoned caller stack.
+        if (local_admission != nullptr) {
+            local_admission->end_local_signal_admission();
+            local_admission = nullptr;
+        }
+        while (auto* target = take()) target->release();
+        if (targets != inline_targets.data()) delete[] targets;
+        targets = inline_targets.data();
+        capacity = inline_targets.size();
+        cursor = 0;
+    }
+#ifdef WOS_SELFTEST
+    static auto selftest() -> bool;
+#endif
+
+   private:
+    using Task = ker::mod::sched::task::Task;
+    using Snapshot = size_t (*)(ker::mod::sched::ActiveTaskPredicate, void*, Task**, size_t);
+    auto capture_with(ker::mod::sched::ActiveTaskPredicate predicate, void* context, Snapshot snapshot, bool fail_allocation = false)
+        -> int {
+        if (count != 0) return -EINVAL;
+        // Concurrent forks may grow the registry between the size query and
+        // retry. Bound retries; every failure occurs before any signal effect.
+        constexpr unsigned ATTEMPTS = 4;
+        for (unsigned attempt = 0; attempt < ATTEMPTS; ++attempt) {
+            size_t const REQUIRED = snapshot(predicate, context, targets, capacity);
+            if (REQUIRED <= capacity) {
+                count = REQUIRED;
+                cursor = 0;
+                return 0;
+            }
+            if (attempt + 1 == ATTEMPTS) break;
+            auto** larger = fail_allocation ? nullptr : new (std::nothrow) Task*[REQUIRED];
+            if (larger == nullptr) return -ENOMEM;
+            auto** previous = targets;
+            targets = larger;
+            capacity = REQUIRED;
+            if (previous != inline_targets.data()) delete[] previous;
+        }
+        return -EAGAIN;
+    }
+    ker::mod::sched::task::Task* owner = nullptr;
+    PendingSignalTarget* next = nullptr;
+    Task* local_admission = nullptr;
+    LocalSignalCleanup callback_cleanup = nullptr;
+    void* callback_context = nullptr;
+    std::array<Task*, 32> inline_targets{};
+    Task** targets = inline_targets.data();
+    size_t capacity = inline_targets.size();
+    size_t count = 0;
+    size_t cursor = 0;
+};
+
+void cleanup_signal_targets(ker::mod::sched::task::Task& owner) {
+    while (owner.pending_signal_targets != nullptr) owner.pending_signal_targets->cancel();
+}
+
+#ifdef WOS_SELFTEST
+auto PendingSignalTarget::selftest() -> bool {
+    // Boot KTEST runs after setup_queues, before a current task exists.
+    // Exercise the same registration/cleanup path with an explicit owner.
+    Task caller{};
+    auto* current = &caller;
+    Task target{};
+    struct Fixture {
+        Task* target;
+        size_t required;
+        unsigned calls = 0;
+        bool grow = false;
+    } fixture{&target, 2};
+    auto snapshot = [](ker::mod::sched::ActiveTaskPredicate, void* context, Task** out, size_t capacity) -> size_t {
+        auto& test = *static_cast<Fixture*>(context);
+        ++test.calls;
+        size_t const REQUIRED = test.grow ? capacity + 1 : test.required;
+        if (REQUIRED > capacity) return REQUIRED;
+        for (size_t i = 0; i < REQUIRED; ++i) {
+            if (!test.target->try_acquire_lifetime_ref()) return i;
+            out[i] = test.target;
+        }
+        return REQUIRED;
+    };
+    bool ok = true;
+    for (size_t required : {size_t{2}, size_t{40}}) {
+        fixture = {&target, required};
+        {
+            PendingSignalTarget cohort(current);
+            ok &= cohort.capture_with(nullptr, &fixture, snapshot) == 0 && cohort.count == required &&
+                  target.ref_count.load() == required + 1;
+            ok &= cohort.capture_with(nullptr, &fixture, snapshot) == -EINVAL;
+            auto* selected = cohort.take();
+            ok &= selected == &target && cohort.count == required - 1;
+            if (selected != nullptr) {
+                PendingSignalTarget active(*selected, current);
+                ok &= current->pending_signal_targets == &active && active.next == &cohort;
+            }
+            ok &= current->pending_signal_targets == &cohort && target.ref_count.load() == required;
+        }
+        ok &= current->pending_signal_targets == nullptr && target.ref_count.load() == 1;
+    }
+    fixture = {&target, 40};
+    {
+        PendingSignalTarget cohort(current);
+        ok &= cohort.capture_with(nullptr, &fixture, snapshot) == 0;
+        struct Selection {
+            PendingSignalTarget* cohort;
+            unsigned visited = 0;
+            bool dense = true;
+        } selection{&cohort};
+        cohort.retain_if(
+            [](Task*, void* context) {
+                auto& state = *static_cast<Selection*>(context);
+                for (auto* retained : state.cohort->view()) state.dense &= retained != nullptr;
+                return ++state.visited % 2 == 0;
+            },
+            &selection);
+        ok &= selection.visited == 40 && selection.dense && cohort.view().size() == 20 && target.ref_count.load() == 21;
+        cleanup_signal_targets(*current);
+        ok &= cohort.view().empty() && target.ref_count.load() == 1 && current->pending_signal_targets == nullptr;
+    }
+    fixture = {&target, 40};
+    {
+        PendingSignalTarget cohort(current);
+        ok &= cohort.capture_with(nullptr, &fixture, snapshot, true) == -ENOMEM && cohort.count == 0 && fixture.calls == 1;
+        ok &= target.ref_count.load() == 1;
+    }
+    fixture = {&target, 40, 0, true};
+    {
+        PendingSignalTarget cohort(current);
+        ok &= cohort.capture_with(nullptr, &fixture, snapshot) == -EAGAIN && cohort.count == 0 && fixture.calls == 4;
+        ok &= cohort.targets != cohort.inline_targets.data() && target.ref_count.load() == 1;
+        cohort.cancel();
+        ok &= cohort.targets == cohort.inline_targets.data() && cohort.capacity == cohort.inline_targets.size();
+    }
+    fixture = {&target, 40};
+    {
+        PendingSignalTarget cohort(current);
+        ok &= cohort.capture_with(nullptr, &fixture, snapshot) == 0;
+        auto* selected = cohort.take();
+        if (selected == nullptr) return false;
+        PendingSignalTarget active(*selected, current);
+        // Fatal cleanup must release both the in-flight target and all
+        // unvisited references, then tolerate normal destructor reentry.
+        cleanup_signal_targets(*current);
+        ok &= current->pending_signal_targets == nullptr && target.ref_count.load() == 1 && cohort.count == 0 && active.count == 0 &&
+              cohort.targets == cohort.inline_targets.data();
+    }
+    {
+        PendingSignalTarget first(current);
+        PendingSignalTarget second(current);
+        auto const INITIAL = first.admit_local(target);
+        auto const ALSO_LOCAL = second.admit_local(target);
+        ok &= INITIAL.local_lease && ALSO_LOCAL.local_lease && !target.local_signal_admissions_drained();
+        target.publish_accepted_signal_route(0x7B710001, 77);
+        PendingSignalTarget after_cutover(current);
+        auto const REMOTE = after_cutover.admit_local(target);
+        ok &= REMOTE.remote && !REMOTE.local_lease;
+        target.signal_generate_pending_mask(uint64_t{1} << 11);
+        after_cutover.cancel();
+        second.cancel();
+        ok &= !target.local_signal_admissions_drained();
+        // Exercise actual fatal-owner cleanup, then normal destructors. The
+        // remaining local effect drains exactly once before target release.
+        cleanup_signal_targets(*current);
+        ok &= target.local_signal_admissions_drained() && target.signal_pending_bits() == (uint64_t{1} << 11);
+        ok &= current->pending_signal_targets == nullptr && target.ref_count.load() == 1;
+    }
+    target.signal_pending_store(0);
+    struct CallbackStorage {
+        unsigned releases = 0;
+        uint64_t* values = nullptr;
+    } storage;
+    auto release_storage = [](void* opaque) noexcept {
+        auto& state = *static_cast<CallbackStorage*>(opaque);
+        ++state.releases;
+        delete[] std::exchange(state.values, nullptr);
+    };
+    for (bool fatal : {false, true}) {
+        storage = {};
+        {
+            PendingSignalTarget cohort(current);
+            cohort.set_cleanup(release_storage, &storage);
+            storage.values = new (std::nothrow) uint64_t[40];
+            if (storage.values == nullptr) return false;
+            fixture = {&target, 40};
+            ok &= cohort.capture_with(nullptr, &fixture, snapshot) == 0;
+            auto* selected = cohort.take();
+            if (selected == nullptr) return false;
+            PendingSignalTarget active(*selected, current);
+            if (fatal) {
+                cleanup_signal_targets(*current);
+                ok &= storage.releases == 1 && storage.values == nullptr && current->pending_signal_targets == nullptr;
+            }
+        }
+        ok &= storage.releases == 1 && storage.values == nullptr && target.ref_count.load() == 1;
+    }
+    return ok && current->pending_signal_targets == nullptr && target.ref_count.load() == 1 && target.signal_pending_bits() == 0;
+}
+
+auto process_selftest_signal_snapshot_ownership() -> bool { return PendingSignalTarget::selftest(); }
+#endif
+
 namespace {
 using fork_log = ker::mod::dbg::logger<"fork">;
 using process_log = ker::mod::dbg::logger<"process">;
@@ -89,12 +362,6 @@ constexpr uint8_t FORK_ADMISSION_ORDER = 0;
 #ifdef WOS_SELFTEST
 std::atomic<bool> g_process_selftest_force_fd_clone_insert_failure{false};
 #endif
-
-inline auto signal_handler_slot(ker::mod::sched::task::Task& task, size_t index) -> ker::mod::sched::task::Task::SigHandler& {
-    // Signal numbers are range-checked before conversion to this zero-based index.
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
-    return task.sig_handlers[index];
-}
 
 inline auto mutable_hostname_char(ker::mod::sched::task::Task::HostnameBuffer& hostname, size_t index) -> char& {
     // Hostname setters validate len against hostname.size() before indexing.
@@ -157,6 +424,7 @@ auto clone_fd_table_shared_checked(ker::mod::sched::task::Task* parent, ker::mod
     });
     child->fd_cloexec = parent->fd_cloexec;
     parent->fd_table_lock.unlock_irqrestore(IRQF);
+
     return ok;
 }
 
@@ -175,26 +443,6 @@ auto find_process_leader_safe(uint64_t pid) -> ker::mod::sched::task::Task* {
     return ker::mod::sched::find_task_by_pid_safe(PROCESS_PID);
 }
 
-void update_thread_group_job_control(uint64_t process_pid, uint64_t session_id, uint64_t pgid, bool detach_tty) {
-    uint32_t const TASK_COUNT = ker::mod::sched::get_active_task_count();
-    for (uint32_t i = 0; i < TASK_COUNT; ++i) {
-        auto* task = ker::mod::sched::get_active_task_at_safe(i);
-        if (task == nullptr) {
-            continue;
-        }
-        if (!ker::mod::sched::task::same_thread_group(*task, process_pid)) {
-            task->release();
-            continue;
-        }
-        task->session_id = session_id;
-        child_events::update_process_group(*task, pgid);
-        if (detach_tty) {
-            task->controlling_tty = -1;
-        }
-        task->release();
-    }
-}
-
 auto wos_proc_getgroups(size_t size, uint64_t list_addr) -> uint64_t {
     constexpr size_t GETGROUPS_SIZE_MAX = 0x7FFFFFFFU;
 
@@ -206,7 +454,8 @@ auto wos_proc_getgroups(size_t size, uint64_t list_addr) -> uint64_t {
         return static_cast<uint64_t>(-EINVAL);
     }
 
-    size_t const COUNT = task->supplementary_groups.size();
+    auto const CREDENTIALS = task->credentials();
+    size_t const COUNT = CREDENTIALS.groups().size();
     if (size == 0) {
         return COUNT;
     }
@@ -219,7 +468,7 @@ auto wos_proc_getgroups(size_t size, uint64_t list_addr) -> uint64_t {
 
     std::array<uint32_t, ker::mod::sched::task::Task::SUPPLEMENTARY_GROUPS_MAX> groups{};
     for (size_t i = 0; i < COUNT; ++i) {
-        groups.at(i) = task->supplementary_groups.at(i);
+        groups.at(i) = CREDENTIALS.groups()[i];
     }
     size_t const BYTES = COUNT * sizeof(groups.at(0));
     if (!ker::mod::sys::usercopy::ensure_writable(*task, list_addr, BYTES) ||
@@ -234,7 +483,7 @@ auto wos_proc_setgroups(size_t size, uint64_t list_addr) -> uint64_t {
     if (task == nullptr) {
         return static_cast<uint64_t>(-ESRCH);
     }
-    if (task->euid != 0) {
+    if (!task->credentials().allows(ker::mod::security::Authority::SET_GID)) {
         return static_cast<uint64_t>(-EPERM);
     }
     if (size > ker::mod::sched::task::Task::SUPPLEMENTARY_GROUPS_MAX) {
@@ -250,15 +499,9 @@ auto wos_proc_setgroups(size_t size, uint64_t list_addr) -> uint64_t {
         return static_cast<uint64_t>(-EFAULT);
     }
 
-    ker::util::SmallVec<uint32_t, ker::mod::sched::task::Task::SUPPLEMENTARY_GROUPS_MAX> groups;
-    for (size_t i = 0; i < size; ++i) {
-        if (!groups.push_back(copied_groups.at(i))) {
-            return static_cast<uint64_t>(-ENOMEM);
-        }
-    }
-
-    task->supplementary_groups = std::move(groups);
-    return 0;
+    ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+    return static_cast<uint64_t>(ker::mod::sched::resource::change_credentials(
+        *task, {.change = ker::mod::security::Change::SET_GROUPS, .groups = std::span(copied_groups).first(size)}));
 }
 
 inline void record_local_proc_event(ker::mod::sched::task::Task* task, ker::mod::perf::WkiPerfLocalProcOp op,
@@ -386,7 +629,8 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         return static_cast<uint64_t>(result);
     };
 
-    sched::resource::ProcessReservation process_reservation(parent, parent->uid);
+    auto const PARENT_CREDENTIALS = parent->credentials();
+    sched::resource::ProcessReservation process_reservation(parent, PARENT_CREDENTIALS.user().real);
     if (process_reservation.result() < 0) {
         return finish_fork(process_reservation.result());
     }
@@ -465,10 +709,17 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->sched_next = nullptr;
 
     // Copy fixed per-process path storage.
-    child->cwd = parent->cwd;
-    child->cwd_len = parent->cwd_len;
-    child->root = parent->root;
-    child->root_len = parent->root_len;
+    {
+        auto* filesystem_parent = parent->filesystem_owner();
+        uint64_t const PATH_IRQF = filesystem_parent->path_metadata_lock.lock_irqsave();
+        child->cwd = filesystem_parent->cwd;
+        child->cwd_len = filesystem_parent->cwd_len;
+        child->root = filesystem_parent->root;
+        child->root_len = filesystem_parent->root_len;
+        child->root_anchor = filesystem_parent->root_anchor;
+        child->cwd_anchor = filesystem_parent->cwd_anchor;
+        filesystem_parent->path_metadata_lock.unlock_irqrestore(PATH_IRQF);
+    }
     child->exe_path = parent->exe_path;
 
     // Copy WKI spawn configuration. NOINHERIT applies when a process creates
@@ -480,7 +731,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         child->wki_target_hostname = parent->wki_target_hostname;
         child->wki_target_flags = parent->wki_target_flags;
     }
-    child->wki_submitter_hostname = parent->wki_submitter_hostname;
+    child->wki_submitter_hostname = parent->wki_execution_identity().submitter_hostname;
     child->wki_remote_pid =
         (child->wki_submitter_hostname.front() != '\0' && std::strcmp(child->wki_submitter_hostname.data(), local_wki_hostname()) != 0)
             ? child->pid
@@ -494,15 +745,9 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->wki_skip_legacy_placement = false;
 
     // Copy POSIX credentials
-    child->uid = parent->uid;
-    child->gid = parent->gid;
-    child->euid = parent->euid;
-    child->egid = parent->egid;
-    child->suid = parent->suid;
-    child->sgid = parent->sgid;
-    child->umask = parent->umask;
+    (void)child->exchange_creation_mask(parent->creation_mask());
     child->personality = parent->personality;
-    if (!child->supplementary_groups.clone_from(parent->supplementary_groups)) {
+    if (sched::resource::initialize_credentials(*child, PARENT_CREDENTIALS) != 0) {
         delete[] child->name;
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         delete child;
@@ -510,9 +755,9 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     }
 
     // Copy session, process group, and controlling terminal
-    child->session_id = parent->session_id;
-    child->pgid = (parent->pgid != 0) ? parent->pgid : parent->pid;  // POSIX: pgid must never be 0 for user processes
-    child->controlling_tty = parent->controlling_tty;
+    auto child_job = parent->job_identity();
+    child_job.exec_completed = false;
+    child->initialize_job_identity(child_job);
 
     // Copy signal dispositions from parent (fork inherits signal handlers)
     child->signal_pending_store(0, std::memory_order_relaxed);  // Pending signals are NOT inherited
@@ -522,11 +767,10 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->sigaltstack_size = parent->sigaltstack_size;
     child->sigaltstack_flags = parent->sigaltstack_flags;
     child->parent_death_signal = 0;
-    child->dumpable = parent->dumpable;
     child->sigsuspend_active = false;
     child->in_signal_handler = false;
     child->do_sigreturn = false;
-    child->sig_handlers = parent->sig_handlers;
+    child->initialize_signal_handlers(parent->signal_handlers_snapshot());
 
     // --- Create child pagemap with COW ---
     child->pagemap = mm::virt::create_pagemap();
@@ -782,7 +1026,8 @@ auto wos_proc_uname(KernelUtsname* buf) -> uint64_t {
 
     KernelUtsname uts{};
     copy_cstr_field(uts.sysname, sizeof(uts.sysname), ker::release::NAME);
-    copy_cstr_field(uts.nodename, sizeof(uts.nodename), ker::util::hostname::get());
+    auto const HOSTNAME = ker::util::hostname::snapshot();
+    copy_cstr_field(uts.nodename, sizeof(uts.nodename), HOSTNAME.data());
     copy_cstr_field(uts.release, sizeof(uts.release), ker::release::VERSION);
     copy_cstr_field(uts.version, sizeof(uts.version), ker::release::COMPILER);
     copy_cstr_field(uts.machine, sizeof(uts.machine), "x86_64");
@@ -815,9 +1060,13 @@ auto wos_proc_sigaction(int signum, uint64_t act_ptr, uint64_t oldact_ptr) -> ui
         return static_cast<uint64_t>(-EFAULT);
     }
 
+    // Serialize the old-action result and publication across all workers.
+    // Usercopy can fault or sleep, so it must never hold the IRQ-safe store lock.
+    sys::MutexGuard action_guard(task->signal_action_mutex());
+    auto handler = task->signal_handler_snapshot(IDX);
+
     // Return old handler if requested
     if (oldact_ptr != 0) {
-        const auto& handler = signal_handler_slot(*task, IDX);
         KernelSigaction old{};
         old.handler = handler.handler;
         old.flags = handler.flags;
@@ -830,7 +1079,6 @@ auto wos_proc_sigaction(int signum, uint64_t act_ptr, uint64_t oldact_ptr) -> ui
 
     // Set new handler if provided
     if (act_ptr != 0) {
-        auto& handler = signal_handler_slot(*task, IDX);
         handler.handler = act.handler;
         handler.flags = act.flags;
         handler.mask = act.mask;
@@ -838,6 +1086,7 @@ auto wos_proc_sigaction(int signum, uint64_t act_ptr, uint64_t oldact_ptr) -> ui
         if ((act.flags & WOS_SA_RESTORER) != 0U) {
             handler.restorer = act.restorer;
         }
+        task->publish_signal_handler(IDX, handler);
     }
 
     return 0;
@@ -966,7 +1215,7 @@ auto wos_proc_sigpending(uint64_t set_ptr) -> uint64_t {
     }
 
     std::array<uint64_t, 16> set{};
-    set.at(0) = task->signal_pending_bits() & task->signal_mask_bits();
+    set.at(0) = task->signal_delivery_pending_bits() & task->signal_mask_bits();
     bool const COPIED = ker::mod::sys::usercopy::copy_to_task(*task, set_ptr, set.data(), set.size() * sizeof(set.at(0)));
     return COPIED ? 0 : static_cast<uint64_t>(-EFAULT);
 }
@@ -1050,7 +1299,8 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
         return static_cast<uint64_t>(-EFAULT);
     }
 
-    sched::resource::ProcessReservation process_reservation(parent, parent->uid);
+    auto const PARENT_CREDENTIALS = parent->credentials();
+    sched::resource::ProcessReservation process_reservation(parent, PARENT_CREDENTIALS.user().real);
     if (process_reservation.result() < 0) {
         return static_cast<uint64_t>(process_reservation.result());
     }
@@ -1142,34 +1392,34 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
     child->slice_ns = parent->slice_ns;
     child->heap_index = -1;
     child->sched_queue = sched::task::Task::sched_queue::NONE;
-    child->cwd = parent->cwd;
-    child->cwd_len = parent->cwd_len;
-    child->root = parent->root;
-    child->root_len = parent->root_len;
+    {
+        auto* filesystem_parent = parent->filesystem_owner();
+        uint64_t const PATH_IRQF = filesystem_parent->path_metadata_lock.lock_irqsave();
+        child->cwd = filesystem_parent->cwd;
+        child->cwd_len = filesystem_parent->cwd_len;
+        child->root = filesystem_parent->root;
+        child->root_len = filesystem_parent->root_len;
+        child->root_anchor = filesystem_parent->root_anchor;
+        child->cwd_anchor = filesystem_parent->cwd_anchor;
+        filesystem_parent->path_metadata_lock.unlock_irqrestore(PATH_IRQF);
+    }
     child->exe_path = parent->exe_path;
-    child->session_id = parent->session_id;
-    child->pgid = (parent->pgid != 0) ? parent->pgid : parent->pid;
-    child->controlling_tty = parent->controlling_tty;
-    child->uid = parent->uid;
-    child->gid = parent->gid;
-    child->euid = parent->euid;
-    child->egid = parent->egid;
-    child->suid = parent->suid;
-    child->sgid = parent->sgid;
-    child->umask = parent->umask;
+    auto child_job = parent->job_identity();
+    child_job.exec_completed = false;
+    child->initialize_job_identity(child_job);
+    (void)child->exchange_creation_mask(parent->creation_mask());
     child->personality = parent->personality;
     child->signal_pending_store(0, std::memory_order_relaxed);
     child->signal_mask_store(parent->signal_mask_bits(), std::memory_order_relaxed);
-    child->sig_handlers = parent->sig_handlers;
+    child->initialize_signal_handlers(parent->signal_handlers_snapshot());
     child->sigaltstack_sp = parent->sigaltstack_sp;
     child->sigaltstack_size = parent->sigaltstack_size;
     child->sigaltstack_flags = parent->sigaltstack_flags;
-    child->dumpable = parent->dumpable;
     child->wki_skip_legacy_placement = true;
     child->wki_target_flags = sched::task::Task::WKI_TARGET_FLAG_LOCAL;
 
-    if (!child->supplementary_groups.clone_from(parent->supplementary_groups) || !child->wki_vfs_rules.clone_from(parent->wki_vfs_rules) ||
-        !sched::task::clone_lazy_vmem_ranges(*child, *parent)) {
+    if (sched::resource::initialize_credentials(*child, PARENT_CREDENTIALS) != 0 ||
+        !child->wki_vfs_rules.clone_from(parent->wki_vfs_rules) || !sched::task::clone_lazy_vmem_ranges(*child, *parent)) {
         cleanup_child();
         return static_cast<uint64_t>(-ENOMEM);
     }
@@ -1249,28 +1499,63 @@ auto wos_proc_prctl(int option, uint64_t arg2, uint64_t arg3, uint64_t arg4, uin
     }
 
     switch (option) {
+        case static_cast<int>(abi::process::CredentialControl::GET_NO_NEW_PRIVILEGES):
+            if (arg2 != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0) return static_cast<uint64_t>(-EINVAL);
+            return task->credentials().no_new_privileges() ? 1 : 0;
+        case static_cast<int>(abi::process::CredentialControl::GET_AUTHORITY_CEILING):
+            if (arg2 != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0) return static_cast<uint64_t>(-EINVAL);
+            return task->credentials().authority_ceiling();
+        case static_cast<int>(abi::process::CredentialControl::GET_SERVICE_PRIVILEGES): {
+            if (arg2 != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0) return static_cast<uint64_t>(-EINVAL);
+            auto const CREDENTIALS = task->credentials();
+            return CREDENTIALS.service_privileges() |
+                   (CREDENTIALS.service_privileges_locked() ? abi::process::SERVICE_PRIVILEGES_LOCKED : 0);
+        }
+        case static_cast<int>(abi::process::CredentialControl::SET_SERVICE_PRIVILEGES): {
+            if ((arg2 & ~abi::process::SERVICE_PRIVILEGE_ALL) != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0)
+                return static_cast<uint64_t>(-EINVAL);
+            ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+            return static_cast<uint64_t>(ker::mod::sched::resource::change_credentials(
+                *task, {.change = ker::mod::security::Change::SET_SERVICE_PRIVILEGES, .service_privileges = arg2}));
+        }
+        case static_cast<int>(abi::process::CredentialControl::SET_NO_NEW_PRIVILEGES): {
+            if (arg2 != 1 || arg3 != 0 || arg4 != 0 || arg5 != 0) return static_cast<uint64_t>(-EINVAL);
+            ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+            return static_cast<uint64_t>(
+                ker::mod::sched::resource::change_credentials(*task, {.change = ker::mod::security::Change::NO_NEW_PRIVILEGES}));
+        }
+        case static_cast<int>(abi::process::CredentialControl::DROP_AUTHORITY_CEILING): {
+            if ((arg2 & ~abi::process::CREDENTIAL_AUTHORITY_ALL) != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0)
+                return static_cast<uint64_t>(-EINVAL);
+            ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+            return static_cast<uint64_t>(ker::mod::sched::resource::change_credentials(
+                *task, {.change = ker::mod::security::Change::DROP_AUTHORITY, .authority_ceiling = arg2}));
+        }
         case WOS_PR_SET_PDEATHSIG:
             if (arg2 > ker::mod::sched::task::Task::MAX_SIGNALS) {
                 return static_cast<uint64_t>(-EINVAL);
             }
-            task->parent_death_signal = static_cast<uint32_t>(arg2);
+            task->parent_death_signal.store(static_cast<uint32_t>(arg2), std::memory_order_release);
             return 0;
         case WOS_PR_GET_PDEATHSIG:
             if (arg2 == 0) {
                 return static_cast<uint64_t>(-EFAULT);
             }
             {
-                int const SIGNAL = static_cast<int>(task->parent_death_signal);
+                int const SIGNAL = static_cast<int>(task->parent_death_signal.load(std::memory_order_acquire));
                 return ker::mod::sys::usercopy::copy_value_to_task(*task, arg2, SIGNAL) ? 0 : static_cast<uint64_t>(-EFAULT);
             }
         case WOS_PR_GET_DUMPABLE:
-            return static_cast<uint64_t>(task->dumpable);
+            return task->credentials().dumpable() ? 1 : 0;
         case WOS_PR_SET_DUMPABLE:
             if (arg2 > 1) {
                 return static_cast<uint64_t>(-EINVAL);
             }
-            task->dumpable = static_cast<int32_t>(arg2);
-            return 0;
+            {
+                ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+                return static_cast<uint64_t>(ker::mod::sched::resource::change_credentials(
+                    *task, {.change = ker::mod::security::Change::SET_DUMPABLE, .dumpable = arg2 != 0}));
+            }
         case WOS_PR_SET_NAME:
             if (arg2 == 0) {
                 return static_cast<uint64_t>(-EFAULT);
@@ -1285,8 +1570,13 @@ auto wos_proc_prctl(int option, uint64_t arg2, uint64_t arg3, uint64_t arg4, uin
                     delete[] name;
                     return static_cast<uint64_t>(-EFAULT);
                 }
-                delete[] task->name;
-                task->name = name;
+                const char* retired = nullptr;
+                {
+                    ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+                    retired = task->name;
+                    task->name = name;
+                }
+                delete[] retired;
             }
             return 0;
         case WOS_PR_GET_NAME:
@@ -1295,12 +1585,28 @@ auto wos_proc_prctl(int option, uint64_t arg2, uint64_t arg3, uint64_t arg4, uin
             }
             {
                 std::array<char, 16> name{};
-                copy_cstr_field(name.data(), name.size(), task->name != nullptr ? task->name : "");
+                {
+                    ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+                    copy_cstr_field(name.data(), name.size(), task->name != nullptr ? task->name : "");
+                }
                 return ker::mod::sys::usercopy::copy_to_task(*task, arg2, name.data(), name.size()) ? 0 : static_cast<uint64_t>(-EFAULT);
             }
-        case WOS_PR_SET_PTRACER:
-            task->ptrace_tracer_pid = arg2;
+        case WOS_PR_SET_PTRACER: {
+            // WOS has no Yama relationship restriction to relax. Preserve the
+            // valid request as a no-op; never overwrite an active tracer PID.
+            if (arg2 != 0 && arg2 != UINT64_MAX) {
+                auto* candidate = ker::mod::sched::find_task_by_pid_safe(arg2);
+                if (candidate == nullptr) {
+                    return static_cast<uint64_t>(-EINVAL);
+                }
+                bool const PROCESS = candidate->type == ker::mod::sched::task::TaskType::PROCESS;
+                candidate->release();
+                if (!PROCESS) {
+                    return static_cast<uint64_t>(-EINVAL);
+                }
+            }
             return 0;
+        }
         case WOS_PR_SET_VMA:
             return arg2 == WOS_PR_SET_VMA_ANON_NAME ? 0 : static_cast<uint64_t>(-EINVAL);
         default:
@@ -1349,30 +1655,18 @@ auto wos_proc_kill(int64_t pid, int sig) -> uint64_t {
     if (sig < 0 || std::cmp_greater(sig, sched::task::Task::MAX_SIGNALS)) {
         return static_cast<uint64_t>(-EINVAL);
     }
-
-    if (pid == 0) {
-        // pid==0: target all live processes in caller's process group.
-        auto* self = sched::get_current_task();
-        if (self == nullptr) {
-            return static_cast<uint64_t>(-ESRCH);
-        }
-        uint64_t const PGRP = (self->pgid != 0) ? self->pgid : self->pid;
-        return sched::signal_process_group(PGRP, sig) != 0 ? 0 : static_cast<uint64_t>(-ESRCH);
+    auto* self = sched::get_current_task();
+    if (self == nullptr) {
+        return static_cast<uint64_t>(-ESRCH);
     }
-    if (pid < 0) {
-        // pid < -1: send signal to process group -pid
-        // pid == -1: send to all processes (simplified: send to caller's pgrp)
-        uint64_t pgrp = 0;
-        if (pid == -1) {
-            auto* self = sched::get_current_task();
-            if (self == nullptr) {
-                return static_cast<uint64_t>(-ESRCH);
-            }
-            pgrp = (self->pgid != 0) ? self->pgid : self->pid;
-        } else {
-            pgrp = static_cast<uint64_t>(-(pid + 1)) + 1;
-        }
-        return sched::signal_process_group(pgrp, sig) != 0 ? 0 : static_cast<uint64_t>(-ESRCH);
+    auto const CALLER = self->credentials();
+    auto const CALLER_JOB = self->job_identity();
+    auto deliver = [&](sched::task::Task* target) -> int { return signal_as(*target, CALLER, CALLER_JOB, sig); };
+
+    if (pid <= 0) {
+        // Preserve WOS's existing pid=-1 behavior: the caller's process group.
+        uint64_t const PGRP = pid < -1 ? static_cast<uint64_t>(-(pid + 1)) + 1 : CALLER_JOB.pgid;
+        return static_cast<uint64_t>(ker::net::wki::wki_group_signal_as(CALLER, CALLER_JOB, PGRP, pid >= -1, sig));
     }
 
     auto* target = sched::find_task_by_pid_safe(static_cast<uint64_t>(pid));
@@ -1382,36 +1676,8 @@ auto wos_proc_kill(int64_t pid, int sig) -> uint64_t {
     if (target == nullptr) {
         return static_cast<uint64_t>(-ESRCH);
     }
-    if (!is_live_signal_target(*target)) {
-        target->release();
-        return static_cast<uint64_t>(-ESRCH);
-    }
-    if (sig == 0) {
-        target->release();
-        return 0;
-    }
-
-    // Forward interrupt/termination signals to the remote node if target is a
-    // WKI proxy task. When forwarding succeeds, the remote task owns signal
-    // termination semantics; do not also queue the signal locally on the proxy
-    // task or execve()-proxy handoff can be interrupted by a duplicate fatal
-    // signal before TASK_COMPLETE finalizes it.
-    bool const FORWARDED = ker::net::wki::wki_proxy_task_forward_signal(target, sig);
-    if (!FORWARDED) {
-        if (is_ptrace_launch_stop_signal(sig) && ker::mod::debug::ptrace::report_signal_stop(*target, static_cast<uint32_t>(sig))) {
-            target->release();
-            return 0;
-        }
-
-        // Set the signal pending bit (signal N is bit N-1)
-        target->signal_add_pending_mask(1ULL << (sig - 1));
-
-        // Ensure blocked tasks become runnable so pending signals are delivered promptly.
-        sched::wake_task_for_signal(target);
-    }
-
-    target->release();
-    return 0;
+    int const RESULT = deliver(target);
+    return static_cast<uint64_t>(RESULT);
 }
 
 auto wos_proc_setpriority(int which, int64_t who, int prio) -> uint64_t {
@@ -1436,14 +1702,27 @@ auto wos_proc_setpriority(int which, int64_t who, int prio) -> uint64_t {
         return static_cast<uint64_t>(-ESRCH);
     }
 
-    if (self->euid != 0 && target->pid != self->pid) {
-        target->release();
-        return static_cast<uint64_t>(-EPERM);
+    int result = 0;
+    {
+        // Serialize policy and scheduler commit with every process nice/ID
+        // change. Trusted daemon priority setters cannot affect process tasks.
+        ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+        auto const CALLER = self->credentials();
+        auto const TARGET = target->credentials();
+        int const NICE = ker::mod::security::clamp_priority(prio);
+        if (!is_live_signal_target(*target)) {
+            result = -ESRCH;
+        } else if (target->type != mod::sched::task::TaskType::PROCESS && !CALLER.allows(ker::mod::security::Authority::PRIORITY)) {
+            result = -EPERM;
+        } else {
+            result = ker::mod::security::authorize_priority(CALLER, TARGET, target->sched_nice, NICE);
+            if (result == 0) {
+                mod::sched::set_task_nice(target, NICE);
+            }
+        }
     }
-
-    mod::sched::set_task_nice(target, prio);
     target->release();
-    return 0;
+    return static_cast<uint64_t>(result);
 }
 
 auto wos_proc_getpriority(int which, int64_t who) -> uint64_t {
@@ -1468,9 +1747,13 @@ auto wos_proc_getpriority(int which, int64_t who) -> uint64_t {
         return static_cast<uint64_t>(-ESRCH);
     }
 
-    int const ENCODED_NICE = static_cast<int>(target->sched_nice) + WOS_PRIO_KERNEL_ENCODE_BIAS;
+    int encoded_nice = 0;
+    {
+        ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+        encoded_nice = static_cast<int>(target->sched_nice) + WOS_PRIO_KERNEL_ENCODE_BIAS;
+    }
     target->release();
-    return static_cast<uint64_t>(ENCODED_NICE);
+    return static_cast<uint64_t>(encoded_nice);
 }
 
 auto wos_proc_setwkitarget(uint64_t hostname_addr, size_t len, uint32_t flags) -> uint64_t {
@@ -1544,7 +1827,694 @@ auto wos_proc_getwkitarget(uint64_t hostname_out_addr, size_t hostname_out_size,
 }
 }  // namespace
 
+namespace {
+auto signal_local_as(ker::mod::sched::task::Task& target, const ker::mod::security::Snapshot& caller,
+                     const ker::mod::sched::session::Identity& caller_job, int signum, const ker::mod::sched::session::Identity* group)
+    -> std::optional<int> {
+    using namespace ker::mod;
+    bool allowed = false;
+    PendingSignalTarget admission;
+    {
+        ker::syscall::vmem::SharedVmemPublicationGuard publication;
+        if (!is_live_signal_target(target)) return -ESRCH;
+        if (target.type != sched::task::TaskType::PROCESS) return -EPERM;
+        // Native exec publishes the owner's replacement root under this same
+        // guard. Old-image worker TIDs must stop admitting effects before the
+        // execing worker's pending state is drained into that replacement.
+        auto* owner = target.credential_owner();
+        if (target.is_thread && (owner == nullptr || target.pagemap != owner->pagemap)) return -ESRCH;
+        auto const ADMISSION = admission.admit_local(target);
+        auto const& JOB = ADMISSION.job;
+        // Membership, current target authority and session are one decision.
+        // A group request never falls through to per-task proxy forwarding.
+        if (ADMISSION.remote) return group != nullptr ? std::optional<int>{-ESRCH} : std::nullopt;
+        if (!ADMISSION.local_lease) return -EAGAIN;
+        if (group != nullptr && !sched::session::same_group(*group, JOB)) return -ESRCH;
+        allowed = security::may_signal(caller, ADMISSION.credentials, sched::session::same_session(caller_job, JOB), signum == 18);
+    }
+    if (!allowed) return -EPERM;
+    if (signum == 0) return 0;
+    if (is_ptrace_launch_stop_signal(signum) && debug::ptrace::report_signal_stop(target, static_cast<uint32_t>(signum))) return 0;
+    target.signal_generate_pending_mask(1ULL << (signum - 1));
+    sched::wake_task_for_signal(&target);
+    return 0;
+}
+
+auto matches_numeric_process_group(ker::mod::sched::task::Task* target, void* context) -> bool {
+    return target->type == ker::mod::sched::task::TaskType::PROCESS && target->job_identity().pgid == *static_cast<uint64_t*>(context);
+}
+}  // namespace
+
+auto signal_as(ker::mod::sched::task::Task& target, const ker::mod::security::Snapshot& caller,
+               const ker::mod::sched::session::Identity& caller_job, int signum) -> int {
+    using namespace ker::mod;
+    PendingSignalTarget retained(target);
+    if (signum < 0 || std::cmp_greater(signum, sched::task::Task::MAX_SIGNALS)) return -EINVAL;
+    if (!is_live_signal_target(target)) return -ESRCH;
+    if (target.type != sched::task::TaskType::PROCESS) return -EPERM;
+    if (auto remote = ker::net::wki::wki_proxy_task_signal_as(target, caller, caller_job, signum); remote.has_value()) return *remote;
+    if (auto local = signal_local_as(target, caller, caller_job, signum, nullptr); local.has_value()) return *local;
+    // ACCEPT may publish a signal route between the first lookup and local
+    // admission. Retry receiver routing once; never fall back to the old frame.
+    return ker::net::wki::wki_proxy_task_signal_as(target, caller, caller_job, signum).value_or(-ESRCH);
+}
+
+auto signal_group_local_as(const ker::mod::security::Snapshot& caller, const ker::mod::sched::session::Identity& caller_job,
+                           const ker::mod::sched::session::Identity& group, int signum) -> int {
+    if (signum < 0 || std::cmp_greater(signum, ker::mod::sched::task::Task::MAX_SIGNALS)) return -EINVAL;
+    if (group.pgid == 0) return -ESRCH;
+    uint64_t pgid = group.pgid;
+    PendingSignalTarget cohort;
+    int const CAPTURED = cohort.capture(matches_numeric_process_group, &pgid);
+    if (CAPTURED != 0) return CAPTURED;
+    size_t accepted = 0;
+    int error = -ESRCH;
+    while (auto* target = cohort.take()) {
+        PendingSignalTarget retained(*target);
+        if (target->is_thread && signum >= 18 && signum <= 22) continue;
+        int const RESULT = signal_local_as(*target, caller, caller_job, signum, &group).value_or(-ESRCH);
+        accepted += RESULT == 0 ? 1 : 0;
+        if (RESULT != 0 && RESULT != -ESRCH && (error == -ESRCH || RESULT == -EPERM)) error = RESULT;
+    }
+    return accepted != 0 ? 0 : error;
+}
+
+auto with_local_signal_targets(LocalSignalCallback callback, void* context, LocalSignalCleanup cleanup) -> int {
+    if (callback == nullptr) return -EINVAL;
+    auto process = [](ker::mod::sched::task::Task* task, void*) -> bool {
+        return task->type == ker::mod::sched::task::TaskType::PROCESS && !task->is_thread;
+    };
+    PendingSignalTarget cohort;
+    cohort.set_cleanup(cleanup, context);
+    int const CAPTURED = cohort.capture(process, nullptr);
+    if (CAPTURED != 0) return CAPTURED;
+    int error = 0;
+    cohort.retain_if(
+        [](ker::mod::sched::task::Task* target, void* opaque) -> bool {
+            // Registry ownership is already released; no lock crosses the
+            // callback. This is discovery, not authority to deliver later.
+            ker::syscall::vmem::SharedVmemPublicationGuard publication;
+            if (!is_live_signal_target(*target) || target->signal_admission_identity().remote) return false;
+            if (target->signal_home_identity().serial == 0) {
+                *static_cast<int*>(opaque) = -EOVERFLOW;
+                return false;
+            }
+            return true;
+        },
+        &error);
+    if (error != 0) return error;
+    return callback(cohort.view(), context);
+}
+
+auto append_signal_receiver(ker::mod::sched::task::Task& target, uint64_t cursor, uint64_t ceiling,
+                            ker::net::wki::GroupReceiverResponse& response) -> int {
+    auto const HOME = target.signal_home_identity();
+    uint64_t const SERIAL = target.signal_receiver_serial();
+    if (HOME.serial == 0 || SERIAL == 0) return -EOVERFLOW;
+    if (ceiling == 0) response.ceiling = std::max(response.ceiling, SERIAL);
+    if (SERIAL <= cursor || (ceiling != 0 && SERIAL > ceiling)) return 0;
+    size_t at = 0;
+    while (at < response.count && response.receivers[at].serial < SERIAL) ++at;
+    if (at == response.receivers.size() || (at < response.count && response.receivers[at].serial == SERIAL)) return 0;
+    size_t const LAST = std::min<size_t>(response.count, response.receivers.size() - 1);
+    for (size_t i = LAST; i > at; --i) response.receivers[i] = response.receivers[i - 1];
+    auto const& WKI = ker::net::wki::g_wki;
+    response.receivers[at] = {.serial = SERIAL,
+                              .pid = target.pid,
+                              .home = {.origin = {.node = HOME.origin.node == 0 ? WKI.my_node_id : HOME.origin.node,
+                                                  .reserved = 0,
+                                                  .boot = HOME.origin.node == 0 ? WKI.local_boot_epoch : HOME.origin.boot},
+                                       .serial = HOME.serial}};
+    if (response.count < response.receivers.size()) ++response.count;
+    return 0;
+}
+
+auto enumerate_signal_receivers(uint64_t cursor, uint64_t ceiling, ker::net::wki::GroupReceiverResponse& response) -> int {
+    struct Context {
+        uint64_t cursor;
+        uint64_t ceiling;
+        ker::net::wki::GroupReceiverResponse& response;
+    } context{cursor, ceiling, response};
+    response.count = 0;
+    response.ceiling = ceiling;
+    return with_local_signal_targets(
+        [](std::span<ker::mod::sched::task::Task* const> targets, void* opaque) {
+            auto& input = *static_cast<Context*>(opaque);
+            for (auto* target : targets) {
+                int const RESULT = append_signal_receiver(*target, input.cursor, input.ceiling, input.response);
+                if (RESULT != 0) return RESULT;
+            }
+            return 0;
+        },
+        &context);
+}
+
 #ifdef WOS_SELFTEST
+auto process_selftest_signal_receiver_pages() -> bool {
+    using ker::mod::sched::task::Task;
+    std::unique_ptr<Task[]> tasks(new (std::nothrow) Task[40]);
+    if (!tasks) return false;
+    bool ok = true;
+    for (size_t i = 0; i < 40; ++i) {
+        tasks[i].pid = 1000 + i;
+        ok &= tasks[i].adopt_signal_home({.origin = {.node = 7, .boot = 8}, .serial = 50 + i});
+        ok &= tasks[i].signal_receiver_serial() != 0;
+    }
+    ker::net::wki::GroupReceiverResponse first{};
+    for (size_t i = 40; i-- != 0;) ok &= append_signal_receiver(tasks[i], 0, 0, first) == 0;
+    ok &= first.count == 32 && first.ceiling == tasks[39].signal_receiver_serial();
+    for (size_t i = 0; i < first.count; ++i)
+        ok &= first.receivers[i].pid == 1000 + i && first.receivers[i].home.origin.node == 7 && first.receivers[i].home.origin.boot == 8 &&
+              first.receivers[i].home.serial == 50 + i;
+    // Registry and running-table views may overlap as publication completes.
+    ok &= append_signal_receiver(tasks[0], 0, 0, first) == 0 && first.count == 32;
+    ker::net::wki::GroupReceiverResponse second{.ceiling = first.ceiling};
+    uint64_t const CURSOR = first.receivers[31].serial;
+    for (size_t i = 0; i < 40; ++i) ok &= append_signal_receiver(tasks[i], CURSOR, first.ceiling, second) == 0;
+    ok &= second.count == 8 && second.ceiling == first.ceiling;
+    for (size_t i = 0; i < second.count; ++i) ok &= second.receivers[i].pid == 1032 + i;
+    Task arrived{};
+    arrived.pid = 2000;
+    ok &= arrived.adopt_signal_home({.origin = {.node = 9, .boot = 10}, .serial = 50});
+    ok &= append_signal_receiver(arrived, CURSOR, first.ceiling, second) == 0 && second.count == 8;
+    ker::net::wki::GroupReceiverResponse next{};
+    ok &= append_signal_receiver(arrived, 0, 0, next) == 0 && next.count == 1 && next.receivers[0].home.origin.node == 9 &&
+          next.receivers[0].serial > first.ceiling;
+    return ok;
+}
+#endif
+
+auto enumerate_signal_anchors(uint64_t cursor, uint64_t ceiling, ker::net::wki::GroupRouteResponse& response) -> int {
+    auto anchor = [](ker::mod::sched::task::Task* task, void*) -> bool {
+        return task->type == ker::mod::sched::task::TaskType::PROCESS && !task->is_thread;
+    };
+    PendingSignalTarget cohort;
+    int const CAPTURED = cohort.capture(anchor, nullptr);
+    if (CAPTURED != 0) return CAPTURED;
+    response.count = 0;
+    response.ceiling = ceiling;
+    while (auto* target = cohort.take()) {
+        PendingSignalTarget retained(*target);
+        if (!is_live_signal_target(*target) || !target->is_signal_home_anchor()) continue;
+        auto const HOME = target->signal_home_identity();
+        if (HOME.serial == 0) return -EOVERFLOW;
+        if (ceiling == 0) response.ceiling = std::max(response.ceiling, HOME.serial);
+        if (HOME.serial <= cursor || (ceiling != 0 && HOME.serial > ceiling)) continue;
+        size_t at = 0;
+        while (at < response.count && response.anchors[at].serial < HOME.serial) ++at;
+        if (at == response.anchors.size()) continue;
+        size_t const LAST = std::min<size_t>(response.count, response.anchors.size() - 1);
+        for (size_t i = LAST; i > at; --i) response.anchors[i] = response.anchors[i - 1];
+        response.anchors[at] = {.serial = HOME.serial, .pid = target->pid};
+        if (response.count < response.anchors.size()) ++response.count;
+    }
+    return 0;
+}
+
+auto signal_group_target_as(ker::mod::sched::task::Task& target, const ker::mod::security::Snapshot& caller,
+                            const ker::mod::sched::session::Identity& caller_job, const ker::mod::sched::session::Identity& group,
+                            bool query, int signum, ker::mod::sched::session::Identity& current_job, uint32_t& route_task_id,
+                            uint64_t& route_pid) -> std::optional<int> {
+    using namespace ker::mod;
+    PendingSignalTarget retained(target);
+    PendingSignalTarget admission;
+    PendingSignalTarget members;
+    route_task_id = 0;
+    route_pid = 0;
+    if (signum < 0 || std::cmp_greater(signum, sched::task::Task::MAX_SIGNALS)) return -EINVAL;
+    if (!query && signum != 0 && (signum < 18 || signum > 22)) {
+        auto member = [](sched::task::Task* candidate, void* owner) -> bool {
+            return candidate->is_thread && candidate->credential_owner() == owner;
+        };
+        int const CAPTURED = members.capture(member, &target);
+        if (CAPTURED != 0) return CAPTURED;
+    }
+    {
+        ker::syscall::vmem::SharedVmemPublicationGuard publication;
+        if (!is_live_signal_target(target)) return -ESRCH;
+        if (target.type != sched::task::TaskType::PROCESS || target.is_thread) return -EPERM;
+        auto const ADMISSION = admission.admit_local(target);
+        if (ADMISSION.remote) {
+            auto const ROUTE = target.wki_execution_identity();
+            route_task_id = ROUTE.signal_task_id != 0 ? ROUTE.signal_task_id : ROUTE.proxy_task_id;
+            route_pid = ROUTE.remote_pid;
+            return std::nullopt;
+        }
+        if (!ADMISSION.local_lease) return -EAGAIN;
+        current_job = ADMISSION.job;
+        if (query) return 0;
+        if (!sched::session::same_group(group, current_job)) return -ESRCH;
+        if (!security::may_signal(caller, ADMISSION.credentials, sched::session::same_session(caller_job, current_job), signum == 18))
+            return -EPERM;
+    }
+    if (signum == 0) return 0;
+    auto generate = [signum](sched::task::Task& recipient) {
+        if (!is_live_signal_target(recipient)) return;
+        if (recipient.group_signal_visible() && is_ptrace_launch_stop_signal(signum) &&
+            debug::ptrace::report_signal_stop(recipient, static_cast<uint32_t>(signum)))
+            return;
+        if (recipient.generate_group_signal(1ULL << (signum - 1))) sched::wake_task_for_signal(&recipient);
+    };
+    // One canonical admission remains owned through every old-image effect.
+    // A concurrent cutover may close its route, but must drain this lease.
+    generate(target);
+    while (auto* member = members.take()) {
+        PendingSignalTarget owned(*member);
+        generate(*member);
+    }
+    return 0;
+}
+
+namespace {
+template <typename Admitted>
+auto child_event_signal_local(ker::mod::sched::task::Task& target, Admitted&& admitted) -> std::optional<int> {
+    if (!is_live_signal_target(target) || target.exit_in_progress) return -ESRCH;
+    auto const ADMISSION = target.begin_local_signal_admission();
+    if (ADMISSION.remote) return std::nullopt;
+    if (!ADMISSION.local_lease) return -EAGAIN;
+    // Bounded, nonblocking effect: no stack-backed fatal-wait registration is
+    // needed. Exec drains this lease before capturing the final pending state.
+    admitted();
+    target.signal_add_pending_mask(uint64_t{1} << 16);
+    ker::mod::sched::wake_task_from_event(&target);
+    target.end_local_signal_admission();
+    return 0;
+}
+
+template <typename Admitted>
+auto parent_death_signal(ker::mod::sched::task::Task& target, uint16_t hops, Admitted&& admitted) -> int {
+    using namespace ker::mod;
+    if (hops > ker::net::wki::WKI_PARENT_DEATH_HOPS) return -ELOOP;
+    if (!is_live_signal_target(target)) return -ESRCH;
+    if (target.type != sched::task::TaskType::PROCESS) return -EPERM;
+    PendingSignalTarget admission;
+    auto const ADMISSION = admission.admit_local(target);
+    if (ADMISSION.remote) return ker::net::wki::wki_proxy_task_parent_death(target, hops).value_or(-ESRCH);
+    if (!ADMISSION.local_lease) return -EAGAIN;
+    // The event belongs to this child, independent of its parent's credentials.
+    // Exec must drain admission before taking its final registration/pending snapshot.
+    admitted();
+    uint32_t const SIGNAL = target.parent_death_signal.load(std::memory_order_acquire);
+    if (SIGNAL > sched::task::Task::MAX_SIGNALS) return -EINVAL;
+    if (SIGNAL != 0 && target.generate_group_signal(uint64_t{1} << (SIGNAL - 1))) sched::wake_task_for_signal(&target);
+    return 0;
+}
+
+template <typename Admitted>
+auto terminal_source_signal(ker::mod::sched::task::Task& target, const ker::mod::sched::session::Identity& expected, int signum,
+                            bool revoked, Admitted&& admitted) -> int {
+    using namespace ker::mod;
+    if (signum <= 0 || std::cmp_greater(signum, sched::task::Task::MAX_SIGNALS)) return -EINVAL;
+    if (!is_live_signal_target(target)) return -ESRCH;
+    if (target.type != sched::task::TaskType::PROCESS) return -EPERM;
+    PendingSignalTarget admission;
+    // Admission and accepted-route publication share path_metadata_lock. The
+    // terminal object already granted this event; no credential or address-space
+    // decision requires reacquiring the caller's possible publication lock.
+    auto const ADMISSION = admission.admit_local(target);
+    if (ADMISSION.remote) {
+        // No local lease crosses the forwarder's cutover wait. A retired route
+        // cannot restore authority over the parked source frame.
+        return ker::net::wki::wki_proxy_task_terminal_signal(target, expected, signum).value_or(-ESRCH);
+    }
+    if (!ADMISSION.local_lease) return -EAGAIN;
+    if (!sched::session::same_session(expected, ADMISSION.job) || !sched::session::same_group(expected, ADMISSION.job)) return -ESRCH;
+    if (!revoked && (expected.terminal != ADMISSION.job.terminal || expected.terminal_generation != ADMISSION.job.terminal_generation))
+        return -ESRCH;
+    admitted();
+    // Remote exec must drain this lease before capturing the pending state.
+    // Keep it through job-control generation and every scheduler wake as well.
+    if (target.generate_group_signal(1ULL << (signum - 1))) sched::wake_task_for_signal(&target);
+    return 0;
+}
+}  // namespace
+
+auto try_signal_child_event_local(ker::mod::sched::task::Task& target) -> std::optional<int> {
+    return child_event_signal_local(target, [] {});
+}
+
+void signal_child_event(ker::mod::sched::task::Task& target, uint16_t hops) {
+    auto const RESULT = try_signal_child_event_local(target);
+    if (!RESULT.has_value() || *RESULT == -EAGAIN) ker::net::wki::wki_defer_child_signal(target, hops);
+}
+
+auto signal_parent_death(ker::mod::sched::task::Task& target, uint16_t hops) -> int {
+    PendingSignalTarget retained(target);
+    return parent_death_signal(target, hops, [] {});
+}
+
+auto signal_terminal_source_as(ker::mod::sched::task::Task& target, const ker::mod::sched::session::Identity& expected, int signum,
+                               bool revoked) -> int {
+    return terminal_source_signal(target, expected, signum, revoked, [] {});
+}
+
+auto signal_terminal_as(ker::mod::sched::task::Task& target, const ker::mod::sched::session::Identity& expected, int signum, uint16_t hops)
+    -> int {
+    using namespace ker::mod;
+    PendingSignalTarget retained(target);
+    if (signum <= 0 || std::cmp_greater(signum, sched::task::Task::MAX_SIGNALS) || expected.session_id == 0 || expected.pgid == 0)
+        return -EINVAL;
+    if (!is_live_signal_target(target)) return -ESRCH;
+    if (target.type != sched::task::TaskType::PROCESS || target.is_thread) return -EPERM;
+    PendingSignalTarget members;
+    if (signum < 18 || signum > 22) {
+        auto member = [](sched::task::Task* candidate, void* owner) -> bool {
+            return candidate->is_thread && candidate->credential_owner() == owner;
+        };
+        int const CAPTURED = members.capture(member, &target);
+        if (CAPTURED != 0) return CAPTURED;
+    }
+    for (unsigned attempt = 0; attempt < 2; ++attempt) {
+        if (auto remote = ker::net::wki::wki_proxy_task_terminal_signal(target, expected, signum, hops); remote.has_value()) return *remote;
+        PendingSignalTarget admission;
+        {
+            ker::syscall::vmem::SharedVmemPublicationGuard publication;
+            if (!is_live_signal_target(target)) return -ESRCH;
+            auto const ADMISSION = admission.admit_local(target);
+            if (ADMISSION.remote) continue;
+            if (!ADMISSION.local_lease) return -EAGAIN;
+            if (!sched::session::same_session(expected, ADMISSION.job) || !sched::session::same_group(expected, ADMISSION.job))
+                return -ESRCH;
+        }
+        auto generate = [signum](sched::task::Task& recipient) {
+            if (!is_live_signal_target(recipient)) return;
+            if (recipient.group_signal_visible() && is_ptrace_launch_stop_signal(signum) &&
+                debug::ptrace::report_signal_stop(recipient, static_cast<uint32_t>(signum)))
+                return;
+            if (recipient.generate_group_signal(1ULL << (signum - 1))) sched::wake_task_for_signal(&recipient);
+        };
+        // The terminal grant is independent of UID. Membership and cutover
+        // ownership remain stable through every admitted old-image effect.
+        generate(target);
+        while (auto* member = members.take()) {
+            PendingSignalTarget owned(*member);
+            generate(*member);
+        }
+        return 0;
+    }
+    return -EAGAIN;
+}
+
+auto query_group_local(uint64_t pgid, ker::mod::sched::session::Origin local_namespace,
+                       const ker::mod::sched::session::Identity& caller_job, ker::mod::sched::session::GroupCandidates& result) -> int {
+    using namespace ker::mod::sched;
+    result = {};
+    if (pgid == 0) return -ESRCH;
+    PendingSignalTarget cohort;
+    int const CAPTURED = cohort.capture(matches_numeric_process_group, &pgid);
+    if (CAPTURED != 0) return CAPTURED;
+    std::optional<session::Origin> const OWN = pgid == caller_job.pgid ? std::optional{caller_job.group_origin} : std::nullopt;
+    while (auto* target = cohort.take()) {
+        PendingSignalTarget retained(*target);
+        ker::syscall::vmem::SharedVmemPublicationGuard publication;
+        if (!is_live_signal_target(*target)) continue;
+        auto const ADMISSION = target->signal_admission_identity();
+        if (ADMISSION.remote) continue;
+        auto const& JOB = ADMISSION.job;
+        if (JOB.pgid == pgid) result.observe(JOB.group_origin, local_namespace, OWN);
+    }
+    return 0;
+}
+
+#ifdef WOS_SELFTEST
+auto process_selftest_group_signal_authority() -> bool {
+    using namespace ker::mod;
+    sched::task::Task target{};
+    target.type = sched::task::TaskType::PROCESS;
+    target.pid = 0x7B510001;
+    sched::session::Identity group{.session_id = 41, .pgid = 77, .origin = {.node = 7, .boot = 8}, .group_origin = {.node = 8, .boot = 9}};
+    target.initialize_job_identity(group);
+    security::Snapshot caller;
+    bool ok = security::Snapshot::bootstrap_root().prepare({.change = security::Change::SET_UID, .real = 100}, caller) == 0;
+    sched::session::Identity const CALLER_JOB{.session_id = 42, .pgid = 78};
+    auto call = [&](int signum) { return signal_local_as(target, caller, CALLER_JOB, signum, &group); };
+    group.group_origin = {};
+    ok &= call(0) == -ESRCH && call(10) == -ESRCH;
+    group.group_origin = {.node = 8, .boot = 9};
+    ok &= call(0) == -EPERM && call(10) == -EPERM && call(18) == -EPERM;
+    ok &= sched::resource::initialize_credentials(target, caller) == 0;
+    ok &= call(0) == 0;  // Same UID may signal across sessions.
+    target.set_wki_proxy_task_id(42);
+    ok &= call(0) == -ESRCH && call(10) == -ESRCH;
+    target.set_wki_proxy_task_id(0);
+    auto changed = group;
+    changed.pgid = 88;
+    target.initialize_job_identity(changed);
+    ok &= call(0) == -ESRCH && call(10) == -ESRCH;
+    target.initialize_job_identity(group);
+    ok &= call(0) == 0;
+    target.publish_accepted_signal_route(42, 99);
+    ok &= target.wki_execution_identity().proxy_task_id == 0 && !target.wki_proxy_task;
+    ok &= call(0) == -ESRCH && call(10) == -ESRCH;
+    ok &= !signal_local_as(target, caller, CALLER_JOB, 0, nullptr).has_value();
+    target.publish_accepted_signal_route(43, 100);
+    ok &= target.wki_execution_identity().signal_task_id == 42 && target.wki_execution_identity().remote_pid == 99;
+    // The routed path uses the same stable credential/group decision while
+    // retaining the canonical admission through unpublished pending updates.
+    sched::task::Task receiver{};
+    receiver.type = sched::task::TaskType::PROCESS;
+    receiver.initialize_job_identity(group);
+    receiver.hide_group_signals_until_publication();
+    sched::session::Identity observed{};
+    uint32_t route_id = 0;
+    uint64_t route_pid = 0;
+    auto routed = [&](bool query, int signal) -> std::optional<int> {
+        if (!receiver.try_acquire()) return -ESRCH;
+        return signal_group_target_as(receiver, caller, CALLER_JOB, group, query, signal, observed, route_id, route_pid);
+    };
+    ok &= routed(false, 12) == -EPERM && receiver.signal_pending_bits() == 0;
+    ok &= routed(true, 0) == 0 && observed.pgid == group.pgid;
+    ok &= sched::resource::initialize_credentials(receiver, caller) == 0;
+    ok &= routed(false, 12) == 0 && receiver.signal_pending_bits() == (uint64_t{1} << 11);
+    ok &= !receiver.group_signal_visible() && receiver.local_signal_admissions_drained();
+    receiver.publish_accepted_signal_route(44, 101);
+    ok &= !routed(false, 12).has_value() && route_id == 44 && route_pid == 101;
+    ok &= receiver.signal_pending_bits() == (uint64_t{1} << 11) && receiver.ref_count.load() == 1;
+    return ok && target.signal_pending_bits() == 0 && target.ref_count.load() == 1;
+}
+
+auto process_selftest_child_signal_cutover() -> bool {
+    using namespace ker::mod;
+    auto target = std::make_unique<sched::task::Task>();
+    target->type = sched::task::TaskType::PROCESS;
+    target->hide_group_signals_until_publication();
+    constexpr uint64_t CHILD = uint64_t{1} << 16;
+    bool ok = true;
+    for (uint32_t uid : {0U, 104U, 200U}) {
+        security::Snapshot credentials;
+        ok &= security::Snapshot::bootstrap_root().prepare({.change = security::Change::SET_UID, .real = uid}, credentials) == 0;
+        ok &= sched::resource::initialize_credentials(*target, credentials) == 0;
+        for (uint64_t mask : {uint64_t{0}, CHILD}) {
+            target->signal_mask_store(mask);
+            ok &= try_signal_child_event_local(*target) == 0;
+            ok &= try_signal_child_event_local(*target) == 0;
+            ok &= target->signal_pending_bits() == CHILD && target->signal_mask_bits() == mask;
+            ok &= target->credentials() == credentials && target->ref_count.load() == 1 && target->local_signal_admissions_drained();
+            target->signal_clear_pending_mask(~uint64_t{0});
+        }
+    }
+    bool interleaved = false;
+    ok &= child_event_signal_local(*target, [&] {
+              interleaved = true;
+              ok &= !target->local_signal_admissions_drained();
+              target->publish_accepted_signal_route(0x7B7E001, 123);
+              auto const AFTER = target->begin_local_signal_admission();
+              ok &= AFTER.remote && !AFTER.local_lease;
+          }) == 0;
+    ok &= interleaved && ker::net::wki::wki_exec_signal_snapshot(*target).pending == CHILD;
+    target->signal_clear_pending_mask(~uint64_t{0});
+    ok &= !try_signal_child_event_local(*target).has_value() && target->signal_pending_bits() == 0;
+    target->exit_in_progress = true;
+    ok &= try_signal_child_event_local(*target) == -ESRCH;
+    return ok && target->ref_count.load() == 1 && target->local_signal_admissions_drained();
+}
+
+auto process_selftest_parent_death_cutover() -> bool {
+    using namespace ker::mod;
+    auto target = std::make_unique<sched::task::Task>();
+    target->type = sched::task::TaskType::PROCESS;
+    target->hide_group_signals_until_publication();
+    bool ok = true;
+    auto call = [&] {
+        if (!target->try_acquire()) return -ESRCH;
+        return signal_parent_death(*target, ker::net::wki::WKI_PARENT_DEATH_HOPS);
+    };
+    for (uint32_t uid : {0U, 100U, 104U, 200U}) {
+        security::Snapshot credentials;
+        ok &= security::Snapshot::bootstrap_root().prepare({.change = security::Change::SET_UID, .real = uid}, credentials) == 0;
+        ok &= sched::resource::initialize_credentials(*target, credentials) == 0;
+        for (uint32_t registration : {0U, 10U, 12U, 64U, 65U}) {
+            target->parent_death_signal.store(registration);
+            ok &= call() == (registration <= 64 ? 0 : -EINVAL);
+            uint64_t const EXPECTED = registration == 0 || registration > 64 ? 0 : uint64_t{1} << (registration - 1);
+            ok &= target->signal_pending_bits() == EXPECTED && target->credentials() == credentials;
+            ok &= target->ref_count.load() == 1 && target->local_signal_admissions_drained();
+            target->signal_clear_pending_mask(~uint64_t{0});
+        }
+    }
+    target->parent_death_signal.store(10);
+    bool interleaved = false;
+    ok &= parent_death_signal(*target, ker::net::wki::WKI_PARENT_DEATH_HOPS, [&] {
+              interleaved = true;
+              ok &= !target->local_signal_admissions_drained() && target->signal_pending_bits() == 0;
+              target->publish_accepted_signal_route(0x7B7B0001, 99);
+              ok &= !target->local_signal_admissions_drained();
+              auto const AFTER = target->begin_local_signal_admission();
+              ok &= AFTER.remote && !AFTER.local_lease;
+          }) == 0;
+    auto const SNAPSHOT = ker::net::wki::wki_exec_signal_snapshot(*target);
+    ok &= interleaved && SNAPSHOT.parent_death_signal == 10 && SNAPSHOT.pending == (uint64_t{1} << 9);
+    target->signal_clear_pending_mask(~uint64_t{0});
+    // No submitted row: an accepted route never falls back to the source proxy.
+    ok &= call() == -ESRCH && target->signal_pending_bits() == 0;
+    target->parent_death_signal.store(0);
+    ok &= call() == -ESRCH && target->signal_pending_bits() == 0;
+    return ok && target->ref_count.load() == 1 && target->local_signal_admissions_drained();
+}
+
+auto process_selftest_terminal_source_cutover() -> bool {
+    using namespace ker::mod;
+    sched::session::Identity const EXPECTED{
+        .session_id = 41, .pgid = 42, .terminal = {.value = 0x101}, .terminal_generation = 7, .group_origin = {.node = 18, .boot = 10}};
+    bool ok = true;
+    for (bool thread : {false, true}) {
+        auto owner = std::make_unique<sched::task::Task>();
+        auto worker = std::make_unique<sched::task::Task>();
+        owner->type = worker->type = sched::task::TaskType::PROCESS;
+        owner->pid = 0x7B7A0001;
+        worker->pid = 0x7B7A0002;
+        worker->is_thread = true;
+        worker->owner_pid = owner->pid;
+        if (!sched::resource::bind_thread_owner(*worker, *owner)) return false;
+        owner->initialize_job_identity(EXPECTED);
+        auto& target = thread ? *worker : *owner;
+        target.hide_group_signals_until_publication();
+        // The source callback may already own publication (leader detach).
+        // These private Tasks never enter the scheduler or send a packet.
+        ker::syscall::vmem::SharedVmemPublicationGuard publication;
+        auto call = [&](bool revoked = false, int signal = 2) { return signal_terminal_source_as(target, EXPECTED, signal, revoked); };
+        for (unsigned mutation = 0; mutation < 8; ++mutation) {
+            auto changed = EXPECTED;
+            switch (mutation) {
+                case 0:
+                    ++changed.session_id;
+                    break;
+                case 1:
+                    ++changed.pgid;
+                    break;
+                case 2:
+                    ++changed.origin.node;
+                    break;
+                case 3:
+                    ++changed.origin.boot;
+                    break;
+                case 4:
+                    ++changed.group_origin.node;
+                    break;
+                case 5:
+                    ++changed.group_origin.boot;
+                    break;
+                case 6:
+                    ++changed.terminal.value;
+                    break;
+                case 7:
+                    ++changed.terminal_generation;
+                    break;
+            }
+            owner->initialize_job_identity(changed);
+            ok &= call() == -ESRCH && target.signal_pending_bits() == 0 && target.local_signal_admissions_drained();
+        }
+        owner->initialize_job_identity(EXPECTED);
+        ok &= call(false, 0) == -EINVAL && call(false, 65) == -EINVAL;
+        for (uint32_t uid : {0U, 100U, 104U, 200U}) {
+            security::Snapshot credentials;
+            ok &= security::Snapshot::bootstrap_root().prepare({.change = security::Change::SET_UID, .real = uid}, credentials) == 0;
+            ok &= sched::resource::initialize_credentials(*owner, credentials) == 0;
+            ok &= call() == 0 && target.signal_pending_bits() == 2 && target.credentials() == credentials;
+            target.signal_clear_pending_mask(~uint64_t{0});
+        }
+        auto cleared = EXPECTED;
+        cleared.terminal = {};
+        cleared.terminal_generation = 0;
+        owner->initialize_job_identity(cleared);
+        ok &= call() == -ESRCH && call(true, 1) == 0 && target.signal_pending_bits() == 1;
+        target.signal_clear_pending_mask(~uint64_t{0});
+        owner->initialize_job_identity(EXPECTED);
+        bool interleaved = false;
+        int const RESULT = terminal_source_signal(target, EXPECTED, 2, false, [&] {
+            interleaved = true;
+            ok &= !target.local_signal_admissions_drained() && target.signal_pending_bits() == 0;
+            target.publish_accepted_signal_route(0x7B7A0001, 99);
+            // The old no-route observation allowed capture here; admission
+            // now forces exec's actual drain predicate to remain false.
+            ok &= !target.local_signal_admissions_drained();
+            auto const AFTER = target.begin_local_signal_admission();
+            ok &= AFTER.remote && !AFTER.local_lease;
+        });
+        ok &= RESULT == 0 && interleaved && target.local_signal_admissions_drained();
+        ok &= ker::net::wki::wki_exec_signal_snapshot(target).pending == 2;
+        target.signal_clear_pending_mask(~uint64_t{0});
+        // Accepted route without a submitted row: refusal never falls back.
+        ok &= call() == -ESRCH && target.signal_pending_bits() == 0 && target.local_signal_admissions_drained();
+        ok &= owner->ref_count.load() == 2 && worker->ref_count.load() == 1;
+    }
+    return ok;
+}
+
+auto process_selftest_terminal_signal_authority() -> bool {
+    using namespace ker::mod;
+    sched::task::Task target{};
+    target.type = sched::task::TaskType::PROCESS;
+    target.pid = 0x7B790001;
+    target.hide_group_signals_until_publication();
+    sched::session::Identity const EXPECTED{
+        .session_id = 41, .pgid = 42, .origin = {.node = 17, .boot = 9}, .group_origin = {.node = 18, .boot = 10}};
+    target.initialize_job_identity(EXPECTED);
+    auto call = [&](int signal = 2) {
+        if (!target.try_acquire()) return -ESRCH;
+        return signal_terminal_as(target, EXPECTED, signal, ker::net::wki::WKI_TERMINAL_SIGNAL_HOPS);
+    };
+    bool ok = true;
+    for (unsigned mutation = 0; mutation < 6; ++mutation) {
+        auto changed = EXPECTED;
+        switch (mutation) {
+            case 0:
+                ++changed.session_id;
+                break;
+            case 1:
+                ++changed.pgid;
+                break;
+            case 2:
+                ++changed.origin.node;
+                break;
+            case 3:
+                ++changed.origin.boot;
+                break;
+            case 4:
+                ++changed.group_origin.node;
+                break;
+            case 5:
+                ++changed.group_origin.boot;
+                break;
+        }
+        target.initialize_job_identity(changed);
+        ok &= call() == -ESRCH && target.signal_pending_bits() == 0 && target.local_signal_admissions_drained();
+    }
+    target.initialize_job_identity(EXPECTED);
+    ok &= call(0) == -EINVAL && call(65) == -EINVAL && target.signal_pending_bits() == 0;
+    for (uint32_t uid : {0U, 100U, 104U, 200U}) {
+        security::Snapshot credentials;
+        ok &= security::Snapshot::bootstrap_root().prepare({.change = security::Change::SET_UID, .real = uid}, credentials) == 0;
+        ok &= sched::resource::initialize_credentials(target, credentials) == 0;
+        ok &= call() == 0 && target.signal_pending_bits() == 2 && target.credentials() == credentials;
+        target.signal_clear_pending_mask(~uint64_t{0});
+    }
+    target.publish_accepted_signal_route(0x7B790001, 99);
+    // No submitted row: a present remote refusal must never touch the old frame.
+    ok &= call() == -ESRCH && target.signal_pending_bits() == 0;
+    return ok && target.ref_count.load() == 1 && target.local_signal_admissions_drained();
+}
+
 auto process_selftest_fd_clone_failure_releases_refs() -> bool {
     ker::mod::sched::task::Task parent{};
     ker::mod::sched::task::Task child{};
@@ -1585,6 +2555,13 @@ auto process_selftest_fork_child_preserves_entry_registers() -> bool {
 #endif
 
 auto personality(uint64_t persona) -> uint64_t { return wos_proc_personality(persona); }
+
+auto set_creation_mask(ker::mod::sched::task::Task& subject, uint32_t mask) -> int {
+    ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+    if (subject.credential_owner() == nullptr) return -ESRCH;
+    if (request_replaced_exec_thread_retirement(subject)) return -ECANCELED;
+    return static_cast<int>(subject.exchange_creation_mask(mask));
+}
 
 auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, ker::mod::cpu::GPRegs& gpr)
     -> uint64_t {
@@ -1676,34 +2653,35 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
         // --- POSIX credential syscalls ---
         case abi::process::procmgmt_ops::GETUID: {
             auto* task = ker::mod::sched::get_current_task();
-            return (task != nullptr) ? task->uid : 0;
+            return (task != nullptr) ? task->credentials().user().real : 0;
         }
         case abi::process::procmgmt_ops::GETEUID: {
             auto* task = ker::mod::sched::get_current_task();
-            return (task != nullptr) ? task->euid : 0;
+            return (task != nullptr) ? task->credentials().user().effective : 0;
         }
         case abi::process::procmgmt_ops::GETGID: {
             auto* task = ker::mod::sched::get_current_task();
-            return (task != nullptr) ? task->gid : 0;
+            return (task != nullptr) ? task->credentials().group().real : 0;
         }
         case abi::process::procmgmt_ops::GETEGID: {
             auto* task = ker::mod::sched::get_current_task();
-            return (task != nullptr) ? task->egid : 0;
+            return (task != nullptr) ? task->credentials().group().effective : 0;
         }
         case abi::process::procmgmt_ops::GETRESUID: {
             auto* task = ker::mod::sched::get_current_task();
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
+            auto const IDS = task->credentials().user();
             if (a2 == 0 || a3 == 0 || a4 == 0) {
                 return static_cast<uint64_t>(-EFAULT);
             }
-            if (!ker::mod::sys::usercopy::ensure_writable(*task, a2, sizeof(task->uid)) ||
-                !ker::mod::sys::usercopy::ensure_writable(*task, a3, sizeof(task->euid)) ||
-                !ker::mod::sys::usercopy::ensure_writable(*task, a4, sizeof(task->suid)) ||
-                !ker::mod::sys::usercopy::copy_value_to_task(*task, a2, task->uid) ||
-                !ker::mod::sys::usercopy::copy_value_to_task(*task, a3, task->euid) ||
-                !ker::mod::sys::usercopy::copy_value_to_task(*task, a4, task->suid)) {
+            if (!ker::mod::sys::usercopy::ensure_writable(*task, a2, sizeof(IDS.real)) ||
+                !ker::mod::sys::usercopy::ensure_writable(*task, a3, sizeof(IDS.effective)) ||
+                !ker::mod::sys::usercopy::ensure_writable(*task, a4, sizeof(IDS.saved)) ||
+                !ker::mod::sys::usercopy::copy_value_to_task(*task, a2, IDS.real) ||
+                !ker::mod::sys::usercopy::copy_value_to_task(*task, a3, IDS.effective) ||
+                !ker::mod::sys::usercopy::copy_value_to_task(*task, a4, IDS.saved)) {
                 return static_cast<uint64_t>(-EFAULT);
             }
             return 0;
@@ -1713,15 +2691,16 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
+            auto const IDS = task->credentials().group();
             if (a2 == 0 || a3 == 0 || a4 == 0) {
                 return static_cast<uint64_t>(-EFAULT);
             }
-            if (!ker::mod::sys::usercopy::ensure_writable(*task, a2, sizeof(task->gid)) ||
-                !ker::mod::sys::usercopy::ensure_writable(*task, a3, sizeof(task->egid)) ||
-                !ker::mod::sys::usercopy::ensure_writable(*task, a4, sizeof(task->sgid)) ||
-                !ker::mod::sys::usercopy::copy_value_to_task(*task, a2, task->gid) ||
-                !ker::mod::sys::usercopy::copy_value_to_task(*task, a3, task->egid) ||
-                !ker::mod::sys::usercopy::copy_value_to_task(*task, a4, task->sgid)) {
+            if (!ker::mod::sys::usercopy::ensure_writable(*task, a2, sizeof(IDS.real)) ||
+                !ker::mod::sys::usercopy::ensure_writable(*task, a3, sizeof(IDS.effective)) ||
+                !ker::mod::sys::usercopy::ensure_writable(*task, a4, sizeof(IDS.saved)) ||
+                !ker::mod::sys::usercopy::copy_value_to_task(*task, a2, IDS.real) ||
+                !ker::mod::sys::usercopy::copy_value_to_task(*task, a3, IDS.effective) ||
+                !ker::mod::sys::usercopy::copy_value_to_task(*task, a4, IDS.saved)) {
                 return static_cast<uint64_t>(-EFAULT);
             }
             return 0;
@@ -1729,95 +2708,39 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
         case abi::process::procmgmt_ops::GETGROUPS: {
             return wos_proc_getgroups(static_cast<size_t>(a2), a3);
         }
-        case abi::process::procmgmt_ops::SETUID: {
-            auto* task = ker::mod::sched::get_current_task();
-            if (task == nullptr) {
-                return static_cast<uint64_t>(-ESRCH);
-            }
-            auto new_uid = static_cast<uint32_t>(a2);
-            if (task->euid == 0) {
-                // Privileged: set all three
-                int const TRANSFER = ker::mod::sched::resource::change_real_uid(*task, new_uid);
-                if (TRANSFER < 0) return static_cast<uint64_t>(TRANSFER);
-                task->euid = new_uid;
-                task->suid = new_uid;
-            } else if (new_uid == task->uid || new_uid == task->suid) {
-                task->euid = new_uid;
-            } else {
-                return static_cast<uint64_t>(-EPERM);
-            }
-            return 0;
-        }
-        case abi::process::procmgmt_ops::SETGID: {
-            auto* task = ker::mod::sched::get_current_task();
-            if (task == nullptr) {
-                return static_cast<uint64_t>(-ESRCH);
-            }
-            auto new_gid = static_cast<uint32_t>(a2);
-            if (task->euid == 0) {
-                task->gid = new_gid;
-                task->egid = new_gid;
-                task->sgid = new_gid;
-            } else if (new_gid == task->gid || new_gid == task->sgid) {
-                task->egid = new_gid;
-            } else {
-                return static_cast<uint64_t>(-EPERM);
-            }
-            return 0;
-        }
-        case abi::process::procmgmt_ops::SETEUID: {
-            auto* task = ker::mod::sched::get_current_task();
-            if (task == nullptr) {
-                return static_cast<uint64_t>(-ESRCH);
-            }
-            auto new_euid = static_cast<uint32_t>(a2);
-            if (task->euid == 0 || new_euid == task->uid || new_euid == task->suid) {
-                task->euid = new_euid;
-                return 0;
-            }
-            return static_cast<uint64_t>(-EPERM);
-        }
+        case abi::process::procmgmt_ops::SETUID:
+        case abi::process::procmgmt_ops::SETGID:
+        case abi::process::procmgmt_ops::SETEUID:
         case abi::process::procmgmt_ops::SETEGID: {
             auto* task = ker::mod::sched::get_current_task();
-            if (task == nullptr) {
-                return static_cast<uint64_t>(-ESRCH);
-            }
-            auto new_egid = static_cast<uint32_t>(a2);
-            if (task->euid == 0 || new_egid == task->gid || new_egid == task->sgid) {
-                task->egid = new_egid;
-                return 0;
-            }
-            return static_cast<uint64_t>(-EPERM);
+            if (task == nullptr) return static_cast<uint64_t>(-ESRCH);
+            using ker::mod::security::Change;
+            auto change = Change::SET_UID;
+            if (op == abi::process::procmgmt_ops::SETGID) change = Change::SET_GID;
+            if (op == abi::process::procmgmt_ops::SETEUID) change = Change::SET_EUID;
+            if (op == abi::process::procmgmt_ops::SETEGID) change = Change::SET_EGID;
+            ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+            return static_cast<uint64_t>(ker::mod::sched::resource::change_credentials(
+                *task, {.change = change, .real = static_cast<uint32_t>(a2), .effective = static_cast<uint32_t>(a2)}));
         }
         case abi::process::procmgmt_ops::SETGROUPS: {
             return wos_proc_setgroups(static_cast<size_t>(a2), a3);
         }
         case abi::process::procmgmt_ops::GETUMASK: {
             auto* task = ker::mod::sched::get_current_task();
-            return (task != nullptr) ? task->umask : 022;
+            return (task != nullptr) ? task->creation_mask() : 022;
         }
         case abi::process::procmgmt_ops::SETUMASK: {
             auto* task = ker::mod::sched::get_current_task();
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
-            auto old_umask = task->umask;
-            task->umask = static_cast<uint32_t>(a2) & 0777;
-            return old_umask;
+            return static_cast<uint64_t>(set_creation_mask(*task, static_cast<uint32_t>(a2)));
         }
 
         case abi::process::procmgmt_ops::SETSID: {
             auto* task = ker::mod::sched::get_current_task();
-            if (task == nullptr) {
-                return static_cast<uint64_t>(-ESRCH);
-            }
-            uint64_t const PROCESS_PID = process_pid_for_task(*task);
-            // POSIX: setsid fails if the caller is already a process group leader
-            if (task->pgid == PROCESS_PID && task->session_id != 0) {
-                return static_cast<uint64_t>(-EPERM);
-            }
-            update_thread_group_job_control(PROCESS_PID, PROCESS_PID, PROCESS_PID, true);
-            return PROCESS_PID;
+            return task != nullptr ? static_cast<uint64_t>(ker::mod::sched::session::create(*task)) : static_cast<uint64_t>(-ESRCH);
         }
         case abi::process::procmgmt_ops::GETSID: {
             auto pid = static_cast<int64_t>(a2);
@@ -1826,51 +2749,21 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
                 if (task == nullptr) {
                     return static_cast<uint64_t>(-ESRCH);
                 }
-                uint64_t const PROCESS_PID = process_pid_for_task(*task);
-                return task->session_id != 0 ? task->session_id : PROCESS_PID;
+                return task->job_identity().session_id;
             }
             auto* target = find_process_leader_safe(static_cast<uint64_t>(pid));
             if (target == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
-            auto sid = target->session_id != 0 ? target->session_id : process_pid_for_task(*target);
+            auto sid = target->job_identity().session_id;
             target->release();
             return sid;
         }
         case abi::process::procmgmt_ops::SETPGID: {
             auto* task = ker::mod::sched::get_current_task();
-            if (task == nullptr) {
-                return static_cast<uint64_t>(-ESRCH);
-            }
-            uint64_t const CALLER_PID = process_pid_for_task(*task);
-            auto pid = a2;
-            auto new_pgid = a3;
-            // pid==0 means current process
-            if (pid == 0) {
-                pid = CALLER_PID;
-            }
-            // pgid==0 means use pid as pgid
-            if (new_pgid == 0) {
-                new_pgid = pid;
-            }
-            auto* target = find_process_leader_safe(pid);
-            if (target == nullptr) {
-                return static_cast<uint64_t>(-ESRCH);
-            }
-            uint64_t const TARGET_PID = process_pid_for_task(*target);
-            if (TARGET_PID == CALLER_PID) {
-                update_thread_group_job_control(TARGET_PID, target->session_id, new_pgid, false);
-                target->release();
-                return 0;
-            }
-            // Setting pgid for another process (must be a child, same session)
-            if (target->parent_pid != CALLER_PID || target->session_id != task->session_id) {
-                target->release();
-                return static_cast<uint64_t>(-EPERM);
-            }
-            update_thread_group_job_control(TARGET_PID, target->session_id, new_pgid, false);
-            target->release();
-            return 0;
+            return task != nullptr ? static_cast<uint64_t>(
+                                         ker::mod::sched::session::set_group(*task, static_cast<int64_t>(a2), static_cast<int64_t>(a3)))
+                                   : static_cast<uint64_t>(-ESRCH);
         }
         case abi::process::procmgmt_ops::GETPGID: {
             auto pid = static_cast<int64_t>(a2);
@@ -1879,15 +2772,13 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
                 if (task == nullptr) {
                     return static_cast<uint64_t>(-ESRCH);
                 }
-                uint64_t const PROCESS_PID = process_pid_for_task(*task);
-                return task->pgid != 0 ? task->pgid : PROCESS_PID;
+                return task->job_identity().pgid;
             }
             auto* target = find_process_leader_safe(static_cast<uint64_t>(pid));
             if (target == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
-            uint64_t const PROCESS_PID = process_pid_for_task(*target);
-            auto pgid = target->pgid != 0 ? target->pgid : PROCESS_PID;
+            auto pgid = target->job_identity().pgid;
             target->release();
             return pgid;
         }
@@ -1904,18 +2795,23 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             if (a2 == 0) {
                 return static_cast<uint64_t>(-EFAULT);
             }
-            const char* name = ker::util::hostname::get();
-            size_t const LEN = std::strlen(name);
+            auto const NAME = ker::util::hostname::snapshot();
+            size_t const LEN = std::strlen(NAME.data());
             if (LEN + 1 > bufsize) {
                 return static_cast<uint64_t>(-ENAMETOOLONG);
             }
-            return ker::mod::sys::usercopy::copy_to_task(*task, a2, name, LEN + 1) ? 0 : static_cast<uint64_t>(-EFAULT);
+            return ker::mod::sys::usercopy::copy_to_task(*task, a2, NAME.data(), LEN + 1) ? 0 : static_cast<uint64_t>(-EFAULT);
         }
         case abi::process::procmgmt_ops::SETHOSTNAME: {
             auto len = static_cast<size_t>(a3);
             auto* task = ker::mod::sched::get_current_task();
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
+            }
+            auto const CREDENTIALS = task->credentials();
+            int const AUTHORIZATION = ker::mod::security::authorize_hostname_change(CREDENTIALS);
+            if (AUTHORIZATION != 0) {
+                return static_cast<uint64_t>(AUTHORIZATION);
             }
             if (a2 == 0) {
                 return static_cast<uint64_t>(-EFAULT);

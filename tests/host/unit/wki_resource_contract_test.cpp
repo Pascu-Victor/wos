@@ -462,3 +462,52 @@ TEST(WkiServiceContract, UnalignedExactWireAndFinalFlags) {
         EXPECT_FALSE(service::decode(bytes.data() + 1, sizeof(bad), decoded, observation));
     }
 }
+
+TEST(WkiResourceContract, ImportedChildObservationsRequireExplicitSubmissionOutput) {
+    resource::State source;
+    auto record = contract::snapshot(source);
+    record.reaped_user_time_us = 17;
+    record.reaped_system_time_us = 19;
+    resource::State receiver;
+    receiver.commit_extent(AS, 123);
+    auto const BEFORE = contract::snapshot(receiver);
+    ker::net::wki::TaskChildCpuObservation observations{31, 37};
+    EXPECT_FALSE(contract::restore(record, receiver, 256, &observations));
+    EXPECT_EQ(observations.user_time_us, 31);
+    record.flags |= ker::net::wki::WKI_RESOURCE_CHILD_OBSERVATIONS;
+    EXPECT_FALSE(contract::restore(record, receiver, 256));
+    auto const UNCHANGED = contract::snapshot(receiver);
+    EXPECT_EQ(std::memcmp(&BEFORE, &UNCHANGED, sizeof(BEFORE)), 0);
+    ASSERT_TRUE(contract::restore(record, receiver, 256, &observations));
+    EXPECT_EQ(observations.user_time_us, 17);
+    EXPECT_EQ(observations.system_time_us, 19);
+    auto const RESTORED = contract::snapshot(receiver);
+    EXPECT_EQ(RESTORED.reaped_user_time_us, 0);
+    EXPECT_EQ(RESTORED.reaped_system_time_us, 0);
+    EXPECT_EQ(RESTORED.flags & ker::net::wki::WKI_RESOURCE_CHILD_OBSERVATIONS, 0);
+    auto invalid = record;
+    invalid.reserved = 1;
+    EXPECT_FALSE(contract::restore(invalid, receiver, 256, &observations));
+    EXPECT_EQ(observations.user_time_us, 17);
+    EXPECT_EQ(observations.system_time_us, 19);
+}
+
+TEST(WkiResourceContract, CompletionAndRejectionNeverReturnImportedObservations) {
+    resource::State source;
+    auto baseline = contract::snapshot(source);
+    baseline.flags |= ker::net::wki::WKI_RESOURCE_CHILD_OBSERVATIONS;
+    baseline.reaped_user_time_us = UINT64_MAX;
+    baseline.reaped_system_time_us = 19;
+    auto completion = contract::snapshot(source);
+    EXPECT_TRUE(contract::valid_rejection(baseline, completion, 256));
+    completion.reaped_user_time_us = 5;
+    completion.reaped_system_time_us = 7;
+    EXPECT_TRUE(contract::valid_completion(baseline, completion, 256));
+    EXPECT_FALSE(contract::valid_rejection(baseline, completion, 256));
+    completion.flags |= ker::net::wki::WKI_RESOURCE_CHILD_OBSERVATIONS;
+    EXPECT_FALSE(contract::valid_completion(baseline, completion, 256));
+    EXPECT_FALSE(contract::valid_rejection(baseline, completion, 256));
+    baseline.flags &= ~ker::net::wki::WKI_RESOURCE_CHILD_OBSERVATIONS;
+    completion.flags &= ~ker::net::wki::WKI_RESOURCE_CHILD_OBSERVATIONS;
+    EXPECT_FALSE(contract::valid_completion(baseline, completion, 256));
+}

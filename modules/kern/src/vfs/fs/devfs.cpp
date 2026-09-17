@@ -21,6 +21,7 @@
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/security/file_policy.hpp>
 #include <platform/sys/mutex.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <string_view>
@@ -43,8 +44,10 @@ namespace {
 constexpr uint32_t DEVFS_FILE_MAGIC = 0xDEADBEEF;
 constexpr uint64_t NS_PER_SEC = 1000000000ULL;
 using log = ker::mod::dbg::logger<"devfs">;
-ker::mod::sys::Spinlock g_wki_lock;          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-ker::mod::sys::Mutex g_pts_namespace_mutex;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Spinlock g_wki_lock;            // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Mutex g_nodes_namespace_mutex;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Mutex g_local_namespace_mutex;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Mutex g_pts_namespace_mutex;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 struct NetStatsDeviceContext {
     ker::net::NetDeviceIdentity identity{};
@@ -89,13 +92,71 @@ class OptionalPtsLock {
     bool locked;
 };
 
+// Peer aliases have their own namespace transaction. Root child-array access
+// additionally serializes with other namespaces through RootChildrenGuard.
+class OptionalNodesLock {
+   public:
+    explicit OptionalNodesLock(bool enabled) : locked_(enabled) {
+        if (locked_) g_nodes_namespace_mutex.lock();
+    }
+    OptionalNodesLock(const OptionalNodesLock&) = delete;
+    auto operator=(const OptionalNodesLock&) -> OptionalNodesLock& = delete;
+    ~OptionalNodesLock() {
+        if (locked_) g_nodes_namespace_mutex.unlock();
+    }
+
+   private:
+    bool locked_;
+};
+
+// Generic paths have no PTS/WKI endpoint state and can use a sleeping guard.
+// Journal publication runs outside its IRQ-safe emission lock.
+class OptionalLocalLock {
+   public:
+    explicit OptionalLocalLock(bool enabled) : locked_(enabled) {
+        if (locked_) {
+            g_local_namespace_mutex.lock();
+        }
+    }
+    OptionalLocalLock(const OptionalLocalLock&) = delete;
+    auto operator=(const OptionalLocalLock&) -> OptionalLocalLock& = delete;
+    ~OptionalLocalLock() {
+        if (locked_) {
+            g_local_namespace_mutex.unlock();
+        }
+    }
+
+   private:
+    bool locked_;
+};
+
+auto is_nodes_devfs_path(const char* path) -> bool {
+    if (path == nullptr) return false;
+    const char* relative = path;
+    while (*relative == '/') {
+        ++relative;
+    }
+    return std::strncmp(relative, "nodes", 5) == 0 && (relative[5] == '\0' || relative[5] == '/');
+}
+
 void wki_release_node_ref(DevFSNode* node);
+
+void pts_release_node_ref(DevFSNode* node) {
+    if (node->pts_refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        // Device belongs to the PTY pair and has its own endpoint lifetime.
+        delete[] node->children;
+        delete node;
+    }
+}
 
 auto is_wki_devfs_path(const char* path) -> bool {
     if (path == nullptr) {
         return false;
     }
-    const char* rel_path = (*path == '/') ? path + 1 : path;
+    const char* rel_path = path;
+    while (*rel_path == '/') {
+        ++rel_path;
+    }
     return std::strncmp(rel_path, "wki", 3) == 0 && (rel_path[3] == '\0' || rel_path[3] == '/');
 }
 
@@ -106,10 +167,23 @@ auto is_pts_devfs_path(const char* path) -> bool {
     const char* rel_path = path;
     if (std::strncmp(rel_path, "/dev/", 5) == 0) {
         rel_path += 5;
-    } else if (*rel_path == '/') {
-        rel_path++;
+    }
+    while (*rel_path == '/') {
+        ++rel_path;
     }
     return std::strncmp(rel_path, "pts", 3) == 0 && (rel_path[3] == '\0' || rel_path[3] == '/');
+}
+
+auto is_local_devfs_path(const char* path) -> bool {
+    return !is_pts_devfs_path(path) && !is_wki_devfs_path(path) && !is_nodes_devfs_path(path);
+}
+
+void local_release_node_ref(DevFSNode* node) {
+    if (node->local_refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        // Device ownership belongs to the endpoint provider, not this metadata.
+        delete[] node->children;
+        delete node;
+    }
 }
 
 auto is_valid_kernel_pointer(const void* ptr) -> bool {
@@ -123,7 +197,67 @@ auto is_valid_kernel_pointer(const void* ptr) -> bool {
 
 DevFSNode root_node;
 
+ker::mod::sys::Spinlock g_root_children_lock;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+class RootChildrenGuard {
+   public:
+    explicit RootChildrenGuard(const DevFSNode* node) : locked_(node == &root_node) {
+        if (locked_) {
+            flags_ = g_root_children_lock.lock_irqsave();
+        }
+    }
+    RootChildrenGuard(const RootChildrenGuard&) = delete;
+    auto operator=(const RootChildrenGuard&) -> RootChildrenGuard& = delete;
+    ~RootChildrenGuard() {
+        if (locked_) {
+            g_root_children_lock.unlock_irqrestore(flags_);
+        }
+    }
+
+   private:
+    bool locked_;
+    uint64_t flags_{};
+};
+
 constexpr size_t INITIAL_CHILDREN_CAPACITY = 16;
+
+class MetadataGuard {
+   public:
+    explicit MetadataGuard(const DevFSNode& node) : lock_(node.metadata_lock), flags_(lock_.lock_irqsave()) {}
+    MetadataGuard(const MetadataGuard&) = delete;
+    auto operator=(const MetadataGuard&) -> MetadataGuard& = delete;
+    ~MetadataGuard() { lock_.unlock_irqrestore(flags_); }
+
+   private:
+    ker::mod::sys::Spinlock& lock_;
+    uint64_t flags_;
+};
+
+auto node_mode_locked(const DevFSNode& node) -> uint32_t {
+    uint32_t type = S_IFCHR;
+    if (node.type == DevFSNodeType::DIRECTORY) {
+        type = S_IFDIR;
+    } else if (node.type == DevFSNodeType::SYMLINK) {
+        type = S_IFLNK;
+    } else if (node.is_block_device) {
+        type = S_IFBLK;
+    }
+    return type | node.mode;
+}
+
+void fill_node_stat_locked(const DevFSNode& node, uint32_t dev_id, Stat& out) {
+    out = {};
+    out.st_dev = dev_id;
+    out.st_ino = reinterpret_cast<ino_t>(&node);
+    out.st_nlink = 1;
+    out.st_uid = node.uid;
+    out.st_gid = node.gid;
+    out.st_mode = node_mode_locked(node);
+    out.st_blksize = 4096;
+    out.st_atim = node.atime;
+    out.st_mtim = node.mtime;
+    out.st_ctim = node.ctime;
+}
 
 // -- Tree helpers -----------------------------------------------------
 
@@ -145,13 +279,52 @@ void stamp_new_node(DevFSNode* node) {
     node->ctime = NOW;
 }
 
-void touch_node_modified(DevFSNode* node) {
+void touch_node_modified(DevFSNode* node, bool attached_child = false) {
     if (node == nullptr) {
         return;
     }
     Timespec const NOW = current_timespec();
+    MetadataGuard const GUARD(*node);
+    if (attached_child) node->child_namespace = true;
     node->mtime = NOW;
     node->ctime = NOW;
+}
+
+// A spare is selected/allocated without the root lock. Recheck the current
+// array before committing: another namespace may have grown it meanwhile.
+// On replacement, spare receives the retired array for deletion after unlock.
+auto try_add_root_child(DevFSNode* child, DevFSNode**& spare, size_t spare_capacity, size_t& required) -> bool {
+    RootChildrenGuard const GUARD(&root_node);
+    if (root_node.children_count == root_node.children_capacity) {
+        if (spare_capacity <= root_node.children_count) {
+            required = root_node.children_capacity == 0 ? INITIAL_CHILDREN_CAPACITY : root_node.children_capacity * 2;
+            return false;
+        }
+        if (root_node.children_count != 0) {
+            std::memcpy(spare, root_node.children, root_node.children_count * sizeof(DevFSNode*));
+        }
+        std::swap(root_node.children, spare);
+        root_node.children_capacity = spare_capacity;
+    }
+    child->parent = &root_node;
+    root_node.children[root_node.children_count++] = child;
+    touch_node_modified(&root_node, true);
+    return true;
+}
+
+void add_root_child(DevFSNode* child) {
+    DevFSNode** spare = nullptr;
+    size_t spare_capacity = 0;
+    size_t required = 0;
+    while (!try_add_root_child(child, spare, spare_capacity, required)) {
+        delete[] spare;
+        spare = new DevFSNode*[required];
+        if (spare == nullptr) {
+            return;
+        }
+        spare_capacity = required;
+    }
+    delete[] spare;
 }
 
 void ensure_children_capacity(DevFSNode* node) {
@@ -171,6 +344,7 @@ void ensure_children_capacity(DevFSNode* node) {
 }
 
 auto find_child(DevFSNode* dir, const char* name) -> DevFSNode* {
+    RootChildrenGuard const ROOT_GUARD(dir);
     if (dir == nullptr) {
         return nullptr;
     }
@@ -186,16 +360,21 @@ void add_child(DevFSNode* parent, DevFSNode* child) {
     if (parent == nullptr || child == nullptr) {
         return;
     }
+    if (parent == &root_node) {
+        add_root_child(child);
+        return;
+    }
     ensure_children_capacity(parent);
     if (parent->children_count >= parent->children_capacity) {
         return;  // allocation failed
     }
     child->parent = parent;
     parent->children[parent->children_count++] = child;
-    touch_node_modified(parent);
+    touch_node_modified(parent, true);
 }
 
 void remove_child(DevFSNode* parent, DevFSNode* child) {
+    RootChildrenGuard const ROOT_GUARD(parent);
     if (parent == nullptr || child == nullptr) {
         return;
     }
@@ -294,6 +473,48 @@ auto walk_path(const char* path, bool create_intermediate = false) -> DevFSNode*
     return current;
 }
 
+template <typename Consumer>
+auto with_lookup_node(const char* path, const DevFSNodeRef& retained, Consumer consume) -> int {
+    OptionalLocalLock const LOCAL_GUARD(is_local_devfs_path(path));
+    OptionalPtsLock const PTS_GUARD(is_pts_devfs_path(path));
+    OptionalNodesLock const NODES_GUARD(is_nodes_devfs_path(path));
+    OptionalWkiLock const WKI_GUARD(is_wki_devfs_path(path));
+    if (!retained || walk_path(path, false) != retained.get()) {
+        return -EAGAIN;
+    }
+    // Namespace validation and metadata commit are one backend operation.
+    return consume(retained.get());
+}
+
+auto change_node_identity(DevFSNode* node, const ker::mod::security::Snapshot& caller, bool chmod, uint32_t first, uint32_t second,
+                          uint32_t dev_id, bool require_directory, Stat* out, bool read_only = false) -> int {
+    if (node == nullptr) {
+        return -EBADF;
+    }
+    MetadataGuard const GUARD(*node);
+    if (require_directory && node->type != DevFSNodeType::DIRECTORY) {
+        return -ENOTDIR;
+    }
+    ker::mod::security::FileIdentity const BEFORE{node->uid, node->gid, node_mode_locked(*node)};
+    ker::mod::security::FileIdentity after{};
+    int const RET = chmod ? ker::mod::security::prepare_file_chmod(caller, BEFORE, first, after)
+                          : ker::mod::security::prepare_file_chown(caller, BEFORE, first, second, after);
+    if (RET != 0) {
+        return RET;
+    }
+    if (read_only) {
+        return -EROFS;
+    }
+    node->uid = after.uid;
+    node->gid = after.gid;
+    node->mode = after.mode & 07777;
+    node->ctime = current_timespec();
+    if (out != nullptr) {
+        fill_node_stat_locked(*node, dev_id, *out);
+    }
+    return 0;
+}
+
 // -- DevFSFile wrapper (stored in File->private_data) -----------------
 
 struct DevFSFile {
@@ -302,6 +523,10 @@ struct DevFSFile {
     uint32_t magic = DEVFS_FILE_MAGIC;
     bool owns_wki_node_ref = false;
     bool guards_pts_namespace = false;
+    bool guards_nodes_namespace = false;
+    bool owns_pts_node_ref = false;
+    bool owns_local_node_ref = false;
+    bool guards_local_namespace = false;
 };
 
 auto validate_devfs_file(File* f, const char* op) -> DevFSFile* {
@@ -354,10 +579,7 @@ auto devfs_close(File* f) -> int {
     auto* devfs_file = static_cast<DevFSFile*>(f->private_data);
 
     // Validate pointer is in valid kernel memory range
-    auto df_addr = reinterpret_cast<uintptr_t>(devfs_file);
-    bool const IN_HHDM = (df_addr >= 0xffff800000000000ULL && df_addr < 0xffff900000000000ULL);
-    bool const IN_KERNEL_STATIC = (df_addr >= 0xffffffff80000000ULL && df_addr < 0xffffffffc0000000ULL);
-    if (!IN_HHDM && !IN_KERNEL_STATIC) {
+    if (!is_valid_kernel_pointer(devfs_file)) {
         log::error("close: devfs_file %p out of valid kernel range; skipping delete", devfs_file);
         f->private_data = nullptr;
         return 0;
@@ -377,6 +599,12 @@ auto devfs_close(File* f) -> int {
 
     if (devfs_file->owns_wki_node_ref) {
         wki_release_node_ref(devfs_file->node);
+    }
+    if (devfs_file->owns_pts_node_ref) {
+        pts_release_node_ref(devfs_file->node);
+    }
+    if (devfs_file->owns_local_node_ref) {
+        local_release_node_ref(devfs_file->node);
     }
 
     devfs_file->magic = 0;
@@ -437,12 +665,16 @@ auto devfs_readdir(File* f, DirEntry* entry, size_t index) -> int {
     if (devfs_file == nullptr) {
         return -EBADF;
     }
+    OptionalLocalLock const LOCAL_GUARD(devfs_file->guards_local_namespace);
     OptionalWkiLock const WKI_GUARD(devfs_file->owns_wki_node_ref);
     OptionalPtsLock const PTS_GUARD(devfs_file->guards_pts_namespace);
+    OptionalNodesLock const NODES_GUARD(devfs_file->guards_nodes_namespace);
     auto* dir_node = devfs_file->node;
     if (dir_node == nullptr || dir_node->type != DevFSNodeType::DIRECTORY) {
         return -ENOTDIR;
     }
+
+    RootChildrenGuard const ROOT_GUARD(dir_node);
 
     // Indices 0 and 1 are synthetic "." and ".." entries
     if (index == 0) {
@@ -477,12 +709,13 @@ auto devfs_readdir(File* f, DirEntry* entry, size_t index) -> int {
     entry->d_off = index;
     entry->d_reclen = sizeof(DirEntry);
 
+    MetadataGuard const CHILD_GUARD(*child);
     switch (child->type) {
         case DevFSNodeType::DIRECTORY:
             entry->d_type = DT_DIR;
             break;
         case DevFSNodeType::DEVICE:
-            if (child->device != nullptr && child->device->type == ker::dev::DeviceType::CHAR) {
+            if (child->device != nullptr && !child->is_block_device) {
                 entry->d_type = DT_CHR;
             } else {
                 entry->d_type = DT_BLK;
@@ -595,8 +828,12 @@ auto DevFSNodeRef::operator=(DevFSNodeRef&& other) noexcept -> DevFSNodeRef& {
         reset();
         node_ = other.node_;
         owns_wki_node_ref_ = other.owns_wki_node_ref_;
+        owns_pts_node_ref_ = other.owns_pts_node_ref_;
+        owns_local_node_ref_ = other.owns_local_node_ref_;
         other.node_ = nullptr;
         other.owns_wki_node_ref_ = false;
+        other.owns_pts_node_ref_ = false;
+        other.owns_local_node_ref_ = false;
     }
     return *this;
 }
@@ -607,18 +844,37 @@ void DevFSNodeRef::reset() {
     if (owns_wki_node_ref_) {
         wki_release_node_ref(node_);
     }
+    if (owns_pts_node_ref_) {
+        pts_release_node_ref(node_);
+    }
+    if (owns_local_node_ref_) {
+        local_release_node_ref(node_);
+    }
     node_ = nullptr;
     owns_wki_node_ref_ = false;
+    owns_pts_node_ref_ = false;
+    owns_local_node_ref_ = false;
 }
 
 auto devfs_acquire_path(const char* path) -> DevFSNodeRef {
+    OptionalLocalLock const LOCAL_GUARD(is_local_devfs_path(path));
     bool const WKI_PATH = is_wki_devfs_path(path);
+    bool const PTS_PATH = is_pts_devfs_path(path);
+    OptionalPtsLock const PTS_GUARD(PTS_PATH);
+    OptionalNodesLock const NODES_GUARD(is_nodes_devfs_path(path));
     OptionalWkiLock const WKI_GUARD(WKI_PATH);
     DevFSNode* node = walk_path(path, false);
     if (node != nullptr && WKI_PATH) {
         node->wki_open_refs++;
     }
-    return DevFSNodeRef(node, node != nullptr && WKI_PATH);
+    if (node != nullptr && PTS_PATH) {
+        node->pts_refs.fetch_add(1, std::memory_order_relaxed);
+    }
+    bool const LOCAL_NODE = node != nullptr && !WKI_PATH && !PTS_PATH;
+    if (LOCAL_NODE) {
+        node->local_refs.fetch_add(1, std::memory_order_relaxed);
+    }
+    return DevFSNodeRef(node, node != nullptr && WKI_PATH, node != nullptr && PTS_PATH, LOCAL_NODE);
 }
 
 auto devfs_file_node(File* file) -> DevFSNode* {
@@ -626,10 +882,107 @@ auto devfs_file_node(File* file) -> DevFSNode* {
     return (devfs_file != nullptr) ? devfs_file->node : nullptr;
 }
 
-auto devfs_open_path(const char* path, int flags, int /*mode*/) -> File* {
-    if (path == nullptr) {
-        return nullptr;
+auto devfs_stat_node(const DevFSNode* node, uint32_t dev_id, Stat* out) -> int {
+    if (out == nullptr) {
+        return -EINVAL;
     }
+    if (node == nullptr) {
+        return -EBADF;
+    }
+    MetadataGuard const GUARD(*node);
+    fill_node_stat_locked(*node, dev_id, *out);
+    return 0;
+}
+
+auto devfs_authorize_search_node(const DevFSNode* node, const ker::mod::security::Snapshot& caller) -> int {
+    if (node == nullptr) return -EBADF;
+    MetadataGuard const GUARD(*node);
+    uint32_t mode = node->mode;
+    if (node->type != DevFSNodeType::DIRECTORY) {
+        if (node->type != DevFSNodeType::DEVICE || !node->child_namespace) return -ENOTDIR;
+        mode = 0755;
+    }
+    return ker::mod::security::authorize_file_access(caller, {node->uid, node->gid, S_IFDIR | mode}, 1);
+}
+
+auto devfs_chmod_node(DevFSNode* node, const ker::mod::security::Snapshot& caller, uint32_t mode, uint32_t dev_id, Stat* out) -> int {
+    return change_node_identity(node, caller, true, mode, 0, dev_id, false, out);
+}
+
+auto devfs_chown_node(DevFSNode* node, const ker::mod::security::Snapshot& caller, uint32_t uid, uint32_t gid, uint32_t dev_id, Stat* out)
+    -> int {
+    return change_node_identity(node, caller, false, uid, gid, dev_id, false, out);
+}
+
+auto devfs_consume_directory_lookup(const char* path, const DevFSNodeRef& retained, DirectoryLookupConsumer consume, void* context) -> int {
+    if (consume == nullptr) {
+        return -EINVAL;
+    }
+    return with_lookup_node(path, retained, [&](DevFSNode* node) {
+        {
+            MetadataGuard const GUARD(*node);
+            if (node->type != DevFSNodeType::DIRECTORY) {
+                return -ENOTDIR;
+            }
+        }
+        // Keep namespace identity stable, but do not hold a metadata/root IRQ
+        // guard while the consumer publishes its already prepared mount row.
+        return consume(context);
+    });
+}
+
+auto devfs_chmod_lookup(const char* path, const DevFSNodeRef& retained, const ker::mod::security::Snapshot& caller, uint32_t mode,
+                        uint32_t dev_id, bool require_directory, Stat* out, bool read_only) -> int {
+    return with_lookup_node(path, retained, [&](DevFSNode* node) {
+        return change_node_identity(node, caller, true, mode, 0, dev_id, require_directory, out, read_only);
+    });
+}
+
+auto devfs_chown_lookup(const char* path, const DevFSNodeRef& retained, const ker::mod::security::Snapshot& caller, uint32_t uid,
+                        uint32_t gid, uint32_t dev_id, bool require_directory, Stat* out) -> int {
+    return with_lookup_node(path, retained, [&](DevFSNode* node) {
+        return change_node_identity(node, caller, false, uid, gid, dev_id, require_directory, out);
+    });
+}
+
+namespace {
+auto update_node_times(DevFSNode* node, const ker::mod::security::Snapshot& caller, const TimestampUpdate& times, bool require_directory,
+                       bool read_only = false) -> int {
+    if (node == nullptr) return -EBADF;
+    MetadataGuard const GUARD(*node);
+    if (require_directory && node->type != DevFSNodeType::DIRECTORY) return -ENOTDIR;
+    int const RET = ker::mod::security::authorize_file_timestamps(caller, {node->uid, node->gid, node_mode_locked(*node)}, times.intent());
+    if (RET != 0) return RET;
+    if (read_only && times.changed()) {
+        return -EROFS;
+    }
+    if (times.set_atime()) node->atime = times.atime();
+    if (times.set_mtime()) node->mtime = times.mtime();
+    if (times.changed()) node->ctime = times.ctime();
+    return 0;
+}
+}  // namespace
+
+auto devfs_update_times_node(DevFSNode* node, const ker::mod::security::Snapshot& caller, const TimestampUpdate& times) -> int {
+    return update_node_times(node, caller, times, false);
+}
+
+auto devfs_utimens_lookup(const char* path, const DevFSNodeRef& retained, const ker::mod::security::Snapshot& caller,
+                          const TimestampUpdate& times, bool require_directory, bool read_only) -> int {
+    return with_lookup_node(path, retained,
+                            [&](DevFSNode* node) { return update_node_times(node, caller, times, require_directory, read_only); });
+}
+
+auto devfs_open_path(const ker::mod::security::Snapshot& credentials, const char* path, int flags, int /*mode*/, int* result_out,
+                     bool require_directory, ker::mod::sched::task::Task* opener) -> File* {
+    auto fail = [result_out](int error) -> File* {
+        if (result_out != nullptr) *result_out = error;
+        return nullptr;
+    };
+    if (result_out != nullptr) *result_out = -ENOENT;
+    if (path == nullptr) return fail(-EINVAL);
+    if ((flags & 3) == 3 || (flags & (O_CREAT | O_DIRECTORY)) == (O_CREAT | O_DIRECTORY)) return fail(-EINVAL);
+    require_directory = require_directory || (flags & O_DIRECTORY) != 0;
 
     // Determine path relative to /dev root
     const char* rel_path = path;
@@ -644,41 +997,67 @@ auto devfs_open_path(const char* path, int flags, int /*mode*/) -> File* {
     // Allocate wrappers before taking the WKI tree lock; allocator paths must
     // not run under this IRQ-safe mutation lock.
     auto* file = new File();
-    if (file == nullptr) {
-        return nullptr;
-    }
+    if (file == nullptr) return fail(-ENOMEM);
 
     auto* devfs_file = new DevFSFile();
     if (devfs_file == nullptr) {
         delete file;
-        return nullptr;
+        return fail(-ENOMEM);
     }
 
     bool const WKI_PATH = is_wki_devfs_path(rel_path);
     bool const PTS_PATH = is_pts_devfs_path(rel_path);
+    bool const NODES_PATH = is_nodes_devfs_path(rel_path);
     // A /dev/pts node embeds its Device in the owning PtyPair. Keep namespace
     // removal from dropping the tree-owned pair reference until the device
     // open callback has published its endpoint reference.
     OptionalPtsLock const PTS_GUARD(PTS_PATH);
     DevFSNode* node = nullptr;
+    DevFSNodeType selected_type = DevFSNodeType::DIRECTORY;
+    int policy = -ENOENT;
     {
+        OptionalLocalLock const LOCAL_GUARD(is_local_devfs_path(rel_path));
+        OptionalNodesLock const NODES_GUARD(NODES_PATH);
         OptionalWkiLock const WKI_GUARD(WKI_PATH);
         node = walk_path(rel_path);
-        if (node != nullptr && WKI_PATH) {
-            node->wki_open_refs++;
-            devfs_file->owns_wki_node_ref = true;
+        if (node != nullptr) {
+            MetadataGuard const GUARD(*node);
+            if ((flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL))
+                policy = -EEXIST;
+            else if (require_directory && node->type != DevFSNodeType::DIRECTORY)
+                policy = -ENOTDIR;
+            else if ((flags & O_NOFOLLOW) != 0 && node->type == DevFSNodeType::SYMLINK)
+                policy = -ELOOP;
+            else
+                policy = ker::mod::security::authorize_file_open(credentials, {node->uid, node->gid, node_mode_locked(*node)},
+                                                                 static_cast<unsigned>(flags) & 3U, (flags & O_TRUNC) != 0);
+            if (policy == 0) {
+                selected_type = node->type;
+                devfs_file->device = node->device;
+            }
+            if (policy == 0 && WKI_PATH) {
+                node->wki_open_refs++;
+                devfs_file->owns_wki_node_ref = true;
+            }
+            if (policy == 0 && !WKI_PATH && !PTS_PATH) {
+                node->local_refs.fetch_add(1, std::memory_order_relaxed);
+                devfs_file->owns_local_node_ref = true;
+            }
         }
     }
-    if (node == nullptr) {
+    if (policy != 0) {
         delete devfs_file;
         delete file;
-        vfs_debug_log("devfs: path not found: ");
-        vfs_debug_log(path);
-        vfs_debug_log("\n");
-        return nullptr;
+        return fail(policy);
     }
     devfs_file->node = node;
-    devfs_file->guards_pts_namespace = PTS_PATH && node->type == DevFSNodeType::DIRECTORY;
+    if (PTS_PATH) {
+        node->pts_refs.fetch_add(1, std::memory_order_relaxed);
+        devfs_file->owns_pts_node_ref = true;
+    }
+    devfs_file->guards_pts_namespace = PTS_PATH && selected_type == DevFSNodeType::DIRECTORY;
+    devfs_file->guards_nodes_namespace = NODES_PATH;
+    devfs_file->guards_local_namespace = is_local_devfs_path(rel_path);
 
     file->fd = -1;
     file->fops = &devfs_fops;
@@ -688,31 +1067,39 @@ auto devfs_open_path(const char* path, int flags, int /*mode*/) -> File* {
     file->open_flags = flags;
     file->fd_flags = 0;
 
-    if (node->type == DevFSNodeType::DIRECTORY) {
+    if (selected_type == DevFSNodeType::DIRECTORY) {
         file->is_directory = true;
         file->private_data = devfs_file;
         vfs_debug_log("devfs: opened directory\n");
-    } else if (node->type == DevFSNodeType::DEVICE) {
+    } else if (selected_type == DevFSNodeType::DEVICE) {
         file->is_directory = false;
-        devfs_file->device = node->device;
         file->private_data = devfs_file;
 
         // Call device open if char device with open handler
-        if (node->device != nullptr && node->device->char_ops != nullptr && node->device->char_ops->open != nullptr) {
-            if (node->device->char_ops->open(file) != 0) {
+        auto const* OPS = devfs_file->device != nullptr ? devfs_file->device->char_ops : nullptr;
+        if (OPS != nullptr && (OPS->open_with_credentials != nullptr || OPS->open != nullptr)) {
+            int const OPEN_RESULT =
+                OPS->open_with_credentials != nullptr ? OPS->open_with_credentials(file, credentials, opener) : OPS->open(file);
+            if (OPEN_RESULT != 0) {
                 if (devfs_file->owns_wki_node_ref) {
                     wki_release_node_ref(node);
                 }
+                if (devfs_file->owns_pts_node_ref) {
+                    pts_release_node_ref(node);
+                }
+                if (devfs_file->owns_local_node_ref) {
+                    local_release_node_ref(node);
+                }
                 delete devfs_file;
                 delete file;
-                return nullptr;
+                return fail(OPEN_RESULT < 0 ? OPEN_RESULT : -EIO);
             }
         }
 
         vfs_debug_log("devfs: opened device: ");
         vfs_debug_log(node->name.data());
         vfs_debug_log("\n");
-    } else if (node->type == DevFSNodeType::SYMLINK) {
+    } else if (selected_type == DevFSNodeType::SYMLINK) {
         // Return a File representing the symlink (for readlink)
         file->is_directory = false;
         file->private_data = devfs_file;
@@ -723,23 +1110,58 @@ auto devfs_open_path(const char* path, int flags, int /*mode*/) -> File* {
         if (devfs_file->owns_wki_node_ref) {
             wki_release_node_ref(node);
         }
+        if (devfs_file->owns_pts_node_ref) {
+            pts_release_node_ref(node);
+        }
+        if (devfs_file->owns_local_node_ref) {
+            local_release_node_ref(node);
+        }
         delete devfs_file;
         delete file;
-        return nullptr;
+        return fail(-ENXIO);
     }
 
+    if (result_out != nullptr) *result_out = 0;
     return file;
 }
 
+auto DevFSNodeRef::readlink(char* buf, size_t bufsize) const -> ssize_t {
+    if (buf == nullptr || bufsize == 0) return -EINVAL;
+    if (node_ == nullptr) return -ENOENT;
+    OptionalWkiLock const WKI_GUARD(owns_wki_node_ref_);
+    MetadataGuard const GUARD(*node_);
+    if (node_->type != DevFSNodeType::SYMLINK) return -EINVAL;
+    size_t const COPY_LEN = std::min(std::strlen(node_->symlink_target.data()), bufsize);
+    std::memcpy(buf, node_->symlink_target.data(), COPY_LEN);
+    return static_cast<ssize_t>(COPY_LEN);
+}
+
+auto devfs_readlink_path(const char* path, char* buf, size_t bufsize) -> ssize_t {
+    if (path == nullptr || buf == nullptr || bufsize == 0) return -EINVAL;
+    auto retained = devfs_acquire_path(path);
+    return retained.readlink(buf, bufsize);
+}
+
 auto devfs_create_directory(const char* path) -> DevFSNode* {
+    if (is_wki_devfs_path(path)) {
+        return nullptr;
+    }
+    OptionalLocalLock const LOCAL_GUARD(is_local_devfs_path(path));
     OptionalPtsLock const PTS_GUARD(is_pts_devfs_path(path));
+    OptionalNodesLock const NODES_GUARD(is_nodes_devfs_path(path));
     return walk_path(path, true);
 }
 
 auto devfs_create_symlink(const char* path, const char* target) -> DevFSNode* {
+    if (is_wki_devfs_path(path)) {
+        return nullptr;
+    }
+    OptionalLocalLock const LOCAL_GUARD(is_local_devfs_path(path));
     if (path == nullptr || target == nullptr) {
         return nullptr;
     }
+    OptionalPtsLock const PTS_GUARD(is_pts_devfs_path(path));
+    OptionalNodesLock const NODES_GUARD(is_nodes_devfs_path(path));
 
     // Split path into parent directory + leaf name
     const char* last_slash = nullptr;
@@ -806,29 +1228,29 @@ auto devfs_add_device_node(const char* name, ker::dev::Device* dev) -> DevFSNode
     return devfs_add_device_node(name_buf, dev);
 }
 
-auto devfs_add_device_node(const std::array<char, DEVFS_NAME_MAX>& name, ker::dev::Device* dev) -> DevFSNode* {
-    OptionalPtsLock const PTS_GUARD(is_pts_devfs_path(name.data()));
-
+namespace {
+// Caller holds the namespace guard appropriate for name.
+auto add_device_node_locked(const char* name, ker::dev::Device* dev, const ker::mod::security::Snapshot* creator) -> DevFSNode* {
     // If the name contains '/', walk to the parent directory first.
     // e.g. "pts/0" => find (or create) the "pts" dir, then add node "0" there.
     const char* slash = nullptr;
-    for (const char* p = name.data(); *p != '\0'; p++) {
+    for (const char* p = name; *p != '\0'; p++) {
         if (*p == '/') {
             slash = p;
         }
     }
 
     DevFSNode* parent = &root_node;
-    const char* leaf_name = name.data();
+    const char* leaf_name = name;
 
     if (slash != nullptr) {
         // Extract the directory portion and walk/create it
-        auto dir_len = static_cast<size_t>(slash - name.data());
+        auto dir_len = static_cast<size_t>(slash - name);
         std::array<char, DEVFS_NAME_MAX> dir_path{};
         if (dir_len >= DEVFS_NAME_MAX) {
             dir_len = DEVFS_NAME_MAX - 1;
         }
-        std::memcpy(dir_path.data(), name.data(), dir_len);
+        std::memcpy(dir_path.data(), name, dir_len);
         dir_path[dir_len] = '\0';
 
         parent = walk_path(dir_path.data(), true);  // create intermediate dirs if needed
@@ -839,10 +1261,17 @@ auto devfs_add_device_node(const std::array<char, DEVFS_NAME_MAX>& name, ker::de
     }
 
     if (auto* existing = find_child(parent, leaf_name); existing != nullptr) {
+        if (creator != nullptr) {
+            return nullptr;
+        }
+        MetadataGuard const GUARD(*existing);
         existing->type = DevFSNodeType::DEVICE;
         existing->device = dev;
+        existing->is_block_device = dev != nullptr && dev->type == ker::dev::DeviceType::BLOCK;
+        existing->block_provider = ker::dev::block_device_find_by_wrapper(dev);
         existing->mode = 0666;
-        touch_node_modified(existing);
+        existing->mtime = current_timespec();
+        existing->ctime = existing->mtime;
         return existing;
     }
 
@@ -851,28 +1280,63 @@ auto devfs_add_device_node(const std::array<char, DEVFS_NAME_MAX>& name, ker::de
         return nullptr;
     }
     node->device = dev;
+    node->is_block_device = dev != nullptr && dev->type == ker::dev::DeviceType::BLOCK;
+    node->block_provider = ker::dev::block_device_find_by_wrapper(dev);
+    if (creator != nullptr) {
+        node->uid = creator->user().effective;
+        node->gid = creator->group().effective;
+        node->mode = 0600;
+    }
     add_child(parent, node);
     return node;
 }
 
+}  // namespace
+
+auto devfs_add_device_node(const std::array<char, DEVFS_NAME_MAX>& name, ker::dev::Device* dev, const ker::mod::security::Snapshot* creator)
+    -> DevFSNode* {
+    if (is_wki_devfs_path(name.data())) {
+        return nullptr;
+    }
+    OptionalLocalLock const LOCAL_GUARD(is_local_devfs_path(name.data()));
+    OptionalPtsLock const PTS_GUARD(is_pts_devfs_path(name.data()));
+    OptionalNodesLock const NODES_GUARD(is_nodes_devfs_path(name.data()));
+    return add_device_node_locked(name.data(), dev, creator);
+}
+
 auto devfs_remove_node(const char* path) -> bool {
-    OptionalPtsLock const PTS_GUARD(is_pts_devfs_path(path));
+    if (is_wki_devfs_path(path)) {
+        return false;
+    }
+    OptionalLocalLock const LOCAL_GUARD(is_local_devfs_path(path));
+    bool const PTS_PATH = is_pts_devfs_path(path);
+    OptionalPtsLock const PTS_GUARD(PTS_PATH);
+    OptionalNodesLock const NODES_GUARD(is_nodes_devfs_path(path));
     auto* node = walk_path(path, false);
     if (node == nullptr || node == &root_node || node->parent == nullptr) {
         return false;
     }
-    if (node->type == DevFSNodeType::DIRECTORY && node->children_count != 0) {
+    // A Device may also host children (journal/modules). Keep any populated
+    // namespace attached so its children never retain a dangling parent.
+    if (node->children_count != 0) {
         return false;
     }
 
     remove_child(node->parent, node);
-    delete node;
+    if (PTS_PATH) {
+        pts_release_node_ref(node);
+    } else {
+        local_release_node_ref(node);
+    }
     return true;
 }
 
 void devfs_populate_partition_symlinks() {
     // Create /dev/disk/by-partuuid/ directory hierarchy
-    walk_path("disk/by-partuuid", true);
+    {
+        OptionalLocalLock const LOCAL_GUARD(true);
+        walk_path("disk/by-partuuid", true);
+    }
 
     size_t const COUNT = ker::dev::block_device_count();
     for (size_t i = 0; i < COUNT; i++) {
@@ -881,12 +1345,15 @@ void devfs_populate_partition_symlinks() {
             continue;
         }
 
-        // Add block device node at /dev root (e.g. sda, sda1)
-        if (find_child(&root_node, bdev->name.data()) == nullptr) {
-            auto* dnode = create_node(bdev->name.data(), DevFSNodeType::DEVICE);
-            if (dnode != nullptr) {
-                dnode->device = nullptr;  // block devices have no char_ops
-                add_child(&root_node, dnode);
+        // Drop the generic guard before the public symlink writer below.
+        {
+            OptionalLocalLock const LOCAL_GUARD(true);
+            if (find_child(&root_node, bdev->name.data()) == nullptr) {
+                auto* dnode = create_node(bdev->name.data(), DevFSNodeType::DEVICE);
+                if (dnode != nullptr) {
+                    dnode->device = nullptr;  // block devices have no char_ops
+                    add_child(&root_node, dnode);
+                }
             }
         }
 
@@ -944,11 +1411,17 @@ void devfs_init() {
     register_devfs();
     ker::mod::dbg::journal::mark_devfs_ready();
     vfs_debug_log("devfs: initialized with ");
-    vfs_debug_log_hex(root_node.children_count);
+    size_t count = 0;
+    {
+        RootChildrenGuard const ROOT_GUARD(&root_node);
+        count = root_node.children_count;
+    }
+    vfs_debug_log_hex(count);
     vfs_debug_log(" device nodes\n");
 }
 
 void devfs_populate_net_nodes() {
+    OptionalLocalLock const LOCAL_GUARD(true);
     // Create /dev/net/ directory
     walk_path("net", true);
     auto* net_dir = walk_path("net");
@@ -1063,10 +1536,10 @@ void devfs_populate_net_nodes() {
                 append_u64(nd->mtu);
 
                 // Show IPv4 addresses if configured
-                auto* nif = ker::net::netif_find_by_dev(nd);
-                if (nif != nullptr && nif->ipv4_addr_count > 0) {
+                auto const IPV4 = ker::net::netif_ipv4_snapshot(nd);
+                if (IPV4.count > 0) {
                     append_str("\nipv4: ");
-                    uint32_t const ADDR = nif->ipv4_addrs[0].addr;
+                    uint32_t const ADDR = IPV4.entries[0].addr;
                     append_u64((ADDR >> 24) & 0xFF);
                     append_str(".");
                     append_u64((ADDR >> 16) & 0xFF);
@@ -1076,7 +1549,7 @@ void devfs_populate_net_nodes() {
                     append_u64(ADDR & 0xFF);
                     append_str("/");
                     // Count prefix length from netmask
-                    uint32_t const MASK = nif->ipv4_addrs[0].netmask;
+                    uint32_t const MASK = IPV4.entries[0].netmask;
                     int prefix = 0;
                     for (int b = 31; b >= 0; b--) {
                         if ((MASK >> b) & 1) {
@@ -1125,6 +1598,7 @@ void devfs_populate_net_nodes() {
         dev->char_ops = &net_stats_ops;
 
         node->device = dev;
+        node->is_block_device = dev != nullptr && dev->type == ker::dev::DeviceType::BLOCK;
         add_child(net_dir, node);
     }
 
@@ -1867,6 +2341,7 @@ void devfs_wki_add_resource(uint16_t node_id, uint16_t resource_type, uint32_t r
         return;
     }
     node->device = dev;
+    node->is_block_device = dev != nullptr && dev->type == ker::dev::DeviceType::BLOCK;
     add_child(type_dir, node);
 
     wki_add_resource_symlinks(type_dir_name, rctx);
@@ -1948,8 +2423,11 @@ void devfs_wki_remove_peer_resources(uint16_t node_id) {
 }
 
 void devfs_populate_wki() {
-    if (!wki_ensure_dirs()) {
-        return;
+    {
+        WkiAutoLock const GUARD;
+        if (!wki_ensure_dirs()) {
+            return;
+        }
     }
 
     // Populate from current discovered resources
@@ -1960,64 +2438,81 @@ void devfs_populate_wki() {
         },
         nullptr);
 
+    size_t count = 0;
+    {
+        WkiAutoLock const GUARD;
+        count = g_wki_total;
+    }
     vfs_debug_log("devfs: wki nodes populated (");
-    vfs_debug_log_hex(g_wki_total);
+    vfs_debug_log_hex(count);
     vfs_debug_log(" resources)\n");
 }
 
-auto devfs_resolve_block_device(const char* path) -> ker::dev::BlockDevice* {
-    auto node_ref = devfs_acquire_path(path);
-    auto* node = node_ref.get();
-    bool const WKI_PATH = is_wki_devfs_path(path);
-    std::array<char, ker::dev::BLOCK_NAME_SIZE> device_name{};
-    uint16_t owner_node = ker::net::wki::WKI_NODE_INVALID;
-    uint32_t resource_id = 0;
-    uint64_t resource_generation = 0;
-    ker::net::wki::ResourceIncarnationToken owner_incarnation = {};
-    bool remote_block = false;
-    {
-        // A WKI pin keeps the backing allocation alive, while this lock makes
-        // the identity snapshot coherent with in-place generation upserts.
-        OptionalWkiLock const WKI_GUARD(WKI_PATH);
-        if (node == nullptr || (WKI_PATH && node->wki_unlinked) || node->type != DevFSNodeType::DEVICE || node->device == nullptr ||
-            node->device->type != ker::dev::DeviceType::BLOCK || node->device->name == nullptr) {
-            return nullptr;
+auto devfs_capture_block_source(const char* path, const DevFSNodeRef& retained, bool require_directory, BlockSourceSnapshot& out) -> int {
+    BlockSourceSnapshot candidate{};
+    int const RESULT = with_lookup_node(path, retained, [&](DevFSNode* node) -> int {
+        MetadataGuard const GUARD(*node);
+        if (require_directory && node->type != DevFSNodeType::DIRECTORY) {
+            return -ENOTDIR;
         }
-
-        std::snprintf(device_name.data(), device_name.size(), "%s", node->device->name);
-        if (node->device->major == 11 && node->device->private_data != nullptr) {
-            auto* ctx = static_cast<WkiDevfsCtx*>(node->device->private_data);
-            if (ctx->resource_type == ker::net::wki::ResourceType::BLOCK) {
-                owner_node = ctx->peer_node_id;
-                resource_id = ctx->resource_id;
-                resource_generation = ctx->resource_generation;
-                remote_block = true;
+        if (node->type != DevFSNodeType::DEVICE || !node->is_block_device) {
+            return -ENOTBLK;
+        }
+        if (!is_wki_devfs_path(path)) {
+            // The generic Device wrapper may have been retired. Only inspect
+            // the cached permanent provider and compare registry identity.
+            if (!ker::dev::block_device_is_registered(node->block_provider)) {
+                return -ENOENT;
             }
+            candidate.local_provider = node->block_provider;
+            return 0;
         }
+        if (node->wki_unlinked || node->device == nullptr || node->device->major != 11 || node->device->private_data == nullptr) {
+            return -ENOENT;
+        }
+        auto* ctx = static_cast<WkiDevfsCtx*>(node->device->private_data);
+        if (ctx->resource_type != ker::net::wki::ResourceType::BLOCK) {
+            return -ENOTBLK;
+        }
+        candidate.remote = true;
+        candidate.owner_node = ctx->peer_node_id;
+        candidate.resource_id = ctx->resource_id;
+        candidate.resource_generation = ctx->resource_generation;
+        std::snprintf(candidate.device_name.data(), candidate.device_name.size(), "%s", ctx->dev_name.data());
+        return 0;
+    });
+    if (RESULT == 0) {
+        out = candidate;
     }
+    return RESULT;
+}
 
-    // Nothing below needs the devfs node. Drop its pin before registry lookup
-    // and the potentially blocking remote attach handshake.
-    node_ref.reset();
-
-    if (remote_block && !ker::net::wki::wki_resource_observation_snapshot(owner_node, ker::net::wki::ResourceType::BLOCK, resource_id,
-                                                                          resource_generation, &owner_incarnation)) {
+auto devfs_resolve_block_source(const BlockSourceSnapshot& source) -> ker::dev::BlockDevice* {
+    if (!source.remote) {
+        return ker::dev::block_device_is_registered(source.local_provider) ? source.local_provider : nullptr;
+    }
+    auto const OWNER_NODE = source.owner_node;
+    auto const RESOURCE_ID = source.resource_id;
+    auto const GENERATION = source.resource_generation;
+    ker::net::wki::ResourceIncarnationToken incarnation{};
+    if (!ker::net::wki::wki_resource_observation_snapshot(OWNER_NODE, ker::net::wki::ResourceType::BLOCK, RESOURCE_ID, GENERATION,
+                                                          &incarnation)) {
         return nullptr;
     }
-
-    // Check if already registered as a block device.
-    auto* existing = ker::dev::block_device_find_by_name(device_name.data());
+    auto* existing = ker::dev::block_device_find_by_name(source.device_name.data());
     if (existing != nullptr) {
-        return existing;
+        return ker::net::wki::wki_dev_proxy_block_matches_observation(existing, OWNER_NODE, RESOURCE_ID, GENERATION, incarnation) ? existing
+                                                                                                                                  : nullptr;
     }
+    return ker::net::wki::wki_dev_proxy_attach_block(OWNER_NODE, RESOURCE_ID, GENERATION, incarnation, source.device_name.data());
+}
 
-    // WKI block resource - trigger proxy attach using only the stable snapshot.
-    if (remote_block) {
-        return ker::net::wki::wki_dev_proxy_attach_block(owner_node, resource_id, resource_generation, owner_incarnation,
-                                                         device_name.data());
-    }
-
-    return nullptr;
+auto devfs_resolve_block_device(const char* path) -> ker::dev::BlockDevice* {
+    auto retained = devfs_acquire_path(path);
+    BlockSourceSnapshot source{};
+    int const CAPTURE = devfs_capture_block_source(path, retained, false, source);
+    retained.reset();
+    return CAPTURE == 0 ? devfs_resolve_block_source(source) : nullptr;
 }
 
 // =============================================================================
@@ -2204,10 +2699,12 @@ void destroy_node_device(ker::dev::Device* dev) {
 }  // namespace
 
 void devfs_nodes_init() {
+    OptionalNodesLock const NODES_GUARD(true);
     walk_path("nodes", true);  // creates /dev/nodes/
 }
 
 void devfs_nodes_add_peer(const char* hostname, uint16_t node_id) {
+    OptionalNodesLock const NODES_GUARD(true);
     if (hostname == nullptr || hostname[0] == '\0') {
         return;
     }
@@ -2222,7 +2719,7 @@ void devfs_nodes_add_peer(const char* hostname, uint16_t node_id) {
     snprintf(path.data(), path.size(), "nodes/%s/id", hostname);
     auto* id_dev = make_node_device(hostname, node_id, 0, &s_node_id_ops);
     if (id_dev != nullptr) {
-        if (devfs_add_device_node(path.data(), id_dev) == nullptr) {
+        if (add_device_node_locked(path.data(), id_dev, nullptr) == nullptr) {
             destroy_node_device(id_dev);
         }
     }
@@ -2231,7 +2728,7 @@ void devfs_nodes_add_peer(const char* hostname, uint16_t node_id) {
     snprintf(path.data(), path.size(), "nodes/%s/state", hostname);
     auto* state_dev = make_node_device(hostname, node_id, 1, &s_node_state_ops);
     if (state_dev != nullptr) {
-        if (devfs_add_device_node(path.data(), state_dev) == nullptr) {
+        if (add_device_node_locked(path.data(), state_dev, nullptr) == nullptr) {
             destroy_node_device(state_dev);
         }
     }
@@ -2240,7 +2737,7 @@ void devfs_nodes_add_peer(const char* hostname, uint16_t node_id) {
     snprintf(path.data(), path.size(), "nodes/%s/load", hostname);
     auto* load_dev = make_node_device(hostname, node_id, 2, &s_node_load_ops);
     if (load_dev != nullptr) {
-        if (devfs_add_device_node(path.data(), load_dev) == nullptr) {
+        if (add_device_node_locked(path.data(), load_dev, nullptr) == nullptr) {
             destroy_node_device(load_dev);
         }
     }
@@ -2252,6 +2749,7 @@ void devfs_nodes_update_state(const char* /*hostname*/, const char* /*state_str*
 }
 
 void devfs_nodes_remove_peer(const char* hostname) {
+    OptionalNodesLock const NODES_GUARD(true);
     if (hostname == nullptr || hostname[0] == '\0') {
         return;
     }
@@ -2274,6 +2772,163 @@ void devfs_nodes_remove_peer(const char* hostname) {
         remove_child(nodes_dir, dir);
     }
 }
+
+#ifdef WOS_SELFTEST
+auto selftest_mount_target_guard() -> bool {
+    constexpr const char* LOCAL = "ktest_mount_guard";
+    struct Cleanup {
+        ~Cleanup() { static_cast<void>(devfs_remove_node(LOCAL)); }
+    } cleanup;
+    if (devfs_create_directory(LOCAL) == nullptr) {
+        return false;
+    }
+    devfs_populate_wki();
+    auto local = devfs_acquire_path(LOCAL);
+    auto wki = devfs_acquire_path("wki");
+    if (!local || !wki) {
+        return false;
+    }
+    struct Context {
+        DevFSNode* node;
+        bool wki;
+        unsigned calls{};
+    } local_context{local.get(), false}, wki_context{wki.get(), true};
+    auto probe = [](void* opaque) -> int {
+        auto& context = *static_cast<Context*>(opaque);
+        ++context.calls;
+        bool const AVAILABLE = context.wki ? g_wki_lock.try_lock() : g_local_namespace_mutex.try_lock();
+        if (AVAILABLE) {
+            if (context.wki) {
+                g_wki_lock.unlock();
+            } else {
+                g_local_namespace_mutex.unlock();
+            }
+        }
+        bool const METADATA_FREE = context.node->metadata_lock.try_lock();
+        if (METADATA_FREE) {
+            context.node->metadata_lock.unlock();
+        }
+        bool const ROOT_FREE = g_root_children_lock.try_lock();
+        if (ROOT_FREE) {
+            g_root_children_lock.unlock();
+        }
+        return !AVAILABLE && METADATA_FREE && ROOT_FREE ? 0 : -EINVAL;
+    };
+    if (devfs_consume_directory_lookup(LOCAL, local, probe, &local_context) != 0 ||
+        devfs_consume_directory_lookup("///wki", wki, probe, &wki_context) != 0 || local_context.calls != 1 || wki_context.calls != 1) {
+        return false;
+    }
+    Stat before{}, after{};
+    if (devfs_stat_node(wki.get(), 0, &before) != 0) {
+        return false;
+    }
+    std::array<char, DEVFS_NAME_MAX> name{};
+    std::snprintf(name.data(), name.size(), "///wki/ktest_forbidden_writer");
+    bool const REFUSED = devfs_create_directory("wki") == nullptr && devfs_create_directory("///wki/ktest_forbidden_writer") == nullptr &&
+                         devfs_create_symlink("wki/ktest_forbidden_writer", "/tmp") == nullptr &&
+                         devfs_add_device_node(name, nullptr) == nullptr && devfs_add_device_node("wki", nullptr) == nullptr &&
+                         !devfs_remove_node("///wki") && !devfs_remove_node("wki/ktest_forbidden_writer");
+    return REFUSED && !devfs_acquire_path("wki/ktest_forbidden_writer") && devfs_acquire_path("wki").get() == wki.get() &&
+           devfs_stat_node(wki.get(), 0, &after) == 0 && before.st_ino == after.st_ino && before.st_mode == after.st_mode &&
+           before.st_uid == after.st_uid && before.st_gid == after.st_gid && before.st_ctim.tv_sec == after.st_ctim.tv_sec &&
+           before.st_ctim.tv_nsec == after.st_ctim.tv_nsec;
+}
+
+auto selftest_root_child_publication() -> bool {
+    // Exercise an allocation selected from a full root array, followed by a
+    // different publisher winning growth before the original publisher commits.
+    std::array<DevFSNode*, 256> nodes{};
+    size_t used = 0;
+    struct Cleanup {
+        std::array<DevFSNode*, 256>& nodes;
+        ~Cleanup() {
+            for (auto* node : nodes) {
+                if (node != nullptr) {
+                    remove_child(&root_node, node);
+                    delete node;
+                }
+            }
+        }
+    } cleanup{nodes};
+    auto make_node = [&]() -> DevFSNode* {
+        if (used == nodes.size()) {
+            return nullptr;
+        }
+        std::array<char, 64> name{};
+        std::snprintf(name.data(), name.size(), "ktest-root-publisher-%zu", used);
+        auto* node = create_node(name.data(), DevFSNodeType::DIRECTORY);
+        nodes.at(used++) = node;
+        return node;
+    };
+    size_t count = 0;
+    size_t capacity = 0;
+    {
+        RootChildrenGuard const GUARD(&root_node);
+        count = root_node.children_count;
+        capacity = root_node.children_capacity;
+    }
+    if (capacity == 0 || capacity - count + 2 > nodes.size()) {
+        return false;
+    }
+    while (count++ < capacity) {
+        auto* node = make_node();
+        if (node == nullptr) {
+            return false;
+        }
+        add_child(&root_node, node);
+        if (find_child(&root_node, node->name.data()) != node) {
+            return false;
+        }
+    }
+    auto* first = make_node();
+    auto* winner = make_node();
+    if (first == nullptr || winner == nullptr) {
+        return false;
+    }
+    DevFSNode** spare = nullptr;
+    size_t required = 0;
+    if (try_add_root_child(first, spare, 0, required) || required != capacity * 2) {
+        delete[] spare;
+        return false;
+    }
+    spare = new DevFSNode*[required];
+    if (spare == nullptr) {
+        return false;
+    }
+    add_child(&root_node, winner);
+    DevFSNode** winning_array = nullptr;
+    {
+        RootChildrenGuard const GUARD(&root_node);
+        winning_array = root_node.children;
+    }
+    bool passed = try_add_root_child(first, spare, required, required);
+    delete[] spare;
+    {
+        RootChildrenGuard const GUARD(&root_node);
+        passed &= root_node.children == winning_array && root_node.children_count == capacity + 2;
+        passed &= root_node.children[capacity] == winner && root_node.children[capacity + 1] == first;
+    }
+    passed &= find_child(&root_node, first->name.data()) == first && find_child(&root_node, winner->name.data()) == winner;
+    auto* file = devfs_open_path(ker::mod::security::Snapshot::bootstrap_root(), "/", 0, 0);
+    if (file == nullptr) {
+        return false;
+    }
+    unsigned first_count = 0;
+    unsigned winner_count = 0;
+    for (size_t i = 0; i < capacity + 4; ++i) {
+        DirEntry entry{};
+        int const RESULT = devfs_readdir(file, &entry, i);
+        passed &= RESULT == 0;
+        first_count += std::strcmp(entry.d_name.data(), first->name.data()) == 0 ? 1U : 0U;
+        winner_count += std::strcmp(entry.d_name.data(), winner->name.data()) == 0 ? 1U : 0U;
+    }
+    DirEntry end{};
+    passed &= devfs_readdir(file, &end, capacity + 4) == -ENOENT;
+    passed &= first_count == 1 && winner_count == 1;
+    passed &= vfs_close_file(file) == 0;
+    return passed;
+}
+#endif
 
 }  // namespace ker::vfs::devfs
 // NOLINTEND(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access, cppcoreguidelines-interfaces-global-init,

@@ -16,6 +16,13 @@ constexpr size_t MAX_NET_INTERFACES = MAX_NET_DEVICES;
 struct IPv4Addr {
     proto::IPv4Address addr;
     proto::IPv4Address netmask;
+    auto operator==(const IPv4Addr&) const -> bool = default;
+};
+
+struct IPv4ConfigSnapshot {
+    std::array<IPv4Addr, MAX_ADDRS_PER_IF> entries{};
+    size_t count = 0;
+    auto operator==(const IPv4ConfigSnapshot&) const -> bool = default;
 };
 
 struct IPv6Addr {
@@ -52,6 +59,7 @@ struct NetInterface {
     NetDeviceIdentity dev_identity{};
     std::array<IPv4Addr, MAX_ADDRS_PER_IF> ipv4_addrs = {};
     size_t ipv4_addr_count = 0;
+    mod::sys::Spinlock ipv4_addr_lock;
     std::array<IPv6Addr, MAX_ADDRS_PER_IF> ipv6_addrs = {};
     size_t ipv6_addr_count = 0;
     uint64_t ipv6_addr_generation = 0;
@@ -70,6 +78,9 @@ auto netif_del_for_dev(NetDevice* dev) -> bool;
 auto netif_add_ipv4(NetDevice* dev, proto::IPv4Address addr, proto::IPv4Address mask) -> int;
 auto netif_set_ipv4(NetDevice* dev, proto::IPv4Address addr, proto::IPv4Address mask, bool replace) -> int;
 auto netif_del_ipv4(NetDevice* dev, proto::IPv4Address addr, proto::IPv4Address mask) -> int;
+// Legacy primary-address operations commit under the same lock as table changes.
+auto netif_set_primary_ipv4_address(NetDevice* dev, proto::IPv4Address addr) -> int;
+auto netif_set_primary_ipv4_netmask(NetDevice* dev, proto::IPv4Address mask) -> int;
 auto netif_add_ipv6(NetDevice* dev, const proto::IPv6Address& addr, uint8_t prefix) -> int;
 auto netif_set_ipv6(NetDevice* dev, const proto::IPv6Address& addr, uint8_t prefix, uint32_t flags, uint64_t preferred_until_ms,
                     uint64_t valid_until_ms, bool replace) -> int;
@@ -77,6 +88,7 @@ auto netif_del_ipv6(NetDevice* dev, const proto::IPv6Address& addr, uint8_t pref
 
 // Copy-only inspection APIs. Callers never retain a reference into the
 // mutable per-interface address array after its IRQ-safe lock is released.
+auto netif_ipv4_snapshot(NetDevice* dev) -> IPv4ConfigSnapshot;
 auto netif_ipv6_snapshot(NetDevice* dev, IPv6Addr* out, size_t capacity) -> size_t;
 auto netif_ipv6_find(NetDevice* dev, const proto::IPv6Address& addr, IPv6Addr& out) -> bool;
 auto netif_ipv6_find_owner(const proto::IPv6Address& addr, IPv6Addr& out, NetDeviceRef& device) -> bool;

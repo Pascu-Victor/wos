@@ -401,7 +401,7 @@ def test_failed_attach_erases_exact_proxy_not_tail() -> None:
         [
             "stage_block_detach_locked(state, owner_node, resource_id, attach_cookie, detach_incarnation, false)",
             "wki_channel_close_generation(channel_to_close.channel, channel_to_close.peer_node_id, channel_to_close.channel_id,",
-            "wki_zone_destroy(rdma_zone_id)",
+            "retired_zone.destroy()",
             "delete[] ra_buf",
             "delete[] bulk_buf",
             "erase_proxy_exact(state)",
@@ -778,7 +778,7 @@ def test_block_chaos_hooks_preserve_descriptor_ownership_and_exact_lifetimes() -
     require_order(
         detach,
         "wait_for_block_chaos_doorbell_quiescence(state)",
-        "state->rdma_attached = false",
+        "take_proxy_zone_locked(state)",
         "RDMA identity clears only after delayed callbacks drain",
     )
 
@@ -805,7 +805,24 @@ def test_block_chaos_hooks_preserve_descriptor_ownership_and_exact_lifetimes() -
     )
 
 
+def test_zone_backing_is_retained_through_proxy_users() -> None:
+    source = DEV_PROXY_CPP.read_text()
+    if "wki_zone_find(" in source or "wki_zone_destroy(" in source:
+        fail("proxy zone lifetime must not use numeric borrowed slots or numeric destruction")
+    require_tokens(source, ["WkiZoneRef::acquire(state->rdma_zone_id, owner_node", "install_proxy_zone(p, zone)",
+                            "rdma_zone_ref.snapshot_memory(memory)", "state->rdma_attached && !state->rdma_zone_ref.live()"],
+                   "proxy grant admission and metadata ownership")
+    take = function_body(source, "take_proxy_zone_locked")
+    require_tokens(take, ["std::move(state->rdma_zone_ref)", "state->rdma_zone_ptr = nullptr"], "withdraw borrowed backing")
+    cleanup = function_body(source, "retire_proxy_zone")
+    require_order(cleanup, "s_proxy_lock.unlock()", "ref.destroy()", "exact destruction outside registry lock")
+    for name in ["wki_dev_proxy_selftest_rdma_sq_wait_stops_on_fence", "wki_dev_proxy_selftest_batch_validation_is_atomic",
+                 "wki_dev_proxy_selftest_zone_retention"]:
+        require_tokens(function_body(source, name), ["wki_zone_selftest_with_local_backing"], "actual retained fixture coverage")
+
+
 def main() -> None:
+    test_zone_backing_is_retained_through_proxy_users()
     test_lifecycle_flags_are_atomic()
     test_lifecycle_helpers_use_acquire_release()
     test_lifecycle_flags_are_only_accessed_through_helpers()

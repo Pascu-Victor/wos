@@ -240,6 +240,8 @@ void xfs_trans_restore_undo(XfsTransaction* tp) {
         undo->ip->nextents = undo->nextents;
         undo->ip->anextents = undo->anextents;
         undo->ip->mode = undo->mode;
+        undo->ip->uid = undo->uid;
+        undo->ip->gid = undo->gid;
         undo->ip->nlink = undo->nlink;
         undo->ip->forkoff = undo->forkoff;
         undo->ip->has_attr_fork = undo->has_attr_fork;
@@ -308,6 +310,7 @@ void xfs_trans_reset_for_reuse(XfsTransaction* tp) {
     tp->error = 0;
     tp->overflowed = false;
     tp->committed = false;
+    tp->lookup_effect = XfsLookupEffect::INVALIDATE;
     tp->cancelled = false;
     tp->retired_range_count = 0;
 }
@@ -441,7 +444,7 @@ XfsTransaction::~XfsTransaction() {
     }
 }
 
-auto xfs_trans_alloc(XfsMountContext* mount) -> XfsTransaction* {
+auto xfs_trans_alloc(XfsMountContext* mount, XfsLookupEffect lookup_effect) -> XfsTransaction* {
     if (mount == nullptr) {
         return nullptr;
     }
@@ -463,6 +466,7 @@ auto xfs_trans_alloc(XfsMountContext* mount) -> XfsTransaction* {
         return nullptr;
     }
     tp->mount = mount;
+    tp->lookup_effect = lookup_effect;
     return tp;
 }
 
@@ -718,6 +722,8 @@ auto xfs_trans_capture_inode(XfsTransaction* tp, XfsInode* ip) -> int {
     undo->nextents = ip->nextents;
     undo->anextents = ip->anextents;
     undo->mode = ip->mode;
+    undo->uid = ip->uid;
+    undo->gid = ip->gid;
     undo->nlink = ip->nlink;
     undo->forkoff = ip->forkoff;
     undo->has_attr_fork = ip->has_attr_fork;
@@ -848,6 +854,15 @@ auto xfs_trans_commit(XfsTransaction* tp) -> int {
 
     tp->committed = true;
     tp->mount->mutation_sequence.fetch_add(1, std::memory_order_release);
+    bool invalidate_lookup = tp->lookup_effect == XfsLookupEffect::INVALIDATE;
+    // Preserve conservative validation if a data transaction also changes
+    // identity/link metadata. Undo snapshots predate the first inode mutation.
+    for (auto* undo = tp->inode_undo; undo != nullptr && !invalidate_lookup; undo = undo->next) {
+        auto* ip = undo->ip;
+        invalidate_lookup = ip != nullptr && (!xfs_inode_isreg(ip) || ip->mode != undo->mode || ip->uid != undo->uid ||
+                                              ip->gid != undo->gid || ip->nlink != undo->nlink);
+    }
+    if (invalidate_lookup) tp->mount->lookup_sequence.fetch_add(1, std::memory_order_release);
     xfs_trans_discard_undo(tp);
     int const CHECKPOINT_RC = xfs_log_checkpoint_if_needed(tp->mount);
     if (CHECKPOINT_RC != 0) {
@@ -916,6 +931,44 @@ auto xfs_selftest_transaction_cancel_restores_nlink() -> bool {
     inode.dirty = true;
     xfs_trans_cancel(tp);
     return inode.nlink == 2 && !inode.dirty;
+}
+
+auto xfs_selftest_transaction_cancel_restores_ownership() -> bool {
+    XfsMountContext mount{};
+    XfsInode inode{};
+    inode.mount = &mount;
+    inode.data_fork.format = XFS_DINODE_FMT_EXTENTS;
+    inode.uid = 1000;
+    inode.gid = 2000;
+    inode.mode = 0106755;
+    inode.ctime = 123;
+    inode.atime = 11;
+    inode.mtime = 22;
+    for (bool commit_failure : {false, true}) {
+        XfsTransaction* tp = xfs_trans_alloc(&mount);
+        if (tp == nullptr) return false;
+        if (xfs_trans_capture_inode(tp, &inode) != 0) {
+            xfs_trans_cancel(tp);
+            return false;
+        }
+        inode.uid = 0;
+        inode.gid = 0;
+        inode.mode = 0100755;
+        inode.ctime = 456;
+        inode.atime = 111;
+        inode.mtime = 222;
+        inode.dirty = true;
+        if (commit_failure) {
+            tp->error = -EIO;
+            if (xfs_trans_commit(tp) != -EIO) return false;
+        } else {
+            xfs_trans_cancel(tp);
+        }
+        if (inode.uid != 1000 || inode.gid != 2000 || inode.mode != 0106755 || inode.ctime != 123 || inode.atime != 11 ||
+            inode.mtime != 22 || inode.dirty)
+            return false;
+    }
+    return true;
 }
 
 auto xfs_selftest_transaction_cancel_restores_attr_fork() -> bool {

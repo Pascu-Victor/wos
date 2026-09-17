@@ -2,10 +2,15 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <platform/security/credentials.hpp>
 #include <platform/sys/mutex.hpp>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
 #include <vfs/stat.hpp>
+
+namespace ker::mod::sched::task {
+struct Task;
+}
 
 namespace ker::vfs::procfs {
 
@@ -83,6 +88,12 @@ struct ProcNode {
 };
 
 struct ProcFileData {
+    ProcFileData() = default;
+    ~ProcFileData();
+    ProcFileData(const ProcFileData&) = delete;
+    auto operator=(const ProcFileData&) -> ProcFileData& = delete;
+    ker::mod::sched::task::Task* target{};
+    uint64_t content_credential_generation{};
     ProcNode node;
     char* content;  // generated content (lazily allocated)
     size_t content_len;
@@ -93,18 +104,83 @@ struct ProcFileData {
 void procfs_init();
 
 // Open a procfs path (relative to /proc mount)
-auto procfs_open_path(const char* path, int flags, int mode) -> File*;
+auto procfs_open_path(const ker::mod::security::Snapshot& credentials, const char* path, int flags, int mode, int* result_out = nullptr,
+                      bool require_directory = false) -> File*;
+// Explicit request identity; compatibility wrapper above uses the current process PID.
+auto procfs_open_path_as(const ker::mod::security::Snapshot& credentials, uint64_t caller_pid, const char* path, int flags, int mode,
+                         int* result_out = nullptr, bool require_directory = false) -> File*;
+// Clone only retained metadata/target identity. Lazy content is never copied.
+auto procfs_open_lookup_as(const ker::mod::security::Snapshot& credentials, uint64_t caller_pid, const File* retained, int flags,
+                           bool require_directory, int* result_out, uint64_t* target_generation) -> File*;
+auto procfs_lookup_is_symlink(const File* file) -> bool;
+auto procfs_lookup_is_fd_link(const File* file) -> bool;
+// Duplicate the descriptor from the pinned process, retaining its actual File.
+// May release a borrowed remote descriptor on failure; run outside publication.
+auto procfs_open_fd_lookup_as(const ker::mod::security::Snapshot& credentials, uint64_t caller_pid, const File* retained, int* result_out,
+                              uint64_t* target_generation) -> File*;
+// No VFS calls or descriptor release; valid during final FD publication.
+auto procfs_revalidate_open_result(const File* file, uint64_t target_generation) -> int;
+// Metadata parser only; FileOperations still authorize data access per operation.
+auto procfs_lookup_path(const char* path, int flags = 0) -> File*;
+// Metadata parser for a retained request context; does not authorize data access.
+// caller_task is retained by the caller and may be an unpublished private child.
+// It supplies only its own process identity; foreign PID lookup is unchanged.
+auto procfs_lookup_path_as(const char* path, uint64_t caller_pid, int flags = 0, ker::mod::sched::task::Task* caller_task = nullptr)
+    -> File*;
 
+// Syntactic detection only: no Task/File lookup or authority is conferred.
+auto procfs_path_is_fd_link(const char* path) -> bool;
 // Open /proc/<pid>/fd/<fd> by retaining the referenced open file.
-auto procfs_open_fd_link_path(const char* path) -> File*;
+// result_out is 0 for a non-FD path, negative for an authoritative failure.
+auto procfs_open_fd_link_path(const ker::mod::security::Snapshot& credentials, uint64_t caller_pid, const char* path, int* result_out)
+    -> File*;
 
 // Fill stat metadata for an already-open procfs file.
-auto procfs_fill_stat(File* f, Stat* statbuf, dev_t dev_id) -> int;
+auto procfs_fill_stat(File* f, Stat* statbuf, dev_t dev_id, uint64_t* target_generation = nullptr) -> int;
+// Revalidate only the retained owner's credential observation; public metadata
+// does not confer private-content authority or require an ACTIVE target.
+auto procfs_revalidate_metadata_result(const File* file, uint64_t target_generation) -> int;
+
+// Per-read mount metadata, with one explicit credential snapshot and retained
+// caller/File. Outside publication/content locks; no persistent content cache.
+// Root/mount changes during collection return EAGAIN without output mutation.
+// Null Task is reserved for explicit global-root boot/model observations.
+auto procfs_read_mounts_as(ker::mod::sched::task::Task* task, const ker::mod::security::Snapshot& credentials, File* file, void* buffer,
+                           size_t count, size_t offset) -> ssize_t;
+
+// Same caller/context contract; SEEK_END measures the current listing outside
+// content locks. Failed seeks preserve the File cursor and cached content.
+auto procfs_lseek_mounts_as(ker::mod::sched::task::Task* task, const ker::mod::security::Snapshot& credentials, File* file, off_t offset,
+                            int whence) -> off_t;
 
 // Get procfs FileOperations
 auto get_procfs_fops() -> FileOperations*;
+// Component walks carry one caller snapshot across native and procfs symlinks.
+// The caller retains file; the call may release a borrowed remote FD and must
+// run outside VFS namespace publication.
+auto procfs_readlink_as(File* file, char* buffer, size_t capacity, const ker::mod::security::Snapshot& credentials, uint64_t caller_pid,
+                        uint64_t* target_generation = nullptr, bool allow_remote_cwd = false) -> ssize_t;
+// Component traversal captures either text or an owned directory scope from
+// one selected FD/cwd, never two reads. Scope success returns zero text bytes.
+// Preserve outputs on failure; run outside publication and retain the origin
+// metadata/generation through commit. Raw READLINK keeps text-only semantics.
+auto procfs_readlink_view_as(File* file, char* buffer, size_t capacity, const ker::mod::security::Snapshot& credentials,
+                             uint64_t caller_pid, DirectoryViewRef& directory_view, uint64_t* target_generation) -> ssize_t;
+// Revalidate a successful staged read using its retained File. No VFS calls or
+// borrowed-FD release; safe during namespace publication. SELF uses generation 0.
+auto procfs_revalidate_readlink_result(File* file, uint64_t target_generation) -> int;
 
 #ifdef WOS_SELFTEST
+extern void (*mounts_snapshot_test_hook)(ker::mod::sched::task::Task*);
+auto selftest_limits_authorization() -> bool;
+auto selftest_limits_seek_authorization() -> bool;
+auto selftest_fd_authorization() -> bool;
+auto selftest_private_authorization() -> bool;
+auto selftest_canonical_filesystem_root() -> bool;
+auto selftest_public_snapshots() -> bool;
+auto selftest_public_retained_subject() -> bool;
+auto selftest_wki_identity_snapshots() -> bool;
+auto selftest_global_authorization() -> bool;
 auto selftest_cpu_observation() -> bool;
 #endif
 }  // namespace ker::vfs::procfs

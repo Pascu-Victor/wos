@@ -4,8 +4,12 @@
 #include <platform/sched/resource.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <syscalls_impl/process/exit.hpp>
 
 namespace ker::mod::sched::resource {
+struct CredentialAccess {
+    static auto store(task::Task& subject) -> security::CredentialStore& { return subject.m_credentials; }
+};
 namespace {
 constexpr unsigned NPROC = static_cast<unsigned>(Id::NPROC);
 sys::Spinlock population_lock;
@@ -48,6 +52,29 @@ auto admit_locked(task::Task* policy, uint64_t current) -> bool {
     policy->resource_lock.unlock_irqrestore(FLAGS);
     return ADMITTED;
 }
+// population_lock is held; the caller also holds the process credential lock.
+// Every linked thread counts toward NPROC and must move with its process.
+auto transfer_uid_locked(task::Task& process, uint32_t old_uid, uint32_t new_uid, bool unpublished) -> int {
+    if (old_uid == new_uid) return 0;
+    uint64_t moving = 0;
+    for (auto* node = population; node != nullptr; node = node->next) {
+        if (node->subject != nullptr && node->subject->credential_owner() == &process) {
+            if (node->uid != old_uid) return -EINVAL;
+            ++moving;
+        }
+    }
+    if (moving == 0) return unpublished ? 0 : -ESRCH;
+    uint64_t const DESTINATION = count_locked(new_uid);
+    uint64_t const FLAGS = process.resource_lock.lock_irqsave();
+    bool const ADMITTED = moving <= UINT64_MAX - DESTINATION && process.resources.admit_extent(NPROC, DESTINATION + moving);
+    process.resource_lock.unlock_irqrestore(FLAGS);
+    if (!ADMITTED) return -EAGAIN;
+    for (auto* node = population; node != nullptr; node = node->next) {
+        if (node->subject != nullptr && node->subject->credential_owner() == &process) node->uid = new_uid;
+    }
+    return 0;
+}
+
 }  // namespace
 
 ProcessCharge::~ProcessCharge() { release(); }
@@ -123,7 +150,7 @@ void ProcessReservation::cancel() {
 auto ProcessReservation::attach(task::Task& subject) -> bool {
     uint64_t const FLAGS = population_lock.lock_irqsave();
     auto& charge = subject.process_charge;
-    bool const VALID = m_charge.linked && !charge.linked && subject.uid == m_charge.uid;
+    bool const VALID = m_charge.linked && !charge.linked && subject.credentials().user().real == m_charge.uid;
     if (VALID) {
         charge.uid = m_charge.uid;
         charge.subject = &subject;
@@ -149,34 +176,90 @@ void cancel_process_reservations(task::Task& executor) {
     while (executor.pending_process_reservations != nullptr) executor.pending_process_reservations->cancel();
 }
 
-auto change_real_uid(task::Task& subject, uint32_t uid) -> int {
-    Owner owner(&subject);
-    if (owner.get() == nullptr) return -ESRCH;
+auto change_credentials(task::Task& subject, const security::Request& request) -> int {
+    auto* process = subject.credential_owner();
+    if (process == nullptr) return -ESRCH;
+    if (ker::syscall::process::request_replaced_exec_thread_retirement(subject)) return -ECANCELED;
     uint64_t const FLAGS = population_lock.lock_irqsave();
-    auto& charge = subject.process_charge;
     int result = 0;
-    if (!charge.linked) {
-        result = -ESRCH;
-    } else if (charge.uid != uid) {
-        uint64_t const DESTINATION = count_locked(uid);
-        if (!admit_locked(owner.get(), DESTINATION)) {
-            result = -EAGAIN;
-        } else {
-            uint32_t const OLD_UID = charge.uid;
-            charge.uid = uid;
-            subject.uid = uid;
-            observe_locked(OLD_UID, count_locked(OLD_UID));
-            observe_locked(uid, DESTINATION + 1);
+    {
+        security::CredentialStore::Transaction transaction(CredentialAccess::store(*process));
+        security::Snapshot next;
+        result = transaction.current().prepare(request, next);
+        uint32_t const OLD_UID = transaction.current().user().real;
+        uint32_t const NEW_UID = next.user().real;
+        if (result == 0 && !transaction.can_publish(next)) result = -EOVERFLOW;
+        if (result == 0) result = transfer_uid_locked(*process, OLD_UID, NEW_UID, false);
+        if (result == 0) {
+            result = transaction.publish(next);
+            if (OLD_UID != NEW_UID) {
+                observe_locked(OLD_UID, count_locked(OLD_UID));
+                observe_locked(NEW_UID, count_locked(NEW_UID));
+            }
         }
     }
     population_lock.unlock_irqrestore(FLAGS);
     return result;
 }
 
+auto initialize_credentials(task::Task& subject, const security::Snapshot& value) -> int {
+    // An exclusively owned construction object has no concurrent publisher.
+    // Never use this entrypoint to mutate a running task or its shared owner.
+    if (subject.is_thread || subject.has_run || subject.sched_queue != task::Task::sched_queue::NONE ||
+        subject.child_membership_state.load(std::memory_order_acquire) != task::ChildMembershipState::UNLINKED)
+        return -EBUSY;
+    uint64_t const FLAGS = population_lock.lock_irqsave();
+    int result = 0;
+    {
+        security::CredentialStore::Transaction transaction(CredentialAccess::store(subject));
+        uint32_t const OLD_UID = transaction.current().user().real;
+        uint32_t const NEW_UID = value.user().real;
+        if (!transaction.can_publish(value)) result = -EOVERFLOW;
+        if (result == 0) result = transfer_uid_locked(subject, OLD_UID, NEW_UID, true);
+        if (result == 0) {
+            result = transaction.publish(value);
+            if (OLD_UID != NEW_UID) {
+                observe_locked(OLD_UID, count_locked(OLD_UID));
+                observe_locked(NEW_UID, count_locked(NEW_UID));
+            }
+        }
+    }
+    population_lock.unlock_irqrestore(FLAGS);
+    return result;
+}
+
+auto initialize_real_uid(task::Task& subject, uint32_t uid) -> int {
+    if (uid == security::UNCHANGED_ID) return -EINVAL;
+    auto value = security::Snapshot::bootstrap_root();
+    int const RESULT = value.prepare({.change = security::Change::SET_RESUID, .real = uid}, value);
+    return RESULT == 0 ? initialize_credentials(subject, value) : RESULT;
+}
+
+auto prepare_exec_credentials(task::Task& subject, const security::ExecIdentity& image, security::Snapshot& before,
+                              security::Snapshot& after, const security::Snapshot* admitted) -> int {
+    auto* process = subject.credential_owner();
+    if (process == nullptr) return -ESRCH;
+    security::CredentialStore::Transaction transaction(CredentialAccess::store(*process));
+    before = transaction.current();
+    if (admitted != nullptr && before != *admitted) return -EAGAIN;
+    int const RESULT = before.prepare_exec(image, after);
+    return RESULT != 0 ? RESULT : (transaction.can_publish(after) ? 0 : -EOVERFLOW);
+}
+
+auto publish_exec_credentials(task::Task& subject, const security::Snapshot& before, const security::Snapshot& after) -> int {
+    auto* process = subject.credential_owner();
+    if (process == nullptr) return -ESRCH;
+    security::CredentialStore::Transaction transaction(CredentialAccess::store(*process));
+    if (transaction.current() != before) return -EAGAIN;
+    if (before.user().real != after.user().real) return -EINVAL;
+    return transaction.publish(after);
+}
+
 void copy_process_observation(task::Task& subject, abi::resource::Usage& usage) {
     uint64_t const FLAGS = population_lock.lock_irqsave();
+    uint32_t const UID = subject.credentials().user().real;
     uint64_t const RESOURCE_FLAGS = subject.resource_lock.lock_irqsave();
-    subject.resources.commit_extent(NPROC, count_locked(subject.uid));
+    subject.resources.commit_extent(NPROC, count_locked(UID));
     usage.current = subject.resources.entries[NPROC].current;
     usage.peak = subject.resources.entries[NPROC].peak;
     subject.resource_lock.unlock_irqrestore(RESOURCE_FLAGS);

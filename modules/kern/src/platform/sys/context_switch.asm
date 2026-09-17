@@ -14,6 +14,7 @@ extern wos_commit_handoff_task
 extern wos_user_handoff_stack_top
 extern wos_restore_return_task_fpu
 extern wos_discard_abandoned_return_fpu_state
+extern deferred_task_switch
 
 ; Same-CPL iretq consumes only RIP/CS/RFLAGS, but the scheduler and panic
 ; diagnostics treat the memory below the saved RSP as GPRegs + InterruptFrame.
@@ -365,6 +366,39 @@ wos_enterIdleStack:
     call wos_commit_handoff_task
     sti
     jmp wos_kernel_idle_loop
+
+; Exec owner entry abandons only a fully unwound user-return/retired-main stack.
+; Preserve the canonical syscall stack top instead of the current C++ depth.
+global wos_asm_enter_exec_owner
+wos_asm_enter_exec_owner:
+    cli
+    mov rsp, rdx
+    and rsp, -16
+    push rdi
+    push rsi
+    call wos_discard_abandoned_return_fpu_state
+    pop rsi
+    pop rdi
+    jmp wos_asm_enter_usermode
+
+; Remote exec has finished all preparation/old-worker cleanup. Discard the
+; former owner continuation and enter the existing deferred-switch boundary,
+; which publishes proxy readiness only after putting this Task on the wait list.
+global wos_asm_park_exec_owner
+wos_asm_park_exec_owner:
+    cli
+    mov rsp, rdi
+    and rsp, -16
+    call wos_discard_abandoned_return_fpu_state
+    sub rsp, 128
+    mov rdi, rsp
+    xor eax, eax
+    mov ecx, 16
+    rep stosq
+    mov rdi, rsp
+    xor esi, esi
+    call deferred_task_switch
+    ud2
 
 global wos_asm_enter_usermode
 wos_asm_enter_usermode:

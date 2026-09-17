@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
@@ -18,10 +19,12 @@
 #include <platform/mm/swap.hpp>
 #include <platform/sched/file_growth.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <platform/security/file_policy.hpp>
 #include <platform/sys/mutex.hpp>
 #include <util/smallvec.hpp>
 #include <utility>
 #include <vfs/file.hpp>
+#include <vfs/mount.hpp>
 #include <vfs/stat.hpp>
 
 #include "vfs/file_operations.hpp"
@@ -82,8 +85,9 @@ std::atomic<uint64_t> tmpfs_resident_pages{0};  // NOLINT(cppcoreguidelines-avoi
 std::atomic<uint64_t> tmpfs_reclaim_node_cursor{0};
 std::atomic<bool> tmpfs_shrinker_registered{false};
 std::atomic<bool> tmpfs_swap_consumer_registered{false};
-uint64_t tmpfs_node_registry_generation{};                  // Guarded by tmpfs_node_registry_lock.
-std::atomic<uint64_t> tmpfs_next_node_incarnation{1};       // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint64_t tmpfs_node_registry_generation{};             // Guarded by tmpfs_node_registry_lock.
+std::atomic<uint64_t> tmpfs_next_node_incarnation{1};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> tmpfs_search_authority_generation_value{1};
 std::atomic<uint64_t> tmpfs_namespace_generation_value{1};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 }  // namespace
 
@@ -701,6 +705,7 @@ auto tmpfs_write_locked(TmpNode* n, const void* buf, size_t count, size_t offset
     if (n == nullptr || buf == nullptr) {
         return -EINVAL;
     }
+    if (!n->exec_content.can_mutate()) return -ETXTBSY;
     if (offset > static_cast<size_t>(-1) - count) {
         return -EFBIG;
     }
@@ -735,6 +740,7 @@ auto tmpfs_resize_locked(TmpNode* n, size_t new_size) -> int {
     if (n == nullptr) {
         return -EINVAL;
     }
+    if (!n->exec_content.can_mutate()) return -ETXTBSY;
     size_t new_pages = 0;
     if (!page_count_for_size(new_size, &new_pages)) {
         return -EFBIG;
@@ -876,7 +882,8 @@ auto tmpfs_mkdir(TmpNode* parent, const char* name) -> TmpNode* {
     return node;
 }
 
-auto tmpfs_create_file(TmpNode* parent, const char* name, uint32_t create_mode) -> TmpNode* {
+namespace {
+auto tmpfs_create_file_with_identity(TmpNode* parent, const char* name, const ker::mod::security::FileIdentity& identity) -> TmpNode* {
     if (parent == nullptr || name == nullptr || parent->type != TmpNodeType::DIRECTORY) {
         return nullptr;
     }
@@ -885,15 +892,23 @@ auto tmpfs_create_file(TmpNode* parent, const char* name, uint32_t create_mode) 
         return existing;  // Return existing node
     }
     auto* node = new TmpNode;
+    if (node == nullptr) return nullptr;
     copy_name(node->name, name);
     node->type = TmpNodeType::FILE;
     node->mount = parent->mount;
-    node->mode = create_mode & 07777;
+    node->mode = identity.mode & 07777;
+    node->uid = identity.uid;
+    node->gid = identity.gid;
     assign_node_incarnation(node);
     stamp_new_node(node);
     register_tmp_node(node);
     add_child(parent, node);
     return node;
+}
+}  // namespace
+
+auto tmpfs_create_file(TmpNode* parent, const char* name, uint32_t create_mode) -> TmpNode* {
+    return tmpfs_create_file_with_identity(parent, name, {0, 0, 0100000U | (create_mode & 07777U)});
 }
 
 auto tmpfs_create_symlink(TmpNode* parent, const char* name, const char* target) -> TmpNode* {
@@ -1107,7 +1122,7 @@ auto tmpfs_acquire_node(TmpNode* node) -> TmpfsNodeRef {
     return TmpfsNodeRef::acquire_locked(node);
 }
 
-auto tmpfs_acquire_lookup(TmpNode* root, const char* path, TmpfsLookupHandle* out) -> int {
+auto tmpfs_acquire_lookup(const ker::mod::security::Snapshot& credentials, TmpNode* root, const char* path, TmpfsLookupHandle* out) -> int {
     if (root == nullptr || path == nullptr || out == nullptr) {
         return -EINVAL;
     }
@@ -1163,10 +1178,26 @@ auto tmpfs_acquire_lookup(TmpNode* root, const char* path, TmpfsLookupHandle* ou
             ++cursor;
         }
 
+        if (current->type != TmpNodeType::DIRECTORY) return -ENOTDIR;
+        int const SEARCH = ker::mod::security::authorize_file_access(credentials, {current->uid, current->gid, S_IFDIR | current->mode}, 1);
+        if (SEARCH != 0) return SEARCH;
+
         bool const FINAL_COMPONENT = *cursor == '\0';
         if (FINAL_COMPONENT) {
-            if (current->type != TmpNodeType::DIRECTORY) {
-                return -ENOTDIR;
+            bool const SELF = kstrcmp(component.data(), ".") == 0;
+            bool const PARENT = kstrcmp(component.data(), "..") == 0;
+            if (SELF || PARENT) {
+                TmpNode* selected = PARENT && current->parent != nullptr ? current->parent : current;
+                result.parent_ = TmpfsNodeRef::acquire_locked(selected);
+                result.target_ = TmpfsNodeRef::acquire_locked(selected);
+                result.parent_incarnation_ = selected->incarnation;
+                result.parent_generation_ = selected->directory_generation;
+                result.namespace_generation_ = tmpfs_namespace_generation_locked();
+                result.target_incarnation_ = selected->incarnation;
+                result.target_existed_ = true;
+                result.root_target_ = true;
+                *out = std::move(result);
+                return 0;
             }
             TmpNode* target = tmpfs_lookup(current, component.data());
             result.parent_ = TmpfsNodeRef::acquire_locked(current);
@@ -1251,7 +1282,9 @@ auto tmpfs_validate_lookup_locked(const TmpfsLookupHandle& handle) -> bool {
     }
     if (handle.root_target_) {
         TmpNode* const TARGET = handle.target_.get();
-        return TARGET == PARENT && TARGET->incarnation == handle.target_incarnation_ && TARGET->parent == nullptr;
+        // Empty/dot lookups bind their selected directory itself, including a
+        // retained directory below the filesystem root.
+        return TARGET == PARENT && TARGET->incarnation == handle.target_incarnation_;
     }
     TmpNode* const CURRENT = tmpfs_lookup(PARENT, handle.name_.data());
     if (!handle.target_existed_) {
@@ -1260,10 +1293,73 @@ auto tmpfs_validate_lookup_locked(const TmpfsLookupHandle& handle) -> bool {
     return CURRENT == handle.target_.get() && CURRENT != nullptr && CURRENT->incarnation == handle.target_incarnation_;
 }
 
+namespace {
+auto directory_path(TmpNode* root, TmpNode* directory, char* out, size_t capacity, bool bounded,
+                    const ker::mod::security::Snapshot* credentials) -> int {
+    if (root == nullptr || directory == nullptr || out == nullptr || capacity == 0) return -EINVAL;
+    ker::mod::sys::MutexGuard guard(tmpfs_lock);
+    if (directory->type != TmpNodeType::DIRECTORY || (bounded && root->type != TmpNodeType::DIRECTORY)) return -ENOTDIR;
+    if (bounded && (root->unlinked || directory->unlinked)) return -ENOENT;
+    if (credentials != nullptr) {
+        int const SEARCH =
+            ker::mod::security::authorize_file_access(*credentials, {directory->uid, directory->gid, 0040000U | directory->mode}, 1);
+        if (SEARCH != 0) return SEARCH;
+    }
+    std::array<char, ker::vfs::MOUNT_PATH_MAX> path{};
+    size_t cursor = path.size() - 1;
+    auto* node = directory;
+    while (node != root) {
+        if (node->unlinked) return -ENOENT;
+        if (bounded && (node->parent == nullptr || node->parent == node)) return -EPERM;
+        if (node->parent == nullptr) return -ENOENT;
+        size_t length = 0;
+        while (length < node->name.size() && node->name[length] != '\0') {
+            if (node->name[length] == '/') return -EIO;
+            ++length;
+        }
+        if (length == 0 || length == node->name.size() || node->parent == node || tmpfs_lookup(node->parent, node->name.data()) != node)
+            return -EIO;
+        if (length + 1 > cursor) return -ENAMETOOLONG;
+        cursor -= length;
+        std::memcpy(path.data() + cursor, node->name.data(), length);
+        path[--cursor] = '/';
+        node = node->parent;
+    }
+    if (cursor == path.size() - 1) path[--cursor] = '/';
+    size_t const LENGTH = path.size() - cursor;
+    if (LENGTH > capacity) return -ENAMETOOLONG;
+    std::memcpy(out, path.data() + cursor, LENGTH);
+    return 0;
+}
+}  // namespace
+
+auto tmpfs_directory_path(TmpNode* root, TmpNode* directory, char* out, size_t capacity) -> int {
+    return directory_path(root, directory, out, capacity, false, nullptr);
+}
+
+auto tmpfs_directory_path_beneath(TmpNode* root, TmpNode* directory, char* out, size_t capacity,
+                                  const ker::mod::security::Snapshot* credentials) -> int {
+    return directory_path(root, directory, out, capacity, true, credentials);
+}
+
+auto tmpfs_lookup_directory_path_beneath(TmpNode* root, const TmpfsLookupHandle& lookup, char* out, size_t capacity) -> int {
+    TmpNode* selected = nullptr;
+    {
+        ker::mod::sys::MutexGuard guard(tmpfs_lock);
+        if (!tmpfs_validate_lookup_locked(lookup)) return -EAGAIN;
+        auto* target = lookup.target();
+        selected = target != nullptr && target->type == TmpNodeType::DIRECTORY ? target : lookup.parent();
+    }
+    // The handle retains either selection. Do not recursively take tmpfs_lock.
+    return directory_path(root, selected, out, capacity, true, nullptr);
+}
+
 auto tmpfs_validate_lookup(const TmpfsLookupHandle& handle) -> bool {
     ker::mod::sys::MutexGuard guard(tmpfs_lock);
     return tmpfs_validate_lookup_locked(handle);
 }
+
+auto tmpfs_search_authority_generation() -> uint64_t { return tmpfs_search_authority_generation_value.load(std::memory_order_acquire); }
 
 auto tmpfs_namespace_generation_locked() -> uint64_t { return tmpfs_namespace_generation_value.load(std::memory_order_acquire); }
 
@@ -1401,6 +1497,39 @@ auto tmpfs_lookup_metadata(const TmpfsLookupHandle& handle, bool require_directo
     return 0;
 }
 
+auto tmpfs_clone_exec_file(File* source, File** output) -> int {
+    if (source == nullptr || output == nullptr || source->fops != get_tmpfs_fops()) return -EINVAL;
+    auto* node = tmpfs_canonical_node(static_cast<TmpNode*>(source->private_data));
+    if (node == nullptr) return -EBADF;
+    std::unique_ptr<File> file(new (std::nothrow) File{});
+    if (file == nullptr) return -ENOMEM;
+    file->exec_read_view.reset(new (std::nothrow) ExecReadView{});
+    if (file->exec_read_view == nullptr) return -ENOMEM;
+    ker::mod::sys::MutexGuard tree_guard(tmpfs_lock);
+    ker::mod::sys::MutexGuard io_guard(node->io_lock);
+    if (node->type != TmpNodeType::FILE) return -ENOEXEC;
+    tmpfs_fill_stat_locked(node, source->mount_dev_id, &file->exec_read_view->metadata);
+    int const RESULT = node->exec_content.acquire(*file->exec_read_view);
+    if (RESULT != 0) return RESULT;
+    node->open_count.fetch_add(1, std::memory_order_relaxed);
+    file->private_data = node;
+    file->fops = get_tmpfs_fops();
+    file->fs_type = FSType::TMPFS;
+    file->fd = -1;
+    file->refcount = 1;
+    file->open_flags = O_NO_CACHE;
+    *output = file.release();
+    return 0;
+}
+
+auto tmpfs_stat_node(const TmpNode* node, uint32_t dev_id, Stat* out) -> int {
+    if (out == nullptr) return -EINVAL;
+    if (node == nullptr) return -EBADF;
+    ker::mod::sys::MutexGuard guard(tmpfs_lock);
+    tmpfs_fill_stat_locked(node, dev_id, out);
+    return 0;
+}
+
 auto tmpfs_stat_lookup(const TmpfsLookupHandle& handle, bool require_directory, uint32_t dev_id, Stat* out) -> int {
     if (out == nullptr) {
         return -EINVAL;
@@ -1456,24 +1585,36 @@ auto tmpfs_create_lookup(const TmpfsLookupHandle& handle, uint32_t mode, TmpfsOb
     return 0;
 }
 
-auto tmpfs_mkdir_lookup(const TmpfsLookupHandle& handle, uint32_t mode, TmpfsObjectMetadata* out) -> int {
+auto tmpfs_mkdir_lookup(const ker::mod::security::Snapshot& credentials, const TmpfsLookupHandle& handle, uint32_t mode,
+                        TmpfsObjectMetadata* out, bool read_only) -> int {
     ker::mod::sys::MutexGuard guard(tmpfs_lock);
     if (!tmpfs_validate_lookup_locked(handle)) {
         return -EAGAIN;
     }
+    TmpNode* const PARENT = handle.parent();
+    ker::mod::security::FileIdentity identity{};
+    int const AUTH =
+        ker::mod::security::prepare_directory_create(credentials, {PARENT->uid, PARENT->gid, 0040000U | PARENT->mode}, mode, identity);
+    if (AUTH != 0) return AUTH;
     if (handle.target_existed()) {
         return -EEXIST;
+    }
+    if (read_only) {
+        return -EROFS;
     }
     TmpNode* const NODE = tmpfs_mkdir(handle.parent(), handle.name());
     if (NODE == nullptr) {
         return -ENOMEM;
     }
-    NODE->mode = mode & 07777;
+    NODE->uid = identity.uid;
+    NODE->gid = identity.gid;
+    NODE->mode = identity.mode & 07777U;
     tmpfs_fill_metadata_locked(NODE, out);
     return 0;
 }
 
-auto tmpfs_symlink_lookup(const TmpfsLookupHandle& handle, const char* target, TmpfsObjectMetadata* out) -> int {
+auto tmpfs_symlink_lookup(const ker::mod::security::Snapshot& credentials, const TmpfsLookupHandle& handle, const char* target,
+                          TmpfsObjectMetadata* out, bool require_directory, bool read_only) -> int {
     if (target == nullptr) {
         return -EINVAL;
     }
@@ -1481,32 +1622,55 @@ auto tmpfs_symlink_lookup(const TmpfsLookupHandle& handle, const char* target, T
     if (!tmpfs_validate_lookup_locked(handle)) {
         return -EAGAIN;
     }
+    TmpNode* const PARENT = handle.parent();
+    ker::mod::security::FileIdentity identity{};
+    int const AUTH = ker::mod::security::prepare_symlink_create(credentials, {PARENT->uid, PARENT->gid, 0040000U | PARENT->mode}, identity);
+    if (AUTH != 0) return AUTH;
     if (handle.target_existed()) {
         // The legacy tmpfs symlink path reports a generic failure for both an
         // existing destination and allocation failure.
         return -1;
+    }
+    if (require_directory) return -ENOENT;
+    if (read_only) {
+        return -EROFS;
     }
     TmpNode* const NODE = tmpfs_create_symlink(handle.parent(), handle.name(), target);
     if (NODE == nullptr) {
         // Preserve the legacy tmpfs symlink branch's generic allocation error.
         return -1;
     }
+    NODE->uid = identity.uid;
+    NODE->gid = identity.gid;
+    NODE->mode = identity.mode & 07777U;
     tmpfs_fill_metadata_locked(NODE, out);
     return 0;
 }
 
-auto tmpfs_unlink_lookup(const TmpfsLookupHandle& handle, bool* hardlink_count_changed) -> int {
-    if (hardlink_count_changed != nullptr) {
-        *hardlink_count_changed = false;
-    }
+namespace {
+auto metadata_identity_locked(const TmpNode& node) -> ker::mod::security::FileIdentity {
+    uint32_t const TYPE = node.type == TmpNodeType::DIRECTORY ? S_IFDIR : (node.type == TmpNodeType::SYMLINK ? S_IFLNK : S_IFREG);
+    return {.uid = node.uid, .gid = node.gid, .mode = TYPE | node.mode};
+}
+}  // namespace
+
+auto tmpfs_unlink_lookup(const ker::mod::security::Snapshot& credentials, const TmpfsLookupHandle& handle, bool* hardlink_count_changed,
+                         bool read_only) -> int {
     ker::mod::sys::MutexGuard guard(tmpfs_lock);
     TmpNode* entry = nullptr;
-    int const RET = tmpfs_lookup_target_locked(handle, &entry, nullptr);
+    TmpNode* canonical = nullptr;
+    int const RET = tmpfs_lookup_target_locked(handle, &entry, &canonical);
     if (RET < 0) {
         return RET;
     }
     if (entry->type == TmpNodeType::DIRECTORY) {
         return -EISDIR;
+    }
+    int const AUTH = ker::mod::security::authorize_file_removal(credentials, metadata_identity_locked(*handle.parent()),
+                                                                metadata_identity_locked(*canonical));
+    if (AUTH != 0) return AUTH;
+    if (read_only) {
+        return -EROFS;
     }
     bool const LINK_COUNT_CHANGED = tmpfs_link_count(entry) > 1;
     if (!tmpfs_detach_child(handle.parent(), entry)) {
@@ -1519,18 +1683,30 @@ auto tmpfs_unlink_lookup(const TmpfsLookupHandle& handle, bool* hardlink_count_c
     return 0;
 }
 
-auto tmpfs_rmdir_lookup(const TmpfsLookupHandle& handle) -> int {
+auto tmpfs_rmdir_lookup(const ker::mod::security::Snapshot& credentials, const TmpfsLookupHandle& handle, bool read_only) -> int {
     ker::mod::sys::MutexGuard guard(tmpfs_lock);
     TmpNode* entry = nullptr;
-    int const RET = tmpfs_lookup_target_locked(handle, &entry, nullptr);
+    TmpNode* canonical = nullptr;
+    int const RET = tmpfs_lookup_target_locked(handle, &entry, &canonical);
     if (RET < 0) {
         return RET;
     }
     if (entry->type != TmpNodeType::DIRECTORY) {
         return -ENOTDIR;
     }
+    int const AUTH = ker::mod::security::authorize_file_removal(credentials, metadata_identity_locked(*handle.parent()),
+                                                                metadata_identity_locked(*canonical));
+    if (AUTH != 0) return AUTH;
     if (!tmpfs_directory_is_empty(entry)) {
         return -ENOTEMPTY;
+    }
+    // A root lookup binds the root as its own parent; it has no detachable
+    // membership. Preserve the existing detach-failure result on readonly too.
+    if (handle.root_target()) {
+        return -ENOENT;
+    }
+    if (read_only) {
+        return -EROFS;
     }
     if (!tmpfs_detach_child(handle.parent(), entry)) {
         return -ENOENT;
@@ -1542,56 +1718,110 @@ auto tmpfs_rmdir_lookup(const TmpfsLookupHandle& handle) -> int {
     return 0;
 }
 
-auto tmpfs_chmod_lookup(const TmpfsLookupHandle& handle, uint32_t mode, TmpfsObjectMetadata* out) -> int {
+namespace {
+
+void commit_metadata_locked(TmpNode& node, const ker::mod::security::FileIdentity& prepared, TmpfsObjectMetadata* out) {
+    bool const SEARCH_AUTHORITY_CHANGED = node.type == TmpNodeType::DIRECTORY &&
+                                          (node.uid != prepared.uid || node.gid != prepared.gid || node.mode != (prepared.mode & 07777U));
+    node.uid = prepared.uid;
+    node.gid = prepared.gid;
+    node.mode = prepared.mode & 07777U;
+    node.ctime = current_timespec();
+    // A component lookup may already have searched this ancestor. Invalidate
+    // that admission before publishing changed directory authority, even when
+    // the directory is not the retained lookup's final parent or target.
+    if (SEARCH_AUTHORITY_CHANGED) tmpfs_search_authority_generation_value.fetch_add(1, std::memory_order_release);
+    tmpfs_fill_metadata_locked(&node, out);
+}
+
+auto chmod_locked(TmpNode& node, const ker::mod::security::Snapshot& credentials, uint32_t mode, TmpfsObjectMetadata* out, bool read_only)
+    -> int {
+    ker::mod::security::FileIdentity prepared;
+    int const RET = ker::mod::security::prepare_file_chmod(credentials, metadata_identity_locked(node), mode, prepared);
+    if (RET == 0 && read_only) {
+        return -EROFS;
+    }
+    if (RET == 0) {
+        commit_metadata_locked(node, prepared, out);
+    }
+    return RET;
+}
+
+auto chown_locked(TmpNode& node, const ker::mod::security::Snapshot& credentials, uint32_t owner, uint32_t group, TmpfsObjectMetadata* out)
+    -> int {
+    ker::mod::security::FileIdentity prepared;
+    int const RET = ker::mod::security::prepare_file_chown(credentials, metadata_identity_locked(node), owner, group, prepared);
+    if (RET == 0) {
+        commit_metadata_locked(node, prepared, out);
+    }
+    return RET;
+}
+}  // namespace
+
+auto tmpfs_chmod_lookup(const TmpfsLookupHandle& handle, const ker::mod::security::Snapshot& credentials, uint32_t mode,
+                        TmpfsObjectMetadata* out, bool read_only) -> int {
     ker::mod::sys::MutexGuard guard(tmpfs_lock);
     TmpNode* canonical = nullptr;
     int const RET = tmpfs_lookup_target_locked(handle, nullptr, &canonical);
-    if (RET < 0) {
-        return RET;
-    }
-    canonical->mode = mode & 07777;
-    tmpfs_fill_metadata_locked(canonical, out);
-    return 0;
+    return RET < 0 ? RET : chmod_locked(*canonical, credentials, mode, out, read_only);
 }
 
-auto tmpfs_chown_lookup(const TmpfsLookupHandle& handle, uint32_t owner, uint32_t group, TmpfsObjectMetadata* out) -> int {
+auto tmpfs_chown_lookup(const TmpfsLookupHandle& handle, const ker::mod::security::Snapshot& credentials, uint32_t owner, uint32_t group,
+                        TmpfsObjectMetadata* out) -> int {
     ker::mod::sys::MutexGuard guard(tmpfs_lock);
     TmpNode* canonical = nullptr;
     int const RET = tmpfs_lookup_target_locked(handle, nullptr, &canonical);
-    if (RET < 0) {
-        return RET;
-    }
-    if (std::cmp_not_equal(owner, -1)) {
-        canonical->uid = owner;
-    }
-    if (std::cmp_not_equal(group, -1)) {
-        canonical->gid = group;
-    }
-    tmpfs_fill_metadata_locked(canonical, out);
-    return 0;
+    return RET < 0 ? RET : chown_locked(*canonical, credentials, owner, group, out);
 }
 
-auto tmpfs_utimens_lookup(const TmpfsLookupHandle& handle, const TmpfsTimesUpdate& times, TmpfsObjectMetadata* out) -> int {
+auto tmpfs_chmod_node(TmpNode* node, const ker::mod::security::Snapshot& credentials, uint32_t mode, TmpfsObjectMetadata* out) -> int {
+    ker::mod::sys::MutexGuard guard(tmpfs_lock);
+    auto* canonical = tmpfs_canonical_node(node);
+    return canonical == nullptr ? -EBADF : chmod_locked(*canonical, credentials, mode, out, false);
+}
+
+auto tmpfs_chown_node(TmpNode* node, const ker::mod::security::Snapshot& credentials, uint32_t owner, uint32_t group,
+                      TmpfsObjectMetadata* out) -> int {
+    ker::mod::sys::MutexGuard guard(tmpfs_lock);
+    auto* canonical = tmpfs_canonical_node(node);
+    return canonical == nullptr ? -EBADF : chown_locked(*canonical, credentials, owner, group, out);
+}
+
+namespace {
+auto utimens_locked(TmpNode& canonical, const ker::mod::security::Snapshot& credentials, const TmpfsTimesUpdate& times,
+                    TmpfsObjectMetadata* out, bool read_only) -> int {
+    int const RET =
+        ker::mod::security::authorize_file_timestamps(credentials, {canonical.uid, canonical.gid, canonical.mode}, times.intent());
+    if (RET != 0) return RET;
+    if (read_only && times.changed()) {
+        return -EROFS;
+    }
+    if (times.set_atime()) canonical.atime = times.atime();
+    if (times.set_mtime()) canonical.mtime = times.mtime();
+    if (times.changed()) canonical.ctime = times.ctime();
+    tmpfs_fill_metadata_locked(&canonical, out);
+    return 0;
+}
+}  // namespace
+
+auto tmpfs_utimens_lookup(const TmpfsLookupHandle& handle, const ker::mod::security::Snapshot& credentials, const TmpfsTimesUpdate& times,
+                          TmpfsObjectMetadata* out, bool read_only) -> int {
     ker::mod::sys::MutexGuard guard(tmpfs_lock);
     TmpNode* canonical = nullptr;
     int const RET = tmpfs_lookup_target_locked(handle, nullptr, &canonical);
-    if (RET < 0) {
-        return RET;
-    }
-    if (times.set_atime) {
-        canonical->atime = times.atime;
-    }
-    if (times.set_mtime) {
-        canonical->mtime = times.mtime;
-    }
-    if (times.set_atime || times.set_mtime) {
-        canonical->ctime = times.ctime;
-    }
-    tmpfs_fill_metadata_locked(canonical, out);
-    return 0;
+    return RET < 0 ? RET : utimens_locked(*canonical, credentials, times, out, read_only);
 }
 
-auto tmpfs_link_lookup(const TmpfsLookupHandle& source, const TmpfsLookupHandle& destination, TmpfsObjectMetadata* out) -> int {
+auto tmpfs_utimens_node(TmpNode* node, const ker::mod::security::Snapshot& credentials, const TmpfsTimesUpdate& times,
+                        TmpfsObjectMetadata* out) -> int {
+    ker::mod::sys::MutexGuard guard(tmpfs_lock);
+    auto* canonical = tmpfs_canonical_node(node);
+    return canonical == nullptr ? -EBADF : utimens_locked(*canonical, credentials, times, out, false);
+}
+
+auto tmpfs_link_lookup(const ker::mod::security::Snapshot& credentials, const TmpfsLookupHandle& source,
+                       const TmpfsLookupHandle& destination, TmpfsObjectMetadata* out, bool source_requires_directory,
+                       bool destination_requires_directory, bool read_only) -> int {
     ker::mod::sys::MutexGuard guard(tmpfs_lock);
     if (!tmpfs_validate_pair_locked(source, destination)) {
         return -EAGAIN;
@@ -1607,8 +1837,17 @@ auto tmpfs_link_lookup(const TmpfsLookupHandle& source, const TmpfsLookupHandle&
     if (SOURCE->type == TmpNodeType::DIRECTORY) {
         return -EPERM;
     }
+    int const AUTH =
+        ker::mod::security::authorize_file_link(credentials, metadata_identity_locked(*source.parent()),
+                                                metadata_identity_locked(*destination.parent()), metadata_identity_locked(*SOURCE));
+    if (AUTH != 0) return AUTH;
+    if (source_requires_directory) return -ENOTDIR;
     if (destination.target_existed()) {
         return -EEXIST;
+    }
+    if (destination_requires_directory) return -ENOENT;
+    if (read_only) {
+        return -EROFS;
     }
     TmpNode* const LINK = tmpfs_create_hardlink(destination.parent(), destination.name(), SOURCE);
     if (LINK == nullptr) {
@@ -1618,71 +1857,90 @@ auto tmpfs_link_lookup(const TmpfsLookupHandle& source, const TmpfsLookupHandle&
     return 0;
 }
 
-auto tmpfs_rename_lookup(const TmpfsLookupHandle& source, const TmpfsLookupHandle& destination, bool source_requires_directory,
-                         bool destination_requires_directory, TmpfsObjectMetadata* out, bool* replaced_hardlink_count_changed) -> int {
-    if (replaced_hardlink_count_changed != nullptr) {
-        *replaced_hardlink_count_changed = false;
-    }
+auto tmpfs_rename_lookup(const ker::mod::security::Snapshot& credentials, const TmpfsLookupHandle& source,
+                         const TmpfsLookupHandle& destination, bool source_requires_directory, bool destination_requires_directory,
+                         TmpfsObjectMetadata* out, bool* replaced_hardlink_count_changed, bool* namespace_changed, bool read_only) -> int {
     ker::mod::sys::MutexGuard guard(tmpfs_lock);
-    if (!tmpfs_validate_pair_locked(source, destination)) {
-        return -EAGAIN;
-    }
+    if (!tmpfs_validate_pair_locked(source, destination)) return -EAGAIN;
     TmpNode* const SOURCE = source.target();
     TmpNode* const DESTINATION = destination.target();
-    if (!source.target_existed() || SOURCE == nullptr) {
-        return -ENOENT;
-    }
-    if (!tmpfs_same_tree_locked(source.parent(), destination.parent())) {
-        return -EXDEV;
-    }
-    if (source_requires_directory && SOURCE->type != TmpNodeType::DIRECTORY) {
-        return -ENOTDIR;
-    }
+    if (!source.target_existed() || SOURCE == nullptr) return -ENOENT;
+    if (!tmpfs_same_tree_locked(source.parent(), destination.parent())) return -EXDEV;
+    TmpNode* const CANONICAL = tmpfs_canonical_node(SOURCE);
+    TmpNode* const DISPLACED = tmpfs_canonical_node(DESTINATION);
+    auto const DISPLACED_IDENTITY = DISPLACED != nullptr ? metadata_identity_locked(*DISPLACED) : ker::mod::security::FileIdentity{};
+    int const AUTH = ker::mod::security::authorize_file_rename(
+        credentials, metadata_identity_locked(*source.parent()), metadata_identity_locked(*CANONICAL),
+        metadata_identity_locked(*destination.parent()), DISPLACED != nullptr ? &DISPLACED_IDENTITY : nullptr,
+        source.parent() != destination.parent());
+    if (AUTH != 0) return AUTH;
+    if (source.root_target() || destination.root_target()) return -EBUSY;
+    auto special_name = [](const char* name) { return kstrcmp(name, ".") == 0 || kstrcmp(name, "..") == 0; };
+    if (special_name(source.name()) || special_name(destination.name())) return -EINVAL;
+    bool const SOURCE_DIRECTORY = SOURCE->type == TmpNodeType::DIRECTORY;
+    if (source_requires_directory && !SOURCE_DIRECTORY) return -ENOTDIR;
     if (destination_requires_directory) {
-        if (!destination.target_existed() || DESTINATION == nullptr) {
-            return -ENOENT;
-        }
-        if (DESTINATION->type != TmpNodeType::DIRECTORY) {
-            return -ENOTDIR;
-        }
-        if (SOURCE->type != TmpNodeType::DIRECTORY) {
-            return -EISDIR;
-        }
+        if (DESTINATION == nullptr) return -ENOENT;
+        if (DESTINATION->type != TmpNodeType::DIRECTORY) return -ENOTDIR;
+        if (!SOURCE_DIRECTORY) return -EISDIR;
     }
-    if (DESTINATION == SOURCE) {
-        tmpfs_fill_metadata_locked(SOURCE, out);
+    if (CANONICAL == DISPLACED) {
+        tmpfs_fill_metadata_locked(CANONICAL, out);
+        if (replaced_hardlink_count_changed != nullptr) *replaced_hardlink_count_changed = false;
+        if (namespace_changed != nullptr) *namespace_changed = false;
         return 0;
     }
-
-    bool link_count_changed = false;
     if (DESTINATION != nullptr) {
-        if (DESTINATION->type == TmpNodeType::DIRECTORY && !tmpfs_directory_is_empty(DESTINATION)) {
-            return -ENOTEMPTY;
+        bool const DESTINATION_DIRECTORY = DESTINATION->type == TmpNodeType::DIRECTORY;
+        if (SOURCE_DIRECTORY && !DESTINATION_DIRECTORY) return -ENOTDIR;
+        if (!SOURCE_DIRECTORY && DESTINATION_DIRECTORY) return -EISDIR;
+        if (DESTINATION_DIRECTORY && !tmpfs_directory_is_empty(DESTINATION)) return -ENOTEMPTY;
+    }
+    if (SOURCE_DIRECTORY) {
+        auto* ancestor = destination.parent();
+        for (size_t depth = 0; ancestor != nullptr; ++depth, ancestor = ancestor->parent) {
+            if (ancestor == SOURCE) return -EINVAL;
+            if (depth == 1024) return -ELOOP;
         }
-        link_count_changed = DESTINATION->type != TmpNodeType::DIRECTORY && tmpfs_link_count(DESTINATION) > 1;
-        if (!tmpfs_detach_child(destination.parent(), DESTINATION)) {
-            return -ENOENT;
-        }
+    }
+    if (read_only) {
+        return -EROFS;
+    }
+    // Pair validation pins both memberships under this lock. Reserve the
+    // append slot before detaching either entry; attach cannot allocate later.
+    auto* parent = destination.parent();
+    if (parent->children_count >= parent->children_capacity) {
+        constexpr size_t MAX_CAPACITY = SIZE_MAX / sizeof(TmpNode*);
+        if (parent->children_count >= MAX_CAPACITY) return -ENOMEM;
+        size_t const CAPACITY = parent->children_capacity == 0                 ? INITIAL_CHILDREN_CAPACITY
+                                : parent->children_capacity > MAX_CAPACITY / 2 ? MAX_CAPACITY
+                                                                               : parent->children_capacity * 2;
+        auto** children = new (std::nothrow) TmpNode*[CAPACITY];
+        if (children == nullptr) return -ENOMEM;
+        for (size_t i = 0; i < parent->children_count; ++i) children[i] = parent->children[i];
+        for (size_t i = parent->children_count; i < CAPACITY; ++i) children[i] = nullptr;
+        delete[] parent->children;
+        parent->children = children;
+        parent->children_capacity = CAPACITY;
+    }
+    bool const LINK_COUNT_CHANGED = DISPLACED != nullptr && DISPLACED->type != TmpNodeType::DIRECTORY && tmpfs_link_count(DISPLACED) > 1;
+    if (DESTINATION != nullptr) {
+        (void)tmpfs_detach_child(destination.parent(), DESTINATION);
         if (DESTINATION->type == TmpNodeType::DIRECTORY) {
             DESTINATION->unlinked = true;
-            if (DESTINATION->open_count.load(std::memory_order_acquire) == 0) {
-                tmpfs_free_node(DESTINATION);
-            }
+            if (DESTINATION->open_count.load(std::memory_order_acquire) == 0) tmpfs_free_node(DESTINATION);
         } else {
+            DISPLACED->ctime = current_timespec();
             tmpfs_drop_detached_node(DESTINATION);
         }
     }
-    if (!tmpfs_detach_child(source.parent(), SOURCE)) {
-        return -ENOENT;
-    }
+    (void)tmpfs_detach_child(source.parent(), SOURCE);
     copy_name(SOURCE->name, destination.name());
-    if (!tmpfs_attach_child(destination.parent(), SOURCE)) {
-        return -EIO;
-    }
-    tmpfs_fill_metadata_locked(SOURCE, out);
-    if (replaced_hardlink_count_changed != nullptr) {
-        *replaced_hardlink_count_changed = link_count_changed;
-    }
+    (void)tmpfs_attach_child(destination.parent(), SOURCE);
+    CANONICAL->ctime = current_timespec();
+    tmpfs_fill_metadata_locked(CANONICAL, out);
+    if (replaced_hardlink_count_changed != nullptr) *replaced_hardlink_count_changed = LINK_COUNT_CHANGED;
+    if (namespace_changed != nullptr) *namespace_changed = true;
     return 0;
 }
 
@@ -1777,7 +2035,8 @@ auto tmpfs_walk_path(const char* path, bool create_intermediate) -> TmpNode* {
     return tmpfs_walk_path(root_node, path, create_intermediate);
 }
 
-auto tmpfs_mkdir_path(TmpNode* root, const char* path, uint32_t mode) -> int {
+auto tmpfs_mkdir_path(const ker::mod::security::Snapshot& credentials, TmpNode* root, const char* path, uint32_t mode, bool read_only)
+    -> int {
     if (root == nullptr || path == nullptr) {
         return -EINVAL;
     }
@@ -1814,14 +2073,23 @@ auto tmpfs_mkdir_path(TmpNode* root, const char* path, uint32_t mode) -> int {
 
             TmpNode* child = tmpfs_lookup(parent, component.data());
             if (*path == '\0') {
+                ker::mod::security::FileIdentity identity{};
+                int const AUTH = ker::mod::security::prepare_directory_create(
+                    credentials, {parent->uid, parent->gid, 0040000U | parent->mode}, mode, identity);
+                if (AUTH != 0) return AUTH;
                 if (child != nullptr) {
                     return -EEXIST;
+                }
+                if (read_only) {
+                    return -EROFS;
                 }
                 child = tmpfs_mkdir(parent, component.data());
                 if (child == nullptr) {
                     return -ENOMEM;
                 }
-                child->mode = mode & 07777;
+                child->uid = identity.uid;
+                child->gid = identity.gid;
+                child->mode = identity.mode & 07777U;
                 return 0;
             }
 
@@ -2009,180 +2277,140 @@ void tmpfs_set_open_result(int* result_out, int result) {
     }
 }
 
-// Caller holds tmpfs_lock and has already established the final dentry.
-auto tmpfs_open_node_locked(TmpNode* entry, int flags, bool require_directory, bool created_by_open, int* result_out) -> ker::vfs::File* {
-    if (entry == nullptr) {
-        tmpfs_set_open_result(result_out, -ENOENT);
-        return nullptr;
-    }
-    if ((flags & ker::vfs::O_NOFOLLOW) != 0 && entry->type == TmpNodeType::SYMLINK) {
-        tmpfs_set_open_result(result_out, -ELOOP);
-        return nullptr;
-    }
-    TmpNode* const NODE = tmpfs_canonical_node(entry);
-    if (NODE == nullptr) {
-        tmpfs_set_open_result(result_out, -ENOENT);
-        return nullptr;
-    }
-    if (require_directory && NODE->type != TmpNodeType::DIRECTORY) {
-        tmpfs_set_open_result(result_out, -ENOTDIR);
-        return nullptr;
-    }
+}  // namespace
 
-    NODE->open_count.fetch_add(1, std::memory_order_relaxed);
-    if ((flags & ker::vfs::O_TRUNC) != 0 && NODE->type == TmpNodeType::FILE) {
-        ker::mod::sys::MutexGuard io_guard(NODE->io_lock);
-        int const TRUNCATE_RET = tmpfs_resize_locked(NODE, 0);
-        if (TRUNCATE_RET < 0) {
-            NODE->open_count.fetch_sub(1, std::memory_order_acq_rel);
-            tmpfs_set_open_result(result_out, TRUNCATE_RET);
-            return nullptr;
+auto tmpfs_open_lookup(const ker::mod::security::Snapshot& credentials, const TmpfsLookupHandle& handle, int flags, int mode,
+                       bool require_directory, int* result_out) -> ker::vfs::File* {
+    ker::mod::sys::MutexGuard guard(tmpfs_lock);
+    auto fail = [&](int error) -> File* {
+        tmpfs_set_open_result(result_out, error);
+        return nullptr;
+    };
+    if (!tmpfs_validate_lookup_locked(handle)) return fail(-EAGAIN);
+    unsigned const ACCESS_MODE = static_cast<unsigned>(flags) & 3U;
+    if (ACCESS_MODE > 2) return fail(-EINVAL);
+    bool const REQUIRE_DIRECTORY = require_directory || (flags & O_DIRECTORY) != 0;
+    if ((flags & (O_DIRECTORY | O_CREAT)) == (O_DIRECTORY | O_CREAT)) return fail(-EINVAL);
+    TmpNode* const PARENT = handle.parent();
+    if (!handle.root_target()) {
+        if (int const RET = ker::mod::security::authorize_file_access(credentials, {PARENT->uid, PARENT->gid, 0040000U | PARENT->mode}, 1);
+            RET != 0)
+            return fail(RET);
+    }
+    bool const CREATED = !handle.target_existed();
+    TmpNode* node = tmpfs_canonical_node(handle.target());
+    ker::mod::security::FileIdentity created_identity{};
+    if (CREATED) {
+        if ((flags & O_CREAT) == 0 || REQUIRE_DIRECTORY) return fail(-ENOENT);
+        int const RET = ker::mod::security::prepare_file_create(credentials, {PARENT->uid, PARENT->gid, 0040000U | PARENT->mode},
+                                                                static_cast<uint32_t>(mode), created_identity);
+        if (RET != 0) return fail(RET);
+    } else {
+        if ((flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) return fail(-EEXIST);
+        if ((flags & O_NOFOLLOW) != 0 && handle.target()->type == TmpNodeType::SYMLINK) return fail(-ELOOP);
+        if (node == nullptr) return fail(-ENOENT);
+        if (REQUIRE_DIRECTORY && node->type != TmpNodeType::DIRECTORY) return fail(-ENOTDIR);
+        uint32_t const TYPE = node->type == TmpNodeType::DIRECTORY ? 0040000U : (node->type == TmpNodeType::SYMLINK ? 0120000U : 0100000U);
+        int const RET = ker::mod::security::authorize_file_open(credentials, {node->uid, node->gid, TYPE | node->mode}, ACCESS_MODE,
+                                                                (flags & O_TRUNC) != 0);
+        if (RET != 0) return fail(RET);
+    }
+    // Complete all authorization and File allocation before publishing a new
+    // dentry or truncating an existing canonical inode.
+    auto* file = new File;
+    if (file == nullptr) return fail(-ENOMEM);
+    if (CREATED) {
+        node = tmpfs_create_file_with_identity(PARENT, handle.name(), created_identity);
+        if (node == nullptr) {
+            delete file;
+            return fail(-ENOMEM);
         }
     }
-
-    auto* file = new File;
-    if (file == nullptr) {
-        NODE->open_count.fetch_sub(1, std::memory_order_acq_rel);
-        tmpfs_set_open_result(result_out, -ENOMEM);
-        return nullptr;
+    if (!CREATED && (flags & O_TRUNC) != 0 && node->type == TmpNodeType::FILE) {
+        ker::mod::sys::MutexGuard io_guard(node->io_lock);
+        int const RET = tmpfs_resize_locked(node, 0);
+        if (RET != 0) {
+            delete file;
+            return fail(RET);
+        }
     }
-    file->private_data = NODE;
+    node->open_count.fetch_add(1, std::memory_order_relaxed);
+    file->private_data = node;
     file->fd = -1;
     file->pos = 0;
-    file->is_directory = NODE->type == TmpNodeType::DIRECTORY;
+    file->is_directory = node->type == TmpNodeType::DIRECTORY;
     file->fs_type = FSType::TMPFS;
     file->refcount = 1;
     file->open_flags = flags;
     file->fd_flags = 0;
     file->open_create_result_known = (flags & O_CREAT) != 0;
-    file->created_by_open = created_by_open;
+    file->created_by_open = CREATED;
     tmpfs_set_open_result(result_out, 0);
     return file;
 }
-}  // namespace
 
-auto tmpfs_open_lookup(const TmpfsLookupHandle& handle, int flags, int mode, bool require_directory, int* result_out) -> ker::vfs::File* {
+auto tmpfs_pin_directory_lookup(const ker::mod::security::Snapshot& credentials, const TmpfsLookupHandle& handle, int* result_out,
+                                bool require_target_search) -> File* {
     ker::mod::sys::MutexGuard guard(tmpfs_lock);
-    if (!tmpfs_validate_lookup_locked(handle)) {
-        tmpfs_set_open_result(result_out, -EAGAIN);
+    auto fail = [&](int error) -> File* {
+        tmpfs_set_open_result(result_out, error);
         return nullptr;
+    };
+    if (!tmpfs_validate_lookup_locked(handle)) return fail(-EAGAIN);
+    auto* node = tmpfs_canonical_node(handle.target());
+    if (node == nullptr) return fail(-ENOENT);
+    if (node->type != TmpNodeType::DIRECTORY) return fail(-ENOTDIR);
+    if (!handle.root_target()) {
+        auto* parent = handle.parent();
+        int const SEARCH = ker::mod::security::authorize_file_access(credentials, {parent->uid, parent->gid, 0040000U | parent->mode}, 1);
+        if (SEARCH != 0) return fail(SEARCH);
     }
-
-    TmpNode* node = handle.target();
-    bool created_by_open = false;
-    if (!handle.target_existed()) {
-        if ((flags & O_CREAT) == 0) {
-            tmpfs_set_open_result(result_out, -ENOENT);
-            return nullptr;
-        }
-        node = tmpfs_create_file(handle.parent(), handle.name(), static_cast<uint32_t>(mode) & 07777);
-        if (node == nullptr) {
-            tmpfs_set_open_result(result_out, -ENOMEM);
-            return nullptr;
-        }
-        created_by_open = true;
-    } else if ((flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) {
-        tmpfs_set_open_result(result_out, -EEXIST);
-        return nullptr;
+    if (require_target_search) {
+        int const SEARCH = ker::mod::security::authorize_file_access(credentials, {node->uid, node->gid, 0040000U | node->mode}, 1);
+        if (SEARCH != 0) return fail(SEARCH);
     }
-
-    bool const REQUIRE_DIRECTORY = require_directory || (flags & ker::vfs::O_DIRECTORY) != 0;
-    return tmpfs_open_node_locked(node, flags, REQUIRE_DIRECTORY, created_by_open, result_out);
-}
-
-auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode, int* result_out) -> ker::vfs::File* {
-    // mode is now used for O_CREAT
-    if (path == nullptr || root == nullptr) {
-        tmpfs_set_open_result(result_out, -EINVAL);
-        return nullptr;
-    }
-
-    // Handle root path
-    if (path[0] == '\0' || (path[0] == '/' && path[1] == '\0')) {
-        auto* file = create_root_file_with_flags(root, flags);
-        tmpfs_set_open_result(result_out, file != nullptr ? 0 : -ENOMEM);
-        return file;
-    }
-
-    // Skip leading slash for walk_path
-    const char* rel_path = path;
-    if (rel_path[0] == '/') {
-        rel_path++;
-    }
-    if (rel_path[0] == '\0') {
-        auto* file = create_root_file_with_flags(root, flags);
-        tmpfs_set_open_result(result_out, file != nullptr ? 0 : -ENOMEM);
-        return file;
-    }
-
-    // Split path into parent path and final component
-    // Find the last '/' to separate parent from name
-    const char* last_slash = nullptr;
-    for (const char* p = rel_path; *p != '\0'; p++) {
-        if (*p == '/') {
-            last_slash = p;
-        }
-    }
-
-    TmpNode* node = nullptr;
-    bool created_by_open = false;
-
-    tmpfs_lock.lock();
-    if (last_slash == nullptr) {
-        // Single component path (e.g., "file.txt")
-        node = tmpfs_lookup(root, rel_path);
-        if (node == nullptr && (flags & O_CREAT) != 0) {
-            node = tmpfs_create_file(root, rel_path, static_cast<uint32_t>(mode) & 07777);
-            created_by_open = node != nullptr;
-        }
-    } else {
-        // Multi-component path (e.g., "etc/fstab")
-        // Walk to the parent directory
-        constexpr size_t MAX_PATH_LEN = 512;
-        auto parent_len = static_cast<size_t>(last_slash - rel_path);
-        std::array<char, MAX_PATH_LEN> parent_path{};
-        if (parent_len >= MAX_PATH_LEN) {
-            tmpfs_lock.unlock();
-            tmpfs_set_open_result(result_out, -ENAMETOOLONG);
-            return nullptr;
-        }
-        std::memcpy(parent_path.data(), rel_path, parent_len);
-        parent_path.at(parent_len) = '\0';
-
-        const char* final_name = last_slash + 1;
-        if (*final_name == '\0') {
-            // Path ends with '/' - open the directory itself
-            node = tmpfs_walk_path_unlocked(root, parent_path.data(), (flags & O_CREAT) != 0);
-        } else {
-            // Walk to parent, then lookup/create the final component
-            TmpNode* parent = tmpfs_walk_path_unlocked(root, parent_path.data(), (flags & O_CREAT) != 0);
-            if (parent == nullptr) {
-                tmpfs_lock.unlock();
-                tmpfs_set_open_result(result_out, -ENOENT);
-                return nullptr;
-            }
-            node = tmpfs_lookup(parent, final_name);
-            if (node == nullptr && (flags & O_CREAT) != 0) {
-                node = tmpfs_create_file(parent, final_name, static_cast<uint32_t>(mode) & 07777);
-                created_by_open = node != nullptr;
-            }
-        }
-    }
-    if (node != nullptr && !created_by_open && (flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) {
-        tmpfs_lock.unlock();
-        tmpfs_set_open_result(result_out, -EEXIST);
-        return nullptr;
-    }
-    auto* file = tmpfs_open_node_locked(node, flags, false, created_by_open, result_out);
-    tmpfs_lock.unlock();
+    auto* file = new (std::nothrow) File{};
+    if (file == nullptr) return fail(-ENOMEM);
+    node->open_count.fetch_add(1, std::memory_order_relaxed);
+    file->private_data = node;
+    file->fops = get_tmpfs_fops();
+    file->fd = -1;
+    file->is_directory = true;
+    file->fs_type = FSType::TMPFS;
+    file->refcount = 1;
+    file->open_flags = O_DIRECTORY | FILE_ACCESS_SEARCH_ONLY | O_NO_CACHE;
+    tmpfs_set_open_result(result_out, 0);
     return file;
 }
 
-auto tmpfs_open_path(const char* path, int flags, int mode, int* result_out) -> ker::vfs::File* {
-    return tmpfs_open_path(root_node, path, flags, mode, result_out);
+auto tmpfs_open_path(const ker::mod::security::Snapshot& credentials, TmpNode* root, const char* path, int flags, int mode, int* result_out)
+    -> ker::vfs::File* {
+    if (root == nullptr || path == nullptr) {
+        tmpfs_set_open_result(result_out, -EINVAL);
+        return nullptr;
+    }
+    size_t const LENGTH = std::strlen(path);
+    bool const REQUIRE_DIRECTORY = LENGTH != 0 && path[LENGTH - 1] == '/';
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        TmpfsLookupHandle lookup;
+        int result = tmpfs_acquire_lookup(credentials, root, path, &lookup);
+        File* file = result == 0 ? tmpfs_open_lookup(credentials, lookup, flags, mode, REQUIRE_DIRECTORY, &result) : nullptr;
+        if (result != -EAGAIN || attempt == 3) {
+            tmpfs_set_open_result(result_out, result);
+            return file;
+        }
+    }
+    tmpfs_set_open_result(result_out, -EAGAIN);
+    return nullptr;
+}
+
+auto tmpfs_open_path(const ker::mod::security::Snapshot& credentials, const char* path, int flags, int mode, int* result_out)
+    -> ker::vfs::File* {
+    return tmpfs_open_path(credentials, root_node, path, flags, mode, result_out);
 }
 
 auto tmpfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ssize_t {
+    if (f != nullptr && (static_cast<unsigned>(f->open_flags) & 3U) == FILE_ACCESS_SEARCH_ONLY) return -EBADF;
     if ((f == nullptr) || (f->private_data == nullptr)) {
         return -EBADF;
     }
@@ -2222,6 +2450,7 @@ auto tmpfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ss
 }
 
 auto tmpfs_write(ker::vfs::File* f, const void* buf, size_t count, size_t offset) -> ssize_t {
+    if (f != nullptr && (static_cast<unsigned>(f->open_flags) & 3U) == FILE_ACCESS_SEARCH_ONLY) return -EBADF;
     if ((f == nullptr) || (f->private_data == nullptr)) {
         return -EBADF;
     }
@@ -2248,6 +2477,7 @@ auto tmpfs_write(ker::vfs::File* f, const void* buf, size_t count, size_t offset
 }
 
 auto tmpfs_write_append(ker::vfs::File* f, const void* buf, size_t count, size_t* offset_out) -> ssize_t {
+    if (f != nullptr && (static_cast<unsigned>(f->open_flags) & 3U) == FILE_ACCESS_SEARCH_ONLY) return -EBADF;
     if ((f == nullptr) || (f->private_data == nullptr)) {
         return -EBADF;
     }
@@ -2349,6 +2579,10 @@ auto tmpfs_fops_close(ker::vfs::File* f) -> int {
         return 0;
     }
     ker::mod::sys::MutexGuard guard(tmpfs_lock);
+    if (f->exec_read_view != nullptr) {
+        ker::mod::sys::MutexGuard io_guard(node->io_lock);
+        node->exec_content.release();
+    }
     node->open_count.fetch_sub(1, std::memory_order_acq_rel);
     if (tmpfs_node_can_be_freed_locked(node)) {
         // Last open/lookup reference to an unlinked node — free it now.
@@ -2394,6 +2628,7 @@ auto tmpfs_fops_isatty(ker::vfs::File* f) -> bool {
 
 namespace {
 auto tmpfs_fops_readdir(ker::vfs::File* f, DirEntry* entry, size_t index) -> int {
+    if (f != nullptr && (static_cast<unsigned>(f->open_flags) & 3U) == FILE_ACCESS_SEARCH_ONLY) return -EBADF;
     if (entry == nullptr) {
         return -EINVAL;
     }
@@ -2504,6 +2739,7 @@ auto tmpfs_fops_readlink(ker::vfs::File* f, char* buf, size_t bufsize) -> ssize_
 // --- FileOperations instance ---
 
 auto tmpfs_fops_truncate(ker::vfs::File* f, off_t length) -> int {
+    if (f != nullptr && (static_cast<unsigned>(f->open_flags) & 3U) == FILE_ACCESS_SEARCH_ONLY) return -EBADF;
     if (f == nullptr || f->private_data == nullptr) {
         return -EBADF;
     }

@@ -34,11 +34,32 @@ constexpr auto wki_remote_net_xmit_request_size(size_t packet_len) -> WkiRemoteN
     };
 }
 
+auto wki_remote_net_selftest_open_identity_owner() -> bool;
+auto wki_remote_net_selftest_close_identity_owner() -> bool;
+auto wki_remote_net_selftest_link_identity_owner() -> bool;
+auto wki_remote_net_selftest_control_state_publication() -> bool;
+auto wki_remote_net_selftest_owner_l3_snapshot() -> bool;
+auto wki_remote_net_selftest_close_transport_failures() -> bool;
+auto wki_remote_net_selftest_completion_ownership() -> bool;
+auto wki_remote_net_selftest_completed_result_survives_retirement() -> bool;
+auto wki_remote_net_selftest_open_error_mapping() -> bool;
+auto wki_remote_net_selftest_control_send_retry() -> bool;
+auto wki_remote_net_selftest_open_transport_failures() -> bool;
+
 auto wki_remote_net_selftest_cancel_preserves_successor_op() -> bool;
 
 // -----------------------------------------------------------------------------
 // ProxyNetState (consumer side) - per-remote-NIC proxy state
 // -----------------------------------------------------------------------------
+
+// Stack-owned result. The writer must claim wait before touching these fields;
+// publishing wait.DONE makes them visible to the caller independently of proxy
+// retirement or slot reuse. No wire representation depends on this type.
+struct NetOpCompletion {
+    WkiWaitEntry wait{};
+    int status = 0;
+    uint16_t response_length = 0;
+};
 
 struct ProxyNetState {
     bool active = false;
@@ -57,14 +78,18 @@ struct ProxyNetState {
     uint32_t resource_id = 0;
     uint64_t resource_generation = 0;
     uint16_t max_op_size = 0;
+    bool link_identity_supported = false;   // Immutable after attach publication.
+    bool close_identity_supported = false;  // Immutable after successful attach publication.
+    bool open_identity_supported = false;   // Immutable after successful attach publication.
 
     std::atomic<bool> op_pending{false};
     uint16_t op_expected_id = 0;
     uint16_t op_expected_seq = 0;
     uint16_t op_next_cookie = 1;
     uint64_t op_deadline_us = 0;
-    int16_t op_status = 0;
-    void* op_resp_buf = nullptr;  // D13: response data buffer for synchronous ops
+    int16_t op_status = 0;                     // Diagnostic only; synchronous callers consume their own completion.
+    NetOpCompletion* op_completion = nullptr;  // Slot owner, protected by lock; cleared before its stack can unwind.
+    void* op_resp_buf = nullptr;               // D13: response data buffer for synchronous ops
     uint16_t op_resp_len = 0;
     uint16_t op_resp_max = 0;
     WkiWaitEntry* op_wait_entry = nullptr;  // V2 I-4: async wait for DEV_OP_RESP
@@ -98,6 +123,10 @@ struct ProxyNetState {
     uint16_t owner_link_state = 0;
     uint32_t owner_mtu = 1500;
     NetIpv6StateSuffix owner_ipv6 = wki_net_ipv6_state_empty();
+    // Latest validated receive-order projection deferred by an active control.
+    // Protected by netdev.control_publication_lock, then lock.
+    bool owner_state_pending = false;
+    bool owner_mtu_pending = false;  // Zero MTU in a notification means no MTU update.
 
     // V2: RX backpressure credit tracking [V2 A5.6]
     uint16_t rx_credits_remaining = 0;  // credits granted to server (server-side tracking)
@@ -109,6 +138,15 @@ struct ProxyNetState {
 };
 
 constexpr size_t WKI_REMOTE_NET_DIAG_MAX = WKI_MAX_PEERS;
+
+// Owned receive-order metadata, independent of the proxy's local addresses.
+// Invalid means no live proxy was available; valid may still contain no L3 addresses.
+struct WkiRemoteNetOwnerL3Snapshot {
+    bool valid = false;
+    uint32_t ipv4_addr = 0;
+    uint32_t ipv4_mask = 0;
+    NetIpv6StateSuffix ipv6 = wki_net_ipv6_state_empty();
+};
 
 struct WkiRemoteNetDiagRow {
     uint16_t owner_node = WKI_NODE_INVALID;
@@ -163,6 +201,10 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
 // Consumer side: true if a proxy for this remote NIC is already active.
 auto wki_remote_net_has_proxy(uint16_t owner_node, uint32_t resource_id) -> bool;
 
+// Retains the exact live proxy and copies one owner record under its state lock.
+// The caller owns the supplied device storage; no mutable cache pointer escapes.
+auto wki_remote_net_owner_l3_snapshot(net::NetDevice* proxy_dev) -> WkiRemoteNetOwnerL3Snapshot;
+
 // Copy every retained proxy row, including inactive tombstones, under the
 // registry lock. No pointer escapes and no allocation is performed.
 auto wki_remote_net_diag_snapshot(WkiRemoteNetDiagRow* rows, size_t capacity, size_t* total) -> size_t;
@@ -195,6 +237,15 @@ auto wki_remote_net_detach_pending_for_resource(uint16_t owner_node, uint32_t re
 // -----------------------------------------------------------------------------
 
 namespace detail {
+
+// Task-context owner adapter; the pre-ACK worker owns the exact NET binding
+// and a copy of the receiver's admitted peer policy.
+void handle_net_link_as(const WkiChannelIdentity& channel_identity, net::NetDevice* net_dev, const uint8_t* data, uint16_t data_len,
+                        uint64_t identity_policy, const std::atomic<bool>* binding_retiring);
+void handle_net_close_as(const WkiChannelIdentity& channel_identity, net::NetDevice* net_dev, const uint8_t* data, uint16_t data_len,
+                         uint64_t identity_policy, const std::atomic<bool>* binding_retiring);
+void handle_net_open_as(const WkiChannelIdentity& channel_identity, net::NetDevice* net_dev, const uint8_t* data, uint16_t data_len,
+                        uint64_t identity_policy, const std::atomic<bool>* binding_retiring);
 
 // Server side: handle NET operations (called from dev_server handle_dev_op_req)
 void handle_net_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_identity, net::NetDevice* net_dev, uint16_t op_id,

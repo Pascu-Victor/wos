@@ -238,7 +238,28 @@ def test_rx_refill_growth_target_does_not_ratchet_from_free_snapshot() -> None:
         fail("modern and legacy VirtIO initialization must reserve RX descriptors before filling queues")
 
 
+def test_mac_admission_precedes_any_legacy_port_or_state_write() -> None:
+    source = VIRTIO_NET_CPP.read_text()
+    check = function_body(source, "virtio_net_check_mac")
+    require_order(check, "netdev == nullptr || mac == nullptr", "std::equal", "dev == nullptr", "dev->modern_cfg != nullptr",
+                  "dev->io_base == 0", "dev->negotiated_features & VIRTIO_NET_F_MAC", "return -ENOTSUP", "return 0")
+    if "outb" in check or "memcpy" in check or re.search(r"mac\.at\([^)]*\)\s*=", check):
+        fail("MAC admission must not write hardware or local state")
+    commit = function_body(source, "virtio_net_set_mac")
+    require_order(commit, "virtio_net_check_mac(netdev, mac)", "std::equal", "return;", "::outb", "netdev->mac.at(i) = mac[i]")
+    if ".check_mac = virtio_net_check_mac" not in source:
+        fail("virtio MAC admission must be exposed through NetDeviceOps")
+    core = (ROOT / "modules/kern/src/net/netdevice.cpp").read_text()
+    admission = function_body(core, "netdev_check_mac")
+    require_order(admission, "std::equal", "dev->ops->set_mac == nullptr", "dev->ops->check_mac == nullptr", "return -ENOTSUP",
+                  "dev->ops->check_mac(dev, mac)")
+    for path in ["net/loopback.cpp", "dev/e1000e/e1000e.cpp", "dev/ivshmem/ivshmem_net.cpp", "dev/usb/cdc_ether.cpp"]:
+        if ".check_mac = ker::net::netdev_check_fixed_mac" not in (ROOT / "modules/kern/src" / path).read_text():
+            fail(f"fixed-address driver must explicitly refuse MAC changes: {path}")
+
+
 def main() -> None:
+    test_mac_admission_precedes_any_legacy_port_or_state_write()
     test_ctrl_ack_deadline_is_saturating()
     test_used_ring_idx_is_acquired_before_empty_check()
     test_split_ring_notification_rearm_is_race_safe_and_bounded()

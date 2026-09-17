@@ -198,7 +198,7 @@ def test_nonfixed_mmap_address_selection_is_reserved_before_mapping() -> None:
         "file mmap must reserve the address before eager file mapping",
     )
     require_order(
-        file_body,
+        file_body[file_body.index("if (file_mmap_can_share(st, prot))"):],
         "release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION)",
         "advance_shared_mmap_cursor_locked(task, vaddr, size)",
         "file mmap reservation must be dropped only after page tables occupy the range",
@@ -536,7 +536,7 @@ def test_page_table_pool_duplicate_release_does_not_fall_through_to_page_free() 
     require_tokens(
         release_pagemap_body,
         [
-            "if (try_release_page_table_to_pool(pagemap))",
+            "if (try_release_page_table_to_pool(pagemap, {__builtin_return_address(0), owner_pid}))",
             "return;",
             "phys::page_free(pagemap);",
         ],

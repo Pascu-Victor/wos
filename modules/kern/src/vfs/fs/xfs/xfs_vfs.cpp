@@ -14,12 +14,14 @@
 #include <cstdint>
 #include <cstring>
 #include <new>
+#include <optional>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/swap.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/file_growth.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <platform/security/file_policy.hpp>
 #include <platform/sys/mutex.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <utility>
@@ -54,6 +56,9 @@ namespace ker::vfs::xfs {
 using log = ker::mod::dbg::logger<"xfs">;
 
 namespace {
+
+// Whole-path search admissions can finish on a different native mount.
+std::atomic<uint64_t> xfs_search_authority_generation_value{1};
 
 constexpr uint32_t XFS_SLOW_TRACE_US = 2048;
 constexpr size_t XFS_READ_BATCH_MAX_BYTES = size_t{2} * 1024 * 1024;
@@ -128,6 +133,7 @@ struct XfsFileData {
     bool recent_write_stat_valid{};
     bool may_have_eof_prealloc{};
     bool close_may_need_inode_commit{};
+    bool swap_extent_pin{};
 };
 
 void xfs_recent_write_stat_invalidate(XfsFileData* xfd) {
@@ -484,6 +490,7 @@ void xfs_set_sequential_alloc_hint(XfsInode* ip, XfsMountContext* ctx, xfs_fileo
 auto xfs_truncate_zero_resets_data(uint64_t old_size, uint64_t nblocks) -> bool { return old_size != 0 || nblocks != 0; }
 
 auto xfs_close_should_trim_prealloc(int open_flags, bool created_by_open, bool may_have_eof_prealloc) -> bool {
+    if ((static_cast<unsigned>(open_flags) & 3U) == ker::vfs::FILE_ACCESS_SEARCH_ONLY) return false;
     if (created_by_open) {
         return false;
     }
@@ -990,13 +997,14 @@ void xfs_parent_path_cache_purge_all_for_mount(XfsMountContext* ctx) {
 }
 
 auto xfs_commit_dirty_inode(XfsMountContext* ctx, XfsInode* ip, bool trim_eof_prealloc = false) -> int {
-    bool const SHOULD_TRIM = ip != nullptr && trim_eof_prealloc && !xfs_inode_isdir(ip) && xfs_inode_has_eof_prealloc(ip);
+    bool const SHOULD_TRIM =
+        ip != nullptr && trim_eof_prealloc && ip->exec_content.can_mutate() && !xfs_inode_isdir(ip) && xfs_inode_has_eof_prealloc(ip);
     if (ctx == nullptr || ip == nullptr || ctx->read_only || (!ip->dirty && !SHOULD_TRIM)) {
         return 0;
     }
 
     uint64_t const STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_ILOG);
-    XfsTransaction* tp = xfs_trans_alloc(ctx);
+    XfsTransaction* tp = xfs_trans_alloc(ctx, xfs_inode_isreg(ip) ? XfsLookupEffect::PRESERVE_FILE_DATA : XfsLookupEffect::INVALIDATE);
     if (tp == nullptr) {
         mod::dbg::log("[xfs] commit dirty inode: ino=%lu transaction allocation failed", static_cast<unsigned long>(ip->ino));
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_ILOG, STARTED_US, -ENOMEM, 0);
@@ -1181,6 +1189,11 @@ auto xfs_vfs_close(File* f) -> int {
         delete xfd->readdir_cache;
         xfd->readdir_cache = nullptr;
         if (xfd->inode != nullptr) {
+            if (f->exec_read_view != nullptr || xfd->swap_extent_pin) {
+                ker::mod::sys::MutexGuard guard(xfd->inode->io_lock);
+                if (f->exec_read_view != nullptr) xfd->inode->exec_content.release();
+                if (xfd->swap_extent_pin) --xfd->inode->exec_content.direct_writers;
+            }
             bool const TRIM_PREALLOC = xfs_close_should_trim_prealloc(f->open_flags, f->created_by_open, xfd->may_have_eof_prealloc);
             bool const COMMIT_NEEDED = xfs_close_should_commit_inode(xfd->close_may_need_inode_commit, f->open_flags, f->created_by_open,
                                                                      xfd->may_have_eof_prealloc);
@@ -1204,6 +1217,7 @@ auto xfs_vfs_close(File* f) -> int {
 }
 
 auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
+    if (f != nullptr && (static_cast<unsigned>(f->open_flags) & 3U) == ker::vfs::FILE_ACCESS_SEARCH_ONLY) return -EBADF;
     if (f == nullptr || buf == nullptr) {
         return -EINVAL;
     }
@@ -1451,6 +1465,7 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset,
 
     XfsInode* ip = xfd->inode;
     XfsMountContext* ctx = xfd->mount;
+    if (count != 0 && !ip->exec_content.can_mutate()) return -ETXTBSY;
     xfs_recent_write_stat_invalidate(xfd);
 
     if (ctx->read_only) {
@@ -1619,6 +1634,7 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset,
             xfd->close_may_need_inode_commit = true;
         }
         ctx->mutation_sequence.fetch_add(1, std::memory_order_release);
+        if (!xfs_inode_isreg(ip)) ctx->lookup_sequence.fetch_add(1, std::memory_order_release);
         ker::vfs::Stat recent_write_stat{};
         if (xfs_inode_fill_stat(ip, &recent_write_stat) == 0) {
             xfs_recent_write_stat_store(xfd, recent_write_stat);
@@ -1696,7 +1712,8 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset,
             t0 = ker::mod::tsc::get_ns();
 #endif
             uint64_t const PERF_ALLOC_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_ALLOC);
-            XfsTransaction* tp = xfs_trans_alloc(ctx);
+            XfsTransaction* tp =
+                xfs_trans_alloc(ctx, xfs_inode_isreg(ip) ? XfsLookupEffect::PRESERVE_FILE_DATA : XfsLookupEffect::INVALIDATE);
             if (tp == nullptr) {
                 perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::WRITE_ALLOC, PERF_ALLOC_STARTED_US, -ENOMEM, 0);
                 write_error = -ENOMEM;
@@ -1931,6 +1948,7 @@ write_done:
 }
 
 auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssize_t {
+    if (f != nullptr && (static_cast<unsigned>(f->open_flags) & 3U) == ker::vfs::FILE_ACCESS_SEARCH_ONLY) return -EBADF;
     if (f == nullptr || buf == nullptr) {
         return -EINVAL;
     }
@@ -2182,6 +2200,7 @@ auto readdir_batch_callback(const XfsDirEntry* xde, void* ctx_ptr) -> int {
 }
 
 auto xfs_vfs_readdir(File* f, DirEntry* entry, size_t index) -> int {
+    if (f != nullptr && (static_cast<unsigned>(f->open_flags) & 3U) == ker::vfs::FILE_ACCESS_SEARCH_ONLY) return -EBADF;
     if (f == nullptr || entry == nullptr) {
         return -EINVAL;
     }
@@ -2306,6 +2325,7 @@ auto xfs_vfs_truncate_impl(File* f, off_t length) -> int {
     }
 
     ker::mod::sys::MutexGuard guard(ip->io_lock);
+    if (!ip->exec_content.can_mutate()) return -ETXTBSY;
     XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());
 
     auto new_size = static_cast<uint64_t>(length);
@@ -2330,7 +2350,7 @@ auto xfs_vfs_truncate_impl(File* f, off_t length) -> int {
             }
         }
 
-        XfsTransaction* tp = xfs_trans_alloc(ctx);
+        XfsTransaction* tp = xfs_trans_alloc(ctx, xfs_inode_isreg(ip) ? XfsLookupEffect::PRESERVE_FILE_DATA : XfsLookupEffect::INVALIDATE);
         if (tp == nullptr) {
             return -ENOMEM;
         }
@@ -2347,7 +2367,7 @@ auto xfs_vfs_truncate_impl(File* f, off_t length) -> int {
     }
 
     if (new_size < OLD_SIZE) {
-        XfsTransaction* tp = xfs_trans_alloc(ctx);
+        XfsTransaction* tp = xfs_trans_alloc(ctx, xfs_inode_isreg(ip) ? XfsLookupEffect::PRESERVE_FILE_DATA : XfsLookupEffect::INVALIDATE);
         if (tp == nullptr) {
             return -ENOMEM;
         }
@@ -2367,7 +2387,7 @@ auto xfs_vfs_truncate_impl(File* f, off_t length) -> int {
     ip->size = new_size;
     xfs_stamp_inode_data_change(ip);
 
-    XfsTransaction* tp = xfs_trans_alloc(ctx);
+    XfsTransaction* tp = xfs_trans_alloc(ctx, xfs_inode_isreg(ip) ? XfsLookupEffect::PRESERVE_FILE_DATA : XfsLookupEffect::INVALIDATE);
     if (tp == nullptr) {
         return -ENOMEM;
     }
@@ -2377,6 +2397,7 @@ auto xfs_vfs_truncate_impl(File* f, off_t length) -> int {
 }
 
 auto xfs_vfs_truncate(File* f, off_t length) -> int {
+    if (f != nullptr && (static_cast<unsigned>(f->open_flags) & 3U) == ker::vfs::FILE_ACCESS_SEARCH_ONLY) return -EBADF;
     if (length < 0) {
         return -EINVAL;
     }
@@ -3491,7 +3512,7 @@ auto xfs_selftest_open_require_directory_uses_dentry_type() -> bool {
     }
 
     int open_result = 0;
-    File* opened = xfs_open_path(NAME, 0, 0, &mount, &open_result, NAME_LEN, true);
+    File* opened = xfs_open_path(ker::mod::security::Snapshot::bootstrap_root(), NAME, 0, 0, &mount, &open_result, NAME_LEN, true);
     bool ok = opened == nullptr && open_result == -ENOTDIR;
     if (opened != nullptr) {
         xfs_vfs_close(opened);
@@ -3502,7 +3523,7 @@ auto xfs_selftest_open_require_directory_uses_dentry_type() -> bool {
     constexpr size_t CACHED_NAME_LEN = 14;
     xfs_path_inode_cache_store(&mount, CACHED_NAME, CACHED_NAME_LEN, CHILD_INO, XFS_DIR3_FT_REG_FILE);
     open_result = 0;
-    opened = xfs_open_path(CACHED_NAME, 0, 0, &mount, &open_result, CACHED_NAME_LEN, true);
+    opened = xfs_open_path(ker::mod::security::Snapshot::bootstrap_root(), CACHED_NAME, 0, 0, &mount, &open_result, CACHED_NAME_LEN, true);
     ok = ok && opened == nullptr && open_result == -ENOTDIR;
     if (opened != nullptr) {
         xfs_vfs_close(opened);
@@ -3577,6 +3598,12 @@ auto xfs_sync_mount(XfsMountContext* ctx) -> int {
         return -EINVAL;
     }
 
+    // This context cannot own dirty state. Do not flush shared device buffers
+    // or journal state on behalf of a read-only mount.
+    if (ctx->read_only) {
+        return 0;
+    }
+
     for (;;) {
         uint64_t const MUTATION_SNAPSHOT = ctx->mutation_sequence.load(std::memory_order_acquire);
         int const INODE_RET = xfs_icache_sync_dirty(ctx);
@@ -3641,6 +3668,7 @@ auto xfs_collect_swap_extents(File* f, ker::mod::mm::swap::SwapExtent** extents_
     }
 
     ker::mod::sys::MutexGuard io_guard(ip->io_lock);
+    if (!ip->exec_content.can_mutate()) return -ETXTBSY;
     XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());
     uint64_t const PAGE_COUNT = ip->size / ker::mod::mm::paging::PAGE_SIZE;
     if (PAGE_COUNT == 0 || PAGE_COUNT > SIZE_MAX) {
@@ -3682,6 +3710,8 @@ auto xfs_collect_swap_extents(File* f, ker::mod::mm::swap::SwapExtent** extents_
         file_block += SPAN;
     }
 
+    ++ip->exec_content.direct_writers;
+    xfd->swap_extent_pin = true;
     *extents_out = extents;
     *extent_count_out = extent_count;
     return 0;
@@ -4119,7 +4149,7 @@ XfsLookupHandle::XfsLookupHandle(XfsLookupHandle&& other) noexcept
       leaf_length_(other.leaf_length_),
       path_length_(other.path_length_),
       expected_parent_generation_(other.expected_parent_generation_),
-      expected_mutation_sequence_(other.expected_mutation_sequence_),
+      expected_lookup_sequence_(other.expected_lookup_sequence_),
       target_existed_(other.target_existed_),
       root_target_(other.root_target_) {
     other.mount_ = nullptr;
@@ -4128,7 +4158,7 @@ XfsLookupHandle::XfsLookupHandle(XfsLookupHandle&& other) noexcept
     other.leaf_length_ = 0;
     other.path_length_ = 0;
     other.expected_parent_generation_ = 0;
-    other.expected_mutation_sequence_ = 0;
+    other.expected_lookup_sequence_ = 0;
     other.target_existed_ = false;
     other.root_target_ = false;
 }
@@ -4144,7 +4174,7 @@ auto XfsLookupHandle::operator=(XfsLookupHandle&& other) noexcept -> XfsLookupHa
         leaf_length_ = other.leaf_length_;
         path_length_ = other.path_length_;
         expected_parent_generation_ = other.expected_parent_generation_;
-        expected_mutation_sequence_ = other.expected_mutation_sequence_;
+        expected_lookup_sequence_ = other.expected_lookup_sequence_;
         target_existed_ = other.target_existed_;
         root_target_ = other.root_target_;
         other.mount_ = nullptr;
@@ -4153,7 +4183,7 @@ auto XfsLookupHandle::operator=(XfsLookupHandle&& other) noexcept -> XfsLookupHa
         other.leaf_length_ = 0;
         other.path_length_ = 0;
         other.expected_parent_generation_ = 0;
-        other.expected_mutation_sequence_ = 0;
+        other.expected_lookup_sequence_ = 0;
         other.target_existed_ = false;
         other.root_target_ = false;
     }
@@ -4171,14 +4201,15 @@ void XfsLookupHandle::reset() {
     leaf_length_ = 0;
     path_length_ = 0;
     expected_parent_generation_ = 0;
-    expected_mutation_sequence_ = 0;
+    expected_lookup_sequence_ = 0;
     target_existed_ = false;
     root_target_ = false;
     xfs_inode_release(TARGET);
     xfs_inode_release(PARENT);
 }
 
-auto xfs_acquire_lookup(const char* fs_path, XfsMountContext* ctx, XfsLookupHandle* out, size_t known_fs_path_len) -> int {
+auto xfs_acquire_lookup(const ker::mod::security::Snapshot& credentials, const char* fs_path, XfsMountContext* ctx, XfsLookupHandle* out,
+                        size_t known_fs_path_len) -> int {
     if (fs_path == nullptr || ctx == nullptr || out == nullptr) {
         return -EINVAL;
     }
@@ -4203,22 +4234,49 @@ auto xfs_acquire_lookup(const char* fs_path, XfsMountContext* ctx, XfsLookupHand
         result.path_.at(1) = '\0';
         result.path_length_ = 1;
         result.expected_parent_generation_ = parent->dir_generation;
-        result.expected_mutation_sequence_ = ctx->mutation_sequence.load(std::memory_order_acquire);
+        result.expected_lookup_sequence_ = ctx->lookup_sequence.load(std::memory_order_acquire);
         result.target_existed_ = true;
         result.root_target_ = true;
         *out = std::move(result);
         return 0;
     }
 
-    XfsInode* parent = nullptr;
-    const char* name = nullptr;
-    uint16_t name_length = 0;
-    size_t path_length = UNKNOWN_XFS_PATH_LEN;
-    int const PARENT_RET =
-        xfs_find_parent_and_name(fs_path, ctx, &parent, &name, &name_length, nullptr, false, known_fs_path_len, &path_length);
-    if (PARENT_RET != 0) {
-        return PARENT_RET;
+    if (INPUT_PATH_LENGTH >= XFS_LOOKUP_PATH_CAPACITY) return -ENAMETOOLONG;
+    XfsInode* parent = xfs_root_inode_read(ctx);
+    if (parent == nullptr) return -ENOENT;
+    auto fail_parent = [&](int error) {
+        xfs_inode_release_metadata_locked(parent);
+        return error;
+    };
+    const char* name = fs_path;
+    for (size_t index = 0; index < INPUT_PATH_LENGTH; ++index)
+        if (fs_path[index] == '/') name = fs_path + index + 1;
+    size_t const LEAF_LENGTH = INPUT_PATH_LENGTH - static_cast<size_t>(name - fs_path);
+    if (LEAF_LENGTH == 0 || LEAF_LENGTH >= XFS_LOOKUP_LEAF_CAPACITY) return fail_parent(LEAF_LENGTH == 0 ? -EINVAL : -ENAMETOOLONG);
+    uint16_t const name_length = static_cast<uint16_t>(LEAF_LENGTH);
+    size_t const path_length = INPUT_PATH_LENGTH;
+    const char* cursor = fs_path;
+    while (cursor < name) {
+        while (cursor < name && *cursor == '/') ++cursor;
+        if (cursor == name) break;
+        const char* component = cursor;
+        while (cursor < name && *cursor != '/') ++cursor;
+        size_t const LENGTH = static_cast<size_t>(cursor - component);
+        if (LENGTH == 0 || LENGTH >= XFS_LOOKUP_LEAF_CAPACITY) return fail_parent(-ENAMETOOLONG);
+        if (!xfs_inode_isdir(parent)) return fail_parent(-ENOTDIR);
+        int const SEARCH = ker::mod::security::authorize_file_access(credentials, {parent->uid, parent->gid, parent->mode}, 1);
+        if (SEARCH != 0) return fail_parent(SEARCH);
+        XfsDirEntry entry{};
+        int const LOOKUP = xfs_dir_lookup_authoritative(parent, component, static_cast<uint16_t>(LENGTH), &entry);
+        if (LOOKUP != 0) return fail_parent(LOOKUP);
+        auto* child = xfs_inode_read_known_allocated(ctx, entry.ino);
+        if (child == nullptr) return fail_parent(-ENOENT);
+        xfs_inode_release_metadata_locked(parent);
+        parent = child;
     }
+    if (!xfs_inode_isdir(parent)) return fail_parent(-ENOTDIR);
+    int const SEARCH = ker::mod::security::authorize_file_access(credentials, {parent->uid, parent->gid, parent->mode}, 1);
+    if (SEARCH != 0) return fail_parent(SEARCH);
 
     size_t actual_name_length = 0;
     while (name[actual_name_length] != '\0') {
@@ -4255,17 +4313,166 @@ auto xfs_acquire_lookup(const char* fs_path, XfsMountContext* ctx, XfsLookupHand
     result.leaf_length_ = name_length;
     result.path_length_ = path_length;
     result.expected_parent_generation_ = parent->dir_generation;
-    result.expected_mutation_sequence_ = ctx->mutation_sequence.load(std::memory_order_acquire);
+    result.expected_lookup_sequence_ = ctx->lookup_sequence.load(std::memory_order_acquire);
     result.target_existed_ = target != nullptr;
     *out = std::move(result);
     return 0;
 }
 
-auto xfs_acquire_lookup_at_file(File* directory, const char* relative_path, XfsLookupHandle* out) -> int {
+auto xfs_directory_path(File* directory, char* out, size_t capacity) -> int {
+    if (directory == nullptr || directory->fs_type != FSType::XFS || directory->private_data == nullptr) return -EBADF;
+    if (!directory->is_directory) return -ENOTDIR;
+    if (out == nullptr || capacity == 0) return -EINVAL;
+    auto* xfd = static_cast<XfsFileData*>(directory->private_data);
+    if (xfd->mount == nullptr || xfd->inode == nullptr) return -EBADF;
+    return xfs_directory_path_at_inode(xfd->mount, xfd->inode, out, capacity);
+}
+
+namespace {
+auto directory_path_at_inode(XfsMountContext* ctx, XfsInode* anchor, XfsInode* boundary, char* out, size_t capacity,
+                             const ker::mod::security::Snapshot* credentials) -> int {
+    if (ctx == nullptr || anchor == nullptr || out == nullptr || capacity == 0) return -EINVAL;
+    XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());
+    if (boundary != nullptr) {
+        auto* retained = xfs_inode_read_cached(ctx, boundary->ino);
+        int const VALID = retained == nullptr || retained != boundary ? -EAGAIN
+                          : !xfs_inode_isdir(retained)                ? -ENOTDIR
+                          : retained->nlink == 0                      ? -ENOENT
+                                                                      : 0;
+        xfs_inode_release_metadata_locked(retained);
+        if (VALID != 0) return VALID;
+    }
+    auto const ROOT_INO = boundary != nullptr ? boundary->ino : ctx->root_ino;
+    std::array<char, XFS_LOOKUP_PATH_CAPACITY> path{};
+    size_t cursor = path.size() - 1;
+    XfsInode* current = xfs_inode_read_cached(ctx, anchor->ino);
+    if (current == nullptr || current != anchor) {
+        xfs_inode_release_metadata_locked(current);
+        return -EAGAIN;
+    }
+    auto fail = [&](int error) {
+        xfs_inode_release_metadata_locked(current);
+        return error;
+    };
+    if (credentials != nullptr) {
+        if (!xfs_inode_isdir(current)) return fail(-ENOTDIR);
+        if (current->nlink == 0) return fail(-ENOENT);
+        int const SEARCH = ker::mod::security::authorize_file_access(*credentials, {current->uid, current->gid, current->mode}, 1);
+        if (SEARCH != 0) return fail(SEARCH);
+    }
+    while (current->ino != ROOT_INO) {
+        if (boundary != nullptr && current->ino == ctx->root_ino) return fail(-EPERM);
+        if (!xfs_inode_isdir(current)) return fail(-ENOTDIR);
+        if (current->nlink == 0) return fail(-ENOENT);
+        XfsDirEntry parent_entry{};
+        int const LOOKUP = xfs_dir_lookup_authoritative(current, "..", 2, &parent_entry);
+        if (LOOKUP != 0) return fail(LOOKUP);
+        if (parent_entry.ino == current->ino) return fail(-EIO);
+        XfsInode* parent = xfs_inode_read_known_allocated(ctx, parent_entry.ino);
+        if (parent == nullptr) return fail(-ENOENT);
+        if (!xfs_inode_isdir(parent) || parent->nlink == 0) {
+            xfs_inode_release_metadata_locked(parent);
+            return fail(-ENOENT);
+        }
+        struct NameScan {
+            XfsInode* parent;
+            xfs_ino_t child;
+            XfsDirEntry entry{};
+            int status = -ENOENT;
+        } scan{parent, current->ino};
+        auto find_name = [](const XfsDirEntry* entry, void* opaque) -> int {
+            auto& scan = *static_cast<NameScan*>(opaque);
+            if (entry->ino != scan.child || (entry->namelen == 1 && entry->name[0] == '.') ||
+                (entry->namelen == 2 && entry->name[0] == '.' && entry->name[1] == '.'))
+                return 0;
+            int const INDEXED = xfs_dir_entry_is_indexed(scan.parent, entry);
+            if (INDEXED == 0) return 0;
+            if (INDEXED < 0) {
+                scan.status = INDEXED;
+                return 1;
+            }
+            if (entry->namelen == 0 || entry->namelen >= entry->name.size()) {
+                scan.status = -EIO;
+                return 1;
+            }
+            for (size_t i = 0; i < entry->namelen; ++i) {
+                if (entry->name[i] == '/' || entry->name[i] == '\0') {
+                    scan.status = -EIO;
+                    return 1;
+                }
+            }
+            scan.entry = *entry;
+            scan.status = 0;
+            return 1;
+        };
+        int const ITERATE = xfs_dir_iterate(parent, find_name, &scan);
+        if (ITERATE < 0 || scan.status != 0 || static_cast<size_t>(scan.entry.namelen) + 1 > cursor) {
+            xfs_inode_release_metadata_locked(parent);
+            return fail(ITERATE < 0 ? ITERATE : (scan.status != 0 ? scan.status : -ENAMETOOLONG));
+        }
+        cursor -= scan.entry.namelen;
+        std::memcpy(path.data() + cursor, scan.entry.name.data(), scan.entry.namelen);
+        path[--cursor] = '/';
+        xfs_inode_release_metadata_locked(current);
+        current = parent;
+    }
+    xfs_inode_release_metadata_locked(current);
+    if (cursor == path.size() - 1) path[--cursor] = '/';
+    size_t const LENGTH = path.size() - cursor;
+    if (LENGTH > capacity) return -ENAMETOOLONG;
+    std::memcpy(out, path.data() + cursor, LENGTH);
+    return 0;
+}
+}  // namespace
+
+auto xfs_directory_path_at_inode(XfsMountContext* ctx, XfsInode* anchor, char* out, size_t capacity) -> int {
+    return directory_path_at_inode(ctx, anchor, nullptr, out, capacity, nullptr);
+}
+
+auto xfs_directory_path_beneath(File* root, File* directory, char* out, size_t capacity, const ker::mod::security::Snapshot* credentials)
+    -> int {
+    if (root == nullptr || directory == nullptr || root->fs_type != FSType::XFS || directory->fs_type != FSType::XFS ||
+        root->private_data == nullptr || directory->private_data == nullptr)
+        return -EBADF;
+    if (!root->is_directory || !directory->is_directory) return -ENOTDIR;
+    auto* root_data = static_cast<XfsFileData*>(root->private_data);
+    auto* directory_data = static_cast<XfsFileData*>(directory->private_data);
+    if (root_data->mount == nullptr || root_data->inode == nullptr || directory_data->mount == nullptr || directory_data->inode == nullptr)
+        return -EBADF;
+    if (root_data->mount != directory_data->mount) return -EXDEV;
+    return directory_path_at_inode(root_data->mount, directory_data->inode, root_data->inode, out, capacity, credentials);
+}
+
+auto xfs_lookup_directory_path_beneath(File* root, const XfsLookupHandle& lookup, char* out, size_t capacity) -> int {
+    auto* ctx = lookup.mount();
+    if (ctx == nullptr) return -EBADF;
+    XfsInode* boundary = nullptr;
+    if (root != nullptr) {
+        if (root->fs_type != FSType::XFS || root->private_data == nullptr) return -EBADF;
+        if (!root->is_directory) return -ENOTDIR;
+        auto* data = static_cast<XfsFileData*>(root->private_data);
+        if (data->mount != ctx) return -EXDEV;
+        if (data->inode == nullptr) return -EBADF;
+        boundary = data->inode;
+    }
+    XfsInode* selected = nullptr;
+    {
+        XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());
+        int const VALID = xfs_validate_lookup_locked(lookup);
+        if (VALID != 0) return VALID;
+        auto* target = lookup.target();
+        selected = target != nullptr && xfs_inode_isdir(target) ? target : lookup.parent();
+    }
+    // The handle retains either selection; ancestry takes its own metadata guard.
+    return directory_path_at_inode(ctx, selected, boundary, out, capacity, nullptr);
+}
+
+auto xfs_acquire_lookup_at_file(const ker::mod::security::Snapshot& credentials, File* directory, const char* relative_path,
+                                XfsLookupHandle* out) -> int {
     if (directory == nullptr || out == nullptr) {
         return -EBADF;
     }
-    if (relative_path == nullptr || relative_path[0] == '\0' || relative_path[0] == '/') {
+    if (relative_path == nullptr || relative_path[0] == '/') {
         return -EINVAL;
     }
     if (directory->fs_type != FSType::XFS || directory->private_data == nullptr) {
@@ -4279,6 +4486,13 @@ auto xfs_acquire_lookup_at_file(File* directory, const char* relative_path, XfsL
     if (xfd->mount == nullptr || xfd->inode == nullptr) {
         return -EBADF;
     }
+    return xfs_acquire_lookup_at_inode(credentials, xfd->mount, xfd->inode, relative_path, out);
+}
+
+auto xfs_acquire_lookup_at_inode(const ker::mod::security::Snapshot& credentials, XfsMountContext* ctx, XfsInode* anchor,
+                                 const char* relative_path, XfsLookupHandle* out) -> int {
+    if (ctx == nullptr || anchor == nullptr || out == nullptr) return -EBADF;
+    if (relative_path == nullptr || relative_path[0] == '/') return -EINVAL;
     std::array<char, XFS_LOOKUP_PATH_CAPACITY> pending{};
     size_t input_length = 0;
     while (relative_path[input_length] != '\0') {
@@ -4291,10 +4505,10 @@ auto xfs_acquire_lookup_at_file(File* directory, const char* relative_path, XfsL
     pending.at(input_length) = '\0';
 
     *out = XfsLookupHandle{};
-    XfsMetadataGuard metadata_guard(xfd->mount, true, WOS_PERF_CALLSITE());
+    XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());
 
-    XfsInode* current = xfs_inode_read_cached(xfd->mount, xfd->inode->ino);
-    if (current == nullptr || current != xfd->inode) {
+    XfsInode* current = xfs_inode_read_cached(ctx, anchor->ino);
+    if (current == nullptr || current != anchor) {
         xfs_inode_release_metadata_locked(current);
         return -EAGAIN;
     }
@@ -4305,6 +4519,25 @@ auto xfs_acquire_lookup_at_file(File* directory, const char* relative_path, XfsL
     if (current->nlink == 0) {
         xfs_inode_release_metadata_locked(current);
         return -ENOENT;
+    }
+
+    if (relative_path[0] == '\0') {
+        auto* target = xfs_inode_read_cached(ctx, current->ino);
+        if (target == nullptr || target != current) {
+            xfs_inode_release_metadata_locked(target);
+            xfs_inode_release_metadata_locked(current);
+            return -EAGAIN;
+        }
+        XfsLookupHandle result{};
+        result.mount_ = ctx;
+        result.parent_ = current;
+        result.target_ = target;
+        result.expected_parent_generation_ = current->dir_generation;
+        result.expected_lookup_sequence_ = ctx->lookup_sequence.load(std::memory_order_acquire);
+        result.target_existed_ = true;
+        result.root_target_ = true;
+        *out = std::move(result);
+        return 0;
     }
 
     constexpr unsigned MAX_LOOKUP_SYMLINKS = 8;
@@ -4337,11 +4570,17 @@ auto xfs_acquire_lookup_at_file(File* directory, const char* relative_path, XfsL
         bool const FINAL_COMPONENT = *rest == '\0';
         auto const COMPONENT_LENGTH = static_cast<uint16_t>(component_length);
 
+        int const SEARCH = ker::mod::security::authorize_file_access(credentials, {current->uid, current->gid, current->mode}, 1);
+        if (SEARCH != 0) {
+            xfs_inode_release_metadata_locked(current);
+            return SEARCH;
+        }
+
         XfsDirEntry entry{};
         int const LOOKUP_RET = xfs_dir_lookup_authoritative(current, COMPONENT, COMPONENT_LENGTH, &entry);
         XfsInode* target = nullptr;
         if (LOOKUP_RET == 0) {
-            target = xfs_inode_read_known_allocated(xfd->mount, entry.ino);
+            target = xfs_inode_read_known_allocated(ctx, entry.ino);
             if (target == nullptr) {
                 xfs_inode_release_metadata_locked(current);
                 return -ENOENT;
@@ -4394,7 +4633,7 @@ auto xfs_acquire_lookup_at_file(File* directory, const char* relative_path, XfsL
                 cursor = pending.data();
                 path_length = 0;
                 if (ABSOLUTE_TARGET) {
-                    XfsInode* root = xfs_root_inode_read(xfd->mount);
+                    XfsInode* root = xfs_root_inode_read(ctx);
                     xfs_inode_release_metadata_locked(current);
                     if (root == nullptr) {
                         return -ENOENT;
@@ -4420,7 +4659,7 @@ auto xfs_acquire_lookup_at_file(File* directory, const char* relative_path, XfsL
         }
 
         XfsLookupHandle result{};
-        result.mount_ = xfd->mount;
+        result.mount_ = ctx;
         result.parent_ = current;
         result.target_ = target;
         std::memcpy(result.leaf_.data(), COMPONENT, component_length);
@@ -4431,7 +4670,7 @@ auto xfs_acquire_lookup_at_file(File* directory, const char* relative_path, XfsL
         result.path_.front() = '\0';
         result.path_length_ = 0;
         result.expected_parent_generation_ = current->dir_generation;
-        result.expected_mutation_sequence_ = xfd->mount->mutation_sequence.load(std::memory_order_acquire);
+        result.expected_lookup_sequence_ = ctx->lookup_sequence.load(std::memory_order_acquire);
         result.target_existed_ = target != nullptr;
         *out = std::move(result);
         return 0;
@@ -4444,7 +4683,7 @@ auto xfs_validate_lookup_locked(const XfsLookupHandle& handle) -> int {
     if (MOUNT == nullptr || PARENT == nullptr || PARENT->mount != MOUNT || !xfs_inode_isdir(PARENT)) {
         return -EINVAL;
     }
-    if (MOUNT->mutation_sequence.load(std::memory_order_acquire) != handle.expected_mutation_sequence_ ||
+    if (MOUNT->lookup_sequence.load(std::memory_order_acquire) != handle.expected_lookup_sequence_ ||
         PARENT->dir_generation != handle.expected_parent_generation_ || PARENT->nlink == 0) {
         return -EAGAIN;
     }
@@ -4841,10 +5080,20 @@ void xfs_set_open_result(int* result_out, int result) {
     }
 }
 
-auto xfs_dentry_type_may_be_directory(uint8_t ftype) -> bool { return ftype == XFS_DIR3_FT_DIR || ftype == XFS_DIR3_FT_UNKNOWN; }
+// Allocate fallible per-open storage before a create transaction publishes its
+// inode/name. Neither object owns an inode reference until final adoption.
+struct XfsOpenStorage {
+    std::unique_ptr<File> file{};
+    std::unique_ptr<XfsFileData> data{};
+    auto prepare() -> bool {
+        if (file == nullptr) file.reset(new (std::nothrow) File{});
+        if (file != nullptr && data == nullptr) data.reset(new (std::nothrow) XfsFileData{});
+        return file != nullptr && data != nullptr;
+    }
+};
 
-auto xfs_file_from_inode(XfsMountContext* ctx, XfsInode* ip, int flags, const char* fs_path, size_t known_fs_path_len, bool created_by_open,
-                         const ker::vfs::Stat& opened_stat, int* result_out) -> File* {
+auto xfs_file_from_inode(XfsOpenStorage& storage, XfsMountContext* ctx, XfsInode* ip, int flags, const char* fs_path,
+                         size_t known_fs_path_len, bool created_by_open, const ker::vfs::Stat& opened_stat, int* result_out) -> File* {
     if (ctx == nullptr || ip == nullptr) {
         xfs_set_open_result(result_out, -EINVAL);
         return nullptr;
@@ -4852,20 +5101,8 @@ auto xfs_file_from_inode(XfsMountContext* ctx, XfsInode* ip, int flags, const ch
 
     bool const IS_DIRECTORY = xfs_inode_isdir(ip);
 
-    auto* f = new (std::nothrow) File{};
-    if (f == nullptr) {
-        xfs_inode_release(ip);
-        xfs_set_open_result(result_out, -ENOMEM);
-        return nullptr;
-    }
-
-    auto* xfd = new (std::nothrow) XfsFileData;
-    if (xfd == nullptr) {
-        delete f;
-        xfs_inode_release(ip);
-        xfs_set_open_result(result_out, -ENOMEM);
-        return nullptr;
-    }
+    auto* f = storage.file.release();
+    auto* xfd = storage.data.release();
     xfd->mount = ctx;
     xfd->inode = ip;
     if (IS_DIRECTORY && fs_path != nullptr) {
@@ -4893,8 +5130,8 @@ auto xfs_file_from_inode(XfsMountContext* ctx, XfsInode* ip, int flags, const ch
 
 }  // namespace
 
-auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ctx, int* result_out, size_t known_fs_path_len,
-                   bool require_directory) -> File* {
+auto xfs_open_path(const ker::mod::security::Snapshot& credentials, const char* fs_path, int flags, int mode, XfsMountContext* ctx,
+                   int* result_out, size_t known_fs_path_len, bool require_directory) -> File* {
     constexpr int O_CREAT_FLAG = 0100;
     constexpr int O_EXCL_FLAG = ker::vfs::O_EXCL;
     constexpr int O_WOS_KNOWN_ABSENT_FLAG = ker::vfs::O_WOS_KNOWN_ABSENT;
@@ -4904,8 +5141,18 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
         xfs_set_open_result(result_out, -EINVAL);
         return nullptr;
     }
+    if (fs_path == nullptr) {
+        fs_path = "";
+        known_fs_path_len = 0;
+    }
 
+    if ((flags & 3) == 3 || (flags & (ker::vfs::O_DIRECTORY | ker::vfs::O_CREAT)) == (ker::vfs::O_DIRECTORY | ker::vfs::O_CREAT)) {
+        xfs_set_open_result(result_out, -EINVAL);
+        return nullptr;
+    }
+    require_directory = require_directory || (flags & ker::vfs::O_DIRECTORY) != 0;
     XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());
+    XfsOpenStorage storage;
 
     XfsInode* ip = nullptr;
     bool used_create_lookup = false;
@@ -4934,6 +5181,13 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
         int parent_ret = xfs_find_parent_and_name(fs_path, ctx, &create_parent_ip, &create_filename, &create_filename_len, nullptr, true,
                                                   known_fs_path_len, nullptr);
         if (parent_ret == 0) {
+            int const SEARCH = ker::mod::security::authorize_file_access(
+                credentials, {create_parent_ip->uid, create_parent_ip->gid, create_parent_ip->mode}, 1);
+            if (SEARCH != 0) {
+                xfs_inode_release_metadata_locked(create_parent_ip);
+                xfs_set_open_result(result_out, SEARCH);
+                return nullptr;
+            }
             used_create_lookup = true;
             bool create_lookup_handled = false;
             bool const EXCLUSIVE_CREATE = (flags & O_EXCL_FLAG) != 0;
@@ -5032,6 +5286,24 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
     }
 
     if (!used_create_lookup) {
+        XfsInode* permission_parent = nullptr;
+        const char* permission_name = nullptr;
+        uint16_t permission_name_len = 0;
+        int const PARENT_RET = xfs_find_parent_and_name(fs_path, ctx, &permission_parent, &permission_name, &permission_name_len, nullptr,
+                                                        true, known_fs_path_len);
+        if (PARENT_RET == 0) {
+            int const SEARCH = ker::mod::security::authorize_file_access(
+                credentials, {permission_parent->uid, permission_parent->gid, permission_parent->mode}, 1);
+            xfs_inode_release_metadata_locked(permission_parent);
+            if (SEARCH != 0) {
+                xfs_set_open_result(result_out, SEARCH);
+                return nullptr;
+            }
+        } else if (PARENT_RET != -EINVAL) {
+            xfs_set_open_result(result_out, PARENT_RET);
+            return nullptr;
+        }
+
         int const CACHED_OPEN_RET = xfs_lookup_with_cached_parent(fs_path, ctx, &ip, known_fs_path_len, require_directory);
         if (CACHED_OPEN_RET == -EAGAIN) {
             ip = walk_path(ctx, fs_path);
@@ -5044,6 +5316,18 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
     }
 
     if (create_missing) {
+        ker::mod::security::FileIdentity identity{};
+        int const CREATE_POLICY = require_directory
+                                      ? -ENOENT
+                                      : ker::mod::security::prepare_file_create(
+                                            credentials, {create_parent_ip->uid, create_parent_ip->gid, create_parent_ip->mode},
+                                            static_cast<uint32_t>(mode), identity);
+        if (CREATE_POLICY != 0 || !storage.prepare()) {
+            xfs_inode_release_metadata_locked(create_parent_ip);
+            xfs_set_open_result(result_out, CREATE_POLICY != 0 ? CREATE_POLICY : -ENOMEM);
+            return nullptr;
+        }
+
         uint64_t const PERF_CREATE_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::OPEN_CREATE);
         bool create_recorded = false;
         auto record_open_create = [&](int32_t status) {
@@ -5064,9 +5348,7 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
             xfs_set_open_result(result_out, -ENOMEM);
             return nullptr;
         }
-        // Apply default mode if not specified (standard POSIX: 0666 for files)
-        int const FILE_MODE = (mode == 0) ? 0666 : mode;
-        uint16_t const INODE_MODE = static_cast<uint16_t>(FILE_MODE & 0xFFF) | 0100000;  // S_IFREG | mode
+        uint16_t const INODE_MODE = static_cast<uint16_t>(identity.mode);
         uint64_t const PERF_IALLOC_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::IALLOC);
         xfs_ino_t const NEW_INO = xfs_ialloc(ctx, tp, INODE_MODE);
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::IALLOC, PERF_IALLOC_STARTED_US, NEW_INO == NULLFSINO ? -ENOSPC : 0, 1);
@@ -5100,8 +5382,8 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
         new_inode->agno = xfs_ino_ag(NEW_INO, ctx->agino_log);
         new_inode->agino = xfs_ag_ino(NEW_INO, ctx->agino_log);
         new_inode->mode = INODE_MODE;
-        new_inode->uid = 0;
-        new_inode->gid = 0;
+        new_inode->uid = identity.uid;
+        new_inode->gid = identity.gid;
         new_inode->nlink = 1;
         new_inode->size = 0;
         new_inode->nblocks = 0;
@@ -5208,6 +5490,20 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
         xfs_set_open_result(result_out, -ENOTDIR);
         return nullptr;
     }
+    if ((flags & ker::vfs::O_NOFOLLOW) != 0 && xfs_inode_islnk(ip)) {
+        xfs_inode_release_metadata_locked(ip);
+        xfs_set_open_result(result_out, -ELOOP);
+        return nullptr;
+    }
+    int const OPEN_POLICY =
+        created_by_open ? 0
+                        : ker::mod::security::authorize_file_open(credentials, {ip->uid, ip->gid, ip->mode},
+                                                                  static_cast<unsigned>(flags) & 3U, (flags & ker::vfs::O_TRUNC) != 0);
+    if (OPEN_POLICY != 0 || !storage.prepare()) {
+        xfs_inode_release_metadata_locked(ip);
+        xfs_set_open_result(result_out, OPEN_POLICY != 0 ? OPEN_POLICY : -ENOMEM);
+        return nullptr;
+    }
     if (path_cache_needs_store) {
         xfs_path_inode_cache_store_inode(ctx, fs_path, known_fs_path_len, ip);
         xfs_parent_path_cache_store_directory(ctx, fs_path, known_fs_path_len, ip);
@@ -5215,7 +5511,7 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
 
     // Check for O_WRONLY/O_RDWR on a read-only mount
     int const ACCMODE = flags & 3;
-    if (ACCMODE == 1 || ACCMODE == 2) {
+    if (ACCMODE == 1 || ACCMODE == 2 || (flags & ker::vfs::O_TRUNC) != 0) {
         // Write access on read-only filesystem
         if (ctx->read_only) {
             xfs_inode_release(ip);
@@ -5228,7 +5524,7 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
     fill_stat(ip, &opened_stat);
 
     metadata_guard.unlock();
-    return xfs_file_from_inode(ctx, ip, flags, fs_path, known_fs_path_len, created_by_open, opened_stat, result_out);
+    return xfs_file_from_inode(storage, ctx, ip, flags, fs_path, known_fs_path_len, created_by_open, opened_stat, result_out);
 }
 
 namespace {
@@ -5429,6 +5725,43 @@ auto xfs_stat(const char* fs_path, ker::vfs::Stat* statbuf, XfsMountContext* ctx
     return 0;
 }
 
+auto xfs_clone_exec_file(File* source, File** output) -> int {
+    if (source == nullptr || output == nullptr || source->fops != get_xfs_fops()) return -EINVAL;
+    auto* original = static_cast<XfsFileData*>(source->private_data);
+    if (original == nullptr || original->inode == nullptr) return -EBADF;
+    std::unique_ptr<File> file(new (std::nothrow) File{});
+    std::unique_ptr<XfsFileData> data(new (std::nothrow) XfsFileData{});
+    if (file == nullptr || data == nullptr) return -ENOMEM;
+    file->exec_read_view.reset(new (std::nothrow) ExecReadView{});
+    if (file->exec_read_view == nullptr) return -ENOMEM;
+    XfsInode* inode = xfs_inode_read_cached(original->mount, original->inode->ino);
+    if (inode == nullptr) return -EAGAIN;
+    int result = 0;
+    {
+        ker::mod::sys::MutexGuard io_guard(inode->io_lock);
+        if (inode != original->inode || !xfs_inode_isreg(inode)) {
+            result = -ENOEXEC;
+        } else {
+            result = xfs_inode_fill_stat(inode, &file->exec_read_view->metadata);
+            if (result == 0) result = inode->exec_content.acquire(*file->exec_read_view);
+        }
+    }
+    if (result != 0) {
+        xfs_inode_release(inode);
+        return result;
+    }
+    data->mount = original->mount;
+    data->inode = inode;
+    file->private_data = data.release();
+    file->fops = get_xfs_fops();
+    file->fs_type = FSType::XFS;
+    file->fd = -1;
+    file->refcount = 1;
+    file->open_flags = O_NO_CACHE;
+    *output = file.release();
+    return 0;
+}
+
 auto xfs_fstat(File* f, ker::vfs::Stat* statbuf) -> int {
     if (f == nullptr || statbuf == nullptr) {
         return -EINVAL;
@@ -5451,7 +5784,7 @@ constexpr int PUBLIC_XATTR_CREATE = 1;
 constexpr int PUBLIC_XATTR_REPLACE = 2;
 constexpr int XATTR_MISSING = -61;  // ENODATA / ENOATTR
 
-enum class PublicXattrNamespace : uint8_t { USER, TRUSTED, SECURITY };
+using PublicXattrNamespace = ker::mod::security::FileXattrNamespace;
 
 struct PublicXattrName {
     const uint8_t* suffix{};
@@ -5497,27 +5830,10 @@ auto parse_public_xattr_name(const char* name, PublicXattrName* out) -> int {
     return -EOPNOTSUPP;
 }
 
-auto check_public_xattr_permission(const XfsInode* ip, PublicXattrNamespace name_space, bool write) -> int {
-    if (ip == nullptr) {
-        return -EINVAL;
-    }
-    auto* task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
-    if (task == nullptr) {
-        // Backend work such as deferred WKI requests and boot selftests runs
-        // outside a userspace task.  Those trusted kernel callers have no
-        // credentials to check; syscall callers always retain their task and
-        // therefore still take the normal UID/GID permission path below.
-        return 0;
-    }
-    if (name_space != PublicXattrNamespace::USER) {
-        return task->euid == 0 ? 0 : -EPERM;
-    }
-    constexpr uint16_t XFS_IFMT = 0xF000;
-    constexpr uint16_t XFS_IFLNK = 0xA000;
-    if (write && (ip->mode & XFS_IFMT) == XFS_IFLNK) {
-        return -EPERM;
-    }
-    return ker::vfs::vfs_check_permission(ip->mode, ip->uid, ip->gid, write ? 2 : 4);
+auto check_public_xattr_permission(const ker::mod::security::Snapshot& credentials, const XfsInode* ip, PublicXattrNamespace name_space,
+                                   bool write) -> int {
+    if (ip == nullptr) return -EINVAL;
+    return ker::mod::security::authorize_file_xattr(credentials, {ip->uid, ip->gid, ip->mode}, name_space, write);
 }
 
 auto lookup_xattr_path_inode(const char* fs_path, XfsMountContext* ctx, size_t known_fs_path_len) -> XfsInode* {
@@ -5529,8 +5845,8 @@ auto lookup_xattr_path_inode(const char* fs_path, XfsMountContext* ctx, size_t k
     return ip;
 }
 
-auto set_public_xattr_locked(XfsMountContext* ctx, XfsInode* ip, const PublicXattrName& parsed, const void* value, size_t size, int flags)
-    -> int {
+auto set_public_xattr_locked(const ker::mod::security::Snapshot& credentials, XfsMountContext* ctx, XfsInode* ip,
+                             const PublicXattrName& parsed, const void* value, size_t size, int flags) -> int {
     if (ctx == nullptr || ip == nullptr || (size != 0 && value == nullptr)) {
         return -EINVAL;
     }
@@ -5541,7 +5857,7 @@ auto set_public_xattr_locked(XfsMountContext* ctx, XfsInode* ip, const PublicXat
         (flags & (PUBLIC_XATTR_CREATE | PUBLIC_XATTR_REPLACE)) == (PUBLIC_XATTR_CREATE | PUBLIC_XATTR_REPLACE)) {
         return -EINVAL;
     }
-    if (int const PERM_RET = check_public_xattr_permission(ip, parsed.name_space, true); PERM_RET < 0) {
+    if (int const PERM_RET = check_public_xattr_permission(credentials, ip, parsed.name_space, true); PERM_RET < 0) {
         return PERM_RET;
     }
 
@@ -5572,11 +5888,12 @@ auto set_public_xattr_locked(XfsMountContext* ctx, XfsInode* ip, const PublicXat
     return xfs_trans_commit(tp) == 0 ? 0 : -EIO;
 }
 
-auto get_public_xattr_locked(XfsInode* ip, const PublicXattrName& parsed, void* value, size_t size) -> ssize_t {
+auto get_public_xattr_locked(const ker::mod::security::Snapshot& credentials, XfsInode* ip, const PublicXattrName& parsed, void* value,
+                             size_t size) -> ssize_t {
     if (ip == nullptr || size > PUBLIC_XATTR_SIZE_MAX || (size != 0 && value == nullptr)) {
         return -EINVAL;
     }
-    if (int const PERM_RET = check_public_xattr_permission(ip, parsed.name_space, false); PERM_RET < 0) {
+    if (int const PERM_RET = check_public_xattr_permission(credentials, ip, parsed.name_space, false); PERM_RET < 0) {
         return PERM_RET;
     }
     return xfs_attr_get(ip, parsed.suffix, parsed.suffix_len, parsed.disk_flags, value, static_cast<uint32_t>(size));
@@ -5628,27 +5945,25 @@ auto append_public_xattr_name(const XfsAttrEntry* entry, void* private_data) -> 
     return 0;
 }
 
-auto list_public_xattrs_locked(XfsInode* ip, char* list, size_t size) -> ssize_t {
+auto list_public_xattrs_locked(const ker::mod::security::Snapshot& credentials, XfsInode* ip, char* list, size_t size) -> ssize_t {
     if (ip == nullptr || size > PUBLIC_XATTR_SIZE_MAX || (size != 0 && list == nullptr)) {
         return -EINVAL;
     }
-    if (int const PERM_RET = ker::vfs::vfs_check_permission(ip->mode, ip->uid, ip->gid, 4); PERM_RET < 0) {
+    if (int const PERM_RET = ker::mod::security::authorize_file_access(credentials, {ip->uid, ip->gid, ip->mode}, 4); PERM_RET < 0) {
         return PERM_RET;
     }
-    auto* task = ker::mod::sched::get_current_task();
-    if (task == nullptr) {
-        return -ESRCH;
-    }
-    PublicXattrListContext context{.list = list, .capacity = size, .used = 0, .privileged = task->euid == 0};
+    PublicXattrListContext context{
+        .list = list, .capacity = size, .used = 0, .privileged = credentials.allows(ker::mod::security::Authority::FILE_OWNER)};
     int const RET = xfs_attr_list(ip, append_public_xattr_name, &context);
     return RET < 0 ? RET : static_cast<ssize_t>(context.used);
 }
 
-auto remove_public_xattr_locked(XfsMountContext* ctx, XfsInode* ip, const PublicXattrName& parsed) -> int {
+auto remove_public_xattr_locked(const ker::mod::security::Snapshot& credentials, XfsMountContext* ctx, XfsInode* ip,
+                                const PublicXattrName& parsed) -> int {
     if (ctx == nullptr || ip == nullptr) {
         return -EINVAL;
     }
-    if (int const PERM_RET = check_public_xattr_permission(ip, parsed.name_space, true); PERM_RET < 0) {
+    if (int const PERM_RET = check_public_xattr_permission(credentials, ip, parsed.name_space, true); PERM_RET < 0) {
         return PERM_RET;
     }
     auto* tp = xfs_trans_alloc(ctx);
@@ -5668,29 +5983,19 @@ auto remove_public_xattr_locked(XfsMountContext* ctx, XfsInode* ip, const Public
 
 }  // namespace
 
-auto xfs_setxattr_path(const char* fs_path, const char* name, const void* value, size_t size, int flags, XfsMountContext* ctx,
-                       size_t known_fs_path_len) -> int {
-    if (fs_path == nullptr || ctx == nullptr) {
-        return -EINVAL;
-    }
-    if (ctx->read_only) {
-        return -EROFS;
-    }
+auto xfs_setxattr_path(const ker::mod::security::Snapshot& credentials, const char* fs_path, const char* name, const void* value,
+                       size_t size, int flags, XfsMountContext* ctx, size_t known_fs_path_len) -> int {
+    if (fs_path == nullptr || ctx == nullptr) return -EINVAL;
+    if (ctx->read_only) return -EROFS;
     PublicXattrName parsed{};
-    if (int const RET = parse_public_xattr_name(name, &parsed); RET < 0) {
-        return RET;
-    }
-    XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());
-    XfsInode* ip = lookup_xattr_path_inode(fs_path, ctx, known_fs_path_len);
-    if (ip == nullptr) {
-        return -ENOENT;
-    }
-    int const RET = set_public_xattr_locked(ctx, ip, parsed, value, size, flags);
-    xfs_inode_release(ip);
-    return RET;
+    if (int const RET = parse_public_xattr_name(name, &parsed); RET < 0) return RET;
+    XfsLookupHandle lookup;
+    int const RET = xfs_acquire_lookup(credentials, fs_path, ctx, &lookup, known_fs_path_len);
+    return RET != 0 ? RET : xfs_setxattr_lookup(credentials, lookup, name, value, size, flags);
 }
 
-auto xfs_fsetxattr(File* f, const char* name, const void* value, size_t size, int flags) -> int {
+auto xfs_fsetxattr(const ker::mod::security::Snapshot& credentials, File* f, const char* name, const void* value, size_t size, int flags)
+    -> int {
     auto* xfd = f != nullptr ? static_cast<XfsFileData*>(f->private_data) : nullptr;
     if (xfd == nullptr || xfd->inode == nullptr || xfd->mount == nullptr) {
         return -EBADF;
@@ -5702,12 +6007,13 @@ auto xfs_fsetxattr(File* f, const char* name, const void* value, size_t size, in
     if (int const RET = parse_public_xattr_name(name, &parsed); RET < 0) {
         return RET;
     }
+    ker::mod::sys::MutexGuard io_guard(xfd->inode->io_lock);
     XfsMetadataGuard metadata_guard(xfd->mount, true, WOS_PERF_CALLSITE());
-    return set_public_xattr_locked(xfd->mount, xfd->inode, parsed, value, size, flags);
+    return set_public_xattr_locked(credentials, xfd->mount, xfd->inode, parsed, value, size, flags);
 }
 
-auto xfs_getxattr_path(const char* fs_path, const char* name, void* value, size_t size, XfsMountContext* ctx, size_t known_fs_path_len)
-    -> ssize_t {
+auto xfs_getxattr_path(const ker::mod::security::Snapshot& credentials, const char* fs_path, const char* name, void* value, size_t size,
+                       XfsMountContext* ctx, size_t known_fs_path_len) -> ssize_t {
     if (fs_path == nullptr || ctx == nullptr) {
         return -EINVAL;
     }
@@ -5720,12 +6026,12 @@ auto xfs_getxattr_path(const char* fs_path, const char* name, void* value, size_
     if (ip == nullptr) {
         return -ENOENT;
     }
-    ssize_t const RET = get_public_xattr_locked(ip, parsed, value, size);
+    ssize_t const RET = get_public_xattr_locked(credentials, ip, parsed, value, size);
     xfs_inode_release(ip);
     return RET;
 }
 
-auto xfs_fgetxattr(File* f, const char* name, void* value, size_t size) -> ssize_t {
+auto xfs_fgetxattr(const ker::mod::security::Snapshot& credentials, File* f, const char* name, void* value, size_t size) -> ssize_t {
     auto* xfd = f != nullptr ? static_cast<XfsFileData*>(f->private_data) : nullptr;
     if (xfd == nullptr || xfd->inode == nullptr || xfd->mount == nullptr) {
         return -EBADF;
@@ -5735,10 +6041,11 @@ auto xfs_fgetxattr(File* f, const char* name, void* value, size_t size) -> ssize
         return RET;
     }
     XfsMetadataGuard metadata_guard(xfd->mount, true, WOS_PERF_CALLSITE());
-    return get_public_xattr_locked(xfd->inode, parsed, value, size);
+    return get_public_xattr_locked(credentials, xfd->inode, parsed, value, size);
 }
 
-auto xfs_listxattr_path(const char* fs_path, char* list, size_t size, XfsMountContext* ctx, size_t known_fs_path_len) -> ssize_t {
+auto xfs_listxattr_path(const ker::mod::security::Snapshot& credentials, const char* fs_path, char* list, size_t size, XfsMountContext* ctx,
+                        size_t known_fs_path_len) -> ssize_t {
     if (fs_path == nullptr || ctx == nullptr) {
         return -EINVAL;
     }
@@ -5747,42 +6054,32 @@ auto xfs_listxattr_path(const char* fs_path, char* list, size_t size, XfsMountCo
     if (ip == nullptr) {
         return -ENOENT;
     }
-    ssize_t const RET = list_public_xattrs_locked(ip, list, size);
+    ssize_t const RET = list_public_xattrs_locked(credentials, ip, list, size);
     xfs_inode_release(ip);
     return RET;
 }
 
-auto xfs_flistxattr(File* f, char* list, size_t size) -> ssize_t {
+auto xfs_flistxattr(const ker::mod::security::Snapshot& credentials, File* f, char* list, size_t size) -> ssize_t {
     auto* xfd = f != nullptr ? static_cast<XfsFileData*>(f->private_data) : nullptr;
     if (xfd == nullptr || xfd->inode == nullptr || xfd->mount == nullptr) {
         return -EBADF;
     }
     XfsMetadataGuard metadata_guard(xfd->mount, true, WOS_PERF_CALLSITE());
-    return list_public_xattrs_locked(xfd->inode, list, size);
+    return list_public_xattrs_locked(credentials, xfd->inode, list, size);
 }
 
-auto xfs_removexattr_path(const char* fs_path, const char* name, XfsMountContext* ctx, size_t known_fs_path_len) -> int {
-    if (fs_path == nullptr || ctx == nullptr) {
-        return -EINVAL;
-    }
-    if (ctx->read_only) {
-        return -EROFS;
-    }
+auto xfs_removexattr_path(const ker::mod::security::Snapshot& credentials, const char* fs_path, const char* name, XfsMountContext* ctx,
+                          size_t known_fs_path_len) -> int {
+    if (fs_path == nullptr || ctx == nullptr) return -EINVAL;
+    if (ctx->read_only) return -EROFS;
     PublicXattrName parsed{};
-    if (int const RET = parse_public_xattr_name(name, &parsed); RET < 0) {
-        return RET;
-    }
-    XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());
-    XfsInode* ip = lookup_xattr_path_inode(fs_path, ctx, known_fs_path_len);
-    if (ip == nullptr) {
-        return -ENOENT;
-    }
-    int const RET = remove_public_xattr_locked(ctx, ip, parsed);
-    xfs_inode_release(ip);
-    return RET;
+    if (int const RET = parse_public_xattr_name(name, &parsed); RET < 0) return RET;
+    XfsLookupHandle lookup;
+    int const RET = xfs_acquire_lookup(credentials, fs_path, ctx, &lookup, known_fs_path_len);
+    return RET != 0 ? RET : xfs_removexattr_lookup(credentials, lookup, name);
 }
 
-auto xfs_fremovexattr(File* f, const char* name) -> int {
+auto xfs_fremovexattr(const ker::mod::security::Snapshot& credentials, File* f, const char* name) -> int {
     auto* xfd = f != nullptr ? static_cast<XfsFileData*>(f->private_data) : nullptr;
     if (xfd == nullptr || xfd->inode == nullptr || xfd->mount == nullptr) {
         return -EBADF;
@@ -5794,11 +6091,116 @@ auto xfs_fremovexattr(File* f, const char* name) -> int {
     if (int const RET = parse_public_xattr_name(name, &parsed); RET < 0) {
         return RET;
     }
+    ker::mod::sys::MutexGuard io_guard(xfd->inode->io_lock);
     XfsMetadataGuard metadata_guard(xfd->mount, true, WOS_PERF_CALLSITE());
-    return remove_public_xattr_locked(xfd->mount, xfd->inode, parsed);
+    return remove_public_xattr_locked(credentials, xfd->mount, xfd->inode, parsed);
 }
 
 #ifdef WOS_SELFTEST
+auto xfs_selftest_open_snapshot_denials() -> bool {
+    auto const bootstrap = ker::mod::security::Snapshot::bootstrap_root();
+    auto caller = bootstrap;
+    if (caller.prepare({.change = ker::mod::security::Change::SET_UID, .real = 1000}, caller) != 0) return false;
+    XfsMountContext mount{};
+    mount.inode_size = 512;
+    mount.feat_incompat = XFS_SB_FEAT_INCOMPAT_FTYPE;
+    mount.root_ino = 100;
+    auto* data = new (std::nothrow) uint8_t[32]{};
+    auto* root = new (std::nothrow) XfsInode{};
+    if (data == nullptr || root == nullptr) {
+        delete[] data;
+        delete root;
+        return false;
+    }
+    root->ino = mount.root_ino;
+    root->mount = &mount;
+    root->mode = 0040755;
+    root->nlink = 2;
+    root->ctime = 123;
+    root->data_fork.format = XFS_DINODE_FMT_LOCAL;
+    root->data_fork.local.data = data;
+    root->data_fork.local.size = xfs_dir2_sf_hdr_size(reinterpret_cast<XfsDir2SfHdr*>(data));
+    root->size = root->data_fork.local.size;
+    if (xfs_inode_cache_new(root) != 0) {
+        delete[] data;
+        delete root;
+        return false;
+    }
+    auto denied = [](File* file, int result, int expected) {
+        if (file != nullptr) {
+            xfs_vfs_close(file);
+            delete file;
+            return false;
+        }
+        return result == expected;
+    };
+    bool ok = true;
+    {
+        XfsLookupHandle missing;
+        XfsLookupHandle directory;
+        ok = xfs_acquire_lookup(ker::mod::security::Snapshot::bootstrap_root(), "missing", &mount, &missing) == 0 &&
+             xfs_acquire_lookup(ker::mod::security::Snapshot::bootstrap_root(), "/", &mount, &directory) == 0;
+        auto const GENERATION = root->dir_generation;
+        auto const SIZE = root->size;
+        int result = 123;
+        File* file = xfs_open_path(caller, "missing", ker::vfs::O_CREAT | 2, 0000, &mount, &result);
+        ok = denied(file, result, -EACCES) && ok;
+        file = xfs_open_lookup(caller, missing, ker::vfs::O_CREAT | 2, 0000, false, &result);
+        ok = denied(file, result, -EACCES) && ok;
+        file = xfs_open_lookup(caller, directory, ker::vfs::O_TRUNC | 1, 0, false, &result);
+        ok = denied(file, result, -EISDIR) && ok;
+        root->mode = 0040700;
+        file = xfs_open_path(caller, "missing", ker::vfs::O_CREAT | 2, 0000, &mount, &result);
+        ok = denied(file, result, -EACCES) && ok;
+        file = xfs_open_lookup(caller, missing, ker::vfs::O_CREAT | 2, 0000, false, &result);
+        ok = denied(file, result, -EACCES) && ok;
+        file = xfs_open_lookup(caller, directory, 0, 0, false, &result);
+        ok = denied(file, result, -EACCES) && ok;
+        ok = !root->dirty && root->ctime == 123 && root->size == SIZE && root->dir_generation == GENERATION && ok;
+        ++root->dir_generation;
+        file = xfs_open_lookup(bootstrap, missing, ker::vfs::O_CREAT | 2, 0000, false, &result);
+        ok = denied(file, result, -EAGAIN) && ok;
+    }
+    xfs_inode_release(root);
+    xfs_icache_purge(&mount);
+    xfs_parent_path_cache_purge_all_for_mount(&mount);
+    xfs_dentry_cache_purge_mount(&mount);
+    xfs_path_inode_cache_bump_generation();
+    return ok;
+}
+
+auto xfs_selftest_xattr_snapshot_denials() -> bool {
+    auto const root = ker::mod::security::Snapshot::bootstrap_root();
+    auto caller = root;
+    if (caller.prepare({.change = ker::mod::security::Change::SET_UID, .real = 1000}, caller) != 0) return false;
+    XfsMountContext mount{};
+    XfsInode inode{};
+    inode.mount = &mount;
+    inode.mode = 0100600;
+    inode.uid = 0;
+    inode.gid = 0;
+    inode.ctime = 123;
+    XfsFileData data{};
+    data.inode = &inode;
+    data.mount = &mount;
+    File file{};
+    file.private_data = &data;
+    std::array<char, 64> output{};
+    output.fill('!');
+    bool const DENIED = xfs_fsetxattr(caller, &file, "user.denied", "x", 1, 0) == -EACCES &&
+                        xfs_fremovexattr(caller, &file, "user.denied") == -EACCES &&
+                        xfs_fgetxattr(caller, &file, "user.denied", output.data(), output.size()) == -EACCES &&
+                        xfs_flistxattr(caller, &file, output.data(), output.size()) == -EACCES;
+    bool const PRIVILEGED_DENIED = xfs_fsetxattr(caller, &file, "trusted.denied", "x", 1, 0) == -EPERM &&
+                                   xfs_fgetxattr(caller, &file, "security.denied", output.data(), output.size()) == -EPERM;
+    bool const UNCHANGED = !inode.dirty && !inode.has_attr_fork && inode.ctime == 123 &&
+                           std::all_of(output.begin(), output.end(), [](char value) { return value == '!'; });
+    bool const ROOT_READS = xfs_fgetxattr(root, &file, "user.missing", output.data(), output.size()) == XATTR_MISSING &&
+                            xfs_flistxattr(root, &file, output.data(), output.size()) == 0;
+    file.private_data = nullptr;
+    return DENIED && PRIVILEGED_DENIED && UNCHANGED && ROOT_READS;
+}
+
 auto xfs_selftest_attr_fork_format(const char* fs_path, XfsMountContext* ctx, uint8_t* format, uint16_t* extent_count) -> bool {
     if (fs_path == nullptr || ctx == nullptr || format == nullptr || extent_count == nullptr) {
         return false;
@@ -6013,117 +6415,121 @@ auto xfs_statvfs(XfsMountContext* ctx, ker::vfs::Statvfs* buf) -> int {
     return 0;
 }
 
+auto xfs_search_authority_generation() -> uint64_t { return xfs_search_authority_generation_value.load(std::memory_order_acquire); }
+
 // ============================================================================
 // chmod
 // ============================================================================
 
-auto xfs_chmod_path(const char* fs_path, int mode, XfsMountContext* ctx, ker::vfs::Stat* statbuf, size_t known_fs_path_len) -> int {
-    if (fs_path == nullptr || ctx == nullptr) {
-        return -EINVAL;
+namespace {
+// Caller holds inode io_lock followed by mount metadata_lock. Deep transaction
+// undo may replace fork allocations, so exclude readers as well as mutators.
+auto commit_file_identity_locked(XfsInode* ip, const ker::mod::security::FileIdentity& prepared, Stat* statbuf) -> int {
+    auto* tp = xfs_trans_alloc(ip->mount);
+    if (tp == nullptr) return -ENOMEM;
+    int const CAPTURE = xfs_trans_capture_inode(tp, ip);
+    if (CAPTURE != 0) {
+        xfs_trans_cancel(tp);
+        return CAPTURE;
     }
-    if (ctx->read_only) {
-        return -EROFS;
-    }
-
-    XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());
-    XfsInode* ip = nullptr;
-    int const LOOKUP_RET = xfs_lookup_with_cached_parent(fs_path, ctx, &ip, known_fs_path_len);
-    if (LOOKUP_RET == -EAGAIN || LOOKUP_RET == -EINVAL) {
-        ip = walk_path(ctx, fs_path);
-    }
-    if (ip == nullptr) {
-        return -ENOENT;
-    }
-    if (LOOKUP_RET != 0) {
-        xfs_parent_path_cache_store_directory(ctx, fs_path, known_fs_path_len, ip);
-    }
-
-    static constexpr uint16_t XFS_IFMT = 0xF000;
-    static constexpr uint16_t XFS_PERM_MASK = 07777;
-    ip->mode = (ip->mode & XFS_IFMT) | (static_cast<uint16_t>(mode) & XFS_PERM_MASK);
+    bool const SEARCH_AUTHORITY_CHANGED =
+        xfs_inode_isdir(ip) && (ip->mode != prepared.mode || ip->uid != prepared.uid || ip->gid != prepared.gid);
+    ip->mode = static_cast<uint16_t>(prepared.mode);
+    ip->uid = prepared.uid;
+    ip->gid = prepared.gid;
+    ip->ctime = xfs_current_timestamp(ip);
     ip->dirty = true;
-
-    auto* tp = xfs_trans_alloc(ctx);
-    if (tp == nullptr) {
-        xfs_inode_release(ip);
-        return -ENOMEM;
-    }
     xfs_trans_log_inode(tp, ip);
     int const RET = xfs_trans_commit(tp);
-    if (RET == 0 && statbuf != nullptr) {
-        fill_stat(ip, statbuf);
-    }
-    xfs_inode_release(ip);
-    return (RET == 0) ? 0 : -EIO;
+    // Failed commits restore inode authority. On success invalidate searched
+    // ancestors before metadata_lock publishes the change, even when the
+    // retained VFS lookup selected its final object on another mount.
+    if (RET == 0 && SEARCH_AUTHORITY_CHANGED) xfs_search_authority_generation_value.fetch_add(1, std::memory_order_release);
+    if (RET == 0 && statbuf != nullptr) fill_stat(ip, statbuf);
+    return RET == 0 ? 0 : -EIO;
 }
 
-auto xfs_fchmod(File* f, int mode, ker::vfs::Stat* statbuf) -> int {
-    if (f == nullptr) {
-        return -EBADF;
-    }
+auto chmod_inode_locked(XfsInode* ip, const ker::mod::security::Snapshot& credentials, int mode, Stat* statbuf) -> int {
+    ker::mod::security::FileIdentity prepared;
+    int const RET =
+        ker::mod::security::prepare_file_chmod(credentials, {ip->uid, ip->gid, ip->mode}, static_cast<uint32_t>(mode), prepared);
+    return RET != 0 ? RET : commit_file_identity_locked(ip, prepared, statbuf);
+}
+
+auto chown_inode_locked(XfsInode* ip, const ker::mod::security::Snapshot& credentials, uint32_t uid, uint32_t gid, Stat* statbuf) -> int {
+    ker::mod::security::FileIdentity prepared;
+    int const RET = ker::mod::security::prepare_file_chown(credentials, {ip->uid, ip->gid, ip->mode}, uid, gid, prepared);
+    return RET != 0 ? RET : commit_file_identity_locked(ip, prepared, statbuf);
+}
+}  // namespace
+
+auto xfs_chmod_path(const char* fs_path, const ker::mod::security::Snapshot& credentials, int mode, XfsMountContext* ctx, Stat* statbuf,
+                    size_t known_fs_path_len) -> int {
+    if (fs_path == nullptr || ctx == nullptr) return -EINVAL;
+    if (ctx->read_only) return -EROFS;
+    XfsLookupHandle lookup;
+    int const RET = xfs_acquire_lookup(credentials, fs_path, ctx, &lookup, known_fs_path_len);
+    return RET != 0 ? RET : xfs_chmod_lookup(lookup, credentials, mode, statbuf);
+}
+
+auto xfs_chown_path(const char* fs_path, const ker::mod::security::Snapshot& credentials, uint32_t uid, uint32_t gid, XfsMountContext* ctx,
+                    Stat* statbuf, size_t known_fs_path_len) -> int {
+    if (fs_path == nullptr || ctx == nullptr) return -EINVAL;
+    if (ctx->read_only) return -EROFS;
+    XfsLookupHandle lookup;
+    int const RET = xfs_acquire_lookup(credentials, fs_path, ctx, &lookup, known_fs_path_len);
+    return RET != 0 ? RET : xfs_chown_lookup(lookup, credentials, uid, gid, statbuf);
+}
+
+auto xfs_fchmod(File* f, const ker::mod::security::Snapshot& credentials, int mode, Stat* statbuf) -> int {
+    if (f == nullptr) return -EBADF;
     auto* xfd = static_cast<XfsFileData*>(f->private_data);
-    if (xfd == nullptr || xfd->inode == nullptr || xfd->mount == nullptr) {
-        return -EBADF;
-    }
-    if (xfd->mount->read_only) {
-        return -EROFS;
-    }
-
+    if (xfd == nullptr || xfd->inode == nullptr || xfd->mount == nullptr) return -EBADF;
+    if (xfd->mount->read_only) return -EROFS;
+    ker::mod::sys::MutexGuard io_guard(xfd->inode->io_lock);
     XfsMetadataGuard metadata_guard(xfd->mount, true, WOS_PERF_CALLSITE());
-    static constexpr uint16_t XFS_IFMT = 0xF000;
-    static constexpr uint16_t XFS_PERM_MASK = 07777;
-    auto* ip = xfd->inode;
-    ip->mode = (ip->mode & XFS_IFMT) | (static_cast<uint16_t>(mode) & XFS_PERM_MASK);
-    ip->dirty = true;
+    return chmod_inode_locked(xfd->inode, credentials, mode, statbuf);
+}
 
-    auto* tp = xfs_trans_alloc(xfd->mount);
-    if (tp == nullptr) {
-        return -ENOMEM;
-    }
-    xfs_trans_log_inode(tp, ip);
-    int const RET = xfs_trans_commit(tp);
-    if (RET == 0 && statbuf != nullptr) {
-        fill_stat(ip, statbuf);
-    }
-    return (RET == 0) ? 0 : -EIO;
+auto xfs_fchown(File* f, const ker::mod::security::Snapshot& credentials, uint32_t uid, uint32_t gid, Stat* statbuf) -> int {
+    if (f == nullptr) return -EBADF;
+    auto* xfd = static_cast<XfsFileData*>(f->private_data);
+    if (xfd == nullptr || xfd->inode == nullptr || xfd->mount == nullptr) return -EBADF;
+    if (xfd->mount->read_only) return -EROFS;
+    ker::mod::sys::MutexGuard io_guard(xfd->inode->io_lock);
+    XfsMetadataGuard metadata_guard(xfd->mount, true, WOS_PERF_CALLSITE());
+    return chown_inode_locked(xfd->inode, credentials, uid, gid, statbuf);
 }
 
 namespace {
 
-auto xfs_set_inode_times(XfsMountContext* ctx, XfsInode* ip, const Timespec& atime, const Timespec& mtime, bool set_atime, bool set_mtime,
-                         ker::vfs::Stat* statbuf) -> int {
-    if (ctx == nullptr || ip == nullptr) {
-        return -EINVAL;
-    }
-    if (!set_atime && !set_mtime) {
+auto xfs_set_inode_times(XfsMountContext* ctx, XfsInode* ip, const ker::mod::security::Snapshot& credentials, const TimestampUpdate& times,
+                         Stat* statbuf) -> int {
+    if (ctx == nullptr || ip == nullptr) return -EINVAL;
+    int const POLICY = ker::mod::security::authorize_file_timestamps(credentials, {ip->uid, ip->gid, ip->mode}, times.intent());
+    if (POLICY != 0) return POLICY;
+    if (!times.changed()) {
+        if (statbuf != nullptr) fill_stat(ip, statbuf);
         return 0;
     }
-
     bool const BIGTIME = (ip->flags2 & XFS_DIFLAG2_BIGTIME) != 0;
     uint64_t encoded_atime = 0;
     uint64_t encoded_mtime = 0;
-    if (set_atime) {
-        if (int const RET = xfs_encode_timespec_timestamp(atime, BIGTIME, &encoded_atime); RET < 0) {
-            return RET;
-        }
+    if (times.set_atime()) {
+        if (int const RET = xfs_encode_timespec_timestamp(times.atime(), BIGTIME, &encoded_atime); RET < 0) return RET;
     }
-    if (set_mtime) {
-        if (int const RET = xfs_encode_timespec_timestamp(mtime, BIGTIME, &encoded_mtime); RET < 0) {
-            return RET;
-        }
+    if (times.set_mtime()) {
+        if (int const RET = xfs_encode_timespec_timestamp(times.mtime(), BIGTIME, &encoded_mtime); RET < 0) return RET;
     }
-
     auto* tp = xfs_trans_alloc(ctx);
-    if (tp == nullptr) {
-        return -ENOMEM;
+    if (tp == nullptr) return -ENOMEM;
+    int const CAPTURE = xfs_trans_capture_inode(tp, ip);
+    if (CAPTURE != 0) {
+        xfs_trans_cancel(tp);
+        return CAPTURE;
     }
-
-    if (set_atime) {
-        ip->atime = encoded_atime;
-    }
-    if (set_mtime) {
-        ip->mtime = encoded_mtime;
-    }
+    if (times.set_atime()) ip->atime = encoded_atime;
+    if (times.set_mtime()) ip->mtime = encoded_mtime;
     ip->ctime = xfs_current_timestamp(ip);
     ip->dirty = true;
     if (!xfs_inode_isdir(ip) && xfs_inode_has_eof_prealloc(ip)) {
@@ -6133,66 +6539,39 @@ auto xfs_set_inode_times(XfsMountContext* ctx, XfsInode* ip, const Timespec& ati
             return TRIM_RET;
         }
     }
-
     xfs_trans_log_inode(tp, ip);
     int const RET = xfs_trans_commit(tp);
-    if (RET == 0 && statbuf != nullptr) {
-        fill_stat(ip, statbuf);
-    }
-    return (RET == 0) ? 0 : -EIO;
+    if (RET == 0 && statbuf != nullptr) fill_stat(ip, statbuf);
+    return RET == 0 ? 0 : -EIO;
 }
 
 }  // namespace
 
-auto xfs_set_times_path(const char* fs_path, const Timespec& atime, const Timespec& mtime, bool set_atime, bool set_mtime,
-                        XfsMountContext* ctx, ker::vfs::Stat* statbuf, size_t known_fs_path_len) -> int {
-    if (fs_path == nullptr || ctx == nullptr) {
-        return -EINVAL;
-    }
-    if (ctx->read_only) {
-        return -EROFS;
-    }
-
-    XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());
-    XfsInode* ip = nullptr;
-    int const LOOKUP_RET = xfs_lookup_with_cached_parent(fs_path, ctx, &ip, known_fs_path_len);
-    if (LOOKUP_RET == -EAGAIN || LOOKUP_RET == -EINVAL) {
-        ip = walk_path(ctx, fs_path);
-    }
-    if (ip == nullptr) {
-        return -ENOENT;
-    }
-    if (LOOKUP_RET != 0) {
-        xfs_parent_path_cache_store_directory(ctx, fs_path, known_fs_path_len, ip);
-    }
-
-    int const RET = xfs_set_inode_times(ctx, ip, atime, mtime, set_atime, set_mtime, statbuf);
-    xfs_inode_release(ip);
-    return RET;
+auto xfs_set_times_path(const char* fs_path, const ker::mod::security::Snapshot& credentials, const TimestampUpdate& times,
+                        XfsMountContext* ctx, Stat* statbuf, size_t known_fs_path_len) -> int {
+    if (fs_path == nullptr || ctx == nullptr) return -EINVAL;
+    if (ctx->read_only) return -EROFS;
+    XfsLookupHandle lookup;
+    int const RET = xfs_acquire_lookup(credentials, fs_path, ctx, &lookup, known_fs_path_len);
+    return RET != 0 ? RET : xfs_utimens_lookup(lookup, credentials, times, statbuf);
 }
 
-auto xfs_set_times_file(File* f, const Timespec& atime, const Timespec& mtime, bool set_atime, bool set_mtime, ker::vfs::Stat* statbuf)
-    -> int {
-    if (f == nullptr) {
-        return -EBADF;
-    }
+auto xfs_set_times_file(File* f, const ker::mod::security::Snapshot& credentials, const TimestampUpdate& times, Stat* statbuf) -> int {
+    if (f == nullptr) return -EBADF;
     auto* xfd = static_cast<XfsFileData*>(f->private_data);
-    if (xfd == nullptr || xfd->inode == nullptr || xfd->mount == nullptr) {
-        return -EBADF;
-    }
-    if (xfd->mount->read_only) {
-        return -EROFS;
-    }
-
+    if (xfd == nullptr || xfd->inode == nullptr || xfd->mount == nullptr) return -EBADF;
+    if (xfd->mount->read_only) return -EROFS;
+    ker::mod::sys::MutexGuard io_guard(xfd->inode->io_lock);
     XfsMetadataGuard metadata_guard(xfd->mount, true, WOS_PERF_CALLSITE());
-    return xfs_set_inode_times(xfd->mount, xfd->inode, atime, mtime, set_atime, set_mtime, statbuf);
+    return xfs_set_inode_times(xfd->mount, xfd->inode, credentials, times, statbuf);
 }
 
 // ============================================================================
 // Mkdir
 // ============================================================================
 
-auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx, ker::vfs::Stat* statbuf, size_t known_fs_path_len) -> int {
+auto xfs_mkdir_path(const ker::mod::security::Snapshot& credentials, const char* fs_path, int mode, XfsMountContext* ctx,
+                    ker::vfs::Stat* statbuf, size_t known_fs_path_len) -> int {
     if (fs_path == nullptr || ctx == nullptr) {
         return -EINVAL;
     }
@@ -6224,6 +6603,13 @@ auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx, ker::vf
         return parent_ret;
     }
 
+    ker::mod::security::FileIdentity identity{};
+    int const AUTH = ker::mod::security::prepare_directory_create(credentials, {parent_ip->uid, parent_ip->gid, parent_ip->mode},
+                                                                  static_cast<uint32_t>(mode), identity);
+    if (AUTH != 0) {
+        xfs_inode_release(parent_ip);
+        return AUTH;
+    }
     XfsDirEntry existing{};
     int const LOOKUP_RET = xfs_dir_lookup(parent_ip, dirname, dirname_len, &existing);
     if (LOOKUP_RET == 0) {
@@ -6249,8 +6635,7 @@ auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx, ker::vf
     // Save before parent_ip is released
     xfs_ino_t const PARENT_INO = parent_ip->ino;
 
-    int const DIR_MODE = (mode == 0) ? 0755 : mode;
-    uint16_t const INODE_MODE = static_cast<uint16_t>(DIR_MODE & 0xFFF) | 0040000;  // S_IFDIR
+    uint16_t const INODE_MODE = static_cast<uint16_t>(identity.mode);
     bool const USE_I8 = (PARENT_INO > 0xFFFFFFFFULL);
     size_t const INO_BYTES = USE_I8 ? 8 : 4;
     size_t const SF_SIZE = 2 + INO_BYTES;
@@ -6308,6 +6693,8 @@ auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx, ker::vf
     new_inode->agno = xfs_ino_ag(NEW_INO, ctx->agino_log);
     new_inode->agino = xfs_ag_ino(NEW_INO, ctx->agino_log);
     new_inode->mode = INODE_MODE;
+    new_inode->uid = identity.uid;
+    new_inode->gid = identity.gid;
     new_inode->size = SF_SIZE;
     new_inode->nlink = 2;  // . and parent ref
     new_inode->data_fork.format = XFS_DINODE_FMT_LOCAL;
@@ -6393,8 +6780,8 @@ auto scan_indexed_directory_entries(const XfsDirEntry* entry, void* ctx) -> int 
 
 }  // anonymous namespace
 
-auto xfs_symlink_path(const char* target, const char* fs_path, XfsMountContext* ctx, ker::vfs::Stat* statbuf, size_t known_fs_path_len)
-    -> int {
+auto xfs_symlink_path(const ker::mod::security::Snapshot& credentials, const char* target, const char* fs_path, XfsMountContext* ctx,
+                      ker::vfs::Stat* statbuf, size_t known_fs_path_len) -> int {
     if (target == nullptr || fs_path == nullptr || ctx == nullptr) {
         return -EINVAL;
     }
@@ -6425,6 +6812,12 @@ auto xfs_symlink_path(const char* target, const char* fs_path, XfsMountContext* 
         return rc;
     }
 
+    ker::mod::security::FileIdentity identity{};
+    rc = ker::mod::security::prepare_symlink_create(credentials, {parent_ip->uid, parent_ip->gid, parent_ip->mode}, identity);
+    if (rc != 0) {
+        xfs_inode_release(parent_ip);
+        return rc;
+    }
     XfsDirEntry existing{};
     rc = xfs_dir_lookup(parent_ip, name, namelen, &existing);
     if (rc == 0) {
@@ -6478,6 +6871,8 @@ auto xfs_symlink_path(const char* target, const char* fs_path, XfsMountContext* 
     new_inode->agno = xfs_ino_ag(NEW_INO, ctx->agino_log);
     new_inode->agino = xfs_ag_ino(NEW_INO, ctx->agino_log);
     new_inode->mode = SYMLINK_MODE;
+    new_inode->uid = identity.uid;
+    new_inode->gid = identity.gid;
     new_inode->size = target_len;
     new_inode->nlink = 1;
     new_inode->data_fork.format = XFS_DINODE_FMT_LOCAL;
@@ -6518,7 +6913,8 @@ auto xfs_symlink_path(const char* target, const char* fs_path, XfsMountContext* 
     return 0;
 }
 
-auto xfs_rmdir_path(const char* fs_path, XfsMountContext* ctx, size_t known_fs_path_len) -> int {
+auto xfs_rmdir_path(const ker::mod::security::Snapshot& credentials, const char* fs_path, XfsMountContext* ctx, size_t known_fs_path_len)
+    -> int {
     if (fs_path == nullptr || ctx == nullptr) {
         return -EINVAL;
     }
@@ -6552,6 +6948,14 @@ auto xfs_rmdir_path(const char* fs_path, XfsMountContext* ctx, size_t known_fs_p
     if (dir_ip == nullptr) {
         xfs_inode_release(parent_ip);
         return -ENOENT;
+    }
+
+    rc = ker::mod::security::authorize_file_removal(credentials, {parent_ip->uid, parent_ip->gid, parent_ip->mode},
+                                                    {dir_ip->uid, dir_ip->gid, dir_ip->mode});
+    if (rc != 0) {
+        xfs_inode_release(dir_ip);
+        xfs_inode_release(parent_ip);
+        return rc;
     }
 
     RmdirDirectoryScan scan{.directory = dir_ip};
@@ -6612,8 +7016,8 @@ auto xfs_rmdir_path(const char* fs_path, XfsMountContext* ctx, size_t known_fs_p
 // Link
 // ============================================================================
 
-auto xfs_link_path(const char* old_fs_path, const char* new_fs_path, XfsMountContext* ctx, ker::vfs::Stat* statbuf,
-                   size_t known_old_fs_path_len, size_t known_new_fs_path_len) -> int {
+auto xfs_link_path(const ker::mod::security::Snapshot& credentials, const char* old_fs_path, const char* new_fs_path, XfsMountContext* ctx,
+                   ker::vfs::Stat* statbuf, size_t known_old_fs_path_len, size_t known_new_fs_path_len) -> int {
     if (old_fs_path == nullptr || new_fs_path == nullptr || ctx == nullptr) {
         return -EINVAL;
     }
@@ -6636,6 +7040,12 @@ auto xfs_link_path(const char* old_fs_path, const char* new_fs_path, XfsMountCon
         return rc;
     }
 
+    ker::mod::security::FileIdentity const SOURCE_PARENT{old_parent->uid, old_parent->gid, old_parent->mode};
+    rc = ker::mod::security::authorize_file_access(credentials, SOURCE_PARENT, 1);
+    if (rc != 0) {
+        xfs_inode_release(old_parent);
+        return rc;
+    }
     XfsDirEntry old_de{};
     rc = xfs_dir_lookup(old_parent, old_name, old_namelen, &old_de);
     xfs_inode_release(old_parent);
@@ -6671,6 +7081,13 @@ auto xfs_link_path(const char* old_fs_path, const char* new_fs_path, XfsMountCon
         return rc;
     }
 
+    rc = ker::mod::security::authorize_file_link(credentials, SOURCE_PARENT, {new_parent->uid, new_parent->gid, new_parent->mode},
+                                                 {source_ip->uid, source_ip->gid, source_ip->mode});
+    if (rc != 0) {
+        xfs_inode_release(new_parent);
+        xfs_inode_release(source_ip);
+        return rc;
+    }
     XfsDirEntry existing{};
     rc = xfs_dir_lookup(new_parent, new_name, new_namelen, &existing);
     if (rc == 0) {
@@ -6733,189 +7150,50 @@ auto xfs_link_path(const char* old_fs_path, const char* new_fs_path, XfsMountCon
 // Rename
 // ============================================================================
 
-auto xfs_rename_path(const char* old_fs_path, const char* new_fs_path, XfsMountContext* ctx, ker::vfs::Stat* statbuf,
-                     size_t known_old_fs_path_len, size_t known_new_fs_path_len) -> int {
-    if (old_fs_path == nullptr || new_fs_path == nullptr || ctx == nullptr) {
-        return -EINVAL;
-    }
-    if (ctx->read_only) {
-        return -EROFS;
-    }
-
-    XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());
-
-    XfsInode* old_parent = nullptr;
-    const char* old_name = nullptr;
-    uint16_t old_namelen = 0;
-    size_t old_fs_path_len = UNKNOWN_XFS_PATH_LEN;
-    int rc = xfs_find_parent_and_name(old_fs_path, ctx, &old_parent, &old_name, &old_namelen, nullptr, true, known_old_fs_path_len,
-                                      &old_fs_path_len);
-    if (rc != 0) {
-        return rc;
-    }
-
-    XfsDirEntry old_de{};
-    rc = xfs_dir_lookup(old_parent, old_name, old_namelen, &old_de);
-    if (rc != 0) {
-        xfs_inode_release(old_parent);
-        return rc;
-    }
-    bool purge_parent_path_cache = xfs_dentry_type_may_be_directory(old_de.ftype);
-    XfsInode* moved_inode = nullptr;
-    if (statbuf != nullptr) {
-        moved_inode = xfs_inode_read_known_allocated(ctx, old_de.ino);
-        if (moved_inode == nullptr) {
-            xfs_inode_release(old_parent);
-            return -ENOENT;
-        }
-    }
-
-    XfsInode* new_parent = nullptr;
-    const char* new_name = nullptr;
-    uint16_t new_namelen = 0;
-    size_t new_fs_path_len = UNKNOWN_XFS_PATH_LEN;
-    rc = xfs_find_parent_and_name(new_fs_path, ctx, &new_parent, &new_name, &new_namelen, nullptr, true, known_new_fs_path_len,
-                                  &new_fs_path_len);
-    if (rc != 0) {
-        if (moved_inode != nullptr) {
-            xfs_inode_release(moved_inode);
-        }
-        xfs_inode_release(old_parent);
-        return rc;
-    }
-
-    XfsDirEntry new_de{};
-    int const NEW_LOOKUP_RC = xfs_dir_lookup(new_parent, new_name, new_namelen, &new_de);
-    if (NEW_LOOKUP_RC == 0 && new_de.ino == old_de.ino) {
-        if (statbuf != nullptr) {
-            fill_stat(moved_inode, statbuf);
-            xfs_inode_release_metadata_locked(moved_inode);
-        }
-        xfs_inode_release_metadata_locked(new_parent);
-        xfs_inode_release_metadata_locked(old_parent);
+auto xfs_rename_path(const ker::mod::security::Snapshot& credentials, const char* old_fs_path, const char* new_fs_path,
+                     XfsMountContext* ctx, Stat* statbuf, size_t known_old_fs_path_len, size_t known_new_fs_path_len,
+                     bool source_requires_directory, bool destination_requires_directory, bool* namespace_changed,
+                     bool* displaced_hardlink_count_changed) -> int {
+    if (old_fs_path == nullptr || new_fs_path == nullptr || ctx == nullptr) return -EINVAL;
+    if (ctx->read_only) return -EROFS;
+    std::array<char, XFS_LOOKUP_PATH_CAPACITY> old_path{}, new_path{};
+    auto copy = [](const char* input, size_t known_length, auto& output, bool& requires_directory) -> int {
+        size_t length = known_length == UNKNOWN_XFS_PATH_LEN ? std::strlen(input) : known_length;
+        if (length >= output.size()) return -ENAMETOOLONG;
+        requires_directory = requires_directory || (length > 1 && input[length - 1] == '/');
+        while (length > 1 && input[length - 1] == '/') --length;
+        size_t start = length;
+        while (start > 0 && input[start - 1] != '/') --start;
+        if ((length - start == 1 && input[start] == '.') || (length - start == 2 && input[start] == '.' && input[start + 1] == '.'))
+            return -EINVAL;
+        std::memcpy(output.data(), input, length);
+        output[length] = '\0';
         return 0;
+    };
+    int rc = copy(old_fs_path, known_old_fs_path_len, old_path, source_requires_directory);
+    if (rc != 0) return rc;
+    rc = copy(new_fs_path, known_new_fs_path_len, new_path, destination_requires_directory);
+    if (rc != 0) return rc;
+    // Acquisition and consumption each take metadata_lock; retained inodes
+    // bridge those scopes and pair validation rejects intervening mutation.
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        XfsLookupHandle source{}, destination{};
+        rc = xfs_acquire_lookup(credentials, old_path.data(), ctx, &source);
+        if (rc == 0) rc = xfs_acquire_lookup(credentials, new_path.data(), ctx, &destination);
+        if (rc == 0)
+            rc = xfs_rename_lookup(credentials, source, destination, statbuf, source_requires_directory, destination_requires_directory,
+                                   namespace_changed, displaced_hardlink_count_changed);
+        if (rc != -EAGAIN) return rc;
     }
-
-    XfsTransaction* tp = xfs_trans_alloc(ctx);
-    if (tp == nullptr) {
-        if (moved_inode != nullptr) {
-            xfs_inode_release(moved_inode);
-        }
-        xfs_inode_release(new_parent);
-        xfs_inode_release(old_parent);
-        return -ENOMEM;
-    }
-
-    // If destination exists, remove it first. Keep the displaced inode
-    // referenced until the transaction no longer points at it.
-    XfsInode* displaced = nullptr;
-    if (NEW_LOOKUP_RC == 0) {
-        purge_parent_path_cache = purge_parent_path_cache || xfs_dentry_type_may_be_directory(new_de.ftype);
-        displaced = xfs_inode_read_known_allocated(ctx, new_de.ino);
-        if (displaced == nullptr) {
-            xfs_trans_cancel(tp);
-            if (moved_inode != nullptr) {
-                xfs_inode_release(moved_inode);
-            }
-            xfs_inode_release(new_parent);
-            xfs_inode_release(old_parent);
-            return -ENOENT;
-        }
-        rc = xfs_trans_capture_inode(tp, displaced);
-        if (rc != 0) {
-            xfs_trans_cancel(tp);
-            xfs_inode_release(displaced);
-            if (moved_inode != nullptr) {
-                xfs_inode_release(moved_inode);
-            }
-            xfs_inode_release(new_parent);
-            xfs_inode_release(old_parent);
-            return rc;
-        }
-        rc = xfs_dir_removename(new_parent, new_name, new_namelen, tp, new_de.ino);
-        if (rc != 0) {
-            xfs_trans_cancel(tp);
-            xfs_inode_release(displaced);
-            if (moved_inode != nullptr) {
-                xfs_inode_release(moved_inode);
-            }
-            xfs_inode_release(new_parent);
-            xfs_inode_release(old_parent);
-            return rc;
-        }
-        // Decrement nlink on the displaced inode
-        if (displaced->nlink > 0) {
-            displaced->nlink--;
-        }
-        displaced->dirty = true;
-        xfs_trans_log_inode(tp, displaced);
-    }
-
-    // Add entry at new location
-    rc = xfs_dir_addname(new_parent, new_name, new_namelen, old_de.ino, old_de.ftype, tp);
-    if (rc != 0) {
-        xfs_trans_cancel(tp);
-        if (displaced != nullptr) {
-            xfs_inode_release(displaced);
-        }
-        if (moved_inode != nullptr) {
-            xfs_inode_release(moved_inode);
-        }
-        xfs_inode_release(new_parent);
-        xfs_inode_release(old_parent);
-        return rc;
-    }
-
-    // Remove old entry
-    rc = xfs_dir_removename(old_parent, old_name, old_namelen, tp, old_de.ino);
-    if (rc != 0) {
-        xfs_trans_cancel(tp);
-        if (displaced != nullptr) {
-            xfs_inode_release(displaced);
-        }
-        if (moved_inode != nullptr) {
-            xfs_inode_release(moved_inode);
-        }
-        xfs_inode_release(new_parent);
-        xfs_inode_release(old_parent);
-        return rc;
-    }
-
-    old_parent->dirty = true;
-    new_parent->dirty = true;
-    xfs_trans_log_inode(tp, old_parent);
-    xfs_trans_log_inode(tp, new_parent);
-
-    rc = xfs_trans_commit(tp);
-    if (rc == 0) {
-        if (purge_parent_path_cache) {
-            xfs_path_inode_cache_bump_generation();
-            xfs_parent_path_cache_purge_all_for_mount(ctx);
-        } else {
-            xfs_path_inode_cache_invalidate_path(ctx, old_fs_path, old_fs_path_len);
-            xfs_path_inode_cache_invalidate_path(ctx, new_fs_path, new_fs_path_len);
-            xfs_path_inode_cache_store(ctx, new_fs_path, new_fs_path_len, old_de.ino, old_de.ftype);
-        }
-    }
-    if (rc == 0 && statbuf != nullptr && moved_inode != nullptr) {
-        fill_stat(moved_inode, statbuf);
-    }
-    if (displaced != nullptr) {
-        xfs_inode_release_metadata_locked(displaced);
-    }
-    if (moved_inode != nullptr) {
-        xfs_inode_release_metadata_locked(moved_inode);
-    }
-    xfs_inode_release_metadata_locked(new_parent);
-    xfs_inode_release_metadata_locked(old_parent);
-    return (rc == 0) ? 0 : -EIO;
+    return -EAGAIN;
 }
 
 // ============================================================================
 // Unlink / remove
 // ============================================================================
 
-auto xfs_unlink_path(const char* fs_path, XfsMountContext* ctx, size_t known_fs_path_len) -> int {
+auto xfs_unlink_path(const ker::mod::security::Snapshot& credentials, const char* fs_path, XfsMountContext* ctx, size_t known_fs_path_len)
+    -> int {
     if (fs_path == nullptr || ctx == nullptr) {
         return -EINVAL;
     }
@@ -6948,20 +7226,24 @@ auto xfs_unlink_path(const char* fs_path, XfsMountContext* ctx, size_t known_fs_
         return -EISDIR;
     }
 
-    // Create transaction for removal
-    XfsTransaction* tp = xfs_trans_alloc(ctx);
-    if (tp == nullptr) {
-        xfs_inode_release(parent_ip);
-        return -ENOMEM;
-    }
-
-    // Keep the inode alive and snapshot its link count before removing the
-    // namespace entry. A later failure must restore both as one transaction.
+    // Retain and authorize the exact inode before starting a removal transaction.
     XfsInode* target_ip = xfs_inode_read_known_allocated(ctx, de.ino);
     if (target_ip == nullptr) {
-        xfs_trans_cancel(tp);
         xfs_inode_release(parent_ip);
         return -ENOENT;
+    }
+    rc = ker::mod::security::authorize_file_removal(credentials, {parent_ip->uid, parent_ip->gid, parent_ip->mode},
+                                                    {target_ip->uid, target_ip->gid, target_ip->mode});
+    if (rc != 0) {
+        xfs_inode_release(target_ip);
+        xfs_inode_release(parent_ip);
+        return rc;
+    }
+    XfsTransaction* tp = xfs_trans_alloc(ctx);
+    if (tp == nullptr) {
+        xfs_inode_release(target_ip);
+        xfs_inode_release(parent_ip);
+        return -ENOMEM;
     }
     rc = xfs_trans_capture_inode(tp, target_ip);
     if (rc != 0) {
@@ -7035,20 +7317,35 @@ void xfs_invalidate_lookup_path(const XfsLookupHandle& handle) {
 
 }  // namespace
 
-auto xfs_open_lookup(const XfsLookupHandle& handle, int flags, int mode, bool require_directory, int* result_out) -> File* {
+auto xfs_open_lookup(const ker::mod::security::Snapshot& credentials, const XfsLookupHandle& handle, int flags, int mode,
+                     bool require_directory, int* result_out) -> File* {
     XfsMountContext* const MOUNT = handle.mount();
     if (MOUNT == nullptr) {
         xfs_set_open_result(result_out, -EINVAL);
         return nullptr;
     }
 
+    if ((flags & 3) == 3 || (flags & (ker::vfs::O_DIRECTORY | ker::vfs::O_CREAT)) == (ker::vfs::O_DIRECTORY | ker::vfs::O_CREAT)) {
+        xfs_set_open_result(result_out, -EINVAL);
+        return nullptr;
+    }
+    require_directory = require_directory || (flags & ker::vfs::O_DIRECTORY) != 0;
     XfsMetadataGuard metadata_guard(MOUNT, true, WOS_PERF_CALLSITE());
+    XfsOpenStorage storage;
     int const VALIDATE_RET = xfs_validate_lookup_locked(handle);
     if (VALIDATE_RET != 0) {
         xfs_set_open_result(result_out, VALIDATE_RET);
         return nullptr;
     }
 
+    if (!handle.root_target()) {
+        auto* parent = handle.parent();
+        int const SEARCH = ker::mod::security::authorize_file_access(credentials, {parent->uid, parent->gid, parent->mode}, 1);
+        if (SEARCH != 0) {
+            xfs_set_open_result(result_out, SEARCH);
+            return nullptr;
+        }
+    }
     XfsInode* inode = nullptr;
     bool created_by_open = false;
     if (handle.target_existed()) {
@@ -7072,13 +7369,22 @@ auto xfs_open_lookup(const XfsLookupHandle& handle, int flags, int mode, bool re
             return nullptr;
         }
 
+        ker::mod::security::FileIdentity identity{};
+        auto* parent = handle.parent();
+        int const CREATE_POLICY = require_directory
+                                      ? -ENOENT
+                                      : ker::mod::security::prepare_file_create(credentials, {parent->uid, parent->gid, parent->mode},
+                                                                                static_cast<uint32_t>(mode), identity);
+        if (CREATE_POLICY != 0 || !storage.prepare()) {
+            xfs_set_open_result(result_out, CREATE_POLICY != 0 ? CREATE_POLICY : -ENOMEM);
+            return nullptr;
+        }
         XfsTransaction* transaction = xfs_trans_alloc(MOUNT);
         if (transaction == nullptr) {
             xfs_set_open_result(result_out, -ENOMEM);
             return nullptr;
         }
-        int const FILE_MODE = mode == 0 ? 0666 : mode;
-        uint16_t const INODE_MODE = static_cast<uint16_t>(FILE_MODE & 0xFFF) | 0100000;
+        uint16_t const INODE_MODE = static_cast<uint16_t>(identity.mode);
         xfs_ino_t const NEW_INO = xfs_ialloc(MOUNT, transaction, INODE_MODE);
         if (NEW_INO == NULLFSINO) {
             xfs_trans_cancel(transaction);
@@ -7102,8 +7408,8 @@ auto xfs_open_lookup(const XfsLookupHandle& handle, int flags, int mode, bool re
         new_inode->agno = xfs_ino_ag(NEW_INO, MOUNT->agino_log);
         new_inode->agino = xfs_ag_ino(NEW_INO, MOUNT->agino_log);
         new_inode->mode = INODE_MODE;
-        new_inode->uid = 0;
-        new_inode->gid = 0;
+        new_inode->uid = identity.uid;
+        new_inode->gid = identity.gid;
         new_inode->nlink = 1;
         new_inode->size = 0;
         new_inode->nblocks = 0;
@@ -7171,8 +7477,22 @@ auto xfs_open_lookup(const XfsLookupHandle& handle, int flags, int mode, bool re
         xfs_set_open_result(result_out, -ENOTDIR);
         return nullptr;
     }
+    if ((flags & ker::vfs::O_NOFOLLOW) != 0 && xfs_inode_islnk(inode)) {
+        xfs_inode_release_metadata_locked(inode);
+        xfs_set_open_result(result_out, -ELOOP);
+        return nullptr;
+    }
+    int const OPEN_POLICY =
+        created_by_open ? 0
+                        : ker::mod::security::authorize_file_open(credentials, {inode->uid, inode->gid, inode->mode},
+                                                                  static_cast<unsigned>(flags) & 3U, (flags & ker::vfs::O_TRUNC) != 0);
+    if (OPEN_POLICY != 0 || !storage.prepare()) {
+        xfs_inode_release_metadata_locked(inode);
+        xfs_set_open_result(result_out, OPEN_POLICY != 0 ? OPEN_POLICY : -ENOMEM);
+        return nullptr;
+    }
     int const ACCESS_MODE = flags & 3;
-    if ((ACCESS_MODE == 1 || ACCESS_MODE == 2) && MOUNT->read_only) {
+    if ((ACCESS_MODE == 1 || ACCESS_MODE == 2 || (flags & ker::vfs::O_TRUNC) != 0) && MOUNT->read_only) {
         xfs_inode_release_metadata_locked(inode);
         xfs_set_open_result(result_out, -EROFS);
         return nullptr;
@@ -7182,7 +7502,47 @@ auto xfs_open_lookup(const XfsLookupHandle& handle, int flags, int mode, bool re
     fill_stat(inode, &opened_stat);
     const char* const HANDLE_PATH = handle.path_length() == 0 ? nullptr : handle.path();
     metadata_guard.unlock();
-    return xfs_file_from_inode(MOUNT, inode, flags, HANDLE_PATH, handle.path_length(), created_by_open, opened_stat, result_out);
+    return xfs_file_from_inode(storage, MOUNT, inode, flags, HANDLE_PATH, handle.path_length(), created_by_open, opened_stat, result_out);
+}
+
+auto xfs_pin_directory_lookup(const ker::mod::security::Snapshot& credentials, const XfsLookupHandle& handle, int* result_out,
+                              bool require_target_search) -> File* {
+    auto fail = [&](int error) -> File* {
+        xfs_set_open_result(result_out, error);
+        return nullptr;
+    };
+    auto* mount = handle.mount();
+    if (mount == nullptr) return fail(-EINVAL);
+    XfsMetadataGuard guard(mount, true, WOS_PERF_CALLSITE());
+    int const VALIDATE = xfs_validate_lookup_locked(handle);
+    if (VALIDATE != 0) return fail(VALIDATE);
+    auto* target = handle.target();
+    if (target == nullptr) return fail(-ENOENT);
+    if (!xfs_inode_isdir(target)) return fail(-ENOTDIR);
+    if (!handle.root_target()) {
+        auto* parent = handle.parent();
+        int const SEARCH = ker::mod::security::authorize_file_access(credentials, {parent->uid, parent->gid, parent->mode}, 1);
+        if (SEARCH != 0) return fail(SEARCH);
+    }
+    if (require_target_search) {
+        int const SEARCH = ker::mod::security::authorize_file_access(credentials, {target->uid, target->gid, target->mode}, 1);
+        if (SEARCH != 0) return fail(SEARCH);
+    }
+    auto* inode = xfs_inode_read_cached(mount, target->ino);
+    if (inode == nullptr || inode != target) {
+        xfs_inode_release_metadata_locked(inode);
+        return fail(-EAGAIN);
+    }
+    XfsOpenStorage storage;
+    if (!storage.prepare()) {
+        xfs_inode_release_metadata_locked(inode);
+        return fail(-ENOMEM);
+    }
+    Stat metadata{};
+    fill_stat(inode, &metadata);
+    guard.unlock();
+    return xfs_file_from_inode(storage, mount, inode, ker::vfs::O_DIRECTORY | ker::vfs::FILE_ACCESS_SEARCH_ONLY | ker::vfs::O_NO_CACHE,
+                               nullptr, 0, false, metadata, result_out);
 }
 
 auto xfs_stat_lookup(const XfsLookupHandle& handle, bool require_directory, Stat* statbuf) -> int {
@@ -7219,73 +7579,70 @@ auto xfs_readlink_lookup(const XfsLookupHandle& handle, char* buf, size_t bufsiz
     return RET < 0 ? RET : static_cast<ssize_t>(RET);
 }
 
-auto xfs_chmod_lookup(const XfsLookupHandle& handle, int mode, Stat* statbuf) -> int {
+auto xfs_chmod_lookup(const XfsLookupHandle& handle, const ker::mod::security::Snapshot& credentials, int mode, Stat* statbuf,
+                      bool read_only) -> int {
     XfsMountContext* const MOUNT = handle.mount();
-    if (MOUNT == nullptr) {
-        return -EINVAL;
-    }
-    if (MOUNT->read_only) {
-        return -EROFS;
-    }
+    if (MOUNT == nullptr) return -EINVAL;
+    if (read_only || MOUNT->read_only) return -EROFS;
+    // Retained target can be absent; still validate first so a stale negative
+    // lookup returns EAGAIN rather than inventing a definitive ENOENT.
+    std::optional<ker::mod::sys::MutexGuard> io_guard;
+    if (handle.target() != nullptr) io_guard.emplace(handle.target()->io_lock);
     XfsMetadataGuard metadata_guard(MOUNT, true, WOS_PERF_CALLSITE());
     XfsInode* target = nullptr;
-    int const LOOKUP_RET = xfs_lookup_target_locked(handle, &target);
-    if (LOOKUP_RET != 0) {
-        return LOOKUP_RET;
-    }
-    static constexpr uint16_t XFS_IFMT = 0xF000;
-    static constexpr uint16_t XFS_PERM_MASK = 07777;
-    target->mode = (target->mode & XFS_IFMT) | (static_cast<uint16_t>(mode) & XFS_PERM_MASK);
-    target->dirty = true;
-    XfsTransaction* tp = xfs_trans_alloc(MOUNT);
-    if (tp == nullptr) {
-        return -ENOMEM;
-    }
-    xfs_trans_log_inode(tp, target);
-    int const RET = xfs_trans_commit(tp);
-    if (RET == 0 && statbuf != nullptr) {
-        fill_stat(target, statbuf);
-    }
-    return RET == 0 ? 0 : -EIO;
+    int const RET = xfs_lookup_target_locked(handle, &target);
+    return RET != 0 ? RET : chmod_inode_locked(target, credentials, mode, statbuf);
 }
 
-auto xfs_utimens_lookup(const XfsLookupHandle& handle, const Timespec& atime, const Timespec& mtime, bool set_atime, bool set_mtime,
-                        Stat* statbuf) -> int {
+auto xfs_chown_lookup(const XfsLookupHandle& handle, const ker::mod::security::Snapshot& credentials, uint32_t uid, uint32_t gid,
+                      Stat* statbuf, bool read_only) -> int {
     XfsMountContext* const MOUNT = handle.mount();
-    if (MOUNT == nullptr) {
-        return -EINVAL;
-    }
-    if (MOUNT->read_only) {
-        return -EROFS;
-    }
+    if (MOUNT == nullptr) return -EINVAL;
+    if (read_only || MOUNT->read_only) return -EROFS;
+    std::optional<ker::mod::sys::MutexGuard> io_guard;
+    if (handle.target() != nullptr) io_guard.emplace(handle.target()->io_lock);
     XfsMetadataGuard metadata_guard(MOUNT, true, WOS_PERF_CALLSITE());
     XfsInode* target = nullptr;
-    int const LOOKUP_RET = xfs_lookup_target_locked(handle, &target);
-    if (LOOKUP_RET != 0) {
-        return LOOKUP_RET;
-    }
-    return xfs_set_inode_times(MOUNT, target, atime, mtime, set_atime, set_mtime, statbuf);
+    int const RET = xfs_lookup_target_locked(handle, &target);
+    return RET != 0 ? RET : chown_inode_locked(target, credentials, uid, gid, statbuf);
 }
 
-auto xfs_setxattr_lookup(const XfsLookupHandle& handle, const char* name, const void* value, size_t size, int flags) -> int {
+auto xfs_utimens_lookup(const XfsLookupHandle& handle, const ker::mod::security::Snapshot& credentials, const TimestampUpdate& times,
+                        Stat* statbuf, bool read_only) -> int {
+    XfsMountContext* const MOUNT = handle.mount();
+    if (MOUNT == nullptr) return -EINVAL;
+    if (read_only || MOUNT->read_only) return -EROFS;
+    std::optional<ker::mod::sys::MutexGuard> io_guard;
+    if (handle.target() != nullptr) io_guard.emplace(handle.target()->io_lock);
+    XfsMetadataGuard metadata_guard(MOUNT, true, WOS_PERF_CALLSITE());
+    XfsInode* target = nullptr;
+    int const RET = xfs_lookup_target_locked(handle, &target);
+    return RET != 0 ? RET : xfs_set_inode_times(MOUNT, target, credentials, times, statbuf);
+}
+
+auto xfs_setxattr_lookup(const ker::mod::security::Snapshot& credentials, const XfsLookupHandle& handle, const char* name,
+                         const void* value, size_t size, int flags, bool read_only) -> int {
     XfsMountContext* const MOUNT = handle.mount();
     if (MOUNT == nullptr) {
         return -EINVAL;
     }
-    if (MOUNT->read_only) {
+    if (read_only || MOUNT->read_only) {
         return -EROFS;
     }
     PublicXattrName parsed{};
     if (int const RET = parse_public_xattr_name(name, &parsed); RET < 0) {
         return RET;
     }
+    std::optional<ker::mod::sys::MutexGuard> io_guard;
+    if (handle.target() != nullptr) io_guard.emplace(handle.target()->io_lock);
     XfsMetadataGuard metadata_guard(MOUNT, true, WOS_PERF_CALLSITE());
     XfsInode* target = nullptr;
     int const LOOKUP_RET = xfs_lookup_target_locked(handle, &target);
-    return LOOKUP_RET != 0 ? LOOKUP_RET : set_public_xattr_locked(MOUNT, target, parsed, value, size, flags);
+    return LOOKUP_RET != 0 ? LOOKUP_RET : set_public_xattr_locked(credentials, MOUNT, target, parsed, value, size, flags);
 }
 
-auto xfs_getxattr_lookup(const XfsLookupHandle& handle, const char* name, void* value, size_t size) -> ssize_t {
+auto xfs_getxattr_lookup(const ker::mod::security::Snapshot& credentials, const XfsLookupHandle& handle, const char* name, void* value,
+                         size_t size) -> ssize_t {
     if (handle.mount() == nullptr) {
         return -EINVAL;
     }
@@ -7296,43 +7653,48 @@ auto xfs_getxattr_lookup(const XfsLookupHandle& handle, const char* name, void* 
     XfsMetadataGuard metadata_guard(handle.mount(), true, WOS_PERF_CALLSITE());
     XfsInode* target = nullptr;
     int const LOOKUP_RET = xfs_lookup_target_locked(handle, &target);
-    return LOOKUP_RET != 0 ? LOOKUP_RET : get_public_xattr_locked(target, parsed, value, size);
+    return LOOKUP_RET != 0 ? LOOKUP_RET : get_public_xattr_locked(credentials, target, parsed, value, size);
 }
 
-auto xfs_listxattr_lookup(const XfsLookupHandle& handle, char* list, size_t size) -> ssize_t {
+auto xfs_listxattr_lookup(const ker::mod::security::Snapshot& credentials, const XfsLookupHandle& handle, char* list, size_t size)
+    -> ssize_t {
     if (handle.mount() == nullptr) {
         return -EINVAL;
     }
     XfsMetadataGuard metadata_guard(handle.mount(), true, WOS_PERF_CALLSITE());
     XfsInode* target = nullptr;
     int const LOOKUP_RET = xfs_lookup_target_locked(handle, &target);
-    return LOOKUP_RET != 0 ? LOOKUP_RET : list_public_xattrs_locked(target, list, size);
+    return LOOKUP_RET != 0 ? LOOKUP_RET : list_public_xattrs_locked(credentials, target, list, size);
 }
 
-auto xfs_removexattr_lookup(const XfsLookupHandle& handle, const char* name) -> int {
+auto xfs_removexattr_lookup(const ker::mod::security::Snapshot& credentials, const XfsLookupHandle& handle, const char* name,
+                            bool read_only) -> int {
     XfsMountContext* const MOUNT = handle.mount();
     if (MOUNT == nullptr) {
         return -EINVAL;
     }
-    if (MOUNT->read_only) {
+    if (read_only || MOUNT->read_only) {
         return -EROFS;
     }
     PublicXattrName parsed{};
     if (int const RET = parse_public_xattr_name(name, &parsed); RET < 0) {
         return RET;
     }
+    std::optional<ker::mod::sys::MutexGuard> io_guard;
+    if (handle.target() != nullptr) io_guard.emplace(handle.target()->io_lock);
     XfsMetadataGuard metadata_guard(MOUNT, true, WOS_PERF_CALLSITE());
     XfsInode* target = nullptr;
     int const LOOKUP_RET = xfs_lookup_target_locked(handle, &target);
-    return LOOKUP_RET != 0 ? LOOKUP_RET : remove_public_xattr_locked(MOUNT, target, parsed);
+    return LOOKUP_RET != 0 ? LOOKUP_RET : remove_public_xattr_locked(credentials, MOUNT, target, parsed);
 }
 
-auto xfs_mkdir_lookup(const XfsLookupHandle& handle, int mode, Stat* statbuf) -> int {
+auto xfs_mkdir_lookup(const ker::mod::security::Snapshot& credentials, const XfsLookupHandle& handle, int mode, Stat* statbuf,
+                      bool read_only) -> int {
     XfsMountContext* const MOUNT = handle.mount();
     if (MOUNT == nullptr) {
         return -EINVAL;
     }
-    if (MOUNT->read_only) {
+    if (read_only || MOUNT->read_only) {
         return -EROFS;
     }
     XfsMetadataGuard metadata_guard(MOUNT, true, WOS_PERF_CALLSITE());
@@ -7340,20 +7702,23 @@ auto xfs_mkdir_lookup(const XfsLookupHandle& handle, int mode, Stat* statbuf) ->
     if (VALIDATE_RET != 0) {
         return VALIDATE_RET;
     }
+    XfsInode* const PARENT = handle.parent();
+    ker::mod::security::FileIdentity identity{};
+    int const AUTH = ker::mod::security::prepare_directory_create(credentials, {PARENT->uid, PARENT->gid, PARENT->mode},
+                                                                  static_cast<uint32_t>(mode), identity);
+    if (AUTH != 0) return AUTH;
     if (handle.target_existed()) {
         if (statbuf != nullptr && handle.target() != nullptr && xfs_inode_isdir(handle.target())) {
             fill_stat(handle.target(), statbuf);
         }
         return -EEXIST;
     }
-    XfsInode* const PARENT = handle.parent();
     if (PARENT->nlink == UINT32_MAX) {
         return -EMLINK;
     }
 
     xfs_ino_t const PARENT_INO = PARENT->ino;
-    int const DIR_MODE = mode == 0 ? 0755 : mode;
-    uint16_t const INODE_MODE = static_cast<uint16_t>(DIR_MODE & 0xFFF) | 0040000;
+    uint16_t const INODE_MODE = static_cast<uint16_t>(identity.mode);
     bool const USE_I8 = PARENT_INO > 0xFFFFFFFFULL;
     size_t const INO_BYTES = USE_I8 ? 8 : 4;
     size_t const SF_SIZE = 2 + INO_BYTES;
@@ -7403,6 +7768,8 @@ auto xfs_mkdir_lookup(const XfsLookupHandle& handle, int mode, Stat* statbuf) ->
     new_inode->agno = xfs_ino_ag(NEW_INO, MOUNT->agino_log);
     new_inode->agino = xfs_ag_ino(NEW_INO, MOUNT->agino_log);
     new_inode->mode = INODE_MODE;
+    new_inode->uid = identity.uid;
+    new_inode->gid = identity.gid;
     new_inode->size = SF_SIZE;
     new_inode->nlink = 2;
     new_inode->data_fork.format = XFS_DINODE_FMT_LOCAL;
@@ -7445,12 +7812,13 @@ auto xfs_mkdir_lookup(const XfsLookupHandle& handle, int mode, Stat* statbuf) ->
     return 0;
 }
 
-auto xfs_symlink_lookup(const XfsLookupHandle& handle, const char* target, Stat* statbuf) -> int {
+auto xfs_symlink_lookup(const ker::mod::security::Snapshot& credentials, const XfsLookupHandle& handle, const char* target, Stat* statbuf,
+                        bool require_directory, bool read_only) -> int {
     XfsMountContext* const MOUNT = handle.mount();
     if (MOUNT == nullptr || target == nullptr) {
         return -EINVAL;
     }
-    if (MOUNT->read_only) {
+    if (read_only || MOUNT->read_only) {
         return -EROFS;
     }
     size_t target_length = 0;
@@ -7467,9 +7835,14 @@ auto xfs_symlink_lookup(const XfsLookupHandle& handle, const char* target, Stat*
     if (VALIDATE_RET != 0) {
         return VALIDATE_RET;
     }
+    ker::mod::security::FileIdentity identity{};
+    int const AUTH = ker::mod::security::prepare_symlink_create(
+        credentials, {handle.parent()->uid, handle.parent()->gid, handle.parent()->mode}, identity);
+    if (AUTH != 0) return AUTH;
     if (handle.target_existed()) {
         return -EEXIST;
     }
+    if (require_directory) return -ENOENT;
     auto* target_data = new (std::nothrow) uint8_t[target_length == 0 ? 1 : target_length];
     auto* new_inode = xfs_inode_alloc_zeroed_object();
     if (target_data == nullptr || new_inode == nullptr) {
@@ -7505,6 +7878,8 @@ auto xfs_symlink_lookup(const XfsLookupHandle& handle, const char* target, Stat*
     new_inode->agno = xfs_ino_ag(NEW_INO, MOUNT->agino_log);
     new_inode->agino = xfs_ag_ino(NEW_INO, MOUNT->agino_log);
     new_inode->mode = SYMLINK_MODE;
+    new_inode->uid = identity.uid;
+    new_inode->gid = identity.gid;
     new_inode->size = target_length;
     new_inode->nlink = 1;
     new_inode->data_fork.format = XFS_DINODE_FMT_LOCAL;
@@ -7540,12 +7915,12 @@ auto xfs_symlink_lookup(const XfsLookupHandle& handle, const char* target, Stat*
     return 0;
 }
 
-auto xfs_unlink_lookup(const XfsLookupHandle& handle) -> int {
+auto xfs_unlink_lookup(const ker::mod::security::Snapshot& credentials, const XfsLookupHandle& handle, bool read_only) -> int {
     XfsMountContext* const MOUNT = handle.mount();
     if (MOUNT == nullptr) {
         return -EINVAL;
     }
-    if (MOUNT->read_only) {
+    if (read_only || MOUNT->read_only) {
         return -EROFS;
     }
     XfsMetadataGuard metadata_guard(MOUNT, true, WOS_PERF_CALLSITE());
@@ -7557,6 +7932,9 @@ auto xfs_unlink_lookup(const XfsLookupHandle& handle) -> int {
     if (xfs_inode_isdir(target)) {
         return -EISDIR;
     }
+    rc = ker::mod::security::authorize_file_removal(credentials, {handle.parent()->uid, handle.parent()->gid, handle.parent()->mode},
+                                                    {target->uid, target->gid, target->mode});
+    if (rc != 0) return rc;
     XfsTransaction* tp = xfs_trans_alloc(MOUNT);
     if (tp == nullptr) {
         return -ENOMEM;
@@ -7585,12 +7963,12 @@ auto xfs_unlink_lookup(const XfsLookupHandle& handle) -> int {
     return rc == 0 ? 0 : -EIO;
 }
 
-auto xfs_rmdir_lookup(const XfsLookupHandle& handle) -> int {
+auto xfs_rmdir_lookup(const ker::mod::security::Snapshot& credentials, const XfsLookupHandle& handle, bool read_only) -> int {
     XfsMountContext* const MOUNT = handle.mount();
     if (MOUNT == nullptr) {
         return -EINVAL;
     }
-    if (MOUNT->read_only) {
+    if (read_only || MOUNT->read_only) {
         return -EROFS;
     }
     XfsMetadataGuard metadata_guard(MOUNT, true, WOS_PERF_CALLSITE());
@@ -7602,6 +7980,9 @@ auto xfs_rmdir_lookup(const XfsLookupHandle& handle) -> int {
     if (!xfs_inode_isdir(directory)) {
         return -ENOTDIR;
     }
+    rc = ker::mod::security::authorize_file_removal(credentials, {handle.parent()->uid, handle.parent()->gid, handle.parent()->mode},
+                                                    {directory->uid, directory->gid, directory->mode});
+    if (rc != 0) return rc;
     if (handle.parent()->nlink <= 2) {
         return -EIO;
     }
@@ -7641,7 +8022,8 @@ auto xfs_rmdir_lookup(const XfsLookupHandle& handle) -> int {
     return rc == 0 ? 0 : -EIO;
 }
 
-auto xfs_link_lookup(const XfsLookupHandle& source, const XfsLookupHandle& destination, Stat* statbuf) -> int {
+auto xfs_link_lookup(const ker::mod::security::Snapshot& credentials, const XfsLookupHandle& source, const XfsLookupHandle& destination,
+                     Stat* statbuf, bool source_requires_directory, bool destination_requires_directory, bool read_only) -> int {
     XfsMountContext* const MOUNT = source.mount();
     if (MOUNT == nullptr || destination.mount() == nullptr) {
         return -EINVAL;
@@ -7649,7 +8031,7 @@ auto xfs_link_lookup(const XfsLookupHandle& source, const XfsLookupHandle& desti
     if (MOUNT != destination.mount()) {
         return -EXDEV;
     }
-    if (MOUNT->read_only) {
+    if (read_only || MOUNT->read_only) {
         return -EROFS;
     }
     XfsMetadataGuard metadata_guard(MOUNT, true, WOS_PERF_CALLSITE());
@@ -7664,12 +8046,18 @@ auto xfs_link_lookup(const XfsLookupHandle& source, const XfsLookupHandle& desti
     if (xfs_inode_isdir(TARGET)) {
         return -EPERM;
     }
+    int const AUTH = ker::mod::security::authorize_file_link(
+        credentials, {source.parent()->uid, source.parent()->gid, source.parent()->mode},
+        {destination.parent()->uid, destination.parent()->gid, destination.parent()->mode}, {TARGET->uid, TARGET->gid, TARGET->mode});
+    if (AUTH != 0) return AUTH;
+    if (source_requires_directory) return -ENOTDIR;
     if (TARGET->nlink == UINT32_MAX) {
         return -EMLINK;
     }
     if (destination.target_existed()) {
         return -EEXIST;
     }
+    if (destination_requires_directory) return -ENOENT;
     XfsTransaction* tp = xfs_trans_alloc(MOUNT);
     if (tp == nullptr) {
         return -ENOMEM;
@@ -7706,98 +8094,155 @@ auto xfs_link_lookup(const XfsLookupHandle& source, const XfsLookupHandle& desti
     return rc == 0 ? 0 : -EIO;
 }
 
-auto xfs_rename_lookup(const XfsLookupHandle& source, const XfsLookupHandle& destination, Stat* statbuf) -> int {
+auto xfs_rename_lookup(const ker::mod::security::Snapshot& credentials, const XfsLookupHandle& source, const XfsLookupHandle& destination,
+                       Stat* statbuf, bool source_requires_directory, bool destination_requires_directory, bool* namespace_changed,
+                       bool* displaced_hardlink_count_changed, bool read_only) -> int {
     XfsMountContext* const MOUNT = source.mount();
-    if (MOUNT == nullptr || destination.mount() == nullptr) {
-        return -EINVAL;
-    }
-    if (MOUNT != destination.mount()) {
-        return -EXDEV;
-    }
-    if (MOUNT->read_only) {
-        return -EROFS;
-    }
+    if (MOUNT == nullptr || destination.mount() == nullptr) return -EINVAL;
+    if (MOUNT != destination.mount()) return -EXDEV;
+    if (read_only || MOUNT->read_only) return -EROFS;
     XfsMetadataGuard metadata_guard(MOUNT, true, WOS_PERF_CALLSITE());
     int rc = xfs_validate_lookup_pair_locked(source, destination);
-    if (rc != 0) {
-        return rc;
-    }
+    if (rc != 0) return rc;
     XfsInode* const MOVED = source.target();
     XfsInode* const DISPLACED = destination.target();
-    if (!source.target_existed() || MOVED == nullptr) {
-        return -ENOENT;
+    if (!source.target_existed() || MOVED == nullptr) return -ENOENT;
+    bool const CROSS_PARENT = source.parent() != destination.parent();
+    auto const DISPLACED_IDENTITY = DISPLACED != nullptr ? ker::mod::security::FileIdentity{DISPLACED->uid, DISPLACED->gid, DISPLACED->mode}
+                                                         : ker::mod::security::FileIdentity{};
+    rc = ker::mod::security::authorize_file_rename(credentials, {source.parent()->uid, source.parent()->gid, source.parent()->mode},
+                                                   {MOVED->uid, MOVED->gid, MOVED->mode},
+                                                   {destination.parent()->uid, destination.parent()->gid, destination.parent()->mode},
+                                                   DISPLACED != nullptr ? &DISPLACED_IDENTITY : nullptr, CROSS_PARENT);
+    if (rc != 0) return rc;
+    if (source.root_target() || destination.root_target() || MOVED->ino == MOUNT->root_ino ||
+        (DISPLACED != nullptr && DISPLACED->ino == MOUNT->root_ino))
+        return -EBUSY;
+    auto special = [](const XfsLookupHandle& lookup) {
+        return (lookup.leaf_length() == 1 && lookup.leaf()[0] == '.') ||
+               (lookup.leaf_length() == 2 && lookup.leaf()[0] == '.' && lookup.leaf()[1] == '.');
+    };
+    if (special(source) || special(destination)) return -EINVAL;
+    bool const DIRECTORY = xfs_inode_isdir(MOVED);
+    bool const REPLACE_DIRECTORY = DISPLACED != nullptr && xfs_inode_isdir(DISPLACED);
+    if (source_requires_directory && !DIRECTORY) return -ENOTDIR;
+    if (destination_requires_directory) {
+        if (DISPLACED == nullptr) return -ENOENT;
+        if (!REPLACE_DIRECTORY) return -ENOTDIR;
+        if (!DIRECTORY) return -EISDIR;
     }
-    if (destination.target_existed() && DISPLACED == MOVED) {
-        if (statbuf != nullptr) {
-            fill_stat(MOVED, statbuf);
-        }
+    if (DISPLACED == MOVED) {
+        if (statbuf != nullptr) fill_stat(MOVED, statbuf);
+        if (namespace_changed != nullptr) *namespace_changed = false;
+        if (displaced_hardlink_count_changed != nullptr) *displaced_hardlink_count_changed = false;
         return 0;
     }
-    XfsTransaction* tp = xfs_trans_alloc(MOUNT);
-    if (tp == nullptr) {
-        return -ENOMEM;
-    }
-    bool purge_parent_path_cache = xfs_inode_isdir(MOVED) || (DISPLACED != nullptr && xfs_inode_isdir(DISPLACED));
     if (DISPLACED != nullptr) {
-        rc = xfs_trans_capture_inode(tp, DISPLACED);
-        if (rc != 0) {
-            xfs_trans_cancel(tp);
-            return rc;
+        if (DIRECTORY && !REPLACE_DIRECTORY) return -ENOTDIR;
+        if (!DIRECTORY && REPLACE_DIRECTORY) return -EISDIR;
+        if (DISPLACED->nlink == 0) return -EIO;
+        if (REPLACE_DIRECTORY) {
+            RmdirDirectoryScan scan{.directory = DISPLACED};
+            rc = xfs_dir_iterate(DISPLACED, scan_indexed_directory_entries, &scan);
+            if (rc < 0 || scan.status != 0) return rc < 0 ? rc : scan.status;
+            if (scan.indexed_entry_found) return -ENOTEMPTY;
         }
+    }
+    if (DIRECTORY) {
+        XfsDirEntry parent{};
+        rc = xfs_dir_lookup_authoritative(MOVED, "..", 2, &parent);
+        if (rc != 0) return rc;
+        if (parent.ino != source.parent()->ino) return -EIO;
+        xfs_ino_t ancestor = destination.parent()->ino;
+        for (unsigned depth = 0;; ++depth) {
+            if (ancestor == MOVED->ino) return -EINVAL;
+            if (ancestor == MOUNT->root_ino) break;
+            if (depth == 1024) return -ELOOP;
+            auto* inode = xfs_inode_read_known_allocated(MOUNT, ancestor);
+            if (inode == nullptr) return -EIO;
+            rc = xfs_inode_isdir(inode) ? xfs_dir_lookup_authoritative(inode, "..", 2, &parent) : -ENOTDIR;
+            xfs_inode_release_metadata_locked(inode);
+            if (rc != 0) return rc;
+            if (parent.ino == ancestor || parent.ino == NULLFSINO) return -EIO;
+            ancestor = parent.ino;
+        }
+    }
+    int const OLD_DELTA = DIRECTORY && CROSS_PARENT ? -1 : 0;
+    int const NEW_DELTA = (DIRECTORY && CROSS_PARENT ? 1 : 0) - (REPLACE_DIRECTORY ? 1 : 0);
+    if ((OLD_DELTA < 0 && source.parent()->nlink <= 2) || (NEW_DELTA < 0 && destination.parent()->nlink <= 2)) return -EIO;
+    if (NEW_DELTA > 0 && destination.parent()->nlink == UINT32_MAX) return -EMLINK;
+    bool const LINKS_CHANGED = DISPLACED != nullptr && !REPLACE_DIRECTORY && DISPLACED->nlink > 1;
+    XfsTransaction* tp = xfs_trans_alloc(MOUNT);
+    if (tp == nullptr) return -ENOMEM;
+    auto fail = [tp](int error) {
+        xfs_trans_cancel(tp);
+        return error;
+    };
+    for (auto* inode : {MOVED, DISPLACED, source.parent(), destination.parent()}) {
+        if (inode != nullptr) {
+            rc = xfs_trans_capture_inode(tp, inode);
+            if (rc != 0) return fail(rc);
+        }
+    }
+    if (DISPLACED != nullptr) {
         rc = xfs_dir_removename(destination.parent(), destination.leaf(), destination.leaf_length(), tp, DISPLACED->ino);
-        if (rc != 0) {
-            xfs_trans_cancel(tp);
-            return rc;
-        }
-        if (DISPLACED->nlink > 0) {
+        if (rc != 0) return fail(rc);
+        if (REPLACE_DIRECTORY)
+            DISPLACED->nlink = 0;
+        else
             DISPLACED->nlink--;
-        }
+        DISPLACED->ctime = xfs_current_timestamp(DISPLACED);
         DISPLACED->dirty = true;
         xfs_trans_log_inode(tp, DISPLACED);
     }
     uint8_t const FTYPE = xfs_ftype_from_inode(MOVED);
     rc = xfs_dir_addname(destination.parent(), destination.leaf(), destination.leaf_length(), MOVED->ino, FTYPE, tp);
-    if (rc != 0) {
-        xfs_trans_cancel(tp);
-        return rc;
-    }
+    if (rc != 0) return fail(rc);
     rc = xfs_dir_removename(source.parent(), source.leaf(), source.leaf_length(), tp, MOVED->ino);
-    if (rc != 0) {
-        xfs_trans_cancel(tp);
-        return rc;
+    if (rc != 0) return fail(rc);
+    if (DIRECTORY && CROSS_PARENT) {
+        rc = xfs_dir_reparent(MOVED, source.parent()->ino, destination.parent()->ino, tp);
+        if (rc != 0) return fail(rc);
     }
-    source.parent()->dirty = true;
-    destination.parent()->dirty = true;
+    if (OLD_DELTA < 0) source.parent()->nlink--;
+    if (NEW_DELTA < 0)
+        destination.parent()->nlink--;
+    else if (NEW_DELTA > 0)
+        destination.parent()->nlink++;
+    xfs_stamp_inode_data_change(source.parent());
+    xfs_stamp_inode_data_change(destination.parent());
+    MOVED->ctime = xfs_current_timestamp(MOVED);
+    MOVED->dirty = true;
+    xfs_trans_log_inode(tp, MOVED);
     xfs_trans_log_inode(tp, source.parent());
     xfs_trans_log_inode(tp, destination.parent());
     rc = xfs_trans_commit(tp);
-    if (rc == 0) {
-        if (purge_parent_path_cache || source.path_length() == 0 || destination.path_length() == 0) {
-            xfs_path_inode_cache_bump_generation();
-            xfs_parent_path_cache_purge_all_for_mount(MOUNT);
-        } else {
-            xfs_path_inode_cache_invalidate_path(MOUNT, source.path(), source.path_length());
-            xfs_path_inode_cache_invalidate_path(MOUNT, destination.path(), destination.path_length());
-            xfs_path_inode_cache_store(MOUNT, destination.path(), destination.path_length(), MOVED->ino, FTYPE);
-        }
-        if (statbuf != nullptr) {
-            fill_stat(MOVED, statbuf);
-        }
+    if (rc != 0) return -EIO;
+    if (DIRECTORY || REPLACE_DIRECTORY || source.path_length() == 0 || destination.path_length() == 0) {
+        xfs_path_inode_cache_bump_generation();
+        xfs_parent_path_cache_purge_all_for_mount(MOUNT);
+    } else {
+        xfs_path_inode_cache_invalidate_path(MOUNT, source.path(), source.path_length());
+        xfs_path_inode_cache_invalidate_path(MOUNT, destination.path(), destination.path_length());
+        xfs_path_inode_cache_store(MOUNT, destination.path(), destination.path_length(), MOVED->ino, FTYPE);
     }
-    return rc == 0 ? 0 : -EIO;
+    if (statbuf != nullptr) fill_stat(MOVED, statbuf);
+    if (namespace_changed != nullptr) *namespace_changed = true;
+    if (displaced_hardlink_count_changed != nullptr) *displaced_hardlink_count_changed = LINKS_CHANGED;
+    return 0;
 }
 
 // ============================================================================
 // Mount / init
 // ============================================================================
 
-auto xfs_vfs_init_device(dev::BlockDevice* device) -> XfsMountContext* {
+auto xfs_vfs_init_device(dev::BlockDevice* device, bool read_only) -> XfsMountContext* {
     if (device == nullptr) {
         return nullptr;
     }
 
     XfsMountContext* ctx = nullptr;
-    int ret = xfs_mount(device, dev::block_device_is_read_only(device), &ctx);
+    int ret = xfs_mount(device, read_only || dev::block_device_is_read_only(device), &ctx);
     if (ret != 0) {
         log::error("mount failed with error %d", ret);
         return nullptr;

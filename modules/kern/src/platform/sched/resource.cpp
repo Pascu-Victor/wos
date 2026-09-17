@@ -1,9 +1,11 @@
 #include "resource.hpp"
 
 #include <abi/resource.hpp>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <optional>
+#include <platform/ktime/ktime.hpp>
 #include <platform/sched/resource_as.hpp>
 #include <platform/sched/resource_model.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -26,7 +28,7 @@ auto LifetimeOwner::attach(task::Task* owner) -> bool {
         return false;
     }
     uint64_t const FLAGS = owner->resource_lock.lock_irqsave();
-    if (owner->resource_cpu_admission_closed) {
+    if (owner->resource_cpu_admission_closed || owner->resource_exec_admission_closed) {
         owner->resource_lock.unlock_irqrestore(FLAGS);
         owner->release();
         return false;
@@ -53,6 +55,137 @@ auto close_thread_cpu_admission(task::Task& subject) -> bool {
     owner->resource_cpu_admission_closed = true;
     owner->resource_lock.unlock_irqrestore(FLAGS);
     return true;
+}
+
+ExecAdmission::~ExecAdmission() { finish(); }
+
+auto ExecAdmission::begin(task::Task& executor) -> bool {
+    if (m_owner != nullptr) return false;
+    auto* owner = executor.credential_owner();
+    if (owner == nullptr) return false;
+    uint64_t const FLAGS = owner->resource_lock.lock_irqsave();
+    bool const AVAILABLE = !owner->resource_cpu_admission_closed && !owner->resource_exec_admission_closed;
+    if (AVAILABLE) {
+        owner->resource_exec_admission_closed = true;
+        m_owner = owner;
+    }
+    owner->resource_lock.unlock_irqrestore(FLAGS);
+    return AVAILABLE;
+}
+
+void ExecAdmission::finish() {
+    if (m_owner == nullptr) return;
+    uint64_t const FLAGS = m_owner->resource_lock.lock_irqsave();
+    m_owner->resource_exec_quiescence_epoch.store(0, std::memory_order_release);
+    m_owner->resource_exec_admission_closed = false;
+    m_owner->resource_lock.unlock_irqrestore(FLAGS);
+    m_owner = nullptr;
+}
+
+auto ExecAdmission::owns(task::Task& executor) const -> bool { return m_owner != nullptr && m_owner == executor.credential_owner(); }
+
+auto ExecAdmission::quiesced(task::Task& executor) const -> bool {
+    if (m_owner == nullptr || &executor != m_owner) return false;
+    uint64_t const FLAGS = m_owner->resource_lock.lock_irqsave();
+    bool const READY = m_owner->resource_exec_quiescence_epoch.load(std::memory_order_relaxed) != 0 &&
+                       m_owner->resource_exec_quiescent_threads == m_owner->resource_cpu_threads.load(std::memory_order_acquire);
+    m_owner->resource_lock.unlock_irqrestore(FLAGS);
+    return READY;
+}
+
+auto ExecAdmission::quiesce(task::Task& executor, uint64_t timeout_us) -> bool {
+    if (m_owner == nullptr || &executor != m_owner) return false;
+    uint64_t const FLAGS = m_owner->resource_lock.lock_irqsave();
+    if (m_owner->resource_exec_quiescence_sequence == UINT64_MAX) {
+        m_owner->resource_lock.unlock_irqrestore(FLAGS);
+        return false;
+    }
+    uint64_t const EPOCH = ++m_owner->resource_exec_quiescence_sequence;
+    m_owner->resource_exec_quiescence_epoch.store(EPOCH, std::memory_order_release);
+    m_owner->resource_lock.unlock_irqrestore(FLAGS);
+    struct Request {
+        task::Task* owner;
+        uint64_t epoch;
+    } request{m_owner, EPOCH};
+    auto eligible = [](task::Task* candidate, void* context) {
+        auto const& request = *static_cast<Request*>(context);
+        return candidate->is_thread && candidate->credential_owner() == request.owner &&
+               candidate->state.load(std::memory_order_acquire) == task::TaskState::ACTIVE &&
+               candidate->resource_exec_nudged_epoch.load(std::memory_order_acquire) != request.epoch;
+    };
+    while (auto* sibling = find_active_task_lifetime_ref_if(eligible, &request)) {
+        sibling->resource_exec_nudged_epoch.store(EPOCH, std::memory_order_release);
+        wake_task_for_signal(sibling);
+        wake_task_from_event(sibling);
+        sibling->release();
+    }
+    uint64_t const START = ker::mod::time::get_us();
+    while (!quiesced(executor)) {
+        if (executor.process_exit_requested.load(std::memory_order_acquire) ||
+            (executor.signal_pending_bits() & (uint64_t{1} << (9 - 1))) != 0 || ker::mod::time::get_us() - START >= timeout_us)
+            return false;
+        kern_yield();
+    }
+    return true;
+}
+
+ExecSafeWait::ExecSafeWait(task::Task& subject) {
+    auto* owner = subject.credential_owner();
+    if (!subject.is_thread || owner == nullptr || !subject.resource_owner.cpu_active()) return;
+    uint64_t const FLAGS = owner->resource_lock.lock_irqsave();
+    if (!subject.resource_exec_safe_wait) {
+        subject.resource_exec_safe_wait = true;
+        ++owner->resource_exec_quiescent_threads;
+        m_subject = &subject;
+    }
+    owner->resource_lock.unlock_irqrestore(FLAGS);
+}
+
+ExecSafeWait::~ExecSafeWait() {
+    if (m_subject == nullptr) return;
+    auto* owner = m_subject->credential_owner();
+    uint64_t const FLAGS = owner->resource_lock.lock_irqsave();
+    m_subject->resource_exec_safe_wait = false;
+    --owner->resource_exec_quiescent_threads;
+    owner->resource_lock.unlock_irqrestore(FLAGS);
+}
+
+auto ExecSafeWait::finish_if_released() -> bool {
+    if (m_subject == nullptr) return true;
+    auto* owner = m_subject->credential_owner();
+    uint64_t const FLAGS = owner->resource_lock.lock_irqsave();
+    bool const RELEASED = owner->resource_exec_quiescence_epoch.load(std::memory_order_relaxed) == 0;
+    if (RELEASED) {
+        m_subject->resource_exec_safe_wait = false;
+        --owner->resource_exec_quiescent_threads;
+        m_subject = nullptr;
+    }
+    owner->resource_lock.unlock_irqrestore(FLAGS);
+    return RELEASED;
+}
+
+void ExecSafeWait::wait_for_release() {
+    while (m_subject != nullptr && !m_subject->process_exit_requested.load(std::memory_order_acquire) &&
+           (m_subject->signal_pending_bits() & (uint64_t{1} << (9 - 1))) == 0) {
+        if (finish_if_released()) return;
+        kern_yield();
+    }
+}
+
+void wait_for_exec_quiescence(task::Task& subject) {
+    if (!subject.exec_quiescence_requested()) return;
+    ExecSafeWait wait(subject);
+    wait.wait_for_release();
+}
+
+auto close_idle_thread_cpu_admission(task::Task& owner) -> bool {
+    uint64_t const FLAGS = owner.resource_lock.lock_irqsave();
+    bool const IDLE = owner.resource_cpu_threads.load(std::memory_order_acquire) == 0 && !owner.resource_exec_admission_closed;
+    if (IDLE) {
+        owner.resource_cpu_admission_closed = true;
+    }
+    owner.resource_lock.unlock_irqrestore(FLAGS);
+    return IDLE;
 }
 
 auto bind_thread_owner(task::Task& thread, task::Task& parent) -> bool {
@@ -85,9 +218,13 @@ void charge_cpu(task::Task* subject, uint64_t elapsed_us, uint64_t user_us) {
 }
 
 Owner::Owner(task::Task* subject) : m_task(subject) {
-    if (subject != nullptr && subject->is_thread && subject->owner_pid != 0 && subject->owner_pid != subject->pid) {
-        m_task = find_task_by_pid_safe(subject->owner_pid);
-        m_retained = m_task != nullptr;
+    if (subject != nullptr && subject->is_thread) {
+        // The subject's immutable LifetimeOwner keeps this exact process alive
+        // until we acquire our independent reference. Never reselect by PID or
+        // fall back to a user thread's stale private resource fields.
+        m_task = subject->credential_owner();
+        m_retained = m_task != nullptr && m_task->try_acquire();
+        if (!m_retained) m_task = nullptr;
     }
 }
 
@@ -137,6 +274,7 @@ auto syscall_limit(uint64_t resource, uint64_t address, uint64_t version, bool s
     if (set && !sys::usercopy::copy_value_from_task(*caller, address, value)) {
         return static_cast<uint64_t>(-EFAULT);
     }
+    auto const CREDENTIALS = caller->credentials();
     int result = 0;
     Usage snapshot{};
     {
@@ -166,7 +304,8 @@ auto syscall_limit(uint64_t resource, uint64_t address, uint64_t version, bool s
             }
         }
         if (set) {
-            result = process->resources.set(static_cast<unsigned>(resource), value, caller->euid == 0, task::Task::FD_TABLE_SIZE);
+            result = process->resources.set(static_cast<unsigned>(resource), value, CREDENTIALS.allows(security::Authority::RESOURCE_LIMIT),
+                                            task::Task::FD_TABLE_SIZE);
         }
         snapshot = process->resources.entries[resource];
         process->resource_lock.unlock_irqrestore(FLAGS);

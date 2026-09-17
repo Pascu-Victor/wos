@@ -4,9 +4,11 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <net/wki/wire.hpp>
+#include <platform/sched/session.hpp>
 #include <vfs/stat.hpp>
 
 using namespace ker::net::wki;
@@ -479,7 +481,11 @@ TEST(WkiWire, VfsMetadataBatchUsesAdditiveBoundedFraming) {
 TEST(WkiWire, VfsXattrUsesVersionedBoundedReplayIdentity) {
     EXPECT_EQ(WKI_CAP_VFS_XATTR, 0x0040u);
     EXPECT_EQ(OP_VFS_XATTR, 0x0417u);
-    EXPECT_EQ(WKI_VFS_XATTR_VERSION, 1u);
+    EXPECT_EQ(WKI_VFS_XATTR_VERSION, 2u);
+    EXPECT_EQ(WKI_VFS_XATTR_CALLER_SIZE, 80u);
+    EXPECT_EQ(WKI_VFS_FEATURE_XATTR_IDENTITY, 32u);
+    EXPECT_EQ(offsetof(VfsXattrBeginPayload, require_directory), 37u);
+    EXPECT_EQ(offsetof(VfsXattrBeginPayload, reserved), 38u);
     EXPECT_EQ(WKI_VFS_XATTR_NAME_MAX, 255u);
     EXPECT_EQ(WKI_VFS_XATTR_DATA_MAX, 65536u);
     EXPECT_EQ(sizeof(VfsXattrPhaseHeader), 20u);
@@ -580,4 +586,186 @@ TEST(WkiWire, HeaderSerializationRoundTrip) {
     EXPECT_EQ(copy.src_port, orig.src_port);
     EXPECT_EQ(copy.dst_port, orig.dst_port);
     EXPECT_EQ(copy.checksum, orig.checksum);
+}
+
+TEST(WkiWire, DescriptorMetadataAddsSelectorsWithoutChangingPathLayouts) {
+    EXPECT_EQ(static_cast<uint16_t>(VfsPathOperation::REALPATH_AT), 13U);
+    EXPECT_EQ(static_cast<uint16_t>(VfsPathOperation::FCHMOD), 14U);
+    EXPECT_EQ(static_cast<uint16_t>(VfsPathOperation::FCHOWN), 15U);
+    EXPECT_EQ(static_cast<uint16_t>(VfsPathOperation::FUTIMENS), 16U);
+    EXPECT_EQ(sizeof(VfsPathIdentityHeader), 8U);
+    EXPECT_EQ(sizeof(VfsPathChmodPrefix), 8U);
+    EXPECT_EQ(sizeof(VfsPathUtimensPrefix), 40U);
+    EXPECT_EQ(sizeof(VfsFileChmodRequest), 8U);
+    EXPECT_EQ(sizeof(VfsFileChownRequest), 12U);
+    EXPECT_EQ(sizeof(VfsFileUtimensRequest), 40U);
+    EXPECT_EQ(offsetof(VfsFileChmodRequest, mode), 4U);
+    EXPECT_EQ(offsetof(VfsFileChownRequest, owner), 4U);
+    EXPECT_EQ(offsetof(VfsFileChownRequest, group), 8U);
+    EXPECT_EQ(offsetof(VfsFileUtimensRequest, reserved), 4U);
+    EXPECT_EQ(offsetof(VfsFileUtimensRequest, atime_sec), 8U);
+    EXPECT_EQ(offsetof(VfsFileUtimensRequest, atime_nsec), 16U);
+    EXPECT_EQ(offsetof(VfsFileUtimensRequest, mtime_sec), 24U);
+    EXPECT_EQ(offsetof(VfsFileUtimensRequest, mtime_nsec), 32U);
+}
+
+TEST(WkiWire, UserSignalHasDistinctBoundedRequestAndResponse) {
+    EXPECT_EQ(static_cast<uint8_t>(MsgType::TASK_SIGNAL_REQ), 0x58);
+    EXPECT_EQ(static_cast<uint8_t>(MsgType::TASK_SIGNAL_RESP), 0x59);
+    EXPECT_EQ(sizeof(TaskCancelPayload), 8u);
+    EXPECT_EQ(sizeof(TaskResponsePayload), 16u);
+    EXPECT_EQ(sizeof(TaskSessionOrigin), 8u);
+    EXPECT_EQ(sizeof(TaskJobOrigins), 16u);
+    EXPECT_EQ(offsetof(TaskJobOrigins, group), 8u);
+    EXPECT_EQ(sizeof(TaskSignalRequest), 112u);
+    EXPECT_EQ(offsetof(TaskSignalRequest, credentials), 32u);
+    EXPECT_EQ(sizeof(TaskSignalResponse), 16u);
+    EXPECT_EQ(offsetof(TaskSignalResponse, result), 12u);
+}
+
+TEST(WkiWire, GroupSignalAddsVersionedServiceWithoutChangingExistingMessages) {
+    EXPECT_EQ(static_cast<uint8_t>(MsgType::GROUP_SIGNAL_REQ), 0x5a);
+    EXPECT_EQ(static_cast<uint8_t>(MsgType::GROUP_SIGNAL_RESP), 0x5b);
+    EXPECT_EQ(sizeof(GroupSignalRequest), 136u);
+    EXPECT_EQ(offsetof(GroupSignalRequest, credentials), 56u);
+    EXPECT_EQ(sizeof(GroupSignalResponse), 24u);
+    EXPECT_EQ(offsetof(GroupSignalResponse, other), 16u);
+    EXPECT_EQ(WKI_GROUP_SIGNAL_VERSION, 1u);
+    EXPECT_EQ(sizeof(HelloPayload), 172u);
+    EXPECT_EQ(sizeof(TaskSignalRequest), 112u);
+    EXPECT_EQ(sizeof(TaskSignalResponse), 16u);
+}
+
+TEST(WkiWire, GroupRoutingHasBoundedVersionedIdentityAndPages) {
+    EXPECT_EQ(static_cast<uint8_t>(MsgType::GROUP_ROUTE_REQ), 0x5e);
+    EXPECT_EQ(static_cast<uint8_t>(MsgType::GROUP_ROUTE_RESP), 0x5f);
+    EXPECT_EQ(sizeof(TaskSignalHome), 16u);
+    EXPECT_EQ(sizeof(GroupAnchor), 16u);
+    EXPECT_EQ(sizeof(GroupRouteRequest), 176u);
+    EXPECT_EQ(offsetof(GroupRouteRequest, credentials), 56u);
+    EXPECT_EQ(offsetof(GroupRouteRequest, home), 136u);
+    EXPECT_EQ(offsetof(GroupRouteRequest, ceiling), 168u);
+    EXPECT_EQ(sizeof(GroupRouteResponse), 576u);
+    EXPECT_EQ(offsetof(GroupRouteResponse, anchors), 64u);
+    EXPECT_EQ(WKI_GROUP_ANCHOR_PAGE, 32u);
+    EXPECT_EQ(WKI_GROUP_ROUTE_VERSION, 1u);
+    EXPECT_EQ(WKI_TASK_SUBMIT_GROUP_HOME & WKI_TASK_SUBMIT_EXEC_HANDOFF, 0u);
+}
+
+TEST(WkiWire, CurrentReceiverPagesPreserveLegacyRoutes) {
+    EXPECT_EQ(static_cast<uint8_t>(MsgType::GROUP_RECEIVER_REQ), 0x60);
+    EXPECT_EQ(static_cast<uint8_t>(MsgType::GROUP_RECEIVER_RESP), 0x61);
+    EXPECT_EQ(sizeof(GroupReceiver), 32u);
+    EXPECT_EQ(offsetof(GroupReceiver, home), 16u);
+    EXPECT_EQ(sizeof(GroupReceiverResponse), 1056u);
+    EXPECT_EQ(offsetof(GroupReceiverResponse, receivers), 32u);
+    EXPECT_EQ(WKI_GROUP_RECEIVER_PAGE, 32u);
+    EXPECT_EQ(WKI_GROUP_RECEIVER_VERSION, 1u);
+    EXPECT_NE(WKI_GROUP_RECEIVER_RESOURCE_ID, WKI_GROUP_ROUTE_RESOURCE_ID);
+    EXPECT_EQ(sizeof(GroupRouteRequest), 176u);
+    EXPECT_EQ(sizeof(GroupRouteResponse), 576u);
+}
+
+TEST(WkiWire, ExecHandoffAddsRecordsWithoutChangingExistingSubmitOrSignalLayouts) {
+    EXPECT_EQ(WKI_EXEC_HANDOFF_RESOURCE_ID, 0x45584304u);
+    EXPECT_EQ(sizeof(TaskExecCredentialTransition), 16u);
+    EXPECT_EQ(offsetof(TaskExecCredentialTransition, uid), 4u);
+    EXPECT_EQ(offsetof(TaskExecCredentialTransition, mode), 12u);
+    EXPECT_EQ(TaskExecCredentialTransition{}.version, 1u);
+    EXPECT_EQ(static_cast<uint8_t>(MsgType::TASK_EXEC_READY), 0x5c);
+    EXPECT_EQ(static_cast<uint8_t>(MsgType::TASK_EXEC_COMMIT), 0x5d);
+    EXPECT_EQ(sizeof(TaskExecReady), 16u);
+    EXPECT_EQ(offsetof(TaskExecReady, remote_pid), 8u);
+    EXPECT_EQ(sizeof(TaskExecCommit), 56u);
+    EXPECT_EQ(offsetof(TaskExecCommit, signals), 16u);
+    EXPECT_EQ(sizeof(TaskSubmitPayload), 20u);
+    EXPECT_EQ(sizeof(TaskResponsePayload), 16u);
+    EXPECT_EQ(sizeof(TaskSignalRequest), 112u);
+    EXPECT_EQ(sizeof(HelloPayload), 172u);
+}
+
+TEST(WkiWire, ExecSignalValuesExcludeUnblockableOverridesAndValidateVersion) {
+    EXPECT_EQ(sizeof(TaskExecSignals), 40u);
+    EXPECT_EQ(offsetof(TaskExecSignals, blocked), 8u);
+    EXPECT_EQ(offsetof(TaskExecSignals, ignored), 16u);
+    EXPECT_EQ(offsetof(TaskExecSignals, pending), 24u);
+    TaskExecSignals state{};
+    EXPECT_TRUE(valid_exec_signals(state));
+    for (unsigned i = 0; i < 64; ++i) {
+        uint64_t const BIT = uint64_t{1} << i;
+        bool const OVERRIDE_ALLOWED = i != 8 && i != 18;
+        state = {};
+        state.pending = BIT;
+        EXPECT_TRUE(valid_exec_signals(state));
+        state.blocked = BIT;
+        EXPECT_EQ(valid_exec_signals(state), OVERRIDE_ALLOWED);
+        state.blocked = 0;
+        state.ignored = BIT;
+        EXPECT_EQ(valid_exec_signals(state), OVERRIDE_ALLOWED);
+    }
+    state = {};
+    state.version = WKI_EXEC_SIGNALS_VERSION + 1;
+    EXPECT_FALSE(valid_exec_signals(state));
+    state = {};
+    state.reserved = 1;
+    EXPECT_FALSE(valid_exec_signals(state));
+    state = {};
+    state.reserved2 = 1;
+    EXPECT_FALSE(valid_exec_signals(state));
+}
+
+TEST(WkiWire, GroupAliasResolutionIsIndependentOfPeerOrderAndDuplicateObservations) {
+    using namespace ker::mod::sched::session;
+    std::array<Origin, 4> const ORIGINS{{{}, {40, 3}, {41, 3}, {41, 4}}};
+    for (bool allow_own : {false, true}) {
+        std::optional<Origin> const OWN = allow_own ? std::optional{ORIGINS[1]} : std::nullopt;
+        for (unsigned mask = 0; mask < 16; ++mask) {
+            std::optional<Origin> expected;
+            if ((mask & 1) != 0)
+                expected = ORIGINS[0];
+            else if (allow_own && (mask & 2) != 0)
+                expected = ORIGINS[1];
+            else if (mask != 0 && (mask & (mask - 1)) == 0) {
+                for (unsigned i = 0; i < 4; ++i)
+                    if ((mask & (1u << i)) != 0) expected = ORIGINS[i];
+            }
+            std::array<unsigned, 4> order{0, 1, 2, 3};
+            do {
+                GroupCandidates result;
+                for (auto i : order) {
+                    GroupCandidates peer;
+                    if ((mask & (1u << i)) != 0) peer.observe(ORIGINS[i], {}, OWN);
+                    result.merge(peer);
+                    result.merge(peer);
+                }
+                EXPECT_EQ(result.resolve(OWN), expected) << "mask=" << mask << " own=" << allow_own;
+            } while (std::next_permutation(order.begin(), order.end()));
+        }
+    }
+}
+
+TEST(WkiWire, ParentDeathRegistrationHasVersionedExecAndSeparateEvent) {
+    EXPECT_EQ(static_cast<uint8_t>(MsgType::TASK_PARENT_DEATH), 0x63);
+    EXPECT_EQ(sizeof(TaskParentDeath), 8u);
+    EXPECT_EQ(offsetof(TaskExecSignals, parent_death_signal), 32u);
+    EXPECT_EQ(offsetof(TaskExecSignals, lifecycle_reserved), 36u);
+    TaskExecSignals state{};
+    for (uint32_t value = 0; value <= 65; ++value) {
+        state.parent_death_signal = value;
+        EXPECT_EQ(valid_exec_signals(state), value <= 64);
+    }
+    state = {};
+    state.lifecycle_reserved = 1;
+    EXPECT_FALSE(valid_exec_signals(state));
+    state = {};
+    state.version = 1;
+    EXPECT_FALSE(valid_exec_signals(state));
+}
+
+TEST(WkiWire, ChildSignalCarriesOnlyVersionedExecutionAuthority) {
+    EXPECT_EQ(static_cast<uint8_t>(MsgType::TASK_CHILD_SIGNAL), 0x64);
+    EXPECT_EQ(sizeof(TaskChildSignal), 8u);
+    EXPECT_EQ(offsetof(TaskChildSignal, hops), 6u);
+    EXPECT_EQ(TaskChildSignal{}.version, WKI_CHILD_SIGNAL_VERSION);
+    EXPECT_NE(WKI_CHILD_SIGNAL_RESOURCE_ID, WKI_PARENT_DEATH_RESOURCE_ID);
 }

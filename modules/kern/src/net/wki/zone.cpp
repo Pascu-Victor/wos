@@ -6,12 +6,16 @@
 #include <cstdint>
 #include <cstring>
 #include <net/wki/event.hpp>
+#ifdef WOS_SELFTEST
+#include <net/wki/dev_server.hpp>
+#endif
 #include <net/wki/transport_ivshmem.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <utility>
 #include <vector>
 
 #include "platform/mm/addr.hpp"
@@ -29,6 +33,8 @@ using log = ker::mod::dbg::logger<"wki">;
 
 namespace {
 
+auto destroy_zone(uint32_t zone_id, const WkiZone* expected) -> int;
+
 std::array<WkiZone, WKI_MAX_ZONES> s_zone_table;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 ker::mod::sys::Spinlock s_zone_table_lock;        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool s_zone_initialized = false;                  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -41,12 +47,13 @@ enum class ZoneCreateWorkKind : uint8_t {
 struct ZoneCreateWork {
     ZoneCreateWorkKind kind = ZoneCreateWorkKind::REQUEST;
     WkiHeader header{};
+    WkiChannelIdentity channel_identity{};
     ZoneCreateReqPayload request{};
     ZoneCreateAckPayload ack{};
 };
 
-void process_zone_create_request(const WkiHeader& header, const ZoneCreateReqPayload& request);
-void process_zone_create_ack(const WkiHeader& header, const ZoneCreateAckPayload& ack);
+void process_zone_create_request(const WkiHeader& header, const ZoneCreateReqPayload& request, const WkiChannelIdentity& identity);
+void process_zone_create_ack(const WkiHeader& header, const ZoneCreateAckPayload& ack, const WkiChannelIdentity& identity);
 
 // At most one request-side and one ACK-side setup can exist for each zone
 // slot. Keeping both populations in fixed storage makes RX admission bounded
@@ -101,6 +108,91 @@ auto dequeue_zone_create_work(ZoneCreateWork* work) -> bool {
     return true;
 }
 
+auto zone_channel_live(const WkiChannelIdentity& identity) -> bool {
+    return identity.channel_id == WKI_CHAN_ZONE_MGMT && identity.peer_node_id != WKI_NODE_INVALID &&
+           identity.peer_node_id != WKI_NODE_BROADCAST &&
+           wki_channel_generation_is_live(identity.channel, identity.peer_node_id, identity.channel_id, identity.generation);
+}
+
+auto same_zone_channel(const WkiChannelIdentity& left, const WkiChannelIdentity& right) -> bool {
+    return left.channel != nullptr && left.channel == right.channel && left.peer_node_id == right.peer_node_id &&
+           left.channel_id == right.channel_id && left.generation == right.generation;
+}
+
+struct ZonePostNotification {
+    WkiChannelIdentity channel{};
+    ZoneNotifyPayload payload{};
+};
+
+// Caller retains this exact ACTIVE allocation. Its ID and channel identity
+// stay immutable until the last pin releases; retirement only ends admission.
+auto prepare_zone_post_notification(const WkiZone* zone, uint8_t op_type, ZonePostNotification& output) -> int {
+    if (op_type > 1) return WKI_ERR_INVALID;  // rkey exchange is a separate setup operation
+    if (zone == nullptr || zone->retiring.load(std::memory_order_acquire) || !zone_channel_live(zone->channel_identity) ||
+        zone->retiring.load(std::memory_order_acquire))
+        return WKI_ERR_ZONE_INACTIVE;
+    ZonePostNotification prepared{};
+    prepared.channel = zone->channel_identity;
+    prepared.payload.zone_id = zone->zone_id;
+    prepared.payload.op_type = op_type;
+    output = prepared;
+    return WKI_OK;
+}
+
+// Task-context local setup only. Release before waiting for a peer response.
+class ZoneSetupLease {
+   public:
+    ZoneSetupLease() = default;
+    ZoneSetupLease(const ZoneSetupLease&) = delete;
+    auto operator=(const ZoneSetupLease&) -> ZoneSetupLease& = delete;
+    ~ZoneSetupLease() { release(); }
+    auto acquire(uint16_t node) -> bool {
+        if (peer != nullptr) return false;
+        WkiPeer* candidate = wki_peer_find(node);
+        if (!wki_peer_lifecycle_acquire(candidate)) return false;
+        peer = candidate;
+        if (peer->node_id != node || peer->state != PeerState::CONNECTED ||
+            peer->vfs_reset_rebind_pending.load(std::memory_order_acquire)) {
+            release();
+            return false;
+        }
+        return true;
+    }
+    auto try_acquire(uint16_t node) -> bool {
+        if (peer != nullptr) return false;
+        WkiPeer* candidate = wki_peer_find(node);
+        if (!wki_peer_lifecycle_try_acquire(candidate)) return false;
+        peer = candidate;
+        if (peer->node_id != node || peer->state != PeerState::CONNECTED ||
+            peer->vfs_reset_rebind_pending.load(std::memory_order_acquire)) {
+            release();
+            return false;
+        }
+        return true;
+    }
+    void release() {
+        if (peer != nullptr) {
+            wki_peer_lifecycle_release(peer);
+            peer = nullptr;
+        }
+    }
+
+   private:
+    WkiPeer* peer = nullptr;
+};
+
+void process_zone_create_work(const ZoneCreateWork& work) {
+    ZoneSetupLease lifecycle;
+    if (!lifecycle.acquire(work.header.src_node) || work.channel_identity.peer_node_id != work.header.src_node ||
+        !zone_channel_live(work.channel_identity))
+        return;
+    if (work.kind == ZoneCreateWorkKind::REQUEST) {
+        process_zone_create_request(work.header, work.request, work.channel_identity);
+    } else {
+        process_zone_create_ack(work.header, work.ack, work.channel_identity);
+    }
+}
+
 [[noreturn]] void zone_create_worker_thread() {
     for (;;) {
         if (!s_zone_create_work_pending.exchange(false, std::memory_order_acq_rel)) {
@@ -110,11 +202,7 @@ auto dequeue_zone_create_work(ZoneCreateWork* work) -> bool {
 
         ZoneCreateWork work{};
         while (dequeue_zone_create_work(&work)) {
-            if (work.kind == ZoneCreateWorkKind::REQUEST) {
-                process_zone_create_request(work.header, work.request);
-            } else {
-                process_zone_create_ack(work.header, work.ack);
-            }
+            process_zone_create_work(work);
         }
     }
 }
@@ -185,6 +273,7 @@ auto zone_write_ack_matches_pending(const WkiZone& zone, const ZoneWriteAckPaylo
 void reset_zone_metadata(WkiZone* zone) {
     zone->zone_id = 0;
     zone->peer_node_id = WKI_NODE_INVALID;
+    zone->channel_identity = {};
     zone->state = ZoneState::NONE;
     zone->size = 0;
     zone->local_vaddr = nullptr;
@@ -581,22 +670,33 @@ void wki_zone_worker_start() {
 // Public API - Zone creation
 // -----------------------------------------------------------------------------
 
-auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t access_policy, ZoneNotifyMode notify, ZoneTypeHint hint)
-    -> int {
+auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t access_policy, ZoneNotifyMode notify, ZoneTypeHint hint,
+                     WkiZoneRef* local_ref) -> int {
     if (!s_zone_initialized) {
         return WKI_ERR_INVALID;
     }
+
+    uint8_t const LOCAL_ACCESS = access_policy & (ZONE_ACCESS_LOCAL_READ | ZONE_ACCESS_LOCAL_WRITE);
+    if (local_ref != nullptr && (*local_ref || LOCAL_ACCESS == 0)) return WKI_ERR_INVALID;
 
     // Size must be page-aligned
     if (size == 0 || (size & 0xFFF) != 0) {
         return WKI_ERR_INVALID;
     }
 
-    // Check peer is connected
-    WkiPeer const* p = wki_peer_find(peer);
-    if (p == nullptr || p->state != PeerState::CONNECTED) {
-        return WKI_ERR_PEER_FENCED;
+    ZoneSetupLease lifecycle;
+    // Device setup callers can retain a binding that peer cleanup must drain.
+    // Never wait for that cleanup's lifecycle writer while holding its pin.
+    if (!lifecycle.try_acquire(peer)) return WKI_ERR_BUSY;
+    WkiChannel* channel = wki_channel_get(peer, WKI_CHAN_ZONE_MGMT);
+    if (channel == nullptr) return WKI_ERR_NO_MEM;
+    WkiChannelIdentity identity{};
+    channel->lock.lock();
+    if (channel->active && channel->peer_node_id == peer && channel->channel_id == WKI_CHAN_ZONE_MGMT) {
+        identity = {channel, peer, WKI_CHAN_ZONE_MGMT, channel->generation};
     }
+    channel->lock.unlock();
+    if (!zone_channel_live(identity)) return WKI_ERR_NOT_FOUND;
 
     s_zone_table_lock.lock();
 
@@ -616,6 +716,7 @@ auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t acc
     // Set up zone in NEGOTIATING state
     zone->zone_id = zone_id;
     zone->peer_node_id = peer;
+    zone->channel_identity = identity;
     zone->state = ZoneState::NEGOTIATING;
     zone->size = size;
     zone->access_policy = access_policy;
@@ -666,7 +767,7 @@ auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t acc
     zone->read_status = 0;
     zone->lock.unlock();
 
-    int const RET = wki_send(peer, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_CREATE_REQ, &req, sizeof(req));
+    int const RET = wki_send_on_channel_identity(identity, MsgType::ZONE_CREATE_REQ, &req, sizeof(req));
     if (RET != WKI_OK) {
         cancel_read_waiter(zone, create_wait, RET);
         s_zone_table_lock.lock();
@@ -675,6 +776,8 @@ auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t acc
         release_zone(zone);
         return RET;
     }
+
+    lifecycle.release();
 
     // Wait for ACK via async wait queue
     int const WAIT_RC = wki_wait_for_op(&create_wait, WKI_OP_TIMEOUT_US);
@@ -688,7 +791,22 @@ auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t acc
         return WKI_ERR_ZONE_TIMEOUT;
     }
 
-    if (zone->state == ZoneState::ACTIVE) {
+    if (local_ref != nullptr) {
+        // Transfer ownership from the exact initiating slot before releasing
+        // its waiter pin. Numeric lookup after return could select a successor.
+        *local_ref = WkiZoneRef::retain(zone, peer, LOCAL_ACCESS);
+        if (!*local_ref) {
+            static_cast<void>(destroy_zone(zone_id, zone));
+            release_zone(zone);
+            return WKI_ERR_ZONE_INACTIVE;
+        }
+        release_zone(zone);
+        return WKI_OK;
+    }
+    s_zone_table_lock.lock();
+    bool const ACTIVE = zone->state == ZoneState::ACTIVE && !zone->retiring.load(std::memory_order_acquire);
+    s_zone_table_lock.unlock();
+    if (ACTIVE) {
         release_zone(zone);
         return WKI_OK;
     }
@@ -702,18 +820,20 @@ auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t acc
 // Public API - Zone destruction
 // -----------------------------------------------------------------------------
 
-auto wki_zone_destroy(uint32_t zone_id) -> int {
+namespace {
+
+auto destroy_zone(uint32_t zone_id, const WkiZone* expected) -> int {
     WkiWaitEntry* read_waiter = nullptr;
     WkiWaitEntry* write_waiter = nullptr;
     s_zone_table_lock.lock();
 
     WkiZone* zone = find_zone_slot(zone_id);
-    if (zone == nullptr) {
+    if (zone == nullptr || (expected != nullptr && zone != expected)) {
         s_zone_table_lock.unlock();
         return WKI_ERR_ZONE_NOT_FOUND;
     }
 
-    uint16_t const PEER = zone->peer_node_id;
+    WkiChannelIdentity const IDENTITY = zone->channel_identity;
 
     mark_zone_retiring_locked(zone);
     zone->lock.lock();
@@ -741,12 +861,16 @@ auto wki_zone_destroy(uint32_t zone_id) -> int {
     // Notify peer
     ZoneDestroyPayload destroy = {};
     destroy.zone_id = zone_id;
-    wki_send(PEER, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_DESTROY, &destroy, sizeof(destroy));
+    wki_send_on_channel_identity(IDENTITY, MsgType::ZONE_DESTROY, &destroy, sizeof(destroy));
 
     log::info("Zone 0x%08x destroyed", zone_id);
     wki_event_publish(EVENT_CLASS_ZONE, EVENT_ZONE_DESTROYED, &zone_id, sizeof(zone_id));
     return WKI_OK;
 }
+
+}  // namespace
+
+auto wki_zone_destroy(uint32_t zone_id) -> int { return destroy_zone(zone_id, nullptr); }
 
 // -----------------------------------------------------------------------------
 // Public API - Zone lookup
@@ -785,7 +909,7 @@ auto wki_zone_read(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len) -
         return WKI_ERR_INVALID;
     }
 
-    // For RDMA zones, the caller should use wki_zone_get_ptr() directly
+    // For RDMA zones, the caller must retain a local WkiZoneRef
     if (zone->is_rdma) {
         if (zone->local_vaddr == nullptr) {
             release_zone(zone);
@@ -836,7 +960,7 @@ auto wki_zone_read(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len) -
         req.length = chunk;
         req.op_cookie = OP_COOKIE;
 
-        int const RET = wki_send(zone->peer_node_id, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_READ_REQ, &req, sizeof(req));
+        int const RET = wki_send_on_channel_identity(zone->channel_identity, MsgType::ZONE_READ_REQ, &req, sizeof(req));
         if (RET != WKI_OK) {
             cancel_read_waiter(zone, read_wait, RET);
             release_zone(zone);
@@ -891,7 +1015,7 @@ auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t
         return WKI_ERR_INVALID;
     }
 
-    // For RDMA zones, the caller should use wki_zone_get_ptr() directly
+    // For RDMA zones, the caller must retain a local WkiZoneRef
     if (zone->is_rdma) {
         if (zone->local_vaddr == nullptr) {
             release_zone(zone);
@@ -950,7 +1074,7 @@ auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t
         zone->lock.unlock();
         req->op_cookie = OP_COOKIE;
 
-        int const RET = wki_send(zone->peer_node_id, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_WRITE_REQ, msg_buf, msg_len);
+        int const RET = wki_send_on_channel_identity(zone->channel_identity, MsgType::ZONE_WRITE_REQ, msg_buf, msg_len);
         delete[] msg_buf;
 
         if (RET != WKI_OK) {
@@ -987,20 +1111,91 @@ auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t
 // Public API - RDMA direct access
 // -----------------------------------------------------------------------------
 
-// Returns a raw pointer to the zone's local backing memory for RDMA direct access.
-// The caller is responsible for respecting the zone's access_policy bits
-// (ZONE_ACCESS_LOCAL_READ/WRITE, ZONE_ACCESS_REMOTE_READ/WRITE from wire.hpp).
-// No enforcement is done here - policy checks are performed at the message-based
-// read/write paths (wki_zone_read / wki_zone_write).
-auto wki_zone_get_ptr(uint32_t zone_id) -> void* {
-    WkiZone* zone = acquire_zone_slot(zone_id);
-    if (zone == nullptr || zone->state != ZoneState::ACTIVE) {
-        release_zone(zone);
-        return nullptr;
+WkiZoneRef::WkiZoneRef(WkiZoneRef&& other) noexcept
+    : zone_(std::exchange(other.zone_, nullptr)), memory_(std::exchange(other.memory_, {})) {}
+
+auto WkiZoneRef::operator=(WkiZoneRef&& other) noexcept -> WkiZoneRef& {
+    if (this != &other) {
+        reset();
+        zone_ = std::exchange(other.zone_, nullptr);
+        memory_ = std::exchange(other.memory_, {});
     }
-    void* ptr = zone->local_vaddr;
+    return *this;
+}
+
+WkiZoneRef::~WkiZoneRef() { reset(); }
+
+void WkiZoneRef::reset() {
+    WkiZone* old = std::exchange(zone_, nullptr);
+    memory_ = {};
+    release_zone(old);
+}
+
+auto WkiZoneRef::live() const -> bool {
+    // The pin keeps identity immutable. Never nest the channel lock under the
+    // zone/table lock: channel retirement may drive zone cleanup.
+    return zone_ != nullptr && !zone_->retiring.load(std::memory_order_acquire) && zone_channel_live(zone_->channel_identity) &&
+           !zone_->retiring.load(std::memory_order_acquire);
+}
+
+auto WkiZoneRef::snapshot_memory(WkiZoneMemory& output) const -> bool {
+    if (!live()) return false;
+    zone_->lock.lock();
+    bool const ACTIVE = !zone_->retiring.load(std::memory_order_acquire);
+    WkiZoneMemory const MEMORY{zone_->local_vaddr, zone_->size, zone_->is_roce, zone_->remote_rkey, zone_->rdma_transport};
+    zone_->lock.unlock();
+    if (!ACTIVE || !live()) return false;
+    output = MEMORY;
+    return true;
+}
+
+auto WkiZoneRef::retain(WkiZone* zone, uint16_t peer, uint8_t local_access) -> WkiZoneRef {
+    WkiZoneRef result;
+    constexpr uint8_t LOCAL_MASK = ZONE_ACCESS_LOCAL_READ | ZONE_ACCESS_LOCAL_WRITE;
+    if (zone == nullptr || local_access == 0 || (local_access & ~LOCAL_MASK) != 0) return result;
+    // Caller already owns a pin, so this exact slot cannot be recycled.
+    s_zone_table_lock.lock();
+    zone->lock.lock();
+    if (!zone->retiring.load(std::memory_order_acquire) && zone->state == ZoneState::ACTIVE && zone->peer_node_id == peer &&
+        zone->local_vaddr != nullptr && (zone->access_policy & local_access) == local_access) {
+        retain_zone(zone);
+        result.zone_ = zone;
+        result.memory_ = {zone->local_vaddr, zone->size, zone->is_roce, zone->remote_rkey, zone->rdma_transport};
+    }
+    zone->lock.unlock();
+    s_zone_table_lock.unlock();
+    if (!result.live()) result.reset();
+    return result;
+}
+
+auto WkiZoneRef::acquire(uint32_t zone_id, uint16_t peer, uint8_t local_access) -> WkiZoneRef {
+    WkiZone* zone = acquire_zone_slot(zone_id);
+    WkiZoneRef result = retain(zone, peer, local_access);
     release_zone(zone);
-    return ptr;
+    return result;
+}
+
+auto WkiZoneRef::destroy() const -> int { return zone_ != nullptr ? destroy_zone(zone_->zone_id, zone_) : WKI_ERR_ZONE_NOT_FOUND; }
+
+auto WkiZoneRef::notify_post(uint8_t op_type) const -> int {
+    ZonePostNotification prepared{};
+    int const RESULT = prepare_zone_post_notification(zone_, op_type, prepared);
+    if (RESULT != WKI_OK) return RESULT;
+    // Reliable enqueue rechecks this exact allocation under its channel lock.
+    // A reset after preparation cannot redirect the wake to a new generation.
+    return wki_send_on_channel_identity(prepared.channel, MsgType::ZONE_NOTIFY_POST, &prepared.payload, sizeof(prepared.payload));
+}
+
+auto WkiZoneRef::set_handlers(ZoneNotifyHandler pre, ZoneNotifyHandler post) const -> bool {
+    if (!live()) return false;
+    zone_->lock.lock();
+    bool const ACTIVE = !zone_->retiring.load(std::memory_order_acquire);
+    if (ACTIVE) {
+        zone_->pre_handler = pre;
+        zone_->post_handler = post;
+    }
+    zone_->lock.unlock();
+    return ACTIVE;
 }
 
 // -----------------------------------------------------------------------------
@@ -1223,7 +1418,7 @@ auto wki_zone_selftest_waiter_slots_and_cookies() -> bool {
 
 namespace {
 
-void process_zone_create_request(const WkiHeader& header, const ZoneCreateReqPayload& request) {
+void process_zone_create_request(const WkiHeader& header, const ZoneCreateReqPayload& request, const WkiChannelIdentity& identity) {
     uint16_t const SRC_NODE = header.src_node;
 
     // Validate size is page-aligned and non-zero
@@ -1231,7 +1426,7 @@ void process_zone_create_request(const WkiHeader& header, const ZoneCreateReqPay
         ZoneCreateAckPayload ack = {};
         ack.zone_id = request.zone_id;
         ack.status = static_cast<uint8_t>(ZoneCreateStatus::REJECTED_POLICY);
-        static_cast<void>(wki_send(SRC_NODE, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_CREATE_ACK, &ack, sizeof(ack)));
+        static_cast<void>(wki_send_on_channel_identity(identity, MsgType::ZONE_CREATE_ACK, &ack, sizeof(ack)));
         return;
     }
 
@@ -1242,7 +1437,7 @@ void process_zone_create_request(const WkiHeader& header, const ZoneCreateReqPay
         ZoneCreateAckPayload ack = {};
         ack.zone_id = request.zone_id;
         ack.status = static_cast<uint8_t>(ZoneCreateStatus::REJECTED_POLICY);
-        static_cast<void>(wki_send(SRC_NODE, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_CREATE_ACK, &ack, sizeof(ack)));
+        static_cast<void>(wki_send_on_channel_identity(identity, MsgType::ZONE_CREATE_ACK, &ack, sizeof(ack)));
         return;
     }
 
@@ -1252,7 +1447,7 @@ void process_zone_create_request(const WkiHeader& header, const ZoneCreateReqPay
         ZoneCreateAckPayload ack = {};
         ack.zone_id = request.zone_id;
         ack.status = static_cast<uint8_t>(ZoneCreateStatus::REJECTED_NO_MEM);
-        static_cast<void>(wki_send(SRC_NODE, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_CREATE_ACK, &ack, sizeof(ack)));
+        static_cast<void>(wki_send_on_channel_identity(identity, MsgType::ZONE_CREATE_ACK, &ack, sizeof(ack)));
         return;
     }
 
@@ -1262,6 +1457,7 @@ void process_zone_create_request(const WkiHeader& header, const ZoneCreateReqPay
     reset_zone_metadata(zone);
     zone->zone_id = request.zone_id;
     zone->peer_node_id = SRC_NODE;
+    zone->channel_identity = identity;
     zone->state = ZoneState::NEGOTIATING;
     zone->size = request.size;
     zone->access_policy = request.access_policy;
@@ -1307,7 +1503,7 @@ void process_zone_create_request(const WkiHeader& header, const ZoneCreateReqPay
     ack.phys_addr = published ? backing.phys_addr : 0;
     ack.rkey = published ? backing.rkey : 0;
     if (reply) {
-        static_cast<void>(wki_send(SRC_NODE, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_CREATE_ACK, &ack, sizeof(ack)));
+        static_cast<void>(wki_send_on_channel_identity(identity, MsgType::ZONE_CREATE_ACK, &ack, sizeof(ack)));
     }
 
     if (published) {
@@ -1318,7 +1514,7 @@ void process_zone_create_request(const WkiHeader& header, const ZoneCreateReqPay
     release_zone(zone);
 }
 
-void process_zone_create_ack(const WkiHeader& header, const ZoneCreateAckPayload& ack_payload) {
+void process_zone_create_ack(const WkiHeader& header, const ZoneCreateAckPayload& ack_payload, const WkiChannelIdentity& identity) {
     auto const STATUS = static_cast<ZoneCreateStatus>(ack_payload.status);
     WkiWaitEntry* create_waiter = nullptr;
     WkiZone* zone = nullptr;
@@ -1327,12 +1523,12 @@ void process_zone_create_ack(const WkiHeader& header, const ZoneCreateAckPayload
     s_zone_table_lock.lock();
     zone = find_zone_slot(ack_payload.zone_id);
     if (zone == nullptr || zone->state != ZoneState::NEGOTIATING || !zone->is_initiator || zone->peer_node_id != header.src_node ||
-        zone->retiring.load(std::memory_order_acquire)) {
+        !same_zone_channel(zone->channel_identity, identity) || zone->retiring.load(std::memory_order_acquire)) {
         s_zone_table_lock.unlock();
         if (STATUS == ZoneCreateStatus::ACCEPTED) {
             ZoneDestroyPayload destroy = {};
             destroy.zone_id = ack_payload.zone_id;
-            static_cast<void>(wki_send(header.src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_DESTROY, &destroy, sizeof(destroy)));
+            static_cast<void>(wki_send_on_channel_identity(identity, MsgType::ZONE_DESTROY, &destroy, sizeof(destroy)));
         }
         return;
     }
@@ -1351,7 +1547,7 @@ void process_zone_create_ack(const WkiHeader& header, const ZoneCreateAckPayload
         if (STATUS == ZoneCreateStatus::ACCEPTED) {
             ZoneDestroyPayload destroy = {};
             destroy.zone_id = ack_payload.zone_id;
-            static_cast<void>(wki_send(header.src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_DESTROY, &destroy, sizeof(destroy)));
+            static_cast<void>(wki_send_on_channel_identity(identity, MsgType::ZONE_DESTROY, &destroy, sizeof(destroy)));
         }
         release_zone(zone);
         return;
@@ -1385,7 +1581,7 @@ void process_zone_create_ack(const WkiHeader& header, const ZoneCreateAckPayload
             release_prepared_zone_backing(&backing, zone_size);
             ZoneDestroyPayload destroy = {};
             destroy.zone_id = ack_payload.zone_id;
-            static_cast<void>(wki_send(header.src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_DESTROY, &destroy, sizeof(destroy)));
+            static_cast<void>(wki_send_on_channel_identity(identity, MsgType::ZONE_DESTROY, &destroy, sizeof(destroy)));
         } else if (backing.is_roce && backing.rkey != 0) {
             // RoCE has separate local memory. Publish our key only after that
             // backing is active under the exact retained zone identity.
@@ -1394,7 +1590,7 @@ void process_zone_create_ack(const WkiHeader& header, const ZoneCreateAckPayload
             rkey_notify.offset = backing.rkey;
             rkey_notify.length = 0;
             rkey_notify.op_type = 0xFE;
-            static_cast<void>(wki_send(header.src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_NOTIFY_POST, &rkey_notify, sizeof(rkey_notify)));
+            static_cast<void>(wki_send_on_channel_identity(identity, MsgType::ZONE_NOTIFY_POST, &rkey_notify, sizeof(rkey_notify)));
         }
 
         if (published) {
@@ -1419,7 +1615,10 @@ void process_zone_create_ack(const WkiHeader& header, const ZoneCreateAckPayload
 
 namespace detail {
 
-void handle_zone_create_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
+void handle_zone_create_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, const WkiChannelIdentity& identity) {
+    if (hdr == nullptr || payload == nullptr || hdr->channel_id != WKI_CHAN_ZONE_MGMT || identity.peer_node_id != hdr->src_node ||
+        !zone_channel_live(identity))
+        return;
     if (hdr == nullptr || payload == nullptr || payload_len < sizeof(ZoneCreateReqPayload)) {
         return;
     }
@@ -1427,16 +1626,20 @@ void handle_zone_create_req(const WkiHeader* hdr, const uint8_t* payload, uint16
     ZoneCreateWork work{};
     work.kind = ZoneCreateWorkKind::REQUEST;
     work.header = *hdr;
+    work.channel_identity = identity;
     std::memcpy(&work.request, payload, sizeof(work.request));
     if (!enqueue_zone_create_work(work)) {
         ZoneCreateAckPayload ack = {};
         ack.zone_id = work.request.zone_id;
         ack.status = static_cast<uint8_t>(ZoneCreateStatus::REJECTED_NO_MEM);
-        static_cast<void>(wki_send(hdr->src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_CREATE_ACK, &ack, sizeof(ack)));
+        static_cast<void>(wki_send_on_channel_identity(identity, MsgType::ZONE_CREATE_ACK, &ack, sizeof(ack)));
     }
 }
 
-void handle_zone_create_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
+void handle_zone_create_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, const WkiChannelIdentity& identity) {
+    if (hdr == nullptr || payload == nullptr || hdr->channel_id != WKI_CHAN_ZONE_MGMT || identity.peer_node_id != hdr->src_node ||
+        !zone_channel_live(identity))
+        return;
     if (hdr == nullptr || payload == nullptr || payload_len < sizeof(ZoneCreateAckPayload)) {
         return;
     }
@@ -1444,13 +1647,17 @@ void handle_zone_create_ack(const WkiHeader* hdr, const uint8_t* payload, uint16
     ZoneCreateWork work{};
     work.kind = ZoneCreateWorkKind::ACK;
     work.header = *hdr;
+    work.channel_identity = identity;
     std::memcpy(&work.ack, payload, sizeof(work.ack));
     if (!enqueue_zone_create_work(work)) {
         log::error("Zone create ACK work queue exhausted: peer=0x%04x zone=0x%08x", hdr->src_node, work.ack.zone_id);
     }
 }
 
-void handle_zone_destroy(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
+void handle_zone_destroy(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, const WkiChannelIdentity& identity) {
+    if (hdr == nullptr || payload == nullptr || hdr->channel_id != WKI_CHAN_ZONE_MGMT || identity.peer_node_id != hdr->src_node ||
+        !zone_channel_live(identity))
+        return;
     if (payload_len < sizeof(ZoneDestroyPayload)) {
         return;
     }
@@ -1468,7 +1675,7 @@ void handle_zone_destroy(const WkiHeader* hdr, const uint8_t* payload, uint16_t 
     }
 
     // Only the peer that shares this zone can destroy it
-    if (zone->peer_node_id != hdr->src_node) {
+    if (zone->peer_node_id != hdr->src_node || !same_zone_channel(zone->channel_identity, identity)) {
         s_zone_table_lock.unlock();
         return;
     }
@@ -1503,7 +1710,10 @@ void handle_zone_destroy(const WkiHeader* hdr, const uint8_t* payload, uint16_t 
 // RX Handlers - Zone notifications
 // -----------------------------------------------------------------------------
 
-void handle_zone_notify_pre(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
+void handle_zone_notify_pre(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, const WkiChannelIdentity& identity) {
+    if (hdr == nullptr || payload == nullptr || hdr->channel_id != WKI_CHAN_ZONE_MGMT || identity.peer_node_id != hdr->src_node ||
+        !zone_channel_live(identity))
+        return;
     if (payload_len < sizeof(ZoneNotifyPayload)) {
         return;
     }
@@ -1515,7 +1725,7 @@ void handle_zone_notify_pre(const WkiHeader* hdr, const uint8_t* payload, uint16
         release_zone(zone);
         return;
     }
-    if (zone->peer_node_id != hdr->src_node) {
+    if (zone->peer_node_id != hdr->src_node || !same_zone_channel(zone->channel_identity, identity)) {
         release_zone(zone);
         return;
     }
@@ -1535,11 +1745,14 @@ void handle_zone_notify_pre(const WkiHeader* hdr, const uint8_t* payload, uint16
     // Send ACK back to notifier
     ZoneNotifyAckPayload ack = {};
     ack.zone_id = notify->zone_id;
-    wki_send(hdr->src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_NOTIFY_PRE_ACK, &ack, sizeof(ack));
+    wki_send_on_channel_identity(identity, MsgType::ZONE_NOTIFY_PRE_ACK, &ack, sizeof(ack));
     release_zone(zone);
 }
 
-void handle_zone_notify_post(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
+void handle_zone_notify_post(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, const WkiChannelIdentity& identity) {
+    if (hdr == nullptr || payload == nullptr || hdr->channel_id != WKI_CHAN_ZONE_MGMT || identity.peer_node_id != hdr->src_node ||
+        !zone_channel_live(identity))
+        return;
     if (payload_len < sizeof(ZoneNotifyPayload)) {
         return;
     }
@@ -1551,7 +1764,7 @@ void handle_zone_notify_post(const WkiHeader* hdr, const uint8_t* payload, uint1
         release_zone(zone);
         return;
     }
-    if (zone->peer_node_id != hdr->src_node) {
+    if (zone->peer_node_id != hdr->src_node || !same_zone_channel(zone->channel_identity, identity)) {
         release_zone(zone);
         return;
     }
@@ -1582,7 +1795,7 @@ void handle_zone_notify_post(const WkiHeader* hdr, const uint8_t* payload, uint1
     // Send ACK back to notifier
     ZoneNotifyAckPayload ack = {};
     ack.zone_id = notify->zone_id;
-    wki_send(hdr->src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_NOTIFY_POST_ACK, &ack, sizeof(ack));
+    wki_send_on_channel_identity(identity, MsgType::ZONE_NOTIFY_POST_ACK, &ack, sizeof(ack));
     release_zone(zone);
 }
 
@@ -1590,7 +1803,10 @@ void handle_zone_notify_post(const WkiHeader* hdr, const uint8_t* payload, uint1
 // RX Handlers - Zone read (message-based)
 // -----------------------------------------------------------------------------
 
-void handle_zone_read_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
+void handle_zone_read_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, const WkiChannelIdentity& identity) {
+    if (hdr == nullptr || payload == nullptr || hdr->channel_id != WKI_CHAN_ZONE_MGMT || identity.peer_node_id != hdr->src_node ||
+        !zone_channel_live(identity))
+        return;
     if (payload_len < sizeof(ZoneReadReqPayload)) {
         return;
     }
@@ -1602,7 +1818,7 @@ void handle_zone_read_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t
         release_zone(zone);
         return;
     }
-    if (zone->peer_node_id != hdr->src_node) {
+    if (zone->peer_node_id != hdr->src_node || !same_zone_channel(zone->channel_identity, identity)) {
         release_zone(zone);
         return;
     }
@@ -1637,12 +1853,15 @@ void handle_zone_read_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t
     // Copy data from local zone backing
     memcpy(resp_buf + sizeof(ZoneReadRespPayload), static_cast<uint8_t*>(zone->local_vaddr) + req->offset, DATA_LEN);
 
-    wki_send(hdr->src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_READ_RESP, resp_buf, resp_len);
+    wki_send_on_channel_identity(identity, MsgType::ZONE_READ_RESP, resp_buf, resp_len);
     delete[] resp_buf;
     release_zone(zone);
 }
 
-void handle_zone_read_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
+void handle_zone_read_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, const WkiChannelIdentity& identity) {
+    if (hdr == nullptr || payload == nullptr || hdr->channel_id != WKI_CHAN_ZONE_MGMT || identity.peer_node_id != hdr->src_node ||
+        !zone_channel_live(identity))
+        return;
     if (payload_len < sizeof(ZoneReadRespPayload)) {
         return;
     }
@@ -1656,7 +1875,8 @@ void handle_zone_read_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_
     }
 
     zone->lock.lock();
-    if (zone->peer_node_id != hdr->src_node || zone->retiring.load(std::memory_order_acquire) || zone->state != ZoneState::ACTIVE ||
+    if (zone->peer_node_id != hdr->src_node || !same_zone_channel(zone->channel_identity, identity) ||
+        zone->retiring.load(std::memory_order_acquire) || zone->state != ZoneState::ACTIVE ||
         !zone->read_pending.load(std::memory_order_acquire)) {
         zone->lock.unlock();
         release_zone(zone);
@@ -1702,7 +1922,10 @@ void handle_zone_read_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_
 // RX Handlers - Zone write (message-based)
 // -----------------------------------------------------------------------------
 
-void handle_zone_write_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
+void handle_zone_write_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, const WkiChannelIdentity& identity) {
+    if (hdr == nullptr || payload == nullptr || hdr->channel_id != WKI_CHAN_ZONE_MGMT || identity.peer_node_id != hdr->src_node ||
+        !zone_channel_live(identity))
+        return;
     if (payload_len < sizeof(ZoneWriteReqPayload)) {
         return;
     }
@@ -1714,7 +1937,7 @@ void handle_zone_write_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         release_zone(zone);
         return;
     }
-    if (zone->peer_node_id != hdr->src_node) {
+    if (zone->peer_node_id != hdr->src_node || !same_zone_channel(zone->channel_identity, identity)) {
         release_zone(zone);
         return;
     }
@@ -1727,7 +1950,7 @@ void handle_zone_write_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         ack.length = req->length;
         ack.status = WKI_ERR_ZONE_ACCESS;
         ack.op_cookie = req->op_cookie;
-        wki_send(hdr->src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_WRITE_ACK, &ack, sizeof(ack));
+        wki_send_on_channel_identity(identity, MsgType::ZONE_WRITE_ACK, &ack, sizeof(ack));
         release_zone(zone);
         return;
     }
@@ -1752,11 +1975,14 @@ void handle_zone_write_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
     ack.length = req->length;
     ack.status = 0;  // success
     ack.op_cookie = req->op_cookie;
-    wki_send(hdr->src_node, WKI_CHAN_ZONE_MGMT, MsgType::ZONE_WRITE_ACK, &ack, sizeof(ack));
+    wki_send_on_channel_identity(identity, MsgType::ZONE_WRITE_ACK, &ack, sizeof(ack));
     release_zone(zone);
 }
 
-void handle_zone_write_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
+void handle_zone_write_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, const WkiChannelIdentity& identity) {
+    if (hdr == nullptr || payload == nullptr || hdr->channel_id != WKI_CHAN_ZONE_MGMT || identity.peer_node_id != hdr->src_node ||
+        !zone_channel_live(identity))
+        return;
     if (payload_len < sizeof(ZoneWriteAckPayload)) {
         return;
     }
@@ -1770,7 +1996,8 @@ void handle_zone_write_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_
     }
 
     zone->lock.lock();
-    if (zone->peer_node_id != hdr->src_node || zone->retiring.load(std::memory_order_acquire) || zone->state != ZoneState::ACTIVE ||
+    if (zone->peer_node_id != hdr->src_node || !same_zone_channel(zone->channel_identity, identity) ||
+        zone->retiring.load(std::memory_order_acquire) || zone->state != ZoneState::ACTIVE ||
         !zone->write_pending.load(std::memory_order_acquire)) {
         zone->lock.unlock();
         release_zone(zone);
@@ -1805,5 +2032,290 @@ void handle_zone_write_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_
 }
 
 }  // namespace detail
+
+#ifdef WOS_SELFTEST
+constexpr uint32_t SELFTEST_LOCAL_ZONE = 0x7A530101;
+
+auto wki_zone_selftest_with_local_backing(uint32_t size, bool (*test)(WkiZoneRef&)) -> bool {
+    constexpr uint16_t PEER = 0x7A53;
+    constexpr uint32_t ZONE = SELFTEST_LOCAL_ZONE;
+    if (g_wki.initialized || s_zone_create_worker_task != nullptr || find_zone_slot(ZONE) != nullptr || test == nullptr) return false;
+    void* memory = allocate_zone_backing(size);
+    if (memory == nullptr) return false;
+    std::memset(memory, 0, size);
+    WkiChannel channel{};
+    channel.active = true;
+    channel.peer_node_id = PEER;
+    channel.channel_id = WKI_CHAN_ZONE_MGMT;
+    channel.generation = 27;
+    s_zone_table_lock.lock();
+    WkiZone* zone = alloc_zone_slot();
+    if (zone != nullptr) {
+        reset_zone_metadata(zone);
+        zone->zone_id = ZONE;
+        zone->peer_node_id = PEER;
+        zone->channel_identity = {&channel, PEER, WKI_CHAN_ZONE_MGMT, channel.generation};
+        zone->size = size;
+        zone->local_vaddr = memory;
+        zone->access_policy = ZONE_ACCESS_LOCAL_READ | ZONE_ACCESS_LOCAL_WRITE;
+        zone->state = ZoneState::ACTIVE;
+        retain_zone(zone);
+    }
+    s_zone_table_lock.unlock();
+    if (zone == nullptr) {
+        ker::mod::mm::phys::page_free(memory);
+        return false;
+    }
+    WkiZoneRef ref = WkiZoneRef::acquire(ZONE, PEER, ZONE_ACCESS_LOCAL_READ | ZONE_ACCESS_LOCAL_WRITE);
+    // The original snapshot stays unchanged; a locked refresh observes late
+    // metadata on this allocation without another ID lookup.
+    zone->lock.lock();
+    zone->remote_rkey = 123;
+    zone->lock.unlock();
+    WkiZoneMemory snapshot{};
+    bool valid = ref.memory().remote_rkey == 0 && ref.snapshot_memory(snapshot) && snapshot.remote_rkey == 123 && snapshot.data == memory;
+    valid = (ref && test(ref)) && valid;
+    wki_zones_destroy_for_peer(PEER);
+    WkiZoneMemory sentinel{.data = memory, .size = 19, .remote_rkey = 456};
+    valid = valid && !ref.snapshot_memory(sentinel) && sentinel.data == memory && sentinel.size == 19 && sentinel.remote_rkey == 456;
+    ref.reset();
+    release_zone(zone);
+    return valid && zone->refs.load(std::memory_order_acquire) == 0 && zone->local_vaddr == nullptr && find_zone_slot(ZONE) == nullptr;
+}
+
+auto wki_zone_selftest_post_notification_authority() -> bool {
+    return wki_zone_selftest_with_local_backing(4096, [](WkiZoneRef& ref) -> bool {
+        WkiZone* zone = acquire_zone_slot(SELFTEST_LOCAL_ZONE);
+        if (zone == nullptr) return false;
+        ZonePostNotification prepared{};
+        bool valid = prepare_zone_post_notification(zone, 1, prepared) == WKI_OK &&
+                     same_zone_channel(prepared.channel, zone->channel_identity) && prepared.payload.zone_id == SELFTEST_LOCAL_ZONE &&
+                     prepared.payload.op_type == 1 && prepared.payload.offset == 0 && prepared.payload.length == 0;
+        ZonePostNotification const ORIGINAL = prepared;
+        valid = prepare_zone_post_notification(zone, 0, prepared) == WKI_OK && prepared.payload.op_type == 0 && valid;
+        prepared.payload.zone_id = 99;
+        valid = prepare_zone_post_notification(zone, 0xFE, prepared) == WKI_ERR_INVALID && prepared.payload.zone_id == 99 && valid;
+        // A live grant reaches the ordinary uninitialized-transport check.
+        // The fixture never enables WKI or transmits a network frame.
+        valid = ref.notify_post(1) == WKI_ERR_INVALID && valid;
+        WkiChannel* channel = ORIGINAL.channel.channel;
+        valid = wki_channel_close_generation(channel, ORIGINAL.channel.peer_node_id, ORIGINAL.channel.channel_id,
+                                             ORIGINAL.channel.generation) &&
+                valid;
+        valid = ref.notify_post(1) == WKI_ERR_ZONE_INACTIVE && valid;
+        ++channel->generation;
+        channel->active = true;
+        auto const CREDITS = channel->tx_credits;
+        auto const SEQUENCE = channel->tx_seq;
+        valid = prepare_zone_post_notification(zone, 1, prepared) == WKI_ERR_ZONE_INACTIVE && prepared.payload.zone_id == 99 && valid;
+        valid = ref.notify_post(0) == WKI_ERR_ZONE_INACTIVE && channel->tx_credits == CREDITS && channel->tx_seq == SEQUENCE &&
+                ORIGINAL.channel.generation != channel->generation && ORIGINAL.payload.zone_id == SELFTEST_LOCAL_ZONE && valid;
+        valid = ref.destroy() == WKI_OK && valid;
+        valid = ref.notify_post(1) == WKI_ERR_ZONE_INACTIVE && valid;
+        release_zone(zone);
+        return valid;
+    });
+}
+
+auto wki_zone_selftest_local_backing_retention() -> bool {
+    constexpr uint16_t PEER = 0x7A52;
+    constexpr uint32_t ZONE = 0x7A520101;
+    if (g_wki.initialized || s_zone_create_worker_task != nullptr || find_zone_slot(ZONE) != nullptr) return false;
+    WkiChannel channel{};
+    channel.active = true;
+    channel.peer_node_id = PEER;
+    channel.channel_id = WKI_CHAN_ZONE_MGMT;
+    channel.generation = 17;
+    auto prepare = [&](uint32_t size) -> WkiZone* {
+        void* memory = allocate_zone_backing(size);
+        if (memory == nullptr) return nullptr;
+        std::memset(memory, 0, size);
+        s_zone_table_lock.lock();
+        WkiZone* zone = alloc_zone_slot();
+        if (zone != nullptr) {
+            reset_zone_metadata(zone);
+            zone->zone_id = ZONE;
+            zone->peer_node_id = PEER;
+            zone->channel_identity = {&channel, PEER, WKI_CHAN_ZONE_MGMT, channel.generation};
+            zone->size = size;
+            zone->local_vaddr = memory;
+            zone->access_policy = ZONE_ACCESS_LOCAL_READ;
+            zone->state = ZoneState::ACTIVE;
+            retain_zone(zone);
+        }
+        s_zone_table_lock.unlock();
+        if (zone == nullptr) ker::mod::mm::phys::page_free(memory);
+        return zone;
+    };
+    WkiZone* zone = prepare(blk_ring_default_zone_size());
+    if (zone == nullptr) return false;
+    bool valid = !WkiZoneRef::acquire(ZONE, PEER + 1, ZONE_ACCESS_LOCAL_READ) &&
+                 !WkiZoneRef::acquire(ZONE, PEER, ZONE_ACCESS_LOCAL_WRITE) && !WkiZoneRef::acquire(ZONE, PEER, 0) &&
+                 !WkiZoneRef::acquire(ZONE, PEER, ZONE_ACCESS_REMOTE_READ) && zone->refs.load(std::memory_order_acquire) == 1;
+    WkiZoneRef read = WkiZoneRef::acquire(ZONE, PEER, ZONE_ACCESS_LOCAL_READ);
+    valid = valid && read.live() && read.memory().data == zone->local_vaddr && read.memory().size == zone->size;
+    read.reset();
+    zone->lock.lock();
+    zone->access_policy |= ZONE_ACCESS_LOCAL_WRITE;
+    zone->lock.unlock();
+    WkiZoneRef ring = WkiZoneRef::acquire(ZONE, PEER, ZONE_ACCESS_LOCAL_READ | ZONE_ACCESS_LOCAL_WRITE);
+    release_zone(zone);
+    valid = valid && ring.live() && zone->refs.load(std::memory_order_acquire) == 1;
+    if (ring) {
+        // Actual binding moves and poll path: one valid FLUSH completes, then
+        // retirement leaves the next SQE and CQ state untouched.
+        valid = wki_dev_server_selftest_zone_retention(ring) && valid;
+        valid = valid && !ring.live() && ring.memory().data == zone->local_vaddr && zone->local_vaddr != nullptr &&
+                !WkiZoneRef::acquire(ZONE, PEER, ZONE_ACCESS_LOCAL_READ) && !ring.set_handlers(nullptr, nullptr);
+        WkiZone* replacement = prepare(4096);
+        valid = valid && replacement != nullptr && replacement != zone;
+        if (replacement != nullptr) {
+            // Retained old storage cannot destroy a new zone with the same ID.
+            int const OLD_DESTROY = ring.destroy();
+            valid = valid && OLD_DESTROY == WKI_ERR_ZONE_NOT_FOUND && replacement->state == ZoneState::ACTIVE;
+            WkiZoneRef fresh = WkiZoneRef::acquire(ZONE, PEER, ZONE_ACCESS_LOCAL_READ);
+            valid = valid && fresh.live() && fresh.memory().data == replacement->local_vaddr;
+            valid = wki_channel_close_generation(&channel, PEER, WKI_CHAN_ZONE_MGMT, channel.generation) && valid;
+            valid = valid && !fresh.live() && !WkiZoneRef::acquire(ZONE, PEER, ZONE_ACCESS_LOCAL_READ);
+            ++channel.generation;
+            channel.active = true;
+            valid = valid && !fresh.live() && !WkiZoneRef::acquire(ZONE, PEER, ZONE_ACCESS_LOCAL_READ);
+            static_cast<void>(fresh.destroy());
+            fresh.reset();
+            release_zone(replacement);
+            valid = valid && replacement->local_vaddr == nullptr && replacement->refs.load(std::memory_order_acquire) == 0;
+        }
+        ring.reset();
+    } else {
+        wki_zones_destroy_for_peer(PEER);
+    }
+    valid = valid && zone->local_vaddr == nullptr && zone->refs.load(std::memory_order_acquire) == 0 && find_zone_slot(ZONE) == nullptr;
+    return valid;
+}
+
+auto wki_zone_selftest_deferred_channel_retirement() -> bool {
+    constexpr uint16_t PEER = 0x7A51;
+    constexpr uint32_t ZONE = 0x7A510101;
+    if (g_wki.initialized || s_zone_create_worker_task != nullptr || s_zone_create_work_count != 0 || wki_peer_find(PEER) != nullptr ||
+        find_zone_slot(ZONE) != nullptr)
+        return false;
+    auto const OLD_HASH = g_wki.peer_hash;
+    auto const OLD_COUNT = g_wki.peer_count;
+    auto* peer = wki_peer_alloc(PEER);
+    if (peer == nullptr) return false;
+    peer->state = PeerState::CONNECTED;
+    bool const WAS_INITIALIZED = s_zone_initialized;
+    s_zone_initialized = true;
+    bool const CLAIMED = wki_peer_lifecycle_acquire(peer);
+    int const CONTENDED_CREATE = wki_zone_create(PEER, ZONE, 4096, ZONE_ACCESS_REMOTE_READ, ZoneNotifyMode::NONE);
+    if (CLAIMED) wki_peer_lifecycle_release(peer);
+    s_zone_initialized = WAS_INITIALIZED;
+    WkiChannel channel{};
+    channel.active = true;
+    channel.peer_node_id = PEER;
+    channel.channel_id = WKI_CHAN_ZONE_MGMT;
+    channel.generation = 7;
+    WkiChannelIdentity const OLD{&channel, PEER, WKI_CHAN_ZONE_MGMT, 7};
+    WkiHeader header{};
+    header.src_node = PEER;
+    header.channel_id = WKI_CHAN_ZONE_MGMT;
+    ZoneCreateReqPayload request{};
+    request.zone_id = ZONE;
+    request.size = 4096;
+    request.access_policy = ZONE_ACCESS_REMOTE_READ | ZONE_ACCESS_REMOTE_WRITE;
+
+    detail::handle_zone_create_req(&header, reinterpret_cast<const uint8_t*>(&request), sizeof(request), OLD);
+    ZoneCreateWork popped{};
+    bool const POPPED = dequeue_zone_create_work(&popped);
+    bool valid = CLAIMED && CONTENDED_CREATE == WKI_ERR_BUSY && POPPED && same_zone_channel(popped.channel_identity, OLD);
+    valid = wki_channel_close_generation(&channel, PEER, WKI_CHAN_ZONE_MGMT, OLD.generation) && valid;
+    process_zone_create_work(popped);
+    valid = valid && find_zone_slot(ZONE) == nullptr;
+    // Closing makes the slot inactive; channel_init advances generation only
+    // when a subsequent allocation republishes that slot.
+    ++channel.generation;
+    channel.active = true;
+    WkiChannelIdentity const CURRENT{&channel, PEER, WKI_CHAN_ZONE_MGMT, channel.generation};
+    process_zone_create_work(popped);
+    valid = valid && find_zone_slot(ZONE) == nullptr;
+
+    // Current work is also refused while connected-epoch cleanup owns admission.
+    popped.channel_identity = CURRENT;
+    peer->vfs_reset_rebind_pending.store(true, std::memory_order_release);
+    process_zone_create_work(popped);
+    valid = valid && find_zone_slot(ZONE) == nullptr;
+    peer->vfs_reset_rebind_pending.store(false, std::memory_order_release);
+    process_zone_create_work(popped);
+    WkiZone* zone = acquire_zone_slot(ZONE);
+    valid = valid && zone != nullptr && zone->state == ZoneState::ACTIVE && same_zone_channel(zone->channel_identity, CURRENT);
+    if (zone != nullptr) {
+        struct Write {
+            ZoneWriteReqPayload request;
+            std::array<uint8_t, 4> data;
+        } __attribute__((packed));
+        Write write{};
+        write.request.zone_id = ZONE;
+        write.request.length = write.data.size();
+        write.request.op_cookie = 1;
+        write.data = {1, 2, 3, 4};
+        detail::handle_zone_write_req(&header, reinterpret_cast<const uint8_t*>(&write), sizeof(write), CURRENT);
+        valid = valid && std::memcmp(zone->local_vaddr, write.data.data(), write.data.size()) == 0;
+        valid = wki_channel_close_generation(&channel, PEER, WKI_CHAN_ZONE_MGMT, CURRENT.generation) && valid;
+        ++channel.generation;
+        channel.active = true;
+        WkiChannelIdentity const REPLACEMENT{&channel, PEER, WKI_CHAN_ZONE_MGMT, channel.generation};
+        write.data = {5, 6, 7, 8};
+        detail::handle_zone_write_req(&header, reinterpret_cast<const uint8_t*>(&write), sizeof(write), REPLACEMENT);
+        std::array<uint8_t, 4> const ORIGINAL{1, 2, 3, 4};
+        valid = valid && std::memcmp(zone->local_vaddr, ORIGINAL.data(), ORIGINAL.size()) == 0;
+        wki_zones_destroy_for_peer(PEER);
+        valid = valid && zone->retiring.load(std::memory_order_acquire) && zone->local_vaddr != nullptr;
+        release_zone(zone);
+
+        // An old queued ACK cannot claim the new incarnation's stack waiter.
+        WkiWaitEntry waiter{};
+        s_zone_table_lock.lock();
+        zone = alloc_zone_slot();
+        if (zone != nullptr) {
+            reset_zone_metadata(zone);
+            zone->zone_id = ZONE;
+            zone->peer_node_id = PEER;
+            zone->channel_identity = REPLACEMENT;
+            zone->state = ZoneState::NEGOTIATING;
+            zone->is_initiator = true;
+            zone->size = 4096;
+            zone->read_wait_entry = &waiter;
+            retain_zone(zone);
+        }
+        s_zone_table_lock.unlock();
+        valid = valid && zone != nullptr;
+        if (zone != nullptr) {
+            ZoneCreateWork ack{};
+            ack.kind = ZoneCreateWorkKind::ACK;
+            ack.header = header;
+            ack.channel_identity = CURRENT;
+            ack.ack.zone_id = ZONE;
+            ack.ack.status = static_cast<uint8_t>(ZoneCreateStatus::ACCEPTED);
+            process_zone_create_work(ack);
+            valid = valid && zone->read_wait_entry == &waiter && zone->state == ZoneState::NEGOTIATING &&
+                    waiter.state.load(std::memory_order_acquire) != WkiWaitEntry::DONE;
+            ack.channel_identity = REPLACEMENT;
+            process_zone_create_work(ack);
+            valid = valid && zone->state == ZoneState::ACTIVE && zone->read_wait_entry == nullptr && zone->local_vaddr != nullptr &&
+                    waiter.state.load(std::memory_order_acquire) == WkiWaitEntry::DONE;
+            wki_zones_destroy_for_peer(PEER);
+            release_zone(zone);
+        }
+    }
+    wki_zones_destroy_for_peer(PEER);
+    valid = valid && find_zone_slot(ZONE) == nullptr && peer->lifecycle_state.load(std::memory_order_acquire) == 0;
+    s_zone_create_work_pending.store(false, std::memory_order_release);
+    peer->~WkiPeer();
+    new (peer) WkiPeer();
+    g_wki.peer_hash = OLD_HASH;
+    g_wki.peer_count = OLD_COUNT;
+    return valid;
+}
+#endif
 
 }  // namespace ker::net::wki

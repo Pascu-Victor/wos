@@ -51,11 +51,18 @@ inline auto cpu_exhausted(const TaskResourceSnapshot& record) -> bool {
     return LIMIT.hard != resource::INFINITY_VALUE && record.cpu_time_us / resource::CPU_US_PER_SECOND >= LIMIT.hard;
 }
 
+inline auto valid_submission(const TaskResourceSnapshot& record, uint64_t max_fds) -> bool {
+    return valid(record, max_fds) && ((record.flags & WKI_RESOURCE_CHILD_OBSERVATIONS) != 0 ||
+                                      (record.reaped_user_time_us == 0 && record.reaped_system_time_us == 0));
+}
+
 // Destination is an unpublished, empty receiver process. Physical resources
 // are reconstructed under the imported limits; previous peaks and denials
 // remain lifetime observations, including when limits were lowered below use.
-inline auto restore(const TaskResourceSnapshot& record, resource::State& destination, uint64_t max_fds) -> bool {
-    if (!valid(record, max_fds) || record.reaped_user_time_us != 0 || record.reaped_system_time_us != 0) return false;
+inline auto restore(const TaskResourceSnapshot& record, resource::State& destination, uint64_t max_fds,
+                    TaskChildCpuObservation* observations = nullptr) -> bool {
+    bool const IMPORT = (record.flags & WKI_RESOURCE_CHILD_OBSERVATIONS) != 0;
+    if (!valid_submission(record, max_fds) || (IMPORT && observations == nullptr)) return false;
     resource::State candidate(max_fds);
     candidate.entries = record.entries;
     candidate.cpu_time_us = record.cpu_time_us;
@@ -67,15 +74,16 @@ inline auto restore(const TaskResourceSnapshot& record, resource::State& destina
         if (id != static_cast<unsigned>(abi::resource::Id::CPU)) candidate.entries[id].current = 0;
     }
     destination = candidate;
+    if (observations != nullptr) *observations = {record.reaped_user_time_us, record.reaped_system_time_us};
     return true;
 }
 
 // Compare against the immutable snapshot sent with this submission. A reply
 // from another execution or a reset counter cannot be used as a delta.
 inline auto valid_completion(const TaskResourceSnapshot& baseline, const TaskResourceSnapshot& completion, uint64_t max_fds) -> bool {
-    if (!valid(baseline, max_fds) || !valid(completion, max_fds) || completion.cpu_time_us < baseline.cpu_time_us ||
-        completion.cpu_user_time_us < baseline.cpu_user_time_us || completion.cpu_system_time_us < baseline.cpu_system_time_us ||
-        baseline.reaped_user_time_us != 0 || baseline.reaped_system_time_us != 0)
+    if (!valid_submission(baseline, max_fds) || !valid(completion, max_fds) || (completion.flags & WKI_RESOURCE_CHILD_OBSERVATIONS) != 0 ||
+        completion.cpu_time_us < baseline.cpu_time_us || completion.cpu_user_time_us < baseline.cpu_user_time_us ||
+        completion.cpu_system_time_us < baseline.cpu_system_time_us)
         return false;
     if ((baseline.flags & WKI_RESOURCE_CPU_HARD_NOTIFIED) != 0 && (completion.flags & WKI_RESOURCE_CPU_HARD_NOTIFIED) == 0) return false;
     if (baseline.cpu_last_soft_second != UINT64_MAX &&

@@ -109,57 +109,21 @@ def test_tmpfs_hardlink_aliases_share_canonical_target() -> None:
 
 def test_tmpfs_file_operations_use_canonical_node() -> None:
     source = TMPFS_CPP.read_text()
-    open_path = function_body(
-        source,
-        r"auto\s+tmpfs_open_path\(TmpNode\*\s+root,\s*const\s+char\*\s+path,\s*int\s+flags,\s*int\s+mode,\s*int\*\s+result_out\)\s*->\s*ker::vfs::File\*",
-        "tmpfs_open_path root",
-    )
-    open_node = function_body(
-        source,
-        r"auto\s+tmpfs_open_node_locked\(TmpNode\*\s+entry,\s*int\s+flags,\s*bool\s+require_directory,\s*bool\s+created_by_open,\s*int\*\s+result_out\)\s*->\s*ker::vfs::File\*",
-        "tmpfs_open_node_locked",
-    )
-    open_lookup = function_body(
-        source,
-        r"auto\s+tmpfs_open_lookup\(const\s+TmpfsLookupHandle&\s+handle,\s*int\s+flags,\s*int\s+mode,\s*bool\s+require_directory,\s*int\*\s+result_out\)\s*->\s*ker::vfs::File\*",
-        "tmpfs_open_lookup",
-    )
+    open_path = function_body(source, r"auto\s+tmpfs_open_path\([^{}]*\)\s*->\s*ker::vfs::File\*", "tmpfs path")
+    open_lookup = function_body(source, r"auto\s+tmpfs_open_lookup\([^{}]*\)\s*->\s*ker::vfs::File\*", "tmpfs lookup")
     read_body = function_body(source, r"auto\s+tmpfs_read\(ker::vfs::File\*\s+f,\s*void\*\s+buf,\s*size_t\s+count,\s*size_t\s+offset\)\s*->\s+ssize_t", "tmpfs_read")
     write_body = function_body(source, r"auto\s+tmpfs_write\(ker::vfs::File\*\s+f,\s*const\s+void\*\s+buf,\s*size_t\s+count,\s*size_t\s+offset\)\s*->\s+ssize_t", "tmpfs_write")
     close_body = function_body(source, r"auto\s+tmpfs_fops_close\(ker::vfs::File\*\s+f\)\s*->\s+int", "tmpfs_fops_close")
     truncate_body = function_body(source, r"auto\s+tmpfs_fops_truncate\(ker::vfs::File\*\s+f,\s*off_t\s+length\)\s*->\s+int", "tmpfs_fops_truncate")
 
-    require_order(
-        open_node,
-        [
-            "TmpNode* const NODE = tmpfs_canonical_node(entry)",
-            "NODE->open_count.fetch_add(1, std::memory_order_relaxed)",
-            "NODE->type == TmpNodeType::FILE",
-            "tmpfs_resize_locked(NODE, 0)",
-            "file->private_data = NODE",
-            "file->is_directory = NODE->type == TmpNodeType::DIRECTORY",
-        ],
-        "tmpfs open canonical file node",
-    )
-    require_order(
-        open_lookup,
-        [
-            "ker::mod::sys::MutexGuard guard(tmpfs_lock)",
-            "tmpfs_validate_lookup_locked(handle)",
-            "TmpNode* node = handle.target()",
-            "return tmpfs_open_node_locked(node, flags, REQUIRE_DIRECTORY, created_by_open, result_out)",
-        ],
-        "tmpfs retained lookup validates and opens one canonical node",
-    )
-    require_order(
-        open_path,
-        [
-            "tmpfs_lock.lock()",
-            "auto* file = tmpfs_open_node_locked(node, flags, false, created_by_open, result_out)",
-            "tmpfs_lock.unlock()",
-        ],
-        "tmpfs compatibility path shares locked canonical open",
-    )
+    require_order(open_lookup, ["MutexGuard guard(tmpfs_lock)", "tmpfs_validate_lookup_locked(handle)",
+                                "TmpNode* node = tmpfs_canonical_node(handle.target())", "authorize_file_open(credentials,",
+                                "tmpfs_resize_locked(node, 0)", "node->open_count.fetch_add(",
+                                "file->private_data = node", "file->is_directory = node->type == TmpNodeType::DIRECTORY"],
+                  "tmpfs validates and authorizes its canonical retained node before truncate/open")
+    require_order(open_path, ["tmpfs_acquire_lookup(credentials, root, path, &lookup)",
+                              "tmpfs_open_lookup(credentials, lookup, flags, mode, REQUIRE_DIRECTORY, &result)"],
+                  "tmpfs compatibility path shares retained canonical open")
     for body, context in [
         (read_body, "tmpfs read"),
         (write_body, "tmpfs write"),
@@ -173,21 +137,21 @@ def test_vfs_link_uses_alias_not_copy() -> None:
     core = CORE_CPP.read_text()
     link_body = function_body(
         core,
-        r"auto\s+vfs_link_resolved_paths\(const\s+char\*\s+old_abs_path,\s*const\s+char\*\s+new_abs_path,\s*bool\s+namespace_already_locked\s*=\s*false\)\s*->\s+int",
+        r"auto\s+vfs_link_resolved_paths\([^)]*\)\s*->\s+int",
         "vfs_link_resolved_paths",
     )
-    stat_helper = function_body(core, r"void\s+fill_tmpfs_node_stat\(uint32_t\s+dev_id,\s*const\s+ker::vfs::tmpfs::TmpNode\*\s+node,\s*Stat\*\s+statbuf\)", "fill_tmpfs_node_stat")
+    tmpfs = TMPFS_CPP.read_text()
+    stat_helper = function_body(tmpfs, r"void\s+tmpfs_fill_metadata_locked\([^)]*\)", "tmpfs metadata snapshot")
     unlink_body = function_body(core, r"auto\s+vfs_unlink_resolved_path\([^)]*\)\s*->\s+int", "vfs_unlink_resolved_path")
 
     require_order(
         link_body,
         [
-            "src_node = ker::vfs::tmpfs::tmpfs_canonical_node(src_node)",
-            "src_node->type == ker::vfs::tmpfs::TmpNodeType::DIRECTORY",
-            "ker::vfs::tmpfs::tmpfs_lock_tree()",
-            "ker::vfs::tmpfs::tmpfs_lookup(new_parent, new_name) != nullptr",
-            "auto* link_node = ker::vfs::tmpfs::tmpfs_create_hardlink(new_parent, new_name, src_node)",
-            "ker::vfs::tmpfs::tmpfs_unlock_tree()",
+            "TmpfsLookupHandle source{}, destination{}",
+            "tmpfs_acquire_lookup(credentials, tmpfs_root_for_mount(old_mount), old_fs, &source)",
+            "tmpfs_acquire_lookup(credentials, tmpfs_root_for_mount(new_mount), new_fs, &destination)",
+            "tmpfs_link_lookup(credentials, source, destination, nullptr,",
+            "if (ret != 0) return ret;",
             "metadata_cache_note_path_changed(\"/\", nullptr)",
             "vfs_cache_notify_path_changed(old_abs_path, new_abs_path)",
         ],
@@ -197,27 +161,20 @@ def test_vfs_link_uses_alias_not_copy() -> None:
     require_absent(link_body, "tmpfs_create_file(new_parent", "vfs_link must not create copied file")
     require_absent(link_body, "tmpfs_create_symlink(new_parent", "vfs_link must not create copied symlink")
 
-    require_order(
-        stat_helper,
-        [
-            "auto const* stat_node = ker::vfs::tmpfs::tmpfs_canonical_node(node)",
-            "statbuf->st_ino = reinterpret_cast<ino_t>(stat_node)",
-            "statbuf->st_nlink = ker::vfs::tmpfs::tmpfs_link_count(stat_node)",
-            "statbuf->st_size = static_cast<off_t>(stat_node->size)",
-        ],
-        "tmpfs stat canonical inode",
-    )
-    require_order(
-        unlink_body,
-        [
-            "bool const HARDLINK_COUNT_CHANGE = ker::vfs::tmpfs::tmpfs_link_count(child) > 1",
-            "ker::vfs::tmpfs::tmpfs_detach_child(parent, child)",
-            "ker::vfs::tmpfs::tmpfs_drop_detached_node(child)",
-            "if (HARDLINK_COUNT_CHANGE)",
-            "metadata_cache_note_path_changed(\"/\", nullptr)",
-        ],
-        "tmpfs unlink hard-link drop",
-    )
+    require_order(stat_helper, ["tmpfs_canonical_node(node)", ".inode = reinterpret_cast<uintptr_t>(canonical)",
+                                ".size = canonical->size", ".link_count = tmpfs_link_count(canonical)"], "tmpfs canonical stat identity")
+    require_order(unlink_body, ["TmpfsLookupHandle lookup", "tmpfs_acquire_lookup(",
+                                "tmpfs_unlink_lookup(credentials, lookup, &hardlink_count_changed, mount->read_only)",
+                                "if (RET == 0 && hardlink_count_changed)",
+                                'metadata_cache_note_path_changed("/", nullptr)'], "retained tmpfs unlink and hardlink invalidation")
+    require_absent(unlink_body, "tmpfs_walk_path", "unlink may not borrow a parent before locking")
+    backend = function_body(tmpfs, r"auto\s+tmpfs_unlink_lookup\([^)]*\)\s*->\s+int", "tmpfs_unlink_lookup")
+    require_order(backend, ["MutexGuard guard(tmpfs_lock)", "tmpfs_lookup_target_locked(handle, &entry, &canonical)",
+                           "authorize_file_removal(credentials,", "metadata_identity_locked(*canonical)", "if (AUTH != 0) return AUTH",
+                           "bool const LINK_COUNT_CHANGED = tmpfs_link_count(entry) > 1", "tmpfs_detach_child(handle.parent(), entry)",
+                           "tmpfs_drop_detached_node(entry)", "*hardlink_count_changed = LINK_COUNT_CHANGED"],
+                  "authorize canonical sticky ownership before detachment and output")
+
 
 
 def main() -> None:

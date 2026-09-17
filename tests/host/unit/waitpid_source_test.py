@@ -93,7 +93,10 @@ def test_task_owns_explicit_topology_events_and_waiters() -> None:
             "JOB_CONTROL_STOP",
             "CONTINUED",
             "struct ChildEvent",
-            "Task* claimed_by{}",
+            "ChildEventClaim* claimed_by{}",
+            "ChildEventClaim child_claim{this}",
+            "ChildEventClaim(const ChildEventClaim&) = delete",
+            "ChildEventClaim(ChildEventClaim&&) = delete",
             "uint64_t claim_cookie{}",
             "uint64_t process_group{}",
             "uint64_t user_time_us{}",
@@ -140,11 +143,12 @@ def test_lifecycle_lock_owns_snapshot_queue_and_claims() -> None:
             "std::atomic<uint64_t> g_event_sequence{1}",
             "std::atomic<uint64_t> g_claim_cookie{1}",
             "queue_insert_locked(owner, event)",
-            "event.process_group = effective_process_group(subject)",
+            "event.process_group = GROUP.pgid",
+            "event.group_origin = GROUP.group_origin",
             "event.user_time_us = sched_task::task_rusage_user_time_us(subject)",
             "event.system_time_us = sched_task::task_rusage_system_time_us(subject)",
             "event.status = status",
-            "EVENT->claimed_by = &waiter",
+            "EVENT->claimed_by = &claim",
             "EVENT->claim_cookie = g_claim_cookie.fetch_add",
             "clear_event_claim_locked(*EVENT)",
             "wake_no_child_waiters(owner)",
@@ -167,6 +171,12 @@ def test_lifecycle_lock_owns_snapshot_queue_and_claims() -> None:
 
     enqueue = function_body(source, "enqueue_event_locked")
     forbid_tokens(enqueue, ["new ", "delete ", "kmalloc", "wake_task", "copy_value_to_task", "dbg::"], "locked event enqueue")
+    claim = function_body(source, "claim_locked")
+    require_order(claim, "claim.event != nullptr", "first_matching_event_locked", "busy records preserve their existing claim")
+    forbid_tokens(claim, ["new ", "delete ", "get_current_task", "find_task_by_pid", "wake_task"], "executor-independent claim")
+    require_tokens(function_body(source, "claim_or_register"), ["claim_locked(owner, waiter.child_claim"], "shared local claim path")
+    clear = function_body(source, "clear_event_claim_locked")
+    require_order(clear, "CLAIMANT->event = nullptr", "drop_lifetime_ref(WAITER)", "clear record before releasing its local waiter")
     commit = function_body(source, "commit_claim")
     require_order(commit, "clear_event_claim_locked(*EVENT)", "remove_event_locked(*EVENT)", "claim retirement before event removal")
     require_order(source, "g_lifecycle_lock.unlock_irqrestore(FLAGS);", "deliver_wake(wake);", "wakes must happen outside lifecycle lock")
@@ -222,6 +232,15 @@ def test_waitpid_is_a_current_context_claim_usercopy_commit_loop() -> None:
     selector = function_body(source, "wait_selector")
     syscall = function_body(source, "wos_proc_waitpid")
     copy = function_body(source, "copy_outputs")
+    lifecycle = CHILD_EVENTS_CPP.read_text()
+    require_tokens(function_body(lifecycle, "selector_matches"), ["origin == selector.group_origin"], "group origin boundary")
+    require_tokens(function_body(lifecycle, "claim_locked"), ["claimed.group_origin = EVENT->group_origin"], "immutable claimed origin")
+    require_tokens(lifecycle, ["registration.selector = selector", "event->process_group, event->group_origin"], "retained group selection")
+    for operation in ["release_claim", "commit_claim"]:
+        body = function_body(lifecycle, operation)
+        require_tokens(body, ["ChildEvent* const EVENT = claim.event"], "live claim storage")
+        forbid_tokens(body, ["EVENT = claimed.node"], "borrowed claim pointer dereference")
+        require_order(body, "claimed.node", "EVENT->queued", "current identity before event access")
 
     require_tokens(
         selector,
@@ -232,7 +251,7 @@ def test_waitpid_is_a_current_context_claim_usercopy_commit_loop() -> None:
             "pid == 0",
             "selector_for_current_process_group(owner)",
             "std::numeric_limits<int64_t>::min()",
-            "selector_for_process_group(static_cast<uint64_t>(-pid))",
+            "selector_for_process_group(owner, GROUP)",
         ],
         "POSIX waitpid selectors",
     )
@@ -301,6 +320,10 @@ def test_exit_signal_and_ptrace_are_event_producers() -> None:
     require_order(exit_body, "child_events::publish_exit", "release_exiting_user_address_space", "exit event before heavy cleanup")
     require_order(exit_body, "close_thread_cpu_admission", "request_thread_group_exit", "close admission before sibling scan")
     require_order(exit_body, "resource_cpu_threads.load", "TaskState::EXITING", "drain CPU contributions while leader schedulable")
+    require_order(exit_body, "shm_cleanup_for_task(current_task)", 'asm volatile("cli"', "sleeping SHM cleanup before final interrupt boundary")
+    require_order(exit_body, "quiesce_usercopy_pagemap()", "release_file_mmap_ranges_for_pagemap", "quiesce user access before mapped-file writeback")
+    require_order(exit_body, "release_file_mmap_ranges_for_pagemap", 'asm volatile("cli"', "sleeping file writeback before final interrupt boundary")
+    require_order(exit_body, 'asm volatile("cli"', "TaskState::EXITING", "final exit notifications cannot abandon wake leadership")
     if "resource_thread_owners.load" in exit_body:
         fail("process exit must not wait for thread metadata GC")
     thread_source = (ROOT / "modules/kern/src/syscalls_impl/multiproc/threadControl.cpp").read_text()
@@ -377,25 +400,35 @@ def test_scheduler_has_only_generic_wait_support() -> None:
 def test_remote_proxy_uses_the_same_immutable_exit_event() -> None:
     source = REMOTE_COMPUTE_CPP.read_text()
     finalize = function_body(source, "finalize_proxy_task")
+    prepare = function_body(source, "prepare_proxy_finalization")
+    finish = function_body(source, "finish_proxy_exit")
+    worker = function_body(source, "run_one_proxy_exit")
+    require_tokens(finalize, ["prepare_proxy_finalization", "enqueue_proxy_exit"], "proxy retirement dispatch")
     require_tokens(
-        finalize,
+        prepare,
         [
             "write_proxy_output(proxy, output_data, output_len, task_id)",
             "cleanup_proxy_resources(proxy)",
-            "child_events::publish_exit(*proxy)",
-            "insert_into_dead_list(proxy)",
+            "enqueue(*proxy)",
         ],
-        "remote proxy child event publication",
+        "remote proxy completion before deferred retirement",
     )
-    require_order(finalize, "cleanup_proxy_resources(proxy)", "child_events::publish_exit(*proxy)", "proxy cleanup before event snapshot")
-    require_order(finalize, "child_events::publish_exit(*proxy)", "insert_into_dead_list(proxy)", "proxy exit event before dead-list publication")
-    forbid_tokens(finalize, ["waiting_for_pid", "waitpid_publish_pending", "try_complete_proxy_wait", "wake_proxy_waiters"], "WKI direct wait completion")
+    require_order(prepare, "cleanup_proxy_resources(proxy)", "enqueue(*proxy)", "proxy cleanup before worker handoff")
+    require_order(finish, "child_events::prepare_process_exit(*proxy)", "proxy->has_exited = true", "child ownership retired before exit")
+    require_order(finish, "exit_notify_ready.store", "publish(*proxy)", "immutable completion before child event")
+    require_tokens(worker, ["finish_proxy_exit", "child_events::publish_exit(task)", "insert_into_dead_list(&task)"], "worker event publication")
+    require_order(worker, "child_events::publish_exit(task)", "insert_into_dead_list(&task)", "proxy exit event before dead-list publication")
+    forbid_tokens(finalize + prepare + finish + worker, ["waiting_for_pid", "waitpid_publish_pending", "try_complete_proxy_wait", "wake_proxy_waiters"], "WKI direct wait completion")
 
 
 def test_deterministic_lifecycle_ktests_cover_required_interleavings() -> None:
     registration = CHILD_EVENTS_KTEST.read_text()
     implementation = CHILD_EVENTS_CPP.read_text()
     tests = [
+        "IndependentClaimsPreserveLocalWaiters",
+        "IndependentClaimsRetireBeforeSubjectStorage",
+        "CanceledClaimsNeverDereferenceRetiredStorage",
+        "StaleClaimCannotReleaseReissuedEvent",
         "PublishAndRegistrationOrdering",
         "ClaimRetryNowaitAndSingleWinner",
         "WaiterHandoffAndSubjectSerialization",
@@ -427,7 +460,34 @@ def test_deterministic_lifecycle_ktests_cover_required_interleavings() -> None:
     )
 
 
+def test_remote_wait_owns_values_and_copies_before_commit() -> None:
+    source = WAITPID_CPP.read_text()
+    remote = function_body(source, "wait_remote")
+    require_order(remote, "copy_outputs(waiter", "wki_child_wait_commit(waiter", "remote wait usercopy before commit")
+    require_tokens(remote, ["wki_child_wait_close(waiter, handle)", "remote_wait_interrupted(waiter, owner, committing)", "result.error != -EAGAIN",
+                            "preemptible_syscall_park"], "remote wait cleanup and interruption")
+    forbid_tokens(remote, ["Claim claim", ".node->", "try_claim", "import_reaped_cpu_times"], "syscall owns only copied values")
+    gate = function_body(source, "remote_wait_interrupted")
+    require_tokens(gate, ["signal_pending_bits() & KILL_MASK", "pending_cpu_signals.load", "process_exit_requested.load",
+                          "return !committing", "has_interrupting_signal_pending", "resource_exec_quiescence_epoch"],
+                   "irrevocable termination can detach an outstanding commit")
+    require_order(gate, "process_exit_requested.load", "return !committing", "termination bypasses catchable-signal deferral")
+    forbid_tokens(gate, ["signal_pending_store", "fetch_and", "exchange(", "wos_proc_exit"], "termination gate preserves return-path markers")
+    require_order(remote, "remote_wait_interrupted(waiter, owner, committing)", "preemptible_syscall_park", "termination unwinds before parking")
+    compute = REMOTE_COMPUTE_CPP.read_text()
+    worker = function_body(compute, "run_one_native_child_wait")
+    require_order(worker, "s_compute_lock.unlock();\n        if (CANCEL)", "child_events::cancel_claim", "claim cleanup outside compute")
+    advance = function_body(compute, "advance_native_child")
+    require_order(advance, "summary.pids.ambiguous", "schedule_native_child_claim(record, ChildWaitCommand::BEGIN)", "collision before claim")
+    require_tokens(advance, ["-EOVERFLOW", "OPTION_NOWAIT", "ChildEventAudience::PARENT", "import_live_reaped_cpu_times"],
+                   "collision refusal and exact parent accounting")
+    prepare = function_body(EXEC_CPP.read_text(), "prepare_remote_exec_owner")
+    require_order(prepare, "plan.admission.quiesce(owner)", "wki_child_wait_quiesce(owner)", "native executors stop before wait drain")
+    require_order(prepare, "wki_child_wait_quiesce(owner)", "wki_exec_signal_snapshot", "wait drain before exec snapshot")
+
+
 def main() -> None:
+    test_remote_wait_owns_values_and_copies_before_commit()
     test_task_owns_explicit_topology_events_and_waiters()
     test_lifecycle_lock_owns_snapshot_queue_and_claims()
     test_publication_and_reparenting_are_explicit_transactions()

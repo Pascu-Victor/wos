@@ -17,6 +17,7 @@ auto LookupHandle::operator=(LookupHandle&& other) noexcept -> LookupHandle& {
     path_ = other.path_;
     parent_path_ = other.parent_path_;
     final_component_ = other.final_component_;
+    remote_relative_path_ = other.remote_relative_path_;
     path_len_ = other.path_len_;
     parent_path_len_ = other.parent_path_len_;
     final_component_len_ = other.final_component_len_;
@@ -24,11 +25,19 @@ auto LookupHandle::operator=(LookupHandle&& other) noexcept -> LookupHandle& {
     follow_policy_ = other.follow_policy_;
     require_directory_ = other.require_directory_;
     mount_ref_ = std::move(other.mount_ref_);
+    mount_policy_ = other.mount_policy_;
+    directory_view_ = std::move(other.directory_view_);
+    mount_membership_ = std::exchange(other.mount_membership_, nullptr);
+    release_mount_membership_ = std::exchange(other.release_mount_membership_, nullptr);
+    procfs_view_origin_ = std::exchange(other.procfs_view_origin_, nullptr);
+    release_procfs_view_origin_ = std::exchange(other.release_procfs_view_origin_, nullptr);
+    procfs_view_generation_ = std::exchange(other.procfs_view_generation_, 0);
     mount_generation_ = other.mount_generation_;
     namespace_generation_ = other.namespace_generation_;
     backend_generation_ = other.backend_generation_;
     authorization_ = other.authorization_;
     dirfd_anchor_ = other.dirfd_anchor_;
+    dirfd_path_revalidated_ = other.dirfd_path_revalidated_;
     backend_parent_ = other.backend_parent_;
     backend_object_ = other.backend_object_;
     release_parent_ = other.release_parent_;
@@ -38,6 +47,9 @@ auto LookupHandle::operator=(LookupHandle&& other) noexcept -> LookupHandle& {
     parent_generation_ = other.parent_generation_;
 
     other.dirfd_anchor_ = nullptr;
+    other.authorization_ = {};
+    other.mount_policy_ = {};
+    other.dirfd_path_revalidated_ = false;
     other.backend_parent_ = nullptr;
     other.backend_object_ = nullptr;
     other.release_parent_ = nullptr;
@@ -45,12 +57,19 @@ auto LookupHandle::operator=(LookupHandle&& other) noexcept -> LookupHandle& {
     other.path_len_ = 0;
     other.parent_path_len_ = 0;
     other.final_component_len_ = 0;
+    other.remote_relative_path_.fill('\0');
     return *this;
 }
 
 LookupHandle::~LookupHandle() { reset(); }
 
 void LookupHandle::reset() {
+    if (procfs_view_origin_ != nullptr && release_procfs_view_origin_ != nullptr) {
+        release_procfs_view_origin_(procfs_view_origin_);
+    }
+    procfs_view_origin_ = nullptr;
+    release_procfs_view_origin_ = nullptr;
+    procfs_view_generation_ = 0;
     if (backend_object_ != nullptr && release_object_ != nullptr) {
         release_object_(backend_object_);
     }
@@ -65,10 +84,20 @@ void LookupHandle::reset() {
     release_object_ = nullptr;
     release_parent_ = nullptr;
     dirfd_anchor_ = nullptr;
+    dirfd_path_revalidated_ = false;
+    if (mount_membership_ != nullptr && release_mount_membership_ != nullptr) {
+        release_mount_membership_(mount_membership_);
+    }
+    mount_membership_ = nullptr;
+    release_mount_membership_ = nullptr;
+    directory_view_ = {};
     mount_ref_.reset();
+    mount_policy_ = {};
+    authorization_ = {};
     path_.fill('\0');
     parent_path_.fill('\0');
     final_component_.fill('\0');
+    remote_relative_path_.fill('\0');
     path_len_ = 0;
     parent_path_len_ = 0;
     final_component_len_ = 0;
@@ -78,6 +107,13 @@ void LookupHandle::reset() {
     parent_identity_ = 0;
     object_identity_ = 0;
     parent_generation_ = 0;
+}
+
+auto LookupHandleBuilder::set_remote_relative_path(LookupHandle& handle, const char* path, size_t length) -> bool {
+    if (path == nullptr || length == 0 || length >= handle.remote_relative_path_.size() || path[0] == '/') return false;
+    handle.remote_relative_path_.fill('\0');
+    std::memcpy(handle.remote_relative_path_.data(), path, length);
+    return true;
 }
 
 void LookupHandleBuilder::set_path(LookupHandle& handle, const char* path, size_t path_len, const char* parent_path, size_t parent_path_len,
@@ -113,16 +149,38 @@ void LookupHandleBuilder::set_policy(LookupHandle& handle, LookupIntent intent, 
 void LookupHandleBuilder::set_mount(LookupHandle& handle, MountRef mount, uint64_t mount_generation, uint64_t namespace_generation,
                                     uint64_t backend_generation) {
     handle.mount_ref_ = std::move(mount);
+    auto* selected = handle.mount_ref_.get();
+    handle.mount_policy_ = selected != nullptr ? MountPolicy{.read_only = selected->read_only, .nosuid = selected->nosuid} : MountPolicy{};
     handle.mount_generation_ = mount_generation;
     handle.namespace_generation_ = namespace_generation;
     handle.backend_generation_ = backend_generation;
 }
 
-void LookupHandleBuilder::set_dirfd_anchor(LookupHandle& handle, File* retained_file) {
+void LookupHandleBuilder::set_directory_view(LookupHandle& handle, const DirectoryViewRef& view) { handle.directory_view_ = view; }
+
+auto LookupHandleBuilder::set_mount_membership(LookupHandle& handle, void* retained, LookupHandle::BackendRelease release) -> bool {
+    if (retained == nullptr || release == nullptr || handle.mount_membership_ != nullptr) return false;
+    handle.mount_membership_ = retained;
+    handle.release_mount_membership_ = release;
+    return true;
+}
+
+void LookupHandleBuilder::set_procfs_view_origin(LookupHandle& handle, File* retained_origin, LookupHandle::BackendRelease release,
+                                                 uint64_t credential_generation) {
+    if (handle.procfs_view_origin_ != nullptr && handle.release_procfs_view_origin_ != nullptr) {
+        handle.release_procfs_view_origin_(handle.procfs_view_origin_);
+    }
+    handle.procfs_view_origin_ = retained_origin;
+    handle.release_procfs_view_origin_ = release;
+    handle.procfs_view_generation_ = credential_generation;
+}
+
+void LookupHandleBuilder::set_dirfd_anchor(LookupHandle& handle, File* retained_file, bool path_revalidated) {
     if (handle.dirfd_anchor_ != nullptr) {
         vfs_put_file(handle.dirfd_anchor_);
     }
     handle.dirfd_anchor_ = retained_file;
+    handle.dirfd_path_revalidated_ = path_revalidated;
 }
 
 void LookupHandleBuilder::set_backend_binding(LookupHandle& handle, void* retained_parent, LookupHandle::BackendRelease release_parent,

@@ -108,6 +108,8 @@ struct XfsTransInodeUndo {
     uint32_t nextents{};
     uint16_t anextents{};
     uint16_t mode{};
+    uint32_t uid{};
+    uint32_t gid{};
     uint32_t nlink{};
     uint8_t forkoff{};
     bool has_attr_fork{};
@@ -131,6 +133,10 @@ struct XfsTransRetiredRange {
     size_t count{};
 };
 
+// Conservative by default. The data-only exception is for regular-file data,
+// size and timestamp updates; names, link counts and credentials must invalidate.
+enum class XfsLookupEffect : uint8_t { INVALIDATE, PRESERVE_FILE_DATA };
+
 // Transaction structure
 struct XfsTransaction {
     XfsTransaction() = default;
@@ -151,6 +157,7 @@ struct XfsTransaction {
     int error{};
     bool overflowed{};
     bool committed{};
+    XfsLookupEffect lookup_effect{XfsLookupEffect::INVALIDATE};
     bool cancelled{};
     XfsTransBufUndo* buf_undo{};
     XfsTransPerAgUndo* perag_undo{};
@@ -164,7 +171,7 @@ struct XfsTransaction {
 // ============================================================================
 
 // Allocate a new transaction.  Returns nullptr on failure.
-auto xfs_trans_alloc(XfsMountContext* mount) -> XfsTransaction*;
+auto xfs_trans_alloc(XfsMountContext* mount, XfsLookupEffect lookup_effect = XfsLookupEffect::INVALIDATE) -> XfsTransaction*;
 
 // Log a modified buffer region within a transaction.
 // The buffer's refcount is held by the transaction until commit/cancel.
@@ -195,6 +202,7 @@ void xfs_trans_cancel(XfsTransaction* tp);
 
 #ifdef WOS_SELFTEST
 auto xfs_selftest_transaction_cancel_restores_nlink() -> bool;
+auto xfs_selftest_transaction_cancel_restores_ownership() -> bool;
 auto xfs_selftest_transaction_cancel_restores_attr_fork() -> bool;
 auto xfs_selftest_transaction_retired_ranges_commit_only() -> bool;
 auto xfs_selftest_transaction_cancel_restores_replaced_buffer_alias() -> bool;

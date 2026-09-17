@@ -1,5 +1,7 @@
 #pragma once
 
+#include <vfs/exec_content.hpp>
+
 // XFS Inode - in-memory representation and disk I/O.
 //
 // XfsInode is the in-memory parsed form of xfs_dinode.  It is cached in a
@@ -111,6 +113,7 @@ struct XfsInode {
     XfsInode* hash_next;      // hash chain link
     mod::sys::Spinlock lock;  // per-inode lock
     mod::sys::Mutex io_lock;  // sleeping lock for data/metadata I/O mutation
+    ker::vfs::ExecContentState exec_content;
 
     // Final zero-link teardown is in progress.  The inode remains in the
     // cache with refcount 0 while the on-disk free transaction runs so stale

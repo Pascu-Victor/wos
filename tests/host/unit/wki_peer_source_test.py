@@ -1049,8 +1049,8 @@ def test_authenticated_hello_requires_session_key_confirmation() -> None:
             "the initiator must install the derived key and confirm it before publication",
         )
     for before, after in [
-        ("AUTH_RESULT == WkiAuthFrameResult::PENDING_CONFIRMATION", "wki_auth_confirm_peer_session(peer)"),
-        ("wki_auth_confirm_peer_session(peer)", "detail::handle_hello(transport, hdr, payload, PAYLOAD_LEN, true)"),
+        ("AUTH_RESULT == WkiAuthFrameResult::PENDING_CONFIRMATION", "wki_auth_confirm_peer_session(peer, verified_trailer)"),
+        ("wki_auth_confirm_peer_session(peer, verified_trailer)", "detail::handle_hello(transport, hdr, payload, PAYLOAD_LEN, true)"),
         ("detail::handle_hello(transport, hdr, payload, PAYLOAD_LEN, true)", "wki_lsa_replay_to_peer(peer->node_id)"),
     ]:
         require_order(
@@ -1065,11 +1065,21 @@ def test_authenticated_hello_requires_session_key_confirmation() -> None:
         "MsgType::HELLO_CONFIRM",
         "peer->auth_session.pending",
         "trailer.session_id == peer->auth_session.pending_session_id",
-        "trailer.counter == 1",
+        "trailer.counter != 0",
         "WkiAuthFrameResult::PENDING_CONFIRMATION",
     ]:
         if token not in verify:
             fail(f"pending-session confirmation gate is missing {token}")
+
+    promotion = function_body(auth, "wki_auth_confirm_peer_session")
+    for token in [
+        "verified_trailer.counter == 0",
+        "peer->auth_session.pending_session_id != verified_trailer.session_id",
+        "peer->auth_session.rx_counter_high = verified_trailer.counter",
+        "peer->auth_session.rx_counter_bitmap = 1",
+    ]:
+        if token not in promotion:
+            fail(f"confirmation must bind promotion and replay state to verified frame: {token}")
 
     prepare = function_body(auth, "wki_auth_prepare_peer_session")
     for token in [

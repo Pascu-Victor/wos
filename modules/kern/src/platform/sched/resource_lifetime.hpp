@@ -19,6 +19,7 @@ class LifetimeOwner {
     // Thread exit calls this after its final accounting flush; destruction is
     // the fallback for an unpublished thread that never ran.
     void finish_cpu();
+    [[nodiscard]] auto cpu_active() const -> bool { return m_cpu_active; }
     auto get() const -> task::Task* { return m_owner; }
 
    private:

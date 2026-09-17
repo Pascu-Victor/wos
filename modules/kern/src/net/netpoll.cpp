@@ -280,7 +280,7 @@ void log_tcp_owner_task(uint64_t pid, const char* label, uint16_t local_port, ui
         label, static_cast<unsigned long long>(pid), task->name != nullptr ? task->name : "?", task_type_name(task->type),
         task_state_name(STATE), task_queue_name(task->sched_queue), static_cast<unsigned long long>(CPU_NO),
         static_cast<unsigned long long>(task->owner_pid), static_cast<unsigned long long>(task->parent_pid),
-        static_cast<unsigned long long>(task->pgid), task->is_voluntary_blocked() ? 1U : 0U, task->wants_block ? 1U : 0U,
+        static_cast<unsigned long long>(task->job_identity().pgid), task->is_voluntary_blocked() ? 1U : 0U, task->wants_block ? 1U : 0U,
         task->cpu_pinned ? 1U : 0U, task->preempt_disable_depth, task->preempt_pending ? 1U : 0U,
         static_cast<unsigned long long>(task->preempt_disable_owner), static_cast<unsigned long long>(task->preempt_disable_start_us),
         static_cast<unsigned long long>(task->preempt_disable_max_us), task->wait_channel != nullptr ? task->wait_channel : "-",

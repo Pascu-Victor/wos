@@ -56,12 +56,12 @@ auto count_shutdown_targets(uint64_t excluded_pid, uint64_t excluded_owner_pid) 
     return sched::signal_visible_processes_except(excluded_pid, excluded_owner_pid, 0);
 }
 
-auto current_task_is_root() -> int {
+auto authorize_current_power() -> int {
     auto* task = sched::get_current_task();
     if (task == nullptr) {
         return -ESRCH;
     }
-    if (task->euid != 0) {
+    if (!task->credentials().allows(ker::mod::security::Authority::POWER)) {
         return -EPERM;
     }
     return 0;
@@ -220,9 +220,9 @@ auto shutdown_in_progress() -> bool { return g_phase.load(std::memory_order_acqu
 auto shutdown_phase() -> ShutdownPhase { return g_phase.load(std::memory_order_acquire); }
 
 auto prepare_shutdown() -> int {
-    int const ROOT_RET = current_task_is_root();
-    if (ROOT_RET != 0) {
-        return ROOT_RET;
+    int const AUTHORITY_RET = authorize_current_power();
+    if (AUTHORITY_RET != 0) {
+        return AUTHORITY_RET;
     }
 
     ShutdownPhase phase = g_phase.load(std::memory_order_acquire);
@@ -251,13 +251,12 @@ auto begin_reboot_command(uint64_t cmd) -> int {
     if (PARSE_RET < 0) {
         return PARSE_RET;
     }
+    int const AUTHORITY_RET = authorize_current_power();
+    if (AUTHORITY_RET != 0) {
+        return AUTHORITY_RET;
+    }
     if (action == ShutdownAction::NONE) {
         return 0;
-    }
-
-    int const ROOT_RET = current_task_is_root();
-    if (ROOT_RET != 0) {
-        return ROOT_RET;
     }
 
     ShutdownPhase phase = g_phase.load(std::memory_order_acquire);

@@ -30,6 +30,17 @@ void save_fpu_state(sched::task::Task* task);
 void restore_fpu_state(sched::task::Task* task);
 void restore_or_init_fpu_state(sched::task::Task* task);
 void reset_fpu_state(sched::task::Task* task);
+// Keep a validated userspace return authorized across blocking work on its
+// current task's own kernel stack. Noreturn exit/exec abandons this scope.
+class UserReturnFpuAuthorization {
+    sched::task::Task* task_{};
+
+   public:
+    explicit UserReturnFpuAuthorization(sched::task::Task& task);
+    ~UserReturnFpuAuthorization();
+    UserReturnFpuAuthorization(const UserReturnFpuAuthorization&) = delete;
+    auto operator=(const UserReturnFpuAuthorization&) -> UserReturnFpuAuthorization& = delete;
+};
 void restore_debug_registers_for_task(sched::task::Task* task);
 void install_task_cpu_bases(sched::task::Task* next_task, uint64_t cpu_id);
 auto normalize_user_return_flags(uint64_t flags) -> uint64_t;
@@ -38,6 +49,7 @@ void normalize_process_user_return_state(sched::task::Task* task);
 auto repair_stale_process_syscall_resume(sched::task::Task* task) -> bool;
 
 #ifdef WOS_SELFTEST
+auto context_switch_selftest_user_return_fpu_authorization() -> bool;
 auto context_switch_selftest_repair_stale_process_syscall_resume() -> bool;
 #endif
 }  // namespace ker::mod::sys::context_switch

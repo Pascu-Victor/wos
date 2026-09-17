@@ -158,7 +158,33 @@ def test_read_response_copies_each_chunk_while_region_lock_is_held() -> None:
         fail("RoCE must not lend raw registered backing pointers past s_region_lock")
 
 
+def test_uninitialized_transport_refuses_receive_before_dispatch() -> None:
+    source = TRANSPORT_ROCE_CPP.read_text()
+    require_order(
+        function_body(source, "roce_rx"),
+        [
+            "!s_roce_initialized.load(std::memory_order_acquire) || roce_disabled()",
+            "pkt_free(pkt)",
+            "return;",
+            "pkt->len < sizeof(RoceHeader)",
+            "switch (static_cast<RoceOpcode>(hdr->opcode))",
+        ],
+        "uninitialized RoCE receive admission precedes all opcode effects",
+    )
+    require_order(
+        function_body(source, "wki_roce_transport_init"),
+        ["s_roce_transport.doorbell = roce_doorbell", "s_roce_initialized.store(true, std::memory_order_release)"],
+        "transport callbacks are initialized before publication",
+    )
+    require_tokens(
+        function_body(source, "wki_roce_transport_get"),
+        ["s_roce_initialized.load(std::memory_order_acquire)"],
+        "transport lookup observes publication",
+    )
+
+
 def main() -> None:
+    test_uninitialized_transport_refuses_receive_before_dispatch()
     test_roce_wait_deadlines_are_saturating()
     test_temporary_read_completion_wait_is_deadline_bounded()
     test_registered_region_waits_use_shared_deadline_helper()

@@ -21,7 +21,7 @@ def require(source: str, snippet: str, context: str) -> None:
 
 def test_devfs_open_preserves_flags() -> None:
     source = DEVFS_CPP.read_text()
-    require(source, "auto devfs_open_path(const char* path, int flags, int /*mode*/) -> File*", "devfs open signature")
+    require(source, "auto devfs_open_path(const ker::mod::security::Snapshot& credentials,", "devfs open signature")
     require(source, "file->open_flags = flags;", "devfs File::open_flags")
     require(source, "file->fd_flags = 0;", "devfs File::fd_flags")
 
@@ -31,24 +31,17 @@ def test_tmpfs_open_preserves_flags() -> None:
     require(source, "auto create_root_file_with_flags(TmpNode* root, int open_flags) -> ker::vfs::File*", "tmpfs root helper")
     require(source, "auto create_root_file(TmpNode* root) -> ker::vfs::File*", "tmpfs public root helper")
     require(source, "f->open_flags = open_flags;", "tmpfs root open flags")
-    if source.count("create_root_file_with_flags(root, flags)") < 2:
-        fail("tmpfs root opens must pass caller flags into create_root_file_with_flags")
-    require(
-        source,
-        "auto tmpfs_open_node_locked(TmpNode* entry, int flags, bool require_directory, bool created_by_open, int* result_out)",
-        "tmpfs retained-node open helper",
-    )
-    require(source, "TmpNode* const NODE = tmpfs_canonical_node(entry);", "tmpfs canonical retained open node")
-    require(source, "file->open_flags = flags;", "tmpfs non-root open flags")
+    require(source, "auto tmpfs_open_lookup(const ker::mod::security::Snapshot& credentials,", "tmpfs explicit caller")
+    require(source, "TmpNode* node = tmpfs_canonical_node(handle.target());", "tmpfs canonical retained open node")
+    require(source, "file->open_flags = flags;", "tmpfs root/non-root open flags")
     require(source, "file->fd_flags = 0;", "tmpfs fd flags")
-    if source.count("tmpfs_open_node_locked(") < 3:
-        fail("tmpfs path and retained-lookup opens must share the flag-preserving node helper")
+    require(source, "tmpfs_open_lookup(credentials, lookup, flags, mode, REQUIRE_DIRECTORY, &result)", "tmpfs shared open flags")
 
 
 def test_procfs_open_preserves_flags() -> None:
     source = PROCFS_CPP.read_text()
-    require(source, "auto procfs_open_path(const char* path, int flags, int mode) -> File*", "procfs open signature")
-    require(source, "auto make_file = [flags]", "procfs make_file captures open flags")
+    require(source, "auto procfs_open_path(const ker::mod::security::Snapshot& credentials,", "procfs open signature")
+    require(source, "auto make_file = [flags, &retain_target]", "procfs make_file captures open flags")
     require(source, "f->open_flags = flags;", "procfs File::open_flags")
     require(source, "f->fd_flags = 0;", "procfs File::fd_flags")
 
@@ -57,11 +50,11 @@ def test_fat32_open_preserves_flags() -> None:
     source = FAT32_CPP.read_text()
     require(
         source,
-        "static auto create_file_in_directory(FAT32MountContext* ctx, uint32_t parent_cluster, const char* filename, int open_flags)",
+        "static auto create_file_in_directory(FAT32MountContext* ctx, uint32_t parent_cluster, const char* filename, int open_flags,",
         "fat32 create helper signature",
     )
     require(source, "f->open_flags = open_flags;", "fat32 O_CREAT helper open flags")
-    require(source, "return create_file_in_directory(ctx, current_cluster, component.data(), flags);", "fat32 O_CREAT path flags")
+    require(source, "return create_file_in_directory(ctx, current_cluster, component.data(), flags, result_out);", "fat32 O_CREAT path flags and errno")
     require(source, "file->open_flags = flags;", "fat32 root open flags")
     require(source, "f->open_flags = flags;", "fat32 existing path open flags")
 

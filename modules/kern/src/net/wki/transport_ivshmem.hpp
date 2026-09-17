@@ -13,6 +13,10 @@ void wki_ivshmem_transport_init();
 // fallback for ivshmem-plain deployments without a usable doorbell interrupt.
 auto wki_ivshmem_transport_poll(uint16_t budget) -> uint16_t;
 
+#ifdef WOS_SELFTEST
+auto wki_ivshmem_selftest_complete_frames() -> bool;
+#endif
+
 // Allocate a region from the ivshmem RDMA pool.
 // Returns the offset within the RDMA region, or -1 on failure.
 // The offset can be used as an rkey for RDMA operations.

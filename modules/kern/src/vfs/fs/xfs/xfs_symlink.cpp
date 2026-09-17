@@ -53,11 +53,10 @@ auto xfs_readlink(XfsInode* ip, char* buf, size_t buflen) -> int {
 
     uint64_t target_len = ip->size;
     if (target_len == 0) {
-        buf[0] = '\0';
         return 0;
     }
-    if (target_len >= buflen) {
-        target_len = buflen - 1;
+    if (target_len > buflen) {
+        target_len = buflen;
     }
 
     if (ip->data_fork.format == XFS_DINODE_FMT_LOCAL) {
@@ -68,7 +67,6 @@ auto xfs_readlink(XfsInode* ip, char* buf, size_t buflen) -> int {
         size_t copy_len = target_len;
         copy_len = std::min(copy_len, ip->data_fork.local.size);
         __builtin_memcpy(buf, ip->data_fork.local.data, copy_len);
-        buf[copy_len] = '\0';
         return static_cast<int>(copy_len);
     }
 
@@ -83,13 +81,11 @@ auto xfs_readlink(XfsInode* ip, char* buf, size_t buflen) -> int {
         int const RC = xfs_bmap_lookup(ip, fblock, &bmap);
         if (RC != 0 || bmap.is_hole) {
             mod::dbg::log("[xfs symlink] bmap failed or hole at block %lu\n", static_cast<unsigned long>(fblock));
-            buf[copied] = '\0';
             return (copied > 0) ? static_cast<int>(copied) : -EIO;
         }
 
         BufHead* bh = xfs_buf_read(ctx, bmap.startblock);
         if (bh == nullptr) {
-            buf[copied] = '\0';
             return (copied > 0) ? static_cast<int>(copied) : -EIO;
         }
 
@@ -115,7 +111,6 @@ auto xfs_readlink(XfsInode* ip, char* buf, size_t buflen) -> int {
         fblock++;
     }
 
-    buf[copied] = '\0';
     return static_cast<int>(copied);
 }
 

@@ -128,7 +128,12 @@ auto send_socket_op_sync(ProxyIpcState* proxy, uint16_t op_id, const void* extra
         delete[] msg;
         return finish(-EBUSY);
     }
-    op_cookie = wki_ipc_allocate_wait_cookie_locked(proxy);
+    op_cookie = wki_ipc_allocate_wait_cookie_locked(proxy, op_id);
+    if (op_cookie == 0) {
+        proxy->lock.unlock_irqrestore(irqf);
+        delete[] msg;
+        return finish(-EAGAIN);
+    }
     proxy->pending_wait = &wait;
     proxy->pending_wait_op = op_id;
     proxy->pending_wait_cookie = op_cookie;
@@ -142,11 +147,11 @@ auto send_socket_op_sync(ProxyIpcState* proxy, uint16_t op_id, const void* extra
         std::memcpy(msg + sizeof(DevOpReqPayload) + RID_SIZE + WKI_IPC_OP_COOKIE_BYTES, extra, extra_len);
     }
 
-    int const TX = wki_send(proxy->home_node, WKI_CHAN_RESOURCE, MsgType::DEV_OP_REQ, msg, static_cast<uint16_t>(MSG_SIZE));
+    int const TX = wki_ipc_send_control(proxy, msg, static_cast<uint16_t>(MSG_SIZE));
     delete[] msg;
 
     if (TX != WKI_OK) {
-        wki_ipc_cancel_pending_wait(proxy, &wait, WKI_ERR_TX_FAILED);
+        wki_ipc_cancel_pending_wait(proxy, &wait, WKI_ERR_TX_FAILED, false);
         return finish(-EIO);
     }
 
@@ -175,6 +180,7 @@ auto send_socket_op_sync(ProxyIpcState* proxy, uint16_t op_id, const void* extra
 
 auto proxy_socket_read(ker::vfs::File* f, void* buf, size_t count, size_t /*offset*/) -> ssize_t {
     auto* proxy = static_cast<ProxyIpcState*>(f->private_data);
+    if (proxy != nullptr && proxy->message_write_flow_control) return wki_ipc_read_stream_proxy(f, buf, count);
     uint64_t const CALLSITE = WOS_PERF_CALLSITE();
     uint32_t const CORRELATION = ker::mod::perf::next_wki_trace_correlation();
     uint64_t const STARTED_US = wki_now_us();
@@ -257,6 +263,7 @@ auto proxy_socket_read(ker::vfs::File* f, void* buf, size_t count, size_t /*offs
 
 auto proxy_socket_write(ker::vfs::File* f, const void* buf, size_t count, size_t /*offset*/) -> ssize_t {
     auto* proxy = static_cast<ProxyIpcState*>(f->private_data);
+    if (proxy != nullptr && proxy->message_write_flow_control) return wki_ipc_write_stream_proxy(f, buf, count);
     uint64_t const CALLSITE = WOS_PERF_CALLSITE();
     uint32_t const CORRELATION = ker::mod::perf::next_wki_trace_correlation();
     uint64_t const STARTED_US = wki_now_us();
@@ -293,7 +300,7 @@ auto proxy_socket_write(ker::vfs::File* f, const void* buf, size_t count, size_t
     std::memcpy(msg + sizeof(DevOpReqPayload), &proxy->resource_id, sizeof(uint32_t));
     std::memcpy(msg + HEADER_SIZE, buf, TO_SEND);
 
-    int const RET = wki_send(proxy->home_node, WKI_CHAN_IPC_DATA, MsgType::DEV_OP_REQ, msg, static_cast<uint16_t>(MSG_SIZE));
+    int const RET = wki_send_on_channel_identity(proxy->data_channel, MsgType::DEV_OP_REQ, msg, static_cast<uint16_t>(MSG_SIZE));
     delete[] msg;
 
     if (RET != WKI_OK) {
@@ -322,6 +329,7 @@ auto proxy_socket_close(ker::vfs::File* f) -> int {
 
 auto proxy_socket_poll_check(ker::vfs::File* f, int events) -> int {
     auto* proxy = static_cast<ProxyIpcState*>(f->private_data);
+    if (proxy != nullptr && proxy->message_write_flow_control) return wki_ipc_poll_stream_proxy(f, events);
     if (proxy == nullptr) {
         return 0;
     }
@@ -338,8 +346,11 @@ auto proxy_socket_poll_check(ker::vfs::File* f, int events) -> int {
     if ((events & 0x0001) != 0 && (AVAIL > 0 || CLOSED)) {
         ready |= 0x0001;  // POLLIN
     }
-    if ((events & 0x0004) != 0) {
-        ready |= 0x0004;  // POLLOUT always ready
+    int32_t const WRITE_ERROR = proxy->message_write_error.load(std::memory_order_acquire);
+    if (WRITE_ERROR != 0) ready |= 0x0008;  // POLLERR
+    bool const HAS_CREDIT = !proxy->message_write_flow_control || proxy->message_write_credits.load(std::memory_order_acquire) != 0;
+    if ((events & 0x0004) != 0 && WRITE_ERROR == 0 && HAS_CREDIT) {
+        ready |= 0x0004;  // POLLOUT
     }
     return ready;
 }
@@ -361,8 +372,17 @@ auto wki_ipc_socket_shutdown(ker::vfs::File* file, int how) -> int {
         return -ENOTSOCK;
     }
 
-    auto how32 = static_cast<int32_t>(how);
-    return send_socket_op_sync(proxy, OP_SOCK_SHUTDOWN, &how32, sizeof(how32), nullptr, 0);
+    if (how < 0 || how > 2) return -EINVAL;
+    // Preserve legacy how first; current homes also fence the accepted DATA
+    // prefix across aliases before changing native stream shutdown state.
+    std::array<uint8_t, sizeof(int32_t) + sizeof(uint32_t)> request{};
+    auto const HOW = static_cast<int32_t>(how);
+    std::memcpy(request.data(), &HOW, sizeof(HOW));
+    if (how == 0) return send_socket_op_sync(proxy, OP_SOCK_SHUTDOWN, request.data(), sizeof(HOW), nullptr, 0);
+    uint32_t boundary = 0;
+    if (!wki_ipc_capture_data_sequence(proxy->data_channel, true, boundary)) return -EHOSTUNREACH;
+    std::memcpy(request.data() + sizeof(HOW), &boundary, sizeof(boundary));
+    return send_socket_op_sync(proxy, OP_SOCK_SHUTDOWN, request.data(), request.size(), nullptr, 0);
 }
 
 auto wki_ipc_socket_getpeername(ker::vfs::File* file, void* addr_out, size_t* addr_len) -> int {

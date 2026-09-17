@@ -12,6 +12,7 @@ namespace ker::dev {
 
 // Forward declaration for function pointer types
 struct BlockDevice;
+struct Device;
 
 // Writable-owner arbitration shared by local filesystem mounts and WKI
 // server bindings. Local mounts may coexist with other local mounts; a remote
@@ -91,11 +92,23 @@ struct BlockDevice {
     uint64_t partition_end_lba = 0;
 };
 
-// Block device registration and management
+// Registry operations serialize publication/selection/removal. Registration
+// reserves a unique name and pointer (including preparation/retirement); a
+// collision returns -1. Duplicate major/minor values remain allowed.
+// Callers keep provider/parent storage and identity/geometry alive and immutable
+// throughout registration and any borrowed use after lookup. These APIs do not
+// acquire provider ownership. count()/at() pairs are not enumeration snapshots.
+// Allocation, wrapper registry operations, callbacks and reclamation occur
+// outside the IRQ-save block registry guard. Readers only select fully
+// published entries; a preparing or retiring provider remains unselectable.
 auto block_device_register(BlockDevice* bdev) -> int;
 auto block_device_unregister(BlockDevice* bdev) -> int;
 auto block_device_find(unsigned major, unsigned minor) -> BlockDevice*;
 auto block_device_find_by_name(const char* name) -> BlockDevice*;
+// Identity queries never dereference the supplied borrowed pointer. Returned
+// providers retain the registry's existing permanent-storage contract.
+auto block_device_find_by_wrapper(const Device* wrapper) -> BlockDevice*;
+auto block_device_is_registered(const BlockDevice* device) -> bool;
 
 // Helper functions for block I/O
 auto block_read(BlockDevice* bdev, uint64_t block, size_t count, void* buffer) -> int;
@@ -107,6 +120,8 @@ auto block_flush(BlockDevice* bdev) -> int;
 // Partition block device management
 // Creates a partition block device that delegates I/O to parent_disk with an LBA offset.
 // The new device is named "<parent_name><1-based partition_index>" (e.g. "sda1").
+// Returns null if allocation or registration fails; no unpublished partition
+// is returned to the caller.
 auto block_device_create_partition(BlockDevice* parent_disk, uint64_t start_lba, uint64_t end_lba, const uint8_t* partuuid,
                                    uint32_t partition_index) -> BlockDevice*;
 

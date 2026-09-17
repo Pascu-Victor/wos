@@ -15,6 +15,7 @@
 #include <net/proto/udp.hpp>
 #include <net/socket.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <syscalls_impl/net/sys_net.hpp>
 #include <test/ktest.hpp>
 
 // ---------------------------------------------------------------------------
@@ -429,3 +430,5 @@ KTEST(Net, UdpSendtoRejectsOversizeBeforeAutobindAndCopy) {
     KEXPECT_EQ(RET, static_cast<ssize_t>(-EMSGSIZE));
     KEXPECT_EQ(sock.local.port, static_cast<uint16_t>(0));
 }
+
+KTEST(Net, SocketZeroReadDoesNotEnterReceiveWait) { KEXPECT_TRUE(ker::syscall::net::net_selftest_socket_zero_read_does_not_receive()); }

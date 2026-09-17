@@ -492,7 +492,7 @@ def test_user_thread_tcbs_publish_nonzero_tid_before_user_execution() -> None:
         [
             "loader::elf::inspect_tls(elf_buffer, static_cast<size_t>(FILE_SIZE), tls_info)",
             "mod::sched::threading::create_thread(ker::mod::mm::USER_STACK_SIZE, tls_info.tls_size",
-            "new_pagemap, task->pid, tls_info",
+            "new_pagemap, PROCESS_OWNER->pid, tls_info",
         ],
         "execve replacement TCB tid publication",
     )
@@ -554,33 +554,32 @@ def test_default_user_stack_reservation_covers_native_toolchain_links() -> None:
 
 
 def test_execve_publishes_new_context_before_old_image_teardown() -> None:
-    body = function_body(EXEC_CPP.read_text(), "wos_proc_execve_impl")
-    require_tokens(
-        body,
-        [
-            "mm::paging::PageTable* old_pagemap_to_destroy = nullptr;",
-            "auto* old_thread_to_destroy = old_thread;",
-            "ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;",
-            "old_pagemap_has_other_publishers = mod::sched::task_has_live_pagemap_sibling(task);",
-            "old_pagemap_to_destroy = task->replace_pagemap_after_usercopy_quiescence(new_pagemap);",
-            "task->thread = new_thread;",
-            "mm::virt::release_pagemap(old_pagemap_to_destroy);",
-            "mm::virt::release_pagemap(new_pagemap);",
-        ],
-        "execve replacement-context publication",
-    )
-    require_order(
-        body,
-        "old_pagemap_to_destroy = task->replace_pagemap_after_usercopy_quiescence(new_pagemap);",
-        "ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(old_pagemap_to_destroy);",
-        "execve must stop publishing the old pagemap before old-image teardown",
-    )
-    require_order(
-        body,
-        "task->thread = new_thread;",
-        "mod::sched::threading::destroy_thread(old_thread_to_destroy);",
-        "execve must stop publishing the old thread before destroying it",
-    )
+    source = EXEC_CPP.read_text()
+    body = function_body(source, "finish_native_exec_image")
+    prepare = function_body(source, "wos_proc_execve_impl")
+    commit = function_body(source, "commit_native_exec_image")
+    require_tokens(commit, [
+        "ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;",
+        "retired.pagemap_has_other_publishers = mod::sched::task_has_live_pagemap_sibling(task);",
+        "retired.thread = task->thread;",
+        "retired.pagemap = task->replace_pagemap_after_usercopy_quiescence(image.pagemap);",
+        "task->thread = image.thread;",
+    ], "execve replacement-context publication")
+    for forbidden in ["destroy_user_space(", "release_pagemap(", "destroy_thread("]:
+        if forbidden in commit:
+            fail("image commit must leave retired storage cleanup to the unlocked caller")
+    require_tokens(prepare, ["mm::virt::release_pagemap(new_pagemap, task->pid);"], "private preparation abort")
+    require_tokens(body, ["PREPARED->mark_activated();"],
+                   "execve replacement activation and preparation abort")
+    cleanup = function_body(source, "discard_retired")
+    require_tokens(cleanup, ["ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(m_retired.pagemap);",
+                            "ker::mod::mm::virt::release_pagemap(m_retired.pagemap, m_origin_pid);",
+                            "ker::mod::sched::threading::destroy_thread(m_retired.thread);"], "owned old-image cleanup")
+    if not (body.index("commit_native_exec_image(task, *PREPARED)") < body.index("PREPARED->mark_activated();") <
+            body.rindex("cleanup_exec_preparation(*task)")):
+        fail("old-image reclamation must follow publication and replacement activation")
+    if "RetiredExecImage retired;" in body:
+        fail("old-image storage must remain recoverable outside the syscall stack")
 
 
 def test_procfs_status_exposes_child_lifecycle_debug_state() -> None:
@@ -648,7 +647,40 @@ def test_process_cpu_observation_preserves_lifetime() -> None:
         fail("live registry scan must not supply process lifetime CPU")
 
 
+def test_job_control_stops_gate_all_runnable_selection() -> None:
+    source = SCHEDULER_CPP.read_text()
+    park = function_body(source, "park_job_control_stopped_task_locked")
+    require_tokens(park, ["jobctl_stopped.load(std::memory_order_acquire)", "transition_detach_runnable_locked",
+                         "transition_detach_all_wait_locked", "transition_make_waiting_locked"], "job-control waiting admission")
+    if "publish_job_control_stop" in park or "resume_job_control_for_pending_signal" in park:
+        fail("runqueue lock cannot enclose child lifecycle publication")
+    for name, candidate in (("pick_best_eligible_for_switch_locked", "next"), ("pick_exit_switch_candidate_locked", "candidate")):
+        body = function_body(source, name)
+        require_tokens(body, [f"park_job_control_stopped_task_locked(rq, {candidate})"], "stopped candidate rejection")
+        if body.index("park_job_control_stopped_task_locked") > body.index(f"return {candidate};"):
+            fail("stopped candidate must be parked before selection returns it")
+    if source.count("runnable_heap.pick_best_eligible(") != 2:
+        fail("raw heap selection must be confined to the two stopped-task-filtering pickers")
+    require_tokens(function_body(source, "process_tasks"), ["park_job_control_stopped_task_locked(rq, current_task)"],
+                   "timer must deschedule an already-current stopped task")
+
+
+def test_gc_pagemap_scan_counts_publishers_not_execution_eligibility() -> None:
+    source = SCHEDULER_CPP.read_text()
+    gc_scan = function_body(source, "gc_task_has_pagemap_sibling_locked")
+    require_tokens(gc_scan, ["task_has_registered_pagemap_sibling(cur)"], "GC registered root ownership")
+    for forbidden in ["get_active_task_at_safe", "try_acquire(", "TaskState::DEAD", "TaskState::EXITING"]:
+        if forbidden in gc_scan:
+            fail("GC may not hide an existing root publisher based on execution eligibility")
+    scan = function_body(source, "task_has_registered_pagemap_sibling")
+    require_order(scan, "global_task_registry_lock.lock_irqsave()", "active_task_slot(i)", "publisher scan holds registry lifetime lock")
+    cleanup = function_body(source, "cleanup_waitable_zombie_resources")
+    require_order(cleanup, "detach_pagemap_after_usercopy_quiescence()", "if (detached.should_free_pagemap)",
+                  "non-owning zombie must stop publishing before last owner frees shared root")
+
+
 def main() -> None:
+    test_job_control_stops_gate_all_runnable_selection()
     test_process_cpu_observation_preserves_lifetime()
     architecture_tests = (
         test_only_active_syscalls_can_defer_rescheduling_to_syscall_exit,

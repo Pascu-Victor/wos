@@ -8,14 +8,17 @@
 #include <cstring>
 #include <dev/block_device.hpp>
 #include <dev/gpt.hpp>
+#include <memory>
 #include <net/wki/event.hpp>
 #include <net/wki/remotable.hpp>
+#include <net/wki/remote_vfs.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/power/power.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <platform/security/credentials.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <util/smallvec.hpp>
 #include <vfs/fs/fat32.hpp>
@@ -46,6 +49,8 @@ std::atomic<uint64_t> mount_generation{1};
 // this odd until task roots are updated and rebase_wki_mounts_for_new_root()
 // completes the namespace transition.
 std::atomic<uint64_t> mount_pivot_epoch{2};
+// Zero is exhausted. IDs also bind exact unmount/export retirement requests,
+// so no published identity may be reused after the last uint32_t value.
 uint32_t next_dev_id = 1;
 using log = ker::mod::dbg::logger<"vfs_mount">;
 
@@ -65,6 +70,52 @@ struct PivotMountReplacement {
     char* path = nullptr;
     size_t path_len = 0;
 };
+
+// This owner is destroyed only after namespace publication is unlocked. The
+// native handles keep failed lookup results alive until that same point.
+struct PivotCoverEntry {
+    File* candidate = nullptr;
+    File* retired = nullptr;
+    MountRef parent_hold;
+    tmpfs::TmpfsLookupHandle tmp;
+    xfs::XfsLookupHandle xfs;
+    ~PivotCoverEntry() {
+        if (candidate != nullptr) vfs_put_file(candidate);
+        if (retired != nullptr) vfs_put_file(retired);
+    }
+};
+struct PivotCoverState {
+    std::unique_ptr<PivotCoverEntry[]> entries;
+    size_t count = 0;
+};
+
+auto pin_pivot_cover(const ker::mod::security::Snapshot& credentials, MountPoint* parent, const char* relative, uint64_t generation,
+                     PivotCoverEntry& output) -> int {
+    if (parent == nullptr || relative == nullptr || output.candidate != nullptr) return -EINVAL;
+    output.parent_hold = retain_mount_point(parent);
+    if (!output.parent_hold) return -EAGAIN;
+    int status = -ENOTSUP;
+    // The caller owns the odd mount epoch and namespace publication. Native
+    // backend lookup deliberately avoids VFS routing and even-epoch waits.
+    if (parent->fs_type == FSType::TMPFS) {
+        auto* root = parent->private_data != nullptr ? tmpfs::mount_root(static_cast<tmpfs::TmpfsMount*>(parent->private_data))
+                                                     : tmpfs::get_root_node();
+        status = tmpfs::tmpfs_acquire_lookup(credentials, root, relative, &output.tmp);
+        if (status == 0) output.candidate = tmpfs::tmpfs_pin_directory_lookup(credentials, output.tmp, &status, false);
+    } else if (parent->fs_type == FSType::XFS) {
+        status = xfs::xfs_acquire_lookup(credentials, relative, static_cast<xfs::XfsMountContext*>(parent->private_data), &output.xfs);
+        if (status == 0) output.candidate = xfs::xfs_pin_directory_lookup(credentials, output.xfs, &status, false);
+    }
+    if (status != 0) return status;
+    if (output.candidate == nullptr) return -ENOMEM;
+    if (!retain_mount_for_open_file(parent)) return -EAGAIN;
+    auto& file = *output.candidate;
+    file.mount_owner = parent;
+    file.mount_dev_id = parent->dev_id;
+    file.mount_generation = generation;
+    file.dir_fs_count = static_cast<size_t>(-1);
+    return 0;
+}
 
 auto wait_for_stable_mount_pivot_epoch() -> uint64_t {
     while (true) {
@@ -301,9 +352,25 @@ auto apply_current_task_root_prefix(const char* path, char* out, size_t outsize)
     return copy_mount_path_string(path, out, outsize);
 }
 
-auto mount_has_active_refs_locked(const MountPoint* mount) -> bool {
-    return mount != nullptr && (mount->refs.load(std::memory_order_acquire) != 0 ||
-                                mount->open_files.load(std::memory_order_acquire) != 0 || mount->retiring.load(std::memory_order_acquire));
+auto mount_has_active_refs_locked(const MountPoint* mount, const PivotCoverState* prepared = nullptr) -> bool {
+    if (mount == nullptr) return false;
+    uint32_t internal_pins = 0;
+    uint32_t prepared_refs = 0;
+    for (auto* child : mounts) {
+        auto* pin = child != nullptr ? child->covered_directory : nullptr;
+        // Each publication gets an independent File. An external reference
+        // makes this an active user again, preserving pivot's busy contract.
+        if (pin != nullptr && pin->mount_owner == mount && pin->refcount.load(std::memory_order_acquire) == 1) ++internal_pins;
+    }
+    if (prepared != nullptr) {
+        for (size_t index = 0; index < prepared->count; ++index) {
+            if (prepared->entries[index].parent_hold.get() == mount) ++prepared_refs;
+            auto* pin = prepared->entries[index].candidate;
+            if (pin != nullptr && pin->mount_owner == mount && pin->refcount.load(std::memory_order_acquire) == 1) ++internal_pins;
+        }
+    }
+    return mount->refs.load(std::memory_order_acquire) != prepared_refs ||
+           mount->open_files.load(std::memory_order_acquire) != internal_pins || mount->retiring.load(std::memory_order_acquire);
 }
 
 auto retain_mount_locked(MountPoint* mount) -> bool {
@@ -351,6 +418,29 @@ auto mount_path_initializing_locked(const char* path) -> bool {
     return false;
 }
 
+// Mount-table topology only, not proof of native directory membership. Paths
+// are canonical table/reservation keys, and every caller holds mount_lock.
+auto mount_path_is_descendant(const char* child, const char* parent) -> bool {
+    if (child == nullptr || parent == nullptr || parent[0] == '\0') return false;
+    if (parent[0] == '/' && parent[1] == '\0') return child[0] == '/' && child[1] != '\0';
+    auto const LENGTH = std::strlen(parent);
+    return std::strncmp(child, parent, LENGTH) == 0 && child[LENGTH] == '/';
+}
+
+auto mount_path_has_descendants_locked(const char* path) -> bool {
+    for (auto* mount : mounts)
+        if (mount != nullptr && mount_path_is_descendant(mount->path, path)) return true;
+    for (const auto& initialization : mount_initializations)
+        if (initialization.active && mount_path_is_descendant(initialization.path.data(), path)) return true;
+    return false;
+}
+
+auto mount_path_has_retiring_ancestor_locked(const char* path) -> bool {
+    for (auto* mount : mounts)
+        if (mount != nullptr && mount->retiring.load(std::memory_order_acquire) && mount_path_is_descendant(path, mount->path)) return true;
+    return false;
+}
+
 class MountInitializationReservation {
    public:
     MountInitializationReservation() = default;
@@ -369,7 +459,7 @@ class MountInitializationReservation {
 
         mount_lock.lock();
         if (mount_pivot_epoch.load(std::memory_order_acquire) != pivot_epoch || mount_path_occupied_locked(path) ||
-            mount_path_initializing_locked(path)) {
+            mount_path_initializing_locked(path) || mount_path_has_retiring_ancestor_locked(path)) {
             mount_lock.unlock();
             return -EBUSY;
         }
@@ -685,9 +775,11 @@ auto destroy_mount_private_data(MountPoint* mount, bool force) -> int {
     }
 
     switch (mount->fs_type) {
-        case FSType::FAT32:
-            ker::vfs::fat32::fat32_unmount(static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data));
+        case FSType::FAT32: {
+            int const RET = ker::vfs::fat32::fat32_unmount(static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data));
+            if (RET != 0) return RET;
             break;
+        }
         case FSType::XFS: {
             auto* context = static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data);
             if (force) {
@@ -714,6 +806,9 @@ void destroy_mount_storage(MountPoint* mount) {
     if (mount == nullptr) {
         return;
     }
+    // The row is already unpublished (or was never published). Its native
+    // backend has closed; drain the parent pin with all registry locks free.
+    if (mount->covered_directory != nullptr) vfs_put_file(mount->covered_directory);
     delete[] mount->path;
     delete[] mount->fstype;
     delete mount;
@@ -804,6 +899,14 @@ auto complete_retired_mount_teardown(MountPoint* mount, bool bounded_ref_wait, s
         mount_lock.unlock();
         return -ENOENT;
     }
+    // Shutdown marks a whole set before leaf-first teardown. A child that
+    // remained busy (or a still-initializing child) must keep this backend live.
+    if (mount_path_has_descendants_locked(mount->path)) {
+        mount->retiring.store(false, std::memory_order_release);
+        bump_mount_generation_locked();
+        mount_lock.unlock();
+        return -EBUSY;
+    }
     uint32_t const OPEN_FILES = mount->open_files.load(std::memory_order_acquire);
     if (OPEN_FILES != 0) {
         mount->retiring.store(false, std::memory_order_release);
@@ -817,8 +920,13 @@ auto complete_retired_mount_teardown(MountPoint* mount, bool bounded_ref_wait, s
     // The mount stays published as an unretainable tombstone while backend
     // closeout performs blocking I/O. A failed XFS teardown leaves its
     // context live, so reopening publication makes the failure retryable.
+    // Pin before clearing private_data: a concurrent WKI unmount must still
+    // see this retiring row and return EBUSY, rather than free its owner on
+    // ENOENT. Busy File/ref checks above leave the group entirely unchanged.
+    auto* remote_owner = mount->fs_type == FSType::REMOTE ? ker::net::wki::wki_remote_vfs_pin_mount_teardown(mount->private_data) : nullptr;
     int const DESTROY_RET = destroy_mount_private_data(mount, false);
     if (DESTROY_RET != 0) {
+        ker::net::wki::wki_remote_vfs_finish_mount_teardown(remote_owner, false);
         rollback_mount_retirement(mount);
         return DESTROY_RET;
     }
@@ -827,6 +935,7 @@ auto complete_retired_mount_teardown(MountPoint* mount, bool bounded_ref_wait, s
     size_t const REMOVE_INDEX = mount_index_locked(mount);
     if (REMOVE_INDEX == MOUNT_INDEX_NONE) {
         mount_lock.unlock();
+        ker::net::wki::wki_remote_vfs_finish_mount_teardown(remote_owner, false);
         log::warn("unmount lost retiring mount after backend teardown");
         return -EIO;
     }
@@ -838,6 +947,7 @@ auto complete_retired_mount_teardown(MountPoint* mount, bool bounded_ref_wait, s
     mount_lock.unlock();
 
     destroy_mount_storage(mount);
+    ker::net::wki::wki_remote_vfs_finish_mount_teardown(remote_owner, true);
     return 0;
 }
 
@@ -1095,8 +1205,8 @@ auto mounted_block_device_overlaps(const ker::dev::BlockDevice* device) -> bool 
 }
 
 auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device, unsigned long flags, const char* data,
-                              void* initial_private_data, FileOperations* initial_fops, PreparedMount* out) -> int {
-    (void)flags;
+                              void* initial_private_data, FileOperations* initial_fops, PreparedMount* out, MountPathKind path_kind)
+    -> int {
     if (path == nullptr || fstype == nullptr || out == nullptr || out->state != nullptr) {
         vfs_debug_log("mount_filesystem: invalid arguments\n");
         return -EINVAL;
@@ -1108,10 +1218,14 @@ auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::Bl
 
     uint64_t const PIVOT_EPOCH = wait_for_stable_mount_pivot_epoch();
 
-    // Resolve through task root prefix so the stored path matches what
-    // find_mount_point receives after resolve_task_path_raw.
+    // Public mount already admitted a physical path. Never reinterpret it
+    // through a later ambient root/cwd observation during preparation.
     std::array<char, MAX_MOUNT_PATH> resolved __attribute__((uninitialized));
-    int const PATH_RET = resolve_mount_path(path, resolved.data(), resolved.size());
+    if (path_kind == MountPathKind::RETAINED_PHYSICAL && path[0] != '/') {
+        return -EINVAL;
+    }
+    int const PATH_RET = path_kind == MountPathKind::RETAINED_PHYSICAL ? copy_mount_path_string(path, resolved.data(), resolved.size())
+                                                                       : resolve_mount_path(path, resolved.data(), resolved.size());
     if (PATH_RET < 0) {
         vfs_debug_log("mount_filesystem: path resolution failed\n");
         return PATH_RET;
@@ -1125,7 +1239,8 @@ auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::Bl
         mount_lock.unlock();
         return -EBUSY;
     }
-    if (mount_path_occupied_locked(resolved.data()) || mount_path_initializing_locked(resolved.data())) {
+    if (mount_path_occupied_locked(resolved.data()) || mount_path_initializing_locked(resolved.data()) ||
+        mount_path_has_retiring_ancestor_locked(resolved.data())) {
         mount_lock.unlock();
         vfs_debug_log("mount_filesystem: mount path already occupied\n");
         return -EBUSY;
@@ -1180,10 +1295,11 @@ auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::Bl
     mount->device = device;
     mount->private_data = nullptr;
     mount->fops = nullptr;
-    mount->read_only = device != nullptr && ker::dev::block_device_is_read_only(device);
+    mount->read_only = (flags & MOUNT_FLAG_RDONLY) != 0 || (device != nullptr && ker::dev::block_device_is_read_only(device));
+    mount->nosuid = (flags & MOUNT_FLAG_NOSUID) != 0;
 
     bool const BLOCK_RW_FS = mount->fs_type == FSType::FAT32 || mount->fs_type == FSType::XFS;
-    if (BLOCK_RW_FS && device != nullptr && !ker::dev::block_device_is_read_only(device) &&
+    if (BLOCK_RW_FS && device != nullptr && !mount->read_only &&
         !mount->block_writer_lease.try_acquire(device, ker::dev::BlockWriterLeaseOwner::LOCAL_MOUNT)) {
         vfs_debug_log("mount_filesystem: block device has a remote writer lease\n");
         static_cast<void>(destroy_mount(mount, true));
@@ -1218,7 +1334,7 @@ auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::Bl
         }
 
         // Initialize FAT32 with the device and partition offset
-        auto* context = ker::vfs::fat32::fat32_init_device(device, partition_start_lba);
+        auto* context = ker::vfs::fat32::fat32_init_device(device, partition_start_lba, mount->read_only);
         if (context == nullptr) {
             vfs_debug_log("mount_filesystem: FAT32 initialization failed\n");
             static_cast<void>(destroy_mount(mount, true));
@@ -1268,7 +1384,7 @@ auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::Bl
             delete state;
             return -EINVAL;
         }
-        auto* xfs_ctx = ker::vfs::xfs::xfs_vfs_init_device(device);
+        auto* xfs_ctx = ker::vfs::xfs::xfs_vfs_init_device(device, mount->read_only);
         if (xfs_ctx == nullptr) {
             vfs_debug_log("mount_filesystem: XFS initialization failed\n");
             static_cast<void>(destroy_mount(mount, true));
@@ -1290,7 +1406,9 @@ auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::Bl
     return 0;
 }
 
-auto publish_prepared_mount(PreparedMount* prepared) -> int {
+namespace {
+auto publish_prepared_mount_with_identity(PreparedMount* prepared, const char* expected_physical_path, File* covered_directory,
+                                          uint32_t& next_identity) -> int {
     if (prepared == nullptr || prepared->state == nullptr) {
         return -EINVAL;
     }
@@ -1299,24 +1417,51 @@ auto publish_prepared_mount(PreparedMount* prepared) -> int {
     if (mount == nullptr || state->published) {
         return -EINVAL;
     }
+    if (expected_physical_path != nullptr && std::strcmp(mount->path, expected_physical_path) != 0) {
+        return -EAGAIN;
+    }
 
     mount_lock.lock();
+    if (covered_directory != nullptr) {
+        auto* parent = covered_directory->mount_owner;
+        // The producer owns a fresh detached native pin from its admitted
+        // target lookup. Refuse sharing a File between mount relationships.
+        if (parent == nullptr || mount_index_locked(parent) == MOUNT_INDEX_NONE || parent->retiring.load(std::memory_order_acquire) ||
+            covered_directory->refcount.load(std::memory_order_acquire) != 1 || !covered_directory->is_directory ||
+            covered_directory->private_data == nullptr || covered_directory->directory_view || covered_directory->vfs_path != nullptr ||
+            (covered_directory->open_flags & 3) != FILE_ACCESS_SEARCH_ONLY || (covered_directory->open_flags & O_DIRECTORY) == 0 ||
+            covered_directory->fs_type != parent->fs_type || (parent->fs_type != FSType::TMPFS && parent->fs_type != FSType::XFS) ||
+            !mount_path_is_descendant(mount->path, parent->path)) {
+            mount_lock.unlock();
+            return -EINVAL;
+        }
+    }
     if (mount_pivot_epoch.load(std::memory_order_acquire) != state->pivot_epoch) {
         mount_lock.unlock();
         vfs_debug_log("mount_filesystem: pivot namespace changed before publication\n");
         return -EBUSY;
     }
-    if (!state->reservation.active_locked() || mount_path_occupied_locked(mount->path)) {
+    if (!state->reservation.active_locked() || mount_path_occupied_locked(mount->path) ||
+        mount_path_has_retiring_ancestor_locked(mount->path)) {
         mount_lock.unlock();
         vfs_debug_log("mount_filesystem: mount path already occupied before publication\n");
         return -EBUSY;
+    }
+    if (next_identity == 0) {
+        mount_lock.unlock();
+        return -EOVERFLOW;
     }
     if (!mounts.push_back(mount)) {
         mount_lock.unlock();
         vfs_debug_log("mount_filesystem: mount table full (OOM)\n");
         return -ENOMEM;
     }
-    mount->dev_id = next_dev_id++;
+    if (covered_directory != nullptr) {
+        vfs_retain_file(covered_directory);
+        mount->covered_directory = covered_directory;
+    }
+    mount->dev_id = next_identity;
+    next_identity = next_identity == UINT32_MAX ? 0 : next_identity + 1;
     if (mount->fs_type == FSType::XFS && mount->private_data != nullptr) {
         static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data)->dev_id = mount->dev_id;
     }
@@ -1327,6 +1472,11 @@ auto publish_prepared_mount(PreparedMount* prepared) -> int {
     mount_lock.unlock();
 
     return 0;
+}
+}  // namespace
+
+auto publish_prepared_mount(PreparedMount* prepared, const char* expected_physical_path, File* covered_directory) -> int {
+    return publish_prepared_mount_with_identity(prepared, expected_physical_path, covered_directory, next_dev_id);
 }
 
 void finish_prepared_mount(PreparedMount* prepared) {
@@ -1408,7 +1558,7 @@ auto unmount_filesystem_impl(const char* path, const void* expected_private_data
             if (!PATH_MATCHES || !OWNER_MATCHES || !DEV_ID_MATCHES) {
                 continue;
             }
-            if (mp->retiring.load(std::memory_order_acquire)) {
+            if (mp->retiring.load(std::memory_order_acquire) || mount_path_has_descendants_locked(mp->path)) {
                 mount_lock.unlock();
                 return -EBUSY;
             }
@@ -1482,7 +1632,7 @@ auto unmount_filesystem_by_private_data(const void* expected_private_data) -> in
             if (MP == nullptr || MP->private_data != expected_private_data) {
                 continue;
             }
-            if (MP->retiring.load(std::memory_order_acquire)) {
+            if (MP->retiring.load(std::memory_order_acquire) || mount_path_has_descendants_locked(MP->path)) {
                 mount_lock.unlock();
                 return -EBUSY;
             }
@@ -1728,7 +1878,13 @@ auto configure_mount_point_exact(const char* path, FSType expected_type, void* p
     }
 }
 
-auto remap_mounts_for_pivot(const char* new_root, const char* put_old) -> int {
+PivotMountReferences::~PivotMountReferences() { delete static_cast<PivotCoverState*>(state_); }
+
+auto remap_mounts_for_pivot(const char* new_root, const char* put_old, const ker::mod::security::Snapshot* credentials,
+                            PivotMountReferences* references) -> int {
+    if ((credentials == nullptr) != (references == nullptr) || (references != nullptr && references->state_ != nullptr)) return -EINVAL;
+    PivotMountReferences local_references;
+    auto& reference_owner = references != nullptr ? *references : local_references;
     if (new_root == nullptr || put_old == nullptr) {
         return -EINVAL;
     }
@@ -1895,6 +2051,51 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old) -> int {
         return abort_mount_pivot(ODD_EPOCH, -EBUSY);
     }
 
+    auto* cover_state = new (std::nothrow) PivotCoverState{};
+    if (cover_state != nullptr) {
+        reference_owner.state_ = cover_state;
+        cover_state->entries.reset(new (std::nothrow) PivotCoverEntry[MOUNT_COUNT]);
+        cover_state->count = MOUNT_COUNT;
+    }
+    if (cover_state == nullptr || !cover_state->entries) {
+        release_pivot_replacements(replacements);
+        return abort_mount_pivot(ODD_EPOCH, -ENOMEM);
+    }
+    auto destination = [&](const MountPoint* mount) -> const char* {
+        for (const auto& replacement : replacements)
+            if (replacement.mount == mount) return replacement.path;
+        return mount->path;
+    };
+    if (credentials != nullptr) {
+        auto const REQUEST_CREDENTIALS = *credentials;
+        for (size_t index = 0; index < MOUNT_COUNT; ++index) {
+            auto* child = mounts.at(index);
+            if (child == nullptr) continue;
+            const char* const CHILD_PATH = destination(child);
+            MountPoint* parent = nullptr;
+            size_t parent_length = 0;
+            for (auto* possible : mounts) {
+                if (possible == nullptr || possible == child) continue;
+                const char* const PARENT_PATH = destination(possible);
+                size_t const LENGTH = std::strlen(PARENT_PATH);
+                if (LENGTH > parent_length && std::strlen(CHILD_PATH) > LENGTH && path_is_under_root(CHILD_PATH, PARENT_PATH, LENGTH)) {
+                    parent = possible;
+                    parent_length = LENGTH;
+                }
+            }
+            if (parent == nullptr || (parent->fs_type != FSType::TMPFS && parent->fs_type != FSType::XFS)) continue;
+            auto* relative = CHILD_PATH + (parent_length == 1 ? 0 : parent_length);
+            int const PIN = pin_pivot_cover(REQUEST_CREDENTIALS, parent, relative, TABLE_GENERATION + 1, cover_state->entries[index]);
+            // Synthetic mount paths can lack a native directory. They remain
+            // explicitly unproven; scoped membership must keep refusing them.
+            if (PIN == -ENOENT || PIN == -ENOTDIR || PIN == -ENOTSUP) continue;
+            if (PIN != 0) {
+                release_pivot_replacements(replacements);
+                return abort_mount_pivot(ODD_EPOCH, PIN);
+            }
+        }
+    }
+
     mount_lock.lock();
     if (mount_pivot_epoch.load(std::memory_order_acquire) != ODD_EPOCH ||
         mount_generation.load(std::memory_order_acquire) != TABLE_GENERATION) {
@@ -1903,7 +2104,7 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old) -> int {
         return abort_mount_pivot(ODD_EPOCH, -EBUSY);
     }
     for (const auto& replacement : replacements) {
-        if (mount_has_active_refs_locked(replacement.mount)) {
+        if (mount_has_active_refs_locked(replacement.mount, cover_state)) {
             mount_pivot_epoch.store(ODD_EPOCH + 1, std::memory_order_release);
             mount_lock.unlock();
             release_pivot_replacements(replacements);
@@ -1911,6 +2112,16 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old) -> int {
         }
     }
 
+    // Publish independently pinned destination covers with the remapped paths.
+    // Failure above leaves every old edge intact; all retired references stay
+    // in the caller's owner until namespace and task-root publication finish.
+    for (size_t i = 0; i < mounts.size(); ++i) {
+        auto* mount = mounts.at(i);
+        if (mount == nullptr) continue;
+        auto& entry = cover_state->entries[i];
+        entry.retired = mount->covered_directory;
+        mount->covered_directory = std::exchange(entry.candidate, nullptr);
+    }
     bump_mount_generation_locked();
     for (auto& replacement : replacements) {
         auto* mp = replacement.mount;
@@ -1993,6 +2204,29 @@ auto get_mount_at(size_t index) -> MountRef {
     }
 }
 
+auto copy_mount_path_exact(const MountPoint* mount, char* out, size_t capacity) -> int {
+    if (mount == nullptr || out == nullptr || capacity == 0) return -EINVAL;
+    mount_lock.lock();
+    int result = -ENOENT;
+    if ((mount_pivot_epoch.load(std::memory_order_acquire) & 1U) != 0) {
+        mount_lock.unlock();
+        return -EAGAIN;
+    }
+    for (auto* candidate : mounts) {
+        if (candidate != mount || candidate->retiring.load(std::memory_order_acquire)) continue;
+        if (candidate->path == nullptr) break;
+        if (candidate->path_len >= capacity) {
+            result = -ENAMETOOLONG;
+        } else {
+            std::memcpy(out, candidate->path, candidate->path_len + 1);
+            result = 0;
+        }
+        break;
+    }
+    mount_lock.unlock();
+    return result;
+}
+
 auto get_mount_snapshot_at(size_t index, MountSnapshot* out) -> bool {
     if (out == nullptr) {
         return false;
@@ -2026,6 +2260,7 @@ auto get_mount_snapshot_at(size_t index, MountSnapshot* out) -> bool {
         out->fs_type = mp->fs_type;
         out->dev_id = mp->dev_id;
         out->read_only = mp->read_only;
+        out->nosuid = mp->nosuid;
         if (mp->fstype != nullptr) {
             size_t const FSTYPE_LEN = std::strlen(mp->fstype);
             size_t const COPY_LEN = (FSTYPE_LEN < MOUNT_FSTYPE_MAX) ? FSTYPE_LEN : MOUNT_FSTYPE_MAX - 1;
@@ -2037,5 +2272,343 @@ auto get_mount_snapshot_at(size_t index, MountSnapshot* out) -> bool {
         return true;
     }
 }
+
+auto capture_mount_covered_directory(MountPoint* mount, File** output, uint64_t* generation) -> int {
+    if (mount == nullptr || output == nullptr || *output != nullptr || generation == nullptr) return -EINVAL;
+    mount_lock.lock();
+    int result = 0;
+    if (mount_index_locked(mount) == MOUNT_INDEX_NONE)
+        result = -ENOENT;
+    else if ((mount_pivot_epoch.load(std::memory_order_acquire) & 1U) != 0 || mount->retiring.load(std::memory_order_acquire))
+        result = -EAGAIN;
+    else if (mount->covered_directory == nullptr)
+        result = -ENOTSUP;
+    if (result == 0) {
+        vfs_retain_file(mount->covered_directory);
+        *output = mount->covered_directory;
+        *generation = mount_generation.load(std::memory_order_acquire);
+    }
+    mount_lock.unlock();
+    return result;
+}
+
+#ifdef WOS_SELFTEST
+auto mount_point_pivot_busy_for_test(MountPoint* mount) -> bool {
+    mount_lock.lock();
+    bool const BUSY = mount_has_active_refs_locked(mount);
+    mount_lock.unlock();
+    return BUSY;
+}
+auto mount_lock_available_for_test() -> bool {
+    bool const AVAILABLE = mount_lock.try_lock();
+    if (AVAILABLE) mount_lock.unlock();
+    return AVAILABLE;
+}
+auto mount_selftest_identity_exhaustion() -> bool {
+    constexpr const char* LAST_PATH = "/tmp/ktest_mount_last_identity";
+    constexpr const char* NEXT_PATH = "/tmp/ktest_mount_exhausted_identity";
+    auto check = [](bool okay, int line) {
+        if (!okay) log::warn("mount identity exhaustion check failed at %d", line);
+        return okay;
+    };
+    // The fixture uses a private cursor and never rewinds the production one.
+    // Before exhaustion, the last ID cannot have been issued by production.
+    mount_lock.lock();
+    bool const LAST_AVAILABLE = next_dev_id != 0 && next_dev_id != UINT32_MAX;
+    mount_lock.unlock();
+    if (!check(LAST_AVAILABLE && !ker::net::wki::g_wki.initialized, __LINE__)) return false;
+    struct Cleanup {
+        PreparedMount last{}, next{};
+        uint32_t last_id = 0;
+        uint32_t next_id = 0;
+        ~Cleanup() {
+            finish_prepared_mount(&last);
+            finish_prepared_mount(&next);
+            if (next_id != 0) static_cast<void>(unmount_filesystem_if_dev_id(NEXT_PATH, next_id));
+            if (last_id != 0) static_cast<void>(unmount_filesystem_if_dev_id(LAST_PATH, last_id));
+        }
+    } cleanup;
+    if (!check(prepare_mount_filesystem(LAST_PATH, "tmpfs", nullptr, 0, nullptr, nullptr, nullptr, &cleanup.last) == 0, __LINE__))
+        return false;
+    uint32_t cursor = UINT32_MAX;
+    if (!check(publish_prepared_mount_with_identity(&cleanup.last, nullptr, nullptr, cursor) == 0, __LINE__)) return false;
+    auto* last = static_cast<PreparedMountState*>(cleanup.last.state);
+    cleanup.last_id = last->mount->dev_id;
+    if (!check(cleanup.last_id == UINT32_MAX && cursor == 0, __LINE__)) return false;
+    finish_prepared_mount(&cleanup.last);
+    if (!check(prepare_mount_filesystem(NEXT_PATH, "tmpfs", nullptr, 0, nullptr, nullptr, nullptr, &cleanup.next) == 0, __LINE__))
+        return false;
+    auto* candidate = static_cast<PreparedMountState*>(cleanup.next.state);
+    auto* storage = candidate->mount->private_data;
+    auto const COUNT = get_mount_count();
+    auto const GENERATION = mount_table_generation_snapshot();
+    for (unsigned attempt = 0; attempt < 2; ++attempt) {
+        if (!check(publish_prepared_mount_with_identity(&cleanup.next, nullptr, nullptr, cursor) == -EOVERFLOW && cursor == 0 &&
+                       get_mount_count() == COUNT && mount_table_generation_snapshot() == GENERATION && !candidate->published &&
+                       candidate->mount->dev_id == 0 && candidate->mount->private_data == storage &&
+                       candidate->mount->covered_directory == nullptr,
+                   __LINE__))
+            return false;
+    }
+    // Failed publication kept its reservation and backend. The ordinary cursor
+    // can publish that same candidate, without reinitializing or borrowing ID 0.
+    if (!check(publish_prepared_mount(&cleanup.next) == 0, __LINE__)) return false;
+    cleanup.next_id = candidate->mount->dev_id;
+    if (!check(cleanup.next_id != 0 && cleanup.next_id != cleanup.last_id, __LINE__)) return false;
+    finish_prepared_mount(&cleanup.next);
+    if (!check(unmount_filesystem_if_dev_id(NEXT_PATH, cleanup.last_id) == -ENOENT &&
+                   unmount_filesystem_if_dev_id(NEXT_PATH, cleanup.next_id) == 0,
+               __LINE__))
+        return false;
+    cleanup.next_id = 0;
+    if (!check(unmount_filesystem_if_dev_id(LAST_PATH, cleanup.last_id) == 0, __LINE__)) return false;
+    cleanup.last_id = 0;
+    return true;
+}
+
+auto mount_selftest_pivot_covers(bool disk) -> bool {
+    constexpr const char* BASE = "/tmp/ktest_pivot_cover";
+    constexpr const char* CHILD = "/tmp/ktest_pivot_cover/covered";
+    auto check = [](bool okay, int line) {
+        if (!okay) log::warn("pivot native cover check failed at %d", line);
+        return okay;
+    };
+    struct Cleanup {
+        bool mounted = false;
+        bool child = false;
+        ~Cleanup() {
+            if (child) static_cast<void>(unmount_filesystem(CHILD));
+            if (mounted) {
+                static_cast<void>(vfs_rmdir(CHILD));
+                static_cast<void>(unmount_filesystem(BASE));
+            }
+            static_cast<void>(vfs_rmdir(BASE));
+        }
+    } cleanup;
+    if (!check(vfs_mkdir(BASE, 0755) == 0, __LINE__)) return false;
+    auto* device = disk ? ker::dev::block_device_find_by_name("sdb2") : nullptr;
+    if (!check((!disk || device != nullptr) && mount_filesystem(BASE, disk ? "xfs" : "tmpfs", device) == 0, __LINE__)) return false;
+    cleanup.mounted = true;
+    if (!check(vfs_mkdir(CHILD, 0755) == 0, __LINE__)) return false;
+    Stat original{};
+    auto const ROOT = ker::mod::security::Snapshot::bootstrap_root();
+    if (!check(vfs_stat(CHILD, &original) == 0, __LINE__)) return false;
+    {
+        ker::mod::sched::task::Task task{};
+        File* pin = nullptr;
+        if (!check(vfs_pin_directory_resolved_beneath_as(task, ROOT, BASE, CHILD, &pin) == 0, __LINE__)) return false;
+        auto release = [](File* file) { vfs_put_file(file); };
+        std::unique_ptr<File, decltype(release)> covered(pin);
+        PreparedMount prepared{};
+        int status =
+            prepare_mount_filesystem(CHILD, "tmpfs", nullptr, 0, nullptr, nullptr, nullptr, &prepared, MountPathKind::RETAINED_PHYSICAL);
+        if (status == 0) status = publish_prepared_mount(&prepared, CHILD, covered.get());
+        finish_prepared_mount(&prepared);
+        if (!check(status == 0, __LINE__)) return false;
+        cleanup.child = true;
+    }
+    auto parent = find_mount_point(BASE);
+    auto* const PARENT = parent.get();
+    if (!check(PARENT != nullptr, __LINE__)) return false;
+    auto const GENERATION = mount_table_generation_snapshot();
+    {
+        PivotCoverState prepared{.entries = std::unique_ptr<PivotCoverEntry[]>(new (std::nothrow) PivotCoverEntry[2]), .count = 2};
+        if (!check(static_cast<bool>(prepared.entries), __LINE__)) return false;
+        // A normal VFS lookup selects the overlaid child. Pivot must pin the
+        // exact native covered inode in its independently selected parent.
+        if (!check(pin_pivot_cover(ROOT, PARENT, "/covered", GENERATION, prepared.entries[0]) == 0 &&
+                       pin_pivot_cover(ROOT, PARENT, "/missing", GENERATION, prepared.entries[1]) == -ENOENT,
+                   __LINE__))
+            return false;
+        auto* file = prepared.entries[0].candidate;
+        Stat actual{};
+        if (!check(file && file->mount_owner == PARENT && file->vfs_path == nullptr && !file->directory_view &&
+                       (file->open_flags & 3) == FILE_ACCESS_SEARCH_ONLY && vfs_fstat_file(file, &actual) == 0 &&
+                       actual.st_ino == original.st_ino && actual.st_dev == original.st_dev && !prepared.entries[1].candidate,
+                   __LINE__))
+            return false;
+        parent.reset();
+        auto busy = [&]() {
+            mount_lock.lock();
+            bool const RESULT = mount_has_active_refs_locked(PARENT, &prepared);
+            mount_lock.unlock();
+            return RESULT;
+        };
+        if (!check(!busy() && mount_point_pivot_busy_for_test(PARENT), __LINE__)) return false;
+        vfs_retain_file(file);
+        bool const EXTERNAL_FILE_BUSY = busy();
+        vfs_put_file(file);
+        if (!check(EXTERNAL_FILE_BUSY && !busy(), __LINE__)) return false;
+        {
+            auto external = retain_mount_point(PARENT);
+            if (!check(external && busy(), __LINE__)) return false;
+        }
+        if (!check(!busy(), __LINE__)) return false;
+        auto old_root = find_mount_point("/");
+        auto child = find_mount_point(CHILD);
+        File* old_cover = nullptr;
+        uint64_t captured_generation = 0;
+        if (!check(old_root && child && capture_mount_covered_directory(child.get(), &old_cover, &captured_generation) == 0, __LINE__))
+            return false;
+        auto release_file = [](File* value) { vfs_put_file(value); };
+        std::unique_ptr<File, decltype(release_file)> retained(old_cover);
+        PivotMountReferences references;
+        if (!check(remap_mounts_for_pivot(BASE, "/tmp/ktest_pivot_cover/oldroot", &ROOT, &references) == -EBUSY &&
+                       mount_table_generation_snapshot() == GENERATION && child->covered_directory == retained.get() &&
+                       std::strcmp(child->path, CHILD) == 0,
+                   __LINE__))
+            return false;
+    }
+    if (!check(!mount_point_pivot_busy_for_test(PARENT), __LINE__)) return false;
+    return check(mount_lock_available_for_test(), __LINE__);
+}
+
+auto mount_selftest_descendant_lifetime(bool disk) -> bool {
+    constexpr const char* BASE = "/tmp/ktest_mount_tree";
+    constexpr const char* CHILD = "/tmp/ktest_mount_tree/child";
+    constexpr const char* DEEP = "/tmp/ktest_mount_tree/child/deep";
+    constexpr const char* SIBLING = "/tmp/ktest_mount_tree2";
+    constexpr const char* SEED = "/tmp/ktest_mount_tree/child/seed";
+    auto check = [](bool okay, int line) {
+        if (!okay) log::warn("mount descendant lifetime check failed at %d", line);
+        return okay;
+    };
+    PreparedMount child{};
+    struct Cleanup {
+        PreparedMount& child;
+        MountPoint* parent = nullptr;
+        MountPoint* child_mount = nullptr;
+        File* file = nullptr;
+        ~Cleanup() {
+            if (parent != nullptr) rollback_mount_retirement(parent);
+            if (child_mount != nullptr) rollback_mount_retirement(child_mount);
+            if (file != nullptr) vfs_put_file(file);
+            finish_prepared_mount(&child);
+            static_cast<void>(unmount_filesystem(DEEP));
+            static_cast<void>(vfs_unlink(SEED));
+            static_cast<void>(unmount_filesystem(CHILD));
+            static_cast<void>(unmount_filesystem(BASE));
+            static_cast<void>(unmount_filesystem(SIBLING));
+            static_cast<void>(vfs_rmdir(BASE));
+            static_cast<void>(vfs_rmdir(SIBLING));
+        }
+    } cleanup{child};
+    if (!check(mount_path_is_descendant("/child", "/") && !mount_path_is_descendant("/", "/") && mount_path_is_descendant(DEEP, BASE) &&
+                   !mount_path_is_descendant(SIBLING, BASE) && !mount_path_is_descendant(BASE, BASE) &&
+                   !mount_path_is_descendant(BASE, CHILD),
+               __LINE__))
+        return false;
+    if (!check(vfs_mkdir(BASE, 0755) == 0 && vfs_mkdir(SIBLING, 0755) == 0, __LINE__)) return false;
+    auto* device = disk ? ker::dev::block_device_find_by_name("sdb2") : nullptr;
+    if (!check((!disk || device != nullptr) && mount_filesystem(BASE, disk ? "xfs" : "tmpfs", device) == 0 &&
+                   mount_filesystem(SIBLING, "tmpfs", nullptr) == 0,
+               __LINE__))
+        return false;
+    auto prepare_child = [&] {
+        return prepare_mount_filesystem(CHILD, "tmpfs", nullptr, 0, nullptr, nullptr, nullptr, &child, MountPathKind::RETAINED_PHYSICAL);
+    };
+    auto select_parent = [&] {
+        auto parent = find_mount_point(BASE);
+        cleanup.parent = parent.get();
+        return parent && std::strcmp(parent->path, BASE) == 0;
+    };
+    if (!check(select_parent(), __LINE__)) return false;
+    // These denials must precede retiring/generation changes, even with no
+    // caller-held MountRef or File keeping the parent busy independently.
+    auto deny_parent = [&] {
+        auto* parent = cleanup.parent;
+        auto* const DATA = parent->private_data;
+        auto const DEV = parent->dev_id;
+        auto const GENERATION = mount_table_generation_snapshot();
+        auto const COUNT = get_mount_count();
+        for (unsigned selector = 0; selector < 4; ++selector) {
+            int result = selector == 0   ? unmount_filesystem(BASE)
+                         : selector == 1 ? unmount_filesystem_if_private_data(BASE, DATA)
+                         : selector == 2 ? unmount_filesystem_by_private_data(DATA)
+                                         : unmount_filesystem_if_dev_id(BASE, DEV);
+            if (result != -EBUSY) {
+                cleanup.parent = nullptr;
+                return false;
+            }
+            auto retained = find_mount_point(BASE);
+            if (!retained || retained.get() != parent || retained->private_data != DATA || retained->dev_id != DEV ||
+                retained->retiring.load() || get_mount_count() != COUNT || mount_table_generation_snapshot() != GENERATION)
+                return false;
+        }
+        return unmount_filesystem_if_dev_id(BASE, 0) == -EINVAL && unmount_filesystem_if_dev_id(BASE, DEV + 1) == -ENOENT &&
+               mount_table_generation_snapshot() == GENERATION;
+    };
+    if (!check(prepare_child() == 0 && deny_parent(), __LINE__)) return false;
+    // Cancellation removes the initialization dependency. A similar-prefix
+    // sibling is not a descendant and must not keep this parent busy.
+    finish_prepared_mount(&child);
+    cleanup.parent = nullptr;
+    if (!check(unmount_filesystem(BASE) == 0 && mount_filesystem(BASE, disk ? "xfs" : "tmpfs", device) == 0 && select_parent() &&
+                   prepare_child() == 0,
+               __LINE__))
+        return false;
+    auto mark_retiring = [](MountPoint* mount) {
+        mount_lock.lock();
+        mount->retiring.store(true, std::memory_order_release);
+        bump_mount_generation_locked();
+        mount_lock.unlock();
+    };
+    // Deterministically exercise shutdown's bulk-marking interleaving with a
+    // previously reserved child. Publication preserves the prepared backend.
+    mark_retiring(cleanup.parent);
+    auto const RETIRING_GENERATION = mount_table_generation_snapshot();
+    auto* const PREPARED = static_cast<PreparedMountState*>(child.state);
+    auto* const CHILD_DATA = PREPARED->mount->private_data;
+    if (!check(publish_prepared_mount(&child, CHILD) == -EBUSY && !PREPARED->published && PREPARED->mount->private_data == CHILD_DATA &&
+                   mount_table_generation_snapshot() == RETIRING_GENERATION,
+               __LINE__))
+        return false;
+    PreparedMount rejected{};
+    int const PREPARE =
+        prepare_mount_filesystem(DEEP, "tmpfs", nullptr, 0, nullptr, nullptr, nullptr, &rejected, MountPathKind::RETAINED_PHYSICAL);
+    bool const REJECTED = PREPARE == -EBUSY && rejected.state == nullptr;
+    finish_prepared_mount(&rejected);
+    MountInitializationReservation raced;
+    if (!check(REJECTED && raced.acquire(DEEP, mount_pivot_epoch.load()) == -EBUSY &&
+                   mount_table_generation_snapshot() == RETIRING_GENERATION &&
+                   complete_retired_mount_teardown(cleanup.parent, true, nullptr) == -EBUSY && !cleanup.parent->retiring.load(),
+               __LINE__))
+        return false;
+    // Once the parent returns to service the same prepared child can publish.
+    if (!check(publish_prepared_mount(&child, CHILD) == 0, __LINE__)) return false;
+    finish_prepared_mount(&child);
+    {
+        auto retained = find_mount_point(CHILD);
+        if (!check(retained && std::strcmp(retained->path, CHILD) == 0 && retained->private_data == CHILD_DATA, __LINE__)) return false;
+        cleanup.child_mount = retained.get();
+    }
+    if (!check(deny_parent() && mount_filesystem(DEEP, "tmpfs", nullptr) == 0 && deny_parent(), __LINE__)) return false;
+    auto const DEEP_GENERATION = mount_table_generation_snapshot();
+    if (!check(unmount_filesystem(CHILD) == -EBUSY && mount_table_generation_snapshot() == DEEP_GENERATION && unmount_filesystem(DEEP) == 0,
+               __LINE__))
+        return false;
+    cleanup.file = vfs_open_file(SEED, O_CREAT | O_EXCL | 2, 0600);
+    if (!check(cleanup.file != nullptr && vfs_pwrite_file(cleanup.file, "seed", 4, 0) == 4, __LINE__)) return false;
+    mark_retiring(cleanup.child_mount);
+    mark_retiring(cleanup.parent);
+    // A busy child's rollback during shutdown cannot permit parent destruction.
+    if (!check(complete_retired_mount_teardown(cleanup.child_mount, true, nullptr) == -EBUSY &&
+                   complete_retired_mount_teardown(cleanup.parent, true, nullptr) == -EBUSY && deny_parent(),
+               __LINE__))
+        return false;
+    std::array<char, 4> read{};
+    if (!check(vfs_pread_file(cleanup.file, read.data(), read.size(), 0) == 4 && std::memcmp(read.data(), "seed", 4) == 0, __LINE__))
+        return false;
+    vfs_put_file(cleanup.file);
+    cleanup.file = nullptr;
+    if (!check(vfs_unlink(SEED) == 0, __LINE__)) return false;
+    cleanup.child_mount = nullptr;
+    if (!check(unmount_filesystem(CHILD) == 0, __LINE__)) return false;
+    cleanup.parent = nullptr;
+    if (!check(unmount_filesystem(BASE) == 0, __LINE__)) return false;
+    auto sibling = find_mount_point(SIBLING);
+    return check(sibling && std::strcmp(sibling->path, SIBLING) == 0, __LINE__);
+}
+#endif
 
 }  // namespace ker::vfs

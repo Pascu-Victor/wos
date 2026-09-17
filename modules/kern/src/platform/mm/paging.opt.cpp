@@ -11,7 +11,7 @@ auto create_page_table_entry(uint64_t frame, uint64_t flags) -> PageTableEntry {
     PageTableEntry entry = {};  // CRITICAL: Zero-initialize to clear reserved bits and pagesize
     entry.frame = frame >> PAGE_SHIFT;
     entry.present = (flags & PAGE_PRESENT) > 0;
-    entry.writable = (flags & PAGE_WRITE) > 0;
+    entry.writable = (flags & PAGE_WRITE) > 0 && !shared_write_restricted(flags);
     entry.user = (flags & PAGE_USER) > 0;
     entry.write_through = ((flags & PAGE_PWT) != 0U) ? 1 : 0;
     entry.cache_disabled = ((flags & PAGE_PCD) != 0U) ? 1 : 0;

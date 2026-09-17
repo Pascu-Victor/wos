@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/spinlock.hpp>
@@ -16,13 +17,43 @@ namespace {
 namespace init_abi = ker::abi::init_control;
 
 ker::mod::sys::Spinlock g_init_control_lock;
-std::array<init_abi::Request, init_abi::MAILBOX_CAPACITY> g_requests{};
-size_t g_request_head{};
-size_t g_request_count{};
-bool g_receive_claimed{};
+struct InitControlMailbox {
+    std::array<init_abi::Request, init_abi::MAILBOX_CAPACITY> requests{};
+    size_t head{};
+    size_t count{};
+    bool receive_claimed{};
+};
+InitControlMailbox g_mailbox;
 init_abi::StatusSnapshot g_status{};
 uint64_t g_status_sequence{};
 bool g_status_available{};
+
+// The caller holds g_init_control_lock for the live mailbox. Keeping these
+// fixed-memory transitions separate lets tests use an isolated mailbox.
+auto enqueue_request(InitControlMailbox& mailbox, const init_abi::Request& request) -> int {
+    if (mailbox.count == init_abi::MAILBOX_CAPACITY) return -EAGAIN;
+    size_t const TAIL = (mailbox.head + mailbox.count) % init_abi::MAILBOX_CAPACITY;
+    mailbox.requests[TAIL] = request;
+    ++mailbox.count;
+    return 0;
+}
+
+auto claim_request(InitControlMailbox& mailbox, init_abi::Request& request) -> int {
+    if (mailbox.receive_claimed) return -EBUSY;
+    if (mailbox.count == 0) return -EAGAIN;
+    mailbox.receive_claimed = true;
+    request = mailbox.requests[mailbox.head];
+    return 0;
+}
+
+void finish_request_copy(InitControlMailbox& mailbox, bool copied) {
+    if (copied) {
+        mailbox.requests[mailbox.head] = {};
+        mailbox.head = (mailbox.head + 1) % init_abi::MAILBOX_CAPACITY;
+        --mailbox.count;
+    }
+    mailbox.receive_claimed = false;
+}
 
 auto current_task() -> ker::mod::sched::task::Task* { return ker::mod::sched::get_current_task(); }
 
@@ -202,7 +233,8 @@ auto wos_proc_init_control_submit(uint64_t request_addr) -> uint64_t {
     if (task == nullptr) {
         return static_cast<uint64_t>(-ESRCH);
     }
-    if (task->euid != 0) {
+    auto const CREDENTIALS = task->credentials();
+    if (!CREDENTIALS.allows(ker::mod::security::Authority::INIT_CONTROL)) {
         return static_cast<uint64_t>(-EPERM);
     }
     if (request_addr == 0) {
@@ -217,20 +249,14 @@ auto wos_proc_init_control_submit(uint64_t request_addr) -> uint64_t {
         return static_cast<uint64_t>(-EINVAL);
     }
     request.sender_pid = ker::mod::sched::task::process_pid(*task);
-    request.sender_euid = task->euid;
+    request.sender_euid = CREDENTIALS.user().effective;
 
     // The lock protects only fixed-size memory. No allocation, blocking,
     // logging, usercopy, VFS, scheduler, network, or WKI call occurs here.
     g_init_control_lock.lock();
-    if (g_request_count == init_abi::MAILBOX_CAPACITY) {
-        g_init_control_lock.unlock();
-        return static_cast<uint64_t>(-EAGAIN);
-    }
-    size_t const TAIL = (g_request_head + g_request_count) % init_abi::MAILBOX_CAPACITY;
-    g_requests[TAIL] = request;
-    ++g_request_count;
+    int const RESULT = enqueue_request(g_mailbox, request);
     g_init_control_lock.unlock();
-    return 0;
+    return static_cast<uint64_t>(RESULT);
 }
 
 auto wos_proc_init_control_receive(uint64_t request_addr) -> uint64_t {
@@ -247,16 +273,11 @@ auto wos_proc_init_control_receive(uint64_t request_addr) -> uint64_t {
 
     init_abi::Request request{};
     g_init_control_lock.lock();
-    if (g_receive_claimed) {
+    int const CLAIM = claim_request(g_mailbox, request);
+    if (CLAIM != 0) {
         g_init_control_lock.unlock();
-        return static_cast<uint64_t>(-EBUSY);
+        return static_cast<uint64_t>(CLAIM);
     }
-    if (g_request_count == 0) {
-        g_init_control_lock.unlock();
-        return static_cast<uint64_t>(-EAGAIN);
-    }
-    g_receive_claimed = true;
-    request = g_requests[g_request_head];
     g_init_control_lock.unlock();
 
     // Faulting usercopy is deliberately outside the spinlock. A failed copy
@@ -264,12 +285,7 @@ auto wos_proc_init_control_receive(uint64_t request_addr) -> uint64_t {
     bool const COPIED = ker::mod::sys::usercopy::copy_value_to_task(*task, request_addr, request);
 
     g_init_control_lock.lock();
-    if (COPIED) {
-        g_requests[g_request_head] = {};
-        g_request_head = (g_request_head + 1) % init_abi::MAILBOX_CAPACITY;
-        --g_request_count;
-    }
-    g_receive_claimed = false;
+    finish_request_copy(g_mailbox, COPIED);
     g_init_control_lock.unlock();
     return COPIED ? 0 : static_cast<uint64_t>(-EFAULT);
 }
@@ -326,5 +342,211 @@ auto wos_proc_init_status_read(uint64_t status_addr) -> uint64_t {
 
     return ker::mod::sys::usercopy::copy_value_to_task(*task, status_addr, status) ? 0 : static_cast<uint64_t>(-EFAULT);
 }
+
+#ifdef WOS_SELFTEST
+auto init_control_selftest_mailbox() -> bool {
+    InitControlMailbox mailbox;
+    init_abi::Request output{};
+    std::memset(&output, 0xA5, sizeof(output));
+    auto const POISON = output;
+    bool ok = claim_request(mailbox, output) == -EAGAIN && std::memcmp(&output, &POISON, sizeof(output)) == 0;
+    for (uint64_t id = 1; id <= init_abi::MAILBOX_CAPACITY; ++id) {
+        init_abi::Request request{};
+        request.request_id = id;
+        request.sender_pid = id + 100;
+        request.sender_euid = static_cast<uint32_t>(id + 200);
+        ok &= enqueue_request(mailbox, request) == 0;
+    }
+    auto const FULL = mailbox.requests;
+    ok &= enqueue_request(mailbox, POISON) == -EAGAIN && mailbox.count == init_abi::MAILBOX_CAPACITY && mailbox.head == 0 &&
+          std::memcmp(mailbox.requests.data(), FULL.data(), sizeof(FULL)) == 0;
+    ok &= claim_request(mailbox, output) == 0 && output.request_id == 1;
+    output = POISON;
+    ok &= claim_request(mailbox, output) == -EBUSY && std::memcmp(&output, &POISON, sizeof(output)) == 0;
+    ok &= enqueue_request(mailbox, POISON) == -EAGAIN;
+    finish_request_copy(mailbox, false);
+    ok &= !mailbox.receive_claimed && mailbox.count == init_abi::MAILBOX_CAPACITY && mailbox.head == 0 &&
+          std::memcmp(mailbox.requests.data(), FULL.data(), sizeof(FULL)) == 0;
+    ok &= claim_request(mailbox, output) == 0 && output.request_id == 1;
+    finish_request_copy(mailbox, true);
+    init_abi::Request wrapped{};
+    wrapped.request_id = init_abi::MAILBOX_CAPACITY + 1;
+    wrapped.sender_pid = wrapped.request_id + 100;
+    wrapped.sender_euid = static_cast<uint32_t>(wrapped.request_id + 200);
+    ok &= enqueue_request(mailbox, wrapped) == 0;
+    for (uint64_t id = 2; id <= wrapped.request_id; ++id) {
+        ok &= claim_request(mailbox, output) == 0 && output.request_id == id && output.sender_pid == id + 100 &&
+              output.sender_euid == id + 200;
+        finish_request_copy(mailbox, true);
+    }
+    output = POISON;
+    return ok && mailbox.count == 0 && !mailbox.receive_claimed && claim_request(mailbox, output) == -EAGAIN &&
+           std::memcmp(&output, &POISON, sizeof(output)) == 0;
+}
+
+auto init_control_selftest_validation() -> bool {
+    init_abi::Request valid{};
+    valid.size = sizeof(valid);
+    valid.version = init_abi::ABI_VERSION;
+    valid.action = init_abi::Action::START;
+    valid.request_id = 1;
+    std::memcpy(valid.service, "service-test", sizeof("service-test"));
+    bool ok = validate_request(valid);
+    for (unsigned field = 0; field < 12; ++field) {
+        auto request = valid;
+        switch (field) {
+            case 0:
+                --request.size;
+                break;
+            case 1:
+                ++request.version;
+                break;
+            case 2:
+                request.action = init_abi::Action::INVALID;
+                break;
+            case 3:
+                request.flags = 1;
+                break;
+            case 4:
+                request.request_id = 0;
+                break;
+            case 5:
+                request.sender_pid = 1;
+                break;
+            case 6:
+                request.sender_euid = 1;
+                break;
+            case 7:
+                request.reserved0 = 1;
+                break;
+            case 8:
+                request.reserved[2] = 1;
+                break;
+            case 9:
+                request.service[0] = '\0';
+                break;
+            case 10:
+                request.service[0] = '/';
+                break;
+            case 11:
+                std::memset(request.service, 'a', sizeof(request.service));
+                break;
+        }
+        ok &= !validate_request(request);
+    }
+    for (auto action : {init_abi::Action::START, init_abi::Action::STOP, init_abi::Action::RESTART}) {
+        auto request = valid;
+        request.action = action;
+        request.service[sizeof("service-test")] = 'x';
+        ok &= validate_request(request) && request.service[sizeof("service-test")] == '\0';
+    }
+    init_abi::StatusSnapshot status{};
+    status.size = sizeof(status);
+    status.version = init_abi::ABI_VERSION;
+    status.state = init_abi::SupervisorState::RUNNING;
+    status.service_count = 1;
+    status.services[0].service[0] = 's';
+    status.services[0].state = init_abi::ServiceState::RUNNING;
+    status.services[0].readiness = init_abi::ReadinessState::READY;
+    status.services[0].history_count = 2;
+    status.services[0].history[0].timestamp_mono_ns = 1;
+    status.services[0].history[1].timestamp_mono_ns = 2;
+    ok &= validate_status(status);
+    for (unsigned field = 0; field < 21; ++field) {
+        auto candidate = status;
+        auto& service = candidate.services[0];
+        switch (field) {
+            case 0:
+                --candidate.size;
+                break;
+            case 1:
+                ++candidate.version;
+                break;
+            case 2:
+                candidate.state = static_cast<init_abi::SupervisorState>(999);
+                break;
+            case 3:
+                candidate.flags = UINT32_MAX;
+                break;
+            case 4:
+                candidate.sequence = 1;
+                break;
+            case 5:
+                candidate.service_count = init_abi::MAX_STATUS_SERVICES + 1;
+                break;
+            case 6:
+                candidate.reserved0 = 1;
+                break;
+            case 7:
+                candidate.reserved[1] = 1;
+                break;
+            case 8:
+                service.state = static_cast<init_abi::ServiceState>(999);
+                break;
+            case 9:
+                service.readiness = static_cast<init_abi::ReadinessState>(999);
+                break;
+            case 10:
+                service.flags = UINT32_MAX;
+                break;
+            case 11:
+                service.pid = -2;
+                break;
+            case 12:
+                service.pgid = -2;
+                break;
+            case 13:
+                service.history_count = init_abi::MAX_TRANSITION_HISTORY + 1;
+                break;
+            case 14:
+                service.reserved1 = 1;
+                break;
+            case 15:
+                service.history[0].from_state = static_cast<init_abi::ServiceState>(999);
+                break;
+            case 16:
+                service.history[0].to_state = static_cast<init_abi::ServiceState>(999);
+                break;
+            case 17:
+                service.history[0].reason = static_cast<init_abi::TransitionReason>(999);
+                break;
+            case 18:
+                service.history[0].reserved0 = 1;
+                break;
+            case 19:
+                service.history[1].timestamp_mono_ns = 0;
+                break;
+            case 20:
+                candidate.service_count = 2;
+                candidate.services[1] = service;
+                break;
+        }
+        ok &= !validate_status(candidate);
+    }
+    std::memset(&status.services[1], 0xA5, sizeof(status.services[1]));
+    std::memset(&status.services[0].history[2], 0xA5, sizeof(status.services[0].history[2]));
+    status.services[0].service[2] = 'x';
+    ok &= validate_status(status) && status.services[0].service[2] == '\0';
+    init_abi::ServiceStatus const EMPTY_SERVICE{};
+    init_abi::Transition const EMPTY_TRANSITION{};
+    return ok && std::memcmp(&status.services[1], &EMPTY_SERVICE, sizeof(EMPTY_SERVICE)) == 0 &&
+           std::memcmp(&status.services[0].history[2], &EMPTY_TRANSITION, sizeof(EMPTY_TRANSITION)) == 0;
+}
+
+auto init_control_selftest_process_role() -> bool {
+    ker::mod::sched::task::Task task;
+    task.pid = 0;
+    bool ok = !is_init_process(task);
+    task.pid = 1;
+    ok &= is_init_process(task);
+    task.pid = 2;
+    ok &= !is_init_process(task);
+    task.owner_pid = 1;
+    ok &= is_init_process(task);
+    task.pid = 1;
+    task.owner_pid = 2;
+    return ok && !is_init_process(task);
+}
+#endif
 
 }  // namespace ker::syscall::process

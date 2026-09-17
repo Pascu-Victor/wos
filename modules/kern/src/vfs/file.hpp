@@ -6,6 +6,11 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <platform/sys/mutex.hpp>
+#include <platform/sys/spinlock.hpp>
+#include <vfs/directory_view.hpp>
+#include <vfs/exec_content.hpp>
 #include <vfs/file_operations.hpp>
 #include <vfs/stat.hpp>
 
@@ -39,6 +44,9 @@ constexpr int O_ALWAYS_CACHE = 0400000000;
 // already know the final path is absent. Filesystems must not persist this in
 // File::open_flags.
 constexpr int O_WOS_KNOWN_ABSENT = 01000000000;
+// Internal directory references grant search only. Public OPEN still rejects
+// access mode 3; this value is assigned only after explicit directory admission.
+constexpr unsigned FILE_ACCESS_SEARCH_ONLY = 3;
 // FD_CLOEXEC: per-descriptor flag indicating close-on-exec
 constexpr int FD_CLOEXEC = 1;
 
@@ -52,9 +60,24 @@ enum class FSType : uint8_t {
     XFS,
 };
 
+// Value policy for a retained filesystem view. Combining views can only add
+// restrictions, including when the object owner has a writable native mount.
+struct MountPolicy {
+    bool read_only{};
+    bool nosuid{};
+
+    constexpr auto restricted_by(MountPolicy other) const -> MountPolicy {
+        return {.read_only = read_only || other.read_only, .nosuid = nosuid || other.nosuid};
+    }
+};
+
 struct File {
     static constexpr size_t INLINE_VFS_PATH_CAPACITY = 256;
 
+    // Set only on a private native directory File before publication. Owns
+    // detached identity pins, never this File; final release may close Files.
+    DirectoryViewRef directory_view;
+    std::unique_ptr<ExecReadView> exec_read_view;
     int fd{};  // numeric descriptor
     void* private_data{};
     FileOperations* fops{};
@@ -80,6 +103,9 @@ struct File {
     // references. The backend close hook must finish before this pin is
     // released so mount-private data stays live through final close.
     MountPoint* mount_owner = nullptr;
+    // Initialized while exclusively owned, before descriptor/anchor/registry
+    // publication. Immutable while shared; retained independently of path text.
+    MountPolicy mount_policy{};
 
     // Mount-overlay directory listing support
     const char* vfs_path{};  // Absolute VFS path, set by VFS open helpers
@@ -94,8 +120,12 @@ struct File {
     // Optional VFS-core cache-notify attachment for O_NOTIFY_CACHE_CHANGE.
     void* cache_notify_attachment = nullptr;
 
-    // Immutable per-open stat snapshot.  VFS uses this only while metadata
-    // invalidation state still proves the opened path has not changed.
+    // Bounded publication/copy of the path text; allocation and retirement stay outside.
+    ker::mod::sys::Spinlock path_metadata_lock;
+
+    // A complete stat and its validation stamps are copied under this mutex.
+    // Never hold it across backend stat/I/O; published Files can be shared.
+    ker::mod::sys::Mutex stat_cache_mutex;
     Stat stat_cache{};
     uint64_t stat_cache_generation = 0;
     uint64_t stat_cache_invalidation_generation = 0;

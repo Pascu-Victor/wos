@@ -91,15 +91,15 @@ def test_syscall_signal_delivery_updates_live_gs_scratch() -> None:
             "uint64_t const USER_RFLAGS = live_syscall_return_flags();",
             "write_task_syscall_return(*task, frame.saved_rsp, frame.saved_rip, frame.saved_rflags);",
             "write_live_syscall_return(frame.saved_rsp, frame.saved_rip, frame.saved_rflags);",
-            "write_task_syscall_return(*task, FRAME_ADDR, handler.handler, USER_RFLAGS);",
-            "write_live_syscall_return(FRAME_ADDR, handler.handler, USER_RFLAGS);",
+            "write_task_syscall_return(*task, FRAME_ADDR, HANDLER.handler, USER_RFLAGS);",
+            "write_live_syscall_return(FRAME_ADDR, HANDLER.handler, USER_RFLAGS);",
         ],
         "syscall signal delivery must keep live GS scratch in sync",
     )
     require_order(
         body,
-        "stack_write(stack_base, STACK_OFF_RCX, handler.handler)",
-        "write_live_syscall_return(FRAME_ADDR, handler.handler, USER_RFLAGS);",
+        "stack_write(stack_base, STACK_OFF_RCX, HANDLER.handler)",
+        "write_live_syscall_return(FRAME_ADDR, HANDLER.handler, USER_RFLAGS);",
         "SYSRET target write must be paired with live GS scratch update",
     )
     require_order(
@@ -129,19 +129,26 @@ def test_signal_iret_preserves_restored_user_r11() -> None:
     )
 
 
-def test_coredump_file_is_private_writable_and_truncated() -> None:
+def test_coredump_file_is_private_and_exclusively_created() -> None:
     source = COREDUMP_CPP.read_text()
 
     require_tokens(
         source,
         [
             "constexpr int O_WRONLY = 01;",
-            "constexpr int O_CREAT = 0100;",
-            "constexpr int O_TRUNC = 01000;",
-            "ker::vfs::vfs_open(path.data(), O_WRONLY | O_CREAT | O_TRUNC, 0600);",
+            "auto open_output_for_task(",
+            "ker::vfs::vfs_openat(writer, ker::vfs::AT_FDCWD, path,",
+            "O_WRONLY | ker::vfs::O_CREAT | ker::vfs::O_EXCL | ker::vfs::O_NOFOLLOW",
+            "int const FD = open_output_for_task(ker::mod::sched::get_current_task(), path.data());",
         ],
         "coredump output open contract",
     )
+    output = function_body(source, "open_output_for_task")
+    require_tokens(output, ["0600"], "new coredump private creation mode")
+    writer = function_body(source, "perform_coredump")
+    if "vfs_unlink(" in writer or "O_TRUNC" in writer:
+        fail("coredump output must not truncate or unlink a reused pathname")
+    require_tokens(writer, ["private partial output retained"], "failed private output ownership")
 
 
 def test_coredump_worker_releases_stolen_elf_buffer() -> None:
@@ -209,7 +216,7 @@ def test_signal_targets_are_user_canonical_on_all_delivery_paths() -> None:
     require_tokens(
         signal_source,
         [
-            "if (!user_signal_target_valid(handler))",
+            "if (!user_signal_target_valid(HANDLER))",
             "ker::syscall::process::wos_proc_exit_signal(WOS_SIGSEGV);",
         ],
         "direct syscall/interrupt signal target validation",
@@ -218,8 +225,8 @@ def test_signal_targets_are_user_canonical_on_all_delivery_paths() -> None:
         signal_source,
         [
             "auto user_signal_target_valid(const ker::mod::sched::task::Task::SigHandler& handler) -> bool",
-            "if (delivery == DeferredSignalDelivery::USER_HANDLERS_ONLY && !is_user_signal_handler(handler))",
-            "if (is_user_signal_handler(handler) && !user_signal_target_valid(handler))",
+            "if (delivery == DeferredSignalDelivery::USER_HANDLERS_ONLY && !is_user_signal_handler(HANDLER))",
+            "if (is_user_signal_handler(HANDLER) && !user_signal_target_valid(HANDLER))",
             "ker::syscall::process::wos_proc_exit_signal(WOS_SIGSEGV);",
         ],
         "deferred signal target validation",
@@ -309,12 +316,12 @@ def test_synchronous_user_exceptions_can_reach_installed_signal_handlers_before_
     require_tokens(
         helper_body,
         [
-            "if (!is_user_signal_handler(handler) || (task->signal_mask_bits() & (1ULL << IDX)) != 0)",
-            "if (!user_signal_target_valid(handler))",
+            "if (!is_user_signal_handler(HANDLER) || (task->signal_mask_bits() & (1ULL << IDX)) != 0)",
+            "if (!user_signal_target_valid(HANDLER))",
             "sigframe.saved_rip = frame.rip;",
             "sigframe.saved_rsp = frame.rsp;",
             "sigframe.saved_retval = gpr.rax;",
-            "frame.rip = handler.handler;",
+            "frame.rip = HANDLER.handler;",
             "frame.rsp = FRAME_ADDR;",
             "task->in_signal_handler = true;",
             "return true;",
@@ -385,7 +392,7 @@ def test_interrupt_and_scheduler_signal_paths_use_mapped_only_usercopy() -> None
 
     interrupt = function_body(source, "check_pending_signals_interrupt")
     frame_copy = interrupt.find("if (!write_signal_frame_mapped(*task, FRAME_ADDR, sigframe))")
-    frame_commit = interrupt.find("task->signal_clear_pending_mask(1ULL << IDX)", frame_copy)
+    frame_commit = interrupt.find("if (!claim.commit())", frame_copy)
     if frame_copy < 0 or frame_commit < frame_copy:
         fail("an unmapped asynchronous signal frame must remain pending")
 
@@ -411,7 +418,7 @@ def test_sigpending_is_wired_through_wos_sysdeps() -> None:
         [
             "auto wos_proc_sigpending(uint64_t set_ptr) -> uint64_t",
             "std::array<uint64_t, 16> set{};",
-            "set.at(0) = task->signal_pending_bits() & task->signal_mask_bits();",
+            "set.at(0) = task->signal_delivery_pending_bits() & task->signal_mask_bits();",
             "bool const COPIED = ker::mod::sys::usercopy::copy_to_task(*task, set_ptr, set.data(), set.size() * sizeof(set.at(0)));",
             "case abi::process::procmgmt_ops::SIGPENDING:",
             "return wos_proc_sigpending(a2);",
@@ -472,13 +479,23 @@ def test_cpu_exhaustion_waits_for_safe_user_return() -> None:
     if "in_signal_handler" in committed:
         fail("CPU hard expiry must not defer for an active signal handler")
     unsafe = function_body(source, "exit_current_on_pending_fatal_default_signal")
+    require_tokens(unsafe, [".deliver_signals", "saved_frame_class_is_valid(task, task->context.frame)"],
+                   "fatal handoff must preserve scoped resources on suspended kernel stacks")
+    for operation in ("exit_current_if_process_exit_requested()", "task->consume_signal_for_delivery"):
+        if unsafe.index("saved_frame_class_is_valid") > unsafe.index(operation):
+            fail("fatal handoff must validate user return before consuming signals or exiting")
+    if not unsafe.index("saved_frame_class_is_valid") < unsafe.index("UserReturnFpuAuthorization return_fpu") < unsafe.index("resume_job_control_for_pending_signal"):
+        fail("blocking handoff work must retain its already validated outer user-return FPU authorization")
+    deferred = function_body(source, "check_pending_signals_deferred")
+    if deferred.index("saved_frame_class_is_valid") > deferred.index("exit_current_if_process_exit_requested()"):
+        fail("deferred process exit also requires a validated user return")
     if "pending_cpu_signals" in unsafe or "deliver_cpu_limits_at_user_return" in unsafe:
         fail("kernel-stack fatal handoff must not consume deferred CPU events")
     for name in ("check_pending_signals_interrupt", "check_pending_signals_handoff"):
         body = function_body(source, name)
         gate = body.index("if (!interrupt_frame_is_user_return(task, frame))")
         delivery = body.index("deliver_cpu_limits_at_user_return(task)")
-        handler = body.index("if (task->in_signal_handler)")
+        handler = body.index("pending_signals_for_user_delivery(task)")
         if not gate < delivery < handler:
             fail(f"{name} must gate CPU delivery on user return and enforce hard expiry during handlers")
     charge_source = (ROOT / "modules/kern/src/platform/sched/resource.cpp").read_text()
@@ -487,11 +504,80 @@ def test_cpu_exhaustion_waits_for_safe_user_return() -> None:
         fail("IRQ CPU charging must buffer signals without registry lookup or early fatal delivery")
 
 
+def test_sigkill_preempts_active_handler_only_at_safe_return() -> None:
+    source = SIGNAL_CPP.read_text()
+    mask = function_body(source, "sanitized_signal_mask")
+    require_tokens(mask, ["WOS_SIGKILL - 1", "WOS_SIGSTOP - 1", "mask & ~"], "uncatchable mask bits excluded")
+    for name in ("restore_deferred_sigreturn", "check_pending_signals"):
+        require_tokens(function_body(source, name), ["signal_mask_store(sanitized_signal_mask(frame.saved_mask))"],
+                       "user-edited signal return mask cannot block KILL/STOP")
+    if "signal_add_mask_bits(HANDLER.mask)" in source:
+        fail("handler mask publication must exclude KILL/STOP on every delivery path")
+    if source.count("signal_add_mask_bits(sanitized_signal_mask(HANDLER.mask))") != 5:
+        fail("all five handler delivery paths must sanitize their mask")
+    helper = function_body(source, "handle_pending_sigkill_at_user_return")
+    require_tokens(helper, ["signal_pending_bits()", "WOS_SIGKILL - 1", "task != sched::get_current_task()",
+                            "!task_owns_current_kernel_stack(task)",
+                            "wos_proc_exit_signal(WOS_SIGKILL)"], "uncatchable KILL with owned-stack delivery")
+    if "signal_clear_pending_mask" in helper:
+        fail("KILL must remain visible to ptrace parking until exit_in_progress protects cleanup")
+    if "in_signal_handler" in helper or "signal_deliverable_bits" in helper:
+        fail("active handlers and mask state must not hide uncatchable SIGKILL")
+    if helper.index("task_owns_current_kernel_stack") > helper.index("wos_proc_exit_signal"):
+        fail("incoming handoff must leave KILL pending until current-stack ownership")
+    for name in ("check_pending_signals", "check_pending_signals_interrupt", "check_pending_signals_handoff",
+                 "check_pending_signals_deferred", "exit_current_on_pending_fatal_default_signal"):
+        body = function_body(source, name)
+        delivery = body.index("handle_pending_sigkill_at_user_return(task)")
+        deferral = "task->in_signal_handler" if name in ("check_pending_signals", "exit_current_on_pending_fatal_default_signal") else "pending_signals_for_user_delivery(task)"
+        if delivery > body.index(deferral):
+            fail(f"{name} must prioritize KILL before handler deferral")
+        if name == "check_pending_signals":
+            if delivery > body.index("if (task->do_sigreturn)"):
+                fail("KILL must not be delayed by restoring a signal frame")
+        else:
+            gate = "interrupt_frame_is_user_return" if name in ("check_pending_signals_interrupt", "check_pending_signals_handoff") else "saved_frame_class_is_valid"
+            if delivery < body.index(gate):
+                fail(f"{name} must retain the safe user-return boundary")
+
+
+def test_sigstop_preempts_active_handler_without_nesting() -> None:
+    source = SIGNAL_CPP.read_text()
+    stop_action = function_body(source, "apply_job_control_stop")
+    if "deferred_task_switch = true" in stop_action:
+        fail("late user-return stop must not create an unserviceable syscall transition")
+    require_tokens(stop_action, ["debug_stop_task(task)", "park_current_job_control_stop(*task)"],
+                   "stop uses timer reschedule or owned syscall parking")
+    selector = function_body(source, "pending_signals_for_user_delivery")
+    require_tokens(selector, ["signal_pending_bits() & STOP_MASK", "WOS_SIGSTOP - 1", "return STOP_MASK",
+                              "task->in_signal_handler ? 0 : task->signal_deliverable_bits()"],
+                   "STOP priority without changing ordinary handler deferral")
+    if selector.index("return STOP_MASK") > selector.index("task->in_signal_handler"):
+        fail("STOP must bypass active handler deferral")
+    syscall = function_body(source, "check_pending_signals")
+    stop = syscall.index("apply_job_control_stop(task, WOS_SIGSTOP, true)")
+    if not syscall.index("handle_pending_sigkill_at_user_return(task)") < stop < syscall.index("if (task->do_sigreturn)"):
+        fail("syscall STOP must follow KILL and precede sigreturn")
+    require_tokens(syscall[stop:syscall.index("if (task->do_sigreturn)")],
+                   ["exit_current_if_process_exit_requested()", "handle_pending_sigkill_at_user_return(task)"],
+                   "KILL after a parked stop must precede user return")
+    for name in ("check_pending_signals_interrupt", "check_pending_signals_handoff", "check_pending_signals_deferred"):
+        body = function_body(source, name)
+        require_tokens(body, ["pending_signals_for_user_delivery(task)"], "validated STOP selection")
+        if "park_current_job_control_stop" in body or "WOS_SIGSTOP, true" in body:
+            fail(f"{name} must not block on a return-preparation stack")
+    deferred = function_body(source, "check_pending_signals_deferred")
+    if deferred.index("delivery == DeferredSignalDelivery::USER_HANDLERS_ONLY") > deferred.index("apply_job_control_stop"):
+        fail("incoming deferred preparation must retain default-action restriction")
+
+
 if __name__ == "__main__":
+    test_sigstop_preempts_active_handler_without_nesting()
+    test_sigkill_preempts_active_handler_only_at_safe_return()
     test_cpu_exhaustion_waits_for_safe_user_return()
     test_syscall_signal_delivery_updates_live_gs_scratch()
     test_signal_iret_preserves_restored_user_r11()
-    test_coredump_file_is_private_writable_and_truncated()
+    test_coredump_file_is_private_and_exclusively_created()
     test_coredump_worker_releases_stolen_elf_buffer()
     test_coredump_ring_has_explicit_slot_ownership_and_no_sequence_holes()
     test_signal_targets_are_user_canonical_on_all_delivery_paths()

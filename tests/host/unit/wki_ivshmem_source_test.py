@@ -107,10 +107,21 @@ def test_explicit_wki_boot_selection_reserves_the_single_ivshmem_device() -> Non
     )
 
 
+def test_receive_capacity_includes_complete_authenticated_frame() -> None:
+    source = IVSHMEM_CPP.read_text()
+    if "using IvshmemFrame = std::array<uint8_t, WKI_MAX_FRAME_SIZE>;" not in source:
+        fail("ivshmem receive capacity must include the full common authenticated envelope")
+    if "IvshmemFrame buf{};" not in function_body(source, "drain_rx_ring"):
+        fail("the real single-drainer must use the complete frame buffer")
+    if "s_ivshmem_transport.mtu = static_cast<uint16_t>(WKI_MAX_FRAME_SIZE - WKI_HEADER_SIZE);" not in source:
+        fail("ivshmem MTU must describe payload capacity excluding the WKI header")
+
+
 def main() -> None:
     test_peer_ready_wait_deadline_is_saturating()
     test_rdma_bitmap_allocation_and_free_are_irq_safe()
     test_explicit_wki_boot_selection_reserves_the_single_ivshmem_device()
+    test_receive_capacity_includes_complete_authenticated_frame()
     print("WKI ivshmem source invariants hold")
 
 
