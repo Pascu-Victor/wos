@@ -29,6 +29,9 @@ void init();
 
 uint64_t get_ticks();
 uint64_t get_us();
+uint64_t get_ns();
+uint64_t get_period_fs();
+uint64_t get_resolution_ns();
 
 void sleep_ticks(uint64_t ticks);
 void sleep_us(uint64_t us);

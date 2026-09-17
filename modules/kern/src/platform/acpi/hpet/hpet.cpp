@@ -2,6 +2,9 @@
 
 #include <cstdint>
 #include <cstring>
+#include <platform/dbg/dbg.hpp>
+#include <platform/ktime/arithmetic.hpp>
+#include <platform/ktime/clocksource_policy.hpp>
 
 #include "platform/acpi/acpi.hpp"
 #include "platform/mm/addr.hpp"
@@ -19,9 +22,9 @@ volatile Hpet* hpet = nullptr;
 // the counter increments in femtoseconds (10^-15 seconds)
 uint64_t tick_period = 0;
 
-auto usec_to_ticks(uint64_t us) -> uint64_t { return (us * 1000000000) / tick_period; }
+auto usec_to_ticks(uint64_t us) -> uint64_t { return time::arithmetic::mul_div(us, 1000000000, tick_period, true); }
 
-auto ticks_to_usec(uint64_t ticks) -> uint64_t { return (ticks * tick_period) / 1000000000; }
+auto ticks_to_usec(uint64_t ticks) -> uint64_t { return time::arithmetic::mul_div(ticks, tick_period, 1000000000); }
 
 }  // namespace
 
@@ -46,10 +49,14 @@ void init() {
     // Map HPET to the kernel page table so all CPUs can access it
     auto const HPET_VIRT = reinterpret_cast<uint64_t>(hpet_addr);
     mm::virt::map_to_kernel_page_table(HPET_VIRT, reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(HPET_VIRT)),
-                                       mm::virt::page_types::KERNEL);
+                                       mm::virt::page_types::MMIO);
 
     hpet = reinterpret_cast<Hpet*>(hpet_addr);
     tick_period = (hpet->capabilities >> 32) & 0xFFFFFFFF;
+    if (!time::clocksource::valid_hpet(tick_period, (hpet->capabilities & (1ULL << 13)) != 0)) {
+        dbg::emergency_log("HPET requires a valid period and 64-bit counter\n");
+        hcf();
+    }
 
     hpet->configuration = 0;  // clear hpet configuration
     hpet->counter_value = 0;  // reset counter value
@@ -59,6 +66,12 @@ void init() {
 uint64_t get_ticks() { return hpet->counter_value; }
 
 uint64_t get_us() { return ticks_to_usec(get_ticks()); }
+
+uint64_t get_ns() { return time::arithmetic::mul_div(get_ticks(), tick_period, 1000000); }
+
+uint64_t get_period_fs() { return tick_period; }
+
+uint64_t get_resolution_ns() { return time::arithmetic::mul_div(1, tick_period, 1000000, true); }
 
 void sleep_ticks(uint64_t ticks) {
     uint64_t const START = get_ticks();

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <platform/rtc/wall_clock.hpp>
 
 namespace ker::mod::rtc {
 
@@ -16,6 +17,7 @@ void init();
 [[nodiscard]] uint64_t get_epoch_ns();
 
 // Apply a signed NTP correction to the current wall clock.
-void adjust_offset_ns(int64_t delta_ns);
+auto adjust_offset_ns(int64_t delta_ns) -> bool;
+[[nodiscard]] auto status() -> WallClock;
 
 }  // namespace ker::mod::rtc

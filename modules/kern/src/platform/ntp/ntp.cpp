@@ -33,7 +33,7 @@ using log = ker::mod::dbg::logger<"ntp">;
 
 constexpr size_t NTP_PACKET_LEN = 48;
 constexpr size_t SOCKADDR_V4_LEN = 16;
-constexpr int RECEIVE_POLL_LIMIT = 200;
+constexpr uint64_t RECEIVE_TIMEOUT_US = 1000000;
 constexpr int MAX_ATTEMPTS = 6;  // 6 * 5 s = 30 s total
 constexpr int RETRY_DELAY_MS = 5000;
 constexpr uint16_t NTP_PORT = 123;
@@ -92,7 +92,10 @@ auto ntp_to_unix_ns(const uint8_t* input, int64_t* output) -> bool {
     return true;
 }
 
-auto timestamps_are_near(int64_t lhs, int64_t rhs) -> bool { return lhs >= rhs - MAX_SERVER_SKEW_NS && lhs <= rhs + MAX_SERVER_SKEW_NS; }
+auto timestamps_are_near(int64_t lhs, int64_t rhs) -> bool {
+    if (lhs < 0 || rhs < 0) return false;
+    return (lhs >= rhs ? lhs - rhs : rhs - lhs) <= MAX_SERVER_SKEW_NS;
+}
 
 // Attempt to synchronise with a single NTP server.
 // Returns true if sync succeeded and the RTC offset has been updated.
@@ -128,15 +131,18 @@ auto try_sync(uint32_t server_ip) -> bool {
         return false;
     }
 
-    // Poll the receive ring buffer for up to ~1 second (200 yields * ~5 ms each).
+    // Use elapsed monotonic time, not a scheduler-dependent yield count.
     std::array<uint8_t, NTP_PACKET_LEN> resp{};
     bool got = false;
-    for (int r = 0; r < RECEIVE_POLL_LIMIT && !got; ++r) {
+    uint64_t receive_epoch_ns = 0;
+    auto const DEADLINE = time::arithmetic::saturating_add(time::get_us(), RECEIVE_TIMEOUT_US);
+    while (!got && time::get_us() < DEADLINE) {
         ssize_t const N = sock->proto_ops->recv(sock, resp.data(), resp.size(), 0);
         if (std::cmp_equal(N, resp.size())) {
+            receive_epoch_ns = rtc::get_epoch_ns();
             got = true;
         } else {
-            ker::mod::sched::kern_yield();
+            ker::mod::sched::kern_sleep_us(1000);
         }
     }
 
@@ -146,7 +152,16 @@ auto try_sync(uint32_t server_ip) -> bool {
         return false;
     }
 
-    uint64_t const CLIENT_RX_NS = rtc::get_epoch_ns();
+    uint64_t const CLIENT_RX_NS = receive_epoch_ns;
+
+    auto const LEAP = resp.at(0) >> 6;
+    auto const VERSION = (resp.at(0) >> 3) & 7U;
+    auto const MODE = resp.at(0) & 7U;
+    if (LEAP == 3 || (VERSION != 3 && VERSION != 4) || MODE != 4 || resp.at(1) == 0 || resp.at(1) > 15 ||
+        CLIENT_TX_NS > static_cast<uint64_t>(INT64_MAX) || CLIENT_RX_NS > static_cast<uint64_t>(INT64_MAX) || CLIENT_RX_NS < CLIENT_TX_NS ||
+        CLIENT_RX_NS - CLIENT_TX_NS > RECEIVE_TIMEOUT_US * 1000) {
+        return false;
+    }
 
     // A server must echo the client's transmit timestamp as its originate
     // timestamp. Reject unrelated or stale UDP responses.
@@ -168,7 +183,10 @@ auto try_sync(uint32_t server_ip) -> bool {
     // Standard NTP offset: ((T2 - T1) + (T3 - T4)) / 2.
     int64_t const OFFSET_NS = ((server_rx_ns - CLIENT_TX) + (server_tx_ns - CLIENT_RX)) / 2;
     int64_t const ROUND_TRIP_NS = (CLIENT_RX - CLIENT_TX) - (server_tx_ns - server_rx_ns);
-    rtc::adjust_offset_ns(OFFSET_NS);
+    if (ROUND_TRIP_NS < 0 || ROUND_TRIP_NS > static_cast<int64_t>(RECEIVE_TIMEOUT_US * 1000) || server_tx_ns < server_rx_ns ||
+        !rtc::adjust_offset_ns(OFFSET_NS)) {
+        return false;
+    }
     log::info("synced to %lu.%lu.%lu.%lu - offset %ld ns, round-trip %ld ns", static_cast<unsigned long>((server_ip >> 24) & 0xFF),
               static_cast<unsigned long>((server_ip >> 16) & 0xFF), static_cast<unsigned long>((server_ip >> 8) & 0xFF),
               static_cast<unsigned long>(server_ip & 0xFF), static_cast<long>(OFFSET_NS), static_cast<long>(ROUND_TRIP_NS));
@@ -186,12 +204,17 @@ void ntp_sync_thread() {
     for (int attempt = 0; attempt < MAX_ATTEMPTS; ++attempt) {
         // Sleep 5 s between attempts so the network has time to come up.
         // (On the first pass this also lets drivers finish their init.)
-        time::sleep(RETRY_DELAY_MS);
+        ker::mod::sched::kern_sleep_us(static_cast<uint64_t>(RETRY_DELAY_MS) * 1000);
 
         for (uint32_t const SERVER_IP : NTP_SERVERS) {
             if (try_sync(SERVER_IP)) {
                 log::info("sync successful on attempt %d", attempt + 1);
-                terminate_ntp_thread();
+                // Subsequent measurements replace the remaining slew target;
+                // only the first accepted correction may step the wall clock.
+                for (;;) {
+                    ker::mod::sched::kern_sleep_us(60000000);
+                    if (!try_sync(SERVER_IP)) log::debug("periodic sync failed; retaining disciplined wall clock");
+                }
             }
         }
 

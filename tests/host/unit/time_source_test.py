@@ -130,7 +130,7 @@ def test_sntp_preserves_fractional_time_and_uses_four_timestamps() -> None:
         function_body(ntp, "try_sync"),
         "CLIENT_TX_NS = rtc::get_epoch_ns()",
         "unix_ns_to_ntp(CLIENT_TX_NS, req.data() + 40)",
-        "CLIENT_RX_NS = rtc::get_epoch_ns()",
+        "receive_epoch_ns = rtc::get_epoch_ns()",
         "resp.at(24 + i) != req.at(40 + i)",
         "ntp_to_unix_ns(resp.data() + 32, &server_rx_ns)",
         "ntp_to_unix_ns(resp.data() + 40, &server_tx_ns)",
@@ -139,8 +139,9 @@ def test_sntp_preserves_fractional_time_and_uses_four_timestamps() -> None:
     )
     require_order(
         function_body(rtc, "get_epoch_ns"),
-        "ntp_delta_ns.load(std::memory_order_relaxed)",
-        "BOOT_EPOCH_NS + MONO_NS + static_cast<uint64_t>(NTP_NS)",
+        "clock_lock.lock_irqsave()",
+        "clock_state.epoch(tsc::get_ns())",
+        "clock_lock.unlock_irqrestore(FLAGS)",
     )
     if "rtc::set_offset(DELTA)" in ntp or "ntp_delta_sec" in rtc:
         fail("SNTP still truncates clock corrections to whole seconds")
