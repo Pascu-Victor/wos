@@ -24,6 +24,7 @@
 #include <platform/sched/resource_process.hpp>
 #include <platform/sched/service_resource.hpp>
 #include <platform/sched/session.hpp>
+#include <platform/sched/shutdown_ownership.hpp>
 #include <platform/sched/signal_pending.hpp>
 #include <platform/sched/threading.hpp>
 #include <platform/security/credential_store.hpp>
@@ -1018,6 +1019,7 @@ struct Task {
     // subsystem; DAEMON tasks observe it at scheduler block/sleep/yield points
     // and exit through the normal task-exit path.
     std::atomic<bool> kernel_shutdown_requested{false};
+    ShutdownOwnership kernel_shutdown_ownership;
 
     // Set by reschedule_task_for_cpu when a wakeup fires while this task is
     // still currentTask (about to block via deferred_task_switch). Checked

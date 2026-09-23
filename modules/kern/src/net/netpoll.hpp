@@ -32,7 +32,8 @@ struct NapiStruct {
     std::atomic<NapiState> state;  // Current NAPI state (lock-free)
     int weight;                    // Max packets per poll (default: 64)
 
-    // Per-device worker thread
+    // Per-device worker thread. A kernel-lifetime task reference acquired before
+    // scheduling protects snapshots/wakeups after cooperative worker exit.
     ker::mod::sched::task::Task* worker;  // Dedicated kernel thread
     std::atomic<bool> has_work;           // Signal to wake worker (set by IRQ)
 
@@ -51,7 +52,9 @@ void napi_init(NapiStruct* napi, NetDevice* dev, NapiPollFn poll, int weight);
 // (same CPU that services the corresponding MSI-X vector).
 void napi_enable(NapiStruct* napi, uint64_t cpu_affinity = UINT64_MAX);
 
-// Disable NAPI - stops the worker thread (call before device shutdown)
+// Disable polling/registry admission. This does not reclaim the NAPI object or
+// its retained worker: existing snapshots and worker epilogues may still refer
+// to them. Drivers must separately close/drain callbacks before freeing queues.
 void napi_disable(NapiStruct* napi);
 
 // Schedule NAPI poll - called from IRQ handler

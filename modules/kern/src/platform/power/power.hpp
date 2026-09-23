@@ -27,9 +27,14 @@ enum class ShutdownPhase : uint64_t {
 [[nodiscard]] auto shutdown_in_progress() -> bool;
 [[nodiscard]] auto shutdown_phase() -> ShutdownPhase;
 [[nodiscard]] auto prepare_shutdown() -> int;
+// Normal task entry without preemption-disabled ownership or a pending handoff.
+// IF may be clear; an accepted non-returning finalizer enables completion IRQs.
 [[nodiscard]] auto begin_reboot_command(uint64_t cmd) -> int;
 #ifdef WOS_SELFTEST
 [[noreturn]] void selftest_poweroff();
+// Task-context live diagnostics use the ordinary finalizer, including VFS and
+// driver retirement. No userspace entrypoint or authority bypass is exposed.
+[[noreturn]] void selftest_shutdown();
 #endif
 
 }  // namespace ker::mod::power

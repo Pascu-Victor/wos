@@ -392,12 +392,16 @@ void log_net_watchdog_diag() {
 // Find NapiStruct by matching worker task pointer
 auto find_napi_for_current_task() -> NapiStruct* {
     auto* current = ker::mod::sched::get_current_task();
+    uint64_t const FLAGS = g_registry_lock.lock_irqsave();
+    NapiStruct* result = nullptr;
     for (auto* napi : g_napi_registry) {
         if (napi != nullptr && napi->worker == current) {
-            return napi;
+            result = napi;
+            break;
         }
     }
-    return nullptr;
+    g_registry_lock.unlock_irqrestore(FLAGS);
+    return result;
 }
 
 // Register a NapiStruct in the global registry
@@ -657,6 +661,10 @@ void napi_init(NapiStruct* napi, NetDevice* dev, NapiPollFn poll, int weight) {
 }
 
 void napi_enable(NapiStruct* napi, uint64_t cpu_affinity) {
+    if (napi->worker != nullptr) {
+        log::warn("refusing to replace a retained NAPI worker");
+        return;
+    }
     // Register in global registry first (so worker can find it)
     if (!register_napi(napi)) {
         return;
@@ -678,6 +686,17 @@ void napi_enable(NapiStruct* napi, uint64_t cpu_affinity) {
     napi->worker = ker::mod::sched::task::Task::create_kernel_thread(name.data(), napi_worker_entry);
     if (napi->worker == nullptr) {
         log::warn("failed to create worker thread for %s", dev_name);
+        unregister_napi(napi);
+        return;
+    }
+
+    // The scheduler owns the initial reference. Take ours before publication:
+    // raw snapshots/wakeups can outlive cooperative worker exit and task GC.
+    // NAPI contexts/worker pointers currently have kernel lifetime; disable
+    // does not establish snapshot/worker-pointer reclamation, so retains this ref.
+    if (!napi->worker->try_acquire()) {
+        log::critical("new NAPI worker unexpectedly lacks a live task reference");
+        napi->worker = nullptr;
         unregister_napi(napi);
         return;
     }

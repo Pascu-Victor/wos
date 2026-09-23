@@ -171,6 +171,11 @@ void io_delay_loop() {
     g_phase.store(ShutdownPhase::FINALIZING, std::memory_order_release);
     log::info("system shutdown finalizer starting action=%lu", static_cast<unsigned long>(action));
 
+    // The power syscall enters with IF clear. Admission has established an
+    // ordinary task with no preemption-disabled ownership; this finalizer
+    // never returns, and its completion/retirement waits require IRQ progress.
+    asm volatile("sti" ::: "memory");
+
     quiesce_kernel_threads(KERNEL_THREAD_WAIT_US);
     clear_current_finalizer_sched_state();
 
@@ -259,6 +264,14 @@ auto begin_reboot_command(uint64_t cmd) -> int {
         return 0;
     }
 
+    // Do not enable IRQs or claim shutdown while a caller owns a locked or
+    // incomplete scheduler transition. IF itself may be clear at syscall entry.
+    auto* const CURRENT = sched::get_current_task();
+    if (!sched::has_run_queues() || sched::preempt_count() != 0 || CURRENT == nullptr ||
+        CURRENT->scheduler_transition_active.load(std::memory_order_acquire) || CURRENT->deferred_task_switch || CURRENT->wants_block) {
+        return -EWOULDBLOCK;
+    }
+
     ShutdownPhase phase = g_phase.load(std::memory_order_acquire);
     for (;;) {
         if (phase != ShutdownPhase::IDLE && phase != ShutdownPhase::PREPARING) {
@@ -273,6 +286,11 @@ auto begin_reboot_command(uint64_t cmd) -> int {
 }
 
 #ifdef WOS_SELFTEST
+[[noreturn]] void selftest_shutdown() {
+    g_action.store(ShutdownAction::POWEROFF, std::memory_order_release);
+    run_finalizer(ShutdownAction::POWEROFF);
+}
+
 [[noreturn]] void selftest_poweroff() {
     g_action.store(ShutdownAction::POWEROFF, std::memory_order_release);
     g_phase.store(ShutdownPhase::PLATFORM_ACTION, std::memory_order_release);

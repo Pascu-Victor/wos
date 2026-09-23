@@ -4294,6 +4294,11 @@ void kern_wake(task::Task* task) {
 
 auto kernel_threads_shutdown_requested() -> bool { return kernel_thread_shutdown_requested.load(std::memory_order_acquire); }
 
+auto hold_kernel_shutdown() -> KernelShutdownHold {
+    auto* owner = can_query_current_task() ? get_current_task() : nullptr;
+    return KernelShutdownHold(owner != nullptr ? &owner->kernel_shutdown_ownership : nullptr);
+}
+
 void maybe_exit_current_kernel_thread_for_shutdown() {
     if (!kernel_threads_shutdown_requested()) {
         return;
@@ -4307,9 +4312,11 @@ void maybe_exit_current_kernel_thread_for_shutdown() {
 
     // A receiver worker may own a fully constructed but unpublished PROCESS
     // plus pre-publication output/monitor locals on this stack. Preserve the
-    // cooperative shutdown request until that ownership is released.
-    if (task->preempt_disable_depth != 0 || !interrupts_enabled() ||
-        task->owned_unpublished_process.load(std::memory_order_acquire) != nullptr) {
+    // cooperative shutdown request until that ownership is released. Driver
+    // callback scopes may also yield; exiting here would not unwind their guards.
+    if (cooperative_exit_deferred(task->preempt_disable_depth, interrupts_enabled(),
+                                  task->owned_unpublished_process.load(std::memory_order_acquire) != nullptr,
+                                  task->kernel_shutdown_ownership.held())) {
         task->preempt_pending = true;
         return;
     }
@@ -4400,22 +4407,30 @@ auto request_kernel_threads_shutdown(uint64_t timeout_us) -> KernelThreadShutdow
         return result;
     }
 
-    uint32_t const COUNT = get_active_task_count();
-    for (uint32_t i = 0; i < COUNT; ++i) {
-        auto* task = get_active_task_at_safe(i);
-        if (task == nullptr) {
-            continue;
+    // Exit removes registry entries by moving the last entry into the hole.
+    // Walking unlocked numeric indices while waking targets can skip exactly
+    // those moved tasks. Mark and retain a bounded batch under the registry
+    // lock, then wake outside it; each new scan starts at zero.
+    while (result.requested < MAX_ACTIVE_TASKS) {
+        std::array<task::Task*, 64> batch{};
+        size_t count = 0;
+        uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
+        for (uint32_t i = 0; i < active_task_count && count < batch.size() && result.requested + count < MAX_ACTIVE_TASKS; ++i) {
+            auto* target = active_task_slot(i);
+            if (!is_kernel_thread_shutdown_target(target, current) || target->kernel_shutdown_requested.load(std::memory_order_acquire) ||
+                !target->try_acquire())
+                continue;
+            target->kernel_shutdown_requested.store(true, std::memory_order_release);
+            target->wakeup_pending.store(true, std::memory_order_release);
+            batch[count++] = target;
         }
-
-        if (is_kernel_thread_shutdown_target(task, current)) {
-            bool const WAS_REQUESTED = task->kernel_shutdown_requested.exchange(true, std::memory_order_acq_rel);
-            if (!WAS_REQUESTED) {
-                ++result.requested;
-            }
-            task->wakeup_pending.store(true, std::memory_order_release);
-            wake_kernel_thread_for_shutdown(task);
+        global_task_registry_lock.unlock_irqrestore(FLAGS);
+        if (count == 0) break;
+        result.requested += count;
+        for (size_t i = 0; i < count; ++i) {
+            wake_kernel_thread_for_shutdown(batch[i]);
+            batch[i]->release();
         }
-        task->release();
     }
 
     uint64_t const START_US = time::get_us();

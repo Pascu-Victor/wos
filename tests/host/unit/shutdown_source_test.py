@@ -309,6 +309,18 @@ def test_kernel_finalizer_sequences_teardown_sync_unmount_and_platform_action() 
     ]:
         require_order(run_body, first, second, context)
 
+    entry = function_body(source, "begin_reboot_command")
+    require_order(entry, "authorize_current_power()", "return -EWOULDBLOCK;", "authority precedes context admission")
+    require_tokens(entry, ["sched::has_run_queues()", "sched::preempt_count() != 0", "CURRENT == nullptr",
+                           "CURRENT->scheduler_transition_active.load", "CURRENT->deferred_task_switch", "CURRENT->wants_block"],
+                   "locked and pending-handoff power entry must fail before changing phase")
+    require_order(entry, "return -EWOULDBLOCK;", "compare_exchange_weak(phase, ShutdownPhase::FINALIZING",
+                  "unsafe power entry cannot claim finalizer ownership")
+    require_order(entry, "compare_exchange_weak(phase, ShutdownPhase::FINALIZING", "run_finalizer(action)",
+                  "accepted ownership precedes the non-returning finalizer")
+    require_order(run_body, 'asm volatile("sti" ::: "memory")', "quiesce_kernel_threads(KERNEL_THREAD_WAIT_US)",
+                  "completion IRQs are enabled before bounded finalizer waits")
+
     sched_init_body = function_body(init_wrappers, "sched_init")
     require_tokens(sched_init_body, ["strcmp(get_kernel_cmdline(), \"--selftest\") == 0", "mod::power::selftest_poweroff();"], "KTEST selftest poweroff call")
     require_order(sched_init_body, "ker::test::run_all();", "mod::power::selftest_poweroff();", "KTEST powers off only after the selftest runner returns")
@@ -351,14 +363,22 @@ def test_kernel_thread_shutdown_is_scheduler_owned_not_ntp_specific() -> None:
         [
             "kernel_thread_shutdown_requested.store(true, std::memory_order_release);",
             "bool const WAKE_TARGETS = timeout_us != 0;",
-            "task->kernel_shutdown_requested.exchange(true, std::memory_order_acq_rel)",
-            "task->wakeup_pending.store(true, std::memory_order_release);",
-            "wake_kernel_thread_for_shutdown(task);",
+            "target->kernel_shutdown_requested.store(true, std::memory_order_release)",
+            "target->wakeup_pending.store(true, std::memory_order_release);",
+            "wake_kernel_thread_for_shutdown(batch[i]);",
             "count_kernel_thread_shutdown_targets(current)",
             "wait_for_kernel_shutdown_progress(current);",
         ],
         "scheduler request/wake/wait kernel-thread shutdown loop",
     )
+    require_order(request_body, "global_task_registry_lock.lock_irqsave()", "target->try_acquire()",
+                  "shutdown batch retains targets under registry lock")
+    require_order(request_body, "target->kernel_shutdown_requested.store", "global_task_registry_lock.unlock_irqrestore(FLAGS)",
+                  "shutdown marks every retained target before unlock")
+    require_order(request_body, "global_task_registry_lock.unlock_irqrestore(FLAGS)", "wake_kernel_thread_for_shutdown(batch[i])",
+                  "shutdown must not take runqueue locks while holding registry lock")
+    if "get_active_task_at_safe(i)" in request_body:
+        fail("shutdown must not skip targets moved into previously visited registry indices")
     require_tokens(
         exit_body,
         [
@@ -368,6 +388,7 @@ def test_kernel_thread_shutdown_is_scheduler_owned_not_ntp_specific() -> None:
         ],
         "kernel threads exit through normal task exit",
     )
+    require_order(exit_body, "task->kernel_shutdown_ownership.held()", "ker::syscall::process::wos_proc_exit(0)", "owned stack resources defer cooperative exit")
     require_order(scheduler_hpp, "maybe_exit_current_kernel_thread_for_shutdown();", "if (preempt_count() != 0)", "scheduler block points check shutdown first")
     forbid_tokens(ntp_source, ["power::shutdown_in_progress()", "#include <platform/power/power.hpp>"], "NTP must not carry shutdown-specific checks")
 
