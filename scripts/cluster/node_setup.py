@@ -117,6 +117,11 @@ def normalize_node_spec(raw: dict) -> dict:
     spec["hostname"] = spec.get("hostname", f"wos-{node_id}")
     spec["debug"] = bool(spec.get("debug", False))
     spec["vm"] = merge_section(DEFAULT_VM_CONFIG, spec.get("vm", {}))
+    iommu = spec["vm"].get("iommu", False)
+    if not isinstance(iommu, bool):
+        raise ValueError("vm.iommu must be a boolean")
+    if iommu and spec["vm"].get("machine", "q35").split(",", 1)[0] != "q35":
+        raise ValueError("vm.iommu requires the q35 machine")
     spec["nics"] = [deepcopy(nic) for nic in spec.get("nics", [])]
     for nic_index, nic in enumerate(spec["nics"]):
         backend = nic.get("qemu_netdev")
@@ -128,6 +133,14 @@ def normalize_node_spec(raw: dict) -> dict:
                 where=f"nics[{nic_index}].qemu_netdev",
             )
     spec["ivshmem"] = [deepcopy(dev) for dev in spec.get("ivshmem", [])]
+    for dev in spec["ivshmem"]:
+        mode = dev.get("mode", "plain")
+        if mode not in ("plain", "doorbell"):
+            raise ValueError("ivshmem mode must be plain or doorbell")
+        if mode == "doorbell":
+            server = dev.get("server")
+            if not isinstance(server, str) or not server or "," in server:
+                raise ValueError("ivshmem doorbell requires a UNIX server path without commas")
     return spec
 
 
@@ -366,6 +379,9 @@ def build_qemu_args(
         str(qemu_log),
     ]
 
+    if vm_cfg.get("iommu", False):
+        args.extend(["-device", "intel-iommu,intremap=off,caching-mode=on,aw-bits=48"])
+
     usb_hotplug = vm_cfg.get("usb_hotplug", {})
     if isinstance(usb_hotplug, dict) and usb_hotplug.get("enabled", False):
         xhci_id = str(usb_hotplug.get("controller_id", "xhci"))
@@ -420,6 +436,16 @@ def build_qemu_args(
         args.extend(["-netdev", ",".join(netdev_options), "-device", ",".join(device_options)])
 
     for idx, dev in enumerate(spec.get("ivshmem", [])):
+        if dev.get("mode", "plain") == "doorbell":
+            args.extend(
+                [
+                    "-chardev",
+                    f"socket,id=ivserver{idx},path={dev['server']}",
+                    "-device",
+                    f"ivshmem-doorbell,chardev=ivserver{idx},vectors=1",
+                ]
+            )
+            continue
         args.extend(
             [
                 "-object",
@@ -606,9 +632,17 @@ def cluster_config_from_node_spec(spec: dict) -> dict:
                     "hostname": node_hostname(spec),
                     "debug": bool(spec.get("debug", False)),
                     "vm": deepcopy(vm_cfg),
+                    # Explicit single-node devices are separate from the
+                    # zone's shared-link topology dictionary.
+                    "ivshmem_devices": deepcopy(spec.get("ivshmem", [])),
+                    "fw_cfg": deepcopy(spec.get("fw_cfg", [])),
                 }
             ],
         }
+        # Preserve the validated rootless backend through KTEST's node-to-zone
+        # conversion; dropping it silently turns a socket NIC into a TAP NIC.
+        if "qemu_netdev" in nic:
+            zone["qemu_netdev"] = deepcopy(nic["qemu_netdev"])
         zones.append(zone)
 
     return {"zones": zones}

@@ -1507,9 +1507,99 @@ def test_wki_invalid_identity_policy_cannot_partially_replace_credentials(module
                 raise AssertionError("invalid configuration created partial credentials")
 
 
+def test_ktest_node_conversion_preserves_rootless_backend(module) -> None:
+    backend = {
+        "type": "socket-mcast",
+        "address": "239.192.90.20",
+        "port": 47920,
+        "localaddr": "127.0.0.1",
+    }
+    spec = {
+        "id": 0,
+        "nics": [{"zone_id": 0, "queues": 1, "vhost": False,
+                  "qemu_netdev": backend}],
+        "ivshmem": [{"mode": "doorbell", "server": "/tmp/wos-test.sock", "role": 0, "peer": 2}],
+        "fw_cfg": [{"name": "opt/wos/wki-ivshmem", "string": "0"}],
+    }
+    config = module.node_setup.cluster_config_from_node_spec(spec)
+    module.validate_cluster_config(config)
+    assert_equal(config["zones"][1]["qemu_netdev"], backend, "KTEST rootless zone")
+    nodes = module.collect_unique_nodes(config)
+    converted = module.cluster_node_spec(0, nodes[0], config)
+    assert_equal(converted["nics"][0]["qemu_netdev"], backend, "KTEST NIC round trip")
+    assert_equal(converted["ivshmem"], spec["ivshmem"], "KTEST explicit ivshmem round trip")
+    assert_equal(converted["fw_cfg"], spec["fw_cfg"], "KTEST firmware overrides round trip")
+    old_link = module.link_json
+    module.link_json = lambda _name: (_ for _ in ()).throw(AssertionError("rootless NIC probed host links"))
+    try:
+        module.validate_no_setup_topology(config)
+    finally:
+        module.link_json = old_link
+    config["zones"][1]["qemu_netdev"]["port"] = 47921
+    assert_equal(backend["port"], 47920, "conversion owns its backend copy")
+
+
+def test_iommu_option_is_explicit_and_validated_before_disk_work(module) -> None:
+    node_setup = module.node_setup
+    old_prepare = node_setup.prepare_node_overlays
+    old_cleanup = node_setup.cleanup_node_logs
+    node_setup.prepare_node_overlays = lambda _spec, log=print: (Path("disk0-overlay"), Path("disk1-overlay"))
+    node_setup.cleanup_node_logs = lambda _spec: None
+    try:
+        for enabled in (False, True):
+            args = node_setup.build_qemu_args({"vm": {"iommu": enabled}}, log=lambda _line: None)
+            expected = "intel-iommu,intremap=off,caching-mode=on,aw-bits=48"
+            assert_equal(expected in args, enabled, "explicit IOMMU device")
+            if enabled:
+                assert_equal(args[args.index(expected) - 1], "-device", "IOMMU option")
+        args = node_setup.build_qemu_args({}, log=lambda _line: None)
+        assert_equal(any("intel-iommu" in arg for arg in args), False, "default has no IOMMU")
+        node_setup.prepare_node_overlays = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("invalid spec touched disks"))
+        for vm in ({"iommu": "on"}, {"iommu": 1}, {"iommu": None}, {"iommu": True, "machine": "pc"}):
+            try:
+                node_setup.build_qemu_args({"vm": vm}, log=lambda _line: None)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"invalid IOMMU spec accepted: {vm!r}")
+    finally:
+        node_setup.prepare_node_overlays = old_prepare
+        node_setup.cleanup_node_logs = old_cleanup
+
+
+def test_ivshmem_modes_share_the_node_launcher(module) -> None:
+    node = module.node_setup
+    old_prepare, old_cleanup = node.prepare_node_overlays, node.cleanup_node_logs
+    node.prepare_node_overlays = lambda _spec, log=print: (Path("disk0-overlay"), Path("disk1-overlay"))
+    node.cleanup_node_logs = lambda _spec: None
+    try:
+        for mode in ("plain", "doorbell"):
+            dev = {"mode": mode, "size": "16M", "path": "/tmp/shared", "server": "/tmp/server.sock", "role": 0, "peer": 2}
+            args = node.build_qemu_args({"ivshmem": [dev]}, log=lambda _line: None)
+            if mode == "plain":
+                assert_equal("ivshmem-plain,memdev=hmem0" in args, True, "default CPU shared BAR device")
+                assert_equal(any("ivserver" in arg for arg in args), False, "plain does not connect to a server")
+            else:
+                assert_equal("ivshmem-doorbell,chardev=ivserver0,vectors=1" in args, True, "single MSI-X vector")
+                assert_equal("socket,id=ivserver0,path=/tmp/server.sock" in args, True, "private UNIX server")
+                assert_equal(any("memory-backend-file" in arg for arg in args), False, "server provides shared fd")
+        node.prepare_node_overlays = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("invalid spec touched disks"))
+        for dev in ({"mode": "legacy"}, {"mode": "doorbell"}, {"mode": "doorbell", "server": ""}, {"mode": "doorbell", "server": "a,b"}):
+            try:
+                node.build_qemu_args({"ivshmem": [dev]}, log=lambda _line: None)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"invalid ivshmem mode accepted: {dev!r}")
+    finally:
+        node.prepare_node_overlays, node.cleanup_node_logs = old_prepare, old_cleanup
+
+
 def main() -> None:
     module = load_module()
     tests = [
+        test_ivshmem_modes_share_the_node_launcher,
+        test_iommu_option_is_explicit_and_validated_before_disk_work,
         test_topology_probe_is_timeout_bounded,
         test_no_setup_topology_accepts_configured_links,
         test_no_setup_topology_rejects_missing_or_stale_links,
@@ -1533,6 +1623,7 @@ def main() -> None:
         test_rootless_wki_auth_config_has_no_host_link_dependency,
         test_rootless_wki_auth_mixed_config_validates_shared_memory,
         test_socket_multicast_backend_validation_qemu_and_no_setup,
+        test_ktest_node_conversion_preserves_rootless_backend,
         test_launch_one_vm_wraps_overlay_creation_failure_without_popen,
         test_wait_for_launched_vms_reaps_and_reports_nonzero_nodes,
         test_cluster_main_preserves_vm_exit_error_for_incident,

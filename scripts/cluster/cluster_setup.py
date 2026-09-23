@@ -2413,7 +2413,8 @@ def cluster_node_spec(node_id: int, node_info: dict, config: dict) -> dict:
         "debug": bool(eff.get("debug", False)),
         "vm": deepcopy(eff.get("vm", {})),
         "nics": [],
-        "ivshmem": [],
+        "ivshmem": deepcopy(eff.get("ivshmem_devices", [])),
+        "fw_cfg": deepcopy(eff.get("fw_cfg", [])),
     }
     auth_path = eff.get("wki_auth_file")
     if auth_path is not None:
