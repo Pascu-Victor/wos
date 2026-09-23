@@ -63,6 +63,8 @@ struct RequestSpec {
     uint64_t deadline_us = 0;
     bool event_data_valid = false;
     uint64_t event_data = 0;
+    uint64_t terminal_trb = 0;
+    bool terminal_event_data = false;
 };
 
 struct RequestSnapshot {
@@ -79,6 +81,10 @@ struct RequestSnapshot {
     uint8_t event_slot_id = 0;
     uint8_t event_dci = 0;
     uint64_t event_parameter = 0;
+    bool event_uses_data = false;
+    bool short_seen = false;
+    uint64_t short_identity = 0;
+    uint32_t short_residual = 0;
 };
 
 struct DecodedCompletionEvent {
@@ -127,6 +133,7 @@ struct DecodedCompletionEvent {
 
 enum class CompletionDisposition : uint8_t {
     COMPLETED,
+    PROGRESS,
     DUPLICATE,
     UNKNOWN,
     LATE_AFTER_TIMEOUT,
@@ -154,6 +161,42 @@ struct TimeoutScanResult {
 };
 
 using TimeoutSink = void (*)(void* context, RequestHandle request);
+
+// Task waiter shared with host tests. A transient result publication is never
+// interpreted as completion; an invalid handle returns unproven ownership.
+template <typename Table, typename Clock, typename Yield>
+auto await_result(Table& requests, RequestHandle handle, uint64_t deadline_us, RequestSnapshot& snapshot, Clock clock, Yield yield,
+                  int timeout_result, int invalid_result) -> int {
+    for (;;) {
+        if (!requests.snapshot(handle, snapshot)) {
+            // COMPLETING/TIMING_OUT publish their result in several steps.
+            // An unavailable snapshot is not permission to release DMA.
+            auto const DISPOSITION = requests.try_timeout(handle, clock(), timeout_result);
+            if (DISPOSITION == TimeoutDisposition::STALE_HANDLE || DISPOSITION == TimeoutDisposition::NOT_ARMED) {
+                snapshot.state = RequestState::TIMED_OUT;
+                snapshot.result = invalid_result;
+                return invalid_result;
+            }
+            yield();
+            continue;
+        }
+        if (snapshot.state == RequestState::COMPLETED) {
+            return snapshot.result;
+        }
+        if (snapshot.state == RequestState::TIMED_OUT || snapshot.state == RequestState::RETIRED) {
+            return snapshot.result;
+        }
+
+        uint64_t const NOW = clock();
+        if (NOW >= deadline_us) {
+            auto const RESULT = requests.try_timeout(handle, NOW, timeout_result);
+            if (RESULT == TimeoutDisposition::TIMED_OUT || RESULT == TimeoutDisposition::ALREADY_TIMED_OUT) {
+                if (requests.snapshot(handle, snapshot)) return snapshot.result;
+            }
+        }
+        yield();
+    }
+}
 
 template <size_t Capacity, size_t MaxRequestTrbs = 4>
 class FixedRequestTable {
@@ -187,6 +230,8 @@ class FixedRequestTable {
             record.deadline_us.store(spec.deadline_us, std::memory_order_relaxed);
             record.event_data_valid.store(spec.event_data_valid, std::memory_order_relaxed);
             record.event_data.store(spec.event_data, std::memory_order_relaxed);
+            record.terminal_trb.store(spec.terminal_trb, std::memory_order_relaxed);
+            record.terminal_event_data.store(spec.terminal_event_data, std::memory_order_relaxed);
             record.trb_count.store(static_cast<uint8_t>(spec.trb_phys.size()), std::memory_order_relaxed);
             for (size_t trb_index = 0; trb_index < MaxRequestTrbs; ++trb_index) {
                 uint64_t const PHYS = trb_index < spec.trb_phys.size() ? spec.trb_phys[trb_index] : 0;
@@ -315,6 +360,10 @@ class FixedRequestTable {
         out.event_slot_id = record->event_slot_id.load(std::memory_order_relaxed);
         out.event_dci = record->event_dci.load(std::memory_order_relaxed);
         out.event_parameter = record->event_parameter.load(std::memory_order_relaxed);
+        out.event_uses_data = record->event_uses_data.load(std::memory_order_relaxed);
+        out.short_seen = record->short_seen.load(std::memory_order_relaxed);
+        out.short_identity = record->short_identity.load(std::memory_order_relaxed);
+        out.short_residual = record->short_residual.load(std::memory_order_relaxed);
 
         std::atomic_thread_fence(std::memory_order_acquire);
         return record->generation.load(std::memory_order_relaxed) == handle.generation &&
@@ -334,6 +383,8 @@ class FixedRequestTable {
         std::array<std::atomic<uint64_t>, MaxRequestTrbs> trb_phys{};
         std::atomic<bool> event_data_valid{false};
         std::atomic<uint64_t> event_data{0};
+        std::atomic<uint64_t> terminal_trb{0};
+        std::atomic<bool> terminal_event_data{false};
         std::atomic<uint32_t> requested_length{0};
         std::atomic<uint64_t> deadline_us{0};
         std::atomic<int32_t> result{DEFAULT_PENDING_RESULT};
@@ -342,6 +393,10 @@ class FixedRequestTable {
         std::atomic<uint8_t> event_slot_id{0};
         std::atomic<uint8_t> event_dci{0};
         std::atomic<uint64_t> event_parameter{0};
+        std::atomic<bool> event_uses_data{false};
+        std::atomic<bool> short_seen{false};
+        std::atomic<uint64_t> short_identity{0};
+        std::atomic<uint32_t> short_residual{0};
     };
 
     [[nodiscard]] static auto transition_to_timed_out(RequestRecord& record, int32_t timeout_result) -> TimeoutDisposition {
@@ -371,6 +426,12 @@ class FixedRequestTable {
         if (spec.kind == RequestKind::TRANSFER && (spec.slot_id == 0 || spec.dci == 0 || spec.dci > 31)) {
             return false;
         }
+        if (spec.terminal_event_data && (!spec.event_data_valid || spec.terminal_trb != 0)) return false;
+        if (spec.terminal_trb != 0) {
+            bool found = false;
+            for (auto identity : spec.trb_phys) found = found || identity == spec.terminal_trb;
+            if (!found) return false;
+        }
         for (size_t i = 0; i < spec.trb_phys.size(); ++i) {
             if (spec.trb_phys[i] == 0 || (spec.trb_phys[i] & ~TRB_POINTER_MASK) != 0) {
                 return false;
@@ -385,6 +446,10 @@ class FixedRequestTable {
     }
 
     static void reset_result(RequestRecord& record) {
+        record.event_uses_data.store(false, std::memory_order_relaxed);
+        record.short_seen.store(false, std::memory_order_relaxed);
+        record.short_identity.store(0, std::memory_order_relaxed);
+        record.short_residual.store(0, std::memory_order_relaxed);
         record.result.store(DEFAULT_PENDING_RESULT, std::memory_order_relaxed);
         record.completion_code.store(0, std::memory_order_relaxed);
         record.residual.store(0, std::memory_order_relaxed);
@@ -515,6 +580,23 @@ class FixedRequestTable {
             return {.disposition = completion_disposition_for_state(expected), .request = HANDLE};
         }
 
+        bool const GUARDED =
+            record.terminal_event_data.load(std::memory_order_relaxed) || record.terminal_trb.load(std::memory_order_relaxed) != 0;
+        bool const TERMINAL = record.terminal_event_data.load(std::memory_order_relaxed)
+                                  ? event.uses_event_data
+                                  : !event.uses_event_data && event.identity == record.terminal_trb.load(std::memory_order_relaxed);
+        if (event.kind == RequestKind::TRANSFER && GUARDED && !TERMINAL && result == 0) {
+            if (event.completion_code == TRB_CC_SHORT_PKT && !record.short_seen.load(std::memory_order_relaxed)) {
+                record.short_identity.store(event.identity, std::memory_order_relaxed);
+                record.short_residual.store(event.residual, std::memory_order_relaxed);
+                record.short_seen.store(true, std::memory_order_relaxed);
+            }
+            // The terminal event still owns retirement. Cancellation retries
+            // this transient publication instead of assuming completion won.
+            record.state.store(RequestState::SUBMITTED, std::memory_order_release);
+            return {.disposition = CompletionDisposition::PROGRESS, .request = HANDLE};
+        }
+        record.event_uses_data.store(event.uses_event_data, std::memory_order_relaxed);
         record.result.store(result, std::memory_order_relaxed);
         record.completion_code.store(event.completion_code, std::memory_order_relaxed);
         record.residual.store(event.residual, std::memory_order_relaxed);

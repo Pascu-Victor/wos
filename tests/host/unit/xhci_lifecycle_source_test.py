@@ -120,9 +120,9 @@ def test_teardown_orders_admission_hardware_barrier_and_release() -> None:
             "bound_driver->detach",
             "retire_endpoint_request_after_barrier",
             "hc.dcbaap[dev.slot_id] = 0",
-            "page_free(ring)",
-            "free_page(dev.input_ctx)",
-            "free_page(dev.dev_ctx)",
+            "endpoint.ring_dma.retire(dma_api, true)",
+            "dev.input_ctx_dma.retire(dma_api, true)",
+            "dev.dev_ctx_dma.retire(dma_api, true)",
             "new (&dev) UsbDevice{}",
         ],
         "xHCI disconnect ownership order",
@@ -131,8 +131,7 @@ def test_teardown_orders_admission_hardware_barrier_and_release() -> None:
         body,
         [
             "hc.command_quarantined.load(std::memory_order_acquire)",
-            "dev.state.store(UsbDeviceState::FAILED",
-            "return false",
+            "return quarantine_slot(dev)",
         ],
         "unproven controller retirement quarantine",
     )
@@ -282,7 +281,81 @@ def test_irq_and_netdevice_unregistration_have_reader_barriers() -> None:
     )
 
 
+def test_controller_dma_publication_and_cleanup() -> None:
+    source = XHCI_CPP.read_text()
+    probe = function_body(source, "init_controller")
+    require_order(probe, ["pci_set_bus_master(pci_device, false)", "allocate_controller_dma(hc, xhci_dma::DCBAA",
+                         "allocate_controller_dma(hc, xhci_dma::COMMAND", "request_irq", "region.expose()",
+                         "pci_set_bus_master(pci_device, true)", "XHCI_OP_DCBAAP", "XHCI_RT_ERSTBA", "XHCI_CMD_RUN | XHCI_CMD_INTE", "XHCI_STS_HCE"], "DMA before BME and RUN")
+    cleanup = function_body(source, "cleanup_controller")
+    require_order(cleanup, ["XHCI_CMD_INTE | XHCI_CMD_RUN", "halt_controller(hc)", "pci_set_bus_master(hc->pci, false)",
+                           "free_irq", "region.retire", "if (!released", "hc->~XhciController"], "halt/readers before release")
+    require_tokens(probe, ["HCCPARAMS1 & 1U", "XHCI_OP_PAGESIZE", "if (vector_reserved)"], "mask, page and IRQ ownership checks")
+
+
+def test_slot_dma_and_retirement_fail_closed() -> None:
+    source = XHCI_CPP.read_text()
+    allocate = function_body(source, "allocate_slot_dma")
+    require_order(allocate, ["dma::allocate_coherent", "region.allocation =", "region.prepare", "region.submission.address"], "managed slot address")
+    enumeration = function_body(source, "enumerate_device")
+    require_order(enumeration, ["dev.controller != nullptr", "dev.~UsbDevice", "dev.dev_ctx_dma", "dev.dev_ctx_dma.expose()", "hc.dcbaap[dev.slot_id] =", "dev.input_ctx_dma", "ring_dma", "ep0.ring_dma.expose()", "address_device"], "mapping and exposure before slot publication")
+    teardown = function_body(source, "teardown_device")
+    require_order(teardown, ["ring_lock.lock_irqsave", "endpoint.accepting.store(false", "ring_lock.unlock_irqrestore", "mark_endpoint_request_cancelled", "endpoint_stop_action", "stop_endpoint", "drop_non_control_endpoints(hc, dev) != 0", "disable_slot(&hc, dev.slot_id) != 0", "bound_driver->detach", "ring_dma.retire"], "close publication, stop and drain before unmap")
+    if "static_cast<void>(stop_endpoint" in teardown or "static_cast<void>(drop_non_control_endpoints" in teardown:
+        fail("slot retirement ignores an endpoint stop/drop failure")
+    publication = function_body(source, "submit_transfer")
+    require_order(publication, ["endpoint.accepting.load", "return {}", "request_table(&hc).reserve"], "final transfer eligibility before publication")
+    require_tokens(function_body(source, "wait_for_request"), ["request::await_result"], "shared tested waiter")
+    waiter = function_body((XHCI_CPP.parent / "xhci_request.hpp").read_text(), "await_result")
+    require_order(waiter, ["!requests.snapshot(handle, snapshot)", "TimeoutDisposition::STALE_HANDLE", "snapshot.state = RequestState::TIMED_OUT", "return invalid_result", "yield", "continue"], "unavailable snapshot never grants completion")
+    require_tokens(waiter, ["if (requests.snapshot(handle, snapshot)) return snapshot.result"], "timeout requires published result")
+    bulk = function_body(source, "xhci_configure_bulk_endpoints")
+    require_order(bulk, ["allocate_slot_dma", "in.ring_dma.expose()", "out.ring_dma.expose()", "configure_endpoint"], "bulk mappings before configure command")
+    if "page_free" in bulk or "alloc_pages" in bulk:
+        fail("endpoint rings bypass managed mapping or release")
+
+
+def test_streaming_ownership_and_terminal_completion() -> None:
+    source = XHCI_CPP.read_text()
+    if "virt_to_phys" in source or "alloc_pages(" in source or "page_free(bounce" in source or "page_free(endpoint.request_dma" in source:
+        fail("xHCI still bypasses the DMA API")
+    prepare = function_body(source, "prepare_transfer_dma")
+    require_order(prepare, ["dma::allocate_streaming", "region.allocation =", "region.allocation.cpu", "region.prepare"], "owned streaming storage before publication")
+    submit = function_body(source, "submit_transfer")
+    require_order(submit, ["endpoint.accepting.load", "request_table(&hc).reserve", "endpoint.transfer_dma.expose()", "request_index.store"], "final acceptance and DMA exposure")
+    finish = function_body(source, "finish_transfer")
+    require_order(finish, ["wait_for_request", "RequestState::TIMED_OUT", "snapshot.event_uses_data", "transfer_dma.complete", "std::memcpy", "transfer_dma.release", "request_table(hc).release", "request_busy.store(false"], "terminal event then synchronization/copy/release")
+    bulk = function_body(source, "xhci_bulk_transfer")
+    require_order(bulk, ["prepare_transfer_dma", "plan_transfer", "submit_transfer", "TRB_NORMAL | TRB_CHAIN", "TRB_EVENT_DATA | TRB_IOC", "ring_doorbell"], "bounded segments and terminal Event Data")
+    control = function_body(source, "xhci_control_transfer")
+    require_tokens(control, ["PLAN.count + 2", "identities.at(PLAN.count + 1)", "TRB_STATUS", "TRB_ISP"], "control Status retirement and short progress")
+    require_tokens(function_body(source, "ring_enqueue"), ["(control & TRB_CHAIN)"], "Link retains TD Chain")
+
+
+def test_terminal_shutdown_owns_readers_and_retains_metadata() -> None:
+    source = XHCI_CPP.read_text()
+    cdc = CDC_CPP.read_text()
+    for name in ("xhci_control_transfer", "xhci_bulk_transfer", "xhci_configure_bulk_endpoints", "send_command_result"):
+        require_order(function_body(source, name), ["CallbackGuard const GUARD", "if (!GUARD"], f"{name} terminal admission")
+    require_order(function_body(source, "process_pending_ports"), ["CallbackGuard const GUARD", "if (!GUARD)", "handle_port"], "lifecycle mutation gate")
+    require_order(function_body(source, "ensure_usb_worker"), ["create_kernel_thread", "try_acquire", "post_task_balanced"], "retained USB worker pointer")
+    require_order(function_body(cdc, "cdc_ether_init"), ["create_kernel_thread", "try_acquire", "post_task_balanced"], "retained CDC worker pointer")
+    for name in ("cdc_start_xmit", "cdc_rx_worker"):
+        require_order(function_body(cdc, name), ["hold_kernel_shutdown", "cdc_io_try_acquire", "release_cdc_io"], f"{name} cooperative ownership")
+    terminal = function_body(cdc, "cdc_terminal_drain")
+    require_tokens(terminal, ["CdcEtherState::RETIRING", "quiesce_proven", "get_ms() - START < 5000", "io_readers.load"], "bounded class drain")
+    if "netdev_unregister_wait" in terminal or "CdcEtherState::FREE" in terminal:
+        fail("terminal class metadata is recycled or waits for arbitrary external references")
+    require_tokens(function_body(source, "retire_controller"), ["hold_kernel_shutdown", "compare_exchange_strong", "xhci_terminal::retire", "State::retained"], "serialized terminal ownership")
+    power = (XHCI_CPP.parents[2] / "platform/power/power.cpp").read_text()
+    require_order(function_body(power, "run_finalizer"), ["wki_shutdown", "vfs_shutdown_unmount_all", "xhci_shutdown", "halt_other_cores"], "power finalizer USB order")
+
+
 def main() -> None:
+    test_terminal_shutdown_owns_readers_and_retains_metadata()
+    test_streaming_ownership_and_terminal_completion()
+    test_slot_dma_and_retirement_fail_closed()
+    test_controller_dma_publication_and_cleanup()
     test_irq_is_bounded_and_only_publishes()
     test_teardown_orders_admission_hardware_barrier_and_release()
     test_live_qemu_interrupt_and_cdc_compatibility()

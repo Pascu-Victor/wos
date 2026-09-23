@@ -11,18 +11,20 @@
 #include <limits>
 #include <new>  // IWYU pragma: keep
 #include <platform/dbg/dbg.hpp>
+#include <platform/init/limine_requests.hpp>
 #include <platform/interrupt/gates.hpp>
 #include <platform/ktime/ktime.hpp>
-#include <platform/mm/addr.hpp>
 #include <platform/mm/page_alloc.hpp>
 #include <platform/mm/phys.hpp>
-#include <platform/mm/virt.hpp>
+#ifdef WOS_SELFTEST
+#include <platform/power/power.hpp>
+#endif
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <span>
+#include <string_view>
 
 #include "dev/pci.hpp"
-#include "util/hcf.hpp"
 
 namespace ker::dev::usb {
 
@@ -43,19 +45,58 @@ constexpr size_t REQUEST_CAPACITY = 128;
 constexpr uint64_t COMMAND_TIMEOUT_US = 2'000'000;
 constexpr uint64_t CONTROL_TIMEOUT_US = 2'000'000;
 constexpr uint64_t BULK_TIMEOUT_US = 5'000'000;
-constexpr uint32_t MAX_TRANSFER_LENGTH = 0x1FFFF;
+constexpr size_t MAX_TRANSFER_LENGTH = xhci_dma::MAX_TRANSFER;
 constexpr int REQUEST_TIMEOUT_RESULT = -ETIMEDOUT;
 
-using RequestTable = request::FixedRequestTable<REQUEST_CAPACITY, 4>;
+using RequestTable = request::FixedRequestTable<REQUEST_CAPACITY, 6>;
 
 UsbClassDriver* class_drivers = nullptr;
 mod::sched::task::Task* usb_worker_task = nullptr;
 std::atomic<bool> usb_worker_pending{false};
+std::atomic<bool> shutdown_started{false};
+
+class CallbackGuard {
+    mod::sched::KernelShutdownHold shutdown_{mod::sched::hold_kernel_shutdown()};
+    dma::lifecycle::Guard admission_;
+
+   public:
+    explicit CallbackGuard(dma::lifecycle::Admission& admission) : admission_(admission) {}
+    [[nodiscard]] explicit operator bool() const { return static_cast<bool>(admission_); }
+};
+
+auto drain_admission(dma::lifecycle::Admission& admission) -> bool {
+    auto const START = mod::time::get_ms();
+    for (size_t n = 0; n < 10'000'000 && mod::time::get_ms() - START < 5000; ++n) {
+        if (admission.drained()) return true;
+        mod::sched::kern_yield();
+    }
+    return admission.drained();
+}
 
 struct Alloc {
     void* virt{};
     uint64_t phys{};
 };
+
+xhci_dma::Api dma_api;
+#ifdef WOS_SELFTEST
+bool dma_test_probing = false, dma_test_withhold_halt = false;
+size_t dma_test_allocations_left = SIZE_MAX;
+size_t dma_test_slot_allocations_left = SIZE_MAX;
+XhciController* dma_test_controller = nullptr;
+std::atomic<size_t> dma_test_packet_echoes{0}, dma_test_protected_yields{0};
+std::atomic<bool> dma_test_submit_held{false};
+auto dma_test_flag(std::string_view token) -> bool {
+    auto const* cmd = ker::init::get_kernel_cmdline();
+    if (cmd == nullptr) return false;
+    std::string_view text(cmd);
+    for (size_t pos = text.find(token); pos != std::string_view::npos; pos = text.find(token, pos + 1)) {
+        auto const END = pos + token.size();
+        if ((pos == 0 || text[pos - 1] == ' ') && (END == text.size() || text[END] == ' ')) return true;
+    }
+    return false;
+}
+#endif
 
 struct CommandResult {
     int status{-EIO};
@@ -74,39 +115,26 @@ auto read32(const volatile uint8_t* base, uint32_t offset) -> uint32_t {
 
 void write32(volatile uint8_t* base, uint32_t offset, uint32_t value) { *reinterpret_cast<volatile uint32_t*>(base + offset) = value; }
 
-void write64(volatile uint8_t* base, uint32_t offset, uint64_t value) { *reinterpret_cast<volatile uint64_t*>(base + offset) = value; }
-
-auto virt_to_phys(void* value) -> uint64_t {
-    auto const ADDRESS = reinterpret_cast<uint64_t>(value);
-    if (ADDRESS >= 0xffffffff80000000ULL) {
-        uint64_t const PHYS = mod::mm::virt::translate(mod::mm::virt::get_kernel_pagemap(), ADDRESS);
-        if (PHYS == mod::mm::virt::PADDR_INVALID) {
-            log::error("virt_to_phys failed for kernel address 0x%lx", ADDRESS);
-            hcf();
-        }
-        return PHYS;
-    }
-    return reinterpret_cast<uint64_t>(mod::mm::addr::get_phys_pointer(ADDRESS));
+void write_dma_address(XhciController* hc, volatile uint8_t* base, uint32_t offset, uint64_t value) {
+    if (hc->dma_mask == UINT32_MAX)
+        write32(base, offset, static_cast<uint32_t>(value));
+    else
+        *reinterpret_cast<volatile uint64_t*>(base + offset) = value;
 }
 
-auto alloc_pages(size_t bytes, const char* name = "xhci_dma") -> Alloc {
-    size_t const ALLOC_BYTES = ((std::max(bytes, size_t{1}) + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
-    void* storage = mod::mm::phys::page_alloc(mod::mm::PhysicalPageOwner::DEVICE_USB, ALLOC_BYTES, name);
-    if (storage == nullptr) {
-        return {};
+auto allocate_slot_dma(XhciController* hc, xhci_dma::Coherent& region, size_t bytes) -> Alloc {
+    if (region.allocation.handle.generation != 0) return {};
+#ifdef WOS_SELFTEST
+    if (dma_test_flag("--xhci-test-fail-slot-allocate")) {
+        if (dma_test_slot_allocations_left == SIZE_MAX) dma_test_slot_allocations_left = 2;
+        if (dma_test_slot_allocations_left == 0) return {};
+        --dma_test_slot_allocations_left;
     }
-    std::memset(storage, 0, ALLOC_BYTES);
-    return {.virt = storage, .phys = virt_to_phys(storage)};
-}
-
-auto alloc_page(const char* name = "xhci_page") -> Alloc { return alloc_pages(PAGE_SIZE, name); }
-
-void free_page(void*& storage) {
-    if (storage == nullptr) {
-        return;
-    }
-    mod::mm::phys::page_free(storage);
-    storage = nullptr;
+#endif
+    auto const R = dma::allocate_coherent(hc->pci, bytes, PAGE_SIZE, hc->dma_mask);
+    region.allocation = R.allocation;
+    if (R.error != dma::Error::none || !region.prepare(dma_api)) return {};
+    return {.virt = region.allocation.cpu, .phys = region.submission.address};
 }
 
 auto request_table(XhciController* hc) -> RequestTable& { return *static_cast<RequestTable*>(hc->request_table); }
@@ -184,7 +212,7 @@ auto ring_enqueue(Trb* ring, uint64_t ring_phys, size_t* enqueue, bool* cycle, s
         ring[index].param = ring_phys;
         ring[index].status = 0;
         std::atomic_thread_fence(std::memory_order_release);
-        ring[index].control = TRB_LINK | TRB_TOGGLE_CYCLE | (*cycle ? TRB_CYCLE : 0);
+        ring[index].control = TRB_LINK | TRB_TOGGLE_CYCLE | (control & TRB_CHAIN) | (*cycle ? TRB_CYCLE : 0);
         *cycle = !*cycle;
         index = 0;
     }
@@ -216,31 +244,13 @@ void clear_endpoint_handle(UsbEndpoint& endpoint) {
 
 auto wait_for_request(RequestTable& requests, request::RequestHandle handle, uint64_t deadline_us, request::RequestSnapshot& snapshot)
     -> int {
-    for (;;) {
-        if (!requests.snapshot(handle, snapshot)) {
-            return -EIO;
-        }
-        if (snapshot.state == request::RequestState::COMPLETED) {
-            return snapshot.result;
-        }
-        if (snapshot.state == request::RequestState::TIMED_OUT || snapshot.state == request::RequestState::RETIRED) {
-            return snapshot.result;
-        }
-
-        uint64_t const NOW = mod::time::get_us();
-        if (NOW >= deadline_us) {
-            auto const RESULT = requests.try_timeout(handle, NOW, REQUEST_TIMEOUT_RESULT);
-            if (RESULT == request::TimeoutDisposition::TIMED_OUT || RESULT == request::TimeoutDisposition::ALREADY_TIMED_OUT) {
-                static_cast<void>(requests.snapshot(handle, snapshot));
-                return REQUEST_TIMEOUT_RESULT;
-            }
-        }
-        mod::sched::kern_yield();
-    }
+    return request::await_result(
+        requests, handle, deadline_us, snapshot, [] { return mod::time::get_us(); }, [] { mod::sched::kern_yield(); },
+        REQUEST_TIMEOUT_RESULT, -EIO);
 }
 
 auto acquire_command(XhciController& hc) -> bool {
-    while (!hc.command_quarantined.load(std::memory_order_acquire)) {
+    while (!hc.command_quarantined.load(std::memory_order_acquire) && !hc.io_admission.closed()) {
         bool expected = false;
         if (hc.command_busy.compare_exchange_weak(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
             return true;
@@ -251,7 +261,9 @@ auto acquire_command(XhciController& hc) -> bool {
 }
 
 auto send_command_result(XhciController* hc, uint64_t parameter, uint32_t status, uint32_t control) -> CommandResult {
-    if (hc == nullptr || hc->request_table == nullptr || !acquire_command(*hc)) {
+    if (hc == nullptr) return {.status = -EINVAL};
+    CallbackGuard const GUARD(hc->io_admission);
+    if (!GUARD || hc->request_table == nullptr || !acquire_command(*hc)) {
         return {.status = -EIO};
     }
 
@@ -336,7 +348,7 @@ void notify_usb_worker() {
 }
 
 void queue_port_snapshot(XhciController& hc, uint8_t port_id, uint32_t portsc) {
-    if (port_id == 0 || port_id > hc.max_ports) {
+    if (hc.lifecycle_admission.closed() || port_id == 0 || port_id > hc.max_ports) {
         return;
     }
     auto& port = hc.ports.at(port_id);
@@ -382,7 +394,7 @@ void process_events(XhciController& hc) {
     hc.evt_dequeue = cursor.dequeue;
     hc.evt_cycle = cursor.cycle;
     uint64_t const ERDP = hc.evt_ring_phys + (hc.evt_dequeue * sizeof(Trb));
-    write64(hc.rt, XHCI_RT_ERDP, ERDP | (uint64_t{1} << 3U));
+    write_dma_address(&hc, hc.rt, XHCI_RT_ERDP, ERDP | (uint64_t{1} << 3U));
     (void)DRAIN;
 }
 
@@ -494,36 +506,31 @@ auto read_configuration(XhciController& hc, UsbDevice& dev, uint8_t config_index
 }
 
 void mark_endpoint_request_cancelled(XhciController& hc, UsbEndpoint& endpoint) {
-    if (!endpoint.request_busy.load(std::memory_order_acquire)) {
-        return;
-    }
+    if (!endpoint.request_busy.load(std::memory_order_acquire)) return;
     request::RequestHandle const HANDLE = load_endpoint_handle(endpoint);
-    if (!HANDLE.valid()) {
-        return;
+    if (!HANDLE.valid()) return;
+    for (;;) {
+        auto const RESULT = request_table(&hc).cancel(HANDLE, -ECANCELED);
+        if (RESULT != request::TimeoutDisposition::COMPLETION_WON) return;
+        request::RequestSnapshot snapshot{};
+        if (request_table(&hc).snapshot(HANDLE, snapshot) && snapshot.state != request::RequestState::SUBMITTED) return;
+        mod::sched::kern_yield();
     }
-    static_cast<void>(request_table(&hc).cancel(HANDLE, -ECANCELED));
 }
 
-void retire_endpoint_request_after_barrier(XhciController& hc, UsbEndpoint& endpoint) {
-    if (!endpoint.request_busy.load(std::memory_order_acquire)) {
-        return;
-    }
+auto retire_endpoint_request_after_barrier(XhciController& hc, UsbEndpoint& endpoint) -> bool {
+    if (!endpoint.request_busy.load(std::memory_order_acquire)) return true;
+    if (!endpoint.transfer_dma.retire(dma_api, true)) return false;
     request::RequestHandle const HANDLE = load_endpoint_handle(endpoint);
     request::RequestSnapshot snapshot{};
-    if (HANDLE.valid() && request_table(&hc).snapshot(HANDLE, snapshot)) {
-        if (snapshot.state == request::RequestState::TIMED_OUT) {
-            static_cast<void>(request_table(&hc).mark_timed_out_retired(HANDLE));
-        }
-        static_cast<void>(request_table(&hc).release(HANDLE));
+    if (HANDLE.valid()) {
+        if (!request_table(&hc).snapshot(HANDLE, snapshot)) return false;
+        if (snapshot.state == request::RequestState::TIMED_OUT && !request_table(&hc).mark_timed_out_retired(HANDLE)) return false;
+        if (!request_table(&hc).release(HANDLE)) return false;
     }
     clear_endpoint_handle(endpoint);
-    if (endpoint.request_dma != nullptr) {
-        mod::mm::phys::page_free(endpoint.request_dma);
-        endpoint.request_dma = nullptr;
-    }
-    endpoint.request_dma_len = 0;
-    endpoint.request_dir_in = false;
     endpoint.request_busy.store(false, std::memory_order_release);
+    return true;
 }
 
 auto drop_non_control_endpoints(XhciController& hc, UsbDevice& dev) -> int {
@@ -540,70 +547,82 @@ auto drop_non_control_endpoints(XhciController& hc, UsbDevice& dev) -> int {
     return configure_endpoint(&hc, dev.slot_id, dev.input_ctx_phys);
 }
 
+auto quarantine_slot(UsbDevice& dev) -> bool {
+    auto pin = [](xhci_dma::Coherent& region) {
+        if (region.allocation.handle.generation != 0) (void)dma::quarantine(region.allocation.handle);
+    };
+    pin(dev.dev_ctx_dma);
+    pin(dev.input_ctx_dma);
+    for (auto& endpoint : dev.endpoints) pin(endpoint.ring_dma);
+    dev.state.store(UsbDeviceState::FAILED, std::memory_order_release);
+    auto const S = dma::stats(dev.controller->pci);
+    log::warn("slot %u DMA retained regions=%zu pages=%zu q=%zu", dev.slot_id, S.regions, S.backing_pages, S.quarantined);
+    return false;
+}
+
 auto teardown_device(XhciController& hc, XhciPort& port, UsbDevice& dev) -> bool {
     dev.state.store(UsbDeviceState::DISCONNECTING, std::memory_order_release);
     for (auto& endpoint : dev.endpoints) {
+        // A caller that already owns request_busy may still be allocating.
+        // Serialize closure with its final eligibility check and doorbell.
+        auto const FLAGS = endpoint.ring_lock.lock_irqsave();
         endpoint.accepting.store(false, std::memory_order_release);
+        endpoint.ring_lock.unlock_irqrestore(FLAGS);
     }
     if (dev.bound_driver != nullptr && dev.bound_driver->quiesce != nullptr && !dev.bound_driver->quiesce(&dev)) {
-        dev.state.store(UsbDeviceState::FAILED, std::memory_order_release);
-        return false;
+        return quarantine_slot(dev);
     }
 
     for (auto& endpoint : dev.endpoints) {
         mark_endpoint_request_cancelled(hc, endpoint);
     }
-
-    if (hc.command_quarantined.load(std::memory_order_acquire)) {
-        dev.state.store(UsbDeviceState::FAILED, std::memory_order_release);
-        return false;
-    }
+    if (hc.command_quarantined.load(std::memory_order_acquire)) return quarantine_slot(dev);
 
     uint32_t const CONTROLLER_ENDPOINTS = dev.configured_dcis;
     for (uint8_t dci = 1; dci < 32; ++dci) {
-        if ((CONTROLLER_ENDPOINTS & (uint32_t{1} << dci)) == 0) {
-            continue;
-        }
-        UsbEndpoint& endpoint = dev.endpoints.at(dci);
-        if (endpoint.request_busy.load(std::memory_order_acquire) || dci != 1) {
-            static_cast<void>(stop_endpoint(&hc, dev.slot_id, dci));
+        if ((CONTROLLER_ENDPOINTS & (uint32_t{1} << dci)) == 0) continue;
+        auto const* state = reinterpret_cast<const volatile uint32_t*>(static_cast<uint8_t*>(dev.dev_ctx) + context_stride(&hc) * dci);
+        auto const ACTION = xhci_dma::endpoint_stop_action(*state);
+        if (ACTION == xhci_dma::StopAction::unproven ||
+            (ACTION == xhci_dma::StopAction::command && stop_endpoint(&hc, dev.slot_id, dci) != 0)) {
+            return quarantine_slot(dev);
         }
     }
-    static_cast<void>(drop_non_control_endpoints(hc, dev));
+#ifdef WOS_SELFTEST
+    if (dma_test_flag("--xhci-test-withhold-slot-stop")) return quarantine_slot(dev);
+#endif
+    if (drop_non_control_endpoints(hc, dev) != 0) return quarantine_slot(dev);
+    if (disable_slot(&hc, dev.slot_id) != 0) return quarantine_slot(dev);
 
-    if (disable_slot(&hc, dev.slot_id) != 0) {
-        dev.state.store(UsbDeviceState::FAILED, std::memory_order_release);
-        return false;
-    }
-
-    // Disable Slot is the final controller-ownership barrier for all endpoint
-    // requests, contexts, and rings of this slot.  Keep canceled request
-    // records and bounce storage intact until class callers have observed the
-    // cancellation and dropped their I/O references.
+    // Every running endpoint stopped successfully, including its prior transfer
+    // events on our single event ring. Disable Slot retires all slot addresses.
+    // Keep request records/storage until the class's CPU readers have drained.
     if (dev.bound_driver != nullptr && dev.bound_driver->detach != nullptr) {
         dev.bound_driver->detach(&dev);
     }
+    bool released = true;
     for (auto& endpoint : dev.endpoints) {
-        retire_endpoint_request_after_barrier(hc, endpoint);
+        released = retire_endpoint_request_after_barrier(hc, endpoint) && released;
     }
 
     hc.dcbaap[dev.slot_id] = 0;
     std::atomic_thread_fence(std::memory_order_release);
     for (auto& endpoint : dev.endpoints) {
-        if (endpoint.ring != nullptr) {
-            void* ring = endpoint.ring;
-            mod::mm::phys::page_free(ring);
-            endpoint.ring = nullptr;
-        }
+        bool const R = endpoint.ring_dma.retire(dma_api, true);
+        if (R) endpoint.ring = nullptr;
+        released = R && released;
     }
-    free_page(dev.input_ctx);
-    free_page(dev.dev_ctx);
+    bool const INPUT_RELEASED = dev.input_ctx_dma.retire(dma_api, true);
+    if (INPUT_RELEASED) dev.input_ctx = nullptr;
+    bool const DEVICE_RELEASED = dev.dev_ctx_dma.retire(dma_api, true);
+    if (DEVICE_RELEASED) dev.dev_ctx = nullptr;
+    if (!released || !INPUT_RELEASED || !DEVICE_RELEASED) return quarantine_slot(dev);
 
-    uint8_t const SLOT_ID = dev.slot_id;
+    auto const AFTER = dma::stats(hc.pci);
+    log::info("slot %u DMA released regions=%zu pages=%zu q=%zu", dev.slot_id, AFTER.regions, AFTER.backing_pages, AFTER.quarantined);
     dev.~UsbDevice();
     new (&dev) UsbDevice{};
     port.slot_id = 0;
-    (void)SLOT_ID;
     return true;
 }
 
@@ -616,6 +635,12 @@ auto enumerate_device(XhciController& hc, XhciPort& port, uint8_t port_id, uint8
     }
 
     auto& dev = hc.devices.at(static_cast<size_t>(SLOT));
+    if (dev.controller != nullptr) {
+        // A completed Disable Slot may still have pinned mappings after an
+        // invalidation failure. Never overwrite that retained ownership record.
+        (void)disable_slot(&hc, static_cast<uint8_t>(SLOT));
+        return EnumerationResult::QUARANTINED;
+    }
     dev.~UsbDevice();
     new (&dev) UsbDevice{};
     dev.controller = &hc;
@@ -636,7 +661,7 @@ auto enumerate_device(XhciController& hc, XhciPort& port, uint8_t port_id, uint8
         return EnumerationResult::REUSABLE_FAILURE;
     };
 
-    Alloc device_context = alloc_page("xhci_device_context");
+    Alloc device_context = allocate_slot_dma(&hc, dev.dev_ctx_dma, PAGE_SIZE);
     if (device_context.virt == nullptr) {
         return fail();
     }
@@ -644,11 +669,12 @@ auto enumerate_device(XhciController& hc, XhciPort& port, uint8_t port_id, uint8
     dev.dev_ctx_phys = device_context.phys;
     dev.enumeration_stage = lifecycle::EnumerationStage::DEVICE_CONTEXT_ALLOCATED;
 
+    dev.dev_ctx_dma.expose();
     hc.dcbaap[dev.slot_id] = device_context.phys;
     std::atomic_thread_fence(std::memory_order_release);
     dev.enumeration_stage = lifecycle::EnumerationStage::DCBAA_PUBLISHED;
 
-    Alloc input_context = alloc_page("xhci_input_context");
+    Alloc input_context = allocate_slot_dma(&hc, dev.input_ctx_dma, PAGE_SIZE);
     if (input_context.virt == nullptr) {
         return fail();
     }
@@ -656,7 +682,7 @@ auto enumerate_device(XhciController& hc, XhciPort& port, uint8_t port_id, uint8
     dev.input_ctx_phys = input_context.phys;
     dev.enumeration_stage = lifecycle::EnumerationStage::INPUT_CONTEXT_ALLOCATED;
 
-    Alloc ep0_ring = alloc_pages(XFER_RING_SIZE * sizeof(Trb), "xhci_ep0_ring");
+    Alloc ep0_ring = allocate_slot_dma(&hc, dev.endpoints.at(1).ring_dma, XFER_RING_SIZE * sizeof(Trb));
     if (ep0_ring.virt == nullptr) {
         return fail();
     }
@@ -674,6 +700,8 @@ auto enumerate_device(XhciController& hc, XhciPort& port, uint8_t port_id, uint8
     clear_input_context(dev);
     input_add_flags(dev) = (1U << 0U) | (1U << 1U);
     setup_ep0_context(dev, dev.max_packet0, ep0.ring_phys);
+    dev.input_ctx_dma.expose();
+    ep0.ring_dma.expose();
     if (address_device(&hc, dev.slot_id, dev.input_ctx_phys) != 0) {
         return fail();
     }
@@ -852,6 +880,8 @@ void process_pending_ports() {
         if (hc == nullptr) {
             continue;
         }
+        CallbackGuard const GUARD(hc->lifecycle_admission);
+        if (!GUARD) continue;
         uint32_t pending = hc->pending_ports.exchange(0, std::memory_order_acq_rel);
         for (uint8_t port_id = 1; port_id <= hc->max_ports; ++port_id) {
             if ((pending & (uint32_t{1} << (port_id - 1U))) != 0U) {
@@ -879,6 +909,8 @@ auto ensure_usb_worker() -> bool {
     if (usb_worker_task == nullptr) {
         return false;
     }
+    // IRQ wakeups retain this pointer after cooperative worker exit.
+    if (!usb_worker_task->try_acquire()) return false;
     return mod::sched::post_task_balanced(usb_worker_task);
 }
 
@@ -891,47 +923,178 @@ void scan_ports(XhciController& hc) {
     }
 }
 
-void cleanup_controller(XhciController* hc, bool irq_registered) {
-    if (hc == nullptr) {
-        return;
+auto allocate_controller_dma(XhciController* hc, size_t index, size_t bytes) -> Alloc {
+#ifdef WOS_SELFTEST
+    if (dma_test_probing && dma_test_allocations_left != SIZE_MAX) {
+        if (dma_test_allocations_left == 0) return {};
+        --dma_test_allocations_left;
     }
-    if (irq_registered) {
-        uint32_t command = read32(hc->op, XHCI_OP_USBCMD);
-        command &= ~(XHCI_CMD_INTE | XHCI_CMD_RUN);
-        write32(hc->op, XHCI_OP_USBCMD, command);
-        write32(hc->rt, XHCI_RT_IMAN, 0);
+#endif
+    auto& region = hc->controller_dma.at(index);
+    auto const R = dma::allocate_coherent(hc->pci, bytes, PAGE_SIZE, hc->dma_mask);
+    region.allocation = R.allocation;
+    if (R.error != dma::Error::none || !region.prepare(dma_api)) return {};
+    return {.virt = region.allocation.cpu, .phys = region.submission.address};
+}
+
+auto configure_coherent_dma(pci::PCIDevice* p) -> bool {
+    uint8_t const CAP = pci::pci_find_capability(p, 0x10);
+    if (CAP == 0) return true;  // Conventional snooped PCI.
+    if (CAP > 0xf4) return false;
+    auto const OFFSET = static_cast<uint8_t>(CAP + 8);
+    auto value = pci::pci_config_read16(p->bus, p->slot, p->function, OFFSET);
+    value = static_cast<uint16_t>(value & ~0x0810U);  // No Snoop and Relaxed Ordering.
+    pci::pci_config_write16(p->bus, p->slot, p->function, OFFSET, value);
+    return (pci::pci_config_read16(p->bus, p->slot, p->function, OFFSET) & 0x0810U) == 0;
+}
+
+auto halt_controller(XhciController* hc) -> bool {
+    auto const START = mod::time::get_ms();
+    for (size_t n = 0; n < 10'000'000 && mod::time::get_ms() - START < 100; ++n) {
+        auto const STATUS = read32(hc->op, XHCI_OP_USBSTS);
+        if (STATUS != UINT32_MAX && (STATUS & XHCI_STS_HCH) != 0) return true;
+        asm volatile("pause" ::: "memory");
+    }
+    return false;
+}
+
+// Probe-owned controllers only: no registry/worker/class callers exist yet.
+// Published-controller terminal retirement needs a separate software drain.
+auto cleanup_controller(XhciController* hc, bool irq_registered) -> bool {
+    if (hc == nullptr) return true;
+    write32(hc->op, XHCI_OP_USBCMD, read32(hc->op, XHCI_OP_USBCMD) & ~(XHCI_CMD_INTE | XHCI_CMD_RUN));
+    write32(hc->rt, XHCI_RT_IMAN, 0);
+    bool const MASKED = (read32(hc->op, XHCI_OP_USBCMD) & XHCI_CMD_INTE) == 0 && (read32(hc->rt, XHCI_RT_IMAN) & XHCI_IMAN_IE) == 0;
+    bool halted = halt_controller(hc);
+#ifdef WOS_SELFTEST
+    if (dma_test_withhold_halt) halted = false;
+#endif
+    bool const BME_OFF = pci::pci_set_bus_master(hc->pci, false);
+    if (irq_registered && MASKED) {
         mod::gates::free_irq(hc->irq_vector);
+        hc->irq_owned = false;
     }
+    bool const PROOF = halted && BME_OFF && (!irq_registered || MASKED);
+    bool released = true;
+    for (auto& region : hc->controller_dma) released = region.retire(dma_api, PROOF) && released;
+    auto const AFTER = dma::stats(hc->pci);
+    log::info("controller DMA cleanup halted=%u masked=%u bme_off=%u released=%u regions=%zu pages=%zu q=%zu", halted, MASKED, BME_OFF,
+              released, AFTER.regions, AFTER.backing_pages, AFTER.quarantined);
+    if (!released || (irq_registered && !MASKED)) return false;
     delete static_cast<RequestTable*>(hc->request_table);
-    hc->request_table = nullptr;
-    for (size_t i = 0; i < hc->scratchpad_count; ++i) {
-        free_page(hc->scratchpad_buffers.at(i));
-    }
-    void* erst = hc->erst;
-    free_page(erst);
-    hc->erst = nullptr;
-    void* event_ring = hc->evt_ring;
-    free_page(event_ring);
-    hc->evt_ring = nullptr;
-    void* command_ring = hc->cmd_ring;
-    free_page(command_ring);
-    hc->cmd_ring = nullptr;
-    void* scratchpad_array = hc->scratchpad_array;
-    free_page(scratchpad_array);
-    hc->scratchpad_array = nullptr;
-    void* dcbaa = hc->dcbaap;
-    free_page(dcbaa);
-    hc->dcbaap = nullptr;
+#ifdef WOS_SELFTEST
+    if (dma_test_controller == hc) dma_test_controller = nullptr;
+#endif
     hc->~XhciController();
     mod::mm::phys::page_free(hc);
+    return true;
+}
+
+struct TerminalBackend {
+    XhciController& hc;
+    bool masked = false, halted = false, bme_off = false;
+    void close_lifecycle() { hc.lifecycle_admission.close(); }
+    void close_io() { hc.io_admission.close(); }
+    auto drain_lifecycle() -> bool { return drain_admission(hc.lifecycle_admission); }
+    auto close_io_and_slots() -> bool {
+        bool closed = true;
+        for (auto& dev : hc.devices) {
+            if (dev.slot_id == 0) continue;
+            dev.state.store(UsbDeviceState::DISCONNECTING, std::memory_order_release);
+            for (auto& endpoint : dev.endpoints) {
+                auto const FLAGS = endpoint.ring_lock.lock_irqsave();
+                endpoint.accepting.store(false, std::memory_order_release);
+                endpoint.ring_lock.unlock_irqrestore(FLAGS);
+            }
+            if (dev.bound_driver != nullptr) {
+                closed = dev.bound_driver->quiesce != nullptr && dev.bound_driver->quiesce(&dev) && closed;
+            }
+            for (auto& endpoint : dev.endpoints) mark_endpoint_request_cancelled(hc, endpoint);
+        }
+        return closed;
+    }
+    auto drain_io() -> bool { return drain_admission(hc.io_admission); }
+    auto drain_classes() -> bool {
+        bool drained = true;
+        for (auto& dev : hc.devices) {
+            if (dev.slot_id != 0 && dev.bound_driver != nullptr) {
+                drained = dev.bound_driver->terminal_drain != nullptr && dev.bound_driver->terminal_drain(&dev) && drained;
+            }
+        }
+        return drained;
+    }
+    auto mask_interrupts() -> bool {
+        write32(hc.op, XHCI_OP_USBCMD, read32(hc.op, XHCI_OP_USBCMD) & ~XHCI_CMD_INTE);
+        write32(hc.rt, XHCI_RT_IMAN, 0);
+        auto const COMMAND = read32(hc.op, XHCI_OP_USBCMD);
+        auto const IMAN = read32(hc.rt, XHCI_RT_IMAN);
+        return masked = COMMAND != UINT32_MAX && IMAN != UINT32_MAX && (COMMAND & XHCI_CMD_INTE) == 0 && (IMAN & XHCI_IMAN_IE) == 0;
+    }
+    auto halt() -> bool {
+        write32(hc.op, XHCI_OP_USBCMD, read32(hc.op, XHCI_OP_USBCMD) & ~(XHCI_CMD_RUN | XHCI_CMD_INTE));
+        halted = halt_controller(&hc);
+#ifdef WOS_SELFTEST
+        if (dma_test_flag("--xhci-test-withhold-terminal-halt")) return false;
+#endif
+        return halted;
+    }
+    auto disable_bus_master() -> bool { return bme_off = pci::pci_set_bus_master(hc.pci, false); }
+    void drain_interrupts() {
+        if (hc.irq_owned) {
+            mod::gates::free_irq(hc.irq_vector);
+            hc.irq_owned = false;
+        }
+    }
+    auto retire_regions(bool proof) -> bool {
+        bool released = true;
+        for (auto& dev : hc.devices) {
+            for (auto& endpoint : dev.endpoints) {
+                bool const STREAM =
+                    proof ? retire_endpoint_request_after_barrier(hc, endpoint) : endpoint.transfer_dma.retire(dma_api, false);
+                released = STREAM && released;
+                released = endpoint.ring_dma.retire(dma_api, proof) && released;
+            }
+            released = dev.input_ctx_dma.retire(dma_api, proof) && released;
+            released = dev.dev_ctx_dma.retire(dma_api, proof) && released;
+            if (dev.slot_id != 0) dev.state.store(UsbDeviceState::FAILED, std::memory_order_release);
+        }
+        for (auto& region : hc.controller_dma) released = region.retire(dma_api, proof) && released;
+        return released;
+    }
+    void quarantine() { (void)retire_regions(false); }
+    auto release() -> bool { return retire_regions(true); }
+};
+
+auto retire_controller(XhciController& hc) -> int {
+    auto const HOLD = mod::sched::hold_kernel_shutdown();
+    auto expected = xhci_terminal::State::active;
+    if (!hc.terminal_state.compare_exchange_strong(expected, xhci_terminal::State::retiring, std::memory_order_acq_rel)) {
+        return expected == xhci_terminal::State::released ? 0 : expected == xhci_terminal::State::retiring ? -EBUSY : -EIO;
+    }
+    TerminalBackend backend{hc};
+    auto const RESULT = xhci_terminal::retire(backend);
+    bool const RELEASED = RESULT == xhci_terminal::Result::released;
+    hc.terminal_state.store(RELEASED ? xhci_terminal::State::released : xhci_terminal::State::retained, std::memory_order_release);
+    auto const AFTER = dma::stats(hc.pci);
+    log::info("terminal DMA result=%u halted=%u masked=%u bme_off=%u irq_owned=%u regions=%zu pages=%zu q=%zu",
+              static_cast<unsigned>(RESULT), backend.halted, backend.masked, backend.bme_off, hc.irq_owned, AFTER.regions,
+              AFTER.backing_pages, AFTER.quarantined);
+    // Controller, request, USB/class and retained worker metadata stay stable.
+    // Public callers must pass the permanently closed admission gate first.
+    return RELEASED ? 0 : -EIO;
 }
 
 auto init_controller(pci::PCIDevice* pci_device) -> int {
+    if (shutdown_started.load(std::memory_order_acquire)) return -ENODEV;
     size_t const CONTROLLER_INDEX = controller_count.load(std::memory_order_acquire);
-    if (CONTROLLER_INDEX >= controllers.size() || !ensure_usb_worker()) {
+    bool need_worker = true;
+#ifdef WOS_SELFTEST
+    need_worker = !dma_test_probing;
+#endif
+    if (CONTROLLER_INDEX >= controllers.size() || (need_worker && !ensure_usb_worker())) {
         return -1;
     }
-    pci::pci_enable_bus_master(pci_device);
+    if (!pci::pci_set_bus_master(pci_device, false) || !configure_coherent_dma(pci_device)) return -1;
     pci::pci_enable_memory_space(pci_device);
     auto* bar = pci::pci_map_bar(pci_device, 0);
     if (bar == nullptr) {
@@ -977,6 +1140,14 @@ auto init_controller(pci::PCIDevice* pci_device) -> int {
     hc->rt = rt;
     hc->db = doorbells;
     hc->pci = pci_device;
+    hc->dma_mask = (HCCPARAMS1 & 1U) != 0 ? UINT64_MAX : UINT32_MAX;
+#ifdef WOS_SELFTEST
+    if (dma_test_probing) dma_test_controller = hc;
+#endif
+    if ((read32(op, XHCI_OP_PAGESIZE) & 1U) == 0) {
+        (void)cleanup_controller(hc, false);
+        return -1;
+    }
     hc->max_slots = static_cast<uint8_t>(std::min<size_t>(HCSPARAMS1 & 0xFFU, MAX_XHCI_SLOTS));
     hc->max_intrs = static_cast<uint16_t>((HCSPARAMS1 >> 8U) & 0x7FFU);
     hc->max_ports = static_cast<uint8_t>(std::min<size_t>((HCSPARAMS1 >> 24U) & 0xFFU, MAX_XHCI_PORTS));
@@ -988,22 +1159,22 @@ auto init_controller(pci::PCIDevice* pci_device) -> int {
     }
 
     write32(op, XHCI_OP_CONFIG, hc->max_slots);
-    Alloc dcbaa = alloc_page("xhci_dcbaa");
+    Alloc dcbaa = allocate_controller_dma(hc, xhci_dma::DCBAA, PAGE_SIZE);
     if (dcbaa.virt == nullptr) {
         cleanup_controller(hc, false);
         return -1;
     }
     hc->dcbaap = static_cast<uint64_t*>(dcbaa.virt);
     hc->dcbaap_phys = dcbaa.phys;
-    write64(op, XHCI_OP_DCBAAP, dcbaa.phys);
 
-    uint32_t const SCRATCHPAD_COUNT = (((HCSPARAMS2 >> 27U) & 0x1FU) << 5U) | ((HCSPARAMS2 >> 21U) & 0x1FU);
+    size_t const SCRATCHPAD_COUNT = xhci_dma::scratchpad_count(HCSPARAMS2);
     if (SCRATCHPAD_COUNT > hc->scratchpad_buffers.size()) {
         cleanup_controller(hc, false);
         return -1;
     }
     if (SCRATCHPAD_COUNT != 0) {
-        Alloc scratchpad_array = alloc_pages(static_cast<size_t>(SCRATCHPAD_COUNT) * sizeof(uint64_t), "xhci_scratchpad_array");
+        Alloc scratchpad_array =
+            allocate_controller_dma(hc, xhci_dma::SCRATCH_ARRAY, static_cast<size_t>(SCRATCHPAD_COUNT) * sizeof(uint64_t));
         if (scratchpad_array.virt == nullptr) {
             cleanup_controller(hc, false);
             return -1;
@@ -1011,7 +1182,7 @@ auto init_controller(pci::PCIDevice* pci_device) -> int {
         hc->scratchpad_array = static_cast<uint64_t*>(scratchpad_array.virt);
         hc->scratchpad_array_phys = scratchpad_array.phys;
         for (uint32_t i = 0; i < SCRATCHPAD_COUNT; ++i) {
-            Alloc scratchpad = alloc_page("xhci_scratchpad");
+            Alloc scratchpad = allocate_controller_dma(hc, xhci_dma::SCRATCH_FIRST + i, PAGE_SIZE);
             if (scratchpad.virt == nullptr) {
                 cleanup_controller(hc, false);
                 return -1;
@@ -1023,19 +1194,10 @@ auto init_controller(pci::PCIDevice* pci_device) -> int {
         hc->dcbaap[0] = scratchpad_array.phys;
     }
 
-    Alloc command_ring = alloc_pages(CMD_RING_SIZE * sizeof(Trb), "xhci_command_ring");
-    Alloc event_ring = alloc_pages(EVENT_RING_SIZE * sizeof(Trb), "xhci_event_ring");
-    Alloc erst = alloc_page("xhci_erst");
+    Alloc command_ring = allocate_controller_dma(hc, xhci_dma::COMMAND, CMD_RING_SIZE * sizeof(Trb));
+    Alloc event_ring = allocate_controller_dma(hc, xhci_dma::EVENT, EVENT_RING_SIZE * sizeof(Trb));
+    Alloc erst = allocate_controller_dma(hc, xhci_dma::ERST, PAGE_SIZE);
     if (command_ring.virt == nullptr || event_ring.virt == nullptr || erst.virt == nullptr) {
-        if (command_ring.virt != nullptr) {
-            mod::mm::phys::page_free(command_ring.virt);
-        }
-        if (event_ring.virt != nullptr) {
-            mod::mm::phys::page_free(event_ring.virt);
-        }
-        if (erst.virt != nullptr) {
-            mod::mm::phys::page_free(erst.virt);
-        }
         cleanup_controller(hc, false);
         return -1;
     }
@@ -1048,41 +1210,66 @@ auto init_controller(pci::PCIDevice* pci_device) -> int {
     hc->erst = new (erst.virt) ErstEntry{};
     hc->erst_phys = erst.phys;
     hc->erst[0] = {.ring_base = event_ring.phys, .ring_size = EVENT_RING_SIZE, .reserved = 0};
-    write64(op, XHCI_OP_CRCR, command_ring.phys | 1U);
-    write32(rt, XHCI_RT_ERSTSZ, 1);
-    write64(rt, XHCI_RT_ERDP, event_ring.phys);
-    write64(rt, XHCI_RT_ERSTBA, erst.phys);
-    write32(rt, XHCI_RT_IMOD, 0);
-    write32(rt, XHCI_RT_IMAN, XHCI_IMAN_IE);
 
     uint8_t vector = mod::gates::allocate_vector();
     if (vector == 0) {
         cleanup_controller(hc, false);
         return -1;
     }
+    bool vector_reserved = true;
     hc->irq_vector = vector;
     if (pci::pci_enable_msix(pci_device, vector) != 0 && pci::pci_enable_msi(pci_device, vector) != 0) {
         mod::gates::free_irq(vector);
+        vector_reserved = false;
+        if (pci_device->interrupt_line == 0 || pci_device->interrupt_line >= 16) {
+            (void)cleanup_controller(hc, false);
+            return -1;
+        }
         vector = static_cast<uint8_t>(pci_device->interrupt_line + 32U);
         hc->irq_vector = vector;
     }
     if (mod::gates::request_irq(vector, xhci_irq, hc, "xhci") != 0) {
-        mod::gates::free_irq(vector);
+        if (vector_reserved) mod::gates::free_irq(vector);
         cleanup_controller(hc, false);
         return -1;
     }
 
+    hc->irq_owned = true;
+
+    // Conservatively expose before attempted BME enable (failed readback may
+    // still mean hardware observed it). All mappings already exist.
+    for (auto& region : hc->controller_dma)
+        if (region.submission.sequence != 0) region.expose();
+    asm volatile("mfence" ::: "memory");
+    if (!pci::pci_set_bus_master(pci_device, true)) {
+        (void)cleanup_controller(hc, true);
+        return -1;
+    }
+    // Address-register publication can fetch tables even before RUN. BME must
+    // already be enabled, with every referenced allocation mapped/prepared.
+    write_dma_address(hc, op, XHCI_OP_DCBAAP, dcbaa.phys);
+    write_dma_address(hc, op, XHCI_OP_CRCR, command_ring.phys | 1U);
+    write32(rt, XHCI_RT_ERSTSZ, 1);
+    write_dma_address(hc, rt, XHCI_RT_ERDP, event_ring.phys);
+    write_dma_address(hc, rt, XHCI_RT_ERSTBA, erst.phys);
+    write32(rt, XHCI_RT_IMOD, 0);
+    write32(rt, XHCI_RT_IMAN, XHCI_IMAN_IE);
     command = read32(op, XHCI_OP_USBCMD) | XHCI_CMD_RUN | XHCI_CMD_INTE;
     write32(op, XHCI_OP_USBCMD, command);
     for (unsigned i = 0; i < 100'000 && (read32(op, XHCI_OP_USBSTS) & XHCI_STS_HCH) != 0U; ++i) {
         asm volatile("pause");
     }
-    if ((read32(op, XHCI_OP_USBSTS) & XHCI_STS_HCH) != 0U) {
-        log::error("controller did not start");
+    if ((read32(op, XHCI_OP_USBSTS) & (XHCI_STS_HCH | XHCI_STS_HSE | XHCI_STS_HCE)) != 0U) {
+        log::error("controller did not start cleanly");
         cleanup_controller(hc, true);
         return -1;
     }
 
+    auto const MAPPED = dma::stats(pci_device);
+    log::info("controller DMA prepared regions=%zu pages=%zu mask=0x%lx", MAPPED.regions, MAPPED.backing_pages, hc->dma_mask);
+#ifdef WOS_SELFTEST
+    if (dma_test_probing) return 0;
+#endif
     controllers.at(CONTROLLER_INDEX) = hc;
     controller_count.store(CONTROLLER_INDEX + 1U, std::memory_order_release);
     log::info("controller ready slots=%u ports=%u ctx64=%u vec=0x%02x", hc->max_slots, hc->max_ports, hc->ctx64 ? 1U : 0U, hc->irq_vector);
@@ -1091,7 +1278,8 @@ auto init_controller(pci::PCIDevice* pci_device) -> int {
 }
 
 auto submit_transfer(XhciController& hc, UsbDevice& dev, UsbEndpoint& endpoint, std::span<const uint64_t> identities, uint64_t deadline,
-                     void* dma, size_t dma_length, bool direction_in) -> request::RequestHandle {
+                     size_t dma_length, uint64_t terminal_trb, uint64_t cookie = 0) -> request::RequestHandle {
+    if (!endpoint.accepting.load(std::memory_order_acquire)) return {};
     request::RequestHandle const HANDLE = request_table(&hc).reserve({
         .kind = request::RequestKind::TRANSFER,
         .slot_id = dev.slot_id,
@@ -1099,13 +1287,13 @@ auto submit_transfer(XhciController& hc, UsbDevice& dev, UsbEndpoint& endpoint, 
         .trb_phys = identities,
         .requested_length = static_cast<uint32_t>(dma_length),
         .deadline_us = deadline,
+        .event_data_valid = cookie != 0,
+        .event_data = cookie,
+        .terminal_trb = terminal_trb,
+        .terminal_event_data = cookie != 0,
     });
-    if (!HANDLE.valid()) {
-        return {};
-    }
-    endpoint.request_dma = dma;
-    endpoint.request_dma_len = dma_length;
-    endpoint.request_dir_in = direction_in;
+    if (!HANDLE.valid()) return {};
+    endpoint.transfer_dma.expose();
     endpoint.request_generation.store(HANDLE.generation, std::memory_order_relaxed);
     endpoint.request_index.store(HANDLE.index, std::memory_order_release);
     return HANDLE;
@@ -1117,6 +1305,108 @@ void request_device_recovery(UsbDevice& dev) {
     port.recovery_requested.store(true, std::memory_order_release);
     hc.pending_ports.fetch_or(uint32_t{1} << (dev.port - 1U), std::memory_order_acq_rel);
     notify_usb_worker();
+}
+
+auto prepare_transfer_dma(XhciController& hc, UsbEndpoint& endpoint, void* data, size_t length, bool direction_in) -> bool {
+    if (length == 0) return true;
+    auto& region = endpoint.transfer_dma;
+    if (region.allocation.handle.generation != 0) return false;
+    auto const DIRECTION = direction_in ? dma::Direction::from_device : dma::Direction::to_device;
+    auto const R = dma::allocate_streaming(hc.pci, length, DIRECTION, hc.dma_mask);
+    region.allocation = R.allocation;
+    if (R.error != dma::Error::none) return false;
+    if (!direction_in) std::memcpy(region.allocation.cpu, data, length);
+    return region.prepare(dma_api, DIRECTION);
+}
+
+auto abort_unpublished_transfer(UsbDevice& dev, UsbEndpoint& endpoint) -> int {
+    if (endpoint.transfer_dma.retire(dma_api, false))
+        endpoint.request_busy.store(false, std::memory_order_release);
+    else
+        request_device_recovery(dev);
+    return -ENOMEM;
+}
+
+auto finish_transfer(UsbDevice& dev, UsbEndpoint& endpoint, request::RequestHandle handle, uint64_t deadline, void* data, size_t length,
+                     bool direction_in, size_t* actual, const xhci_dma::TransferPlan& plan, std::span<const uint64_t> identities,
+                     bool control) -> int {
+    auto* hc = dev.controller;
+    request::RequestSnapshot snapshot{};
+    int const RESULT = wait_for_request(request_table(hc), handle, deadline, snapshot);
+    if (snapshot.state == request::RequestState::TIMED_OUT) {
+        if (RESULT != -ECANCELED) request_device_recovery(dev);
+        return RESULT;
+    }
+    size_t transferred = length;
+    bool valid = RESULT == 0 && snapshot.state == request::RequestState::COMPLETED;
+    if (control) {
+        valid = valid && !snapshot.event_uses_data && snapshot.residual == 0 && snapshot.completion_code == TRB_CC_SUCCESS;
+        if (snapshot.short_seen) {
+            bool found = false;
+            for (size_t i = 0; i < plan.count; ++i) {
+                auto const& SEGMENT = plan.segments.at(i);
+                if (identities[i + 1] != snapshot.short_identity || snapshot.short_residual > SEGMENT.length) continue;
+                transferred = SEGMENT.offset + SEGMENT.length - snapshot.short_residual;
+                found = true;
+                break;
+            }
+            valid = valid && found && direction_in;
+        }
+    } else {
+        transferred = snapshot.residual;  // Event Data reports bytes transferred, not residue.
+        valid = valid && snapshot.event_uses_data && transferred <= length && (direction_in || transferred == length);
+    }
+    if (!valid || !endpoint.transfer_dma.complete(dma_api, transferred, dma::Retirement::command_completed)) {
+        request_device_recovery(dev);
+        return RESULT != 0 ? RESULT : -EIO;
+    }
+    if (direction_in && transferred != 0) std::memcpy(data, endpoint.transfer_dma.allocation.cpu, transferred);
+    if (!endpoint.transfer_dma.release(dma_api) || !request_table(hc).release(handle)) {
+        request_device_recovery(dev);
+        return -EIO;
+    }
+    clear_endpoint_handle(endpoint);
+    endpoint.request_busy.store(false, std::memory_order_release);
+    if (actual != nullptr) *actual = transferred;
+#ifdef WOS_SELFTEST
+    if (!control && transferred >= 28 && dma_test_flag("--xhci-test-packets")) {
+        auto* bytes = static_cast<uint8_t*>(data);
+        constexpr std::array<uint8_t, 10> TAG{0x88, 0xb5, 'W', 'O', 'S', 'D', 'M', 'A', '2', '3'};
+        if (std::memcmp(bytes + 12, TAG.data(), TAG.size()) == 0) {
+            if (!direction_in) {
+                log::info("DMA test bulk TX bytes=%zu segments=%zu first=%zu", transferred, plan.count, plan.segments.front().length);
+            } else if (bytes[22] == 1) {
+                uint32_t expected_length = 0;
+                std::memcpy(&expected_length, bytes + 24, sizeof(expected_length));
+                bool matched = bytes[22] == 1 && expected_length == transferred;
+                for (size_t i = 28; i < transferred; ++i)
+                    matched = matched && bytes[i] == static_cast<uint8_t>(i * 17 + transferred + bytes[23]);
+                int echoed = -ENODEV;
+                if (matched) {
+                    for (auto& out : dev.endpoints) {
+                        if (!out.configured || out.type != USB_EP_TYPE_BULK || (out.address & USB_EP_DIR_IN) != 0) continue;
+                        bytes[22] = 2;
+                        echoed = xhci_bulk_transfer(hc, dev.slot_id, &out, data, transferred);
+                        bytes[22] = 1;
+                        break;
+                    }
+                }
+                log::info("DMA test bulk RX bytes=%zu segments=%zu matched=%u echo=%d low=0x%lx first=%zu", transferred, plan.count,
+                          matched, echoed, plan.segments.front().address & 65535U, plan.segments.front().length);
+                if (matched && echoed == 0) dma_test_packet_echoes.fetch_add(1, std::memory_order_release);
+            }
+        }
+    }
+#endif
+    return 0;
+}
+
+auto next_transfer_cookie(XhciController& hc) -> uint64_t {
+    auto previous = hc.transfer_cookie.load(std::memory_order_relaxed);
+    while (previous != UINT64_MAX) {
+        if (hc.transfer_cookie.compare_exchange_weak(previous, previous + 1, std::memory_order_relaxed)) return previous + 1;
+    }
+    return 0;
 }
 
 }  // namespace
@@ -1135,9 +1425,12 @@ void usb_register_class_driver(UsbClassDriver* driver) {
 
 auto xhci_control_transfer(XhciController* hc, uint8_t slot_id, UsbSetupPacket* setup, void* data, size_t length, bool direction_in)
     -> int {
-    if (hc == nullptr || setup == nullptr || slot_id == 0 || slot_id > hc->max_slots || length > MAX_TRANSFER_LENGTH) {
+    if (hc == nullptr || setup == nullptr || slot_id == 0 || slot_id > hc->max_slots || length > MAX_TRANSFER_LENGTH ||
+        (length != 0 && data == nullptr)) {
         return -EINVAL;
     }
+    CallbackGuard const GUARD(hc->io_admission);
+    if (!GUARD) return -ENODEV;
     UsbDevice& dev = hc->devices.at(slot_id);
     UsbEndpoint& endpoint = dev.endpoints.at(1);
     if (!endpoint.accepting.load(std::memory_order_acquire)) {
@@ -1152,82 +1445,37 @@ auto xhci_control_transfer(XhciController* hc, uint8_t slot_id, UsbSetupPacket* 
         return -ENODEV;
     }
 
-    Alloc bounce{};
-    if (length != 0) {
-        bounce = alloc_pages(length, "xhci_control_bounce");
-        if (bounce.virt == nullptr) {
-            endpoint.request_busy.store(false, std::memory_order_release);
-            return -ENOMEM;
-        }
-        if (!direction_in) {
-            std::memcpy(bounce.virt, data, length);
-        }
-    }
-
+    if (!prepare_transfer_dma(*hc, endpoint, data, length, direction_in)) return abort_unpublished_transfer(dev, endpoint);
+    auto const PLAN = xhci_dma::plan_transfer(endpoint.transfer_dma.submission.address, length, endpoint.max_packet);
+    if (!PLAN.valid) return abort_unpublished_transfer(dev, endpoint);
     uint64_t setup_parameter = 0;
     std::memcpy(&setup_parameter, setup, sizeof(*setup));
     uint64_t const DEADLINE = mod::time::get_us() + CONTROL_TIMEOUT_US;
     request::RequestHandle handle{};
+    std::array<uint64_t, 6> identities{};
     {
         uint64_t const FLAGS = endpoint.ring_lock.lock_irqsave();
-        if (length == 0) {
-            auto const IDENTITIES = plan_ring_entries<2>(endpoint.ring_phys, endpoint.ring_enqueue, XFER_RING_SIZE);
-            handle = submit_transfer(*hc, dev, endpoint, IDENTITIES, DEADLINE, nullptr, 0, direction_in);
-            if (handle.valid()) {
-                static_cast<void>(ring_enqueue(endpoint.ring, endpoint.ring_phys, &endpoint.ring_enqueue, &endpoint.ring_cycle,
-                                               XFER_RING_SIZE, setup_parameter, 8, TRB_SETUP | TRB_IDT | TRB_CHAIN));
-                static_cast<void>(ring_enqueue(endpoint.ring, endpoint.ring_phys, &endpoint.ring_enqueue, &endpoint.ring_cycle,
-                                               XFER_RING_SIZE, 0, 0, TRB_STATUS | TRB_DIR_IN | TRB_IOC));
-            }
-        } else {
-            auto const IDENTITIES = plan_ring_entries<3>(endpoint.ring_phys, endpoint.ring_enqueue, XFER_RING_SIZE);
-            handle = submit_transfer(*hc, dev, endpoint, IDENTITIES, DEADLINE, bounce.virt, length, direction_in);
-            if (handle.valid()) {
-                uint32_t const TRT = direction_in ? (3U << 16U) : (2U << 16U);
-                static_cast<void>(ring_enqueue(endpoint.ring, endpoint.ring_phys, &endpoint.ring_enqueue, &endpoint.ring_cycle,
-                                               XFER_RING_SIZE, setup_parameter, 8, TRB_SETUP | TRB_IDT | TRB_CHAIN | TRT));
-                static_cast<void>(ring_enqueue(endpoint.ring, endpoint.ring_phys, &endpoint.ring_enqueue, &endpoint.ring_cycle,
-                                               XFER_RING_SIZE, bounce.phys, static_cast<uint32_t>(length),
-                                               TRB_DATA | TRB_CHAIN | (direction_in ? (TRB_DIR_IN | TRB_ENT) : 0U)));
-                static_cast<void>(ring_enqueue(endpoint.ring, endpoint.ring_phys, &endpoint.ring_enqueue, &endpoint.ring_cycle,
-                                               XFER_RING_SIZE, 0, 0, TRB_STATUS | (direction_in ? 0U : TRB_DIR_IN) | TRB_IOC));
-            }
-        }
+        identities = plan_ring_entries<6>(endpoint.ring_phys, endpoint.ring_enqueue, XFER_RING_SIZE);
+        handle = submit_transfer(*hc, dev, endpoint, {identities.data(), PLAN.count + 2}, DEADLINE, length, identities.at(PLAN.count + 1));
         if (handle.valid()) {
+            uint32_t const TRT = length == 0 ? 0 : (direction_in ? (3U << 16U) : (2U << 16U));
+            (void)ring_enqueue(endpoint.ring, endpoint.ring_phys, &endpoint.ring_enqueue, &endpoint.ring_cycle, XFER_RING_SIZE,
+                               setup_parameter, 8, TRB_SETUP | TRB_IDT | TRT);
+            for (size_t i = 0; i < PLAN.count; ++i) {
+                auto const& SEGMENT = PLAN.segments.at(i);
+                uint32_t const TYPE = i == 0 ? TRB_DATA | (direction_in ? TRB_DIR_IN : 0U) : TRB_NORMAL;
+                uint32_t const FLAGS = TYPE | (i + 1 < PLAN.count ? TRB_CHAIN : TRB_ENT) | (direction_in ? TRB_ISP : 0U);
+                (void)ring_enqueue(endpoint.ring, endpoint.ring_phys, &endpoint.ring_enqueue, &endpoint.ring_cycle, XFER_RING_SIZE,
+                                   SEGMENT.address, static_cast<uint32_t>(SEGMENT.length) | (SEGMENT.td_size << 17U), FLAGS);
+            }
+            (void)ring_enqueue(endpoint.ring, endpoint.ring_phys, &endpoint.ring_enqueue, &endpoint.ring_cycle, XFER_RING_SIZE, 0, 0,
+                               TRB_STATUS | (length == 0 || !direction_in ? TRB_DIR_IN : 0U) | TRB_IOC);
             ring_doorbell(hc->db, slot_id, 1);
         }
         endpoint.ring_lock.unlock_irqrestore(FLAGS);
     }
-    if (!handle.valid()) {
-        if (bounce.virt != nullptr) {
-            mod::mm::phys::page_free(bounce.virt);
-        }
-        endpoint.request_busy.store(false, std::memory_order_release);
-        return -ENOMEM;
-    }
-
-    request::RequestSnapshot snapshot{};
-    int const RESULT = wait_for_request(request_table(hc), handle, DEADLINE, snapshot);
-    if (snapshot.state == request::RequestState::TIMED_OUT) {
-        if (RESULT == REQUEST_TIMEOUT_RESULT) {
-            request_device_recovery(dev);
-        }
-        return RESULT;
-    }
-
-    size_t const ACTUAL = snapshot.residual <= length ? length - snapshot.residual : 0;
-    if (RESULT == 0 && direction_in && data != nullptr && ACTUAL != 0) {
-        std::memcpy(data, bounce.virt, ACTUAL);
-    }
-    static_cast<void>(request_table(hc).release(handle));
-    clear_endpoint_handle(endpoint);
-    if (bounce.virt != nullptr) {
-        mod::mm::phys::page_free(bounce.virt);
-    }
-    endpoint.request_dma = nullptr;
-    endpoint.request_dma_len = 0;
-    endpoint.request_busy.store(false, std::memory_order_release);
-    return RESULT;
+    if (!handle.valid()) return abort_unpublished_transfer(dev, endpoint);
+    return finish_transfer(dev, endpoint, handle, DEADLINE, data, length, direction_in, nullptr, PLAN, identities, true);
 }
 
 auto xhci_bulk_transfer(XhciController* hc, uint8_t slot_id, UsbEndpoint* endpoint, void* data, size_t length, size_t* actual,
@@ -1239,6 +1487,8 @@ auto xhci_bulk_transfer(XhciController* hc, uint8_t slot_id, UsbEndpoint* endpoi
         slot_id > hc->max_slots) {
         return -EINVAL;
     }
+    CallbackGuard const GUARD(hc->io_admission);
+    if (!GUARD) return -ENODEV;
     if (!endpoint->accepting.load(std::memory_order_acquire)) {
         return -ENODEV;
     }
@@ -1253,64 +1503,66 @@ auto xhci_bulk_transfer(XhciController* hc, uint8_t slot_id, UsbEndpoint* endpoi
 
     UsbDevice& dev = hc->devices.at(slot_id);
     bool const DIRECTION_IN = (endpoint->address & USB_EP_DIR_IN) != 0;
-    Alloc bounce = alloc_pages(length, "xhci_bulk_bounce");
-    if (bounce.virt == nullptr) {
-        endpoint->request_busy.store(false, std::memory_order_release);
-        return -ENOMEM;
+    if (!prepare_transfer_dma(*hc, *endpoint, data, length, DIRECTION_IN)) return abort_unpublished_transfer(dev, *endpoint);
+    size_t first_segment_limit = SIZE_MAX;
+#ifdef WOS_SELFTEST
+    // Small QEMU USB payloads can exercise chained data and short completion
+    // without changing the owned DMA span or the normal boundary planner.
+    if (dma_test_flag("--xhci-test-split-first")) first_segment_limit = endpoint->max_packet;
+#endif
+    auto const PLAN = xhci_dma::plan_transfer(endpoint->transfer_dma.submission.address, length, endpoint->max_packet, first_segment_limit);
+    uint64_t const COOKIE = next_transfer_cookie(*hc);
+    if (!PLAN.valid || COOKIE == 0) return abort_unpublished_transfer(dev, *endpoint);
+#ifdef WOS_SELFTEST
+    bool const HELD_SUBMIT = DIRECTION_IN && dma_test_flag("--xhci-test-hold-slot-submit");
+    if (HELD_SUBMIT) {
+        log::info("slot %u bulk publication held", slot_id);
+        dma_test_submit_held.store(true, std::memory_order_release);
+        while (endpoint->accepting.load(std::memory_order_acquire)) {
+            mod::sched::kern_yield();
+            auto* current = mod::sched::get_current_task();
+            if (current != nullptr && current->kernel_shutdown_requested.load(std::memory_order_acquire))
+                dma_test_protected_yields.fetch_add(1, std::memory_order_release);
+        }
+        log::info("slot %u bulk publication resumed after admission closed", slot_id);
     }
-    if (!DIRECTION_IN) {
-        std::memcpy(bounce.virt, data, length);
-    }
+#endif
 
     uint64_t const DEADLINE = allow_idle_wait ? std::numeric_limits<uint64_t>::max() : mod::time::get_us() + BULK_TIMEOUT_US;
     request::RequestHandle handle{};
+    std::array<uint64_t, 4> identities{};
     {
         uint64_t const FLAGS = endpoint->ring_lock.lock_irqsave();
-        auto const IDENTITIES = plan_ring_entries<1>(endpoint->ring_phys, endpoint->ring_enqueue, XFER_RING_SIZE);
-        handle = submit_transfer(*hc, dev, *endpoint, IDENTITIES, DEADLINE, bounce.virt, length, DIRECTION_IN);
+        identities = plan_ring_entries<4>(endpoint->ring_phys, endpoint->ring_enqueue, XFER_RING_SIZE);
+        handle = submit_transfer(*hc, dev, *endpoint, {identities.data(), PLAN.count + 1}, DEADLINE, length, 0, COOKIE);
         if (handle.valid()) {
-            static_cast<void>(ring_enqueue(endpoint->ring, endpoint->ring_phys, &endpoint->ring_enqueue, &endpoint->ring_cycle,
-                                           XFER_RING_SIZE, bounce.phys, static_cast<uint32_t>(length),
-                                           TRB_NORMAL | TRB_IOC | (DIRECTION_IN ? TRB_ISP : 0U)));
+            for (size_t i = 0; i < PLAN.count; ++i) {
+                auto const& SEGMENT = PLAN.segments.at(i);
+                (void)ring_enqueue(endpoint->ring, endpoint->ring_phys, &endpoint->ring_enqueue, &endpoint->ring_cycle, XFER_RING_SIZE,
+                                   SEGMENT.address, static_cast<uint32_t>(SEGMENT.length) | (SEGMENT.td_size << 17U),
+                                   TRB_NORMAL | TRB_CHAIN);
+            }
+            (void)ring_enqueue(endpoint->ring, endpoint->ring_phys, &endpoint->ring_enqueue, &endpoint->ring_cycle, XFER_RING_SIZE, COOKIE,
+                               0, TRB_EVENT_DATA | TRB_IOC);
             ring_doorbell(hc->db, slot_id, endpoint->dci);
         }
         endpoint->ring_lock.unlock_irqrestore(FLAGS);
     }
     if (!handle.valid()) {
-        mod::mm::phys::page_free(bounce.virt);
-        endpoint->request_busy.store(false, std::memory_order_release);
-        return -ENOMEM;
+#ifdef WOS_SELFTEST
+        if (HELD_SUBMIT) log::info("slot %u held bulk publication rejected", slot_id);
+#endif
+        return abort_unpublished_transfer(dev, *endpoint);
     }
-
-    request::RequestSnapshot snapshot{};
-    int const RESULT = wait_for_request(request_table(hc), handle, DEADLINE, snapshot);
-    if (snapshot.state == request::RequestState::TIMED_OUT) {
-        if (RESULT == REQUEST_TIMEOUT_RESULT) {
-            request_device_recovery(dev);
-        }
-        return RESULT;
-    }
-
-    size_t const ACTUAL = snapshot.residual <= length ? length - snapshot.residual : 0;
-    if (RESULT == 0 && DIRECTION_IN && ACTUAL != 0) {
-        std::memcpy(data, bounce.virt, ACTUAL);
-    }
-    if (actual != nullptr) {
-        *actual = ACTUAL;
-    }
-    static_cast<void>(request_table(hc).release(handle));
-    clear_endpoint_handle(*endpoint);
-    mod::mm::phys::page_free(bounce.virt);
-    endpoint->request_dma = nullptr;
-    endpoint->request_dma_len = 0;
-    endpoint->request_busy.store(false, std::memory_order_release);
-    return RESULT;
+    return finish_transfer(dev, *endpoint, handle, DEADLINE, data, length, DIRECTION_IN, actual, PLAN, identities, false);
 }
 
 auto xhci_configure_bulk_endpoints(UsbDevice* dev, const UsbEndpointDescriptor& endpoint_in, const UsbEndpointDescriptor& endpoint_out,
                                    UsbEndpoint** bulk_in, UsbEndpoint** bulk_out) -> int {
-    if (dev == nullptr || dev->controller == nullptr || dev->input_ctx == nullptr || dev->dev_ctx == nullptr || bulk_in == nullptr ||
-        bulk_out == nullptr) {
+    if (dev == nullptr || dev->controller == nullptr) return -EINVAL;
+    CallbackGuard const GUARD(dev->controller->io_admission);
+    if (!GUARD) return -ENODEV;
+    if (dev->input_ctx == nullptr || dev->dev_ctx == nullptr || bulk_in == nullptr || bulk_out == nullptr) {
         return -EINVAL;
     }
     uint8_t const DCI_IN = ep_dci(endpoint_in.b_endpoint_address);
@@ -1319,15 +1571,13 @@ auto xhci_configure_bulk_endpoints(UsbDevice* dev, const UsbEndpointDescriptor& 
         return -EINVAL;
     }
 
-    Alloc ring_in = alloc_pages(XFER_RING_SIZE * sizeof(Trb), "xhci_bulk_in_ring");
-    Alloc ring_out = alloc_pages(XFER_RING_SIZE * sizeof(Trb), "xhci_bulk_out_ring");
+    UsbEndpoint& in = dev->endpoints.at(DCI_IN);
+    UsbEndpoint& out = dev->endpoints.at(DCI_OUT);
+    if (in.ring_dma.allocation.handle.generation != 0 || out.ring_dma.allocation.handle.generation != 0) return -EBUSY;
+    Alloc ring_in = allocate_slot_dma(dev->controller, in.ring_dma, XFER_RING_SIZE * sizeof(Trb));
+    Alloc ring_out = allocate_slot_dma(dev->controller, out.ring_dma, XFER_RING_SIZE * sizeof(Trb));
     if (ring_in.virt == nullptr || ring_out.virt == nullptr) {
-        if (ring_in.virt != nullptr) {
-            mod::mm::phys::page_free(ring_in.virt);
-        }
-        if (ring_out.virt != nullptr) {
-            mod::mm::phys::page_free(ring_out.virt);
-        }
+        // Enumeration rollback owns even a partial/faulted allocation.
         return -ENOMEM;
     }
 
@@ -1341,8 +1591,6 @@ auto xhci_configure_bulk_endpoints(UsbDevice* dev, const UsbEndpointDescriptor& 
         endpoint.ring_phys = ring.phys;
         endpoint.ring_cycle = true;
     };
-    UsbEndpoint& in = dev->endpoints.at(DCI_IN);
-    UsbEndpoint& out = dev->endpoints.at(DCI_OUT);
     initialize_endpoint(in, endpoint_in, DCI_IN, ring_in);
     initialize_endpoint(out, endpoint_out, DCI_OUT, ring_out);
     dev->enumeration_stage = lifecycle::EnumerationStage::ENDPOINT_RINGS_ALLOCATED;
@@ -1363,16 +1611,12 @@ auto xhci_configure_bulk_endpoints(UsbDevice* dev, const UsbEndpointDescriptor& 
     };
     fill_context(*input_endpoint_context(*dev, DCI_IN), in);
     fill_context(*input_endpoint_context(*dev, DCI_OUT), out);
+    in.ring_dma.expose();
+    out.ring_dma.expose();
     int const RESULT = configure_endpoint(dev->controller, dev->slot_id, dev->input_ctx_phys);
     if (RESULT != 0) {
-        if (!dev->controller->command_quarantined.load(std::memory_order_acquire)) {
-            void* in_ring = in.ring;
-            void* out_ring = out.ring;
-            mod::mm::phys::page_free(in_ring);
-            mod::mm::phys::page_free(out_ring);
-            in.ring = nullptr;
-            out.ring = nullptr;
-        }
+        // Keep exposed rings until slot rollback proves all hardware readers
+        // retired. Command errors alone do not grant mapping-release authority.
         return RESULT;
     }
 
@@ -1392,6 +1636,104 @@ auto xhci_default_controller() -> XhciController* {
     return controller_count.load(std::memory_order_acquire) == 0 ? nullptr : controllers.front();
 }
 
+#ifdef WOS_SELFTEST
+namespace {
+void dma_terminal_runner() {
+    UsbDevice* device = nullptr;
+    XhciController* hc = nullptr;
+    auto const START = mod::time::get_ms();
+    while (mod::time::get_ms() - START < 90'000) {
+        hc = xhci_default_controller();
+        if (hc != nullptr) {
+            for (auto& dev : hc->devices) {
+                if (dev.state.load(std::memory_order_acquire) == UsbDeviceState::CONFIGURED) {
+                    device = &dev;
+                    break;
+                }
+            }
+        }
+        bool const PACKETS = !dma_test_flag("--xhci-test-packets") || dma_test_packet_echoes.load(std::memory_order_acquire) >= 64;
+        bool const HELD = !dma_test_flag("--xhci-test-hold-slot-submit") || dma_test_submit_held.load(std::memory_order_acquire);
+        if (device != nullptr && PACKETS && HELD) break;
+        mod::sched::kern_sleep_us(1000);
+    }
+    bool ok = device != nullptr;
+    mod::sched::kern_sleep_us(1'000'000);
+    if (dma_test_flag("--xhci-test-terminal-power")) {
+        log::info("terminal power fixture ready=%u", ok);
+        mod::power::selftest_shutdown();
+    }
+    auto const REQUEST = mod::sched::request_kernel_threads_shutdown(1000);
+    if (dma_test_flag("--xhci-test-hold-slot-submit")) {
+        auto const WAIT = mod::time::get_ms();
+        while (dma_test_protected_yields.load(std::memory_order_acquire) < 2 && mod::time::get_ms() - WAIT < 2000)
+            mod::sched::kern_sleep_us(1000);
+        ok = ok && dma_test_protected_yields.load(std::memory_order_acquire) >= 2;
+    }
+    auto const BEFORE = hc != nullptr ? dma::stats(hc->pci) : dma::Stats{};
+    int const RESULT = xhci_shutdown();
+    int const AGAIN = xhci_shutdown();
+    auto const AFTER = hc != nullptr ? dma::stats(hc->pci) : dma::Stats{};
+    bool const WITHHELD = dma_test_flag("--xhci-test-withhold-terminal-halt");
+    bool const ACCOUNTED =
+        WITHHELD ? AFTER.regions == BEFORE.regions && AFTER.backing_pages == BEFORE.backing_pages && AFTER.quarantined == AFTER.regions
+                 : AFTER.regions == 0 && AFTER.backing_pages == 0;
+    bool late = false;
+    if (device != nullptr) {
+        UsbSetupPacket setup{};
+        std::array<uint8_t, 1> buffer{};
+        late = xhci_control_transfer(hc, device->slot_id, &setup, nullptr, 0, false) == -ENODEV &&
+               xhci_bulk_transfer(hc, device->slot_id, &device->endpoints.at(1), buffer.data(), 1) == -ENODEV &&
+               configure_endpoint(hc, device->slot_id, device->input_ctx_phys) == -EIO;
+    }
+    ok = ok && ACCOUNTED && late && hc != nullptr && !hc->irq_owned && hc->lifecycle_admission.drained() && hc->io_admission.drained() &&
+         RESULT == (WITHHELD ? -EIO : 0) && AGAIN == RESULT;
+    log::info(
+        "terminal live %s result=%d repeat=%d late=%u accounted=%u shutdown_targets=%zu protected_yields=%zu regions=%zu->%zu "
+        "pages=%zu->%zu q=%zu",
+        ok ? "PASS" : "FAIL", RESULT, AGAIN, late, ACCOUNTED, REQUEST.requested, dma_test_protected_yields.load(), BEFORE.regions,
+        AFTER.regions, BEFORE.backing_pages, AFTER.backing_pages, AFTER.quarantined);
+    mod::power::selftest_shutdown();
+}
+}  // namespace
+
+auto xhci_dma_packet_test_enabled() -> bool { return dma_test_flag("--xhci-test-packets"); }
+
+auto xhci_dma_selftest() -> XhciDmaTestResult {
+    XhciDmaTestResult r;
+    pci::PCIDevice* target = nullptr;
+    for (size_t i = 0; i < pci::pci_device_count(); ++i) {
+        auto* p = pci::pci_get_device(i);
+        if (p != nullptr && p->class_code == pci::PCI_CLASS_SERIAL_BUS && p->subclass_code == pci::PCI_SUBCLASS_USB &&
+            p->prog_if == pci::PCI_PROG_IF_XHCI) {
+            target = p;
+            break;
+        }
+    }
+    if (target == nullptr) return r;
+    r.found = true;
+    r.fail_allocate = dma_test_flag("--xhci-test-fail-allocate");
+    r.withheld = dma_test_flag("--xhci-test-withhold-halt");
+    r.before = dma::stats(target);
+    dma_test_probing = true;
+    dma_test_withhold_halt = r.withheld;
+    dma_test_allocations_left = r.fail_allocate ? 2 : SIZE_MAX;
+    r.prepared = init_controller(target) == 0;
+    r.mapped = dma::stats(target);
+    if (dma_test_controller != nullptr)
+        r.released = cleanup_controller(dma_test_controller, dma_test_controller->irq_owned);
+    else
+        r.released = r.mapped.regions == 0;
+    r.after = dma::stats(target);
+    r.bme_off = (pci::pci_config_read16(target->bus, target->slot, target->function, pci::PCI_COMMAND) & pci::PCI_COMMAND_BUS_MASTER) == 0;
+    log::info("DMA test prepared=%u fail_allocate=%u withheld=%u released=%u bme_off=%u regions=%zu->%zu pages=%zu->%zu q=%zu", r.prepared,
+              r.fail_allocate, r.withheld, r.released, r.bme_off, r.mapped.regions, r.after.regions, r.mapped.backing_pages,
+              r.after.backing_pages, r.after.quarantined);
+    dma_test_probing = false;
+    return r;
+}
+#endif
+
 auto xhci_init() -> int {
     int found = 0;
     size_t const COUNT = pci::pci_device_count();
@@ -1408,7 +1750,26 @@ auto xhci_init() -> int {
     if (found == 0) {
         log::info("no controllers found");
     }
+#ifdef WOS_SELFTEST
+    if (found != 0 && (dma_test_flag("--xhci-test-terminal") || dma_test_flag("--xhci-test-terminal-power"))) {
+        auto* task = mod::sched::task::Task::create_kernel_thread("xhci_dma_terminal", dma_terminal_runner);
+        if (task == nullptr || !mod::sched::post_task_balanced(task)) log::error("terminal fixture failed to start");
+    }
+#endif
     return found;
+}
+
+auto xhci_shutdown() -> int {
+    if (mod::sched::can_query_current_task() && !mod::mm::phys::can_wait_for_reclaim()) return -EWOULDBLOCK;
+    shutdown_started.store(true, std::memory_order_release);
+    int result = 0;
+    auto const COUNT = controller_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < COUNT; ++i) {
+        if (controllers.at(i) == nullptr) continue;
+        int const RET = retire_controller(*controllers.at(i));
+        if (RET != 0) result = RET;
+    }
+    return result;
 }
 
 }  // namespace ker::dev::usb

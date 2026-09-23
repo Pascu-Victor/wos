@@ -16,6 +16,9 @@ wos_add_unit_test(virtio_platform_test
 wos_add_unit_test(vtd_fault_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vtd_fault_test.cpp
 )
+wos_add_unit_test(xhci_dma_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/xhci_dma_test.cpp
+)
 wos_add_unit_test(e1000_dma_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/e1000_dma_test.cpp
 )

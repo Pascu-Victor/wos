@@ -16,6 +16,7 @@
 #include <net/wki/remotable.hpp>
 #include <new>  // IWYU pragma: keep
 #include <platform/dbg/dbg.hpp>
+#include <platform/ktime/ktime.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <utility>
@@ -91,6 +92,7 @@ void cdc_close(net::NetDevice* netdev) {
 }
 
 int cdc_start_xmit(net::NetDevice* netdev, net::PacketBuffer* pkt) {
+    auto const HOLD = mod::sched::hold_kernel_shutdown();
     if (pkt == nullptr) {
         return -EINVAL;
     }
@@ -288,6 +290,9 @@ auto cdc_attach(UsbDevice* dev, UsbInterfaceDescriptor* interface, uint8_t* conf
     CDC->netdev.mac.at(5) = static_cast<uint8_t>(cdc_index(*CDC));
     CDC->netdev.ops = &CDC_OPS;
     CDC->netdev.mtu = 1500;
+#ifdef WOS_SELFTEST
+    if (xhci_dma_packet_test_enabled()) CDC->netdev.mtu = 9000;
+#endif
     CDC->netdev.private_data = CDC;
     CDC->netdev.remotable = &S_REMOTABLE_OPS;
     dev->driver_data = CDC;
@@ -403,6 +408,20 @@ void cdc_detach(UsbDevice* dev) {
     cdc->state.store(CdcEtherState::FREE, std::memory_order_release);
 }
 
+auto cdc_terminal_drain(UsbDevice* dev) -> bool {
+    auto* cdc = dev != nullptr ? static_cast<CdcEtherDevice*>(dev->driver_data) : nullptr;
+    if (cdc == nullptr) return true;
+    if (cdc->state.load(std::memory_order_acquire) != CdcEtherState::RETIRING || !cdc->quiesce_proven) return false;
+    auto const START = mod::time::get_ms();
+    for (size_t n = 0; n < 10'000'000 && mod::time::get_ms() - START < 5000; ++n) {
+        if (cdc->io_readers.load(std::memory_order_acquire) == 0) return true;
+        mod::sched::kern_yield();
+    }
+    // External netdevice references can remain. Their metadata stays valid;
+    // RETIRING rejects new driver I/O, and this class slot is never recycled.
+    return cdc->io_readers.load(std::memory_order_acquire) == 0;
+}
+
 template <size_t Index>
 [[noreturn]] void cdc_rx_worker() {
     auto& cdc = cdc_devices.at(Index);
@@ -413,6 +432,7 @@ template <size_t Index>
             }
             continue;
         }
+        auto const HOLD = mod::sched::hold_kernel_shutdown();
         if (!cdc_io_try_acquire(cdc)) {
             mod::sched::kern_yield();
             continue;
@@ -460,6 +480,7 @@ UsbClassDriver cdc_driver = {
     .publish = cdc_publish,
     .quiesce = cdc_quiesce,
     .detach = cdc_detach,
+    .terminal_drain = cdc_terminal_drain,
     .next = nullptr,
 };
 
@@ -469,7 +490,8 @@ void cdc_ether_init() {
     size_t workers = 0;
     for (size_t index = 0; index < cdc_rx_tasks.size(); ++index) {
         auto* task = mod::sched::task::Task::create_kernel_thread("cdc_rx", CDC_RX_WORKERS.at(index));
-        if (task == nullptr || !mod::sched::post_task_balanced(task)) {
+        // Wakeups may outlive cooperative exit; retain before publication.
+        if (task == nullptr || !task->try_acquire() || !mod::sched::post_task_balanced(task)) {
             log::error("failed to start CDC RX worker %zu", index);
             continue;
         }

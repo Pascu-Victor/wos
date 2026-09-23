@@ -4,8 +4,11 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <dev/dma/lifecycle.hpp>
 #include <dev/pci.hpp>
+#include <dev/usb/xhci_dma.hpp>
 #include <dev/usb/xhci_lifecycle.hpp>
+#include <dev/usb/xhci_terminal.hpp>
 #include <limits>
 #include <platform/sys/spinlock.hpp>
 
@@ -39,7 +42,8 @@ constexpr uint32_t XHCI_CMD_HSEE = (1 << 3);
 
 // USBSTS bits
 constexpr uint32_t XHCI_STS_HCH = (1 << 0);  // HC Halted
-constexpr uint32_t XHCI_STS_HSE = (1 << 2);
+constexpr uint32_t XHCI_STS_HSE = 1U << 2;
+constexpr uint32_t XHCI_STS_HCE = 1U << 12;
 constexpr uint32_t XHCI_STS_EINT = (1 << 3);  // Event Interrupt
 constexpr uint32_t XHCI_STS_PCD = (1 << 4);   // Port Change Detect
 constexpr uint32_t XHCI_STS_CNR = (1 << 11);  // Controller Not Ready
@@ -293,6 +297,7 @@ struct UsbEndpoint {
     uint16_t max_packet;
     uint8_t interval;
     Trb* ring;  // transfer ring (xHCI-specific)
+    xhci_dma::Coherent ring_dma{};
     uint64_t ring_phys;
     size_t ring_enqueue;
     bool ring_cycle;
@@ -303,9 +308,7 @@ struct UsbEndpoint {
     std::atomic<bool> request_busy{false};
     std::atomic<size_t> request_index{INVALID_REQUEST_INDEX};
     std::atomic<uint32_t> request_generation{0};
-    void* request_dma{};
-    size_t request_dma_len{};
-    bool request_dir_in{};
+    xhci_dma::Streaming transfer_dma{};
 };
 
 struct UsbDevice {
@@ -318,12 +321,14 @@ struct UsbDevice {
     uint8_t device_class;
     uint8_t device_subclass;
     uint8_t device_protocol;
-    uint8_t max_packet0;
+    uint16_t max_packet0;
     std::array<UsbEndpoint, MAX_USB_ENDPOINT_CONTEXTS> endpoints{};
     uint8_t num_endpoints;
     void* dev_ctx;
+    xhci_dma::Coherent dev_ctx_dma{};
     uint64_t dev_ctx_phys;
     void* input_ctx;
+    xhci_dma::Coherent input_ctx_dma{};
     uint64_t input_ctx_phys;
     void* driver_data;
     UsbClassDriver* bound_driver;
@@ -345,6 +350,9 @@ struct UsbClassDriver {
     // False leaves the slot and its backing storage quarantined.
     bool (*quiesce)(UsbDevice*);
     void (*detach)(UsbDevice*);
+    // Bounded task-I/O drain for terminal shutdown. Keep class and netdevice
+    // metadata stable for late references; do not recycle through detach().
+    bool (*terminal_drain)(UsbDevice*);
     UsbClassDriver* next;
 };
 
@@ -370,7 +378,12 @@ struct XhciController {
     volatile uint32_t* db;   // Doorbell registers
 
     pci::PCIDevice* pci;
+    uint64_t dma_mask = UINT64_MAX;
+    std::array<xhci_dma::Coherent, xhci_dma::CAPACITY> controller_dma{};
     uint8_t irq_vector;
+    bool irq_owned = false;
+    dma::lifecycle::Admission lifecycle_admission{}, io_admission{};
+    std::atomic<xhci_terminal::State> terminal_state{xhci_terminal::State::active};
 
     // Capability info
     uint8_t max_slots;
@@ -412,6 +425,7 @@ struct XhciController {
     // fixed-capacity so IRQ completion never allocates.
     void* request_table{};
     std::atomic<bool> command_busy{false};
+    std::atomic<uint64_t> transfer_cookie{0};
     std::atomic<bool> command_quarantined{false};
     std::atomic<size_t> command_request_index{INVALID_REQUEST_INDEX};
     std::atomic<uint32_t> command_request_generation{0};
@@ -420,6 +434,7 @@ struct XhciController {
 };
 
 auto xhci_init() -> int;
+auto xhci_shutdown() -> int;
 auto xhci_default_controller() -> XhciController*;
 
 // Internal: used by USB core for transfers
@@ -432,3 +447,14 @@ auto xhci_configure_bulk_endpoints(UsbDevice* dev, const UsbEndpointDescriptor& 
                                    UsbEndpoint** bulk_in, UsbEndpoint** bulk_out) -> int;
 
 }  // namespace ker::dev::usb
+
+#ifdef WOS_SELFTEST
+namespace ker::dev::usb {
+struct XhciDmaTestResult {
+    bool found = false, prepared = false, fail_allocate = false, withheld = false, released = false, bme_off = false;
+    dma::Stats before{}, mapped{}, after{};
+};
+auto xhci_dma_selftest() -> XhciDmaTestResult;
+auto xhci_dma_packet_test_enabled() -> bool;
+}  // namespace ker::dev::usb
+#endif
