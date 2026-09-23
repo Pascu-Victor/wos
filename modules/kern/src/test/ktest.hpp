@@ -13,7 +13,7 @@ struct KTest {
 };
 
 // Implemented in ktest.cpp
-void run_all();
+void run_all(bool final_only = false);
 
 extern int g_pass;
 extern int g_fail;
@@ -90,16 +90,23 @@ inline auto check_null(const char* file, int line, const void* ptr, const char* 
 extern const ker::test::KTest __start_ktests[];
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays): Linker-provided section bounds.
 extern const ker::test::KTest __stop_ktests[];
+extern const ker::test::KTest __start_ktests_final[];
+extern const ker::test::KTest __stop_ktests_final[];
 // NOLINTEND(readability-identifier-naming)
 
 //  Declare + register a test.  The function body follows the macro.
 //  S = suite identifier, N = test identifier (no spaces, used as C names).
 //  E = enabled flag (true/false).
-#define KTEST_IMPL(S, N, E)                                                             \
+#define KTEST_SECTION(S, N, E, SECTION)                                                 \
     static void _kt_##S##_##N();                                                        \
-    [[gnu::section(".ktests"), gnu::used]]                                              \
+    [[gnu::section(SECTION), gnu::used]]                                                \
     static constexpr ker::test::KTest _ktrec_##S##_##N = {#S, #N, &_kt_##S##_##N, (E)}; \
     static void _kt_##S##_##N()
+
+#define KTEST_IMPL(S, N, E) KTEST_SECTION(S, N, E, ".ktests")
+// Destructive tests: no ordinary test runs afterward. Ordering within this
+// final phase is unspecified; each test retires only its own device family.
+#define KTEST_FINAL(S, N) KTEST_SECTION(S, N, true, ".ktests_final")
 
 #define KTEST(S, N) KTEST_IMPL(S, N, true)       // NOLINT(cppcoreguidelines-macro-usage)
 #define KTEST_OFF(S, N) KTEST_IMPL(S, N, false)  // NOLINT(cppcoreguidelines-macro-usage)

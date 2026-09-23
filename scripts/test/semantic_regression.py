@@ -33,7 +33,7 @@ HOST_CMAKE = ROOT / "tests" / "host" / "CMakeLists.txt"
 KTEST_DIR = ROOT / "modules" / "kern" / "src" / "test"
 
 KTEST_RE = re.compile(
-    r"\b(?:KTEST|KTEST_OFF)\(\s*(?P<suite>[A-Za-z_][A-Za-z0-9_]*)\s*,\s*"
+    r"\b(?:KTEST|KTEST_OFF|KTEST_FINAL)\(\s*(?P<suite>[A-Za-z_][A-Za-z0-9_]*)\s*,\s*"
     r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\)"
 )
 HOST_TARGET_RE = re.compile(

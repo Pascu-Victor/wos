@@ -322,8 +322,8 @@ def test_kernel_finalizer_sequences_teardown_sync_unmount_and_platform_action() 
                   "completion IRQs are enabled before bounded finalizer waits")
 
     sched_init_body = function_body(init_wrappers, "sched_init")
-    require_tokens(sched_init_body, ["strcmp(get_kernel_cmdline(), \"--selftest\") == 0", "mod::power::selftest_poweroff();"], "KTEST selftest poweroff call")
-    require_order(sched_init_body, "ker::test::run_all();", "mod::power::selftest_poweroff();", "KTEST powers off only after the selftest runner returns")
+    require_tokens(sched_init_body, ['cmdline_has_token(get_kernel_cmdline(), "--selftest")', "mod::power::selftest_poweroff();"], "KTEST selftest poweroff call")
+    require_order(sched_init_body, 'ker::test::run_all(cmdline_has_token(get_kernel_cmdline(), "--ahci-test-retire-only"));', "mod::power::selftest_poweroff();", "KTEST powers off only after the selftest runner returns")
     require_order(sched_init_body, "mod::power::selftest_poweroff();", "hcf();", "KTEST hcf remains fallback after poweroff")
 
 

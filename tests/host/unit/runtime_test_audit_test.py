@@ -328,6 +328,7 @@ def test_source_manifests_ignore_cxx_comments_and_literals(module) -> None:
         ktest_source.write_text(
             """
 KTEST(RealRuntimeAudit, Runs) { KEXPECT_TRUE(true); }
+KTEST_FINAL(RealRuntimeAudit, Retires) { KEXPECT_TRUE(true); }
 // KTEST(CommentGhost, ShouldNotExist) { KEXPECT_TRUE(false); }
 char const* string_ghost = "KTEST(StringGhost, ShouldNotExist) {";
 uint64_t const key = 0x00FF'FFFF'FFFF'FFFFULL;
@@ -357,7 +358,7 @@ TESTD_RUN_END(test_real)
         module.TESTD_MAIN = testd_main
         try:
             enabled, disabled = module.ktest_manifest()
-            if enabled != {"RealRuntimeAudit/Runs"} or disabled != {"DisabledRuntimeAudit/Skips"}:
+            if enabled != {"RealRuntimeAudit/Runs", "RealRuntimeAudit/Retires"} or disabled != {"DisabledRuntimeAudit/Skips"}:
                 raise AssertionError(f"unexpected synthetic KTEST manifest: enabled={enabled}, disabled={disabled}")
             labels = module.testd_expected_pass_labels()
             if labels != ["real.pass", "real.check"]:

@@ -15,7 +15,7 @@ TESTD_SRC_DIR = ROOT / "modules" / "testd" / "src"
 USERLAND_SUITE = ROOT / "configs" / "drive" / "srv" / "wos_userland_suite.sh"
 
 KTEST_DECL_RE = re.compile(
-    r"\b(?P<kind>KTEST|KTEST_OFF)\(\s*(?P<suite>[A-Za-z_][A-Za-z0-9_]*)\s*,\s*"
+    r"\b(?P<kind>KTEST|KTEST_OFF|KTEST_FINAL)\(\s*(?P<suite>[A-Za-z_][A-Za-z0-9_]*)\s*,\s*"
     r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\)\s*\{"
 )
 KTEST_LOG_PREFIX = r"(?:\[KTEST\]\s+|(?:\[[^\]]+\]\s+)?info\s+ktest:\s+)"
@@ -216,7 +216,7 @@ def ktest_manifest() -> tuple[set[str], set[str]]:
         active_source = _mask_cxx_non_code_preserve_offsets(source)
         for match in KTEST_DECL_RE.finditer(active_source):
             key = f"{match.group('suite')}/{match.group('name')}"
-            if match.group("kind") == "KTEST":
+            if match.group("kind") != "KTEST_OFF":
                 enabled.add(key)
             else:
                 disabled.add(key)

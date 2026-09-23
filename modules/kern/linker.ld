@@ -53,6 +53,13 @@ SECTIONS
         __stop_ktests = .;
     } :rodata
 
+    /* Destructive device retirement tests run after all ordinary tests. */
+    .ktests_final : {
+        __start_ktests_final = .;
+        KEEP(*(.ktests_final))
+        __stop_ktests_final = .;
+    } :rodata
+
     /* Move to the next memory page for .data */
     . = ALIGN(CONSTANT(MAXPAGESIZE));
 

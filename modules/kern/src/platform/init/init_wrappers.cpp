@@ -313,9 +313,9 @@ void sched_init() {
 
     mod::sched::setup_queues();
 #ifdef WOS_SELFTEST
-    if (strcmp(get_kernel_cmdline(), "--selftest") == 0) {
+    if (cmdline_has_token(get_kernel_cmdline(), "--selftest")) {
         mod::smt::park_secondary_cpus_for_selftest();
-        ker::test::run_all();
+        ker::test::run_all(cmdline_has_token(get_kernel_cmdline(), "--ahci-test-retire-only"));
         mod::power::selftest_poweroff();
         hcf();
     }

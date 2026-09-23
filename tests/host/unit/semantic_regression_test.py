@@ -104,6 +104,18 @@ def test_mutation_source_copy_preserves_dirty_input(module) -> None:
             raise AssertionError("mutation source copy modified the dirty input tree")
 
 
+def test_final_phase_ktests_are_registered_oracles(module) -> None:
+    with tempfile.TemporaryDirectory(prefix="semantic-final-phase-") as temporary:
+        root = Path(temporary)
+        test_dir = root / "modules" / "kern" / "src" / "test"
+        test_dir.mkdir(parents=True)
+        (test_dir / "retirement_ktest.cpp").write_text(
+            "KTEST(Ordinary, Runs) {}\nKTEST_FINAL(Device, Retires) {}\nKTEST_OFF(Disabled, Skips) {}\n"
+        )
+        if module.registered_ktests(root) != {"Ordinary/Runs", "Device/Retires", "Disabled/Skips"}:
+            raise AssertionError("final-phase KTEST was omitted from semantic oracle inventory")
+
+
 def test_repository_inventory_is_complete_and_mutants_are_fresh(module) -> None:
     inventory = module.audit(ROOT, module.POLICY_PATH, module.MUTATIONS_PATH, None)
     summary = inventory["summary"]
@@ -124,6 +136,7 @@ def main() -> None:
         test_uninvoked_standalone_test_is_a_silent_skip,
         test_exact_mutation_rejects_stale_operator_and_restores_by_value,
         test_mutation_source_copy_preserves_dirty_input,
+        test_final_phase_ktests_are_registered_oracles,
         test_repository_inventory_is_complete_and_mutants_are_fresh,
     ]
     for test in tests:

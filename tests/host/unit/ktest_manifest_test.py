@@ -16,7 +16,7 @@ KERNEL_SRC_DIR = ROOT / "modules" / "kern" / "src"
 HOST_UNIT_DIR = ROOT / "tests" / "host" / "unit"
 
 KTEST_DECL_RE = re.compile(
-    r"\b(?P<kind>KTEST|KTEST_OFF)\(\s*(?P<suite>[A-Za-z_][A-Za-z0-9_]*)\s*,\s*"
+    r"\b(?P<kind>KTEST|KTEST_OFF|KTEST_FINAL)\(\s*(?P<suite>[A-Za-z_][A-Za-z0-9_]*)\s*,\s*"
     r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\)\s*\{"
 )
 ASSERTION_RE = re.compile(r"\bK(?:EXPECT|REQUIRE)_(?:EQ|NE|TRUE|FALSE|NULL)\s*\(")
@@ -25,7 +25,7 @@ HOST_COVERAGE_RE = re.compile(r"//\s*Host coverage:\s*(?P<tests>[A-Za-z_][A-Za-z
 GTEST_RE = re.compile(
     r"\bTEST(?:_F)?\(\s*(?P<suite>[A-Za-z_][A-Za-z0-9_]*)\s*,\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\)"
 )
-KTEST_SECTION_LITERAL_RE = re.compile(r"\.ktests\b")
+KTEST_SECTION_LITERAL_RE = re.compile(r"\.ktests(?:_final)?\b")
 CXX_SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
 ASM_SOURCE_SUFFIXES = {".S", ".s", ".asm", ".nasm"}
 
@@ -281,8 +281,8 @@ def matching_close_brace(source: str, open_brace: int, path: Path) -> int:
 def parse_ktests(path: Path) -> list[KTestDecl]:
     source = path.read_text()
     active_source = mask_cxx_non_code_preserve_offsets(source)
-    if re.search(r"\bKTEST_IMPL\s*\(", active_source):
-        fail(f"{path.relative_to(ROOT)} uses raw KTEST_IMPL; use KTEST or KTEST_OFF so manifest checks can classify it")
+    if re.search(r"\b(?:KTEST_IMPL|KTEST_SECTION)\s*\(", active_source):
+        fail(f"{path.relative_to(ROOT)} uses a raw record macro; use KTEST, KTEST_FINAL or KTEST_OFF so manifest checks can classify it")
     matches = list(KTEST_DECL_RE.finditer(active_source))
     declarations: list[KTestDecl] = []
     for match in matches:
@@ -298,7 +298,7 @@ def parse_ktests(path: Path) -> list[KTestDecl]:
                 active_body=active_source[match.end() : close_brace],
             )
         )
-    raw_macro_count = len(re.findall(r"\bKTEST(?:_OFF)?\s*\(", active_source))
+    raw_macro_count = len(re.findall(r"\bKTEST(?:_OFF|_FINAL)?\s*\(", active_source))
     if raw_macro_count != len(declarations):
         fail(f"{path.relative_to(ROOT)} has KTEST-like macros the manifest parser did not understand")
     return declarations
@@ -321,6 +321,8 @@ KTEST(ParserBounds, Covered) {
     KEXPECT_TRUE(true);
 }
 
+KTEST_FINAL(ParserBounds, Final) { KEXPECT_TRUE(true); }
+
 KTEST_OFF(ParserBounds, Disabled) {
 }
 // Requires comment outside the disabled test body must not count.
@@ -329,6 +331,8 @@ KTEST_OFF(ParserBounds, Disabled) {
         )
         declarations = parse_ktests(synthetic)
     by_key = {declaration.key: declaration for declaration in declarations}
+    if by_key["ParserBounds/Final"].kind != "KTEST_FINAL":
+        fail("KTEST parser failed to retain final-phase registration")
     if ASSERTION_RE.search(by_key["ParserBounds/Empty"].active_body) is not None:
         fail("KTEST parser allowed one test body to borrow an assertion outside its matching braces")
     if ASSERTION_RE.search(by_key["ParserBounds/Covered"].active_body) is None:
@@ -356,6 +360,8 @@ def require_section_scanner_handles_comments_and_strings() -> None:
         fail("KTEST section scanner missed an active C++ section attribute")
     if KTEST_SECTION_LITERAL_RE.search(strip_cxx_comments_preserve_offsets('asm(".section .ktests");')) is None:
         fail("KTEST section scanner missed an active inline-assembly section switch")
+    if KTEST_SECTION_LITERAL_RE.search('[[gnu::section(".ktests_final"), gnu::used]] static int record;') is None:
+        fail("KTEST section scanner missed a manual final-phase record")
     if KTEST_SECTION_LITERAL_RE.search(strip_asm_comments_preserve_offsets('; .section .ktests\n')) is not None:
         fail("KTEST section scanner treated assembly comments as active code")
     if KTEST_SECTION_LITERAL_RE.search(strip_asm_comments_preserve_offsets(".section .ktests\n")) is None:
@@ -388,16 +394,23 @@ def require_ktest_section_records_only_from_macro() -> None:
             "manual .ktests linker-section records are not allowed outside KTEST_IMPL: "
             + ", ".join(offenders)
         )
-    if len(header_matches) != 1:
-        fail(f"{KTEST_HEADER.relative_to(ROOT)} must contain exactly one .ktests record owned by KTEST_IMPL")
-
-    macro_start = header_visible_source.find("#define KTEST_IMPL")
-    macro_end = header_visible_source.find("#define KTEST(S", macro_start)
-    if macro_start < 0 or macro_end < 0:
-        fail(f"{KTEST_HEADER.relative_to(ROOT)} must keep KTEST_IMPL before the public KTEST wrappers")
-    if not macro_start <= header_matches[0].start() < macro_end:
-        line = source_line(header_source, header_matches[0].start())
-        fail(f"{KTEST_HEADER.relative_to(ROOT)}:{line} has a .ktests record outside KTEST_IMPL")
+    if len(header_matches) != 2:
+        fail(f"{KTEST_HEADER.relative_to(ROOT)} must own exactly the ordinary and final section wrappers")
+    wrappers = [
+        r'#define\s+KTEST_IMPL\(S, N, E\)\s+KTEST_SECTION\(S, N, E, "\.ktests"\)',
+        r'#define\s+KTEST_FINAL\(S, N\)\s+KTEST_SECTION\(S, N, true, "\.ktests_final"\)',
+    ]
+    allowed = []
+    for pattern in wrappers:
+        match = re.search(pattern, header_visible_source)
+        if match is None:
+            fail("KTEST section wrapper is missing or bypasses the shared record macro")
+        allowed.append((match.start(), match.end()))
+    for match in header_matches:
+        if not any(start <= match.start() < end for start, end in allowed):
+            fail("KTEST section record appears outside the canonical wrappers")
+    if '[[gnu::section(SECTION), gnu::used]]' not in header_visible_source:
+        fail("KTEST shared record macro must retain the selected section")
 
     linker_source = KTEST_LINKER.read_text()
     required_tokens = [
@@ -405,6 +418,7 @@ def require_ktest_section_records_only_from_macro() -> None:
         "__start_ktests = .;",
         "KEEP(*(.ktests))",
         "__stop_ktests = .;",
+        ".ktests_final :", "__start_ktests_final = .;", "KEEP(*(.ktests_final))", "__stop_ktests_final = .;",
     ]
     missing = [token for token in required_tokens if token not in linker_source]
     if missing:
@@ -455,7 +469,7 @@ def require_enabled_tests_have_assertions(declarations: list[KTestDecl]) -> None
     missing = [
         f"{declaration.key} at {declaration.path.relative_to(ROOT)}:{declaration.line}"
         for declaration in declarations
-        if declaration.kind == "KTEST" and ASSERTION_RE.search(declaration.active_body) is None
+        if declaration.kind != "KTEST_OFF" and ASSERTION_RE.search(declaration.active_body) is None
     ]
     if missing:
         fail("enabled KTESTs without KEXPECT/KREQUIRE assertions: " + ", ".join(missing))
@@ -534,6 +548,11 @@ def require_runner_uses_linker_section() -> None:
         "g_fail++",
         "panic_handler(\"selftest: failures detected\")",
     ]
+    ordinary = source.find("run_range(__start_ktests, __stop_ktests)")
+    final = source.find("run_range(__start_ktests_final, __stop_ktests_final)")
+    summary = source.find('=== %d passed, %d failed ===')
+    if not (0 <= ordinary < final < summary):
+        fail("KTEST final phase must follow ordinary tests and precede summary")
     missing = [token for token in required_tokens if token not in source]
     if missing:
         fail("KTEST runner is missing expected linker-section execution tokens: " + ", ".join(missing))
@@ -567,7 +586,7 @@ def main() -> None:
     require_runner_uses_linker_section()
     require_selftest_build_toggle()
 
-    enabled = sum(1 for declaration in declarations if declaration.kind == "KTEST")
+    enabled = sum(1 for declaration in declarations if declaration.kind != "KTEST_OFF")
     disabled = len(declarations) - enabled
     print(f"{enabled} enabled KTESTs and {disabled} disabled KTESTs have manifest coverage")
 

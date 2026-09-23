@@ -48,7 +48,7 @@ void check_null_log(const char* file, int line, const void* ptr, const char* pex
                        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(ptr)));
 }
 
-void run_all() {
+void run_all(bool final_only) {
     ker::mod::dbg::log("[KTEST] === WOS Kernel Self-Test Suite ===");
     g_pass = 0;
     g_fail = 0;
@@ -62,29 +62,32 @@ void run_all() {
     ker::sanitizer::kcov::enable();
 #endif
 
-    const KTest* ktest_begin = __start_ktests;  // NOLINT(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
-    const KTest* ktest_end = __stop_ktests;     // NOLINT(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
-    for (const KTest* t = ktest_begin; t < ktest_end; ++t) {
-        if (t->fn == nullptr || t->suite == nullptr || t->name == nullptr) {
-            continue;
-        }  // skip sentinel entries
-        if (!t->enabled) {
-            ker::mod::dbg::log("[KTEST] SKIP  %s/%s", t->suite, t->name);
-            continue;
+    auto run_range = [](const KTest* begin, const KTest* end) {
+        for (const KTest* t = begin; t < end; ++t) {
+            if (t->fn == nullptr || t->suite == nullptr || t->name == nullptr) {
+                continue;
+            }  // skip sentinel entries
+            if (!t->enabled) {
+                ker::mod::dbg::log("[KTEST] SKIP  %s/%s", t->suite, t->name);
+                continue;
+            }
+            int const PASS_BEFORE = g_pass;
+            int const FAIL_BEFORE = g_fail;
+            ker::mod::dbg::log("[KTEST] RUN   %s/%s", t->suite, t->name);
+            t->fn();
+            if (g_pass == PASS_BEFORE && g_fail == FAIL_BEFORE) {
+                ker::mod::dbg::log("[KTEST] FAIL  %s/%s: no assertions executed", t->suite, t->name);
+                g_fail++;
+                continue;
+            }
+            if (g_fail == FAIL_BEFORE) {
+                ker::mod::dbg::log("[KTEST] PASS  %s/%s", t->suite, t->name);
+            }
         }
-        int const PASS_BEFORE = g_pass;
-        int const FAIL_BEFORE = g_fail;
-        ker::mod::dbg::log("[KTEST] RUN   %s/%s", t->suite, t->name);
-        t->fn();
-        if (g_pass == PASS_BEFORE && g_fail == FAIL_BEFORE) {
-            ker::mod::dbg::log("[KTEST] FAIL  %s/%s: no assertions executed", t->suite, t->name);
-            g_fail++;
-            continue;
-        }
-        if (g_fail == FAIL_BEFORE) {
-            ker::mod::dbg::log("[KTEST] PASS  %s/%s", t->suite, t->name);
-        }
-    }
+    };
+    if (!final_only) run_range(__start_ktests, __stop_ktests);
+    ker::mod::dbg::logger<"ktest">::info("device retirement phase; final_only=%u", static_cast<unsigned>(final_only));
+    run_range(__start_ktests_final, __stop_ktests_final);
 
 #ifdef WOS_KCOV
     ker::sanitizer::kcov::disable();
