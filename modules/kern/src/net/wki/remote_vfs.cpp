@@ -197,6 +197,15 @@ static_assert(OPEN_REQ_INLINE_CAPACITY <= WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqP
 constexpr uint16_t OPEN_RESP_NO_STAT_LEN = static_cast<uint16_t>(offsetof(OpenRespPayload, stat));
 constexpr uint16_t OPEN_RESP_WITH_STAT_LEN = static_cast<uint16_t>(offsetof(OpenRespPayload, prefetched_bytes));
 constexpr uint16_t OPEN_RESP_WITH_PREFETCH_LEN = static_cast<uint16_t>(sizeof(OpenRespPayload));
+static_assert(offsetof(OpenRespPayload, stat) == 6);
+
+void remote_vfs_store_open_stat(RemoteFileContext* ctx, const OpenRespPayload& response) {
+    // The wire member starts at byte six. Never bind it to a Stat reference:
+    // even an aligned response object cannot provide the member's alignment.
+    ker::vfs::Stat stat{};
+    std::memcpy(&stat, reinterpret_cast<const uint8_t*>(&response) + offsetof(OpenRespPayload, stat), sizeof(stat));
+    remote_vfs_store_cached_stat(ctx, stat);
+}
 
 auto scalar_open_response_valid(int status, const uint8_t* data, size_t length, size_t capacity) -> bool {
     if (status < 0) return length == 0;
@@ -10634,7 +10643,7 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             ker::vfs::Stat open_stat = {};
             if (ker::vfs::vfs_fstat_file(file, &open_stat) == 0) {
                 open_resp.has_stat = 1;
-                open_resp.stat = open_stat;
+                std::memcpy(reinterpret_cast<uint8_t*>(&open_resp) + offsetof(OpenRespPayload, stat), &open_stat, sizeof(open_stat));
             }
 
             if (prefetch_rkey != 0 && prefetch_len > 0 && open_resp.has_stat != 0 &&
@@ -13968,7 +13977,7 @@ auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode,
     file->dir_fs_count = static_cast<size_t>(-1);  // Unknown FS entry count
 
     if ((flags & ker::vfs::O_NO_CACHE) == 0 && open_resp_len >= OPEN_RESP_WITH_STAT_LEN && open_resp.has_stat != 0) {
-        remote_vfs_store_cached_stat(ctx, open_resp.stat);
+        remote_vfs_store_open_stat(ctx, open_resp);
     }
     if (valid_prefetched_bytes > 0) {
         auto* prefetch_copy = new (std::nothrow) uint8_t[valid_prefetched_bytes];
@@ -15839,8 +15848,25 @@ auto wki_remote_vfs_selftest_open_reply_admission() -> bool {
     WkiHeader header{};
     header.src_node = 42;
     header.channel_id = 77;
-    OpenRespPayload reply{};
+    alignas(ker::vfs::Stat) OpenRespPayload reply{};
     reply.fd = 23;
+    // Exercise the real cache publication path with a deliberately unaligned
+    // wire member. Diagnostic builds must not bind that member by reference.
+    RemoteFileContext cache_context{};
+    ker::vfs::Stat expected_stat{};
+    expected_stat.st_dev = 0x123456789abcdef0;
+    expected_stat.st_ino = 0xfedcba9876543210;
+    expected_stat.st_mode = ker::vfs::S_IFREG | 0640;
+    expected_stat.st_size = 524288;
+    expected_stat.st_mtim = {123456789, 987654321};
+    std::memcpy(reinterpret_cast<uint8_t*>(&reply) + offsetof(OpenRespPayload, stat), &expected_stat, sizeof(expected_stat));
+    remote_vfs_store_open_stat(&cache_context, reply);
+    ker::vfs::Stat cached_stat{};
+    if (!remote_vfs_try_copy_cached_stat(&cache_context, &cached_stat) || cached_stat.st_dev != expected_stat.st_dev ||
+        cached_stat.st_ino != expected_stat.st_ino || cached_stat.st_mode != expected_stat.st_mode ||
+        cached_stat.st_size != expected_stat.st_size || cached_stat.st_mtim.tv_sec != expected_stat.st_mtim.tv_sec ||
+        cached_stat.st_mtim.tv_nsec != expected_stat.st_mtim.tv_nsec)
+        return false;
     auto check = [&](uint16_t operation, int16_t status, uint16_t length, int expected, bool ignored = false,
                      uint16_t capacity = sizeof(OpenRespPayload), bool trailing = false, bool stale_cookie = false,
                      bool stale_generation = false, uint16_t inner = 0, uint64_t challenge = 0, const void* body = nullptr) -> bool {

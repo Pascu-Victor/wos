@@ -1246,7 +1246,7 @@ def test_server_open_reuses_the_open_file_stat_snapshot() -> None:
             "ker::vfs::vfs_open_file_resolved_beneath_as(*worker, mapped_credentials, export_path, full_path.data()",
             "ker::vfs::vfs_fstat_file(file, &open_stat)",
             "open_resp.has_stat = 1",
-            "open_resp.stat = open_stat",
+            "std::memcpy(reinterpret_cast<uint8_t*>(&open_resp) + offsetof(OpenRespPayload, stat), &open_stat, sizeof(open_stat))",
             "if (prefetch_rkey != 0",
             "reservation.publish(file, 0, 0, 0, ordinary_token, ordinary_binding_id)",
             "open_resp.fd = fd_id",
