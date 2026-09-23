@@ -46,6 +46,9 @@ wos_add_unit_test(iommu_scopes_test
 wos_add_unit_test(vtd_activation_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vtd_activation_test.cpp
 )
+wos_add_unit_test(dma_manager_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/dma_manager_test.cpp
+)
 wos_add_fuzz_target(dmar_fuzz
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/dmar_fuzz.cpp
 )
