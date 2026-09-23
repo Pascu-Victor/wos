@@ -336,12 +336,12 @@ def build_qemu_args(
     serial_log.parent.mkdir(parents=True, exist_ok=True)
 
     if tcg_level is not None:
-        accel_args = ["-accel", "tcg,thread=multi", "-cpu", "max"]
+        accel_args = ["-accel", "tcg,thread=multi", "-cpu", str(vm_cfg.get("cpu", "max"))]
         log_flags = TCG_LOG_LEVELS.get(tcg_level, TCG_LOG_LEVELS[""])
         qemu_log = qemu_log_path(spec, tcg_level=tcg_level)
         log(f"  [VM{nid}] Using TCG (software emulation) - level: {tcg_level or 'default'}")
     else:
-        accel_args = ["-cpu", "host,migratable=no,+invtsc", "--enable-kvm"]
+        accel_args = ["-cpu", str(vm_cfg.get("cpu", "host,migratable=no,+invtsc")), "--enable-kvm"]
         log_flags = "cpu_reset,guest_errors"
         qemu_log = qemu_log_path(spec)
 

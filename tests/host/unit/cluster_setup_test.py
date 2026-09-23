@@ -25,6 +25,7 @@ WKI_CHAOS_CONFIGS = {
 ROUTED_WKI_CHAOS_CONFIG = ROOT / "configs" / "cluster_wki_chaos_routed.json"
 ROOTLESS_WKI_AUTH_CONFIG = ROOT / "configs" / "cluster_wki_auth_rootless.json"
 ROOTLESS_WKI_AUTH_MIXED_CONFIG = ROOT / "configs" / "cluster_wki_auth_mixed_rootless.json"
+ROOTLESS_KTEST_CONFIG = ROOT / "configs" / "node_ktest_rootless.json"
 BENCHMARK_LAYOUTS = {
     1: [(32, 32768)],
     2: [(16, 16384), (16, 16384)],
@@ -1539,6 +1540,40 @@ def test_ktest_node_conversion_preserves_rootless_backend(module) -> None:
     assert_equal(backend["port"], 47920, "conversion owns its backend copy")
 
 
+def test_rootless_ktest_config_has_no_host_link_dependency(module) -> None:
+    raw = module.node_setup.load_json_config(ROOTLESS_KTEST_CONFIG)
+    spec = module.node_setup.normalize_node_spec(raw)
+    assert_equal(len(spec["nics"]), 2, "rootless KTEST NIC count")
+    for nic in spec["nics"]:
+        assert_equal(nic["queues"], 1, "rootless KTEST queue count")
+        assert_equal(nic["vhost"], False, "rootless KTEST vhost")
+        assert_equal(nic["qemu_netdev"]["type"], "socket-mcast", "rootless KTEST backend")
+
+    config = module.node_setup.cluster_config_from_node_spec(spec)
+    module.validate_cluster_config(config)
+    old_link = module.link_json
+    module.link_json = lambda _name: (_ for _ in ()).throw(AssertionError("rootless KTEST probed host links"))
+    try:
+        module.validate_no_setup_topology(config)
+    finally:
+        module.link_json = old_link
+
+
+def test_node_cpu_model_override_is_exact(module) -> None:
+    node = module.node_setup
+    old_prepare, old_cleanup = node.prepare_node_overlays, node.cleanup_node_logs
+    node.prepare_node_overlays = lambda _spec, log=print: (Path("disk0-overlay"), Path("disk1-overlay"))
+    node.cleanup_node_logs = lambda _spec: None
+    try:
+        model = "host,migratable=no,+invtsc,-smep,-smap"
+        kvm_args = node.build_qemu_args({"vm": {"cpu": model}}, log=lambda _line: None)
+        assert_equal(kvm_args[kvm_args.index("-cpu") + 1], model, "KVM CPU model override")
+        tcg_args = node.build_qemu_args({"vm": {"cpu": "qemu64"}}, tcg_level="", log=lambda _line: None)
+        assert_equal(tcg_args[tcg_args.index("-cpu") + 1], "qemu64", "TCG CPU model override")
+    finally:
+        node.prepare_node_overlays, node.cleanup_node_logs = old_prepare, old_cleanup
+
+
 def test_iommu_option_is_explicit_and_validated_before_disk_work(module) -> None:
     node_setup = module.node_setup
     old_prepare = node_setup.prepare_node_overlays
@@ -1599,6 +1634,7 @@ def main() -> None:
     module = load_module()
     tests = [
         test_ivshmem_modes_share_the_node_launcher,
+        test_node_cpu_model_override_is_exact,
         test_iommu_option_is_explicit_and_validated_before_disk_work,
         test_topology_probe_is_timeout_bounded,
         test_no_setup_topology_accepts_configured_links,
@@ -1624,6 +1660,7 @@ def main() -> None:
         test_rootless_wki_auth_mixed_config_validates_shared_memory,
         test_socket_multicast_backend_validation_qemu_and_no_setup,
         test_ktest_node_conversion_preserves_rootless_backend,
+        test_rootless_ktest_config_has_no_host_link_dependency,
         test_launch_one_vm_wraps_overlay_creation_failure_without_popen,
         test_wait_for_launched_vms_reaps_and_reports_nonzero_nodes,
         test_cluster_main_preserves_vm_exit_error_for_incident,

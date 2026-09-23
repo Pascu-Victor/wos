@@ -56,9 +56,15 @@
                 "tap": "wos-lan-N0",
                 "mac": "52:54:00:10:00:00",
                 "model": "virtio-net-pci",
-                "queues": 2,
+                "queues": 1,
                 "vhost": false,
                 "driver": "dhcp",
+                "qemu_netdev": {
+                    "type": "socket-mcast",
+                    "address": "239.192.89.20",
+                    "port": 47840,
+                    "localaddr": "127.0.0.1"
+                },
                 "bridge": {
                     "stp": false,
                     "ip": "10.10.0.100/24",
@@ -71,9 +77,15 @@
                 "tap": "wos-wki-N0",
                 "mac": "52:54:00:11:00:00",
                 "model": "virtio-net-pci",
-                "queues": 2,
+                "queues": 1,
                 "vhost": false,
                 "driver": "wki",
+                "qemu_netdev": {
+                    "type": "socket-mcast",
+                    "address": "239.192.89.21",
+                    "port": 47841,
+                    "localaddr": "127.0.0.1"
+                },
                 "bridge": {
                     "stp": false,
                     "ip": null
