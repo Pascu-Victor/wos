@@ -18,6 +18,7 @@
 #include <util/hcf.hpp>
 #ifdef WOS_KASAN
 #include <sanitizer/kasan.hpp>
+#include <sanitizer/stack_resume.hpp>
 #endif
 
 #include "platform/acpi/apic/apic.hpp"
@@ -32,6 +33,18 @@
 #include "platform/sys/signal.hpp"
 
 namespace ker::mod::sys::context_switch {
+#ifdef WOS_KASAN
+// Called only from the final assembly return tail on the incoming stack.
+// A blocked task can reach idle without unwinding the timer's C++ frames;
+// their shadow must not poison later calls on the resumed task's stack.
+extern "C" __attribute__((no_sanitize("address", "undefined", "coverage"))) void wos_kasan_prepare_kernel_resume(uint64_t resume_rsp) {
+    auto* const TASK = sched::get_return_task();
+    if (TASK == nullptr || !kasan::is_enabled()) return;
+    auto const RANGE = kasan::stack_resume_range(TASK->context.syscall_kernel_stack, mm::KERNEL_STACK_SIZE, resume_rsp);
+    if (RANGE.size != 0) kasan::unpoison_range(reinterpret_cast<void*>(RANGE.begin), RANGE.size);
+}
+#endif
+
 extern "C" void wos_kernel_idle_loop();                               // NOLINT(readability-identifier-naming)
 extern "C" void wos_kernel_idle_loop_end();                           // NOLINT(readability-identifier-naming)
 extern "C" void wos_kernel_thread_trampoline();                       // NOLINT(readability-identifier-naming)

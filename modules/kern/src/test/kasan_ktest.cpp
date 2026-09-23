@@ -49,4 +49,19 @@ KTEST(Kasan, RedzonePoisonPreservesPartialPrefix) {
     KEXPECT_TRUE(is_poisoned(storage, 17));
     KEXPECT_TRUE(is_poisoned(storage, 23));
 }
+KTEST(Kasan, AlignedUnpoisonPreservesAdjacentShadowAcrossPages) {
+    // Four shadow pages exercise the bulk path; the first/last application
+    // granules remain poisoned around the exact cleared interior.
+    alignas(8) std::array<uint8_t, 131088> storage{};
+    auto* const BEGIN = storage.data();
+    ker::mod::kasan::poison_range(BEGIN, storage.size(), ker::mod::kasan::SHADOW_HEAP_FREED);
+    ker::mod::kasan::unpoison_range(BEGIN + 8, storage.size() - 16);
+    KEXPECT_TRUE(__asan_address_is_poisoned(BEGIN) != 0);
+    KEXPECT_TRUE(__asan_address_is_poisoned(BEGIN + 7) != 0);
+    for (size_t offset : {size_t{8}, size_t{32767}, size_t{32768}, size_t{65536}, storage.size() - 9})
+        KEXPECT_TRUE(__asan_address_is_poisoned(BEGIN + offset) == 0);
+    KEXPECT_TRUE(__asan_address_is_poisoned(BEGIN + storage.size() - 8) != 0);
+    KEXPECT_TRUE(__asan_address_is_poisoned(BEGIN + storage.size() - 1) != 0);
+    ker::mod::kasan::unpoison_range(BEGIN, storage.size());
+}
 #endif

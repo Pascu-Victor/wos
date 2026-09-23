@@ -254,6 +254,13 @@ void unpoison_range(const void* ptr, size_t size) {
 
     auto const START = reinterpret_cast<uintptr_t>(ptr);
     uintptr_t const END = START + size;
+    // Whole granules need exactly one zero shadow byte per eight data bytes.
+    // Kernel resume clears a large retired-stack extent with interrupts off;
+    // use the excluded scalar/rep-stos runtime instead of an O0 per-granule walk.
+    if ((START & 7U) == 0 && (size & 7U) == 0 && END > START) {
+        std::memset(addr_to_shadow(START), SHADOW_ACCESSIBLE, size / 8);
+        return;
+    }
     for (uintptr_t granule = START & ~0x7ULL; granule < END; granule += 8) {
         uintptr_t const ACCESS_START = START > granule ? START : granule;
         uintptr_t const GRANULE_END = granule + 8;

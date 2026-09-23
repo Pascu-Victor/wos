@@ -1,8 +1,12 @@
+wos_add_unit_test(stack_resume_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/stack_resume_test.cpp
+)
 # ---------------------------------------------------------------------------
 # Unit tests
 # ---------------------------------------------------------------------------
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+
 
 wos_add_unit_test(time_arithmetic_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/time_arithmetic_test.cpp
@@ -200,6 +204,10 @@ add_test(
 add_test(
     NAME init_supervisor_docs_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/init_supervisor_docs_source_test.py
+)
+add_test(
+    NAME stack_resume_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/stack_resume_source_test.py
 )
 add_test(
     NAME shutdown_source_test
@@ -654,6 +662,7 @@ set_tests_properties(
     init_source_test
     service_manifest_config_source_test
     init_supervisor_docs_source_test
+    stack_resume_source_test
     shutdown_source_test
     init_control_source_test
     wos_resolve_test

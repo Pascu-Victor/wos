@@ -15,6 +15,9 @@ extern wos_user_handoff_stack_top
 extern wos_restore_return_task_fpu
 extern wos_discard_abandoned_return_fpu_state
 extern deferred_task_switch
+%ifdef WOS_KASAN
+extern wos_kasan_prepare_kernel_resume
+%endif
 
 ; Same-CPL iretq consumes only RIP/CS/RFLAGS, but the scheduler and panic
 ; diagnostics treat the memory below the saved RSP as GPRegs + InterruptFrame.
@@ -46,6 +49,10 @@ extern deferred_task_switch
 
     mov rsp, r10
     sub rsp, 8
+%ifdef WOS_KASAN
+    lea rdi, [rsp + 8 + KERNEL_RETURN_BLOCK_SIZE]
+    call wos_kasan_prepare_kernel_resume
+%endif
     call wos_commit_handoff_task
     add rsp, 8
     popq
@@ -80,6 +87,10 @@ extern deferred_task_switch
 
     mov rsp, r10
     sub rsp, 8
+%ifdef WOS_KASAN
+    lea rdi, [rsp + 8 + KERNEL_RETURN_BLOCK_SIZE]
+    call wos_kasan_prepare_kernel_resume
+%endif
     call wos_commit_handoff_task
     add rsp, 8
     popq
