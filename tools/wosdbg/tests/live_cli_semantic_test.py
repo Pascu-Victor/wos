@@ -21,6 +21,7 @@ import json
 import os
 import re
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -54,6 +55,10 @@ LIVE_TOOLS = {
     "wosdbg.capture_live_incident",
 }
 MUTATING_RSP_PREFIXES = ("G", "P", "M", "X", "Z", "z", "c", "s", "vCont", "k", "D")
+KERNEL_DEBUG_METADATA_ADDRESS = 0xFFFFFE0000000000
+KERNEL_DEBUG_METADATA_MAGIC = 0x574F534B44424731
+KERNEL_DEBUG_METADATA_VERSION = 1
+KERNEL_DEBUG_METADATA_FORMAT = "<QII10QIB3x32s"
 
 
 class TestFailure(RuntimeError):
@@ -262,9 +267,11 @@ class FakeRsp:
     )
     REGISTER_BYTES = bytes.fromhex("44332211" "0020000000000000" "3412000000000000" "0200")
 
-    def __init__(self, build_id: str, *, fault: str | None = None) -> None:
+    def __init__(self, build_id: str, *, fault: str | None = None, raw_kernel_base: int | None = None, entry_offset: int = 0x1234) -> None:
         self.build_id = build_id
         self.fault = fault
+        self.raw_kernel_base = raw_kernel_base
+        self.entry_offset = entry_offset
         self.commands: list[str] = []
         self.error: BaseException | None = None
         self._stop = threading.Event()
@@ -306,6 +313,31 @@ class FakeRsp:
             sort_keys=True,
         ).encode("ascii")
 
+    def kernel_debug_metadata(self) -> bytes:
+        require(self.raw_kernel_base is not None, "raw metadata requested without a kernel base")
+        base = self.raw_kernel_base
+        build_id = bytes.fromhex(self.build_id)
+        require(0 < len(build_id) <= 32, "test build ID does not fit kernel metadata")
+        return struct.pack(
+            KERNEL_DEBUG_METADATA_FORMAT,
+            KERNEL_DEBUG_METADATA_MAGIC,
+            KERNEL_DEBUG_METADATA_VERSION,
+            struct.calcsize(KERNEL_DEBUG_METADATA_FORMAT),
+            base,
+            base + 0x500000,
+            base,
+            base + 0x200000,
+            base + 0x200000,
+            base + 0x300000,
+            base + 0x300000,
+            base + 0x500000,
+            base + self.entry_offset,
+            base + 0x310000,
+            0x3,
+            len(build_id),
+            build_id.ljust(32, b"\0"),
+        )
+
     @staticmethod
     def xfer(command: str, payload: bytes) -> bytes:
         match = re.fullmatch(r"qXfer:[^:]+:read:[^:]*:([0-9a-fA-F]+),([0-9a-fA-F]+)", command)
@@ -316,7 +348,8 @@ class FakeRsp:
 
     def response(self, command: str) -> bytes:
         if command.startswith("qSupported:"):
-            return b"PacketSize=2000;qXfer:features:read+;qXfer:wos-images:read+;QStartNoAckMode+"
+            images = b"" if self.raw_kernel_base is not None else b";qXfer:wos-images:read+"
+            return b"PacketSize=2000;qXfer:features:read+;QStartNoAckMode+" + images
         if command == "QStartNoAckMode":
             return b"OK"
         if command.startswith("qXfer:features:read:target.xml:"):
@@ -336,6 +369,10 @@ class FakeRsp:
         memory = re.fullmatch(r"m([0-9a-fA-F]+),([0-9a-fA-F]+)", command)
         if memory:
             address, length = (int(value, 16) for value in memory.groups())
+            metadata = self.kernel_debug_metadata() if self.raw_kernel_base is not None else b""
+            if KERNEL_DEBUG_METADATA_ADDRESS <= address and address + length <= KERNEL_DEBUG_METADATA_ADDRESS + len(metadata):
+                offset = address - KERNEL_DEBUG_METADATA_ADDRESS
+                return metadata[offset : offset + length].hex().encode("ascii")
             return bytes((address + index) & 0xFF for index in range(length)).hex().encode("ascii")
         if command == "?":
             return b"T05"
@@ -748,6 +785,61 @@ def run_happy(binary: Path, build_id: str, timeout: float) -> None:
         assert_qmp_lease(qmp, owned=True)
 
 
+def run_raw_qemu_relocation(binary: Path, build_id: str, timeout: float) -> None:
+    for index, load_base in enumerate((0xFFFFFFFF92000000, 0xFFFFFFFFB4000000)):
+        with tempfile.TemporaryDirectory(prefix=f"wosdbg-live-raw-qemu-{index}-") as raw_root:
+            root = Path(raw_root)
+            text_offset = 0x1000
+            qmp = FakeQmp(root / "qmp.sock", running=True)
+            rsp = FakeRsp(build_id, raw_kernel_base=load_base, entry_offset=text_offset)
+            try:
+                write_config(root, [runtime_target("raw-qemu", "5", qmp, rsp, binary, build_id)], binary)
+                _, results = invoke_batch(
+                    binary,
+                    cwd=root,
+                    timeout=timeout,
+                    calls=[
+                        call("discover", "discover_live_targets"),
+                        call("open", "open_live_session", open_arguments(targetId="raw-qemu")),
+                        call(
+                            "resolve",
+                            "resolve_live_address",
+                            {
+                                "sessionId": "$open.sessionId",
+                                "leaseToken": "$open.leaseToken",
+                                "targetId": "raw-qemu",
+                                "address": hex(load_base + text_offset),
+                            },
+                        ),
+                        call(
+                            "close",
+                            "close_live_session",
+                            {"sessionId": "$open.sessionId", "leaseToken": "$open.leaseToken"},
+                        ),
+                    ],
+                )
+                for label in ("discover", "open", "resolve", "close"):
+                    success(results[label], f"raw QEMU {label}")
+                opened = results["open"].get("targets", [{}])[0]
+                require(opened.get("remoteBuildId") == build_id, f"raw metadata build ID mismatch: {opened}")
+                require(opened.get("symbolsQuarantined") is False, f"raw metadata symbols quarantined: {opened}")
+                resolved = results["resolve"]
+                require(int(str(resolved.get("objectAddress")), 16) == text_offset, f"raw metadata slide was not removed: {resolved}")
+                require(resolved.get("verified") is True, f"relocated address was not verified: {resolved}")
+                require(
+                    any(command.startswith(f"m{KERNEL_DEBUG_METADATA_ADDRESS:x},") for command in rsp.commands),
+                    f"fixed kernel metadata was not read: {rsp.commands}",
+                )
+                require(
+                    not any(command.startswith("qXfer:wos-images:read::") for command in rsp.commands),
+                    "raw QEMU unexpectedly used an image catalog",
+                )
+            finally:
+                rsp.close()
+                qmp.close()
+            assert_qmp_lease(qmp, owned=True)
+
+
 def run_initially_paused(binary: Path, build_id: str, timeout: float) -> None:
     with tempfile.TemporaryDirectory(prefix="wosdbg-live-paused-") as raw_root:
         root = Path(raw_root)
@@ -859,7 +951,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--wosdbg", type=Path, default=DEFAULT_WOSDBG, help="WOSDBG executable to exercise")
     parser.add_argument(
         "--mode",
-        choices=("all", "happy", "paused", "rollback", "faults"),
+        choices=("all", "happy", "raw-qemu", "paused", "rollback", "faults"),
         default="all",
         help="bounded scenario group to run",
     )
@@ -886,6 +978,8 @@ def main(argv: list[str]) -> int:
     build_id = elf_build_id(binary)
     if args.mode in {"all", "happy"}:
         run_happy(binary, build_id, args.timeout)
+    if args.mode in {"all", "raw-qemu"}:
+        run_raw_qemu_relocation(binary, build_id, args.timeout)
     if args.mode in {"all", "paused"}:
         run_initially_paused(binary, build_id, args.timeout)
     if args.mode in {"all", "rollback"}:

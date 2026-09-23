@@ -1,6 +1,5 @@
 #include "live_session_manager.h"
 
-#include <elf.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -18,6 +17,7 @@
 #include <QRandomGenerator>
 #include <QRegularExpression>
 #include <QSet>
+#include <abi/kernel_debug_metadata.hpp>
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -45,67 +45,6 @@ constexpr int MAX_LOG_PATHS = 32;
 constexpr int MAX_OWNER_BYTES = 160;
 constexpr int MAX_BACKTRACE_FRAMES = 128;
 constexpr uint64_t MAX_FRAME_POINTER_STEP = 16ULL * 1024 * 1024;
-
-struct ElfBuildIdNote {
-    uint64_t runtime_address = 0;
-    QByteArray bytes;
-};
-
-auto local_elf_build_id_note(const QString& path) -> std::optional<ElfBuildIdNote> {
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly)) {
-        return std::nullopt;
-    }
-    const QByteArray header_bytes = file.read(sizeof(Elf64_Ehdr));
-    Elf64_Ehdr header{};
-    if (header_bytes.size() != sizeof(header)) {
-        return std::nullopt;
-    }
-    std::memcpy(&header, header_bytes.constData(), sizeof(header));
-    if (std::memcmp(header.e_ident, ELFMAG, SELFMAG) != 0 || header.e_ident[EI_CLASS] != ELFCLASS64 ||
-        header.e_ident[EI_DATA] != ELFDATA2LSB || header.e_phentsize != sizeof(Elf64_Phdr) || header.e_phnum == 0 || header.e_phnum > 256) {
-        return std::nullopt;
-    }
-    if (!file.seek(static_cast<qint64>(header.e_phoff))) {
-        return std::nullopt;
-    }
-    const qsizetype program_size = static_cast<qsizetype>(header.e_phnum) * static_cast<qsizetype>(sizeof(Elf64_Phdr));
-    const QByteArray program_bytes = file.read(program_size);
-    if (program_bytes.size() != program_size) {
-        return std::nullopt;
-    }
-    for (uint16_t index = 0; index < header.e_phnum; ++index) {
-        Elf64_Phdr program{};
-        std::memcpy(&program, program_bytes.constData() + static_cast<qsizetype>(index) * sizeof(program), sizeof(program));
-        if (program.p_type != PT_NOTE || program.p_filesz == 0 || program.p_filesz > 64 * 1024 ||
-            program.p_offset > static_cast<uint64_t>(file.size()) ||
-            program.p_filesz > static_cast<uint64_t>(file.size()) - program.p_offset || !file.seek(static_cast<qint64>(program.p_offset))) {
-            continue;
-        }
-        const QByteArray notes = file.read(static_cast<qint64>(program.p_filesz));
-        qsizetype offset = 0;
-        while (offset <= notes.size() - static_cast<qsizetype>(sizeof(Elf64_Nhdr))) {
-            Elf64_Nhdr note{};
-            std::memcpy(&note, notes.constData() + offset, sizeof(note));
-            offset += sizeof(note);
-            const uint64_t name_padded = (static_cast<uint64_t>(note.n_namesz) + 3U) & ~3ULL;
-            const uint64_t descriptor_padded = (static_cast<uint64_t>(note.n_descsz) + 3U) & ~3ULL;
-            if (name_padded > static_cast<uint64_t>(notes.size() - offset) ||
-                descriptor_padded > static_cast<uint64_t>(notes.size() - offset) - name_padded) {
-                break;
-            }
-            const QByteArray name = notes.sliced(offset, note.n_namesz);
-            const qsizetype descriptor_offset = offset + static_cast<qsizetype>(name_padded);
-            if (note.n_type == NT_GNU_BUILD_ID && name.startsWith("GNU") && note.n_descsz > 0 && note.n_descsz <= 64 &&
-                program.p_vaddr <= std::numeric_limits<uint64_t>::max() - static_cast<uint64_t>(descriptor_offset)) {
-                return ElfBuildIdNote{.runtime_address = program.p_vaddr + static_cast<uint64_t>(descriptor_offset),
-                                      .bytes = notes.sliced(descriptor_offset, note.n_descsz)};
-            }
-            offset = descriptor_offset + static_cast<qsizetype>(descriptor_padded);
-        }
-    }
-    return std::nullopt;
-}
 
 [[noreturn]] void fail(LiveSessionErrorCode code, const QString& message) { throw LiveSessionError(code, message); }
 
@@ -745,19 +684,68 @@ class LiveSessionManager::Impl final {
                     connection.quarantine_reason = "remote-image-catalog-unavailable";
                     return;
                 }
-                const auto note = local_elf_build_id_note(connection.target.settings.symbol_path);
-                if (!note) {
-                    connection.quarantine_reason = "local-build-id-note-unavailable";
+                QByteArray bytes;
+                try {
+                    bytes = connection.rsp->read_memory(wos::abi::KERNEL_DEBUG_METADATA_ADDRESS,
+                                                        static_cast<qsizetype>(sizeof(wos::abi::KernelDebugMetadata)), context);
+                } catch (const ProtocolError&) {
+                    connection.quarantine_reason = "kernel-debug-metadata-unavailable";
                     return;
                 }
-                const QByteArray remote = connection.rsp->read_memory(note->runtime_address, note->bytes.size(), context);
-                if (remote != note->bytes || QString::fromLatin1(remote.toHex()).toLower() != connection.target.local_build_id) {
+                if (bytes.size() != static_cast<qsizetype>(sizeof(wos::abi::KernelDebugMetadata))) {
+                    connection.quarantine_reason = "kernel-debug-metadata-truncated";
+                    return;
+                }
+                wos::abi::KernelDebugMetadata metadata{};
+                std::memcpy(&metadata, bytes.constData(), sizeof(metadata));
+                const bool VALID_LAYOUT = metadata.magic == wos::abi::KERNEL_DEBUG_METADATA_MAGIC &&
+                                          metadata.version == wos::abi::KERNEL_DEBUG_METADATA_VERSION &&
+                                          metadata.size == static_cast<uint32_t>(sizeof(metadata)) &&
+                                          (metadata.flags & wos::abi::KERNEL_DEBUG_METADATA_EXACT_MAPPING) != 0U &&
+                                          (metadata.flags & wos::abi::KERNEL_DEBUG_METADATA_BUILD_ID_PRESENT) != 0U &&
+                                          metadata.build_id_size > 0 && metadata.build_id_size <= wos::abi::KERNEL_DEBUG_BUILD_ID_MAX &&
+                                          (metadata.load_base & 0xfffU) == 0U && metadata.load_base >= 0xffff800000000000ULL &&
+                                          metadata.load_base <= metadata.text_start && metadata.text_start < metadata.text_end &&
+                                          metadata.text_end <= metadata.rodata_start && metadata.rodata_start < metadata.rodata_end &&
+                                          metadata.rodata_end <= metadata.data_start && metadata.data_start < metadata.data_end &&
+                                          metadata.data_end == metadata.image_end && metadata.entry >= metadata.text_start &&
+                                          metadata.entry < metadata.text_end && metadata.dynamic_addr >= metadata.data_start &&
+                                          metadata.dynamic_addr < metadata.data_end;
+                if (!VALID_LAYOUT) {
+                    connection.quarantine_reason = "kernel-debug-metadata-invalid";
+                    return;
+                }
+                const QByteArray remote_build_id(reinterpret_cast<const char*>(metadata.build_id), metadata.build_id_size);
+                QString expected = connection.target.settings.expected_build_id;
+                if (expected.isEmpty()) {
+                    expected = connection.target.local_build_id;
+                }
+                const QString remote_build_id_hex = QString::fromLatin1(remote_build_id.toHex()).toLower();
+                if (remote_build_id_hex != expected || connection.target.local_build_id != expected ||
+                    connection.target.local_symbol_status.startsWith("quarantined")) {
                     connection.quarantine_reason = "remote-build-id-mismatch";
                     return;
                 }
-                connection.remote_build_id = connection.target.local_build_id;
-                connection.symbols = wosdbg::load_symbols_from_file(connection.target.settings.symbol_path);
-                connection.sections = wosdbg::load_sections_from_file(connection.target.settings.symbol_path);
+                connection.remote_build_id = remote_build_id_hex;
+                connection.symbol_load_base = metadata.load_base;
+                connection.images = {
+                    .source = "kernel-debug-metadata",
+                    .snapshot_status = "complete",
+                    .snapshot_status_code = 0,
+                    .record_size = static_cast<qint64>(sizeof(metadata)),
+                    .images = {ImageCatalogEntry{.path_bytes = QByteArray("/boot/wos"),
+                                                 .load_base = metadata.load_base,
+                                                 .image_start = metadata.load_base,
+                                                 .image_end = metadata.image_end,
+                                                 .text_address = metadata.text_start,
+                                                 .text_size = metadata.text_end - metadata.text_start,
+                                                 .entry = metadata.entry,
+                                                 .dynamic_address = metadata.dynamic_addr,
+                                                 .flags = metadata.flags,
+                                                 .build_id = remote_build_id}},
+                };
+                connection.symbols = wosdbg::load_symbols_from_file(connection.target.settings.symbol_path, metadata.load_base);
+                connection.sections = wosdbg::load_sections_from_file(connection.target.settings.symbol_path, metadata.load_base);
                 if (!connection.symbols && !connection.sections) {
                     connection.quarantine_reason = "local-symbols-unavailable";
                 }

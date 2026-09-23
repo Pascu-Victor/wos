@@ -2887,6 +2887,13 @@ auto DebugAnalysisService::open_coredump_file(const QString& resolved_path, cons
         }
     }
     discover_modules(*session, allow_external_discovery);
+    if (std::ranges::any_of(session->modules,
+                            [](const DumpSession::LoadedModule& module) { return module.role == "kernel" && module.exact_mapping; })) {
+        // The cataloged kernel module owns the verified, load-biased symbol
+        // view. Never leave an unrelocated ET_DYN fallback in the lookup set.
+        session->kernel_symbols.reset();
+        session->kernel_sections.reset();
+    }
     if (session->binary_build_id_status == "mismatch") {
         session->symbol_status = "build-id-mismatch";
     } else if (session->binary_symbols) {
@@ -2959,8 +2966,9 @@ void DebugAnalysisService::add_module(DumpSession& session, const QString& path,
                                        ACTUAL_BUILD_ID.compare(session.embedded_build_id, Qt::CaseInsensitive) == 0;
     bool const BUILD_ID_MATCHED_RECORDED =
         !RECORDED_BUILD_ID.isEmpty() && !ACTUAL_BUILD_ID.isEmpty() && RECORDED_BUILD_ID.compare(ACTUAL_BUILD_ID, Qt::CaseInsensitive) == 0;
+    bool const LEGACY_EXPLICIT_KERNEL = role == "kernel" && recorded == nullptr;
     bool const SYMBOL_SOURCE_TRUSTED =
-        FILE_AVAILABLE && (EMBEDDED || memory_matched || role == "kernel" || BUILD_ID_MATCHED_MAIN || BUILD_ID_MATCHED_RECORDED);
+        FILE_AVAILABLE && (EMBEDDED || memory_matched || LEGACY_EXPLICIT_KERNEL || BUILD_ID_MATCHED_MAIN || BUILD_ID_MATCHED_RECORDED);
     uint64_t first = 0;
     uint64_t end = 0;
     if (recorded != nullptr) {
@@ -3026,9 +3034,6 @@ void DebugAnalysisService::add_module(DumpSession& session, const QString& path,
                              : EMBEDDED       ? "embedded"
                                               : "unverified";
     module.address_model = INFO.type == 3 ? "runtime = elf_vaddr + load_base" : "absolute ELF virtual addresses";
-    if (role == "kernel") {
-        module.address_model = "absolute linked kernel virtual addresses";
-    }
     module.memory_matched = memory_matched;
     module.exact_mapping = recorded != nullptr;
     if (SYMBOL_SOURCE_TRUSTED) {
@@ -3042,8 +3047,17 @@ void DebugAnalysisService::discover_modules(DumpSession& session, bool allow_ext
     if (!session.dump->modules.empty()) {
         constexpr uint32_t IMAGE_MAIN = 1U << 0;
         constexpr uint32_t IMAGE_INTERPRETER = 1U << 1;
+        constexpr uint32_t IMAGE_KERNEL = 1U << 5;
+        bool kernel_cataloged = false;
         auto catalog_candidates = [&](const wosdbg::CoreDumpModule& module) {
             QStringList candidates;
+            if ((module.flags & IMAGE_KERNEL) != 0U) {
+                if (!session.kernel_elf_path.isEmpty()) {
+                    candidates << session.kernel_elf_path;
+                }
+                candidates << QDir::current().absoluteFilePath("build/modules/kern/wos")
+                           << QDir::current().absoluteFilePath("build-ktest/modules/kern/wos");
+            }
             QString guest_path = module.path;
             while (guest_path.startsWith('/')) {
                 guest_path.remove(0, 1);
@@ -3074,6 +3088,9 @@ void DebugAnalysisService::discover_modules(DumpSession& session, bool allow_ext
                 role = "main";
             } else if ((recorded.flags & IMAGE_INTERPRETER) != 0U) {
                 role = "interpreter";
+            } else if ((recorded.flags & IMAGE_KERNEL) != 0U) {
+                role = "kernel";
+                kernel_cataloged = true;
             }
 
             QString selected;
@@ -3093,7 +3110,7 @@ void DebugAnalysisService::discover_modules(DumpSession& session, bool allow_ext
             }
             add_module(session, selected, role, recorded.load_base, memory_matched, &recorded);
         }
-        if (!session.kernel_elf_path.isEmpty()) {
+        if (!kernel_cataloged && !session.kernel_elf_path.isEmpty()) {
             add_module(session, session.kernel_elf_path, "kernel", 0, true);
         }
         std::ranges::sort(session.modules, [](const DumpSession::LoadedModule& a, const DumpSession::LoadedModule& b) {

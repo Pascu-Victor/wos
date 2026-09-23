@@ -156,6 +156,9 @@ target_link_libraries(wosdbg_worker
 )
 
 # Include directories for main executable
+target_include_directories(wosdbg_core PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../modules/kern/src
+)
 target_include_directories(wosdbg_core PUBLIC
     ${CAPSTONE_INCLUDE_DIRS}
     ${LIBARCHIVE_INCLUDE_DIRS}

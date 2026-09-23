@@ -516,7 +516,13 @@ CoreDumpParseResult parse_core_dump_checked(const QByteArray& data, const CoreDu
                             QString("module %1 build-ID size %2 exceeds %3").arg(i).arg(BUILD_ID_SIZE).arg(MODULE_BUILD_ID_MAX),
                             MOFF_U64 + 60);
             }
-            if (module.image_start >= module.image_end || module.image_end > 0x0000800000000000ULL) {
+            constexpr uint32_t IMAGE_KERNEL = 1U << 5;
+            constexpr uint64_t LOWER_CANONICAL_END = 0x0000800000000000ULL;
+            constexpr uint64_t HIGHER_CANONICAL_START = 0xFFFF800000000000ULL;
+            bool const KERNEL_IMAGE = (module.flags & IMAGE_KERNEL) != 0U;
+            bool const VALID_ADDRESS_HALF =
+                KERNEL_IMAGE ? module.image_start >= HIGHER_CANONICAL_START : module.image_end <= LOWER_CANONICAL_END;
+            if (module.image_start >= module.image_end || !VALID_ADDRESS_HALF) {
                 return fail(CoreDumpParseStatus::CORRUPT, QString("module %1 has an invalid runtime image range").arg(i), MOFF_U64 + 8);
             }
             bool const EMPTY_TEXT = module.text_start == 0 && module.text_end == 0;

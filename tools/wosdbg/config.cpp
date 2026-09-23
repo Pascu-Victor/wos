@@ -217,8 +217,10 @@ void Config::load_defaults() {
     // Example: User space applications (typical range)
     // address_lookups.emplace_back(0x400000, 0x800000, "./build/modules/init/init");
 
-    // Example: Kernel space (x86_64 typical kernel range)
-    address_lookups.emplace_back(0xffffffff80000000ULL, 0xffffffffffffffffULL, "./build/modules/kern/wos");
+    // Do not install a fixed-base kernel lookup: the kernel is ET_DYN and its
+    // load bias changes each boot. Live and coredump image catalogs provide
+    // the exact base plus build ID; an explicit legacy lookup remains possible
+    // for deterministic no-KASLR captures.
 
     // Example: Shared libraries (typical range)
     address_lookups.emplace_back(0x7f0000000000ULL, 0x7fffffffULL, "./build/lib/libc.so");
