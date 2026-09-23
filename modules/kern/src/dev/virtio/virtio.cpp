@@ -1,10 +1,8 @@
 #include "virtio.hpp"
 
 #include <cstdint>
-#include <cstring>
 #include <mod/io/port/port.hpp>
-#include <platform/mm/page_alloc.hpp>
-#include <platform/mm/phys.hpp>
+#include <new>
 
 #include "net/packet.hpp"
 #include "platform/dbg/dbg.hpp"
@@ -12,13 +10,6 @@
 namespace ker::dev::virtio {
 
 using log = ker::mod::dbg::logger<"virtio">;
-
-namespace {
-// Align value up to alignment boundary
-constexpr size_t PAGE_SIZE = 4096;
-
-constexpr auto align_up(size_t val, size_t align) -> size_t { return (val + align - 1) & ~(align - 1); }
-}  // namespace
 
 auto virtq_desc_size(uint16_t qsz) -> size_t { return sizeof(VirtqDesc) * qsz; }
 
@@ -30,38 +21,21 @@ auto virtq_used_size(uint16_t qsz) -> size_t {
     return (sizeof(uint16_t) * 3) + (sizeof(VirtqUsedElem) * qsz);  // flags + idx + ring[qsz] + avail_event
 }
 
-auto virtq_total_size(uint16_t qsz) -> size_t {
-    // Descriptor table, then available ring (aligned to 2), then used ring (aligned to 4096)
-    size_t const DESC_AVAIL = align_up(virtq_desc_size(qsz) + virtq_avail_size(qsz), PAGE_SIZE);
-    return DESC_AVAIL + align_up(virtq_used_size(qsz), PAGE_SIZE);
-}
+auto virtq_total_size(uint16_t qsz) -> size_t { return managed::layout(qsz).bytes; }
 
-auto virtq_alloc(uint16_t size) -> Virtqueue* {
-    if (size == 0 || size > VIRTQ_MAX_SIZE) {
-        log::warn("virtq_alloc: invalid size %u (max %u)", size, VIRTQ_MAX_SIZE);
-        return nullptr;
-    }
-
-    log::debug("virtq_alloc: sizeof(Virtqueue)=%u, using new", sizeof(Virtqueue));
-    // Allocate the Virtqueue control structure with zero initialization
-    auto* vq = new Virtqueue{};
-
-    // Allocate physically contiguous memory for descriptor table + rings
-    size_t const TOTAL = virtq_total_size(size);
-    size_t const ALLOC_BYTES = align_up(TOTAL, PAGE_SIZE);
-
-    log::debug("virtq_alloc: size=%u, total=%zu bytes, alloc=%zu bytes", size, TOTAL, ALLOC_BYTES);
-
-    auto* mem = ker::mod::mm::phys::page_alloc(ker::mod::mm::PhysicalPageOwner::DEVICE_VIRTIO, ALLOC_BYTES, "virtio_queue");
-    if (mem == nullptr) {
-        log::warn("virtq_alloc: page_alloc(%zu) failed", ALLOC_BYTES);
+auto virtq_alloc(const pci::PCIDevice* device, uint16_t size, QueueKind kind, uint64_t mask) -> Virtqueue* {
+    auto const LAYOUT = managed::layout(size);
+    if (LAYOUT.bytes == 0 || (kind != QueueKind::control && kind != QueueKind::receive && kind != QueueKind::transmit)) return nullptr;
+    auto* vq = new (std::nothrow) Virtqueue{};
+    if (vq == nullptr) return nullptr;
+    managed::DmaApi api;
+    if (!vq->ring.allocate(api, device, LAYOUT.bytes, mask)) {
         delete vq;
         return nullptr;
     }
-    std::memset(mem, 0, ALLOC_BYTES);
+    auto* base = reinterpret_cast<uint8_t*>(vq->ring.allocation.cpu);
 
-    auto* base = reinterpret_cast<uint8_t*>(mem);
-
+    vq->kind = kind;
     vq->size = size;
     vq->num_free = size;
     vq->free_head = 0;
@@ -69,10 +43,9 @@ auto virtq_alloc(uint16_t size) -> Virtqueue* {
 
     // Layout: desc table | avail ring | (align 4096) | used ring
     vq->desc = reinterpret_cast<VirtqDesc*>(base);
-    vq->avail = reinterpret_cast<VirtqAvail*>(base + virtq_desc_size(size));
+    vq->avail = reinterpret_cast<VirtqAvail*>(base + LAYOUT.available);
 
-    size_t const USED_OFFSET = align_up(virtq_desc_size(size) + virtq_avail_size(size), PAGE_SIZE);
-    vq->used = reinterpret_cast<VirtqUsed*>(base + USED_OFFSET);
+    vq->used = reinterpret_cast<VirtqUsed*>(base + LAYOUT.used);
 
     // Initialize free list: each descriptor points to the next
     for (uint16_t i = 0; i < size - 1; i++) {
@@ -80,122 +53,171 @@ auto virtq_alloc(uint16_t size) -> Virtqueue* {
     }
     vq->desc[size - 1].next = VIRTQ_NO_BUF;  // End of free list
 
-    // Clear packet map
-    for (auto*& pkt : vq->pkt_map) {
-        pkt = nullptr;
+    if (kind != QueueKind::control) {
+        auto const DIRECTION = kind == QueueKind::receive ? dma::Direction::from_device : dma::Direction::to_device;
+        for (uint16_t i = 0; i < size; ++i) {
+            // Descriptor addresses are 64-bit even on the legacy transport;
+            // its narrower PFN mask applies only to the split ring itself.
+            auto const RESULT = dma::allocate_streaming(device, ker::net::PKT_BUF_SIZE, DIRECTION);
+            if (RESULT.error != dma::Error::none) {
+                (void)virtq_retire(vq, false);
+                return nullptr;
+            }
+            vq->packet_dma[i].allocation = RESULT.allocation;
+        }
     }
-
+    if (!vq->ring.prepare(api)) {
+        (void)virtq_retire(vq, false);
+        return nullptr;
+    }
     return vq;
 }
 
-auto virtq_add_buf(Virtqueue* vq, uint64_t phys, uint32_t len, uint16_t flags, ker::net::PacketBuffer* pkt) -> int {
-    if (vq == nullptr || vq->size == 0 || vq->size > VIRTQ_MAX_SIZE) {
-        return -1;
+auto virtq_retire(Virtqueue*& vq, bool quiesced) -> bool {
+    if (vq == nullptr) return true;
+    // Boot/task only, after draining every software reader. A failed reset
+    // conservatively pins the entire exposed queue, including idle slots.
+    bool const CAN_RELEASE = quiesced || !vq->ring.exposed;
+    bool released = true;
+    for (size_t i = 0; i < vq->packet_dma.size(); ++i) {
+        auto& slot = vq->packet_dma[i];
+        if (slot.allocation.handle.generation == 0) continue;
+        bool borrow_detached = slot.submission.sequence == 0;
+        bool retired = false;
+        if (CAN_RELEASE) {
+            if (slot.submission.sequence != 0) {
+                auto const PROOF = quiesced ? dma::Retirement::device_quiesced : dma::Retirement::never_submitted;
+                if (dma::complete(slot.submission, 0, PROOF) == dma::Error::none) {
+                    slot.submission = {};
+                    borrow_detached = true;
+                }
+            }
+            if (borrow_detached && dma::release(slot.allocation.handle) == dma::Error::none) {
+                slot.allocation = {};
+                retired = true;
+            }
+        }
+        if (!retired) {
+            // Quarantine detaches the borrowed CPU packet; hardware can only
+            // touch the exclusive bounce pages retained by the DMA registry.
+            borrow_detached = dma::quarantine(slot.allocation.handle) == dma::Error::quarantined;
+            released = false;
+        }
+        if (borrow_detached && vq->pkt_map[i] != nullptr) {
+            ker::net::pkt_free(vq->pkt_map[i]);
+            vq->pkt_map[i] = nullptr;
+        }
     }
-    if (vq->num_free == 0) {
-        return -1;
+    for (auto* pkt : vq->pkt_map)
+        if (pkt != nullptr) released = false;
+    managed::DmaApi api;
+    if (!released) {
+        (void)dma::quarantine(vq->ring.allocation.handle);
+        return false;
     }
-    if (vq->num_free > vq->size) {
-        log::error("virtq_add_buf: corrupt free count q=%u free=%u size=%u", vq->queue_index, vq->num_free, vq->size);
-        vq->num_free = 0;
-        vq->free_head = VIRTQ_NO_BUF;
-        return -1;
-    }
+    if (!vq->ring.retire(api, quiesced)) return false;
+    delete vq;
+    vq = nullptr;
+    return true;
+}
 
+namespace {
+auto fail_queue(Virtqueue* vq, const char* reason) -> int {
+    if (!vq->failed.exchange(true, std::memory_order_acq_rel))
+        log::error("virtqueue stopped q=%u: %s; outstanding DMA retained until reset", vq->queue_index, reason);
+    return -1;
+}
+}  // namespace
+
+auto virtq_add_buf(Virtqueue* vq, std::span<std::byte> buffer, ker::net::PacketBuffer* pkt) -> int {
+    if (vq == nullptr || vq->size == 0 || vq->size > VIRTQ_MAX_SIZE || vq->kind == QueueKind::control ||
+        vq->failed.load(std::memory_order_acquire) || pkt == nullptr || buffer.empty())
+        return -1;
+    // Keep packet metadata/lifetime callbacks outside every DMA binding.
+    auto const START = reinterpret_cast<uintptr_t>(pkt->storage.data());
+    auto const ADDRESS = reinterpret_cast<uintptr_t>(buffer.data());
+    if (ADDRESS < START || ADDRESS - START >= ker::net::PKT_BUF_SIZE || buffer.size() > ker::net::PKT_BUF_SIZE - (ADDRESS - START))
+        return -1;
+    if (vq->num_free == 0) return -1;
+    if (vq->num_free > vq->size) return fail_queue(vq, "invalid free count");
     uint16_t const IDX = vq->free_head;
-    if (IDX >= vq->size) {
-        log::error("virtq_add_buf: corrupt free_head q=%u head=%u size=%u free=%u", vq->queue_index, IDX, vq->size, vq->num_free);
-        vq->num_free = 0;
-        vq->free_head = VIRTQ_NO_BUF;
-        return -1;
-    }
+    if (IDX >= vq->size) return fail_queue(vq, "invalid free head");
     uint16_t const NEXT = vq->desc[IDX].next;
-    if (vq->num_free > 1 && (NEXT >= vq->size || NEXT == IDX)) {
-        log::error("virtq_add_buf: corrupt free next q=%u head=%u next=%u size=%u free=%u", vq->queue_index, IDX, NEXT, vq->size,
-                   vq->num_free);
-        vq->num_free = 0;
-        vq->free_head = VIRTQ_NO_BUF;
-        return -1;
+    if ((vq->num_free > 1 && (NEXT >= vq->size || NEXT == IDX)) || (vq->num_free == 1 && NEXT != VIRTQ_NO_BUF))
+        return fail_queue(vq, "invalid free link");
+    auto& slot = vq->packet_dma[IDX];
+    if (vq->pkt_map[IDX] != nullptr || slot.submission.sequence != 0) return fail_queue(vq, "free descriptor still owned");
+    auto const DIRECTION = vq->kind == QueueKind::receive ? dma::Direction::from_device : dma::Direction::to_device;
+    if (dma::bind_streaming(slot.allocation.handle, buffer, DIRECTION) != dma::Error::none) return fail_queue(vq, "streaming bind failed");
+    auto const SUBMISSION = dma::prepare(slot.allocation.handle);
+    if (SUBMISSION.error != dma::Error::none) {
+        // Bind succeeded under sole queue ownership; a failed prepare has not
+        // exposed this packet. Consume that CPU borrow before caller frees it.
+        (void)dma::quarantine(slot.allocation.handle);
+        return fail_queue(vq, "streaming prepare failed");
     }
-    if (vq->pkt_map.at(IDX) != nullptr) {
-        log::error("virtq_add_buf: free descriptor still mapped q=%u idx=%u", vq->queue_index, IDX);
-        vq->num_free = 0;
-        vq->free_head = VIRTQ_NO_BUF;
-        return -1;
-    }
-
+    slot.submission = SUBMISSION.submission;
     vq->free_head = (vq->num_free == 1) ? VIRTQ_NO_BUF : NEXT;
-    vq->num_free--;
-
-    vq->desc[IDX].addr = phys;
-    vq->desc[IDX].len = len;
-    vq->desc[IDX].flags = flags;
+    --vq->num_free;
+    vq->desc[IDX].addr = slot.submission.address;
+#ifdef WOS_SELFTEST
+    if (vq->kind == QueueKind::transmit && vq->selftest_address != 0) vq->desc[IDX].addr = vq->selftest_address;
+#endif
+    vq->desc[IDX].len = static_cast<uint32_t>(slot.submission.size);
+    vq->desc[IDX].flags = vq->kind == QueueKind::receive ? VRING_DESC_F_WRITE : 0;
     vq->desc[IDX].next = 0;
-
-    vq->pkt_map.at(IDX) = pkt;
-
-    // Add to available ring
+    vq->pkt_map[IDX] = pkt;
     uint16_t const AVAIL_IDX = vq->avail->idx;
     vq->avail->ring[AVAIL_IDX % vq->size] = IDX;
-    // Memory barrier: ensure descriptor and ring entries are written before idx update
     __atomic_thread_fence(__ATOMIC_RELEASE);
     vq->avail->idx = AVAIL_IDX + 1;
-
     return static_cast<int>(IDX);
 }
 
 auto virtq_get_buf(Virtqueue* vq, uint32_t* out_len) -> uint16_t {
-    if (vq == nullptr || vq->size == 0 || vq->size > VIRTQ_MAX_SIZE) {
+    if (vq == nullptr || vq->size == 0 || vq->size > VIRTQ_MAX_SIZE || vq->kind == QueueKind::control ||
+        vq->failed.load(std::memory_order_acquire))
         return VIRTQ_NO_BUF;
-    }
+    // Ring backing is page-aligned: packed idx at byte 2 is an aligned x86
+    // 16-bit load. Acquire follows the producer index, before reading its entry.
+    uint16_t const USED_RING_IDX = static_cast<volatile VirtqUsed*>(vq->used)->idx;
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
-    uint16_t const USED_RING_IDX = vq->used->idx;
-
-    // Check if there are consumed buffers
-    if (vq->last_used_idx == USED_RING_IDX) {
-        return VIRTQ_NO_BUF;
-    }
-
+    if (vq->last_used_idx == USED_RING_IDX) return VIRTQ_NO_BUF;
+    auto bad = [&](const char* reason) -> uint16_t {
+        (void)fail_queue(vq, reason);
+        return VIRTQ_BAD_BUF;
+    };
+    auto const PENDING = static_cast<uint16_t>(USED_RING_IDX - vq->last_used_idx);
+    if (vq->num_free >= vq->size || PENDING > vq->size - vq->num_free) return bad("invalid used count");
     uint16_t const USED_IDX = vq->last_used_idx % vq->size;
-    auto& elem = vq->used->ring[USED_IDX];
-
+    volatile auto const& elem = vq->used->ring[USED_IDX];
     uint32_t const DESC_ID = elem.id;
-    if (out_len != nullptr) {
-        *out_len = elem.len;
-    }
-
-    vq->last_used_idx++;
-
-    if (DESC_ID >= vq->size) {
-        log::error("virtq_get_buf: invalid used descriptor q=%u idx=%u size=%u len=%u", vq->queue_index, DESC_ID, vq->size, elem.len);
-        return VIRTQ_BAD_BUF;
-    }
-
-    auto desc_idx = static_cast<uint16_t>(DESC_ID);
-    if (vq->num_free >= vq->size) {
-        log::error("virtq_get_buf: free list overflow q=%u idx=%u free=%u size=%u", vq->queue_index, desc_idx, vq->num_free, vq->size);
-        return VIRTQ_BAD_BUF;
-    }
-    if (vq->pkt_map.at(desc_idx) == nullptr) {
-        log::error("virtq_get_buf: used descriptor not mapped q=%u idx=%u", vq->queue_index, desc_idx);
-        return VIRTQ_BAD_BUF;
-    }
-
-    // Return descriptor to free list
-    vq->desc[desc_idx].next = vq->free_head;
-    vq->free_head = desc_idx;
-    vq->num_free++;
-
-    return desc_idx;
+    uint32_t const LENGTH = elem.len;
+    if (DESC_ID >= vq->size) return bad("invalid used descriptor");
+    auto const IDX = static_cast<uint16_t>(DESC_ID);
+    auto& slot = vq->packet_dma[IDX];
+    if (vq->pkt_map[IDX] == nullptr || slot.submission.sequence == 0) return bad("duplicate or unowned completion");
+    if (vq->kind == QueueKind::receive && LENGTH > slot.submission.size) return bad("oversized receive completion");
+    // Legacy TX used lengths are unreliable; no device-writable TX bytes exist.
+    size_t const COPIED = vq->kind == QueueKind::receive ? LENGTH : 0;
+    if (dma::complete(slot.submission, COPIED, dma::Retirement::command_completed) != dma::Error::none)
+        return bad("streaming completion failed");
+    slot.submission = {};
+    ++vq->last_used_idx;
+    vq->desc[IDX].next = vq->free_head;
+    vq->free_head = IDX;
+    ++vq->num_free;
+    if (out_len != nullptr) *out_len = vq->kind == QueueKind::receive ? LENGTH : 0;
+    return IDX;
 }
 
 void virtq_kick(Virtqueue* vq) {
+    if (vq->failed.load(std::memory_order_acquire)) return;
     __atomic_thread_fence(__ATOMIC_RELEASE);
-    if (vq->notify_addr != nullptr) {
+    if (vq->notify_addr != nullptr)
         *vq->notify_addr = vq->queue_index;
-    } else {
+    else
         ::outw(vq->io_base + VIRTIO_REG_QUEUE_NOTIFY, vq->queue_index);
-    }
 }
 
 }  // namespace ker::dev::virtio

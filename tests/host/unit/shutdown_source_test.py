@@ -307,6 +307,8 @@ def test_kernel_finalizer_sequences_teardown_sync_unmount_and_platform_action() 
         ("ker::vfs::vfs_shutdown_unmount_all(current_root_path())", "smt::halt_other_cores();", "root unmount before CPU quiesce"),
         ("ker::vfs::vfs_shutdown_unmount_all(current_root_path())", "ker::dev::ahci::ahci_shutdown()", "AHCI retirement follows root unmount"),
         ("ker::dev::ahci::ahci_shutdown()", "smt::halt_other_cores();", "AHCI readers drain before CPU halt"),
+        ("ker::dev::ahci::ahci_shutdown()", "ker::dev::virtio::virtio_net_shutdown()", "NIC retirement follows final storage I/O"),
+        ("ker::dev::virtio::virtio_net_shutdown()", "smt::halt_other_cores();", "NIC readers drain before CPU halt"),
         ("smt::halt_other_cores();", "platform_reboot();", "CPU quiesce before platform reboot"),
     ]:
         require_order(run_body, first, second, context)

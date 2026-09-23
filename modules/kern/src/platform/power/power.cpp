@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <dev/ahci.hpp>
+#include <dev/virtio/virtio_net.hpp>
 #include <mod/io/port/port.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/acpi/power.hpp>
@@ -205,6 +206,10 @@ void io_delay_loop() {
     int const AHCI_RET = ker::dev::ahci::ahci_shutdown();
     clear_current_finalizer_sched_state();
     if (AHCI_RET != 0) log::warn("AHCI shutdown returned %d; unproven DMA backing retained", AHCI_RET);
+
+    int const VIRTIO_RET = ker::dev::virtio::virtio_net_shutdown();
+    clear_current_finalizer_sched_state();
+    if (VIRTIO_RET != 0) log::warn("virtio shutdown returned %d; unproven DMA backing retained", VIRTIO_RET);
 
     g_phase.store(ShutdownPhase::CPU_QUIESCE, std::memory_order_release);
     clear_current_finalizer_sched_state();

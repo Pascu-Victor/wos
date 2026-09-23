@@ -10,6 +10,9 @@ wos_add_fuzz_target(pci_ecam_fuzz
 wos_add_unit_test(pci_ecam_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/pci_ecam_test.cpp
 )
+wos_add_unit_test(virtio_platform_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/virtio_platform_test.cpp
+)
 wos_add_unit_test(vtd_fault_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vtd_fault_test.cpp
 )
@@ -18,6 +21,17 @@ wos_add_unit_test(stack_resume_test
 )
 wos_add_unit_test(shutdown_ownership_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/shutdown_ownership_test.cpp
+)
+wos_add_unit_test(virtio_lifecycle_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/virtio_lifecycle_test.cpp
+)
+wos_add_unit_test(virtqueue_dma_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/virtqueue_dma_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/dev/virtio/virtio.cpp
+)
+target_include_directories(virtqueue_dma_test BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit/virtqueue_dma_shim)
+wos_add_unit_test(virtio_dma_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/virtio_dma_test.cpp
 )
 wos_add_unit_test(ahci_lifecycle_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/ahci_lifecycle_test.cpp

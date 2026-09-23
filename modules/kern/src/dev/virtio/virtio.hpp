@@ -1,10 +1,14 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <dev/virtio/platform_features.hpp>
+#include <dev/virtio/virtio_dma.hpp>
 #include <net/packet.hpp>
 #include <platform/sys/spinlock.hpp>
+#include <span>
 
 namespace ker::dev::virtio {
 
@@ -57,7 +61,6 @@ constexpr uint8_t VIRTIO_PCI_CAP_VNDR = 0x09;  // PCI vendor cap ID
 constexpr uint8_t VIRTIO_PCI_CAP_COMMON_CFG = 1;
 constexpr uint8_t VIRTIO_PCI_CAP_NOTIFY_CFG = 2;
 constexpr uint8_t VIRTIO_PCI_CAP_DEVICE_CFG = 4;
-constexpr uint32_t VIRTIO_F_VERSION_1 = (1U << 0);  // bit 0 of upper features word
 
 // Modern virtio common configuration MMIO layout (virtio 1.0  4.1.4.3)
 struct VirtioModernCfg {
@@ -115,6 +118,8 @@ static_assert(sizeof(VirtIONetHeaderMergeableRx) == 12);
 
 constexpr size_t VIRTIO_NET_HDR_SIZE = sizeof(VirtIONetHeader);
 constexpr size_t VIRTIO_NET_HDR_SIZE_MRG_RXBUF = sizeof(VirtIONetHeaderMergeableRx);
+// Modern virtio includes num_buffers even when mergeable RX is not negotiated.
+constexpr size_t VIRTIO_NET_HDR_SIZE_MODERN = sizeof(VirtIONetHeaderMergeableRx);
 
 // Virtqueue structures (packed to match hardware layout)
 struct VirtqDesc {
@@ -150,7 +155,20 @@ constexpr uint16_t VIRTQ_MAX_SIZE = 256;
 constexpr uint16_t VIRTQ_NO_BUF = 0xFFFF;
 constexpr uint16_t VIRTQ_BAD_BUF = 0xFFFE;
 
+enum class QueueKind : uint8_t { control, receive, transmit };
+struct PacketDmaSlot {
+    dma::Allocation allocation{};
+    dma::Submission submission{};
+};
+
 struct Virtqueue {
+#ifdef WOS_SELFTEST
+    // TX lock held; consumed before publishing avail. Never set in normal I/O.
+    uint64_t selftest_address = 0;
+#endif
+    QueueKind kind = QueueKind::control;
+    std::atomic<bool> failed{false};
+    std::array<PacketDmaSlot, VIRTQ_MAX_SIZE> packet_dma{};
     uint16_t size;           // Number of descriptors
     uint16_t num_free;       // Free descriptors count
     uint16_t free_head;      // Head of free descriptor list
@@ -167,12 +185,15 @@ struct Virtqueue {
     uint16_t queue_index;              // Which queue (0=RX, 1=TX, ...)
     volatile uint16_t* notify_addr{};  // Modern MMIO notify addr; nullptr = legacy I/O
 
+    managed::Region ring;
     ker::mod::sys::Spinlock lock;
 };
 
 // Virtqueue management
-auto virtq_alloc(uint16_t size) -> Virtqueue*;
-auto virtq_add_buf(Virtqueue* vq, uint64_t phys, uint32_t len, uint16_t flags, ker::net::PacketBuffer* pkt) -> int;
+auto virtq_alloc(const pci::PCIDevice* device, uint16_t size, QueueKind kind, uint64_t mask = UINT64_MAX) -> Virtqueue*;
+// Probe-only before IRQ/NAPI publication, or after a separate reader drain.
+[[nodiscard]] auto virtq_retire(Virtqueue*& vq, bool quiesced) -> bool;
+auto virtq_add_buf(Virtqueue* vq, std::span<std::byte> buffer, ker::net::PacketBuffer* pkt) -> int;
 auto virtq_get_buf(Virtqueue* vq, uint32_t* out_len) -> uint16_t;  // returns desc idx, VIRTQ_NO_BUF, or VIRTQ_BAD_BUF
 void virtq_kick(Virtqueue* vq);
 
@@ -180,13 +201,17 @@ void virtq_kick(Virtqueue* vq);
 // not consumed yet.  Used after clearing VIRTQ_AVAIL_F_NO_INTERRUPT to close
 // the split-ring missed-notification race.
 inline bool virtq_has_pending(const Virtqueue* vq) {
+    if (vq->failed.load(std::memory_order_acquire)) return false;
+    auto const USED = static_cast<volatile VirtqUsed*>(vq->used)->idx;
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
-    return vq->last_used_idx != vq->used->idx;
+    return vq->last_used_idx != USED;
 }
 
 inline uint16_t virtq_pending_count(const Virtqueue* vq) {
+    if (vq->failed.load(std::memory_order_acquire)) return 0;
+    auto const USED = static_cast<volatile VirtqUsed*>(vq->used)->idx;
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
-    return static_cast<uint16_t>(vq->used->idx - vq->last_used_idx);
+    return static_cast<uint16_t>(USED - vq->last_used_idx);
 }
 
 // Calculate virtqueue memory layout sizes

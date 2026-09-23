@@ -212,8 +212,9 @@ def test_pressure_reclaim_is_real_and_preserves_network_reserve() -> None:
     require_tokens(function_body(e1000, "init_rx"), ["ker::net::pkt_alloc_rx()"], "e1000 persistent RX allocation")
     require_tokens(function_body(e1000, "process_rx_budget"), ["ker::net::pkt_alloc_rx()"], "e1000 RX replacement allocation")
     virtio = VIRTIO_NET_CPP.read_text()
-    if virtio.count("pkt_pool_reserve_for_rx_descriptors") != 2:
-        fail("modern and legacy VirtIO RX initialization must both reserve permanent descriptors")
+    for probe in ("init_device_modern", "init_device"):
+        require_tokens(function_body(virtio, probe), ["pkt_pool_reserve_for_rx_descriptors"],
+                       f"{probe} reserves permanent RX descriptors")
 
     reclaim = function_body(packet, "pkt_pool_reclaim_free")
     require_tokens(

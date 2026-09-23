@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <dev/iommu/domains.hpp>
 #include <mod/io/port/port.hpp>
 #include <net/endian.hpp>
 #include <net/net_trace.hpp>
@@ -22,9 +23,9 @@
 #include <platform/interrupt/gates.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/addr.hpp>
-#include <platform/mm/page_alloc.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
+#include <platform/power/power.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/smt/smt.hpp>
@@ -39,6 +40,17 @@ namespace ker::dev::virtio {
 
 namespace {
 using net_log = ker::mod::dbg::logger<"net">;
+
+class CallbackGuard {
+    // Reverse destruction order releases the driver reference first. Capturing
+    // the owning task also preserves the hold across migration/nested polling.
+    ker::mod::sched::KernelShutdownHold shutdown_{ker::mod::sched::hold_kernel_shutdown()};
+    lifecycle::Guard callback_;
+
+   public:
+    explicit CallbackGuard(lifecycle::Admission& admission) : callback_(admission) {}
+    [[nodiscard]] explicit operator bool() const { return static_cast<bool>(callback_); }
+};
 
 auto remotable_can_remote() -> bool { return true; }
 auto remotable_can_share() -> bool { return true; }
@@ -61,10 +73,24 @@ const ker::net::wki::RemotableOps S_REMOTABLE_OPS = {
 constexpr size_t MAX_VIRTIO_NET_DEVICES = 4;
 std::array<VirtIONetDevice*, MAX_VIRTIO_NET_DEVICES> devices = {};
 size_t device_count = 0;
+std::atomic<bool> shutdown_started{false};
+VirtIONetDevice* failed_probes = nullptr;
+auto retire_device(VirtIONetDevice* dev) -> int;
+auto init_device(pci::PCIDevice* pci_dev) -> int;
+#ifdef WOS_SELFTEST
+SelftestProbeResult* probe_test = nullptr;
+bool probe_test_withhold_reset = false;
+auto selftest_live_rx(VirtIONetDevice* dev, ker::net::PacketBuffer* pkt) -> bool;
+void selftest_live_irq(VirtIONetDevice* dev);
+void selftest_live_start(VirtIONetDevice* dev);
+bool selftest_live_withhold_reset = false;
+std::atomic<uint64_t> fault_override{0};
+#endif
 
 constexpr uint8_t SINGLE_QUEUE_PAIRS = 1;
 constexpr uint8_t MIN_MQ_QUEUE_PAIRS = 2;
 constexpr uint8_t DEFAULT_MQ_QUEUE_PAIR_LIMIT = 4;
+static_assert(MAX_VIRTIO_NET_DEVICES * DEFAULT_MQ_QUEUE_PAIR_LIMIT * 2 * VIRTQ_MAX_SIZE + 2048 < dma::REGISTRY_CAPACITY);
 constexpr uint8_t WKI_CONTROL_TX_RETRY_POLLS = 8;
 constexpr uint8_t RX_EMPTY_PENDING_REARM_LIMIT = 1;
 
@@ -272,27 +298,13 @@ auto is_wki_control_liveness_frame(const ker::net::PacketBuffer* pkt) -> bool {
     }
 }
 
-// Handle both kernel static and HHDM mappings.
-auto virt_to_phys(void* vaddr) -> uint64_t {
-    auto addr = reinterpret_cast<uint64_t>(vaddr);
-    if (addr >= mod::mm::addr::get_hhdm_offset()) {
-        uint64_t const PHYS = ker::mod::mm::virt::translate(ker::mod::mm::virt::get_kernel_pagemap(), addr);
-        if (PHYS == ker::mod::mm::virt::PADDR_INVALID) {
-            net_log::error("virt_to_phys: failed for kernel address 0x%lx", addr);
-            hcf();
-        }
-        return PHYS;
-    }
-    return reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(addr));
-}
-
 void fill_rx_queue_for(VirtIONetDevice* dev, Virtqueue* rxq) {
+    if (rxq->failed.load(std::memory_order_acquire)) return;
     const char* const DEV_NAME = dev != nullptr ? dev->netdev.name.data() : "?";
     if (rxq->num_free > rxq->size) {
         net_log::error("virtio rx refill: dev=%s q=%u corrupt free count free=%u size=%u", DEV_NAME, rxq->queue_index, rxq->num_free,
                        rxq->size);
-        rxq->num_free = 0;
-        rxq->free_head = VIRTQ_NO_BUF;
+        rxq->failed.store(true, std::memory_order_release);
         return;
     }
 
@@ -314,10 +326,8 @@ void fill_rx_queue_for(VirtIONetDevice* dev, Virtqueue* rxq) {
         pkt->data = pkt->storage.data();
         pkt->len = 0;
 
-        uint64_t const PHYS = virt_to_phys(pkt->storage.data());
-        uint32_t const BUF_LEN = ker::net::PKT_BUF_SIZE;
-
-        if (virtq_add_buf(rxq, PHYS, BUF_LEN, VRING_DESC_F_WRITE, pkt) < 0) {
+        auto buffer = std::span<std::byte>(reinterpret_cast<std::byte*>(pkt->storage.data()), pkt->storage.size());
+        if (virtq_add_buf(rxq, buffer, pkt) < 0) {
             ker::net::pkt_free(pkt);
             break;
         }
@@ -391,6 +401,9 @@ auto process_rx_budget_for(VirtIONetDevice* dev, Virtqueue* rxq, int budget) -> 
         pkt->len = len - dev->hdr_size;
         pkt->dev = &dev->netdev;
 
+#ifdef WOS_SELFTEST
+        if (selftest_live_rx(dev, pkt)) continue;
+#endif
         ker::net::netdev_rx(&dev->netdev, pkt);
     }
 
@@ -460,6 +473,7 @@ void virtio_net_set_queue_notifications(Virtqueue* vq, bool enabled) {
     }
 
     auto* flags = reinterpret_cast<uint16_t*>(vq->avail);
+    enabled = enabled && !vq->failed.load(std::memory_order_acquire);
     uint16_t const VALUE = enabled ? uint16_t{0} : VIRTQ_AVAIL_F_NO_INTERRUPT;
     __atomic_store_n(flags, VALUE, __ATOMIC_RELEASE);
 }
@@ -594,6 +608,11 @@ void virtio_net_complete_poll(VirtIONetDevice* dev, VirtIONetQueuePair* pair, ke
 int virtio_net_poll(ker::net::NapiStruct* napi, int budget) {
     NET_TRACE_SPAN(SPAN_NAPI_POLL);
     auto* dev = static_cast<VirtIONetDevice*>(napi->dev->private_data);
+    CallbackGuard const GUARD(dev->admission);
+    if (!GUARD) {
+        ker::net::napi_complete(napi);
+        return 0;
+    }
     auto* pair = queue_pair_for_napi(dev, napi);
     if (pair == nullptr || pair->rxq == nullptr || pair->txq == nullptr) {
         net_log::error("virtio NAPI poll for unknown queue pair napi=%p", napi);
@@ -649,6 +668,12 @@ void virtio_net_irq(uint8_t vector, void* private_data) {
     }
     auto* dev = pair->dev;
 
+    CallbackGuard const GUARD(dev->admission);
+    if (!GUARD) return;
+#ifdef WOS_SELFTEST
+    selftest_live_irq(dev);
+#endif
+
     if (!dev->msix_enabled && pair->index == 0) {
         uint8_t const ISR_STATUS = ::inb(dev->io_base + VIRTIO_REG_ISR_STATUS);
         if (ISR_STATUS == 0) {
@@ -668,34 +693,35 @@ void virtio_net_irq(uint8_t vector, void* private_data) {
 // be called after VIRTIO_STATUS_DRIVER_OK is written to the device.  Returns
 // true on success.
 auto send_mq_ctrl_cmd(VirtIONetDevice* dev, uint16_t queue_pairs) -> bool {
+    CallbackGuard const GUARD(dev->admission);
+    if (!GUARD) return false;
     if (dev->ctrlq == nullptr) {
         return false;
     }
 
-    // Allocate a DMA-accessible page: [class][cmd][pairs_lo][pairs_hi][ack]
-    auto* buf = static_cast<uint8_t*>(ker::mod::mm::phys::page_alloc(ker::mod::mm::PhysicalPageOwner::DEVICE_VIRTIO, 4096, "virtio_net"));
-    if (buf == nullptr) {
-        return false;
-    }
+    // Preallocated before BME admission. Keep this coherent page until reset,
+    // including an ACK timeout: the device may still process the command late.
+    auto* buf = reinterpret_cast<uint8_t*>(dev->control_buffer.allocation.cpu);
+    if (buf == nullptr || !dev->control_buffer.expose()) return false;
     buf[0] = VIRTIO_NET_CTRL_CLASS_MQ;
     buf[1] = VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET;
     buf[2] = static_cast<uint8_t>(queue_pairs & 0xFFU);
     buf[3] = static_cast<uint8_t>((queue_pairs >> 8U) & 0xFFU);
     buf[4] = 0xFF;  // ack placeholder - device writes VIRTIO_NET_OK (0) on success
 
-    uint64_t const PHYS = virt_to_phys(buf);
+    uint64_t const ADDRESS = dev->control_buffer.submission.address;
 
     // Chain three descriptors: [header(2B) | data(2B) | ack(1B,writable)]
     auto* ctrlq = dev->ctrlq;
-    ctrlq->desc[0].addr = PHYS;
+    ctrlq->desc[0].addr = ADDRESS;
     ctrlq->desc[0].len = 2;
     ctrlq->desc[0].flags = VRING_DESC_F_NEXT;
     ctrlq->desc[0].next = 1;
-    ctrlq->desc[1].addr = PHYS + 2;
+    ctrlq->desc[1].addr = ADDRESS + 2;
     ctrlq->desc[1].len = 2;
     ctrlq->desc[1].flags = VRING_DESC_F_NEXT;
     ctrlq->desc[1].next = 2;
-    ctrlq->desc[2].addr = PHYS + 4;
+    ctrlq->desc[2].addr = ADDRESS + 4;
     ctrlq->desc[2].len = 1;
     ctrlq->desc[2].flags = VRING_DESC_F_WRITE;
     ctrlq->desc[2].next = 0;
@@ -712,10 +738,14 @@ auto send_mq_ctrl_cmd(VirtIONetDevice* dev, uint16_t queue_pairs) -> bool {
     // 5 s covers any host scheduler latency during early boot.
     constexpr uint64_t CTRL_ACK_TIMEOUT_MS = 5000;
     uint64_t const DEADLINE_MS = future_deadline_ms(CTRL_ACK_TIMEOUT_MS);
-    while (ker::mod::time::get_ms() < DEADLINE_MS) {
+    for (size_t spins = 0; spins < 100'000'000 && ker::mod::time::get_ms() < DEADLINE_MS; ++spins) {
+        // The packed ABI understates alignment: used is page-aligned and idx
+        // is at byte 2. One aligned x86 load, followed by the DMA acquire fence.
+        auto const USED = static_cast<volatile VirtqUsed*>(ctrlq->used)->idx;
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
-        if (ctrlq->used->idx != 0) {
-            return buf[4] == VIRTIO_NET_OK;  // buf leaked intentionally (init-time, 1 page)
+        if (USED != 0) {
+            return USED == 1 && ctrlq->used->ring[0].id == 0 && ctrlq->used->ring[0].len == 1 &&
+                   *reinterpret_cast<volatile uint8_t*>(buf + 4) == VIRTIO_NET_OK;
         }
         asm volatile("pause" ::: "memory");
     }
@@ -724,11 +754,18 @@ auto send_mq_ctrl_cmd(VirtIONetDevice* dev, uint16_t queue_pairs) -> bool {
 }
 
 auto virtio_net_open(ker::net::NetDevice* netdev) -> int {
+    auto* dev = static_cast<VirtIONetDevice*>(netdev->private_data);
+    CallbackGuard const GUARD(dev->admission);
+    if (!GUARD) return -ENODEV;
     netdev->state = 1;
     return 0;
 }
 
-void virtio_net_close(ker::net::NetDevice* netdev) { netdev->state = 0; }
+void virtio_net_close(ker::net::NetDevice* netdev) {
+    auto* dev = static_cast<VirtIONetDevice*>(netdev->private_data);
+    CallbackGuard const GUARD(dev->admission);
+    if (GUARD) netdev->state = 0;
+}
 
 enum class TxAttemptResult : uint8_t {
     SENT,
@@ -748,6 +785,11 @@ auto virtio_net_try_xmit_pair(ker::net::NetDevice* netdev, VirtIONetDevice* dev,
     // Reap completed TX buffers opportunistically on every send. This keeps
     // TX descriptors available even if completion interrupts are delayed.
     ker::net::PacketBuffer* reclaimed = collect_tx_for(txq);
+    if (txq->failed.load(std::memory_order_acquire)) {
+        txq->lock.unlock_irqrestore(TXFLAGS);
+        free_pkt_list(reclaimed);
+        return TxAttemptResult::FAILED;
+    }
     if (txq->num_free == 0) {
         virtq_kick(txq);
         txq->lock.unlock_irqrestore(TXFLAGS);
@@ -755,14 +797,29 @@ auto virtio_net_try_xmit_pair(ker::net::NetDevice* netdev, VirtIONetDevice* dev,
         return TxAttemptResult::FULL;
     }
 
+    auto const START = reinterpret_cast<uintptr_t>(pkt->storage.data());
+    auto const DATA = reinterpret_cast<uintptr_t>(pkt->data);
+    if (DATA < START || DATA - START < dev->hdr_size || DATA - START > pkt->storage.size() ||
+        pkt->len > pkt->storage.size() - (DATA - START)) {
+        txq->lock.unlock_irqrestore(TXFLAGS);
+        free_pkt_list(reclaimed);
+        return TxAttemptResult::FAILED;
+    }
+#ifdef WOS_SELFTEST
+    if (pkt->len == 64 && std::memcmp(pkt->data + 14, "WOSDMAF1", 8) == 0)
+        txq->selftest_address = fault_override.exchange(0, std::memory_order_acq_rel);
+#endif
     auto* hdr = reinterpret_cast<VirtIONetHeader*>(pkt->push(dev->hdr_size));
     std::memset(hdr, 0, dev->hdr_size);
 
-    uint64_t const PHYS = virt_to_phys(pkt->data);
     auto total_len = static_cast<uint32_t>(pkt->len);
-
-    int const RET = virtq_add_buf(txq, PHYS, total_len, 0, pkt);
+    auto buffer = std::span<std::byte>(reinterpret_cast<std::byte*>(pkt->data), pkt->len);
+    int const RET = virtq_add_buf(txq, buffer, pkt);
+#ifdef WOS_SELFTEST
+    txq->selftest_address = 0;
+#endif
     if (RET < 0) {
+        pkt->pull(dev->hdr_size);
         txq->lock.unlock_irqrestore(TXFLAGS);
         free_pkt_list(reclaimed);
         return TxAttemptResult::FAILED;
@@ -809,6 +866,11 @@ auto virtio_net_start_xmit(ker::net::NetDevice* netdev, ker::net::PacketBuffer* 
         ker::net::pkt_free(pkt);
         return -1;
     }
+    CallbackGuard const GUARD(dev->admission);
+    if (!GUARD) {
+        ker::net::pkt_free(pkt);
+        return -ENODEV;
+    }
     uint8_t const PAIR_COUNT = active_tx_pair_count(dev);
     if (PAIR_COUNT == 0) {
         ker::net::pkt_free(pkt);
@@ -853,6 +915,9 @@ auto virtio_net_start_xmit(ker::net::NetDevice* netdev, ker::net::PacketBuffer* 
 
 auto virtio_net_set_queue_cpu(ker::net::NetDevice* net, uint32_t pair_idx, uint64_t cpu) -> int {
     auto* dev = static_cast<VirtIONetDevice*>(net->private_data);
+    if (dev == nullptr) return -ENODEV;
+    CallbackGuard const GUARD(dev->admission);
+    if (!GUARD) return -ENODEV;
     if (pair_idx >= dev->num_queue_pairs) {
         return -EINVAL;
     }
@@ -891,6 +956,8 @@ auto apply_queue_cpu_mask(VirtIONetDevice& dev, uint64_t mask, PinWorkers&& pin_
 auto virtio_net_set_queue_cpu_mask(ker::net::NetDevice* net, uint64_t mask) -> int {
     auto* dev = static_cast<VirtIONetDevice*>(net->private_data);
     if (dev == nullptr) return -ENODEV;
+    CallbackGuard const GUARD(dev->admission);
+    if (!GUARD) return -ENODEV;
     return apply_queue_cpu_mask(
         *dev, mask, ker::mod::sched::pin_kernel_workers_to_cpus,
         [dev](uint32_t pair, uint8_t vector, uint64_t cpu) { ker::dev::pci::pci_configure_msix_entry(dev->pci, pair, vector, cpu); });
@@ -898,15 +965,21 @@ auto virtio_net_set_queue_cpu_mask(ker::net::NetDevice* net, uint64_t mask) -> i
 
 auto virtio_net_check_mac(ker::net::NetDevice* netdev, const uint8_t* mac) -> int {
     if (netdev == nullptr || mac == nullptr) return -EINVAL;
-    if (std::equal(netdev->mac.bytes.begin(), netdev->mac.bytes.end(), mac)) return 0;
     auto* dev = static_cast<VirtIONetDevice*>(netdev->private_data);
     if (dev == nullptr) return -ENODEV;
+    CallbackGuard const GUARD(dev->admission);
+    if (!GUARD) return -ENODEV;
+    if (std::equal(netdev->mac.bytes.begin(), netdev->mac.bytes.end(), mac)) return 0;
     // Modern config is read-only; runtime CTRL_MAC_ADDR is not negotiated yet.
     if (dev->modern_cfg != nullptr || dev->io_base == 0 || (dev->negotiated_features & VIRTIO_NET_F_MAC) == 0) return -ENOTSUP;
     return 0;
 }
 
 void virtio_net_set_mac(ker::net::NetDevice* netdev, const uint8_t* mac) {
+    if (netdev == nullptr || netdev->private_data == nullptr) return;
+    auto* guarded_dev = static_cast<VirtIONetDevice*>(netdev->private_data);
+    CallbackGuard const GUARD(guarded_dev->admission);
+    if (!GUARD) return;
     if (virtio_net_check_mac(netdev, mac) != 0 || std::equal(netdev->mac.bytes.begin(), netdev->mac.bytes.end(), mac)) return;
     auto* dev = static_cast<VirtIONetDevice*>(netdev->private_data);
     if (dev == nullptr || mac == nullptr) {
@@ -962,15 +1035,657 @@ auto map_virtio_cap_region(ker::dev::pci::PCIDevice* dev, uint8_t cap_off) -> ui
     return static_cast<uint8_t*>(bar) + OFFSET;
 }
 
-// Modern virtio init (virtio 1.0).  Returns 0 on success, -1 if modern caps
-// are absent or the device rejects VERSION_1 (caller falls back to legacy).
+// Serialized probe or terminal retirement after callback admission/drain.
+auto reset_transport(VirtIONetDevice* dev) -> bool {
+    (void)iommu::set_platform_dma_ready(dev->pci, false);
+    struct ResetBackend {
+        VirtIONetDevice* dev;
+        uint64_t deadline;
+        void write_reset() {
+            if (dev->modern_cfg != nullptr)
+                dev->modern_cfg->device_status = 0;
+            else
+                write_status(dev->io_base, 0);
+        }
+        auto read_status() -> uint8_t {
+            if (dev->modern_cfg != nullptr) return dev->modern_cfg->device_status;
+            return ::inb(dev->io_base + VIRTIO_REG_DEVICE_STATUS);
+        }
+        auto expired() -> bool { return ker::mod::time::get_ms() >= deadline; }
+        void relax() { asm volatile("pause" ::: "memory"); }
+    } backend{dev, future_deadline_ms(1000)};
+    return managed::reset(backend, 10'000'000);
+}
+
+// Read back every source mask before releasing any owned interrupt vector.
+auto mask_interrupts(VirtIONetDevice* dev) -> bool {
+    auto* p = dev->pci;
+    auto read = [p](uint8_t offset) { return pci::pci_config_read16(p->bus, p->slot, p->function, offset); };
+    auto write = [p](uint8_t offset, uint16_t value) { pci::pci_config_write16(p->bus, p->slot, p->function, offset, value); };
+    bool masked = true;
+    uint8_t const MSI = pci::pci_find_capability(p, pci::PCI_CAP_ID_MSI);
+    if (MSI != 0) {
+        if (MSI > 0xfc) return false;
+        auto const OFFSET = static_cast<uint8_t>(MSI + 2);
+        write(OFFSET, static_cast<uint16_t>(read(OFFSET) & ~1U));
+        masked = (read(OFFSET) & 1U) == 0;
+    }
+    uint8_t const MSIX = pci::pci_find_capability(p, pci::PCI_CAP_ID_MSIX);
+    if (MSIX != 0) {
+        if (MSIX > 0xfc) return false;
+        auto const OFFSET = static_cast<uint8_t>(MSIX + 2);
+        write(OFFSET, static_cast<uint16_t>((read(OFFSET) | 0x4000U) & ~0x8000U));
+        masked = (read(OFFSET) & 0xc000U) == 0x4000U && masked;
+    }
+    write(pci::PCI_COMMAND, static_cast<uint16_t>(read(pci::PCI_COMMAND) | pci::PCI_COMMAND_INT_DISABLE));
+    return (read(pci::PCI_COMMAND) & pci::PCI_COMMAND_INT_DISABLE) != 0 && masked;
+}
+
+void drain_interrupts(VirtIONetDevice* dev) {
+    for (auto& pair : dev->queue_pairs) {
+        if (!pair.irq_owned) continue;
+        ker::mod::gates::free_irq(pair.irq_vector);
+        pair.irq_owned = false;
+    }
+}
+
+auto retire_regions(VirtIONetDevice* dev, bool quiesced) -> bool {
+    bool released = true;
+    for (auto& pair : dev->queue_pairs) {
+        released = virtq_retire(pair.rxq, quiesced) && released;
+        released = virtq_retire(pair.txq, quiesced) && released;
+    }
+    released = virtq_retire(dev->ctrlq, quiesced) && released;
+    managed::DmaApi api;
+    return dev->control_buffer.retire(api, quiesced) && released;
+}
+
+struct RetirementBackend {
+    VirtIONetDevice* dev;
+    bool reset_observed = false, interrupts_masked = false, bme_disabled = false;
+    void close_admission() { dev->admission.close(); }
+    auto drain_readers() -> bool {
+        uint64_t const DEADLINE = future_deadline_ms(5000);
+        for (size_t spins = 0; spins < 10'000'000 && ker::mod::time::get_ms() < DEADLINE; ++spins) {
+            if (dev->admission.drained()) return true;
+            if (ker::mod::sched::can_query_current_task())
+                ker::mod::sched::kern_yield();
+            else
+                asm volatile("pause" ::: "memory");
+        }
+#ifdef WOS_SELFTEST
+        if (!dev->admission.drained()) {
+            net_log::warn("virtio live reader drain timeout readers=%u", dev->admission.readers());
+            auto const COUNT = ker::mod::sched::get_active_task_count();
+            for (uint32_t i = 0; i < COUNT; ++i) {
+                auto* task = ker::mod::sched::get_active_task_at_safe(i);
+                if (task == nullptr) continue;
+                if (task->kernel_shutdown_ownership.held())
+                    net_log::warn("virtio live held owner pid=%lu name=%s requested=%u", task->pid, task->name,
+                                  task->kernel_shutdown_requested.load());
+                task->release();
+            }
+        }
+#endif
+        return dev->admission.drained();
+    }
+    void unpublish() {
+        ker::net::netdev_mark_control_retiring(&dev->netdev);
+        ker::net::NetDeviceRetireToken token;
+        (void)ker::net::netdev_unregister_begin(&dev->netdev, token);
+        // Keep registry entries, NAPI objects and workers stable for snapshots
+        // and raw WKI references. A late callback cannot pass the closed gate.
+        // No wait for netdevice references: queued packet owners retire below.
+        for (auto& pair : dev->queue_pairs) {
+            pair.napi.state.store(ker::net::NapiState::DISABLED, std::memory_order_release);
+            pair.napi.has_work.store(false, std::memory_order_release);
+        }
+    }
+    auto mask_interrupts() -> bool { return interrupts_masked = virtio::mask_interrupts(dev); }
+    auto reset() -> bool {
+        reset_observed = reset_transport(dev);
+#ifdef WOS_SELFTEST
+        if (probe_test != nullptr) {
+            probe_test->reset_observed = reset_observed;
+            if (probe_test_withhold_reset) return false;
+        }
+        if (selftest_live_withhold_reset) return false;
+#endif
+        return reset_observed;
+    }
+    auto disable_bus_master() -> bool { return bme_disabled = pci::pci_set_bus_master(dev->pci, false); }
+    void drain_interrupts() { virtio::drain_interrupts(dev); }
+    void quarantine() { (void)retire_regions(dev, false); }
+    auto release() -> bool { return retire_regions(dev, true); }
+};
+
+auto retire_device(VirtIONetDevice* dev) -> int {
+    auto const SHUTDOWN_HOLD = ker::mod::sched::hold_kernel_shutdown();
+    uint8_t expected = 0;
+    if (!dev->retirement.compare_exchange_strong(expected, 1, std::memory_order_acq_rel, std::memory_order_acquire))
+        return expected == 2 ? 0 : (expected == 1 ? -EBUSY : -EIO);
+    auto const BEFORE = dma::stats(dev->pci);
+    RetirementBackend backend{dev};
+    auto const RESULT = lifecycle::retire(backend);
+    auto const AFTER = dma::stats(dev->pci);
+    dev->retirement.store(RESULT == lifecycle::Result::released ? 2 : 3, std::memory_order_release);
+    net_log::info("virtio terminal retirement result=%u reset=%u irq_masked=%u bme_off=%u regions=%zu->%zu pages=%zu->%zu q=%zu",
+                  static_cast<unsigned>(RESULT), backend.reset_observed, backend.interrupts_masked, backend.bme_disabled, BEFORE.regions,
+                  AFTER.regions, BEFORE.backing_pages, AFTER.backing_pages, AFTER.quarantined);
+    return RESULT == lifecycle::Result::released ? 0 : -EIO;
+}
+
+auto fail_published_probe(VirtIONetDevice* dev) -> int {
+    (void)retire_device(dev);
+    dev->failed_probe_next = failed_probes;
+    failed_probes = dev;
+    return -1;
+}
+
+auto publish_irqs(VirtIONetDevice* dev) -> bool {
+    dev->netdev.private_data = dev;
+    dev->callbacks_published = true;
+    for (uint8_t i = 0; i < dev->num_queue_pairs; ++i) {
+        auto& pair = dev->queue_pairs[i];
+        ker::net::napi_init(&pair.napi, &dev->netdev, virtio_net_poll, 64);
+        if (pair.irq_vector == 0) return false;
+        if (ker::mod::gates::request_irq(pair.irq_vector, virtio_net_irq, &pair, i == 0 ? "virtio-net" : "virtio-net-mq") != 0) {
+            pair.irq_owned = false;  // A conflicting handler is never ours to free.
+            return false;
+        }
+        pair.irq_owned = true;
+    }
+    if (dev->use_intx) {
+        auto* p = dev->pci;
+        auto const COMMAND = pci::pci_config_read16(p->bus, p->slot, p->function, pci::PCI_COMMAND);
+        pci::pci_config_write16(p->bus, p->slot, p->function, pci::PCI_COMMAND,
+                                static_cast<uint16_t>(COMMAND & ~pci::PCI_COMMAND_INT_DISABLE));
+        if ((pci::pci_config_read16(p->bus, p->slot, p->function, pci::PCI_COMMAND) & pci::PCI_COMMAND_INT_DISABLE) != 0) return false;
+    }
+    return true;
+}
+
+auto fail_probe(VirtIONetDevice* dev) -> int {
+    if (dev->callbacks_published) {
+        net_log::error("refusing probe unwind after callback publication");
+        return -1;
+    }
+    bool const MASKED = mask_interrupts(dev);
+    bool reset = reset_transport(dev);
+#ifdef WOS_SELFTEST
+    if (probe_test != nullptr) {
+        probe_test->reset_observed = reset;
+        if (probe_test_withhold_reset) reset = false;
+    }
+#endif
+    bool const DISABLED = pci::pci_set_bus_master(dev->pci, false);
+    bool const QUIESCED = reset && DISABLED && MASKED;
+    if (MASKED) drain_interrupts(dev);
+    bool const released = retire_regions(dev, QUIESCED);
+    net_log::info("virtio probe unwind reset=%u bme_off=%u released=%u regions=%zu quarantined=%zu", reset, DISABLED, released,
+                  dma::stats(dev->pci).regions, dma::stats(dev->pci).quarantined);
+    if (released)
+        delete dev;
+    else {
+        dev->failed_probe_next = failed_probes;
+        failed_probes = dev;
+    }
+    return -1;
+}
+
+auto prepare_probe(VirtIONetDevice* dev) -> bool {
+    bool const RESET = reset_transport(dev);
+    bool const DISABLED = pci::pci_set_bus_master(dev->pci, false);
+    if (!RESET || !DISABLED) return false;
+    // The current coherent backend requires snooped, ordered x86 PCI DMA.
+    uint8_t const PCIE = pci::pci_find_capability(dev->pci, 0x10);
+    if (PCIE == 0) return true;
+    if (PCIE > 0xf4) return false;
+    auto const OFFSET = static_cast<uint8_t>(PCIE + 8);
+    auto* pci_dev = dev->pci;
+    uint16_t const CONTROL = pci::pci_config_read16(pci_dev->bus, pci_dev->slot, pci_dev->function, OFFSET);
+    pci::pci_config_write16(pci_dev->bus, pci_dev->slot, pci_dev->function, OFFSET, static_cast<uint16_t>(CONTROL & ~0x810U));
+    return (pci::pci_config_read16(pci_dev->bus, pci_dev->slot, pci_dev->function, OFFSET) & 0x810U) == 0;
+}
+
+#ifdef WOS_SELFTEST
+// A private rootless fixture echoes EtherType 0x88b5 and flips request byte 22
+// from 1 to 2. Distinct payload bytes and sizes detect stale/truncated DMA copies.
+auto selftest_packet_byte(size_t offset, size_t frame_size, bool reply) -> uint8_t {
+    constexpr std::array<uint8_t, 6> SOURCE{2, 0, 0, 0x20, 0, 1};
+    constexpr char MAGIC[] = "WOSDMA20";
+    if (offset < 6) return 0xff;
+    if (offset < 12) return SOURCE[offset - 6];
+    if (offset == 12) return 0x88;
+    if (offset == 13) return 0xb5;
+    if (offset < 22) return static_cast<uint8_t>(MAGIC[offset - 14]);
+    if (offset == 22) return reply ? 2 : 1;
+    if (offset == 23) return 0;
+    if (offset < 28) return static_cast<uint8_t>(frame_size >> ((offset - 24) * 8));
+    return static_cast<uint8_t>(offset * 17 + frame_size);
+}
+
+void selftest_packet_dma(VirtIONetDevice* dev) {
+    auto& pair = dev->queue_pairs[0];
+    ker::net::pkt_pool_init();
+    ker::net::pkt_pool_reserve_for_rx_descriptors(pair.rxq->size);
+    probe_test->packet_pool_before = ker::net::pkt_pool_free_count();
+    fill_rx_queue_for(dev, pair.rxq);
+    for (size_t frame_size : {size_t{64}, size_t{9014}}) {
+        auto* tx = ker::net::pkt_alloc();
+        if (tx == nullptr) return;
+        tx->len = frame_size;
+        for (size_t i = 0; i < frame_size; ++i) tx->data[i] = selftest_packet_byte(i, frame_size, false);
+        if (virtio_net_try_xmit_pair(&dev->netdev, dev, tx, 0) != TxAttemptResult::SENT) {
+            ker::net::pkt_free(tx);
+            return;
+        }
+        bool received = false;
+        uint64_t const DEADLINE = future_deadline_ms(5000);
+        for (size_t spins = 0; spins < 100'000'000 && ker::mod::time::get_ms() < DEADLINE; ++spins) {
+            // This unpublished probe has no IRQ/NAPI readers. Exercise the
+            // normal queue completion/copy and refill functions directly.
+            free_pkt_list(collect_tx_for(pair.txq));
+            for (uint16_t n = 0; n < pair.rxq->size; ++n) {
+                uint32_t length = 0;
+                uint16_t const ID = virtq_get_buf(pair.rxq, &length);
+                if (ID == VIRTQ_NO_BUF) break;
+                if (ID == VIRTQ_BAD_BUF) return;
+                auto* rx = pair.rxq->pkt_map[ID];
+                pair.rxq->pkt_map[ID] = nullptr;
+                bool matches = length == dev->hdr_size + frame_size && virtio_net_rx_buffer_count(dev, rx) == 1;
+                if (matches) {
+                    for (size_t i = 0; i < frame_size; ++i) {
+                        if (rx->storage[dev->hdr_size + i] != selftest_packet_byte(i, frame_size, true)) {
+                            matches = false;
+                            break;
+                        }
+                    }
+                }
+                received = received || matches;
+                ker::net::pkt_free(rx);
+            }
+            fill_rx_queue_for(dev, pair.rxq);
+            if (received && pair.txq->num_free == pair.txq->size) break;
+            asm volatile("pause" ::: "memory");
+        }
+        if (!received || pair.txq->num_free != pair.txq->size) return;
+        ++probe_test->packets_verified;
+    }
+}
+#endif
+
+#ifdef WOS_SELFTEST
+struct LiveDmaTest {
+    std::atomic<VirtIONetDevice*> device{nullptr};
+    std::atomic<uint64_t> small{0}, jumbo{0}, bad{0}, worker_rx{0}, irqs{0}, sent{0};
+    std::atomic<uint64_t> sender_cpu{UINT64_MAX}, receive_cpus{0};
+    std::atomic<bool> stop_sender{false}, holder_entered{false}, release_holder{false}, holder_released{false};
+    std::atomic<bool> holder_returned_after_exit_point{false}, retire_started{false}, retire_done{false};
+    std::atomic<uint32_t> protected_yields{0};
+    std::atomic<int> retirement_result{-EBUSY};
+};
+LiveDmaTest live_test;
+
+void selftest_live_irq(VirtIONetDevice* dev) {
+    if (live_test.device.load(std::memory_order_acquire) == dev) live_test.irqs.fetch_add(1, std::memory_order_relaxed);
+}
+
+auto selftest_live_rx(VirtIONetDevice* dev, ker::net::PacketBuffer* pkt) -> bool {
+    if (live_test.device.load(std::memory_order_acquire) != dev || pkt->len < 28 || pkt->data[12] != 0x88 || pkt->data[13] != 0xb5 ||
+        pkt->data[14] != 'W' || pkt->data[22] != 2)
+        return false;
+    bool valid = pkt->len == 64 || pkt->len == 9014;
+    for (size_t i = 0; valid && i < pkt->len; ++i) valid = pkt->data[i] == selftest_packet_byte(i, pkt->len, true);
+    if (valid) {
+        auto& count = pkt->len == 64 ? live_test.small : live_test.jumbo;
+        count.fetch_add(1, std::memory_order_relaxed);
+        uint64_t const CPU = ker::mod::cpu::current_cpu();
+        if (CPU < 64) live_test.receive_cpus.fetch_or(uint64_t{1} << CPU, std::memory_order_relaxed);
+        auto* current = ker::mod::sched::get_current_task();
+        for (auto& pair : dev->queue_pairs)
+            if (current != nullptr && current == pair.napi.worker) live_test.worker_rx.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        live_test.bad.fetch_add(1, std::memory_order_relaxed);
+    }
+    ker::net::pkt_free(pkt);
+    return true;
+}
+
+template <typename Predicate>
+auto live_wait(Predicate predicate, uint64_t timeout_ms = 10000) -> bool {
+    uint64_t const DEADLINE = future_deadline_ms(timeout_ms);
+    while (!predicate()) {
+        if (ker::mod::time::get_ms() >= DEADLINE) return false;
+        ker::mod::sched::kern_sleep_us(1000);
+    }
+    return true;
+}
+
+void selftest_live_sender() {
+    auto* dev = live_test.device.load(std::memory_order_acquire);
+    live_test.sender_cpu.store(ker::mod::cpu::current_cpu(), std::memory_order_release);
+    for (size_t n = 0; n < 20000 && !live_test.stop_sender.load(std::memory_order_acquire); ++n) {
+        size_t const SIZE = (n & 1U) == 0 ? 64 : 9014;
+        if (auto* pkt = ker::net::pkt_alloc_tx()) {
+            pkt->len = SIZE;
+            for (size_t i = 0; i < SIZE; ++i) pkt->data[i] = selftest_packet_byte(i, SIZE, false);
+            if (virtio_net_start_xmit(&dev->netdev, pkt) == 0) live_test.sent.fetch_add(1, std::memory_order_relaxed);
+        }
+        ker::mod::sched::kern_sleep_us(1000);
+    }
+}
+
+void selftest_live_holder() {
+    auto* dev = live_test.device.load(std::memory_order_acquire);
+    {
+        CallbackGuard const GUARD(dev->admission);
+        if (!GUARD) return;
+        live_test.holder_entered.store(true, std::memory_order_release);
+        uint64_t const DEADLINE = future_deadline_ms(20000);
+        while (!live_test.release_holder.load(std::memory_order_acquire) && ker::mod::time::get_ms() < DEADLINE) {
+            ker::mod::sched::kern_sleep_us(1000);
+            auto* current = ker::mod::sched::get_current_task();
+            if (ker::mod::sched::kernel_threads_shutdown_requested() && current->kernel_shutdown_requested.load(std::memory_order_acquire))
+                live_test.protected_yields.fetch_add(1, std::memory_order_release);
+        }
+    }
+    live_test.holder_released.store(true, std::memory_order_release);
+    ker::mod::sched::kern_yield();
+    // A pending cooperative exit must take effect after the ownership scope.
+    live_test.holder_returned_after_exit_point.store(true, std::memory_order_release);
+}
+
+void selftest_live_retirer() {
+    auto const HOLD = ker::mod::sched::hold_kernel_shutdown();
+    live_test.retire_started.store(true, std::memory_order_release);
+    live_test.retirement_result.store(virtio_net_shutdown(), std::memory_order_release);
+    live_test.retire_done.store(true, std::memory_order_release);
+}
+
+auto live_post(const char* name, void (*entry)(), uint64_t cpu) -> ker::mod::sched::task::Task* {
+    auto* task = ker::mod::sched::task::Task::create_kernel_thread(name, entry);
+    if (task == nullptr) return nullptr;
+    if (!task->try_acquire()) return nullptr;
+    ker::mod::sched::post_task_pinned_cpu(cpu, task);
+    return task;  // Caller owns a reference, including after cooperative exit.
+}
+
+void selftest_fault_runner(VirtIONetDevice* dev, bool positive, ker::mod::sched::task::Task* sender) {
+    auto test_flag = [](const char* flag) { return cmdline_has_token(ker::init::get_kernel_cmdline(), flag); };
+    auto hold = ker::mod::sched::hold_kernel_shutdown();
+    auto const DOMAIN = iommu::domain_info(dev->pci);
+    bool const STALE = test_flag("--iommu-test-fault-stale");
+    bool const WITHHELD = test_flag("--iommu-test-withhold-invalidation");
+    live_test.stop_sender.store(true, std::memory_order_release);
+    bool ok = positive && sender != nullptr && live_wait([sender] { return sender->exit_in_progress.load(std::memory_order_acquire); }) &&
+              DOMAIN.mode == iommu::DomainMode::translated;
+    auto const BEFORE = dma::stats(dev->pci);
+    dma::Allocation allocation{};
+    uint64_t address = 0;
+    if (ok && WITHHELD) {
+        ok = iommu::selftest_withhold_invalidation(dev->pci);
+        auto result = dma::allocate_coherent(dev->pci, 4096);
+        ok = ok && result.error == dma::Error::quarantined && result.allocation.handle.registry != nullptr;
+        allocation = result.allocation;
+    } else if (ok) {
+        auto* owner = STALE ? dev->pci : pci::pci_get_device(0);
+        ok = owner != nullptr && (STALE || owner != dev->pci);
+        auto result = dma::allocate_coherent(owner, 4096);
+        ok = ok && result.error == dma::Error::none && result.allocation.cpu != nullptr;
+        allocation = result.allocation;
+        if (ok) {
+            std::memset(allocation.cpu, 0xa5, 4096);
+            auto const SUBMITTED = dma::prepare(allocation.handle);
+            ok = SUBMITTED.error == dma::Error::none;
+            address = SUBMITTED.submission.address;
+            // No hardware has seen this address yet. Revoke the stale case's
+            // PTEs while retaining its registry/physical backing permanently.
+            ok = ok && dma::complete(SUBMITTED.submission, 0, dma::Retirement::never_submitted) == dma::Error::none;
+            if (ok && STALE) ok = iommu::unmap(dev->pci, address, address, 4096, iommu::vtd::Access::read_write);
+            ok = ok && dma::quarantine(allocation.handle) == dma::Error::quarantined;
+        }
+        if (ok) {
+            auto* packet = ker::net::pkt_alloc_tx();
+            ok = packet != nullptr;
+            if (packet != nullptr) {
+                packet->len = 64;
+                std::memset(packet->data, 0, packet->len);
+                std::memcpy(packet->data + 14, "WOSDMAF1", 8);
+                fault_override.store(address, std::memory_order_release);
+                ok = virtio_net_start_xmit(&dev->netdev, packet) == 0;
+            }
+        }
+    }
+    bool const CLOSED = ok && live_wait([&] {
+                            auto s = iommu::unit_status(DOMAIN.unit);
+                            return s.failed && s.inhibited;
+                        });
+    auto const STATUS = iommu::unit_status(DOMAIN.unit);
+    auto const* report = iommu::fault_report(DOMAIN.unit);
+    bool matched = false;
+    if (report != nullptr) {
+        for (size_t i = 0; i < report->count; ++i) {
+            auto const& r = report->records[i];
+            matched |= r.stable && r.identified &&
+                       r.source() == ((uint16_t{dev->pci->bus} << 8U) | (dev->pci->slot << 3U) | dev->pci->function) &&
+                       r.address() == address && r.read() && r.reason() == 6 && r.domain == DOMAIN.id && r.domain_generation != 0;
+        }
+    }
+    bool inhibited = CLOSED;
+    for (size_t i = 0; i < pci::pci_device_count(); ++i) {
+        auto* device = pci::pci_get_device(i);
+        if (iommu::domain_info(device).unit != DOMAIN.unit) continue;
+        inhibited =
+            inhibited && !iommu::bus_master_allowed(device) && !pci::pci_set_bus_master(device, true) &&
+            (pci::pci_config_read16(device->bus, device->slot, device->function, pci::PCI_COMMAND) & pci::PCI_COMMAND_BUS_MASTER) == 0;
+    }
+    bool const REJECTED = CLOSED && dma::allocate_coherent(dev->pci, 4096).error == dma::Error::unavailable_device;
+    int const RETIRED = virtio_net_shutdown();
+    auto const AFTER = dma::stats(dev->pci);
+    bool irq_owned = false;
+    for (auto const& pair : dev->queue_pairs) irq_owned |= pair.irq_owned;
+    bool guards = WITHHELD;
+    if (!WITHHELD && allocation.cpu != nullptr && !irq_owned && dev->admission.drained()) {
+        guards = true;
+        for (size_t i = 0; i < 4096; ++i) guards &= allocation.cpu[i] == std::byte{0xa5};
+    }
+    size_t const EXTRA = STALE || WITHHELD ? 1 : 0;
+    bool const PINNED = AFTER.regions == BEFORE.regions + EXTRA && AFTER.backing_pages == BEFORE.backing_pages + EXTRA &&
+                        AFTER.quarantined == AFTER.regions;
+    ok = ok && CLOSED && inhibited && REJECTED && RETIRED == -EIO && !irq_owned && dev->admission.drained() && guards && PINNED &&
+         (WITHHELD ? report == nullptr && STATUS.irq_count == 0 : matched && STATUS.irq_count != 0 && fault_override.load() == 0);
+    net_log::info(
+        "virtio forbidden DMA %s case=%s address=0x%llx allocation_generation=%llu closed=%u inhibited=%u irq=%llu matched=%u guards=%u "
+        "rejected=%u retired=%d irq_owned=%u regions=%zu->%zu pages=%zu->%zu q=%zu",
+        ok ? "PASS" : "FAIL",
+        WITHHELD ? "withheld-invalidation"
+        : STALE  ? "stale"
+                 : "foreign",
+        static_cast<unsigned long long>(address), static_cast<unsigned long long>(allocation.handle.generation), CLOSED, inhibited,
+        static_cast<unsigned long long>(STATUS.irq_count), matched, guards, REJECTED, RETIRED, irq_owned, BEFORE.regions, AFTER.regions,
+        BEFORE.backing_pages, AFTER.backing_pages, AFTER.quarantined);
+    if (sender != nullptr) sender->release();
+    // AHCI shares the failed unit. Do not run a filesystem shutdown that would
+    // pretend this unit can still perform I/O. The private fixture stops by QMP.
+    for (;;) ker::mod::sched::kern_sleep_us(100000);
+}
+
+void selftest_live_runner() {
+    // Permit the normal init phases and scheduler handoff to finish. No BSP
+    // selftest flag is used: IRQs, NAPI workers and other CPUs remain active.
+    ker::mod::sched::kern_sleep_us(3'000'000);
+    auto* dev = live_test.device.load(std::memory_order_acquire);
+    auto const BEFORE = dma::stats(dev->pci);
+    auto* sender = live_post("dma_live_tx", selftest_live_sender, 1);
+    bool ok = sender != nullptr && live_wait([] {
+                  return live_test.small.load(std::memory_order_acquire) >= 64 && live_test.jumbo.load(std::memory_order_acquire) >= 64 &&
+                         live_test.worker_rx.load(std::memory_order_acquire) != 0 && live_test.irqs.load(std::memory_order_acquire) != 0;
+              });
+    auto const CMDLINE = ker::init::get_kernel_cmdline();
+    if (cmdline_has_token(CMDLINE, "--iommu-test-fault-foreign") || cmdline_has_token(CMDLINE, "--iommu-test-fault-stale") ||
+        cmdline_has_token(CMDLINE, "--iommu-test-withhold-invalidation"))
+        selftest_fault_runner(dev, ok, sender);
+    auto* holder = ok ? live_post("dma_live_owner", selftest_live_holder, 2) : nullptr;
+    ok = holder != nullptr && live_wait([] { return live_test.holder_entered.load(std::memory_order_acquire); }) && ok;
+    // Keep the coordinator that releases the held callback independently
+    // runnable while retirement exercises its bounded reader wait.
+    auto* retirer = ok ? live_post("dma_live_retire", selftest_live_retirer, 3) : nullptr;
+    ok = retirer != nullptr && live_wait([dev] { return dev->admission.closed(); }) && ok;
+    auto const HELD = dma::stats(dev->pci);
+    bool const DRAIN_WAITED = ok && !dev->admission.drained() && !live_test.retire_done.load(std::memory_order_acquire) &&
+                              HELD.regions == BEFORE.regions && HELD.backing_pages == BEFORE.backing_pages;
+    // The coordinator is excluded. Owners and the retiring daemon must survive
+    // scheduler exit checks while their scoped resources are still held.
+    // A zero timeout only raises the global flag. A positive bound also marks
+    // and wakes each target, which is required to exercise cooperative exit.
+    auto const REQUEST = ker::mod::sched::request_kernel_threads_shutdown(1000);
+    net_log::info("virtio live shutdown requested=%zu holder=%u retirer=%u", REQUEST.requested,
+                  holder != nullptr && holder->kernel_shutdown_requested.load(std::memory_order_acquire),
+                  retirer != nullptr && retirer->kernel_shutdown_requested.load(std::memory_order_acquire));
+    bool const DEFERRED = ok && live_wait([] { return live_test.protected_yields.load(std::memory_order_acquire) >= 2; });
+    live_test.stop_sender.store(true, std::memory_order_release);
+    live_test.release_holder.store(true, std::memory_order_release);
+    bool const RETIRED = retirer != nullptr && live_wait([] { return live_test.retire_done.load(std::memory_order_acquire); });
+    bool const OWNER_EXITED = holder != nullptr && live_wait([holder] { return holder->exit_in_progress.load(std::memory_order_acquire); });
+    if (!RETIRED) (void)virtio_net_shutdown();
+    auto const AFTER = dma::stats(dev->pci);
+    bool const ACCOUNTED = selftest_live_withhold_reset ? AFTER.regions == BEFORE.regions && AFTER.quarantined == BEFORE.regions &&
+                                                              AFTER.backing_pages == BEFORE.backing_pages
+                                                        : AFTER.regions == 0 && AFTER.backing_pages == 0 && AFTER.quarantined == 0;
+    bool owners_detached = true, irqs_drained = true;
+    for (auto& pair : dev->queue_pairs) {
+        irqs_drained = irqs_drained && !pair.irq_owned;
+        for (auto* queue : {pair.rxq, pair.txq})
+            if (queue != nullptr)
+                for (auto* pkt : queue->pkt_map) owners_detached = owners_detached && pkt == nullptr;
+    }
+    auto* late = ker::net::pkt_alloc();
+    bool const LATE_REJECTED =
+        late != nullptr && virtio_net_start_xmit(&dev->netdev, late) == -ENODEV && virtio_net_open(&dev->netdev) == -ENODEV;
+    uint64_t const RX_CPUS = live_test.receive_cpus.load(std::memory_order_acquire);
+    uint64_t const TX_CPU = live_test.sender_cpu.load(std::memory_order_acquire);
+    bool const MULTICPU = TX_CPU < 64 && (RX_CPUS & ~(uint64_t{1} << TX_CPU)) != 0;
+    int const EXPECTED = selftest_live_withhold_reset ? -EIO : 0;
+    net_log::info("virtio live checks setup=%u released=%u returned=%u accounted=%u multicpu=%u bad=%lu result=%d expected=%d repeat=%d",
+                  ok, live_test.holder_released.load(), live_test.holder_returned_after_exit_point.load(), ACCOUNTED, MULTICPU,
+                  live_test.bad.load(), live_test.retirement_result.load(), EXPECTED, virtio_net_shutdown());
+    ok = ok && DRAIN_WAITED && DEFERRED && RETIRED && OWNER_EXITED && live_test.holder_released.load(std::memory_order_acquire) &&
+         !live_test.holder_returned_after_exit_point.load(std::memory_order_acquire) && ACCOUNTED && owners_detached && irqs_drained &&
+         LATE_REJECTED && MULTICPU && live_test.bad.load(std::memory_order_acquire) == 0 &&
+         live_test.retirement_result.load(std::memory_order_acquire) == EXPECTED && virtio_net_shutdown() == EXPECTED;
+    net_log::info("virtio live DMA %s sent=%lu rx64=%lu rx9014=%lu worker_rx=%lu irq=%lu tx_cpu=%lu rx_cpus=0x%lx", ok ? "PASS" : "FAIL",
+                  live_test.sent.load(), live_test.small.load(), live_test.jumbo.load(), live_test.worker_rx.load(), live_test.irqs.load(),
+                  TX_CPU, RX_CPUS);
+    net_log::info(
+        "virtio live retirement waited=%u deferred=%u owner_exit=%u done=%u detached=%u irq_drained=%u late=%u regions=%zu->%zu "
+        "pages=%zu->%zu q=%zu",
+        DRAIN_WAITED, DEFERRED, OWNER_EXITED, RETIRED, owners_detached, irqs_drained, LATE_REJECTED, BEFORE.regions, AFTER.regions,
+        BEFORE.backing_pages, AFTER.backing_pages, AFTER.quarantined);
+    if (sender != nullptr) sender->release();
+    if (holder != nullptr) holder->release();
+    if (retirer != nullptr) retirer->release();
+    ker::mod::power::selftest_shutdown();
+}
+
+void selftest_live_start(VirtIONetDevice* dev) {
+    if (ker::mod::smt::get_core_count() < 4 || dev->queue_pairs[0].napi.worker == nullptr) {
+        net_log::error("virtio live DMA requires four CPUs and a NAPI worker");
+        return;
+    }
+    VirtIONetDevice* expected = nullptr;
+    if (!live_test.device.compare_exchange_strong(expected, dev, std::memory_order_acq_rel)) return;
+    selftest_live_withhold_reset = cmdline_has_token(ker::init::get_kernel_cmdline(), "--virtio-test-live-withhold-reset");
+    auto* runner = live_post("dma_live_test", selftest_live_runner, 0);
+    if (runner != nullptr)
+        runner->release();
+    else
+        net_log::error("virtio live DMA coordinator allocation failed");
+}
+
+auto selftest_terminal_retirement(VirtIONetDevice* dev) -> int {
+    // Publish real netdevice and IRQ registry entries. BSP KTEST deliberately
+    // has no running NAPI workers; concurrent execution needs a separate boot.
+    auto& pair = dev->queue_pairs[0];
+    dev->netdev.ops = &virtio_net_ops;
+    dev->netdev.private_data = dev;
+    dev->netdev.state = 1;
+    dev->num_queue_pairs = 1;
+    pair.irq_vector = ker::mod::gates::allocate_vector();
+    pair.irq_owned = pair.irq_vector != 0;
+    if (!pair.irq_owned || pci::pci_enable_msix(dev->pci, pair.irq_vector, 0) != 0) return fail_probe(dev);
+    dev->msix_enabled = true;
+    if (dev->modern_cfg != nullptr) {
+        dev->modern_cfg->config_msix_vector = VIRTIO_MSI_NO_VECTOR;
+        for (uint16_t q : {uint16_t{0}, uint16_t{1}}) {
+            dev->modern_cfg->queue_select = q;
+            dev->modern_cfg->queue_msix_vector = 0;
+            if (dev->modern_cfg->queue_msix_vector != 0) return fail_probe(dev);
+        }
+    } else {
+        ::outw(dev->io_base + VIRTIO_MSI_CONFIG_VECTOR, VIRTIO_MSI_NO_VECTOR);
+        for (uint16_t q : {uint16_t{0}, uint16_t{1}}) {
+            ::outw(dev->io_base + VIRTIO_REG_QUEUE_SELECT, q);
+            ::outw(dev->io_base + VIRTIO_MSI_QUEUE_VECTOR, 0);
+            if (::inw(dev->io_base + VIRTIO_MSI_QUEUE_VECTOR) != 0) return fail_probe(dev);
+        }
+    }
+    if (!publish_irqs(dev)) return fail_published_probe(dev);
+    if (ker::net::netdev_register(&dev->netdev) != 0) return fail_published_probe(dev);
+    devices.at(device_count++) = dev;
+    probe_test->terminal_published = true;
+    int const RET = virtio_net_shutdown();
+    probe_test->terminal_irq_drained = !pair.irq_owned;
+    auto const AFTER = dma::stats(dev->pci);
+    auto* late = ker::net::pkt_alloc();
+    bool const TX_REJECTED = late != nullptr && virtio_net_start_xmit(&dev->netdev, late) == -ENODEV;
+    virtio_net_irq(pair.irq_vector, &pair);
+    bool const POLL_REJECTED = virtio_net_poll(&pair.napi, 64) == 0;
+    probe_test->terminal_late_rejected =
+        TX_REJECTED && POLL_REJECTED && virtio_net_open(&dev->netdev) == -ENODEV &&
+        virtio_net_set_queue_cpu(&dev->netdev, 0, 0) == -ENODEV && virtio_net_set_queue_cpu_mask(&dev->netdev, 1) == -ENODEV &&
+        virtio_net_check_mac(&dev->netdev, dev->netdev.mac.data()) == -ENODEV && !send_mq_ctrl_cmd(dev, 1) &&
+        !ker::net::netdev_is_registered(&dev->netdev) && init_device(dev->pci) == -ENODEV;
+    int const AGAIN = virtio_net_shutdown();
+    auto const REPEATED = dma::stats(dev->pci);
+    probe_test->terminal_repeat_stable = RET == AGAIN && RET == (probe_test_withhold_reset ? -EIO : 0) &&
+                                         AFTER.regions == REPEATED.regions && AFTER.backing_pages == REPEATED.backing_pages &&
+                                         AFTER.quarantined == REPEATED.quarantined;
+    net_log::info("virtio terminal test published=%u late_rejected=%u irq_drained=%u repeat_stable=%u", probe_test->terminal_published,
+                  probe_test->terminal_late_rejected, probe_test->terminal_irq_drained, probe_test->terminal_repeat_stable);
+    return -1;
+}
+
+auto selftest_probe_boundary(VirtIONetDevice* dev, uint16_t pairs) -> int {
+    probe_test->prepared = true;
+    probe_test->mapped = dma::stats(dev->pci);
+    probe_test->bme_enabled =
+        (pci::pci_config_read16(dev->pci->bus, dev->pci->slot, dev->pci->function, pci::PCI_COMMAND) & pci::PCI_COMMAND_BUS_MASTER) != 0;
+    // Queue/control DMA runs before IRQ handlers or NAPI workers are published.
+    if (dev->modern_cfg != nullptr) {
+        dev->modern_cfg->device_status =
+            VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK;
+        probe_test->control_present = dev->ctrlq != nullptr;
+        if (probe_test->control_present) probe_test->control_ack = send_mq_ctrl_cmd(dev, pairs);
+    } else {
+        write_status(dev->io_base, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_DRIVER_OK);
+    }
+    if (probe_test->packets_requested) selftest_packet_dma(dev);
+    int const RESULT = probe_test->terminal_requested ? selftest_terminal_retirement(dev) : fail_probe(dev);
+    if (probe_test->packets_requested) probe_test->packet_pool_after = ker::net::pkt_pool_free_count();
+    return RESULT;
+}
+#endif
+
+// Only -ENOTSUP permits legacy fallback; owned probe failures are terminal.
 auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
     uint8_t const COMMON_CAP = virtio_find_cap(pci_dev, VIRTIO_PCI_CAP_COMMON_CFG);
     uint8_t const NOTIFY_CAP = virtio_find_cap(pci_dev, VIRTIO_PCI_CAP_NOTIFY_CFG);
     if (COMMON_CAP == 0 || NOTIFY_CAP == 0) {
-        return -1;
+        return -ENOTSUP;
     }
 
+    pci::pci_enable_memory_space(pci_dev);
     auto* common_va = map_virtio_cap_region(pci_dev, COMMON_CAP);
     if (common_va == nullptr) {
         return -1;
@@ -980,7 +1695,7 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
     cfg->device_feature_select = 1;
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
     if ((cfg->device_feature & VIRTIO_F_VERSION_1) == 0) {
-        return -1;
+        return -ENOTSUP;
     }
 
     uint32_t notify_off_mult =
@@ -991,9 +1706,6 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
     }
 
     uint8_t const DEVCFG_CAP = virtio_find_cap(pci_dev, VIRTIO_PCI_CAP_DEVICE_CFG);
-
-    ker::dev::pci::pci_enable_memory_space(pci_dev);
-    ker::dev::pci::pci_enable_bus_master(pci_dev);
 
     volatile uint8_t* devcfg_va = (DEVCFG_CAP != 0) ? map_virtio_cap_region(pci_dev, DEVCFG_CAP) : nullptr;
 
@@ -1013,17 +1725,21 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
 
     uint64_t const CORE_COUNT = ker::mod::smt::get_core_count();
 
-    // Reset
-    cfg->device_status = 0;
-    for (int i = 0; i < 1000 && cfg->device_status != 0; i++) {
-        asm volatile("pause");
-    }
+    if (!prepare_probe(dev)) return fail_probe(dev);
     cfg->device_status = VIRTIO_STATUS_ACKNOWLEDGE;
     cfg->device_status = static_cast<uint8_t>(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
 
     cfg->device_feature_select = 0;
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
     uint32_t const FEAT_LO = cfg->device_feature;
+    cfg->device_feature_select = 1;
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    bool const TRANSLATED = iommu::domain_info(pci_dev).mode == iommu::DomainMode::translated;
+    auto const UPPER = platform_features(cfg->device_feature, TRANSLATED);
+    if (!UPPER) {
+        net_log::error("modern virtio requires VERSION_1 and translated DMA requires ACCESS_PLATFORM; probe refused");
+        return fail_probe(dev);
+    }
 
     uint32_t our_lo = 0;
     if ((FEAT_LO & VIRTIO_NET_F_MAC) != 0) {
@@ -1049,21 +1765,22 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
     cfg->driver_feature_select = 0;
     cfg->driver_feature = our_lo;
     cfg->driver_feature_select = 1;
-    cfg->driver_feature = VIRTIO_F_VERSION_1;
+    cfg->driver_feature = *UPPER;
 
     cfg->device_status = static_cast<uint8_t>(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK);
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
     if ((cfg->device_status & VIRTIO_STATUS_FEATURES_OK) == 0) {
         net_log::error("modern FEATURES_OK rejected");
-        cfg->device_status = VIRTIO_STATUS_FAILED;
-        delete dev;
-        return -1;
+        return fail_probe(dev);
     }
+    bool const PLATFORM = (*UPPER & VIRTIO_F_ACCESS_PLATFORM) != 0;
+    if (!iommu::set_platform_dma_ready(pci_dev, PLATFORM)) return fail_probe(dev);
+    net_log::info("virtio platform DMA negotiated=%u translated=%u upper=0x%x", PLATFORM, TRANSLATED, *UPPER);
     dev->negotiated_features = our_lo;
-    dev->hdr_size = virtio_net_hdr_size_for_features(our_lo);
+    dev->hdr_size = static_cast<uint8_t>(VIRTIO_NET_HDR_SIZE_MODERN);
 
     // Set up one queue: select, size, alloc, assign addresses, notify addr, enable.
-    auto setup_queue = [&](uint16_t q_idx, uint16_t max_size) -> Virtqueue* {
+    auto setup_queue = [&](uint16_t q_idx, uint16_t max_size, QueueKind kind) -> Virtqueue* {
         cfg->queue_select = q_idx;
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         uint16_t const HW_SIZE = cfg->queue_size;
@@ -1071,9 +1788,10 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
             return nullptr;
         }
         uint16_t const SIZE = std::min({HW_SIZE, max_size, VIRTQ_MAX_SIZE});
+        if (managed::layout(SIZE).bytes == 0) return nullptr;
         cfg->queue_size = SIZE;
 
-        auto* vq = virtq_alloc(SIZE);
+        auto* vq = virtq_alloc(pci_dev, SIZE, kind);
         if (vq == nullptr) {
             return nullptr;
         }
@@ -1082,27 +1800,29 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
         uint16_t const NOTIFY_OFF = cfg->queue_notify_off;
         vq->notify_addr = reinterpret_cast<volatile uint16_t*>(notify_va + (static_cast<size_t>(NOTIFY_OFF) * notify_off_mult));
 
-        cfg->queue_desc = virt_to_phys(vq->desc);
-        cfg->queue_avail = virt_to_phys(vq->avail);
-        cfg->queue_used = virt_to_phys(vq->used);
+        // expose() precedes every hardware-visible address write.
+        if (!vq->ring.expose()) {
+            (void)virtq_retire(vq, false);
+            return nullptr;
+        }
+        auto const LAYOUT = managed::layout(SIZE);
+        cfg->queue_desc = vq->ring.submission.address;
+        cfg->queue_avail = vq->ring.submission.address + LAYOUT.available;
+        cfg->queue_used = vq->ring.submission.address + LAYOUT.used;
         cfg->queue_enable = 1;
         return vq;
     };
 
     auto& pair0 = dev->queue_pairs.at(0);
-    pair0.rxq = setup_queue(rx_queue_index(0), VIRTQ_MAX_SIZE);
+    pair0.rxq = setup_queue(rx_queue_index(0), VIRTQ_MAX_SIZE, QueueKind::receive);
     if (pair0.rxq == nullptr) {
         net_log::error("modern RX queue failed");
-        cfg->device_status = VIRTIO_STATUS_FAILED;
-        delete dev;
-        return -1;
+        return fail_probe(dev);
     }
-    pair0.txq = setup_queue(tx_queue_index(0), VIRTQ_MAX_SIZE);
+    pair0.txq = setup_queue(tx_queue_index(0), VIRTQ_MAX_SIZE, QueueKind::transmit);
     if (pair0.txq == nullptr) {
         net_log::error("modern TX queue failed");
-        cfg->device_status = VIRTIO_STATUS_FAILED;
-        delete dev;
-        return -1;
+        return fail_probe(dev);
     }
 
     uint8_t target_queue_pairs = SINGLE_QUEUE_PAIRS;
@@ -1111,8 +1831,9 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
         uint16_t max_vq_pairs = 1;
         if (devcfg_va != nullptr) {
             max_vq_pairs = *reinterpret_cast<volatile const uint16_t*>(devcfg_va + 8);
-            if (max_vq_pairs >= MIN_MQ_QUEUE_PAIRS) {
+            if (max_vq_pairs != 0 && max_vq_pairs < 0x8000U) {
                 ctrlq_idx = static_cast<uint16_t>(2U * max_vq_pairs);
+                want_mq = max_vq_pairs >= MIN_MQ_QUEUE_PAIRS;
             } else {
                 want_mq = false;
             }
@@ -1134,32 +1855,45 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
         uint8_t configured_pairs = SINGLE_QUEUE_PAIRS;
         for (uint8_t pair_idx = 1; pair_idx < target_queue_pairs; pair_idx++) {
             auto& pair = dev->queue_pairs.at(pair_idx);
-            pair.rxq = setup_queue(rx_queue_index(pair_idx), VIRTQ_MAX_SIZE);
-            pair.txq = setup_queue(tx_queue_index(pair_idx), VIRTQ_MAX_SIZE);
+            pair.rxq = setup_queue(rx_queue_index(pair_idx), VIRTQ_MAX_SIZE, QueueKind::receive);
+            pair.txq = setup_queue(tx_queue_index(pair_idx), VIRTQ_MAX_SIZE, QueueKind::transmit);
             if (pair.rxq == nullptr || pair.txq == nullptr) {
-                net_log::warn("modern queue pair %u setup failed, using %u pair(s)", pair_idx, configured_pairs);
-                break;
+                net_log::warn("modern queue pair %u setup failed", pair_idx);
+                return fail_probe(dev);
             }
             configured_pairs++;
         }
         target_queue_pairs = configured_pairs;
         want_mq = target_queue_pairs >= MIN_MQ_QUEUE_PAIRS;
     }
-    if (want_mq) {
-        dev->ctrlq = setup_queue(ctrlq_idx, 32);
-        if (dev->ctrlq == nullptr) {
-            want_mq = false;
-        }
+    bool prepare_control = want_mq;
+#ifdef WOS_SELFTEST
+    // Rootless socket backends expose one pair. Still exercise the real MQ
+    // command (pairs=1) and its DMA lifetime without inventing a second backend.
+    if (probe_test != nullptr && ctrlq_idx != 0 && (our_lo & VIRTIO_NET_F_MQ) != 0) prepare_control = true;
+#endif
+    if (prepare_control) {
+        dev->ctrlq = setup_queue(ctrlq_idx, 32, QueueKind::control);
+        managed::DmaApi api;
+        if (dev->ctrlq == nullptr || dev->ctrlq->size < 4 || !dev->control_buffer.allocate(api, pci_dev, managed::PAGE) ||
+            !dev->control_buffer.prepare(api))
+            return fail_probe(dev);
     }
+
+    // Every ring, packet slot and control mapping is ready before DMA admission.
+    // Passthrough is still explicit until translated domains are enabled.
+    if (!pci::pci_set_bus_master(pci_dev, true)) return fail_probe(dev);
+#ifdef WOS_SELFTEST
+    if (probe_test != nullptr) return selftest_probe_boundary(dev, target_queue_pairs);
+#endif
 
     uint8_t vector = ker::mod::gates::allocate_vector();
     if (vector == 0) {
         net_log::error("no free IRQ vector");
-        cfg->device_status = VIRTIO_STATUS_FAILED;
-        delete dev;
-        return -1;
+        return fail_probe(dev);
     }
     pair0.irq_vector = vector;
+    pair0.irq_owned = true;
     uint8_t allocated_pair_vectors = 1;
 
     if (want_mq) {
@@ -1172,6 +1906,7 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
                 break;
             }
             pair.irq_vector = PAIR_VECTOR;
+            pair.irq_owned = true;
             allocated_pair_vectors = static_cast<uint8_t>(pair_idx + 1U);
         }
         want_mq = target_queue_pairs >= MIN_MQ_QUEUE_PAIRS;
@@ -1233,12 +1968,15 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
     }
 
     if (!dev->msix_enabled) {
+        if (!mask_interrupts(dev)) return fail_probe(dev);
         want_mq = false;
         int const MSI_RET = ker::dev::pci::pci_enable_msi(pci_dev, vector, net_cpu_for_pair(CORE_COUNT, 0));
         if (MSI_RET != 0) {
             ker::mod::gates::free_irq(vector);
             vector = pci_dev->interrupt_line + 32;
             pair0.irq_vector = vector;
+            pair0.irq_owned = false;
+            dev->use_intx = true;
             ker::mod::ioapic::route_irq(pci_dev->interrupt_line, vector, 0);
         }
     }
@@ -1246,7 +1984,9 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
     uint8_t const RETAINED_PAIR_VECTORS = (want_mq && dev->msix_enabled) ? target_queue_pairs : SINGLE_QUEUE_PAIRS;
     for (uint8_t pair_idx = RETAINED_PAIR_VECTORS; pair_idx < allocated_pair_vectors; ++pair_idx) {
         auto& pair = dev->queue_pairs.at(pair_idx);
+        virtio_net_unassign_pair_vectors(dev, pair_idx);
         ker::mod::gates::free_irq(pair.irq_vector);
+        pair.irq_owned = false;
         pair.irq_vector = 0;
     }
 
@@ -1260,13 +2000,7 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
         }
     }
 
-    for (uint8_t pair_idx = 0; pair_idx < dev->num_queue_pairs; pair_idx++) {
-        auto& pair = dev->queue_pairs.at(pair_idx);
-        ker::net::napi_init(&pair.napi, &dev->netdev, virtio_net_poll, 64);
-        if (pair.irq_vector != 0) {
-            ker::mod::gates::request_irq(pair.irq_vector, virtio_net_irq, &pair, pair_idx == 0 ? "virtio-net" : "virtio-net-mq");
-        }
-    }
+    if (!publish_irqs(dev)) return fail_published_probe(dev);
 
     cfg->device_status =
         static_cast<uint8_t>(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK);
@@ -1326,12 +2060,22 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
 }
 
 auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
+    if (shutdown_started.load(std::memory_order_acquire)) return -ENODEV;
+    for (size_t i = 0; i < device_count; ++i) {
+        if (devices[i]->pci == pci_dev) return devices[i]->admission.closed() ? -ENODEV : 0;
+    }
+    for (auto* failed = failed_probes; failed != nullptr; failed = failed->failed_probe_next) {
+        if (failed->pci == pci_dev) return -1;
+    }
     if (device_count >= MAX_VIRTIO_NET_DEVICES) {
         return -1;
     }
 
-    if (init_device_modern(pci_dev) == 0) {
-        return 0;
+    int const MODERN = init_device_modern(pci_dev);
+    if (MODERN != -ENOTSUP) return MODERN;
+    if (iommu::domain_info(pci_dev).mode == iommu::DomainMode::translated) {
+        net_log::error("legacy virtio refused in translated DMA mode: ACCESS_PLATFORM unavailable");
+        return -1;
     }
 
     // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access): PCI BAR0 is fixed config-space layout.
@@ -1341,12 +2085,16 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
         return -1;
     }
 
-    ker::dev::pci::pci_enable_bus_master(pci_dev);
     uint16_t cmd = ker::dev::pci::pci_config_read16(pci_dev->bus, pci_dev->slot, pci_dev->function, ker::dev::pci::PCI_COMMAND);
     cmd |= ker::dev::pci::PCI_COMMAND_IO_SPACE;
     ker::dev::pci::pci_config_write16(pci_dev->bus, pci_dev->slot, pci_dev->function, ker::dev::pci::PCI_COMMAND, cmd);
 
-    write_status(io_base, 0);
+    auto* dev = new (std::nothrow) VirtIONetDevice{};
+    if (dev == nullptr) return -1;
+    init_queue_pair_contexts(dev);
+    dev->pci = pci_dev;
+    dev->io_base = io_base;
+    if (!prepare_probe(dev)) return fail_probe(dev);
 
     write_status(io_base, VIRTIO_STATUS_ACKNOWLEDGE);
 
@@ -1363,19 +2111,11 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     if ((DEV_FEATURES & VIRTIO_NET_F_STATUS) != 0) {
         our_features |= VIRTIO_NET_F_STATUS;
     }
-    if ((DEV_FEATURES & VIRTIO_NET_F_MRG_RXBUF) != 0) {
+    if ((DEV_FEATURES & VIRTIO_NET_F_MRG_RXBUF) != 0 && !virtio_net_mrg_rxbuf_disabled()) {
         our_features |= VIRTIO_NET_F_MRG_RXBUF;
     }
     ::outl(io_base + VIRTIO_REG_GUEST_FEATURES, our_features);
 
-    auto* dev = new (std::nothrow) VirtIONetDevice{};
-    if (dev == nullptr) {
-        write_status(io_base, VIRTIO_STATUS_FAILED);
-        return -1;
-    }
-    init_queue_pair_contexts(dev);
-    dev->pci = pci_dev;
-    dev->io_base = io_base;
     dev->hdr_size = virtio_net_hdr_size_for_features(our_features);
     dev->negotiated_features = our_features;
     auto& pair0 = dev->queue_pairs.at(0);
@@ -1384,59 +2124,57 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     uint16_t rxq_size = ::inw(io_base + VIRTIO_REG_QUEUE_SIZE);
     if (rxq_size == 0) {
         net_log::error("RX queue size is 0");
-        write_status(io_base, VIRTIO_STATUS_FAILED);
-        delete dev;
-        return -1;
+        return fail_probe(dev);
     }
-    rxq_size = std::min(rxq_size, VIRTQ_MAX_SIZE);
+    if (managed::layout(rxq_size).bytes == 0) return fail_probe(dev);
 
-    pair0.rxq = virtq_alloc(rxq_size);
+    pair0.rxq = virtq_alloc(pci_dev, rxq_size, QueueKind::receive, managed::LEGACY_QUEUE_MASK);
     if (pair0.rxq == nullptr) {
         net_log::error("failed to alloc RX queue");
-        write_status(io_base, VIRTIO_STATUS_FAILED);
-        delete dev;
-        return -1;
+        return fail_probe(dev);
     }
     pair0.rxq->io_base = io_base;
     pair0.rxq->queue_index = rx_queue_index(0);
     virtio_net_set_queue_notifications(pair0.rxq, false);
 
-    uint64_t const RXQ_PHYS = virt_to_phys(pair0.rxq->desc);
+    if (!pair0.rxq->ring.expose()) return fail_probe(dev);
+    uint64_t const RXQ_PHYS = pair0.rxq->ring.submission.address;
     ::outl(io_base + VIRTIO_REG_QUEUE_ADDR, static_cast<uint32_t>(RXQ_PHYS / 4096));
 
     ::outw(io_base + VIRTIO_REG_QUEUE_SELECT, 1);
     uint16_t txq_size = ::inw(io_base + VIRTIO_REG_QUEUE_SIZE);
     if (txq_size == 0) {
         net_log::error("TX queue size is 0");
-        write_status(io_base, VIRTIO_STATUS_FAILED);
-        delete dev;
-        return -1;
+        return fail_probe(dev);
     }
-    txq_size = std::min(txq_size, VIRTQ_MAX_SIZE);
+    if (managed::layout(txq_size).bytes == 0) return fail_probe(dev);
 
-    pair0.txq = virtq_alloc(txq_size);
+    pair0.txq = virtq_alloc(pci_dev, txq_size, QueueKind::transmit, managed::LEGACY_QUEUE_MASK);
     if (pair0.txq == nullptr) {
         net_log::error("failed to alloc TX queue");
-        write_status(io_base, VIRTIO_STATUS_FAILED);
-        delete dev;
-        return -1;
+        return fail_probe(dev);
     }
     pair0.txq->io_base = io_base;
     pair0.txq->queue_index = tx_queue_index(0);
     virtio_net_set_queue_notifications(pair0.txq, false);
 
-    uint64_t const TXQ_PHYS = virt_to_phys(pair0.txq->desc);
+    if (!pair0.txq->ring.expose()) return fail_probe(dev);
+    uint64_t const TXQ_PHYS = pair0.txq->ring.submission.address;
     ::outl(io_base + VIRTIO_REG_QUEUE_ADDR, static_cast<uint32_t>(TXQ_PHYS / 4096));
+
+    if (!pci::pci_set_bus_master(pci_dev, true)) return fail_probe(dev);
+#ifdef WOS_SELFTEST
+    if (probe_test != nullptr) return selftest_probe_boundary(dev, 1);
+#endif
 
     // Try MSI-X first (needed for per-pair CPU steering), then MSI, then INTx.
     uint8_t vector = ker::mod::gates::allocate_vector();
     if (vector == 0) {
         net_log::error("no free IRQ vector");
-        write_status(io_base, VIRTIO_STATUS_FAILED);
-        delete dev;
-        return -1;
+        return fail_probe(dev);
     }
     pair0.irq_vector = vector;
+    pair0.irq_owned = true;
 
     int const MSIX_RET = ker::dev::pci::pci_enable_msix(pci_dev, vector, net_cpu_for_pair(CORE_COUNT, 0));
     if (MSIX_RET == 0) {
@@ -1464,11 +2202,14 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     }
 
     if (!dev->msix_enabled) {
+        if (!mask_interrupts(dev)) return fail_probe(dev);
         int const MSI_RET = ker::dev::pci::pci_enable_msi(pci_dev, vector, net_cpu_for_pair(CORE_COUNT, 0));
         if (MSI_RET != 0) {
             ker::mod::gates::free_irq(vector);
             vector = pci_dev->interrupt_line + 32;
             pair0.irq_vector = vector;
+            pair0.irq_owned = false;
+            dev->use_intx = true;
             ker::mod::ioapic::route_irq(pci_dev->interrupt_line, vector, 0);
         }
     }
@@ -1484,13 +2225,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
         }
     }
 
-    for (uint8_t pair_idx = 0; pair_idx < dev->num_queue_pairs; pair_idx++) {
-        auto& pair = dev->queue_pairs.at(pair_idx);
-        ker::net::napi_init(&pair.napi, &dev->netdev, virtio_net_poll, 64);
-        if (pair.irq_vector != 0) {
-            ker::mod::gates::request_irq(pair.irq_vector, virtio_net_irq, &pair, pair_idx == 0 ? "virtio-net" : "virtio-net-mq");
-        }
-    }
+    if (!publish_irqs(dev)) return fail_published_probe(dev);
 
     write_status(io_base, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_DRIVER_OK);
 
@@ -1539,6 +2274,9 @@ auto virtio_net_diag_snapshot(VirtIONetDiagSnapshot* out, size_t max) -> size_t 
             continue;
         }
 
+        CallbackGuard const GUARD(dev->admission);
+        if (!GUARD) continue;
+
         uint8_t const CONFIGURED = std::min<uint8_t>(dev->configured_queue_pairs, VIRTIO_NET_MAX_QUEUE_PAIRS);
         for (uint8_t pair_idx = 0; pair_idx < CONFIGURED && count < max; ++pair_idx) {
             auto& pair = dev->queue_pairs.at(pair_idx);
@@ -1566,6 +2304,17 @@ auto virtio_net_diag_snapshot(VirtIONetDiagSnapshot* out, size_t max) -> size_t 
         }
     }
     return count;
+}
+
+auto virtio_net_shutdown() -> int {
+    if (ker::mod::sched::can_query_current_task() && !ker::mod::mm::phys::can_wait_for_reclaim()) return -EWOULDBLOCK;
+    shutdown_started.store(true, std::memory_order_release);
+    int result = 0;
+    for (size_t i = 0; i < device_count; ++i) {
+        int const RET = retire_device(devices[i]);
+        if (RET != 0) result = RET;
+    }
+    return result;
 }
 
 auto virtio_net_init() -> int {
@@ -1605,9 +2354,51 @@ auto virtio_net_init() -> int {
     if (found == 0) {
         net_log::info("no devices found");
     }
+#ifdef WOS_SELFTEST
+    if (found != 0 && cmdline_has_token(ker::init::get_kernel_cmdline(), "--virtio-test-live")) selftest_live_start(devices[0]);
+#endif
 
     return found;
 }
+
+#ifdef WOS_SELFTEST
+auto virtio_selftest_probe_unwind() -> SelftestProbeResult {
+    SelftestProbeResult result;
+    bool const WITHHOLD = cmdline_has_token(ker::init::get_kernel_cmdline(), "--virtio-test-withhold-reset");
+    result.reject_platform_requested = cmdline_has_token(ker::init::get_kernel_cmdline(), "--virtio-test-reject-platform");
+    result.withhold_reset_proof = WITHHOLD;
+    result.packets_requested = cmdline_has_token(ker::init::get_kernel_cmdline(), "--virtio-test-packets");
+    result.terminal_requested = cmdline_has_token(ker::init::get_kernel_cmdline(), "--virtio-test-terminal");
+    if (device_count != 0 || probe_test != nullptr) return result;
+    for (size_t i = 0; i < pci::pci_device_count(); ++i) {
+        auto* dev = pci::pci_get_device(i);
+        if (dev == nullptr || dev->vendor_id != VIRTIO_VENDOR ||
+            (dev->device_id != VIRTIO_NET_MODERN && !(dev->device_id == VIRTIO_NET_LEGACY && dev->class_code == pci::PCI_CLASS_NETWORK)))
+            continue;
+        result.found = true;
+        result.before = dma::stats(dev);
+        probe_test = &result;
+        probe_test_withhold_reset = WITHHOLD;
+        (void)init_device(dev);
+        probe_test = nullptr;
+        probe_test_withhold_reset = false;
+        result.after = dma::stats(dev);
+        result.platform_admission_closed = iommu::domain_info(dev).mode != iommu::DomainMode::translated ||
+                                           (!iommu::bus_master_allowed(dev) && !pci::pci_set_bus_master(dev, true));
+        result.bme_disabled =
+            (pci::pci_config_read16(dev->bus, dev->slot, dev->function, pci::PCI_COMMAND) & pci::PCI_COMMAND_BUS_MASTER) == 0;
+        net_log::info("virtio DMA probe prepared=%u ctrl=%u ack=%u reset_observed=%u withheld=%u regions=%zu->%zu pages=%zu->%zu q=%zu",
+                      result.prepared, result.control_present, result.control_ack, result.reset_observed, WITHHOLD, result.mapped.regions,
+                      result.after.regions, result.mapped.backing_pages, result.after.backing_pages, result.after.quarantined);
+        net_log::info("virtio platform admission closed=%u rejection_requested=%u bme_off=%u", result.platform_admission_closed,
+                      result.reject_platform_requested, result.bme_disabled);
+        net_log::info("virtio packet DMA requested=%u verified=%u pool=%zu->%zu streaming=%zu", result.packets_requested,
+                      result.packets_verified, result.packet_pool_before, result.packet_pool_after, result.mapped.streaming);
+        break;
+    }
+    return result;
+}
+#endif
 
 #ifdef WOS_SELFTEST
 auto virtio_selftest_queue_affinity_batch() -> bool {
