@@ -40,6 +40,8 @@ __attribute__((used, section(".requests"))) volatile limine_hhdm_request hhdm_re
 
 namespace ker::mod::mm {
 
+auto boot_memory_map() -> const limine_memmap_response* { return memmap_request.response; }
+
 namespace {
 using log = ker::mod::dbg::logger<"mm">;
 }  // namespace

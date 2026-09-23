@@ -1,3 +1,18 @@
+wos_add_unit_test(iommu_reserved_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/iommu_reserved_test.cpp
+)
+wos_add_unit_test(iommu_groups_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/iommu_groups_test.cpp
+)
+wos_add_fuzz_target(pci_ecam_fuzz
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/pci_ecam_fuzz.cpp
+)
+wos_add_unit_test(pci_ecam_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/pci_ecam_test.cpp
+)
+wos_add_unit_test(vtd_fault_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vtd_fault_test.cpp
+)
 wos_add_unit_test(stack_resume_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/stack_resume_test.cpp
 )
@@ -10,6 +25,30 @@ wos_add_unit_test(shutdown_ownership_test
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+wos_add_unit_test(dmar_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/dmar_test.cpp
+)
+wos_add_unit_test(vtd_model_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vtd_model_test.cpp
+)
+wos_add_unit_test(vtd_page_table_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vtd_page_table_test.cpp
+)
+wos_add_unit_test(acpi_bounded_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/acpi_bounded_test.cpp
+)
+wos_add_unit_test(vtd_capability_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vtd_capability_test.cpp
+)
+wos_add_unit_test(iommu_scopes_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/iommu_scopes_test.cpp
+)
+wos_add_unit_test(vtd_activation_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vtd_activation_test.cpp
+)
+wos_add_fuzz_target(dmar_fuzz
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/dmar_fuzz.cpp
+)
 
 wos_add_unit_test(time_arithmetic_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/time_arithmetic_test.cpp
