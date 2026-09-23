@@ -25,6 +25,7 @@
 #include <net/wki/routing.hpp>
 #include <net/wki/timer_math.hpp>
 #include <net/wki/transport_eth.hpp>
+#include <net/wki/transport_ivshmem.hpp>
 #include <net/wki/transport_roce.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
@@ -318,6 +319,10 @@ void notify_deferred_work() {
 // One copied routing generation selects both the neighbor and transport.
 // Registry admission keeps that transport alive until the bounded TX ends.
 class ResolvedRoute {
+    // Includes registry leases used by broadcasts even when no unicast route
+    // is resolved. Release the lease in the destructor before allowing exit.
+    mod::sched::KernelShutdownHold shutdown_{mod::sched::hold_kernel_shutdown()};
+
    public:
     ResolvedRoute() = default;
     ResolvedRoute(const ResolvedRoute&) = delete;
@@ -1569,6 +1574,7 @@ auto wki_peer_capability_negotiated(uint16_t peer_node, uint16_t capabilities) -
 
 void wki_shutdown() {
     if (!g_wki.initialized) {
+        (void)wki_ivshmem_transport_shutdown();
         return;
     }
 
@@ -1591,6 +1597,13 @@ void wki_shutdown() {
 
     for (size_t i = 0; i < connected_count; ++i) {
         (void)wki_send_raw(connected_peers.at(i), MsgType::PEER_GOODBYE, &goodbye, sizeof(goodbye), WKI_FLAG_PRIORITY);
+    }
+
+    // Outside transport/peer locks: an admitted shared-memory callback may
+    // still be completing WKI work. Do not clear core/auth state under it.
+    if (wki_ivshmem_transport_shutdown() != 0) {
+        log::warn("ivshmem callback/IRQ drain unproven; retaining WKI shutdown state");
+        return;
     }
 
     // Gracefully detach connected peers locally. This reuses the normal cleanup

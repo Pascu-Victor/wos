@@ -1,12 +1,16 @@
 #include "ivshmem_net.hpp"
 
 #include <array>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <dev/ivshmem/callback.hpp>
+#include <dev/ivshmem/selftest.hpp>
 #include <net/packet.hpp>
 #include <new>  // IWYU pragma: keep
 #include <platform/dbg/dbg.hpp>
-#include <platform/interrupt/gates.hpp>
+#include <platform/fw/qemu_fw_cfg.hpp>
+#include <platform/ktime/ktime.hpp>
 #include <span>
 
 #include "dev/pci.hpp"
@@ -25,129 +29,66 @@ constexpr size_t MAX_IVSHMEM_DEVICES = 2;
 std::array<IvshmemNetDevice, MAX_IVSHMEM_DEVICES> dev_pool = {};
 std::array<IvshmemNetDevice*, MAX_IVSHMEM_DEVICES> devices = {};
 size_t device_count = 0;
+size_t probe_count = 0;
+std::atomic<bool> shutdown_started{false};
+#ifdef WOS_SELFTEST
+IvshmemNetDevice* test_device = nullptr;
+auto selftest_late_calls() -> bool;
+#endif
 
-// BAR0 register offsets (ivshmem-plain)
-constexpr uint32_t IVSHMEM_REG_INTRMASK = 0x00;
-constexpr uint32_t IVSHMEM_REG_INTRSTATUS = 0x04;
+// Revision-1 BAR0 position register
 constexpr uint32_t IVSHMEM_REG_IVPOSITION = 0x08;
-constexpr uint32_t IVSHMEM_REG_DOORBELL = 0x0C;
 
 // -- IRQ enable/disable helpers --
-void ivshmem_irq_disable(IvshmemNetDevice* dev) {
-    // Mask all interrupts
-    dev->regs[IVSHMEM_REG_INTRMASK / 4] = 0;
-}
+void ivshmem_irq_disable(IvshmemNetDevice* dev) { dev->resources.mask_vector(true); }
 
-void ivshmem_irq_enable(IvshmemNetDevice* dev) {
-    // Unmask all interrupts
-    dev->regs[IVSHMEM_REG_INTRMASK / 4] = 0xFFFFFFFF;
-}
-
-// -- Ring buffer operations --
-
-// Write a packet to the ring. Returns 0 on success, -1 if ring full.
-auto ring_write(RingBuffer* ring, std::span<const uint8_t> data) -> int {
-    // Packet format: [len:u16][data][pad to 4 bytes]
-    auto const LEN = static_cast<uint16_t>(data.size());
-    uint32_t const PKT_SIZE = 2 + LEN;
-    uint32_t const PADDED = (PKT_SIZE + 3) & ~3U;
-
-    uint32_t const HEAD = ring->head;
-    uint32_t const TAIL = ring->tail;
-    uint32_t space = 0;
-    if (HEAD >= TAIL) {
-        space = ring->size - HEAD + TAIL;
-    } else {
-        space = TAIL - HEAD;
-    }
-    // Need space + 1 to distinguish full from empty
-    if (PADDED + 1 > space) {
-        return -1;
-    }
-
-    // Write length
-    uint32_t pos = HEAD;
-    ring->data[pos % ring->size] = static_cast<uint8_t>(LEN & 0xFF);
-    ring->data[(pos + 1) % ring->size] = static_cast<uint8_t>(LEN >> 8);
-    pos += 2;
-
-    // Write data
-    for (uint16_t i = 0; i < LEN; i++) {
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access): bounded by LEN from the span size.
-        ring->data[(pos + i) % ring->size] = data[i];
-    }
-    pos += LEN;
-
-    // Pad
-    while (((pos - HEAD) & 3U) != 0U) {
-        ring->data[pos % ring->size] = 0;
-        pos++;
-    }
-
-    // Update head (store with release semantics)
-    asm volatile("" ::: "memory");
-    ring->head = pos % ring->size;
-    return 0;
-}
-
-// Read a packet from the ring. Returns packet length, 0 if empty.
-auto ring_read(RingBuffer* ring, std::span<uint8_t> buf) -> uint16_t {
-    uint32_t const HEAD = ring->head;
-    uint32_t const TAIL = ring->tail;
-    asm volatile("" ::: "memory");
-
-    if (HEAD == TAIL) {
-        return 0;  // Empty
-    }
-
-    // Read length
-    uint16_t const LEN =
-        static_cast<uint16_t>(ring->data[TAIL % ring->size]) | (static_cast<uint16_t>(ring->data[(TAIL + 1) % ring->size]) << 8);
-
-    uint32_t const PKT_SIZE = 2 + LEN;
-    uint32_t const PADDED = (PKT_SIZE + 3) & ~3U;
-
-    uint32_t const POS = TAIL + 2;
-
-    // Read data
-    uint16_t const COPY_LEN = (LEN > buf.size()) ? static_cast<uint16_t>(buf.size()) : LEN;
-    for (uint16_t i = 0; i < COPY_LEN; i++) {
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access): bounded by COPY_LEN from the span size.
-        buf[i] = ring->data[(POS + i) % ring->size];
-    }
-
-    // Advance tail past padding
-    asm volatile("" ::: "memory");
-    ring->tail = (TAIL + PADDED) % ring->size;
-    return COPY_LEN;
-}
+void ivshmem_irq_enable(IvshmemNetDevice* dev) { dev->resources.mask_vector(false); }
 
 // -- NetDevice operations --
 int ivshmem_open(ker::net::NetDevice* netdev) {
+    auto* dev = static_cast<IvshmemNetDevice*>(netdev->private_data);
+    if (dev == nullptr) return -ENODEV;
+    CallbackGuard const GUARD(dev->resources);
+    if (!GUARD || !dev->active || dev->ring_failed.load(std::memory_order_acquire)) return -ENODEV;
     netdev->state = 1;
     return 0;
 }
 
-void ivshmem_close(ker::net::NetDevice* netdev) { netdev->state = 0; }
+void ivshmem_close(ker::net::NetDevice* netdev) {
+    auto* dev = static_cast<IvshmemNetDevice*>(netdev->private_data);
+    if (dev == nullptr) return;
+    CallbackGuard const GUARD(dev->resources);
+    if (GUARD) netdev->state = 0;
+}
 
 int ivshmem_start_xmit(ker::net::NetDevice* netdev, ker::net::PacketBuffer* pkt) {
     auto* dev = static_cast<IvshmemNetDevice*>(netdev->private_data);
-    if (dev == nullptr || !dev->active || pkt == nullptr) {
+    if (dev == nullptr || pkt == nullptr) {
         if (pkt != nullptr) {
             ker::net::pkt_free(pkt);
         }
         return -1;
     }
+    CallbackGuard const GUARD(dev->resources);
+    if (!GUARD || !dev->active || dev->ring_failed.load(std::memory_order_acquire) || pkt->len > ker::net::PKT_BUF_SIZE - pkt->headroom()) {
+        ker::net::pkt_free(pkt);
+        return -ENODEV;
+    }
 
     dev->tx_lock.lock();
-    int const RET = ring_write(&dev->tx_ring, std::span(pkt->data, static_cast<uint16_t>(pkt->len)));
+    auto const RESULT = shared_ring::write(dev->tx_ring, dev->tx_ring.size, std::span(pkt->data, pkt->len));
+    int const RET = RESULT.error == shared_ring::Error::none ? 0 : -1;
     dev->tx_lock.unlock();
+    if (RESULT.error == shared_ring::Error::index || RESULT.error == shared_ring::Error::geometry) {
+        dev->ring_failed.store(true, std::memory_order_release);
+        ivshmem_irq_disable(dev);
+    }
 
     if (RET == 0) {
         netdev->tx_packets++;
         netdev->tx_bytes += pkt->len;
         // Ring doorbell to notify peer
-        dev->regs[IVSHMEM_REG_DOORBELL / 4] = (dev->my_vm_id == 0) ? 1 : 0;
+        dev->resources.ring(dev->my_vm_id == 0 ? 1 : 0);
     } else {
         netdev->tx_dropped++;
     }
@@ -170,12 +111,14 @@ ker::net::NetDeviceOps ivshmem_ops = {
 // -- IRQ handler (minimal - just schedule NAPI) --
 void ivshmem_irq(uint8_t /*unused*/, void* data) {
     auto* dev = static_cast<IvshmemNetDevice*>(data);
-    if (dev == nullptr || !dev->active) {
+    if (dev == nullptr) {
         return;
     }
-
-    // Acknowledge interrupt
-    dev->regs[IVSHMEM_REG_INTRSTATUS / 4] = dev->regs[IVSHMEM_REG_INTRSTATUS / 4];
+    CallbackGuard const GUARD(dev->resources);
+    if (!GUARD || !dev->active) return;
+#ifdef WOS_SELFTEST
+    dev->resources.test_irqs.fetch_add(1, std::memory_order_relaxed);
+#endif
 
     // Disable device interrupts
     ivshmem_irq_disable(dev);
@@ -186,104 +129,78 @@ void ivshmem_irq(uint8_t /*unused*/, void* data) {
 
 // -- Device init --
 auto init_device(pci::PCIDevice* pci_dev) -> int {
-    if (device_count >= MAX_IVSHMEM_DEVICES) {
+    if (shutdown_started.load(std::memory_order_acquire) || ivshmem_net_is_claimed(pci_dev) || probe_count >= MAX_IVSHMEM_DEVICES) {
         return -1;
     }
 
-    // Enable bus mastering + memory space
-    pci::pci_enable_bus_master(pci_dev);
-    pci::pci_enable_memory_space(pci_dev);
-
-    // Map BAR0 (registers) into kernel page table
-    auto* bar0_ptr = pci::pci_map_bar(pci_dev, 0);
-    if (bar0_ptr == nullptr) {
-        log::error("BAR0 is zero");
+    // Failed probe objects remain owned, including any unproven IRQ state.
+    auto* idev = new (&dev_pool.at(probe_count++)) IvshmemNetDevice{};
+    constexpr size_t SHMEM_SIZE = size_t{16} * 1024 * 1024;
+    if (!idev->resources.prepare(pci_dev, SHMEM_SIZE)) {
+        log::error("PCI shared-memory resource admission failed");
         return -1;
     }
-    auto* regs = reinterpret_cast<volatile uint32_t*>(bar0_ptr);
-
-    // Map BAR2 (shared memory) into kernel page table
-    auto* bar2_ptr = pci::pci_map_bar(pci_dev, 2);
-    if (bar2_ptr == nullptr) {
-        log::error("BAR2 is zero");
-        return -1;
-    }
-    auto* shmem = static_cast<uint8_t*>(bar2_ptr);
+    auto* regs = idev->resources.regs;
+    auto* shmem = idev->resources.shared;
 
     // Determine VM position (0 or 1)
     uint32_t const IV_POS = regs[IVSHMEM_REG_IVPOSITION / 4];
 
-    // Use 16MB as default shared memory size
-    constexpr size_t SHMEM_SIZE = size_t{16} * 1024 * 1024;
-
-    auto* idev = new (&dev_pool.at(device_count)) IvshmemNetDevice{};
-
     idev->pci = pci_dev;
     idev->regs = regs;
     idev->shmem = shmem;
-    idev->shmem_size = SHMEM_SIZE;
+    idev->shmem_size = idev->resources.shared_size;
     idev->my_vm_id = IV_POS;
 
-    // Initialize or read shared memory header
+    // Only a zero header may be initialized. A valid existing peer ring is
+    // attached without resetting either side's indices or mailbox data.
     auto* hdr = reinterpret_cast<IvshmemHeader*>(shmem);
-
-    if (hdr->magic != IVSHMEM_MAGIC) {
-        // First VM: initialize header
-        std::memset(hdr, 0, sizeof(IvshmemHeader));
-        hdr->magic = IVSHMEM_MAGIC;
+    auto* magic = reinterpret_cast<uint32_t*>(shmem);
+    char configured = 0;
+    int const READ_ROLE = platform::fw::fw_cfg_read_file("opt/wos/wki-ivshmem-role", &configured, 1);
+    int32_t const ROLE = READ_ROLE == 1 && (configured == '0' || configured == '1') ? configured - '0' : -1;
+    auto const START = mod::time::get_us();
+    shared_ring::Claim claim;
+    do {
+        claim = shared_ring::claim(magic, reinterpret_cast<uint32_t*>(shmem + offsetof(IvshmemHeader, vm_id)), IVSHMEM_MAGIC, ROLE);
+        if (claim.state != shared_ring::ClaimState::wait) break;
+        asm volatile("pause" ::: "memory");
+    } while (mod::time::get_us() - START < 5'000'000);
+    if (claim.state == shared_ring::ClaimState::wait || claim.state == shared_ring::ClaimState::refused) {
+        log::error("shared header claim refused or timed out");
+        return -1;
+    }
+    if (claim.state == shared_ring::ClaimState::initialize) {
+        std::memset(shmem + 4, 0, RING_HEADER_SIZE - 4);
+        constexpr uint32_t HALF = (SHMEM_SIZE - RING_HEADER_SIZE) / 2;
+        hdr->vm_id = claim.role;
         hdr->version = IVSHMEM_VERSION;
-        size_t const HALF = (SHMEM_SIZE - RING_HEADER_SIZE) / 2;
         hdr->ring0_offset = RING_HEADER_SIZE;
-        hdr->ring0_size = static_cast<uint32_t>(HALF);
-        hdr->ring1_offset = static_cast<uint32_t>(RING_HEADER_SIZE + HALF);
-        hdr->ring1_size = static_cast<uint32_t>(HALF);
-        hdr->vm_id = 0;
-        idev->my_vm_id = 0;
-    } else {
-        // Second VM: peer already set up
-        hdr->peer_ready = 1;
-        idev->my_vm_id = 1;
+        hdr->ring0_size = HALF;
+        hdr->ring1_offset = RING_HEADER_SIZE + HALF;
+        hdr->ring1_size = HALF;
+        std::memset(shmem + RING_HEADER_SIZE, 0, 8);
+        std::memset(shmem + RING_HEADER_SIZE + HALF, 0, 8);
+        shared_ring::store_word(magic, IVSHMEM_MAGIC);
     }
-
-    // Set up TX/RX rings based on VM ID
-    if (idev->my_vm_id == 0) {
-        // VM0 transmits on ring0, receives on ring1
-        idev->tx_ring.data = shmem + hdr->ring0_offset + 8;  // skip head/tail
-        idev->tx_ring.size = hdr->ring0_size - 8;
-        idev->tx_ring.head = 0;
-        idev->tx_ring.tail = 0;
-        idev->rx_ring.data = shmem + hdr->ring1_offset + 8;
-        idev->rx_ring.size = hdr->ring1_size - 8;
-        idev->rx_ring.head = 0;
-        idev->rx_ring.tail = 0;
-        // Store head/tail in shared memory for cross-VM sync
-        // Use first 8 bytes of each ring area: [head:u32][tail:u32]
-    } else {
-        // VM1 transmits on ring1, receives on ring0
-        idev->tx_ring.data = shmem + hdr->ring1_offset + 8;
-        idev->tx_ring.size = hdr->ring1_size - 8;
-        idev->tx_ring.head = 0;
-        idev->tx_ring.tail = 0;
-        idev->rx_ring.data = shmem + hdr->ring0_offset + 8;
-        idev->rx_ring.size = hdr->ring0_size - 8;
-        idev->rx_ring.head = 0;
-        idev->rx_ring.tail = 0;
+    auto const SHARED = std::span(shmem, idev->resources.shared_size);
+    auto const LAYOUT = shared_ring::snapshot(SHARED, IVSHMEM_MAGIC, false);
+    if (!LAYOUT) {
+        log::error("shared ring layout refused");
+        return -1;
     }
-
-    // Set up IRQ
-    uint8_t vector = ker::mod::gates::allocate_vector();
-    if (vector != 0) {
-        idev->irq_vector = vector;
-        int const MSI_RET = pci::pci_enable_msi(pci_dev, vector);
-        if (MSI_RET != 0) {
-            ker::mod::gates::free_irq(vector);
-            vector = pci_dev->interrupt_line + 32;
-            idev->irq_vector = vector;
-        }
-        ker::mod::gates::request_irq(vector, ivshmem_irq, idev, "ivshmem-net");
-        // Enable interrupts
-        regs[IVSHMEM_REG_INTRMASK / 4] = 0xFFFFFFFF;
-    }
+    idev->my_vm_id = claim.role;
+    auto const TX = shared_ring::bind(SHARED, LAYOUT->rings[claim.role]);
+    auto const RX = shared_ring::bind(SHARED, LAYOUT->rings[1 - claim.role]);
+    if (!TX || !RX) return -1;
+    if (shared_ring::valid(TX->size, shared_ring::load_word(TX->head_ptr), shared_ring::load_word(TX->tail_ptr)) !=
+            shared_ring::Error::none ||
+        shared_ring::valid(RX->size, shared_ring::load_word(RX->head_ptr), shared_ring::load_word(RX->tail_ptr)) !=
+            shared_ring::Error::none)
+        return -1;
+    idev->tx_ring = *TX;
+    idev->rx_ring = *RX;
+    if (claim.role == 1) shared_ring::store_word(reinterpret_cast<uint32_t*>(shmem + offsetof(IvshmemHeader, peer_ready)), 1);
 
     // Generate MAC: locally administered, based on VM position
     idev->netdev.mac.at(0) = 0x02;
@@ -305,17 +222,30 @@ auto init_device(pci::PCIDevice* pci_dev) -> int {
     idev->netdev.mtu = 9000;  // jumbo frames supported
     idev->netdev.state = 1;
     idev->netdev.private_data = idev;
+    ker::net::napi_init(&idev->napi, &idev->netdev, ivshmem_poll, 64);
+    if (!idev->resources.activate(ivshmem_irq, idev, "ivshmem-net")) return -1;
+    idev->irq_vector = idev->resources.irq_vector;
     idev->active = true;
 
-    ker::net::netdev_register(&idev->netdev);
+    if (ker::net::netdev_register(&idev->netdev) != 0) {
+        idev->active = false;
+        (void)idev->resources.stop_interrupts();
+        return -1;
+    }
+    idev->published = true;
 
     // Initialize and enable NAPI for deferred packet processing
-    ker::net::napi_init(&idev->napi, &idev->netdev, ivshmem_poll, 64);
     ker::net::napi_enable(&idev->napi);
 
     devices.at(device_count++) = idev;
 
     log::info("%s vm_id=%u shmem=0x%lx ready", idev->netdev.name.data(), idev->my_vm_id, reinterpret_cast<uint64_t>(shmem));
+#ifdef WOS_SELFTEST
+    if (test_device == nullptr) {
+        test_device = idev;
+        selftest_start(&idev->resources, "net", ivshmem_net_shutdown, selftest_late_calls);
+    }
+#endif
 
     return 0;
 }
@@ -323,50 +253,94 @@ auto init_device(pci::PCIDevice* pci_dev) -> int {
 // -- NAPI poll function (runs in worker thread context) --
 int ivshmem_poll(ker::net::NapiStruct* napi, int budget) {
     auto* dev = static_cast<IvshmemNetDevice*>(napi->dev->private_data);
-    if (dev == nullptr || !dev->active) {
+    if (dev == nullptr) return 0;
+    CallbackGuard const GUARD(dev->resources);
+    if (!GUARD || !dev->active) return 0;
+
+    if (dev->ring_failed.load(std::memory_order_acquire)) {
         ker::net::napi_complete(napi);
+        ivshmem_irq_disable(dev);
         return 0;
     }
-
     int processed = 0;
-    std::array<uint8_t, 2048> buf{};
-
-    // Process RX packets up to budget
     while (processed < budget) {
-        uint16_t const LEN = ring_read(&dev->rx_ring, buf);
-        if (LEN == 0) {
-            break;
-        }
-
         auto* pkt = ker::net::pkt_alloc();
-        if (pkt == nullptr) {
+        if (pkt == nullptr) break;
+        auto const RESULT = shared_ring::read(dev->rx_ring, dev->rx_ring.size, std::span(pkt->data, pkt->tailroom()));
+        if (RESULT.error != shared_ring::Error::none) {
+            ker::net::pkt_free(pkt);
+            if (RESULT.error != shared_ring::Error::empty) {
+                dev->ring_failed.store(true, std::memory_order_release);
+                dev->netdev.rx_dropped++;
+            }
             break;
         }
-
-        auto* dst = pkt->put(LEN);
-        std::memcpy(dst, buf.data(), LEN);
+        pkt->put(RESULT.bytes);
         pkt->dev = &dev->netdev;
-
         dev->netdev.rx_packets++;
-        dev->netdev.rx_bytes += LEN;
+        dev->netdev.rx_bytes += RESULT.bytes;
         ker::net::netdev_rx(&dev->netdev, pkt);
-
         processed++;
     }
 
     // If we processed less than budget, we're done - re-enable interrupts
     if (processed < budget) {
         ker::net::napi_complete(napi);
-        ivshmem_irq_enable(dev);
+        if (!dev->ring_failed.load(std::memory_order_acquire))
+            ivshmem_irq_enable(dev);
+        else
+            ivshmem_irq_disable(dev);
     }
 
     return processed;
 }
+#ifdef WOS_SELFTEST
+auto selftest_late_calls() -> bool {
+    auto* dev = test_device;
+    auto const POOL = ker::net::pkt_pool_free_count();
+    auto* pkt = ker::net::pkt_alloc_tx();
+    if (pkt == nullptr) return false;
+    auto const STATE = dev->netdev.state;
+    auto const NAPI = dev->napi.state.load();
+    auto const IRQS = dev->resources.test_irqs.load();
+    bool const REJECTED = ivshmem_start_xmit(&dev->netdev, pkt) == -ENODEV && ivshmem_open(&dev->netdev) == -ENODEV;
+    ivshmem_close(&dev->netdev);
+    ivshmem_irq(0, dev);
+    return REJECTED && ivshmem_poll(&dev->napi, 64) == 0 && dev->netdev.state == STATE && dev->napi.state.load() == NAPI &&
+           dev->resources.test_irqs.load() == IRQS && ker::net::pkt_pool_free_count() == POOL;
+}
+#endif
 }  // namespace
 
+auto ivshmem_net_shutdown() -> int {
+    shutdown_started.store(true, std::memory_order_release);
+    int result = 0;
+    for (size_t i = 0; i < probe_count; ++i) {
+        auto& dev = dev_pool.at(i);
+        int const RET = dev.resources.retire(
+            [](void* data) {
+                auto* owner = static_cast<IvshmemNetDevice*>(data);
+                owner->active = false;
+                if (owner->published) {
+                    ker::net::netdev_mark_control_retiring(&owner->netdev);
+                    ker::net::NetDeviceRetireToken token;
+                    (void)ker::net::netdev_unregister_begin(&owner->netdev, token);
+                    owner->published = false;
+                }
+                // Raw registry snapshots and worker epilogues can outlive drain;
+                // retain all metadata and prevent new work without waiting on them.
+                owner->napi.state.store(ker::net::NapiState::DISABLED, std::memory_order_release);
+                owner->napi.has_work.store(false, std::memory_order_release);
+            },
+            &dev);
+        if (RET != 0) result = RET;
+    }
+    return result;
+}
+
 auto ivshmem_net_is_claimed(pci::PCIDevice* dev) -> bool {
-    for (size_t i = 0; i < device_count; i++) {
-        if (devices.at(i) != nullptr && devices.at(i)->pci == dev) {
+    for (size_t i = 0; i < probe_count; i++) {
+        if (dev_pool.at(i).resources.device == dev) {
             return true;
         }
     }

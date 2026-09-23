@@ -53,6 +53,9 @@ auto wki_chaos_capture(WkiChaosSnapshot* out, WkiChaosRuleRow* rules, size_t max
 // Internal message-boundary hooks. The disabled path performs one atomic load
 // and calls the original transport callback directly.
 void wki_chaos_transport_register(WkiTransport* transport);
+// Close lease admission/discard queued work without waiting. An owner using
+// a bounded retirement must then drain chaos_in_flight before final removal.
+void wki_chaos_transport_close(WkiTransport* transport);
 // Teardown is task-context: it may yield until a bounded immediate/deferred
 // callback that already owns the transport lease has returned.
 void wki_chaos_transport_unregister(WkiTransport* transport);

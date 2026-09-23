@@ -231,6 +231,9 @@ void cdc_ether_init() { dev::usb::cdc_ether_init(); }
 void xhci_init() { dev::usb::xhci_init(); }
 
 void ivshmem_init() {
+#ifdef WOS_SELFTEST
+    if (dev::ivshmem::pci_selftest_reserved()) return;
+#endif
     // A single ivshmem PCI function cannot be owned by both netdevice and WKI
     // transports.  Keep the historical ivshmem-net claim policy unless the
     // boot explicitly reserves the functions for the phase-6 WKI RDMA probe.

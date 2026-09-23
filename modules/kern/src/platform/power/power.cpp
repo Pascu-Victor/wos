@@ -8,6 +8,7 @@
 #include <cstring>
 #include <dev/ahci.hpp>
 #include <dev/e1000e/e1000e.hpp>
+#include <dev/ivshmem/ivshmem_net.hpp>
 #include <dev/usb/xhci.hpp>
 #include <dev/virtio/virtio_net.hpp>
 #include <mod/io/port/port.hpp>
@@ -216,6 +217,10 @@ void io_delay_loop() {
     int const E1000_RET = ker::dev::e1000e::e1000e_shutdown();
     clear_current_finalizer_sched_state();
     if (E1000_RET != 0) log::warn("e1000 shutdown returned %d; unproven DMA backing retained", E1000_RET);
+
+    int const IVSHMEM_RET = ker::dev::ivshmem::ivshmem_net_shutdown();
+    clear_current_finalizer_sched_state();
+    if (IVSHMEM_RET != 0) log::warn("ivshmem shutdown returned %d; callback/IRQ ownership retained", IVSHMEM_RET);
 
     int const XHCI_RET = ker::dev::usb::xhci_shutdown();
     clear_current_finalizer_sched_state();

@@ -2,6 +2,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <dev/ivshmem/pci_resources.hpp>
+#include <dev/ivshmem/shared_ring.hpp>
 #include <dev/pci.hpp>
 #include <net/netdevice.hpp>
 #include <net/netpoll.hpp>
@@ -9,12 +11,13 @@
 
 namespace ker::dev::ivshmem {
 
-// ivshmem-plain PCI device: vendor=0x1AF4 device=0x1110
+// Revision-1 ivshmem plain/doorbell PCI device.
 constexpr uint16_t IVSHMEM_VENDOR = 0x1AF4;
 constexpr uint16_t IVSHMEM_DEVICE = 0x1110;
 
 // BAR layout:
-// BAR0: register area (256 bytes) - IntrMask, IntrStatus, IVPosition, Doorbell
+// BAR0: register area (256 bytes) - IVPosition and Doorbell; mask/status reserved
+// BAR1: MSI-X table/PBA in doorbell mode
 // BAR2: shared memory region
 
 // Shared memory ring protocol:
@@ -35,19 +38,15 @@ struct IvshmemHeader {
     uint32_t ring0_size;
     uint32_t ring1_offset;  // VM1->VM0 ring offset
     uint32_t ring1_size;
-    uint32_t vm_id;       // Set by each VM on init (0 or 1)
+    uint32_t vm_id;       // Initializer role, published before magic (0 or 1)
     uint32_t peer_ready;  // Set to 1 when peer has initialized
 } __attribute__((packed));
 static_assert(sizeof(IvshmemHeader) == 32);
 
-struct RingBuffer {
-    volatile uint32_t head;  // Written by producer
-    volatile uint32_t tail;  // Written by consumer
-    uint32_t size;           // Total ring data area size
-    uint8_t* data;           // Points into shared memory
-};
+using RingBuffer = shared_ring::View;
 
 struct IvshmemNetDevice {
+    PciResources resources{};
     ker::net::NetDevice netdev;
     pci::PCIDevice* pci;
     volatile uint32_t* regs;  // BAR0 registers
@@ -57,7 +56,9 @@ struct IvshmemNetDevice {
     RingBuffer tx_ring;  // We write, peer reads
     RingBuffer rx_ring;  // Peer writes, we read
     uint8_t irq_vector;
+    std::atomic<bool> ring_failed{false};
     bool active;
+    bool published = false;
     ker::mod::sys::Spinlock tx_lock;
 
     // NAPI state for deferred packet processing
@@ -65,6 +66,7 @@ struct IvshmemNetDevice {
 };
 
 auto ivshmem_net_init() -> int;
+auto ivshmem_net_shutdown() -> int;
 
 // Check if a PCI device has already been claimed by ivshmem_net
 auto ivshmem_net_is_claimed(pci::PCIDevice* dev) -> bool;

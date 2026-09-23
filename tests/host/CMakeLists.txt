@@ -1,3 +1,6 @@
+wos_add_unit_test(ivshmem_ring_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/ivshmem_ring_test.cpp
+)
 wos_add_unit_test(iommu_reserved_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/iommu_reserved_test.cpp
 )
@@ -15,6 +18,9 @@ wos_add_unit_test(virtio_platform_test
 )
 wos_add_unit_test(vtd_fault_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vtd_fault_test.cpp
+)
+wos_add_unit_test(ivshmem_pci_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/ivshmem_pci_test.cpp
 )
 wos_add_unit_test(xhci_dma_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/xhci_dma_test.cpp

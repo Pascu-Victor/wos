@@ -5,17 +5,20 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <dev/ivshmem/callback.hpp>
 #include <dev/ivshmem/ivshmem_net.hpp>
+#include <dev/ivshmem/selftest.hpp>
+#include <dev/ivshmem/shared_ring.hpp>
 #include <dev/pci.hpp>
 #include <memory>
 #include <net/packet.hpp>
+#include <net/wki/chaos.hpp>
 #include <net/wki/irq_fwd.hpp>
 #include <net/wki/timer_math.hpp>
 #include <net/wki/wki.hpp>
 #include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/fw/qemu_fw_cfg.hpp>
-#include <platform/interrupt/gates.hpp>
 #include <platform/sys/spinlock.hpp>
 
 #include "platform/ktime/ktime.hpp"
@@ -23,6 +26,7 @@
 namespace ker::net::wki {
 
 namespace {
+namespace shared_ring = dev::ivshmem::shared_ring;
 
 // -----------------------------------------------------------------------------
 // BAR2 shared memory layout for WKI ivshmem transport
@@ -52,11 +56,6 @@ constexpr size_t WKI_RDMA_REGION_SIZE = IVSHMEM_SHMEM_SIZE - WKI_IVSHMEM_RDMA_OF
 constexpr size_t RDMA_PAGE_SIZE = 4096;
 constexpr size_t RDMA_MAX_PAGES = WKI_RDMA_REGION_SIZE / RDMA_PAGE_SIZE;
 constexpr size_t RDMA_BITMAP_SIZE = (RDMA_MAX_PAGES + 7) / 8;
-
-// BAR0 register offsets (same as ivshmem_net)
-constexpr uint32_t IVSHMEM_REG_INTRMASK = 0x00;
-constexpr uint32_t IVSHMEM_REG_INTRSTATUS = 0x04;
-constexpr uint32_t IVSHMEM_REG_DOORBELL = 0x0C;
 
 // -----------------------------------------------------------------------------
 // Shared memory header (at offset 0 of BAR2)
@@ -99,18 +98,14 @@ constexpr size_t IRQ_MAILBOX_OFFSET = offsetof(WkiIvshmemHeader, reserved);
 // Ring buffer (reused from ivshmem_net design)
 // -----------------------------------------------------------------------------
 
-struct WkiRing {
-    volatile uint32_t* head_ptr;  // in shared memory
-    volatile uint32_t* tail_ptr;  // in shared memory
-    uint8_t* data;
-    uint32_t size;
-};
+using WkiRing = shared_ring::View;
 
 // -----------------------------------------------------------------------------
 // Transport private state
 // -----------------------------------------------------------------------------
 
 struct IvshmemTransportPrivate {
+    dev::ivshmem::PciResources resources{};
     dev::pci::PCIDevice* pci;
     volatile uint32_t* regs;  // BAR0
     uint8_t* shmem;           // BAR2
@@ -125,15 +120,20 @@ struct IvshmemTransportPrivate {
     uint8_t* rdma_base;  // start of RDMA region in BAR2
     uint32_t rdma_size;
 
-    WkiRxHandler rx_handler;
+    std::atomic<WkiRxHandler> rx_handler{nullptr};
     std::atomic_flag rx_drain_active = ATOMIC_FLAG_INIT;
+    std::atomic_flag tx_active = ATOMIC_FLAG_INIT;
+    std::atomic<bool> ring_failed{false};
     uint16_t direct_peer = WKI_NODE_INVALID;
 };
 
-WkiTransport s_ivshmem_transport;            // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-IvshmemTransportPrivate s_ivshmem_priv;      // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-bool s_ivshmem_initialized = false;          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-ker::mod::sys::Spinlock s_rdma_bitmap_lock;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+WkiTransport s_ivshmem_transport;                // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+IvshmemTransportPrivate s_ivshmem_priv;          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<bool> s_ivshmem_initialized{false};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Spinlock s_rdma_bitmap_lock;      // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+#ifdef WOS_SELFTEST
+auto selftest_late_calls() -> bool;
+#endif
 
 auto configured_vm_role() -> int32_t {
     char value = 0;
@@ -164,62 +164,29 @@ auto configured_direct_peer() -> uint16_t {
 // Ring operations
 // -----------------------------------------------------------------------------
 
-auto ring_write(WkiRing* ring, const uint8_t* data_buf, uint16_t len) -> int {
-    // Packet format: [len:u16][data][pad to 4 bytes]
-    uint32_t const PKT_SIZE = 2 + len;
-    uint32_t const PADDED = (PKT_SIZE + 3) & ~3U;
-
-    uint32_t const HEAD = *ring->head_ptr;
-    uint32_t const TAIL = *ring->tail_ptr;
-    uint32_t const SPACE = (HEAD >= TAIL) ? (ring->size - HEAD + TAIL) : (TAIL - HEAD);
-
-    if (PADDED + 1 > SPACE) {
-        return -1;  // ring full
-    }
-
-    uint32_t pos = HEAD;
-    ring->data[pos % ring->size] = static_cast<uint8_t>(len & 0xFF);
-    ring->data[(pos + 1) % ring->size] = static_cast<uint8_t>(len >> 8);
-    pos += 2;
-
-    for (uint16_t i = 0; i < len; i++) {
-        ring->data[(pos + i) % ring->size] = data_buf[i];
-    }
-    pos += len;
-
-    while (((pos - HEAD) & 3U) != 0U) {
-        ring->data[pos % ring->size] = 0;
-        pos++;
-    }
-
-    asm volatile("" ::: "memory");  // NOLINT(hicpp-no-assembler)
-    *ring->head_ptr = pos % ring->size;
-    return 0;
+#ifdef WOS_SELFTEST
+auto ring_write(WkiRing* ring, const uint8_t* data, size_t bytes) -> int {
+    if (data == nullptr || bytes > WKI_MAX_FRAME_SIZE) return -1;
+    return shared_ring::write(*ring, ring->size, std::span(data, bytes)).error == shared_ring::Error::none ? 0 : -1;
 }
-
-auto ring_read(WkiRing* ring, uint8_t* buf, uint16_t buf_size) -> uint16_t {
-    uint32_t const HEAD = *ring->head_ptr;
-    uint32_t const TAIL = *ring->tail_ptr;
-    asm volatile("" ::: "memory");  // NOLINT(hicpp-no-assembler)
-
-    if (HEAD == TAIL) {
-        return 0;
+auto ring_read(WkiRing* ring, uint8_t* data, size_t bytes) -> uint16_t {
+    auto const RESULT = shared_ring::read(*ring, ring->size, std::span(data, bytes));
+    return RESULT.error == shared_ring::Error::none ? RESULT.bytes : 0;
+}
+#endif
+auto transmit(IvshmemTransportPrivate* priv, const uint8_t* data, size_t bytes) -> int {
+    if (data == nullptr || bytes == 0 || bytes > WKI_MAX_FRAME_SIZE || priv->ring_failed.load(std::memory_order_acquire) ||
+        priv->tx_active.test_and_set(std::memory_order_acquire))
+        return -1;
+    auto const RESULT = shared_ring::write(priv->tx_ring, priv->tx_ring.size, std::span(data, bytes));
+    priv->tx_active.clear(std::memory_order_release);
+    if (RESULT.error == shared_ring::Error::index || RESULT.error == shared_ring::Error::geometry) {
+        priv->ring_failed.store(true, std::memory_order_release);
+        priv->resources.mask_vector(true);
     }
-
-    auto len = static_cast<uint16_t>(ring->data[TAIL % ring->size] | (static_cast<uint16_t>(ring->data[(TAIL + 1) % ring->size]) << 8));
-
-    uint32_t const PKT_SIZE = 2 + len;
-    uint32_t const PADDED = (PKT_SIZE + 3) & ~3U;
-    uint32_t const POS = TAIL + 2;
-
-    uint16_t const COPY_LEN = (len > buf_size) ? buf_size : len;
-    for (uint16_t i = 0; i < COPY_LEN; i++) {
-        buf[i] = ring->data[(POS + i) % ring->size];
-    }
-
-    asm volatile("" ::: "memory");  // NOLINT(hicpp-no-assembler)
-    *ring->tail_ptr = (TAIL + PADDED) % ring->size;
-    return COPY_LEN;
+    if (RESULT.error != shared_ring::Error::none) return -1;
+    priv->resources.ring(priv->my_vm_id == 0 ? 1 : 0);
+    return 0;
 }
 
 // -----------------------------------------------------------------------------
@@ -230,10 +197,9 @@ auto rdma_bitmap_alloc(IvshmemTransportPrivate* priv, uint32_t size) -> int64_t 
     if (priv == nullptr) {
         return -1;
     }
-    uint32_t const PAGES_NEEDED = (size + RDMA_PAGE_SIZE - 1) / RDMA_PAGE_SIZE;
-    if (PAGES_NEEDED == 0) {
-        return -1;
-    }
+    auto const PAGES = shared_ring::rounded_pages(size, priv->rdma_size);
+    if (!PAGES) return -1;
+    uint32_t const PAGES_NEEDED = *PAGES;
 
     int64_t allocated_offset = -1;
     uint64_t const FLAGS = s_rdma_bitmap_lock.lock_irqsave();
@@ -242,7 +208,7 @@ auto rdma_bitmap_alloc(IvshmemTransportPrivate* priv, uint32_t size) -> int64_t 
     uint32_t consecutive = 0;
     uint32_t start_page = 1;
 
-    for (uint32_t page = 1; page < RDMA_MAX_PAGES; page++) {
+    for (uint32_t page = 1; page < priv->rdma_size / RDMA_PAGE_SIZE; page++) {
         uint32_t const BYTE_IDX = page / 8;
         uint32_t const BIT_IDX = page % 8;
 
@@ -272,11 +238,15 @@ void rdma_bitmap_free(IvshmemTransportPrivate* priv, int64_t offset, uint32_t si
     if (priv == nullptr || offset <= 0 || size == 0) {
         return;
     }
+    auto const COUNT = shared_ring::rounded_pages(size, priv->rdma_size);
+    if (!COUNT || (static_cast<uint64_t>(offset) % RDMA_PAGE_SIZE) != 0 ||
+        !shared_ring::contains(priv->rdma_size, static_cast<uint64_t>(offset), uint64_t{*COUNT} * RDMA_PAGE_SIZE))
+        return;
     auto start_page = static_cast<uint32_t>(offset / RDMA_PAGE_SIZE);
-    uint32_t const PAGES = (size + RDMA_PAGE_SIZE - 1) / RDMA_PAGE_SIZE;
+    uint32_t const PAGES = *COUNT;
 
     uint64_t const FLAGS = s_rdma_bitmap_lock.lock_irqsave();
-    for (uint32_t p = start_page; p < start_page + PAGES && p < RDMA_MAX_PAGES; p++) {
+    for (uint32_t p = start_page; p < start_page + PAGES; p++) {
         uint32_t const BI = p / 8;
         uint32_t const BT = p % 8;
         priv->rdma_bitmap.at(BI) &= static_cast<uint8_t>(~(1U << BT));
@@ -294,13 +264,9 @@ auto ivshmem_wki_tx(WkiTransport* self, uint16_t /*neighbor_id*/, const void* da
         return -1;
     }
 
-    int const RET = ring_write(&priv->tx_ring, static_cast<const uint8_t*>(data), len);
-    if (RET == 0) {
-        // Ring doorbell to notify peer
-        uint32_t const PEER_ID = (priv->my_vm_id == 0) ? 1U : 0U;
-        priv->regs[IVSHMEM_REG_DOORBELL / 4] = PEER_ID;
-    }
-    return RET;
+    dev::ivshmem::CallbackGuard const GUARD(priv->resources);
+    if (!GUARD) return -1;
+    return transmit(priv, static_cast<const uint8_t*>(data), len);
 }
 
 auto ivshmem_wki_tx_pkt(WkiTransport* self, uint16_t /*neighbor_id*/, net::PacketBuffer* pkt) -> int {
@@ -310,23 +276,27 @@ auto ivshmem_wki_tx_pkt(WkiTransport* self, uint16_t /*neighbor_id*/, net::Packe
         return -1;
     }
 
-    int const RET = ring_write(&priv->tx_ring, pkt->data, static_cast<uint16_t>(pkt->len));
-    if (RET == 0) {
-        uint32_t const PEER_ID = (priv->my_vm_id == 0) ? 1U : 0U;
-        priv->regs[IVSHMEM_REG_DOORBELL / 4] = PEER_ID;
+    dev::ivshmem::CallbackGuard const GUARD(priv->resources);
+    if (!GUARD) {
+        net::pkt_free(pkt);
+        return -1;
     }
+    int const RET = pkt != nullptr && pkt->len <= net::PKT_BUF_SIZE - pkt->headroom() ? transmit(priv, pkt->data, pkt->len) : -1;
     net::pkt_free(pkt);
     return RET;
 }
 
 void ivshmem_wki_set_rx_handler(WkiTransport* self, WkiRxHandler handler) {
     auto* priv = static_cast<IvshmemTransportPrivate*>(self->private_data);
-    priv->rx_handler = handler;
+    dev::ivshmem::CallbackGuard const GUARD(priv->resources);
+    if (GUARD) priv->rx_handler.store(handler, std::memory_order_release);
 }
 
 auto ivshmem_wki_rdma_register_region(WkiTransport* self, uint64_t /*phys_addr*/, uint32_t size, uint32_t* rkey) -> int {
     auto* priv = static_cast<IvshmemTransportPrivate*>(self->private_data);
 
+    dev::ivshmem::CallbackGuard const GUARD(priv->resources);
+    if (!GUARD) return -1;
     int64_t const OFFSET = rdma_bitmap_alloc(priv, size);
     if (OFFSET < 0) {
         return -1;
@@ -341,12 +311,14 @@ auto ivshmem_wki_rdma_read(WkiTransport* self, uint16_t /*neighbor_id*/, uint32_
                            uint32_t len) -> int {
     auto* priv = static_cast<IvshmemTransportPrivate*>(self->private_data);
 
-    uint64_t const SRC_OFFSET = static_cast<uint64_t>(rkey) + remote_offset;
-    if (SRC_OFFSET + len > priv->rdma_size) {
+    dev::ivshmem::CallbackGuard const GUARD(priv->resources);
+    if (!GUARD) return -1;
+    auto const SRC_OFFSET = shared_ring::remote_extent(priv->rdma_size, rkey, remote_offset, len);
+    if (!SRC_OFFSET || (local_buf == nullptr && len != 0)) {
         return -1;
     }
 
-    memcpy(local_buf, priv->rdma_base + SRC_OFFSET, len);
+    if (len != 0) memcpy(local_buf, priv->rdma_base + *SRC_OFFSET, len);
     return 0;
 }
 
@@ -354,32 +326,37 @@ auto ivshmem_wki_rdma_write(WkiTransport* self, uint16_t /*neighbor_id*/, uint32
                             uint32_t len) -> int {
     auto* priv = static_cast<IvshmemTransportPrivate*>(self->private_data);
 
-    uint64_t const DST_OFFSET = static_cast<uint64_t>(rkey) + remote_offset;
-    if (DST_OFFSET + len > priv->rdma_size) {
+    dev::ivshmem::CallbackGuard const GUARD(priv->resources);
+    if (!GUARD) return -1;
+    auto const DST_OFFSET = shared_ring::remote_extent(priv->rdma_size, rkey, remote_offset, len);
+    if (!DST_OFFSET || (local_buf == nullptr && len != 0)) {
         return -1;
     }
 
-    memcpy(priv->rdma_base + DST_OFFSET, local_buf, len);
+    if (len != 0) memcpy(priv->rdma_base + *DST_OFFSET, local_buf, len);
     return 0;
 }
 
-auto ivshmem_wki_doorbell(WkiTransport* self, uint16_t /*neighbor_id*/, uint32_t value) -> int {
+auto ivshmem_wki_doorbell(WkiTransport* self, uint16_t /*neighbor_id*/, uint32_t /*value*/) -> int {
     auto* priv = static_cast<IvshmemTransportPrivate*>(self->private_data);
 
-    // Encode value into doorbell register write
-    // The peer receives this as an interrupt with the value recoverable from status
-    uint32_t const PEER_ID = (priv->my_vm_id == 0) ? 1U : 0U;
-    // Doorbell register format: (peer_vector << 16) | peer_id
-    priv->regs[IVSHMEM_REG_DOORBELL / 4] = (value << 16) | PEER_ID;
+    dev::ivshmem::CallbackGuard const GUARD(priv->resources);
+    if (!GUARD) return -1;
+    // IRQ forwarding data travels in the shared mailbox. The PCI doorbell
+    // selects the peer and its single configured MSI-X vector, not IRQ status.
+    priv->resources.ring(priv->my_vm_id == 0 ? 1 : 0);
     return 0;
 }
 
 // -----------------------------------------------------------------------------
-// IRQ handler - poll RX ring and deliver to WKI
+// Task RX dispatch and minimal doorbell IRQ
 // -----------------------------------------------------------------------------
 
 auto drain_rx_ring(IvshmemTransportPrivate* priv, uint16_t budget) -> uint16_t {
-    if (priv == nullptr || budget == 0 || priv->rx_drain_active.test_and_set(std::memory_order_acquire)) {
+    if (priv == nullptr) return 0;
+    dev::ivshmem::CallbackGuard const GUARD(priv->resources);
+    if (!GUARD || budget == 0 || priv->ring_failed.load(std::memory_order_acquire) ||
+        priv->rx_drain_active.test_and_set(std::memory_order_acquire)) {
         return 0;
     }
 
@@ -408,17 +385,19 @@ auto drain_rx_ring(IvshmemTransportPrivate* priv, uint16_t budget) -> uint16_t {
     // Drain RX ring
     IvshmemFrame buf{};
     while (processed < budget) {
-        uint16_t const LEN = ring_read(&priv->rx_ring, buf.data(), static_cast<uint16_t>(buf.size()));
-        if (LEN == 0) {
+        auto const RESULT = shared_ring::read(priv->rx_ring, priv->rx_ring.size, std::span(buf));
+        if (RESULT.error != shared_ring::Error::none) {
+            if (RESULT.error != shared_ring::Error::empty) priv->ring_failed.store(true, std::memory_order_release);
             break;
         }
+        uint16_t const LEN = RESULT.bytes;
 
-        if (priv->rx_handler != nullptr) {
+        if (auto handler = priv->rx_handler.load(std::memory_order_acquire); handler != nullptr) {
             WkiRxMetadata const metadata = {
                 .has_direct_peer = priv->direct_peer != WKI_NODE_INVALID,
                 .direct_peer = priv->direct_peer,
             };
-            priv->rx_handler(&s_ivshmem_transport, buf.data(), LEN, &metadata);
+            handler(&s_ivshmem_transport, buf.data(), LEN, &metadata);
         }
         ++processed;
     }
@@ -432,10 +411,14 @@ void ivshmem_wki_irq(uint8_t /*vector*/, void* data) {
         return;
     }
 
-    // Acknowledge interrupt and use the same single-drainer path as the
-    // task-context fallback.
-    priv->regs[IVSHMEM_REG_INTRSTATUS / 4] = priv->regs[IVSHMEM_REG_INTRSTATUS / 4];
-    static_cast<void>(drain_rx_ring(priv, 64));
+    dev::ivshmem::CallbackGuard const GUARD(priv->resources);
+    if (!GUARD) return;
+#ifdef WOS_SELFTEST
+    priv->resources.test_irqs.fetch_add(1, std::memory_order_relaxed);
+#endif
+    // Only mask here. The existing peer task polls shared memory and re-arms
+    // this vector; WKI protocol/ACK processing must never run in IRQ context.
+    priv->resources.mask_vector(true);
 }
 
 }  // namespace
@@ -445,6 +428,8 @@ void ivshmem_wki_irq(uint8_t /*vector*/, void* data) {
 // -----------------------------------------------------------------------------
 
 auto wki_ivshmem_rdma_alloc(uint32_t size) -> int64_t {
+    dev::ivshmem::CallbackGuard const GUARD(s_ivshmem_priv.resources);
+    if (!GUARD) return -1;
     if (!s_ivshmem_initialized) {
         return -1;
     }
@@ -452,6 +437,8 @@ auto wki_ivshmem_rdma_alloc(uint32_t size) -> int64_t {
 }
 
 void wki_ivshmem_rdma_free(int64_t offset, uint32_t size) {
+    dev::ivshmem::CallbackGuard const GUARD(s_ivshmem_priv.resources);
+    if (!GUARD) return;
     if (!s_ivshmem_initialized) {
         return;
     }
@@ -459,7 +446,9 @@ void wki_ivshmem_rdma_free(int64_t offset, uint32_t size) {
 }
 
 auto wki_ivshmem_rdma_ptr(int64_t offset) -> void* {
-    if (!s_ivshmem_initialized || offset < 0) {
+    dev::ivshmem::CallbackGuard const GUARD(s_ivshmem_priv.resources);
+    if (!GUARD) return nullptr;
+    if (!s_ivshmem_initialized || offset <= 0 || static_cast<uint64_t>(offset) >= s_ivshmem_priv.rdma_size) {
         return nullptr;
     }
     return s_ivshmem_priv.rdma_base + offset;
@@ -475,6 +464,8 @@ void wki_ivshmem_irq_mailbox_write(WkiTransport* transport, uint16_t device_id, 
     }
     auto* priv = static_cast<IvshmemTransportPrivate*>(transport->private_data);
 
+    dev::ivshmem::CallbackGuard const GUARD(priv->resources);
+    if (!GUARD) return;
     // Our TX mailbox slot: if we are VM0, we write to slot[0] (VM0->VM1).
     //                      if we are VM1, we write to slot[1] (VM1->VM0).
     auto* mailbox = reinterpret_cast<IrqMailboxSlot*>(priv->shmem + IRQ_MAILBOX_OFFSET);
@@ -492,7 +483,10 @@ void wki_ivshmem_irq_mailbox_write(WkiTransport* transport, uint16_t device_id, 
 // -----------------------------------------------------------------------------
 
 void wki_ivshmem_transport_init() {
-    if (s_ivshmem_initialized) {
+#ifdef WOS_SELFTEST
+    if (dev::ivshmem::pci_selftest_reserved()) return;
+#endif
+    if (s_ivshmem_priv.resources.callbacks.closed() || s_ivshmem_initialized || s_ivshmem_priv.resources.device != nullptr) {
         return;
     }
 
@@ -521,129 +515,91 @@ void wki_ivshmem_transport_init() {
         return;
     }
 
-    // Enable PCI features
-    dev::pci::pci_enable_bus_master(found_dev);
-    dev::pci::pci_enable_memory_space(found_dev);
-
-    // Map BAR0 (registers)
-    auto* bar0_ptr = dev::pci::pci_map_bar(found_dev, 0);
-    if (bar0_ptr == nullptr) {
-        ker::mod::dbg::log("[WKI] ivshmem: failed to map BAR0");
+    if (!s_ivshmem_priv.resources.prepare(found_dev, IVSHMEM_SHMEM_SIZE)) {
+        ker::mod::dbg::log("[WKI] ivshmem: PCI resource preparation failed");
         return;
     }
-    auto* regs = reinterpret_cast<volatile uint32_t*>(bar0_ptr);
-
-    // Map BAR2 (shared memory)
-    auto* bar2_ptr = dev::pci::pci_map_bar(found_dev, 2);
-    if (bar2_ptr == nullptr) {
-        ker::mod::dbg::log("[WKI] ivshmem: failed to map BAR2");
-        return;
-    }
-    auto* shmem = const_cast<uint8_t*>(reinterpret_cast<volatile uint8_t*>(bar2_ptr));  // NOLINT(cppcoreguidelines-pro-type-const-cast)
+    auto* regs = s_ivshmem_priv.resources.regs;
+    auto* shmem = s_ivshmem_priv.resources.shared;
 
     // Set up private state
     s_ivshmem_priv.pci = found_dev;
     s_ivshmem_priv.regs = regs;
     s_ivshmem_priv.shmem = shmem;
-    s_ivshmem_priv.shmem_size = IVSHMEM_SHMEM_SIZE;
+    s_ivshmem_priv.shmem_size = s_ivshmem_priv.resources.shared_size;
     s_ivshmem_priv.rx_handler = nullptr;
     s_ivshmem_priv.direct_peer = configured_direct_peer();
 
-    // Initialize or read shared memory header
+    // Publish magic last and retain a validated private layout. Attaching to
+    // an existing valid header never resets a live peer's indices/mailbox.
     auto* hdr = reinterpret_cast<WkiIvshmemHeader*>(shmem);
-
+    auto* magic = reinterpret_cast<uint32_t*>(shmem);
     int32_t const CONFIGURED_ROLE = configured_vm_role();
-    bool const INITIALIZE_HEADER = CONFIGURED_ROLE == 0 || (CONFIGURED_ROLE < 0 && hdr->magic != WKI_IVSHMEM_MAGIC);
-    if (INITIALIZE_HEADER) {
-        // First VM: initialize header and ring areas
-        memset(hdr, 0, sizeof(WkiIvshmemHeader));
-        hdr->magic = WKI_IVSHMEM_MAGIC;
-        hdr->version = WKI_IVSHMEM_VERSION;
-        hdr->ring0_offset = static_cast<uint32_t>(WKI_IVSHMEM_HEADER_SIZE);
-        hdr->ring0_size = static_cast<uint32_t>(WKI_IVSHMEM_RING_SIZE);
-        hdr->ring1_offset = static_cast<uint32_t>(WKI_IVSHMEM_HEADER_SIZE + WKI_IVSHMEM_RING_SIZE);
-        hdr->ring1_size = static_cast<uint32_t>(WKI_IVSHMEM_RING_SIZE);
-        hdr->rdma_offset = static_cast<uint32_t>(WKI_IVSHMEM_RDMA_OFFSET);
-        hdr->rdma_size = static_cast<uint32_t>(WKI_RDMA_REGION_SIZE);
-        hdr->vm_id = 0;
-        s_ivshmem_priv.my_vm_id = 0;
-
-        // Zero the ring head/tail pointers (first 8 bytes of each ring)
-        memset(shmem + hdr->ring0_offset, 0, 8);
-        memset(shmem + hdr->ring1_offset, 0, 8);
-    } else {
-        if (CONFIGURED_ROLE == 1 && hdr->magic != WKI_IVSHMEM_MAGIC) {
-            constexpr uint64_t HEADER_TIMEOUT_US = 5'000'000;
-            uint64_t const DEADLINE = wki_future_deadline_us(ker::mod::time::get_us(), HEADER_TIMEOUT_US);
-            while (hdr->magic != WKI_IVSHMEM_MAGIC && ker::mod::time::get_us() < DEADLINE) {
-                asm volatile("pause" ::: "memory");
-            }
-            if (hdr->magic != WKI_IVSHMEM_MAGIC) {
-                ker::mod::dbg::log("[WKI] ivshmem: timed out waiting for role-0 header initialization");
-                return;
-            }
-        }
-        hdr->peer_ready = 1;
-        s_ivshmem_priv.my_vm_id = CONFIGURED_ROLE >= 0 ? static_cast<uint32_t>(CONFIGURED_ROLE) : 1;
+    auto const HEADER_DEADLINE = wki_future_deadline_us(ker::mod::time::get_us(), 5'000'000);
+    shared_ring::Claim claim;
+    do {
+        claim = shared_ring::claim(magic, reinterpret_cast<uint32_t*>(shmem + offsetof(WkiIvshmemHeader, vm_id)), WKI_IVSHMEM_MAGIC,
+                                   CONFIGURED_ROLE);
+        if (claim.state != shared_ring::ClaimState::wait) break;
+        asm volatile("pause" ::: "memory");
+    } while (ker::mod::time::get_us() < HEADER_DEADLINE);
+    if (claim.state == shared_ring::ClaimState::wait || claim.state == shared_ring::ClaimState::refused) {
+        ker::mod::dbg::log("[WKI] ivshmem: shared header claim refused or timed out");
+        return;
     }
+    if (claim.state == shared_ring::ClaimState::initialize) {
+        memset(shmem + 4, 0, WKI_IVSHMEM_HEADER_SIZE - 4);
+        hdr->vm_id = claim.role;
+        hdr->version = WKI_IVSHMEM_VERSION;
+        hdr->ring0_offset = WKI_IVSHMEM_HEADER_SIZE;
+        hdr->ring0_size = WKI_IVSHMEM_RING_SIZE;
+        hdr->ring1_offset = WKI_IVSHMEM_HEADER_SIZE + WKI_IVSHMEM_RING_SIZE;
+        hdr->ring1_size = WKI_IVSHMEM_RING_SIZE;
+        hdr->rdma_offset = WKI_IVSHMEM_RDMA_OFFSET;
+        hdr->rdma_size = WKI_RDMA_REGION_SIZE;
+        memset(shmem + WKI_IVSHMEM_HEADER_SIZE, 0, 8);
+        memset(shmem + WKI_IVSHMEM_HEADER_SIZE + WKI_IVSHMEM_RING_SIZE, 0, 8);
+        shared_ring::store_word(magic, WKI_IVSHMEM_MAGIC);
+    }
+    auto const SHARED = std::span(shmem, s_ivshmem_priv.resources.shared_size);
+    auto const LAYOUT = shared_ring::snapshot(SHARED, WKI_IVSHMEM_MAGIC, true);
+    if (!LAYOUT || LAYOUT->extra.bytes < 2 * RDMA_PAGE_SIZE || LAYOUT->extra.bytes / RDMA_PAGE_SIZE > RDMA_MAX_PAGES) {
+        ker::mod::dbg::log("[WKI] ivshmem: shared ring/RDMA layout refused");
+        return;
+    }
+    s_ivshmem_priv.my_vm_id = claim.role;
+    // Set up TX/RX rings from the validated copy only.
+    auto const TX = shared_ring::bind(SHARED, LAYOUT->rings[claim.role]);
+    auto const RX = shared_ring::bind(SHARED, LAYOUT->rings[1 - claim.role]);
+    if (!TX || !RX) return;
+    s_ivshmem_priv.tx_ring = *TX;
+    s_ivshmem_priv.rx_ring = *RX;
+    if (shared_ring::valid(TX->size, shared_ring::load_word(TX->head_ptr), shared_ring::load_word(TX->tail_ptr)) !=
+            shared_ring::Error::none ||
+        shared_ring::valid(RX->size, shared_ring::load_word(RX->head_ptr), shared_ring::load_word(RX->tail_ptr)) !=
+            shared_ring::Error::none)
+        return;
+    // Set up RDMA region using the same bounded snapshot.
+    s_ivshmem_priv.rdma_base = shmem + LAYOUT->extra.offset;
+    s_ivshmem_priv.rdma_size = LAYOUT->extra.bytes;
+    s_ivshmem_priv.rdma_bitmap.fill(0);  // all free
+    auto* ready = reinterpret_cast<uint32_t*>(shmem + offsetof(WkiIvshmemHeader, peer_ready));
+    if (claim.role == 1) shared_ring::store_word(ready, 1);
 
     // VM0: poll for peer_ready with 5s timeout
     if (s_ivshmem_priv.my_vm_id == 0) {
         constexpr uint64_t PEER_READY_TIMEOUT_US = 5'000'000;
         uint64_t const DEADLINE = wki_future_deadline_us(ker::mod::time::get_us(), PEER_READY_TIMEOUT_US);
-        while (hdr->peer_ready == 0) {
+        while (shared_ring::load_word(ready) == 0) {
             if (ker::mod::time::get_us() >= DEADLINE) {
                 ker::mod::dbg::log("[WKI] ivshmem: peer_ready timeout - continuing without peer");
                 break;
             }
             asm volatile("pause" ::: "memory");
         }
-        if (hdr->peer_ready != 0) {
+        if (shared_ring::load_word(ready) != 0) {
             ker::mod::dbg::log("[WKI] ivshmem: peer is ready");
         }
-    }
-
-    // Set up TX/RX rings
-    // Each ring: first 8 bytes are [head:u32][tail:u32], rest is data
-    if (s_ivshmem_priv.my_vm_id == 0) {
-        // VM0 transmits on ring0, receives on ring1
-        s_ivshmem_priv.tx_ring.head_ptr = reinterpret_cast<volatile uint32_t*>(shmem + hdr->ring0_offset);
-        s_ivshmem_priv.tx_ring.tail_ptr = reinterpret_cast<volatile uint32_t*>(shmem + hdr->ring0_offset + 4);
-        s_ivshmem_priv.tx_ring.data = shmem + hdr->ring0_offset + 8;
-        s_ivshmem_priv.tx_ring.size = hdr->ring0_size - 8;
-
-        s_ivshmem_priv.rx_ring.head_ptr = reinterpret_cast<volatile uint32_t*>(shmem + hdr->ring1_offset);
-        s_ivshmem_priv.rx_ring.tail_ptr = reinterpret_cast<volatile uint32_t*>(shmem + hdr->ring1_offset + 4);
-        s_ivshmem_priv.rx_ring.data = shmem + hdr->ring1_offset + 8;
-        s_ivshmem_priv.rx_ring.size = hdr->ring1_size - 8;
-    } else {
-        // VM1 transmits on ring1, receives on ring0
-        s_ivshmem_priv.tx_ring.head_ptr = reinterpret_cast<volatile uint32_t*>(shmem + hdr->ring1_offset);
-        s_ivshmem_priv.tx_ring.tail_ptr = reinterpret_cast<volatile uint32_t*>(shmem + hdr->ring1_offset + 4);
-        s_ivshmem_priv.tx_ring.data = shmem + hdr->ring1_offset + 8;
-        s_ivshmem_priv.tx_ring.size = hdr->ring1_size - 8;
-
-        s_ivshmem_priv.rx_ring.head_ptr = reinterpret_cast<volatile uint32_t*>(shmem + hdr->ring0_offset);
-        s_ivshmem_priv.rx_ring.tail_ptr = reinterpret_cast<volatile uint32_t*>(shmem + hdr->ring0_offset + 4);
-        s_ivshmem_priv.rx_ring.data = shmem + hdr->ring0_offset + 8;
-        s_ivshmem_priv.rx_ring.size = hdr->ring0_size - 8;
-    }
-
-    // Set up RDMA region
-    s_ivshmem_priv.rdma_base = shmem + WKI_IVSHMEM_RDMA_OFFSET;
-    s_ivshmem_priv.rdma_size = static_cast<uint32_t>(WKI_RDMA_REGION_SIZE);
-    s_ivshmem_priv.rdma_bitmap.fill(0);  // all free
-
-    // Set up IRQ
-    uint8_t vector = ker::mod::gates::allocate_vector();
-    if (vector != 0) {
-        int const MSI_RET = dev::pci::pci_enable_msi(found_dev, vector);
-        if (MSI_RET != 0) {
-            ker::mod::gates::free_irq(vector);
-            vector = found_dev->interrupt_line + 32;
-        }
-        ker::mod::gates::request_irq(vector, ivshmem_wki_irq, &s_ivshmem_priv, "wki-ivshmem");
-        regs[IVSHMEM_REG_INTRMASK / 4] = 0xFFFFFFFF;
     }
 
     // Fill in transport struct
@@ -665,17 +621,83 @@ void wki_ivshmem_transport_init() {
     s_ivshmem_transport.doorbell = ivshmem_wki_doorbell;
     s_ivshmem_transport.next = nullptr;
 
+    // Private state is complete before any MSI-X source can call its handler.
+    if (!s_ivshmem_priv.resources.activate(ivshmem_wki_irq, &s_ivshmem_priv, "wki-ivshmem")) {
+        ker::mod::dbg::log("[WKI] ivshmem: PCI activation failed");
+        return;
+    }
+
     // Register with WKI core
     wki_transport_register(&s_ivshmem_transport);
 
     s_ivshmem_initialized = true;
     ker::mod::dbg::log("[WKI] ivshmem RDMA transport initialized (vm_id=%u, rdma=%u KB)", s_ivshmem_priv.my_vm_id,
-                       static_cast<uint32_t>(WKI_RDMA_REGION_SIZE / 1024));
+                       s_ivshmem_priv.rdma_size / 1024);
+#ifdef WOS_SELFTEST
+    dev::ivshmem::selftest_start(&s_ivshmem_priv.resources, "wki", wki_ivshmem_transport_shutdown, selftest_late_calls, [](bool acquire) {
+        if (acquire) {
+            g_wki.transport_lock.lock();
+            s_ivshmem_transport.chaos_in_flight.fetch_add(1, std::memory_order_acq_rel);
+            g_wki.transport_lock.unlock();
+        } else {
+            s_ivshmem_transport.chaos_in_flight.fetch_sub(1, std::memory_order_release);
+        }
+    });
+#endif
 }
 
-auto wki_ivshmem_transport_poll(uint16_t budget) -> uint16_t { return s_ivshmem_initialized ? drain_rx_ring(&s_ivshmem_priv, budget) : 0; }
+auto wki_ivshmem_transport_poll(uint16_t budget) -> uint16_t {
+    dev::ivshmem::CallbackGuard const GUARD(s_ivshmem_priv.resources);
+    if (!GUARD || !s_ivshmem_initialized.load(std::memory_order_acquire)) return 0;
+    auto const PROCESSED = drain_rx_ring(&s_ivshmem_priv, budget);
+    s_ivshmem_priv.resources.mask_vector(s_ivshmem_priv.ring_failed.load(std::memory_order_acquire));
+    return PROCESSED;
+}
+
+auto wki_ivshmem_transport_shutdown() -> int {
+    // Registry leases use this lock; chaos leases use the inner chaos lock.
+    // Closing under both excludes a check-then-increment after a zero snapshot.
+    g_wki.transport_lock.lock();
+    wki_chaos_transport_close(&s_ivshmem_transport);
+    g_wki.transport_lock.unlock();
+    return s_ivshmem_priv.resources.retire(
+        [](void*) {
+            s_ivshmem_priv.rx_handler.store(nullptr, std::memory_order_release);
+            if (s_ivshmem_initialized.exchange(false, std::memory_order_acq_rel)) wki_transport_unregister(&s_ivshmem_transport);
+        },
+        nullptr, [](void*) { return s_ivshmem_transport.chaos_in_flight.load(std::memory_order_acquire) == 0; });
+}
 
 #ifdef WOS_SELFTEST
+namespace {
+auto selftest_late_calls() -> bool {
+    auto* transport = &s_ivshmem_transport;
+    auto& priv = s_ivshmem_priv;
+    std::array<uint8_t, 64> bytes{};
+    std::array<uint8_t, 24> mailbox{};
+    std::memcpy(mailbox.data(), priv.shmem + IRQ_MAILBOX_OFFSET, mailbox.size());
+    auto const BITMAP = priv.rdma_bitmap;
+    auto const HANDLER = priv.rx_handler.load();
+    auto const IRQS = priv.resources.test_irqs.load();
+    auto const POOL = net::pkt_pool_free_count();
+    auto* pkt = net::pkt_alloc_tx();
+    if (pkt == nullptr) return false;
+    bool const TX = ivshmem_wki_tx_pkt(transport, 2, pkt) == -1 && ivshmem_wki_tx(transport, 2, bytes.data(), bytes.size()) == -1;
+    uint32_t rkey = UINT32_MAX;
+    bool const RDMA = ivshmem_wki_rdma_register_region(transport, 0, bytes.size(), &rkey) == -1 && rkey == UINT32_MAX &&
+                      ivshmem_wki_rdma_read(transport, 2, 4096, 0, bytes.data(), bytes.size()) == -1 &&
+                      ivshmem_wki_rdma_write(transport, 2, 4096, 0, bytes.data(), bytes.size()) == -1 &&
+                      wki_ivshmem_rdma_alloc(4096) == -1 && wki_ivshmem_rdma_ptr(4096) == nullptr;
+    wki_ivshmem_rdma_free(4096, 4096);
+    wki_ivshmem_irq_mailbox_write(transport, 1, 2, 3);
+    ivshmem_wki_set_rx_handler(transport, [](WkiTransport*, const void*, uint16_t, const WkiRxMetadata*) {});
+    ivshmem_wki_irq(0, &priv);
+    return TX && RDMA && ivshmem_wki_doorbell(transport, 2, 0) == -1 && wki_ivshmem_transport_poll(64) == 0 &&
+           std::memcmp(mailbox.data(), priv.shmem + IRQ_MAILBOX_OFFSET, mailbox.size()) == 0 && BITMAP == priv.rdma_bitmap &&
+           priv.rx_handler.load() == HANDLER && priv.resources.test_irqs.load() == IRQS && net::pkt_pool_free_count() == POOL;
+}
+}  // namespace
+
 auto wki_ivshmem_selftest_complete_frames() -> bool {
     std::unique_ptr<std::array<uint8_t, WKI_IVSHMEM_RING_SIZE>> storage(new (std::nothrow) std::array<uint8_t, WKI_IVSHMEM_RING_SIZE>{});
     std::unique_ptr<IvshmemFrame> sent(new (std::nothrow) IvshmemFrame{});

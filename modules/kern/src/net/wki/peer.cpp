@@ -2130,10 +2130,8 @@ void drain_pending_epoch_reset_cleanups() {
 }  // namespace
 
 void wki_peer_timer_tick(uint64_t now_us) {
-    // ivshmem-plain has a shared message ring but no reliable doorbell in
-    // rootless file-backed deployments. Keep fallback work bounded and in
-    // task context; an IRQ racing this call is excluded by the transport's
-    // atomic single-drainer guard.
+    // All ivshmem message/mailbox dispatch runs in task context. Doorbell IRQ
+    // only masks its vector; the bounded poll re-arms it under callback ownership.
     static_cast<void>(wki_ivshmem_transport_poll(64));
     if (!g_wki.initialized) {
         return;

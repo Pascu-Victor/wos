@@ -576,6 +576,7 @@ void release_transport_lease(WkiTransport* transport, bool leased) {
 }
 
 auto deliver_ready_once() -> int {
+    auto const HOLD = mod::sched::hold_kernel_shutdown();
     WkiChaosDeliveryView delivery = {};
     WkiTransport* transport = nullptr;
     bool leased = false;
@@ -842,7 +843,7 @@ void wki_chaos_transport_register(WkiTransport* transport) {
     s_chaos_lock.unlock_irqrestore(FLAGS);
 }
 
-void wki_chaos_transport_unregister(WkiTransport* transport) {
+void wki_chaos_transport_close(WkiTransport* transport) {
     if (transport == nullptr) {
         return;
     }
@@ -850,6 +851,11 @@ void wki_chaos_transport_unregister(WkiTransport* transport) {
     transport->chaos_unregistering.store(true, std::memory_order_relaxed);
     s_chaos.discard_transport(reinterpret_cast<uintptr_t>(transport), transport->chaos_id);
     s_chaos_lock.unlock_irqrestore(FLAGS);
+}
+
+void wki_chaos_transport_unregister(WkiTransport* transport) {
+    if (transport == nullptr) return;
+    wki_chaos_transport_close(transport);
 
     // Deferred callbacks are bounded TX/RX operations and run without the
     // chaos or transport-registry lock. Waiting here prevents the caller from
@@ -901,6 +907,7 @@ void wki_chaos_peer_epoch_update(uint16_t node_id, uint32_t remote_boot_epoch, u
 }
 
 auto wki_transport_send(WkiTransport* transport, uint16_t neighbor, const void* data, uint16_t len) -> int {
+    auto const HOLD = mod::sched::hold_kernel_shutdown();
     if (transport == nullptr || transport->tx == nullptr) {
         return WKI_ERR_TX_FAILED;
     }
@@ -943,6 +950,7 @@ auto wki_transport_send(WkiTransport* transport, uint16_t neighbor, const void* 
 }
 
 auto wki_transport_send_pkt(WkiTransport* transport, uint16_t neighbor, ker::net::PacketBuffer* pkt) -> int {
+    auto const HOLD = mod::sched::hold_kernel_shutdown();
     if (pkt == nullptr) {
         return WKI_ERR_TX_FAILED;
     }
@@ -992,6 +1000,7 @@ auto wki_transport_send_pkt(WkiTransport* transport, uint16_t neighbor, ker::net
 }
 
 void wki_chaos_rx_ingress(WkiTransport* transport, const void* data, uint16_t len, const WkiRxMetadata* metadata) {
+    auto const HOLD = mod::sched::hold_kernel_shutdown();
     if (!s_chaos_enabled.load(std::memory_order_relaxed)) {
         deliver_rx(transport, data, len, metadata);
         return;
