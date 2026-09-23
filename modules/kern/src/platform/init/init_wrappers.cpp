@@ -187,7 +187,9 @@ void iommu_init() {
 #ifdef WOS_SELFTEST
     if (cmdline_has_token(get_kernel_cmdline(), "--iommu-test-fail-alloc")) (void)dev::iommu::selftest_limit_table_allocations(1);
 #endif
-    dev::iommu::initialize_domains(cmdline_has_token(get_kernel_cmdline(), "--iommu-off"), false);
+    dev::iommu::initialize_domains(cmdline_has_token(get_kernel_cmdline(), "--iommu-off"),
+                                   cmdline_has_token(get_kernel_cmdline(), "--iommu-strict"),
+                                   cmdline_has_token(get_kernel_cmdline(), "--iommu-translated"));
 }
 
 void console_init() { dev::console::console_init(); }
