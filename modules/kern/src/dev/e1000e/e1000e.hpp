@@ -3,6 +3,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <dev/dma/lifecycle.hpp>
+#include <dev/e1000e/dma.hpp>
 #include <dev/pci.hpp>
 #include <net/netdevice.hpp>
 #include <net/netpoll.hpp>
@@ -129,6 +131,15 @@ struct E1000Device {
     std::array<ker::net::PacketBuffer*, NUM_TX_DESC> tx_bufs{};
     uint16_t tx_tail = 0;
 
+    managed::Buffer rx_ring{}, tx_ring{};
+    std::array<managed::Buffer, NUM_RX_DESC> rx_dma{};
+    std::array<managed::Buffer, NUM_TX_DESC> tx_dma{};
+    dma::lifecycle::Admission admission{};
+    std::atomic<uint8_t> retirement{0};
+    bool irq_owned = false;
+    bool published = false;
+    bool rx_discarding = false;
+
     uint8_t irq_vector = 0;
     ker::mod::sys::Spinlock tx_lock;
 
@@ -138,5 +149,18 @@ struct E1000Device {
 
 // -- Driver entry point --------------------------------------------------
 void e1000e_init();
+auto e1000e_shutdown() -> int;
+#ifdef WOS_SELFTEST
+struct DmaTestResult {
+    bool found = false, prepared = false, fail_prepare = false, withheld = false, release_supported = false;
+    bool packets_requested = false, late_rejected = false, irq_drained = false, bme_disabled = false;
+    uint8_t packets_verified = 0;
+    size_t echoes = 0, pool_before = 0, pool_after = 0;
+    bool repeat_stable = false;
+    int retirement_result = 0;
+    dma::Stats before{}, mapped{}, after{};
+};
+auto e1000e_selftest() -> DmaTestResult;
+#endif
 
 }  // namespace ker::dev::e1000e

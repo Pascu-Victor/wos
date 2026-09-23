@@ -16,6 +16,9 @@ wos_add_unit_test(virtio_platform_test
 wos_add_unit_test(vtd_fault_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vtd_fault_test.cpp
 )
+wos_add_unit_test(e1000_dma_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/e1000_dma_test.cpp
+)
 wos_add_unit_test(stack_resume_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/stack_resume_test.cpp
 )
@@ -273,6 +276,10 @@ add_test(
 add_test(
     NAME stack_resume_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/stack_resume_source_test.py
+)
+add_test(
+    NAME e1000_dma_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/e1000_dma_source_test.py
 )
 add_test(
     NAME shutdown_source_test
@@ -728,6 +735,7 @@ set_tests_properties(
     service_manifest_config_source_test
     init_supervisor_docs_source_test
     stack_resume_source_test
+    e1000_dma_source_test
     shutdown_source_test
     init_control_source_test
     wos_resolve_test

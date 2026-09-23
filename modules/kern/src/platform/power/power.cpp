@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <dev/ahci.hpp>
+#include <dev/e1000e/e1000e.hpp>
 #include <dev/virtio/virtio_net.hpp>
 #include <mod/io/port/port.hpp>
 #include <net/wki/wki.hpp>
@@ -210,6 +211,10 @@ void io_delay_loop() {
     int const VIRTIO_RET = ker::dev::virtio::virtio_net_shutdown();
     clear_current_finalizer_sched_state();
     if (VIRTIO_RET != 0) log::warn("virtio shutdown returned %d; unproven DMA backing retained", VIRTIO_RET);
+
+    int const E1000_RET = ker::dev::e1000e::e1000e_shutdown();
+    clear_current_finalizer_sched_state();
+    if (E1000_RET != 0) log::warn("e1000 shutdown returned %d; unproven DMA backing retained", E1000_RET);
 
     g_phase.store(ShutdownPhase::CPU_QUIESCE, std::memory_order_release);
     clear_current_finalizer_sched_state();
