@@ -335,9 +335,20 @@ struct AHCIDevice {
     uint64_t total_sectors{};
 };
 
-// Function declarations
-auto ahci_init() -> int;
-auto ahci_set_base(volatile uint32_t* base) -> void;
+#ifdef WOS_SELFTEST
+// Boot-only failure injection before the controller has been discovered.
+void selftest_limit_probe_allocations(size_t count);
+enum class SelftestRetirementFault : uint8_t { none, stop, flush };
+void selftest_set_retirement_fault(SelftestRetirementFault fault);
+[[nodiscard]] auto selftest_retirement_fault() -> SelftestRetirementFault;
+#endif
+
+// Close admission permanently, drain command readers, flush, stop engines and
+// release DMA. Task/BSP context only; no port lock may be held by the caller.
+// Call after upper-layer sync/unmount. Providers remain static offline objects.
+// Zero means quiescence, release and durability succeeded. Failure retains any
+// unproven backing; a failed flush returns -EIO even if safe release succeeds.
+[[nodiscard]] auto ahci_shutdown() -> int;
 
 // Initializes AHCI controller by discovering and setting up the AHCI device
 auto ahci_controller_init() -> void;

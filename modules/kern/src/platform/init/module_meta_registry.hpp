@@ -19,7 +19,7 @@ namespace ker::init {
 // The runtime registry (init_registry.hpp) must be kept in sync with this.
 // =============================================================================
 
-inline constexpr size_t MODULE_COUNT = 44;
+inline constexpr size_t MODULE_COUNT = 46;
 
 inline constexpr std::array<ModuleMeta, MODULE_COUNT> MODULE_META_REGISTRY = {{
     // =========================================================================
@@ -59,8 +59,9 @@ inline constexpr std::array<ModuleMeta, MODULE_COUNT> MODULE_META_REGISTRY = {{
     make_meta("epoch_manager", BootPhase::PHASE_3_SUBSYSTEMS, Dependency{"smt"}),
     make_meta("dev", BootPhase::PHASE_3_SUBSYSTEMS, Dependency{"ioapic"}),
     make_meta("pci", BootPhase::PHASE_3_SUBSYSTEMS, Dependency{"dev"}),
+    make_meta("iommu", BootPhase::PHASE_3_SUBSYSTEMS, Dependency{"pci"}, Dependency{"acpi"}, Dependency{"smt"}),
     make_meta("console", BootPhase::PHASE_3_SUBSYSTEMS, Dependency{"pci"}),
-    make_meta("ahci", BootPhase::PHASE_3_SUBSYSTEMS, Dependency{"pci"}),
+    make_meta("ahci", BootPhase::PHASE_3_SUBSYSTEMS, Dependency{"iommu"}),
     make_meta("block_device", BootPhase::PHASE_3_SUBSYSTEMS, Dependency{"ahci"}, Dependency{"epoch_manager"}),
     make_meta("vfs", BootPhase::PHASE_3_SUBSYSTEMS, Dependency{"block_device"}),
     make_meta("devfs_partitions", BootPhase::PHASE_3_SUBSYSTEMS, Dependency{"vfs"}),
@@ -75,11 +76,14 @@ inline constexpr std::array<ModuleMeta, MODULE_COUNT> MODULE_META_REGISTRY = {{
     // =========================================================================
     // PHASE 5: Drivers (now have smt and epoch_manager for worker threads)
     // =========================================================================
-    make_meta("virtio_net", BootPhase::PHASE_5_DRIVERS, Dependency{"pci"}, Dependency{"net"}, Dependency{"sched"}),
-    make_meta("e1000e", BootPhase::PHASE_5_DRIVERS, Dependency{"pci"}, Dependency{"net"}, Dependency{"sched"}),
+    make_meta("iommu_faults", BootPhase::PHASE_5_DRIVERS, Dependency{"iommu"}, Dependency{"sched"}),
+    make_meta("virtio_net", BootPhase::PHASE_5_DRIVERS, Dependency{"pci"}, Dependency{"net"}, Dependency{"sched"},
+              Dependency{"iommu_faults"}),
+    make_meta("e1000e", BootPhase::PHASE_5_DRIVERS, Dependency{"pci"}, Dependency{"net"}, Dependency{"sched"}, Dependency{"iommu_faults"}),
     make_meta("cdc_ether", BootPhase::PHASE_5_DRIVERS, Dependency{"pci"}, Dependency{"net"}, Dependency{"sched"}),
-    make_meta("xhci", BootPhase::PHASE_5_DRIVERS, Dependency{"pci"}, Dependency{"cdc_ether"}, Dependency{"sched"}),
-    make_meta("ivshmem", BootPhase::PHASE_5_DRIVERS, Dependency{"pci"}, Dependency{"net"}, Dependency{"sched"}),
+    make_meta("xhci", BootPhase::PHASE_5_DRIVERS, Dependency{"pci"}, Dependency{"cdc_ether"}, Dependency{"sched"},
+              Dependency{"iommu_faults"}),
+    make_meta("ivshmem", BootPhase::PHASE_5_DRIVERS, Dependency{"pci"}, Dependency{"net"}, Dependency{"sched"}, Dependency{"iommu_faults"}),
     make_meta("pkt_pool_expand", BootPhase::PHASE_5_DRIVERS, Dependency{"virtio_net"}, Dependency{"e1000e"}, Dependency{"ivshmem"}),
     make_meta("ndp", BootPhase::PHASE_5_DRIVERS, Dependency{"net"}),
     make_meta("wki", BootPhase::PHASE_5_DRIVERS, Dependency{"ndp"}),

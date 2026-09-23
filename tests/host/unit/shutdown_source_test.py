@@ -305,6 +305,8 @@ def test_kernel_finalizer_sequences_teardown_sync_unmount_and_platform_action() 
         ("ker::net::wki::wki_shutdown();", "ker::vfs::vfs_shutdown_unmount_all(current_root_path())", "WKI shutdown before root unmount"),
         ("ker::vfs::vfs_shutdown_sync();", "ker::vfs::vfs_shutdown_unmount_all(current_root_path())", "sync before root unmount"),
         ("ker::vfs::vfs_shutdown_unmount_all(current_root_path())", "smt::halt_other_cores();", "root unmount before CPU quiesce"),
+        ("ker::vfs::vfs_shutdown_unmount_all(current_root_path())", "ker::dev::ahci::ahci_shutdown()", "AHCI retirement follows root unmount"),
+        ("ker::dev::ahci::ahci_shutdown()", "smt::halt_other_cores();", "AHCI readers drain before CPU halt"),
         ("smt::halt_other_cores();", "platform_reboot();", "CPU quiesce before platform reboot"),
     ]:
         require_order(run_body, first, second, context)

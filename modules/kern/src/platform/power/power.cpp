@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <dev/ahci.hpp>
 #include <mod/io/port/port.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/acpi/power.hpp>
@@ -200,6 +201,10 @@ void io_delay_loop() {
         (void)ker::vfs::vfs_shutdown_sync();
         clear_current_finalizer_sched_state();
     }
+
+    int const AHCI_RET = ker::dev::ahci::ahci_shutdown();
+    clear_current_finalizer_sched_state();
+    if (AHCI_RET != 0) log::warn("AHCI shutdown returned %d; unproven DMA backing retained", AHCI_RET);
 
     g_phase.store(ShutdownPhase::CPU_QUIESCE, std::memory_order_release);
     clear_current_finalizer_sched_state();

@@ -3,11 +3,14 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <dev/iommu/domains.hpp>
+#include <dev/pci_extended.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/smt/smt.hpp>
+#include <platform/sys/spinlock.hpp>
 #include <utility>
 
 namespace ker::dev::pci {
@@ -19,6 +22,16 @@ constexpr int MAX_PCI_DEVICES = 64;
 std::array<PCIDevice, MAX_PCI_DEVICES> discovered_devices = {};
 int device_count = 0;
 bool enumerated = false;
+bool enumeration_error = false;
+std::array<bool, 256> visited_buses{};
+mod::sys::Spinlock config_lock{};
+struct ConfigGuard {
+    uint64_t flags = config_lock.lock_irqsave();
+    ~ConfigGuard() { config_lock.unlock_irqrestore(flags); }
+    ConfigGuard() = default;
+    ConfigGuard(const ConfigGuard&) = delete;
+    auto operator=(const ConfigGuard&) -> ConfigGuard& = delete;
+};
 constexpr int PCI_FUNCTION_COUNT = 8;
 constexpr int PCI_SLOT_COUNT = 32;
 
@@ -27,20 +40,44 @@ inline auto inl(uint16_t port) -> uint32_t {
     // Written by inline asm output constraints.
     // NOLINTNEXTLINE(misc-const-correctness)
     uint32_t result = 0;
-    asm volatile("inl %1, %0" : "=a"(result) : "Nd"(port));
+    asm volatile("inl %1, %0" : "=a"(result) : "Nd"(port) : "memory");
     return result;
 }
 
-inline void outl(uint16_t port, uint32_t value) { asm volatile("outl %0, %1" : : "a"(value), "Nd"(port)); }
+inline void outl(uint16_t port, uint32_t value) { asm volatile("outl %0, %1" : : "a"(value), "Nd"(port) : "memory"); }
+inline void outw(uint16_t port, uint16_t value) { asm volatile("outw %0, %1" : : "a"(value), "Nd"(port) : "memory"); }
+inline void outb(uint16_t port, uint8_t value) { asm volatile("outb %0, %1" : : "a"(value), "Nd"(port) : "memory"); }
 
-void scan_bus(uint8_t bus);
+auto config_address(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) -> uint32_t {
+    return (static_cast<uint32_t>(bus) << 16) | (static_cast<uint32_t>(slot) << 11) | (static_cast<uint32_t>(func) << 8) |
+           (offset & 0xfcU) | 0x80000000U;
+}
 
-void scan_function(uint8_t bus, uint8_t slot, uint8_t func) {
+// Pure admission lookup is safe under config_lock. Quarantine publishes its
+// closed flag before disabling each requester under this same lock.
+auto bus_master_write_allowed(uint8_t bus, uint8_t slot, uint8_t func, uint32_t value) -> bool {
+    if ((value & PCI_COMMAND_BUS_MASTER) == 0) return true;
+    for (int i = 0; i < device_count; ++i) {
+        auto const& device = discovered_devices[static_cast<size_t>(i)];
+        if (device.bus == bus && device.slot == slot && device.function == func && iommu::bus_master_allowed(&device)) return true;
+    }
+    return false;
+}
+void authorize_bus_master_write(uint8_t bus, uint8_t slot, uint8_t func, uint32_t value) {
+    if (bus_master_write_allowed(bus, slot, func, value)) return;
+    mod::dbg::panic_handler("Raw PCI command write attempted bus mastering without a ready DMA domain");
+    hcf();
+}
+
+void scan_bus(uint8_t bus, uint16_t parent = NO_PARENT);
+
+void scan_function(uint8_t bus, uint8_t slot, uint8_t func, uint16_t parent) {
     uint16_t const VENDOR = pci_config_read16(bus, slot, func, PCI_VENDOR_ID);
     if (VENDOR == 0xFFFF) {
         return;
     }
     if (device_count >= MAX_PCI_DEVICES) {
+        enumeration_error = true;
         return;
     }
 
@@ -48,6 +85,7 @@ void scan_function(uint8_t bus, uint8_t slot, uint8_t func) {
     dev->bus = bus;
     dev->slot = slot;
     dev->function = func;
+    dev->parent_index = parent;
     dev->vendor_id = VENDOR;
     dev->device_id = pci_config_read16(bus, slot, func, PCI_DEVICE_ID);
 
@@ -76,45 +114,58 @@ void scan_function(uint8_t bus, uint8_t slot, uint8_t func) {
 
     // If this is a PCI-to-PCI bridge, scan the secondary bus
     if ((dev->header_type & 0x7F) == PCI_HEADER_TYPE_BRIDGE) {
-        uint8_t const SECONDARY_BUS = pci_config_read8(bus, slot, func, PCI_SECONDARY_BUS);
-        if (SECONDARY_BUS != 0) {
-            scan_bus(SECONDARY_BUS);
+        uint32_t const BUSES = pci_config_read32(bus, slot, func, 0x18);
+        auto const PRIMARY = static_cast<uint8_t>(BUSES);
+        dev->secondary_bus = static_cast<uint8_t>(BUSES >> 8);
+        dev->subordinate_bus = static_cast<uint8_t>(BUSES >> 16);
+        if (dev->secondary_bus == 0 && dev->subordinate_bus == 0) {
+            return;  // Unconfigured bridge: no downstream bus to enumerate.
         }
+        if (PRIMARY != bus || dev->secondary_bus == 0 || dev->secondary_bus == bus || dev->subordinate_bus < dev->secondary_bus ||
+            (parent != NO_PARENT && (dev->secondary_bus < discovered_devices[parent].secondary_bus ||
+                                     dev->subordinate_bus > discovered_devices[parent].subordinate_bus))) {
+            enumeration_error = true;
+            return;
+        }
+        scan_bus(dev->secondary_bus, static_cast<uint16_t>(device_count - 1));
     }
 }
 
-void scan_slot(uint8_t bus, uint8_t slot) {
+void scan_slot(uint8_t bus, uint8_t slot, uint16_t parent) {
     uint16_t const VENDOR = pci_config_read16(bus, slot, 0, PCI_VENDOR_ID);
     if (VENDOR == 0xFFFF) {
         return;
     }
 
-    scan_function(bus, slot, 0);
+    scan_function(bus, slot, 0, parent);
 
     // Check for multi-function device
     uint8_t const HEADER_TYPE = pci_config_read8(bus, slot, 0, PCI_HEADER_TYPE);
     if ((HEADER_TYPE & PCI_HEADER_TYPE_MULTI_FUNC) != 0) {
         for (uint8_t func = 1; func < PCI_FUNCTION_COUNT; func++) {
             if (pci_config_read16(bus, slot, func, PCI_VENDOR_ID) != 0xFFFF) {
-                scan_function(bus, slot, func);
+                scan_function(bus, slot, func, parent);
             }
         }
     }
 }
 
-void scan_bus(uint8_t bus) {
+void scan_bus(uint8_t bus, uint16_t parent) {
+    if (visited_buses[bus]) {
+        enumeration_error = true;
+        return;
+    }
+    visited_buses[bus] = true;
     for (uint8_t slot = 0; slot < PCI_SLOT_COUNT; slot++) {
-        scan_slot(bus, slot);
+        scan_slot(bus, slot, parent);
     }
 }
 }  // namespace
 
 // Read 32-bit from PCI configuration space
 auto pci_config_read32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) -> uint32_t {
-    uint32_t const ADDRESS = (static_cast<uint32_t>(bus) << 16) | (static_cast<uint32_t>(slot) << 11) | (static_cast<uint32_t>(func) << 8) |
-                             (offset & 0xFC) | 0x80000000UL;
-
-    outl(PCI_CONFIG_ADDRESS, ADDRESS);
+    ConfigGuard const GUARD;
+    outl(PCI_CONFIG_ADDRESS, config_address(bus, slot, func, offset));
     return inl(PCI_CONFIG_DATA);
 }
 
@@ -132,27 +183,35 @@ auto pci_config_read8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) -
 
 // Write 32-bit to PCI configuration space
 auto pci_config_write32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint32_t value) -> void {
-    uint32_t const ADDRESS = (static_cast<uint32_t>(bus) << 16) | (static_cast<uint32_t>(slot) << 11) | (static_cast<uint32_t>(func) << 8) |
-                             (offset & 0xFC) | 0x80000000UL;
-
-    outl(PCI_CONFIG_ADDRESS, ADDRESS);
+    if ((offset & 0xfcU) == PCI_COMMAND) authorize_bus_master_write(bus, slot, func, value);
+    ConfigGuard const GUARD;
+    // A unit may close after the pre-lock diagnostic check. Do not restore BME.
+    if ((offset & 0xfcU) == PCI_COMMAND && !bus_master_write_allowed(bus, slot, func, value))
+        value = static_cast<uint32_t>(value & ~PCI_COMMAND_BUS_MASTER);
+    outl(PCI_CONFIG_ADDRESS, config_address(bus, slot, func, offset));
     outl(PCI_CONFIG_DATA, value);
 }
 
 // Write 16-bit to PCI configuration space
 auto pci_config_write16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint16_t value) -> void {
-    uint32_t dword = pci_config_read32(bus, slot, func, offset);
-    int const SHIFT = (offset & 2) * 8;
-    dword = (dword & ~(0xFFFF << SHIFT)) | (static_cast<uint32_t>(value) << SHIFT);
-    pci_config_write32(bus, slot, func, offset, dword);
+    if ((offset & 0xfeU) == PCI_COMMAND) authorize_bus_master_write(bus, slot, func, value);
+    ConfigGuard const GUARD;
+    // A unit may close after the pre-lock diagnostic check. Do not restore BME.
+    if ((offset & 0xfeU) == PCI_COMMAND && !bus_master_write_allowed(bus, slot, func, value))
+        value = static_cast<uint16_t>(value & ~PCI_COMMAND_BUS_MASTER);
+    outl(PCI_CONFIG_ADDRESS, config_address(bus, slot, func, offset));
+    outw(static_cast<uint16_t>(PCI_CONFIG_DATA + (offset & 2U)), value);
 }
 
 // Write 8-bit to PCI configuration space
 auto pci_config_write8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint8_t value) -> void {
-    uint32_t dword = pci_config_read32(bus, slot, func, offset);
-    int const SHIFT = (offset & 3) * 8;
-    dword = (dword & ~(0xFF << SHIFT)) | (static_cast<uint32_t>(value) << SHIFT);
-    pci_config_write32(bus, slot, func, offset, dword);
+    if (offset == PCI_COMMAND) authorize_bus_master_write(bus, slot, func, value);
+    ConfigGuard const GUARD;
+    // A unit may close after the pre-lock diagnostic check. Do not restore BME.
+    if (offset == PCI_COMMAND && !bus_master_write_allowed(bus, slot, func, value))
+        value = static_cast<uint8_t>(value & ~PCI_COMMAND_BUS_MASTER);
+    outl(PCI_CONFIG_ADDRESS, config_address(bus, slot, func, offset));
+    outb(static_cast<uint16_t>(PCI_CONFIG_DATA + (offset & 3U)), value);
 }
 
 // Enumerate all PCI devices across all buses
@@ -162,6 +221,8 @@ auto pci_enumerate_all() -> int {
     }
 
     device_count = 0;
+    enumeration_error = false;
+    visited_buses.fill(false);
 
     // Check if host bridge is multi-function (multiple root buses)
     uint8_t const HEADER_TYPE = pci_config_read8(0, 0, 0, PCI_HEADER_TYPE);
@@ -177,7 +238,7 @@ auto pci_enumerate_all() -> int {
 
     enumerated = true;
 
-    log::info("found %d devices", device_count);
+    log::info("found %d devices (topology complete=%u)", device_count, static_cast<unsigned>(!enumeration_error));
     for (int i = 0; i < device_count; i++) {
         auto* d = &discovered_devices.at(static_cast<size_t>(i));
         log::debug("%d:%d.%d vendor=%x device=%x class=%x:%x prog_if=%x", static_cast<int>(d->bus), static_cast<int>(d->slot),
@@ -185,6 +246,7 @@ auto pci_enumerate_all() -> int {
                    static_cast<int>(d->class_code), static_cast<int>(d->subclass_code), static_cast<int>(d->prog_if));
     }
 
+    collect_extended_config();
     return device_count;
 }
 
@@ -196,6 +258,8 @@ auto pci_get_device(size_t idx) -> PCIDevice* {
 }
 
 auto pci_device_count() -> size_t { return static_cast<size_t>(device_count); }
+
+auto pci_enumeration_complete() -> bool { return enumerated && !enumeration_error; }
 
 auto pci_find_by_class(uint8_t cls, uint8_t sub) -> PCIDevice* {
     if (!enumerated) {
@@ -224,15 +288,29 @@ auto pci_find_by_vendor_device(uint16_t vendor, uint16_t device) -> PCIDevice* {
 }
 
 auto pci_enable_bus_master(PCIDevice* dev) -> void {
-    uint16_t cmd = pci_config_read16(dev->bus, dev->slot, dev->function, PCI_COMMAND);
-    cmd |= PCI_COMMAND_BUS_MASTER;
-    pci_config_write16(dev->bus, dev->slot, dev->function, PCI_COMMAND, cmd);
+    if (!pci_set_bus_master(dev, true)) {
+        mod::dbg::panic_handler("PCI bus mastering requested without a ready DMA domain");
+        hcf();
+    }
+}
+
+auto pci_set_bus_master(PCIDevice* dev, bool enable) -> bool {
+    if (dev == nullptr || (enable && !iommu::bus_master_allowed(dev))) return false;
+    ConfigGuard const GUARD;
+    if (enable && !iommu::bus_master_allowed(dev)) return false;
+    outl(PCI_CONFIG_ADDRESS, config_address(dev->bus, dev->slot, dev->function, PCI_COMMAND));
+    auto command = static_cast<uint16_t>(inl(PCI_CONFIG_DATA));
+    command = enable ? static_cast<uint16_t>(command | PCI_COMMAND_BUS_MASTER) : static_cast<uint16_t>(command & ~PCI_COMMAND_BUS_MASTER);
+    outw(PCI_CONFIG_DATA, command);
+    return (static_cast<uint16_t>(inl(PCI_CONFIG_DATA)) & PCI_COMMAND_BUS_MASTER) == (enable ? PCI_COMMAND_BUS_MASTER : 0);
 }
 
 auto pci_enable_memory_space(PCIDevice* dev) -> void {
-    uint16_t cmd = pci_config_read16(dev->bus, dev->slot, dev->function, PCI_COMMAND);
+    ConfigGuard const GUARD;
+    outl(PCI_CONFIG_ADDRESS, config_address(dev->bus, dev->slot, dev->function, PCI_COMMAND));
+    auto cmd = static_cast<uint16_t>(inl(PCI_CONFIG_DATA));
     cmd |= PCI_COMMAND_MEM_SPACE;
-    pci_config_write16(dev->bus, dev->slot, dev->function, PCI_COMMAND, cmd);
+    outw(PCI_CONFIG_DATA, cmd);
 }
 
 auto pci_find_capability(PCIDevice* dev, uint8_t cap_id) -> uint8_t {

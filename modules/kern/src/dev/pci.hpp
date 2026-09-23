@@ -69,6 +69,7 @@ constexpr uint8_t PCI_HEADER_TYPE_BRIDGE = 0x01;
 constexpr uint8_t PCI_HEADER_TYPE_MULTI_FUNC = 0x80;
 
 constexpr size_t BAR_COUNT = 6;
+constexpr uint16_t NO_PARENT = UINT16_MAX;
 
 // PCI Device structure
 struct PCIDevice {
@@ -84,6 +85,10 @@ struct PCIDevice {
     uint8_t header_type = 0;
     uint8_t interrupt_line = 0;
     uint8_t interrupt_pin = 0;
+    // Boot-enumeration ancestry. Indices refer to the stable PCI registry.
+    uint16_t parent_index = NO_PARENT;
+    uint8_t secondary_bus = 0;
+    uint8_t subordinate_bus = 0;
 };
 
 // Read from PCI configuration space
@@ -102,6 +107,9 @@ auto pci_enumerate_all() -> int;
 // Device access
 auto pci_get_device(size_t idx) -> PCIDevice*;
 auto pci_device_count() -> size_t;
+// False if enumeration truncated or bridge topology was inconsistent. DMA
+// admission must not treat a partial registry as the complete requester set.
+auto pci_enumeration_complete() -> bool;
 
 // Find devices by class/subclass or vendor/device
 auto pci_find_by_class(uint8_t cls, uint8_t sub) -> PCIDevice*;
@@ -109,6 +117,9 @@ auto pci_find_by_vendor_device(uint16_t vendor, uint16_t device) -> PCIDevice*;
 
 // Enable PCI features on a device
 auto pci_enable_bus_master(PCIDevice* dev) -> void;
+// Atomic command-word update, never rewriting adjacent PCI status W1C bits.
+// Enabling requires a published domain; disabling is always permitted.
+auto pci_set_bus_master(PCIDevice* dev, bool enable) -> bool;
 auto pci_enable_memory_space(PCIDevice* dev) -> void;
 
 // PCI Capability support

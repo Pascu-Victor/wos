@@ -45,6 +45,8 @@ enum class PhysicalPageOwner : uint8_t {
     KCOV_BUFFER,
     DEBUGGER,
     SELFTEST,
+    IOMMU_TABLE,
+    DMA_BUFFER,
     COUNT,
 };
 

@@ -290,6 +290,10 @@ constexpr std::array<PhysicalOwnerDescriptor, PHYSICAL_PAGE_OWNER_COUNT> PHYSICA
      "bounded by loaded debug metadata"},
     {PhysicalPageOwner::SELFTEST, "selftest", "individual kernel selftest lifetime", PhysicalOwnerReclaimability::DIAGNOSTIC_LIFETIME,
      "zero outside isolated selftest builds"},
+    {PhysicalPageOwner::IOMMU_TABLE, "iommu_table", "IOMMU domain lifetime", PhysicalOwnerReclaimability::OWNER_TEARDOWN,
+     "root/context/translation pages retained until hardware invalidation and DMA retirement"},
+    {PhysicalPageOwner::DMA_BUFFER, "dma_buffer", "managed DMA region lifetime", PhysicalOwnerReclaimability::OWNER_TEARDOWN,
+     "exclusive coherent/bounce backing retained until hardware retirement and mapping invalidation"},
 }};
 
 static_assert(PHYSICAL_OWNER_DESCRIPTORS.size() == PHYSICAL_PAGE_OWNER_COUNT);

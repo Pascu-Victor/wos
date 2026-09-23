@@ -19,6 +19,12 @@ wos_add_unit_test(stack_resume_test
 wos_add_unit_test(shutdown_ownership_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/shutdown_ownership_test.cpp
 )
+wos_add_unit_test(ahci_lifecycle_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/ahci_lifecycle_test.cpp
+)
+wos_add_unit_test(ahci_dma_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/ahci_dma_test.cpp
+)
 # ---------------------------------------------------------------------------
 # Unit tests
 # ---------------------------------------------------------------------------

@@ -12,14 +12,20 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <dev/ahci_dma.hpp>
+#include <dev/ahci_lifecycle.hpp>
+#include <dev/dma/dma.hpp>
 #include <net/wki/remotable.hpp>
 #include <new>
 #include <platform/dbg/dbg.hpp>
+#include <platform/ktime/ktime.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <platform/sys/usercopy.hpp>
+#include <span>
 #include <utility>
 
 #include "block_device.hpp"
@@ -39,9 +45,7 @@ using log = ker::mod::dbg::logger<"ahci">;
 // AHCI Constants
 constexpr uint32_t HBA_PX_CMD_ST = 0x0001;
 constexpr uint32_t HBA_PX_CMD_FRE = 0x0010;
-constexpr uint32_t HBA_PX_CMD_FR = 0x4000;
 constexpr uint32_t HBA_PX_CMD_CR = 0x8000;
-constexpr uint32_t HBA_PX_IS_TFES = 0x40000000;
 constexpr uint8_t ATA_DEV_BUSY = 0x80;
 constexpr uint8_t ATA_DEV_DRQ = 0x08;
 constexpr uint8_t ATA_CMD_READ_DMA_EX = 0x25;
@@ -98,14 +102,38 @@ constexpr size_t CLB_SIZE = 1024;
 constexpr size_t FIS_RECEIVE_SIZE = 256;
 constexpr uint32_t SECTOR_SIZE = 512;
 constexpr size_t COMMAND_TABLE_PRDT_ENTRY_COUNT = 8192;
+constexpr uint32_t AHCI_MAX_SECTORS_PER_CMD = 1024;
+constexpr size_t TRANSFER_CAPACITY = AHCI_MAX_SECTORS_PER_CMD * SECTOR_SIZE;
+constexpr uint64_t ENGINE_TIMEOUT_NS = 1000000000ULL;
+constexpr uint64_t COMMAND_TIMEOUT_NS = 30000000000ULL;
+constexpr uint64_t MAX_WAIT_ITERATIONS = 100000000ULL;
+pci::PCIDevice* controller = nullptr;
+uint64_t dma_mask = UINT32_MAX;
+std::atomic<bool> controller_failed{false};
+lifecycle::Admission admission;
+mod::sys::Mutex lifecycle_lock;
+bool shutdown_attempted = false;  // lifecycle_lock; terminal, never reopens old DMA addresses.
+int shutdown_result = 0;
+#ifdef WOS_SELFTEST
+size_t probe_allocation_budget = SIZE_MAX;
+SelftestRetirementFault retirement_fault = SelftestRetirementFault::none;
+#endif
 std::array<AHCIDevice, MAX_PORTS> devices{};
 size_t device_count = 0;
 
-// Store virtual addresses for command structures
+struct CoherentRegion {
+    dma::Allocation allocation{};
+    dma::Submission submission{};
+};
 struct PortMemory {
     HbaCmdHeader* clb_virt = nullptr;
     uint8_t* fb_virt = nullptr;
-    std::array<uint8_t*, COMMAND_SLOT_COUNT> ctb_virt{};  // Command tables
+    std::array<uint8_t*, COMMAND_SLOT_COUNT> ctb_virt{};
+    CoherentRegion clb{}, fis{};
+    std::array<CoherentRegion, COMMAND_SLOT_COUNT> tables{};
+    dma::Allocation transfer{};
+    bool prepared = false;
+    bool failed = false;  // Serialized by this port's command mutex after probe.
 };
 
 std::array<PortMemory, MAX_PORTS> port_memory{};
@@ -152,56 +180,85 @@ void log_command_failure(volatile HbaPort* port, int portno, uint32_t slot, bool
 }
 
 void wait_for_completion_relax(uint64_t iteration) {
-    if ((iteration & (AHCI_WAIT_YIELD_INTERVAL - 1)) == 0 && ker::mod::sched::has_run_queues()) {
+    if ((iteration & (AHCI_WAIT_YIELD_INTERVAL - 1)) == 0 && ker::mod::mm::phys::can_wait_for_reclaim()) {
         ker::mod::sched::kern_yield();
         return;
     }
     asm volatile("pause");
 }
 
-// Stop command engine on a port
-void stop_cmd(volatile HbaPort* port) {
-    // Clear ST (bit0)
-    mmio_and32(port->cmd, ~HBA_PX_CMD_ST);
-
-    // Clear FRE (bit4)
-    mmio_and32(port->cmd, ~HBA_PX_CMD_FRE);
-
-    // Wait until FR (bit14), CR (bit15) are cleared
-    while (true) {
-        if ((mmio_read32(port->cmd) & HBA_PX_CMD_FR) != 0U) {
-            continue;
-        }
-        if ((mmio_read32(port->cmd) & HBA_PX_CMD_CR) != 0U) {
-            continue;
-        }
-        break;
+template <typename Predicate>
+auto wait_until(Predicate ready, uint64_t timeout_ns) -> bool {
+    uint64_t const BEGIN = mod::time::get_monotonic_ns();
+    for (uint64_t i = 0; i < MAX_WAIT_ITERATIONS; ++i) {
+        if (ready()) return true;
+        if (mod::time::get_monotonic_ns() - BEGIN >= timeout_ns) return false;
+        wait_for_completion_relax(i);
     }
+    return false;
 }
 
-// Start command engine on a port
-void start_cmd(volatile HbaPort* port) {
-    // Wait until CR (bit15) is cleared
-    uint32_t timeout = 0;
-    constexpr size_t MAX_TIMEOUT = 1000000;
-    while ((mmio_read32(port->cmd) & HBA_PX_CMD_CR) != 0U) {
-        if (timeout++ == MAX_TIMEOUT) {
-            ahci_log("start_cmd: timeout waiting for CR to clear\n");
-            break;
+auto stop_cmd(volatile HbaPort* port) -> bool {
+    struct Port {
+        volatile HbaPort* registers;
+        void clear_command(uint32_t mask) { mmio_and32(registers->cmd, ~mask); }
+        auto wait_clear(uint32_t mask) -> bool {
+            return wait_until([&] { return (mmio_read32(registers->cmd) & mask) == 0; }, ENGINE_TIMEOUT_NS);
         }
-    }
+    } io{port};
+    return dma_rules::stop(io);
+}
 
-    // Set FRE (bit4) and ST (bit0)
+auto start_cmd(volatile HbaPort* port) -> bool {
+    if ((mmio_read32(port->cmd) & (HBA_PX_CMD_ST | HBA_PX_CMD_CR)) != 0) return false;
     mmio_or32(port->cmd, HBA_PX_CMD_FRE);
+    if (!wait_until([&] { return (mmio_read32(port->tfd) & (ATA_DEV_BUSY | ATA_DEV_DRQ)) == 0; }, ENGINE_TIMEOUT_NS)) return false;
+    if ((mmio_read32(port->ssts) & 0xfU) != HBA_PORT_DET_PRESENT) return false;
     mmio_or32(port->cmd, HBA_PX_CMD_ST);
+    return (mmio_read32(port->cmd) & HBA_PX_CMD_ST) != 0;
 }
 
-void recover_port_after_error(volatile HbaPort* port) {
-    stop_cmd(port);
-    mmio_write32(port->ci, 0);
-    mmio_write32(port->sact, 0);
+void quarantine_port(size_t index) {
+    auto& memory = port_memory[index];
+    memory.failed = true;
+    auto pin = [](dma::Handle handle) {
+        if (handle.registry != nullptr) (void)dma::quarantine(handle);
+    };
+    pin(memory.clb.allocation.handle);
+    pin(memory.fis.allocation.handle);
+    for (auto const& table : memory.tables) pin(table.allocation.handle);
+    pin(memory.transfer.handle);
+}
+
+void fail_stop(size_t index) {
+    controller_failed.store(true, std::memory_order_release);
+    bool const DISABLED = pci::pci_set_bus_master(controller, false);
+    quarantine_port(index);
+    log::error("port %zu failed to stop; BME disabled=%u, backing quarantined", index, static_cast<unsigned>(DISABLED));
+}
+
+// The port mutex excludes completion readers; this polled driver has no IRQ
+// handler and keeps both GHC.IE and PxIE masked. A timeout is not retirement.
+auto recover_port_after_error(volatile HbaPort* port, size_t index, dma::Submission transfer) -> bool {
+    mmio_write32(port->ie, 0);
+    if (!stop_cmd(port)) {
+        fail_stop(index);
+        return false;
+    }
+    if (transfer.sequence != 0 && dma::complete(transfer, 0, dma::Retirement::device_quiesced) != dma::Error::none) {
+        quarantine_port(index);
+        return false;
+    }
     clear_port_errors(port);
-    start_cmd(port);
+    // Clearing ST resets CI/SACT. Never restart a device still requiring a
+    // SATA reset; leave it offline with its controller-owned rings retained.
+    if (controller_failed.load(std::memory_order_acquire) || mmio_read32(port->ci) != 0 || mmio_read32(port->sact) != 0 ||
+        (mmio_read32(port->tfd) & (ATA_DEV_BUSY | ATA_DEV_DRQ)) != 0 || !start_cmd(port)) {
+        if (!stop_cmd(port)) fail_stop(index);
+        port_memory[index].failed = true;
+        return false;
+    }
+    return true;
 }
 
 // Check device type on a port
@@ -230,84 +287,83 @@ auto check_type(volatile HbaPort* port) -> AhciDeviceType {
     }
 }
 
-// Rebase port memory structures
-void port_rebase(volatile HbaPort* port, size_t portno) {
-    stop_cmd(port);  // Stop command engine
+auto allocate_region(CoherentRegion& region, size_t bytes) -> bool {
+#ifdef WOS_SELFTEST
+    if (probe_allocation_budget == 0) return false;
+    if (probe_allocation_budget != SIZE_MAX) --probe_allocation_budget;
+#endif
+    auto result = dma::allocate_coherent(controller, bytes, 4096, dma_mask);
+    region.allocation = result.allocation;
+    if (result.error != dma::Error::none) return false;
+    auto submission = dma::prepare(region.allocation.handle);
+    region.submission = submission.submission;
+    return submission.error == dma::Error::none;
+}
 
-    // Get kernel page table for physical address translation
-    auto* kernel_pt = ker::mod::mm::virt::get_kernel_pagemap();
-
-    // Command list offset: 1K*portno
-    // Command list entry size = 32 bytes
-    // Command list entry maxim count = 32
-    // Command list maxium size = 32*32 = 1K per port
-    auto* clb_virt =
-        static_cast<uint8_t*>(ker::mod::mm::phys::page_alloc(ker::mod::mm::PhysicalPageOwner::DEVICE_AHCI, CLB_SIZE, "ahci_clb"));
-    if (clb_virt == nullptr) {
-        log::error("failed to allocate CLB kernel allocation");
-        hcf();
+// Probe-only: all engines are stopped and BME is disabled. Nothing here can
+// expose a buffer to hardware before every port has been prepared successfully.
+auto port_prepare(size_t portno) -> bool {
+    auto& memory = port_memory[portno];
+    if (!allocate_region(memory.clb, CLB_SIZE) || !allocate_region(memory.fis, FIS_RECEIVE_SIZE)) return false;
+    memory.clb_virt = reinterpret_cast<HbaCmdHeader*>(memory.clb.allocation.cpu);
+    memory.fb_virt = reinterpret_cast<uint8_t*>(memory.fis.allocation.cpu);
+    for (size_t i = 0; i < COMMAND_SLOT_COUNT; ++i) {
+        if (!allocate_region(memory.tables[i], command_table_size(COMMAND_TABLE_PRDT_ENTRY_COUNT))) return false;
+        memory.ctb_virt[i] = reinterpret_cast<uint8_t*>(memory.tables[i].allocation.cpu);
+        auto const ADDRESS = memory.tables[i].submission.address;
+        memory.clb_virt[i].ctba = static_cast<uint32_t>(ADDRESS);
+        memory.clb_virt[i].ctbau = static_cast<uint32_t>(ADDRESS >> 32);
     }
-    std::memset(clb_virt, 0, CLB_SIZE);
-    uint64_t const CLB_PHYS = ker::mod::mm::virt::translate(kernel_pt, reinterpret_cast<uint64_t>(clb_virt));
-    if (CLB_PHYS == ker::mod::mm::virt::PADDR_INVALID) {
-        log::error("failed to translate CLB kernel allocation");
-        hcf();
-    }
-    mmio_write32(port->clb, static_cast<uint32_t>(CLB_PHYS & UINT32_MAX));
-    mmio_write32(port->clbu, static_cast<uint32_t>((CLB_PHYS >> 32) & UINT32_MAX));
+    auto pool = dma::allocate_streaming(controller, TRANSFER_CAPACITY, dma::Direction::bidirectional, dma_mask);
+    memory.transfer = pool.allocation;
+    if (pool.error != dma::Error::none) return false;
+    memory.prepared = true;
+    return true;
+}
 
-    // Store virtual address for later use
-    auto& memory = port_memory.at(portno);
-    memory.clb_virt = reinterpret_cast<HbaCmdHeader*>(clb_virt);
-
-    // FIS offset: 32K+256*portno
-    // FIS entry size = 256 bytes per port
-    auto* fb_virt =
-        static_cast<uint8_t*>(ker::mod::mm::phys::page_alloc(ker::mod::mm::PhysicalPageOwner::DEVICE_AHCI, FIS_RECEIVE_SIZE, "ahci_fis"));
-    if (fb_virt == nullptr) {
-        log::error("failed to allocate FIS buffer kernel allocation");
-        hcf();
-    }
-    std::memset(fb_virt, 0, FIS_RECEIVE_SIZE);
-    uint64_t const FB_PHYS = ker::mod::mm::virt::translate(kernel_pt, reinterpret_cast<uint64_t>(fb_virt));
-    if (FB_PHYS == ker::mod::mm::virt::PADDR_INVALID) {
-        log::error("failed to translate FIS buffer kernel allocation");
-        hcf();
-    }
-    mmio_write32(port->fb, static_cast<uint32_t>(FB_PHYS & UINT32_MAX));
-    mmio_write32(port->fbu, static_cast<uint32_t>((FB_PHYS >> 32) & UINT32_MAX));
-
-    // Store virtual address for later use
-    memory.fb_virt = fb_virt;
-
-    // Command table offset: 40K + 8K*portno
-    // Command table size = 256*32 = 8K per port
-    auto* cmdheader = reinterpret_cast<HbaCmdHeader*>(clb_virt);
-    for (size_t i = 0; i < COMMAND_SLOT_COUNT; i++) {
-        // Command table: 128B fixed header + 8192 x 16B PRDT entries = 131200 bytes.
-        // 8192 entries × 4KB/page = 32MB per command (ATA sector count is 16-bit = 32MB max).
-        constexpr size_t CTB_SIZE = command_table_size(COMMAND_TABLE_PRDT_ENTRY_COUNT);
-        cmdheader[i].prdtl = static_cast<uint16_t>(COMMAND_TABLE_PRDT_ENTRY_COUNT);
-        auto* ctb_virt =
-            static_cast<uint8_t*>(ker::mod::mm::phys::page_alloc(ker::mod::mm::PhysicalPageOwner::DEVICE_AHCI, CTB_SIZE, "ahci_ctb"));
-        if (ctb_virt == nullptr) {
-            log::error("failed to allocate CTB kernel allocation");
-            hcf();
+// All engines stopped, BME disabled, and either prepublication or every port
+// mutex held with command admission closed. No IRQ handler can retain a view.
+auto release_quiesced_regions() -> bool {
+    bool released = true;
+    auto release_region = [&](CoherentRegion& region) {
+        if (region.allocation.handle.registry == nullptr) return;
+        if (region.submission.sequence != 0 && dma::complete(region.submission, 0, dma::Retirement::device_quiesced) != dma::Error::none) {
+            released = false;
+            return;
         }
-        std::memset(ctb_virt, 0, CTB_SIZE);
-        uint64_t const CTB_PHYS = ker::mod::mm::virt::translate(kernel_pt, reinterpret_cast<uint64_t>(ctb_virt));
-        if (CTB_PHYS == ker::mod::mm::virt::PADDR_INVALID) {
-            log::error("failed to translate CTB kernel allocation");
-            hcf();
+        region.submission = {};
+        if (dma::release(region.allocation.handle) != dma::Error::none)
+            released = false;
+        else
+            region = {};
+    };
+    for (auto& memory : port_memory) {
+        release_region(memory.clb);
+        release_region(memory.fis);
+        for (auto& table : memory.tables) release_region(table);
+        if (memory.transfer.handle.registry != nullptr) {
+            if (dma::release(memory.transfer.handle) != dma::Error::none)
+                released = false;
+            else
+                memory.transfer = {};
         }
-        cmdheader[i].ctba = static_cast<uint32_t>(CTB_PHYS & UINT32_MAX);
-        cmdheader[i].ctbau = static_cast<uint32_t>((CTB_PHYS >> 32) & UINT32_MAX);
-
-        // Store virtual address for later use
-        memory.ctb_virt.at(i) = ctb_virt;
+        memory.clb_virt = nullptr;
+        memory.fb_virt = nullptr;
+        memory.ctb_virt.fill(nullptr);
+        memory.failed = true;
+        memory.prepared = false;
     }
+    return released;
+}
 
-    start_cmd(port);  // Start command engine
+void port_install(volatile HbaPort* port, size_t portno) {
+    auto const& memory = port_memory[portno];
+    mmio_write32(port->clb, static_cast<uint32_t>(memory.clb.submission.address));
+    mmio_write32(port->clbu, static_cast<uint32_t>(memory.clb.submission.address >> 32));
+    mmio_write32(port->fb, static_cast<uint32_t>(memory.fis.submission.address));
+    mmio_write32(port->fbu, static_cast<uint32_t>(memory.fis.submission.address >> 32));
+    mmio_write32(port->ie, 0);
+    clear_port_errors(port);
 }
 
 // Find a free command slot (must be called with port lock held)
@@ -317,7 +373,7 @@ auto find_cmdslot(volatile HbaPort* port, int portno) -> uint32_t {
     uint32_t const HW_SLOTS = (mmio_read32(port->sact) | mmio_read32(port->ci));
     uint32_t const SW_SLOTS = valid_port(portno) ? port_slots_in_use.at(port_index(portno)).load(std::memory_order_acquire) : 0;
     uint32_t slots = HW_SLOTS | SW_SLOTS;
-    uint32_t const CMDSLOTS = (mmio_read32(hba_mem->cap) & 0x1F00) >> 8;  // Number of command slots
+    uint32_t const CMDSLOTS = ((mmio_read32(hba_mem->cap) & 0x1F00) >> 8) + 1;  // Number of command slots
     for (uint32_t i = 0; i < CMDSLOTS; i++) {
         if ((slots & 1) == 0) {
             return i;
@@ -328,199 +384,117 @@ auto find_cmdslot(volatile HbaPort* port, int portno) -> uint32_t {
     return UINT32_MAX;
 }
 
-// Generic function to read/write sectors from/to disk
-auto read_write_disk(volatile HbaPort* port, int portno, uint32_t startl, uint32_t starth, uint32_t count, const uint8_t* buf,
-                     bool write_op) -> bool {
-    if (!valid_port(portno)) {
-        return false;
-    }
-
-    auto& port_lock = port_locks.at(port_index(portno));
-    auto& port_slots = port_slots_in_use.at(port_index(portno));
-    auto& memory = port_memory.at(port_index(portno));
-    uint32_t slot = UINT32_MAX;
-
-    port_lock.lock();
-
+// Caller holds this port mutex. Teardown alone bypasses closed admission for its final flush.
+auto execute_command_locked(volatile HbaPort* port, int portno, uint8_t command, uint64_t lba, uint32_t sectors,
+                            std::span<std::byte> buffer, bool write_op) -> bool {
+    if (!valid_port(portno) || buffer.size() > TRANSFER_CAPACITY) return false;
+    size_t const INDEX = port_index(portno);
+    auto& memory = port_memory[INDEX];
+    if (!memory.prepared || memory.failed || controller_failed.load(std::memory_order_acquire)) return false;
+    auto& port_slots = port_slots_in_use[INDEX];
     clear_port_errors(port);
-    slot = find_cmdslot(port, portno);
-    if (slot == UINT32_MAX) {
-        log_command_failure(port, portno, slot, write_op, "no free AHCI command slot", starth, startl, count);
-        port_lock.unlock();
-        return false;
+    uint32_t const SLOT = find_cmdslot(port, portno);
+    if (SLOT == UINT32_MAX) return false;
+    dma::Submission transfer{};
+    auto* task = static_cast<mod::sched::task::Task*>(nullptr);
+    bool const USER_BUFFER = !buffer.empty() && reinterpret_cast<uint64_t>(buffer.data()) < mod::mm::addr::get_hhdm_offset();
+    auto target = buffer;
+    if (USER_BUFFER) {
+        if (!mod::sched::can_query_current_task()) return false;
+        task = mod::sched::get_current_task();
+        if (task == nullptr) return false;
+        target = {memory.transfer.cpu, buffer.size()};
+        // No-fault copies preserve the previous requirement of present user
+        // pages and avoid recursive disk faults while holding this port lock.
+        if (write_op &&
+            !mod::sys::usercopy::copy_from_task_mapped(*task, reinterpret_cast<uint64_t>(buffer.data()), target.data(), target.size()))
+            return false;
     }
-
-    // Mark this slot as in-use in software BEFORE releasing the lock
-    // This prevents other CPUs from grabbing the same slot before hardware updates ci
-    port_slots.fetch_or(1U << slot, std::memory_order_release);
-
-    // Choose the right page table for buffer virtual->physical translation.
-    // Kernel-space buffers (HHDM addresses) must always use the kernel pagemap
-    // because kernel threads may have a stale or unrelated task pagemap.
-    // Userspace buffers (below HHDM) need the current task's pagemap.
-    ker::mod::mm::paging::PageTable* active_pt = nullptr;
-    {
-        uint64_t const HHDM = ker::mod::mm::addr::get_hhdm_offset();
-        bool const IS_KERNEL_BUF = (reinterpret_cast<uint64_t>(buf) >= HHDM);
-
-        if (IS_KERNEL_BUF) {
-            active_pt = ker::mod::mm::virt::get_kernel_pagemap();
-        } else {
-            ker::mod::sched::task::Task const* cur_task = nullptr;
-            if (ker::mod::sched::has_run_queues()) {
-                cur_task = ker::mod::sched::get_current_task();
-            }
-            if (cur_task != nullptr && cur_task->pagemap != nullptr) {
-                active_pt = cur_task->pagemap;
-            } else {
-                active_pt = ker::mod::mm::virt::get_kernel_pagemap();
-            }
-        }
+    if (!buffer.empty()) {
+        auto const DIRECTION = write_op ? dma::Direction::to_device : dma::Direction::from_device;
+        if (dma::bind_streaming(memory.transfer.handle, target, DIRECTION) != dma::Error::none) return false;
+        auto prepared = dma::prepare(memory.transfer.handle);
+        if (prepared.error != dma::Error::none) return false;
+        transfer = prepared.submission;
     }
-
-    // Get command header using stored virtual address
-    HbaCmdHeader* cmdheader = &memory.clb_virt[slot];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic): AHCI command-list ABI.
-
-    // Each PRDT entry must stay within a single mapped page span. The old code
-    // assumed page-aligned buffers and advanced in fixed 4 KiB steps, which
-    // breaks for callers like remote VFS that DMA into resp_buf + header.
-    uint64_t const TOTAL_BYTES = static_cast<uint64_t>(count) * SECTOR_SIZE;
-    auto buf_virt = reinterpret_cast<uint64_t>(buf);
-    uint64_t const FIRST_PAGE_OFF = buf_virt & (ker::mod::mm::paging::PAGE_SIZE - 1);
-    auto prdt_entries =
-        static_cast<size_t>((FIRST_PAGE_OFF + TOTAL_BYTES + ker::mod::mm::paging::PAGE_SIZE - 1) / ker::mod::mm::paging::PAGE_SIZE);
-    prdt_entries = std::min(prdt_entries, COMMAND_TABLE_PRDT_ENTRY_COUNT);
-
-    auto* cmdtbl = reinterpret_cast<HbaCmdTbl*>(memory.ctb_virt.at(slot));
-    std::memset(cmdtbl, 0, command_table_size(prdt_entries));
-    auto* prdt = command_table_prdt_entries(cmdtbl);
-
-    uint64_t remaining_bytes = TOTAL_BYTES;
-    size_t actual_prdt_entries = 0;
-    while (remaining_bytes > 0 && actual_prdt_entries < prdt_entries) {
-        uint64_t const PHYS = ker::mod::mm::virt::translate(active_pt, buf_virt);
-        if (PHYS == ker::mod::mm::virt::PADDR_INVALID) {
-            log_command_failure(port, portno, slot, write_op, "AHCI buffer translation failed", starth, startl, count);
-            port_slots.fetch_and(~(1U << slot), std::memory_order_release);
-            port_lock.unlock();
+    auto* header = &memory.clb_virt[SLOT];
+    size_t const PRD_COUNT = (buffer.size() + 4095) / 4096;
+    auto* table = reinterpret_cast<HbaCmdTbl*>(memory.ctb_virt[SLOT]);
+    std::memset(table, 0, command_table_size(PRD_COUNT));
+    auto* prdt = command_table_prdt_entries(table);
+    size_t offset = 0;
+    for (size_t i = 0; i < PRD_COUNT; ++i) {
+        size_t const BYTES = std::min(size_t{4096}, buffer.size() - offset);
+        uint64_t const ADDRESS = transfer.address + offset;
+        prdt[i].dba = static_cast<uint32_t>(ADDRESS);
+        prdt[i].dbau = static_cast<uint32_t>(ADDRESS >> 32);
+        prdt[i].dbc = static_cast<uint32_t>(BYTES - 1);
+        prdt[i].i = 0;  // Polled completion; no descriptor interrupt reader.
+        offset += BYTES;
+    }
+    reset_command_header(header);
+    header->cfl = sizeof(FisRegH2D) / sizeof(uint32_t);
+    header->w = write_op ? 1 : 0;
+    header->prdtl = static_cast<uint16_t>(PRD_COUNT);
+    auto* fis = reinterpret_cast<FisRegH2D*>(&table->cfis);
+    fis->fis_type = FIS_TYPE_REG_H2D;
+    fis->c = 1;
+    fis->command = command;
+    fis->device = command == ATA_CMD_IDENTIFY ? 0 : 1 << 6;
+    fis->lba0 = static_cast<uint8_t>(lba);
+    fis->lba1 = static_cast<uint8_t>(lba >> 8);
+    fis->lba2 = static_cast<uint8_t>(lba >> 16);
+    fis->lba3 = static_cast<uint8_t>(lba >> 24);
+    fis->lba4 = static_cast<uint8_t>(lba >> 32);
+    fis->lba5 = static_cast<uint8_t>(lba >> 40);
+    fis->countl = static_cast<uint8_t>(sectors);
+    fis->counth = static_cast<uint8_t>(sectors >> 8);
+    if (!wait_until([&] { return (mmio_read32(port->tfd) & (ATA_DEV_BUSY | ATA_DEV_DRQ)) == 0; }, ENGINE_TIMEOUT_NS)) {
+        if (transfer.sequence != 0 && dma::complete(transfer, 0, dma::Retirement::never_submitted) != dma::Error::none) {
+            if (!stop_cmd(port)) fail_stop(INDEX);
+            quarantine_port(INDEX);
             return false;
         }
-
-        uint64_t const PAGE_OFF = buf_virt & (ker::mod::mm::paging::PAGE_SIZE - 1);
-        uint64_t const BYTES_THIS_ENTRY = std::min<uint64_t>(remaining_bytes, ker::mod::mm::paging::PAGE_SIZE - PAGE_OFF);
-
-        prdt[actual_prdt_entries].dba = static_cast<uint32_t>(PHYS & UINT32_MAX);
-        prdt[actual_prdt_entries].dbau = static_cast<uint32_t>((PHYS >> 32) & UINT32_MAX);
-        prdt[actual_prdt_entries].dbc = static_cast<uint32_t>(BYTES_THIS_ENTRY - 1);
-        prdt[actual_prdt_entries].i = 1;
-
-        buf_virt += BYTES_THIS_ENTRY;
-        remaining_bytes -= BYTES_THIS_ENTRY;
-        actual_prdt_entries++;
-    }
-
-    if (remaining_bytes != 0) {
-        log_command_failure(port, portno, slot, write_op, "AHCI PRDT table too small", starth, startl, count);
-        port_slots.fetch_and(~(1U << slot), std::memory_order_release);
-        port_lock.unlock();
+        (void)recover_port_after_error(port, INDEX, {});
         return false;
     }
-
-    reset_command_header(cmdheader);
-    cmdheader->cfl = sizeof(FisRegH2D) / sizeof(uint32_t);
-    cmdheader->w = write_op ? 1 : 0;
-    cmdheader->prdtl = static_cast<uint16_t>(actual_prdt_entries);
-
-    // Setup command FIS
-    auto* cmdfis = reinterpret_cast<FisRegH2D*>(&cmdtbl->cfis);
-    cmdfis->fis_type = FIS_TYPE_REG_H2D;
-    cmdfis->c = 1;  // Command
-    cmdfis->command = write_op ? ATA_CMD_WRITE_DMA_EX : ATA_CMD_READ_DMA_EX;
-
-    cmdfis->lba0 = static_cast<uint8_t>(startl);
-    cmdfis->lba1 = static_cast<uint8_t>(startl >> 8);
-    cmdfis->lba2 = static_cast<uint8_t>(startl >> 16);
-    cmdfis->device = 1 << 6;  // LBA mode
-
-    cmdfis->lba3 = static_cast<uint8_t>(startl >> 24);
-    cmdfis->lba4 = static_cast<uint8_t>(starth);
-    cmdfis->lba5 = static_cast<uint8_t>(starth >> 8);
-
-    cmdfis->countl = static_cast<uint8_t>(count & 0xFF);
-    cmdfis->counth = static_cast<uint8_t>((count >> 8) & 0xFF);
-
-    // Wait for port to be ready (still holding lock - this should be quick)
-    int spin = 0;
-    constexpr int MAX_SPIN = 1000000;
-    while (((mmio_read32(port->tfd) & (ATA_DEV_BUSY | ATA_DEV_DRQ)) != 0U) && spin < MAX_SPIN) {
-        spin++;
-    }
-    if (spin == MAX_SPIN) {
-        log_command_failure(port, portno, slot, write_op, "AHCI port hung before command issue", starth, startl, count);
-        port_slots.fetch_and(~(1U << slot), std::memory_order_release);
-        port_lock.unlock();
-        return false;
-    }
-
-    // Issue command
+    port_slots.fetch_or(1U << SLOT, std::memory_order_release);
+    asm volatile("mfence" ::: "memory");  // Publish coherent command table/header before the doorbell.
 #ifdef AHCI_BENCH
-    uint64_t t_issue = ker::mod::tsc::get_ns();
+    uint64_t const t_issue = ker::mod::tsc::get_ns();
 #endif
-    mmio_write32(port->ci, 1U << slot);
-
-    // Wait for completion while holding the per-port command lock. These are
-    // non-NCQ commands, so the device must not see another command on this port
-    // until the current one has completed.
-    constexpr uint64_t COMPLETION_TIMEOUT = 50000000ULL;  // ~50M iterations
-    uint64_t wait_iter = 0;
-    while (true) {
-        uint32_t const CI_VAL = mmio_read32(port->ci);
-        if ((CI_VAL & (1U << slot)) == 0) {
-            break;
-        }
-        uint32_t const IS_VAL = mmio_read32(port->is);
-        if ((IS_VAL & HBA_PX_IS_TFES) != 0U) {  // Task file error
-            log_command_failure(port, portno, slot, write_op, "AHCI task-file error during command", starth, startl, count);
-            // Clear the software slot tracking on error
-            port_slots.fetch_and(~(1U << slot), std::memory_order_release);
-            recover_port_after_error(port);
-            port_lock.unlock();
-            return false;
-        }
-        if (++wait_iter >= COMPLETION_TIMEOUT) {
-            uint32_t const TFD_VAL = mmio_read32(port->tfd);
-            uint32_t const SERR_VAL = mmio_read32(port->serr);
-            uint32_t const CMD_VAL = mmio_read32(port->cmd);
-            uint32_t const SSTS_VAL = mmio_read32(port->ssts);
-            log::warn("timeout: slot=%u ci=0x%x is=0x%x tfd=0x%x serr=0x%x cmd=0x%x ssts=0x%x %s lba=%u:%u cnt=%u", slot, CI_VAL, IS_VAL,
-                      TFD_VAL, SERR_VAL, CMD_VAL, SSTS_VAL, write_op ? "WRITE" : "READ", starth, startl, count);
-            port_slots.fetch_and(~(1U << slot), std::memory_order_release);
-            recover_port_after_error(port);
-            port_lock.unlock();
-            return false;
-        }
-        wait_for_completion_relax(wait_iter);
-    }
-
-    // Check again
-    if ((mmio_read32(port->is) & HBA_PX_IS_TFES) != 0U) {
-        log_command_failure(port, portno, slot, write_op, "AHCI task-file error after command completion", starth, startl, count);
-        // Clear the software slot tracking on error
-        port_slots.fetch_and(~(1U << slot), std::memory_order_release);
-        recover_port_after_error(port);
-        port_lock.unlock();
+    mmio_write32(port->ci, 1U << SLOT);
+    // These are non-NCQ commands, so the device must not see another command on this port
+    // until this mutex-protected command and its DMA completion have retired.
+    dma_rules::Completion result = dma_rules::Completion::pending;
+    bool const FINISHED = wait_until(
+        [&] {
+            if (controller_failed.load(std::memory_order_acquire)) {
+                result = dma_rules::Completion::error;
+                return true;
+            }
+            result =
+                dma_rules::completion(mmio_read32(port->ci), mmio_read32(port->sact), mmio_read32(port->is), mmio_read32(port->tfd), SLOT);
+            return result != dma_rules::Completion::pending;
+        },
+        COMMAND_TIMEOUT_NS);
+    asm volatile("mfence" ::: "memory");
+    if (!FINISHED || result != dma_rules::Completion::success || header->prdbc != buffer.size()) {
+        log_command_failure(port, portno, SLOT, write_op, "managed command failed or timed out", static_cast<uint32_t>(lba >> 32),
+                            static_cast<uint32_t>(lba), sectors);
+        (void)recover_port_after_error(port, INDEX, transfer);
+        port_slots.fetch_and(~(1U << SLOT), std::memory_order_release);
         return false;
     }
-
 #ifdef AHCI_BENCH
-    {
+    if (sectors != 0) {
         uint64_t t_done = ker::mod::tsc::get_ns();
         static std::atomic<uint64_t> s_cmd_count{0};
         static std::atomic<uint64_t> s_total_ns{0};
         static std::atomic<uint64_t> s_total_sectors{0};
         uint64_t n = s_cmd_count.fetch_add(1, std::memory_order_relaxed);
         s_total_ns.fetch_add(t_done - t_issue, std::memory_order_relaxed);
-        s_total_sectors.fetch_add(count, std::memory_order_relaxed);
+        s_total_sectors.fetch_add(sectors, std::memory_order_relaxed);
         if ((n & 63) == 63) {
             uint64_t total_ns = s_total_ns.exchange(0, std::memory_order_relaxed);
             uint64_t total_sec = s_total_sectors.exchange(0, std::memory_order_relaxed);
@@ -531,19 +505,36 @@ auto read_write_disk(volatile HbaPort* port, int portno, uint32_t startl, uint32
         }
     }
 #endif
-
-    // Clear the software slot tracking on success
-    port_slots.fetch_and(~(1U << slot), std::memory_order_release);
-    port_lock.unlock();
-
+    bool success = true;
+    if (transfer.sequence != 0) success = dma::complete(transfer, buffer.size(), dma::Retirement::command_completed) == dma::Error::none;
+    port_slots.fetch_and(~(1U << SLOT), std::memory_order_release);
+    if (!success) {
+        if (!stop_cmd(port)) fail_stop(INDEX);
+        quarantine_port(INDEX);
+        return false;
+    }
+    if (USER_BUFFER && !write_op)
+        return mod::sys::usercopy::copy_to_task_mapped(*task, reinterpret_cast<uint64_t>(buffer.data()), target.data(), target.size());
     return true;
 }
 
-// Keep ordinary ATA DMA commands capped to 512 KiB. Larger requests are legal in
-// the command fields, but QEMU's AHCI/IDE path has proven fragile around
-// multi-megabyte writes in practice, and smaller commands also bound recovery
-// cost after an I/O error.
-constexpr uint32_t AHCI_MAX_SECTORS_PER_CMD = 1024;
+// Serialized non-NCQ command path shared by data, IDENTIFY and durable flush.
+auto execute_command(volatile HbaPort* port, int portno, uint8_t command, uint64_t lba, uint32_t sectors, std::span<std::byte> buffer,
+                     bool write_op) -> bool {
+    if (!valid_port(portno)) return false;
+    auto& port_lock = port_locks[port_index(portno)];
+    mod::sys::MutexGuard const GUARD(port_lock);
+    if (!admission.allows_command()) return false;
+    return execute_command_locked(port, portno, command, lba, sectors, buffer, write_op);
+}
+
+auto read_write_disk(volatile HbaPort* port, int portno, uint32_t startl, uint32_t starth, uint32_t count, const uint8_t* buf,
+                     bool write_op) -> bool {
+    if (count == 0 || count > AHCI_MAX_SECTORS_PER_CMD || buf == nullptr) return false;
+    auto* cpu = reinterpret_cast<std::byte*>(const_cast<uint8_t*>(buf));
+    return execute_command(port, portno, write_op ? ATA_CMD_WRITE_DMA_EX : ATA_CMD_READ_DMA_EX, (uint64_t{starth} << 32) | startl, count,
+                           {cpu, size_t{count} * SECTOR_SIZE}, write_op);
+}
 
 // Read sectors from disk - splits large requests into per-command chunks
 auto read_disk(volatile HbaPort* port, int portno, uint32_t startl, uint32_t starth, uint32_t count, uint8_t* buf) -> bool {
@@ -581,87 +572,9 @@ auto write_disk(volatile HbaPort* port, int portno, uint32_t startl, uint32_t st
     return true;
 }
 
-// Flush volatile write cache to non-volatile storage
+// Only a successfully completed ATA flush establishes durability.
 auto flush_disk(volatile HbaPort* port, int portno) -> bool {
-    if (!valid_port(portno)) {
-        return false;
-    }
-
-    auto& port_lock = port_locks.at(port_index(portno));
-    auto& port_slots = port_slots_in_use.at(port_index(portno));
-    auto& memory = port_memory.at(port_index(portno));
-    uint32_t slot = UINT32_MAX;
-
-    port_lock.lock();
-
-    clear_port_errors(port);
-    slot = find_cmdslot(port, portno);
-    if (slot == UINT32_MAX) {
-        log_command_failure(port, portno, slot, false, "flush_disk: no free AHCI command slot", 0, 0, 0);
-        port_lock.unlock();
-        return false;
-    }
-
-    port_slots.fetch_or(1U << slot, std::memory_order_release);
-
-    HbaCmdHeader* cmdheader = &memory.clb_virt[slot];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic): AHCI command-list ABI.
-    reset_command_header(cmdheader);
-    cmdheader->cfl = sizeof(FisRegH2D) / sizeof(uint32_t);
-    cmdheader->w = 0;
-    cmdheader->prdtl = 0;  // No data transfer
-
-    auto* cmdtbl = reinterpret_cast<HbaCmdTbl*>(memory.ctb_virt.at(slot));
-    std::memset(cmdtbl, 0, command_table_size(0));
-
-    auto* cmdfis = reinterpret_cast<FisRegH2D*>(&cmdtbl->cfis);
-    cmdfis->fis_type = FIS_TYPE_REG_H2D;
-    cmdfis->c = 1;
-    cmdfis->command = ATA_CMD_FLUSH_CACHE_EXT;
-    cmdfis->device = 1 << 6;  // LBA mode
-
-    // Wait for port to be ready
-    int spin = 0;
-    constexpr int MAX_SPIN = 1000000;
-    while (((mmio_read32(port->tfd) & (ATA_DEV_BUSY | ATA_DEV_DRQ)) != 0U) && spin < MAX_SPIN) {
-        spin++;
-    }
-    if (spin == MAX_SPIN) {
-        log_command_failure(port, portno, slot, false, "flush_disk: port hung before command issue", 0, 0, 0);
-        port_slots.fetch_and(~(1U << slot), std::memory_order_release);
-        port_lock.unlock();
-        return false;
-    }
-
-    mmio_write32(port->ci, 1U << slot);
-
-    // Wait for completion
-    uint64_t wait_iter = 0;
-    while (true) {
-        if ((mmio_read32(port->ci) & (1U << slot)) == 0) {
-            break;
-        }
-        if ((mmio_read32(port->is) & HBA_PX_IS_TFES) != 0U) {
-            log_command_failure(port, portno, slot, false, "flush_disk: task-file error during command", 0, 0, 0);
-            port_slots.fetch_and(~(1U << slot), std::memory_order_release);
-            recover_port_after_error(port);
-            port_lock.unlock();
-            return false;
-        }
-        wait_for_completion_relax(++wait_iter);
-    }
-
-    if ((mmio_read32(port->is) & HBA_PX_IS_TFES) != 0U) {
-        log_command_failure(port, portno, slot, false, "flush_disk: task-file error after completion", 0, 0, 0);
-        port_slots.fetch_and(~(1U << slot), std::memory_order_release);
-        recover_port_after_error(port);
-        port_lock.unlock();
-        return false;
-    }
-
-    port_slots.fetch_and(~(1U << slot), std::memory_order_release);
-    port_lock.unlock();
-
-    return true;
+    return execute_command(port, portno, ATA_CMD_FLUSH_CACHE_EXT, 0, 0, {}, false);
 }
 
 // Wrapper for block device flush
@@ -720,138 +633,14 @@ auto ahci_write_blocks(BlockDevice* bdev, uint64_t block, size_t count, const vo
     return RESULT ? 0 : -EIO;
 }
 
-// Send ATA IDENTIFY command and return the actual total number of LBA sectors.
-// Returns 0 on failure, in which case the caller should fall back to a default.
 auto identify_disk(volatile HbaPort* port, int portno) -> uint64_t {
-    if (!valid_port(portno)) {
-        return 0;
-    }
-
-    auto& port_lock = port_locks.at(port_index(portno));
-    auto& port_slots = port_slots_in_use.at(port_index(portno));
-    auto& memory = port_memory.at(port_index(portno));
-    uint32_t slot = UINT32_MAX;
-
-    port_lock.lock();
-
-    clear_port_errors(port);
-    slot = find_cmdslot(port, portno);
-    if (slot == UINT32_MAX) {
-        log_command_failure(port, portno, slot, false, "identify_disk: no free AHCI command slot", 0, 0, 0);
-        port_lock.unlock();
-        return 0;
-    }
-
-    port_slots.fetch_or(1U << slot, std::memory_order_release);
-
-    // Allocate a 512-byte buffer for the IDENTIFY response
-    auto* id_buf = new (std::nothrow) uint8_t[SECTOR_SIZE];
-    if (id_buf == nullptr) {
-        if (valid_port(portno)) {
-            port_slots.fetch_and(~(1U << slot), std::memory_order_release);
-            port_lock.unlock();
-        }
-        return 0;
-    }
-    std::memset(id_buf, 0, SECTOR_SIZE);
-
-    auto* kernel_pt = ker::mod::mm::virt::get_kernel_pagemap();
-    uint64_t const BUF_PHYS = ker::mod::mm::virt::translate(kernel_pt, reinterpret_cast<uint64_t>(id_buf));
-    if (BUF_PHYS == ker::mod::mm::virt::PADDR_INVALID) {
-        log::error("failed to translate identify buffer");
-        hcf();
-    }
-
-    HbaCmdHeader* cmdheader = &memory.clb_virt[slot];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic): AHCI command-list ABI.
-    reset_command_header(cmdheader);
-    cmdheader->cfl = sizeof(FisRegH2D) / sizeof(uint32_t);
-    cmdheader->w = 0;
-    cmdheader->prdtl = 1;
-
-    auto* cmdtbl = reinterpret_cast<HbaCmdTbl*>(memory.ctb_virt.at(slot));
-    std::memset(cmdtbl, 0, command_table_size(1));
-    auto* prdt = command_table_prdt_entries(cmdtbl);
-
-    // Single PRDT entry for 512 bytes
-    prdt[0].dba = static_cast<uint32_t>(BUF_PHYS & UINT32_MAX);
-    prdt[0].dbau = static_cast<uint32_t>((BUF_PHYS >> 32) & UINT32_MAX);
-    prdt[0].dbc = SECTOR_SIZE - 1;  // 512 bytes
-    prdt[0].i = 1;
-
-    auto* cmdfis = reinterpret_cast<FisRegH2D*>(&cmdtbl->cfis);
-    cmdfis->fis_type = FIS_TYPE_REG_H2D;
-    cmdfis->c = 1;
-    cmdfis->command = ATA_CMD_IDENTIFY;
-    cmdfis->device = 0;
-
-    // Wait for port to be ready
-    int spin = 0;
-    constexpr int MAX_SPIN = 1000000;
-    while (((mmio_read32(port->tfd) & (ATA_DEV_BUSY | ATA_DEV_DRQ)) != 0U) && spin < MAX_SPIN) {
-        spin++;
-    }
-    if (spin == MAX_SPIN) {
-        log_command_failure(port, portno, slot, false, "identify_disk: port hung before command issue", 0, 0, 1);
-        delete[] id_buf;
-        port_slots.fetch_and(~(1U << slot), std::memory_order_release);
-        port_lock.unlock();
-        return 0;
-    }
-
-    mmio_write32(port->ci, 1U << slot);
-
-    // Wait for completion
-    uint64_t wait_iter = 0;
-    while (true) {
-        if ((mmio_read32(port->ci) & (1U << slot)) == 0) {
-            break;
-        }
-        if ((mmio_read32(port->is) & HBA_PX_IS_TFES) != 0U) {
-            log_command_failure(port, portno, slot, false, "identify_disk: task-file error during command", 0, 0, 1);
-            delete[] id_buf;
-            port_slots.fetch_and(~(1U << slot), std::memory_order_release);
-            recover_port_after_error(port);
-            port_lock.unlock();
-            return 0;
-        }
-        wait_for_completion_relax(++wait_iter);
-    }
-
-    if ((mmio_read32(port->is) & HBA_PX_IS_TFES) != 0U) {
-        log_command_failure(port, portno, slot, false, "identify_disk: task-file error after completion", 0, 0, 1);
-        delete[] id_buf;
-        port_slots.fetch_and(~(1U << slot), std::memory_order_release);
-        recover_port_after_error(port);
-        port_lock.unlock();
-        return 0;
-    }
-
-    port_slots.fetch_and(~(1U << slot), std::memory_order_release);
-    port_lock.unlock();
-
-    // Parse IDENTIFY response (array of 256 uint16_t words)
-    auto* id_words = reinterpret_cast<uint16_t*>(id_buf);
-
+    std::array<uint16_t, 256> words{};
+    auto buffer = std::as_writable_bytes(std::span{words});
+    if (!execute_command(port, portno, ATA_CMD_IDENTIFY, 0, 0, buffer, false)) return 0;
     uint64_t total = 0;
-
-    // Check if 48-bit LBA is supported (word 83, bit 10)
-    if ((id_words[83] & (1 << 10)) != 0) {
-        // Words 100-103: 48-bit total user addressable LBA sectors
-        total = static_cast<uint64_t>(id_words[100]) | (static_cast<uint64_t>(id_words[101]) << 16) |
-                (static_cast<uint64_t>(id_words[102]) << 32) | (static_cast<uint64_t>(id_words[103]) << 48);
-    }
-
-    // Fall back to 28-bit LBA (words 60-61) if 48-bit returned 0
-    if (total == 0) {
-        total = static_cast<uint64_t>(id_words[60]) | (static_cast<uint64_t>(id_words[61]) << 16);
-    }
-
-    delete[] id_buf;
-
-    ahci_log("identify_disk: total sectors = 0x");
-    ahci_log_hex(total);
-    ahci_log("\n");
-
+    if ((words[83] & (1U << 10)) != 0)
+        total = uint64_t{words[100]} | (uint64_t{words[101]} << 16) | (uint64_t{words[102]} << 32) | (uint64_t{words[103]} << 48);
+    if (total == 0) total = uint64_t{words[60]} | (uint64_t{words[61]} << 16);
     return total;
 }
 
@@ -862,7 +651,7 @@ void probe_port(volatile HbaMem* abar) {
     while (i < MAX_PORTS) {
         if ((port_implemented & 1) != 0U) {
             AhciDeviceType const DT = check_type(&abar->ports[i]);
-            if (DT == AhciDeviceType::SATA) {
+            if (DT == AhciDeviceType::SATA && port_memory[i].prepared && !port_memory[i].failed) {
                 ahci_log("SATA drive found at port ");
                 ahci_log_hex(i);
                 ahci_log("\n");
@@ -874,7 +663,12 @@ void probe_port(volatile HbaMem* abar) {
 
                     // Issue ATA IDENTIFY to get real disk capacity
                     uint64_t const SECTORS = identify_disk(&abar->ports[i], static_cast<int>(i));
-                    dev->total_sectors = (SECTORS > 0) ? SECTORS : 131072;  // Fallback 64MB
+                    if (SECTORS == 0) {
+                        port_implemented >>= 1;
+                        ++i;
+                        continue;  // Never publish invented capacity after a failed IDENTIFY.
+                    }
+                    dev->total_sectors = SECTORS;
 
                     // Set up block device
                     dev->bdev.major = 8;
@@ -914,44 +708,169 @@ void probe_port(volatile HbaMem* abar) {
     }
 }
 
+struct RetirementBackend {
+    size_t locked_ports = 0;
+    bool bme_disabled = false;
+    ~RetirementBackend() {
+        while (locked_ports != 0) port_locks[--locked_ports].unlock();
+    }
+    void close_admission() { admission.close(); }
+    auto drain_readers() -> bool {
+        // A command has a 30-second completion deadline plus bounded recovery.
+        constexpr uint64_t DRAIN_TIMEOUT_NS = COMMAND_TIMEOUT_NS + 4 * ENGINE_TIMEOUT_NS;
+        while (locked_ports < MAX_PORTS) {
+            if (!wait_until([&] { return port_locks[locked_ports].try_lock(); }, DRAIN_TIMEOUT_NS)) return false;
+            ++locked_ports;
+        }
+        return true;
+    }
+    auto flush() -> bool {
+#ifdef WOS_SELFTEST
+        if (retirement_fault == SelftestRetirementFault::flush) return false;
+#endif
+        bool durable = true;
+        for (size_t i = 0; i < device_count; ++i) {
+            auto const PORT = devices[i].port_num;
+            if (!execute_command_locked(&hba_mem->ports[PORT], PORT, ATA_CMD_FLUSH_CACHE_EXT, 0, 0, {}, false)) durable = false;
+        }
+        return durable;
+    }
+    auto stop_engines() -> bool {
+        mmio_and32(hba_mem->ghc, ~HBA_GHC_IE);
+        bool stopped = (mmio_read32(hba_mem->ghc) & HBA_GHC_IE) == 0;
+        uint32_t const PORTS = mmio_read32(hba_mem->pi);
+        for (size_t i = 0; i < MAX_PORTS; ++i) {
+            if ((PORTS & (1U << i)) == 0) continue;
+            auto* port = &hba_mem->ports[i];
+            mmio_write32(port->ie, 0);
+            if (mmio_read32(port->ie) != 0) stopped = false;
+#ifdef WOS_SELFTEST
+            // Deliberately withhold one engine's stop proof. This exercises
+            // retained live backing, not an assertion of a real hardware hang.
+            if (retirement_fault == SelftestRetirementFault::stop && device_count != 0 && i == devices[0].port_num) {
+                stopped = false;
+                continue;
+            }
+#endif
+            if (!stop_cmd(port)) stopped = false;
+        }
+        return stopped;
+    }
+    auto disable_bus_master() -> bool {
+        controller_failed.store(true, std::memory_order_release);
+        bme_disabled = pci::pci_set_bus_master(controller, false);
+        return bme_disabled;
+    }
+    void quarantine() {
+        // All port mutexes were acquired: no CPU completion reader can race
+        // this transition or keep a borrowed streaming buffer alive afterward.
+        for (size_t i = 0; i < MAX_PORTS; ++i) quarantine_port(i);
+    }
+    auto release() -> bool {
+        uint32_t const PORTS = mmio_read32(hba_mem->pi);
+        for (size_t i = 0; i < MAX_PORTS; ++i) {
+            if ((PORTS & (1U << i)) == 0) continue;
+            auto* port = &hba_mem->ports[i];
+            clear_port_errors(port);
+            mmio_write32(port->clb, 0);
+            mmio_write32(port->clbu, 0);
+            mmio_write32(port->fb, 0);
+            mmio_write32(port->fbu, 0);
+        }
+        mmio_write32(hba_mem->is, UINT32_MAX);
+        asm volatile("mfence" ::: "memory");
+        return release_quiesced_regions();
+    }
+};
+
 }  // namespace
 
-// Main AHCI initialization
-auto ahci_init() -> int {
-    if (hba_mem == nullptr) {
-        ahci_log("ahci_init: HBA memory not set\n");
+#ifdef WOS_SELFTEST
+void selftest_limit_probe_allocations(size_t count) {
+    if (controller == nullptr) probe_allocation_budget = count;
+}
+void selftest_set_retirement_fault(SelftestRetirementFault fault) {
+    if (controller == nullptr) retirement_fault = fault;
+}
+auto selftest_retirement_fault() -> SelftestRetirementFault { return retirement_fault; }
+#endif
+
+auto ahci_shutdown() -> int {
+    if (mod::sched::can_query_current_task() && !mod::mm::phys::can_wait_for_reclaim()) return -EWOULDBLOCK;
+    mod::sys::MutexGuard const LIFECYCLE(lifecycle_lock);
+    if (shutdown_attempted) return shutdown_result;
+    shutdown_attempted = true;
+    admission.close();
+    if (controller == nullptr || hba_mem == nullptr) return 0;
+    auto const BEFORE = dma::stats(controller);
+    RetirementBackend backend;
+    auto const RESULT = lifecycle::retire(backend);
+    auto const AFTER = dma::stats(controller);
+    shutdown_result = RESULT == lifecycle::Result::released ? 0 : -EIO;
+    log::info("DMA retirement result=%u bme_disabled=%u regions=%zu->%zu pages=%zu->%zu quarantined=%zu", static_cast<unsigned>(RESULT),
+              static_cast<unsigned>(backend.bme_disabled), BEFORE.regions, AFTER.regions, BEFORE.backing_pages, AFTER.backing_pages,
+              AFTER.quarantined);
+    return shutdown_result;
+}
+
+// Probe runs before publication of block providers, with no command readers.
+static auto ahci_init() -> int {
+    if (hba_mem == nullptr || controller == nullptr) return -1;
+    mmio_or32(hba_mem->ghc, HBA_GHC_AE);
+    mmio_and32(hba_mem->ghc, ~HBA_GHC_IE);  // Polled driver: never admit an IRQ reader.
+    if ((mmio_read32(hba_mem->ghc) & (HBA_GHC_AE | HBA_GHC_IE)) != HBA_GHC_AE) {
+        (void)pci::pci_set_bus_master(controller, false);
         return -1;
     }
-
-    ahci_log("ahci_init: Initializing AHCI driver\n");
-
-    // Enable AHCI mode and interrupts
-    mmio_or32(hba_mem->ghc, HBA_GHC_AE);
-    mmio_or32(hba_mem->ghc, HBA_GHC_IE);
-
-    ahci_log("ahci_init: GHC = 0x");
-    ahci_log_hex(mmio_read32(hba_mem->ghc));
-    ahci_log("\n");
-
-    // Probe and initialize ports
-    uint32_t const PORT_IMPLEMENTED = mmio_read32(hba_mem->pi);
-    for (size_t i = 0; i < MAX_PORTS; i++) {
-        if (((PORT_IMPLEMENTED & (1U << i)) != 0U)) {
-            ahci_log("ahci_init: Rebasing port ");
-            ahci_log_hex(i);
-            ahci_log("\n");
-            port_rebase(&hba_mem->ports[i], i);
+    uint32_t const PORTS = mmio_read32(hba_mem->pi);
+    for (size_t i = 0; i < MAX_PORTS; ++i) {
+        if ((PORTS & (1U << i)) == 0) continue;
+        mmio_write32(hba_mem->ports[i].ie, 0);
+        if (mmio_read32(hba_mem->ports[i].ie) != 0 || !stop_cmd(&hba_mem->ports[i])) {
+            controller_failed.store(true, std::memory_order_release);
+            (void)pci::pci_set_bus_master(controller, false);
+            log::error("inherited port %zu failed to stop; AHCI admission refused", i);
+            return -1;
         }
     }
-
-    // Probe for devices
+    if (!pci::pci_set_bus_master(controller, false)) return -1;
+    dma_mask = (mmio_read32(hba_mem->cap) & (1U << 31)) != 0 ? UINT64_MAX : UINT32_MAX;
+    auto const BEFORE = dma::stats();
+    for (size_t i = 0; i < MAX_PORTS; ++i) {
+        if ((PORTS & (1U << i)) != 0 && !port_prepare(i)) {
+            bool const RELEASED = release_quiesced_regions();
+            auto const AFTER = dma::stats();
+            log::error("probe DMA unwind complete=%u regions=%zu->%zu pages=%zu->%zu", static_cast<unsigned>(RELEASED), BEFORE.regions,
+                       AFTER.regions, BEFORE.backing_pages, AFTER.backing_pages);
+            return -1;
+        }
+    }
+    for (size_t i = 0; i < MAX_PORTS; ++i)
+        if ((PORTS & (1U << i)) != 0) port_install(&hba_mem->ports[i], i);
+    asm volatile("mfence" ::: "memory");
+    if (!pci::pci_set_bus_master(controller, true)) {
+        (void)release_quiesced_regions();
+        return -1;
+    }
+    for (size_t i = 0; i < MAX_PORTS; ++i) {
+        if ((PORTS & (1U << i)) != 0 && check_type(&hba_mem->ports[i]) == AhciDeviceType::SATA && !start_cmd(&hba_mem->ports[i])) {
+            if (!stop_cmd(&hba_mem->ports[i])) {
+                fail_stop(i);
+                return -1;
+            }
+            port_memory[i].failed = true;
+        }
+    }
+    auto const AFTER = dma::stats();
+    log::info("managed DMA ready: regions=%zu pages=%zu mask=0x%llx; passthrough, no isolation", AFTER.regions - BEFORE.regions,
+              AFTER.backing_pages - BEFORE.backing_pages, static_cast<unsigned long long>(dma_mask));
+    admission.open_for_probe();
     probe_port(hba_mem);
-
     return 0;
 }
 
 // Set AHCI base address
-auto ahci_set_base(volatile uint32_t* base) -> void {
+static auto ahci_set_base(volatile uint32_t* base) -> void {
     hba_mem = reinterpret_cast<volatile HbaMem*>(base);
     ahci_log("ahci_set_base: AHCI base = 0x");
     ahci_log_hex(reinterpret_cast<uint64_t>(base));
@@ -962,16 +881,40 @@ extern "C" char __kernel_end[];  // NOLINT
 
 // Initializes AHCI controller by discovering and setting up the AHCI device
 auto ahci_controller_init() -> void {
+    mod::sys::MutexGuard const LIFECYCLE(lifecycle_lock);
+    if (controller != nullptr || shutdown_attempted) return;
     log::info("initializing controller");
 
     // Discover AHCI controller via PCI
-    ker::dev::pci::PCIDevice const* ahci_dev = ker::dev::pci::pci_find_ahci_controller();
+    auto* ahci_dev = ker::dev::pci::pci_find_ahci_controller();
     if (ahci_dev != nullptr) {
         log::info("controller found, setting up");
         // Extract MMIO base from BAR5
         uint32_t const BAR5 = ahci_dev->bar.at(5);
         // BAR5 for AHCI is a memory-mapped I/O base address
         if (BAR5 != 0 && BAR5 != UINT32_MAX) {
+            // MMIO access precedes engine stop; BME admission moves into
+            // ahci_init after every required managed ring/buffer mapping.
+            pci::pci_enable_memory_space(ahci_dev);
+            controller = ahci_dev;
+            // PCIe Device Control: disable Relaxed Ordering and No Snoop for
+            // the coherent, ordered DMA backend. Probe is serialized at boot.
+            uint8_t const PCIE = pci::pci_find_capability(controller, 0x10);
+            if (PCIE != 0) {
+                if (PCIE > 0xf4) {
+                    (void)pci::pci_set_bus_master(controller, false);
+                    return;
+                }
+                auto const OFFSET = static_cast<uint8_t>(PCIE + 8);
+                uint16_t const CONTROL = pci::pci_config_read16(controller->bus, controller->slot, controller->function, OFFSET);
+                pci::pci_config_write16(controller->bus, controller->slot, controller->function, OFFSET,
+                                        static_cast<uint16_t>(CONTROL & ~0x810U));
+                if ((pci::pci_config_read16(controller->bus, controller->slot, controller->function, OFFSET) & 0x810U) != 0) {
+                    (void)pci::pci_set_bus_master(controller, false);
+                    log::error("cannot establish coherent ordered PCIe DMA");
+                    return;
+                }
+            }
             // Place MMIO after the kernel image (linker-provided end + 2MB guard gap, page-aligned)
             const auto KERNEL_END = reinterpret_cast<uint64_t>(__kernel_end);
             constexpr uint64_t MMIO_GUARD_GAP = 0x200000;  // 2 MB

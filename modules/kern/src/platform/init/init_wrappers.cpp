@@ -8,6 +8,8 @@
 #include <dev/console.hpp>
 #include <dev/device.hpp>
 #include <dev/e1000e/e1000e.hpp>
+#include <dev/iommu/discovery.hpp>
+#include <dev/iommu/domains.hpp>
 #include <dev/ivshmem/ivshmem_net.hpp>
 #include <dev/null_device.hpp>
 #include <dev/pci.hpp>
@@ -180,6 +182,14 @@ void dev_init() { dev::dev_init(); }
 
 void pci_enumerate() { dev::pci::pci_enumerate_all(); }
 
+void iommu_init() {
+    dev::iommu::discover();
+#ifdef WOS_SELFTEST
+    if (cmdline_has_token(get_kernel_cmdline(), "--iommu-test-fail-alloc")) (void)dev::iommu::selftest_limit_table_allocations(1);
+#endif
+    dev::iommu::initialize_domains(cmdline_has_token(get_kernel_cmdline(), "--iommu-off"), false);
+}
+
 void console_init() { dev::console::console_init(); }
 
 void null_device_init() { dev::null_device::null_device_init(); }
@@ -188,7 +198,16 @@ void random_device_init() { dev::random_device::random_device_init(); }
 
 void pty_init() { dev::pty::pty_init(); }
 
-void ahci_init() { dev::ahci::ahci_controller_init(); }
+void ahci_init() {
+#ifdef WOS_SELFTEST
+    if (cmdline_has_token(get_kernel_cmdline(), "--ahci-test-fail-prepare")) dev::ahci::selftest_limit_probe_allocations(7);
+    if (cmdline_has_token(get_kernel_cmdline(), "--ahci-test-fail-retire-stop"))
+        dev::ahci::selftest_set_retirement_fault(dev::ahci::SelftestRetirementFault::stop);
+    else if (cmdline_has_token(get_kernel_cmdline(), "--ahci-test-fail-retire-flush"))
+        dev::ahci::selftest_set_retirement_fault(dev::ahci::SelftestRetirementFault::flush);
+#endif
+    dev::ahci::ahci_controller_init();
+}
 
 void block_device_init() { dev::block_device_init(); }
 
@@ -200,6 +219,8 @@ void net_init() {
     // net::init() calls pkt_pool_init() and loopback_init() internally
     net::init();
 }
+
+void iommu_faults_init() { dev::iommu::start_fault_worker(); }
 
 void virtio_net_init() { dev::virtio::virtio_net_init(); }
 

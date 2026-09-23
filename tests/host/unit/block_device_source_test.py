@@ -132,48 +132,16 @@ def main() -> None:
 
     register_body = function_body(block_source, "block_device_register")
     unregister_body = function_body(block_source, "block_device_unregister")
-    remove_node_body = function_body(block_source, "remove_block_dev_node")
-
-    require(block_source, "ker::util::SmallVec<Device*, BDEV_INLINE_ALLOC_COUNT> block_dev_nodes;", "block /dev wrappers must be pointer-stable")
-    require_absent(
-        block_source,
-        "ker::util::SmallVec<Device, BDEV_INLINE_ALLOC_COUNT> block_dev_nodes;",
-        "block /dev wrappers must not be stored by value",
-    )
-    require_order(
-        register_body,
-        [
-            "auto* dev_node = new (std::nothrow) Device{}",
-            "if (dev_node == nullptr)",
-            "block_devices.remove_at(block_devices.size() - 1)",
-            "dev_node->private_data = bdev",
-            "if (!block_dev_nodes.push_back(dev_node))",
-            "delete dev_node",
-            "block_devices.remove_at(block_devices.size() - 1)",
-            "if (dev_register(dev_node) != 0)",
-            "block_dev_nodes.remove_at(block_dev_nodes.size() - 1)",
-            "delete dev_node",
-            "block_devices.remove_at(block_devices.size() - 1)",
-        ],
-        "block device register must own stable /dev wrappers and unwind failures",
-    )
-    require_absent(
-        register_body,
-        "dev_register(&block_dev_nodes.at",
-        "block device register must not register addresses inside SmallVec storage",
-    )
-    require_order(
-        remove_node_body,
-        [
-            "size_t const NODE_INDEX = find_block_dev_node_index(bdev)",
-            "Device* dev_node = block_dev_nodes.at(NODE_INDEX)",
-            "static_cast<void>(dev_unregister(dev_node))",
-            "block_dev_nodes.remove_at(NODE_INDEX)",
-            "delete dev_node",
-        ],
-        "block device unregister must remove and free /dev wrapper",
-    )
-    require(unregister_body, "remove_block_dev_node(bdev);", "block device unregister must free /dev wrapper storage")
+    require(block_source, "struct BlockRegistryEntry", "block /dev wrappers must have stable heap storage")
+    require_order(register_body, [
+        "new (std::nothrow) BlockRegistryEntry", "entry->node.private_data = bdev",
+        "if (dev_register(&entry->node) != 0)", "unlink_entry_locked(entry)", "delete entry",
+        "entry->phase = RegistryPhase::PUBLISHED",
+    ], "block device register must own stable /dev wrappers and unwind failures")
+    require_order(unregister_body, [
+        "entry->phase = RegistryPhase::RETIRING", "dev_unregister(&retired->node)",
+        "unlink_entry_locked(retired)", "delete retired",
+    ], "block device unregister must unpublish and remove its wrapper before freeing it")
 
     for name in ("partition_read", "partition_write", "partition_flush"):
         body = function_body(block_source, name)
@@ -197,21 +165,19 @@ def main() -> None:
         "non-NCQ commands, so the device must not see another command on this port",
         "AHCI completion wait must document non-NCQ serialization",
     )
-    require(
-        ahci_source,
-        'ker::mod::mm::phys::page_alloc(ker::mod::mm::PhysicalPageOwner::DEVICE_AHCI, CLB_SIZE, "ahci_clb")',
-        "AHCI command-list memory must be physically contiguous DMA memory",
-    )
-    require(
-        ahci_source,
-        'ker::mod::mm::phys::page_alloc(ker::mod::mm::PhysicalPageOwner::DEVICE_AHCI, FIS_RECEIVE_SIZE, "ahci_fis")',
-        "AHCI received-FIS memory must be physically contiguous DMA memory",
-    )
-    require(
-        ahci_source,
-        'ker::mod::mm::phys::page_alloc(ker::mod::mm::PhysicalPageOwner::DEVICE_AHCI, CTB_SIZE, "ahci_ctb")',
-        "AHCI command-table memory must be physically contiguous DMA memory",
-    )
+    for raw in ("phys::page_alloc(", "virt_to_phys", "virt_to_phys_addr"):
+        require_absent(ahci_source, raw, "AHCI DMA addresses must come from managed submissions")
+    for managed in ("dma::allocate_coherent", "dma::allocate_streaming", "dma::prepare", "dma::complete"):
+        require(ahci_source, managed, "AHCI must retain managed DMA ownership")
+    prepare = function_body(ahci_source, "port_prepare")
+    for ring in ("memory.clb, CLB_SIZE", "memory.fis, FIS_RECEIVE_SIZE", "memory.tables[i], command_table_size"):
+        require(prepare, ring, "AHCI rings must use managed contiguous backing")
+    install = function_body(ahci_source, "port_install")
+    for address in ("memory.clb.submission.address", "memory.fis.submission.address"):
+        require(install, address, "AHCI must program managed ring addresses")
+    init = function_body(ahci_source, "ahci_init")
+    require_order(init, ["port_prepare(i)", "port_install(", "pci::pci_set_bus_master(controller, true)"],
+                  "AHCI must prepare and install DMA before enabling bus mastering")
     require(
         ahci_source,
         "constexpr uint32_t AHCI_MAX_SECTORS_PER_CMD = 1024;",
@@ -223,15 +189,19 @@ def main() -> None:
         "AHCI command tables must not use virtually contiguous heap arrays for DMA",
     )
 
-    read_write_body = function_body(ahci_source, "read_write_disk")
-    issue_start = read_write_body.find("mmio_write32(port->ci, 1U << slot);")
-    wait_start = read_write_body.find("// Wait for completion while holding the per-port command lock")
-    success_unlock = read_write_body.find("port_lock.unlock();\n\n    return true;", wait_start)
-    if issue_start < 0 or wait_start < 0 or success_unlock < 0:
-        fail("read_write_disk must hold the port lock until command completion")
-    early_unlock = read_write_body.find("port_lock.unlock();", issue_start, wait_start)
-    if early_unlock >= 0:
-        fail("read_write_disk must not unlock the port before the non-NCQ command completes")
+    command = function_body(ahci_source, "execute_command")
+    require(command, "MutexGuard const GUARD(port_lock)", "AHCI must retain the port mutex through completion")
+    require_absent(command, ".unlock()", "AHCI must not release the mutex before command retirement")
+    require_order(command, ["MutexGuard const GUARD(port_lock)", "admission.allows_command()", "execute_command_locked("],
+                  "AHCI must check admission under its port lock")
+    command_body = function_body(ahci_source, "execute_command_locked")
+    for token in ("transfer.address + offset", "dma::bind_streaming", "COMMAND_TIMEOUT_NS", "dma::Retirement::command_completed"):
+        require(command_body, token, "AHCI commands must use bounded managed DMA retirement")
+    power = (ROOT / "modules/kern/src/platform/power/power.cpp").read_text()
+    require_order(function_body(power, "run_finalizer"), ["vfs_shutdown_sync()", "vfs_shutdown_unmount_all(", "ahci_shutdown()", "halt_other_cores()"],
+                  "AHCI shutdown must follow VFS durability and precede CPU halt")
+    for name in ("read_write_disk", "identify_disk", "flush_disk"):
+        require(function_body(ahci_source, name), "execute_command(", "all ATA commands must use the same serialization and retirement")
 
 
 if __name__ == "__main__":

@@ -36,6 +36,7 @@ void smt_init();
 void epoch_manager_init();
 void dev_init();
 void pci_enumerate();
+void iommu_init();
 void console_init();
 void null_device_init();
 void random_device_init();
@@ -52,6 +53,7 @@ void initramfs_init();
 void hostname_init();
 
 // PHASE 5: Drivers
+void iommu_faults_init();
 void virtio_net_init();
 void e1000e_init();
 void cdc_ether_init();
@@ -114,11 +116,12 @@ inline constexpr std::array<ModuleDesc, 9> PHASE_2_MODULES = {{
 }};
 
 // PHASE 3: Subsystems
-inline constexpr std::array<ModuleDesc, 13> PHASE_3_MODULES = {{
+inline constexpr std::array<ModuleDesc, 14> PHASE_3_MODULES = {{
     {.name = "smt", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::smt_init},                      // depends: sys
     {.name = "epoch_manager", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::epoch_manager_init},  // depends: smt
     {.name = "dev", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::dev_init},                      // depends: ioapic
     {.name = "pci", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::pci_enumerate},                 // depends: dev
+    {.name = "iommu", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::iommu_init},                  // depends: pci, acpi, smt
     {.name = "console", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::console_init},              // depends: pci
     {.name = "null_device", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::null_device_init},      // depends: dev
     {.name = "random_device", .phase = BootPhase::PHASE_3_SUBSYSTEMS, .init_fn = fns::random_device_init},  // depends: dev
@@ -140,7 +143,8 @@ inline constexpr std::array<ModuleDesc, 3> PHASE_4_MODULES = {{
 }};
 
 // PHASE 5: Drivers
-inline constexpr std::array<ModuleDesc, 12> PHASE_5_MODULES = {{
+inline constexpr std::array<ModuleDesc, 13> PHASE_5_MODULES = {{
+    {.name = "iommu_faults", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::iommu_faults_init},   // depends: iommu, sched
     {.name = "virtio_net", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::virtio_net_init},       // depends: pci, net, smt
     {.name = "e1000e", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::e1000e_init},               // depends: pci, net, smt
     {.name = "cdc_ether", .phase = BootPhase::PHASE_5_DRIVERS, .init_fn = fns::cdc_ether_init},         // depends: pci, net, smt
