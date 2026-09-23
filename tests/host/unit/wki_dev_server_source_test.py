@@ -907,6 +907,8 @@ def test_deferred_vfs_ops_retain_their_binding_through_blocking_work() -> None:
     ktest = WKI_DEV_SERVER_KTEST.read_text()
     queue_body = function_body(source, "try_queue_pre_admitted_vfs_op")
     run_body = function_body(source, "run_deferred_vfs_op")
+    require_order(run_body, "KernelShutdownHold const SHUTDOWN", "op->retained_binding",
+                  "deferred operation owns binding and pool entry across cooperative shutdown waits")
     release_body = function_body(source, "deferred_vfs_op_release")
     regular_run_body = run_body[run_body.index("// Pre-ACK admission retained") :]
     queue_required = [

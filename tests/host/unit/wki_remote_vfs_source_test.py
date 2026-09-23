@@ -1521,6 +1521,11 @@ def test_server_message_read_uses_bounded_stack_response() -> None:
     if read_start < 0 or write_start < 0:
         fail("remote VFS server read/write opcode cases must remain present")
     read_case = handler_body[read_start:write_start]
+    require_tokens(
+        handler_body,
+        ["send_completed_vfs_reply(channel_identity, response, bytes, binding_retiring)"],
+        "common metadata/write responses retain completed replies on transient refusal",
+    )
 
     require_order(
         read_case,
@@ -1538,7 +1543,7 @@ def test_server_message_read_uses_bounded_stack_response() -> None:
             "resp->reserved = REQ_COOKIE",
             "uint16_t const SEND_LEN = (BYTES_READ > 0) ? static_cast<uint16_t>(sizeof(DevOpRespPayload) + BYTES_READ)",
             ": static_cast<uint16_t>(sizeof(DevOpRespPayload))",
-            "send_completed_vfs_read_reply(channel_identity, resp_buf.data(), SEND_LEN, binding_retiring)",
+            "send_completed_vfs_reply(channel_identity, resp_buf.data(), SEND_LEN, binding_retiring)",
         ],
         "server message-read bounded stack response",
     )

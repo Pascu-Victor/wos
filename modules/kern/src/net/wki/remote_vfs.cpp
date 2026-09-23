@@ -121,6 +121,7 @@ constexpr uint64_t VFS_PROXY_SLOT_WAIT_TIMEOUT_US = VFS_PROXY_OP_TIMEOUT_US;
 // startup into several full RPC timeout windows.
 constexpr uint64_t VFS_PROXY_AUX_ATTACH_TIMEOUT_US = 5'000'000;
 std::atomic<uint32_t> g_vfs_xattr_session_counter{1};
+std::atomic<uint64_t> g_vfs_reply_enqueue_failures{0};
 static_assert(sizeof(DevOpReqPayload) <= WKI_ETH_MAX_PAYLOAD);
 static_assert(WKI_ETH_MAX_PAYLOAD <= UINT16_MAX);
 static_assert(WKI_ETH_MAX_PAYLOAD <= ker::mod::mm::KERNEL_STACK_SIZE / 16);
@@ -3388,8 +3389,8 @@ auto vfs_proxy_send_status_is_retryable(int status) -> bool {
 }
 
 template <typename Send, typename Wait, typename Now>
-auto retry_completed_vfs_read_reply(const WkiChannelIdentity& identity, const std::atomic<bool>* binding_retiring, uint64_t deadline_us,
-                                    Send&& send, Wait&& wait, Now&& now) -> int {
+auto retry_completed_vfs_reply(const WkiChannelIdentity& identity, const std::atomic<bool>* binding_retiring, uint64_t deadline_us,
+                               Send&& send, Wait&& wait, Now&& now) -> int {
     auto retry_live = [&] {
         return binding_retiring != nullptr && !binding_retiring->load(std::memory_order_acquire) && now() < deadline_us &&
                wki_channel_generation_is_live(identity.channel, identity.peer_node_id, identity.channel_id, identity.generation);
@@ -3405,15 +3406,17 @@ auto retry_completed_vfs_read_reply(const WkiChannelIdentity& identity, const st
     return status;
 }
 
-auto send_completed_vfs_read_reply(const WkiChannelIdentity& identity, const void* response, uint16_t response_len,
-                                   const std::atomic<bool>* binding_retiring) -> int {
+auto send_completed_vfs_reply(const WkiChannelIdentity& identity, const void* response, uint16_t response_len,
+                              const std::atomic<bool>* binding_retiring) -> int {
     uint64_t const DEADLINE_US = wki_future_deadline_us(wki_now_us(), VFS_PROXY_OP_TIMEOUT_US);
     ProxySlotCaller const CALLER = current_proxy_slot_caller();
     // The deferred worker retains its binding and this completed byte prefix.
     // Only pre-publication failures retry; WKI_OK transfers retransmit ownership
-    // and must never execute another read or submit this response again.
-    return retry_completed_vfs_read_reply(
-        identity, binding_retiring, DEADLINE_US,
+    // and must never repeat the filesystem operation or submit this response again.
+    bool const CAN_WAIT = ker::mod::sched::interrupts_enabled() && ker::mod::sched::preempt_count() == 0 && CALLER.pid != 0 &&
+                          CALLER.type == ker::mod::sched::task::TaskType::DAEMON;
+    return retry_completed_vfs_reply(
+        identity, CAN_WAIT ? binding_retiring : nullptr, DEADLINE_US,
         [&](const WkiChannelIdentity& retained) {
             return wki_send_on_channel_identity(retained, MsgType::DEV_OP_RESP, response, response_len);
         },
@@ -7604,7 +7607,7 @@ auto wki_remote_vfs_selftest_completed_read_reply_retry() -> bool {
     uint64_t now = 0;
     bool exact = true;
     constexpr std::array RESULTS{WKI_ERR_NO_ROUTE, WKI_ERR_NO_MEM, WKI_ERR_NO_CREDITS, WKI_OK};
-    int result = retry_completed_vfs_read_reply(
+    int result = retry_completed_vfs_reply(
         IDENTITY, &retiring, 10,
         [&](const WkiChannelIdentity& identity) {
             exact &= vfs_channel_identity_matches(IDENTITY, identity) && response == RESPONSE;
@@ -7620,7 +7623,7 @@ auto wki_remote_vfs_selftest_completed_read_reply_retry() -> bool {
     // Terminal errors and accepted replies must not sleep or submit twice.
     for (int terminal : {WKI_OK, WKI_ERR_INVALID, WKI_ERR_NOT_FOUND, WKI_ERR_PEER_FENCED, WKI_ERR_TX_FAILED}) {
         sends = waits = 0;
-        result = retry_completed_vfs_read_reply(
+        result = retry_completed_vfs_reply(
             IDENTITY, &retiring, 10,
             [&](const WkiChannelIdentity&) {
                 ++sends;
@@ -7636,7 +7639,7 @@ auto wki_remote_vfs_selftest_completed_read_reply_retry() -> bool {
         now = 0;
         retiring.store(mode == 3, std::memory_order_relaxed);
         channel.generation = IDENTITY.generation;
-        result = retry_completed_vfs_read_reply(
+        result = retry_completed_vfs_reply(
             IDENTITY, mode == 4 ? nullptr : &retiring, 10,
             [&](const WkiChannelIdentity& identity) {
                 exact &= vfs_channel_identity_matches(IDENTITY, identity) && response == RESPONSE;
@@ -10288,11 +10291,18 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
     perf_record_vfs_server_point(static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsServerOp::RX), hdr->src_node, channel_id, CORRELATION, 0,
                                  data_len, CALLSITE);
 
+    auto send_reply = [&](const void* response, uint16_t bytes) {
+        int const RESULT = send_completed_vfs_reply(channel_identity, response, bytes, binding_retiring);
+        if (RESULT < 0 && g_vfs_reply_enqueue_failures.fetch_add(1, std::memory_order_relaxed) < 16) {
+            ker::mod::dbg::logger<"wki">::warn("VFS reply enqueue failed: peer=0x%04x ch=%u gen=%u op=%u cookie=%u bytes=%u result=%d",
+                                               hdr->src_node, channel_id, channel_identity.generation, op_id, REQ_COOKIE, bytes, RESULT);
+        }
+    };
     auto send_simple_resp = [&](DevOpRespPayload& resp) {
         resp.reserved = REQ_COOKIE;
         perf_record_vfs_server_point(static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsServerOp::REPLY_SEND), hdr->src_node, channel_id,
                                      CORRELATION, resp.status, sizeof(resp), CALLSITE);
-        static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
+        send_reply(&resp, sizeof(resp));
     };
     auto send_buffered_resp = [&](void* resp_buf, uint16_t resp_len) {
         if (resp_buf != nullptr && resp_len >= sizeof(DevOpRespPayload)) {
@@ -10301,7 +10311,7 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             perf_record_vfs_server_point(static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsServerOp::REPLY_SEND), hdr->src_node, channel_id,
                                          CORRELATION, resp->status, resp_len, CALLSITE);
         }
-        static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, resp_buf, resp_len));
+        send_reply(resp_buf, resp_len);
     };
     auto reject_request = [&](int16_t status) {
         DevOpRespPayload resp = {};
@@ -10851,7 +10861,7 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
                                                        : static_cast<uint16_t>(sizeof(DevOpRespPayload));
             perf_record_vfs_server_point(static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsServerOp::REPLY_SEND), hdr->src_node, channel_id,
                                          CORRELATION, resp->status, SEND_LEN, CALLSITE);
-            static_cast<void>(send_completed_vfs_read_reply(channel_identity, resp_buf.data(), SEND_LEN, binding_retiring));
+            static_cast<void>(send_completed_vfs_reply(channel_identity, resp_buf.data(), SEND_LEN, binding_retiring));
             break;
         }
 

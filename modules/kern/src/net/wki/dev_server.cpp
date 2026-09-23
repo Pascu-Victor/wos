@@ -1117,6 +1117,9 @@ void run_deferred_vfs_op(void* arg) {
         return;
     }
 
+    // A cooperative shutdown exit at a VFS/send wait does not unwind this
+    // stack. Finish and release the pre-ACK binding and pool entry first.
+    ker::mod::sched::KernelShutdownHold const SHUTDOWN = ker::mod::sched::hold_kernel_shutdown();
     DevServerBinding* const RETAINED_BINDING = op->retained_binding;
 
     if (op->op_id == OP_NET_OPEN_AS || op->op_id == OP_NET_CLOSE_AS || op->op_id == OP_NET_LINK_AS) {
