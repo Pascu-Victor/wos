@@ -1,5 +1,6 @@
 #pragma once
 
+#include <abi/kernel_debug_metadata.hpp>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -16,6 +17,7 @@ enum ImageFlags : uint32_t {
     IMAGE_SHARED_OBJECT = 1U << 2,
     IMAGE_EXACT_MAPPING = 1U << 3,
     IMAGE_BUILD_ID_PRESENT = 1U << 4,
+    IMAGE_KERNEL = 1U << 5,
 };
 
 struct RuntimeImage {
@@ -66,6 +68,15 @@ enum class SnapshotStatus : uint8_t {
 // that the stable GDB link_map chain was walked to its null terminator.
 [[nodiscard]] auto snapshot_images(TargetReader reader, void* opaque, const SnapshotSource& source,
                                    std::array<RuntimeImage, MAX_IMAGES>& images, size_t& count) -> SnapshotStatus;
+
+// Append the live kernel image, including its relocation base and GNU build
+// identity, to a process catalog. Returns false only when the catalog is full
+// or the linker-provided runtime layout is internally inconsistent.
+[[nodiscard]] auto append_kernel_image(std::array<RuntimeImage, MAX_IMAGES>& images, size_t& count) -> bool;
+
+// Build the fixed-address raw-debugger descriptor from the same authoritative
+// runtime record used by ptrace, procfs, perf, debugserver, and coredumps.
+[[nodiscard]] auto kernel_debug_metadata(wos::abi::KernelDebugMetadata& metadata) -> bool;
 
 #ifdef WOS_SELFTEST
 // Resolve the dynamic-loader rendezvous using the same bounded target-memory

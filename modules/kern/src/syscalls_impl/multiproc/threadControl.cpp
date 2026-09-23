@@ -104,8 +104,11 @@ auto publish_thread_tid_to_tcb(mod::sched::task::Task* parent, uint64_t tcb_va, 
         return false;
     }
 
-    auto* tid_ptr = static_cast<int*>(tid_page.kernel_address());
-    __atomic_store_n(tid_ptr, static_cast<int>(tid), __ATOMIC_RELEASE);
+    {
+        mod::sys::usercopy::UserAccessGuard const ACCESS{};
+        auto* tid_ptr = static_cast<int*>(tid_page.kernel_address());
+        __atomic_store_n(tid_ptr, static_cast<int>(tid), __ATOMIC_RELEASE);
+    }
     return tid_page.commit_write();
 }
 }  // namespace

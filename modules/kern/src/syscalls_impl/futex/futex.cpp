@@ -194,6 +194,7 @@ int64_t futex_wait(uint64_t user_addr, int expected, uint64_t timeout_user_addr)
     }
 
     if (timeout_user_addr != 0 && timeout_us == 0) {
+        mod::sys::usercopy::UserAccessGuard const ACCESS{};
         int const CURRENT_VALUE = __atomic_load_n(kernel_addr, __ATOMIC_ACQUIRE);
         if (!futex_page.still_mapped()) {
             return -EFAULT;
@@ -224,6 +225,7 @@ int64_t futex_wait(uint64_t user_addr, int expected, uint64_t timeout_user_addr)
     bool const INSERTED = futex_table.insert_if(
         waiter,
         [kernel_addr, expected]() -> bool {
+            mod::sys::usercopy::UserAccessGuard const ACCESS{};
             int const CURRENT_VALUE = __atomic_load_n(kernel_addr, __ATOMIC_ACQUIRE);
             return CURRENT_VALUE == expected;
         },

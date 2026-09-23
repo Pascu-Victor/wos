@@ -192,6 +192,7 @@ void zero_per_cpu(cpu::PerCpu& per_cpu_data) {
     per_cpu_data.syscall_ret_rip = 0;
     per_cpu_data.syscall_ret_flags = 0;
     per_cpu_data.syscall_entry_tmp = 0;
+    cpu::initialize_stack_guard(per_cpu_data);
 }
 
 void prepare_selftest_ap_context(uint64_t cpu_no) {
@@ -212,7 +213,7 @@ void prepare_selftest_ap_context(uint64_t cpu_no) {
     kernel_per_cpu_ptrs[cpu_no] = per_cpu_data;
 }
 
-void cpu_param_init(uint64_t cpu_no, uint64_t stack_top) {
+__attribute__((no_stack_protector)) void cpu_param_init(uint64_t cpu_no, uint64_t stack_top) {
     // Enable CPU features FIRST (must be done on each CPU)
     // FSGSBASE must be enabled before using wrgsbase instruction
     cpu::enable_fsgsbase();
@@ -226,7 +227,7 @@ void cpu_param_init(uint64_t cpu_no, uint64_t stack_top) {
     auto const PER_CPU_ADDR = reinterpret_cast<uint64_t>(per_cpu_data);
 
     // Zero out the PerCpu area
-    std::memset(static_cast<void*>(per_cpu_data), 0, sizeof(cpu::PerCpu));
+    zero_per_cpu(*per_cpu_data);
 
     // Store kernel stack in the PerCpu structure
     per_cpu_data->syscall_stack = stack_top;
@@ -289,8 +290,18 @@ void cpu_param_init(uint64_t cpu_no, uint64_t stack_top) {
     sched::start_scheduler();
 }
 
-void non_primary_cpu_init(limine_mp_info* smp_info) {
-    // FIRST: Switch to kernel page table before accessing any kernel data
+__attribute__((no_stack_protector)) void non_primary_cpu_init(limine_mp_info* smp_info) {
+    wos_stack_protector_install_ap_bootstrap();
+    // PAGE_NX is reserved until EFER.NXE is active. Enable it while still on
+    // Limine's page table, before loading the hardened shared kernel pagemap.
+    static_cast<void>(cpu::enable_nx());
+    cpu::enable_write_protect();
+    auto const SUPERVISOR = cpu::enable_supervisor_protections();
+    if ((SUPERVISOR.smep_supported && !SUPERVISOR.smep_enabled) || (SUPERVISOR.smap_supported && !SUPERVISOR.smap_enabled) ||
+        !cpu::supervisor_protection_policy_matches(SUPERVISOR)) {
+        hcf();
+    }
+    // FIRST: Switch to kernel page table before accessing ordinary kernel data.
     mm::virt::switch_to_kernel_pagemap();
     auto* response = SMP_REQUEST.response;
     if (response == nullptr) {
@@ -669,7 +680,15 @@ void halt_nmi_handler(cpu::GPRegs gpr, gates::InterruptFrame frame) {
     ker::mod::dbg::panic_handler("unexpected NMI");
 }
 
-void selftest_secondary_cpu_park(limine_mp_info* smp_info) {
+__attribute__((no_stack_protector)) void selftest_secondary_cpu_park(limine_mp_info* smp_info) {
+    wos_stack_protector_install_ap_bootstrap();
+    static_cast<void>(cpu::enable_nx());
+    cpu::enable_write_protect();
+    auto const SUPERVISOR = cpu::enable_supervisor_protections();
+    if ((SUPERVISOR.smep_supported && !SUPERVISOR.smep_enabled) || (SUPERVISOR.smap_supported && !SUPERVISOR.smap_enabled) ||
+        !cpu::supervisor_protection_policy_matches(SUPERVISOR)) {
+        hcf();
+    }
     mm::virt::switch_to_kernel_pagemap();
     auto* response = SMP_REQUEST.response;
     if (response == nullptr) {
@@ -745,7 +764,7 @@ void init() {
     init_cpu_domains();
 }
 
-void park_secondary_cpus_for_selftest() {
+__attribute__((no_stack_protector)) void park_secondary_cpus_for_selftest() {
     auto* response = SMP_REQUEST.response;
     if (response == nullptr) {
         return;
@@ -815,7 +834,7 @@ void park_secondary_cpus_for_selftest() {
 }
 
 // init per cpu data
-void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
+__attribute__((no_stack_protector)) void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
     auto* response = SMP_REQUEST.response;
     assert(response != nullptr);
     if (response == nullptr) {
@@ -828,7 +847,7 @@ void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
     auto per_cpu_addr = reinterpret_cast<uint64_t>(bsp_per_cpu);
 
     // Zero out the PerCpu area before use
-    std::memset(static_cast<void*>(bsp_per_cpu), 0, sizeof(cpu::PerCpu));
+    zero_per_cpu(*bsp_per_cpu);
 
     // Store kernel stack in the PerCpu structure
     bsp_per_cpu->syscall_stack = kernel_rsp;

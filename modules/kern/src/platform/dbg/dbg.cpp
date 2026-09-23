@@ -11,6 +11,8 @@
 #include "mod/io/serial/serial.hpp"
 #include "platform/dbg/journal.hpp"
 #include "platform/ktime/ktime.hpp"
+#include "platform/mm/kernel_image.hpp"
+#include "platform/mm/mm.hpp"
 #include "platform/sys/spinlock.hpp"
 #include "util/hcf.hpp"
 
@@ -448,8 +450,7 @@ void panic_handler(const char* msg) {
     io::serial::write_unlocked("\n--- Raw Stack (top 64 qwords) ---\n");
     auto* rsp_ptr = reinterpret_cast<uint64_t*>(rsp);
     auto rsp_addr = reinterpret_cast<uintptr_t>(rsp_ptr);
-    bool const RSP_VALID = (rsp_addr >= 0xffff800000000000ULL && rsp_addr < 0xffff900000000000ULL) ||
-                           (rsp_addr >= 0xffffffff80000000ULL && rsp_addr < 0xffffffffc0000000ULL);
+    bool const RSP_VALID = ker::mod::mm::is_kernel_stack_address(rsp_addr) || ker::mod::mm::kernel_image::contains(rsp_addr);
     if (RSP_VALID) {
         for (uint64_t i = 0; i < MAX_RAW_STACK_TRACE; i++) {
             io::serial::write_unlocked("  [RSP+0x");

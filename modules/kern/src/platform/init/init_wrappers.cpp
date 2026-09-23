@@ -341,6 +341,9 @@ void sched_init() {
 #ifdef WOS_SELFTEST
     if (cmdline_has_token(get_kernel_cmdline(), "--selftest")) {
         mod::smt::park_secondary_cpus_for_selftest();
+        if (cmdline_has_token(get_kernel_cmdline(), "--selftest-stack-canary-fail")) {
+            mod::cpu::selftest_corrupt_stack_canary();
+        }
         ker::test::run_all(cmdline_has_token(get_kernel_cmdline(), "--ahci-test-retire-only"));
         mod::power::selftest_poweroff();
         hcf();

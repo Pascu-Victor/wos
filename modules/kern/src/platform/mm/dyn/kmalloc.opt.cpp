@@ -14,6 +14,7 @@
 #include "minimalist_malloc/mini_malloc.hpp"
 #include "minimalist_malloc/slab_allocator.hpp"
 #include "platform/dbg/dbg.hpp"
+#include "platform/mm/kernel_image.hpp"
 #include "platform/mm/page_alloc.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/phys.hpp"
@@ -1298,7 +1299,7 @@ void free(void* ptr) {
     // Validate ptr is in a reasonable range
     auto ptr_val = reinterpret_cast<uintptr_t>(ptr);
     const bool IN_HHDM = (ptr_val >= 0xffff800000000000ULL && ptr_val < 0xffff900000000000ULL);
-    const bool IN_KERNEL_STATIC = (ptr_val >= 0xffffffff80000000ULL && ptr_val < 0xffffffffc0000000ULL);
+    const bool IN_KERNEL_STATIC = kernel_image::contains(ptr_val);
     const bool IN_KERNEL_VMAP = virt::kernel_vmap_contains(ptr);
     if (!IN_HHDM && !IN_KERNEL_STATIC && !IN_KERNEL_VMAP) {
         ker::mod::dbg::log("kmalloc::free: caller=%p freeing ptr=%p outside valid kernel range", __builtin_return_address(0), ptr);

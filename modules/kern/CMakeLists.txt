@@ -113,8 +113,12 @@ set(WOS_KERNEL_C_CXX_OPTIONS
     -fdiagnostics-color=always
     -fdiagnostics-show-option
     -pipe
-    -mcmodel=kernel
-    -fno-stack-protector
+    -mcmodel=small
+    -fPIE
+    -fstack-protector-strong
+    -mstack-protector-guard=tls
+    -mstack-protector-guard-reg=gs
+    -mstack-protector-guard-offset=64
     -fno-stack-check
     -fno-lto
     -fno-sanitize=safe-stack
@@ -143,7 +147,7 @@ target_compile_options(${KERNEL} PRIVATE
     "$<$<COMPILE_LANGUAGE:C>:${WOS_KERNEL_C_CXX_OPTIONS};-fno-exceptions>"
     "$<$<COMPILE_LANGUAGE:CXX>:${WOS_KERNEL_C_CXX_OPTIONS};${WOS_KERNEL_CXX_OPTIONS}>"
 )
-target_link_options(${KERNEL} PRIVATE -static -Wl,--no-dynamic-linker -Wl,--build-id=sha1 -fno-lto)
+target_link_options(${KERNEL} PRIVATE -pie -Wl,-z,text -Wl,--no-dynamic-linker -Wl,--build-id=sha1 -fno-lto)
 
 set(WOS_KERNEL_STRICT_C_CXX_WARNING_OPTIONS
     -Wall

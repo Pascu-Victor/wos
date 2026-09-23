@@ -63,13 +63,23 @@ fi
 
 LIMINE_CONF="$CWD/modules/kern/limine.conf"
 if [ "${WOS_KERNEL_CMDLINE+x}" ]; then
+    KERNEL_KASLR="${WOS_KERNEL_KASLR:-yes}"
+    case "$KERNEL_KASLR" in
+        yes|no)
+            ;;
+        *)
+            echo "error: WOS_KERNEL_KASLR must be 'yes' or 'no'" >&2
+            exit 2
+            ;;
+    esac
     TMP_LIMINE_CONF="$(mktemp)"
     cat > "$TMP_LIMINE_CONF" <<_EOF_
 timeout: 0
 
 /wos
     protocol: limine
-    kaslr: no
+    kaslr: $KERNEL_KASLR
+    randomise_hhdm_base: no
     kernel_path: boot():/wos
     module_path: boot():/initramfs.cpio
     cmdline: $WOS_KERNEL_CMDLINE

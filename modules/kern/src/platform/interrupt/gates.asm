@@ -3,6 +3,7 @@ bits 64
 extern iterrupt_handler
 extern wos_user_interrupt_save_fpu
 extern wos_user_interrupt_restore_fpu
+extern wos_smap_active
 
 %include "platform/asm/helpers.asm"
 
@@ -17,6 +18,10 @@ extern wos_user_interrupt_restore_fpu
 %endmacro
 
 __idt_isr_handler:
+    cmp byte [rel wos_smap_active], 0
+    je .access_closed
+    clac
+.access_closed:
     cld
     clear_live_tf
 
@@ -146,6 +151,10 @@ isr_except 14
 global isr32
 extern task_switch_handler
 isr32:
+    cmp byte [rel wos_smap_active], 0
+    je .access_closed
+    clac
+.access_closed:
     cld
     clear_live_tf
 

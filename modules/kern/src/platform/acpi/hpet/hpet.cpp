@@ -49,7 +49,7 @@ void init() {
     // Map HPET to the kernel page table so all CPUs can access it
     auto const HPET_VIRT = reinterpret_cast<uint64_t>(hpet_addr);
     mm::virt::map_to_kernel_page_table(HPET_VIRT, reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(HPET_VIRT)),
-                                       mm::virt::page_types::MMIO);
+                                       mm::virt::kernel_mmio_page_flags());
 
     hpet = reinterpret_cast<Hpet*>(hpet_addr);
     tick_period = (hpet->capabilities >> 32) & 0xFFFFFFFF;

@@ -25,6 +25,7 @@
 #include "platform/asm/cpu.hpp"
 #include "platform/interrupt/gates.hpp"
 #include "platform/interrupt/gdt.hpp"
+#include "platform/mm/kernel_image.hpp"
 #include "platform/mm/mm.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/virt.hpp"
@@ -69,7 +70,7 @@ constexpr uint64_t USER_RFLAGS_REQUIRED_MASK = USER_RFLAGS_FIXED_ONE | USER_RFLA
 constexpr uint64_t USER_PROT_WRITE = 0x2ULL;
 constexpr uint64_t USER_PROT_EXEC = 0x4ULL;
 
-inline auto valid_kernel_stack(uint64_t rsp) -> bool { return rsp >= 0xffff800000000000ULL && rsp < 0xffff900000000000ULL; }
+inline auto valid_kernel_stack(uint64_t rsp) -> bool { return ker::mod::mm::is_kernel_stack_address(rsp); }
 
 inline auto is_kernel_text_pointer(uint64_t rip) -> bool {
     auto const TEXT_START = reinterpret_cast<uint64_t>(__kernel_text_start);
@@ -1194,7 +1195,7 @@ auto switch_to(cpu::GPRegs& gpr, gates::InterruptFrame& frame, sched::task::Task
 
         // Validate pagemap pointer is in valid HHDM range (not kernel static range)
         auto pm_addr = reinterpret_cast<uintptr_t>(next_task->pagemap);
-        if (pm_addr >= 0xffffffff80000000ULL || pm_addr < 0xffff800000000000ULL) {
+        if (pm_addr < 0xffff800000000000ULL || pm_addr >= 0xffff900000000000ULL) {
             dbg::log("switchTo: FAIL - PID %x pagemap ptr invalid (pmAddr=0x%x)", next_task->pid, pm_addr);
             // Corrupted pagemap pointer - task struct was freed/corrupted
             return false;
@@ -1205,7 +1206,7 @@ auto switch_to(cpu::GPRegs& gpr, gates::InterruptFrame& frame, sched::task::Task
             auto thread_addr = reinterpret_cast<uintptr_t>(next_task->thread);
             // Accept either HHDM or kernel-static addresses as valid
             bool const TH_IN_HHDM = (thread_addr >= 0xffff800000000000ULL && thread_addr < 0xffff900000000000ULL);
-            bool const TH_IN_KERNEL_STATIC = (thread_addr >= 0xffffffff80000000ULL && thread_addr < 0xffffffffc0000000ULL);
+            bool const TH_IN_KERNEL_STATIC = mm::kernel_image::contains(thread_addr);
             if (!TH_IN_HHDM && !TH_IN_KERNEL_STATIC) {
                 dbg::log("switchTo: FAIL - PID %x thread ptr invalid (thread=0x%lx)", next_task->pid, thread_addr);
                 // Corrupted thread pointer - task struct was freed/corrupted

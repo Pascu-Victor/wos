@@ -9,10 +9,14 @@ wos_asm_syscall_handler:
     ; Validate the kernel scratch stack before writing any syscall-entry state
     ; through %gs. If KERNEL_GS_BASE is stale, those writes corrupt whichever
     ; object %gs happens to point at and make the later fault look unrelated.
-    cmp dword [gs:0x04], 0xffff8000
+    mov eax, dword [gs:0x04]
+    cmp eax, 0xffff8000
     jb .bad_syscall_stack
-    cmp dword [gs:0x04], 0xffff9000
-    jae .bad_syscall_stack
+    cmp eax, 0xffff9000
+    jb .valid_syscall_gs
+    cmp eax, 0xfffffd00
+    jne .bad_syscall_stack
+.valid_syscall_gs:
 
     ; Save RCX and R11 IMMEDIATELY - they hold return RIP and RFLAGS
     ; These must be saved before any code can clobber them
@@ -23,9 +27,15 @@ wos_asm_syscall_handler:
     mov [gs:0x38], rax ; save syscall number while validating the stack
     mov rax, [gs:0x0] ; load kernel stack
     cmp rax, [rel syscall_kernel_stack_min]
-    jb .bad_syscall_stack
+    jb .check_guarded_syscall_stack
     cmp rax, [rel syscall_kernel_stack_max]
+    jb .valid_syscall_stack
+.check_guarded_syscall_stack:
+    cmp rax, [rel syscall_guarded_stack_min]
+    jb .bad_syscall_stack
+    cmp rax, [rel syscall_guarded_stack_max]
     jae .bad_syscall_stack
+.valid_syscall_stack:
     mov rsp, rax ; switch to kernel stack
     mov rax, [gs:0x38] ; restore syscall number
     clear_live_tf
@@ -282,5 +292,9 @@ syscall_kernel_stack_min:
     dq 0xffff800000000000
 syscall_kernel_stack_max:
     dq 0xffff900000000000
+syscall_guarded_stack_min:
+    dq 0xfffffd0000000000
+syscall_guarded_stack_max:
+    dq 0xfffffd0008200000
 syscall_user_addr_limit:
     dq 0x0000800000000000

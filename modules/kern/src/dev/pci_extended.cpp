@@ -84,7 +84,7 @@ void collect() {
             continue;
         }
         result.physical = *ADDRESS;
-        mod::mm::virt::map_range_to_kernel_page_table({*ADDRESS, *ADDRESS + 4096}, mod::mm::paging::page_types::MMIO);
+        mod::mm::virt::map_range_to_kernel_page_table({*ADDRESS, *ADDRESS + 4096}, mod::mm::virt::kernel_mmio_page_flags());
         Reader reader{reinterpret_cast<volatile uint8_t*>(mod::mm::addr::get_virt_pointer(*ADDRESS))};
         result.capabilities = ecam::inspect(reader, device->vendor_id, device->device_id, device->header_type);
         result.state = result.capabilities.error == ecam::CapabilityError::identity ? ExtendedState::identity_error

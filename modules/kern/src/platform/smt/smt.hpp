@@ -276,8 +276,8 @@ inline void start_cpu_task(uint64_t cpu_no, CpuGotoAddr task, mm::Stack<4096> st
     auto& cpu_data = get_cpu(cpu);
 
     // push function arguments to the stack of the target CPU
+    --stack.sp;
     *stack.sp = reinterpret_cast<uint64_t>(task);
-    stack.sp++;
 
     __atomic_store_n(&cpu_data.stack_pointer_ref, stack.sp, __ATOMIC_SEQ_CST);
     __atomic_store_n(cpu_data.goto_address, task, __ATOMIC_SEQ_CST);

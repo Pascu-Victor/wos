@@ -53,15 +53,11 @@ using log = ker::mod::dbg::logger<"kasan">;
 // Lower bound of the shadow region we consider valid for demand-paging.
 // Derived: shadow_of(0x0) = SHADOW_OFFSET >> 3 * 0 + SHADOW_OFFSET.
 // For safety just use SHADOW_OFFSET as the bottom.
-constexpr uint64_t SHADOW_REGION_BASE = SHADOW_OFFSET;
-
 // Upper bound: shadow for the top of canonical address space.
 // shadow_of(0xffffffffffffffff) = (0xffffffffffffffff >> 3) + SHADOW_OFFSET
 //                                = 0x1fffffffffffffff + 0xdffffc0000000000
 //                                ≈ 0xfffffc0000000000 (wraps in 64 bits, fine)
 // Use a generous end that covers all kernel VA.
-constexpr uint64_t SHADOW_REGION_END = 0xfffffc2000000000ULL;
-
 // ---------------------------------------------------------------------------
 // Shadow page fault handler
 // ---------------------------------------------------------------------------
@@ -191,7 +187,7 @@ auto handle_shadow_fault(uint64_t cr2) -> bool {
         return true;
     }
 
-    mm::virt::map_to_kernel_page_table(shadow_vaddr, shadow_paddr, mm::paging::page_types::KERNEL);
+    mm::virt::map_to_kernel_page_table(shadow_vaddr, shadow_paddr, mm::virt::kernel_data_page_flags());
     s_shadow_map_lock.clear(std::memory_order_release);
     sync_shadow_pml4_to_current(shadow_vaddr, kernel_pt);
 

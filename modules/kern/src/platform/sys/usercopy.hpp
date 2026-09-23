@@ -23,10 +23,31 @@ enum class CStringCopyStatus : uint8_t {
     TOO_LONG,
 };
 
+// Bounds the architectural SMAP override to a pinned-page copy. Maskable
+// interrupts stay disabled while AC is set, and the prior AC/IF state is
+// restored exactly, so nested ptrace/signal/syscall helpers remain balanced.
+class UserAccessGuard {
+   public:
+    UserAccessGuard();
+    ~UserAccessGuard();
+
+    UserAccessGuard(const UserAccessGuard&) = delete;
+    UserAccessGuard(UserAccessGuard&&) = delete;
+    auto operator=(const UserAccessGuard&) -> UserAccessGuard& = delete;
+    auto operator=(UserAccessGuard&&) -> UserAccessGuard& = delete;
+
+   private:
+    uint64_t m_flags{};
+    bool m_smap{};
+};
+
+[[nodiscard]] auto access_window_active() -> bool;
+
 // Holds both the target Task pagemap-access gate and one allocator frame
 // reference. The HHDM address therefore remains safe even if another thread
 // removes the mapping; still_mapped() supplies the operation's final
-// linearization check before callers commit or report progress.
+// linearization check before callers commit or report progress. Dereference
+// kernel_address() only while a UserAccessGuard is alive.
 class StableUserPage {
    public:
     StableUserPage() = default;

@@ -29,7 +29,8 @@ KTEST(SignalAbi, FrameAddressMatchesSysvCallEntryAlignment) {
 
 KTEST(SyscallAbi, PerCpuEntryScratchOffset) {
     KEXPECT_EQ(offsetof(ker::mod::cpu::PerCpu, syscall_entry_tmp), static_cast<size_t>(0x38));
-    KEXPECT_EQ(sizeof(ker::mod::cpu::PerCpu), static_cast<size_t>(64));
+    KEXPECT_EQ(offsetof(ker::mod::cpu::PerCpu, stack_guard), static_cast<size_t>(0x40));
+    KEXPECT_EQ(sizeof(ker::mod::cpu::PerCpu), static_cast<size_t>(72));
 }
 
 #ifdef WOS_SELFTEST

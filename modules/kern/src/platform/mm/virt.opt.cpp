@@ -32,7 +32,9 @@
 #include "platform/asm/cpu.hpp"
 #include "platform/asm/tlb.hpp"
 #include "platform/dbg/coredump.hpp"
+#include "platform/loader/runtime_images.hpp"
 #include "platform/mm/addr.hpp"
+#include "platform/mm/mm.hpp"
 #include "platform/mm/page_alloc.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/phys.hpp"
@@ -44,7 +46,24 @@
 #include "util/hcf.hpp"
 #include "vfs/vfs.hpp"
 
-extern "C" char __kernel_end[];  // NOLINT(readability-identifier-naming)
+extern "C" {
+extern char __kernel_image_start[];                   // NOLINT(readability-identifier-naming)
+extern char __kernel_text_start[];                    // NOLINT(readability-identifier-naming)
+extern char __kernel_text_end[];                      // NOLINT(readability-identifier-naming)
+extern char __kernel_rodata_start[];                  // NOLINT(readability-identifier-naming)
+extern char __kernel_rodata_end[];                    // NOLINT(readability-identifier-naming)
+extern char __kernel_data_start[];                    // NOLINT(readability-identifier-naming)
+extern char __kernel_data_end[];                      // NOLINT(readability-identifier-naming)
+extern char __kernel_bss_start[];                     // NOLINT(readability-identifier-naming)
+extern char __kernel_bss_end[];                       // NOLINT(readability-identifier-naming)
+extern char __kernel_emergency_stack_region_start[];  // NOLINT(readability-identifier-naming)
+extern char __kernel_emergency_stack_region_end[];    // NOLINT(readability-identifier-naming)
+extern char __stack_chk_emergency_guard_low[];        // NOLINT(readability-identifier-naming)
+extern char __stack_chk_emergency_stack[];            // NOLINT(readability-identifier-naming)
+extern char __stack_chk_emergency_stack_end[];        // NOLINT(readability-identifier-naming)
+extern char __stack_chk_emergency_guard_high_end[];   // NOLINT(readability-identifier-naming)
+extern char __kernel_end[];                           // NOLINT(readability-identifier-naming)
+}
 
 namespace ker::mod::mm::virt {
 
@@ -264,6 +283,19 @@ size_t kernel_vmap_next_page = 0;                                             //
 size_t kernel_vmap_pending_first_page = KERNEL_VMAP_MAX_PAGES;                // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 size_t kernel_vmap_pending_pages = 0;                                         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool kernel_vmap_initialized = false;                                         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+// The arena is fixed and fully mapped before task/AP publication; runtime
+// allocation only changes pool ownership. Its address is deliberately outside
+// KASan's reserved shadow interval so a real stack-guard fault cannot be
+// mistaken for a demand fault on shadow memory.
+constexpr vaddr_t GUARDED_KERNEL_STACK_ARENA_BASE = ker::mod::mm::GUARDED_KERNEL_STACK_ARENA_BASE;
+constexpr uint64_t GUARDED_KERNEL_STACK_STRIDE = ker::mod::mm::KERNEL_STACK_SLOT_STRIDE;
+static_assert(ker::mod::mm::KERNEL_STACK_GUARD_SIZE == paging::PAGE_SIZE);
+#ifdef WOS_KASAN
+static_assert(GUARDED_KERNEL_STACK_ARENA_BASE >= kasan::SHADOW_REGION_END);
+#endif
+size_t guarded_kernel_stack_capacity{};   // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+bool guarded_kernel_stack_initialized{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 auto kernel_vmap_bit_is_set(size_t page) -> bool { return (kernel_vmap_bitmap.at(page / 64) & (uint64_t{1} << (page % 64))) != 0; }
 
@@ -1536,8 +1568,27 @@ paging::PageTable* kernel_pagemap;
 limine_memmap_response* memmap_response;
 limine_executable_file_response* kernel_file_response;
 limine_executable_address_response* kernel_address_response;
+bool kernel_nx_supported{};
 
 #ifdef WOS_SELFTEST
+enum class ExpectedPageFaultState : uint8_t {
+    IDLE,
+    CONFIGURING,
+    ARMED,
+    HANDLED,
+};
+
+struct ExpectedKernelPageFault {
+    std::atomic<ExpectedPageFaultState> state{ExpectedPageFaultState::IDLE};
+    vaddr_t fault_address{};
+    vaddr_t fault_rip{};
+    vaddr_t recovery_rip{};
+    uint64_t expected_error{};
+    uint64_t error_mask{};
+};
+
+ExpectedKernelPageFault expected_kernel_page_fault{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
 void selftest_require_mutable_pagemap_root(PageTable const* root, const char* phase, vaddr_t vaddr = 0);
 #endif
 
@@ -3135,7 +3186,11 @@ auto memmap_page_range(const limine_memmap_entry* entry, Range& range) -> bool {
 auto direct_map_flags_for_entry(uint64_t type) -> uint64_t {
     bool const READONLY =
         type == LIMINE_MEMMAP_RESERVED || type == LIMINE_MEMMAP_BAD_MEMORY || type == LIMINE_MEMMAP_EXECUTABLE_AND_MODULES;
-    return READONLY ? paging::page_types::READONLY : paging::page_types::KERNEL;
+    uint64_t flags = READONLY ? paging::page_types::READONLY : paging::page_types::KERNEL;
+    if (kernel_nx_supported) {
+        flags |= paging::PAGE_NX;
+    }
+    return flags;
 }
 
 struct BootDirectMapStats {
@@ -3143,6 +3198,46 @@ struct BootDirectMapStats {
     size_t small_4k{};
     size_t large_2m{};
 };
+
+struct MappingPermissions {
+    bool present{};
+    bool writable{};
+    bool executable{};
+};
+
+auto mapping_permissions(PageTable* root, vaddr_t vaddr) -> MappingPermissions {
+    MappingPermissions result{.present = true, .writable = true, .executable = true};
+    PageTable* table = root;
+    for (int level = 4; level >= 1; --level) {
+        if (table == nullptr) {
+            return {};
+        }
+        PageTableEntry const& entry = entry_at(table, index_of(vaddr, level));
+        if (entry.present == 0) {
+            return {};
+        }
+        result.writable = result.writable && entry.writable != 0;
+        result.executable = result.executable && entry.no_execute == 0;
+        if (level == 1 || (entry.pagesize != 0 && (level == 3 || level == 2))) {
+            return result;
+        }
+        table = reinterpret_cast<PageTable*>(addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT));
+    }
+    return {};
+}
+
+auto audit_mapping_range(vaddr_t start, vaddr_t end, bool writable, bool executable) -> bool {
+    if (kernel_pagemap == nullptr || start >= end || (start & (paging::PAGE_SIZE - 1)) != 0U || (end & (paging::PAGE_SIZE - 1)) != 0U) {
+        return false;
+    }
+    for (vaddr_t page = start; page < end; page += paging::PAGE_SIZE) {
+        MappingPermissions const PERMISSIONS = mapping_permissions(kernel_pagemap, page);
+        if (!PERMISSIONS.present || PERMISSIONS.writable != writable || PERMISSIONS.executable != executable) {
+            return false;
+        }
+    }
+    return true;
+}
 
 auto map_2m_page(PageTable* page_table, vaddr_t vaddr, paddr_t paddr, uint64_t flags) -> bool {
     if (page_table == nullptr || flags == 0 || !is_aligned_to(vaddr, LARGE_PAGE_2M_BYTES) || !is_aligned_to(paddr, LARGE_PAGE_2M_BYTES)) {
@@ -3497,6 +3592,16 @@ auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, 
     }
 #endif
 
+#ifdef WOS_SELFTEST
+    if (expected_kernel_page_fault.state.load(std::memory_order_acquire) == ExpectedPageFaultState::ARMED &&
+        control_register == expected_kernel_page_fault.fault_address && frame.rip == expected_kernel_page_fault.fault_rip &&
+        (frame.err_code & expected_kernel_page_fault.error_mask) == expected_kernel_page_fault.expected_error) {
+        frame.rip = expected_kernel_page_fault.recovery_rip;
+        expected_kernel_page_fault.state.store(ExpectedPageFaultState::HANDLED, std::memory_order_release);
+        return true;
+    }
+#endif
+
     // Lazy user-stack backing. This handles non-present faults in the
     // reserved process stack range, including kernel-mode faults caused by
     // syscall copy paths writing into a not-yet-backed user stack page.
@@ -3567,6 +3672,29 @@ auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, 
     // Not a COW fault - let the caller handle it (userspace crash / kernel panic).
     return false;
 }
+
+#ifdef WOS_SELFTEST
+auto selftest_arm_expected_kernel_page_fault(vaddr_t fault_address, vaddr_t fault_rip, vaddr_t recovery_rip, uint64_t expected_error,
+                                             uint64_t error_mask) -> bool {
+    ExpectedPageFaultState expected = ExpectedPageFaultState::IDLE;
+    if (!expected_kernel_page_fault.state.compare_exchange_strong(expected, ExpectedPageFaultState::CONFIGURING, std::memory_order_acq_rel,
+                                                                  std::memory_order_acquire)) {
+        return false;
+    }
+    expected_kernel_page_fault.fault_address = fault_address;
+    expected_kernel_page_fault.fault_rip = fault_rip;
+    expected_kernel_page_fault.recovery_rip = recovery_rip;
+    expected_kernel_page_fault.expected_error = expected_error;
+    expected_kernel_page_fault.error_mask = error_mask;
+    expected_kernel_page_fault.state.store(ExpectedPageFaultState::ARMED, std::memory_order_release);
+    return true;
+}
+
+auto selftest_finish_expected_kernel_page_fault() -> bool {
+    ExpectedPageFaultState const STATE = expected_kernel_page_fault.state.exchange(ExpectedPageFaultState::IDLE, std::memory_order_acq_rel);
+    return STATE == ExpectedPageFaultState::HANDLED;
+}
+#endif
 
 paddr_t translate(PageTable* page_table, vaddr_t vaddr) {
     if (page_table == nullptr) {
@@ -4183,6 +4311,21 @@ void start_anonymous_swap_worker() {
 }
 
 void init_pagemap() {
+    // PAGE_NX is reserved until EFER.NXE is active. Configure the BSP before
+    // constructing or loading any page table that contains NX leaves.
+    kernel_nx_supported = cpu::enable_nx();
+    cpu::enable_write_protect();
+    cpu::SupervisorProtectionState const SUPERVISOR = cpu::enable_supervisor_protections();
+    if ((SUPERVISOR.smep_supported && !SUPERVISOR.smep_enabled) || (SUPERVISOR.smap_supported && !SUPERVISOR.smap_enabled)) {
+        log::critical("CPU supervisor protection policy failed: SMEP supported=%u enabled=%u SMAP supported=%u enabled=%u",
+                      SUPERVISOR.smep_supported ? 1U : 0U, SUPERVISOR.smep_enabled ? 1U : 0U, SUPERVISOR.smap_supported ? 1U : 0U,
+                      SUPERVISOR.smap_enabled ? 1U : 0U);
+        hcf();
+    }
+    cpu::publish_supervisor_protection_policy(SUPERVISOR);
+    log::info("CPU supervisor protection policy: SMEP=%s SMAP=%s usercopy=%s", SUPERVISOR.smep_enabled ? "enabled" : "unsupported",
+              SUPERVISOR.smap_enabled ? "enabled" : "unsupported",
+              SUPERVISOR.smap_enabled ? "AC-gated pinned-page window" : "software pinned-page fallback");
     cpu::enable_pae();
     cpu::enable_pse();
     kernel_pagemap = alloc_zeroed_page_table();
@@ -4241,24 +4384,79 @@ void init_pagemap() {
     }
 
     uint64_t const KERNEL_VIRT_BASE = kernel_address_response->virtual_base;
+    auto const KERNEL_LINK_BASE = reinterpret_cast<uint64_t>(__kernel_image_start);
     auto const KERNEL_IMAGE_END = reinterpret_cast<uint64_t>(__kernel_end);
-    if (KERNEL_IMAGE_END < KERNEL_VIRT_BASE) {
-        log::critical("init_pagemap: invalid kernel image bounds base=%p end=%p", KERNEL_VIRT_BASE, KERNEL_IMAGE_END);
+    if (KERNEL_IMAGE_END < KERNEL_VIRT_BASE || KERNEL_LINK_BASE != KERNEL_VIRT_BASE) {
+        log::critical("init_pagemap: invalid kernel image bounds load=%p link=%p end=%p", KERNEL_VIRT_BASE, KERNEL_LINK_BASE,
+                      KERNEL_IMAGE_END);
         hcf();
     }
+#ifdef WOS_SELFTEST
+    // The diagnostic kernel publishes its bootloader-selected base only on the
+    // private serial test channel so repeated-boot KASLR sampling is exact.
+    log::info("selftest kernel relocation: link_base=0x0 load_base=%p slide=%p", KERNEL_VIRT_BASE, KERNEL_VIRT_BASE);
+#endif
 
     uint64_t const KERNEL_IMAGE_SIZE = KERNEL_IMAGE_END - KERNEL_VIRT_BASE;
-    uint64_t const KERNEL_PAGE_COUNT = page_align_up(KERNEL_IMAGE_SIZE) / paging::PAGE_SIZE;
-    if (KERNEL_PAGE_COUNT > 0) {
-        PageMapBatch kernel_batch{};
-        init_page_map_batch(&kernel_batch, kernel_pagemap, paging::page_types::KERNEL);
-        for (uint64_t i = 0; i < KERNEL_PAGE_COUNT; i++) {
-            vaddr_t const VADDR = kernel_address_response->virtual_base + (i * paging::PAGE_SIZE);
-            paddr_t const PADDR = kernel_address_response->physical_base + (i * paging::PAGE_SIZE);
-            map_page_batched(&kernel_batch, VADDR, PADDR, paging::page_types::KERNEL);
+    auto map_kernel_range = [&](vaddr_t start, vaddr_t end, uint64_t flags) {
+        if (start >= end || start < KERNEL_VIRT_BASE || end > KERNEL_IMAGE_END || ((start | end) & (paging::PAGE_SIZE - 1)) != 0U) {
+            log::critical("init_pagemap: invalid section range start=%p end=%p flags=%lx", start, end, flags);
+            hcf();
         }
-        flush_page_map_batch(&kernel_batch);
+        PageMapBatch batch{};
+        init_page_map_batch(&batch, kernel_pagemap, flags);
+        for (vaddr_t vaddr = start; vaddr < end; vaddr += paging::PAGE_SIZE) {
+            paddr_t const paddr = kernel_address_response->physical_base + (vaddr - KERNEL_VIRT_BASE);
+            map_page_batched(&batch, vaddr, paddr, flags);
+        }
+        flush_page_map_batch(&batch);
+    };
+
+    uint64_t const NON_EXEC = kernel_nx_supported ? paging::PAGE_NX : 0;
+    vaddr_t const TEXT_START = page_align_down(reinterpret_cast<vaddr_t>(__kernel_text_start));
+    vaddr_t const TEXT_END = page_align_up(reinterpret_cast<vaddr_t>(__kernel_text_end));
+    vaddr_t const RODATA_START = reinterpret_cast<vaddr_t>(__kernel_rodata_start);
+    vaddr_t const RODATA_END = page_align_up(reinterpret_cast<vaddr_t>(__kernel_rodata_end));
+    vaddr_t const DATA_START = reinterpret_cast<vaddr_t>(__kernel_data_start);
+    vaddr_t const DATA_END = reinterpret_cast<vaddr_t>(__kernel_data_end);
+    vaddr_t const EMERGENCY_REGION_START = reinterpret_cast<vaddr_t>(__kernel_emergency_stack_region_start);
+    vaddr_t const EMERGENCY_GUARD_LOW = reinterpret_cast<vaddr_t>(__stack_chk_emergency_guard_low);
+    vaddr_t const EMERGENCY_STACK_START = reinterpret_cast<vaddr_t>(__stack_chk_emergency_stack);
+    vaddr_t const EMERGENCY_STACK_END = reinterpret_cast<vaddr_t>(__stack_chk_emergency_stack_end);
+    vaddr_t const EMERGENCY_GUARD_HIGH_END = reinterpret_cast<vaddr_t>(__stack_chk_emergency_guard_high_end);
+    vaddr_t const EMERGENCY_REGION_END = reinterpret_cast<vaddr_t>(__kernel_emergency_stack_region_end);
+    if (KERNEL_IMAGE_SIZE == 0 || TEXT_START != KERNEL_VIRT_BASE || TEXT_END != RODATA_START || RODATA_END != DATA_START ||
+        DATA_END != KERNEL_IMAGE_END || EMERGENCY_REGION_START != EMERGENCY_GUARD_LOW ||
+        EMERGENCY_STACK_START - EMERGENCY_GUARD_LOW != paging::PAGE_SIZE ||
+        EMERGENCY_STACK_END - EMERGENCY_STACK_START != 4 * paging::PAGE_SIZE ||
+        EMERGENCY_GUARD_HIGH_END - EMERGENCY_STACK_END != paging::PAGE_SIZE || EMERGENCY_REGION_END != EMERGENCY_GUARD_HIGH_END ||
+        EMERGENCY_REGION_START < DATA_START || EMERGENCY_REGION_END > DATA_END) {
+        log::critical("init_pagemap: non-contiguous kernel sections image=[%p,%p) text=[%p,%p) rodata=[%p,%p) data=[%p,%p)",
+                      KERNEL_VIRT_BASE, KERNEL_IMAGE_END, TEXT_START, TEXT_END, RODATA_START, RODATA_END, DATA_START, DATA_END);
+        hcf();
     }
+    map_kernel_range(TEXT_START, TEXT_END, paging::page_types::READONLY);
+    map_kernel_range(RODATA_START, RODATA_END, paging::page_types::READONLY | NON_EXEC);
+    map_kernel_range(DATA_START, EMERGENCY_GUARD_LOW, kernel_data_page_flags());
+    map_kernel_range(EMERGENCY_STACK_START, EMERGENCY_STACK_END, kernel_data_page_flags());
+    map_kernel_range(EMERGENCY_GUARD_HIGH_END, DATA_END, kernel_data_page_flags());
+
+    // Raw QEMU RSP has no WOS image-catalog packet. Publish one immutable,
+    // NX descriptor at a stable diagnostic VA so WOSDBG can discover the
+    // randomized image base and authenticate the exact local kernel first.
+    auto* const DEBUG_METADATA_PAGE = phys::page_alloc(PhysicalPageOwner::DEBUGGER, paging::PAGE_SIZE, "kernel_debug_metadata");
+    if (DEBUG_METADATA_PAGE == nullptr) {
+        log::critical("init_pagemap: failed to allocate kernel debug metadata");
+        hcf();
+    }
+    std::memset(DEBUG_METADATA_PAGE, 0, paging::PAGE_SIZE);
+    auto* const DEBUG_METADATA = static_cast<wos::abi::KernelDebugMetadata*>(DEBUG_METADATA_PAGE);
+    if (!loader::runtime::kernel_debug_metadata(*DEBUG_METADATA)) {
+        log::critical("init_pagemap: failed to construct kernel debug metadata");
+        hcf();
+    }
+    auto const DEBUG_METADATA_PHYS = reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(DEBUG_METADATA_PAGE)));
+    map_page(kernel_pagemap, wos::abi::KERNEL_DEBUG_METADATA_ADDRESS, DEBUG_METADATA_PHYS, paging::page_types::READONLY | NON_EXEC);
 
     // CRITICAL: Ensure all page table pages are mapped in the HHDM.
     // Page tables allocated by advancePageTable() might be from physical addresses
@@ -4282,7 +4480,7 @@ void init_pagemap() {
             paddr_t const PML3_PHYS = pml4e.frame << paging::PAGE_SHIFT;
             auto pml3_virt = reinterpret_cast<vaddr_t>(addr::get_virt_pointer(PML3_PHYS));
             if (!is_page_mapped(kernel_pagemap, pml3_virt)) {
-                map_page(kernel_pagemap, pml3_virt, PML3_PHYS, paging::page_types::KERNEL);
+                map_page(kernel_pagemap, pml3_virt, PML3_PHYS, kernel_data_page_flags());
                 pt_pages_mappped++;
                 mapped_this_round++;
                 made_progress = true;
@@ -4300,7 +4498,7 @@ void init_pagemap() {
                 paddr_t const PML2_PHYS = pml3e.frame << paging::PAGE_SHIFT;
                 auto pml2_virt = reinterpret_cast<vaddr_t>(addr::get_virt_pointer(PML2_PHYS));
                 if (!is_page_mapped(kernel_pagemap, pml2_virt)) {
-                    map_page(kernel_pagemap, pml2_virt, PML2_PHYS, paging::page_types::KERNEL);
+                    map_page(kernel_pagemap, pml2_virt, PML2_PHYS, kernel_data_page_flags());
                     pt_pages_mappped++;
                     mapped_this_round++;
                     made_progress = true;
@@ -4319,7 +4517,7 @@ void init_pagemap() {
 
                     auto pml1_virt = reinterpret_cast<vaddr_t>(addr::get_virt_pointer(PML1_PHYS));
                     if (!is_page_mapped(kernel_pagemap, pml1_virt)) {
-                        map_page(kernel_pagemap, pml1_virt, PML1_PHYS, paging::page_types::KERNEL);
+                        map_page(kernel_pagemap, pml1_virt, PML1_PHYS, kernel_data_page_flags());
                         pt_pages_mappped++;
                         mapped_this_round++;
                         made_progress = true;
@@ -4340,12 +4538,93 @@ void init_pagemap() {
     log::info("cleared PML4[0] - null derefs will now fault");
 
     switch_to_kernel_pagemap();
+    KernelProtectionAudit const AUDIT = audit_kernel_protections();
+    bool const BASELINE_VALID = AUDIT.write_protect_active && AUDIT.layout_valid && AUDIT.text_readonly && AUDIT.text_executable &&
+                                AUDIT.rodata_readonly && AUDIT.data_writable && AUDIT.emergency_stack_guarded &&
+                                AUDIT.direct_alias_readonly && AUDIT.debug_metadata_readonly;
+    if (!BASELINE_VALID || (kernel_nx_supported && !AUDIT.enforced())) {
+        log::critical(
+            "kernel protection audit failed: nx_supported=%u nx_active=%u wp=%u layout=%u text_ro=%u text_x=%u rodata_ro=%u rodata_nx=%u "
+            "data_rw=%u data_nx=%u emergency_stack_guarded=%u alias_ro=%u alias_nx=%u debug_ro=%u debug_nx=%u",
+            AUDIT.nx_supported ? 1U : 0U, AUDIT.nx_active ? 1U : 0U, AUDIT.write_protect_active ? 1U : 0U, AUDIT.layout_valid ? 1U : 0U,
+            AUDIT.text_readonly ? 1U : 0U, AUDIT.text_executable ? 1U : 0U, AUDIT.rodata_readonly ? 1U : 0U,
+            AUDIT.rodata_non_executable ? 1U : 0U, AUDIT.data_writable ? 1U : 0U, AUDIT.data_non_executable ? 1U : 0U,
+            AUDIT.emergency_stack_guarded ? 1U : 0U, AUDIT.direct_alias_readonly ? 1U : 0U, AUDIT.direct_alias_non_executable ? 1U : 0U,
+            AUDIT.debug_metadata_readonly ? 1U : 0U, AUDIT.debug_metadata_non_executable ? 1U : 0U);
+        hcf();
+    }
+    if (!kernel_nx_supported) {
+        log::warn("CPU lacks NX support; kernel write protection is active but non-executable data cannot be enforced");
+    } else {
+        log::info(
+            "kernel W^X active: text=RO+X rodata=RO+NX data=RW+NX emergency-stack=guarded direct-map-alias=RO+NX "
+            "debug-metadata=RO+NX");
+    }
 #ifdef WOS_SELFTEST
     selftest_register_kernel_page_tables();
     direct_map_selftest_ready = true;
     selftest_audit_boot_direct_map_boundaries("post-cr3-switch");
 #endif
 }
+
+auto audit_kernel_protections() -> KernelProtectionAudit {
+    KernelProtectionAudit audit{};
+    audit.nx_supported = kernel_nx_supported;
+    audit.nx_active = cpu::nx_enabled();
+    audit.write_protect_active = cpu::write_protect_enabled();
+    if (kernel_pagemap == nullptr || kernel_address_response == nullptr) {
+        return audit;
+    }
+
+    vaddr_t const IMAGE_START = reinterpret_cast<vaddr_t>(__kernel_image_start);
+    vaddr_t const TEXT_START = page_align_down(reinterpret_cast<vaddr_t>(__kernel_text_start));
+    vaddr_t const TEXT_END = page_align_up(reinterpret_cast<vaddr_t>(__kernel_text_end));
+    vaddr_t const RODATA_START = reinterpret_cast<vaddr_t>(__kernel_rodata_start);
+    vaddr_t const RODATA_END = page_align_up(reinterpret_cast<vaddr_t>(__kernel_rodata_end));
+    vaddr_t const DATA_START = reinterpret_cast<vaddr_t>(__kernel_data_start);
+    vaddr_t const DATA_END = reinterpret_cast<vaddr_t>(__kernel_data_end);
+    vaddr_t const BSS_START = reinterpret_cast<vaddr_t>(__kernel_bss_start);
+    vaddr_t const BSS_END = reinterpret_cast<vaddr_t>(__kernel_bss_end);
+    vaddr_t const EMERGENCY_GUARD_LOW = reinterpret_cast<vaddr_t>(__stack_chk_emergency_guard_low);
+    vaddr_t const EMERGENCY_STACK_START = reinterpret_cast<vaddr_t>(__stack_chk_emergency_stack);
+    vaddr_t const EMERGENCY_STACK_END = reinterpret_cast<vaddr_t>(__stack_chk_emergency_stack_end);
+    vaddr_t const EMERGENCY_GUARD_HIGH_END = reinterpret_cast<vaddr_t>(__stack_chk_emergency_guard_high_end);
+
+    audit.layout_valid =
+        IMAGE_START == kernel_address_response->virtual_base && IMAGE_START == TEXT_START && TEXT_START < TEXT_END &&
+        TEXT_END == RODATA_START && RODATA_START < RODATA_END && RODATA_END == DATA_START && DATA_START < DATA_END &&
+        BSS_START >= DATA_START && BSS_START <= EMERGENCY_GUARD_LOW && EMERGENCY_STACK_START - EMERGENCY_GUARD_LOW == paging::PAGE_SIZE &&
+        EMERGENCY_STACK_END - EMERGENCY_STACK_START == 4 * paging::PAGE_SIZE &&
+        EMERGENCY_GUARD_HIGH_END - EMERGENCY_STACK_END == paging::PAGE_SIZE && EMERGENCY_GUARD_HIGH_END <= BSS_END && BSS_END <= DATA_END;
+    if (!audit.layout_valid) {
+        return audit;
+    }
+
+    audit.text_readonly = audit_mapping_range(TEXT_START, TEXT_END, false, true);
+    audit.text_executable = audit.text_readonly;
+    audit.rodata_readonly = audit_mapping_range(RODATA_START, RODATA_END, false, !kernel_nx_supported);
+    audit.rodata_non_executable = kernel_nx_supported && audit.rodata_readonly;
+    audit.data_writable = audit_mapping_range(DATA_START, EMERGENCY_GUARD_LOW, true, !kernel_nx_supported) &&
+                          audit_mapping_range(EMERGENCY_STACK_START, EMERGENCY_STACK_END, true, !kernel_nx_supported) &&
+                          audit_mapping_range(EMERGENCY_GUARD_HIGH_END, DATA_END, true, !kernel_nx_supported);
+    audit.data_non_executable = kernel_nx_supported && audit.data_writable;
+    audit.emergency_stack_guarded = !mapping_permissions(kernel_pagemap, EMERGENCY_GUARD_LOW).present &&
+                                    !mapping_permissions(kernel_pagemap, EMERGENCY_STACK_END).present;
+
+    uint64_t const IMAGE_BYTES = DATA_END - IMAGE_START;
+    vaddr_t const ALIAS_START = reinterpret_cast<vaddr_t>(addr::get_virt_pointer(kernel_address_response->physical_base));
+    vaddr_t const ALIAS_END = ALIAS_START + IMAGE_BYTES;
+    audit.direct_alias_readonly = ALIAS_END >= ALIAS_START && audit_mapping_range(ALIAS_START, ALIAS_END, false, !kernel_nx_supported);
+    audit.direct_alias_non_executable = kernel_nx_supported && audit.direct_alias_readonly;
+    audit.debug_metadata_readonly = audit_mapping_range(
+        wos::abi::KERNEL_DEBUG_METADATA_ADDRESS, wos::abi::KERNEL_DEBUG_METADATA_ADDRESS + paging::PAGE_SIZE, false, !kernel_nx_supported);
+    audit.debug_metadata_non_executable = kernel_nx_supported && audit.debug_metadata_readonly;
+    return audit;
+}
+
+auto kernel_data_page_flags() -> uint64_t { return paging::page_types::KERNEL | (kernel_nx_supported ? paging::PAGE_NX : 0); }
+
+auto kernel_mmio_page_flags() -> uint64_t { return paging::page_types::MMIO | (kernel_nx_supported ? paging::PAGE_NX : 0); }
 
 namespace {
 
@@ -4895,7 +5174,7 @@ void init_kernel_vmap() {
     // Pre-create the complete hierarchy down through PML1. Runtime map_page()
     // calls then only publish independent leaf PTEs and cannot recurse into
     // physical reclaim to allocate a page table.
-    uint64_t constexpr FLAGS = paging::page_types::KERNEL;
+    uint64_t const FLAGS = kernel_data_page_flags();
     for (uint64_t offset = 0; offset < arena_bytes; offset += LARGE_PAGE_2M_BYTES) {
         vaddr_t const VADDR = KERNEL_VMAP_BASE + offset;
         PageTable* pml3 = advance_page_table(kernel_pagemap, index_of(VADDR, 4), FLAGS);
@@ -4925,6 +5204,69 @@ void init_kernel_vmap() {
 #endif
     log::info("prepared kernel vmap arena: base=%p bytes=%llu pages=%zu", KERNEL_VMAP_BASE, static_cast<unsigned long long>(arena_bytes),
               kernel_vmap_active_pages);
+}
+
+auto init_guarded_kernel_stack_pool(void* backing, size_t capacity) -> bool {
+    if (guarded_kernel_stack_initialized || kernel_pagemap == nullptr || backing == nullptr || capacity == 0 ||
+        capacity > UINT64_MAX / GUARDED_KERNEL_STACK_STRIDE) {
+        return false;
+    }
+
+    uint64_t const ARENA_BYTES = static_cast<uint64_t>(capacity) * GUARDED_KERNEL_STACK_STRIDE;
+    if (capacity > ker::mod::mm::KERNEL_STACK_POOL_CAPACITY || GUARDED_KERNEL_STACK_ARENA_BASE > UINT64_MAX - ARENA_BYTES ||
+        GUARDED_KERNEL_STACK_ARENA_BASE + ARENA_BYTES > ker::mod::mm::GUARDED_KERNEL_STACK_ARENA_END) {
+        return false;
+    }
+
+    uint64_t const FLAGS = kernel_data_page_flags();
+    uint64_t const HHDM_BACKING = reinterpret_cast<uint64_t>(backing);
+    PageMapBatch batch{};
+    init_page_map_batch(&batch, kernel_pagemap, FLAGS);
+    for (size_t slot = 0; slot < capacity; ++slot) {
+        vaddr_t const STACK_BASE =
+            GUARDED_KERNEL_STACK_ARENA_BASE + (static_cast<uint64_t>(slot) * GUARDED_KERNEL_STACK_STRIDE) + paging::PAGE_SIZE;
+        uint64_t const BACKING_OFFSET = static_cast<uint64_t>(slot) * ker::mod::mm::KERNEL_STACK_SIZE;
+        for (uint64_t offset = 0; offset < ker::mod::mm::KERNEL_STACK_SIZE; offset += paging::PAGE_SIZE) {
+            auto const PADDR = reinterpret_cast<paddr_t>(addr::get_phys_pointer(HHDM_BACKING + BACKING_OFFSET + offset));
+            map_page_batched(&batch, STACK_BASE + offset, PADDR, FLAGS);
+        }
+    }
+    flush_page_map_batch(&batch);
+    guarded_kernel_stack_capacity = capacity;
+    guarded_kernel_stack_initialized = true;
+
+#ifdef WOS_SELFTEST
+    selftest_register_kernel_page_tables();
+#endif
+    log::info("prepared guarded kernel stacks: base=%p slots=%zu stack_bytes=%zu guard_bytes=%zu", GUARDED_KERNEL_STACK_ARENA_BASE,
+              capacity, ker::mod::mm::KERNEL_STACK_SIZE, paging::PAGE_SIZE);
+    return true;
+}
+
+auto guarded_kernel_stack_slot(size_t index) -> void* {
+    if (!guarded_kernel_stack_initialized || index >= guarded_kernel_stack_capacity) {
+        return nullptr;
+    }
+    vaddr_t const BASE = GUARDED_KERNEL_STACK_ARENA_BASE + (static_cast<uint64_t>(index) * GUARDED_KERNEL_STACK_STRIDE) + paging::PAGE_SIZE;
+    return reinterpret_cast<void*>(BASE);
+}
+
+auto audit_guarded_kernel_stack(const void* stack_base) -> bool {
+    if (!guarded_kernel_stack_initialized || stack_base == nullptr) {
+        return false;
+    }
+    auto const BASE = reinterpret_cast<vaddr_t>(stack_base);
+    if (BASE < GUARDED_KERNEL_STACK_ARENA_BASE + paging::PAGE_SIZE) {
+        return false;
+    }
+    uint64_t const OFFSET = BASE - (GUARDED_KERNEL_STACK_ARENA_BASE + paging::PAGE_SIZE);
+    if ((OFFSET % GUARDED_KERNEL_STACK_STRIDE) != 0U || OFFSET / GUARDED_KERNEL_STACK_STRIDE >= guarded_kernel_stack_capacity) {
+        return false;
+    }
+    MappingPermissions const LOWER = mapping_permissions(kernel_pagemap, BASE - paging::PAGE_SIZE);
+    MappingPermissions const UPPER = mapping_permissions(kernel_pagemap, BASE + ker::mod::mm::KERNEL_STACK_SIZE);
+    return !LOWER.present && !UPPER.present &&
+           audit_mapping_range(BASE, BASE + ker::mod::mm::KERNEL_STACK_SIZE, true, !kernel_nx_supported);
 }
 
 auto kernel_vmap_pending_free_pages() -> size_t {
@@ -5031,7 +5373,7 @@ auto kernel_vmap_alloc(PhysicalPageOwner owner, uint64_t size, std::string_view 
             break;
         }
         auto const PADDR = reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(frame)));
-        map_page(kernel_pagemap, VADDR, PADDR, paging::page_types::KERNEL);
+        map_page(kernel_pagemap, VADDR, PADDR, kernel_data_page_flags());
     }
 
     if (mapped_pages != PAGE_COUNT) {

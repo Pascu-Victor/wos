@@ -1,8 +1,10 @@
 #include "cpu.hpp"
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <platform/acpi/apic/apic.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/init/limine_requests.hpp>
@@ -10,8 +12,92 @@
 #include <util/hcf.hpp>
 
 extern "C" uint8_t wos_per_cpu_ready_state = 0;
+extern "C" uint8_t wos_smap_active = 0;
 
 namespace ker::mod::cpu {
+
+namespace {
+uint64_t kernel_stack_guard{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+alignas(PerCpu) std::byte bootstrap_per_cpu_storage[sizeof(PerCpu)]{};
+PerCpu* bootstrap_per_cpu_context{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<bool> supervisor_policy_ready{};
+SupervisorProtectionState supervisor_policy{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+__attribute__((no_stack_protector)) auto early_hardware_entropy(uint64_t& value) -> bool {
+    constexpr unsigned RETRIES = 64;
+    uint32_t max_leaf = 0;
+    uint32_t unused_b = 0;
+    uint32_t unused_c = 0;
+    uint32_t unused_d = 0;
+    asm volatile("cpuid" : "=a"(max_leaf), "=b"(unused_b), "=c"(unused_c), "=d"(unused_d) : "a"(0), "c"(0) : "memory");
+
+    bool has_rdseed = false;
+    bool has_rdrand = false;
+    if (max_leaf >= 1) {
+        uint32_t features_c = 0;
+        asm volatile("cpuid" : "=a"(unused_b), "=b"(unused_c), "=c"(features_c), "=d"(unused_d) : "a"(1), "c"(0) : "memory");
+        has_rdrand = (features_c & (uint32_t{1} << 30U)) != 0U;
+    }
+    if (max_leaf >= 7) {
+        uint32_t features_b = 0;
+        asm volatile("cpuid" : "=a"(unused_c), "=b"(features_b), "=c"(unused_d), "=d"(unused_b) : "a"(7), "c"(0) : "memory");
+        has_rdseed = (features_b & (uint32_t{1} << 18U)) != 0U;
+    }
+
+    for (unsigned attempt = 0; attempt < RETRIES; ++attempt) {
+        unsigned char ok = 0;
+        if (has_rdseed) {
+            asm volatile("rdseed %0; setc %1" : "=&r"(value), "=qm"(ok)::"memory");
+        }
+        if (ok == 0 && has_rdrand) {
+            asm volatile("rdrand %0; setc %1" : "=&r"(value), "=qm"(ok)::"memory");
+        }
+        if (ok != 0) {
+            return true;
+        }
+        asm volatile("pause" ::: "memory");
+    }
+    return false;
+}
+}  // namespace
+
+__attribute__((no_stack_protector)) auto stack_protector_guard() -> uint64_t { return kernel_stack_guard; }
+
+void initialize_stack_guard(PerCpu& per_cpu) { per_cpu.stack_guard = kernel_stack_guard; }
+
+extern "C" __attribute__((no_stack_protector)) auto wos_stack_protector_bootstrap() -> bool {
+    bootstrap_per_cpu_context = new (bootstrap_per_cpu_storage) PerCpu{};
+    auto const CONTEXT = reinterpret_cast<uint64_t>(bootstrap_per_cpu_context);
+    cpu_set_msr(IA32_GS_BASE, CONTEXT);
+    cpu_set_msr(IA32_KERNEL_GS_BASE, CONTEXT);
+
+    uint64_t guard = 0;
+    if (!early_hardware_entropy(guard)) {
+        return false;
+    }
+    guard &= ~uint64_t{0xff};
+    if (guard == 0) {
+        return false;
+    }
+    kernel_stack_guard = guard;
+    bootstrap_per_cpu_context->stack_guard = guard;
+    return true;
+}
+
+extern "C" __attribute__((no_stack_protector)) void wos_stack_protector_install_ap_bootstrap() {
+    auto const CONTEXT = reinterpret_cast<uint64_t>(bootstrap_per_cpu_context);
+    cpu_set_msr(IA32_GS_BASE, CONTEXT);
+    cpu_set_msr(IA32_KERNEL_GS_BASE, CONTEXT);
+}
+
+#ifdef WOS_SELFTEST
+[[gnu::noinline, clang::no_sanitize("address", "undefined", "coverage")]] void selftest_corrupt_stack_canary() {
+    volatile uint8_t protected_buffer[32]{};
+    asm volatile("" : : "r"(protected_buffer) : "memory");
+    asm volatile("movq $0, -8(%%rbp)" ::: "memory");
+    asm volatile("" : : "r"(protected_buffer) : "memory");
+}
+#endif
 
 [[clang::no_sanitize("coverage")]] auto get_current_cpu_id_safe() -> uint64_t {
     if (per_cpu_ready_flag_acquire()) {
@@ -54,6 +140,121 @@ void enable_pse() {
     cr4 |= 1 << 4;  // PSE
     wrcr4(cr4);
 }
+
+auto enable_nx() -> bool {
+    constexpr uint32_t EXTENDED_LEAF_MAX = 0x80000000U;
+    constexpr uint32_t EXTENDED_FEATURES = 0x80000001U;
+    constexpr uint32_t CPUID_NX = uint32_t{1} << 20U;
+    constexpr uint64_t EFER_NXE = uint64_t{1} << 11U;
+
+    CpuidContext max_leaf{};
+    max_leaf.function = static_cast<int>(EXTENDED_LEAF_MAX);
+    cpuid(&max_leaf);
+    if (static_cast<uint32_t>(max_leaf.eax) < EXTENDED_FEATURES) {
+        return false;
+    }
+
+    CpuidContext features{};
+    features.function = static_cast<int>(EXTENDED_FEATURES);
+    cpuid(&features);
+    if ((static_cast<uint32_t>(features.edx) & CPUID_NX) == 0U) {
+        return false;
+    }
+
+    uint64_t efer = 0;
+    cpu_get_msr(IA32_EFER, &efer);
+    cpu_set_msr(IA32_EFER, efer | EFER_NXE);
+    return true;
+}
+
+auto nx_enabled() -> bool {
+    constexpr uint64_t EFER_NXE = uint64_t{1} << 11U;
+    uint64_t efer = 0;
+    cpu_get_msr(IA32_EFER, &efer);
+    return (efer & EFER_NXE) != 0U;
+}
+
+void enable_write_protect() {
+    constexpr uint64_t CR0_WP = uint64_t{1} << 16U;
+    uint64_t cr0 = 0;
+    asm volatile("mov %%cr0, %0" : "=r"(cr0)::"memory");
+    cr0 |= CR0_WP;
+    asm volatile("mov %0, %%cr0" : : "r"(cr0) : "memory");
+}
+
+auto write_protect_enabled() -> bool {
+    constexpr uint64_t CR0_WP = uint64_t{1} << 16U;
+    uint64_t cr0 = 0;
+    asm volatile("mov %%cr0, %0" : "=r"(cr0)::"memory");
+    return (cr0 & CR0_WP) != 0U;
+}
+
+auto supervisor_protection_state() -> SupervisorProtectionState {
+    constexpr uint32_t BASIC_FEATURE_LEAF = 7;
+    constexpr uint32_t CPUID_SMEP = uint32_t{1} << 7U;
+    constexpr uint32_t CPUID_SMAP = uint32_t{1} << 20U;
+    constexpr uint64_t CR4_SMEP = uint64_t{1} << 20U;
+    constexpr uint64_t CR4_SMAP = uint64_t{1} << 21U;
+
+    CpuidContext max_leaf{};
+    max_leaf.function = 0;
+    cpuid(&max_leaf);
+    uint32_t features = 0;
+    if (static_cast<uint32_t>(max_leaf.eax) >= BASIC_FEATURE_LEAF) {
+        uint32_t eax = 0;
+        uint32_t ecx = 0;
+        uint32_t edx = 0;
+        asm volatile("cpuid" : "=a"(eax), "=b"(features), "=c"(ecx), "=d"(edx) : "a"(BASIC_FEATURE_LEAF), "c"(0) : "memory");
+    }
+    uint64_t cr4 = 0;
+    rdcr4(&cr4);
+    return {
+        .smep_supported = (features & CPUID_SMEP) != 0U,
+        .smep_enabled = (cr4 & CR4_SMEP) != 0U,
+        .smap_supported = (features & CPUID_SMAP) != 0U,
+        .smap_enabled = (cr4 & CR4_SMAP) != 0U,
+    };
+}
+
+auto enable_supervisor_protections() -> SupervisorProtectionState {
+    constexpr uint64_t CR4_SMEP = uint64_t{1} << 20U;
+    constexpr uint64_t CR4_SMAP = uint64_t{1} << 21U;
+    SupervisorProtectionState const SUPPORTED = supervisor_protection_state();
+
+    // Clear AC before SMAP becomes active. popfq is valid regardless of SMAP
+    // support, unlike executing CLAC on a CPU that lacks the instruction.
+    uint64_t flags = 0;
+    asm volatile("pushfq; pop %0" : "=r"(flags)::"memory");
+    flags &= ~(uint64_t{1} << 18U);
+    asm volatile("push %0; popfq" : : "r"(flags) : "cc", "memory");
+
+    uint64_t cr4 = 0;
+    rdcr4(&cr4);
+    if (SUPPORTED.smep_supported) {
+        cr4 |= CR4_SMEP;
+    }
+    if (SUPPORTED.smap_supported) {
+        cr4 |= CR4_SMAP;
+    }
+    wrcr4(cr4);
+    return supervisor_protection_state();
+}
+
+void publish_supervisor_protection_policy(const SupervisorProtectionState& state) {
+    supervisor_policy = state;
+    __atomic_store_n(&wos_smap_active, state.smap_enabled ? uint8_t{1} : uint8_t{0}, __ATOMIC_RELEASE);
+    supervisor_policy_ready.store(true, std::memory_order_release);
+}
+
+auto supervisor_protection_policy_matches(const SupervisorProtectionState& state) -> bool {
+    return supervisor_policy_ready.load(std::memory_order_acquire) && state.smep_supported == supervisor_policy.smep_supported &&
+           state.smep_enabled == supervisor_policy.smep_enabled && state.smap_supported == supervisor_policy.smap_supported &&
+           state.smap_enabled == supervisor_policy.smap_enabled;
+}
+
+auto smep_enabled() -> bool { return supervisor_protection_state().smep_enabled; }
+
+auto smap_enabled() -> bool { return supervisor_protection_state().smap_enabled; }
 
 void enable_fsgsbase() {
     uint64_t cr4 = 0;

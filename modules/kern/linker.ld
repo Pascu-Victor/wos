@@ -11,24 +11,32 @@ ENTRY(_start)
 PHDRS
 {
     headers PT_PHDR PHDRS;
-    text    PT_LOAD FILEHDR PHDRS;
-    rodata  PT_LOAD;
+    text    PT_LOAD FILEHDR PHDRS FLAGS(5); /* PF_R | PF_X */
+    rodata  PT_LOAD FLAGS(4);               /* PF_R */
     note    PT_NOTE FLAGS(4);
-    data    PT_LOAD;
+    data    PT_LOAD FLAGS(6);                /* PF_R | PF_W */
+    dynamic PT_DYNAMIC FLAGS(6);
 }
 
 SECTIONS
 {
-    /* We want to be placed in the topmost 2GiB of the address space, for optimisations */
-    /* and because that is what the Limine spec mandates. */
-    /* Any address in this region will do, but often 0xffffffff80000000 is chosen as */
-    /* that is the beginning of the region. */
-    /* Additionally, leave space for the ELF headers by adding SIZEOF_HEADERS to the */
-    /* base load address. */
-    . = 0xffffffff80000000 + SIZEOF_HEADERS;
+    /* A zero-based ET_DYN image lets Limine select a bounded higher-half slide. */
+    /* FILEHDR/PHDRS remain inside the first read/execute PT_LOAD, so the runtime */
+    /* image base is exactly the relocated value of __kernel_image_start. */
+    __kernel_link_base = 0;
+    . = SIZEOF_HEADERS;
+    PROVIDE(__kernel_image_start = . - SIZEOF_HEADERS);
 
     __kernel_text_start = .;
     .text : {
+        __kernel_init_start = .;
+        KEEP(*(.text.init .text.init.*))
+        __kernel_init_end = .;
+
+        __kernel_trampoline_start = .;
+        KEEP(*(.text.trampoline .text.trampoline.*))
+        __kernel_trampoline_end = .;
+
         *(.text .text.*)
     } :text
     __kernel_text_end = .;
@@ -36,14 +44,37 @@ SECTIONS
     /* Move to the next memory page for .rodata */
     . = ALIGN(CONSTANT(MAXPAGESIZE));
 
+    __kernel_rodata_start = .;
     .rodata : {
         *(.rodata .rodata.*)
     } :rodata
 
+    /* Compiler-generated sanitizer/KCFI metadata is immutable at runtime. */
+    __kernel_sanitizer_start = .;
+    .kcfi_traps : { *(.kcfi_traps) } :rodata
+    .sancov_guards : { *(.sancov_guards) } :rodata
+    __kernel_sanitizer_end = .;
+
+    __kernel_relocation_start = .;
+    .rela.dyn : {
+        *(.rela .rela.*)
+    } :rodata
+    .relr.dyn : {
+        *(.relr.dyn)
+    } :rodata
+    __kernel_relocation_end = .;
+
+    .dynsym : { *(.dynsym) } :rodata
+    .dynstr : { *(.dynstr) } :rodata
+    .gnu.hash : { *(.gnu.hash) } :rodata
+    .hash : { *(.hash) } :rodata
+
     /* Keep only the deterministic GNU build identity. Runtime image catalogs
      * consume its PT_NOTE to prove that host symbols match the live kernel. */
     .note.gnu.build-id : {
+        __kernel_build_id_start = .;
         KEEP(*(.note.gnu.build-id))
+        __kernel_build_id_end = .;
     } :rodata :note
 
     /* In-kernel self-test registry (populated by KTEST() macro, iterated by run_all()) */
@@ -59,10 +90,12 @@ SECTIONS
         KEEP(*(.ktests_final))
         __stop_ktests_final = .;
     } :rodata
+    __kernel_rodata_end = .;
 
     /* Move to the next memory page for .data */
     . = ALIGN(CONSTANT(MAXPAGESIZE));
 
+    __kernel_data_start = .;
     .data : {
         *(.data .data.*)
 
@@ -94,15 +127,32 @@ SECTIONS
         __fini_array_end = .;
     } :data
 
+    __kernel_dynamic_start = .;
+    .dynamic : {
+        *(.dynamic)
+    } :data :dynamic
+    __kernel_dynamic_end = .;
+
+    .got : {
+        *(.got .got.*)
+    } :data
+
     /* NOTE: .bss needs to be the last thing mapped to :data, otherwise lots of */
     /* unnecessary zeros will be written to the binary. */
     .bss : {
+        __kernel_bss_start = .;
+        . = ALIGN(CONSTANT(MAXPAGESIZE));
+        __kernel_emergency_stack_region_start = .;
+        KEEP(*(.bss.stack_chk_stack))
+        __kernel_emergency_stack_region_end = .;
         *(.bss .bss.*)
         *(COMMON)
+        __kernel_bss_end = .;
     } :data
 
     /* End of kernel image — page-aligned so MMIO regions can be mapped right after. */
     . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __kernel_data_end = .;
     PROVIDE(__kernel_end = .);
 
     /* Discard non-identity notes and .eh_frame* since they may cause issues on some hosts. */

@@ -26,9 +26,20 @@ constexpr uint64_t GATE_IF_MASK = 0x200;
 auto get_current_cpu_id_safe() -> uint64_t;
 auto is_per_cpu_ready() -> bool;
 void notify_per_cpu_ready();
+// A single entropy-backed guard is replicated into every kernel GS context.
+// Context-switch C frames can legitimately span a GS-base replacement, so a
+// per-task/per-CPU value would report false corruption on their epilogues.
+[[nodiscard]] __attribute__((no_stack_protector)) auto stack_protector_guard() -> uint64_t;
+void initialize_stack_guard(struct PerCpu& per_cpu);
+#ifdef WOS_SELFTEST
+void selftest_corrupt_stack_canary();
+#endif
 }  // namespace ker::mod::cpu
 
 extern "C" uint8_t wos_per_cpu_ready_state;
+extern "C" uint8_t wos_smap_active;
+extern "C" __attribute__((no_stack_protector)) auto wos_stack_protector_bootstrap() -> bool;
+extern "C" __attribute__((no_stack_protector)) void wos_stack_protector_install_ap_bootstrap();
 
 namespace ker::mod::cpu {
 
@@ -64,16 +75,18 @@ struct GPRegs {
 static_assert(sizeof(GPRegs) == 120, "GPRegs interrupt frame ABI size changed");  // NOLINT
 
 struct PerCpu {
-    uint64_t syscall_stack;      // 0x00
-    uint64_t user_rsp;           // 0x08 - saved user RSP at syscall entry
-    uint64_t cpu_id;             // 0x10
-    uint64_t saved_ds;           // 0x18 - saved DS segment
-    uint64_t saved_es;           // 0x20 - saved ES segment
-    uint64_t syscall_ret_rip;    // 0x28 - RCX at syscall entry (return RIP)
-    uint64_t syscall_ret_flags;  // 0x30 - R11 at syscall entry (RFLAGS)
-    uint64_t syscall_entry_tmp;  // 0x38 - scratch before syscall stack switch
-} __attribute__((packed));       // NOLINT(cppcoreguidelines-pro-type-member-init): accessed by fixed GS offsets in asm.
-static_assert(sizeof(PerCpu) == 64, "PerCpu syscall/interrupt ABI size changed");  // NOLINT
+    uint64_t syscall_stack;                          // 0x00
+    uint64_t user_rsp;                               // 0x08 - saved user RSP at syscall entry
+    uint64_t cpu_id;                                 // 0x10
+    uint64_t saved_ds;                               // 0x18 - saved DS segment
+    uint64_t saved_es;                               // 0x20 - saved ES segment
+    uint64_t syscall_ret_rip;                        // 0x28 - RCX at syscall entry (return RIP)
+    uint64_t syscall_ret_flags;                      // 0x30 - R11 at syscall entry (RFLAGS)
+    uint64_t syscall_entry_tmp;                      // 0x38 - scratch before syscall stack switch
+    uint64_t stack_guard = stack_protector_guard();  // 0x40 - compiler stack protector guard
+} __attribute__((packed));                           // NOLINT(cppcoreguidelines-pro-type-member-init): accessed by fixed GS offsets in asm.
+static_assert(offsetof(PerCpu, stack_guard) == 64, "PerCpu stack guard GS offset changed");
+static_assert(sizeof(PerCpu) == 72, "PerCpu syscall/interrupt ABI size changed");  // NOLINT
 
 static ALWAYS_INLINE auto rdfsbase() -> uint64_t {
     // Written by inline asm output constraints.
@@ -105,6 +118,33 @@ static ALWAYS_INLINE void rdcr4(uint64_t* val) { asm volatile("mov %%cr4, %0" : 
 
 void enable_pae();
 void enable_pse();
+// Enables EFER.NXE when the architectural CPUID bit is present. This is safe
+// before the IDT, heap, and per-CPU storage exist and must run before loading a
+// page table containing PAGE_NX leaves.
+[[nodiscard]] auto enable_nx() -> bool;
+[[nodiscard]] auto nx_enabled() -> bool;
+void enable_write_protect();
+[[nodiscard]] auto write_protect_enabled() -> bool;
+
+struct SupervisorProtectionState {
+    bool smep_supported{};
+    bool smep_enabled{};
+    bool smap_supported{};
+    bool smap_enabled{};
+};
+
+// Detect and enable SMEP/SMAP on the current CPU. Unsupported features remain
+// disabled and are reported in the returned state; a supported feature that
+// fails to latch is a fatal CPU-policy mismatch at the caller.
+[[nodiscard]] auto enable_supervisor_protections() -> SupervisorProtectionState;
+[[nodiscard]] auto supervisor_protection_state() -> SupervisorProtectionState;
+// The BSP publishes one system-wide policy before releasing APs. APs must
+// match it exactly; the interrupt entry assembly consumes the published SMAP
+// bit and therefore cannot tolerate heterogeneous per-CPU policy.
+void publish_supervisor_protection_policy(const SupervisorProtectionState& state);
+[[nodiscard]] auto supervisor_protection_policy_matches(const SupervisorProtectionState& state) -> bool;
+[[nodiscard]] auto smep_enabled() -> bool;
+[[nodiscard]] auto smap_enabled() -> bool;
 void enable_sse();
 void enable_fsgsbase();
 

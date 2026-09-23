@@ -4,6 +4,7 @@
 #include <extern/limine.h>
 
 #include <cstdint>
+#include <platform/asm/cpu.hpp>
 #include <platform/init/init_executor.hpp>
 
 #include "platform/init/limine_requests.hpp"
@@ -70,7 +71,13 @@ void global_ctors_init() {
 __attribute__((used, section(".requests"))) volatile uint64_t limine_base_revision[] = LIMINE_BASE_REVISION(6);
 
 // Kernel entry point.
-extern "C" [[noreturn]] void _start(void) {  // NOLINT(readability-identifier-naming): Linker entry-point ABI.
+// NOLINTNEXTLINE(readability-identifier-naming): Linker entry-point ABI.
+extern "C" [[noreturn]] __attribute__((no_stack_protector, section(".text.init"))) void _start(void) {
+    if (!wos_stack_protector_bootstrap()) {
+        while (true) {
+            asm volatile("cli; hlt");
+        }
+    }
     // Check limine protocol support
     if (LIMINE_BASE_REVISION_SUPPORTED(limine_base_revision) == 0) {
         while (true) {

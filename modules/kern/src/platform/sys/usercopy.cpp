@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstring>
 
+#include "platform/asm/cpu.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/virt.hpp"
 #include "platform/sched/task.hpp"
@@ -10,6 +11,8 @@
 
 namespace ker::mod::sys::usercopy {
 namespace {
+
+constexpr uint64_t RFLAGS_AC = uint64_t{1} << 18U;
 
 [[nodiscard]] auto copy_chunk(size_t remaining, uint64_t user_addr) -> size_t {
     uint64_t const PAGE_OFFSET = user_addr & (mm::paging::PAGE_SIZE - 1);
@@ -35,8 +38,11 @@ namespace {
         if (!pin_task_user_page(task, CUR, true, fault_in, pin)) {
             return {.bytes_copied = copied, .fault = true};
         }
-        auto* dst = static_cast<uint8_t*>(pin.kernel_address());
-        ker::util::copy_fast(dst, in + copied, CHUNK);
+        {
+            UserAccessGuard const ACCESS{};
+            auto* dst = static_cast<uint8_t*>(pin.kernel_address());
+            ker::util::copy_fast(dst, in + copied, CHUNK);
+        }
         if (!pin.commit_write()) {
             return {.bytes_copied = copied, .fault = true};
         }
@@ -46,6 +52,36 @@ namespace {
 }
 
 }  // namespace
+
+UserAccessGuard::UserAccessGuard() {
+    asm volatile("pushfq; pop %0; cli" : "=r"(m_flags)::"memory");
+    m_smap = cpu::smap_enabled();
+    if (m_smap) {
+        asm volatile("stac" ::: "cc", "memory");
+    }
+}
+
+UserAccessGuard::~UserAccessGuard() {
+    if (m_smap) {
+        if ((m_flags & RFLAGS_AC) != 0U) {
+            asm volatile("stac" ::: "cc", "memory");
+        } else {
+            asm volatile("clac" ::: "cc", "memory");
+        }
+    }
+    if ((m_flags & cpu::GATE_IF_MASK) != 0U) {
+        asm volatile("sti" ::: "memory");
+    }
+}
+
+auto access_window_active() -> bool {
+    if (!cpu::smap_enabled()) {
+        return true;
+    }
+    uint64_t flags = 0;
+    asm volatile("pushfq; pop %0" : "=r"(flags)::"memory");
+    return (flags & RFLAGS_AC) != 0U;
+}
 
 StableUserPage::~StableUserPage() { reset(); }
 
@@ -163,8 +199,11 @@ auto ensure_writable(sched::task::Task& task, uint64_t user_addr, size_t size) -
         if (!pin_task_user_page(task, CUR, false, fault_in, pin)) {
             return {.bytes_copied = copied, .fault = true};
         }
-        auto const* src = static_cast<const uint8_t*>(pin.kernel_address());
-        ker::util::copy_fast(out + copied, src, CHUNK);
+        {
+            UserAccessGuard const ACCESS{};
+            auto const* src = static_cast<const uint8_t*>(pin.kernel_address());
+            ker::util::copy_fast(out + copied, src, CHUNK);
+        }
         if (!pin.still_mapped()) {
             return {.bytes_copied = copied, .fault = true};
         }

@@ -49,8 +49,6 @@ constexpr uint64_t X86_DR7_RW_MASK = 0x3;
 constexpr uint64_t X86_DR7_RESERVED_ONES = 1ULL << 10;
 constexpr uint64_t PTRACE_O_TRACESYSGOOD = 0x00000001;
 constexpr uint32_t WOS_SIGSYS = 31;
-constexpr uint64_t KERNEL_STACK_MIN = 0xffff800000000000ULL;
-constexpr uint64_t KERNEL_STACK_MAX = 0xffff900000000000ULL;
 
 auto as_error(int err) -> uint64_t { return static_cast<uint64_t>(-err); }
 
@@ -177,11 +175,14 @@ auto copy_prepared_task_memory(Task& target, uint64_t target_addr, void* kernel_
         if (!ker::mod::sys::usercopy::pin_task_user_page(target, CUR, write_target, false, pin)) {
             break;
         }
-        auto* hhdm = static_cast<uint8_t*>(pin.kernel_address());
-        if (write_target) {
-            std::memcpy(hhdm, bytes + done, CHUNK);
-        } else {
-            std::memcpy(bytes + done, hhdm, CHUNK);
+        {
+            ker::mod::sys::usercopy::UserAccessGuard const ACCESS{};
+            auto* hhdm = static_cast<uint8_t*>(pin.kernel_address());
+            if (write_target) {
+                std::memcpy(hhdm, bytes + done, CHUNK);
+            } else {
+                std::memcpy(bytes + done, hhdm, CHUNK);
+            }
         }
         bool const COMMITTED = write_target ? pin.commit_write() : pin.still_mapped();
         if (!COMMITTED) {
@@ -233,9 +234,12 @@ auto write_prepared_task_word(Task& target, uint64_t target_addr, uint64_t word,
     }
 
     auto const* bytes = reinterpret_cast<const uint8_t*>(&word);
-    std::memcpy(first_page.kernel_address(), bytes, FIRST_SIZE);
-    if (second_page.valid()) {
-        std::memcpy(second_page.kernel_address(), bytes + FIRST_SIZE, sizeof(word) - FIRST_SIZE);
+    {
+        ker::mod::sys::usercopy::UserAccessGuard const ACCESS{};
+        std::memcpy(first_page.kernel_address(), bytes, FIRST_SIZE);
+        if (second_page.valid()) {
+            std::memcpy(second_page.kernel_address(), bytes + FIRST_SIZE, sizeof(word) - FIRST_SIZE);
+        }
     }
     // Both halves were written through HHDM aliases. Commit each leaf even if
     // the other half raced an invalidation so every still-live mapping gets
@@ -252,7 +256,7 @@ auto write_task_word(Task& target, uint64_t target_addr, uint64_t word, const ke
 
 auto is_user_canonical(uint64_t value) -> bool { return value != 0 && value < 0x0000'8000'0000'0000ULL; }
 
-auto is_kernel_stack(uint64_t value) -> bool { return value >= KERNEL_STACK_MIN && value < KERNEL_STACK_MAX; }
+auto is_kernel_stack(uint64_t value) -> bool { return ker::mod::mm::is_kernel_stack_address(value); }
 
 auto stack_region_contains(const Task& target, uint64_t addr, size_t size) -> bool {
     if (!is_kernel_stack(target.context.syscall_kernel_stack) || size == 0) {
@@ -909,7 +913,7 @@ auto read_runtime_image_memory(void* opaque, uint64_t address, void* destination
 
 auto snapshot_target_images(Task& target, const ker::mod::security::Snapshot& admitted_target,
                             std::array<ker::loader::runtime::RuntimeImage, ker::loader::runtime::MAX_IMAGES>& runtime_images,
-                            size_t& needed, ker::loader::runtime::SnapshotStatus& status) -> bool {
+                            size_t& needed, ker::loader::runtime::SnapshotStatus& status, bool include_kernel) -> bool {
     // Match exec/fork/mmap publication so the kernel-owned extents and every
     // target-memory read describe one address space.
     ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
@@ -932,6 +936,10 @@ auto snapshot_target_images(Task& target, const ker::mod::security::Snapshot& ad
         .interpreter_path = "/lib/ld.so",
     };
     status = ker::loader::runtime::snapshot_images(read_runtime_image_memory, &target, SOURCE, runtime_images, needed);
+    if (include_kernel && !ker::loader::runtime::append_kernel_image(runtime_images, needed)) {
+        status = needed >= runtime_images.size() ? ker::loader::runtime::SnapshotStatus::TRUNCATED
+                                                 : ker::loader::runtime::SnapshotStatus::INCONSISTENT;
+    }
     return true;
 }
 
@@ -948,7 +956,8 @@ auto list_images(Task& tracer, Task& target, uint64_t data, const ker::mod::secu
     }
     size_t needed = 0;
     auto status = ker::loader::runtime::SnapshotStatus::UNAVAILABLE;
-    if (!snapshot_target_images(target, admitted_target, *runtime_images, needed, status)) {
+    bool const INCLUDE_KERNEL = tracer.credentials().allows(ker::mod::security::Authority::KERNEL_DEBUG);
+    if (!snapshot_target_images(target, admitted_target, *runtime_images, needed, status, INCLUDE_KERNEL)) {
         delete runtime_images;
         return as_error(EPERM);
     }
@@ -1011,7 +1020,8 @@ auto list_image_catalog(Task& tracer, Task& target, uint64_t data, const ker::mo
     }
     size_t needed = 0;
     auto status = ker::loader::runtime::SnapshotStatus::UNAVAILABLE;
-    if (!snapshot_target_images(target, admitted_target, *runtime_images, needed, status)) {
+    bool const INCLUDE_KERNEL = tracer.credentials().allows(ker::mod::security::Authority::KERNEL_DEBUG);
+    if (!snapshot_target_images(target, admitted_target, *runtime_images, needed, status, INCLUDE_KERNEL)) {
         delete runtime_images;
         return as_error(EPERM);
     }
@@ -1908,12 +1918,19 @@ auto ptrace_selftest_image_snapshot_rejects_changed_credentials() -> bool {
     Snapshot changed;
     bool ok = ROOT.prepare({.change = Change::SET_DUMPABLE, .dumpable = !ROOT.dumpable()}, changed) == 0 &&
               ker::mod::sched::resource::initialize_credentials(target, changed) == 0;
-    ok = ok && !snapshot_target_images(target, admitted, *images, needed, status) && needed == 17 &&
+    ok = ok && !snapshot_target_images(target, admitted, *images, needed, status, true) && needed == 17 &&
          status == runtime::SnapshotStatus::TRUNCATED && images->front().entry == 0x1234 && images->back().entry == 0x5678;
-    // A fresh permitted decision may capture the current image. An empty
-    // private Task has no interpreter or image extents: an empty static result.
-    ok = ok && require_traced(tracer, target, &admitted) == 0 && snapshot_target_images(target, admitted, *images, needed, status) &&
+    // An empty private Task has no userspace image extents. Unprivileged
+    // catalogs must not disclose the KASLR slide; a KERNEL_DEBUG tracer gets
+    // the authenticated kernel record used by debugserver and WOSDBG.
+    needed = 0;
+    status = runtime::SnapshotStatus::UNAVAILABLE;
+    ok = ok && require_traced(tracer, target, &admitted) == 0 && snapshot_target_images(target, admitted, *images, needed, status, false) &&
          needed == 0 && status == runtime::SnapshotStatus::STATIC_IMAGE;
+    needed = 0;
+    status = runtime::SnapshotStatus::UNAVAILABLE;
+    ok = ok && snapshot_target_images(target, admitted, *images, needed, status, true) && needed == 1 &&
+         status == runtime::SnapshotStatus::STATIC_IMAGE && (images->at(0).flags & runtime::IMAGE_KERNEL) != 0U;
     delete images;
     return ok;
 }

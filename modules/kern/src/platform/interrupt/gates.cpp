@@ -9,6 +9,8 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/debug/ptrace.hpp>
 #include <platform/ktime/ktime.hpp>
+#include <platform/mm/mm.hpp>
+#include <platform/mm/kernel_image.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -39,8 +41,6 @@ constexpr size_t INTERRUPT_VECTOR_COUNT = 256;
 constexpr uint8_t DYNAMIC_VECTOR_BEGIN = 48;
 constexpr uint64_t HHDM_BEGIN = 0xffff800000000000ULL;
 constexpr uint64_t HHDM_END = 0xffff900000000000ULL;
-constexpr uint64_t KERNEL_STATIC_BEGIN = 0xffffffff80000000ULL;
-constexpr uint64_t KERNEL_STATIC_END = 0xffffffffc0000000ULL;
 constexpr uint64_t PAGE_TABLE_BASE_MASK = ~((uint64_t{1} << ker::mod::mm::paging::PAGE_SHIFT) - 1U);
 constexpr uint32_t IRQ_SLOW_TRACE_US = 30;
 constexpr uint16_t IRQ_KIND_CONTEXT = 1;
@@ -113,8 +113,9 @@ void wait_for_irq_context_readers(IrqContext& context) {
     }
 }
 
-[[nodiscard]] constexpr auto is_kernel_pointer_range(uintptr_t addr) -> bool {
-    return (addr >= HHDM_BEGIN && addr < HHDM_END) || (addr >= KERNEL_STATIC_BEGIN && addr < KERNEL_STATIC_END);
+[[nodiscard]] auto is_kernel_pointer_range(uintptr_t addr) -> bool {
+    return (addr >= HHDM_BEGIN && addr < HHDM_END) || ker::mod::mm::is_kernel_stack_address(addr) ||
+           ker::mod::mm::kernel_image::contains(addr);
 }
 
 void log_userfault_lazy_vmem_ranges(ker::mod::sched::task::Task* task, uint64_t cr2) {

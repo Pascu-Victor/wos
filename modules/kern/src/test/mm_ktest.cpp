@@ -4,7 +4,9 @@
 #include <cstring>
 #include <iterator>
 #include <platform/asm/cpu.hpp>
+#include <platform/loader/runtime_images.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/kernel_image.hpp>
 #include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
@@ -23,11 +25,93 @@ namespace smt = ker::mod::smt;
 namespace virt = ker::mod::mm::virt;
 namespace mm = ker::mod::mm;
 namespace usercopy = ker::mod::sys::usercopy;
+namespace runtime_images = ker::loader::runtime;
 
 namespace {
 
 constexpr uintptr_t PAGE_ALIGNMENT_MASK = 0xFFFULL;
 constexpr uint64_t NON_RAM_TEST_PHYS = (1ULL << 52) - paging::PAGE_SIZE;
+constexpr uint64_t PAGE_FAULT_ERROR_MASK = 0x7FULL;
+
+extern "C" {
+extern char wos_selftest_text_write_target[];      // NOLINT(readability-identifier-naming)
+extern char wos_selftest_text_write_fault[];       // NOLINT(readability-identifier-naming)
+extern char wos_selftest_text_write_recovery[];    // NOLINT(readability-identifier-naming)
+extern char wos_selftest_data_execute_recovery[];  // NOLINT(readability-identifier-naming)
+extern char wos_selftest_guard_write_fault[];      // NOLINT(readability-identifier-naming)
+extern char wos_selftest_guard_write_recovery[];   // NOLINT(readability-identifier-naming)
+extern char wos_selftest_user_read_fault[];        // NOLINT(readability-identifier-naming)
+extern char wos_selftest_user_read_recovery[];     // NOLINT(readability-identifier-naming)
+}
+
+alignas(paging::PAGE_SIZE) std::array<uint8_t, paging::PAGE_SIZE> kernel_nx_probe_page{0xC3};
+
+class InterruptMaskGuard {
+   public:
+    InterruptMaskGuard() { asm volatile("pushfq; pop %0; cli" : "=r"(flags) : : "memory"); }
+    ~InterruptMaskGuard() {
+        if ((flags & cpu::GATE_IF_MASK) != 0U) {
+            asm volatile("sti" ::: "memory");
+        }
+    }
+
+    InterruptMaskGuard(const InterruptMaskGuard&) = delete;
+    auto operator=(const InterruptMaskGuard&) -> InterruptMaskGuard& = delete;
+
+   private:
+    uint64_t flags{};
+};
+
+__attribute__((noinline)) void probe_kernel_text_write() {
+    asm volatile(
+        ".global wos_selftest_text_write_target\n"
+        "wos_selftest_text_write_target:\n"
+        "nop\n"
+        "lea wos_selftest_text_write_target(%%rip), %%rax\n"
+        ".global wos_selftest_text_write_fault\n"
+        "wos_selftest_text_write_fault:\n"
+        "movb $0x90, (%%rax)\n"
+        ".global wos_selftest_text_write_recovery\n"
+        "wos_selftest_text_write_recovery:\n"
+        :
+        :
+        : "rax", "memory");
+}
+
+__attribute__((noinline)) void probe_kernel_data_execute() {
+    auto* target = kernel_nx_probe_page.data();
+    asm volatile(
+        "jmp *%0\n"
+        ".global wos_selftest_data_execute_recovery\n"
+        "wos_selftest_data_execute_recovery:\n"
+        :
+        : "r"(target)
+        : "memory");
+}
+
+__attribute__((noinline)) void probe_kernel_guard_write(void* target) {
+    asm volatile(
+        ".global wos_selftest_guard_write_fault\n"
+        "wos_selftest_guard_write_fault:\n"
+        "movb $0xa5, (%0)\n"
+        ".global wos_selftest_guard_write_recovery\n"
+        "wos_selftest_guard_write_recovery:\n"
+        :
+        : "r"(target)
+        : "memory");
+}
+
+__attribute__((noinline)) void probe_direct_user_read(const void* target) {
+    asm volatile(
+        ".global wos_selftest_user_read_fault\n"
+        "wos_selftest_user_read_fault:\n"
+        "movb (%0), %%al\n"
+        ".global wos_selftest_user_read_recovery\n"
+        "wos_selftest_user_read_recovery:\n"
+        :
+        : "r"(target)
+        : "rax", "memory");
+}
 
 auto is_page_aligned(const void* ptr) -> bool { return (reinterpret_cast<uintptr_t>(ptr) & PAGE_ALIGNMENT_MASK) == 0; }
 
@@ -187,6 +271,134 @@ KTEST(MM, PageAllocWriteReadback) {
     phys::page_free(page);
 }
 
+KTEST(MM, KernelProtectionPtesMatchDeclaredPolicy) {
+    virt::KernelProtectionAudit const AUDIT = virt::audit_kernel_protections();
+    KEXPECT_TRUE(AUDIT.layout_valid);
+    KEXPECT_TRUE(AUDIT.write_protect_active);
+    KEXPECT_TRUE(AUDIT.text_readonly);
+    KEXPECT_TRUE(AUDIT.text_executable);
+    KEXPECT_TRUE(AUDIT.rodata_readonly);
+    KEXPECT_TRUE(AUDIT.data_writable);
+    KEXPECT_TRUE(AUDIT.emergency_stack_guarded);
+    KEXPECT_TRUE(AUDIT.direct_alias_readonly);
+    KEXPECT_EQ(AUDIT.nx_active, AUDIT.nx_supported);
+    if (AUDIT.nx_supported) {
+        KEXPECT_TRUE(AUDIT.rodata_non_executable);
+        KEXPECT_TRUE(AUDIT.data_non_executable);
+        KEXPECT_TRUE(AUDIT.direct_alias_non_executable);
+        KEXPECT_TRUE(AUDIT.enforced());
+    }
+}
+
+KTEST(MM, KernelTextWriteRaisesProtectionFault) {
+    InterruptMaskGuard const INTERRUPTS_MASKED{};
+    constexpr uint64_t EXPECTED_ERROR = (uint64_t{1} << paging::error_flags::PRESENT) | (uint64_t{1} << paging::error_flags::WRITE);
+    KREQUIRE_TRUE(virt::selftest_arm_expected_kernel_page_fault(
+        reinterpret_cast<uintptr_t>(wos_selftest_text_write_target), reinterpret_cast<uintptr_t>(wos_selftest_text_write_fault),
+        reinterpret_cast<uintptr_t>(wos_selftest_text_write_recovery), EXPECTED_ERROR, PAGE_FAULT_ERROR_MASK));
+    probe_kernel_text_write();
+    KEXPECT_TRUE(virt::selftest_finish_expected_kernel_page_fault());
+}
+
+KTEST(MM, KernelDataExecuteRaisesNxFault) {
+    virt::KernelProtectionAudit const AUDIT = virt::audit_kernel_protections();
+    if (!AUDIT.nx_supported) {
+        return;
+    }
+    InterruptMaskGuard const INTERRUPTS_MASKED{};
+    constexpr uint64_t EXPECTED_ERROR = (uint64_t{1} << paging::error_flags::PRESENT) | (uint64_t{1} << paging::error_flags::FETCH);
+    auto const TARGET = reinterpret_cast<uintptr_t>(kernel_nx_probe_page.data());
+    KREQUIRE_TRUE(virt::selftest_arm_expected_kernel_page_fault(
+        TARGET, TARGET, reinterpret_cast<uintptr_t>(wos_selftest_data_execute_recovery), EXPECTED_ERROR, PAGE_FAULT_ERROR_MASK));
+    probe_kernel_data_execute();
+    KEXPECT_TRUE(virt::selftest_finish_expected_kernel_page_fault());
+}
+
+KTEST(MM, KernelStacksHaveUnmappedGuards) {
+    void* stack = phys::kernel_stack_alloc("guarded_stack_ktest");
+    KREQUIRE_NE(stack, nullptr);
+    KEXPECT_TRUE(virt::audit_guarded_kernel_stack(stack));
+
+    InterruptMaskGuard const INTERRUPTS_MASKED{};
+    auto const GUARD = reinterpret_cast<uintptr_t>(stack) - paging::PAGE_SIZE;
+    constexpr uint64_t EXPECTED_ERROR = uint64_t{1} << paging::error_flags::WRITE;
+    KREQUIRE_TRUE(virt::selftest_arm_expected_kernel_page_fault(GUARD, reinterpret_cast<uintptr_t>(wos_selftest_guard_write_fault),
+                                                                reinterpret_cast<uintptr_t>(wos_selftest_guard_write_recovery),
+                                                                EXPECTED_ERROR, PAGE_FAULT_ERROR_MASK));
+    probe_kernel_guard_write(reinterpret_cast<void*>(GUARD));
+    KEXPECT_TRUE(virt::selftest_finish_expected_kernel_page_fault());
+    phys::page_free(stack);
+}
+
+KTEST(MM, KernelStackCanaryIsEntropyBackedAndGsResident) {
+    uint64_t gs_guard = 0;
+    asm volatile("mov %%gs:0x40, %0" : "=r"(gs_guard)::"memory");
+    KEXPECT_NE(gs_guard, 0U);
+    KEXPECT_EQ(gs_guard & 0xffU, 0U);
+    KEXPECT_EQ(gs_guard, cpu::stack_protector_guard());
+}
+
+KTEST(MM, SupervisorProtectionPolicyMatchesCpuState) {
+    cpu::SupervisorProtectionState const STATE = cpu::supervisor_protection_state();
+    KEXPECT_EQ(STATE.smep_enabled, STATE.smep_supported);
+    KEXPECT_EQ(STATE.smap_enabled, STATE.smap_supported);
+    KEXPECT_TRUE(cpu::supervisor_protection_policy_matches(STATE));
+}
+
+KTEST(MM, UserAccessWindowNestsAndRestoresAc) {
+    if (!cpu::smap_enabled()) {
+        return;
+    }
+    KEXPECT_FALSE(usercopy::access_window_active());
+    {
+        usercopy::UserAccessGuard const OUTER{};
+        KEXPECT_TRUE(usercopy::access_window_active());
+        {
+            usercopy::UserAccessGuard const INNER{};
+            KEXPECT_TRUE(usercopy::access_window_active());
+        }
+        KEXPECT_TRUE(usercopy::access_window_active());
+    }
+    KEXPECT_FALSE(usercopy::access_window_active());
+}
+
+KTEST(MM, DirectUserDereferenceRaisesSmapFault) {
+    if (!cpu::smap_enabled()) {
+        return;
+    }
+    constexpr uint64_t USER_VADDR = 0x0000400000000000ULL;
+    auto* root = virt::create_pagemap();
+    KREQUIRE_NE(root, nullptr);
+    auto* kernel_root = virt::get_kernel_pagemap();
+    KREQUIRE_NE(kernel_root, nullptr);
+    for (size_t index = 256; index < root->entries.size(); ++index) {
+        root->entries.at(index) = kernel_root->entries.at(index);
+    }
+    void* backing = alloc_test_pages();
+    KREQUIRE_NE(backing, nullptr);
+    virt::map_page(root, USER_VADDR, phys_addr_of(backing), paging::page_types::USER);
+
+    InterruptMaskGuard const INTERRUPTS_MASKED{};
+    uint64_t original_cr3 = 0;
+    asm volatile("mov %%cr3, %0" : "=r"(original_cr3)::"memory");
+    uint64_t const TEST_CR3 = phys_addr_of(root);
+    asm volatile("mov %0, %%cr3" : : "r"(TEST_CR3) : "memory");
+    constexpr uint64_t EXPECTED_ERROR = uint64_t{1} << paging::error_flags::PRESENT;
+    constexpr uint64_t ERROR_MASK = uint64_t{1} << paging::error_flags::PRESENT;
+    bool const ARMED = virt::selftest_arm_expected_kernel_page_fault(USER_VADDR, reinterpret_cast<uintptr_t>(wos_selftest_user_read_fault),
+                                                                     reinterpret_cast<uintptr_t>(wos_selftest_user_read_recovery),
+                                                                     EXPECTED_ERROR, ERROR_MASK);
+    if (ARMED) {
+        probe_direct_user_read(reinterpret_cast<const void*>(USER_VADDR));
+    }
+    bool const HANDLED = ARMED && virt::selftest_finish_expected_kernel_page_fault();
+    asm volatile("mov %0, %%cr3" : : "r"(original_cr3) : "memory");
+
+    virt::unmap_page(root, USER_VADDR);
+    virt::release_pagemap(root);
+    KEXPECT_TRUE(HANDLED);
+}
+
 KTEST(MM, InternalReservationCarveoutPreservesPageAlignment) {
     KEXPECT_TRUE(phys::selftest_internal_reservation_carveout_preserves_page_alignment());
 }
@@ -320,8 +532,11 @@ KTEST(MM, UserPagePinSurvivesUnmapAndRejectsUnsafeLeaves) {
     virt::unmap_page(root, WRITABLE_VADDR);
     KEXPECT_EQ(phys::page_ref_get(writable), 1U);
     KEXPECT_FALSE(virt::user_page_pin_still_mapped(pin));
-    static_cast<uint8_t*>(pin.hhdm_page)[0] = 0xA5;
-    KEXPECT_EQ(static_cast<uint8_t*>(pin.hhdm_page)[0], 0xA5);
+    {
+        usercopy::UserAccessGuard const ACCESS{};
+        static_cast<uint8_t*>(pin.hhdm_page)[0] = 0xA5;
+        KEXPECT_EQ(static_cast<uint8_t*>(pin.hhdm_page)[0], 0xA5);
+    }
     virt::unpin_user_page(pin);
     KEXPECT_EQ(phys::page_ref_get(writable), 0U);
 
@@ -1376,4 +1591,40 @@ KTEST(MM, FileSyncPreflightsEveryRangeBeforeWriting) {
     tree.pml2->entries.at(2) = entry_for_page(tree.pml1);
     KEXPECT_TRUE(ker::syscall::vmem::selftest_file_mmap_sync_preflight(tree.root));
     cleanup_test_user_tree(tree);
+}
+
+KTEST(MM, RelocatedKernelCatalogAndRawDebuggerMetadataAreExact) {
+    std::array<runtime_images::RuntimeImage, runtime_images::MAX_IMAGES> images{};
+    size_t count = 0;
+    KREQUIRE_TRUE(runtime_images::append_kernel_image(images, count));
+    KREQUIRE_EQ(count, 1U);
+
+    auto const LAYOUT = ker::mod::mm::kernel_image::layout();
+    auto const& IMAGE = images.at(0);
+    KEXPECT_EQ(IMAGE.load_base, LAYOUT.load_base);
+    KEXPECT_EQ(IMAGE.image_start, LAYOUT.load_base);
+    KEXPECT_EQ(IMAGE.image_end, LAYOUT.image_end);
+    KEXPECT_EQ(IMAGE.text_start, LAYOUT.text_start);
+    KEXPECT_EQ(IMAGE.text_end, LAYOUT.text_end);
+    KEXPECT_EQ(IMAGE.dynamic_addr, LAYOUT.dynamic_start);
+    KEXPECT_TRUE((IMAGE.flags & runtime_images::IMAGE_KERNEL) != 0U);
+    KEXPECT_TRUE((IMAGE.flags & runtime_images::IMAGE_EXACT_MAPPING) != 0U);
+    KEXPECT_TRUE((IMAGE.flags & runtime_images::IMAGE_BUILD_ID_PRESENT) != 0U);
+    KEXPECT_TRUE(IMAGE.build_id_size > 0U);
+
+    auto const* const METADATA = reinterpret_cast<const wos::abi::KernelDebugMetadata*>(wos::abi::KERNEL_DEBUG_METADATA_ADDRESS);
+    KEXPECT_EQ(METADATA->magic, wos::abi::KERNEL_DEBUG_METADATA_MAGIC);
+    KEXPECT_EQ(METADATA->version, wos::abi::KERNEL_DEBUG_METADATA_VERSION);
+    KEXPECT_EQ(METADATA->size, static_cast<uint32_t>(sizeof(*METADATA)));
+    KEXPECT_EQ(METADATA->load_base, IMAGE.load_base);
+    KEXPECT_EQ(METADATA->image_end, IMAGE.image_end);
+    KEXPECT_EQ(METADATA->text_start, IMAGE.text_start);
+    KEXPECT_EQ(METADATA->text_end, IMAGE.text_end);
+    KEXPECT_EQ(METADATA->entry, IMAGE.entry);
+    KEXPECT_EQ(METADATA->dynamic_addr, IMAGE.dynamic_addr);
+    KEXPECT_EQ(METADATA->build_id_size, IMAGE.build_id_size);
+    KEXPECT_EQ(std::memcmp(METADATA->build_id, IMAGE.build_id.data(), IMAGE.build_id_size), 0);
+    auto const AUDIT = virt::audit_kernel_protections();
+    KEXPECT_TRUE(AUDIT.debug_metadata_readonly);
+    KEXPECT_TRUE(AUDIT.debug_metadata_non_executable);
 }

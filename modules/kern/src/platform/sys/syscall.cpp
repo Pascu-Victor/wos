@@ -254,7 +254,7 @@ void init() {
     uint64_t efer = 0;
     cpu_get_msr(IA32_EFER, &efer);
     cpu_set_msr(IA32_EFER, efer | (1 << 0));                                                      // Enable syscall/sysret
-    cpu_set_msr(IA32_FMASK, (1 << 9) | (1 << 8));                                                 // clear IF and TF
+    cpu_set_msr(IA32_FMASK, (1 << 18) | (1 << 9) | (1 << 8));                                     // clear AC, IF, and TF
     uint64_t const KERN_CS = desc::gdt::GDT_ENTRY_KERNEL_CODE * 8;                                // Kernel CS
     uint64_t const USER_CS = ((desc::gdt::GDT_ENTRY_USER_CODE * 8) | desc::gdt::GDT_RING3) - 16;  // -16 since 64 bit sysret offsets
     uint64_t const STAR_VALUE = (KERN_CS | (USER_CS << 16)) << 32;  // kern/user CS stored in high half of STAR

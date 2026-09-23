@@ -10,6 +10,7 @@
 #include <cstring>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/kernel_image.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -95,7 +96,7 @@ constexpr uintptr_t USER_CANONICAL_TOP = 0x0000800000000000ULL;
 auto is_valid_kernel_pointer(const void* ptr) -> bool {
     auto addr = reinterpret_cast<uintptr_t>(ptr);
     bool const IN_HHDM = (addr >= 0xffff800000000000ULL && addr < 0xffff900000000000ULL);
-    bool const IN_KERNEL_STATIC = (addr >= 0xffffffff80000000ULL && addr < 0xffffffffc0000000ULL);
+    bool const IN_KERNEL_STATIC = ker::mod::mm::kernel_image::contains(addr);
     return IN_HHDM || IN_KERNEL_STATIC || ker::mod::mm::virt::kernel_vmap_contains(ptr);
 }
 

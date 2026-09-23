@@ -26,6 +26,7 @@
 #include <platform/init/limine_requests.hpp>
 #include <platform/loader/debug_info.hpp>
 #include <platform/loader/gdb_interface.hpp>
+#include <platform/mm/kernel_image.hpp>
 #include <platform/mm/mm.hpp>
 #include <platform/mm/reclaim.hpp>
 #include <platform/mm/virt.hpp>
@@ -112,7 +113,7 @@ inline auto pending_wake_slot(PendingWakeList& tasks, uint32_t index) -> task::T
     return tasks[static_cast<size_t>(index)];
 }
 
-inline auto is_valid_kernel_stack(uint64_t rsp) -> bool { return rsp >= 0xffff800000000000ULL && rsp < 0xffff900000000000ULL; }
+inline auto is_valid_kernel_stack(uint64_t rsp) -> bool { return ker::mod::mm::is_kernel_stack_address(rsp); }
 
 inline auto is_kernel_text_pointer(uint64_t rip) -> bool {
     auto const TEXT_START = reinterpret_cast<uint64_t>(__kernel_text_start);
@@ -6582,7 +6583,7 @@ auto find_dead_task_lifetime_ref_if(DeadTaskPredicate predicate, void* context) 
 }
 
 auto debug_find_task_by_kernel_stack(uint64_t rsp) -> task::Task* {
-    if (rsp < 0xffff800000000000ULL || rsp >= 0xffff900000000000ULL) {
+    if (!ker::mod::mm::is_kernel_stack_address(rsp)) {
         return nullptr;
     }
     uint32_t count = active_task_count;
@@ -6601,7 +6602,7 @@ auto debug_find_task_by_kernel_stack(uint64_t rsp) -> task::Task* {
 }
 
 auto debug_find_dead_task_by_kernel_stack(uint64_t rsp) -> task::Task* {
-    if (rsp < 0xffff800000000000ULL || rsp >= 0xffff900000000000ULL || run_queues == nullptr) {
+    if (!ker::mod::mm::is_kernel_stack_address(rsp) || run_queues == nullptr) {
         return nullptr;
     }
 
@@ -7180,7 +7181,7 @@ auto detach_next_reclaimable_task_locked(RunQueue* rq, uint64_t cpu_no, uint64_t
         }
         if (cur->pagemap != nullptr) {
             auto pm_addr = reinterpret_cast<uintptr_t>(cur->pagemap);
-            if (pm_addr >= 0xffffffff80000000ULL || pm_addr < 0xffff800000000000ULL) {
+            if (pm_addr < 0xffff800000000000ULL || pm_addr >= 0xffff900000000000ULL) {
                 dbg::log("GC: Task %p (PID %x) has invalid pagemap ptr %p, skipping", cur, cur->pid, cur->pagemap);
                 task_looks_valid = false;
             }
@@ -7233,7 +7234,7 @@ void cleanup_task_after_pagemap(task::Task* cur, GcTaskTiming& timing, uint64_t 
         auto thread_addr = reinterpret_cast<uintptr_t>(thread_ptr);
 
         bool const THREAD_IN_HHDM = (thread_addr >= 0xffff800000000000ULL && thread_addr < 0xffff900000000000ULL);
-        bool const THREAD_IN_KERNEL_STATIC = (thread_addr >= 0xffffffff80000000ULL && thread_addr < 0xffffffffc0000000ULL);
+        bool const THREAD_IN_KERNEL_STATIC = mm::kernel_image::contains(thread_addr);
         if (!THREAD_IN_HHDM && !THREAD_IN_KERNEL_STATIC) {
             dbg::log("GC: Task %p (PID %x) thread ptr %p out of range; skipping", cur, cur->pid, thread_ptr);
             cur->thread = nullptr;
@@ -7269,7 +7270,7 @@ void cleanup_task_after_pagemap(task::Task* cur, GcTaskTiming& timing, uint64_t 
         auto* sa = reinterpret_cast<cpu::PerCpu*>(cur->context.syscall_scratch_area);
         auto sa_addr = reinterpret_cast<uintptr_t>(sa);
         bool const IN_HHDM = (sa_addr >= 0xffff800000000000ULL && sa_addr < 0xffff900000000000ULL);
-        bool const IN_KERNEL_STATIC = (sa_addr >= 0xffffffff80000000ULL && sa_addr < 0xffffffffc0000000ULL);
+        bool const IN_KERNEL_STATIC = mm::kernel_image::contains(sa_addr);
         if (IN_HHDM || IN_KERNEL_STATIC) {
             delete sa;
         }
@@ -7281,7 +7282,7 @@ void cleanup_task_after_pagemap(task::Task* cur, GcTaskTiming& timing, uint64_t 
         const auto* nm = cur->name;
         auto nm_addr = reinterpret_cast<uintptr_t>(nm);
         bool const IN_HHDM = (nm_addr >= 0xffff800000000000ULL && nm_addr < 0xffff900000000000ULL);
-        bool const IN_KERNEL_STATIC = (nm_addr >= 0xffffffff80000000ULL && nm_addr < 0xffffffffc0000000ULL);
+        bool const IN_KERNEL_STATIC = mm::kernel_image::contains(nm_addr);
         if (IN_HHDM || IN_KERNEL_STATIC) {
             const size_t MAX_NAME_LEN = 1024;
             bool found_null = false;
@@ -7323,7 +7324,7 @@ void finish_waitable_zombie_resource_cleanup(task::Task* cur, GcTaskTiming& timi
         auto* thread_ptr = cur->thread;
         auto thread_addr = reinterpret_cast<uintptr_t>(thread_ptr);
         bool const THREAD_IN_HHDM = (thread_addr >= 0xffff800000000000ULL && thread_addr < 0xffff900000000000ULL);
-        bool const THREAD_IN_KERNEL_STATIC = (thread_addr >= 0xffffffff80000000ULL && thread_addr < 0xffffffffc0000000ULL);
+        bool const THREAD_IN_KERNEL_STATIC = mm::kernel_image::contains(thread_addr);
         if ((THREAD_IN_HHDM || THREAD_IN_KERNEL_STATIC) && thread_ptr->magic == 0xDEADBEEF) {
             thread_ptr->tls_phys_ptr = 0;
             thread_ptr->stack_phys_ptr = 0;
@@ -7350,7 +7351,7 @@ void finish_waitable_zombie_resource_cleanup(task::Task* cur, GcTaskTiming& timi
         auto* sa = reinterpret_cast<cpu::PerCpu*>(cur->context.syscall_scratch_area);
         auto sa_addr = reinterpret_cast<uintptr_t>(sa);
         bool const IN_HHDM = (sa_addr >= 0xffff800000000000ULL && sa_addr < 0xffff900000000000ULL);
-        bool const IN_KERNEL_STATIC = (sa_addr >= 0xffffffff80000000ULL && sa_addr < 0xffffffffc0000000ULL);
+        bool const IN_KERNEL_STATIC = mm::kernel_image::contains(sa_addr);
         if (IN_HHDM || IN_KERNEL_STATIC) {
             delete sa;
         }

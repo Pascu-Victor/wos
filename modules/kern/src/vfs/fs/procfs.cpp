@@ -1385,8 +1385,8 @@ auto read_proc_runtime_image_memory(void* opaque, uint64_t address, void* destin
 }
 
 auto snapshot_proc_runtime_images(ker::mod::sched::task::Task& task,
-                                  std::array<ker::loader::runtime::RuntimeImage, ker::loader::runtime::MAX_IMAGES>& images, size_t& count)
-    -> ker::loader::runtime::SnapshotStatus {
+                                  std::array<ker::loader::runtime::RuntimeImage, ker::loader::runtime::MAX_IMAGES>& images, size_t& count,
+                                  bool include_kernel = false) -> ker::loader::runtime::SnapshotStatus {
     ker::mod::sched::task::Task::ExePathBuffer exe_path{};
     uint64_t const IRQF = task.path_metadata_lock.lock_irqsave();
     exe_path = task.exe_path;
@@ -1406,7 +1406,12 @@ auto snapshot_proc_runtime_images(ker::mod::sched::task::Task& task,
         .main_path = exe_path.data(),
         .interpreter_path = "/lib/ld.so",
     };
-    return ker::loader::runtime::snapshot_images(read_proc_runtime_image_memory, &task, SOURCE, images, count);
+    auto status = ker::loader::runtime::snapshot_images(read_proc_runtime_image_memory, &task, SOURCE, images, count);
+    if (include_kernel && !ker::loader::runtime::append_kernel_image(images, count)) {
+        status =
+            count >= images.size() ? ker::loader::runtime::SnapshotStatus::TRUNCATED : ker::loader::runtime::SnapshotStatus::INCONSISTENT;
+    }
+    return status;
 }
 
 auto runtime_image_status_name(ker::loader::runtime::SnapshotStatus status) -> const char* {
@@ -1448,7 +1453,7 @@ auto encode_runtime_image_path(const std::array<char, ker::loader::runtime::IMAG
 }
 
 // Generate the authoritative runtime image catalog for profilers and debuggers.
-auto generate_images(ProcTask* task, char* buf, size_t bufsz) -> size_t {
+auto generate_images(ProcTask* task, char* buf, size_t bufsz, bool include_kernel) -> size_t {
     if (bufsz == 0) {
         return 0;
     }
@@ -1460,7 +1465,7 @@ auto generate_images(ProcTask* task, char* buf, size_t bufsz) -> size_t {
         ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
         ProcPagemapPin pin(*task);
         if (pin.pagemap != nullptr) {
-            status = snapshot_proc_runtime_images(*task, images, image_count);
+            status = snapshot_proc_runtime_images(*task, images, image_count, include_kernel);
         }
     }
 
@@ -6177,7 +6182,7 @@ auto procfs_read_private(const ker::mod::security::Snapshot& credentials, uint64
                 length = generate_maps(data.target, staged, CAPACITY);
                 break;
             case ProcNodeType::IMAGES_FILE:
-                length = generate_images(data.target, staged, CAPACITY);
+                length = generate_images(data.target, staged, CAPACITY, credentials.allows(ker::mod::security::Authority::KERNEL_DEBUG));
                 break;
             case ProcNodeType::EXE_LINK: {
                 uint64_t const IRQF = data.target->path_metadata_lock.lock_irqsave();

@@ -332,6 +332,7 @@ wos_kernel_idle_loop:
 wos_kernel_idle_loop_end:
 
 extern wos_kernel_thread_returned
+section .text.trampoline
 global wos_kernel_thread_trampoline
 wos_kernel_thread_trampoline:
     ; Kernel thread tasks enter here via iretq with rdi = entry function and
@@ -343,6 +344,8 @@ wos_kernel_thread_trampoline:
     cli
     hlt
     jmp .kernel_thread_return_halt
+
+section .text
 
 global wos_start_kernel_thread
 wos_start_kernel_thread:

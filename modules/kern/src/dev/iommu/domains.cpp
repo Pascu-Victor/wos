@@ -370,7 +370,7 @@ auto prepare(const Discovery& inventory, size_t cache_line, bool translated, boo
         uint64_t const COMMAND_END = uint64_t{cap.iotlb_offset} + 8U;
         uint64_t const FAULT_END = uint64_t{cap.fault_offset} + uint64_t{cap.fault_records} * 16U;
         uint64_t const END = ((COMMAND_END > FAULT_END ? COMMAND_END : FAULT_END) + vtd::PAGE_SIZE - 1) & ~(vtd::PAGE_SIZE - 1);
-        mod::mm::virt::map_range_to_kernel_page_table({unit.physical, unit.physical + END}, mod::mm::paging::page_types::MMIO);
+        mod::mm::virt::map_range_to_kernel_page_table({unit.physical, unit.physical + END}, mod::mm::virt::kernel_mmio_page_flags());
         units[i].hardware = &unit;
         units[i].index = i;
         units[i].root = allocate_table(cap.physical_bits);

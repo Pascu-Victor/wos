@@ -25,6 +25,7 @@
 #include <platform/sched/resource_process.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/sys/usercopy.hpp>
 #include <utility>
 #include <vfs/file.hpp>
 #include <vfs/vfs.hpp>
@@ -554,7 +555,10 @@ auto read_mapped_user_memory(void* opaque, uint64_t address, void* destination, 
         }
         size_t const PAGE_OFFSET = static_cast<size_t>(address & (ker::mod::mm::paging::PAGE_SIZE - 1));
         size_t const CHUNK = std::min(size, ker::mod::mm::paging::PAGE_SIZE - PAGE_OFFSET);
-        std::memcpy(output, static_cast<const uint8_t*>(pin.hhdm_page) + PAGE_OFFSET, CHUNK);
+        {
+            ker::mod::sys::usercopy::UserAccessGuard const ACCESS{};
+            std::memcpy(output, static_cast<const uint8_t*>(pin.hhdm_page) + PAGE_OFFSET, CHUNK);
+        }
         bool const STILL_MAPPED = ker::mod::mm::virt::user_page_pin_still_mapped(pin);
         ker::mod::mm::virt::unpin_user_page(pin);
         if (!STILL_MAPPED) {
@@ -1132,6 +1136,11 @@ void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::
     };
     req.runtime_image_status = ker::loader::runtime::snapshot_images(read_mapped_user_memory, task->pagemap, IMAGE_SOURCE,
                                                                      req.runtime_images, req.runtime_image_count);
+    if (!ker::loader::runtime::append_kernel_image(req.runtime_images, req.runtime_image_count)) {
+        req.runtime_image_status = req.runtime_image_count >= req.runtime_images.size()
+                                       ? ker::loader::runtime::SnapshotStatus::TRUNCATED
+                                       : ker::loader::runtime::SnapshotStatus::INCONSISTENT;
+    }
     req.user_rsp = frame.rsp;
     req.timestamp = ker::mod::time::get_ticks();
     req.task_ptr = task;

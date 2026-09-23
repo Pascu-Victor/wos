@@ -135,6 +135,30 @@ struct KernelVmapReclaimStats {
     bool unsafe_context{};
 };
 
+struct KernelProtectionAudit {
+    bool nx_supported{};
+    bool nx_active{};
+    bool write_protect_active{};
+    bool layout_valid{};
+    bool text_readonly{};
+    bool text_executable{};
+    bool rodata_readonly{};
+    bool rodata_non_executable{};
+    bool data_writable{};
+    bool data_non_executable{};
+    bool emergency_stack_guarded{};
+    bool direct_alias_readonly{};
+    bool direct_alias_non_executable{};
+    bool debug_metadata_readonly{};
+    bool debug_metadata_non_executable{};
+
+    [[nodiscard]] constexpr auto enforced() const -> bool {
+        return nx_supported && nx_active && write_protect_active && layout_valid && text_readonly && text_executable && rodata_readonly &&
+               rodata_non_executable && data_writable && data_non_executable && emergency_stack_guarded && direct_alias_readonly &&
+               direct_alias_non_executable && debug_metadata_readonly && debug_metadata_non_executable;
+    }
+};
+
 enum class LazyFilePageInstallResult : uint8_t {
     MAPPED,
     ALREADY_MAPPED,
@@ -176,10 +200,22 @@ PageTable* get_kernel_pagemap();
 void init_tlb_shootdown();
 void note_tlb_shootdown_cpu_online();
 void init_pagemap();
+[[nodiscard]] auto audit_kernel_protections() -> KernelProtectionAudit;
+// Final supervisor mappings use these after init_pagemap() has established the
+// CPU feature policy. The base page_types constants remain NX-free so the
+// unsupported-CPU fallback never installs a reserved PTE bit.
+[[nodiscard]] auto kernel_data_page_flags() -> uint64_t;
+[[nodiscard]] auto kernel_mmio_page_flags() -> uint64_t;
 // Prepare a bounded kernel virtual arena whose runtime allocations are backed
 // by independent order-0 physical pages. Call after init_pagemap() and before
 // task pagemaps copy the kernel-half PML4 entries.
 void init_kernel_vmap();
+// Permanently maps fixed-size stack slots through a dedicated virtual arena.
+// Each usable stack has an unmapped page below and above it; slots are never
+// remapped at runtime, so IRQ-constrained stack retirement needs no shootdown.
+[[nodiscard]] auto init_guarded_kernel_stack_pool(void* backing, size_t capacity) -> bool;
+[[nodiscard]] auto guarded_kernel_stack_slot(size_t index) -> void*;
+[[nodiscard]] auto audit_guarded_kernel_stack(const void* stack_base) -> bool;
 auto kernel_vmap_alloc(PhysicalPageOwner owner, uint64_t size, std::string_view name = {}) -> void*;
 void kernel_vmap_free(void* ptr, uint64_t size);
 [[nodiscard]] auto kernel_vmap_contains(const void* ptr) -> bool;
@@ -226,6 +262,13 @@ paddr_t translate(PageTable* page_table, vaddr_t vaddr);
 [[nodiscard]] auto user_page_pin_commit_write(const UserPagePin& pin) -> bool;
 void unpin_user_page(UserPagePin& pin);
 #ifdef WOS_SELFTEST
+// Arms one exact recoverable kernel page fault. KTEST parks secondary CPUs;
+// the caller must also mask local interrupts around the probe. A mismatched
+// fault is deliberately not consumed and therefore follows the normal panic
+// path.
+[[nodiscard]] auto selftest_arm_expected_kernel_page_fault(vaddr_t fault_address, vaddr_t fault_rip, vaddr_t recovery_rip,
+                                                           uint64_t expected_error, uint64_t error_mask) -> bool;
+[[nodiscard]] auto selftest_finish_expected_kernel_page_fault() -> bool;
 // Low-perturbation allocator guard. Before init_pagemap() completes this is a
 // no-op; afterwards it reports the exact live page-table path for a missing or
 // non-identity HHDM leaf without allocating or attempting a repair.

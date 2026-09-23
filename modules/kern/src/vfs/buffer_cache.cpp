@@ -21,6 +21,7 @@
 #include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
+#include <platform/mm/kernel_image.hpp>
 #include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
@@ -76,7 +77,7 @@ bool is_valid_bufhead_ptr(const BufHead* ptr) {
     return true;
 #else
     const bool IN_HHDM = (addr >= 0xffff800000000000ULL && addr < 0xffff900000000000ULL);
-    const bool IN_STATIC = (addr >= 0xffffffff80000000ULL && addr < 0xffffffffc0000000ULL);
+    const bool IN_STATIC = ker::mod::mm::kernel_image::contains(addr);
     return IN_HHDM || IN_STATIC;
 #endif
 }

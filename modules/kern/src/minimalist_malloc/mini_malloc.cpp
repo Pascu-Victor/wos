@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <platform/dbg/dbg.hpp>
+#include <platform/mm/kernel_image.hpp>
 
 #include "slab_allocator.hpp"
 namespace ker::mod::mm::mini_malloc {
@@ -253,8 +254,7 @@ size_t mini_get_slab_size(void* ptr) {
         return 0;
     }
     auto addr = reinterpret_cast<uintptr_t>(ptr);
-    bool const VALID =
-        (addr >= 0xffff800000000000ULL && addr < 0xffff900000000000ULL) || (addr >= 0xffffffff80000000ULL && addr < 0xffffffffc0000000ULL);
+    bool const VALID = (addr >= 0xffff800000000000ULL && addr < 0xffff900000000000ULL) || kernel_image::contains(addr);
     if (!VALID) {
         return 0;
     }
@@ -263,8 +263,7 @@ size_t mini_get_slab_size(void* ptr) {
         return 0;
     }
     uintptr_t const SP = block->slab_ptr;
-    bool const SP_VALID =
-        (SP >= 0xffff800000000000ULL && SP < 0xffff900000000000ULL) || (SP >= 0xffffffff80000000ULL && SP < 0xffffffffc0000000ULL);
+    bool const SP_VALID = (SP >= 0xffff800000000000ULL && SP < 0xffff900000000000ULL) || kernel_image::contains(SP);
     if (!SP_VALID) {
         return 0;
     }
@@ -281,10 +280,10 @@ void mini_free(void* address) {
     }
 
     // Defensive: ensure address is in valid kernel memory range before touching it.
-    // Valid ranges: HHDM (0xffff800000000000-0xffff900000000000) or kernel static (0xffffffff80000000-0xffffffffc0000000)
+    // Valid ranges are the fixed HHDM aperture or the relocated kernel image.
     auto addr_val = reinterpret_cast<uintptr_t>(address);
     bool const IN_HHDM = (addr_val >= 0xffff800000000000ULL && addr_val < 0xffff900000000000ULL);
-    bool const IN_KERNEL_STATIC = (addr_val >= 0xffffffff80000000ULL && addr_val < 0xffffffffc0000000ULL);
+    bool const IN_KERNEL_STATIC = kernel_image::contains(addr_val);
     if (!IN_HHDM && !IN_KERNEL_STATIC) {
         ker::mod::dbg::log("mini_free: address %p outside valid kernel range (caller=%p); skipping free\n", address,
                            __builtin_return_address(0));
@@ -314,7 +313,7 @@ void mini_free(void* address) {
     // Validate slab_ptr is in valid kernel memory range before dereferencing
     uintptr_t const SLAB_PTR_VAL = block->slab_ptr;
     bool const SLAB_IN_HHDM = (SLAB_PTR_VAL >= 0xffff800000000000ULL && SLAB_PTR_VAL < 0xffff900000000000ULL);
-    bool const SLAB_IN_KERNEL_STATIC = (SLAB_PTR_VAL >= 0xffffffff80000000ULL && SLAB_PTR_VAL < 0xffffffffc0000000ULL);
+    bool const SLAB_IN_KERNEL_STATIC = kernel_image::contains(SLAB_PTR_VAL);
     if (!SLAB_IN_HHDM && !SLAB_IN_KERNEL_STATIC) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wframe-address"

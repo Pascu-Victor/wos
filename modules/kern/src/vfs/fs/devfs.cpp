@@ -19,6 +19,7 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/dbg/journal.hpp>
 #include <platform/ktime/ktime.hpp>
+#include <platform/mm/kernel_image.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/security/file_policy.hpp>
@@ -189,7 +190,7 @@ void local_release_node_ref(DevFSNode* node) {
 auto is_valid_kernel_pointer(const void* ptr) -> bool {
     auto addr = reinterpret_cast<uintptr_t>(ptr);
     bool const IN_HHDM = (addr >= 0xffff800000000000ULL && addr < 0xffff900000000000ULL);
-    bool const IN_KERNEL_STATIC = (addr >= 0xffffffff80000000ULL && addr < 0xffffffffc0000000ULL);
+    bool const IN_KERNEL_STATIC = ker::mod::mm::kernel_image::contains(addr);
     return IN_HHDM || IN_KERNEL_STATIC || ker::mod::mm::virt::kernel_vmap_contains(ptr);
 }
 

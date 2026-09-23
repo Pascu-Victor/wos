@@ -26,6 +26,8 @@ namespace ker::mod::kasan {
 
 // Shadow memory base.  Must match -asan-mapping-offset passed to Clang.
 constexpr uint64_t SHADOW_OFFSET = 0xdffffc0000000000ULL;
+constexpr uint64_t SHADOW_REGION_BASE = SHADOW_OFFSET;
+constexpr uint64_t SHADOW_REGION_END = 0xfffffc2000000000ULL;
 
 // Shadow byte sentinels
 constexpr int8_t SHADOW_ACCESSIBLE = 0x00;

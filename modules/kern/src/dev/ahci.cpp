@@ -926,7 +926,7 @@ auto ahci_controller_init() -> void {
             // Map the MMIO region to kernel space
             for (uint64_t offset = 0; offset < AHCI_SIZE; offset += mod::mm::paging::PAGE_SIZE) {
                 ker::mod::mm::virt::map_to_kernel_page_table(AHCI_KERNEL_VADDR + offset, BAR5 + offset,
-                                                             ker::mod::mm::paging::page_types::MMIO);
+                                                             ker::mod::mm::virt::kernel_mmio_page_flags());
             }
 
             auto* ahci_base = reinterpret_cast<volatile uint32_t*>(AHCI_KERNEL_VADDR);

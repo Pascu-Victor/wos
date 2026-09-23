@@ -60,7 +60,7 @@ void init() {
     // MMIO regions are not in the Limine memory map, so the HHDM has no
     // page table entry for them after the kernel switches to its own page tables.
     auto virt_addr = reinterpret_cast<uint64_t>(mm::addr::get_virt_pointer(PHYS_ADDR));
-    mm::virt::map_to_kernel_page_table(virt_addr, PHYS_ADDR, mm::paging::page_types::MMIO);
+    mm::virt::map_to_kernel_page_table(virt_addr, PHYS_ADDR, mm::virt::kernel_mmio_page_flags());
 
     ioapic_base = reinterpret_cast<volatile uint32_t*>(virt_addr);
 

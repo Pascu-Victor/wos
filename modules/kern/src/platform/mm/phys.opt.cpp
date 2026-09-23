@@ -81,7 +81,7 @@ bool regular_zone_lookup_ready = false;
 // Runtime task creation must not depend on an order-7 block surviving in the
 // general buddy allocator. A build workload can leave gigabytes free while
 // fragmenting every regular zone below the 512 KiB kernel-stack order.
-constexpr size_t KERNEL_STACK_POOL_CAPACITY = 256;
+constexpr size_t KERNEL_STACK_POOL_CAPACITY = ker::mod::mm::KERNEL_STACK_POOL_CAPACITY;
 constexpr size_t KERNEL_STACK_POOL_BYTES = KERNEL_STACK_POOL_CAPACITY * ker::mod::mm::KERNEL_STACK_SIZE;
 constexpr size_t KERNEL_STACK_POOL_MIN_BYTES = size_t{16} * 1024 * 1024;
 
@@ -89,7 +89,8 @@ struct KernelStackPool {
     sys::Spinlock lock;
     std::array<void*, KERNEL_STACK_POOL_CAPACITY> free_slots{};
     std::array<bool, KERNEL_STACK_POOL_CAPACITY> in_use{};
-    uint8_t* base = nullptr;
+    uint8_t* backing = nullptr;
+    uint8_t* virtual_base = nullptr;
     size_t capacity = 0;
     size_t free_count = 0;
     size_t high_watermark = 0;
@@ -1489,8 +1490,8 @@ void init_huge_page_zone_deferred() {
 
         for (uint64_t offset = 0; offset < per_cpu_caches_size; offset += paging::PAGE_SIZE) {
             uint64_t const PHYS = per_cpu_caches_phys_base + offset;
-            auto virt = reinterpret_cast<uint64_t>(addr::get_virt_pointer(PHYS));
-            virt::map_to_kernel_page_table(virt, PHYS, paging::page_types::KERNEL);
+            auto virt_addr = reinterpret_cast<uint64_t>(addr::get_virt_pointer(PHYS));
+            virt::map_to_kernel_page_table(virt_addr, PHYS, virt::kernel_data_page_flags());
         }
 
         log::info("per-CPU caches mapped, initializing structures");
@@ -1512,8 +1513,8 @@ void init_huge_page_zone_deferred() {
 
         for (uint64_t offset = 0; offset < huge_page_size; offset += paging::PAGE_SIZE) {
             uint64_t const PHYS = huge_page_base + offset;
-            auto virt = reinterpret_cast<uint64_t>(addr::get_virt_pointer(PHYS));
-            virt::map_to_kernel_page_table(virt, PHYS, paging::page_types::KERNEL);
+            auto virt_addr = reinterpret_cast<uint64_t>(addr::get_virt_pointer(PHYS));
+            virt::map_to_kernel_page_table(virt_addr, PHYS, virt::kernel_data_page_flags());
         }
 
         log::info("huge page region mapped, initializing zone");
@@ -1954,18 +1955,24 @@ void init_kernel_stack_pool() {
 
     void* const BACKING = backing;
     if (BACKING == nullptr) {
-        log::warn("unable to reserve a kernel stack pool; using nonfatal buddy fallback");
-        return;
+        log::critical("unable to reserve guarded kernel stack backing");
+        hcf();
     }
 
     auto& pool = kernel_stack_pool;
+    size_t const CAPACITY = arena_bytes / ker::mod::mm::KERNEL_STACK_SIZE;
+    if (!virt::init_guarded_kernel_stack_pool(BACKING, CAPACITY)) {
+        log::critical("unable to map guarded kernel stack pool");
+        hcf();
+    }
     uint64_t const FLAGS = pool.lock.lock_irqsave();
-    pool.base = static_cast<uint8_t*>(BACKING);
-    pool.capacity = arena_bytes / ker::mod::mm::KERNEL_STACK_SIZE;
+    pool.backing = static_cast<uint8_t*>(BACKING);
+    pool.capacity = CAPACITY;
+    pool.virtual_base = static_cast<uint8_t*>(virt::guarded_kernel_stack_slot(0));
     pool.free_count = pool.capacity;
     pool.high_watermark = 0;
     for (size_t i = 0; i < pool.capacity; ++i) {
-        pool.free_slots.at(i) = pool.base + (i * ker::mod::mm::KERNEL_STACK_SIZE);
+        pool.free_slots.at(i) = virt::guarded_kernel_stack_slot(i);
         pool.in_use.at(i) = false;
     }
     pool.lock.unlock_irqrestore(FLAGS);
@@ -1975,6 +1982,7 @@ void init_kernel_stack_pool() {
 }
 
 auto kernel_stack_alloc(std::string_view name) -> void* {
+    (void)name;
     auto& pool = kernel_stack_pool;
     void* stack = nullptr;
 
@@ -1983,8 +1991,10 @@ auto kernel_stack_alloc(std::string_view name) -> void* {
         --pool.free_count;
         stack = pool.free_slots.at(pool.free_count);
         pool.free_slots.at(pool.free_count) = nullptr;
-        size_t const INDEX = (static_cast<uint8_t*>(stack) - pool.base) / ker::mod::mm::KERNEL_STACK_SIZE;
-        if (INDEX >= pool.in_use.size() || pool.in_use.at(INDEX)) [[unlikely]] {
+        constexpr uint64_t STACK_STRIDE = ker::mod::mm::KERNEL_STACK_SLOT_STRIDE;
+        auto const OFFSET = static_cast<size_t>(reinterpret_cast<uintptr_t>(stack) - reinterpret_cast<uintptr_t>(pool.virtual_base));
+        size_t const INDEX = OFFSET / STACK_STRIDE;
+        if ((OFFSET % STACK_STRIDE) != 0U || INDEX >= pool.capacity || INDEX >= pool.in_use.size() || pool.in_use.at(INDEX)) [[unlikely]] {
             pool.lock.unlock_irqrestore(FLAGS);
             dbg::panic_handler("kernel stack pool allocation state is corrupt");
             hcf();
@@ -1996,11 +2006,16 @@ auto kernel_stack_alloc(std::string_view name) -> void* {
     pool.lock.unlock_irqrestore(FLAGS);
 
     if (stack != nullptr) {
-        prepare_allocated_block(stack, ker::mod::mm::KERNEL_STACK_SIZE, ReturnedPageZeroing::ZERO);
+#ifdef WOS_KASAN
+        if (kasan::is_enabled() && !kasan::in_shadow_fault()) {
+            kasan::unpoison_range(stack, ker::mod::mm::KERNEL_STACK_SIZE);
+        }
+#endif
+        std::memset(stack, 0, ker::mod::mm::KERNEL_STACK_SIZE);
         return stack;
     }
 
-    return page_alloc_with_reclaim_may_fail(PhysicalPageOwner::KERNEL_STACK, ker::mod::mm::KERNEL_STACK_SIZE, name);
+    return nullptr;
 }
 
 namespace {
@@ -2013,19 +2028,20 @@ enum class KernelStackPoolRelease : uint8_t {
 auto release_kernel_stack_pool_slot(void* page) -> KernelStackPoolRelease {
     auto& pool = kernel_stack_pool;
     auto const PTR = reinterpret_cast<uint64_t>(page);
-    auto const BASE = reinterpret_cast<uint64_t>(pool.base);
-    uint64_t const POOL_BYTES = pool.capacity * ker::mod::mm::KERNEL_STACK_SIZE;
-    if (pool.base == nullptr || PTR < BASE || PTR - BASE >= POOL_BYTES) {
+    auto const BASE = reinterpret_cast<uint64_t>(pool.virtual_base);
+    constexpr uint64_t STACK_STRIDE = ker::mod::mm::KERNEL_STACK_SLOT_STRIDE;
+    uint64_t const POOL_BYTES = pool.capacity * STACK_STRIDE;
+    if (pool.virtual_base == nullptr || PTR < BASE || PTR - BASE >= POOL_BYTES) {
         return KernelStackPoolRelease::NOT_POOL;
     }
 
     auto const OFFSET = static_cast<size_t>(PTR - BASE);
-    if ((OFFSET % ker::mod::mm::KERNEL_STACK_SIZE) != 0) [[unlikely]] {
+    if ((OFFSET % STACK_STRIDE) != 0) [[unlikely]] {
         dbg::emergency_log("kernel stack pool: rejecting unaligned free ptr=0x%lx\n", reinterpret_cast<uint64_t>(page));
         return KernelStackPoolRelease::REJECTED;
     }
 
-    size_t const INDEX = OFFSET / ker::mod::mm::KERNEL_STACK_SIZE;
+    size_t const INDEX = OFFSET / STACK_STRIDE;
     uint64_t const FLAGS = pool.lock.lock_irqsave();
     if (INDEX >= pool.in_use.size() || !pool.in_use.at(INDEX) || pool.free_count >= pool.free_slots.size()) [[unlikely]] {
         pool.lock.unlock_irqrestore(FLAGS);

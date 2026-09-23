@@ -22,6 +22,7 @@
 #include <optional>
 #include <platform/init/limine_requests.hpp>
 #include <platform/ktime/ktime.hpp>
+#include <platform/mm/kernel_image.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/power/power.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -3513,10 +3514,8 @@ auto stream_attachment_pointer_looks_valid(const void* ptr) -> bool {
     auto const ADDR = reinterpret_cast<uintptr_t>(ptr);
     constexpr uintptr_t HHDM_START = 0xffff800000000000ULL;
     constexpr uintptr_t HHDM_END = 0xffff900000000000ULL;
-    constexpr uintptr_t KERNEL_STATIC_START = 0xffffffff80000000ULL;
-    constexpr uintptr_t KERNEL_STATIC_END = 0xffffffffc0000000ULL;
     bool const IN_HHDM = ADDR >= HHDM_START && ADDR < HHDM_END;
-    bool const IN_KERNEL_STATIC = ADDR >= KERNEL_STATIC_START && ADDR < KERNEL_STATIC_END;
+    bool const IN_KERNEL_STATIC = ker::mod::mm::kernel_image::contains(ADDR);
     return (IN_HHDM || IN_KERNEL_STATIC) && ((ADDR & (alignof(StreamReaderAttachment) - 1)) == 0);
 }
 
@@ -3579,10 +3578,8 @@ auto cache_notify_attach_pointer_looks_valid(const void* ptr) -> bool {
     auto const ADDR = reinterpret_cast<uintptr_t>(ptr);
     constexpr uintptr_t HHDM_START = 0xffff800000000000ULL;
     constexpr uintptr_t HHDM_END = 0xffff900000000000ULL;
-    constexpr uintptr_t KERNEL_STATIC_START = 0xffffffff80000000ULL;
-    constexpr uintptr_t KERNEL_STATIC_END = 0xffffffffc0000000ULL;
     bool const IN_HHDM = ADDR >= HHDM_START && ADDR < HHDM_END;
-    bool const IN_KERNEL_STATIC = ADDR >= KERNEL_STATIC_START && ADDR < KERNEL_STATIC_END;
+    bool const IN_KERNEL_STATIC = ker::mod::mm::kernel_image::contains(ADDR);
     return (IN_HHDM || IN_KERNEL_STATIC) && ((ADDR & (alignof(CacheNotifyWatcher) - 1)) == 0);
 }
 

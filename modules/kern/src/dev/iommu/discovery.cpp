@@ -43,7 +43,7 @@ void probe(Unit& unit) {
     }
     // Capability discovery needs only the first page. Later command/fault
     // access must map the validated variable register banks explicitly.
-    mod::mm::virt::map_range_to_kernel_page_table({unit.physical, unit.physical + 4096}, mod::mm::paging::page_types::MMIO);
+    mod::mm::virt::map_range_to_kernel_page_table({unit.physical, unit.physical + 4096}, mod::mm::virt::kernel_mmio_page_flags());
     auto const* registers = reinterpret_cast<const volatile uint8_t*>(mod::mm::addr::get_virt_pointer(unit.physical));
     unit.version = *reinterpret_cast<const volatile uint32_t*>(registers);
     unit.cap = *reinterpret_cast<const volatile uint64_t*>(registers + 8);

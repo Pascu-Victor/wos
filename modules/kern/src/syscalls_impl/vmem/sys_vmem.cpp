@@ -1089,7 +1089,10 @@ auto snapshot_file_mmap_page(ker::mod::mm::paging::PageTable* pagemap, ker::mod:
         }
         // Zero bytes probes dirty state without copying, with the same pin
         // lifetime and mapping revalidation as an actual data snapshot.
-        if (size != 0) std::memcpy(snapshot.data(), static_cast<const uint8_t*>(pin.kernel_address()) + page_delta, size);
+        if (size != 0) {
+            ker::mod::sys::usercopy::UserAccessGuard const ACCESS{};
+            std::memcpy(snapshot.data(), static_cast<const uint8_t*>(pin.kernel_address()) + page_delta, size);
+        }
         return pin.still_mapped() ? FileMmapPageSnapshot::READY : FileMmapPageSnapshot::FAULT;
     }
 
@@ -1104,7 +1107,10 @@ auto snapshot_file_mmap_page(ker::mod::mm::paging::PageTable* pagemap, ker::mod:
         ker::mod::mm::virt::unpin_user_page(pin);
         return FileMmapPageSnapshot::SKIP;
     }
-    if (size != 0) std::memcpy(snapshot.data(), static_cast<const uint8_t*>(pin.hhdm_page) + page_delta, size);
+    if (size != 0) {
+        ker::mod::sys::usercopy::UserAccessGuard const ACCESS{};
+        std::memcpy(snapshot.data(), static_cast<const uint8_t*>(pin.hhdm_page) + page_delta, size);
+    }
     bool const STILL_MAPPED = ker::mod::mm::virt::user_page_pin_still_mapped(pin);
     ker::mod::mm::virt::unpin_user_page(pin);
     return STILL_MAPPED ? FileMmapPageSnapshot::READY : FileMmapPageSnapshot::FAULT;
@@ -1736,7 +1742,7 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
 
     // Validate pagemap pointer is in valid HHDM range (not kernel static range)
     auto pm_addr = reinterpret_cast<uintptr_t>(task->pagemap);
-    if (pm_addr >= 0xffffffff80000000ULL || pm_addr < 0xffff800000000000ULL) {
+    if (pm_addr < 0xffff800000000000ULL || pm_addr >= 0xffff900000000000ULL) {
         log::error("task PID %x has corrupted pagemap ptr 0x%x", task->pid, pm_addr);
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
     }
@@ -2932,7 +2938,10 @@ auto anon_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size, uint64
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
         }
 
-        std::memcpy(dst_page.kernel_address(), src_page.kernel_address(), ker::mod::mm::paging::PAGE_SIZE);
+        {
+            ker::mod::sys::usercopy::UserAccessGuard const ACCESS{};
+            std::memcpy(dst_page.kernel_address(), src_page.kernel_address(), ker::mod::mm::paging::PAGE_SIZE);
+        }
         bool const SOURCE_STILL_MAPPED = src_page.still_mapped();
         bool const DESTINATION_COMMITTED = dst_page.commit_write();
         if (!SOURCE_STILL_MAPPED || !DESTINATION_COMMITTED) {
