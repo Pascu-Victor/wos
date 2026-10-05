@@ -253,6 +253,7 @@ UNIT_TESTS=(
     vfs_pread_source_test
     vfs_sendfile_source_test
     vfs_pipe_source_test
+    vfs_pipe_close_test
     tmpfs_swap_source_test
     tmpfs_link_source_test
     init_stdio_source_test

@@ -19977,6 +19977,21 @@ void pipe_reschedule_waiters(const PipeWakeList& waiters, size_t waiter_count, b
     }
 }
 
+void pipe_reschedule_all_waiters(const PipeWaiterList& waiters, bool sigpipe = false) {
+    PipeWakeList pending{};
+    size_t pending_count = 0;
+    for (uint64_t pid : waiters) {
+        pending.at(pending_count++) = pid;
+        if (pending_count == pending.size()) {
+            pipe_reschedule_waiters(pending, pending_count, sigpipe);
+            pending_count = 0;
+        }
+    }
+    if (pending_count != 0) {
+        pipe_reschedule_waiters(pending, pending_count, sigpipe);
+    }
+}
+
 auto pipe_contiguous_write_space_locked(const PipeState* st) -> size_t {
     if (st == nullptr || st->count >= st->capacity) {
         return 0;
@@ -20617,10 +20632,8 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
         size_t capacity = 0;
         bool write_closed = false;
         int open_ends_before = 0;
-        PipeWakeList pending_writers{};
-        size_t pending_writers_count = 0;
-        PipeWakeList pending_write_pollers{};
-        size_t pending_write_pollers_count = 0;
+        PipeWaiterList pending_writers;
+        PipeWaiterList pending_write_pollers;
         {
             uint64_t const IRQF = st->lock.lock_irqsave();
             buffered = st->count;
@@ -20629,12 +20642,10 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
             open_ends_before = st->open_ends.load(std::memory_order_relaxed);
             st->read_closed = true;
             st->read_file = nullptr;
-            if (!st->writers_waiting.empty()) {
-                pipe_collect_waiters_locked(st->writers_waiting, pending_writers, &pending_writers_count);
-            }
-            if (!st->write_poll_waiting.empty()) {
-                pipe_collect_waiters_locked(st->write_poll_waiting, pending_write_pollers, &pending_write_pollers_count);
-            }
+            // Terminal readiness applies to every existing waiter. Moving the
+            // lists allocates nothing and leaves wake delivery outside the lock.
+            pending_writers = std::move(st->writers_waiting);
+            pending_write_pollers = std::move(st->write_poll_waiting);
             st->lock.unlock_irqrestore(IRQF);
         }
         if (pipe_diag_enabled()) {
@@ -20643,8 +20654,8 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
                       static_cast<unsigned long long>(buffered), static_cast<unsigned long long>(capacity), open_ends_before,
                       write_closed ? 1U : 0U);
         }
-        pipe_reschedule_waiters(pending_writers, pending_writers_count, true);
-        pipe_reschedule_waiters(pending_write_pollers, pending_write_pollers_count);
+        pipe_reschedule_all_waiters(pending_writers, true);
+        pipe_reschedule_all_waiters(pending_write_pollers);
         if (st->open_ends.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             pipe_destroy_state(st);
         }
@@ -20660,10 +20671,8 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
         size_t capacity = 0;
         bool read_closed = false;
         int open_ends_before = 0;
-        PipeWakeList pending_readers{};
-        size_t pending_readers_count = 0;
-        PipeWakeList pending_read_pollers{};
-        size_t pending_read_pollers_count = 0;
+        PipeWaiterList pending_readers;
+        PipeWaiterList pending_read_pollers;
         {
             uint64_t const IRQF = st->lock.lock_irqsave();
             buffered = st->count;
@@ -20672,12 +20681,8 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
             open_ends_before = st->open_ends.load(std::memory_order_relaxed);
             st->write_closed = true;
             st->write_file = nullptr;
-            if (!st->readers_waiting.empty()) {
-                pipe_collect_waiters_locked(st->readers_waiting, pending_readers, &pending_readers_count);
-            }
-            if (!st->read_poll_waiting.empty()) {
-                pipe_collect_waiters_locked(st->read_poll_waiting, pending_read_pollers, &pending_read_pollers_count);
-            }
+            pending_readers = std::move(st->readers_waiting);
+            pending_read_pollers = std::move(st->read_poll_waiting);
             st->lock.unlock_irqrestore(IRQF);
         }
         if (pipe_diag_enabled()) {
@@ -20686,8 +20691,8 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
                       static_cast<unsigned long long>(buffered), static_cast<unsigned long long>(capacity), open_ends_before,
                       read_closed ? 1U : 0U);
         }
-        pipe_reschedule_waiters(pending_readers, pending_readers_count);
-        pipe_reschedule_waiters(pending_read_pollers, pending_read_pollers_count);
+        pipe_reschedule_all_waiters(pending_readers);
+        pipe_reschedule_all_waiters(pending_read_pollers);
         if (st->open_ends.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             pipe_destroy_state(st);
         }
