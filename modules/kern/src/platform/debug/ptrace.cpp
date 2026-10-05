@@ -93,8 +93,11 @@ auto is_wki_execve_proxy_wait(const Task& task) -> bool {
 auto is_wki_execve_proxy_handoff(const Task& task) -> bool { return task.deferred_task_switch && is_wki_execve_proxy_wait(task); }
 
 auto deferred_switch_is_sched_yield(const Task& task) -> bool {
-    return task.yield_switch && task.wait_channel != nullptr && task.wait_channel_kind == ker::mod::sched::task::WaitChannelKind::GENERIC &&
-           std::strcmp(task.wait_channel, "sched_yield") == 0;
+    if (!task.yield_switch) return false;
+    // Same-CPU syscall wakes also request a channel-free yield. Match the
+    // scheduler's classification so these retain an observable syscall exit.
+    if (task.wait_channel == nullptr || task.wait_channel_kind == ker::mod::sched::task::WaitChannelKind::NONE) return true;
+    return task.wait_channel_kind == ker::mod::sched::task::WaitChannelKind::GENERIC && std::strcmp(task.wait_channel, "sched_yield") == 0;
 }
 
 auto should_suppress_deferred_syscall_exit_stop(const Task& task) -> bool {
@@ -2018,11 +2021,16 @@ auto ptrace_selftest_syscall_snapshot_patches_live_sysret_state() -> bool {
 }
 
 auto ptrace_selftest_deferred_syscall_exit_stop_suppression() -> bool {
+    Task internal_resched{};
+    internal_resched.deferred_task_switch = true;
+    internal_resched.yield_switch = true;
+    bool ok = !should_suppress_deferred_syscall_exit_stop(internal_resched);
+
     Task waitpid{};
     waitpid.deferred_task_switch = true;
     waitpid.set_wait_channel("waitpid", ker::mod::sched::task::WaitChannelKind::WAITPID);
 
-    bool ok = should_suppress_deferred_syscall_exit_stop(waitpid);
+    ok = ok && should_suppress_deferred_syscall_exit_stop(waitpid);
 
     Task yielded{};
     yielded.deferred_task_switch = true;

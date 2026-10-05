@@ -1300,8 +1300,9 @@ auto current_timer_quantum() -> uint32_t {
     return STATUS.initialized ? STATUS.calibration.ticks_for_delay_us(STATUS.quantum_us) : 0;
 }
 
-// Tick counter for periodic epoch advancement and garbage collection
+// Global ticks retain the scheduler dump cadence; epoch progress uses CPU0 ticks.
 std::atomic<uint64_t> timer_tick_count{0};
+std::atomic<uint64_t> epoch_timer_tick_count{0};
 
 constexpr bool K_ENABLE_SCHED_HOT_LOGGING = false;
 
@@ -1602,19 +1603,29 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
     // Advance epoch and request garbage collection periodically on CPU 0 only.
     // Task reclamation itself runs in the scheduler GC daemon, never in IRQ.
     uint64_t const TICKS = timer_tick_count.fetch_add(1, std::memory_order_relaxed);
-    if (cpu::current_cpu() == 0 && (TICKS % 10) == 0) {
-        sched::EpochManager::advance_epoch();
-        sched::request_gc();
+    // Other CPUs must not consume modulo slots: a repeating SMP IRQ order can
+    // otherwise keep CPU0 from ever observing a multiple of ten.
+    if (cpu::current_cpu() == 0) {
+        uint64_t const EPOCH_TICKS = epoch_timer_tick_count.fetch_add(1, std::memory_order_relaxed);
+        if ((EPOCH_TICKS % 10) == 0) {
+            sched::EpochManager::advance_epoch();
+            sched::request_gc();
+        }
     }
 
     kasan_unpoison_irq_save_area(stack_ptr);
 
     auto* gpr_ptr = reinterpret_cast<cpu::GPRegs*>(stack_ptr);
     auto* frame_ptr = reinterpret_cast<gates::InterruptFrame*>(reinterpret_cast<uint8_t*>(stack_ptr) + sizeof(cpu::GPRegs));
+    sched::record_scheduler_timer_trace(sched::SchedulerTimerTraceKind::TIMER_ENTER, frame_ptr->rip, static_cast<uint32_t>(frame_ptr->cs));
     validate_timer_stack(*frame_ptr, *gpr_ptr, sched::get_current_task());
     if (scheduler_timer_should_bypass_for_inflate_diag(*frame_ptr)) {
         sched::note_scheduler_timer_arm();
-        apic::one_shot_timer(current_timer_quantum());
+        auto const TICKS = current_timer_quantum();
+        sched::record_scheduler_timer_trace(sched::SchedulerTimerTraceKind::ARM_INFLATE, TICKS);
+        apic::one_shot_timer(TICKS);
+        sched::record_scheduler_timer_trace(sched::SchedulerTimerTraceKind::TIMER_EXIT, frame_ptr->rip,
+                                            static_cast<uint32_t>(frame_ptr->cs));
         return;
     }
     auto* const LIVE_TASK = sched::get_current_task();
@@ -1651,6 +1662,8 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
 
     if (is_idle_return_frame(*frame_ptr, return_task)) {
         sched::arm_idle_timer_for_this_cpu();
+        sched::record_scheduler_timer_trace(sched::SchedulerTimerTraceKind::TIMER_EXIT, frame_ptr->rip,
+                                            static_cast<uint32_t>(frame_ptr->cs));
         enter_idle_from_timer(return_task, *frame_ptr);
     }
 
@@ -1659,8 +1672,12 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
         sched::note_scheduler_timer_arm();
         uint64_t const TICKS = TIMER_DECISION.use_deadline_delta ? scheduler_timer_ticks_for_delta_us(TIMER_DECISION.deadline_delta_us)
                                                                  : current_timer_quantum();
+        sched::record_scheduler_timer_trace(
+            TIMER_DECISION.use_deadline_delta ? sched::SchedulerTimerTraceKind::ARM_DEADLINE : sched::SchedulerTimerTraceKind::ARM_QUANTUM,
+            TICKS);
         apic::one_shot_timer(TICKS);
     } else {
+        sched::record_scheduler_timer_trace(sched::SchedulerTimerTraceKind::TIMER_DISARM);
         sched::note_scheduler_timer_disarm();
     }
 
@@ -1740,6 +1757,7 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
     }
 #endif  // SCHED_DEBUG
 
+    sched::record_scheduler_timer_trace(sched::SchedulerTimerTraceKind::TIMER_EXIT, frame_ptr->rip, static_cast<uint32_t>(frame_ptr->cs));
     if (is_first_run_kernel_thread_frame(*frame_ptr, *gpr_ptr, return_task)) {
         wos_start_kernel_thread(frame_ptr->rsp, return_task->kthread_entry);
         __builtin_unreachable();
@@ -1827,16 +1845,20 @@ void start_sched_timer() {
     // start_scheduler keeps IF masked until the final task-stack handoff.
     initialize_clockevent_for_this_cpu();
     sched::note_scheduler_timer_arm();
-    apic::one_shot_timer(std::max<uint32_t>(current_timer_quantum(), 1));
+    auto const TICKS = std::max<uint32_t>(current_timer_quantum(), 1);
+    sched::record_scheduler_timer_trace(sched::SchedulerTimerTraceKind::ARM_START, TICKS);
+    apic::one_shot_timer(TICKS);
 }
 
 auto request_reschedule() -> bool {
     if (defer_process_reschedule_to_syscall_exit()) {
+        sched::record_scheduler_timer_trace(sched::SchedulerTimerTraceKind::SYSCALL_DEFERRED);
         return true;
     }
 
     if (!current_stack_allows_local_reschedule()) {
         if (!sched::interrupts_enabled()) {
+            sched::record_scheduler_timer_trace(sched::SchedulerTimerTraceKind::STACK_REJECTED);
             return false;
         }
         static std::atomic<uint64_t> skipped_mismatch_logs{0};
@@ -1859,12 +1881,14 @@ auto request_reschedule() -> bool {
         uint32_t const QUANTUM = current_timer_quantum();
         if (QUANTUM != 0) {
             sched::note_scheduler_timer_arm();
+            sched::record_scheduler_timer_trace(sched::SchedulerTimerTraceKind::ARM_STACK_FALLBACK, QUANTUM);
             apic::one_shot_timer(QUANTUM);
         }
         asm volatile("push %0; popfq" : : "r"(flags) : "memory", "cc");
         return QUANTUM != 0;
     }
     sched::note_local_reschedule_timer_poke();
+    sched::record_scheduler_timer_trace(sched::SchedulerTimerTraceKind::ARM_LOCAL, 1);
     apic::one_shot_timer(1);
     return true;
 }

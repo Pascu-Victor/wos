@@ -50,8 +50,9 @@ class EpochManager {
     // Get the current global epoch value.
     static auto current_epoch() -> uint64_t;
 
-    // Advance the global epoch. Called periodically (e.g., every N timer ticks).
-    // This should only be called from one CPU (typically the BSP).
+    // Advance the global epoch from the periodic BSP timer or an exclusively
+    // owned GC pass. Concurrent advances are atomic; active reader epochs
+    // still determine whether retired storage may be reclaimed.
     static void advance_epoch();
 
     // Check if it's safe to reclaim memory that was freed at the given epoch.

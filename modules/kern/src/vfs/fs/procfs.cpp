@@ -1876,7 +1876,7 @@ auto generate_cpu_stat(char* buf, size_t bufsz) -> size_t {
 
     ker::mod::sched::CpuAccountingSnapshot total{};
     for (uint64_t cpu = 0; cpu < cpu_count; ++cpu) {
-        auto const SNAP = ker::mod::sched::get_cpu_accounting_snapshot(cpu);
+        auto const SNAP = ker::mod::sched::get_cpu_accounting_committed_snapshot(cpu);
         total.user_us += SNAP.user_us;
         total.nice_us += SNAP.nice_us;
         total.system_us += SNAP.system_us;
@@ -1913,7 +1913,7 @@ auto generate_cpu_stat(char* buf, size_t bufsz) -> size_t {
 
     append_cpu_row("cpu", 0, total, false);
     for (uint64_t cpu = 0; cpu < cpu_count; ++cpu) {
-        append_cpu_row("cpu", cpu, ker::mod::sched::get_cpu_accounting_snapshot(cpu), true);
+        append_cpu_row("cpu", cpu, ker::mod::sched::get_cpu_accounting_committed_snapshot(cpu), true);
     }
 
     auto const LOAD = ker::mod::sched::get_load_average_snapshot();

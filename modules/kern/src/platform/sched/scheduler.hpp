@@ -8,6 +8,8 @@
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/perf/perf_events.hpp>
+#include <platform/sched/event_wake_diagnostics.hpp>
+#include <platform/sched/local_wake_batch.hpp>
 #include <platform/sched/migration_guard.hpp>
 #include <platform/sched/run_heap.hpp>
 #include <platform/sched/task.hpp>
@@ -76,6 +78,7 @@ struct RunQueue {
     std::atomic<uint64_t> idle_timer_disarms;
     std::atomic<uint64_t> idle_timer_wakeups;
     std::atomic<uint64_t> scheduler_timer_interrupts;
+    SchedulerTimerTrace timer_trace{};
     std::atomic<uint64_t> scheduler_timer_arms;
     std::atomic<uint64_t> scheduler_timer_disarms;
     std::atomic<uint64_t> scheduler_timer_arm_wait_deadline;
@@ -489,15 +492,17 @@ enum class EventWakeDeferredSwitch : uint8_t {
     return event_wake_cancels_deferred_switch(deferred_switch) && !wki_execve_proxy_wait;
 }
 [[nodiscard]] auto event_wake_target_cpu(const task::Task* task, uint64_t waker_cpu) -> uint64_t;
-void wake_task_from_event(task::Task* task, EventWakeDeferredSwitch deferred_switch = EventWakeDeferredSwitch::PRESERVE);
+void wake_task_from_event(task::Task* task, EventWakeDeferredSwitch deferred_switch = EventWakeDeferredSwitch::PRESERVE,
+                          EventWakeDiagnostics* diagnostics = nullptr);
 void wake_task_from_event_on_cpu(task::Task* task, uint64_t target_cpu,
-                                 EventWakeDeferredSwitch deferred_switch = EventWakeDeferredSwitch::PRESERVE);
+                                 EventWakeDeferredSwitch deferred_switch = EventWakeDeferredSwitch::PRESERVE,
+                                 EventWakeDiagnostics* diagnostics = nullptr);
 [[nodiscard]] auto wake_task_by_pid_from_event(uint64_t pid, EventWakeDeferredSwitch deferred_switch = EventWakeDeferredSwitch::PRESERVE)
     -> bool;
 [[nodiscard]] auto wake_task_by_pid_from_event_on_cpu(uint64_t pid, uint64_t target_cpu,
                                                       EventWakeDeferredSwitch deferred_switch = EventWakeDeferredSwitch::PRESERVE) -> bool;
-void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task);  // Reschedule a specific task on a specific CPU
-auto debug_stop_task(task::Task* task) -> bool;                   // Move a traced task out of runnable scheduling if possible
+void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task, EventWakeDiagnostics* diagnostics = nullptr);
+auto debug_stop_task(task::Task* task) -> bool;  // Move a traced task out of runnable scheduling if possible
 enum class WakeCpuMode : uint8_t {
     COALESCE,
     FORCE,
@@ -509,9 +514,26 @@ void gc_expired_tasks();                                                   // Ga
 auto gc_expired_tasks_budgeted(uint32_t max_tasks) -> uint32_t;            // Budgeted task GC for scheduler GC daemon
 void request_gc();                                                         // Request deferred scheduler GC from IRQ-safe paths
 void request_gc_memory_pressure();                                         // Request aggressive GC from allocation pressure paths
-auto reclaim_memory_pressure() -> uint32_t;                                // Synchronously run one exclusive pressure-GC pass when safe
-void start_gc_worker();                                                    // Start scheduler GC daemon after init task creation
-void request_local_timer_recheck();                                        // Arm a local timer tick after a new current-task deadline
+// Optional observations from one exclusive pressure pass. These are local to
+// the caller; guard counters describe scanned entries, not a global snapshot.
+struct GcPressureDiagnostics {
+    bool ran{};
+    bool time_budget_exhausted{};
+    bool deferred_pending{};
+    uint32_t reclaimed{};
+    uint64_t scanned{};
+    uint64_t not_dead_skips{};
+    uint64_t epoch_skips{};
+    uint64_t epoch_still_young{};
+    uint64_t current_skips{};
+    uint64_t zombie_busy_skips{};
+    uint64_t retained_zombie_skips{};
+    uint64_t refcount_skips{};
+    uint64_t invalid_tasks{};
+};
+auto reclaim_memory_pressure(GcPressureDiagnostics* diagnostics = nullptr) -> uint32_t;
+void start_gc_worker();              // Start scheduler GC daemon after init task creation
+void request_local_timer_recheck();  // Arm a local timer tick after a new current-task deadline
 enum class ExceptionWaitResult : uint8_t {
     COMPLETION_WON,
     PARKED,
@@ -541,7 +563,12 @@ void note_scheduler_timer_disarm();
 void note_local_reschedule_timer_poke();
 auto get_scheduler_timer_decision_for_this_cpu(uint64_t now_us) -> SchedulerTimerDecision;
 void account_irq_time_us(uint64_t elapsed_us);
+// Includes a provisional live slice; its categories can be reclassified at the
+// next accounting boundary. Used by uptime and WKI load estimates.
 auto get_cpu_accounting_snapshot(uint64_t cpu_no) -> CpuAccountingSnapshot;
+// Cumulative charges only. Tickless idle time can lag until its next accounting
+// event; no speculative category can disappear from a later counter read.
+auto get_cpu_accounting_committed_snapshot(uint64_t cpu_no) -> CpuAccountingSnapshot;
 auto get_load_average_snapshot() -> LoadAverageSnapshot;
 bool has_run_queues();
 void begin_syscall_accounting();
@@ -549,6 +576,16 @@ void finish_syscall_accounting();
 void finalize_current_task_cpu_accounting();
 [[nodiscard]] auto pause_syscall_accounting() -> bool;
 void resume_syscall_accounting();
+
+struct KernelWaitAccounting {
+    bool was_blocked{};
+    bool paused_syscall{};
+    bool accounted_boundary{};
+};
+// Internal wait boundaries require IRQs masked through metadata publication.
+// They keep CPU ledgers and EEVDF consistent before/after a halted interval.
+[[nodiscard]] auto begin_kernel_wait_accounting(task::Task* subject) -> KernelWaitAccounting;
+void finish_kernel_wait_accounting(task::Task* subject, KernelWaitAccounting state);
 
 void preempt_disable();
 void preempt_disable_at(uint64_t caller);
@@ -708,23 +745,21 @@ inline void kern_yield_impl(uint64_t perf_callsite) {
         note_preempt_disabled_block("kern_yield", perf_callsite);
     }
     bool const INTERRUPTS_WERE_ENABLED = interrupts_enabled();
+    asm volatile("cli" ::: "memory");
     auto* task = get_current_task();
-    bool const PAUSED_SYSCALL_ACCOUNTING = pause_syscall_accounting();
     if (task != nullptr) {
         task->perf_wait_callsite = perf_callsite;
         task->set_wait_channel("kern_yield");
-        task->set_voluntary_blocked(true);
     }
+    auto const ACCOUNTING = begin_kernel_wait_accounting(task);
     (void)scheduler_wait_halt_once(task, SchedulerHaltWaitKind::YIELD, INTERRUPTS_WERE_ENABLED);
+    asm volatile("cli" ::: "memory");
     if (task != nullptr) {
         (void)task->wakeup_pending.exchange(false, std::memory_order_acquire);
-        task->set_voluntary_blocked(false);
         task->clear_wait_channel();
     }
+    finish_kernel_wait_accounting(task, ACCOUNTING);
     restore_interrupts_after_scheduler_wait(INTERRUPTS_WERE_ENABLED);
-    if (PAUSED_SYSCALL_ACCOUNTING) {
-        resume_syscall_accounting();
-    }
     maybe_exit_current_kernel_thread_for_shutdown();
 }
 
@@ -740,29 +775,27 @@ inline void kern_block_impl(uint64_t perf_callsite) {
         note_preempt_disabled_block("kern_block", perf_callsite);
     }
     bool const INTERRUPTS_WERE_ENABLED = interrupts_enabled();
+    asm volatile("cli" ::: "memory");
     auto* task = get_current_task();
-    bool const PAUSED_SYSCALL_ACCOUNTING = pause_syscall_accounting();
     if (task != nullptr) {
         task->perf_wait_callsite = perf_callsite;
         task->set_wait_channel("kern_block");
         task->wants_block = true;
-        task->set_voluntary_blocked(true);
     }
+    auto const ACCOUNTING = begin_kernel_wait_accounting(task);
     for (;;) {
         if (!scheduler_wait_halt_once(task, SchedulerHaltWaitKind::BLOCK, INTERRUPTS_WERE_ENABLED) || task == nullptr) {
             break;
         }
     }
+    asm volatile("cli" ::: "memory");
     if (task != nullptr) {
         task->wake_at_us = 0;
         task->wants_block = false;
-        task->set_voluntary_blocked(false);
         task->clear_wait_channel();
     }
+    finish_kernel_wait_accounting(task, ACCOUNTING);
     restore_interrupts_after_scheduler_wait(INTERRUPTS_WERE_ENABLED);
-    if (PAUSED_SYSCALL_ACCOUNTING) {
-        resume_syscall_accounting();
-    }
     maybe_exit_current_kernel_thread_for_shutdown();
 }
 
@@ -780,30 +813,28 @@ inline void kern_sleep_us_impl(uint64_t sleep_us, uint64_t perf_callsite) {
         note_preempt_disabled_block("kern_sleep", perf_callsite);
     }
     bool const INTERRUPTS_WERE_ENABLED = interrupts_enabled();
+    asm volatile("cli" ::: "memory");
     auto* task = get_current_task();
-    bool const PAUSED_SYSCALL_ACCOUNTING = pause_syscall_accounting();
     if (task != nullptr) {
         task->perf_wait_callsite = perf_callsite;
         task->set_wait_channel("kern_sleep");
         task->wake_at_us = saturating_deadline_us(ker::mod::time::get_us(), sleep_us);
         task->wants_block = true;
-        task->set_voluntary_blocked(true);
     }
+    auto const ACCOUNTING = begin_kernel_wait_accounting(task);
     for (;;) {
         if (!scheduler_wait_halt_once(task, SchedulerHaltWaitKind::BLOCK, INTERRUPTS_WERE_ENABLED) || task == nullptr) {
             break;
         }
     }
+    asm volatile("cli" ::: "memory");
     if (task != nullptr) {
         task->wake_at_us = 0;
         task->wants_block = false;
-        task->set_voluntary_blocked(false);
         task->clear_wait_channel();
     }
+    finish_kernel_wait_accounting(task, ACCOUNTING);
     restore_interrupts_after_scheduler_wait(INTERRUPTS_WERE_ENABLED);
-    if (PAUSED_SYSCALL_ACCOUNTING) {
-        resume_syscall_accounting();
-    }
     maybe_exit_current_kernel_thread_for_shutdown();
 }
 
@@ -817,30 +848,28 @@ inline void preemptible_syscall_park_impl(const char* wait_channel, task::WaitCh
         note_preempt_disabled_block("preemptible_syscall_park", perf_callsite);
     }
     bool const INTERRUPTS_WERE_ENABLED = interrupts_enabled();
+    asm volatile("cli" ::: "memory");
     auto* task = get_current_task();
-    bool const PAUSED_SYSCALL_ACCOUNTING = pause_syscall_accounting();
     if (task != nullptr) {
         task->perf_wait_callsite = perf_callsite;
         task->set_wait_channel(wait_channel, wait_kind);
         task->wake_at_us = deadline_us;
         task->wants_block = true;
-        task->set_voluntary_blocked(true);
     }
+    auto const ACCOUNTING = begin_kernel_wait_accounting(task);
     for (;;) {
         if (!scheduler_wait_halt_once(task, SchedulerHaltWaitKind::PROCESS_PARK, INTERRUPTS_WERE_ENABLED) || task == nullptr) {
             break;
         }
     }
+    asm volatile("cli" ::: "memory");
     if (task != nullptr) {
         task->wake_at_us = 0;
         task->wants_block = false;
-        task->set_voluntary_blocked(false);
         task->clear_wait_channel();
     }
+    finish_kernel_wait_accounting(task, ACCOUNTING);
     restore_interrupts_after_scheduler_wait(INTERRUPTS_WERE_ENABLED);
-    if (PAUSED_SYSCALL_ACCOUNTING) {
-        resume_syscall_accounting();
-    }
     restore_process_syscall_park_interrupts(INTERRUPTS_WERE_ENABLED, task);
 }
 

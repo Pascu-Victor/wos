@@ -355,6 +355,19 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/netpoll_backlog_source_test.py
 )
 add_test(
+    NAME local_wake_batch_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/local_wake_batch_test.py
+)
+set_tests_properties(local_wake_batch_test PROPERTIES LABELS "host;unit")
+add_test(
+    NAME process_timer_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/process_timer_source_test.py
+)
+add_test(
+    NAME ptrace_deferred_yield_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/ptrace_deferred_yield_test.py
+)
+add_test(
     NAME virtio_net_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/virtio_net_source_test.py
 )
@@ -472,8 +485,16 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/exec_source_test.py
 )
 add_test(
+    NAME gc_epoch_progress_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/gc_epoch_progress_test.py
+)
+add_test(
     NAME scheduler_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scheduler_source_test.py
+)
+add_test(
+    NAME preempt_guard_timing_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/preempt_guard_timing_test.py
 )
 add_test(
     NAME kernel_preemption_cpu_local_audit_test
@@ -592,6 +613,18 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_routing_source_test.py
 )
 add_test(
+    NAME event_wake_diagnostics_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/event_wake_diagnostics_test.py
+)
+add_test(
+    NAME scheduler_timer_trace_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scheduler_timer_trace_test.py
+)
+add_test(
+    NAME scheduler_poke_migration_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scheduler_poke_migration_test.py
+)
+add_test(
     NAME wki_remote_compute_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_remote_compute_source_test.py
 )
@@ -686,6 +719,14 @@ add_test(
 add_test(
     NAME vas_admission_reuse_runtime_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/vas_admission_reuse_runtime_test.py
+)
+add_test(
+    NAME cpu_accounting_snapshot_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/cpu_accounting_snapshot_runtime_test.py
+)
+add_test(
+    NAME kernel_wait_accounting_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/kernel_wait_accounting_runtime_test.py
 )
 add_test(
     NAME thread_backing_zero_test
@@ -813,6 +854,7 @@ set_tests_properties(    host_test_manifest_test
     wosdbg_interface_source_test
     sftp_timeout_source_test
     netpoll_backlog_source_test
+    process_timer_source_test
     virtio_net_source_test
     block_device_source_test
     buffer_cache_source_test
@@ -842,7 +884,9 @@ set_tests_properties(    host_test_manifest_test
     futex_source_test
     waitpid_source_test
     exec_source_test
+    gc_epoch_progress_test
     scheduler_source_test
+    preempt_guard_timing_test
     kernel_preemption_cpu_local_audit_test
     signal_source_test
     usercopy_source_test
@@ -872,6 +916,9 @@ set_tests_properties(    host_test_manifest_test
     wki_zone_source_test
     wki_peer_source_test
     wki_routing_source_test
+    event_wake_diagnostics_test
+    scheduler_timer_trace_test
+    scheduler_poke_migration_test
     wki_remote_compute_source_test
     wki_remote_vfs_source_test
     wki_chaos_workload_source_test
@@ -896,6 +943,8 @@ set_tests_properties(    host_test_manifest_test
     vmem_cache_perf_runtime_test
     vas_observer_perf_runtime_test
     vas_admission_reuse_runtime_test
+    cpu_accounting_snapshot_runtime_test
+    kernel_wait_accounting_runtime_test
     thread_backing_zero_test
     thread_initial_backing_test
     lazy_page_backing_test
@@ -1206,6 +1255,12 @@ set_tests_properties(perf_capture_io_test PROPERTIES LABELS "unit;host")
 add_test(NAME perf_run_observer_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/perf_run_observer_test.py)
 set_tests_properties(perf_run_observer_test PROPERTIES LABELS "unit;host")
+
+add_test(
+    NAME scheduler_epoch_progress_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scheduler_epoch_progress_test.py
+)
+set_tests_properties(scheduler_epoch_progress_test PROPERTIES LABELS "host;source")
 
 add_test(
     NAME rtld_bss_runtime_test

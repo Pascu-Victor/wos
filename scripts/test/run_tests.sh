@@ -161,6 +161,9 @@ UNIT_TESTS=(
     kernel_vmap_source_test
     sftp_timeout_source_test
     netpoll_backlog_source_test
+    local_wake_batch_test
+    process_timer_source_test
+    ptrace_deferred_yield_test
     virtio_net_source_test
     block_device_source_test
     buffer_cache_source_test
@@ -190,7 +193,10 @@ UNIT_TESTS=(
     futex_source_test
     waitpid_source_test
     exec_source_test
+    gc_epoch_progress_test
     scheduler_source_test
+    kernel_wait_accounting_runtime_test
+    preempt_guard_timing_test
     kernel_preemption_cpu_local_audit_test
     signal_source_test
     usercopy_source_test
@@ -220,6 +226,9 @@ UNIT_TESTS=(
     wki_zone_source_test
     wki_peer_source_test
     wki_routing_source_test
+    event_wake_diagnostics_test
+    scheduler_timer_trace_test
+    scheduler_poke_migration_test
     wki_remote_compute_source_test
     wki_remote_vfs_source_test
     wki_chaos_workload_source_test
@@ -296,9 +305,11 @@ UNIT_TESTS=(
     user_layout_walk_test
     page_table_zero_test
     root_kernel_mappings_test
+    cpu_accounting_snapshot_runtime_test
     mlibc_locale_runtime_test
     mlibc_slab_runtime_test
     perf_event_parser_test
+    scheduler_epoch_progress_test
     vmem_cache_perf_runtime_test
 )
 

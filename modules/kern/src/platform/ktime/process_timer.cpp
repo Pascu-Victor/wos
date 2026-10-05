@@ -16,7 +16,6 @@ namespace {
 using Task = sched::task::Task;
 using log = ker::mod::dbg::logger<"process_timer">;
 constexpr size_t WORK_BUDGET = 32;
-constexpr uint64_t POLL_US = 1000;
 sys::Spinlock service_lock;
 constinit TimerQueue real_queue{TimerDispatch::SYNCHRONOUS};
 Task* wake_head{};
@@ -26,6 +25,8 @@ uint64_t max_late_us{};
 std::atomic<uint64_t> expirations{0};
 std::atomic<bool> worker_ready{false};
 std::atomic<bool> worker_starting{false};
+std::atomic<Task*> worker_task{nullptr};
+std::atomic<bool> deferred_wake_requested{false};
 
 void unused_callback(void*) {}
 void count_expirations(uint64_t count) {
@@ -151,10 +152,40 @@ void dispatch_once(uint64_t now_us) {
     }
 }
 
+struct WorkerWait {
+    bool immediate{};
+    bool timed{};
+    uint64_t delay_us{};
+};
+
+auto worker_wait(uint64_t now_us) -> WorkerWait {
+    uint64_t const FLAGS = service_lock.lock_irqsave();
+    uint64_t deadline = 0;
+    bool const HAS_DEADLINE = real_queue.next_deadline(deadline);
+    WorkerWait const result{
+        .immediate = wake_head != nullptr || (HAS_DEADLINE && deadline <= now_us),
+        .timed = HAS_DEADLINE && deadline > now_us,
+        .delay_us = HAS_DEADLINE && deadline > now_us ? deadline - now_us : 0,
+    };
+    service_lock.unlock_irqrestore(FLAGS);
+    return result;
+}
+
+void wake_worker() {
+    if (auto* worker = worker_task.load(std::memory_order_acquire); worker != nullptr) {
+        sched::wake_task_from_event(worker, sched::EventWakeDeferredSwitch::PRESERVE);
+    }
+}
+
 void worker_main() {
     for (;;) {
         dispatch_once(time::get_us());
-        sched::kern_sleep_us(POLL_US);
+        auto const WAIT = worker_wait(time::get_us());
+        if (WAIT.immediate) continue;
+        if (WAIT.timed)
+            sched::kern_sleep_us(WAIT.delay_us);
+        else
+            sched::kern_block();
     }
 }
 
@@ -187,6 +218,7 @@ auto init() -> bool {
         // without a published worker or retry an ambiguously published task.
         return false;
     }
+    worker_task.store(worker, std::memory_order_release);
     worker_ready.store(true, std::memory_order_release);
     return true;
 }
@@ -235,6 +267,7 @@ auto set(Task& subject, int which, interval::Value requested, interval::Value* p
     service_lock.unlock_irqrestore(FLAGS);
     if (release_previous) release_work(*owner);
     if (release_failed) release_work(*owner);
+    if (KIND == interval::Kind::REAL && result == 0) wake_worker();
     return result;
 }
 
@@ -254,6 +287,7 @@ auto charge_locked(Task& owner) -> bool {
 }
 
 void notify(Task& owner) {
+    bool queued = false;
     uint64_t const FLAGS = service_lock.lock_irqsave();
     uint64_t const OWNER_FLAGS = owner.resource_lock.lock_irqsave();
     if (!owner.interval_timers.closed() && !owner.resource_cpu_admission_closed && !owner.interval_wake_queued &&
@@ -267,9 +301,15 @@ void notify(Task& owner) {
         wake_tail = &owner;
         owner.interval_wake_queued = true;
         wake_depth = arithmetic::saturating_add(wake_depth, 1);
+        queued = true;
     }
     owner.resource_lock.unlock_irqrestore(OWNER_FLAGS);
     service_lock.unlock_irqrestore(FLAGS);
+    if (queued) deferred_wake_requested.store(true, std::memory_order_release);
+}
+
+void service_deferred_wake() {
+    if (deferred_wake_requested.exchange(false, std::memory_order_acq_rel)) wake_worker();
 }
 
 void close(Task& owner) {
@@ -289,6 +329,7 @@ void close(Task& owner) {
     owner.resource_lock.unlock_irqrestore(OWNER_FLAGS);
     service_lock.unlock_irqrestore(FLAGS);
     while (releases-- != 0) release_work(owner);
+    wake_worker();
 }
 
 auto has_active_locked(const Task& owner) -> bool {
@@ -356,6 +397,7 @@ auto selftest_service() -> bool {
     dispatch_once(time::get_us());
     ok &= owner.interval_work_refs.load() == 0 && owner.ref_count.load() == 2 && owner.interval_timers.closed();
     ok &= real_queue.size() == 0 && wake_head == nullptr && wake_depth == 0;
+    deferred_wake_requested.store(false);
     worker_ready.store(false);
     return ok;
 }

@@ -442,6 +442,8 @@ struct Task {
     // Plain spinlocks disable task preemption without masking interrupts. This
     // keeps preemptible DAEMON/NAPI workers from being switched out while they
     // hold locks that other CPUs may spin on.
+    // Hold timestamps/maxima are sampled only with WOS_PREEMPT_GUARD_TIMING;
+    // zero denotes unavailable timing otherwise. Owner/depth stay unconditional.
     uint64_t preempt_disable_start_us = 0;
     uint64_t preempt_disable_max_us = 0;
     uint64_t preempt_disable_owner = 0;
@@ -1230,6 +1232,11 @@ struct Task {
     bool transition_state(TaskState from, TaskState to) {
         return state.compare_exchange_strong(from, to, std::memory_order_acq_rel, std::memory_order_acquire);
     }
+
+    // Caller-owned state, appended to preserve all existing member offsets.
+    // IRQ wake notifications bypass batching and never modify these fields.
+    uint32_t local_wake_batch_depth{};
+    bool local_wake_batch_pending{};
 };
 
 [[nodiscard]] inline auto process_pid(const Task& task) -> uint64_t { return task.owner_pid != 0 ? task.owner_pid : task.pid; }

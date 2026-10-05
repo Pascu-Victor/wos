@@ -469,11 +469,14 @@ def test_user_thread_tcbs_publish_nonzero_tid_before_user_execution() -> None:
     require_tokens(
         map_zeroed_body,
         [
-            "mm::phys::page_alloc_with_reclaim_may_fail(mm::PhysicalPageOwner::USER_THREAD_TLS, mm::paging::PAGE_SIZE, allocation_name)",
+            "mm::phys::page_alloc_full_overwrite_page_with_reclaim_may_fail(mm::PhysicalPageOwner::USER_THREAD_TLS, allocation_name)",
+            "std::memset(page, 0, mm::paging::PAGE_SIZE)",
             "mm::paging::page_types::USER | mm::paging::PAGE_NX",
         ],
         "page-granular NX TLS and SafeStack construction",
     )
+    require_order(map_zeroed_body, "std::memset(page, 0, mm::paging::PAGE_SIZE)", "mm::virt::map_page",
+                  "TLS and SafeStack backing must be cleared before user PTE publication")
     for forbidden in [
         'mm::phys::page_alloc(mm::PhysicalPageOwner::USER_THREAD_TLS, ALIGNED_TOTAL_SIZE, "thread_tls")',
         "mm::phys::page_split_to_order0(tls)",
@@ -576,7 +579,7 @@ def test_execve_publishes_new_context_before_old_image_teardown() -> None:
                             "ker::mod::mm::virt::release_pagemap(m_retired.pagemap, m_origin_pid);",
                             "ker::mod::sched::threading::destroy_thread(m_retired.thread);"], "owned old-image cleanup")
     if not (body.index("commit_native_exec_image(task, *PREPARED)") < body.index("PREPARED->mark_activated();") <
-            body.rindex("cleanup_exec_preparation(*task)")):
+            body.rindex("cleanup_exec_preparation_with_status(*task, 0)")):
         fail("old-image reclamation must follow publication and replacement activation")
     if "RetiredExecImage retired;" in body:
         fail("old-image storage must remain recoverable outside the syscall stack")
@@ -682,6 +685,7 @@ def test_gc_pagemap_scan_counts_publishers_not_execution_eligibility() -> None:
 def main() -> None:
     test_job_control_stops_gate_all_runnable_selection()
     test_process_cpu_observation_preserves_lifetime()
+    test_gc_pagemap_scan_counts_publishers_not_execution_eligibility()
     architecture_tests = (
         test_only_active_syscalls_can_defer_rescheduling_to_syscall_exit,
         test_cpu_limit_charge_does_not_double_count_syscalls,

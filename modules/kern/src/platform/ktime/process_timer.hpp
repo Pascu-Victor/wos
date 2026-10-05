@@ -29,6 +29,9 @@ auto charge_locked(sched::task::Task& owner) -> bool;
 // May be called under runqueue locks, never under resource_lock. Enqueue only;
 // recipient lookup and scheduler wake execute in the dedicated worker.
 void notify(sched::task::Task& owner);
+// Timer-IRQ safe point, outside runqueue locks. Delivers a wake requested by
+// notify() without recursively acquiring the runqueue that performed charging.
+void service_deferred_wake();
 // Committed process exit only, outside locks. Cancels all armed/queued state.
 void close(sched::task::Task& owner);
 // Caller holds owner's resource_lock after excluding setters and CPU producers.

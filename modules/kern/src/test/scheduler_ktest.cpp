@@ -32,6 +32,8 @@ auto scheduler_selftest_wait_timer_index_transfer_and_budget() -> bool;
 auto scheduler_selftest_concurrent_reschedule_requests_are_serialized() -> bool;
 auto scheduler_selftest_final_cpu_slice_freezes_accounting() -> bool;
 auto scheduler_selftest_resource_cpu_split_matches_task() -> bool;
+auto scheduler_selftest_wait_boundaries_preserve_cpu_and_fairness() -> bool;
+auto scheduler_selftest_blocked_runtime_excludes_eevdf_and_irq() -> bool;
 auto scheduler_selftest_runtime_delta_saturates() -> bool;
 auto scheduler_selftest_migration_policy_preserves_hot_process_migration() -> bool;
 auto scheduler_selftest_heap_scan_removal_repairs_stale_index() -> bool;
@@ -600,6 +602,14 @@ KTEST(SchedulerRuntime, ResourceCpuSplitMatchesTask) {
 
 KTEST(SchedulerRuntime, FinalCpuSliceFreezesAccounting) {
     KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_final_cpu_slice_freezes_accounting());
+}
+
+KTEST(SchedulerRuntime, WaitBoundariesPreserveCpuAndFairness) {
+    KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_wait_boundaries_preserve_cpu_and_fairness());
+}
+
+KTEST(SchedulerRuntime, BlockedRuntimeExcludesEevdfAndIrq) {
+    KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_blocked_runtime_excludes_eevdf_and_irq());
 }
 
 KTEST(SchedulerRuntime, GcCountsExitingPagemapPublishers) {

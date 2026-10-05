@@ -205,10 +205,13 @@ def require_preemptible_parking_rechecks_signals() -> None:
         "scheduler_wait_halt_once(task, SchedulerHaltWaitKind::PROCESS_PARK, INTERRUPTS_WERE_ENABLED)",
         "task->wake_at_us = 0",
         "task->wants_block = false",
-        "task->set_voluntary_blocked(false)",
         "task->clear_wait_channel()",
+        "finish_kernel_wait_accounting(task, ACCOUNTING)",
         "restore_interrupts_after_scheduler_wait(INTERRUPTS_WERE_ENABLED)",
     )
+    finish_body = body_after_marker(SCHEDULER_HPP.with_suffix(".cpp").read_text(), "void finish_kernel_wait_accounting(")
+    if "subject->set_voluntary_blocked(state.was_blocked)" not in finish_body:
+        fail("wait completion must restore the task's previous blocked state")
     if "request_local_timer_recheck()" in park_body:
         fail("preemptible park must arm its timer only inside scheduler_wait_halt_once")
 
