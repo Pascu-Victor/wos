@@ -38,8 +38,8 @@
       "id": "dropbear",
       "path": "toolchain/src/dropbear",
       "urls": ["https://github.com/Pascu-Victor/dropbear.git"],
-      "commit": "2183fd364769021321f26c8d15a4fef3404043d7",
-      "treeSha256": "dfbef19a5e1d777235cb2532f9caffdd8feedd943ed39de79933e65a81a4253a",
+      "commit": "fd2461a5c4bb4f8cb2348fe5f72937d35762049d",
+      "treeSha256": "557fa42ebb9e621a34f48790f7c30fbbbd555bcab3e8b629c3347c121ea3c38b",
       "license": "MIT AND BSD-2-Clause AND Public-Domain",
       "role": "SSH userspace"
     },

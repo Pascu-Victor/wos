@@ -136,6 +136,7 @@ UNIT_TESTS=(
     time_source_test
     init_source_test
     service_manifest_config_source_test
+    ssh_broker_readiness_test
     init_supervisor_docs_source_test
     shutdown_source_test
     init_control_source_test

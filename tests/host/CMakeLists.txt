@@ -279,6 +279,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/service_manifest_config_source_test.py
 )
 add_test(
+    NAME ssh_broker_readiness_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/ssh_broker_readiness_test.py
+)
+add_test(
     NAME init_supervisor_docs_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/init_supervisor_docs_source_test.py
 )
@@ -450,6 +454,7 @@ add_test(
     NAME waitpid_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/waitpid_source_test.py
 )
+
 add_test(
     NAME exec_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/exec_source_test.py
@@ -710,8 +715,7 @@ add_test(
     NAME xfs_transaction_rollback_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_transaction_rollback_source_test.py
 )
-set_tests_properties(
-    host_test_manifest_test
+set_tests_properties(    host_test_manifest_test
     semantic_regression_test
     ktest_cov_test
     coverage_summary_test
@@ -742,6 +746,7 @@ set_tests_properties(
     time_source_test
     init_source_test
     service_manifest_config_source_test
+    ssh_broker_readiness_test
     init_supervisor_docs_source_test
     stack_resume_source_test
     e1000_dma_source_test
