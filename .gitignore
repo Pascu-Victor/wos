@@ -58,3 +58,7 @@ configs/rootfs/root/.ssh/authorized_keys
 /goals/
 
 wki-chaos-data/
+
+# Local agent handoffs and generated VM state (including authentication keys)
+/.agents/
+/cluster-overlays/
