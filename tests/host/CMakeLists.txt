@@ -322,6 +322,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/journal_source_test.py
 )
 add_test(
+    NAME serial_fifo_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/serial_fifo_test.py
+)
+add_test(
     NAME wki_launcher_runtime_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_launcher_runtime_test.py
 )

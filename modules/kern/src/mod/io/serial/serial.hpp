@@ -46,6 +46,9 @@ void write_unlocked(char c);
 void write_unlocked(uint64_t num);
 void write_hex_unlocked(uint64_t num);
 void write_bin_unlocked(uint64_t num);
+// Complete synchronous FIFO output before returning a normal journal record.
+// Caller holds the serial lock; early/non-FIFO and panic paths stay unchanged.
+void flush_unlocked();
 
 // RAII-style scoped lock for multiple writes
 class ScopedLock {

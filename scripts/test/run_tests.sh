@@ -339,6 +339,7 @@ UNIT_TESTS=(
     mlibc_slab_runtime_test
     perf_event_parser_test
     scheduler_epoch_progress_test
+    serial_fifo_test
     thread_stack_pressure_test
     vmem_cache_perf_runtime_test
     wki_submit_phase_test

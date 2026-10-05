@@ -1,12 +1,15 @@
 #include "serial.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <platform/asm/cpu.hpp>
 #include <platform/mm/tlb_shootdown.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <span>
 
 #include "mod/io/port/port.hpp"
 
@@ -16,8 +19,12 @@ namespace {
 constexpr uint16_t DATA_PORT = 0x3F8;
 constexpr uint16_t STATUS_PORT = DATA_PORT + 5;
 constexpr uint8_t STATUS_TX_READY = 0x20;
+constexpr uint8_t STATUS_TX_EMPTY = 0x40;
+constexpr uint8_t FIFO_READY_MASK = 0xC0;
+constexpr size_t TX_FIFO_SIZE = 16;
 constexpr uint8_t OP_DISABLE_INTERRUPTS = 0x00;
 bool is_init = false;
+std::atomic<bool> tx_fifo_available{false};
 // Reentrant serial lock: track the owning task when scheduler context exists,
 // otherwise fall back to a tagged CPU id during very early boot.
 constexpr uintptr_t NO_OWNER = 0;
@@ -146,6 +153,62 @@ void write_char_unlocked(char c) {
     }
     outb(DATA_PORT, c);
 }
+
+auto disable_tx_interrupts() -> uint64_t {
+    // Written by inline asm output constraints.
+    // NOLINTNEXTLINE(misc-const-correctness)
+    uint64_t flags = 0;
+    asm volatile("pushfq; pop %0; cli" : "=r"(flags)::"memory");
+    return flags;
+}
+
+void restore_tx_interrupts(uint64_t flags) {
+    if ((flags & cpu::GATE_IF_MASK) != 0) {
+        asm volatile("sti" ::: "memory");
+    }
+}
+
+void write_fifo_bytes(const char* bytes, size_t count) {
+    // Some KVM string-I/O paths emulate OUTSB one byte at a time. Ordinary
+    // OUTB avoids that emulation while retaining one ready check per burst.
+    for (char const VALUE : std::span<const char>(bytes, count)) {
+        outb(DATA_PORT, static_cast<uint8_t>(VALUE));
+    }
+}
+
+void write_bytes_unlocked(const char* bytes, uint64_t len) {
+    if (len == 0) {
+        return;
+    }
+    std::span<const char> remaining(bytes, static_cast<size_t>(len));
+    if (!tx_fifo_available.load(std::memory_order_acquire) || is_panic_mode()) {
+        for (char const VALUE : remaining) {
+            write_char_unlocked(VALUE);
+        }
+        return;
+    }
+
+    while (!remaining.empty()) {
+        // The serial lock is reentrant for interrupt logging on its owner.
+        // Mask IRQs across the empty check and burst so a nested write cannot
+        // consume the FIFO capacity that this burst is about to use.
+        uint64_t const FLAGS = disable_tx_interrupts();
+        if ((inb(STATUS_PORT) & STATUS_TX_READY) == 0) {
+            restore_tx_interrupts(FLAGS);
+            asm volatile("pause" ::: "memory");
+            continue;
+        }
+        size_t const COUNT = std::min(remaining.size(), TX_FIFO_SIZE);
+        write_fifo_bytes(remaining.data(), COUNT);
+        remaining = remaining.subspan(COUNT);
+        restore_tx_interrupts(FLAGS);
+    }
+    // Do not leave a final FIFO burst queued beyond the write call. As with
+    // character writes, only a character in the shift register may remain.
+    while ((inb(STATUS_PORT) & STATUS_TX_READY) == 0) {
+        asm volatile("pause" ::: "memory");
+    }
+}
 }  // namespace
 
 void init() {
@@ -166,21 +229,18 @@ void init() {
     outb(DATA_PORT + 3, LINE_CTRL_8N1);
     outb(DATA_PORT + 2, FIFO_CTRL_ENABLE);
     outb(DATA_PORT + 4, MODEM_CTRL);
+    tx_fifo_available.store((inb(DATA_PORT + 2) & FIFO_READY_MASK) == FIFO_READY_MASK, std::memory_order_release);
     is_init = true;
 }
 
 void write(const char* str) {
     ScopedLock const LOCK;
-    for (size_t i = 0; str[i] != '\0'; i++) {
-        write_char_unlocked(str[i]);
-    }
+    write_unlocked(str);
 }
 
 void write(const char* str, uint64_t len) {
     ScopedLock const LOCK;
-    for (size_t i = 0; i < len; i++) {
-        write_char_unlocked(str[i]);
-    }
+    write_unlocked(str, len);
 }
 
 void write(const char C) {
@@ -237,19 +297,20 @@ void write_bin(uint64_t num) {
 }
 
 // Unlocked write variants - caller must hold lock
-void write_unlocked(const char* str) {
-    for (size_t i = 0; str[i] != '\0'; i++) {
-        write_char_unlocked(str[i]);
-    }
-}
+void write_unlocked(const char* str) { write_bytes_unlocked(str, std::strlen(str)); }
 
-void write_unlocked(const char* str, uint64_t len) {
-    for (size_t i = 0; i < len; i++) {
-        write_char_unlocked(str[i]);
-    }
-}
+void write_unlocked(const char* str, uint64_t len) { write_bytes_unlocked(str, len); }
 
 void write_unlocked(const char C) { write_char_unlocked(C); }
+
+void flush_unlocked() {
+    if (!tx_fifo_available.load(std::memory_order_acquire) || is_panic_mode()) {
+        return;
+    }
+    while ((inb(STATUS_PORT) & STATUS_TX_EMPTY) == 0) {
+        asm volatile("pause" ::: "memory");
+    }
+}
 
 void write_unlocked(uint64_t num) {
     constexpr size_t BUF_SIZE = 21;  // Max uint64_t is 20 digits + null terminator

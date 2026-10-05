@@ -311,6 +311,7 @@ void serial_write_record(const JournalRecord& rec) {
     mod::io::serial::write_unlocked(": ");
     mod::io::serial::write_unlocked(static_cast<const char*>(rec.message), rec.message_len);
     mod::io::serial::write_unlocked('\n');
+    mod::io::serial::flush_unlocked();
 }
 
 void wake_waiters() {
