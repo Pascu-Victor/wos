@@ -305,6 +305,9 @@ if(WOS_KASAN)
         src/platform/mm/paging.opt.cpp
         src/platform/mm/page_alloc.cpp
         src/platform/mm/reclaim.cpp
+        # Fixed debugger metadata is built before the IDT/shadow handler;
+        # kernel-image records are also emitted from the coredump path.
+        src/platform/loader/kernel_runtime_image.cpp
         src/platform/mm/dyn/kmalloc.opt.cpp
         src/platform/mm/dyn/slab.opt.cpp
         src/minimalist_malloc/mini_malloc.cpp
