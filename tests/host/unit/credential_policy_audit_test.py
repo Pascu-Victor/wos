@@ -1243,13 +1243,21 @@ def test_mount_target_uses_admission_snapshot_before_preparation():
     for effect in ["wki_peer_find_by_hostname(", "devfs_resolve_block_source(", "probe_block_device_fstype(", "prepare_mount_filesystem("]:
         assert checked < mount.index(effect), effect
     assert "vfs_consume_lookup(" not in mount
-    assert mount.count("consume_mount_target(") == 3
+    assert mount.count("consume_mount_target(") == 2
+    assert mount.count("consume_prepared_mount_target(") == 1
     assert "strip_current_task_root_prefix(" not in mount
     assert mount.count("MountPathKind::RETAINED_PHYSICAL") == 2
     assert "prepare_mount_filesystem(lookup.path()," in mount
     assert "prepare_mount_filesystem(context.lookup->path()," in mount
     assert "consume_mount_target(lookup, *authorization_task, CREDENTIALS)" in mount
-    assert "consume_mount_target(lookup, *authorization_task, CREDENTIALS, &prepared)" in mount
+    assert "consume_prepared_mount_target(lookup, target, *authorization_task, CREDENTIALS, prepared)" in mount
+    retry = body_after(core, "auto consume_prepared_mount_target(")
+    assert retry.count("consume_mount_target(lookup, task, credentials, &prepared)") == 2
+    assert "&lookup, 3, false, &credentials" in retry
+    assert "attempt < 3 && result == -EAGAIN" in retry
+    assert "get_current_task" not in retry and "->credentials()" not in retry
+    for field in ["task_id", "credentials", "root_hash", "cwd_hash", "root_anchor_identity", "cwd_anchor_identity", "root_identity_view"]:
+        assert f"current.{field} != AUTHORIZATION.{field}" in retry
     assert "consume_mount_target(*context.lookup, *context.task, *context.credentials, &prepared)" in mount
     assert ".task = authorization_task, .credentials = &CREDENTIALS" in mount
     consume = body_after(core, "auto consume_mount_target(")

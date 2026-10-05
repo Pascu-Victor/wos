@@ -26061,6 +26061,49 @@ auto consume_mount_target(const LookupHandle& handle, const ker::mod::sched::tas
     ker::mod::sys::MutexGuard publication_guard(g_vfs_namespace_publication_mutex);
     return consume_lookup_locked(handle, prepared != nullptr, consume, &context, &task, &credentials);
 }
+
+auto consume_prepared_mount_target(LookupHandle& lookup, const char* target, ker::mod::sched::task::Task& task,
+                                   const ker::mod::security::Snapshot& credentials, PreparedMount& prepared) -> int {
+    int result = consume_mount_target(lookup, task, credentials, &prepared);
+    if (result != -EAGAIN || lookup.mount() == nullptr || lookup.mount()->fs_type != FSType::TMPFS || lookup.directory_view() ||
+        lookup.mount()->dev_id == 0 || lookup.object_identity() == 0) {
+        return result;
+    }
+
+    // Unrelated namespace publication can invalidate the lookup while a disk
+    // filesystem is being prepared. Reauthorize the same retained physical
+    // target without repeating recovery/teardown of that prepared filesystem.
+    // TMPFS incarnation IDs (unlike XFS inode-cache pointers) survive releasing
+    // the old handle and distinguish an unlinked/recreated directory.
+    auto const AUTHORIZATION = lookup.authorization();
+    auto const MOUNT_ID = lookup.mount()->dev_id;
+    auto const PARENT_ID = lookup.parent_identity();
+    auto const OBJECT_ID = lookup.object_identity();
+    std::array<char, LookupHandle::PATH_CAPACITY> physical_path __attribute__((uninitialized));
+    std::memcpy(physical_path.data(), lookup.path(), lookup.path_length() + 1);
+    for (unsigned attempt = 0; attempt < 3 && result == -EAGAIN; ++attempt) {
+        // Handle release may close Files. No publication guard spans release,
+        // allocation, path search, or backend I/O during reacquisition.
+        lookup.reset();
+        result = vfs_acquire_lookup(&task, AT_FDCWD, target, LookupIntent::MOUNT_TARGET, LookupFollowPolicy::FOLLOW_FINAL, true, true,
+                                    &lookup, 3, false, &credentials);
+        if (result != 0) return result;
+        auto const& current = lookup.authorization();
+        if (lookup.mount()->fs_type != FSType::TMPFS || lookup.mount()->dev_id != MOUNT_ID || lookup.directory_view() ||
+            lookup.parent_identity() != PARENT_ID || lookup.object_identity() != OBJECT_ID ||
+            std::strcmp(lookup.path(), physical_path.data()) != 0 || current.task_id != AUTHORIZATION.task_id ||
+            current.credentials != AUTHORIZATION.credentials || current.root_hash != AUTHORIZATION.root_hash ||
+            current.cwd_hash != AUTHORIZATION.cwd_hash || current.root_anchor_identity != AUTHORIZATION.root_anchor_identity ||
+            current.cwd_anchor_identity != AUTHORIZATION.cwd_anchor_identity ||
+            current.root_identity_view != AUTHORIZATION.root_identity_view) {
+            return -EAGAIN;
+        }
+        // Fresh search grants and all namespace/backend/permission checks are
+        // consumed under the ordinary publication guard; none are bypassed.
+        result = consume_mount_target(lookup, task, credentials, &prepared);
+    }
+    return result;
+}
 }  // namespace
 
 auto vfs_mount(const char* source, const char* target, const char* fstype, unsigned long flags, const char* data) -> int {
@@ -26228,7 +26271,7 @@ auto vfs_mount(const char* source, const char* target, const char* fstype, unsig
     if (PREPARE != 0) {
         return PREPARE;
     }
-    int const PUBLISH = consume_mount_target(lookup, *authorization_task, CREDENTIALS, &prepared);
+    int const PUBLISH = consume_prepared_mount_target(lookup, target, *authorization_task, CREDENTIALS, prepared);
     finish_prepared_mount(&prepared);
     return PUBLISH;
 }
@@ -28420,6 +28463,92 @@ auto vfs_selftest_mount_physical_target() -> bool {
     auto other = find_mount_point(OTHER);
     return mounted && mounted->nosuid && std::strcmp(mounted->path, TARGET) == 0 && other && other.get() != mounted.get() &&
            g_vfs_namespace_generation.load(std::memory_order_acquire) == NAMESPACE + 1;
+}
+
+auto vfs_selftest_mount_target_refresh() -> bool {
+    constexpr const char* BASE = "/tmp/ktest_mount_refresh";
+    constexpr const char* TARGET = "/tmp/ktest_mount_refresh/target";
+    constexpr const char* OTHER = "/tmp/ktest_mount_refresh/other";
+    PreparedMount prepared{};
+    bool base_created = false, target_created = false, other_created = false, target_mounted = false, other_mounted = false;
+    struct Cleanup {
+        PreparedMount& prepared;
+        bool& base_created;
+        bool& target_created;
+        bool& other_created;
+        bool& target_mounted;
+        bool& other_mounted;
+        ~Cleanup() {
+            finish_prepared_mount(&prepared);
+            if (target_mounted) static_cast<void>(unmount_filesystem(TARGET));
+            if (other_mounted) static_cast<void>(unmount_filesystem(OTHER));
+            if (target_created) static_cast<void>(vfs_rmdir(TARGET));
+            if (other_created) static_cast<void>(vfs_rmdir(OTHER));
+            if (base_created) static_cast<void>(vfs_rmdir(BASE));
+        }
+    } cleanup{prepared, base_created, target_created, other_created, target_mounted, other_mounted};
+    if (vfs_mkdir(BASE, 0755) != 0) return false;
+    base_created = true;
+    if (vfs_mkdir(TARGET, 0755) != 0) return false;
+    target_created = true;
+    if (vfs_mkdir(OTHER, 0755) != 0) return false;
+    other_created = true;
+    auto task = std::make_unique<ker::mod::sched::task::Task>();
+    if (!task) return false;
+    task->pid = UINT64_MAX - 26;
+    auto const ROOT = ker::mod::security::Snapshot::bootstrap_root();
+    LookupHandle lookup{};
+    auto acquire = [&]() {
+        lookup.reset();
+        return vfs_acquire_lookup(task.get(), AT_FDCWD, TARGET, LookupIntent::MOUNT_TARGET, LookupFollowPolicy::FOLLOW_FINAL, true, true,
+                                  &lookup, 0, false, &ROOT);
+    };
+    auto prepare = [&]() {
+        return prepare_mount_filesystem(lookup.path(), "tmpfs", nullptr, MOUNT_FLAG_NOSUID, nullptr, nullptr, nullptr, &prepared,
+                                        MountPathKind::RETAINED_PHYSICAL);
+    };
+    if (acquire() != 0 || lookup.mount()->fs_type != FSType::TMPFS || lookup.directory_view() || prepare() != 0) return false;
+    // A real unrelated mount changes table generation after preparation. The
+    // stale consumer still rejects it; only full reacquisition can publish.
+    if (mount_filesystem(OTHER, "tmpfs", nullptr) != 0) return false;
+    other_mounted = true;
+    if (consume_mount_target(lookup, *task, ROOT, &prepared) != -EAGAIN) return false;
+    target_mounted = consume_prepared_mount_target(lookup, TARGET, *task, ROOT, prepared) == 0;
+    finish_prepared_mount(&prepared);
+    lookup.reset();
+    if (!target_mounted || unmount_filesystem(TARGET) != 0) return false;
+    target_mounted = false;
+
+    if (acquire() != 0 || prepare() != 0) return false;
+    if (vfs_rmdir(TARGET) != 0) return false;
+    target_created = false;
+    if (vfs_mkdir(TARGET, 0755) != 0) return false;
+    target_created = true;
+    auto const MOUNTS = mount_table_generation_snapshot();
+    int const REPLACED = consume_prepared_mount_target(lookup, TARGET, *task, ROOT, prepared);
+    target_mounted = REPLACED == 0;
+    lookup.reset();
+    finish_prepared_mount(&prepared);
+    if (REPLACED != -EAGAIN || mount_table_generation_snapshot() != MOUNTS) return false;
+
+    if (acquire() != 0 || prepare() != 0) return false;
+    auto const CWD = task->cwd;
+    std::memcpy(task->cwd.data(), "/tmp", sizeof("/tmp"));
+    int const CONTEXT_CHANGED = consume_prepared_mount_target(lookup, TARGET, *task, ROOT, prepared);
+    target_mounted = CONTEXT_CHANGED == 0;
+    task->cwd = CWD;
+    lookup.reset();
+    finish_prepared_mount(&prepared);
+    if (CONTEXT_CHANGED != -EAGAIN || mount_table_generation_snapshot() != MOUNTS) return false;
+
+    if (acquire() != 0 || prepare() != 0) return false;
+    auto restricted = ROOT;
+    if (ROOT.prepare({.change = ker::mod::security::Change::DROP_AUTHORITY, .authority_ceiling = 0}, restricted) != 0) return false;
+    int const CREDENTIALS_CHANGED = consume_prepared_mount_target(lookup, TARGET, *task, restricted, prepared);
+    target_mounted = CREDENTIALS_CHANGED == 0;
+    lookup.reset();
+    finish_prepared_mount(&prepared);
+    return CREDENTIALS_CHANGED == -EAGAIN && mount_table_generation_snapshot() == MOUNTS;
 }
 
 auto vfs_selftest_mount_admitted_snapshot() -> bool {

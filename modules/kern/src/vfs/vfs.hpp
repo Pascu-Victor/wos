@@ -591,6 +591,7 @@ auto vfs_selftest_pipe_failure_unwinds() -> bool;
 auto vfs_selftest_pipe_flags() -> bool;
 auto vfs_selftest_mount_admitted_snapshot() -> bool;
 auto vfs_selftest_mount_physical_target() -> bool;
+auto vfs_selftest_mount_target_refresh() -> bool;
 auto vfs_selftest_mount_procfs_binding() -> bool;
 auto vfs_selftest_mount_devfs_binding() -> bool;
 auto vfs_selftest_mount_source_binding() -> bool;

@@ -299,7 +299,8 @@ def check_mount_publication_is_two_phase(mount_source: str, core_source: str, re
     for token in ("validate_mount_target_lookup(target, nullptr)", "publish_prepared_mount", "&task, &credentials"):
         if token not in consume:
             fail(f"mount target consumption lost explicit admission: {token}")
-    if "vfs_consume_lookup(" in mount_handler or mount_handler.count("consume_mount_target(") != 3:
+    if ("vfs_consume_lookup(" in mount_handler or mount_handler.count("consume_mount_target(") != 2
+            or mount_handler.count("consume_prepared_mount_target(") != 1):
         fail("every public mount stage must use its explicit admitted task and snapshot")
     if "RemoteVfsMountPublisher" not in remote_source or "publisher != nullptr" not in remote_source:
         fail("remote mount no longer delegates its publication to retained-target validation")

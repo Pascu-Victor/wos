@@ -239,6 +239,7 @@ UNIT_TESTS=(
     event_wake_diagnostics_test
     scheduler_timer_trace_test
     scheduler_poke_migration_test
+    vfs_mount_retry_test
     wki_remote_compute_source_test
     wki_remote_vfs_source_test
     wki_chaos_workload_source_test

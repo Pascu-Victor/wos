@@ -2752,6 +2752,8 @@ KTEST(Credentials, MountIdentityExhaustionPreservesPublicationAndExactRetirement
 
 KTEST(Credentials, MountPublicationKeepsAdmittedPhysicalTarget) { KEXPECT_TRUE(ker::vfs::vfs_selftest_mount_physical_target()); }
 
+KTEST(Credentials, MountPublicationRefreshesOnlyUnchangedTmpfsTarget) { KEXPECT_TRUE(ker::vfs::vfs_selftest_mount_target_refresh()); }
+
 KTEST(Credentials, MountPublicationKeepsSelectedProcfsDirectory) { KEXPECT_TRUE(ker::vfs::vfs_selftest_mount_procfs_binding()); }
 
 KTEST(Credentials, MountPublicationKeepsSelectedDevfsDirectory) { KEXPECT_TRUE(ker::vfs::vfs_selftest_mount_devfs_binding()); }

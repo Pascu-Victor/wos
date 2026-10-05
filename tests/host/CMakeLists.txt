@@ -668,6 +668,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scheduler_poke_migration_test.py
 )
 add_test(
+    NAME vfs_mount_retry_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/vfs_mount_retry_test.py
+)
+add_test(
     NAME wki_remote_compute_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_remote_compute_source_test.py
 )
@@ -984,6 +988,7 @@ set_tests_properties(    host_test_manifest_test
     event_wake_diagnostics_test
     scheduler_timer_trace_test
     scheduler_poke_migration_test
+    vfs_mount_retry_test
     wki_remote_compute_source_test
     wki_remote_vfs_source_test
     wki_chaos_workload_source_test
