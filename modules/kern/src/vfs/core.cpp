@@ -20412,7 +20412,7 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
                 return finish(-ESRCH);
             }
 
-            if (current_task_has_deliverable_signal()) {
+            if (current_task->has_interrupting_signal_pending(&current_task->exec_read_interrupted)) {
                 size_t const BUFFERED = st->count;
                 size_t const CAPACITY = st->capacity;
                 int const OPEN_ENDS = st->open_ends.load(std::memory_order_relaxed);

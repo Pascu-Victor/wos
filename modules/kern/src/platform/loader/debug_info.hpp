@@ -3,6 +3,7 @@
 #include <extern/elf.h>
 
 #include <defines/defines.hpp>
+#include <memory>
 #include <platform/mm/virt.hpp>
 #include <vector>
 
@@ -35,6 +36,8 @@ struct ProcessDebugInfo {
     uint64_t base_address{};
     uint64_t entry_point{};
     std::vector<DebugSection> sections;
+    // Rows borrow names from these process-owned, individually stable tables.
+    std::vector<std::unique_ptr<char[]>> section_name_storage;
     std::vector<DebugSymbol> symbols;
 
     // ELF header information
@@ -63,6 +66,10 @@ extern std::vector<ProcessDebugInfo> debug_registry;
 // Functions to manage debug info
 void register_process(uint64_t pid, const char* name, uint64_t base_addr, uint64_t entry_point);
 void add_debug_section(uint64_t pid, const char* name, uint64_t vaddr, uint64_t paddr, uint64_t size, uint64_t file_offset, uint32_t type);
+// Copy one complete bounded section-name table, retaining it until registry
+// rollback/unregister. Missing PID succeeds with retained_names=nullptr.
+auto retain_section_names(uint64_t pid, const char* names, size_t size, const char*& retained_names) -> bool;
+
 void add_debug_symbol(uint64_t pid, const char* name, uint64_t vaddr, uint64_t paddr, uint64_t size, uint8_t bind, uint8_t type,
                       bool is_tls_offset, uint16_t shndx, uint64_t raw_value);
 void set_elf_headers(uint64_t pid, const Elf64_Ehdr& header, uint64_t header_addr);

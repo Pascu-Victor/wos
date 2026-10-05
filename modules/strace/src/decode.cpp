@@ -68,6 +68,8 @@ auto subop_name(uint64_t callnum, uint64_t op) -> std::string_view {
                     return "log_block_begin";
                 case ker::abi::sys_log::sys_log_ops::LOG_BLOCK_END:
                     return "log_block_end";
+                case ker::abi::sys_log::sys_log_ops::PERF_TRACE:
+                    return "perf_trace";
             }
             break;
         case ker::abi::callnums::futex:

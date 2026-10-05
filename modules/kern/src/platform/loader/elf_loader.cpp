@@ -529,6 +529,7 @@ auto view_elf(const ElfFileView& view) -> ElfFile {
     elf.read_at = view.read_at;
     elf.read_context = view.read_context;
     elf.logical_size = view.logical_size;
+    elf.source_pointers_stable = view.source_metadata_stable;
     elf.load_base = 0;
     return elf;
 }
@@ -1155,7 +1156,17 @@ auto load_section_headers(const ElfFile& elf, ker::mod::mm::virt::PageTable* pag
     if (!metadata_plan.process_sections) {
         return true;
     }
-    const char* section_names = elf.section_names;
+    ElfFile debug_elf = elf;
+    if (elf.source_pointers_stable) {
+        const char* retained_names = nullptr;
+        if (!debug::retain_section_names(pid, elf.section_names, static_cast<size_t>(elf.section_names_size), retained_names)) {
+            return false;
+        }
+        // A concurrently absent registry cannot retain borrowed rows safely.
+        debug_elf.source_pointers_stable = retained_names != nullptr;
+        if (retained_names != nullptr) debug_elf.section_names = retained_names;
+    }
+    const char* section_names = debug_elf.section_names;
 
     // The PID-scoped registry belongs to the primary image. The interpreter is
     // loaded into the same pagemap and may append section rows below, but must
@@ -1201,14 +1212,14 @@ auto load_section_headers(const ElfFile& elf, ker::mod::mm::virt::PageTable* pag
 
     for (size_t section_index = 0; section_index < elf.elf_head.e_shnum; section_index++) {
         auto const* section_header = section_header_at(elf, section_index);
-        const char* section_name = section_name_at(elf, section_header->sh_name);
+        const char* section_name = section_name_at(debug_elf, section_header->sh_name);
 #ifdef ELF_DEBUG
         mod::dbg::log("Section name: %s", sectionName);
 #endif
         (void)section_name;
 
         // Register sections for debugging without re-mapping any PT_LOAD-backed content
-        if (elf.source_pointers_stable && section_header->sh_type == SHT_PROGBITS && section_header->sh_size > 0) {
+        if (debug_elf.source_pointers_stable && section_header->sh_type == SHT_PROGBITS && section_header->sh_size > 0) {
             // A source-controlled section address is diagnostic metadata, not
             // mapping authority. Record it as resident only when PT_LOAD
             // actually covers the complete byte range.
@@ -1232,7 +1243,7 @@ auto load_section_headers(const ElfFile& elf, ker::mod::mm::virt::PageTable* pag
             }
         }
         // Additionally, record GOT sections in debug info registry for diagnostics (no remapping or copying here)
-        if (elf.source_pointers_stable &&
+        if (debug_elf.source_pointers_stable &&
             ((std::strncmp(section_name, ".got", 4) == 0) || (std::strncmp(section_name, ".got.plt", 8) == 0)) &&
             section_header->sh_addr != 0 && section_header->sh_size > 0 &&
             range_is_covered_by_load_segments(elf, section_header->sh_addr, section_header->sh_size, false)) {

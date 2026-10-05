@@ -1,5 +1,6 @@
 #include "exec.hpp"
 
+#include <abi/callnums/perf_trace.h>
 #include <abi/callnums/process.h>
 #include <bits/off_t.h>
 #include <bits/ssize_t.h>
@@ -46,6 +47,7 @@
 #include <platform/sys/signal.hpp>
 #include <platform/sys/usercopy.hpp>
 #include <platform/sys/userspace.hpp>
+#include <span>
 #include <string_view>
 #include <syscalls_impl/multiproc/threadControl.hpp>
 #include <util/hcf.hpp>
@@ -82,6 +84,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
 constexpr int MAX_SHEBANG_DEPTH = 4;
 constexpr size_t EXEC_PATH_MAX = 512;
 constexpr size_t EXEC_ARG_BYTES_MAX = static_cast<size_t>(2) * 1024 * 1024;
+constexpr size_t EXEC_ARG_SMALL_BYTES = 1024;
 constexpr int WOS_SIGKILL = 9;
 constexpr int WOS_SIGSTOP = 19;
 constexpr uint64_t MAX_SPAWN_ACTIONS = 32;
@@ -237,34 +240,105 @@ auto check_exec_permission_from_stat(const ker::mod::security::Snapshot& credent
 }
 
 struct LocalProcStage {
-    uint32_t correlation;
-    uint64_t started_us;
+    uint32_t correlation{};
+    uint64_t started_us{};
+    uint64_t subject_pid{};
+    uint64_t bytes{};
+    uint64_t capture_session = ker::mod::perf::PERF_ANY_SESSION;
+    ker::mod::perf::WkiPerfLocalProcOp op{};
+    bool active{};
 };
 
 struct NativeExecCompletion {
-    LocalProcStage commit_stage{};
-    uint32_t correlation{};
-    uint64_t started_us{};
-    uint64_t source_file_size{};
+    size_t trace_depth{};
+    uint64_t subject_pid{};
 };
 
-auto begin_local_proc_stage(ker::mod::sched::task::Task* task, ker::mod::perf::WkiPerfLocalProcOp op, uint32_t aux, uint64_t callsite)
+auto begin_local_proc_stage_for_subject(uint64_t subject_pid, ker::mod::perf::WkiPerfLocalProcOp op, uint32_t aux, uint64_t callsite)
     -> LocalProcStage {
+    uint64_t const SESSION =
+        ker::mod::perf::current_wki_capture_session(ker::mod::perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(op));
+    if (SESSION == ker::mod::perf::PERF_ANY_SESSION) {
+        return {};
+    }
     LocalProcStage const STAGE = {
         .correlation = ker::mod::perf::next_wki_trace_correlation(),
         .started_us = ker::mod::time::get_us(),
+        .subject_pid = subject_pid,
+        .capture_session = SESSION,
+        .op = op,
+        .active = true,
     };
-    record_local_proc_event(task, op, ker::mod::perf::WkiPerfPhase::BEGIN, STAGE.correlation, 0, aux, callsite);
+    ker::mod::perf::record_wki_event(static_cast<uint32_t>(ker::mod::cpu::current_cpu()), subject_pid,
+                                     ker::mod::perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(op),
+                                     ker::mod::perf::WkiPerfPhase::BEGIN, 0, 0, STAGE.correlation, 0, aux, callsite, SESSION);
     return STAGE;
 }
 
-auto end_local_proc_stage(ker::mod::sched::task::Task* task, ker::mod::perf::WkiPerfLocalProcOp op, const LocalProcStage& stage,
+auto begin_local_proc_stage(ker::mod::sched::task::Task* task, ker::mod::perf::WkiPerfLocalProcOp op, uint32_t aux, uint64_t callsite)
+    -> LocalProcStage {
+    return task != nullptr ? begin_local_proc_stage_for_subject(task->pid, op, aux, callsite) : LocalProcStage{};
+}
+
+auto end_local_proc_stage(ker::mod::sched::task::Task* /*task*/, ker::mod::perf::WkiPerfLocalProcOp op, LocalProcStage& stage,
                           int32_t status, uint64_t bytes, uint64_t callsite) -> uint32_t {
-    uint32_t const ELAPSED_US = clamp_perf_aux(ker::mod::time::get_us() - stage.started_us);
-    record_local_proc_event(task, op, ker::mod::perf::WkiPerfPhase::END, stage.correlation, status, ELAPSED_US, callsite);
+    if (!std::exchange(stage.active, false)) {
+        return 0;
+    }
+    if (stage.capture_session !=
+        ker::mod::perf::current_wki_capture_session(ker::mod::perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(op))) {
+        return 0;
+    }
+    uint64_t const NOW = ker::mod::time::get_us();
+    uint32_t const ELAPSED_US = clamp_perf_aux(NOW >= stage.started_us ? NOW - stage.started_us : 0);
+    // Completion may run on the canonical owner after the preparing worker
+    // has retired. Subject identity is a value, never a borrowed Task pointer.
+    ker::mod::perf::record_wki_event(static_cast<uint32_t>(ker::mod::cpu::current_cpu()), stage.subject_pid,
+                                     ker::mod::perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(op), ker::mod::perf::WkiPerfPhase::END,
+                                     0, 0, stage.correlation, status, ELAPSED_US, callsite, stage.capture_session);
     ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(op), 0, 0, status, ELAPSED_US, true,
-                                       0, bytes);
+                                       0, bytes, stage.capture_session);
     return ELAPSED_US;
+}
+
+// Every admitted recursive attempt remains open through actual image completion.
+// One pending substage per depth covers aborts that abandon loader stacks.
+// Moving these fixed values follows existing request/image ownership transfers.
+struct ExecTraceState {
+    std::array<LocalProcStage, MAX_SHEBANG_DEPTH + 1> attempts{};
+    std::array<LocalProcStage, MAX_SHEBANG_DEPTH + 1> pending{};
+
+    void begin(ker::mod::sched::task::Task* task, size_t depth, uint64_t callsite) {
+        auto& attempt = attempts.at(depth);
+        if (!attempt.active)
+            attempt = begin_local_proc_stage(task, ker::mod::perf::WkiPerfLocalProcOp::EXECVE, static_cast<uint32_t>(depth), callsite);
+    }
+
+    auto stage(ker::mod::sched::task::Task* task, size_t depth, ker::mod::perf::WkiPerfLocalProcOp op, uint32_t aux, uint64_t callsite)
+        -> LocalProcStage& {
+        auto& slot = pending.at(depth);
+        slot = begin_local_proc_stage(task, op, aux, callsite);
+        return slot;
+    }
+
+    void finish(ker::mod::sched::task::Task* task, int32_t status, uint64_t callsite) {
+        for (size_t depth = attempts.size(); depth != 0; --depth) {
+            auto& slot = pending.at(depth - 1);
+            end_local_proc_stage(task, slot.op, slot, status, slot.bytes, callsite);
+            auto& attempt = attempts.at(depth - 1);
+            end_local_proc_stage(task, ker::mod::perf::WkiPerfLocalProcOp::EXECVE, attempt, status, attempt.bytes, callsite);
+        }
+    }
+};
+
+void arm_native_exec_user_return(ker::mod::sched::task::Task& task, const LocalProcStage& attempt, uint64_t initial_rip) {
+    task.exec_image_trace = {
+        .subject_pid = attempt.subject_pid,
+        .initial_rip = initial_rip,
+        .capture_session = attempt.capture_session,
+        .correlation = attempt.correlation,
+        .pending = attempt.active,
+    };
 }
 
 template <typename T, size_t N>
@@ -625,6 +699,8 @@ struct SpawnOptionsSnapshot {
 struct ExecArgumentsSnapshot {
     std::array<char, EXEC_PATH_MAX> path{};
     char* strings{};
+    // Completed strings retain their addresses when a later string needs the large arena.
+    char* small_strings{};
     const char** argv{};
     const char** envp{};
     ker::util::SmallVec<uint64_t, 16> input_string_addrs;
@@ -635,12 +711,49 @@ struct ExecArgumentsSnapshot {
         delete[] argv;
         delete[] envp;
         delete[] strings;
+        delete[] small_strings;
     }
 
     ExecArgumentsSnapshot() = default;
     ExecArgumentsSnapshot(const ExecArgumentsSnapshot&) = delete;
     auto operator=(const ExecArgumentsSnapshot&) -> ExecArgumentsSnapshot& = delete;
 };
+
+auto snapshot_exec_string(ker::mod::sched::task::Task& task, uint64_t string_addr, ExecArgumentsSnapshot& snapshot, const char*& out)
+    -> int {
+    size_t const REMAINING = EXEC_ARG_BYTES_MAX - snapshot.budget_used;
+    size_t copied = 0;
+    for (;;) {
+        if (copied == REMAINING) return -E2BIG;
+        if (snapshot.strings == nullptr && snapshot.strings_used + copied == EXEC_ARG_SMALL_BYTES) {
+            // Publish ownership before the next faulting copy. Move only this
+            // unfinished prefix; earlier strings remain in the retained small arena.
+            snapshot.strings = new (std::nothrow) char[EXEC_ARG_BYTES_MAX];
+            if (snapshot.strings == nullptr) return -ENOMEM;
+            std::memcpy(snapshot.strings, snapshot.small_strings + snapshot.strings_used, copied);
+            snapshot.strings_used = 0;
+        }
+        char* const STORAGE = snapshot.strings != nullptr ? snapshot.strings : snapshot.small_strings;
+        size_t const CAPACITY = snapshot.strings != nullptr ? EXEC_ARG_BYTES_MAX : EXEC_ARG_SMALL_BYTES;
+        uint64_t current = 0;
+        if (__builtin_add_overflow(string_addr, static_cast<uint64_t>(copied), &current)) return -EFAULT;
+        size_t const PAGE_REMAINING = ker::mod::mm::paging::PAGE_SIZE - (current & (ker::mod::mm::paging::PAGE_SIZE - 1));
+        size_t const CHUNK = std::min({REMAINING - copied, CAPACITY - snapshot.strings_used - copied, PAGE_REMAINING});
+        char* const DEST = STORAGE + snapshot.strings_used + copied;
+        auto const COPY = ker::mod::sys::usercopy::copy_from_task_partial(task, current, DEST, CHUNK);
+        if (COPY.bytes_copied == 0) return -EFAULT;
+        auto const* const NUL = static_cast<const char*>(std::memchr(DEST, '\0', COPY.bytes_copied));
+        if (NUL != nullptr) {
+            copied += static_cast<size_t>(NUL - DEST) + 1;
+            out = STORAGE + snapshot.strings_used;
+            snapshot.strings_used += copied;
+            snapshot.budget_used += copied;
+            return 0;
+        }
+        copied += COPY.bytes_copied;
+        if (COPY.fault) return -EFAULT;
+    }
+}
 
 auto snapshot_exec_vector(ker::mod::sched::task::Task& task, uint64_t vector_addr, ExecArgumentsSnapshot& snapshot, const char**& out)
     -> int {
@@ -655,7 +768,9 @@ auto snapshot_exec_vector(ker::mod::sched::task::Task& task, uint64_t vector_add
 
     auto& string_addrs = snapshot.input_string_addrs;
     string_addrs.clear();
-    for (size_t index = 0;; ++index) {
+    size_t index = 0;
+    bool terminated = false;
+    while (!terminated) {
         if (snapshot.budget_used > EXEC_ARG_BYTES_MAX - sizeof(uint64_t)) {
             return -E2BIG;
         }
@@ -667,17 +782,38 @@ auto snapshot_exec_vector(ker::mod::sched::task::Task& task, uint64_t vector_add
             return -EFAULT;
         }
 
-        uint64_t string_addr = 0;
-        if (!ker::mod::sys::usercopy::copy_value_from_task(task, entry_addr, string_addr)) {
-            return -EFAULT;
+        std::array<uint64_t, 16> captured;
+        size_t const PAGE_REMAINING = ker::mod::mm::paging::PAGE_SIZE - (entry_addr & (ker::mod::mm::paging::PAGE_SIZE - 1));
+        // Batch only the inline prefix. Keep the original per-entry copy at
+        // every spill: public SmallVec capacity does not describe its grow check.
+        size_t const BEFORE_SPILL = string_addrs.size() < captured.size() ? captured.size() - string_addrs.size() + 1 : 1;
+        size_t const BATCH_COUNT = std::min({captured.size(), PAGE_REMAINING / sizeof(uint64_t),
+                                             (EXEC_ARG_BYTES_MAX - snapshot.budget_used) / sizeof(uint64_t), BEFORE_SPILL});
+        ker::mod::sys::usercopy::CopyResult copy{};
+        size_t count = BATCH_COUNT;
+        if (count <= 1) {
+            // Keep one-entry copying at spill growth and unaligned page crossings.
+            count = 1;
+            if (!ker::mod::sys::usercopy::copy_value_from_task(task, entry_addr, captured.at(0))) return -EFAULT;
+            copy.bytes_copied = sizeof(uint64_t);
+        } else {
+            // Never cross a user page or read past the first possible SmallVec
+            // growth failure. The copy releases every pin before push_back.
+            copy = ker::mod::sys::usercopy::copy_from_task_partial(task, entry_addr, captured.data(), count * sizeof(uint64_t));
         }
-        snapshot.budget_used += sizeof(uint64_t);
-        if (string_addr == 0) {
-            break;
+        size_t const COMPLETE = copy.bytes_copied / sizeof(uint64_t);
+        for (size_t entry = 0; entry < COMPLETE; ++entry) {
+            uint64_t const STRING_ADDR = captured.at(entry);
+            snapshot.budget_used += sizeof(uint64_t);
+            ++index;
+            if (STRING_ADDR == 0) {
+                terminated = true;
+                break;
+            }
+            if (!string_addrs.push_back(STRING_ADDR)) return -ENOMEM;
         }
-        if (!string_addrs.push_back(string_addr)) {
-            return -ENOMEM;
-        }
+        // A complete terminating word wins over a fault in later captured bytes.
+        if (!terminated && (copy.fault || COMPLETE != count)) return -EFAULT;
     }
 
     size_t const COUNT = string_addrs.size();
@@ -686,32 +822,13 @@ auto snapshot_exec_vector(ker::mod::sched::task::Task& task, uint64_t vector_add
         return -ENOMEM;
     }
 
-    if (COUNT != 0 && snapshot.strings == nullptr) {
-        snapshot.strings = new (std::nothrow) char[EXEC_ARG_BYTES_MAX];
-        if (snapshot.strings == nullptr) {
-            return -ENOMEM;
-        }
+    if (COUNT != 0 && snapshot.small_strings == nullptr && snapshot.strings == nullptr) {
+        snapshot.small_strings = new (std::nothrow) char[EXEC_ARG_SMALL_BYTES];
+        if (snapshot.small_strings == nullptr) return -ENOMEM;
     }
-
     for (size_t index = 0; index < COUNT; ++index) {
-        size_t const REMAINING = EXEC_ARG_BYTES_MAX - snapshot.budget_used;
-        if (REMAINING == 0) {
-            return -E2BIG;
-        }
-
-        char* const DEST = snapshot.strings + snapshot.strings_used;
-        auto const STATUS = ker::mod::sys::usercopy::copy_cstring_from_task_status(task, string_addrs.at(index), DEST, REMAINING);
-        if (STATUS == ker::mod::sys::usercopy::CStringCopyStatus::FAULT) {
-            return -EFAULT;
-        }
-        if (STATUS == ker::mod::sys::usercopy::CStringCopyStatus::TOO_LONG) {
-            return -E2BIG;
-        }
-
-        size_t const STRING_BYTES = std::strlen(DEST) + 1;
-        out[index] = DEST;
-        snapshot.strings_used += STRING_BYTES;
-        snapshot.budget_used += STRING_BYTES;
+        int const RESULT = snapshot_exec_string(task, string_addrs.at(index), snapshot, out[index]);
+        if (RESULT != 0) return RESULT;
     }
     out[COUNT] = nullptr;
     return 0;
@@ -879,6 +996,7 @@ auto exec_table_size(uint64_t count, uint64_t entry_size, uint64_t& out) -> bool
 struct ExecFileReadContext {
     vfs::File* file{};
     uint64_t logical_size{};
+    int error{};
 };
 
 struct PreparedFileBackedElf {
@@ -895,11 +1013,17 @@ struct PreparedFileBackedElf {
     PreparedFileBackedElf(const PreparedFileBackedElf&) = delete;
     auto operator=(const PreparedFileBackedElf&) -> PreparedFileBackedElf& = delete;
 
-    ~PreparedFileBackedElf() {
-        delete[] program_headers;
-        delete[] section_headers;
-        delete[] section_names;
-        delete[] task_metadata;
+    ~PreparedFileBackedElf() { reset(); }
+
+    void reset() {
+        delete[] std::exchange(program_headers, nullptr);
+        delete[] std::exchange(section_headers, nullptr);
+        delete[] std::exchange(section_names, nullptr);
+        delete[] std::exchange(task_metadata, nullptr);
+        view = {};
+        read_context = {};
+        task_metadata_size = 0;
+        bytes_read = 0;
     }
 
     auto take_task_metadata() -> uint8_t* {
@@ -909,9 +1033,12 @@ struct PreparedFileBackedElf {
     }
 };
 
-auto read_exec_file_exact(vfs::File* file, uint64_t logical_size, uint64_t offset, void* destination, size_t size) -> bool {
+auto read_exec_file_exact(vfs::File* file, uint64_t logical_size, uint64_t offset, void* destination, size_t size, int* error = nullptr)
+    -> bool {
+    if (error != nullptr) *error = 0;
     if (file == nullptr || destination == nullptr || offset > logical_size || size > logical_size - offset ||
         offset > static_cast<uint64_t>(INT64_MAX)) {
+        if (error != nullptr) *error = -EIO;
         return false;
     }
 
@@ -922,6 +1049,7 @@ auto read_exec_file_exact(vfs::File* file, uint64_t logical_size, uint64_t offse
     while (total < size) {
         uint64_t const READ_OFFSET = offset + total;
         if (READ_OFFSET > static_cast<uint64_t>(INT64_MAX)) {
+            if (error != nullptr) *error = -EIO;
             return false;
         }
         ssize_t const RC = vfs::vfs_pread_file(file, out + total, size - total, static_cast<off_t>(READ_OFFSET));
@@ -931,9 +1059,11 @@ auto read_exec_file_exact(vfs::File* file, uint64_t logical_size, uint64_t offse
             continue;
         }
         if (RC == 0) {
+            if (error != nullptr) *error = -EIO;
             return false;
         }
         if (++consecutive_errors >= MAX_CONSECUTIVE_ERRORS) {
+            if (error != nullptr) *error = static_cast<int>(RC);
             return false;
         }
     }
@@ -945,7 +1075,7 @@ auto exec_file_read_at(void* context, uint64_t offset, void* destination, size_t
     if (source == nullptr || source->file == nullptr) {
         return false;
     }
-    return read_exec_file_exact(source->file, source->logical_size, offset, destination, size);
+    return read_exec_file_exact(source->file, source->logical_size, offset, destination, size, &source->error);
 }
 
 enum class PrepareFileBackedElfResult : uint8_t {
@@ -956,19 +1086,30 @@ enum class PrepareFileBackedElfResult : uint8_t {
     IO_ERROR,
 };
 
-auto prepare_file_backed_elf(vfs::File* file, size_t file_size, PreparedFileBackedElf& out) -> PrepareFileBackedElfResult {
-    if (file == nullptr || file_size < sizeof(Elf64_Ehdr) || file_size < EXEC_FILE_BACKED_ELF_MIN_SIZE) {
+auto prepare_file_backed_elf(vfs::File* file, size_t file_size, PreparedFileBackedElf& out,
+                             mod::mm::user_layout::ImageRole role = mod::mm::user_layout::ImageRole::MAIN,
+                             size_t main_minimum_size = EXEC_FILE_BACKED_ELF_MIN_SIZE) -> PrepareFileBackedElfResult {
+    bool const INTERPRETER = role == mod::mm::user_layout::ImageRole::INTERPRETER;
+    if (file == nullptr || file_size < sizeof(Elf64_Ehdr) ||
+        (INTERPRETER ? file_size <= EXEC_SPARSE_ELF_MIN_SIZE || file->exec_read_view == nullptr : file_size < main_minimum_size)) {
         return PrepareFileBackedElfResult::FALLBACK;
     }
 
+    int* const READ_ERROR = INTERPRETER ? &out.read_context.error : nullptr;
     Elf64_Ehdr header{};
-    if (!read_exec_file_exact(file, file_size, 0, &header, sizeof(header))) {
+    if (!read_exec_file_exact(file, file_size, 0, &header, sizeof(header), READ_ERROR)) {
         return PrepareFileBackedElfResult::IO_ERROR;
     }
     out.bytes_read += sizeof(header);
     if (header.e_ident[EI_MAG0] != ELFMAG0 || header.e_ident[EI_MAG1] != ELFMAG1 || header.e_ident[EI_MAG2] != ELFMAG2 ||
         header.e_ident[EI_MAG3] != ELFMAG3 || header.e_ident[EI_CLASS] != ELFCLASS64 || header.e_phnum == 0 ||
         header.e_phentsize != sizeof(Elf64_Phdr)) {
+        return PrepareFileBackedElfResult::FALLBACK;
+    }
+
+    // A compact view must not accept offsets rejected by the old contiguous parser.
+    if (INTERPRETER &&
+        ((header.e_phoff % alignof(Elf64_Phdr)) != 0U || (header.e_shnum != 0 && (header.e_shoff % alignof(Elf64_Shdr)) != 0U))) {
         return PrepareFileBackedElfResult::FALLBACK;
     }
 
@@ -981,7 +1122,7 @@ auto prepare_file_backed_elf(vfs::File* file, size_t file_size, PreparedFileBack
     if (out.program_headers == nullptr) {
         return PrepareFileBackedElfResult::OUT_OF_MEMORY;
     }
-    if (!read_exec_file_exact(file, file_size, header.e_phoff, out.program_headers, static_cast<size_t>(phdr_bytes))) {
+    if (!read_exec_file_exact(file, file_size, header.e_phoff, out.program_headers, static_cast<size_t>(phdr_bytes), READ_ERROR)) {
         return PrepareFileBackedElfResult::IO_ERROR;
     }
     out.bytes_read += static_cast<size_t>(phdr_bytes);
@@ -994,7 +1135,7 @@ auto prepare_file_backed_elf(vfs::File* file, size_t file_size, PreparedFileBack
     // complete image. Large dynamically linked programs are the fragmented-
     // memory failure mode this bounded source removes.
     if (!has_interp) {
-        return PrepareFileBackedElfResult::FALLBACK;
+        if (!INTERPRETER) return PrepareFileBackedElfResult::FALLBACK;
     }
 
     if (header.e_shnum != 0) {
@@ -1002,44 +1143,51 @@ auto prepare_file_backed_elf(vfs::File* file, size_t file_size, PreparedFileBack
         if (header.e_shentsize != sizeof(Elf64_Shdr) || header.e_shstrndx >= header.e_shnum ||
             !exec_table_size(header.e_shnum, header.e_shentsize, shdr_bytes) || shdr_bytes > EXEC_FILE_BACKED_METADATA_MAX ||
             !exec_range_in_file(file_size, header.e_shoff, shdr_bytes)) {
-            return PrepareFileBackedElfResult::INVALID;
+            return (INTERPRETER && shdr_bytes > EXEC_FILE_BACKED_METADATA_MAX) ? PrepareFileBackedElfResult::FALLBACK
+                                                                               : PrepareFileBackedElfResult::INVALID;
         }
         out.section_headers = new Elf64_Shdr[header.e_shnum];
         if (out.section_headers == nullptr) {
             return PrepareFileBackedElfResult::OUT_OF_MEMORY;
         }
-        if (!read_exec_file_exact(file, file_size, header.e_shoff, out.section_headers, static_cast<size_t>(shdr_bytes))) {
+        if (!read_exec_file_exact(file, file_size, header.e_shoff, out.section_headers, static_cast<size_t>(shdr_bytes), READ_ERROR)) {
             return PrepareFileBackedElfResult::IO_ERROR;
         }
         out.bytes_read += static_cast<size_t>(shdr_bytes);
 
-        const Elf64_Shdr& shstrtab = out.section_headers[header.e_shstrndx];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
-        if (shstrtab.sh_size > EXEC_FILE_BACKED_METADATA_MAX || !exec_range_in_file(file_size, shstrtab.sh_offset, shstrtab.sh_size)) {
-            return PrepareFileBackedElfResult::INVALID;
-        }
-        if (shstrtab.sh_size != 0) {
-            out.section_names = new char[static_cast<size_t>(shstrtab.sh_size)];
-            if (out.section_names == nullptr) {
-                return PrepareFileBackedElfResult::OUT_OF_MEMORY;
+        if (!INTERPRETER || header.e_shstrndx != SHN_UNDEF) {
+            const Elf64_Shdr& shstrtab = out.section_headers[header.e_shstrndx];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+            if (shstrtab.sh_size > EXEC_FILE_BACKED_METADATA_MAX || !exec_range_in_file(file_size, shstrtab.sh_offset, shstrtab.sh_size)) {
+                return (INTERPRETER && shstrtab.sh_size > EXEC_FILE_BACKED_METADATA_MAX) ? PrepareFileBackedElfResult::FALLBACK
+                                                                                         : PrepareFileBackedElfResult::INVALID;
             }
-            if (!read_exec_file_exact(file, file_size, shstrtab.sh_offset, out.section_names, static_cast<size_t>(shstrtab.sh_size))) {
-                return PrepareFileBackedElfResult::IO_ERROR;
+            if (shstrtab.sh_size != 0) {
+                out.section_names = new char[static_cast<size_t>(shstrtab.sh_size)];
+                if (out.section_names == nullptr) {
+                    return PrepareFileBackedElfResult::OUT_OF_MEMORY;
+                }
+                if (!read_exec_file_exact(file, file_size, shstrtab.sh_offset, out.section_names, static_cast<size_t>(shstrtab.sh_size),
+                                          READ_ERROR)) {
+                    return PrepareFileBackedElfResult::IO_ERROR;
+                }
+                out.bytes_read += static_cast<size_t>(shstrtab.sh_size);
             }
-            out.bytes_read += static_cast<size_t>(shstrtab.sh_size);
+            out.view.section_names_size = shstrtab.sh_size;
         }
-        out.view.section_names_size = shstrtab.sh_size;
     }
 
-    if (header.e_phoff > EXEC_FILE_BACKED_METADATA_MAX || phdr_bytes > EXEC_FILE_BACKED_METADATA_MAX - header.e_phoff) {
-        return PrepareFileBackedElfResult::INVALID;
+    if (!INTERPRETER) {
+        if (header.e_phoff > EXEC_FILE_BACKED_METADATA_MAX || phdr_bytes > EXEC_FILE_BACKED_METADATA_MAX - header.e_phoff) {
+            return PrepareFileBackedElfResult::INVALID;
+        }
+        out.task_metadata_size = std::max(static_cast<size_t>(header.e_phoff + phdr_bytes), sizeof(Elf64_Ehdr));
+        out.task_metadata = new uint8_t[out.task_metadata_size]{};
+        if (out.task_metadata == nullptr) {
+            return PrepareFileBackedElfResult::OUT_OF_MEMORY;
+        }
+        std::memcpy(out.task_metadata, &header, sizeof(header));
+        std::memcpy(out.task_metadata + header.e_phoff, out.program_headers, static_cast<size_t>(phdr_bytes));
     }
-    out.task_metadata_size = std::max(static_cast<size_t>(header.e_phoff + phdr_bytes), sizeof(Elf64_Ehdr));
-    out.task_metadata = new uint8_t[out.task_metadata_size]{};
-    if (out.task_metadata == nullptr) {
-        return PrepareFileBackedElfResult::OUT_OF_MEMORY;
-    }
-    std::memcpy(out.task_metadata, &header, sizeof(header));
-    std::memcpy(out.task_metadata + header.e_phoff, out.program_headers, static_cast<size_t>(phdr_bytes));
 
     out.view.elf_header = header;
     out.view.program_headers = out.program_headers;
@@ -1050,6 +1198,7 @@ auto prepare_file_backed_elf(vfs::File* file, size_t file_size, PreparedFileBack
     out.view.read_context = &out.read_context;
     out.view.logical_size = file_size;
     out.view.contiguous_base = nullptr;
+    out.view.source_metadata_stable = INTERPRETER;
     return PrepareFileBackedElfResult::READY;
 }
 
@@ -1201,6 +1350,32 @@ void swap_exec_lazy_ranges(ker::mod::sched::task::Task* task, LazyVmemRangeVec& 
     task->lazy_vmem_lock.unlock_irqrestore(IRQF);
 }
 
+auto prepare_execve_file_backed_elf(const ker::mod::sched::task::Task& task, vfs::File* file, size_t file_size, PreparedFileBackedElf& out,
+                                    bool lazy_file_segments) -> PrepareFileBackedElfResult {
+    if (file_size <= EXEC_SPARSE_ELF_MIN_SIZE || file_size >= EXEC_FILE_BACKED_ELF_MIN_SIZE || !lazy_file_segments || file == nullptr ||
+        file->exec_read_view == nullptr || task.wki_prefer_inline) {
+        return prepare_file_backed_elf(file, file_size, out);
+    }
+
+    // This image is already pinned and too large for inline WKI delivery.
+    // Reuse bounded metadata instead of reserving a full logical-file buffer.
+    // Keep preferred-inline and non-lazy execution on their existing paths.
+    auto const RESULT = prepare_file_backed_elf(file, file_size, out, mod::mm::user_layout::ImageRole::MAIN, EXEC_SPARSE_ELF_MIN_SIZE + 1);
+    auto const& HEADER = out.view.elf_header;
+    if (RESULT == PrepareFileBackedElfResult::READY && (HEADER.e_phoff % alignof(Elf64_Phdr)) == 0U &&
+        (HEADER.e_shnum == 0 || (HEADER.e_shoff % alignof(Elf64_Shdr)) == 0U)) {
+        // The syscall-local scratch outlives synchronous loading. Let the
+        // debug registry copy its names/rows before that scratch is retired.
+        out.view.source_metadata_stable = true;
+        return RESULT;
+    }
+
+    // The optional compact path must not introduce a rejection for metadata
+    // accepted by the original parser, or keep partial scratch on fallback.
+    out.reset();
+    return PrepareFileBackedElfResult::FALLBACK;
+}
+
 // A synchronous, borrowed view of a fully prepared native image. It contains
 // no process identity, kernel stack, syscall scratch, or scheduler ownership.
 // The preparation owner retains every pointer until commit returns.
@@ -1256,8 +1431,9 @@ struct RetiredExecImage {
 
 }  // namespace
 
-// Candidate input outlives the preparing syscall stack without replacing the
-// current Task image. Only the canonical owner executes and commits this plan.
+// Worker candidates own storage independently of the preparing stack. The
+// synchronous canonical owner may borrow its current immutable syscall input.
+// Neither form replaces the current Task image before canonical cutover.
 struct RemoteExecPlan {
     using Task = ker::mod::sched::task::Task;
     ker::mod::sched::resource::ExecAdmission admission;
@@ -1274,6 +1450,13 @@ struct RemoteExecPlan {
     const char** argv{};
     const char** envp{};
     char* strings{};
+    // Only a synchronous exec by its canonical owner may borrow its current
+    // immutable request/loader storage. Worker handoffs keep independent copies.
+    bool uses_current_input{};
+    std::span<const uint8_t> current_bytes{};
+    const char* const* current_argv{};
+    const char* const* current_envp{};
+    std::array<const char*, 1> empty_arguments{};
     std::array<char, Task::EXE_PATH_MAX> path{};
     Task::FilesystemContext filesystem;
     std::array<char, Task::WKI_TARGET_HOSTNAME_MAX> target{};
@@ -1291,8 +1474,9 @@ struct RemoteExecPlan {
         delete[] strings;
     }
 
-    auto copy_arguments(const char* const* input_argv, const char* const* input_envp) -> bool {
-        size_t argc = 0, envc = 0, total = 0;
+    static auto measure_arguments(const char* const* input_argv, const char* const* input_envp, size_t& argc, size_t& envc, size_t& total)
+        -> bool {
+        argc = envc = total = 0;
         auto measure = [&](const char* const* input, size_t& count) {
             if (input == nullptr) return true;
             while (input[count] != nullptr) {
@@ -1306,6 +1490,12 @@ struct RemoteExecPlan {
         };
         if (!measure(input_argv, argc) || !measure(input_envp, envc) || (argc + envc + 2) > (EXEC_ARG_BYTES_MAX - total) / sizeof(char*))
             return false;
+        return true;
+    }
+
+    auto copy_arguments(const char* const* input_argv, const char* const* input_envp) -> bool {
+        size_t argc = 0, envc = 0, total = 0;
+        if (!measure_arguments(input_argv, input_envp, argc, envc, total)) return false;
         argv = new (std::nothrow) const char*[argc + 1]{};
         envp = new (std::nothrow) const char*[envc + 1]{};
         strings = new (std::nothrow) char[total != 0 ? total : 1];
@@ -1324,8 +1514,25 @@ struct RemoteExecPlan {
         return true;
     }
 
+    auto borrow_current_input(const uint8_t* elf, size_t elf_size, const char* const* input_argv, const char* const* input_envp) -> bool {
+        size_t argc = 0, envc = 0, total = 0;
+        if (!measure_arguments(input_argv, input_envp, argc, envc, total)) return false;
+        uses_current_input = true;
+        current_bytes = {elf, elf_size};
+        current_argv = input_argv != nullptr ? input_argv : empty_arguments.data();
+        current_envp = input_envp != nullptr ? input_envp : empty_arguments.data();
+        return true;
+    }
+
+    auto arguments() const -> const char* const* { return uses_current_input ? current_argv : argv; }
+    auto environment() const -> const char* const* { return uses_current_input ? current_envp : envp; }
+
     auto candidate() const -> ker::net::wki::WkiRemoteExecCandidate {
-        return {.path = path.data(), .bytes = {bytes, size}, .complete = complete, .target = target.data(), .target_flags = target_flags};
+        return {.path = path.data(),
+                .bytes = uses_current_input ? current_bytes : std::span<const uint8_t>{bytes, size},
+                .complete = complete,
+                .target = target.data(),
+                .target_flags = target_flags};
     }
 
     // Caller has passed every rejecting cutover check under the VM publication
@@ -1360,6 +1567,7 @@ class ExecRequestArguments {
     ExecArgumentsSnapshot snapshot;
     ker::mod::security::Snapshot admitted_credentials;
     NativeExecCompletion completion;
+    ExecTraceState trace;
     WorkerExecHandoff handoff;
     std::unique_ptr<RemoteExecPlan> remote;
     uint32_t remote_proxy_id{};
@@ -1370,11 +1578,18 @@ class ExecRequestArguments {
     // pagemap and Thread ownership belong to the image transaction separately.
     struct NativeScratch {
         PreparedFileBackedElf prepared_elf;
+        PreparedFileBackedElf prepared_interp;
+        uint8_t* interp_buf{};
         loader::elf::ElfLazyLoadRangeVec main_lazy_ranges;
         loader::elf::ElfLazyLoadRangeVec interp_lazy_ranges;
         uint64_t* argv_addrs{};
         uint64_t* envp_addrs{};
+        void reset_interp_storage() {
+            prepared_interp.reset();
+            delete[] std::exchange(interp_buf, nullptr);
+        }
         ~NativeScratch() {
+            reset_interp_storage();
             delete[] argv_addrs;
             delete[] envp_addrs;
         }
@@ -1433,6 +1648,7 @@ WorkerExecHandoff::~WorkerExecHandoff() { delete remote_request; }
 // This is not a cross-task handoff protocol.
 class PreparedNativeExecImage {
    public:
+    ExecTraceState trace;
     PreparedNativeExecImage(const NativeExecImage& image, uint64_t origin_pid)
         : m_name(std::exchange(image.name, nullptr)),
           m_registers(image.registers),
@@ -1581,13 +1797,17 @@ class PreparedNativeExecImage {
     ker::mod::sched::resource::ExecAdmission m_admission;
 };
 
-void cleanup_exec_preparation(ker::mod::sched::task::Task& task) {
+namespace {
+void cleanup_exec_preparation_with_status(ker::mod::sched::task::Task& task, int32_t trace_status) {
     bool expected = false;
     if (!task.exec_preparation_teardown_in_progress.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
         return;
     }
+    ExecTraceState image_trace;
+    ExecTraceState argument_trace;
     auto* prepared = task.owned_exec_preparation.load(std::memory_order_acquire);
     if (prepared != nullptr) {
+        image_trace = std::exchange(prepared->trace, {});
         // Keep recovery ownership published until every potentially blocking
         // release has finished. Reentrant fatal/group exits must stay pending.
         prepared->discard();
@@ -1599,14 +1819,22 @@ void cleanup_exec_preparation(ker::mod::sched::task::Task& task) {
     }
     auto* arguments = task.owned_exec_arguments.load(std::memory_order_acquire);
     if (arguments != nullptr) {
+        argument_trace = std::exchange(arguments->trace, {});
         delete arguments;
         if (task.owned_exec_arguments.exchange(nullptr, std::memory_order_acq_rel) != arguments) {
             ker::mod::dbg::panic_handler("exec argument owner changed during teardown");
             hcf();
         }
     }
+    // Releases and request destruction have finished while fatal recovery is
+    // still deferred. Close the final substage before its enclosing attempts.
+    image_trace.finish(&task, trace_status, WOS_PERF_CALLSITE());
+    argument_trace.finish(&task, trace_status, WOS_PERF_CALLSITE());
     task.exec_preparation_teardown_in_progress.store(false, std::memory_order_release);
 }
+}  // namespace
+
+void cleanup_exec_preparation(ker::mod::sched::task::Task& task) { cleanup_exec_preparation_with_status(task, -ECANCELED); }
 
 namespace {
 auto adopt_exec_arguments(ker::mod::sched::task::Task& task, std::unique_ptr<ExecRequestArguments>& arguments) -> bool {
@@ -1739,12 +1967,13 @@ auto cutover_remote_exec_owner(ker::mod::sched::task::Task& owner, uint32_t task
 auto run_remote_exec_owner(ker::mod::sched::task::Task& owner, ExecRequestArguments& request, WorkerExecHandoff* handoff)
     -> RemoteExecOutcome {
     auto& plan = *request.remote;
+    bool const WORKER_HANDOFF = handoff != nullptr;
     plan.handoff = handoff;
     auto const CANDIDATE = plan.candidate();
     RemoteExecOutcome outcome;
     ker::net::wki::WkiRemoteSpawnSpec const SPEC{
-        .argv = plan.argv,
-        .envp = plan.envp,
+        .argv = plan.arguments(),
+        .envp = plan.environment(),
         .cwd = plan.filesystem.cwd.data(),
         .error_out = &outcome.error,
         .prepare = prepare_remote_exec_owner,
@@ -1762,6 +1991,14 @@ auto run_remote_exec_owner(ker::mod::sched::task::Task& owner, ExecRequestArgume
     // No scheduler proxy identity yet: rollback/argument/actor ownership can
     // safely finish even if a cleanup later gains a blocking release.
     request.remote.reset();
+    if (WORKER_HANDOFF && outcome.result == ker::net::wki::WkiRemoteSpawnResult::REMOTE) {
+        // Acceptance may already have released the worker and its request. The
+        // claimed holder retains the stage until canonical submission finishes.
+        for (auto& stage : request.trace.pending) {
+            if (stage.active && stage.op == ker::mod::perf::WkiPerfLocalProcOp::REMOTE_SPAWN)
+                end_local_proc_stage(&owner, stage.op, stage, static_cast<int32_t>(outcome.result), stage.bytes, WOS_PERF_CALLSITE());
+        }
+    }
     return outcome;
 }
 
@@ -1787,12 +2024,30 @@ auto try_process_remote_exec(ker::mod::sched::task::Task& actor, const uint8_t* 
         return WkiRemoteSpawnResult::FAILED;
     }
     auto plan = std::unique_ptr<RemoteExecPlan>(new (std::nothrow) RemoteExecPlan);
-    if (!plan || !plan->copy_arguments(argv, envp)) {
+    if (!plan) {
         error = -ENOMEM;
         return WkiRemoteSpawnResult::FAILED;
     }
-    plan->bytes = new (std::nothrow) uint8_t[elf_size];
-    if (plan->bytes == nullptr || !actor.try_acquire()) {
+    if (&actor == owner) {
+        // The canonical owner's syscall does not return or release its input
+        // until run_remote_exec_owner finishes. No worker can retire that input.
+        if (!plan->borrow_current_input(elf, elf_size, argv, envp)) {
+            error = -ENOMEM;
+            return WkiRemoteSpawnResult::FAILED;
+        }
+    } else {
+        if (!plan->copy_arguments(argv, envp)) {
+            error = -ENOMEM;
+            return WkiRemoteSpawnResult::FAILED;
+        }
+        plan->bytes = new (std::nothrow) uint8_t[elf_size];
+        if (plan->bytes == nullptr) {
+            error = -ENOMEM;
+            return WkiRemoteSpawnResult::FAILED;
+        }
+        std::memcpy(plan->bytes, elf, elf_size);
+    }
+    if (!actor.try_acquire()) {
         error = -ENOMEM;
         return WkiRemoteSpawnResult::FAILED;
     }
@@ -1806,7 +2061,6 @@ auto try_process_remote_exec(ker::mod::sched::task::Task& actor, const uint8_t* 
                             .mode = stat.st_mode};
     plan->size = elf_size;
     plan->complete = complete;
-    std::memcpy(plan->bytes, elf, elf_size);
     std::memcpy(plan->path.data(), path, std::min(std::strlen(path), plan->path.size() - 1));
     if (!actor.capture_filesystem_context(plan->filesystem)) {
         error = -ESRCH;
@@ -1883,7 +2137,12 @@ auto claim_pending_exec_handoff(ker::mod::sched::task::Task& owner) -> WorkerExe
             owner.resource_lock.unlock_irqrestore(FLAGS);
             return nullptr;
         }
-        owner.owned_exec_arguments.store(std::exchange(handoff->remote_request, nullptr), std::memory_order_release);
+        auto* holder = std::exchange(handoff->remote_request, nullptr);
+        if (handoff->worker != nullptr) {
+            auto* worker_request = handoff->worker->owned_exec_arguments.load(std::memory_order_acquire);
+            if (worker_request != nullptr) holder->trace = std::exchange(worker_request->trace, {});
+        }
+        owner.owned_exec_arguments.store(holder, std::memory_order_release);
     } else {
         auto* prepared = handoff->worker->owned_exec_preparation.exchange(nullptr, std::memory_order_acq_rel);
         owner.owned_exec_preparation.store(prepared, std::memory_order_release);
@@ -2453,8 +2712,150 @@ auto make_exec_selftest_owned_image(bool& consumed) -> std::unique_ptr<PreparedN
 
 namespace {
 ker::mod::sched::task::Task exec_arguments_selftest_owner;  // NOLINT
+ker::mod::sched::task::Task exec_snapshot_selftest_owner;   // NOLINT
 ker::mod::sched::task::Task exec_handoff_selftest_worker;   // NOLINT
 }  // namespace
+
+auto exec_selftest_argument_snapshot_arenas_and_faults() -> bool {
+    namespace mm = ker::mod::mm;
+    constexpr uint64_t USER_BASE = 0x40000000ULL;
+    constexpr size_t PAGE_BYTES = mm::paging::PAGE_SIZE;
+    constexpr size_t LONG_OFFSET = PAGE_BYTES - 1;
+    constexpr size_t LONG_BYTES = 2000;
+    auto* root = mm::virt::create_pagemap();
+    if (root == nullptr) return false;
+    mm::virt::copy_kernel_mappings_to(root);
+    auto& owner = exec_snapshot_selftest_owner;
+    owner.type = ker::mod::sched::task::TaskType::PROCESS;
+    owner.usercopy_pagemap_closing.store(false);
+    owner.pagemap = root;
+    std::array<uint8_t*, 3> pages{};
+    size_t mapped = 0;
+    bool ok = true;
+    for (auto& page : pages) {
+        page = static_cast<uint8_t*>(
+            mm::phys::page_alloc_with_reclaim_may_fail(mm::PhysicalPageOwner::SELFTEST, PAGE_BYTES, "exec-snapshot-selftest"));
+        if (page == nullptr) {
+            ok = false;
+            break;
+        }
+        std::memset(page, 0, PAGE_BYTES);
+        auto const PHYSICAL = reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(reinterpret_cast<mm::addr::vaddr_t>(page)));
+        mm::virt::map_page(root, USER_BASE + mapped * PAGE_BYTES, PHYSICAL, mm::paging::page_types::USER);
+        ++mapped;
+    }
+    if (ok) {
+        // Populate target pages through their HHDM aliases; the snapshot itself
+        // exercises ordinary Task usercopy, including real page pins and SMAP.
+        auto store = [&pages](size_t offset, const void* source, size_t size) {
+            auto* bytes = static_cast<const uint8_t*>(source);
+            for (size_t i = 0; i < size; ++i) pages.at((offset + i) / PAGE_BYTES)[(offset + i) % PAGE_BYTES] = bytes[i];
+        };
+        constexpr char PATH[] = "/bin/true";
+        constexpr char FIRST[] = "first";
+        constexpr char LAST[] = "last";
+        constexpr char ENV[] = "K=value";
+        constexpr std::array<uint64_t, 4> ARGV{USER_BASE + 0x300, USER_BASE + LONG_OFFSET, USER_BASE + 2 * PAGE_BYTES + 300, 0};
+        constexpr std::array<uint64_t, 2> ENVP{USER_BASE + 2 * PAGE_BYTES + 360, 0};
+        constexpr std::array<uint64_t, 2> SHORT_ARGV{USER_BASE + 0x300, 0};
+        constexpr std::array<uint64_t, 2> BAD_ARGV{USER_BASE + 3 * PAGE_BYTES, 0};
+        store(16, PATH, sizeof(PATH));
+        store(0x100, ARGV.data(), sizeof(ARGV));
+        store(0x150, ENVP.data(), sizeof(ENVP));
+        store(0x200, SHORT_ARGV.data(), sizeof(SHORT_ARGV));
+        store(0x240, BAD_ARGV.data(), sizeof(BAD_ARGV));
+        store(0x300, FIRST, sizeof(FIRST));
+        for (size_t i = 0; i < LONG_BYTES; ++i) pages.at((LONG_OFFSET + i) / PAGE_BYTES)[(LONG_OFFSET + i) % PAGE_BYTES] = 'a';
+        store(2 * PAGE_BYTES + 300, LAST, sizeof(LAST));
+        store(2 * PAGE_BYTES + 360, ENV, sizeof(ENV));
+        {
+            ExecArgumentsSnapshot short_args;
+            int const RESULT = snapshot_exec_arguments(owner, USER_BASE + 16, USER_BASE + 0x200, 0, short_args);
+            ok &= RESULT == 0 && short_args.small_strings != nullptr && short_args.strings == nullptr &&
+                  short_args.budget_used == 3 * sizeof(uint64_t) + sizeof(FIRST);
+            if (RESULT == 0) ok &= short_args.argv[1] == nullptr && std::strcmp(short_args.argv[0], FIRST) == 0;
+        }
+        {
+            ExecArgumentsSnapshot arguments;
+            int const RESULT = snapshot_exec_arguments(owner, USER_BASE + 16, USER_BASE + 0x100, USER_BASE + 0x150, arguments);
+            ok &= RESULT == 0 && arguments.small_strings != nullptr && arguments.strings != nullptr &&
+                  arguments.budget_used == 6 * sizeof(uint64_t) + sizeof(FIRST) + LONG_BYTES + 1 + sizeof(LAST) + sizeof(ENV);
+            for (auto* page : pages) std::memset(page, 0, PAGE_BYTES);
+            if (RESULT == 0) {
+                ok &= std::strcmp(arguments.path.data(), PATH) == 0 && std::strcmp(arguments.argv[0], FIRST) == 0 &&
+                      std::strcmp(arguments.argv[2], LAST) == 0 && arguments.argv[3] == nullptr &&
+                      std::strcmp(arguments.envp[0], ENV) == 0 && arguments.envp[1] == nullptr;
+                for (size_t i = 0; i < LONG_BYTES; ++i) ok &= arguments.argv[1][i] == 'a';
+                ok &= arguments.argv[1][LONG_BYTES] == '\0';
+            }
+        }
+        store(16, PATH, sizeof(PATH));
+        store(0x200, SHORT_ARGV.data(), sizeof(SHORT_ARGV));
+        store(0x240, BAD_ARGV.data(), sizeof(BAD_ARGV));
+        {
+            ExecArgumentsSnapshot invalid;
+            ok &= snapshot_exec_arguments(owner, USER_BASE + 16, USER_BASE + 0x240, 0, invalid) == -EFAULT;
+        }
+        {
+            ExecArgumentsSnapshot empty;
+            ok &= snapshot_exec_arguments(owner, USER_BASE + 16, 0, 0, empty) == 0 && empty.argv == nullptr && empty.envp == nullptr &&
+                  empty.small_strings == nullptr && empty.strings == nullptr && empty.budget_used == 2 * sizeof(uint64_t);
+        }
+        {
+            ExecArgumentsSnapshot exhausted;
+            exhausted.budget_used = EXEC_ARG_BYTES_MAX - sizeof(uint64_t);
+            ok &= snapshot_exec_vector(owner, USER_BASE + 0x200, exhausted, exhausted.argv) == -E2BIG && exhausted.small_strings == nullptr;
+        }
+        store(0x300, FIRST, sizeof(FIRST));
+        {
+            ExecArgumentsSnapshot last_null;
+            ok &= snapshot_exec_vector(owner, USER_BASE + 3 * PAGE_BYTES - sizeof(uint64_t), last_null, last_null.argv) == 0 &&
+                  last_null.argv != nullptr && last_null.argv[0] == nullptr && last_null.budget_used == sizeof(uint64_t);
+        }
+        for (size_t offset : {3 * PAGE_BYTES - sizeof(SHORT_ARGV), PAGE_BYTES - 3}) {
+            store(offset, SHORT_ARGV.data(), sizeof(SHORT_ARGV));
+            ExecArgumentsSnapshot boundary;
+            int const RESULT = snapshot_exec_vector(owner, USER_BASE + offset, boundary, boundary.argv);
+            ok &= RESULT == 0 && boundary.budget_used == sizeof(SHORT_ARGV) + sizeof(FIRST);
+            if (RESULT == 0) ok &= boundary.argv[1] == nullptr && std::strcmp(boundary.argv[0], FIRST) == 0;
+        }
+        {
+            std::array<uint64_t, 41> many{};
+            many.fill(USER_BASE + 0x300);
+            many.back() = 0;
+            store(2 * PAGE_BYTES + 512, many.data(), sizeof(many));
+            ExecArgumentsSnapshot spilled;
+            int const RESULT = snapshot_exec_vector(owner, USER_BASE + 2 * PAGE_BYTES + 512, spilled, spilled.argv);
+            ok &= RESULT == 0 && spilled.budget_used == sizeof(many) + 40 * sizeof(FIRST) && spilled.input_string_addrs.size() == 40;
+            if (RESULT == 0) {
+                for (size_t i = 0; i < 40; ++i) ok &= std::strcmp(spilled.argv[i], FIRST) == 0;
+                ok &= spilled.argv[40] == nullptr;
+            }
+        }
+        {
+            store(3 * PAGE_BYTES - 3, SHORT_ARGV.data(), 3);
+            ExecArgumentsSnapshot partial_word;
+            ok &= snapshot_exec_vector(owner, USER_BASE + 3 * PAGE_BYTES - 3, partial_word, partial_word.argv) == -EFAULT &&
+                  partial_word.budget_used == 0 && partial_word.argv == nullptr;
+        }
+        {
+            store(3 * PAGE_BYTES - sizeof(uint64_t), SHORT_ARGV.data(), sizeof(uint64_t));
+            ExecArgumentsSnapshot before_unmapped;
+            before_unmapped.budget_used = EXEC_ARG_BYTES_MAX - sizeof(uint64_t);
+            ok &= snapshot_exec_vector(owner, USER_BASE + 3 * PAGE_BYTES - sizeof(uint64_t), before_unmapped, before_unmapped.argv) ==
+                      -E2BIG &&
+                  before_unmapped.budget_used == EXEC_ARG_BYTES_MAX && before_unmapped.argv == nullptr;
+        }
+    }
+    // Every snapshot and usercopy pin has retired before unmapping the private
+    // root. This fake Task never becomes runnable or changes the active CR3.
+    ok &= owner.usercopy_pagemap_accesses.load() == 0;
+    for (size_t i = 0; i < mapped; ++i) mm::virt::unmap_page(root, USER_BASE + i * PAGE_BYTES);
+    ok &= owner.detach_pagemap_after_usercopy_quiescence() == root;
+    mm::virt::destroy_user_space(root, 0, "exec-snapshot-selftest", "argument-arenas");
+    mm::virt::release_pagemap(root);
+    return ok;
+}
 
 auto exec_selftest_request_arguments_recover_partial_and_recursive_storage() -> bool {
     auto& owner = exec_arguments_selftest_owner;
@@ -2473,7 +2874,8 @@ auto exec_selftest_request_arguments_recover_partial_and_recursive_storage() -> 
     snapshot.argv = new (std::nothrow) const char*[3]{};
     snapshot.envp = new (std::nothrow) const char*[1]{};
     snapshot.strings = new (std::nothrow) char[16]{};
-    if (!snapshot.argv || !snapshot.envp || !snapshot.strings) {
+    snapshot.small_strings = new (std::nothrow) char[EXEC_ARG_SMALL_BYTES]{};
+    if (!snapshot.argv || !snapshot.envp || !snapshot.strings || !snapshot.small_strings) {
         cleanup_exec_preparation(owner);
         return false;
     }
@@ -2565,6 +2967,26 @@ auto exec_selftest_request_scratch_preserves_transferred_metadata() -> bool {
             cleanup_exec_preparation(owner);
             return false;
         }
+        auto& interp = scratch->prepared_interp;
+        if ((depth % 2) == 0) {
+            interp.program_headers = new (std::nothrow) Elf64_Phdr[2]{};
+            interp.section_headers = new (std::nothrow) Elf64_Shdr[2]{};
+            // Leave the first interpreter frame partially prepared.
+            if (depth != 0) interp.section_names = new (std::nothrow) char[16]{};
+            if (!interp.program_headers || !interp.section_headers || (depth != 0 && !interp.section_names)) {
+                cleanup_exec_preparation(owner);
+                return false;
+            }
+            interp.view.program_headers = interp.program_headers;
+            interp.view.read_context = &interp.read_context;
+        } else {
+            scratch->interp_buf = new (std::nothrow) uint8_t[128]{};
+            if (!scratch->interp_buf) {
+                cleanup_exec_preparation(owner);
+                return false;
+            }
+            scratch->interp_buf[0] = static_cast<uint8_t>(depth + 1);
+        }
         elf.task_metadata[0] = static_cast<uint8_t>(depth + 1);
         elf.view.program_headers = elf.program_headers;
         elf.view.read_context = &elf.read_context;
@@ -2581,7 +3003,19 @@ auto exec_selftest_request_scratch_preserves_transferred_metadata() -> bool {
         ok &= elf.task_metadata[0] == depth + 1 && elf.view.program_headers == elf.program_headers &&
               elf.view.read_context == &elf.read_context && scratch->main_lazy_ranges.size() == 40 &&
               scratch->interp_lazy_ranges.size() == 40;
+        auto const& interp = scratch->prepared_interp;
+        if ((depth % 2) == 0) {
+            ok &= interp.view.program_headers == interp.program_headers && interp.view.read_context == &interp.read_context &&
+                  interp.task_metadata == nullptr && scratch->interp_buf == nullptr;
+        } else {
+            ok &= scratch->interp_buf[0] == depth + 1 && interp.program_headers == nullptr;
+        }
     }
+    auto* first = request->native_scratch(0);
+    first->reset_interp_storage();
+    first->reset_interp_storage();
+    ok &= first->prepared_interp.program_headers == nullptr && first->prepared_interp.view.read_context == nullptr &&
+          first->interp_buf == nullptr;
     auto& transferred = request->native_scratch(MAX_SHEBANG_DEPTH)->prepared_elf;
     std::unique_ptr<uint8_t[]> image_metadata(transferred.take_task_metadata());
     ok &= transferred.task_metadata == nullptr;
@@ -3864,8 +4298,11 @@ auto wos_proc_execve(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr,
         request = pending.get();
         if (!adopt_exec_arguments(*task, pending)) return static_cast<uint64_t>(-EAGAIN);
     }
+    request->trace.begin(task, 0, WOS_PERF_CALLSITE());
     auto& snapshot = request->snapshot;
+    auto& SNAPSHOT_STAGE = request->trace.stage(task, 0, ker::mod::perf::WkiPerfLocalProcOp::ARG_COPY, 0, WOS_PERF_CALLSITE());
     int const SNAPSHOT_RESULT = snapshot_exec_arguments(*task, path_addr, argv_addr, envp_addr, snapshot);
+    end_local_proc_stage(task, ker::mod::perf::WkiPerfLocalProcOp::ARG_COPY, SNAPSHOT_STAGE, SNAPSHOT_RESULT, 0, WOS_PERF_CALLSITE());
     uint64_t const RESULT = SNAPSHOT_RESULT < 0 ? static_cast<uint64_t>(SNAPSHOT_RESULT)
                                                 : wos_proc_execve_impl(snapshot.path.data(), snapshot.argv, snapshot.envp, gpr, 0);
     // Preparation has returned through every recursive loader frame. Only a
@@ -3873,14 +4310,18 @@ auto wos_proc_execve(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr,
     // its submitted ELF and has no local image to activate.
     auto* prepared = task->owned_exec_preparation.load(std::memory_order_acquire);
     if (RESULT == 0 && prepared != nullptr) {
+        // Recursive loader frames are gone. The tracked image now owns every
+        // endpoint, including when its existing pointer transfers to the owner.
+        prepared->trace = std::exchange(request->trace, {});
         if (!task->is_thread) return finish_native_exec_image(task, prepared, request->completion);
         uint64_t const HANDOFF_RESULT = handoff_worker_exec(*task, *prepared, *request);
-        cleanup_exec_preparation(*task);
+        cleanup_exec_preparation_with_status(*task, static_cast<int32_t>(HANDOFF_RESULT));
         return HANDOFF_RESULT;
     }
     uint32_t const REMOTE_ID = request->remote_proxy_id;
     bool const REMOTE_WORKER = request->remote_worker_committed;
-    if (task->owned_exec_arguments.load(std::memory_order_acquire) != nullptr) cleanup_exec_preparation(*task);
+    if (task->owned_exec_arguments.load(std::memory_order_acquire) != nullptr)
+        cleanup_exec_preparation_with_status(*task, static_cast<int32_t>(RESULT));
     if (RESULT == 0 && REMOTE_WORKER) ker::syscall::multiproc::wos_thread_exit_current();
     if (RESULT == 0 && REMOTE_ID != 0) publish_remote_exec_proxy(*task, REMOTE_ID);
     return RESULT;
@@ -3911,13 +4352,11 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     auto* request = task->owned_exec_arguments.load(std::memory_order_acquire);
     auto* scratch = request != nullptr ? request->native_scratch(shebang_depth) : nullptr;
     if (scratch == nullptr) return static_cast<uint64_t>(-EAGAIN);
-    uint32_t const EXEC_CORR = perf::next_wki_trace_correlation();
-    uint64_t const EXEC_STARTED_US = time::get_us();
-    record_local_proc_event(task, perf::WkiPerfLocalProcOp::EXECVE, perf::WkiPerfPhase::BEGIN, EXEC_CORR, 0,
-                            static_cast<uint32_t>(shebang_depth), WOS_PERF_CALLSITE());
+    size_t const TRACE_DEPTH = static_cast<size_t>(shebang_depth);
+    request->trace.begin(task, TRACE_DEPTH, WOS_PERF_CALLSITE());
 
     // --- Inspect the immutable kernel argument snapshot before image preparation ---
-    LocalProcStage const ARG_COPY_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::ARG_COPY, 0, WOS_PERF_CALLSITE());
+    auto& ARG_COPY_STAGE = request->trace.stage(task, TRACE_DEPTH, perf::WkiPerfLocalProcOp::ARG_COPY, 0, WOS_PERF_CALLSITE());
     std::array<char, EXEC_PATH_MAX> k_path{};
     int const PATH_COPY_RET = copy_exec_path(path, k_path);
     if (PATH_COPY_RET < 0) {
@@ -3950,7 +4389,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     end_local_proc_stage(task, perf::WkiPerfLocalProcOp::ARG_COPY, ARG_COPY_STAGE, 0, argv_count + envp_count, WOS_PERF_CALLSITE());
 
     // --- Read the ELF file ---
-    LocalProcStage const OPEN_ACCESS_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, 0, WOS_PERF_CALLSITE());
+    auto& OPEN_ACCESS_STAGE = request->trace.stage(task, TRACE_DEPTH, perf::WkiPerfLocalProcOp::OPEN_ACCESS, 0, WOS_PERF_CALLSITE());
     vfs::File* exec_file = nullptr;
     int const OPEN_RESULT = vfs::vfs_open_file_as(*task, request->admitted_credentials, exec_path, 0, &exec_file);
     if (OPEN_RESULT != 0) {
@@ -3982,6 +4421,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     }
 
     ssize_t const FILE_SIZE = exec_stat.st_size;
+    if (FILE_SIZE > 0) request->trace.attempts.at(TRACE_DEPTH).bytes = static_cast<uint64_t>(FILE_SIZE);
     if (FILE_SIZE <= 0) {
         dbg::log("wos_proc_execve: empty file '%s'", exec_path);
         end_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, OPEN_ACCESS_STAGE, -ENOEXEC, 0, WOS_PERF_CALLSITE());
@@ -3996,8 +4436,10 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         }
     };
 
+    bool const EXEC_LAZY_FILE_SEGMENTS = exec_file != nullptr && exec_lazy_file_segments_enabled();
     auto& prepared_elf = scratch->prepared_elf;
-    PrepareFileBackedElfResult const PREPARED_RESULT = prepare_file_backed_elf(exec_file, static_cast<size_t>(FILE_SIZE), prepared_elf);
+    PrepareFileBackedElfResult const PREPARED_RESULT =
+        prepare_execve_file_backed_elf(*task, exec_file, static_cast<size_t>(FILE_SIZE), prepared_elf, EXEC_LAZY_FILE_SEGMENTS);
     bool const FILE_BACKED_ELF = PREPARED_RESULT == PrepareFileBackedElfResult::READY;
     if (PREPARED_RESULT == PrepareFileBackedElfResult::INVALID || PREPARED_RESULT == PrepareFileBackedElfResult::IO_ERROR ||
         PREPARED_RESULT == PrepareFileBackedElfResult::OUT_OF_MEMORY) {
@@ -4026,24 +4468,16 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     end_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, OPEN_ACCESS_STAGE, 0, static_cast<uint64_t>(FILE_SIZE),
                          WOS_PERF_CALLSITE());
 
-    uint32_t const ELF_READ_CORR = perf::next_wki_trace_correlation();
-    uint64_t const ELF_READ_STARTED_US = time::get_us();
-    record_local_proc_event(task, perf::WkiPerfLocalProcOp::ELF_READ, perf::WkiPerfPhase::BEGIN, ELF_READ_CORR, 0,
-                            clamp_perf_aux(static_cast<uint64_t>(FILE_SIZE)), WOS_PERF_CALLSITE());
-    bool const EXEC_LAZY_FILE_SEGMENTS = exec_file != nullptr && exec_lazy_file_segments_enabled();
+    auto& ELF_READ_STAGE = request->trace.stage(task, TRACE_DEPTH, perf::WkiPerfLocalProcOp::ELF_READ,
+                                                clamp_perf_aux(static_cast<uint64_t>(FILE_SIZE)), WOS_PERF_CALLSITE());
     ExecImageReadResult const READ_RESULT =
         FILE_BACKED_ELF
             ? ExecImageReadResult{.bytes_read = static_cast<ssize_t>(prepared_elf.bytes_read),
                                   .status = 0,
                                   .shebang_probe_size = sizeof(Elf64_Ehdr)}
             : read_exec_image_for_loader(exec_file, elf_buffer, static_cast<size_t>(FILE_SIZE), exec_path, true, EXEC_LAZY_FILE_SEGMENTS);
-    uint32_t const ELF_READ_US = clamp_perf_aux(time::get_us() - ELF_READ_STARTED_US);
-    int32_t const ELF_READ_STATUS = READ_RESULT.status;
-    record_local_proc_event(task, perf::WkiPerfLocalProcOp::ELF_READ, perf::WkiPerfPhase::END, ELF_READ_CORR, ELF_READ_STATUS, ELF_READ_US,
-                            WOS_PERF_CALLSITE());
-    perf::record_wki_summary(perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(perf::WkiPerfLocalProcOp::ELF_READ), 0, 0,
-                             ELF_READ_STATUS, ELF_READ_US, true, 0,
-                             READ_RESULT.bytes_read > 0 ? static_cast<uint64_t>(READ_RESULT.bytes_read) : 0);
+    end_local_proc_stage(task, perf::WkiPerfLocalProcOp::ELF_READ, ELF_READ_STAGE, READ_RESULT.status,
+                         READ_RESULT.bytes_read > 0 ? static_cast<uint64_t>(READ_RESULT.bytes_read) : 0, WOS_PERF_CALLSITE());
 
     if (READ_RESULT.status < 0) {
 #ifdef EXEC_DEBUG
@@ -4086,12 +4520,13 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     }
 
     {
-        LocalProcStage const REMOTE_SPAWN_STAGE =
-            begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::REMOTE_SPAWN, 0, WOS_PERF_CALLSITE());
+        auto& REMOTE_SPAWN_STAGE = request->trace.stage(task, TRACE_DEPTH, perf::WkiPerfLocalProcOp::REMOTE_SPAWN, 0, WOS_PERF_CALLSITE());
+        REMOTE_SPAWN_STAGE.bytes = static_cast<uint64_t>(FILE_SIZE);
         int remote_error = 0;
         auto const REMOTE = try_process_remote_exec(*task, elf_buffer, ELF_BUFFER_SIZE, ELF_BUFFER_COMPLETE, exec_path, K_ARGV, K_ENVP,
                                                     exec_stat, EXEC_NOSUID, remote_error);
-        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::REMOTE_SPAWN, REMOTE_SPAWN_STAGE, static_cast<int32_t>(REMOTE),
+        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::REMOTE_SPAWN, REMOTE_SPAWN_STAGE,
+                             REMOTE == ker::net::wki::WkiRemoteSpawnResult::FAILED ? remote_error : static_cast<int32_t>(REMOTE),
                              static_cast<uint64_t>(FILE_SIZE), WOS_PERF_CALLSITE());
         if (REMOTE != ker::net::wki::WkiRemoteSpawnResult::LOCAL) {
             consume_successful_one_shot_wki_target(task, REMOTE);
@@ -4104,7 +4539,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     // --- Replace the pagemap with a fresh one ---
     // Note: We are executing in kernel context (syscall handler) so our
     // kernel mappings are active. We'll create a new user pagemap.
-    LocalProcStage const NEW_IMAGE_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::NEW_IMAGE, 0, WOS_PERF_CALLSITE());
+    auto& NEW_IMAGE_STAGE = request->trace.stage(task, TRACE_DEPTH, perf::WkiPerfLocalProcOp::NEW_IMAGE, 0, WOS_PERF_CALLSITE());
     uint64_t const DEBUG_STAGING_PID = task->pid | EXEC_DEBUG_STAGING_BIT;
     if (DEBUG_STAGING_PID == task->pid) {
         release_exec_file_once();
@@ -4119,11 +4554,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         delete[] elf_buffer;
         return static_cast<uint64_t>(-ENOMEM);
     }
-    {
-        sched::task::Task pagemap_task{};
-        pagemap_task.pagemap = new_pagemap;
-        mm::virt::copy_kernel_mappings(&pagemap_task);
-    }
+    mm::virt::copy_kernel_mappings_to(new_pagemap);
 
     // --- Create new thread (user stack + TLS) ---
     ker::loader::elf::TlsModule tls_info{};
@@ -4178,8 +4609,8 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     end_local_proc_stage(task, perf::WkiPerfLocalProcOp::NEW_IMAGE, NEW_IMAGE_STAGE, 0, 0, WOS_PERF_CALLSITE());
 
     // --- Load ELF into new pagemap ---
-    LocalProcStage const LOAD_ELF_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_ELF,
-                                                                 clamp_perf_aux(static_cast<uint64_t>(FILE_SIZE)), WOS_PERF_CALLSITE());
+    auto& LOAD_ELF_STAGE = request->trace.stage(task, TRACE_DEPTH, perf::WkiPerfLocalProcOp::LOAD_ELF,
+                                                clamp_perf_aux(static_cast<uint64_t>(FILE_SIZE)), WOS_PERF_CALLSITE());
     auto& main_loader_lazy_ranges = scratch->main_lazy_ranges;
     loader::elf::ElfLoadOptions const MAIN_LOAD_OPTIONS{
         .register_special_symbols = true,
@@ -4229,8 +4660,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     // If the binary requests a dynamic linker (PT_INTERP), load it.
     if (elf_result.has_interp) {
         const char* const INTERP_PATH = std::begin(elf_result.interp_path);
-        LocalProcStage const LOAD_INTERP_STAGE =
-            begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, 0, WOS_PERF_CALLSITE());
+        auto& LOAD_INTERP_STAGE = request->trace.stage(task, TRACE_DEPTH, perf::WkiPerfLocalProcOp::LOAD_INTERP, 0, WOS_PERF_CALLSITE());
 
         int interp_open_flags = vfs::O_NOTIFY_CACHE_CHANGE;
         if (task->wki_submitter_hostname.front() == '\0') {
@@ -4264,31 +4694,51 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
             return static_cast<uint64_t>(-ENOEXEC);
         }
 
+        auto& prepared_interp = scratch->prepared_interp;
+        auto*& interp_buf = scratch->interp_buf;
         auto release_interp_file_once = [&]() {
             if (interp_file != nullptr) {
+                prepared_interp.read_context.file = nullptr;
                 vfs::vfs_put_file(interp_file);
                 interp_file = nullptr;
             }
         };
 
-        auto* interp_buf = new uint8_t[INTERP_SIZE];
-        if (interp_buf == nullptr) {
+        PrepareFileBackedElfResult const INTERP_PREPARED = prepare_file_backed_elf(
+            interp_file, static_cast<size_t>(INTERP_SIZE), prepared_interp, mod::mm::user_layout::ImageRole::INTERPRETER);
+        bool const FILE_BACKED_INTERP = INTERP_PREPARED == PrepareFileBackedElfResult::READY;
+        if (!FILE_BACKED_INTERP && INTERP_PREPARED != PrepareFileBackedElfResult::FALLBACK) {
+            int const ERROR = INTERP_PREPARED == PrepareFileBackedElfResult::OUT_OF_MEMORY ? -ENOMEM
+                              : INTERP_PREPARED == PrepareFileBackedElfResult::IO_ERROR
+                                  ? (prepared_interp.read_context.error != 0 ? prepared_interp.read_context.error : -EIO)
+                                  : -ENOEXEC;
             release_interp_file_once();
-            end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE, -ENOMEM, 0, WOS_PERF_CALLSITE());
+            scratch->reset_interp_storage();
+            end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE, ERROR, 0, WOS_PERF_CALLSITE());
             cleanup_new_image();
-            return static_cast<uint64_t>(-ENOMEM);
+            return static_cast<uint64_t>(ERROR);
         }
         bool const INTERP_LAZY_FILE_SEGMENTS = interp_file != nullptr && exec_lazy_file_segments_enabled();
-        ExecImageReadResult const INTERP_READ = read_exec_image_for_loader(interp_file, interp_buf, static_cast<size_t>(INTERP_SIZE),
-                                                                           INTERP_PATH, false, INTERP_LAZY_FILE_SEGMENTS);
-
-        if (INTERP_READ.status < 0) {
-            release_interp_file_once();
-            delete[] interp_buf;
-            end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE, INTERP_READ.status, 0,
-                                 WOS_PERF_CALLSITE());
-            cleanup_new_image();
-            return static_cast<uint64_t>(INTERP_READ.status);
+        if (!FILE_BACKED_INTERP) {
+            // Drop partial metadata before allocating the original sparse buffer.
+            prepared_interp.reset();
+            interp_buf = new uint8_t[INTERP_SIZE];
+            if (interp_buf == nullptr) {
+                release_interp_file_once();
+                end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE, -ENOMEM, 0, WOS_PERF_CALLSITE());
+                cleanup_new_image();
+                return static_cast<uint64_t>(-ENOMEM);
+            }
+            ExecImageReadResult const INTERP_READ = read_exec_image_for_loader(interp_file, interp_buf, static_cast<size_t>(INTERP_SIZE),
+                                                                               INTERP_PATH, false, INTERP_LAZY_FILE_SEGMENTS);
+            if (INTERP_READ.status < 0) {
+                release_interp_file_once();
+                scratch->reset_interp_storage();
+                end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE, INTERP_READ.status, 0,
+                                     WOS_PERF_CALLSITE());
+                cleanup_new_image();
+                return static_cast<uint64_t>(INTERP_READ.status);
+            }
         }
 
         auto& interp_loader_lazy_ranges = scratch->interp_lazy_ranges;
@@ -4301,20 +4751,24 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
             .policy_owner = task,
         };
         loader::elf::ElfLoadResult const INTERP_RESULT =
-            loader::elf::load_elf(interp_buf, static_cast<size_t>(INTERP_SIZE), new_pagemap, task->pid, "ld.so", INTERP_LOAD_OPTIONS);
+            FILE_BACKED_INTERP
+                ? loader::elf::load_elf(prepared_interp.view, new_pagemap, task->pid, "ld.so", INTERP_LOAD_OPTIONS)
+                : loader::elf::load_elf(interp_buf, static_cast<size_t>(INTERP_SIZE), new_pagemap, task->pid, "ld.so", INTERP_LOAD_OPTIONS);
 
         if (INTERP_RESULT.entry_point == 0) {
+            int const ERROR = prepared_interp.read_context.error != 0 ? prepared_interp.read_context.error
+                              : INTERP_RESULT.error != 0              ? INTERP_RESULT.error
+                                                                      : -ENOEXEC;
             release_interp_file_once();
-            delete[] interp_buf;
-            end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE,
-                                 (INTERP_RESULT.error != 0 ? INTERP_RESULT.error : -ENOEXEC), static_cast<uint64_t>(INTERP_SIZE),
+            scratch->reset_interp_storage();
+            end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE, ERROR, static_cast<uint64_t>(INTERP_SIZE),
                                  WOS_PERF_CALLSITE());
             cleanup_new_image();
-            return static_cast<uint64_t>((INTERP_RESULT.error != 0 ? INTERP_RESULT.error : -ENOEXEC));
+            return static_cast<uint64_t>(ERROR);
         }
         if (!append_exec_lazy_file_ranges(new_lazy_ranges, interp_loader_lazy_ranges, interp_file, interp_stat)) {
             release_interp_file_once();
-            delete[] interp_buf;
+            scratch->reset_interp_storage();
             end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, LOAD_INTERP_STAGE, -ENOMEM,
                                  static_cast<uint64_t>(INTERP_SIZE), WOS_PERF_CALLSITE());
             cleanup_new_image();
@@ -4330,10 +4784,10 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         new_interp_vaddr_start = INTERP_RESULT.image_start;
         new_interp_vaddr_end = INTERP_RESULT.image_end;
 
-        delete[] interp_buf;
+        scratch->reset_interp_storage();
     }
 
-    LocalProcStage const STACK_SETUP_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::STACK_SETUP, 0, WOS_PERF_CALLSITE());
+    auto& STACK_SETUP_STAGE = request->trace.stage(task, TRACE_DEPTH, perf::WkiPerfLocalProcOp::STACK_SETUP, 0, WOS_PERF_CALLSITE());
 
     std::string_view const PATH_STR(exec_path, std::strlen(exec_path));
     const char* base_name = PATH_STR.data();
@@ -4349,6 +4803,14 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         }
         std::memcpy(new_name, base_name, BASE_LEN + 1);
     }
+
+    // Advertise only this captured native root attempt. Old kernels advertise
+    // nothing; new libc then skips the optional operation entirely.
+    LocalProcStage const STARTUP_ATTEMPT = request->trace.attempts.front();
+    bool const STARTUP_TRACE =
+        STARTUP_ATTEMPT.active && STARTUP_ATTEMPT.capture_session ==
+                                      perf::current_wki_capture_session(perf::WkiPerfScope::LOCAL_PROC,
+                                                                        static_cast<uint8_t>(perf::WkiPerfLocalProcOp::USERSPACE_STAGE));
 
     // --- Set up the user stack with argv/envp/auxv ---
     uint64_t user_stack_virt = new_thread->stack;
@@ -4492,7 +4954,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         current_virt_offset += (CURRENT_ADDR - ALIGNED);
 
         constexpr size_t AUXV_BASE_QWORDS = 16 + security::exec_policy::IDENTITY_AUXV_WORDS;
-        size_t const AUXV_QWORDS = AUXV_BASE_QWORDS + (new_interp_base != 0 ? 2 : 0);
+        size_t const AUXV_QWORDS = AUXV_BASE_QWORDS + (new_interp_base != 0 ? 2 : 0) + (STARTUP_TRACE ? 6 : 0);
         size_t const STRUCTURED_QWORDS = AUXV_QWORDS + (envp_count + 1) + (argv_count + 1) + 1;
         if (STRUCTURED_QWORDS % 2 != 0) {
             uint64_t pad = 0;
@@ -4512,7 +4974,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         constexpr uint64_t AT_RANDOM = 25;
         constexpr uint64_t AT_EXECFN = 31;
         bool built_correct_auxv = true;
-        ker::util::SmallVec<uint64_t, 30> auxv;
+        ker::util::SmallVec<uint64_t, 36> auxv;
         built_correct_auxv &= auxv.push_back(AT_PAGESZ);
         built_correct_auxv &= auxv.push_back(mm::paging::PAGE_SIZE);
         built_correct_auxv &= auxv.push_back(AT_ENTRY);
@@ -4532,6 +4994,14 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         built_correct_auxv &= auxv.push_back(AT_EXECFN);
         built_correct_auxv &= auxv.push_back(EXECFN_ADDR);
         for (auto value : security::exec_policy::identity_auxv(stack_credentials)) built_correct_auxv &= auxv.push_back(value);
+        if (STARTUP_TRACE) {
+            built_correct_auxv &= auxv.push_back(WOS_AT_PERF_TRACE_VERSION);
+            built_correct_auxv &= auxv.push_back(WOS_PERF_TRACE_VERSION);
+            built_correct_auxv &= auxv.push_back(WOS_AT_PERF_TRACE_SESSION);
+            built_correct_auxv &= auxv.push_back(STARTUP_ATTEMPT.capture_session);
+            built_correct_auxv &= auxv.push_back(WOS_AT_PERF_TRACE_CORRELATION);
+            built_correct_auxv &= auxv.push_back(STARTUP_ATTEMPT.correlation);
+        }
         built_correct_auxv &= auxv.push_back(AT_NULL);
         built_correct_auxv &= auxv.push_back(0);
 
@@ -4594,7 +5064,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         *dest_ptr = new_thread->safestack_ptr_value;
     }
 
-    LocalProcStage const COMMIT_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::COMMIT, 0, WOS_PERF_CALLSITE());
+    auto& COMMIT_STAGE = request->trace.stage(task, TRACE_DEPTH, perf::WkiPerfLocalProcOp::COMMIT, 0, WOS_PERF_CALLSITE());
     uint64_t const NEW_RSP = user_stack_virt - current_virt_offset;
     auto const INITIAL_REGS = [&]() {
         cpu::GPRegs regs{};
@@ -4662,10 +5132,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
             end_local_proc_stage(task, perf::WkiPerfLocalProcOp::COMMIT, COMMIT_STAGE, -EAGAIN, 0, WOS_PERF_CALLSITE());
             return static_cast<uint64_t>(-EAGAIN);
         }
-        request->completion = {.commit_stage = COMMIT_STAGE,
-                               .correlation = EXEC_CORR,
-                               .started_us = EXEC_STARTED_US,
-                               .source_file_size = static_cast<uint64_t>(FILE_SIZE)};
+        request->completion = {.trace_depth = TRACE_DEPTH, .subject_pid = task->pid};
         return 0;
     }
 }
@@ -4691,10 +5158,9 @@ auto finish_native_exec_image(ker::mod::sched::task::Task* task, PreparedNativeE
     uint64_t const new_initial_rip = PREPARED->view().initial_rip;
     auto* const new_thread = PREPARED->view().thread;
     auto const phys_pagemap = reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(PREPARED->view().pagemap)));
-    auto const COMMIT_STAGE = completion.commit_stage;
-    uint32_t const EXEC_CORR = completion.correlation;
-    uint64_t const EXEC_STARTED_US = completion.started_us;
-    uint64_t const FILE_SIZE = completion.source_file_size;
+    auto& COMMIT_STAGE = PREPARED->trace.pending.at(completion.trace_depth);
+    uint64_t const TRACE_SUBJECT_PID = completion.subject_pid;
+    auto const ENTRY_ATTEMPT = PREPARED->trace.attempts.front();
     {
         // Publication can block after some Task fields have changed. Defer
         // fatal recovery until failure or complete replacement-root activation.
@@ -4703,8 +5169,8 @@ auto finish_native_exec_image(ker::mod::sched::task::Task* task, PreparedNativeE
         if (COMMIT_RESULT == 0) COMMIT_RESULT = commit_native_exec_image(task, *PREPARED);
         if (COMMIT_RESULT < 0) {
             task->exec_preparation_teardown_in_progress.store(false, std::memory_order_release);
-            end_local_proc_stage(task, perf::WkiPerfLocalProcOp::COMMIT, COMMIT_STAGE, -EIO, 0, WOS_PERF_CALLSITE());
-            cleanup_exec_preparation(*task);
+            end_local_proc_stage(task, perf::WkiPerfLocalProcOp::COMMIT, COMMIT_STAGE, COMMIT_RESULT, 0, WOS_PERF_CALLSITE());
+            cleanup_exec_preparation_with_status(*task, COMMIT_RESULT);
             if (handoff != nullptr) acknowledge_worker_exec(*task, *handoff, COMMIT_RESULT);
             return static_cast<uint64_t>(COMMIT_RESULT);
         }
@@ -4760,13 +5226,17 @@ auto finish_native_exec_image(ker::mod::sched::task::Task* task, PreparedNativeE
         // execve() replaces the current image in-place. Reclaim an exclusive old
         // address space now; if CLONE_VM/thread publishers still exist, their
         // last-publisher GC owns that shared root instead.
-        LocalProcStage const DESTROY_OLD_STAGE =
-            begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::DESTROY_OLD, 0, WOS_PERF_CALLSITE());
+        auto& DESTROY_OLD_STAGE = PREPARED->trace.pending.at(completion.trace_depth);
+        DESTROY_OLD_STAGE =
+            begin_local_proc_stage_for_subject(TRACE_SUBJECT_PID, perf::WkiPerfLocalProcOp::DESTROY_OLD, 0, WOS_PERF_CALLSITE());
         ker::syscall::shm::shm_cleanup_for_task(task);
-        cleanup_exec_preparation(*task);
-        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::DESTROY_OLD, DESTROY_OLD_STAGE, 0, 0, WOS_PERF_CALLSITE());
+        cleanup_exec_preparation_with_status(*task, 0);
 
     }  // Exec admission and owned storage are gone before the on-stack return patch.
+
+    // The request and prepared image are already destroyed; retain values only.
+    // Failed exec never arms/replaces this successful image's entry marker.
+    arm_native_exec_user_return(*task, ENTRY_ATTEMPT, new_initial_rip);
 
     // --- Update the sysret return path so it lands at the new binary ---
     //
@@ -4799,10 +5269,6 @@ auto finish_native_exec_image(ker::mod::sched::task::Task* task, PreparedNativeE
     dbg::log("wos_proc_execve: PID %x now running '%s' (entry 0x%lx, rsp 0x%lx)", task->pid, task->exe_path.data(), new_initial_rip,
              NEW_RSP);
 #endif
-    uint32_t const EXEC_US = clamp_perf_aux(time::get_us() - EXEC_STARTED_US);
-    record_local_proc_event(task, perf::WkiPerfLocalProcOp::EXECVE, perf::WkiPerfPhase::END, EXEC_CORR, 0, EXEC_US, WOS_PERF_CALLSITE());
-    perf::record_wki_summary(perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(perf::WkiPerfLocalProcOp::EXECVE), 0, 0, 0, EXEC_US, true,
-                             0, static_cast<uint64_t>(FILE_SIZE));
 
     if (OWNER_HANDOFF) {
         asm volatile("cli" ::: "memory");
@@ -5152,6 +5618,36 @@ auto exec_selftest_remote_plan_binding_and_rollback() -> bool {
     RemoteExecPlan empty;
     ok &= empty.copy_arguments(nullptr, nullptr) && empty.argv != nullptr && empty.envp != nullptr && empty.argv[0] == nullptr &&
           empty.envp[0] == nullptr;
+    for (bool accepted : {false, true}) {
+        Task owner{};
+        owner.type = ker::mod::sched::task::TaskType::PROCESS;
+        std::array<uint8_t, 16> image{};
+        image.front() = 0x7f;
+        const char* args[] = {"candidate", nullptr};
+        const char* env[] = {"K=value", nullptr};
+        std::memcpy(owner.exe_path.data(), "/old", 5);
+        {
+            RemoteExecPlan plan;
+            if (!plan.borrow_current_input(image.data(), image.size(), args, env)) return false;
+            plan.size = image.size();
+            plan.complete = true;
+            std::memcpy(plan.path.data(), "/new", 5);
+            auto const CANDIDATE = plan.candidate();
+            ok &= CANDIDATE.bytes.data() == image.data() && CANDIDATE.bytes.size() == image.size() && CANDIDATE.complete &&
+                  plan.arguments() == args && plan.environment() == env && plan.bytes == nullptr && plan.argv == nullptr &&
+                  plan.envp == nullptr && plan.strings == nullptr && std::strcmp(owner.exe_path.data(), "/old") == 0;
+            if (accepted) {
+                ker::syscall::vmem::SharedVmemPublicationGuard publication;
+                plan.publish_metadata(owner);
+            }
+            ok &= std::strcmp(owner.exe_path.data(), accepted ? "/new" : "/old") == 0;
+        }
+        // View teardown never owns these current loader/request bytes.
+        ok &= image.front() == 0x7f && std::strcmp(args[0], "candidate") == 0 && std::strcmp(env[0], "K=value") == 0;
+    }
+    RemoteExecPlan borrowed_empty;
+    ok &= borrowed_empty.borrow_current_input(nullptr, 0, nullptr, nullptr) && borrowed_empty.arguments() != nullptr &&
+          borrowed_empty.environment() != nullptr && borrowed_empty.arguments()[0] == nullptr && borrowed_empty.environment()[0] == nullptr;
     return ok;
 }
 
@@ -5197,7 +5693,11 @@ void service_pending_exec_handoff() {
         auto* request = owner->owned_exec_arguments.load(std::memory_order_acquire);
         auto const OUTCOME = run_remote_exec_owner(*owner, *request, handoff);
         uint32_t const ID = request->remote_proxy_id;
-        cleanup_exec_preparation(*owner);
+        if (OUTCOME.pending != nullptr) {
+            auto* worker_request = OUTCOME.pending->worker->owned_exec_arguments.load(std::memory_order_acquire);
+            if (worker_request != nullptr) worker_request->trace = std::exchange(request->trace, {});
+        }
+        cleanup_exec_preparation_with_status(*owner, OUTCOME.result == ker::net::wki::WkiRemoteSpawnResult::REMOTE ? 0 : OUTCOME.error);
         if (OUTCOME.pending != nullptr) {
             acknowledge_worker_exec(*owner, *OUTCOME.pending,
                                     OUTCOME.result == ker::net::wki::WkiRemoteSpawnResult::LOCAL ? 0 : OUTCOME.error);

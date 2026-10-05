@@ -164,7 +164,7 @@ def test_dispositions_are_shared_snapshots_and_faults_precede_publication() -> N
                   "sigsuspend_active = false", "do_sigreturn = false", "in_signal_handler = false"]:
         require(reset, token, "exec drops old-image signal state")
     exec_body = function_body(exec_source[exec_source.rindex("auto finish_native_exec_image("):], "auto finish_native_exec_image(")
-    commit = exec_body[exec_body.index("auto const COMMIT_STAGE"):]
+    commit = exec_body[exec_body.index("auto& COMMIT_STAGE"):]
     if not (commit.index("commit_native_exec_image(task, *PREPARED)") < commit.index("if (COMMIT_RESULT < 0)") <
             commit.index("retire_exec_siblings(*task)") < commit.rindex("MutexGuard action_guard") <
             commit.index("reset_signal_state_for_exec()") < commit.index("Exec admission and owned storage are gone")):

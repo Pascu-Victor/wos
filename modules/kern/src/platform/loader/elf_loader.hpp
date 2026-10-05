@@ -92,6 +92,9 @@ struct ElfFileView {
     void* read_context{};
     uint64_t logical_size{};
     const uint8_t* contiguous_base{};
+    // Metadata arrays/names remain valid through load_elf and can feed copied
+    // debug-section rows. This grants no mapping authority to section addresses.
+    bool source_metadata_stable{};
 };
 
 struct ElfFile {

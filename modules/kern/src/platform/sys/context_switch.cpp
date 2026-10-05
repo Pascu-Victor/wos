@@ -971,6 +971,31 @@ extern "C" void wos_syscall_save_current_fpu() {
     save_live_fpu_state(task);
 }
 
+// Called on the published current task's stack with interrupts masked, before
+// register restore/swapgs. This is a kernel handoff timestamp, not a timestamp
+// of the first userspace instruction (which may still fault on a lazy page).
+extern "C" void wos_record_exec_user_return(uint64_t return_rip, uint32_t return_kind) {
+    auto* task = sched::get_return_task();
+    if (task == nullptr || task != sched::get_current_task() || task->type != sched::task::TaskType::PROCESS) {
+        return;
+    }
+    auto& trace = task->exec_image_trace;
+    if (!trace.pending || trace.initial_rip != return_rip) {
+        return;
+    }
+    trace.pending = false;
+    if (trace.capture_session != perf::current_wki_capture_session(perf::WkiPerfScope::LOCAL_PROC,
+                                                                   static_cast<uint8_t>(perf::WkiPerfLocalProcOp::EXEC_USER_RETURN))) {
+        return;
+    }
+    auto const CPU = static_cast<uint32_t>(cpu::current_cpu());
+    perf::record_wki_event(CPU, task->pid, perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(perf::WkiPerfLocalProcOp::EXEC_IMAGE_OWNER),
+                           perf::WkiPerfPhase::POINT, 0, 0, trace.correlation, 0, return_kind, WOS_PERF_CALLSITE(), trace.capture_session);
+    perf::record_wki_event(CPU, trace.subject_pid, perf::WkiPerfScope::LOCAL_PROC,
+                           static_cast<uint8_t>(perf::WkiPerfLocalProcOp::EXEC_USER_RETURN), perf::WkiPerfPhase::POINT, 0, 0,
+                           trace.correlation, 0, return_kind, WOS_PERF_CALLSITE(), trace.capture_session);
+}
+
 extern "C" void wos_syscall_restore_current_fpu() {
     auto* task = sched::get_current_task();
     if (task == nullptr || task->type != sched::task::TaskType::PROCESS) {

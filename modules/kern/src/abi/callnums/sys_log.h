@@ -10,6 +10,7 @@ enum class sys_log_ops : uint64_t {
     LOG_EX,
     LOG_BLOCK_BEGIN,
     LOG_BLOCK_END,
+    PERF_TRACE,  // Optional numeric startup milestone; no pointer arguments.
 };
 
 enum class sys_log_device : uint64_t {

@@ -129,6 +129,25 @@ def test_signal_iret_preserves_restored_user_r11() -> None:
     )
 
 
+def test_syscall_entry_preserves_selector_until_saved() -> None:
+    source = SYSCALL_ASM.read_text()
+    entry = source.split("wos_asm_syscall_handler:", 1)[1]
+    before_save = entry.split("mov [gs:0x38], rax", 1)[0]
+    instructions = "\n".join(line.split(";", 1)[0] for line in before_save.splitlines())
+
+    require_tokens(
+        instructions,
+        [
+            "cmp dword [gs:0x04], 0xffff8000",
+            "cmp dword [gs:0x04], 0xffff9000",
+            "cmp dword [gs:0x04], 0xfffffd00",
+        ],
+        "syscall entry GS validation must not borrow the selector register",
+    )
+    if re.search(r"\b(?:rax|eax|ax|al|ah)\b", instructions, flags=re.IGNORECASE):
+        fail("syscall entry must preserve RAX until the syscall selector is saved")
+
+
 def test_coredump_file_is_private_and_exclusively_created() -> None:
     source = COREDUMP_CPP.read_text()
 
@@ -576,6 +595,7 @@ if __name__ == "__main__":
     test_sigkill_preempts_active_handler_only_at_safe_return()
     test_cpu_exhaustion_waits_for_safe_user_return()
     test_syscall_signal_delivery_updates_live_gs_scratch()
+    test_syscall_entry_preserves_selector_until_saved()
     test_signal_iret_preserves_restored_user_r11()
     test_coredump_file_is_private_and_exclusively_created()
     test_coredump_worker_releases_stolen_elf_buffer()

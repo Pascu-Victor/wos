@@ -55,6 +55,10 @@ KTEST(ExecWkiTarget, OneShotConsumesOnlyOnSuccessfulPlacement) {
     KEXPECT_TRUE(ker::syscall::process::exec_selftest_one_shot_wki_target_consumes_only_on_success());
 }
 
+KTEST(ExecRequestArguments, SnapshotArenasPreservePrefixesAndBudgets) {
+    KEXPECT_TRUE(ker::syscall::process::exec_selftest_argument_snapshot_arenas_and_faults());
+}
+
 KTEST(ExecRequestArguments, RecoversPartialAndRecursiveStorage) {
     KEXPECT_TRUE(ker::syscall::process::exec_selftest_request_arguments_recover_partial_and_recursive_storage());
 }

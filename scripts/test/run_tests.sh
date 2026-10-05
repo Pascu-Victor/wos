@@ -194,10 +194,16 @@ UNIT_TESTS=(
     waitpid_source_test
     waitpid_telemetry_test
     exec_source_test
+    exec_trace_ownership_test
+    exec_owner_return_test
+    exec_read_retry_test
+    exec_interpreter_view_test
+    exec_image_entry_test
     fork_child_trace_test
     fork_failure_diagnostics_test
     fork_stack_pressure_test
     gc_epoch_progress_test
+    userspace_startup_test
     scheduler_source_test
     kernel_wait_accounting_runtime_test
     preempt_guard_timing_test
@@ -309,7 +315,9 @@ UNIT_TESTS=(
     lazy_page_backing_test
     user_layout_walk_test
     page_table_zero_test
+    exec_remote_input_test
     root_kernel_mappings_test
+    exec_argument_arena_test
     cpu_accounting_snapshot_runtime_test
     kvmclock_test
     mlibc_locale_runtime_test

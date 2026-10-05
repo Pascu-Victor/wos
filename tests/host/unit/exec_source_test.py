@@ -203,8 +203,10 @@ def require_large_dynamic_elf_is_file_backed(source: str) -> None:
             fail(f"large dynamic ELF file-backed invariant missing: {snippet}")
 
     prepare_body = function_body(source, "prepare_file_backed_elf")
+    if "size_t main_minimum_size = EXEC_FILE_BACKED_ELF_MIN_SIZE)" not in source:
+        fail("default main ELF compact threshold must remain 8 MiB")
     for snippet in [
-        "file_size < EXEC_FILE_BACKED_ELF_MIN_SIZE",
+        "file_size < main_minimum_size",
         "phdr_bytes > EXEC_FILE_BACKED_METADATA_MAX",
         "shdr_bytes > EXEC_FILE_BACKED_METADATA_MAX",
         "shstrtab.sh_size > EXEC_FILE_BACKED_METADATA_MAX",
@@ -470,7 +472,7 @@ def require_main_exec_retirement_order(source: str) -> None:
         if token in commit:
             fail("image publication must not infer its subject or change executor ownership/cleanup")
     tokens = ["commit_native_exec_image(task, *PREPARED)", "if (COMMIT_RESULT < 0)",
-              "cleanup_exec_preparation(*task)", "retire_exec_siblings(*task)",
+              "cleanup_exec_preparation_with_status(*task,", "retire_exec_siblings(*task)",
               "task->reset_signal_state_for_exec()", "collect_cloexec_fds_locked(task, fds)",
               "ensure_exec_stdio_fallbacks(task)", "Exec admission and owned storage are gone", "// === CRITICAL SECTION"]
     positions = [body.index(token) for token in tokens]
@@ -478,9 +480,9 @@ def require_main_exec_retirement_order(source: str) -> None:
         fail("exec retirement must follow validated commit and precede userspace return")
     failure_start = body.index("if (COMMIT_RESULT < 0)")
     failure = body[failure_start:body.index("return static_cast<uint64_t>(COMMIT_RESULT)", failure_start)]
-    if "cleanup_exec_preparation(*task)" not in failure or "retire_exec_siblings" in failure:
+    if "cleanup_exec_preparation_with_status(*task," not in failure or "retire_exec_siblings" in failure:
         fail("failed exec must recover owned admission/storage without retiring siblings")
-    if body.rindex("cleanup_exec_preparation(*task)") < body.index("ensure_exec_stdio_fallbacks(task)"):
+    if body.rindex("cleanup_exec_preparation_with_status(*task,") < body.index("ensure_exec_stdio_fallbacks(task)"):
         fail("successful exec must retain recovery ownership and admission through final shared state")
     if body.index('asm volatile("mov %0, %%cr3"') > body.index("retire_exec_siblings(*task)"):
         fail("retirement must wait only after replacement CR3 is active")
@@ -500,7 +502,7 @@ def require_main_exec_retirement_order(source: str) -> None:
 
 
 def require_tracked_exec_cleanup(source: str) -> None:
-    cleanup = function_body(source, "cleanup_exec_preparation")
+    cleanup = function_body(source, "cleanup_exec_preparation_with_status")
     order = ["compare_exchange_strong", "owned_exec_preparation.load", "prepared->discard()",
              "owned_exec_preparation.exchange(nullptr", "delete prepared", "teardown_in_progress.store(false"]
     positions = [cleanup.index(token) for token in order]
@@ -587,7 +589,7 @@ def require_request_arguments_are_published_before_usercopy(source: str) -> None
     vector = function_body(source, "snapshot_exec_vector")
     if "auto& string_addrs = snapshot.input_string_addrs" not in vector:
         fail("input-address spill must belong to snapshot recovery")
-    cleanup = function_body(source, "cleanup_exec_preparation")
+    cleanup = function_body(source, "cleanup_exec_preparation_with_status")
     order = ["compare_exchange_strong", "prepared->discard()", "owned_exec_arguments.load", "delete arguments",
              "owned_exec_arguments.exchange", "exec_preparation_teardown_in_progress.store(false"]
     if [cleanup.index(token) for token in order] != sorted(cleanup.index(token) for token in order):
@@ -605,13 +607,17 @@ def require_native_loader_scratch_is_request_owned(source: str) -> None:
     if native.index("request->native_scratch(shebang_depth)") > native.index("vfs::vfs_open_file_as(*task"):
         fail("native scratch must be retained before potentially blocking loader work")
     for snippet in ["auto& prepared_elf = scratch->prepared_elf",
+                    "auto& prepared_interp = scratch->prepared_interp",
+                    "auto*& interp_buf = scratch->interp_buf",
+                    "scratch->reset_interp_storage()",
                     "auto& main_loader_lazy_ranges = scratch->main_lazy_ranges",
                     "auto& interp_loader_lazy_ranges = scratch->interp_lazy_ranges",
                     "auto*& argv_addrs = scratch->argv_addrs",
                     "auto*& envp_addrs = scratch->envp_addrs"]:
         if snippet not in native:
             fail(f"native temporary storage must belong to the request: {snippet}")
-    for snippet in ["PreparedFileBackedElf prepared_elf;", "ElfLazyLoadRangeVec main_loader_lazy_ranges;",
+    for snippet in ["PreparedFileBackedElf prepared_elf;", "PreparedFileBackedElf prepared_interp;",
+                    "auto* interp_buf = new", "delete[] interp_buf", "ElfLazyLoadRangeVec main_loader_lazy_ranges;",
                     "ElfLazyLoadRangeVec interp_loader_lazy_ranges;", "delete[] argv_addrs", "delete[] envp_addrs"]:
         if snippet in native:
             fail(f"native scratch must not retain independent lexical ownership: {snippet}")
@@ -638,7 +644,7 @@ def require_preparation_unwinds_before_completion(source: str) -> None:
         fail("wrapper must complete only successful native preparation after recursive unwind")
     if "auto const INITIAL_REGS = PREPARED->view().registers" not in finish:
         fail("completion must copy startup registers before destroying the image owner")
-    after_cleanup = finish[finish.rindex("cleanup_exec_preparation(*task)"):]
+    after_cleanup = finish[finish.rindex("cleanup_exec_preparation_with_status(*task,"):]
     for forbidden in ["PREPARED->", "request->", "completion."]:
         if forbidden in after_cleanup:
             fail("return-frame patch must not borrow disposed preparation/request data")
@@ -815,10 +821,10 @@ def require_remote_exec_uses_canonical_owned_request(source: str) -> None:
     cutover = function_body(source, "cutover_remote_exec_owner")
     assert cutover.index("publish_exec_credentials") < cutover.index("if (ERROR != 0) return ERROR") < cutover.index("plan.publish_metadata(owner)")
     wrapper = function_body(source, "wos_proc_execve")
-    if wrapper.rindex("cleanup_exec_preparation(*task)") > wrapper.index("publish_remote_exec_proxy(*task"):
+    if wrapper.rindex("cleanup_exec_preparation_with_status(*task,") > wrapper.index("publish_remote_exec_proxy(*task"):
         fail("scheduler proxy identity cannot precede outer exec cleanup")
     service = function_body(source, "service_pending_exec_handoff")
-    order = ["run_remote_exec_owner", "cleanup_exec_preparation(*owner)", "publish_remote_exec_proxy", "wos_asm_park_exec_owner"]
+    order = ["run_remote_exec_owner", "cleanup_exec_preparation_with_status(*owner,", "publish_remote_exec_proxy", "wos_asm_park_exec_owner"]
     if [service.index(t) for t in order] != sorted(service.index(t) for t in order):
         fail("canonical remote success must clean ownership and abandon the old owner continuation")
     remote = function_body(source, "try_process_remote_exec")
@@ -847,7 +853,53 @@ def require_exec_auxv_matches_committed_snapshot() -> None:
     assert remote.index("identity_auxv(CREDENTIAL_TRANSITION ? replacement_credentials : mapped_credentials)") < remote.index("publish_exec_credentials(*new_task")
 
 
+def require_exec_trace_ownership(source: str) -> None:
+    wrapper = function_body(source, "wos_proc_execve")
+    order = ["adopt_exec_arguments(*task, pending)", "request->trace.begin(task, 0",
+             "SNAPSHOT_STAGE", "snapshot_exec_arguments(*task", "SNAPSHOT_RESULT, 0, WOS_PERF_CALLSITE()",
+             "wos_proc_execve_impl(snapshot.path.data()"]
+    assert [wrapper.index(t) for t in order] == sorted(wrapper.index(t) for t in order)
+    assert wrapper.index("prepared->trace = std::exchange(request->trace, {})") < wrapper.index("handoff_worker_exec(*task")
+    assert "cleanup_exec_preparation_with_status(*task, static_cast<int32_t>(HANDOFF_RESULT))" in wrapper
+    assert "cleanup_exec_preparation_with_status(*task, static_cast<int32_t>(RESULT))" in wrapper
+    native = function_body(source, "wos_proc_execve_impl")
+    assert "request->trace.begin(task, TRACE_DEPTH" in native
+    assert "next_wki_trace_correlation" not in native and "time::get_us" not in native
+    for op in ["ARG_COPY", "OPEN_ACCESS", "ELF_READ", "REMOTE_SPAWN", "NEW_IMAGE", "LOAD_ELF", "LOAD_INTERP", "STACK_SETUP", "COMMIT"]:
+        assert f"request->trace.stage(task, TRACE_DEPTH, perf::WkiPerfLocalProcOp::{op}" in native
+    assert "WkiRemoteSpawnResult::FAILED ? remote_error" in " ".join(native.split())
+    cleanup = function_body(source, "cleanup_exec_preparation_with_status")
+    order = ["compare_exchange_strong", "std::exchange(prepared->trace, {})", "prepared->discard()", "delete prepared",
+             "std::exchange(arguments->trace, {})", "delete arguments", "owned_exec_arguments.exchange",
+             "image_trace.finish", "argument_trace.finish", "teardown_in_progress.store(false"]
+    assert [cleanup.index(t) for t in order] == sorted(cleanup.index(t) for t in order)
+    assert "cleanup_exec_preparation_with_status(task, -ECANCELED)" in function_body(source, "cleanup_exec_preparation")
+    claim = function_body(source, "claim_pending_exec_handoff")
+    order = ["resource_lock.lock_irqsave", "auto* holder = std::exchange(handoff->remote_request, nullptr)",
+             "holder->trace = std::exchange(worker_request->trace, {})", "owned_exec_arguments.store(holder", "pending_exec_handoff.store(nullptr"]
+    assert [claim.index(t) for t in order] == sorted(claim.index(t) for t in order)
+    for forbidden in ["record_wki", "trace.finish", "get_us()", "next_wki_trace", "new "]:
+        assert forbidden not in claim
+    service = function_body(source, "service_pending_exec_handoff")
+    order = ["run_remote_exec_owner", "worker_request->trace = std::exchange(request->trace, {})",
+             "cleanup_exec_preparation_with_status(*owner", "acknowledge_worker_exec(*owner", "publish_remote_exec_proxy"]
+    assert [service.index(t) for t in order] == sorted(service.index(t) for t in order)
+    finish = function_body(source, "finish_native_exec_image")
+    assert "COMMIT_STAGE, COMMIT_RESULT, 0" in finish
+    assert "auto& COMMIT_STAGE = PREPARED->trace.pending.at(completion.trace_depth)" in finish
+    assert "auto& DESTROY_OLD_STAGE = PREPARED->trace.pending.at(completion.trace_depth)" in finish
+    assert finish.index("TRACE_SUBJECT_PID, perf::WkiPerfLocalProcOp::DESTROY_OLD") < finish.index("shm_cleanup_for_task(task)")
+    remote = function_body(source, "run_remote_exec_owner")
+    assert remote.index("WORKER_HANDOFF = handoff != nullptr") < remote.index("wki_try_remote_spawn(&owner")
+    after = remote[remote.index("outcome.result = ker::net::wki::wki_try_remote_spawn"):]
+    assert "handoff->" not in after and "request.trace.pending" in after
+    trace = source[source.index("struct ExecTraceState {"):source.index("template <typename T, size_t N>")]
+    assert trace.count("std::array<LocalProcStage, MAX_SHEBANG_DEPTH + 1>") == 2
+    assert "depth != 0; --depth" in trace
+
+
 def main() -> None:
+    require_exec_trace_ownership(EXEC_CPP.read_text())
     require_exec_auxv_matches_committed_snapshot()
     source = EXEC_CPP.read_text()
     loader_source = ELF_LOADER_CPP.read_text()

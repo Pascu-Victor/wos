@@ -163,6 +163,12 @@ wos_asm_syscall_handler:
     cmp r10, [gs:0x28]
     jne .sysret_rcx_corrupt_prepop
 
+    extern wos_record_exec_user_return
+    mov rdi, [gs:0x28]
+    mov esi, 1
+    call wos_record_exec_user_return
+    cli
+
     popq
     pop rax
 
@@ -220,6 +226,10 @@ wos_asm_syscall_handler:
     jmp .sysret_halt
 
 .signal_iret_return:
+    mov rdi, [gs:0x28]
+    mov esi, 2
+    call wos_record_exec_user_return
+    cli
     ; Signal delivery and sigreturn need the complete saved GP register block
     ; restored before userspace runs. SYSRET consumes RCX/R11 for the return
     ; RIP/RFLAGS, so build an IRETQ frame below the saved GPRegs block and

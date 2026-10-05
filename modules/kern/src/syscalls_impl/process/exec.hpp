@@ -66,6 +66,7 @@ auto exec_selftest_remote_cutover_refusal_is_atomic() -> bool;
 auto exec_selftest_remote_plan_binding_and_rollback() -> bool;
 auto exec_selftest_remote_request_claim_and_cancel() -> bool;
 auto exec_selftest_worker_handoff_claim_and_cancel() -> bool;
+auto exec_selftest_argument_snapshot_arenas_and_faults() -> bool;
 auto exec_selftest_request_arguments_recover_partial_and_recursive_storage() -> bool;
 auto exec_selftest_request_scratch_preserves_transferred_metadata() -> bool;
 auto exec_selftest_transaction_recovers_admission_and_retired_storage() -> bool;

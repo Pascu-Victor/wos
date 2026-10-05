@@ -43,6 +43,7 @@ alignment, overflow, and ownership validation before page-table mutation.
 | `SYS_LOG` | `LOG_EX` | `in` | message up to 4096 plus optional module C string up to `JOURNAL_MODULE_MAX` | module yes; message no | message prefix may be emitted as truncated; module faults are atomic | snapshots message and module before journal emission |
 | `SYS_LOG` | `LOG_BLOCK_BEGIN` | `none` | n/a | n/a | none | acquires logical log-block ownership only |
 | `SYS_LOG` | `LOG_BLOCK_END` | `none` | n/a | n/a | none | releases logical log-block ownership only |
+| `SYS_LOG` | `PERF_TRACE` | `none` | n/a | n/a | none | validates numeric version, milestone, reserved field and correlation range before optional perf emission; canonical native-image ownership, consumed handoff, exact session/correlation, prerequisites and duplicate mask guard admission; no log gate or usercopy |
 
 ## Futex
 

@@ -1,7 +1,10 @@
 #include "syscall.hpp"
 
+#include <abi/callnums/vfs.h>
+
 #include <cerrno>
 #include <cstdint>
+#include <platform/sched/resource.hpp>
 #include <platform/security/credentials.hpp>
 #include <syscalls_impl/futex/futex.hpp>
 #include <syscalls_impl/multiproc/threadControl.hpp>
@@ -11,6 +14,7 @@
 #include <syscalls_impl/time/time.hpp>
 #include <syscalls_impl/vfs/sys_vfs.hpp>
 #include <syscalls_impl/vmem/sys_vmem.hpp>
+#include <utility>
 
 #include "abi/callnums.hpp"
 #include "abi/callnums/multiproc.h"
@@ -25,6 +29,7 @@
 #include "platform/sched/scheduler.hpp"
 #include "syscalls_impl/log/sys_log.hpp"
 #include "syscalls_impl/multiproc/threadInfo.hpp"
+#include "syscalls_impl/process/exec.hpp"
 #include "syscalls_impl/process/exit.hpp"
 #include "syscalls_impl/process/process.hpp"
 #include "util/hcf.hpp"
@@ -32,6 +37,37 @@
 namespace ker::mod::sys {
 namespace {
 constexpr int WOS_SIGSYS = 31;
+
+auto read_vfs_with_exec_retry(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) -> int64_t {
+    auto* task = sched::get_current_task();
+    for (;;) {
+        if (task != nullptr) {
+            task->exec_read_interrupted = false;
+        }
+        auto const RESULT = ker::syscall::vfs::sys_vfs(op, a1, a2, a3, a4, a5);
+        if (RESULT != -EINTR || task == nullptr || !std::exchange(task->exec_read_interrupted, false)) {
+            return RESULT;
+        }
+        // Pipe/File/usercopy owners have unwound. An optional remote probe can
+        // choose LOCAL and release its row before native preparation starts;
+        // that internal wake must not escape as EINTR to the old image.
+        bool const ACCOUNTING_ACTIVE = sched::pause_syscall_accounting();
+        sched::resource::wait_for_exec_quiescence(*task);
+        ker::syscall::process::exit_current_if_process_exit_requested();
+        bool interrupted = task->has_interrupting_user_signal_pending();
+        if (!interrupted) {
+            ker::syscall::process::service_pending_exec_handoff();
+            ker::syscall::process::exit_current_if_process_exit_requested();
+            interrupted = task->has_interrupting_user_signal_pending();
+        }
+        if (ACCOUNTING_ACTIVE) {
+            sched::resume_syscall_accounting();
+        }
+        if (interrupted) {
+            return RESULT;
+        }
+    }
+}
 
 auto sysret_bad_return_reason(uint64_t reason) -> const char* {
     switch (reason) {
@@ -90,7 +126,8 @@ extern "C" auto syscall_handler(cpu::GPRegs* regs) -> uint64_t {
             result = ker::syscall::time::sys_time_get(A1, A2, A3);
             break;
         case abi::callnums::VFS:
-            result = ker::syscall::vfs::sys_vfs(A1, A2, A3, A4, A5, A6);
+            result = A1 == static_cast<uint64_t>(abi::vfs::ops::READ) ? read_vfs_with_exec_retry(A1, A2, A3, A4, A5, A6)
+                                                                      : ker::syscall::vfs::sys_vfs(A1, A2, A3, A4, A5, A6);
             break;
         case abi::callnums::NET:
             result = ker::syscall::net::sys_net(A1, A2, A3, A4, A5, A6);

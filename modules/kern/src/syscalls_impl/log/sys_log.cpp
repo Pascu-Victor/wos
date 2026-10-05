@@ -7,10 +7,13 @@
 #include <cstdint>
 #include <cstring>
 
+#include "abi/callnums/perf_trace.h"
 #include "abi/callnums/sys_log.h"
 #include "mod/gfx/fb.hpp"
+#include "platform/asm/cpu.hpp"
 #include "platform/dbg/dbg.hpp"
 #include "platform/dbg/journal.hpp"
+#include "platform/perf/perf_events.hpp"
 #include "platform/sched/scheduler.hpp"
 #include "platform/sched/task.hpp"
 #include "platform/sys/mutex.hpp"
@@ -177,9 +180,68 @@ void nul_terminate_copy(std::array<char, Size>& buf, uint64_t copied, bool trim_
 
 }  // namespace
 
+// The caller supplies a diagnostic milestone, never an identity or pointer.
+// Image ownership and capture provenance are kernel values. No logging gate,
+// allocation, usercopy or blocking is involved, including before userspace TLS.
+auto record_userspace_startup_marker(ker::mod::sched::task::Task* task, uint64_t stage, uint64_t session, uint64_t correlation,
+                                     uint64_t version, uint64_t reserved) -> uint64_t {
+    using namespace ker::mod;
+    if (version != WOS_PERF_TRACE_VERSION || reserved != 0 || stage < WOS_PERF_STAGE_IMAGE_ENTRY || stage > WOS_PERF_STAGE_RTLD_TCB_READY ||
+        correlation > UINT32_MAX) {
+        return static_cast<uint64_t>(-EINVAL);
+    }
+    if (task == nullptr || task->type != sched::task::TaskType::PROCESS || task->is_thread) {
+        return 0;
+    }
+    auto& trace = task->exec_image_trace;
+    if (trace.pending || trace.capture_session == perf::PERF_ANY_SESSION || trace.capture_session != session ||
+        trace.correlation != correlation ||
+        session != perf::current_wki_capture_session(perf::WkiPerfScope::LOCAL_PROC,
+                                                     static_cast<uint8_t>(perf::WkiPerfLocalProcOp::USERSPACE_STAGE))) {
+        return 0;
+    }
+    static_assert(WOS_PERF_STAGE_RTLD_TCB_READY <= 8);  // emitted_user_stages is one byte.
+    uint8_t const BIT = static_cast<uint8_t>(1U << (stage - 1));
+    if ((trace.emitted_user_stages & BIT) != 0) {
+        return 0;
+    }
+    if (stage != WOS_PERF_STAGE_IMAGE_ENTRY && (trace.emitted_user_stages & 1U) == 0) {
+        return 0;
+    }
+    // Old libc can omit the intermediate stages. New ones must be ordered and
+    // precede RTLD_READY; static CRT_ENTRY may legitimately come before them.
+    if (stage >= WOS_PERF_STAGE_RTLD_DEPENDENCIES_READY) {
+        constexpr uint8_t RTLD_READY_BIT = static_cast<uint8_t>(1U << (WOS_PERF_STAGE_RTLD_READY - 1U));
+        if ((trace.emitted_user_stages & RTLD_READY_BIT) != 0) {
+            return 0;
+        }
+        if (stage != WOS_PERF_STAGE_RTLD_DEPENDENCIES_READY && (trace.emitted_user_stages & (1U << (stage - 2))) == 0) {
+            return 0;
+        }
+    }
+    constexpr uint8_t MAIN_PREREQUISITES = (1U << (WOS_PERF_STAGE_RTLD_READY - 1)) | (1U << (WOS_PERF_STAGE_CRT_ENTRY - 1));
+    if (stage == WOS_PERF_STAGE_MAIN_BEGIN && (trace.emitted_user_stages & MAIN_PREREQUISITES) != MAIN_PREREQUISITES) {
+        return 0;
+    }
+    if (stage == WOS_PERF_STAGE_MAIN_END && (trace.emitted_user_stages & (1U << (WOS_PERF_STAGE_MAIN_BEGIN - 1))) == 0) {
+        return 0;
+    }
+    trace.emitted_user_stages |= BIT;
+    perf::record_wki_event(static_cast<uint32_t>(cpu::current_cpu()), task->pid, perf::WkiPerfScope::LOCAL_PROC,
+                           static_cast<uint8_t>(perf::WkiPerfLocalProcOp::USERSPACE_STAGE), perf::WkiPerfPhase::POINT, 0, 0,
+                           trace.correlation, 0, static_cast<uint32_t>(stage), WOS_PERF_CALLSITE(), session);
+    return 0;
+}
+
+static_assert(static_cast<uint64_t>(ker::abi::callnums::SYS_LOG) == WOS_PERF_TRACE_SYS_LOG);
+static_assert(static_cast<uint64_t>(ker::abi::sys_log::sys_log_ops::PERF_TRACE) == WOS_PERF_TRACE_LOG_OP);
+
 auto sys_log(ker::abi::sys_log::sys_log_ops op, uint64_t str_user_addr, uint64_t len, uint64_t device_or_level, uint64_t module_user_addr,
              uint64_t cookie) -> uint64_t {
     auto* current_task = ker::mod::sched::get_current_task();
+    if (op == abi::sys_log::sys_log_ops::PERF_TRACE) {
+        return record_userspace_startup_marker(current_task, str_user_addr, len, device_or_level, module_user_addr, cookie);
+    }
 
     // A byte-counted log may emit a fully copied prefix when a later page
     // faults. NUL-terminated inputs are all-or-error because there is no ABI

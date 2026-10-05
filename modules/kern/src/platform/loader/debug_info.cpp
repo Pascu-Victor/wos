@@ -3,8 +3,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/sys/spinlock.hpp>
+#include <utility>
 #include <vector>
 
 #include "extern/elf.h"
@@ -30,7 +32,7 @@ void register_process(uint64_t pid, const char* name, uint64_t base_addr, uint64
     info.sections = std::vector<DebugSection>();
 
     debug_registry_lock.lock();
-    debug_registry.push_back(info);
+    debug_registry.push_back(std::move(info));
     debug_registry_lock.unlock();
 #ifdef ELF_DEBUG
     log::debug("registered process: pid=%x, name=%s, base=%x, entry=%x", pid, name, base_addr, entry_point);
@@ -58,6 +60,29 @@ void add_debug_section(uint64_t pid, const char* name, uint64_t vaddr, uint64_t 
         }
     }
     debug_registry_lock.unlock();
+}
+
+auto retain_section_names(uint64_t pid, const char* names, size_t size, const char*& retained_names) -> bool {
+    retained_names = nullptr;
+    // Same complete-table bound as the ELF loader debug metadata plan. Do not
+    // multiply a hostile long name by the number of referencing sections.
+    constexpr size_t MAX_SIZE = 0x400000;
+    if (names == nullptr || size == 0 || size > MAX_SIZE) return false;
+    std::unique_ptr<char[]> storage(new (std::nothrow) char[size]);
+    if (!storage) return false;
+    std::memcpy(storage.get(), names, size);
+
+    debug_registry_lock.lock();
+    for (auto& process : debug_registry) {
+        if (process.pid == pid) {
+            retained_names = storage.get();
+            process.section_name_storage.push_back(std::move(storage));
+            debug_registry_lock.unlock();
+            return true;
+        }
+    }
+    debug_registry_lock.unlock();
+    return true;
 }
 
 void add_debug_symbol(uint64_t pid, const char* name, uint64_t vaddr, uint64_t paddr, uint64_t size, uint8_t bind, uint8_t type,

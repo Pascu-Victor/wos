@@ -110,6 +110,18 @@ enum class TaskType : uint8_t {
     IDLE,
 };
 
+// Native exec's immutable root-attempt identity, owned by the executing task.
+// Final return tails consume pending only when their actual RIP is initial_rip.
+// Fork/default construction does not inherit another image's pending marker.
+struct ExecImageTrace {
+    uint64_t subject_pid{};
+    uint64_t initial_rip{};
+    uint64_t capture_session = UINT64_MAX;
+    uint32_t correlation{};
+    bool pending{};
+    uint8_t emitted_user_stages{};
+};
+
 // Task lifecycle state for lock-free scheduling
 // Transitions: ACTIVE -> EXITING -> DEAD
 enum class TaskState : uint8_t {
@@ -405,7 +417,7 @@ struct Task {
     // ELF buffer for cleanup and auxv metadata.
     uint8_t* elf_buffer{};
     size_t elf_buffer_size{};
-    // Large dynamic executables retain the opened file instead of a
+    // File-backed dynamic executables retain the opened file instead of a
     // contiguous full-file buffer. elf_buffer then contains only bounded ELF
     // header/program-header metadata for ptrace and procfs.
     ker::vfs::File* exec_image_file{};
@@ -587,12 +599,19 @@ struct Task {
         return is_thread && owner != nullptr && owner->resource_exec_quiescence_epoch.load(std::memory_order_acquire) != 0;
     }
 
-    auto has_interrupting_signal_pending() -> bool {
-        if (process_exit_requested.load(std::memory_order_acquire) || pending_exec_handoff.load(std::memory_order_acquire) != nullptr ||
-            exec_quiescence_requested()) {
+    auto has_interrupting_signal_pending(bool* exec_interrupted = nullptr) -> bool {
+        if (exec_interrupted != nullptr) *exec_interrupted = false;
+        if (process_exit_requested.load(std::memory_order_acquire)) {
             return true;
         }
+        if (pending_exec_handoff.load(std::memory_order_acquire) != nullptr || exec_quiescence_requested()) {
+            if (exec_interrupted != nullptr) *exec_interrupted = true;
+            return true;
+        }
+        return has_interrupting_user_signal_pending();
+    }
 
+    auto has_interrupting_user_signal_pending() -> bool {
         for (;;) {
             uint64_t const DELIVERABLE = signal_deliverable_bits();
             if (DELIVERABLE == 0) {
@@ -996,6 +1015,10 @@ struct Task {
     // cancellation and preparation-slot transfer use the owner's resource_lock.
     std::atomic<ker::syscall::process::WorkerExecHandoff*> pending_exec_handoff{nullptr};
     std::atomic<ker::syscall::process::WorkerExecHandoff*> active_exec_handoff{nullptr};
+    // Current-task-only cause of an empty pipe read's EINTR. The syscall
+    // dispatcher clears this before each READ and retries only after VFS unwinds.
+    bool exec_read_interrupted{};
+    ExecImageTrace exec_image_trace{};
 
     std::atomic<bool> exit_in_progress{false};
     bool has_exited{};

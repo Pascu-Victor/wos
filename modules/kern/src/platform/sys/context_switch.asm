@@ -13,6 +13,7 @@ bits 64
 extern wos_commit_handoff_task
 extern wos_user_handoff_stack_top
 extern wos_restore_return_task_fpu
+extern wos_record_exec_user_return
 extern wos_discard_abandoned_return_fpu_state
 extern deferred_task_switch
 %ifdef WOS_KASAN
@@ -211,6 +212,9 @@ extern wos_kasan_prepare_kernel_resume
     and rsp, -16
     call wos_commit_handoff_task
     call wos_restore_return_task_fpu
+    mov rdi, [r14 + GPREGS_SIZE] ; actual incoming iret RIP
+    mov esi, 3
+    call wos_record_exec_user_return
     mov rsp, r14
 
     ; Returning to userspace - set up data segment selectors. The base values
@@ -287,6 +291,9 @@ extern wos_kasan_prepare_kernel_resume
     and rsp, -16
     call wos_commit_handoff_task
     call wos_restore_return_task_fpu
+    mov rdi, [r14] ; actual same-stack iret RIP
+    mov esi, 3
+    call wos_record_exec_user_return
     mov rsp, r14
 
     ; Swap from kernel GS base to the user's GS base prepared by switch_to().
@@ -421,6 +428,9 @@ wos_asm_enter_usermode:
     mov r14, rsp
     and rsp, -16
     call wos_restore_return_task_fpu
+    mov rdi, r12
+    mov esi, 4
+    call wos_record_exec_user_return
     mov rsp, r14
     mov rdi, r12
     mov rsi, r13

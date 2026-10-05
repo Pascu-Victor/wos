@@ -492,6 +492,26 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/exec_source_test.py
 )
 add_test(
+    NAME exec_trace_ownership_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/exec_trace_ownership_test.py
+)
+add_test(
+    NAME exec_owner_return_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/exec_owner_return_test.py
+)
+add_test(
+    NAME exec_interpreter_view_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/exec_interpreter_view_test.py
+)
+add_test(
+    NAME exec_read_retry_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/exec_read_retry_test.py
+)
+add_test(
+    NAME exec_image_entry_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/exec_image_entry_test.py
+)
+add_test(
     NAME fork_child_trace_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/fork_child_trace_test.py
 )
@@ -506,6 +526,10 @@ add_test(
 add_test(
     NAME gc_epoch_progress_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/gc_epoch_progress_test.py
+)
+add_test(
+    NAME userspace_startup_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/userspace_startup_test.py
 )
 add_test(
     NAME scheduler_source_test
@@ -772,6 +796,14 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/page_table_zero_test.py
 )
 add_test(
+    NAME exec_remote_input_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/exec_remote_input_test.py
+)
+add_test(
+    NAME exec_argument_arena_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/exec_argument_arena_test.py
+)
+add_test(
     NAME root_kernel_mappings_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/root_kernel_mappings_test.py
 )
@@ -908,10 +940,16 @@ set_tests_properties(    host_test_manifest_test
     waitpid_source_test
     waitpid_telemetry_test
     exec_source_test
+    exec_trace_ownership_test
+    exec_owner_return_test
+    exec_read_retry_test
+    exec_interpreter_view_test
+    exec_image_entry_test
     fork_child_trace_test
     fork_failure_diagnostics_test
     fork_stack_pressure_test
     gc_epoch_progress_test
+    userspace_startup_test
     scheduler_source_test
     preempt_guard_timing_test
     kernel_preemption_cpu_local_audit_test
@@ -978,7 +1016,9 @@ set_tests_properties(    host_test_manifest_test
     lazy_page_backing_test
     user_layout_walk_test
     page_table_zero_test
+    exec_remote_input_test
     root_kernel_mappings_test
+    exec_argument_arena_test
     tmpfs_swap_source_test
     tmpfs_link_source_test
     init_stdio_source_test
