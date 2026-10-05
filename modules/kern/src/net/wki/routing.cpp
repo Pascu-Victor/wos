@@ -8,7 +8,9 @@
 #include <net/wki/routing_model.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
+#include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
+#include <platform/sched/event_wake_diagnostics.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/spinlock.hpp>
@@ -20,14 +22,17 @@ using log = ker::mod::dbg::logger<"wki">;
 
 namespace {
 
-constexpr uint64_t WORKER_INTERVAL_US = 20'000;
+constexpr uint64_t WORKER_ACTIVE_INTERVAL_US = 20'000;
+constexpr uint64_t WORKER_IDLE_INTERVAL_US = 1'000'000;
 constexpr uint64_t ROUTED_HELLO_PROBE_INTERVAL_US = 1'000'000;
+constexpr uint64_t DISCOVERY_REFRESH_INTERVAL_US = WKI_ROUTING_DISCOVERY_US / 2;
 // At maximum capacity this budgets one origin's entire peer fanout per
 // iteration: a 65,536-send sweep has 5.12 seconds of nominal worker sleeps.
 // Transport and scheduler time remain additional, not a hard latency bound.
 constexpr size_t FLOOD_BUDGET = WKI_MAX_PEERS;
 constexpr size_t PROBE_BUDGET = 8;
 constexpr size_t LEASE_BUDGET = 8;
+constexpr size_t ORIGIN_REPLAY_BUDGET = 8;
 constexpr size_t LSA_BUFFER_SIZE = sizeof(LsaPayload) + (WKI_MAX_NEIGHBORS_PER_LSA * sizeof(LsaNeighborEntry)) + sizeof(LsaLeaseSuffix);
 
 // All large storage is static. Only the routing worker touches scratch/output;
@@ -47,15 +52,23 @@ uint64_t s_published_revision = 0;
 uint64_t s_invalidation_revision = 0;
 WkiRoutingDiag s_diag{};
 std::atomic<bool> s_initialized{false};
+std::atomic<bool> s_rx_timing_enabled{false};
 std::atomic<bool> s_own_pending{false};
 std::atomic<bool> s_replay_pending{false};
-mod::sched::task::Task* s_worker = nullptr;
+std::atomic<mod::sched::task::Task*> s_worker{nullptr};
 uint64_t s_last_own_lsa_time = 0;
 uint64_t s_last_probe_time = 0;
 size_t s_flood_index = 0;
 size_t s_probe_index = 0;
 size_t s_lease_index = 0;
 size_t s_response_index = 0;
+size_t s_origin_replay_index = 0;
+
+void notify_routing_worker(mod::sched::EventWakeDiagnostics* diagnostics = nullptr) {
+    if (auto* worker = s_worker.load(std::memory_order_acquire); worker != nullptr) {
+        mod::sched::wake_task_from_event(worker, mod::sched::EventWakeDeferredSwitch::PRESERVE, diagnostics);
+    }
+}
 
 struct DirectPeer {
     uint16_t node = WKI_NODE_INVALID;
@@ -160,9 +173,73 @@ void observe_authenticated_identity(LsdbEntry& entry, routing_lease::Identity co
     entry.authenticated_identity = identity;
 }
 
-void note_rx_time(uint64_t start) {
-    uint64_t const ELAPSED = wki_now_us() - start;
+enum class RoutingRxStage : uint8_t { VALIDATION, ORIGIN, PREPARE, LOCK_WAIT, APPLY, TAIL };
+
+class RoutingRxTiming {
+    bool m_enabled;
+    uint64_t m_previous;
+    WkiRoutingRxDiag m_sample{};
+
+    void mark_at(RoutingRxStage stage, uint64_t now) {
+        size_t const INDEX = static_cast<size_t>(stage);
+        m_sample.stages_us.at(INDEX) = now - m_previous;
+        m_sample.stage_mask |= static_cast<uint8_t>(1U << INDEX);
+        m_previous = now;
+    }
+
+   public:
+    RoutingRxTiming(uint64_t start, MsgType message, WkiHeader const* header, uint16_t payload_len)
+        : m_enabled(s_rx_timing_enabled.load(std::memory_order_acquire)), m_previous(start) {
+        if (m_enabled) {
+            m_sample.started_us = start;
+            m_sample.cpu_start = mod::cpu::current_cpu_fast();
+            m_sample.message = static_cast<uint8_t>(message);
+            m_sample.source = header == nullptr ? WKI_NODE_INVALID : header->src_node;
+            m_sample.payload_len = payload_len;
+        }
+    }
+    auto enabled() const -> bool { return m_enabled; }
+    void identify(uint16_t origin, uint32_t sequence) {
+        if (m_enabled) {
+            m_sample.origin = origin;
+            m_sample.sequence = sequence;
+        }
+    }
+    void mark(RoutingRxStage stage) {
+        if (m_enabled) {
+            mark_at(stage, wki_now_us());
+        }
+    }
+    void notified() {
+        if (m_enabled) {
+            m_sample.notified = true;
+        }
+    }
+    auto wake_diagnostics() -> mod::sched::EventWakeDiagnostics* { return m_enabled ? &m_sample.wake : nullptr; }
+    auto finish(uint64_t end, uint8_t outcome) -> WkiRoutingRxDiag {
+        if (m_enabled) {
+            mark_at(RoutingRxStage::TAIL, end);
+            m_sample.total_us = end - m_sample.started_us;
+            m_sample.cpu_end = mod::cpu::current_cpu_fast();
+            m_sample.outcome = outcome;
+        }
+        return m_sample;
+    }
+};
+
+void note_rx_time(uint64_t start, RoutingRxTiming& timing, uint8_t outcome) {
+    uint64_t const END = wki_now_us();
+    uint64_t const ELAPSED = END - start;
+    // Complete the bounded sample before taking the original diagnostic lock;
+    // its wait remains outside the original max_rx_us interval.
+    auto const SAMPLE = timing.finish(END, outcome);
     s_routing_lock.lock();
+    if (timing.enabled() && ELAPSED > s_diag.max_rx_us) {
+        s_diag.max_rx_sample = SAMPLE;
+        // Bulk trace storage is outside the per-handler sample, and this copy
+        // follows the original END timestamp. Use the existing snapshot lock.
+        mod::sched::capture_scheduler_timer_trace(SAMPLE.wake.cpu_start, SAMPLE.wake.timer_trace, s_diag.max_rx_timer_trace);
+    }
     s_diag.max_rx_us = std::max(s_diag.max_rx_us, ELAPSED);
     s_routing_lock.unlock();
 }
@@ -443,6 +520,9 @@ void drain_lease_responses(uint64_t now) {
         s_routing_lock.lock();
         if (entry.lease_response_token == token && (RESULT == WKI_OK || !CURRENT)) {
             entry.lease_response_token = 0;
+            entry.lease_response_retry = false;
+        } else if (entry.lease_response_token == token) {
+            entry.lease_response_retry = true;
         }
         if (RESULT == WKI_OK) {
             ++s_diag.lease_responses;
@@ -466,6 +546,78 @@ void replay_database() {
             entry.flood_exclude = WKI_NODE_INVALID;
         }
         s_routing_lock.unlock();
+    }
+}
+
+auto send_origin_replay(uint16_t node, uint32_t generation, LsdbEntry const& own, uint64_t now, bool& obsolete) -> int {
+    auto* peer = wki_peer_find(node);
+    if (peer == nullptr) {
+        obsolete = true;
+        return WKI_ERR_PEER_FENCED;
+    }
+    // Pin the completed origin session through reliable queue submission.
+    // RX never waits for a writer; contention retries at the idle cadence.
+    if (!wki_peer_lifecycle_rx_try_acquire(peer)) {
+        return WKI_ERR_NO_ROUTE;
+    }
+    OriginPeer const CURRENT = confirmed_rx_origin(node);
+    int result = WKI_ERR_PEER_FENCED;
+    if (peer->node_id == node && peer->state == PeerState::CONNECTED && CURRENT.node == node && CURRENT.generation == generation) {
+        std::array<uint8_t, LSA_BUFFER_SIZE> buffer{};
+        uint16_t const LENGTH = encode_lsa(own, buffer, leases_enabled() && (CURRENT.capabilities & WKI_CAP_ROUTING_LEASE) != 0, 0, now);
+        result = wki_send(node, WKI_CHAN_CONTROL, MsgType::LSA, buffer.data(), LENGTH);
+    } else {
+        obsolete = true;
+    }
+    wki_peer_lifecycle_rx_release(peer);
+    return result;
+}
+
+void drain_origin_replays(uint64_t now) {
+    // Wait for a rate-limited topology change to build the current local LSA.
+    if (s_own_pending.load(std::memory_order_acquire)) {
+        return;
+    }
+    size_t attempts = 0;
+    for (size_t scanned = 0; scanned < WKI_MAX_PEERS && attempts < ORIGIN_REPLAY_BUDGET; ++scanned) {
+        size_t const INDEX = s_origin_replay_index++ % WKI_MAX_PEERS;
+        LsdbEntry own{};
+        uint16_t node = WKI_NODE_INVALID;
+        uint32_t generation = 0;
+        s_routing_lock.lock();
+        auto& entry = s_lsdb.at(INDEX);
+        auto const* local = lsdb_find(g_wki.my_node_id);
+        if (entry.origin_replay_pending) {
+            if (local != nullptr && local->valid) {
+                own = *local;
+                node = entry.origin_node;
+                generation = entry.origin_replay_generation;
+                // Consume before sending. A fresh RX request during TX must
+                // survive success, cancellation and failed-send bookkeeping.
+                entry.origin_replay_pending = false;
+                entry.origin_replay_retry = false;
+            } else {
+                entry.origin_replay_retry = true;
+            }
+        }
+        s_routing_lock.unlock();
+        if (node == WKI_NODE_INVALID) {
+            continue;
+        }
+        ++attempts;
+        bool obsolete = false;
+        int const RESULT = send_origin_replay(node, generation, own, now, obsolete);
+        if (RESULT != WKI_OK && !obsolete) {
+            // Lifecycle admission has been released before taking this lock.
+            s_routing_lock.lock();
+            if (entry.origin_node == node && !entry.fenced && entry.authenticated_generation == generation &&
+                !entry.origin_replay_pending) {
+                entry.origin_replay_generation = generation;
+                entry.origin_replay_pending = true;
+                entry.origin_replay_retry = true;
+            }
+            s_routing_lock.unlock();
+        }
     }
 }
 
@@ -649,7 +801,10 @@ void drain_floods() {
         }
         std::array<uint8_t, LSA_BUFFER_SIZE> buffer{};
         size_t cursor = snapshot.flood_cursor;
-        bool retry = snapshot.flood_retry;
+        // Carry failures across a budget-limited sweep, but a fresh sweep
+        // must be able to succeed. Retaining the previous sweep's failure
+        // here makes one transient send failure replay this LSA forever.
+        bool retry = cursor != 0 && snapshot.flood_retry;
         for (; cursor < s_direct.size() && attempts < FLOOD_BUDGET; ++cursor) {
             auto const& peer = s_direct.at(cursor);
             if (peer.node == WKI_NODE_INVALID || peer.node == snapshot.flood_exclude || peer.node == snapshot.origin_node) {
@@ -671,7 +826,7 @@ void drain_floods() {
         if (entry.revision == snapshot.revision && entry.flood_cursor == snapshot.flood_cursor) {
             entry.flood_cursor = cursor == s_direct.size() ? 0 : static_cast<uint16_t>(cursor);
             entry.flood_pending = cursor != s_direct.size() || retry;
-            entry.flood_retry = cursor != s_direct.size() && retry;
+            entry.flood_retry = retry;
         }
         s_routing_lock.unlock();
     }
@@ -700,6 +855,24 @@ void probe_routed_peers(uint64_t now) {
     }
 }
 
+auto routing_work_pending() -> bool {
+    if (s_own_pending.load(std::memory_order_acquire) || s_replay_pending.load(std::memory_order_acquire)) {
+        return true;
+    }
+    s_routing_lock.lock();
+    bool pending = s_published_revision != s_revision;
+    if (!pending) {
+        pending = std::ranges::any_of(s_lsdb, [](auto const& entry) {
+            bool const FLOOD_READY = entry.flood_pending && (entry.flood_cursor != 0 || !entry.flood_retry);
+            bool const RESPONSE_READY = entry.lease_response_token != 0 && !entry.lease_response_retry;
+            bool const ORIGIN_READY = entry.origin_replay_pending && !entry.origin_replay_retry;
+            return FLOOD_READY || RESPONSE_READY || ORIGIN_READY;
+        });
+    }
+    s_routing_lock.unlock();
+    return pending;
+}
+
 [[noreturn]] void routing_worker() {
     for (;;) {
         if (s_initialized.load(std::memory_order_acquire) && g_wki.initialized) {
@@ -711,27 +884,32 @@ void probe_routed_peers(uint64_t now) {
             compute_and_publish();
             drain_lease_requests(NOW);
             drain_lease_responses(NOW);
+            drain_origin_replays(NOW);
             drain_floods();
             probe_routed_peers(NOW);
         }
-        // Dedicated periodic task gives overload/retry a bounded service
-        // opportunity without coupling routing to blocking remote-service work.
-        mod::sched::kern_sleep_us(WORKER_INTERVAL_US);
+        // Notifications make topology changes immediate. The active cadence
+        // preserves bounded fanout/retry progress, while the idle deadline
+        // retains lease, expiry, and probe maintenance without a 50 Hz poll.
+        mod::sched::kern_sleep_us(routing_work_pending() ? WORKER_ACTIVE_INTERVAL_US : WORKER_IDLE_INTERVAL_US);
     }
 }
 
 }  // namespace
 
-void wki_routing_init() {
+void wki_routing_init(bool rx_timing) {
     if (s_initialized.load(std::memory_order_acquire)) {
         return;
     }
+    s_diag.rx_timing_enabled = rx_timing;
+    s_rx_timing_enabled.store(rx_timing, std::memory_order_release);
+    mod::sched::set_scheduler_timer_trace_enabled(rx_timing);
     s_own_pending.store(true, std::memory_order_release);
     s_initialized.store(true, std::memory_order_release);
 }
 
 void wki_routing_thread_start() {
-    if (s_worker != nullptr) {
+    if (s_worker.load(std::memory_order_acquire) != nullptr) {
         return;
     }
     auto* task = mod::sched::task::Task::create_kernel_thread("wki_routing", routing_worker);
@@ -739,7 +917,7 @@ void wki_routing_thread_start() {
         log::error("Failed to create WKI routing worker");
         return;
     }
-    s_worker = task;
+    s_worker.store(task, std::memory_order_release);
     mod::sched::post_task_balanced(task);
 }
 
@@ -749,9 +927,16 @@ void wki_lsa_generate_and_flood() {
 }
 
 void wki_lsa_replay_to_peer(uint16_t peer_node) {
-    if (!routing_model::valid_node(peer_node)) {
+    if (!routing_model::valid_node(peer_node) || peer_node == g_wki.my_node_id) {
         return;
     }
+    s_routing_lock.lock();
+    if (auto* entry = lsdb_find(peer_node); entry != nullptr && !entry->fenced && entry->authenticated_generation != 0) {
+        entry->origin_replay_generation = entry->authenticated_generation;
+        entry->origin_replay_pending = true;
+        entry->origin_replay_retry = false;
+    }
+    s_routing_lock.unlock();
     s_replay_pending.store(true, std::memory_order_release);
     wki_lsa_generate_and_flood();
 }
@@ -760,6 +945,7 @@ namespace detail {
 
 void handle_lsa(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
     uint64_t const START = wki_now_us();
+    RoutingRxTiming timing{START, MsgType::LSA, hdr, payload_len};
     bool malformed = hdr == nullptr || payload == nullptr || payload_len < sizeof(LsaPayload);
     auto const* lsa = reinterpret_cast<LsaPayload const*>(payload);
     LsaLeaseSuffix const* suffix = nullptr;
@@ -784,27 +970,39 @@ void handle_lsa(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_l
             }
         }
     }
+    timing.mark(RoutingRxStage::VALIDATION);
     if (malformed) {
+        timing.mark(RoutingRxStage::PREPARE);
         s_routing_lock.lock();
+        timing.mark(RoutingRxStage::LOCK_WAIT);
         ++s_diag.malformed;
         s_routing_lock.unlock();
-        note_rx_time(START);
+        timing.mark(RoutingRxStage::APPLY);
+        note_rx_time(START, timing, 1);
         return;
     }
+    timing.identify(lsa->origin_node, lsa->lsa_seq);
     if (lsa->origin_node == g_wki.my_node_id) {
         return;
     }
     OriginPeer const SENDER = confirmed_rx_origin(hdr->src_node);
+    timing.mark(RoutingRxStage::ORIGIN);
     uint32_t const GENERATION = leases_enabled() && (SENDER.capabilities & WKI_CAP_ROUTING_LEASE) != 0 ? SENDER.generation : 0;
     if (suffix != nullptr && (GENERATION == 0 || (suffix->token != 0 && (hdr->src_node != lsa->origin_node || suffix->age_ms != 0)))) {
+        timing.mark(RoutingRxStage::PREPARE);
         s_routing_lock.lock();
+        timing.mark(RoutingRxStage::LOCK_WAIT);
         ++s_diag.lease_rejected;
         s_routing_lock.unlock();
-        note_rx_time(START);
+        timing.mark(RoutingRxStage::APPLY);
+        note_rx_time(START, timing, 2);
         return;
     }
 
+    bool notify = false;
+    timing.mark(RoutingRxStage::PREPARE);
     s_routing_lock.lock();
+    timing.mark(RoutingRxStage::LOCK_WAIT);
     auto* entry = lsdb_alloc(lsa->origin_node);
     bool store = false;
     bool withdrawn = false;
@@ -817,9 +1015,13 @@ void handle_lsa(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_l
         bool const NEW_HINT = !entry->hint_valid || entry->hint_identity != HINT_IDENTITY ||
                               routing_model::sequence_newer(lsa->lsa_seq, entry->hint_sequence);
         // Legacy origins need not increment their sequence while disconnected.
-        // A replay refreshes discovery only; it never revives service topology
-        // or refloods duplicates around a cycle.
+        // Every exact replay refreshes receipt freshness, but only a bounded
+        // cadence advances the routing revision. This keeps the published
+        // discovery deadline ahead of expiry without running SPF per packet.
         bool const REFRESH_HINT = suffix == nullptr && entry->hint_valid && lsa->lsa_seq == entry->hint_sequence;
+        bool const REFRESH_DUE =
+            REFRESH_HINT && (entry->discovery_expired || entry->hint_revision_time_us == 0 || START < entry->hint_revision_time_us ||
+                             START - entry->hint_revision_time_us >= DISCOVERY_REFRESH_INTERVAL_US);
         if (NEW_HINT || REFRESH_HINT) {
             if (NEW_HINT) {
                 entry->hint_identity = HINT_IDENTITY;
@@ -834,8 +1036,12 @@ void handle_lsa(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_l
             }
             entry->hint_received_time_us = START;
             entry->hint_valid = true;
-            entry->revision = ++s_revision;
-            entry->discovery_expired = false;
+            if (NEW_HINT || REFRESH_DUE) {
+                notify = true;
+                entry->hint_revision_time_us = START;
+                entry->revision = ++s_revision;
+                entry->discovery_expired = false;
+            }
         }
     }
     if (entry == nullptr) {
@@ -876,6 +1082,7 @@ void handle_lsa(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_l
         ++s_diag.stale;
     }
     if (store) {
+        notify = true;
         if (entry->flood_pending) {
             ++s_diag.coalesced;
         }
@@ -912,37 +1119,59 @@ void handle_lsa(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_l
         ++s_diag.accepted;
     }
     s_routing_lock.unlock();
-    note_rx_time(START);
+    timing.mark(RoutingRxStage::APPLY);
+    if (notify) {
+        timing.notified();
+        notify_routing_worker(timing.wake_diagnostics());
+    }
+    note_rx_time(START, timing, 3);
 }
 
 void handle_lsa_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
     uint64_t const START = wki_now_us();
+    RoutingRxTiming timing{START, MsgType::LSA_ACK, hdr, payload_len};
     if (!leases_enabled() || hdr == nullptr || payload == nullptr || payload_len != sizeof(LsaLeaseRequest)) {
         return;
     }
+    timing.mark(RoutingRxStage::VALIDATION);
     auto const* request = reinterpret_cast<LsaLeaseRequest const*>(payload);
+    timing.identify(hdr->src_node, hdr->seq_num);
     OriginPeer const SENDER = confirmed_rx_origin(hdr->src_node);
+    timing.mark(RoutingRxStage::ORIGIN);
     uint32_t const GENERATION = (SENDER.capabilities & WKI_CAP_ROUTING_LEASE) != 0 ? SENDER.generation : 0;
     if (GENERATION == 0 || !wki_lsa_lease_request_valid(*request)) {
+        timing.mark(RoutingRxStage::PREPARE);
         s_routing_lock.lock();
+        timing.mark(RoutingRxStage::LOCK_WAIT);
         ++s_diag.lease_rejected;
         s_routing_lock.unlock();
-        note_rx_time(START);
+        timing.mark(RoutingRxStage::APPLY);
+        note_rx_time(START, timing, 4);
         return;
     }
+    bool notify = false;
+    timing.mark(RoutingRxStage::PREPARE);
     s_routing_lock.lock();
+    timing.mark(RoutingRxStage::LOCK_WAIT);
     auto* entry = lsdb_alloc(hdr->src_node);
     if (entry != nullptr) {
+        notify = true;
         if (entry->lease_response_token != 0) {
             ++s_diag.coalesced;
         }
         entry->lease_response_token = request->token;
         entry->lease_response_generation = GENERATION;
+        entry->lease_response_retry = false;
     } else {
         ++s_diag.full;
     }
     s_routing_lock.unlock();
-    note_rx_time(START);
+    timing.mark(RoutingRxStage::APPLY);
+    if (notify) {
+        timing.notified();
+        notify_routing_worker(timing.wake_diagnostics());
+    }
+    note_rx_time(START, timing, 5);
 }
 
 }  // namespace detail
@@ -951,6 +1180,7 @@ void wki_routing_recompute() {
     s_routing_lock.lock();
     ++s_revision;
     s_routing_lock.unlock();
+    notify_routing_worker();
 }
 
 auto wki_routing_lookup(uint16_t dst_node, RoutingEntry* out, bool discovery) -> bool {
@@ -1020,6 +1250,8 @@ void wki_routing_invalidate_node(uint16_t node_id) {
         entry->fenced = true;
         entry->flood_pending = false;
         routing_lease::fence(entry->lease);
+        entry->origin_replay_pending = false;
+        entry->origin_replay_retry = false;
         entry->lease_response_token = 0;
         entry->lease_last_request_us = 0;
         entry->revision = ++s_revision;
@@ -1028,6 +1260,7 @@ void wki_routing_invalidate_node(uint16_t node_id) {
     }
     s_invalidation_revision = s_revision;
     s_routing_lock.unlock();
+    notify_routing_worker();
 }
 
 void wki_routing_peer_session_changed(uint16_t node_id) {
@@ -1035,8 +1268,10 @@ void wki_routing_peer_session_changed(uint16_t node_id) {
     if (CURRENT.node == WKI_NODE_INVALID) {
         return;
     }
+    bool notify = false;
     s_routing_lock.lock();
     if (auto* entry = lsdb_alloc(node_id); entry != nullptr) {
+        notify = true;
         bool const NEW_SESSION = entry->authenticated_generation != CURRENT.generation || entry->authenticated_identity != CURRENT.identity;
         observe_authenticated_identity(*entry, CURRENT.identity);
         entry->authenticated_generation = CURRENT.generation;
@@ -1054,6 +1289,9 @@ void wki_routing_peer_session_changed(uint16_t node_id) {
         }
     }
     s_routing_lock.unlock();
+    if (notify) {
+        notify_routing_worker();
+    }
 }
 
 void wki_routing_timer_tick(uint64_t /*now_us*/) {
@@ -1066,6 +1304,52 @@ auto wki_routing_diag_snapshot() -> WkiRoutingDiag {
     WkiRoutingDiag const RESULT = s_diag;
     s_routing_lock.unlock();
     return RESULT;
+}
+
+auto wki_routing_origin_diag_snapshot(WkiRoutingOriginDiag* out, size_t max) -> size_t {
+    if (out == nullptr || max == 0) {
+        return 0;
+    }
+    size_t count = 0;
+    s_routing_lock.lock();
+    for (auto const& entry : s_lsdb) {
+        if (entry.origin_node == WKI_NODE_INVALID) {
+            continue;
+        }
+        if (count >= max) {
+            break;
+        }
+        out[count++] = {
+            // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+            .origin_node = entry.origin_node,
+            .lsa_seq = entry.lsa_seq,
+            .num_neighbors = entry.num_neighbors,
+            .neighbors = entry.neighbors,
+            .received_time_us = entry.received_time_us,
+            .revision = entry.revision,
+            .authenticated_generation = entry.authenticated_generation,
+            .authenticated_boot_epoch = entry.authenticated_identity.boot_epoch,
+            .authenticated_capabilities = entry.authenticated_capabilities,
+            .hint_sequence = entry.hint_sequence,
+            .hint_received_time_us = entry.hint_received_time_us,
+            .origin_replay_generation = entry.origin_replay_generation,
+            .lease_session_generation = entry.lease.session_generation,
+            .lease_expires_us = entry.lease.lease_expires_us,
+            .valid = entry.valid,
+            .sequence_known = entry.sequence_known,
+            .fenced = entry.fenced,
+            .authenticated_identity_valid = routing_lease::identity_valid(entry.authenticated_identity),
+            .hint_valid = entry.hint_valid,
+            .discovery_expired = entry.discovery_expired,
+            .origin_replay_pending = entry.origin_replay_pending,
+            .origin_replay_retry = entry.origin_replay_retry,
+            .lease_bound = entry.lease.bound,
+            .lease_extended_required = entry.lease.extended_required,
+            .lease_withdrawn = entry.lease.withdrawn,
+        };
+    }
+    s_routing_lock.unlock();
+    return count;
 }
 
 }  // namespace ker::net::wki

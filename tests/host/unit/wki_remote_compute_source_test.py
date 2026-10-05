@@ -1016,7 +1016,12 @@ def test_task_exit_retires_remote_compute_wait_owners() -> None:
     for forbidden in ["is_waitpid_wait_channel", "waiting_for_pid", "complete_waitpid", "waitpid_repair"]:
         if forbidden in reschedule:
             fail(f"generic reschedule path must not own waitpid repair state: {forbidden}")
-    final_lock_start = reschedule.rfind("run_queues->with_lock_void(cpu_no")
+    lock_wrapper = function_body(scheduler_source, "with_event_wake_runqueue_lock")
+    require_tokens(lock_wrapper, ["run_queues->with_lock_void(cpu_no", "std::forward<Func>(func)(rq)"],
+                   "wake diagnostic callback retains the existing runqueue lock")
+    final_lock_start = reschedule.rfind("with_event_wake_runqueue_lock(cpu_no, diagnostics")
+    if final_lock_start < 0:
+        fail("reschedule final runqueue lock callback is missing")
     final_lock_end = reschedule.find("if (!published_runnable)", final_lock_start)
     final_publication = reschedule[final_lock_start:final_lock_end]
     require_tokens(
@@ -1993,7 +1998,7 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
         [
             "s_compute_submit_task_count.load(std::memory_order_acquire)",
             "for (size_t i = 0; i < WORKER_COUNT; ++i)",
-            "kern_wake(s_compute_submit_tasks.at(i))",
+            "wake_task_from_event(s_compute_submit_tasks.at(i))",
         ],
         "compute-submit wake-all",
     )
@@ -2012,6 +2017,9 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
         "bounded zero-initialized compute RX pool",
     )
     admission_body = function_body(source, "wki_remote_compute_admit_rx")
+    require_tokens(admission_body, ["queue_compute_rx_work(type, hdr, payload, copy_len, rx_channel, rx_channel_generation)"],
+                   "classified compute RX forwards to the shared bounded copy")
+    admission_body += function_body(source, "queue_compute_rx_work")
     require_tokens(
         admission_body,
         [

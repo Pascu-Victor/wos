@@ -15,6 +15,16 @@ namespace ker::net::wki {
 // Send HELLO broadcast on all transports (called during init and periodically)
 void wki_peer_send_hello_broadcast();
 
+// Publish bounded targeted retries for a validated lower-ID discovery hint.
+// This never creates a trusted peer or changes authentication/session state.
+// Returns whether to send the initial HELLO; reciprocal direct-session progress
+// suppresses both publication and that initial send.
+auto wki_peer_retry_discovery(WkiTransport* transport, const HelloPayload& hint) -> bool;
+// Arm reciprocal progress after an authenticated ACK installs a direct session.
+void wki_peer_retry_confirmation(WkiTransport* transport, const HelloPayload& ack);
+// Caller holds transport_lock after unlink; nullptr cancels the complete queue.
+void wki_peer_cancel_hello_retries(WkiTransport* transport, uint64_t registration_generation);
+
 // Send HELLO to a specific neighbor via a transport
 void wki_peer_send_hello(WkiTransport* transport, uint16_t dst_node);
 
@@ -76,7 +86,8 @@ void wki_peer_fence(WkiPeer* peer);
 // Gracefully detach a peer that intentionally left the mesh.
 void wki_peer_graceful_leave(WkiPeer* peer);
 
-// WKI timer kernel thread - calls wki_peer_timer_tick() in a loop (~10ms cadence).
+// WKI timer kernel thread - sleeps until the next deadline or work notification,
+// with bounded periodic maintenance while peers are connected.
 // Must be started after scheduler is running (from smt.cpp, like tcp_timer_thread).
 [[noreturn]] void wki_timer_thread();
 void wki_timer_thread_start();

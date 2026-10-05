@@ -237,9 +237,19 @@ UNIT_TESTS=(
     wki_zone_source_test
     wki_peer_source_test
     wki_routing_source_test
+    wki_routing_rx_timing_runtime_test
     event_wake_diagnostics_test
+    wki_submit_notification_test
+    wki_submit_denial_test
     scheduler_timer_trace_test
+    routing_timer_metadata_test
     scheduler_poke_migration_test
+    wki_flood_retry_test
+    wki_origin_replay_test
+    wki_control_ack_test
+    wki_hello_retry_test
+    wki_timer_notification_test
+    wki_autoattach_wait_test
     vfs_mount_retry_test
     wki_remote_compute_source_test
     wki_remote_vfs_source_test
@@ -328,6 +338,7 @@ UNIT_TESTS=(
     scheduler_epoch_progress_test
     thread_stack_pressure_test
     vmem_cache_perf_runtime_test
+    wki_submit_phase_test
 )
 
 list_targets() {

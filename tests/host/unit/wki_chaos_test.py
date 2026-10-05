@@ -206,6 +206,71 @@ def test_bounded_command_records_exit_timeout_and_truncation(module) -> None:
     assert_equal(snapshot_sized["stdoutBytes"], "140000", "snapshot-sized stdout bytes")
 
 
+def test_large_netdiag_keeps_other_capture_bounds(module) -> None:
+    # 1024 distinct pool slots plus a footer exceed the old 1024 row bound;
+    # fixed long fields also exceed its independent 256KiB capture bound.
+    text = ''.join(f'wki_channel peer=0x{1+i//256:04x} ch={i%256} generation=1 '
+        f'active=1 model_payload={"x"*400}\n' for i in range(1024))
+    text += 'wki_netdiag_end complete=1\n'
+    rows = module.parse_snapshot_rows('netdiag', text)
+    assert len(rows) == 1025
+    chaos = module.parse_snapshot_rows('chaos', 'wki_chaos runtime_control=1 supported=1\nwki_chaos_end complete=1\n')
+    assert not module.snapshot_completeness_issues({'netdiag': rows, 'chaos': chaos})
+    for invalid in (text.removesuffix('wki_netdiag_end complete=1\n'),
+        text.replace('complete=1', 'complete=0'),
+        text.replace('wki_netdiag_end', 'wki_wait_truncated max=256\nwki_netdiag_end')):
+        assert module.snapshot_completeness_issues({'netdiag': module.parse_snapshot_rows('netdiag', invalid), 'chaos': chaos})
+    try:
+        module.parse_snapshot_rows('netdiag', 'row value=1\n' * 4097)
+    except module.ChaosInputError: pass
+    else: raise AssertionError('netdiag row ceiling missing')
+    try:
+        module.parse_snapshot_rows('chaos', 'row value=1\n' * 1025)
+    except module.ChaosInputError: pass
+    else: raise AssertionError('other source row ceiling widened')
+    # Exercise the real bounded subprocess pipe reader above the former cap.
+    with tempfile.TemporaryDirectory(prefix='wos-netdiag-capture-') as directory:
+        path = Path(directory)/'snapshot.txt'
+        path.write_text(text)
+        result = module.run_bounded_command([sys.executable, '-c',
+            'from pathlib import Path; import sys; sys.stdout.write(Path(sys.argv[1]).read_text())', str(path)], 5000,
+            stdout_limit_bytes=module.MAX_NETDIAG_OUTPUT_BYTES)
+    assert not result['stdoutTruncated'] and result['stdout'] == text
+    assert module.MAX_SNAPSHOT_OUTPUT_BYTES == 262144
+    assert module.MAX_COMMAND_OUTPUT_BYTES == 65536
+    assert module.MAX_TELEMETRY_LINE_BYTES == 1048576
+    truncated = module.run_bounded_command([sys.executable, '-c',
+        "import sys; sys.stdout.write('x'*(4194304+1))"], 5000,
+        stdout_limit_bytes=module.MAX_NETDIAG_OUTPUT_BYTES)
+    assert truncated['stdoutTruncated'] and len(truncated['stdout']) == 4194304
+    texts = snapshot_texts()
+    texts['netdiag'] = text
+    limits = {}
+    original = module._run_guest_argv
+
+    def capture(_node, argv, _timeout, _ssh, *, stdout_limit_bytes):
+        source = next(key for key, command in module.DEFAULT_SNAPSHOT_COMMANDS.items() if command == argv)
+        limits[source] = stdout_limit_bytes
+        value = texts[source]
+        return {'exitCode': 0, 'timedOut': False, 'stdout': value,
+                'stdoutBytes': str(len(value.encode())), 'stdoutTruncated': len(value.encode()) > stdout_limit_bytes,
+                'stderr': '', 'stderrBytes': '0', 'stderrTruncated': False}
+
+    module._run_guest_argv = capture
+    try:
+        with tempfile.TemporaryDirectory(prefix='wos-netdiag-routing-') as temporary:
+            root = Path(temporary)
+            captured, observation = module._capture_snapshot(event_id='large', sample='one',
+                operation={'node': '0', 'timeout_ms': 5000, 'commands': module.DEFAULT_SNAPSHOT_COMMANDS},
+                nodes={'0': {'host': 'unused'}}, output_dir=root, ssh_script=Path('/tmp/modeled-transport'))
+            assert captured['complete'] and observation['complete']
+            assert (root / observation['sources']['netdiag']['stdoutPath']).read_text() == text
+            assert limits['netdiag'] == 4194304
+            assert all(value == 262144 for key, value in limits.items() if key != 'netdiag')
+    finally:
+        module._run_guest_argv = original
+
+
 def test_guest_poll_retries_direct_argv_and_records_attempts(module) -> None:
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -2084,6 +2149,7 @@ def main() -> None:
         test_plan_is_seed_stable_and_choice_sensitive,
         test_schema_rejects_shell_duplicates_and_bad_qmp,
         test_bounded_command_records_exit_timeout_and_truncation,
+        test_large_netdiag_keeps_other_capture_bounds,
         test_guest_poll_retries_direct_argv_and_records_attempts,
         test_guest_stdout_row_contract_is_bounded_and_relational,
         test_group_reducer_never_splits_pairs,

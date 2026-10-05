@@ -83,7 +83,8 @@ Local values reviewed on 2026-06-01 include:
 - `WKI_MAX_TRANSPORTS = 8`
 - `WKI_MAX_CHANNELS = 256`
 - `WKI_HEADER_SIZE = 32`
-- `WKI_ETH_MAX_PAYLOAD = 8954`
+- `WKI_ETH_MAX_PAYLOAD = 8914` (8954 minus the 40-byte authentication trailer;
+  rechecked against local `wire.hpp` on 2026-10-02)
 - `WKI_NODE_INVALID = 0x0000`
 - `WKI_NODE_BROADCAST = 0xFFFF`
 - well-known channels `0..3`, dynamic channels starting at `16`, reserved dynamic channels starting at `240`, and `WKI_CHAN_IPC_DATA = 240`

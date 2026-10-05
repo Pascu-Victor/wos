@@ -6,6 +6,7 @@
 #include <net/wki/routing_lease.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
+#include <platform/sched/event_wake_diagnostics.hpp>
 
 namespace ker::net::wki {
 
@@ -54,6 +55,10 @@ struct LsdbEntry {
     routing_lease::Identity authenticated_identity{};
     uint32_t authenticated_generation = 0;
     uint16_t authenticated_capabilities = 0;
+    // Completed-session own-origin replay, coalesced in this bounded slot.
+    uint32_t origin_replay_generation = 0;
+    bool origin_replay_pending = false;
+    bool origin_replay_retry = false;
     bool fenced = false;
     // Discovery hints are distinct from the origin-validated service snapshot.
     // An opaque hinted reboot can change discovery without resetting freshness.
@@ -63,12 +68,14 @@ struct LsdbEntry {
     uint32_t hint_sequence = 0;
     uint32_t hint_rdma_zone_bitmap = 0;
     uint64_t hint_received_time_us = 0;
+    uint64_t hint_revision_time_us = 0;
     bool hint_valid = false;
     bool lease_was_usable = false;
     bool discovery_expired = false;
     uint64_t lease_last_request_us = 0;
     uint64_t lease_response_token = 0;
     uint32_t lease_response_generation = 0;
+    bool lease_response_retry = false;
 };
 
 // -----------------------------------------------------------------------------
@@ -94,14 +101,14 @@ struct RoutingEntry {
 // -----------------------------------------------------------------------------
 
 // Initialize routing subsystem (called from wki_init)
-void wki_routing_init();
+void wki_routing_init(bool rx_timing = false);
 
 // RX-safe request: the dedicated worker builds and floods the current topology.
 void wki_lsa_generate_and_flood();
 
-// Replay the current local LSA to one newly authenticated direct peer. HELLO
-// handlers run before session installation, so their normal flood cannot use
-// the new session yet.
+// RX-safe replay request for a completed direct or routed origin session.
+// The worker sends its current local LSA under that generation's lifecycle
+// admission and also retains the normal database replay to direct neighbors.
 void wki_lsa_replay_to_peer(uint16_t peer_node);
 
 // RX-safe coalesced recomputation request. SPF runs only in the routing worker.
@@ -132,6 +139,30 @@ void wki_routing_peer_session_changed(uint16_t node_id);
 // Called from wki_peer_timer_tick().
 void wki_routing_timer_tick(uint64_t now_us);
 
+// Optional wall-time checkpoints for the same handler that set max_rx_us.
+// Stage order: validation, origin, prepare, database lock wait, apply/unlock,
+// remaining tail (including worker wake). Missing stages have a clear mask bit.
+// CPU IDs are adjacent observations, not a proof of no intervening migration.
+constexpr size_t WKI_ROUTING_RX_STAGES = 6;
+struct WkiRoutingRxDiag {
+    mod::sched::EventWakeDiagnostics wake{};
+    std::array<uint64_t, WKI_ROUTING_RX_STAGES> stages_us{};
+    uint64_t started_us = 0;
+    uint64_t total_us = 0;
+    uint64_t cpu_start = 0;
+    uint64_t cpu_end = 0;
+    uint32_t sequence = 0;
+    uint16_t source = WKI_NODE_INVALID;
+    uint16_t origin = WKI_NODE_INVALID;
+    uint16_t payload_len = 0;
+    uint8_t message = 0;
+    // 1 malformed LSA, 2 rejected LSA suffix, 3 processed LSA,
+    // 4 rejected lease request, 5 processed lease request.
+    uint8_t outcome = 0;
+    uint8_t stage_mask = 0;
+    bool notified = false;
+};
+
 struct WkiRoutingDiag {
     uint64_t accepted = 0;
     uint64_t malformed = 0;
@@ -148,7 +179,43 @@ struct WkiRoutingDiag {
     uint64_t lease_rejected = 0;
     uint64_t lease_requests = 0;
     uint64_t lease_responses = 0;
+    bool rx_timing_enabled = false;
+    WkiRoutingRxDiag max_rx_sample{};
+    mod::sched::SchedulerTimerTraceSnapshot max_rx_timer_trace{};
 };
 auto wki_routing_diag_snapshot() -> WkiRoutingDiag;
+
+// One locked LSDB observation, including invalid/fenced occupied slots. These
+// fields are sampled independently of peer authentication and route snapshots.
+// Authentication keys and nonces are deliberately excluded.
+struct WkiRoutingOriginDiag {
+    uint16_t origin_node = WKI_NODE_INVALID;
+    uint32_t lsa_seq = 0;
+    uint16_t num_neighbors = 0;
+    std::array<LsaNeighborEntry, WKI_MAX_NEIGHBORS_PER_LSA> neighbors{};
+    uint64_t received_time_us = 0;
+    uint64_t revision = 0;
+    uint32_t authenticated_generation = 0;
+    uint32_t authenticated_boot_epoch = 0;
+    uint16_t authenticated_capabilities = 0;
+    uint32_t hint_sequence = 0;
+    uint64_t hint_received_time_us = 0;
+    uint32_t origin_replay_generation = 0;
+    uint32_t lease_session_generation = 0;
+    uint64_t lease_expires_us = 0;
+    bool valid = false;
+    bool sequence_known = false;
+    bool fenced = false;
+    bool authenticated_identity_valid = false;
+    bool hint_valid = false;
+    bool discovery_expired = false;
+    bool origin_replay_pending = false;
+    bool origin_replay_retry = false;
+    bool lease_bound = false;
+    bool lease_extended_required = false;
+    bool lease_withdrawn = false;
+};
+// Caller provides storage; copies at most min(max, WKI_MAX_PEERS) occupied rows.
+auto wki_routing_origin_diag_snapshot(WkiRoutingOriginDiag* out, size_t max) -> size_t;
 
 }  // namespace ker::net::wki

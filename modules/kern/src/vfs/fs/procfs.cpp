@@ -4246,8 +4246,40 @@ auto generate_wki_chaos(char* buf, size_t bufsz) -> size_t {
     return static_cast<size_t>(p - buf);
 }
 
-// This is the canonical text snapshot aggregator for the network/WKI state
-// graph. Keeping one append cursor makes truncation atomic and parseable.
+// Covers all retained snapshot rows at maximal numeric/string widths. Other
+// snapshot caps/allocation failures remain explicit; this is not an atomic
+// observation across subsystems. Only netdiag uses this per-open allocation.
+constexpr size_t MAX_WKI_NETDIAG_BUF = 4 * 1024 * 1024;
+
+// Ordinary procfs read only: authenticate timer RIPs against the relocated
+// kernel without adding work to the IRQ recorder or routing receive interval.
+void append_routing_timer_kernel_metadata(char*& p, const char* end) {
+    wos::abi::KernelDebugMetadata metadata{};
+    bool const VALID =
+        ker::loader::runtime::kernel_debug_metadata(metadata) && (metadata.flags & wos::abi::KERNEL_DEBUG_METADATA_EXACT_MAPPING) != 0;
+    append_sconst(p, end, " kernel_meta_valid=");
+    append_bool01(p, end, VALID);
+    append_sconst(p, end, " kernel_load_base=");
+    append_dec64(p, end, VALID ? metadata.load_base : 0);
+    append_sconst(p, end, " kernel_text_start=");
+    append_dec64(p, end, VALID ? metadata.text_start : 0);
+    append_sconst(p, end, " kernel_text_end=");
+    append_dec64(p, end, VALID ? metadata.text_end : 0);
+    append_sconst(p, end, " kernel_build_id=");
+    if (!VALID || (metadata.flags & wos::abi::KERNEL_DEBUG_METADATA_BUILD_ID_PRESENT) == 0 || metadata.build_id_size == 0 ||
+        metadata.build_id_size > sizeof(metadata.build_id)) {
+        append_char(p, end, '-');
+        return;
+    }
+    constexpr std::array<char, 16> HEX_DIGITS{'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
+    for (size_t i = 0; i < metadata.build_id_size; ++i) {
+        uint8_t const BYTE = metadata.build_id[i];  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+        append_char(p, end, HEX_DIGITS.at(BYTE >> 4U));
+        append_char(p, end, HEX_DIGITS.at(BYTE & 0xfU));
+    }
+}
+
+// Aggregate network/WKI state. Readers must require the completion footer.
 auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {  // NOLINT(readability-function-size)
     if (bufsz == 0) {
         return 0;
@@ -5171,6 +5203,242 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {  // NOLINT(readab
     append_dec64(p, end, ROUTING.lease_responses);
     append_char(p, end, '\n');
 
+    append_sconst(p, end, "wki_routing_rx version=1 enabled=");
+    append_bool01(p, end, ROUTING.rx_timing_enabled);
+    if (ROUTING.rx_timing_enabled) {
+        auto const& rx = ROUTING.max_rx_sample;
+        append_sconst(p, end, " total_us=");
+        append_dec64(p, end, rx.total_us);
+        append_sconst(p, end, " started_us=");
+        append_dec64(p, end, rx.started_us);
+        append_sconst(p, end, " cpu_start=");
+        append_dec64(p, end, rx.cpu_start);
+        append_sconst(p, end, " cpu_end=");
+        append_dec64(p, end, rx.cpu_end);
+        append_sconst(p, end, " source=");
+        append_dec64(p, end, rx.source);
+        append_sconst(p, end, " origin=");
+        append_dec64(p, end, rx.origin);
+        append_sconst(p, end, " sequence=");
+        append_dec64(p, end, rx.sequence);
+        append_sconst(p, end, " payload_len=");
+        append_dec64(p, end, rx.payload_len);
+        append_sconst(p, end, " message=");
+        append_dec64(p, end, rx.message);
+        append_sconst(p, end, " outcome=");
+        append_dec64(p, end, rx.outcome);
+        append_sconst(p, end, " stage_mask=");
+        append_dec64(p, end, rx.stage_mask);
+        append_sconst(p, end, " notified=");
+        append_bool01(p, end, rx.notified);
+        append_sconst(p, end, " validation_us=");
+        append_dec64(p, end, rx.stages_us.at(0));
+        append_sconst(p, end, " origin_us=");
+        append_dec64(p, end, rx.stages_us.at(1));
+        append_sconst(p, end, " prepare_us=");
+        append_dec64(p, end, rx.stages_us.at(2));
+        append_sconst(p, end, " lock_wait_us=");
+        append_dec64(p, end, rx.stages_us.at(3));
+        append_sconst(p, end, " apply_us=");
+        append_dec64(p, end, rx.stages_us.at(4));
+        append_sconst(p, end, " tail_us=");
+        append_dec64(p, end, rx.stages_us.at(5));
+    }
+    append_char(p, end, '\n');
+
+    // Same maximum RX sample as the unchanged version-1 row above. These are
+    // elapsed subspans; lock/poke time overlaps reschedule time. Counter reads
+    // observe the wake's start CPU, including unrelated execution on that CPU.
+    append_sconst(p, end, "wki_routing_wake version=1 enabled=");
+    append_bool01(p, end, ROUTING.rx_timing_enabled);
+    if (ROUTING.rx_timing_enabled) {
+        auto const& rx = ROUTING.max_rx_sample;
+        auto const& wake = rx.wake;
+        append_sconst(p, end, " rx_started_us=");
+        append_dec64(p, end, rx.started_us);
+        append_sconst(p, end, " recorded=");
+        append_bool01(p, end, wake.recorded);
+        append_sconst(p, end, " started_us=");
+        append_dec64(p, end, wake.started_us);
+        append_sconst(p, end, " total_us=");
+        append_dec64(p, end, wake.total_us);
+        append_sconst(p, end, " target_us=");
+        append_dec64(p, end, wake.target_us);
+        append_sconst(p, end, " prepare_us=");
+        append_dec64(p, end, wake.prepare_us);
+        append_sconst(p, end, " admission_us=");
+        append_dec64(p, end, wake.admission_us);
+        append_sconst(p, end, " reschedule_us=");
+        append_dec64(p, end, wake.reschedule_us);
+        append_sconst(p, end, " rq_wait_us=");
+        append_dec64(p, end, wake.rq_wait_us);
+        append_sconst(p, end, " rq_body_us=");
+        append_dec64(p, end, wake.rq_body_us);
+        append_sconst(p, end, " rq_return_us=");
+        append_dec64(p, end, wake.rq_return_us);
+        append_sconst(p, end, " poke_us=");
+        append_dec64(p, end, wake.poke_us);
+        append_sconst(p, end, " cpu_start=");
+        append_dec64(p, end, wake.cpu_start);
+        append_sconst(p, end, " cpu_end=");
+        append_dec64(p, end, wake.cpu_end);
+        append_sconst(p, end, " target_cpu=");
+        append_dec64(p, end, wake.target_cpu);
+        append_sconst(p, end, " leader=");
+        append_bool01(p, end, wake.leader);
+        append_sconst(p, end, " passes=");
+        append_dec64(p, end, wake.passes);
+        append_sconst(p, end, " locks=");
+        append_dec64(p, end, wake.locks);
+        append_sconst(p, end, " scans=");
+        append_dec64(p, end, wake.scans);
+        append_sconst(p, end, " pokes=");
+        append_dec64(p, end, wake.pokes);
+        append_sconst(p, end, " counters_valid=");
+        append_bool01(p, end, wake.counters_valid);
+        append_sconst(p, end, " irq_start_us=");
+        append_dec64(p, end, wake.irq_start_us);
+        append_sconst(p, end, " irq_end_us=");
+        append_dec64(p, end, wake.irq_end_us);
+        append_sconst(p, end, " timer_start=");
+        append_dec64(p, end, wake.timer_start);
+        append_sconst(p, end, " timer_end=");
+        append_dec64(p, end, wake.timer_end);
+    }
+    append_char(p, end, '\n');
+
+    if (ROUTING.rx_timing_enabled) {
+        auto const& rx = ROUTING.max_rx_sample;
+        auto const& wake = rx.wake;
+        auto const& trace = ROUTING.max_rx_timer_trace;
+        append_sconst(p, end, "wki_routing_timer_trace version=1 rx_started_us=");
+        append_dec64(p, end, rx.started_us);
+        append_sconst(p, end, " enabled=");
+        append_bool01(p, end, trace.enabled);
+        append_sconst(p, end, " cpu=");
+        append_dec64(p, end, wake.cpu_start);
+        append_sconst(p, end, " waker_valid=");
+        append_bool01(p, end, wake.waker_valid);
+        append_sconst(p, end, " waker_pid=");
+        append_dec64(p, end, wake.waker_pid);
+        append_sconst(p, end, " waker_type=");
+        append_dec64(p, end, wake.waker_type);
+        append_sconst(p, end, " waker_pinned=");
+        append_bool01(p, end, wake.waker_pinned);
+        append_sconst(p, end, " start=");
+        append_dec64(p, end, trace.start_sequence);
+        append_sconst(p, end, " end=");
+        append_dec64(p, end, trace.end_sequence);
+        append_sconst(p, end, " count=");
+        append_dec64(p, end, trace.count);
+        append_sconst(p, end, " omitted=");
+        append_dec64(p, end, trace.omitted);
+        append_sconst(p, end, " missing=");
+        append_dec64(p, end, trace.missing);
+        append_sconst(p, end, " complete=");
+        append_bool01(p, end, trace.complete());
+        append_routing_timer_kernel_metadata(p, end);
+        append_char(p, end, '\n');
+        for (size_t i = 0; i < trace.count; ++i) {
+            auto const& event = trace.events.at(i);
+            append_sconst(p, end, "wki_routing_timer_event version=1 rx_started_us=");
+            append_dec64(p, end, rx.started_us);
+            append_sconst(p, end, " cpu=");
+            append_dec64(p, end, wake.cpu_start);
+            append_sconst(p, end, " sequence=");
+            append_dec64(p, end, event.sequence);
+            append_sconst(p, end, " at_us=");
+            append_dec64(p, end, event.at_us);
+            append_sconst(p, end, " kind=");
+            append_dec64(p, end, event.metadata & 0xffU);
+            append_sconst(p, end, " pid=");
+            append_dec64(p, end, event.pid);
+            append_sconst(p, end, " value=");
+            append_dec64(p, end, event.value);
+            append_sconst(p, end, " task_type=");
+            append_dec64(p, end, (event.metadata >> 8U) & 0xffU);
+            append_sconst(p, end, " pinned=");
+            append_bool01(p, end, ((event.metadata >> 16U) & 1U) != 0);
+            append_sconst(p, end, " detail=");
+            append_dec64(p, end, event.metadata >> 32U);
+            append_char(p, end, '\n');
+        }
+    }
+
+    auto* origins = new (std::nothrow) ker::net::wki::WkiRoutingOriginDiag[ker::net::wki::WKI_MAX_PEERS];
+    if (origins != nullptr) {
+        size_t const ORIGIN_COUNT = ker::net::wki::wki_routing_origin_diag_snapshot(origins, ker::net::wki::WKI_MAX_PEERS);
+        for (size_t i = 0; i < ORIGIN_COUNT; ++i) {
+            auto const& origin = origins[i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+            append_sconst(p, end, "wki_routing_origin version=1 origin=");
+            append_hex16(p, end, origin.origin_node);
+            append_sconst(p, end, " valid=");
+            append_bool01(p, end, origin.valid);
+            append_sconst(p, end, " fenced=");
+            append_bool01(p, end, origin.fenced);
+            append_sconst(p, end, " sequence_known=");
+            append_bool01(p, end, origin.sequence_known);
+            append_sconst(p, end, " sequence=");
+            append_dec64(p, end, origin.lsa_seq);
+            append_sconst(p, end, " received_us=");
+            append_dec64(p, end, origin.received_time_us);
+            append_sconst(p, end, " revision=");
+            append_dec64(p, end, origin.revision);
+            append_sconst(p, end, " completed_generation=");
+            append_dec64(p, end, origin.authenticated_generation);
+            append_sconst(p, end, " completed_boot_epoch=");
+            append_dec64(p, end, origin.authenticated_boot_epoch);
+            append_sconst(p, end, " completed_capabilities=");
+            append_dec64(p, end, origin.authenticated_capabilities);
+            append_sconst(p, end, " completed_identity_valid=");
+            append_bool01(p, end, origin.authenticated_identity_valid);
+            append_sconst(p, end, " hint_valid=");
+            append_bool01(p, end, origin.hint_valid);
+            append_sconst(p, end, " hint_sequence=");
+            append_dec64(p, end, origin.hint_sequence);
+            append_sconst(p, end, " hint_received_us=");
+            append_dec64(p, end, origin.hint_received_time_us);
+            append_sconst(p, end, " discovery_expired=");
+            append_bool01(p, end, origin.discovery_expired);
+            append_sconst(p, end, " replay_generation=");
+            append_dec64(p, end, origin.origin_replay_generation);
+            append_sconst(p, end, " replay_pending=");
+            append_bool01(p, end, origin.origin_replay_pending);
+            append_sconst(p, end, " replay_retry=");
+            append_bool01(p, end, origin.origin_replay_retry);
+            append_sconst(p, end, " lease_generation=");
+            append_dec64(p, end, origin.lease_session_generation);
+            append_sconst(p, end, " lease_bound=");
+            append_bool01(p, end, origin.lease_bound);
+            append_sconst(p, end, " lease_extended_required=");
+            append_bool01(p, end, origin.lease_extended_required);
+            append_sconst(p, end, " lease_withdrawn=");
+            append_bool01(p, end, origin.lease_withdrawn);
+            append_sconst(p, end, " lease_expires_us=");
+            append_dec64(p, end, origin.lease_expires_us);
+            append_sconst(p, end, " neighbor_count=");
+            append_dec64(p, end, origin.num_neighbors);
+            append_sconst(p, end, " neighbors=");
+            for (size_t n = 0; n < std::min<size_t>(origin.num_neighbors, origin.neighbors.size()); ++n) {
+                if (n != 0) {
+                    append_char(p, end, ',');
+                }
+                auto const& neighbor = origin.neighbors.at(n);
+                append_hex16(p, end, neighbor.node_id);
+                append_char(p, end, ':');
+                append_dec64(p, end, neighbor.link_cost);
+                append_char(p, end, ':');
+                append_dec64(p, end, neighbor.transport_mtu);
+            }
+            append_char(p, end, '\n');
+        }
+        delete[] origins;
+    } else {
+        append_sconst(p, end, "wki_routing_origin allocation_failed=1\n");
+        *p = '\0';
+        return static_cast<size_t>(p - buf);
+    }
+
     auto* routes = new (std::nothrow) ker::net::wki::RoutingEntry[ker::net::wki::WKI_MAX_PEERS];
     if (routes != nullptr) {
         size_t const ROUTE_COUNT = ker::net::wki::wki_routing_snapshot(routes, ker::net::wki::WKI_MAX_PEERS);
@@ -5298,18 +5566,23 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {  // NOLINT(readab
             append_dec64(p, end, wait.diag_cookie);
             append_char(p, end, '\n');
         }
+        if (WAIT_COUNT == ker::net::wki::WKI_WAIT_DIAG_MAX) {
+            append_sconst(p, end, "wki_wait_truncated max=");
+            append_dec64(p, end, ker::net::wki::WKI_WAIT_DIAG_MAX);
+            append_char(p, end, '\n');
+        }
         delete[] waits;
     } else {
         append_sconst(p, end, "wki_wait allocation_failed=1\n");
     }
 
-    auto* channels = new (std::nothrow) ker::net::wki::WkiChannelDiag[ker::net::wki::WKI_CHANNEL_DIAG_MAX];
+    auto* channels = new (std::nothrow) ker::net::wki::WkiChannelDiag[ker::net::wki::WKI_CHANNEL_POOL_SIZE];
     if (channels == nullptr) {
         append_sconst(p, end, "wki_channel allocation_failed=1\n");
         *p = '\0';
         return static_cast<size_t>(p - buf);
     }
-    size_t const CHANNEL_COUNT = ker::net::wki::wki_channel_diag_snapshot(channels, ker::net::wki::WKI_CHANNEL_DIAG_MAX);
+    size_t const CHANNEL_COUNT = ker::net::wki::wki_channel_diag_snapshot(channels, ker::net::wki::WKI_CHANNEL_POOL_SIZE);
     for (size_t i = 0; i < CHANNEL_COUNT; ++i) {
         const auto& ch = channels[i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
         append_sconst(p, end, "wki_channel peer=");
@@ -5380,11 +5653,8 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {  // NOLINT(readab
         append_dec64(p, end, ch.bytes_received);
         append_char(p, end, '\n');
     }
-    if (CHANNEL_COUNT == ker::net::wki::WKI_CHANNEL_DIAG_MAX) {
-        append_sconst(p, end, "wki_channel_truncated max=");
-        append_dec64(p, end, ker::net::wki::WKI_CHANNEL_DIAG_MAX);
-        append_char(p, end, '\n');
-    }
+    // This buffer covers the entire fixed channel pool, including every
+    // allocated slot; equality with its capacity does not omit a row.
     delete[] channels;
 
     // The host runner requires this terminal row. If the bounded append
@@ -6284,9 +6554,9 @@ auto procfs_read_with_credentials(const ker::mod::security::Snapshot& credential
         bool const IS_KPERF = (pfd->node.type == ProcNodeType::KPERF_FILE || pfd->node.type == ProcNodeType::KWKISTAT_FILE ||
                                pfd->node.type == ProcNodeType::KCPUSTAT_FILE || pfd->node.type == ProcNodeType::KCPUSTATE_FILE ||
                                pfd->node.type == ProcNodeType::KCONTSTAT_FILE || pfd->node.type == ProcNodeType::KIPCSTAT_FILE ||
-                               pfd->node.type == ProcNodeType::WKI_NETDIAG_FILE || pfd->node.type == ProcNodeType::WKI_PIPES_FILE ||
-                               pfd->node.type == ProcNodeType::CPU_STAT_FILE);
-        bool const IS_LARGE_WKI = pfd->node.type == ProcNodeType::WKI_CHAOS_FILE || pfd->node.type == ProcNodeType::WKI_NETDIAG_FILE;
+                               pfd->node.type == ProcNodeType::WKI_NETDIAG_FILE ||
+                               pfd->node.type == ProcNodeType::WKI_PIPES_FILE || pfd->node.type == ProcNodeType::CPU_STAT_FILE);
+        bool const IS_LARGE_WKI = pfd->node.type == ProcNodeType::WKI_CHAOS_FILE;
         bool const IS_MEMACC =
             (pfd->node.type == ProcNodeType::MEMACC_SUMMARY_FILE || pfd->node.type == ProcNodeType::MEMACC_ZONES_FILE ||
              pfd->node.type == ProcNodeType::MEMACC_PROCS_FILE || pfd->node.type == ProcNodeType::MEMACC_DEAD_FILE ||
@@ -6300,7 +6570,9 @@ auto procfs_read_with_credentials(const ker::mod::security::Snapshot& credential
              pfd->node.type == ProcNodeType::MEMACC_RECLAIM_ANONYMOUS_SWAP_FILE ||
              pfd->node.type == ProcNodeType::MEMACC_RECLAIM_COORDINATOR_FILE);
         size_t alloc_sz = MAX_PROCFS_BUF;
-        if (IS_MEMACC || IS_RUNTIME_MAP || IS_LARGE_WKI) {
+        if (pfd->node.type == ProcNodeType::WKI_NETDIAG_FILE) {
+            alloc_sz = MAX_WKI_NETDIAG_BUF;
+        } else if (IS_MEMACC || IS_RUNTIME_MAP || IS_LARGE_WKI) {
             alloc_sz = MAX_MEMACC_BUF;
         } else if (IS_KPERF) {
             alloc_sz = MAX_KPERF_BUF;
@@ -6378,7 +6650,7 @@ auto procfs_read_with_credentials(const ker::mod::security::Snapshot& credential
                 pfd->content_len = generate_wki_auth(pfd->content, MAX_PROCFS_BUF);
                 break;
             case ProcNodeType::WKI_NETDIAG_FILE:
-                pfd->content_len = generate_wki_netdiag(pfd->content, MAX_MEMACC_BUF);
+                pfd->content_len = generate_wki_netdiag(pfd->content, MAX_WKI_NETDIAG_BUF);
                 break;
             case ProcNodeType::WKI_PIPES_FILE:
                 pfd->content_len = ker::vfs::vfs_generate_local_pipe_diag(pfd->content, MAX_KPERF_BUF);

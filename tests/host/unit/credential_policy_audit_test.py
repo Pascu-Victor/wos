@@ -3292,7 +3292,9 @@ def test_compute_queues_retain_one_authenticated_peer_identity():
         assert token in capture, token
     for forbidden in (".lock(", "lock_irqsave", "new ", "wki_wait"):
         assert forbidden not in capture
-    rx = body_after(source, "auto wki_remote_compute_admit_rx(")
+    admission = body_after(source, "auto wki_remote_compute_admit_rx(")
+    assert "queue_compute_rx_work(type, hdr, payload, copy_len, rx_channel, rx_channel_generation)" in admission
+    rx = body_after(source, "auto queue_compute_rx_work(")
     assert rx.index("capture_compute_peer_identity(") < rx.index("s_compute_rx_lock.lock()")
     assert rx.index("slot.identity = IDENTITY") < rx.index("shard.slot_indices.at(shard.tail)")
     assert "s_compute_lock" not in rx

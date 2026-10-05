@@ -50,11 +50,11 @@ MAX_ARGV = 64
 MAX_ARG_BYTES = 4096
 MAX_COMMAND_BYTES = 32768
 MAX_COMMAND_OUTPUT_BYTES = 64 * 1024
-# WKI netdiag and chaos proc files are generated into fixed 256 KiB kernel
-# buffers. Snapshot capture may retain that producer ceiling without widening
-# ordinary guest-command or stderr capture.
+# Netdiag retains all bounded rows including the entire fixed channel pool.
+# Other snapshots, ordinary guest commands and stderr keep their existing bounds.
 MAX_SNAPSHOT_OUTPUT_BYTES = 256 * 1024
-MAX_PEER_EPOCH_OUTPUT_BYTES = MAX_SNAPSHOT_OUTPUT_BYTES + MAX_COMMAND_OUTPUT_BYTES
+MAX_NETDIAG_OUTPUT_BYTES = 4 * 1024 * 1024
+MAX_PEER_EPOCH_OUTPUT_BYTES = MAX_NETDIAG_OUTPUT_BYTES + MAX_COMMAND_OUTPUT_BYTES
 # WOSDBG deliberately rejects any single telemetry JSONL record larger than
 # 1 MiB. Keep the producer bound identical so every emitted batch is directly
 # consumable by the shared analysis backend.
@@ -63,6 +63,7 @@ MAX_GUEST_TELEMETRY_RECORDS = 256
 MAX_GUEST_POLL_ATTEMPTS = 64
 MAX_GUEST_POLL_INTERVAL_MS = 10_000
 MAX_SNAPSHOT_ROWS = 1024
+MAX_NETDIAG_ROWS = 4096
 MAX_CONVERGENCE_SAMPLES = 32
 MAX_EVENT_TIMEOUT_MS = 300_000
 MAX_REDUCTION_ATTEMPTS = 128
@@ -1512,6 +1513,7 @@ def parse_snapshot_rows(source: str, text: str) -> list[dict[str, Any]]:
     if not lines:
         raise ChaosInputError(f"{source} snapshot contains no rows")
     rows: list[dict[str, Any]] = []
+    row_limit = MAX_NETDIAG_ROWS if source == "netdiag" else MAX_SNAPSHOT_ROWS
     if source == "peers" and lines[0].split() == list(PEERS_HEADER_FIELDS):
         for line_number, line in enumerate(lines[1:], 2):
             fields = line.split()
@@ -1555,8 +1557,8 @@ def parse_snapshot_rows(source: str, text: str) -> list[dict[str, Any]]:
                     },
                 }
             )
-            if len(rows) > MAX_SNAPSHOT_ROWS:
-                raise ChaosInputError(f"{source} exceeds the {MAX_SNAPSHOT_ROWS}-row snapshot bound")
+            if len(rows) > row_limit:
+                raise ChaosInputError(f"{source} exceeds the {row_limit}-row snapshot bound")
             continue
         row_name = source
         if "=" not in tokens[0]:
@@ -1574,8 +1576,8 @@ def parse_snapshot_rows(source: str, text: str) -> list[dict[str, Any]]:
                 raise ChaosInputError(f"{source} row {line_number} has an oversized field")
             values[key] = value
         rows.append({"row": row_name, "values": values})
-        if len(rows) > MAX_SNAPSHOT_ROWS:
-            raise ChaosInputError(f"{source} exceeds the {MAX_SNAPSHOT_ROWS}-row snapshot bound")
+        if len(rows) > row_limit:
+            raise ChaosInputError(f"{source} exceeds the {row_limit}-row snapshot bound")
     return rows
 
 
@@ -1796,7 +1798,7 @@ def _capture_snapshot(
             operation["commands"][source],
             timeout_ms,
             ssh_script,
-            stdout_limit_bytes=MAX_SNAPSHOT_OUTPUT_BYTES,
+            stdout_limit_bytes=MAX_NETDIAG_OUTPUT_BYTES if source == "netdiag" else MAX_SNAPSHOT_OUTPUT_BYTES,
         )
         stdout_path = snapshot_dir / f"{source}.txt"
         write_new_bytes(stdout_path, result["stdout"].encode("utf-8"))
@@ -3388,6 +3390,8 @@ def _manifest_for_replay(replay: dict[str, Any], output_dir: Path) -> dict[str, 
             "commandOutputBytes": MAX_COMMAND_OUTPUT_BYTES,
             "events": MAX_EVENTS,
             "snapshotOutputBytes": MAX_SNAPSHOT_OUTPUT_BYTES,
+            "netdiagOutputBytes": MAX_NETDIAG_OUTPUT_BYTES,
+            "netdiagRows": MAX_NETDIAG_ROWS,
             "telemetryLineBytes": MAX_TELEMETRY_LINE_BYTES,
         },
         "planDigest": replay["planDigest"],

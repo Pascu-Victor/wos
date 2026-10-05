@@ -6458,6 +6458,7 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
 
     int cutover_error = 0;
     int const WAIT_RC = wait_for_exec_submit(wait, WKI_TASK_SUBMIT_VFS_TIMEOUT_US, TASK_ID, *local_task, transfer, cutover_error);
+    perf_record_compute_point(ker::mod::perf::WkiPerfComputeOp::SUBMIT_WAIT_RETURN, target_node, TASK_ID, WAIT_RC, 0, WOS_PERF_CALLSITE());
     uint8_t accept_status = 0;
     SubmittedIpcHandoffCleanup handoff_cleanup = {};
     WkiIpcSubmissionGuard accepted_handoff(local_task, nullptr, handoff_cleanup.handoff.data(), handoff_cleanup.count, WKI_NODE_INVALID);
@@ -6504,7 +6505,11 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
         s_compute_lock.unlock();
         delete[] discarded_output;
         cleanup_submit_ipc();
+        perf_record_compute_point(ker::mod::perf::WkiPerfComputeOp::SUBMIT_REJECTION_LOG_BEGIN, target_node, TASK_ID,
+                                  -static_cast<int32_t>(accept_status == 0 ? 1 : accept_status), 0, WOS_PERF_CALLSITE());
         ker::mod::dbg::log("[WKI] VFS_REF task rejected: task_id=%u status=%u", TASK_ID, accept_status);
+        perf_record_compute_point(ker::mod::perf::WkiPerfComputeOp::SUBMIT_REJECTION_LOG_END, target_node, TASK_ID,
+                                  -static_cast<int32_t>(accept_status == 0 ? 1 : accept_status), 0, WOS_PERF_CALLSITE());
         perf_record_compute_end(ker::mod::perf::WkiPerfComputeOp::SUBMIT_VFS_REF, target_node, TASK_ID,
                                 -static_cast<int32_t>(accept_status == 0 ? 1 : accept_status),
                                 static_cast<uint32_t>(wki_now_us() - STARTED_US), PATH_LEN_WIRE, CALLSITE);
@@ -13518,7 +13523,13 @@ void requeue_compute_rx_slot(size_t worker_index, uint16_t slot_index) {
                 if (peer != nullptr && compute_rx_identity_matches(work, *peer, g_wki.capabilities) &&
                     compute_submit_channel_token_matches(work.hdr.src_node, work.rx_channel, work.rx_channel_generation)) {
                     auto const WORK_TYPE = static_cast<MsgType>(work.type);
-                    if (WORK_TYPE == MsgType::TASK_CHILD_CLAIM_REQ || WORK_TYPE == MsgType::TASK_CHILD_CLAIM_RESP) {
+                    if (WORK_TYPE == MsgType::TASK_REJECT) {
+                        // This fixed slot owns only a submit-policy denial,
+                        // never an admitted execution. Transient enqueue
+                        // refusal cannot discard the already ACKed decision.
+                        retry_reply = wki_send_on_channel_generation(work.hdr.src_node, work.rx_channel, work.rx_channel_generation,
+                                                                     MsgType::TASK_REJECT, work.payload.data(), work.payload_len) != WKI_OK;
+                    } else if (WORK_TYPE == MsgType::TASK_CHILD_CLAIM_REQ || WORK_TYPE == MsgType::TASK_CHILD_CLAIM_RESP) {
                         s_compute_lock.lock();
                         auto const SESSION = capture_compute_submit_session_locked(work.hdr.src_node, work.rx_channel,
                                                                                    work.rx_channel_generation, work.identity);
@@ -13693,9 +13704,9 @@ void drain_pending_task_submits() {
     for (;;) {
         drain_pending_task_submits();
 
-        // Sleep until woken by wki_remote_compute_notify_pending_submit().
-        // No polling — kern_wake() delivers an immediate wakeup when a new
-        // TASK_SUBMIT is queued.
+        // The notifier preserves an event-before-park token even if this
+        // worker is preempted after observing an empty queue. kern_block()
+        // consumes that token instead of sleeping with a queued TASK_SUBMIT.
         s_pending_submit_lock.lock();
         bool const EMPTY = s_pending_task_submit_count == 0;
         s_pending_submit_lock.unlock();
@@ -13707,13 +13718,10 @@ void drain_pending_task_submits() {
 
 }  // namespace
 
-auto wki_remote_compute_admit_rx(MsgType type, const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
-                                 uint32_t rx_channel_generation) -> WkiComputeRxAdmission {
-    uint16_t copy_len = 0;
-    WkiComputeRxAdmission const CLASSIFICATION = classify_compute_rx_payload(type, payload, payload_len, &copy_len);
-    if (CLASSIFICATION != WkiComputeRxAdmission::DEFERRED) {
-        return CLASSIFICATION;
-    }
+namespace {
+
+auto queue_compute_rx_work(MsgType type, const WkiHeader* hdr, const uint8_t* payload, uint16_t copy_len, WkiChannel* rx_channel,
+                           uint32_t rx_channel_generation) -> WkiComputeRxAdmission {
     if (hdr == nullptr || rx_channel == nullptr || rx_channel_generation == 0 || hdr->channel_id != WKI_CHAN_RESOURCE ||
         rx_channel->channel_id != WKI_CHAN_RESOURCE) {
         return WkiComputeRxAdmission::DISCARD;
@@ -13769,6 +13777,36 @@ auto wki_remote_compute_admit_rx(MsgType type, const WkiHeader* hdr, const uint8
     shard.count++;
     s_compute_rx_lock.unlock();
     return WkiComputeRxAdmission::DEFERRED;
+}
+
+}  // namespace
+
+auto wki_remote_compute_admit_rx(MsgType type, const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
+                                 uint32_t rx_channel_generation) -> WkiComputeRxAdmission {
+    uint16_t copy_len = 0;
+    WkiComputeRxAdmission const CLASSIFICATION = classify_compute_rx_payload(type, payload, payload_len, &copy_len);
+    if (CLASSIFICATION != WkiComputeRxAdmission::DEFERRED) {
+        return CLASSIFICATION;
+    }
+    return queue_compute_rx_work(type, hdr, payload, copy_len, rx_channel, rx_channel_generation);
+}
+
+auto wki_remote_compute_admit_submit_denial_rx(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
+                                               uint32_t rx_channel_generation) -> WkiComputeRxAdmission {
+    if (hdr == nullptr || payload == nullptr || payload_len < sizeof(uint32_t) ||
+        (hdr->msg_type != static_cast<uint8_t>(MsgType::TASK_SUBMIT) &&
+         hdr->msg_type != static_cast<uint8_t>(MsgType::TASK_SUBMIT_FRAGMENT))) {
+        return WkiComputeRxAdmission::DISCARD;
+    }
+    TaskResponsePayload response{};
+    std::memcpy(&response.task_id, payload, sizeof(response.task_id));
+    if (response.task_id == 0) return WkiComputeRxAdmission::DISCARD;
+    response.status = static_cast<uint8_t>(TaskRejectReason::UNAUTHORIZED);
+    auto const ADMISSION = queue_compute_rx_work(MsgType::TASK_REJECT, hdr, reinterpret_cast<const uint8_t*>(&response), sizeof(response),
+                                                 rx_channel, rx_channel_generation);
+    // A valid denied request must not be ACKed without an owned decision,
+    // including when its peer/channel snapshot cannot currently be captured.
+    return ADMISSION == WkiComputeRxAdmission::DISCARD ? WkiComputeRxAdmission::RETRY : ADMISSION;
 }
 
 void wki_remote_compute_notify_deferred_rx(uint16_t src_node) {
@@ -13856,7 +13894,7 @@ void wki_remote_compute_start_submit_thread() {
 void wki_remote_compute_notify_pending_submit() {
     size_t const WORKER_COUNT = s_compute_submit_task_count.load(std::memory_order_acquire);
     for (size_t i = 0; i < WORKER_COUNT; ++i) {
-        ker::mod::sched::kern_wake(s_compute_submit_tasks.at(i));
+        ker::mod::sched::wake_task_from_event(s_compute_submit_tasks.at(i));
     }
 }
 

@@ -111,7 +111,7 @@ def test_wki_send_paths_consume_route_snapshots() -> None:
     )
     require_tokens(source, ["leased_transport->chaos_in_flight.fetch_sub(1", "wki_peer_lifecycle_rx_release(leased_hop)"], "route lease release")
     require_tokens(source, ["wki_peer_lifecycle_rx_release(leased_origin)"], "service origin lease release")
-    require_order(resolve, ["wki_peer_find(dst_node)", "!allow_discovery && !admit_origin(peer)",
+    require_order(resolve, ["wki_peer_find(dst_node)", "(!allow_discovery || retain_origin) && !admit_origin(peer)",
                             "wki_routing_lookup(dst_node, &route, allow_discovery)"],
                   "service origin is pinned before its route generation is captured")
     require_order(function_body(source, "admit_origin"),
@@ -353,9 +353,14 @@ def test_legacy_fences_keep_bounded_discovery_without_service_revival() -> None:
     admission = function_body(routing, "handle_lsa")
     require_order(admission,
                   ["if (entry != nullptr && !DOWNGRADE", "bool const NEW_HINT", "bool const REFRESH_HINT",
-                   "if (NEW_HINT)", "entry->flood_pending = true", "entry->hint_received_time_us = START",
+                   "bool const REFRESH_DUE", "if (NEW_HINT)", "entry->flood_pending = true",
+                   "entry->hint_received_time_us = START", "if (NEW_HINT || REFRESH_DUE)",
+                   "entry->hint_revision_time_us = START",
                    "else if (entry->fenced)"],
                   "all-mode hints and duplicate-only refresh precede the terminal service barrier")
+    require_tokens(admission,
+                   ["entry->discovery_expired", "DISCOVERY_REFRESH_INTERVAL_US", "notify = true"],
+                   "exact legacy replays refresh discovery without scheduling SPF for every packet")
     compute = function_body(routing, "compute_table")
     require_tokens(" ".join(compute.split()), ["if (discovery && entry.hint_valid", "bool const BLOCKED = discovery",
                              "s_path_expiry.fill(discovery ? DISCOVERY_DEADLINE : UINT64_MAX)",
@@ -371,15 +376,50 @@ def test_legacy_fences_keep_bounded_discovery_without_service_revival() -> None:
 def test_flood_worker_budget_covers_maximum_peer_fanout() -> None:
     routing = ROUTING_CPP.read_text()
     require_tokens(routing, ["constexpr size_t FLOOD_BUDGET = WKI_MAX_PEERS;",
-                             "constexpr uint64_t WORKER_INTERVAL_US = 20'000;"],
+                             "constexpr uint64_t WORKER_ACTIVE_INTERVAL_US = 20'000;",
+                             "constexpr uint64_t WORKER_IDLE_INTERVAL_US = 1'000'000;"],
                    "maximum flood sweep must fit nominally within the ten-second refresh")
+    worker = function_body(routing, "routing_worker")
+    require_tokens(worker, ["routing_work_pending() ? WORKER_ACTIVE_INTERVAL_US : WORKER_IDLE_INTERVAL_US"],
+                   "routing worker must retain the bounded active cadence without polling it while idle")
+    pending = function_body(routing, "routing_work_pending")
+    require_tokens(pending, ["entry.flood_cursor != 0 || !entry.flood_retry",
+                             "entry.lease_response_token != 0 && !entry.lease_response_retry"],
+                   "failed sends must use the idle retry deadline instead of keeping the worker hot")
     require_tokens(function_body(routing, "drain_floods"),
-                   ["attempts < FLOOD_BUDGET", "++attempts", "wki_send"],
+                   ["attempts < FLOOD_BUDGET", "++attempts", "wki_send", "entry.flood_retry = retry"],
                    "worker flood transmissions have an explicit fixed attempt budget")
+    require_tokens(function_body(routing, "drain_lease_responses"),
+                   ["entry.lease_response_retry = false", "entry.lease_response_retry = true"],
+                   "lease response failures use bounded retry pacing")
     # Conservative 256 origins x 256 peers: 256 iterations * 20ms = 5.12s.
     # This excludes variable compute, scheduler and transport time by design.
     if 256 * 256 * 20_000 // 256 >= 10_000_000:
         fail("nominal capacity flood sweep exceeds the origin refresh period")
+
+
+def test_completed_origin_replay_is_worker_owned_and_generation_pinned() -> None:
+    source = ROUTING_CPP.read_text()
+    producer = function_body(source, "wki_lsa_replay_to_peer")
+    require_order(producer, ["s_routing_lock.lock()", "lsdb_find(peer_node)",
+                            "!entry->fenced", "entry->authenticated_generation != 0",
+                            "entry->origin_replay_generation = entry->authenticated_generation",
+                            "entry->origin_replay_pending = true", "s_routing_lock.unlock()",
+                            "s_replay_pending.store", "wki_lsa_generate_and_flood()"],
+                  "completed-session replay keeps generation and database fanout")
+    if "wki_send(" in producer or "lsdb_alloc(" in producer:
+        fail("origin replay enqueue must use existing bounded state without inline TX")
+    send = function_body(source, "send_origin_replay")
+    require_order(send, ["wki_peer_lifecycle_rx_try_acquire(peer)", "confirmed_rx_origin(node)",
+                        "peer->state == PeerState::CONNECTED", "CURRENT.generation == generation",
+                        "encode_lsa(", "wki_send(", "wki_peer_lifecycle_rx_release(peer)"],
+                  "directed origin replay pins its completed generation through TX")
+    worker = function_body(source, "routing_worker")
+    require_order(worker, ["generate_own_lsa(NOW)", "compute_and_publish()", "drain_origin_replays(NOW)"],
+                  "origin replay uses current own topology and published discovery admission")
+    require_tokens(function_body(source, "routing_work_pending"),
+                   ["entry.origin_replay_pending && !entry.origin_replay_retry"],
+                   "failed origin sends retry at the idle deadline")
 
 
 def main() -> None:
@@ -393,6 +433,7 @@ def main() -> None:
     test_origin_leases_are_authenticated_and_do_not_promote_hints()
     test_legacy_fences_keep_bounded_discovery_without_service_revival()
     test_flood_worker_budget_covers_maximum_peer_fanout()
+    test_completed_origin_replay_is_worker_owned_and_generation_pinned()
     print("WKI routing source invariants hold")
 
 

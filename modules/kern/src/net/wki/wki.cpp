@@ -152,8 +152,9 @@ struct AutoAttachDeferredGuard {
 };
 
 auto is_timer_deferred_waiter(const mod::sched::task::Task* task) -> bool {
-    return task != nullptr && (s_timer_deferred_task.load(std::memory_order_acquire) == task ||
-                               s_auto_attach_deferred_task.load(std::memory_order_acquire) == task);
+    // Only the protocol-service worker must drive inline progress. Auto-attach
+    // has an independent worker; its ACK and timeout can complete while it sleeps.
+    return task != nullptr && s_timer_deferred_task.load(std::memory_order_acquire) == task;
 }
 
 auto cmdline_has_token(const char* cmdline, const char* token) -> bool {
@@ -335,7 +336,7 @@ class ResolvedRoute {
         wki_peer_lifecycle_rx_release(leased_origin);
     }
 
-    auto resolve(uint16_t dst_node, bool allow_discovery = false, bool allow_fenced_handshake = false) -> bool;
+    auto resolve(uint16_t dst_node, bool allow_discovery = false, bool allow_fenced_handshake = false, bool retain_origin = false) -> bool;
     [[nodiscard]] auto transport() const -> WkiTransport* { return leased_transport; }
     [[nodiscard]] auto next_hop() const -> uint16_t { return route.next_hop; }
     [[nodiscard]] auto direct() const -> bool { return route.hop_count == 1; }
@@ -419,6 +420,15 @@ auto routing_discovery_message(MsgType type) -> bool {
 
 auto routing_handshake_message(MsgType type) -> bool {
     return type == MsgType::HELLO || type == MsgType::HELLO_ACK || type == MsgType::HELLO_CONFIRM;
+}
+
+auto routing_control_ack(const WkiHeader& header) -> bool {
+    // The control stream carries the LSA that restores service routing. Its
+    // standalone cumulative ACK must be able to advance that stream first.
+    // Payloads, other channels and cross-channel piggybacks remain service TX.
+    uint8_t const FLAGS = wki_flags(header.version_flags);
+    return static_cast<MsgType>(header.msg_type) == MsgType::HEARTBEAT_ACK && header.channel_id == WKI_CHAN_CONTROL &&
+           header.payload_len == 0 && header.seq_num == 0 && header.reserved == 0 && (FLAGS & ~WKI_FLAG_PRIORITY) == WKI_FLAG_ACK_PRESENT;
 }
 
 auto perf_current_pid() -> uint64_t { return 0; }
@@ -881,7 +891,8 @@ auto wki_send_authenticated_header(WkiTransport* transport, uint16_t next_hop, c
     if (header.payload_len != 0) {
         return WKI_ERR_INVALID;
     }
-    if (!route.resolve(header.dst_node)) {
+    bool const CONTROL_ACK = routing_control_ack(header);
+    if (!route.resolve(header.dst_node, CONTROL_ACK, false, CONTROL_ACK)) {
         return WKI_ERR_NO_ROUTE;
     }
     std::array<uint8_t, WKI_HEADER_SIZE + WKI_AUTH_TRAILER_SIZE> frame{};
@@ -1500,7 +1511,7 @@ void wki_init() {
     g_wki.initialized = true;
 
     // Init routing subsystem (LSDB, routing table)
-    wki_routing_init();
+    wki_routing_init(cmdline_has_token(ker::init::get_kernel_cmdline(), "wki.routing_rx_timing"));
 
     // Init zone subsystem (shared memory zones)
     wki_zone_init();
@@ -1629,6 +1640,7 @@ void wki_shutdown() {
     }
     g_wki.transports = nullptr;
     g_wki.transport_count = 0;
+    wki_peer_cancel_hello_retries(nullptr, 0);
     g_wki.transport_lock.unlock();
 
     for (WkiTransport* t = TRANSPORTS; t != nullptr;) {
@@ -1647,10 +1659,24 @@ void wki_shutdown() {
 // Transport registry
 // -----------------------------------------------------------------------------
 
+namespace {
+uint64_t s_next_transport_generation = 1;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+// Caller holds transport_lock. Exhaustion disables new retry admission rather
+// than recycling a registration identity; ordinary transport behavior remains.
+auto next_transport_registration_generation() -> uint64_t {
+    uint64_t const GENERATION = s_next_transport_generation;
+    if (GENERATION != 0) {
+        ++s_next_transport_generation;
+    }
+    return GENERATION;
+}
+}  // namespace
+
 void wki_transport_register(WkiTransport* transport) {
     wki_chaos_transport_register(transport);
     g_wki.transport_lock.lock();
 
+    transport->registration_generation = next_transport_registration_generation();
     transport->next = g_wki.transports;
     g_wki.transports = transport;
     g_wki.transport_count++;
@@ -1673,6 +1699,8 @@ void wki_transport_unregister(WkiTransport* transport) {
         if (*pp == transport) {
             *pp = transport->next;
             g_wki.transport_count--;
+            wki_peer_cancel_hello_retries(transport, transport->registration_generation);
+            transport->registration_generation = 0;
             break;
         }
         pp = &(*pp)->next;
@@ -1789,11 +1817,10 @@ auto wki_peer_count() -> uint16_t { return g_wki.peer_count; }
 // Channels are allocated from a contiguous flat pool (cache-friendly) but
 // indexed via per-peer pointer arrays for O(1) lookup without global locks.
 
-constexpr size_t CHANNEL_POOL_SIZE = 1024;
 namespace {
-std::array<WkiChannel, CHANNEL_POOL_SIZE> s_channel_pool;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-bool s_channel_pool_init = false;                          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-ker::mod::sys::Spinlock s_channel_pool_lock;               // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::array<WkiChannel, WKI_CHANNEL_POOL_SIZE> s_channel_pool;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+bool s_channel_pool_init = false;                              // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Spinlock s_channel_pool_lock;                   // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 // Highest channel-pool index ever published, plus one. It is monotonic so a
 // timer snapshot remains safe across channel close and slot reuse.
 std::atomic<size_t> s_channel_pool_high_water{0};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -2653,7 +2680,7 @@ auto wki_peer_diag_snapshot(WkiPeerDiag* out, size_t max) -> size_t {
 // -----------------------------------------------------------------------------
 namespace {
 
-auto ResolvedRoute::resolve(uint16_t dst_node, bool allow_discovery, bool allow_fenced_handshake) -> bool {
+auto ResolvedRoute::resolve(uint16_t dst_node, bool allow_discovery, bool allow_fenced_handshake, bool retain_origin) -> bool {
     if (leased_transport != nullptr || leased_hop != nullptr || admitted_origin != nullptr || dst_node == WKI_NODE_INVALID ||
         dst_node == WKI_NODE_BROADCAST) {
         return false;
@@ -2669,7 +2696,7 @@ auto ResolvedRoute::resolve(uint16_t dst_node, bool allow_discovery, bool allow_
     // installation holds this peer's writer through synchronous invalidation,
     // so a routed next hop cannot hide an origin transition from this send.
     // Discovery may bootstrap an origin that has no peer/session yet.
-    if (!allow_discovery && !admit_origin(peer)) {
+    if ((!allow_discovery || retain_origin) && !admit_origin(peer)) {
         g_wki.peer_lock.unlock();
         return false;
     }
@@ -2745,8 +2772,9 @@ auto send_routed_frame(uint16_t dst_node, const void* frame, uint16_t len) -> in
     std::memcpy(&header, frame, sizeof(header));
     ResolvedRoute route;
     auto const TYPE = static_cast<MsgType>(header.msg_type);
-    return route.resolve(dst_node, routing_discovery_message(TYPE), routing_handshake_message(TYPE)) ? route.send(frame, len)
-                                                                                                     : WKI_ERR_NO_ROUTE;
+    return route.resolve(dst_node, routing_discovery_message(TYPE) || routing_control_ack(header), routing_handshake_message(TYPE))
+               ? route.send(frame, len)
+               : WKI_ERR_NO_ROUTE;
 }
 
 }  // namespace
@@ -3481,12 +3509,16 @@ auto reliable_dispatch_needs_serial_order(const WkiChannel* ch) -> bool {
     return ch != nullptr && (ch->channel_id == WKI_CHAN_IPC_DATA || channel_requires_existing_rx_reservation(ch->channel_id));
 }
 
+auto policy_denial_dispatch_ready_locked(WkiChannel& channel, uint32_t sequence) -> bool {
+    return sequence == channel.rx_seq && (!reliable_dispatch_needs_serial_order(&channel) || sequence == channel.rx_dispatch_seq);
+}
+
 auto try_consume_policy_denial_locked(WkiChannel& channel, uint32_t sequence, uint16_t payload_length, DispatchWaiterList& waiters)
     -> bool {
     bool const ORDERED = reliable_dispatch_needs_serial_order(&channel);
     // A denial still occupies a dispatch turn. Do not consume it ahead of an
     // earlier handler or wait in RX: ordinary retransmission retries admission.
-    if (sequence != channel.rx_seq || (ORDERED && sequence != channel.rx_dispatch_seq)) {
+    if (!policy_denial_dispatch_ready_locked(channel, sequence)) {
         return false;
     }
     channel.rx_seq++;
@@ -3812,7 +3844,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
         }
 
         ResolvedRoute route;
-        if (!route.resolve(hdr->dst_node, routing_discovery_message(msg), routing_handshake_message(msg))) {
+        if (!route.resolve(hdr->dst_node, routing_discovery_message(msg) || routing_control_ack(*hdr), routing_handshake_message(msg))) {
             return;
         }
 
@@ -3860,7 +3892,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
         if (metadata != nullptr && metadata->has_src_mac) {
             wki_eth_neighbor_add(hello->node_id, metadata->src_mac);
         }
-        if (g_wki.my_node_id < hello->node_id) {
+        if (g_wki.my_node_id < hello->node_id && wki_peer_retry_discovery(transport, *hello)) {
             wki_peer_send_hello(transport, hello->node_id);
         }
         return;
@@ -4133,6 +4165,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
                     }
                 }
                 if (installed) {
+                    wki_peer_retry_confirmation(transport, *reinterpret_cast<const HelloPayload*>(payload));
                     wki_peer_send_hello_confirm(peer);
                     wki_lsa_replay_to_peer(peer->node_id);
                     wki_resource_advertise_to_peer(peer->node_id);
@@ -4273,6 +4306,20 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
 
             if (hdr->seq_num == ch->rx_seq) {
                 if (!authorized) {
+                    if (!policy_denial_dispatch_ready_locked(*ch, hdr->seq_num)) {
+                        ch->lock.unlock();
+                        return;
+                    }
+                    WkiComputeRxAdmission denial_admission = WkiComputeRxAdmission::INLINE;
+                    if (ch->channel_id == WKI_CHAN_RESOURCE && (msg == MsgType::TASK_SUBMIT || msg == MsgType::TASK_SUBMIT_FRAGMENT)) {
+                        // A consumed request will not retry its denial. Own the
+                        // negative reply before publishing receive progress.
+                        denial_admission = wki_remote_compute_admit_submit_denial_rx(hdr, payload, PAYLOAD_LEN, ch, ch->generation);
+                        if (denial_admission == WkiComputeRxAdmission::RETRY) {
+                            ch->lock.unlock();
+                            return;
+                        }
+                    }
                     DispatchWaiterList waiters{};
                     if (!try_consume_policy_denial_locked(*ch, hdr->seq_num, PAYLOAD_LEN, waiters)) {
                         ch->lock.unlock();
@@ -4282,7 +4329,11 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
                     ch->lock.unlock();
                     wake_reliable_dispatch_waiters(waiters);
                     mark_peer_rx_progress(hdr->src_node);
-                    send_policy_denial(*hdr, payload, PAYLOAD_LEN, ch, RX_CHANNEL_GENERATION);
+                    if (denial_admission == WkiComputeRxAdmission::DEFERRED) {
+                        wki_remote_compute_notify_deferred_rx(hdr->src_node);
+                    } else {
+                        send_policy_denial(*hdr, payload, PAYLOAD_LEN, ch, RX_CHANNEL_GENERATION);
+                    }
                     wki_timer_notify();
                     return;
                 }

@@ -573,6 +573,11 @@ void wki_remote_compute_start_rx_threads();
 // task. Notify after dropping the channel lock when DEFERRED is returned.
 auto wki_remote_compute_admit_rx(MsgType type, const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
                                  uint32_t rx_channel_generation) -> WkiComputeRxAdmission;
+// Own an authenticated submit-policy rejection before reliable RX consumes the
+// request. RETRY leaves a valid request unconsumed; the worker retains the
+// negative response until reliable enqueue or exact session retirement.
+auto wki_remote_compute_admit_submit_denial_rx(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
+                                               uint32_t rx_channel_generation) -> WkiComputeRxAdmission;
 void wki_remote_compute_notify_deferred_rx(uint16_t src_node);
 
 // Wake the compute-submit workers after queuing a new pending submit.

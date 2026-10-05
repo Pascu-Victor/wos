@@ -161,10 +161,11 @@ def test_deferred_work_reentrancy_guard_prevents_recursive_blocking_work() -> No
         [
             "task != nullptr",
             "s_timer_deferred_task.load(std::memory_order_acquire) == task",
-            "s_auto_attach_deferred_task.load(std::memory_order_acquire) == task",
         ],
-        "timer deferred waiter identity check",
+        "protocol-service waiter identity check",
     )
+    if "s_auto_attach_deferred_task" in waiter_body:
+        fail("independent auto-attach worker must sleep while protocol-service work progresses")
 
     deferred_body = function_body(source, "process_deferred_blocking_work")
     require_order(

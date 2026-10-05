@@ -660,16 +660,56 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_routing_source_test.py
 )
 add_test(
+    NAME wki_routing_rx_timing_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_routing_rx_timing_runtime_test.py
+)
+add_test(
     NAME event_wake_diagnostics_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/event_wake_diagnostics_test.py
+)
+add_test(
+    NAME wki_submit_notification_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_submit_notification_test.py
+)
+add_test(
+    NAME wki_submit_denial_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_submit_denial_test.py
 )
 add_test(
     NAME scheduler_timer_trace_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scheduler_timer_trace_test.py
 )
 add_test(
+    NAME routing_timer_metadata_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/routing_timer_metadata_test.py
+)
+add_test(
     NAME scheduler_poke_migration_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scheduler_poke_migration_test.py
+)
+add_test(
+    NAME wki_flood_retry_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_flood_retry_test.py
+)
+add_test(
+    NAME wki_control_ack_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_control_ack_test.py
+)
+add_test(
+    NAME wki_origin_replay_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_origin_replay_test.py
+)
+add_test(
+    NAME wki_hello_retry_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_hello_retry_test.py
+)
+add_test(
+    NAME wki_timer_notification_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_timer_notification_test.py
+)
+add_test(
+    NAME wki_autoattach_wait_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_autoattach_wait_test.py
 )
 add_test(
     NAME vfs_mount_retry_test
@@ -867,7 +907,8 @@ add_test(
     NAME xfs_transaction_rollback_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_transaction_rollback_source_test.py
 )
-set_tests_properties(    host_test_manifest_test
+set_tests_properties(
+    host_test_manifest_test
     semantic_regression_test
     ktest_cov_test
     coverage_summary_test
@@ -990,9 +1031,19 @@ set_tests_properties(    host_test_manifest_test
     wki_zone_source_test
     wki_peer_source_test
     wki_routing_source_test
+    wki_routing_rx_timing_runtime_test
     event_wake_diagnostics_test
+    wki_submit_notification_test
+    wki_submit_denial_test
     scheduler_timer_trace_test
+    routing_timer_metadata_test
     scheduler_poke_migration_test
+    wki_flood_retry_test
+    wki_origin_replay_test
+    wki_control_ack_test
+    wki_hello_retry_test
+    wki_timer_notification_test
+    wki_autoattach_wait_test
     vfs_mount_retry_test
     wki_remote_compute_source_test
     wki_remote_vfs_source_test
@@ -1271,6 +1322,10 @@ target_link_libraries(perf_data_test PRIVATE wos::telemetry)
 add_test(NAME perf_event_parser_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/perf_event_parser_test.py)
 set_tests_properties(perf_event_parser_test PROPERTIES LABELS "unit;host")
+
+add_test(NAME wki_submit_phase_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_submit_phase_test.py)
+set_tests_properties(wki_submit_phase_test PROPERTIES LABELS "unit;host")
 
 # ---------------------------------------------------------------------------
 # Fuzz targets

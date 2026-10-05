@@ -558,11 +558,251 @@ auto free_mem_wire_units() -> uint16_t {
     return static_cast<uint16_t>(std::min<uint64_t>(UNITS, 0xFFFFULL));
 }
 
+// Discovery work is independent of WkiPeer allocation: the first HELLO can be
+// lost before a trusted peer exists. Hints never publish peer/session state.
+constexpr uint64_t HELLO_RETRY_INITIAL_US = 1'000'000;
+constexpr uint64_t HELLO_RETRY_MAX_US = 4'000'000;
+constexpr uint64_t HELLO_RETRY_WINDOW_US = 60'000'000;
+constexpr size_t HELLO_RETRY_TX_BUDGET = 8;
+
+struct HelloRetry {
+    WkiTransport* transport = nullptr;  // compare against registry before use
+    uint64_t registration_generation = 0;
+    uint16_t node = WKI_NODE_INVALID;
+    uint32_t boot_epoch = 0;
+    std::array<uint8_t, WKI_AUTH_NONCE_SIZE> nonce{};
+    uint64_t due_us = 0;
+    uint64_t expires_us = 0;
+    uint64_t backoff_us = HELLO_RETRY_INITIAL_US;
+};
+
+std::array<HelloRetry, WKI_MAX_PEERS> s_hello_retries;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Spinlock s_hello_retry_lock;             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<size_t> s_hello_retry_count{0};             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+void clear_hello_retry_locked(HelloRetry& retry) {
+    retry = {};
+    s_hello_retry_count.fetch_sub(1, std::memory_order_release);
+}
+
+auto same_hello_retry(const HelloRetry& lhs, const HelloRetry& rhs) -> bool {
+    return lhs.node == rhs.node && lhs.transport == rhs.transport && lhs.registration_generation == rhs.registration_generation &&
+           lhs.boot_epoch == rhs.boot_epoch && lhs.nonce == rhs.nonce && lhs.expires_us == rhs.expires_us;
+}
+
+void finish_hello_retry(const HelloRetry& finished) {
+    uint64_t const FLAGS = s_hello_retry_lock.lock_irqsave();
+    for (auto& retry : s_hello_retries) {
+        if (retry.node != WKI_NODE_INVALID && same_hello_retry(retry, finished)) {
+            clear_hello_retry_locked(retry);
+            break;
+        }
+    }
+    s_hello_retry_lock.unlock_irqrestore(FLAGS);
+}
+
+auto hello_retry_session_progress(const HelloRetry& retry) -> bool {
+    bool progress = false;
+    g_wki.peer_lock.lock();
+    WkiPeer* peer = wki_peer_find(retry.node);
+    if (peer != nullptr && wki_peer_lifecycle_rx_try_acquire(peer)) {
+        peer->auth_session.replay_lock.lock();
+        // CONNECTED is only the initiator's local state. A received session-key
+        // datagram proves the responder promoted this exact boot/nonce session.
+        progress = peer->state == PeerState::CONNECTED && peer->is_direct && peer->remote_boot_epoch == retry.boot_epoch &&
+                   peer->remote_auth_nonce == retry.nonce && peer->auth_session.active && peer->auth_session.rx_counter_high != 0;
+        peer->auth_session.replay_lock.unlock();
+        wki_peer_lifecycle_rx_release(peer);
+    }
+    g_wki.peer_lock.unlock();
+    return progress;
+}
+
+auto hello_retry_transport_pin(const HelloRetry& retry) -> WkiTransport* {
+    WkiTransport* pinned = nullptr;
+    g_wki.transport_lock.lock();
+    for (WkiTransport* transport = g_wki.transports; transport != nullptr; transport = transport->next) {
+        if (transport == retry.transport && transport->registration_generation == retry.registration_generation &&
+            !transport->chaos_unregistering.load(std::memory_order_acquire)) {
+            transport->chaos_in_flight.fetch_add(1, std::memory_order_acq_rel);
+            pinned = transport;
+            break;
+        }
+    }
+    g_wki.transport_lock.unlock();
+    return pinned;
+}
+
+auto hello_retry_next_deadline_us() -> uint64_t {
+    if (s_hello_retry_count.load(std::memory_order_acquire) == 0) {
+        return UINT64_MAX;
+    }
+    uint64_t next = UINT64_MAX;
+    uint64_t const FLAGS = s_hello_retry_lock.lock_irqsave();
+    for (auto const& retry : s_hello_retries) {
+        if (retry.node != WKI_NODE_INVALID) {
+            next = std::min({next, retry.due_us, retry.expires_us});
+        }
+    }
+    s_hello_retry_lock.unlock_irqrestore(FLAGS);
+    return next;
+}
+
+void drain_hello_retries(uint64_t now_us) {
+    if (s_hello_retry_count.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    auto shutdown_hold = mod::sched::hold_kernel_shutdown();
+    size_t attempts = 0;
+    for (size_t index = 0; index < s_hello_retries.size() && attempts < HELLO_RETRY_TX_BUDGET; ++index) {
+        HelloRetry pending{};
+        uint64_t const FLAGS = s_hello_retry_lock.lock_irqsave();
+        auto& retry = s_hello_retries.at(index);
+        if (retry.node != WKI_NODE_INVALID) {
+            if (now_us >= retry.expires_us) {
+                clear_hello_retry_locked(retry);
+            } else if (now_us >= retry.due_us) {
+                pending = retry;
+                retry.backoff_us = std::min(retry.backoff_us * 2, HELLO_RETRY_MAX_US);
+                retry.due_us = std::min(wki_future_deadline_us(now_us, retry.backoff_us), retry.expires_us);
+            }
+        }
+        s_hello_retry_lock.unlock_irqrestore(FLAGS);
+        if (pending.node == WKI_NODE_INVALID) {
+            continue;
+        }
+        ++attempts;
+        if (hello_retry_session_progress(pending)) {
+            finish_hello_retry(pending);
+            continue;
+        }
+        WkiTransport* transport = hello_retry_transport_pin(pending);
+        if (transport == nullptr) {
+            finish_hello_retry(pending);
+            continue;
+        }
+        // Retain a present peer's channel epoch across frame construction. RX
+        // lifecycle contention defers one attempt instead of waiting/borrowing
+        // another task's exclusive writer. No trusted peer is needed for TX.
+        g_wki.peer_lock.lock();
+        WkiPeer* peer = wki_peer_find(pending.node);
+        bool const ADMITTED = peer == nullptr || wki_peer_lifecycle_rx_try_acquire(peer);
+        g_wki.peer_lock.unlock();
+        if (ADMITTED) {
+            wki_peer_send_hello(transport, pending.node);
+            wki_peer_lifecycle_rx_release(peer);
+        }
+        transport->chaos_in_flight.fetch_sub(1, std::memory_order_release);
+    }
+}
+
 }  // namespace
 
 // -----------------------------------------------------------------------------
 // HELLO broadcast - discover neighbors on all transports
 // -----------------------------------------------------------------------------
+
+namespace {
+
+auto queue_hello_retry(WkiTransport* transport, const HelloPayload& hint, bool confirmation) -> bool {
+    bool const NONCE_ZERO = std::ranges::all_of(hint.auth_nonce, [](uint8_t byte) { return byte == 0; });
+    if (transport == nullptr || hint.node_id == WKI_NODE_INVALID || hint.node_id == WKI_NODE_BROADCAST ||
+        g_wki.my_node_id == hint.node_id || (!confirmation && g_wki.my_node_id > hint.node_id) || !wki_auth_peer_configured(hint.node_id) ||
+        hint.magic != WKI_HELLO_MAGIC || hint.protocol_version != WKI_VERSION || hello_boot_epoch(&hint) == 0 || NONCE_ZERO) {
+        return false;
+    }
+    HelloRetry pending{};
+    pending.transport = transport;
+    pending.node = hint.node_id;
+    pending.boot_epoch = hello_boot_epoch(&hint);
+    pending.nonce = hint.auth_nonce;
+    if (confirmation) {
+        bool direct = false;
+        g_wki.peer_lock.lock();
+        WkiPeer* peer = wki_peer_find(pending.node);
+        if (peer != nullptr && wki_peer_lifecycle_rx_try_acquire(peer)) {
+            direct = peer->is_direct && peer->remote_boot_epoch == pending.boot_epoch && peer->remote_auth_nonce == pending.nonce;
+            wki_peer_lifecycle_rx_release(peer);
+        }
+        g_wki.peer_lock.unlock();
+        if (!direct) {
+            return false;
+        }
+    }
+    if (hello_retry_session_progress(pending)) {
+        return false;
+    }
+    uint64_t const NOW_US = wki_now_us();
+    pending.due_us = wki_future_deadline_us(NOW_US, HELLO_RETRY_INITIAL_US);
+    pending.expires_us = wki_future_deadline_us(NOW_US, HELLO_RETRY_WINDOW_US);
+    bool published = false;
+    bool admitted = false;
+    // Registry removal and cancellation use the same registry -> queue order,
+    // so a disappearing transport cannot leave newly published stale work.
+    g_wki.transport_lock.lock();
+    for (WkiTransport* registered = g_wki.transports; registered != nullptr; registered = registered->next) {
+        if (registered != transport || registered->registration_generation == 0 ||
+            registered->chaos_unregistering.load(std::memory_order_acquire)) {
+            continue;
+        }
+        pending.registration_generation = registered->registration_generation;
+        admitted = true;
+        uint64_t const FLAGS = s_hello_retry_lock.lock_irqsave();
+        HelloRetry* empty = nullptr;
+        bool existing = false;
+        for (auto& retry : s_hello_retries) {
+            if (retry.node == pending.node) {
+                // Coalesce hints without delaying work or extending its window.
+                // A new hinted transcript is still only an untrusted TX hint.
+                retry.transport = pending.transport;
+                retry.registration_generation = pending.registration_generation;
+                retry.boot_epoch = pending.boot_epoch;
+                retry.nonce = pending.nonce;
+                existing = true;
+                break;
+            }
+            if (empty == nullptr && retry.node == WKI_NODE_INVALID) {
+                empty = &retry;
+            }
+        }
+        if (!existing && empty != nullptr) {
+            *empty = pending;
+            s_hello_retry_count.fetch_add(1, std::memory_order_release);
+            published = true;
+        }
+        s_hello_retry_lock.unlock_irqrestore(FLAGS);
+        break;
+    }
+    g_wki.transport_lock.unlock();
+    if (published) {
+        wki_timer_notify();
+    }
+    // A full retry queue still permits the existing immediate HELLO attempt.
+    return admitted;
+}
+
+}  // namespace
+
+auto wki_peer_retry_discovery(WkiTransport* transport, const HelloPayload& hint) -> bool {
+    return queue_hello_retry(transport, hint, false);
+}
+
+void wki_peer_retry_confirmation(WkiTransport* transport, const HelloPayload& ack) {
+    static_cast<void>(queue_hello_retry(transport, ack, true));
+}
+
+// Called under transport_lock after unlink, before the existing callback drain.
+// nullptr clears all work after shutdown detaches the complete registry.
+void wki_peer_cancel_hello_retries(WkiTransport* transport, uint64_t registration_generation) {
+    uint64_t const FLAGS = s_hello_retry_lock.lock_irqsave();
+    for (auto& retry : s_hello_retries) {
+        if (retry.node != WKI_NODE_INVALID &&
+            (transport == nullptr || (retry.transport == transport && retry.registration_generation == registration_generation))) {
+            clear_hello_retry_locked(retry);
+        }
+    }
+    s_hello_retry_lock.unlock_irqrestore(FLAGS);
+}
 
 void wki_peer_send_hello_broadcast() {
     HelloPayload hello = {};
@@ -2137,6 +2377,7 @@ void wki_peer_timer_tick(uint64_t now_us) {
         return;
     }
 
+    drain_hello_retries(now_us);
     drain_pending_epoch_reset_cleanups();
     drain_pending_fence_notifies();
     drain_pending_peer_goodbyes();
@@ -2402,7 +2643,8 @@ void wki_timer_notify() {
 namespace {
 
 auto wki_next_periodic_deadline_us(uint64_t now_us) -> uint64_t {
-    uint64_t next_deadline = wki_future_deadline_us(s_last_hello_broadcast, wki_hello_broadcast_interval_us());
+    uint64_t next_deadline =
+        std::min(wki_future_deadline_us(s_last_hello_broadcast, wki_hello_broadcast_interval_us()), hello_retry_next_deadline_us());
 
     if (s_next_heartbeat_send_deadline != 0) {
         next_deadline = std::min(next_deadline, s_next_heartbeat_send_deadline);
@@ -2432,6 +2674,10 @@ auto wki_next_periodic_deadline_us(uint64_t now_us) -> uint64_t {
         uint64_t now_us = mod::time::get_us();
         wki_peer_timer_tick(now_us);
 
+        // Notifications serviced by the tick are coalesced. Snapshot before
+        // scanning deadlines so newly published work cannot hide behind a
+        // deadline that was read before its notification.
+        uint32_t const NOTIFY_SEQ_BEFORE_SLEEP = s_wki_timer_notify_seq.load(std::memory_order_acquire);
         now_us = mod::time::get_us();
         uint64_t const NEXT_DEADLINE = std::min(
             {wki_next_fast_timer_deadline_us(now_us), wki_event_next_timer_deadline_us(now_us), wki_next_periodic_deadline_us(now_us)});
@@ -2448,9 +2694,6 @@ auto wki_next_periodic_deadline_us(uint64_t now_us) -> uint64_t {
             sleep_us = std::min(sleep_us, WKI_TIMER_CONNECTED_MAINTENANCE_US);
         }
 
-        // Detect a notify that races with the sleep transition without turning
-        // every earlier notify in this loop iteration into a zero-sleep spin.
-        uint32_t const NOTIFY_SEQ_BEFORE_SLEEP = s_wki_timer_notify_seq.load(std::memory_order_acquire);
         s_wki_timer_sleep_armed.store(true, std::memory_order_release);
         if (s_wki_timer_notify_seq.load(std::memory_order_acquire) != NOTIFY_SEQ_BEFORE_SLEEP) {
             s_wki_timer_sleep_armed.store(false, std::memory_order_release);

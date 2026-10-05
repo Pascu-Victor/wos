@@ -151,6 +151,9 @@ struct WkiTransport {
     uint16_t mtu;      // max payload excluding WKI header
     bool rdma_capable;
     void* private_data;
+    // Local registry incarnation, protected by transport_lock. Never reused,
+    // even when an allocator recycles an address or the chaos ID wraps.
+    uint64_t registration_generation = 0;
     uint16_t chaos_id = 0;  // stable local registration id; never transmitted
     // Deferred chaos delivery holds this count while invoking the original
     // callback. Transport teardown marks unregistering, discards queued work,
@@ -435,6 +438,7 @@ enum class WkiReliableTxStatus : uint8_t {
     RETIRED = 3,
 };
 
+constexpr size_t WKI_CHANNEL_POOL_SIZE = 1024;
 constexpr size_t WKI_CHANNEL_DIAG_MAX = 256;
 
 struct WkiChannelDiag {
@@ -835,8 +839,8 @@ constexpr uint64_t WKI_OP_TIMEOUT_US = 15'000'000;
 // Caller allocates WkiWaitEntry on kernel stack (no heap allocation needed).
 auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int;
 
-// True while the current WKI deferred worker must keep polling transport work
-// instead of entering a long scheduler park.
+// True while the current WKI protocol-service worker must keep polling transport
+// work. The independent auto-attach worker can park while ACK/timer work proceeds.
 auto wki_current_wait_must_drive_progress() -> bool;
 
 // True when the current PROCESS task is at an in-kernel syscall point where
