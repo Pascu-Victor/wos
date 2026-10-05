@@ -427,7 +427,14 @@ class RootfsDelta:
         )
 
         if changed:
-            changed.update({"/etc/wos-managed-paths", "/etc/wos-rootfs-source-state.tsv", "/etc/wos-rootfs-manifest.tsv"})
+            # The host-side source cache is the incremental-sync authority.
+            # Neither it nor the full-image managed-path list needs to be
+            # rewritten for an in-place delta: removals already force a full
+            # image recreate, and that recreate regenerates the managed list.
+            # Keeping these out of the payload also avoids requiring a large,
+            # fixed XFS extent reservation for build metadata that grows with
+            # every file in the sysroot.
+            changed.add("/etc/wos-rootfs-manifest.tsv")
 
     def write_path_lists(self, changed: set[str]) -> None:
         self.changed_paths.write_text("\n".join(sorted(changed)) + ("\n" if changed else ""), encoding="utf-8")

@@ -26,6 +26,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -174,17 +175,65 @@ class QcowPartitionFuse:
             raise RuntimeError(detail or "qemu-storage-daemon FUSE export failed")
         return self.part_file
 
+    @staticmethod
+    def _process_stopped(pid: int) -> bool:
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()[2]
+            return state == "Z"
+        except FileNotFoundError:
+            return True
+        except (IndexError, OSError):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            except OSError:
+                return False
+            return False
+
+    @classmethod
+    def _wait_stopped(cls, pid: int, timeout_seconds: float = 10.0) -> None:
+        deadline = time.monotonic() + timeout_seconds
+        while not cls._process_stopped(pid):
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"qemu-storage-daemon {pid} did not stop after FUSE unmount")
+            time.sleep(0.01)
+
     def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[no-untyped-def]
+        cleanup_error: RuntimeError | None = None
+        unmounted = False
         for tool in ("fusermount3", "fusermount"):
             if shutil.which(tool) is not None:
-                run([tool, "-u", str(self.part_file)])
+                result = run([tool, "-u", str(self.part_file)])
+                if result.returncode != 0:
+                    detail = (result.stderr or result.stdout).strip()
+                    cleanup_error = RuntimeError(detail or f"failed to unmount {self.part_file}")
+                else:
+                    unmounted = True
                 break
+        if not unmounted and cleanup_error is None:
+            cleanup_error = RuntimeError("required tool not found: fusermount3 or fusermount")
+
         if self.pid_file.exists():
             try:
                 pid = int(self.pid_file.read_text(encoding="utf-8").strip())
                 os.kill(pid, 15)
-            except (OSError, ValueError):
+                self._wait_stopped(pid)
+            except ProcessLookupError:
                 pass
+            except (OSError, ValueError, RuntimeError) as error:
+                if cleanup_error is None:
+                    cleanup_error = RuntimeError(f"failed to stop qemu-storage-daemon: {error}")
+
+        if unmounted and cleanup_error is None:
+            try:
+                with self.disk.open("rb") as disk:
+                    os.fsync(disk.fileno())
+            except OSError as error:
+                cleanup_error = RuntimeError(f"failed to flush {self.disk}: {error}")
+
+        if cleanup_error is not None and exc_type is None:
+            raise cleanup_error
 
 
 def xfs_db(partition_file: Path, commands: list[str], *, write: bool = False) -> str:
@@ -218,7 +267,7 @@ def read_inode_info(partition_file: Path, target: str, *, allow_root: bool = Fal
         partition_file,
         [
             "sb 0",
-            "p blocksize",
+            "p blocksize dblocks agblocks agcount agblklog",
             f"path {target}",
             "p core.mode core.size core.nblocks core.format",
             "bmap",
@@ -228,12 +277,33 @@ def read_inode_info(partition_file: Path, target: str, *, allow_root: bool = Fal
         raise RuntimeError(f"{target} is not present in the XFS image")
 
     block_size = parse_int_field(output, "blocksize")
+    data_blocks = parse_int_field(output, "dblocks")
+    ag_blocks = parse_int_field(output, "agblocks")
+    ag_count = parse_int_field(output, "agcount")
+    ag_block_log = parse_int_field(output, "agblklog")
+    if (block_size < 512 or block_size & (block_size - 1) or data_blocks <= 0 or ag_blocks <= 0 or
+            ag_count <= 0 or (data_blocks + ag_blocks - 1) // ag_blocks != ag_count or
+            ag_block_log < 0 or ag_block_log > 63 or (ag_blocks - 1).bit_length() != ag_block_log):
+        raise RuntimeError("invalid XFS allocation-group geometry")
     mode = parse_int_field(output, "core.mode", base=8)
     size = parse_int_field(output, "core.size")
     nblocks = parse_int_field(output, "core.nblocks")
     extents: list[Extent] = []
-    for match in re.finditer(r"^data offset (\d+) startblock (\d+) .* count (\d+) flag", output, re.MULTILINE):
-        extents.append(Extent(int(match.group(1)), int(match.group(2)), int(match.group(3))))
+    for match in re.finditer(r"^data offset (\d+) startblock (\d+) .* count (\d+) flag (\d+)", output, re.MULTILINE):
+        file_block, encoded_block, count, flag = (int(value) for value in match.groups())
+        # xfs_db bmap reports an encoded xfs_fsblock_t, not a linear block.
+        # AG sizes need not be powers of two; multiplying the encoded value
+        # writes into a different region and makes same-address verification
+        # falsely succeed. Decode the AG and its block before seeking.
+        ag_number = encoded_block >> ag_block_log
+        ag_block = encoded_block & ((1 << ag_block_log) - 1)
+        physical_block = ag_number * ag_blocks + ag_block
+        if (flag != 0 or count <= 0 or ag_number >= ag_count or ag_block + count > ag_blocks or
+                physical_block + count > data_blocks):
+            raise RuntimeError(f"{target} has an invalid or unwritten XFS data extent")
+        if extents and file_block < extents[-1].file_block + extents[-1].block_count:
+            raise RuntimeError(f"{target} has overlapping XFS data extents")
+        extents.append(Extent(file_block, physical_block, count))
     return InodeInfo(mode, size, nblocks, block_size, tuple(extents))
 
 
@@ -314,6 +384,42 @@ def copy_regular_file(partition_file: Path, source: Path, target: str, mode: int
     )
 
 
+def verify_regular_file(partition_file: Path, source: Path, target: str, mode: int) -> None:
+    info = read_inode_info(partition_file, target)
+    expected_mode = XFS_REGULAR_MODE | mode
+    if info.mode != expected_mode:
+        raise RuntimeError(f"{target} mode is {info.mode:o}, expected {expected_mode:o} after delta")
+
+    size = source.stat().st_size
+    if info.size != size:
+        raise RuntimeError(f"{target} size is {info.size}, expected {size} after delta")
+
+    verified = 0
+    with source.open("rb") as expected, partition_file.open("rb", buffering=0) as actual:
+        for extent in sorted(info.extents, key=lambda item: item.file_block):
+            file_start = extent.file_block * info.block_size
+            if file_start >= size:
+                break
+            if file_start > verified:
+                raise RuntimeError(f"{target} has a hole in its persisted extent map")
+
+            to_compare = min(extent.block_count * info.block_size, size - file_start)
+            expected.seek(file_start)
+            actual.seek(extent.fs_block * info.block_size)
+            remaining = to_compare
+            while remaining > 0:
+                chunk_size = min(1024 * 1024, remaining)
+                expected_chunk = expected.read(chunk_size)
+                actual_chunk = actual.read(chunk_size)
+                if expected_chunk != actual_chunk:
+                    raise RuntimeError(f"{target} data verification failed after delta")
+                remaining -= chunk_size
+            verified = max(verified, file_start + to_compare)
+
+    if verified != size:
+        raise RuntimeError(f"{target} persisted only {verified} of {size} bytes after delta")
+
+
 def verify_existing_directory(partition_file: Path, target: str, mode: int) -> None:
     info = read_inode_info(partition_file, target, allow_root=True)
     if not stat.S_ISDIR(info.mode):
@@ -352,6 +458,19 @@ def apply_delta(args: argparse.Namespace) -> int:
                     copy_regular_file(partition_file, source, target, stat.S_IMODE(source.stat().st_mode))
                 else:
                     raise RuntimeError(f"{target} is a deletion or missing staged path; recreate mountfs.qcow2")
+
+    # Reopen the qcow image after the writer daemon has closed. Reads through
+    # the original FUSE export can be satisfied by its cache even if qcow
+    # metadata or data was not durably published. Do not let the caller advance
+    # its source cache until a fresh daemon observes every written byte.
+    with tempfile.TemporaryDirectory(prefix="wos-rootfs-qcow-xfs-verify.") as temp:
+        with QcowPartitionFuse(disk, partition, Path(temp)) as partition_file:
+            for rel in relpaths:
+                source = staging / rel
+                if not source.is_file() or source.is_symlink():
+                    continue
+                target = "/" if rel == "." else "/" + rel
+                verify_regular_file(partition_file, source, target, stat.S_IMODE(source.stat().st_mode))
     print(f"  rootfs sync: xfs qcow delta applied: {len(relpaths)} paths")
     return 0
 
