@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <wos/netctl.h>
@@ -12,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <utility>
 
 #include "netd/config.hpp"
@@ -24,7 +26,7 @@ namespace netd {
 namespace {
 
 constexpr uint32_t RA_RETRY_DELAY_S = 5;
-constexpr uint32_t RA_POLL_INTERVAL_US = 50'000;
+constexpr uint32_t RA_RECEIVE_ERROR_BACKOFF_US = 50'000;
 constexpr uint32_t ROUTER_SOLICIT_INTERVAL_S = 4;
 constexpr uint32_t IDENTITY_RECHECK_INTERVAL_S = 1;
 constexpr size_t MAX_ROUTER_SOLICITATIONS = 3;
@@ -217,6 +219,27 @@ auto same_interface_identity(const InterfaceIdentity& left, const InterfaceIdent
     return left.ifindex == right.ifindex && left.mtu == right.mtu && left.mac == right.mac && left.link_local == right.link_local;
 }
 
+auto wait_for_ra_packet(int socket_fd, uint64_t deadline_us) -> int {
+    for (;;) {
+        uint64_t const NOW_US = monotonic_now_us();
+        if (NOW_US >= deadline_us) {
+            return 0;
+        }
+        uint64_t const REMAINING_US = deadline_us - NOW_US;
+        uint64_t const TIMEOUT_MS = REMAINING_US / 1000 + static_cast<uint64_t>(REMAINING_US % 1000 != 0);
+        pollfd descriptor{.fd = socket_fd, .events = POLLIN, .revents = 0};
+        int const RESULT = poll(&descriptor, 1, static_cast<int>(std::min<uint64_t>(TIMEOUT_MS, std::numeric_limits<int>::max())));
+        if (RESULT < 0 && errno == EINTR) {
+            continue;  // Preserve the absolute identity/solicitation deadline.
+        }
+        if (RESULT > 0 && (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            errno = (descriptor.revents & POLLNVAL) != 0 ? EBADF : EIO;
+            return -1;
+        }
+        return RESULT;
+    }
+}
+
 auto apply_ra_plan(const char* ifname, uint32_t ifindex, const RaUpdatePlan& plan, RaManagedState& state) -> bool {
     bool mtu_applied = false;
     if (plan.set_mtu && update_interface_mtu(ifindex, plan.mtu)) {
@@ -314,8 +337,16 @@ void receive_router_advertisements(int socket_fd, const char* ifname, InterfaceI
         if (RECEIVED < 0) {
             if (errno != EAGAIN && errno != EINTR) {
                 logger::warn("netd: %s RA receive failed: errno=%d", ifname, errno);
+                sleep_until_us(monotonic_now_us() + RA_RECEIVE_ERROR_BACKOFF_US);
+                continue;
             }
-            sleep_until_us(monotonic_now_us() + RA_POLL_INTERVAL_US);
+            uint64_t const DEADLINE_US =
+                solicitations < MAX_ROUTER_SOLICITATIONS ? std::min(next_identity_check_us, next_solicitation_us) : next_identity_check_us;
+            if (wait_for_ra_packet(socket_fd, DEADLINE_US) < 0) {
+                logger::warn("netd: %s RA readiness wait failed: errno=%d", ifname, errno);
+                sleep_for_seconds(RA_RETRY_DELAY_S);
+                return;
+            }
             continue;
         }
         if (source_length != sizeof(source) || source.sin6_family != AF_INET6 || source.sin6_scope_id != identity.ifindex) {
