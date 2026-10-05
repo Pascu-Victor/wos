@@ -9,6 +9,7 @@
 #include <cstring>
 #include <iterator>
 #include <memory>
+#include <mod/io/serial/serial.hpp>
 #include <new>
 #include <platform/sched/resource_as.hpp>
 #include <platform/sched/session.hpp>
@@ -37,6 +38,7 @@
 #include "platform/sched/scheduler.hpp"
 #include "platform/sched/task.hpp"
 #include "platform/sched/threading.hpp"
+#include "platform/smt/smt.hpp"
 #include "platform/sys/context_switch.hpp"
 #include "platform/sys/signal.hpp"
 #include "platform/sys/usercopy.hpp"
@@ -504,41 +506,72 @@ auto wos_proc_setgroups(size_t size, uint64_t list_addr) -> uint64_t {
         *task, {.change = ker::mod::security::Change::SET_GROUPS, .groups = std::span(copied_groups).first(size)}));
 }
 
-inline void record_local_proc_event(ker::mod::sched::task::Task* task, ker::mod::perf::WkiPerfLocalProcOp op,
-                                    ker::mod::perf::WkiPerfPhase phase, uint32_t correlation, int32_t status, uint32_t aux,
-                                    uint64_t callsite) {
-    if (task == nullptr) {
-        return;
-    }
-
-    ker::mod::perf::record_wki_event(static_cast<uint32_t>(ker::mod::cpu::current_cpu()), task->pid,
-                                     ker::mod::perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(op), phase, 0, 0, correlation, status,
-                                     aux, callsite);
-}
-
 inline auto clamp_perf_aux(uint64_t value) -> uint32_t { return value > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(value); }
 
 struct LocalProcStage {
-    uint32_t correlation;
-    uint64_t started_us;
+    uint32_t correlation{};
+    uint64_t started_us{};
+    uint64_t subject_pid{};
+    uint64_t capture_session = ker::mod::perf::PERF_ANY_SESSION;
+    bool active{};
 };
 
 auto begin_local_proc_stage(ker::mod::sched::task::Task* task, ker::mod::perf::WkiPerfLocalProcOp op, uint32_t aux, uint64_t callsite)
     -> LocalProcStage {
+    if (task == nullptr) {
+        return {};
+    }
+    uint64_t const SESSION =
+        ker::mod::perf::current_wki_capture_session(ker::mod::perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(op));
+    if (SESSION == ker::mod::perf::PERF_ANY_SESSION) {
+        return {};
+    }
     LocalProcStage const STAGE = {
         .correlation = ker::mod::perf::next_wki_trace_correlation(),
         .started_us = ker::mod::time::get_us(),
+        .subject_pid = task->pid,
+        .capture_session = SESSION,
+        .active = true,
     };
-    record_local_proc_event(task, op, ker::mod::perf::WkiPerfPhase::BEGIN, STAGE.correlation, 0, aux, callsite);
+    ker::mod::perf::record_wki_event(static_cast<uint32_t>(ker::mod::cpu::current_cpu()), STAGE.subject_pid,
+                                     ker::mod::perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(op),
+                                     ker::mod::perf::WkiPerfPhase::BEGIN, 0, 0, STAGE.correlation, 0, aux, callsite, SESSION);
     return STAGE;
 }
 
-auto end_local_proc_stage(ker::mod::sched::task::Task* task, ker::mod::perf::WkiPerfLocalProcOp op, const LocalProcStage& stage,
+void record_fork_child(const LocalProcStage& stage, uint64_t child_pid, uint64_t child_cpu, uint64_t callsite) {
+    using namespace ker::mod;
+    if (!stage.active ||
+        stage.capture_session !=
+            perf::current_wki_capture_session(perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(perf::WkiPerfLocalProcOp::FORK_CHILD))) {
+        return;
+    }
+    // Keep the legacy independent child POINT while adding an explicit link.
+    // Child first scheduling may precede either parent-side publication POINT.
+    perf::record_wki_event(static_cast<uint32_t>(cpu::current_cpu()), child_pid, perf::WkiPerfScope::LOCAL_PROC,
+                           static_cast<uint8_t>(perf::WkiPerfLocalProcOp::FORK), perf::WkiPerfPhase::POINT, 0, 0,
+                           perf::next_wki_trace_correlation(), 0, clamp_perf_aux(child_cpu), callsite, stage.capture_session);
+    perf::record_wki_event(static_cast<uint32_t>(cpu::current_cpu()), child_pid, perf::WkiPerfScope::LOCAL_PROC,
+                           static_cast<uint8_t>(perf::WkiPerfLocalProcOp::FORK_CHILD), perf::WkiPerfPhase::POINT, 0, 0, stage.correlation,
+                           0, clamp_perf_aux(child_cpu), callsite, stage.capture_session);
+}
+
+auto end_local_proc_stage(ker::mod::sched::task::Task* /*task*/, ker::mod::perf::WkiPerfLocalProcOp op, LocalProcStage& stage,
                           int32_t status, uint64_t bytes, uint64_t callsite) -> uint32_t {
-    uint32_t const ELAPSED_US = clamp_perf_aux(ker::mod::time::get_us() - stage.started_us);
-    record_local_proc_event(task, op, ker::mod::perf::WkiPerfPhase::END, stage.correlation, status, ELAPSED_US, callsite);
+    if (!std::exchange(stage.active, false)) {
+        return 0;
+    }
+    if (stage.capture_session !=
+        ker::mod::perf::current_wki_capture_session(ker::mod::perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(op))) {
+        return 0;
+    }
+    uint64_t const NOW = ker::mod::time::get_us();
+    uint32_t const ELAPSED_US = clamp_perf_aux(NOW >= stage.started_us ? NOW - stage.started_us : 0);
+    ker::mod::perf::record_wki_event(static_cast<uint32_t>(ker::mod::cpu::current_cpu()), stage.subject_pid,
+                                     ker::mod::perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(op), ker::mod::perf::WkiPerfPhase::END,
+                                     0, 0, stage.correlation, status, ELAPSED_US, callsite, stage.capture_session);
     ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::LOCAL_PROC, static_cast<uint8_t>(op), 0, 0, status, ELAPSED_US, true,
-                                       0, bytes);
+                                       0, bytes, stage.capture_session);
     return ELAPSED_US;
 }
 
@@ -574,6 +607,75 @@ auto alloc_fork_kernel_stack_with_reclaim() -> uint64_t {
     return reinterpret_cast<uint64_t>(ker::mod::mm::phys::kernel_stack_alloc("fork_kstack"));
 }
 
+auto reclaim_fork_stack_from_syscall(ker::mod::sched::task::Task* parent, bool wait_for_retirement = false) -> bool {
+    using namespace ker::mod;
+    // FORK enters with IF cleared by IA32_FMASK. Keep the generic allocator
+    // predicate strict; only this syscall boundary can permit blocking GC.
+    if (!sched::has_run_queues() || !sched::can_query_current_task() || parent == nullptr || parent != sched::get_current_task() ||
+        parent->type != sched::task::TaskType::PROCESS || parent->syscall_account_start_us == 0 || sched::preempt_count() != 0 ||
+        io::serial::is_panic_mode() || parent->scheduler_transition_active.load(std::memory_order_acquire) ||
+        parent->deferred_task_switch || parent->wants_block || parent->is_voluntary_blocked()) {
+        return false;
+    }
+
+    // Initial pool allocation has released its lock, and no child or VM
+    // publication lock exists yet. Reuse GC's exclusive bounded pressure pass
+    // with every epoch/current/refcount guard intact, then restore caller IF.
+    bool const INTERRUPTS_WERE_ENABLED = sched::interrupts_enabled();
+    asm volatile("sti" ::: "memory");
+    if (wait_for_retirement) {
+        // waitpid can consume the exit event before the child finishes its
+        // address-space cleanup and switches off its stack. Give that executor
+        // a safe scheduling opportunity before starting another owned GC pass.
+        sched::request_gc_memory_pressure();
+        sched::kern_yield_impl(WOS_PERF_CALLSITE());
+    }
+    sched::GcPressureDiagnostics diagnostics{};
+    uint32_t const RECLAIMED = sched::reclaim_memory_pressure(&diagnostics);
+    // NOLINTNEXTLINE(bugprone-branch-clone)
+    if (INTERRUPTS_WERE_ENABLED) {
+        asm volatile("sti" ::: "memory");
+    } else {
+        asm volatile("cli" ::: "memory");
+    }
+    auto const POOL = mm::phys::get_kernel_stack_pool_stats();
+    process_log::info(
+        "fork_stack_pressure_v1 parent=%lu entry_if=%u reclaimed=%u ran=%u scanned=%lu epoch=%lu young=%lu current=%lu ref=%lu "
+        "zombie_busy=%lu retained=%lu invalid=%lu time_limit=%u deferred=%u stack_free=%lu stack_cap=%lu",
+        parent->pid, INTERRUPTS_WERE_ENABLED ? 1U : 0U, RECLAIMED, diagnostics.ran ? 1U : 0U, diagnostics.scanned, diagnostics.epoch_skips,
+        diagnostics.epoch_still_young, diagnostics.current_skips, diagnostics.refcount_skips, diagnostics.zombie_busy_skips,
+        diagnostics.retained_zombie_skips, diagnostics.invalid_tasks, diagnostics.time_budget_exhausted ? 1U : 0U,
+        diagnostics.deferred_pending ? 1U : 0U, POOL.free_slots, POOL.capacity);
+    return true;
+}
+
+auto alloc_fork_kernel_stack_from_syscall(ker::mod::sched::task::Task* parent) -> uint64_t {
+    auto stack = alloc_fork_kernel_stack_with_reclaim();
+    if (stack != 0) {
+        return stack;
+    }
+
+    uint64_t const START_US = ker::mod::time::get_us();
+    constexpr uint64_t RETIREMENT_BUDGET_US = 50000;
+    for (uint32_t attempt = 0; attempt < ker::mod::mm::reclaim::DIRECT_RECLAIM_MAX_PASSES; ++attempt) {
+        uint64_t const NOW_US = ker::mod::time::get_us();
+        if (attempt != 0 && (NOW_US < START_US || NOW_US - START_US >= RETIREMENT_BUDGET_US)) {
+            break;
+        }
+        if (!reclaim_fork_stack_from_syscall(parent, attempt != 0)) {
+            break;
+        }
+        // Retry once per bounded pass, also accepting a concurrent free when
+        // another GC owner was busy. Persistent or reader-pinned shortage
+        // still returns NULL; never bypass reclamation's lifetime guards.
+        stack = alloc_fork_kernel_stack_with_reclaim();
+        if (stack != 0) {
+            break;
+        }
+    }
+    return stack;
+}
+
 auto throttle_fork_for_reclaim_pressure(uint64_t callsite) -> bool {
     if (!ker::mod::mm::phys::can_wait_for_reclaim()) {
         return true;
@@ -581,9 +683,8 @@ auto throttle_fork_for_reclaim_pressure(uint64_t callsite) -> bool {
 
     constexpr uint64_t STACK_PAGES = ker::mod::mm::KERNEL_STACK_SIZE / ker::mod::mm::paging::PAGE_SIZE;
     for (uint32_t attempt = 0; attempt < ker::mod::mm::reclaim::DIRECT_RECLAIM_MAX_PASSES; ++attempt) {
-        // Admission protects global page headroom without requiring an
-        // order-sized buddy block: kernel_stack_alloc() consumes the reserved
-        // stack pool first and its buddy fallback performs order-aware reclaim.
+        // Admission protects global page headroom. Guarded stacks come only
+        // from the reserved pool; physical headroom does not imply a free slot.
         auto const PRESSURE = ker::mod::mm::reclaim::pressure_for_order(FORK_ADMISSION_ORDER);
         if (PRESSURE == ker::mod::mm::reclaim::PressureLevel::NONE) {
             return true;
@@ -611,6 +712,32 @@ auto fork_child_return_regs(ker::mod::cpu::GPRegs entry_regs) -> ker::mod::cpu::
     return entry_regs;
 }
 
+void note_fork_failure(ker::mod::sched::task::Task* parent, const char* stage, int32_t status) {
+    using namespace ker::mod;
+    // Observe after the existing failure cleanup. Pool fields are coherent,
+    // but queue/physical snapshots are later, independent observations; they
+    // cannot prove the allocator's state at the moment it rejected the fork.
+    auto const STACK_POOL = mm::phys::get_kernel_stack_pool_stats();
+    uint64_t const PHYS_FREE_PAGES = mm::phys::get_free_mem_pages();
+    uint64_t const CPU_COUNT = smt::get_core_count();
+    uint64_t dead = 0;
+    uint64_t runnable = 0;
+    uint64_t waiting = 0;
+    for (uint64_t cpu_no = 0; cpu_no < CPU_COUNT; ++cpu_no) {
+        auto const QUEUES = sched::get_run_queue_stats(cpu_no);
+        dead += QUEUES.expired_task_count;
+        runnable += QUEUES.active_task_count;
+        waiting += QUEUES.wait_queue_count;
+    }
+    uint64_t const GC_DEFERRED = CPU_COUNT != 0 ? sched::get_scheduler_trace_stats(0).gc_deferred_depth : 0;
+    // No pool or run-queue lock remains held when the journal wakes readers.
+    process_log::warn(
+        "fork_failure_v1 stage=%s status=%d parent=%lu cpu=%u cpus=%lu stack_cap=%lu stack_free=%lu stack_high=%lu "
+        "phys_free_pages=%lu dead=%lu runnable=%lu waiting=%lu gc_deferred=%lu",
+        stage, status, parent->pid, cpu::current_cpu(), CPU_COUNT, STACK_POOL.capacity, STACK_POOL.free_slots, STACK_POOL.high_watermark,
+        PHYS_FREE_PAGES, dead, runnable, waiting, GC_DEFERRED);
+}
+
 auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     using namespace ker::mod;
 
@@ -622,10 +749,13 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         return static_cast<uint64_t>(-ESHUTDOWN);
     }
 
-    LocalProcStage const FORK_STAGE = begin_local_proc_stage(parent, perf::WkiPerfLocalProcOp::FORK, 0, WOS_PERF_CALLSITE());
-    auto finish_fork = [&](int64_t result, uint64_t bytes = 0) -> uint64_t {
+    LocalProcStage FORK_STAGE = begin_local_proc_stage(parent, perf::WkiPerfLocalProcOp::FORK, 0, WOS_PERF_CALLSITE());
+    auto finish_fork = [&](int64_t result, uint64_t bytes = 0, const char* failure_stage = nullptr) -> uint64_t {
         int32_t const STATUS = result < 0 ? static_cast<int32_t>(result) : 0;
         end_local_proc_stage(parent, perf::WkiPerfLocalProcOp::FORK, FORK_STAGE, STATUS, bytes, WOS_PERF_CALLSITE());
+        if (result == -ENOMEM && failure_stage != nullptr) {
+            note_fork_failure(parent, failure_stage, STATUS);
+        }
         return static_cast<uint64_t>(result);
     };
 
@@ -635,7 +765,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         return finish_fork(process_reservation.result());
     }
     if (!throttle_fork_for_reclaim_pressure(WOS_PERF_CALLSITE())) {
-        return finish_fork(-ENOMEM);
+        return finish_fork(-ENOMEM, 0, "pressure-admission");
     }
 
     // Snapshot the syscall-entry register block after any pressure-reclaim
@@ -647,9 +777,9 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     parent->context.regs = FORK_ENTRY_REGS;
 
     // --- Allocate child kernel stack ---
-    auto const KERNEL_STACK_BASE = alloc_fork_kernel_stack_with_reclaim();
+    auto const KERNEL_STACK_BASE = alloc_fork_kernel_stack_from_syscall(parent);
     if (KERNEL_STACK_BASE == 0) {
-        return finish_fork(-ENOMEM);
+        return finish_fork(-ENOMEM, 0, "kernel-stack");
     }
     uint64_t const KERNEL_RSP = KERNEL_STACK_BASE + ker::mod::mm::KERNEL_STACK_SIZE;
 
@@ -657,7 +787,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     auto* child = new sched::task::Task{};
     if (child == nullptr) {
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
-        return finish_fork(-ENOMEM);
+        return finish_fork(-ENOMEM, 0, "task");
     }
     if (!sched::resource::inherit(*child, *parent)) {
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
@@ -740,7 +870,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         delete[] child->name;
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         delete child;
-        return finish_fork(-ENOMEM);
+        return finish_fork(-ENOMEM, 0, "vfs-rules");
     }
     child->wki_skip_legacy_placement = false;
 
@@ -751,7 +881,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         delete[] child->name;
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         delete child;
-        return finish_fork(-ENOMEM);
+        return finish_fork(-ENOMEM, 0, "credentials");
     }
 
     // Copy session, process group, and controlling terminal
@@ -778,7 +908,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         delete[] child->name;
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         delete child;
-        return finish_fork(-ENOMEM);
+        return finish_fork(-ENOMEM, 0, "pagemap");
     }
 
     // Copy kernel mappings
@@ -817,7 +947,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         delete[] child->name;
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         delete child;
-        return finish_fork(-ENOMEM);
+        return finish_fork(-ENOMEM, 0, "vm-snapshot");
     }
 
     (void)sched::resource::observe_address_space(*child);
@@ -836,7 +966,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
             delete[] child->name;
             mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
             delete child;
-            return finish_fork(-ENOMEM);
+            return finish_fork(-ENOMEM, 0, "thread");
         }
         // Copy all fields - virtual addresses are the same (same address space layout via COW)
         *child_thread = *parent->thread;
@@ -910,7 +1040,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         delete[] child->name;
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         delete child;
-        return finish_fork(-ENOMEM);
+        return finish_fork(-ENOMEM, 0, "fd-table");
     }
 
     // Establish authoritative process ownership before either scheduler or
@@ -928,7 +1058,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         delete[] child->name;
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         delete child;
-        return finish_fork(-ENOMEM);
+        return finish_fork(-ENOMEM, 0, "child-publication");
     }
 
     // --- Enqueue child ---
@@ -947,7 +1077,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         delete[] child->name;
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         delete child;
-        return finish_fork(-ENOMEM);
+        return finish_fork(-ENOMEM, 0, "scheduler-publication");
     }
     if (!child_events::commit_publication(*child)) [[unlikely]] {
         // Scheduler publication is irreversible at this call site. Preserve
@@ -955,8 +1085,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         // a child that is already runnable (or already exited/reaped).
         process_log::error("fork: lifecycle commit completed concurrently for published child PID %x", child->pid);
     }
-    record_local_proc_event(child, perf::WkiPerfLocalProcOp::FORK, perf::WkiPerfPhase::POINT, perf::next_wki_trace_correlation(), 0,
-                            static_cast<uint32_t>(child->cpu), WOS_PERF_CALLSITE());
+    record_fork_child(FORK_STAGE, child->pid, child->cpu, WOS_PERF_CALLSITE());
 
     // Return child PID to parent
     return finish_fork(static_cast<int64_t>(child->pid), child->cpu);

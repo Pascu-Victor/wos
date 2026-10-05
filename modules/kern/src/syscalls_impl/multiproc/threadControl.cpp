@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <mod/io/serial/serial.hpp>
 #include <net/wki/remote_compute.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/sched/epoch.hpp>
@@ -34,6 +35,41 @@ constexpr uint32_t SOFT_EXCLUSIVE_DAEMON_PENALTY = 7;
 constexpr uint64_t MLIBC_TCB_TID_OFFSET = 0x18;
 static_assert(MLIBC_TCB_TID_OFFSET + sizeof(int) <= mod::sys::signal::WOS_TCB_SIGNAL_CACHE_BYTES);
 std::atomic<uint64_t> next_thread_cpu{0};
+
+auto reclaim_thread_stack_from_syscall(mod::sched::task::Task* parent) -> bool {
+    // THREAD_CREATE enters with IF cleared by IA32_FMASK. The allocator's
+    // generic reclaim predicate must keep rejecting that state in fault
+    // handlers; this private helper is reached only from the syscall dispatcher.
+    if (!mod::sched::has_run_queues() || !mod::sched::can_query_current_task() || parent == nullptr ||
+        parent != mod::sched::get_current_task() || parent->type != mod::sched::task::TaskType::PROCESS ||
+        parent->syscall_account_start_us == 0 || mod::sched::preempt_count() != 0 || mod::io::serial::is_panic_mode() ||
+        parent->scheduler_transition_active.load(std::memory_order_acquire) || parent->deferred_task_switch || parent->wants_block ||
+        parent->is_voluntary_blocked()) {
+        return false;
+    }
+
+    // No publication/runqueue/pool lock or unpublished child is held here.
+    // GC can park at its existing scheduler safe points and keeps all of its
+    // epoch/current/refcount guards. Preserve the caller's IF across that work.
+    bool const INTERRUPTS_WERE_ENABLED = mod::sched::interrupts_enabled();
+    asm volatile("sti" ::: "memory");
+    mod::sched::GcPressureDiagnostics diagnostics{};
+    uint32_t const RECLAIMED = mod::sched::reclaim_memory_pressure(&diagnostics);
+    // NOLINTNEXTLINE(bugprone-branch-clone)
+    if (INTERRUPTS_WERE_ENABLED) {
+        asm volatile("sti" ::: "memory");
+    } else {
+        asm volatile("cli" ::: "memory");
+    }
+    mod::dbg::logger<"thread">::info(
+        "stack pressure: pid=%lx entry_if=%u reclaimed=%u ran=%u scanned=%lu epoch=%lu young=%lu current=%lu ref=%lu not_dead=%lu "
+        "zombie_busy=%lu retained=%lu invalid=%lu time_limit=%u deferred=%u",
+        parent->pid, INTERRUPTS_WERE_ENABLED ? 1U : 0U, RECLAIMED, diagnostics.ran ? 1U : 0U, diagnostics.scanned, diagnostics.epoch_skips,
+        diagnostics.epoch_still_young, diagnostics.current_skips, diagnostics.refcount_skips, diagnostics.not_dead_skips,
+        diagnostics.zombie_busy_skips, diagnostics.retained_zombie_skips, diagnostics.invalid_tasks,
+        diagnostics.time_budget_exhausted ? 1U : 0U, diagnostics.deferred_pending ? 1U : 0U);
+    return true;
+}
 
 auto online_cpu_mask() -> uint64_t {
     uint64_t const CPU_COUNT = mod::smt::get_core_count();
@@ -215,44 +251,58 @@ auto thread_control(abi::multiproc::threadControlOps op, uint64_t arg1, uint64_t
             }
 
             uint64_t thread_pid = 0;
-            {
-                // Serialize the lazy-range clone through scheduler publication with
-                // shared-address-space mmap/munmap/mprotect metadata propagation.
-                // The new thread must either clone a completed update or be visible
-                // to the next update's active-task snapshot.
-                ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
-                auto* t = mod::sched::task::Task::create_user_thread(parent, tcb_va, user_sp, enter_va, prepared_stack_words.at(0),
-                                                                     prepared_stack_words.at(1));
-                if (t == nullptr) {
+            for (uint32_t attempt = 0; attempt < 2; ++attempt) {
+                bool creation_failed = false;
+                bool stack_exhausted = false;
+                {
+                    // Serialize the lazy-range clone through scheduler publication with
+                    // shared-address-space mmap/munmap/mprotect metadata propagation.
+                    // The new thread must either clone a completed update or be visible
+                    // to the next update's active-task snapshot.
+                    ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+                    auto* t = mod::sched::task::Task::create_user_thread(parent, tcb_va, user_sp, enter_va, prepared_stack_words.at(0),
+                                                                         prepared_stack_words.at(1), &stack_exhausted);
+                    if (t == nullptr) {
+                        creation_failed = true;
+                    } else {
+                        uint64_t const CPU_COUNT = mod::smt::get_core_count();
+                        if (CPU_COUNT == 0) {
+                            mod::sched::task::destroy_unpublished_user_thread(t);
+                            return static_cast<uint64_t>(-ENOMEM);
+                        }
+                        uint64_t const TARGET_CPU = next_thread_cpu.fetch_add(1, std::memory_order_relaxed) % CPU_COUNT;
+
+                        if (!publish_thread_tid_to_tcb(parent, tcb_va, t->pid)) {
+                            mod::sched::task::destroy_unpublished_user_thread(t);
+                            return static_cast<uint64_t>(-EFAULT);
+                        }
+                        mod::sys::signal::sync_task_signal_mask_cache_mapped(t);
+
+                        bool const POSTED = process_reservation.attach(*t) && mod::sched::post_task_for_cpu(TARGET_CPU, t);
+                        if (!POSTED) {
+                            (void)publish_thread_tid_to_tcb(parent, tcb_va, 0);
+                            mod::sched::task::destroy_unpublished_user_thread(t);
+                            return static_cast<uint64_t>(-ENOMEM);
+                        }
+
+                        // Group exit can race with THREAD_CREATE after its active-registry
+                        // scan has passed this creator but before the new sibling is
+                        // published. Inherit the creator's request after publication so
+                        // the sibling cannot escape the process-wide exit.
+                        static_cast<void>(ker::syscall::process::inherit_pending_process_exit_request(parent, t));
+                        thread_pid = t->pid;
+                    }
+                }
+                if (!creation_failed) {
+                    break;
+                }
+                // Retired tasks can exhaust the fixed guarded-stack reserve
+                // even with free general RAM. Reclaim once without holding the
+                // shared-VM publication mutex: GC may need that mutex itself.
+                // Epoch/current/refcount checks still fence every stack free.
+                if (attempt != 0 || !stack_exhausted || !reclaim_thread_stack_from_syscall(parent)) {
                     return static_cast<uint64_t>(-ENOMEM);
                 }
-
-                uint64_t const CPU_COUNT = mod::smt::get_core_count();
-                if (CPU_COUNT == 0) {
-                    mod::sched::task::destroy_unpublished_user_thread(t);
-                    return static_cast<uint64_t>(-ENOMEM);
-                }
-                uint64_t const TARGET_CPU = next_thread_cpu.fetch_add(1, std::memory_order_relaxed) % CPU_COUNT;
-
-                if (!publish_thread_tid_to_tcb(parent, tcb_va, t->pid)) {
-                    mod::sched::task::destroy_unpublished_user_thread(t);
-                    return static_cast<uint64_t>(-EFAULT);
-                }
-                mod::sys::signal::sync_task_signal_mask_cache_mapped(t);
-
-                bool const POSTED = process_reservation.attach(*t) && mod::sched::post_task_for_cpu(TARGET_CPU, t);
-                if (!POSTED) {
-                    (void)publish_thread_tid_to_tcb(parent, tcb_va, 0);
-                    mod::sched::task::destroy_unpublished_user_thread(t);
-                    return static_cast<uint64_t>(-ENOMEM);
-                }
-
-                // Group exit can race with THREAD_CREATE after its active-registry
-                // scan has passed this creator but before the new sibling is
-                // published. Inherit the creator's request after publication so
-                // the sibling cannot escape the process-wide exit.
-                static_cast<void>(ker::syscall::process::inherit_pending_process_exit_request(parent, t));
-                thread_pid = t->pid;
             }
 
             // wos_proc_exit() does not unwind C++ stack objects. Check only

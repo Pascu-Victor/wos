@@ -9,7 +9,9 @@
 #ifdef WOS_SELFTEST
 #include <memory>
 #endif
+#include <platform/asm/cpu.hpp>
 #include <platform/ktime/ktime.hpp>
+#include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/usercopy.hpp>
@@ -139,22 +141,53 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
     if (waiter == nullptr) {
         return static_cast<uint64_t>(-ESRCH);
     }
+    // A span follows this syscall continuation across park/resume. Its
+    // successful point names the returned child, with the same correlation as
+    // the waiting parent's begin/end; no borrowed child pointer is retained.
+    namespace perf = ker::mod::perf;
+    constexpr auto OP = static_cast<uint8_t>(perf::WkiPerfLocalProcOp::WAITPID);
+    bool const TRACE = perf::is_wki_scope_recording_enabled(perf::WkiPerfScope::LOCAL_PROC, OP);
+    uint32_t const CORRELATION = TRACE ? perf::next_wki_trace_correlation() : 0;
+    uint64_t const STARTED_US = TRACE ? ker::mod::time::get_us() : 0;
+    if (TRACE) {
+        perf::record_wki_event(static_cast<uint32_t>(ker::mod::cpu::current_cpu()), waiter->pid, perf::WkiPerfScope::LOCAL_PROC, OP,
+                               perf::WkiPerfPhase::BEGIN, 0, 0, CORRELATION, 0, static_cast<uint32_t>(options), WOS_PERF_CALLSITE());
+    }
+    auto finish_wait = [&](uint64_t result) -> uint64_t {
+        if (TRACE) {
+            auto const SIGNED_RESULT = static_cast<int64_t>(result);
+            int32_t const STATUS = SIGNED_RESULT < 0 ? static_cast<int32_t>(SIGNED_RESULT) : 0;
+            uint64_t const NOW_US = ker::mod::time::get_us();
+            uint64_t const ELAPSED_US = NOW_US >= STARTED_US ? NOW_US - STARTED_US : 0;
+            uint32_t const DURATION_US = ELAPSED_US > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(ELAPSED_US);
+            auto const CPU = static_cast<uint32_t>(ker::mod::cpu::current_cpu());
+            if (SIGNED_RESULT > 0) {
+                perf::record_wki_event(CPU, result, perf::WkiPerfScope::LOCAL_PROC, OP, perf::WkiPerfPhase::POINT, 0, 0, CORRELATION, 0, 0,
+                                       WOS_PERF_CALLSITE());
+            }
+            perf::record_wki_event(CPU, waiter->pid, perf::WkiPerfScope::LOCAL_PROC, OP, perf::WkiPerfPhase::END, 0, 0, CORRELATION, STATUS,
+                                   DURATION_US, WOS_PERF_CALLSITE());
+            perf::record_wki_summary(perf::WkiPerfScope::LOCAL_PROC, OP, 0, 0, STATUS, DURATION_US, true, 0, 0);
+        }
+        return result;
+    };
+
     if (!outputs_writable(*waiter, status, rusage_vaddr)) {
-        return static_cast<uint64_t>(-EFAULT);
+        return finish_wait(static_cast<uint64_t>(-EFAULT));
     }
 
     sched_task::Task* const OWNER = events::acquire_process_owner(*waiter);
     if (OWNER == nullptr) {
-        return static_cast<uint64_t>(-ECHILD);
+        return finish_wait(static_cast<uint64_t>(-ECHILD));
     }
     if (auto const REMOTE = wait_remote(pid, *OWNER, *waiter, status, options, rusage_vaddr)) {
         OWNER->release();
-        return *REMOTE;
+        return finish_wait(*REMOTE);
     }
     events::Selector selector{};
     if (!wait_selector(pid, *OWNER, selector)) {
         OWNER->release();
-        return static_cast<uint64_t>(-EINVAL);
+        return finish_wait(static_cast<uint64_t>(-EINVAL));
     }
 
     bool const NOHANG = (options & events::OPTION_NOHANG) != 0;
@@ -167,31 +200,31 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
                 events::release_claim(*waiter, claimed);
                 events::cancel_wait(*waiter);
                 OWNER->release();
-                return static_cast<uint64_t>(-EFAULT);
+                return finish_wait(static_cast<uint64_t>(-EFAULT));
             }
             if (!events::commit_claim(*OWNER, *waiter, claimed, NOWAIT)) {
                 events::cancel_wait(*waiter);
                 OWNER->release();
-                return static_cast<uint64_t>(-EINTR);
+                return finish_wait(static_cast<uint64_t>(-EINTR));
             }
             events::cancel_wait(*waiter);
             OWNER->release();
-            return claimed.subject_pid;
+            return finish_wait(claimed.subject_pid);
         }
         if (PROBE == events::ProbeResult::NO_CHILD) {
             events::cancel_wait(*waiter);
             OWNER->release();
-            return static_cast<uint64_t>(-ECHILD);
+            return finish_wait(static_cast<uint64_t>(-ECHILD));
         }
         if (NOHANG) {
             events::cancel_wait(*waiter);
             OWNER->release();
-            return 0;
+            return finish_wait(0);
         }
         if (waiter->has_interrupting_signal_pending()) {
             events::cancel_wait(*waiter);
             OWNER->release();
-            return static_cast<uint64_t>(-EINTR);
+            return finish_wait(static_cast<uint64_t>(-EINTR));
         }
 
         ker::mod::sched::preemptible_syscall_park("waitpid", sched_task::WaitChannelKind::WAITPID);

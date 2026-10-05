@@ -484,8 +484,24 @@ add_test(
 )
 
 add_test(
+    NAME waitpid_telemetry_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/waitpid_telemetry_test.py
+)
+add_test(
     NAME exec_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/exec_source_test.py
+)
+add_test(
+    NAME fork_child_trace_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/fork_child_trace_test.py
+)
+add_test(
+    NAME fork_failure_diagnostics_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/fork_failure_diagnostics_test.py
+)
+add_test(
+    NAME fork_stack_pressure_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/fork_stack_pressure_test.py
 )
 add_test(
     NAME gc_epoch_progress_test
@@ -886,7 +902,11 @@ set_tests_properties(    host_test_manifest_test
     poll_deadline_source_test
     futex_source_test
     waitpid_source_test
+    waitpid_telemetry_test
     exec_source_test
+    fork_child_trace_test
+    fork_failure_diagnostics_test
+    fork_stack_pressure_test
     gc_epoch_progress_test
     scheduler_source_test
     preempt_guard_timing_test
@@ -1258,6 +1278,12 @@ set_tests_properties(perf_capture_io_test PROPERTIES LABELS "unit;host")
 add_test(NAME perf_run_observer_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/perf_run_observer_test.py)
 set_tests_properties(perf_run_observer_test PROPERTIES LABELS "unit;host")
+
+add_test(
+    NAME thread_stack_pressure_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/thread_stack_pressure_test.py
+)
+set_tests_properties(thread_stack_pressure_test PROPERTIES LABELS "host;source")
 
 add_test(
     NAME scheduler_epoch_progress_test

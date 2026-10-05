@@ -192,7 +192,11 @@ UNIT_TESTS=(
     poll_deadline_source_test
     futex_source_test
     waitpid_source_test
+    waitpid_telemetry_test
     exec_source_test
+    fork_child_trace_test
+    fork_failure_diagnostics_test
+    fork_stack_pressure_test
     gc_epoch_progress_test
     scheduler_source_test
     kernel_wait_accounting_runtime_test
@@ -311,6 +315,7 @@ UNIT_TESTS=(
     mlibc_slab_runtime_test
     perf_event_parser_test
     scheduler_epoch_progress_test
+    thread_stack_pressure_test
     vmem_cache_perf_runtime_test
 )
 

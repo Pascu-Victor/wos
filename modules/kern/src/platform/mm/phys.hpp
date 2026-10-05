@@ -205,6 +205,12 @@ auto page_alloc_full_overwrite_page_with_reclaim_may_fail(PhysicalPageOwner owne
                                                           uint32_t retry_count = PAGE_ALLOC_RECLAIM_RETRY_DEFAULT) -> void*;
 auto page_alloc_huge(PhysicalPageOwner owner, uint64_t size) -> void*;  // Try the optional huge page zone, if enabled.
 auto kernel_stack_alloc(std::string_view name = "kernel_stack") -> void*;
+struct KernelStackPoolStatsSnapshot {
+    uint64_t capacity = 0;
+    uint64_t free_slots = 0;
+    uint64_t high_watermark = 0;
+};
+auto get_kernel_stack_pool_stats() -> KernelStackPoolStatsSnapshot;
 void page_free(void* page);
 auto can_wait_for_reclaim() -> bool;
 auto page_split_to_order0(void* page) -> bool;

@@ -1983,6 +1983,18 @@ void init_kernel_stack_pool() {
               arena_bytes);
 }
 
+auto get_kernel_stack_pool_stats() -> KernelStackPoolStatsSnapshot {
+    auto& pool = kernel_stack_pool;
+    uint64_t const FLAGS = pool.lock.lock_irqsave();
+    KernelStackPoolStatsSnapshot const SNAPSHOT{
+        .capacity = pool.capacity,
+        .free_slots = pool.free_count,
+        .high_watermark = pool.high_watermark,
+    };
+    pool.lock.unlock_irqrestore(FLAGS);
+    return SNAPSHOT;
+}
+
 auto kernel_stack_alloc(std::string_view name) -> void* {
     (void)name;
     auto& pool = kernel_stack_pool;

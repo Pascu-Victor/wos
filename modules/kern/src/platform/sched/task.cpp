@@ -1416,9 +1416,15 @@ auto Task::initialize_process_image(const ker::loader::elf::ElfFileView& elf, co
 }
 
 Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_sp, uint64_t enter_thread_va, uint64_t entry_va,
-                               uint64_t user_arg_va) {
+                               uint64_t user_arg_va, bool* stack_exhausted) {
+    if (stack_exhausted != nullptr) {
+        *stack_exhausted = false;
+    }
     auto const KSTACK_BASE = reinterpret_cast<uint64_t>(mm::phys::kernel_stack_alloc("user_thread_kstack"));
     if (KSTACK_BASE == 0) {
+        if (stack_exhausted != nullptr) {
+            *stack_exhausted = true;
+        }
         dbg::log("createUserThread: OOM allocating kernel stack");
         return nullptr;
     }

@@ -273,7 +273,7 @@ def test_waitpid_is_a_current_context_claim_usercopy_commit_loop() -> None:
     )
     require_order(syscall, "copy_outputs(*waiter, status, rusage_vaddr, claimed)", "events::commit_claim", "usercopy before consume")
     release_pos = syscall.find("events::release_claim(*waiter, claimed)")
-    fault_pos = syscall.find("return static_cast<uint64_t>(-EFAULT)", release_pos)
+    fault_pos = syscall.find("return finish_wait(static_cast<uint64_t>(-EFAULT))", release_pos)
     if release_pos < 0 or fault_pos < release_pos:
         fail("EFAULT must release the claim and keep the event retryable")
     forbid_tokens(

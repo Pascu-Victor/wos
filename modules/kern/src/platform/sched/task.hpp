@@ -271,8 +271,9 @@ struct Task {
     // tcbVaddr: virtual address of the mlibc TCB (becomes FS base / fsbase).
     // userSp:   prepared stack pointer (sys_prepare_stack pushed entry+user_arg below it).
     // enterThreadVa: virtual address of __mlibc_enter_thread in the process image.
+    // stack_exhausted: optional kernel-only failure classification for bounded reclaim.
     static auto create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_sp, uint64_t enter_thread_va, uint64_t entry_va,
-                                   uint64_t user_arg_va) -> Task*;
+                                   uint64_t user_arg_va, bool* stack_exhausted = nullptr) -> Task*;
 
     Task(const Task& task) = delete;
 
