@@ -66,6 +66,13 @@ an explicit pause/block rule.
 | 38 | [Disaggregated guest memory](38-wki-disaggregated-guest-memory.md) | remote RAM providers, EPT/NPT cache, page ownership | 25 on transport; 33, 36, 40 on MM/EPT/NPT | Not started |
 | 39 | [Isolated service compartments](39-isolated-service-compartments.md) | mount/PID/IPC namespaces, lifecycle, authority, launcher | 19 on credentials; 26 on VFS policy | Not started |
 | 40 | [NUMA placement and safe large pages](40-numa-memory-locality.md) | SRAT/SLIT, CPU domains, page policy, compound lifetime | 33, 36, 38 on VM/MM/Task state | Not started |
+| 41 | [Physical GPU platform](41-physical-gpu-platform.md) | PCI resources/reset, firmware, device mmap, AMD-Vi, IRQ remap | 20 on DMA/IOMMU; 40 on VM/page lifetime | Not started |
+| 42 | [DRM-compatible GPU kernel core](42-drm-gpu-kernel-core.md) | DRM uAPI, GEM/GPUVM, dma-buf, syncobj, scheduler, KMS | 21, 22, 41 on MM/security/device state | Not started |
+| 43 | [Mesa and windowed graphics platform](43-mesa-graphics-platform.md) | libdrm, Mesa, Vulkan/EGL/GL, LLVM/Rust, Wayland/WSI | 11, 23, 42; vendor userland integration | Not started |
+| 44 | [AMD amdgpu/RADV/RadeonSI graphics](44-amd-amdgpu-mesa-vulkan.md) | AMD firmware/IP, VRAM/GPUVM/rings, display, Vulkan/GL | 41–43; 45 on shared amdgpu state | Not started |
+| 45 | [AMD ROCm HSA/HIP compute](45-amd-rocm-hsa-hip.md) | amdkfd, HSA queues/memory, ROCr, HIP/LLVM, rocBLAS | 41, 44 on IOMMU/MM/amdgpu/reset | Not started |
+| 46 | [NVIDIA Nouveau/NVK/Zink graphics](46-nvidia-nouveau-nvk.md) | Nouveau/NVKM, GSP, VRAM/GPUVM, NVK/NAK/Zink, display | 41–43; 47 on exclusive GPU ownership | Not started |
+| 47 | [NVIDIA open KMD and CUDA runtime](47-nvidia-cuda-driver-stack.md) | NVIDIA RM/UVM OS layer, proprietary libcuda ABI, CUDA | 41; 46 on exclusive GPU ownership | Not started |
 
 ## New platform goals: 33–40
 
@@ -101,6 +108,33 @@ splitting one guest's vCPUs concurrently across physical hosts requires a
 further memory-consistency design and is not promised by these contracts.
 Each goal targets approximately 168–336 hours of continuous primary-agent work
 with bounded subagents, without treating time spent as proof of completion.
+
+## Physical GPU program: 41–47
+
+Goals 41–47 were investigated on 2026-09-23. Read the shared
+[physical GPU architecture and evaluation](GPU-ARCHITECTURE.md) before selecting
+one. These are multi-quarter program contracts, not ordinary package ports; their
+individual effort estimates supersede the portfolio's usual one-to-two-week
+planning size while retaining the same evidence-based completion rule.
+
+The supported device is a complete physical PCI function owned by WOS, either on
+bare metal or assigned whole to a WOS guest by an external Linux KVM/VFIO host.
+No virtio-gpu, virgl, Venus, mediated device, SR-IOV VF or host API forwarding can
+satisfy physical-driver acceptance. WOS consuming a passed-through GPU does not
+depend on goals 33–34. Conversely, making WOS pass a GPU onward to its own guests
+is a future device-assignment goal and remains outside both programs.
+
+The common path is **41 → 42 → 43**. AMD graphics is goal 44 and ROCm/KFD/HIP is
+goal 45. NVIDIA open graphics is goal 46. Genuine CUDA is goal 47 and uses
+NVIDIA's open RM/UVM kernel source plus exactly matching, lawfully obtained
+proprietary `libcuda` and firmware; Mesa/NVK does not implement CUDA. Goals 46
+and 47 are alternative owners of one NVIDIA GPU and must not bind it concurrently.
+
+Every vendor claim names exact PCI IDs, firmware/VBIOS hashes, driver revisions,
+IOMMU/BAR configuration and execution environment. A Mesa build, software
+renderer, mocked ioctl, emulated GPU or single triangle is only a milestone.
+Physical runtime/debug evidence is mandatory and remains user-run under the
+current repository instructions.
 
 ## Status authority
 
@@ -155,3 +189,25 @@ that documentation discrepancy when their work touches KTEST configuration.
 
 This directory is intentionally ignored by the root `.gitignore`; it is local
 planning material unless a later task explicitly chooses to publish it.
+
+## Stability and launch-overhead work
+
+The broad stability continuation was replaced at the user's request by a focused
+launch-overhead goal. That replacement is complete: serial FIFO batching retains
+synchronous journal completion and reduced the rejection-log median from 1.250
+to 1.060 ms in the final private comparison. The balanced placement launch
+median of eight group medians fell from 3.900 to 3.763 ms. Direct, locally and
+homeward timings increased slightly; no general speedup or matched Linux ratio
+is claimed. Ordinary placement launch overhead remains above roughly 1 ms.
+
+Normal and diagnostic builds, focused host harnesses, a fresh isolated KTEST
+(66,705 assertions, zero failures, three existing skips), SSH and visible idle
+checks passed in that goal. All owned VMs were closed. Positive trusted compute,
+physical hardware and broader topology qualification remain outside that result.
+
+The implementation is documented in [runtime-linker startup milestones](../docs/goal48_rtld_stages.md),
+[wait accounting](../docs/goal48_wait_accounting.md),
+[WKI retry ownership](../docs/goal50_origin_replay.md) and
+[perf capture](../docs/perf_capture.md). The final local evidence receipt is
+`build/goal48-launch-performance-result-v87/goal-result-proof.json`; chronological
+experiments and immutable raw archives remain referenced by the local handoffs.
