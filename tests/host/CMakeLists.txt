@@ -1081,6 +1081,10 @@ wos_add_unit_test(perf_data_test
 target_include_directories(perf_data_test PRIVATE ${WOS_ROOT}/modules/perf/src)
 target_link_libraries(perf_data_test PRIVATE wos::telemetry)
 
+add_test(NAME perf_event_parser_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/perf_event_parser_test.py)
+set_tests_properties(perf_event_parser_test PROPERTIES LABELS "unit;host")
+
 # ---------------------------------------------------------------------------
 # Fuzz targets
 # ---------------------------------------------------------------------------
@@ -1121,3 +1125,24 @@ wos_add_fuzz_target(perf_data_fuzz
 )
 target_include_directories(perf_data_fuzz PRIVATE ${WOS_ROOT}/modules/perf/src)
 target_link_libraries(perf_data_fuzz PRIVATE wos::telemetry)
+
+add_test(NAME perf_capture_kernel_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/perf_capture_kernel_test.py)
+set_tests_properties(perf_capture_kernel_test PROPERTIES LABELS "unit;host")
+wos_add_unit_test(perf_capture_policy_test
+    SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/perf_capture_policy_test.cpp
+        ${WOS_ROOT}/modules/perf/src/capture_policy.cpp
+        ${WOS_ROOT}/modules/perf/src/observer.cpp
+        ${WOS_ROOT}/modules/perf/src/perf_data.cpp
+)
+target_include_directories(perf_capture_policy_test PRIVATE ${WOS_ROOT}/modules/perf/src)
+target_link_libraries(perf_capture_policy_test PRIVATE wos::telemetry)
+
+add_test(NAME perf_capture_io_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/perf_capture_io_test.py)
+set_tests_properties(perf_capture_io_test PROPERTIES LABELS "unit;host")
+
+add_test(NAME perf_run_observer_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/perf_run_observer_test.py)
+set_tests_properties(perf_run_observer_test PROPERTIES LABELS "unit;host")

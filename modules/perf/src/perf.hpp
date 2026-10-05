@@ -28,6 +28,7 @@
 #include <utility>
 #include <vector>
 
+#include "capture.hpp"
 #include "perf_data.hpp"
 #include "perf_event_json.hpp"
 
@@ -97,6 +98,7 @@ constexpr std::string_view PROC_IMAGES_SUFFIX = "/images";
 constexpr std::string_view PROC_TASK_SUFFIX = "/task";
 constexpr std::string_view KPERF_PATH = "/proc/kperf";
 constexpr std::string_view KPERFCTL_PATH = "/proc/kperfctl";
+constexpr std::string_view KPERFSTATUS_PATH = "/proc/kperfstatus";
 constexpr std::string_view KWKISTAT_PATH = "/proc/kwkistat";
 constexpr std::string_view KIPCSTAT_PATH = "/proc/kipcstat";
 constexpr std::string_view KCPUSTAT_PATH = "/proc/kcpustat";
@@ -456,7 +458,7 @@ void wall_sleep_ms(int target_ms);
 auto open_readonly(std::string_view path) -> ScopedFd;
 auto open_writeonly(std::string_view path) -> ScopedFd;
 auto open_write_trunc(std::string_view path, mode_t mode = PERF_DATA_MODE) -> ScopedFd;
-void write_all(int fd, std::string_view text);
+auto write_all(int fd, std::string_view text) -> bool;
 auto read_limit_for_path(std::string_view path) -> std::size_t;
 auto read_fd(ScopedFd& fd, std::size_t initial_capacity = INITIAL_FILE_CAPACITY, std::size_t max_bytes = PERF_DATA_READ_LIMIT)
     -> std::optional<std::string>;
@@ -481,18 +483,18 @@ auto read_cmdline(uint64_t pid) -> std::string;
 auto read_proc_images(uint64_t pid) -> std::string;
 auto proc_map_line(uint64_t pid, std::string_view comm, std::string_view cmdline) -> std::string;
 auto peer_map_line(uint64_t peer, std::string_view hostname) -> std::string;
-void write_section_timebase(int fd);
+auto write_section_timebase(int fd) -> bool;
 auto collect_live_wki_peer_map() -> std::vector<WkiPeerMapEntry>;
-void write_section_proc_map(int fd);
+auto write_section_proc_map(int fd) -> bool;
 auto write_section_events(int fd) -> ssize_t;
 auto write_section_wki_summary(int fd) -> ssize_t;
 auto write_section_ipc_stats(int fd) -> ssize_t;
 auto write_section_contstat(int fd) -> ssize_t;
 auto write_section_memacc_alloc_totals(int fd) -> ssize_t;
-void write_section_peer_map(int fd);
-void write_section_image_map(int fd, const std::vector<TrackedProc>* tracked = nullptr);
+auto write_section_peer_map(int fd) -> bool;
+auto write_section_image_map(int fd, const std::vector<TrackedProc>* tracked = nullptr) -> bool;
 auto save_perf_data() -> bool;
-void set_recording_enabled(bool enabled, const char* filter = nullptr);
+auto set_recording_enabled(bool enabled, const char* filter = nullptr) -> bool;
 
 auto parse_proc_map_section(std::string_view buffer) -> std::vector<ProcMapEntry>;
 auto parse_image_map_line(std::string_view line, ImageMapEntry& out) -> bool;

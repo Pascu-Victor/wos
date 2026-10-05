@@ -1269,17 +1269,21 @@ def test_optional_perf_diagnostics_preserve_invalid_utf8(runner) -> None:
             for entry in [*cpustat_entries, *report_entries]:
                 assert_equal(entry["status"], "ok", "diagnostic capture status")
                 assert_equal(entry["returncode"], 0, "diagnostic capture return code")
+                artifacts = {}
+                for field in ("stdout_file", "stderr_file", "metadata_file"):
+                    path = Path(entry[field])
+                    artifacts[field] = path if path.is_absolute() else ROOT / path
                 assert_equal(
-                    Path(entry["stdout_file"]).read_text(encoding="utf-8"),
+                    artifacts["stdout_file"].read_text(encoding="utf-8"),
                     "stdout:\\xb4\n",
                     "diagnostic stdout preserves invalid UTF-8",
                 )
                 assert_equal(
-                    Path(entry["stderr_file"]).read_text(encoding="utf-8"),
+                    artifacts["stderr_file"].read_text(encoding="utf-8"),
                     "stderr:\\xb5\n",
                     "diagnostic stderr preserves invalid UTF-8",
                 )
-                metadata = json.loads(Path(entry["metadata_file"]).read_text(encoding="utf-8"))
+                metadata = json.loads(artifacts["metadata_file"].read_text(encoding="utf-8"))
                 assert_equal(metadata["status"], "ok", "diagnostic metadata status")
                 assert_equal(metadata["artifacts"], entry["artifacts"], "diagnostic metadata artifacts")
     finally:

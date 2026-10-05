@@ -170,6 +170,9 @@ enum class WkiPerfComputeOp : uint8_t {
     TASK_RUNTIME = 11,
     PROXY_READY_WAIT = 12,
     COMPLETE_HOLD = 13,
+    SUBMIT_WAIT_RETURN = 14,
+    SUBMIT_REJECTION_LOG_BEGIN = 15,
+    SUBMIT_REJECTION_LOG_END = 16,
 };
 
 enum class WkiPerfEventOp : uint8_t {
@@ -223,8 +226,20 @@ enum class WkiPerfLocalProcOp : uint8_t {
     STACK_SETUP = 11,
     COMMIT = 12,
     DESTROY_OLD = 13,
+    // BEGIN: waiting parent's PID, aux=options. POINT: returned child's PID,
+    // same correlation, only for a positive return. END: waiting parent's PID,
+    // status=errno/0, aux=saturated wall duration in us (including parks).
     WAITPID = 14,
     EXIT = 15,
+    // POINTs share the enclosing native EXECVE correlation. OWNER uses the
+    // canonical execution PID; USER_RETURN retains the preparing subject PID.
+    EXEC_IMAGE_OWNER = 16,
+    EXEC_USER_RETURN = 17,
+    // POINT: full-width child PID, correlation of the successful parent FORK
+    // span, aux=child CPU. Emitted by the parent after publication succeeds.
+    FORK_CHILD = 18,
+    // POINT: canonical owner PID, native EXECVE correlation, aux=userspace milestone.
+    USERSPACE_STAGE = 19,
 };
 
 enum class WkiPerfLocalVmemOp : uint8_t {
@@ -238,6 +253,7 @@ enum class WkiPerfLocalVmemOp : uint8_t {
     COW_ZERO = 8,
     COW_COPY = 9,
     COW_PROMOTE = 10,
+    VAS_OBSERVE = 11,
 };
 
 enum class WkiPerfLocalLoaderOp : uint8_t {
@@ -459,7 +475,9 @@ constexpr size_t PERF_MAX_CPUS = 16;
 struct PerfCpuRing {
     PerfCpuStatsAtomic stats;
     uint64_t head;                        // Monotonically-increasing write index
-    uint64_t drain;                       // Consumer read index (advances on drain_events)
+    uint64_t drain;                       // Consumer read index (advances only after accepting an event)
+    uint64_t consumed{};                  // Accepted by consumers since reset
+    uint64_t overwritten{};               // Unread events overwritten since reset
     ker::mod::sys::Spinlock lock;         // IRQ-safe spinlock protecting head/drain/events
     PerfEvent events[PERF_RING_ENTRIES];  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
 };
@@ -480,6 +498,20 @@ void init();
 bool is_enabled();
 void enable();
 void disable();
+// Atomically disable/reset/set the mask/enable a fresh recording session.
+void start_recording(uint16_t mask);
+struct PerfCaptureStatus {
+    uint64_t session{};
+    uint64_t control_version{};
+    uint64_t cpus{};
+    uint64_t written{};
+    uint64_t consumed{};
+    uint64_t overwritten{};
+    uint64_t pending{};
+    uint16_t mask{};
+    bool enabled{};
+};
+PerfCaptureStatus get_capture_status();
 // Reset all ring buffers (clear head/drain/events) without affecting stats counters.
 // Called before enable() to ensure report only contains events from the new session.
 void reset_rings();
@@ -502,9 +534,17 @@ void record_sleep(uint32_t cpu, uint64_t pid, uint64_t wake_at_us, uint8_t flags
 
 // Drain up to max_events events into dst.
 // cpu_filter < get_num_perf_cpus() -> drain only that CPU.
-// cpu_filter == UINT32_MAX   -> drain all CPUs round-robin.
+// cpu_filter == UINT32_MAX   -> drain all CPUs in CPU-index order.
 // Returns number of events written.  Advances each ring's drain cursor.
 size_t drain_events(PerfEvent* dst, size_t max_events, uint32_t cpu_filter);
+
+// A sink accepts one complete event before its cursor advances. It runs with
+// that CPU ring's IRQ-safe lock held for one event only, and must not allocate,
+// block, log, read clocks, take another lock, or re-enter perf. False leaves the
+// rejected event queued and stops the drain. Calls are serialized with writers
+// and other consumers; a successful event is consumed exactly once.
+using PerfEventSink = bool (*)(const PerfEvent&, void*);
+size_t drain_events_to(PerfEventSink sink, void* context, size_t max_events, uint32_t cpu_filter);
 
 // Read per-CPU aggregate stats (non-destructive).
 PerfCpuStats get_cpu_stats(uint32_t cpu);
@@ -546,10 +586,13 @@ uint32_t wki_unpack_trace_correlation(int64_t packed);
 int32_t wki_unpack_trace_status(int64_t packed);
 
 uint32_t next_wki_trace_correlation();
+constexpr uint64_t PERF_ANY_SESSION = UINT64_MAX;
+// Disabled/excluded recording returns PERF_ANY_SESSION; session zero is valid.
+auto current_wki_capture_session(WkiPerfScope scope, uint8_t op) -> uint64_t;
 void record_wki_event(uint32_t cpu, uint64_t pid, WkiPerfScope scope, uint8_t op, WkiPerfPhase phase, uint16_t peer, uint16_t channel,
-                      uint32_t correlation, int32_t status, uint32_t aux, uint64_t callsite);
+                      uint32_t correlation, int32_t status, uint32_t aux, uint64_t callsite, uint64_t expected_session = PERF_ANY_SESSION);
 void record_wki_summary(WkiPerfScope scope, uint8_t op, uint16_t peer, uint16_t channel, int32_t status, uint32_t latency_us,
-                        bool has_latency, uint32_t retries, uint64_t bytes);
+                        bool has_latency, uint32_t retries, uint64_t bytes, uint64_t expected_session = PERF_ANY_SESSION);
 void record_local_xfs_summary(WkiPerfLocalXfsOp op, int32_t status, uint32_t latency_us, bool has_latency, uint64_t bytes);
 void record_local_irq_summary(WkiPerfLocalIrqOp op, uint16_t vector, uint16_t kind, int32_t status, uint32_t latency_us, bool has_latency);
 size_t get_wki_summary_snapshots(WkiPerfSummarySnapshot* dst, size_t max);

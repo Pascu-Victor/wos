@@ -128,6 +128,7 @@ constexpr auto diagnostic_access(ProcNodeType type) -> DiagnosticAccess {
         case ProcNodeType::MEMACC_RECLAIM_COORDINATOR_FILE:
         case ProcNodeType::LIMITS_FILE:
             return DiagnosticAccess::PUBLIC_READ;
+        case ProcNodeType::KPERFSTATUS_FILE:
         case ProcNodeType::KPERF_FILE:
         case ProcNodeType::KWKISTAT_FILE:
         case ProcNodeType::KCPUSTATE_FILE:
@@ -5484,143 +5485,180 @@ void append_perf_callsite(PerfEventTextWriter& writer, uint64_t callsite) {
 //   W <ts_ns> <cpu> <pid> <wake_at_us> <sleep_us> <flags> <callsite> <wait_channel> WAKE
 //   B <ts_ns> <cpu> <pid> <wake_at_us> <run_us>   <flags> <callsite> <wait_channel> SLEEP
 //   K <ts_ns> <cpu> <pid> <scope> <op> <phase> <peer> <channel> <corr> <status> <aux> <callsite>
-auto generate_kperf(char* buf, size_t bufsz) -> size_t {
-    char* p = buf;
-    char* end = buf + bufsz - 1;
+struct PerfTextOutput {
+    char* cursor;
+    char* end;
+};
 
-    std::array<ker::mod::perf::PerfEvent, 64> batch{};
-    size_t n = 0;
-    bool output_full = false;
-    while (!output_full && (n = ker::mod::perf::drain_events(batch.data(), 64, UINT32_MAX)) > 0) {
-        for (size_t i = 0; i < n; ++i) {
-            const auto& ev = batch[i];
-            char* const EVENT_START = p;
-            PerfEventTextWriter writer(p, end);
-            // Determine event letter
-            char letter = '?';
-            switch (static_cast<ker::mod::perf::PerfEventType>(ev.type)) {
-                case ker::mod::perf::PerfEventType::SAMPLE:
-                    letter = 'S';
-                    break;
-                case ker::mod::perf::PerfEventType::SWITCH:
-                    letter = 'X';
-                    break;
-                case ker::mod::perf::PerfEventType::WAKE:
-                    letter = 'W';
-                    break;
-                case ker::mod::perf::PerfEventType::SLEEP:
-                    letter = 'B';
-                    break;
-                case ker::mod::perf::PerfEventType::CONTAINER_STAT:
-                    letter = 'C';
-                    break;
-                case ker::mod::perf::PerfEventType::WKI:
-                    letter = 'K';
-                    break;
-            }
-            writer.append(letter);
-            writer.append(' ');
-            writer.append_dec(ev.ts_ns);
-            writer.append(' ');
-            writer.append_dec(ev.cpu);
-            writer.append(' ');
-            // Type-specific fields
-            if (static_cast<ker::mod::perf::PerfEventType>(ev.type) == ker::mod::perf::PerfEventType::SAMPLE) {
-                writer.append_dec(ev.pid);
-                writer.append(' ');
-                writer.append_hex(ev.data);  // RIP
-                writer.append(' ');
-                writer.append_signed(ev.lag_v);
-                writer.append(' ');
-                writer.append_dec(ev.flags);
-            } else if (static_cast<ker::mod::perf::PerfEventType>(ev.type) == ker::mod::perf::PerfEventType::SWITCH) {
-                writer.append_dec(ev.pid);  // prev
-                writer.append(' ');
-                writer.append_dec(ev.data);  // next
-                writer.append(' ');
-                writer.append_dec(static_cast<uint64_t>(ev.lag_v >= 0 ? ev.lag_v : 0U));
-                writer.append(' ');
-                writer.append_dec(ev.flags);
-                writer.append(' ');
-                writer.append_dec(ev.aux);
-                writer.append(' ');
-                append_perf_callsite(writer, ev.callsite);
-            } else if (static_cast<ker::mod::perf::PerfEventType>(ev.type) == ker::mod::perf::PerfEventType::CONTAINER_STAT) {
-                // CONTAINER_STAT: C <ts> <cpu> <pid> <subsys_name> <flags> <count> <capacity> <callsite>
-                auto const SUBSYS_ID = static_cast<uint8_t>(ev.data >> 32);
-                writer.append_dec(ev.pid);
-                writer.append(' ');
-                writer.append(ker::mod::perf::subsystem_name(static_cast<ker::mod::perf::PerfSubsystem>(SUBSYS_ID)));
-                writer.append(' ');
-                writer.append_dec(ev.flags);
-                writer.append(' ');
-                writer.append_signed(ev.lag_v);
-                writer.append(' ');
-                writer.append_dec(ev.aux);
-                writer.append(' ');
-                append_perf_callsite(writer, ev.callsite);
-            } else if (static_cast<ker::mod::perf::PerfEventType>(ev.type) == ker::mod::perf::PerfEventType::WKI) {
-                ker::mod::perf::WkiPerfScope scope = ker::mod::perf::WkiPerfScope::NONE;
-                ker::mod::perf::WkiPerfPhase phase = ker::mod::perf::WkiPerfPhase::POINT;
-                uint8_t op = 0;
-                uint16_t peer = 0;
-                uint16_t channel = 0;
-                ker::mod::perf::wki_unpack_event_data(ev.data, scope, op, phase, peer, channel);
-
-                writer.append_dec(ev.pid);
-                writer.append(' ');
-                writer.append(ker::mod::perf::wki_scope_name(scope));
-                writer.append(' ');
-                writer.append(ker::mod::perf::wki_op_name(scope, op));
-                writer.append(' ');
-                writer.append(ker::mod::perf::wki_phase_name(phase));
-                writer.append(' ');
-                writer.append_dec(peer);
-                writer.append(' ');
-                writer.append_dec(channel);
-                writer.append(' ');
-                writer.append_dec(ker::mod::perf::wki_unpack_trace_correlation(ev.lag_v));
-                writer.append(' ');
-                writer.append_signed(ker::mod::perf::wki_unpack_trace_status(ev.lag_v));
-                writer.append(' ');
-                writer.append_dec(ev.aux);
-                writer.append(' ');
-                if (scope == ker::mod::perf::WkiPerfScope::LOCAL_VMEM ||
-                    (scope == ker::mod::perf::WkiPerfScope::LOCAL_LOADER &&
-                     (op == static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalLoaderOp::PT_LOAD_MAIN) ||
-                      op == static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalLoaderOp::PT_LOAD_INTERP)))) {
-                    writer.append_hex(ev.callsite);
-                } else {
-                    append_perf_callsite(writer, ev.callsite);
-                }
-            } else {
-                // WAKE or SLEEP
-                writer.append_dec(ev.pid);
-                writer.append(' ');
-                writer.append_dec(ev.data);  // wakeAtUs
-                writer.append(' ');
-                writer.append_dec(ev.aux);
-                writer.append(' ');
-                writer.append_dec(ev.flags);
-                writer.append(' ');
-                append_perf_callsite(writer, ev.callsite);
-                writer.append(' ');
-                auto const* wait_channel = reinterpret_cast<const char*>(static_cast<uint64_t>(ev.lag_v));
-                writer.append(wait_channel != nullptr ? wait_channel : "-");
-            }
-            writer.append('\n');
-            if (!writer.complete()) {
-                p = EVENT_START;
-                output_full = true;
-                break;
-            }
-        }
-        if (n < 64) {
-            break;  // ring drained
-        }
+auto append_perf_event(const ker::mod::perf::PerfEvent& ev, void* context) -> bool {
+    auto& output = *static_cast<PerfTextOutput*>(context);
+    char* const EVENT_START = output.cursor;
+    PerfEventTextWriter writer(output.cursor, output.end);
+    // Determine event letter
+    char letter = '?';
+    switch (static_cast<ker::mod::perf::PerfEventType>(ev.type)) {
+        case ker::mod::perf::PerfEventType::SAMPLE:
+            letter = 'S';
+            break;
+        case ker::mod::perf::PerfEventType::SWITCH:
+            letter = 'X';
+            break;
+        case ker::mod::perf::PerfEventType::WAKE:
+            letter = 'W';
+            break;
+        case ker::mod::perf::PerfEventType::SLEEP:
+            letter = 'B';
+            break;
+        case ker::mod::perf::PerfEventType::CONTAINER_STAT:
+            letter = 'C';
+            break;
+        case ker::mod::perf::PerfEventType::WKI:
+            letter = 'K';
+            break;
     }
-    *p = '\0';
-    return static_cast<size_t>(p - buf);
+    writer.append(letter);
+    writer.append(' ');
+    writer.append_dec(ev.ts_ns);
+    writer.append(' ');
+    writer.append_dec(ev.cpu);
+    writer.append(' ');
+    // Type-specific fields
+    if (static_cast<ker::mod::perf::PerfEventType>(ev.type) == ker::mod::perf::PerfEventType::SAMPLE) {
+        writer.append_dec(ev.pid);
+        writer.append(' ');
+        writer.append_hex(ev.data);  // RIP
+        writer.append(' ');
+        writer.append_signed(ev.lag_v);
+        writer.append(' ');
+        writer.append_dec(ev.flags);
+    } else if (static_cast<ker::mod::perf::PerfEventType>(ev.type) == ker::mod::perf::PerfEventType::SWITCH) {
+        writer.append_dec(ev.pid);  // prev
+        writer.append(' ');
+        writer.append_dec(ev.data);  // next
+        writer.append(' ');
+        writer.append_dec(static_cast<uint64_t>(ev.lag_v >= 0 ? ev.lag_v : 0U));
+        writer.append(' ');
+        writer.append_dec(ev.flags);
+        writer.append(' ');
+        writer.append_dec(ev.aux);
+        writer.append(' ');
+        append_perf_callsite(writer, ev.callsite);
+    } else if (static_cast<ker::mod::perf::PerfEventType>(ev.type) == ker::mod::perf::PerfEventType::CONTAINER_STAT) {
+        // CONTAINER_STAT: C <ts> <cpu> <pid> <subsys_name> <flags> <count> <capacity> <callsite>
+        auto const SUBSYS_ID = static_cast<uint8_t>(ev.data >> 32);
+        writer.append_dec(ev.pid);
+        writer.append(' ');
+        writer.append(ker::mod::perf::subsystem_name(static_cast<ker::mod::perf::PerfSubsystem>(SUBSYS_ID)));
+        writer.append(' ');
+        writer.append_dec(ev.flags);
+        writer.append(' ');
+        writer.append_signed(ev.lag_v);
+        writer.append(' ');
+        writer.append_dec(ev.aux);
+        writer.append(' ');
+        append_perf_callsite(writer, ev.callsite);
+    } else if (static_cast<ker::mod::perf::PerfEventType>(ev.type) == ker::mod::perf::PerfEventType::WKI) {
+        ker::mod::perf::WkiPerfScope scope = ker::mod::perf::WkiPerfScope::NONE;
+        ker::mod::perf::WkiPerfPhase phase = ker::mod::perf::WkiPerfPhase::POINT;
+        uint8_t op = 0;
+        uint16_t peer = 0;
+        uint16_t channel = 0;
+        ker::mod::perf::wki_unpack_event_data(ev.data, scope, op, phase, peer, channel);
+
+        writer.append_dec(ev.pid);
+        writer.append(' ');
+        writer.append(ker::mod::perf::wki_scope_name(scope));
+        writer.append(' ');
+        writer.append(ker::mod::perf::wki_op_name(scope, op));
+        writer.append(' ');
+        writer.append(ker::mod::perf::wki_phase_name(phase));
+        writer.append(' ');
+        writer.append_dec(peer);
+        writer.append(' ');
+        writer.append_dec(channel);
+        writer.append(' ');
+        writer.append_dec(ker::mod::perf::wki_unpack_trace_correlation(ev.lag_v));
+        writer.append(' ');
+        writer.append_signed(ker::mod::perf::wki_unpack_trace_status(ev.lag_v));
+        writer.append(' ');
+        writer.append_dec(ev.aux);
+        writer.append(' ');
+        if (scope == ker::mod::perf::WkiPerfScope::LOCAL_VMEM ||
+            (scope == ker::mod::perf::WkiPerfScope::LOCAL_LOADER &&
+             (op == static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalLoaderOp::PT_LOAD_MAIN) ||
+              op == static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalLoaderOp::PT_LOAD_INTERP)))) {
+            writer.append_hex(ev.callsite);
+        } else {
+            append_perf_callsite(writer, ev.callsite);
+        }
+    } else {
+        // WAKE or SLEEP
+        writer.append_dec(ev.pid);
+        writer.append(' ');
+        writer.append_dec(ev.data);  // wakeAtUs
+        writer.append(' ');
+        writer.append_dec(ev.aux);
+        writer.append(' ');
+        writer.append_dec(ev.flags);
+        writer.append(' ');
+        append_perf_callsite(writer, ev.callsite);
+        writer.append(' ');
+        auto const* wait_channel = reinterpret_cast<const char*>(static_cast<uint64_t>(ev.lag_v));
+        writer.append(wait_channel != nullptr ? wait_channel : "-");
+    }
+    writer.append('\n');
+    if (!writer.complete()) {
+        output.cursor = EVENT_START;
+        return false;
+    }
+    return true;
+}
+
+auto generate_kperf(char* buf, size_t bufsz) -> size_t {
+    if (bufsz == 0) {
+        return 0;
+    }
+    PerfTextOutput output{buf, buf + bufsz - 1};
+    // Each cursor advances only after a complete line fits. The sink holds one
+    // ring lock for one event, formats into this bounded buffer, and takes no
+    // other locks. Rejected events remain queued for the next snapshot.
+    while (ker::mod::perf::drain_events_to(append_perf_event, &output, 64, UINT32_MAX) == 64) {
+    }
+    *output.cursor = '\0';
+    return static_cast<size_t>(output.cursor - buf);
+}
+
+auto generate_kperfstatus(char* buf, size_t bufsz) -> size_t {
+    if (bufsz == 0) {
+        return 0;
+    }
+    auto const STATUS = ker::mod::perf::get_capture_status();
+    char* cursor = buf;
+    PerfEventTextWriter writer(cursor, buf + bufsz - 1);
+    writer.append("perf_capture version=1 session=");
+    writer.append_dec(STATUS.session);
+    writer.append(" control_version=");
+    writer.append_dec(STATUS.control_version);
+    writer.append(" enabled=");
+    writer.append_dec(STATUS.enabled ? 1 : 0);
+    writer.append(" mask=");
+    writer.append_dec(STATUS.mask);
+    writer.append(" cpus=");
+    writer.append_dec(STATUS.cpus);
+    writer.append(" written=");
+    writer.append_dec(STATUS.written);
+    writer.append(" consumed=");
+    writer.append_dec(STATUS.consumed);
+    writer.append(" overwritten=");
+    writer.append_dec(STATUS.overwritten);
+    writer.append(" pending=");
+    writer.append_dec(STATUS.pending);
+    writer.append('\n');
+    if (!writer.complete()) {
+        cursor = buf;
+    }
+    *cursor = '\0';
+    return static_cast<size_t>(cursor - buf);
 }
 
 // Generate content for /proc/kcpustat
@@ -6313,6 +6351,9 @@ auto procfs_read_with_credentials(const ker::mod::security::Snapshot& credential
             case ProcNodeType::KPERFCTL_FILE:
                 pfd->content_len = generate_kperfctl(pfd->content, MAX_PROCFS_BUF);
                 break;
+            case ProcNodeType::KPERFSTATUS_FILE:
+                pfd->content_len = generate_kperfstatus(pfd->content, MAX_PROCFS_BUF);
+                break;
             case ProcNodeType::KCONTSTAT_FILE:
                 pfd->content_len = generate_kcontstat(pfd->content, MAX_KPERF_BUF);
                 break;
@@ -6775,20 +6816,18 @@ auto procfs_write_with_credentials(const ker::mod::security::Snapshot& credentia
     // Accept "enable", "enable <filter>", "mask <filter>", or "disable"
     const char* s = static_cast<const char*>(buf);
     if (count >= 6 && memcmp(s, "enable", 6) == 0) {
+        uint16_t mask = ker::mod::perf::PERF_MASK_ALL;
         // Check for optional filter: "enable switch,wake,container"
         if (count > 7 && s[6] == ' ') {
             uint16_t const MASK = ker::mod::perf::parse_event_mask(s + 7, count - 7);
             if (MASK == 0) {
                 return -EINVAL;
             }
-            ker::mod::perf::set_event_mask(MASK);
-        } else {
-            ker::mod::perf::set_event_mask(ker::mod::perf::PERF_MASK_ALL);
+            mask = MASK;
         }
         // Reset ring buffers on fresh enable so report only sees the new session
-        ker::mod::perf::reset_rings();
         ker::vfs::vfs_reset_local_pipe_perf_counters();
-        ker::mod::perf::enable();
+        ker::mod::perf::start_recording(mask);
     } else if (count >= 4 && memcmp(s, "mask", 4) == 0) {
         // Change mask without resetting rings or toggling enable: "mask switch,container"
         if (count > 5 && s[4] == ' ') {
@@ -7627,6 +7666,11 @@ auto procfs_lookup_path_as(const char* path, uint64_t caller_pid, int flags, Pro
     // /proc/kperf - drain kernel perf ring buffer as text events
     if (strcmp(path, "kperf") == 0) {
         return make_file(ProcNodeType::KPERF_FILE, 0, false);
+    }
+
+    // /proc/kperfstatus - recording session, loss and consumer counters
+    if (strcmp(path, "kperfstatus") == 0) {
+        return make_file(ProcNodeType::KPERFSTATUS_FILE, 0, false);
     }
 
     // /proc/kwkistat - recording-scoped WKI summary statistics

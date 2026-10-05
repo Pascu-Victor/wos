@@ -140,6 +140,7 @@ auto cmd_run(int argc, char** argv) -> bool {
     // Parse --filter=... option (strip from argv before exec)
     const char* filter = "switch,wake,sleep";  // default: no container spam
     bool structured = false;
+    bool observer_stages = false;
     bool options_done = false;
     WkiDisplayOptions display_options{};
     std::vector<char*> cmd_argv;
@@ -153,6 +154,8 @@ auto cmd_run(int argc, char** argv) -> bool {
             filter = argv[i] + 9;
         } else if (ARG == "--structured") {
             structured = true;
+        } else if (ARG == "--observer-stages") {
+            observer_stages = true;
         } else if (parse_display_arg(ARG, display_options)) {
             continue;
         } else {
@@ -207,7 +210,22 @@ auto cmd_run(int argc, char** argv) -> bool {
 
     auto before = collect_main_stats();
     int64_t const START_MS = now_ms();
-    set_recording_enabled(true, filter);
+    auto capture = begin_capture(filter);
+    if (capture.control_failed) {
+        std::println("perf run: cannot enable /proc/kperfctl");
+        return false;
+    }
+    if (observer_stages) {
+        auto& trace = capture.run_observer.emplace();
+        trace.parent_pid = static_cast<uint64_t>(getpid());
+        trace.spans.reserve(RUN_OBSERVER_SPAN_LIMIT);
+    }
+    auto observe = [&](std::optional<RunObserverPhase> next, std::optional<int64_t> result = std::nullopt) {
+        if (!capture.run_observer) return;
+        auto& trace = *capture.run_observer;
+        auto sample = trace.spans.size() < RUN_OBSERVER_SPAN_LIMIT ? read_clock_ns(CLOCK_MONOTONIC) : std::nullopt;
+        advance_run_observer(trace, next, sample, result);
+    };
 
     int64_t child_pid = ker::process::fork();
     if (child_pid == 0) {
@@ -226,6 +244,8 @@ auto cmd_run(int argc, char** argv) -> bool {
         return false;
     }
 
+    if (capture.run_observer) capture.run_observer->child_pid = static_cast<uint64_t>(child_pid);
+    observe(RunObserverPhase::PARENT_SETUP);
     ker::process::setpgid(child_pid, child_pid);
     int64_t target_pgid = child_pid;
     std::println("perf run: tracing pgid={} cmd={}", target_pgid, exec_path);
@@ -234,8 +254,22 @@ auto cmd_run(int argc, char** argv) -> bool {
     install_perf_run_signal_handlers(signal_handlers);
 
     std::vector<TrackedProc> tracked;
-    auto upsert_tracked = [&](const StatInfo& stat) {
+    auto scan_stats = [&](RunObserverPhase scan_phase) {
+        observe(RunObserverPhase::PROC_STATS);
+        auto stats = collect_main_stats();
+        observe(scan_phase);
+        return stats;
+    };
+    auto scan_cmdline = [&](uint64_t pid, RunObserverPhase scan_phase) {
+        observe(RunObserverPhase::PROC_CMDLINE);
+        auto cmdline = read_cmdline(pid);
+        observe(scan_phase);
+        return cmdline;
+    };
+    auto upsert_tracked = [&](const StatInfo& stat, RunObserverPhase scan_phase) {
+        observe(RunObserverPhase::PROC_IMAGES);
         std::string image_map = read_proc_images(stat.pid);
+        observe(scan_phase);
         for (auto& proc : tracked) {
             if (proc.pid == stat.pid) {
                 proc.last_utime = stat.utime;
@@ -251,23 +285,25 @@ auto cmd_run(int argc, char** argv) -> bool {
         tracked.push_back(TrackedProc{
             .pid = stat.pid,
             .comm = stat.comm,
-            .cmdline = read_cmdline(stat.pid),
+            .cmdline = scan_cmdline(stat.pid, scan_phase),
             .image_map = std::move(image_map),
             .last_utime = stat.utime,
             .last_stime = stat.stime,
         });
     };
 
+    observe(RunObserverPhase::DATA_OPEN);
     ScopedFd data_fd = open_write_trunc(PERF_DATA_FILE);
     bool output_ok = data_fd.valid();
+    observe(RunObserverPhase::TIMEBASE_WRITE);
     if (data_fd.valid()) {
-        write_section_timebase(data_fd.get());
-        write_all(data_fd.get(), SECTION_EVENTS);
+        capture.write_failed = !write_section_timebase(data_fd.get());
+        capture.write_failed = !write_all(data_fd.get(), SECTION_EVENTS) || capture.write_failed;
     }
 
     int32_t status = 0;
     int64_t last_drain_ms = now_ms();
-    ssize_t total_event_bytes = 0;
+
     bool command_exited = false;
     bool last_group_alive = false;
     int64_t last_proc_scan_ms = 0;
@@ -275,11 +311,11 @@ auto cmd_run(int argc, char** argv) -> bool {
     bool cancel_escalated = false;
     int64_t cancel_forwarded_ms = 0;
 
-    auto scan_target_group = [&]() {
+    auto scan_target_group = [&](RunObserverPhase scan_phase) {
         bool any_alive = false;
-        for (const auto& stat : collect_main_stats()) {
+        for (const auto& stat : scan_stats(scan_phase)) {
             if (std::cmp_equal(stat.pgid, target_pgid)) {
-                upsert_tracked(stat);
+                upsert_tracked(stat, scan_phase);
                 if (stat.state != EXITED_STATE) {
                     any_alive = true;
                 }
@@ -289,11 +325,14 @@ auto cmd_run(int argc, char** argv) -> bool {
         last_proc_scan_ms = now_ms();
     };
 
-    scan_target_group();
+    observe(RunObserverPhase::INITIAL_SCAN);
+    scan_target_group(RunObserverPhase::INITIAL_SCAN);
 
     for (;;) {
         for (;;) {
+            observe(RunObserverPhase::WAIT_PROBE);
             int64_t const REAPED = waitpid_nohang(-1, &status);
+            observe(RunObserverPhase::LOOP_CONTROL, REAPED);
             if (REAPED <= 0) {
                 break;
             }
@@ -317,7 +356,9 @@ auto cmd_run(int argc, char** argv) -> bool {
             }
         }
         if (command_exited || LOOP_NOW_MS - last_proc_scan_ms >= PERF_RUN_PROC_SCAN_INTERVAL_MS) {
-            scan_target_group();
+            observe(RunObserverPhase::GROUP_SCAN);
+            scan_target_group(RunObserverPhase::GROUP_SCAN);
+            observe(RunObserverPhase::LOOP_CONTROL);
         }
 
         if (cancel_forwarded && !cancel_escalated && last_group_alive &&
@@ -331,26 +372,30 @@ auto cmd_run(int argc, char** argv) -> bool {
             break;
         }
 
+        observe(RunObserverPhase::SLEEP);
         wall_sleep_ms(SLEEP_SLICE_MS);
+        observe(RunObserverPhase::LOOP_CONTROL);
         if (data_fd.valid() && now_ms() - last_drain_ms >= DRAIN_INTERVAL_MS) {
-            auto events = read_file(KPERF_PATH, PERF_DRAIN_CAPACITY);
-            if (events.has_value() && !events->empty()) {
-                write_all(data_fd.get(), *events);
-                total_event_bytes += static_cast<ssize_t>(events->size());
-            }
+            observe(RunObserverPhase::RING_DRAIN);
+            (void)drain_capture(data_fd.get(), capture);
             last_drain_ms = now_ms();
+            observe(RunObserverPhase::LOOP_CONTROL);
         }
     }
 
+    observe(RunObserverPhase::FINAL_REAP);
     while (waitpid_nohang(-1, &status) > 0) {
     }
 
     int64_t elapsed_ms = now_ms() - START_MS;
     elapsed_ms = std::max<int64_t>(elapsed_ms, 1);
 
-    set_recording_enabled(false);
+    observe(RunObserverPhase::CAPTURE_STOP);
+    capture.control_failed = !set_recording_enabled(false) || capture.control_failed;
     restore_perf_run_signal_handlers(signal_handlers);
+    observe(RunObserverPhase::FINAL_STATS);
     auto after = collect_main_stats();
+    observe(RunObserverPhase::FINAL_REPORT);
     std::vector<CpuRow> rows;
 
     for (const auto& proc : tracked) {
@@ -429,23 +474,22 @@ auto cmd_run(int argc, char** argv) -> bool {
     std::println("");
 
     if (data_fd.valid()) {
-        auto events = read_file(KPERF_PATH, PERF_DRAIN_CAPACITY);
-        if (events.has_value() && !events->empty()) {
-            write_all(data_fd.get(), *events);
-            total_event_bytes += static_cast<ssize_t>(events->size());
-        }
-
-        write_all(data_fd.get(), SECTION_EVENTS_END);
+        observe(RunObserverPhase::FINAL_DRAIN);
+        finish_capture(data_fd.get(), capture);
+        observe(std::nullopt);
+        capture.write_failed = !write_all(data_fd.get(), SECTION_EVENTS_END) || capture.write_failed;
+        auto const TOTAL_EVENT_BYTES = static_cast<ssize_t>(capture.saved_bytes);
         ssize_t const SUMMARY_BYTES = write_section_wki_summary(data_fd.get());
         ssize_t const IPC_BYTES = write_section_ipc_stats(data_fd.get());
         ssize_t const CONTSTAT_BYTES = write_section_contstat(data_fd.get());
         ssize_t const MEMACC_BYTES = write_section_memacc_alloc_totals(data_fd.get());
         ssize_t const DIAG_BYTES = CONTSTAT_BYTES + MEMACC_BYTES;
-        write_section_peer_map(data_fd.get());
-        write_all(data_fd.get(), SECTION_PROC_MAP);
+        capture.write_failed = !write_section_peer_map(data_fd.get()) || capture.write_failed;
+        capture.write_failed = !write_all(data_fd.get(), SECTION_PROC_MAP) || capture.write_failed;
 
         for (const auto& stat : collect_main_stats()) {
-            write_all(data_fd.get(), proc_map_line(stat.pid, stat.comm, read_cmdline(stat.pid)));
+            capture.write_failed =
+                !write_all(data_fd.get(), proc_map_line(stat.pid, stat.comm, read_cmdline(stat.pid))) || capture.write_failed;
         }
 
         for (const auto& proc : tracked) {
@@ -457,18 +501,20 @@ auto cmd_run(int argc, char** argv) -> bool {
                 }
             }
             if (!alive) {
-                write_all(data_fd.get(), proc_map_line(proc.pid, proc.comm, proc.cmdline));
+                capture.write_failed = !write_all(data_fd.get(), proc_map_line(proc.pid, proc.comm, proc.cmdline)) || capture.write_failed;
             }
         }
 
-        write_all(data_fd.get(), SECTION_PROC_MAP_END);
-        write_section_image_map(data_fd.get(), &tracked);
+        capture.write_failed = !write_all(data_fd.get(), SECTION_PROC_MAP_END) || capture.write_failed;
+        capture.write_failed = !write_section_image_map(data_fd.get(), &tracked) || capture.write_failed;
+        capture.write_failed = SUMMARY_BYTES < 0 || IPC_BYTES < 0 || CONTSTAT_BYTES < 0 || MEMACC_BYTES < 0 || capture.write_failed;
+        output_ok = write_capture_receipt(data_fd.get(), capture) && output_ok;
 
-        if (total_event_bytes <= 0 && SUMMARY_BYTES <= 0 && IPC_BYTES <= 0 && DIAG_BYTES <= 0) {
+        if (TOTAL_EVENT_BYTES <= 0 && SUMMARY_BYTES <= 0 && IPC_BYTES <= 0 && DIAG_BYTES <= 0) {
             std::println("perf: ring buffer empty - PROC_MAP saved, no events");
         } else {
             std::println("perf: saved to {} ({} event bytes, {} summary bytes, {} IPC bytes, {} diag bytes)", PERF_DATA_FILE,
-                         total_event_bytes, SUMMARY_BYTES, IPC_BYTES, DIAG_BYTES);
+                         TOTAL_EVENT_BYTES, SUMMARY_BYTES, IPC_BYTES, DIAG_BYTES);
         }
         data_fd.reset();
         if (structured && !finalize_structured_perf_data()) {

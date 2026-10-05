@@ -20,10 +20,13 @@ include_directories(
 # Source files
 set(SOURCES
     src/args.cpp
+    src/capture.cpp
+    src/capture_policy.cpp
     src/commands.cpp
     src/data.cpp
     src/main.cpp
     src/map.cpp
+    src/observer.cpp
     src/perf_data.cpp
     src/perf_event_json.cpp
     src/run.cpp

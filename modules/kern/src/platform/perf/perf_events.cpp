@@ -23,6 +23,11 @@ std::atomic<bool> g_enabled{false};
 // Event type mask: bitmask of PerfEventType/local scope values to record.
 // Default: all types enabled. Only checked when g_enabled is true.
 std::atomic<uint16_t> g_event_mask{PERF_MASK_ALL};
+// Control -> ring/summary is the only nested lock order. Producers never take
+// the control lock; their admission is rechecked inside the ring lock.
+ker::mod::sys::Spinlock g_capture_control_lock;
+std::atomic<uint64_t> g_capture_session{0};
+uint64_t g_capture_control_version = 0;
 
 // Static ring buffers — dynamically allocated at init() time based on actual CPU count.
 PerfCpuRing* g_rings = nullptr;
@@ -77,7 +82,9 @@ void perf_push_event(PerfCpuRing& ring, const PerfEvent& evt) {
     ring.head++;
     ring.stats.ring_writes.fetch_add(1, std::memory_order_relaxed);
     if ((ring.head - ring.drain) > PERF_RING_ENTRIES) {
-        ring.drain = ring.head - PERF_RING_ENTRIES;
+        uint64_t const NEW_DRAIN = ring.head - PERF_RING_ENTRIES;
+        ring.overwritten += NEW_DRAIN - ring.drain;
+        ring.drain = NEW_DRAIN;
     }
 }
 
@@ -247,6 +254,9 @@ auto wki_is_launch_measurement_event(WkiPerfScope scope, uint8_t op) -> bool {
         case WkiPerfComputeOp::TASK_RUNTIME:
         case WkiPerfComputeOp::PROXY_READY_WAIT:
         case WkiPerfComputeOp::COMPLETE_HOLD:
+        case WkiPerfComputeOp::SUBMIT_WAIT_RETURN:
+        case WkiPerfComputeOp::SUBMIT_REJECTION_LOG_BEGIN:
+        case WkiPerfComputeOp::SUBMIT_REJECTION_LOG_END:
             return true;
         default:
             return false;
@@ -555,6 +565,14 @@ const char* wki_op_name(WkiPerfScope scope, uint8_t op) {
                     return "waitpid";
                 case WkiPerfLocalProcOp::EXIT:
                     return "exit";
+                case WkiPerfLocalProcOp::EXEC_IMAGE_OWNER:
+                    return "exec_image_owner";
+                case WkiPerfLocalProcOp::EXEC_USER_RETURN:
+                    return "exec_user_return";
+                case WkiPerfLocalProcOp::FORK_CHILD:
+                    return "fork_child";
+                case WkiPerfLocalProcOp::USERSPACE_STAGE:
+                    return "userspace_stage";
                 default:
                     return "unknown";
             }
@@ -580,6 +598,8 @@ const char* wki_op_name(WkiPerfScope scope, uint8_t op) {
                     return "cow_copy";
                 case WkiPerfLocalVmemOp::COW_PROMOTE:
                     return "cow_promote";
+                case WkiPerfLocalVmemOp::VAS_OBSERVE:
+                    return "address_space_observe";
                 default:
                     return "unknown";
             }
@@ -726,6 +746,12 @@ const char* wki_op_name(WkiPerfScope scope, uint8_t op) {
                     return "proxy_ready_wait";
                 case WkiPerfComputeOp::COMPLETE_HOLD:
                     return "complete_hold";
+                case WkiPerfComputeOp::SUBMIT_WAIT_RETURN:
+                    return "submit_wait_return";
+                case WkiPerfComputeOp::SUBMIT_REJECTION_LOG_BEGIN:
+                    return "submit_rejection_log_begin";
+                case WkiPerfComputeOp::SUBMIT_REJECTION_LOG_END:
+                    return "submit_rejection_log_end";
                 default:
                     return "unknown";
             }
@@ -794,12 +820,25 @@ void init() {
 }
 
 bool is_enabled() { return g_enabled.load(std::memory_order_acquire); }
-void enable() { g_enabled.store(true, std::memory_order_release); }
-void disable() { g_enabled.store(false, std::memory_order_release); }
+void enable() {
+    auto const FLAGS = g_capture_control_lock.lock_irqsave();
+    g_enabled.store(true, std::memory_order_release);
+    ++g_capture_control_version;
+    g_capture_control_lock.unlock_irqrestore(FLAGS);
+}
+void disable() {
+    auto const FLAGS = g_capture_control_lock.lock_irqsave();
+    g_enabled.store(false, std::memory_order_release);
+    ++g_capture_control_version;
+    g_capture_control_lock.unlock_irqrestore(FLAGS);
+}
 
 size_t get_num_perf_cpus() { return g_num_cpus; }
 
-void reset_rings() {
+namespace {
+// Caller owns the control lock and has disabled recording.
+void reset_rings_locked() {
+    g_capture_session.fetch_add(1, std::memory_order_release);
     // IRQ-safe reset of all ring head/drain pointers.
     // Stats counters are NOT cleared - they accumulate across sessions for /proc/kcpustat.
     for (size_t i = 0; i < g_num_cpus; ++i) {
@@ -807,6 +846,8 @@ void reset_rings() {
         auto saved = ring.lock.lock_irqsave();
         ring.head = 0;
         ring.drain = 0;
+        ring.consumed = 0;
+        ring.overwritten = 0;
         ring.lock.unlock_irqrestore(saved);
     }
 
@@ -829,6 +870,49 @@ void reset_rings() {
     reset_local_xfs_summary();
     g_wki_trace_correlation.store(1, std::memory_order_release);
     g_wki_summary_lock.unlock_irqrestore(saved);
+}
+
+}  // namespace
+
+void reset_rings() {
+    auto const FLAGS = g_capture_control_lock.lock_irqsave();
+    bool const WAS_ENABLED = g_enabled.exchange(false, std::memory_order_acq_rel);
+    reset_rings_locked();
+    g_enabled.store(WAS_ENABLED, std::memory_order_release);
+    ++g_capture_control_version;
+    g_capture_control_lock.unlock_irqrestore(FLAGS);
+}
+
+void start_recording(uint16_t mask) {
+    auto const FLAGS = g_capture_control_lock.lock_irqsave();
+    g_enabled.store(false, std::memory_order_release);
+    g_event_mask.store(mask, std::memory_order_release);
+    reset_rings_locked();
+    g_enabled.store(true, std::memory_order_release);
+    ++g_capture_control_version;
+    g_capture_control_lock.unlock_irqrestore(FLAGS);
+}
+
+PerfCaptureStatus get_capture_status() {
+    auto const FLAGS = g_capture_control_lock.lock_irqsave();
+    PerfCaptureStatus result{
+        .session = g_capture_session.load(std::memory_order_acquire),
+        .control_version = g_capture_control_version,
+        .cpus = g_num_cpus,
+    };
+    result.mask = g_event_mask.load(std::memory_order_acquire);
+    result.enabled = g_enabled.load(std::memory_order_acquire);
+    for (size_t c = 0; c < g_num_cpus; ++c) {
+        auto& ring = g_rings[c];
+        auto const RING_FLAGS = ring.lock.lock_irqsave();
+        result.written += ring.head;
+        result.consumed += ring.consumed;
+        result.overwritten += ring.overwritten;
+        result.pending += ring.head - ring.drain;
+        ring.lock.unlock_irqrestore(RING_FLAGS);
+    }
+    g_capture_control_lock.unlock_irqrestore(FLAGS);
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -855,7 +939,13 @@ void record_sample(uint32_t cpu, uint64_t pid, uint64_t rip, bool user_mode, int
         return;
     }
 
+    uint64_t const SESSION = g_capture_session.load(std::memory_order_acquire);
     auto saved = ring.lock.lock_irqsave();
+    if (!g_enabled.load(std::memory_order_acquire) || SESSION != g_capture_session.load(std::memory_order_acquire) ||
+        (g_event_mask.load(std::memory_order_relaxed) & PERF_MASK_SAMPLE) == 0) {
+        ring.lock.unlock_irqrestore(saved);
+        return;
+    }
     PerfEvent evt{};
     evt.ts_ns = ker::mod::time::get_monotonic_ns();
     evt.pid = pid;
@@ -900,7 +990,13 @@ void record_switch(uint32_t cpu, uint64_t prev_pid, uint64_t next_pid, uint8_t f
         return;
     }
 
+    uint64_t const SESSION = g_capture_session.load(std::memory_order_acquire);
     auto saved = ring.lock.lock_irqsave();
+    if (!g_enabled.load(std::memory_order_acquire) || SESSION != g_capture_session.load(std::memory_order_acquire) ||
+        (g_event_mask.load(std::memory_order_relaxed) & PERF_MASK_SWITCH) == 0) {
+        ring.lock.unlock_irqrestore(saved);
+        return;
+    }
     PerfEvent evt{};
     evt.ts_ns = ker::mod::time::get_monotonic_ns();
     evt.pid = prev_pid;
@@ -937,7 +1033,13 @@ void record_wake(uint32_t cpu, uint64_t pid, uint64_t wake_at_us, uint8_t flags,
         return;
     }
 
+    uint64_t const SESSION = g_capture_session.load(std::memory_order_acquire);
     auto saved = ring.lock.lock_irqsave();
+    if (!g_enabled.load(std::memory_order_acquire) || SESSION != g_capture_session.load(std::memory_order_acquire) ||
+        (g_event_mask.load(std::memory_order_relaxed) & PERF_MASK_WAKE) == 0) {
+        ring.lock.unlock_irqrestore(saved);
+        return;
+    }
     PerfEvent evt{};
     evt.ts_ns = ker::mod::time::get_monotonic_ns();
     evt.pid = pid;
@@ -974,7 +1076,13 @@ void record_sleep(uint32_t cpu, uint64_t pid, uint64_t wake_at_us, uint8_t flags
         return;
     }
 
+    uint64_t const SESSION = g_capture_session.load(std::memory_order_acquire);
     auto saved = ring.lock.lock_irqsave();
+    if (!g_enabled.load(std::memory_order_acquire) || SESSION != g_capture_session.load(std::memory_order_acquire) ||
+        (g_event_mask.load(std::memory_order_relaxed) & PERF_MASK_SLEEP) == 0) {
+        ring.lock.unlock_irqrestore(saved);
+        return;
+    }
     PerfEvent evt{};
     evt.ts_ns = ker::mod::time::get_monotonic_ns();
     evt.pid = pid;
@@ -1004,8 +1112,38 @@ size_t drain_events(PerfEvent* dst, size_t max_events, uint32_t cpu_filter) {
         while (ring.drain < ring.head && total < max_events) {
             dst[total++] = ring.events[ring.drain & PERF_RING_MASK];
             ring.drain++;
+            ++ring.consumed;
         }
         ring.lock.unlock_irqrestore(saved);
+    }
+    return total;
+}
+
+size_t drain_events_to(PerfEventSink sink, void* context, size_t max_events, uint32_t cpu_filter) {
+    if (sink == nullptr) {
+        return 0;
+    }
+    size_t total = 0;
+    for (uint32_t c = 0; c < g_num_cpus && total < max_events; ++c) {
+        if (cpu_filter < g_num_cpus && c != cpu_filter) {
+            continue;
+        }
+        auto& ring = g_rings[c];
+        while (total < max_events) {
+            auto const FLAGS = ring.lock.lock_irqsave();
+            if (ring.drain >= ring.head) {
+                ring.lock.unlock_irqrestore(FLAGS);
+                break;
+            }
+            if (!sink(ring.events[ring.drain & PERF_RING_MASK], context)) {
+                ring.lock.unlock_irqrestore(FLAGS);
+                return total;
+            }
+            ++ring.drain;
+            ++ring.consumed;
+            ++total;
+            ring.lock.unlock_irqrestore(FLAGS);
+        }
     }
     return total;
 }
@@ -1043,7 +1181,13 @@ void record_container_stat(uint32_t cpu, uint64_t pid, PerfSubsystem subsystem, 
     }
 
     auto& ring = g_rings[cpu];
+    uint64_t const SESSION = g_capture_session.load(std::memory_order_acquire);
     auto saved = ring.lock.lock_irqsave();
+    if (!g_enabled.load(std::memory_order_acquire) || SESSION != g_capture_session.load(std::memory_order_acquire) ||
+        (g_event_mask.load(std::memory_order_relaxed) & PERF_MASK_CONTAINER) == 0) {
+        ring.lock.unlock_irqrestore(saved);
+        return;
+    }
 
     PerfEvent evt{};
     evt.ts_ns = ker::mod::time::get_monotonic_ns();
@@ -1116,8 +1260,13 @@ int32_t wki_unpack_trace_status(int64_t packed) { return static_cast<int32_t>(st
 
 uint32_t next_wki_trace_correlation() { return g_wki_trace_correlation.fetch_add(1, std::memory_order_relaxed); }
 
+auto current_wki_capture_session(WkiPerfScope scope, uint8_t op) -> uint64_t {
+    uint64_t const SESSION = g_capture_session.load(std::memory_order_acquire);
+    return is_wki_scope_recording_enabled(scope, op) ? SESSION : PERF_ANY_SESSION;
+}
+
 void record_wki_event(uint32_t cpu, uint64_t pid, WkiPerfScope scope, uint8_t op, WkiPerfPhase phase, uint16_t peer, uint16_t channel,
-                      uint32_t correlation, int32_t status, uint32_t aux, uint64_t callsite) {
+                      uint32_t correlation, int32_t status, uint32_t aux, uint64_t callsite, uint64_t expected_session) {
     if (cpu >= g_num_cpus || !g_enabled.load(std::memory_order_acquire)) {
         return;
     }
@@ -1128,7 +1277,16 @@ void record_wki_event(uint32_t cpu, uint64_t pid, WkiPerfScope scope, uint8_t op
     }
 
     auto& ring = g_rings[cpu];
+    uint64_t const SESSION = g_capture_session.load(std::memory_order_acquire);
+    if (expected_session != PERF_ANY_SESSION && expected_session != SESSION) {
+        return;
+    }
     auto saved = ring.lock.lock_irqsave();
+    if (!g_enabled.load(std::memory_order_acquire) || SESSION != g_capture_session.load(std::memory_order_acquire) ||
+        !wki_should_record(g_event_mask.load(std::memory_order_relaxed), scope, op)) {
+        ring.lock.unlock_irqrestore(saved);
+        return;
+    }
 
     PerfEvent evt{};
     evt.ts_ns = ker::mod::time::get_monotonic_ns();
@@ -1146,7 +1304,7 @@ void record_wki_event(uint32_t cpu, uint64_t pid, WkiPerfScope scope, uint8_t op
 }
 
 void record_wki_summary(WkiPerfScope scope, uint8_t op, uint16_t peer, uint16_t channel, int32_t status, uint32_t latency_us,
-                        bool has_latency, uint32_t retries, uint64_t bytes) {
+                        bool has_latency, uint32_t retries, uint64_t bytes, uint64_t expected_session) {
     if (!g_enabled.load(std::memory_order_acquire)) {
         return;
     }
@@ -1157,6 +1315,12 @@ void record_wki_summary(WkiPerfScope scope, uint8_t op, uint16_t peer, uint16_t 
     }
 
     auto saved = g_wki_summary_lock.lock_irqsave();
+    if (expected_session != PERF_ANY_SESSION &&
+        (!g_enabled.load(std::memory_order_acquire) || expected_session != g_capture_session.load(std::memory_order_acquire) ||
+         !wki_should_record(g_event_mask.load(std::memory_order_relaxed), scope, op))) {
+        g_wki_summary_lock.unlock_irqrestore(saved);
+        return;
+    }
     WkiPerfSummaryBucket* bucket = wki_get_or_create_summary_bucket(static_cast<uint8_t>(scope), op, peer, channel);
     if (bucket != nullptr) {
         bucket->calls++;
@@ -1309,7 +1473,12 @@ PerfSubsystemSnapshot get_subsystem_stats(PerfSubsystem subsystem) {
 // ---------------------------------------------------------------------------
 // Event mask control
 // ---------------------------------------------------------------------------
-void set_event_mask(uint16_t mask) { g_event_mask.store(mask, std::memory_order_release); }
+void set_event_mask(uint16_t mask) {
+    auto const FLAGS = g_capture_control_lock.lock_irqsave();
+    g_event_mask.store(mask, std::memory_order_release);
+    ++g_capture_control_version;
+    g_capture_control_lock.unlock_irqrestore(FLAGS);
+}
 
 uint16_t get_event_mask() { return g_event_mask.load(std::memory_order_acquire); }
 

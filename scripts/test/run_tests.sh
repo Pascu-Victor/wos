@@ -147,6 +147,10 @@ UNIT_TESTS=(
     journal_source_test
     wkictl_source_test
     perf_source_test
+    perf_capture_kernel_test
+    perf_capture_io_test
+    perf_capture_policy_test
+    perf_run_observer_test
     telemetry_test
     perf_data_test
     memacc_source_test
@@ -281,6 +285,7 @@ UNIT_TESTS=(
     reclaim_policy_test
     anonymous_swap_state_test
     vmem_source_test
+    perf_event_parser_test
 )
 
 list_targets() {

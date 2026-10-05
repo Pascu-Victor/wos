@@ -79,6 +79,7 @@ enum class ProcNodeType : uint8_t {
     MEMACC_RECLAIM_COORDINATOR_FILE,
     LIMITS_FILE,       // /proc/<pid>/limits and task aliases
     TIMEKEEPING_FILE,  // /proc/timekeeping -> clocksource and wall-clock discipline
+    KPERFSTATUS_FILE,  // /proc/kperfstatus -> recording session/loss/consumer counters
 };
 
 struct ProcNode {

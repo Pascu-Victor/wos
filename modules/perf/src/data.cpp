@@ -460,7 +460,8 @@ auto parse_event_line(std::string_view line, EventInfo& out) -> bool {
     constexpr int TOK_FLAGS = 5;
     constexpr int TOK_AUX = 6;
     constexpr int TOK_CALLSITE = 7;
-    constexpr int TOK_WAIT = 8;
+    constexpr int TOK_WAIT_CALLSITE = 6;
+    constexpr int TOK_WAIT_CHANNEL = 7;
     constexpr int TOK_SCOPE = 3;
     constexpr int TOK_OP = 4;
     constexpr int TOK_PHASE = 5;
@@ -530,11 +531,11 @@ auto parse_event_line(std::string_view line, EventInfo& out) -> bool {
             if (token_count >= EVENT_EXTENDED_TOKEN_COUNT) {
                 out.aux = parse_u32(tokens.at(TOK_LAG));
                 out.flags = parse_u8(tokens.at(TOK_FLAGS));
-                if (token_count >= TOK_CALLSITE + 1) {
-                    out.callsite = std::string(tokens.at(TOK_CALLSITE));
+                if (token_count >= TOK_WAIT_CALLSITE + 1) {
+                    out.callsite = std::string(tokens.at(TOK_WAIT_CALLSITE));
                 }
-                if (token_count >= TOK_WAIT + 1) {
-                    out.wait_channel = std::string(tokens.at(TOK_WAIT));
+                if (token_count >= TOK_WAIT_CHANNEL + 1) {
+                    out.wait_channel = std::string(tokens.at(TOK_WAIT_CHANNEL));
                 }
             } else {
                 out.flags = static_cast<uint8_t>((out.type == 'B' ? FLAG_BLOCK : 0U) | (out.data != 0 ? FLAG_TIMED : 0U));
@@ -654,6 +655,18 @@ auto build_typed_perf_events(std::string_view legacy_snapshot, std::string& erro
             return std::nullopt;
         }
         result.jsonl += *serialized;
+        result.jsonl.push_back('\n');
+        ++result.record_count;
+    }
+    auto receipt = capture_receipt_from_snapshot(legacy_snapshot, error);
+    if (!error.empty()) return std::nullopt;
+    if (receipt) {
+        if (result.record_count >= perf_data::MAX_TYPED_EVENT_RECORDS || result.jsonl.size() >= perf_data::MAX_TYPED_EVENTS_BYTES ||
+            receipt->size() > perf_data::MAX_TYPED_EVENTS_BYTES - result.jsonl.size() - 1) {
+            error = "capture receipt exceeds typed-events limits";
+            return std::nullopt;
+        }
+        result.jsonl += *receipt;
         result.jsonl.push_back('\n');
         ++result.record_count;
     }

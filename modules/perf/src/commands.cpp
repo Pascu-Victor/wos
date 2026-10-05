@@ -94,7 +94,7 @@ constexpr std::array<CommandSpec, 27> COMMANDS = {{
      .handler = run_all_trace_command},
     {.name = "vmem-trace", .args = "[n=200] [filters]", .summary = "Raw local vmem trace events", .handler = run_vmem_trace_command},
     {.name = "run",
-     .args = "[--filter=<filters>] [--time=FMT] [--structured] <cmd> [args]",
+     .args = "[--filter=<filters>] [--time=FMT] [--structured] [--observer-stages] <cmd> [args]",
      .summary = "Trace a command and descendants",
      .handler = run_run_command},
     {.name = "show-map", .args = "", .summary = "Show PID to command map from perf.data", .handler = run_show_map_command},

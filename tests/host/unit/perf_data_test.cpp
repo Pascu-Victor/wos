@@ -234,8 +234,7 @@ TEST(PerfDataTest, PartialLegacyRecordsAndSectionMarkersAreRejected) {
 }
 
 TEST(PerfDataTest, AtomicConversionPreservesInputOnRejection) {
-    std::array<char, 64> directory_template{};
-    std::ranges::copy(std::string_view("/tmp/wos-perf-data-test-XXXXXX"), directory_template.begin());
+    std::string directory_template = (std::filesystem::temp_directory_path() / "wos-perf-data-test-XXXXXX").string();
     char* created = mkdtemp(directory_template.data());
     ASSERT_NE(created, nullptr);
     std::filesystem::path const directory(created);
@@ -247,7 +246,9 @@ TEST(PerfDataTest, AtomicConversionPreservesInputOnRejection) {
     std::string const LEGACY = "--- SECTION EVENTS ---\n--- END EVENTS ---\n";
     {
         std::ofstream output(PATH, std::ios::binary);
+        ASSERT_TRUE(output);
         output << LEGACY;
+        ASSERT_TRUE(output);
     }
 
     std::string error;

@@ -305,7 +305,7 @@ def test_structured_perf_is_opt_in_atomic_and_legacy_projected() -> None:
     record_body = function_body(source, "cmd_record")
     require_tokens(
         record_body,
-        ["return !structured || finalize_structured_perf_data()"],
+        ["bool const STRUCTURED_OK = !structured || finalize_structured_perf_data()", "return CAPTURE_OK && STRUCTURED_OK"],
         "opt-in perf record failure propagation",
     )
     run_body = function_body(source, "cmd_run")
@@ -408,19 +408,24 @@ def test_kernel_kperf_formatter_is_transactionally_bounded() -> None:
         "bounded /proc/kperf event writer",
     )
 
-    formatter = function_body(procfs, "generate_kperf")
+    control = function_body(procfs, "procfs_write_with_credentials")
+    if control.find("vfs_reset_local_pipe_perf_counters()") > control.find("start_recording(mask)"):
+        fail("fresh capture must reset the pipe summary before enabling recording")
+    formatter = function_body(procfs, "append_perf_event")
     require_tokens(
         formatter,
         [
-            "char* const EVENT_START = p",
-            "PerfEventTextWriter writer(p, end)",
+            "char* const EVENT_START = output.cursor",
+            "PerfEventTextWriter writer(output.cursor, output.end)",
             "writer.append('\\n')",
             "if (!writer.complete())",
-            "p = EVENT_START",
-            "output_full = true",
+            "output.cursor = EVENT_START",
+            "return false",
         ],
         "transactional /proc/kperf formatter",
     )
+    require_tokens(function_body(procfs, "generate_kperf"), ["drain_events_to(append_perf_event", "*output.cursor = '\\0'"],
+                   "consume only completely formatted events")
     if "*p++" in formatter:
         fail("/proc/kperf formatting must not bypass the bounded event writer")
 

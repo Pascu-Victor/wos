@@ -11,6 +11,7 @@
 #include <platform/init/limine_requests.hpp>
 #include <platform/ktime/clockevent.hpp>
 #include <platform/ktime/ktime.hpp>
+#include <platform/perf/perf_events.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/frame_class.hpp>
 #include <platform/sched/preemption_policy.hpp>

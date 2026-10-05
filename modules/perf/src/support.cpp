@@ -181,15 +181,15 @@ auto open_write_trunc(std::string_view path, mode_t mode) -> ScopedFd {
     return ScopedFd(open(OWNED_PATH.c_str(), O_WRONLY | O_CREAT | O_TRUNC, mode));
 }
 
-void write_all(int fd, std::string_view text) {
+auto write_all(int fd, std::string_view text) -> bool {
     std::size_t written = 0;
     while (written < text.size()) {
         ssize_t const RC = write(fd, text.data() + written, text.size() - written);
-        if (RC <= 0) {
-            break;
-        }
+        if (RC < 0 && errno == EINTR) continue;
+        if (RC <= 0) return false;
         written += static_cast<std::size_t>(RC);
     }
+    return true;
 }
 
 auto read_limit_for_path(std::string_view path) -> std::size_t {
@@ -561,13 +561,11 @@ auto peer_map_line(uint64_t peer, std::string_view hostname) -> std::string {
     return line;
 }
 
-void write_section_timebase(int fd) {
-    write_all(fd, SECTION_TIMEBASE);
+auto write_section_timebase(int fd) -> bool {
     std::string line(REALTIME_OFFSET_NS_KEY);
     line += std::to_string(realtime_offset_ns());
     line += '\n';
-    write_all(fd, line);
-    write_all(fd, SECTION_TIMEBASE_END);
+    return write_all(fd, SECTION_TIMEBASE) && write_all(fd, line) && write_all(fd, SECTION_TIMEBASE_END);
 }
 
 auto collect_live_wki_peer_map() -> std::vector<WkiPeerMapEntry> {
@@ -604,23 +602,23 @@ auto collect_live_wki_peer_map() -> std::vector<WkiPeerMapEntry> {
     return entries;
 }
 
-void write_section_proc_map(int fd) {
-    write_all(fd, SECTION_PROC_MAP);
-    for_each_process_stat(
-        [&](const StatInfo& info, std::string_view) { write_all(fd, proc_map_line(info.pid, info.comm, read_cmdline(info.pid))); });
-    write_all(fd, SECTION_PROC_MAP_END);
+auto write_section_proc_map(int fd) -> bool {
+    bool ok = write_all(fd, SECTION_PROC_MAP);
+    for_each_process_stat([&](const StatInfo& info, std::string_view) {
+        ok = write_all(fd, proc_map_line(info.pid, info.comm, read_cmdline(info.pid))) && ok;
+    });
+    return write_all(fd, SECTION_PROC_MAP_END) && ok;
 }
 
 auto write_section_events(int fd) -> ssize_t {
-    auto events = read_file(KPERF_PATH, PERF_DRAIN_CAPACITY);
-    if (!events.has_value() || events->empty()) {
-        return 0;
-    }
-
-    write_all(fd, SECTION_EVENTS);
-    write_all(fd, *events);
-    write_all(fd, SECTION_EVENTS_END);
-    return static_cast<ssize_t>(events->size());
+    CaptureReceipt receipt;
+    receipt.requested_filter = "existing_session";
+    // No start was observed: a snapshot cannot claim complete capture coverage.
+    receipt.write_failed = !write_all(fd, SECTION_EVENTS);
+    finish_capture(fd, receipt);
+    receipt.write_failed = !write_all(fd, SECTION_EVENTS_END) || receipt.write_failed;
+    (void)write_capture_receipt(fd, receipt);
+    return static_cast<ssize_t>(receipt.saved_bytes);
 }
 
 auto write_section_wki_summary(int fd) -> ssize_t {
@@ -629,9 +627,7 @@ auto write_section_wki_summary(int fd) -> ssize_t {
         return 0;
     }
 
-    write_all(fd, SECTION_WKI_SUMMARY);
-    write_all(fd, *summary);
-    write_all(fd, SECTION_WKI_SUMMARY_END);
+    if (!write_all(fd, SECTION_WKI_SUMMARY) || !write_all(fd, *summary) || !write_all(fd, SECTION_WKI_SUMMARY_END)) return -1;
     return static_cast<ssize_t>(summary->size());
 }
 
@@ -641,9 +637,7 @@ auto write_section_ipc_stats(int fd) -> ssize_t {
         return 0;
     }
 
-    write_all(fd, SECTION_IPC_STATS);
-    write_all(fd, *stats);
-    write_all(fd, SECTION_IPC_STATS_END);
+    if (!write_all(fd, SECTION_IPC_STATS) || !write_all(fd, *stats) || !write_all(fd, SECTION_IPC_STATS_END)) return -1;
     return static_cast<ssize_t>(stats->size());
 }
 
@@ -653,9 +647,7 @@ auto write_section_contstat(int fd) -> ssize_t {
         return 0;
     }
 
-    write_all(fd, SECTION_CONTSTAT);
-    write_all(fd, *stats);
-    write_all(fd, SECTION_CONTSTAT_END);
+    if (!write_all(fd, SECTION_CONTSTAT) || !write_all(fd, *stats) || !write_all(fd, SECTION_CONTSTAT_END)) return -1;
     return static_cast<ssize_t>(stats->size());
 }
 
@@ -665,56 +657,45 @@ auto write_section_memacc_alloc_totals(int fd) -> ssize_t {
         return 0;
     }
 
-    write_all(fd, SECTION_MEMACC_ALLOC_TOTALS);
-    write_all(fd, *stats);
-    write_all(fd, SECTION_MEMACC_ALLOC_TOTALS_END);
+    if (!write_all(fd, SECTION_MEMACC_ALLOC_TOTALS) || !write_all(fd, *stats) || !write_all(fd, SECTION_MEMACC_ALLOC_TOTALS_END)) return -1;
     return static_cast<ssize_t>(stats->size());
 }
 
-void write_section_peer_map(int fd) {
+auto write_section_peer_map(int fd) -> bool {
     auto peers = collect_live_wki_peer_map();
-    if (peers.empty()) {
-        return;
-    }
-
-    write_all(fd, SECTION_PEER_MAP);
-    for (const auto& peer : peers) {
-        write_all(fd, peer_map_line(peer.peer, peer.hostname));
-    }
-    write_all(fd, SECTION_PEER_MAP_END);
+    if (peers.empty()) return true;
+    bool ok = write_all(fd, SECTION_PEER_MAP);
+    for (const auto& peer : peers) ok = write_all(fd, peer_map_line(peer.peer, peer.hostname)) && ok;
+    return write_all(fd, SECTION_PEER_MAP_END) && ok;
 }
 
-void write_image_map_snapshot(int fd, uint64_t pid, std::string_view snapshot) {
+auto write_image_map_snapshot(int fd, uint64_t pid, std::string_view snapshot) -> bool {
+    bool ok = true;
     std::size_t pos = 0;
     while (pos < snapshot.size()) {
         std::string_view const LINE = next_line(snapshot, pos);
-        if (LINE.empty()) {
-            continue;
-        }
+        if (LINE.empty()) continue;
         std::string output = "pid=";
         output += std::to_string(pid);
         output += ' ';
         output += LINE;
         output += '\n';
-        write_all(fd, output);
+        ok = write_all(fd, output) && ok;
     }
+    return ok;
 }
 
-void write_section_image_map(int fd, const std::vector<TrackedProc>* tracked) {
-    write_all(fd, SECTION_IMAGE_MAP);
+auto write_section_image_map(int fd, const std::vector<TrackedProc>* tracked) -> bool {
+    bool ok = write_all(fd, SECTION_IMAGE_MAP);
     auto const LIVE = collect_main_stats();
-    for (const auto& stat : LIVE) {
-        write_image_map_snapshot(fd, stat.pid, read_proc_images(stat.pid));
-    }
+    for (const auto& stat : LIVE) ok = write_image_map_snapshot(fd, stat.pid, read_proc_images(stat.pid)) && ok;
     if (tracked != nullptr) {
         for (const auto& proc : *tracked) {
             bool const IS_LIVE = std::ranges::any_of(LIVE, [&](const StatInfo& stat) { return stat.pid == proc.pid; });
-            if (!IS_LIVE) {
-                write_image_map_snapshot(fd, proc.pid, proc.image_map);
-            }
+            if (!IS_LIVE) ok = write_image_map_snapshot(fd, proc.pid, proc.image_map) && ok;
         }
     }
-    write_all(fd, SECTION_IMAGE_MAP_END);
+    return write_all(fd, SECTION_IMAGE_MAP_END) && ok;
 }
 
 auto save_perf_data() -> bool {
@@ -836,17 +817,14 @@ auto cmd_data_info(std::string_view path) -> bool {
     return true;
 }
 
-void set_recording_enabled(bool enabled, const char* filter) {
+auto set_recording_enabled(bool enabled, const char* filter) -> bool {
     ScopedFd const FD = open_writeonly(KPERFCTL_PATH);
-    if (!FD.valid()) {
-        return;
-    }
+    if (!FD.valid()) return false;
     if (enabled && filter != nullptr) {
         std::string const CMD = std::string("enable ") + filter;
-        write_all(FD.get(), CMD);
-    } else {
-        write_all(FD.get(), enabled ? "enable" : "disable");
+        return write_all(FD.get(), CMD);
     }
+    return write_all(FD.get(), enabled ? "enable" : "disable");
 }
 
 void cmd_stat(int ms) {
@@ -905,25 +883,17 @@ auto cmd_record(int ms, const char* filter, bool structured) -> bool {
         ms = DEFAULT_SAMPLE_MS;
     }
 
-    ScopedFd const CONTROL_FD = open_writeonly(KPERFCTL_PATH);
-    if (!CONTROL_FD.valid()) {
-        std::println("perf: cannot open /proc/kperfctl");
+    auto capture = begin_capture(filter);
+    if (capture.control_failed) {
+        std::println("perf: cannot enable /proc/kperfctl");
         return false;
     }
-
-    if (filter != nullptr) {
-        std::string const CMD = std::string("enable ") + filter;
-        write_all(CONTROL_FD.get(), CMD);
-        std::println("perf: recording with filter '{}' for {} ms...", filter, ms);
-    } else {
-        write_all(CONTROL_FD.get(), "enable");
-        std::println("perf: recording for {} ms...", ms);
-    }
+    std::println("perf: recording with filter '{}' for {} ms...", capture.requested_filter, ms);
 
     ScopedFd data_fd = open_write_trunc(PERF_DATA_FILE);
     if (data_fd.valid()) {
-        write_section_timebase(data_fd.get());
-        write_all(data_fd.get(), SECTION_EVENTS);
+        capture.write_failed = !write_section_timebase(data_fd.get());
+        capture.write_failed = !write_all(data_fd.get(), SECTION_EVENTS) || capture.write_failed;
     }
 
     // Track all processes seen during recording so short-lived ones
@@ -953,7 +923,6 @@ auto cmd_record(int ms, const char* filter, bool structured) -> bool {
 
     int64_t const DEADLINE_MS = now_ms() + ms;
     int64_t last_drain_ms = now_ms();
-    ssize_t total_event_bytes = 0;
 
     while (true) {
         int64_t const REMAINING_MS = DEADLINE_MS - now_ms();
@@ -966,11 +935,7 @@ auto cmd_record(int ms, const char* filter, bool structured) -> bool {
             continue;
         }
 
-        auto events = read_file(KPERF_PATH, PERF_DRAIN_CAPACITY);
-        if (events.has_value() && !events->empty()) {
-            write_all(data_fd.get(), *events);
-            total_event_bytes += static_cast<ssize_t>(events->size());
-        }
+        (void)drain_capture(data_fd.get(), capture);
 
         // Pick up any newly-spawned processes.
         for_each_process_stat([&](const StatInfo& stat, std::string_view) { upsert_tracked(stat); });
@@ -978,35 +943,28 @@ auto cmd_record(int ms, const char* filter, bool structured) -> bool {
         last_drain_ms = now_ms();
     }
 
-    write_all(CONTROL_FD.get(), "disable");
+    capture.control_failed = !set_recording_enabled(false) || capture.control_failed;
     std::println("perf: recording stopped.");
-
     if (!data_fd.valid()) {
-        if (!save_perf_data()) {
-            return false;
-        }
-        return !structured || finalize_structured_perf_data();
+        std::println("perf: cannot write {}", PERF_DATA_FILE);
+        return false;
     }
-
-    auto events = read_file(KPERF_PATH, PERF_DRAIN_CAPACITY);
-    if (events.has_value() && !events->empty()) {
-        write_all(data_fd.get(), *events);
-        total_event_bytes += static_cast<ssize_t>(events->size());
-    }
-
-    write_all(data_fd.get(), SECTION_EVENTS_END);
+    finish_capture(data_fd.get(), capture);
+    capture.write_failed = !write_all(data_fd.get(), SECTION_EVENTS_END) || capture.write_failed;
+    auto const TOTAL_EVENT_BYTES = static_cast<ssize_t>(capture.saved_bytes);
     ssize_t const SUMMARY_BYTES = write_section_wki_summary(data_fd.get());
     ssize_t const IPC_BYTES = write_section_ipc_stats(data_fd.get());
     ssize_t const CONTSTAT_BYTES = write_section_contstat(data_fd.get());
     ssize_t const MEMACC_BYTES = write_section_memacc_alloc_totals(data_fd.get());
     ssize_t const DIAG_BYTES = CONTSTAT_BYTES + MEMACC_BYTES;
-    write_section_peer_map(data_fd.get());
+    capture.write_failed = !write_section_peer_map(data_fd.get()) || capture.write_failed;
 
     // Write proc map: current live processes plus any tracked ones that exited.
-    write_all(data_fd.get(), SECTION_PROC_MAP);
+    capture.write_failed = !write_all(data_fd.get(), SECTION_PROC_MAP) || capture.write_failed;
     auto after = collect_stats();
     for_each_process_stat([&](const StatInfo& info, std::string_view) {
-        write_all(data_fd.get(), proc_map_line(info.pid, info.comm, read_cmdline(info.pid)));
+        capture.write_failed =
+            !write_all(data_fd.get(), proc_map_line(info.pid, info.comm, read_cmdline(info.pid))) || capture.write_failed;
     });
     for (const auto& proc : tracked) {
         bool alive = false;
@@ -1017,20 +975,23 @@ auto cmd_record(int ms, const char* filter, bool structured) -> bool {
             }
         }
         if (!alive) {
-            write_all(data_fd.get(), proc_map_line(proc.pid, proc.comm, proc.cmdline));
+            capture.write_failed = !write_all(data_fd.get(), proc_map_line(proc.pid, proc.comm, proc.cmdline)) || capture.write_failed;
         }
     }
-    write_all(data_fd.get(), SECTION_PROC_MAP_END);
-    write_section_image_map(data_fd.get(), &tracked);
+    capture.write_failed = !write_all(data_fd.get(), SECTION_PROC_MAP_END) || capture.write_failed;
+    capture.write_failed = !write_section_image_map(data_fd.get(), &tracked) || capture.write_failed;
+    capture.write_failed = SUMMARY_BYTES < 0 || IPC_BYTES < 0 || CONTSTAT_BYTES < 0 || MEMACC_BYTES < 0 || capture.write_failed;
+    bool const CAPTURE_OK = write_capture_receipt(data_fd.get(), capture);
 
-    if (total_event_bytes <= 0 && SUMMARY_BYTES <= 0 && IPC_BYTES <= 0 && DIAG_BYTES <= 0) {
+    if (TOTAL_EVENT_BYTES <= 0 && SUMMARY_BYTES <= 0 && IPC_BYTES <= 0 && DIAG_BYTES <= 0) {
         std::println("perf: ring buffer empty - PROC_MAP saved, no events");
     } else {
-        std::println("perf: saved to {} ({} event bytes, {} summary bytes, {} IPC bytes, {} diag bytes)", PERF_DATA_FILE, total_event_bytes,
+        std::println("perf: saved to {} ({} event bytes, {} summary bytes, {} IPC bytes, {} diag bytes)", PERF_DATA_FILE, TOTAL_EVENT_BYTES,
                      SUMMARY_BYTES, IPC_BYTES, DIAG_BYTES);
     }
     data_fd.reset();
-    return !structured || finalize_structured_perf_data();
+    bool const STRUCTURED_OK = !structured || finalize_structured_perf_data();
+    return CAPTURE_OK && STRUCTURED_OK;
 }
 
 }  // namespace perf
