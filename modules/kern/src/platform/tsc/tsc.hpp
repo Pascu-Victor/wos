@@ -20,6 +20,9 @@ struct ClocksourceStatus {
     uint64_t conversion_divisor;
     uint64_t calibration_spread_ppm;
     uint64_t watchdog_deviation_ns;
+    uint64_t kvm_registered_cpus{};
+    uint64_t kvm_expected_cpus{};
+    uint64_t kvm_watchdog_checks{};
 };
 
 [[nodiscard]] ClocksourceStatus get_status();

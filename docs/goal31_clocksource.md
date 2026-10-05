@@ -33,8 +33,11 @@ periodic wrap observer that this kernel does not yet provide.
 A TSC candidate requires CPUID TSC and invariant-TSC feature bits, three 10 ms
 HPET-referenced samples in 1 MHz..20 GHz, and at most 1,000 ppm sample spread.
 These are qualification thresholds, not a guarantee of physical clock accuracy.
-Multi-CPU systems explicitly select HPET: invariant frequency does not prove
-cross-CPU offset agreement. No TSC synchronization success is fabricated.
+The raw-TSC policy explicitly selects HPET on multi-CPU systems: invariant
+frequency does not prove cross-CPU offset agreement. No raw TSC synchronization
+success is fabricated. The separately qualified KVM clock path described in
+`goal48_kvmclock.md` uses the hypervisor's versioned per-vCPU conversions and
+explicit stable-clock guarantee, with an all-CPU registration quorum.
 Single-CPU TSC reads are ordered and bracketed by HPET reads. Drift outside the
 reference bracket by more than 100 us permanently selects HPET. A backwards TSC
 relative to its origin also selects HPET. The common epoch and shared monotonic
@@ -46,8 +49,8 @@ resolution, invariant feature, sample spread, and observed watchdog deviation.
 Before initialization, reads return zero and status reports unavailable.
 Constant-initialized atomics must not reset when global constructors run later.
 
-This deliberately favors correctness over speed: SMP reads incur HPET MMIO and
-a shared atomic update; UP TSC watchdog reads also incur HPET MMIO. Physical HPET
+Without qualified KVM clock support, SMP reads incur HPET MMIO and a shared
+atomic update; UP raw-TSC watchdog reads also incur HPET MMIO. Physical HPET
 accuracy, suspend/resume recovery, and TSC cross-CPU qualification remain platform
 limitations. Live suspend/resume is unsupported; no runtime HPET reset is allowed.
 

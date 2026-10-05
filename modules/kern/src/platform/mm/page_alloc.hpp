@@ -47,6 +47,7 @@ enum class PhysicalPageOwner : uint8_t {
     SELFTEST,
     IOMMU_TABLE,
     DMA_BUFFER,
+    KVM_CLOCK,
     COUNT,
 };
 

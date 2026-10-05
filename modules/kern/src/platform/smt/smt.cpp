@@ -12,6 +12,7 @@
 #include <iterator>
 #include <new>
 #include <platform/dbg/journal.hpp>
+#include <platform/ktime/kvmclock.hpp>
 #include <platform/ktime/process_timer.hpp>
 
 #include "mod/io/serial/serial.hpp"
@@ -265,6 +266,10 @@ __attribute__((no_stack_protector)) void cpu_param_init(uint64_t cpu_no, uint64_
 
     // Initialize APIC for this CPU
     apic::init_apic_mp();
+
+    // Registration allocates and unpoisons a physical page. KASan can demand
+    // fault its shadow, so this CPU's exception descriptors must be ready.
+    time::kvmclock::register_current_cpu(cpu_no);
 
     // Initialize scheduler for this CPU
     sched::percpu_init();
@@ -731,6 +736,9 @@ __attribute__((no_stack_protector)) void selftest_secondary_cpu_park(limine_mp_i
     sys::init();
     apic::init_apic_mp();
 
+    // Physical allocation can fault to populate KASan shadow memory.
+    time::kvmclock::register_current_cpu(cpu_no);
+
     selftest_parked_cpu_mask.fetch_or(1ULL << cpu_no, std::memory_order_acq_rel);
     halt_this_cpu_forever();
 }
@@ -794,6 +802,7 @@ __attribute__((no_stack_protector)) void park_secondary_cpus_for_selftest() {
     cpu::wrgsbase(BSP_PER_CPU_ADDR);
     cpu_set_msr(IA32_KERNEL_GS_BASE, BSP_PER_CPU_ADDR);
     cpu::set_current_cpuid(bsp_cpu);
+    time::kvmclock::register_current_cpu(bsp_cpu, true);
 
     if (g_cpu_count <= 1) {
         return;
@@ -858,6 +867,7 @@ __attribute__((no_stack_protector)) void start_smt(boot::HandoverModules& module
     // Write cpuId directly to the memory location
     bsp_per_cpu->cpu_id = 0;
     cpu::set_current_cpuid(0);
+    time::kvmclock::register_current_cpu(0, true);
 
     // GS base is now valid - cpu::current_cpu() works, safe to enable CPU ID in serial logs
     io::serial::mark_cpu_id_available();

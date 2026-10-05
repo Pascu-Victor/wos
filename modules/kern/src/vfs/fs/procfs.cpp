@@ -1788,14 +1788,16 @@ auto generate_timekeeping(char* buf, size_t bufsz) -> size_t {
         buf, bufsz,
         "version=1\nsource=%s\ninvariant_tsc=%u\nfrequency_hz=%llu\nresolution_ns=%llu\n"
         "conversion_multiplier=%llu\nconversion_divisor=%llu\ncalibration_spread_ppm=%llu\nwatchdog_deviation_ns=%llu\n"
+        "kvm_registered_cpus=%llu\nkvm_expected_cpus=%llu\nkvm_watchdog_checks=%llu\n"
         "rtc_valid=%u\nwall_steps=%llu\nwall_slews=%llu\nwall_rejected=%llu\nwall_pending_ns=%lld\nslew_limit_ppm=500\n"
         "process_timer_real_depth=%llu\nprocess_timer_wake_depth=%llu\nprocess_timer_expirations=%llu\n"
         "process_timer_late_us_max=%llu\nprocess_timer_work_budget=%llu\nclockevent=x2apic-oneshot\n",
         ker::mod::tsc::state_name(SOURCE.state), SOURCE.invariant_tsc ? 1U : 0U, static_cast<unsigned long long>(SOURCE.frequency_hz),
         static_cast<unsigned long long>(SOURCE.resolution_ns), static_cast<unsigned long long>(SOURCE.conversion_multiplier),
         static_cast<unsigned long long>(SOURCE.conversion_divisor), static_cast<unsigned long long>(SOURCE.calibration_spread_ppm),
-        static_cast<unsigned long long>(SOURCE.watchdog_deviation_ns), WALL.rtc_valid ? 1U : 0U,
-        static_cast<unsigned long long>(WALL.steps), static_cast<unsigned long long>(WALL.slews),
+        static_cast<unsigned long long>(SOURCE.watchdog_deviation_ns), static_cast<unsigned long long>(SOURCE.kvm_registered_cpus),
+        static_cast<unsigned long long>(SOURCE.kvm_expected_cpus), static_cast<unsigned long long>(SOURCE.kvm_watchdog_checks),
+        WALL.rtc_valid ? 1U : 0U, static_cast<unsigned long long>(WALL.steps), static_cast<unsigned long long>(WALL.slews),
         static_cast<unsigned long long>(WALL.rejected), static_cast<long long>(WALL.correction_ns - WALL.applied(NOW)),
         static_cast<unsigned long long>(TIMERS.real_depth), static_cast<unsigned long long>(TIMERS.wake_depth),
         static_cast<unsigned long long>(TIMERS.expirations), static_cast<unsigned long long>(TIMERS.max_late_us),

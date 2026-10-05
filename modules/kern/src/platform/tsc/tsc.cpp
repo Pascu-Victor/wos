@@ -8,6 +8,7 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/arithmetic.hpp>
 #include <platform/ktime/clocksource_policy.hpp>
+#include <platform/ktime/kvmclock.hpp>
 #include <platform/smt/smt.hpp>
 
 namespace ker::mod::tsc {
@@ -92,6 +93,7 @@ void init() {
         }
     }
     source_state.store(state, std::memory_order_release);
+    time::kvmclock::prepare(smt::get_early_cpu_count());
     log::info("clocksource=%s TSC=%lu MHz calibration_spread=%lu ppm", state_name(state), static_cast<unsigned long>(tsc_hz / 1000000),
               static_cast<unsigned long>(calibration_spread));
 }
@@ -99,6 +101,8 @@ void init() {
 uint64_t get_hz() { return tsc_hz; }
 
 uint64_t get_resolution_ns() {
+    if (time::kvmclock::mode() == time::kvmclock::Mode::active) return 1;
+    if (time::kvmclock::mode() == time::kvmclock::Mode::failed) return hpet::get_resolution_ns();
     State const STATE = source_state.load(std::memory_order_acquire);
     if (STATE == State::unavailable) {
         return 1;
@@ -117,6 +121,13 @@ uint64_t get_ns() {
     State const STATE = source_state.load(std::memory_order_acquire);
     if (STATE == State::unavailable) {
         return 0;
+    }
+    if (time::kvmclock::mode() == time::kvmclock::Mode::active) {
+        uint64_t candidate = 0;
+        if (time::kvmclock::read(candidate)) return policy::publish_max(monotonic_floor, candidate);
+    }
+    if (time::kvmclock::mode() == time::kvmclock::Mode::failed) {
+        return policy::publish_max(monotonic_floor, time::kvmclock::fallback_hpet_time(hpet::get_ns()));
     }
     if (STATE != State::tsc) {
         return policy::publish_max(monotonic_floor, hpet::get_ns());
@@ -138,7 +149,10 @@ uint64_t get_ns() {
 }
 
 ClocksourceStatus get_status() {
-    State const STATE = source_state.load(std::memory_order_acquire);
+    auto const KVM_MODE = time::kvmclock::mode();
+    State const STATE = KVM_MODE == time::kvmclock::Mode::active   ? State::kvm_clock
+                        : KVM_MODE == time::kvmclock::Mode::failed ? State::kvm_clock_failed
+                                                                   : source_state.load(std::memory_order_acquire);
     if (STATE == State::unavailable) {
         return {.state = STATE,
                 .invariant_tsc = false,
@@ -150,14 +164,26 @@ ClocksourceStatus get_status() {
                 .watchdog_deviation_ns = 0};
     }
     bool const TSC = STATE == State::tsc;
+    bool const KVM = STATE == State::kvm_clock;
     return {.state = STATE,
             .invariant_tsc = invariant_tsc,
-            .frequency_hz = TSC ? tsc_hz : time::arithmetic::mul_div(1, 1000000000000000ULL, hpet::get_period_fs()),
-            .resolution_ns = TSC ? time::arithmetic::mul_div(1, 1000000000, tsc_hz, true) : hpet::get_resolution_ns(),
-            .conversion_multiplier = TSC ? 1000000000 : hpet::get_period_fs(),
-            .conversion_divisor = TSC ? tsc_hz : 1000000,
+            .frequency_hz = KVM   ? 1000000000
+                            : TSC ? tsc_hz
+                                  : time::arithmetic::mul_div(1, 1000000000000000ULL, hpet::get_period_fs()),
+            .resolution_ns = KVM   ? 1
+                             : TSC ? time::arithmetic::mul_div(1, 1000000000, tsc_hz, true)
+                                   : hpet::get_resolution_ns(),
+            .conversion_multiplier = KVM   ? 1
+                                     : TSC ? 1000000000
+                                           : hpet::get_period_fs(),
+            .conversion_divisor = KVM   ? 1
+                                  : TSC ? tsc_hz
+                                        : 1000000,
             .calibration_spread_ppm = calibration_spread,
-            .watchdog_deviation_ns = watchdog_deviation.load(std::memory_order_relaxed)};
+            .watchdog_deviation_ns = std::max(watchdog_deviation.load(std::memory_order_relaxed), time::kvmclock::deviation()),
+            .kvm_registered_cpus = time::kvmclock::registered(),
+            .kvm_expected_cpus = time::kvmclock::expected(),
+            .kvm_watchdog_checks = time::kvmclock::checks()};
 }
 
 const char* state_name(State state) {
@@ -178,6 +204,10 @@ const char* state_name(State state) {
             return "hpet:tsc-backwards";
         case State::tsc_drift:
             return "hpet:tsc-drift";
+        case State::kvm_clock:
+            return "kvm-clock";
+        case State::kvm_clock_failed:
+            return "hpet:kvm-clock-failed";
     }
     return "unavailable";
 }

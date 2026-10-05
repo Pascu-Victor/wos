@@ -295,6 +295,8 @@ constexpr std::array<PhysicalOwnerDescriptor, PHYSICAL_PAGE_OWNER_COUNT> PHYSICA
      "root/context/translation pages retained until hardware invalidation and DMA retirement"},
     {PhysicalPageOwner::DMA_BUFFER, "dma_buffer", "managed DMA region lifetime", PhysicalOwnerReclaimability::OWNER_TEARDOWN,
      "exclusive coherent/bounce backing retained until hardware retirement and mapping invalidation"},
+    {PhysicalPageOwner::KVM_CLOCK, "kvm_clock", "boot-to-shutdown hypervisor clock record lifetime", PhysicalOwnerReclaimability::PERMANENT,
+     "at most one page per configured vCPU, retained after MSR registration even on clock qualification failure"},
 }};
 
 static_assert(PHYSICAL_OWNER_DESCRIPTORS.size() == PHYSICAL_PAGE_OWNER_COUNT);

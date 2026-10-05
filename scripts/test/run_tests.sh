@@ -306,6 +306,7 @@ UNIT_TESTS=(
     page_table_zero_test
     root_kernel_mappings_test
     cpu_accounting_snapshot_runtime_test
+    kvmclock_test
     mlibc_locale_runtime_test
     mlibc_slab_runtime_test
     perf_event_parser_test

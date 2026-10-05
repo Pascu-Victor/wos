@@ -14,7 +14,9 @@ enum class State : uint8_t {
     calibration_failed,
     smp_unqualified,
     tsc_backwards,
-    tsc_drift
+    tsc_drift,
+    kvm_clock,
+    kvm_clock_failed
 };
 inline constexpr uint64_t MAX_CALIBRATION_PPM = 1000;
 inline constexpr uint64_t MAX_DEVIATION_NS = 100000;

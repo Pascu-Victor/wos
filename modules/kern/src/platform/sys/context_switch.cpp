@@ -11,6 +11,7 @@
 #include <platform/init/limine_requests.hpp>
 #include <platform/ktime/clockevent.hpp>
 #include <platform/ktime/ktime.hpp>
+#include <platform/ktime/kvmclock.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/frame_class.hpp>
@@ -1593,6 +1594,7 @@ void dump_irq_stats() {
 #endif  // SCHED_DEBUG
 
 extern "C" void wos_sched_timer(void* stack_ptr) {
+    time::kvmclock::watchdog_tick();
     [[maybe_unused]] uint64_t const IRQ_ACCOUNT_STARTED_US = K_ENABLE_SCHED_HOT_LOGGING ? ker::mod::time::get_us() : 0;
     apic::eoi();
     sched::note_scheduler_timer_interrupt();

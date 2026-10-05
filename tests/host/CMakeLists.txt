@@ -97,6 +97,9 @@ wos_add_unit_test(timer_queue_test
 wos_add_unit_test(clocksource_policy_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/clocksource_policy_test.cpp
 )
+wos_add_unit_test(kvmclock_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/kvmclock_test.cpp
+)
 wos_add_unit_test(clockevent_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/clockevent_test.cpp
 )
