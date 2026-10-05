@@ -712,7 +712,8 @@ auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const pagin
         // This may run from a hardware page fault with interrupts disabled.
         // Failure is process-local; never enter the fatal allocator dump or a
         // yielding reclaim loop from this context.
-        void* const PAGE = phys::page_alloc_may_fail(PhysicalPageOwner::USER_PRIVATE_MAPPING, paging::PAGE_SIZE, "lazy-vmem");
+        void* const PAGE =
+            phys::page_alloc_full_overwrite_may_fail(PhysicalPageOwner::USER_PRIVATE_MAPPING, paging::PAGE_SIZE, "lazy-vmem");
         if (PAGE == nullptr) {
             log::error("lazy vmem fault: OOM pid=%lu vaddr=0x%llx", task->pid, static_cast<unsigned long long>(PAGE_VADDR));
             return false;
@@ -2212,13 +2213,14 @@ auto alloc_zeroed_page_table() -> PageTable* {
         return pooled_table;
     }
 
-    auto* table = static_cast<PageTable*>(phys::page_alloc_with_reclaim(PhysicalPageOwner::PAGE_TABLE, paging::PAGE_SIZE, "page_table"));
+    auto* table = static_cast<PageTable*>(phys::page_alloc_full_overwrite_page_with_reclaim(PhysicalPageOwner::PAGE_TABLE, "page_table"));
     if (table == nullptr) {
         return nullptr;
     }
 
-    // page_alloc zeroes every returned PAGE_SIZE page; keep page-table ownership
-    // tagging centralized before any reclaim code can observe the page.
+    // Clear the private HHDM page before kind tagging or hierarchy publication,
+    // keeping the current pagemap instead of switching CR3 solely to zero it.
+    std::memset(table, 0, paging::PAGE_SIZE);
     (void)phys::page_mark_kind(table, PageKind::PAGE_TABLE);
     return table;
 }
@@ -3542,6 +3544,8 @@ void get_owned_frame_stats_snapshot(OwnedFrameStatsSnapshot& out) {
     };
 }
 
+void copy_kernel_mappings_to(PageTable* pagemap) { refresh_kernel_mappings(pagemap); }
+
 void copy_kernel_mappings(sched::task::Task* t) {
     if (t == nullptr) {
         return;
@@ -4101,19 +4105,37 @@ bool selftest_anonymous_swap_is_swapped(PageTable* pagemap, vaddr_t vaddr) {
 #endif
 
 namespace {
+template <bool StopAtFirst = false>
 auto count_virtual_bytes_in_table(PageTable* table, unsigned level, uint64_t base, uint64_t start, uint64_t end) -> uint64_t {
     unsigned const SHIFT = paging::PAGE_SHIFT + 9 * (level - 1);
     uint64_t const STRIDE = uint64_t{1} << SHIFT;
     uint64_t bytes = 0;
     size_t const FIRST = static_cast<size_t>((start - base) >> SHIFT);
     size_t const LAST = static_cast<size_t>((end - 1 - base) >> SHIFT);
+    if (level == 1) {
+        // Public bounds and recursive table clips are page aligned. Count
+        // occupied leaves before scaling once to their exact byte total.
+        uint64_t occupied_pages = 0;
+        for (size_t i = FIRST; i <= LAST; ++i) {
+            uint64_t const RAW = pte_raw(entry_at(table, i));
+            bool const OCCUPIED = (RAW & (paging::PAGE_PRESENT | paging::PAGE_RESERVED)) != 0;
+            if constexpr (StopAtFirst) {
+                if (OCCUPIED) {
+                    return paging::PAGE_SIZE;
+                }
+            } else {
+                occupied_pages += OCCUPIED;
+            }
+        }
+        return occupied_pages * paging::PAGE_SIZE;
+    }
     for (size_t i = FIRST; i <= LAST; ++i) {
         uint64_t const RAW = pte_raw(entry_at(table, i));
         uint64_t const ENTRY_START = base + i * STRIDE;
         uint64_t const LOW = std::max(start, ENTRY_START);
         uint64_t const HIGH = std::min(end, ENTRY_START + STRIDE);
         bool const PRESENT = (RAW & paging::PAGE_PRESENT) != 0;
-        if (level == 1 || (PRESENT && level < 4 && (RAW & (uint64_t{1} << 7)) != 0)) {
+        if (PRESENT && level < 4 && (RAW & (uint64_t{1} << 7)) != 0) {
             // Lower-half supervisor leaves can be resident PROT_NONE. They
             // still occupy user VA; kernel mappings live in the upper half.
             if (PRESENT || (RAW & paging::PAGE_RESERVED) != 0) {
@@ -4121,12 +4143,26 @@ auto count_virtual_bytes_in_table(PageTable* table, unsigned level, uint64_t bas
             }
         } else if (PRESENT) {
             auto* child = reinterpret_cast<PageTable*>(addr::get_virt_pointer(RAW & 0x000ffffffffff000ULL));
-            bytes += count_virtual_bytes_in_table(child, level - 1, ENTRY_START, LOW, HIGH);
+            bytes += count_virtual_bytes_in_table<StopAtFirst>(child, level - 1, ENTRY_START, LOW, HIGH);
+        }
+        if constexpr (StopAtFirst) {
+            if (bytes != 0) {
+                return bytes;
+            }
         }
     }
     return bytes;
 }
 }  // namespace
+
+auto validate_user_pagemap_access(PageTable* page_table) -> bool {
+    size_t gate = USER_PAGEMAP_ACCESS_GATE_NONE;
+    if (!acquire_user_pagemap_access(page_table, false, gate)) {
+        return false;
+    }
+    release_user_pagemap_access(gate);
+    return true;
+}
 
 auto count_user_virtual_bytes(PageTable* page_table, uint64_t start, uint64_t end, uint64_t& bytes) -> bool {
     bytes = 0;
@@ -4146,6 +4182,22 @@ auto count_user_virtual_bytes(PageTable* page_table, uint64_t start, uint64_t en
     bytes = count_virtual_bytes_in_table(page_table, 4, 0, start, end);
     release_user_pagemap_access(gate);
     return true;
+}
+
+auto is_user_virtual_range_free(PageTable* page_table, uint64_t start, uint64_t end) -> bool {
+    if (page_table == nullptr || start >= end || end > 0x0000800000000000ULL || ((start | end) & (paging::PAGE_SIZE - 1)) != 0) {
+        return false;
+    }
+    // As with counting, callers serialize publication or own a private root.
+    // The pin only keeps fork/teardown from reclaiming tables during the walk.
+    sched::PreemptGuard guard;
+    size_t gate = USER_PAGEMAP_ACCESS_GATE_NONE;
+    if (!acquire_user_pagemap_access(page_table, false, gate)) {
+        return false;
+    }
+    bool const FREE = count_virtual_bytes_in_table<true>(page_table, 4, 0, start, end) == 0;
+    release_user_pagemap_access(gate);
+    return FREE;
 }
 
 auto collect_user_memory_stats(PageTable* page_table) -> UserMemoryStats {
@@ -4859,34 +4911,51 @@ void reserve_page_range(PageTable* page_table, const vaddr_t VADDR, const uint64
     }
 
     uint64_t constexpr TABLE_FLAGS = paging::PAGE_PRESENT | paging::PAGE_WRITE | paging::PAGE_USER;
-    bool changed = false;
-    bool path_promoted = false;
-    for (uint64_t i = 0; i < PAGE_COUNT; i++) {
-        vaddr_t const CURRENT_VADDR = VADDR + (i * paging::PAGE_SIZE);
-        PageTable* pml3 = advance_page_table(page_table, index_of(CURRENT_VADDR, 4), TABLE_FLAGS, &path_promoted);
-        PageTable* pml2 = advance_page_table(pml3, index_of(CURRENT_VADDR, 3), TABLE_FLAGS, &path_promoted);
-        PageTable* pml1 = advance_page_table(pml2, index_of(CURRENT_VADDR, 2), TABLE_FLAGS, &path_promoted);
-
+    std::array<PageTableEntry, paging::PAGE_TABLE_ENTRIES> retired_present{};
+    uint64_t page_index = 0;
+    while (page_index < PAGE_COUNT) {
+        vaddr_t const BATCH_VADDR = VADDR + (page_index * paging::PAGE_SIZE);
+        bool path_promoted = false;
+        PageTable* pml3 = advance_page_table(page_table, index_of(BATCH_VADDR, 4), TABLE_FLAGS, &path_promoted);
+        PageTable* pml2 = advance_page_table(pml3, index_of(BATCH_VADDR, 3), TABLE_FLAGS, &path_promoted);
+        PageTable* pml1 = advance_page_table(pml2, index_of(BATCH_VADDR, 2), TABLE_FLAGS, &path_promoted);
+        size_t const FIRST_LEAF = index_of(BATCH_VADDR, 1);
+        uint64_t const BATCH_PAGES = std::min<uint64_t>(PAGE_COUNT - page_index, paging::PAGE_TABLE_ENTRIES - FIRST_LEAF);
+        size_t retired_count = 0;
+        bool replaced_translation = false;
         uint64_t const PIN_LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
-        PageTableEntry& entry = entry_at(pml1, index_of(CURRENT_VADDR, 1));
-        uint64_t const OLD_RAW = pte_raw(entry);
-        if (OLD_RAW == paging::PAGE_RESERVED) {
-            user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
-            continue;
+        for (uint64_t batch_page = 0; batch_page < BATCH_PAGES; ++batch_page) {
+            vaddr_t const CURRENT_VADDR = BATCH_VADDR + (batch_page * paging::PAGE_SIZE);
+            PageTableEntry& entry = entry_at(pml1, FIRST_LEAF + batch_page);
+            uint64_t const OLD_RAW = pte_raw(entry);
+            if (OLD_RAW == paging::PAGE_RESERVED) {
+                continue;
+            }
+
+            PageTableEntry const OLD_ENTRY = entry;
+            if (OLD_RAW != 0) {
+                replaced_translation = true;
+                owned_frame_untrack_leaf(page_table, CURRENT_VADDR, OLD_ENTRY);
+            }
+            if (OLD_ENTRY.present != 0 && OLD_ENTRY.frame != 0) {
+                retired_present.at(retired_count++) = OLD_ENTRY;
+            }
+            entry = pte_from_raw(paging::PAGE_RESERVED);
         }
-
-        PageTableEntry const OLD_ENTRY = entry;
-        owned_frame_untrack_leaf(page_table, CURRENT_VADDR, OLD_ENTRY);
-        entry = pte_from_raw(paging::PAGE_RESERVED);
         user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
-        changed = true;
-        flush_pagemap_after_update(page_table, CURRENT_VADDR, path_promoted);
-        path_promoted = false;
-        drop_present_leaf_ref(OLD_ENTRY);
-    }
 
-    if (!changed && path_promoted) {
-        flush_pagemap_after_update(page_table, VADDR, true);
+        // Installing a non-present reservation into an empty leaf cannot
+        // leave a stale translation. Fresh exec stacks contain thousands of
+        // these leaves, so cache each leaf-table walk and hold the pin lock for
+        // one bounded batch. Existing metadata/translations and promoted table
+        // permissions receive one full flush before any old frame is released.
+        if (path_promoted || replaced_translation) {
+            flush_pagemap_after_update(page_table, BATCH_VADDR, true);
+        }
+        for (size_t i = 0; i < retired_count; ++i) {
+            drop_present_leaf_ref(retired_present.at(i));
+        }
+        page_index += BATCH_PAGES;
     }
 }
 

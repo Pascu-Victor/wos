@@ -453,6 +453,26 @@ KTEST(MM, PagemapPoolReusesZeroedRootPage) {
     }
     KEXPECT_TRUE(table_zero);
 
+    // Exec initializes a private root without constructing an unrelated Task.
+    // The current upper half must refresh while private lower entries survive.
+    auto* kernel_root = virt::get_kernel_pagemap();
+    paging::PageTableEntry retained_leaf{};
+    retained_leaf.frame = 0x12345;
+    second->entries.at(7) = retained_leaf;
+    auto copied_kernel_half = [&]() -> bool {
+        if (kernel_root == nullptr) return false;
+        for (size_t index = 0; index < second->entries.size(); ++index) {
+            auto const& EXPECTED = index >= 256 ? kernel_root->entries.at(index) : (index == 7 ? retained_leaf : zero_entry);
+            if (std::memcmp(&second->entries.at(index), &EXPECTED, sizeof(EXPECTED)) != 0) return false;
+        }
+        return true;
+    };
+    virt::copy_kernel_mappings_to(second);
+    KEXPECT_TRUE(copied_kernel_half());
+    second->entries.at(256).present ^= 1U;
+    virt::copy_kernel_mappings_to(second);
+    KEXPECT_TRUE(copied_kernel_half());
+
     virt::PageTablePoolStatsSnapshot after{};
     virt::get_page_table_pool_stats_snapshot(after);
     KEXPECT_TRUE(after.alloc_hits >= before.alloc_hits + 1);
@@ -675,6 +695,15 @@ KTEST(MM, UsercopyMaterializesLazyAnonymousPages) {
     std::array<uint8_t, 8> output{};
     KEXPECT_TRUE(virt::is_page_reserved(root, LAZY_VADDR));
     KEXPECT_FALSE(usercopy::copy_from_task_mapped(task, LAZY_VADDR, output.data(), output.size()));
+    KREQUIRE_TRUE(virt::ensure_user_page_mapped(&task, LAZY_VADDR));
+    uint64_t const LAZY_PHYS = virt::translate(root, LAZY_VADDR);
+    KREQUIRE_NE(LAZY_PHYS, virt::PADDR_INVALID);
+    auto const* lazy_bytes = reinterpret_cast<const uint8_t*>(addr::get_virt_pointer(LAZY_PHYS));
+    bool all_zero = true;
+    for (size_t i = 0; i < paging::PAGE_SIZE; ++i) {
+        all_zero = all_zero && lazy_bytes[i] == 0;
+    }
+    KEXPECT_TRUE(all_zero);
     KREQUIRE_TRUE(usercopy::copy_to_task(task, LAZY_VADDR, input.data(), input.size()));
     KEXPECT_TRUE(virt::is_page_mapped(root, LAZY_VADDR));
     KEXPECT_TRUE(usercopy::copy_from_task(task, LAZY_VADDR, output.data(), output.size()));

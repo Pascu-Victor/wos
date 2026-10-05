@@ -27,8 +27,18 @@ class AddressSpaceObservation {
     ~AddressSpaceObservation();
     AddressSpaceObservation(const AddressSpaceObservation&) = delete;
     auto operator=(const AddressSpaceObservation&) -> AddressSpaceObservation& = delete;
+    // One admission and one complete lazy mapping under the same publication
+    // guard. Every refusal, partial mapping, or ineligible root is recounted.
+    [[nodiscard]] auto admit_mapping(mm::paging::PageTable* root, uint64_t added, uint64_t replaced_start = 0, uint64_t replaced_size = 0)
+        -> bool;
+    void commit_mapping();
 
    private:
+    [[nodiscard]] auto observe() -> bool;
     task::Task* m_subject;
+    mm::paging::PageTable* m_admitted_root = nullptr;
+    uint64_t m_admitted_bytes = 0;
+    bool m_admission_attempted = false;
+    bool m_committed = false;
 };
 }  // namespace ker::mod::sched::resource

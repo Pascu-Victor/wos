@@ -235,6 +235,9 @@ PageTable* create_pagemap();
 void release_pagemap(PageTable* pagemap, uint64_t owner_pid = 0);
 void get_page_table_pool_stats_snapshot(PageTablePoolStatsSnapshot& out);
 void get_owned_frame_stats_snapshot(OwnedFrameStatsSnapshot& out);
+// Refresh only the kernel half using the current kernel root. Caller retains
+// the root and serializes publication, or owns a private unpublished root.
+void copy_kernel_mappings_to(PageTable* pagemap);
 void copy_kernel_mappings(sched::task::Task* t);
 void switch_pagemap(sched::task::Task* t);
 bool pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, ker::mod::cpu::GPRegs& gpr);
@@ -291,10 +294,16 @@ auto install_lazy_file_page_if_current(sched::task::Task* task, const sched::tas
 bool ensure_user_page_writable(sched::task::Task* task, vaddr_t vaddr);
 bool ensure_user_page_mapped(sched::task::Task* task, vaddr_t vaddr);
 auto collect_user_memory_stats(PageTable* page_table) -> UserMemoryStats;
+// Nonwaiting MM lifetime-gate check for a count proven by a serialized mapping
+// transaction. Caller retains the Task/root; no PTE walk or allocation.
+[[nodiscard]] auto validate_user_pagemap_access(PageTable* page_table) -> bool;
 // Logical user VA, including non-present reservations. Caller serializes
 // mapping publication or owns an unpublished root. Bounds must be page aligned.
 // A root teardown collision fails closed without blocking or allocating.
 auto count_user_virtual_bytes(PageTable* page_table, uint64_t start, uint64_t end, uint64_t& bytes) -> bool;
+// Same publication/root-lifetime contract as counting, but stops at the first
+// present or reserved leaf. Invalid/empty ranges and teardown fail closed.
+auto is_user_virtual_range_free(PageTable* page_table, uint64_t start, uint64_t end) -> bool;
 void get_anonymous_swap_stats_snapshot(AnonymousSwapStatsSnapshot& out);
 void register_anonymous_swap_shrinker();
 void start_anonymous_swap_worker();

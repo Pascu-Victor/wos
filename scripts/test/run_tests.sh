@@ -288,9 +288,18 @@ UNIT_TESTS=(
     reclaim_policy_test
     anonymous_swap_state_test
     vmem_source_test
+    vas_observer_perf_runtime_test
+    vas_admission_reuse_runtime_test
+    thread_backing_zero_test
+    thread_initial_backing_test
+    lazy_page_backing_test
+    user_layout_walk_test
+    page_table_zero_test
+    root_kernel_mappings_test
     mlibc_locale_runtime_test
     mlibc_slab_runtime_test
     perf_event_parser_test
+    vmem_cache_perf_runtime_test
 )
 
 list_targets() {

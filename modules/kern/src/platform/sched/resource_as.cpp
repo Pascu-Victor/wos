@@ -1,7 +1,12 @@
 #include "resource_as.hpp"
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdint>
+#include <platform/asm/cpu.hpp>
+#include <platform/ktime/ktime.hpp>
 #include <platform/mm/virt.hpp>
+#include <platform/perf/perf_events.hpp>
 #include <platform/sched/resource.hpp>
 #include <platform/sched/scheduler.hpp>
 
@@ -49,8 +54,14 @@ auto count_address_space(task::Task& subject, mm::paging::PageTable* root, uint6
     return true;
 }
 
-auto admit_address_space(task::Task* subject, mm::paging::PageTable* root, uint64_t added, uint64_t replaced_start, uint64_t replaced_size)
-    -> bool {
+namespace {
+auto can_reuse_mapping_count(task::Task& subject, mm::paging::PageTable* root) -> bool {
+    return root != nullptr && root == subject.pagemap && &subject == get_current_task() && subject.type == task::TaskType::PROCESS &&
+           !subject.is_thread && !subject.shares_user_pagemap.load(std::memory_order_acquire);
+}
+
+auto admit_mapping_count(task::Task* subject, mm::paging::PageTable* root, uint64_t added, uint64_t replaced_start, uint64_t replaced_size,
+                         uint64_t* admitted_bytes) -> bool {
     // Loader selftests and pre-process boot helpers have no policy owner.
     if (subject == nullptr) {
         return true;
@@ -71,10 +82,14 @@ auto admit_address_space(task::Task* subject, mm::paging::PageTable* root, uint6
     uint64_t const FLAGS = process.resource_lock.lock_irqsave();
     bool const ADMITTED = process.resources.admit_address_space(current, removed, added);
     process.resource_lock.unlock_irqrestore(FLAGS);
+    if (ADMITTED && admitted_bytes != nullptr) {
+        // The policy has checked removed <= current and addition overflow.
+        *admitted_bytes = current - removed + added;
+    }
     return ADMITTED;
 }
 
-auto observe_address_space(task::Task& subject) -> bool {
+auto observe_mapping_count(task::Task& subject, mm::paging::PageTable* admitted_root, uint64_t admitted_bytes) -> bool {
     // No allocation/blocking while the short-lived Task/root pins are held.
     PreemptGuard guard;
     mm::paging::PageTable* root = nullptr;
@@ -82,12 +97,45 @@ auto observe_address_space(task::Task& subject) -> bool {
         return false;
     }
     uint64_t bytes = 0;
-    bool const VALID = count_address_space(subject, root, 0, USER_END, bytes);
+    bool const REUSE = root == admitted_root && can_reuse_mapping_count(subject, root);
+    bool const VALID = REUSE ? mm::virt::validate_user_pagemap_access(root) : count_address_space(subject, root, 0, USER_END, bytes);
     if (VALID) {
-        record_address_space_usage(&subject, root, bytes);
+        record_address_space_usage(&subject, root, REUSE ? admitted_bytes : bytes);
     }
     subject.release_usercopy_pagemap();
     return VALID;
+}
+}  // namespace
+
+auto admit_address_space(task::Task* subject, mm::paging::PageTable* root, uint64_t added, uint64_t replaced_start, uint64_t replaced_size)
+    -> bool {
+    return admit_mapping_count(subject, root, added, replaced_start, replaced_size, nullptr);
+}
+
+auto observe_address_space(task::Task& subject) -> bool { return observe_mapping_count(subject, nullptr, 0); }
+
+auto AddressSpaceObservation::admit_mapping(mm::paging::PageTable* root, uint64_t added, uint64_t replaced_start, uint64_t replaced_size)
+    -> bool {
+    bool const FIRST = !m_admission_attempted;
+    m_admission_attempted = true;
+    m_admitted_root = nullptr;
+    m_committed = false;
+    bool const ADMITTED = admit_mapping_count(m_subject, root, added, replaced_start, replaced_size, &m_admitted_bytes);
+    if (ADMITTED && FIRST && m_subject != nullptr && can_reuse_mapping_count(*m_subject, root)) {
+        m_admitted_root = root;
+    }
+    return ADMITTED;
+}
+
+void AddressSpaceObservation::commit_mapping() {
+    if (m_committed) {
+        m_admitted_root = nullptr;
+    }
+    m_committed = true;
+}
+
+auto AddressSpaceObservation::observe() -> bool {
+    return observe_mapping_count(*m_subject, m_committed ? m_admitted_root : nullptr, m_admitted_bytes);
 }
 
 void copy_address_space_observation(task::Task& subject, abi::resource::Usage& usage) {
@@ -99,7 +147,20 @@ void copy_address_space_observation(task::Task& subject, abi::resource::Usage& u
 
 AddressSpaceObservation::~AddressSpaceObservation() {
     if (m_subject != nullptr) {
-        (void)observe_address_space(*m_subject);
+        constexpr auto SCOPE = perf::WkiPerfScope::LOCAL_VMEM;
+        constexpr auto OP = static_cast<uint8_t>(perf::WkiPerfLocalVmemOp::VAS_OBSERVE);
+        uint64_t const SESSION = perf::current_wki_capture_session(SCOPE, OP);
+        bool const TRACE = SESSION != perf::PERF_ANY_SESSION;
+        uint64_t const START = TRACE ? time::get_us() : 0;
+        bool const OBSERVED = observe();
+        if (TRACE) {
+            uint64_t const NOW = time::get_us();
+            uint32_t const ELAPSED = static_cast<uint32_t>(std::min<uint64_t>(UINT32_MAX, NOW >= START ? NOW - START : 0));
+            int32_t const STATUS = OBSERVED ? 0 : -EFAULT;
+            perf::record_wki_event(static_cast<uint32_t>(cpu::current_cpu()), m_subject->pid, SCOPE, OP, perf::WkiPerfPhase::END, 0, 0,
+                                   perf::next_wki_trace_correlation(), STATUS, ELAPSED, 0, SESSION);
+            perf::record_wki_summary(SCOPE, OP, 0, 0, STATUS, ELAPSED, true, 0, 0, SESSION);
+        }
     }
 }
 }  // namespace ker::mod::sched::resource

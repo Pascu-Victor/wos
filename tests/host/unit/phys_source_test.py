@@ -606,6 +606,16 @@ def test_kernel_stacks_use_an_early_fixed_slot_pool() -> None:
     phys = PHYS_CPP.read_text()
     phys_hpp = PHYS_HPP.read_text()
     mm = MM_CPP.read_text()
+    mm_hpp = (MM_CPP.parent / "mm.hpp").read_text()
+
+    require_tokens(
+        mm_hpp,
+        [
+            "inline constexpr size_t KERNEL_STACK_POOL_CAPACITY = 256",
+            "KERNEL_STACK_SLOT_STRIDE = KERNEL_STACK_SIZE + (2 * KERNEL_STACK_GUARD_SIZE)",
+        ],
+        "guarded stack capacity and two-sided slot layout",
+    )
 
     require_tokens(
         phys_hpp,
@@ -630,7 +640,7 @@ def test_kernel_stacks_use_an_early_fixed_slot_pool() -> None:
     require_tokens(
         phys,
         [
-            "constexpr size_t KERNEL_STACK_POOL_CAPACITY = 256",
+            "constexpr size_t KERNEL_STACK_POOL_CAPACITY = ker::mod::mm::KERNEL_STACK_POOL_CAPACITY",
             "constexpr size_t KERNEL_STACK_POOL_BYTES = KERNEL_STACK_POOL_CAPACITY * ker::mod::mm::KERNEL_STACK_SIZE",
             "constexpr size_t KERNEL_STACK_POOL_MIN_BYTES = size_t{16} * 1024 * 1024",
             "std::array<void*, KERNEL_STACK_POOL_CAPACITY> free_slots{}",
@@ -644,24 +654,39 @@ def test_kernel_stacks_use_an_early_fixed_slot_pool() -> None:
             "while (arena_bytes >= KERNEL_STACK_POOL_MIN_BYTES)",
             'page_alloc_full_overwrite_may_fail(PhysicalPageOwner::KERNEL_STACK_POOL, arena_bytes, "kernel_stack_pool")',
             "arena_bytes /= 2",
-            "pool.base = static_cast<uint8_t*>(BACKING)",
-            "pool.capacity = arena_bytes / ker::mod::mm::KERNEL_STACK_SIZE",
+            "virt::init_guarded_kernel_stack_pool(BACKING, CAPACITY)",
+            "pool.lock.lock_irqsave()",
+            "pool.backing = static_cast<uint8_t*>(BACKING)",
+            "pool.capacity = CAPACITY",
+            "pool.virtual_base = static_cast<uint8_t*>(virt::guarded_kernel_stack_slot(0))",
             "pool.free_count = pool.capacity",
-            "pool.free_slots.at(i) = pool.base + (i * ker::mod::mm::KERNEL_STACK_SIZE)",
+            "pool.free_slots.at(i) = virt::guarded_kernel_stack_slot(i)",
+            "pool.in_use.at(i) = false",
+            "pool.lock.unlock_irqrestore(FLAGS)",
         ],
-        "early contiguous kernel stack pool reservation",
+        "early backing reservation and guarded virtual stack publication",
     )
     require_order(
         function_body(phys, "kernel_stack_alloc"),
         [
             "pool.lock.lock_irqsave()",
             "--pool.free_count",
+            "pool.free_slots.at(pool.free_count) = nullptr",
+            "OFFSET % STACK_STRIDE",
+            "INDEX >= pool.capacity",
+            "pool.in_use.at(INDEX)",
             "pool.in_use.at(INDEX) = true",
             "pool.lock.unlock_irqrestore(FLAGS)",
-            "prepare_allocated_block(stack, ker::mod::mm::KERNEL_STACK_SIZE, ReturnedPageZeroing::ZERO)",
-            "page_alloc_with_reclaim_may_fail(PhysicalPageOwner::KERNEL_STACK, ker::mod::mm::KERNEL_STACK_SIZE, name)",
+            "std::memset(stack, 0, ker::mod::mm::KERNEL_STACK_SIZE)",
+            "return stack",
+            "return nullptr",
         ],
-        "kernel stack pool allocation and buddy fallback",
+        "guarded stack allocation validates ownership and zeroes outside its lock",
+    )
+    require_absent(
+        function_body(phys, "kernel_stack_alloc"),
+        "page_alloc",
+        "exhausted guarded pool must not fall back to unguarded stacks",
     )
     require_tokens(
         function_body(phys, "page_alloc_full_overwrite_may_fail"),
@@ -681,7 +706,7 @@ def test_kernel_stacks_use_an_early_fixed_slot_pool() -> None:
     require_order(
         function_body(phys, "release_kernel_stack_pool_slot"),
         [
-            "OFFSET % ker::mod::mm::KERNEL_STACK_SIZE",
+            "OFFSET % STACK_STRIDE",
             "pool.lock.lock_irqsave()",
             "!pool.in_use.at(INDEX)",
             "pool.in_use.at(INDEX) = false",

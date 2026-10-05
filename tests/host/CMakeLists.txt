@@ -676,6 +676,42 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/vmem_source_test.py
 )
 add_test(
+    NAME vmem_cache_perf_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/vmem_cache_perf_runtime_test.py
+)
+add_test(
+    NAME vas_observer_perf_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/vas_observer_perf_runtime_test.py
+)
+add_test(
+    NAME vas_admission_reuse_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/vas_admission_reuse_runtime_test.py
+)
+add_test(
+    NAME thread_backing_zero_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/thread_backing_zero_test.py
+)
+add_test(
+    NAME thread_initial_backing_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/thread_initial_backing_test.py
+)
+add_test(
+    NAME lazy_page_backing_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/lazy_page_backing_test.py
+)
+add_test(
+    NAME user_layout_walk_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/user_layout_walk_test.py
+)
+add_test(
+    NAME page_table_zero_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/page_table_zero_test.py
+)
+add_test(
+    NAME root_kernel_mappings_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/root_kernel_mappings_test.py
+)
+add_test(
     NAME tmpfs_swap_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/tmpfs_swap_source_test.py
 )
@@ -857,6 +893,15 @@ set_tests_properties(    host_test_manifest_test
     vfs_pread_source_test
     vfs_sendfile_source_test
     vmem_source_test
+    vmem_cache_perf_runtime_test
+    vas_observer_perf_runtime_test
+    vas_admission_reuse_runtime_test
+    thread_backing_zero_test
+    thread_initial_backing_test
+    lazy_page_backing_test
+    user_layout_walk_test
+    page_table_zero_test
+    root_kernel_mappings_test
     tmpfs_swap_source_test
     tmpfs_link_source_test
     init_stdio_source_test

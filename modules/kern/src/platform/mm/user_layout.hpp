@@ -32,8 +32,9 @@ inline constexpr AddressWindow MMAP_WINDOW{0x0000200000000000ULL, 0x000060000000
 // Leaves the fixed ELF-debug metadata starting at 0x700000000000 untouched.
 inline constexpr AddressWindow THREAD_WINDOW{0x0000740000000000ULL, 0x00007F0000000000ULL, THREAD_ALIGNMENT};
 
-// True only when every page in [start, start + size) is neither mapped nor
-// reserved. Publication/metadata locks remain the caller's responsibility.
+// True only when every page in the lower-half user range [start, start + size)
+// is neither mapped nor reserved. Publication/metadata locks remain the
+// caller's responsibility; invalid ranges and root teardown fail closed.
 [[nodiscard]] auto range_is_free(paging::PageTable* page_table, uint64_t start, uint64_t size) -> bool;
 
 // image_min_vaddr and image_max_vaddr are page-aligned PT_LOAD extents, with

@@ -264,8 +264,24 @@ def require_mapping_mutations_use_shootdown(source: str) -> None:
         fail("unmap_page must complete the shootdown before dropping the old page reference")
 
     reserve_body = function_body(source, "reserve_page_range")
-    flush = reserve_body.find("flush_pagemap_after_update(page_table, CURRENT_VADDR, path_promoted)")
-    drop = reserve_body.find("drop_present_leaf_ref(OLD_ENTRY)")
+    reserve_order = [
+        "while (page_index < PAGE_COUNT)",
+        "paging::PAGE_TABLE_ENTRIES - FIRST_LEAF",
+        "user_mapping_pin_lock.lock_irqsave()",
+        "entry = pte_from_raw(paging::PAGE_RESERVED)",
+        "user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS)",
+        "if (path_promoted || replaced_translation)",
+        "flush_pagemap_after_update(page_table, BATCH_VADDR, true)",
+        "drop_present_leaf_ref(retired_present.at(i))",
+    ]
+    cursor = 0
+    for snippet in reserve_order:
+        found = reserve_body.find(snippet, cursor)
+        if found < 0:
+            fail("fresh reservations must skip redundant TLB flushes while replacements flush before releasing ownership")
+        cursor = found + len(snippet)
+    flush = reserve_body.find("flush_pagemap_after_update(page_table, BATCH_VADDR, true)")
+    drop = reserve_body.find("drop_present_leaf_ref(retired_present.at(i))")
     if flush < 0 or drop < 0 or flush > drop:
         fail("reserve_page_range must complete the shootdown before dropping the old page reference")
 

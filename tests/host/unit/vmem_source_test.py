@@ -629,7 +629,7 @@ def test_user_memory_pressure_does_not_enter_fatal_oom() -> None:
     require_tokens(
         function_body(virt, "handle_lazy_vmem_fault"),
         [
-            'page_alloc_may_fail(PhysicalPageOwner::USER_PRIVATE_MAPPING, paging::PAGE_SIZE, "lazy-vmem")',
+            'page_alloc_full_overwrite_may_fail(PhysicalPageOwner::USER_PRIVATE_MAPPING, paging::PAGE_SIZE, "lazy-vmem")',
             "cow_pte_lock.lock_irqsave()",
             "anonymous_lazy_range_allows_fault(task, PAGE_VADDR, fault, current_prot)",
             "translate(task->pagemap, PAGE_VADDR) != PADDR_INVALID",
@@ -642,8 +642,14 @@ def test_user_memory_pressure_does_not_enter_fatal_oom() -> None:
     require_order(
         lazy_body,
         "task->lazy_vmem_lock.unlock_irqrestore(IRQF);",
-        'page_alloc_may_fail(PhysicalPageOwner::USER_PRIVATE_MAPPING, paging::PAGE_SIZE, "lazy-vmem")',
+        'page_alloc_full_overwrite_may_fail(PhysicalPageOwner::USER_PRIVATE_MAPPING, paging::PAGE_SIZE, "lazy-vmem")',
         "lazy anonymous allocation must happen outside the task range lock",
+    )
+    require_order(
+        lazy_body,
+        "std::memset(PAGE, 0, paging::PAGE_SIZE);",
+        "map_page(task->pagemap, PAGE_VADDR, PADDR, lazy_user_vmem_flags(current_prot));",
+        "full-overwrite lazy anonymous pages must be zero before publication",
     )
     require_order(
         lazy_body,
@@ -826,7 +832,7 @@ def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
             "copy_from_task(*parent, user_sp, prepared_stack_words.data(), sizeof(prepared_stack_words))",
             "ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;",
             "Task::create_user_thread(parent, tcb_va, user_sp, enter_va, prepared_stack_words.at(0),",
-            "prepared_stack_words.at(1));",
+            "prepared_stack_words.at(1), &stack_exhausted);",
             "post_task_for_cpu(TARGET_CPU, t)",
         ],
         "thread lazy-range clone through scheduler publication",
@@ -929,7 +935,7 @@ def test_fork_child_registers_use_immutable_syscall_entry_snapshot() -> None:
         fork,
         [
             "ker::mod::cpu::GPRegs const FORK_ENTRY_REGS = gpr;",
-            "auto const KERNEL_STACK_BASE = alloc_fork_kernel_stack_with_reclaim();",
+            "auto const KERNEL_STACK_BASE = alloc_fork_kernel_stack_from_syscall(parent);",
             "child->context.regs = fork_child_return_regs(FORK_ENTRY_REGS);",
             "post_task_balanced(child)",
         ],
@@ -943,11 +949,11 @@ def test_as_admission_precedes_mapping_mutation() -> None:
     source = SYS_VMEM_CPP.read_text()
     for name in ("anon_allocate", "file_allocate"):
         body = function_body(source, name)
-        require_order(body, "SharedVmemPublicationGuard publication_guard", "admit_address_space(task, task->pagemap, size",
+        require_order(body, "SharedVmemPublicationGuard publication_guard", "observation.admit_mapping(task->pagemap, size",
                       "AS admission must serialize with shared-root publishers")
-        require_order(body, "admit_address_space(task, task->pagemap, size, hint, size)", "release_fixed_mmap_range_locked",
+        require_order(body, "observation.admit_mapping(task->pagemap, size, hint, size)", "release_fixed_mmap_range_locked",
                       "AS denial must preserve MAP_FIXED source mappings")
-        require_order(body, "admit_address_space(task, task->pagemap, size))", "reserve_free_mmap_range_locked",
+        require_order(body, "observation.admit_mapping(task->pagemap, size))", "reserve_free_mmap_range_locked",
                       "AS denial must precede nonfixed VA reservation")
         require_tokens(body, ["AddressSpaceObservation observation(task)"], "AS observes commit/rollback before publication unlock")
     attach = function_body(SHM_CPP.read_text(), "shmat_impl")

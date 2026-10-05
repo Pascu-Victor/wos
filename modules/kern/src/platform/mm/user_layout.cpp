@@ -92,13 +92,7 @@ auto range_is_free(paging::PageTable* page_table, uint64_t start, uint64_t size)
         start > UINT64_MAX - size) {
         return false;
     }
-    uint64_t const END = start + size;
-    for (uint64_t address = start; address < END; address += paging::PAGE_SIZE) {
-        if (virt::is_page_mapped_or_reserved(page_table, address)) {
-            return false;
-        }
-    }
-    return true;
+    return virt::is_user_virtual_range_free(page_table, start, start + size);
 }
 
 auto choose_image_base(paging::PageTable* page_table, ImageRole role, uint64_t image_min_vaddr, uint64_t image_max_vaddr, uint64_t& base)

@@ -941,19 +941,26 @@ auto file_mmap_cached_page_for_file(ker::vfs::File* file, const ker::vfs::Stat& 
         return false;
     }
 
-    auto* task = get_current_task();
+    // Clock reads can require HPET MMIO. Only sample cache diagnostics when
+    // recording is active; the recorder otherwise discards these events.
+    bool const TRACE_CACHE = ker::mod::perf::is_wki_recording_enabled();
+    auto* task = TRACE_CACHE ? get_current_task() : nullptr;
     FileMmapPageKey key = file_mmap_page_key(st, file_offset);
     if (file->exec_read_view != nullptr) key.exec_content_id = file->exec_read_view->content_id;
     FileMmapPageKey const KEY = key;
-    uint64_t const LOOKUP_STARTED_US = ker::mod::time::get_us();
+    uint64_t const LOOKUP_STARTED_US = TRACE_CACHE ? ker::mod::time::get_us() : 0;
     if (void* const CACHED_PAGE = file_mmap_cache_lookup(KEY); CACHED_PAGE != nullptr) {
         *page_out = CACHED_PAGE;
-        record_local_vmem_cache_event(task, ker::mod::perf::WkiPerfLocalVmemOp::FILE_CACHE_HIT, file_offset,
-                                      vmem_latency_since(LOOKUP_STARTED_US), true);
+        if (TRACE_CACHE) {
+            record_local_vmem_cache_event(task, ker::mod::perf::WkiPerfLocalVmemOp::FILE_CACHE_HIT, file_offset,
+                                          vmem_latency_since(LOOKUP_STARTED_US), true);
+        }
         return true;
     }
-    record_local_vmem_cache_event(task, ker::mod::perf::WkiPerfLocalVmemOp::FILE_CACHE_MISS, file_offset,
-                                  vmem_latency_since(LOOKUP_STARTED_US), true);
+    if (TRACE_CACHE) {
+        record_local_vmem_cache_event(task, ker::mod::perf::WkiPerfLocalVmemOp::FILE_CACHE_MISS, file_offset,
+                                      vmem_latency_since(LOOKUP_STARTED_US), true);
+    }
 
     uint64_t const FILE_SIZE = KEY.size;
     bool const FULL_PAGE_READ =
@@ -970,7 +977,7 @@ auto file_mmap_cached_page_for_file(ker::vfs::File* file, const ker::vfs::Stat& 
         std::memset(NEW_PAGE, 0, ker::mod::mm::paging::PAGE_SIZE);
     }
 
-    uint64_t const FILL_STARTED_US = ker::mod::time::get_us();
+    uint64_t const FILL_STARTED_US = TRACE_CACHE ? ker::mod::time::get_us() : 0;
     if (file_offset < FILE_SIZE) {
         size_t const READ_SIZE = static_cast<size_t>(std::min<uint64_t>(ker::mod::mm::paging::PAGE_SIZE, FILE_SIZE - file_offset));
         if (file_offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
@@ -984,13 +991,15 @@ auto file_mmap_cached_page_for_file(ker::vfs::File* file, const ker::vfs::Stat& 
     }
 
     FileMmapCacheInsertResult const INSERT_RESULT = file_mmap_cache_insert_or_discard(KEY, NEW_PAGE, page_out);
-    uint32_t const FILL_US = vmem_latency_since(FILL_STARTED_US);
-    if (INSERT_RESULT == FileMmapCacheInsertResult::DUPLICATE) {
-        record_local_vmem_cache_event(task, ker::mod::perf::WkiPerfLocalVmemOp::FILE_CACHE_HIT, file_offset, FILL_US, true);
-    } else {
-        record_local_vmem_cache_event(task, ker::mod::perf::WkiPerfLocalVmemOp::FILE_CACHE_FILL, file_offset, FILL_US, true);
-        if (INSERT_RESULT == FileMmapCacheInsertResult::EVICTED) {
-            record_local_vmem_cache_event(task, ker::mod::perf::WkiPerfLocalVmemOp::FILE_CACHE_EVICT, file_offset, 0, false);
+    if (TRACE_CACHE) {
+        uint32_t const FILL_US = vmem_latency_since(FILL_STARTED_US);
+        if (INSERT_RESULT == FileMmapCacheInsertResult::DUPLICATE) {
+            record_local_vmem_cache_event(task, ker::mod::perf::WkiPerfLocalVmemOp::FILE_CACHE_HIT, file_offset, FILL_US, true);
+        } else {
+            record_local_vmem_cache_event(task, ker::mod::perf::WkiPerfLocalVmemOp::FILE_CACHE_FILL, file_offset, FILL_US, true);
+            if (INSERT_RESULT == FileMmapCacheInsertResult::EVICTED) {
+                record_local_vmem_cache_event(task, ker::mod::perf::WkiPerfLocalVmemOp::FILE_CACHE_EVICT, file_offset, 0, false);
+            }
         }
     }
     return true;
@@ -1559,8 +1568,8 @@ auto materialize_lazy_file_page_impl(ker::mod::sched::task::Task* task, const La
             return false;
         }
     } else {
-        page = ker::mod::mm::phys::page_alloc_with_reclaim_may_fail(ker::mod::mm::PhysicalPageOwner::USER_FILE_MAPPING,
-                                                                    ker::mod::mm::paging::PAGE_SIZE, "vmem-file-lazy");
+        page = ker::mod::mm::phys::page_alloc_full_overwrite_page_with_reclaim_may_fail(ker::mod::mm::PhysicalPageOwner::USER_FILE_MAPPING,
+                                                                                        "vmem-file-lazy");
         if (page == nullptr) {
             return false;
         }
@@ -1787,11 +1796,11 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
         }
         vaddr = hint;
-        if (!ker::mod::sched::resource::admit_address_space(task, task->pagemap, size, hint, size)) {
+        if (!observation.admit_mapping(task->pagemap, size, hint, size)) {
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
         }
     } else {
-        if (!ker::mod::sched::resource::admit_address_space(task, task->pagemap, size)) {
+        if (!observation.admit_mapping(task->pagemap, size)) {
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
         }
         uint64_t const RESERVE_RET = reserve_free_mmap_range_locked(task, size, hint, vaddr);
@@ -1817,6 +1826,7 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
         advance_shared_mmap_cursor_locked(task, vaddr, size);
         record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::ANON_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES, 1, 0,
                                 vmem_latency_since(PERF_STARTED_US), vaddr, size, true);
+        observation.commit_mapping();
         return vaddr;
     }
 
@@ -1839,6 +1849,7 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
         advance_shared_mmap_cursor_locked(task, vaddr, size);
         record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::ANON_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES, 3, 0,
                                 vmem_latency_since(PERF_STARTED_US), vaddr, size, true);
+        observation.commit_mapping();
         return vaddr;
     }
 
@@ -2042,11 +2053,11 @@ auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t si
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
         }
         vaddr = hint;
-        if (!ker::mod::sched::resource::admit_address_space(task, task->pagemap, size, hint, size)) {
+        if (!observation.admit_mapping(task->pagemap, size, hint, size)) {
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
         }
     } else {
-        if (!ker::mod::sched::resource::admit_address_space(task, task->pagemap, size)) {
+        if (!observation.admit_mapping(task->pagemap, size)) {
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
         }
         uint64_t const RESERVE_RET = reserve_free_mmap_range_locked(task, size, hint, vaddr);
@@ -2081,6 +2092,7 @@ auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t si
         advance_shared_mmap_cursor_locked(task, vaddr, size);
         record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::FILE_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES, 0, 0,
                                 vmem_latency_since(PERF_STARTED_US), vaddr, size, true);
+        observation.commit_mapping();
         return vaddr;
     }
 

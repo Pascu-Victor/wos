@@ -26,7 +26,9 @@ using log = ker::mod::dbg::logger<"thread">;
 
 util::List<Thread*> active_threads;
 sys::Spinlock active_threads_lock;
-constexpr uint64_t STACK_INITIAL_BACKING_BYTES = 256ULL * 1024ULL;
+// Keep startup residency small; exec backs argument pages explicitly and the
+// existing fault path grows the full reserved stack in larger batches.
+constexpr uint64_t STACK_INITIAL_BACKING_BYTES = 32ULL * 1024ULL;
 constexpr uint64_t STACK_GROW_NORMAL_BYTES = 256ULL * 1024ULL;
 constexpr uint64_t STACK_GROW_MEDIUM_BYTES = 512ULL * 1024ULL;
 constexpr uint64_t STACK_GROW_LARGE_BYTES = 1024ULL * 1024ULL;
@@ -78,8 +80,10 @@ void free_mapped_user_range(mm::paging::PageTable* page_table, uint64_t start, u
 
 auto map_zeroed_user_range(mm::paging::PageTable* page_table, uint64_t start, uint64_t size, const char* allocation_name) -> bool {
     for (uint64_t offset = 0; offset < size; offset += mm::paging::PAGE_SIZE) {
+        // Fully clear private backing before publishing its user PTE. Avoid
+        // an allocator zero/CR3 round trip followed by the same full clear.
         void* page =
-            mm::phys::page_alloc_with_reclaim_may_fail(mm::PhysicalPageOwner::USER_THREAD_TLS, mm::paging::PAGE_SIZE, allocation_name);
+            mm::phys::page_alloc_full_overwrite_page_with_reclaim_may_fail(mm::PhysicalPageOwner::USER_THREAD_TLS, allocation_name);
         if (page == nullptr) {
             return false;
         }
@@ -155,8 +159,8 @@ auto back_stack_pages(mm::paging::PageTable* page_table, uint64_t low, uint64_t 
         constexpr bool INJECT_FAILURE = false;
 #endif
         auto* page = INJECT_FAILURE ? nullptr
-                                    : static_cast<PendingPage*>(mm::phys::page_alloc_may_fail(mm::PhysicalPageOwner::USER_THREAD_STACK,
-                                                                                              mm::paging::PAGE_SIZE, "thread_stack_lazy"));
+                                    : static_cast<PendingPage*>(mm::phys::page_alloc_full_overwrite_may_fail(
+                                          mm::PhysicalPageOwner::USER_THREAD_STACK, mm::paging::PAGE_SIZE, "thread_stack_lazy"));
         if (page == nullptr) {
             while (pending != nullptr) {
                 auto* next = pending->next;
