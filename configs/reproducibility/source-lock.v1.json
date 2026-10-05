@@ -29,8 +29,8 @@
       "id": "mlibc",
       "path": "toolchain/src/mlibc",
       "urls": ["https://github.com/Pascu-Victor/mlibc.git"],
-      "commit": "17fdb933d0ab5624ef027efb2bc5473744c10713",
-      "treeSha256": "55f78f5649a6e09f14513457ea484dcea10e170e9cfbc8b33ae5900aa4890131",
+      "commit": "1db6e08fb8feb0890c7254df347b7a521c6e85d5",
+      "treeSha256": "1a5b08cdc202f778967e7983002710e5de3f0c704b183370c454d496d7429b71",
       "license": "MIT",
       "role": "WOS libc"
     },

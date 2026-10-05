@@ -166,6 +166,9 @@ UNIT_TESTS=(
     buffer_cache_source_test
     udp_bind_device_source_test
     mlibc_dns_source_test
+    mlibc_allocator_source_test
+    rtld_bss_runtime_test
+    rtld_gnu_bloom_runtime_test
     mlibc_spawn_source_test
     mlibc_vfs_source_test
     mlibc_conformance_test
@@ -285,6 +288,8 @@ UNIT_TESTS=(
     reclaim_policy_test
     anonymous_swap_state_test
     vmem_source_test
+    mlibc_locale_runtime_test
+    mlibc_slab_runtime_test
     perf_event_parser_test
 )
 

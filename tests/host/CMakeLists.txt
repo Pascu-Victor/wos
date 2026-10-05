@@ -379,6 +379,18 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/mlibc_dns_source_test.py
 )
 add_test(
+    NAME mlibc_allocator_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/mlibc_allocator_source_test.py
+)
+add_test(
+    NAME mlibc_slab_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/mlibc_slab_runtime_test.py
+)
+add_test(
+    NAME mlibc_locale_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/mlibc_locale_runtime_test.py
+)
+add_test(
     NAME mlibc_spawn_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/mlibc_spawn_source_test.py
 )
@@ -771,6 +783,9 @@ set_tests_properties(    host_test_manifest_test
     kernel_vmap_source_test
     udp_bind_device_source_test
     mlibc_dns_source_test
+    mlibc_allocator_source_test
+    mlibc_slab_runtime_test
+    mlibc_locale_runtime_test
     mlibc_spawn_source_test
     mlibc_vfs_source_test
     mlibc_conformance_test
@@ -1146,3 +1161,15 @@ set_tests_properties(perf_capture_io_test PROPERTIES LABELS "unit;host")
 add_test(NAME perf_run_observer_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/perf_run_observer_test.py)
 set_tests_properties(perf_run_observer_test PROPERTIES LABELS "unit;host")
+
+add_test(
+    NAME rtld_bss_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/rtld_bss_runtime_test.py
+)
+set_tests_properties(rtld_bss_runtime_test PROPERTIES LABELS "host;unit")
+
+add_test(
+    NAME rtld_gnu_bloom_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/rtld_gnu_bloom_runtime_test.py
+)
+set_tests_properties(rtld_gnu_bloom_runtime_test PROPERTIES LABELS "host;unit")
