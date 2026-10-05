@@ -106,7 +106,7 @@ def test_rto_floor_is_not_aggressive() -> None:
         fail("initial TCP RTO must not inherit the established-flow 200ms floor")
     if "std::max<uint64_t>(cb->rto_ms, TCP_RTO_MIN_MS)" not in input_source:
         fail("RTT estimator must clamp to TCP_RTO_MIN_MS")
-    if "std::min<uint64_t>(rcb->rto_ms, TCP_RTO_MAX_MS)" not in timer_source:
+    if "std::min<uint64_t>(std::max<uint64_t>(cb->rto_ms, TCP_RTO_MIN_MS), TCP_RTO_MAX_MS / 2) * 2" not in timer_source:
         fail("timer backoff must clamp to TCP_RTO_MAX_MS")
     if "50ULL" in input_source:
         fail("TCP RTO floor regressed to 50ms")
@@ -170,19 +170,24 @@ def test_receiver_sack_advertises_and_reports_out_of_order_block() -> None:
         "single-block SACK ACK helper",
     )
 
-    build_control = function_body(output_source, "tcp_build_control_locked")
+    fill_control = function_body(output_source, "tcp_fill_control_locked")
     require_order(
-        build_control,
+        fill_control,
         [
             "write_sack_option_locked(cb, options.data(), options.size())",
             "size_t const HDR_LEN = sizeof(TcpHeader) + OPTS_LEN",
             "std::memcpy(payload + sizeof(TcpHeader), options.data(), OPTS_LEN)",
             "hdr->data_offset = static_cast<uint8_t>((HDR_LEN / 4U) << 4U)",
-            "*out_local = cb->local",
-            "*out_remote = cb->remote",
-            "return pkt",
+            "return true",
         ],
         "SACK option included in ACK packet",
+    )
+    build_control = function_body(output_source, "tcp_build_control_locked")
+    require_order(
+        build_control,
+        ["pkt_alloc()", "tcp_fill_control_locked(cb, pkt, seq, flags, include_sack)",
+         "*out_local = cb->local", "*out_remote = cb->remote", "return pkt"],
+        "control allocation delegates to the bounded family-neutral filler",
     )
     build_ack = function_body(output_source, "tcp_build_ack")
     if "tcp_build_control_locked(cb, cb->snd_nxt, TCP_ACK, true, out_local, out_remote)" not in build_ack:

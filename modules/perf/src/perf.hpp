@@ -80,6 +80,7 @@ constexpr std::size_t PERF_DRAIN_CAPACITY = 65536;
 constexpr std::size_t CPUSTAT_READ_CAPACITY = 16384;
 constexpr std::size_t READ_CHUNK_CAPACITY = 4096;
 constexpr std::size_t PROCFS_READ_LIMIT = 262144;
+constexpr std::size_t NETDIAG_READ_LIMIT = 4U * 1024U * 1024U;
 constexpr std::size_t PERF_PROC_READ_LIMIT = 65536;
 constexpr std::size_t PERF_DATA_READ_LIMIT = std::size_t{8} * 1024 * 1024;
 constexpr std::size_t MAX_EVENT_TOKENS = 14;

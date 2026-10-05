@@ -2726,6 +2726,31 @@ void append_ipv4(char*& p, const char* end, uint32_t ip) {
     append_dec64(p, end, ip & 0xffU);
 }
 
+void append_tcp_endpoint(char*& p, const char* end, const ker::net::SocketEndpoint& endpoint) {
+    if (endpoint.is_ipv6() && !endpoint.is_v4_mapped()) {
+        constexpr std::array<char, 16> HEX_DIGITS{'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
+        append_char(p, end, '[');
+        for (size_t i = 0; i < endpoint.address.size(); i += 2) {
+            if (i != 0) {
+                append_char(p, end, ':');
+            }
+            uint16_t const WORD = static_cast<uint16_t>((static_cast<uint16_t>(endpoint.address.at(i)) << 8U) | endpoint.address.at(i + 1));
+            for (int shift = 12; shift >= 0; shift -= 4) {
+                append_char(p, end, HEX_DIGITS.at((WORD >> shift) & 0xfU));
+            }
+        }
+        if (endpoint.scope_id != 0) {
+            append_char(p, end, '%');
+            append_dec64(p, end, endpoint.scope_id);
+        }
+        append_char(p, end, ']');
+    } else {
+        append_ipv4(p, end, endpoint.ipv4_address().to_host_order());
+    }
+    append_char(p, end, ':');
+    append_dec64(p, end, endpoint.port);
+}
+
 auto peer_state_name(ker::net::wki::PeerState state) -> const char* {
     switch (state) {
         case ker::net::wki::PeerState::UNKNOWN:
@@ -4543,9 +4568,7 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {  // NOLINT(readab
     for (size_t i = 0; i < LISTENER_COUNT; ++i) {
         const auto& listener = listeners.at(i);
         append_sconst(p, end, "tcp_listener local=");
-        append_ipv4(p, end, listener.local_ip);
-        append_char(p, end, ':');
-        append_dec64(p, end, listener.local_port);
+        append_tcp_endpoint(p, end, listener.local);
         append_sconst(p, end, " state=");
         append_sconst(p, end, tcp_state_name(listener.state));
         append_sconst(p, end, " owner_pid=");
@@ -4575,13 +4598,9 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {  // NOLINT(readab
     for (size_t i = 0; i < TCP_CONN_COUNT; ++i) {
         const auto& conn = tcp_conns.at(i);
         append_sconst(p, end, "tcp_conn local=");
-        append_ipv4(p, end, conn.local_ip);
-        append_char(p, end, ':');
-        append_dec64(p, end, conn.local_port);
+        append_tcp_endpoint(p, end, conn.local);
         append_sconst(p, end, " remote=");
-        append_ipv4(p, end, conn.remote_ip);
-        append_char(p, end, ':');
-        append_dec64(p, end, conn.remote_port);
+        append_tcp_endpoint(p, end, conn.remote);
         append_sconst(p, end, " state=");
         append_sconst(p, end, tcp_state_name(conn.state));
         append_sconst(p, end, " owner_pid=");
@@ -4604,6 +4623,38 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {  // NOLINT(readab
         append_dec64(p, end, conn.ooo_bytes);
         append_sconst(p, end, " sack=");
         append_bool01(p, end, conn.sack_permitted);
+        append_sconst(p, end, " sender_enabled=");
+        append_bool01(p, end, conn.sender_enabled);
+        append_sconst(p, end, " cwnd=");
+        append_dec64(p, end, conn.cwnd);
+        append_sconst(p, end, " ssthresh=");
+        append_dec64(p, end, conn.ssthresh);
+        append_sconst(p, end, " flight=");
+        append_dec64(p, end, conn.flight);
+        append_sconst(p, end, " dupacks=");
+        append_dec64(p, end, conn.duplicate_acks);
+        append_sconst(p, end, " recovery=");
+        append_bool01(p, end, conn.in_recovery);
+        append_sconst(p, end, " recovery_reason=");
+        append_dec64(p, end, conn.recovery_reason);
+        append_sconst(p, end, " rto_ms=");
+        append_dec64(p, end, conn.rto_ms);
+        append_sconst(p, end, " retransmit_packets=");
+        append_dec64(p, end, conn.retransmits);
+        append_sconst(p, end, " recovery_requests=");
+        append_dec64(p, end, conn.recovery_requests);
+        append_sconst(p, end, " timeouts=");
+        append_dec64(p, end, conn.timeouts);
+        append_sconst(p, end, " sack_ranges=");
+        append_dec64(p, end, conn.sack_ranges);
+        append_sconst(p, end, " sack_blocks=");
+        append_dec64(p, end, conn.sack_blocks);
+        append_sconst(p, end, " sack_drops=");
+        append_dec64(p, end, conn.sack_drops);
+        append_sconst(p, end, " persist_probes=");
+        append_dec64(p, end, conn.persist_probes);
+        append_sconst(p, end, " persist_deadline=");
+        append_dec64(p, end, conn.persist_deadline);
         append_sconst(p, end, " refcnt=");
         append_dec64(p, end, conn.refcount);
         append_char(p, end, '\n');

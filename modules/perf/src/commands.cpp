@@ -16,6 +16,7 @@ int run_record_command(int argc, char** argv);
 int run_report_command(int argc, char** argv);
 int run_cpustat_command(int argc, char** argv);
 int run_contstat_command(int argc, char** argv);
+int run_tcp_report_command(int argc, char** argv);
 int run_ipc_report_command(int argc, char** argv);
 int run_wki_report_command(int argc, char** argv);
 int run_local_report_command(int argc, char** argv);
@@ -38,7 +39,7 @@ int run_data_convert_command(int argc, char** argv);
 int run_data_export_command(int argc, char** argv);
 int run_help_command(int argc, char** argv);
 
-constexpr std::array<CommandSpec, 27> COMMANDS = {{
+constexpr std::array<CommandSpec, 28> COMMANDS = {{
     {.name = "stat", .args = "[ms=1000]", .summary = "CPU% per process over a sampling window", .handler = run_stat_command},
     {.name = "record",
      .args = "[ms=1000] [--filter=<filters>] [--structured]",
@@ -54,6 +55,10 @@ constexpr std::array<CommandSpec, 27> COMMANDS = {{
      .handler = run_report_command},
     {.name = "cpustat", .args = "", .summary = "Per-CPU aggregate scheduler statistics", .handler = run_cpustat_command},
     {.name = "contstat", .args = "", .summary = "Per-subsystem container statistics", .handler = run_contstat_command},
+    {.name = "tcp-report",
+     .args = "",
+     .summary = "Live TCP congestion, recovery, SACK and persist state",
+     .handler = run_tcp_report_command},
     {.name = "ipc-report",
      .args = "[n=15] [filters]",
      .summary = "Remote IPC and local pipe latency, jitter, throughput, memory, and queue pressure",
@@ -237,6 +242,45 @@ int run_cpustat_command(int /*argc*/, char** /*argv*/) {
 
 int run_contstat_command(int /*argc*/, char** /*argv*/) {
     cmd_contstat();
+    return 0;
+}
+
+int run_tcp_report_command(int argc, char** /*argv*/) {
+    if (argc != 2) {
+        std::println("Usage: perf tcp-report");
+        return 1;
+    }
+    auto snapshot = read_file("/proc/wki/netdiag");
+    if (!snapshot) {
+        std::println("perf tcp-report: cannot read /proc/wki/netdiag");
+        return 1;
+    }
+    std::string_view remaining(*snapshot);
+    size_t connections = 0;
+    bool complete = false;
+    while (!remaining.empty()) {
+        size_t const END = remaining.find('\n');
+        std::string_view const LINE = remaining.substr(0, END);
+        if (LINE.starts_with("tcp_conn ")) {
+            std::println("{}", LINE);
+            ++connections;
+        } else if (LINE.starts_with("tcp_conn_truncated ")) {
+            std::println("{}", LINE);
+        } else if (LINE == "wki_netdiag_end complete=1") {
+            complete = true;
+        }
+        if (END == std::string_view::npos) {
+            break;
+        }
+        remaining.remove_prefix(END + 1);
+    }
+    if (!complete) {
+        std::println("perf tcp-report: incomplete network snapshot");
+        return 1;
+    }
+    if (connections == 0) {
+        std::println("No TCP connections.");
+    }
     return 0;
 }
 

@@ -22,6 +22,7 @@ option(WOS_SCHED_TRANSITION_VALIDATION "Validate scheduler transitions at stable
 option(WOS_PREEMPT_GUARD_TIMING "Sample preemption-disabled hold durations for diagnostics" OFF)
 option(WOS_NET_TRACE               "Enable network hot-path cycle-count trace spans"                    OFF)
 option(WOS_NET_PACKET_DEBUG        "Track packet buffer allocation provenance and TX-refusal snapshots" OFF)
+option(WOS_TCP_CONGESTION_CONTROL  "Enable bounded NewReno/SACK TCP sender"                               ON)
 option(WOS_PHYS_ALLOC_CALLER_STATS "Track physical page allocation call sites for OOM reports"          OFF)
 option(WOS_PHYS_LOCK_DEBUG         "Track physical allocator memlock holder CR3/CPU/RIP"                OFF)
 option(WOS_KMALLOC_DEBUG_INFO      "Track kmalloc allocation call sites/tags for OOM/corruption dumps"  OFF)
@@ -94,6 +95,9 @@ endif()
 
 # Add executable
 add_executable(${KERNEL} ${CFILES} ${ASFILES} ${NASMFILES} ${CXXFILES})
+if(WOS_TCP_CONGESTION_CONTROL)
+    target_compile_definitions(${KERNEL} PRIVATE WOS_TCP_CONGESTION_CONTROL=1)
+endif()
 
 set(WOS_KERNEL_C_CXX_OPTIONS
     -ffreestanding

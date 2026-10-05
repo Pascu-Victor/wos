@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -13,6 +14,7 @@
 #include <net/packet.hpp>
 #include <net/proto/ipv4.hpp>
 #include <net/proto/ipv6.hpp>
+#include <net/proto/tcp_sender.hpp>
 #include <new>
 #include <platform/dbg/dbg.hpp>
 #include <utility>
@@ -28,6 +30,20 @@ namespace {
 constexpr size_t TCP_OOO_MAX_BYTES = static_cast<size_t>(1024U) * 1024U;
 constexpr size_t TCP_OOO_MAX_SEGMENTS = 512;
 constexpr uint16_t TCP_DIAG_SSH_PORT = 22;
+
+struct TcpInputSocketRef {
+    Socket* socket = nullptr;
+    ~TcpInputSocketRef() {
+        if (socket != nullptr) {
+            socket_release(socket);
+        }
+    }
+};
+
+struct TcpInputPacketRef {
+    PacketBuffer* packet = nullptr;
+    ~TcpInputPacketRef() { pkt_free(packet); }
+};
 
 auto tcp_header_len(const TcpHeader* hdr) -> size_t { return static_cast<size_t>(hdr->data_offset >> 4U) * sizeof(uint32_t); }
 
@@ -63,11 +79,11 @@ void parse_syn_options(TcpCB* cb, const TcpHeader* hdr, bool refresh_receive_wsc
             break;
         }
         if (opts[i] == TCP_OPTION_MSS && OPT_LEN == TCP_OPTION_MSS_LEN) {
-            cb->snd_mss = read_be16_unaligned(opts + i + TCP_OPTION_DATA_OFFSET);
+            cb->snd_mss = std::max<uint16_t>(1, read_be16_unaligned(opts + i + TCP_OPTION_DATA_OFFSET));
         } else if (opts[i] == TCP_OPTION_SACK_PERMITTED && OPT_LEN == TCP_OPTION_SACK_PERMITTED_LEN) {
             cb->sack_permitted = true;
         } else if (opts[i] == TCP_OPTION_WSCALE && OPT_LEN == TCP_OPTION_WSCALE_LEN) {
-            cb->snd_wscale = opts[i + TCP_OPTION_DATA_OFFSET];
+            cb->snd_wscale = std::min<uint8_t>(14, opts[i + TCP_OPTION_DATA_OFFSET]);
             cb->ws_enabled = true;
             if (refresh_receive_wscale && cb->socket != nullptr) {
                 cb->rcv_wscale = tcp_wscale_for_buf(cb->socket->rcvbuf.capacity);
@@ -102,6 +118,11 @@ void drain_retransmit_queue(TcpCB* cb) {
         n++;
     }
     cb->retransmit_tail = nullptr;
+    cb->retransmit_entries = 0;
+    cb->retransmit_deadline = 0;
+    cb->fast_retransmit_pending = false;
+    cb->persist_needed = false;
+    cb->persist_deadline = 0;
 #ifdef TCP_DEBUG
     if (n > 0) {
         log::debug("drain_rtx: freed %zu entries port=%u pool_free=%zu", n, cb->local.port, ker::net::pkt_pool_free_count());
@@ -113,9 +134,7 @@ void update_rto_from_sample_locked(TcpCB* cb, uint64_t rtt_ms) {
     if (cb == nullptr) {
         return;
     }
-    if (rtt_ms == 0) {
-        rtt_ms = 1;
-    }
+    rtt_ms = std::clamp<uint64_t>(rtt_ms, 1, TCP_RTO_MAX_MS);
 
     if (cb->srtt_ms == 0) {
         cb->srtt_ms = rtt_ms;
@@ -138,6 +157,12 @@ void retire_acked_retransmits_locked(TcpCB* cb, uint32_t seg_ack, uint64_t now_m
     }
 
     bool rtt_sampled = false;
+    // A cumulative ACK spanning any retransmission is ambiguous even if it
+    // also retires a later original packet (Karn's rule).
+    bool ambiguous = false;
+    for (auto* entry = cb->retransmit_head; entry != nullptr && tcp_seq_before(entry->seq, seg_ack); entry = entry->next) {
+        ambiguous = ambiguous || entry->retries != 0;
+    }
     while (cb->retransmit_head != nullptr) {
         auto* entry = cb->retransmit_head;
         uint32_t const ENTRY_END = entry->seq + static_cast<uint32_t>(entry->len);
@@ -145,12 +170,15 @@ void retire_acked_retransmits_locked(TcpCB* cb, uint32_t seg_ack, uint64_t now_m
             break;
         }
 
-        if (update_rtt && !rtt_sampled && entry->retries == 0) {
+        if (update_rtt && !ambiguous && !rtt_sampled && entry->retries == 0 && now_ms >= entry->send_time_ms) {
             update_rto_from_sample_locked(cb, now_ms - entry->send_time_ms);
             rtt_sampled = true;
         }
 
         cb->retransmit_head = entry->next;
+        if (cb->retransmit_entries != 0) {
+            --cb->retransmit_entries;
+        }
         if (cb->retransmit_head == nullptr) {
             cb->retransmit_tail = nullptr;
         }
@@ -165,6 +193,47 @@ void retire_acked_retransmits_locked(TcpCB* cb, uint32_t seg_ack, uint64_t now_m
     } else {
         cb->retransmit_deadline = 0;
     }
+}
+
+auto read_be32_unaligned(const uint8_t* bytes) -> uint32_t {
+    return (static_cast<uint32_t>(bytes[0]) << 24U) | (static_cast<uint32_t>(bytes[1]) << 16U) | (static_cast<uint32_t>(bytes[2]) << 8U) |
+           bytes[3];
+}
+
+auto parse_sender_sack_locked(TcpCB* cb, const TcpHeader* hdr) -> bool {
+    if (!cb->sender_enabled || !cb->sack_permitted) {
+        return false;
+    }
+    size_t const HEADER_LEN = tcp_header_len(hdr);
+    if (HEADER_LEN < sizeof(TcpHeader) || HEADER_LEN > 60) {
+        return false;
+    }
+    auto const* options = reinterpret_cast<const uint8_t*>(hdr) + sizeof(TcpHeader);
+    size_t const LENGTH = HEADER_LEN - sizeof(TcpHeader);
+    bool new_sack = false;
+    for (size_t i = 0; i < LENGTH;) {
+        uint8_t const KIND = options[i];
+        if (KIND == TCP_OPTION_EOL) {
+            break;
+        }
+        if (KIND == TCP_OPTION_NOP) {
+            ++i;
+            continue;
+        }
+        if (i + 1 >= LENGTH || options[i + 1] < 2 || options[i + 1] > LENGTH - i) {
+            break;
+        }
+        size_t const OPTION_LEN = options[i + 1];
+        if (KIND == TCP_OPTION_SACK && OPTION_LEN >= 10 && (OPTION_LEN - 2) % 8 == 0) {
+            for (size_t j = 2; j + 8 <= OPTION_LEN; j += 8) {
+                new_sack = tcp_sack_add(cb->sender.sack, cb->snd_una, cb->snd_nxt, read_be32_unaligned(options + i + j),
+                                        read_be32_unaligned(options + i + j + 4)) ||
+                           new_sack;
+            }
+        }
+        i += OPTION_LEN;
+    }
+    return new_sack;
 }
 
 auto queue_in_order_payload(TcpCB* cb, Socket* sock, const uint8_t* payload, size_t payload_len) -> bool {
@@ -533,7 +602,11 @@ auto discard_orphaned_payload(TcpCB* cb, size_t payload_len, uint32_t seg_seq) -
 // Handle SYN on a listening socket.
 void handle_listen_syn(TcpCB* listener, const TcpHeader* hdr, const SocketEndpoint& source, const SocketEndpoint& destination,
                        uint32_t ingress_mtu) {
-    Socket* listen_sock = listener->socket;
+    uint64_t const LISTENER_FLAGS = listener->lock.lock_irqsave();
+    TcpInputSocketRef listen_ref{listener->socket != nullptr && socket_try_acquire(listener->socket) ? listener->socket : nullptr};
+    Socket* listen_sock = listen_ref.socket;
+    uint16_t const LISTEN_PORT = listener->local.port;
+    listener->lock.unlock_irqrestore(LISTENER_FLAGS);
     if (listen_sock == nullptr) {
         return;
     }
@@ -556,6 +629,7 @@ void handle_listen_syn(TcpCB* listener, const TcpHeader* hdr, const SocketEndpoi
     if (child == nullptr) {
         return;
     }
+    TcpInputSocketRef child_ref{socket_try_acquire(child) ? child : nullptr};
 
     auto* child_cb = static_cast<TcpCB*>(child->proto_data);
     if (child_cb == nullptr) {
@@ -569,14 +643,14 @@ void handle_listen_syn(TcpCB* listener, const TcpHeader* hdr, const SocketEndpoi
     SocketEndpoint const CHILD_DESTINATION = tcp_endpoint_for_socket_domain(listen_sock->domain, destination);
 
     child_cb->local = CHILD_DESTINATION;
-    child_cb->local.port = listener->local.port;
+    child_cb->local.port = LISTEN_PORT;
     child_cb->remote = CHILD_SOURCE;
     child_cb->remote.port = ntohs(hdr->src_port);
     child_cb->rcv_mss = tcp_receive_mss_for_path(child_cb->remote, ingress_mtu);
 
     child->local = child_cb->local;
     child->remote = child_cb->remote;
-    child->ipv6_v6only = listener->socket != nullptr && listener->socket->ipv6_v6only;
+    child->ipv6_v6only = listen_sock->ipv6_v6only;
     child->bound_ifindex = listen_sock->bound_ifindex;
     child->reuse_addr = listen_sock->reuse_addr;
     child->reuse_port = listen_sock->reuse_port;
@@ -585,6 +659,7 @@ void handle_listen_syn(TcpCB* listener, const TcpHeader* hdr, const SocketEndpoi
     child->nonblock = listen_sock->nonblock;
 
     child_cb->irs = ntohl(hdr->seq);
+    ++child_cb->output_generation;
     child_cb->rcv_nxt = child_cb->irs + 1;
     child_cb->rcv_wnd = child->rcvbuf.capacity;
     child_cb->rcv_wscale = tcp_wscale_for_buf(child->rcvbuf.capacity);
@@ -594,8 +669,12 @@ void handle_listen_syn(TcpCB* listener, const TcpHeader* hdr, const SocketEndpoi
     child_cb->snd_nxt = child_cb->iss + 1;
     // SYN window is not scaled (RFC 1323).
     child_cb->snd_wnd = ntohs(hdr->window);
+    child_cb->snd_wl1 = child_cb->irs;
+    child_cb->snd_wl2 = child_cb->snd_una;
 
     parse_syn_options(child_cb, hdr, false);
+    child_cb->snd_mss = tcp_send_mss_for_path(child_cb->remote, child_cb->snd_mss, ingress_mtu);
+    tcp_sender_reset(child_cb->sender, child_cb->snd_mss, child_cb->snd_nxt);
 
     child_cb->state = TcpState::SYN_RECEIVED;
     child->state = SocketState::CONNECTING;
@@ -616,25 +695,55 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
     uint32_t seg_ack = ntohl(hdr->ack);
     uint16_t seg_wnd = ntohs(hdr->window);
 
+    // Only potential data/handshake/FIN replies reserve a packet in RX. Pure
+    // keepalive replies without a spare are retried by the timer.
+    TcpInputPacketRef ack_spare{payload_len != 0 || (flags & (TCP_SYN | TCP_FIN)) != 0 ? pkt_alloc() : nullptr};
+
     // Build ACK/wake decisions under lock, execute after unlock.
     PacketBuffer* deferred_ack = nullptr;
     SocketEndpoint defer_local{};
     SocketEndpoint defer_remote{};
     uint32_t defer_bound_ifindex = 0;
+    uint64_t defer_generation = 0;
     bool defer_ack_pending = false;
     bool deferred_wake = false;
     uint64_t cb_lock_flags = 0;
 
     // Rebuilding supersedes an earlier deferred ACK.
     auto build_deferred_ack = [&]() {
-        if (deferred_ack != nullptr) {
-            pkt_free(deferred_ack);
-        }
-        deferred_ack = tcp_build_ack(cb, &defer_local, &defer_remote);
+        deferred_ack = tcp_build_ack_locked(cb, ack_spare.packet) ? ack_spare.packet : nullptr;
+        defer_local = cb->local;
+        defer_remote = cb->remote;
         defer_bound_ifindex = cb->socket != nullptr ? cb->socket->bound_ifindex : 0;
+        defer_generation = cb->output_generation;
         if (deferred_ack == nullptr) {
             defer_ack_pending = true;
         }
+    };
+
+    auto retry_deferred_ack = [&] {
+        uint64_t const RETRY_FLAGS = cb->lock.lock_irqsave();
+        if (cb->output_generation == defer_generation && cb->state != TcpState::CLOSED && cb->state != TcpState::LISTEN &&
+            cb->state != TcpState::SYN_SENT) {
+            cb->ack_pending = true;
+            tcp_timer_arm(cb);
+        }
+        cb->lock.unlock_irqrestore(RETRY_FLAGS);
+    };
+    auto emit_deferred_ack = [&] {
+        uint64_t const OUTPUT_FLAGS = cb->lock.lock_irqsave();
+        bool const NEEDED = cb->output_generation == defer_generation && cb->state != TcpState::CLOSED && cb->state != TcpState::LISTEN &&
+                            cb->state != TcpState::SYN_SENT;
+        cb->lock.unlock_irqrestore(OUTPUT_FLAGS);
+        ack_spare.packet = nullptr;
+        if (NEEDED) {
+            if (tcp_transmit_prebuilt(deferred_ack, defer_local, defer_remote, defer_bound_ifindex) < 0) {
+                retry_deferred_ack();
+            }
+        } else {
+            pkt_free(deferred_ack);
+        }
+        deferred_ack = nullptr;
     };
 
     auto process_stream_ack = [&]() -> void {
@@ -642,22 +751,66 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
             return;
         }
 
-        bool const VALID_ACK = !tcp_seq_after(seg_ack, cb->snd_nxt);
+        bool const VALID_ACK = !tcp_seq_before(seg_ack, cb->snd_una) && !tcp_seq_after(seg_ack, cb->snd_nxt);
         bool const ACK_ADVANCES = tcp_seq_after(seg_ack, cb->snd_una);
-        if (VALID_ACK && (ACK_ADVANCES || seg_wnd != cb->snd_wnd)) {
-            cb->snd_wnd = static_cast<uint32_t>(seg_wnd) << cb->snd_wscale;
-            if (!ACK_ADVANCES) {
+        if (!VALID_ACK) {
+            return;
+        }
+        uint32_t const OLD_UNA = cb->snd_una;
+        uint32_t const OLD_WINDOW = cb->snd_wnd;
+        uint32_t const NEW_WINDOW = static_cast<uint32_t>(seg_wnd) << cb->snd_wscale;
+        bool const WINDOW_FRESH = tcp_seq_after(SEG_SEQ, cb->snd_wl1) || (SEG_SEQ == cb->snd_wl1 && !tcp_seq_before(seg_ack, cb->snd_wl2));
+        if (WINDOW_FRESH) {
+            cb->snd_wnd = NEW_WINDOW;
+            cb->snd_wl1 = SEG_SEQ;
+            cb->snd_wl2 = seg_ack;
+            if (OLD_WINDOW != NEW_WINDOW) {
                 deferred_wake = true;
             }
         }
-        if (ACK_ADVANCES && VALID_ACK) {
+        if (cb->snd_wnd != 0) {
+            if (cb->persist_deadline != 0 && cb->retransmit_head != nullptr) {
+                cb->retransmit_deadline = tcp_deadline_after_ms(tcp_now_ms(), cb->rto_ms);
+            }
+            cb->persist_needed = false;
+            cb->persist_deadline = 0;
+            cb->persist_interval = TCP_PERSIST_INITIAL_MS;
+        } else if (cb->sender_enabled && WINDOW_FRESH && (cb->state == TcpState::ESTABLISHED || cb->state == TcpState::CLOSE_WAIT)) {
+            // The ACK below may retire every packet. Poll-based writers need
+            // an empty probe even if they do not call send again at window 0.
+            cb->persist_needed = true;
+        }
+        bool const NEW_SACK = parse_sender_sack_locked(cb, hdr);
+        // OOO receive storage can shrink the advertised window on every ACK.
+        // RFC 5681 also permits previously unknown SACK delivery evidence.
+        bool const DUPLICATE = !ACK_ADVANCES && payload_len == 0 && (flags & (TCP_SYN | TCP_FIN | TCP_RST)) == 0 &&
+                               (OLD_WINDOW == NEW_WINDOW || NEW_SACK) && cb->snd_nxt != OLD_UNA;
+        bool const WINDOW_LIMITED = cb->snd_nxt - OLD_UNA >= cb->sender.cwnd;
+        if (cb->sender_enabled && tcp_sender_on_ack(cb->sender, OLD_UNA, cb->snd_nxt, seg_ack, DUPLICATE, WINDOW_LIMITED)) {
+            TcpSackRange hole{};
+            if (tcp_sack_first_hole(cb->sender.sack, seg_ack, cb->snd_nxt, hole)) {
+                cb->fast_retransmit_pending = true;
+                cb->fast_retransmit_seq = hole.left;
+                cb->fast_retransmit_deadline = 0;
+                tcp_timer_arm(cb);
+            }
+        }
+        if (ACK_ADVANCES) {
             cb->snd_una = seg_ack;
+            cb->rto_backed_off = false;
 
             uint64_t const NOW = tcp_now_ms();
             retire_acked_retransmits_locked(cb, seg_ack, NOW, true);
+            if (cb->fast_retransmit_pending && tcp_seq_before(cb->fast_retransmit_seq, seg_ack)) {
+                cb->fast_retransmit_pending = false;
+            }
 
             cb->ack_pending = false;
             deferred_wake = true;
+        }
+        if (cb->sender_enabled &&
+            (cb->fast_retransmit_pending || cb->persist_needed || cb->persist_deadline != 0 || cb->retransmit_head != nullptr)) {
+            tcp_timer_arm(cb);
         }
     };
 
@@ -684,23 +837,46 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
         case TcpState::SYN_SENT: {
             if ((flags & TCP_ACK) != 0 && (flags & TCP_SYN) != 0) {
                 if (seg_ack == cb->snd_nxt) {
+                    bool const SYN_TIMED_OUT = cb->rto_backed_off;
                     cb->irs = SEG_SEQ;
                     cb->rcv_nxt = SEG_SEQ + 1;
                     cb->snd_una = seg_ack;
                     cb->snd_wnd = seg_wnd;
+                    cb->snd_wl1 = SEG_SEQ;
+                    cb->snd_wl2 = seg_ack;
                     retire_acked_retransmits_locked(cb, seg_ack, tcp_now_ms(), true);
                     parse_syn_options(cb, hdr, true);
+                    cb->snd_mss = std::min(cb->rcv_mss, tcp_send_mss_for_path(cb->remote, cb->snd_mss, ingress_mtu));
+                    tcp_sender_reset(cb->sender, cb->snd_mss, cb->snd_nxt);
+                    if (SYN_TIMED_OUT) {
+                        cb->sender.cwnd = cb->sender.mss;
+                    }
+                    // Handshake progress ends its backoff epoch. The first
+                    // data timeout must compute its own threshold reduction.
+                    cb->rto_backed_off = false;
 
                     cb->state = TcpState::ESTABLISHED;
+                    if (cb->sender_enabled && cb->snd_wnd == 0) {
+                        cb->persist_needed = true;
+                        tcp_timer_arm(cb);
+                    }
                     if (cb->socket != nullptr) {
                         cb->socket->state = SocketState::CONNECTED;
                     }
-                    Socket* socket_to_wake = cb->socket;
+                    build_deferred_ack();
+                    Socket* socket_to_wake = cb->socket != nullptr && socket_try_acquire(cb->socket) ? cb->socket : nullptr;
                     cb->lock.unlock_irqrestore(cb_lock_flags);
 
-                    tcp_send_ack(cb);
+                    if (deferred_ack != nullptr) {
+                        emit_deferred_ack();
+                    } else {
+                        retry_deferred_ack();
+                    }
 
                     wake_socket(socket_to_wake);
+                    if (socket_to_wake != nullptr) {
+                        socket_release(socket_to_wake);
+                    }
 
                     // Lock already dropped above.
                     tcp_cb_release(cb);
@@ -715,15 +891,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
 
         case TcpState::SYN_RECEIVED: {
             if ((flags & TCP_RST) != 0) {
-                while (cb->retransmit_head != nullptr) {
-                    auto* entry = cb->retransmit_head;
-                    cb->retransmit_head = entry->next;
-                    if (entry->pkt != nullptr) {
-                        pkt_free(entry->pkt);
-                    }
-                    delete entry;
-                }
-                cb->retransmit_tail = nullptr;
+                drain_retransmit_queue(cb);
                 cb->state = TcpState::CLOSED;
                 break;
             }
@@ -731,12 +899,20 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                 if (seg_ack == cb->snd_nxt) {
                     cb->state = TcpState::ESTABLISHED;
                     cb->snd_una = seg_ack;
+                    cb->rto_backed_off = false;
 
                     retire_acked_retransmits_locked(cb, seg_ack, tcp_now_ms(), true);
                     cb->snd_wnd = static_cast<uint32_t>(seg_wnd) << cb->snd_wscale;
+                    cb->snd_wl1 = SEG_SEQ;
+                    cb->snd_wl2 = seg_ack;
+                    if (cb->sender_enabled && cb->snd_wnd == 0) {
+                        cb->persist_needed = true;
+                        tcp_timer_arm(cb);
+                    }
 
                     // Release cb->lock before tcp_find_listener (takes tcb_list_lock).
-                    Socket* child_sock = cb->socket;
+                    TcpInputSocketRef child_ref{cb->socket != nullptr && socket_try_acquire(cb->socket) ? cb->socket : nullptr};
+                    Socket* child_sock = child_ref.socket;
                     SocketEndpoint const SAVED_LOCAL = cb->local;
                     cb->lock.unlock_irqrestore(cb_lock_flags);
 
@@ -748,8 +924,16 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                         log::debug("SYN_RCVD->ESTAB: port=%u listener=%p owner_pid=%lu", SAVED_LOCAL.port, static_cast<void*>(listener),
                                    (listener != nullptr && listener->socket != nullptr) ? listener->socket->owner_pid : 0UL);
 #endif
-                        if (listener != nullptr && listener->socket != nullptr) {
-                            Socket* lsock = listener->socket;
+                        TcpInputSocketRef listener_ref{};
+                        if (listener != nullptr) {
+                            uint64_t const LISTENER_FLAGS = listener->lock.lock_irqsave();
+                            if (listener->socket != nullptr && socket_try_acquire(listener->socket)) {
+                                listener_ref.socket = listener->socket;
+                            }
+                            listener->lock.unlock_irqrestore(LISTENER_FLAGS);
+                        }
+                        if (listener_ref.socket != nullptr) {
+                            Socket* lsock = listener_ref.socket;
                             uint64_t const LSOCK_FLAGS = lsock->lock.lock_irqsave();
                             if (lsock->state == SocketState::LISTENING && std::cmp_less(lsock->aq_count, lsock->backlog)) {
                                 child_sock->state = SocketState::CONNECTED;
@@ -795,18 +979,9 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                         build_deferred_ack();
                         cb->lock.unlock_irqrestore(cb_lock_flags);
                         if (deferred_ack != nullptr) {
-                            if (tcp_transmit_prebuilt(deferred_ack, defer_local, defer_remote, defer_bound_ifindex) < 0) {
-                                cb_lock_flags = cb->lock.lock_irqsave();
-                                cb->ack_pending = true;
-                                tcp_timer_arm(cb);
-                                cb->lock.unlock_irqrestore(cb_lock_flags);
-                            }
-                            deferred_ack = nullptr;
+                            emit_deferred_ack();
                         } else if (defer_ack_pending) {
-                            cb_lock_flags = cb->lock.lock_irqsave();
-                            cb->ack_pending = true;
-                            tcp_timer_arm(cb);
-                            cb->lock.unlock_irqrestore(cb_lock_flags);
+                            retry_deferred_ack();
                             defer_ack_pending = false;
                         }
                     }
@@ -820,15 +995,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
 
         case TcpState::ESTABLISHED: {
             if ((flags & TCP_RST) != 0) {
-                while (cb->retransmit_head != nullptr) {
-                    auto* entry = cb->retransmit_head;
-                    cb->retransmit_head = entry->next;
-                    if (entry->pkt != nullptr) {
-                        pkt_free(entry->pkt);
-                    }
-                    delete entry;
-                }
-                cb->retransmit_tail = nullptr;
+                drain_retransmit_queue(cb);
                 cb->state = TcpState::CLOSED;
                 cb->keepalive_deadline = 0;
                 deferred_wake = true;
@@ -883,9 +1050,6 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                     cb->delayed_ack_deadline = tcp_deadline_after_ms(tcp_now_ms(), 40);
                     tcp_timer_arm(cb);
                 }
-            } else if (payload_len == 0 && (flags & TCP_ACK) != 0 && tcp_seq_before(SEG_SEQ, cb->rcv_nxt)) {
-                // Keepalive probe
-                build_deferred_ack();
             }
 
             // FIN: ACK immediately and cancel delayed ACK.
@@ -933,10 +1097,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
             if ((flags & TCP_ACK) != 0) {
                 // Accept partial or full ACK to advance snd_una.
                 if (tcp_seq_after(seg_ack, cb->snd_una) && !tcp_seq_after(seg_ack, cb->snd_nxt)) {
-                    cb->snd_una = seg_ack;
-                    cb->snd_wnd = static_cast<uint32_t>(seg_wnd) << cb->snd_wscale;
-
-                    retire_acked_retransmits_locked(cb, seg_ack, tcp_now_ms(), true);
+                    process_stream_ack();
 
                     // Full ACK includes our FIN.
                     if (seg_ack == cb->snd_nxt) {
@@ -946,6 +1107,8 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                             deferred_wake = true;
                         }
                     }
+                } else {
+                    process_stream_ack();
                 }
             }
             if (payload_len > 0) {
@@ -989,6 +1152,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
 
             // Allow SYN to recycle FIN_WAIT_2 like TIME_WAIT.
             if ((flags & TCP_SYN) != 0 && (flags & TCP_ACK) == 0) {
+                uint32_t const SAVED_IFINDEX = cb->socket != nullptr ? cb->socket->bound_ifindex : 0;
                 cb->state = TcpState::CLOSED;
                 cb->lock.unlock_irqrestore(cb_lock_flags);
 
@@ -998,7 +1162,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                 uint16_t const L_PORT = ntohs(hdr->dst_port);
                 SocketEndpoint listen_local = destination;
                 listen_local.port = L_PORT;
-                TcpCB* listener = tcp_find_listener(listen_local, cb->socket != nullptr ? cb->socket->bound_ifindex : 0);
+                TcpCB* listener = tcp_find_listener(listen_local, SAVED_IFINDEX);
                 if (listener != nullptr) {
                     handle_listen_syn(listener, hdr, source, destination, ingress_mtu);
                     tcp_cb_release(listener);
@@ -1031,6 +1195,15 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
         }
 
         case TcpState::CLOSING: {
+            if ((flags & TCP_RST) != 0) {
+                drain_retransmit_queue(cb);
+                cb->state = TcpState::CLOSED;
+                deferred_wake = true;
+                break;
+            }
+            // Data remains queued ahead of FIN after close. Retire partial
+            // cumulative ACKs so recovery can reach the remaining data/FIN.
+            process_stream_ack();
             if ((flags & TCP_FIN) != 0) {
                 build_deferred_ack();
             }
@@ -1045,6 +1218,13 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
         }
 
         case TcpState::LAST_ACK: {
+            if ((flags & TCP_RST) != 0) {
+                drain_retransmit_queue(cb);
+                cb->state = TcpState::CLOSED;
+                deferred_wake = true;
+                break;
+            }
+            process_stream_ack();
             if ((flags & TCP_FIN) != 0) {
                 build_deferred_ack();
             }
@@ -1057,11 +1237,12 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                 defer_ack_pending = false;
 
                 cb->state = TcpState::CLOSED;
-                if (cb->socket != nullptr) {
-                    cb->socket->proto_data = nullptr;
-                }
+                // The owning socket keeps this CLOSED TCB until its close
+                // operation. FIN can be ACKed inline while shutdown/close is
+                // still returning from packet output.
                 cb->lock.unlock_irqrestore(cb_lock_flags);
                 if (closing_ack != nullptr) {
+                    ack_spare.packet = nullptr;
                     static_cast<void>(tcp_transmit_prebuilt(closing_ack, CLOSING_ACK_LOCAL, CLOSING_ACK_REMOTE, CLOSING_ACK_IFINDEX));
                 }
                 tcp_free_cb(cb);
@@ -1074,6 +1255,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
         case TcpState::TIME_WAIT: {
             // Allow SYN to recycle TIME_WAIT.
             if ((flags & TCP_SYN) != 0 && (flags & TCP_ACK) == 0) {
+                uint32_t const SAVED_IFINDEX = cb->socket != nullptr ? cb->socket->bound_ifindex : 0;
                 cb->state = TcpState::CLOSED;
                 cb->lock.unlock_irqrestore(cb_lock_flags);
 
@@ -1083,7 +1265,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                 uint16_t const L_PORT = ntohs(hdr->dst_port);
                 SocketEndpoint listen_local = destination;
                 listen_local.port = L_PORT;
-                TcpCB* listener = tcp_find_listener(listen_local, cb->socket != nullptr ? cb->socket->bound_ifindex : 0);
+                TcpCB* listener = tcp_find_listener(listen_local, SAVED_IFINDEX);
                 if (listener != nullptr) {
                     handle_listen_syn(listener, hdr, source, destination, ingress_mtu);
                     tcp_cb_release(listener);
@@ -1101,26 +1283,30 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
             break;
     }
 
+    bool const PROBE_REPLY_STATE = cb->state == TcpState::ESTABLISHED || cb->state == TcpState::CLOSE_WAIT ||
+                                   cb->state == TcpState::FIN_WAIT_1 || cb->state == TcpState::FIN_WAIT_2;
+    if (PROBE_REPLY_STATE && payload_len == 0 && (flags & TCP_ACK) != 0 && (flags & (TCP_SYN | TCP_FIN | TCP_RST)) == 0 &&
+        tcp_seq_before(SEG_SEQ, cb->rcv_nxt)) {
+        // Empty persist/keepalive probes must also recover lost window updates
+        // after half-close. A missing RX spare uses the existing timer retry.
+        build_deferred_ack();
+    }
+
+    Socket* socket_to_wake = deferred_wake && cb->socket != nullptr && socket_try_acquire(cb->socket) ? cb->socket : nullptr;
+    tcp_timer_arm(cb);
     cb->lock.unlock_irqrestore(cb_lock_flags);
 
     // Send deferred ACK outside cb->lock.
     if (deferred_ack != nullptr) {
-        if (tcp_transmit_prebuilt(deferred_ack, defer_local, defer_remote, defer_bound_ifindex) < 0) {
-            cb_lock_flags = cb->lock.lock_irqsave();
-            cb->ack_pending = true;
-            tcp_timer_arm(cb);
-            cb->lock.unlock_irqrestore(cb_lock_flags);
-        }
+        emit_deferred_ack();
     } else if (defer_ack_pending) {
-        cb_lock_flags = cb->lock.lock_irqsave();
-        cb->ack_pending = true;
-        tcp_timer_arm(cb);
-        cb->lock.unlock_irqrestore(cb_lock_flags);
+        retry_deferred_ack();
     }
 
     // Wake outside cb->lock to avoid scheduler lock-order issues.
-    if (deferred_wake && cb->socket != nullptr) {
-        wake_socket(cb->socket);
+    if (socket_to_wake != nullptr) {
+        wake_socket(socket_to_wake);
+        socket_release(socket_to_wake);
     }
 
     tcp_cb_release(cb);
@@ -1247,6 +1433,7 @@ void tcp_error_v6(const IPv6Address& local_addr, uint16_t local_port, const IPv6
         if (mtu > sizeof(IPv6Header) + sizeof(TcpHeader)) {
             uint16_t const NEW_MSS = static_cast<uint16_t>(std::min<size_t>(UINT16_MAX, mtu - sizeof(IPv6Header) - sizeof(TcpHeader)));
             cb->snd_mss = std::min(cb->snd_mss, NEW_MSS);
+            cb->sender.mss = std::min<uint32_t>(cb->sender.mss, cb->snd_mss);
         }
         if (cb->socket != nullptr) {
             cb->socket->pending_error.store(EMSGSIZE, std::memory_order_release);

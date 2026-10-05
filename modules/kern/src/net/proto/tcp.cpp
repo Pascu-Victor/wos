@@ -15,6 +15,7 @@
 #include <net/packet.hpp>
 #include <net/proto/ipv4.hpp>
 #include <net/proto/ipv6.hpp>
+#include <net/proto/tcp_sender.hpp>
 #include <net/route.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
@@ -244,9 +245,13 @@ void maybe_send_recv_window_update(TcpCB* cb, Socket* sock) {
         return;
     }
 
-    PacketBuffer* ack_pkt = nullptr;
+    tcp_cb_acquire(cb);
+    PacketBuffer* ack_pkt = pkt_alloc_tx();
     SocketEndpoint ack_local{};
     SocketEndpoint ack_remote{};
+    uint32_t bound_ifindex = 0;
+    uint64_t generation = 0;
+    bool ack_built = false;
 
     uint64_t const FLAGS = cb->lock.lock_irqsave();
     uint32_t const OLD_WND = cb->rcv_wnd;
@@ -254,21 +259,41 @@ void maybe_send_recv_window_update(TcpCB* cb, Socket* sock) {
     uint32_t const WND_GROWTH = cb->rcv_wnd > OLD_WND ? cb->rcv_wnd - OLD_WND : 0;
     uint32_t const UPDATE_THRESHOLD = std::max<uint32_t>(static_cast<uint32_t>(cb->rcv_mss) * 2U, cb->rcv_wnd / 4U);
     bool const SHOULD_UPDATE_WINDOW = cb->rcv_wnd > OLD_WND && (OLD_WND == 0 || OLD_WND < cb->rcv_mss || WND_GROWTH >= UPDATE_THRESHOLD);
-    if (SHOULD_UPDATE_WINDOW) {
-        ack_pkt = tcp_build_ack(cb, &ack_local, &ack_remote);
-        if (ack_pkt == nullptr) {
+    bool const LIVE = cb->state != TcpState::CLOSED && cb->state != TcpState::LISTEN;
+    if (SHOULD_UPDATE_WINDOW && LIVE) {
+        ack_built = tcp_build_ack_locked(cb, ack_pkt);
+        if (ack_built) {
+            ack_local = cb->local;
+            ack_remote = cb->remote;
+            bound_ifindex = sock->bound_ifindex;
+            generation = cb->output_generation;
+        } else {
             cb->ack_pending = true;
             tcp_timer_arm(cb);
         }
     }
     cb->lock.unlock_irqrestore(FLAGS);
 
-    if (ack_pkt != nullptr && tcp_transmit_prebuilt(ack_pkt, ack_local, ack_remote, sock->bound_ifindex) < 0) {
-        uint64_t const RETRY_FLAGS = cb->lock.lock_irqsave();
-        cb->ack_pending = true;
-        tcp_timer_arm(cb);
-        cb->lock.unlock_irqrestore(RETRY_FLAGS);
+    if (ack_built) {
+        uint64_t flags = cb->lock.lock_irqsave();
+        bool const NEEDED = cb->state != TcpState::CLOSED && cb->state != TcpState::LISTEN && cb->output_generation == generation;
+        cb->lock.unlock_irqrestore(flags);
+        if (NEEDED) {
+            if (tcp_transmit_prebuilt(ack_pkt, ack_local, ack_remote, bound_ifindex) < 0) {
+                flags = cb->lock.lock_irqsave();
+                if (cb->state != TcpState::CLOSED && cb->state != TcpState::LISTEN && cb->output_generation == generation) {
+                    cb->ack_pending = true;
+                    tcp_timer_arm(cb);
+                }
+                cb->lock.unlock_irqrestore(flags);
+            }
+        } else {
+            pkt_free(ack_pkt);
+        }
+    } else {
+        pkt_free(ack_pkt);
     }
+    tcp_cb_release(cb);
 }
 
 int tcp_bind(Socket* sock, const void* addr_raw, size_t addr_len) {
@@ -461,20 +486,23 @@ int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len, int flags) 
     }
 
     // Resolve the source before constructing the SYN/checksum.
-    if ((remote.is_ipv4() || remote.is_v4_mapped()) && cb->local.is_unspecified()) {
+    if (remote.is_ipv4() || remote.is_v4_mapped()) {
         auto* route = ker::net::route_lookup(remote.ipv4_address());
         NetDeviceRef route_ref = sock->bound_ifindex != 0 ? tcp_netdev_find_by_ifindex(sock->bound_ifindex)
                                                           : (route != nullptr ? netdev_try_retain(route->dev_identity) : NetDeviceRef{});
         if (!route_ref) {
             return -EHOSTUNREACH;
         }
-        auto const IPV4 = netif_ipv4_snapshot(route_ref.get());
-        if (IPV4.count == 0) {
-            return -EADDRNOTAVAIL;
+        cb->rcv_mss = tcp_receive_mss_for_path(remote, route_ref->mtu);
+        if (cb->local.is_unspecified()) {
+            auto const IPV4 = netif_ipv4_snapshot(route_ref.get());
+            if (IPV4.count == 0) {
+                return -EADDRNOTAVAIL;
+            }
+            cb->local = sock->domain == SOCKADDR_V6_FAMILY ? SocketEndpoint::mapped_ipv4(IPV4.entries.front().addr, cb->local.port)
+                                                           : SocketEndpoint::ipv4(IPV4.entries.front().addr, cb->local.port);
+            sock->local = cb->local;
         }
-        cb->local = sock->domain == SOCKADDR_V6_FAMILY ? SocketEndpoint::mapped_ipv4(IPV4.entries.front().addr, cb->local.port)
-                                                       : SocketEndpoint::ipv4(IPV4.entries.front().addr, cb->local.port);
-        sock->local = cb->local;
     }
     if (remote.is_ipv6() && !remote.is_v4_mapped()) {
         IPv6Address requested{};
@@ -507,6 +535,8 @@ int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len, int flags) 
         }
     }
 
+    cb->lock.lock();
+    ++cb->output_generation;
     cb->remote = remote;
     sock->remote = remote;
 
@@ -514,10 +544,14 @@ int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len, int flags) 
     cb->iss = tcp_generate_iss(cb->local, cb->remote);
     cb->snd_una = cb->iss;
     cb->snd_nxt = cb->iss + 1;
+    cb->snd_wl1 = 0;
+    cb->snd_wl2 = cb->snd_una;
+    tcp_sender_reset(cb->sender, cb->snd_mss, cb->snd_nxt);
     cb->rcv_wnd = sock->rcvbuf.capacity;
     cb->rcv_wscale = tcp_wscale_for_buf(sock->rcvbuf.capacity);
     cb->state = TcpState::SYN_SENT;
     sock->state = SocketState::CONNECTING;
+    cb->lock.unlock();
 
     // Insert into hash table now that endpoints are set
     tcp_insert_cb(cb);
@@ -622,7 +656,19 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int flags) -> ssize_t {
 
         uint32_t const AVAILABLE = tcp_send_available_bytes(cb);
         if (AVAILABLE == 0) {
+            bool const SEND_PERSIST_BYTE = cb->sender_enabled && cb->snd_wnd == 0 && cb->snd_nxt == cb->snd_una;
+            if (cb->sender_enabled && cb->snd_wnd == 0) {
+                cb->persist_needed = true;
+                if (cb->persist_deadline == 0) {
+                    cb->persist_interval = TCP_PERSIST_INITIAL_MS;
+                    cb->persist_deadline = tcp_deadline_after_ms(tcp_now_ms(), cb->persist_interval);
+                }
+                tcp_timer_arm(cb);
+            }
             cb->lock.unlock();
+            if (SEND_PERSIST_BYTE && tcp_send_segment(cb, TCP_ACK, data + sent, 1, true)) {
+                return static_cast<ssize_t>(sent + 1);
+            }
             if (sent > 0) {
                 return static_cast<ssize_t>(sent);
             }
@@ -775,9 +821,11 @@ void tcp_close_op(Socket* sock) {
     bool send_fin = false;
     TcpState next_state = cb->state;
 
-    // Drain outstanding retransmits.
+    // Graceful close retains queued data ahead of FIN. Discard only terminal
+    // or never-established streams, whose sequence ranges cannot be recovered.
     [[maybe_unused]] size_t rtx_drained = 0;
-    while (cb->retransmit_head != nullptr) {
+    bool const DISCARD_QUEUE = cb->state == TcpState::CLOSED || cb->state == TcpState::LISTEN || cb->state == TcpState::SYN_SENT;
+    while (DISCARD_QUEUE && cb->retransmit_head != nullptr) {
         auto* entry = cb->retransmit_head;
         cb->retransmit_head = entry->next;
         if (entry->pkt != nullptr) {
@@ -786,7 +834,14 @@ void tcp_close_op(Socket* sock) {
         delete entry;
         rtx_drained++;
     }
-    cb->retransmit_tail = nullptr;
+    if (DISCARD_QUEUE) {
+        cb->retransmit_tail = nullptr;
+        cb->retransmit_entries = 0;
+    }
+    ++cb->output_generation;
+    cb->persist_needed = false;
+    cb->persist_deadline = 0;
+    cb->fast_retransmit_pending = false;
 #ifdef TCP_DEBUG
     if (rtx_drained > 0) {
         log::debug("tcp_close: drained %zu rtx entries, pool_free=%zu", rtx_drained, ker::net::pkt_pool_free_count());
@@ -816,11 +871,7 @@ void tcp_close_op(Socket* sock) {
     cb->lock.unlock();
 
     if (send_fin) {
-        if (tcp_send_segment(cb, TCP_FIN | TCP_ACK, nullptr, 0)) {
-            cb->lock.lock();
-            cb->state = next_state;
-            cb->lock.unlock();
-        } else {
+        if (!tcp_send_segment(cb, TCP_FIN | TCP_ACK, nullptr, 0)) {
             cb->lock.lock();
             cb->state = TcpState::CLOSED;
             cb->lock.unlock();
@@ -846,9 +897,13 @@ void tcp_close_op(Socket* sock) {
     tcp_bind_lock.unlock();
 
     // Keep TCB alive for closing states; free immediately if CLOSED.
+    cb->lock.lock();
     sock->proto_data = nullptr;
     cb->socket = nullptr;
-    if (cb->state == TcpState::CLOSED) {
+    bool const CLOSED = cb->state == TcpState::CLOSED;
+    tcp_timer_arm(cb);
+    cb->lock.unlock();
+    if (CLOSED) {
         tcp_free_cb(cb);
     }
     // Drop the owning socket ref; timer/hash/listener refs keep the TCB alive if needed.
@@ -879,9 +934,6 @@ int tcp_shutdown_op(Socket* sock, int how) {
             tcp_diag_log_local_close("shutdown", sock, cb, cb->state, TcpState::FIN_WAIT_1, how, true);
             cb->lock.unlock();
             if (tcp_send_segment(cb, TCP_FIN | TCP_ACK, nullptr, 0)) {
-                cb->lock.lock();
-                cb->state = TcpState::FIN_WAIT_1;
-                cb->lock.unlock();
                 socket_wake_waiters(sock);
                 return 0;
             }
@@ -889,9 +941,6 @@ int tcp_shutdown_op(Socket* sock, int how) {
             tcp_diag_log_local_close("shutdown", sock, cb, cb->state, TcpState::LAST_ACK, how, true);
             cb->lock.unlock();
             if (tcp_send_segment(cb, TCP_FIN | TCP_ACK, nullptr, 0)) {
-                cb->lock.lock();
-                cb->state = TcpState::LAST_ACK;
-                cb->lock.unlock();
                 socket_wake_waiters(sock);
                 return 0;
             }
@@ -1190,7 +1239,9 @@ void tcp_destroy_unaccepted_child(Socket* child) {
 
         tcp_free_cb(cb);
         child->proto_data = nullptr;
+        cb->lock.lock();
         cb->socket = nullptr;
+        cb->lock.unlock();
         tcp_cb_release(cb);
     }
 
@@ -1336,8 +1387,10 @@ auto tcp_conn_snapshot(TcpConnSnapshot* out, size_t max) -> size_t {
     size_t count = 0;
     for (auto& bucket : tcb_hash) {
         bucket.lock.lock();
-        for (TcpCB const* cb = bucket.head; cb != nullptr && count < max; cb = cb->hash_next) {
+        for (TcpCB* cb = bucket.head; cb != nullptr && count < max; cb = cb->hash_next) {
+            uint64_t const CB_FLAGS = cb->lock.lock_irqsave();
             if (cb->state == TcpState::LISTEN) {
+                cb->lock.unlock_irqrestore(CB_FLAGS);
                 continue;
             }
 
@@ -1357,12 +1410,29 @@ auto tcp_conn_snapshot(TcpConnSnapshot* out, size_t max) -> size_t {
             row.ooo_bytes = cb->ooo_bytes.load(std::memory_order_acquire);
             row.refcount = cb->refcnt.load(std::memory_order_acquire);
             row.sack_permitted = cb->sack_permitted;
+            row.sender_enabled = cb->sender_enabled;
+            row.cwnd = cb->sender.cwnd;
+            row.ssthresh = cb->sender.ssthresh;
+            row.flight = cb->snd_nxt - cb->snd_una;
+            row.duplicate_acks = cb->sender.duplicate_acks;
+            row.recovery_reason = static_cast<uint8_t>(cb->sender.reason);
+            row.in_recovery = cb->sender.in_recovery;
+            row.rto_ms = cb->rto_ms;
+            row.retransmits = cb->retransmit_packets;
+            row.recovery_requests = tcp_saturating_add_ms(cb->sender.fast_retransmits, cb->sender.partial_retransmits);
+            row.timeouts = cb->sender.timeouts;
+            row.sack_ranges = cb->sender.sack.count;
+            row.sack_blocks = cb->sender.sack.accepted_blocks;
+            row.sack_drops = cb->sender.sack.overflow_drops;
+            row.persist_probes = cb->persist_probes;
+            row.persist_deadline = cb->persist_deadline;
             Socket const* sock = cb->socket;
             if (sock != nullptr) {
                 row.owner_pid = sock->owner_pid;
                 row.rcvbuf_used = sock->rcvbuf.available();
                 row.rcvbuf_capacity = sock->rcvbuf.capacity;
             }
+            cb->lock.unlock_irqrestore(CB_FLAGS);
         }
         bucket.lock.unlock();
         if (count >= max) {

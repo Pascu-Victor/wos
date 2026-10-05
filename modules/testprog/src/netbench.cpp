@@ -1,20 +1,26 @@
 #include "netbench.hpp"
 
 #include <abi-bits/in.h>
+#include <abi-bits/ioctls.h>
+#include <abi-bits/route.h>
 #include <abi-bits/socket.h>
 #include <arpa/inet.h>
 #include <bits/ssize_t.h>
 #include <bits/timeval.h>
 #include <fcntl.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#include <wos/netctl.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <climits>
 #include <cstdint>
@@ -52,6 +58,11 @@ struct ServerOptions {
     uint16_t port = 9000;
     uint32_t sessions = 1;
     int timeout_ms = DEFAULT_NETBENCH_TIMEOUT_MS;
+    int family = AF_INET;
+    const char* bind_address = nullptr;
+    uint32_t scope = 0;
+    uint32_t read_pause_ms = 0;
+    uint64_t read_pause_bytes = 0;
 };
 
 struct ClientOptions {
@@ -62,6 +73,7 @@ struct ClientOptions {
     uint32_t iterations = 1000;
     uint64_t total_bytes = 64ULL * 1024ULL * 1024ULL;
     int timeout_ms = DEFAULT_NETBENCH_TIMEOUT_MS;
+    uint32_t scope = 0;
 };
 
 auto parse_u32(const char* value, uint32_t* out) -> bool {
@@ -101,10 +113,13 @@ auto parse_timeout_ms(const char* value, int* out) -> bool {
 
 void print_usage() {
     std::println("Usage:");
-    std::println("  testprog netbench-server --port <port> [--sessions N] [--timeout-ms N]");
+    std::println("  testprog netbench-configure --interface NAME --ipv4 ADDR --ipv6 LINKLOCAL (static /24 and /64; prints scope)");
     std::println(
-        "  testprog netbench-client --host <ipv4> --port <port> --mode pingpong|stream [--payload-size N] [--iterations N] [--total-bytes "
-        "N] [--timeout-ms N]");
+        "  testprog netbench-server --port <port> [--sessions N] [--timeout-ms N] [--family ipv4|ipv6] [--bind ADDR] [--scope N] "
+        "[--read-pause-ms N] [--read-pause-bytes N]");
+    std::println(
+        "  testprog netbench-client --host <ipv4-or-ipv6> --port <port> --mode pingpong|stream [--payload-size N] [--iterations N] "
+        "[--total-bytes N] [--timeout-ms N] [--scope N]");
 }
 
 auto monotonic_now_ms() -> int64_t {
@@ -289,8 +304,25 @@ auto wallclock_us() -> uint64_t {
     return (static_cast<uint64_t>(tv.tv_sec) * 1000000ULL) + static_cast<uint64_t>(tv.tv_usec);
 }
 
-auto open_server_socket(uint16_t port) -> int {
-    int const FD = socket(AF_INET, SOCK_STREAM, 0);
+auto benchmark_address(const char* host, int family, uint16_t port, uint32_t scope, sockaddr_storage& storage, socklen_t& length) -> bool {
+    storage = {};
+    if (family == AF_INET6) {
+        auto* address = reinterpret_cast<sockaddr_in6*>(&storage);
+        address->sin6_family = AF_INET6;
+        address->sin6_port = htons(port);
+        address->sin6_scope_id = scope;
+        length = sizeof(*address);
+        return host == nullptr || inet_pton(AF_INET6, host, &address->sin6_addr) == 1;
+    }
+    auto* address = reinterpret_cast<sockaddr_in*>(&storage);
+    address->sin_family = AF_INET;
+    address->sin_port = htons(port);
+    length = sizeof(*address);
+    return scope == 0 && (host == nullptr || inet_pton(AF_INET, host, &address->sin_addr) == 1);
+}
+
+auto open_server_socket(const ServerOptions& options) -> int {
+    int const FD = socket(options.family, SOCK_STREAM, 0);
     if (FD < 0) {
         return -1;
     }
@@ -298,12 +330,10 @@ auto open_server_socket(uint16_t port) -> int {
     int opt = 1;
     setsockopt(FD, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-
-    if (bind(FD, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+    sockaddr_storage addr{};
+    socklen_t length = 0;
+    if (!benchmark_address(options.bind_address, options.family, options.port, options.scope, addr, length) ||
+        bind(FD, reinterpret_cast<sockaddr*>(&addr), length) != 0) {
         close(FD);
         return -1;
     }
@@ -382,23 +412,23 @@ auto connect_timeout(int fd, const sockaddr* addr, socklen_t addrlen, int timeou
     }
 }
 
-auto connect_to_host(const char* host, uint16_t port, int timeout_ms) -> int {
-    int const FD = socket(AF_INET, SOCK_STREAM, 0);
+auto connect_to_host(const char* host, uint16_t port, int timeout_ms, uint32_t scope) -> int {
+    int const FAMILY = std::strchr(host, ':') != nullptr ? AF_INET6 : AF_INET;
+    int const FD = socket(FAMILY, SOCK_STREAM, 0);
     if (FD < 0) {
         return -1;
     }
 
     tune_tcp_low_latency(FD);
 
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+    sockaddr_storage addr{};
+    socklen_t length = 0;
+    if (!benchmark_address(host, FAMILY, port, scope, addr, length)) {
         close(FD);
         return -1;
     }
 
-    if (connect_timeout(FD, reinterpret_cast<sockaddr*>(&addr), sizeof(addr), timeout_ms) != 0) {
+    if (connect_timeout(FD, reinterpret_cast<sockaddr*>(&addr), length, timeout_ms) != 0) {
         close(FD);
         return -1;
     }
@@ -442,17 +472,26 @@ auto handle_pingpong_server(int client_fd, const BenchHeader& header, int timeou
     return ok;
 }
 
-auto handle_stream_server(int client_fd, const BenchHeader& header, int timeout_ms) -> bool {
+auto handle_stream_server(int client_fd, const BenchHeader& header, const ServerOptions& options) -> bool {
     std::vector<uint8_t> buf(header.payload_size);
 
     uint64_t remaining = header.total_bytes;
+    uint64_t next_pause = 0;
     bool ok = true;
     while (remaining > 0) {
+        uint64_t const RECEIVED = header.total_bytes - remaining;
+        if (options.read_pause_ms != 0 && RECEIVED >= next_pause) {
+            timespec delay{static_cast<time_t>(options.read_pause_ms / MSEC_PER_SEC),
+                           static_cast<long>(options.read_pause_ms % MSEC_PER_SEC) * NSEC_PER_MSEC};
+            while (nanosleep(&delay, &delay) < 0 && errno == EINTR) {
+            }
+            next_pause = options.read_pause_bytes == 0 ? header.total_bytes : RECEIVED + options.read_pause_bytes;
+        }
         uint32_t chunk = header.payload_size;
         if (remaining < chunk) {
             chunk = static_cast<uint32_t>(remaining);
         }
-        ok = recv_all_timeout(client_fd, buf.data(), chunk, timeout_ms);
+        ok = recv_all_timeout(client_fd, buf.data(), chunk, options.timeout_ms);
         if (!ok) {
             break;
         }
@@ -466,10 +505,75 @@ auto handle_stream_server(int client_fd, const BenchHeader& header, int timeout_
 
     uint64_t ack = header.total_bytes - remaining;
     if (ok) {
-        ok = send_all_timeout(client_fd, &ack, sizeof(ack), timeout_ms);
+        ok = send_all_timeout(client_fd, &ack, sizeof(ack), options.timeout_ms);
     }
 
     return ok;
+}
+
+auto configure_endpoint(int argc, char** argv) -> int {
+    const char* interface = nullptr;
+    const char* ipv4 = nullptr;
+    const char* ipv6 = nullptr;
+    for (int i = 0; i < argc; i += 2) {
+        if (i + 1 >= argc) return 1;
+        if (std::strcmp(argv[i], "--interface") == 0)
+            interface = argv[i + 1];
+        else if (std::strcmp(argv[i], "--ipv4") == 0)
+            ipv4 = argv[i + 1];
+        else if (std::strcmp(argv[i], "--ipv6") == 0)
+            ipv6 = argv[i + 1];
+        else
+            return 1;
+    }
+    if (interface == nullptr || ipv4 == nullptr || ipv6 == nullptr) return 1;
+    std::array<wos_net_if_info, 32> interfaces{};
+    size_t count = interfaces.size();
+    if (wos_net_if_list(interfaces.data(), &count) != 0 || count > interfaces.size()) return 1;
+    uint32_t index = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (std::strncmp(interfaces[i].name, interface, WOS_NET_IF_NAME_LEN) == 0) index = interfaces[i].ifindex;
+    }
+    if (index == 0) return 1;
+    wos_net_link_set_req link{};
+    link.ifindex = index;
+    link.fields = WOS_NET_LINK_SET_FLAGS;
+    link.flag_mask = IFF_UP;
+    link.flags = IFF_UP;
+    if (wos_net_link_set(&link) != 0) return 1;
+    wos_net_addr_req address{};
+    address.ifindex = index;
+    address.family = AF_INET;
+    address.prefix_len = 24;
+    address.flags = WOS_NET_ADDR_F_PERMANENT;
+    address.replace = 1;
+    if (inet_pton(AF_INET, ipv4, address.address) != 1 || wos_net_addr_set(&address) != 0) return 1;
+    rtentry route{};
+    route.rt_flags = RTF_UP;
+    auto* destination = reinterpret_cast<sockaddr_in*>(&route.rt_dst);
+    destination->sin_family = AF_INET;
+    std::memcpy(&destination->sin_addr, address.address, sizeof(destination->sin_addr));
+    destination->sin_addr.s_addr &= htonl(0xffffff00U);
+    auto* mask = reinterpret_cast<sockaddr_in*>(&route.rt_genmask);
+    mask->sin_family = AF_INET;
+    mask->sin_addr.s_addr = htonl(0xffffff00U);
+    int const FD = socket(AF_INET, SOCK_DGRAM, 0);
+    if (FD < 0) return 1;
+    int const ROUTE_RESULT = ioctl(FD, SIOCADDRT, &route);
+    close(FD);
+    if (ROUTE_RESULT != 0) return 1;
+    address = {};
+    address.ifindex = index;
+    address.family = AF_INET6;
+    address.prefix_len = 64;
+    address.scope = 253;
+    address.flags = WOS_NET_ADDR_F_PERMANENT | WOS_NET_ADDR_F_NODAD;
+    address.replace = 1;
+    if (inet_pton(AF_INET6, ipv6, address.address) != 1 || address.address[0] != 0xfe || (address.address[1] & 0xc0U) != 0x80 ||
+        wos_net_addr_set(&address) != 0)
+        return 1;
+    std::println("{}", index);
+    return 0;
 }
 
 auto run_server(int argc, char** argv) -> int {
@@ -487,6 +591,33 @@ auto run_server(int argc, char** argv) -> int {
                 print_usage();
                 return 1;
             }
+        } else if (std::strcmp(argv[i], "--family") == 0 && i + 1 < argc) {
+            const char* family = argv[++i];
+            if (std::strcmp(family, "ipv4") == 0) {
+                options.family = AF_INET;
+            } else if (std::strcmp(family, "ipv6") == 0) {
+                options.family = AF_INET6;
+            } else {
+                print_usage();
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
+            options.bind_address = argv[++i];
+        } else if (std::strcmp(argv[i], "--scope") == 0 && i + 1 < argc) {
+            if (!parse_u32(argv[++i], &options.scope)) {
+                print_usage();
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--read-pause-ms") == 0 && i + 1 < argc) {
+            if (!parse_u32(argv[++i], &options.read_pause_ms) || options.read_pause_ms > 10000) {
+                print_usage();
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--read-pause-bytes") == 0 && i + 1 < argc) {
+            if (!parse_u64(argv[++i], &options.read_pause_bytes)) {
+                print_usage();
+                return 1;
+            }
         } else if (std::strcmp(argv[i], "--timeout-ms") == 0 && i + 1 < argc) {
             if (!parse_timeout_ms(argv[++i], &options.timeout_ms)) {
                 print_usage();
@@ -498,7 +629,7 @@ auto run_server(int argc, char** argv) -> int {
         }
     }
 
-    int const SERVER_FD = open_server_socket(options.port);
+    int const SERVER_FD = open_server_socket(options);
     if (SERVER_FD < 0) {
         std::println("netbench-server: failed to bind/listen on port {}", options.port);
         return 1;
@@ -527,7 +658,7 @@ auto run_server(int argc, char** argv) -> int {
         if (header.mode == static_cast<uint32_t>(BenchMode::K_PINGPONG)) {
             ok = handle_pingpong_server(CLIENT_FD, header, options.timeout_ms);
         } else if (header.mode == static_cast<uint32_t>(BenchMode::K_STREAM)) {
-            ok = handle_stream_server(CLIENT_FD, header, options.timeout_ms);
+            ok = handle_stream_server(CLIENT_FD, header, options);
         } else {
             ok = false;
         }
@@ -582,6 +713,11 @@ auto run_client(int argc, char** argv) -> int {
                 print_usage();
                 return 1;
             }
+        } else if (std::strcmp(argv[i], "--scope") == 0 && i + 1 < argc) {
+            if (!parse_u32(argv[++i], &options.scope)) {
+                print_usage();
+                return 1;
+            }
         } else if (std::strcmp(argv[i], "--timeout-ms") == 0 && i + 1 < argc) {
             if (!parse_timeout_ms(argv[++i], &options.timeout_ms)) {
                 print_usage();
@@ -602,7 +738,7 @@ auto run_client(int argc, char** argv) -> int {
         options.total_bytes = std::max<uint64_t>(options.total_bytes, options.payload_size);
     }
 
-    int const FD = connect_to_host(options.host, options.port, options.timeout_ms);
+    int const FD = connect_to_host(options.host, options.port, options.timeout_ms, options.scope);
     if (FD < 0) {
         std::println("netbench-client: failed to connect to {}:{}", options.host, options.port);
         return 1;
@@ -674,6 +810,7 @@ auto run_client(int argc, char** argv) -> int {
 
     std::print(R"({{"benchmark":"wos_netbench","mode":"{}",)", options.mode == BenchMode::K_PINGPONG ? "pingpong" : "stream");
     std::print(R"("host":"{}","port":{},"payload_bytes":{},)", options.host, options.port, options.payload_size);
+    std::print(R"("family":{},"started_us":{},"elapsed_us":{},)", std::strchr(options.host, ':') != nullptr ? 6 : 4, START_US, ELAPSED_US);
     if (options.mode == BenchMode::K_PINGPONG) {
         const uint64_t AVG_LATENCY_US = options.iterations > 0 ? (ELAPSED_US / static_cast<uint64_t>(options.iterations)) : 0;
         std::print(R"("iterations":{},"latency_us":{},)", options.iterations, AVG_LATENCY_US);
@@ -707,6 +844,9 @@ int run_netbench(int argc, char** argv) {
 
     if (std::strcmp(command, "netbench-server") == 0) {
         return run_server(argc - 1, argv + 1);
+    }
+    if (std::strcmp(command, "netbench-configure") == 0) {
+        return configure_endpoint(argc - 1, argv + 1);
     }
     if (std::strcmp(command, "netbench-client") == 0) {
         return run_client(argc - 1, argv + 1);

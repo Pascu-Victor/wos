@@ -1,10 +1,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
+#include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <net/packet.hpp>
-#include <net/proto/ipv4.hpp>
+#include <net/proto/tcp_sender.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -23,7 +24,6 @@ namespace ker::net::proto {
 using log = ker::mod::dbg::logger<"tcp">;
 
 // Defined in tcp.cpp (namespace scope, not anonymous)
-extern std::array<TcpHashBucket, TCB_HASH_SIZE> tcb_hash;
 extern volatile uint64_t tcp_ms_counter;
 
 // Timer list: only TCBs with pending timer work are scanned.
@@ -42,15 +42,19 @@ constexpr size_t MAX_DEFERRED_RETRANSMITS = 16;
 constexpr uint64_t TCP_TIMER_IDLE_SLEEP_US = 100000;
 constexpr uint64_t TCP_TIMER_OVERDUE_BACKOFF_US = 1000;
 constexpr uint64_t TCP_TIMER_MS_TO_US = 1000;
+constexpr uint64_t TCP_TIMER_ALLOCATION_RETRY_MS = 10;
 
 struct DeferredRetransmit {
-    PacketBuffer* pkt;
-    SocketEndpoint local;
-    SocketEndpoint remote;
-    uint32_t bound_ifindex;
-    uint32_t seq_end;
-    TcpCB* cb;
-    TcpCB* ack_cb;
+    PacketBuffer* pkt{};
+    SocketEndpoint local{};
+    SocketEndpoint remote{};
+    uint32_t bound_ifindex{};
+    uint32_t seq_end{};
+    bool check_sequence{};
+    bool ack_completion{};
+    bool persist_probe{};
+    uint64_t generation{};
+    TcpCB* cb{};
 };
 
 void timer_lock_acquire() {
@@ -66,43 +70,47 @@ void timer_lock_acquire() {
 
 void timer_lock_release() { timer_lock.unlock(); }
 
-auto retransmit_segment(TcpCB* cb, RetransmitEntry* entry, std::array<DeferredRetransmit, MAX_DEFERRED_RETRANSMITS>& deferred,
-                        size_t deferred_count) -> size_t {
-    entry->retries++;
-    entry->send_time_ms = tcp_now_ms();
-
-    if (entry->pkt == nullptr) {
-        return deferred_count;
-    }
-    if (deferred_count >= MAX_DEFERRED_RETRANSMITS) {
-        return deferred_count;
-    }
-
-    auto* pkt = pkt_alloc_tx();
-    if (pkt == nullptr) {
-        return deferred_count;
-    }
-
-    std::memcpy(pkt->storage.data(), entry->pkt->storage.data(), PKT_BUF_SIZE);
-    pkt->data = pkt->storage.data() + (entry->pkt->data - entry->pkt->storage.data());
-    pkt->len = entry->pkt->len;
-
-    auto& deferred_entry = deferred.at(deferred_count);
-    deferred_entry.pkt = pkt;
-    deferred_entry.local = cb->local;
-    deferred_entry.remote = cb->remote;
-    deferred_entry.bound_ifindex = cb->socket != nullptr ? cb->socket->bound_ifindex : 0;
-    deferred_entry.seq_end = entry->seq + static_cast<uint32_t>(entry->len);
+void stage_packet_locked(TcpCB* cb, PacketBuffer* pkt, DeferredRetransmit& deferred_entry, bool check_sequence = false,
+                         uint32_t seq_end = 0, bool ack_completion = false, bool persist_probe = false) {
     tcp_cb_acquire(cb);
-    deferred_entry.cb = cb;
-    return deferred_count + 1;
+    deferred_entry = {
+        .pkt = pkt,
+        .local = cb->local,
+        .remote = cb->remote,
+        .bound_ifindex = cb->socket != nullptr ? cb->socket->bound_ifindex : 0,
+        .seq_end = seq_end,
+        .check_sequence = check_sequence,
+        .ack_completion = ack_completion,
+        .persist_probe = persist_probe,
+        .generation = cb->output_generation,
+        .cb = cb,
+    };
 }
 
-void wake_socket_timer(Socket* sock) {
-    if (sock == nullptr) {
-        return;
+auto find_retransmit_locked(TcpCB* cb, uint32_t sequence) -> RetransmitEntry* {
+    for (auto* entry = cb->retransmit_head; entry != nullptr; entry = entry->next) {
+        if (tcp_seq_between(sequence, entry->seq, entry->seq + static_cast<uint32_t>(entry->len))) {
+            return entry;
+        }
     }
-    socket_wake_waiters(sock);
+    return nullptr;
+}
+
+void clear_retransmits_locked(TcpCB* cb) {
+    while (cb->retransmit_head != nullptr) {
+        auto* entry = cb->retransmit_head;
+        cb->retransmit_head = entry->next;
+        pkt_free(entry->pkt);
+        delete entry;
+    }
+    cb->retransmit_tail = nullptr;
+    cb->retransmit_entries = 0;
+    cb->retransmit_deadline = 0;
+    cb->fast_retransmit_pending = false;
+    cb->fast_retransmit_deadline = 0;
+    cb->persist_needed = false;
+    cb->persist_deadline = 0;
+    cb->keepalive_deadline = 0;
 }
 
 auto ooo_ack_probe_interval_ms(uint8_t probes_sent) -> uint64_t {
@@ -116,46 +124,75 @@ auto ooo_ack_probe_interval_ms(uint8_t probes_sent) -> uint64_t {
 }  // namespace
 
 void tcp_timer_arm(TcpCB* cb) {
-    // cb->lock must be held by the caller.
+    // cb->lock must be held. Publish one deadline; the list lock never reads
+    // protocol fields or nests with cb->lock in the opposite direction.
+    uint64_t const NOW = tcp_now_ms();
     uint64_t deadline = UINT64_MAX;
-
-    if (cb->retransmit_head != nullptr && cb->state != TcpState::CLOSED && cb->state != TcpState::LISTEN) {
-        deadline = std::min(deadline, cb->retransmit_deadline);
+    bool const LIVE = cb->state != TcpState::CLOSED && cb->state != TcpState::LISTEN;
+    bool const PERSIST = cb->sender_enabled && (cb->state == TcpState::ESTABLISHED || cb->state == TcpState::CLOSE_WAIT) &&
+                         cb->snd_wnd == 0 && (cb->persist_needed || cb->retransmit_head != nullptr);
+    if (PERSIST) {
+        cb->persist_needed = true;
+        if (cb->persist_interval == 0) {
+            cb->persist_interval = TCP_PERSIST_INITIAL_MS;
+        }
+        if (cb->persist_deadline == 0) {
+            cb->persist_deadline = tcp_deadline_after_ms(NOW, cb->persist_interval);
+        }
+        deadline = std::min(deadline, cb->persist_deadline);
+    } else {
+        cb->persist_needed = false;
+        cb->persist_deadline = 0;
+        cb->persist_interval = TCP_PERSIST_INITIAL_MS;
+        if (LIVE && cb->state != TcpState::TIME_WAIT && cb->retransmit_head != nullptr) {
+            deadline = std::min(deadline, cb->retransmit_deadline);
+        }
+        if (LIVE && cb->fast_retransmit_pending) {
+            deadline = std::min(deadline, cb->fast_retransmit_deadline != 0 ? cb->fast_retransmit_deadline : NOW);
+        }
     }
     if (cb->state == TcpState::TIME_WAIT) {
         deadline = std::min(deadline, cb->time_wait_deadline);
     }
     if (cb->state == TcpState::FIN_WAIT_2 && cb->socket == nullptr) {
-        deadline = std::min(deadline, cb->time_wait_deadline != 0 ? cb->time_wait_deadline : tcp_deadline_after_ms(tcp_now_ms(), 60000));
+        if (cb->time_wait_deadline == 0) {
+            cb->time_wait_deadline = tcp_deadline_after_ms(NOW, 60000);
+        }
+        deadline = std::min(deadline, cb->time_wait_deadline);
     }
-    if (cb->ack_pending) {
-        deadline = std::min(deadline, tcp_deadline_after_ms(tcp_now_ms(), 10));
+    if (cb->state == TcpState::CLOSED && cb->socket == nullptr) {
+        deadline = NOW;
     }
-    if (cb->delayed_ack_deadline != 0) {
-        deadline = std::min(deadline, cb->delayed_ack_deadline);
-    }
-    if (cb->ooo_ack_deadline != 0) {
-        deadline = std::min(deadline, cb->ooo_ack_deadline);
-    }
-    if (cb->keepalive_deadline != 0) {
-        deadline = std::min(deadline, cb->keepalive_deadline);
+    if (LIVE) {
+        if (cb->ack_pending) {
+            deadline = std::min(deadline, tcp_deadline_after_ms(NOW, TCP_TIMER_ALLOCATION_RETRY_MS));
+        }
+        if (cb->delayed_ack_deadline != 0) {
+            deadline = std::min(deadline, cb->delayed_ack_deadline);
+        }
+        if (cb->ooo_ack_deadline != 0) {
+            deadline = std::min(deadline, cb->ooo_ack_deadline);
+        }
+        if (cb->keepalive_deadline != 0 && cb->state == TcpState::ESTABLISHED) {
+            deadline = std::min(deadline, cb->keepalive_deadline);
+        }
     }
 
     if (deadline == UINT64_MAX) {
+        tcp_timer_disarm(cb);
         return;
     }
 
     bool wake_timer = false;
     timer_lock_acquire();
+    cb->timer_deadline.store(deadline, std::memory_order_release);
     if (!cb->on_timer_list) {
         tcp_cb_acquire(cb);
         cb->timer_next = timer_head;
         timer_head = cb;
         cb->on_timer_list = true;
     }
-    // Conservatively early is fine.
-    uint64_t const CUR = timer_earliest.load(std::memory_order_relaxed);
-    if (deadline < CUR) {
+    if (deadline < timer_earliest.load(std::memory_order_relaxed)) {
         timer_earliest.store(deadline, std::memory_order_relaxed);
         wake_timer = true;
     }
@@ -168,6 +205,7 @@ void tcp_timer_arm(TcpCB* cb) {
 
 void tcp_timer_disarm(TcpCB* cb) {
     timer_lock_acquire();
+    cb->timer_deadline.store(UINT64_MAX, std::memory_order_release);
     if (!cb->on_timer_list) {
         timer_lock_release();
         return;
@@ -191,348 +229,247 @@ void tcp_timer_disarm(TcpCB* cb) {
 
 void tcp_timer_tick(uint64_t now_ms) {
     tcp_ms_counter = now_ms;
+    constexpr size_t MAX_BATCH = 32;
+    std::array<TcpCB*, MAX_BATCH> batch{};
+    size_t batch_count = 0;
+    uint64_t next_earliest = UINT64_MAX;
+#ifdef TCP_DEBUG
+    size_t timer_list_len = 0;
+#endif
+
+    // Membership owns a reference. Snapshot due work before taking any TCB
+    // lock; no protocol fields are accessed while timer_lock is held.
+    timer_lock_acquire();
+    for (TcpCB* cb = timer_head; cb != nullptr; cb = cb->timer_next) {
+#ifdef TCP_DEBUG
+        ++timer_list_len;
+#endif
+        uint64_t const DEADLINE = cb->timer_deadline.load(std::memory_order_acquire);
+        next_earliest = std::min(next_earliest, DEADLINE);
+        if (DEADLINE <= now_ms && batch_count < MAX_BATCH) {
+            tcp_cb_acquire(cb);
+            batch.at(batch_count++) = cb;
+        }
+    }
+    timer_earliest.store(next_earliest, std::memory_order_relaxed);
+    timer_lock_release();
 #ifdef TCP_DEBUG
     static uint64_t last_status_ms = 0;
     if (now_ms - last_status_ms >= 5000) {
         last_status_ms = now_ms;
-        size_t timer_list_len = 0;
-        timer_lock_acquire();
-        for (TcpCB* c = timer_head; c != nullptr; c = c->timer_next) {
-            timer_list_len++;
-        }
-        timer_lock_release();
         log::debug("pool_free=%zu/%zu timer_list=%zu timer_lock_contentions=%lu", ker::net::pkt_pool_free_count(),
                    ker::net::pkt_pool_size(), timer_list_len, timer_lock_contentions.load(std::memory_order_relaxed));
     }
 #endif
 
+    std::array<PacketBuffer*, MAX_DEFERRED_RETRANSMITS> spare{};
+    size_t spare_count = 0;
+    if (batch_count != 0) {
+        for (auto& pkt : spare) {
+            pkt = pkt_alloc_tx();
+            if (pkt == nullptr) {
+                break;
+            }
+            ++spare_count;
+        }
+    }
     std::array<DeferredRetransmit, MAX_DEFERRED_RETRANSMITS> deferred{};
     size_t deferred_count = 0;
-    std::array<Socket*, MAX_DEFERRED_RETRANSMITS> sockets_to_wake{};
+    std::array<Socket*, MAX_BATCH> sockets_to_wake{};
     size_t wake_count = 0;
 
-    // Snapshot work under timer_lock; process under cb->lock.
-    constexpr size_t MAX_BATCH = 32;
-    std::array<TcpCB*, MAX_BATCH> batch{};
-    size_t batch_count = 0;
-
-    TcpCB* to_free = nullptr;
-    uint64_t next_earliest = UINT64_MAX;
-
-    timer_lock_acquire();
-    TcpCB** pp = &timer_head;
-    while (*pp != nullptr) {
-        TcpCB* cb = *pp;
-
-        uint64_t deadline = UINT64_MAX;
-        bool should_remove = false;
-
-        // Cleanup checks; stale reads are safe and handled next tick.
-        if (cb->state == TcpState::TIME_WAIT) {
-            deadline = cb->time_wait_deadline;
-            if (now_ms >= deadline) {
-                should_remove = true;
-            }
-        } else if (cb->state == TcpState::CLOSED && cb->socket == nullptr) {
-            should_remove = true;
-        } else if (cb->state == TcpState::FIN_WAIT_2 && cb->socket == nullptr) {
-            if (cb->time_wait_deadline == 0) {
-                cb->time_wait_deadline = tcp_deadline_after_ms(now_ms, 60000);
-            }
-            deadline = cb->time_wait_deadline;
-            if (now_ms >= deadline) {
-                should_remove = true;
-            }
-        }
-
-        if (should_remove) {
-            *pp = cb->timer_next;
-            cb->on_timer_list = false;
-            cb->timer_next = to_free;
-            to_free = cb;
+    for (size_t i = 0; i < batch_count; ++i) {
+        TcpCB* cb = batch.at(i);
+        uint64_t const FLAGS = cb->lock.lock_irqsave();
+        bool const EXPIRED = (cb->state == TcpState::TIME_WAIT && now_ms >= cb->time_wait_deadline) ||
+                             (cb->state == TcpState::FIN_WAIT_2 && cb->socket == nullptr && cb->time_wait_deadline != 0 &&
+                              now_ms >= cb->time_wait_deadline) ||
+                             (cb->state == TcpState::CLOSED && cb->socket == nullptr);
+        if (EXPIRED) {
+            cb->state = TcpState::CLOSED;
+            ++cb->output_generation;
+            clear_retransmits_locked(cb);
+            tcp_timer_disarm(cb);
+            cb->lock.unlock_irqrestore(FLAGS);
+            tcp_free_cb(cb);
+            tcp_cb_release(cb);
             continue;
         }
 
-        bool needs_work = false;
-        if (cb->retransmit_head != nullptr && cb->state != TcpState::CLOSED && cb->state != TcpState::LISTEN &&
-            now_ms >= cb->retransmit_deadline) {
-            needs_work = true;
-        }
-        if (cb->ack_pending && cb->state == TcpState::ESTABLISHED) {
-            needs_work = true;
-        }
-        if (cb->delayed_ack_deadline != 0 && now_ms >= cb->delayed_ack_deadline && cb->state == TcpState::ESTABLISHED) {
-            needs_work = true;
-        }
-        if (cb->ooo_ack_deadline != 0 && now_ms >= cb->ooo_ack_deadline && cb->state == TcpState::ESTABLISHED) {
-            needs_work = true;
-        }
-        if (cb->keepalive_deadline != 0 && now_ms >= cb->keepalive_deadline && cb->state == TcpState::ESTABLISHED) {
-            needs_work = true;
-        }
-
-        if (needs_work && batch_count < MAX_BATCH) {
-            tcp_cb_acquire(cb);
-            batch.at(batch_count++) = cb;
-        }
-
-        if (cb->retransmit_head != nullptr) {
-            next_earliest = std::min(next_earliest, cb->retransmit_deadline);
-        }
-        if (cb->ack_pending) {
-            next_earliest = std::min(next_earliest, tcp_deadline_after_ms(now_ms, 10));
-        }
-        if (cb->delayed_ack_deadline != 0) {
-            next_earliest = std::min(next_earliest, cb->delayed_ack_deadline);
-        }
-        if (cb->ooo_ack_deadline != 0) {
-            next_earliest = std::min(next_earliest, cb->ooo_ack_deadline);
-        }
-        if (cb->keepalive_deadline != 0) {
-            next_earliest = std::min(next_earliest, cb->keepalive_deadline);
-        }
-        if (cb->state == TcpState::TIME_WAIT) {
-            next_earliest = std::min(next_earliest, cb->time_wait_deadline);
-        }
-        if (cb->state == TcpState::FIN_WAIT_2 && cb->socket == nullptr && cb->time_wait_deadline != 0) {
-            next_earliest = std::min(next_earliest, cb->time_wait_deadline);
-        }
-
-        pp = &(*pp)->timer_next;
-    }
-    timer_earliest.store(next_earliest, std::memory_order_relaxed);
-    timer_lock_release();
-
-    // Free dead TCBs after removing from hash table.
-    while (to_free != nullptr) {
-        auto* next_free = to_free->timer_next;
-        to_free->timer_next = nullptr;
-        // hash_next still has the original bucket chain.
-        uint32_t const IDX = tcp_hash_tuple(to_free->local, to_free->remote) % TCB_HASH_SIZE;
-        auto& bucket = tcb_hash.at(IDX);
-        bool removed_from_hash = false;
-        bucket.lock.lock();
-        TcpCB** hp = &bucket.head;
-        while (*hp != nullptr) {
-            if (*hp == to_free) {
-                *hp = to_free->hash_next;
-                to_free->hash_next = nullptr;
-                removed_from_hash = true;
-                break;
+        auto stage = [&](bool check_sequence = false, uint32_t seq_end = 0, bool ack_completion = false, bool persist_probe = false) {
+            stage_packet_locked(cb, spare.at(deferred_count), deferred.at(deferred_count), check_sequence, seq_end, ack_completion,
+                                persist_probe);
+            spare.at(deferred_count++) = nullptr;
+        };
+        auto wake_after_unlock = [&] {
+            if (cb->socket != nullptr && wake_count < sockets_to_wake.size() && socket_try_acquire(cb->socket)) {
+                sockets_to_wake.at(wake_count++) = cb->socket;
             }
-            hp = &(*hp)->hash_next;
-        }
-        bucket.lock.unlock();
-        if (removed_from_hash) {
-            tcp_cb_release(to_free);
-        }
-        // Releasing the timer-list membership ref is separate from hash removal.
-        tcp_cb_release(to_free);
-        to_free = next_free;
-    }
-
-    constexpr size_t MAX_TIMER_BATCH_ENTRIES = 4;
-    for (size_t i = 0; i < batch_count; i++) {
-        TcpCB* rcb = batch.at(i);
-        uint64_t const RCB_LOCK_FLAGS = rcb->lock.lock_irqsave();
-
-        if (rcb->delayed_ack_deadline != 0 && now_ms >= rcb->delayed_ack_deadline && rcb->state == TcpState::ESTABLISHED &&
-            deferred_count < MAX_DEFERRED_RETRANSMITS) {
-            rcb->delayed_ack_deadline = 0;
-            rcb->segs_pending_ack = 0;
-            SocketEndpoint ack_local{};
-            SocketEndpoint ack_remote{};
-            auto* ack_pkt = tcp_build_ack(rcb, &ack_local, &ack_remote);
-            if (ack_pkt != nullptr) {
-                tcp_cb_acquire(rcb);
-                deferred.at(deferred_count++) = {
-                    .pkt = ack_pkt,
-                    .local = ack_local,
-                    .remote = ack_remote,
-                    .bound_ifindex = rcb->socket != nullptr ? rcb->socket->bound_ifindex : 0,
-                    .seq_end = 0,
-                    .cb = nullptr,
-                    .ack_cb = rcb,
-                };
+        };
+        bool const STREAM = cb->state == TcpState::ESTABLISHED || cb->state == TcpState::CLOSE_WAIT;
+        bool const LIVE = cb->state != TcpState::CLOSED && cb->state != TcpState::LISTEN && cb->state != TcpState::TIME_WAIT;
+        bool const PERSIST = cb->sender_enabled && STREAM && cb->snd_wnd == 0 && cb->persist_needed;
+        if (PERSIST && cb->persist_deadline != 0 && now_ms >= cb->persist_deadline) {
+            if (deferred_count < spare_count && tcp_build_probe_locked(cb, spare.at(deferred_count))) {
+                stage(false, 0, false, true);
+                cb->persist_interval =
+                    std::min<uint64_t>(std::max<uint64_t>(cb->persist_interval, TCP_PERSIST_INITIAL_MS), TCP_PERSIST_MAX_MS / 2) * 2;
+                cb->persist_deadline = tcp_deadline_after_ms(now_ms, cb->persist_interval);
             } else {
-                rcb->ack_pending = true;
+                cb->persist_deadline = tcp_deadline_after_ms(now_ms, TCP_TIMER_ALLOCATION_RETRY_MS);
             }
-        }
-
-        if (rcb->ack_pending && rcb->state == TcpState::ESTABLISHED && deferred_count < MAX_DEFERRED_RETRANSMITS) {
-            SocketEndpoint ack_local{};
-            SocketEndpoint ack_remote{};
-            auto* ack_pkt = tcp_build_ack(rcb, &ack_local, &ack_remote);
-            if (ack_pkt != nullptr) {
-                tcp_cb_acquire(rcb);
-                deferred.at(deferred_count++) = {
-                    .pkt = ack_pkt,
-                    .local = ack_local,
-                    .remote = ack_remote,
-                    .bound_ifindex = rcb->socket != nullptr ? rcb->socket->bound_ifindex : 0,
-                    .seq_end = 0,
-                    .cb = nullptr,
-                    .ack_cb = rcb,
-                };
-            }
-        }
-
-        if (rcb->ooo_ack_deadline != 0 && now_ms >= rcb->ooo_ack_deadline && rcb->state == TcpState::ESTABLISHED) {
-            if (rcb->ooo_head == nullptr && !rcb->ooo_fin_pending) {
-                rcb->ooo_ack_deadline = 0;
-                rcb->ooo_ack_probes = 0;
-            } else if (deferred_count < MAX_DEFERRED_RETRANSMITS) {
-                SocketEndpoint ack_local{};
-                SocketEndpoint ack_remote{};
-                auto* ack_pkt = tcp_build_ack(rcb, &ack_local, &ack_remote);
-                if (ack_pkt != nullptr) {
-                    tcp_cb_acquire(rcb);
-                    deferred.at(deferred_count++) = {
-                        .pkt = ack_pkt,
-                        .local = ack_local,
-                        .remote = ack_remote,
-                        .bound_ifindex = rcb->socket != nullptr ? rcb->socket->bound_ifindex : 0,
-                        .seq_end = 0,
-                        .cb = nullptr,
-                        .ack_cb = rcb,
-                    };
-                } else {
-                    rcb->ack_pending = true;
+        } else if (LIVE && !PERSIST && cb->retransmit_head != nullptr && now_ms >= cb->retransmit_deadline) {
+            auto* entry = find_retransmit_locked(cb, cb->snd_una);
+            if (entry == nullptr || entry->rto_retries >= MAX_RETRIES) {
+                cb->state = TcpState::CLOSED;
+                ++cb->output_generation;
+                clear_retransmits_locked(cb);
+                if (cb->socket != nullptr) {
+                    cb->socket->pending_error.store(ETIMEDOUT, std::memory_order_release);
                 }
-
-                rcb->ooo_ack_probes++;
-                if (rcb->ooo_ack_probes < TCP_OOO_ACK_PROBE_MAX_COUNT) {
-                    rcb->ooo_ack_deadline = tcp_deadline_after_ms(now_ms, ooo_ack_probe_interval_ms(rcb->ooo_ack_probes));
-                } else {
-                    rcb->ooo_ack_deadline = 0;
-                }
-            }
-        }
-
-        // Keepalive probe.
-        if (rcb->keepalive_deadline != 0 && now_ms >= rcb->keepalive_deadline && rcb->state == TcpState::ESTABLISHED &&
-            deferred_count < MAX_DEFERRED_RETRANSMITS) {
-            if (rcb->keepalive_count >= rcb->keepalive_probes_max) {
-                // Peer is unreachable; kill the connection.
-                rcb->keepalive_deadline = 0;
-                rcb->state = TcpState::CLOSED;
-                while (rcb->retransmit_head != nullptr) {
-                    auto* e = rcb->retransmit_head;
-                    rcb->retransmit_head = e->next;
-                    if (e->pkt != nullptr) {
-                        pkt_free(e->pkt);
+                wake_after_unlock();
+            } else if (entry != nullptr && deferred_count < spare_count) {
+                uint32_t const START = cb->snd_una;
+                uint32_t const REMAINING = entry->seq + static_cast<uint32_t>(entry->len) - START;
+                uint32_t const END = START + std::min<uint32_t>(REMAINING, std::max<uint16_t>(cb->snd_mss, 1));
+                if (tcp_build_retransmit_locked(cb, entry, START, END, spare.at(deferred_count))) {
+                    stage(true, END);
+                    ++entry->rto_retries;
+                    if (cb->sender_enabled) {
+                        tcp_sender_on_timeout(cb->sender, cb->snd_una, cb->snd_nxt, !cb->rto_backed_off);
                     }
-                    delete e;
-                }
-                rcb->retransmit_tail = nullptr;
-                if (rcb->socket != nullptr && wake_count < MAX_DEFERRED_RETRANSMITS) {
-                    sockets_to_wake.at(wake_count++) = rcb->socket;
+                    cb->rto_backed_off = true;
+                    cb->fast_retransmit_pending = false;
+                    cb->fast_retransmit_deadline = 0;
+                    cb->rto_ms = std::min<uint64_t>(std::max<uint64_t>(cb->rto_ms, TCP_RTO_MIN_MS), TCP_RTO_MAX_MS / 2) * 2;
+                    cb->retransmit_deadline = tcp_deadline_after_ms(now_ms, cb->rto_ms);
+                } else {
+                    cb->retransmit_deadline = tcp_deadline_after_ms(now_ms, TCP_TIMER_ALLOCATION_RETRY_MS);
                 }
             } else {
-                SocketEndpoint ka_local{};
-                SocketEndpoint ka_remote{};
-                auto* ka_pkt = tcp_build_keepalive_probe(rcb, &ka_local, &ka_remote);
-                if (ka_pkt != nullptr) {
-                    deferred.at(deferred_count++) = {
-                        .pkt = ka_pkt,
-                        .local = ka_local,
-                        .remote = ka_remote,
-                        .bound_ifindex = rcb->socket != nullptr ? rcb->socket->bound_ifindex : 0,
-                        .seq_end = 0,
-                        .cb = nullptr,
-                        .ack_cb = nullptr,
-                    };
-                }
-                rcb->keepalive_count++;
-                rcb->keepalive_deadline = tcp_deadline_after_ms(now_ms, rcb->keepalive_intvl_ms);
+                cb->retransmit_deadline = tcp_deadline_after_ms(now_ms, TCP_TIMER_ALLOCATION_RETRY_MS);
             }
-        }
-
-        if (rcb->retransmit_head != nullptr && rcb->state != TcpState::CLOSED && rcb->state != TcpState::TIME_WAIT &&
-            rcb->state != TcpState::LISTEN) {
-            if (now_ms >= rcb->retransmit_deadline) {
-                auto* entry = rcb->retransmit_head;
-
-                if (entry->retries >= MAX_RETRIES) {
-                    rcb->state = TcpState::CLOSED;
-                    while (rcb->retransmit_head != nullptr) {
-                        auto* e = rcb->retransmit_head;
-                        rcb->retransmit_head = e->next;
-                        if (e->pkt != nullptr) {
-                            pkt_free(e->pkt);
-                        }
-                        delete e;
-                    }
-                    rcb->retransmit_tail = nullptr;
-                    if (rcb->socket != nullptr && wake_count < MAX_DEFERRED_RETRANSMITS) {
-                        sockets_to_wake.at(wake_count++) = rcb->socket;
-                    }
+        } else if (LIVE && !PERSIST && cb->fast_retransmit_pending &&
+                   (cb->fast_retransmit_deadline == 0 || now_ms >= cb->fast_retransmit_deadline)) {
+            TcpSackRange hole{};
+            bool const HAS_HOLE = tcp_sack_first_hole(cb->sender.sack, cb->snd_una, cb->snd_nxt, hole);
+            uint32_t const START = hole.left;
+            auto* entry = HAS_HOLE ? find_retransmit_locked(cb, START) : nullptr;
+            if (entry == nullptr) {
+                cb->fast_retransmit_pending = false;
+                cb->fast_retransmit_deadline = 0;
+            } else if (deferred_count < spare_count) {
+                uint32_t const REMAINING = entry->seq + static_cast<uint32_t>(entry->len) - START;
+                uint32_t const END =
+                    START + std::min({REMAINING, hole.right - START, static_cast<uint32_t>(std::max<uint16_t>(cb->snd_mss, 1))});
+                if (tcp_build_retransmit_locked(cb, entry, START, END, spare.at(deferred_count))) {
+                    stage(true, END);
+                    cb->fast_retransmit_seq = START;
+                    cb->fast_retransmit_pending = false;
+                    cb->fast_retransmit_deadline = 0;
                 } else {
-                    deferred_count = retransmit_segment(rcb, entry, deferred, deferred_count);
-
-                    if (entry->retries == 1) {
-                        auto* nxt = entry->next;
-                        while (nxt != nullptr && nxt->retries == 0 && deferred_count < MAX_TIMER_BATCH_ENTRIES) {
-                            deferred_count = retransmit_segment(rcb, nxt, deferred, deferred_count);
-                            nxt = nxt->next;
-                        }
-                    }
-
-                    rcb->rto_ms = rcb->rto_ms * 2;
-                    rcb->rto_ms = std::min<uint64_t>(rcb->rto_ms, TCP_RTO_MAX_MS);
-                    rcb->retransmit_deadline = tcp_deadline_after_ms(now_ms, rcb->rto_ms);
+                    cb->fast_retransmit_deadline = tcp_deadline_after_ms(now_ms, TCP_TIMER_ALLOCATION_RETRY_MS);
                 }
-            }
-        }
-
-        bool const STILL_ACTIVE = rcb->retransmit_head != nullptr || rcb->ack_pending || rcb->delayed_ack_deadline != 0 ||
-                                  rcb->ooo_ack_deadline != 0 || rcb->keepalive_deadline != 0 || rcb->state == TcpState::TIME_WAIT ||
-                                  (rcb->state == TcpState::FIN_WAIT_2 && rcb->socket == nullptr);
-        if (!STILL_ACTIVE) {
-            tcp_timer_disarm(rcb);
-        }
-
-        rcb->lock.unlock_irqrestore(RCB_LOCK_FLAGS);
-        tcp_cb_release(rcb);
-    }
-
-    // Send deferred packets outside all locks.
-    for (size_t i = 0; i < deferred_count; i++) {
-        int tx_res = 0;
-        auto& deferred_entry = deferred.at(i);
-        if (deferred_entry.seq_end != 0 && deferred_entry.cb != nullptr) {
-            uint32_t const UNA = deferred_entry.cb->snd_una;
-            if (!tcp_seq_after(deferred_entry.seq_end, UNA)) {
-                pkt_free(deferred_entry.pkt);
-                tcp_cb_release(deferred_entry.cb);
-                if (deferred_entry.ack_cb != nullptr) {
-                    tcp_cb_release(deferred_entry.ack_cb);
-                }
-                continue;
-            }
-        }
-        tx_res = tcp_transmit_prebuilt(deferred_entry.pkt, deferred_entry.local, deferred_entry.remote, deferred_entry.bound_ifindex);
-
-        if (deferred_entry.cb != nullptr) {
-            tcp_cb_release(deferred_entry.cb);
-        }
-
-        if (deferred_entry.ack_cb != nullptr) {
-            TcpCB* ack_cb = deferred_entry.ack_cb;
-            uint64_t const ACK_CB_FLAGS = ack_cb->lock.lock_irqsave();
-            if (tx_res >= 0) {
-                ack_cb->ack_pending = false;
             } else {
-                ack_cb->ack_pending = true;
-                tcp_timer_arm(ack_cb);
+                cb->fast_retransmit_deadline = tcp_deadline_after_ms(now_ms, TCP_TIMER_ALLOCATION_RETRY_MS);
             }
-            ack_cb->lock.unlock_irqrestore(ACK_CB_FLAGS);
-            tcp_cb_release(ack_cb);
         }
+
+        bool const ACK_STATE = cb->state != TcpState::CLOSED && cb->state != TcpState::LISTEN && cb->state != TcpState::SYN_SENT;
+        if (ACK_STATE && (cb->ack_pending || (cb->delayed_ack_deadline != 0 && now_ms >= cb->delayed_ack_deadline))) {
+            if (deferred_count < spare_count && tcp_build_ack_locked(cb, spare.at(deferred_count))) {
+                stage(false, 0, true);
+                // Clear at admission. A later RX request must survive successful
+                // completion of this older ACK; only failed sends re-arm it.
+                cb->ack_pending = false;
+                cb->delayed_ack_deadline = 0;
+                cb->segs_pending_ack = 0;
+            } else {
+                cb->ack_pending = true;
+                cb->delayed_ack_deadline = 0;
+            }
+        }
+        if (STREAM && cb->ooo_ack_deadline != 0 && now_ms >= cb->ooo_ack_deadline) {
+            if (cb->ooo_head == nullptr && !cb->ooo_fin_pending) {
+                cb->ooo_ack_deadline = 0;
+                cb->ooo_ack_probes = 0;
+            } else if (deferred_count < spare_count && tcp_build_ack_locked(cb, spare.at(deferred_count))) {
+                stage(false, 0, true);
+                ++cb->ooo_ack_probes;
+                cb->ooo_ack_deadline = cb->ooo_ack_probes < TCP_OOO_ACK_PROBE_MAX_COUNT
+                                           ? tcp_deadline_after_ms(now_ms, ooo_ack_probe_interval_ms(cb->ooo_ack_probes))
+                                           : 0;
+            } else {
+                cb->ooo_ack_deadline = tcp_deadline_after_ms(now_ms, TCP_TIMER_ALLOCATION_RETRY_MS);
+            }
+        }
+        if (cb->state == TcpState::ESTABLISHED && cb->keepalive_deadline != 0 && now_ms >= cb->keepalive_deadline) {
+            if (cb->keepalive_count >= cb->keepalive_probes_max) {
+                cb->state = TcpState::CLOSED;
+                ++cb->output_generation;
+                clear_retransmits_locked(cb);
+                if (cb->socket != nullptr) {
+                    cb->socket->pending_error.store(ETIMEDOUT, std::memory_order_release);
+                }
+                wake_after_unlock();
+            } else if (deferred_count < spare_count && tcp_build_keepalive_locked(cb, spare.at(deferred_count))) {
+                stage();
+                ++cb->keepalive_count;
+                cb->keepalive_deadline = tcp_deadline_after_ms(now_ms, cb->keepalive_intvl_ms);
+            } else {
+                cb->keepalive_deadline = tcp_deadline_after_ms(now_ms, TCP_TIMER_ALLOCATION_RETRY_MS);
+            }
+        }
+
+        tcp_timer_arm(cb);
+        cb->lock.unlock_irqrestore(FLAGS);
+        tcp_cb_release(cb);
     }
 
-    for (size_t i = 0; i < wake_count; i++) {
-        wake_socket_timer(sockets_to_wake.at(i));
+    // Retained TCBs and copied packets survive ACK/close. Revalidate under the
+    // TCB lock, then route/transmit only after releasing every protocol lock.
+    for (size_t i = 0; i < deferred_count; ++i) {
+        auto& entry = deferred.at(i);
+        TcpCB* cb = entry.cb;
+        uint64_t flags = cb->lock.lock_irqsave();
+        bool const LIVE = cb->state != TcpState::CLOSED && cb->state != TcpState::LISTEN;
+        bool const NEEDED = LIVE && cb->output_generation == entry.generation &&
+                            (!entry.check_sequence || tcp_seq_after(entry.seq_end, cb->snd_una)) &&
+                            (!entry.persist_probe || (cb->persist_needed && cb->snd_wnd == 0));
+        cb->lock.unlock_irqrestore(flags);
+        int const RESULT = NEEDED ? tcp_transmit_prebuilt(entry.pkt, entry.local, entry.remote, entry.bound_ifindex) : 0;
+        if (!NEEDED) {
+            pkt_free(entry.pkt);
+        }
+        if (NEEDED && (entry.check_sequence || entry.persist_probe) && RESULT >= 0) {
+            flags = cb->lock.lock_irqsave();
+            if (cb->output_generation == entry.generation) {
+                if (entry.persist_probe) {
+                    if (cb->persist_probes != UINT64_MAX) {
+                        ++cb->persist_probes;
+                    }
+                } else if (cb->retransmit_packets != UINT64_MAX) {
+                    ++cb->retransmit_packets;
+                }
+            }
+            cb->lock.unlock_irqrestore(flags);
+        }
+        if (NEEDED && entry.ack_completion && RESULT < 0) {
+            flags = cb->lock.lock_irqsave();
+            if (cb->state != TcpState::CLOSED && cb->state != TcpState::LISTEN && cb->output_generation == entry.generation) {
+                cb->ack_pending = true;
+                tcp_timer_arm(cb);
+            }
+            cb->lock.unlock_irqrestore(flags);
+        }
+        tcp_cb_release(cb);
+    }
+    for (auto* pkt : spare) {
+        pkt_free(pkt);
+    }
+    for (size_t i = 0; i < wake_count; ++i) {
+        socket_wake_waiters(sockets_to_wake.at(i));
+        socket_release(sockets_to_wake.at(i));
     }
 }
 
@@ -552,7 +489,10 @@ void tcp_timer_tick(uint64_t now_ms) {
             if (earliest <= now_ms) {
                 sleep_us = TCP_TIMER_OVERDUE_BACKOFF_US;
             } else {
-                sleep_us = std::max<uint64_t>((earliest - now_ms) * TCP_TIMER_MS_TO_US, 1);
+                // Periodic bounded sleep also covers an arm/wake racing with
+                // this worker entering sleep. Clamp before multiplication.
+                sleep_us = std::max<uint64_t>(
+                    std::min<uint64_t>(earliest - now_ms, TCP_TIMER_IDLE_SLEEP_US / TCP_TIMER_MS_TO_US) * TCP_TIMER_MS_TO_US, 1);
             }
         }
 #ifdef NET_TRACE

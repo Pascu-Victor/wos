@@ -68,18 +68,29 @@ def require_recv_window_ack_is_locked(problems: list[str]) -> None:
     require_order(
         helper,
         [
+            "tcp_cb_acquire(cb)",
+            "PacketBuffer* ack_pkt = pkt_alloc_tx()",
             "cb->lock.lock_irqsave()",
             "cb->rcv_wnd = tcp_receive_window_space(cb, sock)",
-            "tcp_build_ack(cb, &ack_local, &ack_remote)",
+            "tcp_build_ack_locked(cb, ack_pkt)",
+            "ack_local = cb->local",
+            "ack_remote = cb->remote",
+            "generation = cb->output_generation",
             "cb->lock.unlock_irqrestore(FLAGS)",
-            "tcp_transmit_prebuilt(ack_pkt, ack_local, ack_remote, sock->bound_ifindex) < 0",
-            "uint64_t const RETRY_FLAGS = cb->lock.lock_irqsave()",
+            "cb->output_generation == generation",
+            "cb->lock.unlock_irqrestore(flags)",
+            "tcp_transmit_prebuilt(ack_pkt, ack_local, ack_remote, bound_ifindex) < 0",
+            "flags = cb->lock.lock_irqsave()",
+            "cb->output_generation == generation",
             "cb->ack_pending = true",
             "tcp_timer_arm(cb)",
-            "cb->lock.unlock_irqrestore(RETRY_FLAGS)",
+            "cb->lock.unlock_irqrestore(flags)",
+            "tcp_cb_release(cb)",
         ],
         "locked recv-window ACK snapshot",
     )
+    if "tcp_build_ack(cb," in helper:
+        problems.append("receive-window ACK must fill a preallocated packet while holding cb->lock")
 
 
 def require_timer_scan_covers_full_list(problems: list[str]) -> None:
@@ -92,14 +103,23 @@ def require_timer_scan_covers_full_list(problems: list[str]) -> None:
     require_order(
         timer_tick,
         [
-            "while (*pp != nullptr)",
-            "bool needs_work = false",
-            "if (needs_work && batch_count < MAX_BATCH)",
-            "next_earliest = std::min(next_earliest, cb->retransmit_deadline)",
+            "timer_lock_acquire()",
+            "for (TcpCB* cb = timer_head; cb != nullptr; cb = cb->timer_next)",
+            "cb->timer_deadline.load(std::memory_order_acquire)",
+            "next_earliest = std::min(next_earliest, DEADLINE)",
+            "if (DEADLINE <= now_ms && batch_count < MAX_BATCH)",
+            "tcp_cb_acquire(cb)",
             "timer_earliest.store(next_earliest, std::memory_order_relaxed)",
+            "timer_lock_release()",
+            "pkt = pkt_alloc_tx()",
+            "uint64_t const FLAGS = cb->lock.lock_irqsave()",
         ],
         "full TCP timer list scan with bounded work batch",
     )
+    snapshot = timer_tick[timer_tick.index("timer_lock_acquire()"):timer_tick.index("timer_lock_release()")]
+    for field in ("state", "socket", "retransmit_deadline", "keepalive_deadline", "ack_pending"):
+        if f"cb->{field}" in snapshot:
+            problems.append(f"timer list snapshot reads protocol field {field} without cb->lock")
 
 
 def main() -> None:
@@ -119,12 +139,12 @@ def main() -> None:
 
     timer_source = (ROOT / "modules" / "kern" / "src" / "net" / "proto" / "tcp_timer.cpp").read_text()
     for token in [
-        "tcp_deadline_after_ms(tcp_now_ms(), 60000)",
-        "tcp_deadline_after_ms(tcp_now_ms(), 10)",
-        "tcp_deadline_after_ms(now_ms, 60000)",
-        "tcp_deadline_after_ms(now_ms, 10)",
-        "tcp_deadline_after_ms(now_ms, rcb->keepalive_intvl_ms)",
-        "tcp_deadline_after_ms(now_ms, rcb->rto_ms)",
+        "tcp_deadline_after_ms(NOW, 60000)",
+        "tcp_deadline_after_ms(NOW, TCP_TIMER_ALLOCATION_RETRY_MS)",
+        "tcp_deadline_after_ms(now_ms, TCP_TIMER_ALLOCATION_RETRY_MS)",
+        "tcp_deadline_after_ms(now_ms, cb->keepalive_intvl_ms)",
+        "tcp_deadline_after_ms(now_ms, cb->rto_ms)",
+        "tcp_deadline_after_ms(now_ms, cb->persist_interval)",
     ]:
         if token not in timer_source:
             problems.append(f"tcp_timer.cpp missing saturating deadline use: {token}")

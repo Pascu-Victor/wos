@@ -616,7 +616,8 @@ auto main(int argc, char** argv, char** envp) -> int {
         return run_fsbench(argc - 1, argv + 1);
     }
 
-    if (command != nullptr && (std::strcmp(command, "netbench-server") == 0 || std::strcmp(command, "netbench-client") == 0)) {
+    if (command != nullptr && (std::strcmp(command, "netbench-server") == 0 || std::strcmp(command, "netbench-client") == 0 ||
+                               std::strcmp(command, "netbench-configure") == 0)) {
         return run_netbench(argc - 1, argv + 1);
     }
 

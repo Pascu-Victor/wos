@@ -93,8 +93,11 @@ def main() -> None:
     require_order(
         connect_body,
         [
-            "if ((remote.is_ipv4() || remote.is_v4_mapped()) && cb->local.is_unspecified())",
+            "if (remote.is_ipv4() || remote.is_v4_mapped())",
             "ker::net::route_lookup(remote.ipv4_address())",
+            "cb->rcv_mss = tcp_receive_mss_for_path(remote, route_ref->mtu)",
+            "if (cb->local.is_unspecified())",
+            "sock->local = cb->local",
             "if (remote.is_ipv6() && !remote.is_v4_mapped())",
             "ipv6_route_resolve(remote.ipv6_address(), requested_ptr, IFINDEX, route)",
             "if (cb->local.port == 0)",

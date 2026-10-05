@@ -1206,6 +1206,28 @@ wos_add_unit_test(tcp_test
     SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/tcp_test.cpp
 )
 
+wos_add_unit_test(tcp_sender_test
+    SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/tcp_sender_test.cpp
+)
+
+add_test(
+    NAME tcp_integration_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/tcp_integration_test.py
+)
+set_tests_properties(tcp_integration_test PROPERTIES LABELS "host;unit;source" TIMEOUT 90)
+
+add_test(
+    NAME tcp_impairment_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/tcp_impairment_test.py
+)
+set_tests_properties(tcp_impairment_test PROPERTIES LABELS "host;unit;source")
+
+add_test(
+    NAME tcp_window_cap_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/tcp_window_cap_test.py
+)
+set_tests_properties(tcp_window_cap_test PROPERTIES LABELS "host;unit;source")
+
 wos_add_unit_test(xfs_format_test
     SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_format_test.cpp
 )
@@ -1355,6 +1377,10 @@ wos_add_fuzz_target(data_struct_fuzz
 
 wos_add_fuzz_target(tcp_fuzz
     SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/tcp_fuzz.cpp
+)
+
+wos_add_fuzz_target(tcp_sender_fuzz
+    SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/tcp_sender_fuzz.cpp
 )
 
 wos_add_fuzz_target(xfs_format_fuzz

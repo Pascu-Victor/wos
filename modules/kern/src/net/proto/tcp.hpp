@@ -8,6 +8,7 @@
 #include <net/address.hpp>
 #include <net/netdevice.hpp>
 #include <net/packet.hpp>
+#include <net/proto/tcp_sender.hpp>
 #include <net/socket.hpp>
 #include <platform/sys/spinlock.hpp>
 
@@ -68,6 +69,8 @@ struct RetransmitEntry {
     size_t len{};
     uint64_t send_time_ms{};
     uint8_t retries{};
+    uint8_t rto_retries{};
+    uint64_t tx_id{};
     RetransmitEntry* next{};
 };
 
@@ -90,6 +93,14 @@ constexpr uint64_t TCP_OOO_ACK_PROBE_MAX_MS = 1000;
 constexpr uint8_t TCP_OOO_ACK_PROBE_MAX_COUNT = 64;
 // Per-send syscall burst before returning a partial count; not an in-flight cap.
 constexpr uint32_t TCP_SEND_BURST_BYTES = 1024U * 1024U;
+constexpr size_t TCP_RETRANSMIT_MAX_ENTRIES = 256;
+constexpr uint64_t TCP_PERSIST_INITIAL_MS = 1000;
+constexpr uint64_t TCP_PERSIST_MAX_MS = 60000;
+#ifdef WOS_TCP_CONGESTION_CONTROL
+constexpr bool TCP_CONGESTION_DEFAULT_ENABLED = true;
+#else
+constexpr bool TCP_CONGESTION_DEFAULT_ENABLED = false;
+#endif
 
 // MSS advertised to a peer is bounded by both the ingress path MTU and the
 // largest packet this stack can represent. Native IPv6 needs 40 more bytes of
@@ -102,6 +113,10 @@ constexpr uint32_t TCP_SEND_BURST_BYTES = 1024U * 1024U;
     size_t const MTU_PAYLOAD = mtu == 0 ? FALLBACK : (mtu > OVERHEAD ? static_cast<size_t>(mtu) - OVERHEAD : 1U);
     size_t const BUFFER_PAYLOAD = PKT_BUF_SIZE - PKT_HEADROOM - OVERHEAD;
     return static_cast<uint16_t>(std::min({static_cast<size_t>(UINT16_MAX), MTU_PAYLOAD, BUFFER_PAYLOAD}));
+}
+
+[[nodiscard]] inline auto tcp_send_mss_for_path(const SocketEndpoint& peer, uint16_t offered_mss, uint32_t mtu) -> uint16_t {
+    return std::min(std::max<uint16_t>(offered_mss, 1), tcp_receive_mss_for_path(peer, mtu));
 }
 
 // Normalize an on-wire endpoint to the address family exposed by a socket.
@@ -130,6 +145,23 @@ struct TcpCB {
     uint32_t snd_nxt = 0;  // next sequence number to send
     uint32_t snd_wnd = 0;  // send window
     uint32_t iss = 0;      // initial send sequence number
+    uint32_t snd_wl1 = 0;  // sequence of last accepted window update
+    uint32_t snd_wl2 = 0;  // ACK of last accepted window update
+
+    TcpSenderState sender{};
+    bool sender_enabled = TCP_CONGESTION_DEFAULT_ENABLED;
+    bool fast_retransmit_pending = false;
+    uint32_t fast_retransmit_seq = 0;
+    uint64_t fast_retransmit_deadline = 0;
+    bool rto_backed_off = false;
+    size_t retransmit_entries = 0;
+    uint64_t next_tx_id = 0;
+    uint64_t output_generation = 1;
+    bool persist_needed = false;
+    uint64_t persist_deadline = 0;
+    uint64_t persist_interval = TCP_PERSIST_INITIAL_MS;
+    uint64_t persist_probes = 0;
+    uint64_t retransmit_packets = 0;
 
     uint32_t rcv_nxt = 0;  // next expected receive sequence number
     uint32_t rcv_wnd = 0;  // receive window
@@ -188,6 +220,7 @@ struct TcpCB {
     // Timer list chain.
     TcpCB* timer_next = nullptr;
     bool on_timer_list = false;
+    std::atomic<uint64_t> timer_deadline{UINT64_MAX};
 
     ker::mod::sys::Spinlock lock;
 };
@@ -255,6 +288,22 @@ struct TcpConnSnapshot {
     size_t ooo_bytes = 0;
     uint32_t refcount = 0;
     bool sack_permitted = false;
+    bool sender_enabled = false;
+    uint32_t cwnd = 0;
+    uint32_t ssthresh = 0;
+    uint32_t flight = 0;
+    uint32_t duplicate_acks = 0;
+    uint8_t recovery_reason = 0;
+    bool in_recovery = false;
+    uint64_t rto_ms = 0;
+    uint64_t retransmits = 0;
+    uint64_t recovery_requests = 0;
+    uint64_t timeouts = 0;
+    size_t sack_ranges = 0;
+    uint64_t sack_blocks = 0;
+    uint64_t sack_drops = 0;
+    uint64_t persist_probes = 0;
+    uint64_t persist_deadline = 0;
 };
 
 void tcp_rx(NetDevice* dev, PacketBuffer* pkt, IPv4Address src_ip, IPv4Address dst_ip);
@@ -276,7 +325,7 @@ inline auto tcp_generate_iss(uint32_t local_ip, uint16_t local_port, uint32_t re
     return tcp_generate_iss(SocketEndpoint::ipv4(IPv4Address{local_ip}, local_port),
                             SocketEndpoint::ipv4(IPv4Address{remote_ip}, remote_port));
 }
-auto tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) -> bool;
+auto tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len, bool persist_probe = false) -> bool;
 void tcp_send_rst(const SocketEndpoint& source, const SocketEndpoint& destination, uint32_t seq, uint32_t ack, uint8_t flags,
                   uint32_t bound_ifindex = 0);
 auto tcp_send_ack(TcpCB* cb) -> bool;
@@ -286,6 +335,11 @@ auto tcp_transmit_prebuilt(PacketBuffer* pkt, const SocketEndpoint& local, const
 auto tcp_build_ack(TcpCB* cb, SocketEndpoint* out_local, SocketEndpoint* out_remote) -> PacketBuffer*;
 // Build a keepalive probe (ACK with seq = snd_una - 1); caller holds cb->lock.
 auto tcp_build_keepalive_probe(TcpCB* cb, SocketEndpoint* out_local, SocketEndpoint* out_remote) -> PacketBuffer*;
+// Fill caller-owned spare packets without allocation; cb->lock must be held.
+auto tcp_build_ack_locked(TcpCB* cb, PacketBuffer* spare) -> bool;
+auto tcp_build_keepalive_locked(TcpCB* cb, PacketBuffer* spare) -> bool;
+auto tcp_build_probe_locked(TcpCB* cb, PacketBuffer* spare) -> bool;
+auto tcp_build_retransmit_locked(TcpCB* cb, RetransmitEntry* entry, uint32_t start_seq, uint32_t end_seq, PacketBuffer* spare) -> bool;
 
 void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload, size_t payload_len, const SocketEndpoint& source,
                          const SocketEndpoint& destination, uint32_t ingress_mtu = 0);
@@ -321,6 +375,13 @@ inline auto tcp_send_available_bytes(const TcpCB* cb) -> uint32_t {
         return 0;
     }
 
+    if (cb->sender_enabled) {
+        // Reserve one control entry so a full data queue can still publish FIN.
+        if (cb->retransmit_entries >= TCP_RETRANSMIT_MAX_ENTRIES - 1) {
+            return 0;
+        }
+        return tcp_sender_available(cb->sender, cb->snd_una, cb->snd_nxt, cb->snd_wnd);
+    }
     uint32_t const IN_FLIGHT = cb->snd_nxt - cb->snd_una;
     if (IN_FLIGHT >= cb->snd_wnd) {
         return 0;

@@ -96,7 +96,7 @@ err()   { printf '\033[1;31m==>\033[0m %s\n' "$*" >&2; }
 
 timestamp() { date '+%Y-%m-%d_%H%M%S'; }
 
-FUZZ_TARGETS=(wki_wire_fuzz data_struct_fuzz tcp_fuzz xfs_format_fuzz wki_routing_fuzz slab_fuzz telemetry_fuzz perf_data_fuzz)
+FUZZ_TARGETS=(wki_wire_fuzz data_struct_fuzz tcp_fuzz tcp_sender_fuzz xfs_format_fuzz wki_routing_fuzz slab_fuzz telemetry_fuzz perf_data_fuzz)
 UNIT_TESTS=(
     credential_model_test
     credential_policy_audit_test
@@ -307,6 +307,10 @@ UNIT_TESTS=(
     data_struct_test
     hashtable_limit_test
     tcp_test
+    tcp_sender_test
+    tcp_integration_test
+    tcp_impairment_test
+    tcp_window_cap_test
     xfs_format_test
     xfs_log_codec_test
     wki_channel_test

@@ -29,7 +29,7 @@ an explicit pause/block rule.
 | 25  | [Secure session-bound WKI RDMA](25-secure-wki-rdma.md)                               | WKI auth, RoCE, ivshmem, zones, fast paths                   | 20 on ivshmem; 26 on remote VFS               | Not started |
 | 26  | [Owner-authoritative remote VFS coherency](26-remote-vfs-coherency-locking.md)        | remote VFS, caches, append, advisory locks                   | 18 and 25 on shared VFS/wire surfaces         | Not started |
 | 28  | [Durable reconnectable remote jobs](28-durable-remote-jobs.md)                        | remote compute, streams, reconnect, result retention         | 19 identity; 22 quotas; compute rewrites      | Not started |
-| 29  | [Production TCP congestion and loss recovery](29-tcp-congestion-loss-recovery.md)    | TCP sender, ACK/SACK, timers, impairment tests               | 31 on shared timer paths; broad TCP rewrites  | Not started |
+| 29  | [Production TCP congestion and loss recovery](29-tcp-congestion-loss-recovery.md)    | TCP sender, ACK/SACK, timers, impairment tests               | 31 on shared timer paths; broad TCP rewrites  | Complete    |
 | 30  | [Asynchronous multi-queue block I/O](30-asynchronous-block-io.md)                    | block API, AHCI, buffer cache, XFS, swap, proxy              | 20 on DMA/AHCI; 25 on remote block            | Not started |
 | 33 | [Native WOS hardware virtualization](33-native-hypervisor.md) | Intel VMX/EPT, AMD SVM/NPT, common VM ABI | 36, 38, 40 on VM/MM/Task state | Not started |
 | 34 | [Linux guest virtual machine monitor](34-linux-guest-virtual-machine-monitor.md) | libwosvirt, per-VM VMM, vmmd/vmctl, Linux boot/devices | 33 until VM ABI stabilizes; 35 on VMM control | Not started |

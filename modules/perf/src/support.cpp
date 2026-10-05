@@ -193,6 +193,9 @@ auto write_all(int fd, std::string_view text) -> bool {
 }
 
 auto read_limit_for_path(std::string_view path) -> std::size_t {
+    if (path == "/proc/wki/netdiag") {
+        return NETDIAG_READ_LIMIT;
+    }
     if (path == KPERF_PATH || path == KWKISTAT_PATH || path == KIPCSTAT_PATH || path == KCPUSTAT_PATH || path == KCONTSTAT_PATH) {
         return PERF_PROC_READ_LIMIT;
     }

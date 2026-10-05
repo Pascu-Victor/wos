@@ -4,10 +4,12 @@
 #include <sys/types.h>  // ssize_t on Linux host
 
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <net/address.hpp>
+#include <platform/sys/spinlock.hpp>
 
 namespace ker::net {
 
@@ -169,6 +171,10 @@ struct Socket {
     RingBuffer rcvbuf{};
     void* private_data = nullptr;
     uint32_t bound_ifindex = 0;
+    std::atomic<int> pending_error{0};
+    void* proto_data = nullptr;
+    SocketState state = SocketState::UNBOUND;
+    ker::mod::sys::Spinlock lock;
 };
 
 }  // namespace ker::net
