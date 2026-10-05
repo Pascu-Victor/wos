@@ -557,7 +557,7 @@ it does not withdraw other mounts of the same resource generation. Publication
 success is the commit: subsequent asynchronous retirement cannot change it into
 a failed syscall. Constructor lifetime pins span publication and teardown;
 registry locks do not span VFS publication or remote waits. Actual VFS removal
-owns the mount-released flag. See [the audit](goal19_remote_mount_publication.md).
+owns the mount-released flag. See [the audit](security/audits/remote_mount_publication.md).
 Declared LOCAL `/` routing and retained cwd authority are preserved.
 
 
@@ -573,4 +573,4 @@ bindings and issued Files; existing revision advancement invalidates previously
 captured export snapshots. Custom unrelated aliases retain their names. Remote
 proxy unmount remains on its exact-group teardown path. No caller-root export
 rediscovery, declared VFS routing, wire format or existing pathname errno change.
-See [review and qualification limits](goal19_native_unmount_exports.md).
+See [review and qualification limits](security/audits/native_unmount_exports.md).

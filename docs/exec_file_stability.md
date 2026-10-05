@@ -12,7 +12,7 @@ it is not a supported execution path awaiting qualification.
 ## Current authority audit (9LT)
 
 The current requirement checklist is in
-[the exec authority audit](goal19_exec_authority_audit.md). Private candidate
+[the exec authority audit](security/audits/exec_authority_audit.md). Private candidate
 metadata, saved-ID/set-ID transitions, secure auxv, interpreter admission,
 one-shot commit, signal handoff and finite stream output/read work have later
 qualification records. See [remote output completion](remote_exec_output.md)

@@ -66,11 +66,17 @@ mapping/page counts to zero. Quarantine counts intentionally remain nonzero.
 
 ## Validation and limits
 
-The detailed source contracts, frozen artifacts, host/model/fuzz results, full
-KTEST runs and live device/fault receipts are in
-[`goal20_dma_ownership.md`](goal20_dma_ownership.md). Live fixtures use
-`bin/wos-ktest --no-setup` or `bin/wos-cluster --no-setup` with private configuration
-and disks, preserving the normal build and unrelated VMs.
+Historical qualification covered bounded DMAR parsing, strict requester-domain
+admission, managed driver transfers, terminal retirement and fault quarantine.
+The final diagnostic run recorded 68,578 assertions with zero failures; QEMU
+fixtures also covered ACS admission and explicit refusal of unsupported
+boundaries. These are prior results, not a validation of the current source.
+The completed implementation ledger was removed during worktree cleanup on
+2026-10-05, together with its private experiment artifacts.
+
+Fresh fixtures use the isolated KTEST or cluster workflow with private
+configuration and disks. Follow the current repository instructions for runtime
+authorization and preserve the normal build and unrelated VMs.
 
 QEMU qualification does not establish physical chipset, firmware, cache or
 ACS behavior. The policy assumes a conforming trusted root complex and firmware.

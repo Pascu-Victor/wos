@@ -947,7 +947,7 @@ survives UID changes; it does not survive leaving the selected group/session.
 Unsupported protocol, stale route and send refusal never fall back to lifecycle
 TASK_CANCEL or the parked source frame. ACCEPT/CANCEL layouts and ordinary user
 signal negotiation are unchanged. Older peers without the advertisement do not
-receive the new terminal events. See [the implementation and evidence](goal19_remote_terminal_admission.md).
+receive the new terminal events. See [the implementation and evidence](security/audits/remote_terminal_admission.md).
 
 ## Issued block access (Goal19 9OD)
 
@@ -960,4 +960,4 @@ Scalar/ring READ and ring BULK_READ reject write-only bindings with EACCES befor
 device callbacks or data transfer. Scalar/ring FLUSH requires writable access,
 returning EROFS otherwise. Existing write denials, geometry validation, exact
 channel/zone lifetime and wire layouts remain unchanged. See the
-[implementation and native functional evidence](goal19_block_binding_authority.md).
+[implementation and native functional evidence](security/audits/block_binding_authority.md).

@@ -6,7 +6,7 @@ parent-cover publication across boot pivot preserve the selected cwd through
 rename. General native-source, owned-root and third-owner transfer, plus broader
 readonly/nosuid and placement evidence, remain pending.
 This is Goal19 requirement5 and the pending VFS traversal domain. The9LT
-[exec authority audit](goal19_exec_authority_audit.md) qualifies supported exec
+[exec authority audit](security/audits/exec_authority_audit.md) qualifies supported exec
 authority and explicit refusal of unsupported transfers; it does not implement
 general root/cwd transfer. Declared routing is preserved, including LOCAL `/`
 selecting the receiver root.

@@ -26,38 +26,11 @@ an explicit pause/block rule.
 
 | ID  | Goal                                                                                 | Primary surfaces                                            | Avoid concurrent ownership with               | Status      |
 | --- | ------------------------------------------------------------------------------------ | ----------------------------------------------------------- | --------------------------------------------- | ----------- |
-| 01  | [Fault-safe syscall user access](01-syscall-usercopy-safety.md)                      | syscall ABI, usercopy, VFS, sockets                         | 10, 11 when changing the same ABI wrappers    | Done        |
-| 02  | [Unified memory-pressure coordinator](02-unified-memory-reclaim.md)                  | allocator, caches, swap, reclaim                            | other allocator/reclaim rewrites              | Done        |
-| 03  | [Event-driven child lifecycle](03-process-child-events.md)                           | waitpid, exit, ptrace, scheduler                            | 04 or 16 in shared Task/deferred-switch code  | Done        |
-| 04  | [Executable scheduler transition model](04-scheduler-transition-model.md)            | EEVDF transitions, migration, handoff                       | 03, 16, and other scheduler restructures      | Done        |
-| 05  | [Asynchronous xHCI hotplug lifecycle](05-xhci-hotplug-lifecycle.md)                  | IRQ, USB DMA, CDC netdevice teardown                        | other USB/netdevice lifetime rewrites         | Done        |
-| 06  | [Production IPv6 dual stack](06-ipv6-dual-stack.md)                                  | TCP/UDP, NDP, routing, netd                                 | broad socket or network-stack rewrites        | Done        |
-| 07  | [Mount-scoped crash-consistent XFS journal](07-xfs-crash-consistency.md)             | XFS log, buffer cache, block I/O                            | 10 when changing XFS transactions             | Done        |
-| 08  | [Deterministic WKI chaos and recovery](08-wki-chaos-recovery.md)                     | WKI transport, peers, every remote service                  | 09 and broad WKI lifecycle changes            | Done        |
-| 09  | [Authenticated WKI peer sessions](09-wki-authenticated-sessions.md)                  | WKI wire protocol, admission, authorization                 | 08 until transport hooks are coordinated      | Done        |
-| 10  | [End-to-end extended attributes](10-end-to-end-xattrs.md)                            | libc, syscall/VFS, XFS, remote VFS                          | 01, 07, 11 on shared surfaces                 | Done        |
-| 11  | [libc and syscall-ABI conformance gate](11-libc-syscall-conformance.md)              | mlibc, syscall ABI, target test runner                      | 01, 10, or 13 on shared wrappers/ABI mirrors  | Done        |
-| 12  | [Reproducible WOSDBG incident bundles](12-wosdbg-incident-bundles.md)                | KTEST/cluster capture, WOSDBG                               | 13 on shared ingestion schemas                | Done        |
-| 13  | [Versioned structured telemetry](13-structured-telemetry.md)                         | journal, perf, strace, WOSDBG                               | 11 or 12 on shared ABI/ingestion formats      | Done        |
-| 14  | [Declarative bounded init supervisor](14-declarative-init-supervisor.md)             | PID 1, service lifecycle, shutdown                          | other init/service ownership rewrites         | Done        |
-| 15  | [Randomized and hardened userspace layouts](15-userspace-address-space-hardening.md) | ELF/exec, VM, TLS, ptrace/debugging                         | 01, 04, 11 on loader/VM/ABI surfaces          | Done        |
-| 16  | [PREEMPT_NOBLOCK default kernel preemption](16-preempt-noblock-kernel-preemption.md) | timer preemption, kernel frames, migration, return assembly | 03 or 04 on shared scheduler/Task transitions | Done        |
-| 17  | [Fault-safe anonymous memory swap](17-anonymous-memory-swap.md)                      | VM faults, PTEs, COW, reclaim, swap                         | 15 and allocator/VM rewrites                  | Done        |
-| 18  | [Stable transactional VFS pathwalk](18-stable-vfs-pathwalk.md)                      | pathwalk, mounts, namespace mutation, remote VFS             | 26 and broad VFS/remote-VFS changes           | Done        |
-| 19  | [Immutable credentials and least privilege](19-immutable-credentials-least-privilege.md) | credentials, authorization, init, WKI identity            | 22 on Task/ServiceSpec; 18 on VFS policy      | Done        |
-| 20  | [IOMMU-backed DMA ownership](20-iommu-dma-ownership.md)                              | ACPI/PCI, DMA, AHCI, xHCI, NICs                              | 25 on ivshmem; 30 on AHCI/DMA                 | Done        |
-| 21  | [Modern kernel self-protection](21-kernel-self-protection.md)                        | linker/boot, W^X, KASLR, SMEP/SMAP, stacks                  | 16 and entry/return or VM rewrites            | Done        |
-| 22  | [Kernel-enforced resource governance](22-kernel-resource-governance.md)              | rlimits, Task, VM/VFS, init, remote compute                  | 19 on Task/ServiceSpec; 28 on job quotas      | Done        |
-| 23  | [Reproducible offline builds](23-reproducible-offline-builds.md)                      | toolchain, CMake, sysroots, images, SBOM                     | broad build/image/cluster script changes      | Done        |
-| 24  | [Semantic regression and mutation testing](24-semantic-regression-platform.md)       | host tests, models, KTEST, faults, fuzzing                   | broad structural refactors in tested paths    | Done        |
 | 25  | [Secure session-bound WKI RDMA](25-secure-wki-rdma.md)                               | WKI auth, RoCE, ivshmem, zones, fast paths                   | 20 on ivshmem; 26 on remote VFS               | Not started |
 | 26  | [Owner-authoritative remote VFS coherency](26-remote-vfs-coherency-locking.md)        | remote VFS, caches, append, advisory locks                   | 18 and 25 on shared VFS/wire surfaces         | Not started |
-| 27  | [Loop-free bounded WKI routing](27-wki-routing-convergence.md)                        | WKI LSA/LSDB, RX, SPF, route publication                     | other peer/routing/wire protocol rewrites     | Done        |
 | 28  | [Durable reconnectable remote jobs](28-durable-remote-jobs.md)                        | remote compute, streams, reconnect, result retention         | 19 identity; 22 quotas; compute rewrites      | Not started |
 | 29  | [Production TCP congestion and loss recovery](29-tcp-congestion-loss-recovery.md)    | TCP sender, ACK/SACK, timers, impairment tests               | 31 on shared timer paths; broad TCP rewrites  | Not started |
 | 30  | [Asynchronous multi-queue block I/O](30-asynchronous-block-io.md)                    | block API, AHCI, buffer cache, XFS, swap, proxy              | 20 on DMA/AHCI; 25 on remote block            | Not started |
-| 31  | [High-resolution timekeeping and timers](31-high-resolution-timekeeping.md)           | TSC/RTC/NTP, timer queues, signals, libc                     | 16 scheduler timers; 29 TCP timers            | Done        |
-| 32  | [Live multi-node WOSDBG control plane](32-live-wosdbg-control-plane.md)               | WOSDBG, QMP/gdb, debugserver, incident capture               | 21 symbolization; debugserver rewrites        | Done        |
 | 33 | [Native WOS hardware virtualization](33-native-hypervisor.md) | Intel VMX/EPT, AMD SVM/NPT, common VM ABI | 36, 38, 40 on VM/MM/Task state | Not started |
 | 34 | [Linux guest virtual machine monitor](34-linux-guest-virtual-machine-monitor.md) | libwosvirt, per-VM VMM, vmmd/vmctl, Linux boot/devices | 33 until VM ABI stabilizes; 35 on VMM control | Not started |
 | 35 | [WKI distributed virtualization](35-wki-distributed-virtualization.md) | VM identity/control, executor placement, remote devices | 25, 28, 36–38 on WKI and service state | Not started |
@@ -138,19 +111,18 @@ current repository instructions.
 
 ## Status authority
 
-The portfolio `Status` column is the canonical goal-selection filter. Do not
-select, reload, or rescan a row marked `Done`; its completion record and current
-source remain available only for later regression work. Select only a row whose
-status is `Not started` or `In progress`; use the current table rather than an
-older enumeration of unfinished goals.
+The portfolio lists unfinished goals only. Its `Status` column is the
+canonical selection filter. Completed and superseded contracts were removed
+on 2026-10-05; their historical summaries below are not active objectives.
+Select a row marked `Not started` or `In progress` and verify its premises
+against the current source before starting work.
 
 ## How to use a goal
 
-1. Skip every portfolio row marked `Done`, then re-read the current local source
-   and path-specific instructions for the selected unfinished goal. The evidence
-   for goals 01–16 was collected beginning on 2026-08-08; goals 17–32 were
-   investigated on 2026-09-03. Any of it may become stale in this fast-moving
-   repository.
+1. Select an unfinished portfolio row, then re-read the current local source
+   and path-specific instructions. Goals 17–32 were investigated on 2026-09-03;
+   the later platform programs have their own reconnaissance dates. Planning
+   evidence may become stale in this fast-moving repository.
 2. Use a dedicated thread and preferably a dedicated worktree for one goal.
 3. Paste that file's `/goal` block. Do not turn the week estimate into a token or
    time budget; completion remains evidence-based.
@@ -180,34 +152,33 @@ older enumeration of unfinished goals.
 - If the local tree invalidates a premise, update the contract before acting.
   Do not implement a stale plan because it is written here.
 
-## Reconnaissance note
+## Retired work
 
-The current `scripts/test/ktest_setup.py` defaults to
-`configs/node_ktest.json`, while some repository instructions still name
-`configs/node.json`. Goal executors must follow the local script and reconcile
-that documentation discrepancy when their work touches KTEST configuration.
+Goals 01–24, 27, 31 and 32 were marked Done in the previous portfolio.
+The WOSDBG UI revision and event-driven SSH broker work also have completed
+records. Their contracts and chronological ledgers were removed during cleanup.
+Durable subsystem documentation, regression tests and referenced security audits
+remain in the repository; the audits now live under `docs/security/audits/`.
 
-This directory is intentionally ignored by the root `.gitignore`; it is local
-planning material unless a later task explicitly chooses to publish it.
-
-## Stability and launch-overhead work
-
-The broad stability continuation was replaced at the user's request by a focused
-launch-overhead goal. That replacement is complete: serial FIFO batching retains
-synchronous journal completion and reduced the rejection-log median from 1.250
-to 1.060 ms in the final private comparison. The balanced placement launch
-median of eight group medians fell from 3.900 to 3.763 ms. Direct, locally and
-homeward timings increased slightly; no general speedup or matched Linux ratio
-is claimed. Ordinary placement launch overhead remains above roughly 1 ms.
-
-Normal and diagnostic builds, focused host harnesses, a fresh isolated KTEST
-(66,705 assertions, zero failures, three existing skips), SSH and visible idle
-checks passed in that goal. All owned VMs were closed. Positive trusted compute,
+The broad stability continuation and old goals 48–50 were replaced at the
+user's request by a focused launch-overhead objective. That replacement is
+complete. Serial FIFO batching retained synchronous journal completion and
+reduced the rejection-log median from 1.250 to 1.060 ms in the final private
+comparison. The balanced placement median of eight group medians fell from
+3.900 to 3.763 ms. Direct, locally and homeward timings increased slightly;
+no general speedup or matched Linux ratio is claimed. Positive trusted compute,
 physical hardware and broader topology qualification remain outside that result.
 
-The implementation is documented in [runtime-linker startup milestones](../docs/goal48_rtld_stages.md),
-[wait accounting](../docs/goal48_wait_accounting.md),
-[WKI retry ownership](../docs/goal50_origin_replay.md) and
-[perf capture](../docs/perf_capture.md). The final local evidence receipt is
-`build/goal48-launch-performance-result-v87/goal-result-proof.json`; chronological
-experiments and immutable raw archives remain referenced by the local handoffs.
+See [runtime-linker startup milestones](../docs/rtld_startup.md),
+[wait accounting](../docs/kernel_wait_accounting.md),
+[WKI retry ownership](../docs/wki_bootstrap_replay.md) and
+[perf capture](../docs/perf_capture.md) for the retained implementation contracts.
+The compact historical completion receipt remains local at
+`build/goal48-launch-performance-result-v87/goal-result-proof.json`.
+Superseded handoffs, experiment builds and private VM archives were pruned on
+2026-10-05. The cleanup inventory is `build/worktree-cleanup-20261005.json`.
+The retained receipt summarizes prior validation and is not a current-source
+audit.
+
+This directory is ignored by default, although some existing files are tracked.
+Untracked contracts remain local planning material.
