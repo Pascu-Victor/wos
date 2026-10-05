@@ -284,6 +284,15 @@ void wki_eth_transport_init() {
     for (size_t i = 0; i < wki_dev_count; ++i) {
         net::wki::wki_eth_transport_claim(wki_dev_refs.at(i).get());
     }
+#ifdef WOS_SELFTEST
+    // The one-NIC IRQ fixture needs an empty queue between cookie replies.
+    // Preserve the reservation (including IPv6 exclusion), but do not publish
+    // a WKI transport that would produce periodic control completions.
+    if (cmdline_has_token(get_kernel_cmdline(), "--napi-irq-test")) {
+        mod::dbg::logger<"init">::info("napi irq fixture reserved NIC without WKI transport");
+        return;
+    }
+#endif
     net::wki::wki_eth_transport_init(wki_dev_refs.front().get());
     net::wki::wki_peer_send_hello_broadcast();
 }

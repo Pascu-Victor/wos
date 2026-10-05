@@ -43,6 +43,7 @@ struct VirtIONetDiagSnapshot {
     uint64_t napi_worker_cpu = 0;
     uint64_t napi_polls = 0;
     uint64_t napi_completes = 0;
+    ker::net::NapiDiagSnapshot napi_diag{};
     VirtqueueDiagSnapshot rx{};
     VirtqueueDiagSnapshot tx{};
 };

@@ -362,10 +362,20 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/netpoll_backlog_source_test.py
 )
 add_test(
+    NAME napi_handoff_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/napi_handoff_test.py
+)
+set_tests_properties(napi_handoff_test PROPERTIES LABELS "host;unit")
+add_test(
     NAME local_wake_batch_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/local_wake_batch_test.py
 )
 set_tests_properties(local_wake_batch_test PROPERTIES LABELS "host;unit")
+add_test(
+    NAME napi_irq_recovery_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/napi_irq_recovery_test.py
+)
+set_tests_properties(napi_irq_recovery_test PROPERTIES LABELS "host;unit")
 add_test(
     NAME process_timer_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/process_timer_source_test.py
@@ -1400,6 +1410,12 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scheduler_epoch_progress_test.py
 )
 set_tests_properties(scheduler_epoch_progress_test PROPERTIES LABELS "host;source")
+
+add_test(
+    NAME wki_netdiag_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_netdiag_runtime_test.py
+)
+set_tests_properties(wki_netdiag_runtime_test PROPERTIES LABELS "host;unit")
 
 add_test(
     NAME rtld_bss_runtime_test

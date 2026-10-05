@@ -23,7 +23,7 @@ using log = ker::mod::dbg::logger<"ivsh">;
 
 namespace {
 // Forward declarations for NAPI
-auto ivshmem_poll(ker::net::NapiStruct* napi, int budget) -> int;
+auto ivshmem_poll(ker::net::NapiStruct* napi, int budget, ker::net::NapiPollSource source) -> int;
 
 constexpr size_t MAX_IVSHMEM_DEVICES = 2;
 std::array<IvshmemNetDevice, MAX_IVSHMEM_DEVICES> dev_pool = {};
@@ -124,7 +124,7 @@ void ivshmem_irq(uint8_t /*unused*/, void* data) {
     ivshmem_irq_disable(dev);
 
     // Schedule NAPI poll (atomic, IRQ-safe)
-    ker::net::napi_schedule(&dev->napi);
+    ker::net::napi_schedule(&dev->napi, ker::net::NapiScheduleSource::IRQ);
 }
 
 // -- Device init --
@@ -251,7 +251,7 @@ auto init_device(pci::PCIDevice* pci_dev) -> int {
 }
 
 // -- NAPI poll function (runs in worker thread context) --
-int ivshmem_poll(ker::net::NapiStruct* napi, int budget) {
+int ivshmem_poll(ker::net::NapiStruct* napi, int budget, ker::net::NapiPollSource /*source*/) {
     auto* dev = static_cast<IvshmemNetDevice*>(napi->dev->private_data);
     if (dev == nullptr) return 0;
     CallbackGuard const GUARD(dev->resources);
@@ -306,8 +306,8 @@ auto selftest_late_calls() -> bool {
     bool const REJECTED = ivshmem_start_xmit(&dev->netdev, pkt) == -ENODEV && ivshmem_open(&dev->netdev) == -ENODEV;
     ivshmem_close(&dev->netdev);
     ivshmem_irq(0, dev);
-    return REJECTED && ivshmem_poll(&dev->napi, 64) == 0 && dev->netdev.state == STATE && dev->napi.state.load() == NAPI &&
-           dev->resources.test_irqs.load() == IRQS && ker::net::pkt_pool_free_count() == POOL;
+    return REJECTED && ivshmem_poll(&dev->napi, 64, ker::net::NapiPollSource::INLINE) == 0 && dev->netdev.state == STATE &&
+           dev->napi.state.load() == NAPI && dev->resources.test_irqs.load() == IRQS && ker::net::pkt_pool_free_count() == POOL;
 }
 #endif
 }  // namespace

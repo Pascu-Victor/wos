@@ -35,10 +35,12 @@ namespace {
 constexpr uint32_t NET_LATENCY_DAEMON_SLICE_NS = 2'000'000;
 constexpr int NET_LATENCY_DAEMON_NICE = -5;
 constexpr int NAPI_WORKER_MAX_FULL_BUDGET_POLLS = 8;
-constexpr uint64_t NAPI_WORKER_IDLE_SLEEP_US = 1000;
 constexpr uint64_t NAPI_WORKER_CONTENTION_SLEEP_US = 50;
 constexpr int NAPI_RESCUE_MAX_PASSES = 4;
-constexpr uint64_t NAPI_RESCUE_IDLE_SLEEP_US = 10000;
+// Normal IRQ-driven workers own the fast path. The rescue thread is only a
+// bounded missed-interrupt watchdog, so an idle system must not scan every
+// 10 ms. Once it finds work, retain the short cadence until the queues drain.
+constexpr uint64_t NAPI_RESCUE_IDLE_SLEEP_US = 100000;
 constexpr uint64_t NAPI_RESCUE_ACTIVE_SLEEP_US = 1000;
 constexpr uint64_t BACKLOG_RESCUE_MIN_QUEUE_DEPTH = 64;
 constexpr uint64_t NET_WATCHDOG_INTERVAL_US = 5000000;
@@ -55,6 +57,48 @@ std::atomic<bool> g_rescue_started{false};
 ker::mod::sched::task::Task* g_rescue_task = nullptr;
 std::atomic<bool> g_watchdog_started{false};
 ker::mod::sched::task::Task* g_watchdog_task = nullptr;
+
+void napi_diag_add(NapiStruct* napi, std::atomic<uint64_t>& counter, uint64_t amount = 1) {
+    if (napi->diagnostics_enabled) {
+        counter.fetch_add(amount, std::memory_order_relaxed);
+    }
+}
+
+void napi_diag_poll(NapiStruct* napi, NapiPollSource source, int processed) {
+    if (!napi->diagnostics_enabled) return;
+    size_t const INDEX = static_cast<size_t>(source);
+    if (INDEX >= NAPI_POLL_SOURCES) return;
+    auto& diag = napi->diagnostics;
+    diag.polls.at(INDEX).fetch_add(1, std::memory_order_relaxed);
+    if (processed > 0) {
+        diag.rx_work.at(INDEX).fetch_add(static_cast<uint64_t>(processed), std::memory_order_relaxed);
+    } else if (processed == 0) {
+        // Zero RX can still reclaim TX. This is not an empty/spurious poll count.
+        diag.rx_zero.at(INDEX).fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void napi_diag_reset(NapiStruct* napi) {
+    auto& diag = napi->diagnostics;
+    for (size_t i = 0; i < NAPI_SCHEDULE_SOURCES; ++i) {
+        diag.schedules.at(i).store(0, std::memory_order_relaxed);
+        diag.accepted.at(i).store(0, std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < NAPI_POLL_SOURCES; ++i) {
+        diag.polls.at(i).store(0, std::memory_order_relaxed);
+        diag.rx_work.at(i).store(0, std::memory_order_relaxed);
+        diag.rx_zero.at(i).store(0, std::memory_order_relaxed);
+        diag.tx_reclaimed.at(i).store(0, std::memory_order_relaxed);
+    }
+    diag.coalesced.store(0, std::memory_order_relaxed);
+    diag.polling_rejects.store(0, std::memory_order_relaxed);
+    diag.disabled_rejects.store(0, std::memory_order_relaxed);
+    diag.park_calls.store(0, std::memory_order_relaxed);
+    diag.park_empty_returns.store(0, std::memory_order_relaxed);
+    diag.contention_sleeps.store(0, std::memory_order_relaxed);
+    diag.inline_refused.store(0, std::memory_order_relaxed);
+    diag.budget_handoffs.store(0, std::memory_order_relaxed);
+}
 
 void promote_latency_sensitive_daemon(ker::mod::sched::task::Task* task) {
     if (task == nullptr || task->type != ker::mod::sched::task::TaskType::DAEMON) {
@@ -453,7 +497,10 @@ void wake_napi_worker(NapiStruct* napi) {
     }
 
     auto* worker = napi->worker;
-    ker::mod::sched::kern_wake(worker);
+    // Publish an event token as well as making a blocked worker runnable. This
+    // closes the IRQ-before-park race when the worker observes an empty queue
+    // immediately before kern_block().
+    ker::mod::sched::wake_task_from_event(worker, ker::mod::sched::EventWakeDeferredSwitch::PRESERVE);
     poke_napi_worker_cpu(worker);
 }
 
@@ -477,7 +524,7 @@ auto napi_worker_has_work(NapiStruct* napi) -> bool {
 auto napi_rescue_poll_once() -> int {
     int total = 0;
     for (int pass = 0; pass < NAPI_RESCUE_MAX_PASSES; ++pass) {
-        int const POLLED = napi_poll_all_pending();
+        int const POLLED = napi_poll_all_pending(NapiPollSource::RESCUE);
         total += POLLED;
         if (POLLED == 0) {
             break;
@@ -549,24 +596,18 @@ void start_napi_rescue_thread() {
 // Worker thread main loop
 [[noreturn]] void napi_worker_loop(NapiStruct* napi) {
     for (;;) {
-        // Disable interrupts before checking work flag.
-        asm volatile("cli" ::: "memory");
-
         if (!napi_worker_has_work(napi)) {
-            // No work: block until napi_schedule() explicitly wakes us.
-            //
-            // The CLI above only protects the work check.  Entering kern_block()
-            // with IF clear resumes through the scheduler's sti/hlt/cli path,
-            // which is a fragile same-CPL timer-return point for high-rate
-            // netpoll workers.  Re-enable first; a racing IRQ wake is preserved
-            // by the task's wakeup_pending check inside kern_block().
-            asm volatile("sti" ::: "memory");
-            ker::mod::sched::kern_sleep_us(NAPI_WORKER_IDLE_SLEEP_US);
+            // No work: remain parked until napi_schedule() publishes an event
+            // token. A racing IRQ between this check and kern_block() is
+            // consumed by the scheduler wait path instead of being lost.
+            napi_diag_add(napi, napi->diagnostics.park_calls);
+            ker::mod::sched::kern_block();
+            if (napi->diagnostics_enabled && !napi->has_work.load(std::memory_order_acquire) &&
+                napi->state.load(std::memory_order_acquire) != NapiState::SCHEDULED) {
+                napi_diag_add(napi, napi->diagnostics.park_empty_returns);
+            }
             continue;
         }
-
-        // Work available: re-enable interrupts before polling.
-        asm volatile("sti" ::: "memory");
 
         // SCHEDULED -> POLLING. Inline polling can drain the device before the
         // worker observes has_work; if state is already IDLE, clear that stale
@@ -589,6 +630,7 @@ void start_napi_rescue_thread() {
                 continue;
             }
 
+            napi_diag_add(napi, napi->diagnostics.contention_sleeps);
             ker::mod::sched::kern_sleep_us(NAPI_WORKER_CONTENTION_SLEEP_US);
             continue;
         }
@@ -605,8 +647,17 @@ void start_napi_rescue_thread() {
                     asm volatile("hlt");
                 }
             }
-            int const PROCESSED = napi->poll(napi, napi->weight);
-            napi->poll_count++;
+            int processed = 0;
+            {
+                // Publish every target wake immediately, then notify the local
+                // scheduler once after this packet budget. Existing timer IRQs
+                // can still preempt polling; remote and IRQ wakes stay prompt.
+                ker::mod::sched::LocalWakeBatch const WAKE_BATCH;
+                processed = napi->poll(napi, napi->weight, NapiPollSource::WORKER);
+            }
+            int const PROCESSED = processed;
+            napi->poll_count.fetch_add(1, std::memory_order_relaxed);
+            napi_diag_poll(napi, NapiPollSource::WORKER, PROCESSED);
 
             if (PROCESSED < napi->weight) {
                 // Driver called napi_complete().
@@ -656,8 +707,44 @@ void napi_init(NapiStruct* napi, NetDevice* dev, NapiPollFn poll, int weight) {
     napi->weight = (weight > 0) ? weight : NAPI_DEFAULT_WEIGHT;
     napi->worker = nullptr;
     napi->has_work.store(false, std::memory_order_release);
-    napi->poll_count = 0;
-    napi->complete_count = 0;
+    napi->poll_count.store(0, std::memory_order_relaxed);
+    napi->complete_count.store(0, std::memory_order_relaxed);
+    napi_diag_reset(napi);
+    napi->diagnostics_enabled = cmdline_has_token(ker::init::get_kernel_cmdline(), "net.napi_diag");
+}
+
+auto napi_diag_snapshot(const NapiStruct* napi) -> NapiDiagSnapshot {
+    NapiDiagSnapshot out{};
+    if (napi == nullptr || !napi->diagnostics_enabled) return out;
+    out.enabled = true;
+    auto const& diag = napi->diagnostics;
+    for (size_t i = 0; i < NAPI_SCHEDULE_SOURCES; ++i) {
+        out.schedules.at(i) = diag.schedules.at(i).load(std::memory_order_relaxed);
+        out.accepted.at(i) = diag.accepted.at(i).load(std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < NAPI_POLL_SOURCES; ++i) {
+        out.polls.at(i) = diag.polls.at(i).load(std::memory_order_relaxed);
+        out.rx_work.at(i) = diag.rx_work.at(i).load(std::memory_order_relaxed);
+        out.rx_zero.at(i) = diag.rx_zero.at(i).load(std::memory_order_relaxed);
+        out.tx_reclaimed.at(i) = diag.tx_reclaimed.at(i).load(std::memory_order_relaxed);
+    }
+    out.coalesced = diag.coalesced.load(std::memory_order_relaxed);
+    out.polling_rejects = diag.polling_rejects.load(std::memory_order_relaxed);
+    out.disabled_rejects = diag.disabled_rejects.load(std::memory_order_relaxed);
+    out.park_calls = diag.park_calls.load(std::memory_order_relaxed);
+    out.park_empty_returns = diag.park_empty_returns.load(std::memory_order_relaxed);
+    out.contention_sleeps = diag.contention_sleeps.load(std::memory_order_relaxed);
+    out.inline_refused = diag.inline_refused.load(std::memory_order_relaxed);
+    out.budget_handoffs = diag.budget_handoffs.load(std::memory_order_relaxed);
+    return out;
+}
+
+void napi_diag_tx_reclaimed(NapiStruct* napi, NapiPollSource source, uint64_t count) {
+    if (napi == nullptr || !napi->diagnostics_enabled || count == 0) return;
+    size_t const INDEX = static_cast<size_t>(source);
+    if (INDEX < NAPI_POLL_SOURCES) {
+        napi->diagnostics.tx_reclaimed.at(INDEX).fetch_add(count, std::memory_order_relaxed);
+    }
 }
 
 void napi_enable(NapiStruct* napi, uint64_t cpu_affinity) {
@@ -753,19 +840,31 @@ void napi_disable(NapiStruct* napi) {
     log::debug("disabled for %s", napi->dev->name.data());
 }
 
-auto napi_schedule(NapiStruct* napi) -> bool {
+auto napi_schedule(NapiStruct* napi, NapiScheduleSource source) -> bool {
+    size_t const INDEX = static_cast<size_t>(source);
+    if (napi->diagnostics_enabled && INDEX < NAPI_SCHEDULE_SOURCES) {
+        napi_diag_add(napi, napi->diagnostics.schedules.at(INDEX));
+    }
     // Try to transition from IDLE to SCHEDULED (atomic, no lock)
     NapiState expected = NapiState::IDLE;
     if (!napi->state.compare_exchange_strong(expected, NapiState::SCHEDULED, std::memory_order_acq_rel, std::memory_order_acquire)) {
         if (expected == NapiState::SCHEDULED) {
+            napi_diag_add(napi, napi->diagnostics.coalesced);
             napi->has_work.store(true, std::memory_order_release);
             if (napi->worker != nullptr) {
                 wake_napi_worker(napi);
             }
+        } else if (expected == NapiState::POLLING) {
+            napi_diag_add(napi, napi->diagnostics.polling_rejects);
+        } else if (expected == NapiState::DISABLED) {
+            napi_diag_add(napi, napi->diagnostics.disabled_rejects);
         }
         return false;
     }
 
+    if (napi->diagnostics_enabled && INDEX < NAPI_SCHEDULE_SOURCES) {
+        napi_diag_add(napi, napi->diagnostics.accepted.at(INDEX));
+    }
     // Set work flag for interface worker thread
     napi->has_work.store(true, std::memory_order_release);
 
@@ -778,7 +877,7 @@ auto napi_schedule(NapiStruct* napi) -> bool {
 }
 
 void napi_complete(NapiStruct* napi) {
-    napi->complete_count++;
+    napi->complete_count.fetch_add(1, std::memory_order_relaxed);
 
     // Transition from POLLING back to IDLE
     NapiState expected = NapiState::POLLING;
@@ -789,7 +888,7 @@ void napi_complete(NapiStruct* napi) {
 
 namespace {
 
-auto napi_poll_struct_inline_budget(NapiStruct* napi, int budget) -> int {
+auto napi_poll_struct_inline_budget(NapiStruct* napi, int budget, NapiPollSource source) -> int {
     if (napi == nullptr) {
         return 0;
     }
@@ -800,6 +899,7 @@ auto napi_poll_struct_inline_budget(NapiStruct* napi, int budget) -> int {
     if (!napi->state.compare_exchange_strong(expected, NapiState::POLLING, std::memory_order_acq_rel, std::memory_order_acquire)) {
         expected = NapiState::SCHEDULED;
         if (!napi->state.compare_exchange_strong(expected, NapiState::POLLING, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            napi_diag_add(napi, napi->diagnostics.inline_refused);
             return 0;  // already polling or disabled
         }
     }
@@ -820,10 +920,12 @@ auto napi_poll_struct_inline_budget(NapiStruct* napi, int budget) -> int {
         napi->has_work.store(false, std::memory_order_release);
         return 0;
     }
-    int const PROCESSED = napi->poll(napi, EFFECTIVE_BUDGET);
-    napi->poll_count++;
+    int const PROCESSED = napi->poll(napi, EFFECTIVE_BUDGET, source);
+    napi->poll_count.fetch_add(1, std::memory_order_relaxed);
+    napi_diag_poll(napi, source, PROCESSED);
 
     if (PROCESSED >= EFFECTIVE_BUDGET) {
+        napi_diag_add(napi, napi->diagnostics.budget_handoffs);
         // Driver did NOT call napi_complete() (more work pending).
         // Transition back to SCHEDULED so the worker can pick up the
         // remaining work and re-enable IRQs when it's done.
@@ -851,7 +953,7 @@ auto napi_poll_struct_inline_budget(NapiStruct* napi, int budget) -> int {
 
 auto net_watchdog_enabled() -> bool { return net_watchdog_enabled_impl(); }
 
-auto napi_poll_all_pending() -> int {
+auto napi_poll_all_pending(NapiPollSource source) -> int {
     int total = 0;
     // Snapshot count under lock to avoid tearing, then poll without the lock
     // (per-NAPI inline polling is safe to call without the registry lock).
@@ -866,7 +968,7 @@ auto napi_poll_all_pending() -> int {
 
     for (size_t i = 0; i < count; ++i) {
         if (auto* napi = snapshot.at(i); napi != nullptr && napi->dev != nullptr) {
-            total += napi_poll_struct_inline_budget(napi, NAPI_DEFAULT_WEIGHT);
+            total += napi_poll_struct_inline_budget(napi, NAPI_DEFAULT_WEIGHT, source);
         }
     }
     return total;

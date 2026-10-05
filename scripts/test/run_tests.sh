@@ -162,7 +162,10 @@ UNIT_TESTS=(
     kernel_vmap_source_test
     sftp_timeout_source_test
     netpoll_backlog_source_test
+    napi_handoff_test
     local_wake_batch_test
+    wki_netdiag_runtime_test
+    napi_irq_recovery_test
     process_timer_source_test
     ptrace_deferred_yield_test
     virtio_net_source_test

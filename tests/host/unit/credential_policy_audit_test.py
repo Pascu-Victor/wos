@@ -766,7 +766,7 @@ def test_procfs_global_policy_covers_types_and_precedes_content_or_controls():
     assert read.index("authorize_diagnostic(credentials,") < read.index("MutexGuard content_guard(") < read.index("if (pfd->content == nullptr)")
     write = body_after(proc, "auto procfs_write_with_credentials(")
     assert write.index("authorize_diagnostic(credentials,") < write.index("MutexGuard content_guard(") < write.index("if (count == 0)")
-    for token in ("wki_chaos_workload_configure(", "wki_chaos_configure(", "procfs_write_memacc_track(", "reset_rings()", "delete[] pfd->content"):
+    for token in ("wki_chaos_workload_configure(", "wki_chaos_configure(", "procfs_write_memacc_track(", "start_recording(mask)", "ker::mod::perf::disable()", "set_event_mask(MASK)", "delete[] pfd->content"):
         assert write.index("if (POLICY != 0)") < write.index(token)
     for name in ("auto procfs_read(", "auto procfs_write("):
         assert body_after(proc, name).count("current_procfs_credentials()") == 1

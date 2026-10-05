@@ -1,5 +1,9 @@
 #include "virtio_net.hpp"
 
+#ifdef WOS_SELFTEST
+#include "napi_irq_test.hpp"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -71,6 +75,8 @@ const ker::net::wki::RemotableOps S_REMOTABLE_OPS = {
 };
 
 constexpr size_t MAX_VIRTIO_NET_DEVICES = 4;
+// The dedicated procfs NAPI view must include every admitted queue pair.
+static_assert(MAX_VIRTIO_NET_DEVICES * VIRTIO_NET_MAX_QUEUE_PAIRS <= VIRTIO_NET_DIAG_MAX_ROWS);
 std::array<VirtIONetDevice*, MAX_VIRTIO_NET_DEVICES> devices = {};
 size_t device_count = 0;
 std::atomic<bool> shutdown_started{false};
@@ -83,6 +89,10 @@ bool probe_test_withhold_reset = false;
 auto selftest_live_rx(VirtIONetDevice* dev, ker::net::PacketBuffer* pkt) -> bool;
 void selftest_live_irq(VirtIONetDevice* dev);
 void selftest_live_start(VirtIONetDevice* dev);
+void selftest_napi_start(VirtIONetDevice* dev);
+auto selftest_napi_irq(VirtIONetQueuePair* pair) -> bool;
+auto selftest_napi_rx(VirtIONetDevice* dev, Virtqueue* queue, ker::net::PacketBuffer* pkt, ker::net::NapiPollSource source, uint16_t desc)
+    -> bool;
 bool selftest_live_withhold_reset = false;
 std::atomic<uint64_t> fault_override{0};
 #endif
@@ -346,7 +356,11 @@ void fill_rx_queue_for(VirtIONetDevice* dev, Virtqueue* rxq) {
     }
 }
 
-auto process_rx_budget_for(VirtIONetDevice* dev, Virtqueue* rxq, int budget) -> int {
+auto process_rx_budget_for(VirtIONetDevice* dev, Virtqueue* rxq, int budget,
+                           ker::net::NapiPollSource source = ker::net::NapiPollSource::INLINE) -> int {
+#ifndef WOS_SELFTEST
+    (void)source;
+#endif
     int processed = 0;
     uint32_t len = 0;
     uint16_t desc_idx = 0;
@@ -402,6 +416,7 @@ auto process_rx_budget_for(VirtIONetDevice* dev, Virtqueue* rxq, int budget) -> 
         pkt->dev = &dev->netdev;
 
 #ifdef WOS_SELFTEST
+        if (selftest_napi_rx(dev, rxq, pkt, source, desc_idx)) continue;
         if (selftest_live_rx(dev, pkt)) continue;
 #endif
         ker::net::netdev_rx(&dev->netdev, pkt);
@@ -413,7 +428,7 @@ auto process_rx_budget_for(VirtIONetDevice* dev, Virtqueue* rxq, int budget) -> 
 }
 
 // Collect completed TX buffers from a specific queue; caller frees after releasing lock.
-auto collect_tx_for(Virtqueue* txq) -> ker::net::PacketBuffer* {
+auto collect_tx_for(Virtqueue* txq, uint64_t* reclaimed_count = nullptr) -> ker::net::PacketBuffer* {
     ker::net::PacketBuffer* head = nullptr;
     uint32_t len = 0;
     uint16_t desc_idx = 0;
@@ -426,6 +441,7 @@ auto collect_tx_for(Virtqueue* txq) -> ker::net::PacketBuffer* {
         auto* pkt = txq->pkt_map.at(desc_idx);
         txq->pkt_map.at(desc_idx) = nullptr;
         if (pkt != nullptr) {
+            if (reclaimed_count != nullptr) ++*reclaimed_count;
             pkt->next = head;
             head = pkt;
         }
@@ -601,11 +617,11 @@ void virtio_net_complete_poll(VirtIONetDevice* dev, VirtIONetQueuePair* pair, ke
     bool const SHOULD_RESCHEDULE = virtio_net_rearm_pair_notifications_locked(dev, pair, rx_processed);
     pair->notification_lock.unlock_irqrestore(FLAGS);
     if (SHOULD_RESCHEDULE) {
-        ker::net::napi_schedule(napi);
+        ker::net::napi_schedule(napi, ker::net::NapiScheduleSource::REARM);
     }
 }
 
-int virtio_net_poll(ker::net::NapiStruct* napi, int budget) {
+int virtio_net_poll(ker::net::NapiStruct* napi, int budget, ker::net::NapiPollSource source) {
     NET_TRACE_SPAN(SPAN_NAPI_POLL);
     auto* dev = static_cast<VirtIONetDevice*>(napi->dev->private_data);
     CallbackGuard const GUARD(dev->admission);
@@ -628,15 +644,17 @@ int virtio_net_poll(ker::net::NapiStruct* napi, int budget) {
     // Reclaim TX buffers early to return PacketBuffers to the pool.
     {
         NET_TRACE_SPAN(SPAN_TX_RECLAIM);
+        uint64_t reclaimed_count = 0;
         uint64_t const TXFLAGS = pair->txq->lock.lock_irqsave();
-        auto* reclaimed = collect_tx_for(pair->txq);
+        auto* reclaimed = collect_tx_for(pair->txq, napi->diagnostics_enabled ? &reclaimed_count : nullptr);
         pair->txq->lock.unlock_irqrestore(TXFLAGS);
         free_pkt_list(reclaimed);
+        ker::net::napi_diag_tx_reclaimed(napi, source, reclaimed_count);
     }
 
     {
         NET_TRACE_SPAN(SPAN_RX_BUDGET);
-        processed = process_rx_budget_for(dev, pair->rxq, budget);
+        processed = process_rx_budget_for(dev, pair->rxq, budget, source);
     }
 
     // If MQ activation timed out, the device may still process the control
@@ -647,7 +665,7 @@ int virtio_net_poll(ker::net::NapiStruct* napi, int budget) {
         for (uint8_t i = dev->num_queue_pairs; i < dev->configured_queue_pairs && processed < budget; i++) {
             auto* rxq = dev->queue_pairs.at(i).rxq;
             if (rxq != nullptr) {
-                processed += process_rx_budget_for(dev, rxq, budget - processed);
+                processed += process_rx_budget_for(dev, rxq, budget - processed, source);
             }
         }
     }
@@ -684,8 +702,14 @@ void virtio_net_irq(uint8_t vector, void* private_data) {
     // Always defer packet processing to NAPI worker context.
     uint64_t const FLAGS = pair->notification_lock.lock_irqsave();
     virtio_net_set_pair_notifications(pair, false);
+#ifdef WOS_SELFTEST
+    bool const SUPPRESSED = selftest_napi_irq(pair);
+#endif
     pair->notification_lock.unlock_irqrestore(FLAGS);
-    ker::net::napi_schedule(&pair->napi);
+#ifdef WOS_SELFTEST
+    if (SUPPRESSED) return;
+#endif
+    ker::net::napi_schedule(&pair->napi, ker::net::NapiScheduleSource::IRQ);
 }
 
 // Send VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET over the control queue to activate the
@@ -1316,6 +1340,93 @@ void selftest_packet_dma(VirtIONetDevice* dev) {
 #endif
 
 #ifdef WOS_SELFTEST
+struct NapiIrqTest {
+    std::atomic<VirtIONetDevice*> device{nullptr};
+    std::atomic<uint64_t> expected_cookie{0}, armed_cookie{0}, received_cookie{0}, suppressed_cookie{0};
+    std::atomic<uint64_t> suppressed{0}, bad{0}, duplicate{0}, foreign{0}, reflections{0};
+    std::atomic<uint64_t> suppressed_us{0}, received_us{0};
+    std::atomic<uint16_t> suppressed_idx{0}, suppressed_desc{0}, received_idx{0}, received_desc{0};
+    std::atomic<uint32_t> suppressed_len{0};
+    std::atomic<ker::net::NapiPollSource> source{ker::net::NapiPollSource::INLINE};
+};
+NapiIrqTest napi_irq_test;
+
+// Existing notification lock is held, after masking this admitted real IRQ.
+// An IDLE owner cannot consume RX until its begin-poll gate acquires that lock.
+auto selftest_napi_irq(VirtIONetQueuePair* pair) -> bool {
+    if (napi_irq_test.device.load(std::memory_order_acquire) != pair->dev || pair->index != 0) return false;
+    uint64_t cookie = napi_irq_test.armed_cookie.load(std::memory_order_acquire);
+    if (cookie == 0 || pair->napi.state.load(std::memory_order_acquire) != ker::net::NapiState::IDLE ||
+        pair->napi.has_work.load(std::memory_order_acquire) || pair->rxq->failed.load(std::memory_order_acquire))
+        return false;
+    auto* queue = pair->rxq;
+    uint16_t const USED = static_cast<volatile VirtqUsed*>(queue->used)->idx;
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    if (static_cast<uint16_t>(USED - queue->last_used_idx) != 1) return false;
+    volatile auto const& elem = queue->used->ring[queue->last_used_idx % queue->size];
+    uint32_t const DESC = elem.id;
+    uint32_t const LENGTH = elem.len;
+    if (DESC >= queue->size || LENGTH != napi_test::FRAME_BYTES + pair->dev->hdr_size) return false;
+    if (!napi_irq_test.armed_cookie.compare_exchange_strong(cookie, 0, std::memory_order_acq_rel)) return false;
+    napi_irq_test.suppressed_idx.store(USED, std::memory_order_relaxed);
+    napi_irq_test.suppressed_desc.store(static_cast<uint16_t>(DESC), std::memory_order_relaxed);
+    napi_irq_test.suppressed_len.store(LENGTH, std::memory_order_relaxed);
+    napi_irq_test.suppressed_us.store(ker::mod::time::get_us(), std::memory_order_relaxed);
+    napi_irq_test.suppressed.fetch_add(1, std::memory_order_relaxed);
+    napi_irq_test.suppressed_cookie.store(cookie, std::memory_order_release);
+    return true;
+}
+
+auto selftest_napi_rx(VirtIONetDevice* dev, Virtqueue* queue, ker::net::PacketBuffer* pkt, ker::net::NapiPollSource source, uint16_t desc)
+    -> bool {
+    if (napi_irq_test.device.load(std::memory_order_acquire) != dev) return false;
+    auto const BYTES = std::span<const uint8_t>(pkt->data, pkt->len);
+    if (!napi_test::has_magic(BYTES)) {
+        napi_irq_test.foreign.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    auto const FRAME = napi_test::inspect(BYTES);
+    if (!FRAME || FRAME->cookie != napi_irq_test.expected_cookie.load(std::memory_order_acquire)) {
+        napi_irq_test.bad.fetch_add(1, std::memory_order_relaxed);
+    } else if (!FRAME->reply) {
+        napi_irq_test.reflections.fetch_add(1, std::memory_order_relaxed);
+    } else if (napi_irq_test.received_cookie.load(std::memory_order_acquire) != 0) {
+        napi_irq_test.duplicate.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        napi_irq_test.received_desc.store(desc, std::memory_order_relaxed);
+        napi_irq_test.received_idx.store(queue->last_used_idx, std::memory_order_relaxed);
+        napi_irq_test.received_us.store(ker::mod::time::get_us(), std::memory_order_relaxed);
+        napi_irq_test.source.store(source, std::memory_order_relaxed);
+        napi_irq_test.received_cookie.store(FRAME->cookie, std::memory_order_release);
+    }
+    ker::net::pkt_free(pkt);
+    return true;
+}
+
+auto selftest_napi_quiet(VirtIONetDevice* dev) -> bool {
+    auto& pair = dev->queue_pairs.at(0);
+    uint64_t const FLAGS = pair.notification_lock.lock_irqsave();
+    bool quiet =
+        pair.napi.state.load(std::memory_order_acquire) == ker::net::NapiState::IDLE && !pair.napi.has_work.load(std::memory_order_acquire);
+    if (quiet) {
+        auto const PENDING = virtio_net_pair_pending(dev, &pair);
+        quiet = !PENDING.rx && !PENDING.tx && (pair.rxq->avail->flags & VIRTQ_AVAIL_F_NO_INTERRUPT) == 0 &&
+                (pair.txq->avail->flags & VIRTQ_AVAIL_F_NO_INTERRUPT) == 0;
+    }
+    pair.notification_lock.unlock_irqrestore(FLAGS);
+    return quiet;
+}
+
+void selftest_napi_cleanup(VirtIONetDevice* dev) {
+    napi_irq_test.armed_cookie.store(0, std::memory_order_release);
+    auto& pair = dev->queue_pairs.at(0);
+    uint64_t const FLAGS = pair.notification_lock.lock_irqsave();
+    bool const PENDING = virtio_net_rearm_pair_notifications_locked(dev, &pair, 0);
+    pair.notification_lock.unlock_irqrestore(FLAGS);
+    if (PENDING) ker::net::napi_schedule(&pair.napi);
+    napi_irq_test.device.store(nullptr, std::memory_order_release);
+}
+
 struct LiveDmaTest {
     std::atomic<VirtIONetDevice*> device{nullptr};
     std::atomic<uint64_t> small{0}, jumbo{0}, bad{0}, worker_rx{0}, irqs{0}, sent{0};
@@ -1588,6 +1699,139 @@ void selftest_live_runner() {
     ker::mod::power::selftest_shutdown();
 }
 
+auto selftest_napi_wait_quiet(VirtIONetDevice* dev) -> bool {
+    uint64_t quiet_since = 0;
+    return live_wait(
+        [&] {
+            uint64_t const NOW = ker::mod::time::get_us();
+            if (!selftest_napi_quiet(dev)) {
+                quiet_since = 0;
+                return false;
+            }
+            if (quiet_since == 0) quiet_since = NOW;
+            return NOW - quiet_since >= 200000;
+        },
+        3000);
+}
+
+auto selftest_napi_fault_valid(uint64_t cookie, uint64_t suppressed_before, uint8_t hdr_size, const ker::net::NapiDiagSnapshot& before,
+                               const ker::net::NapiDiagSnapshot& after) -> bool {
+    if (!before.enabled || !after.enabled || before.schedules != after.schedules ||
+        napi_irq_test.suppressed.load() - suppressed_before != 1 || napi_irq_test.suppressed_cookie.load() != cookie ||
+        napi_irq_test.received_cookie.load() != cookie || napi_irq_test.source.load() != ker::net::NapiPollSource::RESCUE ||
+        napi_irq_test.suppressed_idx.load() != napi_irq_test.received_idx.load() ||
+        napi_irq_test.suppressed_desc.load() != napi_irq_test.received_desc.load() ||
+        napi_irq_test.suppressed_len.load() != napi_test::FRAME_BYTES + hdr_size)
+        return false;
+    uint64_t const BEGIN = napi_irq_test.suppressed_us.load();
+    uint64_t const END = napi_irq_test.received_us.load();
+    return END >= BEGIN && END - BEGIN <= napi_test::RECOVERY_LIMIT_US;
+}
+
+void selftest_napi_runner() {
+    auto* dev = napi_irq_test.device.load(std::memory_order_acquire);
+    bool ok = false;
+    uint64_t completed = 0, max_recovery_us = 0;
+    std::array<uint64_t, 2> ordinary_irq{}, ordinary_worker_rx{};
+    {
+        CallbackGuard const GUARD(dev->admission);
+        if (GUARD) {
+            // Let normal boot traffic settle before the measured, private phase.
+            ker::mod::sched::kern_sleep_us(3000000);
+            ok = selftest_napi_wait_quiet(dev);
+            uint64_t const BAD = napi_irq_test.bad.load();
+            uint64_t const DUPLICATE = napi_irq_test.duplicate.load();
+            uint64_t const FOREIGN = napi_irq_test.foreign.load();
+            auto& napi = dev->queue_pairs.at(0).napi;
+            for (uint64_t cookie = 1; ok && cookie <= 16; ++cookie) {
+                bool const FAULT = cookie >= 5 && cookie <= 12;
+                uint64_t const SUPPRESSED_BEFORE = napi_irq_test.suppressed.load();
+                napi_irq_test.received_cookie.store(0, std::memory_order_release);
+                napi_irq_test.expected_cookie.store(cookie, std::memory_order_release);
+                auto before = ker::net::napi_diag_snapshot(&napi);
+                auto* packet = ker::net::pkt_alloc_tx();
+                ok = packet != nullptr;
+                if (packet != nullptr) {
+                    packet->len = napi_test::FRAME_BYTES;
+                    for (size_t i = 0; i < packet->len; ++i) packet->data[i] = napi_test::packet_byte(i, cookie, false);
+                    // start_xmit consumes the packet on success and failure.
+                    ok = virtio_net_start_xmit(&dev->netdev, packet) == 0;
+                }
+                if (ok && FAULT) {
+                    // The backend holds this cookie's reply until ARM. Drain
+                    // request reflections and TX completions before suppressing.
+                    ok = selftest_napi_wait_quiet(dev);
+                    before = ker::net::napi_diag_snapshot(&napi);
+                    if (ok) {
+                        napi_irq_test.armed_cookie.store(cookie, std::memory_order_release);
+                        net_log::info("napi irq ARM cookie=%lu", cookie);
+                    }
+                }
+                if (ok) ok = live_wait([&] { return napi_irq_test.received_cookie.load(std::memory_order_acquire) == cookie; }, 2000);
+                napi_irq_test.armed_cookie.store(0, std::memory_order_release);
+                if (ok) ok = selftest_napi_wait_quiet(dev);
+                auto const AFTER = ker::net::napi_diag_snapshot(&napi);
+                uint64_t const BEGIN = napi_irq_test.suppressed_us.load();
+                uint64_t const END = napi_irq_test.received_us.load();
+                uint64_t const RECOVERY_US = END >= BEGIN ? END - BEGIN : UINT64_MAX;
+                if (FAULT) {
+                    ok = ok && selftest_napi_fault_valid(cookie, SUPPRESSED_BEFORE, dev->hdr_size, before, AFTER);
+                    if (ok) max_recovery_us = std::max(max_recovery_us, RECOVERY_US);
+                } else {
+                    size_t const PHASE = cookie <= 4 ? 0 : 1;
+                    ordinary_irq.at(PHASE) += AFTER.accepted.at(static_cast<size_t>(ker::net::NapiScheduleSource::IRQ)) -
+                                              before.accepted.at(static_cast<size_t>(ker::net::NapiScheduleSource::IRQ));
+                    ordinary_worker_rx.at(PHASE) += AFTER.rx_work.at(static_cast<size_t>(ker::net::NapiPollSource::WORKER)) -
+                                                    before.rx_work.at(static_cast<size_t>(ker::net::NapiPollSource::WORKER));
+                    ok = ok && napi_irq_test.suppressed.load() == SUPPRESSED_BEFORE;
+                }
+                ok = ok && napi_irq_test.bad.load() == BAD && napi_irq_test.duplicate.load() == DUPLICATE &&
+                     napi_irq_test.foreign.load() == FOREIGN;
+                net_log::info(
+                    "napi irq CASE cookie=%lu fault=%u ok=%u source=%u suppressed=%lu idx=%u/%u desc=%u/%u len=%u dt_us=%lu "
+                    "schedule=%lu/%lu/%lu/%lu bad=%lu duplicate=%lu foreign=%lu",
+                    cookie, FAULT, ok, static_cast<unsigned>(napi_irq_test.source.load()),
+                    napi_irq_test.suppressed.load() - SUPPRESSED_BEFORE, napi_irq_test.suppressed_idx.load(),
+                    napi_irq_test.received_idx.load(), napi_irq_test.suppressed_desc.load(), napi_irq_test.received_desc.load(),
+                    napi_irq_test.suppressed_len.load(), FAULT ? RECOVERY_US : 0, AFTER.schedules.at(0) - before.schedules.at(0),
+                    AFTER.schedules.at(1) - before.schedules.at(1), AFTER.schedules.at(2) - before.schedules.at(2),
+                    AFTER.schedules.at(3) - before.schedules.at(3), napi_irq_test.bad.load() - BAD,
+                    napi_irq_test.duplicate.load() - DUPLICATE, napi_irq_test.foreign.load() - FOREIGN);
+                if (ok) ++completed;
+            }
+            ok = ok && completed == 16 && ordinary_irq.at(0) != 0 && ordinary_irq.at(1) != 0 && ordinary_worker_rx.at(0) != 0 &&
+                 ordinary_worker_rx.at(1) != 0;
+            selftest_napi_cleanup(dev);
+        }
+    }  // Release the driver/shutdown hold before the ordinary global finalizer.
+    net_log::info(
+        "napi irq recovery %s cases=%lu suppressed=%lu max_dt_us=%lu bound_us=%lu slack_us=%lu "
+        "ordinary_irq=%lu/%lu ordinary_worker_rx=%lu/%lu",
+        ok ? "PASS" : "FAIL", completed, napi_irq_test.suppressed.load(), max_recovery_us, napi_test::RECOVERY_LIMIT_US,
+        max_recovery_us > 100000 ? max_recovery_us - 100000 : 0, ordinary_irq.at(0), ordinary_irq.at(1), ordinary_worker_rx.at(0),
+        ordinary_worker_rx.at(1));
+    ker::mod::power::selftest_shutdown();
+}
+
+void selftest_napi_start(VirtIONetDevice* dev) {
+    auto const* cmdline = ker::init::get_kernel_cmdline();
+    if (ker::mod::smt::get_core_count() < 4 || device_count != 1 || dev->num_queue_pairs != 1 || dev->configured_queue_pairs != 1 ||
+        dev->queue_pairs.at(0).napi.worker == nullptr || !dev->queue_pairs.at(0).napi.diagnostics_enabled ||
+        cmdline_has_token(cmdline, "--selftest") || cmdline_has_token(cmdline, "--virtio-test-live")) {
+        net_log::error("napi irq recovery FAIL configuration: require live SMP, four CPUs, one device/pair, net.napi_diag");
+        return;
+    }
+    VirtIONetDevice* expected = nullptr;
+    if (!napi_irq_test.device.compare_exchange_strong(expected, dev, std::memory_order_acq_rel)) return;
+    auto* runner = live_post("napi_irq_test", selftest_napi_runner, 0);
+    if (runner != nullptr) {
+        runner->release();
+    } else {
+        napi_irq_test.device.store(nullptr, std::memory_order_release);
+        net_log::error("napi irq recovery FAIL coordinator allocation");
+    }
+}
+
 void selftest_live_start(VirtIONetDevice* dev) {
     if (ker::mod::smt::get_core_count() < 4 || dev->queue_pairs[0].napi.worker == nullptr) {
         net_log::error("virtio live DMA requires four CPUs and a NAPI worker");
@@ -1640,7 +1884,7 @@ auto selftest_terminal_retirement(VirtIONetDevice* dev) -> int {
     auto* late = ker::net::pkt_alloc();
     bool const TX_REJECTED = late != nullptr && virtio_net_start_xmit(&dev->netdev, late) == -ENODEV;
     virtio_net_irq(pair.irq_vector, &pair);
-    bool const POLL_REJECTED = virtio_net_poll(&pair.napi, 64) == 0;
+    bool const POLL_REJECTED = virtio_net_poll(&pair.napi, 64, ker::net::NapiPollSource::INLINE) == 0;
     probe_test->terminal_late_rejected =
         TX_REJECTED && POLL_REJECTED && virtio_net_open(&dev->netdev) == -ENODEV &&
         virtio_net_set_queue_cpu(&dev->netdev, 0, 0) == -ENODEV && virtio_net_set_queue_cpu_mask(&dev->netdev, 1) == -ENODEV &&
@@ -2045,7 +2289,7 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
         if (pair.napi.worker != nullptr) {
             // Keep notifications suppressed until the NAPI owner drains any
             // startup completions and performs the normal rearm handshake.
-            ker::net::napi_schedule(&pair.napi);
+            ker::net::napi_schedule(&pair.napi, ker::net::NapiScheduleSource::STARTUP);
         }
     }
 
@@ -2247,7 +2491,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
         if (pair.napi.worker != nullptr) {
             // Keep notifications suppressed until the NAPI owner drains any
             // startup completions and performs the normal rearm handshake.
-            ker::net::napi_schedule(&pair.napi);
+            ker::net::napi_schedule(&pair.napi, ker::net::NapiScheduleSource::STARTUP);
         }
     }
 
@@ -2293,8 +2537,9 @@ auto virtio_net_diag_snapshot(VirtIONetDiagSnapshot* out, size_t max) -> size_t 
             row.active = pair_idx < dev->num_queue_pairs;
             row.napi_state = static_cast<uint8_t>(pair.napi.state.load(std::memory_order_acquire));
             row.napi_has_work = pair.napi.has_work.load(std::memory_order_acquire);
-            row.napi_polls = pair.napi.poll_count;
-            row.napi_completes = pair.napi.complete_count;
+            row.napi_polls = pair.napi.poll_count.load(std::memory_order_relaxed);
+            row.napi_completes = pair.napi.complete_count.load(std::memory_order_relaxed);
+            row.napi_diag = ker::net::napi_diag_snapshot(&pair.napi);
             if (pair.napi.worker != nullptr) {
                 row.napi_worker_pid = pair.napi.worker->pid;
                 row.napi_worker_cpu = pair.napi.worker->cpu;
@@ -2355,6 +2600,7 @@ auto virtio_net_init() -> int {
         net_log::info("no devices found");
     }
 #ifdef WOS_SELFTEST
+    if (found != 0 && cmdline_has_token(ker::init::get_kernel_cmdline(), "--napi-irq-test")) selftest_napi_start(devices[0]);
     if (found != 0 && cmdline_has_token(ker::init::get_kernel_cmdline(), "--virtio-test-live")) selftest_live_start(devices[0]);
 #endif
 

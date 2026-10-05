@@ -68,7 +68,7 @@ def test_napi_worker_and_scheduler_lost_wake_guards() -> None:
         worker_body,
         [
             "!napi_worker_has_work(napi)",
-            "ker::mod::sched::kern_sleep_us(NAPI_WORKER_IDLE_SLEEP_US)",
+            "ker::mod::sched::kern_block()",
             "napi->has_work.store(false, std::memory_order_release)",
             "napi->state.load(std::memory_order_acquire) == NapiState::SCHEDULED",
             "napi->has_work.store(true, std::memory_order_release)",
@@ -100,10 +100,26 @@ def test_napi_worker_and_scheduler_lost_wake_guards() -> None:
     require_tokens(
         wake_body,
         [
-            "ker::mod::sched::kern_wake(worker)",
+            "ker::mod::sched::wake_task_from_event(worker, ker::mod::sched::EventWakeDeferredSwitch::PRESERVE)",
             "poke_napi_worker_cpu(worker)",
         ],
         "NAPI worker wake helper",
+    )
+    if "NAPI_WORKER_IDLE_SLEEP_US" in source:
+        fail("NAPI idle worker still has a periodic polling deadline")
+
+    rescue_interval = re.search(r"NAPI_RESCUE_IDLE_SLEEP_US\s*=\s*([0-9']+)", source)
+    if rescue_interval is None:
+        fail("NAPI rescue watchdog has no bounded idle interval")
+    if int(rescue_interval.group(1).replace("'", "")) < 100_000:
+        fail("NAPI rescue watchdog scans idle devices more than ten times per second")
+    require_tokens(
+        source,
+        [
+            "NAPI_RESCUE_ACTIVE_SLEEP_US = 1000",
+            "WORK == 0 ? NAPI_RESCUE_IDLE_SLEEP_US : NAPI_RESCUE_ACTIVE_SLEEP_US",
+        ],
+        "NAPI rescue keeps bounded idle recovery and fast active draining",
     )
 
     schedule_body = function_body(source, "napi_schedule")
@@ -219,7 +235,7 @@ def test_backlog_handler_and_enqueue_lost_wake_guards() -> None:
             "int const QUEUE_DRAINED = prepare_backlog_batch(batch, q, normal_head, wki_head)",
             "process_packet_list(normal_head, true)",
             "release_backlog_consumer(q)",
-            "process_packet_list(wki_head, true)",
+            "process_packet_list(wki_head, true, true)",
         ],
         "backlog handler releases consumer before WKI post-processing",
     )

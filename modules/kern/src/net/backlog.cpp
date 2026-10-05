@@ -175,12 +175,20 @@ void process_backlog_packet(PacketBuffer* pkt) {
     proto::eth_rx(pkt->dev, pkt);
 }
 
-void process_packet_list(PacketBuffer* batch, bool cooperative) {
+void process_packet_list(PacketBuffer* batch, bool cooperative, bool batch_local_wakes = false) {
     uint32_t processed_since_sleep = 0;
     while (batch != nullptr) {
         PacketBuffer* next = batch->next;
         batch->next = nullptr;
-        process_backlog_packet(batch);
+        if (batch_local_wakes) {
+            // Protocol RX runs here after NAPI has queued the packet. Keep
+            // publication immediate and flush notifications before the next
+            // packet or the existing cooperative sleep below.
+            ker::mod::sched::LocalWakeBatch const PACKET_WAKE_BATCH;
+            process_backlog_packet(batch);
+        } else {
+            process_backlog_packet(batch);
+        }
         batch = next;
         if (cooperative && batch != nullptr && ++processed_since_sleep >= BACKLOG_HANDLER_COOPERATIVE_BATCH) {
             processed_since_sleep = 0;
@@ -320,7 +328,7 @@ void backlog_handler_loop(uint64_t cpu_idx) {
         mark_consumer_stage(q, BacklogConsumerStage::NORMAL);
         process_packet_list(normal_head, true);
         release_backlog_consumer(q);
-        process_packet_list(wki_head, true);
+        process_packet_list(wki_head, true, true);
     }
 }
 

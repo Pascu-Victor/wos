@@ -80,6 +80,7 @@ enum class ProcNodeType : uint8_t {
     LIMITS_FILE,       // /proc/<pid>/limits and task aliases
     TIMEKEEPING_FILE,  // /proc/timekeeping -> clocksource and wall-clock discipline
     KPERFSTATUS_FILE,  // /proc/kperfstatus -> recording session/loss/consumer counters
+    WKI_NAPI_FILE,     // /proc/wki/napi -> bounded admitted virtio queue diagnostics
 };
 
 struct ProcNode {

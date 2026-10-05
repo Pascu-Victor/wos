@@ -86,6 +86,8 @@ namespace {
 
 using ker::mod::security::DiagnosticAccess;
 
+constexpr size_t MAX_WKI_NAPI_BUF = 65536;
+
 constexpr auto diagnostic_access(ProcNodeType type) -> DiagnosticAccess {
     switch (type) {
         case ProcNodeType::ROOT_DIR:
@@ -135,6 +137,7 @@ constexpr auto diagnostic_access(ProcNodeType type) -> DiagnosticAccess {
         case ProcNodeType::KCONTSTAT_FILE:
         case ProcNodeType::KIPCSTAT_FILE:
         case ProcNodeType::WKI_NETDIAG_FILE:
+        case ProcNodeType::WKI_NAPI_FILE:
         case ProcNodeType::WKI_PIPES_FILE:
         case ProcNodeType::MEMACC_PROCS_FILE:
         case ProcNodeType::MEMACC_DEAD_FILE:
@@ -875,6 +878,14 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
             buf->d_reclen = sizeof(DirEntry);
             buf->d_type = DT_REG;
             std::memcpy(buf->d_name.data(), "auth", 5);
+            return 0;
+        }
+        if (count == 8) {
+            buf->d_ino = 27;
+            buf->d_off = 9;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_REG;
+            std::memcpy(buf->d_name.data(), "napi", 5);
             return 0;
         }
         return -ENOENT;
@@ -3886,6 +3897,39 @@ auto generate_memacc_reclaim_coordinator(char* buf, size_t bufsz) -> size_t {
     return static_cast<size_t>(p - buf);
 }
 
+void append_napi_diag(char*& p, const char* end, const ker::net::NapiDiagSnapshot& diag) {
+    append_memacc_bool(p, end, "napi_diag", diag.enabled);
+    if (!diag.enabled) return;
+    constexpr std::array<const char*, ker::net::NAPI_SCHEDULE_SOURCES> SCHEDULE_NAMES = {"unspecified", "irq", "rearm", "startup"};
+    constexpr std::array<const char*, ker::net::NAPI_POLL_SOURCES> POLL_NAMES = {"worker", "inline", "rescue"};
+    auto append_source = [&](const char* key, const char* source, uint64_t value) {
+        append_char(p, end, ' ');
+        append_sconst(p, end, key);
+        append_char(p, end, '_');
+        append_sconst(p, end, source);
+        append_char(p, end, '=');
+        append_dec64(p, end, value);
+    };
+    for (size_t i = 0; i < SCHEDULE_NAMES.size(); ++i) {
+        append_source("sched", SCHEDULE_NAMES.at(i), diag.schedules.at(i));
+        append_source("accepted", SCHEDULE_NAMES.at(i), diag.accepted.at(i));
+    }
+    for (size_t i = 0; i < POLL_NAMES.size(); ++i) {
+        append_source("poll", POLL_NAMES.at(i), diag.polls.at(i));
+        append_source("rxwork", POLL_NAMES.at(i), diag.rx_work.at(i));
+        append_source("rxzero", POLL_NAMES.at(i), diag.rx_zero.at(i));
+        append_source("txreclaimed", POLL_NAMES.at(i), diag.tx_reclaimed.at(i));
+    }
+    append_memacc_dec(p, end, "sched_coalesced", diag.coalesced);
+    append_memacc_dec(p, end, "sched_polling_reject", diag.polling_rejects);
+    append_memacc_dec(p, end, "sched_disabled_reject", diag.disabled_rejects);
+    append_memacc_dec(p, end, "park_calls", diag.park_calls);
+    append_memacc_dec(p, end, "park_empty_returns", diag.park_empty_returns);
+    append_memacc_dec(p, end, "contention_sleeps", diag.contention_sleeps);
+    append_memacc_dec(p, end, "inline_refused", diag.inline_refused);
+    append_memacc_dec(p, end, "budget_handoffs", diag.budget_handoffs);
+}
+
 void append_virtqueue_diag(char*& p, const char* end, const char* prefix, const ker::dev::virtio::VirtqueueDiagSnapshot& q) {
     append_char(p, end, ' ');
     append_sconst(p, end, prefix);
@@ -4246,6 +4290,93 @@ auto generate_wki_chaos(char* buf, size_t bufsz) -> size_t {
     return static_cast<size_t>(p - buf);
 }
 
+void append_virtio_net_diag(char*& p, const char* end, const ker::dev::virtio::VirtIONetDiagSnapshot& row) {
+    append_sconst(p, end, "virtio_net name=");
+    append_netdev_name(p, end, row.name);
+    append_sconst(p, end, " ifindex=");
+    append_dec64(p, end, row.ifindex);
+    append_sconst(p, end, " pair=");
+    append_dec64(p, end, row.pair);
+    append_sconst(p, end, " active=");
+    append_bool01(p, end, row.active);
+    append_sconst(p, end, " pairs=");
+    append_dec64(p, end, row.num_queue_pairs);
+    append_sconst(p, end, " configured=");
+    append_dec64(p, end, row.configured_queue_pairs);
+    append_sconst(p, end, " msix=");
+    append_bool01(p, end, row.msix_enabled);
+    append_sconst(p, end, " vector=");
+    append_dec64(p, end, row.irq_vector);
+    append_sconst(p, end, " hdr_size=");
+    append_dec64(p, end, row.hdr_size);
+    append_sconst(p, end, " napi_state=");
+    append_sconst(p, end, napi_state_name(row.napi_state));
+    append_sconst(p, end, " napi_work=");
+    append_bool01(p, end, row.napi_has_work);
+    append_sconst(p, end, " worker_pid=");
+    append_dec64(p, end, row.napi_worker_pid);
+    append_sconst(p, end, " worker_cpu=");
+    append_dec64(p, end, row.napi_worker_cpu);
+    append_sconst(p, end, " polls=");
+    append_dec64(p, end, row.napi_polls);
+    append_sconst(p, end, " completes=");
+    append_dec64(p, end, row.napi_completes);
+    append_virtqueue_diag(p, end, "rx", row.rx);
+    append_virtqueue_diag(p, end, "tx", row.tx);
+    append_napi_diag(p, end, row.napi_diag);
+    append_char(p, end, '\n');
+}
+
+auto generate_wki_napi(char* buf, size_t bufsz) -> size_t {
+    if (buf == nullptr || bufsz == 0) return 0;
+    char* p = buf;
+    char const* end = buf + bufsz - 1;
+    // Reserve the footer before copying any rows. Never publish a partial row
+    // or claim a complete snapshot when the body or a staged row cannot fit.
+    constexpr size_t FOOTER_RESERVE = 96;
+    if (bufsz <= FOOTER_RESERVE) {
+        append_sconst(p, end, "wki_napi_end complete=0\n");
+        *p = '\0';
+        return static_cast<size_t>(p - buf);
+    }
+    char const* body_end = end - FOOTER_RESERVE;
+    constexpr char HEADER[] = "wki_napi version=1 scope=virtio_admitted\n";
+    bool complete = sizeof(HEADER) - 1 <= static_cast<size_t>(body_end - p);
+    if (complete) {
+        std::memcpy(p, HEADER, sizeof(HEADER) - 1);
+        p += sizeof(HEADER) - 1;
+    }
+
+    // The driver statically bounds its registry to at most 32 queue pairs.
+    // Closed admission excludes retiring devices; the snapshot owns its data.
+    std::array<ker::dev::virtio::VirtIONetDiagSnapshot, ker::dev::virtio::VIRTIO_NET_DIAG_MAX_ROWS> rows{};
+    size_t const SNAPSHOT_ROWS = ker::dev::virtio::virtio_net_diag_snapshot(rows.data(), rows.size());
+    size_t written_rows = 0;
+    std::array<char, 4096> row_buf{};
+    for (size_t i = 0; complete && i < SNAPSHOT_ROWS; ++i) {
+        char* row_p = row_buf.data();
+        char const* row_end = row_buf.data() + row_buf.size() - 1;
+        append_virtio_net_diag(row_p, row_end, rows.at(i));
+        size_t const ROW_BYTES = static_cast<size_t>(row_p - row_buf.data());
+        if (row_p + 1 >= row_end || ROW_BYTES > static_cast<size_t>(body_end - p)) {
+            complete = false;
+            break;
+        }
+        std::memcpy(p, row_buf.data(), ROW_BYTES);
+        p += ROW_BYTES;
+        ++written_rows;
+    }
+    append_sconst(p, end, "wki_napi_end complete=");
+    append_bool01(p, end, complete);
+    append_sconst(p, end, " rows=");
+    append_dec64(p, end, written_rows);
+    append_sconst(p, end, " snapshot_rows=");
+    append_dec64(p, end, SNAPSHOT_ROWS);
+    append_char(p, end, '\n');
+    *p = '\0';
+    return static_cast<size_t>(p - buf);
+}
+
 // Covers all retained snapshot rows at maximal numeric/string widths. Other
 // snapshot caps/allocation failures remain explicit; this is not an atomic
 // observation across subsystems. Only netdiag uses this per-open allocation.
@@ -4399,40 +4530,7 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {  // NOLINT(readab
     std::array<ker::dev::virtio::VirtIONetDiagSnapshot, ker::dev::virtio::VIRTIO_NET_DIAG_MAX_ROWS> virtio_rows{};
     size_t const VIRTIO_COUNT = ker::dev::virtio::virtio_net_diag_snapshot(virtio_rows.data(), virtio_rows.size());
     for (size_t i = 0; i < VIRTIO_COUNT; ++i) {
-        const auto& row = virtio_rows.at(i);
-        append_sconst(p, end, "virtio_net name=");
-        append_netdev_name(p, end, row.name);
-        append_sconst(p, end, " ifindex=");
-        append_dec64(p, end, row.ifindex);
-        append_sconst(p, end, " pair=");
-        append_dec64(p, end, row.pair);
-        append_sconst(p, end, " active=");
-        append_bool01(p, end, row.active);
-        append_sconst(p, end, " pairs=");
-        append_dec64(p, end, row.num_queue_pairs);
-        append_sconst(p, end, " configured=");
-        append_dec64(p, end, row.configured_queue_pairs);
-        append_sconst(p, end, " msix=");
-        append_bool01(p, end, row.msix_enabled);
-        append_sconst(p, end, " vector=");
-        append_dec64(p, end, row.irq_vector);
-        append_sconst(p, end, " hdr_size=");
-        append_dec64(p, end, row.hdr_size);
-        append_sconst(p, end, " napi_state=");
-        append_sconst(p, end, napi_state_name(row.napi_state));
-        append_sconst(p, end, " napi_work=");
-        append_bool01(p, end, row.napi_has_work);
-        append_sconst(p, end, " worker_pid=");
-        append_dec64(p, end, row.napi_worker_pid);
-        append_sconst(p, end, " worker_cpu=");
-        append_dec64(p, end, row.napi_worker_cpu);
-        append_sconst(p, end, " polls=");
-        append_dec64(p, end, row.napi_polls);
-        append_sconst(p, end, " completes=");
-        append_dec64(p, end, row.napi_completes);
-        append_virtqueue_diag(p, end, "rx", row.rx);
-        append_virtqueue_diag(p, end, "tx", row.tx);
-        append_char(p, end, '\n');
+        append_virtio_net_diag(p, end, virtio_rows.at(i));
     }
     if (VIRTIO_COUNT == virtio_rows.size()) {
         append_sconst(p, end, "virtio_net_truncated max=");
@@ -6554,7 +6652,7 @@ auto procfs_read_with_credentials(const ker::mod::security::Snapshot& credential
         bool const IS_KPERF = (pfd->node.type == ProcNodeType::KPERF_FILE || pfd->node.type == ProcNodeType::KWKISTAT_FILE ||
                                pfd->node.type == ProcNodeType::KCPUSTAT_FILE || pfd->node.type == ProcNodeType::KCPUSTATE_FILE ||
                                pfd->node.type == ProcNodeType::KCONTSTAT_FILE || pfd->node.type == ProcNodeType::KIPCSTAT_FILE ||
-                               pfd->node.type == ProcNodeType::WKI_NETDIAG_FILE ||
+                               pfd->node.type == ProcNodeType::WKI_NETDIAG_FILE || pfd->node.type == ProcNodeType::WKI_NAPI_FILE ||
                                pfd->node.type == ProcNodeType::WKI_PIPES_FILE || pfd->node.type == ProcNodeType::CPU_STAT_FILE);
         bool const IS_LARGE_WKI = pfd->node.type == ProcNodeType::WKI_CHAOS_FILE;
         bool const IS_MEMACC =
@@ -6572,6 +6670,8 @@ auto procfs_read_with_credentials(const ker::mod::security::Snapshot& credential
         size_t alloc_sz = MAX_PROCFS_BUF;
         if (pfd->node.type == ProcNodeType::WKI_NETDIAG_FILE) {
             alloc_sz = MAX_WKI_NETDIAG_BUF;
+        } else if (pfd->node.type == ProcNodeType::WKI_NAPI_FILE) {
+            alloc_sz = MAX_WKI_NAPI_BUF;
         } else if (IS_MEMACC || IS_RUNTIME_MAP || IS_LARGE_WKI) {
             alloc_sz = MAX_MEMACC_BUF;
         } else if (IS_KPERF) {
@@ -6648,6 +6748,9 @@ auto procfs_read_with_credentials(const ker::mod::security::Snapshot& credential
                 break;
             case ProcNodeType::WKI_AUTH_FILE:
                 pfd->content_len = generate_wki_auth(pfd->content, MAX_PROCFS_BUF);
+                break;
+            case ProcNodeType::WKI_NAPI_FILE:
+                pfd->content_len = generate_wki_napi(pfd->content, MAX_WKI_NAPI_BUF);
                 break;
             case ProcNodeType::WKI_NETDIAG_FILE:
                 pfd->content_len = generate_wki_netdiag(pfd->content, MAX_WKI_NETDIAG_BUF);
@@ -7991,6 +8094,11 @@ auto procfs_lookup_path_as(const char* path, uint64_t caller_pid, int flags, Pro
         return make_file(ProcNodeType::WKI_AUTH_FILE, 0, false);
     }
 
+    // /proc/wki/napi - complete bounded virtio queue diagnostics
+    if (strcmp(path, "wki/napi") == 0) {
+        return make_file(ProcNodeType::WKI_NAPI_FILE, 0, false);
+    }
+
     // /proc/wki/netdiag
     if (strcmp(path, "wki/netdiag") == 0) {
         return make_file(ProcNodeType::WKI_NETDIAG_FILE, 0, false);
@@ -8868,15 +8976,17 @@ auto selftest_fd_authorization() -> bool {
 auto selftest_global_authorization() -> bool {
     namespace security = ker::mod::security;
     auto const ROOT = security::Snapshot::bootstrap_root();
-    security::Snapshot user;
-    if (ROOT.prepare({.change = security::Change::SET_UID, .real = 1000}, user) != 0) return false;
+    security::Snapshot user, restricted_root;
+    if (ROOT.prepare({.change = security::Change::SET_UID, .real = 1000}, user) != 0 ||
+        ROOT.prepare({.change = security::Change::DROP_AUTHORITY, .authority_ceiling = 0}, restricted_root) != 0)
+        return false;
     bool passed = true;
     bool const PERF_ENABLED = ker::mod::perf::is_enabled();
     auto const PERF_MASK = ker::mod::perf::get_event_mask();
     for (const char* path :
          {"kperfctl", "wki/chaos", "wki/chaos_workload", "memacc/track/page_callers", "memacc/track/kmalloc_debug",
           "memacc/reclaim/buffer_cache", "memacc/reclaim/packet_pool", "memacc/reclaim/xfs_inode", "memacc/reclaim/file_mmap_cache",
-          "memacc/reclaim/anonymous_swap", "kperf", "kcpustate", "memacc/kmalloc_live"}) {
+          "memacc/reclaim/anonymous_swap", "kperf", "kperfstatus", "kcpustate", "memacc/kmalloc_live", "wki/napi"}) {
         int result = 0;
         auto* file = procfs_open_path(ROOT, path, 0, 0, &result);
         if (file == nullptr || result != 0) return false;
@@ -8884,6 +8994,25 @@ auto selftest_global_authorization() -> bool {
         std::array<char, 4> output{'s', 'a', 'f', 'e'};
         passed &= procfs_read_with_credentials(user, file, output.data(), output.size(), 0) == -EACCES;
         passed &= data->content == nullptr && data->content_len == 0;
+        if (std::strcmp(path, "wki/napi") == 0) {
+            passed &= procfs_read_with_credentials(ROOT, file, output.data(), output.size(), 0) == 4;
+            passed &= std::memcmp(output.data(), "wki_", 4) == 0;
+            auto* const SNAPSHOT = data->content;
+            output = {'s', 'a', 'f', 'e'};
+            passed &= procfs_read_with_credentials(user, file, output.data(), output.size(), 0) == -EACCES;
+            passed &= procfs_read_with_credentials(restricted_root, file, output.data(), output.size(), 0) == -EACCES;
+            passed &= std::memcmp(output.data(), "safe", 4) == 0 && data->content == SNAPSHOT;
+            int restricted_result = 0;
+            auto* restricted_file = procfs_open_path(restricted_root, path, 0, 0, &restricted_result);
+            passed &= restricted_file == nullptr && restricted_result == -EACCES;
+            if (restricted_file != nullptr) {
+                procfs_close(restricted_file);
+                delete restricted_file;
+            }
+            delete[] data->content;
+            data->content = nullptr;
+            data->content_len = 0;
+        }
         data->content = new char[4];
         if (data->content == nullptr) {
             procfs_close(file);

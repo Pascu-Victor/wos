@@ -348,7 +348,7 @@ void process_tx(E1000Device* dev) {
 }
 
 // -- NAPI poll function - called from worker thread context --------------
-int e1000_poll(ker::net::NapiStruct* napi, int budget) {
+int e1000_poll(ker::net::NapiStruct* napi, int budget, ker::net::NapiPollSource /*source*/) {
     auto* dev = reinterpret_cast<E1000Device*>(napi->dev);
     CallbackGuard const GUARD(dev);
     if (!GUARD) return 0;
@@ -403,7 +403,7 @@ void e1000_irq_handler(uint8_t /*vector*/, void* private_data) {
         reg_write(dev, REG_IMC, 0xFFFFFFFF);
 
         // Schedule NAPI poll - all real work happens in worker thread
-        ker::net::napi_schedule(&dev->napi);
+        ker::net::napi_schedule(&dev->napi, ker::net::NapiScheduleSource::IRQ);
     }
 }
 

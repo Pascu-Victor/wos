@@ -139,13 +139,13 @@ def test_split_ring_notification_rearm_is_race_safe_and_bounded() -> None:
         "ker::net::napi_complete(napi)",
         "virtio_net_rearm_pair_notifications_locked(dev, pair, rx_processed)",
         "pair->notification_lock.unlock_irqrestore(FLAGS)",
-        "ker::net::napi_schedule(napi)",
+        "ker::net::napi_schedule(napi, ker::net::NapiScheduleSource::REARM)",
     )
     require_order(
         poll_body,
         "virtio_net_begin_poll(pair)",
         "pair->txq->lock.lock_irqsave()",
-        "process_rx_budget_for(dev, pair->rxq, budget)",
+        "process_rx_budget_for(dev, pair->rxq, budget, source)",
         "virtio_net_complete_poll(dev, pair, napi, processed)",
     )
     require_order(
@@ -153,7 +153,7 @@ def test_split_ring_notification_rearm_is_race_safe_and_bounded() -> None:
         "pair->notification_lock.lock_irqsave()",
         "virtio_net_set_pair_notifications(pair, false)",
         "pair->notification_lock.unlock_irqrestore(FLAGS)",
-        "ker::net::napi_schedule(&pair->napi)",
+        "ker::net::napi_schedule(&pair->napi, ker::net::NapiScheduleSource::IRQ)",
     )
     if "queue_msix_vector" in poll_body or "VIRTIO_MSI_QUEUE_VECTOR" in poll_body:
         fail("NAPI poll must not rewrite queue-vector selectors")
@@ -198,7 +198,7 @@ def test_queues_start_suppressed_and_napi_precedes_irq_registration() -> None:
         "if (!publish_irqs(dev)) return fail_published_probe(dev)",
         "ker::net::napi_enable(&pair.napi",
         "pair.napi.worker != nullptr",
-        "ker::net::napi_schedule(&pair.napi)",
+        "ker::net::napi_schedule(&pair.napi, ker::net::NapiScheduleSource::STARTUP)",
     )
     require_order(
         legacy_body,
@@ -209,7 +209,7 @@ def test_queues_start_suppressed_and_napi_precedes_irq_registration() -> None:
         "if (!publish_irqs(dev)) return fail_published_probe(dev)",
         "ker::net::napi_enable(&pair.napi",
         "pair.napi.worker != nullptr",
-        "ker::net::napi_schedule(&pair.napi)",
+        "ker::net::napi_schedule(&pair.napi, ker::net::NapiScheduleSource::STARTUP)",
     )
     if "VIRTIO_MSI_NO_VECTOR" not in unassign_body:
         fail("inactive MQ pairs must still be detached from MSI-X vectors")

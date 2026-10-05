@@ -122,6 +122,8 @@ the boot command line contains the exact token.
 | Token | Location | What it does | Downsides |
 | --- | --- | --- | --- |
 | `wki.routing_rx_timing` | `modules/kern/src/net/wki/routing.cpp` | Saves five intermediate monotonic checkpoints and a bounded snapshot for the same slowest LSA/lease-request handler as `max_rx_us`; `/proc/wki/netdiag` adds `wki_routing_rx version=1` and `wki_routing_wake version=1`. | Extra enabled clock reads and their overhead lie inside the unchanged wall-time total. RX stages cover validation, origin lookup, preparation, database lock wait, apply/unlock, and remaining tail including scheduler wake. The wake row links to the same RX `started_us` and reports target selection, token/placement preparation, leader admission, reschedule drain, aggregate runqueue lock wait/body/return and timer/IPI poke spans with pass/lock/scan/poke counts. Lock and poke spans overlap reschedule time; all are elapsed time, not exclusive CPU. Fixed start-CPU IRQ/timer counters may include unrelated execution; committed IRQ time excludes scheduler timer duration. Enabled boots also retain a bounded fixed-start-CPU timer trace: 64 slots per runqueue and at most 32 copied events, with caller identity, arm intent/ticks, interrupt RIP/CS and completed handoffs. Bulk trace storage is separate from the per-handler wake sample; copying occurs only for an enabled winning maximum, after the original RX end timestamp under its existing diagnostic lock. `wki_routing_timer_trace` declares sequence range, retained count, omitted/missing events and completeness; event rows share `rx_started_us`. Sequence is reservation order, not timestamp order. Arm observations precede hardware writes; C++ IRQ boundaries omit assembly and may have no exit for a non-returning path. No retained Task/stack pointers, observer locks or waits; busy slots drop. Enabled event clocks/atomics perturb timing, and OFF branch/stack plus fixed per-runqueue storage costs are not zero. `recorded=0` means no worker wake was sampled. A mask identifies RX stages reached; ignored own LSAs and empty/disabled legacy ACKs remain excluded. Endpoint CPU observations do not prove no intervening migration. Disabled boots add no diagnostic clocks/counter reads, allocation, locks or periodic work; branch/stack costs are not assumed zero. |
+| `net.napi_diag` | `modules/kern/src/net/netpoll.cpp`, `modules/kern/src/dev/virtio/virtio_net.cpp` | Enables fixed NAPI scheduling-source, poll-origin, RX-budget-work, TX-reclamation and worker-wait counters. Virtio queue rows in `/proc/wki/napi` and `/proc/wki/netdiag` append `napi_diag=1` and the counters; ordinary boots append only `napi_diag=0`. | Adds relaxed atomic counter updates when enabled. Snapshots are independent cumulative observations, not a transactional state or a packet trace. |
+| `--napi-irq-test` | `modules/kern/src/dev/virtio/virtio_net.cpp` (`WOS_SELFTEST` only) | Opt-in live IRQ-publication recovery fixture; requires `net.napi_diag`, four CPUs, one virtio device and one configured queue pair. | Use the private socket backend runner below; omit BSP `--selftest` and `--virtio-test-live`. Suppresses software scheduling publication from an admitted real IRQ, not physical IRQ delivery. |
 | `sched.cpu_dump` | `modules/kern/src/platform/sys/context_switch.cpp`, `modules/kern/src/platform/sched/scheduler.cpp` | Periodically logs per-CPU scheduler state from CPU 0 as bounded `schedcpu`, `schedcpu_preempt`, `schedcpu_migrate`, and `schedcpu_wait` records correlated by CPU/current PID. Together they include saved/live frame classes, preemption and migration depth/owner, pending/transition state, last source/target CPU and rejection reason, queues, timer counters, wake IPIs, and local reschedules. | Scheduler timer-path logging and runqueue lock sampling; use only for short diagnostic boots. |
 | `sched.cpu_dump_local` | `modules/kern/src/platform/sys/context_switch.cpp`, `modules/kern/src/platform/sched/scheduler.cpp` | Periodically logs only the current CPU's scheduler state from that CPU's timer path, including live interrupt CS/RIP/RSP plus current task wait channel/callsite; avoids CPU 0 cross-CPU runqueue inspection. | Scheduler timer-path logging on every active CPU; use instead of `sched.cpu_dump` when CPU 0 or cross-CPU dump progress is suspect. |
 | `sched.preempt_stall` | `modules/kern/src/platform/sched/scheduler.cpp` | Rate-limited log when a scheduler timer tick cannot preempt while runnable work is queued; includes the live frame class, exact rejection reason, task/source/target CPU, live CS/RIP/RSP, preemption and migration depth/owner, transition state, queues, wait metadata, and syscall start time. | Timer-path logging on the affected CPU; use only to diagnose non-preemptible syscall/kernel stalls. The same last-decision scalars are always available without logging in `/proc/kcpustate`. |
@@ -146,6 +148,43 @@ the boot command line contains the exact token.
 | `wki.spawn_diag` | `modules/kern/src/net/wki/remote_compute.cpp` | Logs WKI exec-placement decisions, including result, reason, pid/name, target flags, submitter identity, proxy/local fd hints, and selected node. | Adds journal output on WKI-aware exec placement paths; use only for short remote-compute placement investigations. |
 | `wki.wait_diag` | `modules/kern/src/net/wki/wki.cpp`, `modules/kern/src/net/wki/remote_ipc.cpp` | Rate-limited logs for WKI waits that remain pending, PTY ioctl send/handle/response breadcrumbs, and remote IPC pipe/PTY send retry loops with peer, resource, retry count, and task identity. | Adds journal output from WKI wait and remote IPC control/data paths; use only for short deadlock investigations. |
 | `pipe.diag` | `modules/kern/src/vfs/core.cpp` | Logs local pipe reader/writer block points and read/write-end close events, including pipe buffer state, waiters, open-end count, PID/task, and callsite. | Adds journal output from local pipe hot paths; use only around focused EOF or local pipe ownership investigations. |
+
+`/proc/wki/napi` is a separate 64 KiB snapshot of admitted virtio queue pairs,
+readable only with kernel-debug authority. It shares the `virtio_net` row format
+with the aggregate view and includes full worker PIDs and CPUs. Its version-1
+header declares `scope=virtio_admitted`; the final `wki_napi_end` row reports
+`complete`, emitted `rows` and `snapshot_rows`. Require `complete=1` and matching
+counts before using a snapshot. The driver statically bounds admitted queues to
+32, and rows are staged before copying so buffer exhaustion preserves whole rows
+and reports `complete=0`. Closed admission excludes retiring devices. Reopen the
+file for a fresh snapshot; counters remain independent cumulative observations.
+This view does not include other drivers or establish completeness of the larger
+`/proc/wki/netdiag` aggregate, which uses a separate 4 MiB text buffer. Require
+its own final `wki_netdiag_end complete=1` row before treating the aggregate as
+complete; allocation failure while staging origin snapshots suppresses that row.
+
+NAPI scheduling counters distinguish `irq`, completion `rearm`, `startup` and
+`unspecified` attempts; `accepted_*` counts successful IDLE-to-SCHEDULED
+transitions. Coalesced, polling and disabled refusals are separate. Poll counters
+distinguish `worker`, caller-driven `inline` and watchdog `rescue` origins;
+the origin travels as a callback argument, including across a completion that
+admits another poll owner. `rxwork_*` is the driver's returned RX budget work,
+which can include dropped or invalid completions, rather than delivered packets.
+If multiqueue activation fails, pair 0 can also drain configured inactive RX
+queues; that work is attributed to pair 0's poll.
+`rxzero_*` does not establish an empty or spurious poll. `txreclaimed_*` counts
+owned buffers detached by virtio NAPI polling, excluding opportunistic send-side
+reclamation. Other drivers do not provide this virtio TX accounting.
+`park_calls` counts attempted block calls, including calls that consume an
+already-published event. `park_empty_returns` records a return with no work flag
+and no SCHEDULED state observed; a racing producer can change either observation.
+The unsigned 64-bit counters may wrap and are read independently. They do not
+prove which interrupt was lost, match each wake to a packet, or establish a
+hardware recovery bound. Diagnostics do not change the watchdog cadence,
+notification handshake, polling budgets or trust policy.
+
+`inline_refused` counts inline POLLING admission failures, including an already
+owned or DISABLED queue. It does not imply useful work or an IRQ failure.
 
 ## Legacy Source-Only Debug Macros
 
@@ -172,3 +211,33 @@ shared workflow.
   logs enabled. The flags above only gate extra provenance/tracing.
 - Reconfigure after changing an option; many of these flags affect compile-time
   instrumentation and object layout.
+
+### Live NAPI IRQ-publication recovery fixture
+
+Build the isolated diagnostic kernel, stop other WOS VMs, then run
+`python3 scripts/test/napi_irq_recovery.py`. `--prepare-only` packages and verifies
+without launching; `--no-package --run-dir <prepared directory>` launches the
+verified image. All private boot images, overlays, endpoints, configs and raw
+receipts stay under `ktest-data/napi-irq/`. The runner uses the shared KTEST
+single-node socket-multicast backend on loopback, one queue pair and four CPUs.
+It does not change the normal images, TAPs, bridges or trust configuration.
+In this named selftest boot only, initialization reserves the fixture NIC but
+skips WKI Ethernet transport registration and broadcasts. This prevents
+background control completions; the reservation also excludes IPv6 setup.
+
+Four ordinary cookies precede eight suppressed cases; four ordinary cookies
+follow them. The backend holds each fault reply until the kernel arms its
+one-shot hook after 200 ms of queue quiet. The hook runs after the admitted IRQ
+masks notifications and records one pending RX used index, descriptor and
+length without reading DMA payload. Normal managed RX completion must deliver
+the same cookie and tuple through a `RESCUE` poll, within 150000 microseconds
+(the 100 ms idle rescue interval plus a declared 50 ms scheduling allowance).
+Every fault window must have zero scheduling-producer attempts, bad cookies,
+duplicates and foreign packets. Both ordinary phases need accepted IRQ and
+worker RX progress. The kernel releases its driver/shutdown hold before the
+ordinary poweroff finalizer. Raw failed attempts remain evidence.
+
+This fixture qualifies software IRQ-schedule publication loss on that real
+single-pair vNIC. It does not establish physical IRQ-loss, multiqueue recovery,
+four-node throughput, or idle CPU bounds. Host hook tests use clock and DMA
+seams; they separately exercise eligibility, ownership and rejected verdicts.
