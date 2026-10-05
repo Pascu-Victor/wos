@@ -3,7 +3,7 @@
 #include <sys/process.h>
 
 #include <array>
-#include <print>
+#include <cstdio>
 
 #include "wkictl/cli.hpp"
 
@@ -20,7 +20,8 @@ auto print_wosid() -> int {
     const char* remote_pid_text =
         read_trimmed_file("/proc/self/wki_remote_pid", remote_pid.data(), remote_pid.size()) ? remote_pid.data() : "0";
 
-    std::println("spawner={} host={} pid={} remote_pid={}", launcher_text, runner_text, ker::process::getpid(), remote_pid_text);
+    std::printf("spawner=%s host=%s pid=%llu remote_pid=%s\n", launcher_text, runner_text,
+                static_cast<unsigned long long>(ker::process::getpid()), remote_pid_text);
     return 0;
 }
 

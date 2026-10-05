@@ -12,14 +12,6 @@
 
 namespace {
 
-auto command_basename(const char* path) -> const char* {
-    if (path == nullptr) {
-        return "";
-    }
-    const char* slash = std::strrchr(path, '/');
-    return slash == nullptr ? path : slash + 1;
-}
-
 auto run_wkictl(int argc, char** argv) -> int {
     if (argc < 2) {
         return wkictl::usage();
@@ -53,27 +45,9 @@ auto run_wkictl(int argc, char** argv) -> int {
 namespace wkictl {
 
 auto run(int argc, char** argv) -> int {
-    const char* name = command_basename(argc > 0 ? argv[0] : "wkictl");
-    if (std::strcmp(name, "locally") == 0) {
-        return run_locally(argc, argv);
-    }
-    if (std::strcmp(name, "remotely") == 0) {
-        return run_remotely(argc, argv);
-    }
-    if (std::strcmp(name, "anywhere") == 0) {
-        return run_anywhere(argc, argv);
-    }
-    if (std::strcmp(name, "homeward") == 0) {
-        return run_homeward(argc, argv);
-    }
-    if (std::strcmp(name, "on") == 0) {
-        return run_on(argc, argv);
-    }
-    if (std::strcmp(name, "forward") == 0) {
-        return run_forward(argc, argv);
-    }
-    if (std::strcmp(name, "wosid") == 0) {
-        return print_wosid();
+    int status = 0;
+    if (run_launcher(argc, argv, status)) {
+        return status;
     }
     return run_wkictl(argc, argv);
 }

@@ -1145,6 +1145,7 @@ if(WOS_BUILD_DISK_IMAGES)
         $<TARGET_FILE:journal>
         $<TARGET_FILE:journal_lib>
         $<TARGET_FILE:wkictl>
+        $<TARGET_FILE:wki_run>
         $<TARGET_FILE:powerctl>
         $<TARGET_FILE:servicectl>
         $<TARGET_FILE:renderbench>
@@ -1412,6 +1413,7 @@ set(WOS_ATTEST_ARTIFACT_ARGS
     --artifact journal=$<TARGET_FILE:journal>
     --artifact libjournal=$<TARGET_FILE:journal_lib>
     --artifact wkictl=$<TARGET_FILE:wkictl>
+    --artifact wki-run=$<TARGET_FILE:wki_run>
     --artifact powerctl=$<TARGET_FILE:powerctl>
     --artifact servicectl=$<TARGET_FILE:servicectl>
     --artifact renderbench=$<TARGET_FILE:renderbench>

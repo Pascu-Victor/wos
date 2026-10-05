@@ -322,6 +322,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/journal_source_test.py
 )
 add_test(
+    NAME wki_launcher_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_launcher_runtime_test.py
+)
+add_test(
     NAME wkictl_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wkictl_source_test.py
 )
@@ -905,6 +909,7 @@ set_tests_properties(    host_test_manifest_test
     strace_source_test
     journal_source_test
     wkictl_source_test
+    wki_launcher_runtime_test
     perf_source_test
     memacc_source_test
     wos_memory_balance_test

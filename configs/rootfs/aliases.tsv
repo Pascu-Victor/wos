@@ -28,6 +28,7 @@ copy	build/modules/strace/strace	/usr/bin/strace
 copy-mode	build/modules/sftpserver/sftp-server	/usr/libexec/sftp-server	755
 copy	build/modules/journal/journal	/usr/bin/journalctl
 copy	build/modules/wkictl/wkictl	/usr/bin/wkictl
+copy	build/modules/wkictl/wki-run	/usr/libexec/wki-run
 copy	build/modules/powerctl/powerctl	/usr/sbin/powerctl
 copy	build/modules/servicectl/servicectl	/usr/bin/servicectl
 symlink	/usr/sbin/powerctl	/sbin/reboot
@@ -38,13 +39,13 @@ symlink	/usr/sbin/powerctl	/usr/bin/reboot
 symlink	/usr/sbin/powerctl	/usr/bin/poweroff
 symlink	/usr/sbin/powerctl	/usr/bin/halt
 symlink	/usr/sbin/powerctl	/usr/bin/shutdown
-symlink	/usr/bin/wkictl	/usr/bin/locally
-symlink	/usr/bin/wkictl	/usr/bin/remotely
-symlink	/usr/bin/wkictl	/usr/bin/anywhere
-symlink	/usr/bin/wkictl	/usr/bin/homeward
-symlink	/usr/bin/wkictl	/usr/bin/on
-symlink	/usr/bin/wkictl	/usr/bin/forward
-symlink	/usr/bin/wkictl	/usr/bin/wosid
+symlink	/usr/libexec/wki-run	/usr/bin/locally
+symlink	/usr/libexec/wki-run	/usr/bin/remotely
+symlink	/usr/libexec/wki-run	/usr/bin/anywhere
+symlink	/usr/libexec/wki-run	/usr/bin/homeward
+symlink	/usr/libexec/wki-run	/usr/bin/on
+symlink	/usr/libexec/wki-run	/usr/bin/forward
+symlink	/usr/libexec/wki-run	/usr/bin/wosid
 copy	toolchain/sysroot/bin/dropbearmulti	/usr/bin/dropbearmulti
 symlink	/usr/bin/dropbearmulti	/usr/bin/dropbear
 symlink	/usr/bin/dropbearmulti	/usr/bin/dbclient

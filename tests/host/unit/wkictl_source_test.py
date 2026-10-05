@@ -78,19 +78,20 @@ def test_wkictl_installed_aliases_match_persona_dispatch() -> None:
     aliases = alias_targets()
     expected = {
         "/usr/bin/wkictl": ("copy", "build/modules/wkictl/wkictl"),
-        "/usr/bin/locally": ("symlink", "/usr/bin/wkictl"),
-        "/usr/bin/remotely": ("symlink", "/usr/bin/wkictl"),
-        "/usr/bin/anywhere": ("symlink", "/usr/bin/wkictl"),
-        "/usr/bin/homeward": ("symlink", "/usr/bin/wkictl"),
-        "/usr/bin/on": ("symlink", "/usr/bin/wkictl"),
-        "/usr/bin/forward": ("symlink", "/usr/bin/wkictl"),
-        "/usr/bin/wosid": ("symlink", "/usr/bin/wkictl"),
+        "/usr/libexec/wki-run": ("copy", "build/modules/wkictl/wki-run"),
+        "/usr/bin/locally": ("symlink", "/usr/libexec/wki-run"),
+        "/usr/bin/remotely": ("symlink", "/usr/libexec/wki-run"),
+        "/usr/bin/anywhere": ("symlink", "/usr/libexec/wki-run"),
+        "/usr/bin/homeward": ("symlink", "/usr/libexec/wki-run"),
+        "/usr/bin/on": ("symlink", "/usr/libexec/wki-run"),
+        "/usr/bin/forward": ("symlink", "/usr/libexec/wki-run"),
+        "/usr/bin/wosid": ("symlink", "/usr/libexec/wki-run"),
     }
     for target, wanted in expected.items():
         if aliases.get(target) != wanted:
             fail(f"rootfs alias mismatch for {target}: got {aliases.get(target)!r}, expected {wanted!r}")
 
-    main_body = function_body(source, "run")
+    main_body = function_body(source, "run_launcher")
     require_tokens(
         main_body,
         [
@@ -102,10 +103,12 @@ def test_wkictl_installed_aliases_match_persona_dispatch() -> None:
             'std::strcmp(name, "on") == 0',
             'std::strcmp(name, "forward") == 0',
             'std::strcmp(name, "wosid") == 0',
-            "return run_wkictl(argc, argv)",
+            "return false",
         ],
         "wkictl basename dispatch",
     )
+    require_tokens(function_body(source, "run"), ["run_launcher(argc, argv, status)",
+                   "return status", "return run_wkictl(argc, argv)"], "full management dispatch")
 
 
 def test_external_coproc_preserves_argv_stdio_and_status() -> None:

@@ -8,13 +8,11 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
-#include <print>
 
 namespace wkictl {
 
 auto usage() -> int {
-    std::println(
-        stderr,
+    std::fputs(
         "usage:\n  locally <command> [args...]\n  remotely <command> [args...]\n  anywhere <command> [args...]\n  homeward "
         "<command> [args...]\n  on <hostname> "
         "<command> [args...]\n  forward "
@@ -24,13 +22,14 @@ auto usage() -> int {
         "<clear|disable|enable|heal|release|rule> [key=value ...]\n  wkictl chaos wait id=<u32> applied=<u32> "
         "timeout_ms=<1..300000>\n  chaos rule extras: op=<u16|*> corrupt=<checksum|payload> payload_offset=<u16> "
         "payload_xor=<nonzero-u8>\n  wkictl chaos-workload <strict-command> [key=value ...]\n  wkictl chaos-workload "
-        "compute-publish-wait waiters=1 timeout_ms=<1..300000>\n  wkictl wosid");
+        "compute-publish-wait waiters=1 timeout_ms=<1..300000>\n  wkictl wosid\n",
+        stderr);
     return 1;
 }
 
 auto exec_command(char** argv) -> int {
     execvp(argv[0], argv);
-    std::println(stderr, "{}: exec failed: {}", argv[0], std::strerror(errno));
+    std::fprintf(stderr, "%s: exec failed: %s\n", argv[0], std::strerror(errno));
     return 127;
 }
 

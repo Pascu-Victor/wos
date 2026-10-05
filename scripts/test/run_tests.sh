@@ -146,6 +146,7 @@ UNIT_TESTS=(
     strace_source_test
     journal_source_test
     wkictl_source_test
+    wki_launcher_runtime_test
     perf_source_test
     perf_capture_kernel_test
     perf_capture_io_test

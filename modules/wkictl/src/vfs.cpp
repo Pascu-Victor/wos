@@ -1,7 +1,6 @@
 #include "wkictl/vfs.hpp"
 
 #include <abi-bits/access.h>
-#include <glob.h>
 #include <sys/process.h>
 #include <sys/stat.h>
 #include <sys/vfs.h>
@@ -19,28 +18,7 @@
 
 namespace {
 
-auto has_glob_meta(const char* text) -> bool {
-    if (text == nullptr) {
-        return false;
-    }
-    for (const char* p = text; *p != '\0'; ++p) {
-        if (*p == '*' || *p == '?' || *p == '[') {
-            return true;
-        }
-    }
-    return false;
-}
-
-auto route_name(uint32_t route) -> const char* {
-    switch (route) {
-        case ker::abi::vfs::WKI_VFS_ROUTE_LOCAL:
-            return "local";
-        case ker::abi::vfs::WKI_VFS_ROUTE_HOST:
-            return "host";
-        default:
-            return "unknown";
-    }
-}
+using wkictl::route_name;
 
 auto parse_route(const char* text, uint32_t* out) -> bool {
     if (text == nullptr || out == nullptr) {
@@ -55,44 +33,6 @@ auto parse_route(const char* text, uint32_t* out) -> bool {
         return true;
     }
     return false;
-}
-
-auto add_forward_rule(const char* path, uint32_t route) -> bool {
-    int rc = ker::abi::vfs::wki_rule_add_vfs(path, route);
-    if (rc < 0) {
-        std::println(stderr, "forward: failed to add {} rule for '{}': {}", route_name(route), path, rc);
-        return false;
-    }
-    return true;
-}
-
-auto add_forward_operand(const char* operand, uint32_t route) -> bool {
-    if (operand == nullptr || operand[0] == '\0') {
-        std::println(stderr, "forward: empty VFS rule operand");
-        return false;
-    }
-
-    if (!has_glob_meta(operand)) {
-        return add_forward_rule(operand, route);
-    }
-
-    glob_t matches{};
-    int const GLOB_RC = glob(operand, 0, nullptr, &matches);
-    if (GLOB_RC != 0) {
-        globfree(&matches);
-        std::println(stderr, "forward: no matches for '{}'", operand);
-        return false;
-    }
-
-    bool ok = true;
-    for (std::size_t i = 0; i < matches.gl_pathc; ++i) {
-        if (!add_forward_rule(matches.gl_pathv[i], route)) {
-            ok = false;
-            break;
-        }
-    }
-    globfree(&matches);
-    return ok;
 }
 
 auto list_rules(bool defaults) -> int {
@@ -135,72 +75,6 @@ auto probe_path(const char* path) -> int {
 }  // namespace
 
 namespace wkictl {
-
-auto run_forward(int argc, char** argv) -> int {
-    int command_index = 1;
-    const char* target_policy = nullptr;
-    bool one_shot = false;
-    while (command_index < argc) {
-        if (std::strcmp(argv[command_index], "--clear") == 0) {
-            int const CLEAR_RC = ker::abi::vfs::wki_rule_clear_vfs();
-            if (CLEAR_RC < 0) {
-                std::println(stderr, "forward: failed to clear inherited VFS rules: {}", CLEAR_RC);
-                return 1;
-            }
-            command_index++;
-            continue;
-        }
-        if (std::strcmp(argv[command_index], "--target") == 0) {
-            if (++command_index >= argc) {
-                std::println(stderr, "forward: --target requires a placement policy");
-                return 1;
-            }
-            target_policy = argv[command_index++];
-            continue;
-        }
-        if (std::strcmp(argv[command_index], "--one-shot") == 0) {
-            one_shot = true;
-            command_index++;
-            continue;
-        }
-        break;
-    }
-
-    if (one_shot && target_policy == nullptr) {
-        std::println(stderr, "forward: --one-shot requires --target");
-        return 1;
-    }
-
-    for (; command_index < argc; ++command_index) {
-        const char* arg = argv[command_index];
-        if (std::strcmp(arg, "--") == 0) {
-            command_index++;
-            break;
-        }
-        if ((arg[0] != '+' && arg[0] != '-') || arg[1] == '\0') {
-            break;
-        }
-
-        uint32_t const ROUTE = arg[0] == '+' ? ker::abi::vfs::WKI_VFS_ROUTE_HOST : ker::abi::vfs::WKI_VFS_ROUTE_LOCAL;
-        if (!add_forward_operand(arg + 1, ROUTE)) {
-            return 1;
-        }
-    }
-
-    if (target_policy != nullptr) {
-        uint32_t const EXTRA_FLAGS = one_shot ? ker::process::WKI_TARGET_FLAG_ONESHOT : 0;
-        int64_t const TARGET_RC = set_target_policy(target_policy, EXTRA_FLAGS);
-        if (TARGET_RC < 0) {
-            std::println(stderr, "forward: failed to set '{}' placement policy: {}", target_policy, static_cast<long>(TARGET_RC));
-            return 1;
-        }
-    }
-
-    if (command_index >= argc) {
-        return usage();
-    }
-    return exec_command(argv + command_index);
-}
 
 auto handle_vfs(int argc, char** argv) -> int {
     if (argc < 3 || std::strcmp(argv[2], "list") == 0) {

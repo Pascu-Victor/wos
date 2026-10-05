@@ -322,6 +322,7 @@ set(WOS_USERSPACE_TARGETS
     journal
     journal_lib
     wkictl
+    wki_run
     powerctl
     servicectl
     renderbench
@@ -342,6 +343,7 @@ set(WOS_DYNAMIC_USERSPACE_EXECUTABLE_TARGETS
     memacc
     journal
     wkictl
+    wki_run
     powerctl
     servicectl
     renderbench
@@ -485,4 +487,4 @@ endif()
 
 # Aggregate target for all WOS modules
 add_custom_target(wos_modules)
-add_dependencies(wos_modules wos journal_lib init testprog testd netd httpd debugserver perf top memacc journal wkictl powerctl servicectl renderbench strace sftpserver)
+add_dependencies(wos_modules wos journal_lib init testprog testd netd httpd debugserver perf top memacc journal wkictl wki_run powerctl servicectl renderbench strace sftpserver)
