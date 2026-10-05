@@ -9,12 +9,14 @@ wos_asm_syscall_handler:
     ; Validate the kernel scratch stack before writing any syscall-entry state
     ; through %gs. If KERNEL_GS_BASE is stale, those writes corrupt whichever
     ; object %gs happens to point at and make the later fault look unrelated.
-    mov eax, dword [gs:0x04]
-    cmp eax, 0xffff8000
+    ; RAX still contains the userspace syscall selector.  Validate the high
+    ; half of the scratch pointer in memory so the selector survives until it
+    ; is saved below.
+    cmp dword [gs:0x04], 0xffff8000
     jb .bad_syscall_stack
-    cmp eax, 0xffff9000
+    cmp dword [gs:0x04], 0xffff9000
     jb .valid_syscall_gs
-    cmp eax, 0xfffffd00
+    cmp dword [gs:0x04], 0xfffffd00
     jne .bad_syscall_stack
 .valid_syscall_gs:
 
