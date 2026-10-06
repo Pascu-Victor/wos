@@ -19,6 +19,10 @@ Do not add new public scripts at the top level of this directory. Add the
 implementation under the appropriate category and expose it with a `bin/`
 symlink only if it is meant to be part of the user-facing command surface.
 
+For block request, AHCI, cache/swap and benchmark test targets, see
+[`docs/asynchronous_block_io.md`](../docs/asynchronous_block_io.md). It maps
+host/source/KTEST coverage and the separate native hardware acceptance gates.
+
 ## WOS self-host build benchmark
 
 `scripts/bench/run_wos_selfhost_build.sh` runs the clone/submodule/bootstrap/

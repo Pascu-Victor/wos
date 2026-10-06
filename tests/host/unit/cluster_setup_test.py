@@ -1630,9 +1630,38 @@ def test_ivshmem_modes_share_the_node_launcher(module) -> None:
         node.prepare_node_overlays, node.cleanup_node_logs = old_prepare, old_cleanup
 
 
+def test_disk_cache_modes_are_validated_before_disk_work(module) -> None:
+    node = module.node_setup
+    old_prepare, old_cleanup = node.prepare_node_overlays, node.cleanup_node_logs
+    node.prepare_node_overlays = lambda _spec, log=print: (Path("disk0-overlay"), Path("disk1-overlay"))
+    node.cleanup_node_logs = lambda _spec: None
+    try:
+        for mode in ("unsafe", "writeback", "none", "writethrough", "directsync"):
+            args = node.build_qemu_args({"vm": {"disk_cache": mode}}, log=lambda _line: None)
+            drives = [args[i + 1] for i, value in enumerate(args[:-1]) if value == "-drive"]
+            assert_equal(len(drives), 2, "both private disks are configured")
+            assert_equal(all(f"cache={mode}" in drive.split(",") for drive in drives), True, "exact disk cache mode")
+            config = node.cluster_config_from_node_spec({"vm": {"disk_cache": mode}})
+            assert_equal(config["zones"][0]["vm"]["disk_cache"], mode, "single-node conversion preserves cache mode")
+        args = node.build_qemu_args({}, log=lambda _line: None)
+        drives = [args[i + 1] for i, value in enumerate(args[:-1]) if value == "-drive"]
+        assert_equal(all("cache=unsafe" in drive.split(",") for drive in drives), True, "existing default is preserved")
+        node.prepare_node_overlays = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("invalid cache mode touched disks"))
+        for mode in (None, True, 1, "", "off", "writeback,readonly=on"):
+            try:
+                node.build_qemu_args({"vm": {"disk_cache": mode}}, log=lambda _line: None)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"invalid disk cache mode accepted: {mode!r}")
+    finally:
+        node.prepare_node_overlays, node.cleanup_node_logs = old_prepare, old_cleanup
+
+
 def main() -> None:
     module = load_module()
     tests = [
+        test_disk_cache_modes_are_validated_before_disk_work,
         test_ivshmem_modes_share_the_node_launcher,
         test_node_cpu_model_override_is_exact,
         test_iommu_option_is_explicit_and_validated_before_disk_work,

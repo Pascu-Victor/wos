@@ -64,6 +64,9 @@ struct XfsTransBufUndo {
     uint8_t* before_image{};
     size_t size{};
     bool journal_held{};
+#ifdef WOS_ASYNC_BLOCK_IO
+    bool before_image_page_allocated{};
+#endif
     XfsTransBufUndo* next{};
 };
 

@@ -96,7 +96,7 @@ err()   { printf '\033[1;31m==>\033[0m %s\n' "$*" >&2; }
 
 timestamp() { date '+%Y-%m-%d_%H%M%S'; }
 
-FUZZ_TARGETS=(wki_wire_fuzz data_struct_fuzz tcp_fuzz tcp_sender_fuzz xfs_format_fuzz wki_routing_fuzz slab_fuzz telemetry_fuzz perf_data_fuzz)
+FUZZ_TARGETS=(wki_wire_fuzz data_struct_fuzz tcp_fuzz tcp_sender_fuzz xfs_format_fuzz wki_routing_fuzz slab_fuzz telemetry_fuzz perf_data_fuzz block_request_model_fuzz dmar_fuzz pci_ecam_fuzz)
 UNIT_TESTS=(
     credential_model_test
     credential_policy_audit_test
@@ -171,6 +171,9 @@ UNIT_TESTS=(
     virtio_net_source_test
     block_device_source_test
     buffer_cache_source_test
+    buffer_cache_allocation_runtime_test
+    xfs_undo_allocation_runtime_test
+    block_read_arbiter_test
     udp_bind_device_source_test
     mlibc_dns_source_test
     mlibc_allocator_source_test
@@ -347,6 +350,65 @@ UNIT_TESTS=(
     thread_stack_pressure_test
     vmem_cache_perf_runtime_test
     wki_submit_phase_test
+    acpi_bounded_test
+    ahci_async_integration_test
+    ahci_async_test
+    ahci_controller_init_integration_test
+    vfs_metadata_batch_runtime_test
+    ahci_dma_test
+    ahci_lifecycle_test
+    block_device_registry_test
+    block_qualification_test
+    block_request_fault_test
+    block_request_model_test
+    block_request_runtime_test
+    block_worker_runtime_test
+    block_wait_poll_predicate_test
+    block_wait_diagnostics_test
+    blockbench_io_test
+    blockbench_mmap_io_test
+    clockevent_test
+    clocksource_policy_test
+    device_registry_test
+    dma_manager_test
+    dmar_test
+    e1000_dma_source_test
+    e1000_dma_test
+    file_content_match_test
+    init_session_runtime_test
+    interval_timer_model_test
+    iommu_groups_test
+    iommu_reserved_test
+    iommu_scopes_test
+    ivshmem_pci_test
+    ivshmem_ring_test
+    lazy_file_fault_runtime_test
+    netd_resolver_test
+    pci_ecam_test
+    reclaim_runtime_test
+    shutdown_ownership_test
+    stack_resume_source_test
+    stack_resume_test
+    swap_async_test
+    time_abi_math_test
+    time_arithmetic_test
+    timer_queue_test
+    virtio_dma_test
+    virtio_lifecycle_test
+    virtio_platform_test
+    virtqueue_dma_test
+    vtd_activation_test
+    vtd_capability_test
+    vtd_fault_test
+    vtd_model_test
+    vtd_page_table_test
+    wall_clock_test
+    workqueue_runtime_test
+    xhci_dma_test
+    xfs_log_clean_runtime_test
+    xfs_read_compiled_test
+    xfs_read_runtime_test
+    xfs_read_disabled_runtime_test
 )
 
 list_targets() {

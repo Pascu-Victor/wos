@@ -48,6 +48,8 @@ struct ProxyBlockState {
     // Once the bdev is published, external holders may retain bdev/private_data
     // indefinitely. Published state is therefore retired in place, never erased.
     bool ever_published = false;
+    // Configured queues retain provider identity even if final attach fails.
+    bool async_configured = false;
     bool epoch_reset_pending = false;
     bool cleanup_in_progress = false;
     bool resume_pending = false;

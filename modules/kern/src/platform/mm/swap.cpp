@@ -7,6 +7,7 @@
 #include <cstring>
 #include <dev/block_device.hpp>
 #include <platform/mm/paging.hpp>
+#include <platform/sched/scheduler.hpp>
 #include <platform/sys/mutex.hpp>
 #include <util/crc32c.hpp>
 #include <util/smallvec.hpp>
@@ -47,6 +48,7 @@ struct SwapArea {
     uint64_t free_pages{};
     uint64_t used_pages{};
     AreaState state = AreaState::ACTIVE;
+    uint64_t io_in_flight{};
     ker::vfs::File* backing_file{};
 };
 
@@ -329,7 +331,7 @@ auto swapoff_path(const char* path) -> int {
             if (area == nullptr || area->id != area_id) {
                 continue;
             }
-            if (migration_ret < 0 || area->used_pages != 0) {
+            if (migration_ret < 0 || area->used_pages != 0 || area->io_in_flight != 0) {
                 area->state = AreaState::ACTIVE;
                 return migration_ret < 0 ? migration_ret : -EBUSY;
             }
@@ -411,94 +413,114 @@ auto free_slot(SwapSlot slot) -> int {
     return 0;
 }
 
-auto write_slot(SwapSlot slot, const void* page) -> int {
-    if (!slot_valid(slot) || page == nullptr) {
-        return -EINVAL;
-    }
+auto submit_slot_io(SlotIo& io, SwapSlot slot, void* page, bool write) -> int {
+    if (!slot_valid(slot) || page == nullptr || io.active || io.request.queue != nullptr) return -EINVAL;
     SwapExtent extent{};
+    uint32_t checksum = 0;
+    SlotState previous_state{};
+    uint32_t previous_checksum = 0;
     {
-        ker::mod::sys::MutexGuard guard(g_swap_lock);
+        ker::mod::sys::MutexGuard const GUARD(g_swap_lock);
         auto* area = find_area_locked(slot.area);
         SlotMetadata* metadata = nullptr;
-        int const LOOKUP_RET = slot_metadata_locked(area, slot, &metadata);
-        if (LOOKUP_RET < 0) {
-            return LOOKUP_RET;
+        int const LOOKUP = slot_metadata_locked(area, slot, &metadata);
+        if (LOOKUP < 0) return LOOKUP;
+        if (metadata->io_in_flight) return -EBUSY;
+        if (!write && metadata->state != SlotState::STORED) return -ENODATA;
+        if (!slot_to_extent_locked(area, slot.index, &extent)) return -EIO;
+        if (area->io_in_flight == UINT64_MAX) return -EOVERFLOW;
+        previous_state = metadata->state;
+        previous_checksum = metadata->checksum;
+        if (write) {
+            metadata->state = SlotState::RESERVED;
+            metadata->checksum = 0;
+        } else {
+            checksum = metadata->checksum;
         }
-        if (metadata->io_in_flight) {
-            return -EBUSY;
-        }
-        if (!slot_to_extent_locked(area, slot.index, &extent)) {
-            return -EIO;
-        }
-        metadata->state = SlotState::RESERVED;
-        metadata->checksum = 0;
         metadata->io_in_flight = true;
+        ++area->io_in_flight;
     }
-    uint32_t const CHECKSUM = ker::util::crc32c_compute(page, PAGE_SIZE);
+    io.slot = slot;
+    io.page = page;
+    io.device = extent.device;
+    io.write = write;
+    io.checksum = write ? ker::util::crc32c_compute(page, PAGE_SIZE) : checksum;
+    io.active = true;
+    io.asynchronous = ker::dev::block_queue_available(extent.device);
     size_t const BLOCKS = PAGE_SIZE / extent.device->block_size;
-    int const RET = ker::dev::block_write(extent.device, extent.start_block, BLOCKS, page);
-    {
-        ker::mod::sys::MutexGuard guard(g_swap_lock);
-        auto* area = find_area_locked(slot.area);
-        SlotMetadata* metadata = nullptr;
-        int const LOOKUP_RET = slot_metadata_locked(area, slot, &metadata);
-        if (LOOKUP_RET < 0 || !metadata->io_in_flight) {
-            return LOOKUP_RET < 0 ? LOOKUP_RET : -EIO;
+    if (io.asynchronous) {
+        ker::dev::BlockSegment const SEGMENT{page, PAGE_SIZE};
+        int const RESULT = ker::dev::block_request_submit(
+            extent.device, io.request, write ? ker::dev::BlockRequestOperation::WRITE : ker::dev::BlockRequestOperation::READ,
+            extent.start_block, BLOCKS, {&SEGMENT, 1});
+        if (RESULT != 0) {
+            ker::mod::sys::MutexGuard const GUARD(g_swap_lock);
+            auto* area = find_area_locked(slot.area);
+            SlotMetadata* metadata = nullptr;
+            int const LOOKUP = slot_metadata_locked(area, slot, &metadata);
+            if (LOOKUP == 0 && metadata->io_in_flight) {
+                metadata->io_in_flight = false;
+                --area->io_in_flight;
+                metadata->state = previous_state;
+                metadata->checksum = previous_checksum;
+            }
+            io.active = false;
+            return RESULT;
         }
+    } else {
+        io.backend_status = write ? ker::dev::block_write(extent.device, extent.start_block, BLOCKS, page)
+                                  : ker::dev::block_read(extent.device, extent.start_block, BLOCKS, page);
+    }
+    return 0;
+}
+
+auto finish_slot_io(SlotIo& io) -> int {
+    if (!io.active) return -EINVAL;
+    int result = io.backend_status;
+    if (io.asynchronous) {
+        result = ker::dev::block_request_wait(io.request);
+        int const RELEASE = ker::dev::block_request_release(io.request);
+        if (result == 0) result = RELEASE;
+    }
+    if (!io.write && result == 0 && ker::util::crc32c_compute(io.page, PAGE_SIZE) != io.checksum) result = -EILSEQ;
+    if (!io.write && result != 0) std::memset(io.page, 0, PAGE_SIZE);
+    {
+        ker::mod::sys::MutexGuard const GUARD(g_swap_lock);
+        auto* area = find_area_locked(io.slot.area);
+        SlotMetadata* metadata = nullptr;
+        int const LOOKUP = slot_metadata_locked(area, io.slot, &metadata);
+        if (LOOKUP < 0 || !metadata->io_in_flight) return LOOKUP < 0 ? LOOKUP : -EIO;
         metadata->io_in_flight = false;
-        if (RET == 0) {
-            metadata->checksum = CHECKSUM;
+        --area->io_in_flight;
+        if (io.write && result == 0) {
+            metadata->checksum = io.checksum;
             metadata->state = SlotState::STORED;
         }
+        io.active = false;
     }
-    return RET;
+    return result;
+}
+
+auto write_slot(SwapSlot slot, const void* page) -> int {
+    auto const HOLD = ker::mod::sched::hold_kernel_shutdown();
+    SlotIo io;
+    int result = 0;
+    do {
+        result = submit_slot_io(io, slot, const_cast<void*>(page), true);
+        if (result == -EAGAIN) ker::dev::block_queue_wait_for_capacity(io.device);
+    } while (result == -EAGAIN);
+    return result == 0 ? finish_slot_io(io) : result;
 }
 
 auto read_slot(SwapSlot slot, void* page) -> int {
-    if (!slot_valid(slot) || page == nullptr) {
-        return -EINVAL;
-    }
-    SwapExtent extent{};
-    uint32_t expected_checksum = 0;
-    {
-        ker::mod::sys::MutexGuard guard(g_swap_lock);
-        auto* area = find_area_locked(slot.area);
-        SlotMetadata* metadata = nullptr;
-        int const LOOKUP_RET = slot_metadata_locked(area, slot, &metadata);
-        if (LOOKUP_RET < 0) {
-            return LOOKUP_RET;
-        }
-        if (metadata->state != SlotState::STORED) {
-            return -ENODATA;
-        }
-        if (metadata->io_in_flight) {
-            return -EBUSY;
-        }
-        if (!slot_to_extent_locked(area, slot.index, &extent)) {
-            return -EIO;
-        }
-        expected_checksum = metadata->checksum;
-        metadata->io_in_flight = true;
-    }
-    size_t const BLOCKS = PAGE_SIZE / extent.device->block_size;
-    int ret = ker::dev::block_read(extent.device, extent.start_block, BLOCKS, page);
-    if (ret == 0 && ker::util::crc32c_compute(page, PAGE_SIZE) != expected_checksum) {
-        ret = -EILSEQ;
-    }
-    if (ret < 0) {
-        std::memset(page, 0, PAGE_SIZE);
-    }
-    {
-        ker::mod::sys::MutexGuard guard(g_swap_lock);
-        auto* area = find_area_locked(slot.area);
-        SlotMetadata* metadata = nullptr;
-        int const LOOKUP_RET = slot_metadata_locked(area, slot, &metadata);
-        if (LOOKUP_RET < 0 || !metadata->io_in_flight) {
-            return LOOKUP_RET < 0 ? LOOKUP_RET : -EIO;
-        }
-        metadata->io_in_flight = false;
-    }
-    return ret;
+    auto const HOLD = ker::mod::sched::hold_kernel_shutdown();
+    SlotIo io;
+    int result = 0;
+    do {
+        result = submit_slot_io(io, slot, page, false);
+        if (result == -EAGAIN) ker::dev::block_queue_wait_for_capacity(io.device);
+    } while (result == -EAGAIN);
+    return result == 0 ? finish_slot_io(io) : result;
 }
 
 void get_stats(SwapStats* out) {

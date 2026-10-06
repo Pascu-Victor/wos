@@ -18327,6 +18327,19 @@ auto vfs_metadata_batch(ker::mod::sched::task::Task* task, MetadataBatchOperatio
         LookupHandle lookup{};
         int const resolve_result =
             vfs_acquire_lookup(task, AT_FDCWD, raw_path, INTENT, FOLLOW, false, true, &lookup, 3, false, &REQUEST_CREDENTIALS);
+        if (resolve_result == -ENOENT) {
+            // REMOVE and RENAME_SOURCE require an existing final entry. A
+            // missing local entry must still decline this remote-only API so
+            // callers can perform the scalar operation and handle its errno.
+            // STAT permits a missing final entry without executing a mutation;
+            // retain the original error unless it proves a local target.
+            LookupHandle capability_lookup{};
+            int const CAPABILITY_RESULT = vfs_acquire_lookup(task, AT_FDCWD, raw_path, LookupIntent::STAT, FOLLOW, false, true,
+                                                             &capability_lookup, 3, false, &REQUEST_CREDENTIALS);
+            if (CAPABILITY_RESULT == 0 && capability_lookup.mount()->fs_type != FSType::REMOTE) {
+                return -EOPNOTSUPP;
+            }
+        }
         if (resolve_result == 0) {
             if (lookup.mount()->fs_type != FSType::REMOTE || lookup.dirfd_anchor() != nullptr) return -EOPNOTSUPP;
             *resolved_len = lookup.path_length();

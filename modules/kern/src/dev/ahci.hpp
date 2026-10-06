@@ -335,6 +335,35 @@ struct AHCIDevice {
     uint64_t total_sectors{};
 };
 
+struct AhciAsyncSnapshot {
+    uint64_t submitted{};
+    uint64_t completed{};
+    uint64_t timeouts{};
+    uint64_t resets{};
+    uint64_t quarantines{};
+    size_t active{};
+    size_t high_water{};
+    size_t hardware_active{};
+    size_t hardware_high_water{};
+    size_t depth{1};
+    uint32_t current_ci{};
+    uint32_t current_sact{};
+    uint32_t hba_cap{};
+    uint16_t identify_queue_depth{};
+    uint16_t identify_sata_caps{};
+    uint16_t identify_command_sets{};
+    uint8_t port{};
+    bool ncq{};
+    bool offline{};
+};
+// Task/boot diagnostics; snapshots never authorize DMA or extend ownership.
+auto ahci_async_snapshot(BlockDevice*, AhciAsyncSnapshot&) -> bool;
+#ifdef WOS_SELFTEST
+enum class SelftestAsyncFault : uint8_t { none, timeout, taskfile, stop, reset };
+// One-shot fault consumed by native service with at least one admitted slot.
+auto selftest_inject_async_fault(BlockDevice*, SelftestAsyncFault) -> bool;
+#endif
+
 #ifdef WOS_SELFTEST
 // Boot-only failure injection before the controller has been discovered.
 void selftest_limit_probe_allocations(size_t count);

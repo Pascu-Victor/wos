@@ -51,11 +51,212 @@ wos_add_unit_test(ahci_lifecycle_test
 wos_add_unit_test(ahci_dma_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/ahci_dma_test.cpp
 )
+wos_add_unit_test(ahci_async_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/ahci_async_test.cpp
+)
+wos_add_unit_test(block_request_model_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/block_request_model_test.cpp
+)
+wos_add_unit_test(block_request_fault_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/block_request_fault_test.cpp
+)
+wos_add_unit_test(block_request_runtime_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/block_request_runtime_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/dev/block_request.cpp
+                 ${WOS_KERN_SRC}/platform/mm/reclaim.cpp
+)
+target_include_directories(block_request_runtime_test BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit/block_request_runtime_shim)
+set_tests_properties(block_request_runtime_test PROPERTIES TIMEOUT 60)
+wos_add_unit_test(swap_async_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/swap_async_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/platform/mm/swap.cpp
+                 ${WOS_KERN_SRC}/dev/block_request.cpp
+                 ${WOS_KERN_SRC}/util/crc32c.cpp
+                 ${WOS_KERN_SRC}/platform/mm/reclaim.cpp
+)
+target_include_directories(swap_async_test BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit/swap_async_shim
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit/block_request_runtime_shim
+)
+set_tests_properties(swap_async_test PROPERTIES TIMEOUT 60)
+wos_add_unit_test(workqueue_runtime_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/workqueue_runtime_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/platform/sched/workqueue.cpp
+)
+target_include_directories(workqueue_runtime_test BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit/workqueue_runtime_shim
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit/block_request_runtime_shim
+)
+set_tests_properties(workqueue_runtime_test PROPERTIES TIMEOUT 60)
+wos_add_unit_test(reclaim_runtime_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/reclaim_runtime_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/platform/mm/reclaim.cpp
+)
+target_include_directories(reclaim_runtime_test BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit/block_request_runtime_shim
+)
+wos_add_unit_test(block_worker_runtime_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/block_worker_runtime_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/dev/block_request.cpp
+                 ${WOS_KERN_SRC}/platform/mm/reclaim.cpp
+)
+target_include_directories(block_worker_runtime_test BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit/block_worker_shim
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit/block_request_runtime_shim
+)
+set_tests_properties(block_worker_runtime_test PROPERTIES TIMEOUT 60)
+wos_add_fuzz_target(block_request_model_fuzz
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/block_request_model_fuzz.cpp
+)
 # ---------------------------------------------------------------------------
 # Unit tests
 # ---------------------------------------------------------------------------
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME block_wait_poll_predicate_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/block_wait_poll_predicate_test.py
+)
+set_tests_properties(block_wait_poll_predicate_test PROPERTIES
+    LABELS "host;unit;source;integration" TIMEOUT 60
+    ENVIRONMENT "TMPDIR=${WOS_ROOT}/build/goal30-tmp"
+)
+if(WOS_HOST_TEST_DISABLE_LSAN)
+    set_property(TEST block_wait_poll_predicate_test APPEND PROPERTY ENVIRONMENT
+        "ASAN_OPTIONS=detect_leaks=0" "LSAN_OPTIONS=detect_leaks=0")
+endif()
+add_test(NAME block_wait_diagnostics_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/block_wait_diagnostics_test.py
+)
+set_tests_properties(block_wait_diagnostics_test PROPERTIES
+    LABELS "host;unit;source;integration" TIMEOUT 60
+    ENVIRONMENT "TMPDIR=${WOS_ROOT}/build/goal30-tmp"
+)
+if(WOS_HOST_TEST_DISABLE_LSAN)
+    set_property(TEST block_wait_diagnostics_test APPEND PROPERTY ENVIRONMENT
+        "ASAN_OPTIONS=detect_leaks=0" "LSAN_OPTIONS=detect_leaks=0")
+endif()
+add_test(NAME xfs_read_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_read_runtime_test.py
+        --host-build ${CMAKE_BINARY_DIR}
+        --gtest-main $<TARGET_FILE:gtest_main> --gtest-lib $<TARGET_FILE:gtest>
+)
+add_test(NAME xfs_read_disabled_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_read_runtime_test.py
+        --host-build ${CMAKE_BINARY_DIR}
+        --gtest-main $<TARGET_FILE:gtest_main> --gtest-lib $<TARGET_FILE:gtest>
+        --disabled
+)
+set_tests_properties(xfs_read_runtime_test xfs_read_disabled_runtime_test PROPERTIES
+    LABELS "host;unit;source;integration" TIMEOUT 60
+    ENVIRONMENT "TMPDIR=${WOS_ROOT}/build/goal30-tmp"
+)
+if(WOS_HOST_TEST_DISABLE_LSAN)
+    set_property(TEST xfs_read_runtime_test xfs_read_disabled_runtime_test APPEND PROPERTY ENVIRONMENT
+        "ASAN_OPTIONS=detect_leaks=0" "LSAN_OPTIONS=detect_leaks=0")
+endif()
+set(XFS_READ_RUNTIME_DIR "${CMAKE_CURRENT_BINARY_DIR}/xfs_read_runtime")
+set(XFS_READ_RUNTIME_INC "${XFS_READ_RUNTIME_DIR}/actual_xfs_read.inc")
+add_custom_command(
+    OUTPUT ${XFS_READ_RUNTIME_INC}
+           ${XFS_READ_RUNTIME_DIR}/platform/perf/perf_events.hpp
+           ${XFS_READ_RUNTIME_DIR}/platform/mm/phys.hpp
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_read_runtime_test.py
+        --generate-only ${XFS_READ_RUNTIME_DIR}
+    DEPENDS
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_read_runtime_test.py
+        ${WOS_KERN_SRC}/vfs/fs/xfs/xfs_vfs.cpp
+        ${WOS_KERN_SRC}/platform/perf/perf_events.hpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/kern_shim/platform/perf/perf_events.hpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/buffer_cache_async_shim/platform/mm/phys.hpp
+    VERBATIM
+)
+wos_add_unit_test(xfs_read_compiled_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_read_runtime_test.cpp
+            ${XFS_READ_RUNTIME_INC}
+    KERN_SOURCES ${WOS_KERN_SRC}/vfs/buffer_cache.cpp
+)
+target_include_directories(xfs_read_compiled_test BEFORE PRIVATE
+    ${XFS_READ_RUNTIME_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_read_runtime_shim
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit/buffer_cache_async_shim
+)
+target_compile_definitions(xfs_read_compiled_test PRIVATE WOS_HOST_TEST=1 WOS_ASYNC_BLOCK_IO=1)
+target_compile_options(xfs_read_compiled_test PRIVATE -ffunction-sections -fdata-sections)
+target_link_options(xfs_read_compiled_test PRIVATE -Wl,--gc-sections)
+set_tests_properties(xfs_read_compiled_test PROPERTIES
+    TIMEOUT 60 LABELS "host;unit;source;integration"
+)
+add_test(NAME lazy_file_fault_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/lazy_file_fault_runtime_test.py
+)
+set_tests_properties(lazy_file_fault_runtime_test PROPERTIES
+    LABELS "host;source;integration" TIMEOUT 60
+    ENVIRONMENT "TMPDIR=${WOS_ROOT}/build/goal30-tmp"
+)
+if(WOS_HOST_TEST_DISABLE_LSAN)
+    set_property(TEST lazy_file_fault_runtime_test APPEND PROPERTY ENVIRONMENT
+        "ASAN_OPTIONS=detect_leaks=0" "LSAN_OPTIONS=detect_leaks=0")
+endif()
+add_test(NAME ahci_async_integration_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/ahci_async_integration_test.py
+)
+set_tests_properties(ahci_async_integration_test PROPERTIES
+    LABELS "host;source;integration" TIMEOUT 60
+    ENVIRONMENT "TMPDIR=${WOS_ROOT}/build/goal30-tmp"
+)
+if(WOS_HOST_TEST_DISABLE_LSAN)
+    set_property(TEST ahci_async_integration_test APPEND PROPERTY ENVIRONMENT
+        "ASAN_OPTIONS=detect_leaks=0" "LSAN_OPTIONS=detect_leaks=0")
+endif()
+add_test(NAME ahci_controller_init_integration_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/ahci_controller_init_integration_test.py
+)
+set_tests_properties(ahci_controller_init_integration_test PROPERTIES
+    LABELS "host;source;integration" TIMEOUT 60
+    ENVIRONMENT "TMPDIR=${WOS_ROOT}/build/goal30-tmp"
+)
+if(WOS_HOST_TEST_DISABLE_LSAN)
+    set_property(TEST ahci_controller_init_integration_test APPEND PROPERTY ENVIRONMENT
+        "ASAN_OPTIONS=detect_leaks=0" "LSAN_OPTIONS=detect_leaks=0")
+endif()
+add_test(NAME blockbench_io_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/blockbench_io_test.py
+)
+set_tests_properties(blockbench_io_test PROPERTIES
+    LABELS "host;source;integration" TIMEOUT 60
+    ENVIRONMENT "TMPDIR=${WOS_ROOT}/build/goal30-tmp"
+)
+if(WOS_HOST_TEST_DISABLE_LSAN)
+    set_property(TEST blockbench_io_test APPEND PROPERTY ENVIRONMENT
+        "ASAN_OPTIONS=detect_leaks=0" "LSAN_OPTIONS=detect_leaks=0")
+endif()
+add_test(NAME blockbench_mmap_io_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/blockbench_mmap_io_test.py
+)
+set_tests_properties(blockbench_mmap_io_test PROPERTIES
+    LABELS "host;source;integration" TIMEOUT 60
+    ENVIRONMENT "TMPDIR=${WOS_ROOT}/build/goal30-tmp"
+)
+if(WOS_HOST_TEST_DISABLE_LSAN)
+    set_property(TEST blockbench_mmap_io_test APPEND PROPERTY ENVIRONMENT
+        "ASAN_OPTIONS=detect_leaks=0" "LSAN_OPTIONS=detect_leaks=0")
+endif()
+add_test(NAME block_qualification_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/block_qualification_test.py
+)
+set_tests_properties(block_qualification_test PROPERTIES LABELS "host;source")
+add_test(NAME vfs_metadata_batch_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/vfs_metadata_batch_runtime_test.py
+)
+set_tests_properties(vfs_metadata_batch_runtime_test PROPERTIES
+    LABELS "host;source;integration" TIMEOUT 60
+    ENVIRONMENT "TMPDIR=${WOS_ROOT}/build/goal30-tmp"
+)
+if(WOS_HOST_TEST_DISABLE_LSAN)
+    set_property(TEST vfs_metadata_batch_runtime_test APPEND PROPERTY ENVIRONMENT
+        "ASAN_OPTIONS=detect_leaks=0" "LSAN_OPTIONS=detect_leaks=0")
+endif()
 
 wos_add_unit_test(dmar_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/dmar_test.cpp
@@ -400,6 +601,42 @@ add_test(
     NAME buffer_cache_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/buffer_cache_source_test.py
 )
+add_test(
+    NAME buffer_cache_allocation_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/buffer_cache_allocation_runtime_test.py
+)
+set_tests_properties(buffer_cache_allocation_runtime_test PROPERTIES
+    LABELS "host;unit;source;integration" TIMEOUT 60
+    ENVIRONMENT "TMPDIR=${WOS_ROOT}/build/goal30-tmp"
+)
+if(WOS_HOST_TEST_DISABLE_LSAN)
+    set_property(TEST buffer_cache_allocation_runtime_test APPEND PROPERTY ENVIRONMENT
+        "ASAN_OPTIONS=detect_leaks=0" "LSAN_OPTIONS=detect_leaks=0")
+endif()
+add_test(
+    NAME xfs_undo_allocation_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_undo_allocation_runtime_test.py
+)
+set_tests_properties(xfs_undo_allocation_runtime_test PROPERTIES
+    LABELS "host;unit;source;integration" TIMEOUT 90
+    ENVIRONMENT "TMPDIR=${WOS_ROOT}/build/goal30-tmp"
+)
+if(WOS_HOST_TEST_DISABLE_LSAN)
+    set_property(TEST xfs_undo_allocation_runtime_test APPEND PROPERTY ENVIRONMENT
+        "ASAN_OPTIONS=detect_leaks=0" "LSAN_OPTIONS=detect_leaks=0")
+endif()
+add_test(
+    NAME block_read_arbiter_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/block_read_arbiter_test.py
+)
+set_tests_properties(block_read_arbiter_test PROPERTIES
+    LABELS "host;unit;source;integration" TIMEOUT 90
+    ENVIRONMENT "TMPDIR=${WOS_ROOT}/build/goal30-tmp"
+)
+if(WOS_HOST_TEST_DISABLE_LSAN)
+    set_property(TEST block_read_arbiter_test APPEND PROPERTY ENVIRONMENT
+        "ASAN_OPTIONS=detect_leaks=0" "LSAN_OPTIONS=detect_leaks=0")
+endif()
 add_test(
     NAME kernel_vmap_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/kernel_vmap_source_test.py
@@ -1238,6 +1475,32 @@ wos_add_unit_test(xfs_log_codec_test
                  ${WOS_KERN_SRC}/util/crc32c.cpp
 )
 
+set(XFS_LOG_CLEAN_RUNTIME_INC "${CMAKE_CURRENT_BINARY_DIR}/xfs_log_clean_runtime.inc")
+add_custom_command(
+    OUTPUT ${XFS_LOG_CLEAN_RUNTIME_INC}
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/extract_xfs_log_clean_runtime.py
+        --output ${XFS_LOG_CLEAN_RUNTIME_INC}
+    DEPENDS
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/extract_xfs_log_clean_runtime.py
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/exec_trace_ownership_test.py
+        ${WOS_KERN_SRC}/vfs/fs/xfs/xfs_log.cpp
+    VERBATIM
+)
+wos_add_unit_test(xfs_log_clean_runtime_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_log_clean_runtime_test.cpp
+            ${XFS_LOG_CLEAN_RUNTIME_INC}
+    KERN_SOURCES ${WOS_KERN_SRC}/vfs/fs/xfs/xfs_log_codec.cpp
+                 ${WOS_KERN_SRC}/util/crc32c.cpp
+)
+target_include_directories(xfs_log_clean_runtime_test BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_log_clean_runtime_shim
+    ${CMAKE_CURRENT_BINARY_DIR}
+)
+set_tests_properties(xfs_log_clean_runtime_test PROPERTIES
+    TIMEOUT 60 LABELS "host;unit;source;integration"
+)
+
 wos_add_unit_test(wki_channel_test
     SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_channel_test.cpp
     KERN_SOURCES ${WOS_KERN_SRC}/net/wki/channel.cpp
@@ -1323,9 +1586,11 @@ wos_add_unit_test(crc32c_test
 
 wos_add_unit_test(buffer_cache_test
     SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/buffer_cache_test.cpp
+                 ${CMAKE_CURRENT_SOURCE_DIR}/unit/buffer_cache_async_test.cpp
     KERN_SOURCES ${WOS_KERN_SRC}/vfs/buffer_cache.cpp
 )
 target_compile_definitions(buffer_cache_test PRIVATE WOS_HOST_TEST=1)
+target_include_directories(buffer_cache_test BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit/buffer_cache_async_shim)
 
 wos_add_unit_test(physical_balance_test
     SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/physical_balance_test.cpp

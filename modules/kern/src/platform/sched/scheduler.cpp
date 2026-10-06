@@ -4440,6 +4440,13 @@ auto hold_kernel_shutdown() -> KernelShutdownHold {
     return KernelShutdownHold(owner != nullptr ? &owner->kernel_shutdown_ownership : nullptr);
 }
 
+[[noreturn]] void exit_current_kernel_thread() {
+    ker::syscall::process::wos_proc_exit(0);
+    for (;;) {
+        asm volatile("cli\n\thlt" ::: "memory");
+    }
+}
+
 void maybe_exit_current_kernel_thread_for_shutdown() {
     if (!kernel_threads_shutdown_requested()) {
         return;

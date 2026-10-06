@@ -96,6 +96,9 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no, BufferReadClass read_class
 // `count` blocks starting at `block_no` are read. The returned buffer's `size`
 // field reflects the total byte count (count * block_size).
 // Returns nullptr on I/O error.
+// Native queues split a cold demand span into at most eight retained requests.
+// Every request/callback retires before publication; returned data is valid and
+// includes newer dirty aliases. Mapping owners keep their lock across this call.
 auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count, BufferReadClass read_class = BufferReadClass::GENERIC)
     -> BufHead*;
 

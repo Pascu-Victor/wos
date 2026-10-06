@@ -23,6 +23,7 @@ include_directories(
 set(SOURCES
     src/aslr_hardening.cpp
     src/asan_crasher.cpp
+    src/blockbench.cpp
     src/cowbench.cpp
     src/credentials.cpp
     src/fsbench.cpp
@@ -34,6 +35,7 @@ set(SOURCES
     src/perfbench.cpp
     src/resource_limits.cpp
     src/thread_exit_stress.cpp
+    src/tests/blockbench_mmap.cpp
     src/usercopy_negative.cpp
     src/wki_chaos_workload.cpp
     src/xattr_matrix.cpp

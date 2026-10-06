@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <dev/ahci.hpp>
+#include <dev/block_request.hpp>
 #include <dev/virtio/virtio_net.hpp>
 #include <minimalist_malloc/mini_malloc.hpp>
 #include <net/backlog.hpp>
@@ -138,6 +140,7 @@ constexpr auto diagnostic_access(ProcNodeType type) -> DiagnosticAccess {
         case ProcNodeType::KIPCSTAT_FILE:
         case ProcNodeType::WKI_NETDIAG_FILE:
         case ProcNodeType::WKI_NAPI_FILE:
+        case ProcNodeType::BLOCK_QUEUE_FILE:
         case ProcNodeType::WKI_PIPES_FILE:
         case ProcNodeType::MEMACC_PROCS_FILE:
         case ProcNodeType::MEMACC_DEAD_FILE:
@@ -221,6 +224,7 @@ enum class ProcRootReaddirIndex : uint8_t {
     WKI,
     MEMACC,
     TIMEKEEPING,
+    BLOCKQ,
     FIRST_PID,
 };
 
@@ -676,6 +680,14 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
         }
         // PID directories from active task list. Threads and WKI proxy tasks
         // stay hidden here; real threads are exposed under /proc/<pid>/task/<tid>.
+        if (count == proc_root_readdir_index(ProcRootReaddirIndex::BLOCKQ)) {
+            buf->d_ino = proc_root_readdir_index(ProcRootReaddirIndex::BLOCKQ);
+            buf->d_off = proc_root_readdir_next_index(ProcRootReaddirIndex::BLOCKQ);
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_REG;
+            std::memcpy(buf->d_name.data(), "blockq", 7);
+            return 0;
+        }
         size_t const PID_INDEX = count - proc_root_readdir_index(ProcRootReaddirIndex::FIRST_PID);
         auto* task = process_visible_task_at(PID_INDEX);
         if (task == nullptr) {
@@ -6502,6 +6514,97 @@ auto generate_version(char* buf, size_t bufsz) -> size_t {
 }
 
 // Procfs stores generated content in the File's private_data as ProcFileData.
+auto generate_blockq(char* buffer, size_t capacity) -> size_t {
+    constexpr size_t MAX_QUEUES = 64;
+    auto* rows = new (std::nothrow) ker::dev::BlockQueueSnapshot[MAX_QUEUES];
+    if (rows == nullptr) return 0;
+    size_t const COUNT = ker::dev::block_queue_snapshots({rows, MAX_QUEUES});
+    char* cursor = buffer;
+    char const* end = buffer + capacity - 1;
+    append_sconst(cursor, end, "blockq version=1 capacity=64 count=");
+    append_dec64(cursor, end, COUNT);
+    append_char(cursor, end, '\n');
+    for (size_t i = 0; i < COUNT; ++i) {
+        auto const& row = rows[i];
+        append_sconst(cursor, end, "device=");
+        append_sconst(cursor, end, row.name.data());
+        auto field = [&](const char* key, uint64_t value) {
+            append_char(cursor, end, ' ');
+            append_sconst(cursor, end, key);
+            append_char(cursor, end, '=');
+            append_dec64(cursor, end, value);
+        };
+        field("generation", row.generation);
+        field("open", row.admission_open);
+        field("async_open", row.async_admission_open);
+        field("worker", row.worker_present);
+        field("caller_driven", row.caller_driven);
+        field("depth", row.limits.depth);
+        field("owned", row.owned_requests);
+        field("owned_bytes", row.owned_bytes);
+        field("queued", row.queued);
+        field("inflight", row.issued);
+        field("inflight_bytes", row.issued_bytes);
+        field("completing", row.completing);
+        field("submitted", row.stats.submitted);
+        field("completed", row.stats.completed);
+        field("released", row.stats.released);
+        field("backpressure", row.stats.admission_rejections);
+        field("timeouts", row.stats.timeouts);
+        field("resets", row.stats.resets);
+        field("stale", row.stats.stale_completions);
+        field("flushes", row.flushes);
+        field("request_high", row.stats.request_high_water);
+        field("byte_high", row.stats.byte_high_water);
+        field("latency_us", row.latency_us);
+        field("max_latency_us", row.max_latency_us);
+#ifdef WOS_BLOCK_WAIT_DIAGNOSTICS
+        auto const& wait = row.wait_diagnostics;
+        field("wait_bursts", wait.bursts);
+        field("wait_completed", wait.completed);
+        field("wait_no_context", wait.no_context);
+        field("wait_mandatory_busy", wait.mandatory_busy);
+        field("wait_disallowed", wait.disallowed);
+        field("wait_clock_regression", wait.clock_regression);
+        field("wait_budget", wait.budget);
+        field("wait_deadline", wait.deadline);
+        field("wait_extra_busy", wait.extra_busy);
+        field("wait_count_cap", wait.count_cap);
+        field("wait_extra_passes", wait.extra_passes);
+        field("wait_count_cap_under_budget", wait.count_cap_under_budget);
+        field("wait_cap_elapsed_us", wait.cap_elapsed_us);
+        field("wait_cap_elapsed_max_us", wait.cap_elapsed_max_us);
+        field("wait_park_attempts", wait.park_attempts);
+#endif
+        ker::dev::ahci::AhciAsyncSnapshot hardware{};
+        if (ker::dev::ahci::ahci_async_snapshot(ker::dev::block_device_find_by_name(row.name.data()), hardware)) {
+            field("ahci_depth", hardware.depth);
+            field("ahci_ncq", hardware.ncq);
+            field("ahci_active", hardware.active);
+            field("ahci_high", hardware.high_water);
+            field("hardware_active", hardware.hardware_active);
+            field("hardware_high", hardware.hardware_high_water);
+            field("pxci", hardware.current_ci);
+            field("pxsact", hardware.current_sact);
+            field("hba_cap", hardware.hba_cap);
+            field("identify75", hardware.identify_queue_depth);
+            field("identify76", hardware.identify_sata_caps);
+            field("identify83", hardware.identify_command_sets);
+            field("ahci_resets", hardware.resets);
+            field("ahci_quarantines", hardware.quarantines);
+            field("ahci_offline", hardware.offline);
+        }
+        append_sconst(cursor, end, " latency_log2_us=");
+        for (size_t bucket = 0; bucket < row.latency_histogram.size(); ++bucket) {
+            if (bucket != 0) append_char(cursor, end, ',');
+            append_dec64(cursor, end, row.latency_histogram[bucket]);
+        }
+        append_char(cursor, end, '\n');
+    }
+    *cursor = '\0';
+    delete[] rows;
+    return static_cast<size_t>(cursor - buffer);
+}
 
 // --- FileOperations ---
 
@@ -6698,13 +6801,15 @@ auto procfs_read_with_credentials(const ker::mod::security::Snapshot& credential
     if (pfd->content == nullptr) {
         constexpr size_t MAX_PROCFS_BUF = 4096;
         constexpr size_t MAX_KPERF_BUF = 65536;  // 64 KiB for event streams
+        constexpr size_t MAX_BLOCKQ_BUF = 131072;
         constexpr size_t MAX_MEMACC_BUF = 262144;
         bool const IS_RUNTIME_MAP = pfd->node.type == ProcNodeType::MAPS_FILE || pfd->node.type == ProcNodeType::IMAGES_FILE;
         bool const IS_KPERF = (pfd->node.type == ProcNodeType::KPERF_FILE || pfd->node.type == ProcNodeType::KWKISTAT_FILE ||
                                pfd->node.type == ProcNodeType::KCPUSTAT_FILE || pfd->node.type == ProcNodeType::KCPUSTATE_FILE ||
                                pfd->node.type == ProcNodeType::KCONTSTAT_FILE || pfd->node.type == ProcNodeType::KIPCSTAT_FILE ||
                                pfd->node.type == ProcNodeType::WKI_NETDIAG_FILE || pfd->node.type == ProcNodeType::WKI_NAPI_FILE ||
-                               pfd->node.type == ProcNodeType::WKI_PIPES_FILE || pfd->node.type == ProcNodeType::CPU_STAT_FILE);
+                               pfd->node.type == ProcNodeType::WKI_PIPES_FILE || pfd->node.type == ProcNodeType::CPU_STAT_FILE ||
+                               pfd->node.type == ProcNodeType::BLOCK_QUEUE_FILE);
         bool const IS_LARGE_WKI = pfd->node.type == ProcNodeType::WKI_CHAOS_FILE;
         bool const IS_MEMACC =
             (pfd->node.type == ProcNodeType::MEMACC_SUMMARY_FILE || pfd->node.type == ProcNodeType::MEMACC_ZONES_FILE ||
@@ -6723,6 +6828,8 @@ auto procfs_read_with_credentials(const ker::mod::security::Snapshot& credential
             alloc_sz = MAX_WKI_NETDIAG_BUF;
         } else if (pfd->node.type == ProcNodeType::WKI_NAPI_FILE) {
             alloc_sz = MAX_WKI_NAPI_BUF;
+        } else if (pfd->node.type == ProcNodeType::BLOCK_QUEUE_FILE) {
+            alloc_sz = MAX_BLOCKQ_BUF;
         } else if (IS_MEMACC || IS_RUNTIME_MAP || IS_LARGE_WKI) {
             alloc_sz = MAX_MEMACC_BUF;
         } else if (IS_KPERF) {
@@ -6781,6 +6888,9 @@ auto procfs_read_with_credentials(const ker::mod::security::Snapshot& credential
                 break;
             case ProcNodeType::KCONTSTAT_FILE:
                 pfd->content_len = generate_kcontstat(pfd->content, MAX_KPERF_BUF);
+                break;
+            case ProcNodeType::BLOCK_QUEUE_FILE:
+                pfd->content_len = generate_blockq(pfd->content, MAX_BLOCKQ_BUF);
                 break;
             case ProcNodeType::KIPCSTAT_FILE:
                 pfd->content_len = generate_kipcstat(pfd->content, MAX_KPERF_BUF);
@@ -8097,6 +8207,8 @@ auto procfs_lookup_path_as(const char* path, uint64_t caller_pid, int flags, Pro
     }
 
     // /proc/kperfstatus - recording session, loss and consumer counters
+    if (strcmp(path, "blockq") == 0) return make_file(ProcNodeType::BLOCK_QUEUE_FILE, 0, false);
+
     if (strcmp(path, "kperfstatus") == 0) {
         return make_file(ProcNodeType::KPERFSTATUS_FILE, 0, false);
     }

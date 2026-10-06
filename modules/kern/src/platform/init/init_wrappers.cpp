@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <dev/ahci.hpp>
 #include <dev/block_device.hpp>
+#include <dev/block_request.hpp>
 #include <dev/console.hpp>
 #include <dev/device.hpp>
 #include <dev/e1000e/e1000e.hpp>
@@ -387,6 +388,11 @@ void sched_init() {
     mod::smt::start_smt(modules, get_kernel_rsp());
 }
 
-void kernel_start() { mod::sched::start_scheduler(); }
+void kernel_start() {
+#ifdef WOS_ASYNC_BLOCK_IO
+    dev::block_request_start_workers();
+#endif
+    mod::sched::start_scheduler();
+}
 
 }  // namespace ker::init::fns

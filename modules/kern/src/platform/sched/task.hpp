@@ -1261,6 +1261,23 @@ struct Task {
     // IRQ wake notifications bypass batching and never modify these fields.
     uint32_t local_wake_batch_depth{};
     bool local_wake_batch_pending{};
+
+    // Kernel worker's opaque launch context, initialized before post. Appended
+    // to preserve every existing Task/assembly member offset; user tasks leave
+    // it null. The worker clears it before retiring its owner's storage.
+    void* kernel_thread_context{};
+
+    // Direct allocator reclaim must not issue I/O while storage service owns
+    // a queue. Task-local nesting survives migration; fresh Tasks start clear.
+    // Appended to preserve all existing Task/assembly member offsets.
+    uint32_t reclaim_no_io_depth{};
+
+    // Deferred hardware file faults publish after worker I/O and all borrowed
+    // File/pagemap references retire. Other fields share the fixed-pool guard.
+    uint64_t lazy_file_fault_generation{};
+    uint64_t lazy_file_fault_vaddr{};
+    int lazy_file_fault_status{};
+    std::atomic<uint64_t> lazy_file_fault_completion_generation{};
 };
 
 [[nodiscard]] inline auto process_pid(const Task& task) -> uint64_t { return task.owner_pid != 0 ? task.owner_pid : task.pid; }

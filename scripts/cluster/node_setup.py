@@ -26,6 +26,7 @@ DEFAULT_VM_CONFIG = {
     "disk1": "mountfs.qcow2",
     "overlay_dir": "cluster-overlays",
     "bios": "/usr/share/OVMF/x64/OVMF.4m.fd",
+    "disk_cache": "unsafe",
 }
 
 TCG_LOG_LEVELS = {
@@ -117,6 +118,9 @@ def normalize_node_spec(raw: dict) -> dict:
     spec["hostname"] = spec.get("hostname", f"wos-{node_id}")
     spec["debug"] = bool(spec.get("debug", False))
     spec["vm"] = merge_section(DEFAULT_VM_CONFIG, spec.get("vm", {}))
+    disk_cache = spec["vm"]["disk_cache"]
+    if not isinstance(disk_cache, str) or disk_cache not in ("unsafe", "writeback", "none", "writethrough", "directsync"):
+        raise ValueError("vm.disk_cache must be unsafe, writeback, none, writethrough, or directsync")
     iommu = spec["vm"].get("iommu", False)
     if not isinstance(iommu, bool):
         raise ValueError("vm.iommu must be a boolean")
@@ -357,13 +361,13 @@ def build_qemu_args(
         "-smp",
         str(cpus),
         "-drive",
-        f"file={overlay0},if=none,id=drive0,format=qcow2,cache=unsafe",
+        f"file={overlay0},if=none,id=drive0,format=qcow2,cache={vm_cfg['disk_cache']}",
         "-device",
         "ahci,id=ahci",
         "-device",
         "ide-hd,drive=drive0,bus=ahci.0",
         "-drive",
-        f"file={overlay1},if=none,id=drive1,format=qcow2,cache=unsafe",
+        f"file={overlay1},if=none,id=drive1,format=qcow2,cache={vm_cfg['disk_cache']}",
         "-device",
         "ide-hd,drive=drive1,bus=ahci.1",
         "-chardev",

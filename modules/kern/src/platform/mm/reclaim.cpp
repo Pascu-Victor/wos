@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -717,6 +718,20 @@ auto fake_scan(void* opaque, const ReclaimRequest& request) -> ReclaimScanResult
 
 }  // namespace
 
+NoIoScope::NoIoScope() {
+    auto* current = sched::can_query_current_task() ? sched::get_current_task() : nullptr;
+    if (current == nullptr) return;
+    depth_ = &current->reclaim_no_io_depth;
+    if (*depth_ == UINT32_MAX) dbg::panic_handler("reclaim: no-I/O scope depth exhausted");
+    ++*depth_;
+}
+
+NoIoScope::~NoIoScope() {
+    if (depth_ == nullptr) return;
+    if (*depth_ == 0) dbg::panic_handler("reclaim: unbalanced no-I/O scope");
+    --*depth_;
+}
+
 void init() {
     bool expected = false;
     if (initialized.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
@@ -767,13 +782,14 @@ auto reclaim_for_allocation(uint8_t requested_order, uint64_t target_pages) -> R
     if (PRESSURE == PressureLevel::NONE) {
         return {};
     }
+    auto const* CURRENT = sched::can_query_current_task() ? sched::get_current_task() : nullptr;
     ReclaimRequest const REQUEST{
         .context = ReclaimContext::DIRECT,
         .priority = pressure_priority(PRESSURE),
         .requested_order = requested_order,
         .target_pages = std::max<uint64_t>(target_pages, 1),
         .may_block = true,
-        .may_io = true,
+        .may_io = CURRENT == nullptr || CURRENT->reclaim_no_io_depth == 0,
         .may_allocate = true,
     };
     ReclaimRunResult result = run(REQUEST);

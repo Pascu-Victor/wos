@@ -14,6 +14,12 @@
 #include <cstring>
 #include <dev/ahci_dma.hpp>
 #include <dev/ahci_lifecycle.hpp>
+#ifdef WOS_ASYNC_BLOCK_IO
+#include <dev/ahci_async.hpp>
+#include <dev/block_request.hpp>
+#include <platform/interrupt/gates.hpp>
+#include <platform/sys/spinlock.hpp>
+#endif
 #include <dev/dma/dma.hpp>
 #include <net/wki/remotable.hpp>
 #include <new>
@@ -101,7 +107,7 @@ constexpr size_t COMMAND_SLOT_COUNT = 32;
 constexpr size_t CLB_SIZE = 1024;
 constexpr size_t FIS_RECEIVE_SIZE = 256;
 constexpr uint32_t SECTOR_SIZE = 512;
-constexpr size_t COMMAND_TABLE_PRDT_ENTRY_COUNT = 8192;
+constexpr size_t COMMAND_TABLE_PRDT_ENTRY_COUNT = 128;
 constexpr uint32_t AHCI_MAX_SECTORS_PER_CMD = 1024;
 constexpr size_t TRANSFER_CAPACITY = AHCI_MAX_SECTORS_PER_CMD * SECTOR_SIZE;
 constexpr uint64_t ENGINE_TIMEOUT_NS = 1000000000ULL;
@@ -132,6 +138,26 @@ struct PortMemory {
     CoherentRegion clb{}, fis{};
     std::array<CoherentRegion, COMMAND_SLOT_COUNT> tables{};
     dma::Allocation transfer{};
+#ifdef WOS_ASYNC_BLOCK_IO
+    std::array<dma::Allocation, async_rules::MAX_SLOTS - 1> extra_transfers{};
+    std::array<dma::Submission, async_rules::MAX_SLOTS> async_submissions{};
+    std::array<BlockRequest*, async_rules::MAX_SLOTS> requests{};
+    async_rules::Port async{};
+    uint32_t pending_issue_mask{};  // Slot guard; retained preparing slots, no hardware doorbell yet.
+    bool health_check_due = true;   // Slot guard; every reserve attempt obligates the following full health snapshot.
+    mod::sys::Spinlock slot_guard{};
+    std::atomic<uint32_t> interrupt_status{};
+    BlockDevice* provider = nullptr;
+    bool native_enabled = false;
+    bool ncq_supported = false;
+    bool flush_supported = false;
+    std::array<uint16_t, 10> identify_serial{};
+    std::atomic<bool> queue_reset_pending{false};
+    AhciAsyncSnapshot stats{};
+#ifdef WOS_SELFTEST
+    SelftestAsyncFault injected_fault = SelftestAsyncFault::none;
+#endif
+#endif
     bool prepared = false;
     bool failed = false;  // Serialized by this port's command mutex after probe.
 };
@@ -146,6 +172,20 @@ std::array<ker::mod::sys::Mutex, MAX_PORTS> port_locks{};
 // Software-level tracking of which command slots are in use
 // This prevents the race where we release the lock but hardware hasn't updated ci yet
 std::array<std::atomic<uint32_t>, MAX_PORTS> port_slots_in_use{};
+auto execute_command_locked(volatile HbaPort* port, int portno, uint8_t command, uint64_t lba, uint32_t sectors,
+                            std::span<std::byte> buffer, bool write_op) -> bool;
+#ifdef WOS_ASYNC_BLOCK_IO
+uint8_t native_irq_vector = 0;
+constexpr uint32_t NATIVE_IRQ_MASK = dma_rules::ERROR_INTERRUPTS | (1U << 6) | (1U << 22) | (1U << 3) | 1U;
+void ahci_async_service(BlockDevice* bdev);
+auto ahci_async_poll_active(BlockDevice* bdev) -> bool;
+auto ahci_async_submit(BlockDevice* bdev, BlockRequest& request) -> int;
+void ahci_async_cancel(BlockDevice* bdev, BlockRequestToken token, int reason);
+auto native_ops = BlockAsyncOps{ahci_async_submit, ahci_async_service, ahci_async_cancel, ahci_async_poll_active};
+auto slot_transfer(PortMemory& memory, size_t index) -> dma::Allocation& {
+    return index == 0 ? memory.transfer : memory.extra_transfers[index - 1];
+}
+#endif
 
 constexpr auto command_table_size(size_t prdt_entries) -> size_t { return sizeof(HbaCmdTbl) + (prdt_entries * sizeof(HbaPrdtEntry)); }
 
@@ -228,6 +268,9 @@ void quarantine_port(size_t index) {
     pin(memory.fis.allocation.handle);
     for (auto const& table : memory.tables) pin(table.allocation.handle);
     pin(memory.transfer.handle);
+#ifdef WOS_ASYNC_BLOCK_IO
+    for (auto const& pool : memory.extra_transfers) pin(pool.handle);
+#endif
 }
 
 void fail_stop(size_t index) {
@@ -317,6 +360,13 @@ auto port_prepare(size_t portno) -> bool {
     auto pool = dma::allocate_streaming(controller, TRANSFER_CAPACITY, dma::Direction::bidirectional, dma_mask);
     memory.transfer = pool.allocation;
     if (pool.error != dma::Error::none) return false;
+#ifdef WOS_ASYNC_BLOCK_IO
+    for (auto& extra : memory.extra_transfers) {
+        auto result = dma::allocate_streaming(controller, TRANSFER_CAPACITY, dma::Direction::bidirectional, dma_mask);
+        extra = result.allocation;
+        if (result.error != dma::Error::none) return false;
+    }
+#endif
     memory.prepared = true;
     return true;
 }
@@ -347,6 +397,15 @@ auto release_quiesced_regions() -> bool {
             else
                 memory.transfer = {};
         }
+#ifdef WOS_ASYNC_BLOCK_IO
+        for (auto& pool : memory.extra_transfers) {
+            if (pool.handle.registry == nullptr) continue;
+            if (dma::release(pool.handle) != dma::Error::none)
+                released = false;
+            else
+                pool = {};
+        }
+#endif
         memory.clb_virt = nullptr;
         memory.fb_virt = nullptr;
         memory.ctb_virt.fill(nullptr);
@@ -383,6 +442,590 @@ auto find_cmdslot(volatile HbaPort* port, int portno) -> uint32_t {
     ahci_log("Cannot find free command list entry\n");
     return UINT32_MAX;
 }
+
+#ifdef WOS_ASYNC_BLOCK_IO
+struct NativeCompletion {
+    BlockRequestToken token{};
+    int status{};
+    size_t bytes{};
+};
+
+auto native_memory(BlockDevice* bdev) -> PortMemory* {
+    if (bdev == nullptr || bdev->private_data == nullptr) return nullptr;
+    auto* dev = static_cast<AHCIDevice*>(bdev->private_data);
+    if (dev->port_num >= MAX_PORTS) return nullptr;
+    auto& memory = port_memory[dev->port_num];
+    return memory.provider == bdev && memory.native_enabled ? &memory : nullptr;
+}
+
+// SG is retained kernel storage; DMA sees only the driver's exclusive pool.
+auto native_validate(const BlockRequest& request, const AHCIDevice& device) -> int {
+    auto const& io = request.description;
+    if (io.op == BlockRequestOperation::FLUSH)
+        return io.lba == 0 && io.count == 0 && io.bytes == 0 && request.segment_count == 0 ? 0 : -EINVAL;
+    if ((io.op != BlockRequestOperation::READ && io.op != BlockRequestOperation::WRITE) || io.count == 0 ||
+        io.count > AHCI_MAX_SECTORS_PER_CMD || io.lba >= (uint64_t{1} << 48) || io.count > (uint64_t{1} << 48) - io.lba ||
+        io.lba > device.total_sectors || io.count > device.total_sectors - io.lba || io.bytes != io.count * SECTOR_SIZE ||
+        request.segment_count == 0 || request.segment_count > request.segments.size())
+        return -EINVAL;
+    size_t total = 0;
+    for (size_t i = 0; i < request.segment_count; ++i) {
+        auto const& sg = request.segments[i];
+        auto const ADDRESS = reinterpret_cast<uint64_t>(sg.data);
+        if (ADDRESS < mod::mm::addr::get_hhdm_offset() || sg.size == 0 || sg.size > io.bytes - total || sg.size - 1 > UINT64_MAX - ADDRESS)
+            return -EINVAL;
+        total += sg.size;
+    }
+    return total == io.bytes ? 0 : -EINVAL;
+}
+
+void native_copy(BlockRequest& request, std::byte* pool, bool to_pool) {
+    size_t offset = 0;
+    for (size_t i = 0; i < request.segment_count; ++i) {
+        auto const& sg = request.segments[i];
+        if (to_pool)
+            std::memcpy(pool + offset, sg.data, sg.size);
+        else
+            std::memcpy(sg.data, pool + offset, sg.size);
+        offset += sg.size;
+    }
+}
+
+void native_build(PortMemory& memory, size_t index, const BlockRequest& request, dma::Submission transfer, bool ncq) {
+    auto* header = &memory.clb_virt[index];
+    auto* table = reinterpret_cast<HbaCmdTbl*>(memory.ctb_virt[index]);
+    size_t const BYTES = request.description.bytes;
+    size_t const PRDS = (BYTES + 4095) / 4096;
+    std::memset(table, 0, command_table_size(PRDS));
+    reset_command_header(header);
+    header->cfl = sizeof(FisRegH2D) / sizeof(uint32_t);
+    header->w = request.description.op == BlockRequestOperation::WRITE;
+    header->prdtl = static_cast<uint16_t>(PRDS);
+    header->prdbc = 0;
+    auto* prds = command_table_prdt_entries(table);
+    for (size_t i = 0; i < PRDS; ++i) {
+        uint64_t const ADDRESS = transfer.address + i * 4096;
+        prds[i].dba = static_cast<uint32_t>(ADDRESS);
+        prds[i].dbau = static_cast<uint32_t>(ADDRESS >> 32);
+        prds[i].dbc = static_cast<uint32_t>(std::min(size_t{4096}, BYTES - i * 4096) - 1);
+    }
+    auto* fis = reinterpret_cast<FisRegH2D*>(table->cfis);
+    fis->fis_type = FIS_TYPE_REG_H2D;
+    fis->c = 1;
+    bool const WRITE = request.description.op == BlockRequestOperation::WRITE;
+    fis->command = BYTES == 0 ? ATA_CMD_FLUSH_CACHE_EXT
+                   : ncq      ? (WRITE ? 0x61 : 0x60)
+                              : (WRITE ? ATA_CMD_WRITE_DMA_EX : ATA_CMD_READ_DMA_EX);
+    fis->device = 1U << 6;
+    auto const LBA = request.description.lba;
+    fis->lba0 = static_cast<uint8_t>(LBA);
+    fis->lba1 = static_cast<uint8_t>(LBA >> 8);
+    fis->lba2 = static_cast<uint8_t>(LBA >> 16);
+    fis->lba3 = static_cast<uint8_t>(LBA >> 24);
+    fis->lba4 = static_cast<uint8_t>(LBA >> 32);
+    fis->lba5 = static_cast<uint8_t>(LBA >> 40);
+    if (ncq) {
+        fis->featurel = static_cast<uint8_t>(request.description.count);
+        fis->featureh = static_cast<uint8_t>(request.description.count >> 8);
+        fis->countl = static_cast<uint8_t>(index << 3);
+    } else {
+        fis->countl = static_cast<uint8_t>(request.description.count);
+        fis->counth = static_cast<uint8_t>(request.description.count >> 8);
+    }
+}
+
+// Called with the port mutex and short slot guard held. Count actual MMIO
+// active bits separately from retained software ownership, without allocation.
+void native_observe_hardware(PortMemory& memory, uint32_t ci, uint32_t sact) {
+    size_t active = 0;
+    uint32_t const BITS = ci | sact;
+    for (size_t i = 0; i < memory.ctb_virt.size(); ++i) {
+        if ((BITS & (uint32_t{1} << i)) != 0) ++active;
+    }
+    memory.stats.current_ci = ci;
+    memory.stats.current_sact = sact;
+    memory.stats.hardware_active = active;
+    memory.stats.hardware_high_water = std::max(memory.stats.hardware_high_water, active);
+}
+
+auto ahci_async_submit(BlockDevice* bdev, BlockRequest& request) -> int {
+    auto* memory_ptr = native_memory(bdev);
+    if (memory_ptr == nullptr) return -ENODEV;
+    auto* device = static_cast<AHCIDevice*>(bdev->private_data);
+    auto& memory = *memory_ptr;
+    size_t const PORT = device->port_num;
+    int const VALID = native_validate(request, *device);
+    if (VALID != 0) return VALID;
+    if (request.description.op == BlockRequestOperation::FLUSH && !memory.flush_supported) return -EOPNOTSUPP;
+    if (!port_locks[PORT].try_lock()) return -EAGAIN;
+    auto unlock = [&] { port_locks[PORT].unlock(); };
+    auto* port = &hba_mem->ports[PORT];
+    if (!admission.allows_command() || memory.failed || controller_failed.load(std::memory_order_acquire)) {
+        unlock();
+        return -ENODEV;
+    }
+    if (memory.queue_reset_pending.load(std::memory_order_acquire)) {
+        unlock();
+        return -EAGAIN;
+    }
+    bool const NCQ = memory.ncq_supported && request.description.op != BlockRequestOperation::FLUSH;
+    uint64_t flags = memory.slot_guard.lock_irqsave();
+    memory.health_check_due = true;
+    size_t const INDEX = async_rules::reserve(memory.async, request.token, request.description.bytes, request.deadline_us, NCQ);
+    uint64_t const GENERATION = INDEX < async_rules::MAX_SLOTS ? memory.async.slots[INDEX].generation : 0;
+    memory.slot_guard.unlock_irqrestore(flags);
+    if (INDEX == async_rules::MAX_SLOTS) {
+        bool const OFFLINE = memory.async.offline;
+        unlock();
+        return OFFLINE ? -EOVERFLOW : -EAGAIN;
+    }
+    auto& pool = slot_transfer(memory, INDEX);
+    dma::Submission submission{};
+    int status = 0;
+    if (request.description.bytes != 0) {
+        if (request.description.op == BlockRequestOperation::WRITE) native_copy(request, pool.cpu, true);
+        auto const DIRECTION =
+            request.description.op == BlockRequestOperation::WRITE ? dma::Direction::to_device : dma::Direction::from_device;
+        if (dma::bind_streaming(pool.handle, {pool.cpu, request.description.bytes}, DIRECTION) != dma::Error::none)
+            status = -EIO;
+        else {
+            auto const PREPARED = dma::prepare(pool.handle);
+            submission = PREPARED.submission;
+            if (PREPARED.error != dma::Error::none) status = -EIO;
+        }
+    }
+    // No wait here: the task service retries transient taskfile backpressure.
+    if (status == 0 && (mmio_read32(port->tfd) & (ATA_DEV_BUSY | ATA_DEV_DRQ)) != 0) status = -EAGAIN;
+    if (status == 0) native_build(memory, INDEX, request, submission, NCQ);
+    flags = memory.slot_guard.lock_irqsave();
+    if (status == 0 && (!admission.allows_command() || memory.async.frozen || memory.async.offline ||
+                        memory.async.slots[INDEX].phase != async_rules::Phase::preparing ||
+                        memory.async.slots[INDEX].generation != GENERATION || memory.async.slots[INDEX].cancel_reason != 0))
+        status = -ECANCELED;
+    if (status == 0) {
+        memory.requests[INDEX] = &request;
+        memory.async_submissions[INDEX] = submission;
+        memory.pending_issue_mask |= uint32_t{1} << INDEX;
+        port_slots_in_use[PORT].fetch_or(uint32_t{1} << INDEX, std::memory_order_release);
+        block_model_detail::increment(memory.stats.submitted);
+        memory.stats.high_water = std::max(memory.stats.high_water, async_rules::owned(memory.async));
+    }
+    memory.slot_guard.unlock_irqrestore(flags);
+    if (status != 0) {
+        if (submission.sequence != 0 && dma::complete(submission, 0, dma::Retirement::never_submitted) != dma::Error::none) {
+            quarantine_port(PORT);
+            status = -EIO;
+        }
+        flags = memory.slot_guard.lock_irqsave();
+        (void)async_rules::release(memory.async, INDEX, GENERATION);
+        memory.slot_guard.unlock_irqrestore(flags);
+    }
+    unlock();
+    // The runtime service owner always calls the provider again after its
+    // issue loop, publishing every staged slot before releasing service_lock.
+    return status;
+}
+
+void ahci_async_cancel(BlockDevice* bdev, BlockRequestToken token, int reason) {
+    auto* memory = native_memory(bdev);
+    if (memory == nullptr) return;
+    uint64_t const FLAGS = memory->slot_guard.lock_irqsave();
+    bool const CANCELED = async_rules::cancel(memory->async, token, reason);
+    memory->slot_guard.unlock_irqrestore(FLAGS);
+    if (CANCELED) block_queue_wake(bdev);
+}
+
+auto native_port_reset(volatile HbaPort* port) -> bool {
+    // Rings are retained and every data submission has already retired. FIS
+    // reception permits the post-COMRESET D2H FIS to clear taskfile busy.
+    mmio_or32(port->cmd, HBA_PX_CMD_FRE);
+    uint32_t const CONTROL = mmio_read32(port->sctl) & ~0xfU;
+    mmio_write32(port->sctl, CONTROL | 1U);
+    uint64_t const START = mod::time::get_us();
+    if (!wait_until([&] { return mod::time::get_us() - START >= 1'000; }, ENGINE_TIMEOUT_NS)) return false;
+    mmio_write32(port->sctl, CONTROL);
+    if (!wait_until(
+            [&] {
+                return (mmio_read32(port->ssts) & 0xfU) == HBA_PORT_DET_PRESENT &&
+                       (mmio_read32(port->tfd) & (ATA_DEV_BUSY | ATA_DEV_DRQ)) == 0;
+            },
+            ENGINE_TIMEOUT_NS))
+        return false;
+    clear_port_errors(port);
+    return mmio_read32(port->ci) == 0 && mmio_read32(port->sact) == 0 && start_cmd(port);
+}
+
+auto native_revalidate(volatile HbaPort* port, size_t index) -> bool {
+    auto& memory = port_memory[index];
+    auto const* device = static_cast<AHCIDevice*>(memory.provider->private_data);
+    std::array<uint16_t, 256> words{};
+    // COMRESET's signature D2H can contain DF/diagnostic status (QEMU uses
+    // 0x130). Qualify it with an exclusive real command before native admission;
+    // never suppress fatal status checks for a subsequently issued request.
+    if (!execute_command_locked(port, static_cast<int>(index), ATA_CMD_IDENTIFY, 0, 0, std::as_writable_bytes(std::span{words}), false))
+        return false;
+    uint64_t total = uint64_t{words[100]} | (uint64_t{words[101]} << 16) | (uint64_t{words[102]} << 32) | (uint64_t{words[103]} << 48);
+    if ((words[83] & (1U << 10)) == 0 || total == 0) total = uint64_t{words[60]} | (uint64_t{words[61]} << 16);
+    return total == device->total_sectors && words[75] == memory.stats.identify_queue_depth &&
+           words[76] == memory.stats.identify_sata_caps && words[83] == memory.stats.identify_command_sets &&
+           std::equal(memory.identify_serial.begin(), memory.identify_serial.end(), words.begin() + 10) &&
+           (mmio_read32(port->tfd) & 0x21U) == 0 && mmio_read32(port->ci) == 0 && mmio_read32(port->sact) == 0;
+}
+
+auto ahci_async_poll_active(BlockDevice* bdev) -> bool {
+    auto* memory_ptr = native_memory(bdev);
+    if (memory_ptr == nullptr) return false;
+    auto& memory = *memory_ptr;
+    size_t const PORT = static_cast<AHCIDevice*>(bdev->private_data)->port_num;
+    if (!port_locks[PORT].try_lock()) return false;
+    struct Unlock {
+        mod::sys::Mutex& lock;
+        ~Unlock() { lock.unlock(); }
+    } const UNLOCK{port_locks[PORT]};
+    uint64_t const FLAGS = memory.slot_guard.lock_irqsave();
+    struct Restore {
+        mod::sys::Spinlock& lock;
+        uint64_t flags;
+        ~Restore() { lock.unlock_irqrestore(flags); }
+    } const RESTORE{memory.slot_guard, FLAGS};
+    if (memory.pending_issue_mask != 0 || memory.health_check_due || memory.async.frozen || memory.async.offline || memory.failed ||
+        memory.queue_reset_pending.load(std::memory_order_acquire) || !admission.allows_command() ||
+        controller_failed.load(std::memory_order_acquire) || memory.interrupt_status.load(std::memory_order_acquire) != 0)
+        return false;
+#ifdef WOS_SELFTEST
+    if (memory.injected_fault != SelftestAsyncFault::none) return false;
+#endif
+    uint32_t owned_mask = 0;
+    size_t owned_count = 0;
+    for (size_t i = 0; i < memory.async.slots.size(); ++i) {
+        auto const& slot = memory.async.slots[i];
+        if (slot.phase == async_rules::Phase::free) continue;
+        auto const* request = memory.requests[i];
+        auto const& submission = memory.async_submissions[i];
+        if (slot.phase != async_rules::Phase::active || !slot.ncq || slot.cancel_reason != 0 || slot.generation == 0 || slot.epoch == 0 ||
+            slot.epoch != memory.async.epoch || request == nullptr || request->token != slot.token || slot.bytes == 0 ||
+            request->description.bytes != slot.bytes || submission.size != slot.bytes || submission.sequence == 0)
+            return false;
+        owned_mask |= uint32_t{1} << i;
+        ++owned_count;
+    }
+    // Preserve sole-command full qualification and every staged submission.
+    if (owned_count < 2) return false;
+    auto* port = &hba_mem->ports[PORT];
+    uint32_t const CI = mmio_read32(port->ci);
+    uint32_t const SACT = mmio_read32(port->sact);
+    uint32_t const STATUS = mmio_read32(port->is);
+    uint64_t const NOW = mod::time::get_us();
+    if ((CI | SACT) != owned_mask || STATUS != 0 || memory.interrupt_status.load(std::memory_order_acquire) != 0 ||
+        controller_failed.load(std::memory_order_acquire) || !admission.allows_command())
+        return false;
+    for (auto const& slot : memory.async.slots) {
+        if (slot.phase != async_rules::Phase::free && slot.deadline_us != 0 && NOW >= slot.deadline_us) return false;
+    }
+    // No status acknowledgement, completion claim, DMA retirement or copy.
+    // A TFD-only fault remains retained until the next mandatory full service.
+    return true;
+}
+
+void ahci_async_service(BlockDevice* bdev) {
+    auto* memory_ptr = native_memory(bdev);
+    if (memory_ptr == nullptr) return;
+    auto& memory = *memory_ptr;
+    size_t const PORT = static_cast<AHCIDevice*>(bdev->private_data)->port_num;
+    if (!port_locks[PORT].try_lock()) return;
+    auto* port = &hba_mem->ports[PORT];
+    if (memory.failed) {
+        uint64_t const FLAGS = memory.slot_guard.lock_irqsave();
+        bool const EMPTY = async_rules::owned(memory.async) == 0;
+        memory.slot_guard.unlock_irqrestore(FLAGS);
+        if (EMPTY) {
+            port_locks[PORT].unlock();
+            if (memory.queue_reset_pending.load(std::memory_order_acquire) && block_queue_finish_reset(bdev, false) == 0)
+                memory.queue_reset_pending.store(false, std::memory_order_release);
+            return;
+        }
+    }
+    std::array<NativeCompletion, async_rules::MAX_SLOTS> completions{};
+    std::array<async_rules::Slot, async_rules::MAX_SLOTS> qualified{};
+    size_t count = 0;
+    uint64_t flags = memory.slot_guard.lock_irqsave();
+    if (async_rules::owned(memory.async) == 0 && memory.pending_issue_mask == 0 && !memory.health_check_due && !memory.async.frozen &&
+        !memory.failed && !memory.queue_reset_pending.load(std::memory_order_acquire) &&
+        !controller_failed.load(std::memory_order_acquire) && memory.interrupt_status.load(std::memory_order_acquire) == 0) {
+        memory.slot_guard.unlock_irqrestore(flags);
+        port_locks[PORT].unlock();
+        return;
+    }
+    // Active bits precede error reads. A hardware fault that clears a command
+    // after this snapshot cannot make an earlier active command look complete.
+    // The same guard excludes IRQ publication/acknowledgment until every
+    // eligible completion has been claimed from this qualified snapshot.
+    uint32_t const CI = mmio_read32(port->ci);
+    uint32_t const SACT = mmio_read32(port->sact);
+    uint32_t const OBSERVED = memory.interrupt_status.exchange(0, std::memory_order_acq_rel) | mmio_read32(port->is);
+    uint32_t const TFD = mmio_read32(port->tfd);
+    mmio_write32(port->is, OBSERVED);
+    memory.health_check_due = false;
+    native_observe_hardware(memory, CI, SACT);
+    if ((OBSERVED & (dma_rules::ERROR_INTERRUPTS | (1U << 6) | (1U << 22))) != 0 || (TFD & 0x21U) != 0 ||
+        controller_failed.load(std::memory_order_acquire))
+        async_rules::freeze(memory.async);
+    if (async_rules::timeout(memory.async, mod::time::get_us())) block_model_detail::increment(memory.stats.timeouts);
+#ifdef WOS_SELFTEST
+    SelftestAsyncFault fault = SelftestAsyncFault::none;
+    bool issued = false;
+    for (auto const& slot : memory.async.slots) issued = issued || slot.phase == async_rules::Phase::active;
+    if (issued) {
+        fault = memory.injected_fault;
+        memory.injected_fault = SelftestAsyncFault::none;
+        if (fault != SelftestAsyncFault::none) {
+            async_rules::freeze(memory.async, fault == SelftestAsyncFault::timeout ? -ETIMEDOUT : -EIO);
+            if (fault == SelftestAsyncFault::timeout) block_model_detail::increment(memory.stats.timeouts);
+        }
+    }
+#endif
+    if (memory.pending_issue_mask != 0 &&
+        (!admission.allows_command() || memory.failed || controller_failed.load(std::memory_order_acquire)))
+        async_rules::freeze(memory.async, -ESHUTDOWN);
+    if (!memory.async.frozen) {
+        for (size_t i = 0; i < qualified.size(); ++i) {
+            auto const SLOT = memory.async.slots[i];
+            if (async_rules::claim(memory.async, i, SLOT.generation, SLOT.epoch, CI, SACT)) qualified[i] = SLOT;
+        }
+        // Root queue service prepares its bounded issue loop before calling
+        // us again. Preparing slots cannot claim completion from clear CI/SACT;
+        // publish them together so preparation cannot serialize hardware I/O.
+        uint32_t const PENDING = memory.pending_issue_mask;
+        if (PENDING != 0 && (TFD & (ATA_DEV_BUSY | ATA_DEV_DRQ)) == 0) {
+            uint32_t ncq = 0;
+            size_t completion_index = async_rules::MAX_SLOTS;
+            bool const SOLE = (PENDING & (PENDING - 1)) == 0 && async_rules::owned(memory.async) == 1;
+            for (size_t i = 0; i < memory.async.slots.size(); ++i) {
+                uint32_t const BIT = uint32_t{1} << i;
+                if ((PENDING & BIT) == 0) continue;
+                auto const SLOT = memory.async.slots[i];
+                if (memory.requests[i] == nullptr || !async_rules::publish(memory.async, i, SLOT.generation)) {
+                    async_rules::freeze(memory.async);
+                    break;
+                }
+                if (SLOT.ncq) ncq |= BIT;
+                bool const FLUSH = !SLOT.ncq && SLOT.bytes == 0 && memory.requests[i]->description.op == BlockRequestOperation::FLUSH &&
+                                   memory.requests[i]->description.bytes == 0 && memory.async_submissions[i].sequence == 0;
+                bool const DATA = memory.requests[i]->token == SLOT.token &&
+                                  (memory.requests[i]->description.op == BlockRequestOperation::READ ||
+                                   memory.requests[i]->description.op == BlockRequestOperation::WRITE) &&
+                                  SLOT.bytes != 0 && memory.requests[i]->description.bytes == SLOT.bytes &&
+                                  memory.async_submissions[i].size == SLOT.bytes && memory.async_submissions[i].sequence != 0;
+                if (SOLE && (FLUSH || DATA)) completion_index = i;
+            }
+            if (!admission.allows_command() || memory.failed || controller_failed.load(std::memory_order_acquire))
+                async_rules::freeze(memory.async, -ESHUTDOWN);
+            if (!memory.async.frozen) {
+                asm volatile("mfence" ::: "memory");
+                if (ncq != 0) mmio_write32(port->sact, ncq);
+                mmio_write32(port->ci, PENDING);
+                // NCQ occupancy lives in SACT after queue acceptance clears
+                // CI. Sample it before another MMIO exit can retire the batch.
+                uint32_t const PUBLISHED_SACT = mmio_read32(port->sact);
+                uint32_t const PUBLISHED_CI = mmio_read32(port->ci);
+                memory.pending_issue_mask &= ~PENDING;
+                native_observe_hardware(memory, PUBLISHED_CI, PUBLISHED_SACT);
+                if (completion_index != async_rules::MAX_SLOTS) {
+                    // A sole command may finish during or after the doorbell
+                    // readback. Qualify one fresh full active-before-error
+                    // snapshot under the same IRQ guard before claiming it.
+                    auto const SLOT = memory.async.slots[completion_index];
+                    uint32_t const FRESH_CI = mmio_read32(port->ci);
+                    uint32_t const FRESH_SACT = mmio_read32(port->sact);
+                    uint32_t const FRESH_STATUS = memory.interrupt_status.exchange(0, std::memory_order_acq_rel) | mmio_read32(port->is);
+                    uint32_t const FRESH_TFD = mmio_read32(port->tfd);
+                    mmio_write32(port->is, FRESH_STATUS);
+                    native_observe_hardware(memory, FRESH_CI, FRESH_SACT);
+                    if ((FRESH_STATUS & (dma_rules::ERROR_INTERRUPTS | (1U << 6) | (1U << 22))) != 0 || (FRESH_TFD & 0x21U) != 0 ||
+                        controller_failed.load(std::memory_order_acquire))
+                        async_rules::freeze(memory.async);
+                    if (async_rules::timeout(memory.async, mod::time::get_us())) block_model_detail::increment(memory.stats.timeouts);
+#ifdef WOS_SELFTEST
+                    fault = memory.injected_fault;
+                    memory.injected_fault = SelftestAsyncFault::none;
+                    if (fault != SelftestAsyncFault::none) {
+                        async_rules::freeze(memory.async, fault == SelftestAsyncFault::timeout ? -ETIMEDOUT : -EIO);
+                        if (fault == SelftestAsyncFault::timeout) block_model_detail::increment(memory.stats.timeouts);
+                    }
+#endif
+                    if (!admission.allows_command() || memory.failed || memory.queue_reset_pending.load(std::memory_order_acquire) ||
+                        controller_failed.load(std::memory_order_acquire))
+                        async_rules::freeze(memory.async, -ESHUTDOWN);
+                    if (!memory.async.frozen && FRESH_CI == 0 && FRESH_SACT == 0 &&
+                        async_rules::claim(memory.async, completion_index, SLOT.generation, SLOT.epoch, FRESH_CI, FRESH_SACT))
+                        qualified[completion_index] = SLOT;
+                }
+            }
+        }
+    }
+    bool const FROZEN = memory.async.frozen;
+    int const RESET_REASON = memory.async.reset_reason;
+    memory.slot_guard.unlock_irqrestore(flags);
+    if (FROZEN) {
+        if (!memory.queue_reset_pending.load(std::memory_order_acquire)) {
+            (void)block_queue_begin_reset(bdev, RESET_REASON == 0 ? -EIO : RESET_REASON);
+            memory.queue_reset_pending.store(true, std::memory_order_release);
+        }
+        mmio_write32(port->ie, 0);
+        bool stopped = stop_cmd(port);
+#ifdef WOS_SELFTEST
+        if (fault == SelftestAsyncFault::stop) stopped = false;
+#endif
+        bool retired = stopped;
+        for (size_t i = 0; i < async_rules::MAX_SLOTS; ++i) {
+            flags = memory.slot_guard.lock_irqsave();
+            auto const SLOT = memory.async.slots[i];
+            bool const STAGED = (memory.pending_issue_mask & (uint32_t{1} << i)) != 0;
+            memory.slot_guard.unlock_irqrestore(flags);
+            if (SLOT.phase == async_rules::Phase::free) continue;
+            auto const SUBMISSION = memory.async_submissions[i];
+            if ((STAGED || stopped) && SUBMISSION.sequence != 0 &&
+                dma::complete(SUBMISSION, 0, STAGED ? dma::Retirement::never_submitted : dma::Retirement::device_quiesced) !=
+                    dma::Error::none) {
+                (void)dma::quarantine(slot_transfer(memory, i).handle);
+                retired = false;
+            }
+            completions[count++] = {SLOT.token, SLOT.cancel_reason != 0 ? SLOT.cancel_reason : -EIO, 0};
+            memory.requests[i] = nullptr;
+            memory.async_submissions[i] = {};
+            flags = memory.slot_guard.lock_irqsave();
+            (void)async_rules::release(memory.async, i, SLOT.generation);
+            memory.pending_issue_mask &= ~(uint32_t{1} << i);
+            memory.slot_guard.unlock_irqrestore(flags);
+        }
+        if (!stopped) {
+            fail_stop(PORT);
+            block_model_detail::increment(memory.stats.quarantines);
+        }
+        port_slots_in_use[PORT].store(0, std::memory_order_release);
+        // Join captured reset-era IRQ status after old command/DMA ownership
+        // retires. A delayed IRQ now samples only the current hardware latch.
+        flags = memory.slot_guard.lock_irqsave();
+        memory.interrupt_status.store(0, std::memory_order_release);
+        clear_port_errors(port);
+        memory.slot_guard.unlock_irqrestore(flags);
+        bool reset = retired && admission.allows_command() && !controller_failed.load(std::memory_order_acquire) &&
+                     native_port_reset(port) && native_revalidate(port, PORT);
+#ifdef WOS_SELFTEST
+        if (fault == SelftestAsyncFault::reset) reset = false;
+#endif
+        flags = memory.slot_guard.lock_irqsave();
+        // Qualify the final epoch against errors arriving after IDENTIFY as
+        // well as IRQ-published errors; clearing a latch never proves success.
+        uint32_t const FINAL_CI = mmio_read32(port->ci);
+        uint32_t const FINAL_SACT = mmio_read32(port->sact);
+        uint32_t const FINAL_STATUS = memory.interrupt_status.exchange(0, std::memory_order_acq_rel) | mmio_read32(port->is);
+        uint32_t const FINAL_TFD = mmio_read32(port->tfd);
+        if (reset && ((FINAL_STATUS & (dma_rules::ERROR_INTERRUPTS | (1U << 6) | (1U << 22))) != 0 || (FINAL_TFD & 0x21U) != 0 ||
+                      FINAL_CI != 0 || FINAL_SACT != 0))
+            reset = false;
+        mmio_write32(port->is, FINAL_STATUS);
+        if (!reset) memory.failed = true;
+        (void)async_rules::finish_reset(memory.async, reset);
+        block_model_detail::increment(memory.stats.resets);
+        if (reset && native_irq_vector != 0) mmio_write32(port->ie, NATIVE_IRQ_MASK);
+        memory.slot_guard.unlock_irqrestore(flags);
+        if (!reset) {
+            if (stopped && !stop_cmd(port)) fail_stop(PORT);
+        }
+        log::info("port %zu reset qualified=%u tfd=0x%x ci=0x%x sact=0x%x", PORT, static_cast<unsigned>(reset), mmio_read32(port->tfd),
+                  mmio_read32(port->ci), mmio_read32(port->sact));
+    } else {
+        for (size_t i = 0; i < async_rules::MAX_SLOTS; ++i) {
+            auto const SLOT = qualified[i];
+            if (SLOT.phase == async_rules::Phase::free) continue;
+            int status = 0;
+            // AHCI 5.4.1: PRDBC is not valid for NCQ commands.
+            if (!SLOT.ncq && memory.clb_virt[i].prdbc != SLOT.bytes) status = -EIO;
+            auto const SUBMISSION = memory.async_submissions[i];
+            if (SUBMISSION.sequence != 0 &&
+                dma::complete(SUBMISSION, status == 0 ? SLOT.bytes : 0, dma::Retirement::command_completed) != dma::Error::none) {
+                (void)dma::quarantine(slot_transfer(memory, i).handle);
+                status = -EIO;
+                memory.failed = true;
+            }
+            if (status == 0 && memory.requests[i]->description.op == BlockRequestOperation::READ)
+                native_copy(*memory.requests[i], slot_transfer(memory, i).cpu, false);
+            completions[count++] = {SLOT.token, status, status == 0 ? SLOT.bytes : 0};
+            memory.requests[i] = nullptr;
+            memory.async_submissions[i] = {};
+            flags = memory.slot_guard.lock_irqsave();
+            (void)async_rules::release(memory.async, i, SLOT.generation);
+            memory.slot_guard.unlock_irqrestore(flags);
+            port_slots_in_use[PORT].fetch_and(~(uint32_t{1} << i), std::memory_order_release);
+        }
+    }
+    for (size_t i = 0; i < count; ++i) block_model_detail::increment(memory.stats.completed);
+    bool const RESET_PENDING = memory.queue_reset_pending.load(std::memory_order_acquire);
+    bool const REOPEN = !memory.failed && !controller_failed.load(std::memory_order_acquire) && admission.allows_command();
+    port_locks[PORT].unlock();
+    for (size_t i = 0; i < count; ++i)
+        (void)block_request_complete_from_service(bdev, completions[i].token, completions[i].status, completions[i].bytes);
+    if (RESET_PENDING && block_queue_finish_reset(bdev, REOPEN) == 0) memory.queue_reset_pending.store(false, std::memory_order_release);
+}
+
+void native_irq(uint8_t, void*) {
+    uint32_t const PENDING = mmio_read32(hba_mem->is) & mmio_read32(hba_mem->pi);
+    for (size_t i = 0; i < MAX_PORTS; ++i) {
+        if ((PENDING & (uint32_t{1} << i)) == 0) continue;
+        auto& memory = port_memory[i];
+        uint64_t const FLAGS = memory.slot_guard.lock_irqsave();
+        uint32_t const STATUS = mmio_read32(hba_mem->ports[i].is);
+        memory.interrupt_status.fetch_or(STATUS, std::memory_order_release);
+        mmio_write32(hba_mem->ports[i].is, STATUS);
+        memory.slot_guard.unlock_irqrestore(FLAGS);
+        if (memory.provider != nullptr) block_queue_wake(memory.provider);
+    }
+    mmio_write32(hba_mem->is, PENDING);
+}
+
+void native_interrupts_init() {
+    uint8_t const VECTOR = mod::gates::allocate_vector();
+    if (VECTOR == 0) return;
+    if (mod::gates::request_irq(VECTOR, native_irq, nullptr, "ahci") != 0) {
+        mod::gates::free_irq(VECTOR);
+        return;
+    }
+    if (pci::pci_enable_msi(controller, VECTOR) != 0) {
+        mod::gates::free_irq(VECTOR);
+        return;  // Polling service remains fully functional.
+    }
+    native_irq_vector = VECTOR;
+    for (size_t i = 0; i < MAX_PORTS; ++i) {
+        if (!port_memory[i].native_enabled) continue;
+        clear_port_errors(&hba_mem->ports[i]);
+        mmio_write32(hba_mem->ports[i].ie, NATIVE_IRQ_MASK);
+    }
+    mmio_write32(hba_mem->is, UINT32_MAX);
+    mmio_or32(hba_mem->ghc, HBA_GHC_IE);
+}
+
+auto native_interrupts_stop() -> bool {
+    mmio_and32(hba_mem->ghc, ~HBA_GHC_IE);
+    bool masked = (mmio_read32(hba_mem->ghc) & HBA_GHC_IE) == 0;
+    uint32_t const PORTS = mmio_read32(hba_mem->pi);
+    for (size_t i = 0; i < MAX_PORTS; ++i) {
+        if ((PORTS & (uint32_t{1} << i)) == 0) continue;
+        mmio_write32(hba_mem->ports[i].ie, 0);
+        if (mmio_read32(hba_mem->ports[i].ie) != 0) masked = false;
+    }
+    if (native_irq_vector != 0 && masked) {
+        uint8_t const CAP = pci::pci_find_capability(controller, pci::PCI_CAP_ID_MSI);
+        if (CAP != 0) {
+            auto const CONTROL = pci::pci_config_read16(controller->bus, controller->slot, controller->function, CAP + 2);
+            pci::pci_config_write16(controller->bus, controller->slot, controller->function, CAP + 2, CONTROL & ~uint16_t{1});
+        }
+        mod::gates::free_irq(native_irq_vector);
+        native_irq_vector = 0;
+    }
+    return masked;
+}
+#endif
 
 // Caller holds this port mutex. Teardown alone bypasses closed admission for its final flush.
 auto execute_command_locked(volatile HbaPort* port, int portno, uint8_t command, uint64_t lba, uint32_t sectors,
@@ -577,6 +1220,14 @@ auto flush_disk(volatile HbaPort* port, int portno) -> bool {
     return execute_command(port, portno, ATA_CMD_FLUSH_CACHE_EXT, 0, 0, {}, false);
 }
 
+#ifdef WOS_ASYNC_BLOCK_IO
+// Legacy providers report an unavailable or closed command path as I/O failure.
+auto native_legacy_sync(BlockDevice* bdev, BlockRequestOperation operation, uint64_t block, size_t count, void* buffer) -> int {
+    int const RESULT = block_request_sync(bdev, operation, block, count, buffer);
+    return RESULT == -ENODEV || RESULT == -ESHUTDOWN ? -EIO : RESULT;
+}
+#endif
+
 // Wrapper for block device flush
 auto ahci_flush_blocks(BlockDevice* bdev) -> int {
     if (bdev == nullptr || bdev->private_data == nullptr) {
@@ -587,6 +1238,9 @@ auto ahci_flush_blocks(BlockDevice* bdev) -> int {
     if (dev->port_num >= MAX_PORTS) {
         return -EINVAL;
     }
+#ifdef WOS_ASYNC_BLOCK_IO
+    if (native_memory(bdev) != nullptr) return native_legacy_sync(bdev, BlockRequestOperation::FLUSH, 0, 0, nullptr);
+#endif
 
     volatile HbaPort* port = &hba_mem->ports[dev->port_num];
     return flush_disk(port, dev->port_num) ? 0 : -EIO;
@@ -602,6 +1256,9 @@ auto ahci_read_blocks(BlockDevice* bdev, uint64_t block, size_t count, void* buf
     if (dev->port_num >= MAX_PORTS) {
         return -EINVAL;
     }
+#ifdef WOS_ASYNC_BLOCK_IO
+    if (native_memory(bdev) != nullptr) return native_legacy_sync(bdev, BlockRequestOperation::READ, block, count, buffer);
+#endif
 
     volatile HbaPort* port = &hba_mem->ports[dev->port_num];
 
@@ -622,6 +1279,10 @@ auto ahci_write_blocks(BlockDevice* bdev, uint64_t block, size_t count, const vo
     if (dev->port_num >= MAX_PORTS) {
         return -EINVAL;
     }
+#ifdef WOS_ASYNC_BLOCK_IO
+    if (native_memory(bdev) != nullptr)
+        return native_legacy_sync(bdev, BlockRequestOperation::WRITE, block, count, const_cast<void*>(buffer));
+#endif
 
     volatile HbaPort* port = &hba_mem->ports[dev->port_num];
 
@@ -641,6 +1302,26 @@ auto identify_disk(volatile HbaPort* port, int portno) -> uint64_t {
     if ((words[83] & (1U << 10)) != 0)
         total = uint64_t{words[100]} | (uint64_t{words[101]} << 16) | (uint64_t{words[102]} << 32) | (uint64_t{words[103]} << 48);
     if (total == 0) total = uint64_t{words[60]} | (uint64_t{words[61]} << 16);
+#ifdef WOS_ASYNC_BLOCK_IO
+    auto& memory = port_memory[port_index(portno)];
+    bool const LBA48 = (words[83] & 0xc000U) == 0x4000U && (words[83] & (1U << 10)) != 0;
+    memory.flush_supported = (words[83] & 0xc000U) == 0x4000U && (words[83] & (1U << 13)) != 0;
+    memory.ncq_supported =
+        LBA48 && words[76] != UINT16_MAX && (words[76] & (1U << 8)) != 0 && (mmio_read32(hba_mem->cap) & (1U << 30)) != 0;
+    size_t const HBA_DEPTH = ((mmio_read32(hba_mem->cap) >> 8) & 0x1fU) + 1;
+    size_t const DEVICE_DEPTH = (words[75] & 0x1fU) + 1;
+    memory.async.depth = memory.ncq_supported ? std::min({async_rules::MAX_SLOTS, HBA_DEPTH, DEVICE_DEPTH}) : 1;
+    memory.stats.depth = memory.async.depth;
+    memory.stats.ncq = memory.ncq_supported;
+    memory.stats.port = static_cast<uint8_t>(portno);
+    memory.stats.hba_cap = mmio_read32(hba_mem->cap);
+    memory.stats.identify_queue_depth = words[75];
+    memory.stats.identify_sata_caps = words[76];
+    memory.stats.identify_command_sets = words[83];
+    std::copy_n(words.begin() + 10, memory.identify_serial.size(), memory.identify_serial.begin());
+    log::info("port %d IDENTIFY depth=%zu ncq=%u words75=0x%x words76=0x%x words83=0x%x", portno, memory.async.depth,
+              static_cast<unsigned>(memory.ncq_supported), words[75], words[76], words[83]);
+#endif
     return total;
 }
 
@@ -690,6 +1371,17 @@ void probe_port(volatile HbaMem* abar) {
 
                     // Register with block device manager
                     block_device_register(&dev->bdev);
+#ifdef WOS_ASYNC_BLOCK_IO
+                    auto& memory = port_memory[i];
+                    BlockQueueLimits limits{};
+                    limits.depth = memory.async.depth;
+                    limits.max_transfer_bytes = TRANSFER_CAPACITY;
+                    limits.max_segments = BLOCK_MODEL_MAX_SG;
+                    limits.max_requests = BLOCK_MODEL_MAX_REQUESTS;
+                    limits.max_inflight_bytes = 8 * 1024 * 1024;
+                    memory.provider = &dev->bdev;
+                    memory.native_enabled = block_queue_configure(&dev->bdev, limits, &native_ops) == 0;
+#endif
                     device_count++;
                 }
             } else if (DT == AhciDeviceType::SATAPI) {
@@ -711,6 +1403,7 @@ void probe_port(volatile HbaMem* abar) {
 struct RetirementBackend {
     size_t locked_ports = 0;
     bool bme_disabled = false;
+    bool interrupts_stopped = true;
     ~RetirementBackend() {
         while (locked_ports != 0) port_locks[--locked_ports].unlock();
     }
@@ -722,6 +1415,11 @@ struct RetirementBackend {
             if (!wait_until([&] { return port_locks[locked_ports].try_lock(); }, DRAIN_TIMEOUT_NS)) return false;
             ++locked_ports;
         }
+#ifdef WOS_ASYNC_BLOCK_IO
+        // No admitted request/CPU reader remains; mask and drain IRQ readers
+        // before the final polled flush so IRQ acknowledgement cannot hide an error.
+        interrupts_stopped = native_interrupts_stop();
+#endif
         return true;
     }
     auto flush() -> bool {
@@ -737,7 +1435,7 @@ struct RetirementBackend {
     }
     auto stop_engines() -> bool {
         mmio_and32(hba_mem->ghc, ~HBA_GHC_IE);
-        bool stopped = (mmio_read32(hba_mem->ghc) & HBA_GHC_IE) == 0;
+        bool stopped = interrupts_stopped && (mmio_read32(hba_mem->ghc) & HBA_GHC_IE) == 0;
         uint32_t const PORTS = mmio_read32(hba_mem->pi);
         for (size_t i = 0; i < MAX_PORTS; ++i) {
             if ((PORTS & (1U << i)) == 0) continue;
@@ -785,7 +1483,44 @@ struct RetirementBackend {
 
 }  // namespace
 
+auto ahci_async_snapshot(BlockDevice* bdev, AhciAsyncSnapshot& snapshot) -> bool {
+#ifdef WOS_ASYNC_BLOCK_IO
+    auto* memory = native_memory(bdev);
+    if (memory == nullptr) return false;
+    size_t const PORT = static_cast<AHCIDevice*>(bdev->private_data)->port_num;
+    if (!port_locks[PORT].try_lock()) return false;
+    uint64_t const FLAGS = memory->slot_guard.lock_irqsave();
+    auto* port = &hba_mem->ports[PORT];
+    native_observe_hardware(*memory, mmio_read32(port->ci), mmio_read32(port->sact));
+    snapshot = memory->stats;
+    snapshot.active = async_rules::owned(memory->async);
+    snapshot.offline = memory->failed || memory->async.offline;
+    memory->slot_guard.unlock_irqrestore(FLAGS);
+    port_locks[PORT].unlock();
+    return true;
+#else
+    (void)bdev;
+    (void)snapshot;
+    return false;
+#endif
+}
+
 #ifdef WOS_SELFTEST
+auto selftest_inject_async_fault(BlockDevice* bdev, SelftestAsyncFault fault) -> bool {
+#ifdef WOS_ASYNC_BLOCK_IO
+    auto* memory = native_memory(bdev);
+    if (memory == nullptr) return false;
+    uint64_t const FLAGS = memory->slot_guard.lock_irqsave();
+    memory->injected_fault = fault;
+    memory->slot_guard.unlock_irqrestore(FLAGS);
+    block_queue_wake(bdev);
+    return true;
+#else
+    (void)bdev;
+    (void)fault;
+    return false;
+#endif
+}
 void selftest_limit_probe_allocations(size_t count) {
     if (controller == nullptr) probe_allocation_budget = count;
 }
@@ -802,6 +1537,23 @@ auto ahci_shutdown() -> int {
     shutdown_attempted = true;
     admission.close();
     if (controller == nullptr || hba_mem == nullptr) return 0;
+#ifdef WOS_ASYNC_BLOCK_IO
+    bool queues_drained = true;
+    for (size_t i = 0; i < device_count; ++i) {
+        auto* bdev = &devices[i].bdev;
+        if (native_memory(bdev) == nullptr) continue;
+        block_queue_close(bdev);
+        if (block_queue_drain(bdev) != 0) queues_drained = false;
+    }
+    if (!queues_drained) {
+        // Keep request and DMA ownership for a future safe service; retirement
+        // cannot free rings while a provider still owns a request.
+        controller_failed.store(true, std::memory_order_release);
+        (void)pci::pci_set_bus_master(controller, false);
+        shutdown_result = -EIO;
+        return shutdown_result;
+    }
+#endif
     auto const BEFORE = dma::stats(controller);
     RetirementBackend backend;
     auto const RESULT = lifecycle::retire(backend);
@@ -866,6 +1618,9 @@ static auto ahci_init() -> int {
               AFTER.backing_pages - BEFORE.backing_pages, static_cast<unsigned long long>(dma_mask));
     admission.open_for_probe();
     probe_port(hba_mem);
+#ifdef WOS_ASYNC_BLOCK_IO
+    native_interrupts_init();
+#endif
     return 0;
 }
 
@@ -876,8 +1631,6 @@ static auto ahci_set_base(volatile uint32_t* base) -> void {
     ahci_log_hex(reinterpret_cast<uint64_t>(base));
     ahci_log("\n");
 }
-
-extern "C" char __kernel_end[];  // NOLINT
 
 // Initializes AHCI controller by discovering and setting up the AHCI device
 auto ahci_controller_init() -> void {
@@ -891,8 +1644,15 @@ auto ahci_controller_init() -> void {
         log::info("controller found, setting up");
         // Extract MMIO base from BAR5
         uint32_t const BAR5 = ahci_dev->bar.at(5);
-        // BAR5 for AHCI is a memory-mapped I/O base address
-        if (BAR5 != 0 && BAR5 != UINT32_MAX) {
+        uint64_t const PHYSICAL = BAR5 & ~uint32_t{0xf};
+        uint64_t const HHDM = mod::mm::addr::get_hhdm_offset();
+        constexpr uint64_t AHCI_SIZE = 0x2000;  // 2 pages
+        // Share a checked high-half alias with every task's kernel mappings;
+        // randomized image-end placement can wrap into a private user half.
+        if ((BAR5 & 1U) == 0 && BAR5 != UINT32_MAX && PHYSICAL != 0 && (PHYSICAL & (mod::mm::paging::PAGE_SIZE - 1)) == 0 &&
+            HHDM >= 0xffff800000000000ULL && (HHDM & (mod::mm::paging::PAGE_SIZE - 1)) == 0 && PHYSICAL <= UINT64_MAX - (AHCI_SIZE - 1) &&
+            HHDM <= UINT64_MAX - PHYSICAL && AHCI_SIZE - 1 <= UINT64_MAX - HHDM - PHYSICAL) {
+            uint64_t const AHCI_KERNEL_VADDR = HHDM + PHYSICAL;
             // MMIO access precedes engine stop; BME admission moves into
             // ahci_init after every required managed ring/buffer mapping.
             pci::pci_enable_memory_space(ahci_dev);
@@ -915,17 +1675,11 @@ auto ahci_controller_init() -> void {
                     return;
                 }
             }
-            // Place MMIO after the kernel image (linker-provided end + 2MB guard gap, page-aligned)
-            const auto KERNEL_END = reinterpret_cast<uint64_t>(__kernel_end);
-            constexpr uint64_t MMIO_GUARD_GAP = 0x200000;  // 2 MB
-            const uint64_t AHCI_KERNEL_VADDR = (KERNEL_END + MMIO_GUARD_GAP + 0xFFF) & ~0xFFFULL;
-            const uint64_t AHCI_SIZE = 0x2000;  // 2 pages
-
-            log::info("mapping MMIO from physical 0x%x to virtual 0x%lx", BAR5, AHCI_KERNEL_VADDR);
+            log::info("mapping MMIO from physical 0x%lx to virtual 0x%lx", PHYSICAL, AHCI_KERNEL_VADDR);
 
             // Map the MMIO region to kernel space
             for (uint64_t offset = 0; offset < AHCI_SIZE; offset += mod::mm::paging::PAGE_SIZE) {
-                ker::mod::mm::virt::map_to_kernel_page_table(AHCI_KERNEL_VADDR + offset, BAR5 + offset,
+                ker::mod::mm::virt::map_to_kernel_page_table(AHCI_KERNEL_VADDR + offset, PHYSICAL + offset,
                                                              ker::mod::mm::virt::kernel_mmio_page_flags());
             }
 
@@ -935,7 +1689,8 @@ auto ahci_controller_init() -> void {
             // Now initialize AHCI
             ahci_init();
         } else {
-            log::error("invalid BAR5 address: 0x%x", BAR5);
+            (void)pci::pci_set_bus_master(ahci_dev, false);
+            log::error("invalid MMIO BAR5/HHDM range: bar=0x%x hhdm=0x%lx", BAR5, HHDM);
         }
     } else {
         log::info("no controller found on PCI");

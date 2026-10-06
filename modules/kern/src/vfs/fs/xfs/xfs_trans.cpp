@@ -143,6 +143,35 @@ auto xfs_trans_clone_ifork(const XfsIfork& source, XfsIfork* destination) -> int
     }
 }
 
+#ifdef WOS_ASYNC_BLOCK_IO
+auto xfs_trans_allocate_before_image(XfsTransBufUndo& undo, size_t size) -> uint8_t* {
+    // Exact-size backing avoids a heap header and redundant zeroing. The
+    // capture path initializes every byte before publishing the undo record.
+    // One non-reclaiming attempt preserves the original heap fallback.
+    constexpr size_t MAX_PAGE_BACKING_BYTES = size_t{64} * 1024;
+    if (size >= ker::mod::mm::paging::PAGE_SIZE && size <= MAX_PAGE_BACKING_BYTES && (size % ker::mod::mm::paging::PAGE_SIZE) == 0 &&
+        (size & (size - 1)) == 0) {
+        auto* data = static_cast<uint8_t*>(ker::mod::mm::phys::page_alloc_full_overwrite_may_fail(
+            ker::mod::mm::PhysicalPageOwner::XFS_TRANSACTION_METADATA, size, "xfs_undo"));
+        if (data != nullptr) {
+            undo.before_image_page_allocated = true;
+            return data;
+        }
+    }
+    return new (std::nothrow) uint8_t[size];
+}
+#endif
+
+void xfs_trans_free_before_image(XfsTransBufUndo* undo) {
+#ifdef WOS_ASYNC_BLOCK_IO
+    if (undo->before_image_page_allocated) {
+        ker::mod::mm::phys::page_free(undo->before_image);
+        return;
+    }
+#endif
+    delete[] undo->before_image;
+}
+
 void xfs_trans_discard_undo(XfsTransaction* tp) {
     while (tp->buf_undo != nullptr) {
         XfsTransBufUndo* undo = tp->buf_undo;
@@ -153,7 +182,7 @@ void xfs_trans_discard_undo(XfsTransaction* tp) {
             }
             brelse(undo->bp);
         }
-        delete[] undo->before_image;
+        xfs_trans_free_before_image(undo);
         delete undo;
     }
     while (tp->perag_undo != nullptr) {
@@ -606,7 +635,11 @@ auto xfs_trans_capture_buf(XfsTransaction* tp, BufHead* bp) -> int {
         tp->error = -ENOMEM;
         return -ENOMEM;
     }
+#ifdef WOS_ASYNC_BLOCK_IO
+    undo->before_image = xfs_trans_allocate_before_image(*undo, bp->size);
+#else
     undo->before_image = new (std::nothrow) uint8_t[bp->size];
+#endif
     if (undo->before_image == nullptr) {
         delete undo;
         tp->error = -ENOMEM;
@@ -638,7 +671,7 @@ auto xfs_trans_capture_buf(XfsTransaction* tp, BufHead* bp) -> int {
         if (current == nullptr || current->data == nullptr || span_undo->before_image == nullptr) {
             bjournal_release(bp);
             undo->journal_held = false;
-            delete[] undo->before_image;
+            xfs_trans_free_before_image(undo);
             delete undo;
             tp->error = -EIO;
             return -EIO;

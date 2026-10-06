@@ -15,6 +15,22 @@ inline constexpr size_t MAX_SHRINKERS = 16;
 inline constexpr size_t MAX_WATERMARK_ZONES = 128;
 inline constexpr uint32_t DIRECT_RECLAIM_MAX_PASSES = 8;
 
+// Prevent direct allocator reclaim from issuing I/O while the caller owns
+// storage service state. The scope follows its creating Task across migration;
+// it leaves scheduling, blocking and allocation enabled. Early boot is a no-op.
+class NoIoScope {
+   public:
+    NoIoScope();
+    ~NoIoScope();
+    NoIoScope(const NoIoScope&) = delete;
+    auto operator=(const NoIoScope&) -> NoIoScope& = delete;
+    NoIoScope(NoIoScope&&) = delete;
+    auto operator=(NoIoScope&&) -> NoIoScope& = delete;
+
+   private:
+    uint32_t* depth_{};
+};
+
 enum class ReclaimContext : uint8_t {
     DIRECT = 0,
     BACKGROUND,

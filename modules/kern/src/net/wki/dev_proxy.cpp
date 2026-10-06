@@ -10,6 +10,7 @@
 #include <cstring>
 #include <deque>
 #include <dev/block_device.hpp>
+#include <dev/block_request.hpp>
 #include <limits>
 #include <memory>
 #include <net/backlog.hpp>
@@ -163,7 +164,7 @@ void unindex_proxy_locked(ProxyBlockState* state) {
 auto erase_proxy_exact_locked(ProxyBlockState* state) -> bool {
     for (auto it = g_proxies.begin(); it != g_proxies.end(); ++it) {
         if (it->get() == state) {
-            if (state->ever_published || state->detach_pending || state->cleanup_in_progress) {
+            if (state->ever_published || state->async_configured || state->detach_pending || state->cleanup_in_progress) {
                 return false;
             }
             unindex_proxy_locked(state);
@@ -527,6 +528,12 @@ auto refresh_proxy_zone_key(ProxyBlockState* state) -> bool {
 void cleanup_failed_block_attach(ProxyBlockState* state, const WkiChannelIdentity& channel_to_close, bool send_detach) {
     if (state == nullptr) {
         return;
+    }
+    if (state->async_configured) {
+        ker::dev::block_queue_close(&state->bdev);
+        static_cast<void>(ker::dev::block_queue_begin_reset(&state->bdev, -ENOTCONN));
+        static_cast<void>(ker::dev::block_queue_drain(&state->bdev));
+        static_cast<void>(ker::dev::block_queue_finish_reset(&state->bdev, false));
     }
 
     uint16_t owner_node = WKI_NODE_INVALID;
@@ -1274,6 +1281,12 @@ void rdma_signal_server(ProxyBlockState* state, uint32_t ring_index, uint32_t op
 // Returns true if the proxy came back, false if the fence timed out (proxy torn down).
 auto wait_for_fence_lift(ProxyBlockState* state) -> bool {
     while (proxy_block_fenced(state)) {
+        // A task cleanup owns lifting/retiring this fence. An admitted async
+        // adapter must leave its RPC before that cleanup can join its queue.
+        s_proxy_lock.lock();
+        bool const RETIRING = state->cleanup_in_progress || state->epoch_reset_pending;
+        s_proxy_lock.unlock();
+        if (RETIRING) return false;
         // Check if the fence timeout has expired (hard teardown will clear active)
         if (!proxy_block_active(state)) {
             return false;
@@ -1339,6 +1352,10 @@ class BlockResumeClaim {
 
 void wait_for_block_io_quiescence(ProxyBlockState* state) {
     if (state != nullptr) {
+        if (state->async_configured) {
+            static_cast<void>(ker::dev::block_queue_begin_reset(&state->bdev, -ENOTCONN));
+            static_cast<void>(ker::dev::block_queue_drain(&state->bdev));
+        }
         state->io_lock.lock();
         state->io_lock.unlock();
     }
@@ -3471,6 +3488,19 @@ auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, uint6
     state->bdev.flush = remote_block_flush;
     state->bdev.private_data = state;
 
+#ifdef WOS_ASYNC_BLOCK_IO
+    // The serial authenticated-RPC adapter removes caller blocking while
+    // preserving the existing one-RPC/one-lease protocol and flush ordering.
+    ker::dev::BlockQueueLimits const QUEUE_LIMITS{1, size_t{512} * 1024, 32, 64, size_t{8} * 1024 * 1024};
+    if (ker::dev::block_queue_configure(&state->bdev, QUEUE_LIMITS) != 0) {
+        cleanup_failed_block_attach(state, reserved_channel_identity, true);
+        return nullptr;
+    }
+    s_proxy_lock.lock();
+    state->async_configured = true;
+    s_proxy_lock.unlock();
+#endif
+
     // Set up streaming bulk transfer if the server advertised support.
     static_cast<void>(setup_block_bulk_staging(state));
 
@@ -3541,7 +3571,9 @@ void wki_dev_proxy_detach_block(ker::dev::BlockDevice* proxy_bdev) {
         break;
     }
 
+    if (state->async_configured) ker::dev::block_queue_close(&state->bdev);
     wait_for_block_io_quiescence(state);
+    if (state->async_configured) static_cast<void>(ker::dev::block_queue_finish_reset(&state->bdev, false));
     wait_for_block_chaos_doorbell_quiescence(state);
 
     s_proxy_lock.lock();
@@ -3748,6 +3780,8 @@ void wki_dev_proxy_cleanup_epoch_reset_for_peer(uint16_t node_id, bool retire_pr
         }
         state->lock.unlock();
         s_proxy_lock.unlock();
+
+        if (retire_proxy && state->async_configured) static_cast<void>(ker::dev::block_queue_finish_reset(&state->bdev, false));
 
         finish_claimed_waiter(op_waiter, WKI_ERR_PEER_FENCED);
         finish_claimed_waiter(attach_waiter, WKI_ERR_PEER_FENCED);
@@ -4114,6 +4148,12 @@ void wki_dev_proxy_resume_for_peer(uint16_t node_id) {
                 static_cast<void>(wki_channel_close_generation(rebound_channel_identity.channel, rebound_channel_identity.peer_node_id,
                                                                rebound_channel_identity.channel_id, rebound_channel_identity.generation));
                 continue;
+            }
+
+            if (p->async_configured) {
+                // Queue epoch changes only after all old RPC accesses and
+                // callbacks retired; authenticated reattach lifted the fence.
+                static_cast<void>(ker::dev::block_queue_finish_reset(&p->bdev, true));
             }
 
             ker::mod::dbg::log("[WKI] Dev proxy resumed: %s node=0x%04x ch=%u access=%s - blocked I/O will now proceed",

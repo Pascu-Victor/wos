@@ -759,7 +759,8 @@ TEST_F(BufferCacheTest, SyncRangeWritesOverlappingMultiBlockDirtyBuffer) {
 
     EXPECT_EQ(sync_bdev_range(&dev, BLOCK_NO + BLOCK_COUNT, 1), 0);
     EXPECT_EQ(io.write_calls, 1u);
-    EXPECT_EQ(io.flush_calls, 1u);
+    // Clean ranges still publish a barrier for prior/background writes.
+    EXPECT_EQ(io.flush_calls, 2u);
     dev.private_data = nullptr;
 }
 

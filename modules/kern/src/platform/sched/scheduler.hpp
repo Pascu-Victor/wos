@@ -468,6 +468,9 @@ auto signal_visible_processes_except(uint64_t excluded_pid, uint64_t excluded_ow
 void wake_task_for_signal(task::Task* task);  // Make a signaled blocked task runnable so signal delivery can occur
 [[nodiscard]] auto kernel_threads_shutdown_requested() -> bool;
 void maybe_exit_current_kernel_thread_for_shutdown();
+// DAEMON entry completion after all subsystem ownership and RAII scopes have
+// retired. The unexpected entry-return fallback remains an error diagnostic.
+[[noreturn]] void exit_current_kernel_thread();
 // Scope is bound to the current task, including after migration. Construction
 // before task context exists returns a no-op hold; destruction never exits.
 [[nodiscard]] auto hold_kernel_shutdown() -> KernelShutdownHold;

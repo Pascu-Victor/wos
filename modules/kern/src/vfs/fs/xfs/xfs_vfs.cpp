@@ -13,9 +13,12 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <dev/block_request.hpp>
+#include <mod/io/serial/serial.hpp>
 #include <new>
 #include <optional>
 #include <platform/ktime/ktime.hpp>
+#include <platform/mm/addr.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/swap.hpp>
 #include <platform/perf/perf_events.hpp>
@@ -62,6 +65,10 @@ std::atomic<uint64_t> xfs_search_authority_generation_value{1};
 
 constexpr uint32_t XFS_SLOW_TRACE_US = 2048;
 constexpr size_t XFS_READ_BATCH_MAX_BYTES = size_t{2} * 1024 * 1024;
+constexpr size_t XFS_READ_CACHE_COPY_MAX_BYTES = size_t{512} * 1024;
+constexpr size_t XFS_READ_CLUSTER_DEMAND_MAX_BYTES = size_t{512} * 1024;
+constexpr size_t XFS_READ_CLUSTER_MAX_BYTES = size_t{4} * 1024 * 1024;
+constexpr size_t XFS_READ_CLUSTER_MIN_BYTES = size_t{64} * 1024;
 constexpr int64_t XFS_NSEC_PER_SEC_SIGNED = 1000000000LL;
 constexpr uint64_t XFS_NSEC_PER_SEC = static_cast<uint64_t>(XFS_NSEC_PER_SEC_SIGNED);
 constexpr int64_t XFS_BIGTIME_EPOCH_OFFSET = (1LL << 31);
@@ -134,6 +141,9 @@ struct XfsFileData {
     bool may_have_eof_prealloc{};
     bool close_may_need_inode_commit{};
     bool swap_extent_pin{};
+    // Offset prediction only; mappings and EOF are resolved again under io_lock.
+    size_t read_next_offset{};
+    bool read_sequence_valid{};
 };
 
 void xfs_recent_write_stat_invalidate(XfsFileData* xfd) {
@@ -455,6 +465,67 @@ auto xfs_read_batch_max_bytes(size_t block_size) -> size_t {
     }
     size_t const MAX_BLOCKS = std::max<size_t>(1, XFS_READ_BATCH_MAX_BYTES / block_size);
     return MAX_BLOCKS * block_size;
+}
+
+auto xfs_read_kernel_destination_eligible(const void* destination, size_t bytes) -> bool {
+#ifdef WOS_ASYNC_BLOCK_IO
+    uint64_t const HHDM = ker::mod::mm::addr::get_hhdm_offset();
+    uint64_t const START = reinterpret_cast<uint64_t>(destination);
+    return HHDM != 0 && START >= HHDM && bytes != 0 && bytes - 1 <= UINT64_MAX - START;
+#else
+    static_cast<void>(destination);
+    static_cast<void>(bytes);
+    return false;
+#endif
+}
+
+auto xfs_read_cluster_context_eligible() -> bool {
+#ifdef WOS_ASYNC_BLOCK_IO
+    namespace sched = ker::mod::sched;
+    if (!sched::has_run_queues() || !sched::can_query_current_task() || ker::mod::io::serial::is_panic_mode() ||
+        sched::kernel_threads_shutdown_requested()) {
+        return false;
+    }
+    auto* task = sched::get_current_task();
+    if (task == nullptr || task->type != sched::task::TaskType::PROCESS || task->preempt_disable_depth != 0) return false;
+    bool const RETURN_YIELD = task->deferred_task_switch && task->yield_switch && task->wait_channel == nullptr &&
+                              task->wait_channel_kind == sched::task::WaitChannelKind::NONE;
+    return task->syscall_account_start_us != 0 && !task->scheduler_transition_active.load(std::memory_order_acquire) &&
+           (!task->deferred_task_switch || RETURN_YIELD) && !task->wants_block && !task->is_voluntary_blocked() &&
+           task->wki_proxy_task_id == 0 && !task->wait_channel_is(sched::task::WaitChannelKind::WKI_EXECVE_PROXY) &&
+           !task->has_interrupting_signal_pending();
+#else
+    return false;
+#endif
+}
+
+auto xfs_read_cluster_bytes(XfsMountContext* ctx, const XfsBmapResult& bmap, size_t read_offset, uint64_t file_size, size_t demand,
+                            bool sequential) -> size_t {
+    if (!sequential || demand < XFS_READ_CLUSTER_MIN_BYTES || demand >= XFS_READ_CLUSTER_DEMAND_MAX_BYTES || ctx == nullptr ||
+        ctx->device == nullptr || ctx->block_size == 0 || demand % ctx->block_size != 0 || read_offset % ctx->block_size != 0 ||
+        read_offset >= file_size || bmap.is_hole || bmap.unwritten || bmap.startblock == NULLFSBLOCK || bmap.blockcount == 0 ||
+        ctx->ag_blk_log >= 64 || !xfs_read_cluster_context_eligible() || !dev::block_queue_available(ctx->device)) {
+        return demand;
+    }
+    dev::BlockQueueLimits const LIMITS = dev::block_queue_limits(ctx->device);
+    if (LIMITS.depth <= 1 || LIMITS.max_segments == 0 || LIMITS.max_requests == 0 || LIMITS.max_transfer_bytes == 0) return demand;
+    auto const AG = bmap.startblock >> ctx->ag_blk_log;
+    uint64_t const AG_BLOCK = bmap.startblock & ((uint64_t{1} << ctx->ag_blk_log) - 1);
+    if (ctx->ag_blocks == 0 || ctx->ag_blocks > (uint64_t{1} << ctx->ag_blk_log) || AG >= ctx->ag_count || AG_BLOCK >= ctx->ag_blocks)
+        return demand;
+    uint64_t const AG_START = AG * static_cast<uint64_t>(ctx->ag_blocks);
+    if (AG_START >= ctx->total_blocks) return demand;
+    uint64_t const AG_SIZE = std::min<uint64_t>(ctx->ag_blocks, ctx->total_blocks - AG_START);
+    if (AG_BLOCK >= AG_SIZE) return demand;
+    uint64_t const BOUND_BLOCKS =
+        std::min({static_cast<uint64_t>(bmap.blockcount), AG_SIZE - AG_BLOCK, (file_size - read_offset) / ctx->block_size});
+    // Aggregate only this caller's bounded read; bread_multi retains and joins
+    // every provider-sized slice before the inode mapping lock is released.
+    size_t const SLOTS = std::min(LIMITS.depth, LIMITS.max_requests);
+    size_t const TRANSFER_BUDGET = SLOTS > SIZE_MAX / LIMITS.max_transfer_bytes ? SIZE_MAX : LIMITS.max_transfer_bytes * SLOTS;
+    size_t const BYTE_LIMIT = std::min({XFS_READ_CLUSTER_MAX_BYTES, TRANSFER_BUDGET, LIMITS.max_inflight_bytes});
+    size_t const READ_BYTES = static_cast<size_t>(std::min<uint64_t>(BOUND_BLOCKS, BYTE_LIMIT / ctx->block_size)) * ctx->block_size;
+    return std::max(demand, READ_BYTES);
 }
 
 void xfs_set_alloc_hint_from_fsb(XfsMountContext* ctx, xfs_fsblock_t fsb, XfsAllocReq* req) {
@@ -1239,6 +1310,9 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
     // duration of this read. B-tree lookup only reads buffer-cache state, so it
     // does not need to serialize unrelated files through the mount mutex.
 
+    bool const SEQUENTIAL = xfd->read_sequence_valid && xfd->read_next_offset == offset;
+    xfd->read_sequence_valid = false;
+
     // Inline data (LOCAL format)
     if (ip->data_fork.format == XFS_DINODE_FMT_LOCAL) {
         if (offset >= ip->size) {
@@ -1261,6 +1335,10 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
     uint64_t const PERF_READ_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::READ);
     uint32_t perf_accounted_us = 0;
     auto finish_read = [&](ssize_t result) -> ssize_t {
+        if (result > 0 && static_cast<size_t>(result) <= SIZE_MAX - offset) {
+            xfd->read_next_offset = offset + static_cast<size_t>(result);
+            xfd->read_sequence_valid = true;
+        }
         uint64_t const BYTES = result > 0 ? static_cast<uint64_t>(result) : static_cast<uint64_t>(total_read);
         int32_t const STATUS = result < 0 ? static_cast<int32_t>(result) : 0;
         if (PERF_READ_STARTED_US != 0) {
@@ -1392,16 +1470,38 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
         t0 = ker::mod::tsc::get_ns();
 #endif
         if (BLOCK_OFF == 0 && (chunk & (ctx->block_size - 1)) == 0) {
-            // Cache the complete request span. Besides coalescing the first
-            // device read, bread_multi reuses overlapping cached aliases and
-            // overlays newer dirty buffers before returning the data.
+            // Cache the complete request span. Native bread_multi pipelines
+            // bounded demand slices while this inode io_lock freezes mappings;
+            // all slices retire before publication/copy. Dirty aliases remain
+            // authoritative; no supplemental read escapes this inode lock.
             size_t const FSB_COUNT = chunk >> ctx->block_log;
             uint64_t const DEV_BLOCK = xfs_fsblock_to_dev_block(ctx, DISK_BLOCK);
             size_t const DEV_COUNT = xfs_fsb_to_dev_count(ctx, static_cast<xfs_filblks_t>(FSB_COUNT));
 #ifdef XFS_BENCH
             acc_io += ker::mod::tsc::get_ns() - t0;
 #endif
-            BufHead* bp = bread_multi(ctx->device, DEV_BLOCK, DEV_COUNT, BufferReadClass::FILE_DATA);
+            bool const KERNEL_DESTINATION = xfs_read_kernel_destination_eligible(dst + total_read, chunk);
+            bool const NATIVE_CACHE = KERNEL_DESTINATION && xfs_inode_isreg(ip) && !bmap.unwritten &&
+                                      chunk <= XFS_READ_CACHE_COPY_MAX_BYTES && dev::block_queue_available(ctx->device) &&
+                                      dev::block_queue_limits(ctx->device).depth > 1;
+            if (NATIVE_CACHE && copy_cached_bdev_range_if_complete(ctx->device, DEV_BLOCK, DEV_COUNT, dst + total_read)) {
+                perf_accounted_us +=
+                    perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_IO, PERF_IO_STARTED_US, 0, chunk);
+                total_read += chunk;
+                remaining -= chunk;
+                continue;
+            }
+            // A cache miss can partially copy. The referenced demand read
+            // below overwrites the complete returned prefix in that case.
+            size_t const READ_BYTES = xfs_read_cluster_bytes(ctx, bmap, offset + total_read, ip->size, chunk,
+                                                             KERNEL_DESTINATION && xfs_inode_isreg(ip) && SEQUENTIAL);
+            size_t const READ_DEV_COUNT = xfs_fsb_to_dev_count(ctx, static_cast<xfs_filblks_t>(READ_BYTES >> ctx->block_log));
+            BufHead* bp = bread_multi(ctx->device, DEV_BLOCK, READ_DEV_COUNT, BufferReadClass::FILE_DATA);
+            if (bp == nullptr && READ_BYTES > chunk) {
+                // bread_multi retires all native slices and detached backing
+                // on failure. An unread future block must not fail demand.
+                bp = bread_multi(ctx->device, DEV_BLOCK, DEV_COUNT, BufferReadClass::FILE_DATA);
+            }
             perf_accounted_us += perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_IO, PERF_IO_STARTED_US,
                                                                bp != nullptr ? 0 : -EIO, bp != nullptr ? chunk : 0);
             if (bp == nullptr) {

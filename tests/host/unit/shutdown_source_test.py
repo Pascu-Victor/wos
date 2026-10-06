@@ -446,6 +446,31 @@ def test_shutdown_unmount_is_exact_deepest_first_and_root_last() -> None:
     )
 
 
+def test_drained_workers_exit_explicitly_without_suppressing_unexpected_returns() -> None:
+    scheduler = SCHEDULER_CPP.read_text()
+    require_tokens(SCHEDULER_HPP.read_text(), ["[[noreturn]] void exit_current_kernel_thread();"], "clean daemon termination API")
+    clean_exit = function_body(scheduler, "exit_current_kernel_thread")
+    require_tokens(clean_exit, ["ker::syscall::process::wos_proc_exit(0);"], "existing status-zero task cleanup")
+    forbid_tokens(clean_exit, ["kernel_threads_shutdown_requested", "kernel_shutdown_requested", "log::"],
+                  "clean completion must not depend on shutdown flags or suppress diagnostics")
+    unexpected = function_body(scheduler, "wos_kernel_thread_returned")
+    require_order(unexpected, '::error("kernel thread returned:', "ker::syscall::process::wos_proc_exit(0);",
+                  "unexpected entry return keeps its error diagnostic")
+    block_request = (ROOT / "modules/kern/src/dev/block_request.cpp").read_text()
+    require_order(function_body(block_request, "worker_entry"), "worker_loop()", "sched::exit_current_kernel_thread();",
+                  "block loop unwinds scopes before explicit exit")
+    require_order(function_body(block_request, "worker_loop"), "own->worker = nullptr;", "current->release();",
+                  "block worker retires queue publication before retained ownership")
+    workqueue = (ROOT / "modules/kern/src/platform/sched/workqueue.cpp").read_text()
+    # The inner scope is necessary: terminating a task does not run C++ destructors.
+    require_tokens(workqueue, ["    }\n    exit_current_kernel_thread();\n}"], "workqueue shutdown hold ends before task exit")
+    virt = (ROOT / "modules/kern/src/platform/mm/virt.opt.cpp").read_text()
+    require_order(function_body(virt, "lazy_file_fault_worker_entry"), "lazy_file_fault_worker_loop();",
+                  "sched::exit_current_kernel_thread();", "FILE loop unwinds scopes before explicit exit")
+    require_order(function_body(virt, "lazy_file_fault_worker_loop"), "lazy_file_fault_worker = nullptr;", "current->release();",
+                  "FILE worker retires publication before retained ownership")
+
+
 def test_acpi_power_validates_fadt_reset_pm1_and_s5() -> None:
     source = ACPI_POWER_CPP.read_text()
     require_tokens(
@@ -477,6 +502,7 @@ def main() -> None:
     test_init_owns_scheduled_shutdown_and_service_sync_order()
     test_kernel_finalizer_sequences_teardown_sync_unmount_and_platform_action()
     test_kernel_thread_shutdown_is_scheduler_owned_not_ntp_specific()
+    test_drained_workers_exit_explicitly_without_suppressing_unexpected_returns()
     test_shutdown_unmount_is_exact_deepest_first_and_root_last()
     test_acpi_power_validates_fadt_reset_pm1_and_s5()
     print("shutdown/reboot v1 source invariants hold")

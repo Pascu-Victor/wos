@@ -3,8 +3,7 @@
 // Workqueue - deferred work execution on dedicated kernel threads.
 //
 // Each Workqueue owns one kernel thread that drains a FIFO of work items.
-// XFS uses workqueues for: journal log writes, inode reclaim, extent
-// freeing, buffer writeback.
+// Buffer-cache dirty writeback uses a permanent workqueue.
 //
 // Reference: Linux kernel/workqueue.c (simplified single-threaded variant)
 
@@ -35,17 +34,21 @@ class Workqueue {
     static auto create(const char* name) -> Workqueue*;
 
     // Enqueue a work item for execution by the worker thread.
-    // The WorkItem pointed to by `item` must remain valid until the work
-    // function has been called (typically stack- or kmalloc-allocated).
-    void enqueue(WorkItem* item);
+    // The item stays live through callback return and must not already be
+    // queued. Rejection after close/invalid input takes no item ownership.
+    // Allocation-free and IRQ-safe; caller keeps queue storage live through
+    // every concurrent producer call, including calls racing destroy().
+    auto enqueue(WorkItem* item) -> bool;
 
-    // Flush - block the caller until all currently-queued work has completed.
-    // New work submitted after the flush call returns is NOT waited on.
-    void flush();
+    // Join all work admitted before the snapshot, including a running callback.
+    // Returns false from this queue's own worker: no join was performed.
+    auto flush() -> bool;
 
     // Destroy the workqueue (drain remaining items, stop the worker thread).
-    // After this call the Workqueue object should be freed by the caller.
-    void destroy();
+    // Returns true only after callbacks and the worker's final queue access
+    // retire. The caller may then delete after joining producer API calls.
+    // Returns false from its own worker; caller MUST NOT delete in that case.
+    auto destroy() -> bool;
 
     // Get the name of the workqueue.
     auto name() const -> const char* { return wk_name; }
@@ -66,18 +69,11 @@ class Workqueue {
     sys::Spinlock lock;
     WorkItem* head = nullptr;
     WorkItem* tail = nullptr;
-    std::atomic<uint32_t> pending_count{0};
-
-    // Flush synchronization - incremented after completing each work item.
-    // flush() snapshots pending_count_ and spins until completed >= snapshot.
+    uint64_t submitted_count{};  // Queue guard; never wraps.
+    // Mutated under queue guard, acquired by flush waiters after fn returns.
     std::atomic<uint64_t> completed_count{0};
-
-    // Shutdown flag
-    std::atomic<bool> stopping{false};
-
-    // Thread-local pointer to the Workqueue that owns the current worker
-    // thread (set inside worker_entry so the static entry can find the wq).
-    static Workqueue* current_wq_;  // NOLINT - per-thread but only one worker per wq
+    bool stopping{};                   // Queue guard; closes admission before draining.
+    std::atomic<bool> stopped{false};  // Worker's final queue access.
 };
 
 }  // namespace ker::mod::sched

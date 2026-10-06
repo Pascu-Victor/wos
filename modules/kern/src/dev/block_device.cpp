@@ -6,6 +6,9 @@
 #include <cstdint>
 #include <cstring>
 #include <dev/gpt.hpp>
+#ifdef WOS_ASYNC_BLOCK_IO
+#include <dev/block_request.hpp>
+#endif
 #include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/perf/perf_events.hpp>
@@ -189,6 +192,12 @@ auto block_device_unregister(BlockDevice* bdev) -> int {
     if (retired == nullptr) {
         return -1;
     }
+#ifdef WOS_ASYNC_BLOCK_IO
+    if (!bdev->is_partition && block_queue_configured(bdev)) {
+        block_queue_close(bdev);
+        static_cast<void>(block_queue_drain(bdev));
+    }
+#endif
     // Keep the name reserved until wrapper removal finishes. Neither registry
     // guard spans the other registry's callbacks or entry reclamation.
     static_cast<void>(dev_unregister(&retired->node));
@@ -271,6 +280,9 @@ auto block_read(BlockDevice* bdev, uint64_t block, size_t count, void* buffer) -
         log::error("block_read: invalid zero block size for %s", bdev->name.data());
         return -EINVAL;
     }
+#ifdef WOS_ASYNC_BLOCK_IO
+    if (block_queue_configured(bdev)) return block_request_sync(bdev, BlockRequestOperation::READ, block, count, buffer);
+#endif
 
     auto* out = static_cast<uint8_t*>(buffer);
     uint64_t current_block = block;
@@ -320,6 +332,10 @@ auto block_write(BlockDevice* bdev, uint64_t block, size_t count, const void* bu
         log::error("block_write: invalid zero block size for %s", bdev->name.data());
         return -EINVAL;
     }
+#ifdef WOS_ASYNC_BLOCK_IO
+    if (block_queue_configured(bdev))
+        return block_request_sync(bdev, BlockRequestOperation::WRITE, block, count, const_cast<void*>(buffer));
+#endif
 
     auto const* in = static_cast<uint8_t const*>(buffer);
     uint64_t current_block = block;
@@ -352,6 +368,9 @@ auto block_flush(BlockDevice* bdev) -> int {
         // (for example the RAM disk) advertise an explicit no-op callback.
         return -EOPNOTSUPP;
     }
+#ifdef WOS_ASYNC_BLOCK_IO
+    if (block_queue_configured(bdev)) return block_request_sync(bdev, BlockRequestOperation::FLUSH, 0, 0, nullptr);
+#endif
 
     return normalize_io_result(bdev->flush(bdev));
 }

@@ -81,6 +81,7 @@ enum class ProcNodeType : uint8_t {
     TIMEKEEPING_FILE,  // /proc/timekeeping -> clocksource and wall-clock discipline
     KPERFSTATUS_FILE,  // /proc/kperfstatus -> recording session/loss/consumer counters
     WKI_NAPI_FILE,     // /proc/wki/napi -> bounded admitted virtio queue diagnostics
+    BLOCK_QUEUE_FILE,  // /proc/blockq -> bounded block request/latency counters
 };
 
 struct ProcNode {

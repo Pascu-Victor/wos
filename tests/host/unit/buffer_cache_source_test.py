@@ -60,6 +60,51 @@ def require_order(source: str, tokens: list[str], context: str) -> None:
 def main() -> None:
     source = BUFFER_CACHE.read_text()
     xfs_mount = XFS_MOUNT.read_text()
+    require(source, "constexpr size_t DIRTY_WRITEBACK_PIPELINE_DEPTH = 8;", "cache asynchronous descriptor budget")
+    read_pipeline = function_body(source, "read_blocks_pipelined")
+    require_order(read_pipeline, ["dev::block_request_submit_for_wait(", "dev::block_request_wait(",
+                                  "dev::block_request_release(", "to_wait->accepted = false", "delete multiple"],
+                  "demand read descriptor storage must remain live through every accepted slice retirement")
+    require_order(read_pipeline, ["ReadIo single{}", "if (TOTAL > MAX_SLICE)",
+                                  "new (std::nothrow) std::array<ReadIo, DIRTY_WRITEBACK_PIPELINE_DEPTH>",
+                                  "NoIoScope const NO_IO", "dev::block_request_submit_for_wait("],
+                  "stack demand descriptor and bounded larger storage must exist before caller-serviced admission")
+    retire_io = function_body(source, "retire_writeback_io")
+    require_order(retire_io, ["finish_dirty_writeback_run(", "free_writeback_snapshot(", "brelse(",
+                              "cache_lock.lock_irqsave()", "*active = io->active_next", "destroy_writeback_io(io)"],
+                  "writeback join token must remain published through snapshot and reference cleanup")
+    write_pipeline = function_body(source, "writeback_dirty_pipeline")
+    require_order(write_pipeline, ["cache_lock.lock_irqsave()",
+                                   "bool const HAVE_CANDIDATE = find_writeback_candidate_locked(filter, failed_epoch, max_epoch, true) != nullptr",
+                                   "cache_lock.unlock_irqrestore(PEEK_FLAGS)", "if (!HAVE_CANDIDATE)",
+                                   "break", "allocate_writeback_io()",
+                                   "collect_dirty_writeback_run_locked(", "size_t const PREPARED_COUNT",
+                                   "submit_writeback_slice(*io, PREPARED_COUNT == 1)", "dev::block_request_wait("],
+                  "nonmutating work peek must precede allocation, while sole admission immediately reaches its join")
+    allocate_io = function_body(source, "allocate_writeback_io")
+    require_order(allocate_io, ["page_alloc_full_overwrite_may_fail(", "PhysicalPageOwner::BUFFER_CACHE_METADATA",
+                               "sizeof(DirtyWritebackIo)", '"buffer_cache_writeback"', "if (STORAGE != nullptr)",
+                               "new (STORAGE) DirtyWritebackIo", "io->physical_backing = true",
+                               "return io", "new (std::nothrow) DirtyWritebackIo"],
+                  "one full-overwrite metadata attempt must construct all members before heap fallback or publication")
+    require(source, "bool physical_backing{}", "heap construction must preserve a false backing tag")
+    require_absent(allocate_io, "cache_lock", "descriptor allocation must remain outside the cache guard")
+    destroy_io = function_body(source, "destroy_writeback_io")
+    require_order(destroy_io, ["if (io->physical_backing)", "io->~DirtyWritebackIo()", "page_free(io)", "else", "delete io"],
+                  "each metadata backing must use its matching destruction and allocator")
+    require_order(write_pipeline, ["collect_dirty_writeback_run_locked(", "if (!WB.wrote)", "destroy_writeback_io(io)",
+                                   "io = nullptr"], "a rejected collector must retire its unsubmitted descriptor")
+    require_order(write_pipeline, ["dev::block_request_release(", "bool const ACTIVE = matching_writeback_locked(filter)",
+                                   "bool const RETRY_SELECTION", "cache_lock.unlock_irqrestore(IRQFLAGS)",
+                                   "if (ACTIVE)", "kern_yield()", "if (RETRY_SELECTION)"],
+                  "empty refill must retain foreign cleanup join and fresh candidate retry checks")
+    submit_slice = function_body(source, "submit_writeback_slice")
+    require_order(submit_slice, ["int const RC =", "immediate_wait", "dev::block_request_submit_for_wait(",
+                                 "dev::block_request_submit(", "if (RC == 0)", "io.accepted = true"],
+                  "only the immediately joined sole request may elide the ordinary worker wake")
+    require_order(write_pipeline, ["dev::block_request_wait(", "dev::block_request_release(",
+                                   "io->offset += io->submitted_bytes", "retire_writeback_io(io, 0"],
+                  "writeback may clear its dirty epoch only after each accepted slice retires")
 
     require_absent(source, "evict_lru();", "cold miss eviction must be allocation-sized")
     require_absent(source, "alloc_buffer_with_size", "buffers must be detached until inserted")
@@ -129,9 +174,17 @@ def main() -> None:
         allocate_body,
         [
             "flags &= ~(BH_DATA_PAGE_ALLOC | BH_DATA_VMAP)",
-            "if (size > BUFFER_CACHE_CONTIG_ALLOC_MAX_BYTES)",
+            "if (size > BUFFER_CACHE_DATA_ALLOC_MAX_BYTES)",
             "return nullptr",
             "if (size > BUFFER_CACHE_BUDDY_ALLOC_MAX_BYTES)",
+            "#ifdef WOS_ASYNC_BLOCK_IO",
+            "if ((size % ker::mod::mm::paging::PAGE_SIZE) == 0 && (size & (size - 1)) == 0)",
+            "ker::mod::mm::phys::page_alloc_full_overwrite_may_fail(",
+            'ker::mod::mm::PhysicalPageOwner::BUFFER_CACHE_DATA, size, "buffer_cache")',
+            "if (page_data != nullptr)",
+            "flags |= BH_DATA_PAGE_ALLOC",
+            "return page_data",
+            "#endif",
             'kernel_vmap_alloc(ker::mod::mm::PhysicalPageOwner::BUFFER_CACHE_DATA, size, "buffer_cache")',
             "flags |= BH_DATA_VMAP",
             "ker::mod::mm::phys::page_alloc_full_overwrite_may_fail(",
@@ -141,7 +194,7 @@ def main() -> None:
             'kernel_vmap_alloc(ker::mod::mm::PhysicalPageOwner::BUFFER_CACHE_DATA, size, "buffer_cache")',
             "flags |= BH_DATA_VMAP",
         ],
-        "buffer data allocation must use order-0 virtual backing for large runs and as the bounded buddy fallback",
+        "buffer data allocation must keep exact-size ON buddy preference and immediate virtual fragmentation fallback",
     )
 
     free_data_body = function_body(source, "free_data_buffer")

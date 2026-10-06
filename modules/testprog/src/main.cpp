@@ -32,6 +32,7 @@
 
 #include "asan_crasher.hpp"
 #include "aslr_hardening.hpp"
+#include "blockbench.hpp"
 #include "cowbench.hpp"
 #include "credentials.hpp"
 #include "fsbench.hpp"
@@ -43,6 +44,7 @@
 #include "netbench.hpp"
 #include "perfbench.hpp"
 #include "resource_limits.hpp"
+#include "tests/blockbench_mmap.hpp"
 #include "thread_exit_stress.hpp"
 #include "usercopy_negative.hpp"
 #include "wki_chaos_workload.hpp"
@@ -615,6 +617,9 @@ auto main(int argc, char** argv, char** envp) -> int {
                                std::strcmp(command, "vfsbench-metadata-worker") == 0)) {
         return run_fsbench(argc - 1, argv + 1);
     }
+    if (command != nullptr && (std::strcmp(command, "blockbench-read") == 0 || std::strcmp(command, "blockbench-fsync") == 0))
+        return run_blockbench(argc - 1, argv + 1);
+    if (command != nullptr && std::strcmp(command, "blockbench-mmap") == 0) return run_blockbench_mmap(argc - 1, argv + 1);
 
     if (command != nullptr && (std::strcmp(command, "netbench-server") == 0 || std::strcmp(command, "netbench-client") == 0 ||
                                std::strcmp(command, "netbench-configure") == 0)) {

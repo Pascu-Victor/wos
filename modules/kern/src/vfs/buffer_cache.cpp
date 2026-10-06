@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstring>
 #include <new>
+#include <optional>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/kernel_image.hpp>
@@ -26,6 +27,7 @@
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/reclaim.hpp>
+#include <span>
 #ifndef WOS_HOST_TEST
 #include <platform/mm/virt.hpp>
 #endif
@@ -36,6 +38,7 @@
 #include <util/smallvec.hpp>
 
 #include "dev/block_device.hpp"
+#include "dev/block_request.hpp"
 #include "platform/sys/spinlock.hpp"
 
 namespace ker::vfs {
@@ -282,6 +285,11 @@ constexpr size_t DIRTY_HARD_FALLBACK_BUDGET = DIRTY_WRITEBACK_BUDGET * 4;
 constexpr size_t DIRTY_HARD_FALLBACK_BYTES = size_t{64} * 1024 * 1024;
 constexpr size_t DIRTY_WRITEBACK_RUN_MAX_BUFFERS = 1024;
 constexpr size_t BUFFER_CACHE_CONTIG_ALLOC_MAX_BYTES = size_t{2} * 1024 * 1024;
+#ifdef WOS_ASYNC_BLOCK_IO
+constexpr size_t BUFFER_CACHE_DATA_ALLOC_MAX_BYTES = size_t{4} * 1024 * 1024;
+#else
+constexpr size_t BUFFER_CACHE_DATA_ALLOC_MAX_BYTES = BUFFER_CACHE_CONTIG_ALLOC_MAX_BYTES;
+#endif
 #ifndef WOS_HOST_TEST
 constexpr size_t BUFFER_CACHE_BUDDY_ALLOC_MAX_BYTES = size_t{64} * 1024;
 #endif
@@ -385,6 +393,7 @@ void dirty_coverage_add(std::array<DirtyCoverageInterval, DIRTY_COPY_COVERAGE_MA
 auto dirty_coverage_complete(const std::array<DirtyCoverageInterval, DIRTY_COPY_COVERAGE_MAX_INTERVALS>& intervals, size_t interval_count,
                              uint64_t block_no, size_t count) -> bool;
 void dirty_writeback_worker(void* unused);
+auto read_blocks_pipelined(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* data) -> int;
 ker::mod::sched::WorkItem dirty_writeback_work{.fn = dirty_writeback_worker, .arg = nullptr, .next = nullptr};
 constexpr size_t HOT_EVICT_SCAN_BUDGET = 8192;
 constexpr size_t HOT_EVICT_MAX_VICTIMS = 4096;
@@ -568,11 +577,24 @@ void free_bufhead(BufHead* bh) {
 
 auto allocate_buffer_data(size_t size, uint32_t& flags) -> uint8_t* {
     flags &= ~(BH_DATA_PAGE_ALLOC | BH_DATA_VMAP);
-    if (size > BUFFER_CACHE_CONTIG_ALLOC_MAX_BYTES) {
+    if (size > BUFFER_CACHE_DATA_ALLOC_MAX_BYTES) {
         return nullptr;
     }
 #ifndef WOS_HOST_TEST
     if (size > BUFFER_CACHE_BUDDY_ALLOC_MAX_BYTES) {
+#ifdef WOS_ASYNC_BLOCK_IO
+        // A single non-reclaiming attempt avoids per-page vmap work when an
+        // exact-size buddy block is available. Fragmentation keeps the same
+        // virtual backing fallback; other sizes cannot inflate physical use.
+        if ((size % ker::mod::mm::paging::PAGE_SIZE) == 0 && (size & (size - 1)) == 0) {
+            auto* page_data = static_cast<uint8_t*>(ker::mod::mm::phys::page_alloc_full_overwrite_may_fail(
+                ker::mod::mm::PhysicalPageOwner::BUFFER_CACHE_DATA, size, "buffer_cache"));
+            if (page_data != nullptr) {
+                flags |= BH_DATA_PAGE_ALLOC;
+                return page_data;
+            }
+        }
+#endif
         auto* data = static_cast<uint8_t*>(
             ker::mod::mm::virt::kernel_vmap_alloc(ker::mod::mm::PhysicalPageOwner::BUFFER_CACHE_DATA, size, "buffer_cache"));
         if (data != nullptr) {
@@ -987,6 +1009,13 @@ void account_disk_read(BufferReadClass read_class, uint64_t bytes) {
 auto read_blocks_with_retry(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* data, BufferReadClass read_class) -> int {
     constexpr int MAX_ATTEMPTS = 3;
     uint64_t const STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::BUF_DISK_READ);
+    int const ASYNC_RC = read_blocks_pipelined(bdev, block_no, count, data);
+    if (ASYNC_RC != -EOPNOTSUPP) {
+        uint64_t const BYTES = count * static_cast<uint64_t>(bdev->block_size);
+        account_disk_read(read_class, BYTES);
+        perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_DISK_READ, STARTED_US, ASYNC_RC, BYTES);
+        return ASYNC_RC;
+    }
     int rc = -EIO;
     for (int attempt = 1; attempt <= MAX_ATTEMPTS; ++attempt) {
         int const RC = dev::block_read(bdev, block_no, count, data);
@@ -2338,6 +2367,16 @@ auto find_writeback_candidate_locked(const DirtyWritebackFilter& filter, uint64_
             search_min_epoch = bh->dirty_epoch;
             continue;
         }
+        // Redirty can move an in-flight alias beyond this pass's dirty-epoch
+        // bound. Its retained snapshot must still retire before a newer
+        // overlapping generation can be selected.
+        if (BufHead* active = find_overlapping_writeback_locked(bh); active != nullptr) {
+            if (!skip_writeback) {
+                return active;
+            }
+            search_min_epoch = bh->dirty_epoch;
+            continue;
+        }
         if (!has_older_overlapping_dirty_buffer_locked(bh)) {
             return bh;
         }
@@ -2475,6 +2514,9 @@ auto mark_buffer_dirty_locked(BufHead* bh) -> bool {
 }
 
 auto write_buffer_snapshot_for_epoch(BufHead* bh, uint64_t writeback_dirty_epoch, uint64_t owned_writeback_epoch) -> int {
+    // The cache marker is already owned. Allocator-triggered I/O could join
+    // that marker or consume the same queue capacity needed for this write.
+    ker::mod::mm::reclaim::NoIoScope const NO_IO;
     WritebackSnapshot snapshot = make_writeback_snapshot_for_epoch(bh, writeback_dirty_epoch);
     if (snapshot.data == nullptr) {
         uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
@@ -2505,8 +2547,8 @@ auto dirty_writeback_run_can_append_locked(const DirtyWritebackRun& run, const B
                                            uint64_t min_epoch_exclusive, uint64_t max_epoch_inclusive) -> bool {
     if (bh == nullptr || !dirty_filter_matches(bh, filter) || bh->dirty_epoch <= min_epoch_exclusive ||
         bh->dirty_epoch > max_epoch_inclusive || (bh->flags & BH_WRITEBACK) != 0 || has_overlapping_journal_pending_locked(bh) ||
-        has_older_overlapping_dirty_buffer_locked(bh) || bh->bdev == nullptr || bh->bdev->block_size == 0 || bh->data == nullptr ||
-        bh->size == 0 || (bh->size % bh->bdev->block_size) != 0) {
+        has_older_overlapping_dirty_buffer_locked(bh) || find_overlapping_writeback_locked(bh) != nullptr || bh->bdev == nullptr ||
+        bh->bdev->block_size == 0 || bh->data == nullptr || bh->size == 0 || (bh->size % bh->bdev->block_size) != 0) {
         return false;
     }
 
@@ -2681,6 +2723,7 @@ auto write_dirty_run_buffers_individually(DirtyWritebackRun& run) -> int {
 }
 
 auto write_dirty_run_snapshot(DirtyWritebackRun& run) -> int {
+    ker::mod::mm::reclaim::NoIoScope const NO_IO;
     WritebackSnapshot snapshot = make_writeback_run_snapshot(run);
     if (snapshot.data == nullptr) {
         if (run.count > 1) {
@@ -2728,7 +2771,392 @@ auto writeback_dirty_one(const DirtyWritebackFilter& filter) -> DirtyWritebackRe
     return writeback_dirty_one_after(filter, 0, UINT64_MAX, true);
 }
 
+constexpr size_t DIRTY_WRITEBACK_PIPELINE_DEPTH = 8;
+constexpr uint64_t DIRTY_WRITEBACK_ADMISSION_TIMEOUT_US = 30'000'000;
+
+struct DirtyWritebackIo {
+    DirtyWritebackRun run{};
+    WritebackSnapshot snapshot{};
+    dev::BlockRequest request{};
+    dev::BlockQueueLimits limits{};
+    size_t offset{};
+    size_t submitted_bytes{};
+    uint64_t admission_started_us{};
+    bool accepted{};
+    bool physical_backing{};
+    DirtyWritebackIo* active_next{};
+};
+DirtyWritebackIo* active_writeback_ios{};
+
+auto allocate_writeback_io() -> DirtyWritebackIo* {
+    // Construct every typed member once without first zeroing medium-heap
+    // backing. Fragmentation retains the existing fallible heap path.
+    void* const STORAGE = ker::mod::mm::phys::page_alloc_full_overwrite_may_fail(ker::mod::mm::PhysicalPageOwner::BUFFER_CACHE_METADATA,
+                                                                                 sizeof(DirtyWritebackIo), "buffer_cache_writeback");
+    if (STORAGE != nullptr) {
+        auto* io = new (STORAGE) DirtyWritebackIo;
+        io->physical_backing = true;
+        return io;
+    }
+    return new (std::nothrow) DirtyWritebackIo;
+}
+
+void destroy_writeback_io(DirtyWritebackIo* io) {
+    if (io->physical_backing) {
+        io->~DirtyWritebackIo();
+        ker::mod::mm::phys::page_free(io);
+    } else {
+        delete io;
+    }
+}
+
+auto supports_writeback_pipeline(dev::BlockDevice* bdev) -> bool {
+    if (bdev == nullptr || !dev::block_queue_available(bdev)) {
+        return false;
+    }
+    dev::BlockQueueLimits const LIMITS = dev::block_queue_limits(bdev);
+    return LIMITS.depth > 1 && LIMITS.max_segments != 0 && LIMITS.max_requests != 0 && LIMITS.max_transfer_bytes >= bdev->block_size &&
+           LIMITS.max_inflight_bytes >= bdev->block_size;
+}
+
+auto read_blocks_pipelined(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* data) -> int {
+    if (!supports_writeback_pipeline(bdev)) {
+        return -EOPNOTSUPP;
+    }
+    // Demand-only: the caller retains its detached cache buffer and, for XFS,
+    // its inode mapping lock until every slice retires. No stale detached
+    // prefetch is published after truncate or unmount.
+    struct ReadIo {
+        dev::BlockRequest request{};
+        size_t bytes{};
+        bool accepted{};
+    };
+    dev::BlockQueueLimits const LIMITS = dev::block_queue_limits(bdev);
+    size_t const BLOCK_SIZE = bdev->block_size;
+    size_t const LIMIT = std::min(LIMITS.max_transfer_bytes, LIMITS.max_inflight_bytes);
+    size_t const MAX_SLICE = LIMIT - LIMIT % BLOCK_SIZE;
+    size_t const TOTAL = count * BLOCK_SIZE;
+    // Small demand spans need just one retained descriptor. Keep it on the
+    // caller's stack rather than allocating/initializing an eight-slot array.
+    ReadIo single{};
+    std::span<ReadIo> pending{&single, 1};
+    std::array<ReadIo, DIRTY_WRITEBACK_PIPELINE_DEPTH>* multiple{};
+    if (TOTAL > MAX_SLICE) {
+        multiple = new (std::nothrow) std::array<ReadIo, DIRTY_WRITEBACK_PIPELINE_DEPTH>;
+        if (multiple == nullptr) {
+            return -EOPNOTSUPP;  // No ownership was admitted; serial retry remains safe.
+        }
+        pending = *multiple;
+    }
+    // Descriptors exist before admission. Keep later provider work and
+    // cleanup from re-entering I/O reclaim while requests own capacity.
+    ker::mod::mm::reclaim::NoIoScope const NO_IO;
+    size_t offset = 0;
+    int result = 0;
+    uint64_t admission_started_us = ker::mod::time::get_us();
+    while (true) {
+        ReadIo* to_wait = nullptr;
+        for (auto& io : pending) {
+            if (!io.accepted && offset < TOTAL && result == 0) {
+                size_t const BYTES = std::min(TOTAL - offset, MAX_SLICE);
+                dev::BlockSegment const SEGMENT{data + offset, BYTES};
+                int const RC =
+                    dev::block_request_submit_for_wait(bdev, io.request, dev::BlockRequestOperation::READ, block_no + offset / BLOCK_SIZE,
+                                                       BYTES / BLOCK_SIZE, std::span<const dev::BlockSegment>(&SEGMENT, 1));
+                if (RC == 0) {
+                    io.bytes = BYTES;
+                    io.accepted = true;
+                    offset += BYTES;
+                    admission_started_us = ker::mod::time::get_us();
+                } else if (RC != -EAGAIN) {
+                    result = RC;
+                }
+            }
+            if (io.accepted && (to_wait == nullptr || io.request.completed.load(std::memory_order_acquire))) {
+                to_wait = &io;
+            }
+        }
+        if (to_wait != nullptr) {
+            int rc = dev::block_request_wait(to_wait->request);
+            if (rc == 0 && to_wait->request.bytes != to_wait->bytes) rc = -EIO;
+            int const RELEASE_RC = dev::block_request_release(to_wait->request);
+            if (rc == 0) rc = RELEASE_RC;
+            if (rc != 0 && result == 0) result = rc;
+            to_wait->accepted = false;
+            continue;
+        }
+        if (result != 0 || offset == TOTAL) break;
+        if (ker::mod::time::get_us() - admission_started_us >= DIRTY_WRITEBACK_ADMISSION_TIMEOUT_US) {
+            result = -ETIMEDOUT;
+            break;
+        }
+        dev::block_queue_wait_for_capacity(bdev);
+    }
+    delete multiple;
+    return result;
+}
+
+auto pipeline_device(const DirtyWritebackFilter& filter) -> dev::BlockDevice* {
+    if (filter.bdev != nullptr) {
+        return supports_writeback_pipeline(filter.bdev) ? filter.bdev : nullptr;
+    }
+    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+    BufHead* oldest = find_oldest_matching_dirty_buffer_locked(filter, 0, UINT64_MAX);
+    dev::BlockDevice* bdev = oldest == nullptr ? nullptr : oldest->bdev;
+    cache_lock.unlock_irqrestore(IRQFLAGS);
+    // Providers have permanent kernel lifetime. Query their queue outside the
+    // cache guard, which cannot nest the provider's mutex or queue guard.
+    return supports_writeback_pipeline(bdev) ? bdev : nullptr;
+}
+
+auto matching_writeback_locked(const DirtyWritebackFilter& filter) -> bool {
+    // A marker can clear before task-side snapshot/ref cleanup. Keep an
+    // explicit join token through that cleanup so unmount/sync cannot return
+    // while a foreign pipeline still owns cache references.
+    for (auto* io = active_writeback_ios; io != nullptr; io = io->active_next) {
+        if ((filter.bdev == nullptr || io->run.bdev == filter.bdev) &&
+            (!filter.use_range || (io->run.block_no <= block_range_last_block(filter.block_no, filter.count) &&
+                                   block_range_last_block(io->run.block_no, io->run.block_count) >= filter.block_no))) {
+            return true;
+        }
+    }
+    if (!range_index_degraded && filter.bdev != nullptr) {
+        RangeBdevState* state = find_range_bdev_state_locked(filter.bdev);
+        uint64_t const FIRST = filter.use_range ? filter.block_no : 0;
+        size_t const COUNT = filter.use_range ? filter.count : SIZE_MAX;
+        return state != nullptr && range_find_overlap_locked(state->tree_root, filter.bdev, FIRST, COUNT, true) != nullptr;
+    }
+    for (auto* head : hash_buckets) {
+        for (BufHead* bh = head; bh != nullptr; bh = bh->hash_next) {
+            if ((bh->flags & BH_WRITEBACK) == 0 || (filter.bdev != nullptr && bh->bdev != filter.bdev)) {
+                continue;
+            }
+            if (!filter.use_range || buffer_overlaps_range(bh, filter.bdev, filter.block_no, filter.count)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void retire_writeback_io(DirtyWritebackIo*& io, int status, DirtyWritebackResult& result, uint64_t& failed_epoch) {
+    // Every accepted slice has been waited and released before this cleanup.
+    finish_dirty_writeback_run(io->run, status);
+    if (status != 0) {
+        if (result.status == 0) {
+            result.status = status;
+        }
+        failed_epoch = std::max(failed_epoch, dirty_writeback_run_max_dirty_epoch(io->run));
+    }
+    free_writeback_snapshot(io->snapshot);
+    for (size_t i = 0; i < io->run.count; ++i) {
+        brelse(io->run.buffers.at(i));
+    }
+    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+    auto** active = &active_writeback_ios;
+    while (*active != io) {
+        active = &(*active)->active_next;
+    }
+    *active = io->active_next;
+    cache_lock.unlock_irqrestore(IRQFLAGS);
+    destroy_writeback_io(io);
+    io = nullptr;
+}
+
+auto submit_writeback_slice(DirtyWritebackIo& io, bool immediate_wait) -> int {
+    size_t const BLOCK_SIZE = io.run.bdev->block_size;
+    size_t const LIMIT = std::min(io.limits.max_transfer_bytes, io.limits.max_inflight_bytes);
+    size_t const SLICE = std::min(io.run.bytes - io.offset, LIMIT - LIMIT % BLOCK_SIZE);
+    dev::BlockSegment const SEGMENT{io.snapshot.data + io.offset, SLICE};
+    int const RC = immediate_wait ? dev::block_request_submit_for_wait(io.run.bdev, io.request, dev::BlockRequestOperation::WRITE,
+                                                                       io.run.block_no + io.offset / BLOCK_SIZE, SLICE / BLOCK_SIZE,
+                                                                       std::span<const dev::BlockSegment>(&SEGMENT, 1))
+                                  : dev::block_request_submit(io.run.bdev, io.request, dev::BlockRequestOperation::WRITE,
+                                                              io.run.block_no + io.offset / BLOCK_SIZE, SLICE / BLOCK_SIZE,
+                                                              std::span<const dev::BlockSegment>(&SEGMENT, 1));
+    if (RC == 0) {
+        io.submitted_bytes = SLICE;
+        io.accepted = true;
+    }
+    return RC;
+}
+
+auto writeback_dirty_pipeline(const DirtyWritebackFilter& filter, uint64_t max_epoch, size_t buffer_budget, size_t byte_budget)
+    -> DirtyWritebackResult {
+    std::array<DirtyWritebackIo*, DIRTY_WRITEBACK_PIPELINE_DEPTH> pending{};
+    DirtyWritebackResult result{};
+    uint64_t failed_epoch = 0;
+    bool allocation_failed = false;
+    std::optional<ker::mod::mm::reclaim::NoIoScope> no_io;
+    while (true) {
+        // Peek without retaining a candidate before allocating a large run.
+        // Selection still rechecks and owns its marker only after allocation.
+        for (auto*& io : pending) {
+            if (io != nullptr || allocation_failed || result.buffers >= buffer_budget || result.bytes >= byte_budget) {
+                continue;
+            }
+            uint64_t const PEEK_FLAGS = cache_lock.lock_irqsave();
+            bool const HAVE_CANDIDATE = find_writeback_candidate_locked(filter, failed_epoch, max_epoch, true) != nullptr;
+            cache_lock.unlock_irqrestore(PEEK_FLAGS);
+            if (!HAVE_CANDIDATE) {
+                break;
+            }
+            io = allocate_writeback_io();
+            if (io == nullptr) {
+                allocation_failed = true;
+                break;
+            }
+            // Selection owns a writeback marker before snapshot allocation.
+            // Keep reclaim I/O suppressed through all refills and cleanup;
+            // clean reclaim, allocation, scheduling and explicit I/O remain
+            // available. The first descriptor has no ownership to protect.
+            if (!no_io.has_value()) {
+                no_io.emplace();
+            }
+            uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+            DirtyWritebackResult const WB = collect_dirty_writeback_run_locked(filter, failed_epoch, max_epoch, io->run, true);
+            if (WB.wrote) {
+                io->active_next = active_writeback_ios;
+                active_writeback_ios = io;
+            }
+            cache_lock.unlock_irqrestore(IRQFLAGS);
+            if (!WB.wrote) {
+                destroy_writeback_io(io);
+                io = nullptr;
+                break;
+            }
+            result.wrote = true;
+            result.buffers += WB.buffers;
+            result.bytes += WB.bytes;
+            if (io->run.bytes > DIRTY_WRITEBACK_RUN_MAX_BYTES) {
+                // A caller can cache one unusually large span. Keep that
+                // existing serial behavior rather than multiplying oversized
+                // immutable snapshots across the native pipeline window.
+                int const RC = write_dirty_run_snapshot(io->run);
+                retire_writeback_io(io, RC, result, failed_epoch);
+                continue;
+            }
+            io->limits = dev::block_queue_limits(io->run.bdev);
+            io->snapshot = make_writeback_run_snapshot(io->run);
+            if (io->snapshot.data == nullptr) {
+                // Preserve the existing individually snapshotted progress path
+                // without releasing references or claiming another generation.
+                int const RC = write_dirty_run_buffers_individually(io->run);
+                retire_writeback_io(io, RC, result, failed_epoch);
+                continue;
+            }
+            io->admission_started_us = ker::mod::time::get_us();
+        }
+
+        size_t const PREPARED_COUNT =
+            static_cast<size_t>(std::count_if(pending.begin(), pending.end(), [](const auto* io) { return io != nullptr; }));
+        DirtyWritebackIo** to_wait = nullptr;
+        bool have_pending = false;
+        for (auto*& io : pending) {
+            if (io == nullptr) {
+                continue;
+            }
+            have_pending = true;
+            if (!io->accepted) {
+                // A sole prepared run is joined immediately below. Multiple
+                // runs retain worker wakes for progress during later refills.
+                int const RC = submit_writeback_slice(*io, PREPARED_COUNT == 1);
+                if (RC == -EAGAIN) {
+                    if (ker::mod::time::get_us() - io->admission_started_us >= DIRTY_WRITEBACK_ADMISSION_TIMEOUT_US) {
+                        retire_writeback_io(io, -ETIMEDOUT, result, failed_epoch);
+                    }
+                    continue;
+                }
+                if (RC != 0) {
+                    retire_writeback_io(io, RC, result, failed_epoch);
+                    continue;
+                }
+            }
+            if (to_wait == nullptr || io->request.completed.load(std::memory_order_acquire)) {
+                to_wait = &io;
+            }
+        }
+        if (to_wait != nullptr) {
+            DirtyWritebackIo*& io = *to_wait;
+            int rc = dev::block_request_wait(io->request);
+            if (rc == 0 && io->request.bytes != io->submitted_bytes) {
+                rc = -EIO;
+            }
+            int const RELEASE_RC = dev::block_request_release(io->request);
+            io->accepted = false;
+            if (rc == 0) {
+                rc = RELEASE_RC;
+            }
+            if (rc != 0) {
+                retire_writeback_io(io, rc, result, failed_epoch);
+                continue;
+            }
+            io->offset += io->submitted_bytes;
+            io->admission_started_us = ker::mod::time::get_us();
+            if (io->offset == io->run.bytes) {
+                retire_writeback_io(io, 0, result, failed_epoch);
+            }
+            continue;
+        }
+        if (have_pending) {
+            // No request was accepted, so backpressure transferred no ownership.
+            // Service/yield until admission opens or its bounded deadline expires.
+            for (auto* io : pending) {
+                if (io != nullptr) {
+                    dev::block_queue_wait_for_capacity(io->run.bdev);
+                }
+            }
+            ker::mod::sched::kern_yield();
+            continue;
+        }
+        if (allocation_failed) {
+            // All native requests have retired. The old bounded synchronous
+            // path remains available when descriptor allocation fails.
+            DirtyWritebackResult const WB = writeback_dirty_one_after(filter, failed_epoch, max_epoch);
+            if (WB.wrote) {
+                result.wrote = true;
+                result.buffers += WB.buffers;
+                result.bytes += WB.bytes;
+                if (WB.status != 0) {
+                    result.status = WB.status;
+                    failed_epoch = std::max(failed_epoch, WB.dirty_epoch);
+                }
+                if (result.buffers < buffer_budget && result.bytes < byte_budget) {
+                    continue;
+                }
+            }
+        }
+        uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+        bool const ACTIVE = matching_writeback_locked(filter);
+        BufHead* candidate = result.buffers < buffer_budget && result.bytes < byte_budget
+                                 ? find_writeback_candidate_locked(filter, failed_epoch, max_epoch, true)
+                                 : nullptr;
+        bool const RETRY_SELECTION = candidate != nullptr && !has_overlapping_journal_pending_locked(candidate) &&
+                                     candidate->bdev != nullptr && candidate->bdev->block_size != 0 && candidate->data != nullptr &&
+                                     candidate->size != 0 && candidate->size % candidate->bdev->block_size == 0;
+        cache_lock.unlock_irqrestore(IRQFLAGS);
+        if (ACTIVE) {
+            result.busy = true;
+            ker::mod::sched::kern_yield();
+            continue;
+        }
+        if (RETRY_SELECTION) {
+            // A foreign marker may have retired between selection and the
+            // join check. Recheck work under the same guard before declaring
+            // this captured dirty generation fully joined.
+            continue;
+        }
+        break;
+    }
+    return result;
+}
+
 auto writeback_dirty_budgeted(const DirtyWritebackFilter& filter, size_t buffer_budget, size_t byte_budget) -> int {
+    if (auto* bdev = pipeline_device(filter); bdev != nullptr) {
+        DirtyWritebackFilter selected = filter;
+        selected.bdev = bdev;
+        return writeback_dirty_pipeline(selected, max_matching_dirty_epoch(selected), buffer_budget, byte_budget).status;
+    }
     int result = 0;
     uint64_t min_epoch = 0;
     uint64_t const MAX_EPOCH = max_matching_dirty_epoch(filter);
@@ -2960,7 +3388,10 @@ auto request_dirty_writeback() -> bool {
 
     bool expected = false;
     if (dirty_writeback_queued.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_relaxed)) {
-        wq->enqueue(&dirty_writeback_work);
+        if (!wq->enqueue(&dirty_writeback_work)) {
+            dirty_writeback_queued.store(false, std::memory_order_release);
+            return false;
+        }
     }
     return true;
 }
@@ -2980,7 +3411,16 @@ void dirty_writeback_worker(void* unused) {
             break;
         }
 
-        DirtyWritebackResult const WB = writeback_dirty_one({});
+        DirtyWritebackResult wb{};
+        if (auto* bdev = pipeline_device({}); bdev != nullptr) {
+            DirtyWritebackFilter filter{};
+            filter.bdev = bdev;
+            wb = writeback_dirty_pipeline(filter, max_matching_dirty_epoch(filter),
+                                          DIRTY_WRITEBACK_PIPELINE_DEPTH * DIRTY_WRITEBACK_RUN_MAX_BUFFERS, DIRTY_WRITEBACK_YIELD_BYTES);
+        } else {
+            wb = writeback_dirty_one({});
+        }
+        DirtyWritebackResult const WB = wb;
         if (WB.wrote) {
             if (WB.status != 0) {
                 break;
@@ -3356,23 +3796,36 @@ auto bwrite(BufHead* bh) -> int {
 
     uint64_t writeback_dirty_epoch = 0;
     uint64_t owned_writeback_epoch = 0;
+    bool const JOIN_QUEUED_WRITEBACK = dev::block_queue_available(bh->bdev);
     {
-        uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+        uint64_t irqflags = cache_lock.lock_irqsave();
         if (bh->retired.load(std::memory_order_acquire)) {
-            cache_lock.unlock_irqrestore(IRQFLAGS);
+            cache_lock.unlock_irqrestore(irqflags);
             return -EIO;
         }
         mark_buffer_dirty_locked(bh);
         if (has_overlapping_journal_pending_locked(bh)) {
-            cache_lock.unlock_irqrestore(IRQFLAGS);
+            cache_lock.unlock_irqrestore(irqflags);
             return -EBUSY;
+        }
+        // A pipeline can own a prepared snapshot before queue admission.
+        // Device FIFO alone cannot keep this newer synchronous write behind
+        // that snapshot; join its cache marker before preparing another one.
+        while (JOIN_QUEUED_WRITEBACK && find_overlapping_writeback_locked(bh) != nullptr) {
+            cache_lock.unlock_irqrestore(irqflags);
+            ker::mod::sched::kern_yield();
+            irqflags = cache_lock.lock_irqsave();
+            if (bh->retired.load(std::memory_order_acquire) || has_overlapping_journal_pending_locked(bh)) {
+                cache_lock.unlock_irqrestore(irqflags);
+                return bh->retired.load(std::memory_order_acquire) ? -EIO : -EBUSY;
+            }
         }
         writeback_dirty_epoch = bh->dirty_epoch;
         if ((bh->flags & BH_WRITEBACK) == 0) {
             owned_writeback_epoch = allocate_writeback_epoch();
             mark_buffer_writeback(bh, owned_writeback_epoch);
         }
-        cache_lock.unlock_irqrestore(IRQFLAGS);
+        cache_lock.unlock_irqrestore(irqflags);
     }
 
     return write_buffer_snapshot_for_epoch(bh, writeback_dirty_epoch, owned_writeback_epoch);
@@ -3564,7 +4017,11 @@ auto sync_blockdev(dev::BlockDevice* bdev) -> int {
 
     uint64_t min_epoch = 0;
     uint64_t const MAX_EPOCH = max_matching_dirty_epoch(filter);
-    while (true) {
+    bool const PIPELINE = supports_writeback_pipeline(bdev);
+    if (PIPELINE) {
+        result = writeback_dirty_pipeline(filter, MAX_EPOCH, SIZE_MAX, SIZE_MAX).status;
+    }
+    while (!PIPELINE) {
         DirtyWritebackResult const WB = writeback_dirty_one_after(filter, min_epoch, MAX_EPOCH);
         if (WB.wrote) {
             min_epoch = WB.dirty_epoch;
@@ -3607,7 +4064,11 @@ auto sync_blockdev_file_data(dev::BlockDevice* bdev) -> int {
 
     uint64_t min_epoch = 0;
     uint64_t const MAX_EPOCH = max_matching_dirty_epoch(filter);
-    while (true) {
+    bool const PIPELINE = supports_writeback_pipeline(bdev);
+    if (PIPELINE) {
+        result = writeback_dirty_pipeline(filter, MAX_EPOCH, SIZE_MAX, SIZE_MAX).status;
+    }
+    while (!PIPELINE) {
         DirtyWritebackResult const WB = writeback_dirty_one_after(filter, min_epoch, MAX_EPOCH);
         if (WB.wrote) {
             min_epoch = WB.dirty_epoch;
@@ -3813,7 +4274,13 @@ auto writeback_bdev_range_internal(dev::BlockDevice* bdev, uint64_t block_no, si
     filter.use_range = true;
 
     uint64_t const MAX_EPOCH = max_matching_dirty_epoch(filter);
-    while (true) {
+    bool const PIPELINE = supports_writeback_pipeline(bdev);
+    if (PIPELINE) {
+        DirtyWritebackResult const WB = writeback_dirty_pipeline(filter, MAX_EPOCH, SIZE_MAX, SIZE_MAX);
+        result = WB.status;
+        writeback_activity = WB.wrote || WB.busy;
+    }
+    while (!PIPELINE) {
         DirtyWritebackResult const WB = writeback_dirty_one_after(filter, min_epoch, MAX_EPOCH);
         if (WB.wrote) {
             writeback_activity = true;
@@ -3844,7 +4311,7 @@ auto writeback_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t coun
 auto sync_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> int {
     bool writeback_activity = false;
     int result = writeback_bdev_range_internal(bdev, block_no, count, writeback_activity);
-    if (bdev != nullptr && writeback_activity && bdev->flush != nullptr) {
+    if (bdev != nullptr && count != 0) {
         int const RC = flush_blockdev(bdev);
         if (RC != 0) {
             result = RC;

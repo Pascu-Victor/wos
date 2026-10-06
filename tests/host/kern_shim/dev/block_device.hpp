@@ -102,7 +102,7 @@ inline auto block_flush(BlockDevice* dev) -> int {
         return -EINVAL;
     }
     if (dev->flush == nullptr) {
-        return 0;
+        return -EOPNOTSUPP;
     }
     return normalize_io_result(dev->flush(dev));
 }

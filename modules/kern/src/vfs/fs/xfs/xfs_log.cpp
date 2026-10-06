@@ -114,6 +114,26 @@ auto xfs_log_lsn_to_position(const XfsLog* log, uint64_t lsn, uint32_t* cycle, u
     return 0;
 }
 
+auto xfs_log_next_clean_cycle(uint32_t cycle, uint32_t* next_cycle) -> int {
+    if (next_cycle == nullptr) {
+        return -EINVAL;
+    }
+    if (cycle == 0 || cycle == XLOG_HEADER_MAGIC_NUM) {
+        return -EUCLEAN;
+    }
+    if (cycle == UINT32_MAX) {
+        return -EOVERFLOW;
+    }
+    uint32_t candidate = cycle + 1;
+    // A packed payload word equal to the header magic is ambiguous to XFS
+    // log scanning. Linux also skips this reserved cycle on ring wrap.
+    if (candidate == XLOG_HEADER_MAGIC_NUM) {
+        ++candidate;
+    }
+    *next_cycle = candidate;
+    return 0;
+}
+
 auto xfs_log_record_fs_blocks(const XfsMountContext* mount, size_t body_bytes, uint32_t* blocks_out) -> int {
     if (mount == nullptr || blocks_out == nullptr || mount->block_size < XLOG_HEADER_SIZE || body_bytes > SIZE_MAX - XLOG_HEADER_SIZE) {
         return -EINVAL;
@@ -703,12 +723,17 @@ auto xfs_log_clear_clean(XfsMountContext* mount, XfsLog* log) -> int {
     if (mount == nullptr || log == nullptr || log->mount != mount) {
         return -EINVAL;
     }
+    uint32_t next_cycle = 0;
+    int rc = xfs_log_next_clean_cycle(log->head_cycle, &next_cycle);
+    if (rc != 0) {
+        return rc;
+    }
     // WOS crash-recovery records deliberately use a private body encoding.
     // Once every covered home image is durable, retire that private history
     // before publishing the standard XFS unmount operation.  This leaves a
     // byte-canonical clean log that Linux can inspect without attempting to
     // interpret private records as multi-header v2 iclogs.
-    int rc = xfs_log_erase_device(log);
+    rc = xfs_log_erase_device(log);
     if (rc == 0) {
         rc = flush_blockdev(mount->device);
     }
@@ -718,6 +743,10 @@ auto xfs_log_clear_clean(XfsMountContext* mount, XfsLog* log) -> int {
     }
     log->head_block = 0;
     log->tail_block = 0;
+    // Rewinding within the same cycle would put untouched Linux-written
+    // metadata LSNs ahead of this clean log's current LSN. The validated new
+    // epoch keeps those durable home images older than the unmount record.
+    log->head_cycle = next_cycle;
     log->tail_cycle = log->head_cycle;
     log->previous_block = UINT32_MAX;
 

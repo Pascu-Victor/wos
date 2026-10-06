@@ -667,8 +667,260 @@ auto lazy_file_range_matches(const sched::task::LazyVmemRange& lhs, const sched:
            lhs.file_ino == rhs.file_ino && page_vaddr >= lhs.start && page_vaddr < lhs.end;
 }
 
+#ifdef WOS_ASYNC_BLOCK_IO
+enum class LazyFileFaultDisposition : uint8_t { NOT_TRACKED, RESOLVED, PARK, FAILED };
+
+struct LazyFileFaultWork {
+    sched::task::Task* task{};
+    PageTable* pagemap{};
+    sched::task::LazyVmemRange range{};
+    paging::PageFault fault{};
+    uint64_t vaddr{};
+    uint64_t generation{};
+    uint64_t sequence{};
+    size_t access_gate{USER_PAGEMAP_ACCESS_GATE_NONE};
+    bool issued{};
+};
+constexpr size_t LAZY_FILE_FAULT_CAPACITY = 64;
+std::array<LazyFileFaultWork, LAZY_FILE_FAULT_CAPACITY> lazy_file_fault_work;
+sys::Spinlock lazy_file_fault_lock;
+sched::task::Task* lazy_file_fault_worker{};  // Retained while published.
+uint64_t lazy_file_fault_next_sequence{1};
+bool lazy_file_fault_admission{};
+bool lazy_file_fault_worker_starting{};
+
+void wake_lazy_file_fault_worker() {
+    uint64_t const FLAGS = lazy_file_fault_lock.lock_irqsave();
+    auto* worker = lazy_file_fault_worker;
+    if (worker != nullptr && !worker->try_acquire()) worker = nullptr;
+    lazy_file_fault_lock.unlock_irqrestore(FLAGS);
+    if (worker != nullptr) {
+        sched::wake_task_from_event(worker);
+        worker->release();
+    }
+}
+
+auto probe_lazy_file_fault(sched::task::Task* task, uint64_t vaddr, const paging::PageFault& fault, bool user_frame, uint64_t& generation)
+    -> LazyFileFaultDisposition {
+    if (task == nullptr || task->pagemap == nullptr) return LazyFileFaultDisposition::NOT_TRACKED;
+    uint64_t const PAGE_VADDR = page_align_down(vaddr);
+    sched::task::LazyVmemRange snapshot;
+    bool found = false;
+    uint64_t flags = task->lazy_vmem_lock.lock_irqsave();
+    for (auto const& range : task->lazy_vmem_ranges) {
+        if (PAGE_VADDR >= range.start && PAGE_VADDR < range.end && range.kind == sched::task::LazyVmemKind::FILE_BACKED) {
+            snapshot = range;
+            found = true;
+            break;
+        }
+    }
+    task->lazy_vmem_lock.unlock_irqrestore(flags);
+    if (!found) return LazyFileFaultDisposition::NOT_TRACKED;
+    // The existing exception-wait frame classifier accepts a user PROCESS
+    // fault. A kernel PROCESS fault is not a timer frame and cannot be parked
+    // through that protocol. Ordinary software-prefault usercopy is unchanged.
+    if (!user_frame || task->type != sched::task::TaskType::PROCESS || task->preempt_disable_depth != 0 || snapshot.file == nullptr ||
+        snapshot.prot == 0 || (fault.writable != 0U && (snapshot.prot & 2U) == 0) || (fault.fetch != 0U && (snapshot.prot & 4U) == 0))
+        return LazyFileFaultDisposition::FAILED;
+    if (!task->try_acquire()) return LazyFileFaultDisposition::FAILED;
+    PageTable* pagemap = nullptr;
+    if (!task->try_acquire_usercopy_pagemap(pagemap)) {
+        task->release();
+        return LazyFileFaultDisposition::FAILED;
+    }
+    size_t gate = USER_PAGEMAP_ACCESS_GATE_NONE;
+    if (!acquire_user_pagemap_access(pagemap, false, gate)) {
+        task->release_usercopy_pagemap();
+        task->release();
+        return LazyFileFaultDisposition::FAILED;
+    }
+    auto release_leases = [&] {
+        release_user_pagemap_access(gate);
+        task->release_usercopy_pagemap();
+        task->release();
+    };
+    uint64_t const PTE_FLAGS = cow_pte_lock.lock_irqsave();
+    bool const MAPPED = task->pagemap == pagemap && translate(pagemap, PAGE_VADDR) != PADDR_INVALID;
+    cow_pte_lock.unlock_irqrestore(PTE_FLAGS);
+    if (MAPPED) {
+        release_leases();
+        return LazyFileFaultDisposition::RESOLVED;
+    }
+
+    flags = lazy_file_fault_lock.lock_irqsave();
+    uint64_t const PREVIOUS = task->lazy_file_fault_generation;
+    uint64_t const COMPLETED = task->lazy_file_fault_completion_generation.load(std::memory_order_acquire);
+    if (PREVIOUS != 0 && COMPLETED != PREVIOUS) {
+        generation = PREVIOUS;
+        bool const SAME = task->lazy_file_fault_vaddr == PAGE_VADDR;
+        lazy_file_fault_lock.unlock_irqrestore(flags);
+        release_leases();
+        return SAME ? LazyFileFaultDisposition::PARK : LazyFileFaultDisposition::FAILED;
+    }
+    if ((PREVIOUS != 0 && task->lazy_file_fault_vaddr == PAGE_VADDR && task->lazy_file_fault_status != 0) || !lazy_file_fault_admission ||
+        lazy_file_fault_worker == nullptr || lazy_file_fault_worker_starting || PREVIOUS == UINT64_MAX ||
+        lazy_file_fault_next_sequence == UINT64_MAX) {
+        lazy_file_fault_lock.unlock_irqrestore(flags);
+        release_leases();
+        return LazyFileFaultDisposition::FAILED;
+    }
+    size_t index = lazy_file_fault_work.size();
+    for (size_t i = 0; i < lazy_file_fault_work.size(); ++i) {
+        if (lazy_file_fault_work[i].task == nullptr) {
+            index = i;
+            break;
+        }
+    }
+    if (index == lazy_file_fault_work.size()) {
+        lazy_file_fault_lock.unlock_irqrestore(flags);
+        release_leases();
+        return LazyFileFaultDisposition::FAILED;
+    }
+    // The pool -> range order occurs only here. Revalidate and retain the File
+    // once publication is guaranteed, so rejection can never run a last File
+    // put/close from the hardware fault. retain_file is an atomic increment.
+    uint64_t const RANGE_FLAGS = task->lazy_vmem_lock.lock_irqsave();
+    bool current = false;
+    for (auto const& range : task->lazy_vmem_ranges) {
+        if (task->pagemap == pagemap && lazy_file_range_matches(range, snapshot, PAGE_VADDR)) {
+            snapshot = range;
+            ker::vfs::vfs_retain_file(snapshot.file);
+            current = true;
+            break;
+        }
+    }
+    if (current) {
+        generation = PREVIOUS + 1;
+        lazy_file_fault_work[index] = {task, pagemap, snapshot, fault, PAGE_VADDR, generation, lazy_file_fault_next_sequence++,
+                                       gate, false};
+        task->lazy_file_fault_vaddr = PAGE_VADDR;
+        task->lazy_file_fault_status = 0;
+        task->lazy_file_fault_generation = generation;
+    }
+    task->lazy_vmem_lock.unlock_irqrestore(RANGE_FLAGS);
+    lazy_file_fault_lock.unlock_irqrestore(flags);
+    if (!current) {
+        release_leases();
+        return LazyFileFaultDisposition::FAILED;
+    }
+    wake_lazy_file_fault_worker();
+    return LazyFileFaultDisposition::PARK;
+}
+
+auto take_lazy_file_fault(LazyFileFaultWork& work, size_t& index) -> bool {
+    uint64_t const FLAGS = lazy_file_fault_lock.lock_irqsave();
+    index = lazy_file_fault_work.size();
+    for (size_t i = 0; i < lazy_file_fault_work.size(); ++i) {
+        auto const& candidate = lazy_file_fault_work[i];
+        if (candidate.task != nullptr && !candidate.issued &&
+            (index == lazy_file_fault_work.size() || candidate.sequence < lazy_file_fault_work[index].sequence))
+            index = i;
+    }
+    if (index != lazy_file_fault_work.size()) {
+        lazy_file_fault_work[index].issued = true;
+        work = lazy_file_fault_work[index];
+    }
+    lazy_file_fault_lock.unlock_irqrestore(FLAGS);
+    return index != lazy_file_fault_work.size();
+}
+
+void finish_lazy_file_fault(const LazyFileFaultWork& work, size_t index, int status) {
+    auto* task = work.task;
+    ker::vfs::vfs_put_file(work.range.file);
+    release_user_pagemap_access(work.access_gate);
+    task->release_usercopy_pagemap();
+    uint64_t const FLAGS = lazy_file_fault_lock.lock_irqsave();
+    task->lazy_file_fault_status = status;
+    lazy_file_fault_work[index] = {};
+    task->lazy_file_fault_completion_generation.store(work.generation, std::memory_order_release);
+    lazy_file_fault_lock.unlock_irqrestore(FLAGS);
+    sched::wake_task_from_event(task);
+    task->release();
+}
+
+void lazy_file_fault_worker_loop() {
+    auto* current = sched::get_current_task();
+    for (;;) {
+        auto const HOLD = sched::hold_kernel_shutdown();
+        uint64_t flags = lazy_file_fault_lock.lock_irqsave();
+        if (sched::kernel_threads_shutdown_requested()) lazy_file_fault_admission = false;
+        lazy_file_fault_lock.unlock_irqrestore(flags);
+        LazyFileFaultWork work;
+        size_t index = lazy_file_fault_work.size();
+        if (take_lazy_file_fault(work, index)) {
+#ifdef WOS_KASAN
+            if (kasan::is_enabled()) kasan::unpoison_range(&work, sizeof(work));
+#endif
+            bool const LIVE =
+                work.task->state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE && work.task->pagemap == work.pagemap;
+            bool const OK = LIVE && ker::syscall::vmem::materialize_lazy_file_page(work.task, work.range, work.vaddr, work.fault);
+            finish_lazy_file_fault(work, index, OK ? 0 : -EFAULT);
+            continue;
+        }
+        flags = lazy_file_fault_lock.lock_irqsave();
+        bool stop = sched::kernel_threads_shutdown_requested();
+        bool pending = false;
+        for (auto const& candidate : lazy_file_fault_work) pending |= candidate.task != nullptr;
+        if (stop) lazy_file_fault_admission = false;
+        bool const DRAIN = stop && pending;
+        stop &= !pending;
+        if (stop) {
+            lazy_file_fault_worker = nullptr;
+        }
+        lazy_file_fault_lock.unlock_irqrestore(flags);
+        if (stop) {
+            current->release();
+            return;
+        }
+        if (DRAIN) continue;
+        sched::kern_block();
+    }
+}
+
+void lazy_file_fault_worker_entry() {
+    lazy_file_fault_worker_loop();
+    sched::exit_current_kernel_thread();
+}
+
+void start_lazy_file_fault_worker() {
+    auto const HOLD = sched::hold_kernel_shutdown();
+    uint64_t flags = lazy_file_fault_lock.lock_irqsave();
+    if (lazy_file_fault_worker != nullptr || lazy_file_fault_worker_starting || sched::kernel_threads_shutdown_requested()) {
+        lazy_file_fault_lock.unlock_irqrestore(flags);
+        return;
+    }
+    lazy_file_fault_worker_starting = true;
+    lazy_file_fault_lock.unlock_irqrestore(flags);
+    auto* worker = sched::task::Task::create_kernel_thread("file_fault", lazy_file_fault_worker_entry);
+    if (worker == nullptr) {
+        flags = lazy_file_fault_lock.lock_irqsave();
+        lazy_file_fault_worker_starting = false;
+        lazy_file_fault_lock.unlock_irqrestore(flags);
+        return;
+    }
+    if (!worker->try_acquire_lifetime_ref()) ker::mod::dbg::panic_handler("file fault: invalid fresh worker lifetime");
+    flags = lazy_file_fault_lock.lock_irqsave();
+    lazy_file_fault_worker = worker;
+    lazy_file_fault_lock.unlock_irqrestore(flags);
+    if (!sched::post_task_balanced(worker)) {
+        flags = lazy_file_fault_lock.lock_irqsave();
+        lazy_file_fault_worker = nullptr;
+        lazy_file_fault_worker_starting = false;
+        lazy_file_fault_lock.unlock_irqrestore(flags);
+        worker->release();
+        sched::task::destroy_unpublished_user_thread(worker);
+        return;
+    }
+    flags = lazy_file_fault_lock.lock_irqsave();
+    lazy_file_fault_admission = lazy_file_fault_worker == worker && !sched::kernel_threads_shutdown_requested();
+    lazy_file_fault_worker_starting = false;
+    lazy_file_fault_lock.unlock_irqrestore(flags);
+    wake_lazy_file_fault_worker();
+}
+#endif
+
 auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const paging::PageFault& fault, uint64_t fault_rip = 0,
-                            uint64_t fault_rsp = 0) -> bool {
+                            uint64_t fault_rsp = 0, bool allow_file_io = true) -> bool {
     if (task == nullptr || task->pagemap == nullptr) {
         return false;
     }
@@ -686,6 +938,13 @@ auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const pagin
         }
 
         if (range.kind == sched::task::LazyVmemKind::FILE_BACKED) {
+            // A range can become file-backed after the hardware fault's
+            // deferred probe missed it. Never fall back to synchronous file
+            // I/O from that exception context.
+            if (!allow_file_io) {
+                task->lazy_vmem_lock.unlock_irqrestore(IRQF);
+                return false;
+            }
             auto file_range = range;
             if (file_range.file != nullptr) {
                 ker::vfs::vfs_retain_file(file_range.file);
@@ -1006,18 +1265,38 @@ auto probe_anonymous_swap_fault(sched::task::Task* task, vaddr_t vaddr, const pa
     return RESULT;
 }
 
-void service_anonymous_pagein(AnonymousSwapMapping* mapping) {
-    if (mapping == nullptr) {
-        return;
-    }
-    uint64_t const STARTED_US = time::get_us();
-    size_t const ACCESS_GATE = mapping->pagein_access_gate;
-    bool const ACCESS = ACCESS_GATE != USER_PAGEMAP_ACCESS_GATE_NONE;
-    void* page = nullptr;
-    swap::SwapSlot slot{};
-    uint64_t generation = 0;
-    bool should_read = false;
+// Every window entry owns its access gate, mapping/frame and slot I/O until
+// finish. Storage is permanent and bounded; no batch lives on the kernel stack.
+struct AnonymousPageinOperation {
+    AnonymousSwapMapping* mapping{};
+    void* page{};
+    uint64_t started_us{};
+    uint64_t generation{};
+    size_t access_gate{USER_PAGEMAP_ACCESS_GATE_NONE};
+    bool should_read{};
+    int result{};
+    swap::SlotIo io;
+};
+#ifdef WOS_ASYNC_BLOCK_IO
+constexpr size_t ANONYMOUS_PAGEIN_WINDOW = 8;
+#else
+constexpr size_t ANONYMOUS_PAGEIN_WINDOW = 1;
+#endif
+std::array<AnonymousPageinOperation, ANONYMOUS_PAGEIN_WINDOW> anonymous_pagein_operations;
 
+void begin_anonymous_pagein(AnonymousSwapMapping* mapping, AnonymousPageinOperation& operation) {
+    operation.mapping = mapping;
+    operation.page = nullptr;
+    operation.generation = 0;
+    operation.should_read = false;
+    operation.started_us = time::get_us();
+    operation.access_gate = mapping->pagein_access_gate;
+    size_t const ACCESS_GATE = operation.access_gate;
+    bool const ACCESS = ACCESS_GATE != USER_PAGEMAP_ACCESS_GATE_NONE;
+    auto& page = operation.page;
+    auto& generation = operation.generation;
+    auto& should_read = operation.should_read;
+    swap::SwapSlot slot{};
     if (ACCESS) {
         page = phys::page_alloc_full_overwrite_page_with_reclaim_may_fail(PhysicalPageOwner::USER_PRIVATE_MAPPING, "anon-swapin");
     }
@@ -1037,10 +1316,27 @@ void service_anonymous_pagein(AnonymousSwapMapping* mapping) {
         cow_pte_lock.unlock_irqrestore(FLAGS);
     }
 
-    int result = page == nullptr ? -ENOMEM : -ECANCELED;
+    operation.result = page == nullptr ? -ENOMEM : -ECANCELED;
     if (should_read) {
-        result = swap::read_slot(slot, page);
+        operation.result = swap::submit_slot_io(operation.io, slot, page, false);
     }
+}
+
+void finish_anonymous_pagein(AnonymousPageinOperation& operation) {
+    auto* mapping = operation.mapping;
+    void* page = operation.page;
+    uint64_t const STARTED_US = operation.started_us;
+    size_t const ACCESS_GATE = operation.access_gate;
+    bool const ACCESS = ACCESS_GATE != USER_PAGEMAP_ACCESS_GATE_NONE;
+    uint64_t const generation = operation.generation;
+    bool const should_read = operation.should_read;
+    // The worker stops preparation at backpressure and finishes older entries
+    // first. Their explicit release makes capacity available for this retry.
+    while (!operation.io.active && operation.result == -EAGAIN) {
+        operation.result = swap::submit_slot_io(operation.io, operation.io.slot, page, false);
+        if (operation.result == -EAGAIN) ker::dev::block_queue_wait_for_capacity(operation.io.device);
+    }
+    int result = operation.io.active ? swap::finish_slot_io(operation.io) : operation.result;
     AnonymousSwapObject* object_to_release = nullptr;
     sched::task::Task* waiters = nullptr;
     bool installed = false;
@@ -1125,14 +1421,42 @@ void service_anonymous_pagein(AnonymousSwapMapping* mapping) {
     }
 }
 
+// Migration and BSP selftests retain the one-page bridge; only the dedicated
+// worker owns the permanent window above.
+void service_anonymous_pagein(AnonymousSwapMapping* mapping) {
+    if (mapping == nullptr) return;
+    auto const HOLD = sched::hold_kernel_shutdown();
+    AnonymousPageinOperation operation;
+    begin_anonymous_pagein(mapping, operation);
+    finish_anonymous_pagein(operation);
+}
+
 [[noreturn]] void anonymous_pagein_worker_main() {
     for (;;) {
-        auto* mapping = anonymous_pagein_dequeue();
-        if (mapping == nullptr) {
-            sched::kern_block();
-            continue;
+        bool empty = true;
+        {
+            auto const HOLD = sched::hold_kernel_shutdown();
+            size_t count = 0;
+            while (count < anonymous_pagein_operations.size()) {
+                auto* mapping = anonymous_pagein_dequeue();
+                if (mapping == nullptr) break;
+                if (count == 0) {
+                    begin_anonymous_pagein(mapping, anonymous_pagein_operations[count]);
+                } else {
+                    // Earlier entries retain the queue's owner/byte budget.
+                    // Allocation must not reclaim through I/O on that queue
+                    // before this batch can join and release those owners.
+                    reclaim::NoIoScope const NO_IO;
+                    begin_anonymous_pagein(mapping, anonymous_pagein_operations[count]);
+                }
+                bool const FULL = anonymous_pagein_operations[count].result == -EAGAIN;
+                ++count;
+                if (FULL) break;
+            }
+            empty = count == 0;
+            for (size_t i = 0; i < count; ++i) finish_anonymous_pagein(anonymous_pagein_operations[i]);
         }
-        service_anonymous_pagein(mapping);
+        if (empty) sched::kern_block();
     }
 }
 
@@ -3629,7 +3953,26 @@ auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, 
         if (SWAP_FAULT == AnonymousSwapFaultDisposition::FAILED) {
             return false;
         }
-        if (handle_lazy_vmem_fault(current_task, control_register, PAGEFAULT, frame.rip, frame.rsp)) {
+#ifdef WOS_ASYNC_BLOCK_IO
+        auto const FILE_FAULT = probe_lazy_file_fault(current_task, control_register, PAGEFAULT, (frame.cs & 3U) == 3U, wait_generation);
+        if (FILE_FAULT == LazyFileFaultDisposition::PARK) {
+            while (current_task->lazy_file_fault_completion_generation.load(std::memory_order_acquire) != wait_generation) {
+                auto const WAIT = sched::place_task_in_wait_queue_if_pending(
+                    gpr, frame, current_task->lazy_file_fault_completion_generation, wait_generation);
+                if (WAIT == sched::ExceptionWaitResult::PARKED) return true;
+            }
+            return current_task->lazy_file_fault_status == 0 &&
+                   translate(current_task->pagemap, page_align_down(control_register)) != PADDR_INVALID;
+        }
+        if (FILE_FAULT == LazyFileFaultDisposition::RESOLVED) return true;
+        if (FILE_FAULT == LazyFileFaultDisposition::FAILED) return false;
+#endif
+#ifdef WOS_ASYNC_BLOCK_IO
+        constexpr bool ALLOW_FILE_IO = false;
+#else
+        constexpr bool ALLOW_FILE_IO = true;
+#endif
+        if (handle_lazy_vmem_fault(current_task, control_register, PAGEFAULT, frame.rip, frame.rsp, ALLOW_FILE_IO)) {
             return true;
         }
         if (current_task != nullptr && current_task->pagemap != nullptr && current_task->thread != nullptr &&
@@ -4346,6 +4689,11 @@ void register_anonymous_swap_shrinker() {
 }
 
 void start_anonymous_swap_worker() {
+#ifdef WOS_ASYNC_BLOCK_IO
+    // SMT calls this after scheduler startup even when swap is disabled. Cold
+    // file mappings need their own task-context fault service in every ON boot.
+    start_lazy_file_fault_worker();
+#endif
     if (!anonymous_swap_enabled()) {
         return;
     }

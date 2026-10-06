@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <dev/block_request.hpp>
 
 namespace ker::dev {
 struct BlockDevice;
@@ -55,6 +56,22 @@ auto allocate_slot(SwapSlot* out) -> int;
 auto free_slot(SwapSlot slot) -> int;
 auto write_slot(SwapSlot slot, const void* page) -> int;
 auto read_slot(SwapSlot slot, void* page) -> int;
+// Caller retains the descriptor and page until finish_slot_io. Admission is
+// bounded and can return -EAGAIN without retaining either. The slot/area pin
+// remains active until task-side CRC/status publication and request release.
+struct SlotIo {
+    ker::dev::BlockRequest request;
+    SwapSlot slot{};
+    void* page{};
+    ker::dev::BlockDevice* device{};
+    uint32_t checksum{};
+    int backend_status{};
+    bool write{};
+    bool active{};
+    bool asynchronous{};
+};
+auto submit_slot_io(SlotIo&, SwapSlot, void* page, bool write) -> int;
+auto finish_slot_io(SlotIo&) -> int;
 void get_stats(SwapStats* out);
 
 auto activate_block_device(ker::dev::BlockDevice* device, const char* name) -> int;

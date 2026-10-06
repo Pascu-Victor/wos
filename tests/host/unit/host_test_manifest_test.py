@@ -77,16 +77,34 @@ def require_registered_files(
     for path in files:
         target = path.stem
         body = registrations.get(target)
+        expected_source = f"${{CMAKE_CURRENT_SOURCE_DIR}}/{source_dir}/{path.name}"
+        source_token = re.compile(r"(?:^|[\s\"';(])" + re.escape(expected_source) + r"(?=$|[\s\"';)])")
+        # One executable may link multiple independent GTest translation units.
+        # Each source still has to appear in an actual registered target.
+        if body is None:
+            body = next((registered for registered in registrations.values() if source_token.search(registered)), None)
         if body is None:
             missing.append(str(path.relative_to(ROOT)))
             continue
-        expected_source = f"${{CMAKE_CURRENT_SOURCE_DIR}}/{source_dir}/{path.name}"
-        if expected_source not in body:
+        if source_token.search(body) is None:
             wrong_source.append(f"{target} missing source {expected_source}")
     if missing:
         fail(f"{registration_kind} files not registered in tests/host/CMakeLists.txt: {', '.join(missing)}")
     if wrong_source:
         fail(f"{registration_kind} registrations with stale/missing source paths: {'; '.join(wrong_source)}")
+
+
+def require_composite_source_registration_checks() -> None:
+    companion = HOST_DIR / "unit" / "companion_test.cpp"
+    source = "${CMAKE_CURRENT_SOURCE_DIR}/unit/companion_test.cpp"
+    require_registered_files([companion], {"suite_test": source}, "unit", "synthetic composite test")
+    for registrations in ({"suite_test": ""}, {"suite_test": source + ".missing"},
+                          {"companion_test": "", "suite_test": source}):
+        try:
+            require_registered_files([companion], registrations, "unit", "synthetic composite test")
+        except AssertionError:
+            continue
+        fail("source registration accepted a missing source or a stale same-name target")
 
 
 def require_no_stale_sources(source: str, existing: set[str]) -> None:
@@ -336,6 +354,7 @@ def require_sets_equal(left: set[str], right: set[str], left_name: str, right_na
 def main() -> None:
     source = strip_comments(HOST_CMAKE.read_text())
 
+    require_composite_source_registration_checks()
     require_discoverable_test_source_names()
 
     unit_cpp_files = sorted((HOST_DIR / "unit").glob("*_test.cpp"))
