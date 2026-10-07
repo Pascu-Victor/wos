@@ -179,6 +179,21 @@ auto cmdline_has_token(const char* cmdline, const char* token) -> bool {
     return false;
 }
 
+#ifdef WOS_SELFTEST
+// Set before WKI publication, then read only by task-context feature handlers.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+uint64_t s_vfs_owner_qualification_features = 0;
+
+auto vfs_owner_qualification_features(const char* cmdline) -> uint64_t {
+    uint64_t features = 0;
+    if (cmdline_has_token(cmdline, "wki.vfs_owner_versions")) features |= WKI_VFS_FEATURE_OWNER_VERSIONS;
+    if (cmdline_has_token(cmdline, "wki.vfs_atomic_append")) features |= WKI_VFS_FEATURE_ATOMIC_APPEND;
+    if (cmdline_has_token(cmdline, "wki.vfs_owner_locks")) features |= WKI_VFS_FEATURE_OWNER_LOCKS;
+    if (cmdline_has_token(cmdline, "wki.vfs_committed_io")) features |= WKI_VFS_FEATURE_COMMITTED_IO;
+    return features;
+}
+#endif
+
 auto wait_diag_enabled() -> bool {
     static std::atomic<int> cached{-1};
     int value = cached.load(std::memory_order_acquire);
@@ -1461,6 +1476,42 @@ void resolve_local_hostname() {
 // Initialization
 // -----------------------------------------------------------------------------
 
+auto wki_vfs_owner_qualification_features() -> uint64_t {
+#ifdef WOS_SELFTEST
+    return s_vfs_owner_qualification_features;
+#else
+    return 0;
+#endif
+}
+
+#ifdef WOS_SELFTEST
+auto wki_selftest_vfs_owner_qualification_tokens() -> bool {
+    constexpr std::array TOKENS{"wki.vfs_owner_versions", "wki.vfs_atomic_append", "wki.vfs_owner_locks", "wki.vfs_committed_io"};
+    constexpr std::array BITS{WKI_VFS_FEATURE_OWNER_VERSIONS, WKI_VFS_FEATURE_ATOMIC_APPEND, WKI_VFS_FEATURE_OWNER_LOCKS,
+                              WKI_VFS_FEATURE_COMMITTED_IO};
+    for (unsigned selection = 0; selection != 16; ++selection) {
+        std::array<char, 128> command{};
+        size_t used = 0;
+        uint64_t expected = 0;
+        for (size_t i = 0; i != TOKENS.size(); ++i) {
+            if ((selection & (1U << i)) == 0) continue;
+            size_t const LENGTH = std::strlen(TOKENS[i]);
+            std::memcpy(command.data() + used, TOKENS[i], LENGTH);
+            used += LENGTH;
+            command[used++] = i % 2 == 0 ? ' ' : '\t';
+            expected |= BITS[i];
+        }
+        if (vfs_owner_qualification_features(command.data()) != expected) return false;
+    }
+    for (const char* command :
+         std::array<const char*, 7>{nullptr, "", "wki.vfs_owner_versions=1", "wki.vfs_atomic_append_off", "xwki.vfs_owner_locks",
+                                    "wki.vfs_committed_io.extra", "wki.vfs_owner_locks,wki.vfs_atomic_append"}) {
+        if (vfs_owner_qualification_features(command) != 0) return false;
+    }
+    return vfs_owner_qualification_features("wki.vfs_owner_locks\twki.vfs_owner_locks") == WKI_VFS_FEATURE_OWNER_LOCKS;
+}
+#endif
+
 void wki_init() {
     if (g_wki.initialized) {
         return;
@@ -1535,6 +1586,9 @@ void wki_init() {
     if (cmdline_has_token(ker::init::get_kernel_cmdline(), "wki.routing_lease")) {
         g_wki.capabilities |= WKI_CAP_ROUTING_LEASE;
     }
+#ifdef WOS_SELFTEST
+    s_vfs_owner_qualification_features = vfs_owner_qualification_features(ker::init::get_kernel_cmdline());
+#endif
     g_wki.initialized = true;
 
     if (!wki_secure_rdma_init()) {

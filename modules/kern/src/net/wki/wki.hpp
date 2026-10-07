@@ -590,6 +590,10 @@ constexpr auto wki_requester_controls_dynamic_channel(uint16_t requester_node, u
 // Initialize WKI subsystem. Called from main.cpp during boot.
 void wki_init();
 
+// Immutable boot qualification mask. Normal builds always return zero; an
+// authenticated exact VFS binding must still authorize feature advertisement.
+auto wki_vfs_owner_qualification_features() -> uint64_t;
+
 // Shutdown WKI subsystem.
 void wki_shutdown();
 
@@ -878,6 +882,7 @@ void wki_wait_cleanup_for_task(ker::mod::sched::task::Task* task);
 auto wki_wait_diag_snapshot(WkiWaitDiag* out, size_t max) -> size_t;
 
 #ifdef WOS_SELFTEST
+auto wki_selftest_vfs_owner_qualification_tokens() -> bool;
 void wki_selftest_wait_list_link(WkiWaitEntry* entry);
 auto wki_selftest_wait_list_contains(WkiWaitEntry const* entry) -> bool;
 auto wki_selftest_reliable_rx_peer_state_accepts(PeerState state) -> bool;

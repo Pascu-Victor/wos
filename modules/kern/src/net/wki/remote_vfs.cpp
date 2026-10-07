@@ -14398,11 +14398,13 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
                 .version = WKI_VFS_FEATURES_VERSION,
                 .length = sizeof(VfsFeaturesResponse),
                 .reserved = 0,
-                .features = WKI_VFS_FEATURE_MKDIR_IDENTITY | WKI_VFS_FEATURE_SYMLINK_IDENTITY | WKI_VFS_FEATURE_REMOVE_IDENTITY |
-                            WKI_VFS_FEATURE_RENAME_IDENTITY | WKI_VFS_FEATURE_BATCH_MUTATION_IDENTITY | WKI_VFS_FEATURE_XATTR_IDENTITY |
-                            WKI_VFS_FEATURE_DIRECTORY_REFERENCE | WKI_VFS_FEATURE_FILE_METADATA_IDENTITY | WKI_VFS_FEATURE_CHOWN_IDENTITY |
-                            (GRANTS ? WKI_VFS_FEATURE_DIRECTORY_GRANT | WKI_VFS_FEATURE_OPEN_LIFETIME : 0) |
-                            (g_wki.vfs_realpath_enabled && g_wki.vfs_directory_paths_enabled ? WKI_VFS_FEATURE_REALPATH_AT : 0)};
+                .features =
+                    WKI_VFS_FEATURE_MKDIR_IDENTITY | WKI_VFS_FEATURE_SYMLINK_IDENTITY | WKI_VFS_FEATURE_REMOVE_IDENTITY |
+                    WKI_VFS_FEATURE_RENAME_IDENTITY | WKI_VFS_FEATURE_BATCH_MUTATION_IDENTITY | WKI_VFS_FEATURE_XATTR_IDENTITY |
+                    WKI_VFS_FEATURE_DIRECTORY_REFERENCE | WKI_VFS_FEATURE_FILE_METADATA_IDENTITY | WKI_VFS_FEATURE_CHOWN_IDENTITY |
+                    (GRANTS ? WKI_VFS_FEATURE_DIRECTORY_GRANT | WKI_VFS_FEATURE_OPEN_LIFETIME | wki_vfs_owner_qualification_features()
+                            : 0) |
+                    (g_wki.vfs_realpath_enabled && g_wki.vfs_directory_paths_enabled ? WKI_VFS_FEATURE_REALPATH_AT : 0)};
             std::array<uint8_t, sizeof(DevOpRespPayload) + sizeof(features)> response{};
             DevOpRespPayload const header{.op_id = OP_VFS_FEATURES, .status = 0, .data_len = sizeof(features), .reserved = REQ_COOKIE};
             std::memcpy(response.data(), &header, sizeof(header));

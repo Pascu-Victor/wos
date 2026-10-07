@@ -339,3 +339,19 @@ corrupted one append payload and all three verifiers rejected it. This validates
 the workload's assertions and coordination; it does not qualify WOS packets,
 capability negotiation, signals, fencing or process exit. WOS compilation and
 packet qualification are recorded separately when performed.
+
+Owned qualification topologies can use a `WOS_SELFTEST` kernel with the exact
+boot tokens `wki.vfs_owner_versions`, `wki.vfs_atomic_append`,
+`wki.vfs_owner_locks` and `wki.vfs_committed_io`. Each token enables only its
+corresponding feature. The default diagnostic mask is zero, and normal builds
+always return zero regardless of boot tokens. Feature replies still require
+the current authenticated resource-incarnation binding; these options grant no
+credential, export or ordinary-open authority. They are qualification controls
+while the multi-client recovery matrix remains incomplete.
+
+Normal and isolated fast KTEST builds and formatting passed for these controls.
+The diagnostic suite passed 73,499 assertions with zero failures and selftest
+poweroff, including every feature-token combination and malformed-token
+rejection. All four private images were pruned after ownership/liveness audits.
+The normal kernel's compiled feature getter was also inspected and returns zero.
+These checks qualify the diagnostic controls; packet evidence is separate.

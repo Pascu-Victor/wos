@@ -4,12 +4,17 @@
 #include <net/wki/dev_server.hpp>
 #include <net/wki/remotable.hpp>
 #include <net/wki/remote_vfs.hpp>
+#include <net/wki/wki.hpp>
 #include <platform/security/credential_record.hpp>
 #include <test/ktest.hpp>
 #include <type_traits>
 #include <utility>
 #include <vfs/mount.hpp>
 #include <vfs/timestamps.hpp>
+
+KTEST(WkiRemoteVfsCoherency, DiagnosticFeatureTokensAreExactAndIndependent) {
+    KEXPECT_TRUE(ker::net::wki::wki_selftest_vfs_owner_qualification_tokens());
+}
 
 KTEST(WkiVfsWithdrawal, RetainsExactRevocationsUntilAcknowledged) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_withdrawal_outbox());
