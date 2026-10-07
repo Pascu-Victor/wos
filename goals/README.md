@@ -37,7 +37,7 @@ an explicit pause/block rule.
 | 36 | [VM checkpoints and live migration](36-wki-vm-checkpoint-migration.md) | dirty tracking, device quiescence, state transfer, ownership | 33, 35, 38, 40 on VM/MM/wire state | Not started |
 | 37 | [Replicated VM volumes](37-wki-replicated-vm-volumes.md) | durable quorum log, block leases, snapshots, recovery | 20, 25, 30 on block transport; 35–38 on WKI | Not started |
 | 38 | [Disaggregated guest memory](38-wki-disaggregated-guest-memory.md) | remote RAM providers, EPT/NPT cache, page ownership | 25 on transport; 33, 36, 40 on MM/EPT/NPT | Not started |
-| 39 | [Isolated service compartments](39-isolated-service-compartments.md) | mount/PID/IPC namespaces, lifecycle, authority, launcher | 19 on credentials; 26 on VFS policy | Not started |
+| 39 | [Isolated service compartments](39-isolated-service-compartments.md) | mount/PID/IPC namespaces, lifecycle, authority, launcher | 19 on credentials; 26 on VFS policy | In progress |
 | 40 | [NUMA placement and safe large pages](40-numa-memory-locality.md) | SRAT/SLIT, CPU domains, page policy, compound lifetime | 33, 36, 38 on VM/MM/Task state | Not started |
 | 41 | [Physical GPU platform](41-physical-gpu-platform.md) | PCI resources/reset, firmware, device mmap, AMD-Vi, IRQ remap | 20 on DMA/IOMMU; 40 on VM/page lifetime | Not started |
 | 42 | [DRM-compatible GPU kernel core](42-drm-gpu-kernel-core.md) | DRM uAPI, GEM/GPUVM, dma-buf, syncobj, scheduler, KMS | 21, 22, 41 on MM/security/device state | Not started |
@@ -54,6 +54,12 @@ availability observations and physical hardware qualification still constrain
 production rollout; see [the qualification record](../docs/wki_secure_rdma.md).
 
 ## New platform goals: 33–40
+
+Goal 28 is paused and incomplete at its tested wire-codec checkpoint
+`70bc3fe7`. At the user's request, current work selects Goal 39. Its native
+isolation, launcher and runtime criteria remain outstanding; the local progress
+ledger records source reconnaissance and qualification. The goal-manager API
+currently refuses replacement of the unfinished paused Goal 28.
 
 The [local virtualization manual corpus](../docs/virtualization-manuals.md)
 provides pinned source downloads, Docling PDF text and offline search. Check its

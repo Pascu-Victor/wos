@@ -143,3 +143,30 @@ authorized work remains, report the attempts, evidence, exact missing input,
 and restart step, and mark the active goal blocked. Missing prerequisites or
 hardware are never completion. Budget and pause controls remain user/system
 controlled.
+
+## Current session checkpoint (2026-10-08)
+
+Selected after user-requested Goal28 checkpoint commit70bc3fe7 and goal switch.
+Goal28 remains paused/incomplete; goal-manager create_goal rejects replacement
+while it is unfinished, and clearing/replacing it in goal controls is pending.
+Repository Goal39 work proceeds independently; no false prior completion.
+
+Current source already implements immutable CredentialStore and retained root/
+cwd views; the dated dirty-credential premise must not be copied. Full prior
+Goal19 authorization completion is not inferred from its retired portfolio row.
+Reuse existing checked APIs and map shared native consumers before modifying them.
+Initial profile preparation and13hosttests implemented;101focusedASan/UBSan cases,
+freestanding compiler probe, Normal Build WOS and formatter pass. These do not
+qualify namespace isolation; all10criteria/native integration remain outstanding.
+See progress/39/{ledger,evidence,reconnaissance,contract-01-profile}.md and
+docs/wos_service_compartments.md.
+
+User explicitly authorizes owned software VM runtime/debug through
+bin/wos-cluster --no-setup and isolated bin/wos-ktest --no-setup. This overrides
+the older user-run-only software test guidance above. Preserve the shared launch
+guard and build/data/sysroot isolation. Maintain one active topology,20GiB
+disposable-image budget and40GiB free floor; use immutable required bases and
+private COW/reflink images. Audit exact ownership/live process/QMP/FD/backing
+references and prune inactive agent-created disposable disks/backings/per-run
+appliances after PASS/FAIL/exceptions. Keep small evidence and user/unrelated
+disks/source/current artifacts. No Goal39 VM disks have been created.
