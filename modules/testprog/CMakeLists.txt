@@ -37,6 +37,7 @@ set(SOURCES
     src/thread_exit_stress.cpp
     src/tests/blockbench_mmap.cpp
     src/usercopy_negative.cpp
+    src/vfs_coherency.cpp
     src/wki_chaos_workload.cpp
     src/xattr_matrix.cpp
     src/mandelbench/lodepng.cpp

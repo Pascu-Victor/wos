@@ -47,6 +47,7 @@
 #include "tests/blockbench_mmap.hpp"
 #include "thread_exit_stress.hpp"
 #include "usercopy_negative.hpp"
+#include "vfs_coherency.hpp"
 #include "wki_chaos_workload.hpp"
 #include "xattr_matrix.hpp"
 
@@ -684,6 +685,10 @@ auto main(int argc, char** argv, char** envp) -> int {
 
     if (command != nullptr && std::strcmp(command, "xattr-matrix") == 0) {
         return run_xattr_matrix(argc - 1, argv + 1);
+    }
+
+    if (command != nullptr && std::strcmp(command, "vfs-coherency") == 0) {
+        return run_vfs_coherency(argc - 2, argv + 2);
     }
 
     if (command != nullptr && std::strcmp(command, "mandelbench") == 0) {

@@ -291,3 +291,27 @@ including TMPFS metadata-only timestamp publication and real mounted-XFS
 timestamp commit, OMIT and denial behavior. Normal and isolated fast KTEST builds,
 formatting and source-policy checks passed. This is a mutation-audit checkpoint;
 full client integration and multi-client packet qualification remain required.
+
+## Userspace campaign
+
+`testprog vfs-coherency ABSOLUTE_ROOT ROLE RUN_ID [TIMEOUT_SECONDS]` runs the
+public-syscall consistency workload. Start role 0 on the filesystem owner with a
+fresh root; start roles 1 and 2 on separate clients using their remote path to
+that same root and the same nonzero run ID. For example, the owner uses
+`/tmp/vfs-campaign-1`, and clients use `/wki/OWNER/tmp/vfs-campaign-1`.
+The root must not already exist. The default barrier deadline is 120 seconds;
+the topology runner must also bound blocked syscalls and clean up owned VMs.
+
+Each role appends 64 distinguishable records with one write per record. All
+three verify exact length, initialized payloads, every role/sequence and no
+duplicates. The workload primes read/stat/directory observations before an owner
+write, truncate, chmod, rename, unlink and pathname replacement, then checks
+fresh bytes/metadata and retained inode identity. It also tests owner-local
+versus remote POSIX, OFD and flock conflicts, record-lock queries, blocking
+grants/unlocks and POSIX release by an independently opened descriptor close.
+
+Three host processes passed this campaign under ASan/UBSan. A wrapped host write
+corrupted one append payload and all three verifiers rejected it. This validates
+the workload's assertions and coordination; it does not qualify WOS packets,
+capability negotiation, signals, fencing or process exit. WOS compilation and
+packet qualification are recorded separately when performed.
