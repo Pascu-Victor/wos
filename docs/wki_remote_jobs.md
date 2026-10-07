@@ -1,10 +1,12 @@
 # Durable remote job design
 
-Goal28 is in progress. Private value layers define bounded identity, admission,
-lifecycle and output-credit rules; they do not enable a job protocol, syscall or
-scheduler path. The existing one-shot remote-compute service keeps its current
-semantics. Native integration, stream transport, public controls and runtime
-qualification remain required.
+Goal28 is incomplete and checkpointed while work switches to Goal39 at the
+user's request. Private value layers and effect-free wire codecs define bounded
+identity, admission, lifecycle and output-credit rules. No job service is
+advertised and no job syscall, dispatcher or scheduler path is enabled. The
+existing one-shot remote-compute service keeps its current semantics. Native
+integration, stream transport, public controls and runtime qualification remain
+required before Goal28 can be completed.
 
 A job belongs to the provisioned authenticated submitter node and the effective
 UID from its authorized mapped credential snapshot. Status, attach, cancel and
@@ -18,9 +20,9 @@ monotonic nonzero job serial, a nonzero receiver incarnation and an immutable
 nonzero attempt. Receiver-incarnation mismatch reports `LOST`; it cannot admit
 or automatically resubmit the old job. A new execution requires an explicit new
 identity. A repeated serial cannot change its attempt or command digest.
-Incarnation generation and authenticated strict wire translation are subsequent
-integration work; these private value types do not authenticate input by
-themselves.
+Incarnation generation and authenticated native service admission are subsequent
+integration work. The private codec translates wire keys field by field; neither
+the values nor successfully decoded bytes authenticate input by themselves.
 
 The current receiver provisioning table is immutable during normal operation:
 one provisioned credential identifies each node until shutdown/restart. Session
@@ -135,8 +137,30 @@ handle and the enclosing job handle; both generations must match. The adapter
 must retain the exact native Task before claiming and deliver outside locks.
 Whole-job cancellation is independent of optional signal-receipt capacity.
 
-Negotiated wire framing, native retention/controls, actual stream transport and
-the versioned public CLI remain to be implemented.
+`net/wki/job_protocol.hpp/cpp` supplies an unadvertised version-one schema and
+bounded, allocation-free codecs. Request, response, output and credit headers
+have exact lengths, explicit integer fields, canonical 80-byte credentials,
+zero reserved fields and separate request/control/attachment identities. Decodes
+and failed encodes leave outputs unchanged; payload spans borrow their input
+owner. Encoders support overlapping payload buffers. EOF and stream credits use
+checked absolute offsets, and replies must match the complete job key, service,
+operation, correlation and signal serial. Receiver-restart replies carry a new
+incarnation with `LOST` and no invented task/output evidence.
+
+The owner mapper uses the production compute identity policy and checks the
+current authenticated node and mapped effective UID. Root and active service
+privileges require separately provisioned root identity trust. The mapper does
+not verify MACs, channel generations, live peer admission or negotiated service
+grants. Those checks must precede native effects. SUBMIT framing exposes a bounded
+opaque plan; its process, filesystem, argv, resource and authority semantics must
+be validated before acceptance. Framing success grants no execution.
+
+All existing HELLO capability bits are allocated. Future job discovery uses the
+named, versioned COMPUTE resource `process-durable-jobs-v1` and explicit INFO
+negotiation bound to the authenticated peer and exact RESOURCE channel. No new
+MsgType or resource advertisement is installed by these codecs. Native service
+negotiation/admission, retention/controls, stream transport and the public CLI
+remain to be implemented.
 
 The lifecycle implementation is `net/wki/job_state.hpp`. Its host test target,
 `wki_job_state_test`, exercises actual production values under ASan/UBSan,
@@ -167,6 +191,16 @@ claim/result replies, generation/capacity refusal and concurrent once-only claim
 with balanced outer job holders. The effect counters are model witnesses, not
 native signal-delivery evidence. Freestanding instantiation, formatting and
 Normal Build WOS pass for this stage; native adapters remain outstanding.
+
+The codec target adds 19 production-source ASan/UBSan cases: golden byte layouts,
+all truncated lengths, operation/credential/reserved/range errors, incarnation
+and correlation binding, root/service trust, unchanged output on rejection,
+overlapping encoder payloads and 5,000 deterministic mutated/random inputs.
+All 100 focused cases (60 job foundations/codecs and 40 existing authentication
+policy cases), the repository format check and Normal Build WOS passed for the
+wire checkpoint. The normal kernel compiles and links the codec. This is host
+framing/mapping evidence, not native process execution or network qualification;
+no Goal28 VM images were created. LeakSanitizer was disabled by the host harness.
 
 Owned tests may use `bin/wos-cluster --no-setup` and isolated
 `bin/wos-ktest --no-setup`. Keep one active topology, private COW/reflink images,

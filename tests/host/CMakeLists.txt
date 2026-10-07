@@ -1864,6 +1864,12 @@ wos_add_unit_test(wki_job_control_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_job_control_test.cpp
 )
 
+wos_add_unit_test(wki_job_protocol_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_job_protocol_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/net/wki/job_protocol.cpp
+                 ${WOS_KERN_SRC}/net/wki/auth_policy.cpp
+)
+
 wos_add_unit_test(vfs_advisory_client_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vfs_advisory_client_test.cpp
 )
