@@ -387,6 +387,23 @@ struct WkiRemoteVfsServerDiag {
     uint64_t async_close_misses = 0;
 };
 
+struct WkiRemoteVfsClientAdvisoryDiag {
+    uint64_t scopes = 0;
+    uint64_t scope_cleanup = 0;
+    uint64_t scope_users = 0;
+    uint64_t scope_rpc_held = 0;
+    uint64_t operations = 0;
+    uint64_t started = 0;
+    uint64_t cancelling = 0;
+    uint64_t acknowledging = 0;
+    uint64_t active_operations = 0;
+    bool task_owners_present = false;
+    constexpr auto operator==(const WkiRemoteVfsClientAdvisoryDiag&) const -> bool = default;
+};
+// Task context, called unlocked. Fixed registry scalars, with no ownership or
+// lifecycle changes. Its lock is independent of the native advisory snapshot.
+auto wki_remote_vfs_client_advisory_diag_snapshot() -> WkiRemoteVfsClientAdvisoryDiag;
+
 struct WkiRemoteVfsExecDiag {
     uint64_t capacity = 0;
     uint64_t owned = 0;

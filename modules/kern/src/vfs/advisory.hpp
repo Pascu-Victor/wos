@@ -14,6 +14,19 @@ struct RemoteAdvisoryReply;
 struct RemoteAdvisoryScopeResult;
 enum class RemoteAdvisoryPhase : uint8_t;
 
+struct AdvisoryDiag {
+    uint64_t locks = 0;
+    uint64_t associations = 0;
+    uint64_t scopes = 0;
+    uint64_t closed_scopes = 0;
+    uint64_t wait_receipts = 0;
+    uint64_t pending = 0;
+    constexpr auto operator==(const AdvisoryDiag&) const -> bool = default;
+};
+// Task context only, called unlocked. Copies scalars under the native manager
+// mutex; no retained File/Task pointers or network work escapes the snapshot.
+auto vfs_advisory_diag_snapshot() -> AdvisoryDiag;
+
 // Assigned by the authenticated peer's process owner, independently of PID
 // reuse. Caller captures peer/boot from the exact admitted server binding.
 struct RemoteAdvisoryOwner {

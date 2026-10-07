@@ -49,6 +49,7 @@
 #include <syscalls_impl/process/child_events.hpp>
 #include <syscalls_impl/vmem/sys_vmem.hpp>
 #include <utility>
+#include <vfs/advisory.hpp>
 #include <vfs/buffer_cache.hpp>
 #include <vfs/file.hpp>
 #include <vfs/fs/xfs/xfs_dir2.hpp>
@@ -5277,6 +5278,33 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {  // NOLINT(readab
     } else {
         append_sconst(p, end, "wki_server_binding_counts allocation_failed=1\n");
     }
+
+    // Independent scalar observations. Neither subsystem lock crosses the
+    // other snapshot or formatting, and no File/Task identity is exposed.
+    auto const ADVISORY = ker::vfs::vfs_advisory_diag_snapshot();
+    auto const CLIENT_ADVISORY = ker::net::wki::wki_remote_vfs_client_advisory_diag_snapshot();
+    append_sconst(p, end, "wki_vfs_advisory version=1");
+    auto advisory_field = [&](const char* name, uint64_t value) {
+        append_sconst(p, end, name);
+        append_dec64(p, end, value);
+    };
+    advisory_field(" locks=", ADVISORY.locks);
+    advisory_field(" associations=", ADVISORY.associations);
+    advisory_field(" scopes=", ADVISORY.scopes);
+    advisory_field(" closed_scopes=", ADVISORY.closed_scopes);
+    advisory_field(" wait_receipts=", ADVISORY.wait_receipts);
+    advisory_field(" pending=", ADVISORY.pending);
+    advisory_field(" client_scopes=", CLIENT_ADVISORY.scopes);
+    advisory_field(" client_scope_cleanup=", CLIENT_ADVISORY.scope_cleanup);
+    advisory_field(" client_scope_users=", CLIENT_ADVISORY.scope_users);
+    advisory_field(" client_scope_rpc_held=", CLIENT_ADVISORY.scope_rpc_held);
+    advisory_field(" client_operations=", CLIENT_ADVISORY.operations);
+    advisory_field(" client_started=", CLIENT_ADVISORY.started);
+    advisory_field(" client_cancelling=", CLIENT_ADVISORY.cancelling);
+    advisory_field(" client_acknowledging=", CLIENT_ADVISORY.acknowledging);
+    advisory_field(" client_active_operations=", CLIENT_ADVISORY.active_operations);
+    advisory_field(" client_task_owners_present=", CLIENT_ADVISORY.task_owners_present ? 1U : 0U);
+    append_char(p, end, '\n');
 
     ker::net::wki::WkiRemoteVfsExecDiag exec_views{};
     ker::net::wki::wki_remote_vfs_exec_diag_snapshot(&exec_views);

@@ -371,3 +371,30 @@ release. Both remote OFD query outputs were `pid=-1`. The run then failed during
 XFS setup because the owner image lacked `/var/tmp`; it does not qualify XFS or
 recovery. All 12 owned images were pruned after the failure. Normal and isolated
 builds, host ABI/campaign tests and formatting passed for the PID correction.
+
+The later `eth-pos5` run passed both TMPFS and XFS on all three authenticated
+nodes. Clients connected after the owner completed its root pivot and service
+startup. This qualifies an initialized owner with cold clients; it does not
+qualify reconciliation during simultaneous root pivots. Each filesystem run
+also checked that a forked child's POSIX close cannot release its parent's
+locks, that shared OFD locks survive until the last inherited/duplicated close,
+and that child exit retires POSIX locks before waitpid returns and a successor
+acquires them. All 12 disposable images were pruned after the run.
+
+`/proc/wki/netdiag` now includes `wki_vfs_advisory version=1`. Its native and
+client scalar counts cover locks, associations, scopes, wait receipts, pending
+waits, client operation/cleanup stages, scope users and RPC gates, active
+operations and the presence of task-owned references. Snapshots use the existing
+manager locks independently; they allocate no storage and expose no pointers.
+The three complete terminal snapshots in `eth-pos5` each reported all 16 counts
+as zero, an empty server FD registry and zero proxy open/lifecycle/wait references.
+This establishes cleanup after the exercised successful lifecycle paths. Exec,
+interrupted/fatal waits, injected packet faults and fence/session replacement
+remain separate required qualification.
+
+The corrected diagnostic fixture also passed in the subsequent isolated fast
+KTEST run: 73,501 assertions, zero failures and normal selftest poweroff. It
+checks both retained lost-reply obligations and return to the initial native/
+client diagnostic baselines after cleanup. The owner applies ACK before its
+reply is dropped, so the client retains an ACK obligation while the native
+receipt count is already zero. All four private KTEST images were pruned.

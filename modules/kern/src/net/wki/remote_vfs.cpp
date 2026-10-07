@@ -7772,6 +7772,31 @@ void wki_remote_vfs_server_diag_snapshot(WkiRemoteVfsServerDiag* out) {
     *out = snapshot;
 }
 
+auto wki_remote_vfs_client_advisory_diag_snapshot() -> WkiRemoteVfsClientAdvisoryDiag {
+    WkiRemoteVfsClientAdvisoryDiag result{};
+    s_vfs_lock.lock();
+    for (auto const& row : g_client_scopes) {
+        auto const PHASE = row.lifecycle.phase();
+        if (PHASE == client_advisory::ScopePhase::EMPTY) continue;
+        ++result.scopes;
+        result.scope_cleanup += PHASE != client_advisory::ScopePhase::ACTIVE ? 1U : 0U;
+        result.scope_users += row.lifecycle.users();
+        result.scope_rpc_held += row.lifecycle.rpc_held() ? 1U : 0U;
+    }
+    for (auto const& row : g_client_operations) {
+        auto const PHASE = row.lifecycle.phase();
+        if (PHASE == client_advisory::OperationPhase::EMPTY) continue;
+        ++result.operations;
+        result.started += PHASE == client_advisory::OperationPhase::STARTED ? 1U : 0U;
+        result.cancelling += PHASE == client_advisory::OperationPhase::CANCEL ? 1U : 0U;
+        result.acknowledging += PHASE == client_advisory::OperationPhase::ACK ? 1U : 0U;
+        result.active_operations += row.active_pid != 0 ? 1U : 0U;
+    }
+    result.task_owners_present = g_client_task_owners != nullptr;
+    s_vfs_lock.unlock();
+    return result;
+}
+
 #ifdef WOS_SELFTEST
 namespace {
 auto selftest_xattr_staged_namespace() -> bool;
@@ -10105,6 +10130,13 @@ auto wki_remote_vfs_selftest_client_advisory() -> bool {
     // lost ACK retains only client receipt storage, never releases that grant.
     fixture.drop_start = fixture.drop_lock_ack = true;
     if (vfs::vfs_fcntl_for_task(task, fixture.fds.front(), 6, 0, &lock) != 0 || !lock_visible(1) || g_client_record_count.load() != 2)
+        return fail(__LINE__);
+    auto const CLIENT_DIAG = wki_remote_vfs_client_advisory_diag_snapshot();
+    auto const NATIVE_DIAG = vfs::vfs_advisory_diag_snapshot();
+    // The endpoint loses the reply AFTER applying ACK: owner storage is gone,
+    // while the client's ACK outbox still retains its confirmation obligation.
+    if (CLIENT_DIAG.scopes != 1 || CLIENT_DIAG.operations != 1 || CLIENT_DIAG.acknowledging != 1 || CLIENT_DIAG.task_owners_present ||
+        NATIVE_DIAG.locks != 1 || NATIVE_DIAG.scopes != 1 || NATIVE_DIAG.wait_receipts != 0 || NATIVE_DIAG.pending != 0)
         return fail(__LINE__);
     fixture.drop_lock_ack = false;
     fixture.drain();

@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -76,7 +77,7 @@ class Campaign {
     auto execute() -> bool {
         if (seconds() < 0) return failure("monotonic-clock");
         if (role_ == 0 && !initialize()) return false;
-        if (!wait("initialized", 0) || !append() || !cache() || !locks() || !mark("complete")) return false;
+        if (!wait("initialized", 0) || !append() || !cache() || !locks() || !lifecycle() || !mark("complete")) return false;
         if (role_ == 0 && !wait_all("complete")) return false;
         std::printf("VFS-COHERENCY-PASS role=%u run=%llu records=%u\n", role_, static_cast<unsigned long long>(run_), RECORDS);
         return true;
@@ -146,6 +147,11 @@ class Campaign {
         if (mkdir(root_, 0700) != 0) return failure("fresh-root");
         for (const char* leaf : {"append", "posix", "ofd", "flock", "close"})
             if (!create(leaf)) return false;
+        for (unsigned role = 0; role < PARTICIPANTS; ++role) {
+            std::array<char, 32> leaf{};
+            std::snprintf(leaf.data(), leaf.size(), "lifecycle-%u", role);
+            if (!create(leaf.data())) return false;
+        }
         return create("original", "seed") && create("removed", "seed") && create("directory-old") && mark("initialized");
     }
     auto append() -> bool {
@@ -308,6 +314,96 @@ class Campaign {
         query.l_pid = 0;
         if (fcntl(holder.get(), F_OFD_GETLK, &query) != 0 || query.l_type != F_UNLCK) return failure("any-descriptor-close-release");
         return holder.finish();
+    }
+    auto query(int fd, short type, pid_t pid) -> bool {
+        struct flock value{};
+        value.l_type = F_WRLCK;
+        value.l_whence = SEEK_SET;
+        value.l_len = 16;
+        return fcntl(fd, F_OFD_GETLK, &value) == 0 && value.l_type == type &&
+               (type == F_UNLCK || (value.l_start == 0 && value.l_len == 16 && value.l_pid == pid));
+    }
+    auto join(pid_t child) -> bool {
+        int status = 0;
+        pid_t observed = -1;
+        do {
+            observed = waitpid(child, &status, 0);
+        } while (observed == -1 && errno == EINTR);
+        if (observed == child && WIFEXITED(status) && WEXITSTATUS(status) == 0) return true;
+        std::printf("VFS-COHERENCY-CHILD role=%u pid=%lld observed=%lld status=%d\n", role_, static_cast<long long>(child),
+                    static_cast<long long>(observed), status);
+        return false;
+    }
+    auto lifecycle() -> bool {
+        std::array<char, 32> leaf{};
+        std::snprintf(leaf.data(), leaf.size(), "lifecycle-%u", role_);
+        pid_t const PARENT = getpid();
+        {
+            Descriptor holder(open_file(leaf.data(), O_RDWR)), observer(open_file(leaf.data(), O_RDWR));
+            if (holder.get() < 0 || observer.get() < 0 || command(holder.get(), 0, false, false) != 0) return failure("fork-posix-parent");
+            pid_t const CHILD = fork();
+            if (CHILD < 0) return failure("fork-posix");
+            if (CHILD == 0) {
+                struct flock value{};
+                value.l_type = F_WRLCK;
+                value.l_whence = SEEK_SET;
+                value.l_len = 16;
+                if (fcntl(holder.get(), F_GETLK, &value) != 0 || value.l_type != F_WRLCK || value.l_pid != PARENT) _exit(11);
+                errno = 0;
+                if (command(holder.get(), 0, false, false) != -1 || (errno != EAGAIN && errno != EACCES)) _exit(12);
+                if (!holder.finish()) _exit(13);
+                _exit(0);
+            }
+            if (!join(CHILD) || !query(observer.get(), F_WRLCK, PARENT) || !observer.finish() || !query(holder.get(), F_UNLCK, 0) ||
+                !holder.finish())
+                return failure("fork-posix-parent-survives-child-close");
+        }
+        std::printf("VFS-COHERENCY-CASE role=%u case=fork-posix-scope\n", role_);
+        {
+            Descriptor holder(open_file(leaf.data(), O_RDWR)), observer(open_file(leaf.data(), O_RDWR));
+            if (holder.get() < 0 || observer.get() < 0 || command(holder.get(), 1, false, false) != 0) return failure("fork-ofd-parent");
+            pid_t const CHILD = fork();
+            if (CHILD < 0) return failure("fork-ofd");
+            if (CHILD == 0) {
+                if (command(holder.get(), 1, false, false) != 0 || !holder.finish()) _exit(21);
+                _exit(0);
+            }
+            if (!join(CHILD) || !query(observer.get(), F_WRLCK, -1)) return failure("fork-ofd-child-close");
+            Descriptor alias(dup(holder.get()));
+            if (alias.get() < 0 || !holder.finish() || !query(observer.get(), F_WRLCK, -1) || !alias.finish() ||
+                !query(observer.get(), F_UNLCK, 0) || !observer.finish())
+                return failure("ofd-last-shared-close");
+        }
+        std::printf("VFS-COHERENCY-CASE role=%u case=fork-ofd-last-close\n", role_);
+        {
+            Descriptor observer(open_file(leaf.data(), O_RDWR));
+            std::array<int, 2> ready{}, release{};
+            if (observer.get() < 0 || pipe(ready.data()) != 0) return failure("exit-ready-pipe");
+            Descriptor ready_read(ready.at(0)), ready_write(ready.at(1));
+            if (pipe(release.data()) != 0) return failure("exit-release-pipe");
+            Descriptor release_read(release.at(0)), release_write(release.at(1));
+            pid_t const CHILD = fork();
+            if (CHILD < 0) return failure("exit-fork");
+            if (CHILD == 0) {
+                if (!observer.finish() || !ready_read.finish() || !release_write.finish()) _exit(31);
+                Descriptor holder(open_file(leaf.data(), O_RDWR));
+                if (holder.get() < 0 || command(holder.get(), 0, false, false) != 0) _exit(32);
+                char value = 'L';
+                if (write(ready_write.get(), &value, 1) != 1 || read(release_read.get(), &value, 1) != 1 || value != 'X') _exit(33);
+                // No explicit close/unlock: kernel process exit owns retirement.
+                _exit(0);
+            }
+            if (!ready_write.finish() || !release_read.finish()) return failure("exit-parent-pipes");
+            char value = 0;
+            if (read(ready_read.get(), &value, 1) != 1 || value != 'L' || !query(observer.get(), F_WRLCK, CHILD))
+                return failure("exit-child-lock-visible");
+            value = 'X';
+            if (write(release_write.get(), &value, 1) != 1 || !join(CHILD) || !query(observer.get(), F_UNLCK, 0) ||
+                command(observer.get(), 0, false, false) != 0 || command(observer.get(), 0, true, false) != 0 || !observer.finish())
+                return failure("exit-lock-release-before-waitpid");
+        }
+        std::printf("VFS-COHERENCY-CASE role=%u case=exit-lock-retirement\n", role_);
+        return mark("lifecycle-verified") && wait_all("lifecycle-verified");
     }
     const char* root_;
     unsigned role_;

@@ -19871,6 +19871,19 @@ auto vfs_advisory_process_generation(ker::mod::sched::task::Task& subject, bool 
     return generation;
 }
 
+auto vfs_advisory_diag_snapshot() -> AdvisoryDiag {
+    ker::mod::sys::MutexGuard guard(g_advisory_lock_mutex);
+    AdvisoryDiag result{.locks = g_advisory_locks.size(), .pending = g_remote_advisory_pending};
+    for (auto const& row : g_remote_advisory_associations) result.associations += row.file != nullptr ? 1U : 0U;
+    for (auto const& row : g_remote_advisory_scopes) {
+        if (row.witness == nullptr) continue;
+        ++result.scopes;
+        result.closed_scopes += row.scope.snapshot().state == RemoteAdvisoryScopeState::CLOSED ? 1U : 0U;
+    }
+    for (auto const& row : g_remote_advisory_waits) result.wait_receipts += row.file != nullptr ? 1U : 0U;
+    return result;
+}
+
 auto vfs_advisory_remote_identity(File* file, uint64_t& output) -> int {
     if (file == nullptr || file->fops == nullptr) return -EBADF;
     uint64_t identity = 0;

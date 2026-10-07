@@ -9,6 +9,7 @@
 #include <test/ktest.hpp>
 #include <type_traits>
 #include <utility>
+#include <vfs/advisory.hpp>
 #include <vfs/mount.hpp>
 #include <vfs/timestamps.hpp>
 
@@ -161,7 +162,11 @@ KTEST(WkiRemoteVfsCoherency, OwnerAdvisoryAdapterDerivesScopeAndPreservesSharedO
 }
 
 KTEST(WkiRemoteVfsCoherency, ClientDispatchScopesOutboxesAndFatalOwnershipUseExactReferences) {
+    auto const NATIVE_BEFORE = ker::vfs::vfs_advisory_diag_snapshot();
+    auto const CLIENT_BEFORE = ker::net::wki::wki_remote_vfs_client_advisory_diag_snapshot();
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_client_advisory());
+    KEXPECT_TRUE(ker::vfs::vfs_advisory_diag_snapshot() == NATIVE_BEFORE);
+    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_client_advisory_diag_snapshot() == CLIENT_BEFORE);
 }
 
 KTEST(WkiRemoteVfsCoherency, OwnerScopeControllerUsesTokenAuthorityAndNeverClosesSuccessor) {
