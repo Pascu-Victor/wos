@@ -1580,6 +1580,7 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset,
         return 0;
     }
 
+    coherency::Publication publication(ip->coherency, coherency::Domain::CONTENT);
     const auto* src = static_cast<const uint8_t*>(buf);
     size_t total_written = 0;
     int write_error = 0;
@@ -2426,6 +2427,7 @@ auto xfs_vfs_truncate_impl(File* f, off_t length) -> int {
 
     ker::mod::sys::MutexGuard guard(ip->io_lock);
     if (!ip->exec_content.can_mutate()) return -ETXTBSY;
+    coherency::Publication publication(ip->coherency, coherency::Domain::CONTENT);
     XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());
 
     auto new_size = static_cast<uint64_t>(length);
@@ -5874,6 +5876,12 @@ auto xfs_fstat(File* f, ker::vfs::Stat* statbuf) -> int {
     ker::mod::sys::MutexGuard guard(xfd->inode->io_lock);
     fill_stat(xfd->inode, statbuf);
     return 0;
+}
+
+auto xfs_coherency_snapshot(File* file, coherency::Stamp& output) -> bool {
+    if (file == nullptr || file->fops != get_xfs_fops()) return false;
+    auto* data = static_cast<XfsFileData*>(file->private_data);
+    return data != nullptr && data->inode != nullptr && data->inode->coherency.snapshot(output);
 }
 
 namespace {

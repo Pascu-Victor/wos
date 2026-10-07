@@ -7,6 +7,7 @@
 #include <platform/mm/swap.hpp>
 #include <platform/sys/mutex.hpp>
 #include <vfs/exec_content.hpp>
+#include <vfs/native_coherency.hpp>
 #include <vfs/timestamps.hpp>
 
 #include "../file_operations.hpp"
@@ -66,6 +67,7 @@ struct TmpNode {
     // Serializes file data/size updates for regular file I/O.
     ker::mod::sys::Mutex io_lock;
     ker::vfs::ExecContentState exec_content;
+    ker::vfs::coherency::Object coherency{};
 
     // Reference counting for POSIX unlink semantics
     std::atomic<uint32_t> open_count{0};
@@ -309,4 +311,5 @@ auto tmpfs_fops_isatty(ker::vfs::File* f) -> bool;
 
 // Get tmpfs FileOperations structure
 auto get_tmpfs_fops() -> ker::vfs::FileOperations*;
+auto tmpfs_coherency_snapshot(File* file, coherency::Stamp& output) -> bool;
 }  // namespace ker::vfs::tmpfs

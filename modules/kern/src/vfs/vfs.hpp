@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <platform/dbg/dbg.hpp>
 #include <string_view>
+#include <vfs/coherency.hpp>
 #include <vfs/stat.hpp>
 
 #include "bits/off_t.h"
@@ -157,6 +158,8 @@ auto vfs_close(int fd) -> int;
 auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size = nullptr) -> ssize_t;
 auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size = nullptr) -> ssize_t;
 auto vfs_write_file(File* file, const void* buf, size_t count, size_t* actual_size = nullptr) -> ssize_t;
+// Exact native owner File; never emulate append with SEEK_END plus WRITE.
+auto vfs_append_file_native(File* file, const void* buf, size_t count, size_t* offset) -> ssize_t;
 auto vfs_lseek(int fd, off_t offset, int whence) -> off_t;
 auto vfs_isatty(int fd) -> bool;
 // Optional explicit filesystem owner supports kernel callers without a running Task.
@@ -213,6 +216,9 @@ auto vfs_statat(ker::mod::sched::task::Task* task, int dirfd, const char* pathna
 auto vfs_fstat(int fd, Stat* statbuf) -> int;
 // Stat an already-open file without allocating an FD or consulting task state.
 auto vfs_fstat_file(File* file, Stat* statbuf) -> int;
+// Caller retains the exact native File. Failure preserves output and never
+// authorizes a cached result; unsupported/pending authority needs fresh I/O.
+auto vfs_file_coherency_snapshot(File* file, coherency::Stamp& output) -> int;
 // Fast cached fstat path for syscall dispatch. Returns -EAGAIN when the caller
 // must fall back to vfs_fstat_file() with a retained file reference.
 auto vfs_fstat_snapshot_fast(ker::mod::sched::task::Task* task, int fd, Stat* statbuf) -> int;
@@ -673,6 +679,8 @@ auto vfs_selftest_symlink_prefix_cache_skips_known_parent() -> bool;
 auto vfs_selftest_procfs_fd_link_probe_gate() -> bool;
 auto vfs_selftest_packed_dirent_records() -> bool;
 auto vfs_selftest_fcntl_setfl_preserves_open_policy_flags() -> bool;
+auto vfs_selftest_advisory_remote_shared() -> bool;
+auto vfs_selftest_advisory_remote_waits() -> bool;
 auto vfs_selftest_stream_cache_read_eligibility() -> bool;
 auto vfs_selftest_remote_read_bounce_window() -> bool;
 auto vfs_selftest_stream_cache_local_detached_ttl() -> bool;

@@ -48,6 +48,7 @@
 #include <vfs/mount.hpp>
 #include <vfs/stat.hpp>
 
+#include "advisory.hpp"
 #include "fd_reservation.hpp"
 #include "file.hpp"
 #include "filesystem_context.hpp"
@@ -381,6 +382,7 @@ enum class AdvisoryLockFamily : uint8_t {
 enum class AdvisoryOwnerKind : uint8_t {
     PROCESS,
     OPEN_FILE,
+    REMOTE_PROCESS,
 };
 
 enum class AdvisoryLockType : uint8_t {
@@ -404,6 +406,7 @@ struct AdvisoryLock {
     AdvisoryLockFamily family = AdvisoryLockFamily::RECORD;
     AdvisoryOwnerKind owner_kind = AdvisoryOwnerKind::PROCESS;
     uint64_t owner_pid = 0;
+    RemoteAdvisoryOwner remote_owner{};
     const File* owner_file = nullptr;
     AdvisoryLockType type = AdvisoryLockType::READ;
     uint64_t start = 0;
@@ -430,6 +433,17 @@ std::atomic<uint64_t> g_metadata_invalidation_generation{1};
 std::atomic<uint64_t> g_metadata_subtree_invalidation_generation{1};
 std::deque<AdvisoryLock> g_advisory_locks;
 ker::mod::sys::Mutex g_advisory_lock_mutex;
+struct RemoteAdvisoryAssociation {
+    File* file = nullptr;
+    RemoteAdvisoryOwner owner{};
+    uint64_t dev = 0;
+    uint64_t ino = 0;
+};
+// Fixed remote process/open membership. No registry pointer is retained.
+constexpr size_t REMOTE_ADVISORY_SCOPES_PER_OPEN = 32;
+constexpr size_t REMOTE_ADVISORY_PENDING_MAX = 64;
+size_t g_remote_advisory_pending = 0;
+std::array<RemoteAdvisoryAssociation, 512> g_remote_advisory_associations{};
 // XFS serializes its on-disk namespace updates internally, but VFS publishes
 // the corresponding cache invalidation after the backend call returns. Keep
 // those two halves ordered so an older create cannot publish after a newer
@@ -750,6 +764,27 @@ auto advisory_build_key(File* file, AdvisoryFileKey& key, Stat* stat_out = nullp
     return 0;
 }
 
+// Owner lock normalization needs the retained native object's current EOF,
+// not a generic path/stat snapshot. Native stat acquires backend serialization
+// before the advisory manager and remains valid after rename/unlink.
+auto advisory_build_remote_key(File* file, AdvisoryFileKey& key, Stat* stat = nullptr) -> int {
+    Stat current{};
+    int status = -EOPNOTSUPP;
+    if (file->fs_type == FSType::TMPFS && file->fops == tmpfs::get_tmpfs_fops()) {
+        auto* node = static_cast<tmpfs::TmpNode*>(file->private_data);
+        if (node == nullptr) return -EBADF;
+        uint32_t const DEV = file->mount_dev_id != 0 ? file->mount_dev_id : file->mount_owner != nullptr ? file->mount_owner->dev_id : 0;
+        status = tmpfs::tmpfs_stat_node(node, DEV, &current);
+    } else if (file->fs_type == FSType::XFS && file->fops == xfs::get_xfs_fops()) {
+        status = xfs::xfs_fstat(file, &current);
+    }
+    if (status != 0) return status;
+    if (current.st_ino == 0) return -EOPNOTSUPP;
+    key = {.dev = current.st_dev, .ino = current.st_ino, .has_inode = true};
+    if (stat != nullptr) *stat = current;
+    return 0;
+}
+
 auto advisory_keys_equal(const AdvisoryFileKey& left, const AdvisoryFileKey& right) -> bool {
     if (left.has_inode && right.has_inode) {
         return left.dev == right.dev && left.ino == right.ino;
@@ -760,13 +795,13 @@ auto advisory_keys_equal(const AdvisoryFileKey& left, const AdvisoryFileKey& rig
     return left.anonymous_file != nullptr && left.anonymous_file == right.anonymous_file;
 }
 
-auto advisory_same_owner(const AdvisoryLock& lock, AdvisoryOwnerKind owner_kind, uint64_t owner_pid, const File* owner_file) -> bool {
+auto advisory_same_owner(const AdvisoryLock& lock, AdvisoryOwnerKind owner_kind, uint64_t owner_pid, const File* owner_file,
+                         const RemoteAdvisoryOwner& remote_owner = {}) -> bool {
     if (lock.owner_kind != owner_kind) {
         return false;
     }
-    if (owner_kind == AdvisoryOwnerKind::PROCESS) {
-        return lock.owner_pid == owner_pid;
-    }
+    if (owner_kind == AdvisoryOwnerKind::PROCESS) return lock.owner_pid == owner_pid;
+    if (owner_kind == AdvisoryOwnerKind::REMOTE_PROCESS) return lock.remote_owner == remote_owner;
     return lock.owner_file == owner_file;
 }
 
@@ -785,7 +820,7 @@ auto advisory_locks_conflict(const AdvisoryLock& held, const AdvisoryLock& reque
     if (!advisory_keys_equal(held.key, requested.key)) {
         return false;
     }
-    if (advisory_same_owner(held, requested.owner_kind, requested.owner_pid, requested.owner_file)) {
+    if (advisory_same_owner(held, requested.owner_kind, requested.owner_pid, requested.owner_file, requested.remote_owner)) {
         return false;
     }
     if (!advisory_ranges_overlap(held.start, held.end, requested.start, requested.end)) {
@@ -803,10 +838,12 @@ void advisory_remove_lock_at(size_t index) {
 }
 
 void advisory_unlock_owned_range_locked(const AdvisoryFileKey& key, AdvisoryLockFamily family, AdvisoryOwnerKind owner_kind,
-                                        uint64_t owner_pid, const File* owner_file, uint64_t start, uint64_t end) {
+                                        uint64_t owner_pid, const File* owner_file, uint64_t start, uint64_t end,
+                                        const RemoteAdvisoryOwner& remote_owner = {}) {
     for (size_t i = 0; i < g_advisory_locks.size();) {
         AdvisoryLock& lock = g_advisory_locks.at(i);
-        if (lock.family != family || !advisory_keys_equal(lock.key, key) || !advisory_same_owner(lock, owner_kind, owner_pid, owner_file) ||
+        if (lock.family != family || !advisory_keys_equal(lock.key, key) ||
+            !advisory_same_owner(lock, owner_kind, owner_pid, owner_file, remote_owner) ||
             !advisory_ranges_overlap(lock.start, lock.end, start, end)) {
             ++i;
             continue;
@@ -836,13 +873,14 @@ void advisory_unlock_owned_range_locked(const AdvisoryFileKey& key, AdvisoryLock
 }
 
 void advisory_insert_owned_lock_locked(AdvisoryLock lock) {
-    advisory_unlock_owned_range_locked(lock.key, lock.family, lock.owner_kind, lock.owner_pid, lock.owner_file, lock.start, lock.end);
+    advisory_unlock_owned_range_locked(lock.key, lock.family, lock.owner_kind, lock.owner_pid, lock.owner_file, lock.start, lock.end,
+                                       lock.remote_owner);
 
     for (size_t i = 0; i < g_advisory_locks.size();) {
         AdvisoryLock& existing = g_advisory_locks.at(i);
         if (existing.family != lock.family || !advisory_keys_equal(existing.key, lock.key) ||
-            !advisory_same_owner(existing, lock.owner_kind, lock.owner_pid, lock.owner_file) || existing.type != lock.type ||
-            !advisory_ranges_touch_or_overlap(existing.start, existing.end, lock.start, lock.end)) {
+            !advisory_same_owner(existing, lock.owner_kind, lock.owner_pid, lock.owner_file, lock.remote_owner) ||
+            existing.type != lock.type || !advisory_ranges_touch_or_overlap(existing.start, existing.end, lock.start, lock.end)) {
             ++i;
             continue;
         }
@@ -910,7 +948,8 @@ auto advisory_to_lock_type(int16_t flock_type, AdvisoryLockType& out) -> int {
     }
 }
 
-auto advisory_range_from_flock(const VfsFlockAbi& flock, File* file, const Stat& stat, uint64_t& start, uint64_t& end) -> int {
+auto advisory_range_from_flock(const VfsFlockAbi& flock, File* file, const Stat& stat, uint64_t& start, uint64_t& end,
+                               const int64_t* position = nullptr) -> int {
     constexpr auto ADVISORY_RANGE_EOF_WIDE = static_cast<__int128>(ADVISORY_RANGE_EOF);
     __int128 base = 0;
     switch (flock.l_whence) {
@@ -918,7 +957,7 @@ auto advisory_range_from_flock(const VfsFlockAbi& flock, File* file, const Stat&
             base = 0;
             break;
         case SEEK_CUR_VALUE:
-            base = file != nullptr ? file->pos : 0;
+            base = position != nullptr ? *position : file != nullptr ? file->pos : 0;
             break;
         case SEEK_END_VALUE:
             base = stat.st_size;
@@ -952,6 +991,7 @@ auto advisory_range_from_flock(const VfsFlockAbi& flock, File* file, const Stat&
 
 auto advisory_set_lock(File* file, uint64_t owner_pid, AdvisoryOwnerKind owner_kind, AdvisoryLockFamily family, const VfsFlockAbi& flock,
                        bool wait) -> int {
+    if (file != nullptr && file->fs_type == FSType::REMOTE) return -EOPNOTSUPP;
     AdvisoryLockType lock_type{};
     if (flock.l_type != F_UNLCK_TYPE) {
         if (int const TYPE_RET = advisory_to_lock_type(flock.l_type, lock_type); TYPE_RET < 0) {
@@ -1014,6 +1054,7 @@ auto advisory_set_lock(File* file, uint64_t owner_pid, AdvisoryOwnerKind owner_k
 }
 
 auto advisory_get_lock(File* file, uint64_t owner_pid, AdvisoryOwnerKind owner_kind, AdvisoryLockFamily family, VfsFlockAbi& flock) -> int {
+    if (file != nullptr && file->fs_type == FSType::REMOTE) return -EOPNOTSUPP;
     AdvisoryLockType lock_type{};
     if (flock.l_type == F_UNLCK_TYPE) {
         flock.l_pid = 0;
@@ -1062,7 +1103,9 @@ auto advisory_get_lock(File* file, uint64_t owner_pid, AdvisoryOwnerKind owner_k
     flock.l_whence = SEEK_SET_VALUE;
     flock.l_start = static_cast<off_t>(std::min<uint64_t>(conflict.start, static_cast<uint64_t>(INT64_MAX)));
     flock.l_len = conflict.end == ADVISORY_RANGE_EOF ? 0 : static_cast<off_t>(conflict.end - conflict.start);
-    flock.l_pid = conflict.owner_kind == AdvisoryOwnerKind::PROCESS ? static_cast<int32_t>(conflict.owner_pid) : -1;
+    flock.l_pid = conflict.owner_kind == AdvisoryOwnerKind::PROCESS          ? static_cast<int32_t>(conflict.owner_pid)
+                  : conflict.owner_kind == AdvisoryOwnerKind::REMOTE_PROCESS ? conflict.remote_owner.pid
+                                                                             : -1;
     return 0;
 }
 
@@ -1092,11 +1135,55 @@ auto advisory_flock(File* file, int options) -> int {
     return advisory_set_lock(file, 0, AdvisoryOwnerKind::OPEN_FILE, AdvisoryLockFamily::FLOCK, flock, WAIT);
 }
 
-void advisory_release_file_owner_locks(const File* file) {
+void advisory_release_remote_process_locked(const RemoteAdvisoryOwner& owner, uint64_t dev, uint64_t ino) {
+    for (size_t index = 0; index < g_advisory_locks.size();) {
+        auto const& lock = g_advisory_locks.at(index);
+        if (lock.owner_kind == AdvisoryOwnerKind::REMOTE_PROCESS && lock.remote_owner == owner && lock.key.has_inode &&
+            lock.key.dev == dev && lock.key.ino == ino)
+            advisory_remove_lock_at(index);
+        else
+            ++index;
+    }
+}
+
+void advisory_release_remote_associations_locked(const File* file) {
+    for (auto& association : g_remote_advisory_associations) {
+        if (association.file != file) continue;
+        advisory_release_remote_process_locked(association.owner, association.dev, association.ino);
+        association = {};
+    }
+}
+
+auto advisory_associate_remote_process_locked(File* file, const RemoteAdvisoryOwner& owner, const AdvisoryFileKey& key) -> int {
+    RemoteAdvisoryAssociation* available = nullptr;
+    size_t on_file = 0;
+    bool existing = false;
+    for (auto& association : g_remote_advisory_associations) {
+        if (association.file == nullptr) {
+            if (available == nullptr) available = &association;
+            continue;
+        }
+        // PID is an immutable diagnostic name, not a new process authority.
+        if (association.owner.peer == owner.peer && association.owner.boot_epoch == owner.boot_epoch &&
+            association.owner.generation == owner.generation && association.owner.pid != owner.pid)
+            return -EPROTO;
+        if (association.file != file) continue;
+        ++on_file;
+        if (association.owner == owner) existing = true;
+    }
+    if (existing) return 0;
+    if (on_file >= REMOTE_ADVISORY_SCOPES_PER_OPEN || available == nullptr) return -ENOLCK;
+    *available = {.file = file, .owner = owner, .dev = key.dev, .ino = key.ino};
+    return 0;
+}
+
+void advisory_release_file_owner_locks(File* file) {
     if (file == nullptr) {
         return;
     }
     g_advisory_lock_mutex.lock();
+    if (file->remote_advisory_receipt.retire()) --g_remote_advisory_pending;
+    advisory_release_remote_associations_locked(file);
     for (size_t i = 0; i < g_advisory_locks.size();) {
         const AdvisoryLock& lock = g_advisory_locks.at(i);
         if (lock.owner_kind == AdvisoryOwnerKind::OPEN_FILE && lock.owner_file == file) {
@@ -4336,6 +4423,9 @@ auto stream_build_identity(File* file, const Stat& statbuf, StreamCacheIdentity*
     if (file == nullptr || file->vfs_path == nullptr || identity == nullptr) {
         return -EINVAL;
     }
+    // Remote cache authority belongs to the exact-open version protocol below
+    // VFS. Path/stat snapshots and O_ALWAYS_CACHE cannot bypass that protocol.
+    if (file->fs_type == FSType::REMOTE) return -ENOTSUP;
 
     const auto MODE = static_cast<mode_t>(statbuf.st_mode & S_IFMT);
     if (MODE != S_IFREG) {
@@ -4650,8 +4740,7 @@ void stream_invalidate_file(File* file) {
 }
 
 auto stream_cache_read_eligible(const File* file) -> bool {
-    if (file == nullptr || file->vfs_path == nullptr || (file->open_flags & ker::vfs::O_NO_CACHE) != 0 ||
-        (file->fs_type == FSType::REMOTE && file->vfs_path_namespace_generation == 0)) {
+    if (file == nullptr || file->vfs_path == nullptr || (file->open_flags & ker::vfs::O_NO_CACHE) != 0 || file->fs_type == FSType::REMOTE) {
         return false;
     }
     if ((file->open_flags & 3) != 0) {
@@ -4662,7 +4751,7 @@ auto stream_cache_read_eligible(const File* file) -> bool {
     // files while another process is still generating them; a fresh stat size
     // can then race ahead of XFS-readable data and make a valid short read look
     // like a cache-level premature EOF.
-    return file->fs_type == FSType::TMPFS || file->fs_type == FSType::FAT32 || file->fs_type == FSType::REMOTE;
+    return file->fs_type == FSType::TMPFS || file->fs_type == FSType::FAT32;
 }
 
 void stream_invalidate_scope_locked(FSType fs_type, const void* scope_key) {
@@ -8715,6 +8804,20 @@ auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size) -> ssize_t {
     return R;
 }
 
+auto vfs_append_file_native(File* file, const void* buf, size_t count, size_t* offset) -> ssize_t {
+    if (file == nullptr || !vfs_file_can_write(file)) return -EBADF;
+    if (buf == nullptr && count != 0) return -EFAULT;
+    if (file->is_directory) return -EISDIR;
+    if (file_mount_read_only(*file)) return -EROFS;
+    ssize_t result = -EOPNOTSUPP;
+    if (file->fs_type == FSType::TMPFS && file->fops == tmpfs::get_tmpfs_fops())
+        result = tmpfs::tmpfs_write_append(file, buf, count, offset);
+    else if (file->fs_type == FSType::XFS && file->fops == xfs::get_xfs_fops())
+        result = xfs::xfs_write_append(file, buf, count, offset);
+    if (result > 0) vfs_cache_notify_file_data_changed(file);
+    return result;
+}
+
 namespace {
 auto vfs_write_file_direct(File* f, const void* buf, size_t count, size_t* actual_size) -> ssize_t {
     if (f == nullptr) {
@@ -8736,10 +8839,13 @@ auto vfs_write_file_direct(File* f, const void* buf, size_t count, size_t* actua
         ((f->open_flags & ker::vfs::O_APPEND) != 0) && f->fs_type == FSType::TMPFS && f->fops == ker::vfs::tmpfs::get_tmpfs_fops();
     bool const XFS_APPEND =
         ((f->open_flags & ker::vfs::O_APPEND) != 0) && f->fs_type == FSType::XFS && f->fops == ker::vfs::xfs::get_xfs_fops();
+    bool const REMOTE_APPEND = ((f->open_flags & ker::vfs::O_APPEND) != 0) && f->fs_type == FSType::REMOTE;
     if (TMPFS_APPEND) {
         result = ker::vfs::tmpfs::tmpfs_write_append(f, buf, count, &append_offset);
     } else if (XFS_APPEND) {
         result = ker::vfs::xfs::xfs_write_append(f, buf, count, &append_offset);
+    } else if (REMOTE_APPEND) {
+        result = ker::net::wki::wki_remote_vfs_write_append(f, buf, count, &append_offset);
     } else {
         if (((f->open_flags & ker::vfs::O_APPEND) != 0) && (f->fops->vfs_lseek != nullptr)) {
             f->fops->vfs_lseek(f, 0, 2);  // SEEK_END
@@ -8752,7 +8858,7 @@ auto vfs_write_file_direct(File* f, const void* buf, size_t count, size_t* actua
             cache_notify_file_data_changed_impl(f);
             refresh_created_file_stat_snapshot_after_write(f);
         }
-        if (TMPFS_APPEND || XFS_APPEND) {
+        if (TMPFS_APPEND || XFS_APPEND || REMOTE_APPEND) {
             f->pos = static_cast<off_t>(append_offset + static_cast<size_t>(result));
         } else {
             f->pos += result;
@@ -15046,6 +15152,14 @@ auto vfs_statat(ker::mod::sched::task::Task* task, int dirfd, const char* pathna
     return -EAGAIN;
 }
 
+auto vfs_file_coherency_snapshot(File* file, coherency::Stamp& output) -> int {
+    if (file == nullptr || file->fops == nullptr) return -EBADF;
+    if (file->fs_type == FSType::TMPFS && file->fops == tmpfs::get_tmpfs_fops())
+        return tmpfs::tmpfs_coherency_snapshot(file, output) ? 0 : -EAGAIN;
+    if (file->fs_type == FSType::XFS && file->fops == xfs::get_xfs_fops()) return xfs::xfs_coherency_snapshot(file, output) ? 0 : -EAGAIN;
+    return -EOPNOTSUPP;
+}
+
 auto vfs_fstat_file(File* file, Stat* statbuf) -> int {
     if (file == nullptr || statbuf == nullptr) {
         return -EINVAL;
@@ -19474,6 +19588,206 @@ auto vfs_ftruncate(int fd, off_t length) -> int {
 }
 
 // --- fcntl ---
+void vfs_advisory_remote_close_admission(File* file) {
+    if (file != nullptr) file->remote_advisory_closed.store(true, std::memory_order_release);
+}
+
+void vfs_advisory_remote_retire(File* file) {
+    if (file == nullptr) return;
+    vfs_advisory_remote_close_admission(file);
+    // No filesystem or registry work under the native arbiter mutex.
+    advisory_release_file_owner_locks(file);
+}
+
+auto vfs_advisory_remote_close_process(File* file, const RemoteAdvisoryOwner& owner) -> int {
+    if (file == nullptr) return -EBADF;
+    if (!owner.valid()) return -EINVAL;
+    if (file->fs_type != FSType::TMPFS && file->fs_type != FSType::XFS) return -EOPNOTSUPP;
+    AdvisoryFileKey key{};
+    if (int const STATUS = advisory_build_remote_key(file, key); STATUS != 0) return STATUS;
+    if (!key.has_inode) return -EOPNOTSUPP;
+    ker::mod::sys::MutexGuard guard(g_advisory_lock_mutex);
+    advisory_release_remote_process_locked(owner, key.dev, key.ino);
+    return 0;
+}
+
+namespace {
+auto advisory_prepare_remote(File* file, const RemoteAdvisoryOwner& owner, RemoteAdvisoryKind kind, bool query, const VfsFlockAbi& request,
+                             RemoteAdvisoryPrepared& prepared, const int64_t* position = nullptr) -> int {
+    if (file == nullptr) return -EBADF;
+    if (!owner.valid()) return -EINVAL;
+    if (kind != RemoteAdvisoryKind::PROCESS && kind != RemoteAdvisoryKind::OPEN_FILE && kind != RemoteAdvisoryKind::FLOCK) return -EINVAL;
+    if (file->fs_type != FSType::TMPFS && file->fs_type != FSType::XFS) return -EOPNOTSUPP;
+    if (file->remote_advisory_closed.load(std::memory_order_acquire)) return -ENOTCONN;
+    AdvisoryLockType type{};
+    if (request.l_type != F_UNLCK_TYPE) {
+        if (int const STATUS = advisory_to_lock_type(request.l_type, type); STATUS != 0) return STATUS;
+        if (!query && kind != RemoteAdvisoryKind::FLOCK) {
+            int const ACCESS = ker::mod::security::authorize_file_description_access(static_cast<unsigned>(file->open_flags) & 3U,
+                                                                                     type == AdvisoryLockType::WRITE);
+            if (ACCESS != 0) return ACCESS;
+        }
+    }
+    if (query && kind == RemoteAdvisoryKind::FLOCK) return -EINVAL;
+    if (kind == RemoteAdvisoryKind::OPEN_FILE && request.l_pid != 0) return -EINVAL;
+    Stat stat{};
+    AdvisoryFileKey key{};
+    bool const END_RELATIVE = request.l_whence == SEEK_END_VALUE;
+    if (int const STATUS = advisory_build_remote_key(file, key, END_RELATIVE ? &stat : nullptr); STATUS != 0) return STATUS;
+    if (!key.has_inode) return -EOPNOTSUPP;
+    uint64_t start = 0;
+    uint64_t end = 0;
+    if (int const STATUS = advisory_range_from_flock(request, file, stat, start, end, position); STATUS != 0) return STATUS;
+    if (kind == RemoteAdvisoryKind::FLOCK && (start != 0 || end != ADVISORY_RANGE_EOF)) return -EINVAL;
+    prepared = {.dev = key.dev, .ino = key.ino, .start = start, .end = end};
+    return 0;
+}
+
+// Existing manager mutex held; saved key/range are from retained native File.
+auto advisory_apply_remote_locked(File* file, const RemoteAdvisoryOwner& owner, RemoteAdvisoryKind kind, bool query,
+                                  const RemoteAdvisoryPrepared& prepared, VfsFlockAbi& request) -> int {
+    if (file->remote_advisory_closed.load(std::memory_order_acquire)) return -ENOTCONN;
+    AdvisoryFileKey const KEY{.dev = prepared.dev, .ino = prepared.ino, .has_inode = true};
+    if (kind == RemoteAdvisoryKind::PROCESS) {
+        if (int const STATUS = advisory_associate_remote_process_locked(file, owner, KEY); STATUS != 0) return STATUS;
+    }
+    AdvisoryLock requested{
+        .key = KEY,
+        .family = kind == RemoteAdvisoryKind::FLOCK ? AdvisoryLockFamily::FLOCK : AdvisoryLockFamily::RECORD,
+        .owner_kind = kind == RemoteAdvisoryKind::PROCESS ? AdvisoryOwnerKind::REMOTE_PROCESS : AdvisoryOwnerKind::OPEN_FILE,
+        .remote_owner = owner,
+        .owner_file = kind == RemoteAdvisoryKind::PROCESS ? nullptr : file,
+        .type = request.l_type == F_WRLCK_TYPE ? AdvisoryLockType::WRITE : AdvisoryLockType::READ,
+        .start = prepared.start,
+        .end = prepared.end};
+    if (request.l_type == F_UNLCK_TYPE) {
+        if (query)
+            request.l_pid = 0;
+        else
+            advisory_unlock_owned_range_locked(KEY, requested.family, requested.owner_kind, 0, requested.owner_file, prepared.start,
+                                               prepared.end, owner);
+        return 0;
+    }
+    AdvisoryLock conflict{};
+    bool const CONFLICT = advisory_find_conflict_locked(requested, query ? &conflict : nullptr);
+    if (query) {
+        if (!CONFLICT) {
+            request.l_type = F_UNLCK_TYPE;
+            request.l_pid = 0;
+        } else {
+            request.l_type = conflict.type == AdvisoryLockType::READ ? F_RDLCK_TYPE : F_WRLCK_TYPE;
+            request.l_whence = SEEK_SET_VALUE;
+            request.l_start = static_cast<off_t>(std::min<uint64_t>(conflict.start, INT64_MAX));
+            request.l_len = conflict.end == ADVISORY_RANGE_EOF ? 0 : static_cast<off_t>(conflict.end - conflict.start);
+            request.l_pid = conflict.owner_kind == AdvisoryOwnerKind::PROCESS          ? static_cast<int32_t>(conflict.owner_pid)
+                            : conflict.owner_kind == AdvisoryOwnerKind::REMOTE_PROCESS ? conflict.remote_owner.pid
+                                                                                       : -1;
+        }
+        return 0;
+    }
+    if (CONFLICT) return -EAGAIN;
+    advisory_insert_owned_lock_locked(requested);
+    return 0;
+}
+
+auto advisory_claim_error(RemoteAdvisoryClaim claim) -> int {
+    switch (claim) {
+        case RemoteAdvisoryClaim::STALE:
+            return -ESTALE;
+        case RemoteAdvisoryClaim::MISMATCH:
+            return -EPROTO;
+        case RemoteAdvisoryClaim::BUSY:
+            return -EBUSY;
+        case RemoteAdvisoryClaim::CLOSED:
+            return -ENOTCONN;
+        default:
+            return -EINVAL;
+    }
+}
+}  // namespace
+
+auto vfs_advisory_remote_try(File* file, const RemoteAdvisoryOwner& owner, RemoteAdvisoryKind kind, bool query, VfsFlockAbi& request)
+    -> int {
+    RemoteAdvisoryPrepared prepared{};
+    if (int const STATUS = advisory_prepare_remote(file, owner, kind, query, request, prepared); STATUS != 0) return STATUS;
+    ker::mod::sys::MutexGuard guard(g_advisory_lock_mutex);
+    return advisory_apply_remote_locked(file, owner, kind, query, prepared, request);
+}
+
+auto vfs_advisory_remote_request(File* file, uint64_t operation, RemoteAdvisoryPhase phase, const RemoteAdvisoryCommand& command,
+                                 RemoteAdvisoryReply& output) -> int {
+    if (file == nullptr) return -EBADF;
+    if (!command.valid() || operation == 0) return -EINVAL;
+    if (phase != RemoteAdvisoryPhase::START && phase != RemoteAdvisoryPhase::POLL && phase != RemoteAdvisoryPhase::CANCEL) return -EINVAL;
+    if (file->fs_type != FSType::TMPFS && file->fs_type != FSType::XFS) return -EOPNOTSUPP;
+    RemoteAdvisoryPrepared prepared{};
+    auto& receipt = file->remote_advisory_receipt;
+    VfsFlockAbi request{.l_type = command.type, .l_whence = command.whence, .l_start = command.start, .l_len = command.length};
+    if (phase == RemoteAdvisoryPhase::START) {
+        // Replay/cancel tombstone never revisits filesystem preparation.
+        g_advisory_lock_mutex.lock();
+        auto const PROBE = receipt.probe(operation, command);
+        int status = 0;
+        if (file->remote_advisory_closed.load(std::memory_order_acquire))
+            status = -ENOTCONN;
+        else if (PROBE == RemoteAdvisoryClaim::PENDING || PROBE == RemoteAdvisoryClaim::REPLAY)
+            status = receipt.snapshot(operation, output) ? 0 : -EPROTO;
+        else if (PROBE != RemoteAdvisoryClaim::NEW)
+            status = advisory_claim_error(PROBE);
+        g_advisory_lock_mutex.unlock();
+        if (status != 0 || PROBE != RemoteAdvisoryClaim::NEW) return status;
+        if (int const STATUS =
+                advisory_prepare_remote(file, command.owner, command.kind, command.query, request, prepared, &command.position);
+            STATUS != 0)
+            return STATUS;
+    }
+    ker::mod::sys::MutexGuard guard(g_advisory_lock_mutex);
+    if (file->remote_advisory_closed.load(std::memory_order_acquire)) return -ENOTCONN;
+    auto const CLAIM =
+        phase == RemoteAdvisoryPhase::START ? receipt.claim(operation, command, prepared) : receipt.probe(operation, command);
+    if (phase == RemoteAdvisoryPhase::CANCEL) {
+        if (CLAIM == RemoteAdvisoryClaim::NEW) {
+            if (!receipt.cancel_unstarted(operation, command)) return -EPROTO;
+        } else if (CLAIM == RemoteAdvisoryClaim::PENDING) {
+            bool const WAITING = receipt.waiting();
+            if (!receipt.complete(operation, {.status = -EINTR}, true)) return -EPROTO;
+            if (WAITING) --g_remote_advisory_pending;
+        } else if (CLAIM != RemoteAdvisoryClaim::REPLAY)
+            return advisory_claim_error(CLAIM);
+        return receipt.snapshot(operation, output) ? 0 : -EPROTO;
+    }
+    if (CLAIM == RemoteAdvisoryClaim::REPLAY || (phase == RemoteAdvisoryPhase::START && CLAIM == RemoteAdvisoryClaim::PENDING))
+        return receipt.snapshot(operation, output) ? 0 : -EPROTO;
+    if (CLAIM != RemoteAdvisoryClaim::NEW && CLAIM != RemoteAdvisoryClaim::PENDING) return advisory_claim_error(CLAIM);
+    if (phase == RemoteAdvisoryPhase::POLL && CLAIM != RemoteAdvisoryClaim::PENDING) return -ESTALE;
+    {
+        int status = advisory_apply_remote_locked(file, command.owner, command.kind, command.query, receipt.prepared(), request);
+        if (status == -EAGAIN && command.wait) {
+            if (!receipt.waiting()) {
+                if (g_remote_advisory_pending >= REMOTE_ADVISORY_PENDING_MAX)
+                    status = -ENOLCK;
+                else {
+                    if (!receipt.mark_waiting(operation)) return -EPROTO;
+                    ++g_remote_advisory_pending;
+                }
+            }
+            if (status == -EAGAIN) return receipt.snapshot(operation, output) ? 0 : -EPROTO;
+        }
+        bool const WAITING = receipt.waiting();
+        RemoteAdvisoryOutcome outcome{.status = status};
+        if (command.query && status == 0)
+            outcome = {.status = 0,
+                       .pid = request.l_pid,
+                       .start = request.l_start,
+                       .length = request.l_len,
+                       .type = request.l_type,
+                       .whence = request.l_whence};
+        if (!receipt.complete(operation, outcome)) return -EPROTO;
+        if (WAITING) --g_remote_advisory_pending;
+    }
+    return receipt.snapshot(operation, output) ? 0 : -EPROTO;
+}
+
 auto vfs_fcntl(int fd, int cmd, uint64_t arg, VfsFlockAbi* flock) -> int {
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) {
@@ -25812,6 +26126,252 @@ auto vfs_selftest_packed_dirent_records() -> bool {
     return ok;
 }
 
+auto vfs_selftest_advisory_remote_waits() -> bool {
+    constexpr const char* PATH = "/tmp/ktest_owner_waits26";
+    struct Cleanup {
+        ~Cleanup() { static_cast<void>(vfs_unlink("/tmp/ktest_owner_waits26")); }
+    } cleanup;
+    static_cast<void>(vfs_unlink(PATH));
+    auto release = [](File* file) {
+        advisory_release_process_locks_for_file(7, file);
+        vfs_put_file(file);
+    };
+    using Owned = std::unique_ptr<File, decltype(release)>;
+    Owned local(vfs_open_file(PATH, O_CREAT | O_EXCL | 2, 0600), release);
+    Owned remote(vfs_open_file(PATH, 2, 0), release);
+    if (!local || !remote || local->fs_type != FSType::TMPFS || vfs_pwrite_file(local.get(), "data", 4, 0) != 4) return false;
+    auto fail = [](int line) {
+        ker::mod::dbg::logger<"ktest">::error("native advisory wait failed at core.cpp:%d", line);
+        return false;
+    };
+    VfsFlockAbi const WHOLE{.l_type = F_WRLCK_TYPE, .l_whence = SEEK_SET_VALUE};
+    VfsFlockAbi unlock = WHOLE;
+    unlock.l_type = F_UNLCK_TYPE;
+    RemoteAdvisoryCommand command{.owner = {.generation = 13, .boot_epoch = 17, .pid = 7, .peer = 19}, .type = F_WRLCK_TYPE, .wait = true};
+    RemoteAdvisoryReply reply{};
+    auto request = [&](uint64_t operation, RemoteAdvisoryPhase phase, const RemoteAdvisoryCommand& cmd) {
+        return vfs_advisory_remote_request(remote.get(), operation, phase, cmd, reply);
+    };
+    auto local_set = [&](const VfsFlockAbi& value) {
+        return advisory_set_lock(local.get(), 7, AdvisoryOwnerKind::PROCESS, AdvisoryLockFamily::RECORD, value, false);
+    };
+    auto pending_count = [] {
+        ker::mod::sys::MutexGuard guard(g_advisory_lock_mutex);
+        return g_remote_advisory_pending;
+    };
+    if (pending_count() != 0 || local_set(WHOLE) != 0 || request(1, RemoteAdvisoryPhase::START, command) != 0 ||
+        reply.state != RemoteAdvisoryState::PENDING || reply.outcome.status != -EAGAIN || pending_count() != 1)
+        return fail(__LINE__);
+    if (request(1, RemoteAdvisoryPhase::START, command) != 0 || pending_count() != 1 ||
+        request(2, RemoteAdvisoryPhase::START, command) != -EBUSY)
+        return fail(__LINE__);
+    auto mismatch = command;
+    ++mismatch.start;
+    if (request(1, RemoteAdvisoryPhase::POLL, mismatch) != -EPROTO || pending_count() != 1) return fail(__LINE__);
+    if (request(1, RemoteAdvisoryPhase::CANCEL, command) != 0 || reply.state != RemoteAdvisoryState::CANCELLED ||
+        reply.outcome.status != -EINTR || pending_count() != 0 || local_set(unlock) != 0)
+        return fail(__LINE__);
+    if (request(1, RemoteAdvisoryPhase::POLL, command) != 0 || reply.outcome.status != -EINTR ||
+        request(1, RemoteAdvisoryPhase::START, command) != 0 || reply.state != RemoteAdvisoryState::CANCELLED)
+        return fail(__LINE__);
+    if (request(2, RemoteAdvisoryPhase::START, command) != 0 || reply.outcome.status != 0 || reply.state != RemoteAdvisoryState::COMPLETE ||
+        local_set(WHOLE) != -EAGAIN || request(2, RemoteAdvisoryPhase::CANCEL, command) != 0 || reply.outcome.status != 0 ||
+        local_set(WHOLE) != -EAGAIN)
+        return fail(__LINE__);
+    auto release_command = command;
+    release_command.type = F_UNLCK_TYPE;
+    release_command.wait = false;
+    if (request(3, RemoteAdvisoryPhase::START, release_command) != 0 || reply.outcome.status != 0 ||
+        request(4, RemoteAdvisoryPhase::START, command) != 0 || reply.outcome.status != 0 ||
+        request(2, RemoteAdvisoryPhase::CANCEL, command) != -ESTALE || local_set(WHOLE) != -EAGAIN)
+        return fail(__LINE__);
+    if (vfs_advisory_remote_close_process(remote.get(), command.owner) != 0 || request(5, RemoteAdvisoryPhase::CANCEL, command) != 0 ||
+        request(5, RemoteAdvisoryPhase::START, command) != 0 || reply.state != RemoteAdvisoryState::CANCELLED || local_set(WHOLE) != 0)
+        return fail(__LINE__);
+    auto query = command;
+    query.query = true;
+    query.wait = false;
+    if (request(6, RemoteAdvisoryPhase::START, query) != 0 || reply.outcome.type != F_WRLCK_TYPE || reply.outcome.pid != 7 ||
+        local_set(unlock) != 0 || request(6, RemoteAdvisoryPhase::START, query) != 0 || reply.outcome.type != F_WRLCK_TYPE ||
+        request(7, RemoteAdvisoryPhase::START, query) != 0 || reply.outcome.type != F_UNLCK_TYPE)
+        return fail(__LINE__);
+    // Client SEEK_CUR uses captured client position, not the owner's File pos.
+    auto relative = command;
+    relative.whence = SEEK_CUR_VALUE;
+    relative.position = 20;
+    relative.length = 1;
+    VfsFlockAbi range{.l_type = F_WRLCK_TYPE, .l_whence = SEEK_SET_VALUE, .l_start = 20, .l_len = 1};
+    remote->pos = 99;
+    if (local_set(range) != 0 || request(8, RemoteAdvisoryPhase::START, relative) != 0 || reply.state != RemoteAdvisoryState::PENDING)
+        return fail(__LINE__);
+    remote->pos = 500;
+    range.l_type = F_UNLCK_TYPE;
+    if (local_set(range) != 0 || request(8, RemoteAdvisoryPhase::POLL, relative) != 0 || reply.outcome.status != 0 || pending_count() != 0)
+        return fail(__LINE__);
+    range.l_type = F_WRLCK_TYPE;
+    if (local_set(range) != -EAGAIN || vfs_advisory_remote_close_process(remote.get(), command.owner) != 0) return fail(__LINE__);
+    // SEEK_END is fixed at the first owner admission, even if EOF changes later.
+    relative.whence = SEEK_END_VALUE;
+    relative.position = 0;
+    range.l_start = 4;
+    if (local_set(range) != 0 || request(9, RemoteAdvisoryPhase::START, relative) != 0 || reply.state != RemoteAdvisoryState::PENDING ||
+        vfs_pwrite_file(local.get(), "x", 1, 49) != 1)
+        return fail(__LINE__);
+    range.l_type = F_UNLCK_TYPE;
+    if (local_set(range) != 0 || request(9, RemoteAdvisoryPhase::POLL, relative) != 0 || reply.outcome.status != 0) return fail(__LINE__);
+    range.l_type = F_WRLCK_TYPE;
+    if (local_set(range) != -EAGAIN) return fail(__LINE__);
+    range.l_start = 50;
+    if (local_set(range) != 0 || vfs_advisory_remote_close_process(remote.get(), command.owner) != 0 || local_set(unlock) != 0)
+        return fail(__LINE__);
+    Stat cached{};
+    if (vfs_fstat_file(remote.get(), &cached) != 0 || cached.st_size != 50 || tmpfs::tmpfs_write(local.get(), "x", 1, 79) != 1)
+        return fail(__LINE__);
+    relative.wait = false;
+    if (request(10, RemoteAdvisoryPhase::START, relative) != 0 || reply.outcome.status != 0) return fail(__LINE__);
+    range.l_start = 80;
+    if (local_set(range) != -EAGAIN || vfs_advisory_remote_close_process(remote.get(), command.owner) != 0) return fail(__LINE__);
+    // Bounded waiter state; retirement and duplicate cancel release capacity once.
+    std::array<Owned, REMOTE_ADVISORY_PENDING_MAX + 1> waiters{};
+    if (local_set(WHOLE) != 0) return fail(__LINE__);
+    for (size_t index = 0; index < waiters.size(); ++index) {
+        waiters[index] = Owned(vfs_open_file(PATH, 2, 0), release);
+        if (!waiters[index] || vfs_advisory_remote_request(waiters[index].get(), 1, RemoteAdvisoryPhase::START, command, reply) != 0)
+            return fail(__LINE__);
+        if (index < REMOTE_ADVISORY_PENDING_MAX) {
+            if (reply.state != RemoteAdvisoryState::PENDING || pending_count() != index + 1) return fail(__LINE__);
+        } else if (reply.state != RemoteAdvisoryState::COMPLETE || reply.outcome.status != -ENOLCK ||
+                   pending_count() != REMOTE_ADVISORY_PENDING_MAX)
+            return fail(__LINE__);
+    }
+    if (vfs_advisory_remote_request(waiters.front().get(), 1, RemoteAdvisoryPhase::CANCEL, command, reply) != 0 ||
+        pending_count() != REMOTE_ADVISORY_PENDING_MAX - 1 ||
+        vfs_advisory_remote_request(waiters.back().get(), 2, RemoteAdvisoryPhase::START, command, reply) != 0 ||
+        reply.state != RemoteAdvisoryState::PENDING || pending_count() != REMOTE_ADVISORY_PENDING_MAX ||
+        vfs_advisory_remote_request(waiters.front().get(), 1, RemoteAdvisoryPhase::CANCEL, command, reply) != 0 ||
+        pending_count() != REMOTE_ADVISORY_PENDING_MAX)
+        return fail(__LINE__);
+    for (auto& waiter : waiters) {
+        vfs_advisory_remote_retire(waiter.get());
+        vfs_advisory_remote_retire(waiter.get());
+        if (vfs_advisory_remote_request(waiter.get(), 1, RemoteAdvisoryPhase::POLL, command, reply) != -ENOTCONN) return fail(__LINE__);
+    }
+    return pending_count() == 0;
+}
+
+auto vfs_selftest_advisory_remote_shared() -> bool {
+    constexpr const char* PATH = "/tmp/ktest_owner_locks26";
+    constexpr const char* ALIAS = "/tmp/ktest_owner_locks26_alias";
+    constexpr const char* MOVED = "/tmp/ktest_owner_locks26_moved";
+    struct Cleanup {
+        ~Cleanup() {
+            static_cast<void>(vfs_unlink("/tmp/ktest_owner_locks26"));
+            static_cast<void>(vfs_unlink("/tmp/ktest_owner_locks26_alias"));
+            static_cast<void>(vfs_unlink("/tmp/ktest_owner_locks26_moved"));
+        }
+    } cleanup;
+    static_cast<void>(vfs_unlink(PATH));
+    static_cast<void>(vfs_unlink(ALIAS));
+    static_cast<void>(vfs_unlink(MOVED));
+    auto release = [](File* file) {
+        advisory_release_process_locks_for_file(7, file);
+        vfs_put_file(file);
+    };
+    using Owned = std::unique_ptr<File, decltype(release)>;
+    Owned local(vfs_open_file(PATH, O_CREAT | O_EXCL | 2, 0600), release);
+    if (!local || local->fs_type != FSType::TMPFS || vfs_link(PATH, ALIAS) != 0) return false;
+    Owned remote(vfs_open_file(ALIAS, 2, 0), release);
+    Owned other(vfs_open_file(PATH, 2, 0), release);
+    Owned untouched(vfs_open_file(PATH, 2, 0), release);
+    if (!remote || !other || !untouched || vfs_rename(PATH, MOVED) != 0) return false;
+    RemoteAdvisoryOwner const OWNER{.generation = 13, .boot_epoch = 17, .pid = 7, .peer = 19};
+    auto different = OWNER;
+    ++different.generation;
+    auto boot = OWNER;
+    ++boot.boot_epoch;
+    VfsFlockAbi const WRITE{.l_type = F_WRLCK_TYPE, .l_whence = SEEK_SET_VALUE, .l_start = 10, .l_len = 10};
+    VfsFlockAbi unlock = WRITE;
+    unlock.l_type = F_UNLCK_TYPE;
+    auto request = WRITE;
+    auto set = [&](File* file, const RemoteAdvisoryOwner& owner, RemoteAdvisoryKind kind, VfsFlockAbi value) {
+        return vfs_advisory_remote_try(file, owner, kind, false, value);
+    };
+    if (advisory_set_lock(local.get(), 7, AdvisoryOwnerKind::PROCESS, AdvisoryLockFamily::RECORD, WRITE, false) != 0 ||
+        set(remote.get(), OWNER, RemoteAdvisoryKind::PROCESS, WRITE) != -EAGAIN)
+        return false;
+    if (vfs_advisory_remote_try(remote.get(), OWNER, RemoteAdvisoryKind::PROCESS, true, request) != 0 || request.l_pid != 7 ||
+        request.l_type != F_WRLCK_TYPE || request.l_start != 10 || request.l_len != 10)
+        return false;
+    if (advisory_set_lock(local.get(), 7, AdvisoryOwnerKind::PROCESS, AdvisoryLockFamily::RECORD, unlock, false) != 0 ||
+        set(remote.get(), OWNER, RemoteAdvisoryKind::PROCESS, WRITE) != 0)
+        return false;
+    request = WRITE;
+    if (advisory_get_lock(local.get(), 7, AdvisoryOwnerKind::PROCESS, AdvisoryLockFamily::RECORD, request) != 0 ||
+        request.l_type != F_WRLCK_TYPE || request.l_pid != OWNER.pid)
+        return false;
+    if (set(other.get(), different, RemoteAdvisoryKind::PROCESS, WRITE) != -EAGAIN ||
+        set(other.get(), boot, RemoteAdvisoryKind::PROCESS, WRITE) != -EAGAIN)
+        return false;
+    auto renamed_pid = OWNER;
+    ++renamed_pid.pid;
+    if (set(other.get(), renamed_pid, RemoteAdvisoryKind::PROCESS, WRITE) != -EPROTO) return false;
+    // Closing an alias never used to acquire locks still releases this process's inode locks.
+    if (vfs_advisory_remote_close_process(untouched.get(), OWNER) != 0 ||
+        set(other.get(), different, RemoteAdvisoryKind::PROCESS, WRITE) != 0)
+        return false;
+    if (set(other.get(), different, RemoteAdvisoryKind::PROCESS, unlock) != 0 ||
+        set(remote.get(), OWNER, RemoteAdvisoryKind::OPEN_FILE, WRITE) != 0 ||
+        set(other.get(), OWNER, RemoteAdvisoryKind::PROCESS, WRITE) != -EAGAIN)
+        return false;
+    if (vfs_advisory_remote_close_process(remote.get(), OWNER) != 0 ||
+        set(other.get(), OWNER, RemoteAdvisoryKind::PROCESS, WRITE) != -EAGAIN)
+        return false;
+    VfsFlockAbi const WHOLE{.l_type = F_WRLCK_TYPE, .l_whence = SEEK_SET_VALUE};
+    if (set(other.get(), OWNER, RemoteAdvisoryKind::FLOCK, WHOLE) != 0 ||
+        advisory_flock(local.get(), LOCK_EX_VALUE | LOCK_NB_VALUE) != -EAGAIN ||
+        set(remote.get(), OWNER, RemoteAdvisoryKind::FLOCK, WHOLE) != -EAGAIN)
+        return false;
+    auto whole_unlock = WHOLE;
+    whole_unlock.l_type = F_UNLCK_TYPE;
+    if (set(other.get(), OWNER, RemoteAdvisoryKind::FLOCK, whole_unlock) != 0 ||
+        advisory_flock(local.get(), LOCK_EX_VALUE | LOCK_NB_VALUE) != 0 || advisory_flock(local.get(), LOCK_UN_VALUE) != 0)
+        return false;
+    vfs_advisory_remote_retire(remote.get());
+    if (set(remote.get(), OWNER, RemoteAdvisoryKind::OPEN_FILE, WRITE) != -ENOTCONN ||
+        set(other.get(), different, RemoteAdvisoryKind::PROCESS, WRITE) != 0)
+        return false;
+    // Retiring the old open cannot release a distinct generation on another open.
+    vfs_advisory_remote_retire(remote.get());
+    if (advisory_set_lock(local.get(), 7, AdvisoryOwnerKind::PROCESS, AdvisoryLockFamily::RECORD, WRITE, false) != -EAGAIN) return false;
+    if (set(other.get(), different, RemoteAdvisoryKind::PROCESS, unlock) != 0) return false;
+    // Closing admission is permanent while I/O references still retain the open.
+    vfs_advisory_remote_close_admission(other.get());
+    request = WRITE;
+    if (vfs_advisory_remote_try(other.get(), different, RemoteAdvisoryKind::PROCESS, true, request) != -ENOTCONN ||
+        (request.l_type != WRITE.l_type || request.l_whence != WRITE.l_whence || request.l_start != WRITE.l_start ||
+         request.l_len != WRITE.l_len || request.l_pid != WRITE.l_pid))
+        return false;
+    vfs_advisory_remote_retire(other.get());
+    Owned bounded(vfs_open_file(MOVED, 2, 0), release);
+    if (!bounded) return false;
+    for (size_t index = 0; index < REMOTE_ADVISORY_SCOPES_PER_OPEN; ++index) {
+        auto scope = OWNER;
+        scope.generation = 100 + index;
+        if (set(bounded.get(), scope, RemoteAdvisoryKind::PROCESS, unlock) != 0) return false;
+    }
+    auto overflow = OWNER;
+    overflow.generation = 200;
+    if (set(bounded.get(), overflow, RemoteAdvisoryKind::PROCESS, WRITE) != -ENOLCK) return false;
+    vfs_advisory_remote_retire(bounded.get());
+    if (advisory_set_lock(local.get(), 7, AdvisoryOwnerKind::PROCESS, AdvisoryLockFamily::RECORD, WRITE, false) != 0) return false;
+    File client;
+    client.fs_type = FSType::REMOTE;
+    request = WRITE;
+    return advisory_set_lock(&client, 7, AdvisoryOwnerKind::PROCESS, AdvisoryLockFamily::RECORD, WRITE, false) == -EOPNOTSUPP &&
+           advisory_get_lock(&client, 7, AdvisoryOwnerKind::PROCESS, AdvisoryLockFamily::RECORD, request) == -EOPNOTSUPP &&
+           advisory_flock(&client, LOCK_EX_VALUE | LOCK_NB_VALUE) == -EOPNOTSUPP;
+}
+
 auto vfs_selftest_fcntl_setfl_preserves_open_policy_flags() -> bool {
     constexpr int IMMUTABLE_FLAGS = 2 | ker::vfs::O_CREAT | ker::vfs::O_TRUNC | ker::vfs::O_DIRECTORY | ker::vfs::O_CLOEXEC |
                                     ker::vfs::O_NOTIFY_CACHE_CHANGE | ker::vfs::O_NO_CACHE | ker::vfs::O_LOCAL | ker::vfs::O_ALWAYS_CACHE;
@@ -25868,9 +26428,18 @@ auto vfs_selftest_stream_cache_read_eligibility() -> bool {
     bool const NO_CACHE_REJECTED = !stream_cache_read_eligible(&xfs_no_cache);
     bool const ANONYMOUS_REJECTED = !stream_cache_read_eligible(&anonymous_pipe);
     bool const DEVFS_REJECTED = !stream_cache_read_eligible(&devfs_read);
-    bool const REMOTE_ALLOWED = stream_cache_read_eligible(&remote_read);
-    return LOCAL_REGULAR_REJECTED && WRITABLE_REJECTED && NO_CACHE_REJECTED && ANONYMOUS_REJECTED && DEVFS_REJECTED && REMOTE_ALLOWED &&
-           COMPATIBILITY_PATH_REJECTED && COMPATIBILITY_WATCH_REJECTED;
+    bool const REMOTE_REJECTED = !stream_cache_read_eligible(&remote_read);
+    remote_read.open_flags = O_ALWAYS_CACHE;
+    bool const REMOTE_ALWAYS_CACHE_REJECTED = !stream_cache_read_eligible(&remote_read);
+    remote_read.open_flags = O_NO_CACHE;
+    bool const REMOTE_NO_CACHE_REJECTED = !stream_cache_read_eligible(&remote_read);
+    File tmpfs_read{};
+    tmpfs_read.fs_type = FSType::TMPFS;
+    tmpfs_read.vfs_path = path;
+    bool const LOCAL_TMPFS_ALLOWED = stream_cache_read_eligible(&tmpfs_read);
+    return LOCAL_REGULAR_REJECTED && WRITABLE_REJECTED && NO_CACHE_REJECTED && ANONYMOUS_REJECTED && DEVFS_REJECTED && REMOTE_REJECTED &&
+           REMOTE_ALWAYS_CACHE_REJECTED && REMOTE_NO_CACHE_REJECTED && LOCAL_TMPFS_ALLOWED && COMPATIBILITY_PATH_REJECTED &&
+           COMPATIBILITY_WATCH_REJECTED;
 }
 
 auto vfs_selftest_remote_read_bounce_window() -> bool {

@@ -193,6 +193,14 @@ void xfs_trans_discard_undo(XfsTransaction* tp) {
     while (tp->inode_undo != nullptr) {
         XfsTransInodeUndo* undo = tp->inode_undo;
         tp->inode_undo = undo->next;
+        if (undo->version_guard) {
+            if (tp->committed)
+                undo->version_guard->publish();
+            else if (tp->cancelled && undo->ip != nullptr)
+                undo->version_guard->cancel_no_effect();
+            // An unexpected uncommitted release publishes conservatively in
+            // the guard's destructor rather than blessing possibly changed data.
+        }
         if (undo->owns_data_fork) {
             xfs_trans_free_ifork(&undo->data_fork);
         }
@@ -795,6 +803,8 @@ auto xfs_trans_capture_inode(XfsTransaction* tp, XfsInode* ip) -> int {
     }
     undo->owns_attr_fork = true;
 
+    undo->version_guard.emplace(ip->coherency, coherency::Domain::ALL);
+
     undo->next = tp->inode_undo;
     tp->inode_undo = undo;
     return 0;
@@ -886,6 +896,18 @@ auto xfs_trans_commit(XfsTransaction* tp) -> int {
     }
 
     tp->committed = true;
+    // Namespace, ownership and xattr mutations all log their retained inode.
+    // Publish only after journal/backend commit, before serialization is released.
+    // Conservatively advance both data domains on regular/symlink objects;
+    // a cache may lose a hit but cannot keep a stale committed revision.
+    for (int i = 0; i < tp->item_count; ++i) {
+        XfsTransItem const& item = tp->items[i];
+        if (item.type == XfsLogItemType::INODE && item.inode.ip != nullptr) {
+            XfsInode* const INODE = item.inode.ip;
+            coherency::Publication publication(INODE->coherency,
+                                               xfs_inode_isdir(INODE) ? coherency::Domain::DIRECTORY : coherency::Domain::CONTENT);
+        }
+    }
     tp->mount->mutation_sequence.fetch_add(1, std::memory_order_release);
     bool invalidate_lookup = tp->lookup_effect == XfsLookupEffect::INVALIDATE;
     // Preserve conservative validation if a data transaction also changes
@@ -977,10 +999,17 @@ auto xfs_selftest_transaction_cancel_restores_ownership() -> bool {
     inode.ctime = 123;
     inode.atime = 11;
     inode.mtime = 22;
+    coherency::Stamp before{};
+    if (!inode.coherency.snapshot(before)) return false;
     for (bool commit_failure : {false, true}) {
         XfsTransaction* tp = xfs_trans_alloc(&mount);
         if (tp == nullptr) return false;
         if (xfs_trans_capture_inode(tp, &inode) != 0) {
+            xfs_trans_cancel(tp);
+            return false;
+        }
+        coherency::Stamp during = before;
+        if (inode.coherency.snapshot(during) || during != before) {
             xfs_trans_cancel(tp);
             return false;
         }
@@ -1000,6 +1029,8 @@ auto xfs_selftest_transaction_cancel_restores_ownership() -> bool {
         if (inode.uid != 1000 || inode.gid != 2000 || inode.mode != 0106755 || inode.ctime != 123 || inode.atime != 11 ||
             inode.mtime != 22 || inode.dirty)
             return false;
+        coherency::Stamp after{};
+        if (!inode.coherency.snapshot(after) || after != before) return false;
     }
     return true;
 }

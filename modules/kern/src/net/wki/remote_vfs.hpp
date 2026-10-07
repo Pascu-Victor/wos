@@ -9,6 +9,8 @@
 #include <net/wki/wki.hpp>
 #include <platform/sys/mutex.hpp>
 #include <platform/sys/spinlock.hpp>
+#include <vfs/append_receipt.hpp>
+#include <vfs/coherency.hpp>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
 #include <vfs/stat.hpp>
@@ -104,6 +106,7 @@ struct RemoteVfsFd {
     uint64_t directory_pin_token = 0;  // Separate purpose from executable content views.
     uint64_t ordinary_open_token = 0;  // Exact-binding ordinary OPEN/CANCEL namespace.
     uint64_t ordinary_open_binding_id = 0;
+    ker::vfs::coherency::AppendReceipt append_receipt{};
     int32_t exec_view_source_fd = 0;
     // Only a separately prepared transfer PIN has an owner-issued grant.
     VfsDirectoryGrant directory_grant{};
@@ -261,6 +264,7 @@ constexpr size_t VFS_WRITE_BEHIND_SIZE = VFS_RDMA_WRITE_SIZE;
 struct ReadAheadCache {
     int64_t cached_offset = -1;  // Start offset of cached region (-1 = empty)
     uint16_t cached_len = 0;     // Bytes valid in cache
+    ker::vfs::coherency::CacheValidation validation{};
     // A response initializes cached_len bytes before any cache lookup can read them.
     std::array<uint8_t, VFS_CACHE_SIZE> data;
 };
@@ -288,6 +292,8 @@ struct RemoteFileContext {
     uint32_t ordinary_owner_boot_epoch = 0;
     uint32_t ordinary_resource_incarnation = 0;
     uint32_t ordinary_resource_id = 0;
+    bool owner_features_known = false;  // Exact open binding, protected by io_lock.
+    uint64_t owner_features = 0;
     // An accepted WRITE without an exact native result must never be replayed.
     int secure_write_error = 0;         // Protected by io_lock.
     bool secure_io_negotiated = false;  // Sticky under io_lock; no numeric-FD downgrade.
@@ -477,6 +483,10 @@ auto wki_remote_vfs_selftest_directory_grant_lifetime() -> bool;
 auto wki_remote_vfs_selftest_native_directory_grant() -> bool;
 auto wki_remote_vfs_selftest_completed_read_reply_retry() -> bool;
 auto wki_remote_vfs_selftest_owner_write_policy() -> bool;
+auto wki_remote_vfs_selftest_owner_version_admission() -> bool;
+auto wki_remote_vfs_selftest_owner_append() -> bool;
+auto wki_remote_vfs_selftest_owner_committed_io() -> bool;
+auto wki_remote_vfs_selftest_owner_io_outcomes() -> bool;
 auto wki_remote_vfs_selftest_file_retirement() -> bool;
 auto wki_remote_vfs_selftest_file_metadata_decoder() -> bool;
 auto wki_remote_vfs_selftest_directory_grant_preparation() -> bool;
@@ -571,6 +581,7 @@ auto wki_remote_vfs_metadata_batch(void* mount_private_data, ker::vfs::MetadataB
 
 // Consumer side: cached metadata lookup for an already-open remote file.
 auto wki_remote_vfs_fstat(ker::vfs::File* file, ker::vfs::Stat* statbuf) -> int;
+auto wki_remote_vfs_write_append(ker::vfs::File* file, const void* bytes, size_t count, size_t* offset) -> ssize_t;
 
 // Consumer side: flush write-behind state and forward fsync for an open remote file.
 auto wki_remote_vfs_fsync(ker::vfs::File* file) -> int;

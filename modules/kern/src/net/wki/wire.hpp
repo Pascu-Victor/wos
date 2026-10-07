@@ -1305,6 +1305,10 @@ constexpr uint64_t WKI_VFS_FEATURE_FILE_METADATA_IDENTITY = 256;
 constexpr uint64_t WKI_VFS_FEATURE_CHOWN_IDENTITY = 512;
 constexpr uint64_t WKI_VFS_FEATURE_DIRECTORY_GRANT = 1024;
 constexpr uint64_t WKI_VFS_FEATURE_OPEN_LIFETIME = 2048;
+constexpr uint64_t WKI_VFS_FEATURE_OWNER_VERSIONS = 4096;
+constexpr uint64_t WKI_VFS_FEATURE_ATOMIC_APPEND = 8192;
+constexpr uint64_t WKI_VFS_FEATURE_OWNER_LOCKS = 16384;
+constexpr uint64_t WKI_VFS_FEATURE_COMMITTED_IO = 32768;
 struct VfsFeaturesRequest {
     uint16_t version;
     uint16_t reserved;
@@ -1477,6 +1481,120 @@ constexpr uint16_t OP_VFS_OPEN_LIFETIME = 0x0421;
 // Independently negotiated secure VFS fallback: canonical native intent and
 // ordinary authenticated bytes preserve the exact tokenized open authority.
 constexpr uint16_t OP_VFS_SECURE_IO = 0x0422;
+constexpr uint16_t OP_VFS_VERSION = 0x0423;
+constexpr uint16_t WKI_VFS_OWNER_VERSION = 1;
+// The binding nonce already selects the retained export/resource incarnation.
+// Pair it with boot and ordinary token so numeric FD/channel reuse grants none.
+struct VfsOwnerFdRequest {
+    uint16_t version = WKI_VFS_OWNER_VERSION;
+    uint16_t reserved = 0;
+    int32_t fd = 0;
+    uint64_t open_token = 0;
+    uint64_t binding_id = 0;
+    uint32_t owner_boot_epoch = 0;
+    uint32_t reserved2 = 0;
+    uint64_t query_id = 0;
+} __attribute__((packed));
+static_assert(sizeof(VfsOwnerFdRequest) == 40);
+constexpr auto wki_vfs_owner_fd_request_valid(const VfsOwnerFdRequest& request, size_t length) -> bool {
+    return length == sizeof(request) && request.version == WKI_VFS_OWNER_VERSION && request.reserved == 0 && request.reserved2 == 0 &&
+           request.fd > 0 && request.open_token != 0 && request.binding_id != 0 && request.owner_boot_epoch != 0 && request.query_id != 0;
+}
+struct VfsVersionResponse {
+    uint16_t version = WKI_VFS_OWNER_VERSION;
+    uint16_t length = sizeof(VfsVersionResponse);
+    uint32_t reserved = 0;
+    uint64_t query_id = 0;
+    uint64_t object = 0;
+    uint64_t content = 0;
+    uint64_t metadata = 0;
+    uint64_t directory = 0;
+} __attribute__((packed));
+static_assert(sizeof(VfsVersionResponse) == 48);
+constexpr auto wki_vfs_version_response_valid(const VfsVersionResponse& response, uint64_t query_id, size_t length) -> bool {
+    return length == sizeof(response) && response.version == WKI_VFS_OWNER_VERSION && response.length == sizeof(response) &&
+           response.reserved == 0 && query_id != 0 && response.query_id == query_id && response.object != 0 &&
+           response.content >= response.object && response.directory >= response.object && response.metadata >= response.content &&
+           response.metadata >= response.directory;
+}
+constexpr auto wki_vfs_version_reply_size_valid(int status, size_t length, size_t capacity) -> bool {
+    return status <= 0 && length <= capacity && length == (status == 0 ? sizeof(VfsVersionResponse) : 0);
+}
+constexpr uint16_t OP_VFS_APPEND = 0x0424;
+struct VfsAppendRequest {
+    VfsOwnerFdRequest owner{};
+    uint32_t data_len = 0;
+    uint32_t reserved = 0;
+} __attribute__((packed));
+static_assert(sizeof(VfsAppendRequest) == 48);
+constexpr uint32_t WKI_VFS_APPEND_MAX = WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload) - sizeof(VfsAppendRequest);
+struct VfsAppendResponse {
+    uint16_t version = WKI_VFS_OWNER_VERSION;
+    uint16_t length = sizeof(VfsAppendResponse);
+    uint32_t reserved = 0;
+    uint64_t operation = 0;
+    int64_t offset = 0;
+    int32_t status = 0;
+    uint32_t bytes = 0;
+} __attribute__((packed));
+static_assert(sizeof(VfsAppendResponse) == 32);
+constexpr auto wki_vfs_append_request_valid(const VfsAppendRequest& request, size_t length) -> bool {
+    return wki_vfs_owner_fd_request_valid(request.owner, sizeof(request.owner)) && request.reserved == 0 &&
+           request.data_len <= WKI_VFS_APPEND_MAX && length == sizeof(request) + request.data_len;
+}
+constexpr auto wki_vfs_append_response_valid(const VfsAppendResponse& response, uint64_t operation, uint32_t requested, size_t length)
+    -> bool {
+    return length == sizeof(response) && response.version == WKI_VFS_OWNER_VERSION && response.length == sizeof(response) &&
+           response.reserved == 0 && operation != 0 && response.operation == operation && requested <= WKI_VFS_APPEND_MAX &&
+           response.status <= 0 && response.bytes <= requested && response.offset >= 0 &&
+           response.bytes <= static_cast<uint64_t>(INT64_MAX - response.offset) &&
+           (response.status == 0 || (response.bytes == 0 && response.offset == 0));
+}
+constexpr auto wki_vfs_append_reply_size_valid(int status, size_t length, size_t capacity) -> bool {
+    return status <= 0 && length <= capacity && length == (status == 0 ? sizeof(VfsAppendResponse) : 0);
+}
+constexpr uint16_t OP_VFS_WRITE_COMMITTED = 0x0425;
+constexpr uint16_t OP_VFS_READ_OWNER = 0x0426;
+struct VfsOwnerIoRequest {
+    VfsOwnerFdRequest owner{};
+    int64_t offset = 0;
+    uint32_t data_len = 0;
+    uint32_t reserved = 0;
+} __attribute__((packed));
+static_assert(sizeof(VfsOwnerIoRequest) == 56);
+constexpr uint32_t WKI_VFS_OWNER_WRITE_MAX = WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload) - sizeof(VfsOwnerIoRequest);
+struct VfsOwnerReadResponse {
+    uint16_t version = WKI_VFS_OWNER_VERSION;
+    uint16_t length = sizeof(VfsOwnerReadResponse);
+    uint32_t reserved = 0;
+    uint64_t query_id = 0;
+    uint32_t bytes = 0;
+    uint32_t reserved2 = 0;
+} __attribute__((packed));
+static_assert(sizeof(VfsOwnerReadResponse) == 24);
+constexpr uint32_t WKI_VFS_OWNER_READ_MAX = WKI_ETH_MAX_PAYLOAD - sizeof(DevOpRespPayload) - sizeof(VfsOwnerReadResponse);
+constexpr auto wki_vfs_owner_io_request_valid(const VfsOwnerIoRequest& request, size_t length, bool write) -> bool {
+    return wki_vfs_owner_fd_request_valid(request.owner, sizeof(request.owner)) && request.reserved == 0 && request.offset >= 0 &&
+           request.data_len <= (write ? WKI_VFS_OWNER_WRITE_MAX : WKI_VFS_OWNER_READ_MAX) &&
+           request.data_len <= static_cast<uint64_t>(INT64_MAX - request.offset) &&
+           length == sizeof(request) + (write ? request.data_len : 0);
+}
+// WRITE shares the exact offset/prefix/errno outcome frame with APPEND.
+constexpr auto wki_vfs_owner_write_response_valid(const VfsAppendResponse& response, uint64_t operation, int64_t offset, uint32_t requested,
+                                                  size_t length) -> bool {
+    return offset >= 0 && requested <= WKI_VFS_OWNER_WRITE_MAX && requested <= static_cast<uint64_t>(INT64_MAX - offset) &&
+           wki_vfs_append_response_valid(response, operation, requested, length) && (response.status != 0 || response.offset == offset);
+}
+constexpr auto wki_vfs_owner_read_reply_size_valid(int status, size_t length, size_t capacity) -> bool {
+    return status <= 0 && length <= capacity && length <= sizeof(VfsOwnerReadResponse) + WKI_VFS_OWNER_READ_MAX &&
+           (status == 0 ? length >= sizeof(VfsOwnerReadResponse) : length == 0);
+}
+constexpr auto wki_vfs_owner_read_response_valid(const VfsOwnerReadResponse& response, uint64_t query, uint32_t requested, size_t length)
+    -> bool {
+    return response.version == WKI_VFS_OWNER_VERSION && response.length == sizeof(response) && response.reserved == 0 &&
+           response.reserved2 == 0 && query != 0 && response.query_id == query && requested <= WKI_VFS_OWNER_READ_MAX &&
+           response.bytes <= requested && length == sizeof(response) + response.bytes;
+}
 constexpr uint16_t WKI_VFS_OPEN_LIFETIME_VERSION = 1;
 struct VfsOpenLifetimeRequest {
     uint16_t version = WKI_VFS_OPEN_LIFETIME_VERSION;

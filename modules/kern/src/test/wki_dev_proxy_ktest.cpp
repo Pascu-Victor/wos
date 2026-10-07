@@ -139,6 +139,22 @@ KTEST(WkiRemoteVfsOwnerWrite, PolicyAdmissionAndRetirementKeepOneFile) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_owner_write_policy());
 }
 
+KTEST(WkiRemoteVfsCoherency, ExactOwnerVersionAuthorityDeniesStaleOpenAndRetainsAdmittedFile) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_owner_version_admission());
+}
+
+KTEST(WkiRemoteVfsCoherency, OwnerAppendSharesNativeOffsetAndReplaysOnlyExactCompletedOutcome) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_owner_append());
+}
+
+KTEST(WkiRemoteVfsCoherency, PositionedCommittedIoHasExactLifetimeAndStableReplay) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_owner_committed_io());
+}
+
+KTEST(WkiRemoteVfsCoherency, NativeIoPartialErrorAndRetirementHaveOneOutcome) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_owner_io_outcomes());
+}
+
 KTEST(WkiRemoteVfsDirectoryPaths, OpenReservationIsInvisibleUntilCommit) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_directory_open_reservation());
 }

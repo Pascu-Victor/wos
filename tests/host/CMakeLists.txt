@@ -1403,6 +1403,13 @@ set_tests_properties(
     PROPERTIES LABELS "host;source"
 )
 
+wos_add_unit_test(vfs_coherency_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vfs_coherency_test.cpp
+)
+wos_add_unit_test(wki_vfs_coherency_wire_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_vfs_coherency_wire_test.cpp
+)
+
 wos_add_unit_test(wki_wire_test
     SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_wire_test.cpp
 )
@@ -1833,3 +1840,7 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/rtld_gnu_bloom_runtime_test.py
 )
 set_tests_properties(rtld_gnu_bloom_runtime_test PROPERTIES LABELS "host;unit")
+
+wos_add_unit_test(vfs_advisory_receipt_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vfs_advisory_receipt_test.cpp
+)

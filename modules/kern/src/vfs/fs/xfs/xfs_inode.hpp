@@ -1,6 +1,7 @@
 #pragma once
 
 #include <vfs/exec_content.hpp>
+#include <vfs/native_coherency.hpp>
 
 // XFS Inode - in-memory representation and disk I/O.
 //
@@ -114,6 +115,7 @@ struct XfsInode {
     mod::sys::Spinlock lock;  // per-inode lock
     mod::sys::Mutex io_lock;  // sleeping lock for data/metadata I/O mutation
     ker::vfs::ExecContentState exec_content;
+    ker::vfs::coherency::Object coherency{};
 
     // Final zero-link teardown is in progress.  The inode remains in the
     // cache with refcount 0 while the on-disk free transaction runs so stale

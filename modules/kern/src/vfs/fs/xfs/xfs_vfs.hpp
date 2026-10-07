@@ -1,5 +1,6 @@
 #pragma once
 
+#include <vfs/coherency.hpp>
 #include <vfs/timestamps.hpp>
 
 // XFS VFS Integration - connects the XFS native implementation to the
@@ -184,6 +185,7 @@ auto xfs_readlink_path(const char* fs_path, char* buf, size_t bufsize, XfsMountC
 auto xfs_clone_exec_file(File* source, File** output) -> int;
 // Fstat an open file descriptor.
 auto xfs_fstat(File* f, ker::vfs::Stat* statbuf) -> int;
+auto xfs_coherency_snapshot(File* file, coherency::Stamp& output) -> bool;
 
 // Extended attributes. Names use the public qualified namespace form
 // (user.*, trusted.*, security.*); internal XFS namespaces are never exposed.

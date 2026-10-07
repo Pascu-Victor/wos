@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <new>
+#include <optional>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
@@ -675,6 +676,7 @@ void ensure_children_capacity(TmpNode* dir, size_t slot) {
 }
 
 void add_child(TmpNode* parent, TmpNode* child) {
+    coherency::Publication publication(parent->coherency, coherency::Domain::DIRECTORY);
     size_t slot = parent->children_count;
     if (parent->open_count.load(std::memory_order_acquire) == 0) {
         for (size_t i = 0; i < parent->children_count; ++i) {
@@ -709,6 +711,8 @@ auto tmpfs_write_locked(TmpNode* n, const void* buf, size_t count, size_t offset
     if (offset > static_cast<size_t>(-1) - count) {
         return -EFBIG;
     }
+
+    coherency::Publication publication(n->coherency, coherency::Domain::CONTENT);
 
     auto const* src = static_cast<const uint8_t*>(buf);
     size_t total_written = 0;
@@ -745,6 +749,8 @@ auto tmpfs_resize_locked(TmpNode* n, size_t new_size) -> int {
     if (!page_count_for_size(new_size, &new_pages)) {
         return -EFBIG;
     }
+
+    coherency::Publication publication(n->coherency, coherency::Domain::CONTENT);
 
     if (new_size < n->size && new_pages != 0 && (new_size % DEFAULT_TMPFS_BLOCK_SIZE) != 0 && new_pages <= n->page_count) {
         TmpPage& existing_tail = n->pages[new_pages - 1];
@@ -953,6 +959,8 @@ auto tmpfs_create_hardlink(TmpNode* parent, const char* name, TmpNode* target) -
         return nullptr;
     }
 
+    coherency::Publication publication(canonical->coherency, coherency::Domain::METADATA);
+
     auto* node = new TmpNode;
     copy_name(node->name, name);
     node->type = canonical->type;
@@ -992,6 +1000,8 @@ auto tmpfs_detach_child(TmpNode* parent, TmpNode* child) -> bool {
             continue;
         }
 
+        coherency::Publication publication(parent->coherency, coherency::Domain::DIRECTORY);
+
         parent->children[i] = nullptr;
         if (parent->children_live_count > 0) {
             parent->children_live_count--;
@@ -1018,6 +1028,7 @@ void tmpfs_drop_detached_node(TmpNode* node) {
     }
 
     TmpNode* canonical = tmpfs_canonical_node(node);
+    coherency::Publication publication(canonical->coherency, coherency::Domain::METADATA);
     bool last_link = false;
     if (canonical != nullptr && canonical->type != TmpNodeType::DIRECTORY) {
         uint32_t const PREV = canonical->link_count.fetch_sub(1, std::memory_order_acq_rel);
@@ -1031,6 +1042,8 @@ void tmpfs_drop_detached_node(TmpNode* node) {
 
     if (canonical != nullptr && last_link) {
         canonical->unlinked = true;
+        // The guard refers to the canonical object; drain before reclamation.
+        publication.publish();
         if (canonical->open_count.load(std::memory_order_acquire) == 0 &&
             canonical->lookup_ref_count.load(std::memory_order_acquire) == 0) {
             tmpfs_free_node(canonical);
@@ -1606,6 +1619,7 @@ auto tmpfs_mkdir_lookup(const ker::mod::security::Snapshot& credentials, const T
     if (NODE == nullptr) {
         return -ENOMEM;
     }
+    coherency::Publication publication(NODE->coherency, coherency::Domain::METADATA);
     NODE->uid = identity.uid;
     NODE->gid = identity.gid;
     NODE->mode = identity.mode & 07777U;
@@ -1640,6 +1654,7 @@ auto tmpfs_symlink_lookup(const ker::mod::security::Snapshot& credentials, const
         // Preserve the legacy tmpfs symlink branch's generic allocation error.
         return -1;
     }
+    coherency::Publication publication(NODE->coherency, coherency::Domain::METADATA);
     NODE->uid = identity.uid;
     NODE->gid = identity.gid;
     NODE->mode = identity.mode & 07777U;
@@ -1721,6 +1736,7 @@ auto tmpfs_rmdir_lookup(const ker::mod::security::Snapshot& credentials, const T
 namespace {
 
 void commit_metadata_locked(TmpNode& node, const ker::mod::security::FileIdentity& prepared, TmpfsObjectMetadata* out) {
+    coherency::Publication publication(node.coherency, coherency::Domain::METADATA);
     bool const SEARCH_AUTHORITY_CHANGED = node.type == TmpNodeType::DIRECTORY &&
                                           (node.uid != prepared.uid || node.gid != prepared.gid || node.mode != (prepared.mode & 07777U));
     node.uid = prepared.uid;
@@ -1796,6 +1812,8 @@ auto utimens_locked(TmpNode& canonical, const ker::mod::security::Snapshot& cred
     if (read_only && times.changed()) {
         return -EROFS;
     }
+    std::optional<coherency::Publication> publication;
+    if (times.changed()) publication.emplace(canonical.coherency, coherency::Domain::METADATA);
     if (times.set_atime()) canonical.atime = times.atime();
     if (times.set_mtime()) canonical.mtime = times.mtime();
     if (times.changed()) canonical.ctime = times.ctime();
@@ -1908,6 +1926,12 @@ auto tmpfs_rename_lookup(const ker::mod::security::Snapshot& credentials, const 
     }
     // Pair validation pins both memberships under this lock. Reserve the
     // append slot before detaching either entry; attach cannot allocate later.
+    coherency::Publication source_parent_publication(source.parent()->coherency, coherency::Domain::DIRECTORY);
+    coherency::Publication destination_parent_publication(destination.parent()->coherency, coherency::Domain::DIRECTORY);
+    coherency::Publication source_publication(CANONICAL->coherency,
+                                              SOURCE_DIRECTORY ? coherency::Domain::DIRECTORY : coherency::Domain::METADATA);
+    std::optional<coherency::Publication> displaced_publication;
+    if (DISPLACED != nullptr) displaced_publication.emplace(DISPLACED->coherency, coherency::Domain::METADATA);
     auto* parent = destination.parent();
     if (parent->children_count >= parent->children_capacity) {
         constexpr size_t MAX_CAPACITY = SIZE_MAX / sizeof(TmpNode*);
@@ -2516,6 +2540,12 @@ auto tmpfs_get_size(ker::vfs::File* f) -> size_t {
     return n->size;
 }
 
+auto tmpfs_coherency_snapshot(File* file, coherency::Stamp& output) -> bool {
+    if (file == nullptr || file->fops != get_tmpfs_fops()) return false;
+    auto* node = tmpfs_canonical_node(static_cast<TmpNode*>(file->private_data));
+    return node != nullptr && node->coherency.snapshot(output);
+}
+
 auto tmpfs_copy_file_contents(TmpNode* dst, TmpNode* src) -> int {
     dst = tmpfs_canonical_node(dst);
     src = tmpfs_canonical_node(src);
@@ -2529,6 +2559,8 @@ auto tmpfs_copy_file_contents(TmpNode* dst, TmpNode* src) -> int {
     TmpNode* second = dst < src ? src : dst;
     ker::mod::sys::MutexGuard first_guard(first->io_lock);
     ker::mod::sys::MutexGuard second_guard(second->io_lock);
+
+    coherency::Publication publication(dst->coherency, coherency::Domain::CONTENT);
 
     int ret = tmpfs_resize_locked(dst, 0);
     if (ret < 0) {

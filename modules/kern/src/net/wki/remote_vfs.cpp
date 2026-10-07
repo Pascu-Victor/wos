@@ -18,6 +18,7 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <net/wki/auth_crypto.hpp>
 #include <net/wki/auth_policy.hpp>
 #include <net/wki/dev_server.hpp>
 #include <net/wki/remotable.hpp>
@@ -39,6 +40,7 @@
 #include <string_view>
 #include <util/hcf.hpp>
 #include <utility>
+#include <vfs/advisory.hpp>
 #include <vfs/mount.hpp>
 #include <vfs/timestamps.hpp>
 #include <vfs/vfs.hpp>
@@ -169,7 +171,8 @@ static_assert(!vfs_readdir_batch_payload_is_valid(static_cast<uint16_t>(VFS_READ
                                                   VFS_READDIR_BATCH_MAX_ENTRIES));
 static_assert(!vfs_readdir_batch_payload_is_valid(UINT16_MAX, VFS_READDIR_BATCH_MAX_ENTRIES + 1));
 
-auto remote_vfs_try_copy_cached_stat(RemoteFileContext* ctx, ker::vfs::Stat* statbuf) -> bool {
+// Diagnostic state only; public remote operations obtain fresh owner results.
+[[maybe_unused]] auto remote_vfs_try_copy_cached_stat(RemoteFileContext* ctx, ker::vfs::Stat* statbuf) -> bool {
     if (ctx == nullptr || statbuf == nullptr) {
         return false;
     }
@@ -1246,57 +1249,6 @@ bool should_hide_recursive_wki_entry(const RemoteFileContext* ctx, const ker::vf
 // Consumer side
 // -----------------------------------------------------------------------------
 
-// D7: Directory listing cache - avoids repeated round-trips for readdir()
-struct DirCacheEntry {
-    ProxyVfsState* proxy = nullptr;
-    int32_t remote_fd = -1;
-    uint64_t cache_time_us = 0;
-    bool complete = false;  // true if we fetched all entries (server returned error/empty)
-    std::deque<ker::vfs::DirEntry> entries;
-
-    static constexpr uint64_t STALE_US = 5000000;  // 5 seconds
-};
-
-bool try_get_visible_cached_dirent(const DirCacheEntry* cache, const RemoteFileContext* ctx, size_t visible_index,
-                                   ker::vfs::DirEntry* out) {
-    if (cache == nullptr || out == nullptr) {
-        return false;
-    }
-
-    size_t current_visible = 0;
-    for (const auto& candidate : cache->entries) {
-        if (should_hide_recursive_wki_entry(ctx, candidate)) {
-            continue;
-        }
-        if (current_visible == visible_index) {
-            *out = candidate;
-            return true;
-        }
-        current_visible++;
-    }
-
-    return false;
-}
-
-std::deque<DirCacheEntry> g_dir_cache;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-
-auto find_dir_cache(ProxyVfsState* proxy, int32_t remote_fd) -> DirCacheEntry* {
-    for (auto& dc : g_dir_cache) {
-        if (dc.proxy == proxy && dc.remote_fd == remote_fd) {
-            return &dc;
-        }
-    }
-    return nullptr;
-}
-
-void invalidate_dir_cache(ProxyVfsState* proxy, int32_t remote_fd) {
-    std::erase_if(g_dir_cache, [&](const DirCacheEntry& dc) { return dc.proxy == proxy && dc.remote_fd == remote_fd; });
-}
-
-void invalidate_all_dir_caches(ProxyVfsState* proxy) {
-    std::erase_if(g_dir_cache, [&](const DirCacheEntry& dc) { return dc.proxy == proxy; });
-}
-
 std::deque<std::unique_ptr<ProxyVfsState>> g_vfs_proxies;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool g_remote_vfs_initialized = false;                     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 uint8_t g_vfs_attach_next_cookie = 1;                      // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -1675,6 +1627,114 @@ auto retain_server_write_file(const WkiChannelIdentity& identity, int32_t fd, in
     return result;
 }
 
+// Caller owns deferred admission of this exact authenticated export binding.
+// Snapshot/backend work happens only after the retained File leaves this lock.
+auto retain_server_owner_file(DevServerBinding& binding, const WkiChannelIdentity& identity, const VfsOwnerFdRequest& request,
+                              ker::vfs::File*& output) -> int {
+    if (!wki_vfs_owner_fd_request_valid(request, sizeof(request))) return -EINVAL;
+    s_vfs_lock.lock();
+    int result = -ENOTCONN;
+    if (grant_binding_matches(binding, identity) && request.binding_id == binding.vfs_open_binding_id &&
+        request.owner_boot_epoch == binding.resource_incarnation.owner_boot_epoch) {
+        result = -EBADF;
+        auto* row = find_remote_fd(identity, request.fd);
+        if (row != nullptr && row->file != nullptr && row->ordinary_open_token == request.open_token &&
+            row->ordinary_open_binding_id == request.binding_id) {
+            ker::vfs::vfs_retain_file(row->file);
+            output = row->file;
+            touch_remote_fd(row);
+            result = 0;
+        }
+    }
+    s_vfs_lock.unlock();
+    return result;
+}
+
+auto perform_server_mutation(DevServerBinding& binding, const WkiChannelIdentity& identity, const VfsOwnerFdRequest& owner,
+                             const uint8_t* data, uint32_t length, bool append, int64_t requested_offset, VfsAppendResponse& output)
+    -> int {
+    if (data == nullptr || requested_offset < 0 || !wki_vfs_owner_fd_request_valid(owner, sizeof(owner))) return -EINVAL;
+    // Include operation and offset: reusing an append ID for positioned WRITE
+    // cannot borrow its receipt, even when the bytes themselves match.
+    uint16_t const OPCODE = append ? OP_VFS_APPEND : OP_VFS_WRITE_COMMITTED;
+    auth_crypto::Sha256 hash;
+    hash.update(&OPCODE, sizeof(OPCODE));
+    hash.update(&requested_offset, sizeof(requested_offset));
+    hash.update(&length, sizeof(length));
+    hash.update(data, length);
+    auto const DIGEST = hash.finish();
+    ker::vfs::File* file = nullptr;
+    int status = retain_server_owner_file(binding, identity, owner, file);
+    if (status != 0) return status;
+    ker::vfs::coherency::AppendOutcome outcome{};
+    s_vfs_lock.lock();
+    auto* row = find_remote_fd(identity, owner.fd);
+    bool const EXACT = row != nullptr && row->file == file && row->ordinary_open_token == owner.open_token &&
+                       row->ordinary_open_binding_id == owner.binding_id && grant_binding_matches(binding, identity);
+    auto const CLAIM =
+        EXACT ? row->append_receipt.claim(owner.query_id, length, DIGEST, outcome) : ker::vfs::coherency::AppendClaim::INVALID;
+    s_vfs_lock.unlock();
+    if (CLAIM == ker::vfs::coherency::AppendClaim::NEW) {
+        size_t offset = static_cast<size_t>(requested_offset);
+        ssize_t const RESULT = append ? ker::vfs::vfs_append_file_native(file, data, length, &offset)
+                                      : ker::vfs::vfs_pwrite_file(file, data, length, requested_offset);
+        if (RESULT < 0) {
+            outcome.status = static_cast<int32_t>(RESULT);
+        } else if (static_cast<uint64_t>(RESULT) > length || offset > INT64_MAX ||
+                   static_cast<uint64_t>(RESULT) > static_cast<uint64_t>(INT64_MAX) - offset) {
+            outcome.status = -EPROTO;
+        } else {
+            outcome.bytes = static_cast<uint32_t>(RESULT);
+            outcome.offset = offset;
+        }
+        s_vfs_lock.lock();
+        row = find_remote_fd(identity, owner.fd);
+        if (row != nullptr && row->file == file && row->ordinary_open_token == owner.open_token &&
+            row->ordinary_open_binding_id == owner.binding_id) {
+            if (!row->append_receipt.complete(owner.query_id, outcome)) status = -EPROTO;
+        }
+        s_vfs_lock.unlock();
+    } else if (CLAIM != ker::vfs::coherency::AppendClaim::REPLAY) {
+        status = CLAIM == ker::vfs::coherency::AppendClaim::PENDING    ? -EAGAIN
+                 : CLAIM == ker::vfs::coherency::AppendClaim::STALE    ? -ESTALE
+                 : CLAIM == ker::vfs::coherency::AppendClaim::MISMATCH ? -EPROTO
+                                                                       : -ENOTCONN;
+    }
+    ker::vfs::vfs_put_file(file);
+    if (status != 0) return status;
+    output = {
+        .operation = owner.query_id, .offset = static_cast<int64_t>(outcome.offset), .status = outcome.status, .bytes = outcome.bytes};
+    return 0;
+}
+
+auto perform_server_append(DevServerBinding& binding, const WkiChannelIdentity& identity, const VfsAppendRequest& request,
+                           const uint8_t* data, VfsAppendResponse& output) -> int {
+    if (!wki_vfs_append_request_valid(request, sizeof(request) + request.data_len)) return -EINVAL;
+    return perform_server_mutation(binding, identity, request.owner, data, request.data_len, true, 0, output);
+}
+
+auto perform_server_write(DevServerBinding& binding, const WkiChannelIdentity& identity, const VfsOwnerIoRequest& request,
+                          const uint8_t* data, VfsAppendResponse& output) -> int {
+    if (!wki_vfs_owner_io_request_valid(request, sizeof(request) + request.data_len, true)) return -EINVAL;
+    return perform_server_mutation(binding, identity, request.owner, data, request.data_len, false, request.offset, output);
+}
+
+// The exact File pin spans backend read. The bounded candidate is caller-owned
+// worker storage; no registry pointer or user buffer survives admission.
+auto perform_server_read(DevServerBinding& binding, const WkiChannelIdentity& identity, const VfsOwnerIoRequest& request, uint8_t* data,
+                         VfsOwnerReadResponse& output) -> int {
+    if (data == nullptr || !wki_vfs_owner_io_request_valid(request, sizeof(request), false)) return -EINVAL;
+    ker::vfs::File* file = nullptr;
+    int const ADMISSION = retain_server_owner_file(binding, identity, request.owner, file);
+    if (ADMISSION != 0) return ADMISSION;
+    ssize_t const RESULT = ker::vfs::vfs_pread_file(file, data, request.data_len, request.offset);
+    ker::vfs::vfs_put_file(file);
+    if (RESULT < 0) return static_cast<int>(RESULT);
+    if (static_cast<uint64_t>(RESULT) > request.data_len) return -EPROTO;
+    output = {.query_id = request.owner.query_id, .bytes = static_cast<uint32_t>(RESULT)};
+    return 0;
+}
+
 // Hooks are invoked in core task context. Every loan separately pins the exact
 // binding and File; registration storage is never native FD authority.
 auto secure_vfs_request_matches(const WkiSecureRdmaRequest& lhs, const WkiSecureRdmaRequest& rhs) -> bool {
@@ -1877,7 +1937,10 @@ auto find_directory_pin_locked(const WkiChannelIdentity& identity, uint64_t toke
 // Every published File may be retained by an admitted operation or transfer
 // stage. Retire only the registry reference. If it is final, preserve the
 // backend close result for the synchronous CLOSE response.
-auto release_server_file(ker::vfs::File* file) -> int { return ker::vfs::vfs_put_file_result(file); }
+auto release_server_file(ker::vfs::File* file) -> int {
+    ker::vfs::vfs_advisory_remote_retire(file);
+    return ker::vfs::vfs_put_file_result(file);
+}
 
 auto cancel_directory_pin(const WkiChannelIdentity& identity, uint64_t token) -> int {
     std::map<int32_t, RemoteVfsFd>::node_type retired;
@@ -2655,6 +2718,7 @@ void invalidate_remote_file_open_caches(RemoteFileContext* ctx) {
     if (ctx->read_cache != nullptr) {
         ctx->read_cache->cached_offset = -1;
         ctx->read_cache->cached_len = 0;
+        ctx->read_cache->validation.invalidate();
     }
 
     ctx->bulk_cached_offset = -1;
@@ -4684,8 +4748,8 @@ auto vfs_proxy_send_untracked(ProxyVfsState* state, uint16_t op_id, const uint8_
     return normalize_proxy_status_for_errno(encode_proxy_wki_status(SEND_RET));
 }
 
-auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int64_t offset, const uint8_t* src, uint32_t chunk,
-                                   uint32_t* written_out) -> int {
+[[maybe_unused]] auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int64_t offset, const uint8_t* src,
+                                                    uint32_t chunk, uint32_t* written_out) -> int {
     if (state == nullptr || src == nullptr || written_out == nullptr || state->rdma_transport == nullptr ||
         state->rdma_server_write_rkey == 0 || chunk == 0 || chunk > VFS_RDMA_WRITE_SIZE) {
         return -EINVAL;
@@ -4978,7 +5042,7 @@ auto install_write_behind_storage(WriteBehindBuffer* wb, std::unique_ptr<uint8_t
     return true;
 }
 
-auto try_reserve_write_behind(WriteBehindBuffer* wb, uint64_t required_bytes) -> bool {
+[[maybe_unused]] auto try_reserve_write_behind(WriteBehindBuffer* wb, uint64_t required_bytes) -> bool {
     if (wb == nullptr) {
         return false;
     }
@@ -5012,6 +5076,51 @@ auto capture_secure_vfs_client(const RemoteFileContext& context, WkiChannelIdent
     }
     s_vfs_lock.unlock();
     return status;
+}
+
+// io_lock holds the exact open stable. Capability information is never shared
+// with another binding or substituted for a successful version validation.
+auto query_remote_owner_features(RemoteFileContext& context, WkiChannelIdentity& identity) -> int {
+    int const AUTHORITY = capture_secure_vfs_client(context, identity);
+    if (AUTHORITY != 0) return AUTHORITY;
+    if (!context.owner_features_known) {
+        VfsFeaturesRequest const request{WKI_VFS_FEATURES_VERSION, 0};
+        VfsFeaturesResponse response{};
+        uint16_t length = 0;
+        int const STATUS = normalize_proxy_status_for_errno(
+            vfs_proxy_send_and_wait(context.proxy, OP_VFS_FEATURES, reinterpret_cast<const uint8_t*>(&request), sizeof(request), &response,
+                                    sizeof(response), &length, VFS_PROXY_OP_TIMEOUT_US, nullptr, nullptr, 0, false, &identity));
+        if (STATUS != 0) return STATUS;
+        if (!wki_vfs_features_response_valid(response, length)) return -EPROTO;
+        context.owner_features = response.features;
+        context.owner_features_known = true;
+    }
+    return 0;
+}
+
+auto query_remote_owner_version(RemoteFileContext& context, ker::vfs::coherency::Stamp& output) -> int {
+    WkiChannelIdentity identity{};
+    int const FEATURES = query_remote_owner_features(context, identity);
+    if (FEATURES != 0) return FEATURES;
+    if ((context.owner_features & WKI_VFS_FEATURE_OWNER_VERSIONS) == 0) return -EOPNOTSUPP;
+    static ker::vfs::coherency::Counter queries;
+    uint64_t const QUERY = queries.take();
+    if (QUERY == 0) return -EOVERFLOW;
+    VfsOwnerFdRequest const request{.version = WKI_VFS_OWNER_VERSION,
+                                    .fd = context.remote_fd,
+                                    .open_token = context.ordinary_open_token,
+                                    .binding_id = context.ordinary_open_binding_id,
+                                    .owner_boot_epoch = context.ordinary_owner_boot_epoch,
+                                    .query_id = QUERY};
+    VfsVersionResponse response{};
+    uint16_t length = 0;
+    int const STATUS = normalize_proxy_status_for_errno(
+        vfs_proxy_send_and_wait(context.proxy, OP_VFS_VERSION, reinterpret_cast<const uint8_t*>(&request), sizeof(request), &response,
+                                sizeof(response), &length, VFS_PROXY_OP_TIMEOUT_US, nullptr, nullptr, 0, false, &identity));
+    if (STATUS != 0) return STATUS;
+    if (!wki_vfs_version_response_valid(response, QUERY, length)) return -EPROTO;
+    output = {response.object, response.content, response.metadata, response.directory};
+    return 0;
 }
 
 auto make_secure_vfs_intent(const RemoteFileContext& context, rdma_protocol::Opcode opcode, int64_t offset, uint32_t length)
@@ -5112,6 +5221,74 @@ auto secure_vfs_message_read(RemoteFileContext& context, const WkiChannelIdentit
     return {reply.status, reply.bytes, static_cast<WkiSecureRdmaOutcome>(reply.outcome)};
 }
 
+auto next_owner_mutation_id() -> uint64_t {
+    static ker::vfs::coherency::Counter operations;
+    return operations.take();
+}
+
+auto make_owner_io_request(const RemoteFileContext& context, uint64_t query, int64_t offset, uint32_t length) -> VfsOwnerIoRequest {
+    return {.owner = {.fd = context.remote_fd,
+                      .open_token = context.ordinary_open_token,
+                      .binding_id = context.ordinary_open_binding_id,
+                      .owner_boot_epoch = context.ordinary_owner_boot_epoch,
+                      .query_id = query},
+            .offset = offset,
+            .data_len = length};
+}
+
+auto owner_message_read(RemoteFileContext& context, const WkiChannelIdentity& identity, int64_t offset, uint32_t requested,
+                        uint8_t* destination, uint16_t& bytes) -> int {
+    static ker::vfs::coherency::Counter queries;
+    uint64_t const QUERY = queries.take();
+    if (QUERY == 0) return -EOVERFLOW;
+    auto const REQUEST = make_owner_io_request(context, QUERY, offset, requested);
+    if (!wki_vfs_owner_io_request_valid(REQUEST, sizeof(REQUEST), false)) return -EINVAL;
+    std::array<uint8_t, sizeof(VfsOwnerReadResponse) + WKI_VFS_OWNER_READ_MAX> candidate{};
+    uint16_t length = 0;
+    int const STATUS = normalize_proxy_status_for_errno(vfs_proxy_send_and_wait(
+        context.proxy, OP_VFS_READ_OWNER, reinterpret_cast<const uint8_t*>(&REQUEST), sizeof(REQUEST), candidate.data(), candidate.size(),
+        &length, VFS_PROXY_OP_TIMEOUT_US, nullptr, nullptr, 0, false, &identity));
+    if (STATUS != 0) return STATUS;
+    VfsOwnerReadResponse response{};
+    if (length < sizeof(response)) return -EPROTO;
+    std::memcpy(&response, candidate.data(), sizeof(response));
+    if (!wki_vfs_owner_read_response_valid(response, QUERY, requested, length)) return -EPROTO;
+    std::memcpy(destination, candidate.data() + sizeof(response), response.bytes);
+    bytes = static_cast<uint16_t>(response.bytes);
+    return 0;
+}
+
+auto owner_message_write(RemoteFileContext& context, const WkiChannelIdentity& identity, int64_t offset, std::span<const uint8_t> input)
+    -> WkiSecureRdmaResult {
+    uint64_t const OPERATION = next_owner_mutation_id();
+    if (OPERATION == 0) return {-EOVERFLOW};
+    auto const REQUEST = make_owner_io_request(context, OPERATION, offset, static_cast<uint32_t>(input.size()));
+    if (!wki_vfs_owner_io_request_valid(REQUEST, sizeof(REQUEST) + input.size(), true)) return {-EINVAL};
+    VfsAppendResponse response{};
+    uint16_t length = 0;
+    int const STATUS = normalize_proxy_status_for_errno(vfs_proxy_send_and_wait(
+        context.proxy, OP_VFS_WRITE_COMMITTED, reinterpret_cast<const uint8_t*>(&REQUEST), sizeof(REQUEST), &response, sizeof(response),
+        &length, VFS_PROXY_OP_TIMEOUT_US, nullptr, input.data(), input.size(), false, &identity));
+    if (STATUS != 0 || !wki_vfs_owner_write_response_valid(response, OPERATION, offset, input.size(), length))
+        return {STATUS < 0 ? STATUS : -EPROTO, 0, WkiSecureRdmaOutcome::UNCERTAIN};
+    return {response.status, response.bytes, WkiSecureRdmaOutcome::EXACT};
+}
+
+auto legacy_message_write(RemoteFileContext& context, const WkiChannelIdentity* identity, int64_t offset, std::span<const uint8_t> input)
+    -> WkiSecureRdmaResult {
+    std::array<uint8_t, 12> prefix{};
+    std::memcpy(prefix.data(), &context.remote_fd, sizeof(context.remote_fd));
+    std::memcpy(prefix.data() + 4, &offset, sizeof(offset));
+    uint32_t written = 0;
+    uint16_t length = 0;
+    int const STATUS = normalize_proxy_status_for_errno(vfs_proxy_send_and_wait(context.proxy, OP_VFS_WRITE, prefix.data(), prefix.size(),
+                                                                                &written, sizeof(written), &length, VFS_PROXY_OP_TIMEOUT_US,
+                                                                                nullptr, input.data(), input.size(), false, identity));
+    if (STATUS != 0 || length != sizeof(written) || written > input.size())
+        return {STATUS < 0 ? STATUS : -EPROTO, 0, WkiSecureRdmaOutcome::UNCERTAIN};
+    return {0, written, WkiSecureRdmaOutcome::EXACT};
+}
+
 // The caller holds ctx->io_lock so storage promotion cannot invalidate src
 // while an RDMA or message flush is sleeping on the remote operation.
 auto flush_write_behind(RemoteFileContext* ctx) -> int {
@@ -5185,6 +5362,7 @@ auto flush_write_behind(RemoteFileContext* ctx) -> int {
                                         VFS_PROXY_OP_TIMEOUT_US, nullptr, src, chunk, false, required_identity));
             if (STATUS != 0) {
                 keep_pending_tail(src, remaining, cur_offset);
+                ctx->secure_write_error = STATUS;
                 return STATUS;
             }
         }
@@ -5323,7 +5501,7 @@ auto close_ordinary_file(ker::vfs::File* file) -> int {
     if (context->proxy == nullptr || !context->proxy->active) return -EIO;
     int const FLUSH_STATUS = flush_write_behind(context);
     s_vfs_lock.lock();
-    invalidate_dir_cache(context->proxy, context->remote_fd);
+
     s_vfs_lock.unlock();
     int close_status = 0;
     if (remote_vfs_close_needs_completion(file->open_flags)) close_status = cancel_remote_ordinary_open(context->ordinary_cancel_slot);
@@ -5437,7 +5615,7 @@ auto close_immutable_pin(ker::vfs::File* file) -> int {
         return -EIO;
     }
     s_vfs_lock.lock();
-    invalidate_dir_cache(proxy, context->remote_fd);
+
     s_vfs_lock.unlock();
     // Immutable pins have no pending writes. Keep the acknowledged cancellation
     // and its errno, with neither a registry nor per-file I/O mutex held.
@@ -5478,7 +5656,7 @@ auto remote_vfs_close(ker::vfs::File* f) -> int {
 
         // D7: Invalidate directory cache for this file
         s_vfs_lock.lock();
-        invalidate_dir_cache(ctx->proxy, ctx->remote_fd);
+
         s_vfs_lock.unlock();
 
         int32_t const REMOTE_FD = ctx->remote_fd;
@@ -5547,30 +5725,23 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
     auto cur_offset = static_cast<int64_t>(offset);
     ssize_t total_read = 0;
     bool const POSITIONAL_READ = f->positional_read_depth.load(std::memory_order_acquire) != 0;
-    bool const ALLOW_READ_CACHES = (f->open_flags & ker::vfs::O_NO_CACHE) == 0;
-
-    if (ALLOW_READ_CACHES && ctx->open_prefetch_buf != nullptr && ctx->open_prefetch_len > 0 && cur_offset >= ctx->open_prefetch_offset) {
-        int64_t const PREFETCH_END = ctx->open_prefetch_offset + static_cast<int64_t>(ctx->open_prefetch_len);
-        if (cur_offset < PREFETCH_END) {
-            auto off_in_buf = static_cast<uint32_t>(cur_offset - ctx->open_prefetch_offset);
-            auto available = static_cast<uint32_t>(PREFETCH_END - cur_offset);
-            auto to_copy = std::min(remaining, available);
-
-            memcpy(dest, ctx->open_prefetch_buf + off_in_buf, to_copy);
-            dest += to_copy;
-            cur_offset += static_cast<int64_t>(to_copy);
-            remaining -= to_copy;
-            total_read += static_cast<ssize_t>(to_copy);
-
-            if (remaining == 0) {
-                return total_read;
-            }
-
-            ker::vfs::Stat cached_stat = {};
-            if (remote_vfs_try_copy_cached_stat(ctx, &cached_stat) && cached_stat.st_size >= 0 && cur_offset >= cached_stat.st_size) {
-                return total_read;
-            }
-        }
+    // Ordinary OPEN prefetch was not bracketed by owner snapshots. It cannot
+    // gain authority from a later query, even if its size/stat still matches.
+    clear_remote_file_open_prefetch(ctx);
+    ctx->bulk_cached_offset = -1;
+    ctx->bulk_cached_len = 0;
+    ker::vfs::coherency::Stamp owner_before{};
+    WkiChannelIdentity owner_identity{};
+    int const FEATURES = query_remote_owner_features(*ctx, owner_identity);
+    if (FEATURES != 0 && FEATURES != -ENOTSUP && FEATURES != -EOPNOTSUPP && FEATURES != -ENOSYS) return FEATURES;
+    bool const OWNER_IO = FEATURES == 0 && (ctx->owner_features & WKI_VFS_FEATURE_COMMITTED_IO) != 0;
+    bool const ALLOW_READ_CACHES =
+        OWNER_IO && (f->open_flags & ker::vfs::O_NO_CACHE) == 0 && query_remote_owner_version(*ctx, owner_before) == 0;
+    if (ctx->read_cache != nullptr &&
+        (!ALLOW_READ_CACHES || !ctx->read_cache->validation.matches(owner_before, ker::vfs::coherency::Domain::CONTENT))) {
+        ctx->read_cache->cached_len = 0;
+        ctx->read_cache->cached_offset = -1;
+        ctx->read_cache->validation.invalidate();
     }
 
     WkiChannelIdentity secure_identity{};
@@ -5624,7 +5795,7 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
     const bool BULK_PUSH_CAPABLE = !BULK_PULL_CAPABLE && transport_supports_vfs_read_push_rdma(ctx->proxy->rdma_transport) &&
                                    BULK_READ_ENABLED && ctx->proxy->bulk_rdma_capable && ctx->proxy->rdma_transport != nullptr &&
                                    ctx->proxy->rdma_bulk_rkey != 0 && ctx->proxy->rdma_bulk_buf != nullptr;
-    if (BULK_PULL_CAPABLE || BULK_ROCE_PUSH_CAPABLE || BULK_PUSH_CAPABLE) {
+    if (!OWNER_IO && (BULK_PULL_CAPABLE || BULK_ROCE_PUSH_CAPABLE || BULK_PUSH_CAPABLE)) {
         SharedIoSlotGuard const SHARED_IO_GUARD(ctx->proxy, wki_now_us());
         if (!SHARED_IO_GUARD.acquired()) {
             skip_read_rdma_this_call = true;
@@ -5636,7 +5807,9 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
                                    ctx->proxy->assigned_channel, ctx->remote_fd, remaining);
             }
 #endif
-            bool const USE_BULK_PREFETCH_CACHE = ALLOW_READ_CACHES;
+            // The shared bulk window has no pre/post version authority. Keep
+            // bulk transfers as fresh exact-offset reads, without retaining it.
+            bool const USE_BULK_PREFETCH_CACHE = false;
 
             // -- (b) Prefetch path: try to satisfy from the existing bulk cache --
             if (USE_BULK_PREFETCH_CACHE && ctx->proxy->bulk_owner_fd == ctx->remote_fd && ctx->bulk_cached_len > 0 &&
@@ -5826,7 +5999,8 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
     // RDMA path: 64 KB per round-trip vs ~1400 B per message.
     // Pull mode (RoCE): server stages data; client rdma_reads from server staging buf.
     // Push mode (ivshmem): server rdma_writes to client's bounce buf; client reads locally.
-    const bool RDMA_READ_ENABLED = !skip_read_rdma_this_call && !ctx->proxy->rdma_read_disabled.load(std::memory_order_acquire) &&
+    const bool RDMA_READ_ENABLED = !OWNER_IO && !skip_read_rdma_this_call &&
+                                   !ctx->proxy->rdma_read_disabled.load(std::memory_order_acquire) &&
                                    remote_vfs_rdma_retry_ready(ctx->proxy->rdma_read_retry_after_us, wki_now_us());
     const bool RDMA_ROCE_PUSH_CAPABLE = RDMA_READ_ENABLED && transport_is_roce(ctx->proxy->rdma_transport) && ctx->proxy->rdma_capable &&
                                         ctx->proxy->rdma_transport != nullptr && ctx->proxy->rdma_read_rkey != 0 &&
@@ -5975,7 +6149,7 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
         }
         bool const USING_CACHE = SHOULD_READ_AHEAD && ctx->read_cache != nullptr;
         auto fetch_size = USING_CACHE ? static_cast<uint32_t>(VFS_CACHE_SIZE) : std::min(remaining, VFS_DIRECT_READ_STACK_SIZE);
-        fetch_size = std::min(fetch_size, max_resp_data);
+        fetch_size = std::min(fetch_size, OWNER_IO ? WKI_VFS_OWNER_READ_MAX : max_resp_data);
 
         uint8_t* fetch_dest = direct_read_buf.data();
         if (USING_CACHE) {
@@ -5991,8 +6165,10 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
         memcpy(req_data.data() + 8, &cur_offset, sizeof(int64_t));
 
         uint16_t resp_len = 0;
-        int const STATUS = vfs_proxy_read_with_retry(ctx->proxy, OP_VFS_READ, req_data.data(), 16, fetch_dest, static_cast<uint16_t>(chunk),
-                                                     &resp_len, nullptr, nullptr, required_identity);
+        int const STATUS = OWNER_IO
+                               ? owner_message_read(*ctx, owner_identity, cur_offset, chunk, fetch_dest, resp_len)
+                               : vfs_proxy_read_with_retry(ctx->proxy, OP_VFS_READ, req_data.data(), 16, fetch_dest,
+                                                           static_cast<uint16_t>(chunk), &resp_len, nullptr, nullptr, required_identity);
         if (STATUS != 0) {
             return (total_read > 0) ? total_read : STATUS;
         }
@@ -6012,7 +6188,11 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
         if (USING_CACHE) {
             // Fill read-ahead cache and copy requested portion to caller
             ctx->read_cache->cached_offset = cur_offset;
-            ctx->read_cache->cached_len = BYTES_READ;
+            ker::vfs::coherency::Stamp owner_after{};
+            bool const VALIDATED = query_remote_owner_version(*ctx, owner_after) == 0 &&
+                                   ctx->read_cache->validation.publish(owner_before, owner_after, ker::vfs::coherency::Domain::CONTENT);
+            ctx->read_cache->cached_len = VALIDATED ? BYTES_READ : 0;
+            if (!VALIDATED) ctx->read_cache->validation.invalidate();
 
             auto to_copy = static_cast<uint16_t>(std::min(static_cast<uint32_t>(BYTES_READ), remaining));
             memcpy(dest, ctx->read_cache->data.data(), to_copy);
@@ -6039,106 +6219,58 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
 
 auto remote_vfs_write_impl(ker::vfs::File* f, const void* buf, size_t count, size_t offset) -> ssize_t {
     if (f != nullptr && (static_cast<unsigned>(f->open_flags) & 3U) == ker::vfs::FILE_ACCESS_SEARCH_ONLY) return -EBADF;
-    if (f == nullptr || f->private_data == nullptr || buf == nullptr) {
-        return -EINVAL;
-    }
-    auto* ctx = static_cast<RemoteFileContext*>(f->private_data);
-    if (ctx->proxy == nullptr || !ctx->proxy->active) {
-        return -EIO;
-    }
-    ker::mod::sys::MutexGuard io_guard(ctx->io_lock);
-    consume_remote_file_cache_invalidation(ctx);
-    if (ctx->secure_write_error != 0) return ctx->secure_write_error;
+    if (f == nullptr || f->private_data == nullptr || buf == nullptr) return -EINVAL;
+    auto& context = *static_cast<RemoteFileContext*>(f->private_data);
+    ker::mod::sys::MutexGuard io_guard(context.io_lock);
+    consume_remote_file_cache_invalidation(&context);
+    if (context.secure_write_error != 0) return context.secure_write_error;
+    WkiChannelIdentity identity{};
+    int const AUTHORITY = capture_secure_vfs_client(context, identity);
+    if (AUTHORITY != 0 && AUTHORITY != -ENOTSUP) return AUTHORITY;
+    auto const* required_identity = AUTHORITY == 0 ? &identity : nullptr;
+    int const FEATURES = required_identity == nullptr ? -ENOTSUP : query_remote_owner_features(context, identity);
+    if (FEATURES != 0 && FEATURES != -ENOTSUP && FEATURES != -EOPNOTSUPP && FEATURES != -ENOSYS) return FEATURES;
+    bool const OWNER_IO = FEATURES == 0 && (context.owner_features & WKI_VFS_FEATURE_COMMITTED_IO) != 0;
+    int const FLUSH = flush_write_behind(&context);
+    if (FLUSH != 0) return FLUSH;
+    invalidate_remote_file_open_caches(&context);
 
-    remote_vfs_invalidate_cached_stat(ctx);
-
-    // D6: Invalidate read-ahead cache on write (stale data)
-    if (ctx->read_cache != nullptr) {
-        ctx->read_cache->cached_len = 0;
-        ctx->read_cache->cached_offset = -1;
-    }
-
-    // Invalidate bulk prefetch cache on write
-    clear_remote_file_open_prefetch(ctx);
-    ctx->bulk_cached_len = 0;
-    ctx->bulk_cached_offset = -1;
-
-    const auto* src = static_cast<const uint8_t*>(buf);
-    auto remaining = static_cast<uint32_t>(count);
-    auto cur_offset = static_cast<int64_t>(offset);
-    ssize_t total_written = 0;
-    bool allow_write_behind_growth = true;
-
-    // D6: Try to buffer sequential writes
-    while (remaining > 0) {
-        // Lazily allocate write-behind buffer
-        if (ctx->write_buf == nullptr) {
-            ctx->write_buf = new (std::nothrow) WriteBehindBuffer();  // NOLINT(cppcoreguidelines-owning-memory)
-            if (ctx->write_buf == nullptr) {
-                return (total_written > 0) ? total_written : -ENOMEM;
+    auto const* source = static_cast<const uint8_t*>(buf);
+    size_t remaining = count;
+    int64_t current_offset = static_cast<int64_t>(offset);
+    ssize_t total = 0;
+    constexpr uint32_t LEGACY_MESSAGE_MAX = WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload) - 12;
+    while (remaining != 0) {
+        uint32_t chunk = static_cast<uint32_t>(std::min(remaining, static_cast<size_t>(VFS_RDMA_WRITE_SIZE)));
+        auto result = required_identity == nullptr ? WkiSecureRdmaResult{-ENOTSUP}
+                                                   : secure_vfs_client_write(context, identity, current_offset, {source, chunk});
+        if (secure_vfs_message_fallback(result)) {
+            if (context.secure_io_negotiated) {
+                chunk = static_cast<uint32_t>(std::min(remaining, static_cast<size_t>(VFS_SECURE_MESSAGE_WRITE_MAX)));
+                result = secure_vfs_message_write(context, identity, current_offset, {source, chunk});
+            } else if (OWNER_IO) {
+                chunk = static_cast<uint32_t>(std::min(remaining, static_cast<size_t>(WKI_VFS_OWNER_WRITE_MAX)));
+                result = owner_message_write(context, identity, current_offset, {source, chunk});
+            } else {
+                chunk = static_cast<uint32_t>(std::min(remaining, static_cast<size_t>(LEGACY_MESSAGE_MAX)));
+                result = legacy_message_write(context, required_identity, current_offset, {source, chunk});
             }
         }
-
-        auto* wb = ctx->write_buf;
-
-        // Check if this write is sequential and fits in the buffer
-        bool const IS_SEQUENTIAL = (wb->pending_len == 0) || (wb->pending_offset + wb->pending_len == cur_offset);
-        if (!IS_SEQUENTIAL) {
-            int const FLUSH_STATUS = flush_write_behind(ctx);
-            if (FLUSH_STATUS != 0) {
-                return (total_written > 0) ? total_written : FLUSH_STATUS;
-            }
-            continue;
+        if (result.outcome != WkiSecureRdmaOutcome::EXACT || result.status != 0 || result.bytes > chunk) {
+            int const ERROR = result.status < 0 ? result.status : -EPROTO;
+            if (result.outcome != WkiSecureRdmaOutcome::EXACT && result.outcome != WkiSecureRdmaOutcome::NO_EFFECT)
+                context.secure_write_error = ERROR;
+            if (result.bytes > chunk || result.status > 0) context.secure_write_error = -EPROTO;
+            return total > 0 ? total : ERROR;
         }
-
-        uint64_t const REQUIRED_CAPACITY = static_cast<uint64_t>(wb->pending_len) + remaining;
-        if (allow_write_behind_growth && REQUIRED_CAPACITY > wb->capacity && wb->capacity < VFS_WRITE_BEHIND_MAX_CAPACITY &&
-            !try_reserve_write_behind(wb, REQUIRED_CAPACITY)) {
-            // Keep using the existing allocation after one failed promotion;
-            // repeated reclaim attempts in the same write would only add churn.
-            allow_write_behind_growth = false;
-        }
-
-        if (wb->data == nullptr || wb->capacity == 0) {
-            return (total_written > 0) ? total_written : -ENOMEM;
-        }
-        if (wb->capacity > VFS_WRITE_BEHIND_MAX_CAPACITY || wb->pending_len > wb->capacity) {
-            return (total_written > 0) ? total_written : -EIO;
-        }
-
-        if (wb->pending_len == wb->capacity) {
-            int const FLUSH_STATUS = flush_write_behind(ctx);
-            if (FLUSH_STATUS != 0) {
-                return (total_written > 0) ? total_written : FLUSH_STATUS;
-            }
-            continue;
-        }
-
-        uint32_t const SPACE = wb->capacity - wb->pending_len;
-        uint32_t const TO_BUFFER = std::min(SPACE, remaining);
-        memcpy(wb->data.get() + wb->pending_len, src, TO_BUFFER);
-        if (wb->pending_len == 0) {
-            wb->pending_offset = cur_offset;
-        }
-        wb->pending_len += TO_BUFFER;
-
-        src += TO_BUFFER;
-        cur_offset += TO_BUFFER;
-        remaining -= TO_BUFFER;
-        total_written += TO_BUFFER;
-
-        if (wb->pending_len >= wb->capacity) {
-            int const FLUSH_STATUS = flush_write_behind(ctx);
-            if (FLUSH_STATUS != 0) {
-                // The bytes are already owned by write-behind, including any
-                // tail retained after a partial flush. Report them as accepted
-                // so a retry cannot overlap data that remains queued.
-                return total_written;
-            }
-        }
+        if (result.bytes == 0) break;
+        source += result.bytes;
+        current_offset += result.bytes;
+        remaining -= result.bytes;
+        total += result.bytes;
+        if (result.bytes < chunk) break;
     }
-
-    return total_written;
+    return total;
 }
 
 auto remote_vfs_write(ker::vfs::File* f, const void* buf, size_t count, size_t offset) -> ssize_t {
@@ -6158,8 +6290,7 @@ auto remote_vfs_write(ker::vfs::File* f, const void* buf, size_t count, size_t o
     }
     ssize_t const RET = remote_vfs_write_impl(f, buf, count, offset);
     if (RET > 0) {
-        // Includes data accepted into write-behind, whose exact-offset tail
-        // remains owned even if a later flush fails.
+        // Only a known native committed prefix is counted as written.
         growth.committed(offset + static_cast<uint64_t>(RET));
     }
     return RET;
@@ -6197,21 +6328,6 @@ auto remote_vfs_lseek(ker::vfs::File* f, off_t offset, int whence) -> off_t {
                 return FLUSH_STATUS;
             }
 
-            ker::vfs::Stat cached_stat{};
-            if ((f->open_flags & ker::vfs::O_NO_CACHE) == 0 && remote_vfs_try_copy_cached_stat(ctx, &cached_stat)) {
-                auto const BASE = static_cast<int64_t>(cached_stat.st_size);
-                auto const OFF = static_cast<int64_t>(offset);
-                if ((OFF > 0 && BASE > INT64_MAX - OFF) || (OFF < 0 && BASE < INT64_MIN - OFF)) {
-                    return -EINVAL;
-                }
-                int64_t const NEW_POS = BASE + OFF;
-                if (NEW_POS < 0) {
-                    return -EINVAL;
-                }
-                f->pos = static_cast<off_t>(NEW_POS);
-                break;
-            }
-
             // Request: {remote_fd:i32, offset:i64} = 12 bytes
             std::array<uint8_t, 12> req{};
             memcpy(req.data(), &ctx->remote_fd, sizeof(int32_t));
@@ -6223,7 +6339,13 @@ auto remote_vfs_lseek(ker::vfs::File* f, off_t offset, int whence) -> off_t {
 #endif
             // Response: {pos:i64} = 8 bytes
             int64_t new_pos = -1;
-            int const RET = vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_SEEK_END, req.data(), 12, &new_pos, sizeof(new_pos));
+            WkiChannelIdentity identity{};
+            int const AUTHORITY = capture_secure_vfs_client(*ctx, identity);
+            if (AUTHORITY != 0 && AUTHORITY != -ENOTSUP) return AUTHORITY;
+            uint16_t reply_length = 0;
+            int const RET =
+                vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_SEEK_END, req.data(), 12, &new_pos, sizeof(new_pos), &reply_length,
+                                        VFS_PROXY_OP_TIMEOUT_US, nullptr, nullptr, 0, false, AUTHORITY == 0 ? &identity : nullptr);
 #ifdef WKI_DEBUG
             ker::mod::dbg::log("remote_vfs_lseek: SEEK_END ret=%d new_pos=%ld", ret, (long)new_pos);
 #endif
@@ -6233,6 +6355,7 @@ auto remote_vfs_lseek(ker::vfs::File* f, off_t offset, int whence) -> off_t {
                 return RET;
             }
 
+            if (RET != 0 || reply_length != sizeof(new_pos) || new_pos < 0) return -EPROTO;
             f->pos = new_pos;
             break;
         }
@@ -6247,109 +6370,59 @@ auto remote_vfs_isatty(ker::vfs::File* /*f*/) -> bool { return false; }
 
 auto remote_vfs_readdir(ker::vfs::File* f, ker::vfs::DirEntry* entry, size_t index) -> int {
     if (f != nullptr && (static_cast<unsigned>(f->open_flags) & 3U) == ker::vfs::FILE_ACCESS_SEARCH_ONLY) return -EBADF;
-    if (f == nullptr || f->private_data == nullptr || entry == nullptr) {
-        return -EINVAL;
-    }
+    if (f == nullptr || f->private_data == nullptr || entry == nullptr) return -EINVAL;
+    if (index > UINT32_MAX) return -EOVERFLOW;
     auto* ctx = static_cast<RemoteFileContext*>(f->private_data);
-    if (ctx->proxy == nullptr || !ctx->proxy->active) {
-        return -EIO;
-    }
+    ker::mod::sys::MutexGuard io_guard(ctx->io_lock);
+    consume_remote_file_cache_invalidation(ctx);
+    if (ctx->proxy == nullptr || !ctx->proxy->active) return -EIO;
+    WkiChannelIdentity identity{};
+    int const AUTHORITY = capture_secure_vfs_client(*ctx, identity);
+    if (AUTHORITY != 0 && AUTHORITY != -ENOTSUP) return AUTHORITY;
+    auto const* required_identity = AUTHORITY == 0 ? &identity : nullptr;
+    ker::vfs::coherency::Stamp before{};
+    bool const VERSIONED = query_remote_owner_version(*ctx, before) == 0;
 
-    // D7: Check directory cache first (under lock)
-    s_vfs_lock.lock();
-    DirCacheEntry* cache = find_dir_cache(ctx->proxy, ctx->remote_fd);
-
-    // Invalidate stale cache
-    if (cache != nullptr && (wki_now_us() - cache->cache_time_us) > DirCacheEntry::STALE_US) {
-        invalidate_dir_cache(ctx->proxy, ctx->remote_fd);
-        cache = nullptr;
-    }
-
-    // Cache hit: entry already fetched
-    if (cache != nullptr && try_get_visible_cached_dirent(cache, ctx, index, entry)) {
-        s_vfs_lock.unlock();
-        return 0;
-    }
-
-    // Cache hit but we already know directory is exhausted
-    if (cache != nullptr && cache->complete) {
-        s_vfs_lock.unlock();
-        return -1;
-    }
-
-    // Create cache on first access
-    if (cache == nullptr) {
-        g_dir_cache.push_back({});
-        cache = &g_dir_cache.back();
-        cache->proxy = ctx->proxy;
-        cache->remote_fd = ctx->remote_fd;
-        cache->cache_time_us = wki_now_us();
-        cache->complete = false;
-    }
-    s_vfs_lock.unlock();
-
-    // Fetch entries from server in batches.
-    // One OP_VFS_READDIR_BATCH request returns up to VFS_READDIR_BATCH_MAX_ENTRIES entries,
-    // filling the full jumbo frame - typically the entire directory in one round-trip.
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init): RX fills every byte read below before publishing the response length.
-    std::array<uint8_t, VFS_READDIR_BATCH_DATA_CAPACITY> batch_buf __attribute__((uninitialized));
-
+    // One fixed fresh batch: no unbounded global deque, timestamp or cached EOF.
+    // Filtering changes visible indices, so filtered directories scan from zero.
+    std::array<uint8_t, VFS_READDIR_BATCH_DATA_CAPACITY> batch_buf{};
+    uint32_t fetch_index = ctx->hide_recursive_wki_entries ? 0 : static_cast<uint32_t>(index);
+    size_t visible_index = ctx->hide_recursive_wki_entries ? 0 : index;
     while (true) {
-        s_vfs_lock.lock();
-        cache = find_dir_cache(ctx->proxy, ctx->remote_fd);
-        if (cache == nullptr) {
-            s_vfs_lock.unlock();
-            return -EIO;
-        }
-        if (try_get_visible_cached_dirent(cache, ctx, index, entry)) {
-            s_vfs_lock.unlock();
-            return 0;
-        }
-        if (cache->complete) {
-            s_vfs_lock.unlock();
-            return -1;
-        }
-        auto fetch_idx = static_cast<uint32_t>(cache->entries.size());
-        s_vfs_lock.unlock();
-
-        // Request: {fd:i32, start_idx:u32, max_count:u32} = 12 bytes
-        std::array<uint8_t, 12> req_data{};
-        memcpy(req_data.data(), &ctx->remote_fd, sizeof(int32_t));
-        memcpy(req_data.data() + 4, &fetch_idx, sizeof(uint32_t));
-        memcpy(req_data.data() + 8, &VFS_READDIR_BATCH_MAX_ENTRIES, sizeof(uint32_t));
-
-        uint16_t resp_len = 0;
-        int const STATUS = vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_READDIR_BATCH, req_data.data(), 12, batch_buf.data(),
-                                                   static_cast<uint16_t>(batch_buf.size()), &resp_len);
-        if (STATUS != 0 || resp_len < sizeof(uint32_t)) {
-            s_vfs_lock.lock();
-            cache = find_dir_cache(ctx->proxy, ctx->remote_fd);
-            if (cache != nullptr) {
-                cache->complete = true;
-            }
-            s_vfs_lock.unlock();
-            return (STATUS != 0) ? STATUS : -EIO;
-        }
-
+        std::array<uint8_t, 12> request{};
+        std::memcpy(request.data(), &ctx->remote_fd, sizeof(ctx->remote_fd));
+        std::memcpy(request.data() + 4, &fetch_index, sizeof(fetch_index));
+        std::memcpy(request.data() + 8, &VFS_READDIR_BATCH_MAX_ENTRIES, sizeof(uint32_t));
+        uint16_t length = 0;
+        int const STATUS =
+            vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_READDIR_BATCH, request.data(), request.size(), batch_buf.data(), batch_buf.size(),
+                                    &length, VFS_PROXY_OP_TIMEOUT_US, nullptr, nullptr, 0, false, required_identity);
+        if (STATUS != 0) return STATUS;
         uint32_t count = 0;
-        memcpy(&count, batch_buf.data(), sizeof(uint32_t));
-        if (!vfs_readdir_batch_payload_is_valid(resp_len, count)) {
-            return -EIO;
+        if (length < sizeof(count)) return -EPROTO;
+        std::memcpy(&count, batch_buf.data(), sizeof(count));
+        if (!vfs_readdir_batch_payload_is_valid(length, count) || length != sizeof(count) + count * sizeof(ker::vfs::DirEntry))
+            return -EPROTO;
+        if (VERSIONED) {
+            ker::vfs::coherency::Stamp after{};
+            int const VALIDATION = query_remote_owner_version(*ctx, after);
+            if (VALIDATION != 0) return VALIDATION;
+            if (!ker::vfs::coherency::cache_matches(before, after, ker::vfs::coherency::Domain::DIRECTORY)) return -EAGAIN;
         }
-
-        s_vfs_lock.lock();
-        cache = find_dir_cache(ctx->proxy, ctx->remote_fd);
-        if (cache != nullptr) {
-            for (uint32_t i = 0; i < count; i++) {
-                ker::vfs::DirEntry fetched = {};
-                memcpy(&fetched, batch_buf.data() + sizeof(uint32_t) + (i * sizeof(ker::vfs::DirEntry)), sizeof(ker::vfs::DirEntry));
-                cache->entries.push_back(fetched);
+        for (uint32_t i = 0; i < count; ++i) {
+            ker::vfs::DirEntry candidate{};
+            std::memcpy(&candidate, batch_buf.data() + sizeof(count) + i * sizeof(candidate), sizeof(candidate));
+            if (std::memchr(candidate.d_name.data(), '\0', candidate.d_name.size()) == nullptr) return -EPROTO;
+            if (should_hide_recursive_wki_entry(ctx, candidate)) continue;
+            if (visible_index == index) {
+                *entry = candidate;
+                return 0;
             }
-            if (count < VFS_READDIR_BATCH_MAX_ENTRIES) {
-                cache->complete = true;  // Server returned fewer than asked -> end of directory
-            }
+            ++visible_index;
         }
-        s_vfs_lock.unlock();
+        if (count < VFS_READDIR_BATCH_MAX_ENTRIES) return -1;
+        if (fetch_index > UINT32_MAX - count) return -EOVERFLOW;
+        fetch_index += count;
     }
 }
 
@@ -8031,6 +8104,371 @@ auto wki_remote_vfs_selftest_completed_read_reply_retry() -> bool {
         if (result != WKI_ERR_NO_ROUTE || sends != 1 || waits != (mode < 3 ? 1U : 0U) || !exact) return false;
     }
     return response == RESPONSE;
+}
+
+auto wki_remote_vfs_selftest_owner_version_admission() -> bool {
+    namespace vfs = ker::vfs;
+    struct State {
+        unsigned closes = 0;
+        bool unlocked = true;
+    } state;
+    vfs::FileOperations operations{};
+    operations.vfs_close = [](vfs::File* file) -> int {
+        auto& state = *static_cast<State*>(file->private_data);
+        ++state.closes;
+        if (!s_vfs_lock.try_lock())
+            state.unlocked = false;
+        else
+            s_vfs_lock.unlock();
+        return 0;
+    };
+    WkiChannel channel{};
+    WkiChannelIdentity const IDENTITY{&channel, 0x7FFC, 74, 61};
+    DevServerBinding binding;
+    binding.resource_type = ResourceType::VFS;
+    binding.resource_id = 71;
+    binding.resource_incarnation = {37, 41};
+    binding.consumer_node = IDENTITY.peer_node_id;
+    binding.consumer_boot_epoch = 43;
+    binding.channel_identity = IDENTITY;
+    binding.vfs_export_publication_revision = 47;
+    VfsOpenLifetimeRequest binding_response{};
+    if (query_ordinary_open_binding(binding, IDENTITY, 53, binding_response) != 0) return false;
+    auto release = [](vfs::File* file) { vfs::vfs_put_file(file); };
+    std::unique_ptr<vfs::File, decltype(release)> file(new vfs::File, release);
+    file->fs_type = vfs::FSType::SOCKET;
+    file->fops = &operations;
+    file->private_data = &state;
+    file->refcount.store(1);
+    struct Cleanup {
+        WkiChannelIdentity identity;
+        ~Cleanup() { wki_remote_vfs_cleanup_server_fds_for_channel(identity); }
+    } cleanup{IDENTITY};
+    RemoteFdReservation reservation(IDENTITY);
+    int32_t const FD = reservation.result();
+    constexpr uint64_t TOKEN = 59;
+    if (FD < 0 || !reservation.publish(file.get(), 0, 0, 0, TOKEN, binding_response.binding_id)) return false;
+    auto* published = file.release();
+    s_vfs_lock.lock();
+    find_remote_fd(IDENTITY, FD)->last_activity_us = 19;
+    s_vfs_lock.unlock();
+    VfsOwnerFdRequest const REQUEST{.fd = FD,
+                                    .open_token = TOKEN,
+                                    .binding_id = binding_response.binding_id,
+                                    .owner_boot_epoch = binding_response.owner_boot_epoch,
+                                    .query_id = 67};
+    vfs::File sentinel;
+    auto denied = [&](const WkiChannelIdentity& identity, const VfsOwnerFdRequest& request, int expected) {
+        vfs::File* output = &sentinel;
+        int const RESULT = retain_server_owner_file(binding, identity, request, output);
+        s_vfs_lock.lock();
+        auto* row = find_remote_fd(IDENTITY, FD);
+        bool const UNCHANGED = row != nullptr && row->file == published && row->last_activity_us == 19;
+        s_vfs_lock.unlock();
+        return RESULT == expected && output == &sentinel && UNCHANGED && published->refcount.load() == 1 && state.closes == 0;
+    };
+    auto stale = IDENTITY;
+    ++stale.generation;
+    if (!denied(stale, REQUEST, -ENOTCONN)) return false;
+    auto foreign = IDENTITY;
+    ++foreign.peer_node_id;
+    if (!denied(foreign, REQUEST, -ENOTCONN)) return false;
+    WkiChannel successor{};
+    stale = IDENTITY;
+    stale.channel = &successor;
+    if (!denied(stale, REQUEST, -ENOTCONN)) return false;
+    for (unsigned field = 0; field < 5; ++field) {
+        auto wrong = REQUEST;
+        switch (field) {
+            case 0:
+                ++wrong.binding_id;
+                break;
+            case 1:
+                ++wrong.owner_boot_epoch;
+                break;
+            case 2:
+                ++wrong.open_token;
+                break;
+            case 3:
+                ++wrong.fd;
+                break;
+            default:
+                wrong.reserved = 1;
+                break;
+        }
+        int const EXPECTED = field < 2 ? -ENOTCONN : field < 4 ? -EBADF : -EINVAL;
+        if (!denied(IDENTITY, wrong, EXPECTED)) return false;
+    }
+    binding.retiring.store(true);
+    if (!denied(IDENTITY, REQUEST, -ENOTCONN)) return false;
+    binding.retiring.store(false);
+    vfs::File* admitted = nullptr;
+    if (retain_server_owner_file(binding, IDENTITY, REQUEST, admitted) != 0 || admitted != published) return false;
+    std::unique_ptr<vfs::File, decltype(release)> hold(admitted, release);
+    if (admitted->refcount.load() != 2) return false;
+    wki_remote_vfs_cleanup_server_fds_for_channel(IDENTITY);
+    if (state.closes != 0 || admitted->refcount.load() != 1) return false;
+    vfs::File* output = &sentinel;
+    if (retain_server_owner_file(binding, IDENTITY, REQUEST, output) != -EBADF || output != &sentinel) return false;
+    hold.reset();
+    return state.closes == 1 && state.unlocked;
+}
+
+auto wki_remote_vfs_selftest_owner_append() -> bool {
+    namespace vfs = ker::vfs;
+    constexpr const char* PATH = "/tmp/ktest_owner_append26";
+    static_cast<void>(vfs::vfs_unlink(PATH));
+    WkiChannel channel{};
+    WkiChannelIdentity const IDENTITY{&channel, 0x7FF9, 75, 63};
+    struct Cleanup {
+        WkiChannelIdentity identity;
+        const char* path;
+        ~Cleanup() {
+            wki_remote_vfs_cleanup_server_fds_for_channel(identity);
+            static_cast<void>(vfs::vfs_unlink(path));
+        }
+    } cleanup{IDENTITY, PATH};
+    DevServerBinding binding;
+    binding.resource_type = ResourceType::VFS;
+    binding.resource_id = 72;
+    binding.resource_incarnation = {37, 41};
+    binding.consumer_node = IDENTITY.peer_node_id;
+    binding.consumer_boot_epoch = 43;
+    binding.channel_identity = IDENTITY;
+    binding.vfs_export_publication_revision = 47;
+    VfsOpenLifetimeRequest bound{};
+    if (query_ordinary_open_binding(binding, IDENTITY, 53, bound) != 0) return false;
+    auto release = [](vfs::File* file) { vfs::vfs_put_file(file); };
+    std::unique_ptr<vfs::File, decltype(release)> owner(vfs::vfs_open_file(PATH, vfs::O_CREAT | vfs::O_EXCL | 2, 0600), release);
+    if (!owner || owner->fs_type != vfs::FSType::TMPFS) return false;
+    size_t offset = 99;
+    if (vfs::vfs_append_file_native(owner.get(), "L", 1, &offset) != 1 || offset != 0) return false;
+    RemoteFdReservation reservation(IDENTITY);
+    int32_t const FD = reservation.result();
+    constexpr uint64_t TOKEN = 59;
+    if (FD < 0 || !reservation.publish(owner.get(), 0, 0, 0, TOKEN, bound.binding_id)) return false;
+    // A separate fixture pin survives exact remote row retirement.
+    vfs::vfs_retain_file(owner.get());
+    VfsAppendRequest request{
+        .owner = {.fd = FD, .open_token = TOKEN, .binding_id = bound.binding_id, .owner_boot_epoch = bound.owner_boot_epoch, .query_id = 1},
+        .data_len = 2};
+    VfsAppendResponse reply{};
+    auto invoke = [&](const VfsAppendRequest& operation, const char* bytes) {
+        return perform_server_append(binding, IDENTITY, operation, reinterpret_cast<const uint8_t*>(bytes), reply);
+    };
+    if (invoke(request, "RR") != 0 || reply.status != 0 || reply.bytes != 2 || reply.offset != 1) return false;
+    if (invoke(request, "RR") != 0 || reply.bytes != 2 || reply.offset != 1) return false;
+    if (invoke(request, "XX") != -EPROTO) return false;
+    std::unique_ptr<vfs::File, decltype(release)> local(vfs::vfs_open_file(PATH, 2, 0), release);
+    if (!local || vfs::vfs_append_file_native(local.get(), "C", 1, &offset) != 1 || offset != 3) return false;
+    if (invoke(request, "RR") != 0 || reply.offset != 1) return false;
+    request.owner.query_id = 2;
+    request.data_len = 1;
+    if (invoke(request, "Z") != 0 || reply.bytes != 1 || reply.offset != 4) return false;
+    auto old = request;
+    old.owner.query_id = 1;
+    old.data_len = 2;
+    if (invoke(old, "RR") != -ESTALE) return false;
+    auto stale = request;
+    ++stale.owner.open_token;
+    stale.owner.query_id = 3;
+    if (invoke(stale, "X") != -EBADF) return false;
+    request.owner.query_id = 3;
+    request.data_len = 0;
+    if (invoke(request, "") != 0 || reply.bytes != 0 || reply.offset != 5) return false;
+    std::array<char, 5> contents{};
+    if (owner->fops->vfs_read(owner.get(), contents.data(), contents.size(), 0) != 5 ||
+        std::memcmp(contents.data(), "LRRCZ", contents.size()) != 0)
+        return false;
+    wki_remote_vfs_cleanup_server_fds_for_channel(IDENTITY);
+    if (invoke(request, "") != -EBADF) return false;
+    return owner->fops->vfs_read(owner.get(), contents.data(), contents.size(), 0) == 5;
+}
+
+auto wki_remote_vfs_selftest_owner_committed_io() -> bool {
+    namespace vfs = ker::vfs;
+    constexpr const char* PATH = "/tmp/ktest_owner_io26";
+    static_cast<void>(vfs::vfs_unlink(PATH));
+    WkiChannel channel{};
+    WkiChannelIdentity const IDENTITY{&channel, 0x7FF8, 76, 64};
+    struct Cleanup {
+        WkiChannelIdentity identity;
+        ~Cleanup() {
+            wki_remote_vfs_cleanup_server_fds_for_channel(identity);
+            static_cast<void>(ker::vfs::vfs_unlink("/tmp/ktest_owner_io26"));
+        }
+    } cleanup{IDENTITY};
+    DevServerBinding binding;
+    binding.resource_type = ResourceType::VFS;
+    binding.resource_id = 72;
+    binding.resource_incarnation = {37, 41};
+    binding.consumer_node = IDENTITY.peer_node_id;
+    binding.consumer_boot_epoch = 43;
+    binding.channel_identity = IDENTITY;
+    binding.vfs_export_publication_revision = 47;
+    VfsOpenLifetimeRequest bound{};
+    if (query_ordinary_open_binding(binding, IDENTITY, 53, bound) != 0) return false;
+    auto release = [](vfs::File* file) { vfs::vfs_put_file(file); };
+    std::unique_ptr<vfs::File, decltype(release)> owner(vfs::vfs_open_file(PATH, vfs::O_CREAT | vfs::O_EXCL | vfs::O_APPEND | 2, 0600),
+                                                        release);
+    if (!owner || owner->fs_type != vfs::FSType::TMPFS || vfs::vfs_pwrite_file(owner.get(), "abcd", 4, 0) != 4) return false;
+    owner->pos = 17;
+    RemoteFdReservation reservation(IDENTITY);
+    int32_t const FD = reservation.result();
+    constexpr uint64_t TOKEN = 59;
+    if (FD < 0 || !reservation.publish(owner.get(), 0, 0, 0, TOKEN, bound.binding_id)) return false;
+    vfs::vfs_retain_file(owner.get());
+    VfsOwnerIoRequest request{
+        .owner = {.fd = FD, .open_token = TOKEN, .binding_id = bound.binding_id, .owner_boot_epoch = bound.owner_boot_epoch, .query_id = 1},
+        .offset = 1,
+        .data_len = 2};
+    VfsAppendResponse written{};
+    auto write = [&](const VfsOwnerIoRequest& operation) {
+        return perform_server_write(binding, IDENTITY, operation, reinterpret_cast<const uint8_t*>("XY"), written);
+    };
+    if (write(request) != 0 || written.status != 0 || written.bytes != 2 || written.offset != 1 || owner->pos != 17) return false;
+    // A repeated committed write cannot overwrite a newer local mutation.
+    if (vfs::vfs_pwrite_file(owner.get(), "Z", 1, 1) != 1 || write(request) != 0 || written.offset != 1) return false;
+    auto different = request;
+    different.offset = 0;
+    if (write(different) != -EPROTO) return false;
+    VfsAppendRequest append{.owner = request.owner, .data_len = request.data_len};
+    if (perform_server_append(binding, IDENTITY, append, reinterpret_cast<const uint8_t*>("XY"), written) != -EPROTO) return false;
+    std::array<uint8_t, 8> bytes{};
+    VfsOwnerReadResponse read{};
+    auto read_request = request;
+    read_request.owner.query_id = 97;
+    read_request.offset = 0;
+    read_request.data_len = bytes.size();
+    if (perform_server_read(binding, IDENTITY, read_request, bytes.data(), read) != 0 || read.query_id != 97 || read.bytes != 4 ||
+        std::memcmp(bytes.data(), "aZYd", 4) != 0 || owner->pos != 17)
+        return false;
+    auto stale = read_request;
+    ++stale.owner.open_token;
+    auto const SAVED_BYTES = bytes;
+    auto const SAVED_REPLY = read;
+    if (perform_server_read(binding, IDENTITY, stale, bytes.data(), read) != -EBADF || bytes != SAVED_BYTES ||
+        std::memcmp(&read, &SAVED_REPLY, sizeof(read)) != 0)
+        return false;
+    read_request.offset = 4;
+    ++read_request.owner.query_id;
+    if (perform_server_read(binding, IDENTITY, read_request, bytes.data(), read) != 0 || read.bytes != 0 || read.query_id != 98)
+        return false;
+    // A completed native error is a stable outcome, even when mount policy changes.
+    request.owner.query_id = 2;
+    owner->mount_policy.read_only = true;
+    if (write(request) != 0 || written.status != -EROFS || written.bytes != 0 || written.offset != 0) return false;
+    owner->mount_policy.read_only = false;
+    if (write(request) != 0 || written.status != -EROFS) return false;
+    request.owner.query_id = 3;
+    if (write(request) != 0 || written.status != 0 || written.bytes != 2) return false;
+    binding.retiring.store(true);
+    if (write(request) != -ENOTCONN) return false;
+    binding.retiring.store(false);
+    wki_remote_vfs_cleanup_server_fds_for_channel(IDENTITY);
+    if (write(request) != -EBADF || perform_server_read(binding, IDENTITY, read_request, bytes.data(), read) != -EBADF) return false;
+    return vfs::vfs_pread_file(owner.get(), bytes.data(), bytes.size(), 0) == 4 && std::memcmp(bytes.data(), "aXYd", 4) == 0;
+}
+
+auto wki_remote_vfs_selftest_owner_io_outcomes() -> bool {
+    namespace vfs = ker::vfs;
+    struct State {
+        WkiChannelIdentity identity{};
+        unsigned mode = 0;
+        unsigned calls = 0;
+        unsigned closes = 0;
+        bool unlocked = true;
+        bool retained = true;
+    };
+    vfs::FileOperations operations{};
+    operations.vfs_write = [](vfs::File* file, const void*, size_t, size_t) -> ssize_t {
+        auto& state = *static_cast<State*>(file->private_data);
+        if (!s_vfs_lock.try_lock()) {
+            state.unlocked = false;
+            return -EIO;
+        }
+        s_vfs_lock.unlock();
+        ++state.calls;
+        if (state.mode == 3) {
+            wki_remote_vfs_cleanup_server_fds_for_channel(state.identity);
+            state.retained &= state.closes == 0 && file->refcount.load() == 1;
+        }
+        return state.mode == 1 ? -ENOSPC : state.mode == 2 ? 0 : 2;
+    };
+    operations.vfs_read = [](vfs::File* file, void* data, size_t, size_t) -> ssize_t {
+        auto& state = *static_cast<State*>(file->private_data);
+        ++state.calls;
+        wki_remote_vfs_cleanup_server_fds_for_channel(state.identity);
+        state.retained &= state.closes == 0 && file->refcount.load() == 1;
+        std::memcpy(data, "ok", 2);
+        return 2;
+    };
+    operations.vfs_close = [](vfs::File* file) -> int {
+        auto& state = *static_cast<State*>(file->private_data);
+        ++state.closes;
+        if (!s_vfs_lock.try_lock())
+            state.unlocked = false;
+        else
+            s_vfs_lock.unlock();
+        return 0;
+    };
+    for (unsigned mode = 0; mode < 5; ++mode) {
+        WkiChannel channel{};
+        WkiChannelIdentity const IDENTITY{&channel, 0x7FF7, 77, 65};
+        State state{.identity = IDENTITY, .mode = mode};
+        struct Cleanup {
+            WkiChannelIdentity identity;
+            ~Cleanup() { wki_remote_vfs_cleanup_server_fds_for_channel(identity); }
+        } cleanup{IDENTITY};
+        DevServerBinding binding;
+        binding.resource_type = ResourceType::VFS;
+        binding.resource_id = 72;
+        binding.resource_incarnation = {37, 41};
+        binding.consumer_node = IDENTITY.peer_node_id;
+        binding.consumer_boot_epoch = 43;
+        binding.channel_identity = IDENTITY;
+        binding.vfs_export_publication_revision = 47;
+        VfsOpenLifetimeRequest bound{};
+        if (query_ordinary_open_binding(binding, IDENTITY, 53, bound) != 0) return false;
+        auto release = [](vfs::File* file) { vfs::vfs_put_file(file); };
+        std::unique_ptr<vfs::File, decltype(release)> file(new vfs::File, release);
+        file->fs_type = vfs::FSType::SOCKET;
+        file->fops = &operations;
+        file->private_data = &state;
+        file->open_flags = 2;
+        file->pos = 17;
+        file->refcount.store(1);
+        RemoteFdReservation reservation(IDENTITY);
+        int32_t const FD = reservation.result();
+        if (FD < 0 || !reservation.publish(file.get(), 0, 0, 0, 59, bound.binding_id)) return false;
+        file.release();
+        VfsOwnerIoRequest const REQUEST{.owner = {.fd = FD,
+                                                  .open_token = 59,
+                                                  .binding_id = bound.binding_id,
+                                                  .owner_boot_epoch = bound.owner_boot_epoch,
+                                                  .query_id = 1},
+                                        .offset = 3,
+                                        .data_len = 5};
+        if (mode == 4) {
+            std::array<uint8_t, 5> bytes{};
+            VfsOwnerReadResponse read{};
+            if (perform_server_read(binding, IDENTITY, REQUEST, bytes.data(), read) != 0 || read.query_id != 1 || read.bytes != 2 ||
+                std::memcmp(bytes.data(), "ok", 2) != 0 || state.closes != 1)
+                return false;
+        } else {
+            VfsAppendResponse result{};
+            if (perform_server_write(binding, IDENTITY, REQUEST, reinterpret_cast<const uint8_t*>("abcde"), result) != 0 ||
+                result.status != (mode == 1 ? -ENOSPC : 0) || result.bytes != (mode == 1 || mode == 2 ? 0U : 2U) ||
+                result.offset != (mode == 1 ? 0 : 3))
+                return false;
+            auto const SAVED = result;
+            int const REPLAY = perform_server_write(binding, IDENTITY, REQUEST, reinterpret_cast<const uint8_t*>("abcde"), result);
+            if (REPLAY != (mode == 3 ? -EBADF : 0) || std::memcmp(&result, &SAVED, sizeof(result)) != 0) return false;
+            wki_remote_vfs_cleanup_server_fds_for_channel(IDENTITY);
+        }
+        if (state.calls != 1 || state.closes != 1 || !state.unlocked || !state.retained) return false;
+    }
+    return true;
 }
 
 auto wki_remote_vfs_selftest_owner_write_policy() -> bool {
@@ -10760,6 +11198,109 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
     }
 
     switch (effective_op) {
+        case OP_VFS_VERSION: {
+            VfsOwnerFdRequest request{};
+            if (data == nullptr || data_len != sizeof(request)) {
+                reject_request(-EINVAL);
+                break;
+            }
+            std::memcpy(&request, data, sizeof(request));
+            if (!wki_vfs_owner_fd_request_valid(request, data_len)) {
+                reject_request(-EINVAL);
+                break;
+            }
+            if (grant_binding == nullptr || (identity_capabilities & WKI_CAP_RESOURCE_INCARNATION) == 0) {
+                reject_request(-EOPNOTSUPP);
+                break;
+            }
+            ker::vfs::File* file = nullptr;
+            int result = retain_server_owner_file(*grant_binding, channel_identity, request, file);
+            ker::vfs::coherency::Stamp stamp{};
+            if (result == 0) {
+                result = ker::vfs::vfs_file_coherency_snapshot(file, stamp);
+                ker::vfs::vfs_put_file(file);
+            }
+            if (result != 0) {
+                reject_request(static_cast<int16_t>(result));
+                break;
+            }
+            VfsVersionResponse const version{.query_id = request.query_id,
+                                             .object = stamp.object,
+                                             .content = stamp.content,
+                                             .metadata = stamp.metadata,
+                                             .directory = stamp.directory};
+            std::array<uint8_t, sizeof(DevOpRespPayload) + sizeof(version)> response{};
+            DevOpRespPayload const header{.op_id = op_id, .status = 0, .data_len = sizeof(version), .reserved = REQ_COOKIE};
+            std::memcpy(response.data(), &header, sizeof(header));
+            std::memcpy(response.data() + sizeof(header), &version, sizeof(version));
+            send_buffered_resp(response.data(), response.size());
+            break;
+        }
+        case OP_VFS_WRITE_COMMITTED:
+        case OP_VFS_READ_OWNER: {
+            bool const WRITE = effective_op == OP_VFS_WRITE_COMMITTED;
+            VfsOwnerIoRequest request{};
+            if (data == nullptr || data_len < sizeof(request)) {
+                reject_request(-EINVAL);
+                break;
+            }
+            std::memcpy(&request, data, sizeof(request));
+            if (!wki_vfs_owner_io_request_valid(request, data_len, WRITE)) {
+                reject_request(-EINVAL);
+                break;
+            }
+            if (grant_binding == nullptr || (identity_capabilities & WKI_CAP_RESOURCE_INCARNATION) == 0) {
+                reject_request(-EOPNOTSUPP);
+                break;
+            }
+            std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> response{};
+            VfsAppendResponse written{};
+            VfsOwnerReadResponse read{};
+            int const STATUS = WRITE ? perform_server_write(*grant_binding, channel_identity, request, data + sizeof(request), written)
+                                     : perform_server_read(*grant_binding, channel_identity, request,
+                                                           response.data() + sizeof(DevOpRespPayload) + sizeof(read), read);
+            if (STATUS != 0) {
+                reject_request(static_cast<int16_t>(STATUS));
+                break;
+            }
+            uint16_t const REPLY_LENGTH = WRITE ? sizeof(written) : sizeof(read) + read.bytes;
+            DevOpRespPayload const header{.op_id = op_id, .status = 0, .data_len = REPLY_LENGTH, .reserved = REQ_COOKIE};
+            std::memcpy(response.data(), &header, sizeof(header));
+            if (WRITE)
+                std::memcpy(response.data() + sizeof(header), &written, sizeof(written));
+            else
+                std::memcpy(response.data() + sizeof(header), &read, sizeof(read));
+            send_buffered_resp(response.data(), sizeof(header) + REPLY_LENGTH);
+            break;
+        }
+        case OP_VFS_APPEND: {
+            VfsAppendRequest request{};
+            if (data == nullptr || data_len < sizeof(request)) {
+                reject_request(-EINVAL);
+                break;
+            }
+            std::memcpy(&request, data, sizeof(request));
+            if (!wki_vfs_append_request_valid(request, data_len)) {
+                reject_request(-EINVAL);
+                break;
+            }
+            if (grant_binding == nullptr || (identity_capabilities & WKI_CAP_RESOURCE_INCARNATION) == 0) {
+                reject_request(-EOPNOTSUPP);
+                break;
+            }
+            VfsAppendResponse append{};
+            int const STATUS = perform_server_append(*grant_binding, channel_identity, request, data + sizeof(request), append);
+            if (STATUS != 0) {
+                reject_request(static_cast<int16_t>(STATUS));
+                break;
+            }
+            std::array<uint8_t, sizeof(DevOpRespPayload) + sizeof(append)> response{};
+            DevOpRespPayload const header{.op_id = op_id, .status = 0, .data_len = sizeof(append), .reserved = REQ_COOKIE};
+            std::memcpy(response.data(), &header, sizeof(header));
+            std::memcpy(response.data() + sizeof(header), &append, sizeof(append));
+            send_buffered_resp(response.data(), response.size());
+            break;
+        }
         case OP_VFS_DIRECTORY_GRANT: {
             if ((identity_capabilities & WKI_CAP_RESOURCE_INCARNATION) == 0 || grant_binding == nullptr) {
                 reject_request(-ENOTSUP);
@@ -13079,7 +13620,7 @@ void claim_vfs_proxy_group_unmount_locked(ProxyVfsState* anchor, PendingVfsProxy
         if (state != anchor) {
             state->mount_released = true;
         }
-        invalidate_all_dir_caches(state);
+
         group.count++;
     }
 }
@@ -14715,6 +15256,44 @@ auto wki_remote_vfs_metadata_batch(void* mount_private_data, ker::vfs::MetadataB
     return finish(0);
 }
 
+auto wki_remote_vfs_write_append(ker::vfs::File* file, const void* bytes, size_t count, size_t* offset) -> ssize_t {
+    if (file == nullptr || file->private_data == nullptr || file->fops != wki_remote_vfs_get_fops()) return -EBADF;
+    if (bytes == nullptr && count != 0) return -EFAULT;
+    auto& context = *static_cast<RemoteFileContext*>(file->private_data);
+    ker::mod::sys::MutexGuard io_guard(context.io_lock);
+    consume_remote_file_cache_invalidation(&context);
+    if (context.secure_write_error != 0) return context.secure_write_error;
+    WkiChannelIdentity identity{};
+    int const FEATURES = query_remote_owner_features(context, identity);
+    if (FEATURES != 0) return FEATURES == -ENOTSUP || FEATURES == -ENOSYS ? -EOPNOTSUPP : FEATURES;
+    if ((context.owner_features & WKI_VFS_FEATURE_ATOMIC_APPEND) == 0) return -EOPNOTSUPP;
+    int const FLUSH = flush_write_behind(&context);
+    if (FLUSH != 0) return FLUSH;
+    invalidate_remote_file_open_caches(&context);
+    uint64_t const OPERATION = next_owner_mutation_id();
+    if (OPERATION == 0) return -EOVERFLOW;
+    uint32_t const REQUESTED = static_cast<uint32_t>(std::min(count, static_cast<size_t>(WKI_VFS_APPEND_MAX)));
+    VfsAppendRequest const request{.owner = {.fd = context.remote_fd,
+                                             .open_token = context.ordinary_open_token,
+                                             .binding_id = context.ordinary_open_binding_id,
+                                             .owner_boot_epoch = context.ordinary_owner_boot_epoch,
+                                             .query_id = OPERATION},
+                                   .data_len = REQUESTED};
+    VfsAppendResponse response{};
+    uint16_t length = 0;
+    int const STATUS = normalize_proxy_status_for_errno(vfs_proxy_send_and_wait(
+        context.proxy, OP_VFS_APPEND, reinterpret_cast<const uint8_t*>(&request), sizeof(request), &response, sizeof(response), &length,
+        VFS_PROXY_OP_TIMEOUT_US, nullptr, static_cast<const uint8_t*>(bytes), REQUESTED, false, &identity));
+    if (STATUS != 0 || !wki_vfs_append_response_valid(response, OPERATION, REQUESTED, length)) {
+        // A missing/malformed completion cannot authorize another append ID.
+        context.secure_write_error = STATUS < 0 ? STATUS : -EPROTO;
+        return context.secure_write_error;
+    }
+    if (response.status < 0) return response.status;
+    if (offset != nullptr) *offset = static_cast<size_t>(response.offset);
+    return response.bytes;
+}
+
 auto wki_remote_vfs_fstat(ker::vfs::File* file, ker::vfs::Stat* statbuf) -> int {
     if (file == nullptr || file->private_data == nullptr || statbuf == nullptr) return -EINVAL;
     auto* ctx = static_cast<RemoteFileContext*>(file->private_data);
@@ -15765,13 +16344,11 @@ void handle_vfs_invalidate_notify(const WkiHeader* hdr, const uint8_t* payload, 
                 }
                 member->lifecycle_refs++;
                 group.members.at(group.count++) = member;
-                invalidate_all_dir_caches(member);
             }
         }
         if (group.count == 0) {
             state->lifecycle_refs++;
             group.members.at(group.count++) = state;
-            invalidate_all_dir_caches(state);
         }
     }
     s_vfs_lock.unlock();
@@ -15902,7 +16479,9 @@ void handle_vfs_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
     if ((resp->op_id == OP_VFS_XATTR || resp->op_id == OP_VFS_FSTAT || resp->op_id == OP_VFS_STAT_AS ||
          resp->op_id == OP_VFS_METADATA_BATCH || resp->op_id == OP_VFS_PATH_AS || resp->op_id == OP_VFS_EXEC_VIEW ||
          resp->op_id == OP_VFS_DIRECTORY_REFERENCE || resp->op_id == OP_VFS_DIRECTORY_GRANT || resp->op_id == OP_VFS_FEATURES ||
-         resp->op_id == OP_VFS_OPEN_AS || resp->op_id == OP_VFS_OPEN_READ_AS || resp->op_id == OP_VFS_OPEN_LIFETIME)
+         resp->op_id == OP_VFS_OPEN_AS || resp->op_id == OP_VFS_OPEN_READ_AS || resp->op_id == OP_VFS_OPEN_LIFETIME ||
+         resp->op_id == OP_VFS_VERSION || resp->op_id == OP_VFS_APPEND || resp->op_id == OP_VFS_WRITE_COMMITTED ||
+         resp->op_id == OP_VFS_READ_OWNER)
             ? EXPECTED_LEN != payload_len
             : EXPECTED_LEN > payload_len) {
         return;
@@ -15951,8 +16530,15 @@ void handle_vfs_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
         bool const INVALID_LIFETIME = resp->op_id == OP_VFS_OPEN_LIFETIME &&
                                       !ordinary_open_response_valid(state->op_lifetime_inner, state->op_lifetime_challenge, resp->status,
                                                                     resp_data, RESP_DATA_LEN, state->op_resp_max);
+        bool const INVALID_VERSION =
+            resp->op_id == OP_VFS_VERSION && !wki_vfs_version_reply_size_valid(resp->status, RESP_DATA_LEN, state->op_resp_max);
+        bool const INVALID_APPEND = (resp->op_id == OP_VFS_APPEND || resp->op_id == OP_VFS_WRITE_COMMITTED) &&
+                                    !wki_vfs_append_reply_size_valid(resp->status, RESP_DATA_LEN, state->op_resp_max);
+        bool const INVALID_OWNER_READ =
+            resp->op_id == OP_VFS_READ_OWNER && !wki_vfs_owner_read_reply_size_valid(resp->status, RESP_DATA_LEN, state->op_resp_max);
         bool const INVALID_RESPONSE = INVALID_STAT || INVALID_BATCH || INVALID_PATH || INVALID_EXEC || INVALID_FEATURES ||
-                                      INVALID_DIRECTORY || INVALID_GRANT || INVALID_OPEN || INVALID_LIFETIME;
+                                      INVALID_DIRECTORY || INVALID_GRANT || INVALID_OPEN || INVALID_LIFETIME || INVALID_VERSION ||
+                                      INVALID_APPEND || INVALID_OWNER_READ;
         if (INVALID_RESPONSE) {
             state->op_resp_len = 0;
             state->op_status = -EPROTO;
@@ -16669,6 +17255,7 @@ void wki_remote_vfs_mark_server_fds_for_channel(const WkiChannelIdentity& channe
         if (rfd.retiring || !vfs_channel_identity_matches(rfd.channel_identity, channel_identity)) {
             continue;
         }
+        ker::vfs::vfs_advisory_remote_close_admission(rfd.file);
         rfd.retiring = true;
         rfd.active = false;
         marked = true;
@@ -16888,7 +17475,6 @@ void wki_remote_vfs_cleanup_for_peer(uint16_t node_id, bool owner_reboot_proven)
         if (owner_reboot_proven || p->detach_pending) {
             p->epoch_reset_pending = false;
         }
-        invalidate_all_dir_caches(p);
 
         proxies_to_cleanup.push_back(cleanup);
     }

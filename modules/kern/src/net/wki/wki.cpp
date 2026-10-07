@@ -619,7 +619,9 @@ auto message_uses_vfs_export_admission(MsgType type, const uint8_t* payload, uin
             auto const* req = reinterpret_cast<const DevOpReqPayload*>(payload);
             return (req->op_id == OP_NET_OPEN_AS || req->op_id == OP_NET_CLOSE_AS || req->op_id == OP_NET_LINK_AS) ||
                    (req->op_id >= OP_VFS_OPEN && req->op_id <= OP_VFS_DIRECTORY_REFERENCE) ||
-                   (req->op_id == OP_VFS_DIRECTORY_GRANT || req->op_id == OP_VFS_OPEN_LIFETIME || req->op_id == OP_VFS_SECURE_IO);
+                   (req->op_id == OP_VFS_DIRECTORY_GRANT || req->op_id == OP_VFS_OPEN_LIFETIME || req->op_id == OP_VFS_SECURE_IO ||
+                    req->op_id == OP_VFS_VERSION || req->op_id == OP_VFS_APPEND || req->op_id == OP_VFS_WRITE_COMMITTED ||
+                    req->op_id == OP_VFS_READ_OWNER);
         }
         case MsgType::DEV_OP_RESP: {
             if (payload_len < sizeof(DevOpRespPayload)) {
@@ -627,7 +629,9 @@ auto message_uses_vfs_export_admission(MsgType type, const uint8_t* payload, uin
             }
             auto const* resp = reinterpret_cast<const DevOpRespPayload*>(payload);
             return (resp->op_id >= OP_VFS_OPEN && resp->op_id <= OP_VFS_DIRECTORY_REFERENCE) ||
-                   (resp->op_id == OP_VFS_DIRECTORY_GRANT || resp->op_id == OP_VFS_OPEN_LIFETIME || resp->op_id == OP_VFS_SECURE_IO);
+                   (resp->op_id == OP_VFS_DIRECTORY_GRANT || resp->op_id == OP_VFS_OPEN_LIFETIME || resp->op_id == OP_VFS_SECURE_IO ||
+                    resp->op_id == OP_VFS_VERSION || resp->op_id == OP_VFS_APPEND || resp->op_id == OP_VFS_WRITE_COMMITTED ||
+                    resp->op_id == OP_VFS_READ_OWNER);
         }
         default:
             return false;
@@ -647,13 +651,17 @@ auto admit_vfs_op(MsgType type, const WkiHeader* hdr, const uint8_t* payload, ui
                            req->op_id == OP_VFS_METADATA_BATCH || req->op_id == OP_VFS_XATTR || req->op_id == OP_VFS_OPEN_READ_AS ||
                            req->op_id == OP_VFS_OPEN_AS || req->op_id == OP_VFS_FSTAT || req->op_id == OP_VFS_STAT_AS ||
                            req->op_id == OP_VFS_PATH_AS || req->op_id == OP_VFS_EXEC_VIEW || req->op_id == OP_VFS_DIRECTORY_REFERENCE ||
-                           (req->op_id == OP_VFS_DIRECTORY_GRANT || req->op_id == OP_VFS_OPEN_LIFETIME || req->op_id == OP_VFS_SECURE_IO) ||
+                           (req->op_id == OP_VFS_DIRECTORY_GRANT || req->op_id == OP_VFS_OPEN_LIFETIME || req->op_id == OP_VFS_SECURE_IO ||
+                            req->op_id == OP_VFS_VERSION || req->op_id == OP_VFS_APPEND || req->op_id == OP_VFS_WRITE_COMMITTED ||
+                            req->op_id == OP_VFS_READ_OWNER) ||
                            req->op_id == OP_VFS_FEATURES;
     size_t const EXPECTED_LEN = sizeof(DevOpReqPayload) + req->data_len;
     if (!IS_VFS_OP || (((req->op_id == OP_NET_OPEN_AS || req->op_id == OP_NET_CLOSE_AS || req->op_id == OP_NET_LINK_AS) ||
                         req->op_id == OP_VFS_XATTR || req->op_id == OP_VFS_FSTAT || req->op_id == OP_VFS_STAT_AS ||
                         req->op_id == OP_VFS_PATH_AS || req->op_id == OP_VFS_EXEC_VIEW || req->op_id == OP_VFS_DIRECTORY_REFERENCE ||
-                        (req->op_id == OP_VFS_DIRECTORY_GRANT || req->op_id == OP_VFS_OPEN_LIFETIME || req->op_id == OP_VFS_SECURE_IO) ||
+                        (req->op_id == OP_VFS_DIRECTORY_GRANT || req->op_id == OP_VFS_OPEN_LIFETIME || req->op_id == OP_VFS_SECURE_IO ||
+                         req->op_id == OP_VFS_VERSION || req->op_id == OP_VFS_APPEND || req->op_id == OP_VFS_WRITE_COMMITTED ||
+                         req->op_id == OP_VFS_READ_OWNER) ||
                         req->op_id == OP_VFS_FEATURES || req->op_id == OP_VFS_METADATA_BATCH)
                            ? EXPECTED_LEN != payload_len
                            : EXPECTED_LEN > payload_len)) {

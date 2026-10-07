@@ -9,6 +9,7 @@
 #include <memory>
 #include <platform/sys/mutex.hpp>
 #include <platform/sys/spinlock.hpp>
+#include <vfs/advisory_receipt.hpp>
 #include <vfs/directory_view.hpp>
 #include <vfs/exec_content.hpp>
 #include <vfs/file_operations.hpp>
@@ -84,6 +85,10 @@ struct File {
     off_t pos{};
     bool is_directory{};
     FSType fs_type{};
+    // Owner-side remote advisory admission. Retirement closes this before
+    // releasing arbiter state; retained native I/O does not reopen admission.
+    std::atomic<bool> remote_advisory_closed{false};
+    RemoteAdvisoryReceipt remote_advisory_receipt;
     std::atomic<int> refcount{0};  // reference count for shared file descriptors (fork/exec)
     int open_flags{};              // O_RDONLY, O_WRONLY, etc. - preserved from open() for fcntl F_GETFL
     int fd_flags{};                // FD_CLOEXEC - per-descriptor flags for fcntl F_GETFD/F_SETFD

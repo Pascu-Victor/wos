@@ -461,6 +461,12 @@ KTEST(VFS, PackedDirentRecords) { KEXPECT_TRUE(ker::vfs::vfs_selftest_packed_dir
 
 KTEST(VFS, FcntlSetflPreservesOpenPolicyFlags) { KEXPECT_TRUE(ker::vfs::vfs_selftest_fcntl_setfl_preserves_open_policy_flags()); }
 
+KTEST(VFS, OwnerLocalAndRemoteAdvisoryRequestsShareNativeInodeArbiter) { KEXPECT_TRUE(ker::vfs::vfs_selftest_advisory_remote_shared()); }
+
+KTEST(VFS, OwnerAdvisoryWaitCancelReplayAndRetirementUseBoundedNativeState) {
+    KEXPECT_TRUE(ker::vfs::vfs_selftest_advisory_remote_waits());
+}
+
 KTEST(VFS, StreamCacheReadEligibility) { KEXPECT_TRUE(ker::vfs::vfs_selftest_stream_cache_read_eligibility()); }
 
 KTEST(VFS, RemoteReadBounceMatchesBulkWindow) { KEXPECT_TRUE(ker::vfs::vfs_selftest_remote_read_bounce_window()); }

@@ -1,5 +1,8 @@
 #pragma once
 
+#include <optional>
+#include <vfs/native_coherency.hpp>
+
 // XFS Transaction API - accumulate metadata modifications and commit them
 // atomically to the write-ahead log.
 //
@@ -100,6 +103,9 @@ struct XfsTransPerAgUndo {
 // Deep snapshot of mutable inode state used by block-map and attr-fork updates.
 struct XfsTransInodeUndo {
     XfsInode* ip{};
+    // Capture precedes the first native effect; snapshots remain unavailable
+    // until commit publication or proven restoration on cancellation.
+    std::optional<coherency::Publication> version_guard{};
     XfsIfork data_fork{};
     XfsIfork attr_fork{};
     uint64_t size{};
