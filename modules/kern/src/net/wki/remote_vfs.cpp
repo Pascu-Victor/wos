@@ -3956,8 +3956,9 @@ void wake_proxy_slot_waiters(const PendingProxyTeardown& teardown) {
     }
 }
 
-void finish_proxy_teardown_op_waiter(const PendingProxyTeardown& teardown, int result) {
-    finish_or_quiesce_waiter(teardown.op_wait_entry, teardown.op_wait_claimed, result);
+void finish_proxy_teardown_op_waiter(const PendingProxyTeardown& teardown) {
+    // A retired binding is a transport disconnection, never an allocation error.
+    finish_or_quiesce_waiter(teardown.op_wait_entry, teardown.op_wait_claimed, WKI_ERR_PEER_FENCED);
     if (teardown.state == nullptr || teardown.op_wait_entry == nullptr) {
         return;
     }
@@ -4149,14 +4150,14 @@ void deactivate_vfs_proxy_locked(ProxyVfsState* state, PendingProxyTeardown& tea
         teardown.op_expected_id = state->op_expected_id;
         teardown.op_expected_seq = state->op_expected_seq;
         uint64_t const OP_WAITER_PID = state->op_waiter_pid;
-        state->op_status = -1;
+        state->op_status = WKI_ERR_PEER_FENCED;
         teardown.op_wait_entry = state->op_wait_entry;
         if (teardown.op_wait_entry != nullptr) {
             teardown.op_wait_entry->retirement_pending.store(true, std::memory_order_release);
         }
         state->op_wait_entry = nullptr;
         teardown.op_wait_claimed = wki_claim_op(teardown.op_wait_entry);
-        clear_proxy_op_state_locked(state, -1);
+        clear_proxy_op_state_locked(state, WKI_ERR_PEER_FENCED);
         state->op_retiring_wait_entry = teardown.op_wait_entry;
         state->op_retiring_waiter_pid = OP_WAITER_PID;
     }
@@ -12170,10 +12171,21 @@ auto wki_remote_vfs_selftest_teardown_quiesces_retiring_slot() -> bool {
         .op_wait_claimed = true,
     };
 
-    finish_proxy_teardown_op_waiter(teardown, WKI_ERR_PEER_FENCED);
-    return state.op_retiring_wait_entry == nullptr && state.op_retiring_waiter_pid == 0 &&
-           !retiring.retirement_pending.load(std::memory_order_acquire) &&
-           retiring.state.load(std::memory_order_acquire) == WkiWaitEntry::DONE;
+    finish_proxy_teardown_op_waiter(teardown);
+    if (state.op_retiring_wait_entry != nullptr || state.op_retiring_waiter_pid != 0 ||
+        retiring.retirement_pending.load(std::memory_order_acquire) ||
+        retiring.state.load(std::memory_order_acquire) != WkiWaitEntry::DONE || retiring.result != WKI_ERR_PEER_FENCED ||
+        wki_wait_for_op(&retiring, 0) != WKI_ERR_PEER_FENCED ||
+        normalize_proxy_status_for_errno(encode_proxy_wki_status(retiring.result)) != -ENOTCONN)
+        return false;
+
+    // A reply that completed first keeps its result; teardown cannot overwrite it.
+    WkiWaitEntry completed{};
+    completed.result = WKI_OK;
+    completed.state.store(WkiWaitEntry::DONE, std::memory_order_release);
+    PendingProxyTeardown const COMPLETED{.op_wait_entry = &completed};
+    finish_proxy_teardown_op_waiter(COMPLETED);
+    return wki_wait_for_op(&completed, 0) == WKI_OK && normalize_proxy_status_for_errno(encode_proxy_wki_status(WKI_ERR_NO_MEM)) == -ENOMEM;
 }
 
 auto wki_remote_vfs_selftest_inactive_slot_rejected() -> bool {
@@ -16059,7 +16071,7 @@ void finish_vfs_proxy_lane_teardown(const PendingProxyTeardown& teardown, bool d
         return;
     }
 
-    finish_proxy_teardown_op_waiter(teardown, -1);
+    finish_proxy_teardown_op_waiter(teardown);
     ker::vfs::vfs_stream_cache_invalidate_remote_scope(teardown.state);
     invalidate_readlink_cache(teardown.state);
 
@@ -16069,7 +16081,7 @@ void finish_vfs_proxy_lane_teardown(const PendingProxyTeardown& teardown, bool d
     }
 
     wake_proxy_slot_waiters(teardown);
-    finish_claimed_waiter(teardown.attach_wait_entry, -1);
+    finish_claimed_waiter(teardown.attach_wait_entry, WKI_ERR_PEER_FENCED);
 
     if (detach_remote) {
         if (teardown.detach_staged) {
@@ -20085,7 +20097,7 @@ void wki_remote_vfs_cleanup_for_peer(uint16_t node_id, bool owner_reboot_proven)
     s_vfs_lock.unlock();
 
     for (const auto& cleanup : proxies_to_cleanup) {
-        finish_proxy_teardown_op_waiter(cleanup, -1);
+        finish_proxy_teardown_op_waiter(cleanup);
     }
 
     for (size_t index = 0; index < xattr_stage_release_count; ++index) {
@@ -20108,7 +20120,7 @@ void wki_remote_vfs_cleanup_for_peer(uint16_t node_id, bool owner_reboot_proven)
         }
 
         wake_proxy_slot_waiters(cleanup);
-        finish_claimed_waiter(cleanup.attach_wait_entry, -1);
+        finish_claimed_waiter(cleanup.attach_wait_entry, WKI_ERR_PEER_FENCED);
 
         static_cast<void>(wki_channel_close_generation(cleanup.assigned_channel_ref, cleanup.owner_node, cleanup.assigned_channel,
                                                        cleanup.assigned_channel_generation));

@@ -691,6 +691,10 @@ auto main(int argc, char** argv, char** envp) -> int {
         return run_vfs_coherency(argc - 2, argv + 2);
     }
 
+    if (command != nullptr && std::strcmp(command, "vfs-coherency-recovery") == 0) {
+        return run_vfs_coherency_recovery(argc - 2, argv + 2);
+    }
+
     if (command != nullptr && std::strcmp(command, "vfs-coherency-exec-probe") == 0) {
         return run_vfs_coherency_exec_probe(argc - 2, argv + 2);
     }

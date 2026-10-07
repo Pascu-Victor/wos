@@ -38,6 +38,7 @@ set(SOURCES
     src/tests/blockbench_mmap.cpp
     src/usercopy_negative.cpp
     src/vfs_coherency.cpp
+    src/vfs_coherency_recovery.cpp
     src/wki_chaos_workload.cpp
     src/xattr_matrix.cpp
     src/mandelbench/lodepng.cpp

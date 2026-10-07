@@ -946,7 +946,7 @@ def test_proxy_slot_release_paths_handoff_after_unlock() -> None:
             "teardown.op_wait_entry = state->op_wait_entry",
             "teardown.op_wait_entry->retirement_pending.store(true, std::memory_order_release)",
             "state->op_wait_entry = nullptr",
-            "clear_proxy_op_state_locked(state, -1)",
+            "clear_proxy_op_state_locked(state, WKI_ERR_PEER_FENCED)",
             "teardown.op_slot_waiter_pids = state->op_slot_waiter_pids",
             "state->op_slot_waiter_pids.fill(0)",
             "state->op_slot_waiter_count = 0",
@@ -955,10 +955,29 @@ def test_proxy_slot_release_paths_handoff_after_unlock() -> None:
         "proxy teardown rejects and detaches FIFO waiters under the state lock",
     )
     finish_teardown_body = function_body(source, "finish_proxy_teardown_op_waiter")
+    require_tokens(
+        finish_teardown_body,
+        ["finish_or_quiesce_waiter(teardown.op_wait_entry, teardown.op_wait_claimed, WKI_ERR_PEER_FENCED)"],
+        "retired binding wait completion must preserve the transport disconnection errno",
+    )
+    for name in ["finish_vfs_proxy_lane_teardown", "wki_remote_vfs_cleanup_for_peer"]:
+        body = function_body(source, name)
+        if re.search(r"finish_(?:proxy_teardown_op_waiter|claimed_waiter)\([^;]*,\s*-1\s*\)", body):
+            fail("teardown must not alias the WKI allocation-failure completion")
+    require_tokens(
+        function_body(source, "finish_vfs_proxy_lane_teardown"),
+        ["finish_claimed_waiter(teardown.attach_wait_entry, WKI_ERR_PEER_FENCED)"],
+        "unmount attach waits report transport disconnection",
+    )
+    require_tokens(
+        function_body(source, "wki_remote_vfs_cleanup_for_peer"),
+        ["finish_claimed_waiter(cleanup.attach_wait_entry, WKI_ERR_PEER_FENCED)"],
+        "fenced peer attach waits report transport disconnection",
+    )
     require_order(
         finish_teardown_body,
         [
-            "finish_or_quiesce_waiter(teardown.op_wait_entry, teardown.op_wait_claimed, result)",
+            "finish_or_quiesce_waiter(teardown.op_wait_entry, teardown.op_wait_claimed, WKI_ERR_PEER_FENCED)",
             "teardown.state->lock.lock()",
             "teardown.state->op_retiring_wait_entry = nullptr",
             "teardown.state->op_retiring_waiter_pid = 0",
@@ -2407,7 +2426,7 @@ def test_remote_vfs_unmount_cancels_waiters_before_teardown() -> None:
             "teardown.op_wait_entry = state->op_wait_entry",
             "state->op_wait_entry = nullptr",
             "teardown.op_wait_claimed = wki_claim_op(teardown.op_wait_entry)",
-            "clear_proxy_op_state_locked(state, -1)",
+            "clear_proxy_op_state_locked(state, WKI_ERR_PEER_FENCED)",
             "state->op_retiring_wait_entry = teardown.op_wait_entry",
             "state->op_retiring_waiter_pid = OP_WAITER_PID",
             "if (state->attach_pending.load(std::memory_order_acquire))",
@@ -2455,10 +2474,10 @@ def test_remote_vfs_unmount_cancels_waiters_before_teardown() -> None:
     require_order(
         lane_finish,
         [
-            "finish_proxy_teardown_op_waiter(teardown, -1)",
+            "finish_proxy_teardown_op_waiter(teardown)",
             "vfs_stream_cache_invalidate_remote_scope(teardown.state)",
             "wake_proxy_slot_waiters(teardown)",
-            "finish_claimed_waiter(teardown.attach_wait_entry, -1)",
+            "finish_claimed_waiter(teardown.attach_wait_entry, WKI_ERR_PEER_FENCED)",
             "teardown.detach_staged",
             "wki_deferred_work_notify()",
             "wki_channel_close_generation(teardown.assigned_channel_ref",
@@ -2586,9 +2605,9 @@ def test_vfs_detach_uses_exact_negotiated_incarnation_form() -> None:
         [
             "deactivate_vfs_proxy_locked(p, cleanup, false)",
             "s_vfs_lock.unlock()",
-            "finish_proxy_teardown_op_waiter(cleanup, -1)",
+            "finish_proxy_teardown_op_waiter(cleanup)",
             "wake_proxy_slot_waiters(cleanup)",
-            "finish_claimed_waiter(cleanup.attach_wait_entry, -1)",
+            "finish_claimed_waiter(cleanup.attach_wait_entry, WKI_ERR_PEER_FENCED)",
             "wki_channel_close_generation(cleanup.assigned_channel_ref",
             "release_vfs_proxy_lifecycle_ref(cleanup.state)",
         ],

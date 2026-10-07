@@ -543,3 +543,64 @@ retirement, deadline, generation and unsafe-context cases. All 38 source/ELF
 pins matched and all four private images were pruned. This verifies the shared
 admission behavior used by the corrected ordinary-open paths; the separate
 startup timeout remains an unresolved runtime observation.
+
+## Public recovery and teardown errors
+
+`testprog vfs-coherency-recovery ABSOLUTE_ROOT owner|client|successor RUN_ID
+session|fence [TIMEOUT_SECONDS]` exercises recovery through ordinary syscalls.
+Use a fresh owner root and the same nonzero run ID on the remote client. The
+deadline defaults to 300 seconds and accepts 1 through 600. The owner retains
+native witnesses for POSIX, OFD and flock locks and separate blockers for three
+remote child waiters. WOS readiness requires exactly three native pending waits
+and native conflicts on all three held files; child readiness alone is
+insufficient. Complete netdiag snapshots distinguish an authenticated session
+replacement from a timeout or confirmed fence.
+
+In session mode an external topology runner resets only the armed client and
+starts its successor against the same owner root. In fence mode the runner
+pauses the armed owner, waits for actual client fencing, three terminal network
+errors and failed/closed old descriptors, then resumes the owner. Both modes
+require the old native locks and waits to disappear, fresh successor acquisitions
+and native conflicts while those successor locks remain held. The runner must
+bound its actions and check final reference drains separately. Portable host
+runs exercise coordination and cleanup but cannot claim WOS pending-wait or
+peer-state evidence.
+
+The first ivshmem fence run found a production errno error: literal `-1` used
+for peer/unmount wait completion aliases `WKI_ERR_NO_MEM`, reporting `ENOMEM`
+after disconnection. The internal teardown helper now always completes with
+named `WKI_ERR_PEER_FENCED`, which normal RPC translation maps to `ENOTCONN`.
+Attach completions and retired proxy status use the same named result. An
+already completed reply keeps its result, genuine allocation errors remain
+`ENOMEM`, and the existing retirement marker and exact reference ordering are
+preserved. No wire, syscall layout, authentication or locking change is involved.
+
+Normal Build WOS, isolated fast diagnostic compilation, formatting and all 62
+source audits passed. Isolated runtime28 passed 73,505 assertions with zero
+failures and normal poweroff, including all twelve required fixtures. The actual
+teardown fixture consumes its wait result, checks `ENOTCONN`, preserves an earlier
+success and distinguishes genuine `ENOMEM`. All 38 source/ELF pins matched and
+all four disposable images were pruned. The ASan/UBSan portable recovery smoke
+also passed with three child waiters and native witnesses.
+
+The actual ivshmem session-reset campaign passed on TMPFS and XFS. Both runs
+observed changed authenticated client boot epochs, unchanged owner boot, retired
+native locks/waits, successor ownership, complete zero final advisory/server-FD/
+proxy reference drains and normal shutdown. All eight disks and shared backing
+were pruned after each case. A corrected ivshmem fence rerun failed its strict
+90-second owner-pause deadline: all three waits returned `ETIMEDOUT`, but every
+heartbeat probe failed to transmit and peer fencing remained deferred. That is
+an unresolved transport/probe availability observation, not confirmed fencing
+or a passing cleanup result. Its disks and shared backing were also pruned.
+
+The four ordinary cold-boot Ethernet recovery cases passed: session replacement
+and confirmed fencing on both TMPFS and XFS. Before each host action the native
+owner had three pending waits and six held locks. Session resets changed only
+the client's authenticated boot epoch; fencing preserved both boot epochs and
+changed the channel incarnation. All three fenced waits returned `ENOTCONN`,
+old descriptors failed and closed, old native locks/waits retired, and native
+witnesses conflicted with each live successor lock. Every case finished with
+complete zero advisory/server-FD/proxy reference drains and normal shutdown.
+All 53 source/artifact pins matched, and all eight disposable disks per case
+were pruned before the next topology. These runs use the diagnostic kernel's
+four explicit feature tokens; normal-kernel rollout is qualified separately.
