@@ -442,3 +442,23 @@ request for an append-completion marker timed out at the owner. Exact logs are
 retained and all twelve disks were pruned; no extended Ethernet qualification
 is claimed for that run. Root retirement and packet recovery work remain. New
 capabilities remain opt-in.
+
+Automatic mount retirement now distinguishes automatic mounts from manual
+mounts before publication. Withdrawal and retired-parent retry select at most
+32 groups per pass, deepest first, through retained exact native mount rows and
+physical ancestry. Only automatic descendants of the same owner and nonzero
+owner boot are eligible. Ordinary unmount retains held-file and child-mount
+`EBUSY` protection; manual/native/foreign-owner mounts and same-path successors
+keep their identities. No forced or lazy removal or wire change is introduced.
+Normal Build WOS, isolated fast diagnostic compilation and formatting passed.
+Isolated runtime25 passed 73,503 assertions with zero failures, including the
+actual mounted tree with 33 extra descendants, a retained deepest open, protected
+owners and a same-path successor. It powered off normally and all four private
+images were pruned. IVpos8 cold-booted both nodes without the owner-first gate
+and passed the complete TMPFS+XFS campaign across three processes, all twelve
+pending-wait transitions and complete zero terminal reference drains, followed
+by WKI shutdown. All eight disks and shared backing were pruned. ETHpos7
+cold-booted three nodes without retirement `EBUSY` errors but failed an ordinary
+`OPEN_AS` timeout while creating the append-completion marker; all twelve disks
+were pruned. Extended Ethernet liveness remains unresolved and is not attributed
+to mount retirement without further evidence.

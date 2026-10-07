@@ -121,7 +121,10 @@ struct RemoteVfsFd {
 // ProxyVfsState (consumer side) - per-mount proxy state
 // -----------------------------------------------------------------------------
 
+enum class RemoteVfsMountOrigin : uint8_t { MANUAL, AUTOMATIC };
+
 struct ProxyVfsState {
+    RemoteVfsMountOrigin mount_origin = RemoteVfsMountOrigin::MANUAL;
     struct ReadlinkCacheEntry {
         uint32_t generation = 0;
         int16_t status = 0;
@@ -498,7 +501,7 @@ auto wki_remote_vfs_advertise_exports_to_peer(uint16_t peer_node) -> bool;
 using RemoteVfsMountPublisher = int (*)(const char* local_mount_path, void* private_data, ker::vfs::FileOperations* fops, void* context);
 auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char* local_mount_path,
                           uint64_t expected_resource_generation = 0, RemoteVfsMountPublisher publisher = nullptr,
-                          void* publisher_context = nullptr) -> int;
+                          void* publisher_context = nullptr, RemoteVfsMountOrigin origin = RemoteVfsMountOrigin::MANUAL) -> int;
 
 auto wki_remote_vfs_selftest_attach_ack_cookie_fences_stale_completion() -> bool;
 
@@ -531,6 +534,7 @@ auto wki_remote_vfs_selftest_pin_close_lifetime() -> bool;
 auto wki_remote_vfs_selftest_exec_cancellation_ownership() -> bool;
 auto wki_remote_vfs_selftest_retired_mount_retry() -> bool;
 auto wki_remote_vfs_selftest_retired_ancestor_admission() -> bool;
+auto wki_remote_vfs_selftest_automatic_descendant_retirement() -> bool;
 auto wki_remote_vfs_selftest_withdrawal_outbox() -> bool;
 auto wki_remote_vfs_selftest_manual_mount_teardown() -> bool;
 auto wki_remote_vfs_selftest_mount_candidate_isolation() -> bool;

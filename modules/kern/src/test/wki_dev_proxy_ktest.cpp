@@ -277,6 +277,10 @@ KTEST(WkiRemoteVfsUnmount, RetiredAncestorDefersSuccessorsUntilOldChildrenDrain)
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_retired_ancestor_admission());
 }
 
+KTEST(WkiRemoteVfsUnmount, AutomaticDescendantsRetireInBoundedPassesAndPreserveForeignOwners) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_automatic_descendant_retirement());
+}
+
 KTEST(WkiRemoteVfsUnmount, ManualRetirementReleasesExactGroupAfterBusyDenial) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_manual_mount_teardown());
 }

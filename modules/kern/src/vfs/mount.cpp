@@ -1038,6 +1038,59 @@ auto retain_mount_point(MountPoint* mount) -> MountRef {
     return MountRef{RETAINED};
 }
 
+auto retain_mount_by_private_data(const void* private_data) -> MountRef {
+    if (private_data == nullptr) return {};
+    while (true) {
+        uint64_t const PIVOT_EPOCH = wait_for_stable_mount_pivot_epoch();
+        mount_lock.lock();
+        if (mount_pivot_epoch.load(std::memory_order_acquire) != PIVOT_EPOCH) {
+            mount_lock.unlock();
+            continue;
+        }
+        MountPoint* retained = nullptr;
+        for (auto* mount : mounts) {
+            if (mount != nullptr && !mount->retiring.load(std::memory_order_acquire) && mount->private_data == private_data &&
+                retain_mount_locked(mount)) {
+                retained = mount;
+                break;
+            }
+        }
+        mount_lock.unlock();
+        return MountRef{retained};
+    }
+}
+
+auto retain_remote_mount_descendant_at(const void* parent_private_data, size_t index, size_t* path_length) -> MountRef {
+    if (parent_private_data == nullptr || path_length == nullptr) return {};
+    while (true) {
+        uint64_t const PIVOT_EPOCH = wait_for_stable_mount_pivot_epoch();
+        mount_lock.lock();
+        if (mount_pivot_epoch.load(std::memory_order_acquire) != PIVOT_EPOCH) {
+            mount_lock.unlock();
+            continue;
+        }
+        MountPoint* parent = nullptr;
+        for (auto* mount : mounts) {
+            if (mount != nullptr && mount->fs_type == FSType::REMOTE && !mount->retiring.load(std::memory_order_acquire) &&
+                mount->private_data == parent_private_data) {
+                parent = mount;
+                break;
+            }
+        }
+        MountPoint* child = index < mounts.size() ? mounts.at(index) : nullptr;
+        MountPoint* retained = nullptr;
+        if (parent != nullptr && child != nullptr && parent->path != nullptr && child->path != nullptr &&
+            child->fs_type == FSType::REMOTE && child->path_len > parent->path_len &&
+            std::memcmp(child->path, parent->path, parent->path_len) == 0 &&
+            (parent->path_len == 1 || child->path[parent->path_len] == '/') && retain_mount_locked(child)) {
+            retained = child;
+            *path_length = child->path_len;
+        }
+        mount_lock.unlock();
+        return MountRef{retained};
+    }
+}
+
 auto retain_mount_for_open_file(MountPoint* mount) -> bool {
     if (mount == nullptr) {
         return false;

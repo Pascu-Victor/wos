@@ -2241,8 +2241,8 @@ void wki_remotable_process_pending_mounts() {
             // must process the queued withdrawal that would let it complete.
             // Mount-table children provide the visible directory entries.
 
-            int const RET =
-                wki_remote_vfs_mount(pending.node_id, pending.resource_id, pending.mount_path.data(), pending.resource_generation);
+            int const RET = wki_remote_vfs_mount(pending.node_id, pending.resource_id, pending.mount_path.data(),
+                                                 pending.resource_generation, nullptr, nullptr, RemoteVfsMountOrigin::AUTOMATIC);
             if (RET == 0) {
                 ker::mod::dbg::log("[WKI] Auto-mounted VFS: %s -> node=0x%04x", pending.mount_path.data(), pending.node_id);
                 continue;

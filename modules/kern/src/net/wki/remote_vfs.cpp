@@ -2415,8 +2415,8 @@ auto allocate_vfs_mount_group_id_locked() -> uint64_t {
 // Caller must hold s_vfs_lock.
 auto create_vfs_proxy_state_locked(uint16_t owner_node, uint32_t resource_id, uint64_t resource_generation,
                                    const ResourceIncarnationToken& owner_incarnation, uint32_t binding_peer_boot_epoch,
-                                   const char* local_mount_path, uint64_t mount_group_id, uint8_t lane_index, bool lane_anchor)
-    -> ProxyVfsState* {
+                                   const char* local_mount_path, uint64_t mount_group_id, uint8_t lane_index, bool lane_anchor,
+                                   RemoteVfsMountOrigin origin = RemoteVfsMountOrigin::MANUAL) -> ProxyVfsState* {
     g_vfs_proxies.push_back(std::make_unique<ProxyVfsState>());
     auto* state = g_vfs_proxies.back().get();
 
@@ -2428,6 +2428,7 @@ auto create_vfs_proxy_state_locked(uint16_t owner_node, uint32_t resource_id, ui
     state->mount_group_id = mount_group_id;
     state->lane_index = lane_index;
     state->lane_anchor = lane_anchor;
+    state->mount_origin = origin;
     state->lifecycle_refs = 1;
 
     size_t path_len = std::strlen(local_mount_path);
@@ -15381,7 +15382,8 @@ void retire_constructed_vfs_mount_group(ProxyVfsState* anchor, bool unpublished)
 
 auto mount_vfs_proxy_lane(uint16_t owner_node, uint32_t resource_id, const char* local_mount_path, uint64_t resource_generation,
                           const ResourceIncarnationToken& owner_incarnation, uint32_t binding_peer_boot_epoch, uint64_t mount_group_id,
-                          uint8_t lane_index, bool lane_anchor, RemoteVfsMountPublisher publisher, void* publisher_context) -> int {
+                          uint8_t lane_index, bool lane_anchor, RemoteVfsMountPublisher publisher, void* publisher_context,
+                          RemoteVfsMountOrigin origin) -> int {
     if (local_mount_path == nullptr) {
         return -EINVAL;
     }
@@ -15397,7 +15399,7 @@ auto mount_vfs_proxy_lane(uint16_t owner_node, uint32_t resource_id, const char*
         return -EAGAIN;
     }
     auto* state = create_vfs_proxy_state_locked(owner_node, resource_id, RESOURCE_GENERATION, owner_incarnation, BINDING_PEER_BOOT_EPOCH,
-                                                local_mount_path, mount_group_id, lane_index, lane_anchor);
+                                                local_mount_path, mount_group_id, lane_index, lane_anchor, origin);
 
     WkiWaitEntry wait = {};
     attach_cookie = allocate_vfs_attach_cookie_locked(owner_node, resource_id, owner_incarnation);
@@ -15721,7 +15723,7 @@ auto mount_vfs_proxy_lane(uint16_t owner_node, uint32_t resource_id, const char*
     uint8_t const TARGET_LANE_COUNT = vfs_proxy_lane_count_for_mount(local_mount_path);
     for (uint8_t lane_index = 1; lane_index < TARGET_LANE_COUNT; ++lane_index) {
         int const LANE_RET = mount_vfs_proxy_lane(owner_node, resource_id, local_mount_path, RESOURCE_GENERATION, owner_incarnation,
-                                                  BINDING_PEER_BOOT_EPOCH, mount_group_id, lane_index, false, nullptr, nullptr);
+                                                  BINDING_PEER_BOOT_EPOCH, mount_group_id, lane_index, false, nullptr, nullptr, origin);
         if (LANE_RET != 0) {
             ker::mod::dbg::log("[WKI] Remote VFS auxiliary lane unavailable: node=0x%04x res_id=%u lane=%u ret=%d", owner_node, resource_id,
                                lane_index, LANE_RET);
@@ -15787,7 +15789,7 @@ auto mount_vfs_proxy_lane(uint16_t owner_node, uint32_t resource_id, const char*
 }  // namespace
 
 auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char* local_mount_path, uint64_t expected_resource_generation,
-                          RemoteVfsMountPublisher publisher, void* publisher_context) -> int {
+                          RemoteVfsMountPublisher publisher, void* publisher_context, RemoteVfsMountOrigin origin) -> int {
     if (local_mount_path == nullptr) {
         return -EINVAL;
     }
@@ -15813,7 +15815,7 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
     s_vfs_lock.unlock();
 
     return mount_vfs_proxy_lane(owner_node, resource_id, local_mount_path, RESOURCE_GENERATION, owner_incarnation, BINDING_PEER_BOOT_EPOCH,
-                                mount_group_id, 0, true, publisher, publisher_context);
+                                mount_group_id, 0, true, publisher, publisher_context, origin);
 }
 
 namespace {
@@ -15962,6 +15964,66 @@ void finish_vfs_proxy_group_unmount(const PendingVfsProxyGroupTeardown& group, b
     release_vfs_proxy_lifecycle_ref(group.anchor);
 }
 
+// The caller holds an exact parent lifecycle pin. Each ordinary child removal
+// is claimed under the registry lock and finished in task context. A retained
+// native parent row excludes removal/replacement during selection; no pathname
+// can transfer old retirement authority to a successor.
+auto automatic_descendant_owner_matches_locked(const ProxyVfsState& parent, const ProxyVfsState& child) -> bool {
+    return parent.mount_origin == RemoteVfsMountOrigin::AUTOMATIC && parent.destroy_when_idle && !parent.mount_released &&
+           parent.binding_peer_boot_epoch != 0 && parent.owner_node != WKI_NODE_INVALID && child.lane_anchor && child.mount_configured &&
+           !child.destroy_when_idle && !child.mount_released && child.mount_origin == RemoteVfsMountOrigin::AUTOMATIC &&
+           child.owner_node == parent.owner_node && child.binding_peer_boot_epoch == parent.binding_peer_boot_epoch &&
+           child.mount_group_id != parent.mount_group_id;
+}
+
+void retire_automatic_vfs_descendants(ProxyVfsState* parent) {
+    s_vfs_lock.lock();
+    bool const MANAGED = parent->mount_origin == RemoteVfsMountOrigin::AUTOMATIC && parent->destroy_when_idle && !parent->mount_released &&
+                         parent->binding_peer_boot_epoch != 0 && parent->owner_node != WKI_NODE_INVALID;
+    s_vfs_lock.unlock();
+    if (!MANAGED) return;
+    constexpr unsigned MAX_GROUPS = 32;
+    for (unsigned pass = 0; pass < MAX_GROUPS; ++pass) {
+        auto parent_mount = ker::vfs::retain_mount_by_private_data(parent);
+        if (!parent_mount) return;
+        ker::vfs::MountRef selected{};
+        size_t deepest = 0;
+        size_t const COUNT = ker::vfs::get_mount_count();
+        for (size_t index = 0; index < COUNT; ++index) {
+            size_t depth = 0;
+            auto mount = ker::vfs::retain_remote_mount_descendant_at(parent, index, &depth);
+            if (!mount || depth <= deepest) continue;
+            bool eligible = false;
+            s_vfs_lock.lock();
+            for (auto const& proxy : g_vfs_proxies) {
+                if (proxy.get() == mount->private_data && automatic_descendant_owner_matches_locked(*parent, *proxy)) {
+                    eligible = true;
+                    break;
+                }
+            }
+            s_vfs_lock.unlock();
+            if (eligible) {
+                selected = std::move(mount);
+                deepest = depth;
+            }
+        }
+        if (!selected) return;
+        PendingVfsProxyGroupTeardown child{};
+        s_vfs_lock.lock();
+        for (auto const& proxy : g_vfs_proxies) {
+            if (proxy.get() == selected->private_data && automatic_descendant_owner_matches_locked(*parent, *proxy)) {
+                claim_vfs_proxy_group_unmount_locked(proxy.get(), child);
+                break;
+            }
+        }
+        s_vfs_lock.unlock();
+        selected.reset();
+        parent_mount.reset();
+        if (child.anchor == nullptr) return;
+        finish_vfs_proxy_group_unmount(child);
+    }
+}
+
 // The caller retains its construction reference. This also covers private
 // auxiliary lanes, which have no mount_configured row and cannot be found by
 // generation-wide mount retirement. Unpublished failure must never affect a
@@ -15986,6 +16048,7 @@ auto claim_retired_vfs_mount_retry_locked(ProxyVfsState* state) -> bool {
 }
 
 auto finish_retired_vfs_mount_retry(ProxyVfsState* state) -> int {
+    retire_automatic_vfs_descendants(state);
     int const RESULT = ker::vfs::unmount_filesystem_by_private_data(state);
     if (RESULT == 0 || RESULT == -ENOENT) mark_vfs_proxy_mount_released_and_maybe_destroy(state);
     release_vfs_proxy_lifecycle_ref(state);
@@ -16292,6 +16355,115 @@ auto wki_remote_vfs_selftest_retired_mount_retry() -> bool {
     }
     return true;
 }
+
+auto wki_remote_vfs_selftest_automatic_descendant_retirement() -> bool {
+    namespace vfs = ker::vfs;
+    constexpr auto BASE = "/tmp/ktest_auto_tree26";
+    constexpr auto NATIVE = "/tmp/ktest_auto_tree26/native";
+    constexpr uint16_t OWNER = 0x7FE1;
+    constexpr uint32_t BOOT = 37;
+    constexpr uint64_t GENERATION = 77;
+    struct Fixture {
+        std::array<ProxyVfsState*, 48> owners{};
+        size_t count = 0;
+        vfs::MountPoint* held = nullptr;
+        bool native = false;
+        ~Fixture() {
+            if (held != nullptr) vfs::release_mount_from_open_file(held);
+            if (native) static_cast<void>(vfs::unmount_filesystem("/tmp/ktest_auto_tree26/native"));
+            while (count != 0) {
+                auto* owner = owners.at(--count);
+                retire_constructed_vfs_mount_group(owner, false);
+                release_vfs_proxy_lifecycle_ref(owner);
+            }
+        }
+    } fixture;
+    auto fail = [](int line) {
+        ker::mod::dbg::log("[WKI managed descendant selftest] line=%d", line);
+        return false;
+    };
+    auto add = [&](const char* path, uint16_t node, uint32_t boot, RemoteVfsMountOrigin origin,
+                   uint64_t generation = 77) -> ProxyVfsState* {
+        s_vfs_lock.lock();
+        auto const GROUP = allocate_vfs_mount_group_id_locked();
+        uint32_t const RESOURCE = static_cast<uint32_t>(600 + fixture.count);
+        auto* state = create_vfs_proxy_state_locked(node, RESOURCE, generation, {}, boot, path, GROUP, 0, true, origin);
+        state->active = state->mount_configured = state->lanes_ready = true;
+        state->binding_retirement_confirmed = true;
+        state->lanes.at(0) = state;
+        state->lane_count = 1;
+        fixture.owners.at(fixture.count++) = state;
+        s_vfs_lock.unlock();
+        // Construction pins exclude the real retry worker while assertions
+        // inspect the actual mount rows and retained proxy identities.
+        return vfs::mount_filesystem(path, "remote", nullptr, 0, nullptr, state, &g_remote_vfs_fops) == 0 ? state : nullptr;
+    };
+    auto const AUTOMATIC = RemoteVfsMountOrigin::AUTOMATIC;
+    auto const MANUAL = RemoteVfsMountOrigin::MANUAL;
+    auto* parent = add(BASE, OWNER, BOOT, AUTOMATIC);
+    auto* child = add("/tmp/ktest_auto_tree26/auto", OWNER, BOOT, AUTOMATIC);
+    auto* deep = add("/tmp/ktest_auto_tree26/auto/deep", OWNER, BOOT, AUTOMATIC);
+    if (parent == nullptr || child == nullptr || deep == nullptr) return fail(__LINE__);
+    std::array<ProxyVfsState*, 33> extras{};
+    for (size_t i = 0; i < extras.size(); ++i) {
+        std::array<char, VFS_EXPORT_PATH_LEN> path{};
+        std::snprintf(path.data(), path.size(), "/tmp/ktest_auto_tree26/extra-%02zu", i);
+        extras.at(i) = add(path.data(), OWNER, BOOT, AUTOMATIC);
+        if (extras.at(i) == nullptr) return fail(__LINE__);
+    }
+    auto* manual = add("/tmp/ktest_auto_tree26/manual", OWNER, BOOT, MANUAL);
+    auto* foreign_node = add("/tmp/ktest_auto_tree26/foreign-node", OWNER + 1, BOOT, AUTOMATIC);
+    auto* foreign_boot = add("/tmp/ktest_auto_tree26/foreign-boot", OWNER, BOOT + 1, AUTOMATIC);
+    auto* unknown_boot = add("/tmp/ktest_auto_tree26/unknown-boot", OWNER, 0, AUTOMATIC);
+    auto* sibling = add("/tmp/ktest_auto_tree26-sibling", OWNER, BOOT, AUTOMATIC);
+    if (manual == nullptr || foreign_node == nullptr || foreign_boot == nullptr || unknown_boot == nullptr || sibling == nullptr)
+        return fail(__LINE__);
+    fixture.native = vfs::mount_filesystem(NATIVE, "tmpfs", nullptr) == 0;
+    if (!fixture.native) return fail(__LINE__);
+    auto pin = vfs::find_mount_point(deep->local_mount_path.data());
+    if (!pin || pin->private_data != deep || !vfs::retain_mount_for_open_file(pin.get())) return fail(__LINE__);
+    fixture.held = pin.get();
+    pin.reset();
+    wki_remote_vfs_unmount_resource_generation(OWNER, parent->resource_id, GENERATION);
+    size_t retired = child->destroy_when_idle + deep->destroy_when_idle;
+    for (auto* extra : extras) retired += extra->destroy_when_idle;
+    if (retired != 32 || !deep->destroy_when_idle || deep->mount_released || !parent->destroy_when_idle || parent->mount_released)
+        return fail(__LINE__);
+    retire_automatic_vfs_descendants(parent);
+    if (!child->destroy_when_idle || child->mount_released) return fail(__LINE__);
+    for (auto* extra : extras)
+        if (!extra->destroy_when_idle || !extra->mount_released) return fail(__LINE__);
+    for (auto* protected_owner : {manual, foreign_node, foreign_boot, unknown_boot, sibling})
+        if (!protected_owner->active || protected_owner->destroy_when_idle || protected_owner->mount_released) return fail(__LINE__);
+    auto native = vfs::find_mount_point(NATIVE);
+    if (!native || native->fs_type != vfs::FSType::TMPFS) return fail(__LINE__);
+    native.reset();
+    if (vfs::unmount_filesystem_by_private_data(deep) != -EBUSY) return fail(__LINE__);
+    vfs::release_mount_from_open_file(fixture.held);
+    fixture.held = nullptr;
+    if (vfs::unmount_filesystem_by_private_data(deep) != 0 || vfs::unmount_filesystem_by_private_data(child) != 0 ||
+        vfs::unmount_filesystem_by_private_data(parent) != -EBUSY)
+        return fail(__LINE__);
+    for (auto* protected_owner : {manual, foreign_node, foreign_boot, unknown_boot})
+        if (vfs::unmount_filesystem_by_private_data(protected_owner) != 0) return fail(__LINE__);
+    if (vfs::unmount_filesystem(NATIVE) != 0) return fail(__LINE__);
+    fixture.native = false;
+    if (vfs::unmount_filesystem_by_private_data(parent) != 0) return fail(__LINE__);
+    auto* successor = add(BASE, OWNER, BOOT, AUTOMATIC, GENERATION + 1);
+    auto* successor_child = add("/tmp/ktest_auto_tree26/successor-child", OWNER, BOOT, AUTOMATIC, GENERATION + 1);
+    if (successor == nullptr || successor_child == nullptr) return fail(__LINE__);
+    // Even a stale cached release flag cannot transfer old path authority.
+    s_vfs_lock.lock();
+    parent->mount_released = false;
+    ++parent->lifecycle_refs;
+    s_vfs_lock.unlock();
+    if (finish_retired_vfs_mount_retry(parent) != -ENOENT || !successor->active || !successor_child->active ||
+        successor->destroy_when_idle || successor_child->destroy_when_idle)
+        return fail(__LINE__);
+    auto current = vfs::find_mount_point(BASE);
+    return current && current->private_data == successor && sibling->active;
+}
+
 #endif
 
 void wki_remote_vfs_unmount(const char* local_mount_path) {
@@ -16315,6 +16487,7 @@ void wki_remote_vfs_unmount_resource_generation(uint16_t owner_node, uint32_t re
         if (!claim_vfs_proxy_unmount_by_generation(owner_node, resource_id, resource_generation, group)) {
             return;
         }
+        retire_automatic_vfs_descendants(group.anchor);
         finish_vfs_proxy_group_unmount(group);
     }
 }

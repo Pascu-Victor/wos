@@ -6351,8 +6351,8 @@ auto ensure_wki_host_root_mount(const char* path) -> int {
     // directory entry. mkdir here would re-enter this helper through mapped
     // CREATE_DIRECTORY lookup before the host mount exists.
 
-    int const RET =
-        ker::net::wki::wki_remote_vfs_mount(NODE_ID, find_ctx.result.resource_id, mount_root.data(), find_ctx.result.generation);
+    int const RET = ker::net::wki::wki_remote_vfs_mount(NODE_ID, find_ctx.result.resource_id, mount_root.data(), find_ctx.result.generation,
+                                                        nullptr, nullptr, ker::net::wki::RemoteVfsMountOrigin::AUTOMATIC);
     if (RET == 0) {
         log::info("auto-mounted WKI host root %s for path %s", mount_root.data(), logical.data());
     }

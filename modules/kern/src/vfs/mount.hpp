@@ -117,6 +117,10 @@ auto unmount_filesystem_if_dev_id(const char* path, uint32_t expected_dev_id) ->
 auto unmount_filesystem_by_private_data(const void* expected_private_data) -> int;
 auto shutdown_unmount_all_exact(const char* root_path) -> int;
 auto find_mount_point(const char* path, size_t known_path_len = UNKNOWN_MOUNT_PATH_LEN) -> MountRef;
+// Exact internal owner lookup and physical remote descendant selection. These
+// retain native rows without resolving a logical path through a task root.
+auto retain_mount_by_private_data(const void* private_data) -> MountRef;
+auto retain_remote_mount_descendant_at(const void* parent_private_data, size_t index, size_t* path_length) -> MountRef;
 // Retain this exact published mount identity without resolving its pathname.
 // Used by dirfd-relative lookup, where the directory's historical VFS path may
 // have been renamed since the File was opened.
