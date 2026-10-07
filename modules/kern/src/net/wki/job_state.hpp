@@ -39,6 +39,7 @@ class Lifecycle {
     [[nodiscard]] constexpr auto phase() const -> Phase { return phase_; }
     [[nodiscard]] constexpr auto detached() const -> bool { return detached_; }
     [[nodiscard]] constexpr auto cancellation_requested() const -> bool { return cancel_requested_; }
+    [[nodiscard]] constexpr auto cancellation_claimed() const -> bool { return cancel_claimed_; }
     [[nodiscard]] constexpr auto publication_claimed() const -> bool { return publication_claimed_; }
     [[nodiscard]] constexpr auto terminal() const -> bool {
         return phase_ == Phase::TERMINAL || phase_ == Phase::CANCELED || phase_ == Phase::EXPIRED;
@@ -77,6 +78,13 @@ class Lifecycle {
         if (phase_ == Phase::PROPOSED || phase_ == Phase::ACCEPTED || phase_ == Phase::COMMITTED) phase_ = Phase::CANCELED;
         return true;
     }
+    // Retain the exact published Task and deferred work before claiming. Queue
+    // pressure before this claim leaves the recorded request available to retry.
+    constexpr auto claim_cancellation() -> bool {
+        if (phase_ != Phase::RUNNING || !cancel_requested_ || cancel_claimed_) return false;
+        cancel_claimed_ = true;
+        return true;
+    }
     constexpr auto complete() -> bool {
         if (phase_ != Phase::RUNNING) return false;
         phase_ = cancel_requested_ ? Phase::CANCELED : Phase::TERMINAL;
@@ -98,6 +106,7 @@ class Lifecycle {
     }
     Phase phase_{Phase::PROPOSED};
     bool cancel_requested_{};
+    bool cancel_claimed_{};
     bool publication_claimed_{};
     bool detached_{};
 };
@@ -113,6 +122,12 @@ struct Result {
     Admission admission{Admission::INVALID};
     Handle handle{};
 };
+struct RetentionPolicy {
+    uint64_t byte_limit{};
+    uint64_t proposal_ttl_us{};
+    uint64_t result_ttl_us{};
+    [[nodiscard]] constexpr auto valid() const -> bool { return byte_limit != 0 && proposal_ttl_us != 0 && result_ttl_us != 0; }
+};
 
 // Caller serializes all shared access. No allocation or native reference is
 // hidden here. Borrowed lifecycle pointers may not escape the registry lock.
@@ -123,20 +138,24 @@ class Registry {
     static_assert(ScopeCount != 0 && RecordCount != 0);
 
    public:
-    constexpr explicit Registry(uint64_t receiver_incarnation, uint64_t first_generation = 1)
-        : receiver_incarnation_(receiver_incarnation), next_generation_(first_generation) {}
+    constexpr Registry(uint64_t receiver_incarnation, RetentionPolicy policy, uint64_t first_generation = 1)
+        : receiver_incarnation_(receiver_incarnation), next_generation_(first_generation), policy_(policy) {}
     Registry(const Registry&) = delete;
     auto operator=(const Registry&) -> Registry& = delete;
     Registry(Registry&&) = delete;
     auto operator=(Registry&&) -> Registry& = delete;
 
-    constexpr auto propose(const Key& key, const Digest& digest) -> Result {
+    // The adapter reserves its bounded maximum payload/stream cost before any
+    // native allocation. Keep the charge until cleanup and record reclamation.
+    constexpr auto propose(const Key& key, const Digest& digest, uint64_t reserved_bytes, uint64_t now_us) -> Result {
+        if (reserved_bytes == 0) return {Admission::INVALID};
         auto const EXISTING = lookup(key);
         if (EXISTING.admission == Admission::REPLAY) {
             auto const& record = records_[EXISTING.handle.index];
             return record.digest == digest ? EXISTING : Result{Admission::CONFLICT};
         }
         if (EXISTING.admission != Admission::UNKNOWN) return EXISTING;
+        if (reserved_bytes > policy_.byte_limit - reserved_bytes_) return {Admission::CAPACITY};
         ScopeRow* scope = nullptr;
         ScopeRow* free_scope = nullptr;
         for (auto& row : scopes_) {
@@ -150,15 +169,23 @@ class Registry {
             if (record.used) continue;
             auto const GENERATION = next_generation_;
             next_generation_ = GENERATION == UINT64_MAX ? 0 : GENERATION + 1;
-            record = {.used = true, .key = key, .digest = digest, .generation = GENERATION};
+            record = {.used = true,
+                      .key = key,
+                      .digest = digest,
+                      .generation = GENERATION,
+                      .reserved_bytes = reserved_bytes,
+                      .created_us = now_us};
+            if (!scope->used) ++scopes_in_use_;
             *scope = {.used = true, .scope = key.scope, .high_water = key.serial};
+            ++records_in_use_;
+            reserved_bytes_ += reserved_bytes;
             return {Admission::NEW, {index, GENERATION}};
         }
         return {Admission::CAPACITY};
     }
 
     [[nodiscard]] constexpr auto lookup(const Key& key) const -> Result {
-        if (!key.valid() || receiver_incarnation_ == 0) return {Admission::INVALID};
+        if (!key.valid() || receiver_incarnation_ == 0 || !policy_.valid()) return {Admission::INVALID};
         if (key.receiver_incarnation != receiver_incarnation_) return {Admission::LOST};
         for (size_t index = 0; index < records_.size(); ++index) {
             auto const& record = records_[index];
@@ -186,6 +213,36 @@ class Registry {
         --record->holders;
         return true;
     }
+    [[nodiscard]] constexpr auto records_in_use() const -> size_t { return records_in_use_; }
+    [[nodiscard]] constexpr auto scopes_in_use() const -> size_t { return scopes_in_use_; }
+    [[nodiscard]] constexpr auto reserved_bytes() const -> uint64_t { return reserved_bytes_; }
+    [[nodiscard]] constexpr auto handle_at(size_t index) const -> Handle {
+        if (index >= records_.size() || !records_[index].used) return {};
+        return {index, records_[index].generation};
+    }
+
+    // Stamp the first terminal transition under the owner lock. A missing stamp
+    // retains safely; status/reattach/replay must never renew terminal retention.
+    constexpr auto mark_terminal(Handle handle, uint64_t now_us) -> bool {
+        auto* record = find(handle);
+        if (record == nullptr || record->terminal_stamped ||
+            (record->lifecycle.phase() != Phase::TERMINAL && record->lifecycle.phase() != Phase::CANCELED))
+            return false;
+        record->terminal_us = now_us;
+        record->terminal_stamped = true;
+        return true;
+    }
+    constexpr auto expire_due(Handle handle, uint64_t now_us) -> bool {
+        auto* record = find(handle);
+        if (record == nullptr) return false;
+        auto const PHASE = record->lifecycle.phase();
+        if (PHASE == Phase::EXPIRED) return expire(handle);
+        bool const DUE = (PHASE == Phase::PROPOSED || PHASE == Phase::ACCEPTED)
+                             ? elapsed(now_us, record->created_us, policy_.proposal_ttl_us)
+                             : (PHASE == Phase::TERMINAL || PHASE == Phase::CANCELED) && record->terminal_stamped &&
+                                   elapsed(now_us, record->terminal_us, policy_.result_ttl_us);
+        return DUE && expire(handle);
+    }
 
     // The adapter checks TTL/ACK policy and releases all native ownership first.
     // Active or held storage cannot be recycled to satisfy a result quota.
@@ -193,6 +250,8 @@ class Registry {
         auto* record = find(handle);
         if (record == nullptr || record->holders != 0) return false;
         if (record->lifecycle.phase() != Phase::EXPIRED && !record->lifecycle.expire()) return false;
+        reserved_bytes_ -= record->reserved_bytes;
+        --records_in_use_;
         *record = {};
         return true;
     }
@@ -208,9 +267,16 @@ class Registry {
         Key key{};
         Digest digest{};
         uint64_t generation{};
+        uint64_t reserved_bytes{};
+        uint64_t created_us{};
+        uint64_t terminal_us{};
         uint32_t holders{};
         Lifecycle lifecycle{};
+        bool terminal_stamped{};
     };
+    [[nodiscard]] static constexpr auto elapsed(uint64_t now_us, uint64_t since_us, uint64_t ttl_us) -> bool {
+        return now_us >= since_us && now_us - since_us >= ttl_us;
+    }
     constexpr auto find(Handle handle) -> Record* {
         if (handle.index >= records_.size() || handle.generation == 0) return nullptr;
         auto& record = records_[handle.index];
@@ -218,6 +284,10 @@ class Registry {
     }
     uint64_t receiver_incarnation_{};
     uint64_t next_generation_{};
+    RetentionPolicy policy_{};
+    uint64_t reserved_bytes_{};
+    size_t records_in_use_{};
+    size_t scopes_in_use_{};
     std::array<ScopeRow, ScopeCount> scopes_{};
     std::array<Record, RecordCount> records_{};
 };

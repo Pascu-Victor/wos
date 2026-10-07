@@ -61,6 +61,13 @@ until publication bookkeeping makes completion consumable. Completion that wins
 the registry lock first remains terminal; cancellation that wins first is
 reported canceled only after actual native cleanup/completion.
 
+Recording cancellation and claiming its native effect are separate transitions.
+A full deferred queue must leave the request pending before the effect claim.
+The adapter may claim only after retaining the exact published Task and work
+ownership. That claim is once-only across disconnect/reattach. Construction
+before publication needs no native signal; completion can win before a pending
+effect is claimed. The value layer does not perform native signal delivery.
+
 Disconnect and reattach change attachment state without changing lifecycle.
 They cannot turn a committed or terminal job back into a proposal. Registry
 handles include nonreused generations, so late callbacks cannot mutate a reused
@@ -107,10 +114,31 @@ Task/File ownership and wait/wakeup implementation for that boundary is still
 outstanding. Existing combined 4096-byte capture and generation-scoped IPC do
 not satisfy these durable stream semantics.
 
-Result count/byte/TTL policy, idempotent signal receipts, negotiated wire framing,
-actual stream transport and the versioned public CLI remain to be implemented.
+The registry requires explicit positive proposal/result TTLs and a byte limit.
+Admission charges the caller's bounded maximum payload/stream cost before native
+allocation, in addition to fixed record/scope count limits. Replays add no charge.
+The conservative charge remains until eligible zero-holder reclamation; active
+committed/starting/running work cannot be expired to admit another job. Manual
+retirement requires explicit result/proposal policy, while timer retirement uses
+the original creation time or first stamped terminal time. Reattach cannot renew
+either. Missing terminal stamps and backward clock observations retain safely.
+Elapsed-time comparisons avoid deadline overflow. Reclamation frees the charge
+while leaving compact dedup watermarks intact. The native adapter still must
+choose realistic limits/costs, stamp transitions and drain exact ownership.
 
-The first implementation is `net/wki/job_state.hpp`. Its host test target,
+`net/wki/job_control.hpp` supplies count-bounded signal receipts per exact job.
+Each immutable serial/signum has one claim and one checked result; retries replay
+proposed, claimed or completed evidence without another effect. Claimed receipts
+cannot be reclaimed. Retirement of completed receipts keeps a compact watermark,
+so an expired signal serial cannot deliver again. Callbacks carry a typed signal
+handle and the enclosing job handle; both generations must match. The adapter
+must retain the exact native Task before claiming and deliver outside locks.
+Whole-job cancellation is independent of optional signal-receipt capacity.
+
+Negotiated wire framing, native retention/controls, actual stream transport and
+the versioned public CLI remain to be implemented.
+
+The lifecycle implementation is `net/wki/job_state.hpp`. Its host test target,
 `wki_job_state_test`, exercises actual production values under ASan/UBSan,
 including lost acceptance/commit replies, disconnect/completion/reattach,
 duplicate identity/digest/attempt rejection, quota refusal, replay after expiry,
@@ -118,17 +146,27 @@ late generation callbacks and publication/cancellation races. The state-space
 walk covers all reachable combinations of lifecycle and attachment flags; it
 does not simulate native task construction or authenticate a network frame.
 Normal Build WOS and a separate instantiation using its current freestanding
-compiler flags passed. No new VM run is required for this unconnected value
-layer; native protocol and lifetime qualification remain outstanding.
+compiler flags passed. No new VM run is required for these unconnected value
+layers; native protocol and lifetime qualification remain outstanding.
 
 The stream host target, `wki_job_stream_test`, has 12 cases. Together with the
-12 lifecycle cases it passes under ASan/UBSan. Sixteen deterministic two-stream
+lifecycle cases it passes under ASan/UBSan. Sixteen deterministic two-stream
 traces compare 323,200 unique delivered bytes against independent input vectors,
 including send refusal/retry, lost/duplicate/reordered credits, rejected stream
 gaps and attachment replay. Additional cases cover full buffers, EOF, stale
 callbacks, early ACK ownership and numeric exhaustion. Freestanding stream
 instantiation, repo format check and Normal Build WOS pass. These are value-model
 checks; actual WKI packets, native blocking and task/FD cleanup are unqualified.
+
+The current foundation suite has 41 ASan/UBSan cases: 22 lifecycle/retention,
+12 streaming and seven signal-receipt tests. Retention cases exercise byte quota
+refusal, original TTLs, missing/time-zero terminal stamps, active/pinned expiry
+refusal, clock/unsigned boundaries, stale timer handles and 2,500 reclaimed
+accepted completions. Signal cases exercise immutable control identities, lost
+claim/result replies, generation/capacity refusal and concurrent once-only claims
+with balanced outer job holders. The effect counters are model witnesses, not
+native signal-delivery evidence. Freestanding instantiation, formatting and
+Normal Build WOS pass for this stage; native adapters remain outstanding.
 
 Owned tests may use `bin/wos-cluster --no-setup` and isolated
 `bin/wos-ktest --no-setup`. Keep one active topology, private COW/reflink images,
