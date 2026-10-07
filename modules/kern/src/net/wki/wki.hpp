@@ -590,8 +590,8 @@ constexpr auto wki_requester_controls_dynamic_channel(uint16_t requester_node, u
 // Initialize WKI subsystem. Called from main.cpp during boot.
 void wki_init();
 
-// Immutable boot qualification mask. Normal builds always return zero; an
-// authenticated exact VFS binding must still authorize feature advertisement.
+// Immutable explicit boot opt-in mask; absent tokens leave every feature off.
+// An authenticated exact VFS binding must still authorize feature advertisement.
 auto wki_vfs_owner_qualification_features() -> uint64_t;
 
 // Shutdown WKI subsystem.

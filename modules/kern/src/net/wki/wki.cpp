@@ -179,7 +179,6 @@ auto cmdline_has_token(const char* cmdline, const char* token) -> bool {
     return false;
 }
 
-#ifdef WOS_SELFTEST
 // Set before WKI publication, then read only by task-context feature handlers.
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 uint64_t s_vfs_owner_qualification_features = 0;
@@ -192,7 +191,6 @@ auto vfs_owner_qualification_features(const char* cmdline) -> uint64_t {
     if (cmdline_has_token(cmdline, "wki.vfs_committed_io")) features |= WKI_VFS_FEATURE_COMMITTED_IO;
     return features;
 }
-#endif
 
 auto wait_diag_enabled() -> bool {
     static std::atomic<int> cached{-1};
@@ -1476,13 +1474,7 @@ void resolve_local_hostname() {
 // Initialization
 // -----------------------------------------------------------------------------
 
-auto wki_vfs_owner_qualification_features() -> uint64_t {
-#ifdef WOS_SELFTEST
-    return s_vfs_owner_qualification_features;
-#else
-    return 0;
-#endif
-}
+auto wki_vfs_owner_qualification_features() -> uint64_t { return s_vfs_owner_qualification_features; }
 
 #ifdef WOS_SELFTEST
 auto wki_selftest_vfs_owner_qualification_tokens() -> bool {
@@ -1586,9 +1578,7 @@ void wki_init() {
     if (cmdline_has_token(ker::init::get_kernel_cmdline(), "wki.routing_lease")) {
         g_wki.capabilities |= WKI_CAP_ROUTING_LEASE;
     }
-#ifdef WOS_SELFTEST
     s_vfs_owner_qualification_features = vfs_owner_qualification_features(ker::init::get_kernel_cmdline());
-#endif
     g_wki.initialized = true;
 
     if (!wki_secure_rdma_init()) {

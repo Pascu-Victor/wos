@@ -1,11 +1,13 @@
 # Owner-authoritative remote VFS consistency
 
-Goal26 design and qualification record. This work is in progress. Normal builds
-leave owner-version, atomic remote append, distributed advisory-lock and
-committed-I/O capabilities unadvertised. Isolated diagnostic runs opt in with
-independent kernel command-line tokens. Host models, compiled KTEST cases
-and native/live qualification will be reported separately as they actually
-complete.
+Goal26 design and qualification record. Owner versions, atomic remote append,
+distributed advisory locks and committed I/O require independent explicit boot
+tokens in normal and diagnostic builds. Every feature defaults off; authenticated
+exact resource-incarnation binding remains required. Earlier diagnostic evidence
+and subsequent normal-kernel qualification are recorded separately below.
+The implementation sections are chronological checkpoints; their disabled or
+pending capability statements describe those checkpoints. The current rollout
+and remaining availability limits are in the final section.
 
 ## Consistency contract
 
@@ -352,14 +354,14 @@ the workload's assertions and coordination; it does not qualify WOS packets,
 capability negotiation, signals, fencing or process exit. WOS compilation and
 packet qualification are recorded separately when performed.
 
-Owned qualification topologies can use a `WOS_SELFTEST` kernel with the exact
+Normal and diagnostic kernels accept the exact
 boot tokens `wki.vfs_owner_versions`, `wki.vfs_atomic_append`,
 `wki.vfs_owner_locks` and `wki.vfs_committed_io`. Each token enables only its
-corresponding feature. The default diagnostic mask is zero, and normal builds
-always return zero regardless of boot tokens. Feature replies still require
+corresponding feature. The default mask is zero in both profiles. Feature
+replies still require
 the current authenticated resource-incarnation binding; these options grant no
-credential, export or ordinary-open authority. They are qualification controls
-while the multi-client recovery matrix remains incomplete.
+credential, export or ordinary-open authority. Explicit opt-in allows ordinary
+kernel use without enabling expensive selftest instrumentation.
 
 Normal and isolated fast KTEST builds and formatting passed for these controls.
 The diagnostic suite passed 73,499 assertions with zero failures and selftest
@@ -604,3 +606,46 @@ complete zero advisory/server-FD/proxy reference drains and normal shutdown.
 All 53 source/artifact pins matched, and all eight disposable disks per case
 were pruned before the next topology. These runs use the diagnostic kernel's
 four explicit feature tokens; normal-kernel rollout is qualified separately.
+
+## Normal opt-in qualification
+
+Normal Build WOS accepts the four exact independent tokens documented above.
+The same immutable mask parser now compiles in both normal and diagnostic
+profiles and runs before WKI publication. Without those tokens the mask remains
+zero. Exact authenticated binding, captured credentials, secure-RDMA defaults,
+wire framing, syscall layouts, channel generations and lock ordering are
+unchanged. Rollback consists of omitting the applicable tokens; unsupported
+semantics continue to fail explicitly or use the documented fresh RPC fallback.
+
+Normal Build WOS, isolated fast compilation, formatting and all 62 source audits
+passed. Isolated runtime29 passed 73,505 assertions with zero failures, all twelve
+required fixtures and normal poweroff. All 38 diagnostic source/ELF pins matched
+and all four private images were pruned.
+
+The normal `RelWithDebInfo` kernel, with `WOS_SELFTEST=OFF` and expensive
+diagnostics off, passed the following ordinary cold-boot cases without an
+owner-first or debugger startup gate:
+
+| Case | Actual qualification |
+|---|---|
+| `n-ivpos1` | Full TMPFS/XFS campaign, three processes on two authenticated ivshmem nodes |
+| `n-ethpos1` | Full TMPFS/XFS campaign, three processes on three authenticated Ethernet nodes |
+| `n-ivmix1` | Full TMPFS/XFS campaign with owner versions disabled, preserving fresh directory fallback |
+| `n-eth-s1`, `n-eth-s2` | TMPFS/XFS client reset, changed authenticated client boot, native old-state retirement and live successor conflicts |
+| `n-eth-f1`, `n-eth-f2` | TMPFS/XFS confirmed fence, three `ENOTCONN` waits, failed/closed old FDs, changed channel incarnation and live successor conflicts |
+
+Every full campaign observed all twelve native pending transitions from zero to
+exactly two before signal/fatal actions. Every recovery case armed three actual
+native pending waits and six locks before its host action. All cases checked
+complete zero final advisory/server-FD/proxy reference drains and normal shutdown.
+All 53 normal source/artifact pins matched. Each topology's private images and
+ivshmem backing were pruned before the next case; an independent final audit
+found no remaining disposable images in any agent-owned Goal26 run.
+
+These results complete the owner-authoritative consistency, append, advisory
+locking, compatibility and VFS retirement contract in the exercised software
+scope. Features remain explicit opt-in. Earlier diagnostic three-node startup
+timeouts and ivshmem heartbeat-probe refusal during the owner-pause fence test
+remain unresolved transport availability observations; the normal passes do
+not establish their causes or a transport-wide fix. No physical RDMA, receiver
+power-loss, replication or journal-durability qualification is implied.
