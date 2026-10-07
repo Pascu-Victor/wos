@@ -51,7 +51,7 @@ def require_order(source: str, tokens: list[str], context: str) -> None:
 
 def test_kernel_advisory_lock_table_is_real_state() -> None:
     source = CORE_CPP.read_text()
-    header = VFS_HPP.read_text()
+    header = VFS_HPP.with_name("flock_abi.hpp").read_text()
     require_tokens(
         header,
         ["struct VfsFlockAbi", "static_assert(sizeof(VfsFlockAbi) == 32)"],

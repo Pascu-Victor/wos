@@ -5,6 +5,7 @@
 #include <platform/dbg/dbg.hpp>
 #include <string_view>
 #include <vfs/coherency.hpp>
+#include <vfs/flock_abi.hpp>
 #include <vfs/stat.hpp>
 
 #include "bits/off_t.h"
@@ -536,14 +537,6 @@ void vfs_wki_load_default_rules();
 
 // File control. Pointer-bearing record-lock commands receive a kernel-owned
 // snapshot; scalar commands continue to use arg and leave flock null.
-struct VfsFlockAbi {
-    int16_t l_type = 0;
-    int16_t l_whence = 0;
-    off_t l_start = 0;
-    off_t l_len = 0;
-    int32_t l_pid = 0;
-};
-static_assert(sizeof(VfsFlockAbi) == 32);
 auto vfs_fcntl(int fd, int cmd, uint64_t arg, VfsFlockAbi* flock = nullptr) -> int;
 auto vfs_fcntl_for_task(ker::mod::sched::task::Task* task, int fd, int cmd, uint64_t arg, VfsFlockAbi* flock = nullptr) -> int;
 

@@ -31,6 +31,9 @@ wos_add_unit_test(e1000_dma_test
 wos_add_unit_test(stack_resume_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/stack_resume_test.cpp
 )
+wos_add_unit_test(vfs_flock_abi_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vfs_flock_abi_test.cpp
+)
 wos_add_unit_test(shutdown_ownership_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/shutdown_ownership_test.cpp
 )

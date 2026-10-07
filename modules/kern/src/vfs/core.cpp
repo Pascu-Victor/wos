@@ -1110,7 +1110,7 @@ auto advisory_get_lock(File* file, uint64_t owner_pid, AdvisoryOwnerKind owner_k
     flock.l_whence = SEEK_SET_VALUE;
     flock.l_start = static_cast<off_t>(std::min<uint64_t>(conflict.start, static_cast<uint64_t>(INT64_MAX)));
     flock.l_len = conflict.end == ADVISORY_RANGE_EOF ? 0 : static_cast<off_t>(conflict.end - conflict.start);
-    flock.l_pid = conflict.owner_kind == AdvisoryOwnerKind::PROCESS          ? static_cast<int32_t>(conflict.owner_pid)
+    flock.l_pid = conflict.owner_kind == AdvisoryOwnerKind::PROCESS          ? static_cast<int64_t>(conflict.owner_pid)
                   : conflict.owner_kind == AdvisoryOwnerKind::REMOTE_PROCESS ? conflict.remote_owner.pid
                                                                              : -1;
     return 0;
@@ -20096,7 +20096,7 @@ auto advisory_apply_remote_locked(File* file, const RemoteAdvisoryOwner& owner, 
             request.l_whence = SEEK_SET_VALUE;
             request.l_start = static_cast<off_t>(std::min<uint64_t>(conflict.start, INT64_MAX));
             request.l_len = conflict.end == ADVISORY_RANGE_EOF ? 0 : static_cast<off_t>(conflict.end - conflict.start);
-            request.l_pid = conflict.owner_kind == AdvisoryOwnerKind::PROCESS          ? static_cast<int32_t>(conflict.owner_pid)
+            request.l_pid = conflict.owner_kind == AdvisoryOwnerKind::PROCESS          ? static_cast<int64_t>(conflict.owner_pid)
                             : conflict.owner_kind == AdvisoryOwnerKind::REMOTE_PROCESS ? conflict.remote_owner.pid
                                                                                        : -1;
         }
@@ -20251,10 +20251,11 @@ auto vfs_advisory_remote_request(File* file, uint64_t operation, RemoteAdvisoryP
         return advisory_snapshot_operation_locked(file, wait, operation, output);
     }
     bool const WAITING = receipt->waiting();
+    if (command.query && status == 0 && (request.l_pid < -1 || request.l_pid > INT32_MAX)) status = -EOVERFLOW;
     RemoteAdvisoryOutcome outcome{.status = status};
     if (command.query && status == 0)
         outcome = {.status = 0,
-                   .pid = request.l_pid,
+                   .pid = static_cast<int32_t>(request.l_pid),
                    .start = request.l_start,
                    .length = request.l_len,
                    .type = request.l_type,
@@ -20377,6 +20378,10 @@ auto vfs_fcntl_for_task(ker::mod::sched::task::Task* task, int fd, int cmd, uint
                 vfs_put_file(f);
                 return -EFAULT;
             }
+            if (cmd == F_OFD_GETLK_CMD && flock->l_pid != 0) {
+                vfs_put_file(f);
+                return -EINVAL;
+            }
             AdvisoryOwnerKind const OWNER_KIND = cmd == F_OFD_GETLK_CMD ? AdvisoryOwnerKind::OPEN_FILE : AdvisoryOwnerKind::PROCESS;
             int const ret = advisory_get_lock(f, ker::mod::sched::task::process_pid(*task), OWNER_KIND, AdvisoryLockFamily::RECORD, *flock);
             vfs_put_file(f);
@@ -20389,6 +20394,10 @@ auto vfs_fcntl_for_task(ker::mod::sched::task::Task* task, int fd, int cmd, uint
             if (flock == nullptr) {
                 vfs_put_file(f);
                 return -EFAULT;
+            }
+            if ((cmd == F_OFD_SETLK_CMD || cmd == F_OFD_SETLKW_CMD) && flock->l_pid != 0) {
+                vfs_put_file(f);
+                return -EINVAL;
             }
             AdvisoryOwnerKind const OWNER_KIND =
                 (cmd == F_OFD_SETLK_CMD || cmd == F_OFD_SETLKW_CMD) ? AdvisoryOwnerKind::OPEN_FILE : AdvisoryOwnerKind::PROCESS;

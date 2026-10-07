@@ -333,6 +333,14 @@ write, truncate, chmod, rename, unlink and pathname replacement, then checks
 fresh bytes/metadata and retained inode identity. It also tests owner-local
 versus remote POSIX, OFD and flock conflicts, record-lock queries, blocking
 grants/unlocks and POSIX release by an independently opened descriptor close.
+The workload rejects nonzero OFD input PIDs, including a value with only high
+32 bits set on WOS, and records each query's result and lock fields. Target
+compilation checks the kernel snapshot against the installed libc's layout.
+
+WOS libc uses a signed 64-bit `flock.l_pid`. The kernel snapshot retains that
+width in the existing 32-byte structure so an OFD conflict's `-1` reaches
+userspace intact. Native queries retain the full PID; remote queries report
+`EOVERFLOW` if a conflict PID cannot fit the unchanged signed 32-bit wire field.
 
 Three host processes passed this campaign under ASan/UBSan. A wrapped host write
 corrupted one append payload and all three verifiers rejected it. This validates
@@ -355,3 +363,11 @@ poweroff, including every feature-token combination and malformed-token
 rejection. All four private images were pruned after ownership/liveness audits.
 The normal kernel's compiled feature getter was also inspected and returns zero.
 These checks qualify the diagnostic controls; packet evidence is separate.
+
+The Ethernet `eth-pos3` diagnostic run passed the complete TMPFS campaign on
+three authenticated nodes: append, cache/retained-handle freshness, POSIX/OFD/
+flock conflict/query/wait/unlock, nonzero OFD PID rejection and independent-close
+release. Both remote OFD query outputs were `pid=-1`. The run then failed during
+XFS setup because the owner image lacked `/var/tmp`; it does not qualify XFS or
+recovery. All 12 owned images were pruned after the failure. Normal and isolated
+builds, host ABI/campaign tests and formatting passed for the PID correction.

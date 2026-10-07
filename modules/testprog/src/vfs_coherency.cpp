@@ -9,14 +9,26 @@
 
 #include <array>
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string_view>
+#include <type_traits>
 #include <utility>
+#include <vfs/flock_abi.hpp>
 
 namespace {
+static_assert(sizeof(struct flock) == sizeof(ker::vfs::VfsFlockAbi));
+static_assert(offsetof(struct flock, l_type) == offsetof(ker::vfs::VfsFlockAbi, l_type));
+static_assert(offsetof(struct flock, l_whence) == offsetof(ker::vfs::VfsFlockAbi, l_whence));
+static_assert(offsetof(struct flock, l_start) == offsetof(ker::vfs::VfsFlockAbi, l_start));
+static_assert(offsetof(struct flock, l_len) == offsetof(ker::vfs::VfsFlockAbi, l_len));
+static_assert(offsetof(struct flock, l_pid) == offsetof(ker::vfs::VfsFlockAbi, l_pid));
+#ifdef __WOS__
+static_assert(std::is_same_v<decltype(flock::l_pid), int64_t>);
+#endif
 constexpr unsigned PARTICIPANTS = 3;
 constexpr unsigned RECORDS = 64;
 constexpr uint64_t RECORD_MAGIC = 0x574F535646533236;
@@ -234,6 +246,21 @@ class Campaign {
             std::snprintf(checked.data(), checked.size(), "%s-conflict", leaf);
             std::snprintf(done.data(), done.size(), "%s-done", leaf);
             if (file.get() < 0) return failure("lock-open");
+            if (family == 1) {
+                for (int cmd : {F_OFD_GETLK, F_OFD_SETLK, F_OFD_SETLKW}) {
+                    struct flock invalid{};
+                    invalid.l_type = F_WRLCK;
+                    invalid.l_whence = SEEK_SET;
+                    invalid.l_len = 16;
+#ifdef __WOS__
+                    invalid.l_pid = static_cast<pid_t>(uint64_t{1} << 32);
+#else
+                    invalid.l_pid = 1;
+#endif
+                    errno = 0;
+                    if (fcntl(file.get(), cmd, &invalid) != -1 || errno != EINVAL) return failure("ofd-invalid-pid");
+                }
+            }
             if (role_ == 0) {
                 if (command(file.get(), family, false, false) != 0 || !mark(held.data())) return failure("owner-acquire");
                 for (unsigned peer = 1; peer < PARTICIPANTS; ++peer)
@@ -249,8 +276,14 @@ class Campaign {
                     query.l_type = F_WRLCK;
                     query.l_whence = SEEK_SET;
                     query.l_len = 16;
-                    if (fcntl(file.get(), family == 0 ? F_GETLK : F_OFD_GETLK, &query) != 0 || query.l_type != F_WRLCK ||
-                        query.l_start != 0 || query.l_len != 16 || (family == 0 ? query.l_pid <= 0 : query.l_pid != -1))
+                    errno = 0;
+                    int const RESULT = fcntl(file.get(), family == 0 ? F_GETLK : F_OFD_GETLK, &query);
+                    std::printf(
+                        "VFS-COHERENCY-QUERY role=%u family=%s result=%d errno=%d type=%d whence=%d start=%lld length=%lld pid=%lld\n",
+                        role_, leaf, RESULT, errno, query.l_type, query.l_whence, static_cast<long long>(query.l_start),
+                        static_cast<long long>(query.l_len), static_cast<long long>(query.l_pid));
+                    if (RESULT != 0 || query.l_type != F_WRLCK || query.l_start != 0 || query.l_len != 16 ||
+                        (family == 0 ? query.l_pid <= 0 : query.l_pid != -1))
                         return failure("remote-query-owner");
                 }
                 if (!mark(checked.data()) || command(file.get(), family, false, true) != 0 || command(file.get(), family, true, false) != 0)
