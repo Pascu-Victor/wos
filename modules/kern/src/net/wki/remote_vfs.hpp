@@ -26,6 +26,13 @@ struct MetadataBatchResult;
 namespace ker::net::wki {
 
 struct DevServerBinding;
+struct VfsSecureContext;
+
+// Retained deferred owner task only. Cleanup closes before joining references,
+// and retains context/backing until both registry regions can be reclaimed.
+void wki_remote_vfs_prepare_secure_binding(DevServerBinding& binding);
+void wki_remote_vfs_close_secure_context(VfsSecureContext* context);
+void wki_remote_vfs_release_secure_context(VfsSecureContext* context);
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -276,6 +283,16 @@ struct RemoteFileContext {
     int32_t remote_fd = -1;
     uint16_t exec_cancel_slot = VFS_EXEC_CANCEL_SLOT_NONE;
     uint16_t ordinary_cancel_slot = VFS_EXEC_CANCEL_SLOT_NONE;
+    uint64_t ordinary_open_token = 0;
+    uint64_t ordinary_open_binding_id = 0;
+    uint32_t ordinary_owner_boot_epoch = 0;
+    uint32_t ordinary_resource_incarnation = 0;
+    uint32_t ordinary_resource_id = 0;
+    // An accepted WRITE without an exact native result must never be replayed.
+    int secure_write_error = 0;         // Protected by io_lock.
+    bool secure_io_negotiated = false;  // Sticky under io_lock; no numeric-FD downgrade.
+    std::unique_ptr<uint8_t[]> secure_read_scratch{};
+    uint32_t secure_read_capacity = 0;
     bool directory_pin = false;
 
     // When browsing a remote host's /wki directory through its root export,

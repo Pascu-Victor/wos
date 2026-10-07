@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <net/wki/rdma_protocol.hpp>
 #include <net/wki/wire.hpp>
 
 namespace ker::net::wki {
@@ -49,6 +50,13 @@ auto stable_key_hash(const WkiChaosFrameKey& key) -> uint64_t {
     hash = hash_value(hash, key.seq_num);
     hash = hash_value(hash, key.ack_num);
     hash = hash_value(hash, key.frame_len);
+    if (key.secure_record) {
+        hash = hash_value(hash, key.secure_transport);
+        hash = hash_value(hash, key.secure_service);
+        hash = hash_value(hash, key.secure_counter);
+        hash = hash_value(hash, key.secure_operation);
+        hash = hash_value(hash, key.secure_region_generation);
+    }
     return hash;
 }
 
@@ -61,6 +69,10 @@ auto stream_key_hash(const WkiChaosFrameKey& key) -> uint64_t {
     hash = hash_value(hash, key.dst_node);
     hash = hash_value(hash, key.channel_id);
     hash = hash_value(hash, key.msg_type);
+    if (key.secure_record) {
+        hash = hash_value(hash, key.secure_transport);
+        hash = hash_value(hash, key.secure_service);
+    }
     return hash;
 }
 
@@ -111,7 +123,9 @@ auto mix64(uint64_t value) -> uint64_t {
 
 auto stream_keys_equal(const WkiChaosFrameKey& lhs, const WkiChaosFrameKey& rhs) -> bool {
     return lhs.direction == rhs.direction && lhs.transport_id == rhs.transport_id && lhs.neighbor == rhs.neighbor &&
-           lhs.src_node == rhs.src_node && lhs.dst_node == rhs.dst_node && lhs.channel_id == rhs.channel_id && lhs.msg_type == rhs.msg_type;
+           lhs.src_node == rhs.src_node && lhs.dst_node == rhs.dst_node && lhs.channel_id == rhs.channel_id &&
+           lhs.msg_type == rhs.msg_type && lhs.secure_record == rhs.secure_record && lhs.secure_transport == rhs.secure_transport &&
+           lhs.secure_service == rhs.secure_service;
 }
 
 auto block_stream_keys_equal(const WkiChaosBlockKey& lhs, const WkiChaosBlockKey& rhs) -> bool {
@@ -182,6 +196,14 @@ auto reliable_message_type(uint8_t raw_type) -> bool {
         case MsgType::GROUP_ROUTE_RESP:
         case MsgType::GROUP_SIGNAL_REQ:
         case MsgType::GROUP_SIGNAL_RESP:
+        case MsgType::SECURE_RDMA_OFFER:
+        case MsgType::SECURE_RDMA_CONFIRM:
+        case MsgType::SECURE_RDMA_GRANT:
+        case MsgType::SECURE_RDMA_REVOKE:
+        case MsgType::SECURE_RDMA_ARM:
+        case MsgType::SECURE_RDMA_ARM_ACK:
+        case MsgType::SECURE_RDMA_CANCEL:
+        case MsgType::SECURE_RDMA_RESULT:
             return true;
     }
     return false;
@@ -223,13 +245,36 @@ auto parse_frame(const void* data, uint16_t len) -> ParsedFrame {
     return parsed;
 }
 
-auto frame_key(WkiChaosDirection direction, uint16_t transport_id, uint16_t neighbor, const void* data, uint16_t len) -> WkiChaosFrameKey {
+auto frame_key(WkiChaosDirection direction, uint16_t transport_id, uint16_t neighbor, const void* data, uint16_t len,
+               bool secure_record = false) -> WkiChaosFrameKey {
     WkiChaosFrameKey key = {};
     key.direction = direction;
     key.transport_id = transport_id;
     key.neighbor = neighbor;
     key.frame_len = len;
-    if (data != nullptr && len >= WKI_HEADER_SIZE) {
+    key.secure_record = secure_record;
+    if (secure_record && data != nullptr && len >= rdma_protocol::HEADER_BYTES) {
+        rdma_protocol::Header header{};
+        std::memcpy(&header, data, sizeof(header));
+        key.src_node = header.src_node;
+        key.dst_node = header.dst_node;
+        key.channel_id = header.channel_id;
+        key.msg_type = static_cast<uint8_t>(WKI_CHAOS_SECURE_TYPE_BASE | header.opcode);
+        key.seq_num = static_cast<uint32_t>(header.counter);
+        key.ack_num = header.fragment_offset;
+        key.secure_transport = header.transport;
+        key.secure_service = header.service;
+        key.secure_counter = header.counter;
+        key.secure_operation = header.operation_id;
+        key.secure_region_generation = header.region_generation;
+        key.frame_valid = header.magic == rdma_protocol::MAGIC && header.version == rdma_protocol::VERSION &&
+                          header.payload_length <= rdma_protocol::FRAGMENT_BYTES &&
+                          rdma_protocol::HEADER_BYTES + header.payload_length == len;
+        key.payload_len = key.frame_valid ? static_cast<uint16_t>(header.payload_length) : 0;
+        key.dev_op_valid = key.frame_valid && header.service >= static_cast<uint8_t>(rdma_protocol::Service::ZONE) &&
+                           header.service <= static_cast<uint8_t>(rdma_protocol::Service::BLOCK);
+        key.dev_op_id = header.service;
+    } else if (!secure_record && data != nullptr && len >= WKI_HEADER_SIZE) {
         ParsedFrame const PARSED = parse_frame(data, len);
         key.src_node = PARSED.header.src_node;
         key.dst_node = PARSED.header.dst_node;
@@ -246,8 +291,8 @@ auto frame_key(WkiChaosDirection direction, uint16_t transport_id, uint16_t neig
     return key;
 }
 
-auto frame_checksum(const void* data, uint16_t len) -> uint32_t {
-    if (data == nullptr || len < WKI_HEADER_SIZE) {
+auto frame_checksum(const void* data, uint16_t len, bool secure_record = false) -> uint32_t {
+    if (secure_record || data == nullptr || len < WKI_HEADER_SIZE) {
         return 0;
     }
     WkiHeader header = {};
@@ -272,7 +317,11 @@ auto valid_frame_checksum(const uint8_t* data, uint16_t len, const WkiHeader& he
     return crc ^ UINT32_MAX;
 }
 
-void corrupt_frame_checksum(uint8_t* data, uint16_t len) {
+void corrupt_frame_checksum(uint8_t* data, uint16_t len, bool secure_record = false) {
+    if (secure_record) {
+        if (data != nullptr && len >= rdma_protocol::HEADER_BYTES) data[offsetof(rdma_protocol::Header, tag)] ^= 1U;
+        return;
+    }
     if (data == nullptr || len < WKI_HEADER_SIZE) {
         return;
     }
@@ -286,10 +335,21 @@ void corrupt_frame_checksum(uint8_t* data, uint16_t len) {
     std::memcpy(data, &header, sizeof(header));
 }
 
-auto corrupt_frame_payload(uint8_t* data, uint16_t len, uint16_t payload_offset, uint8_t payload_xor, WkiChaosCorruptionTrace* trace)
-    -> bool {
+auto corrupt_frame_payload(uint8_t* data, uint16_t len, uint16_t payload_offset, uint8_t payload_xor, WkiChaosCorruptionTrace* trace,
+                           bool secure_record = false) -> bool {
     if (trace == nullptr || payload_xor == 0) {
         return false;
+    }
+    if (secure_record) {
+        auto const KEY = frame_key(WkiChaosDirection::TX, 0, 0, data, len, true);
+        if (!KEY.frame_valid || payload_offset >= KEY.payload_len) return false;
+        data[rdma_protocol::HEADER_BYTES + payload_offset] ^= payload_xor;
+        // Ciphertext/tag byte values are deliberately absent from diagnostics.
+        trace->mode = WkiChaosCorruptMode::PAYLOAD_XOR;
+        trace->payload_offset = payload_offset;
+        trace->payload_xor = payload_xor;
+        trace->payload_changed = true;
+        return true;
     }
     ParsedFrame const PARSED = parse_frame(data, len);
     if (!PARSED.valid || payload_offset >= PARSED.header.payload_len) {
@@ -369,7 +429,8 @@ auto WkiChaosModel::upsert_rule(const WkiChaosRule& rule) -> bool {
     bool valid = VALID_SURFACE;
     if (rule.surface == WkiChaosSurface::FRAME) {
         bool const DEV_OP_TYPE = !rule.match_type || rule.msg_type == static_cast<uint8_t>(MsgType::DEV_OP_REQ) ||
-                                 rule.msg_type == static_cast<uint8_t>(MsgType::DEV_OP_RESP);
+                                 rule.msg_type == static_cast<uint8_t>(MsgType::DEV_OP_RESP) ||
+                                 (rule.msg_type > WKI_CHAOS_SECURE_TYPE_BASE && rule.msg_type <= WKI_CHAOS_SECURE_TYPE_BASE + 6U);
         valid = valid && !HAS_BLOCK_SELECTOR && !HAS_SQE_CORRUPTION && (!rule.match_op || DEV_OP_TYPE) &&
                 (rule.corrupt_mode == WkiChaosCorruptMode::CHECKSUM || rule.corrupt_mode == WkiChaosCorruptMode::PAYLOAD_XOR) &&
                 (rule.action == WkiChaosAction::CORRUPT || !HAS_FRAME_CORRUPTION) &&
@@ -426,9 +487,10 @@ auto WkiChaosModel::heal_partition(uint32_t rule_id) -> bool {
                     continue;
                 }
                 static_cast<void>(append_trace(frame.key, frame.rule_id, WkiChaosAction::PARTITION, WkiChaosOutcome::HEALED,
-                                               frame.queued_event_id, 0, frame_checksum(frame.frame.data(), frame.len),
-                                               frame_checksum(frame.frame.data(), frame.len), 0, 0, 0, 0, frame.corruption,
-                                               frame.coalesced_count));
+                                               frame.queued_event_id, 0,
+                                               frame_checksum(frame.frame.data(), frame.len, frame.key.secure_record),
+                                               frame_checksum(frame.frame.data(), frame.len, frame.key.secure_record), 0, 0, 0, 0,
+                                               frame.corruption, frame.coalesced_count));
                 frame = {};
             }
             return true;
@@ -658,21 +720,21 @@ auto WkiChaosModel::queue_frame(const WkiChaosFrameKey& key, uintptr_t transport
         frame.coalesced_count = 0;
         frame.key = key;
         std::memcpy(frame.frame.data(), data, len);
-        *checksum_before = frame_checksum(frame.frame.data(), len);
+        *checksum_before = frame_checksum(frame.frame.data(), len, key.secure_record);
         if (rule.action == WkiChaosAction::CORRUPT) {
             corruption->mode = rule.corrupt_mode;
             if (rule.corrupt_mode == WkiChaosCorruptMode::PAYLOAD_XOR) {
-                if (!corrupt_frame_payload(frame.frame.data(), len, rule.payload_offset, rule.payload_xor, corruption)) {
+                if (!corrupt_frame_payload(frame.frame.data(), len, rule.payload_offset, rule.payload_xor, corruption, key.secure_record)) {
                     frame = {};
                     invalid_ = true;
                     return QueueFrameResult::INVALID_CORRUPTION;
                 }
             } else {
-                corrupt_frame_checksum(frame.frame.data(), len);
+                corrupt_frame_checksum(frame.frame.data(), len, key.secure_record);
             }
         }
         frame.corruption = *corruption;
-        *checksum_after = frame_checksum(frame.frame.data(), len);
+        *checksum_after = frame_checksum(frame.frame.data(), len, key.secure_record);
         return QueueFrameResult::QUEUED;
     }
     queue_overflow_ = true;
@@ -682,7 +744,7 @@ auto WkiChaosModel::queue_frame(const WkiChaosFrameKey& key, uintptr_t transport
 
 auto WkiChaosModel::coalesce_held_frame(const WkiChaosFrameKey& key, uintptr_t transport_cookie, uint64_t ingress_cookie, uint16_t neighbor,
                                         const void* data, uint16_t len, WkiChaosInterceptResult* result) -> bool {
-    if (data == nullptr || result == nullptr || !key.frame_valid || !reliable_message_type(key.msg_type)) {
+    if (data == nullptr || result == nullptr || key.secure_record || !key.frame_valid || !reliable_message_type(key.msg_type)) {
         return false;
     }
     for (auto& frame : queued_) {
@@ -709,20 +771,20 @@ auto WkiChaosModel::coalesce_held_frame(const WkiChaosFrameKey& key, uintptr_t t
 
 auto WkiChaosModel::intercept(WkiChaosDirection direction, uint16_t transport_id, uintptr_t transport_cookie, uint16_t neighbor,
                               const void* data, uint16_t len, uint32_t local_boot_epoch, uint32_t peer_boot_epoch,
-                              uint32_t peer_channel_epoch, uint64_t ingress_cookie) -> WkiChaosInterceptResult {
+                              uint32_t peer_channel_epoch, uint64_t ingress_cookie, bool secure_record) -> WkiChaosInterceptResult {
     WkiChaosInterceptResult result = {};
     if (!enabled_) {
         return result;
     }
     ++counters_.observed;
-    WkiChaosFrameKey key = frame_key(direction, transport_id, neighbor, data, len);
+    WkiChaosFrameKey key = frame_key(direction, transport_id, neighbor, data, len, secure_record);
     if (coalesce_held_frame(key, transport_cookie, ingress_cookie, neighbor, data, len, &result)) {
         return result;
     }
     if (!next_occurrence(key)) {
         result.outcome = WkiChaosOutcome::STREAM_OVERFLOW;
-        result.event_id = append_trace(key, 0, WkiChaosAction::PASS, result.outcome, 0, 0, frame_checksum(data, len),
-                                       frame_checksum(data, len), local_boot_epoch, peer_boot_epoch, peer_channel_epoch);
+        result.event_id = append_trace(key, 0, WkiChaosAction::PASS, result.outcome, 0, 0, frame_checksum(data, len, secure_record),
+                                       frame_checksum(data, len, secure_record), local_boot_epoch, peer_boot_epoch, peer_channel_epoch);
         return result;
     }
 
@@ -743,7 +805,7 @@ auto WkiChaosModel::intercept(WkiChaosDirection direction, uint16_t transport_id
     result.action = matched->action;
     result.rule_id = matched->id;
     result.matched = true;
-    uint32_t checksum_before = frame_checksum(data, len);
+    uint32_t checksum_before = frame_checksum(data, len, secure_record);
     uint32_t checksum_after = checksum_before;
     uint64_t queued_event_id = 0;
     WkiChaosCorruptionTrace corruption = {};
@@ -965,7 +1027,7 @@ auto WkiChaosModel::intercept_block_sqe(WkiChaosBlockKey key, void* descriptor, 
 }
 
 auto WkiChaosModel::transport_removed(WkiChaosDirection direction, uint16_t transport_id, uint16_t neighbor, const void* data, uint16_t len,
-                                      uint32_t local_boot_epoch, uint32_t peer_boot_epoch, uint32_t peer_channel_epoch)
+                                      uint32_t local_boot_epoch, uint32_t peer_boot_epoch, uint32_t peer_channel_epoch, bool secure_record)
     -> WkiChaosInterceptResult {
     WkiChaosInterceptResult result = {};
     result.action = direction == WkiChaosDirection::TX ? WkiChaosAction::FAIL : WkiChaosAction::DROP;
@@ -974,15 +1036,15 @@ auto WkiChaosModel::transport_removed(WkiChaosDirection direction, uint16_t tran
         return result;
     }
     ++counters_.observed;
-    WkiChaosFrameKey key = frame_key(direction, transport_id, neighbor, data, len);
+    WkiChaosFrameKey key = frame_key(direction, transport_id, neighbor, data, len, secure_record);
     static_cast<void>(next_occurrence(key));
     if (direction == WkiChaosDirection::TX) {
         ++counters_.failed;
     } else {
         ++counters_.dropped;
     }
-    result.event_id = append_trace(key, 0, result.action, result.outcome, 0, 0, frame_checksum(data, len), frame_checksum(data, len),
-                                   local_boot_epoch, peer_boot_epoch, peer_channel_epoch, -1);
+    result.event_id = append_trace(key, 0, result.action, result.outcome, 0, 0, frame_checksum(data, len, secure_record),
+                                   frame_checksum(data, len, secure_record), local_boot_epoch, peer_boot_epoch, peer_channel_epoch, -1);
     return result;
 }
 
@@ -1032,7 +1094,7 @@ auto WkiChaosModel::claim_ready(WkiChaosDeliveryView* out) -> bool {
     oldest->state = QueueState::IN_FLIGHT;
     *out = WkiChaosDeliveryView{
         .slot = oldest_slot,
-        .kind = WkiChaosDeliveryView::Kind::FRAME,
+        .kind = oldest->key.secure_record ? WkiChaosDeliveryView::Kind::SECURE_RECORD : WkiChaosDeliveryView::Kind::FRAME,
         .direction = oldest->direction,
         .action = oldest->action,
         .transport_cookie = oldest->transport_cookie,
@@ -1062,9 +1124,9 @@ void WkiChaosModel::finish_delivery(size_t slot, int32_t transport_result) {
         ++counters_.released;
         WkiChaosOutcome const OUTCOME = transport_result < 0 ? WkiChaosOutcome::FAILED : WkiChaosOutcome::RELEASED;
         static_cast<void>(append_trace(frame.key, frame.rule_id, WkiChaosAction::RELEASE, OUTCOME, frame.queued_event_id,
-                                       frame.release_order, frame_checksum(frame.frame.data(), frame.len),
-                                       frame_checksum(frame.frame.data(), frame.len), 0, 0, 0, transport_result, frame.corruption,
-                                       frame.coalesced_count));
+                                       frame.release_order, frame_checksum(frame.frame.data(), frame.len, frame.key.secure_record),
+                                       frame_checksum(frame.frame.data(), frame.len, frame.key.secure_record), 0, 0, 0, transport_result,
+                                       frame.corruption, frame.coalesced_count));
         frame = {};
     }
 }
@@ -1080,8 +1142,9 @@ void WkiChaosModel::discard_transport(uintptr_t transport_cookie, uint16_t trans
             continue;
         }
         static_cast<void>(append_trace(frame.key, frame.rule_id, frame.action, WkiChaosOutcome::TRANSPORT_REMOVED, frame.queued_event_id,
-                                       frame.release_order, frame_checksum(frame.frame.data(), frame.len),
-                                       frame_checksum(frame.frame.data(), frame.len), 0, 0, 0, 0, frame.corruption, frame.coalesced_count));
+                                       frame.release_order, frame_checksum(frame.frame.data(), frame.len, frame.key.secure_record),
+                                       frame_checksum(frame.frame.data(), frame.len, frame.key.secure_record), 0, 0, 0, 0, frame.corruption,
+                                       frame.coalesced_count));
         frame = {};
     }
     if (transport_id == 0) {

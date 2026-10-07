@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <dev/block_device.hpp>
 #include <net/wki/blk_ring.hpp>
+#include <net/wki/secure_block.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <net/wki/zone.hpp>
@@ -111,6 +112,16 @@ struct ProxyBlockState {
     // Preserve the caller's attach policy across same-binding reconnects.
     // This maps to the existing DEV_ATTACH_DISABLE_RDMA wire bit.
     bool rdma_disabled = false;
+    // Serialized by io_lock; reset only on a confirmed fresh exact attach.
+    rdma_protocol::RegionDescriptor secure_block_grant{};
+    uint64_t secure_block_sequence = 0;
+    bool secure_block_compatible = false;
+    bool secure_block_write_uncertain = false;
+    uint64_t secure_block_attempts = 0;
+    uint64_t secure_block_completions = 0;
+    uint64_t secure_block_bytes = 0;
+    uint64_t secure_block_fallbacks = 0;
+    rdma_protocol::Transport secure_block_transport = rdma_protocol::Transport::NONE;
     uint32_t rdma_zone_id = 0;
     uint32_t rdma_zone_size = 0;
     WkiZoneRef rdma_zone_ref{};  // Exact local grant; cleanup drains users before release.
@@ -170,6 +181,13 @@ struct WkiDevProxyDiagRow {
     uint32_t binding_peer_boot_epoch = 0;
     bool lifecycle_detail_complete = false;
     bool io_detail_complete = false;
+    bool secure_block_compatible = false;
+    bool secure_block_write_uncertain = false;
+    uint64_t secure_block_attempts = 0;
+    uint64_t secure_block_completions = 0;
+    uint64_t secure_block_bytes = 0;
+    uint64_t secure_block_fallbacks = 0;
+    rdma_protocol::Transport secure_block_transport = rdma_protocol::Transport::NONE;
     bool active = false;
     bool fenced = false;
     bool ever_published = false;

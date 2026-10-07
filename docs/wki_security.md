@@ -247,11 +247,20 @@ VFS frames before authentication, leaving reliable requests unacknowledged.
 The capacity fix preserves the fixed receive budget and single-drainer path;
 all 42 native executable stability cases pass over authenticated message rings.
 
-Raw RoCE and direct ivshmem RDMA/doorbell paths can bypass ordinary WKI RX. WKI v3 does not initialize RoCE, does not publish a dedicated RDMA transport on peers, and does not negotiate RDMA capability. RoCE receive admission checks transport publication before parsing or dispatching any opcode, including doorbells.
+Goal 25 closes the former primary-ivshmem exception as well as the dormant raw
+RoCE path: old region allocation, raw read/write and generic doorbell callbacks
+are unavailable, and authoritative zone/service backing is private. A dedicated
+RDMA pointer or authenticated rkey exchange never authorizes subsequent memory
+access. Ethernet and ivshmem instead expose a typed ciphertext facet feeding the
+same session, replay, registry and native-operation admission engine.
 
-Current source does allow authenticated zone creation when the peer policy includes `ZONE_RDMA`; policy denial is conditional. Zone backing selection can also fall back to an RDMA-capable primary ivshmem message transport. IRQ forwarding registration has a similar primary-transport fallback, although no current C++ callers of its registration API were found in the Goal19 9GG review. These paths need further authorization and lifetime qualification; a null dedicated RDMA pointer does not establish that every direct shared-memory path is disabled. The earlier blanket zone-denial statement was stale.
-
-Authenticated raw data access requires a separately reviewed session-bound MAC/replay record for RoCE headers, shared rings, staged data, block SQ/CQ records, and doorbells; authenticating only an rkey exchange is insufficient. Goal19 9GG records the current source map in `build/goal19-roce-receive-admission/next-recon.txt`; it does not claim complete RDMA authorization.
+The new explicit authenticated negotiation preserves the full 16-bit HELLO
+layout and enables ZONE/VFS/IPC/BLOCK independently. Its default service mask
+remains zero pending production availability and physical hardware qualification.
+The scoped software/model/KTEST evidence and retained availability limitations
+are explicit; see [the current design and qualification record](wki_secure_rdma.md). Zones
+still require the ordinary `ZONE_RDMA` policy, and IRQ hints never authorize a
+callback or native effect.
 
 ## Visibility and verification
 

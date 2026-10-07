@@ -1,196 +1,73 @@
 #!/usr/bin/env python3
+"""Audit permanent raw RoCE closure and concrete secure ingress boundaries."""
 
 import re
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[3]
-TRANSPORT_ROCE_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "transport_roce.cpp"
-
-
-def fail(message: str) -> None:
-    raise AssertionError(message)
+ROCE = ROOT / "modules/kern/src/net/wki/transport_roce.cpp"
+ETH = ROOT / "modules/kern/src/net/wki/transport_eth.cpp"
 
 
 def function_body(source: str, name: str) -> str:
     match = re.search(rf"\b(?:int|void|auto)\s+{name}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>*]+)?\s*\{{", source)
     if match is None:
-        fail(f"missing function {name}")
-
-    depth = 1
-    pos = match.end()
-    while pos < len(source) and depth > 0:
-        if source[pos] == "{":
-            depth += 1
-        elif source[pos] == "}":
-            depth -= 1
+        raise AssertionError(f"missing function {name}")
+    depth, pos = 1, match.end()
+    while pos < len(source) and depth:
+        depth += (source[pos] == "{") - (source[pos] == "}")
         pos += 1
-    if depth != 0:
-        fail(f"unterminated function {name}")
-    return source[match.end() : pos - 1]
+    assert depth == 0
+    return source[match.end():pos - 1]
 
 
-def require_tokens(source: str, tokens: list[str], context: str) -> None:
-    missing = [token for token in tokens if token not in source]
-    if missing:
-        fail(f"{context}: missing {', '.join(missing)}")
-
-
-def require_order(source: str, tokens: list[str], context: str) -> None:
-    cursor = 0
+def ordered(body: str, *tokens: str) -> None:
+    pos = 0
     for token in tokens:
-        found = source.find(token, cursor)
-        if found < 0:
-            fail(f"{context}: missing ordered token {token}")
-        cursor = found + len(token)
-
-
-def test_roce_wait_deadlines_are_saturating() -> None:
-    source = TRANSPORT_ROCE_CPP.read_text()
-    require_tokens(
-        source,
-        [
-            "#include <net/wki/timer_math.hpp>",
-            "wki_future_deadline_us(wki_now_us(), ROCE_RDMA_READ_TIMEOUT_US)",
-            "wki_future_deadline_us(wki_now_us(), timeout_us)",
-        ],
-        "RoCE deadline helper use",
-    )
-
-    forbidden = [
-        "wki_now_us() + ROCE_RDMA_READ_TIMEOUT_US",
-        "wki_now_us() + timeout_us",
-    ]
-    present = [token for token in forbidden if token in source]
-    if present:
-        fail("RoCE waits must not use wrapping deadline arithmetic: " + ", ".join(present))
-
-
-def test_temporary_read_completion_wait_is_deadline_bounded() -> None:
-    body = function_body(TRANSPORT_ROCE_CPP.read_text(), "wait_for_temporary_region_completion")
-    require_order(
-        body,
-        [
-            "uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us(), ROCE_RDMA_READ_TIMEOUT_US)",
-            "while (region_is_registered(rkey))",
-            "if (wki_now_us() >= DEADLINE)",
-            "return region_unregister(rkey) ? WKI_ERR_TIMEOUT : WKI_OK",
-            "wki_spin_yield()",
-        ],
-        "temporary RoCE read completion wait",
-    )
-
-
-def test_registered_region_waits_use_shared_deadline_helper() -> None:
-    source = TRANSPORT_ROCE_CPP.read_text()
-    wait_received = function_body(source, "wki_roce_region_wait_received")
-    wait_tagged = function_body(source, "wki_roce_region_wait_tagged_write")
-
-    for name, body, completion_check in [
-        ("wki_roce_region_wait_received", wait_received, "region_received_at_least(rkey, len)"),
-        ("wki_roce_region_wait_tagged_write", wait_tagged, "region_tagged_write_received_at_least(rkey, cookie, len)"),
-    ]:
-        require_order(
-            body,
-            [
-                "uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us(), timeout_us)",
-                "while (wki_now_us() < DEADLINE)",
-                completion_check,
-                "napi_poll_all_pending()",
-                "backlog_drain_all_pending_inline()",
-            ],
-            name,
-        )
-
-
-def test_tagged_completion_query_is_bounded_and_cookie_exact() -> None:
-    body = function_body(TRANSPORT_ROCE_CPP.read_text(), "wki_roce_region_tagged_write_complete")
-    require_tokens(
-        body,
-        [
-            "len == 0 ? region_is_registered(rkey)",
-            "region_tagged_write_received_at_least(rkey, cookie, len)",
-        ],
-        "bounded tagged completion query",
-    )
-    for forbidden in ["while", "napi_poll_all_pending", "backlog_drain_all_pending_inline", "wki_now_us"]:
-        if forbidden in body:
-            fail(f"tagged completion query must not wait or drive unrelated work: found {forbidden}")
-
-
-def test_read_response_copies_each_chunk_while_region_lock_is_held() -> None:
-    source = TRANSPORT_ROCE_CPP.read_text()
-    copy_chunk = function_body(source, "region_copy_read_chunk")
-    packet_chunk = function_body(source, "roce_eth_tx_region_read_chunk")
-    rx = function_body(source, "roce_rx")
-
-    require_order(
-        copy_chunk,
-        [
-            "s_region_lock.lock_irqsave()",
-            "region_find_locked(rkey)",
-            "region->temporary",
-            "memcpy(dst, static_cast<const uint8_t*>(region->vaddr) + offset, len)",
-            "s_region_lock.unlock_irqrestore(FLAGS)",
-        ],
-        "RoCE read chunk must copy from a live region under the registry lock",
-    )
-    require_order(
-        packet_chunk,
-        [
-            "PacketBuffer* pkt = pkt_alloc_tx()",
-            "region_copy_read_chunk(source_rkey, source_offset, pkt->data + sizeof(RoceHeader), payload_len)",
-            "proto::eth_tx(netdev, pkt, peer->mac, WKI_ETHERTYPE_ROCE)",
-        ],
-        "RoCE read response must own copied packet bytes before transmit",
-    )
-    require_order(
-        rx,
-        [
-            "case RoceOpcode::RDMA_READ_REQ",
-            "region_read_range_valid(hdr->rkey, hdr->offset, hdr->length)",
-            "while (remaining > 0)",
-            "roce_eth_tx_region_read_chunk(hdr->src_node, resp_hdr, hdr->rkey, source_offset, CHUNK)",
-        ],
-        "RoCE read request validates the full range then sends copied chunks",
-    )
-    if "region_snapshot(" in source or "RoceRegionSnapshot" in source:
-        fail("RoCE must not lend raw registered backing pointers past s_region_lock")
-
-
-def test_uninitialized_transport_refuses_receive_before_dispatch() -> None:
-    source = TRANSPORT_ROCE_CPP.read_text()
-    require_order(
-        function_body(source, "roce_rx"),
-        [
-            "!s_roce_initialized.load(std::memory_order_acquire) || roce_disabled()",
-            "pkt_free(pkt)",
-            "return;",
-            "pkt->len < sizeof(RoceHeader)",
-            "switch (static_cast<RoceOpcode>(hdr->opcode))",
-        ],
-        "uninitialized RoCE receive admission precedes all opcode effects",
-    )
-    require_order(
-        function_body(source, "wki_roce_transport_init"),
-        ["s_roce_transport.doorbell = roce_doorbell", "s_roce_initialized.store(true, std::memory_order_release)"],
-        "transport callbacks are initialized before publication",
-    )
-    require_tokens(
-        function_body(source, "wki_roce_transport_get"),
-        ["s_roce_initialized.load(std::memory_order_acquire)"],
-        "transport lookup observes publication",
-    )
+        found = body.find(token, pos)
+        assert found >= 0, f"missing ordered token {token}"
+        pos = found + len(token)
 
 
 def main() -> None:
-    test_uninitialized_transport_refuses_receive_before_dispatch()
-    test_roce_wait_deadlines_are_saturating()
-    test_temporary_read_completion_wait_is_deadline_bounded()
-    test_registered_region_waits_use_shared_deadline_helper()
-    test_tagged_completion_query_is_bounded_and_cookie_exact()
-    test_read_response_copies_each_chunk_while_region_lock_is_held()
-    print("WKI RoCE source invariants hold")
+    roce, eth = ROCE.read_text(), ETH.read_text()
+    rejects = {
+        "wki_roce_transport_init": "", "wki_roce_transport_get": "return nullptr;",
+        "wki_roce_region_reset_received": "return false;",
+        "wki_roce_region_prepare_tagged_write": "return false;",
+        "wki_roce_region_tagged_write_complete": "return false;",
+        "wki_roce_region_finish_tagged_write": "",
+        "wki_roce_region_wait_received": "return false;",
+        "wki_roce_region_wait_tagged_write": "return false;",
+        "wki_roce_rdma_write_tagged": "return -1;",
+        "roce_rdma_register_region": "return -1;",
+        "roce_rdma_unregister_region": "return -1;",
+    }
+    for name, expected in rejects.items():
+        assert function_body(roce, name).strip() == expected, f"{name} raw authority/effects remain"
+    for forbidden in ("s_region_buckets", "s_roce_transport", "region_write(", "region_copy_read_chunk", "wki_zone_find(",
+                      "wki_ipc_doorbell_rx(", "while (", "new ", "wki_transport_register("):
+        assert forbidden not in roce, f"legacy RoCE effect remains: {forbidden}"
+    rx = function_body(roce, "roce_rx")
+    ordered(rx, "if (pkt == nullptr) return;", "wki_eth_transport_find(dev)",
+            "transport->secure_kind == rdma_protocol::Transport::ROCE", "dev->mtu >= rdma_protocol::RECORD_BYTES + proto::ETH_HLEN",
+            "pkt->len >= rdma_protocol::HEADER_BYTES", "pkt->len <= rdma_protocol::RECORD_BYTES",
+            "std::memcpy(&magic", "magic == rdma_protocol::MAGIC", "WkiRxMetadata const METADATA",
+            "wki_chaos_secure_rx_ingress(", "net::pkt_free(pkt)")
+    assert rx.count("pkt_free(") == 1 and "get_or_create" not in rx
+    lookup = function_body(eth, "wki_eth_transport_find")
+    ordered(lookup, "g_wki.transport_lock.lock()", "visited < WKI_MAX_TRANSPORTS", "transport->tx != eth_wki_tx",
+            "transport->registration_generation == 0", "transport->chaos_unregistering.load", "priv->netdev == netdev",
+            "g_wki.transport_lock.unlock()")
+    assert "register(" not in lookup and "get_or_create" not in lookup
+    tx = function_body(eth, "eth_secure_tx")
+    ordered(tx, "!eth_secure_record(data, len)", "!eth_secure_capable(priv->netdev)",
+            "wki_eth_transport_find(priv->netdev) != self", "peer->state != PeerState::CONNECTED", "!peer->auth_session.active",
+            "peer->transport != self", "peer->mac.is_multicast()", "PacketBuffer* pkt = pkt_alloc_tx()",
+            "std::memcpy(pkt->data, data, len)", "pkt->dev = priv->netdev", "proto::eth_tx(priv->netdev, pkt, DST_MAC, WKI_ETHERTYPE_ROCE)")
+    assert "pkt_alloc()" not in tx and "wki_eth_get_netdev()" not in tx and "eth_neighbor_find_mac" not in tx
+    assert "rdma_capable = true" not in eth
+    print("WKI secure adapter/legacy RoCE closure source invariants hold")
 
 
 if __name__ == "__main__":

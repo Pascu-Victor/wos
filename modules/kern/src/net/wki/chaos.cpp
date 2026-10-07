@@ -11,6 +11,7 @@
 #include <net/wki/chaos_model.hpp>
 #include <net/wki/dev_proxy.hpp>
 #include <net/wki/dev_server.hpp>
+#include <net/wki/secure_rdma.hpp>
 #include <net/wki/transport_eth.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
@@ -23,10 +24,12 @@ namespace {
 
 constexpr size_t WKI_CHAOS_COMMAND_MAX = 512;
 constexpr uint64_t WKI_CHAOS_INGRESS_MAC_PRESENT = 1ULL << 63U;
+constexpr uint64_t WKI_CHAOS_INGRESS_DIRECT_PRESENT = 1ULL << 62U;
 
 mod::sys::Spinlock s_chaos_lock;                                          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 WkiChaosModel s_chaos;                                                    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<bool> s_chaos_enabled{false};                                 // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> s_secure_pressure_drops{0};                         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<bool> s_runtime_control_allowed{false};                       // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 uint16_t s_next_transport_id = 1;                                         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::array<WkiTransport*, WKI_MAX_TRANSPORTS> s_registered_transports{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -40,7 +43,8 @@ struct ChaosPeerEpochRow {
 std::array<ChaosPeerEpochRow, WKI_MAX_PEERS> s_peer_epochs;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 #ifdef WOS_SELFTEST
-std::atomic<WkiChaosRxDeliveryHook> s_rx_delivery_hook{nullptr};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<WkiChaosRxDeliveryHook> s_rx_delivery_hook{nullptr};         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<WkiChaosRxDeliveryHook> s_secure_rx_delivery_hook{nullptr};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<WkiChaosBlockDoorbellDeliveryHook> s_block_doorbell_delivery_hook{
     nullptr};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 #endif
@@ -472,7 +476,14 @@ auto parse_id_count(TokenCursor& tokens, uint32_t* id, uint32_t* count, bool all
 }
 
 auto pack_ingress_metadata(const WkiRxMetadata* metadata) -> uint64_t {
-    if (metadata == nullptr || !metadata->has_src_mac) {
+    if (metadata == nullptr) return 0;
+    if (metadata->has_direct_peer) {
+        // Providers supply either L2 or provisioned point-to-point identity.
+        // Ambiguous mixed metadata is rejected rather than truncated on delay.
+        if (metadata->has_src_mac || metadata->direct_peer == WKI_NODE_INVALID || metadata->direct_peer == WKI_NODE_BROADCAST) return 0;
+        return WKI_CHAOS_INGRESS_DIRECT_PRESENT | metadata->direct_peer;
+    }
+    if (!metadata->has_src_mac) {
         return 0;
     }
     uint64_t packed = WKI_CHAOS_INGRESS_MAC_PRESENT;
@@ -483,6 +494,11 @@ auto pack_ingress_metadata(const WkiRxMetadata* metadata) -> uint64_t {
 }
 
 auto unpack_ingress_metadata(uint64_t packed, WkiRxMetadata* metadata) -> const WkiRxMetadata* {
+    if (metadata != nullptr && (packed & WKI_CHAOS_INGRESS_DIRECT_PRESENT) != 0 && (packed & WKI_CHAOS_INGRESS_MAC_PRESENT) == 0) {
+        metadata->has_direct_peer = true;
+        metadata->direct_peer = static_cast<uint16_t>(packed);
+        return metadata;
+    }
     if ((packed & WKI_CHAOS_INGRESS_MAC_PRESENT) == 0 || metadata == nullptr) {
         return nullptr;
     }
@@ -494,18 +510,26 @@ auto unpack_ingress_metadata(uint64_t packed, WkiRxMetadata* metadata) -> const 
 }
 
 void frame_epochs_locked(WkiChaosDirection direction, const void* data, uint16_t len, uint32_t* local_boot, uint32_t* peer_boot,
-                         uint32_t* peer_channel) {
+                         uint32_t* peer_channel, bool secure_record = false) {
     *local_boot = g_wki.local_boot_epoch;
     *peer_boot = 0;
     *peer_channel = 0;
     if (data == nullptr || len < WKI_HEADER_SIZE) {
         return;
     }
-    WkiHeader header = {};
-    std::memcpy(&header, data, sizeof(header));
-    uint16_t const PEER_NODE = direction == WkiChaosDirection::TX ? header.dst_node : header.src_node;
+    uint16_t peer_node = WKI_NODE_INVALID;
+    if (secure_record) {
+        if (len < rdma_protocol::HEADER_BYTES) return;
+        rdma_protocol::Header header{};
+        std::memcpy(&header, data, sizeof(header));
+        peer_node = direction == WkiChaosDirection::TX ? header.dst_node : header.src_node;
+    } else {
+        WkiHeader header{};
+        std::memcpy(&header, data, sizeof(header));
+        peer_node = direction == WkiChaosDirection::TX ? header.dst_node : header.src_node;
+    }
     for (auto const& row : s_peer_epochs) {
-        if (row.node_id == PEER_NODE) {
+        if (row.node_id == peer_node) {
             *peer_boot = row.remote_boot_epoch;
             *peer_channel = row.remote_channel_epoch;
             break;
@@ -521,6 +545,16 @@ void deliver_rx(WkiTransport* transport, const void* data, uint16_t len, const W
     }
 #endif
     wki_rx(transport, data, len, metadata);
+}
+
+void deliver_secure_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRxMetadata* metadata) {
+#ifdef WOS_SELFTEST
+    if (auto* hook = s_secure_rx_delivery_hook.load(std::memory_order_acquire); hook != nullptr) {
+        hook(transport, data, len, metadata);
+        return;
+    }
+#endif
+    wki_secure_rdma_rx_ingress(transport, data, len, metadata);
 }
 
 auto deliver_block_doorbell(const WkiChaosBlockKey& key) -> bool {
@@ -544,28 +578,42 @@ struct ChaosRuntimeIntercept {
 };
 
 auto chaos_intercept(WkiChaosDirection direction, WkiTransport* transport, uint16_t neighbor, const void* data, uint16_t len,
-                     uint64_t ingress_cookie) -> ChaosRuntimeIntercept {
+                     uint64_t ingress_cookie, bool secure_record = false) -> ChaosRuntimeIntercept {
     uint32_t local_boot = 0;
     uint32_t peer_boot = 0;
     uint32_t peer_channel = 0;
     ChaosRuntimeIntercept result = {};
-    uint64_t const FLAGS = s_chaos_lock.lock_irqsave();
+    uint64_t flags = 0;
+    if (secure_record) {
+        if (!s_chaos_lock.try_lock()) {
+            s_secure_pressure_drops.fetch_add(1, std::memory_order_relaxed);
+            result.decision.action = WkiChaosAction::DROP;
+            result.decision.outcome = WkiChaosOutcome::QUEUE_OVERFLOW;
+            return result;
+        }
+    } else {
+        flags = s_chaos_lock.lock_irqsave();
+    }
     // Epoch writers publish into this fixed cache while peer_lock is held.
     // Looking it up under only the chaos lock avoids channel.lock -> peer_lock
     // inversion and keeps the injected RX/TX boundary allocation-free.
-    frame_epochs_locked(direction, data, len, &local_boot, &peer_boot, &peer_channel);
+    frame_epochs_locked(direction, data, len, &local_boot, &peer_boot, &peer_channel, secure_record);
     uint16_t const TRANSPORT_ID = transport != nullptr ? transport->chaos_id : 0;
     if (transport == nullptr || TRANSPORT_ID == 0 || transport->chaos_unregistering.load(std::memory_order_relaxed)) {
-        result.decision = s_chaos.transport_removed(direction, TRANSPORT_ID, neighbor, data, len, local_boot, peer_boot, peer_channel);
+        result.decision =
+            s_chaos.transport_removed(direction, TRANSPORT_ID, neighbor, data, len, local_boot, peer_boot, peer_channel, secure_record);
     } else {
         // This lease spans the immediate callback or suppression decision. It
         // closes the enqueue/callback gap against concurrent unregister.
         transport->chaos_in_flight.fetch_add(1, std::memory_order_relaxed);
         result.transport_leased = true;
         result.decision = s_chaos.intercept(direction, TRANSPORT_ID, reinterpret_cast<uintptr_t>(transport), neighbor, data, len,
-                                            local_boot, peer_boot, peer_channel, ingress_cookie);
+                                            local_boot, peer_boot, peer_channel, ingress_cookie, secure_record);
     }
-    s_chaos_lock.unlock_irqrestore(FLAGS);
+    if (secure_record)
+        s_chaos_lock.unlock();
+    else
+        s_chaos_lock.unlock_irqrestore(flags);
     return result;
 }
 
@@ -582,7 +630,7 @@ auto deliver_ready_once() -> int {
     bool leased = false;
     uint64_t const FLAGS = s_chaos_lock.lock_irqsave();
     bool const PRESENT = s_chaos.claim_ready(&delivery);
-    if (PRESENT && delivery.kind == WkiChaosDeliveryView::Kind::FRAME) {
+    if (PRESENT && delivery.kind != WkiChaosDeliveryView::Kind::BLOCK_DOORBELL) {
         transport = reinterpret_cast<WkiTransport*>(delivery.transport_cookie);
         if (transport != nullptr && transport->chaos_id != 0 && !transport->chaos_unregistering.load(std::memory_order_relaxed)) {
             transport->chaos_in_flight.fetch_add(1, std::memory_order_relaxed);
@@ -608,7 +656,20 @@ auto deliver_ready_once() -> int {
     }
 
     int result = WKI_ERR_TX_FAILED;
-    if (transport != nullptr && delivery.direction == WkiChaosDirection::TX && transport->tx != nullptr) {
+    if (delivery.kind == WkiChaosDeliveryView::Kind::SECURE_RECORD && delivery.direction == WkiChaosDirection::TX) {
+        auto* peer = wki_peer_find(delivery.neighbor);
+        if (wki_peer_lifecycle_rx_try_acquire(peer)) {
+            if (peer->node_id == delivery.neighbor && peer->state == PeerState::CONNECTED && peer->auth_session.active && peer->is_direct &&
+                peer->transport == transport && transport->secure_tx != nullptr) {
+                result = transport->secure_tx(transport, delivery.neighbor, delivery.data, delivery.len);
+            }
+            wki_peer_lifecycle_rx_release(peer);
+        }
+    } else if (delivery.kind == WkiChaosDeliveryView::Kind::SECURE_RECORD && delivery.direction == WkiChaosDirection::RX) {
+        WkiRxMetadata metadata{};
+        deliver_secure_rx(transport, delivery.data, delivery.len, unpack_ingress_metadata(delivery.ingress_cookie, &metadata));
+        result = WKI_OK;
+    } else if (transport != nullptr && delivery.direction == WkiChaosDirection::TX && transport->tx != nullptr) {
         result = transport->tx(transport, delivery.neighbor, delivery.data, delivery.len);
     } else if (transport != nullptr && delivery.direction == WkiChaosDirection::RX) {
         WkiRxMetadata metadata = {};
@@ -761,6 +822,7 @@ auto wki_chaos_capture(WkiChaosSnapshot* out, WkiChaosRuleRow* rules, size_t max
         .trace_overflow = s_chaos.trace_overflow(),
         .stream_overflow = s_chaos.stream_overflow(),
         .invalid = s_chaos.invalid(),
+        .secure_pressure_drops = s_secure_pressure_drops.load(std::memory_order_relaxed),
     };
     *rule_count = s_chaos.rule_snapshot(rules, max_rules);
     *trace_count = s_chaos.trace_snapshot(trace, max_trace, after_event_id);
@@ -1034,6 +1096,73 @@ void wki_chaos_rx_ingress(WkiTransport* transport, const void* data, uint16_t le
     release_transport_lease(transport, INTERCEPT.transport_leased);
 }
 
+auto wki_transport_send_secure(WkiTransport* transport, uint16_t neighbor, const void* record, uint16_t size) -> int {
+    auto const HOLD = mod::sched::hold_kernel_shutdown();
+    if (transport == nullptr || transport->secure_tx == nullptr) return WKI_ERR_TX_FAILED;
+    if (!s_chaos_enabled.load(std::memory_order_relaxed)) return transport->secure_tx(transport, neighbor, record, size);
+    auto const INTERCEPT = chaos_intercept(WkiChaosDirection::TX, transport, neighbor, record, size, 0, true);
+    int result = WKI_ERR_TX_FAILED;
+    switch (INTERCEPT.decision.action) {
+        case WkiChaosAction::PASS:
+        case WkiChaosAction::RELEASE:
+            result = transport->secure_tx(transport, neighbor, record, size);
+            break;
+        case WkiChaosAction::DUPLICATE:
+            result = transport->secure_tx(transport, neighbor, record, size);
+            wki_deferred_work_notify();
+            break;
+        case WkiChaosAction::CORRUPT:
+            wki_deferred_work_notify();
+            result = WKI_OK;
+            break;
+        case WkiChaosAction::DROP:
+        case WkiChaosAction::PARTITION:
+        case WkiChaosAction::DELAY:
+        case WkiChaosAction::REORDER:
+            result = WKI_OK;
+            break;
+        case WkiChaosAction::FAIL:
+            break;
+    }
+    release_transport_lease(transport, INTERCEPT.transport_leased);
+    return result;
+}
+
+void wki_chaos_secure_rx_ingress(WkiTransport* transport, const void* record, uint16_t size, const WkiRxMetadata* metadata) {
+    auto const HOLD = mod::sched::hold_kernel_shutdown();
+    if (!s_chaos_enabled.load(std::memory_order_relaxed)) {
+        deliver_secure_rx(transport, record, size, metadata);
+        return;
+    }
+    uint16_t neighbor = WKI_NODE_INVALID;
+    if (record != nullptr && size >= rdma_protocol::HEADER_BYTES) {
+        rdma_protocol::Header header{};
+        std::memcpy(&header, record, sizeof(header));
+        neighbor = header.src_node;
+    }
+    auto const INTERCEPT = chaos_intercept(WkiChaosDirection::RX, transport, neighbor, record, size, pack_ingress_metadata(metadata), true);
+    switch (INTERCEPT.decision.action) {
+        case WkiChaosAction::PASS:
+        case WkiChaosAction::RELEASE:
+            deliver_secure_rx(transport, record, size, metadata);
+            break;
+        case WkiChaosAction::DUPLICATE:
+            deliver_secure_rx(transport, record, size, metadata);
+            wki_deferred_work_notify();
+            break;
+        case WkiChaosAction::CORRUPT:
+            wki_deferred_work_notify();
+            break;
+        case WkiChaosAction::DROP:
+        case WkiChaosAction::DELAY:
+        case WkiChaosAction::REORDER:
+        case WkiChaosAction::FAIL:
+        case WkiChaosAction::PARTITION:
+            break;
+    }
+    release_transport_lease(transport, INTERCEPT.transport_leased);
+}
+
 auto wki_chaos_block_doorbell(const WkiChaosBlockKey& key) -> WkiChaosAction {
     if (!s_chaos_enabled.load(std::memory_order_relaxed)) {
         return WkiChaosAction::PASS;
@@ -1057,6 +1186,9 @@ void wki_chaos_drain_ready() { static_cast<void>(drain_ready()); }
 
 #ifdef WOS_SELFTEST
 void wki_chaos_selftest_set_rx_delivery_hook(WkiChaosRxDeliveryHook hook) { s_rx_delivery_hook.store(hook, std::memory_order_release); }
+void wki_chaos_selftest_set_secure_rx_delivery_hook(WkiChaosRxDeliveryHook hook) {
+    s_secure_rx_delivery_hook.store(hook, std::memory_order_release);
+}
 
 void wki_chaos_selftest_set_block_doorbell_delivery_hook(WkiChaosBlockDoorbellDeliveryHook hook) {
     s_block_doorbell_delivery_hook.store(hook, std::memory_order_release);

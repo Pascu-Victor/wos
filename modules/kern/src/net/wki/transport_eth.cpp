@@ -9,6 +9,7 @@
 #include <net/packet.hpp>
 #include <net/proto/ethernet.hpp>
 #include <net/wki/peer.hpp>
+#include <net/wki/rdma_protocol.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
@@ -167,6 +168,44 @@ namespace {
 // Ethernet WKI Transport
 // -----------------------------------------------------------------------------
 
+auto eth_secure_record(const void* data, uint16_t len) -> bool {
+    if (data == nullptr || len < rdma_protocol::HEADER_BYTES || len > rdma_protocol::RECORD_BYTES) return false;
+    uint32_t magic = 0;
+    std::memcpy(&magic, data, sizeof(magic));
+    return magic == rdma_protocol::MAGIC;
+}
+
+auto eth_secure_capable(const net::NetDevice* dev) -> bool {
+    return dev != nullptr && dev->mtu >= rdma_protocol::RECORD_BYTES + proto::ETH_HLEN;
+}
+
+auto eth_secure_tx(WkiTransport* self, uint16_t neighbor_id, const void* data, uint16_t len) -> int {
+    if (self == nullptr || !eth_secure_record(data, len) || neighbor_id == WKI_NODE_INVALID || neighbor_id == WKI_NODE_BROADCAST ||
+        neighbor_id == g_wki.my_node_id)
+        return -1;
+    auto* priv = static_cast<EthTransportPrivate*>(self->private_data);
+    if (priv == nullptr || !eth_secure_capable(priv->netdev) || self->secure_kind != rdma_protocol::Transport::ROCE ||
+        wki_eth_transport_find(priv->netdev) != self)
+        return -1;
+
+    // The caller retains this exact provider and peer lifecycle incarnation.
+    // Never substitute a global NIC or neighbor-table entry after admission.
+    WkiPeer const* peer = wki_peer_find(neighbor_id);
+    if (peer == nullptr || peer->state != PeerState::CONNECTED || !peer->is_direct || !peer->auth_session.active ||
+        peer->transport != self || peer->mac == proto::MacAddress::zero() || peer->mac.is_multicast())
+        return -1;
+    proto::MacAddress const DST_MAC = peer->mac;
+
+    static_assert(rdma_protocol::RECORD_BYTES <= PKT_BUF_SIZE - PKT_HEADROOM - proto::ETH_HLEN);
+    PacketBuffer* pkt = pkt_alloc_tx();
+    if (pkt == nullptr) return -1;
+    std::memcpy(pkt->data, data, len);
+    pkt->len = len;
+    pkt->dev = priv->netdev;
+    // eth_tx owns the copied packet on every outcome; no control reserve.
+    return proto::eth_tx(priv->netdev, pkt, DST_MAC, WKI_ETHERTYPE_ROCE);
+}
+
 // TX: send a WKI frame over Ethernet
 int eth_wki_tx(WkiTransport* self, uint16_t neighbor_id, const void* data, uint16_t len) {
     auto* priv = static_cast<EthTransportPrivate*>(self->private_data);
@@ -292,6 +331,8 @@ auto get_or_create_eth_transport(net::NetDevice* dev) -> WkiTransport* {
             slot.transport.name = "wki-eth";
             slot.transport.mtu = static_cast<uint16_t>(dev->mtu - proto::ETH_HLEN - WKI_HEADER_SIZE);
             slot.transport.rdma_capable = false;
+            slot.transport.secure_kind = eth_secure_capable(dev) ? rdma_protocol::Transport::ROCE : rdma_protocol::Transport::NONE;
+            slot.transport.secure_tx = eth_secure_capable(dev) ? eth_secure_tx : nullptr;
             slot.transport.private_data = &slot.priv;
             slot.transport.tx = eth_wki_tx;
             slot.transport.tx_pkt = eth_wki_tx_pkt;
@@ -366,6 +407,25 @@ auto wki_eth_transport_source_mac(const WkiTransport* transport, proto::MacAddre
     return true;
 }
 
+auto wki_eth_transport_find(net::NetDevice* netdev) -> WkiTransport* {
+    if (netdev == nullptr) return nullptr;
+    WkiTransport* found = nullptr;
+    g_wki.transport_lock.lock();
+    size_t visited = 0;
+    for (auto* transport = g_wki.transports; transport != nullptr && visited < WKI_MAX_TRANSPORTS; transport = transport->next, ++visited) {
+        if (transport->tx != eth_wki_tx || transport->registration_generation == 0 ||
+            transport->chaos_unregistering.load(std::memory_order_acquire))
+            continue;
+        auto const* priv = static_cast<const EthTransportPrivate*>(transport->private_data);
+        if (priv != nullptr && priv->netdev == netdev) {
+            found = transport;
+            break;
+        }
+    }
+    g_wki.transport_lock.unlock();
+    return found;
+}
+
 void wki_eth_note_rx_contact(WkiTransport* transport, const WkiHeader* header, const proto::MacAddress& src_mac) {
     if (eth_rx_needs_peer_contact_update(transport, header, src_mac)) {
         wki_peer_note_rx_contact(transport, header->src_node, src_mac);
@@ -437,6 +497,8 @@ void wki_eth_transport_init(net::NetDevice* netdev) {
     s_eth_transport.name = "wki-eth";
     s_eth_transport.mtu = static_cast<uint16_t>(netdev->mtu - proto::ETH_HLEN - WKI_HEADER_SIZE);
     s_eth_transport.rdma_capable = false;
+    s_eth_transport.secure_kind = eth_secure_capable(netdev) ? rdma_protocol::Transport::ROCE : rdma_protocol::Transport::NONE;
+    s_eth_transport.secure_tx = eth_secure_capable(netdev) ? eth_secure_tx : nullptr;
     s_eth_transport.private_data = &s_eth_priv;
     s_eth_transport.tx = eth_wki_tx;
     s_eth_transport.tx_pkt = eth_wki_tx_pkt;

@@ -516,6 +516,14 @@ constexpr size_t WKI_IPC_EXPORT_PIPE_FLUSH_WORKER_COUNT = 4;
 constexpr size_t WKI_IPC_EXPORT_PIPE_WRITE_BURST_CALLS = 3;
 std::array<std::deque<ExportPipeWriteBacklog*>, WKI_IPC_EXPORT_PIPE_FLUSH_WORKER_COUNT> g_export_pipe_write_flush_queues;
 std::array<ker::mod::sched::task::Task*, WKI_IPC_EXPORT_PIPE_FLUSH_WORKER_COUNT> g_export_pipe_write_flush_tasks = {};
+std::array<std::atomic<bool>, WKI_IPC_EXPORT_PIPE_FLUSH_WORKER_COUNT> g_export_pipe_write_flush_stopped = {true, true, true, true};
+std::atomic<bool> g_ipc_consumer_stopping{false};
+bool g_ipc_flush_workers_starting = false;  // Protected by s_ipc_lock.
+std::atomic<bool> g_ipc_shutdown_drain_owner{false};
+
+struct IpcShutdownDrainOwner {
+    ~IpcShutdownDrainOwner() { g_ipc_shutdown_drain_owner.store(false, std::memory_order_release); }
+};
 constexpr std::array<const char*, WKI_IPC_EXPORT_PIPE_FLUSH_WORKER_COUNT> WKI_IPC_EXPORT_PIPE_FLUSH_WORKER_NAMES = {
     "wki_pipe_w0",
     "wki_pipe_w1",
@@ -626,18 +634,43 @@ void release_pending_pipe_chunk(PendingPipeChunk& chunk) {
     delete[] DATA;
 }
 
-#ifndef WKI_IPC_PIPE_RDMA_DOORBELL
-#define WKI_IPC_PIPE_RDMA_DOORBELL 0  // NOLINT(cppcoreguidelines-macro-usage)
-#endif
-
-constexpr bool WKI_IPC_PIPE_RDMA_DOORBELL_ENABLED = WKI_IPC_PIPE_RDMA_DOORBELL != 0;
 constexpr uint32_t WKI_IPC_PIPE_RDMA_CAPACITY = WKI_IPC_PIPE_REGION_SIZE;
-constexpr uint32_t WKI_IPC_PIPE_RDMA_TOTAL_SIZE = static_cast<uint32_t>(sizeof(WkiPipeSharedRegion) + WKI_IPC_PIPE_RDMA_CAPACITY);
-constexpr uint32_t WKI_IPC_PIPE_RDMA_NOTIFY_RETRIES = 8;
-constexpr uint32_t WKI_IPC_PIPE_RDMA_NOTIFY_BURST = 3;
+constexpr uint32_t WKI_IPC_PIPE_RDMA_TOTAL_SIZE = WKI_IPC_PIPE_RDMA_CAPACITY;
 constexpr uint64_t WKI_IPC_PIPE_RDMA_WATCH_US = 1000;
-static_assert(WKI_IPC_PIPE_RDMA_CAPACITY != 0);
-
+constexpr uint16_t IPC_SECURE_VERSION = 1;
+constexpr uint16_t IPC_SECURE_QUERY = 1;
+constexpr uint16_t IPC_SECURE_APPEND = 2;
+struct IpcSecureIntent {
+    uint16_t version = IPC_SECURE_VERSION;
+    uint16_t kind = 0;
+    uint32_t resource_id = 0;
+    uint64_t lifetime = 0;
+    uint64_t head = 0;
+    uint64_t tail = 0;
+    uint32_t credit = 0;
+    std::array<uint8_t, 28> reserved{};
+} __attribute__((packed));
+static_assert(sizeof(IpcSecureIntent) == rdma_control::NATIVE_INTENT_BYTES);
+struct IpcSecureSnapshot {
+    uint16_t version = IPC_SECURE_VERSION;
+    uint16_t reserved = 0;
+    uint32_t resource_id = 0;
+    uint64_t lifetime = 0;
+    uint64_t head = 0;
+    uint64_t tail = 0;
+    uint32_t credit = 0;
+    uint32_t flags = 0;
+    int32_t status = 0;
+    uint32_t reserved2 = 0;
+} __attribute__((packed));
+static_assert(sizeof(IpcSecureSnapshot) == 48);
+WkiIpcExport* g_secure_retired_exports = nullptr;
+uint64_t g_next_ipc_secure_lifetime = 1;
+void service_secure_retired_exports();
+auto ipc_peer_cleanup_epoch_locked(uint16_t node_id) -> uint64_t;
+auto ipc_peer_cleanup_active_locked(uint16_t node_id) -> bool;
+auto ipc_peer_cleanup_slot_locked(uint16_t node_id, bool create) -> IpcPeerCleanupEpoch*;
+void release_ipc_dev_op_worker_locked(uint16_t node_id);
 struct PendingProxyPipeClose {
     WkiChannelIdentity channel_identity{};
     uint16_t home_node = WKI_NODE_INVALID;
@@ -717,10 +750,10 @@ auto find_export_by_resource_id(uint32_t resource_id) -> WkiIpcExport*;
 auto send_proxy_pipe_close(ProxyIpcState* proxy, const uint8_t* msg, uint16_t msg_size, uint32_t resource_id, uint16_t op_id) -> void;
 auto enqueue_proxy_pipe_close_tx(const WkiChannelIdentity& identity, const uint8_t* msg, uint16_t msg_size, uint32_t resource_id,
                                  uint16_t op_id) -> bool;
-auto export_pipe_rdma_header(WkiIpcExport* exp) -> WkiPipeSharedRegion*;
 auto export_pipe_rdma_front_locked(WkiIpcExport* exp, uint32_t* tail_out, uint16_t* len_out, uint8_t** data_out) -> bool;
 auto queue_export_pipe_rdma_flush(uint16_t src_node, uint32_t resource_id) -> bool;
 void ipc_release_file_ref(ker::vfs::File* file);
+void wake_export_pipe_write_flush_worker(size_t shard);
 auto is_proxy_pipe_file(const ker::vfs::File* file) -> bool;
 
 auto should_proxy_tty_like_file(ker::vfs::File* file) -> bool {
@@ -1128,7 +1161,7 @@ auto export_can_retire_locked(const WkiIpcExport* exp) -> bool {
     if (exp == nullptr) {
         return true;
     }
-    if ((exp->active && exp->file != nullptr) || exp->pipe_write_in_flight) {
+    if ((exp->active && exp->file != nullptr) || exp->pipe_write_in_flight || exp->pipe_secure_reserved) {
         return false;
     }
     return !export_has_write_backlog_locked(exp) && !export_has_pipe_pump_slot_locked(exp);
@@ -1154,36 +1187,74 @@ auto compact_inactive_exports_locked() -> WkiIpcExport* {
     return retired;
 }
 
-// The selected RoCE transport unregisters under its region lock and does not
-// park. Revoke the key before freeing its backing memory, including abandoned
-// private preparation. No IPC lock may be held by callers.
-void release_export_pipe_rdma(WkiIpcExport& exp) {
-    if (exp.pipe_rdma_rkey != 0 && exp.pipe_rdma_transport != nullptr && exp.pipe_rdma_transport->rdma_unregister_region != nullptr) {
-        static_cast<void>(
-            exp.pipe_rdma_transport->rdma_unregister_region(exp.pipe_rdma_transport, exp.pipe_rdma_rkey, exp.pipe_rdma_region_size));
+// Core unregister closes admission and returns BUSY while exact native/job
+// pins remain. Keep context and backing intact until unregister0. Callers hold
+// no IPC lock; task retirement retries without waiting under a gate.
+auto release_export_pipe_rdma(WkiIpcExport& exp) -> bool {
+    if (exp.pipe_secure_descriptor.rkey != 0) {
+        if (wki_secure_rdma_unregister_region(exp.pipe_secure_descriptor) != 0) return false;
+        exp.pipe_rdma_enabled = false;
+        exp.pipe_secure_descriptor = {};
     }
     exp.pipe_rdma_rkey = 0;
-    exp.pipe_rdma_enabled = false;
-    exp.pipe_rdma_transport = nullptr;
-    auto* region = exp.pipe_rdma_region;
-    exp.pipe_rdma_region = nullptr;
+    auto* region = std::exchange(exp.pipe_rdma_region, nullptr);
+    if (region != nullptr) std::fill_n(region, exp.pipe_rdma_region_size, uint8_t{0});
     exp.pipe_rdma_region_size = 0;
     exp.pipe_rdma_capacity = 0;
     delete[] region;
+    return true;
 }
 
 void free_retired_exports(WkiIpcExport* retired) {
+    bool wake = false;
     while (retired != nullptr) {
         auto* next = retired->pump_next;
         retired->pump_next = nullptr;
-        auto* file = retired->file;
-        retired->file = nullptr;
-        release_export_pipe_rdma(*retired);
-        ipc_release_file_ref(file);
+        if (retired->pipe_secure_descriptor.rkey != 0) {
+            // Context/backing stays reachable until task-context unregister0.
+            uint64_t const IRQF = s_ipc_lock.lock_irqsave();
+            retired->active = false;
+            retired->pump_next = g_secure_retired_exports;
+            g_secure_retired_exports = retired;
+            s_ipc_lock.unlock_irqrestore(IRQF);
+            wake = true;
+        } else {
+            auto* file = retired->file;
+            retired->file = nullptr;
+            static_cast<void>(release_export_pipe_rdma(*retired));
+            ipc_release_file_ref(file);
 #ifdef WOS_SELFTEST
-        g_ipc_export_selftest_frees.fetch_add(1, std::memory_order_relaxed);
+            g_ipc_export_selftest_frees.fetch_add(1, std::memory_order_relaxed);
 #endif
-        delete retired;
+            delete retired;
+        }
+        retired = next;
+    }
+    if (wake) wake_export_pipe_write_flush_worker(0);
+}
+
+void service_secure_retired_exports() {
+    // One bounded detached batch; requeue BUSY without waiting or freeing.
+    uint64_t const IRQF = s_ipc_lock.lock_irqsave();
+    auto* retired = std::exchange(g_secure_retired_exports, nullptr);
+    s_ipc_lock.unlock_irqrestore(IRQF);
+    while (retired != nullptr) {
+        auto* next = retired->pump_next;
+        retired->pump_next = nullptr;
+        if (release_export_pipe_rdma(*retired)) {
+            auto* file = retired->file;
+            retired->file = nullptr;
+            ipc_release_file_ref(file);
+#ifdef WOS_SELFTEST
+            g_ipc_export_selftest_frees.fetch_add(1, std::memory_order_relaxed);
+#endif
+            delete retired;
+        } else {
+            uint64_t const BUSY_IRQF = s_ipc_lock.lock_irqsave();
+            retired->pump_next = g_secure_retired_exports;
+            g_secure_retired_exports = retired;
+            s_ipc_lock.unlock_irqrestore(BUSY_IRQF);
+        }
         retired = next;
     }
 }
@@ -1264,9 +1335,13 @@ void wake_export_pipe_write_flush_worker(size_t shard) {
     if (shard >= g_export_pipe_write_flush_tasks.size()) {
         return;
     }
+    uint64_t const IRQF = s_ipc_lock.lock_irqsave();
     auto* task = g_export_pipe_write_flush_tasks.at(shard);
+    if (task != nullptr && !task->try_acquire_lifetime_ref()) task = nullptr;
+    s_ipc_lock.unlock_irqrestore(IRQF);
     if (task != nullptr) {
         ker::mod::sched::kern_wake(task);
+        task->release();
     }
 }
 
@@ -1448,7 +1523,8 @@ auto queue_export_pipe_write_data(uint32_t resource_id, const uint8_t* data, uin
 
     uint64_t const IRQF = s_ipc_lock.lock_irqsave();
     auto* exp = find_export_by_resource_id(resource_id);
-    if (exp == nullptr || !exp->active || exp->file == nullptr) {
+    if (exp == nullptr || !exp->active || exp->file == nullptr || exp->pipe_secure_reserved ||
+        len > UINT64_MAX - exp->pipe_bytes_received) {
         s_ipc_lock.unlock_irqrestore(IRQF);
         delete[] copy;
         return false;
@@ -1505,7 +1581,7 @@ auto export_pipe_write_bounded(ker::vfs::File* write_file, const uint8_t* data, 
     return written != 0 ? static_cast<ssize_t>(written) : result;
 }
 
-auto export_pipe_write_nonblocking(ker::vfs::File* file, const uint8_t* data, uint16_t len) -> ssize_t {
+auto export_pipe_write_nonblocking(ker::vfs::File* file, const uint8_t* data, uint16_t len, bool grow_capacity = true) -> ssize_t {
     if (len == 0) {
         return 0;
     }
@@ -1517,7 +1593,7 @@ auto export_pipe_write_nonblocking(ker::vfs::File* file, const uint8_t* data, ui
     bool const IS_PROXY_PIPE = is_proxy_pipe_file(file);
     ker::vfs::File pipe_write_view{};
     ker::vfs::File* write_file = file;
-    if (IS_PIPE) {
+    if (IS_PIPE && grow_capacity) {
         // Only actual remote output may grow the source pipe. Submission
         // preparation and rejection must leave its capacity untouched. The
         // deferred caller owns File lifetime and holds no IPC/FD lock here;
@@ -1539,6 +1615,161 @@ auto export_pipe_write_nonblocking(ker::vfs::File* file, const uint8_t* data, ui
 
     return RET;
 }
+
+auto ipc_secure_same_request(const WkiSecureRdmaRequest& a, const WkiSecureRdmaRequest& b) -> bool {
+    return std::memcmp(&a.grant, &b.grant, sizeof(a.grant)) == 0 && a.operation_id == b.operation_id &&
+           a.receive_ticket == b.receive_ticket && a.offset == b.offset && a.length == b.length && a.peer_node == b.peer_node &&
+           a.flags == b.flags && a.opcode == b.opcode && a.intent_length == b.intent_length && a.native_intent == b.native_intent;
+}
+
+auto ipc_secure_intent(const WkiSecureRdmaRequest& request, IpcSecureIntent& intent) -> bool {
+    if (request.intent_length != sizeof(intent) || request.flags != 0 || request.operation_id == 0 || request.receive_ticket == 0)
+        return false;
+    std::memcpy(&intent, request.native_intent.data(), sizeof(intent));
+    return intent.version == IPC_SECURE_VERSION && intent.resource_id != 0 && intent.lifetime != 0 &&
+           std::ranges::all_of(intent.reserved, [](uint8_t value) { return value == 0; });
+}
+
+auto ipc_secure_credit_locked(const WkiIpcExport& exp) -> uint32_t {
+    auto* backlog = find_export_pipe_write_backlog_locked(const_cast<WkiIpcExport*>(&exp));
+    if (exp.pipe_write_in_flight ||
+        (backlog != nullptr && (!backlog->chunks.empty() || backlog->close_pending || backlog->write_error != 0)) ||
+        exp.pipe_bytes_received < exp.pipe_bytes_delivered || exp.pipe_bytes_received - exp.pipe_bytes_delivered > exp.pipe_rdma_capacity)
+        return 0;
+    return exp.pipe_rdma_capacity - static_cast<uint32_t>(exp.pipe_bytes_received - exp.pipe_bytes_delivered);
+}
+
+auto ipc_secure_arm(void* context, const WkiSecureRdmaRequest& request, uint64_t& generation) -> int {
+    auto* exp = static_cast<WkiIpcExport*>(context);
+    IpcSecureIntent intent{};
+    if (exp == nullptr || !ipc_secure_intent(request, intent)) return -EINVAL;
+    if (!ipc_channels_live(exp->channels, request.peer_node)) return -ESTALE;
+    uint64_t const IRQF = s_ipc_lock.lock_irqsave();
+    int status = -ESTALE;
+    if (!g_ipc_consumer_stopping.load(std::memory_order_acquire) && exp->active && exp->pipe_secure_activated && exp->pipe_rdma_enabled &&
+        exp->file != nullptr && exp->res_type == ResourceType::IPC_PIPE && exp->consumer_node == request.peer_node &&
+        exp->pipe_rdma_capacity != 0 && exp->pipe_secure_descriptor.service == static_cast<uint8_t>(rdma_protocol::Service::IPC) &&
+        exp->pipe_secure_descriptor.binding_generation == exp->pipe_secure_lifetime &&
+        !ipc_peer_cleanup_active_locked(exp->consumer_node) &&
+        exp->pipe_secure_epoch == ipc_peer_cleanup_epoch_locked(exp->consumer_node) && intent.resource_id == exp->resource_id &&
+        intent.lifetime == exp->pipe_secure_lifetime &&
+        std::memcmp(&request.grant, &exp->pipe_secure_descriptor, sizeof(request.grant)) == 0) {
+        status = -EAGAIN;
+        if (!exp->pipe_secure_reserved && !exp->pipe_write_in_flight) {
+            if (intent.kind == IPC_SECURE_QUERY && request.opcode == rdma_protocol::Opcode::READ && request.offset == 0 &&
+                request.length == sizeof(IpcSecureSnapshot) && intent.head == 0 && intent.tail == 0 && intent.credit == 0)
+                status = 0;
+            else if (intent.kind == IPC_SECURE_APPEND && request.opcode == rdma_protocol::Opcode::WRITE && request.length != 0 &&
+                     intent.head == exp->pipe_bytes_received && intent.tail == exp->pipe_bytes_delivered &&
+                     intent.credit == ipc_secure_credit_locked(*exp) && intent.credit != 0 && request.length <= intent.credit &&
+                     request.length <= UINT16_MAX && request.offset == intent.head % exp->pipe_rdma_capacity &&
+                     request.length <= exp->pipe_rdma_capacity - request.offset && request.length <= UINT64_MAX - intent.head)
+                status = 0;
+            if (status == 0) {
+                exp->pipe_secure_reserved = true;
+                exp->pipe_secure_request = request;
+                exp->pipe_secure_file = exp->file;
+                exp->file->refcount.fetch_add(1, std::memory_order_acq_rel);
+                generation = exp->pipe_secure_lifetime;
+            }
+        }
+    }
+    s_ipc_lock.unlock_irqrestore(IRQF);
+    return status;
+}
+
+auto ipc_secure_effect(void* context, const WkiSecureRdmaRequest& request, std::span<uint8_t> backing, std::span<const uint8_t> input,
+                       std::span<uint8_t> output) -> WkiSecureRdmaResult {
+    auto* exp = static_cast<WkiIpcExport*>(context);
+    IpcSecureIntent intent{};
+    if (exp == nullptr || !ipc_secure_intent(request, intent)) return {-EINVAL, 0, WkiSecureRdmaOutcome::NO_EFFECT};
+    if (!ipc_channels_live(exp->channels, request.peer_node)) return {-ESTALE, 0, WkiSecureRdmaOutcome::NO_EFFECT};
+    uint64_t const IRQF = s_ipc_lock.lock_irqsave();
+    bool const EXACT = exp->pipe_secure_reserved && ipc_secure_same_request(request, exp->pipe_secure_request) &&
+                       backing.data() == exp->pipe_rdma_region && backing.size() == exp->pipe_rdma_region_size;
+    bool const LIVE = EXACT && exp->active && exp->pipe_secure_activated && exp->file == exp->pipe_secure_file &&
+                      !ipc_peer_cleanup_active_locked(exp->consumer_node) &&
+                      exp->pipe_secure_epoch == ipc_peer_cleanup_epoch_locked(exp->consumer_node);
+    if (!LIVE) {
+        s_ipc_lock.unlock_irqrestore(IRQF);
+        return {-ESTALE, 0, WkiSecureRdmaOutcome::NO_EFFECT};
+    }
+    if (intent.kind == IPC_SECURE_QUERY) {
+        if (!input.empty() || output.size() != sizeof(IpcSecureSnapshot)) {
+            s_ipc_lock.unlock_irqrestore(IRQF);
+            return {-EINVAL, 0, WkiSecureRdmaOutcome::NO_EFFECT};
+        }
+        IpcSecureSnapshot const SNAPSHOT{.resource_id = exp->resource_id,
+                                         .lifetime = exp->pipe_secure_lifetime,
+                                         .head = exp->pipe_bytes_received,
+                                         .tail = exp->pipe_bytes_delivered,
+                                         .credit = ipc_secure_credit_locked(*exp)};
+        s_ipc_lock.unlock_irqrestore(IRQF);
+        std::memcpy(output.data(), &SNAPSHOT, sizeof(SNAPSHOT));
+        return {0, sizeof(SNAPSHOT), WkiSecureRdmaOutcome::EXACT};
+    }
+    auto* epoch = ipc_peer_cleanup_slot_locked(exp->consumer_node, false);
+    if (intent.kind != IPC_SECURE_APPEND || input.size() != request.length || !output.empty() || epoch == nullptr ||
+        epoch->active_workers == UINT32_MAX || exp->pipe_write_in_flight || intent.head != exp->pipe_bytes_received ||
+        intent.tail != exp->pipe_bytes_delivered || intent.credit != ipc_secure_credit_locked(*exp) || request.length > intent.credit ||
+        request.offset > backing.size() || request.length > backing.size() - request.offset) {
+        s_ipc_lock.unlock_irqrestore(IRQF);
+        return {-EAGAIN, 0, WkiSecureRdmaOutcome::NO_EFFECT};
+    }
+    ++epoch->active_workers;
+    exp->pipe_secure_effect_claimed = true;
+    exp->pipe_write_in_flight = true;
+    auto* file = exp->pipe_secure_file;
+    s_ipc_lock.unlock_irqrestore(IRQF);
+    // Full authenticated coverage is immutable before any private/native effect.
+    std::memcpy(backing.data() + request.offset, input.data(), input.size());
+    // The common service owner must not allocate/reclaim while executing a
+    // native effect. Ordinary shard writes retain their optional pipe growth.
+    ssize_t const WRITTEN =
+        export_pipe_write_nonblocking(file, backing.data() + request.offset, static_cast<uint16_t>(request.length), false);
+    uint32_t const PREFIX = WRITTEN > 0 ? static_cast<uint32_t>(std::min<ssize_t>(WRITTEN, request.length)) : 0;
+    uint64_t const DONE_IRQF = s_ipc_lock.lock_irqsave();
+    // The claimed native File remains pinned through close. Publish its actual
+    // prefix even if native admission retired while VFS ran; never resolve a replacement.
+    exp->pipe_bytes_received += PREFIX;
+    exp->pipe_bytes_delivered += PREFIX;
+    exp->pipe_write_in_flight = false;
+    exp->pipe_secure_effect_claimed = false;
+    release_ipc_dev_op_worker_locked(exp->consumer_node);
+    s_ipc_lock.unlock_irqrestore(DONE_IRQF);
+    if (PREFIX != 0) return {0, PREFIX, WkiSecureRdmaOutcome::EXACT};
+    if (WRITTEN == -EAGAIN || WRITTEN == -EPIPE || WRITTEN == -EINTR)
+        return {static_cast<int32_t>(WRITTEN), 0, WkiSecureRdmaOutcome::NO_EFFECT};
+    return {WRITTEN < 0 ? static_cast<int32_t>(WRITTEN) : -EIO, 0, WkiSecureRdmaOutcome::UNCERTAIN};
+}
+
+void ipc_secure_release(void* context, const WkiSecureRdmaRequest& request, const WkiSecureRdmaResult& /*result*/) {
+    auto* exp = static_cast<WkiIpcExport*>(context);
+    if (exp == nullptr) return;
+    ker::vfs::File* file = nullptr;
+    size_t shard = 0;
+    bool wake = false;
+    WkiIpcExport* retired = nullptr;
+    uint64_t const IRQF = s_ipc_lock.lock_irqsave();
+    if (exp->pipe_secure_reserved && !exp->pipe_secure_effect_claimed && ipc_secure_same_request(request, exp->pipe_secure_request)) {
+        file = std::exchange(exp->pipe_secure_file, nullptr);
+        exp->pipe_secure_reserved = false;
+        exp->pipe_secure_request = {};
+        auto* backlog = find_export_pipe_write_backlog_locked(exp);
+        if (backlog != nullptr) {
+            queue_export_pipe_write_flush_locked(backlog);
+            shard = export_pipe_write_backlog_shard(backlog);
+            wake = true;
+        }
+        retired = compact_inactive_exports_locked();
+    }
+    s_ipc_lock.unlock_irqrestore(IRQF);
+    ipc_release_file_ref(file);
+    free_retired_exports(retired);
+    if (wake) wake_export_pipe_write_flush_worker(shard);
+}
+
+constexpr WkiSecureRdmaHooks IPC_SECURE_HOOKS{ipc_secure_arm, ipc_secure_effect, ipc_secure_release};
 
 auto mark_export_pipe_write_closed(uint32_t resource_id, uint16_t consumer_node, uint64_t expected_bytes = 0,
                                    bool has_expected_bytes = false, ResourceType expected_type = ResourceType::CUSTOM) -> bool {
@@ -1585,8 +1816,19 @@ auto finish_export_pipe_write_locked(ExportPipeWriteBacklog* backlog, WkiIpcExpo
     return exp;
 }
 
-[[noreturn]] void export_pipe_write_flush_thread_loop(size_t shard) {
+void export_pipe_write_flush_thread_loop(size_t shard) {
     for (;;) {
+        auto const HOLD = ker::mod::sched::hold_kernel_shutdown();
+        if (g_ipc_consumer_stopping.load(std::memory_order_acquire) || ker::mod::sched::kernel_threads_shutdown_requested()) {
+            g_ipc_consumer_stopping.store(true, std::memory_order_release);
+            uint64_t const IRQF = s_ipc_lock.lock_irqsave();
+            auto* worker = std::exchange(g_export_pipe_write_flush_tasks.at(shard), nullptr);
+            s_ipc_lock.unlock_irqrestore(IRQF);
+            if (worker != nullptr) worker->release();
+            g_export_pipe_write_flush_stopped.at(shard).store(true, std::memory_order_release);
+            return;
+        }
+        if (shard == 0) service_secure_retired_exports();
         ExportPipeWriteBacklog* backlog = nullptr;
         uint64_t irqf = s_ipc_lock.lock_irqsave();
         auto& queue = g_export_pipe_write_flush_queues.at(shard);
@@ -1600,7 +1842,13 @@ auto finish_export_pipe_write_locked(ExportPipeWriteBacklog* backlog, WkiIpcExpo
         s_ipc_lock.unlock_irqrestore(irqf);
 
         if (backlog == nullptr) {
-            ker::mod::sched::kern_block();
+            uint64_t const RETIRE_IRQF = s_ipc_lock.lock_irqsave();
+            bool const RETIRING = shard == 0 && g_secure_retired_exports != nullptr;
+            s_ipc_lock.unlock_irqrestore(RETIRE_IRQF);
+            if (RETIRING)
+                ker::mod::sched::kern_sleep_us(WKI_IPC_PIPE_RDMA_WATCH_US);
+            else
+                ker::mod::sched::kern_block();
             continue;
         }
 
@@ -1609,9 +1857,6 @@ auto finish_export_pipe_write_locked(ExportPipeWriteBacklog* backlog, WkiIpcExpo
         uint32_t resource_id = 0;
         uint16_t remaining = 0;
         uint8_t const* data_ptr = nullptr;
-        uint8_t* rdma_data_ptr = nullptr;
-        uint32_t rdma_tail = 0;
-        bool rdma_chunk = false;
         bool close_pending = false;
         bool close_ready = false;
 
@@ -1621,6 +1866,13 @@ auto finish_export_pipe_write_locked(ExportPipeWriteBacklog* backlog, WkiIpcExpo
             erase_export_pipe_write_backlog_locked(backlog);
             s_ipc_lock.unlock_irqrestore(irqf);
             free_export_pipe_write_backlog(backlog);
+            continue;
+        }
+
+        if (exp->pipe_secure_reserved) {
+            queue_export_pipe_write_flush_locked(backlog);
+            s_ipc_lock.unlock_irqrestore(irqf);
+            ker::mod::sched::kern_sleep_us(WKI_IPC_PIPE_WRITE_RETRY_US);
             continue;
         }
 
@@ -1685,10 +1937,6 @@ auto finish_export_pipe_write_locked(ExportPipeWriteBacklog* backlog, WkiIpcExpo
             auto& chunk = backlog->chunks.front();
             remaining = static_cast<uint16_t>(chunk.len - chunk.offset);
             data_ptr = chunk.data + chunk.offset;
-        } else if (export_pipe_rdma_front_locked(exp, &rdma_tail, &remaining, &rdma_data_ptr)) {
-            file->refcount.fetch_add(1, std::memory_order_acq_rel);
-            data_ptr = rdma_data_ptr;
-            rdma_chunk = true;
         } else if (close_pending) {
             if (!close_ready) {
                 s_ipc_lock.unlock_irqrestore(irqf);
@@ -1746,18 +1994,8 @@ auto finish_export_pipe_write_locked(ExportPipeWriteBacklog* backlog, WkiIpcExpo
 
         if (WRITE_RET > 0) {
             auto const ADVANCED = static_cast<uint16_t>(std::cmp_less(WRITE_RET, remaining) ? WRITE_RET : remaining);
-            if (rdma_chunk) {
-                auto* header = export_pipe_rdma_header(exp);
-                if (header != nullptr) {
-                    uint32_t const NEW_TAIL = rdma_tail + ADVANCED;
-                    header->tail.store(NEW_TAIL, std::memory_order_release);
-                    uint32_t const HEAD = header->head.load(std::memory_order_acquire);
-                    uint32_t const USED = HEAD - NEW_TAIL;
-                    uint32_t const CREDITS = USED < exp->pipe_rdma_capacity ? exp->pipe_rdma_capacity - USED : 0;
-                    header->credits.store(CREDITS, std::memory_order_release);
-                    exp->pipe_bytes_received += ADVANCED;
-                }
-            } else {
+            if (ADVANCED <= UINT64_MAX - exp->pipe_bytes_delivered) exp->pipe_bytes_delivered += ADVANCED;
+            {
                 auto& chunk = backlog->chunks.front();
                 chunk.offset = static_cast<uint16_t>(chunk.offset + ADVANCED);
                 backlog->buffered_bytes -= ADVANCED;
@@ -1826,13 +2064,25 @@ auto finish_export_pipe_write_locked(ExportPipeWriteBacklog* backlog, WkiIpcExpo
     }
 }
 
-[[noreturn]] void export_pipe_write_flush_thread_0() { export_pipe_write_flush_thread_loop(0); }
+[[noreturn]] void export_pipe_write_flush_thread_0() {
+    export_pipe_write_flush_thread_loop(0);
+    ker::mod::sched::exit_current_kernel_thread();
+}
 
-[[noreturn]] void export_pipe_write_flush_thread_1() { export_pipe_write_flush_thread_loop(1); }
+[[noreturn]] void export_pipe_write_flush_thread_1() {
+    export_pipe_write_flush_thread_loop(1);
+    ker::mod::sched::exit_current_kernel_thread();
+}
 
-[[noreturn]] void export_pipe_write_flush_thread_2() { export_pipe_write_flush_thread_loop(2); }
+[[noreturn]] void export_pipe_write_flush_thread_2() {
+    export_pipe_write_flush_thread_loop(2);
+    ker::mod::sched::exit_current_kernel_thread();
+}
 
-[[noreturn]] void export_pipe_write_flush_thread_3() { export_pipe_write_flush_thread_loop(3); }
+[[noreturn]] void export_pipe_write_flush_thread_3() {
+    export_pipe_write_flush_thread_loop(3);
+    ker::mod::sched::exit_current_kernel_thread();
+}
 
 auto queue_pending_pipe_data(uint16_t home_node, uint32_t resource_id, const uint8_t* data, uint16_t len,
                              IpcDevOpWork** work_owner = nullptr) -> bool {
@@ -2090,26 +2340,6 @@ auto proxy_pipe_read(ker::vfs::File* f, void* buf, size_t count, size_t /*offset
     }
 }
 
-auto ipc_pipe_rdma_transport_for_peer(uint16_t peer_node) -> WkiTransport* {
-    if (!WKI_IPC_PIPE_RDMA_DOORBELL_ENABLED) {
-        return nullptr;
-    }
-
-    WkiPeer const* peer = wki_peer_find(peer_node);
-    WkiTransport* transport = peer != nullptr ? peer->rdma_transport : nullptr;
-    if (transport == nullptr || transport->name == nullptr) {
-        return nullptr;
-    }
-    if (std::strcmp(transport->name, "wki-roce") != 0) {
-        return nullptr;
-    }
-    if (!transport->rdma_capable || transport->rdma_register_region == nullptr || transport->rdma_read == nullptr ||
-        transport->rdma_write == nullptr || transport->doorbell == nullptr || transport->rdma_unregister_region == nullptr) {
-        return nullptr;
-    }
-    return transport;
-}
-
 auto acquire_proxy_pipe_rdma_writer(ProxyIpcState* proxy, bool nonblocking) -> bool {
     if (proxy == nullptr) {
         return false;
@@ -2139,120 +2369,68 @@ void release_proxy_pipe_rdma_writer(ProxyIpcState* proxy) {
     }
 }
 
-auto notify_proxy_pipe_rdma_data(ProxyIpcState* proxy) -> int {
-    if (proxy == nullptr || proxy->pipe_rdma_transport == nullptr || proxy->pipe_rdma_transport->doorbell == nullptr) {
-        return WKI_ERR_INVALID;
-    }
-
-    uint32_t const DOORBELL = WKI_DOORBELL_IPC_BASE | (proxy->resource_id & WKI_IPC_RESOURCE_MASK);
-    int last_ret = WKI_ERR_TX_FAILED;
-    bool any_ok = false;
-    for (uint32_t attempt = 0; attempt < WKI_IPC_PIPE_RDMA_NOTIFY_BURST; ++attempt) {
-        last_ret = proxy->pipe_rdma_transport->doorbell(proxy->pipe_rdma_transport, proxy->home_node, DOORBELL);
-        if (last_ret != WKI_OK) {
-            break;
-        }
-        any_ok = true;
-    }
-    return any_ok ? WKI_OK : last_ret;
-}
-
 auto proxy_pipe_write_rdma(ProxyIpcState* proxy, const uint8_t* src, size_t count, uint64_t callsite, bool nonblocking) -> ssize_t {
-    if (proxy == nullptr || src == nullptr || count == 0 || !proxy->pipe_rdma_enabled || proxy->pipe_rdma_transport == nullptr ||
-        proxy->pipe_rdma_rkey == 0 || proxy->pipe_rdma_capacity == 0) {
+    if (proxy == nullptr || src == nullptr || count == 0 || !proxy->pipe_rdma_enabled || proxy->pipe_rdma_rkey == 0 ||
+        proxy->pipe_rdma_capacity == 0)
         return -EOPNOTSUPP;
-    }
-
-    if (!acquire_proxy_pipe_rdma_writer(proxy, nonblocking)) {
-        if (!proxy->active.load(std::memory_order_acquire)) {
-            return -EIO;
-        }
-        return nonblocking ? -EAGAIN : -EINTR;
-    }
-
-    auto release = [&]() { release_proxy_pipe_rdma_writer(proxy); };
+    if (proxy->pipe_secure_uncertain.load(std::memory_order_acquire)) return -EIO;
+    rdma_protocol::RegionDescriptor grant{};
+    if (!wki_secure_rdma_remote_grant(proxy->data_channel, rdma_protocol::Service::IPC, proxy->pipe_rdma_rkey, grant,
+                                      rdma_protocol::PERMIT_READ | rdma_protocol::PERMIT_WRITE) ||
+        grant.size != proxy->pipe_rdma_capacity || grant.binding_generation == 0)
+        return -EOPNOTSUPP;
     size_t sent = 0;
-    uint32_t attempts = 0;
-
     while (sent < count && proxy->active.load(std::memory_order_acquire)) {
-        uint32_t used = proxy->pipe_rdma_head - proxy->pipe_rdma_tail_cache;
-        if (used >= proxy->pipe_rdma_capacity) {
-            std::array<uint8_t, sizeof(WkiPipeSharedRegion)> header = {};
-            int const READ_RET = proxy->pipe_rdma_transport->rdma_read(proxy->pipe_rdma_transport, proxy->home_node, proxy->pipe_rdma_rkey,
-                                                                       0, header.data(), static_cast<uint32_t>(header.size()));
-            if (READ_RET != WKI_OK) {
-                release();
-                return sent != 0 ? static_cast<ssize_t>(sent) : static_cast<ssize_t>(-EIO);
-            }
-
-            uint32_t remote_tail = 0;
-            uint32_t remote_flags = 0;
-            std::memcpy(&remote_tail, header.data() + offsetof(WkiPipeSharedRegion, tail), sizeof(remote_tail));
-            std::memcpy(&remote_flags, header.data() + offsetof(WkiPipeSharedRegion, flags), sizeof(remote_flags));
-            if ((remote_flags & WKI_PIPE_FLAG_READ_CLOSED) != 0U) {
-                release();
-                return sent != 0 ? static_cast<ssize_t>(sent) : static_cast<ssize_t>(-EPIPE);
-            }
-            proxy->pipe_rdma_tail_cache = remote_tail;
-            used = proxy->pipe_rdma_head - proxy->pipe_rdma_tail_cache;
+        IpcSecureIntent query{.kind = IPC_SECURE_QUERY, .resource_id = proxy->resource_id, .lifetime = grant.binding_generation};
+        IpcSecureSnapshot snapshot{};
+        auto const OBSERVED = wki_secure_rdma_read(proxy->data_channel, grant, 0, {reinterpret_cast<uint8_t*>(&snapshot), sizeof(snapshot)},
+                                                   {reinterpret_cast<const uint8_t*>(&query), sizeof(query)});
+        if (OBSERVED.outcome != WkiSecureRdmaOutcome::EXACT || OBSERVED.status != 0 || OBSERVED.bytes != sizeof(snapshot))
+            return sent != 0 ? static_cast<ssize_t>(sent) : -EOPNOTSUPP;
+        if (snapshot.version != IPC_SECURE_VERSION || snapshot.reserved != 0 || snapshot.reserved2 != 0 ||
+            snapshot.resource_id != proxy->resource_id || snapshot.lifetime != grant.binding_generation || snapshot.credit > grant.size ||
+            snapshot.head < snapshot.tail || snapshot.head - snapshot.tail > grant.size || snapshot.flags != 0)
+            return sent != 0 ? static_cast<ssize_t>(sent) : -EIO;
+        if (snapshot.status != 0) return sent != 0 ? static_cast<ssize_t>(sent) : snapshot.status < 0 ? snapshot.status : -EIO;
+        if (snapshot.credit == 0) return sent != 0 ? static_cast<ssize_t>(sent) : -EOPNOTSUPP;
+        uint64_t const OFFSET = snapshot.head % grant.size;
+        uint32_t const LENGTH = static_cast<uint32_t>(std::min<size_t>({count - sent, snapshot.credit, grant.size - OFFSET, UINT16_MAX}));
+        IpcSecureIntent intent{.kind = IPC_SECURE_APPEND,
+                               .resource_id = proxy->resource_id,
+                               .lifetime = grant.binding_generation,
+                               .head = snapshot.head,
+                               .tail = snapshot.tail,
+                               .credit = snapshot.credit};
+        auto const RESULT = wki_secure_rdma_write(proxy->data_channel, grant, OFFSET, {src + sent, LENGTH}, 0,
+                                                  {reinterpret_cast<const uint8_t*>(&intent), sizeof(intent)});
+        if (RESULT.outcome == WkiSecureRdmaOutcome::NO_EFFECT) {
+            if (RESULT.status == -EPIPE) proxy->message_write_error.store(-EPIPE, std::memory_order_release);
+            return sent != 0 ? static_cast<ssize_t>(sent) : RESULT.status == -EPIPE ? -EPIPE : -EOPNOTSUPP;
         }
-
-        if (used >= proxy->pipe_rdma_capacity) {
-            if (nonblocking) {
-                release();
-                return sent != 0 ? static_cast<ssize_t>(sent) : static_cast<ssize_t>(-EAGAIN);
-            }
-            if (current_task_has_deliverable_signal()) {
-                release();
-                return sent != 0 ? static_cast<ssize_t>(sent) : static_cast<ssize_t>(-EINTR);
-            }
-            if (attempts < WKI_IPC_PIPE_RDMA_NOTIFY_RETRIES) {
-                static_cast<void>(notify_proxy_pipe_rdma_data(proxy));
-            }
-            attempts++;
-            uint64_t const SLEEP_US = ipc_pipe_send_retry_sleep_us(WKI_ERR_NO_CREDITS, attempts);
-            g_proxy_pipe_rdma_full_waits.fetch_add(1, std::memory_order_relaxed);
-            g_proxy_write_block_us.fetch_add(SLEEP_US, std::memory_order_relaxed);
-            ker::mod::sched::kern_sleep_us(SLEEP_US);
-            continue;
+        if (RESULT.outcome != WkiSecureRdmaOutcome::EXACT || RESULT.status != 0 || RESULT.bytes == 0 || RESULT.bytes > LENGTH) {
+            proxy->pipe_secure_uncertain.store(true, std::memory_order_release);
+            proxy->message_write_error.store(-EIO, std::memory_order_release);
+            proxy_wake_message_write_waiters(proxy);
+            wki_ipc_proxy_wake_poll_waiters(proxy);
+            return sent != 0 ? static_cast<ssize_t>(sent) : -EIO;
         }
-
-        attempts = 0;
-        uint32_t const FREE = proxy->pipe_rdma_capacity - used;
-        uint32_t const RING_HEAD = proxy->pipe_rdma_head % proxy->pipe_rdma_capacity;
-        uint32_t const CONTIG = std::min(proxy->pipe_rdma_capacity - RING_HEAD, FREE);
-        uint32_t const TO_SEND = static_cast<uint32_t>(std::min<size_t>(count - sent, CONTIG));
-        uint64_t const DATA_OFFSET = sizeof(WkiPipeSharedRegion) + RING_HEAD;
-
-        int const DATA_RET = proxy->pipe_rdma_transport->rdma_write(proxy->pipe_rdma_transport, proxy->home_node, proxy->pipe_rdma_rkey,
-                                                                    DATA_OFFSET, src + sent, TO_SEND);
-        if (DATA_RET != WKI_OK) {
-            release();
-            return sent != 0 ? static_cast<ssize_t>(sent) : static_cast<ssize_t>(-EIO);
-        }
-
-        uint32_t const NEW_HEAD = proxy->pipe_rdma_head + TO_SEND;
-        int const HEAD_RET = proxy->pipe_rdma_transport->rdma_write(proxy->pipe_rdma_transport, proxy->home_node, proxy->pipe_rdma_rkey,
-                                                                    offsetof(WkiPipeSharedRegion, head), &NEW_HEAD, sizeof(NEW_HEAD));
-        if (HEAD_RET != WKI_OK) {
-            release();
-            return sent != 0 ? static_cast<ssize_t>(sent) : static_cast<ssize_t>(-EIO);
-        }
-
-        proxy->pipe_rdma_head = NEW_HEAD;
-        sent += TO_SEND;
-        proxy->bytes_written.fetch_add(TO_SEND, std::memory_order_acq_rel);
-        g_proxy_write_payload_bytes.fetch_add(TO_SEND, std::memory_order_relaxed);
-        perf_record_ipc_point(ker::mod::perf::WkiPerfIpcOp::PROXY_WRITE, proxy->home_node, WKI_CHAN_IPC_DATA, 0, 0, TO_SEND, callsite);
-        static_cast<void>(notify_proxy_pipe_rdma_data(proxy));
+        proxy->pipe_rdma_head = snapshot.head + RESULT.bytes;
+        proxy->pipe_rdma_tail_cache = proxy->pipe_rdma_head;
+        proxy->bytes_written.fetch_add(RESULT.bytes, std::memory_order_acq_rel);
+        // Only the authenticated native prefix receipt certifies delivery.
+        proxy->bytes_delivered.fetch_add(RESULT.bytes, std::memory_order_release);
+        sent += RESULT.bytes;
+        g_proxy_write_payload_bytes.fetch_add(RESULT.bytes, std::memory_order_relaxed);
+        perf_record_ipc_point(ker::mod::perf::WkiPerfIpcOp::PROXY_WRITE, proxy->home_node, WKI_CHAN_IPC_DATA, 0, 0, RESULT.bytes, callsite);
+        if (nonblocking || current_task_has_deliverable_signal()) break;
     }
-
-    release();
-    if (sent == 0 && !proxy->active.load(std::memory_order_acquire)) {
-        return -EIO;
-    }
-    return static_cast<ssize_t>(sent);
+    return sent != 0 ? static_cast<ssize_t>(sent) : -EIO;
 }
+
+struct ProxyPipeWriterLoan {
+    ProxyIpcState* proxy = nullptr;
+    ~ProxyPipeWriterLoan() { release_proxy_pipe_rdma_writer(proxy); }
+};
 
 auto proxy_pipe_write(ker::vfs::File* f, const void* buf, size_t count, size_t /*offset*/) -> ssize_t {
     auto* proxy = static_cast<ProxyIpcState*>(f->private_data);
@@ -2274,7 +2452,11 @@ auto proxy_pipe_write(ker::vfs::File* f, const void* buf, size_t count, size_t /
     }
 
     bool const NONBLOCKING = (f->open_flags & WKI_IPC_O_NONBLOCK) != 0;
-    if (proxy->pipe_rdma_enabled && proxy->pipe_rdma_transport != nullptr) {
+    ProxyPipeWriterLoan writer;
+    if (proxy->pipe_rdma_enabled) {
+        if (!acquire_proxy_pipe_rdma_writer(proxy, NONBLOCKING))
+            return finish(!proxy->active.load(std::memory_order_acquire) ? -EIO : NONBLOCKING ? -EAGAIN : -EINTR);
+        writer.proxy = proxy;
         auto const RDMA_RET = proxy_pipe_write_rdma(proxy, static_cast<const uint8_t*>(buf), count, WOS_PERF_CALLSITE(), NONBLOCKING);
         if (RDMA_RET != -EOPNOTSUPP) {
             return finish(RDMA_RET, RDMA_RET > 0 ? static_cast<uint64_t>(RDMA_RET) : 0);
@@ -2833,37 +3015,8 @@ auto reserve_ipc_resource_ids(uint32_t& next, uint16_t count, uint32_t& first) -
     return true;
 }
 
-auto export_pipe_rdma_header(WkiIpcExport* exp) -> WkiPipeSharedRegion* {
-    if (exp == nullptr || !exp->pipe_rdma_enabled || exp->pipe_rdma_region == nullptr) {
-        return nullptr;
-    }
-    return reinterpret_cast<WkiPipeSharedRegion*>(exp->pipe_rdma_region);
-}
-
-auto export_pipe_rdma_front_locked(WkiIpcExport* exp, uint32_t* tail_out, uint16_t* len_out, uint8_t** data_out) -> bool {
-    if (tail_out == nullptr || len_out == nullptr || data_out == nullptr) {
-        return false;
-    }
-
-    auto* header = export_pipe_rdma_header(exp);
-    if (header == nullptr || exp->pipe_rdma_capacity == 0) {
-        return false;
-    }
-
-    uint32_t const HEAD = header->head.load(std::memory_order_acquire);
-    uint32_t const TAIL = header->tail.load(std::memory_order_relaxed);
-    uint32_t used = HEAD - TAIL;
-    if (used == 0) {
-        return false;
-    }
-    used = std::min(used, exp->pipe_rdma_capacity);
-
-    uint32_t const RING_TAIL = TAIL % exp->pipe_rdma_capacity;
-    uint32_t const CONTIG = std::min(exp->pipe_rdma_capacity - RING_TAIL, used);
-    *tail_out = TAIL;
-    *len_out = static_cast<uint16_t>(std::min<uint32_t>(CONTIG, UINT16_MAX));
-    *data_out = exp->pipe_rdma_region + sizeof(WkiPipeSharedRegion) + RING_TAIL;
-    return *len_out != 0;
+auto export_pipe_rdma_front_locked(WkiIpcExport* /*exp*/, uint32_t* /*tail_out*/, uint16_t* /*len_out*/, uint8_t** /*data_out*/) -> bool {
+    return false;
 }
 
 auto queue_export_pipe_rdma_flush(uint16_t src_node, uint32_t resource_id) -> bool {
@@ -2889,39 +3042,35 @@ auto queue_export_pipe_rdma_flush(uint16_t src_node, uint32_t resource_id) -> bo
 
 // Both output objects are owned by IpcFdSnapshot until final publication.
 // Never put a private backlog in a global registry or queue across registration.
-void prepare_export_pipe_rdma(WkiIpcExport& exp, ExportPipeWriteBacklog*& backlog, WkiTransport* transport, int fail_at = -1) {
-    if (transport == nullptr || transport->rdma_register_region == nullptr || transport->rdma_unregister_region == nullptr ||
-        exp.res_type != ResourceType::IPC_PIPE || exp.resource_id > WKI_IPC_RESOURCE_MASK)
+void prepare_export_pipe_rdma(WkiIpcExport& exp, ExportPipeWriteBacklog*& /*backlog*/, ker::vfs::File* file, int fail_at = -1) {
+    if (g_ipc_consumer_stopping.load(std::memory_order_acquire)) return;
+    // Relay/socket/PTY effects may recursively call WKI and stay message-only.
+    if (fail_at == 0 || exp.res_type != ResourceType::IPC_PIPE || !ker::vfs::vfs_is_pipe_file(file) ||
+        !wki_secure_rdma_available(exp.channels.data, rdma_protocol::Service::IPC))
         return;
-    if (fail_at == 0) return;
-    backlog = new (std::nothrow) ExportPipeWriteBacklog();
-    if (backlog == nullptr) return;
+    uint64_t const IRQF = s_ipc_lock.lock_irqsave();
+    uint64_t const LIFETIME = g_next_ipc_secure_lifetime;
+    if (LIFETIME != 0 && LIFETIME != UINT64_MAX)
+        ++g_next_ipc_secure_lifetime;
+    else
+        g_next_ipc_secure_lifetime = 0;
+    exp.pipe_secure_epoch = ipc_peer_cleanup_epoch_locked(exp.consumer_node);
+    s_ipc_lock.unlock_irqrestore(IRQF);
+    if (LIFETIME == 0 || LIFETIME == UINT64_MAX) return;
     if (fail_at != 1) exp.pipe_rdma_region = new (std::nothrow) uint8_t[WKI_IPC_PIPE_RDMA_TOTAL_SIZE];
-    if (exp.pipe_rdma_region != nullptr) {
-        exp.pipe_rdma_region_size = WKI_IPC_PIPE_RDMA_TOTAL_SIZE;
-        exp.pipe_rdma_capacity = WKI_IPC_PIPE_RDMA_CAPACITY;
-        exp.pipe_rdma_transport = transport;
-        std::fill_n(exp.pipe_rdma_region, WKI_IPC_PIPE_RDMA_TOTAL_SIZE, uint8_t{0});
-        auto* header = reinterpret_cast<WkiPipeSharedRegion*>(exp.pipe_rdma_region);
-        header->head.store(0, std::memory_order_relaxed);
-        header->tail.store(0, std::memory_order_relaxed);
-        header->credits.store(WKI_IPC_PIPE_RDMA_CAPACITY, std::memory_order_relaxed);
-        header->capacity = WKI_IPC_PIPE_RDMA_CAPACITY;
-        header->flags = 0;
-        // Write the key directly into the recovery-owned exporter. The current
-        // RoCE callback publishes that key under its lock and does not park.
-        int const RESULT = transport->rdma_register_region(transport, reinterpret_cast<uint64_t>(exp.pipe_rdma_region),
-                                                           exp.pipe_rdma_region_size, &exp.pipe_rdma_rkey);
-        if (RESULT == WKI_OK && exp.pipe_rdma_rkey != 0) {
-            exp.pipe_rdma_enabled = true;
-            backlog->exp = &exp;
-            backlog->resource_id = exp.resource_id;
-            return;
-        }
-    }
-    release_export_pipe_rdma(exp);
-    delete backlog;
-    backlog = nullptr;
+    if (exp.pipe_rdma_region == nullptr) return;
+    exp.pipe_rdma_region_size = WKI_IPC_PIPE_RDMA_TOTAL_SIZE;
+    exp.pipe_rdma_capacity = WKI_IPC_PIPE_RDMA_CAPACITY;
+    exp.pipe_secure_lifetime = LIFETIME;
+    std::fill_n(exp.pipe_rdma_region, exp.pipe_rdma_region_size, uint8_t{0});
+    int const RESULT = wki_secure_rdma_register_region(
+        exp.channels.data, rdma_protocol::Service::IPC, exp.pipe_rdma_region, exp.pipe_rdma_region_size, LIFETIME,
+        rdma_protocol::PERMIT_READ | rdma_protocol::PERMIT_WRITE, IPC_SECURE_HOOKS, &exp, exp.pipe_secure_descriptor);
+    if (RESULT == 0) {
+        exp.pipe_rdma_enabled = true;
+        exp.pipe_rdma_rkey = exp.pipe_secure_descriptor.rkey;
+    } else
+        static_cast<void>(release_export_pipe_rdma(exp));
 }
 
 auto proxy_ring_used_bytes(const ProxyIpcState* proxy) -> uint64_t {
@@ -2942,6 +3091,8 @@ auto proxy_ring_used_bytes(const ProxyIpcState* proxy) -> uint64_t {
 struct PipePumpArg {
     std::atomic<WkiIpcExport*> exp{nullptr};
     ker::mod::sched::task::Task* worker = nullptr;
+    bool starting = false;  // Protected by s_ipc_lock.
+    std::atomic<bool> stopped{true};
 };
 
 struct PipePumpRetirement {
@@ -3033,7 +3184,8 @@ auto pop_pipe_pump_queue_locked() -> WkiIpcExport* {
 }
 
 auto assign_next_pipe_pump_locked(PipePumpArg& pump_arg) -> WkiIpcExport* {
-    if (pump_arg.worker == nullptr || pump_arg.exp.load(std::memory_order_acquire) != nullptr) {
+    if (g_ipc_consumer_stopping.load(std::memory_order_acquire) || ker::mod::sched::kernel_threads_shutdown_requested() ||
+        pump_arg.worker == nullptr || pump_arg.exp.load(std::memory_order_acquire) != nullptr) {
         return nullptr;
     }
 
@@ -3086,12 +3238,14 @@ auto stop_pipe_pump_locked(WkiIpcExport* exp) -> ker::mod::sched::task::Task* {
     }
     remove_pipe_pump_queue_locked(exp);
     exp->pump_running.store(false, std::memory_order_release);
-    return exp->pump_task;
+    auto* task = exp->pump_task;
+    return task != nullptr && task->try_acquire_lifetime_ref() ? task : nullptr;
 }
 
 void wake_pipe_pump(ker::mod::sched::task::Task* task) {
     if (task != nullptr) {
         ker::mod::sched::kern_wake(task);
+        task->release();
     }
 }
 
@@ -3156,7 +3310,7 @@ auto register_poll_write_waiter(ker::vfs::File* file, bool* ready_now) -> bool {
 }
 
 template <int SLOT>
-[[noreturn]] void pipe_pump_thread_fn() {
+void pipe_pump_thread_fn() {
     auto* arg = &std::get<SLOT>(g_pump_args);
     // Each DATA/EOF send initializes its exact transmitted prefix. Keep the
     // unused bounded tail untouched while this worker reuses the frame.
@@ -3164,6 +3318,18 @@ template <int SLOT>
     std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> msg __attribute__((uninitialized));
 
     for (;;) {
+        auto const HOLD = ker::mod::sched::hold_kernel_shutdown();
+        if (g_ipc_consumer_stopping.load(std::memory_order_acquire) || ker::mod::sched::kernel_threads_shutdown_requested()) {
+            g_ipc_consumer_stopping.store(true, std::memory_order_release);
+            uint64_t const IRQF = s_ipc_lock.lock_irqsave();
+            auto* worker = std::exchange(arg->worker, nullptr);
+            PipePumpRetirement const RETIREMENT = collect_pipe_pump_retirement_locked(*arg, arg->exp.load(std::memory_order_acquire));
+            s_ipc_lock.unlock_irqrestore(IRQF);
+            finish_pipe_pump_retirement(RETIREMENT);
+            if (worker != nullptr) worker->release();
+            arg->stopped.store(true, std::memory_order_release);
+            return;
+        }
         auto* exp = arg->exp.load(std::memory_order_acquire);
         if (exp == nullptr) {
             ker::mod::sched::kern_block();
@@ -3199,7 +3365,8 @@ template <int SLOT>
 #ifdef DEBUG_WKI_IPC
         ker::mod::dbg::log("[WKI] IPC pipe pump started: resource_id=%u target=0x%04x", resource_id, target);
 #endif
-        while (exp->active && exp->pump_running.load(std::memory_order_acquire)) {
+        while (exp->active && exp->pump_running.load(std::memory_order_acquire) &&
+               !g_ipc_consumer_stopping.load(std::memory_order_acquire) && !ker::mod::sched::kernel_threads_shutdown_requested()) {
             if (!pipe_pump_read_ready(file)) {
                 continue;
             }
@@ -3210,7 +3377,7 @@ template <int SLOT>
             IpcPerfTrace read_trace(ker::mod::perf::WkiPerfIpcOp::PIPE_PUMP_READ, target, WKI_CHAN_RESOURCE, WOS_PERF_CALLSITE());
             ssize_t n = 0;
             if (file != nullptr && file->fops != nullptr && file->fops->vfs_read != nullptr) {
-                if (ker::vfs::vfs_is_socket_file(file)) {
+                if (ker::vfs::vfs_is_socket_file(file) || ker::vfs::vfs_is_pipe_file(file)) {
                     // A blocking read holds the last File after remote close,
                     // preventing TCP EOF until the peer closes first. Keep the
                     // shared endpoint flags intact and revisit pump retirement
@@ -3238,7 +3405,8 @@ template <int SLOT>
                 uint32_t attempts = 0;
                 uint64_t const SEND_STARTED_US = wki_now_us();
                 uint64_t last_send_diag_us = 0;
-                while (exp->active && exp->pump_running.load(std::memory_order_acquire)) {
+                while (exp->active && exp->pump_running.load(std::memory_order_acquire) &&
+                       !g_ipc_consumer_stopping.load(std::memory_order_acquire) && !ker::mod::sched::kernel_threads_shutdown_requested()) {
                     ret =
                         wki_send_on_channel_identity(data_channel, MsgType::DEV_OP_REQ, msg.data(), static_cast<uint16_t>(HEADER_SIZE + n));
                     if (ret == WKI_OK || ret == WKI_ERR_NOT_FOUND) {
@@ -3268,7 +3436,8 @@ template <int SLOT>
                 uint64_t const SEND_STARTED_US = wki_now_us();
                 uint64_t last_send_diag_us = 0;
                 while (exp->active && (exp->pump_running.load(std::memory_order_acquire) || attempts == 0) &&
-                       attempts < WKI_IPC_PIPE_EOF_MAX_SEND_ATTEMPTS) {
+                       attempts < WKI_IPC_PIPE_EOF_MAX_SEND_ATTEMPTS && !g_ipc_consumer_stopping.load(std::memory_order_acquire) &&
+                       !ker::mod::sched::kernel_threads_shutdown_requested()) {
                     attempts++;
                     ret = wki_send_on_channel_identity(data_channel, MsgType::DEV_OP_REQ, msg.data(), static_cast<uint16_t>(HEADER_SIZE));
                     if (ret == WKI_OK || ret == WKI_ERR_NOT_FOUND) {
@@ -3316,38 +3485,86 @@ template <int SLOT>
     }
 }
 
+template <int SLOT>
+[[noreturn]] void pipe_pump_thread_entry() {
+    pipe_pump_thread_fn<SLOT>();
+    ker::mod::sched::exit_current_kernel_thread();
+}
+
 using PumpFn = void (*)();
 constexpr std::array<PumpFn, MAX_PUMPS> G_PUMP_FNS = {
-    pipe_pump_thread_fn<0>,  pipe_pump_thread_fn<1>,  pipe_pump_thread_fn<2>,  pipe_pump_thread_fn<3>,  pipe_pump_thread_fn<4>,
-    pipe_pump_thread_fn<5>,  pipe_pump_thread_fn<6>,  pipe_pump_thread_fn<7>,  pipe_pump_thread_fn<8>,  pipe_pump_thread_fn<9>,
-    pipe_pump_thread_fn<10>, pipe_pump_thread_fn<11>, pipe_pump_thread_fn<12>, pipe_pump_thread_fn<13>, pipe_pump_thread_fn<14>,
-    pipe_pump_thread_fn<15>, pipe_pump_thread_fn<16>, pipe_pump_thread_fn<17>, pipe_pump_thread_fn<18>, pipe_pump_thread_fn<19>,
-    pipe_pump_thread_fn<20>, pipe_pump_thread_fn<21>, pipe_pump_thread_fn<22>, pipe_pump_thread_fn<23>, pipe_pump_thread_fn<24>,
-    pipe_pump_thread_fn<25>, pipe_pump_thread_fn<26>, pipe_pump_thread_fn<27>, pipe_pump_thread_fn<28>, pipe_pump_thread_fn<29>,
-    pipe_pump_thread_fn<30>, pipe_pump_thread_fn<31>,
+    pipe_pump_thread_entry<0>,  pipe_pump_thread_entry<1>,  pipe_pump_thread_entry<2>,  pipe_pump_thread_entry<3>,
+    pipe_pump_thread_entry<4>,  pipe_pump_thread_entry<5>,  pipe_pump_thread_entry<6>,  pipe_pump_thread_entry<7>,
+    pipe_pump_thread_entry<8>,  pipe_pump_thread_entry<9>,  pipe_pump_thread_entry<10>, pipe_pump_thread_entry<11>,
+    pipe_pump_thread_entry<12>, pipe_pump_thread_entry<13>, pipe_pump_thread_entry<14>, pipe_pump_thread_entry<15>,
+    pipe_pump_thread_entry<16>, pipe_pump_thread_entry<17>, pipe_pump_thread_entry<18>, pipe_pump_thread_entry<19>,
+    pipe_pump_thread_entry<20>, pipe_pump_thread_entry<21>, pipe_pump_thread_entry<22>, pipe_pump_thread_entry<23>,
+    pipe_pump_thread_entry<24>, pipe_pump_thread_entry<25>, pipe_pump_thread_entry<26>, pipe_pump_thread_entry<27>,
+    pipe_pump_thread_entry<28>, pipe_pump_thread_entry<29>, pipe_pump_thread_entry<30>, pipe_pump_thread_entry<31>,
 };
 
 auto create_pipe_pump_worker(PipePumpArg& pump_arg, PumpFn pump_fn) -> ker::mod::sched::task::Task* {
-    if (pump_arg.worker != nullptr || pump_fn == nullptr) {
-        return pump_arg.worker;
+    auto const HOLD = ker::mod::sched::hold_kernel_shutdown();
+    uint64_t irqf = s_ipc_lock.lock_irqsave();
+    if (g_ipc_consumer_stopping.load(std::memory_order_acquire) || ker::mod::sched::kernel_threads_shutdown_requested() ||
+        pump_arg.starting || pump_fn == nullptr) {
+        s_ipc_lock.unlock_irqrestore(irqf);
+        return nullptr;
     }
+    if (pump_arg.worker != nullptr) {
+        auto* worker = pump_arg.worker->try_acquire_lifetime_ref() ? pump_arg.worker : nullptr;
+        s_ipc_lock.unlock_irqrestore(irqf);
+        return worker;
+    }
+    pump_arg.starting = true;
+    s_ipc_lock.unlock_irqrestore(irqf);
 
     auto* task = ker::mod::sched::task::Task::create_kernel_thread("wki_pipe_pump", pump_fn);
     if (task == nullptr) {
+        irqf = s_ipc_lock.lock_irqsave();
+        pump_arg.starting = false;
+        s_ipc_lock.unlock_irqrestore(irqf);
         ker::mod::dbg::log("[WKI] IPC pump: failed to create kernel thread");
         return nullptr;
     }
 
+    if (!task->try_acquire_lifetime_ref()) {
+        ker::mod::sched::task::destroy_unpublished_user_thread(task);
+        irqf = s_ipc_lock.lock_irqsave();
+        pump_arg.starting = false;
+        s_ipc_lock.unlock_irqrestore(irqf);
+        return nullptr;
+    }
     promote_latency_sensitive_daemon(task);
-    pump_arg.worker = task;
-    ker::mod::sched::post_task_balanced(task);
-    return task;
+    irqf = s_ipc_lock.lock_irqsave();
+    bool const PUBLISH = !g_ipc_consumer_stopping.load(std::memory_order_acquire) && !ker::mod::sched::kernel_threads_shutdown_requested();
+    if (PUBLISH) {
+        pump_arg.worker = task;
+        pump_arg.stopped.store(false, std::memory_order_release);
+    }
+    s_ipc_lock.unlock_irqrestore(irqf);
+    bool const POSTED = PUBLISH && ker::mod::sched::post_task_balanced(task);
+    irqf = s_ipc_lock.lock_irqsave();
+    if (!POSTED) {
+        pump_arg.worker = nullptr;
+        pump_arg.stopped.store(true, std::memory_order_release);
+    }
+    pump_arg.starting = false;
+    // Return a separate temporary ref; the new worker may already have stopped.
+    auto* result = POSTED && pump_arg.worker != nullptr && pump_arg.worker->try_acquire_lifetime_ref() ? pump_arg.worker : nullptr;
+    s_ipc_lock.unlock_irqrestore(irqf);
+    if (!POSTED) {
+        task->release();
+        ker::mod::sched::task::destroy_unpublished_user_thread(task);
+    }
+    return result;
 }
 
 void init_pipe_pump_workers() {
     const auto* pump_fn_it = G_PUMP_FNS.begin();
     for (auto& pump_arg : g_pump_args) {
-        static_cast<void>(create_pipe_pump_worker(pump_arg, *pump_fn_it));
+        auto* worker = create_pipe_pump_worker(pump_arg, *pump_fn_it);
+        if (worker != nullptr) worker->release();
         ++pump_fn_it;
     }
 }
@@ -3370,6 +3587,10 @@ void start_pipe_pump(uint32_t resource_id, uint16_t consumer_node) {
     const auto* pump_fn_it = G_PUMP_FNS.begin();
     {
         uint64_t const IRQF = s_ipc_lock.lock_irqsave();
+        if (g_ipc_consumer_stopping.load(std::memory_order_acquire)) {
+            s_ipc_lock.unlock_irqrestore(IRQF);
+            return;
+        }
         auto* exp = claim_accepted_pipe_pump_locked(resource_id, consumer_node);
         if (exp == nullptr) {
             s_ipc_lock.unlock_irqrestore(IRQF);
@@ -3380,6 +3601,7 @@ void start_pipe_pump(uint32_t resource_id, uint16_t consumer_node) {
                 slot_arg = &pump_arg;
                 pump_fn = *pump_fn_it;
                 task = pump_arg.worker;
+                if (task != nullptr && !task->try_acquire_lifetime_ref()) task = nullptr;
                 exp->pump_running.store(true, std::memory_order_release);
                 exp->pump_task = task;
                 pump_arg.exp.store(exp, std::memory_order_release);
@@ -3415,7 +3637,7 @@ void start_pipe_pump(uint32_t resource_id, uint16_t consumer_node) {
         s_ipc_lock.unlock_irqrestore(IRQF);
         if (task == nullptr) return;
     }
-    ker::mod::sched::kern_wake(task);
+    wake_pipe_pump(task);
 }
 
 void init_ipc_dev_op_work_pool_locked() {
@@ -4011,7 +4233,8 @@ void wki_ipc_send_proxy_close(ProxyIpcState* proxy, const uint8_t* msg, uint16_t
 // =============================================================================
 
 void wki_ipc_subsystem_init() {
-    if (g_ipc_initialized) {
+    if (g_ipc_initialized || g_ipc_consumer_stopping.load(std::memory_order_acquire) ||
+        ker::mod::sched::kernel_threads_shutdown_requested()) {
         return;
     }
     g_ipc_initialized = true;
@@ -4024,16 +4247,43 @@ void wki_ipc_subsystem_init() {
         export_pipe_write_flush_thread_2,
         export_pipe_write_flush_thread_3,
     };
+    uint64_t const START_IRQF = s_ipc_lock.lock_irqsave();
+    g_ipc_flush_workers_starting = true;
+    s_ipc_lock.unlock_irqrestore(START_IRQF);
     for (size_t i = 0; i < FLUSH_WORKER_ENTRIES.size(); ++i) {
-        g_export_pipe_write_flush_tasks.at(i) =
+        if (g_ipc_consumer_stopping.load(std::memory_order_acquire) || ker::mod::sched::kernel_threads_shutdown_requested()) break;
+        auto* worker =
             ker::mod::sched::task::Task::create_kernel_thread(WKI_IPC_EXPORT_PIPE_FLUSH_WORKER_NAMES.at(i), FLUSH_WORKER_ENTRIES.at(i));
-        if (g_export_pipe_write_flush_tasks.at(i) != nullptr) {
-            promote_latency_sensitive_daemon(g_export_pipe_write_flush_tasks.at(i));
-            ker::mod::sched::post_task_balanced(g_export_pipe_write_flush_tasks.at(i));
+        if (worker != nullptr) {
+            if (!worker->try_acquire_lifetime_ref()) {
+                ker::mod::sched::task::destroy_unpublished_user_thread(worker);
+                continue;
+            }
+            promote_latency_sensitive_daemon(worker);
+            uint64_t const IRQF = s_ipc_lock.lock_irqsave();
+            bool const PUBLISH =
+                !g_ipc_consumer_stopping.load(std::memory_order_acquire) && !ker::mod::sched::kernel_threads_shutdown_requested();
+            if (PUBLISH) {
+                g_export_pipe_write_flush_tasks.at(i) = worker;
+                g_export_pipe_write_flush_stopped.at(i).store(false, std::memory_order_release);
+            }
+            s_ipc_lock.unlock_irqrestore(IRQF);
+            if (!PUBLISH || !ker::mod::sched::post_task_balanced(worker)) {
+                uint64_t const FAIL_IRQF = s_ipc_lock.lock_irqsave();
+                g_export_pipe_write_flush_tasks.at(i) = nullptr;
+                g_export_pipe_write_flush_stopped.at(i).store(true, std::memory_order_release);
+                s_ipc_lock.unlock_irqrestore(FAIL_IRQF);
+                worker->release();
+                ker::mod::sched::task::destroy_unpublished_user_thread(worker);
+            }
         } else {
             ker::mod::dbg::log("[WKI] IPC export pipe writer thread creation failed: shard=%u", static_cast<unsigned>(i));
         }
     }
+    uint64_t const FINISH_IRQF = s_ipc_lock.lock_irqsave();
+    g_ipc_flush_workers_starting = false;
+    s_ipc_lock.unlock_irqrestore(FINISH_IRQF);
+    if (g_ipc_consumer_stopping.load(std::memory_order_acquire) || ker::mod::sched::kernel_threads_shutdown_requested()) return;
 
     constexpr std::array<WorkerEntry, WKI_IPC_DEV_OP_WORKER_COUNT> DEV_OP_WORKER_ENTRIES = {
         ipc_dev_op_worker_thread_0,
@@ -4065,6 +4315,61 @@ void wki_ipc_subsystem_init() {
         ker::mod::dbg::log("[WKI] IPC close-tx worker thread creation failed");
     }
     ker::mod::dbg::log("[WKI] IPC proxy subsystem initialized");
+}
+
+auto wki_ipc_secure_shutdown_drain() -> bool {
+    bool expected = false;
+    if (!g_ipc_shutdown_drain_owner.compare_exchange_strong(expected, true, std::memory_order_acquire)) return false;
+    IpcShutdownDrainOwner const OWNER;
+    g_ipc_consumer_stopping.store(true, std::memory_order_release);
+    uint64_t irqf = s_ipc_lock.lock_irqsave();
+    bool stopped = !g_ipc_flush_workers_starting;
+    for (size_t shard = 0; shard < g_export_pipe_write_flush_tasks.size(); ++shard)
+        if (g_export_pipe_write_flush_tasks.at(shard) != nullptr ||
+            !g_export_pipe_write_flush_stopped.at(shard).load(std::memory_order_acquire))
+            stopped = false;
+    for (auto const& arg : g_pump_args)
+        if (arg.worker != nullptr || arg.starting || !arg.stopped.load(std::memory_order_acquire) ||
+            arg.exp.load(std::memory_order_acquire) != nullptr)
+            stopped = false;
+    s_ipc_lock.unlock_irqrestore(irqf);
+    if (!stopped) {
+        wake_all_export_pipe_write_flush_workers();
+        // Snapshot each retained pump publication separately; no wake under IPC.
+        for (auto& arg : g_pump_args) {
+            irqf = s_ipc_lock.lock_irqsave();
+            auto* worker = arg.worker != nullptr && arg.worker->try_acquire_lifetime_ref() ? arg.worker : nullptr;
+            s_ipc_lock.unlock_irqrestore(irqf);
+            wake_pipe_pump(worker);
+        }
+        return false;
+    }
+    // All sole shard owners have retired; peer cleanup detached these queues.
+    for (size_t count = 0; count < WKI_IPC_MAX_EXPORTS; ++count) {
+        irqf = s_ipc_lock.lock_irqsave();
+        ExportPipeWriteBacklog* backlog = nullptr;
+        for (auto* candidate : g_export_pipe_write_backlogs)
+            if (candidate != nullptr && (candidate->exp == nullptr || (!candidate->exp->active && !candidate->exp->pipe_write_in_flight &&
+                                                                       !candidate->exp->pipe_secure_reserved))) {
+                backlog = candidate;
+                break;
+            }
+        if (backlog != nullptr) erase_export_pipe_write_backlog_locked(backlog);
+        auto* retired = compact_inactive_exports_locked();
+        s_ipc_lock.unlock_irqrestore(irqf);
+        free_export_pipe_write_backlog(backlog);
+        free_retired_exports(retired);
+        if (backlog == nullptr) break;
+    }
+    service_secure_retired_exports();
+    irqf = s_ipc_lock.lock_irqsave();
+    bool drained = g_secure_retired_exports == nullptr && g_ipc_exports.size() == 0 && g_export_pipe_write_backlogs.size() == 0 &&
+                   g_pipe_pump_queue_head == nullptr && g_pipe_pump_queue_tail == nullptr;
+    for (auto* exp : g_ipc_exports)
+        if (exp != nullptr && (exp->pipe_secure_descriptor.rkey != 0 || exp->pipe_secure_reserved || exp->pipe_secure_file != nullptr))
+            drained = false;
+    s_ipc_lock.unlock_irqrestore(irqf);
+    return drained;
 }
 
 auto wki_ipc_admit_dev_op_rx(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
@@ -4597,11 +4902,8 @@ class IpcFdSnapshot {
             auto* exp = slot;
             slot = nullptr;
             if (exp == nullptr) continue;
-            release_export_pipe_rdma(*exp);
-            delete exp;
-#ifdef WOS_SELFTEST
-            g_ipc_export_selftest_frees.fetch_add(1, std::memory_order_relaxed);
-#endif
+            exp->active = false;
+            free_retired_exports(exp);
         }
         // Keep the node reachable while puts may block. A fatal exit can
         // re-enter cleanup and drain the remaining pins without double puts.
@@ -4775,7 +5077,6 @@ auto wki_ipc_export_task_fds(ker::mod::sched::task::Task* task, uint16_t target_
     int const PREPARATION = snapshot.prepare_exports(plan.count);
     if (PREPARATION != 0) return PREPARATION;
     std::array<WkiIpcFdEntry, MAX_SUBMIT_IPC_FDS> entries{};
-    auto* rdma_transport = ipc_pipe_rdma_transport_for_peer(target_node);
     // IDs may be consumed by an abandoned preparation, but no endpoint or
     // handoff File ownership is visible until every entry is ready.
     uint64_t irqf = s_ipc_lock.lock_irqsave();
@@ -4804,10 +5105,10 @@ auto wki_ipc_export_task_fds(ker::mod::sched::task::Task* task, uint16_t target_
         entry.home_node = g_wki.my_node_id;
         entry.reserved1 = ipc_fd_export_open_flags(file->open_flags);
         if (res_type == ResourceType::IPC_PIPE && ACCESS_MODE != 0) {
-            prepare_export_pipe_rdma(*exp, snapshot.prepared_backlogs[count], rdma_transport);
+            prepare_export_pipe_rdma(*exp, snapshot.prepared_backlogs[count], file);
             entry.rdma_rkey = exp->pipe_rdma_rkey;
             entry.rdma_offset = exp->pipe_rdma_capacity;
-            exp->message_write_flow_control = !exp->pipe_rdma_enabled;
+            exp->message_write_flow_control = true;
             if (exp->message_write_flow_control) entry.reserved1 |= WKI_IPC_FD_FLAG_PIPE_FLOW_CONTROL;
         }
         if ((res_type == ResourceType::IPC_PTY || (res_type == ResourceType::IPC_SOCKET && exp->endpoint_identity != nullptr)) &&
@@ -4857,14 +5158,8 @@ void wki_ipc_activate_task_fds(const WkiIpcFdEntry* map, uint16_t count, uint16_
         size_t shard = 0;
         uint64_t const IRQF = s_ipc_lock.lock_irqsave();
         auto* exp = find_export_by_resource_id(entry.resource_id);
-        if (exp != nullptr && exp->consumer_node == consumer_node && exp->pipe_rdma_enabled) {
-            auto* backlog = find_export_pipe_write_backlog_locked(exp);
-            if (backlog != nullptr && !backlog->persistent_for_rdma) {
-                backlog->persistent_for_rdma = true;
-                queue_export_pipe_write_flush_locked(backlog);
-                shard = export_pipe_write_backlog_shard(backlog);
-                wake = true;
-            }
+        if (exp != nullptr && exp->active && exp->consumer_node == consumer_node && exp->pipe_rdma_enabled) {
+            exp->pipe_secure_activated = true;
         }
         s_ipc_lock.unlock_irqrestore(IRQF);
         if (wake) wake_export_pipe_write_flush_worker(shard);
@@ -5144,20 +5439,12 @@ auto wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEn
         proxy_file->open_flags = OPEN_FLAGS;
 
         if (proxy->res_type == ResourceType::IPC_PIPE) {
-            if (ACCESS_MODE != 0 && entry.rdma_rkey != 0 && entry.rdma_offset != 0 && WKI_IPC_PIPE_RDMA_DOORBELL_ENABLED) {
-                auto* transport = ipc_pipe_rdma_transport_for_peer(entry.home_node);
-                if (transport != nullptr) {
-                    proxy->pipe_rdma_enabled = true;
-                    proxy->pipe_rdma_rkey = entry.rdma_rkey;
-                    proxy->pipe_rdma_capacity = static_cast<uint32_t>(std::min<uint64_t>(entry.rdma_offset, UINT32_MAX));
-                    proxy->pipe_rdma_head = 0;
-                    proxy->pipe_rdma_tail_cache = 0;
-                    proxy->pipe_rdma_transport = transport;
-                    proxy->pipe_rdma_writer_active.store(false, std::memory_order_relaxed);
-                }
+            if (ACCESS_MODE != 0 && entry.rdma_rkey != 0 && entry.rdma_offset == WKI_IPC_PIPE_RDMA_CAPACITY) {
+                proxy->pipe_rdma_enabled = true;
+                proxy->pipe_rdma_rkey = entry.rdma_rkey;
+                proxy->pipe_rdma_capacity = static_cast<uint32_t>(entry.rdma_offset);
             }
-            proxy->message_write_flow_control =
-                ACCESS_MODE != 0 && !proxy->pipe_rdma_enabled && (entry.reserved1 & WKI_IPC_FD_FLAG_PIPE_FLOW_CONTROL) != 0;
+            proxy->message_write_flow_control = ACCESS_MODE != 0 && (entry.reserved1 & WKI_IPC_FD_FLAG_PIPE_FLOW_CONTROL) != 0;
             proxy->message_write_credits.store(proxy->message_write_flow_control ? WKI_IPC_MESSAGE_PIPE_WINDOW : 0,
                                                std::memory_order_relaxed);
             if (ACCESS_MODE == 0) {
@@ -5246,14 +5533,7 @@ auto wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEn
 // Doorbell RX handler — called from ISR when IPC doorbell arrives
 // =============================================================================
 
-auto wki_ipc_doorbell_rx(uint16_t src_node, uint32_t doorbell_value) -> bool {
-    if ((doorbell_value & WKI_DOORBELL_IPC_MASK) != WKI_DOORBELL_IPC_BASE) {
-        return false;
-    }
-
-    uint32_t const RESOURCE_ID = doorbell_value & WKI_IPC_RESOURCE_MASK;
-    return queue_export_pipe_rdma_flush(src_node, RESOURCE_ID);
-}
+auto wki_ipc_doorbell_rx(uint16_t /*src_node*/, uint32_t /*doorbell_value*/) -> bool { return false; }
 
 auto wki_ipc_epoll_ctl_forward(ker::vfs::File* epfile, int op, int fd, uint32_t events, uint64_t data) -> int {
     if (epfile == nullptr) {
@@ -5889,100 +6169,81 @@ auto wki_ipc_selftest_export_compaction_frees() -> int {
 auto wki_ipc_selftest_rdma_write_survives_detachment() -> int {
     constexpr uint16_t PEER = 0x7B26;
     constexpr std::array<uint8_t, 4> BYTES{0x91, 0x27, 0x35, 0xA4};
-    bool ok = true;
-    for (bool peer_cleanup : {false, true}) {
-        struct Script {
-            uint8_t* region = nullptr;
-            std::array<uint8_t, 4> output{};
-            unsigned writes = 0;
-            unsigned closes = 0;
-            unsigned revoked = 0;
-            bool valid_revoke = true;
-        } script;
-        WkiTransport transport{};
-        transport.private_data = &script;
-        transport.rdma_register_region = [](WkiTransport* self, uint64_t address, uint32_t, uint32_t* key) -> int {
-            auto& state = *static_cast<Script*>(self->private_data);
-            state.region = reinterpret_cast<uint8_t*>(address);
-            *key = 0x7B26;
-            return WKI_OK;
-        };
-        transport.rdma_unregister_region = [](WkiTransport* self, uint32_t key, uint32_t size) -> int {
-            auto& state = *static_cast<Script*>(self->private_data);
-            ++state.revoked;
-            auto* header = reinterpret_cast<WkiPipeSharedRegion*>(state.region);
-            state.valid_revoke &= key == 0x7B26 && size == WKI_IPC_PIPE_RDMA_TOTAL_SIZE && header->capacity == WKI_IPC_PIPE_RDMA_CAPACITY;
-            return WKI_OK;
-        };
-        ker::vfs::FileOperations operations{};
-        operations.vfs_write = [](ker::vfs::File* file, const void* data, size_t size, size_t) -> ssize_t {
-            auto& state = *static_cast<Script*>(file->private_data);
-            ++state.writes;
-            if (size != state.output.size()) return -EINVAL;
-            std::memcpy(state.output.data(), data, size);
-            return static_cast<ssize_t>(size);
-        };
-        operations.vfs_close = [](ker::vfs::File* file) -> int {
-            ++static_cast<Script*>(file->private_data)->closes;
-            return 0;
-        };
-        auto* exp = new (std::nothrow) WkiIpcExport{};
-        auto* file = new (std::nothrow) ker::vfs::File{};
-        if (exp == nullptr || file == nullptr) {
-            delete exp;
-            delete file;
-            return -ENOMEM;
-        }
-        exp->resource_id = 0x7B26;
-        exp->res_type = ResourceType::IPC_PIPE;
-        ExportPipeWriteBacklog* backlog = nullptr;
-        prepare_export_pipe_rdma(*exp, backlog, &transport);
-        if (!exp->pipe_rdma_enabled) {
-            delete backlog;
-            release_export_pipe_rdma(*exp);
-            delete exp;
-            delete file;
-            return -ENOMEM;
-        }
-        file->refcount.store(2, std::memory_order_release);  // Export plus deferred writer.
-        file->fops = &operations;
-        file->private_data = &script;
-        exp->file = file;
-        exp->active = true;
-        exp->consumer_node = PEER;
-        auto* data = exp->pipe_rdma_region + sizeof(WkiPipeSharedRegion);
-        std::memcpy(data, BYTES.data(), BYTES.size());
-        WkiIpcFdEntry entry{.resource_id = exp->resource_id};
-        uint64_t flags = s_ipc_lock.lock_irqsave();
-        size_t const BEFORE = g_ipc_exports.size();
-        g_ipc_exports.push_back(exp);
-        g_export_pipe_write_backlogs.push_back(backlog);
-        exp->pipe_write_in_flight = true;
+    WkiIpcExport exp{};
+    struct Script {
+        WkiIpcExport* exp;
+        std::array<uint8_t, 4> output{};
+        unsigned writes = 0;
+    } script{.exp = &exp};
+    ker::vfs::FileOperations operations{};
+    operations.vfs_write = [](ker::vfs::File* file, const void* data, size_t size, size_t) -> ssize_t {
+        auto& state = *static_cast<Script*>(file->private_data);
+        ++state.writes;
+        if (size != state.output.size() || !state.exp->pipe_secure_effect_claimed) return -EINVAL;
+        std::memcpy(state.output.data(), data, size);
+        uint64_t const IRQF = s_ipc_lock.lock_irqsave();
+        state.exp->active = false;
+        state.exp->file = nullptr;
+        s_ipc_lock.unlock_irqrestore(IRQF);
+        return static_cast<ssize_t>(size);
+    };
+    ker::vfs::File file{};
+    file.refcount.store(1);
+    file.fops = &operations;
+    file.private_data = &script;
+    // The hook test needs a bounded private window, not a registered 64 KiB slot.
+    std::array<uint8_t, 64> backing{};
+    exp.active = true;
+    exp.resource_id = 0x7B26;
+    exp.consumer_node = PEER;
+    exp.res_type = ResourceType::IPC_PIPE;
+    exp.file = &file;
+    exp.pipe_rdma_enabled = true;
+    exp.pipe_secure_activated = true;
+    exp.pipe_secure_lifetime = 1;
+    exp.pipe_rdma_capacity = backing.size();
+    exp.pipe_rdma_region_size = backing.size();
+    exp.pipe_rdma_region = backing.data();
+    exp.pipe_secure_descriptor.binding_generation = 1;
+    exp.pipe_secure_descriptor.service = static_cast<uint8_t>(rdma_protocol::Service::IPC);
+    WkiChannel control{}, data{};
+    control.active = true;
+    control.peer_node_id = PEER;
+    control.channel_id = WKI_CHAN_RESOURCE;
+    control.generation = 1;
+    data.active = true;
+    data.peer_node_id = PEER;
+    data.channel_id = WKI_CHAN_IPC_DATA;
+    data.generation = 1;
+    exp.channels = {{&control, PEER, WKI_CHAN_RESOURCE, 1}, {&data, PEER, WKI_CHAN_IPC_DATA, 1}};
+    uint64_t flags = s_ipc_lock.lock_irqsave();
+    auto* epoch = ipc_peer_cleanup_slot_locked(PEER, true);
+    if (epoch == nullptr || epoch->cleanup_active) {
         s_ipc_lock.unlock_irqrestore(flags);
-        if (peer_cleanup)
-            wki_ipc_cleanup_for_peer(PEER);
-        else
-            wki_ipc_cleanup_exported_fds(&entry, 1, PEER);
-        flags = s_ipc_lock.lock_irqsave();
-        ok &= !exp->active && exp->file == nullptr && backlog->exp == nullptr && !export_can_retire_locked(exp);
-        s_ipc_lock.unlock_irqrestore(flags);
-        ok &= script.revoked == 0 && script.closes == 0 && file->refcount.load() == 1;
-        // Use the real deferred write helper with the still-pinned RDMA bytes
-        // after production cleanup detached both registry ownership links.
-        ok &= export_pipe_write_nonblocking(file, data, BYTES.size()) == static_cast<ssize_t>(BYTES.size());
-        ok &= script.writes == 1 && script.output == BYTES;
-        WkiIpcExport* retired = nullptr;
-        flags = s_ipc_lock.lock_irqsave();
-        ok &= finish_export_pipe_write_locked(backlog, exp, file, &retired) == nullptr && retired == exp;
-        ok &= g_ipc_exports.size() == BEFORE;
-        s_ipc_lock.unlock_irqrestore(flags);
-        free_export_pipe_write_backlog(backlog);
-        free_retired_exports(retired);
-        ipc_release_file_ref(file);
-        wki_ipc_cleanup_for_peer(PEER);
-        ok &= script.valid_revoke && script.revoked == 1 && script.closes == 1;
+        return -EIO;
     }
-    return ok ? 0 : -EIO;
+    exp.pipe_secure_epoch = epoch->epoch;
+    s_ipc_lock.unlock_irqrestore(flags);
+    IpcSecureIntent intent{.kind = IPC_SECURE_APPEND, .resource_id = exp.resource_id, .lifetime = 1, .credit = backing.size()};
+    WkiSecureRdmaRequest request{};
+    request.grant = exp.pipe_secure_descriptor;
+    request.operation_id = 1;
+    request.receive_ticket = 2;
+    request.peer_node = PEER;
+    request.opcode = rdma_protocol::Opcode::WRITE;
+    request.length = BYTES.size();
+    request.intent_length = sizeof(intent);
+    std::memcpy(request.native_intent.data(), &intent, sizeof(intent));
+    uint64_t generation = 0;
+    if (ipc_secure_arm(&exp, request, generation) != 0) return -EIO;
+    auto const RESULT = ipc_secure_effect(&exp, request, backing, BYTES, {});
+    bool const PINNED = file.refcount.load() == 2 && !exp.active && exp.pipe_secure_reserved;
+    ipc_secure_release(&exp, request, RESULT);
+    return PINNED && RESULT.status == 0 && RESULT.outcome == WkiSecureRdmaOutcome::EXACT && RESULT.bytes == BYTES.size() &&
+                   exp.pipe_bytes_received == BYTES.size() && exp.pipe_bytes_delivered == BYTES.size() && file.refcount.load() == 1 &&
+                   script.writes == 1 && script.output == BYTES && !exp.pipe_secure_reserved
+               ? 0
+               : -EIO;
 }
 
 auto wki_ipc_selftest_accepted_handoff_cancellation() -> int {
@@ -6188,89 +6449,24 @@ auto wki_ipc_selftest_submission_guard_reentrant_put() -> int {
 }
 
 auto wki_ipc_selftest_private_rdma_preparation_unwinds() -> int {
-    struct Script {
-        WkiIpcExport* exp = nullptr;
-        int result = WKI_OK;
-        uint32_t key = 0x7C22;
-        unsigned registered = 0;
-        unsigned unregistered = 0;
-        bool ok = true;
-    };
+    // No authenticated IPC session is present in this isolated boot fixture.
+    // Private preparation must leave no raw provider registration or storage.
     ker::mod::sched::task::Task task{};
-    bool ok = true;
-    for (int phase = 0; phase < 7; ++phase) {
-        Script script;
-        if (phase == 2 || phase == 4) script.result = WKI_ERR_NO_MEM;
-        if (phase == 2 || phase == 3) script.key = 0;
-        WkiTransport transport{};
-        transport.private_data = &script;
-        transport.rdma_register_region = [](WkiTransport* self, uint64_t address, uint32_t size, uint32_t* key) -> int {
-            auto& state = *static_cast<Script*>(self->private_data);
-            ++state.registered;
-            state.ok &= address == reinterpret_cast<uint64_t>(state.exp->pipe_rdma_region) && size == WKI_IPC_PIPE_RDMA_TOTAL_SIZE;
-            state.ok &= key == &state.exp->pipe_rdma_rkey;
-            auto* header = reinterpret_cast<WkiPipeSharedRegion*>(address);
-            state.ok &= header->head.load() == 0 && header->tail.load() == 0 && header->credits.load() == WKI_IPC_PIPE_RDMA_CAPACITY;
-            // Exercise the retirement inspection exactly at the callback
-            // boundary: neither object may be discoverable or queued yet.
-            uint64_t const FLAGS = s_ipc_lock.lock_irqsave();
-            state.ok &= !std::ranges::any_of(g_ipc_exports, [&](auto* entry) { return entry == state.exp; });
-            state.ok &= find_export_pipe_write_backlog_locked(state.exp) == nullptr;
-            s_ipc_lock.unlock_irqrestore(FLAGS);
-            *key = state.key;
-            return state.result;
-        };
-        transport.rdma_unregister_region = [](WkiTransport* self, uint32_t key, uint32_t size) -> int {
-            auto& state = *static_cast<Script*>(self->private_data);
-            ++state.unregistered;
-            // KASan also catches revocation after the memory has been freed.
-            auto* header = reinterpret_cast<WkiPipeSharedRegion*>(state.exp->pipe_rdma_region);
-            state.ok &= key == state.key && size == WKI_IPC_PIPE_RDMA_TOTAL_SIZE && header != nullptr;
-            if (header != nullptr) state.ok &= header->capacity == WKI_IPC_PIPE_RDMA_CAPACITY;
-            return WKI_OK;
-        };
-        {
-            IpcFdSnapshot snapshot(task);
-            if (snapshot.prepare_exports(1) != 0) return -ENOMEM;
-            auto* exp = snapshot.prepared_exports[0];
-            script.exp = exp;
-            exp->resource_id = 0x7D22;
-            exp->res_type = ResourceType::IPC_PIPE;
-            prepare_export_pipe_rdma(*exp, snapshot.prepared_backlogs[0], &transport, phase < 2 ? phase : -1);
-            bool const SUCCESS = phase >= 5;
-            ok &= exp->pipe_rdma_enabled == SUCCESS;
-            ok &= (snapshot.prepared_backlogs[0] != nullptr) == SUCCESS;
-            if (SUCCESS) {
-                auto* backlog = snapshot.prepared_backlogs[0];
-                ok &= backlog->exp == exp && !backlog->queued && !backlog->persistent_for_rdma;
-                ok &= exp->pipe_rdma_rkey == script.key;
-            } else {
-                ok &= exp->pipe_rdma_region == nullptr && exp->pipe_rdma_rkey == 0 && exp->pipe_rdma_transport == nullptr;
-            }
-            if (phase == 6) {
-                // Transfer ownership exactly as publication does, then use the
-                // production retirement/free path to revoke a committed ring.
-                auto* backlog = snapshot.prepared_backlogs[0];
-                uint64_t const FLAGS = s_ipc_lock.lock_irqsave();
-                snapshot.prepared_exports[0] = nullptr;
-                snapshot.prepared_backlogs[0] = nullptr;
-                g_ipc_exports.push_back(exp);
-                g_export_pipe_write_backlogs.push_back(backlog);
-                ok &= !export_can_retire_locked(exp);
-                erase_export_pipe_write_backlog_locked(backlog);
-                auto* retired = compact_inactive_exports_locked();
-                s_ipc_lock.unlock_irqrestore(FLAGS);
-                ok &= retired == exp;
-                free_export_pipe_write_backlog(backlog);
-                free_retired_exports(retired);
-            }
-            wki_ipc_cancel_fd_snapshots(task);
-            ok &= task.pending_wki_fd_snapshots == nullptr && snapshot.prepared_exports[0] == nullptr &&
-                  snapshot.prepared_backlogs[0] == nullptr;
-        }
-        ok &= script.ok && script.registered == (phase < 2 ? 0U : 1U) && script.unregistered == (phase >= 4 ? 1U : 0U);
+    for (int phase : {0, 1}) {
+        IpcFdSnapshot snapshot(task);
+        if (snapshot.prepare_exports(1) != 0) return -ENOMEM;
+        auto* exp = snapshot.prepared_exports[0];
+        exp->resource_id = 0x7D22;
+        exp->res_type = ResourceType::IPC_PIPE;
+        prepare_export_pipe_rdma(*exp, snapshot.prepared_backlogs[0], nullptr, phase);
+        if (exp->pipe_rdma_enabled || exp->pipe_rdma_region != nullptr || exp->pipe_rdma_rkey != 0 ||
+            snapshot.prepared_backlogs[0] != nullptr)
+            return -EIO;
+        wki_ipc_cancel_fd_snapshots(task);
+        if (task.pending_wki_fd_snapshots != nullptr || snapshot.prepared_exports[0] != nullptr || snapshot.prepared_backlogs[0] != nullptr)
+            return -EIO;
     }
-    return ok ? 0 : -EIO;
+    return 0;
 }
 
 auto wki_ipc_selftest_private_export_allocation_unwinds() -> int {

@@ -9,7 +9,7 @@
 #ifdef WOS_SELFTEST
 #include <net/wki/dev_server.hpp>
 #endif
-#include <net/wki/transport_ivshmem.hpp>
+#include <net/wki/secure_rdma.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <new>
@@ -38,6 +38,7 @@ auto destroy_zone(uint32_t zone_id, const WkiZone* expected) -> int;
 std::array<WkiZone, WKI_MAX_ZONES> s_zone_table;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 ker::mod::sys::Spinlock s_zone_table_lock;        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool s_zone_initialized = false;                  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint64_t s_next_zone_binding = 1;                 // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 enum class ZoneCreateWorkKind : uint8_t {
     REQUEST,
@@ -54,6 +55,7 @@ struct ZoneCreateWork {
 
 void process_zone_create_request(const WkiHeader& header, const ZoneCreateReqPayload& request, const WkiChannelIdentity& identity);
 void process_zone_create_ack(const WkiHeader& header, const ZoneCreateAckPayload& ack, const WkiChannelIdentity& identity);
+auto process_zone_retirement_work() -> bool;
 
 // At most one request-side and one ACK-side setup can exist for each zone
 // slot. Keeping both populations in fixed storage makes RX admission bounded
@@ -69,10 +71,31 @@ size_t s_zone_create_work_count = 0;                          // NOLINT(cppcoreg
 ker::mod::sys::Spinlock s_zone_create_work_lock;              // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<bool> s_zone_create_work_pending{false};          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 mod::sched::task::Task* s_zone_create_worker_task = nullptr;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<bool> s_zone_stopping{false};
+std::atomic<bool> s_zone_worker_stopped{true};
+bool s_zone_worker_starting = false;  // Protected by s_zone_create_work_lock.
+
+auto retain_zone_worker_locked() -> mod::sched::task::Task* {
+    auto* worker = s_zone_create_worker_task;
+    return worker != nullptr && worker->try_acquire_lifetime_ref() ? worker : nullptr;
+}
+
+void wake_retained_zone_worker(mod::sched::task::Task* worker) {
+    if (worker == nullptr) return;
+    mod::sched::wake_task_from_event(worker);
+    worker->release();
+}
+
+void wake_zone_worker() {
+    uint64_t const FLAGS = s_zone_create_work_lock.lock_irqsave();
+    auto* const WORKER = retain_zone_worker_locked();
+    s_zone_create_work_lock.unlock_irqrestore(FLAGS);
+    wake_retained_zone_worker(WORKER);
+}
 
 auto enqueue_zone_create_work(const ZoneCreateWork& work) -> bool {
     uint64_t const FLAGS = s_zone_create_work_lock.lock_irqsave();
-    if (s_zone_create_work_count == s_zone_create_work.size()) {
+    if (s_zone_stopping.load(std::memory_order_acquire) || s_zone_create_work_count == s_zone_create_work.size()) {
         s_zone_create_work_lock.unlock_irqrestore(FLAGS);
         return false;
     }
@@ -81,12 +104,10 @@ auto enqueue_zone_create_work(const ZoneCreateWork& work) -> bool {
     s_zone_create_work_tail = (s_zone_create_work_tail + 1) % s_zone_create_work.size();
     ++s_zone_create_work_count;
     s_zone_create_work_pending.store(true, std::memory_order_release);
-    auto* const WORKER = s_zone_create_worker_task;
+    auto* const WORKER = retain_zone_worker_locked();
     s_zone_create_work_lock.unlock_irqrestore(FLAGS);
 
-    if (WORKER != nullptr) {
-        mod::sched::wake_task_from_event(WORKER);
-    }
+    wake_retained_zone_worker(WORKER);
     return true;
 }
 
@@ -186,6 +207,9 @@ void process_zone_create_work(const ZoneCreateWork& work) {
     if (!lifecycle.acquire(work.header.src_node) || work.channel_identity.peer_node_id != work.header.src_node ||
         !zone_channel_live(work.channel_identity))
         return;
+    // Core registration owns its own short admission lease. Never retain an
+    // outer peer writer over core callbacks, registration or retirement.
+    lifecycle.release();
     if (work.kind == ZoneCreateWorkKind::REQUEST) {
         process_zone_create_request(work.header, work.request, work.channel_identity);
     } else {
@@ -193,8 +217,20 @@ void process_zone_create_work(const ZoneCreateWork& work) {
     }
 }
 
-[[noreturn]] void zone_create_worker_thread() {
+void zone_create_worker_body() {
     for (;;) {
+        auto const HOLD = mod::sched::hold_kernel_shutdown();
+        if (s_zone_stopping.load(std::memory_order_acquire) || mod::sched::kernel_threads_shutdown_requested()) {
+            s_zone_stopping.store(true, std::memory_order_release);
+            uint64_t const FLAGS = s_zone_create_work_lock.lock_irqsave();
+            auto* const WORKER = std::exchange(s_zone_create_worker_task, nullptr);
+            s_zone_create_work_head = s_zone_create_work_tail = s_zone_create_work_count = 0;
+            s_zone_create_work_pending.store(false, std::memory_order_release);
+            s_zone_create_work_lock.unlock_irqrestore(FLAGS);
+            if (WORKER != nullptr) WORKER->release();
+            s_zone_worker_stopped.store(true, std::memory_order_release);
+            return;
+        }
         if (!s_zone_create_work_pending.exchange(false, std::memory_order_acq_rel)) {
             mod::sched::kern_block();
             continue;
@@ -204,7 +240,18 @@ void process_zone_create_work(const ZoneCreateWork& work) {
         while (dequeue_zone_create_work(&work)) {
             process_zone_create_work(work);
         }
+        if (process_zone_retirement_work()) {
+            // Unregister is close-first and nonblocking. A retained operation
+            // can finish without this worker holding its lifecycle gate.
+            mod::sched::kern_sleep_us(1000);
+            s_zone_create_work_pending.store(true, std::memory_order_release);
+        }
     }
+}
+
+[[noreturn]] void zone_create_worker_thread() {
+    zone_create_worker_body();
+    mod::sched::exit_current_kernel_thread();
 }
 
 auto find_zone_slot(uint32_t zone_id) -> WkiZone* {
@@ -218,7 +265,7 @@ auto find_zone_slot(uint32_t zone_id) -> WkiZone* {
 
 auto alloc_zone_slot() -> WkiZone* {
     for (auto& zone : s_zone_table) {
-        if (zone.state == ZoneState::NONE && !zone.retiring.load(std::memory_order_acquire) &&
+        if (zone.state == ZoneState::NONE && !zone.retiring.load(std::memory_order_acquire) && !zone.backing_cleanup &&
             zone.refs.load(std::memory_order_acquire) == 0) {
             return &zone;
         }
@@ -228,14 +275,10 @@ auto alloc_zone_slot() -> WkiZone* {
 
 void free_zone_backing(WkiZone* zone) {
     if (zone->local_vaddr != nullptr) {
-        if (zone->is_rdma && !zone->is_roce) {
-            // ivshmem RDMA-backed: free from ivshmem RDMA pool
-            auto offset = static_cast<int64_t>(zone->local_phys_addr);
-            wki_ivshmem_rdma_free(offset, zone->size);
-        } else {
-            // RoCE-backed or non-RDMA: regular kernel pages
-            ker::mod::mm::phys::page_free(zone->local_vaddr);
-        }
+        // Only private kernel pages are authoritative. A registered region
+        // must have completed close/reclaim before this helper is reached.
+        std::memset(zone->local_vaddr, 0, zone->size);
+        ker::mod::mm::phys::page_free(zone->local_vaddr);
     }
     zone->local_vaddr = nullptr;
     zone->local_phys_addr = 0;
@@ -282,6 +325,14 @@ void reset_zone_metadata(WkiZone* zone) {
     zone->access_policy = 0;
     zone->notify_mode = ZoneNotifyMode::NONE;
     zone->type_hint = ZoneTypeHint::BUFFER;
+    zone->binding_generation = 0;
+    zone->secure_descriptor = {};
+    zone->secure_registered = false;
+    zone->secure_peer_compatible = false;
+    zone->secure_reclaiming = false;
+    zone->memory_reserved = false;
+    zone->secure_reserved = false;
+    zone->secure_request = {};
     zone->is_rdma = false;
     zone->is_roce = false;
     zone->remote_rkey = 0;
@@ -307,17 +358,29 @@ void reset_zone_metadata(WkiZone* zone) {
     zone->write_wait_entry = nullptr;
 }
 
-void finalize_retired_zone_if_idle(WkiZone* zone) {
-    if (zone == nullptr || !zone->retiring.load(std::memory_order_acquire) || zone->refs.load(std::memory_order_acquire) != 0) {
+void finalize_retired_zone_if_idle(WkiZone* zone, bool task_cleanup = false) {
+    if (zone == nullptr || !zone->retiring.load(std::memory_order_acquire)) {
         return;
     }
 
     s_zone_table_lock.lock();
-    if (zone->retiring.load(std::memory_order_acquire) && zone->refs.load(std::memory_order_acquire) == 0) {
-        free_zone_backing(zone);
-        reset_zone_metadata(zone);
-        zone->retiring.store(false, std::memory_order_release);
+    if (zone->secure_registered ||
+        (!task_cleanup && (!s_zone_worker_stopped.load(std::memory_order_acquire) || s_zone_stopping.load(std::memory_order_acquire)))) {
+        s_zone_create_work_pending.store(true, std::memory_order_release);
+        s_zone_table_lock.unlock();
+        wake_zone_worker();
+        return;
     }
+    bool const CLEANUP =
+        zone->retiring.load(std::memory_order_acquire) && zone->refs.load(std::memory_order_acquire) == 0 && !zone->backing_cleanup;
+    if (CLEANUP) zone->backing_cleanup = true;
+    s_zone_table_lock.unlock();
+    if (!CLEANUP) return;
+    free_zone_backing(zone);
+    s_zone_table_lock.lock();
+    reset_zone_metadata(zone);
+    zone->backing_cleanup = false;
+    zone->retiring.store(false, std::memory_order_release);
     s_zone_table_lock.unlock();
 }
 
@@ -332,15 +395,15 @@ void release_zone(WkiZone* zone) {
         return;
     }
     uint32_t const PREV = zone->refs.fetch_sub(1, std::memory_order_acq_rel);
-    if (PREV == 1) {
+    if (PREV == 1 || zone->retiring.load(std::memory_order_acquire)) {
         finalize_retired_zone_if_idle(zone);
     }
 }
 
-auto acquire_zone_slot(uint32_t zone_id) -> WkiZone* {
+auto acquire_zone_slot(uint32_t zone_id, const WkiZone* expected = nullptr) -> WkiZone* {
     s_zone_table_lock.lock();
     WkiZone* zone = find_zone_slot(zone_id);
-    if (zone != nullptr && !zone->retiring.load(std::memory_order_acquire)) {
+    if (zone != nullptr && (expected == nullptr || zone == expected) && !zone->retiring.load(std::memory_order_acquire)) {
         retain_zone(zone);
     } else {
         zone = nullptr;
@@ -353,7 +416,9 @@ void mark_zone_retiring_locked(WkiZone* zone) {
     if (zone == nullptr || zone->retiring.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
+    zone->lock.lock();
     zone->state = ZoneState::NONE;
+    zone->lock.unlock();
 }
 
 void retire_zone_after_timeout(WkiZone* zone) {
@@ -453,178 +518,194 @@ void clear_write_waiter_after_wait(WkiZone* zone, WkiWaitEntry& wait, int wait_r
     zone->lock.unlock();
 }
 
-// Check if a peer has any RDMA-capable transport (ivshmem or RoCE)
-auto peer_has_rdma(uint16_t node_id) -> bool {
-    WkiPeer const* peer = wki_peer_find(node_id);
-    if (peer == nullptr) {
-        return false;
-    }
-    // Check dedicated RDMA transport (RoCE or ivshmem set during HELLO)
-    if (peer->rdma_transport != nullptr && peer->rdma_transport->rdma_capable) {
-        return true;
-    }
-    // Fallback: check primary message transport (ivshmem has rdma_capable=true)
-    if (peer->transport != nullptr && peer->transport->rdma_capable) {
-        return true;
-    }
-    return false;
-}
-
-// Get the RDMA transport for a peer (prefers rdma_transport, falls back to transport)
-auto peer_rdma_transport(uint16_t node_id) -> WkiTransport* {
-    WkiPeer const* peer = wki_peer_find(node_id);
-    if (peer == nullptr) {
-        return nullptr;
-    }
-    if (peer->rdma_transport != nullptr && peer->rdma_transport->rdma_capable) {
-        return peer->rdma_transport;
-    }
-    if (peer->transport != nullptr && peer->transport->rdma_capable) {
-        return peer->transport;
-    }
-    return nullptr;
-}
-
-// Check if the peer's RDMA transport is RoCE (not ivshmem shared memory)
-[[maybe_unused]]
-auto peer_rdma_is_roce(uint16_t node_id) -> bool {
-    WkiPeer const* peer = wki_peer_find(node_id);
-    if (peer == nullptr) {
-        return false;
-    }
-    // If rdma_transport is set and it's NOT the same as the primary transport,
-    // it's the RoCE overlay. Also check if the primary transport is not rdma_capable.
-    if (peer->rdma_transport != nullptr && peer->rdma_transport->rdma_capable) {
-        // If the primary transport is also rdma_capable, it's ivshmem (preferred)
-        return peer->transport == nullptr || !peer->transport->rdma_capable;
-    }
-    return false;
-}
-
-// Allocate RDMA-backed zone memory from ivshmem shared region.
-// Returns the local virtual pointer and sets out_offset to the RDMA offset (used as rkey).
-// Returns nullptr if RDMA allocation fails.
-auto allocate_rdma_zone_backing(uint32_t size, int64_t& out_offset) -> void* {
-    int64_t const OFFSET = wki_ivshmem_rdma_alloc(size);
-    if (OFFSET < 0) {
-        return nullptr;
-    }
-    out_offset = OFFSET;
-    return wki_ivshmem_rdma_ptr(OFFSET);
-}
-
-// Allocate RoCE-backed zone memory: kernel pages registered with the RoCE transport.
-// Each side has separate local memory; RDMA write/read must be used to synchronize.
-// Returns the local virtual pointer and sets out_rkey to the registered RDMA key.
-auto allocate_roce_zone_backing(WkiTransport* transport, uint32_t size, uint32_t& out_rkey) -> void* {
-    if (transport == nullptr || transport->rdma_register_region == nullptr) {
-        return nullptr;
-    }
-    void* backing = ker::mod::mm::phys::page_alloc(ker::mod::mm::PhysicalPageOwner::WKI_ZONE, size, "wki_zone");
-    if (backing == nullptr) {
-        return nullptr;
-    }
-    uint32_t rkey = 0;
-    int const RET = transport->rdma_register_region(transport, reinterpret_cast<uint64_t>(backing), size, &rkey);
-    if (RET != 0) {
-        ker::mod::mm::phys::page_free(backing);
-        return nullptr;
-    }
-    out_rkey = rkey;
-    return backing;
-}
-
 struct PreparedZoneBacking {
     void* ptr = nullptr;
-    uint64_t phys_addr = 0;
-    uint32_t rkey = 0;
-    WkiTransport* rdma_transport = nullptr;
-    bool is_rdma = false;
-    bool is_roce = false;
 };
 
-constexpr size_t WKI_ZONE_ZERO_YIELD_BYTES = static_cast<size_t>(8) * 1024 * 1024;
-
-void zero_ivshmem_zone_backing(void* backing, uint32_t size) {
-    auto* cursor = static_cast<uint64_t*>(backing);
-    size_t remaining_words = size / sizeof(uint64_t);
-    constexpr size_t WORDS_PER_SLICE = WKI_ZONE_ZERO_YIELD_BYTES / sizeof(uint64_t);
-
-    while (remaining_words != 0) {
-        size_t words = std::min(remaining_words, WORDS_PER_SLICE);
-        remaining_words -= words;
-        // BAR2 is mapped as device memory. Wide stores avoid turning a large
-        // security clear into millions of byte MMIO transactions.
-        asm volatile(
-            "cld\n\t"
-            "rep stosq\n\t"
-            : "+D"(cursor), "+c"(words)
-            : "a"(uint64_t{0})
-            : "memory", "cc");  // NOLINT(hicpp-no-assembler)
-        if (remaining_words != 0) {
-            mod::sched::kern_yield();
-        }
-    }
-}
-
-void zero_prepared_zone_backing(const PreparedZoneBacking& backing, uint32_t size) {
-    if (backing.is_rdma && !backing.is_roce) {
-        zero_ivshmem_zone_backing(backing.ptr, size);
-        return;
-    }
-    memset(backing.ptr, 0, size);
-}
-
-auto prepare_zone_backing(uint16_t peer, uint32_t size, bool allow_rdma) -> PreparedZoneBacking {
-    PreparedZoneBacking result{};
-    int64_t rdma_offset = -1;
-
-    if (allow_rdma && peer_has_rdma(peer)) {
-        result.ptr = allocate_rdma_zone_backing(size, rdma_offset);
-        if (result.ptr != nullptr) {
-            result.is_rdma = true;
-            result.phys_addr = static_cast<uint64_t>(rdma_offset);
-            result.rkey = static_cast<uint32_t>(rdma_offset);
-        }
-
-        if (result.ptr == nullptr) {
-            WkiTransport* const ROCE = peer_rdma_transport(peer);
-            if (ROCE != nullptr) {
-                result.ptr = allocate_roce_zone_backing(ROCE, size, result.rkey);
-                if (result.ptr != nullptr) {
-                    result.is_rdma = true;
-                    result.is_roce = true;
-                    result.rdma_transport = ROCE;
-                    result.phys_addr =
-                        reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(result.ptr)));
-                }
-            }
-        }
-    }
-
-    if (result.ptr == nullptr) {
-        result.ptr = allocate_zone_backing(size);
-        if (result.ptr != nullptr) {
-            result.phys_addr = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(result.ptr)));
-        }
-    }
-
-    if (result.ptr != nullptr) {
-        zero_prepared_zone_backing(result, size);
-    }
+auto prepare_zone_backing(uint16_t /*peer*/, uint32_t size, bool /*allow_rdma*/) -> PreparedZoneBacking {
+    PreparedZoneBacking result{allocate_zone_backing(size)};
+    if (result.ptr != nullptr) std::memset(result.ptr, 0, size);
     return result;
 }
 
-void release_prepared_zone_backing(PreparedZoneBacking* backing, uint32_t size) {
-    if (backing == nullptr || backing->ptr == nullptr) {
+// Caller holds the table lock. Exhaustion is terminal and failed publication
+// never makes an allocation identity available for reuse.
+auto allocate_zone_binding_locked() -> uint64_t {
+    if (s_next_zone_binding == 0 || s_next_zone_binding == UINT64_MAX) return 0;
+    return s_next_zone_binding++;
+}
+
+auto same_secure_request(const WkiSecureRdmaRequest& left, const WkiSecureRdmaRequest& right) -> bool {
+    return std::memcmp(&left.grant, &right.grant, sizeof(left.grant)) == 0 && left.operation_id == right.operation_id &&
+           left.receive_ticket == right.receive_ticket && left.offset == right.offset && left.length == right.length &&
+           left.peer_node == right.peer_node && left.flags == right.flags && left.opcode == right.opcode &&
+           left.intent_length == right.intent_length && left.native_intent == right.native_intent;
+}
+
+auto zone_secure_request_valid_locked(const WkiZone* zone, const WkiSecureRdmaRequest& request) -> bool {
+    if (zone == nullptr || !zone->secure_registered || zone->type_hint != ZoneTypeHint::BUFFER ||
+        std::memcmp(&request.grant, &zone->secure_descriptor, sizeof(request.grant)) != 0 ||
+        request.grant.binding_generation != zone->binding_generation || request.peer_node != zone->peer_node_id ||
+        request.operation_id == 0 || request.receive_ticket == 0 || request.flags != 0 || request.intent_length != 0 ||
+        request.offset > zone->size || request.length > zone->size - request.offset)
+        return false;
+    for (uint8_t byte : request.native_intent)
+        if (byte != 0) return false;
+    if (request.opcode == rdma_protocol::Opcode::READ) return (zone->access_policy & ZONE_ACCESS_REMOTE_READ) != 0;
+    if (request.opcode == rdma_protocol::Opcode::WRITE) return (zone->access_policy & ZONE_ACCESS_REMOTE_WRITE) != 0;
+    return false;
+}
+
+auto zone_secure_arm(void* context, const WkiSecureRdmaRequest& request, uint64_t& consumer_generation) -> int {
+    auto* zone = static_cast<WkiZone*>(context);
+    if (zone == nullptr || !zone_channel_live(zone->channel_identity)) return WKI_ERR_ZONE_INACTIVE;
+    zone->lock.lock();
+    int result = WKI_OK;
+    if (zone->retiring.load(std::memory_order_acquire) || zone->state != ZoneState::ACTIVE)
+        result = WKI_ERR_ZONE_INACTIVE;
+    else if (!zone_secure_request_valid_locked(zone, request))
+        result = WKI_ERR_ZONE_ACCESS;
+    else if (zone->memory_reserved)
+        result = WKI_ERR_BUSY;
+    else {
+        zone->memory_reserved = true;
+        zone->secure_reserved = true;
+        zone->secure_request = request;
+        retain_zone(zone);
+        consumer_generation = zone->binding_generation;
+    }
+    zone->lock.unlock();
+    return result;
+}
+
+auto zone_secure_effect(void* context, const WkiSecureRdmaRequest& request, std::span<uint8_t> backing, std::span<const uint8_t> input,
+                        std::span<uint8_t> output) -> WkiSecureRdmaResult {
+    auto* zone = static_cast<WkiZone*>(context);
+    if (zone == nullptr) return {WKI_ERR_ZONE_INACTIVE, 0, WkiSecureRdmaOutcome::NO_EFFECT};
+    zone->lock.lock();
+    // Retirement ends admission. An already claimed exact reservation may
+    // finish against immutable pinned backing without reacquiring a peer gate.
+    bool const VALID = zone->memory_reserved && zone->secure_reserved && same_secure_request(zone->secure_request, request) &&
+                       zone_secure_request_valid_locked(zone, request) && backing.data() == zone->local_vaddr &&
+                       backing.size() == zone->size &&
+                       ((request.opcode == rdma_protocol::Opcode::WRITE && input.size() == request.length && output.empty()) ||
+                        (request.opcode == rdma_protocol::Opcode::READ && output.size() == request.length && input.empty()));
+    zone->lock.unlock();
+    if (!VALID) return {WKI_ERR_ZONE_ACCESS, 0, WkiSecureRdmaOutcome::NO_EFFECT};
+    if (request.length != 0) {
+        if (request.opcode == rdma_protocol::Opcode::WRITE)
+            std::memcpy(backing.data() + request.offset, input.data(), request.length);
+        else
+            std::memcpy(output.data(), backing.data() + request.offset, request.length);
+    }
+    return {WKI_OK, request.length, WkiSecureRdmaOutcome::EXACT};
+}
+
+void zone_secure_release(void* context, const WkiSecureRdmaRequest& request, const WkiSecureRdmaResult& /*result*/) {
+    auto* zone = static_cast<WkiZone*>(context);
+    if (zone == nullptr) return;
+    zone->lock.lock();
+    bool const RELEASE = zone->memory_reserved && zone->secure_reserved && same_secure_request(zone->secure_request, request);
+    if (RELEASE) {
+        zone->memory_reserved = false;
+        zone->secure_reserved = false;
+        zone->secure_request = {};
+    }
+    zone->lock.unlock();
+    if (RELEASE) release_zone(zone);
+}
+
+// Setup owns a native pin. No peer/table/zone gate may span this call.
+void register_zone_backing(WkiZone* zone, const PreparedZoneBacking& backing) {
+    if (zone->type_hint != ZoneTypeHint::BUFFER || zone->binding_generation == 0 || backing.ptr == nullptr ||
+        !wki_secure_rdma_available(zone->channel_identity, rdma_protocol::Service::ZONE))
         return;
+    s_zone_table_lock.lock();
+    zone->lock.lock();
+    zone->secure_peer_compatible = true;
+    zone->lock.unlock();
+    s_zone_table_lock.unlock();
+    uint8_t permissions = 0;
+    if ((zone->access_policy & ZONE_ACCESS_REMOTE_READ) != 0) permissions |= rdma_protocol::PERMIT_READ;
+    if ((zone->access_policy & ZONE_ACCESS_REMOTE_WRITE) != 0) permissions |= rdma_protocol::PERMIT_WRITE;
+    if (permissions == 0) return;
+    rdma_protocol::RegionDescriptor descriptor{};
+    WkiSecureRdmaHooks const HOOKS{zone_secure_arm, zone_secure_effect, zone_secure_release};
+    if (wki_secure_rdma_register_region(zone->channel_identity, rdma_protocol::Service::ZONE, backing.ptr, zone->size,
+                                        zone->binding_generation, permissions, HOOKS, zone, descriptor) != WKI_OK)
+        return;
+    s_zone_table_lock.lock();
+    zone->lock.lock();
+    zone->secure_descriptor = descriptor;
+    zone->secure_registered = true;
+    zone->local_rkey = descriptor.rkey;
+    retain_zone(zone);  // Registration/context owner until unregister succeeds.
+    zone->lock.unlock();
+    s_zone_table_lock.unlock();
+}
+
+auto process_zone_retirement_work() -> bool {
+    bool retry = false;
+    for (auto& zone : s_zone_table) {
+        rdma_protocol::RegionDescriptor descriptor{};
+        s_zone_table_lock.lock();
+        zone.lock.lock();
+        bool const RECLAIM = zone.retiring.load(std::memory_order_acquire) && zone.secure_registered && !zone.secure_reclaiming;
+        if (RECLAIM) {
+            zone.secure_reclaiming = true;
+            descriptor = zone.secure_descriptor;
+            retain_zone(&zone);
+        }
+        zone.lock.unlock();
+        s_zone_table_lock.unlock();
+        if (!RECLAIM) {
+            finalize_retired_zone_if_idle(&zone, true);
+            continue;
+        }
+        int const RESULT = wki_secure_rdma_unregister_region(descriptor);
+        s_zone_table_lock.lock();
+        zone.lock.lock();
+        zone.secure_reclaiming = false;
+        if (RESULT == WKI_OK) {
+            zone.secure_registered = false;
+            zone.secure_descriptor = {};
+            zone.local_rkey = 0;
+        } else {
+            retry = true;  // Retain rather than free on any unproven drain.
+        }
+        zone.lock.unlock();
+        s_zone_table_lock.unlock();
+        if (RESULT == WKI_OK) release_zone(&zone);  // Registration pin.
+        release_zone(&zone);                        // This cleanup pass pin.
+        finalize_retired_zone_if_idle(&zone, true);
     }
-    if (backing->is_rdma && !backing->is_roce) {
-        wki_ivshmem_rdma_free(static_cast<int64_t>(backing->phys_addr), size);
-    } else {
-        ker::mod::mm::phys::page_free(backing->ptr);
-    }
-    *backing = {};
+    return retry;
+}
+
+auto reserve_zone_message_memory(WkiZone* zone) -> bool {
+    zone->lock.lock();
+    bool const ADMIT = zone->state == ZoneState::ACTIVE && !zone->retiring.load(std::memory_order_acquire) &&
+                       zone->local_vaddr != nullptr && !zone->memory_reserved;
+    if (ADMIT) zone->memory_reserved = true;
+    zone->lock.unlock();
+    return ADMIT;
+}
+
+void release_zone_message_memory(WkiZone* zone) {
+    zone->lock.lock();
+    zone->memory_reserved = false;
+    zone->lock.unlock();
+}
+
+auto zone_remote_secure_grant(WkiZone* zone, rdma_protocol::RegionDescriptor& output, uint8_t permission) -> bool {
+    zone->lock.lock();
+    uint32_t const RKEY = zone->remote_rkey;
+    bool const ELIGIBLE =
+        zone->type_hint == ZoneTypeHint::BUFFER && !zone->retiring.load(std::memory_order_acquire) && zone->state == ZoneState::ACTIVE;
+    zone->lock.unlock();
+    return ELIGIBLE && RKEY != 0 &&
+           wki_secure_rdma_remote_grant(zone->channel_identity, rdma_protocol::Service::ZONE, RKEY, output, permission) &&
+           output.size == zone->size;
 }
 
 }  // namespace
@@ -650,20 +731,58 @@ void wki_zone_init() {
 }
 
 void wki_zone_worker_start() {
-    if (s_zone_create_worker_task != nullptr) {
+    auto const HOLD = mod::sched::hold_kernel_shutdown();
+    uint64_t flags = s_zone_create_work_lock.lock_irqsave();
+    if (s_zone_create_worker_task != nullptr || s_zone_worker_starting || s_zone_stopping.load(std::memory_order_acquire) ||
+        mod::sched::kernel_threads_shutdown_requested()) {
+        s_zone_create_work_lock.unlock_irqrestore(flags);
         return;
     }
+    s_zone_worker_starting = true;
+    s_zone_create_work_lock.unlock_irqrestore(flags);
 
     auto* task = mod::sched::task::Task::create_kernel_thread("wki_zone_setup", zone_create_worker_thread);
+    if (task != nullptr && !task->try_acquire_lifetime_ref()) {
+        mod::sched::task::destroy_unpublished_user_thread(task);
+        task = nullptr;
+    }
+    flags = s_zone_create_work_lock.lock_irqsave();
+    bool const PUBLISH =
+        task != nullptr && !s_zone_stopping.load(std::memory_order_acquire) && !mod::sched::kernel_threads_shutdown_requested();
+    if (PUBLISH) {
+        s_zone_create_worker_task = task;
+        s_zone_worker_stopped.store(false, std::memory_order_release);
+    }
+    s_zone_create_work_lock.unlock_irqrestore(flags);
+    if (task != nullptr && !PUBLISH) {
+        task->release();
+        mod::sched::task::destroy_unpublished_user_thread(task);
+        task = nullptr;
+    }
     if (task == nullptr) {
+        flags = s_zone_create_work_lock.lock_irqsave();
+        s_zone_worker_starting = false;
+        s_zone_create_work_lock.unlock_irqrestore(flags);
         log::error("Failed to create WKI zone setup worker");
         return;
     }
     task->slice_ns = WKI_ZONE_WORK_SLICE_NS;
     mod::sched::set_task_nice(task, WKI_ZONE_WORK_NICE);
-    s_zone_create_worker_task = task;
-    mod::sched::post_task_balanced(task);
-    log::info("Zone setup worker started (PID %d)", task->pid);
+    int const PID = task->pid;
+    bool const POSTED = mod::sched::post_task_balanced(task);
+    flags = s_zone_create_work_lock.lock_irqsave();
+    if (!POSTED) {
+        s_zone_create_worker_task = nullptr;
+        s_zone_worker_stopped.store(true, std::memory_order_release);
+    }
+    s_zone_worker_starting = false;
+    s_zone_create_work_lock.unlock_irqrestore(flags);
+    if (!POSTED) {
+        task->release();
+        mod::sched::task::destroy_unpublished_user_thread(task);
+        return;
+    }
+    log::info("Zone setup worker started (PID %d)", PID);
 }
 
 // -----------------------------------------------------------------------------
@@ -672,6 +791,7 @@ void wki_zone_worker_start() {
 
 auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t access_policy, ZoneNotifyMode notify, ZoneTypeHint hint,
                      WkiZoneRef* local_ref) -> int {
+    if (s_zone_stopping.load(std::memory_order_acquire)) return -ESHUTDOWN;
     if (!s_zone_initialized) {
         return WKI_ERR_INVALID;
     }
@@ -700,6 +820,10 @@ auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t acc
 
     s_zone_table_lock.lock();
 
+    if (s_zone_stopping.load(std::memory_order_acquire)) {
+        s_zone_table_lock.unlock();
+        return -ESHUTDOWN;
+    }
     // Check zone_id doesn't already exist
     if (find_zone_slot(zone_id) != nullptr) {
         s_zone_table_lock.unlock();
@@ -713,7 +837,14 @@ auto wki_zone_create(uint16_t peer, uint32_t zone_id, uint32_t size, uint8_t acc
         return WKI_ERR_ZONE_NO_MEM;
     }
 
+    uint64_t const BINDING = allocate_zone_binding_locked();
+    if (BINDING == 0) {
+        s_zone_table_lock.unlock();
+        return WKI_ERR_ZONE_NO_MEM;
+    }
+    reset_zone_metadata(zone);
     // Set up zone in NEGOTIATING state
+    zone->binding_generation = BINDING;
     zone->zone_id = zone_id;
     zone->peer_node_id = peer;
     zone->channel_identity = identity;
@@ -887,8 +1018,10 @@ auto wki_zone_find(uint32_t zone_id) -> WkiZone* {
 // Public API - Zone read (message-based, blocking)
 // -----------------------------------------------------------------------------
 
-auto wki_zone_read(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len) -> int {
-    WkiZone* zone = acquire_zone_slot(zone_id);
+namespace {
+
+auto read_zone(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len, const WkiZone* expected) -> int {
+    WkiZone* zone = acquire_zone_slot(zone_id, expected);
     if (zone == nullptr) {
         return WKI_ERR_ZONE_NOT_FOUND;
     }
@@ -899,7 +1032,7 @@ auto wki_zone_read(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len) -
 
     // Check access policy - we need REMOTE_READ on the peer's zone
     // (The remote side validates this too, but checking early avoids network round-trip)
-    if ((zone->access_policy & ZONE_ACCESS_REMOTE_READ) == 0) {
+    if (zone->type_hint == ZoneTypeHint::MSG_QUEUE || (zone->access_policy & ZONE_ACCESS_REMOTE_READ) == 0) {
         release_zone(zone);
         return WKI_ERR_ZONE_ACCESS;
     }
@@ -909,15 +1042,21 @@ auto wki_zone_read(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len) -
         return WKI_ERR_INVALID;
     }
 
-    // For RDMA zones, the caller must retain a local WkiZoneRef
-    if (zone->is_rdma) {
-        if (zone->local_vaddr == nullptr) {
-            release_zone(zone);
-            return WKI_ERR_ZONE_INACTIVE;
-        }
-        memcpy(buf, static_cast<uint8_t*>(zone->local_vaddr) + offset, len);
+    if (buf == nullptr && len != 0) {
         release_zone(zone);
-        return WKI_OK;
+        return WKI_ERR_INVALID;
+    }
+    rdma_protocol::RegionDescriptor remote{};
+    if (zone_remote_secure_grant(zone, remote, rdma_protocol::PERMIT_READ)) {
+        auto const RESULT = wki_secure_rdma_read(zone->channel_identity, remote, offset, {static_cast<uint8_t*>(buf), len});
+        if (RESULT.outcome != WkiSecureRdmaOutcome::NO_EFFECT) {
+            int const STATUS =
+                RESULT.status != WKI_OK
+                    ? RESULT.status
+                    : (RESULT.outcome == WkiSecureRdmaOutcome::EXACT && RESULT.bytes == len ? WKI_OK : WKI_ERR_ZONE_UNCERTAIN);
+            release_zone(zone);
+            return STATUS;
+        }
     }
 
     // Message-based: chunk if necessary
@@ -995,8 +1134,8 @@ auto wki_zone_read(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len) -
 // Public API - Zone write (message-based, blocking)
 // -----------------------------------------------------------------------------
 
-auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t len) -> int {
-    WkiZone* zone = acquire_zone_slot(zone_id);
+auto write_zone(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t len, const WkiZone* expected) -> int {
+    WkiZone* zone = acquire_zone_slot(zone_id, expected);
     if (zone == nullptr) {
         return WKI_ERR_ZONE_NOT_FOUND;
     }
@@ -1005,7 +1144,7 @@ auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t
         return WKI_ERR_ZONE_INACTIVE;
     }
 
-    if ((zone->access_policy & ZONE_ACCESS_REMOTE_WRITE) == 0) {
+    if (zone->type_hint == ZoneTypeHint::MSG_QUEUE || (zone->access_policy & ZONE_ACCESS_REMOTE_WRITE) == 0) {
         release_zone(zone);
         return WKI_ERR_ZONE_ACCESS;
     }
@@ -1015,15 +1154,21 @@ auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t
         return WKI_ERR_INVALID;
     }
 
-    // For RDMA zones, the caller must retain a local WkiZoneRef
-    if (zone->is_rdma) {
-        if (zone->local_vaddr == nullptr) {
-            release_zone(zone);
-            return WKI_ERR_ZONE_INACTIVE;
-        }
-        memcpy(static_cast<uint8_t*>(zone->local_vaddr) + offset, buf, len);
+    if (buf == nullptr && len != 0) {
         release_zone(zone);
-        return WKI_OK;
+        return WKI_ERR_INVALID;
+    }
+    rdma_protocol::RegionDescriptor remote{};
+    if (zone_remote_secure_grant(zone, remote, rdma_protocol::PERMIT_WRITE)) {
+        auto const RESULT = wki_secure_rdma_write(zone->channel_identity, remote, offset, {static_cast<const uint8_t*>(buf), len});
+        if (RESULT.outcome != WkiSecureRdmaOutcome::NO_EFFECT) {
+            int const STATUS =
+                RESULT.status != WKI_OK
+                    ? RESULT.status
+                    : (RESULT.outcome == WkiSecureRdmaOutcome::EXACT && RESULT.bytes == len ? WKI_OK : WKI_ERR_ZONE_UNCERTAIN);
+            release_zone(zone);
+            return STATUS;
+        }
     }
 
     // Message-based: chunk if necessary
@@ -1107,6 +1252,16 @@ auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t
     return WKI_OK;
 }
 
+}  // namespace
+
+auto wki_zone_read(uint32_t zone_id, uint32_t offset, void* buf, uint32_t len) -> int {
+    return read_zone(zone_id, offset, buf, len, nullptr);
+}
+
+auto wki_zone_write(uint32_t zone_id, uint32_t offset, const void* buf, uint32_t len) -> int {
+    return write_zone(zone_id, offset, buf, len, nullptr);
+}
+
 // -----------------------------------------------------------------------------
 // Public API - RDMA direct access
 // -----------------------------------------------------------------------------
@@ -1138,10 +1293,18 @@ auto WkiZoneRef::live() const -> bool {
            !zone_->retiring.load(std::memory_order_acquire);
 }
 
+auto WkiZoneRef::secure_ready() const -> bool {
+    if (!live()) return false;
+    rdma_protocol::RegionDescriptor remote{};
+    constexpr uint8_t PERMISSIONS = rdma_protocol::PERMIT_READ | rdma_protocol::PERMIT_WRITE;
+    return wki_secure_rdma_available(zone_->channel_identity, rdma_protocol::Service::ZONE) &&
+           zone_remote_secure_grant(zone_, remote, PERMISSIONS) && live();
+}
+
 auto WkiZoneRef::snapshot_memory(WkiZoneMemory& output) const -> bool {
     if (!live()) return false;
     zone_->lock.lock();
-    bool const ACTIVE = !zone_->retiring.load(std::memory_order_acquire);
+    bool const ACTIVE = !zone_->retiring.load(std::memory_order_acquire) && !zone_->secure_registered;
     WkiZoneMemory const MEMORY{zone_->local_vaddr, zone_->size, zone_->is_roce, zone_->remote_rkey, zone_->rdma_transport};
     zone_->lock.unlock();
     if (!ACTIVE || !live()) return false;
@@ -1160,7 +1323,8 @@ auto WkiZoneRef::retain(WkiZone* zone, uint16_t peer, uint8_t local_access) -> W
         zone->local_vaddr != nullptr && (zone->access_policy & local_access) == local_access) {
         retain_zone(zone);
         result.zone_ = zone;
-        result.memory_ = {zone->local_vaddr, zone->size, zone->is_roce, zone->remote_rkey, zone->rdma_transport};
+        result.memory_ = {zone->secure_registered ? nullptr : zone->local_vaddr, zone->size, zone->is_roce, zone->remote_rkey,
+                          zone->rdma_transport};
     }
     zone->lock.unlock();
     s_zone_table_lock.unlock();
@@ -1176,6 +1340,14 @@ auto WkiZoneRef::acquire(uint32_t zone_id, uint16_t peer, uint8_t local_access) 
 }
 
 auto WkiZoneRef::destroy() const -> int { return zone_ != nullptr ? destroy_zone(zone_->zone_id, zone_) : WKI_ERR_ZONE_NOT_FOUND; }
+
+auto WkiZoneRef::read(uint32_t offset, void* buf, uint32_t len) const -> int {
+    return zone_ != nullptr ? read_zone(zone_->zone_id, offset, buf, len, zone_) : WKI_ERR_ZONE_NOT_FOUND;
+}
+
+auto WkiZoneRef::write(uint32_t offset, const void* buf, uint32_t len) const -> int {
+    return zone_ != nullptr ? write_zone(zone_->zone_id, offset, buf, len, zone_) : WKI_ERR_ZONE_NOT_FOUND;
+}
 
 auto WkiZoneRef::notify_post(uint8_t op_type) const -> int {
     ZonePostNotification prepared{};
@@ -1266,6 +1438,42 @@ void wki_zones_destroy_for_peer(uint16_t node_id) {
         finish_claimed_waiter(write_waiter, -1);
         finalize_retired_zone_if_idle(zone);
     }
+}
+
+auto wki_zone_shutdown_drain() -> bool {
+    s_zone_stopping.store(true, std::memory_order_release);
+    uint64_t const FLAGS = s_zone_create_work_lock.lock_irqsave();
+    bool const STOPPED =
+        s_zone_worker_stopped.load(std::memory_order_acquire) && !s_zone_worker_starting && s_zone_create_worker_task == nullptr;
+    s_zone_create_work_lock.unlock_irqrestore(FLAGS);
+    if (!STOPPED) {
+        wake_zone_worker();
+        return false;
+    }
+    // Exclusive task handoff: the worker has retired its final table access.
+    for (;;) {
+        s_zone_table_lock.lock();
+        uint16_t peer = WKI_NODE_INVALID;
+        for (auto const& zone : s_zone_table)
+            if (zone.state != ZoneState::NONE) {
+                peer = zone.peer_node_id;
+                break;
+            }
+        s_zone_table_lock.unlock();
+        if (peer == WKI_NODE_INVALID) break;
+        wki_zones_destroy_for_peer(peer);
+    }
+    if (process_zone_retirement_work()) return false;
+    s_zone_table_lock.lock();
+    bool drained = true;
+    for (auto const& zone : s_zone_table)
+        if (zone.state != ZoneState::NONE || zone.secure_registered || zone.secure_reclaiming || zone.backing_cleanup ||
+            zone.local_vaddr != nullptr || zone.refs.load(std::memory_order_acquire) != 0) {
+            drained = false;
+            break;
+        }
+    s_zone_table_lock.unlock();
+    return drained;
 }
 
 // -----------------------------------------------------------------------------
@@ -1419,7 +1627,10 @@ auto wki_zone_selftest_waiter_slots_and_cookies() -> bool {
 namespace {
 
 void process_zone_create_request(const WkiHeader& header, const ZoneCreateReqPayload& request, const WkiChannelIdentity& identity) {
+    if (s_zone_stopping.load(std::memory_order_acquire)) return;
     uint16_t const SRC_NODE = header.src_node;
+    ZoneSetupLease setup;
+    if (!setup.try_acquire(SRC_NODE) || !zone_channel_live(identity)) return;
 
     // Validate size is page-aligned and non-zero
     if (request.size == 0 || (request.size & 0xFFF) != 0) {
@@ -1432,6 +1643,10 @@ void process_zone_create_request(const WkiHeader& header, const ZoneCreateReqPay
 
     s_zone_table_lock.lock();
 
+    if (s_zone_stopping.load(std::memory_order_acquire)) {
+        s_zone_table_lock.unlock();
+        return;
+    }
     if (find_zone_slot(request.zone_id) != nullptr) {
         s_zone_table_lock.unlock();
         ZoneCreateAckPayload ack = {};
@@ -1454,7 +1669,17 @@ void process_zone_create_request(const WkiHeader& header, const ZoneCreateReqPay
     // Reserve the table identity before dropping the lock. A destroy or peer
     // fence can retire this NEGOTIATING row while allocation is in flight;
     // the retained reference prevents slot reuse until publication aborts.
+    uint64_t const BINDING = allocate_zone_binding_locked();
+    if (BINDING == 0) {
+        s_zone_table_lock.unlock();
+        ZoneCreateAckPayload ack{};
+        ack.zone_id = request.zone_id;
+        ack.status = static_cast<uint8_t>(ZoneCreateStatus::REJECTED_NO_MEM);
+        static_cast<void>(wki_send_on_channel_identity(identity, MsgType::ZONE_CREATE_ACK, &ack, sizeof(ack)));
+        return;
+    }
     reset_zone_metadata(zone);
+    zone->binding_generation = BINDING;
     zone->zone_id = request.zone_id;
     zone->peer_node_id = SRC_NODE;
     zone->channel_identity = identity;
@@ -1467,22 +1692,24 @@ void process_zone_create_request(const WkiHeader& header, const ZoneCreateReqPay
     zone->retiring.store(false, std::memory_order_release);
     retain_zone(zone);
     s_zone_table_lock.unlock();
+    setup.release();
 
     PreparedZoneBacking backing = prepare_zone_backing(SRC_NODE, request.size, true);
+    register_zone_backing(zone, backing);
+    ZoneSetupLease publication;
+    bool const CHANNEL_LIVE = publication.try_acquire(SRC_NODE) && zone_channel_live(identity);
     bool published = false;
     bool reply = false;
     auto status = ZoneCreateStatus::REJECTED_NO_MEM;
 
     s_zone_table_lock.lock();
-    bool const IDENTITY_LIVE = zone->state == ZoneState::NEGOTIATING && !zone->retiring.load(std::memory_order_acquire) &&
+    // The setup pin owns the allocation even if retirement won during core
+    // registration. Install backing for close/reclaim cleanup in either case.
+    zone->local_vaddr = backing.ptr;
+    bool const IDENTITY_LIVE = CHANNEL_LIVE && zone->state == ZoneState::NEGOTIATING && !zone->retiring.load(std::memory_order_acquire) &&
                                !zone->is_initiator && zone->zone_id == request.zone_id && zone->peer_node_id == SRC_NODE;
     if (IDENTITY_LIVE && backing.ptr != nullptr) {
         zone->local_vaddr = backing.ptr;
-        zone->local_phys_addr = backing.phys_addr;
-        zone->is_rdma = backing.is_rdma;
-        zone->is_roce = backing.is_roce;
-        zone->local_rkey = backing.rkey;
-        zone->rdma_transport = backing.rdma_transport;
         zone->state = ZoneState::ACTIVE;
         published = true;
         reply = true;
@@ -1492,29 +1719,36 @@ void process_zone_create_request(const WkiHeader& header, const ZoneCreateReqPay
         reply = true;
     }
     s_zone_table_lock.unlock();
+    publication.release();
 
     if (!published) {
-        release_prepared_zone_backing(&backing, request.size);
+        s_zone_table_lock.lock();
+        mark_zone_retiring_locked(zone);
+        s_zone_table_lock.unlock();
     }
 
     ZoneCreateAckPayload ack = {};
     ack.zone_id = request.zone_id;
     ack.status = static_cast<uint8_t>(status);
-    ack.phys_addr = published ? backing.phys_addr : 0;
-    ack.rkey = published ? backing.rkey : 0;
+    // This legacy field is only a lookup hint for the separately authenticated
+    // full GRANT. Never advertise a physical address or raw provider key.
+    ack.phys_addr = 0;
+    ack.rkey = published ? zone->local_rkey : 0;
     if (reply) {
         static_cast<void>(wki_send_on_channel_identity(identity, MsgType::ZONE_CREATE_ACK, &ack, sizeof(ack)));
     }
 
     if (published) {
-        log::info("Zone 0x%08x created (responder, peer 0x%04x, %u bytes, rdma=%d, roce=%d)", request.zone_id, SRC_NODE, request.size,
-                  backing.is_rdma ? 1 : 0, backing.is_roce ? 1 : 0);
+        log::info("Zone 0x%08x created (responder, peer 0x%04x, %u private bytes)", request.zone_id, SRC_NODE, request.size);
         wki_event_publish(EVENT_CLASS_ZONE, EVENT_ZONE_CREATED, &request.zone_id, sizeof(request.zone_id));
     }
     release_zone(zone);
 }
 
 void process_zone_create_ack(const WkiHeader& header, const ZoneCreateAckPayload& ack_payload, const WkiChannelIdentity& identity) {
+    if (s_zone_stopping.load(std::memory_order_acquire)) return;
+    ZoneSetupLease setup;
+    if (!setup.try_acquire(header.src_node) || !zone_channel_live(identity)) return;
     auto const STATUS = static_cast<ZoneCreateStatus>(ack_payload.status);
     WkiWaitEntry* create_waiter = nullptr;
     WkiZone* zone = nullptr;
@@ -1553,22 +1787,25 @@ void process_zone_create_ack(const WkiHeader& header, const ZoneCreateAckPayload
         return;
     }
     s_zone_table_lock.unlock();
+    setup.release();
 
     if (STATUS == ZoneCreateStatus::ACCEPTED) {
         PreparedZoneBacking backing = prepare_zone_backing(header.src_node, zone_size, ack_payload.rkey != 0);
+        register_zone_backing(zone, backing);
+        ZoneSetupLease publication;
+        bool const CHANNEL_LIVE = publication.try_acquire(header.src_node) && zone_channel_live(identity);
         bool published = false;
 
         s_zone_table_lock.lock();
-        bool const IDENTITY_LIVE = zone->state == ZoneState::NEGOTIATING && !zone->retiring.load(std::memory_order_acquire) &&
-                                   zone->is_initiator && zone->zone_id == ack_payload.zone_id && zone->peer_node_id == header.src_node;
+        zone->local_vaddr = backing.ptr;
+        bool const IDENTITY_LIVE = CHANNEL_LIVE && zone->state == ZoneState::NEGOTIATING &&
+                                   !zone->retiring.load(std::memory_order_acquire) && zone->is_initiator &&
+                                   zone->zone_id == ack_payload.zone_id && zone->peer_node_id == header.src_node;
         if (IDENTITY_LIVE && backing.ptr != nullptr) {
             zone->local_vaddr = backing.ptr;
-            zone->local_phys_addr = backing.phys_addr;
-            zone->is_rdma = backing.is_rdma;
-            zone->is_roce = backing.is_roce;
-            zone->local_rkey = backing.rkey;
-            zone->rdma_transport = backing.rdma_transport;
-            zone->remote_phys_addr = ack_payload.phys_addr;
+            // The rkey is retained as an untrusted lookup hint. Transfer
+            // admission resolves the complete current authenticated GRANT.
+            zone->remote_phys_addr = 0;
             zone->remote_rkey = ack_payload.rkey;
             zone->state = ZoneState::ACTIVE;
             published = true;
@@ -1576,26 +1813,28 @@ void process_zone_create_ack(const WkiHeader& header, const ZoneCreateAckPayload
             mark_zone_retiring_locked(zone);
         }
         s_zone_table_lock.unlock();
+        publication.release();
 
         if (!published) {
-            release_prepared_zone_backing(&backing, zone_size);
+            s_zone_table_lock.lock();
+            mark_zone_retiring_locked(zone);
+            s_zone_table_lock.unlock();
             ZoneDestroyPayload destroy = {};
             destroy.zone_id = ack_payload.zone_id;
             static_cast<void>(wki_send_on_channel_identity(identity, MsgType::ZONE_DESTROY, &destroy, sizeof(destroy)));
-        } else if (backing.is_roce && backing.rkey != 0) {
+        } else if (zone->secure_registered && zone->local_rkey != 0) {
             // RoCE has separate local memory. Publish our key only after that
             // backing is active under the exact retained zone identity.
             ZoneNotifyPayload rkey_notify = {};
             rkey_notify.zone_id = ack_payload.zone_id;
-            rkey_notify.offset = backing.rkey;
+            rkey_notify.offset = zone->local_rkey;
             rkey_notify.length = 0;
             rkey_notify.op_type = 0xFE;
             static_cast<void>(wki_send_on_channel_identity(identity, MsgType::ZONE_NOTIFY_POST, &rkey_notify, sizeof(rkey_notify)));
         }
 
         if (published) {
-            log::info("Zone 0x%08x active (initiator, peer 0x%04x, %u bytes, rdma=%d, roce=%d)", ack_payload.zone_id, header.src_node,
-                      zone_size, backing.is_rdma ? 1 : 0, backing.is_roce ? 1 : 0);
+            log::info("Zone 0x%08x active (initiator, peer 0x%04x, %u private bytes)", ack_payload.zone_id, header.src_node, zone_size);
             wki_event_publish(EVENT_CLASS_ZONE, EVENT_ZONE_CREATED, &ack_payload.zone_id, sizeof(ack_payload.zone_id));
         }
     } else {
@@ -1772,6 +2011,10 @@ void handle_zone_notify_post(const WkiHeader* hdr, const uint8_t* payload, uint1
     // op_type=0xFE: rkey-exchange - the initiator is telling us its RDMA rkey
     // so we can write/read its zone memory.  Store it in remote_rkey.
     if (notify->op_type == 0xFE) {
+        if (notify->length != 0 || zone->type_hint != ZoneTypeHint::BUFFER || !zone->secure_peer_compatible) {
+            release_zone(zone);
+            return;
+        }
         zone->lock.lock();
         zone->remote_rkey = notify->offset;  // rkey encoded in offset field
         zone->lock.unlock();
@@ -1824,7 +2067,7 @@ void handle_zone_read_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t
     }
 
     // Check access policy - peer wants to read our local data
-    if ((zone->access_policy & ZONE_ACCESS_REMOTE_READ) == 0) {
+    if (zone->type_hint == ZoneTypeHint::MSG_QUEUE || (zone->access_policy & ZONE_ACCESS_REMOTE_READ) == 0) {
         release_zone(zone);
         return;
     }
@@ -1850,8 +2093,23 @@ void handle_zone_read_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t
     resp->length = DATA_LEN;
     resp->op_cookie = req->op_cookie;
 
-    // Copy data from local zone backing
+    if (!reserve_zone_message_memory(zone)) {
+        delete[] resp_buf;
+        if (zone->secure_peer_compatible && req->length != 0) {
+            std::array<uint8_t, sizeof(ZoneReadRespPayload) + sizeof(int32_t)> error{};
+            ZoneReadRespPayload const RESPONSE{req->zone_id, req->offset, 0, req->op_cookie};
+            int32_t const STATUS = WKI_ERR_BUSY;
+            std::memcpy(error.data(), &RESPONSE, sizeof(RESPONSE));
+            std::memcpy(error.data() + sizeof(RESPONSE), &STATUS, sizeof(STATUS));
+            static_cast<void>(wki_send_on_channel_identity(identity, MsgType::ZONE_READ_RESP, error.data(), error.size()));
+        }
+        release_zone(zone);
+        return;
+    }
+    // The retained native allocation and reservation keep backing immutable
+    // in identity and exclusive through this bounded copy, outside all guards.
     memcpy(resp_buf + sizeof(ZoneReadRespPayload), static_cast<uint8_t*>(zone->local_vaddr) + req->offset, DATA_LEN);
+    release_zone_message_memory(zone);
 
     wki_send_on_channel_identity(identity, MsgType::ZONE_READ_RESP, resp_buf, resp_len);
     delete[] resp_buf;
@@ -1867,6 +2125,7 @@ void handle_zone_read_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_
     }
 
     const auto* resp = reinterpret_cast<const ZoneReadRespPayload*>(payload);
+
     WkiWaitEntry* waiter = nullptr;
 
     WkiZone* zone = acquire_zone_slot(resp->zone_id);
@@ -1883,7 +2142,15 @@ void handle_zone_read_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_
         return;
     }
 
-    if (resp->length > payload_len - sizeof(ZoneReadRespPayload) || !zone_read_response_matches_pending(*zone, *resp)) {
+    int32_t response_status = 0;
+    bool const ERROR_ENCODING =
+        resp->length == 0 && payload_len == sizeof(ZoneReadRespPayload) + sizeof(int32_t) && zone->secure_peer_compatible;
+    if (ERROR_ENCODING) std::memcpy(&response_status, payload + sizeof(ZoneReadRespPayload), sizeof(response_status));
+
+    bool const MATCHED_ERROR = ERROR_ENCODING && response_status < 0 && zone->read_expected_len != 0 &&
+                               resp->offset == zone->read_expected_offset && resp->op_cookie == zone->read_expected_cookie;
+    if (!MATCHED_ERROR && ((resp->length == 0 && payload_len != sizeof(ZoneReadRespPayload)) ||
+                           resp->length > payload_len - sizeof(ZoneReadRespPayload) || !zone_read_response_matches_pending(*zone, *resp))) {
         zone->lock.unlock();
         release_zone(zone);
         return;
@@ -1902,12 +2169,12 @@ void handle_zone_read_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_
     }
 
     // Copy data to the waiting buffer
-    if (zone->read_dest_buf != nullptr && resp->length > 0) {
+    if (!MATCHED_ERROR && zone->read_dest_buf != nullptr && resp->length > 0) {
         memcpy(zone->read_dest_buf, payload + sizeof(ZoneReadRespPayload), resp->length);
     }
 
     zone->read_result_len = resp->length;
-    zone->read_status = 0;
+    zone->read_status = MATCHED_ERROR ? response_status : 0;
     zone->read_pending.store(false, std::memory_order_release);
     zone->read_dest_buf = nullptr;
     zone->read_expected_offset = 0;
@@ -1943,7 +2210,7 @@ void handle_zone_write_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
     }
 
     // Check access policy - peer wants to write to our local data
-    if ((zone->access_policy & ZONE_ACCESS_REMOTE_WRITE) == 0) {
+    if (zone->type_hint == ZoneTypeHint::MSG_QUEUE || (zone->access_policy & ZONE_ACCESS_REMOTE_WRITE) == 0) {
         ZoneWriteAckPayload ack = {};
         ack.zone_id = req->zone_id;
         ack.offset = req->offset;
@@ -1965,8 +2232,14 @@ void handle_zone_write_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         return;
     }
 
-    // Copy data into local zone backing
+    if (!reserve_zone_message_memory(zone)) {
+        ZoneWriteAckPayload const ACK{req->zone_id, req->offset, req->length, WKI_ERR_BUSY, req->op_cookie};
+        static_cast<void>(wki_send_on_channel_identity(identity, MsgType::ZONE_WRITE_ACK, &ACK, sizeof(ACK)));
+        release_zone(zone);
+        return;
+    }
     memcpy(static_cast<uint8_t*>(zone->local_vaddr) + req->offset, payload + sizeof(ZoneWriteReqPayload), req->length);
+    release_zone_message_memory(zone);
 
     // Send ACK
     ZoneWriteAckPayload ack = {};

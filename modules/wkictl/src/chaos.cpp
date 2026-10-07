@@ -28,7 +28,7 @@ constexpr std::size_t WKI_CHAOS_ARGUMENT_MAX = 64;
 constexpr std::size_t WKI_CHAOS_SNAPSHOT_MAX = 262144;
 constexpr std::size_t WKI_CHAOS_WORKLOAD_COMMAND_MAX = 256;
 constexpr std::size_t WKI_CHAOS_WORKLOAD_ARGUMENT_MAX = 16;
-constexpr std::size_t WKI_CHAOS_WORKLOAD_RESULT_MAX = 2048;
+constexpr std::size_t WKI_CHAOS_WORKLOAD_RESULT_MAX = 4096;
 constexpr uint32_t WKI_CHAOS_WAIT_MAX_MS = 300'000;
 constexpr long WKI_CHAOS_WAIT_POLL_NS = 10'000'000L;
 
@@ -79,6 +79,8 @@ auto valid_workload_verb(const char* verb) -> bool {
                                "block",
                                "block-discovered",
                                "block-rdma-discovered",
+                               "zone",
+                               "zone-rdma",
                                "net-attach",
                                "net-attach-discovered",
                                "net-query",

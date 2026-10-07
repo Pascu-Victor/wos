@@ -14,6 +14,7 @@ constexpr size_t WKI_CHAOS_MAX_QUEUED_FRAMES = 8;
 constexpr size_t WKI_CHAOS_MAX_QUEUED_BLOCK_EVENTS = 8;
 constexpr size_t WKI_CHAOS_MAX_TRACE_ROWS = 256;
 constexpr size_t WKI_CHAOS_MAX_STREAMS = 128;
+constexpr uint8_t WKI_CHAOS_SECURE_TYPE_BASE = 0x80;
 constexpr size_t WKI_CHAOS_MAX_FRAME_SIZE = WKI_HEADER_SIZE + WKI_ETH_MAX_PAYLOAD;
 // Server-side completion notifications do not retain the proxy's waiter
 // deadline, so their copied metadata receives this conservative finite hold
@@ -131,6 +132,12 @@ struct WkiChaosFrameKey {
     uint16_t frame_len = 0;
     uint16_t payload_len = 0;
     bool frame_valid = false;
+    bool secure_record = false;
+    uint8_t secure_transport = 0;
+    uint8_t secure_service = 0;
+    uint64_t secure_counter = 0;
+    uint64_t secure_operation = 0;
+    uint64_t secure_region_generation = 0;
     bool dev_op_valid = false;
     uint16_t dev_op_id = 0;
     uint64_t stream_occurrence = 0;
@@ -254,6 +261,7 @@ struct WkiChaosDeliveryView {
     enum class Kind : uint8_t {
         FRAME = 0,
         BLOCK_DOORBELL = 1,
+        SECURE_RECORD = 2,
     };
 
     size_t slot = WKI_CHAOS_MAX_QUEUED_FRAMES;
@@ -284,12 +292,12 @@ class WkiChaosModel {
 
     auto intercept(WkiChaosDirection direction, uint16_t transport_id, uintptr_t transport_cookie, uint16_t neighbor, const void* data,
                    uint16_t len, uint32_t local_boot_epoch = 0, uint32_t peer_boot_epoch = 0, uint32_t peer_channel_epoch = 0,
-                   uint64_t ingress_cookie = 0) -> WkiChaosInterceptResult;
+                   uint64_t ingress_cookie = 0, bool secure_record = false) -> WkiChaosInterceptResult;
     auto intercept_block_doorbell(WkiChaosBlockKey key) -> WkiChaosInterceptResult;
     auto intercept_block_sqe(WkiChaosBlockKey key, void* descriptor, uint16_t descriptor_len) -> WkiChaosInterceptResult;
     auto transport_removed(WkiChaosDirection direction, uint16_t transport_id, uint16_t neighbor, const void* data, uint16_t len,
-                           uint32_t local_boot_epoch = 0, uint32_t peer_boot_epoch = 0, uint32_t peer_channel_epoch = 0)
-        -> WkiChaosInterceptResult;
+                           uint32_t local_boot_epoch = 0, uint32_t peer_boot_epoch = 0, uint32_t peer_channel_epoch = 0,
+                           bool secure_record = false) -> WkiChaosInterceptResult;
     auto claim_ready(WkiChaosDeliveryView* out) -> bool;
     void finish_delivery(size_t slot, int32_t transport_result = 0);
     void discard_transport(uintptr_t transport_cookie, uint16_t transport_id = 0);

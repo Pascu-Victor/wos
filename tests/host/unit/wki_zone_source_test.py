@@ -17,7 +17,7 @@ def fail(message: str) -> None:
 
 def function_body(source: str, name: str) -> str:
     match = re.search(
-        rf"\b(?:void|auto)\s+{name}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>,\s*&]+)?\s*\{{",
+        rf"\b(?:void|auto)\s+{name}\([^)]*\)\s*(?:const\s*)?(?:->\s*[A-Za-z0-9_:<>,\s*&]+)?\s*\{{",
         source,
         flags=re.DOTALL,
     )
@@ -103,8 +103,8 @@ def test_timeout_cleanup_clears_pending_waiters() -> None:
 
 def test_message_read_write_timeouts_retire_zone_before_release() -> None:
     source = ZONE_CPP.read_text()
-    read_body = function_body(source, "wki_zone_read")
-    write_body = function_body(source, "wki_zone_write")
+    read_body = function_body(source, "read_zone")
+    write_body = function_body(source, "write_zone")
 
     require_order(read_body, "clear_read_waiter_after_wait(zone, read_wait, WAIT_RC)", "retire_zone_after_timeout(zone)", "read timeout retire")
     require_token_after(read_body, "retire_zone_after_timeout(zone)", "release_zone(zone)", "read timeout release")
@@ -187,8 +187,8 @@ def test_zone_ranges_and_read_responses_are_validated_without_wrapping() -> None
         "zone write ACK matcher",
     )
 
-    read_body = function_body(source, "wki_zone_read")
-    write_body = function_body(source, "wki_zone_write")
+    read_body = function_body(source, "read_zone")
+    write_body = function_body(source, "write_zone")
     read_req_body = function_body(source, "handle_zone_read_req")
     write_req_body = function_body(source, "handle_zone_write_req")
     read_resp_body = function_body(source, "handle_zone_read_resp")
@@ -284,7 +284,7 @@ def test_zone_ranges_and_read_responses_are_validated_without_wrapping() -> None
     )
     require_order(
         read_resp_body,
-        "if (resp->length > payload_len - sizeof(ZoneReadRespPayload) || !zone_read_response_matches_pending(*zone, *resp))",
+        "if (!MATCHED_ERROR &&",
         "claim_and_clear_waiter_locked(zone->read_wait_entry)",
         "zone read response validates before claiming waiter",
     )
@@ -368,7 +368,7 @@ def test_zone_create_backing_setup_is_bounded_out_of_rx_context() -> None:
     ack_rx = function_body(source, "handle_zone_create_ack")
     request_worker = function_body(source, "process_zone_create_request")
     ack_worker = function_body(source, "process_zone_create_ack")
-    zero_backing = function_body(source, "zero_ivshmem_zone_backing")
+    zero_backing = function_body(source, "prepare_zone_backing")
 
     require_tokens(
         source,
@@ -400,17 +400,9 @@ def test_zone_create_backing_setup_is_bounded_out_of_rx_context() -> None:
         "prepare_zone_backing(header.src_node, zone_size, ack_payload.rkey != 0)",
         "initiator backing allocation outside table lock",
     )
-    require_tokens(
-        zero_backing,
-        ['"rep stosq\\n\\t"', "mod::sched::kern_yield()"],
-        "wide yieldable ivshmem security clear",
-    )
-    require_order(
-        zero_backing,
-        "remaining_words -= words",
-        '"rep stosq\\n\\t"',
-        "rep stosq count must be retired before the instruction consumes RCX",
-    )
+    require_tokens(zero_backing, ["allocate_zone_backing(size)", "std::memset(result.ptr, 0, size)"], "private page security clear")
+    reject_tokens(source, ["wki_ivshmem_rdma_", "allocate_rdma_zone_backing", "allocate_roce_zone_backing",
+                           "->rdma_register_region", "->rdma_write", "->rdma_read"], "no raw or peer BAR zone authority")
     require_tokens(header, ["void wki_zone_worker_start();"], "zone worker API")
     require_tokens(
         function_body(source, "wki_zone_worker_start"),
@@ -493,7 +485,104 @@ def test_device_notifications_keep_retained_zone_identity() -> None:
     require_tokens(WKI_WAIT_KTEST.read_text(), ["NotificationsKeepOriginalGrantThroughRetirement"], "actual notification lifetime coverage")
 
 
+def test_secure_zone_reservation_and_retirement_boundaries() -> None:
+    source = ZONE_CPP.read_text()
+    header = ZONE_HPP.read_text()
+    require_tokens(header, ["uint64_t binding_generation = 0", "secure_descriptor{}", "bool secure_registered = false",
+                           "bool memory_reserved = false", "bool secure_reserved = false"], "private secure zone authority")
+    register = function_body(source, "register_zone_backing")
+    require_tokens(register, ["zone->type_hint != ZoneTypeHint::BUFFER", "rdma_protocol::Service::ZONE",
+                              "zone->binding_generation", "zone_secure_arm, zone_secure_effect, zone_secure_release"], "independent ZONE enrollment")
+    for name in ["process_zone_create_request", "process_zone_create_ack"]:
+        body = function_body(source, name)
+        require_order(body, "setup.release()", "register_zone_backing(zone, backing)", "core registration outside setup lease")
+        require_order(body, "register_zone_backing(zone, backing)", "publication.try_acquire(", "nonblocking publication revalidation")
+    require_order(register, "s_zone_table_lock.unlock()", "wki_secure_rdma_register_region(", "core registration outside native gates")
+    require_tokens(register, ["zone->secure_peer_compatible = true"], "task-captured format compatibility")
+    arm = function_body(source, "zone_secure_arm")
+    require_order(arm, "else if (zone->memory_reserved)", "zone->memory_reserved = true", "exclusive native reservation")
+    require_tokens(arm, ["zone->state != ZoneState::ACTIVE", "zone_secure_request_valid_locked(zone, request)",
+                         "retain_zone(zone)", "consumer_generation = zone->binding_generation"], "native arm and pin")
+    validation = function_body(source, "zone_secure_request_valid_locked")
+    require_tokens(validation, ["std::memcmp(&request.grant, &zone->secure_descriptor", "request.peer_node != zone->peer_node_id",
+                                "request.operation_id == 0", "request.receive_ticket == 0", "request.intent_length != 0",
+                                "request.length > zone->size - request.offset"], "complete consumer intent authority")
+    effect = function_body(source, "zone_secure_effect")
+    require_order(effect, "zone->lock.unlock()", "std::memcpy(", "native copy outside locks")
+    require_tokens(effect, ["same_secure_request(zone->secure_request, request)", "backing.data() == zone->local_vaddr",
+                           "input.size() == request.length", "output.size() == request.length"], "exact backing and coverage boundary")
+    reclaim = function_body(source, "process_zone_retirement_work")
+    require_order(reclaim, "s_zone_table_lock.unlock()", "wki_secure_rdma_unregister_region(descriptor)", "core reclaim outside native gates")
+    require_tokens(reclaim, ["if (RESULT == WKI_OK)", "retry = true", "release_zone(&zone)"], "BUSY retains registration owner")
+    release = function_body(source, "zone_secure_release")
+    require_order(release, "zone->lock.unlock()", "release_zone(zone)", "release independent of native guard")
+    for name in ["read_zone", "write_zone", "handle_zone_read_req", "handle_zone_write_req"]:
+        require_tokens(function_body(source, name), ["zone->type_hint == ZoneTypeHint::MSG_QUEUE"], "generic ZONE cannot alter BLOCK rings")
+    for name in ["handle_zone_read_req", "handle_zone_write_req"]:
+        body = function_body(source, name)
+        require_order(body, "reserve_zone_message_memory(zone)", "memcpy(", "message copy shares reservation")
+        require_tokens(body, ["release_zone_message_memory(zone)", "WKI_ERR_BUSY"], "bounded BUSY before effect")
+    require_tokens(function_body(source, "WkiZoneRef::retain"), ["zone->secure_registered ? nullptr : zone->local_vaddr"], "raw pointer refusal")
+    require_tokens(function_body(source, "WkiZoneRef::snapshot_memory"), ["!zone_->secure_registered"], "snapshot pointer refusal")
+    for name in ["read_zone", "write_zone"]:
+        body = function_body(source, name)
+        require_tokens(body, ["RESULT.outcome != WkiSecureRdmaOutcome::NO_EFFECT", "WKI_ERR_ZONE_UNCERTAIN"], "NO_EFFECT only fallback")
+
+
+def test_secure_read_error_extension_is_exact_and_correlated() -> None:
+    source = ZONE_CPP.read_text()
+    read = function_body(source, "handle_zone_read_resp")
+    require_tokens(read, ["payload_len == sizeof(ZoneReadRespPayload) + sizeof(int32_t)",
+                         "zone->secure_peer_compatible", "response_status < 0",
+                         "zone->read_expected_len != 0", "resp->offset == zone->read_expected_offset",
+                         "resp->op_cookie == zone->read_expected_cookie", "if (!MATCHED_ERROR &&",
+                         "resp->length == 0 && payload_len != sizeof(ZoneReadRespPayload)",
+                         "if (!MATCHED_ERROR && zone->read_dest_buf != nullptr", "MATCHED_ERROR ? response_status : 0"], "bounded negative READ encoding")
+    for name in ["handle_zone_notify_post", "handle_zone_read_req", "handle_zone_read_resp"]:
+        reject_tokens(function_body(source, name), ["wki_secure_rdma_available("], "no fresh peer reader under exclusive ordinary RX")
+    require_order(read, "bool const MATCHED_ERROR", "claim_and_clear_waiter_locked", "error validates before waiter claim")
+    require_order(read, "claim_and_clear_waiter_locked", "if (!MATCHED_ERROR && zone->read_dest_buf", "no error data publication")
+
+
+def test_exact_ref_transfers_never_select_successors() -> None:
+    source = ZONE_CPP.read_text()
+    acquire = function_body(source, "acquire_zone_slot")
+    require_order(acquire, "s_zone_table_lock.lock()", "expected == nullptr || zone == expected", "allocation match under table gate")
+    require_order(acquire, "expected == nullptr || zone == expected", "retain_zone(zone)", "exact selection before pin")
+    for op in ["read", "write"]:
+        require_tokens(function_body(source, "WkiZoneRef::" + op), [op + "_zone(zone_->zone_id, offset, buf, len, zone_)"], "exact retained ref")
+        require_tokens(function_body(source, "wki_zone_" + op), [op + "_zone(zone_id, offset, buf, len, nullptr)"], "numeric API preserved")
+        require_tokens(function_body(source, op + "_zone"), ["acquire_zone_slot(zone_id, expected)"], "exact transfer pin")
+    ready = function_body(source, "WkiZoneRef::secure_ready")
+    require_tokens(ready, ["if (!live()) return false", "rdma_protocol::PERMIT_READ | rdma_protocol::PERMIT_WRITE",
+                          "wki_secure_rdma_available(zone_->channel_identity, rdma_protocol::Service::ZONE)",
+                          "zone_remote_secure_grant(zone_, remote, PERMISSIONS) && live()"], "exact observational secure readiness")
+    reject_tokens(ready, ["wki_zone_find", "acquire_zone_slot", "local_vaddr", "wki_secure_rdma_write", "wki_secure_rdma_read"],
+                   "readiness cannot select successors, expose memory, or perform effects")
+
+
+def test_shutdown_hands_native_owners_to_task_drain() -> None:
+    source = ZONE_CPP.read_text()
+    worker = function_body(source, "zone_create_worker_body")
+    require_order(worker, "hold_kernel_shutdown()", "kernel_threads_shutdown_requested()", "zone shutdown hold")
+    require_order(worker, "std::exchange(s_zone_create_worker_task, nullptr)", "WORKER->release()", "zone publication retirement")
+    require_order(worker, "WORKER->release()", "s_zone_worker_stopped.store(true", "zone stopped publication")
+    entry = function_body(source, "zone_create_worker_thread")
+    require_order(entry, "zone_create_worker_body()", "exit_current_kernel_thread()", "zone clean worker exit")
+    wake = function_body(source, "wake_zone_worker")
+    require_order(wake, "retain_zone_worker_locked()", "s_zone_create_work_lock.unlock_irqrestore", "zone retained wake snapshot")
+    require_order(wake, "s_zone_create_work_lock.unlock_irqrestore", "wake_retained_zone_worker", "zone wake outside guard")
+    drain = function_body(source, "wki_zone_shutdown_drain")
+    require_tokens(drain, ["s_zone_worker_stopped.load", "s_zone_worker_starting", "s_zone_create_worker_task", "process_zone_retirement_work()"], "zone drain ownership certificate")
+    require_order(drain, "if (!STOPPED)", "process_zone_retirement_work()", "zone stopped owner before drain")
+    require_tokens(ZONE_HPP.read_text(), ["wki_zone_shutdown_drain() -> bool"], "zone drain declaration")
+
+
 def main() -> None:
+    test_shutdown_hands_native_owners_to_task_drain()
+    test_exact_ref_transfers_never_select_successors()
+    test_secure_zone_reservation_and_retirement_boundaries()
+    test_secure_read_error_extension_is_exact_and_correlated()
     test_device_notifications_keep_retained_zone_identity()
     test_local_backing_uses_retained_grants()
     test_zone_authority_keeps_the_admitted_channel()

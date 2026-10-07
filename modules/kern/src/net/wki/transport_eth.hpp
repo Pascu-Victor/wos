@@ -30,6 +30,10 @@ auto eth_neighbor_find_mac(uint16_t node_id, proto::MacAddress& mac_out) -> bool
 // use this so multi-NIC peers advertise the MAC reachable on that link.
 auto wki_eth_transport_source_mac(const WkiTransport* transport, proto::MacAddress& mac_out) -> bool;
 
+// Lookup only: secure records cannot create or substitute an ingress transport.
+// The common admission boundary rechecks the retained registry incarnation.
+auto wki_eth_transport_find(net::NetDevice* netdev) -> WkiTransport*;
+
 // Return the underlying NetDevice used by the WKI Ethernet transport.
 // Used by wki_spin_yield() to drive inline NAPI polling.
 auto wki_eth_get_netdev() -> net::NetDevice*;

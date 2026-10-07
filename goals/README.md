@@ -26,7 +26,7 @@ an explicit pause/block rule.
 
 | ID  | Goal                                                                                 | Primary surfaces                                            | Avoid concurrent ownership with               | Status      |
 | --- | ------------------------------------------------------------------------------------ | ----------------------------------------------------------- | --------------------------------------------- | ----------- |
-| 25  | [Secure session-bound WKI RDMA](25-secure-wki-rdma.md)                               | WKI auth, RoCE, ivshmem, zones, fast paths                   | 20 on ivshmem; 26 on remote VFS               | Not started |
+| 25  | [Secure session-bound WKI RDMA](25-secure-wki-rdma.md)                               | WKI auth, RoCE, ivshmem, zones, fast paths                   | 20 on ivshmem; 26 on remote VFS               | Complete    |
 | 26  | [Owner-authoritative remote VFS coherency](26-remote-vfs-coherency-locking.md)        | remote VFS, caches, append, advisory locks                   | 18 and 25 on shared VFS/wire surfaces         | Not started |
 | 28  | [Durable reconnectable remote jobs](28-durable-remote-jobs.md)                        | remote compute, streams, reconnect, result retention         | 19 identity; 22 quotas; compute rewrites      | Not started |
 | 29  | [Production TCP congestion and loss recovery](29-tcp-congestion-loss-recovery.md)    | TCP sender, ACK/SACK, timers, impairment tests               | 31 on shared timer paths; broad TCP rewrites  | Complete    |
@@ -46,6 +46,12 @@ an explicit pause/block rule.
 | 45 | [AMD ROCm HSA/HIP compute](45-amd-rocm-hsa-hip.md) | amdkfd, HSA queues/memory, ROCr, HIP/LLVM, rocBLAS | 41, 44 on IOMMU/MM/amdgpu/reset | Not started |
 | 46 | [NVIDIA Nouveau/NVK/Zink graphics](46-nvidia-nouveau-nvk.md) | Nouveau/NVKM, GSP, VRAM/GPUVM, NVK/NAK/Zink, display | 41–43; 47 on exclusive GPU ownership | Not started |
 | 47 | [NVIDIA open KMD and CUDA runtime](47-nvidia-cuda-driver-stack.md) | NVIDIA RM/UVM OS layer, proprietary libcuda ABI, CUDA | 41; 46 on exclusive GPU ownership | Not started |
+
+Goal 25 completes the authenticated opt-in implementation and its documented
+software-QEMU, production-source model and isolated-KTEST security scope. The
+default service mask remains zero. Combined Ethernet failures, multicore
+availability observations and physical hardware qualification still constrain
+production rollout; see [the qualification record](../docs/wki_secure_rdma.md).
 
 ## New platform goals: 33–40
 
@@ -133,10 +139,12 @@ against the current source before starting work.
    Re-run it whenever the design or file set materially changes.
 6. Keep an iteration ledger: hypothesis, patch, focused evidence, regressions,
    next action. Never broaden into unrelated cleanup merely to keep working.
-7. Under the current agent instructions, kernel/cluster runtime execution and
-   debugging are user-run. Prepare isolated fixtures and exact commands, then
-   analyze the supplied logs while continuing independent work. The existence
-   of a rootless `--no-setup` option does not change this instruction.
+7. Follow the user's current runtime authorization. In this session the user
+   explicitly permits launching owned WOS instances with `bin/wos-cluster
+   --no-setup` and isolated selftests with `bin/wos-ktest --no-setup`. Preserve
+   unrelated VMs, use the shared launch guard, and retain KTEST isolation.
+   Hardware scenarios outside that authorization still require user-run
+   fixtures and supplied logs.
 
 ## Portfolio rules
 

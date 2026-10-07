@@ -9,6 +9,7 @@
 #include <net/wki/auth_crypto.hpp>
 #include <net/wki/auth_policy.hpp>
 #include <net/wki/auth_protocol.hpp>
+#include <net/wki/secure_rdma.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/fw/qemu_fw_cfg.hpp>
@@ -153,6 +154,7 @@ auto wki_auth_init() -> bool {
         if (entry.peer_node == WKI_NODE_INVALID || entry.peer_node == WKI_NODE_BROADCAST || entry.peer_node == header.local_node ||
             entry.key_id == 0 || entry.policy == 0 || (entry.policy & ~wki_policy_bits(WkiPolicy::ALL)) != 0 ||
             credential_for(entry.peer_node) != nullptr) {
+            auth_crypto::secure_erase(&entry, sizeof(entry));
             auth_crypto::secure_erase(bytes.data(), bytes.size());
             wki_auth_shutdown();
             return false;
@@ -163,6 +165,7 @@ auto wki_auth_init() -> bool {
         credential.key_id = entry.key_id;
         credential.policy = entry.policy;
         credential.key = entry.key;
+        auth_crypto::secure_erase(&entry, sizeof(entry));
     }
     auth_crypto::secure_erase(bytes.data(), bytes.size());
     g_auth.ready = true;
@@ -362,6 +365,7 @@ auto wki_auth_install_peer_session(WkiPeer* peer, uint32_t remote_boot_epoch) ->
     }
 
     if (peer->auth_session.active) {
+        wki_secure_rdma_retire_peer(peer);
         peer->auth_session.retired_session_id = peer->auth_session.session_id;
         peer->auth_session.retired_session_valid = true;
         auth_crypto::secure_erase(peer->auth_session.tx_key.data(), peer->auth_session.tx_key.size());
@@ -429,6 +433,7 @@ auto wki_auth_confirm_peer_session(WkiPeer* peer, const WkiAuthTrailer& verified
         peer->auth_session.replay_lock.unlock();
         return false;
     }
+    wki_secure_rdma_retire_peer(peer);
     if (peer->auth_session.active) {
         peer->auth_session.retired_session_id = peer->auth_session.session_id;
         peer->auth_session.retired_session_valid = true;
@@ -461,6 +466,7 @@ void wki_auth_retire_peer_session(WkiPeer* peer) {
     if (peer == nullptr) {
         return;
     }
+    wki_secure_rdma_retire_peer(peer);
     peer->auth_session.replay_lock.lock();
     if (peer->auth_session.active) {
         peer->auth_session.retired_session_id = peer->auth_session.session_id;

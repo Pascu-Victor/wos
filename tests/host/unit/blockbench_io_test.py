@@ -16,15 +16,32 @@ def main():
     with tempfile.TemporaryDirectory(prefix="blockbench-test-", dir=scratch) as temporary:
         work = Path(temporary)
         adapter = work / "main.cpp"
-        adapter.write_text('#include "blockbench.hpp"\nint main(int argc, char** argv) { return run_blockbench(argc - 1, argv + 1); }\n')
+        adapter.write_text('''#include "blockbench.hpp"
+#include <cerrno>
+#include <cstdlib>
+#include <unistd.h>
+extern "C" off_t __real_lseek(int, off_t, int);
+extern "C" int __real_close(int);
+extern "C" off_t __wrap_lseek(int fd, off_t offset, int origin) {
+    if (std::getenv("WOS_BLOCKBENCH_FAIL_SEEK")) { errno = ESPIPE; return -1; }
+    return __real_lseek(fd, offset, origin);
+}
+extern "C" int __wrap_close(int fd) {
+    int result = __real_close(fd);
+    if (result == 0 && std::getenv("WOS_BLOCKBENCH_FAIL_CLOSE")) { errno = EIO; return -1; }
+    return result;
+}
+int main(int argc, char** argv) { return run_blockbench(argc - 1, argv + 1); }
+''')
         binary = work / "blockbench"
         environment = dict(os.environ, TMPDIR=str(work))
         subprocess.run(["/usr/bin/clang++", "-std=c++23", "-O2", "-Wall", "-Wextra", "-Werror", "-pthread", "-DO_NO_CACHE=0",
                         "-I", str(ROOT / "modules/testprog/src"), str(adapter), str(ROOT / "modules/testprog/src/blockbench.cpp"),
-                        "-o", str(binary)], env=environment, check=True, capture_output=True, text=True)
+                        "-Wl,--wrap=lseek,--wrap=close", "-o", str(binary)], env=environment, check=True, capture_output=True, text=True)
 
-        def run(*arguments, status=0):
-            result = subprocess.run([str(binary), *map(str, arguments)], check=False, capture_output=True, text=True, timeout=30)
+        def run(*arguments, status=0, injected=None):
+            result = subprocess.run([str(binary), *map(str, arguments)], check=False, capture_output=True, text=True, timeout=30,
+                                    env=dict(environment, **(injected or {})))
             assert result.returncode == status, (arguments, result.returncode, result.stdout, result.stderr)
             return json.loads(result.stdout) if result.stdout.strip().startswith("{") else None
 
@@ -46,6 +63,7 @@ def main():
         run("blockbench-read", "--path", work / "read", "--workers", 9, status=2)
         run("blockbench-read", "--path", work / "read", "--bytes", "-1", status=2)
         run("blockbench-fsync", "--path", "/dev/null", status=2)
+        run("blockbench-read", "--path", work / "read.0", "--verify-same-fd", status=2)
 
         destination = work / "durability"
         result = run("blockbench-fsync", "--path", destination)
@@ -56,7 +74,23 @@ def main():
         assert len(data) == 100 * 4096
         for index in range(100):
             assert data[index * 4096:(index + 1) * 4096] == bytes([(0x5a + index) & 0xff]) * 4096
-    print("blockbench actual IO: QD1/QD8 exact pattern, corrupt/short input, strict options, 100 fsync latency samples PASS")
+        assert "verify_same_fd" not in result
+        for operations in (1, 16):
+            result = run("blockbench-fsync", "--path", destination, "--verify-same-fd", "--operations", operations)
+            assert result["pass"] and result["verify_same_fd"] and result["operations"] == operations
+            data = destination.read_bytes()
+            assert len(data) == operations * 4096
+            for index in range(operations):
+                assert data[index * 4096:(index + 1) * 4096] == bytes([(0x5a + index) & 0xff]) * 4096
+        result = run("blockbench-fsync", "--path", destination, "--verify-same-fd", "--operations", 1, status=1,
+                     injected={"WOS_BLOCKBENCH_FAIL_SEEK": "1"})
+        assert not result["pass"] and result["error"] == 29  # ESPIPE
+        for retained in (False, True):
+            result = run("blockbench-fsync", "--path", destination, "--operations", 1,
+                         *(["--verify-same-fd"] if retained else []), status=1,
+                         injected={"WOS_BLOCKBENCH_FAIL_CLOSE": "1"})
+            assert not result["pass"] and result["error"] == 5  # EIO
+    print("blockbench actual IO: QD1/QD8, default and retained-handle readback, seek/close errors, strict options and fsync latency PASS")
 
 
 if __name__ == "__main__":

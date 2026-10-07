@@ -30,6 +30,7 @@ struct WkiChaosSnapshot {
     bool trace_overflow = false;
     bool stream_overflow = false;
     bool invalid = false;
+    uint64_t secure_pressure_drops = 0;
 };
 
 using WkiChaosRuleRow = WkiChaosRule;
@@ -66,6 +67,10 @@ void wki_chaos_peer_epoch_update(uint16_t node_id, uint32_t remote_boot_epoch, u
 auto wki_transport_send(WkiTransport* transport, uint16_t neighbor, const void* data, uint16_t len) -> int;
 auto wki_transport_send_pkt(WkiTransport* transport, uint16_t neighbor, ker::net::PacketBuffer* pkt) -> int;
 void wki_chaos_rx_ingress(WkiTransport* transport, const void* data, uint16_t len, const WkiRxMetadata* metadata);
+// Typed ciphertext boundary. Deferred delivery retains the family even after
+// corruption and never falls through to the ordinary32-byte WKI parser.
+auto wki_transport_send_secure(WkiTransport* transport, uint16_t neighbor, const void* record, uint16_t size) -> int;
+void wki_chaos_secure_rx_ingress(WkiTransport* transport, const void* record, uint16_t size, const WkiRxMetadata* metadata);
 // Block-ring semantic hooks. Callers publish descriptors or invoke their
 // original notification path only after consulting the returned action. The
 // disabled path is one relaxed atomic load and returns PASS without touching
@@ -78,6 +83,7 @@ void wki_chaos_drain_ready();
 using WkiChaosRxDeliveryHook = void (*)(WkiTransport* transport, const void* data, uint16_t len, const WkiRxMetadata* metadata);
 using WkiChaosBlockDoorbellDeliveryHook = bool (*)(const WkiChaosBlockKey& key);
 void wki_chaos_selftest_set_rx_delivery_hook(WkiChaosRxDeliveryHook hook);
+void wki_chaos_selftest_set_secure_rx_delivery_hook(WkiChaosRxDeliveryHook hook);
 void wki_chaos_selftest_set_block_doorbell_delivery_hook(WkiChaosBlockDoorbellDeliveryHook hook);
 void wki_chaos_selftest_set_next_transport_id(uint16_t next_id);
 #endif

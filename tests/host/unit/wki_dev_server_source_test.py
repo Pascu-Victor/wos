@@ -1362,22 +1362,20 @@ def test_detach_admission_has_ktest_coverage() -> None:
             fail(f"detach admission KTEST coverage is missing {token!r}")
 
 
-def test_block_attach_honors_disable_rdma_without_weakening_accelerated_mode() -> None:
+def test_block_attach_never_enables_legacy_raw_rings() -> None:
     source = DEV_SERVER_CPP.read_text()
     header = DEV_SERVER_HPP.read_text()
     ktest = WKI_DEV_SERVER_KTEST.read_text()
     attach = function_body(source, "handle_dev_attach_req")
     plan = function_body(source, "make_block_attach_rdma_plan")
 
+    if "return {};" not in plan:
+        fail("legacy raw BLOCK plan must always remain empty")
+    for token in [".rdma_flags = DEV_ATTACH_RDMA_BLK_RING", "plan.rdma_flags |= DEV_ATTACH_RDMA_BULK", "plan.zone_pending = true"]:
+        if token in plan:
+            fail(f"raw provider hints must not authorize shared BLOCK memory: {token!r}")
     for token in [
-        "if ((attach_mode & DEV_ATTACH_DISABLE_RDMA) != 0)",
-        "return {};",
-        ".rdma_flags = DEV_ATTACH_RDMA_BLK_RING",
-        "plan.rdma_flags |= DEV_ATTACH_RDMA_BULK",
-    ]:
-        if token not in plan:
-            fail(f"block attach RDMA plan is missing {token!r}")
-    for token in [
+        "peer->rdma_transport->rdma_capable",
         "make_block_attach_rdma_plan(req->attach_mode, hdr->src_node, req->resource_id, PEER_HAS_RDMA_TRANSPORT)",
         "binding.blk_zone_id = RDMA_PLAN.zone_id",
         "binding.blk_zone_pending = RDMA_PLAN.zone_pending",
@@ -1385,6 +1383,7 @@ def test_block_attach_honors_disable_rdma_without_weakening_accelerated_mode() -
         "ack.rdma_flags = RDMA_PLAN.rdma_flags",
         "ack.blk_zone_id = RDMA_PLAN.zone_id",
         "wki_deferred_work_notify()",
+        "binding.block_secure_disabled = (req->attach_mode & DEV_ATTACH_DISABLE_RDMA) != 0",
     ]:
         if token not in attach:
             fail(f"block attach must apply the exact RDMA plan: missing {token!r}")
@@ -1413,6 +1412,9 @@ def test_vfs_two_lane_rdma_keeps_anchor_identity_independent_and_tears_down_regi
     wire = WIRE_HPP.read_text()
     attach = function_body(source, "handle_dev_attach_req")
     release = function_body(source, "release_vfs_rdma_buffers")
+    remote_source = REMOTE_VFS_HPP.with_suffix(".cpp").read_text()
+    secure_prepare = function_body(remote_source, "wki_remote_vfs_prepare_secure_binding")
+    secure_release = function_body(remote_source, "wki_remote_vfs_release_secure_context")
 
     for token in [
         "constexpr uint16_t WKI_CAP_VFS_MULTI_RDMA_LANES = 0x0008;",
@@ -1438,25 +1440,32 @@ def test_vfs_two_lane_rdma_keeps_anchor_identity_independent_and_tears_down_regi
         "binding.vfs_lane_anchor = wki_vfs_attach_lane_is_anchor(req->attach_mode, MULTI_RDMA_LANES)",
         "explicit auxiliary identity is interpreted only after capability negotiation",
     )
+    vfs_attach = block_body_after(attach, "else if (res_type == ResourceType::VFS)")
     require_order(
-        attach,
+        vfs_attach,
         "binding.vfs_lane_anchor = wki_vfs_attach_lane_is_anchor(req->attach_mode, MULTI_RDMA_LANES)",
-        "if ((req->attach_mode & DEV_ATTACH_DISABLE_RDMA) == 0)",
-        "notification-anchor identity is independent from RDMA buffer allocation",
+        "binding.attach_ack = ack",
+        "notification-anchor identity survives the removal of raw attach allocation",
     )
-    require_order(
-        attach,
-        "if ((req->attach_mode & DEV_ATTACH_DISABLE_RDMA) == 0)",
-        "binding.vfs_rdma_transport = peer->rdma_transport;",
-        "owner RDMA setup remains inside the opt-in attach branch",
-    )
-    vfs_rdm_attach = attach[attach.find("if ((req->attach_mode & DEV_ATTACH_DISABLE_RDMA) == 0)") :]
-    require_order(
-        vfs_rdm_attach,
-        "binding.vfs_rdma_transport = peer->rdma_transport;",
-        "->rdma_register_region(",
-        "owner selects the provider before registering VFS buffers",
-    )
+    for forbidden in ["rdma_register_region(", "new (std::nothrow)", "binding.vfs_rdma_transport = peer->rdma_transport",
+                      "ack.rdma_flags |=", "ack.vfs_write_rkey =", "ack.vfs_bulk_rkey ="]:
+        if forbidden in vfs_attach:
+            fail(f"NAPI VFS attach must not allocate or advertise raw staging: {forbidden!r}")
+    for token in ["VfsSecureContext* vfs_secure_context = nullptr;", "std::exchange(o.vfs_secure_context, nullptr)"]:
+        if token not in header:
+            fail(f"binding must explicitly transfer private secure context ownership: {token!r}")
+    require_order(secure_prepare, "wki_secure_rdma_available", "new (std::nothrow) VfsSecureContext",
+                  "task-context private staging follows independent secure service confirmation")
+    require_order(secure_prepare, "context->write_backing.reset", "wki_secure_rdma_register_region",
+                  "secure registration retains private backing")
+    require_order(secure_prepare, "wki_secure_rdma_register_region", "wki_dev_server_install_vfs_secure_context",
+                  "publish only the fully registered private context")
+    require_order(secure_release, "wki_secure_rdma_unregister_region", "auth_crypto::secure_erase(context->write_backing.get(), VFS_RDMA_WRITE_SIZE)",
+                  "secure VFS backing remains intact until unregister/drain completes")
+    require_order(secure_release, "auth_crypto::secure_erase(context->read_backing.get(), VFS_RDMA_BULK_SIZE)", "delete context",
+                  "both owned private staging buffers are erased before free")
+    if "wki_remote_vfs_release_secure_context(buffers->secure_context)" not in release:
+        fail("binding retirement must hand off secure unregister/drain/erase outside its registry guard")
 
     for token in [
         "buffers->transport->rdma_unregister_region",
@@ -1503,11 +1512,12 @@ def test_vfs_two_lane_rdma_keeps_anchor_identity_independent_and_tears_down_regi
     ]:
         if token not in wki and token not in TRANSPORT_ETH_CPP.read_text():
             fail(f"transport region teardown API is missing {token!r}")
-    if "roce_rdma_unregister_region" not in TRANSPORT_ROCE_CPP.read_text():
-        fail("RoCE must remove persistent VFS regions from its rkey registry")
+    roce = TRANSPORT_ROCE_CPP.read_text()
+    if function_body(roce, "wki_roce_transport_get").strip() != "return nullptr;" or "s_region_buckets" in roce:
+        fail("legacy raw RoCE must have no available overlay or retained VFS region authority")
     ivshmem = TRANSPORT_IVSHMEM_CPP.read_text()
-    if "rdma_unregister_region = nullptr;" not in ivshmem or "no remote revocation" not in ivshmem:
-        fail("ivshmem must keep raw RDMA offset keys pinned without a remote-revocation protocol")
+    if "rdma_unregister_region = nullptr;" not in ivshmem or "s_ivshmem_transport.rdma_capable = false;" not in ivshmem:
+        fail("ivshmem must withhold raw BAR registration and direct consumer authority")
 
 
 def test_mapped_net_open_uses_authenticated_fixed_worker() -> None:
@@ -1571,7 +1581,7 @@ def main() -> None:
     test_epoch_cleanup_and_deferred_vfs_are_channel_generation_fenced()
     test_attach_ack_failure_defers_exact_cleanup_outside_rx()
     test_detach_admission_has_ktest_coverage()
-    test_block_attach_honors_disable_rdma_without_weakening_accelerated_mode()
+    test_block_attach_never_enables_legacy_raw_rings()
     test_vfs_two_lane_rdma_keeps_anchor_identity_independent_and_tears_down_regions()
     print("WKI dev server source invariants hold")
 

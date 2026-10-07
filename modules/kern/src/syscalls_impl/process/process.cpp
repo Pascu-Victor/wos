@@ -1807,7 +1807,11 @@ auto wos_proc_kill(int64_t pid, int sig) -> uint64_t {
     if (pid <= 0) {
         // Preserve WOS's existing pid=-1 behavior: the caller's process group.
         uint64_t const PGRP = pid < -1 ? static_cast<uint64_t>(-(pid + 1)) + 1 : CALLER_JOB.pgid;
-        return static_cast<uint64_t>(ker::net::wki::wki_group_signal_as(CALLER, CALLER_JOB, PGRP, pid >= -1, sig));
+        // Native init keeps its service group's origin after the leader exits.
+        // Migrated members remain reachable without selecting a foreign alias.
+        bool const INIT_LOCAL_GROUP = sched::task::process_pid(*self) == 1 && CALLER_JOB.group_origin.local() &&
+                                      (self->wki_target_flags & sched::task::Task::WKI_TARGET_FLAG_LOCAL) != 0;
+        return static_cast<uint64_t>(ker::net::wki::wki_group_signal_as(CALLER, CALLER_JOB, PGRP, pid >= -1 || INIT_LOCAL_GROUP, sig));
     }
 
     auto* target = sched::find_task_by_pid_safe(static_cast<uint64_t>(pid));

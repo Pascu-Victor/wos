@@ -15,6 +15,7 @@
 #include <memory>
 #include <net/backlog.hpp>
 #include <net/netpoll.hpp>
+#include <net/wki/auth_crypto.hpp>
 #include <net/wki/blk_ring.hpp>
 #include <net/wki/chaos.hpp>
 #include <net/wki/peer.hpp>
@@ -475,6 +476,7 @@ auto send_or_defer_block_detach(ProxyBlockState* state, uint16_t owner_node, uin
 // Registry and state locks held; caller owns construction/resume or has
 // fenced the proxy and drained I/O plus delayed doorbells.
 auto take_proxy_zone_locked(ProxyBlockState* state) -> WkiZoneRef {
+    auth_crypto::secure_erase(&state->secure_block_grant, sizeof(state->secure_block_grant));
     WkiZoneRef ref = std::move(state->rdma_zone_ref);
     state->rdma_attached = false;
     state->rdma_zone_ptr = nullptr;
@@ -1367,6 +1369,102 @@ void wait_for_block_chaos_doorbell_quiescence(ProxyBlockState* state) {
     }
 }
 
+auto secure_block_fallback_allowed(const WkiSecureRdmaResult& result) -> bool {
+    return result.outcome == WkiSecureRdmaOutcome::NO_EFFECT && result.bytes == 0 &&
+           (result.status == -ENOTSUP || result.status == -EAGAIN || result.status == -EBUSY || result.status == -ENOMEM);
+}
+
+// io_lock owns these private discovery/sequence fields. PREPARE has no native
+// I/O effect; full descriptors must also match authenticated core discovery.
+auto prepare_secure_block_grant(ProxyBlockState* state, const WkiChannelIdentity& identity, rdma_protocol::RegionDescriptor& output)
+    -> int {
+    rdma_protocol::RegionDescriptor current{};
+    if (state->secure_block_grant.rkey != 0 &&
+        wki_secure_rdma_remote_grant(identity, rdma_protocol::Service::BLOCK, state->secure_block_grant.rkey, current) &&
+        std::memcmp(&current, &state->secure_block_grant, sizeof(current)) == 0) {
+        output = current;
+        return 0;
+    }
+    BlockSecurePrepare prepare{};
+    prepare.attach_cookie = state->binding_attach_cookie;
+    prepare.resource_id = state->resource_id;
+    prepare.incarnation = state->binding_incarnation;
+    std::array<uint8_t, sizeof(DevOpReqPayload) + sizeof(prepare)> message{};
+    auto* header = reinterpret_cast<DevOpReqPayload*>(message.data());
+    header->op_id = OP_BLOCK_SECURE_PREPARE;
+    header->data_len = sizeof(prepare);
+    std::memcpy(message.data() + sizeof(*header), &prepare, sizeof(prepare));
+    rdma_protocol::RegionDescriptor advertised{};
+    WkiWaitEntry wait{};
+    WkiChannelIdentity captured{};
+    if (prepare_block_op_wait(state, OP_BLOCK_SECURE_PREPARE, wait, &advertised, sizeof(advertised), &captured) != WKI_OK) return -EAGAIN;
+    if (!channel_identity_equal(captured, identity)) {
+        cancel_op_waiter(state, wait, WKI_ERR_NOT_FOUND);
+        return -ENOTCONN;
+    }
+    int const SENT = wki_send_on_channel_identity(captured, MsgType::DEV_OP_REQ, message.data(), static_cast<uint16_t>(message.size()));
+    if (SENT != WKI_OK) {
+        cancel_op_waiter(state, wait, SENT);
+        return -ENOTCONN;
+    }
+    int const WAITED = wki_wait_for_op(&wait, WKI_DEV_PROXY_TIMEOUT_US);
+    if (WAITED != 0) {
+        cancel_op_waiter(state, wait, WAITED);
+        return -ENOTCONN;
+    }
+    int status = 0;
+    uint16_t length = 0;
+    consume_block_op_result(state, wait, &status, &length);
+    if (status != 0) return status;
+    if (length != sizeof(advertised) || advertised.rkey == 0 ||
+        !wki_secure_rdma_remote_grant(identity, rdma_protocol::Service::BLOCK, advertised.rkey, current))
+        return -EAGAIN;
+    if (std::memcmp(&current, &advertised, sizeof(current)) != 0) return -EACCES;
+    state->secure_block_grant = current;
+    output = current;
+    return 0;
+}
+
+auto secure_block_transfer(ProxyBlockState* state, ker::dev::BlockDevice* device, uint64_t lba, uint32_t count, void* output,
+                           const void* input, bool write) -> WkiSecureRdmaResult {
+    if (write && state->secure_block_write_uncertain) return {-EIO, 0, WkiSecureRdmaOutcome::UNCERTAIN};
+    if (state->rdma_disabled) return {-ENOTSUP, 0, WkiSecureRdmaOutcome::NO_EFFECT};
+    WkiChannelIdentity const IDENTITY = block_channel_identity_snapshot(state);
+    if (!wki_secure_rdma_available(IDENTITY, rdma_protocol::Service::BLOCK)) return {-ENOTSUP, 0, WkiSecureRdmaOutcome::NO_EFFECT};
+    state->secure_block_compatible = true;
+    auto const TRANSFER = blk_validate_transfer(lba, count, device->block_size, device->total_blocks, WKI_SECURE_BLOCK_BYTES);
+    if (!TRANSFER.valid || TRANSFER.bytes == 0 || (write ? input == nullptr : output == nullptr))
+        return {-EINVAL, 0, WkiSecureRdmaOutcome::NO_EFFECT};
+    rdma_protocol::RegionDescriptor grant{};
+    int const PREPARED = prepare_secure_block_grant(state, IDENTITY, grant);
+    if (PREPARED != 0) return {PREPARED, 0, WkiSecureRdmaOutcome::NO_EFFECT};
+    if (state->secure_block_sequence == std::numeric_limits<uint64_t>::max()) return {-ENOTSUP, 0, WkiSecureRdmaOutcome::NO_EFFECT};
+    BlockSecureIntent intent{};
+    intent.opcode = static_cast<uint8_t>(write ? rdma_protocol::Opcode::WRITE : rdma_protocol::Opcode::READ);
+    intent.attach_cookie = state->binding_attach_cookie;
+    intent.resource_id = state->resource_id;
+    intent.incarnation = state->binding_incarnation;
+    intent.binding_generation = grant.binding_generation;
+    intent.lba = lba;
+    intent.count = count;
+    intent.block_size = static_cast<uint32_t>(device->block_size);
+    intent.sequence = ++state->secure_block_sequence;
+    auto const NATIVE_INTENT = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&intent), sizeof(intent));
+    auto const KIND = wki_secure_rdma_transport(IDENTITY, rdma_protocol::Service::BLOCK);
+    if (state->secure_block_attempts != UINT64_MAX) ++state->secure_block_attempts;
+    auto result = write ? wki_secure_rdma_write(IDENTITY, grant, 0, {static_cast<const uint8_t*>(input), TRANSFER.bytes}, 0, NATIVE_INTENT)
+                        : wki_secure_rdma_read(IDENTITY, grant, 0, {static_cast<uint8_t*>(output), TRANSFER.bytes}, NATIVE_INTENT);
+    if (result.outcome == WkiSecureRdmaOutcome::EXACT && (result.status != 0 || result.bytes != TRANSFER.bytes))
+        result = {-EIO, result.bytes, WkiSecureRdmaOutcome::UNCERTAIN};
+    if (write && result.outcome == WkiSecureRdmaOutcome::UNCERTAIN) state->secure_block_write_uncertain = true;
+    if (result.outcome == WkiSecureRdmaOutcome::EXACT && result.status == 0) {
+        if (state->secure_block_completions != UINT64_MAX) ++state->secure_block_completions;
+        state->secure_block_bytes += std::min<uint64_t>(result.bytes, UINT64_MAX - state->secure_block_bytes);
+        state->secure_block_transport = KIND;
+    }
+    return result;
+}
+
 // Message-based block read (fallback when RDMA not available)
 auto remote_block_read_msg(ProxyBlockState* state, ker::dev::BlockDevice* dev, uint64_t block, uint32_t count, void* buffer) -> int {
     if (state == nullptr || dev == nullptr || buffer == nullptr || dev->block_size == 0 ||
@@ -1436,12 +1534,34 @@ auto remote_block_read_msg(ProxyBlockState* state, ker::dev::BlockDevice* dev, u
     return 0;
 }
 
-// RDMA ring-based block read - with read-ahead cache and server-push optimisation.
-//
-// Fetches random misses at the caller's requested size, then expands to a full
-// data-slot prefetch once access becomes sequential. For RoCE zones the server
-// already pushes data, CQ, and server-owned indices via rdma_write, so the
-// consumer avoids all rdma_read round-trips (no roce_pull_cq / roce_pull_data_slot).
+auto secure_block_range_valid(ker::dev::BlockDevice* device, uint64_t lba, uint32_t count, const void* buffer) -> bool {
+    return device != nullptr && buffer != nullptr && device->block_size != 0 && device->block_size <= WKI_SECURE_BLOCK_BYTES &&
+           blk_lba_range_valid(lba, count, device->total_blocks) &&
+           (count == 0 || device->block_size <= std::numeric_limits<size_t>::max() / count);
+}
+
+// Split only after validating the complete range; fallback starts at the first
+// proven uneffected chunk, never at an earlier successfully completed prefix.
+auto remote_block_read_secure_or_msg(ProxyBlockState* state, ker::dev::BlockDevice* device, uint64_t lba, uint32_t count, void* buffer)
+    -> int {
+    if (!secure_block_range_valid(device, lba, count, buffer)) return -EINVAL;
+    auto* destination = static_cast<uint8_t*>(buffer);
+    uint32_t const LIMIT = WKI_SECURE_BLOCK_BYTES / static_cast<uint32_t>(device->block_size);
+    while (count != 0) {
+        uint32_t const CHUNK = std::min(count, LIMIT);
+        auto const RESULT = secure_block_transfer(state, device, lba, CHUNK, destination, nullptr, false);
+        if (secure_block_fallback_allowed(RESULT) && state->secure_block_fallbacks != UINT64_MAX) ++state->secure_block_fallbacks;
+        int const STATUS =
+            secure_block_fallback_allowed(RESULT) ? remote_block_read_msg(state, device, lba, CHUNK, destination) : RESULT.status;
+        if (STATUS != 0) return STATUS;
+        if (!secure_block_fallback_allowed(RESULT) && RESULT.outcome != WkiSecureRdmaOutcome::EXACT) return -EIO;
+        destination += static_cast<size_t>(CHUNK) * device->block_size;
+        lba += CHUNK;
+        count -= CHUNK;
+    }
+    return 0;
+}
+
 auto remote_block_read_rdma(ProxyBlockState* state, uint64_t block, uint32_t count, void* buffer) -> int {
     if (!proxy_block_active(state) || state->rdma_zone_ptr == nullptr || buffer == nullptr) {
         return -EIO;
@@ -1692,10 +1812,7 @@ auto remote_block_read(ker::dev::BlockDevice* dev, uint64_t block, size_t count,
         return -EINVAL;
     }
     auto const CNT = static_cast<uint32_t>(count);
-    if (state->rdma_attached) {
-        return remote_block_read_rdma(state, block, CNT, buffer);
-    }
-    return remote_block_read_msg(state, dev, block, CNT, buffer);
+    return remote_block_read_secure_or_msg(state, dev, block, CNT, buffer);
 }
 
 // Message-based block write (fallback when RDMA not available)
@@ -1776,6 +1893,35 @@ auto remote_block_write_msg(ProxyBlockState* state, ker::dev::BlockDevice* dev, 
 }
 
 // RDMA ring-based block write - consumer copies data into slot, server reads from it
+auto remote_block_write_secure_or_msg(ProxyBlockState* state, ker::dev::BlockDevice* device, uint64_t lba, uint32_t count,
+                                      const void* buffer) -> int {
+    if (!secure_block_range_valid(device, lba, count, buffer)) return -EINVAL;
+    if (state->secure_block_write_uncertain) return -EIO;
+    auto* source = static_cast<const uint8_t*>(buffer);
+    uint32_t const LIMIT = WKI_SECURE_BLOCK_BYTES / static_cast<uint32_t>(device->block_size);
+    while (count != 0) {
+        uint32_t const CHUNK = std::min(count, LIMIT);
+        auto const RESULT = secure_block_transfer(state, device, lba, CHUNK, nullptr, source, true);
+        bool const FALLBACK = secure_block_fallback_allowed(RESULT);
+        if (FALLBACK && state->secure_block_fallbacks != UINT64_MAX) ++state->secure_block_fallbacks;
+        int const STATUS = FALLBACK ? remote_block_write_msg(state, device, lba, CHUNK, source) : RESULT.status;
+        if (STATUS != 0) {
+            // Ordinary replies carry errno only, so even EAGAIN/EINVAL cannot
+            // distinguish pre-admission denial from a provider's partial I/O.
+            if (FALLBACK && state->secure_block_compatible) state->secure_block_write_uncertain = true;
+            return STATUS;
+        }
+        if (!FALLBACK && RESULT.outcome != WkiSecureRdmaOutcome::EXACT) {
+            state->secure_block_write_uncertain = true;
+            return -EIO;
+        }
+        source += static_cast<size_t>(CHUNK) * device->block_size;
+        lba += CHUNK;
+        count -= CHUNK;
+    }
+    return 0;
+}
+
 auto remote_block_write_rdma(ProxyBlockState* state, uint64_t block, uint32_t count, const void* buffer) -> int {
     if (!proxy_block_active(state) || state->rdma_zone_ptr == nullptr || buffer == nullptr) {
         return -EIO;
@@ -1945,10 +2091,7 @@ auto remote_block_write(ker::dev::BlockDevice* dev, uint64_t block, size_t count
         return -EINVAL;
     }
     auto const CNT = static_cast<uint32_t>(count);
-    if (state->rdma_attached) {
-        return remote_block_write_rdma(state, block, CNT, buffer);
-    }
-    return remote_block_write_msg(state, dev, block, CNT, buffer);
+    return remote_block_write_secure_or_msg(state, dev, block, CNT, buffer);
 }
 
 // Message-based block flush (fallback when RDMA not available)
@@ -2084,9 +2227,7 @@ auto remote_block_flush(ker::dev::BlockDevice* dev) -> int {
         return -1;
     }
 
-    if (state->rdma_attached) {
-        return remote_block_flush_rdma(state);
-    }
+    if (state->secure_block_write_uncertain) return -EIO;
     return remote_block_flush_msg(state);
 }
 
@@ -2499,13 +2640,12 @@ auto remote_block_read_batch(ker::dev::BlockDevice* dev, const BlockRange* range
         return -1;
     }
 
-    if (state->rdma_attached) {
-        return remote_block_read_batch_rdma(state, ranges, count);
-    }
-
-    // Fallback: sequential single reads via message path
+    // The owner-local operation table replaces peer-writable SQ/CQ indices.
     for (uint32_t i = 0; i < count; i++) {
-        int const RET = remote_block_read_msg(state, dev, ranges[i].lba, ranges[i].block_count, ranges[i].buffer);
+        if (!secure_block_range_valid(dev, ranges[i].lba, ranges[i].block_count, ranges[i].buffer)) return -EINVAL;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        int const RET = remote_block_read_secure_or_msg(state, dev, ranges[i].lba, ranges[i].block_count, ranges[i].buffer);
         if (RET != 0) {
             return RET;
         }
@@ -2539,13 +2679,12 @@ auto remote_block_write_batch(ker::dev::BlockDevice* dev, const BlockRange* rang
         return -1;
     }
 
-    if (state->rdma_attached) {
-        return remote_block_write_batch_rdma(state, ranges, count);
-    }
-
-    // Fallback: sequential single writes via message path
+    // Native completion of each request precedes publication of its successor.
     for (uint32_t i = 0; i < count; i++) {
-        int const RET = remote_block_write_msg(state, dev, ranges[i].lba, ranges[i].block_count, ranges[i].buffer);
+        if (!secure_block_range_valid(dev, ranges[i].lba, ranges[i].block_count, ranges[i].buffer)) return -EINVAL;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        int const RET = remote_block_write_secure_or_msg(state, dev, ranges[i].lba, ranges[i].block_count, ranges[i].buffer);
         if (RET != 0) {
             return RET;
         }
@@ -2894,10 +3033,7 @@ auto remote_block_bulk_read(ker::dev::BlockDevice* dev, uint64_t lba, uint32_t b
     if (!io_lease.acquire(state)) {
         return -1;
     }
-    if (!state->rdma_attached || !state->bulk_capable) {
-        return -1;
-    }
-    return remote_block_bulk_read_rdma(state, lba, block_count, buffer);
+    return remote_block_read_secure_or_msg(state, dev, lba, block_count, buffer);
 }
 
 // Dispatcher: bulk write (called from public API)
@@ -2920,10 +3056,7 @@ auto remote_block_bulk_write(ker::dev::BlockDevice* dev, uint64_t lba, uint32_t 
     if (!io_lease.acquire(state)) {
         return -1;
     }
-    if (!state->rdma_attached || !state->bulk_capable) {
-        return -1;
-    }
-    return remote_block_bulk_write_rdma(state, lba, block_count, buffer);
+    return remote_block_write_secure_or_msg(state, dev, lba, block_count, buffer);
 }
 
 }  // namespace
@@ -2981,6 +3114,13 @@ auto wki_dev_proxy_diag_snapshot(WkiDevProxyDiagRow* rows, size_t capacity, size
 
         row.io_detail_complete = state->io_lock.try_lock();
         if (row.io_detail_complete) {
+            row.secure_block_compatible = state->secure_block_compatible;
+            row.secure_block_write_uncertain = state->secure_block_write_uncertain;
+            row.secure_block_attempts = state->secure_block_attempts;
+            row.secure_block_completions = state->secure_block_completions;
+            row.secure_block_bytes = state->secure_block_bytes;
+            row.secure_block_fallbacks = state->secure_block_fallbacks;
+            row.secure_block_transport = state->secure_block_transport;
             row.data_slot_bitmap = state->data_slot_bitmap;
             row.tag_bitmap = state->tag_bitmap;
             row.bulk_capable = state->bulk_capable;
@@ -4062,6 +4202,15 @@ void wki_dev_proxy_resume_for_peer(uint16_t node_id) {
             p->lock.lock();
             p->assigned_channel = rebound_channel_identity.channel_id;
             p->assigned_channel_identity = rebound_channel_identity;
+            p->secure_block_grant = {};
+            p->secure_block_attempts = 0;
+            p->secure_block_completions = 0;
+            p->secure_block_bytes = 0;
+            p->secure_block_fallbacks = 0;
+            p->secure_block_transport = rdma_protocol::Transport::NONE;
+            p->secure_block_sequence = 0;
+            p->secure_block_compatible = false;
+            p->secure_block_write_uncertain = false;
             p->max_op_size = p->attach_max_op_size;
             ker::dev::block_device_set_read_only(&p->bdev, p->attach_read_only);
             p->lock.unlock();
@@ -4297,23 +4446,11 @@ void handle_dev_attach_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_
         state->binding_incarnation = state->attach_expected_incarnation;
     }
 
-    // Check for RDMA block ring zone in the extended payload
-    if (payload_len >= sizeof(DevAttachAckPayload) && (ack->rdma_flags & DEV_ATTACH_RDMA_BLK_RING) != 0 && ack->blk_zone_id != 0) {
-        state->rdma_zone_id = ack->blk_zone_id;
-#ifdef DEBUG_WKI_TRANSPORT
-        ker::mod::dbg::log("[WKI-DBG] handle_dev_attach_ack: RDMA blk ring zone_id=0x%08x", ack->blk_zone_id);
-#endif
-    }
-
-    // Check for bulk RDMA transfer support
-    if (payload_len >= sizeof(DevAttachAckPayload) && (ack->rdma_flags & DEV_ATTACH_RDMA_BULK) != 0) {
-        state->bulk_capable = true;
-        // Default max transfer size if not explicitly negotiated (2 MB)
-        state->bulk_max_transfer = BLK_RING_MAX_BULK_TRANSFER;
-#ifdef DEBUG_WKI_TRANSPORT
-        ker::mod::dbg::log("[WKI-DBG] handle_dev_attach_ack: bulk transfer supported, max=%u", state->bulk_max_transfer);
-#endif
-    }
+    // Legacy shared-ring flags grant no memory authority, even when an
+    // authenticated peer advertises them. Secure BLOCK negotiates separately.
+    state->rdma_zone_id = 0;
+    state->bulk_capable = false;
+    state->bulk_max_transfer = 0;
 
     // Release the waiter
     state->attach_expected_cookie = 0;

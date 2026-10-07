@@ -1680,63 +1680,35 @@ def test_readlink_cache_invalidation_is_generation_based() -> None:
 def test_server_roce_push_reads_reuse_registered_staging() -> None:
     source = REMOTE_VFS_CPP.read_text()
     handler = function_body(source, "handle_vfs_op")
-    rdma_start = handler.find("case OP_VFS_READ_RDMA:")
-    bulk_start = handler.find("case OP_VFS_READ_BULK:", rdma_start)
-    write_start = handler.find("case OP_VFS_WRITE_RDMA:", bulk_start)
-    if min(rdma_start, bulk_start, write_start) < 0:
-        fail("missing server RDMA/bulk read cases")
-
-    cases = [
-        (
-            handler[rdma_start:bulk_start],
-            "read_staging",
-            "wki_dev_server_get_vfs_read_staging_buf(channel_identity)",
-            "VFS_RDMA_BOUNCE_SIZE",
-        ),
-        (
-            handler[bulk_start:write_start],
-            "bulk_staging",
-            "wki_dev_server_get_vfs_bulk_staging_buf(channel_identity)",
-            "VFS_RDMA_ROCE_BULK_SIZE",
-        ),
-    ]
-    for case, staging_name, getter, size_token in cases:
-        require_tokens(
-            case,
-            [
-                size_token,
-                f"uint8_t* {staging_name} = {getter}",
-                f"PULL_MODE && {staging_name} == nullptr",
-                "uint8_t* allocated_read_buf = nullptr",
-                f"uint8_t* read_buf = {staging_name}",
-                "if (read_buf == nullptr)",
-                "allocated_read_buf = new (std::nothrow) uint8_t[len]",
-                "read_buf = allocated_read_buf",
-                "read_local_file_windowed(local_file, read_buf, len",
-                "if (!PULL_MODE && bytes_read > 0)",
-                "wki_roce_rdma_write_tagged(hdr->src_node, consumer_rkey, 0, read_buf",
-                "rdma_write(",
-                "read_buf,",
-                "delete[] allocated_read_buf",
-            ],
-            "server push read staging reuse",
-        )
-        if f"PULL_MODE ? {getter}" in case:
-            fail("server push reads must fetch registered staging in both modes")
-        if "delete[] read_buf" in case:
-            fail("server push reads must never delete registered staging")
-        require_order(
-            case,
-            [
-                f"uint8_t* {staging_name} = {getter}",
-                f"uint8_t* read_buf = {staging_name}",
-                "read_local_file_windowed(local_file, read_buf, len",
-                "if (!PULL_MODE && bytes_read > 0)",
-                "wki_roce_rdma_write_tagged(hdr->src_node, consumer_rkey, 0, read_buf",
-                "delete[] allocated_read_buf",
-            ],
-            "server push read staging lifetime",
-        )
+    legacy = handler[handler.index("case OP_VFS_READ_RDMA:"):handler.index("default:", handler.index("case OP_VFS_READ_RDMA:"))]
+    require_order(legacy, ["case OP_VFS_READ_RDMA:", "case OP_VFS_READ_BULK:",
+                           "case OP_VFS_WRITE_RDMA:", "reject_request(-ENOTSUP)", "break"],
+                  "legacy raw VFS opcodes permanently fail closed")
+    for forbidden in ["read_local_file_windowed", "vfs_pwrite_file", "rdma_write(", "wki_roce_rdma_write_tagged"]:
+        if forbidden in legacy:
+            fail(f"raw VFS opcode retained native or transport effects: {forbidden}")
+    arm = function_body(source, "secure_vfs_arm")
+    require_order(arm, ["wki_vfs_secure_decode_intent", "secure_vfs_intent_matches", "context->armed = true",
+                        "wki_dev_server_retain_vfs_secure_binding", "secure_vfs_file_locked",
+                        "ker::vfs::vfs_retain_file", "generation = ++context->generation"],
+                  "secure VFS loan retains full native authority")
+    effect = function_body(source, "secure_vfs_effect")
+    require_order(effect, ["backing.data() != expected_backing", "input.size() != request.length",
+                           "secure_vfs_request_matches", "secure_vfs_file_locked",
+                           "context->effect_started = true", "context->loan_lock.unlock_irqrestore(FLAGS)",
+                           "ker::vfs::vfs_pwrite_file", "ker::vfs::vfs_pread_file",
+                           "static_cast<uint32_t>(BYTES), WkiSecureRdmaOutcome::EXACT"],
+                  "complete private coverage and retained prefix before native I/O")
+    native = function_body(source, "secure_vfs_file_locked")
+    require_tokens(native, ["row->ordinary_open_token != intent.open_token",
+                            "row->ordinary_open_binding_id != intent.binding_id",
+                            "vfs_export_publication_revision", "authorize_file_description_access",
+                            "file_mount_read_only"], "secure VFS native token and credentials")
+    release = function_body(source, "secure_vfs_release")
+    require_order(release, ["secure_vfs_request_matches", "std::exchange(context->file, nullptr)",
+                            "context->armed = false", "context->loan_lock.unlock_irqrestore(FLAGS)",
+                            "ker::vfs::vfs_put_file", "wki_dev_server_release_vfs_secure_binding"],
+                  "secure VFS release outside loan guard")
 
 
 def test_remote_metadata_scratch_initializes_only_consumed_prefix() -> None:
@@ -2051,41 +2023,20 @@ def test_write_behind_storage_grows_in_allocator_shaped_classes() -> None:
 def test_message_write_flush_uses_split_send_and_retains_tail() -> None:
     source = REMOTE_VFS_CPP.read_text()
     flush_body = function_body(source, "flush_write_behind")
-    require_order(
-        flush_body,
-        [
-            "uint32_t const CHUNK = std::min(remaining, VFS_RDMA_WRITE_SIZE)",
-            "vfs_proxy_write_rdma_and_wait(ctx->proxy, ctx->remote_fd, cur_offset, src, CHUNK, &written)",
-            "constexpr uint32_t WRITE_HDR_OVERHEAD = sizeof(DevOpReqPayload) + 12",
-            "auto max_data = static_cast<uint32_t>(WKI_ETH_MAX_PAYLOAD - WRITE_HDR_OVERHEAD)",
-            "uint32_t const CHUNK = (remaining > max_data) ? max_data : remaining",
-            "std::array<uint8_t, 12> req_prefix{}",
-            "memcpy(req_prefix.data(), &remote_fd, sizeof(int32_t))",
-            "memcpy(req_prefix.data() + 4, &cur_offset, sizeof(int64_t))",
-            "vfs_proxy_send_split_and_wait(ctx->proxy, OP_VFS_WRITE, req_prefix.data(), req_prefix.size(), src, CHUNK",
-        ],
-        "RDMA and message write-behind chunk bounds",
-    )
-    for forbidden in [
-        "new (std::nothrow) uint8_t[req_data_len]",
-        "delete[] req_data",
-        "memcpy(req_data + 12, src, CHUNK)",
-    ]:
+    require_order(flush_body, ["ctx->secure_write_error != 0", "capture_secure_vfs_client(*ctx, identity)",
+                               "std::min(remaining, VFS_RDMA_WRITE_SIZE)", "secure_vfs_client_write",
+                               "secure_vfs_message_fallback", "ctx->secure_write_error = ERROR",
+                               "message && ctx->secure_io_negotiated", "VFS_SECURE_MESSAGE_WRITE_MAX",
+                               "secure_vfs_message_write", "ctx->secure_write_error = ERROR",
+                               "else if (message)", "vfs_proxy_send_and_wait", "false, required_identity"],
+                  "secure and token-preserving message fallback precede legacy mode")
+    for forbidden in ["new (std::nothrow) uint8_t[req_data_len]", "delete[] req_data", "memcpy(req_data + 12, src, CHUNK)"]:
         if forbidden in flush_body:
             fail(f"message write flush retained request allocation/copy: {forbidden}")
-    require_order(
-        flush_body,
-        [
-            "vfs_proxy_send_split_and_wait(",
-            "if (STATUS != 0)",
-            "keep_pending_tail(src, remaining, cur_offset)",
-            "return STATUS",
-            "written == 0 || written > CHUNK",
-            "keep_pending_tail(src, remaining, cur_offset)",
-            "return -EIO",
-        ],
-        "message-mode write-behind failure tail retention",
-    )
+    require_order(flush_body, ["vfs_proxy_send_and_wait(", "if (STATUS != 0)",
+                               "keep_pending_tail(src, remaining, cur_offset)", "return STATUS",
+                               "written == 0 || written > chunk", "keep_pending_tail(src, remaining, cur_offset)", "return -EIO"],
+                  "message-mode write-behind failure tail retention")
 
     send_body = function_body(source, "vfs_proxy_send_and_wait")
     require_order(
@@ -2121,12 +2072,12 @@ def test_message_write_flush_uses_split_send_and_retains_tail() -> None:
             "wb->data.get()",
             "wb->pending_len > wb->capacity",
             "remote_vfs_invalidate_cached_stat(ctx)",
-            "written == 0 || written > CHUNK",
+            "written == 0 || written > chunk",
         ],
         "dynamic write-behind flush bounds",
     )
-    if flush_body.count("written == 0 || written > CHUNK") != 2:
-        fail("both RDMA and message write-behind flushes must reject oversized write responses")
+    require_tokens(flush_body, ["RESULT.bytes <= chunk", "RESULT.bytes > chunk"],
+                   "secure and tokenized responses reject oversized write prefixes")
 
 
 def test_remote_open_prepares_storage_before_mutation_request() -> None:
@@ -2970,8 +2921,8 @@ def test_remote_vfs_channel_identity_survives_pool_slot_reuse() -> None:
         server_body,
         [
             "wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP",
-            "wki_dev_server_get_vfs_write_region(channel_identity)",
-            "wki_dev_server_complete_vfs_write(channel_identity",
+            "authority.identity = channel_identity",
+            "secure_vfs_file_locked(authority, intent, WRITE, file)",
         ],
         "server VFS responses and binding lookups use exact generation",
     )
@@ -4688,7 +4639,26 @@ def test_ordinary_open_lifetime_client_ownership() -> None:
                             "g_shared_io_owners"], "separate bounded task-owned ordinary outbox")
 
 
+def test_secure_vfs_is_classified_before_reliable_ack() -> None:
+    source = WKI_CPP.read_text()
+    lifecycle = function_body(source, "message_uses_vfs_export_admission")
+    require_tokens(lifecycle, ["req->op_id == OP_VFS_SECURE_IO", "resp->op_id == OP_VFS_SECURE_IO"],
+                   "secure VFS request and response retain export lifecycle")
+    admission = function_body(source, "admit_vfs_op")
+    if admission.count("req->op_id == OP_VFS_SECURE_IO") != 2:
+        fail("secure VFS must use exact-length fixed admission before reliable ACK")
+    require_order(admission, ["OP_VFS_SECURE_IO", "EXPECTED_LEN != payload_len",
+                              "channel->rx_dispatch_seq != hdr->seq_num", "WkiVfsOpRxAdmission::RETRY",
+                              "wki_dev_server_admit_vfs_op_rx"], "secure VFS reliable ordered task admission")
+    dev = DEV_SERVER_CPP.read_text()
+    require_tokens(function_body(dev, "is_vfs_op"), ["OP_VFS_SECURE_IO"], "secure VFS owner classifier")
+    owner_admission = function_body(dev, "wki_dev_server_admit_vfs_op_rx")
+    require_tokens(owner_admission, ["OP_VFS_SECURE_IO", "EXPECTED_LEN != payload_len"],
+                   "secure VFS exact owner-envelope admission")
+
+
 def main() -> None:
+    test_secure_vfs_is_classified_before_reliable_ack()
     test_ordinary_open_lifetime_client_ownership()
     test_ordinary_open_lifetime_owner_uses_ordered_exact_binding()
     test_open_reply_admission_preserves_rejection_status()

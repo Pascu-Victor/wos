@@ -20,6 +20,8 @@ struct PacketBuffer;
 namespace ker::net::wki {
 
 struct WkiChaosBlockKey;
+struct VfsSecureContext;
+struct BlockSecureContext;
 
 // -----------------------------------------------------------------------------
 // DevServerBinding - one per active remote consumer attachment
@@ -55,6 +57,10 @@ struct DevServerBinding {
     bool block_read_allowed = false;  // Immutable issued access, independent of writer arbitration.
     bool block_read_only = false;
     dev::BlockWriterLease block_writer_lease{};
+    BlockSecureContext* block_secure_context = nullptr;
+    // Owner-local reservation shared by ordinary and secure native BLOCK I/O.
+    std::atomic<bool> block_native_busy{false};
+    bool block_secure_disabled = false;
     char vfs_export_path[256] = {};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
     char vfs_export_name[256] = {};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
     uint64_t vfs_export_dev_id = 0;
@@ -101,8 +107,10 @@ struct DevServerBinding {
     // All three VFS regions are registered through this same provider, including
     // partial-registration cases where the write region is unavailable.
     WkiTransport* vfs_rdma_transport = nullptr;
-    uint8_t* vfs_rdma_write_buf = nullptr;  // server-side receive region for RDMA-backed writes
-    uint32_t vfs_rdma_write_rkey = 0;       // rkey identifying this region to the remote consumer
+    VfsSecureContext* vfs_secure_context = nullptr;  // Private task-prepared native regions.
+    bool vfs_secure_compatible = false;              // Task-latched under server registry lock.
+    uint8_t* vfs_rdma_write_buf = nullptr;           // server-side receive region for RDMA-backed writes
+    uint32_t vfs_rdma_write_rkey = 0;                // rkey identifying this region to the remote consumer
     WkiTransport* vfs_rdma_write_transport = nullptr;
     bool vfs_rdma_write_active = false;
     uint16_t vfs_rdma_write_active_cookie = 0;
@@ -144,6 +152,9 @@ struct DevServerBinding {
           block_read_allowed(o.block_read_allowed),
           block_read_only(o.block_read_only),
           block_writer_lease(std::move(o.block_writer_lease)),
+          block_secure_context(std::exchange(o.block_secure_context, nullptr)),
+          block_native_busy(o.block_native_busy.load(std::memory_order_relaxed)),
+          block_secure_disabled(o.block_secure_disabled),
           vfs_export_dev_id(o.vfs_export_dev_id),
           vfs_export_publication_revision(o.vfs_export_publication_revision),
           vfs_export_revision_seen(o.vfs_export_revision_seen),
@@ -172,6 +183,8 @@ struct DevServerBinding {
           blk_remote_rkey(o.blk_remote_rkey),
           blk_rdma_transport(o.blk_rdma_transport),
           vfs_rdma_transport(o.vfs_rdma_transport),
+          vfs_secure_context(std::exchange(o.vfs_secure_context, nullptr)),
+          vfs_secure_compatible(o.vfs_secure_compatible),
           vfs_rdma_write_buf(o.vfs_rdma_write_buf),
           vfs_rdma_write_rkey(o.vfs_rdma_write_rkey),
           vfs_rdma_write_transport(o.vfs_rdma_write_transport),
@@ -217,6 +230,9 @@ struct DevServerBinding {
             block_read_allowed = o.block_read_allowed;
             block_read_only = o.block_read_only;
             block_writer_lease = std::move(o.block_writer_lease);
+            block_secure_context = std::exchange(o.block_secure_context, nullptr);
+            block_native_busy.store(o.block_native_busy.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            block_secure_disabled = o.block_secure_disabled;
             vfs_export_dev_id = o.vfs_export_dev_id;
             vfs_export_publication_revision = o.vfs_export_publication_revision;
             vfs_export_revision_seen = o.vfs_export_revision_seen;
@@ -249,6 +265,8 @@ struct DevServerBinding {
             blk_remote_rkey = o.blk_remote_rkey;
             blk_rdma_transport = o.blk_rdma_transport;
             vfs_rdma_transport = o.vfs_rdma_transport;
+            vfs_secure_context = std::exchange(o.vfs_secure_context, nullptr);
+            vfs_secure_compatible = o.vfs_secure_compatible;
             vfs_rdma_write_buf = o.vfs_rdma_write_buf;
             vfs_rdma_write_rkey = o.vfs_rdma_write_rkey;
             vfs_rdma_write_transport = o.vfs_rdma_write_transport;
@@ -296,6 +314,8 @@ struct WkiDevServerDiagRow {
     bool detach_cleanup_claimed = false;
     bool block_read_only = false;
     bool block_writer_lease_owned = false;
+    bool block_secure_context = false;
+    bool block_native_busy = false;
     bool blk_rdma_active = false;
     bool blk_zone_pending = false;
     bool blk_roce = false;
@@ -329,6 +349,21 @@ void wki_dev_server_init();
 auto wki_dev_server_retain_vfs_sibling(const WkiChannelIdentity& origin, uint16_t channel_id, uint32_t generation,
                                        WkiChannelIdentity* identity) -> DevServerBinding*;
 void wki_dev_server_release_vfs_sibling(DevServerBinding* binding);
+auto wki_dev_server_install_vfs_secure_context(DevServerBinding* binding, VfsSecureContext* context) -> bool;
+auto wki_dev_server_has_vfs_secure_context(const DevServerBinding* binding) -> bool;
+// Borrow only while holding a retained binding reference; cleanup must join it.
+auto wki_dev_server_borrow_vfs_secure_context(const DevServerBinding* binding) -> VfsSecureContext*;
+auto wki_dev_server_take_vfs_secure_context(DevServerBinding* binding, VfsSecureContext* expected) -> bool;
+auto wki_dev_server_vfs_secure_compatible(DevServerBinding* binding, bool publish = false) -> bool;
+auto wki_dev_server_retain_vfs_secure_binding(const WkiChannelIdentity& identity, const VfsSecureContext* context) -> DevServerBinding*;
+void wki_dev_server_release_vfs_secure_binding(DevServerBinding* binding);
+// Task-only context publication/refresh while an accepted worker retains the
+// binding. Native admission is try-only; release needs no peer lifecycle gate.
+auto wki_dev_server_block_secure_context(DevServerBinding* binding) -> BlockSecureContext*;
+auto wki_dev_server_exchange_block_secure_context(DevServerBinding* binding, BlockSecureContext* expected, BlockSecureContext* replacement)
+    -> bool;
+auto wki_dev_server_retain_block_secure_binding(const WkiChannelIdentity& identity, const BlockSecureContext* context) -> DevServerBinding*;
+void wki_dev_server_release_block_secure_binding(DevServerBinding* binding);
 // New admission for an owner-issued directory grant. The source channel
 // identity is owner-local; the grant carries only peer/resource incarnations.
 // Caller releases outside VFS/path/publication locks.

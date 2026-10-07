@@ -22,6 +22,7 @@
 #include <net/wki/remote_ipc.hpp>
 #include <net/wki/remote_net.hpp>
 #include <net/wki/remote_vfs.hpp>
+#include <net/wki/secure_block.hpp>
 #include <net/wki/timer_math.hpp>
 #include <net/wki/transport_roce.hpp>
 #include <net/wki/wire.hpp>
@@ -57,21 +58,10 @@ struct BlockAttachRdmaPlan {
     bool zone_pending = false;
 };
 
-constexpr auto make_block_attach_rdma_plan(uint8_t attach_mode, uint16_t consumer_node, uint32_t resource_id, bool peer_has_rdma_transport)
-    -> BlockAttachRdmaPlan {
-    if ((attach_mode & DEV_ATTACH_DISABLE_RDMA) != 0) {
-        return {};
-    }
-
-    BlockAttachRdmaPlan plan = {
-        .zone_id = (static_cast<uint32_t>(consumer_node) << 16) | resource_id,
-        .rdma_flags = DEV_ATTACH_RDMA_BLK_RING,
-        .zone_pending = true,
-    };
-    if (peer_has_rdma_transport) {
-        plan.rdma_flags |= DEV_ATTACH_RDMA_BULK;
-    }
-    return plan;
+constexpr auto make_block_attach_rdma_plan(uint8_t, uint16_t, uint32_t, bool) -> BlockAttachRdmaPlan {
+    // A raw provider hint never authorizes peer-writable SQ/CQ or bulk memory.
+    // The independently negotiated secure BLOCK path uses private operations.
+    return {};
 }
 
 std::list<DevServerBinding> g_bindings;                  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -384,6 +374,8 @@ void wait_for_binding_refs_to_drain(DevServerBinding* binding) {
 }
 
 struct VfsRdmaBuffers {
+    VfsSecureContext* secure_context = nullptr;
+    BlockSecureContext* block_context = nullptr;
     WkiTransport* transport = nullptr;
     uint8_t* write_buf = nullptr;
     uint32_t write_rkey = 0;
@@ -402,6 +394,8 @@ void take_vfs_rdma_buffers_locked(DevServerBinding& binding, VfsRdmaBuffers* out
     }
 
     *out = {
+        .secure_context = binding.vfs_secure_context,
+        .block_context = binding.block_secure_context,
         .transport = binding.vfs_rdma_transport,
         .write_buf = binding.vfs_rdma_write_buf,
         .write_rkey = binding.vfs_rdma_write_rkey,
@@ -410,6 +404,10 @@ void take_vfs_rdma_buffers_locked(DevServerBinding& binding, VfsRdmaBuffers* out
         .bulk_staging_buf = binding.vfs_rdma_bulk_staging_buf,
         .bulk_staging_rkey = binding.vfs_rdma_bulk_staging_rkey,
     };
+    wki_remote_vfs_close_secure_context(binding.vfs_secure_context);
+    wki_secure_block_close_context(binding.block_secure_context);
+    binding.block_secure_context = nullptr;
+    binding.vfs_secure_context = nullptr;
     binding.vfs_rdma_transport = nullptr;
     binding.vfs_rdma_write_buf = nullptr;
     binding.vfs_rdma_write_rkey = 0;
@@ -424,6 +422,8 @@ void release_vfs_rdma_buffers(VfsRdmaBuffers* buffers) {
     if (buffers == nullptr) {
         return;
     }
+    wki_remote_vfs_release_secure_context(buffers->secure_context);
+    wki_secure_block_release_context(buffers->block_context);
 
     // Invalidate transport metadata before returning backing storage to
     // kmalloc when the transport has a remote-revocation guarantee. This runs
@@ -576,7 +576,7 @@ auto is_vfs_op(uint16_t op_id) -> bool {
     return (op_id >= OP_VFS_OPEN && op_id <= OP_VFS_READ_BULK) || op_id == OP_VFS_UTIMENS || op_id == OP_VFS_METADATA_BATCH ||
            op_id == OP_VFS_XATTR || op_id == OP_VFS_OPEN_READ_AS || op_id == OP_VFS_OPEN_AS || op_id == OP_VFS_FSTAT ||
            op_id == OP_VFS_STAT_AS || op_id == OP_VFS_PATH_AS || op_id == OP_VFS_EXEC_VIEW || op_id == OP_VFS_DIRECTORY_REFERENCE ||
-           op_id == OP_VFS_DIRECTORY_GRANT || op_id == OP_VFS_OPEN_LIFETIME || op_id == OP_VFS_FEATURES;
+           op_id == OP_VFS_DIRECTORY_GRANT || op_id == OP_VFS_OPEN_LIFETIME || op_id == OP_VFS_FEATURES || op_id == OP_VFS_SECURE_IO;
 }
 
 auto transport_is_roce(const WkiTransport* transport) -> bool {
@@ -999,7 +999,45 @@ void run_deferred_block_op(DeferredVfsOp* op) {
     }
 
     ker::dev::BlockDevice* const BDEV = BINDING->block_dev;
+    bool const NATIVE_IO = op->op_id == OP_BLOCK_READ || op->op_id == OP_BLOCK_WRITE || op->op_id == OP_BLOCK_FLUSH;
+    struct NativeReservation {
+        DevServerBinding* binding = nullptr;
+        ~NativeReservation() {
+            if (binding != nullptr) binding->block_native_busy.store(false, std::memory_order_release);
+        }
+    } reservation;
+    if (NATIVE_IO) {
+        bool expected = false;
+        if (!BINDING->block_native_busy.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            send_block_status_response(op->channel_identity, op->op_id, -EBUSY, REQUEST_COOKIE);
+            return;
+        }
+        reservation.binding = BINDING;
+    }
     switch (op->op_id) {
+        case OP_BLOCK_SECURE_PREPARE: {
+            if (op->req_data_len != sizeof(BlockSecurePrepare)) {
+                send_block_status_response(op->channel_identity, op->op_id, -EINVAL, REQUEST_COOKIE);
+                break;
+            }
+            BlockSecurePrepare request{};
+            std::memcpy(&request, op->req_data, sizeof(request));
+            rdma_protocol::RegionDescriptor grant{};
+            int const STATUS = wki_secure_block_prepare(BINDING, request, grant);
+            if (STATUS != 0) {
+                send_block_status_response(op->channel_identity, op->op_id, STATUS, REQUEST_COOKIE);
+                break;
+            }
+            std::array<uint8_t, sizeof(DevOpRespPayload) + sizeof(grant)> response{};
+            auto* header = reinterpret_cast<DevOpRespPayload*>(response.data());
+            header->op_id = op->op_id;
+            header->data_len = sizeof(grant);
+            header->reserved = REQUEST_COOKIE;
+            std::memcpy(response.data() + sizeof(*header), &grant, sizeof(grant));
+            static_cast<void>(wki_send_on_channel_identity(op->channel_identity, MsgType::DEV_OP_RESP, response.data(),
+                                                           static_cast<uint16_t>(response.size())));
+            break;
+        }
         case OP_BLOCK_INFO: {
             if (op->req_data_len != 0) {
                 send_block_status_response(op->channel_identity, op->op_id, -EINVAL, REQUEST_COOKIE);
@@ -1812,6 +1850,94 @@ auto wki_dev_server_retain_vfs_sibling(const WkiChannelIdentity& origin, uint16_
 
 void wki_dev_server_release_vfs_sibling(DevServerBinding* binding) { release_binding(binding); }
 
+auto wki_dev_server_install_vfs_secure_context(DevServerBinding* binding, VfsSecureContext* context) -> bool {
+    uint64_t const FLAGS = s_server_lock.lock_irqsave();
+    bool const ACCEPT = context != nullptr && binding != nullptr && binding->active && !binding->retiring.load(std::memory_order_acquire) &&
+                        !binding->epoch_reset_pending && !binding->detach_cleanup_pending && binding->resource_type == ResourceType::VFS &&
+                        binding->vfs_secure_context == nullptr;
+    if (ACCEPT) binding->vfs_secure_context = context;
+    s_server_lock.unlock_irqrestore(FLAGS);
+    return ACCEPT;
+}
+
+auto wki_dev_server_has_vfs_secure_context(const DevServerBinding* binding) -> bool {
+    uint64_t const FLAGS = s_server_lock.lock_irqsave();
+    bool const PRESENT = binding != nullptr && binding->vfs_secure_context != nullptr;
+    s_server_lock.unlock_irqrestore(FLAGS);
+    return PRESENT;
+}
+
+auto wki_dev_server_borrow_vfs_secure_context(const DevServerBinding* binding) -> VfsSecureContext* {
+    uint64_t const FLAGS = s_server_lock.lock_irqsave();
+    auto* context = binding != nullptr ? binding->vfs_secure_context : nullptr;
+    s_server_lock.unlock_irqrestore(FLAGS);
+    return context;
+}
+
+auto wki_dev_server_take_vfs_secure_context(DevServerBinding* binding, VfsSecureContext* expected) -> bool {
+    uint64_t const FLAGS = s_server_lock.lock_irqsave();
+    bool const OWNED = binding != nullptr && expected != nullptr && binding->vfs_secure_context == expected;
+    if (OWNED) {
+        wki_remote_vfs_close_secure_context(expected);
+        binding->vfs_secure_context = nullptr;
+    }
+    s_server_lock.unlock_irqrestore(FLAGS);
+    return OWNED;
+}
+
+auto wki_dev_server_vfs_secure_compatible(DevServerBinding* binding, bool publish) -> bool {
+    uint64_t const FLAGS = s_server_lock.lock_irqsave();
+    bool const LIVE = binding != nullptr && binding->active && !binding->retiring.load(std::memory_order_acquire) &&
+                      !binding->epoch_reset_pending && !binding->detach_cleanup_pending && binding->resource_type == ResourceType::VFS;
+    if (LIVE && publish) binding->vfs_secure_compatible = true;
+    bool const COMPATIBLE = LIVE && binding->vfs_secure_compatible;
+    s_server_lock.unlock_irqrestore(FLAGS);
+    return COMPATIBLE;
+}
+
+auto wki_dev_server_retain_vfs_secure_binding(const WkiChannelIdentity& identity, const VfsSecureContext* context) -> DevServerBinding* {
+    uint64_t const FLAGS = s_server_lock.lock_irqsave();
+    auto* binding = find_binding_by_channel_identity(identity);
+    if (binding == nullptr || binding->resource_type != ResourceType::VFS || binding->epoch_reset_pending ||
+        binding->detach_cleanup_pending || binding->vfs_secure_context != context || !retain_binding_locked(binding))
+        binding = nullptr;
+    s_server_lock.unlock_irqrestore(FLAGS);
+    return binding;
+}
+
+void wki_dev_server_release_vfs_secure_binding(DevServerBinding* binding) { release_binding(binding); }
+
+auto wki_dev_server_block_secure_context(DevServerBinding* binding) -> BlockSecureContext* {
+    uint64_t const FLAGS = s_server_lock.lock_irqsave();
+    auto* context = binding != nullptr ? binding->block_secure_context : nullptr;
+    s_server_lock.unlock_irqrestore(FLAGS);
+    return context;
+}
+
+auto wki_dev_server_exchange_block_secure_context(DevServerBinding* binding, BlockSecureContext* expected, BlockSecureContext* replacement)
+    -> bool {
+    uint64_t const FLAGS = s_server_lock.lock_irqsave();
+    bool const ACCEPT = binding != nullptr && binding->active && !binding->retiring.load(std::memory_order_acquire) &&
+                        !binding->epoch_reset_pending && !binding->detach_cleanup_pending &&
+                        binding->resource_type == ResourceType::BLOCK && binding->block_secure_context == expected;
+    if (ACCEPT) binding->block_secure_context = replacement;
+    s_server_lock.unlock_irqrestore(FLAGS);
+    return ACCEPT;
+}
+
+auto wki_dev_server_retain_block_secure_binding(const WkiChannelIdentity& identity, const BlockSecureContext* context)
+    -> DevServerBinding* {
+    if (!s_server_lock.try_lock()) return nullptr;
+    auto* binding = find_binding_by_channel_identity(identity);
+    if (binding == nullptr || binding->resource_type != ResourceType::BLOCK || binding->epoch_reset_pending ||
+        binding->detach_cleanup_pending || binding->block_secure_context != context || !retain_binding_locked(binding))
+        binding = nullptr;
+    s_server_lock.unlock();
+    return binding;
+}
+
+void wki_dev_server_release_block_secure_binding(DevServerBinding* binding) { release_binding(binding); }
+
 auto wki_dev_server_retain_vfs_grant_source(const WkiChannelIdentity& origin, const VfsDirectoryGrant& grant, uint64_t publication_revision)
     -> DevServerBinding* {
     if (!wki_vfs_directory_grant_valid(grant) || publication_revision == 0) return nullptr;
@@ -1855,6 +1981,8 @@ auto wki_dev_server_diag_snapshot(WkiDevServerDiagRow* rows, size_t capacity, si
         row.detach_cleanup_claimed = binding.detach_cleanup_claimed;
         row.block_read_only = binding.block_read_only;
         row.block_writer_lease_owned = binding.block_writer_lease.active();
+        row.block_secure_context = binding.block_secure_context != nullptr;
+        row.block_native_busy = binding.block_native_busy.load(std::memory_order_acquire);
         row.blk_rdma_active = binding.blk_rdma_active;
         row.blk_zone_pending = binding.blk_zone_pending;
         row.blk_roce = binding.blk_roce;
@@ -1914,7 +2042,7 @@ auto wki_dev_server_admit_vfs_op_rx(const WkiHeader* hdr, const uint8_t* payload
         (((req->op_id == OP_NET_OPEN_AS || req->op_id == OP_NET_CLOSE_AS || req->op_id == OP_NET_LINK_AS) || req->op_id == OP_VFS_XATTR ||
           req->op_id == OP_VFS_FSTAT || req->op_id == OP_VFS_STAT_AS || req->op_id == OP_VFS_PATH_AS || req->op_id == OP_VFS_EXEC_VIEW ||
           req->op_id == OP_VFS_DIRECTORY_REFERENCE || (req->op_id == OP_VFS_DIRECTORY_GRANT || req->op_id == OP_VFS_OPEN_LIFETIME) ||
-          req->op_id == OP_VFS_FEATURES || req->op_id == OP_VFS_METADATA_BATCH)
+          req->op_id == OP_VFS_FEATURES || req->op_id == OP_VFS_SECURE_IO || req->op_id == OP_VFS_METADATA_BATCH)
              ? EXPECTED_LEN != payload_len
              : EXPECTED_LEN > payload_len)) {
         return WkiVfsOpRxAdmission::NOT_APPLICABLE;
@@ -2859,9 +2987,10 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         binding.block_read_allowed = REQUEST_READ;
         binding.block_read_only = read_only_attach;
         binding.block_writer_lease = std::move(block_writer_lease);
+        binding.block_secure_disabled = (req->attach_mode & DEV_ATTACH_DISABLE_RDMA) != 0;
 
         WkiPeer const* peer = wki_peer_find(hdr->src_node);
-        bool const PEER_HAS_RDMA_TRANSPORT = peer != nullptr && peer->rdma_transport != nullptr;
+        bool const PEER_HAS_RDMA_TRANSPORT = peer != nullptr && peer->rdma_transport != nullptr && peer->rdma_transport->rdma_capable;
         BlockAttachRdmaPlan const RDMA_PLAN =
             make_block_attach_rdma_plan(req->attach_mode, hdr->src_node, req->resource_id, PEER_HAS_RDMA_TRANSPORT);
 
@@ -2983,89 +3112,9 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         binding.vfs_export_path[sizeof(binding.vfs_export_path) - 1] = '\0';
         binding.vfs_export_name[sizeof(binding.vfs_export_name) - 1] = '\0';
 
-        // RDMA-backed VFS I/O: pre-register server-side buffers for the
-        // bounded set of data lanes. Logical notification-anchor identity is
-        // carried independently above.
-        // rdma_register_region is a local-only operation - safe to call in NAPI context.
-        if ((req->attach_mode & DEV_ATTACH_DISABLE_RDMA) == 0) {
-            WkiPeer const* peer = wki_peer_find(hdr->src_node);
-            if (peer != nullptr && peer->rdma_transport != nullptr && peer->rdma_transport->rdma_register_region != nullptr) {
-                binding.vfs_rdma_transport = peer->rdma_transport;
-                // Write receive buffer: consumer rdma_writes file data here.
-                constexpr uint32_t VFS_WRITE_BUF = VFS_RDMA_WRITE_SIZE;
-                auto* wbuf = new (std::nothrow) uint8_t[VFS_WRITE_BUF];
-                if (wbuf != nullptr) {
-                    uint32_t rkey = 0;
-                    int const REG_RET = peer->rdma_transport->rdma_register_region(peer->rdma_transport, reinterpret_cast<uint64_t>(wbuf),
-                                                                                   VFS_WRITE_BUF, &rkey);
-                    if (REG_RET == 0 && rkey != 0) {
-                        binding.vfs_rdma_write_buf = wbuf;
-                        binding.vfs_rdma_write_rkey = rkey;
-                        binding.vfs_rdma_write_transport = peer->rdma_transport;
-                        ack.rdma_flags |= DEV_ATTACH_RDMA_VFS;
-                        ack.blk_zone_id = rkey;  // carry server write-recv rkey to consumer
-                    } else {
-                        if (REG_RET == 0 && peer->rdma_transport->rdma_unregister_region != nullptr) {
-                            static_cast<void>(peer->rdma_transport->rdma_unregister_region(peer->rdma_transport, rkey, VFS_WRITE_BUF));
-                        }
-                        delete[] wbuf;
-                    }
-                }
-
-                // Read staging buffer (RoCE pull mode only): server reads file data here;
-                // consumer rdma_reads to pull. Not needed for ivshmem (push is safe there).
-                bool const PEER_IS_ROCE =
-                    (peer->rdma_transport->name != nullptr && std::strcmp(peer->rdma_transport->name, "wki-roce") == 0);
-                if (PEER_IS_ROCE) {
-                    auto* rbuf = new (std::nothrow) uint8_t[VFS_RDMA_BOUNCE_SIZE];
-                    if (rbuf != nullptr) {
-                        uint32_t rrkey = 0;
-                        int const REG_RET = peer->rdma_transport->rdma_register_region(
-                            peer->rdma_transport, reinterpret_cast<uint64_t>(rbuf), VFS_RDMA_BOUNCE_SIZE, &rrkey);
-                        if (REG_RET == 0 && rrkey != 0) {
-                            binding.vfs_rdma_read_staging_buf = rbuf;
-                            binding.vfs_rdma_read_staging_rkey = rrkey;
-                            ack.rdma_flags |= DEV_ATTACH_RDMA_VFS_READ;
-                            ack.rdma_read_staging_rkey = rrkey;
-                        } else {
-                            if (REG_RET == 0 && peer->rdma_transport->rdma_unregister_region != nullptr) {
-                                static_cast<void>(
-                                    peer->rdma_transport->rdma_unregister_region(peer->rdma_transport, rrkey, VFS_RDMA_BOUNCE_SIZE));
-                            }
-                            delete[] rbuf;
-                        }
-                    }
-
-                    // Bulk staging buffer (RoCE bulk pull mode): server reads
-                    // transport-sized VFS chunks here, then the consumer pulls
-                    // them via RDMA. RoCE already caps each pull burst, so avoid
-                    // reserving a 2 MiB buffer for a 128 KiB transfer window.
-                    auto* bbuf = new (std::nothrow) uint8_t[VFS_RDMA_ROCE_BULK_SIZE];
-                    if (bbuf != nullptr) {
-                        uint32_t brkey = 0;
-                        int const BREG_RET = peer->rdma_transport->rdma_register_region(
-                            peer->rdma_transport, reinterpret_cast<uint64_t>(bbuf), VFS_RDMA_ROCE_BULK_SIZE, &brkey);
-                        if (BREG_RET == 0 && brkey != 0) {
-                            binding.vfs_rdma_bulk_staging_buf = bbuf;
-                            binding.vfs_rdma_bulk_staging_rkey = brkey;
-                            ack.rdma_flags |= DEV_ATTACH_RDMA_BULK_PULL;
-                            ack.rdma_bulk_staging_rkey = brkey;
-                        } else {
-                            if (BREG_RET == 0 && peer->rdma_transport->rdma_unregister_region != nullptr) {
-                                static_cast<void>(
-                                    peer->rdma_transport->rdma_unregister_region(peer->rdma_transport, brkey, VFS_RDMA_ROCE_BULK_SIZE));
-                            }
-                            delete[] bbuf;
-                            ker::mod::dbg::log("[WKI] VFS attach: bulk staging registration failed node=0x%04x ret=%d", hdr->src_node,
-                                               BREG_RET);
-                        }
-                    } else {
-                        ker::mod::dbg::log("[WKI] VFS attach: bulk staging allocation failed node=0x%04x size=%u", hdr->src_node,
-                                           VFS_RDMA_ROCE_BULK_SIZE);
-                    }
-                }
-            }
-        }
+        // Raw attach-time registration is permanently unavailable. Secure VFS
+        // regions are prepared by the retained deferred ordinary-open task;
+        // attach flags/rkeys carry no secure authority and remain zero.
 
         ack.status = static_cast<uint8_t>(DevAttachStatus::OK);
         ack.assigned_channel = ch->channel_id;
@@ -3267,7 +3316,8 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
     if (((req->op_id == OP_NET_OPEN_AS || req->op_id == OP_NET_CLOSE_AS || req->op_id == OP_NET_LINK_AS) || req->op_id == OP_VFS_XATTR ||
          req->op_id == OP_VFS_FSTAT || req->op_id == OP_VFS_STAT_AS || req->op_id == OP_VFS_PATH_AS || req->op_id == OP_VFS_EXEC_VIEW ||
          req->op_id == OP_VFS_DIRECTORY_REFERENCE || (req->op_id == OP_VFS_DIRECTORY_GRANT || req->op_id == OP_VFS_OPEN_LIFETIME) ||
-         req->op_id == OP_VFS_FEATURES || req->op_id == OP_VFS_METADATA_BATCH)
+         req->op_id == OP_VFS_FEATURES || req->op_id == OP_VFS_SECURE_IO || req->op_id == OP_VFS_METADATA_BATCH ||
+         req->op_id == OP_BLOCK_SECURE_PREPARE)
             ? EXPECTED_LEN != payload_len
             : EXPECTED_LEN > payload_len) {
         return;
@@ -4729,22 +4779,18 @@ auto wki_dev_server_selftest_block_writer_lease_transfer() -> bool {
 auto wki_dev_server_selftest_block_attach_honors_disable_rdma() -> bool {
     constexpr uint16_t CONSUMER_NODE = 0x1234;
     constexpr uint32_t RESOURCE_ID = 0x5678;
-    constexpr uint32_t EXPECTED_ZONE_ID = 0x12345678;
     constexpr uint8_t MESSAGE_MODE =
         static_cast<uint8_t>(AttachMode::PROXY) | DEV_ATTACH_ACCESS_READ | DEV_ATTACH_ACCESS_WRITE | DEV_ATTACH_DISABLE_RDMA;
     constexpr uint8_t RDMA_MODE = static_cast<uint8_t>(AttachMode::PROXY) | DEV_ATTACH_ACCESS_READ | DEV_ATTACH_ACCESS_WRITE;
 
     constexpr BlockAttachRdmaPlan MESSAGE = make_block_attach_rdma_plan(MESSAGE_MODE, CONSUMER_NODE, RESOURCE_ID, true);
-    constexpr BlockAttachRdmaPlan RING_ONLY = make_block_attach_rdma_plan(RDMA_MODE, CONSUMER_NODE, RESOURCE_ID, false);
+    constexpr BlockAttachRdmaPlan UNAVAILABLE = make_block_attach_rdma_plan(RDMA_MODE, CONSUMER_NODE, RESOURCE_ID, false);
     constexpr BlockAttachRdmaPlan RING_AND_BULK = make_block_attach_rdma_plan(RDMA_MODE, CONSUMER_NODE, RESOURCE_ID, true);
 
     bool const MESSAGE_HAS_NO_RDMA = MESSAGE.zone_id == 0 && MESSAGE.rdma_flags == 0 && !MESSAGE.zone_pending;
-    bool const RING_IS_DEFERRED =
-        RING_ONLY.zone_id == EXPECTED_ZONE_ID && RING_ONLY.rdma_flags == DEV_ATTACH_RDMA_BLK_RING && RING_ONLY.zone_pending;
-    bool const BULK_REQUIRES_PROVIDER = RING_AND_BULK.zone_id == EXPECTED_ZONE_ID &&
-                                        RING_AND_BULK.rdma_flags == (DEV_ATTACH_RDMA_BLK_RING | DEV_ATTACH_RDMA_BULK) &&
-                                        RING_AND_BULK.zone_pending;
-    return MESSAGE_HAS_NO_RDMA && RING_IS_DEFERRED && BULK_REQUIRES_PROVIDER;
+    bool const UNAVAILABLE_HAS_NO_RDMA = UNAVAILABLE.zone_id == 0 && UNAVAILABLE.rdma_flags == 0 && !UNAVAILABLE.zone_pending;
+    bool const RAW_PROVIDER_CANNOT_ENABLE = RING_AND_BULK.zone_id == 0 && RING_AND_BULK.rdma_flags == 0 && !RING_AND_BULK.zone_pending;
+    return MESSAGE_HAS_NO_RDMA && UNAVAILABLE_HAS_NO_RDMA && RAW_PROVIDER_CANNOT_ENABLE;
 }
 
 auto wki_dev_server_selftest_detach_admission_lifecycle() -> bool {

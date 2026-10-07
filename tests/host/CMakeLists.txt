@@ -855,6 +855,62 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_ivshmem_source_test.py
 )
 add_test(
+    NAME wki_ivshmem_closure_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_ivshmem_closure_test.py
+)
+set_tests_properties(wki_ivshmem_closure_test PROPERTIES
+    LABELS "host;unit;integration;source"
+    TIMEOUT 60
+    ENVIRONMENT "WOS_HOST_TEST_DISABLE_LSAN=$<BOOL:${WOS_HOST_TEST_DISABLE_LSAN}>"
+)
+add_test(
+    NAME wki_secure_adapters_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_secure_adapters_test.py
+)
+set_tests_properties(wki_secure_adapters_test PROPERTIES
+    LABELS "host;unit;integration;source"
+    TIMEOUT 60
+    ENVIRONMENT "WOS_HOST_TEST_DISABLE_LSAN=$<BOOL:${WOS_HOST_TEST_DISABLE_LSAN}>"
+)
+add_test(
+    NAME wki_secure_rdma_fixture_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_secure_rdma_fixture_test.py
+)
+set_tests_properties(wki_secure_rdma_fixture_test PROPERTIES
+    LABELS "host;unit;integration;source"
+    TIMEOUT 60
+)
+add_test(
+    NAME wki_secure_zone_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_secure_zone_test.py
+)
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/secure-fixture-tmp)
+set_tests_properties(wki_secure_zone_test PROPERTIES
+    LABELS "host;unit;integration;source"
+    TIMEOUT 60
+    ENVIRONMENT "WOS_HOST_TEST_DISABLE_LSAN=$<BOOL:${WOS_HOST_TEST_DISABLE_LSAN}>;TMPDIR=${CMAKE_CURRENT_BINARY_DIR}/secure-fixture-tmp"
+)
+add_test(
+    NAME wki_secure_vfs_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_secure_vfs_test.py
+)
+set_tests_properties(wki_secure_vfs_test PROPERTIES
+    LABELS "host;unit;integration;source"
+    TIMEOUT 60
+    ENVIRONMENT "WOS_HOST_TEST_DISABLE_LSAN=$<BOOL:${WOS_HOST_TEST_DISABLE_LSAN}>;TMPDIR=${CMAKE_CURRENT_BINARY_DIR}/secure-fixture-tmp"
+)
+foreach(secure_fixture wki_secure_ipc_test wki_ipc_shutdown_test wki_ivshmem_progress_test wki_init_group_origin_test wki_secure_block_test wki_secure_rdma_engine_test wki_secure_rdma_negotiation_test wki_secure_control_rx_test wki_secure_zone_workload_test)
+    add_test(NAME ${secure_fixture}
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/${secure_fixture}.py)
+    set_tests_properties(${secure_fixture} PROPERTIES
+        LABELS "host;unit;integration;source" TIMEOUT 60
+        ENVIRONMENT "WOS_HOST_TEST_DISABLE_LSAN=$<BOOL:${WOS_HOST_TEST_DISABLE_LSAN}>;TMPDIR=${CMAKE_CURRENT_BINARY_DIR}/secure-fixture-tmp")
+endforeach()
+set_tests_properties(wki_secure_rdma_negotiation_test PROPERTIES TIMEOUT 180)
+add_test(NAME wki_secure_rdma_startup_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_secure_rdma_startup_source_test.py)
+set_tests_properties(wki_secure_rdma_startup_source_test PROPERTIES LABELS "host;unit;source")
+add_test(
     NAME wki_wireshark_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_wireshark_source_test.py
 )
@@ -1356,6 +1412,44 @@ wos_add_unit_test(wki_auth_crypto_test
     KERN_SOURCES ${WOS_ROOT}/modules/kern/src/net/wki/auth_crypto.cpp
 )
 
+wos_add_unit_test(wki_rdma_crypto_test
+    SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_rdma_crypto_test.cpp
+    KERN_SOURCES ${WOS_ROOT}/modules/kern/src/net/wki/rdma_crypto.cpp
+                 ${WOS_ROOT}/modules/kern/src/net/wki/auth_crypto.cpp
+)
+
+wos_add_unit_test(wki_rdma_protocol_test
+    SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_rdma_protocol_test.cpp
+    KERN_SOURCES ${WOS_ROOT}/modules/kern/src/net/wki/rdma_protocol.cpp
+                 ${WOS_ROOT}/modules/kern/src/net/wki/rdma_crypto.cpp
+                 ${WOS_ROOT}/modules/kern/src/net/wki/auth_crypto.cpp
+)
+
+wos_add_unit_test(wki_rdma_registry_test
+    SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_rdma_registry_test.cpp
+    KERN_SOURCES ${WOS_ROOT}/modules/kern/src/net/wki/rdma_registry.cpp
+                 ${WOS_ROOT}/modules/kern/src/net/wki/rdma_protocol.cpp
+                 ${WOS_ROOT}/modules/kern/src/net/wki/rdma_crypto.cpp
+                 ${WOS_ROOT}/modules/kern/src/net/wki/auth_crypto.cpp
+)
+
+wos_add_unit_test(wki_rdma_session_test
+    SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_rdma_session_test.cpp
+    KERN_SOURCES ${WOS_ROOT}/modules/kern/src/net/wki/rdma_session.cpp
+                 ${WOS_ROOT}/modules/kern/src/net/wki/rdma_protocol.cpp
+                 ${WOS_ROOT}/modules/kern/src/net/wki/rdma_crypto.cpp
+                 ${WOS_ROOT}/modules/kern/src/net/wki/auth_crypto.cpp
+)
+
+wos_add_unit_test(wki_rdma_operations_test
+    SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_rdma_operations_test.cpp
+    KERN_SOURCES ${WOS_ROOT}/modules/kern/src/net/wki/rdma_operations.cpp
+                 ${WOS_ROOT}/modules/kern/src/net/wki/rdma_registry.cpp
+                 ${WOS_ROOT}/modules/kern/src/net/wki/rdma_protocol.cpp
+                 ${WOS_ROOT}/modules/kern/src/net/wki/rdma_crypto.cpp
+                 ${WOS_ROOT}/modules/kern/src/net/wki/auth_crypto.cpp
+)
+
 wos_add_unit_test(wki_auth_protocol_test
     SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_auth_protocol_test.cpp
     KERN_SOURCES ${WOS_ROOT}/modules/kern/src/net/wki/auth_crypto.cpp
@@ -1511,6 +1605,14 @@ wos_add_unit_test(wki_chaos_model_test
     KERN_SOURCES ${WOS_KERN_SRC}/net/wki/chaos_model.cpp
 )
 
+wos_add_unit_test(wki_secure_chaos_test
+    SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_secure_chaos_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/net/wki/chaos_model.cpp
+                 ${WOS_KERN_SRC}/net/wki/rdma_protocol.cpp
+                 ${WOS_KERN_SRC}/net/wki/rdma_crypto.cpp
+                 ${WOS_KERN_SRC}/net/wki/auth_crypto.cpp
+)
+
 # Manual, non-gating microbenchmark. It records the isolated cost of the exact
 # disabled-path shape (one relaxed atomic load, then the original callback)
 # without turning scheduler noise into a timing-dependent test assertion.
@@ -1635,6 +1737,14 @@ set_tests_properties(wki_submit_phase_test PROPERTIES LABELS "unit;host")
 wos_add_fuzz_target(wki_wire_fuzz
     SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/wki_wire_fuzz.cpp
 )
+
+wos_add_fuzz_target(wki_rdma_protocol_fuzz
+    SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/wki_rdma_protocol_fuzz.cpp
+    KERN_SOURCES ${WOS_ROOT}/modules/kern/src/net/wki/rdma_protocol.cpp
+                 ${WOS_ROOT}/modules/kern/src/net/wki/rdma_crypto.cpp
+                 ${WOS_ROOT}/modules/kern/src/net/wki/auth_crypto.cpp
+)
+target_compile_options(wki_rdma_protocol_fuzz PRIVATE -UNDEBUG)
 
 wos_add_fuzz_target(data_struct_fuzz
     SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/data_struct_fuzz.cpp

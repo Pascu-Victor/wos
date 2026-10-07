@@ -6,7 +6,7 @@
 namespace ker::net::wki {
 
 constexpr size_t WKI_CHAOS_WORKLOAD_COMMAND_MAX = 256;
-constexpr size_t WKI_CHAOS_WORKLOAD_RESULT_MAX = 2048;
+constexpr size_t WKI_CHAOS_WORKLOAD_RESULT_MAX = 4096;
 constexpr size_t WKI_CHAOS_WORKLOAD_SCRATCH_BYTES = size_t{1} * 1024 * 1024;
 
 // This live-scenario bridge is inert unless both `wki.chaos` and

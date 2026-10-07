@@ -11,29 +11,23 @@ namespace ker::net::wki {
 
 struct WkiTransport;
 
-// Initialize the RoCE RDMA transport (L2, MAC-based GIDs, EtherType 0x88B8).
-// Secure WKI deliberately does not call this until authenticated RDMA records
-// are implemented. The RoCE transport is an RDMA-only overlay - it does
-// not carry WKI control messages (those go over transport_eth or transport_ivshmem).
+// Legacy initialization is a permanent no-op. Secure ciphertext staging uses
+// the exact registered Ethernet transport; no RDMA overlay is created.
 void wki_roce_transport_init();
 
 // RX entry point - called from ethernet.cpp's eth_rx() for EtherType 0x88B8.
-// Consumes the packet without dispatch when the transport is uninitialized.
+// Lookup-only secure-record ingress. Copies into common admission before
+// consuming the packet once; all legacy raw records are rejected.
 void roce_rx(ker::net::NetDevice* dev, ker::net::PacketBuffer* pkt);
 
-// Get the singleton RoCE transport (nullptr if not initialized).
+// Legacy overlay lookup always returns nullptr.
 auto wki_roce_transport_get() -> WkiTransport*;
 
-// Reset/read the receive-progress counter for a registered RoCE region.
-// Used by control-first protocols where the receiver already knows the exact
-// byte count and does not need a separate doorbell to define completion.
+// Legacy raw progress/tagged-write APIs reject immediately without touching
+// memory, counters, callbacks or transport state, even for zero-length calls.
 auto wki_roce_region_reset_received(uint32_t rkey) -> bool;
 auto wki_roce_region_wait_received(uint32_t rkey, uint32_t len, uint64_t timeout_us) -> bool;
 
-// Cookie-tagged writes are used by protocols that reuse one receive rkey at
-// offset 0. Tagged accounting lets data that overtakes the control message
-// remain associated with the eventual request instead of being cleared by the
-// receiver's prepare step.
 auto wki_roce_region_prepare_tagged_write(uint32_t rkey, uint16_t cookie) -> bool;
 auto wki_roce_region_tagged_write_complete(uint32_t rkey, uint16_t cookie, uint32_t len) -> bool;
 auto wki_roce_region_wait_tagged_write(uint32_t rkey, uint16_t cookie, uint32_t len, uint64_t timeout_us) -> bool;

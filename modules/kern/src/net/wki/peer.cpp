@@ -25,6 +25,7 @@
 #include <net/wki/remote_net.hpp>
 #include <net/wki/remote_vfs.hpp>
 #include <net/wki/routing.hpp>
+#include <net/wki/secure_rdma.hpp>
 #include <net/wki/timer_math.hpp>
 #include <net/wki/transport_eth.hpp>
 #include <net/wki/transport_ivshmem.hpp>
@@ -2377,6 +2378,8 @@ void wki_peer_timer_tick(uint64_t now_us) {
         return;
     }
 
+    wki_secure_rdma_tick();
+
     drain_hello_retries(now_us);
     drain_pending_epoch_reset_cleanups();
     drain_pending_fence_notifies();
@@ -2589,6 +2592,7 @@ auto wki_peer_get_hostname(uint16_t node_id) -> const char* {
 // maintenance cadence for legacy deferred work and RDMA block-ring polling that
 // still piggyback here.
 constexpr uint64_t WKI_TIMER_CONNECTED_MAINTENANCE_US = 500000;
+constexpr uint64_t WKI_TIMER_IVSHMEM_POLL_US = 1000;
 constexpr uint64_t WKI_TIMER_IDLE_SLEEP_US = 1000000;
 constexpr uint64_t WKI_TIMER_OVERDUE_BACKOFF_US = 1000;
 
@@ -2692,6 +2696,9 @@ auto wki_next_periodic_deadline_us(uint64_t now_us) -> uint64_t {
 
         if (wki_has_connected_peers()) {
             sleep_us = std::min(sleep_us, WKI_TIMER_CONNECTED_MAINTENANCE_US);
+        }
+        if (wki_ivshmem_transport_poll_required()) {
+            sleep_us = std::min(sleep_us, WKI_TIMER_IVSHMEM_POLL_US);
         }
 
         s_wki_timer_sleep_armed.store(true, std::memory_order_release);

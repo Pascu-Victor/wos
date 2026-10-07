@@ -30,6 +30,7 @@ struct Options {
     size_t operations{100};
     unsigned pattern{0x5a};
     bool prefix{};
+    bool verify_same_fd{};
 };
 
 auto number(const char* text, uint64_t& value) -> bool {
@@ -50,6 +51,8 @@ auto parse(int argc, char** argv, Options& options) -> bool {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--path-prefix") == 0) {
             options.prefix = true;
+        } else if (std::strcmp(argv[i], "--verify-same-fd") == 0) {
+            options.verify_same_fd = true;
         } else if (std::strcmp(argv[i], "--path") == 0 && i + 1 < argc) {
             options.path = argv[++i];
         } else {
@@ -216,21 +219,25 @@ auto run_fsync(const Options& options) -> int {
         latencies[completed] = now_ns() - START;
         if (error != 0) break;
     }
-    if (close(FD) != 0 && error == 0) error = errno;
+    // Transport qualification can retain one native binding for both
+    // directions. Default durability verification still reopens the file.
+    if (!options.verify_same_fd && close(FD) != 0 && error == 0) error = errno;
     if (error == 0) {
-        int const VERIFY = open(options.path, O_RDONLY | O_NO_CACHE);
+        int const VERIFY = options.verify_same_fd ? FD : open(options.path, O_RDONLY | O_NO_CACHE);
         if (VERIFY < 0) {
             error = errno;
         } else {
+            if (options.verify_same_fd && lseek(VERIFY, 0, SEEK_SET) != 0) error = errno == 0 ? EIO : errno;
             std::array<uint8_t, FSYNC_BYTES> expected{};
             for (size_t i = 0; i < completed && error == 0; ++i) {
                 expected.fill(static_cast<uint8_t>((options.pattern + i) & 0xffU));
                 error = transfer(VERIFY, data.data(), data.size(), false);
                 if (error == 0 && data != expected) error = EILSEQ;
             }
-            if (close(VERIFY) != 0 && error == 0) error = errno;
+            if (!options.verify_same_fd && close(VERIFY) != 0 && error == 0) error = errno;
         }
     }
+    if (options.verify_same_fd && close(FD) != 0 && error == 0) error = errno;
     auto sorted = latencies;
     std::sort(sorted.begin(), sorted.begin() + static_cast<ptrdiff_t>(completed));
     size_t const P95_INDEX = completed == 0 ? 0 : (completed * 95 + 99) / 100 - 1;
@@ -242,7 +249,7 @@ auto run_fsync(const Options& options) -> int {
     for (size_t i = 0; i < completed; ++i) {
         std::printf("%s%llu", i == 0 ? "" : ",", static_cast<unsigned long long>(latencies[i]));
     }
-    std::printf("]}\n");
+    std::printf("]%s}\n", options.verify_same_fd ? ",\"verify_same_fd\":true" : "");
     return error == 0 && completed == options.operations ? 0 : 1;
 }
 }  // namespace
@@ -252,10 +259,10 @@ auto run_blockbench(int argc, char** argv) -> int {
     if (argc == 0 || !parse(argc, argv, options)) {
         std::fprintf(stderr,
                      "blockbench-read|blockbench-fsync --path PATH [--path-prefix] [--workers 1..8] "
-                     "[--bytes N] [--block-bytes N] [--pattern 0..255] [--operations 1..1000]\n");
+                     "[--bytes N] [--block-bytes N] [--pattern 0..255] [--operations 1..1000] [--verify-same-fd (fsync only)]\n");
         return 2;
     }
-    if (std::strcmp(argv[0], "blockbench-read") == 0) return run_read(options);
+    if (std::strcmp(argv[0], "blockbench-read") == 0 && !options.verify_same_fd) return run_read(options);
     if (std::strcmp(argv[0], "blockbench-fsync") == 0 && options.workers == 1 && !options.prefix) return run_fsync(options);
     return 2;
 }

@@ -87,7 +87,7 @@ Local values reviewed on 2026-06-01 include:
   rechecked against local `wire.hpp` on 2026-10-02)
 - `WKI_NODE_INVALID = 0x0000`
 - `WKI_NODE_BROADCAST = 0xFFFF`
-- well-known channels `0..3`, dynamic channels starting at `16`, reserved dynamic channels starting at `240`, and `WKI_CHAN_IPC_DATA = 240`
+- well-known channels `0..4` (secure RDMA negotiation/control uses `4`), dynamic channels starting at `16`, reserved dynamic channels starting at `240`, and `WKI_CHAN_IPC_DATA = 240`
 
 ## Wire protocol rules
 
@@ -121,7 +121,7 @@ C-style arrays may remain where required by ABI, packed wire overlays, compiler 
 
 ## WKI initialization
 
-Local `wki_init()` initializes the global node state and then initializes WKI subsystems. Observed order includes routing, zone, RoCE transport, remotable devices, device server, device proxy, event bus, IRQ forwarding, remote VFS, remote NIC, remote compute, and the IPC proxy subsystem.
+Local `wki_init()` initializes the global node state and the private secure-RDMA engine, then routing, zone, remotable devices, device server, device proxy, event bus, IRQ forwarding, remote VFS, remote NIC, remote compute, and the IPC proxy subsystem. It does not call the legacy `wki_roce_init()`. Current Ethernet and ivshmem providers expose a separate typed ciphertext facet; independent secure-service negotiation must not enable legacy raw memory callbacks. Read `secure_rdma.*` and `docs/wki_secure_rdma.md` for the current rollout/qualification state.
 
 If adding a subsystem, check dependency order. Do not assume a later subsystem is available during earlier initialization.
 

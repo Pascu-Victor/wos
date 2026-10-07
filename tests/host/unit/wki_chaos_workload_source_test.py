@@ -60,6 +60,10 @@ def main() -> None:
             'VFS_ADVERTISED_NAME[] = "/tmp"',
             "std::array<uint8_t, WKI_CHAOS_WORKLOAD_SCRATCH_BYTES>",
             'std::strcmp(verb, "block-rdma-discovered")',
+            'std::strcmp(verb, "zone-rdma")',
+            "wki_secure_zone_workload_run",
+            "s_result.secure_completions != 2",
+            "s_result.secure_measurement_complete",
             'std::strcmp(verb, "net-attach-discovered")',
             'std::strcmp(verb, "net-query-discovered")',
             'std::strcmp(verb, "net-detach-discovered")',
@@ -81,7 +85,11 @@ def main() -> None:
             "wki_remote_vfs_unmount_resource_generation",
             "auto run_vfs_query",
             "return capture_vfs_binding(command)",
-            "proxy.rdma_attached != REQUIRE_RDMA",
+            "proxy.rdma_attached || proxy.rdma_zone_id != 0",
+            "s_result.secure_completions != 4",
+            "s_result.secure_bytes != BYTES * 4",
+            "s_result.secure_fallbacks != 0",
+            "before_restore.secure_block_write_uncertain",
             "data_slot_bitmap == 0",
             "tag_bitmap == 0",
             "channel_tx_seq_before",
@@ -98,6 +106,10 @@ def main() -> None:
     )
     if "block_device_find_by_name" in workload or "wki_remote_vfs_unmount(" in workload:
         raise AssertionError("workload bridge must not select an arbitrary device or VFS path")
+    restore = workload[workload.index("WkiDevProxyDiagRow before_restore") : workload.index("WkiChannelDiag channel_after")]
+    uncertain = restore[restore.index("if (UNCERTAIN)") : restore.index("} else {")]
+    if "dev::block_write" in uncertain or "dev::block_flush" in uncertain:
+        raise AssertionError("uncertain secure WRITE must never replay a restoration on the same binding")
     if "first_tag" in workload or "last_tag" in workload:
         raise AssertionError("channel sequence counters must not be reported as block-ring tags")
     if "NET_EVIDENCE_IDENTITY.resource_incarnation == 0" not in workload:
@@ -176,6 +188,8 @@ def main() -> None:
         [
             'WKI_CHAOS_WORKLOAD_PATH = "/proc/wki/chaos_workload"',
             "WKI_CHAOS_WORKLOAD_COMMAND_MAX = 256",
+            '"zone-rdma"',
+            "WKI_CHAOS_WORKLOAD_RESULT_MAX = 4096",
             'std::strcmp(argv[2], "compute-publish-wait") == 0',
             "parse_workload_wait_request",
             "wait_for_compute_publish",

@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <net/wki/secure_rdma.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/sys/spinlock.hpp>
@@ -29,7 +30,7 @@ constexpr size_t WKI_IPC_MAX_EXPORTS = 64;
 constexpr size_t WKI_IPC_MAX_PROXIES = 64;
 constexpr uint32_t WKI_IPC_MESSAGE_PIPE_WINDOW = 1024 * 1024;
 
-// RDMA shared region sizes
+// Legacy region size constants; secure IPC registers private data-only storage.
 constexpr uint32_t WKI_IPC_PIPE_REGION_SIZE = 65536;  // 64 KB pipe ring buffer
 constexpr size_t WKI_IPC_DIAG_MAX = 128;
 constexpr uint32_t WKI_IPC_EVENTFD_REGION_SIZE = 64;  // one cache line
@@ -40,7 +41,7 @@ constexpr uint32_t WKI_IPC_EPOLL_REGION_SIZE = 512;   // readiness bitmap
 constexpr uint32_t WKI_PIPE_SPIN_CYCLES = 1000;
 
 // -----------------------------------------------------------------------------
-// RDMA Shared Region Layouts
+// Legacy layout declarations, never enrolled as secure IPC memory authority.
 // -----------------------------------------------------------------------------
 
 struct WkiPipeSharedRegion {
@@ -164,15 +165,14 @@ struct ProxyIpcState {
 
     ker::mod::sys::Spinlock lock;
 
-    // Optional proxy-write RDMA pipe fast path.  The home/export side owns the
-    // receive ring; proxy writers serialize reservations with writer_active so
-    // byte order remains identical to the message path.
+    // Secure IPC candidate: rkey is a current full-grant lookup hint only.
+    // Whole-call writer loans serialize QUERY/APPEND and zero-effect fallback.
     bool pipe_rdma_enabled = false;
     uint32_t pipe_rdma_rkey = 0;
     uint32_t pipe_rdma_capacity = 0;
-    uint32_t pipe_rdma_head = 0;
-    uint32_t pipe_rdma_tail_cache = 0;
-    WkiTransport* pipe_rdma_transport = nullptr;
+    uint64_t pipe_rdma_head = 0;
+    uint64_t pipe_rdma_tail_cache = 0;
+    std::atomic<bool> pipe_secure_uncertain{false};
     std::atomic<bool> pipe_rdma_writer_active{false};
 
     // Synchronous control-op wait state (socket control ops: SHUTDOWN, GETPEERNAME, etc.)
@@ -296,20 +296,27 @@ struct WkiIpcExport {
     uint16_t assigned_channel = 0;
     uint16_t consumer_node = WKI_NODE_INVALID;
     uint64_t pipe_bytes_received = 0;
+    uint64_t pipe_bytes_delivered = 0;
     bool message_write_flow_control = false;
-    // The sole backlog shard worker pins exporter/ring storage during VFS
-    // writes and receipt sends outside s_ipc_lock. Guarded by that lock.
+    // The backlog worker or a secure native claim pins the exact exporter/File
+    // during VFS writes outside s_ipc_lock. Guarded by that lock.
     bool pipe_write_in_flight = false;
 
-    // Optional proxy-write RDMA receive ring.  This is intentionally separate
-    // from the local pipe backlog so bulk bytes can arrive without consuming
-    // WKI_CHAN_IPC_DATA payload credits.
+    // Private secure IPC data backing. Head/tail/credit stay owner-local;
+    // authenticated complete APPEND consumes bytes through native VFS only.
     bool pipe_rdma_enabled = false;
     uint8_t* pipe_rdma_region = nullptr;
     uint32_t pipe_rdma_region_size = 0;
     uint32_t pipe_rdma_capacity = 0;
     uint32_t pipe_rdma_rkey = 0;
-    WkiTransport* pipe_rdma_transport = nullptr;
+    rdma_protocol::RegionDescriptor pipe_secure_descriptor{};
+    uint64_t pipe_secure_lifetime = 0;
+    uint64_t pipe_secure_epoch = 0;
+    bool pipe_secure_activated = false;
+    bool pipe_secure_reserved = false;
+    bool pipe_secure_effect_claimed = false;
+    WkiSecureRdmaRequest pipe_secure_request{};
+    ker::vfs::File* pipe_secure_file = nullptr;
 
     // Server-side pump state; pending acceptance is protected by s_ipc_lock.
     bool pump_pending_accept = false;
@@ -462,6 +469,9 @@ struct WkiIpcDiagRow {
 
 // Initialize the IPC proxy subsystem. Called from wki_init().
 void wki_ipc_subsystem_init();
+// Task-only, outside peer/channel/IPC gates. False retains native owners until
+// flush/pump workers and exact unregister/claim pins have fully retired.
+auto wki_ipc_secure_shutdown_drain() -> bool;
 
 enum class WkiIpcDevOpRxAdmission : uint8_t {
     NOT_APPLICABLE,

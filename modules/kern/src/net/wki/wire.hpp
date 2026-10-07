@@ -132,6 +132,16 @@ enum class MsgType : uint8_t {
     TASK_CHILD_QUERY_RESP = 0x66,
     TASK_CHILD_CLAIM_REQ = 0x67,
     TASK_CHILD_CLAIM_RESP = 0x68,
+
+    // Secure direct data plane: authenticated extension on channel4.
+    SECURE_RDMA_OFFER = 0x70,
+    SECURE_RDMA_CONFIRM = 0x71,
+    SECURE_RDMA_GRANT = 0x72,
+    SECURE_RDMA_REVOKE = 0x73,
+    SECURE_RDMA_ARM = 0x74,
+    SECURE_RDMA_ARM_ACK = 0x75,
+    SECURE_RDMA_CANCEL = 0x76,
+    SECURE_RDMA_RESULT = 0x77,
 };
 
 // -----------------------------------------------------------------------------
@@ -142,6 +152,7 @@ constexpr uint16_t WKI_CHAN_CONTROL = 0;
 constexpr uint16_t WKI_CHAN_ZONE_MGMT = 1;
 constexpr uint16_t WKI_CHAN_EVENT_BUS = 2;
 constexpr uint16_t WKI_CHAN_RESOURCE = 3;
+constexpr uint16_t WKI_CHAN_SECURE_RDMA = 4;
 constexpr uint16_t WKI_CHAN_DYNAMIC_BASE = 16;
 constexpr uint16_t WKI_CHAN_DYNAMIC_RESERVED_BASE = 240;
 constexpr uint16_t WKI_CHAN_IPC_DATA = WKI_CHAN_DYNAMIC_RESERVED_BASE;
@@ -1012,8 +1023,9 @@ constexpr auto wki_dev_op_response_matches_expected(uint16_t expected_op_id, uin
 constexpr uint16_t OP_BLOCK_READ = 0x0100;
 constexpr uint16_t OP_BLOCK_WRITE = 0x0101;
 constexpr uint16_t OP_BLOCK_FLUSH = 0x0102;
-constexpr uint16_t OP_BLOCK_BULK_READ = 0x0104;   // Streaming bulk transfer: server RDMA-writes entire range to consumer buffer
-constexpr uint16_t OP_BLOCK_BULK_WRITE = 0x0105;  // Streaming bulk transfer: server RDMA-reads entire range from consumer buffer
+constexpr uint16_t OP_BLOCK_SECURE_PREPARE = 0x0106;  // Independent secure BLOCK private-region preparation.
+constexpr uint16_t OP_BLOCK_BULK_READ = 0x0104;       // Streaming bulk transfer: server RDMA-writes entire range to consumer buffer
+constexpr uint16_t OP_BLOCK_BULK_WRITE = 0x0105;      // Streaming bulk transfer: server RDMA-reads entire range from consumer buffer
 
 constexpr uint16_t OP_CHAR_OPEN = 0x0200;
 constexpr uint16_t OP_CHAR_CLOSE = 0x0201;
@@ -1462,6 +1474,9 @@ constexpr auto wki_vfs_directory_reply_size_valid(int status, size_t length, siz
 // Tokens increase in send order on one exact binding. CANCEL is idempotent;
 // consuming its token also prevents a later OPEN from resurrecting that owner.
 constexpr uint16_t OP_VFS_OPEN_LIFETIME = 0x0421;
+// Independently negotiated secure VFS fallback: canonical native intent and
+// ordinary authenticated bytes preserve the exact tokenized open authority.
+constexpr uint16_t OP_VFS_SECURE_IO = 0x0422;
 constexpr uint16_t WKI_VFS_OPEN_LIFETIME_VERSION = 1;
 struct VfsOpenLifetimeRequest {
     uint16_t version = WKI_VFS_OPEN_LIFETIME_VERSION;

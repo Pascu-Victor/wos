@@ -23,6 +23,7 @@
 #include <net/wki/remote_net.hpp>
 #include <net/wki/remote_vfs.hpp>
 #include <net/wki/routing.hpp>
+#include <net/wki/secure_rdma.hpp>
 #include <net/wki/timer_math.hpp>
 #include <net/wki/transport_eth.hpp>
 #include <net/wki/transport_ivshmem.hpp>
@@ -545,7 +546,8 @@ auto message_uses_device_session_lifecycle(MsgType type, const uint8_t* payload,
 }
 
 auto message_uses_rx_peer_lifecycle(MsgType type, const uint8_t* payload, uint16_t payload_len) -> bool {
-    return message_uses_compute_lifecycle(type) || message_uses_deferred_remotable_rx(type) ||
+    bool const SECURE_CONTROL = type >= MsgType::SECURE_RDMA_OFFER && type <= MsgType::SECURE_RDMA_RESULT;
+    return SECURE_CONTROL || message_uses_compute_lifecycle(type) || message_uses_deferred_remotable_rx(type) ||
            message_uses_device_session_lifecycle(type, payload, payload_len);
 }
 
@@ -554,7 +556,8 @@ auto message_allows_shared_rx_peer_lifecycle(uint16_t channel_id, MsgType type, 
     // handlers may therefore share the teardown admission lease without
     // weakening per-stream order. Other lifecycle-sensitive channels retain
     // their existing exclusive handler serialization.
-    return channel_id == WKI_CHAN_IPC_DATA && dev_op_uses_ipc_lifecycle(type, payload, payload_len);
+    return (channel_id == WKI_CHAN_IPC_DATA && dev_op_uses_ipc_lifecycle(type, payload, payload_len)) ||
+           (channel_id == WKI_CHAN_SECURE_RDMA && type >= MsgType::SECURE_RDMA_OFFER && type <= MsgType::SECURE_RDMA_RESULT);
 }
 
 auto message_is_epoch_reset_sensitive(MsgType type) -> bool {
@@ -616,7 +619,7 @@ auto message_uses_vfs_export_admission(MsgType type, const uint8_t* payload, uin
             auto const* req = reinterpret_cast<const DevOpReqPayload*>(payload);
             return (req->op_id == OP_NET_OPEN_AS || req->op_id == OP_NET_CLOSE_AS || req->op_id == OP_NET_LINK_AS) ||
                    (req->op_id >= OP_VFS_OPEN && req->op_id <= OP_VFS_DIRECTORY_REFERENCE) ||
-                   (req->op_id == OP_VFS_DIRECTORY_GRANT || req->op_id == OP_VFS_OPEN_LIFETIME);
+                   (req->op_id == OP_VFS_DIRECTORY_GRANT || req->op_id == OP_VFS_OPEN_LIFETIME || req->op_id == OP_VFS_SECURE_IO);
         }
         case MsgType::DEV_OP_RESP: {
             if (payload_len < sizeof(DevOpRespPayload)) {
@@ -624,7 +627,7 @@ auto message_uses_vfs_export_admission(MsgType type, const uint8_t* payload, uin
             }
             auto const* resp = reinterpret_cast<const DevOpRespPayload*>(payload);
             return (resp->op_id >= OP_VFS_OPEN && resp->op_id <= OP_VFS_DIRECTORY_REFERENCE) ||
-                   (resp->op_id == OP_VFS_DIRECTORY_GRANT || resp->op_id == OP_VFS_OPEN_LIFETIME);
+                   (resp->op_id == OP_VFS_DIRECTORY_GRANT || resp->op_id == OP_VFS_OPEN_LIFETIME || resp->op_id == OP_VFS_SECURE_IO);
         }
         default:
             return false;
@@ -644,15 +647,16 @@ auto admit_vfs_op(MsgType type, const WkiHeader* hdr, const uint8_t* payload, ui
                            req->op_id == OP_VFS_METADATA_BATCH || req->op_id == OP_VFS_XATTR || req->op_id == OP_VFS_OPEN_READ_AS ||
                            req->op_id == OP_VFS_OPEN_AS || req->op_id == OP_VFS_FSTAT || req->op_id == OP_VFS_STAT_AS ||
                            req->op_id == OP_VFS_PATH_AS || req->op_id == OP_VFS_EXEC_VIEW || req->op_id == OP_VFS_DIRECTORY_REFERENCE ||
-                           (req->op_id == OP_VFS_DIRECTORY_GRANT || req->op_id == OP_VFS_OPEN_LIFETIME) || req->op_id == OP_VFS_FEATURES;
+                           (req->op_id == OP_VFS_DIRECTORY_GRANT || req->op_id == OP_VFS_OPEN_LIFETIME || req->op_id == OP_VFS_SECURE_IO) ||
+                           req->op_id == OP_VFS_FEATURES;
     size_t const EXPECTED_LEN = sizeof(DevOpReqPayload) + req->data_len;
-    if (!IS_VFS_OP ||
-        (((req->op_id == OP_NET_OPEN_AS || req->op_id == OP_NET_CLOSE_AS || req->op_id == OP_NET_LINK_AS) || req->op_id == OP_VFS_XATTR ||
-          req->op_id == OP_VFS_FSTAT || req->op_id == OP_VFS_STAT_AS || req->op_id == OP_VFS_PATH_AS || req->op_id == OP_VFS_EXEC_VIEW ||
-          req->op_id == OP_VFS_DIRECTORY_REFERENCE || (req->op_id == OP_VFS_DIRECTORY_GRANT || req->op_id == OP_VFS_OPEN_LIFETIME) ||
-          req->op_id == OP_VFS_FEATURES || req->op_id == OP_VFS_METADATA_BATCH)
-             ? EXPECTED_LEN != payload_len
-             : EXPECTED_LEN > payload_len)) {
+    if (!IS_VFS_OP || (((req->op_id == OP_NET_OPEN_AS || req->op_id == OP_NET_CLOSE_AS || req->op_id == OP_NET_LINK_AS) ||
+                        req->op_id == OP_VFS_XATTR || req->op_id == OP_VFS_FSTAT || req->op_id == OP_VFS_STAT_AS ||
+                        req->op_id == OP_VFS_PATH_AS || req->op_id == OP_VFS_EXEC_VIEW || req->op_id == OP_VFS_DIRECTORY_REFERENCE ||
+                        (req->op_id == OP_VFS_DIRECTORY_GRANT || req->op_id == OP_VFS_OPEN_LIFETIME || req->op_id == OP_VFS_SECURE_IO) ||
+                        req->op_id == OP_VFS_FEATURES || req->op_id == OP_VFS_METADATA_BATCH)
+                           ? EXPECTED_LEN != payload_len
+                           : EXPECTED_LEN > payload_len)) {
         return WkiVfsOpRxAdmission::NOT_APPLICABLE;
     }
     if (channel->rx_dispatch_seq != hdr->seq_num) {
@@ -684,6 +688,16 @@ auto admit_ipc_dev_op(MsgType type, const WkiHeader* hdr, const uint8_t* payload
         return WkiIpcDevOpRxAdmission::RETRY;
     }
     return wki_ipc_admit_dev_op_rx(hdr, payload, payload_len, channel, channel_generation);
+}
+
+auto admit_secure_control(MsgType type, const WkiHeader* header, const uint8_t* payload, uint16_t size, WkiChannel* channel,
+                          uint32_t generation) -> WkiSecureRdmaControlRxAdmission {
+    if (type < MsgType::SECURE_RDMA_OFFER || type > MsgType::SECURE_RDMA_RESULT) return WkiSecureRdmaControlRxAdmission::NOT_APPLICABLE;
+    if (header == nullptr || channel == nullptr || generation == 0) return WkiSecureRdmaControlRxAdmission::DISCARDED;
+    WkiChannelIdentity const IDENTITY{channel, header->src_node, header->channel_id, generation};
+    // Reliable RX owns this authenticated peer's shared lifecycle lease and
+    // the exact channel guard. Engine capture must not re-lock that channel.
+    return wki_secure_rdma_admit_control_rx(header, payload, size, IDENTITY, wki_peer_find(header->src_node));
 }
 
 class VfsExportRxAdmissionLease {
@@ -1510,15 +1524,18 @@ void wki_init() {
     }
     g_wki.initialized = true;
 
+    if (!wki_secure_rdma_init()) {
+        log::warn("Secure RDMA initialization unavailable; retaining authenticated message fallback");
+    }
+
     // Init routing subsystem (LSDB, routing table)
     wki_routing_init(cmdline_has_token(ker::init::get_kernel_cmdline(), "wki.routing_rx_timing"));
 
     // Init zone subsystem (shared memory zones)
     wki_zone_init();
 
-    // Direct RoCE and ivshmem RDMA bypass the authenticated WKI record path.
-    // Secure v3 therefore leaves the raw RoCE transport disabled until its own
-    // session-bound record MAC is implemented.
+    // Legacy raw transports stay disabled. Typed provider facets feed the
+    // independently negotiated private secure engine initialized above.
 
     // Init remotable subsystem (device remoting)
     wki_remotable_init();
@@ -1571,6 +1588,10 @@ void wki_init() {
     // V2: Create /dev/nodes/ hierarchy and register self
     ker::vfs::devfs::devfs_nodes_init();
     ker::vfs::devfs::devfs_nodes_add_peer(local_hostname_data(), g_wki.my_node_id);
+
+    // Scheduler startup precedes this phase. Start secure progress only after
+    // the engine and every consumer table have completed initialization.
+    wki_secure_rdma_worker_start();
 
     ker::mod::dbg::log("[WKI] Initialized, node_id=0x%04x hostname='%s'", g_wki.my_node_id, local_hostname_data());
 }
@@ -1627,6 +1648,34 @@ void wki_shutdown() {
     }
 
     wki_chaos_workload_shutdown();
+
+    // Power finalization already joined kernel workers. Reclaim late native
+    // owners in task context before the secure registry's final zero join.
+    bool const ZONE_DRAINED = wki_zone_shutdown_drain();
+    bool const IPC_DRAINED = wki_ipc_secure_shutdown_drain();
+    if (!ZONE_DRAINED || !IPC_DRAINED) {
+        log::warn("Secure RDMA consumer owner drain unproven (zone=%u ipc=%u); retaining WKI shutdown state", ZONE_DRAINED ? 1U : 0U,
+                  IPC_DRAINED ? 1U : 0U);
+        return;
+    }
+
+    if (!wki_secure_rdma_shutdown()) {
+        log::warn("Secure RDMA operation/region drain unproven; retaining WKI shutdown state");
+        return;
+    }
+
+    if (cmdline_has_token(ker::init::get_kernel_cmdline(), "wki.chaos")) {
+        WkiSecureRdmaDiagnostics retired{};
+        if (wki_secure_rdma_diagnostics(retired)) {
+            log::info(
+                "Secure RDMA retirement complete=1 queued_records=%u live_regions=%u region_references=%u region_claims=%u "
+                "live_operations=%u live_keys=%u replay_windows=%u consumer_pins=%u pending_revocations=%u",
+                retired.queued_records, retired.live_regions, retired.region_references, retired.region_claims, retired.live_operations,
+                retired.live_keys, retired.replay_windows, retired.consumer_pins, retired.pending_revocations);
+        } else {
+            log::info("Secure RDMA retirement complete=0");
+        }
+    }
 
     // Stop receiving and detach the registry under its lock. Chaos teardown
     // waits for any bounded deferred callback only after transport_lock is
@@ -1692,6 +1741,14 @@ void wki_transport_register(WkiTransport* transport) {
 }
 
 void wki_transport_unregister(WkiTransport* transport) {
+    // Close provider admission before removing its exact registry incarnation.
+    // Deferred record references release without acquiring this registry lock.
+    g_wki.transport_lock.lock();
+    uint64_t const SECURE_GENERATION = transport->registration_generation;
+    transport->chaos_unregistering.store(true, std::memory_order_release);
+    g_wki.transport_lock.unlock();
+    wki_secure_rdma_retire_transport(transport, SECURE_GENERATION);
+
     g_wki.transport_lock.lock();
 
     WkiTransport** pp = &g_wki.transports;
@@ -1991,7 +2048,7 @@ auto default_priority_for_channel(uint16_t channel_id) -> PriorityClass {
     // IPC_DATA carries jumbo pipe/socket payloads. Keep it on the throughput
     // ACK policy so bulk receive streams coalesce ACKs instead of emitting an
     // immediate pure ACK for every data frame.
-    return (channel_id <= WKI_CHAN_RESOURCE) ? PriorityClass::LATENCY : PriorityClass::THROUGHPUT;
+    return (channel_id <= WKI_CHAN_SECURE_RDMA) ? PriorityClass::LATENCY : PriorityClass::THROUGHPUT;
 }
 
 auto channel_requires_existing_rx_reservation(uint16_t channel_id) -> bool {
@@ -3359,6 +3416,17 @@ void wki_dispatch_reliable_msg(WkiChannel* rx_channel, uint32_t rx_channel_gener
         .generation = rx_channel_generation,
     };
     switch (type) {
+        case MsgType::SECURE_RDMA_OFFER:
+        case MsgType::SECURE_RDMA_CONFIRM:
+        case MsgType::SECURE_RDMA_GRANT:
+        case MsgType::SECURE_RDMA_REVOKE:
+        case MsgType::SECURE_RDMA_ARM:
+        case MsgType::SECURE_RDMA_ARM_ACK:
+        case MsgType::SECURE_RDMA_CANCEL:
+        case MsgType::SECURE_RDMA_RESULT:
+            // Ownership was committed by pre-ACK admission in reliable RX.
+            // Queued/discarded secure controls never enter inline dispatch.
+            break;
         case MsgType::LSA:
             detail::handle_lsa(hdr, payload, payload_len);
             break;
@@ -4218,6 +4286,14 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
             return;
 
         // Reliable control messages - check seq ordering
+        case MsgType::SECURE_RDMA_OFFER:
+        case MsgType::SECURE_RDMA_CONFIRM:
+        case MsgType::SECURE_RDMA_GRANT:
+        case MsgType::SECURE_RDMA_REVOKE:
+        case MsgType::SECURE_RDMA_ARM:
+        case MsgType::SECURE_RDMA_ARM_ACK:
+        case MsgType::SECURE_RDMA_CANCEL:
+        case MsgType::SECURE_RDMA_RESULT:
         case MsgType::LSA:
         case MsgType::LSA_ACK:
         case MsgType::FENCE_NOTIFY:
@@ -4373,6 +4449,12 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
                     ch->lock.unlock();
                     return;
                 }
+                WkiSecureRdmaControlRxAdmission const SECURE_ADMISSION =
+                    admit_secure_control(msg, hdr, payload, PAYLOAD_LEN, ch, ch->generation);
+                if (SECURE_ADMISSION == WkiSecureRdmaControlRxAdmission::RETRY) {
+                    ch->lock.unlock();
+                    return;
+                }
                 // In-order: advance rx_seq, mark ACK pending
                 ch->rx_seq++;
                 ch->rx_ack_pending = hdr->seq_num;
@@ -4388,7 +4470,10 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
 
                 mark_peer_rx_progress(hdr->src_node);
 
-                if (VFS_OP_ADMISSION == WkiVfsOpRxAdmission::DEFERRED) {
+                if (SECURE_ADMISSION != WkiSecureRdmaControlRxAdmission::NOT_APPLICABLE) {
+                    if (SECURE_ADMISSION == WkiSecureRdmaControlRxAdmission::QUEUED) wki_secure_rdma_tick();
+                    finish_pre_admitted_reliable_msg_ordered(ch, RX_CHANNEL_GENERATION, hdr);
+                } else if (VFS_OP_ADMISSION == WkiVfsOpRxAdmission::DEFERRED) {
                     wki_dev_server_notify_deferred_vfs_op(hdr);
                     finish_pre_admitted_reliable_msg_ordered(ch, RX_CHANNEL_GENERATION, hdr);
                 } else if (IPC_DEV_OP_ADMISSION == WkiIpcDevOpRxAdmission::DEFERRED) {
@@ -4490,6 +4575,11 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
                         break;
                     }
 
+                    WkiSecureRdmaControlRxAdmission const RO_SECURE_ADMISSION =
+                        admit_secure_control(RO_MSG, &ch->reorder_head->hdr, ch->reorder_head->data, ch->reorder_head->len, ch,
+                                             ch->reorder_head->channel_generation);
+                    if (RO_SECURE_ADMISSION == WkiSecureRdmaControlRxAdmission::RETRY) break;
+
                     WkiReorderEntry* ro = ch->reorder_head;
                     ch->reorder_head = ro->next;
                     ch->reorder_count--;
@@ -4508,7 +4598,10 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
                     uint32_t const RO_CHANNEL_GENERATION = ro->channel_generation;
                     ch->lock.unlock();
 
-                    if (RO_VFS_OP_ADMISSION == WkiVfsOpRxAdmission::DEFERRED) {
+                    if (RO_SECURE_ADMISSION != WkiSecureRdmaControlRxAdmission::NOT_APPLICABLE) {
+                        if (RO_SECURE_ADMISSION == WkiSecureRdmaControlRxAdmission::QUEUED) wki_secure_rdma_tick();
+                        finish_pre_admitted_reliable_msg_ordered(ch, RO_CHANNEL_GENERATION, &RO_HDR);
+                    } else if (RO_VFS_OP_ADMISSION == WkiVfsOpRxAdmission::DEFERRED) {
                         wki_dev_server_notify_deferred_vfs_op(&RO_HDR);
                         finish_pre_admitted_reliable_msg_ordered(ch, RO_CHANNEL_GENERATION, &RO_HDR);
                     } else if (RO_IPC_DEV_OP_ADMISSION == WkiIpcDevOpRxAdmission::DEFERRED) {

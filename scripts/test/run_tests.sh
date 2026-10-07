@@ -96,7 +96,7 @@ err()   { printf '\033[1;31m==>\033[0m %s\n' "$*" >&2; }
 
 timestamp() { date '+%Y-%m-%d_%H%M%S'; }
 
-FUZZ_TARGETS=(wki_wire_fuzz data_struct_fuzz tcp_fuzz tcp_sender_fuzz xfs_format_fuzz wki_routing_fuzz slab_fuzz telemetry_fuzz perf_data_fuzz block_request_model_fuzz dmar_fuzz pci_ecam_fuzz)
+FUZZ_TARGETS=(wki_wire_fuzz wki_rdma_protocol_fuzz data_struct_fuzz tcp_fuzz tcp_sender_fuzz xfs_format_fuzz wki_routing_fuzz slab_fuzz telemetry_fuzz perf_data_fuzz block_request_model_fuzz dmar_fuzz pci_ecam_fuzz)
 UNIT_TESTS=(
     credential_model_test
     credential_policy_audit_test
@@ -229,6 +229,21 @@ UNIT_TESTS=(
     wki_timer_source_test
     wki_wait_source_test
     wki_ivshmem_source_test
+    wki_ivshmem_closure_test
+    wki_secure_adapters_test
+    wki_secure_rdma_fixture_test
+    wki_secure_zone_test
+    wki_secure_vfs_test
+    wki_secure_ipc_test
+    wki_ipc_shutdown_test
+    wki_ivshmem_progress_test
+    wki_init_group_origin_test
+    wki_secure_block_test
+    wki_secure_rdma_engine_test
+    wki_secure_rdma_negotiation_test
+    wki_secure_control_rx_test
+    wki_secure_rdma_startup_source_test
+    wki_secure_zone_workload_test
     wki_wireshark_source_test
     wki_dev_server_source_test
     wki_dev_proxy_source_test
@@ -293,6 +308,12 @@ UNIT_TESTS=(
     xfs_transaction_rollback_source_test
     wki_wire_test
     wki_auth_crypto_test
+    wki_rdma_crypto_test
+    wki_rdma_protocol_test
+    wki_rdma_registry_test
+    wki_rdma_session_test
+    wki_rdma_operations_test
+    wki_secure_chaos_test
     wki_auth_protocol_test
     wki_auth_policy_test
     wki_block_validation_test

@@ -21,6 +21,7 @@
 #include <net/wki/auth_policy.hpp>
 #include <net/wki/dev_server.hpp>
 #include <net/wki/remotable.hpp>
+#include <net/wki/secure_vfs.hpp>
 #include <net/wki/timer_math.hpp>
 #include <net/wki/transport_roce.hpp>
 #include <net/wki/wire.hpp>
@@ -48,6 +49,26 @@
 #include "vfs/stat.hpp"
 
 namespace ker::net::wki {
+
+struct VfsSecureContext {
+    WkiChannelIdentity identity{};
+    uint64_t binding_id = 0;
+    uint32_t resource_id = 0;
+    ResourceIncarnationToken incarnation{};
+    uint64_t publication_revision = 0;
+    std::unique_ptr<uint8_t[]> write_backing{};
+    std::unique_ptr<uint8_t[]> read_backing{};
+    rdma_protocol::RegionDescriptor write_grant{};
+    rdma_protocol::RegionDescriptor read_grant{};
+    std::atomic<bool> closed{false};
+    ker::mod::sys::Spinlock loan_lock;
+    uint64_t generation = 0;
+    bool armed = false;
+    bool effect_started = false;
+    WkiSecureRdmaRequest request{};
+    DevServerBinding* binding = nullptr;
+    ker::vfs::File* file = nullptr;
+};
 
 // -------------------------------------------------------------------------------
 // Storage
@@ -1652,6 +1673,148 @@ auto retain_server_write_file(const WkiChannelIdentity& identity, int32_t fd, in
     }
     s_vfs_lock.unlock();
     return result;
+}
+
+// Hooks are invoked in core task context. Every loan separately pins the exact
+// binding and File; registration storage is never native FD authority.
+auto secure_vfs_request_matches(const WkiSecureRdmaRequest& lhs, const WkiSecureRdmaRequest& rhs) -> bool {
+    return lhs.operation_id == rhs.operation_id && lhs.receive_ticket == rhs.receive_ticket && lhs.offset == rhs.offset &&
+           lhs.length == rhs.length && lhs.peer_node == rhs.peer_node && lhs.flags == rhs.flags && lhs.opcode == rhs.opcode &&
+           lhs.intent_length == rhs.intent_length && lhs.native_intent == rhs.native_intent &&
+           std::memcmp(&lhs.grant, &rhs.grant, sizeof(lhs.grant)) == 0;
+}
+
+auto secure_vfs_intent_matches(const VfsSecureContext& context, const WkiSecureRdmaRequest& request, const VfsSecureIoIntent& intent)
+    -> bool {
+    auto const& grant = request.opcode == rdma_protocol::Opcode::WRITE ? context.write_grant : context.read_grant;
+    return request.flags == 0 && request.peer_node == context.identity.peer_node_id && intent.binding_id == context.binding_id &&
+           intent.owner_boot_epoch == context.incarnation.owner_boot_epoch &&
+           intent.resource_incarnation == context.incarnation.resource_incarnation && intent.resource_id == context.resource_id &&
+           request.grant.binding_generation == context.binding_id && std::memcmp(&request.grant, &grant, sizeof(grant)) == 0;
+}
+
+// s_vfs_lock held. Caller owns a retained binding, and retains File before unlock.
+auto secure_vfs_file_locked(const VfsSecureContext& context, const VfsSecureIoIntent& intent, bool write, ker::vfs::File*& output) -> int {
+    if (context.closed.load(std::memory_order_acquire) || context.binding == nullptr ||
+        !grant_binding_matches(*context.binding, context.identity) ||
+        context.binding->vfs_export_publication_revision != context.publication_revision)
+        return -ENOTCONN;
+    auto* row = find_remote_fd(context.identity, intent.fd);
+    if (row == nullptr || row->file == nullptr || row->ordinary_open_token != intent.open_token ||
+        row->ordinary_open_binding_id != intent.binding_id)
+        return -EBADF;
+    auto* file = row->file;
+    if (file->is_directory || file->exec_read_view != nullptr ||
+        (file->fs_type != ker::vfs::FSType::TMPFS && file->fs_type != ker::vfs::FSType::XFS))
+        return -ENOTSUP;
+    if (file->fops == nullptr || (write ? file->fops->vfs_write == nullptr : file->fops->vfs_read == nullptr)) return -ENOTSUP;
+    int const ACCESS = ker::mod::security::authorize_file_description_access(static_cast<unsigned>(file->open_flags) & 3U, write);
+    if (ACCESS != 0) return ACCESS;
+    if (write && ker::vfs::file_mount_read_only(*file)) return -EROFS;
+    output = file;
+    return 0;
+}
+
+auto secure_vfs_arm(void* opaque, const WkiSecureRdmaRequest& request, uint64_t& generation) -> int {
+    auto* context = static_cast<VfsSecureContext*>(opaque);
+    VfsSecureIoIntent intent{};
+    if (context == nullptr || !wki_vfs_secure_decode_intent(request, intent) || !secure_vfs_intent_matches(*context, request, intent))
+        return -EINVAL;
+    uint64_t const FLAGS = context->loan_lock.lock_irqsave();
+    if (context->closed.load(std::memory_order_acquire) || context->armed || context->generation == UINT64_MAX) {
+        context->loan_lock.unlock_irqrestore(FLAGS);
+        return -EBUSY;
+    }
+    context->armed = true;
+    context->effect_started = false;
+    context->request = request;
+    context->loan_lock.unlock_irqrestore(FLAGS);
+
+    DevServerBinding* binding = nullptr;
+    ker::vfs::File* file = nullptr;
+    int status = -ENOTCONN;
+    if (wki_dev_server_vfs_rx_admission_try_acquire()) {
+        binding = wki_dev_server_retain_vfs_secure_binding(context->identity, context);
+        if (binding != nullptr) {
+            // The reserved loan is the only writer of these pointers. Cleanup
+            // cannot destroy context while the core's arm reference is retained.
+            context->binding = binding;
+            s_vfs_lock.lock();
+            status = secure_vfs_file_locked(*context, intent, request.opcode == rdma_protocol::Opcode::WRITE, file);
+            if (status == 0) ker::vfs::vfs_retain_file(file);
+            s_vfs_lock.unlock();
+        }
+        wki_dev_server_vfs_rx_admission_release();
+    }
+    uint64_t const COMMIT_FLAGS = context->loan_lock.lock_irqsave();
+    if (status == 0 && context->closed.load(std::memory_order_acquire)) status = -ENOTCONN;
+    if (status == 0) {
+        context->file = file;
+        generation = ++context->generation;
+    } else {
+        context->binding = nullptr;
+        context->armed = false;
+        context->request = {};
+    }
+    context->loan_lock.unlock_irqrestore(COMMIT_FLAGS);
+    if (status != 0) {
+        if (file != nullptr) ker::vfs::vfs_put_file(file);
+        wki_dev_server_release_vfs_secure_binding(binding);
+    }
+    return status;
+}
+
+auto secure_vfs_effect(void* opaque, const WkiSecureRdmaRequest& request, std::span<uint8_t> backing, std::span<const uint8_t> input,
+                       std::span<uint8_t> output) -> WkiSecureRdmaResult {
+    auto* context = static_cast<VfsSecureContext*>(opaque);
+    VfsSecureIoIntent intent{};
+    if (context == nullptr || !wki_vfs_secure_decode_intent(request, intent)) return {-EINVAL};
+    bool const WRITE = request.opcode == rdma_protocol::Opcode::WRITE;
+    auto* expected_backing = WRITE ? context->write_backing.get() : context->read_backing.get();
+    if (backing.data() != expected_backing || backing.size() < request.length ||
+        (WRITE ? input.size() != request.length : output.size() < request.length))
+        return {-EINVAL};
+    uint64_t const FLAGS = context->loan_lock.lock_irqsave();
+    if (!context->armed || context->effect_started || !secure_vfs_request_matches(context->request, request)) {
+        context->loan_lock.unlock_irqrestore(FLAGS);
+        return {-EINVAL};
+    }
+    ker::vfs::File* file = nullptr;
+    s_vfs_lock.lock();
+    int const STATUS = secure_vfs_file_locked(*context, intent, WRITE, file);
+    if (STATUS == 0 && file == context->file) context->effect_started = true;
+    s_vfs_lock.unlock();
+    bool const ADMITTED = STATUS == 0 && file == context->file;
+    context->loan_lock.unlock_irqrestore(FLAGS);
+    if (!ADMITTED) return {STATUS != 0 ? STATUS : -EBADF};
+
+    // File and complete immutable input/output remain retained through release.
+    // CLOSE after this native admission cannot free the description mid-effect.
+    ssize_t const BYTES = WRITE ? ker::vfs::vfs_pwrite_file(file, input.data(), request.length, intent.file_offset)
+                                : ker::vfs::vfs_pread_file(file, output.data(), request.length, intent.file_offset);
+    if (BYTES < 0) return {static_cast<int32_t>(BYTES), 0, WRITE ? WkiSecureRdmaOutcome::UNCERTAIN : WkiSecureRdmaOutcome::NO_EFFECT};
+    if (static_cast<uint64_t>(BYTES) > request.length || (WRITE && BYTES == 0)) return {-EIO, 0, WkiSecureRdmaOutcome::UNCERTAIN};
+    // Authenticated native RESULT carries an exact short WRITE prefix even
+    // when record WRITE_END cannot represent that partial native completion.
+    return {0, static_cast<uint32_t>(BYTES), WkiSecureRdmaOutcome::EXACT};
+}
+
+void secure_vfs_release(void* opaque, const WkiSecureRdmaRequest& request, const WkiSecureRdmaResult&) {
+    auto* context = static_cast<VfsSecureContext*>(opaque);
+    if (context == nullptr) return;
+    uint64_t const FLAGS = context->loan_lock.lock_irqsave();
+    if (!context->armed || !secure_vfs_request_matches(context->request, request)) {
+        context->loan_lock.unlock_irqrestore(FLAGS);
+        return;
+    }
+    auto* file = std::exchange(context->file, nullptr);
+    auto* binding = std::exchange(context->binding, nullptr);
+    context->request = {};
+    context->effect_started = false;
+    context->armed = false;
+    context->loan_lock.unlock_irqrestore(FLAGS);
+    if (file != nullptr) ker::vfs::vfs_put_file(file);
+    wki_dev_server_release_vfs_secure_binding(binding);
 }
 
 auto pin_exec_view(const WkiChannelIdentity& identity, const VfsExecViewRequest& request, VfsExecViewResponse& response) -> int {
@@ -4311,6 +4474,14 @@ class PinPreparation {
         unlink_locked();
         auto* result = std::exchange(file_, nullptr);
         context_->ordinary_cancel_slot = ordinary_slot_;
+        if (ordinary_slot_ < g_open_cancellations.size()) {
+            auto const& record = g_open_cancellations.at(ordinary_slot_);
+            context_->ordinary_open_token = record.request.token;
+            context_->ordinary_open_binding_id = record.request.binding_id;
+            context_->ordinary_owner_boot_epoch = record.request.owner_boot_epoch;
+            context_->ordinary_resource_incarnation = proxy_->owner_incarnation.resource_incarnation;
+            context_->ordinary_resource_id = proxy_->resource_id;
+        }
         ordinary_slot_ = VFS_EXEC_CANCEL_SLOT_NONE;
         result->private_data = std::exchange(context_, nullptr);
         proxy_ = nullptr;
@@ -4751,10 +4922,11 @@ auto remote_vfs_rdma_note_transient_failure(std::atomic<uint32_t>& failure_count
 
 auto vfs_proxy_read_with_retry(ProxyVfsState* state, uint16_t op_id, const uint8_t* req_data, uint16_t req_data_len, void* resp_buf,
                                uint16_t resp_buf_max, uint16_t* resp_len_out = nullptr, const char* debug_path = nullptr,
-                               RoceTaggedReceive* tagged_receive = nullptr) -> int {
+                               RoceTaggedReceive* tagged_receive = nullptr, const WkiChannelIdentity* required_identity = nullptr) -> int {
     for (uint32_t attempt = 0;; ++attempt) {
-        int const STATUS = vfs_proxy_send_and_wait(state, op_id, req_data, req_data_len, resp_buf, resp_buf_max, resp_len_out,
-                                                   vfs_read_retry_timeout_us(op_id, attempt), tagged_receive);
+        int const STATUS =
+            vfs_proxy_send_and_wait(state, op_id, req_data, req_data_len, resp_buf, resp_buf_max, resp_len_out,
+                                    vfs_read_retry_timeout_us(op_id, attempt), tagged_receive, nullptr, 0, false, required_identity);
         if (!vfs_read_status_is_retryable(STATUS) || attempt >= VFS_READ_RETRIES) {
             return normalize_proxy_status_for_errno(STATUS);
         }
@@ -4821,9 +4993,129 @@ auto try_reserve_write_behind(WriteBehindBuffer* wb, uint64_t required_bytes) ->
     return install_write_behind_storage(wb, std::move(replacement), TARGET_CAPACITY);
 }
 
+// Capture immutable ordinary authority before secure or message I/O. Passing the
+// captured identity to fallback excludes a successor channel reusing numeric fd.
+auto capture_secure_vfs_client(const RemoteFileContext& context, WkiChannelIdentity& identity) -> int {
+    if (context.ordinary_open_token == 0) return -ENOTSUP;
+    s_vfs_lock.lock();
+    int status = -ENOTCONN;
+    if (context.proxy != nullptr && context.proxy->active && !context.proxy->epoch_reset_pending && !context.proxy->resources_releasing &&
+        !context.proxy->resources_released && context.ordinary_cancel_slot < g_open_cancellations.size()) {
+        auto const& record = g_open_cancellations.at(context.ordinary_cancel_slot);
+        if (record.phase == ExecCancellationPhase::OWNED && record.proxy == context.proxy &&
+            record.request.token == context.ordinary_open_token && record.request.binding_id == context.ordinary_open_binding_id &&
+            record.request.owner_boot_epoch == context.ordinary_owner_boot_epoch &&
+            vfs_channel_identity_matches(record.identity, proxy_channel_identity_locked(context.proxy))) {
+            identity = record.identity;
+            status = 0;
+        }
+    }
+    s_vfs_lock.unlock();
+    return status;
+}
+
+auto make_secure_vfs_intent(const RemoteFileContext& context, rdma_protocol::Opcode opcode, int64_t offset, uint32_t length)
+    -> VfsSecureIoIntent {
+    return {.version = 1,
+            .opcode = static_cast<uint8_t>(opcode),
+            .fd = context.remote_fd,
+            .file_offset = offset,
+            .length = length,
+            .binding_id = context.ordinary_open_binding_id,
+            .open_token = context.ordinary_open_token,
+            .owner_boot_epoch = context.ordinary_owner_boot_epoch,
+            .resource_incarnation = context.ordinary_resource_incarnation,
+            .resource_id = context.ordinary_resource_id};
+}
+
+auto secure_vfs_message_fallback(const WkiSecureRdmaResult& result) -> bool {
+    return result.outcome == WkiSecureRdmaOutcome::NO_EFFECT && result.bytes == 0 &&
+           (result.status == -ENOTSUP || result.status == -EOPNOTSUPP || result.status == -ENOMEM || result.status == -EAGAIN ||
+            result.status == -EBUSY);
+}
+
+auto secure_vfs_client_write(RemoteFileContext& context, const WkiChannelIdentity& identity, int64_t offset, std::span<const uint8_t> input)
+    -> WkiSecureRdmaResult {
+    rdma_protocol::RegionDescriptor grant{};
+    bool const COMPATIBLE = wki_secure_rdma_available(identity, rdma_protocol::Service::VFS);
+    if (COMPATIBLE) context.secure_io_negotiated = true;
+    if (!COMPATIBLE || !wki_secure_rdma_remote_grant(identity, rdma_protocol::Service::VFS, 0, grant, rdma_protocol::PERMIT_WRITE))
+        return {-ENOTSUP};
+    if (grant.binding_generation != context.ordinary_open_binding_id || input.size() > grant.size) return {-ENOTCONN};
+    SharedIoSlotGuard const GUARD(context.proxy, wki_now_us());
+    if (!GUARD.acquired()) return {-EAGAIN};
+    auto const INTENT = make_secure_vfs_intent(context, rdma_protocol::Opcode::WRITE, offset, static_cast<uint32_t>(input.size()));
+    return wki_secure_rdma_write(identity, grant, 0, input, 0, {reinterpret_cast<const uint8_t*>(&INTENT), sizeof(INTENT)});
+}
+
+auto secure_vfs_client_read(RemoteFileContext& context, const WkiChannelIdentity& identity, int64_t offset, uint32_t length)
+    -> WkiSecureRdmaResult {
+    rdma_protocol::RegionDescriptor grant{};
+    bool const COMPATIBLE = wki_secure_rdma_available(identity, rdma_protocol::Service::VFS);
+    if (COMPATIBLE) context.secure_io_negotiated = true;
+    if (!COMPATIBLE || !wki_secure_rdma_remote_grant(identity, rdma_protocol::Service::VFS, 0, grant, rdma_protocol::PERMIT_READ))
+        return {-ENOTSUP};
+    if (grant.binding_generation != context.ordinary_open_binding_id || length > grant.size) return {-ENOTCONN};
+    SharedIoSlotGuard const GUARD(context.proxy, wki_now_us());
+    if (!GUARD.acquired()) return {-EAGAIN};
+    if (context.secure_read_capacity < length) {
+        std::unique_ptr<uint8_t[]> candidate{new (std::nothrow) uint8_t[length]};
+        if (!candidate) return {-ENOMEM};
+        context.secure_read_scratch = std::move(candidate);
+        context.secure_read_capacity = length;
+    }
+    auto const INTENT = make_secure_vfs_intent(context, rdma_protocol::Opcode::READ, offset, length);
+    return wki_secure_rdma_read(identity, grant, 0, {context.secure_read_scratch.get(), length},
+                                {reinterpret_cast<const uint8_t*>(&INTENT), sizeof(INTENT)});
+}
+
+constexpr uint32_t VFS_SECURE_MESSAGE_READ_MAX = VFS_CACHE_SIZE;
+constexpr uint32_t VFS_SECURE_MESSAGE_WRITE_MAX = WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload) - sizeof(VfsSecureIoIntent);
+
+// The native outcome distinguishes known denial from a WRITE accepted without
+// a provable completion. Never manufacture NO_EFFECT from an RPC timeout.
+auto secure_vfs_message_write(RemoteFileContext& context, const WkiChannelIdentity& identity, int64_t offset,
+                              std::span<const uint8_t> input) -> WkiSecureRdmaResult {
+    if (input.empty() || input.size() > VFS_SECURE_MESSAGE_WRITE_MAX) return {-EINVAL};
+    auto const INTENT = make_secure_vfs_intent(context, rdma_protocol::Opcode::WRITE, offset, static_cast<uint32_t>(input.size()));
+    VfsSecureIoResult reply{};
+    uint16_t length = 0;
+    int const STATUS = normalize_proxy_status_for_errno(
+        vfs_proxy_send_and_wait(context.proxy, OP_VFS_SECURE_IO, reinterpret_cast<const uint8_t*>(&INTENT), sizeof(INTENT), &reply,
+                                sizeof(reply), &length, VFS_PROXY_OP_TIMEOUT_US, nullptr, input.data(), input.size(), false, &identity));
+    if (STATUS != 0 || !wki_vfs_secure_message_result_valid(reply, true, static_cast<uint32_t>(input.size()), length))
+        return {STATUS < 0 ? STATUS : -EPROTO, 0, WkiSecureRdmaOutcome::UNCERTAIN};
+    return {reply.status, reply.bytes, static_cast<WkiSecureRdmaOutcome>(reply.outcome)};
+}
+
+auto secure_vfs_message_read(RemoteFileContext& context, const WkiChannelIdentity& identity, int64_t offset, uint32_t requested)
+    -> WkiSecureRdmaResult {
+    if (requested == 0 || requested > VFS_SECURE_MESSAGE_READ_MAX) return {-EINVAL};
+    uint32_t const CAPACITY = requested + sizeof(VfsSecureIoResult);
+    if (context.secure_read_capacity < CAPACITY) {
+        std::unique_ptr<uint8_t[]> candidate{new (std::nothrow) uint8_t[CAPACITY]};
+        if (!candidate) return {-ENOMEM};
+        context.secure_read_scratch = std::move(candidate);
+        context.secure_read_capacity = CAPACITY;
+    }
+    auto const INTENT = make_secure_vfs_intent(context, rdma_protocol::Opcode::READ, offset, requested);
+    uint16_t length = 0;
+    int const STATUS = normalize_proxy_status_for_errno(vfs_proxy_send_and_wait(
+        context.proxy, OP_VFS_SECURE_IO, reinterpret_cast<const uint8_t*>(&INTENT), sizeof(INTENT), context.secure_read_scratch.get(),
+        static_cast<uint16_t>(CAPACITY), &length, VFS_PROXY_OP_TIMEOUT_US, nullptr, nullptr, 0, false, &identity));
+    if (STATUS != 0) return {STATUS};
+    VfsSecureIoResult reply{};
+    if (length < sizeof(reply)) return {-EPROTO};
+    std::memcpy(&reply, context.secure_read_scratch.get(), sizeof(reply));
+    if (!wki_vfs_secure_message_result_valid(reply, false, requested, length)) return {-EPROTO};
+    if (reply.bytes != 0) std::memmove(context.secure_read_scratch.get(), context.secure_read_scratch.get() + sizeof(reply), reply.bytes);
+    return {reply.status, reply.bytes, static_cast<WkiSecureRdmaOutcome>(reply.outcome)};
+}
+
 // The caller holds ctx->io_lock so storage promotion cannot invalidate src
 // while an RDMA or message flush is sleeping on the remote operation.
 auto flush_write_behind(RemoteFileContext* ctx) -> int {
+    if (ctx->secure_write_error != 0) return ctx->secure_write_error;
     if (ctx->write_buf == nullptr || ctx->write_buf->pending_len == 0) {
         return 0;
     }
@@ -4850,57 +5142,59 @@ auto flush_write_behind(RemoteFileContext* ctx) -> int {
         wb->pending_len = tail_len;
     };
 
-    // RDMA path: use the server's pre-registered receive buffer and send only
-    // a tiny control message over WKI. Avoids embedding file data in WKI packets.
-    if (transport_supports_vfs_write_push_rdma(ctx->proxy->rdma_transport) && ctx->proxy->rdma_transport != nullptr &&
-        ctx->proxy->rdma_server_write_rkey != 0) {
-        while (remaining > 0) {
-            uint32_t const CHUNK = std::min(remaining, VFS_RDMA_WRITE_SIZE);
-
-            uint32_t written = 0;
-            int const STATUS = vfs_proxy_write_rdma_and_wait(ctx->proxy, ctx->remote_fd, cur_offset, src, CHUNK, &written);
+    WkiChannelIdentity identity{};
+    int const AUTHORITY = capture_secure_vfs_client(*ctx, identity);
+    if (AUTHORITY != 0 && AUTHORITY != -ENOTSUP) return AUTHORITY;
+    auto const* required_identity = AUTHORITY == 0 ? &identity : nullptr;
+    constexpr uint32_t WRITE_HDR_OVERHEAD = sizeof(DevOpReqPayload) + 12;
+    constexpr uint32_t MESSAGE_MAX = WKI_ETH_MAX_PAYLOAD - WRITE_HDR_OVERHEAD;
+    while (remaining > 0) {
+        uint32_t chunk = std::min(remaining, VFS_RDMA_WRITE_SIZE);
+        uint32_t written = 0;
+        bool message = required_identity == nullptr;
+        if (!message) {
+            auto const RESULT = secure_vfs_client_write(*ctx, identity, cur_offset, {src, chunk});
+            if (RESULT.outcome == WkiSecureRdmaOutcome::EXACT && RESULT.status == 0 && RESULT.bytes > 0 && RESULT.bytes <= chunk) {
+                written = RESULT.bytes;
+            } else if (secure_vfs_message_fallback(RESULT)) {
+                message = true;
+            } else {
+                keep_pending_tail(src, remaining, cur_offset);
+                int const ERROR = RESULT.status < 0 ? RESULT.status : -EIO;
+                if (RESULT.outcome != WkiSecureRdmaOutcome::NO_EFFECT) ctx->secure_write_error = ERROR;
+                return ERROR;
+            }
+        }
+        if (message && ctx->secure_io_negotiated) {
+            chunk = std::min(remaining, VFS_SECURE_MESSAGE_WRITE_MAX);
+            auto const RESULT = secure_vfs_message_write(*ctx, identity, cur_offset, {src, chunk});
+            if (RESULT.outcome != WkiSecureRdmaOutcome::EXACT || RESULT.status != 0 || RESULT.bytes == 0 || RESULT.bytes > chunk) {
+                keep_pending_tail(src, remaining, cur_offset);
+                int const ERROR = RESULT.status < 0 ? RESULT.status : -EPROTO;
+                if (RESULT.outcome != WkiSecureRdmaOutcome::NO_EFFECT) ctx->secure_write_error = ERROR;
+                return ERROR;
+            }
+            written = RESULT.bytes;
+        } else if (message) {
+            chunk = std::min(remaining, MESSAGE_MAX);
+            std::array<uint8_t, 12> prefix{};
+            std::memcpy(prefix.data(), &ctx->remote_fd, sizeof(ctx->remote_fd));
+            std::memcpy(prefix.data() + 4, &cur_offset, sizeof(cur_offset));
+            int const STATUS = normalize_proxy_status_for_errno(
+                vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_WRITE, prefix.data(), prefix.size(), &written, sizeof(written), nullptr,
+                                        VFS_PROXY_OP_TIMEOUT_US, nullptr, src, chunk, false, required_identity));
             if (STATUS != 0) {
                 keep_pending_tail(src, remaining, cur_offset);
                 return STATUS;
             }
-
-            if (written == 0 || written > CHUNK) {
-                keep_pending_tail(src, remaining, cur_offset);
-                return -EIO;
-            }
-            src += written;
-            cur_offset += static_cast<int64_t>(written);
-            remaining -= written;
         }
-    } else {
-        // Message path (fallback): embed data in the WKI packet, capped to ethernet MTU
-        constexpr uint32_t WRITE_HDR_OVERHEAD = sizeof(DevOpReqPayload) + 12;
-        auto max_data = static_cast<uint32_t>(WKI_ETH_MAX_PAYLOAD - WRITE_HDR_OVERHEAD);
-
-        while (remaining > 0) {
-            uint32_t const CHUNK = (remaining > max_data) ? max_data : remaining;
-
-            std::array<uint8_t, 12> req_prefix{};
-            int32_t remote_fd = ctx->remote_fd;
-            memcpy(req_prefix.data(), &remote_fd, sizeof(int32_t));
-            memcpy(req_prefix.data() + 4, &cur_offset, sizeof(int64_t));
-
-            uint32_t written = 0;
-            int const STATUS = vfs_proxy_send_split_and_wait(ctx->proxy, OP_VFS_WRITE, req_prefix.data(), req_prefix.size(), src, CHUNK,
-                                                             &written, sizeof(uint32_t));
-            if (STATUS != 0) {
-                keep_pending_tail(src, remaining, cur_offset);
-                return STATUS;
-            }
-            if (written == 0 || written > CHUNK) {
-                keep_pending_tail(src, remaining, cur_offset);
-                return -EIO;
-            }
-
-            src += written;
-            cur_offset += static_cast<int64_t>(written);
-            remaining -= written;
+        if (written == 0 || written > chunk) {
+            keep_pending_tail(src, remaining, cur_offset);
+            return -EIO;
         }
+        src += written;
+        cur_offset += static_cast<int64_t>(written);
+        remaining -= written;
     }
 
     wb->pending_offset = -1;
@@ -5277,6 +5571,30 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
                 return total_read;
             }
         }
+    }
+
+    WkiChannelIdentity secure_identity{};
+    int const SECURE_AUTHORITY = capture_secure_vfs_client(*ctx, secure_identity);
+    if (SECURE_AUTHORITY != 0 && SECURE_AUTHORITY != -ENOTSUP) return total_read > 0 ? total_read : SECURE_AUTHORITY;
+    auto const* required_identity = SECURE_AUTHORITY == 0 ? &secure_identity : nullptr;
+    while (required_identity != nullptr && remaining != 0) {
+        uint32_t chunk = std::min(remaining, VFS_RDMA_BULK_SIZE);
+        auto result = secure_vfs_client_read(*ctx, secure_identity, cur_offset, chunk);
+        if (secure_vfs_message_fallback(result)) {
+            if (!ctx->secure_io_negotiated) break;
+            chunk = std::min(remaining, VFS_SECURE_MESSAGE_READ_MAX);
+            result = secure_vfs_message_read(*ctx, secure_identity, cur_offset, chunk);
+        }
+        auto const RESULT = result;
+        if (RESULT.outcome != WkiSecureRdmaOutcome::EXACT || RESULT.status != 0 || RESULT.bytes > chunk)
+            return total_read > 0 ? total_read : (RESULT.status < 0 ? RESULT.status : -EIO);
+        if (RESULT.bytes == 0) return total_read;
+        std::memcpy(dest, ctx->secure_read_scratch.get(), RESULT.bytes);
+        dest += RESULT.bytes;
+        cur_offset += RESULT.bytes;
+        remaining -= RESULT.bytes;
+        total_read += RESULT.bytes;
+        if (RESULT.bytes < chunk || remaining == 0) return total_read;
     }
 
     // -- Bulk RDMA path ----------------------------------------------------
@@ -5673,8 +5991,8 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
         memcpy(req_data.data() + 8, &cur_offset, sizeof(int64_t));
 
         uint16_t resp_len = 0;
-        int const STATUS =
-            vfs_proxy_read_with_retry(ctx->proxy, OP_VFS_READ, req_data.data(), 16, fetch_dest, static_cast<uint16_t>(chunk), &resp_len);
+        int const STATUS = vfs_proxy_read_with_retry(ctx->proxy, OP_VFS_READ, req_data.data(), 16, fetch_dest, static_cast<uint16_t>(chunk),
+                                                     &resp_len, nullptr, nullptr, required_identity);
         if (STATUS != 0) {
             return (total_read > 0) ? total_read : STATUS;
         }
@@ -5730,6 +6048,7 @@ auto remote_vfs_write_impl(ker::vfs::File* f, const void* buf, size_t count, siz
     }
     ker::mod::sys::MutexGuard io_guard(ctx->io_lock);
     consume_remote_file_cache_invalidation(ctx);
+    if (ctx->secure_write_error != 0) return ctx->secure_write_error;
 
     remote_vfs_invalidate_cached_stat(ctx);
 
@@ -6146,6 +6465,62 @@ ker::vfs::FileOperations g_remote_vfs_fops = {
 };
 
 }  // namespace
+
+void wki_remote_vfs_close_secure_context(VfsSecureContext* context) {
+    if (context != nullptr) context->closed.store(true, std::memory_order_release);
+}
+
+void wki_remote_vfs_release_secure_context(VfsSecureContext* context) {
+    if (context == nullptr) return;
+    wki_remote_vfs_close_secure_context(context);
+    // Nonblocking registry close first; failed reclaim never permits deletion.
+    // Hook release takes no peer/export gate and can drain while cleanup yields.
+    for (auto* grant : {&context->write_grant, &context->read_grant}) {
+        if (grant->rkey == 0) continue;
+        while (wki_secure_rdma_unregister_region(*grant) != 0) ker::mod::sched::kern_yield();
+        *grant = {};
+    }
+    if (context->write_backing) auth_crypto::secure_erase(context->write_backing.get(), VFS_RDMA_WRITE_SIZE);
+    if (context->read_backing) auth_crypto::secure_erase(context->read_backing.get(), VFS_RDMA_BULK_SIZE);
+    delete context;
+}
+
+void wki_remote_vfs_prepare_secure_binding(DevServerBinding& binding) {
+    if (binding.vfs_open_binding_id == 0 || binding.retiring.load(std::memory_order_acquire)) return;
+    if (auto* prior = wki_dev_server_borrow_vfs_secure_context(&binding); prior != nullptr) {
+        int const WRITE = wki_secure_rdma_local_region_current(binding.channel_identity, rdma_protocol::Service::VFS, prior->write_grant);
+        int const READ = wki_secure_rdma_local_region_current(binding.channel_identity, rdma_protocol::Service::VFS, prior->read_grant);
+        if (WRITE == -EAGAIN || READ == -EAGAIN || (WRITE != -ESTALE && READ != -ESTALE)) return;
+        if ((WRITE != 0 && WRITE != -ESTALE) || (READ != 0 && READ != -ESTALE)) return;
+        if (!wki_dev_server_take_vfs_secure_context(&binding, prior)) return;
+        wki_remote_vfs_release_secure_context(prior);
+    }
+    // Deferred task setup owns a retained binding, not a peer RX writer gate.
+    bool const COMPATIBLE = wki_secure_rdma_available(binding.channel_identity, rdma_protocol::Service::VFS);
+    if (!COMPATIBLE || !wki_dev_server_vfs_secure_compatible(&binding, true)) return;
+    auto* context = new (std::nothrow) VfsSecureContext;
+    if (context == nullptr) return;
+    context->identity = binding.channel_identity;
+    context->binding_id = binding.vfs_open_binding_id;
+    context->resource_id = binding.resource_id;
+    context->incarnation = binding.resource_incarnation;
+    context->publication_revision = binding.vfs_export_publication_revision;
+    context->write_backing.reset(new (std::nothrow) uint8_t[VFS_RDMA_WRITE_SIZE]);
+    context->read_backing.reset(new (std::nothrow) uint8_t[VFS_RDMA_BULK_SIZE]);
+    if (!context->write_backing || !context->read_backing) {
+        wki_remote_vfs_release_secure_context(context);
+        return;
+    }
+    WkiSecureRdmaHooks const HOOKS{secure_vfs_arm, secure_vfs_effect, secure_vfs_release};
+    int status =
+        wki_secure_rdma_register_region(context->identity, rdma_protocol::Service::VFS, context->write_backing.get(), VFS_RDMA_WRITE_SIZE,
+                                        context->binding_id, rdma_protocol::PERMIT_WRITE, HOOKS, context, context->write_grant);
+    if (status == 0)
+        status =
+            wki_secure_rdma_register_region(context->identity, rdma_protocol::Service::VFS, context->read_backing.get(), VFS_RDMA_BULK_SIZE,
+                                            context->binding_id, rdma_protocol::PERMIT_READ, HOOKS, context, context->read_grant);
+    if (status != 0 || !wki_dev_server_install_vfs_secure_context(&binding, context)) wki_remote_vfs_release_secure_context(context);
+}
 
 void wki_remote_vfs_cleanup_for_task(uint64_t pid) {
     while (true) {
@@ -10346,6 +10721,7 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
                 reject_request(static_cast<int16_t>(STATUS));
                 return;
             }
+            wki_remote_vfs_prepare_secure_binding(*grant_binding);
             std::array<uint8_t, sizeof(DevOpRespPayload) + sizeof(result)> response{};
             DevOpRespPayload const header{.op_id = op_id, .status = 0, .data_len = sizeof(result), .reserved = REQ_COOKIE};
             std::memcpy(response.data(), &header, sizeof(header));
@@ -10380,6 +10756,7 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
         }
         ordinary_token = lifetime.token;
         ordinary_binding_id = lifetime.binding_id;
+        wki_remote_vfs_prepare_secure_binding(*grant_binding);
     }
 
     switch (effective_op) {
@@ -10756,6 +11133,67 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
                     static_cast<long>(debug_probe_n));
             }
 #endif
+            break;
+        }
+
+        case OP_VFS_SECURE_IO: {
+            if (grant_binding == nullptr || data == nullptr || data_len < sizeof(VfsSecureIoIntent)) {
+                reject_request(-ENOTSUP);
+                break;
+            }
+            VfsSecureIoIntent intent{};
+            std::memcpy(&intent, data, sizeof(intent));
+            bool const WRITE = intent.opcode == static_cast<uint8_t>(rdma_protocol::Opcode::WRITE);
+            if (!wki_vfs_secure_intent_valid(intent) || data_len != sizeof(intent) + (WRITE ? intent.length : 0) ||
+                (!WRITE && intent.length > VFS_SECURE_MESSAGE_READ_MAX) || (WRITE && intent.length > VFS_SECURE_MESSAGE_WRITE_MAX) ||
+                intent.binding_id != grant_binding->vfs_open_binding_id ||
+                intent.owner_boot_epoch != grant_binding->resource_incarnation.owner_boot_epoch ||
+                intent.resource_incarnation != grant_binding->resource_incarnation.resource_incarnation ||
+                intent.resource_id != grant_binding->resource_id) {
+                reject_request(-EINVAL);
+                break;
+            }
+            VfsSecureContext authority{};
+            authority.identity = channel_identity;
+            authority.binding = grant_binding;
+            authority.publication_revision = grant_binding->vfs_export_publication_revision;
+            ker::vfs::File* file = nullptr;
+            s_vfs_lock.lock();
+            int admit = secure_vfs_file_locked(authority, intent, WRITE, file);
+            if (admit == 0) ker::vfs::vfs_retain_file(file);
+            s_vfs_lock.unlock();
+            if (admit == 0 && !wki_dev_server_vfs_secure_compatible(grant_binding)) {
+                // The fixed deferred owner task has no peer RX writer gate.
+                // A confirm may have arrived after the ordinary OPEN handshake.
+                wki_remote_vfs_prepare_secure_binding(*grant_binding);
+                if (!wki_dev_server_vfs_secure_compatible(grant_binding)) {
+                    ker::vfs::vfs_put_file(file);
+                    file = nullptr;
+                    admit = -ENOTSUP;
+                }
+            }
+            std::array<uint8_t, sizeof(DevOpRespPayload) + sizeof(VfsSecureIoResult) + VFS_SECURE_MESSAGE_READ_MAX> response;
+            VfsSecureIoResult result{};
+            if (admit != 0) {
+                result.status = admit;
+            } else {
+                ssize_t const BYTES = WRITE ? ker::vfs::vfs_pwrite_file(file, data + sizeof(intent), intent.length, intent.file_offset)
+                                            : ker::vfs::vfs_pread_file(file, response.data() + sizeof(DevOpRespPayload) + sizeof(result),
+                                                                       intent.length, intent.file_offset);
+                ker::vfs::vfs_put_file(file);
+                if (BYTES < 0 || static_cast<uint64_t>(BYTES) > intent.length || (WRITE && BYTES == 0)) {
+                    result.status = BYTES < 0 ? static_cast<int32_t>(BYTES) : -EIO;
+                    result.outcome = static_cast<uint8_t>(WRITE ? WkiSecureRdmaOutcome::UNCERTAIN : WkiSecureRdmaOutcome::NO_EFFECT);
+                } else {
+                    result.bytes = static_cast<uint32_t>(BYTES);
+                    result.outcome = static_cast<uint8_t>(WkiSecureRdmaOutcome::EXACT);
+                }
+            }
+            uint16_t const RESULT_LENGTH = static_cast<uint16_t>(sizeof(result) + (WRITE ? 0 : result.bytes));
+            DevOpRespPayload const header{.op_id = op_id, .status = 0, .data_len = RESULT_LENGTH, .reserved = REQ_COOKIE};
+            std::memcpy(response.data(), &header, sizeof(header));
+            std::memcpy(response.data() + sizeof(header), &result, sizeof(result));
+            send_buffered_resp(response.data(), static_cast<uint16_t>(sizeof(header) + RESULT_LENGTH));
             break;
         }
 
@@ -12110,294 +12548,13 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             break;
         }
 
-        case OP_VFS_READ_RDMA: {
-            // Request: {fd:i32, len:u32, off:i64, consumer_rkey:u32} = 20 bytes
-            // Two modes depending on transport:
-            //   Push: rdma_write data to the consumer's bounce buf (consumer_rkey), then send a tiny response.
-            //   Pull: stage data in the server's read buf; the consumer rdma_reads after the response.
-            auto send_rdma_read_err = [&](int16_t status = -EIO) {
-                DevOpRespPayload resp = {};
-                resp.op_id = OP_VFS_READ_RDMA;
-                resp.status = status;
-                resp.data_len = 0;
-                resp.reserved = REQ_COOKIE;
-                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
-            };
-
-            if (data_len < 20) {
-                send_rdma_read_err();
-                break;
-            }
-
-            int32_t fd_id = 0;
-            uint32_t len = 0;
-            int64_t offset = 0;
-            uint32_t consumer_rkey = 0;
-            memcpy(&fd_id, data, sizeof(int32_t));
-            memcpy(&len, data + 4, sizeof(uint32_t));
-            memcpy(&offset, data + 8, sizeof(int64_t));
-            memcpy(&consumer_rkey, data + 16, sizeof(uint32_t));
-
-            len = std::min<uint32_t>(len, VFS_RDMA_BOUNCE_SIZE);
-
-            // Determine mode from the request rkey. rkey=0 keeps the legacy
-            // pull path where the server stages data and the client rdma_reads
-            // it; nonzero asks the server to push into the consumer region.
-            bool const PULL_MODE = consumer_rkey == 0;
-            uint8_t* read_staging = wki_dev_server_get_vfs_read_staging_buf(channel_identity);
-            WkiPeer const* rdma_peer = nullptr;
-            if (PULL_MODE && read_staging == nullptr) {
-                send_rdma_read_err(-EIO);
-                break;
-            }
-            if (!PULL_MODE) {
-                // Push mode: need rdma_write capability.
-                rdma_peer = wki_peer_find(hdr->src_node);
-                if (rdma_peer == nullptr || rdma_peer->rdma_transport == nullptr || rdma_peer->rdma_transport->rdma_write == nullptr) {
-                    send_rdma_read_err(-EIO);
-                    break;
-                }
-            }
-
-            s_vfs_lock.lock();
-            RemoteVfsFd* rfd = find_remote_fd(channel_identity, fd_id);
-            if (rfd == nullptr || rfd->file == nullptr || rfd->file->fops == nullptr || rfd->file->fops->vfs_read == nullptr) {
-                s_vfs_lock.unlock();
-                send_rdma_read_err(-EBADF);
-                break;
-            }
-            if (ker::mod::security::authorize_file_description_access(static_cast<unsigned>(rfd->file->open_flags) & 3U, false) != 0) {
-                s_vfs_lock.unlock();
-                reject_request(-EBADF);
-                break;
-            }
-            touch_remote_fd(rfd);
-            ker::vfs::File* local_file = rfd->file;
-            s_vfs_lock.unlock();
-
-            uint8_t* allocated_read_buf = nullptr;
-            uint8_t* read_buf = read_staging;
-            if (read_buf == nullptr) {
-                allocated_read_buf = new (std::nothrow) uint8_t[len];
-                if (allocated_read_buf == nullptr) {
-                    send_rdma_read_err(-ENOMEM);
-                    break;
-                }
-                read_buf = allocated_read_buf;
-            }
-
-            ssize_t bytes_read = read_local_file_windowed(local_file, read_buf, len, static_cast<size_t>(offset));
-            if (!PULL_MODE && bytes_read > 0) {
-                int write_ret = 0;
-                if (transport_is_roce(rdma_peer->rdma_transport)) {
-                    write_ret = wki_roce_rdma_write_tagged(hdr->src_node, consumer_rkey, 0, read_buf, static_cast<uint32_t>(bytes_read),
-                                                           REQ_COOKIE);
-                } else {
-                    write_ret = rdma_peer->rdma_transport->rdma_write(rdma_peer->rdma_transport, hdr->src_node, consumer_rkey, 0, read_buf,
-                                                                      static_cast<uint32_t>(bytes_read));
-                }
-                if (write_ret != 0) {
-                    bytes_read = -EIO;
-                }
-            }
-            delete[] allocated_read_buf;
-
-            // Response: {bytes_read:u32} = 4 bytes (data is now in consumer bounce buf)
-            uint32_t br = (bytes_read > 0) ? static_cast<uint32_t>(bytes_read) : 0;
-            std::array<uint8_t, sizeof(DevOpRespPayload) + 4> resp_buf{};
-            auto* resp = reinterpret_cast<DevOpRespPayload*>(resp_buf.data());
-            resp->op_id = OP_VFS_READ_RDMA;
-            resp->status = (bytes_read >= 0) ? 0 : static_cast<int16_t>(bytes_read);
-            resp->data_len = 4;
-            resp->reserved = REQ_COOKIE;
-            memcpy(resp_buf.data() + sizeof(DevOpRespPayload), &br, sizeof(uint32_t));
-            static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, resp_buf.data(),
-                                                           static_cast<uint16_t>(resp_buf.size())));
+        case OP_VFS_READ_RDMA:
+        case OP_VFS_READ_BULK:
+        case OP_VFS_WRITE_RDMA:
+            // Legacy raw staging/cookie control must never consume a secure
+            // region or authorize native I/O, including on upgraded bindings.
+            reject_request(-ENOTSUP);
             break;
-        }
-
-        case OP_VFS_READ_BULK: {
-            // Bulk RDMA read - identical request layout to OP_VFS_READ_RDMA but len
-            // is not capped to 64 KB.
-            // Two modes:
-            //   Push: rdma_write into the consumer's bulk buf (consumer_rkey).
-            //   Pull: stage data in the server's bulk buf; the consumer rdma_reads after the response.
-            auto send_bulk_read_err = [&](int16_t status = -EIO) {
-                DevOpRespPayload resp = {};
-                resp.op_id = OP_VFS_READ_BULK;
-                resp.status = status;
-                resp.data_len = 0;
-                resp.reserved = REQ_COOKIE;
-                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
-            };
-
-            if (data_len < 20) {
-                send_bulk_read_err();
-                break;
-            }
-
-            int32_t fd_id = 0;
-            uint32_t len = 0;
-            int64_t offset = 0;
-            uint32_t consumer_rkey = 0;
-            memcpy(&fd_id, data, sizeof(int32_t));
-            memcpy(&len, data + 4, sizeof(uint32_t));
-            memcpy(&offset, data + 8, sizeof(int64_t));
-            memcpy(&consumer_rkey, data + 16, sizeof(uint32_t));
-
-            // Cap to the consumer's registered bulk size. A server staging
-            // window can impose a smaller cap in either transfer mode.
-            len = std::min<uint32_t>(len, VFS_RDMA_BULK_SIZE);
-
-            // Determine mode from the request rkey. rkey=0 keeps the legacy
-            // pull path where the server stages data and the client rdma_reads
-            // it; nonzero asks the server to push into the consumer region.
-            bool const PULL_MODE = consumer_rkey == 0;
-            uint8_t* bulk_staging = wki_dev_server_get_vfs_bulk_staging_buf(channel_identity);
-            WkiPeer const* bulk_peer = nullptr;
-            if (bulk_staging != nullptr) {
-                len = std::min<uint32_t>(len, VFS_RDMA_ROCE_BULK_SIZE);
-            }
-            if (PULL_MODE && bulk_staging == nullptr) {
-                send_bulk_read_err(-EIO);
-                break;
-            }
-            if (!PULL_MODE) {
-                bulk_peer = wki_peer_find(hdr->src_node);
-                if (bulk_peer == nullptr || bulk_peer->rdma_transport == nullptr || bulk_peer->rdma_transport->rdma_write == nullptr) {
-                    send_bulk_read_err(-EIO);
-                    break;
-                }
-            }
-
-            s_vfs_lock.lock();
-            RemoteVfsFd* rfd = find_remote_fd(channel_identity, fd_id);
-            if (rfd == nullptr || rfd->file == nullptr || rfd->file->fops == nullptr || rfd->file->fops->vfs_read == nullptr) {
-                s_vfs_lock.unlock();
-                send_bulk_read_err(-EBADF);
-                break;
-            }
-            if (ker::mod::security::authorize_file_description_access(static_cast<unsigned>(rfd->file->open_flags) & 3U, false) != 0) {
-                s_vfs_lock.unlock();
-                reject_request(-EBADF);
-                break;
-            }
-            touch_remote_fd(rfd);
-            ker::vfs::File* local_file = rfd->file;
-            s_vfs_lock.unlock();
-
-            uint8_t* allocated_read_buf = nullptr;
-            uint8_t* read_buf = bulk_staging;
-            if (read_buf == nullptr) {
-                allocated_read_buf = new (std::nothrow) uint8_t[len];
-                if (allocated_read_buf == nullptr) {
-                    send_bulk_read_err(-ENOMEM);
-                    break;
-                }
-                read_buf = allocated_read_buf;
-            }
-
-            ssize_t bytes_read = read_local_file_windowed(local_file, read_buf, len, static_cast<size_t>(offset));
-            if (!PULL_MODE && bytes_read > 0) {
-                int write_ret = 0;
-                if (transport_is_roce(bulk_peer->rdma_transport)) {
-                    write_ret = wki_roce_rdma_write_tagged(hdr->src_node, consumer_rkey, 0, read_buf, static_cast<uint32_t>(bytes_read),
-                                                           REQ_COOKIE);
-                } else {
-                    write_ret = bulk_peer->rdma_transport->rdma_write(bulk_peer->rdma_transport, hdr->src_node, consumer_rkey, 0, read_buf,
-                                                                      static_cast<uint32_t>(bytes_read));
-                }
-                if (write_ret != 0) {
-                    bytes_read = -EIO;
-                }
-            }
-            delete[] allocated_read_buf;
-
-            uint32_t br = (bytes_read > 0) ? static_cast<uint32_t>(bytes_read) : 0;
-            std::array<uint8_t, sizeof(DevOpRespPayload) + 4> bulk_resp_buf{};
-            auto* bulk_resp = reinterpret_cast<DevOpRespPayload*>(bulk_resp_buf.data());
-            bulk_resp->op_id = OP_VFS_READ_BULK;
-            bulk_resp->status = (bytes_read >= 0) ? 0 : static_cast<int16_t>(bytes_read);
-            bulk_resp->data_len = 4;
-            bulk_resp->reserved = REQ_COOKIE;
-            memcpy(bulk_resp_buf.data() + sizeof(DevOpRespPayload), &br, sizeof(uint32_t));
-            static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, bulk_resp_buf.data(),
-                                                           static_cast<uint16_t>(bulk_resp_buf.size())));
-            break;
-        }
-
-        case OP_VFS_WRITE_RDMA: {
-            // Request: {fd:i32, off:i64, len:u32} = 16 bytes
-            // Consumer sends this control message first, then rdma_writes the
-            // data into our pre-registered write buffer.
-            VfsWriteRegionInfo write_region_for_cleanup = {};
-            auto send_rdma_write_err = [&](int16_t status) {
-                if (write_region_for_cleanup.transport != nullptr && write_region_for_cleanup.transport->name != nullptr &&
-                    std::strcmp(write_region_for_cleanup.transport->name, "wki-roce") == 0) {
-                    wki_roce_region_finish_tagged_write(write_region_for_cleanup.rkey, REQ_COOKIE);
-                }
-                DevOpRespPayload resp = {};
-                resp.op_id = OP_VFS_WRITE_RDMA;
-                resp.status = status;
-                resp.data_len = 0;
-                wki_dev_server_complete_vfs_write(channel_identity, REQ_COOKIE, status, 0);
-                send_simple_resp(resp);
-            };
-
-            if (data_len < 16) {
-                send_rdma_write_err(-EINVAL);
-                break;
-            }
-
-            int32_t fd_id = 0;
-            int64_t offset = 0;
-            uint32_t len = 0;
-            memcpy(&fd_id, data, sizeof(int32_t));
-            memcpy(&offset, data + 4, sizeof(int64_t));
-            memcpy(&len, data + 12, sizeof(uint32_t));
-
-            len = std::min<uint32_t>(len, VFS_RDMA_WRITE_SIZE);
-
-            VfsWriteRegionInfo const WRITE_REGION = wki_dev_server_get_vfs_write_region(channel_identity);
-            write_region_for_cleanup = WRITE_REGION;
-            uint8_t const* write_src = WRITE_REGION.buf;
-            if (write_src == nullptr) {
-                send_rdma_write_err(-EIO);
-                break;
-            }
-
-            if (WRITE_REGION.transport != nullptr && WRITE_REGION.transport->name != nullptr &&
-                std::strcmp(WRITE_REGION.transport->name, "wki-roce") == 0 &&
-                !wki_roce_region_wait_tagged_write(WRITE_REGION.rkey, REQ_COOKIE, len, VFS_PROXY_OP_TIMEOUT_US)) {
-                send_rdma_write_err(-ETIMEDOUT);
-                break;
-            }
-
-            ker::vfs::File* local_file = nullptr;
-            int const ADMIT = retain_server_write_file(channel_identity, fd_id, offset, local_file);
-            if (ADMIT != 0) {
-                send_rdma_write_err(static_cast<int16_t>(ADMIT));
-                break;
-            }
-            ssize_t const BYTES_WRITTEN = ker::vfs::vfs_pwrite_file(local_file, write_src, len, static_cast<off_t>(offset));
-            ker::vfs::vfs_put_file(local_file);
-            if (WRITE_REGION.transport != nullptr && WRITE_REGION.transport->name != nullptr &&
-                std::strcmp(WRITE_REGION.transport->name, "wki-roce") == 0) {
-                wki_roce_region_finish_tagged_write(WRITE_REGION.rkey, REQ_COOKIE);
-            }
-
-            // Response: {bytes_written:u32} = 4 bytes
-            uint32_t bw = (BYTES_WRITTEN > 0) ? static_cast<uint32_t>(BYTES_WRITTEN) : 0;
-            std::array<uint8_t, sizeof(DevOpRespPayload) + 4> resp_buf{};
-            auto* resp = reinterpret_cast<DevOpRespPayload*>(resp_buf.data());
-            resp->op_id = OP_VFS_WRITE_RDMA;
-            resp->status = (BYTES_WRITTEN >= 0) ? 0 : static_cast<int16_t>(BYTES_WRITTEN);
-            resp->data_len = 4;
-            memcpy(resp_buf.data() + sizeof(DevOpRespPayload), &bw, sizeof(uint32_t));
-            wki_dev_server_complete_vfs_write(channel_identity, REQ_COOKIE, resp->status, bw);
-            send_buffered_resp(resp_buf.data(), static_cast<uint16_t>(resp_buf.size()));
-            break;
-        }
 
         default: {
             DevOpRespPayload resp = {};

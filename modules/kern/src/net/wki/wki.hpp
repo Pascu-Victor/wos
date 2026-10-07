@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <net/address.hpp>
 #include <net/wki/auth.hpp>
+#include <net/wki/rdma_protocol.hpp>
 #include <net/wki/wire.hpp>
 #include <platform/sys/spinlock.hpp>
 
@@ -150,6 +151,13 @@ struct WkiTransport {
     const char* name;  // "eth0", "ivshmem0", etc.
     uint16_t mtu;      // max payload excluding WKI header
     bool rdma_capable;
+    // Typed encrypted staging providers are separate from legacy raw-memory
+    // callbacks. A provider does not imply peer/consumer negotiation or grant
+    // authority, and never makes rdma_capable true by itself.
+    rdma_protocol::Transport secure_kind = rdma_protocol::Transport::NONE;
+    // Task-context borrow of one complete encoded private record. Copies it
+    // before returning; success means local publication, not remote completion.
+    int (*secure_tx)(WkiTransport* self, uint16_t peer, const void* record, uint16_t len) = nullptr;
     void* private_data;
     // Local registry incarnation, protected by transport_lock. Never reused,
     // even when an allocator recycles an address or the chaos ID wraps.

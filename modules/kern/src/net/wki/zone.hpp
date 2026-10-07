@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <net/wki/secure_rdma.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/sys/spinlock.hpp>
@@ -25,6 +26,7 @@ constexpr int WKI_ERR_ZONE_REJECTED = -23;
 constexpr int WKI_ERR_ZONE_ACCESS = -24;
 constexpr int WKI_ERR_ZONE_TIMEOUT = -25;
 constexpr int WKI_ERR_ZONE_INACTIVE = -26;
+constexpr int WKI_ERR_ZONE_UNCERTAIN = -27;
 
 // -----------------------------------------------------------------------------
 // Zone State
@@ -53,7 +55,7 @@ struct WkiZone {
     ZoneState state = ZoneState::NONE;
 
     // Local memory backing
-    void* local_vaddr = nullptr;   // HHDM ptr (pageAlloc) or BAR2 ptr (ivshmem)
+    void* local_vaddr = nullptr;   // Private HHDM page backing; never a peer BAR.
     uint64_t local_phys_addr = 0;  // physical address of local allocation
     uint32_t size = 0;             // page-aligned zone size in bytes
 
@@ -61,6 +63,21 @@ struct WkiZone {
     uint8_t access_policy = 0;  // ZONE_ACCESS_* bits from wire.hpp
     ZoneNotifyMode notify_mode = ZoneNotifyMode::NONE;
     ZoneTypeHint type_hint = ZoneTypeHint::BUFFER;
+
+    // Registration retains one native pin until nonblocking close/reclaim
+    // succeeds. Allocation generations never wrap or reuse.
+    uint64_t binding_generation = 0;
+    rdma_protocol::RegionDescriptor secure_descriptor{};
+    bool secure_registered = false;
+    // Task-captured format compatibility only; grants/session remain core
+    // authority. Never query a new core peer reader from exclusive ZONE RX.
+    bool secure_peer_compatible = false;
+    bool secure_reclaiming = false;
+    bool backing_cleanup = false;
+    // Message copies share the ARM-to-retirement consumer reservation.
+    bool memory_reserved = false;
+    bool secure_reserved = false;
+    WkiSecureRdmaRequest secure_request{};
 
     // RDMA state
     bool is_rdma = false;
@@ -122,12 +139,22 @@ class WkiZoneRef {
     auto operator=(WkiZoneRef&& other) noexcept -> WkiZoneRef&;
     ~WkiZoneRef();
     explicit operator bool() const { return zone_ != nullptr; }
+    // Enrolled secure BUFFER zones never expose their private backing through
+    // this legacy raw accessor. BLOCK MSG_QUEUE storage is independently owned.
     auto memory() const -> WkiZoneMemory { return memory_; }
     auto live() const -> bool;
+    // Task-only observational snapshot of this exact allocation's authenticated
+    // current READ|WRITE grant. Pressure returns false; transfers re-admit.
+    auto secure_ready() const -> bool;
     // Refresh late transport metadata from this pinned slot; preserve output on refusal.
     auto snapshot_memory(WkiZoneMemory& output) const -> bool;
     void reset();
     auto destroy() const -> int;
+    // Admit transfers only on this retained allocation; a recycled numeric ID
+    // never selects a successor. The owner retains/drains the ref through return.
+    auto read(uint32_t offset, void* buf, uint32_t len) const -> int;
+    auto write(uint32_t offset, const void* buf, uint32_t len) const -> int;
+
     // Zero-range READ(0)/WRITE(1) wake on this zone's original management channel.
     auto notify_post(uint8_t op_type) const -> int;
     auto set_handlers(ZoneNotifyHandler pre, ZoneNotifyHandler post) const -> bool;
@@ -150,6 +177,9 @@ void wki_zone_init();
 // Start the task-context worker that performs allocation-bearing zone-create
 // request/ACK completion after bounded RX admission.
 void wki_zone_worker_start();
+// Task-only finalizer handoff, outside all peer/channel/native gates. False
+// retains exact backing/context until worker ownership and unregister drain.
+auto wki_zone_shutdown_drain() -> bool;
 
 // Create a shared memory zone with a peer.
 // Sends ZONE_CREATE_REQ and blocks until ACK (or timeout).

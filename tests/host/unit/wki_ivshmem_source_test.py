@@ -61,35 +61,32 @@ def test_peer_ready_wait_deadline_is_saturating() -> None:
         fail("ivshmem peer-ready wait must not use wrapping deadline arithmetic")
 
 
-def test_rdma_bitmap_allocation_and_free_are_irq_safe() -> None:
+def test_raw_bar_authority_fails_closed_without_effects() -> None:
     source = IVSHMEM_CPP.read_text()
-    alloc = function_body(source, "rdma_bitmap_alloc")
-    free = function_body(source, "rdma_bitmap_free")
-
-    if "#include <platform/sys/spinlock.hpp>" not in source or "s_rdma_bitmap_lock" not in source:
-        fail("ivshmem RDMA bitmap must have an explicit IRQ-safe lock")
-    require_order(
-        alloc,
-        [
-            "s_rdma_bitmap_lock.lock_irqsave()",
-            "page zero permanently reserved",
-            "uint32_t start_page = 1",
-            "for (uint32_t page = 1",
-            "s_rdma_bitmap_lock.unlock_irqrestore(FLAGS)",
-        ],
-        "ivshmem RDMA bitmap allocation lock lifetime",
-    )
-    if "offset <= 0" not in free:
-        fail("ivshmem RDMA bitmap free must retain page zero as the invalid-rkey sentinel")
-    require_order(
-        free,
-        [
-            "s_rdma_bitmap_lock.lock_irqsave()",
-            "for (uint32_t p = start_page",
-            "s_rdma_bitmap_lock.unlock_irqrestore(FLAGS)",
-        ],
-        "ivshmem RDMA bitmap free lock lifetime",
-    )
+    rejects = {
+        "ivshmem_wki_rdma_register_region": "return -1;",
+        "ivshmem_wki_rdma_read": "return -1;",
+        "ivshmem_wki_rdma_write": "return -1;",
+        "ivshmem_wki_doorbell": "return -1;",
+        "wki_ivshmem_rdma_alloc": "return -1;",
+        "wki_ivshmem_rdma_ptr": "return nullptr;",
+        "wki_ivshmem_rdma_free": "",
+        "wki_ivshmem_irq_mailbox_write": "",
+    }
+    for name, expected in rejects.items():
+        if function_body(source, name).strip() != expected:
+            fail(f"{name} must reject without dereferencing arguments, allocating, or acquiring resources")
+    init = function_body(source, "wki_ivshmem_transport_init")
+    if "s_ivshmem_transport.rdma_capable = false;" not in init:
+        fail("raw ivshmem must not advertise RDMA service authority")
+    if "s_ivshmem_transport.rdma_unregister_region = nullptr;" not in init:
+        fail("raw ivshmem has no registered service backing to revoke")
+    for forbidden in ("rdma_bitmap", "rdma_base", "IrqMailboxSlot", "wki_irq_fwd_doorbell_rx"):
+        if forbidden in source:
+            fail(f"raw shared backing or mailbox callback authority remains: {forbidden}")
+    require_order(function_body(source, "transmit"),
+                  ["shared_ring::write(", "if (RESULT.error != shared_ring::Error::none) return -1;", "priv->resources.ring("],
+                  "ordinary message publication precedes the hardware wake hint")
 
 
 def test_explicit_wki_boot_selection_reserves_the_single_ivshmem_device() -> None:
@@ -119,7 +116,8 @@ def test_receive_capacity_includes_complete_authenticated_frame() -> None:
 
 def main() -> None:
     test_peer_ready_wait_deadline_is_saturating()
-    test_rdma_bitmap_allocation_and_free_are_irq_safe()
+    test_raw_bar_authority_fails_closed_without_effects()
+    test_secure_records_use_private_guarded_ring_boundary()
     test_explicit_wki_boot_selection_reserves_the_single_ivshmem_device()
     test_receive_capacity_includes_complete_authenticated_frame()
     test_shared_pci_owner_precedes_publication()
@@ -152,9 +150,7 @@ def test_shared_pci_owner_precedes_publication() -> None:
 
 def test_terminal_callback_coverage_and_deferred_irq() -> None:
     source = IVSHMEM_CPP.read_text()
-    for name in ("ivshmem_wki_tx", "ivshmem_wki_tx_pkt", "ivshmem_wki_set_rx_handler", "ivshmem_wki_rdma_register_region",
-                 "ivshmem_wki_rdma_read", "ivshmem_wki_rdma_write", "ivshmem_wki_doorbell", "drain_rx_ring", "ivshmem_wki_irq",
-                 "wki_ivshmem_rdma_alloc", "wki_ivshmem_rdma_free", "wki_ivshmem_rdma_ptr", "wki_ivshmem_irq_mailbox_write",
+    for name in ("ivshmem_wki_tx", "ivshmem_wki_tx_pkt", "ivshmem_wki_set_rx_handler", "drain_rx_ring", "ivshmem_wki_irq",
                  "wki_ivshmem_transport_poll"):
         if "CallbackGuard const GUARD" not in function_body(source, name):
             fail(f"{name} must own terminal callback admission")
@@ -181,6 +177,22 @@ def test_terminal_callback_coverage_and_deferred_irq() -> None:
             fail(f"{name} must own terminal callback admission")
     guard = (ROOT / "modules/kern/src/dev/ivshmem/callback.hpp").read_text()
     require_order(guard, ["KernelShutdownHold shutdown_", "lifecycle::Guard callback_"], "callback releases before shutdown ownership")
+
+
+
+
+def test_secure_records_use_private_guarded_ring_boundary() -> None:
+    source = IVSHMEM_CPP.read_text()
+    tx = function_body(source, "ivshmem_secure_tx")
+    require_order(tx, ["self != &s_ivshmem_transport", "!ivshmem_secure_record(data, len)",
+                      "priv != &s_ivshmem_priv", "priv->direct_peer == WKI_NODE_INVALID", "neighbor_id != priv->direct_peer",
+                      "CallbackGuard const GUARD", "if (!GUARD) return -1;", "return transmit(priv,"], "secure TX exact borrowed provider/peer")
+    require_order(function_body(source, "drain_rx_ring"), ["CallbackGuard const GUARD", "IvshmemFrame buf{};", "shared_ring::read(",
+                  "std::memcpy(&magic, buf.data()", "magic == rdma_protocol::MAGIC", "ivshmem_secure_record(buf.data(), LEN)",
+                  "wki_chaos_secure_rx_ingress(", "else if (auto handler"], "secure RX must classify complete private snapshots without ordinary fallback")
+    init = function_body(source, "wki_ivshmem_transport_init")
+    require_order(init, ["s_ivshmem_priv.direct_peer = configured_direct_peer()", "SECURE_PEER", "secure_kind = SECURE_PEER ?",
+                        "secure_tx = SECURE_PEER ?", "resources.activate(", "wki_transport_register("], "provisioned facet before publication")
 
 
 if __name__ == "__main__":

@@ -134,8 +134,13 @@ def test_stopped_pipe_pump_publishes_discard_fence() -> None:
     ]:
         if token not in finish:
             fail(f"stopped pump finisher is missing {token!r}")
-    if pump.count("collect_pipe_pump_retirement_locked(*arg, exp)") != 2 or pump.count("finish_pipe_pump_retirement(RETIREMENT)") != 2:
+    if pump.count("collect_pipe_pump_retirement_locked(*arg, exp)") != 2 or pump.count("finish_pipe_pump_retirement(RETIREMENT)") != 3:
         fail("both pre-read and post-read pump exits must publish the same retirement fence")
+    shutdown_collect = "collect_pipe_pump_retirement_locked(*arg, arg->exp.load(std::memory_order_acquire))"
+    require_order(pump, "std::exchange(arg->worker, nullptr)", shutdown_collect, "shutdown pump publication removal")
+    shutdown_prefix = pump[:pump.index("auto* exp = arg->exp.load")]
+    require_order(shutdown_prefix, shutdown_collect, "s_ipc_lock.unlock_irqrestore(IRQF)", "shutdown retirement unlock")
+    require_order(shutdown_prefix, "finish_pipe_pump_retirement(RETIREMENT)", "arg->stopped.store(true", "shutdown fence before stopped")
 
     flush = function_body(remote_ipc, "export_pipe_write_flush_thread_loop")
     for token in [
@@ -328,7 +333,7 @@ def test_pipe_fd_open_flags_preserve_nonblocking_access_mode() -> None:
         "if (res_type == ResourceType::IPC_PIPE && ACCESS_MODE != 0)",
         "exp->pump_pending_accept = plan.pump_on_accept[fd_key]",
         "entry.reserved1 = ipc_fd_export_open_flags(file->open_flags)",
-        "prepare_export_pipe_rdma(*exp, snapshot.prepared_backlogs[count], rdma_transport)",
+        "prepare_export_pipe_rdma(*exp, snapshot.prepared_backlogs[count], file)",
     ]
     missing = [token for token in export_required if token not in export_body]
     if missing:
@@ -341,7 +346,7 @@ def test_pipe_fd_open_flags_preserve_nonblocking_access_mode() -> None:
         "int const OPEN_FLAGS = ipc_fd_import_open_flags(entry.reserved1)",
         "uint16_t const ACCESS_MODE = ipc_fd_access_mode(OPEN_FLAGS)",
         "proxy_file->open_flags = OPEN_FLAGS",
-        "if (ACCESS_MODE != 0 && entry.rdma_rkey != 0 && entry.rdma_offset != 0 && WKI_IPC_PIPE_RDMA_DOORBELL_ENABLED)",
+        "if (ACCESS_MODE != 0 && entry.rdma_rkey != 0 && entry.rdma_offset == WKI_IPC_PIPE_RDMA_CAPACITY)",
         "if (ACCESS_MODE == 0)",
     ]
     missing = [token for token in attach_required if token not in attach_body]
@@ -387,16 +392,16 @@ def test_pipe_fd_open_flags_preserve_nonblocking_access_mode() -> None:
     if "auto proxy_pipe_write_rdma(ProxyIpcState* proxy, const uint8_t* src, size_t count, uint64_t callsite, bool nonblocking)" not in remote_ipc:
         fail("RDMA pipe write helper must receive nonblocking mode")
     rdma_body = function_body(remote_ipc, "proxy_pipe_write_rdma")
-    rdma_required = [
-        "acquire_proxy_pipe_rdma_writer(proxy, nonblocking)",
-        "return nonblocking ? -EAGAIN : -EINTR",
-        "if (nonblocking)",
-        "return sent != 0 ? static_cast<ssize_t>(sent) : static_cast<ssize_t>(-EAGAIN)",
-    ]
+    rdma_required = ["wki_secure_rdma_remote_grant(proxy->data_channel, rdma_protocol::Service::IPC",
+                     "wki_secure_rdma_read(proxy->data_channel, grant", "wki_secure_rdma_write(proxy->data_channel, grant",
+                     "WkiSecureRdmaOutcome::NO_EFFECT", "WkiSecureRdmaOutcome::EXACT",
+                     "pipe_secure_uncertain.store(true", "proxy->bytes_delivered.fetch_add(RESULT.bytes",
+                     "if (nonblocking || current_task_has_deliverable_signal()) break"]
     missing = [token for token in rdma_required if token not in rdma_body]
-    if missing:
-        fail("RDMA pipe writes must not sleep when the proxy fd is nonblocking: " + ", ".join(missing))
-    require_order(rdma_body, "if (nonblocking)", "ker::mod::sched::kern_sleep_us(SLEEP_US)", "RDMA nonblocking full-ring check")
+    if missing: fail("secure IPC native receipt/authority missing: " + ", ".join(missing))
+    if "kern_sleep" in rdma_body or "->rdma_" in rdma_body:
+        fail("secure IPC frontend must not restore raw callbacks or full-ring sleeps")
+    require_order(rdma_body, "wki_secure_rdma_write(", "bytes_delivered.fetch_add", "delivery only after joined native RESULT")
 
     write_body = function_body(remote_ipc, "proxy_pipe_write")
     write_required = [
@@ -648,7 +653,7 @@ def test_deferred_rdma_write_pins_retirement() -> None:
     predicate = function_body(source, "export_can_retire_locked")
     if "exp->pipe_write_in_flight" not in predicate:
         fail("retirement must respect a deferred writer's ring pointer")
-    begin = source.index("[[noreturn]] void export_pipe_write_flush_thread_loop(")
+    begin = source.index("void export_pipe_write_flush_thread_loop(")
     end = source.index("[[noreturn]] void export_pipe_write_flush_thread_0()", begin)
     worker = source[begin:end]
     require_order(worker, "exp->pipe_write_in_flight = true", "ssize_t const WRITE_RET = export_pipe_write_nonblocking(", "pin before unlocked VFS write")
@@ -661,26 +666,55 @@ def test_deferred_rdma_write_pins_retirement() -> None:
 def test_rdma_preparation_is_private_and_revoked_before_free() -> None:
     source = REMOTE_IPC_CPP.read_text()
     body = function_body(source, "prepare_export_pipe_rdma")
-    for forbidden in ["g_ipc_exports", "g_export_pipe_write_backlogs", "queue_export_pipe_write_flush_locked", "s_ipc_lock", "wake_"]:
-        if forbidden in body:
-            fail("private RDMA preparation cannot publish or queue: " + forbidden)
-    require_order(body, "exp.pipe_rdma_transport = transport", "transport->rdma_register_region(", "recovery metadata before callback")
-    if "&exp.pipe_rdma_rkey" not in body:
-        fail("registered key must stay in recovery-owned exporter")
+    for forbidden in ["g_ipc_exports", "g_export_pipe_write_backlogs", "queue_export_pipe_write_flush_locked", "wake_", "transport->"]:
+        if forbidden in body: fail("private secure preparation cannot publish or queue: " + forbidden)
+    require_order(body, "s_ipc_lock.unlock_irqrestore(IRQF)", "wki_secure_rdma_register_region(", "core outside metadata guard")
+    for token in ["vfs_is_pipe_file(file)", "rdma_protocol::Service::IPC", "PERMIT_READ | rdma_protocol::PERMIT_WRITE",
+                  "&exp, exp.pipe_secure_descriptor", "LIFETIME == UINT64_MAX"]:
+        if token not in body: fail("typed private pipe preparation missing " + token)
     release = function_body(source, "release_export_pipe_rdma")
-    require_order(release, "rdma_unregister_region(", "delete[] region", "revoke before backing memory free")
-    if "release_export_pipe_rdma(*retired)" not in function_body(source, "free_retired_exports"):
-        fail("committed export retirement must revoke registered memory")
+    require_order(release, "wki_secure_rdma_unregister_region(", "delete[] region", "close/drain before backing free")
+    if "!= 0) return false" not in release: fail("failed reclaim must retain backing")
+    retire = function_body(source, "free_retired_exports")
+    if "g_secure_retired_exports = retired" not in retire: fail("registered context must remain on task retirement chain")
+    drain = function_body(source, "service_secure_retired_exports")
+    require_order(drain, "s_ipc_lock.unlock_irqrestore(IRQF)", "release_export_pipe_rdma(*retired)", "reclaim outside IPC guard")
+    if "g_secure_retired_exports = retired" not in drain: fail("BUSY must retain/requeue context")
     export = function_body(source, "wki_ipc_export_task_fds")
-    require_order(export, "prepare_export_pipe_rdma(", "g_ipc_exports.push_back(exp)", "finish preparation before publishing any export")
+    require_order(export, "prepare_export_pipe_rdma(", "g_ipc_exports.push_back(exp)", "finish private prep before publication")
     tail = export[export.index("g_ipc_exports.push_back(exp)"):]
     if "new " in tail or "reserve_capacity(" in tail or "rdma_register_region(" in tail:
         fail("publication cannot allocate or invoke preparation callbacks")
     tail = tail[tail.index("s_ipc_lock.unlock_irqrestore(irqf)"):]
-    if "exp->" in tail or "backlog->" in tail:
-        fail("published pointer cannot survive registry unlock")
+    if "exp->" in tail or "backlog->" in tail: fail("published pointer cannot survive registry unlock")
     if "IpcRegistry<ExportPipeWriteBacklog> g_export_pipe_write_backlogs" not in source:
-        fail("prepared backlog publication cannot allocate registry storage")
+        fail("backlog publication cannot allocate registry storage")
+
+
+def test_secure_pipe_native_prefix_is_owner_authoritative() -> None:
+    source = REMOTE_IPC_CPP.read_text()
+    for forbidden in ["transport->rdma_read", "transport->rdma_write", "transport->rdma_register_region", "transport->doorbell",
+                      "WKI_IPC_PIPE_RDMA_DOORBELL_ENABLED", "header->head", "header->tail"]:
+        if forbidden in source: fail("raw pipe memory authority remains: " + forbidden)
+    arm = function_body(source, "ipc_secure_arm")
+    for token in ["ipc_channels_live", "pipe_secure_activated", "pipe_secure_epoch", "request.peer_node",
+                  "memcmp(&request.grant", "intent.head == exp->pipe_bytes_received", "intent.credit == ipc_secure_credit_locked",
+                  "pipe_secure_reserved = true", "file->refcount.fetch_add"]:
+        if token not in arm: fail("native exact ARM policy missing " + token)
+    effect = function_body(source, "ipc_secure_effect")
+    require_order(effect, "s_ipc_lock.unlock_irqrestore(IRQF)", "export_pipe_write_nonblocking(", "native write outside guards")
+    require_order(effect, "export_pipe_write_nonblocking(", "pipe_bytes_delivered += PREFIX", "actual VFS prefix before receipt")
+    for token in ["++epoch->active_workers", "release_ipc_dev_op_worker_locked", "WRITTEN == -EAGAIN", "WkiSecureRdmaOutcome::UNCERTAIN"]:
+        if token not in effect: fail("native effect drain/error policy missing " + token)
+    if "static_cast<uint16_t>(request.length), false)" not in effect:
+        fail("secure IPC effect cannot allocate/reclaim by growing native pipe")
+    native_write = function_body(source, "export_pipe_write_nonblocking")
+    if "IS_PIPE && grow_capacity" not in native_write:
+        fail("ordinary native pipe growth must remain separately opt-in")
+    writer = function_body(source, "proxy_pipe_write")
+    require_order(writer, "acquire_proxy_pipe_rdma_writer(", "proxy_pipe_write_rdma(", "whole-call writer loan")
+    if "ProxyPipeWriterLoan writer" not in writer: fail("ordinary zero-effect fallback must retain writer serialization")
+    if "return false" not in function_body(source, "wki_ipc_doorbell_rx"): fail("raw doorbell must fail closed")
 
 
 def test_export_admission_precedes_side_effects() -> None:
@@ -1521,7 +1555,36 @@ def test_original_export_channels_survive_submission_and_cleanup() -> None:
     if re.search(r"\bwki_send\(", source): fail("IPC must not send through numeric replacement lookup")
 
 
+def test_consumer_workers_retire_before_shutdown_drain() -> None:
+    source = REMOTE_IPC_CPP.read_text()
+    flush = function_body(source, "export_pipe_write_flush_thread_loop")
+    require_order(flush, "hold_kernel_shutdown()", "kernel_threads_shutdown_requested()", "flush shutdown hold")
+    require_order(flush, "std::exchange(g_export_pipe_write_flush_tasks.at(shard), nullptr)", "worker->release()", "flush publication retirement")
+    require_order(flush, "worker->release()", "g_export_pipe_write_flush_stopped.at(shard).store(true", "flush stopped publication")
+    pump = function_body(source, "pipe_pump_thread_fn")
+    require_order(pump, "hold_kernel_shutdown()", "kernel_threads_shutdown_requested()", "pump shutdown hold")
+    if "ker::vfs::vfs_is_socket_file(file) || ker::vfs::vfs_is_pipe_file(file)" not in pump:
+        fail("native pipe readiness races must use the private nonblocking File view")
+    require_order(pump, "init_nonblocking_pipe_write_view(view, *file)", "view.fops->vfs_read(&view", "nonblocking native pipe read")
+    native_vfs = (ROOT / "modules/kern/src/vfs/core.cpp").read_text()
+    native_pipe_read = native_vfs[native_vfs.index("static auto pipe_read ="):native_vfs.index("static auto pipe_write =")]
+    nonblocking = native_pipe_read[native_pipe_read.index("if (f->open_flags & O_NONBLOCK)"):native_pipe_read.index("auto* current_task =")]
+    require_order(nonblocking, "st->lock.unlock_irqrestore(IRQF)", "return finish(-EAGAIN)", "native pipe returns without waiting")
+    require_order(native_pipe_read, "return finish(-EAGAIN)", "pipe_register_waiter(st->readers_waiting", "native nonblocking branch before wait registration")
+    assign = function_body(source, "assign_next_pipe_pump_locked")
+    require_order(assign, "kernel_threads_shutdown_requested()", "pop_pipe_pump_queue_locked()", "no successor after global shutdown")
+    wake = function_body(source, "wake_export_pipe_write_flush_worker")
+    require_order(wake, "try_acquire_lifetime_ref()", "s_ipc_lock.unlock_irqrestore", "flush retained wake")
+    require_order(wake, "s_ipc_lock.unlock_irqrestore", "kern_wake(task)", "flush wake outside guard")
+    drain = function_body(source, "wki_ipc_secure_shutdown_drain")
+    for token in ["g_ipc_shutdown_drain_owner.compare_exchange_strong", "!g_ipc_flush_workers_starting", "arg.starting", "arg.stopped.load", "g_export_pipe_write_flush_stopped.at(shard).load", "g_ipc_exports.size() == 0", "g_export_pipe_write_backlogs.size() == 0"]:
+        if token not in drain:
+            fail(f"consumer shutdown certificate missing {token!r}")
+    require_order(drain, "if (!stopped)", "service_secure_retired_exports()", "stopped exclusive retirement owner")
+
+
 def main() -> None:
+    test_consumer_workers_retire_before_shutdown_drain()
     test_original_export_channels_survive_submission_and_cleanup()
     test_data_and_queued_close_channel_retirement()
     test_ipc_epoch_control_identities()
@@ -1545,6 +1608,7 @@ def main() -> None:
     test_export_snapshot_pins_and_cloexec_are_safe()
     test_export_registry_publication_cannot_allocate()
     test_rdma_preparation_is_private_and_revoked_before_free()
+    test_secure_pipe_native_prefix_is_owner_authoritative()
     test_deferred_rdma_write_pins_retirement()
     test_submission_guard_covers_preparation_and_failure_transfer()
     test_export_admission_precedes_side_effects()

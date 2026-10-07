@@ -70,6 +70,7 @@
 #include "net/wki/remote_net.hpp"
 #include "net/wki/remote_vfs.hpp"
 #include "net/wki/routing.hpp"
+#include "net/wki/secure_rdma.hpp"
 #include "net/wki/wire.hpp"
 #include "net/wki/wki.hpp"
 #include "platform/mm/paging.hpp"
@@ -4088,6 +4089,8 @@ auto generate_wki_chaos(char* buf, size_t bufsz) -> size_t {
     append_dec64(p, end, counters.released);
     append_sconst(p, end, " coalesced=");
     append_dec64(p, end, counters.coalesced);
+    append_sconst(p, end, " secure_pressure_drops=");
+    append_dec64(p, end, snapshot.secure_pressure_drops);
     append_char(p, end, '\n');
 
     for (size_t i = 0; i < rule_count; ++i) {
@@ -4484,6 +4487,64 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {  // NOLINT(readab
     append_sconst(p, end, " expanding=");
     append_bool01(p, end, pool.expand_in_progress);
     append_char(p, end, '\n');
+
+    ker::net::wki::WkiSecureRdmaDiagnostics secure{};
+    bool const SECURE_COMPLETE = ker::net::wki::wki_secure_rdma_diagnostics(secure);
+    append_sconst(p, end, "wki_secure_rdma complete=");
+    append_bool01(p, end, SECURE_COMPLETE);
+    if (SECURE_COMPLETE) {
+        append_sconst(p, end, " queued_records=");
+        append_dec64(p, end, secure.queued_records);
+        append_sconst(p, end, " live_regions=");
+        append_dec64(p, end, secure.live_regions);
+        append_sconst(p, end, " region_references=");
+        append_dec64(p, end, secure.region_references);
+        append_sconst(p, end, " region_claims=");
+        append_dec64(p, end, secure.region_claims);
+        append_sconst(p, end, " live_operations=");
+        append_dec64(p, end, secure.live_operations);
+        append_sconst(p, end, " live_keys=");
+        append_dec64(p, end, secure.live_keys);
+        append_sconst(p, end, " replay_windows=");
+        append_dec64(p, end, secure.replay_windows);
+        append_sconst(p, end, " consumer_pins=");
+        append_dec64(p, end, secure.consumer_pins);
+        append_sconst(p, end, " pending_revocations=");
+        append_dec64(p, end, secure.pending_revocations);
+    }
+    append_char(p, end, '\n');
+    if (SECURE_COMPLETE) {
+        for (size_t index = 0; index < secure.client_completions.size(); ++index) {
+            append_sconst(p, end, "wki_secure_rdma_client transport=");
+            append_dec64(p, end, index / 4 + 1);
+            append_sconst(p, end, " service=");
+            append_dec64(p, end, index % 4 + 1);
+            append_sconst(p, end, " completions=");
+            append_dec64(p, end, secure.client_completions[index]);
+            append_sconst(p, end, " bytes=");
+            append_dec64(p, end, secure.client_bytes[index]);
+            append_sconst(p, end, " read_completions=");
+            append_dec64(p, end, secure.client_read_completions[index]);
+            append_sconst(p, end, " read_bytes=");
+            append_dec64(p, end, secure.client_read_bytes[index]);
+            append_sconst(p, end, " write_completions=");
+            append_dec64(p, end, secure.client_write_completions[index]);
+            append_sconst(p, end, " write_bytes=");
+            append_dec64(p, end, secure.client_write_bytes[index]);
+            append_char(p, end, '\n');
+        }
+        constexpr std::array REASONS{"none",       "length",         "version",   "field",     "identity", "session",
+                                     "domain",     "authentication", "counter",   "duplicate", "too_old",  "grant",
+                                     "permission", "range",          "operation", "fragment",  "retired",  "pressure"};
+        static_assert(REASONS.size() == static_cast<size_t>(ker::net::wki::rdma_protocol::Drop::COUNT));
+        for (size_t index = 0; index < REASONS.size(); ++index) {
+            append_sconst(p, end, "wki_secure_rdma_drop reason=");
+            append_sconst(p, end, REASONS[index]);
+            append_sconst(p, end, " count=");
+            append_dec64(p, end, secure.drops[index]);
+            append_char(p, end, '\n');
+        }
+    }
 
     ker::net::BacklogSnapshot backlog{};
     ker::net::backlog_get_snapshot(backlog);
@@ -5114,6 +5175,20 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {  // NOLINT(readab
             append_bool01(p, end, row.bulk_capable);
             append_sconst(p, end, " bulk_max=");
             append_dec64(p, end, row.bulk_max_transfer);
+            append_sconst(p, end, " secure_compatible=");
+            append_bool01(p, end, row.secure_block_compatible);
+            append_sconst(p, end, " secure_uncertain=");
+            append_bool01(p, end, row.secure_block_write_uncertain);
+            append_sconst(p, end, " secure_attempts=");
+            append_dec64(p, end, row.secure_block_attempts);
+            append_sconst(p, end, " secure_completions=");
+            append_dec64(p, end, row.secure_block_completions);
+            append_sconst(p, end, " secure_bytes=");
+            append_dec64(p, end, row.secure_block_bytes);
+            append_sconst(p, end, " secure_fallbacks=");
+            append_dec64(p, end, row.secure_block_fallbacks);
+            append_sconst(p, end, " secure_transport=");
+            append_dec64(p, end, static_cast<uint8_t>(row.secure_block_transport));
             append_char(p, end, '\n');
         }
         delete[] block_proxy_rows;
@@ -5167,6 +5242,10 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {  // NOLINT(readab
             append_bool01(p, end, row.block_read_only);
             append_sconst(p, end, " writer_lease=");
             append_bool01(p, end, row.block_writer_lease_owned);
+            append_sconst(p, end, " secure_context=");
+            append_bool01(p, end, row.block_secure_context);
+            append_sconst(p, end, " native_busy=");
+            append_bool01(p, end, row.block_native_busy);
             append_sconst(p, end, " rdma=");
             append_bool01(p, end, row.blk_rdma_active);
             append_sconst(p, end, " roce=");

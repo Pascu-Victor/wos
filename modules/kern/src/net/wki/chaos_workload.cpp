@@ -17,6 +17,7 @@
 #include <net/wki/remotable.hpp>
 #include <net/wki/remote_net.hpp>
 #include <net/wki/remote_vfs.hpp>
+#include <net/wki/secure_zone_workload.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -42,6 +43,8 @@ enum class WorkloadOp : uint8_t {
     BLOCK,
     BLOCK_DISCOVERED,
     BLOCK_RDMA_DISCOVERED,
+    ZONE,
+    ZONE_RDMA,
     NET_ATTACH,
     NET_ATTACH_DISCOVERED,
     NET_QUERY,
@@ -114,6 +117,13 @@ struct WorkloadResult {
     bool ring_geometry_valid = false;
     bool ring_indices_valid = false;
     bool ring_quiescent = false;
+    uint64_t secure_attempts = 0;
+    uint64_t secure_completions = 0;
+    uint64_t secure_bytes = 0;
+    uint64_t secure_fallbacks = 0;
+    bool secure_write_uncertain = false;
+    bool secure_measurement_complete = false;
+    WkiSecureZoneWorkloadResult zone{};
     bool compute_hold = false;
     ComputePublishStage compute_stage = ComputePublishStage::NONE;
     uint32_t compute_waiters = 0;
@@ -376,6 +386,14 @@ auto parse_command(const char* command, size_t len, WorkloadCommand* out) -> boo
     }
     if (std::strcmp(verb, "clear") == 0) {
         return tokens.next() == nullptr;
+    }
+    if (std::strcmp(verb, "zone") == 0 || std::strcmp(verb, "zone-rdma") == 0) {
+        out->op = std::strcmp(verb, "zone") == 0 ? WorkloadOp::ZONE : WorkloadOp::ZONE_RDMA;
+        uint64_t zone_id = 0, bytes = 0;
+        return parse_owner(tokens, out) && parse_key_decimal(tokens.next(), "zone", UINT32_MAX, &zone_id) && zone_id != 0 &&
+               parse_key_decimal(tokens.next(), "bytes", WKI_SECURE_ZONE_WORKLOAD_MAX_BYTES, &bytes) && bytes != 0 &&
+               parse_key_decimal(tokens.next(), "pattern", UINT64_MAX, &out->pattern) && tokens.next() == nullptr &&
+               ((out->resource = static_cast<uint32_t>(zone_id)), (out->blocks = static_cast<uint16_t>(bytes)), true);
     }
     if (std::strcmp(verb, "block") == 0) {
         out->op = WorkloadOp::BLOCK;
@@ -792,11 +810,10 @@ auto run_block(const WorkloadCommand& command) -> int {  // NOLINT(readability-f
     s_result.ring_geometry_valid = proxy.ring_geometry_valid;
     s_result.ring_indices_valid = proxy.ring_indices_valid;
     s_result.exact_binding = EXACT;
-    bool const RING_BUSY =
-        REQUIRE_RDMA && (proxy.data_slot_bitmap != 0 || proxy.tag_bitmap != 0 || proxy.ring_indices.sq_head != proxy.ring_indices.sq_tail ||
-                         proxy.ring_indices.cq_head != proxy.ring_indices.cq_tail);
-    if (!EXACT || proxy.rdma_attached != REQUIRE_RDMA ||
-        (REQUIRE_RDMA && (!proxy.ring_geometry_valid || !proxy.ring_indices_valid || proxy.rdma_zone_id == 0)) || RING_BUSY) {
+    // Raw shared SQ/CQ is permanently disabled. Qualification below uses exact
+    // authenticated completions; attach availability alone proves no data I/O.
+    bool const RING_BUSY = proxy.rdma_attached || proxy.rdma_zone_id != 0 || proxy.data_slot_bitmap != 0 || proxy.tag_bitmap != 0;
+    if (!EXACT || RING_BUSY) {
         wki_dev_proxy_detach_block(device);
         s_result.detached = true;
         if (!EXACT) {
@@ -829,6 +846,20 @@ auto run_block(const WorkloadCommand& command) -> int {  // NOLINT(readability-f
     std::array<uint8_t, BLOCK_TRANSFER_BYTES_MAX> observed{};
     fill_pattern(&pattern, BYTES, command.pattern);
 
+    WkiDevProxyDiagRow measured_before{};
+    if (REQUIRE_RDMA) {
+        int const WARM_READ = dev::block_read(device, command.lba, command.blocks, baseline.data());
+        bool complete = false;
+        bool const WARM_SNAPSHOT = snapshot_block_proxy(command, &measured_before, true, &complete) && complete &&
+                                   block_binding_exact(command, resource, measured_before, &channel_before);
+        if (WARM_READ != 0 || !WARM_SNAPSHOT) {
+            wki_dev_proxy_detach_block(device);
+            s_result.detached = true;
+            return WARM_READ != 0 ? WARM_READ : -ESTALE;
+        }
+        s_result.channel_tx_seq_before = channel_before.tx_seq;
+    }
+
     s_result.read_status = dev::block_read(device, command.lba, command.blocks, baseline.data());
     if (s_result.read_status == 0) {
         s_result.write_status = dev::block_write(device, command.lba, command.blocks, pattern.data());
@@ -851,12 +882,21 @@ auto run_block(const WorkloadCommand& command) -> int {  // NOLINT(readability-f
             }
         }
 
-        // The bridge never leaves test data behind, including after an
-        // injected failure. Restoration uses only the captured scratch range.
-        int const RESTORE_WRITE = dev::block_write(device, command.lba, command.blocks, baseline.data());
-        int const RESTORE_FLUSH = RESTORE_WRITE == 0 ? dev::block_flush(device) : RESTORE_WRITE;
-        s_result.restore_status = RESTORE_WRITE != 0 ? RESTORE_WRITE : RESTORE_FLUSH;
-        s_result.restored = s_result.restore_status == 0;
+        WkiDevProxyDiagRow before_restore{};
+        bool complete = false;
+        bool const UNCERTAIN = REQUIRE_RDMA && (!snapshot_block_proxy(command, &before_restore, true, &complete) || !complete ||
+                                                !before_restore.io_detail_complete || before_restore.secure_block_write_uncertain);
+        if (UNCERTAIN) {
+            // The scratch device is RAM-only. Preserve the receipt and detach;
+            // a missing completion never permits a same-binding restore write.
+            s_result.restore_status = -EIO;
+            s_result.secure_write_uncertain = true;
+        } else {
+            int const RESTORE_WRITE = dev::block_write(device, command.lba, command.blocks, baseline.data());
+            int const RESTORE_FLUSH = RESTORE_WRITE == 0 ? dev::block_flush(device) : RESTORE_WRITE;
+            s_result.restore_status = RESTORE_WRITE != 0 ? RESTORE_WRITE : RESTORE_FLUSH;
+            s_result.restored = s_result.restore_status == 0;
+        }
     }
 
     WkiChannelDiag channel_after{};
@@ -874,8 +914,13 @@ auto run_block(const WorkloadCommand& command) -> int {  // NOLINT(readability-f
         s_result.data_slots_after = post_io.data_slot_bitmap;
         s_result.tags_after = post_io.tag_bitmap;
         s_result.ring_after = post_io.ring_indices;
-        s_result.ring_geometry_valid = s_result.ring_geometry_valid && post_io.ring_geometry_valid;
-        s_result.ring_indices_valid = s_result.ring_indices_valid && post_io.ring_indices_valid;
+        s_result.secure_attempts = post_io.secure_block_attempts - measured_before.secure_block_attempts;
+        s_result.secure_completions = post_io.secure_block_completions - measured_before.secure_block_completions;
+        s_result.secure_bytes = post_io.secure_block_bytes - measured_before.secure_block_bytes;
+        s_result.secure_fallbacks = post_io.secure_block_fallbacks - measured_before.secure_block_fallbacks;
+        s_result.secure_write_uncertain = s_result.secure_write_uncertain || post_io.secure_block_write_uncertain;
+        s_result.rdma = post_io.secure_block_completions != 0;
+        s_result.rdma_roce = post_io.secure_block_transport == rdma_protocol::Transport::ROCE;
         s_result.ring_quiescent = post_io.data_slot_bitmap == 0 && post_io.tag_bitmap == 0 &&
                                   post_io.ring_indices.sq_head == post_io.ring_indices.sq_tail &&
                                   post_io.ring_indices.cq_head == post_io.ring_indices.cq_tail;
@@ -888,15 +933,48 @@ auto run_block(const WorkloadCommand& command) -> int {  // NOLINT(readability-f
     block_snapshot_complete = false;
     s_result.detached = !snapshot_block_proxy(command, &remaining, true, &block_snapshot_complete) && block_snapshot_complete;
 
-    bool const SAFE_WRITE_REJECTION = s_result.read_status == 0 && s_result.write_status != 0 && s_result.verify_status == 0 &&
-                                      s_result.verified && s_result.restore_status == 0 && s_result.restored;
+    bool const SAFE_WRITE_REJECTION = !s_result.secure_write_uncertain && s_result.read_status == 0 && s_result.write_status != 0 &&
+                                      s_result.verify_status == 0 && s_result.verified && s_result.restore_status == 0 && s_result.restored;
     int result = SAFE_WRITE_REJECTION ? 0
                                       : first_error({s_result.read_status, s_result.write_status, s_result.flush_status,
                                                      s_result.verify_status, s_result.restore_status});
-    if (result == 0 && (!s_result.exact_binding || !s_result.verified || !s_result.restored || !s_result.detached ||
-                        (REQUIRE_RDMA && !s_result.ring_quiescent))) {
+    if (result == 0 &&
+        (!s_result.exact_binding || !s_result.verified || !s_result.restored || !s_result.detached ||
+         (REQUIRE_RDMA && (!s_result.ring_quiescent || s_result.secure_completions != 4 || s_result.secure_bytes != BYTES * 4 ||
+                           s_result.secure_fallbacks != 0 || post_io.secure_block_transport == rdma_protocol::Transport::NONE)))) {
         result = -EIO;
     }
+    return result;
+}
+
+auto run_zone(const WorkloadCommand& command) -> int {
+    s_result = {};
+    s_result.op = command.op;
+    s_result.owner = command.owner;
+    s_result.resource = command.resource;
+    s_result.bytes = command.blocks;
+    WkiSecureRdmaDiagnostics before{}, after{};
+    bool const BEFORE_COMPLETE = wki_secure_rdma_diagnostics(before);
+    int result = wki_secure_zone_workload_run(command.owner, command.resource, command.blocks, command.pattern, s_result.zone,
+                                              command.op == WorkloadOp::ZONE_RDMA);
+    bool const AFTER_COMPLETE = wki_secure_rdma_diagnostics(after);
+    s_result.write_status = s_result.zone.write_status;
+    s_result.read_status = s_result.zone.read_status;
+    s_result.verified = s_result.zone.verified;
+    s_result.detached = s_result.zone.destroyed;
+    s_result.secure_measurement_complete = BEFORE_COMPLETE && AFTER_COMPLETE;
+    if (s_result.secure_measurement_complete) {
+        uint64_t const ROCE = after.client_completions[0] - before.client_completions[0];
+        uint64_t const IV = after.client_completions[4] - before.client_completions[4];
+        s_result.secure_completions = ROCE + IV;
+        s_result.secure_bytes = after.client_bytes[0] - before.client_bytes[0] + after.client_bytes[4] - before.client_bytes[4];
+        s_result.rdma = ROCE == 2 || IV == 2;
+        s_result.rdma_roce = ROCE == 2;
+    }
+    if (result == 0 && command.op == WorkloadOp::ZONE_RDMA &&
+        (!s_result.secure_measurement_complete || !s_result.rdma || s_result.secure_completions != 2 ||
+         s_result.secure_bytes != static_cast<uint64_t>(command.blocks) * 2))
+        result = -EOPNOTSUPP;
     return result;
 }
 
@@ -1207,6 +1285,10 @@ auto op_name(WorkloadOp op) -> const char* {
             return "block-discovered";
         case WorkloadOp::BLOCK_RDMA_DISCOVERED:
             return "block-rdma-discovered";
+        case WorkloadOp::ZONE:
+            return "zone";
+        case WorkloadOp::ZONE_RDMA:
+            return "zone-rdma";
         case WorkloadOp::NET_ATTACH:
             return "net-attach";
         case WorkloadOp::NET_ATTACH_DISCOVERED:
@@ -1393,6 +1475,10 @@ auto wki_chaos_workload_configure(const char* command, size_t len) -> int {
         case WorkloadOp::BLOCK_RDMA_DISCOVERED:
             result = run_block(execution);
             break;
+        case WorkloadOp::ZONE:
+        case WorkloadOp::ZONE_RDMA:
+            result = run_zone(execution);
+            break;
         case WorkloadOp::NET_ATTACH:
         case WorkloadOp::NET_ATTACH_DISCOVERED:
             result = run_net_attach(execution);
@@ -1462,7 +1548,11 @@ auto wki_chaos_workload_snapshot(char* out, size_t capacity) -> size_t {
         "rdma_zone=%u data_slots_before=%llu data_slots_after=%llu tags_before=%llu tags_after=%llu ring_ready=%u sq_depth=%u "
         "cq_depth=%u data_slot_count=%u data_slot_size=%u ring_block_size=%u ring_total_blocks=%llu sq_head_before=%u "
         "sq_tail_before=%u cq_head_before=%u cq_tail_before=%u sq_head_after=%u sq_tail_after=%u cq_head_after=%u "
-        "cq_tail_after=%u ring_geometry_valid=%u ring_indices_valid=%u ring_quiescent=%u vfs_lanes=",
+        "cq_tail_after=%u ring_geometry_valid=%u ring_indices_valid=%u ring_quiescent=%u "
+        "secure_attempts=%llu secure_completions=%llu secure_bytes=%llu secure_fallbacks=%llu secure_write_uncertain=%u "
+        "secure_measurement_complete=%u zone_create_status=%d zone_prepare_status=%d zone_destroy_status=%d zone_created=%u "
+        "zone_destroyed=%u "
+        "zone_written_bytes=%u zone_read_bytes=%u zone_mismatch_offset=%u vfs_lanes=",
         ENABLED ? 1U : 0U, SCRATCH_REGISTERED ? 1U : 0U, op_name(result.op), result.status, static_cast<unsigned>(result.owner),
         result.resource, static_cast<unsigned long long>(result.generation), result.owner_incarnation.owner_boot_epoch,
         result.owner_incarnation.resource_incarnation, static_cast<unsigned>(result.channel), result.channel_generation,
@@ -1482,7 +1572,12 @@ auto wki_chaos_workload_snapshot(char* out, size_t capacity) -> size_t {
         static_cast<unsigned long long>(result.ring_geometry.total_blocks), result.ring_before.sq_head, result.ring_before.sq_tail,
         result.ring_before.cq_head, result.ring_before.cq_tail, result.ring_after.sq_head, result.ring_after.sq_tail,
         result.ring_after.cq_head, result.ring_after.cq_tail, result.ring_geometry_valid ? 1U : 0U, result.ring_indices_valid ? 1U : 0U,
-        result.ring_quiescent ? 1U : 0U);
+        result.ring_quiescent ? 1U : 0U, static_cast<unsigned long long>(result.secure_attempts),
+        static_cast<unsigned long long>(result.secure_completions), static_cast<unsigned long long>(result.secure_bytes),
+        static_cast<unsigned long long>(result.secure_fallbacks), result.secure_write_uncertain ? 1U : 0U,
+        result.secure_measurement_complete ? 1U : 0U, result.zone.create_status, result.zone.prepare_status, result.zone.destroy_status,
+        result.zone.created ? 1U : 0U, result.zone.destroyed ? 1U : 0U, result.zone.written_bytes, result.zone.read_bytes,
+        result.zone.mismatch_offset);
     if (WRITTEN < 0) {
         out[0] = '\0';
         return 0;
@@ -1543,6 +1638,10 @@ auto wki_chaos_workload_selftest_parser_and_bounds() -> bool {
     constexpr char INVALID_COMPUTE_HOLD[] = "compute-publish hold=2";
     constexpr char VALID_BLOCK_DISCOVERED[] = "block-discovered owner=1 lba=4 blocks=8 pattern=5";
     constexpr char VALID_BLOCK_RDMA_DISCOVERED[] = "block-rdma-discovered owner=1 lba=4 blocks=8 pattern=5";
+    constexpr char VALID_ZONE[] = "zone owner=1 zone=25 bytes=4096 pattern=7";
+    constexpr char VALID_ZONE_RDMA[] = "zone-rdma owner=1 zone=25 bytes=1 pattern=7";
+    constexpr char INVALID_ZONE_ZERO[] = "zone owner=1 zone=0 bytes=1 pattern=7";
+    constexpr char INVALID_ZONE_OVERSIZE[] = "zone owner=1 zone=25 bytes=4097 pattern=7";
     constexpr char VALID_NET_DISCOVERED[] = "net-attach-discovered owner=1 name=wkc7";
     constexpr char VALID_NET_QUERY_DISCOVERED[] = "net-query-discovered owner=1";
     constexpr char VALID_NET_DETACH_DISCOVERED[] = "net-detach-discovered owner=1";
@@ -1573,7 +1672,11 @@ auto wki_chaos_workload_selftest_parser_and_bounds() -> bool {
            parse_command(VALID_BLOCK_DISCOVERED, sizeof(VALID_BLOCK_DISCOVERED) - 1, &command) &&
            command.op == WorkloadOp::BLOCK_DISCOVERED &&
            parse_command(VALID_BLOCK_RDMA_DISCOVERED, sizeof(VALID_BLOCK_RDMA_DISCOVERED) - 1, &command) &&
-           command.op == WorkloadOp::BLOCK_RDMA_DISCOVERED &&
+           command.op == WorkloadOp::BLOCK_RDMA_DISCOVERED && parse_command(VALID_ZONE, sizeof(VALID_ZONE) - 1, &command) &&
+           command.op == WorkloadOp::ZONE && command.blocks == 4096 &&
+           parse_command(VALID_ZONE_RDMA, sizeof(VALID_ZONE_RDMA) - 1, &command) && command.op == WorkloadOp::ZONE_RDMA &&
+           !parse_command(INVALID_ZONE_ZERO, sizeof(INVALID_ZONE_ZERO) - 1, &command) &&
+           !parse_command(INVALID_ZONE_OVERSIZE, sizeof(INVALID_ZONE_OVERSIZE) - 1, &command) &&
            parse_command(VALID_NET_DISCOVERED, sizeof(VALID_NET_DISCOVERED) - 1, &command) &&
            command.op == WorkloadOp::NET_ATTACH_DISCOVERED &&
            parse_command(VALID_NET_QUERY_DISCOVERED, sizeof(VALID_NET_QUERY_DISCOVERED) - 1, &command) &&
