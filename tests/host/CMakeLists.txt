@@ -1852,6 +1852,10 @@ wos_add_unit_test(vfs_advisory_scope_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vfs_advisory_scope_test.cpp
 )
 
+wos_add_unit_test(wki_job_state_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_job_state_test.cpp
+)
+
 wos_add_unit_test(vfs_advisory_client_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vfs_advisory_client_test.cpp
 )
