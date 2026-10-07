@@ -216,6 +216,12 @@ auto vfs_statat(ker::mod::sched::task::Task* task, int dirfd, const char* pathna
 auto vfs_fstat(int fd, Stat* statbuf) -> int;
 // Stat an already-open file without allocating an FD or consulting task state.
 auto vfs_fstat_file(File* file, Stat* statbuf) -> int;
+// Exact retained TMPFS/XFS description, bypassing generic metadata caches.
+// Native sleeping serialization runs outside registry locks; errors preserve out.
+auto vfs_fstat_file_native(File* file, Stat* out) -> int;
+// Native directory observation with backend namespace lifetime protection.
+// Caller owns a retained File and holds no backend/registry lock.
+auto vfs_readdir_file_native(File* file, struct DirEntry* out, size_t index) -> int;
 // Caller retains the exact native File. Failure preserves output and never
 // authorizes a cached result; unsupported/pending authority needs fresh I/O.
 auto vfs_file_coherency_snapshot(File* file, coherency::Stamp& output) -> int;

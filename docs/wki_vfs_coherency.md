@@ -93,13 +93,14 @@ host cases and ten owner-version/append/positioned-I/O wire cases passed under
 ASan/UBSan, alongside 43 existing wire cases. Four additional production
 advisory-receipt cases passed, including 128 concurrent grant/cancel/retire
 races. Four production scope cases passed, including 128 concurrent close/
-retirement races. Four lock wire and three further scope wire cases passed (93 focused host
-cases total). Normal Build WOS and fast diagnostic KTEST compilation passed. Native
+retirement races. Four lock wire and three further scope wire cases passed, plus
+seven exact-observation framing/EOF/native-cookie cases (100 focused host cases
+total). Normal Build WOS and fast diagnostic KTEST compilation passed. Native
 tmpfs content/metadata/namespace and XFS committed-inode/data hooks now maintain
 private owner revisions; exact-open authenticated version requests use deferred
 owner work and strict reply framing. The version feature remains unadvertised.
 Isolated KTEST runs passed 73,270, 73,280, 73,282, 73,284, 73,301, 73,302 and
-73,304, 73,305, 73,306 and 73,307 assertions
+73,304, 73,305, 73,306, 73,307 and 73,361 assertions
 respectively, with zero failures. The second includes client cache-authority
 policy and an actual owner append fixture sharing native EOF with a local open,
 strict replay, stale-token rejection and retained-handle close behavior. The
@@ -211,3 +212,34 @@ retirement, including access, callback and stale-channel denials. The subsequent
 73,307-assertion run passed immediate-grant replay across higher shared-open
 queries and unlocks, all 64 terminal receipt slots, denial before a 65th effect,
 unlock progress at capacity, ACK recovery and successor preservation.
+
+Exact-owner fresh observations now have an additive unpublished protocol for
+stat, directory batches and EOF selection. All requests retain the complete
+ordinary-open token, binding, boot epoch and query nonce; replies echo the query
+and operation with a bounded exact body. Stat uses the retained native inode and
+bypasses generic metadata caches. TMPFS observes tree and inode data under the
+existing tree-to-inode lock order; XFS uses inode-to-metadata order. EOF selects
+fresh size plus a checked signed offset and preserves the native File position.
+Metadata and EOF do not require readable access; directory reads do.
+
+Directory observations hold native namespace protection while copying each
+record and bracket the batch with directory versions. A membership race returns
+`EAGAIN` without publishing entries. Batches follow opaque 64-bit `d_off`
+continuations through sparse tmpfs slots and XFS cookies. The client validates
+the complete batch, including native aligned record lengths and bounded names,
+before returning an entry. Filtered recursive-WKI views scan with native cookies
+and expose separate visible continuation ranks. This object-only reply grants no
+cache authority; version validation remains independent. Clients select these
+observations only with owner-version negotiation, keep fresh legacy fallback for
+older peers, and never downgrade an exact observation denial. Host validation
+passed. The 73,361-assertion run passed the actual TMPFS fixture with a proven
+poisoned generic cache hit, fresh native bypass, sparse cookies, pending
+publication denial, exact authority/access denials and retained unlinked
+metadata. The same run passed real mounted-XFS identity and versions across
+hardlinks, writes, append, truncate, chmod/chown, xattr, rename and unlink;
+exact metadata/EOF/directory observations preserved cookies above 32 bits and
+the retained inode's native device key. Its scoped POSIX wait/grant/cancel/ACK,
+old CLOSE successor protection, independent OFD/flock and exact registry
+retirement checks also passed, followed by clean native unmount. Client lock
+syscalls/outboxes and packet-level multi-client/recovery qualification remain
+required. New capabilities remain unadvertised.

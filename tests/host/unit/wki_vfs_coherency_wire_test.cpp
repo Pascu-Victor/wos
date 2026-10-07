@@ -1,9 +1,12 @@
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cerrno>
 #include <cstddef>
+#include <cstring>
 #include <net/wki/wire.hpp>
 #include <vfs/coherency.hpp>
+#include <vfs/owner_observation.hpp>
 
 using namespace ker::net::wki;
 namespace coherence = ker::vfs::coherency;
@@ -13,6 +16,230 @@ constexpr VfsOwnerFdRequest REQUEST{.fd = 7, .open_token = 13, .binding_id = 19,
 constexpr VfsVersionResponse RESPONSE{.query_id = 29, .object = 31, .content = 37, .metadata = 43, .directory = 41};
 constexpr VfsOwnerLockRequest LOCK_REQUEST{.owner = REQUEST, .process_generation = 47, .scope_token = 59, .pid = 53, .type = 1};
 }  // namespace
+
+TEST(WkiVfsCoherencyWire, ExactOwnerObservationRejectsMalformedAuthorityAndOperation) {
+    VfsOwnerObserveRequest const valid{.owner = REQUEST};
+    EXPECT_EQ(sizeof(valid), 64U);
+    EXPECT_EQ(sizeof(VfsOwnerObserveResponse), 40U);
+    EXPECT_EQ(OP_VFS_OBSERVE_OWNER, 0x0429U);
+    for (size_t length = 0; length <= 160; ++length) EXPECT_EQ(wki_vfs_owner_observe_request_valid(valid, length), length == sizeof(valid));
+    for (unsigned field = 0; field < 14; ++field) {
+        auto request = valid;
+        switch (field) {
+            case 0:
+                request.owner.version = 0;
+                break;
+            case 1:
+                request.owner.reserved = 1;
+                break;
+            case 2:
+                request.owner.fd = 0;
+                break;
+            case 3:
+                request.owner.open_token = 0;
+                break;
+            case 4:
+                request.owner.binding_id = 0;
+                break;
+            case 5:
+                request.owner.owner_boot_epoch = 0;
+                break;
+            case 6:
+                request.owner.reserved2 = 1;
+                break;
+            case 7:
+                request.owner.query_id = 0;
+                break;
+            case 8:
+                request.offset = 1;
+                break;
+            case 9:
+                request.index = 1;
+                break;
+            case 10:
+                request.count = 1;
+                break;
+            case 11:
+                request.operation = static_cast<VfsOwnerObservation>(4);
+                break;
+            case 12:
+                request.reserved = 1;
+                break;
+            default:
+                request.reserved2 = 1;
+                break;
+        }
+        EXPECT_FALSE(wki_vfs_owner_observe_request_valid(request, sizeof(request))) << field;
+    }
+    auto directory = valid;
+    directory.operation = VfsOwnerObservation::DIRECTORY;
+    directory.count = WKI_VFS_OWNER_DIRECTORY_MAX;
+    directory.index = UINT64_MAX;
+    EXPECT_TRUE(wki_vfs_owner_observe_request_valid(directory, sizeof(directory)));
+    directory.count = 0;
+    EXPECT_FALSE(wki_vfs_owner_observe_request_valid(directory, sizeof(directory)));
+    directory.count = WKI_VFS_OWNER_DIRECTORY_MAX + 1;
+    EXPECT_FALSE(wki_vfs_owner_observe_request_valid(directory, sizeof(directory)));
+    auto end = valid;
+    end.operation = VfsOwnerObservation::END_POSITION;
+    for (int64_t offset : {INT64_MIN, int64_t{-1}, int64_t{0}, INT64_MAX}) {
+        end.offset = offset;
+        EXPECT_TRUE(wki_vfs_owner_observe_request_valid(end, sizeof(end)));
+    }
+}
+
+TEST(WkiVfsCoherencyWire, ObservationReplyMustEchoExactNonceKindAndBody) {
+    VfsOwnerObserveRequest const request{.owner = REQUEST};
+    VfsOwnerObserveResponse const valid{.query_id = REQUEST.query_id, .object = 41, .body_length = WKI_VFS_OWNER_STAT_BYTES};
+    constexpr size_t LENGTH = sizeof(valid) + WKI_VFS_OWNER_STAT_BYTES;
+    EXPECT_TRUE(wki_vfs_owner_observe_response_valid(valid, request, LENGTH));
+    for (unsigned field = 0; field < 10; ++field) {
+        auto response = valid;
+        switch (field) {
+            case 0:
+                response.version = 0;
+                break;
+            case 1:
+                --response.length;
+                break;
+            case 2:
+                response.reserved = 1;
+                break;
+            case 3:
+                ++response.query_id;
+                break;
+            case 4:
+                response.object = 0;
+                break;
+            case 5:
+                response.value = 1;
+                break;
+            case 6:
+                response.operation = VfsOwnerObservation::END_POSITION;
+                break;
+            case 7:
+                response.reserved2 = 1;
+                break;
+            case 8:
+                response.count = 1;
+                break;
+            default:
+                --response.body_length;
+                break;
+        }
+        EXPECT_FALSE(wki_vfs_owner_observe_response_valid(response, request, LENGTH)) << field;
+    }
+    for (size_t length = 0; length <= LENGTH + 16; ++length)
+        EXPECT_EQ(wki_vfs_owner_observe_response_valid(valid, request, length), length == LENGTH);
+    for (int status : {-EAGAIN, -ESTALE, -EBADF}) {
+        EXPECT_TRUE(wki_vfs_owner_observe_reply_size_valid(status, 0, LENGTH));
+        EXPECT_FALSE(wki_vfs_owner_observe_reply_size_valid(status, sizeof(valid), LENGTH));
+    }
+    EXPECT_FALSE(wki_vfs_owner_observe_reply_size_valid(1, 0, LENGTH));
+    EXPECT_FALSE(wki_vfs_owner_observe_reply_size_valid(0, sizeof(valid) - 1, LENGTH));
+    EXPECT_FALSE(wki_vfs_owner_observe_reply_size_valid(0, LENGTH, LENGTH - 1));
+}
+
+TEST(WkiVfsCoherencyWire, DirectoryObservationBoundsCountAndEmptyEofWithoutRankTruncation) {
+    VfsOwnerObserveRequest const request{
+        .owner = REQUEST, .index = uint64_t{1} << 48, .count = WKI_VFS_OWNER_DIRECTORY_MAX, .operation = VfsOwnerObservation::DIRECTORY};
+    VfsOwnerObserveResponse response{.query_id = REQUEST.query_id, .object = 41, .operation = VfsOwnerObservation::DIRECTORY};
+    for (uint16_t count = 0; count <= request.count; ++count) {
+        response.count = count;
+        response.body_length = count * WKI_VFS_OWNER_DIRENT_BYTES;
+        EXPECT_TRUE(wki_vfs_owner_observe_response_valid(response, request, sizeof(response) + response.body_length));
+    }
+    ++response.count;
+    response.body_length += WKI_VFS_OWNER_DIRENT_BYTES;
+    EXPECT_FALSE(wki_vfs_owner_observe_response_valid(response, request, sizeof(response) + response.body_length));
+    response.count = 1;
+    response.body_length = WKI_VFS_OWNER_DIRENT_BYTES - 1;
+    EXPECT_FALSE(wki_vfs_owner_observe_response_valid(response, request, sizeof(response) + response.body_length));
+}
+
+TEST(WkiVfsCoherencyWire, EofSelectionChecksSignedBoundariesAndNeverPublishesErrorPosition) {
+    namespace observation = ker::vfs::owner_observation;
+    int64_t position = 71;
+    EXPECT_EQ(observation::seek_end(3, -4, position), -EINVAL);
+    EXPECT_EQ(position, 71);
+    EXPECT_EQ(observation::seek_end(-1, 0, position), -EIO);
+    EXPECT_EQ(position, 71);
+    EXPECT_EQ(observation::seek_end(INT64_MAX, 1, position), -EOVERFLOW);
+    EXPECT_EQ(position, 71);
+    EXPECT_EQ(observation::seek_end(INT64_MAX, INT64_MIN, position), -EINVAL);
+    EXPECT_EQ(position, 71);
+    EXPECT_EQ(observation::seek_end(INT64_MAX, 0, position), 0);
+    EXPECT_EQ(position, INT64_MAX);
+    EXPECT_EQ(observation::seek_end(7, -7, position), 0);
+    EXPECT_EQ(position, 0);
+    EXPECT_EQ(observation::seek_end(7, 5, position), 0);
+    EXPECT_EQ(position, 12);
+}
+
+TEST(WkiVfsCoherencyWire, EofReplyHasNoBodyAndDirectoryRecordUsesNativeNameLength) {
+    VfsOwnerObserveRequest const request{.owner = REQUEST, .offset = -7, .operation = VfsOwnerObservation::END_POSITION};
+    VfsOwnerObserveResponse response{
+        .query_id = REQUEST.query_id, .object = 41, .value = INT64_MAX, .operation = VfsOwnerObservation::END_POSITION};
+    EXPECT_TRUE(wki_vfs_owner_observe_response_valid(response, request, sizeof(response)));
+    response.value = -1;
+    EXPECT_FALSE(wki_vfs_owner_observe_response_valid(response, request, sizeof(response)));
+    response.value = 0;
+    response.body_length = 1;
+    EXPECT_FALSE(wki_vfs_owner_observe_response_valid(response, request, sizeof(response) + 1));
+    ker::vfs::DirEntry entry{};
+    entry.d_off = 19;
+    entry.d_reclen = ker::vfs::DIRENT_MIN_RECLEN;
+    EXPECT_TRUE(ker::vfs::owner_observation::directory_entry_valid(entry, 1));
+    // The NUL exists in the fixed wire image but lies outside its native record.
+    entry.d_name.fill('a');
+    entry.d_name.back() = '\0';
+    EXPECT_FALSE(ker::vfs::owner_observation::directory_entry_valid(entry, 1));
+}
+
+TEST(WkiVfsCoherencyWire, NativeDirectoryParserFollowsSparseAndLargeCookiesAndRejectsMalformedTail) {
+    namespace observation = ker::vfs::owner_observation;
+    constexpr uint64_t START = uint64_t{1} << 48;
+    std::array<ker::vfs::DirEntry, 3> entries{};
+    entries[0].d_off = START + 7;
+    entries[1].d_off = START + 53;
+    entries[2].d_off = UINT64_MAX;
+    for (auto& entry : entries) entry.d_reclen = sizeof(entry);
+    auto bytes = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(entries.data()), sizeof(entries));
+    uint64_t next = 97;
+    ASSERT_TRUE(observation::directory_end_cookie(bytes, entries.size(), START, next));
+    EXPECT_EQ(next, UINT64_MAX);
+    for (unsigned field = 0; field < 4; ++field) {
+        auto const saved = entries.back();
+        next = 97;
+        switch (field) {
+            case 0:
+                entries.back().d_off = entries[1].d_off;
+                break;
+            case 1:
+                entries.back().d_off = 0;
+                break;
+            case 2:
+                --entries.back().d_reclen;
+                break;
+            default:
+                entries.back().d_name.fill('a');
+                break;
+        }
+        EXPECT_FALSE(observation::directory_end_cookie(bytes, entries.size(), START, next)) << field;
+        EXPECT_EQ(next, 97);
+        entries.back() = saved;
+    }
+    EXPECT_FALSE(observation::directory_end_cookie(bytes.first(bytes.size() - 1), entries.size(), START, next));
+    EXPECT_TRUE(observation::directory_end_cookie({}, 0, UINT64_MAX, next));
+    EXPECT_EQ(next, UINT64_MAX);
+}
+
+TEST(WkiVfsCoherencyWire, DirectoryEndMarkersNeverConvertOtherBackendErrorsToEmptySuccess) {
+    for (int status : {0, -1, -ENOENT, -EIO, -EINVAL, -EBADF, -EAGAIN, -EOPNOTSUPP}) {
+        EXPECT_EQ(ker::vfs::owner_observation::directory_eof(status, true), status == -ENOENT);
+        EXPECT_EQ(ker::vfs::owner_observation::directory_eof(status, false), status == -1);
+    }
+}
 
 TEST(WkiVfsCoherencyWire, OwnerLockRequestRejectsMalformedIdentityAndIntentBeforeAdmission) {
     EXPECT_EQ(sizeof(VfsOwnerLockRequest), 96U);

@@ -1535,6 +1535,16 @@ auto tmpfs_clone_exec_file(File* source, File** output) -> int {
     return 0;
 }
 
+auto tmpfs_stat_file_native(File* file, uint32_t dev_id, Stat* out) -> int {
+    if (file == nullptr || out == nullptr || file->fops != get_tmpfs_fops()) return -EINVAL;
+    auto* node = tmpfs_canonical_node(static_cast<TmpNode*>(file->private_data));
+    if (node == nullptr) return -EBADF;
+    ker::mod::sys::MutexGuard tree_guard(tmpfs_lock);
+    ker::mod::sys::MutexGuard io_guard(node->io_lock);
+    tmpfs_fill_stat_locked(node, dev_id, out);
+    return 0;
+}
+
 auto tmpfs_stat_node(const TmpNode* node, uint32_t dev_id, Stat* out) -> int {
     if (out == nullptr) return -EINVAL;
     if (node == nullptr) return -EBADF;
@@ -2821,5 +2831,11 @@ ker::vfs::FileOperations tmpfs_fops_instance = {
 }  // namespace
 
 auto get_tmpfs_fops() -> ker::vfs::FileOperations* { return &tmpfs_fops_instance; }
+
+auto tmpfs_readdir_file_native(File* file, DirEntry* out, size_t index) -> int {
+    if (file == nullptr || out == nullptr || file->fops != get_tmpfs_fops()) return -EINVAL;
+    ker::mod::sys::MutexGuard tree_guard(tmpfs_lock);
+    return tmpfs_fops_readdir(file, out, index);
+}
 
 }  // namespace ker::vfs::tmpfs

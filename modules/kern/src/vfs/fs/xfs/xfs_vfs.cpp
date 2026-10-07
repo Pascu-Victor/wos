@@ -5864,6 +5864,16 @@ auto xfs_clone_exec_file(File* source, File** output) -> int {
     return 0;
 }
 
+auto xfs_stat_file_native(File* file, ker::vfs::Stat* out) -> int {
+    if (file == nullptr || out == nullptr || file->fops != get_xfs_fops()) return -EINVAL;
+    auto* data = static_cast<XfsFileData*>(file->private_data);
+    if (data == nullptr || data->inode == nullptr || data->mount == nullptr) return -EBADF;
+    ker::mod::sys::MutexGuard io_guard(data->inode->io_lock);
+    XfsMetadataGuard metadata_guard(data->mount, true, WOS_PERF_CALLSITE());
+    fill_stat(data->inode, out);
+    return 0;
+}
+
 auto xfs_fstat(File* f, ker::vfs::Stat* statbuf) -> int {
     if (f == nullptr || statbuf == nullptr) {
         return -EINVAL;

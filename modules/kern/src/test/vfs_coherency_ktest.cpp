@@ -1,9 +1,15 @@
 #include <cstdint>
+#include <cstring>
+#include <dev/block_device.hpp>
 #include <memory>
+#include <net/wki/remote_vfs.hpp>
+#include <platform/security/credential_record.hpp>
 #include <test/ktest.hpp>
 #include <vfs/coherency.hpp>
 #include <vfs/file.hpp>
 #include <vfs/fs/tmpfs.hpp>
+#include <vfs/fs/xfs/xfs_mount.hpp>
+#include <vfs/fs/xfs/xfs_vfs.hpp>
 #include <vfs/vfs.hpp>
 
 namespace coherence = ker::vfs::coherency;
@@ -104,7 +110,98 @@ struct FileCloser {
 };
 using OwnedFile = std::unique_ptr<ker::vfs::File, FileCloser>;
 
+struct XfsOwnerFixture {
+    ker::vfs::xfs::XfsMountContext* mount = nullptr;
+    ~XfsOwnerFixture() {
+        if (mount == nullptr) return;
+        auto const ROOT = ker::mod::security::Snapshot::bootstrap_root();
+        for (const char* path : {"/ktest_owner_xfs26/a", "/ktest_owner_xfs26/b", "/ktest_owner_xfs26/c", "/ktest_owner_xfs26/moved"})
+            static_cast<void>(ker::vfs::xfs::xfs_unlink_path(ROOT, path, mount));
+        static_cast<void>(ker::vfs::xfs::xfs_rmdir_path(ROOT, "/ktest_owner_xfs26", mount));
+        int const STATUS = ker::vfs::xfs::xfs_unmount(mount);
+        KEXPECT_EQ(STATUS, 0);
+        if (STATUS != 0) ker::vfs::xfs::xfs_unmount_force(mount);
+    }
+};
+
 }  // namespace
+
+KTEST(VfsCoherency, MountedXfsNativeOwnerObservationsVersionsScopesAndRetirement) {
+    namespace vfs = ker::vfs;
+    namespace xfs = ker::vfs::xfs;
+    XfsOwnerFixture fixture;
+    auto* device = ker::dev::block_device_find_by_name("sdb2");
+    KREQUIRE_NE(device, nullptr);
+    KREQUIRE_EQ(xfs::xfs_mount(device, false, &fixture.mount), 0);
+    KREQUIRE_NE(fixture.mount, nullptr);
+    auto const ROOT = ker::mod::security::Snapshot::bootstrap_root();
+    KREQUIRE_EQ(xfs::xfs_mkdir_path(ROOT, "/ktest_owner_xfs26", 0700, fixture.mount), 0);
+    OwnedFile directory(xfs::xfs_open_path(ROOT, "/ktest_owner_xfs26", vfs::O_DIRECTORY, 0, fixture.mount));
+    KREQUIRE_NE(directory.get(), nullptr);
+    coherence::Stamp directory_before{}, directory_after{};
+    KREQUIRE_EQ(vfs::vfs_file_coherency_snapshot(directory.get(), directory_before), 0);
+    OwnedFile owner(xfs::xfs_open_path(ROOT, "/ktest_owner_xfs26/a", vfs::O_CREAT | vfs::O_EXCL | 2, 0600, fixture.mount));
+    OwnedFile hole(xfs::xfs_open_path(ROOT, "/ktest_owner_xfs26/b", vfs::O_CREAT | vfs::O_EXCL | 2, 0600, fixture.mount));
+    KREQUIRE_NE(owner.get(), nullptr);
+    KREQUIRE_NE(hole.get(), nullptr);
+    KREQUIRE_EQ(xfs::xfs_link_path(ROOT, "/ktest_owner_xfs26/a", "/ktest_owner_xfs26/c", fixture.mount), 0);
+    OwnedFile alias(xfs::xfs_open_path(ROOT, "/ktest_owner_xfs26/c", 2, 0, fixture.mount));
+    OwnedFile probe(xfs::xfs_open_path(ROOT, "/ktest_owner_xfs26/a", 2, 0, fixture.mount));
+    KREQUIRE_NE(alias.get(), nullptr);
+    KREQUIRE_NE(probe.get(), nullptr);
+    KREQUIRE_EQ(xfs::xfs_unlink_path(ROOT, "/ktest_owner_xfs26/b", fixture.mount), 0);
+    hole.reset();
+    KREQUIRE_EQ(vfs::vfs_file_coherency_snapshot(directory.get(), directory_after), 0);
+    KEXPECT_EQ(directory_after.object, directory_before.object);
+    KEXPECT_TRUE(directory_after.directory > directory_before.directory);
+    coherence::Stamp before{}, after{}, linked{};
+    KREQUIRE_EQ(vfs::vfs_file_coherency_snapshot(owner.get(), before), 0);
+    KREQUIRE_EQ(vfs::vfs_file_coherency_snapshot(alias.get(), linked), 0);
+    KEXPECT_EQ(linked.object, before.object);
+    KREQUIRE_EQ(vfs::vfs_pwrite_file(owner.get(), "abc", 3, 0), ssize_t{3});
+    KREQUIRE_EQ(vfs::vfs_file_coherency_snapshot(alias.get(), after), 0);
+    KEXPECT_EQ(after.object, before.object);
+    KEXPECT_TRUE(after.content > before.content);
+    KEXPECT_TRUE(after.metadata > before.metadata);
+    before = after;
+    size_t offset = 99;
+    KREQUIRE_EQ(vfs::vfs_append_file_native(alias.get(), "de", 2, &offset), ssize_t{2});
+    KEXPECT_EQ(offset, size_t{3});
+    KREQUIRE_EQ(vfs::vfs_ftruncate_file(owner.get(), 2), 0);
+    KREQUIRE_EQ(vfs::vfs_pwrite_file(owner.get(), "cde", 3, 2), ssize_t{3});
+    KREQUIRE_EQ(vfs::vfs_file_coherency_snapshot(owner.get(), after), 0);
+    KEXPECT_TRUE(after.content > before.content);
+    before = after;
+    KREQUIRE_EQ(xfs::xfs_fchmod(owner.get(), ROOT, 0640), 0);
+    KREQUIRE_EQ(xfs::xfs_fchown(owner.get(), ROOT, 17, 19), 0);
+    constexpr char VALUE[] = "revision";
+    KREQUIRE_EQ(xfs::xfs_setxattr_path(ROOT, "/ktest_owner_xfs26/a", "user.owner26", VALUE, sizeof(VALUE) - 1, 0, fixture.mount), 0);
+    KREQUIRE_EQ(vfs::vfs_file_coherency_snapshot(alias.get(), after), 0);
+    KEXPECT_EQ(after.object, before.object);
+    KEXPECT_TRUE(after.metadata > before.metadata);
+    // A generic mount view must not replace the retained inode mount's dev key.
+    owner->mount_dev_id = 0xFEEEBEEF;
+    alias->mount_dev_id = 0xFEEEBEEE;
+    owner->pos = 91;
+    KREQUIRE_TRUE(ker::net::wki::wki_remote_vfs_selftest_xfs_owner_files(owner.get(), alias.get(), directory.get(), probe.get()));
+    KEXPECT_EQ(owner->pos, off_t{91});
+    KREQUIRE_EQ(xfs::xfs_rename_path(ROOT, "/ktest_owner_xfs26/a", "/ktest_owner_xfs26/moved", fixture.mount), 0);
+    KREQUIRE_EQ(xfs::xfs_unlink_path(ROOT, "/ktest_owner_xfs26/c", fixture.mount), 0);
+    KREQUIRE_EQ(xfs::xfs_unlink_path(ROOT, "/ktest_owner_xfs26/moved", fixture.mount), 0);
+    vfs::Stat stat{};
+    KREQUIRE_EQ(vfs::vfs_fstat_file_native(owner.get(), &stat), 0);
+    KEXPECT_EQ(stat.st_dev, uint64_t{fixture.mount->dev_id});
+    KEXPECT_EQ(stat.st_size, off_t{5});
+    KEXPECT_EQ(stat.st_nlink, uint64_t{0});
+    KEXPECT_EQ(stat.st_uid, uint32_t{17});
+    KEXPECT_EQ(stat.st_gid, uint32_t{19});
+    KREQUIRE_EQ(vfs::vfs_file_coherency_snapshot(owner.get(), linked), 0);
+    KEXPECT_EQ(linked.object, after.object);
+    KEXPECT_TRUE(linked.metadata > after.metadata);
+    KREQUIRE_EQ(vfs::vfs_file_coherency_snapshot(directory.get(), linked), 0);
+    KEXPECT_EQ(linked.object, directory_after.object);
+    KEXPECT_TRUE(linked.directory > directory_after.directory);
+}
 
 KTEST(VfsCoherency, NativeTmpfsVersionsFollowHardlinksAppendRenameAndUnlinkedHandles) {
     TmpfsVersionFixture cleanup;

@@ -485,6 +485,9 @@ auto wki_remote_vfs_selftest_completed_read_reply_retry() -> bool;
 auto wki_remote_vfs_selftest_owner_write_policy() -> bool;
 auto wki_remote_vfs_selftest_owner_file_lifetime() -> bool;
 auto wki_remote_vfs_selftest_owner_version_admission() -> bool;
+auto wki_remote_vfs_selftest_owner_observations() -> bool;
+auto wki_remote_vfs_selftest_xfs_owner_files(ker::vfs::File* owner, ker::vfs::File* alias, ker::vfs::File* directory, ker::vfs::File* probe)
+    -> bool;
 auto wki_remote_vfs_selftest_owner_append() -> bool;
 auto wki_remote_vfs_selftest_owner_committed_io() -> bool;
 auto wki_remote_vfs_selftest_owner_advisory() -> bool;

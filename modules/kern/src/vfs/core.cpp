@@ -784,16 +784,8 @@ auto advisory_build_key(File* file, AdvisoryFileKey& key, Stat* stat_out = nullp
 // before the advisory manager and remains valid after rename/unlink.
 auto advisory_build_remote_key(File* file, AdvisoryFileKey& key, Stat* stat = nullptr) -> int {
     Stat current{};
-    int status = -EOPNOTSUPP;
-    if (file->fs_type == FSType::TMPFS && file->fops == tmpfs::get_tmpfs_fops()) {
-        auto* node = static_cast<tmpfs::TmpNode*>(file->private_data);
-        if (node == nullptr) return -EBADF;
-        uint32_t const DEV = file->mount_dev_id != 0 ? file->mount_dev_id : file->mount_owner != nullptr ? file->mount_owner->dev_id : 0;
-        status = tmpfs::tmpfs_stat_node(node, DEV, &current);
-    } else if (file->fs_type == FSType::XFS && file->fops == xfs::get_xfs_fops()) {
-        status = xfs::xfs_fstat(file, &current);
-    }
-    if (status != 0) return status;
+    int const STATUS = vfs_fstat_file_native(file, &current);
+    if (STATUS != 0) return STATUS;
     if (current.st_ino == 0) return -EOPNOTSUPP;
     key = {.dev = current.st_dev, .ino = current.st_ino, .has_inode = true};
     if (stat != nullptr) *stat = current;
@@ -15215,6 +15207,37 @@ auto vfs_file_coherency_snapshot(File* file, coherency::Stamp& output) -> int {
         return tmpfs::tmpfs_coherency_snapshot(file, output) ? 0 : -EAGAIN;
     if (file->fs_type == FSType::XFS && file->fops == xfs::get_xfs_fops()) return xfs::xfs_coherency_snapshot(file, output) ? 0 : -EAGAIN;
     return -EOPNOTSUPP;
+}
+
+auto vfs_readdir_file_native(File* file, DirEntry* out, size_t index) -> int {
+    if (file == nullptr || out == nullptr) return -EINVAL;
+    int const ACCESS = ker::mod::security::authorize_file_description_access(static_cast<unsigned>(file->open_flags) & 3U, false);
+    if (ACCESS != 0) return ACCESS;
+    DirEntry candidate{};
+    int status = -EOPNOTSUPP;
+    if (file->fs_type == FSType::TMPFS && file->fops == tmpfs::get_tmpfs_fops()) {
+        status = tmpfs::tmpfs_readdir_file_native(file, &candidate, index);
+    } else if (file->fs_type == FSType::XFS && file->fops == xfs::get_xfs_fops()) {
+        status = file->fops->vfs_readdir(file, &candidate, index);
+    }
+    if (status == 0) *out = candidate;
+    return status;
+}
+
+auto vfs_fstat_file_native(File* file, Stat* out) -> int {
+    if (file == nullptr || out == nullptr) return -EINVAL;
+    Stat candidate{};
+    int status = -EOPNOTSUPP;
+    if (file->fs_type == FSType::TMPFS && file->fops == tmpfs::get_tmpfs_fops()) {
+        uint32_t const DEV = file->mount_dev_id != 0 ? file->mount_dev_id : file->mount_owner != nullptr ? file->mount_owner->dev_id : 0;
+        status = tmpfs::tmpfs_stat_file_native(file, DEV, &candidate);
+    } else if (file->fs_type == FSType::XFS && file->fops == xfs::get_xfs_fops()) {
+        status = xfs::xfs_stat_file_native(file, &candidate);
+    }
+    if (status == 0) {
+        *out = candidate;
+    }
+    return status;
 }
 
 auto vfs_fstat_file(File* file, Stat* statbuf) -> int {

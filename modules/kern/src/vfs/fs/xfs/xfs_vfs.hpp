@@ -185,6 +185,8 @@ auto xfs_readlink_path(const char* fs_path, char* buf, size_t bufsize, XfsMountC
 auto xfs_clone_exec_file(File* source, File** output) -> int;
 // Fstat an open file descriptor.
 auto xfs_fstat(File* f, ker::vfs::Stat* statbuf) -> int;
+// Caller retains File and holds neither inode I/O nor mount metadata lock.
+auto xfs_stat_file_native(File* file, ker::vfs::Stat* out) -> int;
 auto xfs_coherency_snapshot(File* file, coherency::Stamp& output) -> bool;
 auto xfs_coherency_identity(File* file) -> uint64_t;
 

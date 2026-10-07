@@ -239,6 +239,8 @@ auto tmpfs_stat_lookup(const TmpfsLookupHandle& handle, bool require_directory, 
 // Caller retains the node through a File or TmpfsNodeRef. The tree lock keeps
 // owner/group/mode coherent with metadata policy publication.
 auto tmpfs_stat_node(const TmpNode* node, uint32_t dev_id, ker::vfs::Stat* out) -> int;
+// Caller retains File and holds neither tree nor inode I/O lock.
+auto tmpfs_stat_file_native(File* file, uint32_t dev_id, ker::vfs::Stat* out) -> int;
 auto tmpfs_readlink_lookup(const TmpfsLookupHandle& handle, char* buf, size_t bufsize) -> ssize_t;
 auto tmpfs_open_lookup(const ker::mod::security::Snapshot& credentials, const TmpfsLookupHandle& handle, int flags, int mode,
                        bool require_directory, int* result_out = nullptr) -> ker::vfs::File*;
@@ -311,6 +313,7 @@ auto tmpfs_fops_isatty(ker::vfs::File* f) -> bool;
 
 // Get tmpfs FileOperations structure
 auto get_tmpfs_fops() -> ker::vfs::FileOperations*;
+auto tmpfs_readdir_file_native(File* file, DirEntry* out, size_t index) -> int;
 auto tmpfs_coherency_snapshot(File* file, coherency::Stamp& output) -> bool;
 auto tmpfs_coherency_identity(File* file) -> uint64_t;
 }  // namespace ker::vfs::tmpfs

@@ -1715,6 +1715,65 @@ constexpr auto wki_vfs_owner_scope_response_valid(const VfsOwnerScopeResponse& r
         return response.scope_token != 0 && (response.state == 1 || response.state == 2);
     return response.scope_token == request.scope_token && response.state == 2;
 }
+// Exact-open fresh observations. Object identity alone grants no cache lease.
+constexpr uint16_t OP_VFS_OBSERVE_OWNER = 0x0429;
+constexpr size_t WKI_VFS_OWNER_STAT_BYTES = 144;
+constexpr size_t WKI_VFS_OWNER_DIRENT_BYTES = 280;
+enum class VfsOwnerObservation : uint8_t { STAT = 1, DIRECTORY = 2, END_POSITION = 3 };
+struct VfsOwnerObserveRequest {
+    VfsOwnerFdRequest owner{};
+    int64_t offset = 0;
+    uint64_t index = 0;  // Opaque native continuation cookie, never a uint32 rank.
+    uint16_t count = 0;
+    VfsOwnerObservation operation = VfsOwnerObservation::STAT;
+    uint8_t reserved = 0;
+    uint32_t reserved2 = 0;
+} __attribute__((packed));
+static_assert(sizeof(VfsOwnerObserveRequest) == 64);
+struct VfsOwnerObserveResponse {
+    uint16_t version = WKI_VFS_OWNER_VERSION;
+    uint16_t length = sizeof(VfsOwnerObserveResponse);
+    uint32_t reserved = 0;
+    uint64_t query_id = 0;
+    uint64_t object = 0;
+    int64_t value = 0;  // Position for SEEK_END; zero for STAT/DIRECTORY.
+    VfsOwnerObservation operation = VfsOwnerObservation::STAT;
+    uint8_t reserved2 = 0;
+    uint16_t count = 0;
+    uint32_t body_length = 0;
+} __attribute__((packed));
+static_assert(sizeof(VfsOwnerObserveResponse) == 40);
+constexpr uint16_t WKI_VFS_OWNER_DIRECTORY_MAX =
+    (WKI_ETH_MAX_PAYLOAD - sizeof(DevOpRespPayload) - sizeof(VfsOwnerObserveResponse)) / WKI_VFS_OWNER_DIRENT_BYTES;
+constexpr auto wki_vfs_owner_observe_request_valid(const VfsOwnerObserveRequest& request, size_t length) -> bool {
+    if (length != sizeof(request) || !wki_vfs_owner_fd_request_valid(request.owner, sizeof(request.owner)) || request.reserved != 0 ||
+        request.reserved2 != 0)
+        return false;
+    if (request.operation == VfsOwnerObservation::DIRECTORY)
+        return request.offset == 0 && request.count != 0 && request.count <= WKI_VFS_OWNER_DIRECTORY_MAX;
+    return request.index == 0 && request.count == 0 &&
+           (request.operation == VfsOwnerObservation::END_POSITION ||
+            (request.operation == VfsOwnerObservation::STAT && request.offset == 0));
+}
+constexpr auto wki_vfs_owner_observe_reply_size_valid(int status, size_t length, size_t capacity) -> bool {
+    return status <= 0 && length <= capacity && (status == 0 ? length >= sizeof(VfsOwnerObserveResponse) : length == 0);
+}
+constexpr auto wki_vfs_owner_observe_response_valid(const VfsOwnerObserveResponse& response, const VfsOwnerObserveRequest& request,
+                                                    size_t length) -> bool {
+    if (!wki_vfs_owner_observe_request_valid(request, sizeof(request)) || length < sizeof(response) ||
+        response.version != WKI_VFS_OWNER_VERSION || response.length != sizeof(response) || response.reserved != 0 ||
+        response.reserved2 != 0 || response.object == 0 || response.query_id != request.owner.query_id ||
+        response.operation != request.operation || length != sizeof(response) + response.body_length ||
+        length > WKI_ETH_MAX_PAYLOAD - sizeof(DevOpRespPayload))
+        return false;
+    if (request.operation == VfsOwnerObservation::DIRECTORY)
+        return response.value == 0 && response.count <= request.count &&
+               response.body_length == response.count * WKI_VFS_OWNER_DIRENT_BYTES;
+    if (response.count != 0) return false;
+    return request.operation == VfsOwnerObservation::STAT ? response.value == 0 && response.body_length == WKI_VFS_OWNER_STAT_BYTES
+                                                          : response.value >= 0 && response.body_length == 0;
+}
+
 constexpr uint16_t WKI_VFS_OPEN_LIFETIME_VERSION = 1;
 struct VfsOpenLifetimeRequest {
     uint16_t version = WKI_VFS_OPEN_LIFETIME_VERSION;

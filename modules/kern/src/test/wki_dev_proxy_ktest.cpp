@@ -147,6 +147,10 @@ KTEST(WkiRemoteVfsCoherency, ExactOwnerVersionAuthorityDeniesStaleOpenAndRetains
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_owner_version_admission());
 }
 
+KTEST(WkiRemoteVfsCoherency, ExactNativeObservationsIgnorePoisonedCacheAndKeepSparseCookies) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_owner_observations());
+}
+
 KTEST(WkiRemoteVfsCoherency, OwnerAdvisoryAdapterDerivesScopeAndPreservesSharedOpenWaits) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_owner_advisory());
 }
