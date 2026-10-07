@@ -258,3 +258,24 @@ These fixtures simulate abandoned ownership phases; they do not kill a process
 parked on a contended detach mutex. Normal and isolated fast KTEST builds,
 formatting and existing advisory source-policy checks passed. Client advisory
 syscalls/outboxes and the packet-level matrix remain required for Goal 26.
+
+The client prerequisites now include fixed-capacity lifecycle controllers for
+process/inode scopes and acquisition receipts, with nonreused slot serials and
+short explicit RPC gates. Lost registration retains its original identity;
+close suppresses further grants while registration is uncertain. Confirmed close
+permits a successor while old users and ACK storage remain pinned. Cancellation
+preserves an already committed grant, and stale replies or gate releases cannot
+affect reused storage. Nine production-header host cases passed, including
+registration/close and cancel/grant races, alongside eight native scope/receipt
+regressions.
+
+Ordinary private-open preparation captures its reserved binding's validated
+feature reply before publication. A peer offering owner locks is identified
+while preparation still owns the File and cancellation record; unsupported
+native lock semantics leave the object identity unavailable. The actual remote
+File lifetime fixture passed in a further 73,361-assertion KTEST run and verified
+that a changed proxy feature observation cannot substitute lock support or
+trigger IDENTIFY on the captured non-lock binding. Normal and isolated fast
+KTEST builds and formatting passed. Negotiated IDENTIFY, live client dispatch,
+scope/operation outboxes and packet qualification remain required. The public
+remote advisory path still returns `EOPNOTSUPP`; no new capability is advertised.

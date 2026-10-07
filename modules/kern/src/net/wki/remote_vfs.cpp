@@ -1293,6 +1293,7 @@ struct OrdinaryCancellation {
     WkiChannelIdentity identity{};
     VfsOpenLifetimeRequest request{};  // CANCEL form; token assigned only after the proxy slot is held.
     uint32_t peer_boot_epoch = 0;
+    uint64_t owner_features = 0;
     uint64_t retry_after_us = 0;
 };
 std::array<OrdinaryCancellation, VFS_OPEN_CANCEL_CAPACITY> g_open_cancellations{};
@@ -4514,6 +4515,7 @@ auto prepare_ordinary_open_binding(ProxyVfsState* state) -> int {
     else {
         state->ordinary_open_binding_id = response.binding_id;
         state->ordinary_owner_boot_epoch = response.owner_boot_epoch;
+        state->ordinary_owner_features = features.features;
     }
     s_vfs_lock.unlock();
     return status;
@@ -4534,7 +4536,8 @@ auto reserve_ordinary_cancellation(ProxyVfsState* state) -> uint16_t {
                   .proxy = state,
                   .identity = proxy_channel_identity_locked(state),
                   .request = {.binding_id = state->ordinary_open_binding_id, .owner_boot_epoch = state->ordinary_owner_boot_epoch},
-                  .peer_boot_epoch = state->binding_peer_boot_epoch};
+                  .peer_boot_epoch = state->binding_peer_boot_epoch,
+                  .owner_features = state->ordinary_owner_features};
         state->open_file_refs.fetch_add(1, std::memory_order_release);
         s_vfs_lock.unlock();
         return static_cast<uint16_t>(i);
@@ -4600,6 +4603,7 @@ auto cancel_remote_ordinary_open(uint16_t slot, bool retry = false) -> int {
 // exit first quiesces proxy/wait references, then drains this intrusive list.
 // No registry allocation is needed, and cancellation uses the reserved outbox.
 enum class PinPurpose : uint8_t { DIRECTORY, EXECUTABLE, ORDINARY_OPEN };
+auto identify_private_ordinary_owner(RemoteFileContext& context) -> int;
 class PinPreparation;
 PinPreparation* g_pin_preparations = nullptr;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 #ifdef WOS_SELFTEST
@@ -4702,21 +4706,27 @@ class PinPreparation {
     }
     auto ordinary_slot() const -> uint16_t { return ordinary_slot_; }
 
+    // The private preparation remains linked through this observational RPC.
+    // Every ordinary descriptor must know its canonical object before another
+    // lane's process/inode scope can be released by closing this descriptor.
+    auto prepare_owner_identity() -> int {
+        s_vfs_lock.lock();
+        bool const READY = purpose_ == PinPurpose::ORDINARY_OPEN && ordinary_slot_ < g_open_cancellations.size() &&
+                           g_open_cancellations.at(ordinary_slot_).phase == ExecCancellationPhase::OWNED &&
+                           g_open_cancellations.at(ordinary_slot_).proxy == proxy_ &&
+                           g_open_cancellations.at(ordinary_slot_).request.token != 0;
+        if (READY) initialize_ordinary_context_locked();
+        s_vfs_lock.unlock();
+        return READY ? identify_private_ordinary_owner(*context_) : -ENOTCONN;
+    }
+
     // Success has initialized both objects. Transfer every ownership together;
     // no blocking operation separates this from caller output publication.
     auto publish() -> ker::vfs::File* {
         s_vfs_lock.lock();
+        initialize_ordinary_context_locked();
         unlink_locked();
         auto* result = std::exchange(file_, nullptr);
-        context_->ordinary_cancel_slot = ordinary_slot_;
-        if (ordinary_slot_ < g_open_cancellations.size()) {
-            auto const& record = g_open_cancellations.at(ordinary_slot_);
-            context_->ordinary_open_token = record.request.token;
-            context_->ordinary_open_binding_id = record.request.binding_id;
-            context_->ordinary_owner_boot_epoch = record.request.owner_boot_epoch;
-            context_->ordinary_resource_incarnation = proxy_->owner_incarnation.resource_incarnation;
-            context_->ordinary_resource_id = proxy_->resource_id;
-        }
         ordinary_slot_ = VFS_EXEC_CANCEL_SLOT_NONE;
         result->private_data = std::exchange(context_, nullptr);
         proxy_ = nullptr;
@@ -4746,6 +4756,18 @@ class PinPreparation {
     }
 
    private:
+    void initialize_ordinary_context_locked() {
+        context_->ordinary_cancel_slot = ordinary_slot_;
+        if (ordinary_slot_ >= g_open_cancellations.size()) return;
+        auto const& record = g_open_cancellations.at(ordinary_slot_);
+        context_->ordinary_open_token = record.request.token;
+        context_->ordinary_open_binding_id = record.request.binding_id;
+        context_->ordinary_owner_boot_epoch = record.request.owner_boot_epoch;
+        context_->ordinary_resource_incarnation = proxy_->owner_incarnation.resource_incarnation;
+        context_->ordinary_resource_id = proxy_->resource_id;
+        context_->owner_features = record.owner_features;
+        context_->owner_features_known = true;
+    }
     void link() {
         s_vfs_lock.lock();
         next_ = g_pin_preparations;
@@ -5266,6 +5288,33 @@ auto query_remote_owner_features(RemoteFileContext& context, WkiChannelIdentity&
         context.owner_features = response.features;
         context.owner_features_known = true;
     }
+    return 0;
+}
+
+auto identify_private_ordinary_owner(RemoteFileContext& context) -> int {
+    if ((context.owner_features & WKI_VFS_FEATURE_OWNER_LOCKS) == 0) return 0;
+    WkiChannelIdentity identity{};
+    int const AUTHORITY = capture_secure_vfs_client(context, identity);
+    if (AUTHORITY != 0) return AUTHORITY;
+    static ker::vfs::coherency::Counter queries;
+    uint64_t const QUERY = queries.take();
+    if (QUERY == 0) return -EOVERFLOW;
+    VfsOwnerScopeRequest const REQUEST{.owner = {.fd = context.remote_fd,
+                                                 .open_token = context.ordinary_open_token,
+                                                 .binding_id = context.ordinary_open_binding_id,
+                                                 .owner_boot_epoch = context.ordinary_owner_boot_epoch,
+                                                 .query_id = QUERY}};
+    VfsOwnerScopeResponse response{};
+    uint16_t length = 0;
+    int const STATUS = normalize_proxy_status_for_errno(
+        vfs_proxy_send_and_wait(context.proxy, OP_VFS_LOCK_SCOPE, reinterpret_cast<const uint8_t*>(&REQUEST), sizeof(REQUEST), &response,
+                                sizeof(response), &length, VFS_PROXY_OP_TIMEOUT_US, nullptr, nullptr, 0, false, &identity));
+    // Owner advisory semantics are restricted to its native TMPFS/XFS Files.
+    // Other backends may still be opened, with no advisory object authority.
+    if (STATUS == -EOPNOTSUPP) return 0;
+    if (STATUS != 0) return STATUS;
+    if (!wki_vfs_owner_scope_response_valid(response, REQUEST, length)) return -EPROTO;
+    context.advisory_object = response.object;
     return 0;
 }
 
@@ -9951,6 +10000,7 @@ auto wki_remote_vfs_selftest_open_lifetime_client() -> bool {
     proxy.binding_peer_boot_epoch = 83;
     proxy.ordinary_open_binding_id = 991;
     proxy.ordinary_owner_boot_epoch = 83;
+    proxy.ordinary_owner_features = WKI_VFS_FEATURE_OPEN_LIFETIME;
     proxy.open_file_refs = 1;
     struct Cleanup {
         ProxyVfsState* proxy;
@@ -10051,6 +10101,17 @@ auto wki_remote_vfs_selftest_open_lifetime_client() -> bool {
         file->vfs_path_heap_allocated = true;
         mount.open_files.fetch_add(1);
         file->mount_owner = &mount;
+        // Features belong to the reserved exact binding, not a later proxy
+        // observation. This private initialization must stay tracked and must
+        // not submit IDENTIFY when that captured peer did not offer locks.
+        uint64_t const FEATURES = proxy.ordinary_owner_features;
+        proxy.ordinary_owner_features = WKI_VFS_FEATURE_OWNER_LOCKS;
+        int const INITIALIZED = preparation.prepare_owner_identity();
+        proxy.ordinary_owner_features = FEATURES;
+        if (INITIALIZED != 0 || !context->owner_features_known || context->owner_features != FEATURES ||
+            context->ordinary_open_token != token || context->ordinary_open_binding_id != 991 || context->advisory_object != 0 ||
+            preparation.file() != file || preparation.context() != context)
+            return nullptr;
         return preparation.publish();
     };
     size_t const FINISHED = g_abandoned_ordinary_closes_finished.load();
@@ -15739,6 +15800,11 @@ auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode,
         ctx->bulk_cached_len = valid_prefetched_bytes;
     }
 
+    int const OWNER_IDENTITY = preparation.prepare_owner_identity();
+    if (OWNER_IDENTITY != 0) {
+        if (error != nullptr) *error = OWNER_IDENTITY;
+        return nullptr;
+    }
     if (error != nullptr) *error = 0;
     return preparation.publish();
 }
@@ -17154,6 +17220,8 @@ auto wki_remote_vfs_open_at(ker::vfs::File* directory, const char* relative_path
     prepared.is_directory = opened.is_directory != 0;
     prepared.pos = 0;
     prepared.dir_fs_count = static_cast<size_t>(-1);
+    int const OWNER_IDENTITY = preparation.prepare_owner_identity();
+    if (OWNER_IDENTITY != 0) return OWNER_IDENTITY;
     static_cast<void>(preparation.publish());
     return 0;
 }

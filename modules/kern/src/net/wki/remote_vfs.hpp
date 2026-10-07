@@ -9,6 +9,7 @@
 #include <net/wki/wki.hpp>
 #include <platform/sys/mutex.hpp>
 #include <platform/sys/spinlock.hpp>
+#include <vfs/advisory_client.hpp>
 #include <vfs/append_receipt.hpp>
 #include <vfs/coherency.hpp>
 #include <vfs/file.hpp>
@@ -166,6 +167,7 @@ struct ProxyVfsState {
     uint64_t op_lifetime_challenge = 0;
     uint64_t ordinary_next_token = 1;       // Protected by lock; assigned in operation-slot order, never wraps.
     uint64_t ordinary_open_binding_id = 0;  // Protected by s_vfs_lock; immutable after query.
+    uint64_t ordinary_owner_features = 0;   // Same exact binding's validated feature reply.
     uint32_t ordinary_owner_boot_epoch = 0;
     int16_t op_status = 0;
     void* op_resp_buf = nullptr;
@@ -292,7 +294,10 @@ struct RemoteFileContext {
     uint32_t ordinary_owner_boot_epoch = 0;
     uint32_t ordinary_resource_incarnation = 0;
     uint32_t ordinary_resource_id = 0;
-    bool owner_features_known = false;  // Exact open binding, protected by io_lock.
+    uint64_t advisory_object = 0;                        // Immutable native object, identified before publication; no cache authority.
+    ker::vfs::advisory_client::RpcGate advisory_gate{};  // Protected by s_vfs_lock, one RPC per claim.
+    ker::vfs::coherency::Counter advisory_operations{};  // Allocate in claimed gate order; never wrap.
+    bool owner_features_known = false;                   // Exact open binding, protected by io_lock.
     uint64_t owner_features = 0;
     // An accepted WRITE without an exact native result must never be replayed.
     int secure_write_error = 0;         // Protected by io_lock.
