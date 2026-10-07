@@ -210,6 +210,12 @@ extern wos_kasan_prepare_kernel_resume
 
     mov r14, rsp
     and rsp, -16
+%ifdef WOS_KASAN
+    ; Timer C++ frames on this reused incoming stack were abandoned. Preserve
+    ; the complete return block while clearing the scratch area below it.
+    mov rdi, rsp
+    call wos_kasan_prepare_kernel_resume
+%endif
     call wos_commit_handoff_task
     call wos_restore_return_task_fpu
     mov rdi, [r14 + GPREGS_SIZE] ; actual incoming iret RIP
@@ -289,6 +295,10 @@ extern wos_kasan_prepare_kernel_resume
     ; The stack below the prepared iret frame is scratch for the call.
     mov r14, rsp
     and rsp, -16
+%ifdef WOS_KASAN
+    mov rdi, rsp
+    call wos_kasan_prepare_kernel_resume
+%endif
     call wos_commit_handoff_task
     call wos_restore_return_task_fpu
     mov rdi, [r14] ; actual same-stack iret RIP
@@ -427,6 +437,10 @@ wos_asm_enter_usermode:
     mov r13, rsi
     mov r14, rsp
     and rsp, -16
+%ifdef WOS_KASAN
+    mov rdi, rsp
+    call wos_kasan_prepare_kernel_resume
+%endif
     call wos_restore_return_task_fpu
     mov rdi, r12
     mov esi, 4

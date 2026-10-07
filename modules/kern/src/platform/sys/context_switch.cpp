@@ -37,9 +37,9 @@
 
 namespace ker::mod::sys::context_switch {
 #ifdef WOS_KASAN
-// Called only from the final assembly return tail on the incoming stack.
+// Called from final kernel/user assembly return tails on the incoming stack.
 // A blocked task can reach idle without unwinding the timer's C++ frames;
-// their shadow must not poison later calls on the resumed task's stack.
+// clear only below the live resume/return block before any new C++ tail calls.
 extern "C" __attribute__((no_sanitize("address", "undefined", "coverage"))) void wos_kasan_prepare_kernel_resume(uint64_t resume_rsp) {
     auto* const TASK = sched::get_return_task();
     if (TASK == nullptr || !kasan::is_enabled()) return;
