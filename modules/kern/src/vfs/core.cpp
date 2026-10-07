@@ -49,6 +49,7 @@
 #include <vfs/stat.hpp>
 
 #include "advisory.hpp"
+#include "advisory_scope.hpp"
 #include "fd_reservation.hpp"
 #include "file.hpp"
 #include "filesystem_context.hpp"
@@ -438,12 +439,26 @@ struct RemoteAdvisoryAssociation {
     RemoteAdvisoryOwner owner{};
     uint64_t dev = 0;
     uint64_t ino = 0;
+    uint64_t scope_registration_operation = 0;
+    uint64_t scope_registration_token = 0;
+    uint64_t active_scope_token = 0;
 };
 // Fixed remote process/open membership. No registry pointer is retained.
 constexpr size_t REMOTE_ADVISORY_SCOPES_PER_OPEN = 32;
 constexpr size_t REMOTE_ADVISORY_PENDING_MAX = 64;
 size_t g_remote_advisory_pending = 0;
+struct RemoteAdvisoryWaitRecord {
+    File* file = nullptr;  // Row/I/O lifetime; final File destruction sweeps it.
+    RemoteAdvisoryReceipt receipt;
+};
+std::array<RemoteAdvisoryWaitRecord, REMOTE_ADVISORY_PENDING_MAX> g_remote_advisory_waits{};
 std::array<RemoteAdvisoryAssociation, 512> g_remote_advisory_associations{};
+struct RemoteAdvisoryScopeRecord {
+    File* witness = nullptr;  // Registry/I/O pin; swept before native File put.
+    RemoteAdvisoryScope scope;
+};
+std::array<RemoteAdvisoryScopeRecord, 512> g_remote_advisory_scopes{};
+constinit coherency::Counter g_remote_advisory_scope_tokens;
 // XFS serializes its on-disk namespace updates internally, but VFS publishes
 // the corresponding cache invalidation after the backend call returns. Keep
 // those two halves ordered so an older create cannot publish after a newer
@@ -1146,18 +1161,50 @@ void advisory_release_remote_process_locked(const RemoteAdvisoryOwner& owner, ui
     }
 }
 
-void advisory_release_remote_associations_locked(const File* file) {
-    for (auto& association : g_remote_advisory_associations) {
-        if (association.file != file) continue;
-        advisory_release_remote_process_locked(association.owner, association.dev, association.ino);
-        association = {};
+auto advisory_find_scope_locked(uint64_t token) -> RemoteAdvisoryScopeRecord* {
+    if (token == 0) return nullptr;
+    for (auto& record : g_remote_advisory_scopes) {
+        if (record.witness != nullptr && record.scope.snapshot().token == token) return &record;
+    }
+    return nullptr;
+}
+
+void advisory_close_scope_locked(RemoteAdvisoryScopeRecord& record) {
+    auto const SNAPSHOT = record.scope.snapshot();
+    auto const IDENTITY = record.scope.identity();
+    if (record.scope.close(SNAPSHOT.token, IDENTITY.owner) != RemoteAdvisoryScopeClaim::ACTIVE) return;
+    advisory_release_remote_process_locked(IDENTITY.owner, IDENTITY.dev, IDENTITY.ino);
+    for (auto& wait : g_remote_advisory_waits) {
+        if (wait.file == nullptr || wait.receipt.command().kind != RemoteAdvisoryKind::PROCESS ||
+            wait.receipt.command().scope_token != SNAPSHOT.token || !wait.receipt.waiting())
+            continue;
+        if (wait.receipt.complete(wait.receipt.operation(), {.status = -EINTR}, true)) --g_remote_advisory_pending;
     }
 }
 
-auto advisory_associate_remote_process_locked(File* file, const RemoteAdvisoryOwner& owner, const AdvisoryFileKey& key) -> int {
+void advisory_release_remote_associations_locked(const File* file) {
+    for (auto& association : g_remote_advisory_associations) {
+        if (association.file != file) continue;
+        if (association.active_scope_token != 0) {
+            auto* scope = advisory_find_scope_locked(association.active_scope_token);
+            if (scope != nullptr && scope->scope.identity().owner == association.owner) advisory_close_scope_locked(*scope);
+        } else {
+            advisory_release_remote_process_locked(association.owner, association.dev, association.ino);
+        }
+        association = {};
+    }
+    for (auto& scope : g_remote_advisory_scopes) {
+        if (scope.witness != file) continue;
+        advisory_close_scope_locked(scope);
+        scope = {};
+    }
+}
+
+auto advisory_associate_remote_process_locked(File* file, const RemoteAdvisoryOwner& owner, const AdvisoryFileKey& key,
+                                              RemoteAdvisoryAssociation** result = nullptr) -> int {
     RemoteAdvisoryAssociation* available = nullptr;
     size_t on_file = 0;
-    bool existing = false;
+    RemoteAdvisoryAssociation* existing = nullptr;
     for (auto& association : g_remote_advisory_associations) {
         if (association.file == nullptr) {
             if (available == nullptr) available = &association;
@@ -1169,11 +1216,16 @@ auto advisory_associate_remote_process_locked(File* file, const RemoteAdvisoryOw
             return -EPROTO;
         if (association.file != file) continue;
         ++on_file;
-        if (association.owner == owner) existing = true;
+        if (association.owner == owner) existing = &association;
     }
-    if (existing) return 0;
+    if (existing != nullptr) {
+        if (existing->dev != key.dev || existing->ino != key.ino) return -ESTALE;
+        if (result != nullptr) *result = existing;
+        return 0;
+    }
     if (on_file >= REMOTE_ADVISORY_SCOPES_PER_OPEN || available == nullptr) return -ENOLCK;
     *available = {.file = file, .owner = owner, .dev = key.dev, .ino = key.ino};
+    if (result != nullptr) *result = available;
     return 0;
 }
 
@@ -1182,7 +1234,12 @@ void advisory_release_file_owner_locks(File* file) {
         return;
     }
     g_advisory_lock_mutex.lock();
-    if (file->remote_advisory_receipt.retire()) --g_remote_advisory_pending;
+    static_cast<void>(file->remote_advisory_receipt.retire());
+    for (auto& wait : g_remote_advisory_waits) {
+        if (wait.file != file) continue;
+        if (wait.receipt.retire()) --g_remote_advisory_pending;
+        wait = {};
+    }
     advisory_release_remote_associations_locked(file);
     for (size_t i = 0; i < g_advisory_locks.size();) {
         const AdvisoryLock& lock = g_advisory_locks.at(i);
@@ -19588,6 +19645,132 @@ auto vfs_ftruncate(int fd, off_t length) -> int {
 }
 
 // --- fcntl ---
+auto vfs_advisory_process_generation(ker::mod::sched::task::Task& subject, bool assign) -> uint64_t {
+    auto* owner = subject.filesystem_owner();
+    if (owner == nullptr) return 0;
+    uint64_t generation = owner->advisory_process_generation.load(std::memory_order_acquire);
+    if (generation != 0 || !assign) return generation;
+    static constinit coherency::Counter generations;
+    uint64_t const RESERVED = generations.take();
+    if (RESERVED == 0) return owner->advisory_process_generation.load(std::memory_order_acquire);
+    if (owner->advisory_process_generation.compare_exchange_strong(generation, RESERVED, std::memory_order_acq_rel,
+                                                                   std::memory_order_acquire))
+        return RESERVED;
+    return generation;
+}
+
+auto vfs_advisory_remote_identity(File* file, uint64_t& output) -> int {
+    if (file == nullptr || file->fops == nullptr) return -EBADF;
+    uint64_t identity = 0;
+    if (file->fs_type == FSType::TMPFS && file->fops == tmpfs::get_tmpfs_fops())
+        identity = tmpfs::tmpfs_coherency_identity(file);
+    else if (file->fs_type == FSType::XFS && file->fops == xfs::get_xfs_fops())
+        identity = xfs::xfs_coherency_identity(file);
+    else
+        return -EOPNOTSUPP;
+    if (identity == 0) return -EOVERFLOW;
+    output = identity;
+    return 0;
+}
+
+namespace {
+auto advisory_scope_claim_error(RemoteAdvisoryScopeClaim claim) -> int {
+    return claim == RemoteAdvisoryScopeClaim::INVALID ? -EINVAL : claim == RemoteAdvisoryScopeClaim::MISMATCH ? -EPERM : -ESTALE;
+}
+
+auto advisory_registration_replay_locked(File* file, const RemoteAdvisoryOwner& owner, uint64_t operation,
+                                         RemoteAdvisoryScopeResult& output) -> int {
+    for (auto const& association : g_remote_advisory_associations) {
+        if (association.file != file || association.owner != owner || operation > association.scope_registration_operation) continue;
+        if (operation != association.scope_registration_operation) return -ESTALE;
+        auto* scope = advisory_find_scope_locked(association.scope_registration_token);
+        if (scope == nullptr) return -ESTALE;
+        auto const CLAIM = scope->scope.probe(association.scope_registration_token, owner);
+        if (CLAIM != RemoteAdvisoryScopeClaim::ACTIVE && CLAIM != RemoteAdvisoryScopeClaim::CLOSED)
+            return advisory_scope_claim_error(CLAIM);
+        output = scope->scope.snapshot();
+        return 0;
+    }
+    return -ENOENT;
+}
+}  // namespace
+
+auto vfs_advisory_remote_register_scope(File* witness, const RemoteAdvisoryOwner& owner, uint64_t operation,
+                                        RemoteAdvisoryScopeResult& output) -> int {
+    if (witness == nullptr) return -EBADF;
+    if (!owner.valid() || operation == 0) return -EINVAL;
+    {
+        ker::mod::sys::MutexGuard guard(g_advisory_lock_mutex);
+        if (witness->remote_advisory_closed.load(std::memory_order_acquire)) return -ENOTCONN;
+        int const REPLAY = advisory_registration_replay_locked(witness, owner, operation, output);
+        if (REPLAY != -ENOENT) return REPLAY;
+    }
+    AdvisoryFileKey key{};
+    if (int const STATUS = advisory_build_remote_key(witness, key); STATUS != 0) return STATUS;
+    uint64_t object = 0;
+    if (int const STATUS = vfs_advisory_remote_identity(witness, object); STATUS != 0) return STATUS;
+    RemoteAdvisoryScopeIdentity const IDENTITY{.owner = owner, .object = object, .dev = key.dev, .ino = key.ino};
+    ker::mod::sys::MutexGuard guard(g_advisory_lock_mutex);
+    if (witness->remote_advisory_closed.load(std::memory_order_acquire)) return -ENOTCONN;
+    int const REPLAY = advisory_registration_replay_locked(witness, owner, operation, output);
+    if (REPLAY != -ENOENT) return REPLAY;
+    RemoteAdvisoryScopeRecord* available = nullptr;
+    RemoteAdvisoryScopeRecord* active = nullptr;
+    for (auto& scope : g_remote_advisory_scopes) {
+        if (scope.witness == nullptr) {
+            if (available == nullptr) available = &scope;
+            continue;
+        }
+        auto const& existing = scope.scope.identity();
+        if (scope.scope.snapshot().state != RemoteAdvisoryScopeState::ACTIVE || existing.owner != owner || existing.dev != key.dev ||
+            existing.ino != key.ino)
+            continue;
+        if (scope.witness != witness || existing.object != object) return -EBUSY;
+        active = &scope;
+    }
+    if (active == nullptr && available == nullptr) return -ENOLCK;
+    RemoteAdvisoryAssociation* association = nullptr;
+    if (int const STATUS = advisory_associate_remote_process_locked(witness, owner, key, &association); STATUS != 0) return STATUS;
+    if (active == nullptr) {
+        uint64_t const TOKEN = g_remote_advisory_scope_tokens.take();
+        if (TOKEN == 0) return -EOVERFLOW;
+        if (!available->scope.initialize(TOKEN, IDENTITY)) return -EPROTO;
+        available->witness = witness;
+        active = available;
+    }
+    auto const RESULT = active->scope.snapshot();
+    association->scope_registration_operation = operation;
+    association->scope_registration_token = RESULT.token;
+    association->active_scope_token = RESULT.token;
+    output = RESULT;
+    return 0;
+}
+
+auto vfs_advisory_remote_close_scope(const RemoteAdvisoryOwner& owner, uint64_t token, RemoteAdvisoryScopeResult& output) -> int {
+    ker::mod::sys::MutexGuard guard(g_advisory_lock_mutex);
+    if (token == 0 || !owner.valid()) return -EINVAL;
+    auto* record = advisory_find_scope_locked(token);
+    if (record == nullptr) return -ESTALE;
+    auto const CLAIM = record->scope.probe(token, owner);
+    if (CLAIM != RemoteAdvisoryScopeClaim::ACTIVE && CLAIM != RemoteAdvisoryScopeClaim::CLOSED) return advisory_scope_claim_error(CLAIM);
+    advisory_close_scope_locked(*record);
+    output = record->scope.snapshot();
+    return 0;
+}
+
+auto vfs_advisory_remote_ack_scope(const RemoteAdvisoryOwner& owner, uint64_t token, RemoteAdvisoryScopeResult& output) -> int {
+    ker::mod::sys::MutexGuard guard(g_advisory_lock_mutex);
+    if (token == 0 || !owner.valid()) return -EINVAL;
+    auto* record = advisory_find_scope_locked(token);
+    if (record == nullptr) return -ESTALE;
+    auto const CLAIM = record->scope.probe(token, owner);
+    if (CLAIM == RemoteAdvisoryScopeClaim::ACTIVE) return -EBUSY;
+    if (CLAIM != RemoteAdvisoryScopeClaim::CLOSED) return advisory_scope_claim_error(CLAIM);
+    output = record->scope.snapshot();
+    *record = {};
+    return 0;
+}
+
 void vfs_advisory_remote_close_admission(File* file) {
     if (file != nullptr) file->remote_advisory_closed.store(true, std::memory_order_release);
 }
@@ -19639,17 +19822,39 @@ auto advisory_prepare_remote(File* file, const RemoteAdvisoryOwner& owner, Remot
     uint64_t end = 0;
     if (int const STATUS = advisory_range_from_flock(request, file, stat, start, end, position); STATUS != 0) return STATUS;
     if (kind == RemoteAdvisoryKind::FLOCK && (start != 0 || end != ADVISORY_RANGE_EOF)) return -EINVAL;
-    prepared = {.dev = key.dev, .ino = key.ino, .start = start, .end = end};
+    uint64_t object = 0;
+    static_cast<void>(vfs_advisory_remote_identity(file, object));
+    prepared = {.dev = key.dev, .ino = key.ino, .start = start, .end = end, .object = object};
     return 0;
 }
 
 // Existing manager mutex held; saved key/range are from retained native File.
 auto advisory_apply_remote_locked(File* file, const RemoteAdvisoryOwner& owner, RemoteAdvisoryKind kind, bool query,
-                                  const RemoteAdvisoryPrepared& prepared, VfsFlockAbi& request) -> int {
+                                  const RemoteAdvisoryPrepared& prepared, VfsFlockAbi& request, uint64_t scope_token = 0) -> int {
     if (file->remote_advisory_closed.load(std::memory_order_acquire)) return -ENOTCONN;
     AdvisoryFileKey const KEY{.dev = prepared.dev, .ino = prepared.ino, .has_inode = true};
     if (kind == RemoteAdvisoryKind::PROCESS) {
-        if (int const STATUS = advisory_associate_remote_process_locked(file, owner, KEY); STATUS != 0) return STATUS;
+        if (scope_token != 0) {
+            auto* record = advisory_find_scope_locked(scope_token);
+            if (record == nullptr) return -ESTALE;
+            if (!record->scope.matches({.owner = owner, .object = prepared.object, .dev = prepared.dev, .ino = prepared.ino}))
+                return -ESTALE;
+            if (record->witness->remote_advisory_closed.load(std::memory_order_acquire)) {
+                advisory_close_scope_locked(*record);
+                return -ENOTCONN;
+            }
+        } else {
+            // An established scoped process cannot downgrade to unscoped effects.
+            for (auto const& record : g_remote_advisory_scopes) {
+                auto const& identity = record.scope.identity();
+                if (record.witness != nullptr && identity.owner == owner && identity.dev == prepared.dev && identity.ino == prepared.ino)
+                    return -EOPNOTSUPP;
+            }
+        }
+        RemoteAdvisoryAssociation* association = nullptr;
+        if (int const STATUS = advisory_associate_remote_process_locked(file, owner, KEY, &association); STATUS != 0) return STATUS;
+        if (scope_token == 0 && association->scope_registration_operation != 0) return -EOPNOTSUPP;
+        association->active_scope_token = scope_token;
     }
     AdvisoryLock requested{
         .key = KEY,
@@ -19714,24 +19919,50 @@ auto vfs_advisory_remote_try(File* file, const RemoteAdvisoryOwner& owner, Remot
     return advisory_apply_remote_locked(file, owner, kind, query, prepared, request);
 }
 
+namespace {
+auto advisory_find_wait_locked(File* file, uint64_t operation, const RemoteAdvisoryCommand& command, RemoteAdvisoryWaitRecord*& result)
+    -> RemoteAdvisoryClaim {
+    for (auto& wait : g_remote_advisory_waits) {
+        if (wait.file != file) continue;
+        auto const CLAIM = wait.receipt.probe(operation, command);
+        if (CLAIM == RemoteAdvisoryClaim::PENDING || CLAIM == RemoteAdvisoryClaim::REPLAY || CLAIM == RemoteAdvisoryClaim::MISMATCH) {
+            result = &wait;
+            return CLAIM;
+        }
+    }
+    result = nullptr;
+    auto const CLAIM = file->remote_advisory_receipt.probe(operation, command);
+    if (CLAIM == RemoteAdvisoryClaim::REPLAY || CLAIM == RemoteAdvisoryClaim::MISMATCH) return CLAIM;
+    return operation <= file->remote_advisory_highest_operation ? RemoteAdvisoryClaim::STALE : RemoteAdvisoryClaim::NEW;
+}
+
+auto advisory_snapshot_operation_locked(File* file, RemoteAdvisoryWaitRecord* wait, uint64_t operation, RemoteAdvisoryReply& output)
+    -> int {
+    auto const& receipt = wait != nullptr ? wait->receipt : file->remote_advisory_receipt;
+    return receipt.snapshot(operation, output) ? 0 : -EPROTO;
+}
+}  // namespace
+
 auto vfs_advisory_remote_request(File* file, uint64_t operation, RemoteAdvisoryPhase phase, const RemoteAdvisoryCommand& command,
                                  RemoteAdvisoryReply& output) -> int {
     if (file == nullptr) return -EBADF;
     if (!command.valid() || operation == 0) return -EINVAL;
-    if (phase != RemoteAdvisoryPhase::START && phase != RemoteAdvisoryPhase::POLL && phase != RemoteAdvisoryPhase::CANCEL) return -EINVAL;
+    if (phase != RemoteAdvisoryPhase::START && phase != RemoteAdvisoryPhase::POLL && phase != RemoteAdvisoryPhase::CANCEL &&
+        phase != RemoteAdvisoryPhase::ACK)
+        return -EINVAL;
     if (file->fs_type != FSType::TMPFS && file->fs_type != FSType::XFS) return -EOPNOTSUPP;
     RemoteAdvisoryPrepared prepared{};
-    auto& receipt = file->remote_advisory_receipt;
     VfsFlockAbi request{.l_type = command.type, .l_whence = command.whence, .l_start = command.start, .l_len = command.length};
     if (phase == RemoteAdvisoryPhase::START) {
-        // Replay/cancel tombstone never revisits filesystem preparation.
+        // Known replay/cancel tombstone does not revisit backend preparation.
         g_advisory_lock_mutex.lock();
-        auto const PROBE = receipt.probe(operation, command);
+        RemoteAdvisoryWaitRecord* wait = nullptr;
+        auto const PROBE = advisory_find_wait_locked(file, operation, command, wait);
         int status = 0;
         if (file->remote_advisory_closed.load(std::memory_order_acquire))
             status = -ENOTCONN;
         else if (PROBE == RemoteAdvisoryClaim::PENDING || PROBE == RemoteAdvisoryClaim::REPLAY)
-            status = receipt.snapshot(operation, output) ? 0 : -EPROTO;
+            status = advisory_snapshot_operation_locked(file, wait, operation, output);
         else if (PROBE != RemoteAdvisoryClaim::NEW)
             status = advisory_claim_error(PROBE);
         g_advisory_lock_mutex.unlock();
@@ -19743,49 +19974,82 @@ auto vfs_advisory_remote_request(File* file, uint64_t operation, RemoteAdvisoryP
     }
     ker::mod::sys::MutexGuard guard(g_advisory_lock_mutex);
     if (file->remote_advisory_closed.load(std::memory_order_acquire)) return -ENOTCONN;
-    auto const CLAIM =
-        phase == RemoteAdvisoryPhase::START ? receipt.claim(operation, command, prepared) : receipt.probe(operation, command);
-    if (phase == RemoteAdvisoryPhase::CANCEL) {
-        if (CLAIM == RemoteAdvisoryClaim::NEW) {
-            if (!receipt.cancel_unstarted(operation, command)) return -EPROTO;
-        } else if (CLAIM == RemoteAdvisoryClaim::PENDING) {
-            bool const WAITING = receipt.waiting();
-            if (!receipt.complete(operation, {.status = -EINTR}, true)) return -EPROTO;
-            if (WAITING) --g_remote_advisory_pending;
-        } else if (CLAIM != RemoteAdvisoryClaim::REPLAY)
-            return advisory_claim_error(CLAIM);
-        return receipt.snapshot(operation, output) ? 0 : -EPROTO;
+    RemoteAdvisoryWaitRecord* wait = nullptr;
+    auto const CLAIM = advisory_find_wait_locked(file, operation, command, wait);
+    if (phase == RemoteAdvisoryPhase::ACK) {
+        if (CLAIM == RemoteAdvisoryClaim::PENDING) return -EBUSY;
+        if (CLAIM == RemoteAdvisoryClaim::REPLAY) {
+            int const STATUS = advisory_snapshot_operation_locked(file, wait, operation, output);
+            if (STATUS == 0 && wait != nullptr) *wait = {};
+            return STATUS;
+        }
+        if (CLAIM != RemoteAdvisoryClaim::STALE) return advisory_claim_error(CLAIM);
+        // Already acknowledged/forgotten IDs cannot release any lock or record.
+        output = {.operation = operation, .state = RemoteAdvisoryState::COMPLETE};
+        return 0;
     }
     if (CLAIM == RemoteAdvisoryClaim::REPLAY || (phase == RemoteAdvisoryPhase::START && CLAIM == RemoteAdvisoryClaim::PENDING))
-        return receipt.snapshot(operation, output) ? 0 : -EPROTO;
+        return advisory_snapshot_operation_locked(file, wait, operation, output);
     if (CLAIM != RemoteAdvisoryClaim::NEW && CLAIM != RemoteAdvisoryClaim::PENDING) return advisory_claim_error(CLAIM);
     if (phase == RemoteAdvisoryPhase::POLL && CLAIM != RemoteAdvisoryClaim::PENDING) return -ESTALE;
-    {
-        int status = advisory_apply_remote_locked(file, command.owner, command.kind, command.query, receipt.prepared(), request);
-        if (status == -EAGAIN && command.wait) {
-            if (!receipt.waiting()) {
-                if (g_remote_advisory_pending >= REMOTE_ADVISORY_PENDING_MAX)
-                    status = -ENOLCK;
-                else {
-                    if (!receipt.mark_waiting(operation)) return -EPROTO;
-                    ++g_remote_advisory_pending;
-                }
-            }
-            if (status == -EAGAIN) return receipt.snapshot(operation, output) ? 0 : -EPROTO;
+    if (phase == RemoteAdvisoryPhase::CANCEL) {
+        if (CLAIM == RemoteAdvisoryClaim::NEW) {
+            auto& recent = file->remote_advisory_receipt;
+            recent = {};
+            if (!recent.cancel_unstarted(operation, command)) return -EPROTO;
+            file->remote_advisory_highest_operation = operation;
+        } else {
+            if (wait == nullptr || !wait->receipt.waiting() || !wait->receipt.complete(operation, {.status = -EINTR}, true)) return -EPROTO;
+            --g_remote_advisory_pending;
         }
-        bool const WAITING = receipt.waiting();
-        RemoteAdvisoryOutcome outcome{.status = status};
-        if (command.query && status == 0)
-            outcome = {.status = 0,
-                       .pid = request.l_pid,
-                       .start = request.l_start,
-                       .length = request.l_len,
-                       .type = request.l_type,
-                       .whence = request.l_whence};
-        if (!receipt.complete(operation, outcome)) return -EPROTO;
-        if (WAITING) --g_remote_advisory_pending;
+        return advisory_snapshot_operation_locked(file, wait, operation, output);
     }
-    return receipt.snapshot(operation, output) ? 0 : -EPROTO;
+    RemoteAdvisoryReceipt* receipt = wait != nullptr ? &wait->receipt : &file->remote_advisory_receipt;
+    if (CLAIM == RemoteAdvisoryClaim::NEW) {
+        *receipt = {};
+        if (receipt->claim(operation, command, prepared) != RemoteAdvisoryClaim::NEW) return -EPROTO;
+        file->remote_advisory_highest_operation = operation;
+        if (!command.query && command.type != F_UNLCK_TYPE) {
+            // Every acquisition needs durable replay, including an immediate
+            // grant whose reply can be lost while another shared-open caller
+            // queries/unlocks. Reserve before the arbiter can change a lock.
+            for (auto& available : g_remote_advisory_waits) {
+                if (available.file != nullptr) continue;
+                wait = &available;
+                wait->file = file;
+                wait->receipt = *receipt;
+                *receipt = {};
+                receipt = &wait->receipt;
+                break;
+            }
+            if (wait == nullptr) {
+                if (!receipt->complete(operation, {.status = -ENOLCK})) return -EPROTO;
+                return advisory_snapshot_operation_locked(file, nullptr, operation, output);
+            }
+        }
+    }
+    int status =
+        advisory_apply_remote_locked(file, command.owner, command.kind, command.query, receipt->prepared(), request, command.scope_token);
+    if (status == -EAGAIN && command.wait) {
+        if (wait == nullptr) return -EPROTO;
+        if (!receipt->waiting()) {
+            if (!receipt->mark_waiting(operation)) return -EPROTO;
+            ++g_remote_advisory_pending;
+        }
+        return advisory_snapshot_operation_locked(file, wait, operation, output);
+    }
+    bool const WAITING = receipt->waiting();
+    RemoteAdvisoryOutcome outcome{.status = status};
+    if (command.query && status == 0)
+        outcome = {.status = 0,
+                   .pid = request.l_pid,
+                   .start = request.l_start,
+                   .length = request.l_len,
+                   .type = request.l_type,
+                   .whence = request.l_whence};
+    if (!receipt->complete(operation, outcome)) return -EPROTO;
+    if (WAITING) --g_remote_advisory_pending;
+    return advisory_snapshot_operation_locked(file, wait, operation, output);
 }
 
 auto vfs_fcntl(int fd, int cmd, uint64_t arg, VfsFlockAbi* flock) -> int {
@@ -26162,9 +26426,7 @@ auto vfs_selftest_advisory_remote_waits() -> bool {
     if (pending_count() != 0 || local_set(WHOLE) != 0 || request(1, RemoteAdvisoryPhase::START, command) != 0 ||
         reply.state != RemoteAdvisoryState::PENDING || reply.outcome.status != -EAGAIN || pending_count() != 1)
         return fail(__LINE__);
-    if (request(1, RemoteAdvisoryPhase::START, command) != 0 || pending_count() != 1 ||
-        request(2, RemoteAdvisoryPhase::START, command) != -EBUSY)
-        return fail(__LINE__);
+    if (request(1, RemoteAdvisoryPhase::START, command) != 0 || pending_count() != 1) return fail(__LINE__);
     auto mismatch = command;
     ++mismatch.start;
     if (request(1, RemoteAdvisoryPhase::POLL, mismatch) != -EPROTO || pending_count() != 1) return fail(__LINE__);
@@ -26174,10 +26436,12 @@ auto vfs_selftest_advisory_remote_waits() -> bool {
     if (request(1, RemoteAdvisoryPhase::POLL, command) != 0 || reply.outcome.status != -EINTR ||
         request(1, RemoteAdvisoryPhase::START, command) != 0 || reply.state != RemoteAdvisoryState::CANCELLED)
         return fail(__LINE__);
+    if (request(1, RemoteAdvisoryPhase::ACK, command) != 0 || reply.outcome.status != -EINTR) return fail(__LINE__);
     if (request(2, RemoteAdvisoryPhase::START, command) != 0 || reply.outcome.status != 0 || reply.state != RemoteAdvisoryState::COMPLETE ||
         local_set(WHOLE) != -EAGAIN || request(2, RemoteAdvisoryPhase::CANCEL, command) != 0 || reply.outcome.status != 0 ||
         local_set(WHOLE) != -EAGAIN)
         return fail(__LINE__);
+    if (request(2, RemoteAdvisoryPhase::ACK, command) != 0 || local_set(WHOLE) != -EAGAIN) return fail(__LINE__);
     auto release_command = command;
     release_command.type = F_UNLCK_TYPE;
     release_command.wait = false;
@@ -26185,8 +26449,9 @@ auto vfs_selftest_advisory_remote_waits() -> bool {
         request(4, RemoteAdvisoryPhase::START, command) != 0 || reply.outcome.status != 0 ||
         request(2, RemoteAdvisoryPhase::CANCEL, command) != -ESTALE || local_set(WHOLE) != -EAGAIN)
         return fail(__LINE__);
-    if (vfs_advisory_remote_close_process(remote.get(), command.owner) != 0 || request(5, RemoteAdvisoryPhase::CANCEL, command) != 0 ||
-        request(5, RemoteAdvisoryPhase::START, command) != 0 || reply.state != RemoteAdvisoryState::CANCELLED || local_set(WHOLE) != 0)
+    if (vfs_advisory_remote_close_process(remote.get(), command.owner) != 0 || request(4, RemoteAdvisoryPhase::ACK, command) != 0 ||
+        request(5, RemoteAdvisoryPhase::CANCEL, command) != 0 || request(5, RemoteAdvisoryPhase::START, command) != 0 ||
+        reply.state != RemoteAdvisoryState::CANCELLED || local_set(WHOLE) != 0)
         return fail(__LINE__);
     auto query = command;
     query.query = true;
@@ -26209,7 +26474,9 @@ auto vfs_selftest_advisory_remote_waits() -> bool {
     if (local_set(range) != 0 || request(8, RemoteAdvisoryPhase::POLL, relative) != 0 || reply.outcome.status != 0 || pending_count() != 0)
         return fail(__LINE__);
     range.l_type = F_WRLCK_TYPE;
-    if (local_set(range) != -EAGAIN || vfs_advisory_remote_close_process(remote.get(), command.owner) != 0) return fail(__LINE__);
+    if (local_set(range) != -EAGAIN || request(8, RemoteAdvisoryPhase::ACK, relative) != 0 || local_set(range) != -EAGAIN ||
+        vfs_advisory_remote_close_process(remote.get(), command.owner) != 0)
+        return fail(__LINE__);
     // SEEK_END is fixed at the first owner admission, even if EOF changes later.
     relative.whence = SEEK_END_VALUE;
     relative.position = 0;
@@ -26220,7 +26487,8 @@ auto vfs_selftest_advisory_remote_waits() -> bool {
     range.l_type = F_UNLCK_TYPE;
     if (local_set(range) != 0 || request(9, RemoteAdvisoryPhase::POLL, relative) != 0 || reply.outcome.status != 0) return fail(__LINE__);
     range.l_type = F_WRLCK_TYPE;
-    if (local_set(range) != -EAGAIN) return fail(__LINE__);
+    if (local_set(range) != -EAGAIN || request(9, RemoteAdvisoryPhase::ACK, relative) != 0 || local_set(range) != -EAGAIN)
+        return fail(__LINE__);
     range.l_start = 50;
     if (local_set(range) != 0 || vfs_advisory_remote_close_process(remote.get(), command.owner) != 0 || local_set(unlock) != 0)
         return fail(__LINE__);
@@ -26230,8 +26498,11 @@ auto vfs_selftest_advisory_remote_waits() -> bool {
     relative.wait = false;
     if (request(10, RemoteAdvisoryPhase::START, relative) != 0 || reply.outcome.status != 0) return fail(__LINE__);
     range.l_start = 80;
-    if (local_set(range) != -EAGAIN || vfs_advisory_remote_close_process(remote.get(), command.owner) != 0) return fail(__LINE__);
-    // Bounded waiter state; retirement and duplicate cancel release capacity once.
+    if (local_set(range) != -EAGAIN || vfs_advisory_remote_close_process(remote.get(), command.owner) != 0 ||
+        request(10, RemoteAdvisoryPhase::ACK, relative) != 0)
+        return fail(__LINE__);
+    // Terminal replies consume a record until ACK; cancellation stops waiting
+    // but cannot erase the replay proof before the client observes its outcome.
     std::array<Owned, REMOTE_ADVISORY_PENDING_MAX + 1> waiters{};
     if (local_set(WHOLE) != 0) return fail(__LINE__);
     for (size_t index = 0; index < waiters.size(); ++index) {
@@ -26247,8 +26518,13 @@ auto vfs_selftest_advisory_remote_waits() -> bool {
     if (vfs_advisory_remote_request(waiters.front().get(), 1, RemoteAdvisoryPhase::CANCEL, command, reply) != 0 ||
         pending_count() != REMOTE_ADVISORY_PENDING_MAX - 1 ||
         vfs_advisory_remote_request(waiters.back().get(), 2, RemoteAdvisoryPhase::START, command, reply) != 0 ||
+        reply.state != RemoteAdvisoryState::COMPLETE || reply.outcome.status != -ENOLCK ||
+        pending_count() != REMOTE_ADVISORY_PENDING_MAX - 1 ||
+        vfs_advisory_remote_request(waiters.front().get(), 1, RemoteAdvisoryPhase::ACK, command, reply) != 0 ||
+        reply.outcome.status != -EINTR ||
+        vfs_advisory_remote_request(waiters.back().get(), 3, RemoteAdvisoryPhase::START, command, reply) != 0 ||
         reply.state != RemoteAdvisoryState::PENDING || pending_count() != REMOTE_ADVISORY_PENDING_MAX ||
-        vfs_advisory_remote_request(waiters.front().get(), 1, RemoteAdvisoryPhase::CANCEL, command, reply) != 0 ||
+        vfs_advisory_remote_request(waiters.front().get(), 1, RemoteAdvisoryPhase::ACK, command, reply) != 0 ||
         pending_count() != REMOTE_ADVISORY_PENDING_MAX)
         return fail(__LINE__);
     for (auto& waiter : waiters) {
@@ -26257,6 +26533,302 @@ auto vfs_selftest_advisory_remote_waits() -> bool {
         if (vfs_advisory_remote_request(waiter.get(), 1, RemoteAdvisoryPhase::POLL, command, reply) != -ENOTCONN) return fail(__LINE__);
     }
     return pending_count() == 0;
+}
+
+auto vfs_selftest_advisory_remote_shared_waiters() -> bool {
+    constexpr const char* PATH = "/tmp/ktest_owner_shared_waits26";
+    struct Cleanup {
+        ~Cleanup() { static_cast<void>(vfs_unlink("/tmp/ktest_owner_shared_waits26")); }
+    } cleanup;
+    static_cast<void>(vfs_unlink(PATH));
+    auto release = [](File* file) { vfs_put_file(file); };
+    std::unique_ptr<File, decltype(release)> shared(vfs_open_file(PATH, O_CREAT | O_EXCL | 2, 0600), release);
+    if (!shared || shared->fs_type != FSType::TMPFS) return false;
+    auto fail = [](int line) {
+        ker::mod::dbg::logger<"ktest">::error("shared native advisory wait failed at core.cpp:%d", line);
+        return false;
+    };
+    RemoteAdvisoryCommand parent{.owner = {.generation = 13, .boot_epoch = 17, .pid = 7, .peer = 19}, .type = F_WRLCK_TYPE};
+    auto child = parent;
+    child.owner.generation = 14;
+    child.owner.pid = 8;
+    child.wait = true;
+    auto query = parent;
+    query.query = true;
+    auto unlock = parent;
+    unlock.type = F_UNLCK_TYPE;
+    RemoteAdvisoryReply reply{};
+    auto request = [&](uint64_t operation, RemoteAdvisoryPhase phase, const RemoteAdvisoryCommand& command) {
+        return vfs_advisory_remote_request(shared.get(), operation, phase, command, reply);
+    };
+    auto pending_count = [] {
+        ker::mod::sys::MutexGuard guard(g_advisory_lock_mutex);
+        return g_remote_advisory_pending;
+    };
+    if (pending_count() != 0 || request(1, RemoteAdvisoryPhase::START, parent) != 0 || reply.outcome.status != 0 ||
+        request(2, RemoteAdvisoryPhase::START, child) != 0 || reply.state != RemoteAdvisoryState::PENDING || pending_count() != 1 ||
+        request(3, RemoteAdvisoryPhase::START, query) != 0 || reply.outcome.type != F_UNLCK_TYPE ||
+        request(1, RemoteAdvisoryPhase::POLL, parent) != 0 || reply.outcome.status != 0 || reply.state != RemoteAdvisoryState::COMPLETE ||
+        request(4, RemoteAdvisoryPhase::START, unlock) != 0 || reply.outcome.status != 0 || pending_count() != 1 ||
+        request(2, RemoteAdvisoryPhase::POLL, child) != 0 || reply.outcome.status != 0 || pending_count() != 0 ||
+        request(5, RemoteAdvisoryPhase::START, query) != 0 || reply.outcome.type != F_WRLCK_TYPE || reply.outcome.pid != 8)
+        return fail(__LINE__);
+    if (request(1, RemoteAdvisoryPhase::CANCEL, parent) != 0 || reply.outcome.status != 0 ||
+        request(1, RemoteAdvisoryPhase::ACK, parent) != 0)
+        return fail(__LINE__);
+    // Terminal ACK frees only the waiter receipt. Lost/duplicate ACK cannot
+    // unlock the child's grant, including after the open's watermark advances.
+    if (request(2, RemoteAdvisoryPhase::ACK, child) != 0 || reply.outcome.status != 0 || request(2, RemoteAdvisoryPhase::ACK, child) != 0 ||
+        request(6, RemoteAdvisoryPhase::START, query) != 0 || reply.outcome.type != F_WRLCK_TYPE || reply.outcome.pid != 8)
+        return fail(__LINE__);
+    unlock.owner = child.owner;
+    if (request(7, RemoteAdvisoryPhase::START, unlock) != 0 || reply.outcome.status != 0 ||
+        request(8, RemoteAdvisoryPhase::START, child) != 0 || reply.outcome.status != 0 ||
+        request(2, RemoteAdvisoryPhase::CANCEL, child) != -ESTALE || request(9, RemoteAdvisoryPhase::START, query) != 0 ||
+        reply.outcome.type != F_WRLCK_TYPE || reply.outcome.pid != 8)
+        return fail(__LINE__);
+    parent.wait = true;
+    auto sibling = parent;
+    sibling.owner.generation = 15;
+    sibling.owner.pid = 9;
+    if (request(10, RemoteAdvisoryPhase::START, parent) != 0 || reply.state != RemoteAdvisoryState::PENDING ||
+        request(11, RemoteAdvisoryPhase::START, sibling) != 0 || reply.state != RemoteAdvisoryState::PENDING || pending_count() != 2 ||
+        request(10, RemoteAdvisoryPhase::ACK, parent) != -EBUSY || request(10, RemoteAdvisoryPhase::CANCEL, parent) != 0 ||
+        reply.outcome.status != -EINTR || pending_count() != 1 || request(11, RemoteAdvisoryPhase::POLL, sibling) != 0 ||
+        reply.state != RemoteAdvisoryState::PENDING)
+        return fail(__LINE__);
+    vfs_advisory_remote_retire(shared.get());
+    vfs_advisory_remote_retire(shared.get());
+    return pending_count() == 0 && request(11, RemoteAdvisoryPhase::POLL, sibling) == -ENOTCONN &&
+           request(10, RemoteAdvisoryPhase::ACK, parent) == -ENOTCONN;
+}
+
+auto vfs_selftest_advisory_remote_grant_receipts() -> bool {
+    constexpr const char* PATH = "/tmp/ktest_owner_grant_receipts26";
+    struct Cleanup {
+        ~Cleanup() { static_cast<void>(vfs_unlink("/tmp/ktest_owner_grant_receipts26")); }
+    } cleanup;
+    static_cast<void>(vfs_unlink(PATH));
+    auto release = [](File* file) { vfs_put_file(file); };
+    std::unique_ptr<File, decltype(release)> file(vfs_open_file(PATH, O_CREAT | O_EXCL | 2, 0600), release);
+    std::unique_ptr<File, decltype(release)> observer(vfs_open_file(PATH, 2, 0), release);
+    if (!file || !observer || file->fs_type != FSType::TMPFS) return false;
+    auto fail = [](int line) {
+        ker::mod::dbg::logger<"ktest">::error("native grant replay failed at core.cpp:%d", line);
+        return false;
+    };
+    RemoteAdvisoryCommand command{.owner = {.generation = 13, .boot_epoch = 17, .pid = 7, .peer = 19},
+                                  .kind = RemoteAdvisoryKind::OPEN_FILE,
+                                  .length = 1,
+                                  .type = F_WRLCK_TYPE};
+    RemoteAdvisoryReply reply{};
+    auto request = [&](uint64_t operation, RemoteAdvisoryPhase phase, const RemoteAdvisoryCommand& intent) {
+        return vfs_advisory_remote_request(file.get(), operation, phase, intent, reply);
+    };
+    auto conflict = [&](off_t start, bool locked) {
+        VfsFlockAbi query{.l_type = F_WRLCK_TYPE, .l_whence = SEEK_SET_VALUE, .l_start = start, .l_len = 1};
+        return advisory_get_lock(observer.get(), 7, AdvisoryOwnerKind::PROCESS, AdvisoryLockFamily::RECORD, query) == 0 &&
+               query.l_type == (locked ? F_WRLCK_TYPE : F_UNLCK_TYPE) && query.l_pid == (locked ? -1 : 0);
+    };
+    // Successful immediate acquisitions occupy all replay slots even though
+    // none is waiting. Their grant cannot be erased by a newer shared-open RPC.
+    for (uint64_t operation = 1; operation <= REMOTE_ADVISORY_PENDING_MAX; ++operation) {
+        command.start = static_cast<int64_t>(operation - 1);
+        if (request(operation, RemoteAdvisoryPhase::START, command) != 0 || reply.outcome.status != 0 ||
+            reply.state != RemoteAdvisoryState::COMPLETE || !conflict(command.start, true))
+            return fail(__LINE__);
+    }
+    command.start = REMOTE_ADVISORY_PENDING_MAX;
+    if (request(65, RemoteAdvisoryPhase::START, command) != 0 || reply.outcome.status != -ENOLCK || !conflict(command.start, false))
+        return fail(__LINE__);
+    auto query = command;
+    query.kind = RemoteAdvisoryKind::PROCESS;
+    query.query = true;
+    query.start = 0;
+    if (request(66, RemoteAdvisoryPhase::START, query) != 0 || reply.outcome.status != 0 || reply.outcome.pid != -1) return fail(__LINE__);
+    auto unlock = command;
+    unlock.type = F_UNLCK_TYPE;
+    unlock.start = 0;
+    unlock.length = 0;
+    if (request(67, RemoteAdvisoryPhase::START, unlock) != 0 || reply.outcome.status != 0 || !conflict(0, false) ||
+        request(68, RemoteAdvisoryPhase::START, command) != 0 || reply.outcome.status != -ENOLCK)
+        return fail(__LINE__);
+    auto first = command;
+    first.start = 0;
+    if (request(1, RemoteAdvisoryPhase::CANCEL, first) != 0 || reply.outcome.status != 0 || reply.state != RemoteAdvisoryState::COMPLETE ||
+        request(1, RemoteAdvisoryPhase::ACK, first) != 0 || request(69, RemoteAdvisoryPhase::START, command) != 0 ||
+        reply.outcome.status != 0 || !conflict(command.start, true))
+        return fail(__LINE__);
+    auto second = command;
+    second.start = 1;
+    if (request(2, RemoteAdvisoryPhase::CANCEL, second) != 0 || reply.outcome.status != 0 ||
+        request(1, RemoteAdvisoryPhase::ACK, first) != 0 || !conflict(command.start, true))
+        return fail(__LINE__);
+    {
+        ker::mod::sys::MutexGuard guard(g_advisory_lock_mutex);
+        if (g_remote_advisory_pending != 0) return fail(__LINE__);
+    }
+    vfs_advisory_remote_retire(file.get());
+    return conflict(command.start, false) && request(69, RemoteAdvisoryPhase::POLL, command) == -ENOTCONN;
+}
+
+auto vfs_selftest_advisory_remote_scopes() -> bool {
+    constexpr const char* PATH = "/tmp/ktest_owner_scope26";
+    constexpr const char* ALIAS = "/tmp/ktest_owner_scope26_alias";
+    constexpr const char* OTHER = "/tmp/ktest_owner_scope26_other";
+    struct Cleanup {
+        ~Cleanup() {
+            static_cast<void>(vfs_unlink("/tmp/ktest_owner_scope26_alias"));
+            static_cast<void>(vfs_unlink("/tmp/ktest_owner_scope26"));
+            static_cast<void>(vfs_unlink("/tmp/ktest_owner_scope26_other"));
+        }
+    } cleanup;
+    static_cast<void>(vfs_unlink(ALIAS));
+    static_cast<void>(vfs_unlink(PATH));
+    static_cast<void>(vfs_unlink(OTHER));
+    auto release = [](File* file) {
+        advisory_release_process_locks_for_file(99, file);
+        vfs_put_file(file);
+    };
+    using Owned = std::unique_ptr<File, decltype(release)>;
+    Owned local(vfs_open_file(PATH, O_CREAT | O_EXCL | 2, 0600), release);
+    Owned witness(vfs_open_file(PATH, 2, 0), release);
+    Owned other(vfs_open_file(OTHER, O_CREAT | O_EXCL | 2, 0600), release);
+    if (!local || !witness || !other || local->fs_type != FSType::TMPFS || vfs_link(PATH, ALIAS) != 0) return false;
+    Owned target(vfs_open_file(ALIAS, 2, 0), release);
+    if (!target) return false;
+    auto fail = [](int line) {
+        ker::mod::dbg::logger<"ktest">::error("native POSIX scope failed at core.cpp:%d", line);
+        return false;
+    };
+    RemoteAdvisoryOwner const OWNER{.generation = 113, .boot_epoch = 17, .pid = 7, .peer = 19};
+    RemoteAdvisoryScopeResult scope{};
+    uint64_t identity = 0;
+    if (vfs_advisory_remote_identity(target.get(), identity) != 0 || identity == 0) return fail(__LINE__);
+    auto* node = tmpfs::tmpfs_canonical_node(static_cast<tmpfs::TmpNode*>(witness->private_data));
+    {
+        coherency::Mutation publication(node->coherency, coherency::Domain::CONTENT);
+        coherency::Stamp during{};
+        if (!publication || vfs_file_coherency_snapshot(witness.get(), during) == 0) return fail(__LINE__);
+        if (vfs_advisory_remote_register_scope(witness.get(), OWNER, 1, scope) != 0 || scope.object != identity || scope.token == 0 ||
+            scope.state != RemoteAdvisoryScopeState::ACTIVE)
+            return fail(__LINE__);
+        publication.cancel_no_effect();
+    }
+    uint64_t const FIRST = scope.token;
+    if (vfs_advisory_remote_register_scope(witness.get(), OWNER, 1, scope) != 0 || scope.token != FIRST ||
+        vfs_advisory_remote_register_scope(witness.get(), OWNER, 2, scope) != 0 || scope.token != FIRST ||
+        vfs_advisory_remote_register_scope(witness.get(), OWNER, 1, scope) != -ESTALE)
+        return fail(__LINE__);
+    auto const SAVED_SCOPE = scope;
+    auto foreign = OWNER;
+    ++foreign.generation;
+    if (vfs_advisory_remote_close_scope(foreign, FIRST, scope) != -EPERM || scope.token != SAVED_SCOPE.token ||
+        scope.state != SAVED_SCOPE.state || vfs_advisory_remote_ack_scope(OWNER, FIRST, scope) != -EBUSY)
+        return fail(__LINE__);
+    VfsFlockAbi whole{.l_type = F_WRLCK_TYPE, .l_whence = SEEK_SET_VALUE};
+    auto local_set = [&](int16_t type) {
+        whole.l_type = type;
+        return advisory_set_lock(local.get(), 99, AdvisoryOwnerKind::PROCESS, AdvisoryLockFamily::RECORD, whole, false);
+    };
+    RemoteAdvisoryCommand command{.owner = OWNER, .scope_token = FIRST, .type = F_WRLCK_TYPE, .wait = true};
+    RemoteAdvisoryReply reply{};
+    auto request = [&](File* file, uint64_t operation, RemoteAdvisoryPhase phase, const RemoteAdvisoryCommand& cmd) {
+        return vfs_advisory_remote_request(file, operation, phase, cmd, reply);
+    };
+    if (local_set(F_WRLCK_TYPE) != 0 || request(target.get(), 1, RemoteAdvisoryPhase::START, command) != 0 ||
+        reply.state != RemoteAdvisoryState::PENDING || vfs_advisory_remote_close_scope(OWNER, FIRST, scope) != 0 ||
+        scope.state != RemoteAdvisoryScopeState::CLOSED || vfs_advisory_remote_close_scope(OWNER, FIRST, scope) != 0 ||
+        request(target.get(), 1, RemoteAdvisoryPhase::POLL, command) != 0 || reply.state != RemoteAdvisoryState::CANCELLED ||
+        reply.outcome.status != -EINTR || request(target.get(), 1, RemoteAdvisoryPhase::ACK, command) != 0 ||
+        local_set(F_UNLCK_TYPE) != 0 || request(target.get(), 2, RemoteAdvisoryPhase::START, command) != 0 ||
+        reply.outcome.status != -ESTALE)
+        return fail(__LINE__);
+    if (vfs_advisory_remote_ack_scope(OWNER, FIRST, scope) != 0 || scope.state != RemoteAdvisoryScopeState::CLOSED ||
+        vfs_advisory_remote_ack_scope(OWNER, FIRST, scope) != -ESTALE ||
+        vfs_advisory_remote_register_scope(witness.get(), OWNER, 2, scope) != -ESTALE ||
+        vfs_advisory_remote_register_scope(target.get(), OWNER, 1, scope) != 0 || scope.token == FIRST ||
+        scope.state != RemoteAdvisoryScopeState::ACTIVE)
+        return fail(__LINE__);
+    uint64_t const SUCCESSOR = scope.token;
+    command.scope_token = SUCCESSOR;
+    command.wait = false;
+    command.length = 1;
+    if (request(target.get(), 3, RemoteAdvisoryPhase::START, command) != 0 || reply.outcome.status != 0 ||
+        local_set(F_WRLCK_TYPE) != -EAGAIN || vfs_advisory_remote_close_scope(OWNER, FIRST, scope) != -ESTALE)
+        return fail(__LINE__);
+    vfs_advisory_remote_retire(witness.get());
+    if (local_set(F_WRLCK_TYPE) != -EAGAIN || request(other.get(), 1, RemoteAdvisoryPhase::START, command) != 0 ||
+        reply.outcome.status != -ESTALE)
+        return fail(__LINE__);
+    auto flock = command;
+    flock.scope_token = 0;
+    flock.kind = RemoteAdvisoryKind::FLOCK;
+    flock.length = 0;
+    auto ofd = command;
+    ofd.scope_token = 0;
+    ofd.kind = RemoteAdvisoryKind::OPEN_FILE;
+    ofd.start = 10;
+    VfsFlockAbi first_range{.l_type = F_WRLCK_TYPE, .l_whence = SEEK_SET_VALUE, .l_len = 1};
+    if (request(target.get(), 4, RemoteAdvisoryPhase::START, ofd) != 0 || reply.outcome.status != 0 ||
+        request(target.get(), 5, RemoteAdvisoryPhase::START, flock) != 0 || reply.outcome.status != 0 ||
+        advisory_flock(local.get(), LOCK_EX_VALUE | LOCK_NB_VALUE) != -EAGAIN ||
+        vfs_advisory_remote_close_scope(OWNER, SUCCESSOR, scope) != 0 ||
+        advisory_set_lock(local.get(), 99, AdvisoryOwnerKind::PROCESS, AdvisoryLockFamily::RECORD, first_range, false) != 0 ||
+        local_set(F_WRLCK_TYPE) != -EAGAIN || advisory_flock(local.get(), LOCK_EX_VALUE | LOCK_NB_VALUE) != -EAGAIN)
+        return fail(__LINE__);
+    vfs_advisory_remote_retire(target.get());
+    if (vfs_advisory_remote_close_scope(OWNER, SUCCESSOR, scope) != -ESTALE || local_set(F_WRLCK_TYPE) != 0 ||
+        advisory_flock(local.get(), LOCK_EX_VALUE | LOCK_NB_VALUE) != 0 || advisory_flock(local.get(), LOCK_UN_VALUE) != 0)
+        return fail(__LINE__);
+    static_cast<void>(node->coherency.close_admission());
+    uint64_t closed_identity = 0;
+    return vfs_advisory_remote_identity(witness.get(), closed_identity) == 0 && closed_identity == identity;
+}
+
+auto vfs_selftest_advisory_remote_scope_capacity() -> bool {
+    constexpr const char* PATH = "/tmp/ktest_owner_scope_capacity26";
+    struct Cleanup {
+        ~Cleanup() { static_cast<void>(vfs_unlink("/tmp/ktest_owner_scope_capacity26")); }
+    } cleanup;
+    static_cast<void>(vfs_unlink(PATH));
+    auto release = [](File* file) { vfs_put_file(file); };
+    using Owned = std::unique_ptr<File, decltype(release)>;
+    constexpr size_t FILE_COUNT = g_remote_advisory_scopes.size() / REMOTE_ADVISORY_SCOPES_PER_OPEN;
+    std::array<Owned, FILE_COUNT> files{};
+    auto count = [] {
+        ker::mod::sys::MutexGuard guard(g_advisory_lock_mutex);
+        size_t occupied = 0;
+        for (auto const& scope : g_remote_advisory_scopes) occupied += scope.witness != nullptr;
+        return occupied;
+    };
+    if (count() != 0) return false;
+    RemoteAdvisoryScopeResult result{};
+    uint64_t first_token = 0;
+    RemoteAdvisoryOwner owner{.generation = 1000, .boot_epoch = 17, .pid = 7, .peer = 19};
+    for (size_t index = 0; index < g_remote_advisory_scopes.size(); ++index) {
+        size_t const FILE_INDEX = index / REMOTE_ADVISORY_SCOPES_PER_OPEN;
+        if (index % REMOTE_ADVISORY_SCOPES_PER_OPEN == 0) {
+            files[FILE_INDEX] = Owned(vfs_open_file(PATH, (index == 0 ? O_CREAT | O_EXCL : 0) | 2, 0600), release);
+            if (!files[FILE_INDEX] || files[FILE_INDEX]->fs_type != FSType::TMPFS) return false;
+        }
+        owner.generation = 1000 + index;
+        if (vfs_advisory_remote_register_scope(files[FILE_INDEX].get(), owner, 1, result) != 0 ||
+            result.state != RemoteAdvisoryScopeState::ACTIVE || count() != index + 1)
+            return false;
+        if (index == 0) first_token = result.token;
+    }
+    owner.generation = 2000;
+    if (vfs_advisory_remote_register_scope(files.front().get(), owner, 1, result) != -ENOLCK || count() != g_remote_advisory_scopes.size())
+        return false;
+    owner.generation = 1000;
+    if (vfs_advisory_remote_close_scope(owner, first_token, result) != 0 || count() != g_remote_advisory_scopes.size() ||
+        vfs_advisory_remote_ack_scope(owner, first_token, result) != 0 || count() != g_remote_advisory_scopes.size() - 1 ||
+        vfs_advisory_remote_register_scope(files.front().get(), owner, 2, result) != 0 || result.token == first_token ||
+        count() != g_remote_advisory_scopes.size())
+        return false;
+    for (auto& file : files) file.reset();
+    return count() == 0;
 }
 
 auto vfs_selftest_advisory_remote_shared() -> bool {

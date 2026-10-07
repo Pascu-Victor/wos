@@ -1001,6 +1001,8 @@ auto xfs_selftest_transaction_cancel_restores_ownership() -> bool {
     inode.mtime = 22;
     coherency::Stamp before{};
     if (!inode.coherency.snapshot(before)) return false;
+    uint64_t const IDENTITY = inode.coherency.identity();
+    if (IDENTITY == 0 || IDENTITY != before.object) return false;
     for (bool commit_failure : {false, true}) {
         XfsTransaction* tp = xfs_trans_alloc(&mount);
         if (tp == nullptr) return false;
@@ -1009,7 +1011,7 @@ auto xfs_selftest_transaction_cancel_restores_ownership() -> bool {
             return false;
         }
         coherency::Stamp during = before;
-        if (inode.coherency.snapshot(during) || during != before) {
+        if (inode.coherency.snapshot(during) || during != before || inode.coherency.identity() != IDENTITY) {
             xfs_trans_cancel(tp);
             return false;
         }
@@ -1030,7 +1032,7 @@ auto xfs_selftest_transaction_cancel_restores_ownership() -> bool {
             inode.mtime != 22 || inode.dirty)
             return false;
         coherency::Stamp after{};
-        if (!inode.coherency.snapshot(after) || after != before) return false;
+        if (!inode.coherency.snapshot(after) || after != before || inode.coherency.identity() != IDENTITY) return false;
     }
     return true;
 }

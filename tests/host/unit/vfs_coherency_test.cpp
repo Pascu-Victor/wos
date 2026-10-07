@@ -519,6 +519,8 @@ TEST(VfsNativeCoherency, ClosureDrainsExistingGuardsAndRejectsSuccessors) {
     coherence::Object object(counter);
     coherence::Mutation accepted(object, coherence::Domain::CONTENT);
     ASSERT_TRUE(accepted);
+    auto const IDENTITY = object.identity();
+    EXPECT_NE(IDENTITY, 0U);
     EXPECT_FALSE(object.close_admission());
     EXPECT_FALSE(object.quiescent());
     coherence::Mutation denied(object, coherence::Domain::CONTENT);
@@ -529,6 +531,7 @@ TEST(VfsNativeCoherency, ClosureDrainsExistingGuardsAndRejectsSuccessors) {
     auto output = SENTINEL;
     EXPECT_FALSE(object.snapshot(output));
     EXPECT_EQ(output, SENTINEL);
+    EXPECT_EQ(object.identity(), IDENTITY);
 }
 
 TEST(VfsNativeCoherency, ExhaustionAndInvalidDomainsCannotBeginEffects) {
@@ -547,6 +550,7 @@ TEST(VfsNativeCoherency, ExhaustionAndInvalidDomainsCannotBeginEffects) {
     EXPECT_EQ(output.content, UINT64_MAX);
     EXPECT_EQ(output.metadata, UINT64_MAX);
     coherence::Object successor(counter);
+    EXPECT_EQ(successor.identity(), 0U);
     EXPECT_FALSE(successor.snapshot(output));
     EXPECT_EQ(output.content, UINT64_MAX);
 }

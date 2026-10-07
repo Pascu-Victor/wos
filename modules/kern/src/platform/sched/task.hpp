@@ -1278,6 +1278,11 @@ struct Task {
     uint64_t lazy_file_fault_vaddr{};
     int lazy_file_fault_status{};
     std::atomic<uint64_t> lazy_file_fault_completion_generation{};
+
+    // Nonreused remote advisory process scope. Threads resolve their retained
+    // filesystem owner; native exec preserves it. Appended so existing Task
+    // and assembly member offsets remain unchanged. Zero until first use.
+    std::atomic<uint64_t> advisory_process_generation{0};
 };
 
 [[nodiscard]] inline auto process_pid(const Task& task) -> uint64_t { return task.owner_pid != 0 ? task.owner_pid : task.pid; }

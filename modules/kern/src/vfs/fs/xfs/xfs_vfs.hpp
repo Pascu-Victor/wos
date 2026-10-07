@@ -186,6 +186,7 @@ auto xfs_clone_exec_file(File* source, File** output) -> int;
 // Fstat an open file descriptor.
 auto xfs_fstat(File* f, ker::vfs::Stat* statbuf) -> int;
 auto xfs_coherency_snapshot(File* file, coherency::Stamp& output) -> bool;
+auto xfs_coherency_identity(File* file) -> uint64_t;
 
 // Extended attributes. Names use the public qualified namespace form
 // (user.*, trusted.*, security.*); internal XFS namespaces are never exposed.

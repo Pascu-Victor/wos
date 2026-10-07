@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <net/address.hpp>
@@ -1594,6 +1595,125 @@ constexpr auto wki_vfs_owner_read_response_valid(const VfsOwnerReadResponse& res
     return response.version == WKI_VFS_OWNER_VERSION && response.length == sizeof(response) && response.reserved == 0 &&
            response.reserved2 == 0 && query != 0 && response.query_id == query && requested <= WKI_VFS_OWNER_READ_MAX &&
            response.bytes <= requested && length == sizeof(response) + response.bytes;
+}
+constexpr uint16_t OP_VFS_LOCK_OWNER = 0x0427;
+constexpr uint16_t WKI_VFS_LOCK_QUERY = 1;
+constexpr uint16_t WKI_VFS_LOCK_WAIT = 2;
+// Peer and consumer boot are derived from the retained authenticated binding.
+// query_id is the lock operation's immutable identity, including every poll.
+struct VfsOwnerLockRequest {
+    VfsOwnerFdRequest owner{};
+    uint64_t process_generation = 0;
+    uint64_t scope_token = 0;
+    int64_t start = 0;
+    int64_t range_length = 0;
+    int64_t position = 0;
+    int32_t pid = 0;
+    int16_t type = 0;
+    int16_t whence = 0;
+    uint8_t kind = 1;   // PROCESS=1, OPEN_FILE=2, FLOCK=3.
+    uint8_t phase = 1;  // START=1, POLL=2, CANCEL=3, ACK=4.
+    uint16_t flags = 0;
+    uint32_t reserved = 0;
+} __attribute__((packed));
+static_assert(sizeof(VfsOwnerLockRequest) == 96);
+constexpr auto wki_vfs_owner_lock_request_valid(const VfsOwnerLockRequest& request, size_t length) -> bool {
+    bool const QUERY = (request.flags & WKI_VFS_LOCK_QUERY) != 0;
+    bool const WAIT = (request.flags & WKI_VFS_LOCK_WAIT) != 0;
+    return length == sizeof(request) && wki_vfs_owner_fd_request_valid(request.owner, sizeof(request.owner)) &&
+           request.process_generation != 0 && request.pid > 0 && request.reserved == 0 && request.kind >= 1 && request.kind <= 3 &&
+           (request.kind == 1 ? request.scope_token != 0 : request.scope_token == 0) && request.phase >= 1 && request.phase <= 4 &&
+           request.type >= 0 && request.type <= 2 && request.whence >= 0 && request.whence <= 2 &&
+           (request.flags & ~(WKI_VFS_LOCK_QUERY | WKI_VFS_LOCK_WAIT)) == 0 && (!QUERY || (!WAIT && request.kind != 3)) &&
+           (!WAIT || request.type != 2) &&
+           (request.kind != 3 || (request.start == 0 && request.range_length == 0 && request.position == 0 && request.whence == 0));
+}
+struct VfsOwnerLockResponse {
+    uint16_t version = WKI_VFS_OWNER_VERSION;
+    uint16_t length = sizeof(VfsOwnerLockResponse);
+    uint32_t reserved = 0;
+    uint64_t operation = 0;
+    int32_t status = 0;
+    int32_t pid = 0;
+    int64_t start = 0;
+    int64_t range_length = 0;
+    int16_t type = 2;
+    int16_t whence = 0;
+    uint8_t state = 2;  // PENDING=1, COMPLETE=2, CANCELLED=3.
+    uint8_t reserved2 = 0;
+    uint16_t reserved3 = 0;
+} __attribute__((packed));
+static_assert(sizeof(VfsOwnerLockResponse) == 48);
+constexpr auto wki_vfs_owner_lock_reply_size_valid(int status, size_t length, size_t capacity) -> bool {
+    return status <= 0 && length <= capacity && length == (status == 0 ? sizeof(VfsOwnerLockResponse) : 0);
+}
+constexpr auto wki_vfs_owner_lock_response_valid(const VfsOwnerLockResponse& response, uint64_t operation, bool query, size_t length)
+    -> bool {
+    if (length != sizeof(response) || response.version != WKI_VFS_OWNER_VERSION || response.length != sizeof(response) ||
+        response.reserved != 0 || response.reserved2 != 0 || response.reserved3 != 0 || operation == 0 || response.operation != operation ||
+        response.status > 0 || response.state < 1 || response.state > 3)
+        return false;
+    if ((response.state == 1 && (query || response.status != -EAGAIN)) || (response.state == 3 && response.status != -EINTR)) return false;
+    if (response.state == 2 && response.status == 0 && query && response.type != 2)
+        return (response.type == 0 || response.type == 1) && response.whence == 0 && response.start >= 0 && response.range_length >= 0 &&
+               (response.pid > 0 || response.pid == -1) &&
+               (response.range_length == 0 || response.range_length <= INT64_MAX - response.start);
+    return response.pid == 0 && response.start == 0 && response.range_length == 0 && response.type == 2 && response.whence == 0;
+}
+constexpr uint16_t OP_VFS_LOCK_SCOPE = 0x0428;
+enum class VfsOwnerScopeOperation : uint8_t { IDENTIFY = 1, REGISTER = 2, CLOSE = 3, ACK = 4 };
+struct VfsOwnerScopeRequest {
+    VfsOwnerFdRequest owner{};
+    uint64_t process_generation = 0;
+    uint64_t scope_token = 0;
+    int32_t pid = 0;
+    VfsOwnerScopeOperation operation = VfsOwnerScopeOperation::IDENTIFY;
+    uint8_t reserved = 0;
+    uint16_t reserved2 = 0;
+} __attribute__((packed));
+static_assert(sizeof(VfsOwnerScopeRequest) == 64);
+constexpr auto wki_vfs_owner_scope_request_valid(const VfsOwnerScopeRequest& request, size_t length) -> bool {
+    if (length != sizeof(request) || request.reserved != 0 || request.reserved2 != 0 || request.owner.version != WKI_VFS_OWNER_VERSION ||
+        request.owner.reserved != 0 || request.owner.reserved2 != 0 || request.owner.binding_id == 0 ||
+        request.owner.owner_boot_epoch == 0 || request.owner.query_id == 0)
+        return false;
+    if (request.operation == VfsOwnerScopeOperation::IDENTIFY)
+        return wki_vfs_owner_fd_request_valid(request.owner, sizeof(request.owner)) && request.process_generation == 0 &&
+               request.pid == 0 && request.scope_token == 0;
+    if (request.process_generation == 0 || request.pid <= 0) return false;
+    if (request.operation == VfsOwnerScopeOperation::REGISTER)
+        return wki_vfs_owner_fd_request_valid(request.owner, sizeof(request.owner)) && request.scope_token == 0;
+    // Scope token is its own lifetime authority, independent of a numeric FD.
+    return (request.operation == VfsOwnerScopeOperation::CLOSE || request.operation == VfsOwnerScopeOperation::ACK) &&
+           request.owner.fd == 0 && request.owner.open_token == 0 && request.scope_token != 0;
+}
+struct VfsOwnerScopeResponse {
+    uint16_t version = WKI_VFS_OWNER_VERSION;
+    uint16_t length = sizeof(VfsOwnerScopeResponse);
+    uint32_t reserved = 0;
+    uint64_t query_id = 0;
+    uint64_t scope_token = 0;
+    uint64_t object = 0;
+    uint8_t state = 0;  // IDENTIFY=0, ACTIVE=1, CLOSED=2.
+    uint8_t reserved2 = 0;
+    uint16_t reserved3 = 0;
+    uint32_t reserved4 = 0;
+} __attribute__((packed));
+static_assert(sizeof(VfsOwnerScopeResponse) == 40);
+constexpr auto wki_vfs_owner_scope_reply_size_valid(int status, size_t length, size_t capacity) -> bool {
+    return status <= 0 && length <= capacity && length == (status == 0 ? sizeof(VfsOwnerScopeResponse) : 0);
+}
+constexpr auto wki_vfs_owner_scope_response_valid(const VfsOwnerScopeResponse& response, const VfsOwnerScopeRequest& request, size_t length)
+    -> bool {
+    if (!wki_vfs_owner_scope_request_valid(request, sizeof(request)) || length != sizeof(response) ||
+        response.version != WKI_VFS_OWNER_VERSION || response.length != sizeof(response) || response.reserved != 0 ||
+        response.reserved2 != 0 || response.reserved3 != 0 || response.reserved4 != 0 || response.query_id != request.owner.query_id ||
+        response.object == 0)
+        return false;
+    if (request.operation == VfsOwnerScopeOperation::IDENTIFY) return response.scope_token == 0 && response.state == 0;
+    if (request.operation == VfsOwnerScopeOperation::REGISTER)
+        return response.scope_token != 0 && (response.state == 1 || response.state == 2);
+    return response.scope_token == request.scope_token && response.state == 2;
 }
 constexpr uint16_t WKI_VFS_OPEN_LIFETIME_VERSION = 1;
 struct VfsOpenLifetimeRequest {

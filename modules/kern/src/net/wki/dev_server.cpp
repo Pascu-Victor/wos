@@ -577,7 +577,8 @@ auto is_vfs_op(uint16_t op_id) -> bool {
            op_id == OP_VFS_XATTR || op_id == OP_VFS_OPEN_READ_AS || op_id == OP_VFS_OPEN_AS || op_id == OP_VFS_FSTAT ||
            op_id == OP_VFS_STAT_AS || op_id == OP_VFS_PATH_AS || op_id == OP_VFS_EXEC_VIEW || op_id == OP_VFS_DIRECTORY_REFERENCE ||
            op_id == OP_VFS_DIRECTORY_GRANT || op_id == OP_VFS_OPEN_LIFETIME || op_id == OP_VFS_FEATURES || op_id == OP_VFS_SECURE_IO ||
-           (op_id == OP_VFS_VERSION || op_id == OP_VFS_APPEND || op_id == OP_VFS_WRITE_COMMITTED || op_id == OP_VFS_READ_OWNER);
+           (op_id == OP_VFS_VERSION || op_id == OP_VFS_APPEND || op_id == OP_VFS_WRITE_COMMITTED || op_id == OP_VFS_READ_OWNER ||
+            op_id == OP_VFS_LOCK_OWNER || op_id == OP_VFS_LOCK_SCOPE);
 }
 
 auto transport_is_roce(const WkiTransport* transport) -> bool {
@@ -2044,7 +2045,8 @@ auto wki_dev_server_admit_vfs_op_rx(const WkiHeader* hdr, const uint8_t* payload
           req->op_id == OP_VFS_FSTAT || req->op_id == OP_VFS_STAT_AS || req->op_id == OP_VFS_PATH_AS || req->op_id == OP_VFS_EXEC_VIEW ||
           req->op_id == OP_VFS_DIRECTORY_REFERENCE || (req->op_id == OP_VFS_DIRECTORY_GRANT || req->op_id == OP_VFS_OPEN_LIFETIME) ||
           req->op_id == OP_VFS_FEATURES || req->op_id == OP_VFS_SECURE_IO || req->op_id == OP_VFS_VERSION || req->op_id == OP_VFS_APPEND ||
-          req->op_id == OP_VFS_WRITE_COMMITTED || req->op_id == OP_VFS_READ_OWNER || req->op_id == OP_VFS_METADATA_BATCH)
+          req->op_id == OP_VFS_WRITE_COMMITTED || req->op_id == OP_VFS_READ_OWNER || req->op_id == OP_VFS_LOCK_OWNER ||
+          req->op_id == OP_VFS_LOCK_SCOPE || req->op_id == OP_VFS_METADATA_BATCH)
              ? EXPECTED_LEN != payload_len
              : EXPECTED_LEN > payload_len)) {
         return WkiVfsOpRxAdmission::NOT_APPLICABLE;
@@ -3319,8 +3321,8 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
          req->op_id == OP_VFS_FSTAT || req->op_id == OP_VFS_STAT_AS || req->op_id == OP_VFS_PATH_AS || req->op_id == OP_VFS_EXEC_VIEW ||
          req->op_id == OP_VFS_DIRECTORY_REFERENCE || (req->op_id == OP_VFS_DIRECTORY_GRANT || req->op_id == OP_VFS_OPEN_LIFETIME) ||
          req->op_id == OP_VFS_FEATURES || req->op_id == OP_VFS_SECURE_IO || req->op_id == OP_VFS_VERSION || req->op_id == OP_VFS_APPEND ||
-         req->op_id == OP_VFS_WRITE_COMMITTED || req->op_id == OP_VFS_READ_OWNER || req->op_id == OP_VFS_METADATA_BATCH ||
-         req->op_id == OP_BLOCK_SECURE_PREPARE)
+         req->op_id == OP_VFS_WRITE_COMMITTED || req->op_id == OP_VFS_READ_OWNER || req->op_id == OP_VFS_LOCK_OWNER ||
+         req->op_id == OP_VFS_LOCK_SCOPE || req->op_id == OP_VFS_METADATA_BATCH || req->op_id == OP_BLOCK_SECURE_PREPARE)
             ? EXPECTED_LEN != payload_len
             : EXPECTED_LEN > payload_len) {
         return;

@@ -32,6 +32,10 @@ class Object {
         return VALID;
     }
 
+    // Immutable retained-inode identity, independent of version availability.
+    // This grants no authority to reuse content, metadata or directory bytes.
+    auto identity() const -> uint64_t { return stamp_.object; }
+
     auto close_admission() -> bool {
         lock_.lock();
         closed_ = true;

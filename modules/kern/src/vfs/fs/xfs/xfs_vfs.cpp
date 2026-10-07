@@ -5884,6 +5884,12 @@ auto xfs_coherency_snapshot(File* file, coherency::Stamp& output) -> bool {
     return data != nullptr && data->inode != nullptr && data->inode->coherency.snapshot(output);
 }
 
+auto xfs_coherency_identity(File* file) -> uint64_t {
+    if (file == nullptr || file->fops != get_xfs_fops()) return 0;
+    auto* data = static_cast<XfsFileData*>(file->private_data);
+    return data != nullptr && data->inode != nullptr ? data->inode->coherency.identity() : 0;
+}
+
 namespace {
 
 constexpr size_t PUBLIC_XATTR_NAME_MAX = 255;

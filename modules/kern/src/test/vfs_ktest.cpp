@@ -467,6 +467,22 @@ KTEST(VFS, OwnerAdvisoryWaitCancelReplayAndRetirementUseBoundedNativeState) {
     KEXPECT_TRUE(ker::vfs::vfs_selftest_advisory_remote_waits());
 }
 
+KTEST(VFS, SharedOwnerOpenAllowsUnlockAndQueriesWhileOtherProcessesWait) {
+    KEXPECT_TRUE(ker::vfs::vfs_selftest_advisory_remote_shared_waiters());
+}
+
+KTEST(VFS, PosixScopeCloseCancelsWaitsAndOldWitnessCannotReleaseSuccessorLocks) {
+    KEXPECT_TRUE(ker::vfs::vfs_selftest_advisory_remote_scopes());
+}
+
+KTEST(VFS, ImmediateRemoteGrantsRemainReplayableAndUnlockProgressesAtCapacity) {
+    KEXPECT_TRUE(ker::vfs::vfs_selftest_advisory_remote_grant_receipts());
+}
+
+KTEST(VFS, PosixScopeCapacityIsFixedAndCloseAckAndRetirementRecoverStorage) {
+    KEXPECT_TRUE(ker::vfs::vfs_selftest_advisory_remote_scope_capacity());
+}
+
 KTEST(VFS, StreamCacheReadEligibility) { KEXPECT_TRUE(ker::vfs::vfs_selftest_stream_cache_read_eligibility()); }
 
 KTEST(VFS, RemoteReadBounceMatchesBulkWindow) { KEXPECT_TRUE(ker::vfs::vfs_selftest_remote_read_bounce_window()); }

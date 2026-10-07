@@ -27,7 +27,7 @@ TEST(VfsAdvisoryReceipt, ImmutableIntentAndFirstNativeRangeSurvivePollAndReplay)
     changed_range.end = 107;
     EXPECT_EQ(receipt.claim(31, COMMAND, changed_range), RemoteAdvisoryClaim::PENDING);
     EXPECT_EQ(receipt.prepared().start, 8U);
-    for (unsigned field = 0; field < 12; ++field) {
+    for (unsigned field = 0; field < 13; ++field) {
         auto command = COMMAND;
         if (field == 0) ++command.owner.generation;
         if (field == 1) ++command.owner.boot_epoch;
@@ -44,6 +44,7 @@ TEST(VfsAdvisoryReceipt, ImmutableIntentAndFirstNativeRangeSurvivePollAndReplay)
             command.query = true;
             command.wait = false;
         }
+        if (field == 12) command.scope_token = 41;
         EXPECT_EQ(receipt.probe(31, command), RemoteAdvisoryClaim::MISMATCH) << field;
     }
     EXPECT_EQ(receipt.probe(32, COMMAND), RemoteAdvisoryClaim::BUSY);

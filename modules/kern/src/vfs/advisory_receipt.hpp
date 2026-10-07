@@ -6,7 +6,7 @@
 
 namespace ker::vfs {
 
-enum class RemoteAdvisoryPhase : uint8_t { START = 1, POLL = 2, CANCEL = 3 };
+enum class RemoteAdvisoryPhase : uint8_t { START = 1, POLL = 2, CANCEL = 3, ACK = 4 };
 enum class RemoteAdvisoryState : uint8_t { EMPTY, PENDING, COMPLETE, CANCELLED };
 enum class RemoteAdvisoryClaim : uint8_t { NEW, PENDING, REPLAY, STALE, MISMATCH, BUSY, INVALID, CLOSED };
 
@@ -14,6 +14,7 @@ enum class RemoteAdvisoryClaim : uint8_t { NEW, PENDING, REPLAY, STALE, MISMATCH
 // to its first owner admission, so replay/poll cannot move SEEK_END locks.
 struct RemoteAdvisoryCommand {
     RemoteAdvisoryOwner owner{};
+    uint64_t scope_token = 0;
     RemoteAdvisoryKind kind = RemoteAdvisoryKind::PROCESS;
     int64_t start = 0;
     int64_t length = 0;
@@ -25,8 +26,8 @@ struct RemoteAdvisoryCommand {
     constexpr auto operator==(const RemoteAdvisoryCommand&) const -> bool = default;
     constexpr auto valid() const -> bool {
         bool const KIND = kind == RemoteAdvisoryKind::PROCESS || kind == RemoteAdvisoryKind::OPEN_FILE || kind == RemoteAdvisoryKind::FLOCK;
-        return owner.valid() && KIND && type >= 0 && type <= 2 && whence >= 0 && whence <= 2 &&
-               (!query || (!wait && kind != RemoteAdvisoryKind::FLOCK)) && (!wait || type != 2);
+        return owner.valid() && KIND && (kind == RemoteAdvisoryKind::PROCESS || scope_token == 0) && type >= 0 && type <= 2 &&
+               whence >= 0 && whence <= 2 && (!query || (!wait && kind != RemoteAdvisoryKind::FLOCK)) && (!wait || type != 2);
     }
 };
 struct RemoteAdvisoryPrepared {
@@ -34,6 +35,7 @@ struct RemoteAdvisoryPrepared {
     uint64_t ino = 0;
     uint64_t start = 0;
     uint64_t end = 0;
+    uint64_t object = 0;
     constexpr auto valid() const -> bool { return ino != 0 && start < end; }
 };
 struct RemoteAdvisoryOutcome {
@@ -122,6 +124,7 @@ class RemoteAdvisoryReceipt {
     }
     auto pending() const -> bool { return state_ == RemoteAdvisoryState::PENDING; }
     auto waiting() const -> bool { return waiting_; }
+    auto operation() const -> uint64_t { return operation_; }
     auto command() const -> const RemoteAdvisoryCommand& { return command_; }
     auto prepared() const -> const RemoteAdvisoryPrepared& { return prepared_; }
 

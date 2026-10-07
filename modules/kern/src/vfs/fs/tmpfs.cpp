@@ -2546,6 +2546,12 @@ auto tmpfs_coherency_snapshot(File* file, coherency::Stamp& output) -> bool {
     return node != nullptr && node->coherency.snapshot(output);
 }
 
+auto tmpfs_coherency_identity(File* file) -> uint64_t {
+    if (file == nullptr || file->fops != get_tmpfs_fops()) return 0;
+    auto* node = tmpfs_canonical_node(static_cast<TmpNode*>(file->private_data));
+    return node != nullptr ? node->coherency.identity() : 0;
+}
+
 auto tmpfs_copy_file_contents(TmpNode* dst, TmpNode* src) -> int {
     dst = tmpfs_canonical_node(dst);
     src = tmpfs_canonical_node(src);

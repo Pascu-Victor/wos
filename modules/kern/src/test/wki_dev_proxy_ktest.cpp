@@ -139,8 +139,20 @@ KTEST(WkiRemoteVfsOwnerWrite, PolicyAdmissionAndRetirementKeepOneFile) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_owner_write_policy());
 }
 
+KTEST(WkiRemoteVfsOwnerRead, LegacyOperationsRetainFileAcrossRegistryRetirement) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_owner_file_lifetime());
+}
+
 KTEST(WkiRemoteVfsCoherency, ExactOwnerVersionAuthorityDeniesStaleOpenAndRetainsAdmittedFile) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_owner_version_admission());
+}
+
+KTEST(WkiRemoteVfsCoherency, OwnerAdvisoryAdapterDerivesScopeAndPreservesSharedOpenWaits) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_owner_advisory());
+}
+
+KTEST(WkiRemoteVfsCoherency, OwnerScopeControllerUsesTokenAuthorityAndNeverClosesSuccessor) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_owner_scope_controller());
 }
 
 KTEST(WkiRemoteVfsCoherency, OwnerAppendSharesNativeOffsetAndReplaysOnlyExactCompletedOutcome) {

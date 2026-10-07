@@ -88,6 +88,10 @@ struct File {
     // Owner-side remote advisory admission. Retirement closes this before
     // releasing arbiter state; retained native I/O does not reopen admission.
     std::atomic<bool> remote_advisory_closed{false};
+    // Native manager protects this watermark/recent synchronous receipt.
+    // Pending/terminal acquisitions use the separate fixed owner operation table so
+    // a fork-shared open can still issue query/unlock while another task waits.
+    uint64_t remote_advisory_highest_operation = 0;
     RemoteAdvisoryReceipt remote_advisory_receipt;
     std::atomic<int> refcount{0};  // reference count for shared file descriptors (fork/exec)
     int open_flags{};              // O_RDONLY, O_WRONLY, etc. - preserved from open() for fcntl F_GETFL

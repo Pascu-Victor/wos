@@ -92,11 +92,14 @@ Reconnaissance and initial patch contract are recorded locally under
 host cases and ten owner-version/append/positioned-I/O wire cases passed under
 ASan/UBSan, alongside 43 existing wire cases. Four additional production
 advisory-receipt cases passed, including 128 concurrent grant/cancel/retire
-races. Normal Build WOS and fast diagnostic KTEST compilation passed. Native
+races. Four production scope cases passed, including 128 concurrent close/
+retirement races. Four lock wire and three further scope wire cases passed (93 focused host
+cases total). Normal Build WOS and fast diagnostic KTEST compilation passed. Native
 tmpfs content/metadata/namespace and XFS committed-inode/data hooks now maintain
 private owner revisions; exact-open authenticated version requests use deferred
 owner work and strict reply framing. The version feature remains unadvertised.
-Isolated KTEST runs passed 73,270, 73,280, 73,282 and 73,284 assertions
+Isolated KTEST runs passed 73,270, 73,280, 73,282, 73,284, 73,301, 73,302 and
+73,304, 73,305, 73,306 and 73,307 assertions
 respectively, with zero failures. The second includes client cache-authority
 policy and an actual owner append fixture sharing native EOF with a local open,
 strict replay, stale-token rejection and retained-handle close behavior. The
@@ -159,15 +162,52 @@ native outcomes passed, while multi-client packet/failure qualification remains.
 The shared native advisory API now distinguishes authenticated remote process
 scopes from local PID ownership and uses the same inode table for owner-local
 and remote POSIX/OFD/flock conflicts. It has 512 fixed process/open
-associations, with at most 32 scopes per open, and one inline replay receipt per
-open. Owner waits have a global limit of 64 pending limit; START/POLL/CANCEL
-never sleep for a contested lock. Admission closure is permanent, and task-
+associations, with at most 32 scopes per open. Each open retains a monotonic
+operation watermark and recent synchronous query/unlock replay receipt; up to 64 global
+pending/terminal acquisition records remain until exact ACK or retirement. Every
+acquisition reserves its receipt before a native effect, including an immediate
+grant; higher shared-open query/unlock IDs cannot erase its result. Query and
+unlock remain available when acquisition replay storage is full. A shared
+open can accept unlock/query and independent waits while another process waits.
+ACK releases only terminal receipt storage, preserving any granted lock.
+START/POLL/CANCEL/ACK never sleep for a contested lock. Admission closure is
+permanent, and task-
 context retirement releases the pending capacity and applicable locks before the
 registry File reference drops. Saved native ranges preserve the first
 admission's EOF/client position. Native normalization reads the retained backend
 directly rather than generic stat cache authority. The normal build and
 production receipt host race tests passed; isolated KTEST passed the native
-arbitration, bounded waiter, cancel/grant, replay, close and retirement fixtures
-(73,284 assertions, zero failures). Lock RPC, interruptible client parking,
-independent process-close replay and packet-level cleanup qualification remain
-required before advertising owner locks.
+arbitration, bounded waiter, cancel/grant, replay, close and retirement fixtures.
+The subsequent run passed real shared-open unlock/query during child waits,
+multiple pending process scopes and ACK/capacity recovery. Lazy nonreused Task
+process generations also passed PID reuse and retained thread-owner tests
+(73,301 assertions, zero failures). The additive lock RPC owner adapter derives
+peer/boot from the authenticated binding, retains the exact native File and
+validates fixed operation-echoed replies. Its native foundation passed in the
+following 73,302-assertion run. The unpublished PROCESS format now requires a
+nonzero process/inode scope token; OFD/flock retain description ownership.
+
+Native POSIX scopes have 512 fixed records and nonreused owner tokens. A retained
+ordinary open witnesses a canonical inode/process scope. Closing it releases
+only that scope's POSIX locks and cancels pending POSIX requests; repeated close
+cannot release a later scope. ACK frees closed receipt storage. Registration
+watermarks prevent a delayed register from resurrecting an acknowledged scope,
+and old witness retirement acts only on its admitted token. Identity-only probes
+remain available during version publication and grant no cache freshness.
+The native scope lifecycle/capacity fixture passed in the 73,304-assertion run.
+Independent scope CLOSE/ACK wire controls now use scope authority and an exact
+authenticated binding, with no numeric FD lookup. Their native controller passed
+in the 73,305-assertion run, including old close/ACK successor protection and
+preservation of disjoint OFD and flock locks on process scope close. Client scope
+witnesses, any-descriptor close outboxes,
+interruptible parking and packet-level cleanup qualification remain required
+before advertising owner locks.
+
+Legacy read, directory batch, fstat, seek and fsync owner handlers now acquire
+their own File reference before leaving the registry lock. Native operations and
+final releases run outside that lock. The 73,306-assertion run passed retirement
+from admitted read/directory/seek callbacks and generic stat/fsync after registry
+retirement, including access, callback and stale-channel denials. The subsequent
+73,307-assertion run passed immediate-grant replay across higher shared-open
+queries and unlocks, all 64 terminal receipt slots, denial before a 65th effect,
+unlock progress at capacity, ACK recovery and successor preservation.

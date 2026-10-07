@@ -13,6 +13,7 @@
 #include <syscalls_impl/process/child_events.hpp>
 #include <syscalls_impl/time/time.hpp>
 #include <test/ktest.hpp>
+#include <vfs/advisory.hpp>
 #include <vfs/fd_reservation.hpp>
 #include <vfs/file.hpp>
 #include <vfs/fs/procfs.hpp>
@@ -826,4 +827,44 @@ KTEST(ResourceCpuObservation, ExitContributorsRetireBeforeMetadata) {
     KEXPECT_EQ(process.resource_cpu_threads.load(), 0);
     KEXPECT_EQ(process.resource_thread_owners.load(), 0);
     KEXPECT_EQ(process.ref_count.load(), 1);
+}
+
+KTEST(ResourceIdentity, RemoteAdvisoryGenerationUsesRetainedOwnerAndRejectsPidReuse) {
+    namespace resource = ker::mod::sched::resource;
+    Task first{};
+    first.pid = 0x7B54;
+    first.type = ker::mod::sched::task::TaskType::PROCESS;
+    Task reused{};
+    reused.pid = first.pid;
+    reused.type = first.type;
+    KEXPECT_EQ(ker::vfs::vfs_advisory_process_generation(first, false), uint64_t{0});
+    uint64_t const GENERATION = ker::vfs::vfs_advisory_process_generation(first);
+    KREQUIRE_NE(GENERATION, uint64_t{0});
+    KEXPECT_EQ(ker::vfs::vfs_advisory_process_generation(first), GENERATION);
+    KEXPECT_EQ(ker::vfs::vfs_advisory_process_generation(first, false), GENERATION);
+    KEXPECT_EQ(ker::vfs::vfs_advisory_process_generation(reused, false), uint64_t{0});
+    uint64_t const REUSED = ker::vfs::vfs_advisory_process_generation(reused);
+    KEXPECT_NE(REUSED, uint64_t{0});
+    KEXPECT_NE(REUSED, GENERATION);
+    {
+        Task thread{};
+        thread.pid = first.pid + 1;
+        thread.type = first.type;
+        thread.is_thread = true;
+        thread.owner_pid = first.pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(thread, first));
+        KEXPECT_EQ(thread.advisory_process_generation.load(), uint64_t{0});
+        KEXPECT_EQ(ker::vfs::vfs_advisory_process_generation(thread, false), GENERATION);
+        KEXPECT_EQ(ker::vfs::vfs_advisory_process_generation(thread), GENERATION);
+        // Its owner remains authoritative after normal PID lookup admission closes.
+        first.state.store(ker::mod::sched::task::TaskState::EXITING);
+        KEXPECT_EQ(ker::vfs::vfs_advisory_process_generation(thread), GENERATION);
+        KEXPECT_EQ(first.resource_thread_owners.load(), uint32_t{1});
+    }
+    KEXPECT_EQ(first.resource_thread_owners.load(), uint32_t{0});
+    Task unbound{};
+    unbound.is_thread = true;
+    unbound.owner_pid = reused.pid;
+    KEXPECT_EQ(ker::vfs::vfs_advisory_process_generation(unbound), uint64_t{0});
+    KEXPECT_EQ(unbound.advisory_process_generation.load(), uint64_t{0});
 }

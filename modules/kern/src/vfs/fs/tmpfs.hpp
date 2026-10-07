@@ -312,4 +312,5 @@ auto tmpfs_fops_isatty(ker::vfs::File* f) -> bool;
 // Get tmpfs FileOperations structure
 auto get_tmpfs_fops() -> ker::vfs::FileOperations*;
 auto tmpfs_coherency_snapshot(File* file, coherency::Stamp& output) -> bool;
+auto tmpfs_coherency_identity(File* file) -> uint64_t;
 }  // namespace ker::vfs::tmpfs

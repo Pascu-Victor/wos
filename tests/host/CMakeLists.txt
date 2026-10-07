@@ -1844,3 +1844,7 @@ set_tests_properties(rtld_gnu_bloom_runtime_test PROPERTIES LABELS "host;unit")
 wos_add_unit_test(vfs_advisory_receipt_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vfs_advisory_receipt_test.cpp
 )
+
+wos_add_unit_test(vfs_advisory_scope_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vfs_advisory_scope_test.cpp
+)
