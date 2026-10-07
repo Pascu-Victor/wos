@@ -270,8 +270,13 @@ def test_wki_host_mount_scratch_is_initialized_by_its_producers() -> None:
     mount = function_body(core, "ensure_wki_host_root_mount")
     if "vfs_mkdir(mount_root.data()" in mount:
         fail("host-root attach must not recurse through mapped mkdir before mount publication")
-    if "wki_remote_vfs_mount(NODE_ID, find_ctx.result.resource_id, mount_root.data(), find_ctx.result.generation)" not in mount:
-        fail("host-root attach must directly publish the observed resource generation")
+    if re.search(
+        r"wki_remote_vfs_mount\(NODE_ID,\s*find_ctx\.result\.resource_id,\s*mount_root\.data\(\),"
+        r"\s*find_ctx\.result\.generation,\s*nullptr,\s*nullptr,"
+        r"\s*ker::net::wki::RemoteVfsMountOrigin::AUTOMATIC\)",
+        mount,
+    ) is None:
+        fail("host-root attach must publish the observed generation with automatic origin")
 
     for failure_gate in [
         "if (STRIP_RET < 0)",
@@ -321,7 +326,7 @@ def test_wki_host_mount_scratch_is_initialized_by_its_producers() -> None:
             "if (MOUNT_PATH_RET <= 0 || static_cast<size_t>(MOUNT_PATH_RET) >= mount_root.size())",
             "std::array<char, MAX_PATH_LEN> resolved_mount_root __attribute__((uninitialized));",
             "resolve_mount_path(mount_root.data(), resolved_mount_root.data(), resolved_mount_root.size()) == 0",
-            "wki_remote_vfs_mount(NODE_ID, find_ctx.result.resource_id, mount_root.data(), find_ctx.result.generation)",
+            "wki_remote_vfs_mount(NODE_ID, find_ctx.result.resource_id, mount_root.data(), find_ctx.result.generation,",
             "log::info(\"auto-mounted WKI host root %s for path %s\", mount_root.data(), logical.data())",
         ],
         "WKI host mount root-path producer ordering",
@@ -841,25 +846,31 @@ def test_readdir_batch_buffers_use_bounded_stack_storage() -> None:
         "remote readdir wire-derived stack capacities",
     )
 
-    client_body = function_body(source, "remote_vfs_readdir")
+    client_body = function_body(source, "read_fresh_legacy_directory_entry")
     require_order(
         client_body,
         [
-            "std::array<uint8_t, VFS_READDIR_BATCH_DATA_CAPACITY> batch_buf __attribute__((uninitialized))",
-            "memcpy(req_data.data() + 8, &VFS_READDIR_BATCH_MAX_ENTRIES",
-            "vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_READDIR_BATCH",
-            "batch_buf.data()",
-            "static_cast<uint16_t>(batch_buf.size())",
-            "memcpy(&count, batch_buf.data(), sizeof(uint32_t))",
-            "vfs_readdir_batch_payload_is_valid(resp_len, count)",
-            "for (uint32_t i = 0; i < count; i++)",
+            "if (index > UINT32_MAX) return -EOVERFLOW",
+            "std::array<uint8_t, sizeof(uint32_t) + sizeof(ker::vfs::DirEntry)> bytes{}",
+            "fetch(request_index, std::span<uint8_t>(bytes), length)",
+            "if (STATUS != 0) return STATUS",
+            "if (length < sizeof(count)) return -EPROTO",
+            "std::memcpy(&count, bytes.data(), sizeof(count))",
+            "count > 1 || length != sizeof(count) + static_cast<size_t>(count) * sizeof(ker::vfs::DirEntry)",
+            "if (count == 0) return -ENOENT",
+            "directory_record_valid(candidate)",
+            "legacy_directory_next_index(request_index, candidate.d_off, next)",
+            "output = candidate",
         ],
-        "consumer readdir batch stack storage and length validation",
+        "fresh legacy directory parser validates the exact bounded initialized entry",
+    )
+    require_order(
+        function_body(source, "remote_vfs_readdir_locked"),
+        ["read_fresh_legacy_directory_entry(", "constexpr uint32_t MAXIMUM = 1", "vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_READDIR_BATCH"],
+        "legacy callback requests one fresh entry instead of caching ordinal batches",
     )
     if re.search(r"\bnew\b|delete\s*\[\s*\]|\bmemset\s*\(", client_body):
-        fail("consumer readdir batch retained heap allocation or full-buffer clearing")
-    if re.search(r"\bbatch_buf\s*(?:\{\}|=\s*\{\})", client_body):
-        fail("consumer readdir batch zero-initializes its full stack buffer")
+        fail("fresh legacy directory parser must retain fixed stack storage")
 
     handler_body = function_body(source, "handle_vfs_op")
     batch_start = handler_body.find("case OP_VFS_READDIR_BATCH:")
@@ -1092,7 +1103,7 @@ def test_shared_io_callers_timeout_or_fallback() -> None:
             "SharedIoSlotGuard const SHARED_IO_GUARD(ctx->proxy, wki_now_us())",
             "if (!SHARED_IO_GUARD.acquired())",
             "skip_read_rdma_this_call = true",
-            "const bool RDMA_READ_ENABLED = !skip_read_rdma_this_call",
+            "const bool RDMA_READ_ENABLED = !OWNER_IO && !skip_read_rdma_this_call",
             "SharedIoSlotGuard const SHARED_IO_GUARD(ctx->proxy, wki_now_us())",
             "if (SHARED_IO_GUARD.acquired())",
             "int rdma_error = 0",
@@ -1144,7 +1155,10 @@ def test_message_fallback_readahead_targets_small_sequential_reads() -> None:
             "uint16_t const BYTES_READ = resp_len",
             "if (BYTES_READ == 0)",
             "ctx->read_cache->cached_offset = cur_offset",
-            "ctx->read_cache->cached_len = BYTES_READ",
+            "bool const VALIDATED = query_remote_owner_version(*ctx, owner_after) == 0",
+            "ctx->read_cache->validation.publish(owner_before, owner_after, ker::vfs::coherency::Domain::CONTENT)",
+            "ctx->read_cache->cached_len = VALIDATED ? BYTES_READ : 0",
+            "if (!VALIDATED) ctx->read_cache->validation.invalidate()",
             "auto to_copy = static_cast<uint16_t>(std::min(static_cast<uint32_t>(BYTES_READ), remaining))",
             "remaining -= to_copy",
         ],
@@ -1250,7 +1264,7 @@ def test_server_open_reuses_the_open_file_stat_snapshot() -> None:
             "if (prefetch_rkey != 0",
             "reservation.publish(file, 0, 0, 0, ordinary_token, ordinary_binding_id)",
             "open_resp.fd = fd_id",
-            "int const SEND_RET = wki_send_on_channel_identity(channel_identity",
+            "int const SEND_RET = send_reply(resp_buf.data()",
             "if (SEND_RET != WKI_OK)",
             "RemoteVfsFd* rfd = find_remote_fd(channel_identity, fd_id)",
             "rfd->file == file",
@@ -1553,6 +1567,38 @@ def test_server_message_read_uses_bounded_stack_response() -> None:
         fail("server message read zero-initializes unused response capacity")
     if "WKI_ETH_MAX_PAYLOAD <= ker::mod::mm::KERNEL_STACK_SIZE / 16" not in source:
         fail("server message-read stack response lacks a kernel-stack headroom bound")
+
+
+def test_ordinary_open_replies_retain_completed_results_on_pressure() -> None:
+    handler = function_body(REMOTE_VFS_CPP.read_text(), "handle_vfs_op")
+    start = handler.find("case OP_VFS_OPEN_READ_AS:")
+    end = handler.find("case OP_VFS_SECURE_IO:", start)
+    if start < 0 or end < 0:
+        fail("ordinary mapped open cases must remain present")
+    opened = handler[start:end]
+    if "wki_send_on_channel_identity" in opened:
+        fail("ordinary open bypasses bounded completed-response admission")
+    if opened.count("send_simple_resp(resp)") != 4:
+        fail("ordinary open failures must retain their completed response")
+    require_order(
+        opened,
+        [
+            "vfs_open_file_resolved_beneath_as",
+            "reservation.publish(file",
+            "int const SEND_RET = send_reply(resp_buf.data()",
+            "if (SEND_RET != WKI_OK)",
+            "find_remote_fd(channel_identity, fd_id)",
+            "rfd->file == file",
+            "s_vfs_lock.unlock()",
+            "release_server_file(orphan)",
+        ],
+        "ordinary open retires only its exact published FD after terminal enqueue refusal",
+    )
+    require_tokens(
+        handler,
+        ["send_completed_vfs_reply(channel_identity, response, bytes, binding_retiring)", "return RESULT;"],
+        "ordinary open uses the existing retry helper and observes its final result",
+    )
 
 
 def test_readlink_cache_invalidation_is_generation_based() -> None:
@@ -1874,36 +1920,33 @@ def test_write_behind_storage_grows_in_allocator_shaped_classes() -> None:
     require_order(
         write_body,
         [
-            "bool allow_write_behind_growth = true",
-            "bool const IS_SEQUENTIAL",
-            "if (!IS_SEQUENTIAL)",
-            "flush_write_behind(ctx)",
-            "continue",
-            "uint64_t const REQUIRED_CAPACITY",
-            "!try_reserve_write_behind(wb, REQUIRED_CAPACITY)",
-            "allow_write_behind_growth = false",
-            "uint32_t const SPACE = wb->capacity - wb->pending_len",
-            "memcpy(wb->data.get() + wb->pending_len, src, TO_BUFFER)",
-            "total_written += TO_BUFFER",
-            "if (wb->pending_len >= wb->capacity)",
-            "flush_write_behind(ctx)",
-            "return total_written",
+            "ker::mod::sys::MutexGuard io_guard(context.io_lock)",
+            "consume_remote_file_cache_invalidation(&context)",
+            "if (context.secure_write_error != 0) return context.secure_write_error",
+            "capture_secure_vfs_client(context, identity)",
+            "query_remote_owner_features(context, identity)",
+            "int const FLUSH = flush_write_behind(&context)",
+            "if (FLUSH != 0) return FLUSH",
+            "invalidate_remote_file_open_caches(&context)",
+            "secure_vfs_client_write(context, identity",
+            "secure_vfs_message_write(context, identity",
+            "owner_message_write(context, identity",
+            "legacy_message_write(context, required_identity",
+            "result.outcome != WkiSecureRdmaOutcome::EXACT",
+            "context.secure_write_error = ERROR",
+            "return total > 0 ? total : ERROR",
+            "total += result.bytes",
+            "return total",
         ],
-        "adaptive remote VFS sequential write path",
+        "remote writes flush retained legacy ranges and report only exact owner effects",
     )
-    if "wb->data.data()" in write_body:
-        fail("adaptive remote VFS write path must use the owning storage pointer")
-    if "remaining >= VFS_WRITE_BEHIND_SIZE" in write_body:
-        fail("large remote VFS writes must continue through the RDMA-capable write-behind path")
-    if "WRITTEN_BEFORE_BUFFER" in write_body:
-        fail("remote VFS must report bytes already accepted into write-behind after a flush failure")
+    if "try_reserve_write_behind(" in write_body or "total_written += TO_BUFFER" in write_body:
+        fail("new writes must not silently accept dirty bytes before an owner reply")
 
     for function_name in [
         "remote_vfs_read",
-        "remote_vfs_write_impl",
         "remote_vfs_truncate_impl",
         "remote_vfs_fsync_file",
-        "wki_remote_vfs_fstat",
     ]:
         require_order(
             function_body(source, function_name),
@@ -1913,6 +1956,16 @@ def test_write_behind_storage_grows_in_allocator_shaped_classes() -> None:
             ],
             f"{function_name} adaptive write-behind serialization and deferred invalidation",
         )
+    require_order(
+        function_body(source, "wki_remote_vfs_fstat"),
+        ["ker::mod::sys::MutexGuard io_guard(context->io_lock)", "remote_vfs_fstat_locked(file, statbuf)"],
+        "fstat wrapper serializes its exact retained context",
+    )
+    require_order(
+        function_body(source, "remote_vfs_fstat_locked"),
+        ["consume_remote_file_cache_invalidation(ctx)", "flush_write_behind(ctx)", "query_remote_owner_features(*ctx, identity)"],
+        "locked fstat consumes invalidation and legacy dirty errors before fresh observation",
+    )
     require_order(
         function_body(source, "remote_vfs_lseek"),
         [
@@ -2384,7 +2437,6 @@ def test_remote_vfs_unmount_cancels_waiters_before_teardown() -> None:
             "deactivate_vfs_proxy_locked(state, teardown, true)",
             "stage_vfs_detach_locked(state, teardown.owner_node, teardown.resource_id",
             "state->mount_released = true",
-            "invalidate_all_dir_caches(state)",
         ],
         "remote VFS group unmount claim",
     )
@@ -2533,7 +2585,6 @@ def test_vfs_detach_uses_exact_negotiated_incarnation_form() -> None:
         cleanup_body,
         [
             "deactivate_vfs_proxy_locked(p, cleanup, false)",
-            "invalidate_all_dir_caches(p)",
             "s_vfs_lock.unlock()",
             "finish_proxy_teardown_op_waiter(cleanup, -1)",
             "wake_proxy_slot_waiters(cleanup)",
@@ -3213,9 +3264,7 @@ def test_invalidate_notify_retains_and_invalidates_complete_mount_group() -> Non
             "member->lifecycle_refs++",
             "group.members",
             "group.count++",
-            "invalidate_all_dir_caches(member)",
             "state->lifecycle_refs++",
-            "invalidate_all_dir_caches(state)",
         ],
         "whole-group invalidate retention",
     )
@@ -3234,7 +3283,6 @@ def test_invalidate_notify_retains_and_invalidates_complete_mount_group() -> Non
             "anchor->lanes",
             "member->lifecycle_refs++",
             "group.count++",
-            "invalidate_all_dir_caches(member)",
         ],
         "mount-group retention under the VFS lock",
     )
@@ -3753,8 +3801,8 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
     )
     if source.count("acquire_vfs_proxy_lane(anchor,") != 1:
         fail("only data-oriented open may request RDMA-anchor lane selection")
-    fstat_body = function_body(source, "wki_remote_vfs_fstat")
-    require_tokens(fstat_body, ["ctx->proxy, OP_VFS_FSTAT", "&ctx->remote_fd"], "fstat keeps its FD lane and descriptor")
+    fstat_body = function_body(source, "remote_vfs_fstat_locked")
+    require_tokens(fstat_body, ["ctx->proxy, OP_VFS_FSTAT", "&ctx->remote_fd", "query_remote_owner_observation(*ctx, identity"], "fstat keeps its exact FD lane for owner observations and legacy fallback")
     if "wki_remote_vfs_stat(mount->private_data" in fstat_body:
         fail("fstat must not reselect a lane for an existing remote FD")
 
@@ -4691,6 +4739,7 @@ def main() -> None:
     test_server_backing_path_mutations_bypass_worker_task_root()
     test_remote_path_utimens_preserves_owner_time_and_routing()
     test_server_message_read_uses_bounded_stack_response()
+    test_ordinary_open_replies_retain_completed_results_on_pressure()
     test_readlink_cache_invalidation_is_generation_based()
     test_server_roce_push_reads_reuse_registered_staging()
     test_remote_metadata_scratch_initializes_only_consumed_prefix()

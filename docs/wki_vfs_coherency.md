@@ -504,3 +504,42 @@ An Ethernet run with existing `mutex.stall` and `wki.wait_diag` flags passed the
 full campaign, but an uninstrumented control failed an ordinary OPEN_AS timeout.
 Timing from the diagnostic run does not establish an Ethernet liveness fix.
 New capabilities remain opt-in while these remaining checks are investigated.
+
+
+## Ordinary open reply admission
+
+Completed `OPEN_AS` and `OPEN_READ_AS` replies use the existing bounded reply
+admission helper. Only pre-publication `NO_ROUTE`, `NO_MEM` and `NO_CREDITS`
+refusals can retry immutable response bytes while the retained binding and exact
+channel generation remain live. Accepted replies transfer reliability ownership
+once; the native open is never repeated. A terminal refusal retires only the
+exact published remote FD under the existing registry lock and closes its
+retained File after unlocking. Failure responses preserve their original cookie,
+status and framing. No wire or capability change is involved.
+
+Normal Build WOS, isolated fast diagnostic compilation, formatting and all 62
+remote-VFS source audits passed. The audit also follows current Goal26 cache,
+committed-write, directory and mount-origin paths instead of obsolete source
+assumptions. `ETHdebug2` passed the full TMPFS/XFS campaign on three nodes with
+all pending-wait gates and complete zero final reference drains. It used the
+public debugger startup pause/resume without additional diagnostic kernel flags;
+its timing does not prove ordinary cold-start liveness. The ordinary `ETHpos10`
+control failed a FEATURES timeout during root/export reconciliation. Both runs'
+twelve disks were pruned. The completed-open admission correction is mechanically
+verified, but is not claimed to fix that independent startup failure.
+
+`IVfault7` passed the lock-response drop campaign on both filesystems across
+three processes, with exact single applied/drop receipts, all native pending
+wait gates, complete final zero reference drains and normal WKI shutdown. Its
+eight disks and shared backing were pruned. Together with the preceding append
+and lock duplicate/reorder cases, all six named packet actions now have passing
+receipts. The first dropped lock response need not be a committed grant; this
+provides no lost-grant, fencing or session-replacement claim.
+
+Isolated runtime27 passed 73,505 assertions with zero failures and normal
+selftest poweroff. All eleven required regression fixtures passed, including
+the real completed-response retry helper's transient refusal, terminal error,
+retirement, deadline, generation and unsafe-context cases. All 38 source/ELF
+pins matched and all four private images were pruned. This verifies the shared
+admission behavior used by the corrected ordinary-open paths; the separate
+startup timeout remains an unresolved runtime observation.

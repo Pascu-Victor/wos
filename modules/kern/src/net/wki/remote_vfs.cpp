@@ -13475,6 +13475,7 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             ker::mod::dbg::logger<"wki">::warn("VFS reply enqueue failed: peer=0x%04x ch=%u gen=%u op=%u cookie=%u bytes=%u result=%d",
                                                hdr->src_node, channel_id, channel_identity.generation, op_id, REQ_COOKIE, bytes, RESULT);
         }
+        return RESULT;
     };
     auto send_simple_resp = [&](DevOpRespPayload& resp) {
         resp.reserved = REQ_COOKIE;
@@ -13924,7 +13925,7 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
                 resp.status = -1;
                 resp.data_len = 0;
                 resp.reserved = REQ_COOKIE;
-                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
+                send_simple_resp(resp);
                 break;
             }
 
@@ -13980,7 +13981,7 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
                 resp.status = -EPERM;
                 resp.data_len = 0;
                 resp.reserved = REQ_COOKIE;
-                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
+                send_simple_resp(resp);
                 break;
             }
 
@@ -14015,7 +14016,7 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
                 resp.status = static_cast<int16_t>(open_result);
                 resp.data_len = 0;
                 resp.reserved = REQ_COOKIE;
-                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
+                send_simple_resp(resp);
                 break;
             }
 
@@ -14079,7 +14080,7 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
                 resp.status = -ENOTCONN;
                 resp.data_len = 0;
                 resp.reserved = REQ_COOKIE;
-                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
+                send_simple_resp(resp);
                 break;
             }
             open_resp.fd = fd_id;
@@ -14099,8 +14100,9 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             perf_record_vfs_server_point(static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsServerOp::REPLY_SEND), hdr->src_node, channel_id,
                                          CORRELATION, 0, static_cast<uint16_t>(sizeof(DevOpRespPayload) + OPEN_DATA_LEN), CALLSITE);
 
-            int const SEND_RET = wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, resp_buf.data(),
-                                                              static_cast<uint16_t>(sizeof(DevOpRespPayload) + OPEN_DATA_LEN));
+            // Retain the completed open response through transient enqueue pressure.
+            // Never repeat the native open; only terminal refusal retires its exact FD.
+            int const SEND_RET = send_reply(resp_buf.data(), static_cast<uint16_t>(sizeof(DevOpRespPayload) + OPEN_DATA_LEN));
             if (SEND_RET != WKI_OK) {
                 ker::vfs::File* orphan = nullptr;
                 s_vfs_lock.lock();
