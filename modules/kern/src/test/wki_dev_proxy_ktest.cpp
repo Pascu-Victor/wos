@@ -183,7 +183,7 @@ KTEST(WkiRemoteVfsOpen, OwnerTokenCancellationCannotRepeatOrReachSuccessor) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_open_lifetime_owner());
 }
 
-KTEST(WkiRemoteVfsOpen, ClientCancellationSurvivesAbandonedWaitsAndSlotReuse) {
+KTEST(WkiRemoteVfsOpen, ClientCancellationAndFinalCloseSurviveAbandonedWaitsAndSlotReuse) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_open_lifetime_client());
 }
 

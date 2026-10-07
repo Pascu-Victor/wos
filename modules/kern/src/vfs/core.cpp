@@ -3399,7 +3399,95 @@ class MountOpenFileReservation {
     MountPolicy policy_{};
 };
 
-auto finish_file_close(File* f, bool close_may_change_metadata, int close_result) -> int {
+class OrdinaryFinalCloseOwner;
+ker::mod::sys::Spinlock g_ordinary_final_close_lock;
+OrdinaryFinalCloseOwner* g_ordinary_final_closes = nullptr;
+
+// A final ordinary remote put can abandon its stack before the backend starts.
+// Keep its File represented across generic detachment and the return tail. The
+// backend takes over only after its own close owner has been linked.
+class OrdinaryFinalCloseOwner {
+   public:
+    enum class Phase : uint8_t { PREFIX, DELEGATED, TAIL };
+    struct Retired {
+        File* file = nullptr;
+        Phase phase = Phase::PREFIX;
+        bool metadata = false;
+        int result = 0;
+    };
+    explicit OrdinaryFinalCloseOwner(File* file, uint64_t pid = current_pid()) : pid_(pid) {
+        if (pid == 0 || file == nullptr || file->fs_type != FSType::REMOTE || file->fops != ker::net::wki::wki_remote_vfs_get_fops() ||
+            file->private_data == nullptr || static_cast<ker::net::wki::RemoteFileContext*>(file->private_data)->ordinary_open_token == 0)
+            return;
+        file_ = file;
+        tracked_ = true;
+        metadata_ = file->close_may_change_metadata;
+        g_ordinary_final_close_lock.lock();
+        next_ = g_ordinary_final_closes;
+        if (next_ != nullptr) next_->previous_ = this;
+        g_ordinary_final_closes = this;
+        g_ordinary_final_close_lock.unlock();
+    }
+    ~OrdinaryFinalCloseOwner() { complete(); }
+    OrdinaryFinalCloseOwner(const OrdinaryFinalCloseOwner&) = delete;
+    auto operator=(const OrdinaryFinalCloseOwner&) -> OrdinaryFinalCloseOwner& = delete;
+    void backend_finished(int result) {
+        if (!tracked_) return;
+        g_ordinary_final_close_lock.lock();
+        if (file_ != nullptr) {
+            phase_ = Phase::TAIL;
+            result_ = result;
+        }
+        g_ordinary_final_close_lock.unlock();
+    }
+    void complete() {
+        if (!tracked_) return;
+        g_ordinary_final_close_lock.lock();
+        static_cast<void>(take_locked());
+        g_ordinary_final_close_lock.unlock();
+    }
+    static void delegate(File* file) {
+        g_ordinary_final_close_lock.lock();
+        for (auto* owner = g_ordinary_final_closes; owner != nullptr; owner = owner->next_) {
+            if (owner->file_ == file && owner->phase_ == Phase::PREFIX) {
+                owner->phase_ = Phase::DELEGATED;
+                break;
+            }
+        }
+        g_ordinary_final_close_lock.unlock();
+    }
+    static void cleanup_for_task(uint64_t pid);
+#ifdef WOS_SELFTEST
+    auto file() const -> File* { return file_; }
+#endif
+
+   private:
+    static auto current_pid() -> uint64_t {
+        auto* task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+        return task != nullptr ? task->pid : 0;
+    }
+    auto take_locked() -> Retired {
+        if (file_ == nullptr) return {};
+        if (previous_ != nullptr)
+            previous_->next_ = next_;
+        else
+            g_ordinary_final_closes = next_;
+        if (next_ != nullptr) next_->previous_ = previous_;
+        previous_ = nullptr;
+        next_ = nullptr;
+        return {std::exchange(file_, nullptr), phase_, metadata_, result_};
+    }
+    File* file_ = nullptr;
+    bool tracked_ = false;  // Eligibility is immutable even after fatal retirement.
+    uint64_t pid_ = 0;
+    Phase phase_ = Phase::PREFIX;
+    bool metadata_ = false;
+    int result_ = 0;
+    OrdinaryFinalCloseOwner* previous_ = nullptr;
+    OrdinaryFinalCloseOwner* next_ = nullptr;
+};
+
+auto finish_file_close(File* f, bool close_may_change_metadata, int close_result, OrdinaryFinalCloseOwner* owner = nullptr) -> int {
     if (f == nullptr) return close_result;
     if (close_result < 0) {
         ker::mod::dbg::log("[vfs] close error: fd=%d ret=%d fs=%u flags=0x%x refs=%d fops=%p path=%s", f->fd, close_result,
@@ -3415,16 +3503,13 @@ auto finish_file_close(File* f, bool close_may_change_metadata, int close_result
     MountPoint* const MOUNT_OWNER = f->mount_owner;
     f->mount_owner = nullptr;
     release_mount_from_open_file(MOUNT_OWNER);
+    // No sleeping cleanup follows this handoff; never leave a freed File linked.
+    if (owner != nullptr) owner->complete();
     delete f;
     return close_result;
 }
 
-auto vfs_destroy_file(File* f) -> int {
-    if (f == nullptr) {
-        return 0;
-    }
-
-    int close_result = 0;
+auto prepare_file_close(File* f) -> bool {
     stream_detach_file(f);
     cache_notify_detach_file(f);
     advisory_release_file_owner_locks(f);
@@ -3432,10 +3517,38 @@ auto vfs_destroy_file(File* f) -> int {
     if (!CLOSE_MAY_CHANGE_METADATA) {
         metadata_cache_refresh_file_data_on_close(f);
     }
+    return CLOSE_MAY_CHANGE_METADATA;
+}
+
+auto vfs_destroy_file(File* f) -> int {
+    if (f == nullptr) return 0;
+    OrdinaryFinalCloseOwner owner(f);
+    bool const CLOSE_MAY_CHANGE_METADATA = prepare_file_close(f);
+    int close_result = 0;
     if ((f->fops != nullptr) && (f->fops->vfs_close != nullptr)) {
         close_result = f->fops->vfs_close(f);
     }
-    return finish_file_close(f, CLOSE_MAY_CHANGE_METADATA, close_result);
+    owner.backend_finished(close_result);
+    return finish_file_close(f, CLOSE_MAY_CHANGE_METADATA, close_result, &owner);
+}
+
+void OrdinaryFinalCloseOwner::cleanup_for_task(uint64_t pid) {
+    if (pid == 0) return;
+    for (;;) {
+        g_ordinary_final_close_lock.lock();
+        auto* candidate = g_ordinary_final_closes;
+        while (candidate != nullptr && candidate->pid_ != pid) candidate = candidate->next_;
+        Retired retired{};
+        if (candidate != nullptr) retired = candidate->take_locked();
+        g_ordinary_final_close_lock.unlock();
+        if (candidate == nullptr) return;
+        if (retired.phase == Phase::PREFIX)
+            static_cast<void>(vfs_destroy_file(retired.file));
+        else if (retired.phase == Phase::TAIL)
+            static_cast<void>(finish_file_close(retired.file, retired.metadata, retired.result));
+        // DELEGATED belongs to the already-linked backend close tracker. In
+        // particular, never repeat a flush whose request may have been accepted.
+    }
 }
 
 auto vfs_install_open_file(ker::mod::sched::task::Task* task, File* file) -> int {
@@ -3787,12 +3900,13 @@ void cache_notify_detach_file(File* file) {
     }
 
     auto* watcher = static_cast<CacheNotifyWatcher*>(file->cache_notify_attachment);
-    file->cache_notify_attachment = nullptr;
     if (!cache_notify_attach_pointer_looks_valid(watcher) || watcher->magic != CacheNotifyWatcher::MAGIC) {
+        file->cache_notify_attachment = nullptr;
         return;
     }
 
     g_cache_notify_lock.lock();
+    file->cache_notify_attachment = nullptr;
     if (watcher->entry != nullptr && watcher->entry->watcher_count > 0) {
         watcher->entry->watcher_count--;
         watcher->entry->last_used_us = stream_now_us();
@@ -4725,12 +4839,13 @@ void stream_detach_file(File* file) {
     }
 
     auto* attachment = static_cast<StreamReaderAttachment*>(file->stream_cache_attachment);
-    file->stream_cache_attachment = nullptr;
     if (!stream_attachment_pointer_looks_valid(attachment) || attachment->magic != StreamReaderAttachment::MAGIC) {
+        file->stream_cache_attachment = nullptr;
         return;
     }
 
     g_stream_cache_lock.lock();
+    file->stream_cache_attachment = nullptr;
     stream_unlink_attachment(attachment);
     stream_gc_locked(stream_now_us());
     g_stream_cache_lock.unlock();
@@ -8579,6 +8694,67 @@ auto vfs_close_file(File* file) -> int { return vfs_destroy_file(file); }
 auto vfs_finish_file_close(File* file, bool close_may_change_metadata, int close_result) -> int {
     return finish_file_close(file, close_may_change_metadata, close_result);
 }
+
+void vfs_delegate_ordinary_file_close(File* file) { OrdinaryFinalCloseOwner::delegate(file); }
+
+void vfs_cleanup_ordinary_final_closes_for_task(uint64_t pid) { OrdinaryFinalCloseOwner::cleanup_for_task(pid); }
+
+#ifdef WOS_SELFTEST
+auto vfs_selftest_ordinary_final_close_lifetime(File* file, uint64_t pid, bool backend_complete, bool (*abandon_backend)(File*, uint64_t))
+    -> bool {
+    if (file == nullptr) return false;
+    OrdinaryFinalCloseOwner owner(file, pid);
+    if (owner.file() != file) {
+        vfs_put_file(file);
+        return false;
+    }
+    // Consume the same unique reference as the real final-put entrypoint.
+    if (file->refcount.fetch_sub(1) != 1) {
+        owner.complete();
+        return false;
+    }
+    StreamIsland island{};
+    struct Cleanup {
+        uint64_t pid;
+        ~Cleanup() { ker::net::wki::wki_remote_vfs_cleanup_for_task(pid); }
+    } cleanup{pid};
+    file->open_flags |= O_NOTIFY_CACHE_CHANGE;
+    file->vfs_path_namespace_generation = 1;
+    g_cache_notify_lock.lock();
+    size_t const WATCHERS = g_cache_notify_watchers.size();
+    g_cache_notify_lock.unlock();
+    cache_notify_attach_file(file);
+    if (file->cache_notify_attachment == nullptr) return false;
+    // Ordinary remote opens do not populate shared stream cache. Exercise its
+    // generic detach ownership with a real reader linked to a private island.
+    auto* reader = new (std::nothrow) StreamReaderAttachment{};
+    if (reader == nullptr) return false;
+    reader->island = &island;
+    island.readers = reader;
+    file->stream_cache_attachment = reader;
+    ker::net::wki::wki_remote_vfs_cleanup_for_task(pid + 1);
+    if (owner.file() != file || file->cache_notify_attachment == nullptr || file->stream_cache_attachment != reader) return false;
+    bool valid = true;
+    if (backend_complete || abandon_backend != nullptr) {
+        static_cast<void>(prepare_file_close(file));
+        valid = file->cache_notify_attachment == nullptr && file->stream_cache_attachment == nullptr && island.readers == nullptr;
+        if (abandon_backend != nullptr) {
+            valid = abandon_backend(file, pid) && valid;
+        } else {
+            int const CLOSED = file->fops->vfs_close(file);
+            owner.backend_finished(CLOSED);
+            valid = CLOSED == 0 && file->private_data == nullptr && valid;
+        }
+    }
+    ker::net::wki::wki_remote_vfs_cleanup_for_task(pid);
+    valid = owner.file() == nullptr && island.readers == nullptr && valid;
+    ker::net::wki::wki_remote_vfs_cleanup_for_task(pid);
+    g_cache_notify_lock.lock();
+    valid = g_cache_notify_watchers.size() == WATCHERS && valid;
+    g_cache_notify_lock.unlock();
+    return valid;
+}
+#endif
 
 namespace {
 struct FdTableTaskRef {

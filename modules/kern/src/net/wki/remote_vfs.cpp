@@ -5635,6 +5635,7 @@ class OrdinaryCloseOwner {
         if (next_ != nullptr) next_->previous_ = this;
         g_ordinary_closes = this;
         s_vfs_lock.unlock();
+        ker::vfs::vfs_delegate_ordinary_file_close(file);
     }
     ~OrdinaryCloseOwner() {
         s_vfs_lock.lock();
@@ -6867,6 +6868,7 @@ void wki_remote_vfs_cleanup_for_task(uint64_t pid) {
         wake_proxy_slot_waiter(CLEANUP.next_pid);
     }
     SharedIoTaskOwner::cleanup_for_task(pid);
+    ker::vfs::vfs_cleanup_ordinary_final_closes_for_task(pid);
     PinPreparation::cleanup_for_task(pid);
     PinCloseOwner::cleanup_for_task(pid);
     OrdinaryCloseOwner::cleanup_for_task(pid);
@@ -10103,6 +10105,30 @@ auto wki_remote_vfs_selftest_open_lifetime_client() -> bool {
         }
         if (file->private_data != nullptr || g_open_cancellations.at(SLOT).phase != ExecCancellationPhase::OWNED) return fail(__LINE__);
         ker::vfs::vfs_put_file(file);
+        finish_ordinary_cancellation(SLOT, 0, false, false);
+    }
+    // The core retains prefix/tail ownership and delegates only after this
+    // backend owner links. Test real contexts, cancellation slots, attachments,
+    // heap paths and mount pins through unrelated and repeated fatal cleanup.
+    size_t const ABANDONED = g_abandoned_ordinary_closes_finished.load();
+    for (unsigned stage = 0; stage != 3; ++stage) {
+        auto* file = make_file(25 + stage, 0);
+        if (file == nullptr) return fail(__LINE__);
+        uint16_t const SLOT = static_cast<RemoteFileContext*>(file->private_data)->ordinary_cancel_slot;
+        auto abandon_backend = +[](ker::vfs::File* owned, uint64_t pid) -> bool {
+            OrdinaryCloseOwner backend(owned, pid);
+            wki_remote_vfs_cleanup_for_task(pid + 1);
+            if (backend.file() != owned) return false;
+            wki_remote_vfs_cleanup_for_task(pid);
+            wki_remote_vfs_cleanup_for_task(pid);
+            return backend.file() == nullptr;
+        };
+        if (!ker::vfs::vfs_selftest_ordinary_final_close_lifetime(file, PID, stage == 1, stage == 2 ? abandon_backend : nullptr) ||
+            mount.open_files.load() != 0 || mount.refs.load() != 7 || proxy.open_file_refs.load() != 2 ||
+            g_open_cancellations.at(SLOT).phase != ExecCancellationPhase::PENDING ||
+            g_open_cancellations.at(SLOT).request.token != 25 + stage ||
+            g_abandoned_ordinary_closes_finished.load() != ABANDONED + (stage == 2 ? 1 : 0))
+            return fail(__LINE__);
         finish_ordinary_cancellation(SLOT, 0, false, false);
     }
     return proxy.open_file_refs.load() == 1 && mount.open_files.load() == 0 && g_pin_preparations == nullptr &&

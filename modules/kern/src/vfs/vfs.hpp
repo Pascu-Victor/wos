@@ -154,6 +154,12 @@ auto vfs_close_file(File* file) -> int;
 // The metadata flag was captured before backend close. Releases path/mount/File.
 // This is the task-exit continuation for a backend whose close stack was abandoned.
 auto vfs_finish_file_close(File* file, bool close_may_change_metadata, int close_result) -> int;
+// Link the ordinary backend's fatal-close tracker before transferring the
+// generic final-close prefix. The backend does not hold its registry lock here.
+void vfs_delegate_ordinary_file_close(File* file);
+// Fatal stack cleanup only, after WKI proxy/wait references have quiesced and
+// before draining backend close trackers. Finishes owned prefix/tail stages.
+void vfs_cleanup_ordinary_final_closes_for_task(uint64_t pid);
 auto vfs_close(int fd) -> int;
 auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size = nullptr) -> ssize_t;
 auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size = nullptr) -> ssize_t;
@@ -621,6 +627,10 @@ auto vfs_selftest_file_data_write_invalidates_path_stat() -> bool;
 auto vfs_selftest_file_data_write_skips_uncached_path_invalidation() -> bool;
 auto vfs_selftest_file_data_close_refreshes_created_path_stat() -> bool;
 auto vfs_selftest_file_data_close_does_not_resurrect_removed_path() -> bool;
+// Consumes one unique ordinary remote File for prefix/tail/delegated fatal-close
+// qualification. The optional callback abandons an actual backend close owner.
+auto vfs_selftest_ordinary_final_close_lifetime(File* file, uint64_t pid, bool backend_complete, bool (*abandon_backend)(File*, uint64_t))
+    -> bool;
 auto vfs_selftest_created_open_prefill_seeds_path_stat() -> bool;
 auto vfs_selftest_file_metadata_change_invalidates_path_stat() -> bool;
 auto vfs_selftest_open_create_metadata_hint() -> bool;

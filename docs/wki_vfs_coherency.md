@@ -243,3 +243,18 @@ old CLOSE successor protection, independent OFD/flock and exact registry
 retirement checks also passed, followed by clean native unmount. Client lock
 syscalls/outboxes and packet-level multi-client/recovery qualification remain
 required. New capabilities remain unadvertised.
+
+Ordinary remote final close now tracks the generic detachment prefix and return
+tail on the closing task's stack. The backend receives exclusive ownership only
+after its own fatal-close tracker is linked, before flush or cancellation can
+wait. Task cleanup first quiesces proxy/wait references, then finishes owned
+prefixes or completed tails and leaves delegated effects to the backend.
+Notification and stream attachments remain reachable through their detach mutex
+acquisition. No new close allocation, File/Task layout, syscall or wire change is
+required. A follow-up 73,361-assertion KTEST run passed the extended actual remote
+File fixture for prefix/delegated/tail abandonment, unrelated and repeated PID
+cleanup, exact cancellation slots, cache attachments, heap paths and mount pins.
+These fixtures simulate abandoned ownership phases; they do not kill a process
+parked on a contended detach mutex. Normal and isolated fast KTEST builds,
+formatting and existing advisory source-policy checks passed. Client advisory
+syscalls/outboxes and the packet-level matrix remain required for Goal 26.
