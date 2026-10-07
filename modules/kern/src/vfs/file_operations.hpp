@@ -72,6 +72,9 @@ struct FileOperations {
     vfs_poll_register_waiter_fn vfs_poll_register_waiter;  // Register a task to be woken when readiness changes
     vfs_poll_wait_kind_fn vfs_poll_wait_kind = nullptr;    // Scheduler wait kind for poll wake policy (nullptr = generic)
     vfs_ioctl_fn vfs_ioctl;                                // For device-specific ioctl (nullptr = -ENOTTY)
+    // Validate the cached native EOF before another directory read. Synthetic
+    // mount cookies are separate; errors preserve the caller's current cursor.
+    int (*vfs_readdir_validate_end)(struct File*, size_t) = nullptr;
 };
 
 }  // namespace ker::vfs

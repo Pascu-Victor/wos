@@ -299,6 +299,10 @@ struct RemoteFileContext {
     ker::vfs::coherency::Counter advisory_operations{};  // Allocate in claimed gate order; never wrap.
     bool owner_features_known = false;                   // Exact open binding, protected by io_lock.
     uint64_t owner_features = 0;
+    // Historical EOF observation, compared with a fresh exact-owner directory
+    // version before generic VFS reuses its native end cookie. io_lock protects it.
+    ker::vfs::coherency::Stamp directory_end_stamp{};
+    size_t directory_end_cookie = static_cast<size_t>(-1);
     // An accepted WRITE without an exact native result must never be replayed.
     int secure_write_error = 0;         // Protected by io_lock.
     bool secure_io_negotiated = false;  // Sticky under io_lock; no numeric-FD downgrade.

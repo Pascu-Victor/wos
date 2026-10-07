@@ -1,8 +1,9 @@
 # Owner-authoritative remote VFS consistency
 
-Goal26 design and qualification record. This work is in progress. Current source
-does not yet advertise owner-version, atomic remote append or distributed
-advisory-lock or committed-I/O capabilities. Host models, compiled KTEST cases
+Goal26 design and qualification record. This work is in progress. Normal builds
+leave owner-version, atomic remote append, distributed advisory-lock and
+committed-I/O capabilities unadvertised. Isolated diagnostic runs opt in with
+independent kernel command-line tokens. Host models, compiled KTEST cases
 and native/live qualification will be reported separately as they actually
 complete.
 
@@ -26,8 +27,11 @@ confirmed owner commit must not return an older validated cache version.
 Reads and stat on an open description refer to its retained object even when its
 old pathname names something else. Metadata/path lookups remain subject to
 captured caller credentials and retained namespace confinement. Directory
-iteration is versioned and may restart or return a defined retry if membership
-changes; it is not a cross-operation filesystem snapshot. Rename/unlink/xattr/
+iteration is versioned and may restart or return `EAGAIN` if membership
+changes; it is not a cross-operation filesystem snapshot. Cached remote EOF
+requires fresh validation of its exact native cookie and directory version.
+After a changed EOF, rewind starts fresh iteration; successful directory seeks
+discard the generic EOF count for native and remote descriptions. Rename/unlink/xattr/
 truncate and writes publish relevant versions after the backend commit point
 while its serialization still protects the observed state.
 
@@ -85,7 +89,7 @@ arbitration cannot substitute. Unknown formats fail closed. Secure RDMA retains
 its existing independently gated authority and no-effect-only fallback; this
 goal does not enable its default mask.
 
-## Current evidence
+## Implementation and earlier qualification
 
 Reconnaissance and initial patch contract are recorded locally under
 `goals/progress/26/`. Twenty-five production publication/cache/append-receipt
@@ -105,8 +109,8 @@ respectively, with zero failures. The second includes client cache-authority
 policy and an actual owner append fixture sharing native EOF with a local open,
 strict replay, stale-token rejection and retained-handle close behavior. The
 third run includes XFS rollback publication guards, exact native positioned I/O,
-partial/error outcomes and registry retirement during retained I/O. No multi-
-client or packet-level qualification is claimed. Capability publication awaits
+partial/error outcomes and registry retirement during retained I/O. These early isolated runs provide no multi-client or packet-level
+qualification. Default capability publication awaits
 complete native coverage, cache/append/lock integration and the required
 negative/recovery matrix.
 
@@ -398,3 +402,43 @@ checks both retained lost-reply obligations and return to the initial native/
 client diagnostic baselines after cleanup. The owner applies ACK before its
 reply is dropped, so the client retains an ACK obligation while the native
 receipt count is already zero. All four private KTEST images were pruned.
+
+## Directory errors and retained EOF qualification
+
+Remote callbacks distinguish `ENOENT` EOF from permission, transport and
+version-retry errors. Generic directory dispatch returns a negative error before
+emitting any entry; an initialized short prefix can return successfully while
+the next read retries the first un-emitted native cookie. Errors preserve the
+cursor and cannot authorize a cached EOF or synthetic mount children.
+
+Before generic VFS reuses a negotiated remote EOF, the client validates its
+exact directory version, object identity and native cookie under the existing
+per-open I/O mutex. A changed stamp returns `EAGAIN`; owner/session denials
+remain visible. Older peers get a fresh ordinary readdir probe at the cached
+native EOF cookie. Synthetic mount continuation cookies do not replace the
+native cookie. Successful seeks discard the generic directory EOF count for
+all filesystems; failed seeks and ordinary file seeks preserve it.
+
+The native host campaign passed under ASan/UBSan with three processes, retained
+DIR rewind after owner add/rename/unlink, CLOEXEC retirement observed while the
+exec successor remains alive, and signal/fatal wait cleanup. IV-pos7 passed the
+full public syscall campaign on TMPFS and XFS with three processes across two
+authenticated ivshmem nodes. For every signal/fatal phase the native owner
+confirmed a pending transition from zero to exactly two before the remote
+children received SIGUSR1 or SIGKILL. Complete terminal snapshots on both nodes
+showed all advisory fields, server remote-FD entries and proxy open/lifetime/
+operation-wait references at zero; both shut down normally. Disposable disks and
+shared backing were pruned. This does not qualify owner-local native signal
+interruption, simultaneous pivot-root reconciliation or packet fault recovery.
+
+The first directory-dispatch selftest run failed on its unsigned sentinel
+assertion, not on production error propagation; it is retained as failed
+evidence. The corrected error/EOF/seek fixture passed in isolated runtime24, which
+finished with 73,502 assertions and zero failures and normal selftest poweroff.
+All eight required regression fixtures passed, and all four private images were
+pruned. Normal Build WOS and diagnostic compilation and format checks passed.
+ETH-pos6 failed before the new directory/lifecycle stages: an ordinary OPEN_AS
+request for an append-completion marker timed out at the owner. Exact logs are
+retained and all twelve disks were pruned; no extended Ethernet qualification
+is claimed for that run. Root retirement and packet recovery work remain. New
+capabilities remain opt-in.

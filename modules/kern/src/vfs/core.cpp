@@ -9181,6 +9181,14 @@ auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size) -> ss
     return RESULT;
 }
 
+namespace {
+auto seek_file(File* file, off_t offset, int whence) -> off_t {
+    off_t const RESULT = file->fops->vfs_lseek(file, offset, whence);
+    if (RESULT >= 0 && file->is_directory) file->dir_fs_count = static_cast<size_t>(-1);
+    return RESULT;
+}
+}  // namespace
+
 auto vfs_lseek(int fd, off_t offset, int whence) -> off_t {
     ker::mod::sched::task::Task* t = ker::mod::sched::get_current_task();
     if (t == nullptr) {
@@ -9194,7 +9202,7 @@ auto vfs_lseek(int fd, off_t offset, int whence) -> off_t {
         vfs_put_file(f);
         return -ESPIPE;
     }
-    off_t const RC = f->fops->vfs_lseek(f, offset, whence);
+    off_t const RC = seek_file(f, offset, whence);
     vfs_put_file(f);
     return RC;
 }
@@ -9420,6 +9428,13 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size, ker::mod::sched
 
     // We allow vfs_readdir to be null - the directory may contain only mount children
     bool const HAS_FS_READDIR = (f->fops != nullptr) && (f->fops->vfs_readdir != nullptr);
+    if (HAS_FS_READDIR && f->dir_fs_count != static_cast<size_t>(-1) && f->fops->vfs_readdir_validate_end != nullptr) {
+        int const VALIDATION = f->fops->vfs_readdir_validate_end(f, f->dir_fs_count);
+        if (VALIDATION != 0) {
+            vfs_put_file(f);
+            return VALIDATION;
+        }
+    }
     MountRef readdir_mount_ref{};
     if (f->vfs_path != nullptr && metadata_cacheable_fs(f->fs_type)) {
         readdir_mount_ref = find_mount_point(f->vfs_path, file_vfs_path_len(f));
@@ -9461,7 +9476,8 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size, ker::mod::sched
         size_t const ACTUAL_INDEX = next_index;
 
         // Phase 1: try filesystem readdir
-        if (HAS_FS_READDIR && (f->fs_type == FSType::PROCFS || std::cmp_equal(f->dir_fs_count, -1) || ACTUAL_INDEX < f->dir_fs_count)) {
+        if (HAS_FS_READDIR &&
+            (f->fs_type == FSType::PROCFS || f->dir_fs_count == static_cast<size_t>(-1) || ACTUAL_INDEX < f->dir_fs_count)) {
             DirEntry entry = {};
             int const RET = f->fops->vfs_readdir(f, &entry, ACTUAL_INDEX);
             if (RET == 0) {
@@ -9471,7 +9487,9 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size, ker::mod::sched
                 vfs_seed_readdir_entry_cache_hints(f, readdir_mount, entry, READ_STAMP);
                 continue;
             }
-            if (f->fs_type == FSType::PROCFS && RET != -ENOENT) {
+            // Remote callbacks use explicit ENOENT for EOF. A version retry or
+            // authority/transport error must not become a cached end position.
+            if ((f->fs_type == FSType::PROCFS || f->fs_type == FSType::REMOTE) && RET != -ENOENT) {
                 if (packed_bytes == 0) {
                     vfs_put_file(f);
                     return RET;
@@ -26651,6 +26669,130 @@ auto vfs_selftest_packed_dirent_records() -> bool {
          presized_out->d_type == presized.d_type && std::strcmp(presized_out->d_name.data(), "xfs") == 0;
 
     return ok;
+}
+
+auto vfs_selftest_remote_readdir_errors() -> bool {
+    struct Reader {
+        int error = -EAGAIN;
+        bool prefix = false;
+        bool recover = false;
+        bool references_valid = true;
+        int validation_error = 0;
+        unsigned validations = 0;
+    } reader;
+    FileOperations operations{};
+    operations.vfs_readdir = [](File* file, DirEntry* entry, size_t cookie) -> int {
+        auto& state = *static_cast<Reader*>(file->private_data);
+        state.references_valid &= file->refcount.load() == 3;
+        if (!state.prefix || (cookie == 7 && !state.recover)) return state.error;
+        if (cookie != 0 && cookie != 7) return -ENOENT;
+        *entry = {};
+        entry->d_ino = cookie == 0 ? 11 : 12;
+        entry->d_off = cookie == 0 ? 7 : 13;
+        entry->d_reclen = sizeof(DirEntry);
+        entry->d_type = DT_REG;
+        const char* name = cookie == 0 ? "first" : "second";
+        std::memcpy(entry->d_name.data(), name, std::strlen(name) + 1);
+        return 0;
+    };
+    operations.vfs_readdir_validate_end = [](File* file, size_t cookie) -> int {
+        auto& state = *static_cast<Reader*>(file->private_data);
+        state.references_valid &= file->refcount.load() == 3 && cookie == 13;
+        ++state.validations;
+        return state.validation_error;
+    };
+    ker::mod::sched::task::Task task{};
+    File file{};
+    file.fs_type = FSType::REMOTE;
+    file.is_directory = true;
+    file.dir_fs_count = static_cast<size_t>(-1);
+    file.fops = &operations;
+    file.private_data = &reader;
+    file.refcount.store(1);  // Retain stack ownership; no remote destructor is used.
+    vfs_retain_file(&file);
+    int const FD = vfs_alloc_fd(&task, &file);
+    if (FD < 0) {
+        vfs_put_file(&file);
+        return false;
+    }
+    struct Cleanup {
+        ker::mod::sched::task::Task& task;
+        File& file;
+        int fd;
+        ~Cleanup() {
+            static_cast<void>(vfs_release_fd(&task, fd));
+            vfs_put_file(&file);
+        }
+    } cleanup{task, file, FD};
+    auto check = [](bool okay, int line) {
+        if (!okay) log::warn("remote directory error check failed at %d", line);
+        return okay;
+    };
+    std::array<uint8_t, 512> output{};
+    auto read = [&] { return vfs_read_dir_entries(FD, output.data(), output.size(), &task); };
+    for (int error : {-EAGAIN, -EIO, -EPERM}) {
+        reader.error = error;
+        output.fill(0xa5);
+        if (!check(read() == error && file.pos == 0 && file.dir_fs_count == static_cast<size_t>(-1) && file.refcount.load() == 2 &&
+                       std::ranges::all_of(output, [](uint8_t byte) { return byte == 0xa5; }),
+                   __LINE__))
+            return false;
+    }
+    reader.error = -EAGAIN;
+    reader.prefix = true;
+    output.fill(0xa5);
+    ssize_t const PREFIX = read();
+    if (!check(PREFIX > 0 && static_cast<size_t>(PREFIX) < sizeof(DirEntry) && file.pos == 7 &&
+                   file.dir_fs_count == static_cast<size_t>(-1) && file.refcount.load() == 2,
+               __LINE__))
+        return false;
+    DirEntry observed{};
+    std::memcpy(&observed, output.data(), static_cast<size_t>(PREFIX));
+    if (!check(observed.d_ino == 11 && observed.d_off == 7 && std::strcmp(observed.d_name.data(), "first") == 0 &&
+                   std::ranges::all_of(std::span(output).subspan(static_cast<size_t>(PREFIX)), [](uint8_t byte) { return byte == 0xa5; }),
+               __LINE__))
+        return false;
+    output.fill(0xa5);
+    if (!check(read() == -EAGAIN && file.pos == 7 && file.dir_fs_count == static_cast<size_t>(-1) && file.refcount.load() == 2 &&
+                   std::ranges::all_of(output, [](uint8_t byte) { return byte == 0xa5; }),
+               __LINE__))
+        return false;
+    reader.recover = true;
+    ssize_t const SUFFIX = read();
+    if (!check(SUFFIX > 0 && static_cast<size_t>(SUFFIX) < sizeof(DirEntry) && file.pos == 13 && file.dir_fs_count == 13, __LINE__))
+        return false;
+    observed = {};
+    std::memcpy(&observed, output.data(), static_cast<size_t>(SUFFIX));
+    if (!check(observed.d_ino == 12 && observed.d_off == 13 && std::strcmp(observed.d_name.data(), "second") == 0 && read() == 0 &&
+                   file.pos == 13 && file.dir_fs_count == 13 && file.refcount.load() == 2 && reader.references_valid &&
+                   reader.validations == 1,
+               __LINE__))
+        return false;
+    for (int error : {-EAGAIN, -EIO, -EPERM}) {
+        reader.validation_error = error;
+        output.fill(0xa5);
+        if (!check(read() == error && file.pos == 13 && file.dir_fs_count == 13 && file.refcount.load() == 2 &&
+                       std::ranges::all_of(output, [](uint8_t byte) { return byte == 0xa5; }),
+                   __LINE__))
+            return false;
+    }
+    reader.validation_error = 0;
+    // Synthetic progress must still validate the native EOF cookie, not replace
+    // it with the current position and start synthetic children again.
+    file.pos = 14;
+    if (!check(read() == 0 && file.pos == 14 && file.dir_fs_count == 13 && reader.validations == 5 && reader.references_valid, __LINE__))
+        return false;
+    operations.vfs_lseek = [](File* target, off_t offset, int whence) -> off_t {
+        if (whence != 0) return -EINVAL;
+        target->pos = offset;
+        return offset;
+    };
+    if (!check(seek_file(&file, 0, 3) == -EINVAL && file.pos == 14 && file.dir_fs_count == 13, __LINE__)) return false;
+    file.is_directory = false;
+    if (!check(seek_file(&file, 0, 0) == 0 && file.pos == 0 && file.dir_fs_count == 13, __LINE__)) return false;
+    file.is_directory = true;
+    if (!check(seek_file(&file, 0, 0) == 0 && file.dir_fs_count == static_cast<size_t>(-1), __LINE__)) return false;
+    return check(read() > 0 && file.pos == 13 && file.dir_fs_count == 13 && reader.validations == 5 && reader.references_valid, __LINE__);
 }
 
 auto vfs_selftest_advisory_remote_waits() -> bool {

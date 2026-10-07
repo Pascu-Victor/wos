@@ -690,6 +690,7 @@ auto vfs_selftest_missing_prefix_short_circuits_symlink_walk() -> bool;
 auto vfs_selftest_symlink_prefix_cache_skips_known_parent() -> bool;
 auto vfs_selftest_procfs_fd_link_probe_gate() -> bool;
 auto vfs_selftest_packed_dirent_records() -> bool;
+auto vfs_selftest_remote_readdir_errors() -> bool;
 auto vfs_selftest_fcntl_setfl_preserves_open_policy_flags() -> bool;
 auto vfs_selftest_advisory_remote_shared() -> bool;
 auto vfs_selftest_advisory_remote_waits() -> bool;

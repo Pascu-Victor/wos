@@ -2,6 +2,7 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -10,11 +11,13 @@
 
 #include <array>
 #include <cerrno>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -33,6 +36,8 @@ static_assert(std::is_same_v<decltype(flock::l_pid), int64_t>);
 constexpr unsigned PARTICIPANTS = 3;
 constexpr unsigned RECORDS = 64;
 constexpr uint64_t RECORD_MAGIC = 0x574F535646533236;
+volatile sig_atomic_t interrupted = 0;
+void interrupt_wait(int) { interrupted = 1; }
 
 class Descriptor {
    public:
@@ -77,7 +82,9 @@ class Campaign {
     auto execute() -> bool {
         if (seconds() < 0) return failure("monotonic-clock");
         if (role_ == 0 && !initialize()) return false;
-        if (!wait("initialized", 0) || !append() || !cache() || !locks() || !lifecycle() || !mark("complete")) return false;
+        if (!wait("initialized", 0) || !append() || !cache() || !locks() || !lifecycle() || !exec_lifecycle() || !wait_lifecycle() ||
+            !mark("complete"))
+            return false;
         if (role_ == 0 && !wait_all("complete")) return false;
         std::printf("VFS-COHERENCY-PASS role=%u run=%llu records=%u\n", role_, static_cast<unsigned long long>(run_), RECORDS);
         return true;
@@ -109,7 +116,8 @@ class Campaign {
         return true;
     }
     auto marker(const char* stage, unsigned role, std::array<char, 96>& name) const -> bool {
-        int const LENGTH = std::snprintf(name.data(), name.size(), "%s-%u-%llu", stage, role, static_cast<unsigned long long>(run_));
+        int const LENGTH =
+            std::snprintf(name.data(), name.size(), "barriers/%s-%u-%llu", stage, role, static_cast<unsigned long long>(run_));
         return LENGTH > 0 && static_cast<size_t>(LENGTH) < name.size();
     }
     auto mark(const char* stage) -> bool {
@@ -145,6 +153,10 @@ class Campaign {
     auto initialize() -> bool {
         // Refuse an existing root: every campaign owns a fresh namespace.
         if (mkdir(root_, 0700) != 0) return failure("fresh-root");
+        // Coordination changes a separate directory, so the complete root
+        // enumeration below is stable after the intended namespace mutation.
+        std::array<char, 512> barriers{};
+        if (!path("barriers", barriers) || mkdir(barriers.data(), 0700) != 0) return failure("barrier-directory");
         for (const char* leaf : {"append", "posix", "ofd", "flock", "close"})
             if (!create(leaf)) return false;
         for (unsigned role = 0; role < PARTICIPANTS; ++role) {
@@ -191,25 +203,29 @@ class Campaign {
                pread(fd, observed.data(), observed.size(), 0) == static_cast<ssize_t>(expected.size()) &&
                std::memcmp(observed.data(), expected.data(), expected.size()) == 0;
     }
-    auto directory(bool changed) -> bool {
-        DIR* stream = opendir(root_);
+    auto directory(DIR* stream, bool changed) -> bool {
         if (stream == nullptr) return false;
-        bool old = false, fresh = false;
+        bool old = false, fresh = false, added = false;
         errno = 0;
         while (auto* entry = readdir(stream)) {
             old |= std::strcmp(entry->d_name, "directory-old") == 0;
             fresh |= std::strcmp(entry->d_name, "directory-new") == 0;
+            added |= std::strcmp(entry->d_name, "directory-added") == 0;
         }
-        int const ERROR = errno;
-        bool const CLOSED = closedir(stream) == 0;
-        return ERROR == 0 && CLOSED && old == !changed && fresh == changed;
+        return errno == 0 && old == !changed && fresh == changed && added == changed;
+    }
+    auto directory(bool changed) -> bool {
+        std::unique_ptr<DIR, decltype(&closedir)> stream(opendir(root_), closedir);
+        bool const FRESH = directory(stream.get(), changed);
+        return stream && closedir(stream.release()) == 0 && FRESH;
     }
     auto cache() -> bool {
         Descriptor original(open_file("original", O_RDONLY)), removed(open_file("removed", O_RDONLY));
+        std::unique_ptr<DIR, decltype(&closedir)> retained(opendir(root_), closedir);
         struct stat before{};
         if (original.get() < 0 || removed.get() < 0 || !bytes(original.get(), "seed") || !bytes(removed.get(), "seed") ||
-            fstat(original.get(), &before) != 0 || before.st_size != 4 || !directory(false) || !mark("cache-armed") ||
-            !wait_all("cache-armed"))
+            fstat(original.get(), &before) != 0 || before.st_size != 4 || !directory(retained.get(), false) || !directory(false) ||
+            !mark("cache-armed") || !wait_all("cache-armed"))
             return failure("cache-fill");
         if (role_ == 0) {
             Descriptor writer(open_file("original", O_RDWR)), removed_writer(open_file("removed", O_RDWR));
@@ -219,17 +235,39 @@ class Campaign {
             std::array<char, 512> from{}, to{};
             if (!path("original", from) || !path("moved", to) || rename(from.data(), to.data()) != 0 ||
                 !create("original", "replacement") || !path("removed", from) || unlink(from.data()) != 0 || !path("directory-old", from) ||
-                !path("directory-new", to) || rename(from.data(), to.data()) != 0 || !writer.finish() || !removed_writer.finish() ||
-                !mark("cache-committed"))
+                !path("directory-new", to) || rename(from.data(), to.data()) != 0 || !create("directory-added") || !writer.finish() ||
+                !removed_writer.finish() || !mark("cache-committed"))
                 return failure("cache-namespace-commit");
         }
         if (!wait("cache-committed", 0)) return false;
+#ifdef __WOS__
+        if (role_ != 0) {
+            errno = 0;
+            if (readdir(retained.get()) != nullptr || errno != EAGAIN) return failure("directory-changed-eof-retry");
+        }
+#endif
+        errno = 0;
+        rewinddir(retained.get());
+        if (errno != 0 || !directory(retained.get(), true) || closedir(retained.release()) != 0)
+            return failure("directory-retained-eof-rewind");
+        std::printf("VFS-COHERENCY-CASE role=%u case=directory-retained-eof-rewind\n", role_);
         struct stat after{};
         Descriptor replacement(open_file("original", O_RDONLY));
-        if (!bytes(original.get(), "committed") || !bytes(removed.get(), "unlinked") || fstat(original.get(), &after) != 0 ||
-            after.st_ino != before.st_ino || after.st_size != 9 || (after.st_mode & 07777) != 0640 || replacement.get() < 0 ||
-            !bytes(replacement.get(), "replacement") || !directory(true))
+        bool const ORIGINAL_BYTES = bytes(original.get(), "committed");
+        bool const REMOVED_BYTES = bytes(removed.get(), "unlinked");
+        int const STAT_RESULT = fstat(original.get(), &after);
+        bool const REPLACEMENT_BYTES = replacement.get() >= 0 && bytes(replacement.get(), "replacement");
+        bool const DIRECTORY_FRESH = directory(true);
+        if (!ORIGINAL_BYTES || !REMOVED_BYTES || STAT_RESULT != 0 || after.st_ino != before.st_ino || after.st_size != 9 ||
+            (after.st_mode & 07777) != 0640 || !REPLACEMENT_BYTES || !DIRECTORY_FRESH) {
+            std::printf(
+                "VFS-COHERENCY-CACHE role=%u original=%u removed=%u stat=%d inode_before=%llu inode_after=%llu size=%lld mode=%o "
+                "replacement=%u directory=%u\n",
+                role_, ORIGINAL_BYTES ? 1U : 0U, REMOVED_BYTES ? 1U : 0U, STAT_RESULT, static_cast<unsigned long long>(before.st_ino),
+                static_cast<unsigned long long>(after.st_ino), static_cast<long long>(after.st_size),
+                static_cast<unsigned>(after.st_mode & 07777), REPLACEMENT_BYTES ? 1U : 0U, DIRECTORY_FRESH ? 1U : 0U);
             return failure("cache-fresh-retained-inode");
+        }
         std::printf("VFS-COHERENCY-CASE role=%u case=cache-rename-unlink-stat-directory\n", role_);
         return mark("cache-verified") && wait_all("cache-verified");
     }
@@ -315,21 +353,24 @@ class Campaign {
         if (fcntl(holder.get(), F_OFD_GETLK, &query) != 0 || query.l_type != F_UNLCK) return failure("any-descriptor-close-release");
         return holder.finish();
     }
-    auto query(int fd, short type, pid_t pid) -> bool {
+    auto query(int fd, short type, pid_t pid, off_t start = 0) -> bool {
         struct flock value{};
         value.l_type = F_WRLCK;
         value.l_whence = SEEK_SET;
+        value.l_start = start;
         value.l_len = 16;
         return fcntl(fd, F_OFD_GETLK, &value) == 0 && value.l_type == type &&
-               (type == F_UNLCK || (value.l_start == 0 && value.l_len == 16 && value.l_pid == pid));
+               (type == F_UNLCK || (value.l_start == start && value.l_len == 16 && value.l_pid == pid));
     }
-    auto join(pid_t child) -> bool {
+    auto join(pid_t child, int signal = 0) -> bool {
         int status = 0;
         pid_t observed = -1;
         do {
             observed = waitpid(child, &status, 0);
         } while (observed == -1 && errno == EINTR);
-        if (observed == child && WIFEXITED(status) && WEXITSTATUS(status) == 0) return true;
+        if (observed == child &&
+            (signal == 0 ? WIFEXITED(status) && WEXITSTATUS(status) == 0 : WIFSIGNALED(status) && WTERMSIG(status) == signal))
+            return true;
         std::printf("VFS-COHERENCY-CHILD role=%u pid=%lld observed=%lld status=%d\n", role_, static_cast<long long>(child),
                     static_cast<long long>(observed), status);
         return false;
@@ -405,6 +446,200 @@ class Campaign {
         std::printf("VFS-COHERENCY-CASE role=%u case=exit-lock-retirement\n", role_);
         return mark("lifecycle-verified") && wait_all("lifecycle-verified");
     }
+    auto exec_lifecycle() -> bool {
+        std::array<char, 32> leaf{};
+        std::snprintf(leaf.data(), leaf.size(), "lifecycle-%u", role_);
+        Descriptor observer(open_file(leaf.data(), O_RDWR));
+        std::array<int, 2> ready{}, release{};
+        if (observer.get() < 0 || pipe(ready.data()) != 0) return failure("exec-ready-pipe");
+        Descriptor ready_read(ready.at(0)), ready_write(ready.at(1));
+        if (pipe(release.data()) != 0) return failure("exec-release-pipe");
+        Descriptor release_read(release.at(0)), release_write(release.at(1));
+        pid_t const CHILD = fork();
+        if (CHILD < 0) return failure("exec-fork");
+        if (CHILD == 0) {
+            if (!observer.finish() || !ready_read.finish() || !release_write.finish()) _exit(41);
+            Descriptor holder(open_file(leaf.data(), O_RDWR | O_CLOEXEC));
+            if (holder.get() < 0 || command(holder.get(), 0, false, false) != 0 || command(holder.get(), 1, false, false, 32) != 0)
+                _exit(42);
+            char value = 'L';
+            if (write(ready_write.get(), &value, 1) != 1 || read(release_read.get(), &value, 1) != 1 || value != 'C') _exit(43);
+            std::array<std::array<char, 24>, 3> arguments{};
+            std::snprintf(arguments.at(0).data(), arguments.at(0).size(), "%d", holder.get());
+            std::snprintf(arguments.at(1).data(), arguments.at(1).size(), "%d", ready_write.get());
+            std::snprintf(arguments.at(2).data(), arguments.at(2).size(), "%d", release_read.get());
+            execl("/proc/self/exe", "testprog", "vfs-coherency-exec-probe", arguments.at(0).data(), arguments.at(1).data(),
+                  arguments.at(2).data(), static_cast<char*>(nullptr));
+            _exit(44);
+        }
+        if (!ready_write.finish() || !release_read.finish()) return failure("exec-parent-pipes");
+        char value = 0;
+        if (read(ready_read.get(), &value, 1) != 1 || value != 'L' || !query(observer.get(), F_WRLCK, CHILD) ||
+            !query(observer.get(), F_WRLCK, -1, 32))
+            return failure("exec-child-locks-visible");
+        value = 'C';
+        if (write(release_write.get(), &value, 1) != 1 || read(ready_read.get(), &value, 1) != 1 || value != 'E' ||
+            !query(observer.get(), F_UNLCK, 0) || !query(observer.get(), F_UNLCK, 0, 32))
+            return failure("exec-cloexec-lock-release");
+        // The successor is alive and waiting on the release pipe during both
+        // queries, so normal process exit cannot explain this retirement.
+        value = 'X';
+        if (write(release_write.get(), &value, 1) != 1 || !join(CHILD) || !observer.finish()) return failure("exec-successor-exit");
+        std::printf("VFS-COHERENCY-CASE role=%u case=exec-cloexec-lock-retirement\n", role_);
+        return mark("exec-verified") && wait_all("exec-verified");
+    }
+    auto observe_wait_child(pid_t child) -> bool {
+        std::array<char, 64> name{};
+        std::snprintf(name.data(), name.size(), "/proc/%lld/stat", static_cast<long long>(child));
+        char previous = 0;
+        for (;;) {
+            Descriptor file(open(name.data(), O_RDONLY));
+            std::array<char, 1024> text{};
+            if (file.get() < 0) return failure("wait-child-stat-open");
+            ssize_t const LENGTH = read(file.get(), text.data(), text.size() - 1);
+            if (LENGTH <= 0) return failure("wait-child-stat-read");
+            const char* end = std::strrchr(text.data(), ')');
+            if (end != nullptr && end[1] == ' ' && end[2] != previous) {
+                previous = end[2];
+                std::printf("VFS-COHERENCY-WAIT role=%u child=%lld state=%c\n", role_, static_cast<long long>(child), previous);
+                std::fflush(stdout);
+            }
+#ifdef __WOS__
+            // Short RPC polling can produce a runnable sample. The owner's
+            // exact zero-to-two pending gate proves both native acquisitions.
+            if (end != nullptr && end[1] == ' ' && (end[2] == 'R' || end[2] == 'S' || end[2] == 'D')) return true;
+#else
+            if (end != nullptr && end[1] == ' ' && (end[2] == 'S' || end[2] == 'D')) return true;
+#endif
+            if (seconds() < 0 || seconds() >= deadline_) return failure("wait-child-not-sleeping");
+            timespec const PAUSE{0, 20'000'000};
+            static_cast<void>(nanosleep(&PAUSE, nullptr));
+        }
+    }
+    auto remote_pending(unsigned expected) -> bool {
+#ifdef __WOS__
+        // The native counter covers remote controller waits only. Requiring
+        // a zero baseline before either child starts, then exactly two pending
+        // receipts, establishes both independent remote acquisitions.
+        for (;;) {
+            FILE* stream = std::fopen("/proc/wki/netdiag", "r");
+            if (stream == nullptr) return failure("wait-owner-diagnostic-open");
+            std::array<char, 4096> line{};
+            unsigned rows = 0, ends = 0;
+            uint64_t pending = 0;
+            bool valid = true;
+            while (std::fgets(line.data(), static_cast<int>(line.size()), stream) != nullptr) {
+                std::string_view const TEXT(line.data());
+                if (TEXT.starts_with("wki_vfs_advisory ")) {
+                    ++rows;
+                    const char* token = std::strstr(line.data(), " pending=");
+                    char* end = nullptr;
+                    errno = 0;
+                    if (!TEXT.starts_with("wki_vfs_advisory version=1 ") || token == nullptr) {
+                        valid = false;
+                    } else {
+                        pending = std::strtoull(token + 9, &end, 10);
+                        valid &= errno == 0 && end != token + 9 && (*end == ' ' || *end == '\n');
+                    }
+                }
+                ends += TEXT == "wki_netdiag_end complete=1\n" ? 1U : 0U;
+            }
+            valid &= std::ferror(stream) == 0;
+            valid &= std::fclose(stream) == 0;
+            if (!valid || rows != 1 || ends != 1) return failure("wait-owner-diagnostic-incomplete");
+            if (pending == expected) {
+                std::printf("VFS-COHERENCY-PENDING role=%u remote=%llu expected=%u\n", role_, static_cast<unsigned long long>(pending),
+                            expected);
+                return true;
+            }
+            if (expected != 0 && pending > expected) return failure("wait-owner-unexpected-pending");
+            if (seconds() < 0 || seconds() >= deadline_) return failure("wait-owner-pending-timeout");
+            timespec const PAUSE{0, 20'000'000};
+            static_cast<void>(nanosleep(&PAUSE, nullptr));
+        }
+#else
+        static_cast<void>(expected);
+        return true;
+#endif
+    }
+    auto wait_lifecycle() -> bool {
+        constexpr std::array<const char*, 3> FAMILIES{"posix", "ofd", "flock"};
+        std::array<char, 32> leaf{};
+        std::snprintf(leaf.data(), leaf.size(), "lifecycle-%u", role_);
+        for (bool fatal : {false, true}) {
+            for (unsigned family = 0; family < FAMILIES.size(); ++family) {
+#ifdef __WOS__
+                // The owner's legacy native lock loop yields while runnable.
+                // Coordinate the two remote waiters here; the host
+                // baseline still exercises native signal/kill on all roles.
+                bool const COORDINATOR = role_ == 0;
+#else
+                bool const COORDINATOR = false;
+#endif
+                Descriptor holder(open_file(leaf.data(), O_RDWR)), observer(open_file(leaf.data(), O_RDWR));
+                std::array<int, 2> ready{};
+                if (holder.get() < 0 || observer.get() < 0 || command(holder.get(), family, false, false) != 0 || pipe(ready.data()) != 0)
+                    return failure("wait-parent-setup");
+                Descriptor ready_read(ready.at(0)), ready_write(ready.at(1));
+                std::array<char, 96> start{}, armed{}, pending{}, done{};
+                const char* mode = fatal ? "kill" : "signal";
+                std::snprintf(start.data(), start.size(), "%s-%s-start", mode, FAMILIES.at(family));
+                std::snprintf(armed.data(), armed.size(), "%s-%s-ready", mode, FAMILIES.at(family));
+                std::snprintf(pending.data(), pending.size(), "%s-%s-pending", mode, FAMILIES.at(family));
+                std::snprintf(done.data(), done.size(), "%s-%s-done", mode, FAMILIES.at(family));
+                if ((role_ == 0 && (!remote_pending(0) || !mark(start.data()))) || !wait(start.data(), 0))
+                    return failure("wait-empty-baseline");
+                pid_t const CHILD = COORDINATOR ? 0 : fork();
+                if (CHILD < 0) return failure("wait-fork");
+                if (!COORDINATOR && CHILD == 0) {
+                    std::printf("VFS-COHERENCY-WAIT role=%u child=%lld family=%s stage=setup\n", role_, static_cast<long long>(getpid()),
+                                FAMILIES.at(family));
+                    std::fflush(stdout);
+                    if (!holder.finish() || !observer.finish() || !ready_read.finish()) _exit(51);
+                    struct sigaction action{};
+                    action.sa_handler = interrupt_wait;
+                    if (!fatal && (sigemptyset(&action.sa_mask) != 0 || sigaction(SIGUSR1, &action, nullptr) != 0)) _exit(52);
+                    interrupted = 0;
+                    Descriptor waiter(open_file(leaf.data(), O_RDWR));
+                    char const VALUE = 'W';
+                    if (waiter.get() < 0 || write(ready_write.get(), &VALUE, 1) != 1) _exit(53);
+                    std::printf("VFS-COHERENCY-WAIT role=%u child=%lld family=%s stage=blocking\n", role_, static_cast<long long>(getpid()),
+                                FAMILIES.at(family));
+                    std::fflush(stdout);
+                    errno = 0;
+                    int const RESULT = command(waiter.get(), family, false, true);
+                    if (fatal || RESULT != -1 || errno != EINTR || interrupted != 1) _exit(54);
+                    _exit(0);
+                }
+                std::printf("VFS-COHERENCY-WAIT role=%u child=%lld family=%s stage=parent-ready\n", role_, static_cast<long long>(CHILD),
+                            FAMILIES.at(family));
+                std::fflush(stdout);
+                char value = 0;
+                if (!ready_write.finish() ||
+                    (!COORDINATOR && (read(ready_read.get(), &value, 1) != 1 || value != 'W' || !observe_wait_child(CHILD))))
+                    return failure("wait-child-readiness");
+                if (!mark(armed.data()) || !wait_all(armed.data()) || (role_ == 0 && (!remote_pending(2) || !mark(pending.data()))) ||
+                    !wait(pending.data(), 0))
+                    return failure("wait-confirmed-barrier");
+                if (!COORDINATOR && (kill(CHILD, fatal ? SIGKILL : SIGUSR1) != 0 || !join(CHILD, fatal ? SIGKILL : 0)))
+                    return failure("wait-signal-join");
+                if (family != 2) {
+                    if (!query(observer.get(), F_WRLCK, family == 0 ? getpid() : -1)) return failure("wait-parent-lock-survives");
+                } else {
+                    errno = 0;
+                    if (command(observer.get(), family, false, false) != -1 || errno != EAGAIN)
+                        return failure("wait-parent-flock-survives");
+                }
+                if (command(holder.get(), family, true, false) != 0 || command(observer.get(), family, false, false) != 0 ||
+                    command(observer.get(), family, true, false) != 0 || !holder.finish() || !observer.finish() || !mark(done.data()) ||
+                    !wait_all(done.data()))
+                    return failure("wait-successor-cleanup");
+                std::printf("VFS-COHERENCY-CASE role=%u case=%s-%s-%s\n", role_, mode, FAMILIES.at(family),
+                            COORDINATOR ? "remote-coordinator" : "blocked-retirement");
+            }
+        }
+        return true;
+    }
     const char* root_;
     unsigned role_;
     uint64_t run_;
@@ -429,4 +664,18 @@ auto run_vfs_coherency(int argc, char** argv) -> int {
     }
     Campaign campaign(argv[0], static_cast<unsigned>(role), run, static_cast<unsigned>(timeout));
     return campaign.execute() ? 0 : 1;
+}
+
+auto run_vfs_coherency_exec_probe(int argc, char** argv) -> int {
+    std::array<uint64_t, 3> descriptors{};
+    if (argc != 3) return 61;
+    for (size_t index = 0; index < descriptors.size(); ++index)
+        if (!number(argv[index], descriptors.at(index)) || descriptors.at(index) > INT_MAX) return 62;
+    errno = 0;
+    if (fcntl(static_cast<int>(descriptors.at(0)), F_GETFD) != -1 || errno != EBADF) return 63;
+    char value = 'E';
+    if (write(static_cast<int>(descriptors.at(1)), &value, 1) != 1 || read(static_cast<int>(descriptors.at(2)), &value, 1) != 1 ||
+        value != 'X')
+        return 64;
+    return 0;
 }

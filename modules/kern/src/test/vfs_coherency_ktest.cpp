@@ -15,6 +15,10 @@
 
 namespace coherence = ker::vfs::coherency;
 
+KTEST(VfsCoherency, RemoteDirectoryErrorsPreserveRetryCursorAndInitializedPrefix) {
+    KEXPECT_TRUE(ker::vfs::vfs_selftest_remote_readdir_errors());
+}
+
 KTEST(VfsCoherency, CacheFillCannotAcquireAuthorityAcrossMutationOrObjectReplacement) {
     coherence::CacheValidation cache;
     coherence::Stamp const BEFORE{1, 2, 3, 1};

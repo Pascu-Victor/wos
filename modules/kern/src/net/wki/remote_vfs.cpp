@@ -7373,16 +7373,16 @@ auto remote_owner_readdir(RemoteFileContext& context, const WkiChannelIdentity& 
             if (visible == UINT64_MAX) return -EOVERFLOW;
             ++visible;
         }
-        if (response.count < WKI_VFS_OWNER_DIRECTORY_MAX) return -1;
+        if (response.count < WKI_VFS_OWNER_DIRECTORY_MAX) {
+            context.directory_end_stamp = after;
+            context.directory_end_cookie = index;
+            return -ENOENT;
+        }
         cookie = next;
     }
 }
 
-auto remote_vfs_readdir(ker::vfs::File* f, ker::vfs::DirEntry* entry, size_t index) -> int {
-    if (f != nullptr && (static_cast<unsigned>(f->open_flags) & 3U) == ker::vfs::FILE_ACCESS_SEARCH_ONLY) return -EBADF;
-    if (f == nullptr || f->private_data == nullptr || entry == nullptr) return -EINVAL;
-    auto* ctx = static_cast<RemoteFileContext*>(f->private_data);
-    ker::mod::sys::MutexGuard io_guard(ctx->io_lock);
+auto remote_vfs_readdir_locked(RemoteFileContext* ctx, ker::vfs::DirEntry* entry, size_t index) -> int {
     consume_remote_file_cache_invalidation(ctx);
     if (ctx->proxy == nullptr || !ctx->proxy->active) return -EIO;
     WkiChannelIdentity identity{};
@@ -7434,10 +7434,44 @@ auto remote_vfs_readdir(ker::vfs::File* f, ker::vfs::DirEntry* entry, size_t ind
             }
             ++visible_index;
         }
-        if (count < VFS_READDIR_BATCH_MAX_ENTRIES) return -1;
+        if (count < VFS_READDIR_BATCH_MAX_ENTRIES) return -ENOENT;
         if (fetch_index > UINT32_MAX - count) return -EOVERFLOW;
         fetch_index += count;
     }
+}
+
+auto remote_vfs_readdir(ker::vfs::File* f, ker::vfs::DirEntry* entry, size_t index) -> int {
+    if (f != nullptr && (static_cast<unsigned>(f->open_flags) & 3U) == ker::vfs::FILE_ACCESS_SEARCH_ONLY) return -EBADF;
+    if (f == nullptr || f->private_data == nullptr || entry == nullptr) return -EINVAL;
+    auto* ctx = static_cast<RemoteFileContext*>(f->private_data);
+    ker::mod::sys::MutexGuard io_guard(ctx->io_lock);
+    return remote_vfs_readdir_locked(ctx, entry, index);
+}
+
+auto remote_vfs_validate_directory_end(ker::vfs::File* f, size_t cookie) -> int {
+    if (f == nullptr || f->private_data == nullptr) return -EINVAL;
+    auto* ctx = static_cast<RemoteFileContext*>(f->private_data);
+    ker::mod::sys::MutexGuard io_guard(ctx->io_lock);
+    consume_remote_file_cache_invalidation(ctx);
+    if (ctx->proxy == nullptr || !ctx->proxy->active) return -EIO;
+    WkiChannelIdentity identity{};
+    int const FEATURES = query_remote_owner_features(*ctx, identity);
+    if (FEATURES == 0 && (ctx->owner_features & WKI_VFS_FEATURE_OWNER_VERSIONS) != 0) {
+        ker::vfs::coherency::Stamp current{};
+        int const STATUS = query_remote_owner_version(*ctx, current);
+        if (STATUS != 0) return STATUS;
+        return ctx->directory_end_cookie == cookie &&
+                       ker::vfs::coherency::cache_matches(ctx->directory_end_stamp, current, ker::vfs::coherency::Domain::DIRECTORY)
+                   ? 0
+                   : -EAGAIN;
+    }
+    if (FEATURES != 0 && FEATURES != -ENOTSUP && FEATURES != -EOPNOTSUPP) return FEATURES;
+    // Old peers have no version authority. Probe the native end, never a
+    // synthetic mount cookie, before retaining its position for this call.
+    ker::vfs::DirEntry probe{};
+    int const STATUS = remote_vfs_readdir_locked(ctx, &probe, cookie);
+    if (STATUS == -ENOENT) return 0;
+    return STATUS == 0 ? -EAGAIN : STATUS;
 }
 
 // D8: readlink via remote VFS proxy
@@ -7549,6 +7583,7 @@ ker::vfs::FileOperations g_remote_vfs_fops = {
     .vfs_poll_check = nullptr,
     .vfs_poll_register_waiter = nullptr,
     .vfs_ioctl = nullptr,
+    .vfs_readdir_validate_end = remote_vfs_validate_directory_end,
 };
 
 }  // namespace
