@@ -161,6 +161,7 @@ void vfs_delegate_ordinary_file_close(File* file);
 // before draining backend close trackers. Finishes owned prefix/tail stages.
 void vfs_cleanup_ordinary_final_closes_for_task(uint64_t pid);
 auto vfs_close(int fd) -> int;
+auto vfs_close_for_task(ker::mod::sched::task::Task* task, int fd) -> int;
 auto vfs_read(int fd, void* buf, size_t count, size_t* actual_size = nullptr) -> ssize_t;
 auto vfs_write(int fd, const void* buf, size_t count, size_t* actual_size = nullptr) -> ssize_t;
 auto vfs_write_file(File* file, const void* buf, size_t count, size_t* actual_size = nullptr) -> ssize_t;
@@ -306,6 +307,7 @@ auto vfs_pivot_root(const char* new_root, const char* put_old) -> int;
 // FD duplication
 auto vfs_dup(int oldfd) -> int;
 auto vfs_dup2(int oldfd, int newfd, int flags = 0) -> int;
+auto vfs_dup2_for_task(ker::mod::sched::task::Task* task, int oldfd, int newfd, int flags = 0) -> int;
 
 // Metadata-only subject-root queries; caller must authorize private observation.
 // Supplied snapshot/view output requires outside-publication context. A legacy
@@ -543,6 +545,7 @@ struct VfsFlockAbi {
 };
 static_assert(sizeof(VfsFlockAbi) == 32);
 auto vfs_fcntl(int fd, int cmd, uint64_t arg, VfsFlockAbi* flock = nullptr) -> int;
+auto vfs_fcntl_for_task(ker::mod::sched::task::Task* task, int fd, int cmd, uint64_t arg, VfsFlockAbi* flock = nullptr) -> int;
 
 // IPC file identity helpers (used by WKI remote IPC proxy)
 auto vfs_is_pipe_file(const File* f) -> bool;

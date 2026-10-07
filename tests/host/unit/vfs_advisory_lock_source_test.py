@@ -82,7 +82,7 @@ def test_kernel_fcntl_implements_posix_and_ofd_locks() -> None:
     source = CORE_CPP.read_text()
     fcntl_body = function_body(
         source,
-        r"auto\s+vfs_fcntl\(int\s+fd,\s*int\s+cmd,\s*uint64_t\s+arg,\s*VfsFlockAbi\s*\*\s*flock\)\s*->\s*int",
+        r"auto\s+vfs_fcntl_for_task\(ker::mod::sched::task::Task\*\s+task,\s*int\s+fd,\s*int\s+cmd,\s*uint64_t\s+arg,\s*VfsFlockAbi\s*\*\s*flock\)\s*->\s*int",
     )
     require_tokens(
         fcntl_body,
@@ -162,17 +162,18 @@ def test_advisory_locks_are_released_on_close_lifetimes() -> None:
     source = CORE_CPP.read_text()
     destroy_body = function_body(source, r"auto\s+vfs_destroy_file\(File\s*\*\s*f\)\s*->\s*int")
     prepare_body = function_body(source, r"auto\s+prepare_file_close\(File\s*\*\s*f\)\s*->\s*bool")
-    close_body = function_body(source, r"auto\s+vfs_close\(int\s+fd\)\s*->\s*int")
+    close_body = function_body(source, r"auto\s+vfs_close_for_task\(ker::mod::sched::task::Task\*\s+t,\s*int\s+fd\)\s*->\s*int")
     close_taken_body = function_body(
         source,
-        r"auto\s+vfs_close_taken_file\(ker::mod::sched::task::Task\*\s+caller,\s*ker::mod::sched::task::Task\*\s+table_task,\s*File\*\s+file,\s*size_t\s+fd_count,\s*uint64_t\s+callsite\)\s*->\s*int",
+        r"auto\s+vfs_close_taken_file\(ker::mod::sched::task::Task\*\s+caller,\s*ker::mod::sched::task::Task\*\s+table_task,\s*File\*\s+file,\s*size_t\s+fd_count,\s*uint64_t\s+callsite,\s*Stat\*\s+stat\s*=\s*nullptr,\s*int\*\s+stat_result\s*=\s*nullptr\)\s*->\s*int",
     )
-    dup2_body = function_body(source, r"auto\s+vfs_dup2\(int\s+oldfd,\s*int\s+newfd,\s*int\s+flags\)\s*->\s*int")
+    dup2_body = function_body(source, r"auto\s+vfs_dup2_for_task\(ker::mod::sched::task::Task\*\s+task,\s*int\s+oldfd,\s*int\s+newfd,\s*int\s+flags\)\s*->\s*int")
     require_tokens(destroy_body, ["prepare_file_close(f)"], "file-owner advisory lock cleanup entrypoint")
     require_tokens(prepare_body, ["advisory_release_file_owner_locks(f);"], "file-owner advisory lock cleanup")
     require_tokens(
         close_taken_body,
-        ["advisory_release_process_locks_for_file(ker::mod::sched::task::process_pid(*caller), file);"],
+        ["wki_remote_vfs_close_reference(file, *caller, stat, stat_result)",
+         "advisory_release_process_locks_for_file(ker::mod::sched::task::process_pid(*caller), file);"],
         "process advisory lock cleanup",
     )
     require_tokens(
@@ -182,7 +183,8 @@ def test_advisory_locks_are_released_on_close_lifetimes() -> None:
     )
     require_tokens(
         dup2_body,
-        ["advisory_release_process_locks_for_file(ker::mod::sched::task::process_pid(*task), REPLACE.existing);"],
+        ["wki_remote_vfs_close_reference(REPLACE.existing, *task)",
+         "advisory_release_process_locks_for_file(ker::mod::sched::task::process_pid(*task), REPLACE.existing);"],
         "dup2 advisory lock cleanup",
     )
 

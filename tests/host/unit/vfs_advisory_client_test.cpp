@@ -50,9 +50,11 @@ TEST(VfsAdvisoryClient, LostRegistrationKeepsExactIdAndCloseSuppressesRecoveredG
     EXPECT_EQ(scope.phase(), client::ScopePhase::CLOSING);
     EXPECT_FALSE(scope.grants_allowed(29));
     ASSERT_TRUE(scope.closed(29, 41, KEY.object));
+    EXPECT_FALSE(scope.acknowledgement_complete());
     EXPECT_FALSE(scope.blocks_successor(KEY));
     EXPECT_FALSE(scope.reclaimable(29));
     ASSERT_TRUE(scope.acknowledged(29, 41, KEY.object));
+    EXPECT_TRUE(scope.acknowledgement_complete());
     EXPECT_FALSE(scope.reclaimable(29));  // The RPC stack still owns this record.
     ASSERT_TRUE(scope.release_rpc(29, 43));
     EXPECT_TRUE(scope.reclaimable(29));

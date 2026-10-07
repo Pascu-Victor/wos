@@ -496,6 +496,7 @@ auto wki_remote_vfs_selftest_xfs_owner_files(ker::vfs::File* owner, ker::vfs::Fi
 auto wki_remote_vfs_selftest_owner_append() -> bool;
 auto wki_remote_vfs_selftest_owner_committed_io() -> bool;
 auto wki_remote_vfs_selftest_owner_advisory() -> bool;
+auto wki_remote_vfs_selftest_client_advisory() -> bool;
 auto wki_remote_vfs_selftest_owner_scope_controller() -> bool;
 auto wki_remote_vfs_selftest_owner_io_outcomes() -> bool;
 auto wki_remote_vfs_selftest_file_retirement() -> bool;
@@ -726,6 +727,13 @@ void wki_remote_vfs_process_pending_detaches();
 // Bounded client RPC retries; never invoke from RX or the protocol-service worker.
 void wki_remote_vfs_process_pending_exec_cancellations();
 void wki_remote_vfs_process_pending_open_cancellations();
+void wki_remote_vfs_process_pending_advisory();
+// Consume the caller's retained/removed File reference on every return. Adopt
+// before any RPC/mutex/park, including fstat-close and dup2 replacement.
+auto wki_remote_vfs_advisory_reference(ker::vfs::File* file, ker::mod::sched::task::Task& subject, ker::vfs::RemoteAdvisoryKind kind,
+                                       bool query, bool wait, ker::vfs::VfsFlockAbi& flock) -> int;
+auto wki_remote_vfs_close_reference(ker::vfs::File* file, ker::mod::sched::task::Task& subject, ker::vfs::Stat* stat = nullptr,
+                                    int* stat_result = nullptr) -> int;
 // Retry exact retired mount owners after EBUSY; task/auto-attach context only.
 void wki_remote_vfs_process_pending_unmounts();
 

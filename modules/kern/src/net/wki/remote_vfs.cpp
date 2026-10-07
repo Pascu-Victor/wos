@@ -4604,6 +4604,9 @@ auto cancel_remote_ordinary_open(uint16_t slot, bool retry = false) -> int {
 // No registry allocation is needed, and cancellation uses the reserved outbox.
 enum class PinPurpose : uint8_t { DIRECTORY, EXECUTABLE, ORDINARY_OPEN };
 auto identify_private_ordinary_owner(RemoteFileContext& context) -> int;
+auto client_advisory_rpc(RemoteFileContext& context, const WkiChannelIdentity& identity, uint16_t operation, const void* request,
+                         uint16_t request_length, void* response, uint16_t response_capacity, uint16_t& response_length, uint64_t timeout)
+    -> int;
 class PinPreparation;
 PinPreparation* g_pin_preparations = nullptr;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 #ifdef WOS_SELFTEST
@@ -5306,9 +5309,8 @@ auto identify_private_ordinary_owner(RemoteFileContext& context) -> int {
                                                  .query_id = QUERY}};
     VfsOwnerScopeResponse response{};
     uint16_t length = 0;
-    int const STATUS = normalize_proxy_status_for_errno(
-        vfs_proxy_send_and_wait(context.proxy, OP_VFS_LOCK_SCOPE, reinterpret_cast<const uint8_t*>(&REQUEST), sizeof(REQUEST), &response,
-                                sizeof(response), &length, VFS_PROXY_OP_TIMEOUT_US, nullptr, nullptr, 0, false, &identity));
+    int const STATUS = client_advisory_rpc(context, identity, OP_VFS_LOCK_SCOPE, &REQUEST, sizeof(REQUEST), &response, sizeof(response),
+                                           length, VFS_PROXY_OP_TIMEOUT_US);
     // Owner advisory semantics are restricted to its native TMPFS/XFS Files.
     // Other backends may still be opened, with no advisory object authority.
     if (STATUS == -EOPNOTSUPP) return 0;
@@ -5372,6 +5374,710 @@ auto query_remote_owner_observation(RemoteFileContext& context, const WkiChannel
     if (!wki_vfs_owner_observe_response_valid(candidate, REQUEST, length)) return -EPROTO;
     output = candidate;
     return 0;
+}
+
+// Client advisory ownership is independent of io_lock: a shared description's
+// unlock/query must progress while another process parks between lock polls.
+namespace client_advisory = ker::vfs::advisory_client;
+constexpr size_t CLIENT_SCOPE_NONE = client_advisory::SCOPE_CAPACITY;
+constexpr size_t CLIENT_OPERATION_NONE = client_advisory::OPERATION_CAPACITY;
+constexpr uint64_t CLIENT_ADVISORY_POLL_US = 1000;
+struct ClientScopeRecord {
+    client_advisory::Scope lifecycle{};
+    ker::vfs::File* witness = nullptr;
+    WkiChannelIdentity identity{};
+    uint64_t retry_after_us = 0;
+};
+struct ClientOperationRecord {
+    client_advisory::Operation lifecycle{};
+    ker::vfs::File* file = nullptr;
+    WkiChannelIdentity identity{};
+    VfsOwnerLockRequest request{};
+    uint64_t active_pid = 0;
+    uint64_t retry_after_us = 0;
+    size_t scope_index = CLIENT_SCOPE_NONE;
+    uint64_t scope_serial = 0;
+    uint64_t scope_token = 0;
+};
+std::array<ClientScopeRecord, client_advisory::SCOPE_CAPACITY> g_client_scopes{};
+std::array<ClientOperationRecord, client_advisory::OPERATION_CAPACITY> g_client_operations{};
+std::atomic<uint32_t> g_client_record_count{0};
+ker::vfs::coherency::Counter g_client_serials;
+ker::vfs::coherency::Counter g_client_rpc_tickets;
+ker::vfs::coherency::Counter g_client_registrations;
+ker::vfs::coherency::Counter g_client_scope_queries;
+
+void collect_client_advisory_records();
+auto client_advisory_current_pid() -> uint64_t;
+auto remote_vfs_fstat_locked(ker::vfs::File* file, ker::vfs::Stat* statbuf) -> int;
+#ifdef WOS_SELFTEST
+void client_advisory_test_pause();
+#endif
+
+void client_advisory_pause() {
+#ifdef WOS_SELFTEST
+    client_advisory_test_pause();
+#endif
+    if (wki_current_process_wait_can_park()) {
+        ker::mod::sched::preemptible_syscall_park("wki_vfs_lock", wki_future_deadline_us(wki_now_us(), CLIENT_ADVISORY_POLL_US));
+    } else {
+        // Outside a process syscall safe point preserve the existing exception
+        // and IRQ state. Kernel deferred workers never wait for a native lock.
+        ker::mod::sched::kern_yield();
+    }
+}
+
+class ClientTaskOwner;
+ClientTaskOwner* g_client_task_owners = nullptr;
+
+// Adopts the VFS caller's reference before every possible sleep. Arenas retain
+// separate pins; their outboxes contain only immutable scalar task identity.
+class ClientTaskOwner {
+   public:
+    explicit ClientTaskOwner(ker::vfs::File* adopted = nullptr, uint64_t pid = client_advisory_current_pid()) : file(adopted), pid_(pid) {
+        s_vfs_lock.lock();
+        next_ = g_client_task_owners;
+        if (next_ != nullptr) next_->previous_ = this;
+        g_client_task_owners = this;
+        linked_ = true;
+        s_vfs_lock.unlock();
+    }
+    ClientTaskOwner(const ClientTaskOwner&) = delete;
+    auto operator=(const ClientTaskOwner&) -> ClientTaskOwner& = delete;
+    ~ClientTaskOwner() { static_cast<void>(finish()); }
+    auto pid() const -> uint64_t { return pid_; }
+
+    // Caller holds s_vfs_lock and a File pin/record observer for context.
+    auto try_gate_locked(RemoteFileContext& context, size_t scope = CLIENT_SCOPE_NONE, uint64_t serial = 0) -> bool {
+        if (gate_ != nullptr || context.advisory_gate.holder() != 0) return false;
+        uint64_t const TICKET = g_client_rpc_tickets.take();
+        if (TICKET == 0 || !context.advisory_gate.claim(TICKET)) return false;
+        if (scope < g_client_scopes.size() && !g_client_scopes.at(scope).lifecycle.claim_rpc(serial, TICKET)) {
+            static_cast<void>(context.advisory_gate.release(TICKET));
+            return false;
+        }
+        gate_ = &context;
+        ticket_ = TICKET;
+        rpc_scope_ = scope;
+        rpc_scope_serial_ = serial;
+        return true;
+    }
+    void release_gate_locked() {
+        if (gate_ == nullptr) return;
+        static_cast<void>(gate_->advisory_gate.release(ticket_));
+        if (rpc_scope_ < g_client_scopes.size())
+            static_cast<void>(g_client_scopes.at(rpc_scope_).lifecycle.release_rpc(rpc_scope_serial_, ticket_));
+        gate_ = nullptr;
+        ticket_ = 0;
+        rpc_scope_ = CLIENT_SCOPE_NONE;
+        rpc_scope_serial_ = 0;
+    }
+    void release_gate() {
+        s_vfs_lock.lock();
+        release_gate_locked();
+        s_vfs_lock.unlock();
+    }
+    auto acquire_io(RemoteFileContext& context) -> int {
+        uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us(), VFS_PROXY_OP_TIMEOUT_US);
+        for (;;) {
+            s_vfs_lock.lock();
+            bool const ACQUIRED = context.io_lock.try_lock();
+            if (ACQUIRED) io_ = &context.io_lock;
+            s_vfs_lock.unlock();
+            if (ACQUIRED) return 0;
+            if (wki_now_us() >= DEADLINE) return -ETIMEDOUT;
+            client_advisory_pause();
+        }
+    }
+    void release_io() {
+        s_vfs_lock.lock();
+        auto* mutex = std::exchange(io_, nullptr);
+        s_vfs_lock.unlock();
+        if (mutex != nullptr) mutex->unlock();
+    }
+    auto finish() -> int {
+        s_vfs_lock.lock();
+        auto retired = take_locked();
+        s_vfs_lock.unlock();
+        return finish_retired(retired);
+    }
+    static void cleanup_for_task(uint64_t pid) {
+        if (pid == 0) return;
+        for (;;) {
+            s_vfs_lock.lock();
+            auto* candidate = g_client_task_owners;
+            while (candidate != nullptr && candidate->pid_ != pid) candidate = candidate->next_;
+            Retired const RETIRED = candidate != nullptr ? candidate->take_locked() : Retired{};
+            s_vfs_lock.unlock();
+            if (candidate == nullptr) return;
+            // Proxy/wait stack references have already been quiesced.
+            static_cast<void>(finish_retired(RETIRED));
+        }
+    }
+    ker::vfs::File* file = nullptr;
+    size_t scope_index = CLIENT_SCOPE_NONE;
+    uint64_t scope_serial = 0;
+    bool created_registration = false;
+    size_t operation_index = CLIENT_OPERATION_NONE;
+    uint64_t operation_serial = 0;
+
+   private:
+    struct Retired {
+        ker::vfs::File* file = nullptr;
+        ker::mod::sys::Mutex* io = nullptr;
+        bool linked = false;
+        bool pending = false;
+    };
+    static auto finish_retired(const Retired& retired) -> int {
+        if (retired.io != nullptr) retired.io->unlock();
+        if (!retired.linked) return 0;
+        collect_client_advisory_records();
+        // The final generic/backend/tail close has its own qualified tracker.
+        int const STATUS = ker::vfs::vfs_put_file_result(retired.file);
+        if (retired.pending) wki_deferred_work_notify();
+        return STATUS;
+    }
+    auto take_locked() -> Retired {
+        if (!linked_) return {};
+        bool pending = false;
+        release_gate_locked();
+        if (operation_index < g_client_operations.size()) {
+            auto& record = g_client_operations.at(operation_index);
+            if (record.lifecycle.serial() == operation_serial) {
+                static_cast<void>(record.lifecycle.abandon(operation_serial));
+                record.active_pid = 0;
+                pending = record.lifecycle.phase() == client_advisory::OperationPhase::CANCEL ||
+                          record.lifecycle.phase() == client_advisory::OperationPhase::ACK;
+            }
+        }
+        if (scope_index < g_client_scopes.size()) {
+            auto& lifecycle = g_client_scopes.at(scope_index).lifecycle;
+            if (created_registration && lifecycle.serial() == scope_serial && lifecycle.phase() == client_advisory::ScopePhase::REGISTERING)
+                static_cast<void>(lifecycle.request_close(scope_serial));
+            static_cast<void>(lifecycle.drop(scope_serial));
+            pending = pending || (lifecycle.phase() != client_advisory::ScopePhase::EMPTY &&
+                                  lifecycle.phase() != client_advisory::ScopePhase::ACTIVE && !lifecycle.acknowledgement_complete());
+        }
+        if (previous_ != nullptr)
+            previous_->next_ = next_;
+        else
+            g_client_task_owners = next_;
+        if (next_ != nullptr) next_->previous_ = previous_;
+        previous_ = nullptr;
+        next_ = nullptr;
+        linked_ = false;
+        scope_index = CLIENT_SCOPE_NONE;
+        operation_index = CLIENT_OPERATION_NONE;
+        return {std::exchange(file, nullptr), std::exchange(io_, nullptr), true, pending};
+    }
+    uint64_t pid_ = 0;
+    RemoteFileContext* gate_ = nullptr;
+    uint64_t ticket_ = 0;
+    size_t rpc_scope_ = CLIENT_SCOPE_NONE;
+    uint64_t rpc_scope_serial_ = 0;
+    ker::mod::sys::Mutex* io_ = nullptr;
+    bool linked_ = false;
+    ClientTaskOwner* previous_ = nullptr;
+    ClientTaskOwner* next_ = nullptr;
+};
+
+// Only short registry mutations occur under Spin; every final File put is outside.
+void collect_client_advisory_records() {
+    if (g_client_record_count.load(std::memory_order_acquire) == 0) return;
+    constexpr size_t MAX_RELEASES = 8;
+    for (size_t count = 0; count < MAX_RELEASES; ++count) {
+        ker::vfs::File* released = nullptr;
+        s_vfs_lock.lock();
+        for (auto& record : g_client_operations) {
+            if (record.file == nullptr || record.active_pid != 0 || !record.lifecycle.reclaimable(record.lifecycle.serial())) continue;
+            if (record.scope_index < g_client_scopes.size())
+                static_cast<void>(g_client_scopes.at(record.scope_index).lifecycle.release(record.scope_serial, record.scope_token));
+            released = record.file;
+            record = {};
+            g_client_record_count.fetch_sub(1, std::memory_order_release);
+            break;
+        }
+        if (released == nullptr) {
+            for (auto& record : g_client_scopes) {
+                if (record.witness == nullptr || !record.lifecycle.reclaimable(record.lifecycle.serial())) continue;
+                released = record.witness;
+                record = {};
+                g_client_record_count.fetch_sub(1, std::memory_order_release);
+                break;
+            }
+        }
+        s_vfs_lock.unlock();
+        if (released == nullptr) return;
+        ker::vfs::vfs_put_file(released);
+    }
+}
+
+auto client_advisory_retirement_proven(const RemoteFileContext& context, const WkiChannelIdentity& identity) -> bool {
+    if (wki_peer_remote_boot_epoch_invalidated(identity.peer_node_id, context.ordinary_owner_boot_epoch)) return true;
+    s_vfs_lock.lock();
+    bool const RETIRED =
+        context.proxy->binding_retirement_confirmed && vfs_channel_identity_matches(proxy_channel_identity_locked(context.proxy), identity);
+    s_vfs_lock.unlock();
+    return RETIRED;
+}
+
+auto client_owner_authority(const RemoteFileContext& context, uint64_t operation) -> VfsOwnerFdRequest {
+    return {.fd = context.remote_fd,
+            .open_token = context.ordinary_open_token,
+            .binding_id = context.ordinary_open_binding_id,
+            .owner_boot_epoch = context.ordinary_owner_boot_epoch,
+            .query_id = operation};
+}
+
+#ifdef WOS_SELFTEST
+struct ClientAdvisoryTestEndpoint {
+    ProxyVfsState* proxy = nullptr;
+    void* context = nullptr;
+    int (*invoke)(void*, uint16_t, const void*, void*, uint16_t*) = nullptr;
+    void (*pause)(void*) = nullptr;
+    uint64_t stack_pid = 0;
+};
+ClientAdvisoryTestEndpoint g_client_advisory_test_endpoint{};
+void client_advisory_test_pause() {
+    if (g_client_advisory_test_endpoint.proxy != nullptr && g_client_advisory_test_endpoint.pause != nullptr)
+        g_client_advisory_test_endpoint.pause(g_client_advisory_test_endpoint.context);
+}
+#endif
+
+auto client_advisory_current_pid() -> uint64_t {
+    uint64_t const PID = perf_current_pid();
+#ifdef WOS_SELFTEST
+    if (PID == 0 && g_client_advisory_test_endpoint.proxy != nullptr) return g_client_advisory_test_endpoint.stack_pid;
+#endif
+    return PID;
+}
+
+auto client_advisory_rpc(RemoteFileContext& context, const WkiChannelIdentity& identity, uint16_t operation, const void* request,
+                         uint16_t request_length, void* response, uint16_t response_capacity, uint16_t& response_length, uint64_t timeout)
+    -> int {
+#ifdef WOS_SELFTEST
+    if (g_client_advisory_test_endpoint.proxy == context.proxy && g_client_advisory_test_endpoint.invoke != nullptr)
+        return g_client_advisory_test_endpoint.invoke(g_client_advisory_test_endpoint.context, operation, request, response,
+                                                      &response_length);
+#endif
+    return normalize_proxy_status_for_errno(vfs_proxy_send_and_wait(context.proxy, operation, static_cast<const uint8_t*>(request),
+                                                                    request_length, response, response_capacity, &response_length, timeout,
+                                                                    nullptr, nullptr, 0, false, &identity));
+}
+
+// The caller already borrows this exact slot and its witness. A short pair of
+// explicit gates represents the RPC on the stack before any transport wait.
+auto client_scope_step(ClientTaskOwner& owner, uint64_t timeout) -> int {
+    s_vfs_lock.lock();
+    auto& record = g_client_scopes.at(owner.scope_index);
+    auto& lifecycle = record.lifecycle;
+    uint64_t const SERIAL = owner.scope_serial;
+    auto* context = static_cast<RemoteFileContext*>(record.witness->private_data);
+    auto const IDENTITY = record.identity;
+    s_vfs_lock.unlock();
+    bool const RETIRED = client_advisory_retirement_proven(*context, IDENTITY);
+    s_vfs_lock.lock();
+    if (lifecycle.serial() != SERIAL) {
+        s_vfs_lock.unlock();
+        return -ESTALE;
+    }
+    if (RETIRED) {
+        static_cast<void>(lifecycle.retire(SERIAL));
+        s_vfs_lock.unlock();
+        return -ENOTCONN;
+    }
+    auto const PHASE = lifecycle.phase();
+    if (PHASE == client_advisory::ScopePhase::ACTIVE || lifecycle.acknowledgement_complete()) {
+        s_vfs_lock.unlock();
+        return 0;
+    }
+    if (!owner.try_gate_locked(*context, owner.scope_index, SERIAL)) {
+        s_vfs_lock.unlock();
+        return -EAGAIN;
+    }
+    uint64_t const QUERY = PHASE == client_advisory::ScopePhase::REGISTERING ? lifecycle.registration() : g_client_scope_queries.take();
+    VfsOwnerScopeRequest request{.owner = client_owner_authority(*context, QUERY),
+                                 .process_generation = lifecycle.key().process,
+                                 .scope_token = lifecycle.token(),
+                                 .pid = lifecycle.pid(),
+                                 .operation = PHASE == client_advisory::ScopePhase::REGISTERING ? VfsOwnerScopeOperation::REGISTER
+                                              : PHASE == client_advisory::ScopePhase::CLOSING   ? VfsOwnerScopeOperation::CLOSE
+                                                                                                : VfsOwnerScopeOperation::ACK};
+    if (request.operation != VfsOwnerScopeOperation::REGISTER) {
+        request.owner.fd = 0;
+        request.owner.open_token = 0;
+    }
+    s_vfs_lock.unlock();
+    VfsOwnerScopeResponse response{};
+    uint16_t length = 0;
+    int status = QUERY == 0 ? -EOVERFLOW
+                            : client_advisory_rpc(*context, IDENTITY, OP_VFS_LOCK_SCOPE, &request, sizeof(request), &response,
+                                                  sizeof(response), length, timeout);
+    if (status == 0 && !wki_vfs_owner_scope_response_valid(response, request, length)) status = -EPROTO;
+    s_vfs_lock.lock();
+    bool accepted = false;
+    if (request.operation == VfsOwnerScopeOperation::ACK && status == -ESTALE) {
+        // Confirmed CLOSE preceded this exact ACK: already freed receipt storage.
+        accepted = lifecycle.acknowledged(SERIAL, request.scope_token, lifecycle.key().object);
+        if (accepted) status = 0;
+    } else if (status == 0) {
+        if (request.operation == VfsOwnerScopeOperation::REGISTER)
+            accepted = lifecycle.registered(SERIAL, request.owner.query_id, response.scope_token, response.object, response.state == 2);
+        else if (request.operation == VfsOwnerScopeOperation::CLOSE)
+            accepted = lifecycle.closed(SERIAL, response.scope_token, response.object);
+        else
+            accepted = lifecycle.acknowledged(SERIAL, response.scope_token, response.object);
+    }
+    if (status == 0 && !accepted) status = -EPROTO;
+    record.retry_after_us = status == 0 ? 0 : wki_future_deadline_us(wki_now_us(), VFS_EXEC_CANCEL_RETRY_INTERVAL_US);
+    owner.release_gate_locked();
+    s_vfs_lock.unlock();
+    return status;
+}
+
+auto borrow_client_scope(ClientTaskOwner& owner, RemoteFileContext& context, uint64_t generation, int32_t pid,
+                         const WkiChannelIdentity& identity, bool create, bool close) -> int {
+    client_advisory::ScopeKey const KEY{.object = context.advisory_object,
+                                        .process = generation,
+                                        .boot = context.ordinary_owner_boot_epoch,
+                                        .owner = identity.peer_node_id};
+    if (!KEY.valid()) return -EOPNOTSUPP;
+    s_vfs_lock.lock();
+    size_t index = CLIENT_SCOPE_NONE;
+    for (size_t i = 0; i < g_client_scopes.size(); ++i) {
+        auto& lifecycle = g_client_scopes.at(i).lifecycle;
+        if (!lifecycle.blocks_successor(KEY)) continue;
+        if (lifecycle.pid() != pid) {
+            s_vfs_lock.unlock();
+            return -EPROTO;
+        }
+        index = i;
+        break;
+    }
+    if (index == CLIENT_SCOPE_NONE && create) {
+        for (size_t i = 0; i < g_client_scopes.size(); ++i) {
+            if (g_client_scopes.at(i).witness != nullptr) continue;
+            uint64_t const SERIAL = g_client_serials.take();
+            uint64_t const REGISTRATION = g_client_registrations.take();
+            auto& record = g_client_scopes.at(i);
+            if (!record.lifecycle.reserve(SERIAL, KEY, pid, REGISTRATION)) {
+                s_vfs_lock.unlock();
+                return -EOVERFLOW;
+            }
+            ker::vfs::vfs_retain_file(owner.file);
+            record.witness = owner.file;
+            record.identity = identity;
+            g_client_record_count.fetch_add(1, std::memory_order_release);
+            owner.created_registration = true;
+            index = i;
+            break;
+        }
+    }
+    if (index == CLIENT_SCOPE_NONE) {
+        s_vfs_lock.unlock();
+        return create ? -ENOLCK : 0;
+    }
+    auto& lifecycle = g_client_scopes.at(index).lifecycle;
+    uint64_t const SERIAL = lifecycle.serial();
+    if (!lifecycle.borrow(SERIAL)) {
+        s_vfs_lock.unlock();
+        return -ENOLCK;
+    }
+    owner.scope_index = index;
+    owner.scope_serial = SERIAL;
+    if (close) static_cast<void>(lifecycle.request_close(SERIAL));
+    s_vfs_lock.unlock();
+    return 0;
+}
+
+auto prepare_client_scope(ClientTaskOwner& owner) -> int {
+    uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us(), VFS_PROXY_OP_TIMEOUT_US);
+    for (;;) {
+        s_vfs_lock.lock();
+        auto const& lifecycle = g_client_scopes.at(owner.scope_index).lifecycle;
+        bool const ACTIVE = lifecycle.grants_allowed(owner.scope_serial);
+        bool const REGISTERING = lifecycle.phase() == client_advisory::ScopePhase::REGISTERING;
+        s_vfs_lock.unlock();
+        if (ACTIVE) return 0;
+        if (!REGISTERING) return -EAGAIN;
+        int const STATUS = client_scope_step(owner, VFS_PROXY_OP_TIMEOUT_US);
+        if (STATUS != 0 && STATUS != -EAGAIN) return STATUS;
+        if (wki_now_us() >= DEADLINE) return -ETIMEDOUT;
+        if (STATUS == -EAGAIN) client_advisory_pause();
+    }
+}
+
+auto client_lock_rpc(RemoteFileContext& context, const WkiChannelIdentity& identity, const VfsOwnerLockRequest& request,
+                     ker::vfs::RemoteAdvisoryReply& output, uint64_t timeout) -> int {
+    VfsOwnerLockResponse response{};
+    uint16_t length = 0;
+    int const STATUS =
+        client_advisory_rpc(context, identity, OP_VFS_LOCK_OWNER, &request, sizeof(request), &response, sizeof(response), length, timeout);
+    if (STATUS != 0) return STATUS;
+    if (!wki_vfs_owner_lock_response_valid(response, request.owner.query_id, (request.flags & WKI_VFS_LOCK_QUERY) != 0, length))
+        return -EPROTO;
+    output = {.operation = response.operation,
+              .state = static_cast<ker::vfs::RemoteAdvisoryState>(response.state),
+              .outcome = {.status = response.status,
+                          .pid = response.pid,
+                          .start = response.start,
+                          .length = response.range_length,
+                          .type = response.type,
+                          .whence = response.whence}};
+    return 0;
+}
+
+auto client_operation_step(ClientTaskOwner& owner, uint64_t timeout) -> int {
+    s_vfs_lock.lock();
+    auto& record = g_client_operations.at(owner.operation_index);
+    auto& lifecycle = record.lifecycle;
+    uint64_t const SERIAL = owner.operation_serial;
+    auto* context = static_cast<RemoteFileContext*>(record.file->private_data);
+    auto const IDENTITY = record.identity;
+    s_vfs_lock.unlock();
+    bool const RETIRED = client_advisory_retirement_proven(*context, IDENTITY);
+    s_vfs_lock.lock();
+    if (lifecycle.serial() != SERIAL || record.active_pid != owner.pid()) {
+        s_vfs_lock.unlock();
+        return -ESTALE;
+    }
+    if (RETIRED) {
+        static_cast<void>(lifecycle.retire(SERIAL));
+        s_vfs_lock.unlock();
+        return -ENOTCONN;
+    }
+    auto const PHASE = lifecycle.phase();
+    if (PHASE == client_advisory::OperationPhase::DONE) {
+        s_vfs_lock.unlock();
+        return 0;
+    }
+    if (!owner.try_gate_locked(*context)) {
+        s_vfs_lock.unlock();
+        return -EAGAIN;
+    }
+    VfsOwnerLockRequest request = record.request;
+    if (PHASE == client_advisory::OperationPhase::PREPARED) {
+        request.owner.query_id = context->advisory_operations.take();
+        if (!lifecycle.started(SERIAL, request.owner.query_id)) {
+            owner.release_gate_locked();
+            s_vfs_lock.unlock();
+            return -EOVERFLOW;
+        }
+        record.request = request;
+    } else {
+        request.phase = PHASE == client_advisory::OperationPhase::CANCEL ? 3 : PHASE == client_advisory::OperationPhase::ACK ? 4 : 2;
+    }
+    s_vfs_lock.unlock();
+    ker::vfs::RemoteAdvisoryReply reply{};
+    int status = client_lock_rpc(*context, IDENTITY, request, reply, timeout);
+    s_vfs_lock.lock();
+    if (status == -ESTALE && PHASE == client_advisory::OperationPhase::CANCEL) {
+        if (!lifecycle.cancelled_without_receipt(SERIAL, request.owner.query_id))
+            status = -EPROTO;
+        else
+            status = 0;
+    } else if (status == 0) {
+        bool const ACCEPTED = PHASE == client_advisory::OperationPhase::ACK ? lifecycle.acknowledged(SERIAL, request.owner.query_id)
+                                                                            : lifecycle.observe(SERIAL, reply);
+        if (!ACCEPTED) status = -EPROTO;
+    }
+    record.retry_after_us = status == 0 ? 0 : wki_future_deadline_us(wki_now_us(), VFS_EXEC_CANCEL_RETRY_INTERVAL_US);
+    owner.release_gate_locked();
+    s_vfs_lock.unlock();
+    return status;
+}
+
+auto reserve_client_operation(ClientTaskOwner& owner, const WkiChannelIdentity& identity, const VfsOwnerLockRequest& request) -> int {
+    s_vfs_lock.lock();
+    for (size_t i = 0; i < g_client_operations.size(); ++i) {
+        auto& record = g_client_operations.at(i);
+        if (record.file != nullptr) continue;
+        uint64_t const SERIAL = g_client_serials.take();
+        if (!record.lifecycle.reserve(SERIAL)) {
+            s_vfs_lock.unlock();
+            return -EOVERFLOW;
+        }
+        if (owner.scope_index < g_client_scopes.size()) {
+            auto& scope = g_client_scopes.at(owner.scope_index).lifecycle;
+            if (!scope.retain(owner.scope_serial, request.scope_token)) {
+                record = {};
+                s_vfs_lock.unlock();
+                return -EAGAIN;
+            }
+            record.scope_index = owner.scope_index;
+            record.scope_serial = owner.scope_serial;
+            record.scope_token = request.scope_token;
+        }
+        ker::vfs::vfs_retain_file(owner.file);
+        record.file = owner.file;
+        record.identity = identity;
+        record.request = request;
+        record.active_pid = owner.pid();
+        g_client_record_count.fetch_add(1, std::memory_order_release);
+        owner.operation_index = i;
+        owner.operation_serial = SERIAL;
+        s_vfs_lock.unlock();
+        return 0;
+    }
+    s_vfs_lock.unlock();
+    return -ENOLCK;
+}
+
+auto wait_client_gate(ClientTaskOwner& owner, RemoteFileContext& context) -> int {
+    uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us(), VFS_PROXY_OP_TIMEOUT_US);
+    for (;;) {
+        s_vfs_lock.lock();
+        bool const ACQUIRED = owner.try_gate_locked(context);
+        s_vfs_lock.unlock();
+        if (ACQUIRED) return 0;
+        if (wki_now_us() >= DEADLINE) return -ETIMEDOUT;
+        client_advisory_pause();
+    }
+}
+
+auto run_client_advisory(ClientTaskOwner& owner, ker::mod::sched::task::Task& subject, ker::vfs::RemoteAdvisoryKind kind, bool query,
+                         bool wait, ker::vfs::VfsFlockAbi& flock) -> int {
+    if (owner.file == nullptr || owner.file->private_data == nullptr) return -EOPNOTSUPP;
+    auto& context = *static_cast<RemoteFileContext*>(owner.file->private_data);
+    if (!context.owner_features_known || (context.owner_features & WKI_VFS_FEATURE_OWNER_LOCKS) == 0 || context.advisory_object == 0)
+        return -EOPNOTSUPP;
+    if (owner.pid() == 0) return -ESRCH;
+    if (kind == ker::vfs::RemoteAdvisoryKind::OPEN_FILE && flock.l_pid != 0) return -EINVAL;
+    if (flock.l_type < 0 || flock.l_type > 2 || flock.l_whence < 0 || flock.l_whence > 2) return -EINVAL;
+    uint64_t const PID = ker::mod::sched::task::process_pid(subject);
+    uint64_t const GENERATION = ker::vfs::vfs_advisory_process_generation(subject);
+    if (GENERATION == 0 || PID == 0 || PID > INT32_MAX) return -EOVERFLOW;
+    WkiChannelIdentity identity{};
+    int const AUTHORITY = capture_secure_vfs_client(context, identity);
+    if (AUTHORITY != 0) return AUTHORITY;
+    VfsOwnerLockRequest request{
+        .owner = client_owner_authority(context, 0),
+        .process_generation = GENERATION,
+        .start = flock.l_start,
+        .range_length = flock.l_len,
+        .pid = static_cast<int32_t>(PID),
+        .type = flock.l_type,
+        .whence = flock.l_whence,
+        .kind = static_cast<uint8_t>(kind),
+        .flags = static_cast<uint16_t>((query ? WKI_VFS_LOCK_QUERY : 0) | (wait && flock.l_type != 2 ? WKI_VFS_LOCK_WAIT : 0))};
+    if (flock.l_whence == 1) {
+        int const STATUS = owner.acquire_io(context);
+        if (STATUS != 0) return STATUS;
+        request.position = owner.file->pos;
+        owner.release_io();
+    }
+    if (kind == ker::vfs::RemoteAdvisoryKind::PROCESS) {
+        int const BORROWED = borrow_client_scope(owner, context, GENERATION, static_cast<int32_t>(PID), identity, true, false);
+        if (BORROWED != 0) return BORROWED;
+        int const REGISTERED = prepare_client_scope(owner);
+        if (REGISTERED != 0) return REGISTERED;
+        s_vfs_lock.lock();
+        request.scope_token = g_client_scopes.at(owner.scope_index).lifecycle.token();
+        s_vfs_lock.unlock();
+    }
+    if (query || flock.l_type == 2) {
+        int const GATE = wait_client_gate(owner, context);
+        if (GATE != 0) return GATE;
+        request.owner.query_id = context.advisory_operations.take();
+        if (request.owner.query_id == 0) {
+            owner.release_gate();
+            return -EOVERFLOW;
+        }
+        ker::vfs::RemoteAdvisoryReply reply{};
+        int const STATUS = client_lock_rpc(context, identity, request, reply, VFS_PROXY_OP_TIMEOUT_US);
+        owner.release_gate();
+        if (STATUS != 0) return STATUS;
+        if (reply.state != ker::vfs::RemoteAdvisoryState::COMPLETE) return -EPROTO;
+        if (reply.outcome.status == 0 && query) {
+            flock.l_type = reply.outcome.type;
+            flock.l_pid = reply.outcome.pid;
+            if (reply.outcome.type != 2) {
+                flock.l_whence = reply.outcome.whence;
+                flock.l_start = reply.outcome.start;
+                flock.l_len = reply.outcome.length;
+            }
+        }
+        return reply.outcome.status;
+    }
+    int const RESERVED = reserve_client_operation(owner, identity, request);
+    if (RESERVED != 0) return RESERVED;
+    uint64_t gate_deadline = wki_future_deadline_us(wki_now_us(), VFS_PROXY_OP_TIMEOUT_US);
+    int uncertain = 0;
+    for (;;) {
+        auto* task = ker::mod::sched::get_current_task();
+        if (task != nullptr && task->has_interrupting_signal_pending()) {
+            s_vfs_lock.lock();
+            auto& lifecycle = g_client_operations.at(owner.operation_index).lifecycle;
+            static_cast<void>(lifecycle.abandon(owner.operation_serial));
+            s_vfs_lock.unlock();
+            if (uncertain == 0) uncertain = -EINTR;
+        }
+        int const STATUS = client_operation_step(owner, uncertain == 0 ? VFS_PROXY_OP_TIMEOUT_US : VFS_EXEC_CANCEL_RETRY_TIMEOUT_US);
+        s_vfs_lock.lock();
+        auto& lifecycle = g_client_operations.at(owner.operation_index).lifecycle;
+        auto const PHASE = lifecycle.phase();
+        auto const TERMINAL = lifecycle.terminal();
+        auto const OUTCOME = lifecycle.outcome();
+        s_vfs_lock.unlock();
+        if (PHASE == client_advisory::OperationPhase::ACK || PHASE == client_advisory::OperationPhase::DONE) {
+            if (PHASE == client_advisory::OperationPhase::ACK)
+                static_cast<void>(client_operation_step(owner, VFS_EXEC_CANCEL_RETRY_TIMEOUT_US));
+            return TERMINAL == ker::vfs::RemoteAdvisoryState::EMPTY ? uncertain != 0 ? uncertain : STATUS : OUTCOME.status;
+        }
+        if (STATUS != 0 && STATUS != -EAGAIN) {
+            if (uncertain != 0) return uncertain;
+            uncertain = STATUS;
+            s_vfs_lock.lock();
+            static_cast<void>(lifecycle.abandon(owner.operation_serial));
+            s_vfs_lock.unlock();
+            continue;
+        }
+        if (STATUS == -EAGAIN && wki_now_us() >= gate_deadline) return uncertain != 0 ? uncertain : -ETIMEDOUT;
+        if (uncertain != 0 && STATUS == -EAGAIN) return uncertain;
+        if (STATUS == 0) gate_deadline = wki_future_deadline_us(wki_now_us(), VFS_PROXY_OP_TIMEOUT_US);
+        client_advisory_pause();  // Both RPC gates were released before parking.
+    }
+}
+
+auto close_client_scope(ClientTaskOwner& owner, ker::mod::sched::task::Task& subject) -> int {
+    if (owner.file == nullptr || owner.file->private_data == nullptr) return 0;
+    auto& context = *static_cast<RemoteFileContext*>(owner.file->private_data);
+    uint64_t const GENERATION = ker::vfs::vfs_advisory_process_generation(subject, false);
+    if (GENERATION == 0 || context.advisory_object == 0) return 0;
+    uint64_t const PID = ker::mod::sched::task::process_pid(subject);
+    if (PID == 0 || PID > INT32_MAX) return -EOVERFLOW;
+    // A close must still queue its captured scope after admission is disabled.
+    // The original cancellation row retains that exact binding authority.
+    WkiChannelIdentity identity{};
+    s_vfs_lock.lock();
+    bool captured = false;
+    if (context.ordinary_cancel_slot < g_open_cancellations.size()) {
+        auto const& cancellation = g_open_cancellations.at(context.ordinary_cancel_slot);
+        captured = cancellation.phase == ExecCancellationPhase::OWNED && cancellation.proxy == context.proxy &&
+                   cancellation.request.token == context.ordinary_open_token &&
+                   cancellation.request.binding_id == context.ordinary_open_binding_id &&
+                   cancellation.request.owner_boot_epoch == context.ordinary_owner_boot_epoch;
+        if (captured) identity = cancellation.identity;
+    }
+    s_vfs_lock.unlock();
+    if (!captured) return -ENOTCONN;
+    int const BORROWED = borrow_client_scope(owner, context, GENERATION, static_cast<int32_t>(PID), identity, false, true);
+    if (BORROWED != 0 || owner.scope_index == CLIENT_SCOPE_NONE) return BORROWED;
+    uint64_t const DEADLINE = wki_future_deadline_us(wki_now_us(), VFS_PROXY_OP_TIMEOUT_US);
+    for (;;) {
+        s_vfs_lock.lock();
+        bool const CLOSED = g_client_scopes.at(owner.scope_index).lifecycle.phase() == client_advisory::ScopePhase::CLOSED;
+        s_vfs_lock.unlock();
+        if (CLOSED) {
+            // ACK is receipt storage only. Uncertainty cannot undo this close.
+            static_cast<void>(client_scope_step(owner, VFS_EXEC_CANCEL_RETRY_TIMEOUT_US));
+            return 0;
+        }
+        int const STATUS = client_scope_step(owner, VFS_PROXY_OP_TIMEOUT_US);
+        if (STATUS != 0 && STATUS != -EAGAIN) return STATUS;
+        if (wki_now_us() >= DEADLINE) return -ETIMEDOUT;
+        if (STATUS == -EAGAIN) client_advisory_pause();
+    }
 }
 
 auto make_secure_vfs_intent(const RemoteFileContext& context, rdma_protocol::Opcode opcode, int64_t offset, uint32_t length)
@@ -6917,6 +7623,7 @@ void wki_remote_vfs_cleanup_for_task(uint64_t pid) {
         wake_proxy_slot_waiter(CLEANUP.next_pid);
     }
     SharedIoTaskOwner::cleanup_for_task(pid);
+    ClientTaskOwner::cleanup_for_task(pid);
     ker::vfs::vfs_cleanup_ordinary_final_closes_for_task(pid);
     PinPreparation::cleanup_for_task(pid);
     PinCloseOwner::cleanup_for_task(pid);
@@ -6924,6 +7631,100 @@ void wki_remote_vfs_cleanup_for_task(uint64_t pid) {
 }
 
 auto wki_remote_vfs_fsync(ker::vfs::File* file) -> int { return remote_vfs_fsync_file(file); }
+
+auto wki_remote_vfs_advisory_reference(ker::vfs::File* file, ker::mod::sched::task::Task& subject, ker::vfs::RemoteAdvisoryKind kind,
+                                       bool query, bool wait, ker::vfs::VfsFlockAbi& flock) -> int {
+    ClientTaskOwner owner(file);
+    return run_client_advisory(owner, subject, kind, query, wait, flock);
+}
+
+auto wki_remote_vfs_close_reference(ker::vfs::File* file, ker::mod::sched::task::Task& subject, ker::vfs::Stat* stat, int* stat_result)
+    -> int {
+    ClientTaskOwner owner(file);
+    int flush_status = 0;
+    if (file != nullptr && file->private_data != nullptr) {
+        auto& context = *static_cast<RemoteFileContext*>(file->private_data);
+        if (stat != nullptr || (context.owner_features & WKI_VFS_FEATURE_OWNER_LOCKS) != 0) {
+            int const IO = owner.acquire_io(context);
+            if (IO == 0) {
+                if (stat != nullptr) {
+                    if (stat_result != nullptr) *stat_result = remote_vfs_fstat_locked(file, stat);
+                } else {
+                    flush_status = normalize_proxy_status_for_errno(flush_write_behind(&context));
+                }
+                owner.release_io();
+            } else if (stat != nullptr && stat_result != nullptr) {
+                *stat_result = IO;
+            } else {
+                flush_status = IO;
+            }
+        }
+    } else if (stat != nullptr && stat_result != nullptr) {
+        *stat_result = -EINVAL;
+    }
+    int const SCOPE = close_client_scope(owner, subject);
+    int const RELEASE = owner.finish();
+    return SCOPE != 0 ? SCOPE : flush_status != 0 ? flush_status : RELEASE;
+}
+
+// Bounded rotating outbox work, on the separate auto-attach task, never RX,
+// timer or the hashed owner-service worker. Busy gates and uncertain responses
+// retain their exact original witnesses and commands for another attempt.
+void wki_remote_vfs_process_pending_advisory() {
+    if (g_client_record_count.load(std::memory_order_acquire) == 0) return;
+    static size_t scope_cursor = 0;
+    static size_t operation_cursor = 0;
+    constexpr size_t SCAN_BATCH = 32;
+    constexpr size_t RPC_BATCH = 4;
+    size_t attempted = 0;
+    for (size_t scanned = 0; scanned < SCAN_BATCH && attempted < RPC_BATCH; ++scanned) {
+        ClientTaskOwner owner;
+        s_vfs_lock.lock();
+        size_t const INDEX = scope_cursor++ % g_client_scopes.size();
+        auto& record = g_client_scopes.at(INDEX);
+        bool const READY =
+            record.witness != nullptr && record.retry_after_us <= wki_now_us() && record.lifecycle.borrow(record.lifecycle.serial());
+        if (READY) {
+            owner.scope_index = INDEX;
+            owner.scope_serial = record.lifecycle.serial();
+        }
+        s_vfs_lock.unlock();
+        if (!READY) continue;
+        auto* context = static_cast<RemoteFileContext*>(record.witness->private_data);
+        if (client_advisory_retirement_proven(*context, record.identity)) {
+            s_vfs_lock.lock();
+            static_cast<void>(record.lifecycle.retire(owner.scope_serial));
+            s_vfs_lock.unlock();
+        } else {
+            s_vfs_lock.lock();
+            bool const NEEDS_RPC =
+                record.lifecycle.phase() != client_advisory::ScopePhase::ACTIVE && !record.lifecycle.acknowledgement_complete();
+            s_vfs_lock.unlock();
+            if (NEEDS_RPC) {
+                ++attempted;
+                static_cast<void>(client_scope_step(owner, VFS_EXEC_CANCEL_RETRY_TIMEOUT_US));
+            }
+        }
+    }
+    attempted = 0;
+    for (size_t scanned = 0; scanned < SCAN_BATCH && attempted < RPC_BATCH; ++scanned) {
+        ClientTaskOwner owner;
+        s_vfs_lock.lock();
+        size_t const INDEX = operation_cursor++ % g_client_operations.size();
+        auto& record = g_client_operations.at(INDEX);
+        bool const READY = record.file != nullptr && record.active_pid == 0 && record.retry_after_us <= wki_now_us();
+        if (READY) {
+            record.active_pid = owner.pid();
+            owner.operation_index = INDEX;
+            owner.operation_serial = record.lifecycle.serial();
+        }
+        s_vfs_lock.unlock();
+        if (!READY) continue;
+        ++attempted;
+        static_cast<void>(client_operation_step(owner, VFS_EXEC_CANCEL_RETRY_TIMEOUT_US));
+    }
+    collect_client_advisory_records();
+}
 
 namespace {
 void pin_diag_snapshot(WkiRemoteVfsExecDiag* out, bool directory) {
@@ -9137,6 +9938,278 @@ auto wki_remote_vfs_selftest_owner_advisory() -> bool {
     if (request(parent) != 0 || reply.status != 0) return false;
     wki_remote_vfs_cleanup_server_fds_for_channel(IDENTITY);
     return request(parent) == -EBADF && owner->refcount.load() == 1 && owner->remote_advisory_closed.load();
+}
+
+auto wki_remote_vfs_selftest_client_advisory() -> bool {
+    namespace vfs = ker::vfs;
+    if (g_wki.initialized || g_client_task_owners != nullptr || g_client_record_count.load() != 0) return false;
+    ker::mod::sched::task::Task subject{};
+    subject.pid = 8069;
+    std::memcpy(subject.root.data(), "/", 2);
+    std::memcpy(subject.cwd.data(), "/", 2);
+    auto* task = &subject;
+    auto fail = [](int line) {
+        ker::mod::dbg::logger<"ktest">::error("advisory client invariant failed at remote_vfs.cpp:%d", line);
+        return false;
+    };
+    constexpr const char* PATH = "/tmp/ktest_client_wire_locks26";
+    static_cast<void>(vfs::vfs_unlink(PATH));
+    WkiChannel owner_channel{}, consumer_channel{};
+    WkiChannelIdentity const OWNER_IDENTITY{&owner_channel, 0x7FE0, 77, 65};
+    WkiChannelIdentity const CONSUMER_IDENTITY{&consumer_channel, 0x7FE1, 77, 65};
+    DevServerBinding binding;
+    binding.resource_type = ResourceType::VFS;
+    binding.resource_id = 73;
+    binding.resource_incarnation = {37, 41};
+    binding.consumer_node = CONSUMER_IDENTITY.peer_node_id;
+    binding.consumer_boot_epoch = 43;
+    binding.channel_identity = CONSUMER_IDENTITY;
+    binding.vfs_export_publication_revision = 47;
+    VfsOpenLifetimeRequest bound{};
+    if (query_ordinary_open_binding(binding, CONSUMER_IDENTITY, 53, bound) != 0) return fail(__LINE__);
+    ProxyVfsState proxy{};
+    proxy.active = true;
+    proxy.owner_node = OWNER_IDENTITY.peer_node_id;
+    proxy.assigned_channel_ref = OWNER_IDENTITY.channel;
+    proxy.assigned_channel = OWNER_IDENTITY.channel_id;
+    proxy.assigned_channel_generation = OWNER_IDENTITY.generation;
+    proxy.binding_peer_boot_epoch = bound.owner_boot_epoch;
+    proxy.ordinary_open_binding_id = bound.binding_id;
+    proxy.ordinary_owner_boot_epoch = bound.owner_boot_epoch;
+    proxy.ordinary_owner_features = WKI_VFS_FEATURE_OPEN_LIFETIME | WKI_VFS_FEATURE_OWNER_LOCKS;
+    proxy.open_file_refs = 1;
+    auto release = [](vfs::File* file) { vfs::vfs_put_file(file); };
+    std::unique_ptr<vfs::File, decltype(release)> native(vfs::vfs_open_file(PATH, vfs::O_CREAT | vfs::O_EXCL | 2, 0600), release);
+    std::unique_ptr<vfs::File, decltype(release)> probe(vfs::vfs_open_file(PATH, 2, 0), release);
+    if (!native || !probe || native->fs_type != vfs::FSType::TMPFS) return fail(__LINE__);
+    struct Fixture {
+        ProxyVfsState* proxy;
+        DevServerBinding* binding;
+        WkiChannelIdentity consumer;
+        ker::mod::sched::task::Task* task;
+        std::array<vfs::File*, 2> files{};
+        std::array<int, 2> fds{-1, -1};
+        bool drop_register = false;
+        bool drop_start = false;
+        bool drop_lock_ack = false;
+        bool drop_scope_ack = false;
+        unsigned starts = 0;
+        int unlock_fd = -1;
+        int unlock_result = -999;
+        void drain() {
+            // Deterministic eligibility for this fixture's exact private rows;
+            // production retry deadlines and actual timer pacing are unchanged.
+            for (unsigned pass = 0; pass < 40; ++pass) {
+                s_vfs_lock.lock();
+                for (auto& record : g_client_scopes)
+                    if (record.witness != nullptr && static_cast<RemoteFileContext*>(record.witness->private_data)->proxy == proxy)
+                        record.retry_after_us = 0;
+                for (auto& record : g_client_operations)
+                    if (record.file != nullptr && static_cast<RemoteFileContext*>(record.file->private_data)->proxy == proxy)
+                        record.retry_after_us = 0;
+                s_vfs_lock.unlock();
+                wki_remote_vfs_process_pending_advisory();
+            }
+        }
+        ~Fixture() {
+            drop_register = drop_start = drop_lock_ack = drop_scope_ack = false;
+            for (int fd : fds)
+                if (fd >= 0) static_cast<void>(vfs::vfs_close_for_task(task, fd));
+            wki_remote_vfs_cleanup_server_fds_for_channel(consumer);
+            proxy->binding_retirement_confirmed = true;
+            drain();
+            for (auto* file : files) vfs::vfs_put_file(file);
+            for (size_t i = 0; i < g_open_cancellations.size(); ++i)
+                if (g_open_cancellations.at(i).proxy == proxy) finish_ordinary_cancellation(static_cast<uint16_t>(i), 0, false, false);
+            g_client_advisory_test_endpoint = {};
+            static_cast<void>(vfs::vfs_unlink("/tmp/ktest_client_wire_locks26"));
+        }
+    } fixture{&proxy, &binding, CONSUMER_IDENTITY, task};
+    g_client_advisory_test_endpoint = {
+        .proxy = &proxy,
+        .context = &fixture,
+        .invoke = [](void* opaque, uint16_t operation, const void* request, void* response, uint16_t* length) -> int {
+            auto& fixture = *static_cast<Fixture*>(opaque);
+            int status = -EINVAL;
+            if (operation == OP_VFS_LOCK_SCOPE) {
+                auto const& command = *static_cast<const VfsOwnerScopeRequest*>(request);
+                status = perform_server_advisory_scope(*fixture.binding, fixture.consumer, command,
+                                                       *static_cast<VfsOwnerScopeResponse*>(response));
+                if (status == 0) *length = sizeof(VfsOwnerScopeResponse);
+                if (status == 0 && command.operation == VfsOwnerScopeOperation::REGISTER && std::exchange(fixture.drop_register, false))
+                    return -ETIMEDOUT;
+                if (status == 0 && command.operation == VfsOwnerScopeOperation::ACK && fixture.drop_scope_ack) return -ETIMEDOUT;
+            } else if (operation == OP_VFS_LOCK_OWNER) {
+                auto const& command = *static_cast<const VfsOwnerLockRequest*>(request);
+                if (command.phase == 1 && (command.flags & WKI_VFS_LOCK_QUERY) == 0 && command.type != 2) ++fixture.starts;
+                status =
+                    perform_server_advisory(*fixture.binding, fixture.consumer, command, *static_cast<VfsOwnerLockResponse*>(response));
+                if (status == 0) *length = sizeof(VfsOwnerLockResponse);
+                if (status == 0 && command.phase == 1 && std::exchange(fixture.drop_start, false)) return -ETIMEDOUT;
+                if (status == 0 && command.phase == 4 && fixture.drop_lock_ack) return -ETIMEDOUT;
+            }
+            return status;
+        },
+        .pause =
+            [](void* opaque) {
+                auto& fixture = *static_cast<Fixture*>(opaque);
+                int const FD = std::exchange(fixture.unlock_fd, -1);
+                if (FD < 0) return;
+                vfs::VfsFlockAbi unlock{.l_type = 2};
+                fixture.unlock_result = vfs::vfs_fcntl_for_task(fixture.task, FD, 6, 0, &unlock);
+            },
+        .stack_pid = subject.pid};
+    for (size_t index = 0; index < fixture.files.size(); ++index) {
+        auto* native_file = index == 0 ? native.get() : probe.get();
+        RemoteFdReservation reservation(CONSUMER_IDENTITY);
+        int32_t const FD = reservation.result();
+        uint64_t const TOKEN = 59 + index;
+        if (FD < 0 || !reservation.publish(native_file, 0, 0, 0, TOKEN, bound.binding_id)) return fail(__LINE__);
+        vfs::vfs_retain_file(native_file);
+        PinPreparation preparation(&proxy, PinPurpose::ORDINARY_OPEN);
+        if (preparation.status() != 0) return fail(__LINE__);
+        uint16_t const SLOT = reserve_ordinary_cancellation(&proxy);
+        if (SLOT == VFS_EXEC_CANCEL_SLOT_NONE) return fail(__LINE__);
+        preparation.own_ordinary_cancellation(SLOT);
+        g_open_cancellations.at(SLOT).request.token = TOKEN;
+        auto* context = preparation.context();
+        context->proxy = &proxy;
+        context->remote_fd = FD;
+        auto* file = preparation.file();
+        file->fops = &g_remote_vfs_fops;
+        file->fs_type = vfs::FSType::REMOTE;
+        file->refcount = 1;
+        file->open_flags = vfs::O_NO_CACHE | 2;
+        file->fd = -1;
+        if (preparation.prepare_owner_identity() != 0 || context->advisory_object == 0) return fail(__LINE__);
+        fixture.files.at(index) = preparation.publish();
+        vfs::vfs_retain_file(file);
+        fixture.fds.at(index) = vfs::vfs_alloc_fd(task, file);
+        if (fixture.fds.at(index) < 0) {
+            vfs::vfs_put_file(file);
+            return fail(__LINE__);
+        }
+    }
+    auto* context = static_cast<RemoteFileContext*>(fixture.files.front()->private_data);
+    if (context->advisory_object != static_cast<RemoteFileContext*>(fixture.files.back()->private_data)->advisory_object)
+        return fail(__LINE__);
+    vfs::RemoteAdvisoryOwner const OBSERVER{.generation = 9999, .boot_epoch = 43, .pid = 888, .peer = CONSUMER_IDENTITY.peer_node_id};
+    auto lock_visible = [&](int16_t type, int32_t pid = 0) {
+        vfs::VfsFlockAbi query{.l_type = 1};
+        return vfs::vfs_advisory_remote_try(probe.get(), OBSERVER, vfs::RemoteAdvisoryKind::PROCESS, true, query) == 0 &&
+               query.l_type == type && (pid == 0 || query.l_pid == pid);
+    };
+    vfs::VfsFlockAbi lock{.l_type = 1};
+    vfs::VfsFlockAbi unlock{.l_type = 2};
+    // Lost START observes the owner's committed grant through SAME CANCEL;
+    // lost ACK retains only client receipt storage, never releases that grant.
+    fixture.drop_start = fixture.drop_lock_ack = true;
+    if (vfs::vfs_fcntl_for_task(task, fixture.fds.front(), 6, 0, &lock) != 0 || !lock_visible(1) || g_client_record_count.load() != 2)
+        return fail(__LINE__);
+    fixture.drop_lock_ack = false;
+    fixture.drain();
+    if (g_client_record_count.load() != 1 || !lock_visible(1)) return fail(__LINE__);
+    // Closing an independently opened descriptor releases the canonical
+    // process/inode scope even though that descriptor never acquired a lock.
+    fixture.drop_scope_ack = true;
+    if (vfs::vfs_close_for_task(task, fixture.fds.back()) != 0 || !lock_visible(2)) return fail(__LINE__);
+    fixture.fds.back() = -1;
+    if (vfs::vfs_fcntl_for_task(task, fixture.fds.front(), 6, 0, &lock) != 0 || !lock_visible(1)) return fail(__LINE__);
+    fixture.drop_scope_ack = false;
+    fixture.drain();
+    if (g_client_record_count.load() != 1 || !lock_visible(1)) return fail(__LINE__);
+    // A child uses the fork-shared description, while the actual callback
+    // unlocks the parent between polls through the public VFS dispatcher.
+    ker::mod::sched::task::Task child{};
+    child.pid = 8070;
+    fixture.unlock_fd = fixture.fds.front();
+    vfs::vfs_retain_file(fixture.files.front());
+    if (wki_remote_vfs_advisory_reference(fixture.files.front(), child, vfs::RemoteAdvisoryKind::PROCESS, false, true, lock) != 0 ||
+        fixture.unlock_result != 0 || !lock_visible(1, 8070))
+        return fail(__LINE__);
+    vfs::vfs_retain_file(fixture.files.front());
+    if (wki_remote_vfs_close_reference(fixture.files.front(), child) != 0 || !lock_visible(2)) return fail(__LINE__);
+    // Registration loss leaves a tracked witness, recovers SAME registration,
+    // then closes/ACKs before allowing a successor process/inode scope.
+    if (vfs::vfs_close_for_task(task, fixture.fds.front()) != 0) return fail(__LINE__);
+    fixture.fds.front() = -1;
+    vfs::vfs_retain_file(fixture.files.front());
+    fixture.fds.front() = vfs::vfs_alloc_fd(task, fixture.files.front());
+    fixture.drop_register = true;
+    if (vfs::vfs_fcntl_for_task(task, fixture.fds.front(), 6, 0, &lock) != -ETIMEDOUT || !lock_visible(2)) return fail(__LINE__);
+    fixture.drain();
+    if (g_client_record_count.load() != 0) return fail(__LINE__);
+    // Every acquisition reserves64 cleanup records before START. Query and
+    // unlock still reach the owner when all client ACK receipts are occupied.
+    fixture.drop_lock_ack = true;
+    for (size_t index = 0; index < g_client_operations.size(); ++index)
+        if (vfs::vfs_fcntl_for_task(task, fixture.fds.front(), 37, 0, &lock) != 0) return fail(__LINE__);
+    unsigned const STARTS = fixture.starts;
+    if (vfs::vfs_fcntl_for_task(task, fixture.fds.front(), 37, 0, &lock) != -ENOLCK || fixture.starts != STARTS || !lock_visible(1, -1))
+        return fail(__LINE__);
+    vfs::VfsFlockAbi query{.l_type = 1};
+    if (vfs::vfs_fcntl_for_task(task, fixture.fds.front(), 36, 0, &query) != 0 || query.l_type != 2 ||
+        vfs::vfs_fcntl_for_task(task, fixture.fds.front(), 37, 0, &unlock) != 0 || !lock_visible(2))
+        return fail(__LINE__);
+    fixture.drop_lock_ack = false;
+    fixture.drain();
+    if (g_client_record_count.load() != 0) return fail(__LINE__);
+    // flock is independent of POSIX scope close and uses description lifetime.
+    if (vfs::vfs_fcntl_for_task(task, fixture.fds.front(), 0x5753464c, 2 | 4) != 0) return fail(__LINE__);
+    vfs::VfsFlockAbi whole{.l_type = 1};
+    if (vfs::vfs_advisory_remote_try(probe.get(), OBSERVER, vfs::RemoteAdvisoryKind::FLOCK, false, whole) != -EAGAIN ||
+        vfs::vfs_fcntl_for_task(task, fixture.fds.front(), 0x5753464c, 8) != 0)
+        return fail(__LINE__);
+    // Real dup2 replacement and combined fstat-close consume removed references.
+    if (vfs::vfs_fcntl_for_task(task, fixture.fds.front(), 6, 0, &lock) != 0) return fail(__LINE__);
+    vfs::vfs_retain_file(fixture.files.back());
+    fixture.fds.back() = vfs::vfs_alloc_fd(task, fixture.files.back());
+    if (vfs::vfs_dup2_for_task(task, fixture.fds.front(), fixture.fds.back(), 0) != fixture.fds.back() || !lock_visible(2))
+        return fail(__LINE__);
+    if (vfs::vfs_fcntl_for_task(task, fixture.fds.front(), 6, 0, &lock) != 0) return fail(__LINE__);
+    vfs::Stat stat{};
+    int stat_result = 0;
+    if (vfs::vfs_fstat_close_for_task(task, fixture.fds.back(), &stat, &stat_result) != 0 || stat_result != -ENOTSUP || !lock_visible(2))
+        return fail(__LINE__);
+    fixture.fds.back() = -1;
+    // Actual fatal cleanup releases the claimed short gate and tracked IO
+    // mutex, queues the admitted receipt and drops ONLY its adopted reference.
+    constexpr uint64_t DEAD_PID = 0xD26A01;
+    vfs::vfs_retain_file(fixture.files.front());
+    {
+        ClientTaskOwner abandoned(fixture.files.front(), DEAD_PID);
+        VfsOwnerLockRequest request{.owner = client_owner_authority(*context, 0),
+                                    .process_generation = vfs::vfs_advisory_process_generation(*task),
+                                    .pid = static_cast<int32_t>(ker::mod::sched::task::process_pid(*task)),
+                                    .type = 1,
+                                    .kind = 2};
+        if (reserve_client_operation(abandoned, OWNER_IDENTITY, request) != 0 || client_operation_step(abandoned, 100000) != 0 ||
+            abandoned.acquire_io(*context) != 0)
+            return fail(__LINE__);
+        s_vfs_lock.lock();
+        bool const CLAIMED = abandoned.try_gate_locked(*context);
+        s_vfs_lock.unlock();
+        if (!CLAIMED) return fail(__LINE__);
+        wki_remote_vfs_cleanup_for_task(DEAD_PID + 1);
+        if (abandoned.file == nullptr || context->advisory_gate.holder() == 0 || !context->io_lock.is_locked()) return fail(__LINE__);
+        wki_remote_vfs_cleanup_for_task(DEAD_PID);
+        wki_remote_vfs_cleanup_for_task(DEAD_PID);
+        if (abandoned.file != nullptr || context->advisory_gate.holder() != 0 || context->io_lock.is_locked()) return fail(__LINE__);
+        fixture.drain();
+        if (g_client_record_count.load() != 0 || !lock_visible(1, -1)) return fail(__LINE__);
+    }
+    if (vfs::vfs_fcntl_for_task(task, fixture.fds.front(), 37, 0, &unlock) != 0 || !lock_visible(2)) return fail(__LINE__);
+    // A retirement flag on a different channel generation grants no authority.
+    proxy.binding_retirement_confirmed = true;
+    ++proxy.assigned_channel_generation;
+    if (client_advisory_retirement_proven(*context, OWNER_IDENTITY)) return fail(__LINE__);
+    --proxy.assigned_channel_generation;
+    proxy.binding_retirement_confirmed = false;
+    uint64_t const FEATURES = context->owner_features;
+    context->owner_features = WKI_VFS_FEATURE_OPEN_LIFETIME;
+    if (vfs::vfs_fcntl_for_task(task, fixture.fds.front(), 6, 0, &lock) != -EOPNOTSUPP || !lock_visible(2)) return fail(__LINE__);
+    context->owner_features = FEATURES;
+    return g_client_task_owners == nullptr && g_client_record_count.load() == 0;
 }
 
 auto wki_remote_vfs_selftest_owner_scope_controller() -> bool {
@@ -16398,10 +17471,10 @@ auto wki_remote_vfs_write_append(ker::vfs::File* file, const void* bytes, size_t
     return response.bytes;
 }
 
-auto wki_remote_vfs_fstat(ker::vfs::File* file, ker::vfs::Stat* statbuf) -> int {
+namespace {
+auto remote_vfs_fstat_locked(ker::vfs::File* file, ker::vfs::Stat* statbuf) -> int {
     if (file == nullptr || file->private_data == nullptr || statbuf == nullptr) return -EINVAL;
     auto* ctx = static_cast<RemoteFileContext*>(file->private_data);
-    ker::mod::sys::MutexGuard io_guard(ctx->io_lock);
     if (ctx->proxy == nullptr || !ctx->proxy->active) return -EIO;
     if (!wki_peer_capability_negotiated(ctx->proxy->owner_node, WKI_CAP_VFS_FD_METADATA)) return -ENOTSUP;
     consume_remote_file_cache_invalidation(ctx);
@@ -16435,6 +17508,14 @@ auto wki_remote_vfs_fstat(ker::vfs::File* file, ker::vfs::Stat* statbuf) -> int 
     candidate.st_dev = file->mount_dev_id;
     *statbuf = candidate;
     return 0;
+}
+}  // namespace
+
+auto wki_remote_vfs_fstat(ker::vfs::File* file, ker::vfs::Stat* statbuf) -> int {
+    if (file == nullptr || file->private_data == nullptr || statbuf == nullptr) return -EINVAL;
+    auto* context = static_cast<RemoteFileContext*>(file->private_data);
+    ker::mod::sys::MutexGuard io_guard(context->io_lock);
+    return remote_vfs_fstat_locked(file, statbuf);
 }
 
 auto wki_remote_vfs_mkdir(void* mount_private_data, const char* fs_relative_path, int mode, const ker::mod::security::Snapshot& credentials,

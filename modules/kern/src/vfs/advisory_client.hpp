@@ -125,6 +125,7 @@ class Scope {
     auto token() const -> uint64_t { return token_; }
     auto phase() const -> ScopePhase { return phase_; }
     auto close_requested() const -> bool { return close_requested_; }
+    auto acknowledgement_complete() const -> bool { return acknowledged_; }
 
    private:
     auto matches(uint64_t serial) const -> bool { return serial != 0 && serial == serial_ && phase_ != ScopePhase::EMPTY; }

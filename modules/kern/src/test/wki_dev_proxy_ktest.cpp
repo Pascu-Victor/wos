@@ -155,6 +155,10 @@ KTEST(WkiRemoteVfsCoherency, OwnerAdvisoryAdapterDerivesScopeAndPreservesSharedO
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_owner_advisory());
 }
 
+KTEST(WkiRemoteVfsCoherency, ClientDispatchScopesOutboxesAndFatalOwnershipUseExactReferences) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_client_advisory());
+}
+
 KTEST(WkiRemoteVfsCoherency, OwnerScopeControllerUsesTokenAuthorityAndNeverClosesSuccessor) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_owner_scope_controller());
 }

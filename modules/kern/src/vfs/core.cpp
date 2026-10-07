@@ -8829,11 +8829,12 @@ auto vfs_set_fd_cloexec_for_task(ker::mod::sched::task::Task* task, int fd, bool
 }
 
 auto vfs_close_taken_file(ker::mod::sched::task::Task* caller, ker::mod::sched::task::Task* table_task, File* file, size_t fd_count,
-                          uint64_t callsite) -> int {
-    advisory_release_process_locks_for_file(ker::mod::sched::task::process_pid(*caller), file);
-
+                          uint64_t callsite, Stat* stat = nullptr, int* stat_result = nullptr) -> int {
     ker::mod::perf::record_container_stat(0, table_task->pid, ker::mod::perf::PerfSubsystem::FD_TABLE, 0,
                                           ker::mod::perf::PERF_FLAG_CT_REMOVE, static_cast<int64_t>(fd_count), 0, callsite);
+
+    if (file->fs_type == FSType::REMOTE) return ker::net::wki::wki_remote_vfs_close_reference(file, *caller, stat, stat_result);
+    advisory_release_process_locks_for_file(ker::mod::sched::task::process_pid(*caller), file);
 
     // Atomically decrement; only the CPU that drives refcount to 0 does teardown.
     if (file->refcount.fetch_sub(1, std::memory_order_acq_rel) > 1) {
@@ -8844,9 +8845,9 @@ auto vfs_close_taken_file(ker::mod::sched::task::Task* caller, ker::mod::sched::
 }
 }  // namespace
 
-auto vfs_close(int fd) -> int {
-    // Release FD from current task
-    ker::mod::sched::task::Task* t = ker::mod::sched::get_current_task();
+auto vfs_close(int fd) -> int { return vfs_close_for_task(ker::mod::sched::get_current_task(), fd); }
+
+auto vfs_close_for_task(ker::mod::sched::task::Task* t, int fd) -> int {
     if (t == nullptr) {
         return -ESRCH;
     }
@@ -15612,6 +15613,11 @@ auto vfs_fstat_close_for_task(ker::mod::sched::task::Task* task, int fd, Stat* s
         *stat_result = -EBADF;
         return -EBADF;
     }
+    if (file->fs_type == FSType::REMOTE) {
+        *stat_result = result;
+        return vfs_close_taken_file(task, table_task, file, FD_COUNT, reinterpret_cast<uint64_t>(__builtin_return_address(0)),
+                                    result == -EAGAIN ? statbuf : nullptr, stat_result);
+    }
     if (result == -EAGAIN) {
         result = vfs_fstat_file(file, statbuf);
     }
@@ -16728,7 +16734,10 @@ auto vfs_dup(int oldfd) -> int {
 }
 
 auto vfs_dup2(int oldfd, int newfd, int flags) -> int {
-    auto* task = ker::mod::sched::get_current_task();
+    return vfs_dup2_for_task(ker::mod::sched::get_current_task(), oldfd, newfd, flags);
+}
+
+auto vfs_dup2_for_task(ker::mod::sched::task::Task* task, int oldfd, int newfd, int flags) -> int {
     if (task == nullptr) {
         return -ESRCH;
     }
@@ -16779,8 +16788,12 @@ auto vfs_dup2(int oldfd, int newfd, int flags) -> int {
     }
 
     if (REPLACE.existing != nullptr) {
-        advisory_release_process_locks_for_file(ker::mod::sched::task::process_pid(*task), REPLACE.existing);
-        vfs_put_file(REPLACE.existing);
+        if (REPLACE.existing->fs_type == FSType::REMOTE) {
+            static_cast<void>(ker::net::wki::wki_remote_vfs_close_reference(REPLACE.existing, *task));
+        } else {
+            advisory_release_process_locks_for_file(ker::mod::sched::task::process_pid(*task), REPLACE.existing);
+            vfs_put_file(REPLACE.existing);
+        }
     }
     return newfd;
 }
@@ -20252,13 +20265,42 @@ auto vfs_advisory_remote_request(File* file, uint64_t operation, RemoteAdvisoryP
 }
 
 auto vfs_fcntl(int fd, int cmd, uint64_t arg, VfsFlockAbi* flock) -> int {
-    auto* task = ker::mod::sched::get_current_task();
+    return vfs_fcntl_for_task(ker::mod::sched::get_current_task(), fd, cmd, arg, flock);
+}
+
+auto vfs_fcntl_for_task(ker::mod::sched::task::Task* task, int fd, int cmd, uint64_t arg, VfsFlockAbi* flock) -> int {
     if (task == nullptr) {
         return -ESRCH;
     }
     auto* f = vfs_get_file_retain(task, fd);
     if (f == nullptr) {
         return -EBADF;
+    }
+
+    if (f->fs_type == FSType::REMOTE && (cmd == F_GETLK_CMD || cmd == F_SETLK_CMD || cmd == F_SETLKW_CMD || cmd == F_OFD_GETLK_CMD ||
+                                         cmd == F_OFD_SETLK_CMD || cmd == F_OFD_SETLKW_CMD || cmd == WOS_FLOCK_CMD)) {
+        if (cmd == WOS_FLOCK_CMD) {
+            int const OPTIONS = static_cast<int>(arg);
+            int const MODES = ((OPTIONS & LOCK_SH_VALUE) != 0 ? 1 : 0) + ((OPTIONS & LOCK_EX_VALUE) != 0 ? 1 : 0) +
+                              ((OPTIONS & LOCK_UN_VALUE) != 0 ? 1 : 0);
+            if ((OPTIONS & ~(LOCK_SH_VALUE | LOCK_EX_VALUE | LOCK_NB_VALUE | LOCK_UN_VALUE)) != 0 || MODES != 1) {
+                vfs_put_file(f);
+                return -EINVAL;
+            }
+            VfsFlockAbi request{.l_type = (OPTIONS & LOCK_UN_VALUE) != 0   ? F_UNLCK_TYPE
+                                          : (OPTIONS & LOCK_EX_VALUE) != 0 ? F_WRLCK_TYPE
+                                                                           : F_RDLCK_TYPE};
+            return ker::net::wki::wki_remote_vfs_advisory_reference(f, *task, RemoteAdvisoryKind::FLOCK, false,
+                                                                    (OPTIONS & LOCK_NB_VALUE) == 0, request);
+        }
+        if (flock == nullptr) {
+            vfs_put_file(f);
+            return -EFAULT;
+        }
+        auto const KIND = cmd == F_OFD_GETLK_CMD || cmd == F_OFD_SETLK_CMD || cmd == F_OFD_SETLKW_CMD ? RemoteAdvisoryKind::OPEN_FILE
+                                                                                                      : RemoteAdvisoryKind::PROCESS;
+        return ker::net::wki::wki_remote_vfs_advisory_reference(f, *task, KIND, cmd == F_GETLK_CMD || cmd == F_OFD_GETLK_CMD,
+                                                                cmd == F_SETLKW_CMD || cmd == F_OFD_SETLKW_CMD, *flock);
     }
 
     // F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4 (Linux values)

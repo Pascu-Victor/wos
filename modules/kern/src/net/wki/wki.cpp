@@ -283,6 +283,7 @@ void process_deferred_auto_attach_work() {
     // peers auto-mounting each other cannot deadlock both service paths.
     wki_remote_vfs_process_pending_exec_cancellations();
     wki_remote_vfs_process_pending_open_cancellations();
+    wki_remote_vfs_process_pending_advisory();
     wki_remote_vfs_process_pending_unmounts();
     wki_remotable_process_pending_mounts();
     wki_remotable_process_pending_net_attaches();

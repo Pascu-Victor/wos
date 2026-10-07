@@ -276,9 +276,9 @@ native lock semantics leave the object identity unavailable. The actual remote
 File lifetime fixture passed in a further 73,361-assertion KTEST run and verified
 that a changed proxy feature observation cannot substitute lock support or
 trigger IDENTIFY on the captured non-lock binding. Normal and isolated fast
-KTEST builds and formatting passed. Negotiated IDENTIFY, live client dispatch,
-scope/operation outboxes and packet qualification remain required. The public
-remote advisory path still returns `EOPNOTSUPP`; no new capability is advertised.
+KTEST builds and formatting passed. Negotiated IDENTIFY and client dispatch now
+have the qualification described below. Packet qualification remains required;
+no new capability is advertised.
 
 Retained TMPFS directory versions now cover their synthetic `..` entry when
 rmdir or rename replacement detaches the directory. The directory and metadata
@@ -290,7 +290,31 @@ directory and timestamp fixtures passed in a 73,497-assertion isolated KTEST run
 including TMPFS metadata-only timestamp publication and real mounted-XFS
 timestamp commit, OMIT and denial behavior. Normal and isolated fast KTEST builds,
 formatting and source-policy checks passed. This is a mutation-audit checkpoint;
-full client integration and multi-client packet qualification remain required.
+multi-client packet qualification remains required.
+
+The client now routes POSIX/OFD/flock calls through the native owner controllers
+when the exact ordinary binding offers owner locks. Fixed scope and acquisition
+registries retain uncertain registration, cancellation, close and ACK work for
+bounded task-context retry. Short per-open and per-scope RPC gates allow an
+independent unlock to proceed while another process waits on a shared open.
+Any-descriptor close, dup2 displacement and combined fstat-close use the same
+consuming-reference dispatch. Fatal task cleanup releases precisely its adopted
+references and gates; confirmed grants survive receipt ACK and another task's
+cleanup. Scope retirement requires a changed owner boot or confirmation for the
+complete captured binding, including channel generation.
+
+Normal Build WOS, isolated fast KTEST builds, formatting, source-policy checks
+and 17 host lifecycle/native regression cases passed. The subsequent isolated
+KTEST run passed 73,498 assertions with zero failures and normal selftest
+poweroff. Its new client fixture used the actual shared VFS dispatcher and
+client/native owner controllers with explicit subject tasks and a private
+endpoint. It exercised lost replies after native effects, retained ACK capacity,
+shared-open unlock progress, any-descriptor close, dup2/fstat-close and exact
+abandoned ownership cleanup. All four owned private images were pruned after
+process, QMP, FD and backing-reference audits. This fixture does not qualify
+actual syscall parking, live packet loss or fatal process termination. Those
+cases and the multi-client recovery matrix remain required before normal
+capability advertisement.
 
 ## Userspace campaign
 
