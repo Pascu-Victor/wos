@@ -462,3 +462,45 @@ cold-booted three nodes without retirement `EBUSY` errors but failed an ordinary
 `OPEN_AS` timeout while creating the append-completion marker; all twelve disks
 were pruned. Extended Ethernet liveness remains unresolved and is not attributed
 to mount retirement without further evidence.
+
+## Legacy directory fallback and packet qualification
+
+When owner versions are unsupported, directory iteration fetches one fresh
+entry per ordinary RPC. Representable sparse TMPFS cookies advance the u32
+legacy request; XFS cookies above that range keep its ordinal request mode.
+Filtered directories rescan from zero and maintain separate visible indices.
+Exact count, length, record alignment and name termination are checked before
+publishing an entry. Native callback errors remain visible, initialized short
+prefixes remain retryable, and exhaustion reports `EOVERFLOW`. No wire layout
+or feature mask changes. An old peer's historical EOF/error ambiguity does not
+authorize a version cache.
+
+Normal Build WOS, isolated fast diagnostic compilation, formatting and five
+ASan/UBSan host suites passed. Isolated runtime26 passed 73,505 assertions with
+zero failures, normal poweroff and all ten required regression fixtures,
+including sparse native TMPFS and the actual mounted XFS iterator. All source
+and ELF pins matched, and all four disposable images were pruned. The earlier
+versions-disabled IVmix1 run exposed the XFS legacy-cookie overflow after its
+TMPFS campaign passed; its eight disks and shared backing were pruned. Corrected
+IVmix4 passed the full TMPFS/XFS public campaign across all three processes with
+owner versions disabled, all twelve pending-wait gates and complete zero
+terminal reference drains. Both nodes shut down normally; all eight disks and
+shared backing were pruned. Two ordinary opens timed out during initial marker
+polling before succeeding on fresh probes, so this run qualifies the directory
+fallback and exercised cleanup, while ordinary-open liveness remains unresolved.
+
+Five source-stable ivshmem packet cases passed the full TMPFS/XFS campaign on
+three processes: append response drop, duplicate and reorder; lock response
+duplicate and reorder. Each filesystem has an exact single applied frame rule
+and matching action counter. Reorder additionally has complete held, released
+and empty-queue receipts. All pending-wait gates and complete terminal reference
+drains passed, followed by normal shutdown. Every topology's eight disks and
+shared backing were pruned between cases. The lock-drop case failed an ordinary
+OPEN_AS timeout before its rule applied and does not qualify lock response loss.
+These lock rules do not establish loss after a committed grant. Fence and
+session replacement remain separate qualification requirements.
+
+An Ethernet run with existing `mutex.stall` and `wki.wait_diag` flags passed the
+full campaign, but an uninstrumented control failed an ordinary OPEN_AS timeout.
+Timing from the diagnostic run does not establish an Ethernet liveness fix.
+New capabilities remain opt-in while these remaining checks are investigated.

@@ -7383,6 +7383,76 @@ auto remote_owner_readdir(RemoteFileContext& context, const WkiChannelIdentity& 
     }
 }
 
+// The legacy wire carries u32 requests, not arbitrary native cookies. One
+// fresh entry per RPC avoids old ordinal batches repeating sparse native rows.
+// Neither an old successful EOF nor a previous response grants cache authority.
+template <typename Fetch, typename Hidden>
+auto read_fresh_legacy_directory_entry(size_t index, bool filtered, ker::vfs::DirEntry& output, Fetch&& fetch, Hidden&& hidden) -> int {
+    if (index > UINT32_MAX) return -EOVERFLOW;
+    std::array<uint8_t, sizeof(uint32_t) + sizeof(ker::vfs::DirEntry)> bytes{};
+    uint32_t request_index = filtered ? 0 : static_cast<uint32_t>(index);
+    size_t visible_index = 0;
+    while (true) {
+        uint16_t length = 0;
+        int const STATUS = fetch(request_index, std::span<uint8_t>(bytes), length);
+        if (STATUS != 0) return STATUS;
+        uint32_t count = 0;
+        if (length < sizeof(count)) return -EPROTO;
+        std::memcpy(&count, bytes.data(), sizeof(count));
+        if (count > 1 || length != sizeof(count) + static_cast<size_t>(count) * sizeof(ker::vfs::DirEntry)) return -EPROTO;
+        if (count == 0) return -ENOENT;
+        ker::vfs::DirEntry candidate{};
+        std::memcpy(&candidate, bytes.data() + sizeof(count), sizeof(candidate));
+        if (!ker::vfs::owner_observation::directory_record_valid(candidate)) return -EPROTO;
+        uint32_t next = 0;
+        int const CONTINUATION = ker::vfs::owner_observation::legacy_directory_next_index(request_index, candidate.d_off, next);
+        if (CONTINUATION != 0) return CONTINUATION;
+        if (!filtered || !hidden(candidate)) {
+            if (!filtered || visible_index == index) {
+                if (filtered) {
+                    int const VISIBLE_NEXT =
+                        ker::vfs::owner_observation::legacy_directory_next_index(static_cast<uint32_t>(index), 0, next);
+                    if (VISIBLE_NEXT != 0) return VISIBLE_NEXT;
+                }
+                candidate.d_off = next;
+                output = candidate;
+                return 0;
+            }
+            ++visible_index;
+        }
+        request_index = next;
+    }
+}
+
+// The caller already retains the admitted File. Native TMPFS iteration takes
+// its tree mutex; XFS uses its existing metadata guard. No registry lock spans
+// this callback, and only the exact initialized prefix can become a response.
+auto fill_legacy_directory_batch(ker::vfs::File* file, uint32_t start, uint32_t maximum, std::span<uint8_t> output, uint32_t& count)
+    -> int {
+    count = 0;
+    if (file == nullptr || file->fops == nullptr || file->fops->vfs_readdir == nullptr) return -EBADF;
+    if (maximum == 0 || maximum > VFS_READDIR_BATCH_MAX_ENTRIES) maximum = VFS_READDIR_BATCH_MAX_ENTRIES;
+    if (output.size() < static_cast<size_t>(maximum) * sizeof(ker::vfs::DirEntry)) return -EMSGSIZE;
+    uint32_t index = start;
+    while (count < maximum) {
+        ker::vfs::DirEntry candidate{};
+        bool const NATIVE = file->fs_type == ker::vfs::FSType::TMPFS || file->fs_type == ker::vfs::FSType::XFS;
+        int const STATUS =
+            NATIVE ? ker::vfs::vfs_readdir_file_native(file, &candidate, index) : file->fops->vfs_readdir(file, &candidate, index);
+        bool const ENOENT_END = file->fs_type == ker::vfs::FSType::TMPFS || file->fs_type == ker::vfs::FSType::DEVFS;
+        if (ker::vfs::owner_observation::directory_eof(STATUS, ENOENT_END)) break;
+        if (STATUS != 0) return count == 0 ? STATUS : 0;
+        if (!ker::vfs::owner_observation::directory_record_valid(candidate)) return count == 0 ? -EPROTO : 0;
+        uint32_t next = 0;
+        int const CONTINUATION = ker::vfs::owner_observation::legacy_directory_next_index(index, candidate.d_off, next);
+        if (CONTINUATION != 0) return count == 0 ? CONTINUATION : 0;
+        std::memcpy(output.data() + static_cast<size_t>(count) * sizeof(candidate), &candidate, sizeof(candidate));
+        ++count;
+        index = next;
+    }
+    return 0;
+}
+
 auto remote_vfs_readdir_locked(RemoteFileContext* ctx, ker::vfs::DirEntry* entry, size_t index) -> int {
     consume_remote_file_cache_invalidation(ctx);
     if (ctx->proxy == nullptr || !ctx->proxy->active) return -EIO;
@@ -7393,52 +7463,20 @@ auto remote_vfs_readdir_locked(RemoteFileContext* ctx, ker::vfs::DirEntry* entry
     if (FEATURES != 0 && FEATURES != -ENOTSUP && FEATURES != -EOPNOTSUPP) return FEATURES;
     if (FEATURES == 0 && (ctx->owner_features & WKI_VFS_FEATURE_OWNER_VERSIONS) != 0)
         return remote_owner_readdir(*ctx, identity, entry, index);
-    if (index > UINT32_MAX) return -EOVERFLOW;
     auto const* required_identity = AUTHORITY == 0 ? &identity : nullptr;
-    ker::vfs::coherency::Stamp before{};
-    bool const VERSIONED = query_remote_owner_version(*ctx, before) == 0;
-
-    // One fixed fresh batch: no unbounded global deque, timestamp or cached EOF.
-    // Filtering changes visible indices, so filtered directories scan from zero.
-    std::array<uint8_t, VFS_READDIR_BATCH_DATA_CAPACITY> batch_buf{};
-    uint32_t fetch_index = ctx->hide_recursive_wki_entries ? 0 : static_cast<uint32_t>(index);
-    size_t visible_index = ctx->hide_recursive_wki_entries ? 0 : index;
-    while (true) {
-        std::array<uint8_t, 12> request{};
-        std::memcpy(request.data(), &ctx->remote_fd, sizeof(ctx->remote_fd));
-        std::memcpy(request.data() + 4, &fetch_index, sizeof(fetch_index));
-        std::memcpy(request.data() + 8, &VFS_READDIR_BATCH_MAX_ENTRIES, sizeof(uint32_t));
-        uint16_t length = 0;
-        int const STATUS =
-            vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_READDIR_BATCH, request.data(), request.size(), batch_buf.data(), batch_buf.size(),
-                                    &length, VFS_PROXY_OP_TIMEOUT_US, nullptr, nullptr, 0, false, required_identity);
-        if (STATUS != 0) return STATUS;
-        uint32_t count = 0;
-        if (length < sizeof(count)) return -EPROTO;
-        std::memcpy(&count, batch_buf.data(), sizeof(count));
-        if (!vfs_readdir_batch_payload_is_valid(length, count) || length != sizeof(count) + count * sizeof(ker::vfs::DirEntry))
-            return -EPROTO;
-        if (VERSIONED) {
-            ker::vfs::coherency::Stamp after{};
-            int const VALIDATION = query_remote_owner_version(*ctx, after);
-            if (VALIDATION != 0) return VALIDATION;
-            if (!ker::vfs::coherency::cache_matches(before, after, ker::vfs::coherency::Domain::DIRECTORY)) return -EAGAIN;
-        }
-        for (uint32_t i = 0; i < count; ++i) {
-            ker::vfs::DirEntry candidate{};
-            std::memcpy(&candidate, batch_buf.data() + sizeof(count) + i * sizeof(candidate), sizeof(candidate));
-            if (std::memchr(candidate.d_name.data(), '\0', candidate.d_name.size()) == nullptr) return -EPROTO;
-            if (should_hide_recursive_wki_entry(ctx, candidate)) continue;
-            if (visible_index == index) {
-                *entry = candidate;
-                return 0;
-            }
-            ++visible_index;
-        }
-        if (count < VFS_READDIR_BATCH_MAX_ENTRIES) return -ENOENT;
-        if (fetch_index > UINT32_MAX - count) return -EOVERFLOW;
-        fetch_index += count;
-    }
+    return read_fresh_legacy_directory_entry(
+        index, ctx->hide_recursive_wki_entries, *entry,
+        [&](uint32_t request_index, std::span<uint8_t> output, uint16_t& length) {
+            constexpr uint32_t MAXIMUM = 1;
+            std::array<uint8_t, 12> request{};
+            std::memcpy(request.data(), &ctx->remote_fd, sizeof(ctx->remote_fd));
+            std::memcpy(request.data() + 4, &request_index, sizeof(request_index));
+            std::memcpy(request.data() + 8, &MAXIMUM, sizeof(MAXIMUM));
+            return vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_READDIR_BATCH, request.data(), request.size(), output.data(),
+                                           static_cast<uint16_t>(output.size()), &length, VFS_PROXY_OP_TIMEOUT_US, nullptr, nullptr, 0,
+                                           false, required_identity);
+        },
+        [&](const ker::vfs::DirEntry& candidate) { return should_hide_recursive_wki_entry(ctx, candidate); });
 }
 
 auto remote_vfs_readdir(ker::vfs::File* f, ker::vfs::DirEntry* entry, size_t index) -> int {
@@ -7834,6 +7872,126 @@ auto wki_remote_vfs_client_advisory_diag_snapshot() -> WkiRemoteVfsClientAdvisor
 }
 
 #ifdef WOS_SELFTEST
+auto wki_remote_vfs_selftest_legacy_directory_file(ker::vfs::File* file) -> bool {
+    namespace vfs = ker::vfs;
+    auto fetch = [&](uint32_t start, std::span<uint8_t> bytes, uint16_t& length) {
+        uint32_t count = 0;
+        int const STATUS = fill_legacy_directory_batch(file, start, 1, bytes.subspan(sizeof(count)), count);
+        if (STATUS != 0) return STATUS;
+        std::memcpy(bytes.data(), &count, sizeof(count));
+        length = static_cast<uint16_t>(sizeof(count) + count * sizeof(vfs::DirEntry));
+        return 0;
+    };
+    for (bool filtered : {false, true}) {
+        constexpr std::array<const char*, 4> ALL{".", "..", "a", "c"};
+        constexpr std::array<const char*, 3> FILTERED{".", "..", "c"};
+        auto const expected = filtered ? std::span<const char* const>(FILTERED) : std::span<const char* const>(ALL);
+        size_t index = 0;
+        vfs::DirEntry entry{};
+        for (auto* name : expected) {
+            if (read_fresh_legacy_directory_entry(
+                    index, filtered, entry, fetch,
+                    [](const vfs::DirEntry& candidate) { return std::strcmp(candidate.d_name.data(), "a") == 0; }) != 0 ||
+                std::strcmp(entry.d_name.data(), name) != 0 || entry.d_off <= index || entry.d_off > UINT32_MAX)
+                return false;
+            index = entry.d_off;
+        }
+        auto const saved = entry;
+        if (read_fresh_legacy_directory_entry(
+                index, filtered, entry, fetch,
+                [](const vfs::DirEntry& candidate) { return std::strcmp(candidate.d_name.data(), "a") == 0; }) != -ENOENT ||
+            std::memcmp(&entry, &saved, sizeof(entry)) != 0)
+            return false;
+    }
+    // The ordinary server batch follows sparse/native continuation as well;
+    // another legacy client requesting a batch must see each entry only once.
+    std::array<uint8_t, 8 * sizeof(vfs::DirEntry)> body{};
+    uint32_t count = 99;
+    if (fill_legacy_directory_batch(file, 0, 8, body, count) != 0 || count != 4) return false;
+    constexpr std::array<const char*, 4> NAMES{".", "..", "a", "c"};
+    for (size_t i = 0; i < count; ++i) {
+        vfs::DirEntry entry{};
+        std::memcpy(&entry, body.data() + i * sizeof(entry), sizeof(entry));
+        if (std::strcmp(entry.d_name.data(), NAMES.at(i)) != 0) return false;
+    }
+    return true;
+}
+
+auto wki_remote_vfs_selftest_legacy_directory() -> bool {
+    namespace vfs = ker::vfs;
+    constexpr auto BASE = "/tmp/ktest_legacy_dir26";
+    struct Cleanup {
+        vfs::File* directory = nullptr;
+        ~Cleanup() {
+            vfs::vfs_put_file(directory);
+            for (auto* path : {"/tmp/ktest_legacy_dir26/a", "/tmp/ktest_legacy_dir26/b", "/tmp/ktest_legacy_dir26/c"})
+                static_cast<void>(vfs::vfs_unlink(path));
+            static_cast<void>(vfs::vfs_rmdir("/tmp/ktest_legacy_dir26"));
+        }
+    } cleanup;
+    auto fail = [](int line) {
+        ker::mod::dbg::logger<"ktest">::error("legacy directory fixture failed at remote_vfs.cpp:%d", line);
+        return false;
+    };
+    if (vfs::vfs_mkdir(BASE, 0700) != 0) return fail(__LINE__);
+    for (auto* path : {"/tmp/ktest_legacy_dir26/a", "/tmp/ktest_legacy_dir26/b", "/tmp/ktest_legacy_dir26/c"}) {
+        auto* file = vfs::vfs_open_file(path, vfs::O_LOCAL | vfs::O_CREAT | vfs::O_EXCL | 2, 0600);
+        if (file == nullptr) return fail(__LINE__);
+        vfs::vfs_put_file(file);
+    }
+    if (vfs::vfs_unlink("/tmp/ktest_legacy_dir26/b") != 0) return fail(__LINE__);
+    cleanup.directory = vfs::vfs_open_file(BASE, vfs::O_LOCAL | vfs::O_DIRECTORY, 0);
+    if (cleanup.directory == nullptr || !wki_remote_vfs_selftest_legacy_directory_file(cleanup.directory)) return fail(__LINE__);
+    struct Reader {
+        bool prefix = false;
+    } reader;
+    vfs::FileOperations operations{};
+    operations.vfs_readdir = [](vfs::File* file, vfs::DirEntry* output, size_t index) -> int {
+        auto const& state = *static_cast<Reader*>(file->private_data);
+        if (state.prefix && index == 0) {
+            *output = {};
+            output->d_reclen = sizeof(*output);
+            output->d_off = 7;
+            output->d_name.front() = 'a';
+            return 0;
+        }
+        return -EIO;
+    };
+    vfs::File fake{};
+    fake.fs_type = vfs::FSType::SOCKET;
+    fake.fops = &operations;
+    fake.private_data = &reader;
+    std::array<uint8_t, 2 * sizeof(vfs::DirEntry)> bytes{};
+    bytes.fill(0xA5);
+    auto const untouched = bytes;
+    uint32_t count = 97;
+    if (fill_legacy_directory_batch(&fake, 0, 2, bytes, count) != -EIO || count != 0 || bytes != untouched) return fail(__LINE__);
+    reader.prefix = true;
+    if (fill_legacy_directory_batch(&fake, 0, 2, bytes, count) != 0 || count != 1) return fail(__LINE__);
+    if (fill_legacy_directory_batch(&fake, 7, 2, bytes, count) != -EIO || count != 0) return fail(__LINE__);
+    vfs::DirEntry output{};
+    output.d_ino = 99;
+    auto const saved = output;
+    for (unsigned malformed = 0; malformed < 4; ++malformed) {
+        auto fetch = [&](uint32_t, std::span<uint8_t> wire, uint16_t& length) {
+            uint32_t const COUNT = malformed == 0 ? 2 : 1;
+            std::memcpy(wire.data(), &COUNT, sizeof(COUNT));
+            vfs::DirEntry entry{};
+            entry.d_off = 7;
+            entry.d_reclen = sizeof(entry);
+            if (malformed == 1) entry.d_name.fill('x');
+            if (malformed == 2) --entry.d_reclen;
+            std::memcpy(wire.data() + sizeof(COUNT), &entry, sizeof(entry));
+            length = static_cast<uint16_t>(wire.size() - (malformed == 3 ? 1 : 0));
+            return 0;
+        };
+        if (read_fresh_legacy_directory_entry(0, false, output, fetch, [](const auto&) { return false; }) != -EPROTO ||
+            std::memcmp(&output, &saved, sizeof(output)) != 0)
+            return fail(__LINE__);
+    }
+    return true;
+}
+
 namespace {
 auto selftest_xattr_staged_namespace() -> bool;
 }
@@ -14330,27 +14488,19 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             uint64_t const LOCAL_STARTED_US = wki_now_us();
             uint8_t* entries_base = resp_buf.data() + sizeof(DevOpRespPayload) + sizeof(uint32_t);
             uint32_t count = 0;
-            for (uint32_t i = 0; i < max_count; i++) {
-                ker::vfs::DirEntry entry = {};
-                int const RET = local_file->fops->vfs_readdir(local_file, &entry, start_idx + i);
-                if (RET != 0) {
-                    break;
-                }
-                memcpy(entries_base + (i * sizeof(ker::vfs::DirEntry)), &entry, sizeof(ker::vfs::DirEntry));
-                count++;
-            }
+            int const STATUS = fill_legacy_directory_batch(local_file, start_idx, max_count,
+                                                           {entries_base, VFS_READDIR_BATCH_DATA_CAPACITY - sizeof(uint32_t)}, count);
             ker::vfs::vfs_put_file(local_file);
 
             auto* resp = reinterpret_cast<DevOpRespPayload*>(resp_buf.data());
             resp->op_id = OP_VFS_READDIR_BATCH;
-            resp->status = 0;
-            resp->data_len = static_cast<uint16_t>(sizeof(uint32_t) + (count * sizeof(ker::vfs::DirEntry)));
+            resp->status = static_cast<int16_t>(STATUS);
+            resp->data_len = STATUS == 0 ? static_cast<uint16_t>(sizeof(uint32_t) + (count * sizeof(ker::vfs::DirEntry))) : 0;
             memcpy(resp_buf.data() + sizeof(DevOpRespPayload), &count, sizeof(uint32_t));
-            perf_record_vfs_server_end(SERVER_OP, hdr->src_node, channel_id, CORRELATION, 0,
-                                       static_cast<uint32_t>(wki_now_us() - LOCAL_STARTED_US),
-                                       sizeof(uint32_t) + (count * sizeof(ker::vfs::DirEntry)), CALLSITE);
+            perf_record_vfs_server_end(SERVER_OP, hdr->src_node, channel_id, CORRELATION, STATUS,
+                                       static_cast<uint32_t>(wki_now_us() - LOCAL_STARTED_US), resp->data_len, CALLSITE);
 
-            auto send_len = static_cast<uint16_t>(sizeof(DevOpRespPayload) + sizeof(uint32_t) + (count * sizeof(ker::vfs::DirEntry)));
+            auto send_len = static_cast<uint16_t>(sizeof(DevOpRespPayload) + resp->data_len);
             send_buffered_resp(resp_buf.data(), send_len);
             break;
         }

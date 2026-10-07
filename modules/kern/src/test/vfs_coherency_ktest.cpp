@@ -324,6 +324,7 @@ KTEST(VfsCoherency, MountedXfsNativeOwnerObservationsVersionsScopesAndRetirement
     KREQUIRE_NE(probe.get(), nullptr);
     KREQUIRE_EQ(xfs::xfs_unlink_path(ROOT, "/ktest_owner_xfs26/b", fixture.mount), 0);
     hole.reset();
+    KREQUIRE_TRUE(ker::net::wki::wki_remote_vfs_selftest_legacy_directory_file(directory.get()));
     KREQUIRE_EQ(vfs::vfs_file_coherency_snapshot(directory.get(), directory_after), 0);
     KEXPECT_EQ(directory_after.object, directory_before.object);
     KEXPECT_TRUE(directory_after.directory > directory_before.directory);

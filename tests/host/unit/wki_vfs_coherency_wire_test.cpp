@@ -837,3 +837,23 @@ TEST(WkiVfsCoherencyWire, ReadReplyNonceLengthAndInitializedPrefixAreExact) {
     }
     EXPECT_FALSE(wki_vfs_owner_read_reply_size_valid(0, sizeof(response) + 1, sizeof(response)));
 }
+
+TEST(WkiVfsCoherencyWire, LegacyDirectoryContinuationKeepsSparseCookiesAndXfsOrdinalModeWithBoundedOverflow) {
+    namespace observation = ker::vfs::owner_observation;
+    uint32_t next = 97;
+    EXPECT_EQ(observation::legacy_directory_next_index(2, 7, next), 0);
+    EXPECT_EQ(next, 7U);
+    EXPECT_EQ(observation::legacy_directory_next_index(2, uint64_t{1} << 32, next), 0);
+    EXPECT_EQ(next, 3U);
+    EXPECT_EQ(observation::legacy_directory_next_index(3, UINT64_MAX, next), 0);
+    EXPECT_EQ(next, 4U);
+    EXPECT_EQ(observation::legacy_directory_next_index(4, 4, next), 0);
+    EXPECT_EQ(next, 5U);
+    EXPECT_EQ(observation::legacy_directory_next_index(4, 0, next), 0);
+    EXPECT_EQ(next, 5U);
+    EXPECT_EQ(observation::legacy_directory_next_index(UINT32_MAX - 1, UINT32_MAX, next), 0);
+    EXPECT_EQ(next, UINT32_MAX);
+    next = 97;
+    EXPECT_EQ(observation::legacy_directory_next_index(UINT32_MAX, UINT64_MAX, next), -EOVERFLOW);
+    EXPECT_EQ(next, 97U);
+}

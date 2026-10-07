@@ -153,6 +153,10 @@ KTEST(WkiRemoteVfsCoherency, ExactOwnerVersionAuthorityDeniesStaleOpenAndRetains
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_owner_version_admission());
 }
 
+KTEST(WkiRemoteVfsCoherency, LegacyDirectoryFallbackKeepsSparseCookiesFramingErrorsAndFilteredIndices) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_legacy_directory());
+}
+
 KTEST(WkiRemoteVfsCoherency, ExactNativeObservationsIgnorePoisonedCacheAndKeepSparseCookies) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_owner_observations());
 }
