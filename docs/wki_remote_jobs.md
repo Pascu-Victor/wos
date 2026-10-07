@@ -1,10 +1,10 @@
 # Durable remote job design
 
-Goal28 is in progress. The initial value-state layer defines bounded identity,
-admission and lifecycle rules; it does not enable a job protocol, syscall or
+Goal28 is in progress. Private value layers define bounded identity, admission,
+lifecycle and output-credit rules; they do not enable a job protocol, syscall or
 scheduler path. The existing one-shot remote-compute service keeps its current
-semantics. Native integration, streams, public controls and runtime qualification
-remain required.
+semantics. Native integration, stream transport, public controls and runtime
+qualification remain required.
 
 A job belongs to the provisioned authenticated submitter node and the effective
 UID from its authorized mapped credential snapshot. Status, attach, cancel and
@@ -69,10 +69,46 @@ metadata holders. The future adapter must retire its Task/File/channel ownership
 before dropping those holders; value-only tests cannot prove those native
 lifetimes. Active work cannot be discarded to meet a result quota.
 
-Separate stdout/stderr sequencing, application credits, bounded buffering,
-explicit gap/truncation policy, result count/byte/TTL policy, idempotent signal
-receipts and the versioned public CLI remain to be implemented. Existing combined
-4096-byte capture and generation-scoped IPC do not satisfy durable streaming.
+The stream values in `net/wki/job_stream.hpp` use independent fixed stdout/stderr
+rings and nonwrapping absolute byte offsets. Append returns the accepted prefix
+and backpressure when storage fills. The initial policy permits no producer
+truncation. Disconnect may stop a lossless writer until an authorized consumer
+reattaches or cancellation closes it. The native File adapter still needs to
+implement partial writes, nonblocking errors, interruptible parking outside
+locks and wakeup on credits/cancel/completion.
+
+Credits specify a consumed offset, absolute window and monotonic revision under
+one attachment token. Duplicate grants cannot add credits twice; old revisions
+cannot reopen a spent window. Only application-consumed offsets reclaim sender
+storage. On the receiver, reading creates space without implicitly advertising
+more credits. A smaller grant preserves the earlier grant's high-water mark for
+already authorized packets in flight, while the physical ring remains bounded.
+Frames must contain the next offset or an entirely accepted duplicate; gaps,
+overlaps, conflicting retained bytes and capacity violations change nothing.
+
+Preparation copies one packet into private caller-owned storage and claims a
+nonreused frame generation before sending. The caller must already own that
+buffer and a job holder. TX refusal leaves both the copy and reservation owned
+for retry; finishing is allowed only after reliable TX takes responsibility.
+Application ACK can then recycle the ring without changing the private packet.
+Detach retires the old reservation. Reattach uses a new token and replays from
+the consumed offset, fencing old callbacks and credits. A requested offset below
+the retained prefix produces an explicit `GAP`; an offset beyond prepared data
+is rejected. EOF names the final offset and needs no payload credits.
+
+Both stream attachments require preflight under the job lock before either is
+changed. Current authenticated peer/credential and exact request-channel checks
+remain mandatory. These values cannot authenticate an attachment themselves.
+The native completion adapter must close both producers and publish their final
+accepted offsets together with the root task's terminal result. Inherited File
+writers after that boundary must fail explicitly; they cannot report discarded
+bytes as successful writes or keep expired heavy result storage alive. The
+Task/File ownership and wait/wakeup implementation for that boundary is still
+outstanding. Existing combined 4096-byte capture and generation-scoped IPC do
+not satisfy these durable stream semantics.
+
+Result count/byte/TTL policy, idempotent signal receipts, negotiated wire framing,
+actual stream transport and the versioned public CLI remain to be implemented.
 
 The first implementation is `net/wki/job_state.hpp`. Its host test target,
 `wki_job_state_test`, exercises actual production values under ASan/UBSan,
@@ -84,6 +120,15 @@ does not simulate native task construction or authenticate a network frame.
 Normal Build WOS and a separate instantiation using its current freestanding
 compiler flags passed. No new VM run is required for this unconnected value
 layer; native protocol and lifetime qualification remain outstanding.
+
+The stream host target, `wki_job_stream_test`, has 12 cases. Together with the
+12 lifecycle cases it passes under ASan/UBSan. Sixteen deterministic two-stream
+traces compare 323,200 unique delivered bytes against independent input vectors,
+including send refusal/retry, lost/duplicate/reordered credits, rejected stream
+gaps and attachment replay. Additional cases cover full buffers, EOF, stale
+callbacks, early ACK ownership and numeric exhaustion. Freestanding stream
+instantiation, repo format check and Normal Build WOS pass. These are value-model
+checks; actual WKI packets, native blocking and task/FD cleanup are unqualified.
 
 Owned tests may use `bin/wos-cluster --no-setup` and isolated
 `bin/wos-ktest --no-setup`. Keep one active topology, private COW/reflink images,
