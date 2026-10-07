@@ -5,6 +5,7 @@
 #include <net/wki/remote_vfs.hpp>
 #include <platform/security/credential_record.hpp>
 #include <test/ktest.hpp>
+#include <utility>
 #include <vfs/coherency.hpp>
 #include <vfs/file.hpp>
 #include <vfs/fs/tmpfs.hpp>
@@ -110,6 +111,19 @@ struct FileCloser {
 };
 using OwnedFile = std::unique_ptr<ker::vfs::File, FileCloser>;
 
+struct TmpfsDirectoryFixture {
+    static constexpr const char* BASE = "/tmp/ktest_removed_dirs26";
+    static constexpr const char* REMOVED = "/tmp/ktest_removed_dirs26/removed";
+    static constexpr const char* SOURCE = "/tmp/ktest_removed_dirs26/source";
+    static constexpr const char* HOLDER = "/tmp/ktest_removed_dirs26/holder";
+    static constexpr const char* REPLACED = "/tmp/ktest_removed_dirs26/holder/replaced";
+    static constexpr const char* NONEMPTY = "/tmp/ktest_removed_dirs26/nonempty";
+    static constexpr const char* CHILD = "/tmp/ktest_removed_dirs26/nonempty/child";
+    ~TmpfsDirectoryFixture() {
+        for (auto* path : {CHILD, NONEMPTY, REPLACED, SOURCE, REMOVED, HOLDER, BASE}) static_cast<void>(ker::vfs::vfs_rmdir(path));
+    }
+};
+
 struct XfsOwnerFixture {
     ker::vfs::xfs::XfsMountContext* mount = nullptr;
     ~XfsOwnerFixture() {
@@ -125,6 +139,161 @@ struct XfsOwnerFixture {
 };
 
 }  // namespace
+
+KTEST(VfsCoherency, RetainedTmpfsDirectoryVersionsCoverRemovalReplacementAndParentMovement) {
+    namespace vfs = ker::vfs;
+    namespace tmpfs = ker::vfs::tmpfs;
+    TmpfsDirectoryFixture cleanup;
+    auto const ROOT = ker::mod::security::Snapshot::bootstrap_root();
+    auto denied = ROOT;
+    KREQUIRE_EQ(denied.prepare({.change = ker::mod::security::Change::SET_UID, .real = 1000}, denied), 0);
+    for (auto* path : {cleanup.BASE, cleanup.REMOVED, cleanup.SOURCE, cleanup.HOLDER, cleanup.REPLACED, cleanup.NONEMPTY, cleanup.CHILD})
+        KREQUIRE_EQ(vfs::vfs_mkdir(path, 0700), 0);
+    OwnedFile parent(vfs::vfs_open_file(cleanup.BASE, vfs::O_DIRECTORY, 0));
+    OwnedFile removed(vfs::vfs_open_file(cleanup.REMOVED, vfs::O_DIRECTORY, 0));
+    OwnedFile source(vfs::vfs_open_file(cleanup.SOURCE, vfs::O_DIRECTORY, 0));
+    OwnedFile holder(vfs::vfs_open_file(cleanup.HOLDER, vfs::O_DIRECTORY, 0));
+    OwnedFile replaced(vfs::vfs_open_file(cleanup.REPLACED, vfs::O_DIRECTORY, 0));
+    KREQUIRE_NE(parent.get(), nullptr);
+    KREQUIRE_NE(removed.get(), nullptr);
+    KREQUIRE_NE(source.get(), nullptr);
+    KREQUIRE_NE(holder.get(), nullptr);
+    KREQUIRE_NE(replaced.get(), nullptr);
+    auto* parent_node = static_cast<tmpfs::TmpNode*>(parent->private_data);
+    auto* removed_node = static_cast<tmpfs::TmpNode*>(removed->private_data);
+    auto* source_node = static_cast<tmpfs::TmpNode*>(source->private_data);
+    auto* holder_node = static_cast<tmpfs::TmpNode*>(holder->private_data);
+    auto* replaced_node = static_cast<tmpfs::TmpNode*>(replaced->private_data);
+    vfs::DirEntry entry{};
+    KREQUIRE_EQ(tmpfs::tmpfs_readdir_file_native(removed.get(), &entry, 1), 0);
+    KEXPECT_EQ(entry.d_ino, reinterpret_cast<uint64_t>(parent_node));
+    KEXPECT_EQ(entry.d_off, uint64_t{2});
+    coherence::Stamp before{}, after{}, parent_before{}, parent_after{};
+    KREQUIRE_TRUE(removed_node->coherency.snapshot(before));
+    KREQUIRE_TRUE(parent_node->coherency.snapshot(parent_before));
+    coherence::CacheValidation cache;
+    KREQUIRE_TRUE(cache.publish(before, before, coherence::Domain::DIRECTORY));
+    tmpfs::TmpfsLookupHandle removed_lookup, nonempty_lookup;
+    KREQUIRE_EQ(tmpfs::tmpfs_acquire_lookup(ROOT, tmpfs::get_root_node(), cleanup.REMOVED, &removed_lookup), 0);
+    KREQUIRE_EQ(tmpfs::tmpfs_acquire_lookup(ROOT, tmpfs::get_root_node(), cleanup.NONEMPTY, &nonempty_lookup), 0);
+    KEXPECT_EQ(tmpfs::tmpfs_rmdir_lookup(ROOT, removed_lookup, true), -EROFS);
+    KEXPECT_EQ(tmpfs::tmpfs_rmdir_lookup(denied, removed_lookup), -EACCES);
+    KEXPECT_EQ(tmpfs::tmpfs_rmdir_lookup(ROOT, nonempty_lookup), -ENOTEMPTY);
+    KREQUIRE_TRUE(removed_node->coherency.snapshot(after));
+    KEXPECT_TRUE(coherence::cache_matches(before, after, coherence::Domain::ALL));
+    KREQUIRE_TRUE(parent_node->coherency.snapshot(parent_after));
+    KEXPECT_TRUE(coherence::cache_matches(parent_before, parent_after, coherence::Domain::ALL));
+    KREQUIRE_EQ(vfs::vfs_rmdir(cleanup.REMOVED), 0);
+    KREQUIRE_TRUE(removed_node->coherency.snapshot(after));
+    KEXPECT_EQ(after.object, before.object);
+    KEXPECT_EQ(after.content, before.content);
+    KEXPECT_TRUE(after.metadata > before.metadata);
+    KEXPECT_TRUE(after.directory > before.directory);
+    KEXPECT_FALSE(cache.matches(after, coherence::Domain::DIRECTORY));
+    KEXPECT_FALSE(cache.publish(before, after, coherence::Domain::DIRECTORY));
+    KREQUIRE_EQ(tmpfs::tmpfs_readdir_file_native(removed.get(), &entry, 1), 0);
+    KEXPECT_EQ(entry.d_ino, reinterpret_cast<uint64_t>(removed_node));
+    KEXPECT_EQ(entry.d_off, uint64_t{2});
+    KREQUIRE_TRUE(parent_node->coherency.snapshot(parent_after));
+    KEXPECT_TRUE(parent_after.directory > parent_before.directory);
+    before = after;
+    KEXPECT_EQ(tmpfs::tmpfs_rmdir_lookup(ROOT, removed_lookup), -EAGAIN);
+    KREQUIRE_TRUE(removed_node->coherency.snapshot(after));
+    KEXPECT_TRUE(coherence::cache_matches(before, after, coherence::Domain::ALL));
+
+    // Both the moved directory and the displaced retained directory change
+    // their '..' entries, independently of the two parents' membership lists.
+    coherence::Stamp source_before{}, source_after{}, replaced_before{}, replaced_after{}, holder_before{}, holder_after{};
+    KREQUIRE_TRUE(source_node->coherency.snapshot(source_before));
+    KREQUIRE_TRUE(replaced_node->coherency.snapshot(replaced_before));
+    KREQUIRE_TRUE(holder_node->coherency.snapshot(holder_before));
+    KREQUIRE_EQ(tmpfs::tmpfs_readdir_file_native(source.get(), &entry, 1), 0);
+    KEXPECT_EQ(entry.d_ino, reinterpret_cast<uint64_t>(parent_node));
+    KREQUIRE_EQ(tmpfs::tmpfs_readdir_file_native(replaced.get(), &entry, 1), 0);
+    KEXPECT_EQ(entry.d_ino, reinterpret_cast<uint64_t>(holder_node));
+    tmpfs::TmpfsLookupHandle from, to;
+    KREQUIRE_EQ(tmpfs::tmpfs_acquire_lookup(ROOT, tmpfs::get_root_node(), cleanup.SOURCE, &from), 0);
+    KREQUIRE_EQ(tmpfs::tmpfs_acquire_lookup(ROOT, tmpfs::get_root_node(), cleanup.REPLACED, &to), 0);
+    KEXPECT_EQ(tmpfs::tmpfs_rename_lookup(ROOT, from, to, false, false, nullptr, nullptr, nullptr, true), -EROFS);
+    KREQUIRE_TRUE(source_node->coherency.snapshot(source_after));
+    KREQUIRE_TRUE(replaced_node->coherency.snapshot(replaced_after));
+    KEXPECT_TRUE(coherence::cache_matches(source_before, source_after, coherence::Domain::ALL));
+    KEXPECT_TRUE(coherence::cache_matches(replaced_before, replaced_after, coherence::Domain::ALL));
+    KREQUIRE_EQ(vfs::vfs_rename(cleanup.SOURCE, cleanup.REPLACED), 0);
+    KREQUIRE_TRUE(source_node->coherency.snapshot(source_after));
+    KREQUIRE_TRUE(replaced_node->coherency.snapshot(replaced_after));
+    for (auto const& stamps : {std::pair{source_before, source_after}, std::pair{replaced_before, replaced_after}}) {
+        KEXPECT_EQ(stamps.second.object, stamps.first.object);
+        KEXPECT_EQ(stamps.second.content, stamps.first.content);
+        KEXPECT_TRUE(stamps.second.metadata > stamps.first.metadata);
+        KEXPECT_TRUE(stamps.second.directory > stamps.first.directory);
+        KEXPECT_FALSE(coherence::cache_matches(stamps.first, stamps.second, coherence::Domain::DIRECTORY));
+    }
+    KREQUIRE_EQ(tmpfs::tmpfs_readdir_file_native(source.get(), &entry, 1), 0);
+    KEXPECT_EQ(entry.d_ino, reinterpret_cast<uint64_t>(holder_node));
+    KREQUIRE_EQ(tmpfs::tmpfs_readdir_file_native(replaced.get(), &entry, 1), 0);
+    KEXPECT_EQ(entry.d_ino, reinterpret_cast<uint64_t>(replaced_node));
+    KREQUIRE_TRUE(holder_node->coherency.snapshot(holder_after));
+    KEXPECT_TRUE(holder_after.directory > holder_before.directory);
+    tmpfs::TmpfsLookupHandle root;
+    KREQUIRE_EQ(tmpfs::tmpfs_acquire_lookup(ROOT, tmpfs::get_root_node(), "/", &root), 0);
+    KREQUIRE_TRUE(root.target()->coherency.snapshot(before));
+    // Root is nonempty in this boot; semantic validation precedes root denial.
+    KEXPECT_EQ(tmpfs::tmpfs_rmdir_lookup(ROOT, root), -ENOTEMPTY);
+    KREQUIRE_TRUE(root.target()->coherency.snapshot(after));
+    KEXPECT_TRUE(coherence::cache_matches(before, after, coherence::Domain::ALL));
+}
+
+KTEST(VfsCoherency, TmpfsTimestampCommitAndDenialsPreserveExactVersionDomains) {
+    namespace vfs = ker::vfs;
+    namespace tmpfs = ker::vfs::tmpfs;
+    TmpfsVersionFixture cleanup;
+    auto const ROOT = ker::mod::security::Snapshot::bootstrap_root();
+    auto denied = ROOT;
+    KREQUIRE_EQ(denied.prepare({.change = ker::mod::security::Change::SET_UID, .real = 1000}, denied), 0);
+    KREQUIRE_EQ(vfs::vfs_mkdir(cleanup.DIRECTORY, 0700), 0);
+    OwnedFile file(vfs::vfs_open_file(cleanup.ORIGINAL, vfs::O_CREAT | vfs::O_EXCL | 2, 0600));
+    KREQUIRE_NE(file.get(), nullptr);
+    auto* node = static_cast<tmpfs::TmpNode*>(file->private_data);
+    tmpfs::TmpfsLookupHandle lookup;
+    KREQUIRE_EQ(tmpfs::tmpfs_acquire_lookup(ROOT, tmpfs::get_root_node(), cleanup.ORIGINAL, &lookup), 0);
+    std::array<vfs::Timespec, 2> requested{{{101, 123}, {202, 456}}};
+    vfs::TimestampUpdate explicit_times, omit;
+    KREQUIRE_EQ(vfs::TimestampUpdate::prepare(requested.data(), {303, 789}, explicit_times), 0);
+    requested = {{{0, vfs::TimestampUpdate::OMIT}, {0, vfs::TimestampUpdate::OMIT}}};
+    KREQUIRE_EQ(vfs::TimestampUpdate::prepare(requested.data(), {404, 999}, omit), 0);
+    coherence::Stamp before{}, after{};
+    KREQUIRE_TRUE(node->coherency.snapshot(before));
+    tmpfs::TmpfsObjectMetadata output{};
+    output.uid = 12345;
+    KEXPECT_EQ(tmpfs::tmpfs_utimens_lookup(lookup, denied, explicit_times, &output), -EPERM);
+    KEXPECT_EQ(output.uid, uint32_t{12345});
+    KEXPECT_EQ(tmpfs::tmpfs_utimens_lookup(lookup, ROOT, explicit_times, &output, true), -EROFS);
+    KEXPECT_EQ(output.uid, uint32_t{12345});
+    KEXPECT_EQ(tmpfs::tmpfs_utimens_lookup(lookup, denied, omit, &output, true), 0);
+    KREQUIRE_TRUE(node->coherency.snapshot(after));
+    KEXPECT_TRUE(coherence::cache_matches(before, after, coherence::Domain::ALL));
+    KREQUIRE_EQ(tmpfs::tmpfs_utimens_lookup(lookup, ROOT, explicit_times, &output), 0);
+    KREQUIRE_TRUE(node->coherency.snapshot(after));
+    KEXPECT_EQ(after.object, before.object);
+    KEXPECT_EQ(after.content, before.content);
+    KEXPECT_EQ(after.directory, before.directory);
+    KEXPECT_TRUE(after.metadata > before.metadata);
+    vfs::Stat stat{};
+    KREQUIRE_EQ(vfs::vfs_fstat_file_native(file.get(), &stat), 0);
+    KEXPECT_EQ(stat.st_atim.tv_sec, int64_t{101});
+    KEXPECT_EQ(stat.st_mtim.tv_nsec, int64_t{456});
+    KEXPECT_EQ(stat.st_ctim.tv_sec, int64_t{303});
+    KREQUIRE_EQ(vfs::vfs_unlink(cleanup.ORIGINAL), 0);
+    KREQUIRE_TRUE(node->coherency.snapshot(before));
+    KEXPECT_EQ(tmpfs::tmpfs_utimens_lookup(lookup, ROOT, explicit_times, &output), -EAGAIN);
+    KREQUIRE_TRUE(node->coherency.snapshot(after));
+    KEXPECT_TRUE(coherence::cache_matches(before, after, coherence::Domain::ALL));
+    KREQUIRE_EQ(tmpfs::tmpfs_utimens_node(node, ROOT, explicit_times, &output), 0);
+    KREQUIRE_TRUE(node->coherency.snapshot(after));
+    KEXPECT_EQ(after.object, before.object);
+    KEXPECT_TRUE(after.metadata > before.metadata);
+}
 
 KTEST(VfsCoherency, MountedXfsNativeOwnerObservationsVersionsScopesAndRetirement) {
     namespace vfs = ker::vfs;
@@ -179,6 +348,37 @@ KTEST(VfsCoherency, MountedXfsNativeOwnerObservationsVersionsScopesAndRetirement
     KREQUIRE_EQ(vfs::vfs_file_coherency_snapshot(alias.get(), after), 0);
     KEXPECT_EQ(after.object, before.object);
     KEXPECT_TRUE(after.metadata > before.metadata);
+    before = after;
+    // Timestamp transactions participate in the same retained canonical
+    // authority; policy/readonly/OMIT denials must not publish a new version.
+    std::array<vfs::Timespec, 2> requested{{{101, 123}, {202, 456}}};
+    vfs::TimestampUpdate explicit_times, omit;
+    KREQUIRE_EQ(vfs::TimestampUpdate::prepare(requested.data(), {303, 789}, explicit_times), 0);
+    requested = {{{0, vfs::TimestampUpdate::OMIT}, {0, vfs::TimestampUpdate::OMIT}}};
+    KREQUIRE_EQ(vfs::TimestampUpdate::prepare(requested.data(), {404, 999}, omit), 0);
+    auto denied = ROOT;
+    KREQUIRE_EQ(denied.prepare({.change = ker::mod::security::Change::SET_UID, .real = 1000}, denied), 0);
+    xfs::XfsLookupHandle lookup;
+    KREQUIRE_EQ(xfs::xfs_acquire_lookup(ROOT, "/ktest_owner_xfs26/a", fixture.mount, &lookup), 0);
+    vfs::Stat timestamp_output{};
+    timestamp_output.st_uid = 12345;
+    KEXPECT_EQ(xfs::xfs_set_times_file(owner.get(), denied, explicit_times, &timestamp_output), -EPERM);
+    KEXPECT_EQ(timestamp_output.st_uid, uint32_t{12345});
+    KEXPECT_EQ(xfs::xfs_utimens_lookup(lookup, ROOT, explicit_times, &timestamp_output, true), -EROFS);
+    KEXPECT_EQ(xfs::xfs_utimens_lookup(lookup, ROOT, omit, &timestamp_output, true), -EROFS);
+    KEXPECT_EQ(timestamp_output.st_uid, uint32_t{12345});
+    KREQUIRE_EQ(xfs::xfs_set_times_file(owner.get(), denied, omit, &timestamp_output), 0);
+    KREQUIRE_EQ(vfs::vfs_file_coherency_snapshot(alias.get(), after), 0);
+    KEXPECT_TRUE(coherence::cache_matches(before, after, coherence::Domain::ALL));
+    KREQUIRE_EQ(xfs::xfs_set_times_file(owner.get(), ROOT, explicit_times, &timestamp_output), 0);
+    KREQUIRE_EQ(vfs::vfs_file_coherency_snapshot(alias.get(), after), 0);
+    KEXPECT_EQ(after.object, before.object);
+    KEXPECT_TRUE(after.metadata > before.metadata);
+    KREQUIRE_EQ(vfs::vfs_fstat_file_native(alias.get(), &timestamp_output), 0);
+    KEXPECT_EQ(timestamp_output.st_atim.tv_sec, int64_t{101});
+    KEXPECT_EQ(timestamp_output.st_atim.tv_nsec, int64_t{123});
+    KEXPECT_EQ(timestamp_output.st_mtim.tv_sec, int64_t{202});
+    KEXPECT_EQ(timestamp_output.st_mtim.tv_nsec, int64_t{456});
     // A generic mount view must not replace the retained inode mount's dev key.
     owner->mount_dev_id = 0xFEEEBEEF;
     alias->mount_dev_id = 0xFEEEBEEE;

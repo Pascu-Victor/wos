@@ -1733,10 +1733,15 @@ auto tmpfs_rmdir_lookup(const ker::mod::security::Snapshot& credentials, const T
     if (read_only) {
         return -EROFS;
     }
+    // Retained directory streams synthesize '..' from this parent pointer.
+    // Detaching changes that stream even when the directory has no children.
+    coherency::Publication publication(canonical->coherency, coherency::Domain::DIRECTORY);
     if (!tmpfs_detach_child(handle.parent(), entry)) {
+        publication.cancel_no_effect();
         return -ENOENT;
     }
     entry->unlinked = true;
+    publication.publish();
     if (entry->open_count.load(std::memory_order_acquire) == 0) {
         tmpfs_free_node(entry);
     }
@@ -1941,7 +1946,9 @@ auto tmpfs_rename_lookup(const ker::mod::security::Snapshot& credentials, const 
     coherency::Publication source_publication(CANONICAL->coherency,
                                               SOURCE_DIRECTORY ? coherency::Domain::DIRECTORY : coherency::Domain::METADATA);
     std::optional<coherency::Publication> displaced_publication;
-    if (DISPLACED != nullptr) displaced_publication.emplace(DISPLACED->coherency, coherency::Domain::METADATA);
+    if (DISPLACED != nullptr)
+        displaced_publication.emplace(
+            DISPLACED->coherency, DISPLACED->type == TmpNodeType::DIRECTORY ? coherency::Domain::DIRECTORY : coherency::Domain::METADATA);
     auto* parent = destination.parent();
     if (parent->children_count >= parent->children_capacity) {
         constexpr size_t MAX_CAPACITY = SIZE_MAX / sizeof(TmpNode*);

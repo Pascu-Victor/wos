@@ -279,3 +279,15 @@ trigger IDENTIFY on the captured non-lock binding. Normal and isolated fast
 KTEST builds and formatting passed. Negotiated IDENTIFY, live client dispatch,
 scope/operation outboxes and packet qualification remain required. The public
 remote advisory path still returns `EOPNOTSUPP`; no new capability is advertised.
+
+Retained TMPFS directory versions now cover their synthetic `..` entry when
+rmdir or rename replacement detaches the directory. The directory and metadata
+versions advance before reclamation; its identity and content version remain
+unchanged. Source movement and both parents' membership publication retain their
+existing coverage. Readonly, authorization, nonempty, root and stale-lookup
+denials preserve committed versions and native errno behavior. Actual retained
+directory and timestamp fixtures passed in a 73,497-assertion isolated KTEST run,
+including TMPFS metadata-only timestamp publication and real mounted-XFS
+timestamp commit, OMIT and denial behavior. Normal and isolated fast KTEST builds,
+formatting and source-policy checks passed. This is a mutation-audit checkpoint;
+full client integration and multi-client packet qualification remain required.
