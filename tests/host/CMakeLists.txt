@@ -1874,6 +1874,11 @@ wos_add_unit_test(compartment_policy_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/compartment_policy_test.cpp
 )
 
+wos_add_unit_test(ipc_namespace_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/ipc_namespace_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/platform/sched/ipc_namespace.cpp
+)
+
 wos_add_unit_test(vfs_advisory_client_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vfs_advisory_client_test.cpp
 )

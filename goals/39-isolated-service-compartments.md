@@ -147,17 +147,20 @@ controlled.
 ## Current session checkpoint (2026-10-08)
 
 Selected after user-requested Goal28 checkpoint commit70bc3fe7 and goal switch.
-Goal28 remains paused/incomplete; goal-manager create_goal rejects replacement
-while it is unfinished, and clearing/replacing it in goal controls is pending.
-Repository Goal39 work proceeds independently; no false prior completion.
+Goal28 remains incomplete as a repository checkpoint. The user cleared its
+previous Goal Mode record on 2026-10-08 and Goal39 is now active with the full
+contract, rootless runtime authorization and storage constraints.
 
 Current source already implements immutable CredentialStore and retained root/
 cwd views; the dated dirty-credential premise must not be copied. Full prior
 Goal19 authorization completion is not inferred from its retired portfolio row.
 Reuse existing checked APIs and map shared native consumers before modifying them.
-Initial profile preparation and13hosttests implemented;101focusedASan/UBSan cases,
-freestanding compiler probe, Normal Build WOS and formatter pass. These do not
-qualify namespace isolation; all10criteria/native integration remain outstanding.
+Profile preparation and private native SysV IPC namespace ownership/lookup are
+implemented;109focusedASan/UBSan cases, Normal Build WOS and formatter pass.
+Isolated fast KTEST passes73525assertions/0failures including4newIPC cases.
+No public compartment creation, mount/PID isolation, network/WKI gates or launcher
+is enabled. All10fullacceptancecriteria remain outstanding; registry/metadata
+fixtures do not qualify real user mapping/futex or full service lifecycles.
 See progress/39/{ledger,evidence,reconnaissance,contract-01-profile}.md and
 docs/wos_service_compartments.md.
 
@@ -169,4 +172,5 @@ disposable-image budget and40GiB free floor; use immutable required bases and
 private COW/reflink images. Audit exact ownership/live process/QMP/FD/backing
 references and prune inactive agent-created disposable disks/backings/per-run
 appliances after PASS/FAIL/exceptions. Keep small evidence and user/unrelated
-disks/source/current artifacts. No Goal39 VM disks have been created.
+disks/source/current artifacts. Both Goal39 KTEST attempts pruned their exact-owned
+inactive disposable images; small logs/configs/manifests/receipts remain.

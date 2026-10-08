@@ -16,6 +16,7 @@
 #include <platform/ktime/timer_queue.hpp>
 #include <platform/sched/fd_table.hpp>
 #include <platform/sched/frame_class.hpp>
+#include <platform/sched/ipc_namespace.hpp>
 #include <platform/sched/job_control.hpp>
 #include <platform/sched/migration_guard.hpp>
 #include <platform/sched/preemption_diagnostics.hpp>
@@ -1283,6 +1284,27 @@ struct Task {
     // filesystem owner; native exec preserves it. Appended so existing Task
     // and assembly member offsets remain unchanged. Zero until first use.
     std::atomic<uint64_t> advisory_process_generation{0};
+
+   private:
+    // Appended to preserve existing Task/assembly offsets. Installed only
+    // under exclusive unpublished ownership, then immutable across exec.
+    ipc::NamespaceRef m_ipc_namespace{};
+    bool m_ipc_namespace_initialized{};
+
+   public:
+    [[nodiscard]] auto ipc_namespace() const -> const ipc::NamespaceRef* {
+        auto const* owner = credential_owner();
+        return owner != nullptr ? &owner->m_ipc_namespace : nullptr;
+    }
+    [[nodiscard]] auto initialize_ipc_namespace(const ipc::NamespaceRef& source) -> bool {
+        if (is_thread || scheduler_published.load(std::memory_order_acquire) ||
+            state.load(std::memory_order_acquire) != TaskState::ACTIVE || m_ipc_namespace_initialized || source.closed()) {
+            return false;
+        }
+        if (source.retain(m_ipc_namespace) != 0) return false;
+        m_ipc_namespace_initialized = true;
+        return true;
+    }
 };
 
 [[nodiscard]] inline auto process_pid(const Task& task) -> uint64_t { return task.owner_pid != 0 ? task.owner_pid : task.pid; }

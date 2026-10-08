@@ -258,6 +258,8 @@ auto inherit(task::Task& child, task::Task& parent) -> bool {
         return false;
     }
     auto& source = *owner.get();
+    auto const* ipc_namespace = source.ipc_namespace();
+    if (ipc_namespace == nullptr || !child.initialize_ipc_namespace(*ipc_namespace)) return false;
     uint64_t const FLAGS = source.resource_lock.lock_irqsave();
     child.resources.inherit_limits(source.resources);
     source.resource_lock.unlock_irqrestore(FLAGS);

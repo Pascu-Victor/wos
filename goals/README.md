@@ -58,8 +58,8 @@ production rollout; see [the qualification record](../docs/wki_secure_rdma.md).
 Goal 28 is paused and incomplete at its tested wire-codec checkpoint
 `70bc3fe7`. At the user's request, current work selects Goal 39. Its native
 isolation, launcher and runtime criteria remain outstanding; the local progress
-ledger records source reconnaissance and qualification. The goal-manager API
-currently refuses replacement of the unfinished paused Goal 28.
+ledger records source reconnaissance and qualification. The user cleared the previous goal-manager record on 2026-10-08,
+and Goal 39 is now the active Goal Mode objective.
 
 The [local virtualization manual corpus](../docs/virtualization-manuals.md)
 provides pinned source downloads, Docling PDF text and offline search. Check its
