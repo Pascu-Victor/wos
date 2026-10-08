@@ -259,7 +259,9 @@ auto inherit(task::Task& child, task::Task& parent) -> bool {
     }
     auto& source = *owner.get();
     auto const* ipc_namespace = source.ipc_namespace();
-    if (ipc_namespace == nullptr || !child.initialize_ipc_namespace(*ipc_namespace)) return false;
+    auto const* mount_namespace = source.mount_namespace();
+    if (ipc_namespace == nullptr || mount_namespace == nullptr || ipc_namespace->closed() || mount_namespace->closed()) return false;
+    if (!child.initialize_ipc_namespace(*ipc_namespace) || !child.initialize_mount_namespace(*mount_namespace)) return false;
     uint64_t const FLAGS = source.resource_lock.lock_irqsave();
     child.resources.inherit_limits(source.resources);
     source.resource_lock.unlock_irqrestore(FLAGS);

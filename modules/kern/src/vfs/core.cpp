@@ -5527,6 +5527,12 @@ auto resolved_path_may_need_wki_host_root_mount_for_task(const ker::mod::sched::
 }
 
 void maybe_ensure_wki_host_root_mount_for_task(const ker::mod::sched::task::Task* task, const char* resolved_path) {
+    // Discovery mutates the host mount view. A private or unbound subject
+    // cannot cause that effect through compatibility path helpers.
+    if (task != nullptr) {
+        auto const* scope = task->mount_namespace();
+        if (scope == nullptr || !scope->is_host()) return;
+    }
     if (ker::net::wki::g_wki.initialized && resolved_path_may_need_wki_host_root_mount_for_task(task, resolved_path)) {
         ensure_wki_host_root_mount(resolved_path);
     }
@@ -8088,6 +8094,13 @@ auto vfs_open_resolved_for_task(ker::mod::sched::task::Task* task, const char* r
                                 bool lookup_symlinks_resolved = false, bool namespace_already_locked = false,
                                 const LookupHandle* stable_lookup = nullptr, File** direct_output = nullptr, bool task_is_opener = true,
                                 const DirectoryViewRef* directory_view = nullptr) -> int {
+    auto const* scope = task != nullptr ? task->mount_namespace() : nullptr;
+    if (task != nullptr && scope == nullptr) return -ESRCH;
+    if (scope != nullptr && scope->closed()) return -EIDRM;
+    if (scope != nullptr && !scope->is_host() &&
+        (stable_lookup == nullptr || stable_lookup->mount() == nullptr || stable_lookup->mount()->namespace_owner != *scope ||
+         stable_lookup->authorization().mount_namespace_generation != scope->generation()))
+        return -ENOTSUP;
     if (!common_local_fast_path && (stable_lookup == nullptr || !stable_lookup->directory_view())) {
         maybe_ensure_wki_host_root_mount_for_task(task, path_buffer.data());
     }
@@ -8158,7 +8171,7 @@ auto vfs_open_resolved_for_task(ker::mod::sched::task::Task* task, const char* r
         metadata_store_epoch_before_symlink = g_metadata_store_observation_epoch.load(std::memory_order_acquire);
     }
 
-    if (!REMOTE_MOUNT) {
+    if (!REMOTE_MOUNT && scope->is_host()) {
         int fd_link_result = 0;
         auto* fd_link_file = vfs_try_open_procfs_fd_link(CREDENTIALS, ker::mod::sched::task::process_pid(*task), path_buffer.data(),
                                                          !open_local, fd_link_result, mount, path_buffer_len);
@@ -11577,6 +11590,8 @@ auto lookup_request_context_matches(const LookupHandle& handle, const ker::mod::
     if (task == nullptr || task->pid != authorization.task_id) return false;
     auto* path_owner = task->filesystem_owner();
     if (path_owner == nullptr) return false;
+    auto const* scope = task->mount_namespace();
+    if (scope == nullptr || scope->closed() || scope->generation() != authorization.mount_namespace_generation) return false;
     uint64_t const IRQF = path_owner->path_metadata_lock.lock_irqsave();
     bool const PATHS_MATCH =
         metadata_path_hash_raw(path_owner->root.data(), std::strlen(path_owner->root.data())) == authorization.root_hash &&
@@ -11588,6 +11603,12 @@ auto lookup_request_context_matches(const LookupHandle& handle, const ker::mod::
 }
 
 auto lookup_authorization_still_current(const LookupHandle& handle) -> bool {
+    // A worker consumes the exact retained mount owner, independently of its
+    // own Task namespace. A generation is validation, never a namespace lookup.
+    auto* mount = handle.mount();
+    if (mount == nullptr || mount->namespace_owner.closed() ||
+        mount->namespace_owner.generation() != handle.authorization().mount_namespace_generation)
+        return false;
     if (!lookup_search_authority_current(handle)) return false;
     if (!ker::mod::sched::can_query_current_task()) return true;
     auto* task = ker::mod::sched::get_current_task();
@@ -11818,7 +11839,7 @@ auto local_walk_read_stat(LocalWalkNode& node, const char* path, uint64_t caller
         node.proc.reset(ker::vfs::procfs::procfs_lookup_path_as(fs_path, caller_pid, 0, caller_task));
         result = node.proc ? ker::vfs::procfs::procfs_fill_stat(node.proc.get(), &node.stat, mount->dev_id) : -ENOENT;
     }
-    if (result == -ENOENT && fill_synthetic_mount_dir_stat(path, &node.stat) == 0) {
+    if (result == -ENOENT && mount->namespace_owner.is_host() && fill_synthetic_mount_dir_stat(path, &node.stat) == 0) {
         node.synthetic = true;
         node.tmp.reset();
         node.xfs.reset();
@@ -11838,8 +11859,10 @@ struct LocalWalkEpoch {
     ker::mod::sched::task::Task* caller_task = nullptr;
     MountPoint* confined_mount = nullptr;
     std::unique_ptr<NativeDirectoryMembershipReferences>* membership = nullptr;
+    const mount_ns::NamespaceRef* mount_namespace = nullptr;
     auto current() const -> bool {
-        return g_vfs_namespace_generation.load(std::memory_order_acquire) == namespace_generation &&
+        return mount_namespace != nullptr && !mount_namespace->closed() &&
+               g_vfs_namespace_generation.load(std::memory_order_acquire) == namespace_generation &&
                mount_table_generation_snapshot() == mount_generation;
     }
 };
@@ -11939,14 +11962,16 @@ auto local_walk_cross_native_mount(const LocalWalkEpoch& epoch, const ker::mod::
 
 auto local_walk_bind(const LocalWalkEpoch& epoch, const ker::mod::security::Snapshot& credentials, const char* path, LocalWalkNode* parent,
                      const char* component, File* anchor, LocalWalkNode& out, DirectoryAnchor* retained = nullptr) -> int {
-    out.mount = find_mount_point(path);
+    out.mount = find_mount_point(path, UNKNOWN_MOUNT_PATH_LEN, *epoch.mount_namespace);
     auto* mount = out.mount.get();
+    bool const PRIVATE = !epoch.mount_namespace->is_host();
+    if (PRIVATE && mount != nullptr && mount->fs_type != FSType::TMPFS) return -ENOTSUP;
     // Scoped transitions require native identity proofs below; unsupported
     // backends cannot bind an object or use the unscoped fallback.
     if (epoch.confined_mount != nullptr && (mount == nullptr || (mount->fs_type != FSType::TMPFS && mount->fs_type != FSType::XFS)))
         return -EXDEV;
     if (mount == nullptr) {
-        if (!epoch.physical_path) return -ENOENT;
+        if (PRIVATE || !epoch.physical_path) return -ENOENT;
         std::optional<ker::mod::sys::MutexGuard> publication_guard;
         if (!epoch.serialized) publication_guard.emplace(g_vfs_namespace_publication_mutex);
         if (!epoch.current()) return -EAGAIN;
@@ -11979,7 +12004,7 @@ auto local_walk_bind(const LocalWalkEpoch& epoch, const ker::mod::security::Snap
     if (parent != nullptr && !SAME_MOUNT) {
         int const CROSS = local_walk_cross_native_mount(epoch, credentials, path, *parent, component, out);
         if (CROSS != RESOLVE_FAST_PATH_DECLINED) return CROSS;
-        if (epoch.confined_mount != nullptr) return -EXDEV;
+        if (PRIVATE || epoch.confined_mount != nullptr) return -EXDEV;
     }
     const char* fs_path = strip_mount_prefix(mount, path);
     int result = 0;
@@ -12019,7 +12044,7 @@ auto local_walk_bind(const LocalWalkEpoch& epoch, const ker::mod::security::Snap
         if (!out.dev) return -ENOMEM;
         *out.dev = ker::vfs::devfs::devfs_acquire_path(fs_path);
     }
-    if (result == -ENOENT && fill_synthetic_mount_dir_stat(path, &out.stat) == 0) {
+    if (result == -ENOENT && !PRIVATE && fill_synthetic_mount_dir_stat(path, &out.stat) == 0) {
         out.tmp.reset();
         out.xfs.reset();
         out.synthetic = out.exists = true;
@@ -12233,21 +12258,28 @@ auto acquire_local_component_lookup(ker::mod::sched::task::Task* task, int dirfd
                                     LocalWalkReferences* serialized_references = nullptr, MountPoint* confined_mount = nullptr,
                                     const DirectoryViewRef* initial_view = nullptr, const char* absolute_symlink_root = nullptr,
                                     const char* absolute_symlink_origin = nullptr) -> int {
+    auto const* scope = task->mount_namespace();
+    if (scope == nullptr) return -ESRCH;
+    if (scope->closed()) return -EIDRM;
+    bool const PRIVATE = !scope->is_host();
+    // Owner-side exports do not yet transport private namespace authority.
+    if (PRIVATE && physical_path) return -ENOTSUP;
     if (owner_directory != nullptr && (!physical_path || confinement_root == nullptr || pathname[0] == '/')) return -EINVAL;
     if (pathname[0] == '\0') return -ENOENT;
     if (physical_path && ((owner_directory == nullptr && pathname[0] != '/') || apply_task_route || admitted_credentials == nullptr))
         return -EINVAL;
     if (confinement_root != nullptr && (!physical_path || confinement_root[0] != '/')) return -EINVAL;
     bool const ROUTED_LOCAL = apply_task_route && !task_has_common_local_vfs_routing(task);
+    if (PRIVATE && ROUTED_LOCAL) return -ENOTSUP;
     bool const REMOTE_COMPONENTS =
-        !physical_path &&
+        !PRIVATE && !physical_path &&
         (intent == LookupIntent::OPEN || intent == LookupIntent::STAT || intent == LookupIntent::ACCESS ||
          intent == LookupIntent::READLINK || intent == LookupIntent::CHANGE_MODE || intent == LookupIntent::CHANGE_OWNER ||
          (intent == LookupIntent::CHANGE_TIMES || intent == LookupIntent::XATTR) || intent == LookupIntent::CREATE_DIRECTORY ||
          intent == LookupIntent::CREATE_SYMLINK || intent == LookupIntent::REMOVE || intent == LookupIntent::RENAME_SOURCE ||
          intent == LookupIntent::RENAME_TARGET);
     // Only mapped operations can delegate the original component remainder.
-    if (path_is_wki_prefix(pathname) && !REMOTE_COMPONENTS) return physical_path ? -EPERM : RESOLVE_FAST_PATH_DECLINED;
+    if (!PRIVATE && path_is_wki_prefix(pathname) && !REMOTE_COMPONENTS) return physical_path ? -EPERM : RESOLVE_FAST_PATH_DECLINED;
     auto* path_owner = task->filesystem_owner();
     if (path_owner == nullptr) return -ESRCH;
     if (serialized != (serialized_references != nullptr)) return -EINVAL;
@@ -12263,6 +12295,7 @@ auto acquire_local_component_lookup(ker::mod::sched::task::Task* task, int dirfd
     auto& cwd_anchor = references.cwd;
     std::array<char, MAX_PATH_LEN> root{}, cwd{}, path{}, pending{}, task_root{}, physical_export_root{};
     LookupAuthorizationContext authorization{.task_id = task->pid,
+                                             .mount_namespace_generation = scope->generation(),
                                              .credentials = admitted_credentials != nullptr ? *admitted_credentials : task->credentials(),
                                              .tmpfs_search_generation = tmpfs::tmpfs_search_authority_generation(),
                                              .xfs_search_generation = xfs::xfs_search_authority_generation()};
@@ -12279,6 +12312,17 @@ auto acquire_local_component_lookup(ker::mod::sched::task::Task* task, int dirfd
     }
     path_owner->path_metadata_lock.unlock_irqrestore(PATH_IRQF);
     if (result != 0) return result;
+    auto file_in_scope = [&](const File* file) {
+        return file != nullptr && file->mount_owner != nullptr && file->mount_owner->namespace_owner == *scope;
+    };
+    auto view_in_scope = [&](const DirectoryViewRef& view) {
+        return view && file_in_scope(view.root()) && file_in_scope(view.directory());
+    };
+    if (PRIVATE && ((root_anchor && (root_anchor.get()->mount == nullptr || root_anchor.get()->mount->namespace_owner != *scope ||
+                                     !view_in_scope(root_anchor.get()->view))) ||
+                    (cwd_anchor && (cwd_anchor.get()->mount == nullptr || cwd_anchor.get()->mount->namespace_owner != *scope)) ||
+                    (references.view && !view_in_scope(references.view))))
+        return -EXDEV;
     if (root[0] != '/' || cwd[0] != '/') return RESOLVE_FAST_PATH_DECLINED;
     task_root = root;
     bool const CWD_MATCH = directory_anchor_matches(cwd_anchor, root.data(), cwd.data());
@@ -12327,6 +12371,7 @@ auto acquire_local_component_lookup(ker::mod::sched::task::Task* task, int dirfd
     }
     auto admit_retained_view = [&]() -> int {
         if (!references.view) return 0;
+        if (PRIVATE && !view_in_scope(references.view)) return -EXDEV;
         std::optional<ker::mod::sys::MutexGuard> guard;
         if (!serialized) guard.emplace(g_vfs_namespace_publication_mutex);
         if (NAMESPACE != g_vfs_namespace_generation.load(std::memory_order_acquire) || MOUNTS != mount_table_generation_snapshot())
@@ -12404,6 +12449,7 @@ auto acquire_local_component_lookup(ker::mod::sched::task::Task* task, int dirfd
             anchor.reset(vfs_get_file_retain(task, dirfd));
         }
         if (!anchor) return -EBADF;
+        if (PRIVATE && !file_in_scope(anchor.get())) return -EXDEV;
 #ifdef WOS_SELFTEST
         if (serialized && local_walk_retained_test_hook != nullptr) local_walk_retained_test_hook(task, anchor.get());
 #endif
@@ -12508,7 +12554,8 @@ auto acquire_local_component_lookup(ker::mod::sched::task::Task* task, int dirfd
                          ker::mod::sched::task::process_pid(*task),
                          task,
                          confined_mount,
-                         &references.membership};
+                         &references.membership,
+                         scope};
     if (!EPOCH.current()) return -EAGAIN;
     LocalWalkNode current{};
     DirectoryAnchor* retained_cwd = nullptr;
@@ -12523,8 +12570,10 @@ auto acquire_local_component_lookup(ker::mod::sched::task::Task* task, int dirfd
     }
     // Do not pair an old directory inode with a replacement mount's backend.
     // Publication after this check is still caught by the captured epoch.
-    if (owner_directory != nullptr && find_mount_point(path.data()).get() != anchor->mount_owner) return -EAGAIN;
+    if (owner_directory != nullptr && find_mount_point(path.data(), UNKNOWN_MOUNT_PATH_LEN, *scope).get() != anchor->mount_owner)
+        return -EAGAIN;
     auto publish_remote = [&](const char* remote_path, MountRef mount) -> int {
+        if (PRIVATE) return -ENOTSUP;
         if (references.view) return -EXDEV;
         if (serialized) return RESOLVE_FAST_PATH_DECLINED;
         if (!mount || mount->fs_type != FSType::REMOTE) return -ENOENT;
@@ -12540,7 +12589,7 @@ auto acquire_local_component_lookup(ker::mod::sched::task::Task* task, int dirfd
         // A local alias can encounter the host root before its nested export.
         // Select from the complete remainder just as an explicit path does;
         // dots and names still reach the owner unchanged for authorization.
-        auto selected = find_mount_point(full_path.data(), written);
+        auto selected = find_mount_point(full_path.data(), written, *scope);
         if (selected && selected->fs_type == FSType::REMOTE) mount = std::move(selected);
         LookupHandle candidate{};
         int const COPY = populate_lookup_path_fields(candidate, full_path.data(), written);
@@ -12567,7 +12616,7 @@ auto acquire_local_component_lookup(ker::mod::sched::task::Task* task, int dirfd
             maybe_ensure_wki_host_root_mount_for_task(task, routed.data());
             // Explicit paths can select a nested export even without an alias
             // rewrite. Retain the raw-path mount that consumption validates.
-            auto destination = find_mount_point(routed.data());
+            auto destination = find_mount_point(routed.data(), UNKNOWN_MOUNT_PATH_LEN, *scope);
             if (destination && destination->fs_type == FSType::REMOTE) return publish_remote(routed.data(), std::move(destination));
         }
         if (!unchanged) {
@@ -12744,7 +12793,7 @@ auto acquire_local_component_lookup(ker::mod::sched::task::Task* task, int dirfd
                     // No publication lock spans mount discovery or a remote
                     // request. A newly created mount makes this epoch stale.
                     maybe_ensure_wki_host_root_mount_for_task(task, routed.data());
-                    auto destination = find_mount_point(routed.data());
+                    auto destination = find_mount_point(routed.data(), UNKNOWN_MOUNT_PATH_LEN, *scope);
                     if (destination && destination->fs_type == FSType::REMOTE) return publish_remote(routed.data(), std::move(destination));
                     size_t const ROOT_LEN = std::strlen(root.data());
                     if (!path_prefix_matches(routed.data(), root.data(), ROOT_LEN)) return -EXDEV;
@@ -12906,6 +12955,11 @@ auto vfs_acquire_lookup(ker::mod::sched::task::Task* task, int dirfd, const char
     bool const RENAME = intent == LookupIntent::RENAME_SOURCE || intent == LookupIntent::RENAME_TARGET;
     if (RENAME && path_has_final_dot_component(pathname)) return -EINVAL;
     out->reset();
+    auto const* scope = task->mount_namespace();
+    if (scope == nullptr) return -ESRCH;
+    if (scope->closed()) return -EIDRM;
+    bool const PRIVATE = !scope->is_host();
+    if (PRIVATE && already_resolved) return -ENOTSUP;
     bool const PHYSICAL_OWNER_PATH = already_resolved && admitted_credentials != nullptr;
     // One request keeps its admitted authority through native retries and the
     // routed fallback. In particular, symlink resolution must not recapture a
@@ -12916,7 +12970,7 @@ auto vfs_acquire_lookup(ker::mod::sched::task::Task* task, int dirfd, const char
             int const WALK = acquire_local_component_lookup(task, dirfd, pathname, intent, follow_policy, require_directory,
                                                             apply_task_route, out, &REQUEST_CREDENTIALS, false, PHYSICAL_OWNER_PATH);
             // Explicit owner requests must never retry with ambient authority.
-            if (PHYSICAL_OWNER_PATH && WALK == RESOLVE_FAST_PATH_DECLINED) return -ENOTSUP;
+            if ((PRIVATE || PHYSICAL_OWNER_PATH) && WALK == RESOLVE_FAST_PATH_DECLINED) return -ENOTSUP;
             if (WALK == RESOLVE_FAST_PATH_DECLINED) break;
             if (WALK != -EAGAIN || restart == max_restarts) return WALK;
         }
@@ -13449,6 +13503,9 @@ auto consume_lookup_locked(const LookupHandle& handle, bool namespace_mutation, 
         return -EXDEV;
     }
     if ((request_task == nullptr) != (request_credentials == nullptr)) return -EINVAL;
+    auto const& scope = handle.mount()->namespace_owner;
+    if (scope.closed()) return -EIDRM;
+    if (scope.generation() != handle.authorization().mount_namespace_generation) return -EAGAIN;
     bool const AUTHORIZED = request_task != nullptr ? lookup_request_context_matches(handle, request_task, *request_credentials)
                                                     : lookup_authorization_still_current(handle);
     if (!AUTHORIZED) return -EAGAIN;
@@ -13457,7 +13514,7 @@ auto consume_lookup_locked(const LookupHandle& handle, bool namespace_mutation, 
         g_vfs_namespace_generation.load(std::memory_order_acquire) != handle.namespace_generation()) {
         return -EAGAIN;
     }
-    auto current_mount = find_mount_point(handle.path(), handle.path_length());
+    auto current_mount = find_mount_point(handle.path(), handle.path_length(), scope);
     if (mount_table_generation_snapshot() != handle.mount_generation() || current_mount.get() != handle.mount()) return -EAGAIN;
     if (handle.dirfd_anchor() != nullptr && !handle.dirfd_path_revalidated() && handle.dirfd_anchor()->mount_owner != handle.mount())
         return -EAGAIN;
@@ -13787,6 +13844,11 @@ auto consume_lookup_pair_locked(const LookupHandle& first, const LookupHandle& s
         first.authorization().credentials != second.authorization().credentials)
         return -EAGAIN;
     if ((request_task == nullptr) != (request_credentials == nullptr)) return -EINVAL;
+    auto const& scope = first.mount()->namespace_owner;
+    if (scope.closed()) return -EIDRM;
+    if (scope.generation() != first.authorization().mount_namespace_generation ||
+        scope.generation() != second.authorization().mount_namespace_generation)
+        return -EAGAIN;
     auto authorized = [&](const LookupHandle& handle) {
         return request_task != nullptr ? lookup_request_context_matches(handle, request_task, *request_credentials)
                                        : lookup_authorization_still_current(handle);
@@ -13797,8 +13859,8 @@ auto consume_lookup_pair_locked(const LookupHandle& first, const LookupHandle& s
         second.namespace_generation() != CURRENT_NAMESPACE_GENERATION) {
         return -EAGAIN;
     }
-    auto first_current_mount = find_mount_point(first.path(), first.path_length());
-    auto second_current_mount = find_mount_point(second.path(), second.path_length());
+    auto first_current_mount = find_mount_point(first.path(), first.path_length(), scope);
+    auto second_current_mount = find_mount_point(second.path(), second.path_length(), scope);
     auto mount_still_matches = [](const LookupHandle& handle, const MountRef& current) {
         return mount_table_generation_snapshot() == handle.mount_generation() && current.get() == handle.mount() &&
                (handle.dirfd_anchor() == nullptr || handle.dirfd_path_revalidated() ||
@@ -30927,6 +30989,7 @@ auto validate_native_mount_attachment(MountPoint* child, File* covered, uint64_t
     if (child == nullptr || parent == nullptr || covered->private_data == nullptr || !covered->is_directory ||
         covered->fs_type != parent->fs_type)
         return -EBADF;
+    if (child->namespace_owner != parent->namespace_owner) return -EXDEV;
     if (parent->fs_type != FSType::TMPFS && parent->fs_type != FSType::XFS) return -ENOTSUP;
     if (child->retiring.load(std::memory_order_acquire) || parent->retiring.load(std::memory_order_acquire)) return -EAGAIN;
     std::array<char, MAX_PATH_LEN> child_path{}, parent_path{}, covered_path{};
@@ -30945,7 +31008,7 @@ auto validate_native_mount_attachment(MountPoint* child, File* covered, uint64_t
     size_t const PARENT_KEY_LENGTH = metadata_parent_path_len(parent_key.data(), std::strlen(parent_key.data()));
     parent_key[PARENT_KEY_LENGTH] = '\0';
     // An intermediate overlay cannot silently substitute another parent.
-    auto selected_parent = find_mount_point(parent_key.data(), PARENT_KEY_LENGTH);
+    auto selected_parent = find_mount_point(parent_key.data(), PARENT_KEY_LENGTH, child->namespace_owner);
     if (selected_parent.get() != parent || mount_table_generation_snapshot() != generation) return -EAGAIN;
     if (child_path_output != nullptr) *child_path_output = child_path;
     return 0;
@@ -30957,6 +31020,7 @@ auto directory_member_path_locked(File* directory, File* root, char* buffer, siz
     if (directory == nullptr || root == nullptr || directory->private_data == nullptr || root->private_data == nullptr) return -EBADF;
     if (!directory->is_directory || !root->is_directory) return -ENOTDIR;
     if (directory->mount_owner == nullptr || root->mount_owner == nullptr) return -EBADF;
+    if (directory->mount_owner->namespace_owner != root->mount_owner->namespace_owner) return -EXDEV;
     for (auto* file : {directory, root}) {
         if (file->fs_type != file->mount_owner->fs_type) return -EBADF;
         if (file->fs_type != FSType::TMPFS && file->fs_type != FSType::XFS) return -ENOTSUP;

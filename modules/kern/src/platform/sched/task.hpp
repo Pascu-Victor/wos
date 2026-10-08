@@ -35,6 +35,7 @@
 #include <util/radix_tree.hpp>
 #include <util/smallvec.hpp>
 #include <vfs/directory_anchor.hpp>
+#include <vfs/mount_namespace.hpp>
 // Avoid pulling in in-tree std headers into kernel translation units from here.
 
 namespace ker::vfs {
@@ -1290,6 +1291,10 @@ struct Task {
     // under exclusive unpublished ownership, then immutable across exec.
     ipc::NamespaceRef m_ipc_namespace{};
     bool m_ipc_namespace_initialized{};
+    // Immutable process mount ownership. Threads resolve their retained
+    // filesystem owner; final drop is atomic-only and does not retire mounts.
+    ker::vfs::mount_ns::NamespaceRef m_mount_namespace{};
+    bool m_mount_namespace_initialized{};
 
    public:
     [[nodiscard]] auto ipc_namespace() const -> const ipc::NamespaceRef* {
@@ -1303,6 +1308,19 @@ struct Task {
         }
         if (source.retain(m_ipc_namespace) != 0) return false;
         m_ipc_namespace_initialized = true;
+        return true;
+    }
+    [[nodiscard]] auto mount_namespace() const -> const ker::vfs::mount_ns::NamespaceRef* {
+        auto const* owner = filesystem_owner();
+        return owner != nullptr ? &owner->m_mount_namespace : nullptr;
+    }
+    [[nodiscard]] auto initialize_mount_namespace(const ker::vfs::mount_ns::NamespaceRef& source) -> bool {
+        if (is_thread || scheduler_published.load(std::memory_order_acquire) ||
+            state.load(std::memory_order_acquire) != TaskState::ACTIVE || m_mount_namespace_initialized || source.closed()) {
+            return false;
+        }
+        if (source.retain(m_mount_namespace) != 0) return false;
+        m_mount_namespace_initialized = true;
         return true;
     }
 };

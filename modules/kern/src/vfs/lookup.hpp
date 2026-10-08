@@ -47,6 +47,9 @@ enum class LookupFollowPolicy : uint8_t {
 
 struct LookupAuthorizationContext {
     uint64_t task_id{};
+    // Nonreused subject mount-view identity, retained by the selected MountRef.
+    // This value validates ownership; it cannot be converted into a join grant.
+    uint64_t mount_namespace_generation{};
     ker::mod::security::Snapshot credentials{};
     uint64_t root_hash{};
     uint64_t cwd_hash{};

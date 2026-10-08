@@ -9,7 +9,9 @@
 #include <platform/security/credentials.hpp>
 #include <syscalls_impl/shm/shm.hpp>
 #include <test/ktest.hpp>
+#include <vfs/fd_reservation.hpp>
 #include <vfs/fs/tmpfs.hpp>
+#include <vfs/lookup.hpp>
 #include <vfs/mount.hpp>
 
 namespace ipc = ker::mod::sched::ipc;
@@ -111,7 +113,276 @@ auto private_mount(const mount_ns::NamespaceRef& scope, const char* path) -> int
 auto scoped_mount(const mount_ns::NamespaceRef& scope, const char* path) -> vfs::MountRef {
     return vfs::find_mount_point(path, vfs::UNKNOWN_MOUNT_PATH_LEN, scope);
 }
+// Keep exact installed FD capabilities bounded and close them on every test
+// return before the Task and its namespace/mount fixtures are destroyed.
+struct NativeTask {
+    std::unique_ptr<Task> task = std::make_unique<Task>();
+    std::array<int, 16> descriptors{};
+    size_t used{};
+    NativeTask() { task->pid = ker::mod::sched::task::get_next_pid(); }
+    ~NativeTask() {
+        while (used != 0) KEXPECT_EQ(vfs::vfs_close_for_task(task.get(), descriptors[--used]), 0);
+        KEXPECT_EQ(task->fd_table.size(), 0U);
+        KEXPECT_EQ(task->fd_table.reserved_count(), 0U);
+    }
+    auto track(int fd) -> int {
+        if (fd >= 0) {
+            if (used == descriptors.size()) {
+                static_cast<void>(vfs::vfs_close_for_task(task.get(), fd));
+                return -EMFILE;
+            }
+            descriptors[used++] = fd;
+        }
+        return fd;
+    }
+    auto open(const char* path, int flags = vfs::O_CREAT | 2) -> int {
+        return track(vfs::vfs_openat(task.get(), vfs::AT_FDCWD, path, flags, 0600));
+    }
+};
+auto task_lookup(Task& task, const char* path, vfs::LookupHandle& out, int dirfd = vfs::AT_FDCWD) -> int {
+    return vfs::vfs_acquire_lookup(&task, dirfd, path, vfs::LookupIntent::STAT, vfs::LookupFollowPolicy::FOLLOW_FINAL, false, true, &out);
+}
+struct LookupObservation {
+    unsigned calls{};
+    vfs::Stat stat{};
+};
+auto observe_lookup(const vfs::LookupHandle& handle, void* opaque) -> int {
+    auto& out = *static_cast<LookupObservation*>(opaque);
+    ++out.calls;
+    return tmpfs::tmpfs_stat_lookup(*static_cast<tmpfs::TmpfsLookupHandle*>(handle.backend_parent()), false, handle.mount()->dev_id,
+                                    &out.stat);
+}
 }  // namespace
+
+KTEST(CompartmentPath, ChildThreadAndUnpublishedOwnership) {
+    auto const BASELINE = mount_ns::live_namespace_count();
+    {
+        mount_ns::NamespaceRef scope;
+        KREQUIRE_EQ(mount_ns::create_namespace(scope), 0);
+        auto owner = std::make_unique<Task>();
+        owner->pid = ker::mod::sched::task::get_next_pid();
+        KREQUIRE_TRUE(owner->initialize_mount_namespace(scope));
+        auto thread = std::make_unique<Task>();
+        thread->is_thread = true;
+        thread->owner_pid = owner->pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(*thread, *owner));
+        KEXPECT_EQ(thread->mount_namespace(), owner->mount_namespace());
+        KEXPECT_FALSE(thread->initialize_mount_namespace(scope));
+        auto child = std::make_unique<Task>();
+        KREQUIRE_TRUE(resource::inherit(*child, *thread));
+        KEXPECT_TRUE(*child->mount_namespace() == scope);
+        KEXPECT_FALSE(child->initialize_mount_namespace(scope));
+        auto published = std::make_unique<Task>();
+        published->scheduler_published.store(true);
+        KEXPECT_FALSE(published->initialize_mount_namespace(scope));
+        KEXPECT_TRUE(published->mount_namespace()->is_host());
+        auto unbound = std::make_unique<Task>();
+        unbound->is_thread = true;
+        KEXPECT_NULL(unbound->mount_namespace());
+        vfs::LookupHandle absent;
+        KEXPECT_EQ(task_lookup(*unbound, "/", absent), -ESRCH);
+        KEXPECT_NULL(absent.mount());
+        scope.close();
+        auto closed_child = std::make_unique<Task>();
+        KEXPECT_FALSE(closed_child->initialize_mount_namespace(scope));
+        KEXPECT_FALSE(resource::inherit(*closed_child, *owner));
+        KEXPECT_TRUE(closed_child->mount_namespace()->is_host());
+        scope.reset();
+        thread.reset();
+        owner.reset();
+        KEXPECT_EQ(mount_ns::live_namespace_count(), BASELINE + 1);
+    }
+    KEXPECT_EQ(mount_ns::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentPath, NativeNamesSymlinksRenameAndMovedConsumption) {
+    auto const BASELINE = mount_ns::live_namespace_count();
+    auto const HOST_COUNT = vfs::get_mount_count();
+    {
+        PrivateMounts views;
+        KREQUIRE_EQ(mount_ns::create_namespace(views.first), 0);
+        KREQUIRE_EQ(mount_ns::create_namespace(views.second), 0);
+        KREQUIRE_EQ(private_mount(views.first, "/"), 0);
+        KREQUIRE_EQ(private_mount(views.second, "/"), 0);
+        NativeTask first, second;
+        KREQUIRE_TRUE(first.task->initialize_mount_namespace(views.first));
+        KREQUIRE_TRUE(second.task->initialize_mount_namespace(views.second));
+        KREQUIRE_EQ(vfs::vfs_mkdirat(first.task.get(), vfs::AT_FDCWD, "/service", 0755), 0);
+        KREQUIRE_EQ(vfs::vfs_mkdirat(second.task.get(), vfs::AT_FDCWD, "/service", 0755), 0);
+        int const A = first.open("/service/data"), B = second.open("/service/data");
+        KREQUIRE_TRUE(A >= 0 && B >= 0);
+        NativeFile a(vfs::vfs_get_file_retain(first.task.get(), A));
+        NativeFile b(vfs::vfs_get_file_retain(second.task.get(), B));
+        KREQUIRE_TRUE(a && b);
+        KEXPECT_TRUE(a->mount_owner->namespace_owner == views.first);
+        KEXPECT_TRUE(b->mount_owner->namespace_owner == views.second);
+        char const FIRST = 'a', SECOND = 'b';
+        KREQUIRE_EQ(tmpfs::tmpfs_write(a.get(), &FIRST, 1, 0), 1);
+        KREQUIRE_EQ(tmpfs::tmpfs_write(b.get(), &SECOND, 1, 0), 1);
+        vfs::Stat sa{}, sb{};
+        KREQUIRE_EQ(vfs::vfs_statat(first.task.get(), vfs::AT_FDCWD, "/service/data", 0, &sa), 0);
+        KREQUIRE_EQ(vfs::vfs_statat(second.task.get(), vfs::AT_FDCWD, "/service/data", 0, &sb), 0);
+        KEXPECT_NE(sa.st_dev, sb.st_dev);
+        KREQUIRE_EQ(vfs::vfs_symlinkat(first.task.get(), "/service/data", vfs::AT_FDCWD, "/absolute"), 0);
+        KREQUIRE_EQ(vfs::vfs_symlinkat(first.task.get(), "service/../service/data", vfs::AT_FDCWD, "/relative"), 0);
+        for (auto* path : {"/../../service/data", "/absolute", "/relative", "service/./data"}) {
+            vfs::LookupHandle original;
+            KREQUIRE_EQ(task_lookup(*first.task, path, original), 0);
+            KEXPECT_TRUE(original.mount()->namespace_owner == views.first);
+            KEXPECT_EQ(original.authorization().mount_namespace_generation, views.first.generation());
+            vfs::LookupHandle moved(std::move(original));
+            KEXPECT_NULL(original.mount());
+            LookupObservation observation;
+            KEXPECT_EQ(vfs::vfs_consume_lookup(moved, false, observe_lookup, &observation), 0);
+            KEXPECT_EQ(observation.calls, 1U);
+            KEXPECT_EQ(observation.stat.st_dev, sa.st_dev);
+            KEXPECT_EQ(observation.stat.st_ino, sa.st_ino);
+        }
+        auto worker = std::make_unique<Task>();
+        worker->is_thread = true;
+        worker->owner_pid = first.task->pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(*worker, *first.task));
+        vfs::LookupHandle stale;
+        KREQUIRE_EQ(task_lookup(*worker, "/service/data", stale), 0);
+        KREQUIRE_EQ(vfs::vfs_renameat(first.task.get(), vfs::AT_FDCWD, "/service/data", vfs::AT_FDCWD, "/service/renamed"), 0);
+        LookupObservation skipped;
+        KEXPECT_EQ(vfs::vfs_consume_lookup(stale, false, observe_lookup, &skipped), -EAGAIN);
+        KEXPECT_EQ(skipped.calls, 0U);
+        stale.reset();
+        KEXPECT_EQ(vfs::vfs_statat(first.task.get(), vfs::AT_FDCWD, "/service/data", 0, &sa), -ENOENT);
+        KEXPECT_EQ(vfs::vfs_statat(second.task.get(), vfs::AT_FDCWD, "/service/data", 0, &sb), 0);
+        NativeFile read;
+        vfs::File* raw = nullptr;
+        KREQUIRE_EQ(vfs::vfs_open_file_as(*worker, worker->credentials(), "/service/renamed", 0, &raw), 0);
+        read.reset(raw);
+        char byte = 0;
+        KEXPECT_EQ(tmpfs::tmpfs_read(read.get(), &byte, 1, 0), 1);
+        KEXPECT_EQ(byte, FIRST);
+        KEXPECT_EQ(tmpfs::tmpfs_read(b.get(), &byte, 1, 0), 1);
+        KEXPECT_EQ(byte, SECOND);
+        KEXPECT_EQ(vfs::get_mount_count(), HOST_COUNT);
+    }
+    KEXPECT_EQ(mount_ns::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentPath, ForeignDirfdRefusesNamesButKeepsFileCapability) {
+    PrivateMounts views;
+    KREQUIRE_EQ(mount_ns::create_namespace(views.first), 0);
+    KREQUIRE_EQ(mount_ns::create_namespace(views.second), 0);
+    KREQUIRE_EQ(private_mount(views.first, "/"), 0);
+    KREQUIRE_EQ(private_mount(views.second, "/"), 0);
+    NativeTask first, second;
+    KREQUIRE_TRUE(first.task->initialize_mount_namespace(views.first));
+    KREQUIRE_TRUE(second.task->initialize_mount_namespace(views.second));
+    KREQUIRE_EQ(vfs::vfs_mkdirat(first.task.get(), vfs::AT_FDCWD, "/service", 0755), 0);
+    KREQUIRE_EQ(vfs::vfs_mkdirat(second.task.get(), vfs::AT_FDCWD, "/service", 0755), 0);
+    KREQUIRE_TRUE(second.open("/service/data") >= 0);
+    int const OWN = first.open("/service", vfs::O_DIRECTORY), FOREIGN = second.open("/service", vfs::O_DIRECTORY);
+    KREQUIRE_TRUE(OWN >= 0 && FOREIGN >= 0);
+    NativeFile inherited(vfs::vfs_get_file_retain(second.task.get(), FOREIGN));
+    KREQUIRE_TRUE(inherited);
+    vfs::FdReservation descriptor(first.task.get());
+    int const FD = descriptor.install(inherited.get());
+    KREQUIRE_TRUE(FD >= 0);
+    static_cast<void>(inherited.release());
+    KREQUIRE_EQ(first.track(FD), FD);
+    vfs::LookupHandle absent;
+    KEXPECT_EQ(task_lookup(*first.task, "data", absent, FD), -EXDEV);
+    KEXPECT_NULL(absent.mount());
+    vfs::Stat stat{};
+    KEXPECT_EQ(vfs::vfs_statat(first.task.get(), FD, "data", 0, &stat), -EXDEV);
+    KEXPECT_EQ(vfs::vfs_mkdirat(first.task.get(), FD, "escape", 0755), -EXDEV);
+    KEXPECT_EQ(vfs::vfs_statat(second.task.get(), vfs::AT_FDCWD, "/service/escape", 0, &stat), -ENOENT);
+    KEXPECT_EQ(vfs::vfs_statat(first.task.get(), OWN, ".", 0, &stat), 0);
+    NativeFile explicit_file(vfs::vfs_get_file_retain(first.task.get(), FD));
+    KREQUIRE_TRUE(explicit_file);
+    KEXPECT_EQ(vfs::vfs_fstat_file(explicit_file.get(), &stat), 0);
+    KEXPECT_TRUE(explicit_file->mount_owner->namespace_owner == views.second);
+}
+
+KTEST(CompartmentPath, ClosedAndUnsupportedLookupNeverFallsBackToHost) {
+    auto const HOST_COUNT = vfs::get_mount_count();
+    PrivateMounts views;
+    KREQUIRE_EQ(mount_ns::create_namespace(views.first), 0);
+    KREQUIRE_EQ(private_mount(views.first, "/"), 0);
+    NativeTask subject;
+    KREQUIRE_TRUE(subject.task->initialize_mount_namespace(views.first));
+    KREQUIRE_TRUE(subject.open("/data") >= 0);
+    KREQUIRE_EQ(vfs::vfs_mkdirat(subject.task.get(), vfs::AT_FDCWD, "/wki", 0755), 0);
+    vfs::LookupHandle ordinary;
+    KEXPECT_EQ(task_lookup(*subject.task, "/wki", ordinary), 0);
+    ordinary.reset();
+    vfs::LookupHandle compatibility;
+    KEXPECT_EQ(vfs::vfs_acquire_lookup(subject.task.get(), vfs::AT_FDCWD, "/data", vfs::LookupIntent::STAT,
+                                       vfs::LookupFollowPolicy::FOLLOW_FINAL, false, false, &compatibility, 0, true),
+               -ENOTSUP);
+    KEXPECT_NULL(compatibility.mount());
+    std::snprintf(subject.task->wki_submitter_hostname.data(), subject.task->wki_submitter_hostname.size(), "goal39-foreign-submitter");
+    KEXPECT_EQ(task_lookup(*subject.task, "/data", compatibility), -ENOTSUP);
+    KEXPECT_EQ(vfs::get_mount_count(), HOST_COUNT);
+    subject.task->wki_submitter_hostname.fill('\0');
+    vfs::LookupHandle pinned;
+    KREQUIRE_EQ(task_lookup(*subject.task, "/data", pinned), 0);
+    KEXPECT_EQ(vfs::retire_mount_namespace(views.first), -EBUSY);
+    LookupObservation skipped;
+    KEXPECT_EQ(vfs::vfs_consume_lookup(pinned, false, observe_lookup, &skipped), -EIDRM);
+    KEXPECT_EQ(skipped.calls, 0U);
+    KEXPECT_EQ(task_lookup(*subject.task, "/data", compatibility), -EIDRM);
+    KEXPECT_NULL(compatibility.mount());
+    KEXPECT_EQ(vfs::get_mount_count(), HOST_COUNT);
+}
+
+KTEST(CompartmentPath, NativeCoveredCrossingAndMissingEdgeRefusal) {
+    PrivateMounts views;
+    KREQUIRE_EQ(mount_ns::create_namespace(views.first), 0);
+    KREQUIRE_EQ(mount_ns::create_namespace(views.second), 0);
+    KREQUIRE_EQ(private_mount(views.first, "/"), 0);
+    KREQUIRE_EQ(private_mount(views.second, "/"), 0);
+    NativeTask first, second;
+    KREQUIRE_TRUE(first.task->initialize_mount_namespace(views.first));
+    KREQUIRE_TRUE(second.task->initialize_mount_namespace(views.second));
+    KREQUIRE_EQ(vfs::vfs_mkdirat(first.task.get(), vfs::AT_FDCWD, "/child", 0755), 0);
+    KREQUIRE_EQ(vfs::vfs_mkdirat(second.task.get(), vfs::AT_FDCWD, "/child", 0755), 0);
+    KREQUIRE_EQ(vfs::vfs_mkdirat(first.task.get(), vfs::AT_FDCWD, "/uncovered", 0755), 0);
+    KREQUIRE_TRUE(first.open("/data") >= 0);
+    auto root = scoped_mount(views.first, "/");
+    KREQUIRE_TRUE(root);
+    auto const CREDENTIALS = first.task->credentials();
+    tmpfs::TmpfsLookupHandle backend;
+    KREQUIRE_EQ(tmpfs::tmpfs_acquire_lookup(CREDENTIALS, native_root(root.get()), "/child", &backend), 0);
+    NativeFile cover(tmpfs::tmpfs_pin_directory_lookup(CREDENTIALS, backend));
+    KREQUIRE_TRUE(cover);
+    KREQUIRE_TRUE(vfs::retain_mount_for_open_file(root.get()));
+    cover->mount_owner = root.get();
+    cover->mount_dev_id = root->dev_id;
+    cover->mount_generation = vfs::mount_table_generation_snapshot();
+    KREQUIRE_EQ(vfs::prepare_mount_filesystem("/child", "tmpfs", nullptr, 0, nullptr, nullptr, nullptr, &views.pending_first,
+                                              vfs::MountPathKind::RETAINED_PHYSICAL, views.first),
+                0);
+    KREQUIRE_EQ(vfs::publish_prepared_mount(&views.pending_first, "/child", cover.get()), 0);
+    vfs::finish_prepared_mount(&views.pending_first);
+    cover.reset();
+    KREQUIRE_EQ(private_mount(views.first, "/uncovered"), 0);
+    vfs::LookupHandle missing;
+    KEXPECT_EQ(task_lookup(*first.task, "/uncovered", missing), -EXDEV);
+    KEXPECT_NULL(missing.mount());
+    int const CHILD_FD = first.open("/child/data");
+    KREQUIRE_EQ(CHILD_FD < 0 ? CHILD_FD : 0, 0);
+    auto child = scoped_mount(views.first, "/child");
+    KREQUIRE_TRUE(child);
+    vfs::Stat stat{};
+    KEXPECT_EQ(vfs::vfs_statat(first.task.get(), vfs::AT_FDCWD, "/child/data", 0, &stat), 0);
+    KEXPECT_EQ(stat.st_dev, child->dev_id);
+    KEXPECT_EQ(vfs::vfs_statat(first.task.get(), vfs::AT_FDCWD, "/child/../data", 0, &stat), 0);
+    KEXPECT_EQ(stat.st_dev, root->dev_id);
+    auto sibling = scoped_mount(views.second, "/");
+    KREQUIRE_TRUE(sibling);
+    KEXPECT_EQ(vfs::vfs_statat(second.task.get(), vfs::AT_FDCWD, "/child", 0, &stat), 0);
+    KEXPECT_EQ(stat.st_dev, sibling->dev_id);
+    KEXPECT_EQ(vfs::vfs_statat(second.task.get(), vfs::AT_FDCWD, "/child/data", 0, &stat), -ENOENT);
+    // The backend lookup's root pin must drain before namespace retirement.
+    backend = {};
+}
 
 KTEST(CompartmentMount, SamePathsHaveDistinctBackingAndCacheIdentity) {
     auto const NS_BASELINE = mount_ns::live_namespace_count();

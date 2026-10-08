@@ -1,9 +1,9 @@
 # WOS service compartment design
 
 Goal39 is in progress. Profile preparation, private native SysV IPC namespace
-ownership/lookup and private native mount-table ownership are implemented.
-No public compartment creation syscall, launcher, Task mount/PID view or
-network/WKI gate is enabled. Independent
+ownership/lookup, private native mount-table ownership and Task native mount
+lookup/consumption are implemented. No public compartment creation syscall,
+launcher, PID view or complete network/WKI gate is enabled. Independent
 service isolation and all ten goal criteria remain unqualified. Goal28 remains
 incomplete at its committed wire-codec checkpoint while this work proceeds.
 
@@ -52,9 +52,10 @@ membership and aggregate budgets cannot be reset by entering a compartment.
 The mount table now partitions native rows by exact retained namespace, while
 table generations, pivot publication and storage remain globally serialized.
 Retained native root/cwd views already enforce object identity and read-only/
-nosuid restrictions. Task selection, LookupHandle consumption, path/cache keys,
-mount crossings, readdir and procfs still need explicit subject namespace flow.
-No Task can enter a private mount view through this checkpoint. Shared backend
+nosuid restrictions. Task ownership, native component lookup and retained lookup
+consumption now carry the exact subject mount namespace. Mount administration,
+remaining compatibility helpers, readdir and procfs still require integration
+before public creation can be enabled. Shared backend
 lifetime must remain distinct from visible mount attachment lifetime before
 cloning existing mount attachments can be supported.
 
@@ -166,8 +167,49 @@ Native fixtures exercise actual separate tmpfs contents at identical paths,
 both cache keys, foreign covered-directory refusal, private reservations and
 closure, host-only enumeration, sibling descendant independence, pivot path/
 cover ownership, mount-count exhaustion rollback and File capability drain.
-They call trusted native mount/backend APIs. Task pathwalk, hostile user paths,
-public creation and full service lifecycles remain required follow-on evidence.
+They call trusted native mount/backend APIs. The Task path fixtures described
+below add actual named lookup; hostile user execution, public creation and full
+service lifecycles remain required follow-on evidence.
+
+## Task mount ownership and native pathname lookup
+
+Task appends an immutable retained mount namespace installed only on an active,
+unpublished process. Threads and exec workers resolve their retained filesystem
+owner; an unbound thread fails with ESRCH. Existing resource inheritance installs
+the child's exact namespace before copying limits/service membership. Exec keeps
+the same process owner. No userspace integer can be converted into a namespace
+reference, and there is no public compartment entry or launcher yet.
+
+Native component walking captures the subject's nonreused namespace generation
+with its credential/root/cwd authorization and selects mounts in that exact view.
+The selected MountRef owns the namespace throughout handle move and consumption.
+Single and pair consumers reselect its exact namespace, check closure and match
+the captured generation before backend effects; a different executing worker's
+host view cannot select the pathname. Global mount/VFS/search epochs and backend
+DAC, object identity, covered-parent proofs and read-only/nosuid checks remain.
+Covered-edge validation also selects its parent in the child's retained view.
+
+Only native TMPFS private mounts are admitted currently. Private lookup never
+falls through to host text resolution, synthetic mount/WKI ancestors, procfs FD
+link probes or host mount discovery. Unsupported physical export requests and
+remote routing fail with ENOTSUP before those effects. A local `/wki` directory
+is an ordinary private name. A missing native covered edge returns EXDEV rather
+than bypassing containment. Public mount/pivot/root/procfs and the remaining WKI,
+process and network consumers are not yet a qualified compartment boundary.
+
+Foreign retained root/cwd/dirfd anchors cannot select names in another mount
+view. An explicitly inherited File retains its own read/write/stat capability;
+the launcher will report such grants. Closing a namespace denies new named
+lookup and consuming its old lookup handles (EIDRM), while existing Files keep
+backing alive until explicit close and retirement retry. Dropping a Task namespace
+reference never performs implicit heavy mount teardown.
+
+Native fixtures use real unpublished Tasks with production mkdirat, openat,
+statat, symlinkat, renameat, child/thread ownership, moved lookup consumption and
+read-only exec-input open. They check same-path sibling backing, dotdot/links,
+stale rename handles, foreign dirfd refusal with retained fstat capability,
+closure, covered crossings and missing-edge refusal. These are native kernel
+integration tests; they are not user-process escape/service-lifecycle campaigns.
 
 ## Verification checkpoint
 
