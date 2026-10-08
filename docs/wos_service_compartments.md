@@ -1,8 +1,9 @@
 # WOS service compartment design
 
-Goal39 is in progress. Profile preparation and private native SysV IPC namespace
-ownership/lookup are implemented. No public compartment creation syscall,
-launcher, independent mount/PID view or network/WKI gate is enabled. Independent
+Goal39 is in progress. Profile preparation, private native SysV IPC namespace
+ownership/lookup and private native mount-table ownership are implemented.
+No public compartment creation syscall, launcher, Task mount/PID view or
+network/WKI gate is enabled. Independent
 service isolation and all ten goal criteria remain unqualified. Goal28 remains
 incomplete at its committed wire-codec checkpoint while this work proceeds.
 
@@ -48,12 +49,14 @@ membership and aggregate budgets cannot be reset by entering a compartment.
 
 ## Native integration requirements
 
-The current mount table, mount/pivot generations and mount lookup caches are
-global. Retained native root/cwd views already enforce object identity and
-read-only/nosuid restrictions, but do not create independent mount registries.
-Private views need explicit namespace ownership across publication, lookup,
-mount crossings, caches, readdir, procfs, detach and pivot. Shared backend
-lifetime must remain distinct from visible mount attachment lifetime.
+The mount table now partitions native rows by exact retained namespace, while
+table generations, pivot publication and storage remain globally serialized.
+Retained native root/cwd views already enforce object identity and read-only/
+nosuid restrictions. Task selection, LookupHandle consumption, path/cache keys,
+mount crossings, readdir and procfs still need explicit subject namespace flow.
+No Task can enter a private mount view through this checkpoint. Shared backend
+lifetime must remain distinct from visible mount attachment lifetime before
+cloning existing mount attachments can be supported.
 
 Kernel Task IDs remain internal. Public PID/TID, parent, session and process
 group values need one requester-aware translation policy. Safe lookup retains
@@ -121,6 +124,50 @@ Physical segment allocation/release retains the existing SysV lock/context
 behavior. The new namespace's final release never performs heavy cleanup under
 that lock. Namespace-init policy, namespace-local stat PIDs, aggregate IPC
 budgets and real user mapping/futex tests remain integration work.
+
+## Private native mount ownership
+
+`vfs/mount_namespace.*` has a separate fixed pool of 64 move-only namespace
+owners. Empty explicitly selects host. Exact refs pin immutable, nonreused
+generations; retention/drop never allocates or invokes a backend finalizer.
+There is no generation-to-reference or integer join interface. Each private
+view admits at most 64 published mounts. Mount rows and initialization
+reservations retain their namespace until rollback or exact backend teardown.
+
+Trusted kernel mount APIs accept an explicit namespace; default callers select
+host, independent of the executing task. Private creation accepts admitted
+physical paths and tmpfs only. Private root tmpfs allocates its own tree rather
+than borrowing the global boot root. XFS, FAT32, devfs, procfs and remote private
+mounts reject before initialization. Existing local block writer leases exclude
+remote writers but allow overlapping local writers: admitting private XFS needs
+a separate physical-device/shared-backend ownership contract. This checkpoint
+does not extend or qualify that contract.
+
+Publication, path reservations, longest-prefix lookup, both mount caches,
+covered-directory edges, descendant checks, enumeration and pivot compare the
+exact namespace. Cache entries include its nonreused generation and revalidate
+the global mount generation under mount_lock before dereferencing raw rows.
+Private mounts are absent from host enumeration and automatic WKI discovery;
+their mount/unmount operations do not publish global WKI storage events. Only
+the exact pivot namespace can reopen its pending publication epoch. Global
+serialization and sibling cache invalidation remain; sibling paths/backends do
+not change. A teardown already in progress still blocks pivot to keep shared
+row storage stable while heavy close runs unlocked.
+
+`retire_mount_namespace` closes private lookup/publication admission under
+mount_lock and drains exact rows in the existing root-last shutdown order.
+Backend/File close runs unlocked. Bounded ref drain or live File/initialization
+pins return EBUSY with backing retained for retry; intentionally held Files
+remain usable. A namespace ref's final drop never implicitly destroys a mount.
+The future namespace-init coordinator must close task capabilities and retry
+drain; host namespace retirement through this hook returns EINVAL.
+
+Native fixtures exercise actual separate tmpfs contents at identical paths,
+both cache keys, foreign covered-directory refusal, private reservations and
+closure, host-only enumeration, sibling descendant independence, pivot path/
+cover ownership, mount-count exhaustion rollback and File capability drain.
+They call trusted native mount/backend APIs. Task pathwalk, hostile user paths,
+public creation and full service lifecycles remain required follow-on evidence.
 
 ## Verification checkpoint
 

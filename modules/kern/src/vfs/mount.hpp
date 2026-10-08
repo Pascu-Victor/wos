@@ -6,6 +6,7 @@
 #include <dev/block_device.hpp>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
+#include <vfs/mount_namespace.hpp>
 
 namespace ker::mod::security {
 class Snapshot;
@@ -19,11 +20,12 @@ constexpr unsigned long MOUNT_FLAG_NOSUID = 2;
 
 // Mount point structure
 struct MountPoint {
-    const char* path{};               // Mount path (e.g., "/mnt/disk0")
-    size_t path_len{};                // Cached strlen(path) for hot mount lookups
-    const char* fstype{};             // Filesystem type (e.g., "fat32", "tmpfs")
-    FSType fs_type{};                 // Filesystem type enum
-    ker::dev::BlockDevice* device{};  // Associated block device
+    mount_ns::NamespaceRef namespace_owner{};  // Immutable exact view; row pins through backend teardown.
+    const char* path{};                        // Mount path (e.g., "/mnt/disk0")
+    size_t path_len{};                         // Cached strlen(path) for hot mount lookups
+    const char* fstype{};                      // Filesystem type (e.g., "fat32", "tmpfs")
+    FSType fs_type{};                          // Filesystem type enum
+    ker::dev::BlockDevice* device{};           // Associated block device
     ker::dev::BlockWriterLease block_writer_lease{};
     FileOperations* fops{};  // Filesystem operations
     void* private_data{};    // Filesystem-specific data
@@ -96,17 +98,25 @@ struct PreparedMount {
 enum class MountPathKind { TASK_VISIBLE, RETAINED_PHYSICAL };
 
 // Mount point management
+// Private scopes require admitted physical paths and initially support native
+// TMPFS only. Default arguments explicitly select the host view; these APIs
+// never select a namespace from the executing task.
 // RETAINED_PHYSICAL copies an admitted LookupHandle path without consulting
 // the ambient task. Its caller must revalidate that lookup before publication.
 auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device, unsigned long flags, const char* data,
                               void* initial_private_data, FileOperations* initial_fops, PreparedMount* out,
-                              MountPathKind path_kind = MountPathKind::TASK_VISIBLE) -> int;
+                              MountPathKind path_kind = MountPathKind::TASK_VISIBLE, const mount_ns::NamespaceRef& scope = {}) -> int;
 auto publish_prepared_mount(PreparedMount* prepared, const char* expected_physical_path = nullptr, File* covered_directory = nullptr)
     -> int;
 void finish_prepared_mount(PreparedMount* prepared);
 auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device, unsigned long flags = 0,
-                      const char* data = nullptr, void* initial_private_data = nullptr, FileOperations* initial_fops = nullptr) -> int;
-auto unmount_filesystem(const char* path) -> int;
+                      const char* data = nullptr, void* initial_private_data = nullptr, FileOperations* initial_fops = nullptr,
+                      const mount_ns::NamespaceRef& scope = {}) -> int;
+auto unmount_filesystem(const char* path, const mount_ns::NamespaceRef& scope = {}) -> int;
+// Close new lookup/publication and drain exact private rows leaf-first. EBUSY
+// keeps backing owners alive for retry after explicit capabilities are dropped.
+// Empty host scope cannot be retired through this interface.
+auto retire_mount_namespace(const mount_ns::NamespaceRef& scope) -> int;
 // Unmount only the exact mount whose private_data still matches the expected
 // owner. This prevents deferred teardown from removing a replacement mounted
 // later at the same path.
@@ -116,7 +126,8 @@ auto unmount_filesystem_if_dev_id(const char* path, uint32_t expected_dev_id) ->
 // stable across pivot/rebase and is the preferred deferred-teardown identity.
 auto unmount_filesystem_by_private_data(const void* expected_private_data) -> int;
 auto shutdown_unmount_all_exact(const char* root_path) -> int;
-auto find_mount_point(const char* path, size_t known_path_len = UNKNOWN_MOUNT_PATH_LEN) -> MountRef;
+auto find_mount_point(const char* path, size_t known_path_len = UNKNOWN_MOUNT_PATH_LEN, const mount_ns::NamespaceRef& scope = {})
+    -> MountRef;
 // Exact internal owner lookup and physical remote descendant selection. These
 // retain native rows without resolving a logical path through a task root.
 auto retain_mount_by_private_data(const void* private_data) -> MountRef;
@@ -134,7 +145,8 @@ auto mount_table_generation_snapshot() -> uint64_t;
 // Copy the current path of an exact retained mount; failure leaves output unchanged.
 auto copy_mount_path_exact(const MountPoint* mount, char* out, size_t capacity) -> int;
 auto mounted_block_device_overlaps(const ker::dev::BlockDevice* device) -> bool;
-auto configure_mount_point_exact(const char* path, FSType expected_type, void* private_data, FileOperations* fops) -> bool;
+auto configure_mount_point_exact(const char* path, FSType expected_type, void* private_data, FileOperations* fops,
+                                 const mount_ns::NamespaceRef& scope = {}) -> bool;
 // Candidate and retired native references must outlive the namespace-locked
 // pivot, including the task-root update and reopening of the mount epoch.
 class PivotMountReferences {
@@ -145,14 +157,15 @@ class PivotMountReferences {
     auto operator=(const PivotMountReferences&) -> PivotMountReferences& = delete;
 
    private:
-    friend auto remap_mounts_for_pivot(const char*, const char*, const ker::mod::security::Snapshot*, PivotMountReferences*) -> int;
+    friend auto remap_mounts_for_pivot(const char*, const char*, const ker::mod::security::Snapshot*, PivotMountReferences*,
+                                       const mount_ns::NamespaceRef&) -> int;
     void* state_ = nullptr;
 };
 // Credentials/references are supplied together by the namespace-locked VFS
 // transaction. The legacy two-argument caller does not prepare new covers.
 auto remap_mounts_for_pivot(const char* new_root, const char* put_old, const ker::mod::security::Snapshot* credentials = nullptr,
-                            PivotMountReferences* references = nullptr) -> int;
-void rebase_wki_mounts_for_new_root(const char* new_root);
+                            PivotMountReferences* references = nullptr, const mount_ns::NamespaceRef& scope = {}) -> int;
+void rebase_wki_mounts_for_new_root(const char* new_root, const mount_ns::NamespaceRef& scope = {});
 
 // Resolve path through the current task's root prefix (same as mount_filesystem
 // stores internally).  Callers that need to find_mount_point a raw path AFTER
@@ -163,9 +176,9 @@ auto resolve_mount_path(const char* path, char* out, size_t outsize) -> int;
 auto fstype_to_enum(const char* fstype) -> FSType;
 
 // D9: Iteration API for auto-discovery of exportable mount points
-auto get_mount_count() -> size_t;
-auto get_mount_at(size_t index) -> MountRef;
-auto get_mount_snapshot_at(size_t index, MountSnapshot* out) -> bool;
+auto get_mount_count(const mount_ns::NamespaceRef& scope = {}) -> size_t;
+auto get_mount_at(size_t index, const mount_ns::NamespaceRef& scope = {}) -> MountRef;
+auto get_mount_snapshot_at(size_t index, MountSnapshot* out, const mount_ns::NamespaceRef& scope = {}) -> bool;
 void put_mount_point(MountPoint* mount);
 auto retain_mount_for_open_file(MountPoint* mount) -> bool;
 void release_mount_from_open_file(MountPoint* mount);
@@ -173,6 +186,7 @@ void release_mount_from_open_file(MountPoint* mount);
 #ifdef WOS_SELFTEST
 auto mount_point_pivot_busy_for_test(MountPoint* mount) -> bool;
 auto mount_lock_available_for_test() -> bool;
+auto mount_pivot_pending_for_test() -> bool;
 auto mount_selftest_descendant_lifetime(bool disk) -> bool;
 auto mount_selftest_pivot_covers(bool disk) -> bool;
 auto mount_selftest_identity_exhaustion() -> bool;

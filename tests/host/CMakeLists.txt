@@ -1879,6 +1879,11 @@ wos_add_unit_test(ipc_namespace_test
     KERN_SOURCES ${WOS_KERN_SRC}/platform/sched/ipc_namespace.cpp
 )
 
+wos_add_unit_test(mount_namespace_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/mount_namespace_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/vfs/mount_namespace.cpp
+)
+
 wos_add_unit_test(vfs_advisory_client_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vfs_advisory_client_test.cpp
 )

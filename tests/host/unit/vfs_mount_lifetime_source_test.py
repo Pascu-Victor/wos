@@ -216,13 +216,13 @@ def test_mount_path_scratch_is_fully_produced_before_use() -> None:
     ):
         producer = ("int const PATH_RET = path_kind == MountPathKind::RETAINED_PHYSICAL"
                     if name == "mount_filesystem" else
-                    "int const PATH_RET = resolve_mount_path(path, resolved.data(), resolved.size());")
+                    "int const PATH_RET = scope.is_host() ? resolve_mount_path(path, resolved.data(), resolved.size())")
         gate = "if (PATH_RET < 0)"
         require_order(body, resolved_decl, producer, f"{name} resolver output")
         require_order(body, producer, gate, f"{name} resolver failure gate")
         require_order(body, gate, first_consumer, f"{name} consume only after success")
         before_gate = body[: body.find(gate)]
-        producers = 2 if name == "mount_filesystem" else 1
+        producers = 2  # Physical copy and host-root resolution each fully produce output.
         if before_gate.count("resolved.data()") != producers or before_gate.count("resolved.size()") != producers:
             fail(f"{name} must not inspect resolver output before its failure gate")
         if name == "mount_filesystem":
@@ -238,14 +238,14 @@ def test_mount_path_scratch_is_fully_produced_before_use() -> None:
 
 
 def test_mount_lookup_returns_raii_refs() -> None:
-    header = MOUNT_HPP.read_text()
+    header = normalized_body(MOUNT_HPP.read_text())
     required = [
         "class MountRef",
         "std::atomic<uint32_t> refs{0}",
         "std::atomic<uint32_t> open_files{0}",
         "std::atomic<bool> retiring{false}",
-        "auto find_mount_point(const char* path, size_t known_path_len = UNKNOWN_MOUNT_PATH_LEN) -> MountRef;",
-        "auto get_mount_at(size_t index) -> MountRef;",
+        "auto find_mount_point(const char* path, size_t known_path_len = UNKNOWN_MOUNT_PATH_LEN, const mount_ns::NamespaceRef& scope = {}) -> MountRef;",
+        "auto get_mount_at(size_t index, const mount_ns::NamespaceRef& scope = {}) -> MountRef;",
         "void put_mount_point(MountPoint* mount);",
     ]
     missing = [token for token in required if token not in header]
@@ -278,7 +278,7 @@ def test_open_files_pin_mount_through_backend_close() -> None:
         ["mount_lock.lock()", "mount->open_files.load(std::memory_order_acquire)", "mount->open_files.store(OPEN_FILES - 1", "mount_lock.unlock()"],
         "open-file mount release",
     )
-    require_sequence(destroy, ["f->fops->vfs_close(f)", "finish_file_close(f, CLOSE_MAY_CHANGE_METADATA, close_result)"],
+    require_sequence(destroy, ["f->fops->vfs_close(f)", "finish_file_close(f, CLOSE_MAY_CHANGE_METADATA, close_result, &owner)"],
                      "backend close before shared finalization")
     finish = function_body(core, "finish_file_close")
     require_sequence(finish, ["MountPoint* const MOUNT_OWNER = f->mount_owner", "f->mount_owner = nullptr",
@@ -351,7 +351,7 @@ def test_mount_initialization_reserves_exact_path() -> None:
         "std::array<MountInitialization, MAX_MOUNT_INITIALIZATIONS> mount_initializations{}",
         "mount_path_initializing_locked",
         "MountInitializationReservation reservation{}",
-        "state->reservation.acquire(mount->path, PIVOT_EPOCH)",
+        "state->reservation.acquire(mount->path, PIVOT_EPOCH, scope)",
         "state->reservation.active_locked()",
         "state->reservation.commit_locked()",
     ]
@@ -368,13 +368,13 @@ def test_remote_mount_is_configured_atomically() -> None:
     prepare_body = function_body(source, "prepare_mount_filesystem")
     publish_body = function_body(source, "publish_prepared_mount_with_identity")
     prepare_required = ["mount->private_data = initial_private_data", "mount->fops = initial_fops"]
-    publish_required = ["state->reservation.active_locked()", "mount_path_occupied_locked(mount->path)", "mounts.push_back(mount)"]
+    publish_required = ["state->reservation.active_locked()", "mount_path_occupied_locked(mount->path, mount->namespace_owner)", "mounts.push_back(mount)"]
     missing = [token for token in prepare_required if token not in prepare_body]
     missing.extend(token for token in publish_required if token not in publish_body)
     if missing:
         fail("remote mount publication is missing atomic owner/path tokens: " + ", ".join(missing))
     require_order(prepare_body, "mount->private_data = initial_private_data", "mount->fops = initial_fops", "remote owner setup")
-    require_order(publish_body, "mount_path_occupied_locked(mount->path)", "mounts.push_back(mount)", "duplicate rejection")
+    require_order(publish_body, "mount_path_occupied_locked(mount->path, mount->namespace_owner)", "mounts.push_back(mount)", "duplicate rejection")
 
     remote_mount = function_body(REMOTE_VFS_CPP.read_text(), "mount_vfs_proxy_lane")
     if 'mount_filesystem(local_mount_path, "remote", nullptr, 0, nullptr, state, &g_remote_vfs_fops)' not in remote_mount:
@@ -600,17 +600,17 @@ def test_mount_descendants_and_retiring_ancestors_share_publication_lock() -> No
     assert "parent[0] == '/' && parent[1] == '\\0'" in relation and "child[LENGTH] == '/'" in relation
     for name, subject in (("unmount_filesystem_impl", "mp"), ("unmount_filesystem_by_private_data", "MP")):
         body = function_body(source, name)
-        require_order(body, f"mount_path_has_descendants_locked({subject}->path)",
+        require_order(body, f"mount_path_has_descendants_locked({subject}->path, {subject}->namespace_owner)",
                       f"{subject}->retiring.store(true", name)
     teardown = function_body(source, "complete_retired_mount_teardown")
-    require_order(teardown, "mount_path_has_descendants_locked(mount->path)", "destroy_mount_private_data", "shutdown parent guard")
+    require_order(teardown, "mount_path_has_descendants_locked(mount->path, mount->namespace_owner)", "destroy_mount_private_data", "shutdown parent guard")
     for name, after in (("prepare_mount_filesystem", "new (std::nothrow) PreparedMountState"),
                         ("publish_prepared_mount_with_identity", "mounts.push_back(mount)")):
         body = function_body(source, name)
         require_order(body, "mount_lock.lock()", "mount_path_has_retiring_ancestor_locked", name)
         require_order(body, "mount_path_has_retiring_ancestor_locked", after, name)
     reservation = function_body(source[source.index("class MountInitializationReservation"):], "acquire")
-    require_order(reservation, "mount_path_has_retiring_ancestor_locked(path)", "initialization.active = true", "reservation race")
+    require_order(reservation, "mount_path_has_retiring_ancestor_locked(path, scope)", "initialization.active = true", "reservation race")
     fixture = function_body(source, "mount_selftest_descendant_lifetime")
     for token in ("deny_parent()", "RETIRING_GENERATION", "raced.acquire", "complete_retired_mount_teardown(cleanup.parent",
                   "unmount_filesystem(CHILD)", "std::memcmp(read.data(), \"seed\", 4)"):

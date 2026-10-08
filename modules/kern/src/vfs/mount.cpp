@@ -38,6 +38,7 @@ namespace ker::vfs {
 namespace {
 ker::util::SmallVec<MountPoint*, 8> mounts;
 struct MountInitialization {
+    mount_ns::NamespaceRef namespace_owner{};
     std::array<char, MOUNT_PATH_MAX> path{};
     bool active = false;
 };
@@ -49,6 +50,8 @@ std::atomic<uint64_t> mount_generation{1};
 // this odd until task roots are updated and rebase_wki_mounts_for_new_root()
 // completes the namespace transition.
 std::atomic<uint64_t> mount_pivot_epoch{2};
+// Protected by mount_lock; only the exact pivot owner may reopen the epoch.
+uint64_t pivot_namespace_generation = 0;
 // Zero is exhausted. IDs also bind exact unmount/export retirement requests,
 // so no published identity may be reused after the last uint32_t value.
 uint32_t next_dev_id = 1;
@@ -152,6 +155,7 @@ struct MountLookupCacheEntry {
     std::array<char, MOUNT_PATH_MAX> path{};
     uint64_t hash = 0;
     uint64_t generation = 0;
+    uint64_t namespace_generation = 0;
     uint64_t last_used = 0;
     MountPoint* mount = nullptr;
     size_t path_len = 0;
@@ -168,6 +172,7 @@ struct MountRootFallbackCacheEntry {
     std::array<char, MOUNT_ROOT_COMPONENT_CACHE_MAX> component{};
     uint64_t hash = 0;
     uint64_t generation = 0;
+    uint64_t namespace_generation = 0;
     uint64_t last_used = 0;
     MountPoint* root_mount = nullptr;
     size_t component_len = 0;
@@ -394,24 +399,33 @@ auto mount_index_locked(const MountPoint* mount) -> size_t {
     return MOUNT_INDEX_NONE;
 }
 
-auto mount_path_occupied_locked(const char* path) -> bool {
+auto mount_at_visible_index_locked(const mount_ns::NamespaceRef& scope, size_t index) -> MountPoint* {
+    for (auto* mount : mounts) {
+        if (mount == nullptr || mount->namespace_owner != scope) continue;
+        if (index == 0) return mount;
+        --index;
+    }
+    return nullptr;
+}
+
+auto mount_path_occupied_locked(const char* path, const mount_ns::NamespaceRef& scope) -> bool {
     if (path == nullptr) {
         return false;
     }
     for (auto* mount : mounts) {
-        if (mount != nullptr && mount->path != nullptr && std::strcmp(mount->path, path) == 0) {
+        if (mount != nullptr && mount->namespace_owner == scope && mount->path != nullptr && std::strcmp(mount->path, path) == 0) {
             return true;
         }
     }
     return false;
 }
 
-auto mount_path_initializing_locked(const char* path) -> bool {
+auto mount_path_initializing_locked(const char* path, const mount_ns::NamespaceRef& scope) -> bool {
     if (path == nullptr) {
         return false;
     }
     for (const auto& initialization : mount_initializations) {
-        if (initialization.active && std::strcmp(initialization.path.data(), path) == 0) {
+        if (initialization.active && initialization.namespace_owner == scope && std::strcmp(initialization.path.data(), path) == 0) {
             return true;
         }
     }
@@ -427,17 +441,20 @@ auto mount_path_is_descendant(const char* child, const char* parent) -> bool {
     return std::strncmp(child, parent, LENGTH) == 0 && child[LENGTH] == '/';
 }
 
-auto mount_path_has_descendants_locked(const char* path) -> bool {
+auto mount_path_has_descendants_locked(const char* path, const mount_ns::NamespaceRef& scope) -> bool {
     for (auto* mount : mounts)
-        if (mount != nullptr && mount_path_is_descendant(mount->path, path)) return true;
+        if (mount != nullptr && mount->namespace_owner == scope && mount_path_is_descendant(mount->path, path)) return true;
     for (const auto& initialization : mount_initializations)
-        if (initialization.active && mount_path_is_descendant(initialization.path.data(), path)) return true;
+        if (initialization.active && initialization.namespace_owner == scope && mount_path_is_descendant(initialization.path.data(), path))
+            return true;
     return false;
 }
 
-auto mount_path_has_retiring_ancestor_locked(const char* path) -> bool {
+auto mount_path_has_retiring_ancestor_locked(const char* path, const mount_ns::NamespaceRef& scope) -> bool {
     for (auto* mount : mounts)
-        if (mount != nullptr && mount->retiring.load(std::memory_order_acquire) && mount_path_is_descendant(path, mount->path)) return true;
+        if (mount != nullptr && mount->namespace_owner == scope && mount->retiring.load(std::memory_order_acquire) &&
+            mount_path_is_descendant(path, mount->path))
+            return true;
     return false;
 }
 
@@ -448,7 +465,7 @@ class MountInitializationReservation {
     auto operator=(const MountInitializationReservation&) -> MountInitializationReservation& = delete;
     ~MountInitializationReservation() { reset(); }
 
-    auto acquire(const char* path, uint64_t pivot_epoch) -> int {
+    auto acquire(const char* path, uint64_t pivot_epoch, const mount_ns::NamespaceRef& scope = {}) -> int {
         if (path == nullptr || index_ != MOUNT_INDEX_NONE) {
             return -EINVAL;
         }
@@ -458,8 +475,8 @@ class MountInitializationReservation {
         }
 
         mount_lock.lock();
-        if (mount_pivot_epoch.load(std::memory_order_acquire) != pivot_epoch || mount_path_occupied_locked(path) ||
-            mount_path_initializing_locked(path) || mount_path_has_retiring_ancestor_locked(path)) {
+        if (mount_pivot_epoch.load(std::memory_order_acquire) != pivot_epoch || scope.closed() || mount_path_occupied_locked(path, scope) ||
+            mount_path_initializing_locked(path, scope) || mount_path_has_retiring_ancestor_locked(path, scope)) {
             mount_lock.unlock();
             return -EBUSY;
         }
@@ -467,6 +484,11 @@ class MountInitializationReservation {
             auto& initialization = mount_initializations.at(i);
             if (initialization.active) {
                 continue;
+            }
+            int const RETAIN = scope.retain(initialization.namespace_owner);
+            if (RETAIN != 0) {
+                mount_lock.unlock();
+                return RETAIN;
             }
             std::memcpy(initialization.path.data(), path, PATH_LEN + 1);
             initialization.active = true;
@@ -486,6 +508,7 @@ class MountInitializationReservation {
         }
         auto& initialization = mount_initializations.at(index_);
         initialization.active = false;
+        initialization.namespace_owner.reset();
         initialization.path.at(0) = '\0';
         index_ = MOUNT_INDEX_NONE;
     }
@@ -596,7 +619,8 @@ auto mount_path_matches(const MountPoint* mount, const char* path, size_t path_l
     return std::strncmp(path, mount->path, MOUNT_LEN) == 0 && (path[MOUNT_LEN] == '\0' || path[MOUNT_LEN] == '/');
 }
 
-auto mount_lookup_cache_get_retained(const char* path, size_t path_len, uint64_t pivot_epoch) -> MountPoint* {
+auto mount_lookup_cache_get_retained(const char* path, size_t path_len, uint64_t pivot_epoch, const mount_ns::NamespaceRef& scope)
+    -> MountPoint* {
     if (path == nullptr || path_len == 0 || path_len >= MOUNT_PATH_MAX) {
         return nullptr;
     }
@@ -608,7 +632,8 @@ auto mount_lookup_cache_get_retained(const char* path, size_t path_len, uint64_t
     MountPoint* candidate = nullptr;
     set.lock.lock();
     for (auto& entry : set.ways) {
-        if (!entry.valid || entry.generation != GENERATION || entry.hash != HASH || entry.path_len != path_len) {
+        if (!entry.valid || entry.generation != GENERATION || entry.namespace_generation != scope.generation() || entry.hash != HASH ||
+            entry.path_len != path_len) {
             continue;
         }
         if (std::memcmp(entry.path.data(), path, path_len) != 0) {
@@ -627,8 +652,8 @@ auto mount_lookup_cache_get_retained(const char* path, size_t path_len, uint64_t
     MountPoint* retained = nullptr;
     mount_lock.lock();
     if (mount_pivot_epoch.load(std::memory_order_acquire) == pivot_epoch &&
-        mount_generation.load(std::memory_order_acquire) == GENERATION && mount_path_matches(candidate, path, path_len, true) &&
-        retain_mount_locked(candidate)) {
+        mount_generation.load(std::memory_order_acquire) == GENERATION && !scope.closed() && candidate->namespace_owner == scope &&
+        mount_path_matches(candidate, path, path_len, true) && retain_mount_locked(candidate)) {
         retained = candidate;
     }
     mount_lock.unlock();
@@ -642,7 +667,8 @@ auto mount_lookup_cache_get_retained(const char* path, size_t path_len, uint64_t
     return retained;
 }
 
-auto mount_root_fallback_cache_get_retained(const char* path, size_t component_len, uint64_t pivot_epoch) -> MountPoint* {
+auto mount_root_fallback_cache_get_retained(const char* path, size_t component_len, uint64_t pivot_epoch,
+                                            const mount_ns::NamespaceRef& scope) -> MountPoint* {
     if (path == nullptr || component_len == 0 || component_len >= MOUNT_ROOT_COMPONENT_CACHE_MAX || path[0] != '/') {
         return nullptr;
     }
@@ -654,7 +680,8 @@ auto mount_root_fallback_cache_get_retained(const char* path, size_t component_l
     MountPoint* candidate = nullptr;
     set.lock.lock();
     for (auto& entry : set.ways) {
-        if (!entry.valid || entry.generation != GENERATION || entry.hash != HASH || entry.component_len != component_len) {
+        if (!entry.valid || entry.generation != GENERATION || entry.namespace_generation != scope.generation() || entry.hash != HASH ||
+            entry.component_len != component_len) {
             continue;
         }
         if (std::memcmp(entry.component.data(), path + 1, component_len) != 0) {
@@ -673,7 +700,8 @@ auto mount_root_fallback_cache_get_retained(const char* path, size_t component_l
     MountPoint* retained = nullptr;
     mount_lock.lock();
     if (mount_pivot_epoch.load(std::memory_order_acquire) == pivot_epoch &&
-        mount_generation.load(std::memory_order_acquire) == GENERATION && mount_is_root(candidate) && retain_mount_locked(candidate)) {
+        mount_generation.load(std::memory_order_acquire) == GENERATION && !scope.closed() && candidate->namespace_owner == scope &&
+        mount_is_root(candidate) && retain_mount_locked(candidate)) {
         retained = candidate;
     }
     mount_lock.unlock();
@@ -691,8 +719,8 @@ void mount_lookup_cache_store(const char* path, size_t path_len, MountPoint* mou
     set.lock.lock();
     MountLookupCacheEntry* victim = nullptr;
     for (auto& entry : set.ways) {
-        if (entry.valid && entry.generation == generation && entry.hash == HASH && entry.path_len == path_len &&
-            std::memcmp(entry.path.data(), path, path_len) == 0) {
+        if (entry.valid && entry.generation == generation && entry.namespace_generation == mount->namespace_owner.generation() &&
+            entry.hash == HASH && entry.path_len == path_len && std::memcmp(entry.path.data(), path, path_len) == 0) {
             entry.mount = mount;
             entry.last_used = ++set.clock;
             set.lock.unlock();
@@ -719,6 +747,7 @@ void mount_lookup_cache_store(const char* path, size_t path_len, MountPoint* mou
     victim->generation = generation;
     victim->last_used = ++set.clock;
     victim->mount = mount;
+    victim->namespace_generation = mount->namespace_owner.generation();
     victim->path_len = path_len;
     victim->valid = true;
     set.lock.unlock();
@@ -736,7 +765,8 @@ void mount_root_fallback_cache_store(const char* path, size_t component_len, Mou
     set.lock.lock();
     MountRootFallbackCacheEntry* victim = nullptr;
     for (auto& entry : set.ways) {
-        if (entry.valid && entry.generation == generation && entry.hash == HASH && entry.component_len == component_len &&
+        if (entry.valid && entry.generation == generation && entry.namespace_generation == root_mount->namespace_owner.generation() &&
+            entry.hash == HASH && entry.component_len == component_len &&
             std::memcmp(entry.component.data(), path + 1, component_len) == 0) {
             entry.root_mount = root_mount;
             entry.last_used = ++set.clock;
@@ -764,6 +794,7 @@ void mount_root_fallback_cache_store(const char* path, size_t component_len, Mou
     victim->generation = generation;
     victim->last_used = ++set.clock;
     victim->root_mount = root_mount;
+    victim->namespace_generation = root_mount->namespace_owner.generation();
     victim->component_len = component_len;
     victim->valid = true;
     set.lock.unlock();
@@ -901,7 +932,7 @@ auto complete_retired_mount_teardown(MountPoint* mount, bool bounded_ref_wait, s
     }
     // Shutdown marks a whole set before leaf-first teardown. A child that
     // remained busy (or a still-initializing child) must keep this backend live.
-    if (mount_path_has_descendants_locked(mount->path)) {
+    if (mount_path_has_descendants_locked(mount->path, mount->namespace_owner)) {
         mount->retiring.store(false, std::memory_order_release);
         bump_mount_generation_locked();
         mount_lock.unlock();
@@ -1077,10 +1108,10 @@ auto retain_remote_mount_descendant_at(const void* parent_private_data, size_t i
                 break;
             }
         }
-        MountPoint* child = index < mounts.size() ? mounts.at(index) : nullptr;
+        MountPoint* child = parent != nullptr ? mount_at_visible_index_locked(parent->namespace_owner, index) : nullptr;
         MountPoint* retained = nullptr;
         if (parent != nullptr && child != nullptr && parent->path != nullptr && child->path != nullptr &&
-            child->fs_type == FSType::REMOTE && child->path_len > parent->path_len &&
+            child->namespace_owner == parent->namespace_owner && child->fs_type == FSType::REMOTE && child->path_len > parent->path_len &&
             std::memcmp(child->path, parent->path, parent->path_len) == 0 &&
             (parent->path_len == 1 || child->path[parent->path_len] == '/') && retain_mount_locked(child)) {
             retained = child;
@@ -1258,8 +1289,8 @@ auto mounted_block_device_overlaps(const ker::dev::BlockDevice* device) -> bool 
 }
 
 auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device, unsigned long flags, const char* data,
-                              void* initial_private_data, FileOperations* initial_fops, PreparedMount* out, MountPathKind path_kind)
-    -> int {
+                              void* initial_private_data, FileOperations* initial_fops, PreparedMount* out, MountPathKind path_kind,
+                              const mount_ns::NamespaceRef& scope) -> int {
     if (path == nullptr || fstype == nullptr || out == nullptr || out->state != nullptr) {
         vfs_debug_log("mount_filesystem: invalid arguments\n");
         return -EINVAL;
@@ -1267,6 +1298,14 @@ auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::Bl
     if (ker::mod::power::shutdown_in_progress()) {
         vfs_debug_log("mount_filesystem: shutdown in progress\n");
         return -ESHUTDOWN;
+    }
+
+    if (scope.closed()) return -EIDRM;
+    if (!scope.is_host()) {
+        // Shared native device/backend ownership needs a separate admission
+        // contract. Existing local writer leases only exclude remote writers.
+        if (path_kind != MountPathKind::RETAINED_PHYSICAL || std::strcmp(fstype, "tmpfs") != 0) return -ENOTSUP;
+        if (device != nullptr) return -EINVAL;
     }
 
     uint64_t const PIVOT_EPOCH = wait_for_stable_mount_pivot_epoch();
@@ -1292,8 +1331,8 @@ auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::Bl
         mount_lock.unlock();
         return -EBUSY;
     }
-    if (mount_path_occupied_locked(resolved.data()) || mount_path_initializing_locked(resolved.data()) ||
-        mount_path_has_retiring_ancestor_locked(resolved.data())) {
+    if (scope.closed() || mount_path_occupied_locked(resolved.data(), scope) || mount_path_initializing_locked(resolved.data(), scope) ||
+        mount_path_has_retiring_ancestor_locked(resolved.data(), scope)) {
         mount_lock.unlock();
         vfs_debug_log("mount_filesystem: mount path already occupied\n");
         return -EBUSY;
@@ -1311,6 +1350,12 @@ auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::Bl
     }
     state->mount = mount;
     state->pivot_epoch = PIVOT_EPOCH;
+    int const RETAIN_SCOPE = scope.retain(mount->namespace_owner);
+    if (RETAIN_SCOPE != 0) {
+        delete mount;
+        delete state;
+        return RETAIN_SCOPE;
+    }
 
     // Copy resolved path and fstype into kernel heap.
     size_t const PATH_LEN = std::strlen(resolved.data());
@@ -1325,7 +1370,7 @@ auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::Bl
     mount->path = path_copy;
     mount->path_len = PATH_LEN;
 
-    int const RESERVATION_RET = state->reservation.acquire(mount->path, PIVOT_EPOCH);
+    int const RESERVATION_RET = state->reservation.acquire(mount->path, PIVOT_EPOCH, scope);
     if (RESERVATION_RET != 0) {
         static_cast<void>(destroy_mount(mount, true));
         state->mount = nullptr;
@@ -1402,7 +1447,7 @@ auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::Bl
         mount->fops = ker::vfs::fat32::get_fat32_fops();
     } else if (std::strcmp(fstype, "tmpfs") == 0) {
         // tmpfs filesystem
-        bool const ROOT_COMPAT = std::strcmp(resolved.data(), "/") == 0;
+        bool const ROOT_COMPAT = scope.is_host() && std::strcmp(resolved.data(), "/") == 0;
         auto* root = ROOT_COMPAT ? ker::vfs::tmpfs::get_root_node() : ker::vfs::tmpfs::create_root_node();
         int tmpfs_error = 0;
         mount->private_data = ker::vfs::tmpfs::create_mount_context(root, data, ROOT_COMPAT, &tmpfs_error);
@@ -1479,12 +1524,12 @@ auto publish_prepared_mount_with_identity(PreparedMount* prepared, const char* e
         auto* parent = covered_directory->mount_owner;
         // The producer owns a fresh detached native pin from its admitted
         // target lookup. Refuse sharing a File between mount relationships.
-        if (parent == nullptr || mount_index_locked(parent) == MOUNT_INDEX_NONE || parent->retiring.load(std::memory_order_acquire) ||
-            covered_directory->refcount.load(std::memory_order_acquire) != 1 || !covered_directory->is_directory ||
-            covered_directory->private_data == nullptr || covered_directory->directory_view || covered_directory->vfs_path != nullptr ||
-            (covered_directory->open_flags & 3) != FILE_ACCESS_SEARCH_ONLY || (covered_directory->open_flags & O_DIRECTORY) == 0 ||
-            covered_directory->fs_type != parent->fs_type || (parent->fs_type != FSType::TMPFS && parent->fs_type != FSType::XFS) ||
-            !mount_path_is_descendant(mount->path, parent->path)) {
+        if (parent == nullptr || parent->namespace_owner != mount->namespace_owner || mount_index_locked(parent) == MOUNT_INDEX_NONE ||
+            parent->retiring.load(std::memory_order_acquire) || covered_directory->refcount.load(std::memory_order_acquire) != 1 ||
+            !covered_directory->is_directory || covered_directory->private_data == nullptr || covered_directory->directory_view ||
+            covered_directory->vfs_path != nullptr || (covered_directory->open_flags & 3) != FILE_ACCESS_SEARCH_ONLY ||
+            (covered_directory->open_flags & O_DIRECTORY) == 0 || covered_directory->fs_type != parent->fs_type ||
+            (parent->fs_type != FSType::TMPFS && parent->fs_type != FSType::XFS) || !mount_path_is_descendant(mount->path, parent->path)) {
             mount_lock.unlock();
             return -EINVAL;
         }
@@ -1494,11 +1539,24 @@ auto publish_prepared_mount_with_identity(PreparedMount* prepared, const char* e
         vfs_debug_log("mount_filesystem: pivot namespace changed before publication\n");
         return -EBUSY;
     }
-    if (!state->reservation.active_locked() || mount_path_occupied_locked(mount->path) ||
-        mount_path_has_retiring_ancestor_locked(mount->path)) {
+    if (mount->namespace_owner.closed()) {
+        mount_lock.unlock();
+        return -EIDRM;
+    }
+    if (!state->reservation.active_locked() || mount_path_occupied_locked(mount->path, mount->namespace_owner) ||
+        mount_path_has_retiring_ancestor_locked(mount->path, mount->namespace_owner)) {
         mount_lock.unlock();
         vfs_debug_log("mount_filesystem: mount path already occupied before publication\n");
         return -EBUSY;
+    }
+    if (!mount->namespace_owner.is_host()) {
+        size_t count = 0;
+        for (auto* existing : mounts)
+            if (existing != nullptr && existing->namespace_owner == mount->namespace_owner) ++count;
+        if (count >= mount_ns::MAX_PRIVATE_MOUNTS) {
+            mount_lock.unlock();
+            return -ENOSPC;
+        }
     }
     if (next_identity == 0) {
         mount_lock.unlock();
@@ -1556,7 +1614,7 @@ void finish_prepared_mount(PreparedMount* prepared) {
                                           static_cast<int64_t>(state->mount_count_after_insert), 0, 0);
 
     // Emit WKI storage mount event (if WKI is active)
-    if (ker::net::wki::g_wki.initialized) {
+    if (mount->namespace_owner.is_host() && ker::net::wki::g_wki.initialized) {
         ker::net::wki::wki_event_publish(ker::net::wki::EVENT_CLASS_STORAGE, ker::net::wki::EVENT_STORAGE_MOUNT, mount->path,
                                          static_cast<uint16_t>(mount->path_len + 1));
         ker::net::wki::wki_resource_advertise_all();
@@ -1567,9 +1625,10 @@ void finish_prepared_mount(PreparedMount* prepared) {
 }
 
 auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device, unsigned long flags, const char* data,
-                      void* initial_private_data, FileOperations* initial_fops) -> int {
+                      void* initial_private_data, FileOperations* initial_fops, const mount_ns::NamespaceRef& scope) -> int {
     PreparedMount prepared{};
-    int const PREPARE = prepare_mount_filesystem(path, fstype, device, flags, data, initial_private_data, initial_fops, &prepared);
+    int const PREPARE = prepare_mount_filesystem(path, fstype, device, flags, data, initial_private_data, initial_fops, &prepared,
+                                                 scope.is_host() ? MountPathKind::TASK_VISIBLE : MountPathKind::RETAINED_PHYSICAL, scope);
     if (PREPARE != 0) {
         return PREPARE;
     }
@@ -1580,7 +1639,8 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
 
 namespace {
 auto unmount_filesystem_impl(const char* path, const void* expected_private_data, bool require_private_data_match,
-                             uint32_t expected_dev_id = 0, bool require_dev_id_match = false) -> int {
+                             uint32_t expected_dev_id = 0, bool require_dev_id_match = false, const mount_ns::NamespaceRef& scope = {})
+    -> int {
     if (path == nullptr) {
         return -EINVAL;
     }
@@ -1593,7 +1653,8 @@ auto unmount_filesystem_impl(const char* path, const void* expected_private_data
         // Resolve again after every pivot retry so the task-root prefix and
         // stored mount namespace stay in the same publication epoch.
         std::array<char, MAX_MOUNT_PATH> resolved __attribute__((uninitialized));
-        int const PATH_RET = resolve_mount_path(path, resolved.data(), resolved.size());
+        int const PATH_RET = scope.is_host() ? resolve_mount_path(path, resolved.data(), resolved.size())
+                                             : (path[0] == '/' ? copy_mount_path_string(path, resolved.data(), resolved.size()) : -EINVAL);
         if (PATH_RET < 0) {
             return PATH_RET;
         }
@@ -1605,13 +1666,14 @@ auto unmount_filesystem_impl(const char* path, const void* expected_private_data
         }
         for (size_t i = 0; i < mounts.size(); ++i) {
             MountPoint* mp = mounts.at(i);
-            bool const PATH_MATCHES = mp != nullptr && mp->path != nullptr && std::strcmp(resolved.data(), mp->path) == 0;
+            bool const PATH_MATCHES =
+                mp != nullptr && mp->namespace_owner == scope && mp->path != nullptr && std::strcmp(resolved.data(), mp->path) == 0;
             bool const OWNER_MATCHES = !require_private_data_match || (mp != nullptr && mp->private_data == expected_private_data);
             bool const DEV_ID_MATCHES = !require_dev_id_match || (mp != nullptr && mp->dev_id == expected_dev_id);
             if (!PATH_MATCHES || !OWNER_MATCHES || !DEV_ID_MATCHES) {
                 continue;
             }
-            if (mp->retiring.load(std::memory_order_acquire) || mount_path_has_descendants_locked(mp->path)) {
+            if (mp->retiring.load(std::memory_order_acquire) || mount_path_has_descendants_locked(mp->path, mp->namespace_owner)) {
                 mount_lock.unlock();
                 return -EBUSY;
             }
@@ -1639,7 +1701,7 @@ auto unmount_filesystem_impl(const char* path, const void* expected_private_data
     vfs_debug_log("\n");
 
     // Emit WKI storage unmount event (if WKI is active)
-    if (ker::net::wki::g_wki.initialized) {
+    if (scope.is_host() && ker::net::wki::g_wki.initialized) {
         ker::net::wki::wki_event_publish(ker::net::wki::EVENT_CLASS_STORAGE, ker::net::wki::EVENT_STORAGE_UNMOUNT, path,
                                          static_cast<uint16_t>(std::strlen(path) + 1));
         ker::net::wki::wki_resource_advertise_all();
@@ -1649,7 +1711,54 @@ auto unmount_filesystem_impl(const char* path, const void* expected_private_data
 }
 }  // namespace
 
-auto unmount_filesystem(const char* path) -> int { return unmount_filesystem_impl(path, nullptr, false); }
+auto unmount_filesystem(const char* path, const mount_ns::NamespaceRef& scope) -> int {
+    return unmount_filesystem_impl(path, nullptr, false, 0, false, scope);
+}
+
+auto retire_mount_namespace(const mount_ns::NamespaceRef& scope) -> int {
+    if (scope.is_host()) return -EINVAL;
+    // Keep the exact owner pinned across unlocked backend teardown. The caller
+    // also owns scope; this API never revokes explicitly retained Files.
+    mount_ns::NamespaceRef owner;
+    int const RETAIN = scope.retain(owner);
+    if (RETAIN != 0) return RETAIN;
+    while (true) {
+        auto const EPOCH = wait_for_stable_mount_pivot_epoch();
+        mount_lock.lock();
+        if (mount_pivot_epoch.load(std::memory_order_acquire) != EPOCH) {
+            mount_lock.unlock();
+            continue;
+        }
+        owner.close();
+        MountPoint* leaf = nullptr;
+        for (const auto& initialization : mount_initializations) {
+            if (initialization.active && initialization.namespace_owner == owner) {
+                mount_lock.unlock();
+                return -EBUSY;
+            }
+        }
+        for (auto* mount : mounts) {
+            if (mount == nullptr || mount->namespace_owner != owner) continue;
+            if (mount->retiring.load(std::memory_order_acquire)) {
+                mount_lock.unlock();
+                return -EBUSY;
+            }
+            // '/' and '/child' both contain one slash. Reuse shutdown's
+            // root-last, depth/length ordering rather than counting slashes
+            // alone, which would try to retire the root before its child.
+            if (leaf == nullptr || mount_should_come_after(leaf, mount, "/")) leaf = mount;
+        }
+        if (leaf == nullptr) {
+            mount_lock.unlock();
+            return 0;
+        }
+        leaf->retiring.store(true, std::memory_order_release);
+        bump_mount_generation_locked();
+        mount_lock.unlock();
+        int const DRAIN = complete_retired_mount_teardown(leaf, true, nullptr);
+        if (DRAIN != 0) return DRAIN;
+    }
+}
 
 auto unmount_filesystem_if_private_data(const char* path, const void* expected_private_data) -> int {
     if (expected_private_data == nullptr) {
@@ -1685,7 +1794,7 @@ auto unmount_filesystem_by_private_data(const void* expected_private_data) -> in
             if (MP == nullptr || MP->private_data != expected_private_data) {
                 continue;
             }
-            if (MP->retiring.load(std::memory_order_acquire) || mount_path_has_descendants_locked(MP->path)) {
+            if (MP->retiring.load(std::memory_order_acquire) || mount_path_has_descendants_locked(MP->path, MP->namespace_owner)) {
                 mount_lock.unlock();
                 return -EBUSY;
             }
@@ -1703,6 +1812,7 @@ auto unmount_filesystem_by_private_data(const void* expected_private_data) -> in
         }
     }
 
+    bool const HOST_MOUNT = owned_mount->namespace_owner.is_host();
     int const UNMOUNT_RET = complete_retired_mount_teardown(owned_mount, false, &mount_count_after_remove);
     if (UNMOUNT_RET != 0) {
         return UNMOUNT_RET;
@@ -1711,7 +1821,7 @@ auto unmount_filesystem_by_private_data(const void* expected_private_data) -> in
                                           static_cast<int64_t>(mount_count_after_remove), 0, 0);
 
     vfs_debug_log("unmount_filesystem: unmounted owned mount\n");
-    if (ker::net::wki::g_wki.initialized) {
+    if (HOST_MOUNT && ker::net::wki::g_wki.initialized) {
         ker::net::wki::wki_event_publish(ker::net::wki::EVENT_CLASS_STORAGE, ker::net::wki::EVENT_STORAGE_UNMOUNT, mounted_path.data(),
                                          static_cast<uint16_t>(std::strlen(mounted_path.data()) + 1));
         ker::net::wki::wki_resource_advertise_all();
@@ -1809,8 +1919,8 @@ auto shutdown_unmount_all_exact(const char* root_path) -> int {
     return result;
 }
 
-auto find_mount_point(const char* path, size_t known_path_len) -> MountRef {
-    if (path == nullptr) {
+auto find_mount_point(const char* path, size_t known_path_len, const mount_ns::NamespaceRef& scope) -> MountRef {
+    if (path == nullptr || scope.closed()) {
         return MountRef{};
     }
 
@@ -1826,7 +1936,7 @@ auto find_mount_point(const char* path, size_t known_path_len) -> MountRef {
         uint64_t const PIVOT_EPOCH = wait_for_stable_mount_pivot_epoch();
         if (PATH_LEN_KNOWN) {
             if (ROOT_FALLBACK_CACHEABLE) {
-                if (auto* cached_root = mount_root_fallback_cache_get_retained(path, FIRST_COMPONENT_LEN, PIVOT_EPOCH);
+                if (auto* cached_root = mount_root_fallback_cache_get_retained(path, FIRST_COMPONENT_LEN, PIVOT_EPOCH, scope);
                     cached_root != nullptr) {
                     return MountRef{cached_root};
                 }
@@ -1834,7 +1944,7 @@ auto find_mount_point(const char* path, size_t known_path_len) -> MountRef {
                     continue;
                 }
             }
-            if (auto* cached = mount_lookup_cache_get_retained(path, PATH_LEN, PIVOT_EPOCH); cached != nullptr) {
+            if (auto* cached = mount_lookup_cache_get_retained(path, PATH_LEN, PIVOT_EPOCH, scope); cached != nullptr) {
                 return MountRef{cached};
             }
             if (mount_pivot_epoch.load(std::memory_order_acquire) != PIVOT_EPOCH) {
@@ -1853,8 +1963,12 @@ auto find_mount_point(const char* path, size_t known_path_len) -> MountRef {
             mount_lock.unlock();
             continue;
         }
+        if (scope.closed()) {
+            mount_lock.unlock();
+            return {};
+        }
         for (auto* mount : mounts) {
-            if (mount == nullptr || mount->path == nullptr) {
+            if (mount == nullptr || mount->namespace_owner != scope || mount->path == nullptr) {
                 continue;
             }
 
@@ -1895,8 +2009,9 @@ auto mount_table_generation_snapshot() -> uint64_t {
     }
 }
 
-auto configure_mount_point_exact(const char* path, FSType expected_type, void* private_data, FileOperations* fops) -> bool {
-    if (path == nullptr) {
+auto configure_mount_point_exact(const char* path, FSType expected_type, void* private_data, FileOperations* fops,
+                                 const mount_ns::NamespaceRef& scope) -> bool {
+    if (path == nullptr || scope.closed()) {
         return false;
     }
 
@@ -1908,7 +2023,7 @@ auto configure_mount_point_exact(const char* path, FSType expected_type, void* p
             continue;
         }
         for (auto* mp : mounts) {
-            if (mp == nullptr || mp->path == nullptr) {
+            if (mp == nullptr || mp->namespace_owner != scope || scope.closed() || mp->path == nullptr) {
                 continue;
             }
             if (mp->retiring.load(std::memory_order_acquire)) {
@@ -1934,7 +2049,7 @@ auto configure_mount_point_exact(const char* path, FSType expected_type, void* p
 PivotMountReferences::~PivotMountReferences() { delete static_cast<PivotCoverState*>(state_); }
 
 auto remap_mounts_for_pivot(const char* new_root, const char* put_old, const ker::mod::security::Snapshot* credentials,
-                            PivotMountReferences* references) -> int {
+                            PivotMountReferences* references, const mount_ns::NamespaceRef& scope) -> int {
     if ((credentials == nullptr) != (references == nullptr) || (references != nullptr && references->state_ != nullptr)) return -EINVAL;
     PivotMountReferences local_references;
     auto& reference_owner = references != nullptr ? *references : local_references;
@@ -1952,6 +2067,25 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old, const ker
     }
 
     mount_lock.lock();
+    if (scope.closed()) {
+        mount_lock.unlock();
+        return -EIDRM;
+    }
+    // A foreign teardown also mutates the shared row storage while its heavy
+    // close runs unlocked. Keep the old global publication barrier: no row
+    // may already be retiring when this transaction owns the odd epoch.
+    for (auto* mount : mounts) {
+        if (mount != nullptr && mount->retiring.load(std::memory_order_acquire)) {
+            mount_lock.unlock();
+            return -EBUSY;
+        }
+    }
+    for (const auto& initialization : mount_initializations) {
+        if (initialization.active && initialization.namespace_owner == scope) {
+            mount_lock.unlock();
+            return -EBUSY;
+        }
+    }
 
     uint64_t const STABLE_EPOCH = mount_pivot_epoch.load(std::memory_order_acquire);
     if ((STABLE_EPOCH & 1U) != 0 || STABLE_EPOCH > UINT64_MAX - 2) {
@@ -1959,12 +2093,13 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old, const ker
         return -EBUSY;
     }
     uint64_t const ODD_EPOCH = STABLE_EPOCH + 1;
+    pivot_namespace_generation = scope.generation();
     mount_pivot_epoch.store(ODD_EPOCH, std::memory_order_release);
 
     MountPoint const* new_mount = nullptr;
     MountPoint* old_root_mount = nullptr;
     for (auto* mp : mounts) {
-        if (mp == nullptr || mp->path == nullptr) {
+        if (mp == nullptr || mp->namespace_owner != scope || mp->path == nullptr) {
             continue;
         }
         if (mp->retiring.load(std::memory_order_acquire)) {
@@ -1998,7 +2133,7 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old, const ker
     }
 
     for (auto* mp : mounts) {
-        if (mp == nullptr || mp->path == nullptr || mp == new_mount || mp == old_root_mount) {
+        if (mp == nullptr || mp->namespace_owner != scope || mp->path == nullptr || mp == new_mount || mp == old_root_mount) {
             continue;
         }
         if (path_is_under_root(mp->path, new_root, NEW_ROOT_LEN)) {
@@ -2034,7 +2169,7 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old, const ker
         MountPoint* const MP = mounts.at(i);
         mount_lock.unlock();
 
-        if (MP == nullptr || MP->path == nullptr || MP == new_mount ||
+        if (MP == nullptr || MP->namespace_owner != scope || MP->path == nullptr || MP == new_mount ||
             (MP != old_root_mount && path_is_under_root(MP->path, new_root, NEW_ROOT_LEN))) {
             continue;
         }
@@ -2092,7 +2227,7 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old, const ker
                     break;
                 }
             }
-            if (!existing_is_replaced && existing != nullptr && existing->path != nullptr &&
+            if (!existing_is_replaced && existing != nullptr && existing->namespace_owner == scope && existing->path != nullptr &&
                 std::strcmp(replacements.at(i).path, existing->path) == 0) {
                 target_collision = true;
                 break;
@@ -2123,12 +2258,12 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old, const ker
         auto const REQUEST_CREDENTIALS = *credentials;
         for (size_t index = 0; index < MOUNT_COUNT; ++index) {
             auto* child = mounts.at(index);
-            if (child == nullptr) continue;
+            if (child == nullptr || child->namespace_owner != scope) continue;
             const char* const CHILD_PATH = destination(child);
             MountPoint* parent = nullptr;
             size_t parent_length = 0;
             for (auto* possible : mounts) {
-                if (possible == nullptr || possible == child) continue;
+                if (possible == nullptr || possible->namespace_owner != scope || possible == child) continue;
                 const char* const PARENT_PATH = destination(possible);
                 size_t const LENGTH = std::strlen(PARENT_PATH);
                 if (LENGTH > parent_length && std::strlen(CHILD_PATH) > LENGTH && path_is_under_root(CHILD_PATH, PARENT_PATH, LENGTH)) {
@@ -2156,6 +2291,12 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old, const ker
         release_pivot_replacements(replacements);
         return abort_mount_pivot(ODD_EPOCH, -EBUSY);
     }
+    if (scope.closed()) {
+        mount_pivot_epoch.store(ODD_EPOCH + 1, std::memory_order_release);
+        mount_lock.unlock();
+        release_pivot_replacements(replacements);
+        return -EIDRM;
+    }
     for (const auto& replacement : replacements) {
         if (mount_has_active_refs_locked(replacement.mount, cover_state)) {
             mount_pivot_epoch.store(ODD_EPOCH + 1, std::memory_order_release);
@@ -2170,7 +2311,7 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old, const ker
     // in the caller's owner until namespace and task-root publication finish.
     for (size_t i = 0; i < mounts.size(); ++i) {
         auto* mount = mounts.at(i);
-        if (mount == nullptr) continue;
+        if (mount == nullptr || mount->namespace_owner != scope) continue;
         auto& entry = cover_state->entries[i];
         entry.retired = mount->covered_directory;
         mount->covered_directory = std::exchange(entry.candidate, nullptr);
@@ -2190,21 +2331,21 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old, const ker
     return 0;
 }
 
-void rebase_wki_mounts_for_new_root(const char* new_root) {
+void rebase_wki_mounts_for_new_root(const char* new_root, const mount_ns::NamespaceRef& scope) {
     if (new_root == nullptr) {
         return;
     }
 
     mount_lock.lock();
     uint64_t const ODD_EPOCH = mount_pivot_epoch.load(std::memory_order_acquire);
-    if ((ODD_EPOCH & 1U) == 0) {
+    if ((ODD_EPOCH & 1U) == 0 || pivot_namespace_generation != scope.generation()) {
         mount_lock.unlock();
         return;
     }
 
     size_t const NEW_ROOT_LEN = std::strlen(new_root);
     for (auto* mp : mounts) {
-        if (mp == nullptr || mp->path == nullptr) {
+        if (mp == nullptr || mp->namespace_owner != scope || mp->path == nullptr) {
             continue;
         }
         if (std::strcmp(mp->path, "/wki") != 0 && std::strncmp(mp->path, "/wki/", 5) != 0) {
@@ -2222,7 +2363,7 @@ void rebase_wki_mounts_for_new_root(const char* new_root) {
     mount_lock.unlock();
 }
 
-auto get_mount_count() -> size_t {
+auto get_mount_count(const mount_ns::NamespaceRef& scope) -> size_t {
     while (true) {
         uint64_t const PIVOT_EPOCH = wait_for_stable_mount_pivot_epoch();
         mount_lock.lock();
@@ -2230,13 +2371,15 @@ auto get_mount_count() -> size_t {
             mount_lock.unlock();
             continue;
         }
-        size_t const COUNT = mounts.size();
+        size_t count = 0;
+        for (auto* mount : mounts)
+            if (mount != nullptr && mount->namespace_owner == scope) ++count;
         mount_lock.unlock();
-        return COUNT;
+        return count;
     }
 }
 
-auto get_mount_at(size_t index) -> MountRef {
+auto get_mount_at(size_t index, const mount_ns::NamespaceRef& scope) -> MountRef {
     while (true) {
         uint64_t const PIVOT_EPOCH = wait_for_stable_mount_pivot_epoch();
         mount_lock.lock();
@@ -2244,11 +2387,8 @@ auto get_mount_at(size_t index) -> MountRef {
             mount_lock.unlock();
             continue;
         }
-        if (index >= mounts.size()) {
-            mount_lock.unlock();
-            return MountRef{};
-        }
-        MountPoint* mp = mounts.at(index);
+        MountPoint* mp = mount_at_visible_index_locked(scope, index);
+        if (scope.closed()) mp = nullptr;
         if (!retain_mount_locked(mp)) {
             mp = nullptr;
         }
@@ -2280,7 +2420,7 @@ auto copy_mount_path_exact(const MountPoint* mount, char* out, size_t capacity) 
     return result;
 }
 
-auto get_mount_snapshot_at(size_t index, MountSnapshot* out) -> bool {
+auto get_mount_snapshot_at(size_t index, MountSnapshot* out, const mount_ns::NamespaceRef& scope) -> bool {
     if (out == nullptr) {
         return false;
     }
@@ -2292,12 +2432,7 @@ auto get_mount_snapshot_at(size_t index, MountSnapshot* out) -> bool {
             mount_lock.unlock();
             continue;
         }
-        if (index >= mounts.size()) {
-            mount_lock.unlock();
-            return false;
-        }
-
-        MountPoint const* mp = mounts.at(index);
+        MountPoint const* mp = mount_at_visible_index_locked(scope, index);
         if (mp == nullptr || mp->path == nullptr) {
             mount_lock.unlock();
             return false;
@@ -2357,6 +2492,7 @@ auto mount_lock_available_for_test() -> bool {
     if (AVAILABLE) mount_lock.unlock();
     return AVAILABLE;
 }
+auto mount_pivot_pending_for_test() -> bool { return (mount_pivot_epoch.load(std::memory_order_acquire) & 1U) != 0; }
 auto mount_selftest_identity_exhaustion() -> bool {
     constexpr const char* LAST_PATH = "/tmp/ktest_mount_last_identity";
     constexpr const char* NEXT_PATH = "/tmp/ktest_mount_exhausted_identity";

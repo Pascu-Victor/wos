@@ -155,14 +155,19 @@ Current source already implements immutable CredentialStore and retained root/
 cwd views; the dated dirty-credential premise must not be copied. Full prior
 Goal19 authorization completion is not inferred from its retired portfolio row.
 Reuse existing checked APIs and map shared native consumers before modifying them.
-Profile preparation and private native SysV IPC namespace ownership/lookup are
-implemented;109focusedASan/UBSan cases, Normal Build WOS and formatter pass.
-Isolated fast KTEST passes73525assertions/0failures including4newIPC cases.
-No public compartment creation, mount/PID isolation, network/WKI gates or launcher
-is enabled. All10fullacceptancecriteria remain outstanding; registry/metadata
-fixtures do not qualify real user mapping/futex or full service lifecycles.
-See progress/39/{ledger,evidence,reconnaissance,contract-01-profile}.md and
-docs/wos_service_compartments.md.
+Profile preparation, private native SysV IPC and native mount ownership are
+implemented. Mount publication/reservations/caches/covered edges/unmount/pivot
+now use exact retained namespace identity with separate tmpfs backing. Default
+native callers select host; no Task enters a private mount view yet.
+117 focused ASan/UBSan cases, four existing VFS regression entries, Normal
+Build WOS and formatter pass. Isolated fast KTEST passes 73,910 assertions
+with zero failures, including four IPC and seven mount cases. Public creation,
+Task pathwalk/PID integration, network/WKI gates and launcher remain disabled.
+All ten full acceptance criteria remain
+outstanding; trusted mount/backend fixtures do not qualify hostile user paths,
+real user mappings/futexes, two-hour services or 1,000 full service lifecycles.
+See progress/39/{ledger,evidence,reconnaissance,contract-01-profile,
+contract-02-ipc,contract-03-mount-registry}.md and docs/wos_service_compartments.md.
 
 User explicitly authorizes owned software VM runtime/debug through
 bin/wos-cluster --no-setup and isolated bin/wos-ktest --no-setup. This overrides
@@ -172,5 +177,5 @@ disposable-image budget and40GiB free floor; use immutable required bases and
 private COW/reflink images. Audit exact ownership/live process/QMP/FD/backing
 references and prune inactive agent-created disposable disks/backings/per-run
 appliances after PASS/FAIL/exceptions. Keep small evidence and user/unrelated
-disks/source/current artifacts. Both Goal39 KTEST attempts pruned their exact-owned
+disks/source/current artifacts. All four Goal39 KTEST attempts pruned their exact-owned
 inactive disposable images; small logs/configs/manifests/receipts remain.
