@@ -304,6 +304,11 @@ auto vfs_mkdir_resolved_beneath(const char* confinement_root, const char* path, 
 auto vfs_mount(const char* source, const char* target, const char* fstype, unsigned long flags = 0, const char* data = nullptr) -> int;
 auto vfs_umount(const char* target) -> int;
 auto vfs_pivot_root(const char* new_root, const char* put_old) -> int;
+// Explicit retained subject; worker context never selects the mount view.
+auto vfs_mount_for_task(ker::mod::sched::task::Task* task, const char* source, const char* target, const char* fstype,
+                        unsigned long flags = 0, const char* data = nullptr) -> int;
+auto vfs_umount_for_task(ker::mod::sched::task::Task* task, const char* target) -> int;
+auto vfs_pivot_root_for_task(ker::mod::sched::task::Task* task, const char* new_root, const char* put_old) -> int;
 
 // FD duplication
 auto vfs_dup(int oldfd) -> int;

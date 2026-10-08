@@ -37,7 +37,7 @@ enum class LookupIntent { MOUNT_TARGET };
 enum class LookupFollowPolicy { FOLLOW_FINAL };
 constexpr int AT_FDCWD = -100;
 struct Authorization {
-    uint64_t task_id = 1, root_hash = 2, cwd_hash = 3, root_anchor_identity = 4, cwd_anchor_identity = 5;
+    uint64_t task_id = 1, mount_namespace_generation = 8, root_hash = 2, cwd_hash = 3, root_anchor_identity = 4, cwd_anchor_identity = 5;
     Snapshot credentials;
     bool root_identity_view = false;
 };
@@ -102,7 +102,7 @@ int main() {
     assert(run(lookup) == -EAGAIN && acquires == 3 && resets == 3 && consumes == 4);
     reset(); lookup = {}; results = {-EAGAIN,-EAGAIN,0,0};
     assert(run(lookup) == 0 && acquires == 2 && consumes == 3);
-    for (unsigned change = 0; change < 12; ++change) {
+    for (unsigned change = 0; change < 13; ++change) {
         reset(); lookup = {};
         switch(change) {
             case 0: ++next_lookup.object; break;
@@ -117,6 +117,7 @@ int main() {
             case 9: ++next_lookup.auth.root_anchor_identity; break;
             case 10: ++next_lookup.auth.cwd_anchor_identity; break;
             case 11: next_lookup.auth.root_identity_view = true; break;
+            case 12: ++next_lookup.auth.mount_namespace_generation; break;
         }
         assert(run(lookup) == -EAGAIN && acquires == 1 && consumes == 1);
     }

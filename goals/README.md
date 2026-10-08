@@ -60,8 +60,10 @@ Goal 28 is paused and incomplete at its tested wire-codec checkpoint
 isolation, launcher and runtime criteria remain outstanding; the local progress
 ledger records source reconnaissance and qualification. The user cleared the previous goal-manager record on 2026-10-08,
 and Goal 39 is now the active Goal Mode objective. Private native IPC and mount
-ownership and Task native lookup/consumption are qualified at the kernel API
-checkpoint. Public compartment admission, private mount/root/procfs/PID visibility, complete WKI/
+ownership, Task native lookup/consumption and subject mount/unmount/repeatable
+pivot are qualified at the kernel API checkpoint (74,224 KTEST assertions, zero
+failures). Public compartment admission, remaining root/readdir/procfs/PID
+visibility, complete WKI/
 network enforcement and full service/runtime criteria remain incomplete.
 
 The [local virtualization manual corpus](../docs/virtualization-manuals.md)

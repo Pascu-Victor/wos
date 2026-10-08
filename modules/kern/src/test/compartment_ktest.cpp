@@ -138,6 +138,15 @@ struct NativeTask {
     auto open(const char* path, int flags = vfs::O_CREAT | 2) -> int {
         return track(vfs::vfs_openat(task.get(), vfs::AT_FDCWD, path, flags, 0600));
     }
+    auto close(int fd) -> int {
+        for (size_t i = 0; i < used; ++i) {
+            if (descriptors[i] != fd) continue;
+            int const RESULT = vfs::vfs_close_for_task(task.get(), fd);
+            if (RESULT == 0) descriptors[i] = descriptors[--used];
+            return RESULT;
+        }
+        return -EBADF;
+    }
 };
 auto task_lookup(Task& task, const char* path, vfs::LookupHandle& out, int dirfd = vfs::AT_FDCWD) -> int {
     return vfs::vfs_acquire_lookup(&task, dirfd, path, vfs::LookupIntent::STAT, vfs::LookupFollowPolicy::FOLLOW_FINAL, false, true, &out);
@@ -153,6 +162,171 @@ auto observe_lookup(const vfs::LookupHandle& handle, void* opaque) -> int {
                                     &out.stat);
 }
 }  // namespace
+
+KTEST(CompartmentAdmin, NativeMountUnmountUsesSubjectAndExactIdentity) {
+    auto const BASELINE = mount_ns::live_namespace_count();
+    auto const HOST_COUNT = vfs::get_mount_count();
+    {
+        PrivateMounts views;
+        KREQUIRE_EQ(mount_ns::create_namespace(views.first), 0);
+        KREQUIRE_EQ(mount_ns::create_namespace(views.second), 0);
+        KREQUIRE_EQ(private_mount(views.first, "/"), 0);
+        KREQUIRE_EQ(private_mount(views.second, "/"), 0);
+        NativeTask first, second;
+        KREQUIRE_TRUE(first.task->initialize_mount_namespace(views.first));
+        KREQUIRE_TRUE(second.task->initialize_mount_namespace(views.second));
+        for (auto* task : {first.task.get(), second.task.get()}) {
+            KREQUIRE_EQ(vfs::vfs_mkdirat(task, vfs::AT_FDCWD, "/service", 0755), 0);
+            KREQUIRE_EQ(vfs::vfs_mount_for_task(task, nullptr, "/service", "tmpfs", 0, "size=1M"), 0);
+        }
+        uint32_t first_id = 0, second_id = 0;
+        {
+            auto a = scoped_mount(views.first, "/service"), b = scoped_mount(views.second, "/service");
+            KREQUIRE_TRUE(a && b && a.get() != b.get());
+            first_id = a->dev_id;
+            second_id = b->dev_id;
+            KEXPECT_TRUE(first_id != second_id);
+            KEXPECT_TRUE(a->private_data != b->private_data);
+        }
+        int const FD = first.open("/service/data");
+        KREQUIRE_TRUE(FD >= 0);
+        NativeFile inherited(vfs::vfs_get_file_retain(first.task.get(), FD));
+        KREQUIRE_TRUE(inherited);
+        KREQUIRE_EQ(first.close(FD), 0);
+        char const VALUE = 'v';
+        KREQUIRE_EQ(tmpfs::tmpfs_write(inherited.get(), &VALUE, 1, 0), 1);
+        KEXPECT_EQ(vfs::vfs_umount_for_task(first.task.get(), "/service"), -EBUSY);
+        char value = 0;
+        KEXPECT_EQ(tmpfs::tmpfs_read(inherited.get(), &value, 1, 0), 1);
+        KEXPECT_EQ(value, VALUE);
+        inherited.reset();
+        KREQUIRE_EQ(vfs::vfs_umount_for_task(first.task.get(), "/service"), 0);
+        KREQUIRE_EQ(vfs::vfs_mount_for_task(first.task.get(), nullptr, "/service", "tmpfs", 0, "size=1M"), 0);
+        KEXPECT_EQ(vfs::unmount_filesystem_if_dev_id("/service", first_id, views.first, vfs::MountPathKind::RETAINED_PHYSICAL), -ENOENT);
+        {
+            auto a = scoped_mount(views.first, "/service"), b = scoped_mount(views.second, "/service");
+            KREQUIRE_TRUE(a && b);
+            KEXPECT_TRUE(a->dev_id != first_id);
+            KEXPECT_EQ(b->dev_id, second_id);
+        }
+        KREQUIRE_EQ(vfs::vfs_umount_for_task(first.task.get(), "/service"), 0);
+        KEXPECT_EQ(vfs::get_mount_count(views.first), 1U);
+        KEXPECT_EQ(vfs::get_mount_count(views.second), 2U);
+        KEXPECT_EQ(vfs::get_mount_count(), HOST_COUNT);
+    }
+    KEXPECT_EQ(mount_ns::live_namespace_count(), BASELINE);
+    KEXPECT_EQ(vfs::get_mount_count(), HOST_COUNT);
+}
+
+KTEST(CompartmentAdmin, UnsupportedClosedAndUnauthorizedFailBeforeMountEffects) {
+    auto const BASELINE = mount_ns::live_namespace_count();
+    auto const HOST_COUNT = vfs::get_mount_count();
+    {
+        PrivateMounts views;
+        KREQUIRE_EQ(mount_ns::create_namespace(views.first), 0);
+        KREQUIRE_EQ(private_mount(views.first, "/"), 0);
+        NativeTask subject;
+        KREQUIRE_TRUE(subject.task->initialize_mount_namespace(views.first));
+        KREQUIRE_EQ(vfs::vfs_mkdirat(subject.task.get(), vfs::AT_FDCWD, "/service", 0755), 0);
+        for (auto* source : {"wki://foreign/private", "PARTUUID=foreign", "/dev/foreign", ""})
+            KEXPECT_EQ(vfs::vfs_mount_for_task(subject.task.get(), source, "/service", "tmpfs"), -ENOTSUP);
+        for (auto* type : {"xfs", "fat32", "remote", "devfs", "procfs", ""})
+            KEXPECT_EQ(vfs::vfs_mount_for_task(subject.task.get(), nullptr, "/service", type), -ENOTSUP);
+        KEXPECT_EQ(vfs::vfs_mount_for_task(subject.task.get(), nullptr, "/service", nullptr), -ENOTSUP);
+        KEXPECT_EQ(vfs::vfs_mount_for_task(subject.task.get(), nullptr, "/absent", "tmpfs"), -ENOENT);
+        KEXPECT_EQ(vfs::get_mount_count(views.first), 1U);
+        NativeTask denied;
+        KREQUIRE_TRUE(denied.task->initialize_mount_namespace(views.first));
+        KREQUIRE_EQ(resource::initialize_credentials(*denied.task, ker::mod::security::Snapshot{}), 0);
+        KEXPECT_EQ(vfs::vfs_mount_for_task(denied.task.get(), nullptr, "/service", "tmpfs"), -EPERM);
+        KEXPECT_EQ(vfs::vfs_umount_for_task(denied.task.get(), "/service"), -EPERM);
+        KEXPECT_EQ(vfs::vfs_pivot_root_for_task(denied.task.get(), "/service", "/service/old"), -EPERM);
+        views.first.close();
+        KEXPECT_EQ(vfs::vfs_mount_for_task(subject.task.get(), nullptr, "/service", "tmpfs"), -EIDRM);
+        KEXPECT_EQ(vfs::vfs_umount_for_task(subject.task.get(), "/"), -EIDRM);
+        KEXPECT_EQ(vfs::vfs_pivot_root_for_task(subject.task.get(), "/service", "/service/old"), -EIDRM);
+        KEXPECT_EQ(vfs::unmount_filesystem_if_dev_id("/", 1, views.first, vfs::MountPathKind::RETAINED_PHYSICAL), -EIDRM);
+        KEXPECT_EQ(vfs::get_mount_count(), HOST_COUNT);
+    }
+    KEXPECT_EQ(mount_ns::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentAdmin, NativePivotTwicePreservesSiblingAndHostViews) {
+    auto const BASELINE = mount_ns::live_namespace_count();
+    auto const HOST_COUNT = vfs::get_mount_count();
+    {
+        PrivateMounts views;
+        KREQUIRE_EQ(mount_ns::create_namespace(views.first), 0);
+        KREQUIRE_EQ(mount_ns::create_namespace(views.second), 0);
+        KREQUIRE_EQ(private_mount(views.first, "/"), 0);
+        KREQUIRE_EQ(private_mount(views.second, "/"), 0);
+        NativeTask first, second;
+        KREQUIRE_TRUE(first.task->initialize_mount_namespace(views.first));
+        KREQUIRE_TRUE(second.task->initialize_mount_namespace(views.second));
+        KREQUIRE_EQ(vfs::vfs_mkdirat(first.task.get(), vfs::AT_FDCWD, "/new", 0755), 0);
+        KREQUIRE_EQ(vfs::vfs_mkdirat(first.task.get(), vfs::AT_FDCWD, "/service", 0755), 0);
+        KREQUIRE_EQ(vfs::vfs_mount_for_task(first.task.get(), nullptr, "/new", "tmpfs", 0, "size=1M"), 0);
+        KREQUIRE_EQ(vfs::vfs_mount_for_task(first.task.get(), nullptr, "/service", "tmpfs", 0, "size=1M"), 0);
+        for (auto* path : {"/new/old", "/new/service", "/new/next"})
+            KREQUIRE_EQ(vfs::vfs_mkdirat(first.task.get(), vfs::AT_FDCWD, path, 0755), 0);
+        for (auto* path : {"/rootdata", "/new/data", "/service/data"}) {
+            int const FD = first.open(path);
+            KREQUIRE_TRUE(FD >= 0);
+            KREQUIRE_EQ(first.close(FD), 0);
+        }
+        uint32_t root_id = 0, new_id = 0, service_id = 0;
+        {
+            auto root = scoped_mount(views.first, "/"), next = scoped_mount(views.first, "/new"),
+                 service = scoped_mount(views.first, "/service");
+            KREQUIRE_TRUE(root && next && service);
+            root_id = root->dev_id;
+            new_id = next->dev_id;
+            service_id = service->dev_id;
+        }
+        KEXPECT_EQ(vfs::vfs_pivot_root_for_task(first.task.get(), "/new", "/service"), -EXDEV);
+        KEXPECT_EQ(vfs::vfs_pivot_root_for_task(first.task.get(), "/new/next", "/new/old"), -EINVAL);
+        int const HELD = first.open("/rootdata", 0);
+        KREQUIRE_TRUE(HELD >= 0);
+        KEXPECT_EQ(vfs::vfs_pivot_root_for_task(first.task.get(), "/new", "/new/old"), -EBUSY);
+        KREQUIRE_EQ(first.close(HELD), 0);
+        // A thread uses its retained process filesystem owner; it does not
+        // acquire a worker's host view or publish a new Task.
+        auto thread = std::make_unique<Task>();
+        thread->is_thread = true;
+        thread->owner_pid = first.task->pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(*thread, *first.task));
+        KREQUIRE_EQ(vfs::vfs_pivot_root_for_task(thread.get(), "/new", "/new/old"), 0);
+        KEXPECT_TRUE(std::strcmp(first.task->root.data(), "/new") == 0);
+        KEXPECT_TRUE(std::strcmp(second.task->root.data(), "/") == 0);
+        vfs::Stat stat{};
+        KREQUIRE_EQ(vfs::vfs_statat(first.task.get(), vfs::AT_FDCWD, "/data", 0, &stat), 0);
+        KEXPECT_EQ(stat.st_dev, new_id);
+        KREQUIRE_EQ(vfs::vfs_statat(first.task.get(), vfs::AT_FDCWD, "/old/rootdata", 0, &stat), 0);
+        KEXPECT_EQ(stat.st_dev, root_id);
+        KREQUIRE_EQ(vfs::vfs_statat(first.task.get(), vfs::AT_FDCWD, "/service/data", 0, &stat), 0);
+        KEXPECT_EQ(stat.st_dev, service_id);
+        KREQUIRE_EQ(vfs::vfs_mount_for_task(first.task.get(), nullptr, "/next", "tmpfs", 0, "size=1M"), 0);
+        for (auto* path : {"/next/old2", "/next/old", "/next/service"})
+            KREQUIRE_EQ(vfs::vfs_mkdirat(first.task.get(), vfs::AT_FDCWD, path, 0755), 0);
+        KREQUIRE_EQ(vfs::vfs_pivot_root_for_task(first.task.get(), "/next", "/next/old2"), 0);
+        KEXPECT_TRUE(std::strcmp(first.task->root.data(), "/new/next") == 0);
+        KEXPECT_TRUE(std::strcmp(second.task->root.data(), "/") == 0);
+        KREQUIRE_EQ(vfs::vfs_statat(first.task.get(), vfs::AT_FDCWD, "/old2/data", 0, &stat), 0);
+        KEXPECT_EQ(stat.st_dev, new_id);
+        KREQUIRE_EQ(vfs::vfs_statat(first.task.get(), vfs::AT_FDCWD, "/old/rootdata", 0, &stat), 0);
+        KEXPECT_EQ(stat.st_dev, root_id);
+        KREQUIRE_EQ(vfs::vfs_statat(first.task.get(), vfs::AT_FDCWD, "/service/data", 0, &stat), 0);
+        KEXPECT_EQ(stat.st_dev, service_id);
+        KREQUIRE_EQ(vfs::vfs_umount_for_task(first.task.get(), "/service"), 0);
+        KEXPECT_EQ(vfs::vfs_statat(first.task.get(), vfs::AT_FDCWD, "/service/data", 0, &stat), -ENOENT);
+        KEXPECT_EQ(vfs::vfs_statat(second.task.get(), vfs::AT_FDCWD, "/data", 0, &stat), -ENOENT);
+        KEXPECT_EQ(vfs::get_mount_count(views.second), 1U);
+        KEXPECT_EQ(vfs::get_mount_count(), HOST_COUNT);
+        KEXPECT_FALSE(vfs::mount_pivot_pending_for_test());
+    }
+    KEXPECT_EQ(mount_ns::live_namespace_count(), BASELINE);
+    KEXPECT_EQ(vfs::get_mount_count(), HOST_COUNT);
+}
 
 KTEST(CompartmentPath, ChildThreadAndUnpublishedOwnership) {
     auto const BASELINE = mount_ns::live_namespace_count();

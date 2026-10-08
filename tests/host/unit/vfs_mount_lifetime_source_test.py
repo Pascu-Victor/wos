@@ -216,7 +216,7 @@ def test_mount_path_scratch_is_fully_produced_before_use() -> None:
     ):
         producer = ("int const PATH_RET = path_kind == MountPathKind::RETAINED_PHYSICAL"
                     if name == "mount_filesystem" else
-                    "int const PATH_RET = scope.is_host() ? resolve_mount_path(path, resolved.data(), resolved.size())")
+                    "int const PATH_RET = scope.is_host() && path_kind == MountPathKind::TASK_VISIBLE")
         gate = "if (PATH_RET < 0)"
         require_order(body, resolved_decl, producer, f"{name} resolver output")
         require_order(body, producer, gate, f"{name} resolver failure gate")
@@ -455,7 +455,7 @@ def test_pivot_rewrites_are_transactional_and_gate_publication() -> None:
     missing = [token for token in required_remap if token not in remap_body]
     if missing:
         fail("pivot remap transaction is missing: " + ", ".join(missing))
-    require_order(remap_body, "mp->retiring.load(std::memory_order_acquire)", "path_is_under_root", "retirement fences every pivot path")
+    require_order(remap_body, "mp->retiring.load(std::memory_order_acquire)", "if (current_root != nullptr && !under_old_root(mp->path))", "retirement fences every pivot path")
     require_order(remap_body, "ker::util::SmallVec<PivotMountReplacement, 8> replacements", "bump_mount_generation_locked()", "allocate before commit")
     require_order(remap_body, "mount_has_active_refs_locked(replacement.mount, cover_state)", "delete[] mp->path", "final ref check before commit")
     collision_pos = remap_body.find("bool target_collision = false;")
@@ -496,23 +496,23 @@ def test_mount_table_readers_gate_on_stable_pivot_epoch() -> None:
 
 
 def test_pivot_prepares_wki_before_mount_remap() -> None:
-    body = function_body(CORE_CPP.read_text(), "vfs_pivot_root")
+    body = function_body(CORE_CPP.read_text(), "vfs_pivot_root_for_task")
     required = [
         "snapshot_bounded_path_string(new_root",
         "snapshot_bounded_path_string(put_old",
         "wki_remote_vfs_prepare_export_rebuild()",
-        "remap_mounts_for_pivot(stable_new_root.data(), stable_put_old.data(), &CREDENTIALS, &references)",
+        "remap_mounts_for_pivot(stable_new_root.data(), stable_put_old.data(), &CREDENTIALS, &references, scope,",
         "wki_remote_vfs_cancel_export_rebuild()",
-        "rebase_wki_mounts_for_new_root(stable_new_root.data())",
+        "rebase_wki_mounts_for_new_root(stable_new_root.data(), scope)",
         "wki_remote_vfs_rebuild_exports()",
     ]
     missing = [token for token in required if token not in body]
     if missing:
         fail("pivot/WKI split-phase barrier is missing: " + ", ".join(missing))
     require_order(body, "snapshot_bounded_path_string(put_old", "wki_remote_vfs_prepare_export_rebuild()", "snapshot paths before prepare")
-    require_order(body, "wki_remote_vfs_prepare_export_rebuild()", "remap_mounts_for_pivot(stable_new_root.data(), stable_put_old.data(), &CREDENTIALS, &references)", "prepare before remap")
-    require_order(body, "remap_mounts_for_pivot(stable_new_root.data(), stable_put_old.data(), &CREDENTIALS, &references)", "rebase_wki_mounts_for_new_root(stable_new_root.data())", "remap before final rebase")
-    require_order(body, "rebase_wki_mounts_for_new_root(stable_new_root.data())", "wki_remote_vfs_rebuild_exports()", "rebase before export rebuild")
+    require_order(body, "wki_remote_vfs_prepare_export_rebuild()", "remap_mounts_for_pivot(stable_new_root.data(), stable_put_old.data(), &CREDENTIALS, &references, scope,", "prepare before remap")
+    require_order(body, "remap_mounts_for_pivot(stable_new_root.data(), stable_put_old.data(), &CREDENTIALS, &references, scope,", "rebase_wki_mounts_for_new_root(stable_new_root.data(), scope)", "remap before final rebase")
+    require_order(body, "rebase_wki_mounts_for_new_root(stable_new_root.data(), scope)", "wki_remote_vfs_rebuild_exports()", "rebase before export rebuild")
 
     snapshot_body = function_body(CORE_CPP.read_text(), "snapshot_bounded_path_string")
     if "if (pos == 0)" not in snapshot_body or "return -EINVAL;" not in snapshot_body:
@@ -520,27 +520,28 @@ def test_pivot_prepares_wki_before_mount_remap() -> None:
 
 
 def test_vfs_umount_invalidates_only_exact_mount() -> None:
-    body = function_body(CORE_CPP.read_text(), "vfs_umount")
+    body = function_body(CORE_CPP.read_text(), "vfs_umount_for_task")
     required = [
         "ker::mod::sys::MutexGuard publication_guard(g_vfs_namespace_publication_mutex);",
-        "auto mount_ref = find_mount_point(resolved.data());",
+        "auto mount_ref = find_mount_point(resolved.data(), UNKNOWN_MOUNT_PATH_LEN, scope);",
         "std::strcmp(mount->path, resolved.data()) == 0",
         "expected_dev_id = mount->dev_id;",
         "stream_invalidate_mount_scope(mount->fs_type, stream_scope_key_for_mount(mount));",
-        "unmount_filesystem_if_dev_id(stable_target.data(), expected_dev_id)",
+        "unmount_filesystem_if_dev_id(resolved.data(), expected_dev_id, scope, MountPathKind::RETAINED_PHYSICAL)",
     ]
     missing = [token for token in required if token not in body]
     if missing:
         fail("vfs_umount() must invalidate stream scope only for exact mount targets: " + ", ".join(missing))
-    require_order(body, "std::strcmp(mount->path, resolved.data()) == 0", "stream_invalidate_mount_scope", "exact umount invalidation")
-    require_order(body, "expected_dev_id = mount->dev_id;", "unmount_filesystem_if_dev_id(stable_target.data(), expected_dev_id)", "stable unmount identity")
+    require_order(body, "std::strcmp(mount->path, resolved.data()) == 0", "stream_invalidate_mount_scope(mount->fs_type, stream_scope_key_for_mount(mount));", "exact host umount invalidation")
+    require_order(body, "std::strcmp(target.path(), target.mount()->path) != 0", "stream_invalidate_mount_scope(target.mount()->fs_type, stream_scope_key_for_mount(target.mount()));", "exact private umount invalidation")
+    require_order(body, "expected_dev_id = mount->dev_id;", "unmount_filesystem_if_dev_id(resolved.data(), expected_dev_id, scope, MountPathKind::RETAINED_PHYSICAL)", "stable unmount identity")
     if "return unmount_filesystem(target);" in body:
         fail("vfs_umount() must not retire a replacement mount by pathname alone")
 
 
 def test_vfs_mount_resolves_dev_source_symlinks() -> None:
     source = CORE_CPP.read_text()
-    body = function_body(source, "vfs_mount")
+    body = function_body(source, "vfs_mount_for_task")
     normalized = " ".join(body.split())
     for token in ["LookupIntent::MOUNT_SOURCE", "LookupFollowPolicy::FOLLOW_FINAL, false, true, &source_lookup, 3, false, &CREDENTIALS",
                   "consume_mount_source(source_lookup, *authorization_task, CREDENTIALS, selected)",

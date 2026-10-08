@@ -121,7 +121,8 @@ auto retire_mount_namespace(const mount_ns::NamespaceRef& scope) -> int;
 // owner. This prevents deferred teardown from removing a replacement mounted
 // later at the same path.
 auto unmount_filesystem_if_private_data(const char* path, const void* expected_private_data) -> int;
-auto unmount_filesystem_if_dev_id(const char* path, uint32_t expected_dev_id) -> int;
+auto unmount_filesystem_if_dev_id(const char* path, uint32_t expected_dev_id, const mount_ns::NamespaceRef& scope = {},
+                                  MountPathKind path_kind = MountPathKind::TASK_VISIBLE) -> int;
 // Unmount the mount owned by private_data without re-resolving a path. This is
 // stable across pivot/rebase and is the preferred deferred-teardown identity.
 auto unmount_filesystem_by_private_data(const void* expected_private_data) -> int;
@@ -158,13 +159,16 @@ class PivotMountReferences {
 
    private:
     friend auto remap_mounts_for_pivot(const char*, const char*, const ker::mod::security::Snapshot*, PivotMountReferences*,
-                                       const mount_ns::NamespaceRef&) -> int;
+                                       const mount_ns::NamespaceRef&, const char*) -> int;
     void* state_ = nullptr;
 };
 // Credentials/references are supplied together by the namespace-locked VFS
 // transaction. The legacy two-argument caller does not prepare new covers.
+// A private Task supplies its current physical root for repeatable remaps.
+// Null preserves the historical host spelling; neither form resolves ambient paths.
 auto remap_mounts_for_pivot(const char* new_root, const char* put_old, const ker::mod::security::Snapshot* credentials = nullptr,
-                            PivotMountReferences* references = nullptr, const mount_ns::NamespaceRef& scope = {}) -> int;
+                            PivotMountReferences* references = nullptr, const mount_ns::NamespaceRef& scope = {},
+                            const char* current_root = nullptr) -> int;
 void rebase_wki_mounts_for_new_root(const char* new_root, const mount_ns::NamespaceRef& scope = {});
 
 // Resolve path through the current task's root prefix (same as mount_filesystem

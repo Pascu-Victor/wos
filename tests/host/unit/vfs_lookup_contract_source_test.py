@@ -42,7 +42,7 @@ FAMILIES = {
         "vfs_removexattr_beneath",
     },
     "path.chdir": {"vfs_chdir", "vfs_pin_directory_resolved_beneath_as", "vfs_pin_directory_view_as"},
-    "path.mount": {"vfs_mount", "vfs_umount", "vfs_pivot_root", "vfs_shutdown_unmount_all"},
+    "path.mount": {"vfs_mount", "vfs_mount_for_task", "vfs_umount", "vfs_umount_for_task", "vfs_pivot_root", "vfs_pivot_root_for_task", "vfs_shutdown_unmount_all"},
     "path.batch": {"vfs_metadata_batch"},
     "path.resolve-helper": {"vfs_resolve_dirfd", "vfs_directory_path_beneath"},
     "path.route-policy": {

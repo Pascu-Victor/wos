@@ -1,8 +1,8 @@
 # WOS service compartment design
 
 Goal39 is in progress. Profile preparation, private native SysV IPC namespace
-ownership/lookup, private native mount-table ownership and Task native mount
-lookup/consumption are implemented. No public compartment creation syscall,
+ownership/lookup, private native mount-table ownership, Task native lookup and
+subject mount administration are implemented. No public compartment creation syscall,
 launcher, PID view or complete network/WKI gate is enabled. Independent
 service isolation and all ten goal criteria remain unqualified. Goal28 remains
 incomplete at its committed wire-codec checkpoint while this work proceeds.
@@ -53,8 +53,8 @@ The mount table now partitions native rows by exact retained namespace, while
 table generations, pivot publication and storage remain globally serialized.
 Retained native root/cwd views already enforce object identity and read-only/
 nosuid restrictions. Task ownership, native component lookup and retained lookup
-consumption now carry the exact subject mount namespace. Mount administration,
-remaining compatibility helpers, readdir and procfs still require integration
+consumption and mount administration now carry the exact subject mount namespace.
+Remaining root/compatibility helpers, readdir and procfs still require integration
 before public creation can be enabled. Shared backend
 lifetime must remain distinct from visible mount attachment lifetime before
 cloning existing mount attachments can be supported.
@@ -210,6 +210,38 @@ read-only exec-input open. They check same-path sibling backing, dotdot/links,
 stale rename handles, foreign dirfd refusal with retained fstat capability,
 closure, covered crossings and missing-edge refusal. These are native kernel
 integration tests; they are not user-process escape/service-lifecycle campaigns.
+
+## Subject mount administration
+
+Ambient mount, unmount and pivot wrappers delegate to explicit retained Task
+APIs. A worker selects the subject's immutable namespace and credentials.
+Private mounting accepts tmpfs with no source; devices, PARTUUID, remote URIs,
+other backends and default filesystem detection fail before external effects.
+Preparation and native covered-directory publication use the same exact scope.
+
+Private unmount consumes the actual native target, records its admitted physical
+path and nonreused mount ID, releases lookup/cover pins, and retires only that
+exact scoped identity. It cannot remove a replacement at the same name. A live
+inherited File keeps backing busy and usable. Closed namespaces refuse new
+administration; explicit namespace retirement remains the drain path. Host
+remote detach retains its local identity admission without requiring a fenced
+peer's metadata response, and host export reconciliation stays separate.
+
+Private pivot validates both native directories on the exact new-root mount,
+with put_old strictly beneath it. Captured subject and namespace/mount/backend
+epochs are revalidated after releasing lookup pins. Remapping uses the current
+physical root, so a second pivot rebases relative suffixes rather than duplicating
+the first root prefix. Only filesystem owners in the exact scope change root;
+the retained unpublished subject is included. A plain cwd at the old root moves
+with it. Explicit File/anchor references to remapped backing keep pivot busy;
+these capabilities are not revoked. Host pivot preserves init spelling, bound
+thread root mirrors and WKI export barriers, and does not rewrite private roots.
+
+Three actual unpublished Task fixtures exercise independent mount backing and
+unmount, stale replacement IDs, inherited File busy/drain, unsupported/closed/
+unauthorized refusal, and two pivots including rebased service mounts. They do
+not qualify public compartment entry, scheduled service execution, every root/
+directory/procfs consumer or the required service and lifecycle campaigns.
 
 ## Verification checkpoint
 

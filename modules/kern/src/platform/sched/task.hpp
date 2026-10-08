@@ -315,8 +315,9 @@ struct Task {
     using SignalHandlerTable = std::array<SigHandler, MAX_SIGNALS>;
     using PathBuffer = std::array<char, CWD_MAX>;
     struct FilesystemContext {
-        // Null preserves the global namespace view and its compatibility root
-        // prefix. Non-null retains an exact native root; never serialize it as
+        // Null uses this Task's immutable mount view and compatibility root
+        // prefix. This value does not transfer namespace ownership to another
+        // Task. Non-null retains an exact native root; never serialize it as
         // a pathname or install it without root-aware VFS admission.
         ker::vfs::DirectoryAnchorRef root_anchor;
         ker::vfs::DirectoryAnchorRef cwd_anchor;

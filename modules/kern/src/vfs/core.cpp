@@ -11577,16 +11577,17 @@ auto populate_lookup_path_fields(LookupHandle& handle, const char* path, size_t 
     return 0;
 }
 
-auto lookup_search_authority_current(const LookupHandle& handle) -> bool {
-    auto const GENERATION = handle.authorization().tmpfs_search_generation;
-    auto const XFS_GENERATION = handle.authorization().xfs_search_generation;
+auto lookup_search_authority_current(const LookupAuthorizationContext& authorization) -> bool {
+    auto const GENERATION = authorization.tmpfs_search_generation;
+    auto const XFS_GENERATION = authorization.xfs_search_generation;
     return (GENERATION == 0 || GENERATION == tmpfs::tmpfs_search_authority_generation()) &&
            (XFS_GENERATION == 0 || XFS_GENERATION == xfs::xfs_search_authority_generation());
 }
 
-auto lookup_request_context_matches(const LookupHandle& handle, const ker::mod::sched::task::Task* task,
-                                    const ker::mod::security::Snapshot& credentials) -> bool {
-    auto const& authorization = handle.authorization();
+auto lookup_search_authority_current(const LookupHandle& handle) -> bool { return lookup_search_authority_current(handle.authorization()); }
+
+auto lookup_authorization_context_matches(const LookupAuthorizationContext& authorization, const ker::mod::sched::task::Task* task,
+                                          const ker::mod::security::Snapshot& credentials) -> bool {
     if (task == nullptr || task->pid != authorization.task_id) return false;
     auto* path_owner = task->filesystem_owner();
     if (path_owner == nullptr) return false;
@@ -11599,7 +11600,12 @@ auto lookup_request_context_matches(const LookupHandle& handle, const ker::mod::
         directory_anchor_identity(path_owner->root_anchor) == authorization.root_anchor_identity &&
         directory_anchor_identity(path_owner->cwd_anchor) == authorization.cwd_anchor_identity;
     path_owner->path_metadata_lock.unlock_irqrestore(IRQF);
-    return credentials == authorization.credentials && PATHS_MATCH && lookup_search_authority_current(handle);
+    return credentials == authorization.credentials && PATHS_MATCH && lookup_search_authority_current(authorization);
+}
+
+auto lookup_request_context_matches(const LookupHandle& handle, const ker::mod::sched::task::Task* task,
+                                    const ker::mod::security::Snapshot& credentials) -> bool {
+    return lookup_authorization_context_matches(handle.authorization(), task, credentials);
 }
 
 auto lookup_authorization_still_current(const LookupHandle& handle) -> bool {
@@ -16645,12 +16651,26 @@ auto vfs_fremovexattr(int fd, const char* name) -> int {
 }
 
 // --- umount ---
+namespace {
+auto validate_mount_target_lookup(const LookupHandle& handle, void*) -> int;
+}
+
 auto vfs_umount(const char* target) -> int {
+    auto* task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    return vfs_umount_for_task(task, target);
+}
+
+auto vfs_umount_for_task(ker::mod::sched::task::Task* authorization_task, const char* target) -> int {
     if (target == nullptr) {
         return -EINVAL;
     }
-    auto* authorization_task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
     if (authorization_task == nullptr) return -ESRCH;
+    auto const* subject_scope = authorization_task->mount_namespace();
+    if (subject_scope == nullptr) return -ESRCH;
+    if (subject_scope->closed()) return -EIDRM;
+    mount_ns::NamespaceRef scope;
+    int const RETAIN = subject_scope->retain(scope);
+    if (RETAIN != 0) return RETAIN;
     auto const CREDENTIALS = authorization_task->credentials();
     int const POLICY = ker::mod::security::authorize_mount_administration(CREDENTIALS);
     if (POLICY != 0) return POLICY;
@@ -16661,19 +16681,45 @@ auto vfs_umount(const char* target) -> int {
     // including an empty target, before introducing a blocking transition.
     if (COPY != 0) return -ENAMETOOLONG;
 
-    // Resolve once for mount-scope invalidation lookup.
-    // unmount_filesystem() performs its own task-root-aware resolution,
-    // so passing an already-resolved path would double-prefix after pivot_root.
     std::array<char, MAX_PATH_LEN> resolved{};
-    if (resolve_task_path_raw(stable_target.data(), resolved.data(), resolved.size()) < 0) {
-        return -ENAMETOOLONG;
-    }
-
     uint32_t expected_dev_id = 0;
     bool reconcile_exports = false;
-    {
+    if (!scope.is_host()) {
+        // Admit the native name using the subject, then release all lookup and
+        // cover pins before retirement waits for those references to drain.
+        LookupHandle lookup;
+        int const ACQUIRE = vfs_acquire_lookup(authorization_task, AT_FDCWD, stable_target.data(), LookupIntent::MOUNT_TARGET,
+                                               LookupFollowPolicy::FOLLOW_FINAL, true, true, &lookup, 3, false, &CREDENTIALS);
+        if (ACQUIRE != 0) return ACQUIRE;
+        struct Context {
+            char* path;
+            size_t capacity;
+            uint32_t& id;
+        } context{resolved.data(), resolved.size(), expected_dev_id};
+        auto capture = [](const LookupHandle& target, void* opaque) -> int {
+            int const VALIDATE = validate_mount_target_lookup(target, nullptr);
+            if (VALIDATE != 0) return VALIDATE;
+            if (std::strcmp(target.path(), target.mount()->path) != 0) return -EINVAL;
+            auto& state = *static_cast<Context*>(opaque);
+            int const COPY = snapshot_bounded_path_string(target.path(), state.path, state.capacity, nullptr);
+            if (COPY != 0) return COPY;
+            state.id = target.mount()->dev_id;
+            stream_invalidate_mount_scope(target.mount()->fs_type, stream_scope_key_for_mount(target.mount()));
+            return 0;
+        };
         ker::mod::sys::MutexGuard publication_guard(g_vfs_namespace_publication_mutex);
-        auto mount_ref = find_mount_point(resolved.data());
+        int const ADMIT = consume_lookup_locked(lookup, false, capture, &context, authorization_task, &CREDENTIALS);
+        if (ADMIT != 0) return ADMIT;
+    } else {
+        // Preserve host remote-detach admission: a fenced peer need not answer
+        // a metadata RPC for its exact local proxy to be retired.
+        auto* path_owner = authorization_task->filesystem_owner();
+        if (path_owner == nullptr) return -ESRCH;
+        if (resolve_dirfd_task_path_raw(path_owner, AT_FDCWD, stable_target.data(), resolved.data(), resolved.size(), true, nullptr,
+                                        nullptr, nullptr, nullptr, nullptr, nullptr) < 0)
+            return -ENAMETOOLONG;
+        ker::mod::sys::MutexGuard publication_guard(g_vfs_namespace_publication_mutex);
+        auto mount_ref = find_mount_point(resolved.data(), UNKNOWN_MOUNT_PATH_LEN, scope);
         MountPoint const* mount = mount_ref.get();
         if (mount != nullptr && mount->path != nullptr && std::strcmp(mount->path, resolved.data()) == 0) {
             expected_dev_id = mount->dev_id;
@@ -16690,7 +16736,7 @@ auto vfs_umount(const char* target) -> int {
     // mount can disappear. Remote proxy retirement must not drain its own WKI
     // worker; it already owns exact-group teardown in the mount layer.
     if (reconcile_exports && !ker::net::wki::wki_remote_vfs_prepare_export_rebuild()) return -EBUSY;
-    int const RESULT = unmount_filesystem_if_dev_id(stable_target.data(), expected_dev_id);
+    int const RESULT = unmount_filesystem_if_dev_id(resolved.data(), expected_dev_id, scope, MountPathKind::RETAINED_PHYSICAL);
     if (reconcile_exports) {
         if (RESULT == 0)
             ker::net::wki::wki_remote_vfs_commit_export_unmount(expected_dev_id);
@@ -16702,14 +16748,25 @@ auto vfs_umount(const char* target) -> int {
 
 // --- pivot_root ---
 auto vfs_pivot_root(const char* new_root, const char* put_old) -> int {
+    auto* task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    return vfs_pivot_root_for_task(task, new_root, put_old);
+}
+
+auto vfs_pivot_root_for_task(ker::mod::sched::task::Task* task, const char* new_root, const char* put_old) -> int {
     if (new_root == nullptr || put_old == nullptr) {
         return -EINVAL;
     }
 
-    auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) {
         return -ESRCH;
     }
+    auto* path_owner = task->filesystem_owner();
+    auto const* subject_scope = task->mount_namespace();
+    if (path_owner == nullptr || subject_scope == nullptr) return -ESRCH;
+    if (subject_scope->closed()) return -EIDRM;
+    mount_ns::NamespaceRef scope;
+    int const RETAIN = subject_scope->retain(scope);
+    if (RETAIN != 0) return RETAIN;
 
     auto const CREDENTIALS = task->credentials();
     int const POLICY = ker::mod::security::authorize_mount_administration(CREDENTIALS);
@@ -16730,10 +16787,56 @@ auto vfs_pivot_root(const char* new_root, const char* put_old) -> int {
     if (PUT_OLD_COPY != 0) {
         return PUT_OLD_COPY;
     }
+    std::array<char, MOUNT_PATH_MAX> old_root{};
+    LookupAuthorizationContext admission{};
+    uint64_t admitted_namespace = 0, admitted_mounts = 0, admitted_backend = 0;
+    uint32_t admitted_new_mount = 0;
+    if (!scope.is_host()) {
+        // Native handles prove search, directory identity and root containment.
+        // The two paths must belong to the same new-root backing mount.
+        LookupHandle root_lookup, old_lookup;
+        int result = vfs_acquire_lookup(task, AT_FDCWD, stable_new_root.data(), LookupIntent::MOUNT_TARGET,
+                                        LookupFollowPolicy::FOLLOW_FINAL, true, true, &root_lookup, 3, false, &CREDENTIALS);
+        if (result != 0) return result;
+        result = vfs_acquire_lookup(task, AT_FDCWD, stable_put_old.data(), LookupIntent::MOUNT_TARGET, LookupFollowPolicy::FOLLOW_FINAL,
+                                    true, true, &old_lookup, 3, false, &CREDENTIALS);
+        if (result != 0) return result;
+        {
+            ker::mod::sys::MutexGuard publication_guard(g_vfs_namespace_publication_mutex);
+            auto validate = [](const LookupHandle& root, const LookupHandle& old, void*) -> int {
+                int const ROOT = validate_mount_target_lookup(root, nullptr);
+                if (ROOT != 0) return ROOT;
+                int const OLD = validate_mount_target_lookup(old, nullptr);
+                if (OLD != 0) return OLD;
+                if (root.mount()->fs_type != FSType::TMPFS || root.directory_view() || old.directory_view()) return -ENOTSUP;
+                if (std::strcmp(root.path(), root.mount()->path) != 0 || old.path_length() <= root.path_length() ||
+                    !path_prefix_matches(old.path(), root.path(), root.path_length()))
+                    return -EINVAL;
+                return 0;
+            };
+            result = consume_lookup_pair_locked(root_lookup, old_lookup, false, validate, nullptr, task, &CREDENTIALS);
+            if (result != 0) return result;
+            admission = root_lookup.authorization();
+            admitted_namespace = root_lookup.namespace_generation();
+            admitted_mounts = root_lookup.mount_generation();
+            admitted_backend = root_lookup.backend_generation();
+            admitted_new_mount = root_lookup.mount()->dev_id;
+            result = snapshot_bounded_path_string(root_lookup.path(), stable_new_root.data(), stable_new_root.size(), &new_root_len);
+            if (result == 0)
+                result = snapshot_bounded_path_string(old_lookup.path(), stable_put_old.data(), stable_put_old.size(), nullptr);
+            if (result != 0) return result;
+            uint64_t const IRQF = path_owner->path_metadata_lock.lock_irqsave();
+            result = snapshot_bounded_path_string(path_owner->root.data(), old_root.data(), old_root.size(), nullptr);
+            path_owner->path_metadata_lock.unlock_irqrestore(IRQF);
+            if (result != 0) return result;
+        }
+        // Their membership proofs pin the old covered root. Drop them before
+        // remap's busy check, then revalidate captured values under publication.
+    }
 
     // Stop new owner-side VFS attaches/operations and drain existing binding
     // users before mount paths can change underneath an advertised export.
-    bool const WKI_REBUILD_REQUIRED = ker::net::wki::g_wki.initialized;
+    bool const WKI_REBUILD_REQUIRED = scope.is_host() && ker::net::wki::g_wki.initialized;
     if (WKI_REBUILD_REQUIRED && !ker::net::wki::wki_remote_vfs_prepare_export_rebuild()) {
         return -EBUSY;
     }
@@ -16744,12 +16847,46 @@ auto vfs_pivot_root(const char* new_root, const char* put_old) -> int {
         // unlocks, including on failure. WKI drain/rebuild stay outside.
         PivotMountReferences references;
         ker::mod::sys::MutexGuard publication_guard(g_vfs_namespace_publication_mutex);
-        remap_result = remap_mounts_for_pivot(stable_new_root.data(), stable_put_old.data(), &CREDENTIALS, &references);
+        if (!scope.is_host()) {
+            if (scope.closed()) return -EIDRM;
+            if (!lookup_authorization_context_matches(admission, task, CREDENTIALS) ||
+                admitted_namespace != g_vfs_namespace_generation.load(std::memory_order_acquire) ||
+                admitted_mounts != mount_table_generation_snapshot() || admitted_backend != tmpfs::tmpfs_namespace_generation())
+                return -EAGAIN;
+            {
+                auto selected = find_mount_point(stable_new_root.data(), new_root_len, scope);
+                if (!selected || selected.get()->dev_id != admitted_new_mount) return -EAGAIN;
+            }
+        }
+        remap_result = remap_mounts_for_pivot(stable_new_root.data(), stable_put_old.data(), &CREDENTIALS, &references, scope,
+                                              scope.is_host() ? nullptr : old_root.data());
         if (remap_result == 0) {
-            // Set root to new_root for ALL active tasks (not just the caller).
-            // Kernel threads (TCP timer, WKI timer, netpoll workers, backlog handlers)
-            // must see the same root so that VFS paths like /wki/... resolve through
-            // the correct mount hierarchy after the root has moved.
+            // Host workers retain their shared root; private pivots update only
+            // exact-scope process owners. Include a retained unpublished subject.
+            auto update_root = [&](ker::mod::sched::task::Task* subject) {
+                auto const* owned_scope = subject->mount_namespace();
+                if (owned_scope == nullptr || *owned_scope != scope) return;
+                auto* owner = subject->filesystem_owner();
+                if (owner == nullptr) return;
+                const char* const PREVIOUS = scope.is_host() ? "/" : old_root.data();
+                auto publish = [&](ker::mod::sched::task::Task* paths) {
+                    uint64_t const IRQF = paths->path_metadata_lock.lock_irqsave();
+                    if (std::strcmp(paths->root.data(), PREVIOUS) == 0) {
+                        std::memcpy(paths->root.data(), stable_new_root.data(), new_root_len + 1);
+                        paths->root_len = static_cast<uint16_t>(new_root_len);
+                        if (!scope.is_host() && !paths->cwd_anchor && std::strcmp(paths->cwd.data(), PREVIOUS) == 0) {
+                            std::memcpy(paths->cwd.data(), stable_new_root.data(), new_root_len + 1);
+                            paths->cwd_len = static_cast<uint16_t>(new_root_len);
+                        }
+                    }
+                    paths->path_metadata_lock.unlock_irqrestore(IRQF);
+                };
+                publish(owner);
+                // Legacy host helpers still read a bound thread's root text.
+                // Keep those mirrors consistent with the canonical owner.
+                if (scope.is_host() && owner != subject) publish(subject);
+            };
+            update_root(task);
             {
                 uint32_t const COUNT = ker::mod::sched::get_active_task_count();
                 for (uint32_t i = 0; i < COUNT; ++i) {
@@ -16757,13 +16894,7 @@ auto vfs_pivot_root(const char* new_root, const char* put_old) -> int {
                     if (t == nullptr) {
                         continue;
                     }
-                    uint64_t const PATH_IRQF = t->path_metadata_lock.lock_irqsave();
-                    // Only update tasks that still have the old root "/"
-                    if (t->root[0] == '/' && t->root[1] == '\0') {
-                        std::memcpy(t->root.data(), stable_new_root.data(), new_root_len + 1);
-                        t->root_len = static_cast<uint16_t>(new_root_len);
-                    }
-                    t->path_metadata_lock.unlock_irqrestore(PATH_IRQF);
+                    update_root(t);
                     t->release();
                 }
             }
@@ -16771,7 +16902,7 @@ auto vfs_pivot_root(const char* new_root, const char* put_old) -> int {
             // WKI auto-mounts are driven by deferred work and can land after the
             // initial mount snapshot above, while this pivot is still in progress.
             // Rebase any stale /wki mounts once task roots now point at new_root.
-            rebase_wki_mounts_for_new_root(stable_new_root.data());
+            rebase_wki_mounts_for_new_root(stable_new_root.data(), scope);
             g_vfs_namespace_generation.fetch_add(1, std::memory_order_acq_rel);
         }
     }
@@ -27713,6 +27844,7 @@ auto consume_prepared_mount_target(LookupHandle& lookup, const char* target, ker
         if (lookup.mount()->fs_type != FSType::TMPFS || lookup.mount()->dev_id != MOUNT_ID || lookup.directory_view() ||
             lookup.parent_identity() != PARENT_ID || lookup.object_identity() != OBJECT_ID ||
             std::strcmp(lookup.path(), physical_path.data()) != 0 || current.task_id != AUTHORIZATION.task_id ||
+            current.mount_namespace_generation != AUTHORIZATION.mount_namespace_generation ||
             current.credentials != AUTHORIZATION.credentials || current.root_hash != AUTHORIZATION.root_hash ||
             current.cwd_hash != AUTHORIZATION.cwd_hash || current.root_anchor_identity != AUTHORIZATION.root_anchor_identity ||
             current.cwd_anchor_identity != AUTHORIZATION.cwd_anchor_identity ||
@@ -27728,6 +27860,12 @@ auto consume_prepared_mount_target(LookupHandle& lookup, const char* target, ker
 }  // namespace
 
 auto vfs_mount(const char* source, const char* target, const char* fstype, unsigned long flags, const char* data) -> int {
+    auto* task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    return vfs_mount_for_task(task, source, target, fstype, flags, data);
+}
+
+auto vfs_mount_for_task(ker::mod::sched::task::Task* authorization_task, const char* source, const char* target, const char* fstype,
+                        unsigned long flags, const char* data) -> int {
     if (ker::mod::power::shutdown_in_progress()) {
         return -ESHUTDOWN;
     }
@@ -27736,11 +27874,19 @@ auto vfs_mount(const char* source, const char* target, const char* fstype, unsig
         return -EINVAL;
     }
 
-    auto* authorization_task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
     if (authorization_task == nullptr) return -ESRCH;
+    auto const* subject_scope = authorization_task->mount_namespace();
+    if (subject_scope == nullptr) return -ESRCH;
+    if (subject_scope->closed()) return -EIDRM;
+    mount_ns::NamespaceRef scope;
+    int const RETAIN = subject_scope->retain(scope);
+    if (RETAIN != 0) return RETAIN;
     auto const CREDENTIALS = authorization_task->credentials();
     int const POLICY = ker::mod::security::authorize_mount_administration(CREDENTIALS);
     if (POLICY != 0) return POLICY;
+    // No device resolution, probing, discovery or remote attach can precede
+    // this gate. Private backing support is deliberately native tmpfs only.
+    if (!scope.is_host() && (source != nullptr || fstype == nullptr || std::strcmp(fstype, "tmpfs") != 0)) return -ENOTSUP;
 
     // Mounting does not create namespace entries. Init and tools explicitly
     // create their targets; a failed preparation must leave no directory behind.
@@ -27888,7 +28034,7 @@ auto vfs_mount(const char* source, const char* target, const char* fstype, unsig
 
     PreparedMount prepared{};
     int const PREPARE = prepare_mount_filesystem(lookup.path(), effective_fstype, bdev, flags, data, nullptr, nullptr, &prepared,
-                                                 MountPathKind::RETAINED_PHYSICAL);
+                                                 MountPathKind::RETAINED_PHYSICAL, scope);
     if (PREPARE != 0) {
         return PREPARE;
     }

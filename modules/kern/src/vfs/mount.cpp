@@ -1639,8 +1639,8 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
 
 namespace {
 auto unmount_filesystem_impl(const char* path, const void* expected_private_data, bool require_private_data_match,
-                             uint32_t expected_dev_id = 0, bool require_dev_id_match = false, const mount_ns::NamespaceRef& scope = {})
-    -> int {
+                             uint32_t expected_dev_id = 0, bool require_dev_id_match = false, const mount_ns::NamespaceRef& scope = {},
+                             MountPathKind path_kind = MountPathKind::TASK_VISIBLE) -> int {
     if (path == nullptr) {
         return -EINVAL;
     }
@@ -1653,8 +1653,9 @@ auto unmount_filesystem_impl(const char* path, const void* expected_private_data
         // Resolve again after every pivot retry so the task-root prefix and
         // stored mount namespace stay in the same publication epoch.
         std::array<char, MAX_MOUNT_PATH> resolved __attribute__((uninitialized));
-        int const PATH_RET = scope.is_host() ? resolve_mount_path(path, resolved.data(), resolved.size())
-                                             : (path[0] == '/' ? copy_mount_path_string(path, resolved.data(), resolved.size()) : -EINVAL);
+        int const PATH_RET = scope.is_host() && path_kind == MountPathKind::TASK_VISIBLE
+                                 ? resolve_mount_path(path, resolved.data(), resolved.size())
+                                 : (path[0] == '/' ? copy_mount_path_string(path, resolved.data(), resolved.size()) : -EINVAL);
         if (PATH_RET < 0) {
             return PATH_RET;
         }
@@ -1663,6 +1664,10 @@ auto unmount_filesystem_impl(const char* path, const void* expected_private_data
         if (mount_pivot_epoch.load(std::memory_order_acquire) != PIVOT_EPOCH) {
             mount_lock.unlock();
             continue;
+        }
+        if (scope.closed()) {
+            mount_lock.unlock();
+            return -EIDRM;
         }
         for (size_t i = 0; i < mounts.size(); ++i) {
             MountPoint* mp = mounts.at(i);
@@ -1767,11 +1772,12 @@ auto unmount_filesystem_if_private_data(const char* path, const void* expected_p
     return unmount_filesystem_impl(path, expected_private_data, true);
 }
 
-auto unmount_filesystem_if_dev_id(const char* path, uint32_t expected_dev_id) -> int {
+auto unmount_filesystem_if_dev_id(const char* path, uint32_t expected_dev_id, const mount_ns::NamespaceRef& scope, MountPathKind path_kind)
+    -> int {
     if (expected_dev_id == 0) {
         return -EINVAL;
     }
-    return unmount_filesystem_impl(path, nullptr, false, expected_dev_id, true);
+    return unmount_filesystem_impl(path, nullptr, false, expected_dev_id, true, scope, path_kind);
 }
 
 auto unmount_filesystem_by_private_data(const void* expected_private_data) -> int {
@@ -2049,7 +2055,7 @@ auto configure_mount_point_exact(const char* path, FSType expected_type, void* p
 PivotMountReferences::~PivotMountReferences() { delete static_cast<PivotCoverState*>(state_); }
 
 auto remap_mounts_for_pivot(const char* new_root, const char* put_old, const ker::mod::security::Snapshot* credentials,
-                            PivotMountReferences* references, const mount_ns::NamespaceRef& scope) -> int {
+                            PivotMountReferences* references, const mount_ns::NamespaceRef& scope, const char* current_root) -> int {
     if ((credentials == nullptr) != (references == nullptr) || (references != nullptr && references->state_ != nullptr)) return -EINVAL;
     PivotMountReferences local_references;
     auto& reference_owner = references != nullptr ? *references : local_references;
@@ -2065,6 +2071,19 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old, const ker
     if (NEW_ROOT_LEN >= MAX_MOUNT_PATH || PUT_OLD_LEN >= MAX_MOUNT_PATH) {
         return -ENAMETOOLONG;
     }
+    if (current_root != nullptr && scope.is_host()) return -ENOTSUP;
+    const char* const OLD_ROOT = current_root != nullptr ? current_root : "/";
+    size_t const OLD_ROOT_LEN = std::strlen(OLD_ROOT);
+    if (OLD_ROOT_LEN == 0 || OLD_ROOT_LEN >= MAX_MOUNT_PATH || OLD_ROOT[0] != '/') return -EINVAL;
+    auto under_old_root = [&](const char* path) {
+        return OLD_ROOT_LEN == 1 ? path[0] == '/' : path_is_under_root(path, OLD_ROOT, OLD_ROOT_LEN);
+    };
+    if (current_root != nullptr &&
+        (!under_old_root(new_root) || !path_is_under_root(put_old, new_root, NEW_ROOT_LEN) || PUT_OLD_LEN <= NEW_ROOT_LEN))
+        return -EINVAL;
+    auto old_root_suffix = [&](const MountPoint* mount) {
+        return mount->path + (current_root != nullptr && OLD_ROOT_LEN != 1 ? OLD_ROOT_LEN : 0);
+    };
 
     mount_lock.lock();
     if (scope.closed()) {
@@ -2110,7 +2129,12 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old, const ker
         if (std::strcmp(mp->path, new_root) == 0) {
             new_mount = mp;
         }
-        if (std::strcmp(mp->path, "/") == 0) {
+        if (current_root != nullptr && !under_old_root(mp->path)) {
+            mount_pivot_epoch.store(ODD_EPOCH + 1, std::memory_order_release);
+            mount_lock.unlock();
+            return -EXDEV;
+        }
+        if (std::strcmp(mp->path, OLD_ROOT) == 0) {
             old_root_mount = mp;
         }
     }
@@ -2124,6 +2148,11 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old, const ker
         mount_pivot_epoch.store(ODD_EPOCH + 1, std::memory_order_release);
         mount_lock.unlock();
         return -EINVAL;
+    }
+    if (current_root != nullptr && old_root_mount == nullptr) {
+        mount_pivot_epoch.store(ODD_EPOCH + 1, std::memory_order_release);
+        mount_lock.unlock();
+        return -EXDEV;
     }
 
     if (old_root_mount != nullptr && mount_has_active_refs_locked(old_root_mount)) {
@@ -2144,7 +2173,7 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old, const ker
             mount_lock.unlock();
             return -EBUSY;
         }
-        if (mp->path_len >= MAX_MOUNT_PATH - NEW_ROOT_LEN) {
+        if (std::strlen(old_root_suffix(mp)) >= MAX_MOUNT_PATH - NEW_ROOT_LEN) {
             mount_pivot_epoch.store(ODD_EPOCH + 1, std::memory_order_release);
             mount_lock.unlock();
             return -ENAMETOOLONG;
@@ -2180,7 +2209,7 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old, const ker
 
     ker::util::SmallVec<PivotMountReplacement, 8> replacements;
     for (auto* mp : replacement_mounts) {
-        size_t const TARGET_LEN = mp == old_root_mount ? PUT_OLD_LEN : NEW_ROOT_LEN + mp->path_len;
+        size_t const TARGET_LEN = mp == old_root_mount ? PUT_OLD_LEN : NEW_ROOT_LEN + std::strlen(old_root_suffix(mp));
         auto* target = new char[TARGET_LEN + 1];
         if (target == nullptr) {
             release_pivot_replacements(replacements);
@@ -2189,7 +2218,7 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old, const ker
         if (mp == old_root_mount) {
             std::memcpy(target, put_old, PUT_OLD_LEN + 1);
         } else {
-            std::snprintf(target, TARGET_LEN + 1, "%s%s", new_root, mp->path);
+            std::snprintf(target, TARGET_LEN + 1, "%s%s", new_root, old_root_suffix(mp));
         }
         PivotMountReplacement const REPLACEMENT = {.mount = mp, .path = target, .path_len = TARGET_LEN};
         if (!replacements.push_back(REPLACEMENT)) {
