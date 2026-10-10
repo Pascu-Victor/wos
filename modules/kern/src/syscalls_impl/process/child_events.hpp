@@ -134,6 +134,9 @@ struct ConditionalProbe {
 
 // Returns the process leader with a lifetime reference owned by the caller.
 [[nodiscard]] auto acquire_process_owner(sched_task::Task& task) -> sched_task::Task*;
+// Caller retains task; its canonical owner is retained by thread binding.
+// Snapshot parent membership under lifecycle, without a numeric registry lookup.
+[[nodiscard]] auto namespace_parent_pid(const sched_task::Task& task) -> uint64_t;
 
 [[nodiscard]] auto selector_for_process_group(uint64_t process_group, ker::mod::sched::session::Origin origin = {}) -> Selector;
 // Resolve numeric aliases only within the owner's child/tracer authority.

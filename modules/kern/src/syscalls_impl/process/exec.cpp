@@ -3866,6 +3866,23 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         cleanup_unpublished_task();
         return static_cast<uint64_t>(-EAGAIN);
     }
+    uint64_t const CHILD_VISIBLE_PID = new_task->namespace_tid();
+
+    // PT_INTERP construction can resolve paths and block. Install the exact
+    // inherited roots while fatal-exit recovery still owns this child.
+    {
+        ker::mod::sched::task::Task::FilesystemContext filesystem;
+        if (!parent_task->capture_filesystem_context(filesystem)) {
+            cleanup_unpublished_task();
+            return 0;
+        }
+        new_task->cwd = filesystem.cwd;
+        new_task->cwd_len = filesystem.cwd_len;
+        new_task->root = filesystem.root;
+        new_task->root_len = filesystem.root_len;
+        new_task->root_anchor = std::move(filesystem.root_anchor);
+        new_task->cwd_anchor = std::move(filesystem.cwd_anchor);
+    }
 
     if (FILE_BACKED_ELF) {
         loader::elf::ElfLazyLoadRangeVec loader_lazy_ranges;
@@ -3906,19 +3923,6 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
 
     // Inherit process execution context from the parent before applying
     // executable-specific overrides such as setuid/setgid.
-    {
-        ker::mod::sched::task::Task::FilesystemContext filesystem;
-        if (!parent_task->capture_filesystem_context(filesystem)) {
-            cleanup_unpublished_task();
-            return 0;
-        }
-        new_task->cwd = filesystem.cwd;
-        new_task->cwd_len = filesystem.cwd_len;
-        new_task->root = filesystem.root;
-        new_task->root_len = filesystem.root_len;
-        new_task->root_anchor = std::move(filesystem.root_anchor);
-        new_task->cwd_anchor = std::move(filesystem.cwd_anchor);
-    }
     (void)new_task->exchange_creation_mask(parent_task->creation_mask());
     auto child_job = parent_task->job_identity_snapshot();
     child_job.internal.exec_completed = false;
@@ -4237,9 +4241,9 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
             dbg::log("wos_proc_exec: remote publication lost child ownership for PID %x", CHILD_PID);
             // The child is already published remotely. Report its PID so a
             // posix_spawn caller cannot fall back and launch it a second time.
-            return CHILD_PID;
+            return CHILD_VISIBLE_PID;
         }
-        return CHILD_PID;
+        return CHILD_VISIBLE_PID;
     }
     if (remote_result == ker::net::wki::WkiRemoteSpawnResult::FAILED) {
         cleanup_unpublished_task();
@@ -4273,9 +4277,9 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         dbg::log("wos_proc_exec: local publication lost child ownership for PID %x", CHILD_PID);
         // post_task_balanced() already made the child runnable. A failure
         // result here would make mlibc retry via fork+exec and run it twice.
-        return CHILD_PID;
+        return CHILD_VISIBLE_PID;
     }
-    return CHILD_PID;
+    return CHILD_VISIBLE_PID;
 
     // Note: elfBuffer is now owned by the task and will be cleaned up when the task exits
 }
@@ -4560,9 +4564,10 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     ker::loader::elf::TlsModule tls_info{};
     bool const ELF_CONTRACT_VALID = FILE_BACKED_ELF ? loader::elf::inspect_tls(prepared_elf.view, tls_info)
                                                     : loader::elf::inspect_tls(elf_buffer, static_cast<size_t>(FILE_SIZE), tls_info);
-    auto* new_thread = ELF_CONTRACT_VALID ? mod::sched::threading::create_thread(ker::mod::mm::USER_STACK_SIZE, tls_info.tls_size,
-                                                                                 new_pagemap, PROCESS_OWNER->pid, tls_info, task)
-                                          : nullptr;
+    auto* new_thread = ELF_CONTRACT_VALID
+                           ? mod::sched::threading::create_thread(ker::mod::mm::USER_STACK_SIZE, tls_info.tls_size, new_pagemap,
+                                                                  PROCESS_OWNER->namespace_tid(), tls_info, task)
+                           : nullptr;
     uint64_t new_mmap_cursor = 0;
     char* new_name = nullptr;
     LazyVmemRangeVec new_lazy_ranges;

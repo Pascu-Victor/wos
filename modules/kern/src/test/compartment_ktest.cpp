@@ -5,15 +5,22 @@
 #include <dev/pty.hpp>
 #include <initializer_list>
 #include <memory>
+#include <platform/loader/elf_loader.hpp>
+#include <platform/mm/addr.hpp>
+#include <platform/mm/phys.hpp>
+#include <platform/mm/virt.hpp>
 #include <platform/sched/ipc_namespace.hpp>
 #include <platform/sched/pid_namespace.hpp>
 #include <platform/sched/resource.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/session.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/sched/threading.hpp>
 #include <platform/security/credentials.hpp>
+#include <platform/sys/usercopy.hpp>
 #include <syscalls_impl/process/child_events.hpp>
 #include <syscalls_impl/shm/shm.hpp>
+#include <syscalls_impl/vmem/sys_vmem.hpp>
 #include <test/ktest.hpp>
 #include <vfs/fd_reservation.hpp>
 #include <vfs/filesystem_context.hpp>
@@ -193,6 +200,231 @@ void expect_visible(const Task& requester, uint64_t id, Task* expected, bool lif
     if (found != nullptr) found->release();
 }
 }  // namespace
+
+KTEST(CompartmentIdentity, CanonicalSelfAndParentNamesUseRetainedMembership) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        RegistryTask host, init, creator, child, sibling, grandchild;
+        KREQUIRE_TRUE(init.task->initialize_pid_namespace(scope));
+        creator.task->is_thread = true;
+        creator.task->owner_pid = init.task->pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(*creator.task, *init.task));
+        KREQUIRE_TRUE(resource::inherit(*child.task, *creator.task));
+        sibling.task->is_thread = true;
+        sibling.task->owner_pid = child.task->pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(*sibling.task, *child.task));
+        KREQUIRE_TRUE(resource::inherit(*grandchild.task, *sibling.task));
+        PublicationRollback const INIT_MEMBERSHIP{*init.task}, CHILD_MEMBERSHIP{*child.task}, GRANDCHILD_MEMBERSHIP{*grandchild.task};
+        KREQUIRE_TRUE(child_events::begin_publication(*host.task, *init.task));
+        KREQUIRE_TRUE(child_events::begin_publication(*creator.task, *child.task));
+        KREQUIRE_TRUE(child_events::begin_publication(*sibling.task, *grandchild.task));
+        creator.task->parent_pid = 0x123456;
+        sibling.task->parent_pid = host.task->pid;
+        KEXPECT_EQ(sched::task::namespace_process_pid(*init.task), uint64_t{1});
+        KEXPECT_EQ(sched::task::namespace_process_pid(*creator.task), uint64_t{1});
+        KEXPECT_EQ(creator.task->namespace_tid(), uint64_t{2});
+        KEXPECT_EQ(sched::task::namespace_process_pid(*sibling.task), uint64_t{3});
+        KEXPECT_EQ(sibling.task->namespace_tid(), uint64_t{4});
+        KEXPECT_EQ(child_events::namespace_parent_pid(*init.task), uint64_t{0});
+        KEXPECT_EQ(child_events::namespace_parent_pid(*creator.task), uint64_t{0});
+        KEXPECT_EQ(child_events::namespace_parent_pid(*child.task), uint64_t{1});
+        KEXPECT_EQ(child_events::namespace_parent_pid(*sibling.task), uint64_t{1});
+        KEXPECT_EQ(child_events::namespace_parent_pid(*grandchild.task), uint64_t{3});
+        auto* owner = child_events::acquire_process_owner(*sibling.task);
+        KREQUIRE_TRUE(owner == child.task.get());
+        owner->release();
+        // No physical registry entries are needed to observe these retained
+        // process relationships, even after admission closes.
+        scope.close();
+        KEXPECT_EQ(sched::task::namespace_process_pid(*sibling.task), uint64_t{3});
+        KEXPECT_EQ(child_events::namespace_parent_pid(*sibling.task), uint64_t{1});
+        KEXPECT_EQ(child_events::namespace_parent_pid(*grandchild.task), uint64_t{3});
+        KEXPECT_EQ(sched::task::process_pid(*sibling.task), child.task->pid);
+        KEXPECT_EQ(init.task->parent_pid, host.task->pid);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentIdentity, ForeignMissingAndReplacedParentsNeverUseNumericAliases) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef first, second;
+        KREQUIRE_EQ(pid_ns::create_namespace(first), 0);
+        KREQUIRE_EQ(pid_ns::create_namespace(second), 0);
+        RegistryTask init, foreign, child, replacement, thread, host, host_thread, unbound;
+        KREQUIRE_TRUE(init.task->initialize_pid_namespace(first));
+        KREQUIRE_TRUE(foreign.task->initialize_pid_namespace(second));
+        KREQUIRE_TRUE(resource::inherit(*child.task, *init.task));
+        KREQUIRE_TRUE(resource::inherit(*replacement.task, *init.task));
+        thread.task->is_thread = true;
+        thread.task->owner_pid = child.task->pid;
+        thread.task->parent_pid = init.task->pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(*thread.task, *child.task));
+        PublicationRollback const CHILD_MEMBERSHIP{*child.task};
+        KREQUIRE_TRUE(child_events::begin_publication(*foreign.task, *child.task));
+        KEXPECT_EQ(child_events::namespace_parent_pid(*thread.task), uint64_t{0});
+        child_events::abort_publication(*child.task);
+        child.task->parent_pid = foreign.task->pid;
+        KEXPECT_EQ(child_events::namespace_parent_pid(*child.task), uint64_t{0});
+        KREQUIRE_TRUE(child_events::begin_publication(*replacement.task, *child.task));
+        KEXPECT_EQ(child_events::namespace_parent_pid(*thread.task), uint64_t{3});
+        KEXPECT_EQ(thread.task->parent_pid, init.task->pid);
+        host_thread.task->is_thread = true;
+        host_thread.task->owner_pid = host.task->pid;
+        host_thread.task->parent_pid = 0xdead;
+        KREQUIRE_TRUE(resource::bind_thread_owner(*host_thread.task, *host.task));
+        KEXPECT_EQ(child_events::namespace_parent_pid(*host_thread.task), uint64_t{1});
+        host.task->parent_pid = foreign.task->pid;
+        KEXPECT_EQ(child_events::namespace_parent_pid(*host_thread.task), foreign.task->pid);
+        KEXPECT_EQ(sched::task::namespace_process_pid(*host_thread.task), host.task->pid);
+        KEXPECT_EQ(host_thread.task->namespace_tid(), host_thread.task->pid);
+        unbound.task->is_thread = true;
+        unbound.task->owner_pid = host.task->pid;
+        KEXPECT_EQ(sched::task::namespace_process_pid(*unbound.task), uint64_t{0});
+        KEXPECT_EQ(unbound.task->namespace_tid(), uint64_t{0});
+        KEXPECT_EQ(child_events::namespace_parent_pid(*unbound.task), uint64_t{0});
+        KEXPECT_NULL(child_events::acquire_process_owner(*unbound.task));
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+namespace {
+namespace mm = ker::mod::mm;
+namespace usercopy = ker::mod::sys::usercopy;
+namespace threading = sched::threading;
+struct UserTask {
+    std::unique_ptr<Task> task = std::make_unique<Task>();
+    threading::Thread cache_thread{};
+    threading::Thread* created_thread{};
+    UserTask() {
+        task->pid = sched::task::get_next_pid();
+        task->type = sched::task::TaskType::PROCESS;
+        task->pagemap = mm::virt::create_pagemap();
+    }
+    ~UserTask() {
+        if (created_thread != nullptr) threading::destroy_thread(created_thread);
+        task->thread = nullptr;
+        if (auto* pagemap = task->detach_pagemap_after_usercopy_quiescence(); pagemap != nullptr) {
+            mm::virt::destroy_user_space(pagemap, task->pid, "compartment_ktest", "identity-fixture");
+            mm::virt::release_pagemap(pagemap, task->pid);
+        }
+        KEXPECT_EQ(task->ref_count.load(), uint32_t{1});
+    }
+    auto map_zero(uint64_t address) -> bool {
+        auto* page = mm::phys::page_alloc(mm::PhysicalPageOwner::SELFTEST, mm::paging::PAGE_SIZE, "compartment_tcb");
+        if (page == nullptr) return false;
+        std::memset(page, 0, mm::paging::PAGE_SIZE);
+        auto const PHYSICAL = reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(page)));
+        mm::virt::map_page(task->pagemap, address, PHYSICAL, mm::paging::page_types::USER);
+        return mm::virt::translate(task->pagemap, address) == PHYSICAL;
+    }
+    auto tid(uint64_t tcb) -> int {
+        int result = -1;
+        KEXPECT_TRUE(usercopy::copy_value_from_task(*task, tcb + threading::MLIBC_TCB_TID_OFFSET, result));
+        return result;
+    }
+};
+}  // namespace
+
+KTEST(CompartmentIdentity, ForkTcbPublicationBreaksCowWithoutChangingParent) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        constexpr uint64_t TCB = 0x48000000;
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        UserTask parent, child;
+        KREQUIRE_NE(parent.task->pagemap, nullptr);
+        KREQUIRE_NE(child.task->pagemap, nullptr);
+        KREQUIRE_TRUE(parent.task->initialize_pid_namespace(scope));
+        KREQUIRE_TRUE(resource::inherit(*child.task, *parent.task));
+        KREQUIRE_TRUE(parent.map_zero(TCB));
+        KREQUIRE_TRUE(threading::publish_tid_to_tcb(*parent.task, TCB, parent.task->namespace_tid(), true));
+        uint32_t const DID_EXIT = 0x3a5b6c7d;
+        KREQUIRE_TRUE(usercopy::copy_value_to_task(*parent.task, TCB + 0x1c, DID_EXIT));
+        KREQUIRE_TRUE(mm::virt::deep_copy_user_pagemap_cow(parent.task->pagemap, child.task->pagemap));
+        KEXPECT_FALSE(threading::publish_tid_to_tcb(*child.task, TCB, child.task->namespace_tid(), false));
+        KEXPECT_EQ(parent.tid(TCB), 1);
+        KEXPECT_EQ(child.tid(TCB), 1);
+        KREQUIRE_TRUE(threading::publish_tid_to_tcb(*child.task, TCB, child.task->namespace_tid(), true));
+        KEXPECT_EQ(parent.tid(TCB), 1);
+        KEXPECT_EQ(child.tid(TCB), 2);
+        KEXPECT_NE(mm::virt::translate(parent.task->pagemap, TCB), mm::virt::translate(child.task->pagemap, TCB));
+        uint32_t child_exit = 0;
+        KREQUIRE_TRUE(usercopy::copy_value_from_task(*child.task, TCB + 0x1c, child_exit));
+        KEXPECT_EQ(child_exit, DID_EXIT);
+        KEXPECT_FALSE(threading::publish_tid_to_tcb(*child.task, TCB + 1, 99, true));
+        KEXPECT_FALSE(threading::publish_tid_to_tcb(*child.task, UINT64_MAX, 99, true));
+        KEXPECT_EQ(child.tid(TCB), 2);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentIdentity, SharedCloneTcbRefusesVirtualAndPhysicalParentAliases) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        constexpr uint64_t PARENT_TCB = 0x49000000, CHILD_TCB = 0x49001000, ALIAS_TCB = 0x49002000;
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        UserTask parent;
+        KREQUIRE_NE(parent.task->pagemap, nullptr);
+        KREQUIRE_TRUE(parent.task->initialize_pid_namespace(scope));
+        KREQUIRE_TRUE(parent.map_zero(PARENT_TCB));
+        KREQUIRE_TRUE(parent.map_zero(CHILD_TCB));
+        parent.cache_thread.fsbase = PARENT_TCB;
+        parent.task->thread = &parent.cache_thread;
+        KREQUIRE_TRUE(threading::publish_tid_to_tcb(*parent.task, PARENT_TCB, 1, true));
+        auto const PHYSICAL = mm::virt::translate(parent.task->pagemap, PARENT_TCB);
+        mm::phys::page_ref_inc(reinterpret_cast<void*>(mm::addr::get_virt_pointer(PHYSICAL)));
+        mm::virt::map_page(parent.task->pagemap, ALIAS_TCB, PHYSICAL, mm::paging::page_types::USER);
+        {
+            ker::syscall::vmem::SharedVmemPublicationGuard const PUBLICATION;
+            KEXPECT_EQ(threading::clone_tcb_admission(*parent.task, 0), -ENOTSUP);
+            KEXPECT_EQ(threading::clone_tcb_admission(*parent.task, PARENT_TCB), -ENOTSUP);
+            KEXPECT_EQ(threading::clone_tcb_admission(*parent.task, PARENT_TCB + 4), -ENOTSUP);
+            KEXPECT_EQ(threading::clone_tcb_admission(*parent.task, ALIAS_TCB), -ENOTSUP);
+            KEXPECT_EQ(threading::clone_tcb_admission(*parent.task, CHILD_TCB + 1), -EFAULT);
+            KEXPECT_EQ(threading::clone_tcb_admission(*parent.task, CHILD_TCB + 2 * mm::paging::PAGE_SIZE), -EFAULT);
+            KEXPECT_EQ(threading::clone_tcb_admission(*parent.task, CHILD_TCB), 0);
+            KREQUIRE_TRUE(threading::publish_tid_to_tcb(*parent.task, CHILD_TCB, 2, false));
+        }
+        KEXPECT_EQ(parent.tid(PARENT_TCB), 1);
+        KEXPECT_EQ(parent.tid(ALIAS_TCB), 1);
+        KEXPECT_EQ(parent.tid(CHILD_TCB), 2);
+        scope.close();
+        KEXPECT_EQ(threading::clone_tcb_admission(*parent.task, CHILD_TCB), -EIDRM);
+        UserTask host;
+        KEXPECT_EQ(threading::clone_tcb_admission(*host.task, 0), 0);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentIdentity, NativeImageTcbKeepsCanonicalProcessName) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    auto const THREADS = threading::get_active_thread_count();
+    {
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        UserTask owner;
+        KREQUIRE_NE(owner.task->pagemap, nullptr);
+        KREQUIRE_TRUE(owner.task->initialize_pid_namespace(scope));
+        RegistryTask worker;
+        worker.task->is_thread = true;
+        worker.task->owner_pid = owner.task->pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(*worker.task, *owner.task));
+        ker::loader::elf::TlsModule const TLS{};
+        owner.created_thread = threading::create_thread(32 * 1024, 0, owner.task->pagemap, sched::task::namespace_process_pid(*worker.task),
+                                                        TLS, owner.task.get());
+        KREQUIRE_NE(owner.created_thread, nullptr);
+        owner.task->thread = owner.created_thread;
+        KEXPECT_EQ(owner.tid(owner.created_thread->fsbase), 1);
+        KEXPECT_EQ(worker.task->namespace_tid(), uint64_t{2});
+        KEXPECT_EQ(threading::get_active_thread_count(), THREADS + 1);
+    }
+    KEXPECT_EQ(threading::get_active_thread_count(), THREADS);
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
 
 KTEST(CompartmentJob, DurableNamesSurviveLeaderRetirementAndCanonicalThreadQueries) {
     auto const NAMESPACES = pid_ns::live_namespace_count();

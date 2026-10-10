@@ -487,7 +487,7 @@ def test_user_thread_tcbs_publish_nonzero_tid_before_user_execution() -> None:
     require_order(
         task_source,
         "this->pid = sched::task::get_next_pid();",
-        "threading::create_thread(ker::mod::mm::USER_STACK_SIZE, actual_tls_info.tls_size, this->pagemap, this->pid",
+        "namespace_process_pid(*this), actual_tls_info, this)",
         "fresh process must allocate a PID before building the initial TCB",
     )
     require_tokens(
@@ -495,15 +495,21 @@ def test_user_thread_tcbs_publish_nonzero_tid_before_user_execution() -> None:
         [
             "loader::elf::inspect_tls(elf_buffer, static_cast<size_t>(FILE_SIZE), tls_info)",
             "mod::sched::threading::create_thread(ker::mod::mm::USER_STACK_SIZE, tls_info.tls_size",
-            "new_pagemap, PROCESS_OWNER->pid, tls_info",
+            "PROCESS_OWNER->namespace_tid(), tls_info",
         ],
         "execve replacement TCB tid publication",
     )
     require_order(
         thread_control_source,
-        "publish_thread_tid_to_tcb(parent, tcb_va, t->pid)",
+        "mod::sched::threading::publish_tid_to_tcb(*parent, tcb_va, NEW_TID, false)",
         "mod::sched::post_task_for_cpu(TARGET_CPU, t)",
         "secondary pthread TCB tid must be published before scheduling",
+    )
+    require_order(
+        thread_control_source,
+        "uint64_t const NEW_TID = t->namespace_tid();",
+        "mod::sched::threading::publish_tid_to_tcb(*parent, tcb_va, NEW_TID, false)",
+        "TCB and creation result must use the same prepublication local TID",
     )
 
 

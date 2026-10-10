@@ -315,9 +315,9 @@ withdrawal helpers. They cover pool exhaustion, failed output preservation,
 monotonic names, closed retained owners, child/thread admission, host retirement
 compatibility, same-number siblings, stale names, zombie pins, failed/colliding
 registration and actual probe-chain repair. They do not publish fake runnable
-user processes or qualify a public compartment boundary. PID/PPID, procfs,
-signal/wait/ptrace and TCB adapters, namespace-init death and launcher admission
-remain pending; this foundation does not enable a public compartment.
+user processes or qualify a public compartment boundary. The process/thread
+creation adapters below extend this foundation; procfs, signal/wait/ptrace,
+namespace-init death and launcher admission remain pending.
 
 ## Durable local session and process-group names
 
@@ -353,9 +353,42 @@ Four native tests use real unpublished Tasks, production registry/session/
 child-publication and allocated PTY APIs. They cover destroyed leaders,
 canonical thread queries, identical sibling aliases, foreign/closed/imported
 refusal, child exec admission, Host physical inspection and preserved failed
-outputs. Public compartment entry stays disabled: the remaining PID/TID/TCB,
-parent/wait/signal/ptrace/procfs, init teardown, WKI/network and launcher paths
-must be integrated before scheduled service boundary qualification.
+outputs. Public compartment entry stays disabled: the remaining wait/signal/
+ptrace/procfs, init teardown, WKI/network/resource and launcher paths must be
+integrated before scheduled service boundary qualification.
+
+## Local process and thread creation names
+
+Private getpid observes the retained canonical process owner's local ID;
+GetTid uses the executing thread's reserved local ID. PPID reads the process
+owner's retained parent membership under the lifecycle lock. Namespace init
+reports zero even with a Host supervisor, and missing or foreign parents expose
+no numeric Host alias. Threads follow their owner's current parent instead of
+an old thread-local parent mirror. Host keeps physical identities and its
+parentless process/init-adoption convention. Retained identity observations
+remain available after admission closes; they do not authorize new creation.
+
+Fork, spawn, shared-VM clone and pthread creation return captured local names.
+Initial/replacement ELF images initialize the canonical process TCB ID, and
+pthread TCB publication uses the same local TID as its returned value. Private
+fork updates only its own copy-on-write TCB before publication. Private shared-VM
+clone requires an explicit separate TCB and refuses overlapping parent cache
+bytes, including different virtual addresses mapping the same physical range.
+Mapped writes remain nonfaulting under VM publication, with writable preflight,
+explicit Task/frame pins and final mapping commit. Host clone keeps its existing
+shared-TCB behavior, and Host fork keeps libc's existing cache refresh. The TCB
+uses mlibc's aligned four-byte ID at offset0x18; struct and syscall widths stay
+unchanged. Clone's caller-provided output slots may retain an early copied ID
+after later construction failure, as before.
+
+Creation preserves physical scheduler/debug/perf/WKI/lifecycle IDs. Short Task
+pins cover immediate retirement during commit/trace or pthread exit propagation.
+Spawn inherits exact retained root/cwd before interpreter pathwalks, while its
+existing unpublished recovery owner covers blocking construction. Five native
+fixtures use real Tasks/memberships, user PTE/COW/alias checks and actual initial
+Thread construction. Public admission remains unavailable: wait/signal/ptrace/
+procfs/init teardown, complete WKI/network/resource/launcher integration and
+scheduled hostile service/campaign evidence are still required.
 
 ## Verification checkpoint
 

@@ -43,6 +43,14 @@ struct Thread {
 } __attribute__((packed));
 
 void init_threading();
+inline constexpr uint64_t MLIBC_TCB_TID_OFFSET = 0x18;
+// Explicit address-space subject. Faulting COW is allowed only outside VM
+// publication; mapped publication follows writable preflight under that guard.
+[[nodiscard]] auto publish_tid_to_tcb(task::Task& address_owner, uint64_t tcb, uint64_t tid, bool fault_in) -> bool;
+// Mapped-only, allocation-free. Caller holds shared-VM publication and has
+// preflighted child_tcb. Private clone requires a nonoverlapping explicit TCB,
+// including physical aliases; Host retains its existing clone ABI behavior.
+[[nodiscard]] auto clone_tcb_admission(task::Task& parent, uint64_t child_tcb) -> int;
 #ifdef WOS_SELFTEST
 auto selftest_back_stack_pages(mm::paging::PageTable* page_table, uint64_t low, uint64_t high, int fail_after) -> bool;
 #endif

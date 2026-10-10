@@ -1383,6 +1383,13 @@ struct Task {
 
 [[nodiscard]] inline auto process_pid(const Task& task) -> uint64_t { return task.owner_pid != 0 ? task.owner_pid : task.pid; }
 
+// Public self identity uses the retained canonical owner. Internal scheduler,
+// lifecycle, debug and WKI correlation continues to use process_pid().
+[[nodiscard]] inline auto namespace_process_pid(const Task& task) -> uint64_t {
+    auto const* owner = task.credential_owner();
+    return owner != nullptr ? owner->namespace_tid() : 0;
+}
+
 [[nodiscard]] inline auto same_pid_namespace(const Task& lhs, const Task& rhs) -> bool {
     auto const* first = lhs.pid_namespace();
     auto const* second = rhs.pid_namespace();

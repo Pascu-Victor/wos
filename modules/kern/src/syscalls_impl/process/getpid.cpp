@@ -9,6 +9,6 @@ auto wos_proc_getpid() -> uint64_t {
     if (current_task == nullptr) {
         return 0;
     }
-    return mod::sched::task::process_pid(*current_task);
+    return mod::sched::task::namespace_process_pid(*current_task);
 }
 }  // namespace ker::syscall::process

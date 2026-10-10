@@ -791,6 +791,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     }
 
     child->pid = sched::task::get_next_pid();
+    uint64_t const CHILD_VISIBLE_PID = child->namespace_tid();
     child->type = sched::task::TaskType::PROCESS;
     child->cpu = cpu::current_cpu();
     child->has_run = false;
@@ -962,6 +963,21 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         child->thread = child_thread;
         sched::threading::record_stack_usage(*child);
         ker::mod::sys::signal::sync_task_signal_mask_cache(child);
+        // libc's post-fork refresh is too late for raw fork or an early signal.
+        // Write only this unpublished child's COW view, outside VM publication.
+        if (!child->pid_namespace()->is_host() && child_thread->fsbase != 0 &&
+            !sched::threading::publish_tid_to_tcb(*child, child_thread->fsbase, CHILD_VISIBLE_PID, true)) {
+            delete child->thread;
+            ker::syscall::shm::shm_cleanup_for_task(child);
+            ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(child->pagemap);
+            sched::task::release_lazy_vmem_ranges(*child);
+            mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-tcb-publication-fail");
+            mm::phys::page_free(child->pagemap);
+            delete[] child->name;
+            mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
+            delete child;
+            return finish_fork(-EFAULT, 0, "tcb-publication");
+        }
     } else {
         child->thread = nullptr;
     }
@@ -1047,7 +1063,9 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     }
 
     // --- Enqueue child ---
-    if (!process_reservation.attach(*child) || !sched::post_task_balanced(child)) {
+    bool const PUBLICATION_REF = child->try_acquire_lifetime_ref();
+    if (!PUBLICATION_REF || !process_reservation.attach(*child) || !sched::post_task_balanced(child)) {
+        if (PUBLICATION_REF) child->release();
         child_events::abort_publication(*child);
         // Undo FD refcount increments
         release_cloned_fd_table_refs(child);
@@ -1071,9 +1089,11 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         process_log::error("fork: lifecycle commit completed concurrently for published child PID %x", child->pid);
     }
     record_fork_child(FORK_STAGE, child->pid, child->cpu, WOS_PERF_CALLSITE());
+    uint64_t const CHILD_CPU = child->cpu;
+    child->release();
 
     // Return child PID to parent
-    return finish_fork(static_cast<int64_t>(child->pid), child->cpu);
+    return finish_fork(static_cast<int64_t>(CHILD_VISIBLE_PID), CHILD_CPU);
 }
 
 // --- Signal infrastructure ---
@@ -1418,6 +1438,11 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
     if ((args.flags & ~SUPPORTED_FLAGS) != 0) {
         return static_cast<uint64_t>(-EINVAL);
     }
+    auto const* scope = parent->pid_namespace();
+    if (scope == nullptr) return static_cast<uint64_t>(-ESRCH);
+    if (scope->closed()) return static_cast<uint64_t>(-EIDRM);
+    bool const PRIVATE_CLONE = !scope->is_host();
+    if (PRIVATE_CLONE && args.newtls == 0) return static_cast<uint64_t>(-ENOTSUP);
     if (args.parent_tidptr != 0 && !sys::usercopy::ensure_writable(*parent, args.parent_tidptr, sizeof(int))) {
         return static_cast<uint64_t>(-EFAULT);
     }
@@ -1436,6 +1461,11 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
     }
     if (child_fsbase != 0 && !sys::usercopy::ensure_writable(*parent, child_fsbase, sys::signal::WOS_TCB_SIGNAL_CACHE_BYTES)) {
         return static_cast<uint64_t>(-EFAULT);
+    }
+    {
+        ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+        int const ADMISSION = sched::threading::clone_tcb_admission(*parent, args.newtls);
+        if (ADMISSION != 0) return static_cast<uint64_t>(ADMISSION);
     }
 
     auto const KERNEL_STACK_BASE = alloc_fork_kernel_stack_with_reclaim();
@@ -1487,7 +1517,8 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
     // it cannot leave an unreported live child behind after returning an
     // error. This copy is deliberately before the shared-vmem publication
     // guard, which is a subsystem publication mutex.
-    int const CHILD_PID = static_cast<int>(child->pid);
+    uint64_t const CHILD_VISIBLE_PID = child->namespace_tid();
+    int const CHILD_PID = static_cast<int>(CHILD_VISIBLE_PID);
     if ((args.parent_tidptr != 0 && !sys::usercopy::copy_value_to_task(*parent, args.parent_tidptr, CHILD_PID)) ||
         (args.child_tidptr != 0 && !sys::usercopy::copy_value_to_task(*parent, args.child_tidptr, CHILD_PID))) {
         cleanup_child();
@@ -1499,6 +1530,11 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
     // WOS_CLONE_VM child can clone the old range set after an update's task
     // snapshot and then publish with permanently stale lazy-fault metadata.
     ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+    int const TCB_ADMISSION = sched::threading::clone_tcb_admission(*parent, args.newtls);
+    if (TCB_ADMISSION != 0) {
+        cleanup_child();
+        return static_cast<uint64_t>(TCB_ADMISSION);
+    }
     child->pagemap = parent->pagemap;
     child->entry = parent->entry;
     child->program_header_addr = parent->program_header_addr;
@@ -1569,6 +1605,10 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
     child_thread->stack_base_virt = 0;
     child_thread->stack_lowest_backed = 0;
     child->thread = child_thread;
+    if (PRIVATE_CLONE && !sched::threading::publish_tid_to_tcb(*child, child_fsbase, CHILD_VISIBLE_PID, false)) {
+        cleanup_child();
+        return static_cast<uint64_t>(-EFAULT);
+    }
     ker::mod::sys::signal::sync_task_signal_mask_cache_mapped(child);
 
     child->context.syscall_kernel_stack = KERNEL_RSP;
@@ -1605,7 +1645,9 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
         return static_cast<uint64_t>(-ENOMEM);
     }
 
-    if (!process_reservation.attach(*child) || !sched::post_task_balanced(child)) {
+    bool const PUBLICATION_REF = child->try_acquire_lifetime_ref();
+    if (!PUBLICATION_REF || !process_reservation.attach(*child) || !sched::post_task_balanced(child)) {
+        if (PUBLICATION_REF) child->release();
         cleanup_child();
         return static_cast<uint64_t>(-ENOMEM);
     }
@@ -1615,7 +1657,8 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
         process_log::error("clone-vm: lifecycle commit completed concurrently for published child PID %x", child->pid);
     }
 
-    return child->pid;
+    child->release();
+    return CHILD_VISIBLE_PID;
 }
 
 auto wos_proc_prctl(int option, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5) -> uint64_t {

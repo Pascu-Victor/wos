@@ -1250,8 +1250,8 @@ auto Task::initialize_process_image(const uint8_t* elf_data, size_t elf_size) ->
         return false;
     }
 
-    this->thread =
-        threading::create_thread(ker::mod::mm::USER_STACK_SIZE, actual_tls_info.tls_size, this->pagemap, this->pid, actual_tls_info, this);
+    this->thread = threading::create_thread(ker::mod::mm::USER_STACK_SIZE, actual_tls_info.tls_size, this->pagemap,
+                                            namespace_process_pid(*this), actual_tls_info, this);
     if (this->thread == nullptr) {
         dbg::log("Failed to create thread for task %s - OOM", name);
         // Preserve the pagemap for unpublished-process cleanup.
@@ -1344,7 +1344,8 @@ auto Task::initialize_process_image(const ker::loader::elf::ElfFileView& elf, co
         dbg::log("Invalid file-backed ELF for task %s", name);
         return false;
     }
-    thread = threading::create_thread(ker::mod::mm::USER_STACK_SIZE, TLS_INFO.tls_size, pagemap, pid, TLS_INFO, this);
+    thread =
+        threading::create_thread(ker::mod::mm::USER_STACK_SIZE, TLS_INFO.tls_size, pagemap, namespace_process_pid(*this), TLS_INFO, this);
     if (thread == nullptr) {
         dbg::log("Failed to create thread for task %s - OOM", name);
         return false;

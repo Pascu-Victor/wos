@@ -13,6 +13,7 @@
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/sched/threading.hpp>
 #include <platform/sys/context_switch.hpp>
 #include <platform/sys/signal.hpp>
 #include <platform/sys/usercopy.hpp>
@@ -32,7 +33,7 @@
 namespace ker::syscall::multiproc {
 namespace {
 constexpr uint32_t SOFT_EXCLUSIVE_DAEMON_PENALTY = 7;
-constexpr uint64_t MLIBC_TCB_TID_OFFSET = 0x18;
+constexpr uint64_t MLIBC_TCB_TID_OFFSET = mod::sched::threading::MLIBC_TCB_TID_OFFSET;
 static_assert(MLIBC_TCB_TID_OFFSET + sizeof(int) <= mod::sys::signal::WOS_TCB_SIGNAL_CACHE_BYTES);
 std::atomic<uint64_t> next_thread_cpu{0};
 
@@ -122,31 +123,6 @@ void release_thread_fd_refs(mod::sched::task::Task* task) {
     }
 }
 
-auto publish_thread_tid_to_tcb(mod::sched::task::Task* parent, uint64_t tcb_va, uint64_t tid) -> bool {
-    if (parent == nullptr || tcb_va == 0) {
-        return false;
-    }
-
-    uint64_t tid_user_addr = 0;
-    if (__builtin_add_overflow(tcb_va, MLIBC_TCB_TID_OFFSET, &tid_user_addr) ||
-        !mod::sys::usercopy::range_valid(tid_user_addr, sizeof(int))) {
-        return false;
-    }
-
-    mod::sys::usercopy::StableUserPage tid_page{};
-    // THREAD_CREATE preflights the complete TCB publication range before its
-    // publication guard.  Do not fault or allocate while that mutex is held.
-    if (!mod::sys::usercopy::pin_task_user_page(*parent, tid_user_addr, true, false, tid_page)) {
-        return false;
-    }
-
-    {
-        mod::sys::usercopy::UserAccessGuard const ACCESS{};
-        auto* tid_ptr = static_cast<int*>(tid_page.kernel_address());
-        __atomic_store_n(tid_ptr, static_cast<int>(tid), __ATOMIC_RELEASE);
-    }
-    return tid_page.commit_write();
-}
 }  // namespace
 
 [[noreturn]] void wos_thread_exit_current() {
@@ -272,15 +248,21 @@ auto thread_control(abi::multiproc::threadControlOps op, uint64_t arg1, uint64_t
                         }
                         uint64_t const TARGET_CPU = next_thread_cpu.fetch_add(1, std::memory_order_relaxed) % CPU_COUNT;
 
-                        if (!publish_thread_tid_to_tcb(parent, tcb_va, t->pid)) {
+                        uint64_t const NEW_TID = t->namespace_tid();
+                        if (!mod::sched::threading::publish_tid_to_tcb(*parent, tcb_va, NEW_TID, false)) {
                             mod::sched::task::destroy_unpublished_user_thread(t);
                             return static_cast<uint64_t>(-EFAULT);
                         }
                         mod::sys::signal::sync_task_signal_mask_cache_mapped(t);
 
-                        bool const POSTED = process_reservation.attach(*t) && mod::sched::post_task_for_cpu(TARGET_CPU, t);
+                        // Keep the subject alive through exit propagation even
+                        // if it runs and retires immediately after posting.
+                        bool const PUBLICATION_REF = t->try_acquire_lifetime_ref();
+                        bool const POSTED =
+                            PUBLICATION_REF && process_reservation.attach(*t) && mod::sched::post_task_for_cpu(TARGET_CPU, t);
                         if (!POSTED) {
-                            (void)publish_thread_tid_to_tcb(parent, tcb_va, 0);
+                            if (PUBLICATION_REF) t->release();
+                            (void)mod::sched::threading::publish_tid_to_tcb(*parent, tcb_va, 0, false);
                             mod::sched::task::destroy_unpublished_user_thread(t);
                             return static_cast<uint64_t>(-ENOMEM);
                         }
@@ -290,7 +272,8 @@ auto thread_control(abi::multiproc::threadControlOps op, uint64_t arg1, uint64_t
                         // published. Inherit the creator's request after publication so
                         // the sibling cannot escape the process-wide exit.
                         static_cast<void>(ker::syscall::process::inherit_pending_process_exit_request(parent, t));
-                        thread_pid = t->pid;
+                        thread_pid = NEW_TID;
+                        t->release();
                     }
                 }
                 if (!creation_failed) {
@@ -309,7 +292,7 @@ auto thread_control(abi::multiproc::threadControlOps op, uint64_t arg1, uint64_t
             // after the publication guard has released its global mutex.
             ker::syscall::process::exit_current_if_process_exit_requested();
 
-            // Return the new thread's PID as the TID; mlibc stores this in tcb->tid
+            // Return the same public TID published before the thread ran.
             return thread_pid;
         }
 

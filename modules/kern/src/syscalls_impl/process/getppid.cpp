@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <platform/sched/scheduler.hpp>
+#include <syscalls_impl/process/child_events.hpp>
 
 #include "platform/sched/task.hpp"
 namespace ker::syscall::process {
@@ -10,12 +11,6 @@ auto wos_proc_getppid() -> uint64_t {
     if (current_task == nullptr) {
         return 0;
     }
-    // Some user tasks, including WKI receiver-side remote tasks, are parentless
-    // for lifecycle purposes. Expose them to userspace as init-adopted.
-    const bool PARENTLESS_PROCESS = current_task->parent_pid == 0 && current_task->type == mod::sched::task::TaskType::PROCESS;
-    if (PARENTLESS_PROCESS && mod::sched::task::process_pid(*current_task) != 1) {
-        return 1;
-    }
-    return current_task->parent_pid;
+    return child_events::namespace_parent_pid(*current_task);
 }
 }  // namespace ker::syscall::process

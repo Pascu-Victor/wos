@@ -13,7 +13,7 @@ auto thread_info(abi::multiproc::threadInfoOps op) -> uint64_t {
     switch (op) {
         case abi::multiproc::threadInfoOps::CURRENT_THREAD_ID: {
             auto* task = mod::sched::get_current_task();
-            return task != nullptr ? task->pid : 0;
+            return task != nullptr ? task->namespace_tid() : 0;
         }
 
         case abi::multiproc::threadInfoOps::NATIVE_THREAD_COUNT:

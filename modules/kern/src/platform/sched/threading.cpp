@@ -1,5 +1,6 @@
 #include "threading.hpp"
 
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -11,7 +12,9 @@
 #include <platform/sched/resource.hpp>
 #include <platform/sched/resource_as.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <platform/sys/signal.hpp>
 #include <platform/sys/spinlock.hpp>
+#include <platform/sys/usercopy.hpp>
 #include <util/list.hpp>
 
 #include "platform/asm/cpu.hpp"
@@ -295,6 +298,55 @@ bool handle_lazy_stack_fault(Thread* thread, mm::paging::PageTable* page_table, 
     }
     low = max_u64(low, FLOOR);
     return ensure_stack_backing(thread, page_table, low, high, policy_owner);
+}
+
+auto publish_tid_to_tcb(task::Task& address_owner, uint64_t tcb, uint64_t tid, bool fault_in) -> bool {
+    uint64_t address = 0;
+    if (tcb == 0 || __builtin_add_overflow(tcb, MLIBC_TCB_TID_OFFSET, &address) || address % alignof(int) != 0 ||
+        !sys::usercopy::range_valid(address, sizeof(int)))
+        return false;
+    sys::usercopy::StableUserPage page;
+    if (!sys::usercopy::pin_task_user_page(address_owner, address, true, fault_in, page)) return false;
+    {
+        sys::usercopy::UserAccessGuard const ACCESS;
+        __atomic_store_n(static_cast<int*>(page.kernel_address()), static_cast<int>(tid), __ATOMIC_RELEASE);
+    }
+    return page.commit_write();
+}
+
+auto clone_tcb_admission(task::Task& parent, uint64_t child_tcb) -> int {
+    auto const* scope = parent.pid_namespace();
+    if (scope == nullptr) return -ESRCH;
+    if (scope->is_host()) return 0;
+    if (scope->closed()) return -EIDRM;
+    if (child_tcb == 0) return -ENOTSUP;
+    // Signal-cache publication also touches this range. Compare bounded pinned
+    // physical intervals so a different virtual alias cannot overwrite parent
+    // TID/cache bytes. Alignment ensures the atomic TID never crosses a page.
+    constexpr uint64_t CACHE_BYTES = sys::signal::WOS_TCB_SIGNAL_CACHE_BYTES;
+    if (child_tcb % alignof(int) != 0 || !sys::usercopy::range_valid(child_tcb, CACHE_BYTES)) return -EFAULT;
+    uint64_t const PARENT_TCB = parent.thread != nullptr ? parent.thread->fsbase : 0;
+    if (PARENT_TCB != 0 && !sys::usercopy::range_valid(PARENT_TCB, CACHE_BYTES)) return -EFAULT;
+    for (uint64_t child_offset = 0; child_offset < CACHE_BYTES;) {
+        auto const CHILD_ADDR = child_tcb + child_offset;
+        auto const CHILD_LENGTH = min_u64(CACHE_BYTES - child_offset, mm::paging::PAGE_SIZE - CHILD_ADDR % mm::paging::PAGE_SIZE);
+        sys::usercopy::StableUserPage child_page;
+        if (!sys::usercopy::pin_task_user_page(parent, CHILD_ADDR, true, false, child_page)) return -EFAULT;
+        for (uint64_t parent_offset = 0; PARENT_TCB != 0 && parent_offset < CACHE_BYTES;) {
+            auto const PARENT_ADDR = PARENT_TCB + parent_offset;
+            auto const PARENT_LENGTH = min_u64(CACHE_BYTES - parent_offset, mm::paging::PAGE_SIZE - PARENT_ADDR % mm::paging::PAGE_SIZE);
+            sys::usercopy::StableUserPage parent_page;
+            if (!sys::usercopy::pin_task_user_page(parent, PARENT_ADDR, false, false, parent_page)) return -EFAULT;
+            auto const CHILD_PHYS = child_page.physical_address();
+            auto const PARENT_PHYS = parent_page.physical_address();
+            if (CHILD_PHYS < PARENT_PHYS + PARENT_LENGTH && PARENT_PHYS < CHILD_PHYS + CHILD_LENGTH) return -ENOTSUP;
+            if (!parent_page.still_mapped()) return -EFAULT;
+            parent_offset += PARENT_LENGTH;
+        }
+        if (!child_page.still_mapped()) return -EFAULT;
+        child_offset += CHILD_LENGTH;
+    }
+    return 0;
 }
 
 Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTable* page_table, uint64_t initial_tid,

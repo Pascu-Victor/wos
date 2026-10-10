@@ -550,11 +550,27 @@ void unlink_tracer_locked(Task& tracee, bool discard_events) {
 }  // namespace
 
 auto acquire_process_owner(Task& task) -> Task* {
-    uint64_t const OWNER_PID = sched_task::process_pid(task);
-    if (OWNER_PID == task.pid) {
-        return task.try_acquire_lifetime_ref() ? &task : nullptr;
+    auto* owner = task.credential_owner();
+    return take_lifetime_ref(owner) ? owner : nullptr;
+}
+
+auto namespace_parent_pid(const Task& task) -> uint64_t {
+    auto const* owner = task.credential_owner();
+    if (owner == nullptr) return 0;
+    auto const* scope = owner->pid_namespace();
+    if (scope == nullptr) return 0;
+    uint64_t const FLAGS = g_lifecycle_lock.lock_irqsave();
+    uint64_t result = 0;
+    if (scope->is_host()) {
+        // Keep Host's parentless receiver/process init-adoption convention.
+        result = owner->parent_pid;
+        if (result == 0 && owner->type == sched_task::TaskType::PROCESS && owner->pid != 1) result = 1;
+    } else if (owner->namespace_tid() != 1 && owner->child_parent != nullptr &&
+               sched_task::same_pid_namespace(*owner, *owner->child_parent)) {
+        result = owner->child_parent->namespace_tid();
     }
-    return ker::mod::sched::find_task_by_pid_safe(OWNER_PID);
+    g_lifecycle_lock.unlock_irqrestore(FLAGS);
+    return result;
 }
 
 auto selector_for_process_group(uint64_t process_group, ker::mod::sched::session::Origin origin) -> Selector {

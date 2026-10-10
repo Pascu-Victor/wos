@@ -232,8 +232,23 @@ zero. Attempt13's two assertion-width errors were corrected and its failed
 source/serial/manual-stop/prune receipts retained. This is native adapter evidence,
 not scheduled service isolation or the complete lifecycle campaigns.
 
-Public compartment admission, remaining root/procfs consumers, user PID/PPID/
-signal/wait/ptrace/TCB translation, namespace-init lifecycle policy,
+Canonical local PID/TID/PPID observations now use retained process ownership and
+lifecycle parent membership, including Host-supervised private init PPID0.
+Creation returns and initial/replacement/pthread TCBs carry local names; private
+fork refreshes its own COW TCB before publication. Private shared-VM clone
+requires a separate TCB and refuses physical aliases of parent cache bytes.
+Spawn inherits retained root/cwd before interpreter construction. Five native
+tests use real Tasks/memberships, user PTE/COW/alias operations and actual initial
+Thread creation. Normal Build WOS, isolated fast diagnostic build, formatter,
+twelve selected scheduler/resource/libc checks and seven VFS/libc checks pass.
+The source oracles were updated for local returns; their failed historical
+receipts remain. Actual KTEST15 passes78,906 assertions/0 failures/1,289 cases,
+all37 required compartment cases and normal poweroff. Four inactive disposable
+images257,703,936 allocated bytes were audited/pruned, leaving zero disposable
+usage. This is native creation consumer evidence, not scheduled service proof.
+
+Public compartment admission, remaining root/procfs/positive PID consumers,
+signal/wait/ptrace translation, namespace-init lifecycle policy,
 complete network/WKI gates, launcher and required service campaigns remain
 pending. All ten full acceptance criteria remain outstanding. Prior focused host ASan/UBSan cases are foundation evidence, not
 full service qualification. See progress/39/{ledger,evidence,reconnaissance,

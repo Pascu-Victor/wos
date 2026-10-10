@@ -67,7 +67,10 @@ requester registry lookup and GC pin withdrawal now pass actual kernel tests.
 Durable local SID/PGID inheritance, scoped session/group adapters and exact PTY
 foreground names also pass native production API tests, including destroyed
 leaders and sibling aliases (78,761 assertions, zero failures, 1,284 cases).
-Public compartment admission, user PID/PPID/procfs/signal/wait/ptrace/TCB translation, namespace-
+Canonical self PID/TID/PPID, local creation returns and initial/replacement/
+pthread/COW TCB adapters now pass native production API tests, including explicit
+shared-clone physical-alias refusal (78,906 assertions, zero failures,1,289 cases).
+Public compartment admission, remaining procfs/positive PID/signal/wait/ptrace, namespace-
 init lifecycle, complete WKI/network enforcement and full service/runtime
 criteria remain incomplete. Goal39 remains active with all ten criteria required.
 
