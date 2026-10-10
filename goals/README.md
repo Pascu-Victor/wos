@@ -62,9 +62,12 @@ ledger records source reconnaissance and qualification. The user cleared the pre
 and Goal 39 is now the active Goal Mode objective. Private native IPC and mount
 ownership, Task native lookup/consumption and subject mount/unmount/repeatable
 pivot, retained File listings and subject procfs mount observations are qualified
-at the kernel API checkpoint (74,332 KTEST assertions, zero failures). Public
-compartment admission, remaining root/procfs/PID visibility, complete WKI/
-network enforcement and full service/runtime criteria remain incomplete.
+at the kernel API checkpoint. Native PID owner/local-name inheritance, exact
+requester registry lookup and GC pin withdrawal now pass actual kernel tests
+(78,598 assertions, zero failures, 1,280 cases). Public compartment admission,
+user PID/PPID/group/session/procfs/signal/wait/ptrace/TCB translation, namespace-
+init lifecycle, complete WKI/network enforcement and full service/runtime
+criteria remain incomplete. Goal39 remains active with all ten criteria required.
 
 The [local virtualization manual corpus](../docs/virtualization-manuals.md)
 provides pinned source downloads, Docling PDF text and offline search. Check its

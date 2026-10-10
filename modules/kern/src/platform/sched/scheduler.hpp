@@ -452,6 +452,24 @@ bool can_query_current_task();
 void remove_current_task();                               // Remove current task from runqueue (for exit)
 auto find_task_by_pid(uint64_t pid) -> task::Task*;       // Find a task by PID (O(1) via PID registry)
 auto find_task_by_pid_safe(uint64_t pid) -> task::Task*;  // Find task by PID with refcount (caller must release!)
+// Exact retained kernel scope plus local PID/TID. Host scope keeps physical
+// lookup. Private closed/stale/missing IDs never fall back to a global ID.
+// All successful queries return a Task reference which the caller releases.
+auto find_task_by_pid_namespace_safe(const pid_ns::NamespaceRef& scope, uint64_t id) -> task::Task*;
+auto find_task_by_pid_namespace_lifetime_ref(const pid_ns::NamespaceRef& scope, uint64_t id) -> task::Task*;
+auto find_task_by_visible_pid_safe(const task::Task& requester, uint64_t id) -> task::Task*;
+// Lifetime lookup includes EXITING/DEAD for retained child/zombie observation;
+// it still rejects a closed namespace. Teardown uses explicit retained members.
+auto find_task_by_visible_pid_lifetime_ref(const task::Task& requester, uint64_t id) -> task::Task*;
+auto get_scoped_pid_task_count() -> uint32_t;
+#ifdef WOS_SELFTEST
+// Real production registry transactions for exclusively owned, unpublished
+// fixture Tasks; no runqueue/runnable publication. Remove before destruction.
+auto scheduler_selftest_register_unpublished_task(task::Task& subject) -> bool;
+void scheduler_selftest_unregister_unpublished_task(task::Task& subject);
+auto scheduler_selftest_scoped_pid_bucket(const pid_ns::NamespaceRef& scope, uint64_t id) -> uint32_t;
+auto scheduler_selftest_withdraw_unpublished_gc_task(task::Task& subject) -> bool;
+#endif
 // Atomically claim a child's exit status and retire DEAD tasks from the dense
 // active scan index without waiting for heavyweight GC teardown.
 auto task_has_live_pagemap_sibling(task::Task* subject) -> bool;

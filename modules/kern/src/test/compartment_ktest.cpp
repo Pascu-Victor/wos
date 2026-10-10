@@ -5,7 +5,9 @@
 #include <initializer_list>
 #include <memory>
 #include <platform/sched/ipc_namespace.hpp>
+#include <platform/sched/pid_namespace.hpp>
 #include <platform/sched/resource.hpp>
+#include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/security/credentials.hpp>
 #include <syscalls_impl/shm/shm.hpp>
@@ -20,6 +22,370 @@
 namespace ipc = ker::mod::sched::ipc;
 namespace resource = ker::mod::sched::resource;
 using ker::mod::sched::task::Task;
+
+namespace pid_ns = ker::mod::sched::pid_ns;
+namespace sched = ker::mod::sched;
+
+KTEST(CompartmentPid, RetainedPoolAndMonotonicIdsDrainWithoutRetargeting) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        std::array<pid_ns::NamespaceRef, pid_ns::MAX_NAMESPACES> scopes;
+        auto const AVAILABLE = pid_ns::MAX_NAMESPACES - BASELINE;
+        KREQUIRE_NE(AVAILABLE, size_t{0});
+        for (size_t i = 0; i < AVAILABLE; ++i) KREQUIRE_EQ(pid_ns::create_namespace(scopes[i]), 0);
+        pid_ns::NamespaceRef output;
+        KREQUIRE_EQ(scopes[0].retain(output), 0);
+        auto const ORIGINAL = output.generation();
+        KEXPECT_EQ(pid_ns::create_namespace(output), -ENOSPC);
+        KEXPECT_EQ(output.generation(), ORIGINAL);
+        uint32_t id = 99;
+        pid_ns::NamespaceRef host;
+        KEXPECT_EQ(host.allocate_id(id), -EINVAL);
+        KEXPECT_EQ(id, uint32_t{99});
+        KEXPECT_EQ(output.allocate_id(id), 0);
+        KEXPECT_EQ(id, uint32_t{1});
+        KEXPECT_EQ(scopes[0].allocate_id(id), 0);
+        KEXPECT_EQ(id, uint32_t{2});
+        output.close();
+        KEXPECT_TRUE(scopes[0].closed());
+        KEXPECT_EQ(output.allocate_id(id), -EIDRM);
+        KEXPECT_EQ(id, uint32_t{2});
+        KEXPECT_EQ(output.retain(output), 0);
+        KEXPECT_EQ(output.generation(), ORIGINAL);
+        auto moved = std::move(output);
+        KEXPECT_TRUE(output.is_host());
+        KEXPECT_TRUE(moved.closed());
+        KEXPECT_EQ(moved.generation(), ORIGINAL);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+    uint64_t previous = 0;
+    // Native owner/index foundation stress, not the required public
+    // create/exec/kill/destroy service lifecycle campaign.
+    for (size_t i = 0; i < 1000; ++i) {
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        KEXPECT_TRUE(scope.generation() > previous);
+        previous = scope.generation();
+        uint32_t id = 0;
+        KEXPECT_EQ(scope.allocate_id(id), 0);
+        KEXPECT_EQ(id, uint32_t{1});
+        scope.close();
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentPid, CanonicalChildAndThreadIdsPreserveOwnerAdmission) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        auto owner = std::make_unique<Task>();
+        owner->pid = sched::task::get_next_pid();
+        KREQUIRE_TRUE(owner->initialize_pid_namespace(scope));
+        KEXPECT_EQ(owner->namespace_tid(), uint64_t{1});
+        auto thread = std::make_unique<Task>();
+        thread->pid = sched::task::get_next_pid();
+        thread->is_thread = true;
+        thread->owner_pid = owner->pid;
+        KEXPECT_NULL(thread->pid_namespace());
+        KEXPECT_EQ(thread->namespace_tid(), uint64_t{0});
+        KREQUIRE_TRUE(resource::bind_thread_owner(*thread, *owner));
+        KEXPECT_TRUE(thread->pid_namespace() == owner->pid_namespace());
+        KEXPECT_EQ(thread->namespace_tid(), uint64_t{2});
+        KEXPECT_FALSE(resource::bind_thread_owner(*thread, *owner));
+        KEXPECT_EQ(thread->namespace_tid(), uint64_t{2});
+        KEXPECT_EQ(owner->resource_thread_owners.load(), uint64_t{1});
+        auto child = std::make_unique<Task>();
+        KREQUIRE_TRUE(resource::inherit(*child, *thread));
+        KEXPECT_TRUE(*child->pid_namespace() == scope);
+        KEXPECT_EQ(child->namespace_tid(), uint64_t{3});
+        KEXPECT_FALSE(child->initialize_pid_namespace(scope));
+        // Force a late PID-installation failure after resource attachment;
+        // immutable owner/ref/CPU contribution must all unwind immediately.
+        auto rejected = std::make_unique<Task>();
+        KREQUIRE_TRUE(rejected->initialize_pid_namespace(scope));
+        rejected->is_thread = true;
+        rejected->owner_pid = owner->pid;
+        auto const REFERENCES = owner->ref_count.load();
+        KEXPECT_FALSE(resource::bind_thread_owner(*rejected, *owner));
+        KEXPECT_NULL(rejected->resource_owner.get());
+        KEXPECT_EQ(owner->ref_count.load(), REFERENCES);
+        KEXPECT_EQ(owner->resource_cpu_threads.load(), uint64_t{1});
+        scope.close();
+        auto late = std::make_unique<Task>();
+        late->is_thread = true;
+        late->owner_pid = owner->pid;
+        KEXPECT_FALSE(resource::bind_thread_owner(*late, *owner));
+        KEXPECT_NULL(late->resource_owner.get());
+        auto denied = std::make_unique<Task>();
+        KEXPECT_FALSE(resource::inherit(*denied, *thread));
+        KEXPECT_TRUE(denied->pid_namespace()->is_host());
+        // Exact retained metadata remains observable for teardown.
+        KEXPECT_TRUE(thread->pid_namespace()->closed());
+        KEXPECT_EQ(thread->namespace_tid(), uint64_t{2});
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+    auto host = std::make_unique<Task>();
+    auto child = std::make_unique<Task>();
+    KREQUIRE_TRUE(resource::inherit(*child, *host));
+    child->pid = sched::task::get_next_pid();
+    KEXPECT_TRUE(child->pid_namespace()->is_host());
+    KEXPECT_EQ(child->namespace_tid(), child->pid);
+    host->pid = sched::task::get_next_pid();
+    {
+        auto retired = std::make_unique<Task>();
+        retired->is_thread = true;
+        retired->pid = sched::task::get_next_pid();
+        retired->owner_pid = host->pid;
+        retired->state.store(sched::task::TaskState::EXITING);
+        KREQUIRE_TRUE(resource::bind_thread_owner(*retired, *host));
+        KEXPECT_TRUE(retired->pid_namespace()->is_host());
+        KEXPECT_EQ(retired->namespace_tid(), retired->pid);
+        KEXPECT_FALSE(resource::bind_thread_owner(*retired, *host));
+    }
+    KEXPECT_EQ(host->ref_count.load(), uint32_t{1});
+    KEXPECT_EQ(host->resource_cpu_threads.load(), uint64_t{0});
+}
+
+namespace {
+struct RegistryTask {
+    std::unique_ptr<Task> task = std::make_unique<Task>();
+    bool registered{};
+    RegistryTask() {
+        task->pid = sched::task::get_next_pid();
+        task->type = sched::task::TaskType::PROCESS;
+    }
+    ~RegistryTask() {
+        if (registered) sched::scheduler_selftest_unregister_unpublished_task(*task);
+        KEXPECT_EQ(task->active_registry_index, Task::ACTIVE_REGISTRY_INDEX_INVALID);
+        KEXPECT_EQ(task->ref_count.load(), uint32_t{1});
+    }
+    auto publish() -> bool {
+        if (registered) return false;
+        registered = sched::scheduler_selftest_register_unpublished_task(*task);
+        return registered;
+    }
+    void retire() {
+        if (!registered) return;
+        sched::scheduler_selftest_unregister_unpublished_task(*task);
+        registered = false;
+    }
+    auto retire_if_unreferenced() -> bool {
+        if (!registered || !sched::scheduler_selftest_withdraw_unpublished_gc_task(*task)) return false;
+        registered = false;
+        return true;
+    }
+};
+void expect_visible(const Task& requester, uint64_t id, Task* expected, bool lifetime = false) {
+    auto* found =
+        lifetime ? sched::find_task_by_visible_pid_lifetime_ref(requester, id) : sched::find_task_by_visible_pid_safe(requester, id);
+    KEXPECT_TRUE(found == expected);
+    if (found != nullptr) found->release();
+}
+}  // namespace
+
+KTEST(CompartmentPid, ProductionRegistrySeparatesSameNumberAndHostTargets) {
+    auto const BASELINE = sched::get_scoped_pid_task_count();
+    auto const ACTIVE = sched::get_active_task_count();
+    auto const NAMESPACES = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef first, second;
+        KREQUIRE_EQ(pid_ns::create_namespace(first), 0);
+        KREQUIRE_EQ(pid_ns::create_namespace(second), 0);
+        RegistryTask a, b, ac, bc, host, thread;
+        host.task->pid += uint64_t{1} << 62;
+        KREQUIRE_TRUE(a.task->initialize_pid_namespace(first));
+        KREQUIRE_TRUE(b.task->initialize_pid_namespace(second));
+        KREQUIRE_TRUE(resource::inherit(*ac.task, *a.task));
+        KREQUIRE_TRUE(resource::inherit(*bc.task, *b.task));
+        thread.task->is_thread = true;
+        thread.task->owner_pid = a.task->pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(*thread.task, *a.task));
+        KREQUIRE_TRUE(a.publish());
+        KREQUIRE_TRUE(b.publish());
+        KREQUIRE_TRUE(ac.publish());
+        KREQUIRE_TRUE(bc.publish());
+        KREQUIRE_TRUE(host.publish());
+        KREQUIRE_TRUE(thread.publish());
+        KEXPECT_EQ(a.task->namespace_tid(), b.task->namespace_tid());
+        KEXPECT_EQ(ac.task->namespace_tid(), bc.task->namespace_tid());
+        expect_visible(*a.task, 1, a.task.get());
+        expect_visible(*b.task, 1, b.task.get());
+        expect_visible(*a.task, 2, ac.task.get());
+        expect_visible(*b.task, 2, bc.task.get());
+        expect_visible(*a.task, host.task->pid, nullptr);
+        expect_visible(*b.task, host.task->pid, nullptr, true);
+        expect_visible(*host.task, ac.task->pid, ac.task.get());
+        expect_visible(*host.task, bc.task->pid, bc.task.get());
+        expect_visible(*a.task, 0, nullptr);
+        expect_visible(*a.task, thread.task->namespace_tid(), thread.task.get());
+        expect_visible(*thread.task, 1, a.task.get());
+        expect_visible(*thread.task, 2, ac.task.get());
+        expect_visible(*b.task, thread.task->namespace_tid(), nullptr);
+        auto unbound = std::make_unique<Task>();
+        unbound->is_thread = true;
+        expect_visible(*unbound, host.task->pid, nullptr);
+        KEXPECT_EQ(sched::get_scoped_pid_task_count(), BASELINE + 5);
+        KEXPECT_EQ(sched::get_active_task_count(), ACTIVE + 6);
+        KEXPECT_FALSE(a.task->scheduler_published.load());
+        ac.task->state.store(sched::task::TaskState::EXITING);
+        expect_visible(*a.task, 2, nullptr);
+        expect_visible(*a.task, 2, ac.task.get(), true);
+        ac.task->state.store(sched::task::TaskState::DEAD);
+        expect_visible(*a.task, 2, nullptr);
+        expect_visible(*a.task, 2, ac.task.get(), true);
+        expect_visible(*host.task, ac.task->pid, ac.task.get(), true);
+        auto const OLD_ID = ac.task->namespace_tid();
+        ac.retire();
+        expect_visible(*a.task, OLD_ID, nullptr, true);
+        RegistryTask replacement;
+        KREQUIRE_TRUE(resource::inherit(*replacement.task, *a.task));
+        KEXPECT_TRUE(replacement.task->namespace_tid() > OLD_ID);
+        KREQUIRE_TRUE(replacement.publish());
+        expect_visible(*a.task, OLD_ID, nullptr);
+        expect_visible(*a.task, replacement.task->namespace_tid(), replacement.task.get());
+        first.close();
+        expect_visible(*a.task, 1, nullptr);
+        expect_visible(*a.task, replacement.task->namespace_tid(), nullptr, true);
+        expect_visible(*b.task, 2, bc.task.get());
+        expect_visible(*host.task, a.task->pid, a.task.get());
+    }
+    KEXPECT_EQ(sched::get_scoped_pid_task_count(), BASELINE);
+    KEXPECT_EQ(sched::get_active_task_count(), ACTIVE);
+    KEXPECT_EQ(pid_ns::live_namespace_count(), NAMESPACES);
+}
+
+KTEST(CompartmentPid, ClosedAndCollidingPublicationHaveNoPartialRegistryWrites) {
+    auto const BASELINE = sched::get_scoped_pid_task_count();
+    auto const ACTIVE = sched::get_active_task_count();
+    {
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        RegistryTask first, collision, closed, unpublished;
+        KREQUIRE_TRUE(first.task->initialize_pid_namespace(scope));
+        KREQUIRE_TRUE(collision.task->initialize_pid_namespace(scope));
+        KREQUIRE_TRUE(closed.task->initialize_pid_namespace(scope));
+        unpublished.task->scheduler_published.store(true);
+        KEXPECT_FALSE(unpublished.task->initialize_pid_namespace(scope));
+        unpublished.task->scheduler_published.store(false);
+        KEXPECT_TRUE(unpublished.task->pid_namespace()->is_host());
+        KREQUIRE_TRUE(first.publish());
+        collision.task->pid = first.task->pid;
+        KEXPECT_FALSE(collision.publish());
+        expect_visible(*first.task, collision.task->namespace_tid(), nullptr);
+        KEXPECT_EQ(sched::get_scoped_pid_task_count(), BASELINE + 1);
+        KEXPECT_EQ(sched::get_active_task_count(), ACTIVE + 1);
+        // A failed admission/removal must never remove a foreign collision.
+        sched::scheduler_selftest_unregister_unpublished_task(*collision.task);
+        expect_visible(*first.task, first.task->namespace_tid(), first.task.get());
+        scope.close();
+        KEXPECT_FALSE(closed.publish());
+        auto* global = sched::find_task_by_pid_safe(closed.task->pid);
+        KEXPECT_NULL(global);
+        if (global != nullptr) global->release();
+        KEXPECT_EQ(sched::get_scoped_pid_task_count(), BASELINE + 1);
+        KEXPECT_EQ(sched::get_active_task_count(), ACTIVE + 1);
+        first.retire();
+    }
+    KEXPECT_EQ(sched::get_scoped_pid_task_count(), BASELINE);
+    KEXPECT_EQ(sched::get_active_task_count(), ACTIVE);
+}
+
+KTEST(CompartmentPid, ProductionProbeChainSurvivesHeadAndMiddleRemoval) {
+    auto const BASELINE = sched::get_scoped_pid_task_count();
+    auto const ACTIVE = sched::get_active_task_count();
+    {
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        RegistryTask first, middle, last, host;
+        KREQUIRE_TRUE(first.task->initialize_pid_namespace(scope));
+        auto const BUCKET = sched::scheduler_selftest_scoped_pid_bucket(scope, first.task->namespace_tid());
+        uint32_t allocated = 1;
+        // Find actual production hash collisions, reserving skipped IDs via
+        // the production allocator. No forged Task local IDs or model table.
+        auto install_collision = [&](Task& target) {
+            constexpr uint32_t SEARCH_BOUND = 1U << 20;
+            while (allocated < SEARCH_BOUND) {
+                auto const NEXT = allocated + 1;
+                if (sched::scheduler_selftest_scoped_pid_bucket(scope, NEXT) == BUCKET) {
+                    if (!target.initialize_pid_namespace(scope)) return false;
+                    allocated = NEXT;
+                    return target.namespace_tid() == NEXT;
+                }
+                if (scope.allocate_id(allocated) != 0) return false;
+            }
+            return false;
+        };
+        KREQUIRE_TRUE(install_collision(*middle.task));
+        KREQUIRE_TRUE(install_collision(*last.task));
+        KREQUIRE_TRUE(first.publish());
+        KREQUIRE_TRUE(middle.publish());
+        KREQUIRE_TRUE(last.publish());
+        first.retire();
+        expect_visible(*last.task, first.task->namespace_tid(), nullptr);
+        expect_visible(*last.task, middle.task->namespace_tid(), middle.task.get());
+        expect_visible(*last.task, last.task->namespace_tid(), last.task.get());
+        // Retired physical ID may be reused in this fixture, but its old
+        // scoped name must stay absent; Host-only replacement adds no row.
+        host.task->pid = first.task->pid;
+        KREQUIRE_TRUE(host.publish());
+        expect_visible(*last.task, first.task->namespace_tid(), nullptr, true);
+        expect_visible(*host.task, first.task->pid, host.task.get());
+        middle.retire();
+        expect_visible(*last.task, middle.task->namespace_tid(), nullptr);
+        expect_visible(*last.task, last.task->namespace_tid(), last.task.get());
+        last.retire();
+        KEXPECT_EQ(sched::get_scoped_pid_task_count(), BASELINE);
+    }
+    KEXPECT_EQ(sched::get_scoped_pid_task_count(), BASELINE);
+    KEXPECT_EQ(sched::get_active_task_count(), ACTIVE);
+}
+
+KTEST(CompartmentPid, ZombiePinsSerializeWithProductionGcWithdrawal) {
+    auto const BASELINE = sched::get_scoped_pid_task_count();
+    auto const ACTIVE = sched::get_active_task_count();
+    {
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        RegistryTask zombie, host;
+        KREQUIRE_TRUE(zombie.task->initialize_pid_namespace(scope));
+        KREQUIRE_TRUE(zombie.publish());
+        KREQUIRE_TRUE(host.publish());
+        KEXPECT_FALSE(zombie.retire_if_unreferenced());  // ACTIVE cannot enter GC.
+        zombie.task->state.store(sched::task::TaskState::DEAD);
+        auto* scoped_pin = sched::find_task_by_pid_namespace_lifetime_ref(scope, zombie.task->namespace_tid());
+        auto* host_pin = sched::find_task_by_visible_pid_lifetime_ref(*host.task, zombie.task->pid);
+        auto* active_pin =
+            sched::find_active_task_lifetime_ref_if([](Task* target, void* expected) { return target == expected; }, zombie.task.get());
+        KEXPECT_TRUE(scoped_pin == zombie.task.get());
+        KEXPECT_TRUE(host_pin == zombie.task.get());
+        KEXPECT_TRUE(active_pin == zombie.task.get());
+        KEXPECT_EQ(zombie.task->ref_count.load(), uint32_t{4});
+        KEXPECT_FALSE(zombie.retire_if_unreferenced());
+        KEXPECT_EQ(sched::get_scoped_pid_task_count(), BASELINE + 1);
+        KEXPECT_EQ(sched::get_active_task_count(), ACTIVE + 2);
+        if (scoped_pin != nullptr) scoped_pin->release();
+        KEXPECT_FALSE(zombie.retire_if_unreferenced());
+        if (host_pin != nullptr) host_pin->release();
+        KEXPECT_FALSE(zombie.retire_if_unreferenced());
+        if (active_pin != nullptr) active_pin->release();
+        KEXPECT_EQ(zombie.task->ref_count.load(), uint32_t{1});
+        KREQUIRE_TRUE(zombie.retire_if_unreferenced());
+        expect_visible(*zombie.task, zombie.task->namespace_tid(), nullptr, true);
+        expect_visible(*host.task, zombie.task->pid, nullptr, true);
+        KEXPECT_EQ(sched::get_scoped_pid_task_count(), BASELINE);
+        KEXPECT_EQ(sched::get_active_task_count(), ACTIVE + 1);
+        host.task->state.store(sched::task::TaskState::DEAD);
+        host_pin = sched::find_task_by_pid_namespace_lifetime_ref(*host.task->pid_namespace(), host.task->pid);
+        KEXPECT_TRUE(host_pin == host.task.get());
+        KEXPECT_FALSE(host.retire_if_unreferenced());
+        if (host_pin != nullptr) host_pin->release();
+        KREQUIRE_TRUE(host.retire_if_unreferenced());
+        expect_visible(*host.task, host.task->pid, nullptr, true);
+    }
+    KEXPECT_EQ(sched::get_scoped_pid_task_count(), BASELINE);
+    KEXPECT_EQ(sched::get_active_task_count(), ACTIVE);
+}
 
 KTEST(CompartmentIpc, ChildAndThreadUseExactProcessNamespace) {
     auto const BASELINE = ipc::live_namespace_count();

@@ -192,10 +192,31 @@ credential source inventory has stale expectations reproduced on the committed
 baseline; its existing focused root-metadata observation and native credential
 KTEST cases pass, without claiming the entire source inventory passes.
 
-Public compartment admission, remaining root/procfs consumers, PID and
-init-death lifecycle policy, complete network/WKI gates, launcher and required
-service campaigns remain pending. All ten full acceptance criteria remain
-outstanding. Prior focused host ASan/UBSan cases are foundation evidence, not
+Native PID namespaces now retain exact Task ownership and reserve monotonic local
+process/thread IDs. Canonical child/thread inheritance and requester-aware
+scoped registry queries preserve host physical IDs. Private scoped/physical/
+active registry publication serializes with namespace closure; failed or foreign
+admission makes no registry writes. Named live and zombie queries are distinct,
+and GC rechecks its final reference and withdraws all registry visibility under
+one guard before dead-list detach. Heavy cleanup and existing epoch/current/
+waitable-zombie checks remain. Six actual unpublished Task fixtures cover pool,
+name/reuse, child/thread, host compatibility, native probe-chain repair and exact
+zombie/active/host pin withdrawal. They do not make fake user Tasks runnable.
+
+Checkpoint07 Normal Build WOS, isolated fast diagnostic build, formatter, nine
+scheduler/resource and seven VFS/libc CTest entries pass. Final actual KTEST
+attempt12 passes 78,598 assertions, zero failures, 1,280 cases and normal poweroff,
+including all 28 required compartment cases. Four inactive disposable images
+(257,114,112 allocated bytes) were audited and pruned; final disposable usage is
+zero. Attempt10's host retirement-binding regression was corrected and its failed
+evidence/prune receipt retained; attempt11 passed before the final GC amendment.
+The 1000 native namespace reserve/close/drop cycles are owner-pool evidence, not
+1000 service create/exec/kill/destroy cycles.
+
+Public compartment admission, remaining root/procfs consumers, user PID/PPID/
+group/session/signal/wait/ptrace/TCB translation, namespace-init lifecycle policy,
+complete network/WKI gates, launcher and required service campaigns remain
+pending. All ten full acceptance criteria remain outstanding. Prior focused host ASan/UBSan cases are foundation evidence, not
 full service qualification. See progress/39/{ledger,evidence,reconnaissance,
 contract-01-profile,contract-02-ipc,contract-03-mount-registry,
 contract-04-task-lookup,contract-05-mount-administration}.md and
@@ -209,5 +230,5 @@ disposable-image budget and40GiB free floor; use immutable required bases and
 private COW/reflink images. Audit exact ownership/live process/QMP/FD/backing
 references and prune inactive agent-created disposable disks/backings/per-run
 appliances after PASS/FAIL/exceptions. Keep small evidence and user/unrelated
-disks/source/current artifacts. All seven Goal39 KTEST attempts pruned their exact-owned
-inactive disposable images; small logs/configs/manifests/receipts remain.
+disks/source/current artifacts. All completed Goal39 KTEST attempts pruned their
+exact-owned inactive disposable images; small logs/configs/manifests/receipts remain.

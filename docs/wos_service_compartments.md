@@ -276,6 +276,49 @@ names, and subject/thread procfs mount read/seek with failed-output preservation
 They use unpublished Tasks and trusted mount rows for augmentation; they do not
 qualify scheduled service execution or hostile concurrent rename campaigns.
 
+## Native PID ownership and registry foundation
+
+Tasks now retain a private PID namespace and reserve an immutable local PID/TID
+before native publication. The fixed pool holds 64 namespaces; local IDs are
+positive signed32-compatible values, never reused while that namespace survives.
+Drained pool slots get a globally nonreused generation. References remain exact
+kernel-owned capabilities; no number can join a namespace. Children inherit the
+canonical process owner's scope, and threads retain distinct IDs in that scope.
+Unbound threads have no scope and cannot fall back to host lookup. Exec preserves
+the installed owner. Host queries and internal physical IDs retain their existing
+meaning; host-thread resource binding needs no local reservation.
+
+The scheduler commits private scoped, physical and dense active visibility as
+one allocation-free transaction. Capacity and collision failures write nothing.
+An IRQ-safe per-namespace gate serializes closure with registration; lock order
+is runqueue, registry, namespace. Scoped index storage has 131,072 slots and admits
+at most 65,536 private members, including deferred zombies whose dense row has
+already retired. Each row borrows the physical registry's lifetime; its Task
+retains namespace identity through removal and destruction. Removal repairs
+probe chains and rejects a foreign physical-PID collision.
+
+Requester-aware retained queries select an exact local ID in that owner's scope.
+Closed, missing, stale and foreign IDs fail without global fallback. Live queries
+reject EXITING/DEAD; a separate metadata lifetime query admits zombies while
+their namespace remains open. Host supervision can retain private Tasks by their
+physical identity. This does not promise a zombie's reclaimed address space stays
+intact; memory access still requires the existing usercopy/pagemap gates.
+
+GC checks its final Task reference and withdraws all registry visibility under
+the same registry guard used by lifetime queries. A concurrent retained pin keeps
+the dead task queued; registry withdrawal succeeds only after pins drain. Existing
+epoch/current-task/waitable-zombie guards and outside-lock heavyweight cleanup
+remain. No new reference-count sentinel, teardown callback or user ABI is added.
+
+Six native fixtures use actual unpublished Tasks and production registry/GC
+withdrawal helpers. They cover pool exhaustion, failed output preservation,
+monotonic names, closed retained owners, child/thread admission, host retirement
+compatibility, same-number siblings, stale names, zombie pins, failed/colliding
+registration and actual probe-chain repair. They do not publish fake runnable
+user processes or qualify user-visible PID behavior. Public PID/PPID/group/session/
+procfs/signal/wait/ptrace and TCB adapters, namespace-init death and launcher
+admission remain pending; this foundation does not enable a public compartment.
+
 ## Verification checkpoint
 
 The initial `compartment_policy_test` suite checks actual production preparation

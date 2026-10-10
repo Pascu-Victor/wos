@@ -19,6 +19,7 @@
 #include <platform/sched/ipc_namespace.hpp>
 #include <platform/sched/job_control.hpp>
 #include <platform/sched/migration_guard.hpp>
+#include <platform/sched/pid_namespace.hpp>
 #include <platform/sched/preemption_diagnostics.hpp>
 #include <platform/sched/resource_lifetime.hpp>
 #include <platform/sched/resource_model.hpp>
@@ -1296,8 +1297,41 @@ struct Task {
     // filesystem owner; final drop is atomic-only and does not retire mounts.
     ker::vfs::mount_ns::NamespaceRef m_mount_namespace{};
     bool m_mount_namespace_initialized{};
+    // Each task retains its index identity, including threads whose public
+    // process scope is observed through the canonical retained owner.
+    pid_ns::NamespaceRef m_pid_namespace{};
+    uint32_t m_namespace_tid{};
+    bool m_pid_namespace_initialized{};
 
    public:
+    [[nodiscard]] auto pid_namespace() const -> const pid_ns::NamespaceRef* {
+        auto const* owner = credential_owner();
+        return owner != nullptr ? &owner->m_pid_namespace : nullptr;
+    }
+    [[nodiscard]] auto namespace_tid() const -> uint64_t {
+        auto const* scope = pid_namespace();
+        if (scope == nullptr) return 0;
+        if (scope->is_host()) return pid;
+        if (!m_pid_namespace_initialized || m_pid_namespace != *scope) return 0;
+        return m_namespace_tid;
+    }
+    [[nodiscard]] auto initialize_pid_namespace(const pid_ns::NamespaceRef& source) -> bool {
+        if (scheduler_published.load(std::memory_order_acquire) || state.load(std::memory_order_acquire) != TaskState::ACTIVE ||
+            m_pid_namespace_initialized || source.closed())
+            return false;
+        if (is_thread) {
+            auto const* scope = pid_namespace();
+            if (scope == nullptr || *scope != source) return false;
+        }
+        pid_ns::NamespaceRef candidate;
+        if (source.retain(candidate) != 0) return false;
+        uint32_t id = 0;
+        if (!source.is_host() && source.allocate_id(id) != 0) return false;
+        m_pid_namespace = std::move(candidate);
+        m_namespace_tid = id;
+        m_pid_namespace_initialized = true;
+        return true;
+    }
     [[nodiscard]] auto ipc_namespace() const -> const ipc::NamespaceRef* {
         auto const* owner = credential_owner();
         return owner != nullptr ? &owner->m_ipc_namespace : nullptr;

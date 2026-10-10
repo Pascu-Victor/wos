@@ -562,6 +562,53 @@ std::atomic<bool> kernel_thread_shutdown_requested{false};
 
 ker::mod::sys::Spinlock global_task_registry_lock;
 
+// Private entries borrow the physical registry's Task lifetime. Each Task
+// retains its namespace until removal; generation keys never join a scope.
+constexpr uint32_t SCOPED_PID_SLOTS = 2 * MAX_ACTIVE_TASKS;
+struct ScopedPidEntry {
+    uint64_t generation{};
+    uint64_t id{};
+    task::Task* task{};
+};
+constinit std::array<ScopedPidEntry, SCOPED_PID_SLOTS> scoped_pid_table{};
+uint32_t scoped_pid_count{};  // Protected by global_task_registry_lock.
+
+auto scoped_pid_hash(uint64_t generation, uint64_t id) -> uint32_t {
+    constexpr uint64_t MULTIPLIER = 11400714819323198485ULL;
+    return static_cast<uint32_t>(((generation * MULTIPLIER) ^ (id * (MULTIPLIER >> 1))) >> 32) & (SCOPED_PID_SLOTS - 1);
+}
+
+// Returns an exact key or the first empty slot; callers hold the registry lock.
+auto scoped_pid_slot(uint64_t generation, uint64_t id) -> uint32_t {
+    auto const START = scoped_pid_hash(generation, id);
+    for (uint32_t i = 0; i < SCOPED_PID_SLOTS; ++i) {
+        auto const INDEX = (START + i) & (SCOPED_PID_SLOTS - 1);
+        auto const& entry = scoped_pid_table[INDEX];
+        if (entry.task == nullptr || (entry.generation == generation && entry.id == id)) return INDEX;
+    }
+    return SCOPED_PID_SLOTS;
+}
+
+void scoped_pid_remove(task::Task* subject) {
+    auto const* scope = subject != nullptr ? subject->pid_namespace() : nullptr;
+    if (scope == nullptr || scope->is_host()) return;
+    auto index = scoped_pid_slot(scope->generation(), subject->namespace_tid());
+    if (index == SCOPED_PID_SLOTS || scoped_pid_table[index].task != subject) return;
+    scoped_pid_table[index] = {};
+    --scoped_pid_count;
+    auto next = (index + 1) & (SCOPED_PID_SLOTS - 1);
+    while (scoped_pid_table[next].task != nullptr) {
+        auto const& entry = scoped_pid_table[next];
+        auto const NATURAL = scoped_pid_hash(entry.generation, entry.id);
+        if (((index - NATURAL) & (SCOPED_PID_SLOTS - 1)) < ((next - NATURAL) & (SCOPED_PID_SLOTS - 1))) {
+            scoped_pid_table[index] = entry;
+            scoped_pid_table[next] = {};
+            index = next;
+        }
+        next = (next + 1) & (SCOPED_PID_SLOTS - 1);
+    }
+}
+
 inline auto active_task_slot(uint32_t index) -> task::Task*& {
     // Callers hold global_task_registry_lock and bound index by active_task_count.
     // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
@@ -622,22 +669,15 @@ auto active_list_insert(task::Task* t) -> bool {
     return false;
 }
 
-void active_list_remove(task::Task* subject) {
-    if (subject == nullptr) {
-        return;
-    }
-    uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
-    uint32_t const INDEX = subject->active_registry_index;
-    if (INDEX == task::Task::ACTIVE_REGISTRY_INDEX_INVALID) {
-        global_task_registry_lock.unlock_irqrestore(FLAGS);
-        return;
-    }
-    if (INDEX >= active_task_count || active_task_slot(INDEX) != subject) [[unlikely]] {
-        global_task_registry_lock.unlock_irqrestore(FLAGS);
-        dbg::panic_handler("scheduler: corrupt cached active registry index during removal");
-        hcf();
-    }
+auto active_list_index_valid_locked(const task::Task& subject) -> bool {
+    auto const INDEX = subject.active_registry_index;
+    return INDEX == task::Task::ACTIVE_REGISTRY_INDEX_INVALID || (INDEX < active_task_count && active_task_slot(INDEX) == &subject);
+}
 
+// Caller holds the registry lock and checked the exact cached index.
+void active_list_remove_locked(task::Task* subject) {
+    uint32_t const INDEX = subject->active_registry_index;
+    if (INDEX == task::Task::ACTIVE_REGISTRY_INDEX_INVALID) return;
     uint32_t const LAST_INDEX = --active_task_count;
     task::Task* const MOVED_TASK = active_task_slot(LAST_INDEX);
     active_task_slot(INDEX) = MOVED_TASK;
@@ -646,7 +686,18 @@ void active_list_remove(task::Task* subject) {
         MOVED_TASK->active_registry_index = INDEX;
     }
     subject->active_registry_index = task::Task::ACTIVE_REGISTRY_INDEX_INVALID;
+}
+
+void active_list_remove(task::Task* subject) {
+    if (subject == nullptr) return;
+    uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
+    bool const VALID = active_list_index_valid_locked(*subject);
+    if (VALID) active_list_remove_locked(subject);
     global_task_registry_lock.unlock_irqrestore(FLAGS);
+    if (!VALID) [[unlikely]] {
+        dbg::panic_handler("scheduler: corrupt cached active registry index during removal");
+        hcf();
+    }
 }
 
 inline auto pid_hash(uint64_t pid) -> uint32_t {
@@ -656,7 +707,7 @@ inline auto pid_hash(uint64_t pid) -> uint32_t {
     // NOLINTEND(readability-magic-numbers, cppcoreguidelines-avoid-magic-numbers)
 }
 
-// Publish a fresh task to both global registries as one visibility event.
+// Publish a fresh task to physical/active/scoped registries as one event.
 // Callers may hold the task's runqueue lock; keep this helper allocation-free
 // and do not call back into scheduler/runqueue code while the registry lock is
 // held. Any PID or active-list collision means the task was not fresh.
@@ -665,6 +716,11 @@ auto register_fresh_task_visibility(task::Task* task) -> bool {
         return false;
     }
 
+    auto const* scope = task->pid_namespace();
+    if (scope == nullptr) return false;
+    uint64_t const LOCAL_ID = task->namespace_tid();
+    if (!scope->is_host() && (LOCAL_ID == 0 || LOCAL_ID > pid_ns::MAX_LOCAL_ID)) return false;
+
     uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
     if (task->active_registry_index != ::ker::mod::sched::task::Task::ACTIVE_REGISTRY_INDEX_INVALID) [[unlikely]] {
         global_task_registry_lock.unlock_irqrestore(FLAGS);
@@ -672,39 +728,55 @@ auto register_fresh_task_visibility(task::Task* task) -> bool {
         hcf();
     }
 
-    uint32_t pid_index = MAX_PIDS;
-    uint32_t const SLOT = pid_hash(task->pid);
-    for (uint32_t i = 0; i < MAX_PIDS; ++i) {
-        uint32_t const INDEX = (SLOT + i) & (MAX_PIDS - 1);
-        auto& entry = pid_slot(INDEX);
-        if (entry.pid == task->pid) {
-            if (entry.task == task) [[unlikely]] {
-                global_task_registry_lock.unlock_irqrestore(FLAGS);
-                dbg::panic_handler("scheduler: fresh task already present in PID registry");
-                hcf();
+    bool duplicate_task = false;
+    bool registered = false;
+    {
+        // Destroy the nested IRQ guard before restoring the registry flags.
+        pid_ns::PublicationGuard const GATE(*scope);
+        registered = [&]() {
+            if (!GATE.open() || active_task_count >= MAX_ACTIVE_TASKS) return false;
+            uint32_t pid_index = MAX_PIDS;
+            uint32_t const SLOT = pid_hash(task->pid);
+            for (uint32_t i = 0; i < MAX_PIDS; ++i) {
+                uint32_t const INDEX = (SLOT + i) & (MAX_PIDS - 1);
+                auto const& entry = pid_slot(INDEX);
+                if (entry.pid == task->pid) {
+                    duplicate_task = entry.task == task;
+                    return false;
+                }
+                if (entry.pid == 0) {
+                    pid_index = INDEX;
+                    break;
+                }
             }
-            global_task_registry_lock.unlock_irqrestore(FLAGS);
-            return false;
-        }
-        if (entry.pid == 0) {
-            pid_index = INDEX;
-            break;
-        }
+            if (pid_index == MAX_PIDS) return false;
+            uint32_t scoped_index = SCOPED_PID_SLOTS;
+            if (!scope->is_host()) {
+                // Include unreaped/deferred-GC members in this bound even if
+                // their dense active-list row has already retired.
+                if (scoped_pid_count >= MAX_ACTIVE_TASKS) return false;
+                scoped_index = scoped_pid_slot(scope->generation(), LOCAL_ID);
+                if (scoped_index == SCOPED_PID_SLOTS || scoped_pid_table[scoped_index].task != nullptr) return false;
+            }
+            // All capacities/collisions checked before the first write.
+            if (scoped_index != SCOPED_PID_SLOTS) {
+                scoped_pid_table[scoped_index] = {scope->generation(), LOCAL_ID, task};
+                ++scoped_pid_count;
+            }
+            pid_slot(pid_index).task = task;
+            pid_slot(pid_index).pid = task->pid;
+            uint32_t const ACTIVE_INDEX = active_task_count++;
+            active_task_slot(ACTIVE_INDEX) = task;
+            task->active_registry_index = ACTIVE_INDEX;
+            return true;
+        }();
     }
-    if (pid_index == MAX_PIDS || active_task_count >= MAX_ACTIVE_TASKS) {
-        global_task_registry_lock.unlock_irqrestore(FLAGS);
-        return false;
-    }
-
-    // Readers use this same lock, so neither registry can expose the task
-    // until both fixed-capacity commits are complete.
-    pid_slot(pid_index).task = task;
-    pid_slot(pid_index).pid = task->pid;
-    uint32_t const ACTIVE_INDEX = active_task_count++;
-    active_task_slot(ACTIVE_INDEX) = task;
-    task->active_registry_index = ACTIVE_INDEX;
     global_task_registry_lock.unlock_irqrestore(FLAGS);
-    return true;
+    if (duplicate_task) [[unlikely]] {
+        dbg::panic_handler("scheduler: fresh task already present in PID registry");
+        hcf();
+    }
+    return registered;
 }
 
 auto pid_table_insert(task::Task* t) -> bool {
@@ -729,7 +801,7 @@ auto pid_table_insert(task::Task* t) -> bool {
     return false;  // Table full - MAX_PIDS concurrent processes exceeded
 }
 
-__attribute__((no_sanitize("address"))) auto pid_table_find_internal(uint64_t pid, bool acquire) -> task::Task* {
+__attribute__((no_sanitize("address"))) auto pid_table_find_internal(uint64_t pid, bool acquire, bool lifetime = false) -> task::Task* {
     if (pid == 0) {
         return nullptr;
     }
@@ -745,7 +817,7 @@ __attribute__((no_sanitize("address"))) auto pid_table_find_internal(uint64_t pi
         if (entry.pid == pid) {
             task::Task* t = entry.task;
             if (acquire) {
-                if (!t->try_acquire()) {
+                if (!(lifetime ? t->try_acquire_lifetime_ref() : t->try_acquire())) {
                     t = nullptr;
                 }
             }
@@ -759,11 +831,11 @@ __attribute__((no_sanitize("address"))) auto pid_table_find_internal(uint64_t pi
 
 __attribute__((no_sanitize("address"))) auto pid_table_find(uint64_t pid) -> task::Task* { return pid_table_find_internal(pid, false); }
 
-void pid_table_remove(uint64_t pid) {
+// Caller holds global_task_registry_lock. A failed exact removal writes nothing.
+auto pid_table_remove_locked(uint64_t pid, task::Task* expected) -> bool {
     if (pid == 0) {
-        return;
+        return false;
     }
-    uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
     uint32_t const SLOT = pid_hash(pid);
     uint32_t idx = 0;
     bool found = false;
@@ -773,19 +845,19 @@ void pid_table_remove(uint64_t pid) {
         idx = (SLOT + i) & (MAX_PIDS - 1);
         auto& entry = pid_slot(idx);
         if (entry.pid == 0) {
-            global_task_registry_lock.unlock_irqrestore(FLAGS);
-            return;  // Not in table
+            return false;  // Not in table
         }
         if (entry.pid == pid) {
             found = true;
             break;
         }
     }
-    if (!found) {
-        global_task_registry_lock.unlock_irqrestore(FLAGS);
-        return;
+    if (!found || (expected != nullptr && pid_slot(idx).task != expected)) {
+        return false;
     }
 
+    // Remove the borrowed scoped identity before physical visibility/lifetime.
+    scoped_pid_remove(pid_slot(idx).task);
     // Remove and backward-shift to maintain probe chains
     pid_slot(idx).pid = 0;
     pid_slot(idx).task = nullptr;
@@ -809,7 +881,40 @@ void pid_table_remove(uint64_t pid) {
         }
         next = (next + 1) & (MAX_PIDS - 1);
     }
+    return true;
+}
+
+void pid_table_remove(uint64_t pid, task::Task* expected = nullptr) {
+    if (pid == 0) return;
+    uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
+    static_cast<void>(pid_table_remove_locked(pid, expected));
     global_task_registry_lock.unlock_irqrestore(FLAGS);
+}
+
+// Caller owns the DEAD task under its dead-list/runqueue lock. Reference
+// admission and withdrawal share the registry guard, so a zombie/active query
+// cannot acquire a pin between the final ref check and removal. Heavy cleanup
+// and dead-list detachment remain outside this guard.
+auto try_withdraw_gc_task_visibility(task::Task& subject) -> bool {
+    uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
+    bool const UNREFERENCED =
+        subject.state.load(std::memory_order_acquire) == task::TaskState::DEAD && subject.ref_count.load(std::memory_order_acquire) == 1;
+    const char* corruption = nullptr;
+    if (UNREFERENCED) {
+        if (!active_list_index_valid_locked(subject)) {
+            corruption = "scheduler: corrupt cached active registry index during GC removal";
+        } else if (subject.pid > 0 && !pid_table_remove_locked(subject.pid, &subject)) {
+            corruption = "scheduler: GC task missing from exact PID registry";
+        } else {
+            active_list_remove_locked(&subject);
+        }
+    }
+    global_task_registry_lock.unlock_irqrestore(FLAGS);
+    if (corruption != nullptr) [[unlikely]] {
+        dbg::panic_handler(corruption);
+        hcf();
+    }
+    return UNREFERENCED;
 }
 
 // Per-CPU run queues with spinlocks for cross-CPU access
@@ -3001,6 +3106,13 @@ bool post_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, bool release_rese
 
     __atomic_thread_fence(__ATOMIC_RELEASE);
 
+    auto const* pid_namespace = task->pid_namespace();
+    if (pid_namespace == nullptr || pid_namespace->closed() || (!pid_namespace->is_host() && task->pid == 0)) {
+        log_rejected_task_publication("invalid PID namespace", cpu_no, task);
+        release_reservation_if_needed();
+        return false;
+    }
+
     if (task->type == task::TaskType::PROCESS && !task->jobctl_membership.bind(*task)) {
         log_rejected_task_publication("job-control membership failed", cpu_no, task);
         release_reservation_if_needed();
@@ -3008,13 +3120,14 @@ bool post_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, bool release_rese
     }
 
     if (task->pid > 0) {
-        if (!pid_table_insert(task)) {
+        bool const PRIVATE = !pid_namespace->is_host();
+        if (!(PRIVATE ? register_fresh_task_visibility(task) : pid_table_insert(task))) {
             task->jobctl_membership.rollback_publication(*task);
             log_rejected_task_publication("pid registry full", cpu_no, task);
             release_reservation_if_needed();
             return false;
         }
-        if (!active_list_insert(task)) {
+        if (!PRIVATE && !active_list_insert(task)) {
             pid_table_remove(task->pid);
             task->jobctl_membership.rollback_publication(*task);
             log_rejected_task_publication("active registry full", cpu_no, task);
@@ -6660,6 +6773,80 @@ __attribute__((no_sanitize("address"))) auto find_task_by_pid_safe(uint64_t pid)
 }
 
 namespace {
+auto find_scoped_task(const pid_ns::NamespaceRef& scope, uint64_t id, bool lifetime) -> task::Task* {
+    if (scope.is_host()) return pid_table_find_internal(id, true, lifetime);
+    if (id == 0 || id > pid_ns::MAX_LOCAL_ID) return nullptr;
+    task::Task* found = nullptr;
+    uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
+    {
+        pid_ns::PublicationGuard const GATE(scope);
+        if (GATE.open()) {
+            auto const INDEX = scoped_pid_slot(scope.generation(), id);
+            if (INDEX != SCOPED_PID_SLOTS) {
+                auto* candidate = scoped_pid_table[INDEX].task;
+                auto const* candidate_scope = candidate != nullptr ? candidate->pid_namespace() : nullptr;
+                if (candidate_scope != nullptr && *candidate_scope == scope && candidate->namespace_tid() == id &&
+                    (lifetime ? candidate->try_acquire_lifetime_ref() : candidate->try_acquire())) {
+                    found = candidate;
+                }
+            }
+        }
+    }
+    global_task_registry_lock.unlock_irqrestore(FLAGS);
+    return found;
+}
+}  // namespace
+
+auto find_task_by_pid_namespace_safe(const pid_ns::NamespaceRef& scope, uint64_t id) -> task::Task* {
+    return find_scoped_task(scope, id, false);
+}
+
+auto find_task_by_pid_namespace_lifetime_ref(const pid_ns::NamespaceRef& scope, uint64_t id) -> task::Task* {
+    return find_scoped_task(scope, id, true);
+}
+
+auto find_task_by_visible_pid_safe(const task::Task& requester, uint64_t id) -> task::Task* {
+    auto const* scope = requester.pid_namespace();
+    return scope != nullptr ? find_task_by_pid_namespace_safe(*scope, id) : nullptr;
+}
+
+auto find_task_by_visible_pid_lifetime_ref(const task::Task& requester, uint64_t id) -> task::Task* {
+    auto const* scope = requester.pid_namespace();
+    return scope != nullptr ? find_task_by_pid_namespace_lifetime_ref(*scope, id) : nullptr;
+}
+
+auto get_scoped_pid_task_count() -> uint32_t {
+    uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
+    auto const COUNT = scoped_pid_count;
+    global_task_registry_lock.unlock_irqrestore(FLAGS);
+    return COUNT;
+}
+
+#ifdef WOS_SELFTEST
+auto scheduler_selftest_register_unpublished_task(task::Task& subject) -> bool {
+    if (subject.scheduler_published.load(std::memory_order_acquire) || subject.state.load() != task::TaskState::ACTIVE ||
+        subject.active_registry_index != task::Task::ACTIVE_REGISTRY_INDEX_INVALID)
+        return false;
+    return register_fresh_task_visibility(&subject);
+}
+
+void scheduler_selftest_unregister_unpublished_task(task::Task& subject) {
+    if (subject.scheduler_published.load(std::memory_order_acquire)) return;
+    pid_table_remove(subject.pid, &subject);
+    active_list_remove(&subject);
+}
+
+auto scheduler_selftest_scoped_pid_bucket(const pid_ns::NamespaceRef& scope, uint64_t id) -> uint32_t {
+    return scoped_pid_hash(scope.generation(), id);
+}
+
+auto scheduler_selftest_withdraw_unpublished_gc_task(task::Task& subject) -> bool {
+    if (subject.scheduler_published.load(std::memory_order_acquire)) return false;
+    return try_withdraw_gc_task_visibility(subject);
+}
+#endif
+
+namespace {
 auto task_has_registered_pagemap_sibling(task::Task* subject) -> bool {
     if (subject == nullptr || subject->pagemap == nullptr) {
         return false;
@@ -7493,14 +7680,15 @@ auto detach_next_reclaimable_task_locked(RunQueue* rq, uint64_t cpu_no, uint64_t
             should_free_pagemap = !gc_task_has_pagemap_sibling_locked(cur);
         }
 
-        (void)transition_detach_dead_locked(rq, cur);
-
-        // Once the task is out of the registries, no new pid/active-list lookup
-        // can acquire it while the heavy cleanup runs outside the runqueue lock.
-        if (cur->pid > 0) {
-            pid_table_remove(cur->pid);
-            active_list_remove(cur);
+        // Recheck the final reference under the same lock as registry lookup
+        // and withdrawal. A newly acquired lifetime pin keeps DEAD membership.
+        if (!try_withdraw_gc_task_visibility(*cur)) {
+            if (diagnostics != nullptr) ++diagnostics->refcount_skips;
+            cur = next;
+            continue;
         }
+
+        (void)transition_detach_dead_locked(rq, cur);
 
         return {.task = cur, .should_free_pagemap = should_free_pagemap};
     }

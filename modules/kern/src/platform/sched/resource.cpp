@@ -16,11 +16,14 @@
 #include <syscalls_impl/vmem/sys_vmem.hpp>
 
 namespace ker::mod::sched::resource {
-LifetimeOwner::~LifetimeOwner() {
+LifetimeOwner::~LifetimeOwner() { reset(); }
+
+void LifetimeOwner::reset() {
     finish_cpu();
     if (m_owner != nullptr) {
         m_owner->resource_thread_owners.fetch_sub(1, std::memory_order_acq_rel);
         m_owner->release();
+        m_owner = nullptr;
     }
 }
 
@@ -191,8 +194,18 @@ auto close_idle_thread_cpu_admission(task::Task& owner) -> bool {
 
 auto bind_thread_owner(task::Task& thread, task::Task& parent) -> bool {
     Owner owner(&parent);
-    return thread.is_thread && owner.get() != &thread && thread.owner_pid != 0 && owner.get() != nullptr &&
-           owner.get()->pid == thread.owner_pid && thread.resource_owner.attach(owner.get());
+    if (!thread.is_thread || owner.get() == &thread || thread.owner_pid == 0 || owner.get() == nullptr ||
+        owner.get()->pid != thread.owner_pid)
+        return false;
+    auto const* scope = owner.get()->pid_namespace();
+    if (scope == nullptr || scope->closed()) return false;
+    // Host ownership needs no local-ID reservation. Keep its existing
+    // metadata-only binding behavior, including retained retirement fixtures.
+    if (scope->is_host()) return thread.resource_owner.attach(owner.get());
+    if (thread.scheduler_published.load(std::memory_order_acquire) || !thread.resource_owner.attach(owner.get())) return false;
+    if (thread.initialize_pid_namespace(*scope)) return true;
+    thread.resource_owner.reset();
+    return false;
 }
 
 void charge_cpu(task::Task* subject, uint64_t elapsed_us, uint64_t user_us) {
@@ -260,8 +273,13 @@ auto inherit(task::Task& child, task::Task& parent) -> bool {
     auto& source = *owner.get();
     auto const* ipc_namespace = source.ipc_namespace();
     auto const* mount_namespace = source.mount_namespace();
-    if (ipc_namespace == nullptr || mount_namespace == nullptr || ipc_namespace->closed() || mount_namespace->closed()) return false;
-    if (!child.initialize_ipc_namespace(*ipc_namespace) || !child.initialize_mount_namespace(*mount_namespace)) return false;
+    auto const* pid_namespace = source.pid_namespace();
+    if (ipc_namespace == nullptr || mount_namespace == nullptr || pid_namespace == nullptr || ipc_namespace->closed() ||
+        mount_namespace->closed() || pid_namespace->closed())
+        return false;
+    if (!child.initialize_ipc_namespace(*ipc_namespace) || !child.initialize_mount_namespace(*mount_namespace) ||
+        !child.initialize_pid_namespace(*pid_namespace))
+        return false;
     uint64_t const FLAGS = source.resource_lock.lock_irqsave();
     child.resources.inherit_limits(source.resources);
     source.resource_lock.unlock_irqrestore(FLAGS);

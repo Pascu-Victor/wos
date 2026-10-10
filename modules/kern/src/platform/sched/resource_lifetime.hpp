@@ -5,6 +5,7 @@ struct Task;
 }
 
 namespace ker::mod::sched::resource {
+auto bind_thread_owner(task::Task& thread, task::Task& parent) -> bool;
 // An immutable reference installed before publishing a user thread. Keeping
 // the process metadata alive permits IRQ accounting without registry lookup.
 // The destructor only drops a reference; scheduler GC owns actual reclamation.
@@ -23,6 +24,9 @@ class LifetimeOwner {
     auto get() const -> task::Task* { return m_owner; }
 
    private:
+    friend auto bind_thread_owner(task::Task& thread, task::Task& parent) -> bool;
+    // Only fresh, unpublished binding may roll back immutable ownership.
+    void reset();
     task::Task* m_owner = nullptr;
     bool m_cpu_active = false;
 };
