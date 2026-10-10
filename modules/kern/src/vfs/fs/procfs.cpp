@@ -1765,9 +1765,9 @@ auto generate_mounts_for_task(ProcTask* task, char* buf, size_t bufsz) -> ssize_
     }
 
     // Iterate mount table
-    for (size_t i = 0; i < ker::vfs::get_mount_count(); ++i) {
+    for (size_t i = 0; i < ker::vfs::get_mount_count(root.mount_scope()); ++i) {
         ker::vfs::MountSnapshot mount_snapshot{};
-        if (!ker::vfs::get_mount_snapshot_at(i, &mount_snapshot)) {
+        if (!ker::vfs::get_mount_snapshot_at(i, &mount_snapshot, root.mount_scope())) {
             continue;
         }
         const char* snapshot_path = static_cast<const char*>(mount_snapshot.path);
@@ -1779,6 +1779,7 @@ auto generate_mounts_for_task(ProcTask* task, char* buf, size_t bufsz) -> ssize_
         size_t const MOUNT_PATH_LEN = std::strlen(mount_path);
         bool const INSIDE_ROOT = root_len == 1 || (MOUNT_PATH_LEN >= root_len && std::strncmp(mount_path, task_root, root_len) == 0 &&
                                                    (mount_path[root_len] == '/' || mount_path[root_len] == '\0'));
+        if (!root.mount_scope().is_host() && !INSIDE_ROOT) continue;
         if (root_len > 1 && INSIDE_ROOT) {
             display_path = mount_path + root_len;
             if (display_path[0] == '\0') {

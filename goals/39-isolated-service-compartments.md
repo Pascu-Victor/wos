@@ -144,7 +144,7 @@ and restart step, and mark the active goal blocked. Missing prerequisites or
 hardware are never completion. Budget and pause controls remain user/system
 controlled.
 
-## Current session checkpoint (2026-10-08)
+## Current session checkpoint (2026-10-10)
 
 Selected after user-requested Goal28 checkpoint commit70bc3fe7 and goal switch.
 Goal28 remains incomplete as a repository checkpoint. The user cleared its
@@ -174,7 +174,25 @@ usage is zero. Source/artifact/runner receipts remain pinned. Native fixtures
 use actual unpublished Tasks and production backing/path/admin APIs; they do
 not qualify scheduled hostile user processes or a usable compartment boundary.
 
-Public compartment admission, remaining root/readdir/procfs consumers, PID and
+Retained File directory reads now enumerate the File's exact mount view, recover
+native directory identity after rename, preserve inherited backend capabilities,
+and suppress synthetic names after namespace closure. Host WKI aliases use an
+explicit captured host root; private `wki` names remain ordinary. File observer
+fallbacks refuse replacement mount owners. Procfs mount reads and SEEK_END capture
+the subject process's exact namespace/root and preserve caller output/cursor on
+failed observations; private procfs PID/link support is still absent.
+
+Checkpoint06 Normal Build WOS, isolated fast diagnostic build, formatter and
+seven existing VFS/libc CTest entries pass. Actual isolated KTEST attempt09 passes
+74,332 assertions, zero failures, 1,274 cases and normal poweroff, including all
+22 required compartment cases. Four inactive images (256,786,432 allocated bytes)
+were audited and pruned; final disposable usage is zero. Attempt08's typed-error
+assertion failure and audited cleanup are retained as failed evidence. The broader
+credential source inventory has stale expectations reproduced on the committed
+baseline; its existing focused root-metadata observation and native credential
+KTEST cases pass, without claiming the entire source inventory passes.
+
+Public compartment admission, remaining root/procfs consumers, PID and
 init-death lifecycle policy, complete network/WKI gates, launcher and required
 service campaigns remain pending. All ten full acceptance criteria remain
 outstanding. Prior focused host ASan/UBSan cases are foundation evidence, not

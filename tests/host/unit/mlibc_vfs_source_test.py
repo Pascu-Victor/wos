@@ -187,7 +187,16 @@ def test_wos_fstat_close_abi_consumes_each_fd_once() -> None:
 
     vfs_core = KERNEL_VFS_CORE_CPP.read_text()
     close_body = function_body(vfs_core, r"auto\s+vfs_close\(int\s+fd\)\s*->\s*int")
-    require_tokens(close_body, ["vfs_take_fd_locked", "vfs_close_taken_file"], "factored VFS close path")
+    require_tokens(close_body, ["vfs_close_for_task(ker::mod::sched::get_current_task(), fd)"], "ambient VFS close delegation")
+    task_close_body = function_body(
+        vfs_core, r"auto\s+vfs_close_for_task\(ker::mod::sched::task::Task\*\s+t,\s*int\s+fd\)\s*->\s*int"
+    )
+    require_order(
+        task_close_body,
+        ["fd_table_task_for(t)", "fd_table_lock.lock_irqsave()", "vfs_take_fd_locked(table_task, fd)",
+         "fd_table_lock.unlock_irqrestore(IRQF)", "vfs_close_taken_file(t, table_task, f"],
+        "factored subject VFS close lock and lifetime ordering",
+    )
     combined_body = function_body(
         vfs_core,
         r"auto\s+vfs_fstat_close_for_task\(ker::mod::sched::task::Task\*\s+task,\s*int\s+fd,\s*Stat\*\s+statbuf,\s*int\*\s+stat_result\)\s*->\s*int",
@@ -462,7 +471,15 @@ def test_kernel_vfs_syscalls_accept_the_flags_mlibc_forwards() -> None:
 
     dup2_body = function_body(vfs_core, r"auto\s+vfs_dup2\(int\s+oldfd,\s*int\s+newfd,\s*int\s+flags\)\s*->\s*int")
     require_tokens(
-        dup2_body,
+        dup2_body, ["vfs_dup2_for_task(ker::mod::sched::get_current_task(), oldfd, newfd, flags)"],
+        "ambient VFS dup2 delegation",
+    )
+    task_dup2_body = function_body(
+        vfs_core,
+        r"auto\s+vfs_dup2_for_task\(ker::mod::sched::task::Task\*\s+task,\s*int\s+oldfd,\s*int\s+newfd,\s*int\s+flags\)\s*->\s*int",
+    )
+    require_tokens(
+        task_dup2_body,
         [
             "if ((flags & ~ker::vfs::O_CLOEXEC) != 0)",
             "vfs_replace_fd_for_dup2_locked(table_task, newfd, f, (flags & ker::vfs::O_CLOEXEC) != 0)",

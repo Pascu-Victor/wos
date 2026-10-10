@@ -19,6 +19,7 @@ class FilesystemRootMetadata {
     auto path() const -> const char* { return physical_.data(); }
     auto read_only() const -> bool { return read_only_; }
     auto nosuid() const -> bool { return nosuid_; }
+    auto mount_scope() const -> const mount_ns::NamespaceRef& { return scope_; }
 
    private:
     friend auto vfs_capture_root_metadata(ker::mod::sched::task::Task*, FilesystemRootMetadata&) -> int;
@@ -27,6 +28,7 @@ class FilesystemRootMetadata {
     ker::mod::sched::task::Task::PathBuffer text_{};
     std::array<char, PATH_CAPACITY> physical_{};
     DirectoryAnchorRef anchor_;
+    mount_ns::NamespaceRef scope_;
     uint64_t namespace_generation_ = 0;
     uint64_t mount_generation_ = 0;
     bool read_only_ = false;

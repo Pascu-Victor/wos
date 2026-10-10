@@ -617,6 +617,8 @@ auto realpath_native_as(ker::mod::sched::task::Task* task, const ker::mod::secur
 auto consume_lookup_locked(const LookupHandle& handle, bool namespace_mutation, LookupConsumer consumer, void* context,
                            const ker::mod::sched::task::Task* request_task = nullptr,
                            const ker::mod::security::Snapshot* request_credentials = nullptr) -> int;
+auto copy_directory_lookup_path(File* directory, uint64_t namespace_generation, uint64_t mount_generation,
+                                std::array<char, MAX_PATH_LEN>& out, bool namespace_already_locked = false) -> int;
 auto open_local_serialized(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, LookupFollowPolicy follow_policy,
                            bool require_directory, bool apply_task_route, LookupConsumer consumer, void* context,
                            const ker::mod::security::Snapshot* admitted_credentials = nullptr, DirectoryViewRef* directory_view = nullptr)
@@ -1588,6 +1590,17 @@ auto metadata_cache_has_path_variant(const char* path, size_t path_len, FSType f
     return false;
 }
 
+// A File's historical name never selects an executing worker's mount view.
+// Refuse a replacement/overmount: observer hints do not transfer object authority.
+auto retain_file_named_mount(const File* file, size_t path_length = UNKNOWN_MOUNT_PATH_LEN) -> MountRef {
+    if (file == nullptr || file->vfs_path == nullptr) return {};
+    auto* owner = file->mount_owner;
+    auto selected = owner != nullptr ? find_mount_point(file->vfs_path, path_length, owner->namespace_owner)
+                                     : find_mount_point(file->vfs_path, path_length);
+    if (owner != nullptr && selected.get() != owner) return {};
+    return selected;
+}
+
 auto metadata_cache_has_file_data_observation(File* file) -> bool {
     if (file == nullptr || file->vfs_path == nullptr) {
         return true;
@@ -1604,7 +1617,7 @@ auto metadata_cache_has_file_data_observation(File* file) -> bool {
                metadata_cache_has_path_variant(file->vfs_path, PATH_LEN, file->fs_type, file->mount_dev_id, false, false, true);
     }
 
-    MountRef mount_ref = find_mount_point(file->vfs_path, PATH_LEN);
+    MountRef mount_ref = retain_file_named_mount(file, PATH_LEN);
     MountPoint const* mount = mount_ref.get();
     if (mount == nullptr || !metadata_cacheable_fs(mount->fs_type)) {
         return true;
@@ -2728,7 +2741,7 @@ void metadata_cache_refresh_file_data_on_close(File* file) {
         return;
     }
 
-    MountRef mount_ref = find_mount_point(file->vfs_path, PATH_LEN);
+    MountRef mount_ref = retain_file_named_mount(file, PATH_LEN);
     MountPoint const* mount = mount_ref.get();
     if (mount == nullptr || mount->fs_type != file->fs_type || !metadata_cacheable_fs(mount->fs_type)) {
         return;
@@ -2824,7 +2837,7 @@ void metadata_cache_store_known_file_stat_after_metadata_change(File* file, cons
         return;
     }
 
-    MountRef mount_ref = find_mount_point(file->vfs_path, PATH_LEN);
+    MountRef mount_ref = retain_file_named_mount(file, PATH_LEN);
     MountPoint const* mount = mount_ref.get();
     if (mount == nullptr || mount->fs_type != file->fs_type || !metadata_cacheable_fs(mount->fs_type)) {
         return;
@@ -2853,7 +2866,7 @@ void metadata_cache_store_fresh_file_stat(File* file, const Stat& statbuf, Metad
         return;
     }
 
-    MountRef mount_ref = find_mount_point(file->vfs_path, PATH_LEN);
+    MountRef mount_ref = retain_file_named_mount(file, PATH_LEN);
     MountPoint const* mount = mount_ref.get();
     if (mount == nullptr || mount->fs_type != file->fs_type || !metadata_cacheable_fs(mount->fs_type)) {
         return;
@@ -2890,7 +2903,7 @@ auto metadata_cache_store_opened_file_stat(File* file, MountPoint const* known_m
     MountPoint const* mount = known_mount;
     if (mount == nullptr || mount->fs_type != file->fs_type || !metadata_cacheable_fs(mount->fs_type) ||
         (file->mount_dev_id != 0 && mount->dev_id != file->mount_dev_id)) {
-        mount_ref = find_mount_point(file->vfs_path, PATH_LEN);
+        mount_ref = retain_file_named_mount(file, PATH_LEN);
         mount = mount_ref.get();
     }
     if (mount == nullptr || mount->fs_type != file->fs_type || !metadata_cacheable_fs(mount->fs_type)) {
@@ -2918,7 +2931,7 @@ void metadata_cache_store_opened_file_hints(File* file, MountPoint const* known_
     MountPoint const* mount = known_mount;
     if (mount == nullptr || mount->fs_type != file->fs_type || !metadata_cacheable_fs(mount->fs_type) ||
         (file->mount_dev_id != 0 && mount->dev_id != file->mount_dev_id)) {
-        mount_ref = find_mount_point(file->vfs_path, PATH_LEN);
+        mount_ref = retain_file_named_mount(file, PATH_LEN);
         mount = mount_ref.get();
     }
     if (mount == nullptr || mount->fs_type != file->fs_type || !metadata_cacheable_fs(mount->fs_type)) {
@@ -4538,7 +4551,7 @@ auto vfs_stream_cache_get_file_stat(File* file, Stat* statbuf) -> int {
         if (file->mount_dev_id != 0) {
             return file->mount_dev_id;
         }
-        MountRef sc_mount_ref = (file->vfs_path != nullptr) ? find_mount_point(file->vfs_path, file_vfs_path_len(file)) : MountRef{};
+        MountRef sc_mount_ref = (file->vfs_path != nullptr) ? retain_file_named_mount(file, file_vfs_path_len(file)) : MountRef{};
         MountPoint const* sc_mount = sc_mount_ref.get();
         return sc_mount != nullptr ? sc_mount->dev_id : 0;
     };
@@ -4612,7 +4625,7 @@ auto stream_build_identity(File* file, const Stat& statbuf, StreamCacheIdentity*
     } else if (file->fs_type == FSType::FAT32 && file->mount_owner != nullptr) {
         scope_key = stream_scope_key_for_mount(file->mount_owner);
     } else {
-        auto mount_ref = find_mount_point(file->vfs_path, file_vfs_path_len(file));
+        auto mount_ref = retain_file_named_mount(file, file_vfs_path_len(file));
         MountPoint const* mount = mount_ref.get();
         if (mount == nullptr) {
             return -ENOENT;
@@ -6023,21 +6036,13 @@ bool is_logical_wki_root_dir(const char* path) {
     return std::strncmp(path, task->root.data(), ROOT_LEN) == 0 && std::strcmp(path + ROOT_LEN, "/wki") == 0;
 }
 
-bool logical_wki_root_has_mount_child() {
+bool logical_wki_root_has_mount_child(const char* root) {
     std::array<char, MAX_PATH_LEN> resolved{"/wki"};
-
-    if (ker::mod::sched::can_query_current_task()) {
-        auto* task = ker::mod::sched::get_current_task();
-        if (task != nullptr) {
-            size_t const ROOT_LEN = task_cached_root_len(task);
-            if (ROOT_LEN > 1) {
-                if (ROOT_LEN + 4 >= resolved.size()) {
-                    return false;
-                }
-                std::memcpy(resolved.data(), task->root.data(), ROOT_LEN);
-                std::memcpy(resolved.data() + ROOT_LEN, "/wki", 5);
-            }
-        }
+    size_t const ROOT_LEN = std::strlen(root);
+    if (ROOT_LEN > 1) {
+        if (ROOT_LEN + 4 >= resolved.size()) return false;
+        std::memcpy(resolved.data(), root, ROOT_LEN);
+        std::memcpy(resolved.data() + ROOT_LEN, "/wki", 5);
     }
 
     return static_cast<bool>(find_first_mount_child(resolved.data()));
@@ -6450,6 +6455,12 @@ auto rewrite_wki_host_alias(const ker::mod::sched::task::Task* task, const char*
 
 auto dirent_name_length(const DirEntry& entry) -> size_t;
 
+auto read_directory_backend_entry(File* file, DirEntry* entry, size_t index) -> int {
+    if (file->fs_type == FSType::TMPFS && file->fops == tmpfs::get_tmpfs_fops())
+        return tmpfs::tmpfs_readdir_file_native(file, entry, index);
+    return file->fops->vfs_readdir(file, entry, index);
+}
+
 auto dir_contains_name(ker::vfs::File* file, bool has_fs_readdir, size_t fs_count, const char* name) -> bool {
     if (!has_fs_readdir || file == nullptr || file->fops == nullptr || file->fops->vfs_readdir == nullptr || name == nullptr) {
         return false;
@@ -6458,7 +6469,7 @@ auto dir_contains_name(ker::vfs::File* file, bool has_fs_readdir, size_t fs_coun
     DirEntry probe = {};
     size_t const NAME_LEN = std::strlen(name);
     for (size_t index = 0; index < fs_count;) {
-        if (file->fops->vfs_readdir(file, &probe, index) != 0) {
+        if (read_directory_backend_entry(file, &probe, index) != 0) {
             break;
         }
 
@@ -9448,20 +9459,57 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size, ker::mod::sched
             return VALIDATION;
         }
     }
+    auto const* subject_scope = t->mount_namespace();
+    if (subject_scope == nullptr) {
+        vfs_put_file(f);
+        return -ESRCH;
+    }
+    mount_ns::NamespaceRef scope;
+    if (f->mount_owner != nullptr) {
+        int const RETAIN = f->mount_owner->namespace_owner.retain(scope);
+        if (RETAIN != 0) {
+            vfs_put_file(f);
+            return RETAIN;
+        }
+    }
+    MetadataSnapshotStamp const READ_STAMP = metadata_snapshot_stamp();
+    uint64_t const PATH_EPOCH = g_vfs_namespace_generation.load(std::memory_order_acquire);
+    std::array<char, MAX_PATH_LEN> listing_path{};
+    bool augment = f->vfs_path != nullptr && !scope.closed() && (f->mount_owner != nullptr || subject_scope->is_host());
+    if (augment) {
+        int const PATH =
+            f->mount_owner != nullptr && ((f->fs_type == FSType::TMPFS && f->fops == tmpfs::get_tmpfs_fops()) || f->fs_type == FSType::XFS)
+                ? copy_directory_lookup_path(f, PATH_EPOCH, READ_STAMP.mount_generation, listing_path)
+                : copy_path_string(f->vfs_path, listing_path.data(), listing_path.size());
+        augment = PATH == 0;
+    }
     MountRef readdir_mount_ref{};
-    if (f->vfs_path != nullptr && metadata_cacheable_fs(f->fs_type)) {
-        readdir_mount_ref = find_mount_point(f->vfs_path, file_vfs_path_len(f));
-    }
+    if (augment && metadata_cacheable_fs(f->fs_type)) readdir_mount_ref = retain_file_named_mount(f, file_vfs_path_len(f));
     MountPoint const* readdir_mount = readdir_mount_ref.get();
-    if (readdir_mount != nullptr && readdir_mount->fs_type != f->fs_type) {
+    // A recovered directory can have a different name after rename. Its File
+    // still grants backend listing; historical text cannot receive cache hints.
+    if (readdir_mount != nullptr && (readdir_mount->fs_type != f->fs_type || std::strcmp(listing_path.data(), f->vfs_path) != 0 ||
+                                     (f->mount_owner != nullptr && (f->vfs_path_namespace_generation != PATH_EPOCH ||
+                                                                    f->mount_generation != READ_STAMP.mount_generation))))
         readdir_mount = nullptr;
-    }
+    FilesystemRootMetadata visible_root;
+    bool const HOST_ALIASES = augment && scope.is_host() && subject_scope->is_host() && vfs_capture_root_metadata(t, visible_root) == 0;
+    auto visible_listing_path = [&](const char* path, char* out, size_t capacity) -> int {
+        const char* visible = path;
+        if (HOST_ALIASES) {
+            size_t const ROOT_LEN = std::strlen(visible_root.path());
+            if (ROOT_LEN > 1 && path_prefix_matches(path, visible_root.path(), ROOT_LEN)) {
+                visible = path + ROOT_LEN;
+                if (*visible == '\0') visible = "/";
+            }
+        }
+        return copy_path_string(visible, out, capacity);
+    };
 
     auto* packed_entries = static_cast<uint8_t*>(buffer);
     size_t packed_bytes = 0;
     size_t entries_read = 0;
     bool buffer_full = false;
-    MetadataSnapshotStamp const READ_STAMP = metadata_snapshot_stamp();
 
     // Read directory entries using the current position as an opaque-ish index.
     // Filesystems that need sparse/stable cookies can return d_off greater
@@ -9492,7 +9540,7 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size, ker::mod::sched
         if (HAS_FS_READDIR &&
             (f->fs_type == FSType::PROCFS || f->dir_fs_count == static_cast<size_t>(-1) || ACTUAL_INDEX < f->dir_fs_count)) {
             DirEntry entry = {};
-            int const RET = f->fops->vfs_readdir(f, &entry, ACTUAL_INDEX);
+            int const RET = read_directory_backend_entry(f, &entry, ACTUAL_INDEX);
             if (RET == 0) {
                 if (!emit_entry(entry, ACTUAL_INDEX)) {
                     break;
@@ -9519,23 +9567,25 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size, ker::mod::sched
         // Deduplicate against FS entries and against earlier mounts that
         // yield the same child component.
         bool found_mount_child = false;
-        if (f->vfs_path != nullptr) {
+        if (augment && !scope.closed() && PATH_EPOCH == g_vfs_namespace_generation.load(std::memory_order_acquire) &&
+            READ_STAMP.mount_generation == mount_table_generation_snapshot()) {
             size_t const FS_COUNT = HAS_FS_READDIR ? f->dir_fs_count : 0;
             size_t synthetic_index = ACTUAL_INDEX - FS_COUNT;
 
-            // strip_current_task_root_prefix initializes the complete NUL-terminated path on success.
+            // The producer uses retained File identity and an explicit host root.
             // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays,cppcoreguidelines-pro-type-member-init)
             char visible_dir_path[MAX_PATH_LEN] __attribute__((uninitialized));
-            if (strip_current_task_root_prefix(f->vfs_path, visible_dir_path, sizeof(visible_dir_path)) < 0) {
+            if (visible_listing_path(listing_path.data(), visible_dir_path, sizeof(visible_dir_path)) < 0) {
                 break;
             }
 
             const char* local_hostname = ker::net::wki::g_wki.local_hostname.data();
-            bool const INJECT_WKI_ROOT = std::strcmp(visible_dir_path, "/") == 0 && ker::net::wki::g_wki.initialized &&
-                                         !logical_wki_root_has_mount_child() && !dir_contains_name(f, HAS_FS_READDIR, FS_COUNT, "wki");
+            bool const INJECT_WKI_ROOT = HOST_ALIASES && std::strcmp(visible_dir_path, "/") == 0 && ker::net::wki::g_wki.initialized &&
+                                         !logical_wki_root_has_mount_child(visible_root.path()) &&
+                                         !dir_contains_name(f, HAS_FS_READDIR, FS_COUNT, "wki");
             bool const INJECT_HOST_ALIAS =
-                std::strcmp(visible_dir_path, "/wki") == 0 && !dir_contains_name(f, HAS_FS_READDIR, FS_COUNT, "host");
-            bool const INJECT_LOCAL_ALIAS = std::strcmp(visible_dir_path, "/wki") == 0 && local_hostname[0] != '\0' &&
+                HOST_ALIASES && std::strcmp(visible_dir_path, "/wki") == 0 && !dir_contains_name(f, HAS_FS_READDIR, FS_COUNT, "host");
+            bool const INJECT_LOCAL_ALIAS = HOST_ALIASES && std::strcmp(visible_dir_path, "/wki") == 0 && local_hostname[0] != '\0' &&
                                             !dir_contains_name(f, HAS_FS_READDIR, FS_COUNT, local_hostname);
 
             if (INJECT_WKI_ROOT) {
@@ -9593,16 +9643,16 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size, ker::mod::sched
             size_t const DIR_LEN = std::strlen(visible_dir_path);
             size_t child_count = 0;
 
-            for (size_t mi = 0; mi < get_mount_count(); ++mi) {
+            for (size_t mi = 0; mi < get_mount_count(scope); ++mi) {
                 MountSnapshot mount_snapshot = {};
-                if (!get_mount_snapshot_at(mi, &mount_snapshot)) {
+                if (!get_mount_snapshot_at(mi, &mount_snapshot, scope)) {
                     continue;
                 }
 
-                // strip_current_task_root_prefix initializes the complete NUL-terminated path on success.
+                // Same captured root and exact namespace as the directory.
                 // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays,cppcoreguidelines-pro-type-member-init)
                 char visible_mount_path[MAX_PATH_LEN] __attribute__((uninitialized));
-                if (strip_current_task_root_prefix(mount_snapshot.path, visible_mount_path, sizeof(visible_mount_path)) < 0) {
+                if (visible_listing_path(mount_snapshot.path, visible_mount_path, sizeof(visible_mount_path)) < 0) {
                     continue;
                 }
 
@@ -9641,14 +9691,14 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size, ker::mod::sched
                 bool dup_mount = false;
                 for (size_t mj = 0; mj < mi; ++mj) {
                     MountSnapshot mount_snapshot2 = {};
-                    if (!get_mount_snapshot_at(mj, &mount_snapshot2)) {
+                    if (!get_mount_snapshot_at(mj, &mount_snapshot2, scope)) {
                         continue;
                     }
 
-                    // strip_current_task_root_prefix initializes the complete NUL-terminated path on success.
+                    // Same captured root and exact namespace as the directory.
                     // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays,cppcoreguidelines-pro-type-member-init)
                     char visible_mount_path2[MAX_PATH_LEN] __attribute__((uninitialized));
-                    if (strip_current_task_root_prefix(mount_snapshot2.path, visible_mount_path2, sizeof(visible_mount_path2)) < 0) {
+                    if (visible_listing_path(mount_snapshot2.path, visible_mount_path2, sizeof(visible_mount_path2)) < 0) {
                         continue;
                     }
 
@@ -9689,7 +9739,7 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size, ker::mod::sched
                     bool already_in_fs = false;
                     DirEntry probe = {};
                     for (size_t pi = 0; pi < FS_COUNT;) {
-                        int const PRET = f->fops->vfs_readdir(f, &probe, pi);
+                        int const PRET = read_directory_backend_entry(f, &probe, pi);
                         if (PRET != 0) {
                             break;
                         }
@@ -9718,8 +9768,9 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size, ker::mod::sched
                     // Mark WKI entries with WOSLINK flag for recursion prevention:
                     // - listing /wki: all mount children (wos-0, wos-1, ...) are WOSLINK
                     // - listing /: the "wki" mount child is WOSLINK
-                    if (std::strcmp(visible_dir_path, "/wki") == 0 ||
-                        (DIR_LEN == 1 && visible_dir_path[0] == '/' && child_len == 3 && std::memcmp(child_start, "wki", 3) == 0)) {
+                    if (HOST_ALIASES &&
+                        (std::strcmp(visible_dir_path, "/wki") == 0 ||
+                         (DIR_LEN == 1 && visible_dir_path[0] == '/' && child_len == 3 && std::memcmp(child_start, "wki", 3) == 0))) {
                         entry.d_type = DT_DIR | DT_WOSLINK;
                     } else {
                         entry.d_type = DT_DIR;
@@ -11625,7 +11676,7 @@ auto lookup_authorization_still_current(const LookupHandle& handle) -> bool {
 // Called before acquiring the lookup's publication guard. File and mount are
 // retained; the returned text is request-local and never refreshes a published File.
 auto copy_directory_lookup_path(File* directory, uint64_t namespace_generation, uint64_t mount_generation,
-                                std::array<char, MAX_PATH_LEN>& out, bool namespace_already_locked = false) -> int {
+                                std::array<char, MAX_PATH_LEN>& out, bool namespace_already_locked) -> int {
     std::optional<ker::mod::sys::MutexGuard> publication_guard;
     if (!namespace_already_locked) publication_guard.emplace(g_vfs_namespace_publication_mutex);
     if (g_vfs_namespace_generation.load(std::memory_order_acquire) != namespace_generation ||
@@ -15539,7 +15590,7 @@ auto vfs_fstat_file(File* file, Stat* statbuf) -> int {
         if (file->mount_dev_id != 0) {
             return file->mount_dev_id;
         }
-        MountRef fstat_mount_ref = (file->vfs_path != nullptr) ? find_mount_point(file->vfs_path, file_vfs_path_len(file)) : MountRef{};
+        MountRef fstat_mount_ref = (file->vfs_path != nullptr) ? retain_file_named_mount(file, file_vfs_path_len(file)) : MountRef{};
         MountPoint const* fstat_mount = fstat_mount_ref.get();
         return fstat_mount != nullptr ? fstat_mount->dev_id : 0;
     };
@@ -15953,7 +16004,7 @@ static auto statvfs_for_file(File* file, Statvfs* buf) -> int {
     MountRef mount_ref;
     MountPoint const* mount = file->mount_owner;
     if (mount == nullptr && file->vfs_path != nullptr) {
-        mount_ref = find_mount_point(file->vfs_path, file_vfs_path_len(file));
+        mount_ref = retain_file_named_mount(file, file_vfs_path_len(file));
         mount = mount_ref.get();
     }
     if (mount != nullptr) {
@@ -17012,6 +17063,8 @@ auto vfs_dup2_for_task(ker::mod::sched::task::Task* task, int oldfd, int newfd, 
 auto vfs_root_metadata_current(ker::mod::sched::task::Task* task, const FilesystemRootMetadata& captured) -> bool {
     auto* owner = task != nullptr ? task->filesystem_owner() : nullptr;
     if (!captured.initialized_ || (task != nullptr && owner == nullptr) || captured.owner_ != owner) return false;
+    auto const* scope = task != nullptr ? task->mount_namespace() : nullptr;
+    if (captured.scope_.closed() || (task != nullptr && (scope == nullptr || *scope != captured.scope_))) return false;
     ker::mod::sys::MutexGuard guard(g_vfs_namespace_publication_mutex);
     if (captured.namespace_generation_ != g_vfs_namespace_generation.load(std::memory_order_acquire) ||
         captured.mount_generation_ != mount_table_generation_snapshot())
@@ -17030,6 +17083,11 @@ auto vfs_capture_root_metadata(ker::mod::sched::task::Task* task, FilesystemRoot
     FilesystemRootMetadata candidate;
     candidate.owner_ = owner;
     if (owner != nullptr) {
+        auto const* scope = task->mount_namespace();
+        if (scope == nullptr) return -ESRCH;
+        if (scope->closed()) return -EIDRM;
+        int const RETAIN = scope->retain(candidate.scope_);
+        if (RETAIN != 0) return RETAIN;
         uint64_t const IRQF = owner->path_metadata_lock.lock_irqsave();
         candidate.text_ = owner->root;
         candidate.anchor_ = owner->root_anchor;
@@ -17048,6 +17106,7 @@ auto vfs_capture_root_metadata(ker::mod::sched::task::Task* task, FilesystemRoot
         if (candidate.anchor_) {
             auto const& view = candidate.anchor_.get()->view;
             if (!view || view.root() != view.directory() || candidate.anchor_.get()->remote != nullptr) return -ENOTSUP;
+            if (view.root()->mount_owner == nullptr || view.root()->mount_owner->namespace_owner != candidate.scope_) return -EXDEV;
             result = validate_directory_view_pin(view.root());
             if (result == 0) result = directory_anchor_path(*candidate.anchor_.get(), candidate.physical_, nullptr);
             candidate.read_only_ = view.policy().read_only;

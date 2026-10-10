@@ -54,8 +54,9 @@ table generations, pivot publication and storage remain globally serialized.
 Retained native root/cwd views already enforce object identity and read-only/
 nosuid restrictions. Task ownership, native component lookup and retained lookup
 consumption and mount administration now carry the exact subject mount namespace.
-Remaining root/compatibility helpers, readdir and procfs still require integration
-before public creation can be enabled. Shared backend
+Remaining root/compatibility helpers and procfs PID/link consumers still require
+integration before public creation can be enabled. Retained File listings and
+subject mount observations now select their exact namespace. Shared backend
 lifetime must remain distinct from visible mount attachment lifetime before
 cloning existing mount attachments can be supported.
 
@@ -194,7 +195,7 @@ falls through to host text resolution, synthetic mount/WKI ancestors, procfs FD
 link probes or host mount discovery. Unsupported physical export requests and
 remote routing fail with ENOTSUP before those effects. A local `/wki` directory
 is an ordinary private name. A missing native covered edge returns EXDEV rather
-than bypassing containment. Public mount/pivot/root/procfs and the remaining WKI,
+than bypassing containment. Public compartment entry, remaining root/procfs and WKI,
 process and network consumers are not yet a qualified compartment boundary.
 
 Foreign retained root/cwd/dirfd anchors cannot select names in another mount
@@ -242,6 +243,38 @@ unmount, stale replacement IDs, inherited File busy/drain, unsupported/closed/
 unauthorized refusal, and two pivots including rebased service mounts. They do
 not qualify public compartment entry, scheduled service execution, every root/
 directory/procfs consumer or the required service and lifecycle campaigns.
+
+## Retained directory listings and mount observations
+
+Packed directory reads enumerate synthetic mount children in the retained
+File's mount namespace. An inherited directory File keeps its own backend and
+listing capability; it does not authorize named lookup through a foreign dirfd.
+Closing that namespace disables synthetic augmentation while existing Files
+continue to list their backing objects. Unlinked or stale directory text cannot
+select replacement mount children. Native TMPFS/XFS directory identity supplies
+the current path after rename; failed recovery suppresses augmentation and cache
+hints. Native TMPFS entry reads and deduplication probes take its tree mutex.
+
+File observer fallback queries also select the immutable File mount owner and
+refuse a replacement or overmount at its historical name. Existing exact backing
+and globally nonreused mount IDs remain cache identity. Only host Files observed
+by host subjects receive host WKI aliases and WOSLINK tagging, using an explicitly
+captured root. Private literal `wki` directories remain ordinary directories.
+Packed DirEntry layout, cookies, partial reads and search-only FD refusal remain.
+
+Root metadata captures a retained namespace together with the process owner's
+root text/anchor and existing epochs. Procfs mount read and SEEK_END enumerate
+that exact scope, hide private rows outside the captured physical root, and use
+the canonical process owner for threads. Closed or stale observations fail
+before copying caller output or changing the File cursor. Host mount-row spelling
+and read-only/nosuid flags remain compatible. This does not admit private procfs
+mounts or qualify its PID enumeration and link consumers.
+
+Three native fixtures exercise packed sibling/inherited File listings, closed
+scope capability behavior, renamed-directory replacement text, private WKI
+names, and subject/thread procfs mount read/seek with failed-output preservation.
+They use unpublished Tasks and trusted mount rows for augmentation; they do not
+qualify scheduled service execution or hostile concurrent rename campaigns.
 
 ## Verification checkpoint
 
