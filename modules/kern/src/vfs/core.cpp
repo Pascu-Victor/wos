@@ -12028,7 +12028,7 @@ auto local_walk_cross_private_procfs_mount(const LocalWalkEpoch& epoch, const ke
     bool const UP = from.mount && out.mount && from.mount->fs_type == FSType::PROCFS && out.mount->fs_type == FSType::TMPFS &&
                     component != nullptr && std::strcmp(component, "..") == 0;
     if (!DOWN && !UP) return RESOLVE_FAST_PATH_DECLINED;
-    if (epoch.confined_mount != nullptr || epoch.physical_path) return -EXDEV;
+    if (epoch.physical_path) return -EXDEV;
     if (component == nullptr || from.synthetic || epoch.membership == nullptr) return -EXDEV;
     auto* child = DOWN ? out.mount.get() : from.mount.get();
     auto* parent = DOWN ? from.mount.get() : out.mount.get();
@@ -12080,9 +12080,12 @@ auto local_walk_bind(const LocalWalkEpoch& epoch, const ker::mod::security::Snap
     auto* mount = out.mount.get();
     bool const PRIVATE = !epoch.mount_namespace->is_host();
     if (PRIVATE && mount != nullptr && mount->fs_type != FSType::TMPFS && mount->fs_type != FSType::PROCFS) return -ENOTSUP;
-    // Scoped transitions require native identity proofs below; unsupported
-    // backends cannot bind an object or use the unscoped fallback.
-    if (epoch.confined_mount != nullptr && (mount == nullptr || (mount->fs_type != FSType::TMPFS && mount->fs_type != FSType::XFS)))
+    // Scoped transitions require native identity proofs below. Private PROCFS
+    // uses its exact native cover; consumption also proves that cover beneath
+    // the retained root. Host synthetic backends keep their existing refusal.
+    bool const PRIVATE_PROCFS = PRIVATE && mount != nullptr && mount->fs_type == FSType::PROCFS;
+    if (epoch.confined_mount != nullptr &&
+        (mount == nullptr || (mount->fs_type != FSType::TMPFS && mount->fs_type != FSType::XFS && !PRIVATE_PROCFS)))
         return -EXDEV;
     if (mount == nullptr) {
         if (PRIVATE || !epoch.physical_path) return -ENOENT;
@@ -12834,8 +12837,9 @@ auto acquire_local_component_lookup(ker::mod::sched::task::Task* task, int dirfd
                                                 next_path.data(), target.data(), target.size() - 1, !serialized, task);
             if (READ < 0) return static_cast<int>(READ);
             if (captured) {
-                // Once scoped, crossing to PROCFS is rejected before
-                // binding. There can be only one scoped magic-link origin.
+                // A captured magic link needs its own native root intersection
+                // and origin owner. Existing scoped walks retain their refusal
+                // until that derivation supports both boundaries explicitly.
                 if (references.view || references.procfs_view_origin) return -EXDEV;
                 references.view = std::move(captured);
                 references.procfs_view_origin = std::move(next.proc);
@@ -31427,6 +31431,14 @@ auto validate_lookup_directory_view_locked(const LookupHandle& handle) -> int {
         auto& lookup = *static_cast<xfs::XfsLookupHandle*>(handle.backend_parent());
         if (lookup.mount() != mount->private_data) return -EBADF;
         result = xfs::xfs_lookup_directory_path_beneath(SAME_MOUNT ? view.root() : nullptr, lookup, selected.data(), selected.size());
+    } else if (mount->fs_type == FSType::PROCFS && !mount->namespace_owner.is_host()) {
+        auto* file = static_cast<const File*>(handle.backend_parent());
+        if (file->fs_type != FSType::PROCFS || file->private_data == nullptr) return -EBADF;
+        // Synthetic children are selected by this exact retained ProcFile,
+        // never a native inode cast or a reparsed PID/path. The cover proof
+        // below establishes the mount's membership beneath the native root.
+        result = procfs::procfs_revalidate_lookup_result(file);
+        selected[0] = '/';
     } else {
         return -EXDEV;
     }
@@ -31702,7 +31714,16 @@ namespace {
 auto pin_directory_view_lookup(const LookupHandle& handle, bool require_target_search, std::unique_ptr<File, LocalWalkFileRelease>& pin)
     -> int {
     auto* mount = handle.mount();
-    if (pin || handle.backend_parent() == nullptr || (mount->fs_type != FSType::TMPFS && mount->fs_type != FSType::XFS)) return -EINVAL;
+    if (pin || handle.backend_parent() == nullptr) return -EINVAL;
+    if (mount->fs_type == FSType::PROCFS && !mount->namespace_owner.is_host()) {
+        auto* file = static_cast<const File*>(handle.backend_parent());
+        int const VALID = procfs::procfs_revalidate_lookup_result(file);
+        if (VALID != 0) return VALID;
+        // A regular ProcFile needs mount policy but no native directory view.
+        // Synthetic cwd/dirfd identities require their own retained pin model.
+        return file->is_directory ? -ENOTSUP : -ENOTDIR;
+    }
+    if (mount->fs_type != FSType::TMPFS && mount->fs_type != FSType::XFS) return -EINVAL;
     // Identity storage carries native flags only. Inherited restrictions
     // belong to the new view, separately from these detached native Files.
     MountOpenFileReservation reservation(mount);

@@ -569,8 +569,8 @@ cover's native parent. Rename/replacement text cannot renew an old mount edge.
 FD reopening retains the actual underlying File capability, including its mode
 and cursor; PID closure does not revoke an already inherited ordinary backing
 File. Foreign mount-view dirfds still cannot confer fresh names. Owned native
-DirectoryView roots and physical-export walks continue refusing procfs; extending
-those anchored paths requires separate admission and runtime qualification.
+DirectoryView roots and physical-export walks refused procfs in that checkpoint;
+the owned-root extension below adds separately tested private path admission.
 
 Nine kernel cases exercise actual unpublished Tasks/registry, native private
 mounts and component traversal, target/view retirement, clones, reader self,
@@ -590,6 +590,39 @@ but found a new fixture's incorrect reused-output-handle expectation. Frozen
 failed runs were stopped through exact-owned QMP and their images pruned before
 correction. Final four inactive images (258,818,048 allocated bytes) were checked
 and pruned; disposable usage returned to zero. Small evidence remains.
+
+## Procfs beneath owned native roots (checkpoint 14)
+
+Private procfs can now be traversed beneath a retained native DirectoryView root,
+including through a retained TMPFS directory FD and through nested native mounts.
+The component walker selects the exact native cover and its current attachment
+before synthetic binding. Final consumption validates the retained ProcFile's
+PID view and proves the same cover beneath the actual owned root. ProcFileData
+is never treated as a native inode, and a path, PID or mount generation cannot
+grant membership. Read-only/nosuid policy follows regular procfs opens; operation
+credentials, target generations and output staging keep their existing checks.
+
+Regular procfs Files need no native directory pin. Synthetic procfs directory
+pins return ENOTSUP before FD publication; procfs cwd/dirfd ownership still needs
+integration. An already-scoped walk also refuses captured root/cwd/directory-FD
+magic links until their additional root intersection and origin lifetimes are
+implemented. Ordinary symlink translation and dotdot retain the native root
+boundary. Host procfs and physical-export refusal retain their prior behavior.
+
+Two additional native cases install production-admitted roots on unpublished
+Tasks and exercise scoped regular opens/stat/self links, inherited policy,
+native directory FDs, nested mount cover proofs, dotdot/root escape refusal,
+foreign inherited dirfds, renamed/replaced covers, final consumer refusal and
+closed-view output preservation. These remain unscheduled kernel fixtures.
+Normal Build WOS, isolated fast diagnostic build and 35 selected host regressions
+pass. Formatting covers all four current kernel paths; clang-tidy covers both
+normal compilation units, and the fixture is compiled/executed separately.
+Actual KTEST24 passes 80,442 assertions, zero failures and 1,321 cases, including
+all 69 required compartment cases and normal poweroff. Its four inactive images
+(258,949,120 allocated bytes) were verified and pruned; disposable usage returned
+to zero. Source/artifact/runtime and cleanup receipts remain in the local Goal39
+progress ledger. Public creation and all ten full acceptance criteria remain
+incomplete.
 
 ## Verification checkpoint
 

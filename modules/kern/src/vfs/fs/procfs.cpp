@@ -8072,6 +8072,11 @@ auto procfs_fill_stat(File* f, Stat* statbuf, dev_t dev_id, uint64_t* target_gen
     return 0;
 }
 
+auto procfs_revalidate_lookup_result(const File* file) -> int {
+    if (file == nullptr || file->fs_type != FSType::PROCFS || file->private_data == nullptr) return -EBADF;
+    return procfs_view_policy(*static_cast<const ProcFileData*>(file->private_data));
+}
+
 auto procfs_revalidate_metadata_result(const File* file, uint64_t target_generation) -> int {
     if (file == nullptr || file->private_data == nullptr) return -EINVAL;
     auto const& data = *static_cast<const ProcFileData*>(file->private_data);

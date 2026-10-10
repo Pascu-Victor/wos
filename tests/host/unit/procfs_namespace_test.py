@@ -37,6 +37,11 @@ def main():
     assert policy.index('data.pid_view.is_host()') < policy.index('data.pid_view.closed()')
     for prohibited in ('find_task_by_', 'wki_submitted_task_', 'MutexGuard', 'release()', 'new '):
         assert prohibited not in policy
+    lookup_policy = body_after(proc, 'auto procfs_revalidate_lookup_result(')
+    assert 'file->fs_type != FSType::PROCFS' in lookup_policy
+    assert 'procfs_view_policy(' in lookup_policy
+    for prohibited in ('credential_observation', 'TaskState::ACTIVE', 'procfs_lookup_path_as', 'MutexGuard', 'new '):
+        assert prohibited not in lookup_policy
     for name in ('procfs_read_with_credentials', 'procfs_write_with_credentials', 'procfs_lseek_with_credentials',
                  'procfs_fill_stat', 'procfs_readdir', 'procfs_readlink_as_impl', 'procfs_revalidate_open_result',
                  'procfs_revalidate_metadata_result', 'procfs_revalidate_readlink_result'):
@@ -62,6 +67,14 @@ def main():
     assert 'procfs_lookup_path_as(' not in crossing
     binding = body_after(core, 'auto local_walk_bind(')
     assert binding.index('local_walk_cross_private_procfs_mount(') < binding.index('int const RESULT = local_walk_read_stat(')
+    assert 'PRIVATE && mount != nullptr && mount->fs_type == FSType::PROCFS' in binding
+    assert 'epoch.physical_path && mount->fs_type == FSType::PROCFS' in binding
+    validation = body_after(core, 'auto validate_lookup_directory_view_locked(')
+    assert 'procfs::procfs_revalidate_lookup_result(file)' in validation
+    assert validation.index('procfs::procfs_revalidate_lookup_result(file)') < validation.index('references.capture(')
+    assert validation.index('validate_native_mount_attachment(') < validation.index('directory_member_path_locked(covered, view.root()')
+    pin = body_after(core, 'auto pin_directory_view_lookup(')
+    assert 'file->is_directory ? -ENOTSUP : -ENOTDIR' in pin
     print('Focused procfs credential, retained PID view, native mount and publication contracts passed')
 
 

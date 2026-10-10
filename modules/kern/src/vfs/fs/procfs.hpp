@@ -147,6 +147,10 @@ auto procfs_open_fd_link_path(const ker::mod::security::Snapshot& credentials, u
 
 // Fill stat metadata for an already-open procfs file.
 auto procfs_fill_stat(File* f, Stat* statbuf, dev_t dev_id, uint64_t* target_generation = nullptr) -> int;
+// Validate the retained backend and PID view for synthetic lookup membership.
+// Bounded, nonallocating and safe under VFS publication. This grants no private
+// content authority; each operation retains its own authorization/revalidation.
+auto procfs_revalidate_lookup_result(const File* file) -> int;
 // Revalidate only the retained owner's credential observation; public metadata
 // does not confer private-content authority or require an ACTIVE target.
 auto procfs_revalidate_metadata_result(const File* file, uint64_t target_generation) -> int;
