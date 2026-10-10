@@ -32,6 +32,8 @@ auto LookupHandle::operator=(LookupHandle&& other) noexcept -> LookupHandle& {
     procfs_view_origin_ = std::exchange(other.procfs_view_origin_, nullptr);
     release_procfs_view_origin_ = std::exchange(other.release_procfs_view_origin_, nullptr);
     procfs_view_generation_ = std::exchange(other.procfs_view_generation_, 0);
+    procfs_view_origins_ = std::exchange(other.procfs_view_origins_, nullptr);
+    release_procfs_view_origins_ = std::exchange(other.release_procfs_view_origins_, nullptr);
     mount_generation_ = other.mount_generation_;
     namespace_generation_ = other.namespace_generation_;
     backend_generation_ = other.backend_generation_;
@@ -70,6 +72,11 @@ void LookupHandle::reset() {
     procfs_view_origin_ = nullptr;
     release_procfs_view_origin_ = nullptr;
     procfs_view_generation_ = 0;
+    if (procfs_view_origins_ != nullptr && release_procfs_view_origins_ != nullptr) {
+        release_procfs_view_origins_(procfs_view_origins_);
+    }
+    procfs_view_origins_ = nullptr;
+    release_procfs_view_origins_ = nullptr;
     if (backend_object_ != nullptr && release_object_ != nullptr) {
         release_object_(backend_object_);
     }
@@ -173,6 +180,11 @@ void LookupHandleBuilder::set_procfs_view_origin(LookupHandle& handle, File* ret
     handle.procfs_view_origin_ = retained_origin;
     handle.release_procfs_view_origin_ = release;
     handle.procfs_view_generation_ = credential_generation;
+}
+
+void LookupHandleBuilder::set_procfs_view_origins(LookupHandle& handle, void* retained, LookupHandle::BackendRelease release) {
+    handle.procfs_view_origins_ = retained;
+    handle.release_procfs_view_origins_ = release;
 }
 
 void LookupHandleBuilder::set_dirfd_anchor(LookupHandle& handle, File* retained_file, bool path_revalidated) {

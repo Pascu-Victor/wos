@@ -51,6 +51,9 @@ def main():
     link = body_after(proc, 'auto procfs_readlink_as_impl(')
     assert 'allow_remote_cwd = false' in link
     assert 'task_in_pid_view(*caller_task, pfd->pid_view)' in link
+    assert 'DirectoryRecoveryMode::LOCAL_ONLY' in link
+    assert '!pfd->pid_view.is_host() || allow_remote_cwd ? &CREDENTIALS : nullptr' in link
+    assert link.index('if (pfd->pid_view.is_host())') < link.index('memcpy(link.data(), "/proc/", 6)')
     for name in ('generate_wki_launcher', 'generate_wki_runner', 'generate_wki_remote_pid'):
         assert 'local_view' in body_after(proc, 'auto ' + name + '(')
     child = (ROOT / 'modules/kern/src/syscalls_impl/process/child_events.cpp').read_text()
@@ -70,11 +73,30 @@ def main():
     assert 'PRIVATE && mount != nullptr && mount->fs_type == FSType::PROCFS' in binding
     assert 'epoch.physical_path && mount->fs_type == FSType::PROCFS' in binding
     validation = body_after(core, 'auto validate_lookup_directory_view_locked(')
+    assert validation.index('origins->validate()') < validation.index('admit_directory_view(')
     assert 'procfs::procfs_revalidate_lookup_result(file)' in validation
     assert validation.index('procfs::procfs_revalidate_lookup_result(file)') < validation.index('references.capture(')
     assert validation.index('validate_native_mount_attachment(') < validation.index('directory_member_path_locked(covered, view.root()')
     pin = body_after(core, 'auto pin_directory_view_lookup(')
     assert 'file->is_directory ? -ENOTSUP : -ENOTDIR' in pin
+    root = body_after(core, 'auto vfs_getroot_for_task(')
+    cwd = body_after(core, 'auto vfs_getcwd_for_task(')
+    assert root.index('recovery == DirectoryRecoveryMode::LOCAL_ONLY') < root.index('anchor = owner->root_anchor')
+    assert cwd.index('recovery == DirectoryRecoveryMode::LOCAL_ONLY') < cwd.index('root_anchor = owner->root_anchor')
+    walk = body_after(core, 'auto acquire_local_component_lookup(')
+    assert '!PRIVATE || origin == nullptr || origin->pid_view.is_host()' in walk
+    assert 'previous.policy().restricted_by(references.view.policy())' in walk
+    assert 'admit_directory_view(wider, boundary, references.view.directory()' in walk
+    assert walk.index('references.procfs_view_origins->validate()') < walk.rindex('LookupHandle candidate{}')
+    assert walk.index('populate_lookup_path_fields(') < walk.index('set_procfs_view_origins(')
+    assert 'reset_root = references.view.root()' in walk
+    ownership = (ROOT / 'modules/kern/src/vfs/lookup.cpp').read_text()
+    assert 'std::exchange(other.procfs_view_origins_, nullptr)' in ownership
+    reset = body_after(ownership, 'void LookupHandle::reset(')
+    assert 'release_procfs_view_origins_(procfs_view_origins_)' in reset
+    assert 'procfs_view_origins_ = nullptr' in reset
+    setter = body_after(ownership, 'void LookupHandleBuilder::set_procfs_view_origins(')
+    assert 'release(' not in setter and 'delete ' not in setter and 'new ' not in setter
     print('Focused procfs credential, retained PID view, native mount and publication contracts passed')
 
 

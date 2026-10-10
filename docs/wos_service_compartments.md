@@ -604,9 +604,9 @@ credentials, target generations and output staging keep their existing checks.
 
 Regular procfs Files need no native directory pin. Synthetic procfs directory
 pins return ENOTSUP before FD publication; procfs cwd/dirfd ownership still needs
-integration. An already-scoped walk also refuses captured root/cwd/directory-FD
-magic links until their additional root intersection and origin lifetimes are
-implemented. Ordinary symlink translation and dotdot retain the native root
+integration. That checkpoint refused captured root/cwd/directory-FD magic links
+in an already-scoped walk, pending their additional root intersection and origin
+lifetimes. Ordinary symlink translation and dotdot retain the native root
 boundary. Host procfs and physical-export refusal retain their prior behavior.
 
 Two additional native cases install production-admitted roots on unpublished
@@ -623,6 +623,44 @@ all 69 required compartment cases and normal poweroff. Its four inactive images
 to zero. Source/artifact/runtime and cleanup receipts remain in the local Goal39
 progress ledger. Public creation and all ten full acceptance criteria remain
 incomplete.
+
+## Scoped private procfs magic links (checkpoint 15)
+
+Private root/cwd and native directory-FD links now intersect the retained caller
+and target roots by actual native membership. Their policies combine, preserving
+read-only and nosuid restrictions through repeated links. Absolute symlink
+restarts use the resulting retained root. Host scoped-walk refusal and physical
+procfs export refusal keep their existing behavior.
+
+Local-only metadata recovery now accepts an admitted credential snapshot
+independently of remote recovery permission. Remote root/cwd anchors are refused
+before retention. Private self links return a relative local PID, so a non-default
+or narrower procfs mount stays the origin; Host self spelling remains unchanged.
+
+The lookup retains each followed procfs origin and its admitted credential
+generation until final consumption. A bounded owner allocated outside
+publication retains additional origins; move/reset transfers or drains it once.
+All origins are revalidated before publication and each consumer. Outer retained
+views prevent final File closes while intermediate roots are replaced under
+publication. The existing eight-link limit is unchanged.
+
+Two additional native tests exercise narrower directory FD roots, restrictive
+policy through root/cwd/FD links, absolute-link escape refusal, repeated targets,
+second-target credential/lifecycle cutovers, move/reset, closed PID views and
+depth-limit reference drains. The existing remote-cwd admission test also checks
+local-only refusal with supplied credentials and unchanged output/reference
+counts. These remain unscheduled native fixtures. Public service creation,
+synthetic procfs directory pins and the full acceptance campaigns remain pending.
+
+Normal Build WOS, isolated fast diagnostic build and all 35 selected host checks
+pass. Six kernel paths pass formatting; core, lookup and procfs normal units pass
+clang-tidy. Production pins are unchanged after a fixture-only setup correction;
+the final fixture is compiled and executed separately. Actual KTEST26 passes
+80,605 assertions, zero failures, 1,323 cases and all 72 mandatory checks with
+normal poweroff. Its four inactive images (259,080,192 allocated bytes) were
+verified and pruned; disposable usage returned to zero. The earlier failed
+fixture run was also pruned. Source/artifact/runtime and cleanup receipts remain
+in the local progress ledger; all ten full acceptance criteria remain incomplete.
 
 ## Verification checkpoint
 

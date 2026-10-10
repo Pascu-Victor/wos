@@ -2859,8 +2859,8 @@ KTEST(CompartmentProcfs, DynamicSelfRequiresTypedReaderOfCapturedView) {
     uint64_t generation = UINT64_MAX;
     KEXPECT_EQ(
         procfs::procfs_readlink_as(link.get(), output.data(), output.size(), ROOT, reader.task->pid, &generation, false, reader.task.get()),
-        ssize_t{7});
-    KEXPECT_EQ(std::strcmp(output.data(), "/proc/2"), 0);
+        ssize_t{1});
+    KEXPECT_EQ(std::strcmp(output.data(), "2"), 0);
     KEXPECT_EQ(generation, uint64_t{0});
     output.fill('x');
     generation = UINT64_MAX;
@@ -3037,8 +3037,8 @@ KTEST(CompartmentProcfs, NativePrivateMountWalksAndDescriptorReopensKeepOwnedCap
         vfs::Stat stat{};
         KEXPECT_EQ(vfs::vfs_statat(first.task.get(), vfs::AT_FDCWD, "/proc/self/status", 0, &stat), 0);
         std::array<char, 64> link{};
-        KEXPECT_EQ(vfs::vfs_readlinkat(first.task.get(), vfs::AT_FDCWD, "/proc/self", link.data(), link.size()), ssize_t{7});
-        KEXPECT_EQ(std::strcmp(link.data(), "/proc/1"), 0);
+        KEXPECT_EQ(vfs::vfs_readlinkat(first.task.get(), vfs::AT_FDCWD, "/proc/self", link.data(), link.size()), ssize_t{1});
+        KEXPECT_EQ(std::strcmp(link.data(), "1"), 0);
         int const THROUGH_ROOT = first.open("/proc/self/root/data", 0);
         KREQUIRE_TRUE(THROUGH_ROOT >= 0);
         KEXPECT_EQ(first.open("/proc/self/root/sibling-only", 0), -ENOENT);
@@ -3137,25 +3137,25 @@ KTEST(CompartmentProcfs, RenamedCoverAndReplacementTextCannotRebindMountedView) 
 namespace {
 // Construct only an unpublished fixture from the production native pin/view/
 // context factories. The prepared identities, not root/cwd strings, authorize it.
-auto prepare_procfs_fixture_root(NativeTask& subject, vfs::MountPoint* mount, const char* root, const char* cwd,
-                                 vfs::MountPolicy policy = {}) -> int {
-    auto& task = *subject.task;
+auto pin_procfs_fixture_directory(Task& task, vfs::MountPoint* mount, const char* path) -> NativeFile {
+    auto const CREDENTIALS = task.credentials();
+    tmpfs::TmpfsLookupHandle lookup;
+    if (tmpfs::tmpfs_acquire_lookup(CREDENTIALS, native_root(mount), path, &lookup) != 0) return {};
+    NativeFile file(tmpfs::tmpfs_pin_directory_lookup(CREDENTIALS, lookup));
+    if (!file || !vfs::retain_mount_for_open_file(mount)) return {};
+    file->mount_owner = mount;
+    file->mount_dev_id = mount->dev_id;
+    file->mount_generation = vfs::mount_table_generation_snapshot();
+    return file;
+}
+auto prepare_procfs_fixture_root(Task& task, vfs::MountPoint* mount, const char* root, const char* cwd, vfs::MountPolicy policy = {})
+    -> int {
     if (task.scheduler_published.load() || task.root_anchor || task.cwd_anchor || task.mount_namespace() == nullptr ||
         *task.mount_namespace() != mount->namespace_owner)
         return -EINVAL;
     auto const CREDENTIALS = task.credentials();
-    auto pin = [&](const char* path) -> NativeFile {
-        tmpfs::TmpfsLookupHandle lookup;
-        if (tmpfs::tmpfs_acquire_lookup(CREDENTIALS, native_root(mount), path, &lookup) != 0) return {};
-        NativeFile file(tmpfs::tmpfs_pin_directory_lookup(CREDENTIALS, lookup));
-        if (!file || !vfs::retain_mount_for_open_file(mount)) return {};
-        file->mount_owner = mount;
-        file->mount_dev_id = mount->dev_id;
-        file->mount_generation = vfs::mount_table_generation_snapshot();
-        return file;
-    };
-    auto root_pin = pin(root);
-    auto cwd_pin = pin(cwd);
+    auto root_pin = pin_procfs_fixture_directory(task, mount, root);
+    auto cwd_pin = pin_procfs_fixture_directory(task, mount, cwd);
     if (!root_pin || !cwd_pin) return -ENOMEM;
     vfs::DirectoryViewRef view;
     vfs::PreparedFilesystemContext prepared;
@@ -3211,14 +3211,15 @@ KTEST(CompartmentProcfs, OwnedNativeRootsKeepProcfsNamesPolicyAndDirectoryBounda
             KREQUIRE_EQ(vfs::vfs_symlinkat(fixture->task.get(), "/proc/self/status", vfs::AT_FDCWD, "/service/status"), 0);
             auto mount = scoped_mount(*fixture->task->mount_namespace(), "/");
             KREQUIRE_TRUE(mount);
-            KREQUIRE_EQ(prepare_procfs_fixture_root(*fixture, mount.get(), "/service", "/service/cwd", {.read_only = true, .nosuid = true}),
-                        0);
+            KREQUIRE_EQ(
+                prepare_procfs_fixture_root(*fixture->task, mount.get(), "/service", "/service/cwd", {.read_only = true, .nosuid = true}),
+                0);
             KEXPECT_TRUE(fixture->task->root_anchor && fixture->task->cwd_anchor);
             KEXPECT_EQ(std::strcmp(fixture->task->root.data(), "/service"), 0);
             KEXPECT_EQ(std::strcmp(fixture->task->cwd.data(), "/cwd"), 0);
         }
         for (auto* fixture : {&first, &second}) {
-            for (auto* path : {"/proc/self/status", "../proc/self/status", "/status", "/nested/proc/1/status"}) {
+            for (auto* path : {"/proc/self/status", "../proc/self/status", "/status", "/nested/proc/self/status"}) {
                 int const FD = fixture->open(path, 0);
                 KREQUIRE_TRUE(FD >= 0);
                 NativeFile file(vfs::vfs_get_file_retain(fixture->task.get(), FD));
@@ -3236,8 +3237,8 @@ KTEST(CompartmentProcfs, OwnedNativeRootsKeepProcfsNamesPolicyAndDirectoryBounda
             KEXPECT_EQ(vfs::vfs_statat(fixture->task.get(), vfs::AT_FDCWD, "/proc/self/status", 0, &stat), 0);
             KEXPECT_EQ(vfs::vfs_statat(fixture->task.get(), vfs::AT_FDCWD, "/proc", 0, &stat), 0);
             std::array<char, 64> link{};
-            KEXPECT_EQ(vfs::vfs_readlinkat(fixture->task.get(), vfs::AT_FDCWD, "/proc/self", link.data(), link.size()), ssize_t{7});
-            KEXPECT_EQ(std::strcmp(link.data(), "/proc/1"), 0);
+            KEXPECT_EQ(vfs::vfs_readlinkat(fixture->task.get(), vfs::AT_FDCWD, "/proc/self", link.data(), link.size()), ssize_t{1});
+            KEXPECT_EQ(std::strcmp(link.data(), "1"), 0);
             int const PARENT = fixture->open("/proc/../../data", 0);
             KREQUIRE_TRUE(PARENT >= 0);
             KREQUIRE_EQ(fixture->close(PARENT), 0);
@@ -3246,7 +3247,9 @@ KTEST(CompartmentProcfs, OwnedNativeRootsKeepProcfsNamesPolicyAndDirectoryBounda
             KEXPECT_EQ(fixture->open("/new", vfs::O_CREAT | 2), -EROFS);
             auto const FDS = fixture->task->fd_table.size();
             KEXPECT_EQ(fixture->open("/proc", vfs::O_DIRECTORY), -ENOTSUP);
-            KEXPECT_EQ(fixture->open("/proc/self/root/data", 0), -ENOTSUP);
+            int const THROUGH_ROOT = fixture->open("/proc/self/root/data", 0);
+            KREQUIRE_TRUE(THROUGH_ROOT >= 0);
+            KREQUIRE_EQ(fixture->close(THROUGH_ROOT), 0);
             KEXPECT_EQ(fixture->task->fd_table.size(), FDS);
             KEXPECT_EQ(fixture->task->fd_table.reserved_count(), 0U);
         }
@@ -3291,7 +3294,7 @@ KTEST(CompartmentProcfs, OwnedRootCoverMutationAndClosureRejectBeforePublication
         KREQUIRE_EQ(vfs::vfs_mount_for_task(subject.task.get(), nullptr, "/service/proc", "procfs"), 0);
         auto mount = scoped_mount(views.first, "/");
         KREQUIRE_TRUE(mount);
-        KREQUIRE_EQ(prepare_procfs_fixture_root(subject, mount.get(), "/service", "/service"), 0);
+        KREQUIRE_EQ(prepare_procfs_fixture_root(*subject.task, mount.get(), "/service", "/service"), 0);
         vfs::LookupHandle selected;
         KREQUIRE_EQ(task_lookup(*subject.task, "/proc/self/status", selected), 0);
         KREQUIRE_TRUE(selected.directory_view() && selected.mount_membership());
@@ -3333,6 +3336,178 @@ KTEST(CompartmentProcfs, OwnedRootCoverMutationAndClosureRejectBeforePublication
         KEXPECT_EQ(retained->fops->vfs_read(retained.get(), output.data(), output.size() - 1, 0), ssize_t{-EIDRM});
         KEXPECT_EQ(output[0], '!');
         KEXPECT_EQ(subject.task->fd_table.reserved_count(), 0U);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PID_BASELINE);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNT_BASELINE);
+}
+
+KTEST(CompartmentProcfs, ScopedMagicLinksIntersectNativeRootsAndKeepRestrictions) {
+    auto const PID_BASELINE = pid_ns::live_namespace_count();
+    auto const MOUNT_BASELINE = mount_ns::live_namespace_count();
+    {
+        PrivateMounts views;
+        pid_ns::NamespaceRef pid_view;
+        KREQUIRE_EQ(mount_ns::create_namespace(views.first), 0);
+        KREQUIRE_EQ(pid_ns::create_namespace(pid_view), 0);
+        KREQUIRE_EQ(private_mount(views.first, "/"), 0);
+        NativeTask subject;
+        subject.task->type = sched::task::TaskType::PROCESS;
+        KREQUIRE_TRUE(subject.task->initialize_mount_namespace(views.first));
+        KREQUIRE_TRUE(subject.task->initialize_pid_namespace(pid_view));
+        for (auto* path : {"/service", "/service/proc", "/service/narrow", "/service/narrow/proc", "/service/outside"})
+            KREQUIRE_EQ(vfs::vfs_mkdirat(subject.task.get(), vfs::AT_FDCWD, path, 0755), 0);
+        for (auto* path : {"/service/proc", "/service/narrow/proc"})
+            KREQUIRE_EQ(vfs::vfs_mount_for_task(subject.task.get(), nullptr, path, "procfs"), 0);
+        int const SEED = subject.open("/service/narrow/leaf"), SECRET = subject.open("/service/outside/secret");
+        KREQUIRE_TRUE(SEED >= 0 && SECRET >= 0);
+        NativeFile seed(vfs::vfs_get_file_retain(subject.task.get(), SEED));
+        KREQUIRE_TRUE(seed);
+        char const VALUE = 'q';
+        KREQUIRE_EQ(tmpfs::tmpfs_write(seed.get(), &VALUE, 1, 0), ssize_t{1});
+        KREQUIRE_EQ(subject.close(SEED), 0);
+        KREQUIRE_EQ(subject.close(SECRET), 0);
+        KREQUIRE_EQ(vfs::vfs_symlinkat(subject.task.get(), "/narrow/leaf", vfs::AT_FDCWD, "/service/narrow/absolute"), 0);
+        KREQUIRE_EQ(vfs::vfs_symlinkat(subject.task.get(), "/outside/secret", vfs::AT_FDCWD, "/service/narrow/escape"), 0);
+        auto mount = scoped_mount(views.first, "/");
+        KREQUIRE_TRUE(mount);
+        KREQUIRE_EQ(prepare_procfs_fixture_root(*subject.task, mount.get(), "/service", "/service/narrow"), 0);
+        auto narrow_pin = pin_procfs_fixture_directory(*subject.task, mount.get(), "/service/narrow");
+        KREQUIRE_TRUE(narrow_pin);
+        vfs::DirectoryViewRef narrow;
+        KREQUIRE_EQ(vfs::vfs_prepare_directory_view(subject.task->credentials(), narrow_pin.get(), narrow_pin.get(),
+                                                    {.read_only = true, .nosuid = true}, narrow),
+                    0);
+        int const DIR = subject.open("/narrow", vfs::O_DIRECTORY);
+        KREQUIRE_TRUE(DIR >= 0);
+        NativeFile directory(vfs::vfs_get_file_retain(subject.task.get(), DIR));
+        KREQUIRE_TRUE(directory && directory->directory_view);
+        KREQUIRE_TRUE(directory->private_data == narrow_pin->private_data);
+        KREQUIRE_TRUE(!subject.task->scheduler_published.load());
+        // Prepare this exclusively owned unpublished fixture's inherited FD
+        // from the native view factory. The explicit view path walker serves
+        // Host exports; it intentionally refuses private mount ownership.
+        directory->mount_policy = directory->mount_policy.restricted_by(narrow.policy());
+        directory->directory_view = std::move(narrow);
+        vfs::Stat expected{};
+        KREQUIRE_EQ(vfs::vfs_fstat_file(seed.get(), &expected), 0);
+        for (auto* path : {"proc/1/cwd/leaf", "proc/1/cwd/absolute", "proc/1/cwd/proc/1/cwd/leaf"}) {
+            int const FD = subject.track(vfs::vfs_openat(subject.task.get(), DIR, path, 0, 0));
+            KREQUIRE_TRUE(FD >= 0);
+            NativeFile selected(vfs::vfs_get_file_retain(subject.task.get(), FD));
+            KREQUIRE_TRUE(selected);
+            vfs::Stat actual{};
+            KREQUIRE_EQ(vfs::vfs_fstat_file(selected.get(), &actual), 0);
+            KEXPECT_EQ(actual.st_ino, expected.st_ino);
+            KEXPECT_TRUE(selected->mount_policy.read_only && selected->mount_policy.nosuid);
+            KREQUIRE_EQ(subject.close(FD), 0);
+        }
+        std::array<char, 64> magic{};
+        std::snprintf(magic.data(), magic.size(), "/proc/1/fd/%d/absolute", DIR);
+        int const THROUGH_FD = subject.open(magic.data(), 0);
+        KREQUIRE_TRUE(THROUGH_FD >= 0);
+        NativeFile through(vfs::vfs_get_file_retain(subject.task.get(), THROUGH_FD));
+        KREQUIRE_TRUE(through);
+        KEXPECT_TRUE(through->mount_policy.read_only && through->mount_policy.nosuid);
+        KREQUIRE_EQ(subject.close(THROUGH_FD), 0);
+        auto const FDS = subject.task->fd_table.size();
+        for (auto* path : {"proc/1/root/narrow/leaf", "proc/1/cwd/escape"})
+            KEXPECT_EQ(vfs::vfs_openat(subject.task.get(), DIR, path, 0, 0), -EPERM);
+        KEXPECT_EQ(vfs::vfs_openat(subject.task.get(), DIR, "proc/1/cwd/leaf", vfs::O_TRUNC | 2, 0), -EROFS);
+        KEXPECT_EQ(vfs::vfs_openat(subject.task.get(), DIR, "proc/1/cwd/new", vfs::O_CREAT | 2, 0600), -EROFS);
+        char actual = '\0';
+        KEXPECT_EQ(tmpfs::tmpfs_read(seed.get(), &actual, 1, 0), ssize_t{1});
+        KEXPECT_EQ(actual, VALUE);
+        KEXPECT_EQ(subject.task->fd_table.size(), FDS);
+        KEXPECT_EQ(subject.task->fd_table.reserved_count(), 0U);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PID_BASELINE);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNT_BASELINE);
+}
+
+KTEST(CompartmentProcfs, RepeatedMagicLinksRetainEveryOriginAndDrainAtDepthLimit) {
+    auto const PID_BASELINE = pid_ns::live_namespace_count();
+    auto const MOUNT_BASELINE = mount_ns::live_namespace_count();
+    {
+        PrivateMounts views;
+        pid_ns::NamespaceRef pid_view;
+        KREQUIRE_EQ(mount_ns::create_namespace(views.first), 0);
+        KREQUIRE_EQ(pid_ns::create_namespace(pid_view), 0);
+        KREQUIRE_EQ(private_mount(views.first, "/"), 0);
+        NativeTask subject;
+        subject.task->type = sched::task::TaskType::PROCESS;
+        RegistryTask target;
+        for (auto* task : {subject.task.get(), target.task.get()}) {
+            KREQUIRE_TRUE(task->initialize_mount_namespace(views.first));
+            KREQUIRE_TRUE(task->initialize_pid_namespace(pid_view));
+        }
+        for (auto* path : {"/service", "/service/proc"}) KREQUIRE_EQ(vfs::vfs_mkdirat(subject.task.get(), vfs::AT_FDCWD, path, 0755), 0);
+        KREQUIRE_EQ(vfs::vfs_mount_for_task(subject.task.get(), nullptr, "/service/proc", "procfs"), 0);
+        int const SEED = subject.open("/service/data");
+        KREQUIRE_TRUE(SEED >= 0);
+        KREQUIRE_EQ(subject.close(SEED), 0);
+        auto mount = scoped_mount(views.first, "/");
+        KREQUIRE_TRUE(mount);
+        for (auto* task : {subject.task.get(), target.task.get()})
+            KREQUIRE_EQ(prepare_procfs_fixture_root(*task, mount.get(), "/service", "/service"), 0);
+        KREQUIRE_TRUE(target.publish());
+        auto const SUBJECT_REFS = subject.task->ref_count.load();
+        auto const TARGET_REFS = target.task->ref_count.load();
+        vfs::LookupHandle captured;
+        KREQUIRE_EQ(task_lookup(*subject.task, "/proc/1/root/proc/2/root/data", captured), 0);
+        KEXPECT_TRUE(captured.procfs_view_origin() && captured.procfs_view_origins());
+        vfs::LookupHandle moved(std::move(captured));
+        KEXPECT_NULL(captured.procfs_view_origin());
+        KEXPECT_NULL(captured.procfs_view_origins());
+        LookupObservation observation;
+        KEXPECT_EQ(vfs::vfs_consume_lookup(moved, false, observe_lookup, &observation), 0);
+        KEXPECT_EQ(observation.calls, 1U);
+        auto const ORIGINAL = target.task->credentials();
+        ker::mod::security::Snapshot changed;
+        KREQUIRE_EQ(ker::mod::security::Snapshot::restore_fields({.user = {100, 100, 100}, .group = {100, 100, 100}}, changed), 0);
+        // Exclusively owned, unscheduled construction fixtures exercise the
+        // real immutable credential cutover without editing a live task.
+        KREQUIRE_EQ(resource::initialize_credentials(*target.task, changed), 0);
+        observation = {};
+        KEXPECT_EQ(vfs::vfs_consume_lookup(moved, false, observe_lookup, &observation), -EAGAIN);
+        KEXPECT_EQ(observation.calls, 0U);
+        moved.reset();
+        KEXPECT_EQ(subject.task->ref_count.load(), SUBJECT_REFS);
+        KEXPECT_EQ(target.task->ref_count.load(), TARGET_REFS);
+        KREQUIRE_EQ(resource::initialize_credentials(*target.task, ORIGINAL), 0);
+        KREQUIRE_EQ(task_lookup(*subject.task, "/proc/1/root/proc/2/root/data", moved), 0);
+        target.task->state.store(sched::task::TaskState::EXITING);
+        KEXPECT_EQ(vfs::vfs_consume_lookup(moved, false, observe_lookup, &observation), -ESRCH);
+        KEXPECT_EQ(observation.calls, 0U);
+        moved.reset();
+        target.task->state.store(sched::task::TaskState::ACTIVE);
+        std::array<char, 256> path{};
+        for (unsigned depth = 1; depth <= 9; ++depth) {
+            std::strcat(path.data(), "/proc/1/root");
+            std::array<char, 256> selected = path;
+            std::strcat(selected.data(), "/data");
+            vfs::LookupHandle lookup;
+            KEXPECT_EQ(task_lookup(*subject.task, selected.data(), lookup), depth <= 8 ? 0 : -ELOOP);
+            if (depth <= 8) {
+                observation = {};
+                KEXPECT_EQ(vfs::vfs_consume_lookup(lookup, false, observe_lookup, &observation), 0);
+                KEXPECT_EQ(observation.calls, 1U);
+                KEXPECT_TRUE(depth == 1 ? lookup.procfs_view_origins() == nullptr : lookup.procfs_view_origins() != nullptr);
+            } else {
+                KEXPECT_NULL(lookup.backend_parent());
+                KEXPECT_NULL(lookup.procfs_view_origins());
+            }
+            lookup.reset();
+            KEXPECT_EQ(subject.task->ref_count.load(), SUBJECT_REFS);
+            KEXPECT_EQ(target.task->ref_count.load(), TARGET_REFS);
+        }
+        KREQUIRE_EQ(task_lookup(*subject.task, "/proc/1/root/proc/2/root/data", moved), 0);
+        pid_view.close();
+        observation = {};
+        KEXPECT_EQ(vfs::vfs_consume_lookup(moved, false, observe_lookup, &observation), -EIDRM);
+        KEXPECT_EQ(observation.calls, 0U);
+        moved.reset();
+        KEXPECT_EQ(subject.task->ref_count.load(), SUBJECT_REFS);
+        KEXPECT_EQ(target.task->ref_count.load(), TARGET_REFS);
     }
     KEXPECT_EQ(pid_ns::live_namespace_count(), PID_BASELINE);
     KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNT_BASELINE);

@@ -7758,8 +7758,13 @@ auto procfs_readlink_as_impl(File* f, char* buf, size_t bufsz, const ker::mod::s
         }
         int_to_str(reader_pid, tmp.data(), tmp.size());
         std::array<char, 64> link{};
-        memcpy(link.data(), "/proc/", 6);
-        size_t off = 6;
+        size_t off = 0;
+        // Private self is relative to this exact procfs mount, including a
+        // mount below a narrower directory view. Host spelling is unchanged.
+        if (pfd->pid_view.is_host()) {
+            memcpy(link.data(), "/proc/", 6);
+            off = 6;
+        }
         for (const char* p = tmp.data(); (*p != 0) && off < link.size() - 1; ++p, ++off) {
             link[off] = *p;
         }
@@ -7777,20 +7782,20 @@ auto procfs_readlink_as_impl(File* f, char* buf, size_t bufsz, const ker::mod::s
     int const POLICY = authorize_private_procfs(CREDENTIALS, CALLER_PID, *pfd, before);
     if (POLICY != 0) return POLICY;
     auto* task = pfd->target;
+    auto const* subject_credentials = !pfd->pid_view.is_host() || allow_remote_cwd ? &CREDENTIALS : nullptr;
+    auto const RECOVERY = allow_remote_cwd ? DirectoryRecoveryMode::ALLOW_REMOTE : DirectoryRecoveryMode::LOCAL_ONLY;
     DirectoryViewRef candidate_view;
     std::array<char, 512> staged{};
     ssize_t result = 0;
     if (pfd->node.type == ProcNodeType::CWD_LINK) {
         size_t length = 0;
-        int const CWD =
-            ker::vfs::vfs_getcwd_for_task(task, staged.data(), staged.size(), &length, allow_remote_cwd ? &CREDENTIALS : nullptr,
-                                          directory_view != nullptr ? &candidate_view : nullptr);
+        int const CWD = ker::vfs::vfs_getcwd_for_task(task, staged.data(), staged.size(), &length, subject_credentials,
+                                                      directory_view != nullptr ? &candidate_view : nullptr, RECOVERY);
         result = CWD == 0 ? static_cast<ssize_t>(length) : CWD;
     } else if (pfd->node.type == ProcNodeType::ROOT_LINK) {
         size_t length = 0;
-        int const ROOT =
-            ker::vfs::vfs_getroot_for_task(task, staged.data(), staged.size(), &length, allow_remote_cwd ? &CREDENTIALS : nullptr,
-                                           directory_view != nullptr ? &candidate_view : nullptr);
+        int const ROOT = ker::vfs::vfs_getroot_for_task(task, staged.data(), staged.size(), &length, subject_credentials,
+                                                        directory_view != nullptr ? &candidate_view : nullptr, RECOVERY);
         result = ROOT == 0 ? static_cast<ssize_t>(length) : ROOT;
     } else if (pfd->node.type == ProcNodeType::EXE_LINK) {
         uint64_t const IRQF = task->path_metadata_lock.lock_irqsave();

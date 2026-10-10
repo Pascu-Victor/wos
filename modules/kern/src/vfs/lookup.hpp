@@ -103,6 +103,9 @@ class LookupHandle {
     [[nodiscard]] auto mount_membership() const -> const void* { return mount_membership_; }
     [[nodiscard]] auto procfs_view_origin() const -> File* { return procfs_view_origin_; }
     [[nodiscard]] auto procfs_view_generation() const -> uint64_t { return procfs_view_generation_; }
+    // Bounded additional private magic-link origins. Only VFS core interprets
+    // this retained owner; it is neither a namespace grant nor a wire identity.
+    [[nodiscard]] auto procfs_view_origins() const -> const void* { return procfs_view_origins_; }
     [[nodiscard]] auto path() const -> const char* { return path_.data(); }
     [[nodiscard]] auto parent_path() const -> const char* { return parent_path_.data(); }
     [[nodiscard]] auto final_component() const -> const char* { return final_component_.data(); }
@@ -151,6 +154,8 @@ class LookupHandle {
     File* procfs_view_origin_{};
     BackendRelease release_procfs_view_origin_{};
     uint64_t procfs_view_generation_{};
+    void* procfs_view_origins_{};
+    BackendRelease release_procfs_view_origins_{};
     uint64_t mount_generation_{};
     uint64_t namespace_generation_{};
     uint64_t backend_generation_{};
@@ -184,6 +189,9 @@ struct LookupHandleBuilder {
     static auto set_mount_membership(LookupHandle& handle, void* retained, LookupHandle::BackendRelease release) -> bool;
     static void set_procfs_view_origin(LookupHandle& handle, File* retained_origin, LookupHandle::BackendRelease release,
                                        uint64_t credential_generation);
+    // Take sole ownership on an empty unpublished candidate; no replacement,
+    // allocation or release. Caller finishes fallible work before this transfer.
+    static void set_procfs_view_origins(LookupHandle& handle, void* retained, LookupHandle::BackendRelease release);
     static void set_dirfd_anchor(LookupHandle& handle, File* retained_file, bool path_revalidated = false);
     static auto set_remote_relative_path(LookupHandle& handle, const char* path, size_t length) -> bool;
     static void set_backend_binding(LookupHandle& handle, void* retained_parent, LookupHandle::BackendRelease release_parent,

@@ -320,8 +320,10 @@ auto vfs_dup2_for_task(ker::mod::sched::task::Task* task, int oldfd, int newfd, 
 // null-snapshot caller refuses owned roots before borrowing references. Root text
 // is the current physical spelling; a retained root view returns length zero.
 // Failure preserves all outputs; the subject must remain retained throughout.
+enum class DirectoryRecoveryMode { ALLOW_REMOTE, LOCAL_ONLY };
 auto vfs_getroot_for_task(ker::mod::sched::task::Task* task, char* buffer, size_t capacity, size_t* length = nullptr,
-                          const ker::mod::security::Snapshot* caller = nullptr, DirectoryViewRef* directory_view = nullptr) -> int;
+                          const ker::mod::security::Snapshot* caller = nullptr, DirectoryViewRef* directory_view = nullptr,
+                          DirectoryRecoveryMode recovery = DirectoryRecoveryMode::ALLOW_REMOTE) -> int;
 // Intersect an existing native view with the subject's owned root, preserving
 // narrower boundaries and union policy without new DAC. Outside publication;
 // source may alias output. A null owned root leaves source scope unchanged.
@@ -352,8 +354,8 @@ auto vfs_getcwd(char* buf, size_t size, size_t* len_out = nullptr) -> int;
 // Remote name recovery is allowed only with an explicit caller snapshot and
 // outside namespace publication; text-only/serialized callers leave it null.
 auto vfs_getcwd_for_task(ker::mod::sched::task::Task* task, char* buf, size_t size, size_t* len_out = nullptr,
-                         const ker::mod::security::Snapshot* remote_credentials = nullptr, DirectoryViewRef* directory_view = nullptr)
-    -> int;
+                         const ker::mod::security::Snapshot* remote_credentials = nullptr, DirectoryViewRef* directory_view = nullptr,
+                         DirectoryRecoveryMode recovery = DirectoryRecoveryMode::ALLOW_REMOTE) -> int;
 // A non-null remote_credentials permits blocking owner recovery and requires
 // outside-publication context. Native mixed-mount text recovery uses that same
 // context guarantee to retain its proof through an internal publication guard.
@@ -361,6 +363,8 @@ auto vfs_getcwd_for_task(ker::mod::sched::task::Task* task, char* buf, size_t si
 // refused before retention. Owned-root recovery also requires a supplied snapshot
 // and outside-publication context, including view output; null-snapshot callers
 // refuse before borrowing root/cwd anchors. No caller may use this query as a DAC admission.
+// LOCAL_ONLY separates local snapshot admission from remote permission: remote
+// root/cwd anchors are refused before retention, even with a supplied snapshot.
 // Optional directory_view returns the complete scope instead of text (length
 // zero) when present. Both alternatives use one captured cwd/anchor. A caller
 // requesting scope must run outside publication and authorize private access.

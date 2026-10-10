@@ -11847,6 +11847,31 @@ auto directory_member_path_locked(File* directory, File* root, char* buffer, siz
                                   NativeDirectoryMembershipAccess references) -> int;
 // A serialized caller owns these outside namespace publication, including
 // references captured by a walk that returns before publishing a LookupHandle.
+struct LocalWalkProcOrigins {
+    struct Entry {
+        std::unique_ptr<File, LocalWalkProcRelease> file;
+        uint64_t generation{};
+    };
+    std::array<Entry, MAX_SYMLINK_DEPTH> entries{};
+    size_t used{};
+    auto append(std::unique_ptr<File, LocalWalkProcRelease>& origin, uint64_t generation) -> int {
+        if (!origin) return -EINVAL;
+        if (used == entries.size()) return -ELOOP;
+        auto& entry = entries[used++];
+        entry.file = std::move(origin);
+        entry.generation = generation;
+        return 0;
+    }
+    auto validate() const -> int {
+        for (size_t i = 0; i < used; ++i) {
+            int const RESULT = procfs::procfs_revalidate_open_result(entries[i].file.get(), entries[i].generation);
+            if (RESULT != 0) return RESULT;
+        }
+        return 0;
+    }
+};
+void release_local_walk_proc_origins(void* cookie) { delete static_cast<LocalWalkProcOrigins*>(cookie); }
+
 struct LocalWalkReferences {
     DirectoryAnchorRef root;
     DirectoryAnchorRef cwd;
@@ -11854,6 +11879,17 @@ struct LocalWalkReferences {
     DirectoryViewRef view{};
     std::unique_ptr<File, LocalWalkProcRelease> procfs_view_origin;
     uint64_t procfs_view_generation{};
+    std::unique_ptr<LocalWalkProcOrigins> procfs_view_origins;
+    // Newly detached FD pins can be owned only by a captured view. Retain old
+    // descriptions here before swaps so their last close follows publication.
+    std::array<DirectoryViewRef, 2 * MAX_SYMLINK_DEPTH + 2> retired_views{};
+    size_t retired_view_count{};
+    auto retire_view(const DirectoryViewRef& value) -> int {
+        if (!value) return 0;
+        if (retired_view_count == retired_views.size()) return -ELOOP;
+        retired_views[retired_view_count++] = value;
+        return 0;
+    }
     std::unique_ptr<NativeDirectoryMembershipReferences> membership;
 };
 auto prepare_open_directory_view_locked(ker::mod::sched::task::Task& task, const ker::mod::security::Snapshot& credentials,
@@ -12415,7 +12451,7 @@ auto acquire_local_component_lookup(ker::mod::sched::task::Task* task, int dirfd
     // Reference slots are empty; explicit view admission may already own the
     // same recorder. Never replace it under the caller's publication lock.
     if (references.root || references.cwd || references.directory || references.view || references.procfs_view_origin ||
-        (references.membership && initial_view == nullptr))
+        references.procfs_view_origins || references.retired_view_count != 0 || (references.membership && initial_view == nullptr))
         return -EINVAL;
     if (initial_view != nullptr) references.view = *initial_view;
     auto& root_anchor = references.root;
@@ -12499,6 +12535,8 @@ auto acquire_local_component_lookup(ker::mod::sched::task::Task* task, int dirfd
     auto admit_retained_view = [&]() -> int {
         if (!references.view) return 0;
         if (PRIVATE && !view_in_scope(references.view)) return -EXDEV;
+        int const RETAIN = references.retire_view(references.view);
+        if (RETAIN != 0) return RETAIN;
         std::optional<ker::mod::sys::MutexGuard> guard;
         if (!serialized) guard.emplace(g_vfs_namespace_publication_mutex);
         if (NAMESPACE != g_vfs_namespace_generation.load(std::memory_order_acquire) || MOUNTS != mount_table_generation_snapshot())
@@ -12537,8 +12575,8 @@ auto acquire_local_component_lookup(ker::mod::sched::task::Task* task, int dirfd
             auto const POLICY = references.view.policy().restricted_by(process_view.policy());
             DirectoryViewRef merged(new (std::nothrow) DirectoryView(boundary, references.view.directory(), POLICY));
             if (!merged) return -ENOMEM;
-            // The original root/cwd or dirfd owners outlive publication. Thus
-            // replacing this description cannot perform a final native close.
+            // The outer retirement holder retains even newly detached FD
+            // identity pins, so replacement cannot final-close under publication.
             references.view.swap(merged);
         }
         int result = admit_directory_view(nullptr, references.view.root(), references.view.directory(), authorization.credentials, true,
@@ -12759,7 +12797,7 @@ auto acquire_local_component_lookup(ker::mod::sched::task::Task* task, int dirfd
         }
     }
     File* const OWNED_ROOT = root_anchor && pathname[0] == '/' ? root_anchor.get()->view.root() : nullptr;
-    File* const RESET_ROOT = root_anchor ? references.view.root() : nullptr;
+    File* reset_root = root_anchor ? references.view.root() : nullptr;
     result = local_walk_bind(EPOCH, authorization.credentials, path.data(), nullptr, nullptr,
                              OWNED_ROOT != nullptr ? OWNED_ROOT : (route_restarted ? nullptr : anchor.get()), current,
                              OWNED_ROOT != nullptr ? root_anchor.get() : retained_cwd);
@@ -12837,18 +12875,72 @@ auto acquire_local_component_lookup(ker::mod::sched::task::Task* task, int dirfd
                                                 next_path.data(), target.data(), target.size() - 1, !serialized, task);
             if (READ < 0) return static_cast<int>(READ);
             if (captured) {
-                // A captured magic link needs its own native root intersection
-                // and origin owner. Existing scoped walks retain their refusal
-                // until that derivation supports both boundaries explicitly.
-                if (references.view || references.procfs_view_origin) return -EXDEV;
+                // Scope derivation is supported only with both private mount
+                // and PID ownership. Preserve the Host scoped-walk refusal.
+                auto* origin = next.proc ? static_cast<procfs::ProcFileData*>(next.proc->private_data) : nullptr;
+                if ((references.view || references.procfs_view_origin) && (!PRIVATE || origin == nullptr || origin->pid_view.is_host()))
+                    return -EXDEV;
+                DirectoryViewRef const previous = references.view;
+                result = references.retire_view(previous);
+                if (result != 0) return result;
+                if (references.procfs_view_origin) {
+                    // Allocation and origin ownership transfer happen before
+                    // publication; the fixed owner drains after its guard.
+                    if (!references.procfs_view_origins) {
+                        references.procfs_view_origins.reset(new (std::nothrow) LocalWalkProcOrigins{});
+                        if (!references.procfs_view_origins) return -ENOMEM;
+                    }
+                    result = references.procfs_view_origins->append(next.proc, generation);
+                    if (result != 0) return result;
+                } else {
+                    references.procfs_view_origin = std::move(next.proc);
+                    references.procfs_view_generation = generation;
+                }
                 references.view = std::move(captured);
-                references.procfs_view_origin = std::move(next.proc);
-                references.procfs_view_generation = generation;
+                authorization.root_identity_view = false;
 #ifdef WOS_SELFTEST
                 if (procfs_directory_view_test_hook != nullptr) procfs_directory_view_test_hook(task);
 #endif
                 result = admit_retained_view();
                 if (result != 0) return result;
+                if (previous) {
+                    ker::mod::sys::MutexGuard guard(g_vfs_namespace_publication_mutex);
+                    if (NAMESPACE != g_vfs_namespace_generation.load(std::memory_order_acquire) ||
+                        MOUNTS != mount_table_generation_snapshot())
+                        return -EAGAIN;
+                    if (!references.membership && (previous.root()->mount_owner != references.view.root()->mount_owner ||
+                                                   previous.root()->mount_owner != references.view.directory()->mount_owner)) {
+                        references.membership.reset(new (std::nothrow) NativeDirectoryMembershipReferences{});
+                        if (!references.membership) return -ENOMEM;
+                    }
+                    std::array<char, MAX_PATH_LEN> previous_path{}, incoming_path{};
+                    result = copy_directory_lookup_path(previous.root(), NAMESPACE, MOUNTS, previous_path, true);
+                    if (result == 0) result = copy_directory_lookup_path(references.view.root(), NAMESPACE, MOUNTS, incoming_path, true);
+                    if (result != 0) return result;
+                    File* boundary = nullptr;
+                    File* wider = nullptr;
+                    if (path_prefix_matches(incoming_path.data(), previous_path.data(), std::strlen(previous_path.data()))) {
+                        boundary = references.view.root();
+                        wider = previous.root();
+                    } else if (path_prefix_matches(previous_path.data(), incoming_path.data(), std::strlen(incoming_path.data()))) {
+                        boundary = previous.root();
+                        wider = references.view.root();
+                    } else {
+                        return -EPERM;
+                    }
+                    result = admit_directory_view(wider, boundary, references.view.directory(), authorization.credentials, true, true,
+                                                  references.membership.get());
+                    if (result != 0) return result;
+                    DirectoryViewRef merged(new (std::nothrow) DirectoryView(boundary, references.view.directory(),
+                                                                             previous.policy().restricted_by(references.view.policy())));
+                    if (!merged) return -ENOMEM;
+                    references.view.swap(merged);
+                    result = copy_directory_lookup_path(references.view.root(), NAMESPACE, MOUNTS, root, true);
+                    if (result != 0) return result;
+                    confinement_root = root.data();
+                    confined_mount = references.view.root()->mount_owner;
+                }
+                reset_root = references.view.root();
                 EPOCH.confined_mount = confined_mount;
                 std::array<char, MAX_PATH_LEN> directory_path{}, remainder{};
                 result = copy_directory_lookup_path(references.view.directory(), NAMESPACE, MOUNTS, directory_path, false);
@@ -12940,9 +13032,9 @@ auto acquire_local_component_lookup(ker::mod::sched::task::Task* task, int dirfd
             }
             if (link[0] == '/') {
                 LocalWalkNode restart{};
-                result =
-                    local_walk_bind(EPOCH, authorization.credentials, root.data(), nullptr, nullptr, RESET_ROOT, restart,
-                                    RESET_ROOT != nullptr && RESET_ROOT == root_anchor.get()->view.root() ? root_anchor.get() : nullptr);
+                result = local_walk_bind(
+                    EPOCH, authorization.credentials, root.data(), nullptr, nullptr, reset_root, restart,
+                    root_anchor && reset_root != nullptr && reset_root == root_anchor.get()->view.root() ? root_anchor.get() : nullptr);
                 if (result != 0) return result;
                 current = std::move(restart);
                 path = root;
@@ -12971,6 +13063,10 @@ auto acquire_local_component_lookup(ker::mod::sched::task::Task* task, int dirfd
     if (mount_table_generation_snapshot() != MOUNTS || current.mount->retiring.load(std::memory_order_acquire)) return -EAGAIN;
     if (references.procfs_view_origin) {
         result = procfs::procfs_revalidate_open_result(references.procfs_view_origin.get(), references.procfs_view_generation);
+        if (result != 0) return result;
+    }
+    if (references.procfs_view_origins) {
+        result = references.procfs_view_origins->validate();
         if (result != 0) return result;
     }
     LookupHandle candidate{};
@@ -13016,6 +13112,8 @@ auto acquire_local_component_lookup(ker::mod::sched::task::Task* task, int dirfd
     if (references.procfs_view_origin)
         LookupHandleBuilder::set_procfs_view_origin(candidate, references.procfs_view_origin.release(), release_procfs_lookup_cookie,
                                                     references.procfs_view_generation);
+    if (references.procfs_view_origins)
+        LookupHandleBuilder::set_procfs_view_origins(candidate, references.procfs_view_origins.release(), release_local_walk_proc_origins);
     *out = std::move(candidate);
     return 0;
 }
@@ -17197,14 +17295,20 @@ auto vfs_capture_root_metadata(ker::mod::sched::task::Task* task, FilesystemRoot
 // Metadata-only root queries require a retained subject. Owned references and
 // output replacement belong outside publication, just like cwd recovery.
 auto vfs_getroot_for_task(ker::mod::sched::task::Task* task, char* buffer, size_t capacity, size_t* length,
-                          const ker::mod::security::Snapshot* caller, DirectoryViewRef* directory_view) -> int {
+                          const ker::mod::security::Snapshot* caller, DirectoryViewRef* directory_view, DirectoryRecoveryMode recovery)
+    -> int {
     if (buffer == nullptr || capacity == 0) return -EINVAL;
+    if (recovery != DirectoryRecoveryMode::ALLOW_REMOTE && recovery != DirectoryRecoveryMode::LOCAL_ONLY) return -EINVAL;
     auto* owner = task != nullptr ? task->filesystem_owner() : nullptr;
     if (owner == nullptr) return -ESRCH;
     ker::mod::sched::task::Task::PathBuffer text{};
     DirectoryAnchorRef anchor;
     uint64_t const IRQF = owner->path_metadata_lock.lock_irqsave();
     if (caller == nullptr && owner->root_anchor) {
+        owner->path_metadata_lock.unlock_irqrestore(IRQF);
+        return -ENOTSUP;
+    }
+    if (recovery == DirectoryRecoveryMode::LOCAL_ONLY && owner->root_anchor && owner->root_anchor.get()->remote != nullptr) {
         owner->path_metadata_lock.unlock_irqrestore(IRQF);
         return -ENOTSUP;
     }
@@ -17447,8 +17551,10 @@ auto vfs_directory_path_for_task(ker::mod::sched::task::Task& task, File* direct
 
 // --- getcwd / chdir ---
 auto vfs_getcwd_for_task(ker::mod::sched::task::Task* task, char* buf, size_t size, size_t* len_out,
-                         const ker::mod::security::Snapshot* remote_credentials, DirectoryViewRef* directory_view) -> int {
+                         const ker::mod::security::Snapshot* remote_credentials, DirectoryViewRef* directory_view,
+                         DirectoryRecoveryMode recovery) -> int {
     if (buf == nullptr || size == 0) return -EINVAL;
+    if (recovery != DirectoryRecoveryMode::ALLOW_REMOTE && recovery != DirectoryRecoveryMode::LOCAL_ONLY) return -EINVAL;
     auto* owner = task != nullptr ? task->filesystem_owner() : nullptr;
     if (owner == nullptr) return -ESRCH;
     ker::mod::sched::task::Task::PathBuffer root{}, cwd{};
@@ -17463,7 +17569,12 @@ auto vfs_getcwd_for_task(ker::mod::sched::task::Task* task, char* buf, size_t si
     cwd = owner->cwd;
     // Do not borrow a remote reference in a serialized text-only caller: even
     // dropping that temporary could become the last close and wait for WKI.
-    if (remote_credentials == nullptr && owner->cwd_anchor && owner->cwd_anchor.get()->remote != nullptr) {
+    if ((remote_credentials == nullptr || recovery == DirectoryRecoveryMode::LOCAL_ONLY) && owner->cwd_anchor &&
+        owner->cwd_anchor.get()->remote != nullptr) {
+        owner->path_metadata_lock.unlock_irqrestore(IRQF);
+        return -ENOTSUP;
+    }
+    if (recovery == DirectoryRecoveryMode::LOCAL_ONLY && owner->root_anchor && owner->root_anchor.get()->remote != nullptr) {
         owner->path_metadata_lock.unlock_irqrestore(IRQF);
         return -ENOTSUP;
     }
@@ -17548,7 +17659,9 @@ auto vfs_getcwd_for_task(ker::mod::sched::task::Task* task, char* buf, size_t si
                 if (CROSS_NATIVE) publication_guard.emplace(g_vfs_namespace_publication_mutex);
                 uint64_t const NAMESPACE = g_vfs_namespace_generation.load(std::memory_order_acquire);
                 uint64_t const MOUNTS = mount_table_generation_snapshot();
-                int const RESULT = directory_anchor_path(*anchor.get(), physical, remote_credentials, CROSS_NATIVE ? &membership : nullptr);
+                int const RESULT = directory_anchor_path(*anchor.get(), physical,
+                                                         recovery == DirectoryRecoveryMode::LOCAL_ONLY ? nullptr : remote_credentials,
+                                                         CROSS_NATIVE ? &membership : nullptr);
                 if (RESULT != 0) return RESULT;
                 if (NAMESPACE != g_vfs_namespace_generation.load(std::memory_order_acquire) || MOUNTS != mount_table_generation_snapshot())
                     return -EAGAIN;
@@ -24726,6 +24839,13 @@ auto vfs_selftest_remote_cwd_root_admission() -> bool {
         marker->fops = &operations;
         auto* const FILE = marker.get();
         anchor.get()->remote = marker.release();
+        struct ResetOwner {
+            Task& task;
+            ~ResetOwner() {
+                task.root_anchor = {};
+                task.cwd_anchor = {};
+            }
+        } reset{owner};
         for (auto* root : {"/rootfs", "/restricted", "/"}) {
             for (bool owned : {false, true}) {
                 if (!owned && std::strcmp(root, "/") == 0) continue;
@@ -24738,6 +24858,28 @@ auto vfs_selftest_remote_cwd_root_admission() -> bool {
                 if (owned) captured.root_anchor = anchor;
                 anchor.get()->root_text = captured.root;
                 anchor.get()->cwd_text = captured.cwd;
+                owner.root = captured.root;
+                owner.cwd = captured.cwd;
+                owner.cwd_anchor = captured.cwd_anchor;
+                owner.root_anchor = captured.root_anchor;
+                auto const ANCHOR_REFS = anchor.get()->refs.load();
+                auto const FILE_REFS = FILE->refcount.load();
+                std::array<char, 32> unchanged{};
+                unchanged.fill('x');
+                size_t length = 73;
+                DirectoryViewRef output;
+                if (vfs_getcwd_for_task(&owner, unchanged.data(), unchanged.size(), &length, &CREDENTIALS, &output,
+                                        DirectoryRecoveryMode::LOCAL_ONLY) != -ENOTSUP ||
+                    unchanged[0] != 'x' || length != 73 || output || anchor.get()->refs.load() != ANCHOR_REFS ||
+                    FILE->refcount.load() != FILE_REFS || closes != 0)
+                    return false;
+                if (owned && (vfs_getroot_for_task(&owner, unchanged.data(), unchanged.size(), &length, &CREDENTIALS, &output,
+                                                   DirectoryRecoveryMode::LOCAL_ONLY) != -ENOTSUP ||
+                              unchanged[0] != 'x' || length != 73 || output || anchor.get()->refs.load() != ANCHOR_REFS ||
+                              FILE->refcount.load() != FILE_REFS || closes != 0))
+                    return false;
+                owner.root_anchor = {};
+                owner.cwd_anchor = {};
                 if (vfs_captured_remote_cwd(captured) != FILE ||
                     !ker::net::wki::wki_remote_compute_selftest_cwd_submission_admission(captured, -ENOTSUP, CREDENTIALS) || closes != 0)
                     return false;
@@ -31407,6 +31549,11 @@ auto validate_lookup_directory_view_locked(const LookupHandle& handle) -> int {
     if (handle.procfs_view_origin() != nullptr) {
         int const ORIGIN = procfs::procfs_revalidate_open_result(handle.procfs_view_origin(), handle.procfs_view_generation());
         if (ORIGIN != 0) return ORIGIN;
+    }
+    if (handle.procfs_view_origins() != nullptr) {
+        auto const* origins = static_cast<const LocalWalkProcOrigins*>(handle.procfs_view_origins());
+        int const ORIGINS = origins->validate();
+        if (ORIGINS != 0) return ORIGINS;
     }
     auto const& view = handle.directory_view();
     if (!view) return 0;
