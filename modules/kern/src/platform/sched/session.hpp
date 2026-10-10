@@ -29,6 +29,17 @@ struct Identity {
     Origin group_origin{};
 };
 
+// Durable public names, carried by group/session members after leader exit.
+// Host names equal physical IDs. A private zero is unknown, never a host alias.
+struct Names {
+    uint64_t session_id = 0;
+    uint64_t pgid = 0;
+};
+struct IdentitySnapshot {
+    Identity internal{};
+    Names visible{};
+};
+
 // Bounded, order-independent resolution of one numeric group alias. Remote
 // queries classify origins relative to the caller's namespace, not their own.
 struct GroupCandidates {
@@ -92,9 +103,13 @@ struct GroupCandidates {
 auto create(task::Task& caller) -> int64_t;
 auto set_group(task::Task& caller, int64_t pid, int64_t pgid) -> int;
 auto prepare_spawn_group(task::Task& child, int64_t pgid) -> int;
+// Positive names select in the explicit requester's scope; native threads
+// resolve their retained canonical process. Failures preserve output.
+auto query(task::Task& caller, int64_t pid, Names& out) -> int;
 auto claim_terminal(task::Task& caller, ker::dev::pty::PtyPair& pair) -> int;
 auto detach_terminal(task::Task& caller, ker::dev::pty::PtyPair& pair) -> int;
 auto set_foreground(task::Task& caller, ker::dev::pty::PtyPair& pair, int64_t pgid) -> int;
+auto read_foreground(const task::Task& caller, ker::dev::pty::PtyPair& pair, uint64_t& out) -> int;
 
 // Cleanup may already hold VM publication: these acquire only session mutation.
 void process_exit(task::Task& owner);

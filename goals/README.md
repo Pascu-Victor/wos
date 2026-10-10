@@ -63,9 +63,11 @@ and Goal 39 is now the active Goal Mode objective. Private native IPC and mount
 ownership, Task native lookup/consumption and subject mount/unmount/repeatable
 pivot, retained File listings and subject procfs mount observations are qualified
 at the kernel API checkpoint. Native PID owner/local-name inheritance, exact
-requester registry lookup and GC pin withdrawal now pass actual kernel tests
-(78,598 assertions, zero failures, 1,280 cases). Public compartment admission,
-user PID/PPID/group/session/procfs/signal/wait/ptrace/TCB translation, namespace-
+requester registry lookup and GC pin withdrawal now pass actual kernel tests.
+Durable local SID/PGID inheritance, scoped session/group adapters and exact PTY
+foreground names also pass native production API tests, including destroyed
+leaders and sibling aliases (78,761 assertions, zero failures, 1,284 cases).
+Public compartment admission, user PID/PPID/procfs/signal/wait/ptrace/TCB translation, namespace-
 init lifecycle, complete WKI/network enforcement and full service/runtime
 criteria remain incomplete. Goal39 remains active with all ten criteria required.
 

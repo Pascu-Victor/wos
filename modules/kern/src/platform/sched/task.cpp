@@ -1539,7 +1539,8 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     }
     t->exe_path = parent->exe_path;
     t->personality = parent->personality;
-    t->initialize_job_identity(parent->job_identity());
+    auto const PARENT_JOB = parent->job_identity_snapshot();
+    t->initialize_job_identity(PARENT_JOB.internal, PARENT_JOB.visible);
     t->wki_target_hostname = parent->wki_target_hostname;
     t->wki_target_flags = parent->wki_target_flags;
     auto const PARENT_WKI = parent->wki_execution_identity();

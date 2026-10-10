@@ -3920,9 +3920,9 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         new_task->cwd_anchor = std::move(filesystem.cwd_anchor);
     }
     (void)new_task->exchange_creation_mask(parent_task->creation_mask());
-    auto child_job = parent_task->job_identity();
-    child_job.exec_completed = false;
-    new_task->initialize_job_identity(child_job);
+    auto child_job = parent_task->job_identity_snapshot();
+    child_job.internal.exec_completed = false;
+    new_task->initialize_job_identity(child_job.internal, child_job.visible);
     new_task->signal_mask_store(parent_task->signal_mask_bits(), std::memory_order_relaxed);
     ker::mod::sys::signal::sync_task_signal_mask_cache(new_task);
     new_task->wki_prefer_inline = parent_task->wki_prefer_inline;

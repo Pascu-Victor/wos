@@ -180,6 +180,11 @@ struct PtyPair {
     // Device structs for master and slave
     Device master_dev;
     Device slave_dev;
+
+    // Value-only names for the exact attachment's PID namespace; globally
+    // nonreused generations cannot join or retarget a namespace. Pair-locked.
+    uint64_t pid_namespace_generation = 0;
+    uint64_t namespace_foreground_pgrp = 0;
 };
 
 // Maximum concurrent PTY pairs (soft limit for PTY number assignment)

@@ -430,21 +430,6 @@ auto clone_fd_table_shared_checked(ker::mod::sched::task::Task* parent, ker::mod
     return ok;
 }
 
-auto find_process_leader_safe(uint64_t pid) -> ker::mod::sched::task::Task* {
-    auto* task = ker::mod::sched::find_task_by_pid_safe(pid);
-    if (task == nullptr) {
-        return nullptr;
-    }
-
-    uint64_t const PROCESS_PID = process_pid_for_task(*task);
-    if (PROCESS_PID == task->pid) {
-        return task;
-    }
-
-    task->release();
-    return ker::mod::sched::find_task_by_pid_safe(PROCESS_PID);
-}
-
 auto wos_proc_getgroups(size_t size, uint64_t list_addr) -> uint64_t {
     constexpr size_t GETGROUPS_SIZE_MAX = 0x7FFFFFFFU;
 
@@ -885,9 +870,9 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     }
 
     // Copy session, process group, and controlling terminal
-    auto child_job = parent->job_identity();
-    child_job.exec_completed = false;
-    child->initialize_job_identity(child_job);
+    auto child_job = parent->job_identity_snapshot();
+    child_job.internal.exec_completed = false;
+    child->initialize_job_identity(child_job.internal, child_job.visible);
 
     // Copy signal dispositions from parent (fork inherits signal handlers)
     child->signal_pending_store(0, std::memory_order_relaxed);  // Pending signals are NOT inherited
@@ -1545,9 +1530,9 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
         filesystem_parent->path_metadata_lock.unlock_irqrestore(PATH_IRQF);
     }
     child->exe_path = parent->exe_path;
-    auto child_job = parent->job_identity();
-    child_job.exec_completed = false;
-    child->initialize_job_identity(child_job);
+    auto child_job = parent->job_identity_snapshot();
+    child_job.internal.exec_completed = false;
+    child->initialize_job_identity(child_job.internal, child_job.visible);
     (void)child->exchange_creation_mask(parent->creation_mask());
     child->personality = parent->personality;
     child->signal_pending_store(0, std::memory_order_relaxed);
@@ -2888,21 +2873,11 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             return task != nullptr ? static_cast<uint64_t>(ker::mod::sched::session::create(*task)) : static_cast<uint64_t>(-ESRCH);
         }
         case abi::process::procmgmt_ops::GETSID: {
-            auto pid = static_cast<int64_t>(a2);
-            if (pid == 0) {
-                auto* task = ker::mod::sched::get_current_task();
-                if (task == nullptr) {
-                    return static_cast<uint64_t>(-ESRCH);
-                }
-                return task->job_identity().session_id;
-            }
-            auto* target = find_process_leader_safe(static_cast<uint64_t>(pid));
-            if (target == nullptr) {
-                return static_cast<uint64_t>(-ESRCH);
-            }
-            auto sid = target->job_identity().session_id;
-            target->release();
-            return sid;
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) return static_cast<uint64_t>(-ESRCH);
+            ker::mod::sched::session::Names names;
+            int const RESULT = ker::mod::sched::session::query(*task, static_cast<int64_t>(a2), names);
+            return RESULT != 0 ? static_cast<uint64_t>(RESULT) : names.session_id;
         }
         case abi::process::procmgmt_ops::SETPGID: {
             auto* task = ker::mod::sched::get_current_task();
@@ -2911,21 +2886,11 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
                                    : static_cast<uint64_t>(-ESRCH);
         }
         case abi::process::procmgmt_ops::GETPGID: {
-            auto pid = static_cast<int64_t>(a2);
-            if (pid == 0) {
-                auto* task = ker::mod::sched::get_current_task();
-                if (task == nullptr) {
-                    return static_cast<uint64_t>(-ESRCH);
-                }
-                return task->job_identity().pgid;
-            }
-            auto* target = find_process_leader_safe(static_cast<uint64_t>(pid));
-            if (target == nullptr) {
-                return static_cast<uint64_t>(-ESRCH);
-            }
-            auto pgid = target->job_identity().pgid;
-            target->release();
-            return pgid;
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) return static_cast<uint64_t>(-ESRCH);
+            ker::mod::sched::session::Names names;
+            int const RESULT = ker::mod::sched::session::query(*task, static_cast<int64_t>(a2), names);
+            return RESULT != 0 ? static_cast<uint64_t>(RESULT) : names.pgid;
         }
         case abi::process::procmgmt_ops::EXECVE: {
             // POSIX replace-process execve

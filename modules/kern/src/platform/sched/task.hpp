@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <defines/defines.hpp>
 #include <iterator>
+#include <optional>
 #include <platform/asm/cpu.hpp>
 #include <platform/interrupt/gdt.hpp>
 #include <platform/mm/paging.hpp>
@@ -833,7 +834,7 @@ struct Task {
     session::Identity m_job_identity{};
 
    public:
-    [[nodiscard]] auto job_identity() const -> session::Identity {
+    [[nodiscard]] auto job_identity_snapshot() const -> session::IdentitySnapshot {
         auto* owner = credential_owner();
         if (owner == nullptr) return {};
         uint64_t const IRQF = owner->m_job_identity_lock.lock_irqsave();
@@ -846,21 +847,38 @@ struct Task {
             result.pgid = owner->pid;
             result.group_origin = {};
         }
+        session::Names visible{result.session_id, result.pgid};
+        if (!owner->m_pid_namespace.is_host()) {
+            visible = owner->m_local_job_names;
+            uint64_t const OWN_ID = owner->namespace_tid();
+            if (visible.session_id == 0 && result.session_id == owner->pid) visible.session_id = OWN_ID;
+            if (visible.pgid == 0 && result.pgid == owner->pid) visible.pgid = OWN_ID;
+            if (!result.origin.local() || visible.session_id > pid_ns::MAX_LOCAL_ID) visible.session_id = 0;
+            if (!result.group_origin.local() || visible.pgid > pid_ns::MAX_LOCAL_ID) visible.pgid = 0;
+        }
         owner->m_job_identity_lock.unlock_irqrestore(IRQF);
-        return result;
+        return {.internal = result, .visible = visible};
     }
+    [[nodiscard]] auto job_identity() const -> session::Identity { return job_identity_snapshot().internal; }
     // Only for unpublished construction. Threads subsequently resolve their
     // retained process owner, so later process mutations need no sibling scan.
-    void initialize_job_identity(session::Identity identity) {
+    void initialize_job_identity(session::Identity identity, std::optional<session::Names> names = std::nullopt) {
         uint64_t const IRQF = m_job_identity_lock.lock_irqsave();
+        if (names) {
+            m_local_job_names = *names;
+        } else {
+            if (m_job_identity.session_id != identity.session_id || m_job_identity.origin != identity.origin)
+                m_local_job_names.session_id = 0;
+            if (m_job_identity.pgid != identity.pgid || m_job_identity.group_origin != identity.group_origin) m_local_job_names.pgid = 0;
+        }
         m_job_identity = identity;
         m_job_identity_lock.unlock_irqrestore(IRQF);
     }
     // Runtime callers serialize through session coordination; group commits
     // also hold the child-event lifecycle lock before taking this store lock.
-    void publish_job_identity(session::Identity identity) {
+    void publish_job_identity(session::Identity identity, std::optional<session::Names> names = std::nullopt) {
         auto* owner = credential_owner();
-        if (owner != nullptr) owner->initialize_job_identity(identity);
+        if (owner != nullptr) owner->initialize_job_identity(identity, names);
     }
     void mark_exec_completed() {
         auto* owner = credential_owner();
@@ -1302,6 +1320,9 @@ struct Task {
     pid_ns::NamespaceRef m_pid_namespace{};
     uint32_t m_namespace_tid{};
     bool m_pid_namespace_initialized{};
+    // Value-only names use the existing job store lock. Appended separately
+    // so neither session::Identity nor any prior Task/assembly offset changes.
+    session::Names m_local_job_names{};
 
    public:
     [[nodiscard]] auto pid_namespace() const -> const pid_ns::NamespaceRef* {
@@ -1361,6 +1382,12 @@ struct Task {
 };
 
 [[nodiscard]] inline auto process_pid(const Task& task) -> uint64_t { return task.owner_pid != 0 ? task.owner_pid : task.pid; }
+
+[[nodiscard]] inline auto same_pid_namespace(const Task& lhs, const Task& rhs) -> bool {
+    auto const* first = lhs.pid_namespace();
+    auto const* second = rhs.pid_namespace();
+    return first != nullptr && second != nullptr && *first == *second;
+}
 
 [[nodiscard]] inline auto same_thread_group(const Task& lhs, const Task& rhs) -> bool { return process_pid(lhs) == process_pid(rhs); }
 

@@ -315,9 +315,47 @@ withdrawal helpers. They cover pool exhaustion, failed output preservation,
 monotonic names, closed retained owners, child/thread admission, host retirement
 compatibility, same-number siblings, stale names, zombie pins, failed/colliding
 registration and actual probe-chain repair. They do not publish fake runnable
-user processes or qualify user-visible PID behavior. Public PID/PPID/group/session/
-procfs/signal/wait/ptrace and TCB adapters, namespace-init death and launcher
-admission remain pending; this foundation does not enable a public compartment.
+user processes or qualify a public compartment boundary. PID/PPID, procfs,
+signal/wait/ptrace and TCB adapters, namespace-init death and launcher admission
+remain pending; this foundation does not enable a public compartment.
+
+## Durable local session and process-group names
+
+Task job snapshots now capture internal physical identity and durable local
+SID/PGID names under the same job-store lock. The local store is appended to
+Task; the embedded physical Identity layout and prior assembly offsets remain
+unchanged. Fork, clone, spawn and pthread construction copy the pair together.
+Members retain local names after the leader's Task is withdrawn and destroyed;
+group resolution uses remaining exact-namespace members, never a dead leader
+lookup. Unknown/imported private job identities expose no invented host alias.
+
+GETSID/GETPGID resolve positive PID/TID names through the explicit requester,
+retaining a thread's canonical process owner before releasing the thread.
+Private queries return local job names, while Host observation returns physical
+values. SETSID, SETPGID and spawn group options use local private inputs/outputs,
+preserve physical credential/session/parent/exec admission and resolve groups
+only among exact-scope members. Host public group mutation cannot rewrite a
+private member's names. Closure serializes with the lifecycle/job-store commit;
+failed queries and closed/foreign mutations preserve outputs and state.
+
+PTY attachments retain physical SID/PGID and terminal allocation/attachment
+generations for kernel signals. Additional pair-locked value metadata records
+the globally nonreused PID-namespace generation and local foreground group.
+TIOCGPGRP/TIOCSPGRP translate that exact attachment; the local name survives
+group-leader exit. A private observer cannot turn a foreign terminal's numeric
+group into a local name. Host observation remains physical. Revocation clears
+the name/stamp with the physical attachment; no new namespace reference or
+integer join capability is introduced. Existing explicitly inherited terminal
+Files remain capabilities for their device I/O, without granting foreign group
+selection or job-control authority.
+
+Four native tests use real unpublished Tasks, production registry/session/
+child-publication and allocated PTY APIs. They cover destroyed leaders,
+canonical thread queries, identical sibling aliases, foreign/closed/imported
+refusal, child exec admission, Host physical inspection and preserved failed
+outputs. Public compartment entry stays disabled: the remaining PID/TID/TCB,
+parent/wait/signal/ptrace/procfs, init teardown, WKI/network and launcher paths
+must be integrated before scheduled service boundary qualification.
 
 ## Verification checkpoint
 

@@ -213,8 +213,27 @@ evidence/prune receipt retained; attempt11 passed before the final GC amendment.
 The 1000 native namespace reserve/close/drop cycles are owner-pool evidence, not
 1000 service create/exec/kill/destroy cycles.
 
+Durable local SID/PGID values now accompany physical job identities under the
+same store lock and inherit together across fork/clone/spawn/thread construction.
+GETSID/GETPGID select exact requester names and pin canonical thread owners.
+SETSID/SETPGID/spawn groups resolve exact-scope members, with closed admission
+serialized against lifecycle commit. PTYs retain value-only namespace stamps
+and local foreground names while preserving physical terminal signal identities.
+Names survive actual group/session leader Task destruction. Four native tests
+cover production session/registry/child-publication and allocated PTY APIs;
+public compartment entry remains unavailable.
+
+Checkpoint08 final Normal Build WOS, isolated fast diagnostic build, formatter,
+nine scheduler/resource and seven VFS/libc CTests pass. Actual isolated KTEST
+attempt14 passes 78,761 assertions, zero failures, 1,284 cases and normal poweroff,
+including all32 required compartment cases. Four inactive disposable images
+(257,638,400 allocated bytes) were audited and pruned; final disposable usage is
+zero. Attempt13's two assertion-width errors were corrected and its failed
+source/serial/manual-stop/prune receipts retained. This is native adapter evidence,
+not scheduled service isolation or the complete lifecycle campaigns.
+
 Public compartment admission, remaining root/procfs consumers, user PID/PPID/
-group/session/signal/wait/ptrace/TCB translation, namespace-init lifecycle policy,
+signal/wait/ptrace/TCB translation, namespace-init lifecycle policy,
 complete network/WKI gates, launcher and required service campaigns remain
 pending. All ten full acceptance criteria remain outstanding. Prior focused host ASan/UBSan cases are foundation evidence, not
 full service qualification. See progress/39/{ledger,evidence,reconnaissance,

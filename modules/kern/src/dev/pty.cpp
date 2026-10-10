@@ -1258,9 +1258,12 @@ int slave_ioctl(ker::vfs::File* file, unsigned long cmd, unsigned long arg) {
                 return -EFAULT;
             }
             auto* out = reinterpret_cast<int64_t*>(arg);
-            uint64_t const IRQF = pair->lock.lock_irqsave();
-            *out = static_cast<int64_t>(pair->foreground_pgrp);
-            pair->lock.unlock_irqrestore(IRQF);
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) return -ENOTTY;
+            uint64_t value = 0;
+            int const RESULT = ker::mod::sched::session::read_foreground(*task, *pair, value);
+            if (RESULT != 0) return RESULT;
+            *out = static_cast<int64_t>(value);
             return 0;
         }
         case TIOCSPGRP: {

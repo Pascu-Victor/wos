@@ -661,12 +661,26 @@ auto import_live_reaped_cpu_times(Task& process, uint64_t user_us, uint64_t syst
     return LIVE;
 }
 
-void update_job_identity(Task& process, const ker::mod::sched::session::Identity& identity) {
+auto update_job_identity(Task& process, const ker::mod::sched::session::Identity& identity,
+                         std::optional<ker::mod::sched::session::Names> names) -> bool {
+    auto const* scope = process.pid_namespace();
+    if (scope == nullptr) return false;
     Task* parent = nullptr;
     Task* tracer = nullptr;
     uint64_t const FLAGS = g_lifecycle_lock.lock_irqsave();
     auto const BEFORE = effective_group_identity(process);
-    process.publish_job_identity(identity);
+    bool committed = false;
+    {
+        ker::mod::sched::pid_ns::PublicationGuard const ADMISSION(*scope);
+        if (ADMISSION.open()) {
+            process.publish_job_identity(identity, names);
+            committed = true;
+        }
+    }
+    if (!committed) {
+        g_lifecycle_lock.unlock_irqrestore(FLAGS);
+        return false;
+    }
     auto const AFTER = effective_group_identity(process);
     if (BEFORE.pgid != AFTER.pgid || BEFORE.group_origin != AFTER.group_origin) {
         advance_version_locked(g_group_version);
@@ -692,6 +706,7 @@ void update_job_identity(Task& process, const ker::mod::sched::session::Identity
         wake_no_child_waiters(*tracer);
         tracer->release();
     }
+    return true;
 }
 
 void update_process_group(Task& process, uint64_t process_group) {

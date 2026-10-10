@@ -145,7 +145,10 @@ struct ConditionalProbe {
 // Route runtime setpgid/setsid changes through the lifecycle lock so a wait
 // selector and an immutable event snapshot observe one coherent group value.
 void update_process_group(sched_task::Task& process, uint64_t process_group);
-void update_job_identity(sched_task::Task& process, const ker::mod::sched::session::Identity& identity);
+// Closure serializes with the bounded store commit. False leaves all identity
+// and queue-version fields unchanged; wakes remain outside the namespace gate.
+auto update_job_identity(sched_task::Task& process, const ker::mod::sched::session::Identity& identity,
+                         std::optional<ker::mod::sched::session::Names> names = std::nullopt) -> bool;
 
 // Publication is a two-phase transaction: begin establishes membership before
 // scheduler/WKI visibility; commit marks it live; abort removes the unpublished

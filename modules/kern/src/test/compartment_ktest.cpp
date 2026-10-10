@@ -2,18 +2,22 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <dev/pty.hpp>
 #include <initializer_list>
 #include <memory>
 #include <platform/sched/ipc_namespace.hpp>
 #include <platform/sched/pid_namespace.hpp>
 #include <platform/sched/resource.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <platform/sched/session.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/security/credentials.hpp>
+#include <syscalls_impl/process/child_events.hpp>
 #include <syscalls_impl/shm/shm.hpp>
 #include <test/ktest.hpp>
 #include <vfs/fd_reservation.hpp>
 #include <vfs/filesystem_context.hpp>
+#include <vfs/fs/devfs.hpp>
 #include <vfs/fs/procfs.hpp>
 #include <vfs/fs/tmpfs.hpp>
 #include <vfs/lookup.hpp>
@@ -25,6 +29,8 @@ using ker::mod::sched::task::Task;
 
 namespace pid_ns = ker::mod::sched::pid_ns;
 namespace sched = ker::mod::sched;
+namespace session = ker::mod::sched::session;
+namespace child_events = ker::syscall::process::child_events;
 
 KTEST(CompartmentPid, RetainedPoolAndMonotonicIdsDrainWithoutRetargeting) {
     auto const BASELINE = pid_ns::live_namespace_count();
@@ -176,6 +182,10 @@ struct RegistryTask {
         return true;
     }
 };
+struct PublicationRollback {
+    Task& child;
+    ~PublicationRollback() { child_events::abort_publication(child); }
+};
 void expect_visible(const Task& requester, uint64_t id, Task* expected, bool lifetime = false) {
     auto* found =
         lifetime ? sched::find_task_by_visible_pid_lifetime_ref(requester, id) : sched::find_task_by_visible_pid_safe(requester, id);
@@ -183,6 +193,219 @@ void expect_visible(const Task& requester, uint64_t id, Task* expected, bool lif
     if (found != nullptr) found->release();
 }
 }  // namespace
+
+KTEST(CompartmentJob, DurableNamesSurviveLeaderRetirementAndCanonicalThreadQueries) {
+    auto const NAMESPACES = pid_ns::live_namespace_count();
+    auto const REGISTRY = sched::get_scoped_pid_task_count();
+    auto const ACTIVE = sched::get_active_task_count();
+    {
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        RegistryTask init, member, peer, thread, host;
+        auto leader = std::make_unique<RegistryTask>();
+        KREQUIRE_TRUE(init.task->initialize_pid_namespace(scope));
+        KREQUIRE_TRUE(resource::inherit(*leader->task, *init.task));
+        auto inherited = init.task->job_identity_snapshot();
+        leader->task->initialize_job_identity(inherited.internal, inherited.visible);
+        KEXPECT_EQ(session::create(*init.task), int64_t{-EPERM});
+        KREQUIRE_EQ(session::create(*leader->task), int64_t{2});
+        uint64_t const LEADER_PID = leader->task->pid;
+        for (auto* child : {member.task.get(), peer.task.get()}) {
+            KREQUIRE_TRUE(resource::inherit(*child, *leader->task));
+            inherited = leader->task->job_identity_snapshot();
+            child->initialize_job_identity(inherited.internal, inherited.visible);
+        }
+        KREQUIRE_TRUE(member.publish());
+        KREQUIRE_TRUE(peer.publish());
+        KREQUIRE_TRUE(leader->publish());
+        // Actual withdrawal and Task destruction, not a leader lookup or a
+        // copied stand-alone identity model. Members retain value-only names.
+        leader.reset();
+        KEXPECT_NULL(sched::find_task_by_visible_pid_safe(*member.task, 2));
+        session::Names names{999, 998};
+        KREQUIRE_EQ(session::query(*member.task, 0, names), 0);
+        KEXPECT_EQ(names.session_id, uint64_t{2});
+        KEXPECT_EQ(names.pgid, uint64_t{2});
+        KEXPECT_EQ(member.task->job_identity().session_id, LEADER_PID);
+        KEXPECT_EQ(member.task->job_identity().pgid, LEADER_PID);
+        KREQUIRE_EQ(session::set_group(*member.task, 0, 0), 0);
+        KEXPECT_EQ(member.task->job_identity_snapshot().visible.pgid, member.task->namespace_tid());
+        // Resolve a group through a remaining member after its leader is gone.
+        KREQUIRE_EQ(session::set_group(*member.task, 0, 2), 0);
+        KEXPECT_EQ(member.task->job_identity().pgid, LEADER_PID);
+        thread.task->is_thread = true;
+        thread.task->owner_pid = member.task->pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(*thread.task, *member.task));
+        KREQUIRE_TRUE(thread.publish());
+        auto const REFERENCES = member.task->ref_count.load();
+        KREQUIRE_EQ(session::query(*peer.task, static_cast<int64_t>(thread.task->namespace_tid()), names), 0);
+        KEXPECT_EQ(names.session_id, uint64_t{2});
+        KEXPECT_EQ(names.pgid, uint64_t{2});
+        KEXPECT_EQ(member.task->ref_count.load(), REFERENCES);
+        KREQUIRE_EQ(session::query(*host.task, static_cast<int64_t>(member.task->pid), names), 0);
+        KEXPECT_EQ(names.session_id, LEADER_PID);
+        KEXPECT_EQ(names.pgid, LEADER_PID);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), NAMESPACES);
+    KEXPECT_EQ(sched::get_scoped_pid_task_count(), REGISTRY);
+    KEXPECT_EQ(sched::get_active_task_count(), ACTIVE);
+}
+
+KTEST(CompartmentJob, LocalGroupAdmissionExcludesSiblingAndHostAliases) {
+    auto const NAMESPACES = pid_ns::live_namespace_count();
+    auto const REGISTRY = sched::get_scoped_pid_task_count();
+    {
+        pid_ns::NamespaceRef first, second;
+        KREQUIRE_EQ(pid_ns::create_namespace(first), 0);
+        KREQUIRE_EQ(pid_ns::create_namespace(second), 0);
+        RegistryTask init, sibling, own, foreign, candidate, host;
+        KREQUIRE_TRUE(init.task->initialize_pid_namespace(first));
+        KREQUIRE_TRUE(sibling.task->initialize_pid_namespace(second));
+        KREQUIRE_TRUE(resource::inherit(*own.task, *init.task));
+        KREQUIRE_TRUE(resource::inherit(*foreign.task, *sibling.task));
+        auto const JOB = init.task->job_identity_snapshot();
+        own.task->initialize_job_identity(JOB.internal, JOB.visible);
+        auto const OTHER_JOB = sibling.task->job_identity_snapshot();
+        foreign.task->initialize_job_identity(OTHER_JOB.internal, OTHER_JOB.visible);
+        KREQUIRE_EQ(session::prepare_spawn_group(*foreign.task, 0), 0);
+        KREQUIRE_TRUE(init.publish());
+        KREQUIRE_TRUE(sibling.publish());
+        KREQUIRE_TRUE(own.publish());
+        KREQUIRE_TRUE(foreign.publish());
+        session::Names names;
+        KREQUIRE_EQ(session::query(*init.task, 2, names), 0);
+        KEXPECT_EQ(names.pgid, uint64_t{1});
+        KREQUIRE_EQ(session::query(*sibling.task, 2, names), 0);
+        KEXPECT_EQ(names.pgid, uint64_t{2});
+        // A foreign live local-2 group cannot satisfy this namespace's alias.
+        KREQUIRE_TRUE(resource::inherit(*candidate.task, *init.task));
+        candidate.task->initialize_job_identity(JOB.internal, JOB.visible);
+        KEXPECT_EQ(session::prepare_spawn_group(*candidate.task, 2), -EPERM);
+        KEXPECT_EQ(candidate.task->job_identity_snapshot().visible.pgid, uint64_t{1});
+        PublicationRollback const MEMBERSHIP{*own.task};
+        KREQUIRE_TRUE(child_events::begin_publication(*init.task, *own.task));
+        KREQUIRE_EQ(session::set_group(*init.task, 2, 0), 0);
+        KEXPECT_EQ(own.task->job_identity_snapshot().visible.pgid, uint64_t{2});
+        KEXPECT_EQ(own.task->job_identity().pgid, own.task->pid);
+        KREQUIRE_EQ(session::prepare_spawn_group(*candidate.task, 2), 0);
+        KEXPECT_EQ(candidate.task->job_identity().pgid, own.task->pid);
+        KEXPECT_EQ(candidate.task->job_identity_snapshot().visible.pgid, uint64_t{2});
+        KEXPECT_EQ(session::set_group(*init.task, static_cast<int64_t>(foreign.task->pid), 0), -ESRCH);
+        KEXPECT_EQ(session::set_group(*host.task, static_cast<int64_t>(own.task->pid), 0), -EPERM);
+        own.task->mark_exec_completed();
+        KEXPECT_EQ(session::set_group(*init.task, 2, 0), -EACCES);
+        KEXPECT_EQ(foreign.task->job_identity().pgid, foreign.task->pid);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), NAMESPACES);
+    KEXPECT_EQ(sched::get_scoped_pid_task_count(), REGISTRY);
+}
+
+KTEST(CompartmentJob, ClosedImportedAndInvalidViewsPreserveOutputsAndState) {
+    auto const NAMESPACES = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        RegistryTask init, child, unbound;
+        KREQUIRE_TRUE(init.task->initialize_pid_namespace(scope));
+        KREQUIRE_TRUE(resource::inherit(*child.task, *init.task));
+        auto const JOB = init.task->job_identity_snapshot();
+        child.task->initialize_job_identity(JOB.internal, JOB.visible);
+        KREQUIRE_TRUE(child.publish());
+        session::Names names{111, 222};
+        auto unchanged = [&]() {
+            KEXPECT_EQ(names.session_id, uint64_t{111});
+            KEXPECT_EQ(names.pgid, uint64_t{222});
+        };
+        KEXPECT_EQ(session::query(*init.task, -1, names), -ESRCH);
+        unchanged();
+        KEXPECT_EQ(session::query(*init.task, static_cast<int64_t>(child.task->pid), names), -ESRCH);
+        unchanged();
+        unbound.task->is_thread = true;
+        unbound.task->owner_pid = init.task->pid;
+        KEXPECT_EQ(session::query(*unbound.task, 0, names), -ESRCH);
+        unchanged();
+        auto imported = JOB.internal;
+        imported.origin = {.node = 17, .boot = 31};
+        child.task->initialize_job_identity(imported, JOB.visible);
+        KEXPECT_EQ(child.task->job_identity_snapshot().visible.session_id, uint64_t{0});
+        KEXPECT_EQ(session::query(*child.task, 0, names), -ESRCH);
+        unchanged();
+        child.task->initialize_job_identity(JOB.internal, JOB.visible);
+        auto const VERSION = child.task->child_queue_version;
+        scope.close();
+        KEXPECT_FALSE(
+            child_events::update_job_identity(*child.task, {.session_id = child.task->pid, .pgid = child.task->pid}, session::Names{2, 2}));
+        KEXPECT_EQ(child.task->child_queue_version, VERSION);
+        KEXPECT_EQ(child.task->job_identity().session_id, JOB.internal.session_id);
+        KEXPECT_EQ(child.task->job_identity_snapshot().visible.session_id, uint64_t{1});
+        KEXPECT_EQ(session::query(*child.task, 0, names), -EIDRM);
+        unchanged();
+        KEXPECT_EQ(session::create(*child.task), int64_t{-EIDRM});
+        KEXPECT_EQ(session::set_group(*child.task, 0, 0), -EIDRM);
+        KEXPECT_EQ(session::prepare_spawn_group(*child.task, 0), -EIDRM);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), NAMESPACES);
+}
+
+KTEST(CompartmentJob, TerminalForegroundKeepsExactNameAfterGroupLeaderRetirement) {
+    namespace pty = ker::dev::pty;
+    auto const NAMESPACES = pid_ns::live_namespace_count();
+    auto const REGISTRY = sched::get_scoped_pid_task_count();
+    {
+        pid_ns::NamespaceRef scope, other;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        KREQUIRE_EQ(pid_ns::create_namespace(other), 0);
+        auto release_file = [](ker::vfs::File* file) { ker::vfs::vfs_put_file(file); };
+        std::unique_ptr<ker::vfs::File, decltype(release_file)> master(
+            ker::vfs::devfs::devfs_open_path(ker::mod::security::Snapshot::bootstrap_root(), "/dev/ptmx", 2, 0), release_file);
+        KREQUIRE_TRUE(master != nullptr);
+        int number = -1;
+        KREQUIRE_EQ(ker::vfs::devfs::devfs_ioctl(master.get(), pty::TIOCGPTN, reinterpret_cast<unsigned long>(&number)), 0);
+        auto release_pair = [](pty::PtyPair* pair) { pty::pty_put(pair); };
+        std::unique_ptr<pty::PtyPair, decltype(release_pair)> pair(pty::pty_get(number), release_pair);
+        KREQUIRE_TRUE(pair != nullptr);
+        RegistryTask init, member, foreign, host;
+        auto leader = std::make_unique<RegistryTask>();
+        KREQUIRE_TRUE(init.task->initialize_pid_namespace(scope));
+        KREQUIRE_TRUE(foreign.task->initialize_pid_namespace(other));
+        KREQUIRE_TRUE(resource::inherit(*leader->task, *init.task));
+        auto const JOB = init.task->job_identity_snapshot();
+        leader->task->initialize_job_identity(JOB.internal, JOB.visible);
+        KREQUIRE_EQ(session::prepare_spawn_group(*leader->task, 0), 0);
+        KREQUIRE_TRUE(resource::inherit(*member.task, *leader->task));
+        auto const GROUP = leader->task->job_identity_snapshot();
+        member.task->initialize_job_identity(GROUP.internal, GROUP.visible);
+        KREQUIRE_TRUE(leader->publish());
+        KREQUIRE_TRUE(member.publish());
+        KREQUIRE_EQ(session::claim_terminal(*init.task, *pair), 0);
+        KREQUIRE_EQ(session::set_foreground(*init.task, *pair, 2), 0);
+        uint64_t const PHYSICAL_GROUP = leader->task->pid;
+        KEXPECT_EQ(pair->foreground_pgrp, PHYSICAL_GROUP);
+        KEXPECT_EQ(pair->pid_namespace_generation, scope.generation());
+        leader.reset();
+        uint64_t output = 77;
+        KREQUIRE_EQ(session::read_foreground(*init.task, *pair, output), 0);
+        KEXPECT_EQ(output, uint64_t{2});
+        KREQUIRE_EQ(session::read_foreground(*host.task, *pair, output), 0);
+        KEXPECT_EQ(output, PHYSICAL_GROUP);
+        output = 77;
+        KEXPECT_EQ(session::read_foreground(*foreign.task, *pair, output), -ENOTTY);
+        KEXPECT_EQ(output, uint64_t{77});
+        KEXPECT_EQ(session::set_foreground(*init.task, *pair, static_cast<int64_t>(PHYSICAL_GROUP)), -EPERM);
+        KEXPECT_EQ(pair->foreground_pgrp, PHYSICAL_GROUP);
+        scope.close();
+        KEXPECT_EQ(session::read_foreground(*init.task, *pair, output), -EIDRM);
+        KEXPECT_EQ(output, uint64_t{77});
+        KEXPECT_EQ(session::set_foreground(*init.task, *pair, 2), -EIDRM);
+        // Withdraw fixtures before terminal revocation can signal real tasks.
+        member.retire();
+        KREQUIRE_EQ(session::detach_terminal(*init.task, *pair), 0);
+        KEXPECT_EQ(pair->pid_namespace_generation, uint64_t{0});
+        KEXPECT_EQ(pair->namespace_foreground_pgrp, uint64_t{0});
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), NAMESPACES);
+    KEXPECT_EQ(sched::get_scoped_pid_task_count(), REGISTRY);
+}
 
 KTEST(CompartmentPid, ProductionRegistrySeparatesSameNumberAndHostTargets) {
     auto const BASELINE = sched::get_scoped_pid_task_count();
