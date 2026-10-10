@@ -500,7 +500,7 @@ def require_ptrace_and_mremap_use_stable_pages() -> None:
     ]:
         if snippet not in write_word:
             fail(f"ptrace POKEDATA must preflight and pin an entire cross-page word: {snippet}")
-    if "ret = write_task_word(*target, addr, data, admitted_target);" not in ptrace:
+    if "ret = write_task_word(*target, addr, data, admitted_target, &operation);" not in ptrace:
         fail("ptrace POKEDATA must use the all-pages-pinned word writer")
 
     mremap = function_body(VMEM_CPP.read_text(), "anon_mremap")

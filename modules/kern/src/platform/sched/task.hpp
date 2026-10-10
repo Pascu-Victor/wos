@@ -68,6 +68,10 @@ namespace ker::mod::sched {
 struct IntrusiveTaskList;
 }
 
+namespace ker::mod::debug::ptrace {
+class PendingOperation;
+}
+
 namespace ker::mod::sched::task {
 
 enum class WkiVfsRoute : uint8_t {
@@ -1389,6 +1393,9 @@ struct Task {
     // frozen at publication, independently of subsequent group changes.
     ChildWaitView child_wait_view{ChildWaitView::PHYSICAL};
     std::array<uint64_t, 5> child_event_local_groups{};
+    // Current-executor stack ownership; ordinary/fatal ptrace cleanup only.
+    // Appended so preceding Task and assembly offsets remain unchanged.
+    debug::ptrace::PendingOperation* pending_ptrace_operations{};
     [[nodiscard]] auto local_group_slot(const ChildEvent& event) -> uint64_t* {
         std::array<const ChildEvent*, 5> const EVENTS{&child_parent_exit_event, &child_tracer_exit_event, &child_job_stop_event,
                                                       &child_continued_event, &child_ptrace_stop_event};

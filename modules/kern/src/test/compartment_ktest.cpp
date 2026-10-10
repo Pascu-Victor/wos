@@ -6,6 +6,8 @@
 #include <initializer_list>
 #include <limits>
 #include <memory>
+#include <platform/debug/ptrace.hpp>
+#include <platform/interrupt/gdt.hpp>
 #include <platform/loader/elf_loader.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/phys.hpp>
@@ -32,6 +34,7 @@
 #include <vfs/lookup.hpp>
 #include <vfs/mount.hpp>
 
+namespace abi = ker::abi;
 namespace ipc = ker::mod::sched::ipc;
 namespace resource = ker::mod::sched::resource;
 using ker::mod::sched::task::Task;
@@ -481,6 +484,175 @@ KTEST(CompartmentSignal, ClosureRouteAndLocalGroupChangesLinearizeWithAdmission)
     KEXPECT_TRUE(ker::syscall::process::process_selftest_namespace_signal_interleaving());
     KEXPECT_TRUE(ker::syscall::process::process_selftest_signal_snapshot_ownership());
 }
+
+namespace {
+namespace ptrace = ker::mod::debug::ptrace;
+using PtraceRequest = abi::ptrace::request;
+auto scoped_ptrace(Task& tracer, PtraceRequest request, uint64_t id, uint64_t data = 0) -> int64_t {
+    return static_cast<int64_t>(ptrace::ptrace_as(tracer, request, id, 0, data));
+}
+// Membership cleanup must never make these unscheduled Tasks runnable, even
+// when a REQUIRE returns before the last assertion.
+struct InertOnExit {
+    std::initializer_list<Task*> tasks;
+    ~InertOnExit() { make_wait_fixtures_inert(tasks); }
+};
+struct PtraceUnlink {
+    Task& target;
+    ~PtraceUnlink() { child_events::detach_tracer(target); }
+};
+}  // namespace
+
+KTEST(CompartmentPtrace, LocalSelectorsPreserveCredentialsAndHostInspection) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef first, second;
+        KREQUIRE_EQ(pid_ns::create_namespace(first), 0);
+        KREQUIRE_EQ(pid_ns::create_namespace(second), 0);
+        RegistryTask caller, target, sibling, foreign, host;
+        PtraceUnlink const TRACE_CLEANUP{*target.task};
+        KREQUIRE_TRUE(caller.task->initialize_pid_namespace(first));
+        KREQUIRE_TRUE(target.task->initialize_pid_namespace(first));
+        KREQUIRE_TRUE(sibling.task->initialize_pid_namespace(second));
+        KREQUIRE_TRUE(foreign.task->initialize_pid_namespace(second));
+        KREQUIRE_TRUE(caller.publish());
+        KREQUIRE_TRUE(target.publish());
+        KREQUIRE_TRUE(sibling.publish());
+        KREQUIRE_TRUE(foreign.publish());
+        KREQUIRE_TRUE(host.publish());
+        KEXPECT_EQ(scoped_ptrace(*caller.task, PtraceRequest::SEIZE, target.task->pid), -int64_t{ESRCH});
+        KEXPECT_EQ(scoped_ptrace(*caller.task, PtraceRequest::SEIZE, foreign.task->pid), -int64_t{ESRCH});
+        KEXPECT_EQ(scoped_ptrace(*caller.task, PtraceRequest::SEIZE, host.task->pid), -int64_t{ESRCH});
+        KEXPECT_EQ(scoped_ptrace(*caller.task, PtraceRequest::SEIZE, 1), -int64_t{EPERM});
+        KREQUIRE_EQ(scoped_ptrace(*caller.task, PtraceRequest::SEIZE, 2), 0);
+        KEXPECT_TRUE(target.task->child_tracer == caller.task.get());
+        KEXPECT_EQ(target.task->ptrace_tracer_pid, caller.task->pid);
+        KEXPECT_FALSE(foreign.task->ptrace_traced);
+        KREQUIRE_EQ(scoped_ptrace(*caller.task, PtraceRequest::SETOPTIONS, 2, 0x41), 0);
+        KEXPECT_EQ(target.task->ptrace_options, uint64_t{0x41});
+        KREQUIRE_EQ(scoped_ptrace(*caller.task, PtraceRequest::DETACH, 2), 0);
+        KEXPECT_NULL(target.task->child_tracer);
+        ker::mod::security::Snapshot user, other;
+        KREQUIRE_EQ(ker::mod::security::Snapshot::restore_fields({.user = {100, 100, 100}, .group = {100, 100, 100}}, user), 0);
+        KREQUIRE_EQ(ker::mod::security::Snapshot::restore_fields({.user = {200, 200, 200}, .group = {200, 200, 200}}, other), 0);
+        KREQUIRE_EQ(resource::initialize_credentials(*caller.task, user), 0);
+        KREQUIRE_EQ(resource::initialize_credentials(*target.task, other), 0);
+        KEXPECT_EQ(scoped_ptrace(*caller.task, PtraceRequest::SEIZE, 2), -int64_t{EPERM});
+        KEXPECT_FALSE(target.task->ptrace_traced);
+        KREQUIRE_EQ(scoped_ptrace(*host.task, PtraceRequest::SEIZE, target.task->pid), 0);
+        KEXPECT_EQ(target.task->ptrace_tracer_pid, host.task->pid);
+        KREQUIRE_EQ(scoped_ptrace(*host.task, PtraceRequest::DETACH, target.task->pid), 0);
+        // Both positive self lookups own and release their registry reference.
+        KEXPECT_EQ(scoped_ptrace(*host.task, PtraceRequest::GET_REMOTE_INFO, host.task->pid), -int64_t{EFAULT});
+        KEXPECT_EQ(scoped_ptrace(*caller.task, PtraceRequest::GET_REMOTE_INFO, 1), -int64_t{EFAULT});
+        KEXPECT_EQ(caller.task->ref_count.load(), uint32_t{1});
+        KEXPECT_EQ(target.task->ref_count.load(), uint32_t{1});
+        KEXPECT_TRUE(first.operations_drained());
+        KEXPECT_TRUE(second.operations_drained());
+        KEXPECT_NULL(caller.task->pending_ptrace_operations);
+        KEXPECT_TRUE(target.task->local_signal_admissions_drained());
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentPtrace, TracemeUsesCanonicalRetainedParent) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef scope, other;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        KREQUIRE_EQ(pid_ns::create_namespace(other), 0);
+        RegistryTask parent, child, foreign, host, thread, init;
+        KREQUIRE_TRUE(parent.task->initialize_pid_namespace(scope));
+        KREQUIRE_TRUE(resource::inherit(*child.task, *parent.task));
+        KREQUIRE_TRUE(foreign.task->initialize_pid_namespace(other));
+        thread.task->is_thread = true;
+        thread.task->owner_pid = child.task->pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(*thread.task, *child.task));
+        KREQUIRE_TRUE(init.task->initialize_pid_namespace(other));
+        WaitMembership membership{*parent.task, *child.task};
+        WaitMembership supervisor{*host.task, *foreign.task};
+        InertOnExit const INERT{
+            {parent.task.get(), child.task.get(), foreign.task.get(), host.task.get(), thread.task.get(), init.task.get()}};
+        PtraceUnlink const CHILD_TRACE{*child.task}, THREAD_TRACE{*thread.task};
+        KREQUIRE_TRUE(membership.publish());
+        KREQUIRE_TRUE(supervisor.publish());
+        child.task->parent_pid = foreign.task->pid;
+        thread.task->parent_pid = host.task->pid;
+        KREQUIRE_EQ(scoped_ptrace(*child.task, PtraceRequest::TRACEME, 0), 0);
+        KEXPECT_TRUE(child.task->child_tracer == parent.task.get());
+        KEXPECT_EQ(child.task->ptrace_tracer_pid, parent.task->pid);
+        child_events::detach_tracer(*child.task);
+        child.task->ptrace_traced = false;
+        child.task->ptrace_tracer_pid = 0;
+        KREQUIRE_EQ(scoped_ptrace(*thread.task, PtraceRequest::TRACEME, 0), 0);
+        KEXPECT_TRUE(thread.task->child_tracer == parent.task.get());
+        KEXPECT_EQ(thread.task->ptrace_tracer_pid, parent.task->pid);
+        child_events::detach_tracer(*thread.task);
+        thread.task->ptrace_traced = false;
+        thread.task->ptrace_tracer_pid = 0;
+        KEXPECT_EQ(scoped_ptrace(*foreign.task, PtraceRequest::TRACEME, 0), -int64_t{ESRCH});
+        KEXPECT_EQ(scoped_ptrace(*init.task, PtraceRequest::TRACEME, 0), -int64_t{ESRCH});
+        KEXPECT_FALSE(foreign.task->ptrace_traced);
+        KEXPECT_TRUE(scope.operations_drained());
+        KEXPECT_TRUE(other.operations_drained());
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentPtrace, ClosedRemoteAndRetiredImagesFailBeforeEffects) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        RegistryTask caller, target, thread;
+        KREQUIRE_TRUE(caller.task->initialize_pid_namespace(scope));
+        KREQUIRE_TRUE(target.task->initialize_pid_namespace(scope));
+        thread.task->is_thread = true;
+        thread.task->owner_pid = target.task->pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(*thread.task, *target.task));
+        KREQUIRE_TRUE(caller.publish());
+        KREQUIRE_TRUE(target.publish());
+        KREQUIRE_TRUE(thread.publish());
+        auto const REQUESTS = std::array{PtraceRequest::SEIZE,      PtraceRequest::SETOPTIONS,      PtraceRequest::KILL,
+                                         PtraceRequest::CONT,       PtraceRequest::PEEKDATA,        PtraceRequest::POKEDATA,
+                                         PtraceRequest::GETREGSET,  PtraceRequest::SETREGSET,       PtraceRequest::LIST_THREADS,
+                                         PtraceRequest::GET_IMAGES, PtraceRequest::GET_REMOTE_INFO, PtraceRequest::SYSCALL_WAIT};
+        target.task->set_wki_proxy_task_id(42);
+        for (auto request : REQUESTS) KEXPECT_EQ(scoped_ptrace(*caller.task, request, 2), -int64_t{ENOTSUP});
+        target.task->set_wki_proxy_task_id(0);
+        auto unbound = std::make_unique<Task>();
+        unbound->is_thread = true;
+        KEXPECT_EQ(scoped_ptrace(*unbound, PtraceRequest::SEIZE, 2), -int64_t{ESRCH});
+        KREQUIRE_TRUE(unbound->resource_owner.attach(caller.task.get()));
+        KEXPECT_EQ(scoped_ptrace(*unbound, PtraceRequest::SEIZE, 2), -int64_t{ESRCH});
+        thread.task->pagemap = reinterpret_cast<decltype(thread.task->pagemap)>(uintptr_t{1});
+        // Restore before any assertion can return and before Task destruction.
+        auto const STALE = scoped_ptrace(*caller.task, PtraceRequest::SEIZE, 3);
+        thread.task->pagemap = nullptr;
+        KEXPECT_EQ(STALE, -int64_t{ESRCH});
+        target.task->publish_accepted_signal_route(43, 123);
+        for (auto request : REQUESTS) KEXPECT_EQ(scoped_ptrace(*caller.task, request, 2), -int64_t{ENOTSUP});
+        scope.close();
+        for (auto request : REQUESTS) KEXPECT_EQ(scoped_ptrace(*caller.task, request, 2), -int64_t{EIDRM});
+        KEXPECT_FALSE(target.task->ptrace_traced);
+        KEXPECT_NULL(target.task->child_tracer);
+        KEXPECT_EQ(target.task->ptrace_options, uint64_t{0});
+        KEXPECT_EQ(target.task->signal_pending_bits(), uint64_t{0});
+        KEXPECT_TRUE(target.task->local_signal_admissions_drained());
+        KEXPECT_TRUE(scope.operations_drained());
+        KEXPECT_NULL(caller.task->pending_ptrace_operations);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentPtrace, ClosureAndRoutesLinearizeWithEffectAdmission) {
+    KEXPECT_TRUE(ptrace::ptrace_selftest_namespace_effect_lifetime());
+}
+KTEST(CompartmentPtrace, ClaimsAndThreadObservationsUseLocalNames) { KEXPECT_TRUE(ptrace::ptrace_selftest_namespace_observations()); }
+KTEST(CompartmentPtrace, RegisterAndImageEffectsRecheckScopeAndCredentials) {
+    KEXPECT_TRUE(ptrace::ptrace_selftest_namespace_register_images());
+}
+KTEST(CompartmentPtrace, FatalAndOrdinaryOwnershipDrainExactlyOnce) { KEXPECT_TRUE(ptrace::ptrace_selftest_operation_cleanup()); }
 
 KTEST(CompartmentWait, SameNumbersAndForeignMembershipNeverAuthorizePublicWait) {
     auto const BASELINE = pid_ns::live_namespace_count();
@@ -966,6 +1138,112 @@ KTEST(CompartmentIdentity, NativeImageTcbKeepsCanonicalProcessName) {
         KEXPECT_EQ(threading::get_active_thread_count(), THREADS + 1);
     }
     KEXPECT_EQ(threading::get_active_thread_count(), THREADS);
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentPtrace, PublicAdapterCopiesMappedMemoryRegistersAndLocalOutputs) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        constexpr uint64_t IO = 0x49000000, BUFFER = IO + 0x400, TARGET = 0x4a000000;
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        UserTask tracer, target;
+        KREQUIRE_NE(tracer.task->pagemap, nullptr);
+        KREQUIRE_NE(target.task->pagemap, nullptr);
+        KREQUIRE_TRUE(tracer.task->initialize_pid_namespace(scope));
+        KREQUIRE_TRUE(target.task->initialize_pid_namespace(scope));
+        KREQUIRE_TRUE(tracer.map_zero(IO));
+        KREQUIRE_TRUE(target.map_zero(TARGET));
+        struct Registration {
+            Task& task;
+            bool registered{};
+            ~Registration() {
+                if (registered) sched::scheduler_selftest_unregister_unpublished_task(task);
+            }
+        } registration{*target.task};
+        registration.registered = sched::scheduler_selftest_register_unpublished_task(*target.task);
+        KREQUIRE_TRUE(registration.registered);
+        struct TraceCleanup {
+            Task& target;
+            ~TraceCleanup() {
+                child_events::detach_tracer(target);
+                target.ptrace_traced = false;
+                target.ptrace_stopped = false;
+            }
+        } trace_cleanup{*target.task};
+        KREQUIRE_EQ(scoped_ptrace(*tracer.task, PtraceRequest::SEIZE, 2), 0);
+        uint64_t const FIRST = 0x1234567890abcdef;
+        KREQUIRE_TRUE(usercopy::copy_value_to_task(*target.task, TARGET, FIRST));
+        abi::ptrace::MemIo io{.address = TARGET, .buffer = reinterpret_cast<void*>(BUFFER), .size = sizeof(FIRST), .transferred = 99};
+        KREQUIRE_TRUE(usercopy::copy_value_to_task(*tracer.task, IO, io));
+        KREQUIRE_EQ(scoped_ptrace(*tracer.task, PtraceRequest::READ_MEM, 2, IO), 0);
+        uint64_t read = 0;
+        KREQUIRE_TRUE(usercopy::copy_value_from_task(*tracer.task, BUFFER, read));
+        KEXPECT_EQ(read, FIRST);
+        KREQUIRE_TRUE(usercopy::copy_value_from_task(*tracer.task, IO, io));
+        KEXPECT_EQ(io.transferred, sizeof(FIRST));
+        uint64_t const SECOND = 0xdeadbeefcafef00d;
+        KREQUIRE_TRUE(usercopy::copy_value_to_task(*tracer.task, BUFFER, SECOND));
+        KREQUIRE_EQ(scoped_ptrace(*tracer.task, PtraceRequest::WRITE_MEM, 2, IO), 0);
+        KREQUIRE_TRUE(usercopy::copy_value_from_task(*target.task, TARGET, read));
+        KEXPECT_EQ(read, SECOND);
+        KEXPECT_EQ(static_cast<int64_t>(ptrace::ptrace_as(*tracer.task, PtraceRequest::PEEKDATA, 2, TARGET, BUFFER)), int64_t{0});
+        KREQUIRE_TRUE(usercopy::copy_value_from_task(*tracer.task, BUFFER, read));
+        KEXPECT_EQ(read, SECOND);
+        KEXPECT_EQ(static_cast<int64_t>(ptrace::ptrace_as(*tracer.task, PtraceRequest::POKEDATA, 2, TARGET, FIRST)), int64_t{0});
+        KREQUIRE_TRUE(usercopy::copy_value_from_task(*target.task, TARGET, read));
+        KEXPECT_EQ(read, FIRST);
+        // An unmapped second target page keeps the existing valid-prefix ABI.
+        uint64_t const LAST = TARGET + mm::paging::PAGE_SIZE - sizeof(FIRST);
+        KREQUIRE_TRUE(usercopy::copy_value_to_task(*target.task, LAST, FIRST));
+        io.address = LAST;
+        io.size = 2 * sizeof(FIRST);
+        io.transferred = 99;
+        KREQUIRE_TRUE(usercopy::copy_value_to_task(*tracer.task, IO, io));
+        KEXPECT_EQ(scoped_ptrace(*tracer.task, PtraceRequest::READ_MEM, 2, IO), -int64_t{EFAULT});
+        KREQUIRE_TRUE(usercopy::copy_value_from_task(*tracer.task, IO, io));
+        KEXPECT_EQ(io.transferred, sizeof(FIRST));
+        target.task->ptrace_stopped = true;
+        target.task->context.frame.rip = TARGET;
+        target.task->context.frame.rsp = TARGET + 0x800;
+        target.task->context.frame.cs = ker::mod::desc::gdt::GDT_USER_CS;
+        target.task->context.frame.ss = ker::mod::desc::gdt::GDT_USER_DS;
+        target.task->context.frame.flags = 0x202;
+        target.task->context.regs.rax = 123;
+        abi::ptrace::RegsetIo regset{.kind = abi::ptrace::regset::X86_64_GPR,
+                                     .buffer = reinterpret_cast<void*>(BUFFER),
+                                     .size = sizeof(abi::ptrace::X86_64GprState)};
+        KREQUIRE_TRUE(usercopy::copy_value_to_task(*tracer.task, IO, regset));
+        KREQUIRE_EQ(scoped_ptrace(*tracer.task, PtraceRequest::GETREGSET, 2, IO), 0);
+        abi::ptrace::X86_64GprState regs{};
+        KREQUIRE_TRUE(usercopy::copy_value_from_task(*tracer.task, BUFFER, regs));
+        KEXPECT_EQ(regs.rax, uint64_t{123});
+        regs.rax = 456;
+        KREQUIRE_TRUE(usercopy::copy_value_to_task(*tracer.task, BUFFER, regs));
+        KREQUIRE_EQ(scoped_ptrace(*tracer.task, PtraceRequest::SETREGSET, 2, IO), 0);
+        KEXPECT_EQ(target.task->context.regs.rax, uint64_t{456});
+        KREQUIRE_EQ(scoped_ptrace(*tracer.task, PtraceRequest::GET_REMOTE_INFO, 2, BUFFER), 0);
+        abi::ptrace::RemoteInfo remote{};
+        KREQUIRE_TRUE(usercopy::copy_value_from_task(*tracer.task, BUFFER, remote));
+        KEXPECT_EQ(remote.proxy_pid, uint64_t{2});
+        KEXPECT_EQ(remote.remote_pid, uint64_t{0});
+        abi::ptrace::ThreadList list{.tids = reinterpret_cast<uint64_t*>(BUFFER), .capacity = 8, .count = 99};
+        KREQUIRE_TRUE(usercopy::copy_value_to_task(*tracer.task, IO, list));
+        KREQUIRE_EQ(scoped_ptrace(*tracer.task, PtraceRequest::LIST_THREADS, 2, IO), 0);
+        KREQUIRE_TRUE(usercopy::copy_value_from_task(*tracer.task, IO, list));
+        KEXPECT_EQ(list.count, size_t{1});
+        KREQUIRE_TRUE(usercopy::copy_value_from_task(*tracer.task, BUFFER, read));
+        KEXPECT_EQ(read, uint64_t{2});
+        KREQUIRE_TRUE(usercopy::copy_value_from_task(*tracer.task, BUFFER, remote));
+        auto const BEFORE = remote;
+        scope.close();
+        KEXPECT_EQ(scoped_ptrace(*tracer.task, PtraceRequest::GET_REMOTE_INFO, 2, BUFFER), -int64_t{EIDRM});
+        KREQUIRE_TRUE(usercopy::copy_value_from_task(*tracer.task, BUFFER, remote));
+        KEXPECT_EQ(std::memcmp(&remote, &BEFORE, sizeof(remote)), 0);
+        KEXPECT_TRUE(scope.operations_drained());
+        KEXPECT_TRUE(target.task->local_signal_admissions_drained());
+        KEXPECT_EQ(target.task->usercopy_pagemap_accesses.load(), uint32_t{0});
+    }
     KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
 }
 

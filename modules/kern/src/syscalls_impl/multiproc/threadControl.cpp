@@ -10,6 +10,7 @@
 #include <mod/io/serial/serial.hpp>
 #include <net/wki/remote_compute.hpp>
 #include <net/wki/wki.hpp>
+#include <platform/debug/ptrace.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
@@ -140,6 +141,7 @@ void release_thread_fd_refs(mod::sched::task::Task* task) {
         }
     }
     task->exit_in_progress = true;
+    mod::debug::ptrace::cleanup_operations(*task);
     task->jobctl_membership.detach();
     ker::vfs::cancel_fd_reservations(*task);
     mod::sched::resource::cancel_process_reservations(*task);

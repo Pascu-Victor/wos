@@ -603,6 +603,18 @@ auto namespace_parent_pid(const Task& task) -> uint64_t {
     return result;
 }
 
+auto acquire_namespace_parent(Task& task) -> Task* {
+    auto const* owner = task.credential_owner();
+    auto const* scope = owner != nullptr ? owner->pid_namespace() : nullptr;
+    if (scope == nullptr || scope->is_host() || scope->closed() || owner->namespace_tid() == 1) return nullptr;
+    uint64_t const FLAGS = g_lifecycle_lock.lock_irqsave();
+    auto* parent = owner->child_parent;
+    if (parent != nullptr && (!sched_task::same_pid_namespace(*owner, *parent) || parent->namespace_tid() == 0 || !parent->try_acquire()))
+        parent = nullptr;
+    g_lifecycle_lock.unlock_irqrestore(FLAGS);
+    return parent;
+}
+
 auto public_wait_selector(Task& owner, int64_t pid, Selector& out) -> int {
     auto const* scope = owner.pid_namespace();
     if (scope == nullptr) return -ESRCH;

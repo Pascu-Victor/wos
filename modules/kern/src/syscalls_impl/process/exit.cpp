@@ -9,6 +9,7 @@
 #include <net/wki/wki.hpp>
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
+#include <platform/debug/ptrace.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/ktime/process_timer.hpp>
 #include <platform/mm/virt.hpp>
@@ -247,6 +248,7 @@ namespace {
         }
     }
     current_task->exit_in_progress = true;
+    ker::mod::debug::ptrace::cleanup_operations(*current_task);
     cancel_pending_exec_handoff(*current_task);
     ker::vfs::cancel_fd_reservations(*current_task);
     ker::mod::sched::resource::cancel_process_reservations(*current_task);

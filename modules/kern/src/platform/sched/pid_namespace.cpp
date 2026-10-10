@@ -13,6 +13,7 @@ struct Namespace {
     uint64_t generation{};
     std::atomic<bool> closed{};
     std::atomic<uint32_t> next_id{1};
+    std::atomic<uint32_t> operations{};
     sys::Spinlock publication;
 };
 
@@ -65,6 +66,37 @@ auto NamespaceRef::generation() const -> uint64_t { return namespace_ != nullptr
 
 auto NamespaceRef::closed() const -> bool { return namespace_ != nullptr && namespace_->closed.load(std::memory_order_acquire); }
 
+auto NamespaceRef::operations_drained() const -> bool {
+    return namespace_ == nullptr || namespace_->operations.load(std::memory_order_acquire) == 0;
+}
+
+OperationLease::~OperationLease() { reset(); }
+
+auto OperationLease::begin(const NamespaceRef& scope) -> int {
+    if (active_) return -EBUSY;
+    NamespaceRef candidate;
+    int const RETAINED = scope.retain(candidate);
+    if (RETAINED != 0) return RETAINED;
+    {
+        PublicationGuard const ADMISSION(scope);
+        if (!ADMISSION.open()) return -EIDRM;
+        if (auto* ns = candidate.namespace_; ns != nullptr) {
+            if (ns->operations.load(std::memory_order_relaxed) == UINT32_MAX) return -EOVERFLOW;
+            ns->operations.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    scope_ = std::move(candidate);
+    active_ = true;
+    return 0;
+}
+
+void OperationLease::reset() {
+    if (std::exchange(active_, false)) {
+        if (auto* ns = scope_.namespace_; ns != nullptr) ns->operations.fetch_sub(1, std::memory_order_release);
+    }
+    scope_.reset();
+}
+
 auto NamespaceRef::allocate_id(uint32_t& out) const -> int {
     if (namespace_ == nullptr) return -EINVAL;
     if (closed()) return -EIDRM;
@@ -107,6 +139,7 @@ auto create_namespace(NamespaceRef& out) -> int {
         slot.generation = GENERATION;
         slot.closed.store(false, std::memory_order_relaxed);
         slot.next_id.store(1, std::memory_order_relaxed);
+        slot.operations.store(0, std::memory_order_relaxed);
         slot.references.store(1, std::memory_order_release);
         NamespaceRef candidate;
         candidate.namespace_ = &slot;

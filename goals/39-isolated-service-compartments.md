@@ -293,8 +293,18 @@ selection; corrected builds/oracle/selection pass and old receipts remain.
 This qualifies native signal consumers, not scheduled private services or full
 namespace-init closure/drain. Goal39 stays active with its full original scope.
 
+Scoped ptrace checkpoint12 now preserves exact local selection, canonical
+retained TRACEME parents, current credentials, Host physical inspection and
+private local observations. Target/buffer/namespace/effect ownership drains
+through ordinary and fatal process/thread cleanup. Eight native cases include
+actual mapped public copies/registers, claims, closure/routes and reference
+baselines. Normal Build WOS, isolated fast diagnostic build, format-only check
+and 34 selected Host regressions pass. Actual KTEST19 passes 79,819 assertions with zero failures across 1,310 cases, including all 58 required compartment cases and normal poweroff.
+Both the failed assertion-width VM and successful rerun pruned all disposable
+images. Public creation and the full service boundary remain unavailable.
+
 Public compartment admission, remaining root/procfs/positive PID consumers,
-ptrace translation, namespace-init lifecycle policy,
+namespace-init lifecycle policy,
 complete network/WKI gates, launcher and required service campaigns remain
 pending. All ten full acceptance criteria remain outstanding. Prior focused host ASan/UBSan cases are foundation evidence, not
 full service qualification. See progress/39/{ledger,evidence,reconnaissance,

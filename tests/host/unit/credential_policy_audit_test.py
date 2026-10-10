@@ -217,7 +217,11 @@ def test_ptrace_and_dumpability_use_shared_policy():
     assert "security::may_trace(TRACER, TARGET)" in permission
     assert permission.index("security::may_trace(TRACER, TARGET)") < permission.index("*admitted_target = TARGET")
     preparation = body_after(ptrace, "auto prepare_target_memory(")
-    assert "SharedVmemPublicationGuard" not in preparation
+    admission = body_after(preparation, "if (operation != nullptr && operation->private_scope() != nullptr)")
+    assert admission.index("SharedVmemPublicationGuard") < admission.index("effect.begin(target)")
+    assert preparation.index("effect.begin(target)") < preparation.index("pin_task_user_page(")
+    # The sleeping image guard ends before a fault can allocate or wait.
+    assert "pin_task_user_page(" not in admission
     assert "writable, true, pin" in preparation
     assert preparation.index("target.credentials() != admitted_target") < preparation.index("pin_task_user_page(")
     for name in ("copy_prepared_task_memory", "write_prepared_task_word"):
@@ -226,9 +230,9 @@ def test_ptrace_and_dumpability_use_shared_policy():
         assert operation.index("target.credentials() != admitted_target") < operation.index("pin_task_user_page(") < operation.index("std::memcpy(")
         assert "true, true," not in operation and "write_target, true," not in operation
     bulk = body_after(ptrace, "auto transfer_memory(")
-    refusal = body_after(bulk, "if (result == as_error(EPERM))")
+    refusal = body_after(bulk, "if (result == as_error(EPERM)")
     assert "if (done == 0) return result" in refusal and "result = as_error(EFAULT)" in refusal
-    assert bulk.index("if (result == as_error(EPERM))") < bulk.index("io.transferred = done")
+    assert bulk.index("if (result == as_error(EPERM)") < bulk.index("io.transferred = done")
     for request in ("PEEKDATA", "POKEDATA", "READ_MEM", "WRITE_MEM"):
         dispatch = body_after(ptrace, "case abi::ptrace::request::" + request + ":")
         assert "require_traced(*tracer, *target, &admitted_target)" in dispatch
@@ -240,11 +244,12 @@ def test_ptrace_and_dumpability_use_shared_policy():
         operation = body_after(ptrace, "auto " + name + "(")
         refusal = body_after(operation, "if (!snapshot_target_images(")
         assert "admitted_target, *runtime_images, needed, status" in operation
-        assert "delete runtime_images" in refusal and "return as_error(EPERM)" in refusal
+        assert "return failure" in refusal and "&failure" in operation
+        assert "OwnedBuffer<" in operation and "runtime_storage(operation" in operation
         assert operation.index("snapshot_target_images(") < operation.index("list.count = needed")
         dispatch = body_after(ptrace, "case abi::ptrace::request::" + request + ":")
         assert "require_traced(*tracer, *target, &admitted_target)" in dispatch
-        assert name + "(*tracer, *target, data, admitted_target)" in dispatch
+        assert name + "(*tracer, *target, data, admitted_target, &operation)" in dispatch
     detach = body_after(ptrace, "auto detach(")
     assert "target.ptrace_tracer_pid != tracer.pid" in detach and "require_traced(" not in detach
     wait = body_after(ptrace, "auto syscall_wait(")
@@ -265,7 +270,7 @@ def test_ptrace_and_dumpability_use_shared_policy():
     assert threads.index("new (std::nothrow)") < threads.index("capture_threads(target, admitted_target") < threads.index("copy_to_task(")
     dispatch = body_after(ptrace, "case abi::ptrace::request::LIST_THREADS:")
     assert "require_traced(*tracer, *target, &admitted_target)" in dispatch
-    assert "list_threads(*tracer, *target, data, admitted_target)" in dispatch
+    assert "list_threads(*tracer, *target, data, admitted_target, &operation)" in dispatch
     event = body_after(ptrace, "case abi::ptrace::request::GETEVENTMSG:")
     assert event.index("SharedVmemPublicationGuard") < event.index("require_traced(") < event.index("fill_event(") < event.index("copy_value_to_task(")
     remote = body_after(ptrace, "auto remote_info(")
@@ -298,16 +303,19 @@ def test_ptrace_register_validation_precedes_mutation():
         assert operation.index("SharedVmemPublicationGuard publication_guard") < operation.index("target.credentials() != admitted_target")
         assert "usercopy::" not in operation
     read = body_after(ptrace, "auto read_regset(")
-    assert "capture_gprs(target, out, admitted_target)" in read and "capture_xstate(target, out, admitted_target)" in read
+    assert "capture_gprs(target, out, admitted_target, operation)" in read and "capture_xstate(target, out, admitted_target, operation)" in read
     assert "target.fx_state" not in read
     write = body_after(ptrace, "auto write_regset(")
-    assert "apply_gprs(target, in, admitted_target)" in write and "apply_xstate(target, state, admitted_target)" in write
+    assert "apply_gprs(target, in, admitted_target, operation)" in write and "apply_xstate(target, state, admitted_target, operation)" in write
     hardware_input = body_after(ptrace, "auto set_hw_break(")
-    assert hardware_input.index("copy_value_from_task(") < hardware_input.index("apply_hw_break(target, desc, enable, admitted_target)")
+    assert hardware_input.index("copy_value_from_task(") < hardware_input.index("apply_hw_break(target, desc, enable, admitted_target, operation)")
     for request in ("GETREGSET", "SETREGSET", "SET_HW_BREAK", "DEL_HW_BREAK"):
         dispatch = body_after(ptrace, "case abi::ptrace::request::" + request + ":")
         assert "require_traced(*tracer, *target, &admitted_target)" in dispatch and dispatch.count("admitted_target") == 3
-    for request in ("KILL", "CONT", "SINGLESTEP", "SYSCALL", "INTERRUPT", "SETOPTIONS"):
+    options = body_after(ptrace, "auto set_trace_options(")
+    assert options.index("SharedVmemPublicationGuard") < options.index("require_traced(") < options.index("target.ptrace_options =")
+    assert "set_trace_options(*tracer, *target, data, &operation" in ptrace
+    for request in ("KILL", "CONT", "SINGLESTEP", "SYSCALL", "INTERRUPT"):
         dispatch = body_after(ptrace, "case abi::ptrace::request::" + request + ":")
         assert dispatch.index("SharedVmemPublicationGuard publication_guard") < dispatch.index("require_traced(")
         assert "usercopy::" not in dispatch

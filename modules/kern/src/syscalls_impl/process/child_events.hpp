@@ -141,6 +141,9 @@ struct ConditionalProbe {
 // Caller retains task; its canonical owner is retained by thread binding.
 // Snapshot parent membership under lifecycle, without a numeric registry lookup.
 [[nodiscard]] auto namespace_parent_pid(const sched_task::Task& task) -> uint64_t;
+// Exact private canonical parent membership, retained live for TRACEME.
+// Namespace init/unknown/foreign membership has no Host/numeric fallback.
+[[nodiscard]] auto acquire_namespace_parent(sched_task::Task& task) -> sched_task::Task*;
 // Public wait argument translation. Errors preserve out; private names never
 // consult the global registry or remote group-origin resolution.
 [[nodiscard]] auto public_wait_selector(sched_task::Task& owner, int64_t pid, Selector& out) -> int;

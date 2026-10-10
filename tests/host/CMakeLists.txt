@@ -593,6 +593,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/ptrace_deferred_yield_test.py
 )
 add_test(
+    NAME ptrace_namespace_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/ptrace_namespace_test.py
+)
+add_test(
     NAME virtio_net_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/virtio_net_source_test.py
 )

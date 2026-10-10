@@ -482,6 +482,56 @@ checks the current atomic timer producer/claim path. Failed and zero-selection
 receipts remain alongside successful reruns. Four proven inactive private images
 (258,162,688 allocated bytes) were pruned, returning disposable usage to zero.
 
+## Scoped ptrace ownership and observations
+
+Private ptrace selects positive local PID/TID values through the exact requester
+namespace. Zero borrows the requester. Same-number siblings, physical aliases
+and Host tasks do not become fallback targets, even for root. Host keeps physical
+inspection under existing credential and dumpability policy. Private TRACEME
+retains the canonical process parent's actual lifecycle membership; namespace
+init cannot select its Host supervisor through a numeric parent hint.
+Internal tracer IDs, trusted child claims and WKI identifiers remain physical.
+Only private public Event/StopInfo TIDs, thread lists and local RemoteInfo proxy
+names translate. Private remote/proxy observation rejects before WKI discovery.
+
+Each call owns a namespace operation reference/counter and its positive target
+reference. Each private effect separately checks scope closure, live Task type,
+current thread image and local route under VM publication and a short namespace
+guard, preserving current credential revalidation. Source-image admission uses
+the existing bounded local-effect lease. The namespace guard ends before faults,
+allocation, usercopy and scheduler effects. An admitted effect can finish after
+closure or route publication; subsequent effects fail. Initial memory denial
+publishes no result; later invalidation preserves the existing partial-transfer
+fault ABI.
+
+SYSCALL_WAIT retains lifetime ownership across blocking, with separate leases
+for resume and each claim capture. No source-image lease spans a park that may
+resume the target's own exec. Private parks recheck closure within a 10ms timer
+interval. A captured claim owns a copied local result and can finish copy/commit
+after closure; existing competition, failed-copy retry and claim-cookie behavior
+remains. Namespace-init descendant closure/drain remains future integration.
+
+Current-executor ownership lists register target references, effect leases and
+allocated observation buffers for ordinary and fatal cleanup. Both process and
+worker-thread exit drain this ownership before image/WKI/stack reclamation.
+Scratch buffers and nested operations release exactly once. The new Task pointer
+follows the previous final data field; all preceding fields remain unchanged.
+No public request, record layout, libc errno conversion or wire format changed.
+
+Eight native tests exercise actual unpublished Tasks/registry and retained
+parents, mapped bulk/word/partial copies, public register/thread/remote output,
+closure/route interleavings, current credential denial, stop claims and nested
+fatal/ordinary cleanup. The fixtures never become scheduled service processes.
+The full service boundary and all ten goal criteria remain pending.
+
+Checkpoint 12 Normal Build WOS, isolated fast diagnostic build, format-only check
+and 34 selected Host regressions pass. Actual KTEST19 passes 79,819 assertions with zero failures across 1,310 cases, including all 58 required compartment cases and normal poweroff.
+The first VM exposed 50 signed-width errno assertion mismatches; its source
+stayed frozen, the exact-owned VM was stopped and all four images were pruned.
+Corrected assertions passed the full rerun. Final four inactive private images
+(258,555,904 allocated bytes) were verified and pruned; disposable usage
+returned to zero. Small successful and failed receipts remain available.
+
 ## Verification checkpoint
 
 The initial `compartment_policy_test` suite checks actual production preparation
