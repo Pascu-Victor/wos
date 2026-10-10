@@ -2,8 +2,9 @@
 
 Goal39 is in progress. Profile preparation, private native SysV IPC namespace
 ownership/lookup, private native mount-table ownership, Task native lookup and
-subject mount administration are implemented. No public compartment creation syscall,
-launcher, PID view or complete network/WKI gate is enabled. Independent
+subject mount administration are implemented. No public compartment creation
+syscall or launcher is enabled. PID, lifecycle and complete network/WKI
+integration remain incomplete. Independent
 service isolation and all ten goal criteria remain unqualified. Goal28 remains
 incomplete at its committed wire-codec checkpoint while this work proceeds.
 
@@ -353,7 +354,7 @@ Four native tests use real unpublished Tasks, production registry/session/
 child-publication and allocated PTY APIs. They cover destroyed leaders,
 canonical thread queries, identical sibling aliases, foreign/closed/imported
 refusal, child exec admission, Host physical inspection and preserved failed
-outputs. Public compartment entry stays disabled: the remaining wait/signal/
+outputs. Public compartment entry stays disabled: the remaining signal/
 ptrace/procfs, init teardown, WKI/network/resource and launcher paths must be
 integrated before scheduled service boundary qualification.
 
@@ -386,9 +387,55 @@ pins cover immediate retirement during commit/trace or pthread exit propagation.
 Spawn inherits exact retained root/cwd before interpreter pathwalks, while its
 existing unpublished recovery owner covers blocking construction. Five native
 fixtures use real Tasks/memberships, user PTE/COW/alias checks and actual initial
-Thread construction. Public admission remains unavailable: wait/signal/ptrace/
+Thread construction. Public admission remains unavailable: signal/ptrace/
 procfs/init teardown, complete WKI/network/resource/launcher integration and
 scheduled hostile service/campaign evidence are still required.
+
+## Local wait selection and event names
+
+Public wait selection now uses the canonical owner's exact PID scope. Private
+positive IDs select reserved local PID/TID values; zero and negative selectors
+use local group names. Only actual owned child/tracer memberships and retained
+queued event subjects confer wait authority. Same-number foreign subjects do
+not become candidates, including a foreign reference in the owner's queue.
+Host public waits retain physical names and can supervise private namespace
+init. Trusted WKI claims, inspections and conditional queue-version claims
+continue to use physical selectors and physical origin values.
+
+Event publication takes one coherent internal/visible job snapshot and freezes
+local PGID alongside the existing physical group. Five appended Task slots
+correspond to its embedded exit, tracer exit, stop, continued and ptrace nodes;
+the embedded event/selector/registration layouts and prior Task offsets remain
+unchanged. Moving an event between owners does not rewrite the snapshot. An old
+group remains selectable after live group changes or actual leader destruction.
+Claims copy the public result under lifecycle ownership; usercopy and return
+never dereference a copied borrowed event pointer. Perf retains the physical
+subject separately from the returned local name.
+
+Registered waiters retain their selection view in appended Task metadata.
+Ordinary and no-child wakes use the same policy as initial claiming. Local-only
+group changes invalidate queue/group versions and wake obsolete selectors.
+Public claim/registration admission holds lifecycle then the exact namespace
+publication guard; the guard spans both actions and drops before lifecycle
+restores IRQs. Closed private admission reports EIDRM; an already admitted claim
+can still commit using its existing verified cookie. Default trusted physical
+claims remain available for controlled retirement. Private public wait bypasses
+WKI before any distributed-wait operation; Host remote behavior is unchanged.
+
+Six native fixtures exercise actual membership, producers, claims, event reuse,
+nowait/copy retry, reaping and registration/wake paths. They initialize real
+unpublished Tasks then mark them EXITING before producing events, without
+posting fabricated user Tasks to the scheduler. Cleanup drains through trusted
+physical claims and verifies Task/namespace references. Namespace-init closure
+notification and bounded descendant/zombie teardown remain subsequent work.
+Public compartment admission and scheduled service qualification stay pending.
+
+Checkpoint 10 Normal Build WOS, isolated fast diagnostic build, format-only check
+and 22 selected Host CTests pass. Actual KTEST16 passes 79,109 assertions with zero
+failures across 1,295 cases, including all 43 required compartment cases and normal
+poweroff. Four inactive private images (258,031,616 allocated bytes) were verified
+and pruned; disposable image use returned to zero. Small failed sandbox/cache/
+stale-source-oracle receipts are retained alongside the successful retries.
 
 ## Verification checkpoint
 

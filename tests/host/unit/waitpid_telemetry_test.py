@@ -45,9 +45,9 @@ sched_task::Task waiter, owner;
 bool have_waiter, have_owner, writable, valid_selector, copied, committed;
 bool recording, scope_enabled, registration, observed_nowait, drop_during_park;
 unsigned reads, correlations, summaries, cancels, claim_releases, commits, probes, parks, cpu;
-uint64_t now_us, park_advance, returned_pid;
+uint64_t now_us, park_advance, returned_pid, returned_visible_pid;
 std::optional<uint64_t> remote;
-enum class Mode { CLAIM, NONE, BLOCK } mode;
+enum class Mode { CLAIM, NONE, BLOCK, CLOSED } mode;
 namespace ker::mod::time { uint64_t get_us() { ++reads; return now_us; } }
 namespace ker::mod::cpu { unsigned current_cpu() { return ::cpu; } }
 namespace ker::mod::perf {
@@ -87,15 +87,19 @@ void preemptible_syscall_park(const char*, task::WaitChannelKind) {
 namespace events {
 constexpr int32_t OPTION_NOHANG = 1, OPTION_NOWAIT = 0x1000000;
 struct Selector {};
-struct ClaimedEvent { uint64_t subject_pid; };
-enum class ProbeResult { CLAIMED, WOULD_BLOCK, NO_CHILD };
+struct ClaimedEvent { uint64_t subject_pid, visible_pid; };
+enum class ProbeResult { CLAIMED, WOULD_BLOCK, NO_CHILD, CLOSED };
+enum class View { PHYSICAL, PUBLIC };
+int public_wait_selector(sched_task::Task&, int64_t, Selector&) { return valid_selector ? 0 : -EINVAL; }
 sched_task::Task* acquire_process_owner(sched_task::Task&) { return have_owner ? &owner : nullptr; }
 ProbeResult claim_or_register(sched_task::Task&, sched_task::Task&, Selector, int32_t,
-                              bool block, ClaimedEvent& claimed) {
+                              bool block, ClaimedEvent& claimed, View view) {
+    assert(view == View::PUBLIC);
     ++probes; registration = block;
     if (mode == Mode::NONE) return ProbeResult::NO_CHILD;
+    if (mode == Mode::CLOSED) return ProbeResult::CLOSED;
     if (mode == Mode::BLOCK && parks == 0) return ProbeResult::WOULD_BLOCK;
-    claimed.subject_pid = returned_pid; return ProbeResult::CLAIMED;
+    claimed.subject_pid = returned_pid; claimed.visible_pid = returned_visible_pid; return ProbeResult::CLAIMED;
 }
 void release_claim(sched_task::Task&, ClaimedEvent&) { ++claim_releases; }
 void cancel_wait(sched_task::Task&) { ++cancels; registration = false; }
@@ -107,7 +111,6 @@ bool outputs_writable(sched_task::Task&, int32_t*, uint64_t) { return writable; 
 std::optional<uint64_t> wait_remote(int64_t, sched_task::Task&, sched_task::Task&, int32_t*, int32_t, uint64_t) {
     return remote;
 }
-bool wait_selector(int64_t, sched_task::Task&, events::Selector&) { return valid_selector; }
 bool copy_outputs(sched_task::Task&, int32_t*, uint64_t, events::ClaimedEvent&) { return copied; }
 '''
 
@@ -118,7 +121,7 @@ void reset() {
     recording = scope_enabled = true;
     registration = observed_nowait = drop_during_park = false;
     reads = correlations = summaries = cancels = claim_releases = commits = probes = parks = 0;
-    cpu = 2; now_us = 100; park_advance = 250; returned_pid = 42;
+    cpu = 2; now_us = 100; park_advance = 250; returned_pid = returned_visible_pid = 42;
     remote.reset(); mode = Mode::CLAIM; perf::emitted.clear();
 }
 void check(int64_t expected, int32_t options = 0, bool span = true, uint32_t duration = 0) {
@@ -137,7 +140,7 @@ void check(int64_t expected, int32_t options = 0, bool span = true, uint32_t dur
     assert(end.status == (expected < 0 ? expected : 0) && end.aux == duration && end.cpu == cpu);
     if (expected > 0) {
         const auto& point = perf::emitted.at(1);
-        assert(point.phase == perf::WkiPerfPhase::POINT && point.pid == uint64_t(expected));
+        assert(point.phase == perf::WkiPerfPhase::POINT && point.pid == (remote ? uint64_t(expected) : returned_pid));
         assert(point.corr == end.corr && point.status == 0 && point.aux == 0 && point.cpu == cpu);
     }
 }
@@ -156,7 +159,10 @@ int main() {
     assert(commits == 1 && cancels == 1 && owner.releases == 1);
     reset(); check(42, events::OPTION_NOWAIT);
     assert(observed_nowait && commits == 1 && cancels == 1 && owner.releases == 1);
-    reset(); returned_pid = uint64_t{1} << 40; check(int64_t(returned_pid));
+    reset(); returned_pid = returned_visible_pid = uint64_t{1} << 40; check(int64_t(returned_pid));
+    reset(); returned_visible_pid = 2; check(2);
+    assert(perf::emitted.at(1).pid == 42 && owner.releases == 1 && cancels == 1);
+    reset(); mode = Mode::CLOSED; check(-EIDRM); assert(cancels == 1 && owner.releases == 1 && commits == 0);
     reset(); mode = Mode::NONE; check(-ECHILD); assert(cancels == 1 && owner.releases == 1);
     reset(); mode = Mode::BLOCK; check(0, events::OPTION_NOHANG);
     assert(parks == 0 && commits == 0 && cancels == 1 && owner.releases == 1);

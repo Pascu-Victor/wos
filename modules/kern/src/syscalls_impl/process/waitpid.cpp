@@ -2,7 +2,6 @@
 
 #include <cerrno>
 #include <cstdint>
-#include <limits>
 #include <net/wki/remote_compute.hpp>
 #include <net/wki/wki.hpp>
 #include <optional>
@@ -23,28 +22,6 @@ namespace {
 
 namespace sched_task = ker::mod::sched::task;
 namespace events = ker::syscall::process::child_events;
-
-[[nodiscard]] auto wait_selector(int64_t pid, sched_task::Task& owner, events::Selector& selector) -> bool {
-    if (pid > 0) {
-        selector = static_cast<uint64_t>(pid);
-        return true;
-    }
-    if (pid == -1) {
-        selector = events::SELECT_ANY;
-        return true;
-    }
-    if (pid == 0) {
-        selector = events::selector_for_current_process_group(owner);
-        return selector.value != 0;
-    }
-    if (pid == std::numeric_limits<int64_t>::min()) {
-        return false;
-    }
-    uint64_t const GROUP = static_cast<uint64_t>(-pid);
-    if (events::selector_for_process_group(GROUP).value == 0) return false;
-    selector = events::selector_for_process_group(owner, GROUP);
-    return true;
-}
 
 [[nodiscard]] auto outputs_writable(sched_task::Task& waiter, const int32_t* status, uint64_t rusage_vaddr) -> bool {
     if (status != nullptr && !ker::mod::sys::usercopy::ensure_writable(waiter, reinterpret_cast<uint64_t>(status), sizeof(*status))) {
@@ -86,6 +63,10 @@ namespace events = ker::syscall::process::child_events;
 // their own owner/waiter pins and contain values only at the syscall boundary.
 [[nodiscard]] auto wait_remote(int64_t pid, sched_task::Task& owner, sched_task::Task& waiter, int32_t* status, int32_t options,
                                uint64_t rusage_vaddr) -> std::optional<uint64_t> {
+    // Private public IDs cannot enter the physical distributed-wait protocol.
+    // Fail closed through local admission even for an unbound owner.
+    auto const* scope = owner.pid_namespace();
+    if (scope == nullptr || !scope->is_host()) return std::nullopt;
     using namespace ker::net::wki;
     uint64_t handle = 0;
     bool committing = false;
@@ -142,7 +123,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         return static_cast<uint64_t>(-ESRCH);
     }
     // A span follows this syscall continuation across park/resume. Its
-    // successful point names the returned child, with the same correlation as
+    // successful point names the physical child, with the same correlation as
     // the waiting parent's begin/end; no borrowed child pointer is retained.
     namespace perf = ker::mod::perf;
     constexpr auto OP = static_cast<uint8_t>(perf::WkiPerfLocalProcOp::WAITPID);
@@ -153,7 +134,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         perf::record_wki_event(static_cast<uint32_t>(ker::mod::cpu::current_cpu()), waiter->pid, perf::WkiPerfScope::LOCAL_PROC, OP,
                                perf::WkiPerfPhase::BEGIN, 0, 0, CORRELATION, 0, static_cast<uint32_t>(options), WOS_PERF_CALLSITE());
     }
-    auto finish_wait = [&](uint64_t result) -> uint64_t {
+    auto finish_wait = [&](uint64_t result, uint64_t physical_subject = 0) -> uint64_t {
         if (TRACE) {
             auto const SIGNED_RESULT = static_cast<int64_t>(result);
             int32_t const STATUS = SIGNED_RESULT < 0 ? static_cast<int32_t>(SIGNED_RESULT) : 0;
@@ -162,8 +143,8 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
             uint32_t const DURATION_US = ELAPSED_US > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(ELAPSED_US);
             auto const CPU = static_cast<uint32_t>(ker::mod::cpu::current_cpu());
             if (SIGNED_RESULT > 0) {
-                perf::record_wki_event(CPU, result, perf::WkiPerfScope::LOCAL_PROC, OP, perf::WkiPerfPhase::POINT, 0, 0, CORRELATION, 0, 0,
-                                       WOS_PERF_CALLSITE());
+                perf::record_wki_event(CPU, physical_subject != 0 ? physical_subject : result, perf::WkiPerfScope::LOCAL_PROC, OP,
+                                       perf::WkiPerfPhase::POINT, 0, 0, CORRELATION, 0, 0, WOS_PERF_CALLSITE());
             }
             perf::record_wki_event(CPU, waiter->pid, perf::WkiPerfScope::LOCAL_PROC, OP, perf::WkiPerfPhase::END, 0, 0, CORRELATION, STATUS,
                                    DURATION_US, WOS_PERF_CALLSITE());
@@ -185,16 +166,17 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         return finish_wait(*REMOTE);
     }
     events::Selector selector{};
-    if (!wait_selector(pid, *OWNER, selector)) {
+    int const SELECTOR_ERROR = events::public_wait_selector(*OWNER, pid, selector);
+    if (SELECTOR_ERROR != 0) {
         OWNER->release();
-        return finish_wait(static_cast<uint64_t>(-EINVAL));
+        return finish_wait(static_cast<uint64_t>(SELECTOR_ERROR));
     }
 
     bool const NOHANG = (options & events::OPTION_NOHANG) != 0;
     bool const NOWAIT = (options & events::OPTION_NOWAIT) != 0;
     for (;;) {
         events::ClaimedEvent claimed{};
-        auto const PROBE = events::claim_or_register(*OWNER, *waiter, selector, options, !NOHANG, claimed);
+        auto const PROBE = events::claim_or_register(*OWNER, *waiter, selector, options, !NOHANG, claimed, events::View::PUBLIC);
         if (PROBE == events::ProbeResult::CLAIMED) {
             if (!copy_outputs(*waiter, status, rusage_vaddr, claimed)) {
                 events::release_claim(*waiter, claimed);
@@ -209,12 +191,12 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
             }
             events::cancel_wait(*waiter);
             OWNER->release();
-            return finish_wait(claimed.subject_pid);
+            return finish_wait(claimed.visible_pid, claimed.subject_pid);
         }
-        if (PROBE == events::ProbeResult::NO_CHILD) {
+        if (PROBE == events::ProbeResult::NO_CHILD || PROBE == events::ProbeResult::CLOSED) {
             events::cancel_wait(*waiter);
             OWNER->release();
-            return finish_wait(static_cast<uint64_t>(-ECHILD));
+            return finish_wait(static_cast<uint64_t>(PROBE == events::ProbeResult::CLOSED ? -EIDRM : -ECHILD));
         }
         if (NOHANG) {
             events::cancel_wait(*waiter);

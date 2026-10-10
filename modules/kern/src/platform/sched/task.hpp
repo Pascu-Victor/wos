@@ -181,6 +181,8 @@ struct ChildWaitSelector {
     constexpr auto operator==(const ChildWaitSelector&) const -> bool = default;
 };
 
+enum class ChildWaitView : uint8_t { PHYSICAL, PUBLIC };
+
 struct ChildEvent;
 
 // Stable intrusive claim storage. External users must retain this record until
@@ -1378,6 +1380,20 @@ struct Task {
         if (source.retain(m_mount_namespace) != 0) return false;
         m_mount_namespace_initialized = true;
         return true;
+    }
+
+    // Lifecycle-protected, appended so embedded event/selector layouts and
+    // all preceding Task offsets stay unchanged. Event slots retain names
+    // frozen at publication, independently of subsequent group changes.
+    ChildWaitView child_wait_view{ChildWaitView::PHYSICAL};
+    std::array<uint64_t, 5> child_event_local_groups{};
+    [[nodiscard]] auto local_group_slot(const ChildEvent& event) -> uint64_t* {
+        std::array<const ChildEvent*, 5> const EVENTS{&child_parent_exit_event, &child_tracer_exit_event, &child_job_stop_event,
+                                                      &child_continued_event, &child_ptrace_stop_event};
+        for (size_t i = 0; i < EVENTS.size(); ++i) {
+            if (EVENTS[i] == &event) return &child_event_local_groups[i];
+        }
+        return nullptr;
     }
 };
 

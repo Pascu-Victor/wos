@@ -4,6 +4,7 @@
 #include <cstring>
 #include <dev/pty.hpp>
 #include <initializer_list>
+#include <limits>
 #include <memory>
 #include <platform/loader/elf_loader.hpp>
 #include <platform/mm/addr.hpp>
@@ -193,6 +194,39 @@ struct PublicationRollback {
     Task& child;
     ~PublicationRollback() { child_events::abort_publication(child); }
 };
+struct WaitMembership {
+    Task& parent;
+    Task& child;
+    ~WaitMembership() {
+        child_events::cancel_wait(parent);
+        child_events::cancel_wait(child);
+        child_events::detach_tracer(child);
+        child_events::abort_publication(child);
+        if (child.child_parent == &parent) {
+            KEXPECT_TRUE(child_events::publish_exit(child));
+            child_events::Claim claim;
+            child_events::ClaimedEvent event;
+            if (child_events::try_claim(parent, claim, child.pid, 0, event) == child_events::ProbeResult::CLAIMED)
+                KEXPECT_TRUE(child_events::commit_claim(parent, claim, event, false));
+            child_events::cancel_claim(claim);
+        }
+        KEXPECT_NULL(child.child_parent);
+        KEXPECT_NULL(child.child_tracer);
+        KEXPECT_EQ(child.child_membership_state.load(), sched::task::ChildMembershipState::UNLINKED);
+    }
+    auto publish() -> bool { return child_events::begin_publication(parent, child) && child_events::commit_publication(child); }
+};
+struct WaitClaim {
+    child_events::Claim value;
+    ~WaitClaim() { child_events::cancel_claim(value); }
+};
+struct WaitRegistration {
+    Task& waiter;
+    ~WaitRegistration() { child_events::cancel_wait(waiter); }
+};
+void make_wait_fixtures_inert(std::initializer_list<Task*> tasks) {
+    for (auto* task : tasks) task->state.store(sched::task::TaskState::EXITING);
+}
 void expect_visible(const Task& requester, uint64_t id, Task* expected, bool lifetime = false) {
     auto* found =
         lifetime ? sched::find_task_by_visible_pid_lifetime_ref(requester, id) : sched::find_task_by_visible_pid_safe(requester, id);
@@ -200,6 +234,268 @@ void expect_visible(const Task& requester, uint64_t id, Task* expected, bool lif
     if (found != nullptr) found->release();
 }
 }  // namespace
+
+KTEST(CompartmentWait, SameNumbersAndForeignMembershipNeverAuthorizePublicWait) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef a, b;
+        KREQUIRE_EQ(pid_ns::create_namespace(a), 0);
+        KREQUIRE_EQ(pid_ns::create_namespace(b), 0);
+        RegistryTask parent, sibling, child, foreign;
+        KREQUIRE_TRUE(parent.task->initialize_pid_namespace(a));
+        KREQUIRE_TRUE(sibling.task->initialize_pid_namespace(b));
+        KREQUIRE_TRUE(child.task->initialize_pid_namespace(a));
+        KREQUIRE_TRUE(foreign.task->initialize_pid_namespace(b));
+        KEXPECT_EQ(child.task->namespace_tid(), foreign.task->namespace_tid());
+        make_wait_fixtures_inert({parent.task.get(), sibling.task.get(), child.task.get(), foreign.task.get()});
+        WaitMembership own{*parent.task, *child.task}, other{*parent.task, *foreign.task};
+        KREQUIRE_TRUE(own.publish());
+        KREQUIRE_TRUE(other.publish());
+        child.task->exit_status = 0x2300;
+        foreign.task->exit_status = 0x4500;
+        KREQUIRE_TRUE(child_events::publish_exit(*foreign.task));
+        KREQUIRE_TRUE(child_events::publish_exit(*child.task));
+        WaitClaim claim;
+        child_events::ClaimedEvent event;
+        using child_events::ProbeResult;
+        using child_events::View;
+        KEXPECT_EQ(child_events::try_claim(*sibling.task, claim.value, 2, 0, event, View::PUBLIC), ProbeResult::NO_CHILD);
+        KEXPECT_EQ(child_events::try_claim(*parent.task, claim.value, foreign.task->pid, 0, event, View::PUBLIC), ProbeResult::NO_CHILD);
+        KREQUIRE_EQ(child_events::try_claim(*parent.task, claim.value, 2, 0, event, View::PUBLIC), ProbeResult::CLAIMED);
+        KEXPECT_EQ(event.subject_pid, child.task->pid);
+        KEXPECT_EQ(event.visible_pid, uint64_t{2});
+        KEXPECT_EQ(event.status, int32_t{0x2300});
+        KREQUIRE_TRUE(child_events::commit_claim(*parent.task, claim.value, event, false));
+        KEXPECT_EQ(child_events::try_claim(*parent.task, claim.value, child_events::SELECT_ANY, 0, event, View::PUBLIC),
+                   ProbeResult::NO_CHILD);
+        // Trusted physical consumers retain their existing contract.
+        KREQUIRE_EQ(child_events::try_claim(*parent.task, claim.value, foreign.task->pid, 0, event), ProbeResult::CLAIMED);
+        KEXPECT_EQ(event.visible_pid, foreign.task->pid);
+        KEXPECT_EQ(event.status, int32_t{0x4500});
+        KREQUIRE_TRUE(child_events::commit_claim(*parent.task, claim.value, event, false));
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentWait, FrozenEventGroupsSurviveMutationAndLeaderDestruction) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        RegistryTask parent, child;
+        auto leader = std::make_unique<RegistryTask>();
+        KREQUIRE_TRUE(parent.task->initialize_pid_namespace(scope));
+        KREQUIRE_TRUE(leader->task->initialize_pid_namespace(scope));
+        auto const INHERITED = parent.task->job_identity_snapshot();
+        leader->task->initialize_job_identity(INHERITED.internal, INHERITED.visible);
+        KREQUIRE_EQ(session::create(*leader->task), int64_t{2});
+        KREQUIRE_TRUE(child.task->initialize_pid_namespace(scope));
+        auto const JOB = leader->task->job_identity_snapshot();
+        child.task->initialize_job_identity(JOB.internal, JOB.visible);
+        uint64_t const LEADER_PID = leader->task->pid;
+        make_wait_fixtures_inert({parent.task.get(), child.task.get(), leader->task.get()});
+        WaitMembership membership{*parent.task, *child.task};
+        KREQUIRE_TRUE(membership.publish());
+        KREQUIRE_TRUE(child_events::publish_job_control_stop(*child.task, 19));
+        auto job = JOB.internal;
+        job.pgid = child.task->pid;
+        KREQUIRE_TRUE(child_events::update_job_identity(*child.task, job, session::Names{2, 3}));
+        leader.reset();
+        child_events::Selector old_group;
+        KREQUIRE_EQ(child_events::public_wait_selector(*parent.task, -2, old_group), 0);
+        WaitClaim claim;
+        child_events::ClaimedEvent stopped, continued, exited;
+        using child_events::ProbeResult;
+        using child_events::View;
+        KREQUIRE_EQ(child_events::try_claim(*parent.task, claim.value, old_group, child_events::OPTION_STOPPED, stopped, View::PUBLIC),
+                    ProbeResult::CLAIMED);
+        KEXPECT_EQ(stopped.process_group, LEADER_PID);
+        KEXPECT_EQ(stopped.visible_pid, uint64_t{3});
+        KREQUIRE_TRUE(child_events::commit_claim(*parent.task, claim.value, stopped, false));
+        KREQUIRE_TRUE(child_events::publish_continued(*child.task));
+        job.pgid = LEADER_PID;
+        KREQUIRE_TRUE(child_events::update_job_identity(*child.task, job, session::Names{2, 2}));
+        child_events::Selector moved_group;
+        KREQUIRE_EQ(child_events::public_wait_selector(*parent.task, -3, moved_group), 0);
+        KREQUIRE_EQ(
+            child_events::try_claim(*parent.task, claim.value, moved_group, child_events::OPTION_CONTINUED, continued, View::PUBLIC),
+            ProbeResult::CLAIMED);
+        KEXPECT_EQ(continued.process_group, child.task->pid);
+        KEXPECT_EQ(continued.status, int32_t{0xffff});
+        KREQUIRE_TRUE(child_events::commit_claim(*parent.task, claim.value, continued, false));
+        KREQUIRE_TRUE(child_events::publish_exit(*child.task));
+        job.pgid = child.task->pid;
+        KREQUIRE_TRUE(child_events::update_job_identity(*child.task, job, session::Names{2, 3}));
+        KREQUIRE_EQ(child_events::try_claim(*parent.task, claim.value, old_group, 0, exited, View::PUBLIC), ProbeResult::CLAIMED);
+        KEXPECT_EQ(exited.process_group, LEADER_PID);
+        KEXPECT_EQ(exited.visible_pid, uint64_t{3});
+        KREQUIRE_TRUE(child_events::commit_claim(*parent.task, claim.value, exited, false));
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentWait, PublicClaimsPreserveNowaitCompetitionAndReissuedTokens) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        RegistryTask parent, child;
+        KREQUIRE_TRUE(parent.task->initialize_pid_namespace(scope));
+        KREQUIRE_TRUE(child.task->initialize_pid_namespace(scope));
+        make_wait_fixtures_inert({parent.task.get(), child.task.get()});
+        WaitMembership membership{*parent.task, *child.task};
+        KREQUIRE_TRUE(membership.publish());
+        WaitClaim first, second;
+        child_events::ClaimedEvent old, competing, retry;
+        using child_events::ProbeResult;
+        using child_events::View;
+        KREQUIRE_TRUE(child_events::publish_job_control_stop(*child.task, 19));
+        KREQUIRE_EQ(child_events::try_claim(*parent.task, first.value, 2, child_events::OPTION_STOPPED, old, View::PUBLIC),
+                    ProbeResult::CLAIMED);
+        KEXPECT_EQ(child_events::try_claim(*parent.task, second.value, 2, child_events::OPTION_STOPPED, competing, View::PUBLIC),
+                   ProbeResult::WOULD_BLOCK);
+        KREQUIRE_TRUE(child_events::commit_claim(*parent.task, first.value, old, true));
+        KREQUIRE_EQ(child_events::try_claim(*parent.task, second.value, 2, child_events::OPTION_STOPPED, retry, View::PUBLIC),
+                    ProbeResult::CLAIMED);
+        KEXPECT_EQ(retry.visible_pid, old.visible_pid);
+        KEXPECT_NE(retry.claim_cookie, old.claim_cookie);
+        child_events::release_claim(second.value, retry);  // Failed copyout retry.
+        KREQUIRE_EQ(child_events::try_claim(*parent.task, first.value, 2, child_events::OPTION_STOPPED, retry, View::PUBLIC),
+                    ProbeResult::CLAIMED);
+        KREQUIRE_TRUE(child_events::commit_claim(*parent.task, first.value, retry, false));
+        KREQUIRE_TRUE(child_events::publish_job_control_stop(*child.task, 20));
+        KREQUIRE_EQ(child_events::try_claim(*parent.task, first.value, 2, child_events::OPTION_STOPPED, retry, View::PUBLIC),
+                    ProbeResult::CLAIMED);
+        KEXPECT_TRUE(old.node == retry.node);
+        child_events::release_claim(first.value, old);
+        KEXPECT_TRUE(first.value.event == retry.node);
+        KEXPECT_FALSE(child_events::commit_claim(*parent.task, first.value, old, false));
+        KREQUIRE_TRUE(child_events::commit_claim(*parent.task, first.value, retry, false));
+        KEXPECT_EQ(old.visible_pid, uint64_t{2});  // Copied values outlive node reuse.
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentWait, RegistrationUsesPublicViewForEventsAndGroupInvalidation) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        RegistryTask parent, child, waiter, group_waiter;
+        KREQUIRE_TRUE(parent.task->initialize_pid_namespace(scope));
+        KREQUIRE_TRUE(child.task->initialize_pid_namespace(scope));
+        make_wait_fixtures_inert({parent.task.get(), child.task.get(), waiter.task.get(), group_waiter.task.get()});
+        WaitMembership membership{*parent.task, *child.task};
+        KREQUIRE_TRUE(membership.publish());
+        WaitRegistration registration{*waiter.task}, group_registration{*group_waiter.task};
+        child_events::ClaimedEvent event;
+        using child_events::ProbeResult;
+        using child_events::View;
+        auto const GROUP = child_events::selector_for_process_group(2);
+        KREQUIRE_EQ(child_events::claim_or_register(*parent.task, *waiter.task, 2, child_events::OPTION_STOPPED, true, event, View::PUBLIC),
+                    ProbeResult::WOULD_BLOCK);
+        KEXPECT_FALSE(waiter.task->child_wait_registration.notified);
+        KREQUIRE_TRUE(child_events::publish_job_control_stop(*child.task, 19));
+        KEXPECT_TRUE(waiter.task->child_wait_registration.notified);
+        KREQUIRE_EQ(
+            child_events::claim_or_register(*parent.task, *waiter.task, 2, child_events::OPTION_STOPPED, false, event, View::PUBLIC),
+            ProbeResult::CLAIMED);
+        KREQUIRE_TRUE(child_events::commit_claim(*parent.task, *waiter.task, event, false));
+        KREQUIRE_EQ(child_events::claim_or_register(*parent.task, *group_waiter.task, GROUP, 0, true, event, View::PUBLIC),
+                    ProbeResult::WOULD_BLOCK);
+        auto job = child.task->job_identity_snapshot();
+        auto const BEFORE = child_events::inspect_queue(*parent.task, child.task->pid, 0).version;
+        // Only the local name changes. Versioning and no-child wake must still
+        // observe the mutation, while physical WKI selectors stay identical.
+        job.visible.pgid = 7;
+        KREQUIRE_TRUE(child_events::update_job_identity(*child.task, job.internal, job.visible));
+        KEXPECT_TRUE(group_waiter.task->child_wait_registration.notified);
+        KEXPECT_EQ(child_events::validate_queue_version(*parent.task, BEFORE), child_events::QueueVersionStatus::STALE);
+        KEXPECT_EQ(child_events::claim_or_register(*parent.task, *group_waiter.task, GROUP, 0, false, event, View::PUBLIC),
+                   ProbeResult::NO_CHILD);
+        KEXPECT_EQ(group_waiter.task->state.load(), sched::task::TaskState::EXITING);
+        scope.close();
+        KEXPECT_EQ(child_events::claim_or_register(*parent.task, *waiter.task, 2, 0, true, event, View::PUBLIC), ProbeResult::CLOSED);
+        KEXPECT_FALSE(waiter.task->child_wait_registration.registered);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentWait, HostSupervisionAndClosedAdmissionPreserveExistingClaims) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        RegistryTask host, init, child;
+        KREQUIRE_TRUE(init.task->initialize_pid_namespace(scope));
+        KREQUIRE_TRUE(child.task->initialize_pid_namespace(scope));
+        make_wait_fixtures_inert({host.task.get(), init.task.get(), child.task.get()});
+        WaitMembership host_membership{*host.task, *init.task}, child_membership{*init.task, *child.task};
+        KREQUIRE_TRUE(host_membership.publish());
+        KREQUIRE_TRUE(child_membership.publish());
+        KEXPECT_EQ(child_events::namespace_parent_pid(*init.task), uint64_t{0});
+        KREQUIRE_TRUE(child_events::publish_exit(*child.task));
+        KREQUIRE_TRUE(child_events::publish_exit(*init.task));
+        WaitClaim host_claim, claim, rejected;
+        child_events::ClaimedEvent host_event, event, empty;
+        using child_events::ProbeResult;
+        using child_events::View;
+        KREQUIRE_EQ(child_events::try_claim(*host.task, host_claim.value, init.task->pid, 0, host_event, View::PUBLIC),
+                    ProbeResult::CLAIMED);
+        KEXPECT_EQ(host_event.visible_pid, init.task->pid);
+        KREQUIRE_EQ(child_events::try_claim(*init.task, claim.value, 2, 0, event, View::PUBLIC), ProbeResult::CLAIMED);
+        scope.close();
+        child_events::Selector preserved{123};
+        KEXPECT_EQ(child_events::public_wait_selector(*init.task, -1, preserved), -EIDRM);
+        KEXPECT_EQ(preserved.value, uint64_t{123});
+        KEXPECT_EQ(child_events::try_claim(*init.task, rejected.value, 2, 0, empty, View::PUBLIC), ProbeResult::CLOSED);
+        KEXPECT_NULL(empty.node);
+        KREQUIRE_TRUE(child_events::commit_claim(*init.task, claim.value, event, false));
+        KREQUIRE_TRUE(child_events::commit_claim(*host.task, host_claim.value, host_event, false));
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentWait, TracedThreadsAndPublicSelectorsUseExactRetainedScope) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef scope, other;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        KREQUIRE_EQ(pid_ns::create_namespace(other), 0);
+        RegistryTask tracer, owner, thread, foreign, unbound, host;
+        KREQUIRE_TRUE(tracer.task->initialize_pid_namespace(scope));
+        KREQUIRE_TRUE(owner.task->initialize_pid_namespace(scope));
+        KREQUIRE_TRUE(foreign.task->initialize_pid_namespace(other));
+        thread.task->is_thread = true;
+        thread.task->owner_pid = owner.task->pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(*thread.task, *owner.task));
+        unbound.task->is_thread = true;
+        make_wait_fixtures_inert(
+            {tracer.task.get(), owner.task.get(), thread.task.get(), foreign.task.get(), unbound.task.get(), host.task.get()});
+        WaitMembership cleanup{*tracer.task, *thread.task};
+        KREQUIRE_TRUE(child_events::attach_tracer(*thread.task, *tracer.task));
+        KREQUIRE_TRUE(child_events::publish_ptrace_stop(*thread.task, 0x137f));
+        WaitClaim claim;
+        child_events::ClaimedEvent event;
+        using child_events::ProbeResult;
+        using child_events::View;
+        KEXPECT_EQ(child_events::try_claim(*foreign.task, claim.value, 3, 0, event, View::PUBLIC), ProbeResult::NO_CHILD);
+        KREQUIRE_EQ(child_events::try_claim(*tracer.task, claim.value, 3, 0, event, View::PUBLIC), ProbeResult::CLAIMED);
+        KEXPECT_EQ(event.subject_pid, thread.task->pid);
+        KEXPECT_EQ(event.visible_pid, uint64_t{3});
+        KREQUIRE_TRUE(child_events::commit_claim(*tracer.task, claim.value, event, false));
+        child_events::Selector selector{123};
+        KEXPECT_EQ(child_events::public_wait_selector(*unbound.task, -1, selector), -ESRCH);
+        KEXPECT_EQ(selector.value, uint64_t{123});
+        KEXPECT_EQ(child_events::public_wait_selector(*tracer.task, std::numeric_limits<int64_t>::min(), selector), -EINVAL);
+        KEXPECT_EQ(selector.value, uint64_t{123});
+        KREQUIRE_EQ(child_events::public_wait_selector(*tracer.task, 0, selector), 0);
+        KEXPECT_EQ(selector.value, child_events::selector_for_process_group(1).value);
+        KREQUIRE_EQ(child_events::public_wait_selector(*host.task, 0, selector), 0);
+        KEXPECT_EQ(selector.value, child_events::selector_for_process_group(host.task->pid).value);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
 
 KTEST(CompartmentIdentity, CanonicalSelfAndParentNamesUseRetainedMembership) {
     auto const BASELINE = pid_ns::live_namespace_count();

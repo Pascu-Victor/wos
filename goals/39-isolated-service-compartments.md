@@ -247,8 +247,31 @@ all37 required compartment cases and normal poweroff. Four inactive disposable
 images257,703,936 allocated bytes were audited/pruned, leaving zero disposable
 usage. This is native creation consumer evidence, not scheduled service proof.
 
+Public wait now selects exact local PID/TID and event-time group names. Queue
+subjects retain their scope and names; foreign same-number memberships cannot
+supply a public result. Waiter registrations carry the same public/physical view
+through ordinary and no-child wakes; local-only group changes version queues.
+Closed private claim/registration admission reports EIDRM while existing claims
+can finish. Host supervision and trusted/WKI physical selection stay intact.
+Private public wait bypasses WKI before distributed effects; returned local
+values are copied separately from physical perf correlation. Embedded event/
+selector/registration layouts and preceding Task offsets are unchanged.
+
+Checkpoint 10 Normal Build WOS, isolated fast diagnostic build, format-only check,
+six wait/usercopy, nine scheduler/resource/libc and seven VFS/libc CTests pass.
+The first normal packaging attempt hit sandbox socket-bind restrictions; the
+outside-sandbox retry passed. The combined formatter/tidy run hit a read-only
+cache path; format-only apply/check passed. The stale TCB usercopy source oracle
+was reproduced at the parent commit and updated for the moved helper; failed
+receipts remain. Actual KTEST16 passes 79,109 assertions/0 failures/1,295 cases,
+all 43 required compartment cases and normal poweroff. Six new fixtures exercise
+real event producers/claims/reaping and public-view wakes without posting fake
+runnable Tasks. Four inactive disposable images (258,031,616 allocated bytes) were
+audited/pruned, leaving zero disposable usage. This qualifies native wait
+adapters, not scheduled service syscalls or complete init closure/drain.
+
 Public compartment admission, remaining root/procfs/positive PID consumers,
-signal/wait/ptrace translation, namespace-init lifecycle policy,
+signal/ptrace translation, namespace-init lifecycle policy,
 complete network/WKI gates, launcher and required service campaigns remain
 pending. All ten full acceptance criteria remain outstanding. Prior focused host ASan/UBSan cases are foundation evidence, not
 full service qualification. See progress/39/{ledger,evidence,reconnaissance,

@@ -143,8 +143,9 @@ def test_lifecycle_lock_owns_snapshot_queue_and_claims() -> None:
             "std::atomic<uint64_t> g_event_sequence{1}",
             "std::atomic<uint64_t> g_claim_cookie{1}",
             "queue_insert_locked(owner, event)",
-            "event.process_group = GROUP.pgid",
-            "event.group_origin = GROUP.group_origin",
+            "event.process_group = JOB.internal.pgid",
+            "event.group_origin = JOB.internal.pgid",
+            "*local_group = JOB.visible.pgid",
             "event.user_time_us = sched_task::task_rusage_user_time_us(subject)",
             "event.system_time_us = sched_task::task_rusage_system_time_us(subject)",
             "event.status = status",
@@ -229,7 +230,7 @@ def test_publication_and_reparenting_are_explicit_transactions() -> None:
 def test_waitpid_is_a_current_context_claim_usercopy_commit_loop() -> None:
     source = WAITPID_CPP.read_text()
     header = WAITPID_HPP.read_text()
-    selector = function_body(source, "wait_selector")
+    selector = function_body(CHILD_EVENTS_CPP.read_text(), "public_wait_selector")
     syscall = function_body(source, "wos_proc_waitpid")
     copy = function_body(source, "copy_outputs")
     lifecycle = CHILD_EVENTS_CPP.read_text()
@@ -247,7 +248,7 @@ def test_waitpid_is_a_current_context_claim_usercopy_commit_loop() -> None:
         [
             "pid > 0",
             "pid == -1",
-            "events::SELECT_ANY",
+            "SELECT_ANY",
             "pid == 0",
             "selector_for_current_process_group(owner)",
             "std::numeric_limits<int64_t>::min()",
@@ -261,7 +262,7 @@ def test_waitpid_is_a_current_context_claim_usercopy_commit_loop() -> None:
             "events::acquire_process_owner(*waiter)",
             "events::OPTION_NOHANG",
             "events::OPTION_NOWAIT",
-            "events::claim_or_register(*OWNER, *waiter, selector, options, !NOHANG, claimed)",
+            "events::claim_or_register(*OWNER, *waiter, selector, options, !NOHANG, claimed, events::View::PUBLIC)",
             "events::ProbeResult::CLAIMED",
             "events::release_claim(*waiter, claimed)",
             "events::commit_claim(*OWNER, *waiter, claimed, NOWAIT)",

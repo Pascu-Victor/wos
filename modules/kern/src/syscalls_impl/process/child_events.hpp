@@ -10,6 +10,7 @@ namespace ker::syscall::process::child_events {
 namespace sched_task = ker::mod::sched::task;
 using Selector = sched_task::ChildWaitSelector;
 using Claim = sched_task::ChildEventClaim;
+using View = sched_task::ChildWaitView;
 
 constexpr uint64_t SELECT_ANY = UINT64_MAX;
 constexpr uint64_t SELECT_PROCESS_GROUP = 1ULL << 63U;
@@ -34,6 +35,8 @@ struct ClaimedEvent {
     int32_t status{};
     sched_task::ChildEventKind kind{sched_task::ChildEventKind::EXIT};
     sched_task::ChildEventAudience audience{sched_task::ChildEventAudience::PARENT};
+    // Value snapshot for public copyout/return; physical fields remain intact.
+    uint64_t visible_pid{};
 };
 
 struct ReapedCpuTimes {
@@ -62,6 +65,7 @@ enum class ProbeResult : uint8_t {
     CLAIMED,
     WOULD_BLOCK,
     NO_CHILD,
+    CLOSED,
 };
 
 // Positive-PID reports use the child's PID namespace, never its process group
@@ -137,6 +141,9 @@ struct ConditionalProbe {
 // Caller retains task; its canonical owner is retained by thread binding.
 // Snapshot parent membership under lifecycle, without a numeric registry lookup.
 [[nodiscard]] auto namespace_parent_pid(const sched_task::Task& task) -> uint64_t;
+// Public wait argument translation. Errors preserve out; private names never
+// consult the global registry or remote group-origin resolution.
+[[nodiscard]] auto public_wait_selector(sched_task::Task& owner, int64_t pid, Selector& out) -> int;
 
 [[nodiscard]] auto selector_for_process_group(uint64_t process_group, ker::mod::sched::session::Origin origin = {}) -> Selector;
 // Resolve numeric aliases only within the owner's child/tracer authority.
@@ -188,8 +195,8 @@ void cancel_wait(sched_task::Task& waiter);
 // storage through commit/release/cancel; never destroy or reuse an active record.
 // A busy record returns WOULD_BLOCK without changing its existing claim. No
 // sleeping waiter is registered, and no authority is inferred from the executor.
-[[nodiscard]] auto try_claim(sched_task::Task& owner, Claim& claim, Selector selector, int32_t options, ClaimedEvent& claimed)
-    -> ProbeResult;
+[[nodiscard]] auto try_claim(sched_task::Task& owner, Claim& claim, Selector selector, int32_t options, ClaimedEvent& claimed,
+                             View view = View::PHYSICAL) -> ProbeResult;
 void cancel_claim(Claim& claim);
 void release_claim(Claim& claim, const ClaimedEvent& claimed);
 [[nodiscard]] auto commit_claim(sched_task::Task& owner, Claim& claim, const ClaimedEvent& claimed, bool keep_event) -> bool;
@@ -197,7 +204,7 @@ void release_claim(Claim& claim, const ClaimedEvent& claimed);
 // Atomic event claim / waiter registration.  The event remains queued and
 // retryable until commit_claim; usercopy must occur between these calls.
 [[nodiscard]] auto claim_or_register(sched_task::Task& owner, sched_task::Task& waiter, Selector selector, int32_t options,
-                                     bool register_if_empty, ClaimedEvent& claimed) -> ProbeResult;
+                                     bool register_if_empty, ClaimedEvent& claimed, View view = View::PHYSICAL) -> ProbeResult;
 void release_claim(sched_task::Task& waiter, const ClaimedEvent& claimed);
 [[nodiscard]] auto commit_claim(sched_task::Task& owner, sched_task::Task& waiter, const ClaimedEvent& claimed, bool keep_event) -> bool;
 

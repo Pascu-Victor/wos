@@ -1,7 +1,9 @@
 #include "child_events.hpp"
 
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <net/wki/wire.hpp>
 #include <optional>
@@ -151,7 +153,8 @@ void publish_subject_claim_locked(ChildEvent& event) {
 
 [[nodiscard]] auto enqueue_event_locked(Task& owner, Task& subject, ChildEvent& event, ChildEventKind kind, ChildEventAudience audience,
                                         int32_t status) -> bool {
-    if (event.queued) {
+    auto* local_group = subject.local_group_slot(event);
+    if (event.queued || local_group == nullptr) {
         return false;
     }
     if (!take_lifetime_ref(&owner)) {
@@ -168,9 +171,10 @@ void publish_subject_claim_locked(ChildEvent& event) {
     event.sequence = g_event_sequence.fetch_add(1, std::memory_order_relaxed);
     event.claim_cookie = 0;
     event.subject_pid = subject.pid;
-    auto const GROUP = effective_group_identity(subject);
-    event.process_group = GROUP.pgid;
-    event.group_origin = GROUP.group_origin;
+    auto const JOB = subject.job_identity_snapshot();
+    event.process_group = JOB.internal.pgid != 0 ? JOB.internal.pgid : sched_task::process_pid(subject);
+    event.group_origin = JOB.internal.pgid != 0 ? JOB.internal.group_origin : ker::mod::sched::session::Origin{};
+    *local_group = JOB.visible.pgid;
     event.user_time_us = sched_task::task_rusage_user_time_us(subject);
     event.system_time_us = sched_task::task_rusage_system_time_us(subject);
     if (kind == ChildEventKind::EXIT && !subject.is_thread && subject.type == sched_task::TaskType::PROCESS) {
@@ -282,8 +286,26 @@ void remove_subject_events_locked(Task& owner, Task& subject, ChildEventAudience
     }
 }
 
-[[nodiscard]] auto event_matches(const ChildEvent& event, Selector selector, int32_t options) -> bool {
-    if (!selector_matches(selector, event.subject_pid, event.process_group, event.group_origin)) {
+[[nodiscard]] auto subject_matches(const Task& owner, const Task& subject, Selector selector, uint64_t process_group,
+                                   ker::mod::sched::session::Origin origin, View view, uint64_t local_group) -> bool {
+    if (view == View::PHYSICAL) return selector_matches(selector, subject.pid, process_group, origin);
+    auto const* scope = owner.pid_namespace();
+    if (scope == nullptr) return false;
+    if (scope->is_host()) return selector_matches(selector, subject.pid, process_group, origin);
+    if (scope->closed() || !sched_task::same_pid_namespace(owner, subject) || subject.namespace_tid() == 0) return false;
+    return selector_matches(selector, subject.namespace_tid(), local_group);
+}
+
+[[nodiscard]] auto event_matches(const Task& owner, const ChildEvent& event, Selector selector, int32_t options, View view = View::PHYSICAL)
+    -> bool {
+    auto const* scope = owner.pid_namespace();
+    bool const PHYSICAL = view == View::PHYSICAL || (scope != nullptr && scope->is_host());
+    auto* local_group = event.subject != nullptr ? event.subject->local_group_slot(event) : nullptr;
+    bool const MATCH =
+        PHYSICAL ? selector_matches(selector, event.subject_pid, event.process_group, event.group_origin)
+                 : event.subject != nullptr && local_group != nullptr &&
+                       subject_matches(owner, *event.subject, selector, event.process_group, event.group_origin, view, *local_group);
+    if (!MATCH) {
         return false;
     }
     switch (event.kind) {
@@ -298,10 +320,10 @@ void remove_subject_events_locked(Task& owner, Task& subject, ChildEventAudience
     return false;
 }
 
-[[nodiscard]] auto first_matching_event_locked(Task& owner, Selector selector, int32_t options) -> ChildEvent* {
+[[nodiscard]] auto first_matching_event_locked(Task& owner, Selector selector, int32_t options, View view = View::PHYSICAL) -> ChildEvent* {
     ChildEvent* event = owner.child_event_head;
     while (event != nullptr) {
-        if (event->claimed_by == nullptr && event_matches(*event, selector, options)) {
+        if (event->claimed_by == nullptr && event_matches(owner, *event, selector, options, view)) {
             // Serialize every status for one subject, not merely one event
             // node.  Otherwise a waiter that ignores an older stop can claim
             // the later exit while a WUNTRACED waiter concurrently claims the
@@ -315,25 +337,29 @@ void remove_subject_events_locked(Task& owner, Task& subject, ChildEventAudience
     return nullptr;
 }
 
-[[nodiscard]] auto has_potential_subject_locked(Task& owner, Selector selector) -> bool {
+[[nodiscard]] auto has_potential_subject_locked(Task& owner, Selector selector, View view = View::PHYSICAL) -> bool {
     // Claimed events remain potential children for competing waiters.  They
     // must observe WOULD_BLOCK, not ECHILD, until the single winner commits or
     // releases the claim.
     for (ChildEvent* event = owner.child_event_head; event != nullptr; event = event->next) {
-        if (selector_matches(selector, event->subject_pid, event->process_group, event->group_origin)) {
+        if (event_matches(owner, *event, selector, OPTION_STOPPED | OPTION_CONTINUED, view)) {
             return true;
         }
     }
     for (Task* child = owner.child_list_head; child != nullptr; child = child->child_sibling_next) {
-        auto const GROUP = effective_group_identity(*child);
+        auto const JOB = child->job_identity_snapshot();
+        uint64_t const GROUP = JOB.internal.pgid != 0 ? JOB.internal.pgid : sched_task::process_pid(*child);
+        auto const ORIGIN = JOB.internal.pgid != 0 ? JOB.internal.group_origin : ker::mod::sched::session::Origin{};
         if (child->child_membership_state.load(std::memory_order_relaxed) != ChildMembershipState::UNLINKED &&
-            selector_matches(selector, child->pid, GROUP.pgid, GROUP.group_origin)) {
+            subject_matches(owner, *child, selector, GROUP, ORIGIN, view, JOB.visible.pgid)) {
             return true;
         }
     }
     for (Task* tracee = owner.child_tracee_head; tracee != nullptr; tracee = tracee->child_tracee_next) {
-        auto const GROUP = effective_group_identity(*tracee);
-        if (selector_matches(selector, tracee->pid, GROUP.pgid, GROUP.group_origin)) {
+        auto const JOB = tracee->job_identity_snapshot();
+        uint64_t const GROUP = JOB.internal.pgid != 0 ? JOB.internal.pgid : sched_task::process_pid(*tracee);
+        auto const ORIGIN = JOB.internal.pgid != 0 ? JOB.internal.group_origin : ker::mod::sched::session::Origin{};
+        if (subject_matches(owner, *tracee, selector, GROUP, ORIGIN, view, JOB.visible.pgid)) {
             return true;
         }
     }
@@ -390,11 +416,12 @@ void waiter_unlink_locked(ChildWaitRegistration& registration) {
     drop_lifetime_ref(OWNER);
 }
 
-[[nodiscard]] auto waiter_register_locked(Task& owner, Task& waiter, Selector selector, int32_t options) -> bool {
+[[nodiscard]] auto waiter_register_locked(Task& owner, Task& waiter, Selector selector, int32_t options, View view) -> bool {
     ChildWaitRegistration& registration = waiter.child_wait_registration;
     if (registration.registered && registration.queue_owner == &owner) {
         registration.selector = selector;
         registration.options = options;
+        waiter.child_wait_view = view;
         registration.notified = false;
         registration.generation = g_waiter_generation.fetch_add(1, std::memory_order_relaxed);
         return true;
@@ -413,6 +440,7 @@ void waiter_unlink_locked(ChildWaitRegistration& registration) {
     registration.selector = selector;
     registration.generation = g_waiter_generation.fetch_add(1, std::memory_order_relaxed);
     registration.options = options;
+    waiter.child_wait_view = view;
     registration.registered = true;
     registration.notified = false;
     owner.child_waiter_head = &registration;
@@ -423,7 +451,8 @@ void waiter_unlink_locked(ChildWaitRegistration& registration) {
     ChildWaitRegistration* registration = owner.child_waiter_head;
     while (registration != nullptr) {
         if (!registration->notified && registration->waiter != nullptr &&
-            first_matching_event_locked(owner, registration->selector, registration->options) != nullptr) {
+            first_matching_event_locked(owner, registration->selector, registration->options, registration->waiter->child_wait_view) !=
+                nullptr) {
             registration->notified = true;
             if (take_lifetime_ref(registration->waiter)) {
                 return registration->waiter;
@@ -437,7 +466,8 @@ void waiter_unlink_locked(ChildWaitRegistration& registration) {
 [[nodiscard]] auto select_no_child_waiter_locked(Task& owner) -> Task* {
     ChildWaitRegistration* registration = owner.child_waiter_head;
     while (registration != nullptr) {
-        if (!registration->notified && registration->waiter != nullptr && !has_potential_subject_locked(owner, registration->selector)) {
+        if (!registration->notified && registration->waiter != nullptr &&
+            !has_potential_subject_locked(owner, registration->selector, registration->waiter->child_wait_view)) {
             registration->notified = true;
             if (take_lifetime_ref(registration->waiter)) {
                 return registration->waiter;
@@ -573,6 +603,35 @@ auto namespace_parent_pid(const Task& task) -> uint64_t {
     return result;
 }
 
+auto public_wait_selector(Task& owner, int64_t pid, Selector& out) -> int {
+    auto const* scope = owner.pid_namespace();
+    if (scope == nullptr) return -ESRCH;
+    if (scope->closed()) return -EIDRM;
+    Selector selector{};
+    if (pid > 0) {
+        selector = static_cast<uint64_t>(pid);
+    } else if (pid == -1) {
+        selector = SELECT_ANY;
+    } else if (pid == 0) {
+        if (scope->is_host()) {
+            selector = selector_for_current_process_group(owner);
+        } else {
+            uint64_t const FLAGS = g_lifecycle_lock.lock_irqsave();
+            selector = selector_for_process_group(owner.job_identity_snapshot().visible.pgid);
+            g_lifecycle_lock.unlock_irqrestore(FLAGS);
+        }
+        if (selector.value == 0) return -EINVAL;
+    } else {
+        if (pid == std::numeric_limits<int64_t>::min()) return -EINVAL;
+        uint64_t const GROUP = static_cast<uint64_t>(-pid);
+        selector = selector_for_process_group(GROUP);
+        if (selector.value == 0) return -EINVAL;
+        if (scope->is_host()) selector = selector_for_process_group(owner, GROUP);
+    }
+    out = selector;
+    return 0;
+}
+
 auto selector_for_process_group(uint64_t process_group, ker::mod::sched::session::Origin origin) -> Selector {
     if (process_group == 0 || process_group >= SELECT_PROCESS_GROUP_MASK) {
         return 0;
@@ -684,7 +743,7 @@ auto update_job_identity(Task& process, const ker::mod::sched::session::Identity
     Task* parent = nullptr;
     Task* tracer = nullptr;
     uint64_t const FLAGS = g_lifecycle_lock.lock_irqsave();
-    auto const BEFORE = effective_group_identity(process);
+    auto const BEFORE = process.job_identity_snapshot();
     bool committed = false;
     {
         ker::mod::sched::pid_ns::PublicationGuard const ADMISSION(*scope);
@@ -697,8 +756,9 @@ auto update_job_identity(Task& process, const ker::mod::sched::session::Identity
         g_lifecycle_lock.unlock_irqrestore(FLAGS);
         return false;
     }
-    auto const AFTER = effective_group_identity(process);
-    if (BEFORE.pgid != AFTER.pgid || BEFORE.group_origin != AFTER.group_origin) {
+    auto const AFTER = process.job_identity_snapshot();
+    if (BEFORE.internal.pgid != AFTER.internal.pgid || BEFORE.internal.group_origin != AFTER.internal.group_origin ||
+        BEFORE.visible.pgid != AFTER.visible.pgid) {
         advance_version_locked(g_group_version);
         if (process.child_parent != nullptr) advance_queue_version_locked(*process.child_parent);
         if (process.child_tracer != nullptr && process.child_tracer != process.child_parent)
@@ -1181,12 +1241,13 @@ void cancel_wait(Task& waiter) {
 }
 
 namespace {
-auto claim_locked(Task& owner, Claim& claim, Selector selector, int32_t options, ClaimedEvent& claimed) -> ProbeResult {
+auto claim_locked(Task& owner, Claim& claim, Selector selector, int32_t options, ClaimedEvent& claimed, View view = View::PHYSICAL)
+    -> ProbeResult {
     claimed = {};
     if (claim.event != nullptr) {
         return ProbeResult::WOULD_BLOCK;
     }
-    if (ChildEvent* const EVENT = first_matching_event_locked(owner, selector, options); EVENT != nullptr) {
+    if (ChildEvent* const EVENT = first_matching_event_locked(owner, selector, options, view); EVENT != nullptr) {
         if (claim.waiter != nullptr && !take_lifetime_ref(claim.waiter)) {
             return ProbeResult::WOULD_BLOCK;
         }
@@ -1204,10 +1265,24 @@ auto claim_locked(Task& owner, Claim& claim, Selector selector, int32_t options,
         claimed.status = EVENT->status;
         claimed.kind = EVENT->kind;
         claimed.audience = EVENT->audience;
+        auto const* scope = owner.pid_namespace();
+        claimed.visible_pid =
+            view == View::PUBLIC && scope != nullptr && !scope->is_host() ? EVENT->subject->namespace_tid() : EVENT->subject_pid;
         return ProbeResult::CLAIMED;
     }
 
-    return has_potential_subject_locked(owner, selector) ? ProbeResult::WOULD_BLOCK : ProbeResult::NO_CHILD;
+    return has_potential_subject_locked(owner, selector, view) ? ProbeResult::WOULD_BLOCK : ProbeResult::NO_CHILD;
+}
+
+// Caller holds lifecycle. Keep the guard alive across both claim and waiter
+// registration; destroy it before lifecycle restores IRQs or delivers wakes.
+auto public_admission_locked(Task& owner, View view, std::optional<ker::mod::sched::pid_ns::PublicationGuard>& admission)
+    -> std::optional<ProbeResult> {
+    if (view == View::PHYSICAL) return std::nullopt;
+    auto const* scope = owner.pid_namespace();
+    if (scope == nullptr) return ProbeResult::NO_CHILD;
+    admission.emplace(*scope);
+    return admission->open() ? std::nullopt : std::optional{ProbeResult::CLOSED};
 }
 }  // namespace
 
@@ -1221,21 +1296,34 @@ auto try_claim_if_current(Task& owner, Claim& claim, Selector selector, int32_t 
     return result;
 }
 
-auto try_claim(Task& owner, Claim& claim, Selector selector, int32_t options, ClaimedEvent& claimed) -> ProbeResult {
+auto try_claim(Task& owner, Claim& claim, Selector selector, int32_t options, ClaimedEvent& claimed, View view) -> ProbeResult {
+    claimed = {};
     uint64_t const FLAGS = g_lifecycle_lock.lock_irqsave();
-    auto const RESULT = claim_locked(owner, claim, selector, options, claimed);
+    ProbeResult result{ProbeResult::NO_CHILD};
+    {
+        std::optional<ker::mod::sched::pid_ns::PublicationGuard> admission;
+        auto const REJECTED = public_admission_locked(owner, view, admission);
+        result = REJECTED ? *REJECTED : claim_locked(owner, claim, selector, options, claimed, view);
+    }
     g_lifecycle_lock.unlock_irqrestore(FLAGS);
-    return RESULT;
+    return result;
 }
 
-auto claim_or_register(Task& owner, Task& waiter, Selector selector, int32_t options, bool register_if_empty, ClaimedEvent& claimed)
-    -> ProbeResult {
+auto claim_or_register(Task& owner, Task& waiter, Selector selector, int32_t options, bool register_if_empty, ClaimedEvent& claimed,
+                       View view) -> ProbeResult {
+    claimed = {};
     uint64_t const FLAGS = g_lifecycle_lock.lock_irqsave();
-    auto result = claim_locked(owner, waiter.child_claim, selector, options, claimed);
-    if (result != ProbeResult::WOULD_BLOCK) {
-        waiter_unlink_locked(waiter.child_wait_registration);
-    } else if (waiter.child_claim.event == nullptr && register_if_empty && !waiter_register_locked(owner, waiter, selector, options)) {
-        result = ProbeResult::NO_CHILD;
+    ProbeResult result{ProbeResult::NO_CHILD};
+    {
+        std::optional<ker::mod::sched::pid_ns::PublicationGuard> admission;
+        auto const REJECTED = public_admission_locked(owner, view, admission);
+        result = REJECTED ? *REJECTED : claim_locked(owner, waiter.child_claim, selector, options, claimed, view);
+        if (result != ProbeResult::WOULD_BLOCK) {
+            waiter_unlink_locked(waiter.child_wait_registration);
+        } else if (waiter.child_claim.event == nullptr && register_if_empty &&
+                   !waiter_register_locked(owner, waiter, selector, options, view)) {
+            result = ProbeResult::NO_CHILD;
+        }
     }
     g_lifecycle_lock.unlock_irqrestore(FLAGS);
     return result;

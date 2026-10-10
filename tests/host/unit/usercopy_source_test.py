@@ -25,6 +25,7 @@ VMEM_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "vmem" / "sys_v
 LOG_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "log" / "sys_log.cpp"
 SIGNAL_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sys" / "signal.cpp"
 THREAD_CONTROL_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "multiproc" / "threadControl.cpp"
+THREADING_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "threading.cpp"
 SMT_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "smt" / "smt.cpp"
 PTRACE_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "debug" / "ptrace.cpp"
 REMOTE_COMPUTE_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_compute.cpp"
@@ -570,7 +571,7 @@ def require_string_and_ioctl_contracts_are_closed() -> None:
 
 def require_thread_publication_uses_preflighted_mapped_usercopy() -> None:
     source = THREAD_CONTROL_CPP.read_text()
-    publish = function_body(source, "publish_thread_tid_to_tcb")
+    publish = function_body(THREADING_CPP.read_text(), "publish_tid_to_tcb")
     thread_control = function_body(source, "thread_control")
     clone_vm = function_body(PROCESS_CPP.read_text(), "wos_proc_clone_vm")
 
@@ -606,11 +607,11 @@ def require_thread_publication_uses_preflighted_mapped_usercopy() -> None:
     if "usercopy::" in arch_prctl[arch_set_start:arch_set_end] or "sync_task_signal_mask_cache" in arch_prctl[arch_set_start:arch_set_end]:
         fail("ARCH_SET_FS is an address-only operation and must not dereference the supplied base")
 
-    if "pin_task_user_page(*parent, tid_user_addr, true, false, tid_page)" not in publish:
-        fail("thread TID publication must use a mapped-only stable page")
-    if "pin_task_user_page(*parent, tid_user_addr, true, true, tid_page)" in publish:
+    if "pin_task_user_page(address_owner, address, true, fault_in, page)" not in publish:
+        fail("TCB TID publication must use an explicit subject and stable writable page")
+    if "publish_tid_to_tcb(*parent, tcb_va, NEW_TID, false)" not in thread_control:
         fail("thread TID publication must not fault while the publication mutex is held")
-    if "return tid_page.commit_write();" not in publish:
+    if "return page.commit_write();" not in publish:
         fail("thread TID publication must commit its HHDM write and mark the live PTE dirty")
 
     preflight = thread_control.find("ensure_writable(*parent, tcb_va, mod::sys::signal::WOS_TCB_SIGNAL_CACHE_BYTES)")
