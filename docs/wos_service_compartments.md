@@ -662,6 +662,39 @@ verified and pruned; disposable usage returned to zero. The earlier failed
 fixture run was also pruned. Source/artifact/runtime and cleanup receipts remain
 in the local progress ledger; all ten full acceptance criteria remain incomplete.
 
+## Retained private procfs directory descriptors
+
+Private procfs directory FDs without an owned native root now start component
+walks from their retained PID view and target. A retained PID/thread directory
+keeps that target after registry withdrawal; a fresh numeric root lookup still
+requires scoped registry selection. Thread parents use exact process-owner
+identity. Thread FD-directory names preserve the `/PID/task/TID/fd` form.
+
+Directory names come from retained identities rather than cached PID text.
+Traversal requires the caller's exact mount and PID views and current directory
+lifecycle. Content access keeps its per-operation credential checks. Numeric FD
+selection authorizes before probing the target table; borrowed description
+release stays outside namespace publication. Final consumption revalidates the
+exact native cover and attachment, including direct backend renames that do not
+advance the VFS publication epoch. Failed output and FD reservations stay intact.
+Host, owned-root synthetic-pin, serialized and physical-export refusals remain;
+Task/File/anchor/view, callback, syscall, libc and wire layouts are unchanged.
+
+Owned-root procfs directory pins and cwd publication remain pending. Unpublished
+task teardown requires exactly two references before clearing anchors and FDs;
+self-procfs objects add retained task references. Enabling cwd requires an exact
+internal ownership proof that also rejects external File/view/anchor aliases.
+
+Three new native cases check registry withdrawal and exact FD capability reopen,
+thread parents/canonical names, stale/closed/foreign views, bounded failed paths
+and cover mutation before consumption. Normal Build WOS, isolated fast
+diagnostics, formatting/clang-tidy and 35 selected host regressions pass. Actual
+KTEST28 passes 80,721 assertions, zero failures, 1,326 cases and all 75 mandatory
+checks with normal poweroff and stable source/artifact pins. The failed and
+successful runs' inactive images were verified and pruned; disposable usage
+returned to zero. These are unscheduled native fixtures. Public service creation
+and all ten full acceptance criteria remain incomplete.
+
 ## Verification checkpoint
 
 The initial `compartment_policy_test` suite checks actual production preparation

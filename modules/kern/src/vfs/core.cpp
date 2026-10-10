@@ -11684,15 +11684,18 @@ auto copy_directory_lookup_path(File* directory, uint64_t namespace_generation, 
         return -EAGAIN;
     auto* mount = directory->mount_owner;
     if (mount == nullptr || mount->retiring.load(std::memory_order_acquire)) return -ENOENT;
-    uint64_t const IRQF = directory->path_metadata_lock.lock_irqsave();
-    bool const CURRENT = directory->vfs_path_namespace_generation == namespace_generation &&
-                         directory->mount_generation == mount_generation && directory->vfs_path != nullptr;
-    if (CURRENT) {
-        int const RET = copy_path_string(directory->vfs_path, out.data(), out.size());
+    bool const PRIVATE_PROCFS = directory->fs_type == FSType::PROCFS && !mount->namespace_owner.is_host();
+    if (!PRIVATE_PROCFS) {
+        uint64_t const IRQF = directory->path_metadata_lock.lock_irqsave();
+        bool const CURRENT = directory->vfs_path_namespace_generation == namespace_generation &&
+                             directory->mount_generation == mount_generation && directory->vfs_path != nullptr;
+        if (CURRENT) {
+            int const RET = copy_path_string(directory->vfs_path, out.data(), out.size());
+            directory->path_metadata_lock.unlock_irqrestore(IRQF);
+            return RET;
+        }
         directory->path_metadata_lock.unlock_irqrestore(IRQF);
-        return RET;
     }
-    directory->path_metadata_lock.unlock_irqrestore(IRQF);
     std::array<char, MAX_PATH_LEN> mount_path{}, backend_path{};
     int result = copy_mount_path_exact(mount, mount_path.data(), mount_path.size());
     if (result != 0) return result;
@@ -11700,6 +11703,10 @@ auto copy_directory_lookup_path(File* directory, uint64_t namespace_generation, 
         result = ker::vfs::tmpfs::tmpfs_directory_path(tmpfs_root_for_mount(mount),
                                                        static_cast<ker::vfs::tmpfs::TmpNode*>(directory->private_data), backend_path.data(),
                                                        backend_path.size());
+    } else if (PRIVATE_PROCFS) {
+        // A procfs directory's name comes from its exact retained target/view,
+        // including cached descriptors. It must never reach a native inode cast.
+        result = procfs::procfs_directory_path(directory, backend_path.data(), backend_path.size());
     } else {
         result = ker::vfs::xfs::xfs_directory_path(directory, backend_path.data(), backend_path.size());
     }
@@ -12143,18 +12150,50 @@ auto local_walk_bind(const LocalWalkEpoch& epoch, const ker::mod::security::Snap
     if (epoch.physical_path && mount->fs_type == FSType::PROCFS) return -ENOTSUP;
     if (epoch.serialized && mount->fs_type != FSType::TMPFS && mount->fs_type != FSType::XFS) return RESOLVE_FAST_PATH_DECLINED;
     if (mount->fs_type == FSType::PROCFS) {
-        if (PRIVATE && (parent == nullptr || parent->mount.get() != mount)) {
-            if (parent == nullptr) return -EXDEV;
+        File* const PROC_DIRECTORY = anchor != nullptr && anchor->fs_type == FSType::PROCFS ? anchor
+                                     : parent != nullptr && parent->mount.get() == mount    ? parent->proc.get()
+                                                                                            : nullptr;
+        if (PRIVATE && PROC_DIRECTORY != nullptr && PROC_DIRECTORY->private_data == nullptr) return -EBADF;
+        if (PRIVATE && anchor != nullptr && PROC_DIRECTORY != nullptr) {
+            if (epoch.membership == nullptr) return -EINVAL;
             ker::mod::sys::MutexGuard publication_guard(g_vfs_namespace_publication_mutex);
             if (!epoch.current()) return -EAGAIN;
-            int const CROSS = local_walk_cross_private_procfs_mount(epoch, credentials, path, *parent, component, out);
-            if (CROSS != 0) return CROSS == RESOLVE_FAST_PATH_DECLINED ? -EXDEV : CROSS;
+            auto& references = *epoch.membership;
+            if (!references) {
+                references.reset(new (std::nothrow) NativeDirectoryMembershipReferences{});
+                if (!references) return -ENOMEM;
+            }
+            File* covered = nullptr;
+            int result = references->capture(mount, epoch.mount_generation, covered);
+            if (result == 0) result = validate_native_mount_attachment(mount, covered, epoch.mount_generation);
+            if (result != 0) return result;
+        }
+        if (PRIVATE && (parent == nullptr || parent->mount.get() != mount)) {
+            if (parent == nullptr) {
+                if (PROC_DIRECTORY == nullptr) return -EXDEV;
+            } else {
+                ker::mod::sys::MutexGuard publication_guard(g_vfs_namespace_publication_mutex);
+                if (!epoch.current()) return -EAGAIN;
+                int const CROSS = local_walk_cross_private_procfs_mount(epoch, credentials, path, *parent, component, out);
+                if (CROSS != 0) return CROSS == RESOLVE_FAST_PATH_DECLINED ? -EXDEV : CROSS;
+            }
         }
         // PROCFS can release a borrowed remote FD. Keep that close/owner wait
         // outside namespace publication, then validate the entire walk epoch.
-        int const RESULT = local_walk_read_stat(out, path, epoch.caller_pid, epoch.caller_task);
+        int result = 0;
+        auto const* data = PROC_DIRECTORY != nullptr ? static_cast<const procfs::ProcFileData*>(PROC_DIRECTORY->private_data) : nullptr;
+        if (PRIVATE && data != nullptr && !data->pid_view.is_host()) {
+            int selected = -ENOENT;
+            out.proc.reset(procfs::procfs_lookup_component_as(credentials, epoch.caller_pid, PROC_DIRECTORY,
+                                                              component != nullptr ? component : "", epoch.caller_task, &selected));
+            result = out.proc ? procfs::procfs_fill_stat(out.proc.get(), &out.stat, mount->dev_id) : selected;
+            out.exists = result == 0;
+            if (result == -ENOENT) result = 0;
+        } else {
+            result = local_walk_read_stat(out, path, epoch.caller_pid, epoch.caller_task);
+        }
         ker::mod::sys::MutexGuard publication_guard(g_vfs_namespace_publication_mutex);
-        return epoch.current() && !mount->retiring.load(std::memory_order_acquire) ? RESULT : -EAGAIN;
+        return epoch.current() && !mount->retiring.load(std::memory_order_acquire) ? result : -EAGAIN;
     }
     std::optional<ker::mod::sys::MutexGuard> publication_guard;
     if (!epoch.serialized) publication_guard.emplace(g_vfs_namespace_publication_mutex);
@@ -12476,7 +12515,13 @@ auto acquire_local_component_lookup(ker::mod::sched::task::Task* task, int dirfd
     path_owner->path_metadata_lock.unlock_irqrestore(PATH_IRQF);
     if (result != 0) return result;
     auto file_in_scope = [&](const File* file) {
-        return file != nullptr && file->mount_owner != nullptr && file->mount_owner->namespace_owner == *scope;
+        if (file == nullptr || file->mount_owner == nullptr || file->mount_owner->namespace_owner != *scope) return false;
+        if (file->fs_type == FSType::PROCFS) {
+            auto const* data = static_cast<const procfs::ProcFileData*>(file->private_data);
+            auto const* pid_view = task->pid_namespace();
+            return data != nullptr && pid_view != nullptr && data->pid_view == *pid_view;
+        }
+        return true;
     };
     auto view_in_scope = [&](const DirectoryViewRef& view) {
         return view && file_in_scope(view.root()) && file_in_scope(view.directory());
@@ -12688,7 +12733,14 @@ auto acquire_local_component_lookup(ker::mod::sched::task::Task* task, int dirfd
             *out = std::move(candidate);
             return 0;
         }
-        if (anchor->fs_type != FSType::TMPFS && anchor->fs_type != FSType::XFS) return RESOLVE_FAST_PATH_DECLINED;
+        // The private procfs component helper derives children from this exact
+        // retained directory. Owned-root pins, serialized and export paths keep
+        // their existing native-only admission until their ownership is ready.
+        bool const PRIVATE_PROC_DIRECTORY = PRIVATE && !serialized && anchor->fs_type == FSType::PROCFS &&
+                                            anchor->private_data != nullptr &&
+                                            !static_cast<const procfs::ProcFileData*>(anchor->private_data)->pid_view.is_host();
+        if (anchor->fs_type != FSType::TMPFS && anchor->fs_type != FSType::XFS && !PRIVATE_PROC_DIRECTORY)
+            return RESOLVE_FAST_PATH_DECLINED;
         result = copy_directory_lookup_path(anchor.get(), NAMESPACE, MOUNTS, path, serialized);
         if (result != 0) return result;
         if (!path_prefix_matches(path.data(), root.data(), std::strlen(root.data()))) return owner_directory != nullptr ? -EPERM : -EXDEV;
@@ -31556,9 +31608,20 @@ auto validate_lookup_directory_view_locked(const LookupHandle& handle) -> int {
         if (ORIGINS != 0) return ORIGINS;
     }
     auto const& view = handle.directory_view();
-    if (!view) return 0;
     auto const* membership = static_cast<const NativeDirectoryMembershipReferences*>(handle.mount_membership());
     if (membership != nullptr && !membership->current(handle.mount_generation())) return -EAGAIN;
+    if (!view) {
+        auto* mount = handle.mount();
+        if (mount == nullptr || mount->fs_type != FSType::PROCFS || mount->namespace_owner.is_host()) return 0;
+        if (membership == nullptr || handle.backend_parent() == nullptr) return -EAGAIN;
+        int result = procfs::procfs_revalidate_lookup_result(static_cast<const File*>(handle.backend_parent()));
+        if (result != 0) return result;
+        NativeDirectoryMembershipAccess references(membership);
+        File* covered = nullptr;
+        result = references.capture(mount, handle.mount_generation(), covered);
+        if (result == 0) result = validate_native_mount_attachment(mount, covered, handle.mount_generation());
+        return result;
+    }
     if (handle.authorization().root_identity_view && view.root() != view.directory()) return -EAGAIN;
     int result = admit_directory_view(nullptr, view.root(), view.directory(), handle.authorization().credentials, true,
                                       !handle.authorization().root_identity_view, membership);

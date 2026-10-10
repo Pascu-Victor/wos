@@ -8344,6 +8344,224 @@ auto procfs_open_path_as(const ker::mod::security::Snapshot& credentials, uint64
     return file;
 }
 
+namespace {
+auto private_directory_policy(const File* file) -> int {
+    if (file == nullptr || file->fs_type != FSType::PROCFS || file->private_data == nullptr) return -EBADF;
+    if (!file->is_directory) return -ENOTDIR;
+    auto const& data = *static_cast<const ProcFileData*>(file->private_data);
+    if (data.pid_view.is_host()) return -ENOTSUP;
+    int const VIEW = procfs_view_policy(data);
+    if (VIEW != 0) return VIEW;
+    switch (data.node.type) {
+        case ProcNodeType::ROOT_DIR:
+            return data.target == nullptr ? 0 : -EBADF;
+        case ProcNodeType::PID_DIR:
+        case ProcNodeType::TASK_DIR:
+        case ProcNodeType::TASK_TID_DIR:
+        case ProcNodeType::FD_DIR:
+            return data.target != nullptr && data.node.pid == data.target->pid &&
+                           data.target->state.load(std::memory_order_acquire) == ker::mod::sched::task::TaskState::ACTIVE
+                       ? 0
+                       : -ESRCH;
+        default:
+            return -ENOTDIR;
+    }
+}
+
+auto make_private_component(const pid_ns::NamespaceRef& view, ProcNodeType type, ProcTask* target, bool directory, bool thread_view,
+                            uint64_t fd, int& error) -> File* {
+    auto data = std::unique_ptr<ProcFileData>(new (std::nothrow) ProcFileData{});
+    if (!data) {
+        error = -ENOMEM;
+        return nullptr;
+    }
+    error = view.retain(data->pid_view);
+    if (error != 0) return nullptr;
+    if (target != nullptr) {
+        if (!target->try_acquire()) {
+            error = -ESRCH;
+            return nullptr;
+        }
+        data->target = target;
+    }
+    data->node = {.type = type, .pid = target != nullptr ? target->pid : 0, .fd = fd, .thread_view = thread_view};
+    error = procfs_view_policy(*data);
+    if (error != 0) return nullptr;
+    auto file = std::unique_ptr<File>(new (std::nothrow) File{});
+    if (!file) {
+        error = -ENOMEM;
+        return nullptr;
+    }
+    file->private_data = data.release();
+    file->fd = -1;
+    file->is_directory = directory;
+    file->fs_type = FSType::PROCFS;
+    file->refcount = 1;
+    // This is metadata. Its caller supplies operations and authorizes the
+    // eventual access just like the ordinary parser's retained result.
+    error = 0;
+    return file.release();
+}
+}  // namespace
+
+auto procfs_directory_path(const File* directory, char* buffer, size_t capacity) -> int {
+    if (buffer == nullptr || capacity == 0) return -EINVAL;
+    int const POLICY = private_directory_policy(directory);
+    if (POLICY != 0) return POLICY;
+    auto const& data = *static_cast<const ProcFileData*>(directory->private_data);
+    std::array<char, 96> staged{};
+    int length = 0;
+    if (data.node.type == ProcNodeType::ROOT_DIR) {
+        staged[0] = '/';
+        length = 1;
+    } else {
+        auto const TID = data.target->namespace_tid();
+        auto const GROUP = ker::mod::sched::task::namespace_process_pid(*data.target);
+        if (TID == 0 || GROUP == 0) return -ESRCH;
+        bool const THREAD_PATH =
+            data.node.type == ProcNodeType::TASK_TID_DIR || (data.node.type == ProcNodeType::FD_DIR && data.node.thread_view);
+        if (THREAD_PATH) {
+            length = std::snprintf(staged.data(), staged.size(), "/%llu/task/%llu%s", static_cast<unsigned long long>(GROUP),
+                                   static_cast<unsigned long long>(TID), data.node.type == ProcNodeType::FD_DIR ? "/fd" : "");
+        } else {
+            length = std::snprintf(staged.data(), staged.size(), "/%llu%s",
+                                   static_cast<unsigned long long>(data.node.type == ProcNodeType::TASK_DIR ? GROUP : TID),
+                                   data.node.type == ProcNodeType::TASK_DIR ? "/task"
+                                   : data.node.type == ProcNodeType::FD_DIR ? "/fd"
+                                                                            : "");
+        }
+    }
+    if (length < 0 || static_cast<size_t>(length) >= staged.size()) return -ENAMETOOLONG;
+    if (static_cast<size_t>(length) + 1 > capacity) return -ERANGE;
+    int const CURRENT = private_directory_policy(directory);
+    if (CURRENT != 0) return CURRENT;
+    std::memcpy(buffer, staged.data(), static_cast<size_t>(length) + 1);
+    return 0;
+}
+
+auto procfs_lookup_component_as(const ker::mod::security::Snapshot& credentials, uint64_t caller_pid, const File* directory,
+                                const char* component, ProcTask* caller_task, int* result_out) -> File* {
+    auto fail = [result_out](int error) -> File* {
+        if (result_out != nullptr) *result_out = error;
+        return nullptr;
+    };
+    int const POLICY = private_directory_policy(directory);
+    if (POLICY != 0) return fail(POLICY);
+    auto const& source = *static_cast<const ProcFileData*>(directory->private_data);
+    if (caller_task == nullptr || ker::mod::sched::task::process_pid(*caller_task) != caller_pid) return fail(-ESRCH);
+    auto const* scope = caller_task->pid_namespace();
+    if (scope == nullptr) return fail(-ESRCH);
+    if (scope->closed()) return fail(-EIDRM);
+    if (*scope != source.pid_view || !task_in_pid_view(*caller_task, source.pid_view)) return fail(-EXDEV);
+    if (component == nullptr) return fail(-EINVAL);
+    constexpr size_t COMPONENT_LIMIT = 256;
+    size_t length = 0;
+    while (length < COMPONENT_LIMIT && component[length] != '\0') {
+        if (component[length] == '/') return fail(-EINVAL);
+        ++length;
+    }
+    if (length == COMPONENT_LIMIT) return fail(-ENAMETOOLONG);
+    int error = -ENOENT;
+    File* candidate = nullptr;
+    auto select = [&](ProcNodeType type, ProcTask* target, bool is_directory, bool thread_view = false, uint64_t fd = 0) {
+        candidate = make_private_component(source.pid_view, type, target, is_directory, thread_view, fd, error);
+    };
+    if (component[0] == '\0' || std::strcmp(component, ".") == 0) {
+        select(source.node.type, source.target, true, source.node.thread_view);
+    } else if (std::strcmp(component, "..") == 0) {
+        // The VFS handles a procfs-root exit using its exact native cover.
+        if (source.node.type == ProcNodeType::ROOT_DIR || source.node.type == ProcNodeType::PID_DIR)
+            select(ProcNodeType::ROOT_DIR, nullptr, true);
+        else if (source.node.type == ProcNodeType::TASK_TID_DIR)
+            select(ProcNodeType::TASK_DIR, source.target->credential_owner(), true);
+        else if (source.node.type == ProcNodeType::TASK_DIR)
+            select(ProcNodeType::PID_DIR, source.target->credential_owner(), true);
+        else
+            select(source.node.thread_view ? ProcNodeType::TASK_TID_DIR : ProcNodeType::PID_DIR, source.target, true);
+    } else if (source.node.type == ProcNodeType::ROOT_DIR) {
+        // A root entry is a new scoped selection. All deeper directories use
+        // their retained target instead of joining again through numeric text.
+        candidate = procfs_lookup_path_as(component, caller_pid, 0, caller_task, &error);
+    } else if (source.node.type == ProcNodeType::TASK_DIR) {
+        int64_t const ID = parse_pid(component);
+        if (ID > 0) {
+            ProcTask* target = nullptr;
+            auto* group = source.target->credential_owner();
+            if (group != nullptr && static_cast<uint64_t>(ID) == group->namespace_tid())
+                target = group->try_acquire() ? group : nullptr;
+            else
+                target = ker::mod::sched::find_task_by_pid_namespace_safe(source.pid_view, static_cast<uint64_t>(ID));
+            if (target != nullptr) {
+                if (target->credential_owner() == group && task_in_pid_view(*target, source.pid_view))
+                    select(ProcNodeType::TASK_TID_DIR, target, true);
+                target->release();
+            }
+        }
+    } else if (source.node.type == ProcNodeType::FD_DIR) {
+        uint64_t fd = 0;
+        if (parse_fd_component(component, fd)) {
+            ker::mod::security::CredentialStore::Observation observation{};
+            error = authorize_private_procfs(credentials, caller_pid, source, observation);
+            if (error == 0) {
+                auto* description = task_fd_file_retain(source.target, fd);
+                if (description != nullptr) {
+                    // This possible last remote close stays outside publication.
+                    ker::vfs::vfs_put_file(description);
+                    error = revalidate_private_procfs(source, observation);
+                    if (error == 0) select(ProcNodeType::FD_LINK, source.target, false, source.node.thread_view, fd);
+                } else {
+                    error = -ENOENT;
+                }
+            }
+        }
+    } else {
+        bool const THREAD = source.node.type == ProcNodeType::TASK_TID_DIR;
+        struct Child {
+            const char* name;
+            ProcNodeType type;
+        };
+        constexpr std::array<Child, 13> CHILDREN{{
+            {"exe", ProcNodeType::EXE_LINK},
+            {"cwd", ProcNodeType::CWD_LINK},
+            {"root", ProcNodeType::ROOT_LINK},
+            {"fd", ProcNodeType::FD_DIR},
+            {"status", ProcNodeType::STATUS_FILE},
+            {"stat", ProcNodeType::STAT_FILE},
+            {"statm", ProcNodeType::STATM_FILE},
+            {"cmdline", ProcNodeType::CMDLINE_FILE},
+            {"maps", ProcNodeType::MAPS_FILE},
+            {"images", ProcNodeType::IMAGES_FILE},
+            {"limits", ProcNodeType::LIMITS_FILE},
+            {"wki_launcher", ProcNodeType::WKI_LAUNCHER_FILE},
+            {"wki_runner", ProcNodeType::WKI_RUNNER_FILE},
+        }};
+        if (!THREAD && std::strcmp(component, "task") == 0) {
+            select(ProcNodeType::TASK_DIR, source.target->credential_owner(), true);
+        } else if (std::strcmp(component, "wki_remote_pid") == 0) {
+            select(ProcNodeType::WKI_REMOTE_PID_FILE, source.target, false);
+        } else {
+            for (auto const& child : CHILDREN) {
+                if (std::strcmp(component, child.name) != 0) continue;
+                bool const DIR = child.type == ProcNodeType::FD_DIR;
+                select(child.type, source.target, DIR,
+                       THREAD && (DIR || child.type == ProcNodeType::STATUS_FILE || child.type == ProcNodeType::STAT_FILE));
+                break;
+            }
+        }
+    }
+    if (candidate == nullptr) return fail(error);
+    int const CURRENT = private_directory_policy(directory);
+    auto const& selected = *static_cast<const ProcFileData*>(candidate->private_data);
+    int const FINAL = CURRENT != 0 ? CURRENT : selected.pid_view != source.pid_view ? -EXDEV : procfs_view_policy(selected);
+    if (FINAL != 0) {
+        procfs_close(candidate);
+        delete candidate;
+        return fail(FINAL);
+    }
+    if (result_out != nullptr) *result_out = 0;
+    return candidate;
+}
+
 auto procfs_lookup_path(const char* path, int flags) -> File* {
     auto* task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
     return procfs_lookup_path_as(path, current_procfs_pid(), flags, task);
@@ -8513,7 +8731,7 @@ auto procfs_lookup_path_as(const char* path, uint64_t caller_pid, int flags, Pro
             return make_file(ProcNodeType::ROOT_LINK, TID_VALUE, false);
         }
         if (strcmp(task_sub, "fd") == 0) {
-            return make_file(ProcNodeType::FD_DIR, TID_VALUE, true);
+            return make_file(ProcNodeType::FD_DIR, TID_VALUE, true, PRIVATE_VIEW);
         }
         if (strncmp(task_sub, "fd/", 3) == 0) {
             return make_fd_link(TID_VALUE, task_sub + 3);

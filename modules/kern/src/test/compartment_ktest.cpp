@@ -3512,3 +3512,184 @@ KTEST(CompartmentProcfs, RepeatedMagicLinksRetainEveryOriginAndDrainAtDepthLimit
     KEXPECT_EQ(pid_ns::live_namespace_count(), PID_BASELINE);
     KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNT_BASELINE);
 }
+
+namespace {
+auto proc_component(Task& caller, const NativeFile& directory, const char* name, int* result = nullptr) -> NativeFile {
+    auto* file =
+        procfs::procfs_lookup_component_as(caller.credentials(), sched::task::process_pid(caller), directory.get(), name, &caller, result);
+    if (file != nullptr) file->fops = procfs::get_procfs_fops();
+    return NativeFile(file);
+}
+struct ProcFixtureFd {
+    Task& task;
+    int fd = -1;
+    ~ProcFixtureFd() {
+        if (fd >= 0) KEXPECT_EQ(vfs::vfs_close_for_task(&task, fd), 0);
+    }
+};
+}  // namespace
+
+KTEST(CompartmentProcfs, DirectoryDescriptorsKeepTargetAfterRegistryWithdrawal) {
+    auto const PID_BASELINE = pid_ns::live_namespace_count();
+    auto const MOUNT_BASELINE = mount_ns::live_namespace_count();
+    {
+        PrivateMounts views;
+        pid_ns::NamespaceRef pid_view, foreign_pid;
+        KREQUIRE_EQ(mount_ns::create_namespace(views.first), 0);
+        KREQUIRE_EQ(pid_ns::create_namespace(pid_view), 0);
+        KREQUIRE_EQ(pid_ns::create_namespace(foreign_pid), 0);
+        KREQUIRE_EQ(private_mount(views.first, "/"), 0);
+        RegistryTask target;
+        NativeTask subject, foreign;
+        subject.task->type = foreign.task->type = sched::task::TaskType::PROCESS;
+        KREQUIRE_TRUE(subject.task->initialize_pid_namespace(pid_view));
+        KREQUIRE_TRUE(target.task->initialize_pid_namespace(pid_view));
+        KREQUIRE_TRUE(foreign.task->initialize_pid_namespace(foreign_pid));
+        for (auto* task : {subject.task.get(), target.task.get(), foreign.task.get()})
+            KREQUIRE_TRUE(task->initialize_mount_namespace(views.first));
+        KREQUIRE_EQ(vfs::vfs_mkdirat(subject.task.get(), vfs::AT_FDCWD, "/proc", 0755), 0);
+        KREQUIRE_EQ(vfs::vfs_mount_for_task(subject.task.get(), nullptr, "/proc", "procfs"), 0);
+        ProcFixtureFd target_fd{*target.task};
+        target_fd.fd = vfs::vfs_openat(target.task.get(), vfs::AT_FDCWD, "/target-data", vfs::O_CREAT | 2, 0600);
+        KREQUIRE_TRUE(target_fd.fd >= 0);
+        NativeFile original(vfs::vfs_get_file_retain(target.task.get(), target_fd.fd));
+        KREQUIRE_TRUE(original);
+        KREQUIRE_TRUE(target.publish());
+        int const DIR = subject.open("/proc/2", vfs::O_DIRECTORY);
+        KREQUIRE_TRUE(DIR >= 0);
+        target.retire();
+        KEXPECT_EQ(subject.open("/proc/2/status", 0), -ENOENT);
+        int const STATUS = subject.track(vfs::vfs_openat(subject.task.get(), DIR, "status", 0, 0));
+        KREQUIRE_TRUE(STATUS >= 0);
+        NativeFile status(vfs::vfs_get_file_retain(subject.task.get(), STATUS));
+        KREQUIRE_TRUE(status);
+        KEXPECT_TRUE(proc_data(status).target == target.task.get());
+        std::array<char, 8192> output{};
+        KREQUIRE_TRUE(proc_text(status, output) > 0);
+        KEXPECT_TRUE(status_row(output.data(), "Pid", 2));
+        int const FOLDER = subject.track(vfs::vfs_openat(subject.task.get(), DIR, "fd", vfs::O_DIRECTORY, 0));
+        KREQUIRE_TRUE(FOLDER >= 0);
+        std::array<char, 32> number{};
+        std::snprintf(number.data(), number.size(), "%d", target_fd.fd);
+        int const CAP = subject.track(vfs::vfs_openat(subject.task.get(), FOLDER, number.data(), 0, 0));
+        KREQUIRE_TRUE(CAP >= 0);
+        NativeFile duplicate(vfs::vfs_get_file_retain(subject.task.get(), CAP));
+        KREQUIRE_TRUE(duplicate);
+        KEXPECT_TRUE(duplicate.get() == original.get());
+        int const PARENT = subject.track(vfs::vfs_openat(subject.task.get(), FOLDER, "../status", 0, 0));
+        KREQUIRE_TRUE(PARENT >= 0);
+        NativeFile directory(vfs::vfs_get_file_retain(subject.task.get(), DIR));
+        KREQUIRE_TRUE(directory);
+        vfs::FdReservation import(foreign.task.get());
+        int const FOREIGN = foreign.track(import.install(directory.get()));
+        KREQUIRE_TRUE(FOREIGN >= 0);
+        directory.release();
+        auto const FDS = foreign.task->fd_table.size();
+        KEXPECT_EQ(vfs::vfs_openat(foreign.task.get(), FOREIGN, "status", 0, 0), -EXDEV);
+        KEXPECT_EQ(foreign.task->fd_table.size(), FDS);
+        target.task->state.store(sched::task::TaskState::EXITING);
+        vfs::Stat unchanged{};
+        unchanged.st_ino = 73;
+        KEXPECT_EQ(vfs::vfs_statat(subject.task.get(), DIR, "status", 0, &unchanged), -ESRCH);
+        KEXPECT_EQ(unchanged.st_ino, uint64_t{73});
+        target.task->state.store(sched::task::TaskState::ACTIVE);
+        pid_view.close();
+        KEXPECT_EQ(vfs::vfs_openat(subject.task.get(), DIR, "status", 0, 0), -EIDRM);
+        KEXPECT_EQ(subject.task->fd_table.reserved_count(), 0U);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PID_BASELINE);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNT_BASELINE);
+}
+
+KTEST(CompartmentProcfs, RetainedThreadDirectoryParentsAndCanonicalNamesStayExact) {
+    auto const PID_BASELINE = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        RegistryTask group, thread, sibling;
+        KREQUIRE_TRUE(group.task->initialize_pid_namespace(scope));
+        thread.task->is_thread = true;
+        thread.task->owner_pid = group.task->pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(*thread.task, *group.task));
+        KREQUIRE_TRUE(sibling.task->initialize_pid_namespace(scope));
+        KREQUIRE_TRUE(thread.publish());
+        KREQUIRE_TRUE(sibling.publish());
+        auto tasks = scoped_proc(*group.task, "1/task");
+        KREQUIRE_TRUE(tasks);
+        int error = 0;
+        KEXPECT_FALSE(proc_component(*group.task, tasks, "3", &error));
+        KEXPECT_EQ(error, -ENOENT);
+        auto tid = proc_component(*group.task, tasks, "2", &error);
+        KREQUIRE_TRUE(tid);
+        KEXPECT_TRUE(proc_data(tid).target == thread.task.get());
+        thread.retire();
+        auto status = proc_component(*group.task, tid, "status");
+        auto fds = proc_component(*group.task, tid, "fd");
+        KREQUIRE_TRUE(status && fds);
+        KEXPECT_TRUE(proc_data(status).target == thread.task.get() && proc_data(status).node.thread_view);
+        std::array<char, 64> path{};
+        KREQUIRE_EQ(procfs::procfs_directory_path(tid.get(), path.data(), path.size()), 0);
+        KEXPECT_EQ(std::strcmp(path.data(), "/1/task/2"), 0);
+        KREQUIRE_EQ(procfs::procfs_directory_path(fds.get(), path.data(), path.size()), 0);
+        KEXPECT_EQ(std::strcmp(path.data(), "/1/task/2/fd"), 0);
+        auto parent = proc_component(*group.task, fds, "..");
+        KREQUIRE_TRUE(parent);
+        KEXPECT_TRUE(proc_data(parent).target == thread.task.get());
+        KEXPECT_EQ(proc_data(parent).node.type, procfs::ProcNodeType::TASK_TID_DIR);
+        auto owner = proc_component(*group.task, parent, "..");
+        KREQUIRE_TRUE(owner);
+        KEXPECT_TRUE(proc_data(owner).target == group.task.get());
+        KEXPECT_EQ(proc_data(owner).node.type, procfs::ProcNodeType::TASK_DIR);
+        path.fill('x');
+        KEXPECT_EQ(procfs::procfs_directory_path(tid.get(), path.data(), 2), -ERANGE);
+        KEXPECT_EQ(path[0], 'x');
+        KEXPECT_FALSE(proc_component(*group.task, tid, "status/extra", &error));
+        KEXPECT_EQ(error, -EINVAL);
+        std::array<char, 257> too_long{};
+        too_long.fill('x');
+        too_long.back() = '\0';
+        KEXPECT_FALSE(proc_component(*group.task, tid, too_long.data(), &error));
+        KEXPECT_EQ(error, -ENAMETOOLONG);
+        scope.close();
+        KEXPECT_EQ(procfs::procfs_directory_path(tid.get(), path.data(), path.size()), -EIDRM);
+        KEXPECT_EQ(path[0], 'x');
+        KEXPECT_FALSE(proc_component(*group.task, tid, "status", &error));
+        KEXPECT_EQ(error, -EIDRM);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PID_BASELINE);
+}
+
+KTEST(CompartmentProcfs, UnscopedDirectoryCoverMutationInvalidatesConsumption) {
+    PrivateMounts views;
+    pid_ns::NamespaceRef pid_view;
+    KREQUIRE_EQ(mount_ns::create_namespace(views.first), 0);
+    KREQUIRE_EQ(pid_ns::create_namespace(pid_view), 0);
+    KREQUIRE_EQ(private_mount(views.first, "/"), 0);
+    NativeTask subject;
+    subject.task->type = sched::task::TaskType::PROCESS;
+    KREQUIRE_TRUE(subject.task->initialize_mount_namespace(views.first));
+    KREQUIRE_TRUE(subject.task->initialize_pid_namespace(pid_view));
+    KREQUIRE_EQ(vfs::vfs_mkdirat(subject.task.get(), vfs::AT_FDCWD, "/proc", 0755), 0);
+    KREQUIRE_EQ(vfs::vfs_mount_for_task(subject.task.get(), nullptr, "/proc", "procfs"), 0);
+    int const DIR = subject.open("/proc/1", vfs::O_DIRECTORY);
+    KREQUIRE_TRUE(DIR >= 0);
+    vfs::LookupHandle selected;
+    KREQUIRE_EQ(task_lookup(*subject.task, "status", selected, DIR), 0);
+    KEXPECT_FALSE(selected.directory_view());
+    KEXPECT_TRUE(selected.mount_membership() != nullptr);
+    unsigned calls = 0;
+    KEXPECT_EQ(vfs::vfs_consume_lookup(selected, false, observe_procfs_lookup, &calls), 0);
+    KEXPECT_EQ(calls, 1U);
+    auto mount = scoped_mount(views.first, "/");
+    KREQUIRE_TRUE(mount);
+    auto const CREDENTIALS = subject.task->credentials();
+    tmpfs::TmpfsLookupHandle source, destination;
+    KREQUIRE_EQ(tmpfs::tmpfs_acquire_lookup(CREDENTIALS, native_root(mount.get()), "/proc", &source), 0);
+    KREQUIRE_EQ(tmpfs::tmpfs_acquire_lookup(CREDENTIALS, native_root(mount.get()), "/moved", &destination), 0);
+    KREQUIRE_EQ(tmpfs::tmpfs_rename_lookup(CREDENTIALS, source, destination, true, false), 0);
+    calls = 0;
+    KEXPECT_EQ(vfs::vfs_consume_lookup(selected, false, observe_procfs_lookup, &calls), -EAGAIN);
+    KEXPECT_EQ(calls, 0U);
+    KEXPECT_EQ(vfs::vfs_openat(subject.task.get(), DIR, "status", 0, 0), -EAGAIN);
+    KEXPECT_EQ(subject.task->fd_table.reserved_count(), 0U);
+}

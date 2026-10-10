@@ -137,6 +137,15 @@ auto procfs_lookup_path(const char* path, int flags = 0) -> File*;
 // Null Task is reserved for explicit trusted Host/boot/model observations.
 auto procfs_lookup_path_as(const char* path, uint64_t caller_pid, int flags = 0, ker::mod::sched::task::Task* caller_task = nullptr,
                            int* result_out = nullptr) -> File*;
+// Private directory component selection preserves the retained view/target.
+// Scoped registry/FD selection and possible description release run outside
+// publication. Metadata only; each operation keeps its own authorization.
+auto procfs_lookup_component_as(const ker::mod::security::Snapshot& credentials, uint64_t caller_pid, const File* directory,
+                                const char* component, ker::mod::sched::task::Task* caller_task, int* result_out) -> File*;
+// Bounded canonical private directory name from exact retained identities.
+// Safe under publication: no registry/FD selection, allocation or File release.
+// Reject closed/retired directories before changing output; never grants access.
+auto procfs_directory_path(const File* directory, char* buffer, size_t capacity) -> int;
 
 // Syntactic detection only: no Task/File lookup or authority is conferred.
 auto procfs_path_is_fd_link(const char* path) -> bool;

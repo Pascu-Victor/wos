@@ -69,14 +69,15 @@ def main():
     assert 'ProcNodeType::ROOT_DIR' in crossing
     assert 'procfs_lookup_path_as(' not in crossing
     binding = body_after(core, 'auto local_walk_bind(')
-    assert binding.index('local_walk_cross_private_procfs_mount(') < binding.index('int const RESULT = local_walk_read_stat(')
+    assert binding.index('local_walk_cross_private_procfs_mount(') < binding.index('result = local_walk_read_stat(out, path')
     assert 'PRIVATE && mount != nullptr && mount->fs_type == FSType::PROCFS' in binding
     assert 'epoch.physical_path && mount->fs_type == FSType::PROCFS' in binding
     validation = body_after(core, 'auto validate_lookup_directory_view_locked(')
     assert validation.index('origins->validate()') < validation.index('admit_directory_view(')
-    assert 'procfs::procfs_revalidate_lookup_result(file)' in validation
-    assert validation.index('procfs::procfs_revalidate_lookup_result(file)') < validation.index('references.capture(')
-    assert validation.index('validate_native_mount_attachment(') < validation.index('directory_member_path_locked(covered, view.root()')
+    scoped_validation = validation[validation.index('if (handle.authorization().root_identity_view'):]
+    assert 'procfs::procfs_revalidate_lookup_result(file)' in scoped_validation
+    assert scoped_validation.index('procfs::procfs_revalidate_lookup_result(file)') < scoped_validation.index('references.capture(')
+    assert scoped_validation.index('validate_native_mount_attachment(') < scoped_validation.index('directory_member_path_locked(covered, view.root()')
     pin = body_after(core, 'auto pin_directory_view_lookup(')
     assert 'file->is_directory ? -ENOTSUP : -ENOTDIR' in pin
     root = body_after(core, 'auto vfs_getroot_for_task(')
@@ -90,6 +91,42 @@ def main():
     assert walk.index('references.procfs_view_origins->validate()') < walk.rindex('LookupHandle candidate{}')
     assert walk.index('populate_lookup_path_fields(') < walk.index('set_procfs_view_origins(')
     assert 'reset_root = references.view.root()' in walk
+    directory_policy = body_after(proc, 'auto private_directory_policy(')
+    assert 'data.target->state.load(' in directory_policy
+    assert 'data.node.pid == data.target->pid' in directory_policy
+    directory_path = body_after(proc, 'auto procfs_directory_path(')
+    assert directory_path.count('private_directory_policy(directory)') == 2
+    assert directory_path.index('if (static_cast<size_t>(length) + 1 > capacity)') < directory_path.index('std::memcpy(buffer,')
+    for prohibited in ('find_task_by_', 'procfs_lookup_path', 'new ', 'release()', 'vfs_path'):
+        assert prohibited not in directory_path, prohibited
+    component = body_after(proc, 'auto procfs_lookup_component_as(')
+    assert component.index('*scope != source.pid_view') < component.index('File* candidate')
+    assert component.index('length == COMPONENT_LIMIT') < component.index('File* candidate')
+    assert 'strchr(' not in component
+    assert component.count('procfs_lookup_path_as(') == 1
+    root_branch = component.index('source.node.type == ProcNodeType::ROOT_DIR) {')
+    thread_branch = component.index('source.node.type == ProcNodeType::TASK_DIR) {')
+    assert root_branch < component.index('procfs_lookup_path_as(') < thread_branch
+    assert 'target->credential_owner() == group' in component
+    assert component.index('authorize_private_procfs(') < component.index('task_fd_file_retain(')
+    assert component.index('vfs_put_file(description)') < component.index('revalidate_private_procfs(')
+    assert 'select(child.type, source.target' in component
+    assert 'select(ProcNodeType::TASK_DIR, source.target->credential_owner()' in component
+    assert component.index('private_directory_policy(directory);', component.index('if (candidate == nullptr)')) < component.index('*result_out = 0')
+    path_copy = body_after(core, 'auto copy_directory_lookup_path(')
+    assert path_copy.index('if (!PRIVATE_PROCFS)') < path_copy.index('directory->vfs_path')
+    assert 'procfs::procfs_directory_path(directory' in path_copy
+    assert 'PROC_DIRECTORY->private_data == nullptr) return -EBADF' in binding
+    assert 'procfs::procfs_lookup_component_as(credentials, epoch.caller_pid, PROC_DIRECTORY' in binding
+    assert 'data->pid_view == *pid_view' in walk
+    assert 'PRIVATE_PROC_DIRECTORY = PRIVATE && !serialized && anchor->fs_type == FSType::PROCFS' in walk
+    assert 'root_anchor && anchor->fs_type != FSType::TMPFS && anchor->fs_type != FSType::XFS' in walk
+    unscoped = validation[validation.index('if (!view) {'):validation.index('if (handle.authorization().root_identity_view')]
+    assert unscoped.index('procfs::procfs_revalidate_lookup_result(') < unscoped.index('references.capture(')
+    assert 'NativeDirectoryMembershipAccess references(membership)' in unscoped
+    assert 'validate_native_mount_attachment(mount, covered' in unscoped
+    for prohibited in ('new ', 'procfs_lookup_path', 'release()', '->capture('):
+        assert prohibited not in unscoped, prohibited
     ownership = (ROOT / 'modules/kern/src/vfs/lookup.cpp').read_text()
     assert 'std::exchange(other.procfs_view_origins_, nullptr)' in ownership
     reset = body_after(ownership, 'void LookupHandle::reset(')
