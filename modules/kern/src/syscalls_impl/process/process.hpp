@@ -35,6 +35,9 @@ auto set_creation_mask(ker::mod::sched::task::Task& subject, uint32_t mask) -> i
 void cleanup_signal_targets(ker::mod::sched::task::Task& owner);
 auto signal_as(ker::mod::sched::task::Task& target, const ker::mod::security::Snapshot& caller,
                const ker::mod::sched::session::Identity& caller_job, int signum) -> int;
+// Borrow retained requester. Private public PID/TID/group selection and effects
+// only; Host callers keep the syscall's existing physical/distributed path.
+auto signal_in_namespace(ker::mod::sched::task::Task& requester, int64_t pid, int signum) -> int;
 // Consumes one retained canonical process reference. The caller has already
 // established a terminal object grant; current job membership is checked here.
 auto signal_terminal_as(ker::mod::sched::task::Task& target, const ker::mod::sched::session::Identity& expected, int signum, uint16_t hops)
@@ -77,6 +80,7 @@ auto with_local_signal_targets(LocalSignalCallback callback, void* context, Loca
 
 #ifdef WOS_SELFTEST
 auto process_selftest_signal_snapshot_ownership() -> bool;
+auto process_selftest_namespace_signal_interleaving() -> bool;
 auto process_selftest_signal_receiver_pages() -> bool;
 auto process_selftest_group_signal_authority() -> bool;
 auto process_selftest_terminal_signal_authority() -> bool;

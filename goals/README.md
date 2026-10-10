@@ -72,9 +72,11 @@ pthread/COW TCB adapters now pass native production API tests, including explici
 shared-clone physical-alias refusal (78,906 assertions, zero failures,1,289 cases).
 Public wait now preserves local and event-time group names, exact scope, public
 wakes, claims/reaping and Host supervision (79,109 assertions, zero failures,
-1,295 cases; all 43 compartment cases). Disposable test images were audited and
-pruned; Goal39 remains active. Public compartment admission, remaining
-procfs/positive PID/signal/ptrace, namespace-
+1,295 cases; all 43 compartment cases). Private signal PID/TID/group selectors,
+exact admission and closure/route interleavings now pass native production tests
+(79,602 assertions, zero failures, 1,302 cases; all 50 compartment cases).
+Disposable test images were audited and pruned; Goal39 remains active.
+Public compartment admission, remaining procfs/positive PID/ptrace, namespace-
 init lifecycle, complete WKI/network enforcement and full service/runtime
 criteria remain incomplete. Goal39 remains active with all ten criteria required.
 

@@ -11,6 +11,7 @@ PROCESS_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / 
 EXIT_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / "exit.cpp"
 CHILD_EVENTS_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / "child_events.cpp"
 SCHEDULER_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "scheduler.cpp"
+PROCESS_TIMER_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "ktime" / "process_timer.cpp"
 REMOTE_COMPUTE_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_compute.cpp"
 
 
@@ -47,6 +48,8 @@ def test_task_signal_fields_are_atomic() -> None:
     task_hpp = TASK_HPP.read_text()
     for snippet in [
         "std::atomic<uint64_t> sig_pending{0};",
+        "std::atomic<uint64_t> timer_sig_pending{0};",
+        "std::atomic<uint64_t> timer_sig_claimed{0};",
         "std::atomic<uint64_t> sig_mask{0};",
         "std::atomic<uint64_t> sig_mask_seq{0};",
         "sig_pending.fetch_or(mask, order)",
@@ -106,8 +109,17 @@ def test_signal_producers_use_atomic_fetch_or_helpers() -> None:
     for name in ["auto signal_terminal_process_group(", "void revoke_terminal_attachment("]:
         require(function_body(scheduler_cpp, name), "signal_terminal_source_as", "terminal source admission")
     require(function_body(process_cpp, "auto terminal_source_signal("), "generate_group_signal", "admitted terminal generation")
-    if scheduler_cpp.count("signal_add_pending_mask(1ULL << (14 - 1))") < 2:
-        fail("scheduler SIGALRM timer paths must publish pending bits with atomic helpers")
+    # Interval timers now own a shared canonical-process pending pool. Check
+    # its actual producer/claim path, rather than obsolete scheduler callsites.
+    timers = PROCESS_TIMER_CPP.read_text()
+    require(function_body(timers, "auto publish_locked("),
+            "owner.timer_sig_pending.fetch_or(signals, std::memory_order_release)", "timer atomic publication")
+    require(function_body(timers, "auto charge_locked("), "publish_locked(owner, 0b110)", "CPU timer publication")
+    require(function_body(scheduler_cpp, "void process_tasks("), "time::process_timer::service_deferred_wake()",
+            "scheduler services timer wake requests")
+    require(function_body(TASK_HPP.read_text(), "auto claim_signal_for_delivery("),
+            "SignalPendingClaim::acquire(owner->timer_sig_pending, owner->timer_sig_claimed, mask)",
+            "shared timer pending delivery claim")
     require(
         function_body(remote_compute_cpp, "run_one_proxy_exit"),
         "child_events::publish_exit(task)",

@@ -1228,7 +1228,9 @@ struct Task {
     // Caller holds VM publication for current credential/job admission. This
     // additionally serializes the value capture with RX route publication.
     [[nodiscard]] auto signal_admission_identity() const -> SignalAdmissionIdentity;
-    [[nodiscard]] auto begin_local_signal_admission() -> SignalAdmissionIdentity;
+    // Optional kernel-only output shares the admitted physical job snapshot;
+    // no Task or SignalAdmissionIdentity layout change is needed.
+    [[nodiscard]] auto begin_local_signal_admission(session::Names* visible_job = nullptr) -> SignalAdmissionIdentity;
     void end_local_signal_admission();
     [[nodiscard]] auto local_signal_admissions_drained() const -> bool;
 

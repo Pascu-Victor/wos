@@ -141,8 +141,9 @@ class PendingSignalTarget {
         --count;
         return target;
     }
-    auto admit_local(ker::mod::sched::task::Task& target) -> ker::mod::sched::task::Task::SignalAdmissionIdentity {
-        auto identity = target.begin_local_signal_admission();
+    auto admit_local(ker::mod::sched::task::Task& target, ker::mod::sched::session::Names* visible_job = nullptr)
+        -> ker::mod::sched::task::Task::SignalAdmissionIdentity {
+        auto identity = target.begin_local_signal_admission(visible_job);
         if (identity.local_lease) local_admission = &target;
         return identity;
     }
@@ -1828,6 +1829,10 @@ auto wos_proc_kill(int64_t pid, int sig) -> uint64_t {
     if (self == nullptr) {
         return static_cast<uint64_t>(-ESRCH);
     }
+    auto const* scope = self->pid_namespace();
+    if (scope == nullptr) return static_cast<uint64_t>(-ESRCH);
+    if (scope->closed()) return static_cast<uint64_t>(-EIDRM);
+    if (!scope->is_host()) return static_cast<uint64_t>(signal_in_namespace(*self, pid, sig));
     auto const CALLER = self->credentials();
     auto const CALLER_JOB = self->job_identity();
     auto deliver = [&](sched::task::Task* target) -> int { return signal_as(*target, CALLER, CALLER_JOB, sig); };
@@ -2036,7 +2041,151 @@ auto signal_local_as(ker::mod::sched::task::Task& target, const ker::mod::securi
 auto matches_numeric_process_group(ker::mod::sched::task::Task* target, void* context) -> bool {
     return target->type == ker::mod::sched::task::TaskType::PROCESS && target->job_identity().pgid == *static_cast<uint64_t*>(context);
 }
+
+struct NamespaceSignalSelection {
+    const ker::mod::sched::task::Task& requester;
+    uint64_t group{};
+};
+
+auto matches_namespace_process_group(ker::mod::sched::task::Task* target, void* context) -> bool {
+    auto const& selection = *static_cast<const NamespaceSignalSelection*>(context);
+    return target->type == ker::mod::sched::task::TaskType::PROCESS && is_live_signal_target(*target) &&
+           ker::mod::sched::task::same_pid_namespace(selection.requester, *target) && target->namespace_tid() != 0 &&
+           target->job_identity_snapshot().visible.pgid == selection.group;
+}
+
+// The callbacks allow native selftests to interleave closure/cutover with the
+// actual admission/effect flow. Production supplies empty callbacks. No remote
+// route, usercopy, allocation or wake occurs under namespace admission.
+template <typename Ready, typename Admitted>
+auto namespace_signal_local(ker::mod::sched::task::Task& target, const NamespaceSignalSelection& selection,
+                            const ker::mod::security::Snapshot& caller, const ker::mod::sched::session::Identity& caller_job, int signum,
+                            Ready&& ready, Admitted&& admitted) -> int {
+    using namespace ker::mod;
+    PendingSignalTarget admission;
+    ready();
+    {
+        ker::syscall::vmem::SharedVmemPublicationGuard publication;
+        auto const* scope = selection.requester.pid_namespace();
+        if (scope == nullptr || scope->is_host() || !sched::task::same_pid_namespace(selection.requester, target) ||
+            target.namespace_tid() == 0)
+            return -ESRCH;
+        sched::pid_ns::PublicationGuard const NAMESPACE_ADMISSION(*scope);
+        if (!NAMESPACE_ADMISSION.open()) return -EIDRM;
+        if (!is_live_signal_target(target)) return -ESRCH;
+        if (target.type != sched::task::TaskType::PROCESS) return -EPERM;
+        auto const* owner = target.credential_owner();
+        if (target.is_thread && (owner == nullptr || target.pagemap != owner->pagemap)) return -ESRCH;
+        sched::session::Names visible;
+        auto const ADMISSION = admission.admit_local(target, &visible);
+        if (ADMISSION.remote) return -ENOTSUP;
+        if (!ADMISSION.local_lease) return -EAGAIN;
+        if (selection.group != 0 && selection.group != visible.pgid) return -ESRCH;
+        if (!security::may_signal(caller, ADMISSION.credentials, sched::session::same_session(caller_job, ADMISSION.job), signum == 18))
+            return -EPERM;
+    }
+    // An admitted lease may finish after closure, and exec must drain it before
+    // moving the pending state. Guards are gone before any callback or wake.
+    admitted();
+    if (signum == 0) return 0;
+    if (target.group_signal_visible() && is_ptrace_launch_stop_signal(signum) &&
+        debug::ptrace::report_signal_stop(target, static_cast<uint32_t>(signum)))
+        return 0;
+    if (target.generate_group_signal(1ULL << (signum - 1))) sched::wake_task_for_signal(&target);
+    return 0;
+}
 }  // namespace
+
+auto signal_in_namespace(ker::mod::sched::task::Task& requester, int64_t pid, int signum) -> int {
+    using namespace ker::mod;
+    if (signum < 0 || std::cmp_greater(signum, sched::task::Task::MAX_SIGNALS)) return -EINVAL;
+    auto const* scope = requester.pid_namespace();
+    if (scope == nullptr) return -ESRCH;
+    if (scope->is_host()) return -EINVAL;
+    if (scope->closed()) return -EIDRM;
+    if (requester.namespace_tid() == 0) return -ESRCH;
+    auto const CALLER = requester.credentials();
+    auto const JOB = requester.job_identity_snapshot();
+    NamespaceSignalSelection selection{requester};
+    if (pid > 0) {
+        auto* target = sched::find_task_by_visible_pid_safe(requester, static_cast<uint64_t>(pid));
+        if (target == nullptr) return scope->closed() ? -EIDRM : -ESRCH;
+        PendingSignalTarget retained(*target);
+        return namespace_signal_local(*target, selection, CALLER, JOB.internal, signum, [] {}, [] {});
+    }
+    // Preserve WOS's pid=-1 current-group convention. Local groups are durable
+    // values; discovering or delivering one never looks up a numeric leader.
+    selection.group = pid < -1 ? static_cast<uint64_t>(-(pid + 1)) + 1 : JOB.visible.pgid;
+    if (selection.group == 0 || selection.group > sched::pid_ns::MAX_LOCAL_ID) return -ESRCH;
+    PendingSignalTarget cohort;
+    int const CAPTURED = cohort.capture(matches_namespace_process_group, &selection);
+    if (CAPTURED != 0) return CAPTURED;
+    if (scope->closed()) return -EIDRM;
+    size_t accepted = 0;
+    int error = -ESRCH;
+    while (auto* target = cohort.take()) {
+        PendingSignalTarget retained(*target);
+        if (target->is_thread && signum >= 18 && signum <= 22) continue;
+        int const RESULT = namespace_signal_local(*target, selection, CALLER, JOB.internal, signum, [] {}, [] {});
+        accepted += RESULT == 0 ? 1 : 0;
+        if (RESULT != 0 && RESULT != -ESRCH && (error == -ESRCH || RESULT == -EPERM)) error = RESULT;
+    }
+    return accepted != 0 ? 0 : error;
+}
+
+#ifdef WOS_SELFTEST
+auto process_selftest_namespace_signal_interleaving() -> bool {
+    using namespace ker::mod;
+    auto const BASELINE = sched::pid_ns::live_namespace_count();
+    bool ok = true;
+    for (unsigned scenario = 0; scenario != 4; ++scenario) {
+        sched::pid_ns::NamespaceRef scope;
+        if (sched::pid_ns::create_namespace(scope) != 0) return false;
+        auto requester = std::make_unique<sched::task::Task>();
+        auto target = std::make_unique<sched::task::Task>();
+        requester->pid = sched::task::get_next_pid();
+        target->pid = sched::task::get_next_pid();
+        target->type = sched::task::TaskType::PROCESS;
+        target->hide_group_signals_until_publication();
+        if (!requester->initialize_pid_namespace(scope) || !target->initialize_pid_namespace(scope)) return false;
+        auto const JOB = requester->job_identity_snapshot().internal;
+        target->initialize_job_identity(JOB, sched::session::Names{1, 2});
+        NamespaceSignalSelection selection{*requester, 2};
+        bool admitted = false;
+        int const RESULT = namespace_signal_local(
+            *target, selection, requester->credentials(), JOB, 10,
+            [&] {
+                if (scenario == 0) scope.close();
+                if (scenario == 2) target->publish_accepted_signal_route(0x7B7F001, 123);
+                if (scenario == 3) {
+                    ker::syscall::vmem::SharedVmemPublicationGuard publication;
+                    ok &= child_events::update_job_identity(*target, JOB, sched::session::Names{1, 7});
+                }
+            },
+            [&] {
+                admitted = true;
+                ok &= !target->local_signal_admissions_drained();
+                // Both operations reacquire metadata admission. Their success
+                // also proves that no namespace/path guard spans this callback.
+                scope.close();
+                target->publish_accepted_signal_route(0x7B7F001, 123);
+                auto const AFTER = target->begin_local_signal_admission();
+                ok &= AFTER.remote && !AFTER.local_lease;
+            });
+        int const EXPECTED = scenario == 0 ? -EIDRM : scenario == 1 ? 0 : scenario == 2 ? -ENOTSUP : -ESRCH;
+        ok &= RESULT == EXPECTED && admitted == (scenario == 1);
+        uint64_t const PENDING = scenario == 1 ? uint64_t{1} << 9 : 0;
+        ok &= target->signal_pending_bits() == PENDING && !target->group_signal_visible();
+        ok &= target->local_signal_admissions_drained() && target->ref_count.load() == 1;
+        auto const CURRENT_JOB = target->job_identity();
+        ok &= CURRENT_JOB.session_id == JOB.session_id && CURRENT_JOB.pgid == JOB.pgid && CURRENT_JOB.origin == JOB.origin &&
+              CURRENT_JOB.group_origin == JOB.group_origin;
+        if (scenario == 1) ok &= ker::net::wki::wki_exec_signal_snapshot(*target).pending == PENDING;
+        if (scenario == 3) ok &= target->job_identity_snapshot().visible.pgid == 7;
+    }
+    return ok && sched::pid_ns::live_namespace_count() == BASELINE;
+}
+#endif
 
 auto signal_as(ker::mod::sched::task::Task& target, const ker::mod::security::Snapshot& caller,
                const ker::mod::sched::session::Identity& caller_job, int signum) -> int {

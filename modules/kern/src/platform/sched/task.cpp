@@ -977,10 +977,12 @@ auto Task::signal_admission_identity() const -> SignalAdmissionIdentity {
     return identity;
 }
 
-auto Task::begin_local_signal_admission() -> SignalAdmissionIdentity {
+auto Task::begin_local_signal_admission(session::Names* visible_job) -> SignalAdmissionIdentity {
     uint64_t const FLAGS = path_metadata_lock.lock_irqsave();
+    auto const JOB = job_identity_snapshot();
     SignalAdmissionIdentity identity{
-        .credentials = credentials(), .job = job_identity(), .remote = m_accepted_signal_task_id != 0 || wki_proxy_task_id != 0};
+        .credentials = credentials(), .job = JOB.internal, .remote = m_accepted_signal_task_id != 0 || wki_proxy_task_id != 0};
+    if (visible_job != nullptr) *visible_job = JOB.visible;
     if (!identity.remote && m_local_signal_admissions.load(std::memory_order_relaxed) != UINT32_MAX) {
         m_local_signal_admissions.fetch_add(1, std::memory_order_relaxed);
         identity.local_lease = true;

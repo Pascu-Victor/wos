@@ -20,6 +20,7 @@
 #include <platform/security/credentials.hpp>
 #include <platform/sys/usercopy.hpp>
 #include <syscalls_impl/process/child_events.hpp>
+#include <syscalls_impl/process/process.hpp>
 #include <syscalls_impl/shm/shm.hpp>
 #include <syscalls_impl/vmem/sys_vmem.hpp>
 #include <test/ktest.hpp>
@@ -234,6 +235,252 @@ void expect_visible(const Task& requester, uint64_t id, Task* expected, bool lif
     if (found != nullptr) found->release();
 }
 }  // namespace
+
+namespace {
+void hide_signal_fixtures(std::initializer_list<Task*> tasks) {
+    for (auto* task : tasks) task->hide_group_signals_until_publication();
+}
+auto private_signal(Task& requester, int64_t id, int signum) -> int {
+    return ker::syscall::process::signal_in_namespace(requester, id, signum);
+}
+}  // namespace
+
+KTEST(CompartmentSignal, PositiveLocalNamesExcludeSiblingHostAndPhysicalAliases) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    auto const ACTIVE = sched::get_active_task_count();
+    auto const INDEXED = sched::get_scoped_pid_task_count();
+    {
+        pid_ns::NamespaceRef a, b;
+        KREQUIRE_EQ(pid_ns::create_namespace(a), 0);
+        KREQUIRE_EQ(pid_ns::create_namespace(b), 0);
+        RegistryTask caller, target, sibling, foreign, host, thread;
+        KREQUIRE_TRUE(caller.task->initialize_pid_namespace(a));
+        KREQUIRE_TRUE(target.task->initialize_pid_namespace(a));
+        KREQUIRE_TRUE(sibling.task->initialize_pid_namespace(b));
+        KREQUIRE_TRUE(foreign.task->initialize_pid_namespace(b));
+        thread.task->is_thread = true;
+        thread.task->owner_pid = target.task->pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(*thread.task, *target.task));
+        hide_signal_fixtures(
+            {caller.task.get(), target.task.get(), sibling.task.get(), foreign.task.get(), host.task.get(), thread.task.get()});
+        for (auto* fixture : {&caller, &target, &sibling, &foreign, &host, &thread}) KREQUIRE_TRUE(fixture->publish());
+        KEXPECT_EQ(target.task->namespace_tid(), foreign.task->namespace_tid());
+        KEXPECT_EQ(private_signal(*caller.task, 2, 0), 0);
+        KEXPECT_EQ(target.task->signal_pending_bits(), uint64_t{0});
+        KEXPECT_EQ(private_signal(*caller.task, 2, 10), 0);
+        KEXPECT_EQ(target.task->signal_pending_bits(), uint64_t{1} << 9);
+        KEXPECT_EQ(private_signal(*caller.task, static_cast<int64_t>(thread.task->namespace_tid()), 12), 0);
+        KEXPECT_EQ(thread.task->signal_pending_bits(), uint64_t{1} << 11);
+        for (auto* other : {foreign.task.get(), sibling.task.get(), host.task.get()}) {
+            KEXPECT_EQ(private_signal(*caller.task, static_cast<int64_t>(other->pid), 10), -ESRCH);
+            KEXPECT_EQ(other->signal_pending_bits(), uint64_t{0});
+        }
+        KEXPECT_EQ(private_signal(*caller.task, static_cast<int64_t>(target.task->pid), 10), -ESRCH);
+        KEXPECT_EQ(private_signal(*caller.task, 2, -1), -EINVAL);
+        KEXPECT_EQ(private_signal(*caller.task, 2, 65), -EINVAL);
+        KEXPECT_EQ(private_signal(*caller.task, std::numeric_limits<int64_t>::min(), 10), -ESRCH);
+        KEXPECT_TRUE(target.task->local_signal_admissions_drained());
+        KEXPECT_TRUE(thread.task->local_signal_admissions_drained());
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+    KEXPECT_EQ(sched::get_active_task_count(), ACTIVE);
+    KEXPECT_EQ(sched::get_scoped_pid_task_count(), INDEXED);
+}
+
+KTEST(CompartmentSignal, DurableLocalGroupsSurviveLeaderDestructionWithoutForeignDelivery) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef a, b;
+        KREQUIRE_EQ(pid_ns::create_namespace(a), 0);
+        KREQUIRE_EQ(pid_ns::create_namespace(b), 0);
+        RegistryTask caller, member, foreign, host, thread;
+        auto leader = std::make_unique<RegistryTask>();
+        KREQUIRE_TRUE(caller.task->initialize_pid_namespace(a));
+        KREQUIRE_TRUE(leader->task->initialize_pid_namespace(a));
+        auto const CALLER_JOB = caller.task->job_identity_snapshot();
+        leader->task->initialize_job_identity(CALLER_JOB.internal, CALLER_JOB.visible);
+        KREQUIRE_EQ(session::create(*leader->task), int64_t{2});
+        auto const GROUP = leader->task->job_identity_snapshot();
+        KREQUIRE_TRUE(member.task->initialize_pid_namespace(a));
+        member.task->initialize_job_identity(GROUP.internal, GROUP.visible);
+        KREQUIRE_TRUE(foreign.task->initialize_pid_namespace(b));
+        foreign.task->initialize_job_identity(GROUP.internal, GROUP.visible);
+        host.task->initialize_job_identity(GROUP.internal);
+        thread.task->is_thread = true;
+        thread.task->owner_pid = member.task->pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(*thread.task, *member.task));
+        hide_signal_fixtures(
+            {caller.task.get(), member.task.get(), foreign.task.get(), host.task.get(), thread.task.get(), leader->task.get()});
+        for (auto* fixture : {&caller, &member, &foreign, &host, &thread, leader.get()}) KREQUIRE_TRUE(fixture->publish());
+        leader.reset();
+        KEXPECT_EQ(private_signal(*caller.task, -2, 10), 0);
+        KEXPECT_EQ(member.task->signal_pending_bits(), uint64_t{1} << 9);
+        KEXPECT_EQ(thread.task->signal_pending_bits(), uint64_t{1} << 9);
+        KEXPECT_EQ(foreign.task->signal_pending_bits(), uint64_t{0});
+        KEXPECT_EQ(host.task->signal_pending_bits(), uint64_t{0});
+        member.task->signal_clear_pending_mask(~uint64_t{0});
+        thread.task->signal_clear_pending_mask(~uint64_t{0});
+        KEXPECT_EQ(private_signal(*caller.task, -2, 19), 0);
+        KEXPECT_EQ(member.task->signal_pending_bits(), uint64_t{1} << 18);
+        KEXPECT_EQ(thread.task->signal_pending_bits(), uint64_t{0});
+        for (int64_t id : {int64_t{0}, int64_t{-1}}) {
+            caller.task->signal_clear_pending_mask(~uint64_t{0});
+            KEXPECT_EQ(private_signal(*caller.task, id, 12), 0);
+            KEXPECT_EQ(caller.task->signal_pending_bits(), uint64_t{1} << 11);
+            KEXPECT_EQ(thread.task->signal_pending_bits(), uint64_t{0});
+        }
+        KEXPECT_EQ(private_signal(*caller.task, -9999, 10), -ESRCH);
+        KEXPECT_TRUE(member.task->local_signal_admissions_drained());
+        KEXPECT_TRUE(thread.task->local_signal_admissions_drained());
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentSignal, CredentialsSavedIdsAndContinueUseCurrentExactAdmission) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        RegistryTask caller, target;
+        KREQUIRE_TRUE(caller.task->initialize_pid_namespace(scope));
+        KREQUIRE_TRUE(target.task->initialize_pid_namespace(scope));
+        auto const JOB = caller.task->job_identity_snapshot();
+        target.task->initialize_job_identity(JOB.internal, JOB.visible);
+        ker::mod::security::Snapshot user, other, saved;
+        KREQUIRE_EQ(ker::mod::security::Snapshot::restore_fields({.user = {100, 100, 100}, .group = {100, 100, 100}}, user), 0);
+        KREQUIRE_EQ(ker::mod::security::Snapshot::restore_fields({.user = {200, 200, 200}, .group = {200, 200, 200}}, other), 0);
+        KREQUIRE_EQ(ker::mod::security::Snapshot::restore_fields({.user = {200, 200, 100}, .group = {200, 200, 200}}, saved), 0);
+        KREQUIRE_EQ(resource::initialize_credentials(*caller.task, user), 0);
+        KREQUIRE_EQ(resource::initialize_credentials(*target.task, other), 0);
+        hide_signal_fixtures({caller.task.get(), target.task.get()});
+        KREQUIRE_TRUE(caller.publish());
+        KREQUIRE_TRUE(target.publish());
+        KEXPECT_EQ(private_signal(*caller.task, 2, 0), -EPERM);
+        KEXPECT_EQ(private_signal(*caller.task, 2, 12), -EPERM);
+        KEXPECT_EQ(target.task->signal_pending_bits(), uint64_t{0});
+        KEXPECT_EQ(private_signal(*caller.task, 2, 18), 0);
+        KEXPECT_EQ(target.task->signal_pending_bits(), uint64_t{1} << 17);
+        target.task->signal_clear_pending_mask(~uint64_t{0});
+        auto changed = JOB.internal;
+        changed.session_id = target.task->pid;
+        KREQUIRE_TRUE(child_events::update_job_identity(*target.task, changed, session::Names{2, 1}));
+        KEXPECT_EQ(private_signal(*caller.task, 2, 18), -EPERM);
+        KEXPECT_EQ(target.task->signal_pending_bits(), uint64_t{0});
+        // These are exclusively owned, unscheduled construction fixtures.
+        KREQUIRE_EQ(resource::initialize_credentials(*target.task, saved), 0);
+        KEXPECT_EQ(private_signal(*caller.task, 2, 12), 0);
+        KEXPECT_EQ(target.task->signal_pending_bits(), uint64_t{1} << 11);
+        KEXPECT_TRUE(target.task->credentials() == saved);
+        KEXPECT_TRUE(target.task->local_signal_admissions_drained());
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentSignal, ClosedUnboundAndRemoteAdmissionNeverChangePending) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        RegistryTask caller, target;
+        KREQUIRE_TRUE(caller.task->initialize_pid_namespace(scope));
+        KREQUIRE_TRUE(target.task->initialize_pid_namespace(scope));
+        hide_signal_fixtures({caller.task.get(), target.task.get()});
+        KREQUIRE_TRUE(caller.publish());
+        KREQUIRE_TRUE(target.publish());
+        auto unbound = std::make_unique<Task>();
+        unbound->is_thread = true;
+        KEXPECT_EQ(private_signal(*unbound, 2, 10), -ESRCH);
+        // A retained owner alone does not publish the thread's local identity.
+        KREQUIRE_TRUE(unbound->resource_owner.attach(caller.task.get()));
+        KEXPECT_EQ(unbound->namespace_tid(), uint64_t{0});
+        KEXPECT_EQ(private_signal(*unbound, 2, 10), -ESRCH);
+        target.task->set_wki_proxy_task_id(42);
+        KEXPECT_EQ(private_signal(*caller.task, 2, 0), -ENOTSUP);
+        KEXPECT_EQ(private_signal(*caller.task, 2, 10), -ENOTSUP);
+        target.task->set_wki_proxy_task_id(0);
+        KEXPECT_EQ(private_signal(*caller.task, 2, 0), 0);
+        target.task->publish_accepted_signal_route(43, 123);
+        KEXPECT_EQ(private_signal(*caller.task, 2, 10), -ENOTSUP);
+        KEXPECT_EQ(private_signal(*caller.task, -2, 10), -ENOTSUP);
+        target.task->state.store(sched::task::TaskState::EXITING);
+        KEXPECT_EQ(private_signal(*caller.task, 2, 10), -ESRCH);
+        target.task->state.store(sched::task::TaskState::ACTIVE);
+        scope.close();
+        KEXPECT_EQ(private_signal(*caller.task, 2, 10), -EIDRM);
+        KEXPECT_EQ(private_signal(*caller.task, -2, 10), -EIDRM);
+        KEXPECT_EQ(target.task->signal_pending_bits(), uint64_t{0});
+        KEXPECT_TRUE(target.task->local_signal_admissions_drained());
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentSignal, RetiredThreadImagesCannotReceiveLocalSignals) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        RegistryTask caller, owner, thread;
+        KREQUIRE_TRUE(caller.task->initialize_pid_namespace(scope));
+        KREQUIRE_TRUE(owner.task->initialize_pid_namespace(scope));
+        thread.task->is_thread = true;
+        thread.task->owner_pid = owner.task->pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(*thread.task, *owner.task));
+        hide_signal_fixtures({caller.task.get(), owner.task.get(), thread.task.get()});
+        KREQUIRE_TRUE(caller.publish());
+        KREQUIRE_TRUE(owner.publish());
+        KREQUIRE_TRUE(thread.publish());
+        auto first = std::make_unique<ker::mod::mm::paging::PageTable>();
+        auto retired = std::make_unique<ker::mod::mm::paging::PageTable>();
+        owner.task->pagemap = first.get();
+        thread.task->pagemap = retired.get();
+        KEXPECT_EQ(private_signal(*caller.task, 3, 10), -ESRCH);
+        KEXPECT_EQ(thread.task->signal_pending_bits(), uint64_t{0});
+        thread.task->pagemap = first.get();
+        KEXPECT_EQ(private_signal(*caller.task, 3, 0), 0);
+        thread.task->pagemap = nullptr;
+        owner.task->pagemap = nullptr;
+        KEXPECT_TRUE(thread.task->local_signal_admissions_drained());
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentSignal, LargeNativeCohortDrainsRegistryReferences) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    auto const ACTIVE = sched::get_active_task_count();
+    auto const INDEXED = sched::get_scoped_pid_task_count();
+    {
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        RegistryTask caller;
+        KREQUIRE_TRUE(caller.task->initialize_pid_namespace(scope));
+        caller.task->hide_group_signals_until_publication();
+        KREQUIRE_TRUE(caller.publish());
+        auto const JOB = caller.task->job_identity_snapshot();
+        std::array<RegistryTask, 40> members;
+        for (auto& member : members) {
+            KREQUIRE_TRUE(member.task->initialize_pid_namespace(scope));
+            member.task->initialize_job_identity(JOB.internal, JOB.visible);
+            member.task->hide_group_signals_until_publication();
+            KREQUIRE_TRUE(member.publish());
+        }
+        KEXPECT_EQ(private_signal(*caller.task, 0, 10), 0);
+        KEXPECT_EQ(caller.task->signal_pending_bits(), uint64_t{1} << 9);
+        for (auto const& member : members) {
+            KEXPECT_EQ(member.task->signal_pending_bits(), uint64_t{1} << 9);
+            KEXPECT_EQ(member.task->ref_count.load(), uint32_t{1});
+            KEXPECT_TRUE(member.task->local_signal_admissions_drained());
+            KEXPECT_FALSE(member.task->group_signal_visible());
+        }
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+    KEXPECT_EQ(sched::get_active_task_count(), ACTIVE);
+    KEXPECT_EQ(sched::get_scoped_pid_task_count(), INDEXED);
+}
+
+KTEST(CompartmentSignal, ClosureRouteAndLocalGroupChangesLinearizeWithAdmission) {
+    KEXPECT_TRUE(ker::syscall::process::process_selftest_namespace_signal_interleaving());
+    KEXPECT_TRUE(ker::syscall::process::process_selftest_signal_snapshot_ownership());
+}
 
 KTEST(CompartmentWait, SameNumbersAndForeignMembershipNeverAuthorizePublicWait) {
     auto const BASELINE = pid_ns::live_namespace_count();

@@ -437,6 +437,51 @@ poweroff. Four inactive private images (258,031,616 allocated bytes) were verifi
 and pruned; disposable image use returned to zero. Small failed sandbox/cache/
 stale-source-oracle receipts are retained alongside the successful retries.
 
+## Local signal selection and admission
+
+Private public kill resolves positive PID/TID values only in the caller's exact
+retained PID namespace. Zero and minus one preserve WOS's current-group convention;
+other negative values select durable local group names. Group selection does not
+depend on a live leader. Same-number siblings, physical IDs and Host tasks never
+become fallback targets. Unknown or uninstalled identity fails with ESRCH and a
+closed namespace with EIDRM. Host retains its physical and distributed routing.
+
+A bounded registry snapshot owns group members before effects. Each target is
+admitted again under VM publication and exact namespace admission, then through
+the existing local signal lease. Visible PGID and physical session come from one
+job snapshot. Existing credential, saved-ID, SIGNAL authority, SIGCONT session,
+live-task and retired-thread-image checks remain in force. Accepted or proxy
+remote routes fail locally with ENOTSUP; private delivery never redirects to WKI.
+Group signals 18..22 retain the existing direct-thread exclusion and partial
+delivery policy. Snapshot allocation fails before any member receives a signal.
+
+Admission guards end before ptrace, pending generation or scheduler wakes. An
+already admitted local lease can finish after closure or route publication;
+exec drains it before transferring pending state. Delivery uses the existing
+pending-before-visibility publication handshake, so an unpublished Task retains
+its signal without being posted to the scheduler. Task storage, physical job
+identity, syscall widths, wire formats and trusted lifecycle/terminal/WKI signal
+APIs are unchanged. Namespace-init drain must integrate these admitted effects
+before public compartment creation can be enabled.
+
+Seven native cases exercise actual Tasks, scoped registry lookup/cohorts, pending
+state and reference/lease cleanup. They cover local PID/TID and group selectors,
+foreign and physical aliases, actual leader destruction, credentials/SIGCONT,
+unknown/closed scopes, remote refusal, stale thread images, a 41-member cohort,
+and deterministic closure/route/local-group changes around admission. Fixtures
+remain unpublished to the scheduler. Full scheduled service qualification and
+all ten goal criteria remain pending.
+
+Checkpoint 11 Normal Build WOS, isolated fast diagnostic build, format-only check
+and 28 selected Host CTests pass. Actual KTEST17 passes 79,602 assertions with zero
+failures across 1,302 cases, including all 50 required compartment cases and
+normal poweroff.
+The first Host run found an unbuilt pending-signal binary and stale timer source
+assertion. The assertion also failed at the committed baseline; the test now
+checks the current atomic timer producer/claim path. Failed and zero-selection
+receipts remain alongside successful reruns. Four proven inactive private images
+(258,162,688 allocated bytes) were pruned, returning disposable usage to zero.
+
 ## Verification checkpoint
 
 The initial `compartment_policy_test` suite checks actual production preparation

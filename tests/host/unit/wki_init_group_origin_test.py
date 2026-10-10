@@ -72,6 +72,11 @@ void require(bool value, const char* message) {
 }
 }
 namespace ker::mod::sched::task {
+struct Scope {
+    bool host = true, shut = false;
+    auto is_host() const -> bool { return host; }
+    auto closed() const -> bool { return shut; }
+};
 struct Task {
     /* actual task constants */
     uint64_t pid = 0, owner_pid = 0;
@@ -84,6 +89,9 @@ struct Task {
     uint16_t location = 249;
     uint32_t location_boot = 11;
     uint64_t proxy_remote_pid = 0, pending = 0;
+    Scope scope{};
+    bool unbound = false;
+    auto pid_namespace() const -> const Scope* { return unbound ? nullptr : &scope; }
     auto credentials() const { return creds; }
     auto job_identity() const { return job; }
     auto signal_home_identity(bool = true) const { return home; }
@@ -95,6 +103,8 @@ using Task = ker::mod::sched::task::Task;
 Task* current = nullptr;
 std::vector<Task*> tasks;
 unsigned local_lookups = 0, proxy_lookups = 0, group_calls = 0;
+unsigned private_calls = 0;
+int private_result = -ENOTSUP;
 uint64_t routed_pgid = 0;
 int rpc_error = 0;
 }
@@ -109,6 +119,13 @@ auto find_task_by_pid_safe(uint64_t pid) -> task::Task* {
 namespace task {} // process_pid is compiled above, not reimplemented.
 }
 namespace ker::syscall::process {
+// Private delivery is exercised by native KTEST Tasks. This seam checks that
+// the real public dispatcher branches before physical lookup or WKI discovery.
+auto signal_in_namespace(fixture::Task& requester, int64_t, int) -> int {
+    fixture::require(&requester == fixture::current, "private dispatch borrows its exact caller");
+    ++fixture::private_calls;
+    return fixture::private_result;
+}
 using LocalSignalCallback = int (*)(std::span<ker::mod::sched::task::Task* const>, void*);
 using LocalSignalCleanup = void (*)(void*) noexcept;
 auto with_local_signal_targets(LocalSignalCallback callback, void* context, LocalSignalCleanup cleanup) -> int {
@@ -228,13 +245,31 @@ auto user(uint32_t uid) -> Snapshot {
 }
 void reset(Task& caller, std::initializer_list<Task*> targets) {
     current = &caller; tasks = targets; rpc_error = 0;
-    local_lookups = proxy_lookups = group_calls = 0; routed_pgid = 0;
+    local_lookups = proxy_lookups = group_calls = private_calls = 0; routed_pgid = 0;
     ker::net::wki::g_wki.peers = {};
     ker::net::wki::g_wki.peers[0] = {{},250,22,ker::net::wki::PeerState::CONNECTED};
     for (auto* target : tasks) target->pending = 0;
 }
 auto kill(int64_t pid, int sig) -> int64_t {
     return static_cast<int64_t>(ker::syscall::process::wos_proc_kill(pid, sig));
+}
+void private_dispatch() {
+    Task caller = subject(40,40), target = subject(88,88);
+    caller.scope.host = false;
+    for (int64_t pid : {int64_t{88}, int64_t{0}, int64_t{-1}, int64_t{-88}}) {
+        reset(caller,{&target});
+        require(kill(pid,15) == private_result && private_calls == 1 && local_lookups == 0 &&
+                proxy_lookups == 0 && group_calls == 0 && target.pending == 0,
+                "private dispatcher never enters Host physical or distributed paths");
+    }
+    reset(caller,{&target}); caller.scope.shut = true;
+    require(kill(88,15) == -EIDRM && private_calls == 0 && local_lookups == 0 && group_calls == 0,
+            "closed scope fails before selection or routing");
+    require(kill(88,65) == -EINVAL, "signal validation still precedes scope admission");
+    caller.unbound = true;
+    require(kill(88,15) == -ESRCH && private_calls == 0 && proxy_lookups == 0,
+            "unbound caller never falls back to Host");
+    std::puts("PASS public private-scope dispatcher controls");
 }
 void controls() {
     Task init = subject(1,1); init.wki_target_flags = Task::WKI_TARGET_FLAG_LOCAL;
@@ -328,6 +363,7 @@ void collision() {
 }
 int main(int argc, char** argv) {
     fixture::controls();
+    /* private routing controls */
     if (argc == 1 || std::string_view(argv[1]) != "controls") fixture::collision();
 }
 '''
@@ -338,6 +374,7 @@ def generate(source: Path) -> str:
     task = (KERN / "platform/sched/task.hpp").read_text()
     wki = (KERN / "net/wki/wki.hpp").read_text()
     replacements = {
+        "/* private routing controls */": "fixture::private_dispatch();" if "signal_in_namespace(*self" in source.read_text() else "",
         "/* actual task constants */": "\n".join(
             re.search(rf"static constexpr [^;]+\b{name}\s*=[^;]+;", task).group(0)
             for name in ("MAX_SIGNALS", "WKI_TARGET_FLAG_LOCAL")

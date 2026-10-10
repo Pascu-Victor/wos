@@ -270,8 +270,31 @@ runnable Tasks. Four inactive disposable images (258,031,616 allocated bytes) we
 audited/pruned, leaving zero disposable usage. This qualifies native wait
 adapters, not scheduled service syscalls or complete init closure/drain.
 
+Checkpoint 11 adds private positive PID/TID and durable local group signal
+selection before Host physical/proxy/WKI discovery. Exact scope admission,
+current credential/session checks, stale-image refusal, coherent group capture
+and existing local leases precede effects. Closed/unknown/remote requests have
+no fallback or pending side effects. Guards release before pending/ptrace/wake
+work; admitted effects can finish across closure/route publication using the
+existing exec-drained lease. Host and trusted physical signal APIs keep their
+behavior. Task/SignalAdmissionIdentity storage and syscall/wire ABI are unchanged.
+Seven new native tests use real hidden unpublished Tasks/cohorts/pending state,
+with ownership/lease drain and deterministic closure/route/group interleavings.
+Public compartment creation remains disabled until the full boundary is ready.
+
+Checkpoint 11 Normal Build WOS, isolated fast diagnostic build, format-only check
+and 28 selected Host CTests pass. KTEST17 passes 79,602 assertions with zero
+failures across 1,302 cases, all 50 required compartment cases and normal poweroff
+with stable source/artifact pins. Four inactive disposable images (258,162,688
+allocated bytes) were audited and pruned, leaving zero disposable usage.
+Initial Host evidence records an unbuilt
+test binary, a baseline-reproduced stale timer assertion and an empty VFS test
+selection; corrected builds/oracle/selection pass and old receipts remain.
+This qualifies native signal consumers, not scheduled private services or full
+namespace-init closure/drain. Goal39 stays active with its full original scope.
+
 Public compartment admission, remaining root/procfs/positive PID consumers,
-signal/ptrace translation, namespace-init lifecycle policy,
+ptrace translation, namespace-init lifecycle policy,
 complete network/WKI gates, launcher and required service campaigns remain
 pending. All ten full acceptance criteria remain outstanding. Prior focused host ASan/UBSan cases are foundation evidence, not
 full service qualification. See progress/39/{ledger,evidence,reconnaissance,
