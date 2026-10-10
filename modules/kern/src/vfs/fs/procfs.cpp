@@ -13,6 +13,7 @@
 #include <dev/ahci.hpp>
 #include <dev/block_request.hpp>
 #include <dev/virtio/virtio_net.hpp>
+#include <memory>
 #include <minimalist_malloc/mini_malloc.hpp>
 #include <net/backlog.hpp>
 #include <net/netdevice.hpp>
@@ -89,6 +90,8 @@ void (*mounts_snapshot_test_hook)(ker::mod::sched::task::Task*) = nullptr;
 namespace {
 
 using ker::mod::security::DiagnosticAccess;
+using ProcTask = ker::mod::sched::task::Task;
+namespace pid_ns = ker::mod::sched::pid_ns;
 
 constexpr size_t MAX_WKI_NAPI_BUF = 65536;
 
@@ -194,8 +197,71 @@ constexpr auto private_procfs_node(ProcNodeType type) -> bool {
     }
 }
 
+constexpr auto private_view_node(ProcNodeType type) -> bool {
+    switch (type) {
+        case ProcNodeType::ROOT_DIR:
+        case ProcNodeType::PID_DIR:
+        case ProcNodeType::TASK_DIR:
+        case ProcNodeType::TASK_TID_DIR:
+        case ProcNodeType::SELF_LINK:
+        case ProcNodeType::EXE_LINK:
+        case ProcNodeType::CWD_LINK:
+        case ProcNodeType::ROOT_LINK:
+        case ProcNodeType::FD_DIR:
+        case ProcNodeType::FD_LINK:
+        case ProcNodeType::STATUS_FILE:
+        case ProcNodeType::MOUNTS_FILE:
+        case ProcNodeType::STAT_FILE:
+        case ProcNodeType::STATM_FILE:
+        case ProcNodeType::CMDLINE_FILE:
+        case ProcNodeType::MAPS_FILE:
+        case ProcNodeType::IMAGES_FILE:
+        case ProcNodeType::LIMITS_FILE:
+        case ProcNodeType::WKI_LAUNCHER_FILE:
+        case ProcNodeType::WKI_RUNNER_FILE:
+        case ProcNodeType::WKI_REMOTE_PID_FILE:
+        case ProcNodeType::UPTIME_FILE:
+        case ProcNodeType::TIMEKEEPING_FILE:
+        case ProcNodeType::CPU_STAT_FILE:
+        case ProcNodeType::LOADAVG_FILE:
+        case ProcNodeType::MEMINFO_FILE:
+        case ProcNodeType::VERSION_FILE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+auto task_in_pid_view(const ProcTask& task, const pid_ns::NamespaceRef& view) -> bool {
+    if (view.is_host()) return true;
+    auto const* scope = task.pid_namespace();
+    return scope != nullptr && *scope == view && task.namespace_tid() != 0;
+}
+
+// Bounded value observation only: safe at retained VFS result publication.
+// No registry join, allocation, blocking, File release or remote discovery.
+auto procfs_view_policy(const ProcFileData& data) -> int {
+    if (data.pid_view.is_host()) return 0;
+    if (data.pid_view.closed()) return -EIDRM;
+    if (!private_view_node(data.node.type)) return -ENOTSUP;
+    if (data.target != nullptr) {
+        if (!task_in_pid_view(*data.target, data.pid_view)) return -ESRCH;
+        auto const* owner = data.target->credential_owner();
+        if (owner == nullptr) return -ESRCH;
+        auto const IDENTITY = owner->wki_execution_identity();
+        auto const THREAD_IDENTITY = data.target->wki_execution_identity();
+        if (owner->wki_proxy_task || data.target->wki_proxy_task || IDENTITY.remote_pid != 0 || IDENTITY.proxy_task_id != 0 ||
+            IDENTITY.signal_task_id != 0 || THREAD_IDENTITY.remote_pid != 0 || THREAD_IDENTITY.proxy_task_id != 0 ||
+            THREAD_IDENTITY.signal_task_id != 0)
+            return -ENOTSUP;
+    }
+    return data.pid_view.closed() ? -EIDRM : 0;
+}
+
 auto authorize_private_procfs(const ker::mod::security::Snapshot& caller, uint64_t caller_pid, const ProcFileData& data,
                               ker::mod::security::CredentialStore::Observation& observation) -> int {
+    int const VIEW = procfs_view_policy(data);
+    if (VIEW != 0) return VIEW;
     if (data.target == nullptr || data.target->state.load(std::memory_order_acquire) != ker::mod::sched::task::TaskState::ACTIVE)
         return -ESRCH;
     observation = data.target->credential_observation();
@@ -204,6 +270,8 @@ auto authorize_private_procfs(const ker::mod::security::Snapshot& caller, uint64
 }
 
 auto revalidate_private_procfs(const ProcFileData& data, const ker::mod::security::CredentialStore::Observation& before) -> int {
+    int const VIEW = procfs_view_policy(data);
+    if (VIEW != 0) return VIEW;
     if (data.target == nullptr || data.target->state.load(std::memory_order_acquire) != ker::mod::sched::task::TaskState::ACTIVE)
         return -ESRCH;
     return data.target->credential_observation().generation == before.generation ? 0 : -EAGAIN;
@@ -261,8 +329,6 @@ void int_to_str(uint64_t val, char* buf, size_t bufsz) {
     buf[std::cmp_less(LEN, bufsz) ? LEN : static_cast<int>(bufsz - 1)] = '\0';
 }
 
-using ProcTask = ker::mod::sched::task::Task;
-
 auto proc_task_state_char(const ProcTask& task) -> char {
     auto const TASK_STATE = task.state.load(std::memory_order_acquire);
     if (TASK_STATE == ker::mod::sched::task::TaskState::DEAD || TASK_STATE == ker::mod::sched::task::TaskState::EXITING ||
@@ -300,7 +366,7 @@ struct ProcTaskStats {
     char state{'S'};
 };
 
-auto collect_proc_task_stats(ProcTask& task, bool thread_view) -> ProcTaskStats {
+auto collect_proc_task_stats(ProcTask& task, bool thread_view, bool local_view = false) -> ProcTaskStats {
     ProcTaskStats stats{
         .user_time_us = task.user_time_us,
         .system_time_us = task.system_time_us,
@@ -332,7 +398,9 @@ auto collect_proc_task_stats(ProcTask& task, bool thread_view) -> ProcTaskStats 
         if (candidate == nullptr) {
             continue;
         }
-        if (!ker::mod::sched::task::same_thread_group(*candidate, GROUP_PID)) {
+        if (!ker::mod::sched::task::same_thread_group(*candidate, GROUP_PID) ||
+            (local_view &&
+             (!ker::mod::sched::task::same_pid_namespace(*candidate, task) || candidate->credential_owner() != task.credential_owner()))) {
             candidate->release();
             continue;
         }
@@ -363,7 +431,7 @@ auto collect_proc_task_stats(ProcTask& task, bool thread_view) -> ProcTaskStats 
     return stats;
 }
 
-auto process_visible_task_at(size_t index) -> ProcTask* {
+auto process_visible_task_at(size_t index, const pid_ns::NamespaceRef* view = nullptr) -> ProcTask* {
     size_t seen = 0;
     uint32_t const TASK_COUNT = ker::mod::sched::get_active_task_count();
     for (uint32_t i = 0; i < TASK_COUNT; ++i) {
@@ -371,7 +439,7 @@ auto process_visible_task_at(size_t index) -> ProcTask* {
         if (task == nullptr) {
             continue;
         }
-        if (!ker::mod::sched::task::process_visible(*task)) {
+        if (!ker::mod::sched::task::process_visible(*task) || (view != nullptr && !task_in_pid_view(*task, *view))) {
             task->release();
             continue;
         }
@@ -384,7 +452,8 @@ auto process_visible_task_at(size_t index) -> ProcTask* {
     return nullptr;
 }
 
-auto thread_group_task_at(uint64_t group_pid, size_t index) -> ProcTask* {
+auto thread_group_task_at(uint64_t group_pid, size_t index, const pid_ns::NamespaceRef* view = nullptr, const ProcTask* group = nullptr)
+    -> ProcTask* {
     size_t seen = 0;
     uint32_t const TASK_COUNT = ker::mod::sched::get_active_task_count();
     for (uint32_t i = 0; i < TASK_COUNT; ++i) {
@@ -392,7 +461,9 @@ auto thread_group_task_at(uint64_t group_pid, size_t index) -> ProcTask* {
         if (task == nullptr) {
             continue;
         }
-        if (!ker::mod::sched::task::same_thread_group(*task, group_pid)) {
+        if (!ker::mod::sched::task::same_thread_group(*task, group_pid) ||
+            (view != nullptr && !view->is_host() &&
+             (!task_in_pid_view(*task, *view) || group == nullptr || task->credential_owner() != group->credential_owner()))) {
             task->release();
             continue;
         }
@@ -413,18 +484,6 @@ auto task_group_pid_for(uint64_t pid, uint64_t& group_pid) -> bool {
     group_pid = ker::mod::sched::task::process_pid(*task);
     task->release();
     return true;
-}
-
-auto find_task_in_group_safe(uint64_t group_pid, uint64_t tid) -> ProcTask* {
-    auto* task = ker::mod::sched::find_task_by_pid_safe(tid);
-    if (task == nullptr) {
-        return nullptr;
-    }
-    if (!ker::mod::sched::task::same_thread_group(*task, group_pid)) {
-        task->release();
-        return nullptr;
-    }
-    return task;
 }
 
 auto task_fd_file_retain(ProcTask* task, uint64_t fd) -> File* {
@@ -568,7 +627,7 @@ auto procfs_readdir_private(const ker::mod::security::Snapshot& credentials, uin
     return result;
 }
 
-auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
+auto procfs_readdir_in_view(File* f, DirEntry* buf, size_t count) -> int {
     if (f == nullptr || f->private_data == nullptr) {
         return -EBADF;
     }
@@ -599,6 +658,39 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
     }
 
     if (pfd->node.type == ProcNodeType::ROOT_DIR) {
+        // Private cookies are dense: unavailable global trees cannot terminate
+        // iteration before scoped process names. Host keeps its existing order.
+        if (!pfd->pid_view.is_host()) {
+            struct Entry {
+                const char* name;
+                uint8_t type;
+            };
+            constexpr std::array<Entry, 8> ENTRIES{{
+                {"self", DT_LNK},
+                {"mounts", DT_REG},
+                {"uptime", DT_REG},
+                {"version", DT_REG},
+                {"stat", DT_REG},
+                {"loadavg", DT_REG},
+                {"meminfo", DT_REG},
+                {"timekeeping", DT_REG},
+            }};
+            if (count - 2 < ENTRIES.size()) {
+                auto const& entry = ENTRIES[count - 2];
+                buf->d_ino = count;
+                buf->d_off = count + 1;
+                buf->d_reclen = sizeof(DirEntry);
+                buf->d_type = entry.type;
+                std::strcpy(buf->d_name.data(), entry.name);
+                return 0;
+            }
+            auto* task = process_visible_task_at(count - 2 - ENTRIES.size(), &pfd->pid_view);
+            if (task == nullptr) return -ENOENT;
+            uint64_t const PID = task->namespace_tid();
+            task->release();
+            fill_numeric_dirent(buf, count, PID);
+            return 0;
+        }
         // /proc root: fixed entries then PID directories
         if (count == proc_root_readdir_index(ProcRootReaddirIndex::SELF)) {
             buf->d_ino = proc_root_readdir_index(ProcRootReaddirIndex::SELF);
@@ -835,11 +927,11 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
     }
 
     if (pfd->node.type == ProcNodeType::TASK_DIR) {
-        auto* task = thread_group_task_at(pfd->node.pid, count - 2);
+        auto* task = thread_group_task_at(pfd->node.pid, count - 2, &pfd->pid_view, pfd->target);
         if (task == nullptr) {
             return -ENOENT;
         }
-        uint64_t const TID = task->pid;
+        uint64_t const TID = pfd->pid_view.is_host() ? task->pid : task->namespace_tid();
         task->release();
         fill_numeric_dirent(buf, count, TID);
         return 0;
@@ -978,6 +1070,20 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
 }
 
 // Helper to parse a PID from a path component
+auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
+    if (f == nullptr || f->private_data == nullptr) return -EBADF;
+    if (buf == nullptr) return -EINVAL;
+    auto const& data = *static_cast<const ProcFileData*>(f->private_data);
+    int const VIEW = procfs_view_policy(data);
+    if (VIEW != 0) return VIEW;
+    DirEntry candidate{};
+    int const RESULT = procfs_readdir_in_view(f, &candidate, count);
+    int const VALID = procfs_view_policy(data);
+    if (VALID != 0) return VALID;
+    if (RESULT == 0) *buf = candidate;
+    return RESULT;
+}
+
 auto parse_pid(const char* s) -> int64_t {
     if (s == nullptr || *s == '\0') {
         return -EINVAL;
@@ -1059,13 +1165,14 @@ auto copy_proc_public_comm(ProcTask& task) -> ProcTask::ExePathBuffer {
 // Public generators borrow the Task retained by ProcFileData. A numeric PID
 // must not reselect the subject between lookup/open and first content generation.
 // Generate content for /proc/<pid>/status
-auto generate_status(ProcTask* task, char* buf, size_t bufsz, bool thread_view) -> size_t {
+auto generate_status(ProcTask* task, char* buf, size_t bufsz, bool thread_view, bool local_view = false) -> size_t {
     if (task == nullptr || task->state.load(std::memory_order_acquire) != ker::mod::sched::task::TaskState::ACTIVE) {
         return 0;
     }
     auto const MEM = collect_proc_memory(*task);
-    auto const STATS = collect_proc_task_stats(*task, thread_view);
-    uint64_t const PROCESS_PID = ker::mod::sched::task::process_pid(*task);
+    auto const STATS = collect_proc_task_stats(*task, thread_view, local_view);
+    uint64_t const PROCESS_PID =
+        local_view ? ker::mod::sched::task::namespace_process_pid(*task) : ker::mod::sched::task::process_pid(*task);
 
     size_t off = 0;
     auto append = [&](const char* s) {
@@ -1085,9 +1192,9 @@ auto generate_status(ProcTask* task, char* buf, size_t bufsz, bool thread_view) 
     append("\nTgid:\t");
     append_int(PROCESS_PID);
     append("\nPid:\t");
-    append_int(task->pid);
+    append_int(local_view ? task->namespace_tid() : task->pid);
     append("\nPPid:\t");
-    append_int(task->parent_pid);
+    append_int(local_view ? ker::syscall::process::child_events::namespace_parent_pid(*task) : task->parent_pid);
     append("\nUid:\t");
     auto const CREDENTIALS = task->credentials();
     append_int(CREDENTIALS.user().real);
@@ -1171,7 +1278,7 @@ auto generate_status(ProcTask* task, char* buf, size_t bufsz, bool thread_view) 
     }
 
     // Blocking and process-child lifecycle state.
-    auto const CHILD_DIAGNOSTICS = ker::syscall::process::child_events::diagnostics(*task);
+    auto const CHILD_DIAGNOSTICS = ker::syscall::process::child_events::diagnostics(*task, local_view);
     append("\nDeferredSwitch:\t");
     append(task->deferred_task_switch ? "1" : "0");
     append("\nVoluntaryBlock:\t");
@@ -1207,7 +1314,8 @@ auto generate_status(ProcTask* task, char* buf, size_t bufsz, bool thread_view) 
 
     // Terminal
     append("\nTTY:\t");
-    auto const JOB = task->job_identity();
+    auto const JOB_SNAPSHOT = task->job_identity_snapshot();
+    auto const& JOB = JOB_SNAPSHOT.internal;
     int const TTY_INDEX = JOB.terminal.index();
     if (TTY_INDEX >= 0) {
         append_int(static_cast<uint64_t>(TTY_INDEX));
@@ -1215,9 +1323,9 @@ auto generate_status(ProcTask* task, char* buf, size_t bufsz, bool thread_view) 
         append("-1");
     }
     append("\nPGID:\t");
-    append_int(JOB.pgid);
+    append_int(local_view ? JOB_SNAPSHOT.visible.pgid : JOB.pgid);
     append("\nSID:\t");
-    append_int(JOB.session_id);
+    append_int(local_view ? JOB_SNAPSHOT.visible.session_id : JOB.session_id);
 
     // Time accounting
     append("\nUserTime:\t");
@@ -1239,12 +1347,12 @@ auto generate_status(ProcTask* task, char* buf, size_t bufsz, bool thread_view) 
 // Generate content for /proc/<pid>/stat (Linux-compatible format)
 // Format: pid (comm) state ppid pgid sid tty tpgid flags minflt cminflt majflt cmajflt
 //         utime stime cutime cstime priority nice nthreads itrealvalue starttime vsize rss ...
-auto generate_stat(ProcTask* task, char* buf, size_t bufsz, bool thread_view) -> size_t {
+auto generate_stat(ProcTask* task, char* buf, size_t bufsz, bool thread_view, bool local_view = false) -> size_t {
     if (task == nullptr || task->state.load(std::memory_order_acquire) != ker::mod::sched::task::TaskState::ACTIVE) {
         return 0;
     }
     auto const MEM = collect_proc_memory(*task);
-    auto const STATS = collect_proc_task_stats(*task, thread_view);
+    auto const STATS = collect_proc_task_stats(*task, thread_view, local_view);
 
     size_t off = 0;
     auto append = [&](const char* s) {
@@ -1261,18 +1369,19 @@ auto generate_stat(ProcTask* task, char* buf, size_t bufsz, bool thread_view) ->
     auto const COMM = copy_proc_public_comm(*task);
 
     // pid (comm) state ppid pgid sid tty_nr tpgid flags
-    append_int(task->pid);
+    append_int(local_view ? task->namespace_tid() : task->pid);
     append(" (");
     append(COMM.data());
     append(") ");
     buf[off++] = STATS.state;
     append(" ");
-    append_int(task->parent_pid);  // ppid
+    append_int(local_view ? ker::syscall::process::child_events::namespace_parent_pid(*task) : task->parent_pid);  // ppid
     append(" ");
-    auto const JOB = task->job_identity();
-    append_int(JOB.pgid);  // pgrp
+    auto const JOB_SNAPSHOT = task->job_identity_snapshot();
+    auto const& JOB = JOB_SNAPSHOT.internal;
+    append_int(local_view ? JOB_SNAPSHOT.visible.pgid : JOB.pgid);  // pgrp
     append(" ");
-    append_int(JOB.session_id);  // session
+    append_int(local_view ? JOB_SNAPSHOT.visible.session_id : JOB.session_id);  // session
     append(" ");
     int const TTY_INDEX = JOB.terminal.index();
     append_int(TTY_INDEX >= 0 ? static_cast<uint64_t>(TTY_INDEX) : 0);  // tty_nr
@@ -1883,7 +1992,32 @@ auto generate_uptime(char* buf, size_t bufsz) -> size_t {
     return off;
 }
 
-auto generate_cpu_stat(char* buf, size_t bufsz) -> size_t {
+struct ProcViewTaskCounts {
+    uint64_t runnable{};
+    uint64_t total{};
+    uint64_t blocked{};
+    uint64_t last_name{};  // highest currently observed local PID/TID
+};
+
+auto collect_view_task_counts(const pid_ns::NamespaceRef& view) -> ProcViewTaskCounts {
+    ProcViewTaskCounts result{};
+    uint32_t const COUNT = ker::mod::sched::get_active_task_count();
+    for (uint32_t i = 0; i < COUNT; ++i) {
+        auto* task = ker::mod::sched::get_active_task_at_safe(i);
+        if (task == nullptr) continue;
+        if (task_in_pid_view(*task, view) && !task->wki_proxy_task) {
+            ++result.total;
+            char const STATE = proc_task_state_char(*task);
+            if (STATE == 'R') ++result.runnable;
+            if (STATE == 'D') ++result.blocked;
+            result.last_name = std::max(result.last_name, task->namespace_tid());
+        }
+        task->release();
+    }
+    return result;
+}
+
+auto generate_cpu_stat(char* buf, size_t bufsz, const pid_ns::NamespaceRef* view = nullptr) -> size_t {
     size_t off = 0;
     auto append = [&](const char* s) {
         while (*s && off < bufsz - 1) {
@@ -1946,16 +2080,18 @@ auto generate_cpu_stat(char* buf, size_t bufsz) -> size_t {
 
     auto const LOAD = ker::mod::sched::get_load_average_snapshot();
     append("procs_running ");
-    append_int(LOAD.runnable_tasks);
+    bool const PRIVATE = view != nullptr && !view->is_host();
+    auto const COUNTS = PRIVATE ? collect_view_task_counts(*view) : ProcViewTaskCounts{};
+    append_int(PRIVATE ? COUNTS.runnable : LOAD.runnable_tasks);
     append("\nprocs_blocked ");
-    append_int(LOAD.uninterruptible_tasks);
+    append_int(PRIVATE ? COUNTS.blocked : LOAD.uninterruptible_tasks);
     append("\n");
 
     buf[off] = '\0';
     return off;
 }
 
-auto generate_loadavg(char* buf, size_t bufsz) -> size_t {
+auto generate_loadavg(char* buf, size_t bufsz, const pid_ns::NamespaceRef* view = nullptr) -> size_t {
     size_t off = 0;
     auto append = [&](const char* s) {
         while (*s && off < bufsz - 1) {
@@ -1984,11 +2120,13 @@ auto generate_loadavg(char* buf, size_t bufsz) -> size_t {
     append(" ");
     append_load(LOAD.load15_milli);
     append(" ");
-    append_int(LOAD.runnable_tasks);
+    bool const PRIVATE = view != nullptr && !view->is_host();
+    auto const COUNTS = PRIVATE ? collect_view_task_counts(*view) : ProcViewTaskCounts{};
+    append_int(PRIVATE ? COUNTS.runnable : LOAD.runnable_tasks);
     append("/");
-    append_int(LOAD.total_tasks);
+    append_int(PRIVATE ? COUNTS.total : LOAD.total_tasks);
     append(" ");
-    append_int(LOAD.last_pid);
+    append_int(PRIVATE ? COUNTS.last_name : LOAD.last_pid);
     append("\n");
 
     buf[off] = '\0';
@@ -2076,18 +2214,22 @@ auto format_procfs_hostname(const char* hostname, char* buf, size_t bufsz) -> si
 }
 
 // Public placement metadata is a copied observation, never remote authority.
-auto generate_wki_launcher(ProcTask* task, char* buf, size_t bufsz) -> size_t {
+auto generate_wki_launcher(ProcTask* task, char* buf, size_t bufsz, bool local_view = false) -> size_t {
     if (task == nullptr || task->state.load(std::memory_order_acquire) != ker::mod::sched::task::TaskState::ACTIVE) return 0;
+    if (local_view) {
+        auto const LOCAL = procfs_local_wki_hostname();
+        return format_procfs_hostname(LOCAL.data(), buf, bufsz);
+    }
     auto const IDENTITY = task->wki_execution_identity();
     auto const LOCAL = procfs_local_wki_hostname();
     return format_procfs_hostname(IDENTITY.submitter_hostname.front() != '\0' ? IDENTITY.submitter_hostname.data() : LOCAL.data(), buf,
                                   bufsz);
 }
 
-auto generate_wki_runner(ProcTask* task, char* buf, size_t bufsz) -> size_t {
+auto generate_wki_runner(ProcTask* task, char* buf, size_t bufsz, bool local_view = false) -> size_t {
     if (task == nullptr || task->state.load(std::memory_order_acquire) != ker::mod::sched::task::TaskState::ACTIVE) return 0;
     std::array<char, ker::net::wki::WKI_HOSTNAME_MAX> runner{};
-    (void)ker::net::wki::wki_proxy_task_remote_info(task, nullptr, runner.data(), runner.size());
+    if (!local_view) (void)ker::net::wki::wki_proxy_task_remote_info(task, nullptr, runner.data(), runner.size());
     if (runner.front() == '\0') runner = procfs_local_wki_hostname();
     return format_procfs_hostname(runner.data(), buf, bufsz);
 }
@@ -2101,12 +2243,13 @@ auto task_wki_remote_pid(uint64_t pid, const ProcTask::WkiExecutionIdentity& ide
     return 0;
 }
 
-auto generate_wki_remote_pid(ProcTask* task, char* buf, size_t bufsz) -> size_t {
+auto generate_wki_remote_pid(ProcTask* task, char* buf, size_t bufsz, bool local_view = false) -> size_t {
     if (task == nullptr || task->state.load(std::memory_order_acquire) != ker::mod::sched::task::TaskState::ACTIVE) return 0;
     auto const IDENTITY = task->wki_execution_identity();
     uint64_t const PID = task->pid;
     auto const LOCAL = procfs_local_wki_hostname();
-    int const LENGTH = std::snprintf(buf, bufsz, "%llu\n", static_cast<unsigned long long>(task_wki_remote_pid(PID, IDENTITY, LOCAL)));
+    int const LENGTH =
+        std::snprintf(buf, bufsz, "%llu\n", static_cast<unsigned long long>(local_view ? 0 : task_wki_remote_pid(PID, IDENTITY, LOCAL)));
     if (LENGTH < 0) {
         if (bufsz != 0) buf[0] = '\0';
         return 0;
@@ -6720,6 +6863,8 @@ auto generate_blockq(char* buffer, size_t capacity) -> size_t {
 // canonical process. Read and seek must admit the same subject and caller.
 auto authorize_procfs_limits(const ker::mod::security::Snapshot& credentials, uint64_t caller_pid, const ProcFileData& data,
                              ProcTask*& process) -> int {
+    int const VIEW = procfs_view_policy(data);
+    if (VIEW != 0) return VIEW;
     auto* subject = data.target;
     if (subject == nullptr || subject->state.load(std::memory_order_acquire) != ker::mod::sched::task::TaskState::ACTIVE) return -ESRCH;
     auto* owner = subject->credential_owner();
@@ -6824,6 +6969,8 @@ auto procfs_read_limits(const ker::mod::security::Snapshot& credentials, uint64_
         data.content[off] = '\0';
         data.content_len = off;
     }
+    int const VALID_VIEW = procfs_view_policy(data);
+    if (VALID_VIEW != 0) return VALID_VIEW;
     if (offset >= data.content_len) {
         return 0;
     }
@@ -6852,7 +6999,8 @@ auto procfs_read_private(const ker::mod::security::Snapshot& credentials, uint64
                 length = generate_maps(data.target, staged, CAPACITY);
                 break;
             case ProcNodeType::IMAGES_FILE:
-                length = generate_images(data.target, staged, CAPACITY, credentials.allows(ker::mod::security::Authority::KERNEL_DEBUG));
+                length = generate_images(data.target, staged, CAPACITY,
+                                         data.pid_view.is_host() && credentials.allows(ker::mod::security::Authority::KERNEL_DEBUG));
                 break;
             case ProcNodeType::EXE_LINK: {
                 uint64_t const IRQF = data.target->path_metadata_lock.lock_irqsave();
@@ -6890,6 +7038,8 @@ auto procfs_read_with_credentials(const ker::mod::security::Snapshot& credential
         return -EINVAL;
     }
     auto* pfd = static_cast<ProcFileData*>(f->private_data);
+    int const VIEW = procfs_view_policy(*pfd);
+    if (VIEW != 0) return VIEW;
     if (pfd->node.type == ProcNodeType::MOUNTS_FILE) {
         if ((caller_task == nullptr && caller_pid != 0) ||
             (caller_task != nullptr && ker::mod::sched::task::process_pid(*caller_task) != caller_pid))
@@ -6950,10 +7100,12 @@ auto procfs_read_with_credentials(const ker::mod::security::Snapshot& credential
 
         switch (pfd->node.type) {
             case ProcNodeType::STATUS_FILE:
-                pfd->content_len = generate_status(pfd->target, pfd->content, MAX_PROCFS_BUF, pfd->node.thread_view);
+                pfd->content_len =
+                    generate_status(pfd->target, pfd->content, MAX_PROCFS_BUF, pfd->node.thread_view, !pfd->pid_view.is_host());
                 break;
             case ProcNodeType::STAT_FILE:
-                pfd->content_len = generate_stat(pfd->target, pfd->content, MAX_PROCFS_BUF, pfd->node.thread_view);
+                pfd->content_len =
+                    generate_stat(pfd->target, pfd->content, MAX_PROCFS_BUF, pfd->node.thread_view, !pfd->pid_view.is_host());
                 break;
             case ProcNodeType::STATM_FILE:
                 pfd->content_len = generate_statm(pfd->target, pfd->content, MAX_PROCFS_BUF);
@@ -6965,10 +7117,10 @@ auto procfs_read_with_credentials(const ker::mod::security::Snapshot& credential
                 pfd->content_len = generate_timekeeping(pfd->content, MAX_PROCFS_BUF);
                 break;
             case ProcNodeType::CPU_STAT_FILE:
-                pfd->content_len = generate_cpu_stat(pfd->content, MAX_KPERF_BUF);
+                pfd->content_len = generate_cpu_stat(pfd->content, MAX_KPERF_BUF, &pfd->pid_view);
                 break;
             case ProcNodeType::LOADAVG_FILE:
-                pfd->content_len = generate_loadavg(pfd->content, MAX_PROCFS_BUF);
+                pfd->content_len = generate_loadavg(pfd->content, MAX_PROCFS_BUF, &pfd->pid_view);
                 break;
             case ProcNodeType::MEMINFO_FILE:
                 pfd->content_len = generate_meminfo(pfd->content, MAX_PROCFS_BUF);
@@ -7004,13 +7156,13 @@ auto procfs_read_with_credentials(const ker::mod::security::Snapshot& credential
                 pfd->content_len = generate_kipcstat(pfd->content, MAX_KPERF_BUF);
                 break;
             case ProcNodeType::WKI_LAUNCHER_FILE:
-                pfd->content_len = generate_wki_launcher(pfd->target, pfd->content, MAX_PROCFS_BUF);
+                pfd->content_len = generate_wki_launcher(pfd->target, pfd->content, MAX_PROCFS_BUF, !pfd->pid_view.is_host());
                 break;
             case ProcNodeType::WKI_RUNNER_FILE:
-                pfd->content_len = generate_wki_runner(pfd->target, pfd->content, MAX_PROCFS_BUF);
+                pfd->content_len = generate_wki_runner(pfd->target, pfd->content, MAX_PROCFS_BUF, !pfd->pid_view.is_host());
                 break;
             case ProcNodeType::WKI_REMOTE_PID_FILE:
-                pfd->content_len = generate_wki_remote_pid(pfd->target, pfd->content, MAX_PROCFS_BUF);
+                pfd->content_len = generate_wki_remote_pid(pfd->target, pfd->content, MAX_PROCFS_BUF, !pfd->pid_view.is_host());
                 break;
             case ProcNodeType::WKI_PEERS_FILE:
                 pfd->content_len = generate_wki_peers(pfd->content, MAX_PROCFS_BUF);
@@ -7113,6 +7265,8 @@ auto procfs_read_with_credentials(const ker::mod::security::Snapshot& credential
         return -ESRCH;
     }
 
+    int const VALID_VIEW = procfs_view_policy(*pfd);
+    if (VALID_VIEW != 0) return VALID_VIEW;
     if (offset >= pfd->content_len) {
         return 0;
     }
@@ -7388,6 +7542,8 @@ auto procfs_write_with_credentials(const ker::mod::security::Snapshot& credentia
         return -EINVAL;
     }
     auto* pfd = static_cast<ProcFileData*>(f->private_data);
+    int const VIEW = procfs_view_policy(*pfd);
+    if (VIEW != 0) return VIEW;
     int const POLICY = ker::mod::security::authorize_diagnostic(credentials, diagnostic_access(pfd->node.type), true);
     if (POLICY != 0) return POLICY;
     ker::mod::sys::MutexGuard content_guard(pfd->limits_content_lock);
@@ -7519,6 +7675,8 @@ auto procfs_lseek_with_credentials(const ker::mod::security::Snapshot& CREDENTIA
         return -EINVAL;
     }
     auto* pfd = static_cast<ProcFileData*>(f->private_data);
+    int const VIEW = procfs_view_policy(*pfd);
+    if (VIEW != 0) return VIEW;
     if (pfd->node.type == ProcNodeType::MOUNTS_FILE) {
         if ((caller_task == nullptr && caller_pid != 0) ||
             (caller_task != nullptr && ker::mod::sched::task::process_pid(*caller_task) != caller_pid))
@@ -7562,6 +7720,8 @@ auto procfs_lseek_with_credentials(const ker::mod::security::Snapshot& CREDENTIA
         int const VALID = revalidate_private_procfs(*pfd, before);
         if (VALID != 0) return VALID;
     }
+    int const VALID_VIEW = procfs_view_policy(*pfd);
+    if (VALID_VIEW != 0) return VALID_VIEW;
     f->pos = new_pos;
     return new_pos;
 }
@@ -7573,11 +7733,14 @@ auto procfs_lseek(File* f, off_t offset, int whence) -> off_t {
 
 auto procfs_readlink_as_impl(File* f, char* buf, size_t bufsz, const ker::mod::security::Snapshot& CREDENTIALS, uint64_t CALLER_PID,
                              uint64_t* target_generation = nullptr, bool allow_remote_cwd = false,
-                             DirectoryViewRef* directory_view = nullptr) -> ssize_t {
+                             DirectoryViewRef* directory_view = nullptr, const ProcTask* caller_task = nullptr) -> ssize_t {
     if (f == nullptr || f->private_data == nullptr || buf == nullptr) {
         return -EINVAL;
     }
     auto* pfd = static_cast<ProcFileData*>(f->private_data);
+    int const VIEW = procfs_view_policy(*pfd);
+    if (VIEW != 0) return VIEW;
+    if (!pfd->pid_view.is_host()) allow_remote_cwd = false;
     if (pfd->node.type != ProcNodeType::EXE_LINK && pfd->node.type != ProcNodeType::SELF_LINK && pfd->node.type != ProcNodeType::CWD_LINK &&
         pfd->node.type != ProcNodeType::ROOT_LINK && pfd->node.type != ProcNodeType::FD_LINK) {
         return -EINVAL;
@@ -7586,7 +7749,14 @@ auto procfs_readlink_as_impl(File* f, char* buf, size_t bufsz, const ker::mod::s
     if (pfd->node.type == ProcNodeType::SELF_LINK) {
         if (CALLER_PID == 0) return -ESRCH;
         std::array<char, 24> tmp{};
-        int_to_str(CALLER_PID, tmp.data(), tmp.size());
+        uint64_t reader_pid = CALLER_PID;
+        if (!pfd->pid_view.is_host()) {
+            if (caller_task == nullptr || ker::mod::sched::task::process_pid(*caller_task) != CALLER_PID) return -ESRCH;
+            if (!task_in_pid_view(*caller_task, pfd->pid_view)) return -EXDEV;
+            reader_pid = ker::mod::sched::task::namespace_process_pid(*caller_task);
+            if (reader_pid == 0) return -ESRCH;
+        }
+        int_to_str(reader_pid, tmp.data(), tmp.size());
         std::array<char, 64> link{};
         memcpy(link.data(), "/proc/", 6);
         size_t off = 6;
@@ -7596,6 +7766,8 @@ auto procfs_readlink_as_impl(File* f, char* buf, size_t bufsz, const ker::mod::s
         link[off] = '\0';
         size_t len = off;
         len = std::min(len, bufsz);
+        int const VALID_VIEW = procfs_view_policy(*pfd);
+        if (VALID_VIEW != 0) return VALID_VIEW;
         if (target_generation != nullptr) *target_generation = 0;
         memcpy(buf, link.data(), len);
         return static_cast<ssize_t>(len);
@@ -7690,7 +7862,8 @@ auto procfs_readlink_as_impl(File* f, char* buf, size_t bufsz, const ker::mod::s
 }
 
 auto procfs_readlink(File* f, char* buf, size_t bufsz) -> ssize_t {
-    return procfs_readlink_as_impl(f, buf, bufsz, current_procfs_credentials(), current_procfs_pid());
+    auto* task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    return procfs_readlink_as_impl(f, buf, bufsz, current_procfs_credentials(), current_procfs_pid(), nullptr, false, nullptr, task);
 }
 
 FileOperations procfs_fops_instance = {
@@ -7721,6 +7894,8 @@ auto procfs_read_mounts_as(ker::mod::sched::task::Task* task, const ker::mod::se
     if (file == nullptr || file->private_data == nullptr) return -EINVAL;
     auto const& data = *static_cast<ProcFileData*>(file->private_data);
     if (data.node.type != ProcNodeType::MOUNTS_FILE) return -EINVAL;
+    int const VIEW = procfs_view_policy(data);
+    if (VIEW != 0) return VIEW;
     int const POLICY = ker::mod::security::authorize_diagnostic(credentials, diagnostic_access(data.node.type), false);
     if (POLICY != 0) return POLICY;
     if (buffer == nullptr && count != 0) return -EFAULT;
@@ -7729,6 +7904,8 @@ auto procfs_read_mounts_as(ker::mod::sched::task::Task* task, const ker::mod::se
     std::array<char, 4096> staged{};
     ssize_t const LENGTH = generate_mounts_for_task(task, staged.data(), staged.size());
     if (LENGTH < 0) return LENGTH;
+    int const VALID_VIEW = procfs_view_policy(data);
+    if (VALID_VIEW != 0) return VALID_VIEW;
     if (offset >= static_cast<size_t>(LENGTH)) return 0;
     count = std::min(count, static_cast<size_t>(LENGTH) - offset);
     if (count != 0) std::memcpy(buffer, staged.data() + offset, count);
@@ -7740,6 +7917,8 @@ auto procfs_lseek_mounts_as(ker::mod::sched::task::Task* task, const ker::mod::s
     if (file == nullptr || file->private_data == nullptr) return -EINVAL;
     auto& data = *static_cast<ProcFileData*>(file->private_data);
     if (data.node.type != ProcNodeType::MOUNTS_FILE) return -EINVAL;
+    int const VIEW = procfs_view_policy(data);
+    if (VIEW != 0) return VIEW;
     int const POLICY = ker::mod::security::authorize_diagnostic(credentials, diagnostic_access(data.node.type), false);
     if (POLICY != 0) return POLICY;
     if (whence < 0 || whence > 2) return -EINVAL;
@@ -7753,26 +7932,33 @@ auto procfs_lseek_mounts_as(ker::mod::sched::task::Task* task, const ker::mod::s
     ker::mod::sys::MutexGuard content_guard(data.limits_content_lock);
     off_t const POSITION = (whence == 0 ? 0 : whence == 1 ? file->pos : static_cast<off_t>(length)) + offset;
     if (POSITION < 0) return -EINVAL;
+    int const VALID_VIEW = procfs_view_policy(data);
+    if (VALID_VIEW != 0) return VALID_VIEW;
     file->pos = POSITION;
     return POSITION;
 }
 
 auto procfs_readlink_as(File* file, char* buffer, size_t capacity, const ker::mod::security::Snapshot& credentials, uint64_t caller_pid,
-                        uint64_t* target_generation, bool allow_remote_cwd) -> ssize_t {
-    return procfs_readlink_as_impl(file, buffer, capacity, credentials, caller_pid, target_generation, allow_remote_cwd);
+                        uint64_t* target_generation, bool allow_remote_cwd, const ProcTask* caller_task) -> ssize_t {
+    return procfs_readlink_as_impl(file, buffer, capacity, credentials, caller_pid, target_generation, allow_remote_cwd, nullptr,
+                                   caller_task);
 }
 
 auto procfs_readlink_view_as(File* file, char* buffer, size_t capacity, const ker::mod::security::Snapshot& credentials,
-                             uint64_t caller_pid, DirectoryViewRef& directory_view, uint64_t* target_generation) -> ssize_t {
+                             uint64_t caller_pid, DirectoryViewRef& directory_view, uint64_t* target_generation,
+                             const ProcTask* caller_task) -> ssize_t {
     DirectoryViewRef candidate;
-    ssize_t const RESULT = procfs_readlink_as_impl(file, buffer, capacity, credentials, caller_pid, target_generation, true, &candidate);
+    ssize_t const RESULT =
+        procfs_readlink_as_impl(file, buffer, capacity, credentials, caller_pid, target_generation, true, &candidate, caller_task);
     if (RESULT >= 0) directory_view = std::move(candidate);
     return RESULT;
 }
 
 auto procfs_revalidate_readlink_result(File* file, uint64_t target_generation) -> int {
     if (file == nullptr || file->private_data == nullptr) return -EINVAL;
-    auto const& data = *static_cast<ProcFileData*>(file->private_data);
+    auto const& data = *static_cast<const ProcFileData*>(file->private_data);
+    int const VIEW = procfs_view_policy(data);
+    if (VIEW != 0) return VIEW;
     if (data.node.type == ProcNodeType::SELF_LINK) return target_generation == 0 ? 0 : -EAGAIN;
     if (data.node.type != ProcNodeType::EXE_LINK && data.node.type != ProcNodeType::CWD_LINK && data.node.type != ProcNodeType::ROOT_LINK &&
         data.node.type != ProcNodeType::FD_LINK)
@@ -7834,29 +8020,33 @@ auto procfs_fill_stat(File* f, Stat* statbuf, dev_t dev_id, uint64_t* target_gen
     }
 
     auto* pfd = static_cast<ProcFileData*>(f->private_data);
+    int const VIEW = procfs_view_policy(*pfd);
+    if (VIEW != 0) return VIEW;
+    Stat candidate{};
+    auto* output = &candidate;
     auto* owner_task = pfd->target;
     ker::mod::security::CredentialStore::Observation owner{};
     owner.credentials = ker::mod::security::Snapshot::bootstrap_root();
     if (owner_task != nullptr) owner = owner_task->credential_observation();
 
-    std::memset(statbuf, 0, sizeof(Stat));
-    statbuf->st_dev = dev_id;
-    statbuf->st_ino = 1;
-    statbuf->st_nlink = 1;
+    std::memset(output, 0, sizeof(Stat));
+    output->st_dev = dev_id;
+    output->st_ino = 1;
+    output->st_nlink = 1;
     auto const& OWNER_CREDENTIALS = owner.credentials;
-    statbuf->st_uid = OWNER_CREDENTIALS.user().real;
-    statbuf->st_gid = OWNER_CREDENTIALS.group().real;
-    statbuf->st_rdev = 0;
-    statbuf->st_size = 0;
-    statbuf->st_blksize = 4096;
-    statbuf->st_blocks = 0;
+    output->st_uid = OWNER_CREDENTIALS.user().real;
+    output->st_gid = OWNER_CREDENTIALS.group().real;
+    output->st_rdev = 0;
+    output->st_size = 0;
+    output->st_blksize = 4096;
+    output->st_blocks = 0;
 
     if (f->is_directory) {
-        statbuf->st_mode = S_IFDIR | 0555;
+        output->st_mode = S_IFDIR | 0555;
     } else if (pfd->node.type == ProcNodeType::EXE_LINK || pfd->node.type == ProcNodeType::SELF_LINK ||
                pfd->node.type == ProcNodeType::CWD_LINK || pfd->node.type == ProcNodeType::ROOT_LINK ||
                pfd->node.type == ProcNodeType::FD_LINK) {
-        statbuf->st_mode = S_IFLNK | 0777;
+        output->st_mode = S_IFLNK | 0777;
     } else if (pfd->node.type == ProcNodeType::KPERFCTL_FILE || pfd->node.type == ProcNodeType::WKI_CHAOS_FILE ||
                pfd->node.type == ProcNodeType::WKI_CHAOS_WORKLOAD_FILE || pfd->node.type == ProcNodeType::MEMACC_TRACK_PAGE_CALLERS_FILE ||
                pfd->node.type == ProcNodeType::MEMACC_TRACK_KMALLOC_DEBUG_FILE ||
@@ -7865,23 +8055,29 @@ auto procfs_fill_stat(File* f, Stat* statbuf, dev_t dev_id, uint64_t* target_gen
                pfd->node.type == ProcNodeType::MEMACC_RECLAIM_XFS_INODE_FILE ||
                pfd->node.type == ProcNodeType::MEMACC_RECLAIM_FILE_MMAP_CACHE_FILE ||
                pfd->node.type == ProcNodeType::MEMACC_RECLAIM_ANONYMOUS_SWAP_FILE) {
-        statbuf->st_mode = S_IFREG | 0644;
+        output->st_mode = S_IFREG | 0644;
     } else {
-        statbuf->st_mode = S_IFREG | 0444;
+        output->st_mode = S_IFREG | 0444;
     }
 
     auto const ACCESS = diagnostic_access(pfd->node.type);
-    if (ACCESS == DiagnosticAccess::KERNEL_READ) statbuf->st_mode = S_IFREG | 0400;
-    if (ACCESS == DiagnosticAccess::KERNEL_CONTROL || ACCESS == DiagnosticAccess::WKI_CONTROL) statbuf->st_mode = S_IFREG | 0600;
+    if (ACCESS == DiagnosticAccess::KERNEL_READ) output->st_mode = S_IFREG | 0400;
+    if (ACCESS == DiagnosticAccess::KERNEL_CONTROL || ACCESS == DiagnosticAccess::WKI_CONTROL) output->st_mode = S_IFREG | 0600;
 
-    set_stat_timestamps(statbuf, procfs_node_creation_epoch_ns(owner_task));
+    set_stat_timestamps(output, procfs_node_creation_epoch_ns(owner_task));
+    int const VALID_VIEW = procfs_view_policy(*pfd);
+    if (VALID_VIEW != 0) return VALID_VIEW;
+    *statbuf = candidate;
     if (target_generation != nullptr) *target_generation = owner.generation;
     return 0;
 }
 
 auto procfs_revalidate_metadata_result(const File* file, uint64_t target_generation) -> int {
     if (file == nullptr || file->private_data == nullptr) return -EINVAL;
-    auto const* target = static_cast<const ProcFileData*>(file->private_data)->target;
+    auto const& data = *static_cast<const ProcFileData*>(file->private_data);
+    int const VIEW = procfs_view_policy(data);
+    if (VIEW != 0) return VIEW;
+    auto const* target = data.target;
     // A retained metadata object survives target exit. Unlike private content,
     // it does not require an ACTIVE task or authorize access to task resources.
     uint64_t const GENERATION = target != nullptr ? target->credential_observation().generation : 0;
@@ -7935,12 +8131,26 @@ auto procfs_path_is_fd_link(const char* path) -> bool {
     return parse_proc_fd_path(path, parsed);
 }
 
-auto procfs_open_fd_link_path(const ker::mod::security::Snapshot& credentials, uint64_t caller_pid, const char* path, int* result_out)
-    -> File* {
+auto procfs_open_fd_link_path(const ker::mod::security::Snapshot& credentials, uint64_t caller_pid, const char* path, int* result_out,
+                              ProcTask* caller_task) -> File* {
     if (result_out == nullptr) return nullptr;
     *result_out = 0;
     ProcFdPath parsed{};
     if (!parse_proc_fd_path(path, parsed)) return nullptr;
+    if (caller_task != nullptr) {
+        auto const* view = caller_task->pid_namespace();
+        if (view == nullptr || ker::mod::sched::task::process_pid(*caller_task) != caller_pid) {
+            *result_out = -ESRCH;
+            return nullptr;
+        }
+        if (!view->is_host()) {
+            auto release = [](File* file) { ker::vfs::vfs_put_file(file); };
+            std::unique_ptr<File, decltype(release)> origin(procfs_lookup_path_as(path, caller_pid, 0, caller_task, result_out), release);
+            if (!origin) return nullptr;
+            origin->fops = get_procfs_fops();
+            return procfs_open_fd_lookup_as(credentials, caller_pid, origin.get(), result_out, nullptr);
+        }
+    }
     if (parsed.self) {
         if (caller_pid == 0) {
             *result_out = -ESRCH;
@@ -7982,6 +8192,8 @@ auto authorize_procfs_open_as(const ker::mod::security::Snapshot& credentials, u
     if (file == nullptr || file->private_data == nullptr) return -ENOENT;
     if ((flags & O_NOFOLLOW) != 0 && procfs_lookup_is_symlink(file)) return -ELOOP;
     auto const* data = static_cast<const ProcFileData*>(file->private_data);
+    int const VIEW = procfs_view_policy(*data);
+    if (VIEW != 0) return VIEW;
     bool const REQUIRE_DIRECTORY = require_directory || (flags & O_DIRECTORY) != 0;
     int policy = 0;
     if ((flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL))
@@ -8009,6 +8221,8 @@ auto authorize_procfs_open_as(const ker::mod::security::Snapshot& credentials, u
 auto procfs_revalidate_open_result(const File* file, uint64_t target_generation) -> int {
     if (file == nullptr || file->private_data == nullptr) return -EINVAL;
     auto const& data = *static_cast<const ProcFileData*>(file->private_data);
+    int const VIEW = procfs_view_policy(data);
+    if (VIEW != 0) return VIEW;
     if (!private_procfs_node(data.node.type)) return target_generation == 0 ? 0 : -EAGAIN;
     ker::mod::security::CredentialStore::Observation before{};
     before.generation = target_generation;
@@ -8056,6 +8270,11 @@ auto procfs_open_lookup_as(const ker::mod::security::Snapshot& credentials, uint
     auto* data = new ProcFileData{};
     if (data == nullptr) return fail(-ENOMEM);
     data->node = source.node;
+    int const RETAIN = source.pid_view.retain(data->pid_view);
+    if (RETAIN != 0) {
+        delete data;
+        return fail(RETAIN);
+    }
     if (source.target != nullptr) {
         if (!source.target->try_acquire()) {
             delete data;
@@ -8088,52 +8307,92 @@ auto procfs_open_lookup_as(const ker::mod::security::Snapshot& credentials, uint
 
 auto procfs_open_path(const ker::mod::security::Snapshot& credentials, const char* path, int flags, int mode, int* result_out,
                       bool require_directory) -> File* {
-    return procfs_open_path_as(credentials, current_procfs_pid(), path, flags, mode, result_out, require_directory);
+    auto* task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    return procfs_open_path_as(credentials, current_procfs_pid(), path, flags, mode, result_out, require_directory, task);
 }
 
 auto procfs_open_path_as(const ker::mod::security::Snapshot& credentials, uint64_t caller_pid, const char* path, int flags, int mode,
-                         int* result_out, bool require_directory) -> File* {
+                         int* result_out, bool require_directory, ProcTask* caller_task) -> File* {
     (void)mode;
     auto fail = [result_out](int error) -> File* {
         if (result_out != nullptr) *result_out = error;
         return nullptr;
     };
     if ((flags & 3) == 3 || (flags & (O_CREAT | O_DIRECTORY)) == (O_CREAT | O_DIRECTORY)) return fail(-EINVAL);
-    auto* file = procfs_lookup_path_as(path, caller_pid, flags);
-    if (file == nullptr) return fail(-ENOENT);
-    int const POLICY = authorize_procfs_open_as(credentials, caller_pid, file, flags, require_directory, nullptr);
-    if (POLICY != 0) {
+    int lookup_result = -ENOENT;
+    auto* file = procfs_lookup_path_as(path, caller_pid, flags, caller_task, &lookup_result);
+    if (file == nullptr) return fail(lookup_result);
+    uint64_t generation = 0;
+    int const POLICY = authorize_procfs_open_as(credentials, caller_pid, file, flags, require_directory, &generation);
+    int const VALID = POLICY == 0 ? procfs_revalidate_open_result(file, generation) : POLICY;
+    if (VALID != 0) {
         procfs_close(file);
         delete file;
-        return fail(POLICY);
+        return fail(VALID);
     }
     if (result_out != nullptr) *result_out = 0;
     return file;
 }
 
-auto procfs_lookup_path(const char* path, int flags) -> File* { return procfs_lookup_path_as(path, current_procfs_pid(), flags); }
+auto procfs_lookup_path(const char* path, int flags) -> File* {
+    auto* task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    return procfs_lookup_path_as(path, current_procfs_pid(), flags, task);
+}
 
-auto procfs_lookup_path_as(const char* path, uint64_t caller_pid, int flags, ProcTask* caller_task) -> File* {
-    if (path == nullptr) {
+auto procfs_lookup_path_as(const char* path, uint64_t caller_pid, int flags, ProcTask* caller_task, int* result_out) -> File* {
+    int lookup_error = -ENOENT;
+    if (result_out != nullptr) *result_out = lookup_error;
+    auto fail = [&](int error) -> File* {
+        lookup_error = error;
+        if (result_out != nullptr) *result_out = error;
         return nullptr;
-    }
+    };
+    if (path == nullptr) return nullptr;
+    pid_ns::NamespaceRef const HOST_VIEW;
+    auto const* view = caller_task != nullptr ? caller_task->pid_namespace() : &HOST_VIEW;
+    if (view == nullptr || (caller_task != nullptr && ker::mod::sched::task::process_pid(*caller_task) != caller_pid)) return fail(-ESRCH);
+    if (view->closed()) return fail(-EIDRM);
+    bool const PRIVATE_VIEW = !view->is_host();
+    uint64_t const SELF_PID = PRIVATE_VIEW ? ker::mod::sched::task::namespace_process_pid(*caller_task) : caller_pid;
+    if (PRIVATE_VIEW && SELF_PID == 0) return fail(-ESRCH);
 
     // Skip leading /
     while (*path == '/') {
         path++;
     }
 
-    uint64_t const SELF_PID = caller_pid;
-
-    auto retain_target = [caller_pid, caller_task](uint64_t pid) -> ProcTask* {
-        auto* owner = caller_task != nullptr ? caller_task->credential_owner() : nullptr;
-        if (owner != nullptr && pid == caller_pid && pid == owner->pid) return owner->try_acquire() ? owner : nullptr;
-        return ker::mod::sched::find_task_by_pid_safe(pid);
+    auto release_target = [](ProcTask* task) {
+        if (task != nullptr) task->release();
     };
-    auto make_file = [flags, &retain_target](ProcNodeType type, uint64_t pid, bool is_dir, bool thread_view = false,
-                                             uint64_t fd = 0) -> File* {
-        auto* pfd = new ProcFileData;
-        if (pfd == nullptr) return nullptr;
+    std::unique_ptr<ProcTask, decltype(release_target)> selected(nullptr, release_target);
+    uint64_t selected_name = 0;
+    auto retain_target = [&](uint64_t pid) -> ProcTask* {
+        if (view->closed()) {
+            fail(-EIDRM);
+            return nullptr;
+        }
+        if (!selected || selected_name != pid) {
+            auto* owner = caller_task != nullptr ? caller_task->credential_owner() : nullptr;
+            auto* target =
+                owner != nullptr && pid == SELF_PID && (PRIVATE_VIEW || owner->pid == caller_pid) && task_in_pid_view(*owner, *view)
+                    ? (owner->try_acquire() ? owner : nullptr)
+                    : ker::mod::sched::find_task_by_pid_namespace_safe(*view, pid);
+            if (target == nullptr) return nullptr;
+            selected.reset(target);
+            selected_name = pid;
+        }
+        return selected->try_acquire() ? selected.get() : nullptr;
+    };
+    auto make_file = [&](ProcNodeType type, uint64_t pid, bool is_dir, bool thread_view = false, uint64_t fd = 0) -> File* {
+        if (view->closed()) return fail(-EIDRM);
+        if (PRIVATE_VIEW && !private_view_node(type)) return fail(-ENOTSUP);
+        auto* pfd = new ProcFileData{};
+        if (pfd == nullptr) return fail(-ENOMEM);
+        int const RETAIN = view->retain(pfd->pid_view);
+        if (RETAIN != 0) {
+            delete pfd;
+            return fail(RETAIN);
+        }
         pfd->node.type = type;
         pfd->node.pid = pid;
         pfd->node.fd = fd;
@@ -8142,18 +8401,19 @@ auto procfs_lookup_path_as(const char* path, uint64_t caller_pid, int flags, Pro
         // an explicit synthetic caller without a registered Task.
         if (pid != 0 || private_procfs_node(type)) {
             pfd->target = retain_target(pid);
-            if (pfd->target == nullptr && type != ProcNodeType::SELF_LINK) {
+            if (pfd->target == nullptr && (PRIVATE_VIEW || type != ProcNodeType::SELF_LINK)) {
                 delete pfd;
-                return nullptr;
+                return fail(lookup_error);
             }
+            if (pfd->target != nullptr) pfd->node.pid = pfd->target->pid;
         }
         pfd->content = nullptr;
         pfd->content_len = 0;
 
-        auto* f = new File;
+        auto* f = new File{};
         if (f == nullptr) {
             delete pfd;
-            return nullptr;
+            return fail(-ENOMEM);
         }
         f->private_data = pfd;
         f->fd = -1;
@@ -8164,6 +8424,13 @@ auto procfs_lookup_path_as(const char* path, uint64_t caller_pid, int flags, Pro
         f->open_flags = flags;
         f->fd_flags = 0;
         f->fops = nullptr;  // set by caller
+        int const VALID = procfs_view_policy(*pfd);
+        if (VALID != 0) {
+            delete pfd;
+            delete f;
+            return fail(VALID);
+        }
+        if (result_out != nullptr) *result_out = 0;
         return f;
     };
     auto pid_exists = [&retain_target](uint64_t pid) -> bool {
@@ -8186,6 +8453,9 @@ auto procfs_lookup_path_as(const char* path, uint64_t caller_pid, int flags, Pro
         return make_file(ProcNodeType::FD_LINK, pid, false, false, fd);
     };
     auto open_task_subpath = [&](uint64_t group_pid, const char* subpath) -> File* {
+        std::unique_ptr<ProcTask, decltype(release_target)> group(retain_target(group_pid), release_target);
+        if (!group) return nullptr;
+        uint64_t const PHYSICAL_GROUP = ker::mod::sched::task::process_pid(*group);
         if (subpath == nullptr || *subpath == '\0') {
             return make_file(ProcNodeType::TASK_DIR, group_pid, true);
         }
@@ -8211,12 +8481,12 @@ auto procfs_lookup_path_as(const char* path, uint64_t caller_pid, int flags, Pro
         }
 
         auto const TID_VALUE = static_cast<uint64_t>(TID);
-        auto* target =
-            group_pid == caller_pid && TID_VALUE == caller_pid ? retain_target(TID_VALUE) : find_task_in_group_safe(group_pid, TID_VALUE);
-        if (target == nullptr) {
-            return nullptr;
-        }
+        auto* target = retain_target(TID_VALUE);
+        if (target == nullptr) return nullptr;
+        bool const MEMBER = ker::mod::sched::task::same_thread_group(*target, PHYSICAL_GROUP) &&
+                            (!PRIVATE_VIEW || target->credential_owner() == group->credential_owner());
         target->release();
+        if (!MEMBER) return nullptr;
 
         if (slash == nullptr) {
             return make_file(ProcNodeType::TASK_TID_DIR, TID_VALUE, true);
@@ -8567,7 +8837,8 @@ auto procfs_lookup_path_as(const char* path, uint64_t caller_pid, int flags, Pro
     const char* sub = slash + 1;
     auto* group_target = retain_target(static_cast<uint64_t>(PID));
     if (group_target == nullptr) return nullptr;
-    uint64_t const GROUP_PID = ker::mod::sched::task::process_pid(*group_target);
+    uint64_t const GROUP_PID =
+        PRIVATE_VIEW ? ker::mod::sched::task::namespace_process_pid(*group_target) : ker::mod::sched::task::process_pid(*group_target);
     group_target->release();
     if (strcmp(sub, "task") == 0) {
         return open_task_subpath(GROUP_PID, "");

@@ -596,7 +596,7 @@ def test_procfs_status_exposes_child_lifecycle_debug_state() -> None:
     require_tokens(
         body,
         [
-            "child_events::diagnostics(*task)",
+            "child_events::diagnostics(*task, local_view)",
             "WaitingForPid",
             "WaitpidCompletionClaimed",
             "WaitpidLastRepairUs",

@@ -532,6 +532,65 @@ Corrected assertions passed the full rerun. Final four inactive private images
 (258,555,904 allocated bytes) were verified and pruned; disposable usage
 returned to zero. Small successful and failed receipts remain available.
 
+## Retained native procfs views (checkpoint 13)
+
+Procfs lookup and raw/resolved opens now carry the retained requesting Task.
+Each procfs File owns its PID namespace reference, including roots and clones;
+its target and backend PID remain physical retained identity. Private parsed names
+use the exact native scoped index and canonical unpublished self. Integers never
+join a view. Clones and inherited Files preserve the captured view and target;
+Host observations continue using physical names, including Host supervision of
+private Tasks. Credential, dumpability, FD-mode and generation checks remain.
+
+Private root and thread listings filter before counting and emit dense local
+names. Status/stat use local PID/Tgid/PPID and durable local group/session names.
+Physical wait selectors are redacted in private status; public selectors retain
+their local names. Private loadavg/cpu-stat task counts are scoped; the last-name
+field is the greatest currently observed local TID, not an allocation counter.
+CPU time/load averages, machine memory, uptime, version and timekeeping remain
+explicit shared-machine metadata. Mounts retains its existing per-reader root
+and mount-view semantics without a persistent shared listing cache.
+
+Fresh private global perf, allocator, WKI topology/control and block diagnostics
+return ENOTSUP and are absent from root enumeration. Private image observations
+omit kernel images. Unsupported proxy/accepted/remote execution observations
+reject before discovery or remote effects; private cwd/root observations disable
+remote capture. Full WKI/network/export enforcement still requires integration.
+Dynamic self links require an explicit reader in the captured PID view and emit
+that reader's local process name. Host self links retain physical semantics.
+Closed private views reject reads, seeks, enumeration, links, metadata, cloning
+and fresh binding before output/cursor publication.
+
+Private mount administration permits device-free native procfs and forces it
+read-only. Entry from tmpfs proves the actual retained covered directory,
+namespace, attachment and admitted parent component before procfs binding outside
+publication. Dotdot exit proves the synthetic procfs root and selects the exact
+cover's native parent. Rename/replacement text cannot renew an old mount edge.
+FD reopening retains the actual underlying File capability, including its mode
+and cursor; PID closure does not revoke an already inherited ordinary backing
+File. Foreign mount-view dirfds still cannot confer fresh names. Owned native
+DirectoryView roots and physical-export walks continue refusing procfs; extending
+those anchored paths requires separate admission and runtime qualification.
+
+Nine kernel cases exercise actual unpublished Tasks/registry, native private
+mounts and component traversal, target/view retirement, clones, reader self,
+local/thread/parent/group/wait names, dense enumeration/census, closure staging,
+global/placement denial, descriptor capabilities and renamed cover refusal.
+The fixtures remain unscheduled. Public creation stays disabled and all ten full
+goal criteria remain incomplete, including namespace-init drain, mapped shared
+futex qualification, complete authority/WKI/network gates, launcher/spec,
+two simultaneous two-hour service trees and 1,000 full service lifecycles.
+
+Checkpoint 13 final Normal Build WOS, isolated fast diagnostic build, full formatter/clang-tidy
+check and 35 selected Host checks pass. Actual KTEST22 passes 80,236 assertions,
+zero failures and 1,319 cases, including all 67 required compartment cases and
+normal poweroff. KTEST20 exposed the remaining tmpfs-only path gate plus an old
+unsupported-procfs oracle. KTEST21 passed mounted traversal and rename refusal,
+but found a new fixture's incorrect reused-output-handle expectation. Frozen
+failed runs were stopped through exact-owned QMP and their images pruned before
+correction. Final four inactive images (258,818,048 allocated bytes) were checked
+and pruned; disposable usage returned to zero. Small evidence remains.
+
 ## Verification checkpoint
 
 The initial `compartment_policy_test` suite checks actual production preparation

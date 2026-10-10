@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <platform/sched/pid_namespace.hpp>
 #include <platform/security/credentials.hpp>
 #include <platform/sys/mutex.hpp>
 #include <vfs/file.hpp>
@@ -86,7 +87,7 @@ enum class ProcNodeType : uint8_t {
 
 struct ProcNode {
     ProcNodeType type;
-    uint64_t pid;  // process ID, task ID, or thread-group ID depending on node type
+    uint64_t pid;  // physical backend identity; display names use the retained view
     uint64_t fd;
     bool thread_view;
 };
@@ -97,6 +98,9 @@ struct ProcFileData {
     ProcFileData(const ProcFileData&) = delete;
     auto operator=(const ProcFileData&) -> ProcFileData& = delete;
     ker::mod::sched::task::Task* target{};
+    // Captured at binding; inherited Files and clones retain this exact view.
+    // Empty is Host, independent of the worker reading the File later.
+    ker::mod::sched::pid_ns::NamespaceRef pid_view{};
     uint64_t content_credential_generation{};
     ProcNode node;
     char* content;  // generated content (lazily allocated)
@@ -112,7 +116,8 @@ auto procfs_open_path(const ker::mod::security::Snapshot& credentials, const cha
                       bool require_directory = false) -> File*;
 // Explicit request identity; compatibility wrapper above uses the current process PID.
 auto procfs_open_path_as(const ker::mod::security::Snapshot& credentials, uint64_t caller_pid, const char* path, int flags, int mode,
-                         int* result_out = nullptr, bool require_directory = false) -> File*;
+                         int* result_out = nullptr, bool require_directory = false, ker::mod::sched::task::Task* caller_task = nullptr)
+    -> File*;
 // Clone only retained metadata/target identity. Lazy content is never copied.
 auto procfs_open_lookup_as(const ker::mod::security::Snapshot& credentials, uint64_t caller_pid, const File* retained, int flags,
                            bool require_directory, int* result_out, uint64_t* target_generation) -> File*;
@@ -128,16 +133,17 @@ auto procfs_revalidate_open_result(const File* file, uint64_t target_generation)
 auto procfs_lookup_path(const char* path, int flags = 0) -> File*;
 // Metadata parser for a retained request context; does not authorize data access.
 // caller_task is retained by the caller and may be an unpublished private child.
-// It supplies only its own process identity; foreign PID lookup is unchanged.
-auto procfs_lookup_path_as(const char* path, uint64_t caller_pid, int flags = 0, ker::mod::sched::task::Task* caller_task = nullptr)
-    -> File*;
+// caller_pid is trusted physical canonical identity; parsed names use its view.
+// Null Task is reserved for explicit trusted Host/boot/model observations.
+auto procfs_lookup_path_as(const char* path, uint64_t caller_pid, int flags = 0, ker::mod::sched::task::Task* caller_task = nullptr,
+                           int* result_out = nullptr) -> File*;
 
 // Syntactic detection only: no Task/File lookup or authority is conferred.
 auto procfs_path_is_fd_link(const char* path) -> bool;
 // Open /proc/<pid>/fd/<fd> by retaining the referenced open file.
 // result_out is 0 for a non-FD path, negative for an authoritative failure.
-auto procfs_open_fd_link_path(const ker::mod::security::Snapshot& credentials, uint64_t caller_pid, const char* path, int* result_out)
-    -> File*;
+auto procfs_open_fd_link_path(const ker::mod::security::Snapshot& credentials, uint64_t caller_pid, const char* path, int* result_out,
+                              ker::mod::sched::task::Task* caller_task = nullptr) -> File*;
 
 // Fill stat metadata for an already-open procfs file.
 auto procfs_fill_stat(File* f, Stat* statbuf, dev_t dev_id, uint64_t* target_generation = nullptr) -> int;
@@ -163,13 +169,15 @@ auto get_procfs_fops() -> FileOperations*;
 // The caller retains file; the call may release a borrowed remote FD and must
 // run outside VFS namespace publication.
 auto procfs_readlink_as(File* file, char* buffer, size_t capacity, const ker::mod::security::Snapshot& credentials, uint64_t caller_pid,
-                        uint64_t* target_generation = nullptr, bool allow_remote_cwd = false) -> ssize_t;
+                        uint64_t* target_generation = nullptr, bool allow_remote_cwd = false,
+                        const ker::mod::sched::task::Task* caller_task = nullptr) -> ssize_t;
 // Component traversal captures either text or an owned directory scope from
 // one selected FD/cwd, never two reads. Scope success returns zero text bytes.
 // Preserve outputs on failure; run outside publication and retain the origin
 // metadata/generation through commit. Raw READLINK keeps text-only semantics.
 auto procfs_readlink_view_as(File* file, char* buffer, size_t capacity, const ker::mod::security::Snapshot& credentials,
-                             uint64_t caller_pid, DirectoryViewRef& directory_view, uint64_t* target_generation) -> ssize_t;
+                             uint64_t caller_pid, DirectoryViewRef& directory_view, uint64_t* target_generation,
+                             const ker::mod::sched::task::Task* caller_task = nullptr) -> ssize_t;
 // Revalidate a successful staged read using its retained File. No VFS calls or
 // borrowed-FD release; safe during namespace publication. SELF uses generation 0.
 auto procfs_revalidate_readlink_result(File* file, uint64_t target_generation) -> int;

@@ -7809,7 +7809,7 @@ auto procfs_fd_link_prefix_probe_needed(const char* path, size_t known_path_len,
 
 auto vfs_try_open_procfs_fd_link(const ker::mod::security::Snapshot& credentials, uint64_t caller_pid, const char* path,
                                  bool apply_task_policy, int& result, MountPoint const* initial_mount = nullptr,
-                                 size_t known_path_len = UNKNOWN_PATH_LEN) -> File* {
+                                 size_t known_path_len = UNKNOWN_PATH_LEN, ker::mod::sched::task::Task* caller_task = nullptr) -> File* {
     result = 0;
     if (path == nullptr) {
         return nullptr;
@@ -7817,7 +7817,7 @@ auto vfs_try_open_procfs_fd_link(const ker::mod::security::Snapshot& credentials
 
     if (initial_mount != nullptr && initial_mount->fs_type == FSType::PROCFS) {
         const char* fs_relative_path = strip_mount_prefix(initial_mount, path);
-        auto* file = ker::vfs::procfs::procfs_open_fd_link_path(credentials, caller_pid, fs_relative_path, &result);
+        auto* file = ker::vfs::procfs::procfs_open_fd_link_path(credentials, caller_pid, fs_relative_path, &result, caller_task);
         if (file != nullptr || result != 0) return file;
     } else if (!procfs_fd_link_prefix_probe_needed(path, known_path_len, initial_mount)) {
         return nullptr;
@@ -7838,7 +7838,7 @@ auto vfs_try_open_procfs_fd_link(const ker::mod::security::Snapshot& credentials
     }
 
     const char* fs_relative_path = strip_mount_prefix(mount, prefix_resolved.data());
-    return ker::vfs::procfs::procfs_open_fd_link_path(credentials, caller_pid, fs_relative_path, &result);
+    return ker::vfs::procfs::procfs_open_fd_link_path(credentials, caller_pid, fs_relative_path, &result, caller_task);
 }
 }  // namespace
 
@@ -8185,7 +8185,7 @@ auto vfs_open_resolved_for_task(ker::mod::sched::task::Task* task, const char* r
     if (!REMOTE_MOUNT && scope->is_host()) {
         int fd_link_result = 0;
         auto* fd_link_file = vfs_try_open_procfs_fd_link(CREDENTIALS, ker::mod::sched::task::process_pid(*task), path_buffer.data(),
-                                                         !open_local, fd_link_result, mount, path_buffer_len);
+                                                         !open_local, fd_link_result, mount, path_buffer_len, task);
         if (fd_link_result != 0) return fd_link_result;
         if (fd_link_file != nullptr) {
             int const LINK_FLAGS_ERROR = (flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)      ? -EEXIST
@@ -8352,7 +8352,7 @@ auto vfs_open_resolved_for_task(ker::mod::sched::task::Task* task, const char* r
             break;
         case FSType::PROCFS:
             f = ker::vfs::procfs::procfs_open_path_as(CREDENTIALS, ker::mod::sched::task::process_pid(*task), fs_relative_path,
-                                                      backend_flags, mode, &backend_open_result, OPEN_REQUIRE_DIRECTORY);
+                                                      backend_flags, mode, &backend_open_result, OPEN_REQUIRE_DIRECTORY, task);
             if (f != nullptr) {
                 f->fops = ker::vfs::procfs::get_procfs_fops();
                 f->fs_type = FSType::PROCFS;
@@ -11893,8 +11893,9 @@ auto local_walk_read_stat(LocalWalkNode& node, const char* path, uint64_t caller
     else if (mount->fs_type == FSType::FAT32)
         result = ker::vfs::fat32::fat32_stat(fs_path, &node.stat, static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data));
     else if (mount->fs_type == FSType::PROCFS) {
-        node.proc.reset(ker::vfs::procfs::procfs_lookup_path_as(fs_path, caller_pid, 0, caller_task));
-        result = node.proc ? ker::vfs::procfs::procfs_fill_stat(node.proc.get(), &node.stat, mount->dev_id) : -ENOENT;
+        int lookup_result = -ENOENT;
+        node.proc.reset(ker::vfs::procfs::procfs_lookup_path_as(fs_path, caller_pid, 0, caller_task, &lookup_result));
+        result = node.proc ? ker::vfs::procfs::procfs_fill_stat(node.proc.get(), &node.stat, mount->dev_id) : lookup_result;
     }
     if (result == -ENOENT && mount->namespace_owner.is_host() && fill_synthetic_mount_dir_stat(path, &node.stat) == 0) {
         node.synthetic = true;
@@ -12017,12 +12018,68 @@ auto local_walk_cross_native_mount(const LocalWalkEpoch& epoch, const ker::mod::
     return result != 0 ? result : (out.exists ? 0 : -ENOENT);
 }
 
+// Caller holds publication. Private synthetic procfs has no native directory
+// inode; only its exact retained cover can establish a mount transition.
+// This helper never binds procfs or releases a borrowed process descriptor.
+auto local_walk_cross_private_procfs_mount(const LocalWalkEpoch& epoch, const ker::mod::security::Snapshot& credentials, const char* path,
+                                           LocalWalkNode& from, const char* component, LocalWalkNode& out) -> int {
+    if (epoch.mount_namespace == nullptr || epoch.mount_namespace->is_host()) return RESOLVE_FAST_PATH_DECLINED;
+    bool const DOWN = from.mount && out.mount && from.mount->fs_type == FSType::TMPFS && out.mount->fs_type == FSType::PROCFS;
+    bool const UP = from.mount && out.mount && from.mount->fs_type == FSType::PROCFS && out.mount->fs_type == FSType::TMPFS &&
+                    component != nullptr && std::strcmp(component, "..") == 0;
+    if (!DOWN && !UP) return RESOLVE_FAST_PATH_DECLINED;
+    if (epoch.confined_mount != nullptr || epoch.physical_path) return -EXDEV;
+    if (component == nullptr || from.synthetic || epoch.membership == nullptr) return -EXDEV;
+    auto* child = DOWN ? out.mount.get() : from.mount.get();
+    auto* parent = DOWN ? from.mount.get() : out.mount.get();
+    int result = local_walk_search(from, credentials);
+    if (result != 0) return result;
+    if (UP) {
+        if (!from.proc || from.proc->private_data == nullptr ||
+            static_cast<const procfs::ProcFileData*>(from.proc->private_data)->node.type != procfs::ProcNodeType::ROOT_DIR)
+            return -EXDEV;
+        result = procfs::procfs_revalidate_open_result(from.proc.get(), 0);
+        if (result != 0) return result;
+    }
+    auto& references = *epoch.membership;
+    if (!references) {
+        references.reset(new (std::nothrow) NativeDirectoryMembershipReferences{});
+        if (!references) return -ENOMEM;
+    }
+    File* covered = nullptr;
+    result = references->capture(child, epoch.mount_generation, covered);
+    if (result != 0) return result;
+    std::array<char, MAX_PATH_LEN> child_path{};
+    result = validate_native_mount_attachment(child, covered, epoch.mount_generation, &child_path);
+    if (result != 0) return result;
+    if (covered->mount_owner != parent || covered->fs_type != FSType::TMPFS) return -EXDEV;
+    if (DOWN) {
+        if (!from.tmp || std::strcmp(path, child_path.data()) != 0) return -EAGAIN;
+        tmpfs::TmpfsLookupHandle selected;
+        result = tmpfs::tmpfs_acquire_lookup(credentials, from.tmp->target(), component, &selected);
+        if (result != 0) return result;
+        if (!selected.target_existed() || selected.target() != static_cast<tmpfs::TmpNode*>(covered->private_data)) return -EAGAIN;
+    } else {
+        child_path[metadata_parent_path_len(child_path.data(), std::strlen(child_path.data()))] = '\0';
+        if (std::strcmp(path, child_path.data()) != 0) return -EAGAIN;
+        out.tmp.reset(new (std::nothrow) tmpfs::TmpfsLookupHandle{});
+        if (!out.tmp) return -ENOMEM;
+        // The hidden cover supplies parent identity, not renewed search rights.
+        // The following visible component receives the admitted credentials.
+        result = tmpfs::tmpfs_acquire_lookup(ker::mod::security::Snapshot::bootstrap_root(),
+                                             static_cast<tmpfs::TmpNode*>(covered->private_data), "..", out.tmp.get());
+        if (result == 0) result = local_walk_read_stat(out, path, epoch.caller_pid, epoch.caller_task);
+        if (result != 0) return result;
+    }
+    return epoch.current() && references->current(epoch.mount_generation) ? 0 : -EAGAIN;
+}
+
 auto local_walk_bind(const LocalWalkEpoch& epoch, const ker::mod::security::Snapshot& credentials, const char* path, LocalWalkNode* parent,
                      const char* component, File* anchor, LocalWalkNode& out, DirectoryAnchor* retained = nullptr) -> int {
     out.mount = find_mount_point(path, UNKNOWN_MOUNT_PATH_LEN, *epoch.mount_namespace);
     auto* mount = out.mount.get();
     bool const PRIVATE = !epoch.mount_namespace->is_host();
-    if (PRIVATE && mount != nullptr && mount->fs_type != FSType::TMPFS) return -ENOTSUP;
+    if (PRIVATE && mount != nullptr && mount->fs_type != FSType::TMPFS && mount->fs_type != FSType::PROCFS) return -ENOTSUP;
     // Scoped transitions require native identity proofs below; unsupported
     // backends cannot bind an object or use the unscoped fallback.
     if (epoch.confined_mount != nullptr && (mount == nullptr || (mount->fs_type != FSType::TMPFS && mount->fs_type != FSType::XFS)))
@@ -12047,6 +12104,13 @@ auto local_walk_bind(const LocalWalkEpoch& epoch, const ker::mod::security::Snap
     if (epoch.physical_path && mount->fs_type == FSType::PROCFS) return -ENOTSUP;
     if (epoch.serialized && mount->fs_type != FSType::TMPFS && mount->fs_type != FSType::XFS) return RESOLVE_FAST_PATH_DECLINED;
     if (mount->fs_type == FSType::PROCFS) {
+        if (PRIVATE && (parent == nullptr || parent->mount.get() != mount)) {
+            if (parent == nullptr) return -EXDEV;
+            ker::mod::sys::MutexGuard publication_guard(g_vfs_namespace_publication_mutex);
+            if (!epoch.current()) return -EAGAIN;
+            int const CROSS = local_walk_cross_private_procfs_mount(epoch, credentials, path, *parent, component, out);
+            if (CROSS != 0) return CROSS == RESOLVE_FAST_PATH_DECLINED ? -EXDEV : CROSS;
+        }
         // PROCFS can release a borrowed remote FD. Keep that close/owner wait
         // outside namespace publication, then validate the entire walk epoch.
         int const RESULT = local_walk_read_stat(out, path, epoch.caller_pid, epoch.caller_task);
@@ -12059,6 +12123,8 @@ auto local_walk_bind(const LocalWalkEpoch& epoch, const ker::mod::security::Snap
     bool const SAME_MOUNT = parent != nullptr && parent->mount.get() == mount;
     bool const CROSS_PARENT = parent != nullptr && !SAME_MOUNT && component != nullptr && std::strcmp(component, "..") == 0;
     if (parent != nullptr && !SAME_MOUNT) {
+        int const PROCFS_CROSS = local_walk_cross_private_procfs_mount(epoch, credentials, path, *parent, component, out);
+        if (PROCFS_CROSS != RESOLVE_FAST_PATH_DECLINED) return PROCFS_CROSS;
         int const CROSS = local_walk_cross_native_mount(epoch, credentials, path, *parent, component, out);
         if (CROSS != RESOLVE_FAST_PATH_DECLINED) return CROSS;
         if (PRIVATE || epoch.confined_mount != nullptr) return -EXDEV;
@@ -12129,11 +12195,12 @@ auto local_walk_bind(const LocalWalkEpoch& epoch, const ker::mod::security::Snap
 }
 
 auto local_walk_readlink(const ker::mod::security::Snapshot& credentials, uint64_t caller_pid, LocalWalkNode& node, const char* path,
-                         char* out, size_t capacity, bool allow_remote_cwd) -> ssize_t {
+                         char* out, size_t capacity, bool allow_remote_cwd, const ker::mod::sched::task::Task* caller_task) -> ssize_t {
     if (node.tmp) return ker::vfs::tmpfs::tmpfs_readlink_lookup(*node.tmp, out, capacity);
     if (node.xfs) return ker::vfs::xfs::xfs_readlink_lookup(*node.xfs, out, capacity);
     if (node.proc)
-        return ker::vfs::procfs::procfs_readlink_as(node.proc.get(), out, capacity, credentials, caller_pid, nullptr, allow_remote_cwd);
+        return ker::vfs::procfs::procfs_readlink_as(node.proc.get(), out, capacity, credentials, caller_pid, nullptr, allow_remote_cwd,
+                                                    caller_task);
     if (node.dev) return ker::vfs::devfs::devfs_readlink_path(strip_mount_prefix(node.mount.get(), path), out, capacity);
     return -EINVAL;
 }
@@ -12762,9 +12829,9 @@ auto acquire_local_component_lookup(ker::mod::sched::task::Task* task, int dirfd
             // yields either its exact view or text from the same FD/cwd.
             ssize_t const READ =
                 next.proc ? procfs::procfs_readlink_view_as(next.proc.get(), target.data(), target.size() - 1, authorization.credentials,
-                                                            ker::mod::sched::task::process_pid(*task), captured, &generation)
+                                                            ker::mod::sched::task::process_pid(*task), captured, &generation, task)
                           : local_walk_readlink(authorization.credentials, ker::mod::sched::task::process_pid(*task), next,
-                                                next_path.data(), target.data(), target.size() - 1, !serialized);
+                                                next_path.data(), target.data(), target.size() - 1, !serialized, task);
             if (READ < 0) return static_cast<int>(READ);
             if (captured) {
                 // Once scoped, crossing to PROCFS is rejected before
@@ -13216,9 +13283,10 @@ auto vfs_acquire_lookup(ker::mod::sched::task::Task* task, int dirfd, const char
         if (mount->fs_type == FSType::PROCFS &&
             (intent == LookupIntent::READLINK || intent == LookupIntent::OPEN || intent == LookupIntent::STAT ||
              intent == LookupIntent::ACCESS || intent == LookupIntent::MOUNT_TARGET)) {
-            auto* backend =
-                procfs::procfs_lookup_path_as(strip_mount_prefix(mount, path.data()), ker::mod::sched::task::process_pid(*task), 0, task);
-            if (backend == nullptr) return path_walk_error(-ENOENT);
+            int lookup_result = -ENOENT;
+            auto* backend = procfs::procfs_lookup_path_as(strip_mount_prefix(mount, path.data()), ker::mod::sched::task::process_pid(*task),
+                                                          0, task, &lookup_result);
+            if (backend == nullptr) return path_walk_error(lookup_result);
             LookupHandleBuilder::set_backend_binding(candidate, backend, release_procfs_lookup_cookie, 0, 0, nullptr, nullptr,
                                                      reinterpret_cast<uintptr_t>(backend));
         }
@@ -13737,7 +13805,7 @@ auto readlink_procfs_lookup_as(const LookupHandle& handle, const ker::mod::sched
     context.result = handle.requires_directory() && !context.file->is_directory
                          ? -ENOTDIR
                          : procfs::procfs_readlink_as(context.file, context.candidate.data(), std::min(capacity, context.candidate.size()),
-                                                      credentials, caller_pid, &context.target_generation, true);
+                                                      credentials, caller_pid, &context.target_generation, true, &task);
     auto publish = [](const LookupHandle&, void* opaque) -> int {
         auto& args = *static_cast<Context*>(opaque);
         if (args.result < 0) return static_cast<int>(args.result);
@@ -27944,8 +28012,10 @@ auto vfs_mount_for_task(ker::mod::sched::task::Task* authorization_task, const c
     int const POLICY = ker::mod::security::authorize_mount_administration(CREDENTIALS);
     if (POLICY != 0) return POLICY;
     // No device resolution, probing, discovery or remote attach can precede
-    // this gate. Private backing support is deliberately native tmpfs only.
-    if (!scope.is_host() && (source != nullptr || fstype == nullptr || std::strcmp(fstype, "tmpfs") != 0)) return -ENOTSUP;
+    // this gate. Native procfs captures the requester PID view without devices.
+    if (!scope.is_host() &&
+        (source != nullptr || fstype == nullptr || (std::strcmp(fstype, "tmpfs") != 0 && std::strcmp(fstype, "procfs") != 0)))
+        return -ENOTSUP;
 
     // Mounting does not create namespace entries. Init and tools explicitly
     // create their targets; a failed preparation must leave no directory behind.
@@ -30690,7 +30760,7 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
         uint64_t const CALLER_PID = caller != nullptr ? ker::mod::sched::task::process_pid(*caller) : 0;
         int fd_link_result = 0;
         auto* fd_link_file = vfs_try_open_procfs_fd_link(CREDENTIALS, CALLER_PID, pathBuffer, apply_task_policy && !OPEN_LOCAL,
-                                                         fd_link_result, mount, path_buffer_len);
+                                                         fd_link_result, mount, path_buffer_len, CALLER);
         if (fd_link_result != 0) return nullptr;
         if (fd_link_file != nullptr) {
             if ((flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL) || (flags & O_NOFOLLOW) != 0 ||
@@ -30824,7 +30894,7 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
             break;
         case FSType::PROCFS:
             f = ker::vfs::procfs::procfs_open_path_as(CREDENTIALS, REQUEST_PID, fs_relative_path, backend_flags, mode, &backend_open_result,
-                                                      OPEN_REQUIRE_DIRECTORY);
+                                                      OPEN_REQUIRE_DIRECTORY, CALLER);
             if (f != nullptr) {
                 f->fops = ker::vfs::procfs::get_procfs_fops();
                 f->fs_type = FSType::PROCFS;

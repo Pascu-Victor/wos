@@ -214,7 +214,8 @@ void release_claim(sched_task::Task& waiter, const ClaimedEvent& claimed);
 // Scheduler GC may inspect only this explicit lifecycle state; it must not scan
 // for a parent or infer waitability from PID relationships.
 [[nodiscard]] auto is_waitable_zombie(const sched_task::Task& task) -> bool;
-[[nodiscard]] auto diagnostics(sched_task::Task& task) -> Diagnostics;
+// Public proc observations suppress trusted physical wait selectors.
+[[nodiscard]] auto diagnostics(sched_task::Task& task, bool public_names = false) -> Diagnostics;
 
 #ifdef WOS_SELFTEST
 [[nodiscard]] auto selftest_native_tracee_queue_versions() -> bool;

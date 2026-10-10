@@ -790,7 +790,7 @@ def test_procfs_metadata_retains_owner_and_stages_before_publication():
     proc = (ROOT / "modules/kern/src/vfs/fs/procfs.cpp").read_text()
     parser = body_after(proc, "auto procfs_lookup_path_as(")
     assert "pid != 0 || private_procfs_node(type)" in parser
-    assert "pfd->target == nullptr && type != ProcNodeType::SELF_LINK" in parser
+    assert "pfd->target == nullptr && (PRIVATE_VIEW || type != ProcNodeType::SELF_LINK)" in parser
     stat = body_after(proc, "auto procfs_fill_stat(")
     assert stat.count("credential_observation()") == 1
     assert "owner_task = pfd->target" in stat and "*target_generation = owner.generation" in stat
@@ -825,7 +825,7 @@ def test_procfs_open_retains_identity_and_publishes_only_after_validation():
     for token in ("procfs_lookup_path", "current_procfs_pid", "get_current_task", "memcpy"):
         assert token not in cloned
     path = body_after(proc, "auto procfs_open_path_as(")
-    assert "procfs_lookup_path_as(path, caller_pid, flags)" in path
+    assert "procfs_lookup_path_as(path, caller_pid, flags, caller_task, &lookup_result)" in path
     assert "authorize_procfs_open_as(credentials, caller_pid," in path
     assert "current_procfs_pid" not in path
     consumed = body_after(core, "auto open_procfs_lookup_as(")
@@ -853,10 +853,10 @@ def test_procfs_final_readlink_retains_request_identity_and_stages_before_public
     core = (ROOT / "modules/kern/src/vfs/core.cpp").read_text()
     proc = (ROOT / "modules/kern/src/vfs/fs/procfs.cpp").read_text()
     parser = body_after(proc, "auto procfs_lookup_path_as(")
-    assert "SELF_PID = caller_pid" in parser
+    assert "SELF_PID = PRIVATE_VIEW ? ker::mod::sched::task::namespace_process_pid(*caller_task) : caller_pid" in parser
     assert "get_current_task" not in parser and "current_procfs_pid" not in parser
     stat = body_after(core, "auto local_walk_read_stat(")
-    assert "procfs_lookup_path_as(fs_path, caller_pid, 0, caller_task)" in stat
+    assert "procfs_lookup_path_as(fs_path, caller_pid, 0, caller_task, &lookup_result)" in stat
     walker = body_after(core, "auto acquire_local_component_lookup(")
     assert "current.proc && (intent == LookupIntent::READLINK || intent == LookupIntent::OPEN ||" in walker
     assert "current.mount->fs_type == FSType::PROCFS &&" in walker
@@ -926,7 +926,7 @@ def test_procfs_fd_access_authorizes_and_revalidates_before_publication():
     link = body_after(proc, "auto procfs_readlink_as_impl(")
     assert "current_procfs_credentials()" not in link and "get_current_task" not in link
     explicit = body_after(proc, "auto procfs_readlink_as(")
-    assert "procfs_readlink_as_impl(file, buffer, capacity, credentials, caller_pid, target_generation, allow_remote_cwd)" in explicit
+    assert "procfs_readlink_as_impl(file, buffer, capacity, credentials, caller_pid, target_generation, allow_remote_cwd, nullptr, caller_task)" in " ".join(explicit.split())
     assert link.index("authorized_task_fd_retain(") < link.index("file->path_metadata_lock.lock_irqsave()")
     opened = body_after(proc, "auto procfs_open_fd_link_path(")
     assert "get_current_task" not in opened

@@ -1443,10 +1443,10 @@ auto is_waitable_zombie(const Task& task) -> bool {
     return task.child_membership_state.load(std::memory_order_acquire) == ChildMembershipState::ZOMBIE;
 }
 
-auto diagnostics(Task& task) -> Diagnostics {
+auto diagnostics(Task& task, bool public_names) -> Diagnostics {
     Diagnostics result{};
     uint64_t const FLAGS = g_lifecycle_lock.lock_irqsave();
-    if (task.child_wait_registration.registered) {
+    if (task.child_wait_registration.registered && (!public_names || task.child_wait_view == View::PUBLIC)) {
         result.registered_selector = task.child_wait_registration.selector.value;
     }
     for (ChildEvent* event = task.child_event_head; event != nullptr; event = event->next) {

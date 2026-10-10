@@ -2059,7 +2059,7 @@ KTEST(CompartmentAdmin, UnsupportedClosedAndUnauthorizedFailBeforeMountEffects) 
         KREQUIRE_EQ(vfs::vfs_mkdirat(subject.task.get(), vfs::AT_FDCWD, "/service", 0755), 0);
         for (auto* source : {"wki://foreign/private", "PARTUUID=foreign", "/dev/foreign", ""})
             KEXPECT_EQ(vfs::vfs_mount_for_task(subject.task.get(), source, "/service", "tmpfs"), -ENOTSUP);
-        for (auto* type : {"xfs", "fat32", "remote", "devfs", "procfs", ""})
+        for (auto* type : {"xfs", "fat32", "remote", "devfs", ""})
             KEXPECT_EQ(vfs::vfs_mount_for_task(subject.task.get(), nullptr, "/service", type), -ENOTSUP);
         KEXPECT_EQ(vfs::vfs_mount_for_task(subject.task.get(), nullptr, "/service", nullptr), -ENOTSUP);
         KEXPECT_EQ(vfs::vfs_mount_for_task(subject.task.get(), nullptr, "/absent", "tmpfs"), -ENOENT);
@@ -2481,7 +2481,7 @@ KTEST(CompartmentMount, ReservationsClosureAndUnsupportedViewsFailBeforePublicat
     vfs::finish_prepared_mount(&views.pending_first);
     KEXPECT_EQ(vfs::retire_mount_namespace(views.first), 0);
     KEXPECT_EQ(prepare(views.first, "tmpfs", duplicate), -EIDRM);
-    for (auto* type : {"devfs", "procfs", "remote", "fat32", "xfs"}) {
+    for (auto* type : {"devfs", "remote", "fat32", "xfs"}) {
         KEXPECT_EQ(prepare(views.second, type, duplicate), -ENOTSUP);
         KEXPECT_NULL(duplicate.state);
     }
@@ -2653,4 +2653,483 @@ KTEST(CompartmentMount, PrivateMountLimitRollsBackPreparedBacking) {
         KEXPECT_EQ(private_mount(views.first, "/exhausted"), 0);
     }
     KEXPECT_EQ(mount_ns::live_namespace_count(), BASELINE);
+}
+
+namespace {
+namespace procfs = vfs::procfs;
+
+auto scoped_proc(Task& requester, const char* path, int* result = nullptr) -> NativeFile {
+    auto* file = procfs::procfs_lookup_path_as(path, sched::task::process_pid(requester), 0, &requester, result);
+    // Metadata lookup deliberately leaves operations unset; own the production
+    // backend close path on every test return, including failed REQUIREs.
+    if (file != nullptr) file->fops = procfs::get_procfs_fops();
+    return NativeFile(file);
+}
+auto host_proc(uint64_t requester, const char* path) -> NativeFile {
+    auto* file = procfs::procfs_lookup_path_as(path, requester);
+    if (file != nullptr) file->fops = procfs::get_procfs_fops();
+    return NativeFile(file);
+}
+auto proc_data(const NativeFile& file) -> const procfs::ProcFileData& {
+    return *static_cast<const procfs::ProcFileData*>(file->private_data);
+}
+auto proc_text(const NativeFile& file, std::array<char, 8192>& output) -> ssize_t {
+    output.fill('\0');
+    return file->fops->vfs_read(file.get(), output.data(), output.size() - 1, 0);
+}
+auto status_row(const char* content, const char* key, uint64_t value) -> bool {
+    std::array<char, 96> expected{};
+    std::snprintf(expected.data(), expected.size(), "\n%s:\t%llu\n", key, static_cast<unsigned long long>(value));
+    return std::strstr(content, expected.data()) != nullptr;
+}
+}  // namespace
+
+KTEST(CompartmentProcfs, BindingCloningAndRetirementKeepExactViewAndTarget) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    auto const ACTIVE = sched::get_active_task_count();
+    auto const INDEXED = sched::get_scoped_pid_task_count();
+    {
+        pid_ns::NamespaceRef first, second;
+        KREQUIRE_EQ(pid_ns::create_namespace(first), 0);
+        KREQUIRE_EQ(pid_ns::create_namespace(second), 0);
+        RegistryTask caller, target, sibling, foreign;
+        KREQUIRE_TRUE(caller.task->initialize_pid_namespace(first));
+        KREQUIRE_TRUE(target.task->initialize_pid_namespace(first));
+        KREQUIRE_TRUE(sibling.task->initialize_pid_namespace(second));
+        KREQUIRE_TRUE(foreign.task->initialize_pid_namespace(second));
+        KREQUIRE_TRUE(caller.publish());
+        KREQUIRE_TRUE(target.publish());
+        KREQUIRE_TRUE(sibling.publish());
+        KREQUIRE_TRUE(foreign.publish());
+        auto local = scoped_proc(*caller.task, "2/status");
+        auto other = scoped_proc(*sibling.task, "2/status");
+        KREQUIRE_TRUE(local && other);
+        KEXPECT_TRUE(proc_data(local).target == target.task.get());
+        KEXPECT_TRUE(proc_data(other).target == foreign.task.get());
+        KEXPECT_TRUE(proc_data(local).pid_view == first);
+        KEXPECT_EQ(proc_data(local).node.pid, target.task->pid);
+        std::array<char, 64> path{};
+        std::snprintf(path.data(), path.size(), "%llu/status", static_cast<unsigned long long>(target.task->pid));
+        int result = 0;
+        KEXPECT_FALSE(scoped_proc(*caller.task, path.data(), &result));
+        KEXPECT_EQ(result, -ENOENT);
+        auto host = host_proc(caller.task->pid, path.data());
+        KREQUIRE_TRUE(host);
+        KEXPECT_TRUE(proc_data(host).pid_view.is_host());
+        KEXPECT_TRUE(proc_data(host).target == target.task.get());
+        uint64_t generation = UINT64_MAX;
+        NativeFile clone(procfs::procfs_open_lookup_as(ker::mod::security::Snapshot::bootstrap_root(), caller.task->pid, local.get(), 0,
+                                                       false, &result, &generation));
+        KREQUIRE_TRUE(clone);
+        KEXPECT_EQ(result, 0);
+        KEXPECT_TRUE(proc_data(clone).pid_view == first);
+        KEXPECT_TRUE(proc_data(clone).target == target.task.get());
+        KEXPECT_NULL(proc_data(clone).content);
+        target.retire();
+        RegistryTask replacement;
+        KREQUIRE_TRUE(replacement.task->initialize_pid_namespace(first));
+        KEXPECT_EQ(replacement.task->namespace_tid(), uint64_t{3});
+        KREQUIRE_TRUE(replacement.publish());
+        KEXPECT_FALSE(scoped_proc(*caller.task, "2/status", &result));
+        KEXPECT_EQ(result, -ENOENT);
+        KEXPECT_TRUE(proc_data(local).target == target.task.get());
+        KEXPECT_TRUE(proc_data(clone).target == target.task.get());
+        vfs::Stat stat{};
+        KEXPECT_EQ(procfs::procfs_fill_stat(local.get(), &stat, 0), 0);
+        KEXPECT_TRUE(first.operations_drained());
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+    KEXPECT_EQ(sched::get_active_task_count(), ACTIVE);
+    KEXPECT_EQ(sched::get_scoped_pid_task_count(), INDEXED);
+}
+
+KTEST(CompartmentProcfs, DenseRootAndThreadListingsExcludeSiblingAndHostNames) {
+    pid_ns::NamespaceRef first, second;
+    KREQUIRE_EQ(pid_ns::create_namespace(first), 0);
+    KREQUIRE_EQ(pid_ns::create_namespace(second), 0);
+    RegistryTask caller, child, thread, foreign, host;
+    KREQUIRE_TRUE(caller.task->initialize_pid_namespace(first));
+    KREQUIRE_TRUE(child.task->initialize_pid_namespace(first));
+    thread.task->is_thread = true;
+    thread.task->owner_pid = caller.task->pid;
+    KREQUIRE_TRUE(resource::bind_thread_owner(*thread.task, *caller.task));
+    KREQUIRE_TRUE(foreign.task->initialize_pid_namespace(second));
+    for (auto* fixture : {&caller, &child, &thread, &foreign, &host}) KREQUIRE_TRUE(fixture->publish());
+    auto root = scoped_proc(*caller.task, "");
+    auto tasks = scoped_proc(*caller.task, "1/task");
+    KREQUIRE_TRUE(root && tasks);
+    constexpr std::array<const char*, 10> FIXED{".",       "..",   "self",    "mounts",  "uptime",
+                                                "version", "stat", "loadavg", "meminfo", "timekeeping"};
+    vfs::DirEntry entry{};
+    for (size_t i = 0; i < FIXED.size(); ++i) {
+        KREQUIRE_EQ(root->fops->vfs_readdir(root.get(), &entry, i), 0);
+        KEXPECT_EQ(std::strcmp(entry.d_name.data(), FIXED[i]), 0);
+        KEXPECT_EQ(entry.d_off, uint64_t{i + 1});
+    }
+    bool saw_first = false, saw_child = false;
+    for (size_t i = 10; i < 12; ++i) {
+        KREQUIRE_EQ(root->fops->vfs_readdir(root.get(), &entry, i), 0);
+        KEXPECT_EQ(entry.d_off, uint64_t{i + 1});
+        saw_first |= std::strcmp(entry.d_name.data(), "1") == 0;
+        saw_child |= std::strcmp(entry.d_name.data(), "2") == 0;
+        KEXPECT_EQ(entry.d_type, vfs::DT_DIR);
+    }
+    KEXPECT_TRUE(saw_first && saw_child);
+    entry.d_ino = UINT64_MAX;
+    KEXPECT_EQ(root->fops->vfs_readdir(root.get(), &entry, 12), -ENOENT);
+    KEXPECT_EQ(entry.d_ino, UINT64_MAX);
+    bool saw_owner = false, saw_thread = false;
+    for (size_t i = 2; i < 4; ++i) {
+        KREQUIRE_EQ(tasks->fops->vfs_readdir(tasks.get(), &entry, i), 0);
+        saw_owner |= std::strcmp(entry.d_name.data(), "1") == 0;
+        saw_thread |= std::strcmp(entry.d_name.data(), "3") == 0;
+    }
+    KEXPECT_TRUE(saw_owner && saw_thread);
+    KEXPECT_EQ(tasks->fops->vfs_readdir(tasks.get(), &entry, 4), -ENOENT);
+    int result = 0;
+    KEXPECT_FALSE(scoped_proc(*caller.task, "2/task/3/status", &result));
+    KEXPECT_EQ(result, -ENOENT);
+    auto selected = scoped_proc(*caller.task, "1/task/3/status");
+    KREQUIRE_TRUE(selected);
+    KEXPECT_TRUE(proc_data(selected).target == thread.task.get());
+    KEXPECT_EQ(proc_data(selected).node.pid, thread.task->pid);
+}
+
+KTEST(CompartmentProcfs, PublicIdentityRowsAndWaitSelectorsUseLocalNames) {
+    pid_ns::NamespaceRef scope;
+    KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+    RegistryTask parent, child, thread;
+    KREQUIRE_TRUE(parent.task->initialize_pid_namespace(scope));
+    KREQUIRE_TRUE(child.task->initialize_pid_namespace(scope));
+    auto const JOB = parent.task->job_identity_snapshot();
+    child.task->initialize_job_identity(JOB.internal, JOB.visible);
+    thread.task->is_thread = true;
+    thread.task->owner_pid = child.task->pid;
+    KREQUIRE_TRUE(resource::bind_thread_owner(*thread.task, *child.task));
+    for (auto* fixture : {&parent, &child, &thread}) KREQUIRE_TRUE(fixture->publish());
+    WaitMembership membership{*parent.task, *child.task};
+    InertOnExit const INERT{{parent.task.get(), child.task.get(), thread.task.get()}};
+    KREQUIRE_TRUE(membership.publish());
+    auto local = scoped_proc(*parent.task, "2/status");
+    auto tid = scoped_proc(*parent.task, "2/task/3/status");
+    KREQUIRE_TRUE(local && tid);
+    std::array<char, 8192> output{};
+    KREQUIRE_TRUE(proc_text(local, output) > 0);
+    for (auto* row : {"Pid", "Tgid"}) KEXPECT_TRUE(status_row(output.data(), row, 2));
+    for (auto* row : {"PPid", "PGID", "SID"}) KEXPECT_TRUE(status_row(output.data(), row, 1));
+    KREQUIRE_TRUE(proc_text(tid, output) > 0);
+    KEXPECT_TRUE(status_row(output.data(), "Pid", 3));
+    KEXPECT_TRUE(status_row(output.data(), "Tgid", 2));
+    std::array<char, 64> path{};
+    std::snprintf(path.data(), path.size(), "%llu/status", static_cast<unsigned long long>(child.task->pid));
+    auto host = host_proc(parent.task->pid, path.data());
+    KREQUIRE_TRUE(host);
+    KREQUIRE_TRUE(proc_text(host, output) > 0);
+    KEXPECT_TRUE(status_row(output.data(), "Pid", child.task->pid));
+    KEXPECT_TRUE(status_row(output.data(), "PPid", parent.task->pid));
+    WaitRegistration registration{*parent.task};
+    child_events::ClaimedEvent event;
+    KREQUIRE_EQ(child_events::claim_or_register(*parent.task, *parent.task, child.task->pid, 0, true, event),
+                child_events::ProbeResult::WOULD_BLOCK);
+    auto physical_wait = scoped_proc(*parent.task, "1/status");
+    KREQUIRE_TRUE(physical_wait);
+    KREQUIRE_TRUE(proc_text(physical_wait, output) > 0);
+    KEXPECT_TRUE(status_row(output.data(), "WaitingForPid", 0));
+    child_events::cancel_wait(*parent.task);
+    KREQUIRE_EQ(child_events::claim_or_register(*parent.task, *parent.task, 2, 0, true, event, child_events::View::PUBLIC),
+                child_events::ProbeResult::WOULD_BLOCK);
+    auto public_wait = scoped_proc(*parent.task, "1/status");
+    KREQUIRE_TRUE(public_wait);
+    KREQUIRE_TRUE(proc_text(public_wait, output) > 0);
+    KEXPECT_TRUE(status_row(output.data(), "WaitingForPid", 2));
+}
+
+KTEST(CompartmentProcfs, DynamicSelfRequiresTypedReaderOfCapturedView) {
+    pid_ns::NamespaceRef first, second;
+    KREQUIRE_EQ(pid_ns::create_namespace(first), 0);
+    KREQUIRE_EQ(pid_ns::create_namespace(second), 0);
+    RegistryTask opener, reader, sibling;
+    KREQUIRE_TRUE(opener.task->initialize_pid_namespace(first));
+    KREQUIRE_TRUE(reader.task->initialize_pid_namespace(first));
+    KREQUIRE_TRUE(sibling.task->initialize_pid_namespace(second));
+    auto link = scoped_proc(*opener.task, "self");
+    KREQUIRE_TRUE(link);
+    auto const ROOT = ker::mod::security::Snapshot::bootstrap_root();
+    std::array<char, 64> output{};
+    uint64_t generation = UINT64_MAX;
+    KEXPECT_EQ(
+        procfs::procfs_readlink_as(link.get(), output.data(), output.size(), ROOT, reader.task->pid, &generation, false, reader.task.get()),
+        ssize_t{7});
+    KEXPECT_EQ(std::strcmp(output.data(), "/proc/2"), 0);
+    KEXPECT_EQ(generation, uint64_t{0});
+    output.fill('x');
+    generation = UINT64_MAX;
+    KEXPECT_EQ(procfs::procfs_readlink_as(link.get(), output.data(), output.size(), ROOT, sibling.task->pid, &generation, false,
+                                          sibling.task.get()),
+               -ssize_t{EXDEV});
+    KEXPECT_EQ(output[0], 'x');
+    KEXPECT_EQ(generation, UINT64_MAX);
+    KEXPECT_EQ(procfs::procfs_readlink_as(link.get(), output.data(), output.size(), ROOT, reader.task->pid, &generation), -ssize_t{ESRCH});
+    KEXPECT_EQ(output[0], 'x');
+    auto inherited_host = host_proc(0xdead, "self");
+    KREQUIRE_TRUE(inherited_host);
+    KEXPECT_TRUE(proc_data(inherited_host).pid_view.is_host());
+    output.fill('\0');
+    std::array<char, 64> expected{};
+    std::snprintf(expected.data(), expected.size(), "/proc/%llu", static_cast<unsigned long long>(reader.task->pid));
+    KEXPECT_TRUE(procfs::procfs_readlink_as(inherited_host.get(), output.data(), output.size(), ROOT, reader.task->pid, &generation, false,
+                                            reader.task.get()) > 0);
+    KEXPECT_EQ(std::strcmp(output.data(), expected.data()), 0);
+}
+
+KTEST(CompartmentProcfs, ClosedViewRejectsAllObservationsWithoutPublishingOutputs) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        RegistryTask owner;
+        KREQUIRE_TRUE(owner.task->initialize_pid_namespace(scope));
+        auto root = scoped_proc(*owner.task, "");
+        auto status = scoped_proc(*owner.task, "self/status");
+        auto self = scoped_proc(*owner.task, "self");
+        KREQUIRE_TRUE(root && status && self);
+        scope.close();
+        status->pos = 37;
+        std::array<char, 64> output{};
+        output.fill('x');
+        KEXPECT_EQ(status->fops->vfs_read(status.get(), output.data(), output.size(), 0), -ssize_t{EIDRM});
+        KEXPECT_EQ(output[0], 'x');
+        KEXPECT_EQ(status->fops->vfs_lseek(status.get(), 0, 0), -off_t{EIDRM});
+        KEXPECT_EQ(status->pos, off_t{37});
+        vfs::DirEntry entry{};
+        entry.d_ino = UINT64_MAX;
+        KEXPECT_EQ(root->fops->vfs_readdir(root.get(), &entry, 0), -EIDRM);
+        KEXPECT_EQ(entry.d_ino, UINT64_MAX);
+        vfs::Stat stat{};
+        stat.st_ino = 73;
+        uint64_t generation = UINT64_MAX;
+        KEXPECT_EQ(procfs::procfs_fill_stat(status.get(), &stat, 0, &generation), -EIDRM);
+        KEXPECT_EQ(stat.st_ino, uint64_t{73});
+        KEXPECT_EQ(generation, UINT64_MAX);
+        auto const ROOT = ker::mod::security::Snapshot::bootstrap_root();
+        KEXPECT_EQ(procfs::procfs_readlink_as(self.get(), output.data(), output.size(), ROOT, owner.task->pid, &generation, false,
+                                              owner.task.get()),
+                   -ssize_t{EIDRM});
+        KEXPECT_EQ(output[0], 'x');
+        KEXPECT_EQ(generation, UINT64_MAX);
+        int result = 0;
+        NativeFile rejected(procfs::procfs_open_lookup_as(ROOT, owner.task->pid, status.get(), 0, false, &result, &generation));
+        KEXPECT_FALSE(rejected);
+        KEXPECT_EQ(result, -EIDRM);
+        KEXPECT_EQ(generation, UINT64_MAX);
+        KEXPECT_EQ(procfs::procfs_revalidate_open_result(status.get(), 0), -EIDRM);
+        KEXPECT_EQ(procfs::procfs_revalidate_metadata_result(status.get(), 0), -EIDRM);
+        KEXPECT_FALSE(scoped_proc(*owner.task, "", &result));
+        KEXPECT_EQ(result, -EIDRM);
+        KEXPECT_TRUE(scope.operations_drained());
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentProcfs, UnsupportedGlobalsAndPlacementFailBeforeContentOrControlEffects) {
+    pid_ns::NamespaceRef scope;
+    KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+    RegistryTask owner;
+    KREQUIRE_TRUE(owner.task->initialize_pid_namespace(scope));
+    int result = 0;
+    for (auto* path : {"kperf",       "kperfctl",       "kwkistat",     "kcpustat",
+                       "kcpustate",   "kcontstat",      "kipcstat",     "kperfstatus",
+                       "wki",         "wki/peers",      "wki/auth",     "wki/napi",
+                       "wki/netdiag", "wki/pipes",      "wki/chaos",    "wki/chaos_workload",
+                       "memacc",      "memacc/summary", "memacc/procs", "memacc/track/kmalloc_debug",
+                       "blockq"}) {
+        KEXPECT_FALSE(scoped_proc(*owner.task, path, &result));
+        KEXPECT_EQ(result, -ENOTSUP);
+        auto host = host_proc(owner.task->pid, path);
+        KREQUIRE_TRUE(host);
+        KEXPECT_TRUE(proc_data(host).pid_view.is_host());
+    }
+    procfs::ProcFileData denied{};
+    KREQUIRE_EQ(scope.retain(denied.pid_view), 0);
+    denied.node.type = procfs::ProcNodeType::KPERFCTL_FILE;
+    vfs::File control{};
+    control.private_data = &denied;
+    control.pos = 73;
+    KEXPECT_EQ(procfs::get_procfs_fops()->vfs_write(&control, "enable", 6, 0), -ssize_t{ENOTSUP});
+    KEXPECT_EQ(control.pos, off_t{73});
+    KEXPECT_NULL(denied.content);
+    auto local = scoped_proc(*owner.task, "self/wki_remote_pid");
+    KREQUIRE_TRUE(local);
+    std::array<char, 8192> output{};
+    KREQUIRE_TRUE(proc_text(local, output) > 0);
+    KEXPECT_EQ(std::strcmp(output.data(), "0\n"), 0);
+    auto cached = scoped_proc(*owner.task, "self/status");
+    KREQUIRE_TRUE(cached);
+    KREQUIRE_TRUE(proc_text(cached, output) > 0);
+    owner.task->set_wki_remote_pid(9191);
+    output.fill('x');
+    KEXPECT_EQ(cached->fops->vfs_read(cached.get(), output.data(), output.size(), 0), -ssize_t{ENOTSUP});
+    KEXPECT_EQ(output[0], 'x');
+    KEXPECT_FALSE(scoped_proc(*owner.task, "self/status", &result));
+    KEXPECT_EQ(result, -ENOTSUP);
+    owner.task->set_wki_remote_pid(0);
+    owner.task->set_wki_proxy_task_id(17);
+    KEXPECT_FALSE(scoped_proc(*owner.task, "self/status", &result));
+    KEXPECT_EQ(result, -ENOTSUP);
+    owner.task->set_wki_proxy_task_id(0);
+    KEXPECT_TRUE(scope.operations_drained());
+}
+
+KTEST(CompartmentProcfs, NativePrivateMountWalksAndDescriptorReopensKeepOwnedCapabilities) {
+    auto const PID_BASELINE = pid_ns::live_namespace_count();
+    auto const MOUNT_BASELINE = mount_ns::live_namespace_count();
+    auto const HOST_MOUNTS = vfs::get_mount_count();
+    {
+        PrivateMounts views;
+        pid_ns::NamespaceRef first_pid, second_pid;
+        KREQUIRE_EQ(mount_ns::create_namespace(views.first), 0);
+        KREQUIRE_EQ(mount_ns::create_namespace(views.second), 0);
+        KREQUIRE_EQ(pid_ns::create_namespace(first_pid), 0);
+        KREQUIRE_EQ(pid_ns::create_namespace(second_pid), 0);
+        KREQUIRE_EQ(private_mount(views.first, "/"), 0);
+        KREQUIRE_EQ(private_mount(views.second, "/"), 0);
+        NativeTask first, second;
+        first.task->type = sched::task::TaskType::PROCESS;
+        second.task->type = sched::task::TaskType::PROCESS;
+        KREQUIRE_TRUE(first.task->initialize_mount_namespace(views.first));
+        KREQUIRE_TRUE(second.task->initialize_mount_namespace(views.second));
+        KREQUIRE_TRUE(first.task->initialize_pid_namespace(first_pid));
+        KREQUIRE_TRUE(second.task->initialize_pid_namespace(second_pid));
+        for (auto* fixture : {&first, &second}) {
+            KREQUIRE_EQ(vfs::vfs_mkdirat(fixture->task.get(), vfs::AT_FDCWD, "/proc", 0755), 0);
+            KREQUIRE_EQ(vfs::vfs_mount_for_task(fixture->task.get(), nullptr, "/proc", "procfs"), 0);
+        }
+        {
+            auto proc = scoped_mount(views.first, "/proc");
+            KREQUIRE_TRUE(proc);
+            KEXPECT_EQ(proc->fs_type, vfs::FSType::PROCFS);
+            KEXPECT_TRUE(proc->read_only);
+            KEXPECT_NULL(proc->device);
+        }
+        int const DATA = first.open("/data");
+        int const FOREIGN = second.open("/sibling-only");
+        KREQUIRE_TRUE(DATA >= 0 && FOREIGN >= 0);
+        NativeFile original(vfs::vfs_get_file_retain(first.task.get(), DATA));
+        KREQUIRE_TRUE(original);
+        char const VALUE = 'q';
+        KREQUIRE_EQ(tmpfs::tmpfs_write(original.get(), &VALUE, 1, 0), ssize_t{1});
+        std::array<char, 64> path{};
+        std::snprintf(path.data(), path.size(), "/proc/self/fd/%d", DATA);
+        int const DUPLICATE = first.open(path.data(), 0);
+        KREQUIRE_EQ(DUPLICATE < 0 ? DUPLICATE : 0, 0);
+        NativeFile duplicate(vfs::vfs_get_file_retain(first.task.get(), DUPLICATE));
+        KREQUIRE_TRUE(duplicate);
+        KEXPECT_TRUE(duplicate.get() == original.get());
+        int const STATUS = first.open("/proc/self/status", 0);
+        KREQUIRE_TRUE(STATUS >= 0);
+        NativeFile status(vfs::vfs_get_file_retain(first.task.get(), STATUS));
+        KREQUIRE_TRUE(status);
+        KEXPECT_TRUE(proc_data(status).pid_view == first_pid);
+        KEXPECT_TRUE(proc_data(status).target == first.task.get());
+        std::array<char, 8192> output{};
+        KREQUIRE_TRUE(proc_text(status, output) > 0);
+        KEXPECT_TRUE(status_row(output.data(), "Pid", 1));
+        vfs::Stat stat{};
+        KEXPECT_EQ(vfs::vfs_statat(first.task.get(), vfs::AT_FDCWD, "/proc/self/status", 0, &stat), 0);
+        std::array<char, 64> link{};
+        KEXPECT_EQ(vfs::vfs_readlinkat(first.task.get(), vfs::AT_FDCWD, "/proc/self", link.data(), link.size()), ssize_t{7});
+        KEXPECT_EQ(std::strcmp(link.data(), "/proc/1"), 0);
+        int const THROUGH_ROOT = first.open("/proc/self/root/data", 0);
+        KREQUIRE_TRUE(THROUGH_ROOT >= 0);
+        KEXPECT_EQ(first.open("/proc/self/root/sibling-only", 0), -ENOENT);
+        int const PARENT_DATA = first.open("/proc/../data", 0);
+        KREQUIRE_TRUE(PARENT_DATA >= 0);
+        KEXPECT_EQ(first.open("/proc/kperfctl", 0), -ENOTSUP);
+        int const ROOT_FD = first.open("/proc", vfs::O_DIRECTORY);
+        KREQUIRE_TRUE(ROOT_FD >= 0);
+        NativeFile inherited_root(vfs::vfs_get_file_retain(first.task.get(), ROOT_FD));
+        KREQUIRE_TRUE(inherited_root);
+        vfs::FdReservation imported(second.task.get());
+        KREQUIRE_TRUE(imported.result() >= 0);
+        int const IMPORTED = imported.install(inherited_root.get());
+        KREQUIRE_TRUE(IMPORTED >= 0);
+        inherited_root.release();
+        second.track(IMPORTED);
+        KEXPECT_EQ(vfs::vfs_openat(second.task.get(), IMPORTED, "1/status", 0, 0), -EXDEV);
+        first_pid.close();
+        stat.st_ino = 73;
+        KEXPECT_EQ(vfs::vfs_statat(first.task.get(), vfs::AT_FDCWD, "/proc/self/status", 0, &stat), -EIDRM);
+        KEXPECT_EQ(stat.st_ino, uint64_t{73});
+        char value = 0;
+        KEXPECT_EQ(tmpfs::tmpfs_read(duplicate.get(), &value, 1, 0), ssize_t{1});
+        KEXPECT_EQ(value, VALUE);
+        KEXPECT_EQ(vfs::vfs_statat(second.task.get(), vfs::AT_FDCWD, "/proc/self/status", 0, &stat), 0);
+        KEXPECT_EQ(vfs::get_mount_count(), HOST_MOUNTS);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PID_BASELINE);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNT_BASELINE);
+    KEXPECT_EQ(vfs::get_mount_count(), HOST_MOUNTS);
+}
+
+KTEST(CompartmentProcfs, ScopedCensusAndRootFileOwnNamespaceUntilFinalClose) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    NativeFile retained;
+    {
+        pid_ns::NamespaceRef first, second;
+        KREQUIRE_EQ(pid_ns::create_namespace(first), 0);
+        KREQUIRE_EQ(pid_ns::create_namespace(second), 0);
+        RegistryTask owner, child, foreign;
+        KREQUIRE_TRUE(owner.task->initialize_pid_namespace(first));
+        KREQUIRE_TRUE(child.task->initialize_pid_namespace(first));
+        KREQUIRE_TRUE(foreign.task->initialize_pid_namespace(second));
+        for (auto* fixture : {&owner, &child, &foreign}) KREQUIRE_TRUE(fixture->publish());
+        auto load = scoped_proc(*owner.task, "loadavg");
+        KREQUIRE_TRUE(load);
+        std::array<char, 8192> output{};
+        KREQUIRE_TRUE(proc_text(load, output) > 0);
+        KEXPECT_TRUE(std::strstr(output.data(), "0/2 2\n") != nullptr);
+        retained = scoped_proc(*owner.task, "");
+        KREQUIRE_TRUE(retained);
+        KEXPECT_NULL(proc_data(retained).target);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE + 1);
+    vfs::DirEntry entry{};
+    KEXPECT_EQ(retained->fops->vfs_readdir(retained.get(), &entry, 0), 0);
+    KEXPECT_EQ(std::strcmp(entry.d_name.data(), "."), 0);
+    retained.reset();
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentProcfs, RenamedCoverAndReplacementTextCannotRebindMountedView) {
+    PrivateMounts views;
+    pid_ns::NamespaceRef scope;
+    KREQUIRE_EQ(mount_ns::create_namespace(views.first), 0);
+    KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+    KREQUIRE_EQ(private_mount(views.first, "/"), 0);
+    NativeTask subject;
+    subject.task->type = sched::task::TaskType::PROCESS;
+    KREQUIRE_TRUE(subject.task->initialize_mount_namespace(views.first));
+    KREQUIRE_TRUE(subject.task->initialize_pid_namespace(scope));
+    KREQUIRE_EQ(vfs::vfs_mkdirat(subject.task.get(), vfs::AT_FDCWD, "/proc", 0755), 0);
+    KREQUIRE_EQ(vfs::vfs_mount_for_task(subject.task.get(), nullptr, "/proc", "procfs"), 0);
+    vfs::LookupHandle retained;
+    KREQUIRE_EQ(task_lookup(*subject.task, "/proc/self/status", retained), 0);
+    auto* const ORIGINAL = retained.backend_parent();
+    auto root = scoped_mount(views.first, "/");
+    KREQUIRE_TRUE(root);
+    auto const ROOT = ker::mod::security::Snapshot::bootstrap_root();
+    {
+        // Exercise an actual backend rename underneath an already published
+        // cover. A matching new pathname must not stand in for the old inode.
+        tmpfs::TmpfsLookupHandle source, destination;
+        KREQUIRE_EQ(tmpfs::tmpfs_acquire_lookup(ROOT, native_root(root.get()), "/proc", &source), 0);
+        KREQUIRE_EQ(tmpfs::tmpfs_acquire_lookup(ROOT, native_root(root.get()), "/moved", &destination), 0);
+        KREQUIRE_EQ(tmpfs::tmpfs_rename_lookup(ROOT, source, destination, true, false), 0);
+    }
+    KREQUIRE_EQ(tmpfs::tmpfs_mkdir_path(ROOT, native_root(root.get()), "/proc", 0755), 0);
+    vfs::LookupHandle rejected;
+    KEXPECT_EQ(task_lookup(*subject.task, "/proc/self/status", rejected), -EAGAIN);
+    KEXPECT_NULL(rejected.backend_parent());
+    KEXPECT_TRUE(retained.backend_parent() == ORIGINAL);
+    KEXPECT_EQ(vfs::get_mount_count(views.first), 2U);
 }

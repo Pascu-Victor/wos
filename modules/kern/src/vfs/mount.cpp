@@ -1302,9 +1302,10 @@ auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::Bl
 
     if (scope.closed()) return -EIDRM;
     if (!scope.is_host()) {
-        // Shared native device/backend ownership needs a separate admission
-        // contract. Existing local writer leases only exclude remote writers.
-        if (path_kind != MountPathKind::RETAINED_PHYSICAL || std::strcmp(fstype, "tmpfs") != 0) return -ENOTSUP;
+        // Device-backed/shared backends need separate admission. Native procfs
+        // captures the requester's PID view in each File and owns no device.
+        bool const NATIVE = std::strcmp(fstype, "tmpfs") == 0 || std::strcmp(fstype, "procfs") == 0;
+        if (path_kind != MountPathKind::RETAINED_PHYSICAL || !NATIVE) return -ENOTSUP;
         if (device != nullptr) return -EINVAL;
     }
 
@@ -1394,6 +1395,7 @@ auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::Bl
     mount->private_data = nullptr;
     mount->fops = nullptr;
     mount->read_only = (flags & MOUNT_FLAG_RDONLY) != 0 || (device != nullptr && ker::dev::block_device_is_read_only(device));
+    if (!scope.is_host() && mount->fs_type == FSType::PROCFS) mount->read_only = true;
     mount->nosuid = (flags & MOUNT_FLAG_NOSUID) != 0;
 
     bool const BLOCK_RW_FS = mount->fs_type == FSType::FAT32 || mount->fs_type == FSType::XFS;

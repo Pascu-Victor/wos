@@ -597,6 +597,11 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/ptrace_namespace_test.py
 )
 add_test(
+    NAME procfs_namespace_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/procfs_namespace_test.py
+)
+set_tests_properties(procfs_namespace_test PROPERTIES LABELS "host;unit")
+add_test(
     NAME virtio_net_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/virtio_net_source_test.py
 )
