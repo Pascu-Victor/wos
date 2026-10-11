@@ -42,6 +42,7 @@
 // NOLINTBEGIN(cppcoreguidelines-avoid-c-arrays, modernize-avoid-c-arrays, cppcoreguidelines-pro-bounds-array-to-pointer-decay,
 // cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 namespace ker::syscall::net {
+using ker::mod::sched::task::Task;
 
 namespace {
 constexpr int WOS_O_NONBLOCK = 04000;
@@ -235,8 +236,7 @@ auto register_poll_waiters(KPollFd* fds, size_t nfds, ker::mod::sched::task::Tas
     return can_block ? 1 : 0;
 }
 
-auto run_poll_wait(KPollFd* fds, size_t nfds, int timeout, const char* wait_channel) -> int {
-    auto* task = ker::mod::sched::get_current_task();
+auto run_poll_wait(Task* task, KPollFd* fds, size_t nfds, int timeout, const char* wait_channel) -> int {
     if (task == nullptr || (fds == nullptr && nfds != 0)) {
         return -EINVAL;
     }
@@ -345,7 +345,7 @@ auto select_events_for_fd(size_t fd, const uint8_t* readfds, const uint8_t* writ
     return events;
 }
 
-auto run_select(size_t nfds, uint8_t* readfds, uint8_t* writefds, uint8_t* exceptfds, const KSelectTimeval* timeout) -> int {
+auto run_select(Task* task, size_t nfds, uint8_t* readfds, uint8_t* writefds, uint8_t* exceptfds, const KSelectTimeval* timeout) -> int {
     int timeout_ms = -1;
     int const TIMEOUT_RET = select_timeout_ms(timeout, timeout_ms);
     if (TIMEOUT_RET < 0) {
@@ -376,7 +376,7 @@ auto run_select(size_t nfds, uint8_t* readfds, uint8_t* writefds, uint8_t* excep
         poll_fds[out++] = KPollFd{.fd = static_cast<int32_t>(fd), .events = EVENTS, .revents = 0};
     }
 
-    int const READY = run_poll_wait(poll_fds, watched_fds, timeout_ms, "select");
+    int const READY = run_poll_wait(task, poll_fds, watched_fds, timeout_ms, "select");
     if (READY <= 0) {
         delete[] poll_fds;
         if (READY == 0) {
@@ -485,9 +485,8 @@ auto socket_bounce_heap_or_stack(std::unique_ptr<uint8_t[]>& heap, uint8_t* stac
 }
 
 template <typename Fn>
-auto socket_send_user_bounced(ker::vfs::File* file, ker::net::Socket* sock, uint64_t user_addr, size_t count, int call_flags, Fn&& fn)
-    -> ssize_t {
-    auto* task = ker::mod::sched::get_current_task();
+auto socket_send_user_bounced(Task* task, ker::vfs::File* file, ker::net::Socket* sock, uint64_t user_addr, size_t count, int call_flags,
+                              Fn&& fn) -> ssize_t {
     if (task == nullptr) {
         return -ESRCH;
     }
@@ -516,9 +515,8 @@ auto socket_send_user_bounced(ker::vfs::File* file, ker::net::Socket* sock, uint
 }
 
 template <typename Fn>
-auto socket_recv_user_bounced(ker::vfs::File* file, ker::net::Socket* sock, uint64_t user_addr, size_t count, int call_flags, Fn&& fn)
-    -> ssize_t {
-    auto* task = ker::mod::sched::get_current_task();
+auto socket_recv_user_bounced(Task* task, ker::vfs::File* file, ker::net::Socket* sock, uint64_t user_addr, size_t count, int call_flags,
+                              Fn&& fn) -> ssize_t {
     if (task == nullptr) {
         return -ESRCH;
     }
@@ -661,9 +659,8 @@ struct FileHandle {
 };
 
 // Get socket from fd using VFS helpers
-auto fd_to_socket(uint64_t fd_num) -> SocketHandle {
+auto fd_to_socket(Task* task, uint64_t fd_num) -> SocketHandle {
     SocketHandle handle;
-    auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) {
         return handle;
     }
@@ -681,9 +678,8 @@ auto fd_to_socket(uint64_t fd_num) -> SocketHandle {
     return handle;
 }
 
-auto fd_to_file(uint64_t fd_num) -> FileHandle {
+auto fd_to_file(Task* task, uint64_t fd_num) -> FileHandle {
     FileHandle handle;
-    auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) {
         return handle;
     }
@@ -694,11 +690,6 @@ auto fd_to_file(uint64_t fd_num) -> FileHandle {
 
 // Allocate fd for a socket using VFS helpers
 auto allocate_socket_fd(ker::net::Socket* sock, ker::vfs::FdReservation& descriptor) -> int {
-    auto* task = ker::mod::sched::get_current_task();
-    if (task == nullptr) {
-        return -1;
-    }
-
     auto* file = new (std::nothrow) ker::vfs::File{};
     if (file == nullptr) {
         return -1;
@@ -743,8 +734,7 @@ auto copy_sockaddr_io_v1_from_user(ker::mod::sched::task::Task& task, uint64_t u
 }
 
 template <typename Fn>
-auto socket_name_to_user(uint64_t addr_out_addr, uint64_t addr_len_addr, size_t default_capacity, Fn&& fn) -> int {
-    auto* task = ker::mod::sched::get_current_task();
+auto socket_name_to_user(Task* task, uint64_t addr_out_addr, uint64_t addr_len_addr, size_t default_capacity, Fn&& fn) -> int {
     if (task == nullptr) {
         return -ESRCH;
     }
@@ -1601,8 +1591,44 @@ auto net_selftest_open_error_preserves_link_request() -> bool {
 }
 #endif
 
-uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+namespace {
+
+// Global interface/route/device control is ambient authority. Socket operations
+// on already inherited Files remain explicit shared object capabilities.
+auto is_ambient_network_control(ker::abi::net::ops op) -> bool {
+    using ker::abi::net::ops;
+    switch (op) {
+        case ops::IOCTL_NET:
+        case ops::SET_DEV_CPU_AFFINITY:
+        case ops::NETCTL_IF_LIST:
+        case ops::NETCTL_ADDR_LIST:
+        case ops::NETCTL_ADDR_SET:
+        case ops::NETCTL_ADDR_DEL:
+        case ops::NETCTL_ADDR_SET_V2:
+        case ops::NETCTL_ROUTE_LIST:
+        case ops::NETCTL_ROUTE_SET:
+        case ops::NETCTL_ROUTE_DEL:
+        case ops::NETCTL_LINK_SET:
+            return true;
+        default:
+            return false;
+    }
+}
+
+auto ambient_network_admission(const Task* subject) -> int {
+    auto const* scope = subject != nullptr ? subject->pid_namespace() : nullptr;
+    if (scope == nullptr) return -ESRCH;
+    if (scope->is_host()) return 0;
+    if (scope->closed()) return -EIDRM;
+    return scope->network() == ker::mod::security::compartment::Network::SHARED_HOST ? 0 : -EPERM;
+}
+
+uint64_t sys_net_impl(Task* const subject, uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     auto net_op = static_cast<ker::abi::net::ops>(op);
+    if (is_ambient_network_control(net_op)) {
+        int const ADMISSION = ambient_network_admission(subject);
+        if (ADMISSION != 0) return static_cast<uint64_t>(ADMISSION);
+    }
 
     switch (net_op) {
         case ker::abi::net::ops::SOCKET: {
@@ -1618,8 +1644,9 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return static_cast<uint64_t>(-EPROTONOSUPPORT);
             }
 
-            auto* task = ker::mod::sched::get_current_task();
-            if (task == nullptr) return static_cast<uint64_t>(-ESRCH);
+            auto* task = subject;
+            int const ADMISSION = ambient_network_admission(task);
+            if (ADMISSION != 0) return static_cast<uint64_t>(ADMISSION);
             if ((TYPE & ker::net::SOCK_TYPE_MASK) == 3) {
                 auto const CREDENTIALS = task->credentials();
                 int const AUTHORIZATION = ker::mod::security::authorize_network_administration(CREDENTIALS);
@@ -1650,7 +1677,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
 
         case ker::abi::net::ops::BIND: {
             // a1=fd, a2=addr_ptr, a3=addr_len
-            auto handle = fd_to_socket(a1);
+            auto handle = fd_to_socket(subject, a1);
             auto* sock = handle.sock;
             if (sock == nullptr) {
                 return static_cast<uint64_t>(-EBADF);
@@ -1663,7 +1690,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return static_cast<uint64_t>(-EINVAL);
             }
             std::array<uint8_t, SOCKADDR_STORAGE_MAX> address{};
-            auto* task = ker::mod::sched::get_current_task();
+            auto* task = subject;
             if (ADDR_LEN != 0 && (task == nullptr || !ker::mod::sys::usercopy::copy_from_task(*task, a2, address.data(), ADDR_LEN))) {
                 return static_cast<uint64_t>(task == nullptr ? -ESRCH : -EFAULT);
             }
@@ -1674,7 +1701,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
 
         case ker::abi::net::ops::LISTEN: {
             // a1=fd, a2=backlog
-            auto handle = fd_to_socket(a1);
+            auto handle = fd_to_socket(subject, a1);
             auto* sock = handle.sock;
             if (sock == nullptr) {
                 return static_cast<uint64_t>(-EBADF);
@@ -1688,7 +1715,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
 
         case ker::abi::net::ops::ACCEPT: {
             // a1=fd, a2=addr_ptr, a3=addr_len_ptr
-            auto handle = fd_to_socket(a1);
+            auto handle = fd_to_socket(subject, a1);
             auto* sock = handle.sock;
             if (sock == nullptr) {
                 return static_cast<uint64_t>(-EBADF);
@@ -1696,7 +1723,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (sock->proto_ops == nullptr || sock->proto_ops->accept == nullptr) {
                 return static_cast<uint64_t>(-ENOSYS);
             }
-            auto* task = ker::mod::sched::get_current_task();
+            auto* task = subject;
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
@@ -1749,7 +1776,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
 
         case ker::abi::net::ops::CONNECT: {
             // a1=fd, a2=addr_ptr, a3=addr_len
-            auto handle = fd_to_socket(a1);
+            auto handle = fd_to_socket(subject, a1);
             auto* sock = handle.sock;
             if (sock == nullptr) {
                 return static_cast<uint64_t>(-EBADF);
@@ -1762,7 +1789,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return static_cast<uint64_t>(-EINVAL);
             }
             std::array<uint8_t, SOCKADDR_STORAGE_MAX> address{};
-            auto* task = ker::mod::sched::get_current_task();
+            auto* task = subject;
             if (ADDR_LEN != 0 && (task == nullptr || !ker::mod::sys::usercopy::copy_from_task(*task, a2, address.data(), ADDR_LEN))) {
                 return static_cast<uint64_t>(task == nullptr ? -ESRCH : -EFAULT);
             }
@@ -1774,10 +1801,10 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
 
         case ker::abi::net::ops::SEND: {
             // a1=fd, a2=buf, a3=len, a4=flags
-            auto handle = fd_to_socket(a1);
+            auto handle = fd_to_socket(subject, a1);
             auto* sock = handle.sock;
             if (sock == nullptr) {
-                auto file_handle = fd_to_file(a1);
+                auto file_handle = fd_to_file(subject, a1);
                 if (file_handle.file != nullptr && ker::net::wki::wki_ipc_is_socket_proxy_file(file_handle.file)) {
                     if (static_cast<int>(a4) != 0) {
                         return static_cast<uint64_t>(-EOPNOTSUPP);
@@ -1786,7 +1813,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                         return static_cast<uint64_t>(-ENOSYS);
                     }
                     auto result = socket_send_user_bounced(
-                        file_handle.file, nullptr, a2, static_cast<size_t>(a3), 0,
+                        subject, file_handle.file, nullptr, a2, static_cast<size_t>(a3), 0,
                         [&](const void* buf, size_t len, int) { return file_handle.file->fops->vfs_write(file_handle.file, buf, len, 0); });
                     return static_cast<uint64_t>(result);
                 }
@@ -1796,17 +1823,17 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return static_cast<uint64_t>(-ENOSYS);
             }
             ssize_t const RESULT = socket_send_user_bounced(
-                handle.file, sock, a2, static_cast<size_t>(a3), static_cast<int>(a4),
+                subject, handle.file, sock, a2, static_cast<size_t>(a3), static_cast<int>(a4),
                 [&](const void* buf, size_t len, int flags) { return sock->proto_ops->send(sock, buf, len, flags); });
             return static_cast<uint64_t>(RESULT);
         }
 
         case ker::abi::net::ops::RECV: {
             // a1=fd, a2=buf, a3=len, a4=flags
-            auto handle = fd_to_socket(a1);
+            auto handle = fd_to_socket(subject, a1);
             auto* sock = handle.sock;
             if (sock == nullptr) {
-                auto file_handle = fd_to_file(a1);
+                auto file_handle = fd_to_file(subject, a1);
                 if (file_handle.file != nullptr && ker::net::wki::wki_ipc_is_socket_proxy_file(file_handle.file)) {
                     if (static_cast<int>(a4) != 0) {
                         return static_cast<uint64_t>(-EOPNOTSUPP);
@@ -1815,7 +1842,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                         return static_cast<uint64_t>(-ENOSYS);
                     }
                     auto result = socket_recv_user_bounced(
-                        file_handle.file, nullptr, a2, static_cast<size_t>(a3), 0,
+                        subject, file_handle.file, nullptr, a2, static_cast<size_t>(a3), 0,
                         [&](void* buf, size_t len, int) { return file_handle.file->fops->vfs_read(file_handle.file, buf, len, 0); });
                     return static_cast<uint64_t>(result);
                 }
@@ -1825,20 +1852,20 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return static_cast<uint64_t>(-ENOSYS);
             }
             ssize_t const RESULT =
-                socket_recv_user_bounced(handle.file, sock, a2, static_cast<size_t>(a3), static_cast<int>(a4),
+                socket_recv_user_bounced(subject, handle.file, sock, a2, static_cast<size_t>(a3), static_cast<int>(a4),
                                          [&](void* buf, size_t len, int flags) { return sock->proto_ops->recv(sock, buf, len, flags); });
             return static_cast<uint64_t>(RESULT);
         }
 
         case ker::abi::net::ops::CLOSE: {
             // a1=fd - use VFS close which calls socket_fops_close
-            int const RESULT = ker::vfs::vfs_close(static_cast<int>(a1));
+            int const RESULT = ker::vfs::vfs_close_for_task(subject, static_cast<int>(a1));
             return static_cast<uint64_t>(RESULT);
         }
 
         case ker::abi::net::ops::SENDTO: {
             // a1=fd, a2=buf, a3=len, a4=flags, a5=addr_ptr
-            auto handle = fd_to_socket(a1);
+            auto handle = fd_to_socket(subject, a1);
             auto* sock = handle.sock;
             if (sock == nullptr) {
                 return static_cast<uint64_t>(-EBADF);
@@ -1850,7 +1877,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             size_t const ALEN = addr_len_for_domain(sock->domain);
             const void* addr_ptr = nullptr;
             if (a5 != 0) {
-                auto* task = ker::mod::sched::get_current_task();
+                auto* task = subject;
                 if (task == nullptr) {
                     return static_cast<uint64_t>(-ESRCH);
                 }
@@ -1861,14 +1888,14 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             }
 
             ssize_t const RESULT = socket_send_user_bounced(
-                handle.file, sock, a2, static_cast<size_t>(a3), static_cast<int>(a4),
+                subject, handle.file, sock, a2, static_cast<size_t>(a3), static_cast<int>(a4),
                 [&](const void* buf, size_t len, int flags) { return sock->proto_ops->sendto(sock, buf, len, flags, addr_ptr, ALEN); });
             return static_cast<uint64_t>(RESULT);
         }
 
         case ker::abi::net::ops::RECVFROM: {
             // a1=fd, a2=buf, a3=len, a4=flags, a5=addr_out_ptr
-            auto handle = fd_to_socket(a1);
+            auto handle = fd_to_socket(subject, a1);
             auto* sock = handle.sock;
             if (sock == nullptr) {
                 return static_cast<uint64_t>(-EBADF);
@@ -1879,7 +1906,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             std::array<uint8_t, SOCKADDR_STORAGE_MAX> addr_storage{};
             size_t alen = addr_len_for_domain(sock->domain);
             void* addr_ptr = a5 != 0 ? addr_storage.data() : nullptr;
-            auto* task = ker::mod::sched::get_current_task();
+            auto* task = subject;
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
@@ -1887,7 +1914,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return static_cast<uint64_t>(-EFAULT);
             }
             ssize_t const RESULT = socket_recv_user_bounced(
-                handle.file, sock, a2, static_cast<size_t>(a3), static_cast<int>(a4),
+                subject, handle.file, sock, a2, static_cast<size_t>(a3), static_cast<int>(a4),
                 [&](void* buf, size_t len, int flags) { return sock->proto_ops->recvfrom(sock, buf, len, flags, addr_ptr, &alen); });
             if (RESULT >= 0 && a5 != 0) {
                 if (alen > addr_storage.size()) {
@@ -1902,7 +1929,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
 
         case ker::abi::net::ops::SENDTO_EX: {
             // a1=fd, a2=buf, a3=len, a4=flags, a5=SockaddrIoV1*
-            auto handle = fd_to_socket(a1);
+            auto handle = fd_to_socket(subject, a1);
             auto* sock = handle.sock;
             if (sock == nullptr) {
                 return static_cast<uint64_t>(-EBADF);
@@ -1910,7 +1937,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (sock->proto_ops == nullptr || sock->proto_ops->sendto == nullptr) {
                 return static_cast<uint64_t>(-ENOSYS);
             }
-            auto* task = ker::mod::sched::get_current_task();
+            auto* task = subject;
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
@@ -1932,7 +1959,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             }
 
             ssize_t const RESULT = socket_send_user_bounced(
-                handle.file, sock, a2, static_cast<size_t>(a3), static_cast<int>(a4), [&](const void* buf, size_t len, int flags) {
+                subject, handle.file, sock, a2, static_cast<size_t>(a3), static_cast<int>(a4), [&](const void* buf, size_t len, int flags) {
                     return sock->proto_ops->sendto(sock, buf, len, flags, address_ptr, ADDRESS_LEN);
                 });
             return static_cast<uint64_t>(RESULT);
@@ -1940,7 +1967,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
 
         case ker::abi::net::ops::RECVFROM_EX: {
             // a1=fd, a2=buf, a3=len, a4=flags, a5=SockaddrIoV1*
-            auto handle = fd_to_socket(a1);
+            auto handle = fd_to_socket(subject, a1);
             auto* sock = handle.sock;
             if (sock == nullptr) {
                 return static_cast<uint64_t>(-EBADF);
@@ -1948,7 +1975,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (sock->proto_ops == nullptr || sock->proto_ops->recvfrom == nullptr) {
                 return static_cast<uint64_t>(-ENOSYS);
             }
-            auto* task = ker::mod::sched::get_current_task();
+            auto* task = subject;
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
@@ -1972,7 +1999,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             size_t address_len = ADDRESS_CAPACITY;
             void* address_ptr = io.address != 0 ? address.data() : nullptr;
             ssize_t const RESULT = socket_recv_user_bounced(
-                handle.file, sock, a2, static_cast<size_t>(a3), static_cast<int>(a4), [&](void* buf, size_t len, int flags) {
+                subject, handle.file, sock, a2, static_cast<size_t>(a3), static_cast<int>(a4), [&](void* buf, size_t len, int flags) {
                     return sock->proto_ops->recvfrom(sock, buf, len, flags, address_ptr, &address_len);
                 });
             if (RESULT < 0) {
@@ -1990,11 +2017,11 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
 
         case ker::abi::net::ops::SETSOCKOPT: {
             // a1=fd, a2=level, a3=optname, a4=optval_ptr, a5=optlen
-            auto handle = fd_to_socket(a1);
+            auto handle = fd_to_socket(subject, a1);
             auto* sock = handle.sock;
             FileHandle proxy_file;
             if (sock == nullptr) {
-                proxy_file = fd_to_file(a1);
+                proxy_file = fd_to_file(subject, a1);
                 if (proxy_file.file == nullptr || !ker::net::wki::wki_ipc_is_socket_proxy_file(proxy_file.file)) {
                     return static_cast<uint64_t>(-EBADF);
                 }
@@ -2009,7 +2036,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (OPTLEN != 0 && a4 == 0) {
                 return static_cast<uint64_t>(-EFAULT);
             }
-            auto* task = ker::mod::sched::get_current_task();
+            auto* task = subject;
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
@@ -2031,11 +2058,11 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
 
         case ker::abi::net::ops::GETSOCKOPT: {
             // a1=fd, a2=level, a3=optname, a4=optval_ptr, a5=optlen_ptr
-            auto handle = fd_to_socket(a1);
+            auto handle = fd_to_socket(subject, a1);
             auto* sock = handle.sock;
             FileHandle proxy_file;
             if (sock == nullptr) {
-                proxy_file = fd_to_file(a1);
+                proxy_file = fd_to_file(subject, a1);
                 if (proxy_file.file == nullptr || !ker::net::wki::wki_ipc_is_socket_proxy_file(proxy_file.file)) {
                     return static_cast<uint64_t>(-EBADF);
                 }
@@ -2043,7 +2070,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return static_cast<uint64_t>(-ENOSYS);
             }
 
-            auto* task = ker::mod::sched::get_current_task();
+            auto* task = subject;
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
@@ -2083,10 +2110,10 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
 
         case ker::abi::net::ops::SHUTDOWN: {
             // a1=fd, a2=how
-            auto handle = fd_to_socket(a1);
+            auto handle = fd_to_socket(subject, a1);
             auto* sock = handle.sock;
             if (sock == nullptr) {
-                auto file_handle = fd_to_file(a1);
+                auto file_handle = fd_to_file(subject, a1);
                 if (file_handle.file != nullptr && ker::net::wki::wki_ipc_is_socket_proxy_file(file_handle.file)) {
                     int const RESULT = ker::net::wki::wki_ipc_socket_shutdown(file_handle.file, static_cast<int>(a2));
                     return static_cast<uint64_t>(RESULT);
@@ -2102,12 +2129,12 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
 
         case ker::abi::net::ops::GETPEERNAME: {
             // a1=fd, a2=addr_out, a3=addr_len_ptr
-            auto handle = fd_to_socket(a1);
+            auto handle = fd_to_socket(subject, a1);
             auto* sock = handle.sock;
             if (sock == nullptr) {
-                auto file_handle = fd_to_file(a1);
+                auto file_handle = fd_to_file(subject, a1);
                 if (file_handle.file != nullptr && ker::net::wki::wki_ipc_is_socket_proxy_file(file_handle.file)) {
-                    int const RESULT = socket_name_to_user(a2, a3, ker::net::SOCKADDR_V4_LEN, [&](void* addr, size_t* len) {
+                    int const RESULT = socket_name_to_user(subject, a2, a3, ker::net::SOCKADDR_V4_LEN, [&](void* addr, size_t* len) {
                         return ker::net::wki::wki_ipc_socket_getpeername(file_handle.file, addr, len);
                     });
                     return static_cast<uint64_t>(RESULT);
@@ -2118,7 +2145,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return static_cast<uint64_t>(-ENOTCONN);
             }
             size_t const DEFAULT_CAPACITY = sock->domain == WOS_AF_INET6 ? ker::net::SOCKADDR_V6_LEN : ker::net::SOCKADDR_V4_LEN;
-            int const RESULT = socket_name_to_user(a2, a3, DEFAULT_CAPACITY, [&](void* addr, size_t* len) {
+            int const RESULT = socket_name_to_user(subject, a2, a3, DEFAULT_CAPACITY, [&](void* addr, size_t* len) {
                 size_t const CAPACITY = *len;
                 return ker::net::socket_fill_sockaddr(sock->remote, addr, CAPACITY, len);
             });
@@ -2127,13 +2154,13 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
 
         case ker::abi::net::ops::GETSOCKNAME: {
             // a1=fd, a2=addr_out, a3=addr_len_ptr
-            auto handle = fd_to_socket(a1);
+            auto handle = fd_to_socket(subject, a1);
             auto* sock = handle.sock;
             if (sock == nullptr) {
                 return static_cast<uint64_t>(-EBADF);
             }
             size_t const DEFAULT_CAPACITY = sock->domain == WOS_AF_INET6 ? ker::net::SOCKADDR_V6_LEN : ker::net::SOCKADDR_V4_LEN;
-            int const RESULT = socket_name_to_user(a2, a3, DEFAULT_CAPACITY, [&](void* addr, size_t* len) {
+            int const RESULT = socket_name_to_user(subject, a2, a3, DEFAULT_CAPACITY, [&](void* addr, size_t* len) {
                 size_t const CAPACITY = *len;
                 return ker::net::socket_fill_sockaddr(sock->local, addr, CAPACITY, len);
             });
@@ -2167,7 +2194,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             constexpr size_t IFREQ_BYTES = 40;
             constexpr size_t ROUTE_INPUT_BYTES = 48;
             std::array<uint8_t, ROUTE_INPUT_BYTES> arg_storage{};
-            auto* task = ker::mod::sched::get_current_task();
+            auto* task = subject;
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
@@ -2395,7 +2422,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             // cpu_mask: each set bit (from LSB) is the CPU for the next queue pair:
             //   pair 0 ← CPU of lowest set bit, pair 1 ← CPU of next set bit, ...
             std::array<uint8_t, 24> request{};
-            auto* task = ker::mod::sched::get_current_task();
+            auto* task = subject;
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
@@ -2423,7 +2450,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
         }
 
         case ker::abi::net::ops::NETCTL_IF_LIST: {
-            auto* task = ker::mod::sched::get_current_task();
+            auto* task = subject;
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
@@ -2451,7 +2478,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
         }
 
         case ker::abi::net::ops::NETCTL_ADDR_LIST: {
-            auto* task = ker::mod::sched::get_current_task();
+            auto* task = subject;
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
@@ -2514,7 +2541,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
         }
 
         case ker::abi::net::ops::NETCTL_ADDR_SET: {
-            auto* task = ker::mod::sched::get_current_task();
+            auto* task = subject;
             WosNetAddrReq req{};
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
@@ -2558,7 +2585,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
         }
 
         case ker::abi::net::ops::NETCTL_ADDR_DEL: {
-            auto* task = ker::mod::sched::get_current_task();
+            auto* task = subject;
             WosNetAddrReq req{};
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
@@ -2598,7 +2625,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
         }
 
         case ker::abi::net::ops::NETCTL_ADDR_SET_V2: {
-            auto* task = ker::mod::sched::get_current_task();
+            auto* task = subject;
             WosNetAddrReqV2 req{};
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
@@ -2630,7 +2657,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
         }
 
         case ker::abi::net::ops::NETCTL_ROUTE_LIST: {
-            auto* task = ker::mod::sched::get_current_task();
+            auto* task = subject;
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
@@ -2674,7 +2701,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
 
         case ker::abi::net::ops::NETCTL_ROUTE_SET:
         case ker::abi::net::ops::NETCTL_ROUTE_DEL: {
-            auto* task = ker::mod::sched::get_current_task();
+            auto* task = subject;
             WosNetRouteRecord req{};
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
@@ -2716,7 +2743,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
         }
 
         case ker::abi::net::ops::NETCTL_LINK_SET: {
-            auto* task = ker::mod::sched::get_current_task();
+            auto* task = subject;
             WosNetLinkSetReq req{};
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
@@ -2733,7 +2760,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (a1 > WOS_FD_SETSIZE) {
                 return static_cast<uint64_t>(-EINVAL);
             }
-            auto* task = ker::mod::sched::get_current_task();
+            auto* task = subject;
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
@@ -2751,8 +2778,9 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return static_cast<uint64_t>(-EFAULT);
             }
 
-            int const RESULT = run_select(static_cast<size_t>(a1), a2 != 0 ? readfds.data() : nullptr, a3 != 0 ? writefds.data() : nullptr,
-                                          a4 != 0 ? exceptfds.data() : nullptr, a5 != 0 ? &timeout : nullptr);
+            int const RESULT =
+                run_select(subject, static_cast<size_t>(a1), a2 != 0 ? readfds.data() : nullptr, a3 != 0 ? writefds.data() : nullptr,
+                           a4 != 0 ? exceptfds.data() : nullptr, a5 != 0 ? &timeout : nullptr);
             if (RESULT >= 0 && ((a2 != 0 && !ker::mod::sys::usercopy::copy_to_task(*task, a2, readfds.data(), readfds.size())) ||
                                 (a3 != 0 && !ker::mod::sys::usercopy::copy_to_task(*task, a3, writefds.data(), writefds.size())) ||
                                 (a4 != 0 && !ker::mod::sys::usercopy::copy_to_task(*task, a4, exceptfds.data(), exceptfds.size())))) {
@@ -2767,7 +2795,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (NFDS > ker::mod::sched::task::Task::FD_TABLE_SIZE) {
                 return static_cast<uint64_t>(-EINVAL);
             }
-            auto* task = ker::mod::sched::get_current_task();
+            auto* task = subject;
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
@@ -2785,7 +2813,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return static_cast<uint64_t>(-EFAULT);
             }
             auto timeout = static_cast<int>(static_cast<int64_t>(a3));
-            int const RESULT = run_poll_wait(fds, NFDS, timeout, "poll");
+            int const RESULT = run_poll_wait(subject, fds, NFDS, timeout, "poll");
             if (RESULT >= 0 && FDS_BYTES != 0 && !ker::mod::sys::usercopy::copy_to_task(*task, a1, fds, FDS_BYTES)) {
                 delete[] fds;
                 return static_cast<uint64_t>(-EFAULT);
@@ -2798,6 +2826,18 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             return static_cast<uint64_t>(-ENOSYS);
     }
 }
+
+}  // namespace
+
+uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+    return sys_net_impl(ker::mod::sched::get_current_task(), op, a1, a2, a3, a4, a5);
+}
+
+#if defined(WOS_SELFTEST) && WOS_SELFTEST
+auto net_selftest_call_as(Task& subject, uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) -> uint64_t {
+    return sys_net_impl(&subject, op, a1, a2, a3, a4, a5);
+}
+#endif
 
 }  // namespace ker::syscall::net
 // NOLINTEND(cppcoreguidelines-avoid-c-arrays, modernize-avoid-c-arrays, cppcoreguidelines-pro-bounds-array-to-pointer-decay,

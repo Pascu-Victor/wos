@@ -13,6 +13,7 @@ struct Namespace {
     uint64_t generation{};
     std::atomic<bool> closed{};
     std::atomic<bool> retiring{};
+    security::compartment::Network network{security::compartment::Network::DENIED};
     std::atomic<uint32_t> next_id{1};
     std::atomic<uint32_t> operations{};
     sys::Spinlock publication;
@@ -64,6 +65,10 @@ auto NamespaceRef::retain(NamespaceRef& out) const -> int {
 }
 
 auto NamespaceRef::generation() const -> uint64_t { return namespace_ != nullptr ? namespace_->generation : 0; }
+
+auto NamespaceRef::network() const -> security::compartment::Network {
+    return namespace_ != nullptr ? namespace_->network : security::compartment::Network::SHARED_HOST;
+}
 
 auto NamespaceRef::closed() const -> bool { return namespace_ != nullptr && namespace_->closed.load(std::memory_order_acquire); }
 
@@ -140,6 +145,15 @@ PublicationGuard::~PublicationGuard() {
 auto PublicationGuard::open() const -> bool { return namespace_ == nullptr || !namespace_->closed.load(std::memory_order_acquire); }
 
 auto create_namespace(NamespaceRef& out) -> int {
+    NamespaceRef const HOST;
+    return create_namespace(HOST, security::compartment::Network::DENIED, out);
+}
+
+auto create_namespace(const NamespaceRef& parent, security::compartment::Network network, NamespaceRef& out) -> int {
+    using security::compartment::Network;
+    if (&parent == &out || (network != Network::DENIED && network != Network::SHARED_HOST)) return -EINVAL;
+    if (parent.closed()) return -EIDRM;
+    if (network == Network::SHARED_HOST && parent.network() != Network::SHARED_HOST) return -EPERM;
     for (auto& slot : namespaces) {
         uint64_t expected = 0;
         if (!slot.references.compare_exchange_strong(expected, RESERVED, std::memory_order_acquire)) continue;
@@ -151,12 +165,19 @@ auto create_namespace(NamespaceRef& out) -> int {
         slot.generation = GENERATION;
         slot.closed.store(false, std::memory_order_relaxed);
         slot.retiring.store(false, std::memory_order_relaxed);
+        slot.network = network;
         slot.next_id.store(1, std::memory_order_relaxed);
         slot.operations.store(0, std::memory_order_relaxed);
         slot.references.store(1, std::memory_order_release);
         NamespaceRef candidate;
         candidate.namespace_ = &slot;
-        out = std::move(candidate);
+        {
+            PublicationGuard const ADMISSION(parent);
+            if (!ADMISSION.open()) return -EIDRM;
+            // parent is a distinct retained reference. Replacing out drops
+            // only atomic namespace ownership, never Task/backend objects.
+            out = std::move(candidate);
+        }
         return 0;
     }
     return -ENOSPC;

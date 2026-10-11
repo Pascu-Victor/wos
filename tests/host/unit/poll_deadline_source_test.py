@@ -141,7 +141,7 @@ def require_select_is_implemented_on_poll_core() -> None:
         "ker::mod::sys::usercopy::ensure_writable(*task, user_addr, set.size())",
         "ker::mod::sys::usercopy::copy_from_task(*task, user_addr, set.data(), set.size())",
         "ker::mod::sys::usercopy::copy_value_from_task(*task, a5, timeout)",
-        "run_select(static_cast<size_t>(a1)",
+        "run_select(subject, static_cast<size_t>(a1)",
         "a5 != 0 ? &timeout : nullptr",
         "ker::mod::sys::usercopy::copy_to_task(*task, a2, readfds.data(), readfds.size())",
     )
@@ -162,7 +162,7 @@ def require_select_is_implemented_on_poll_core() -> None:
         select_body,
         "select_timeout_ms(timeout, timeout_ms)",
         "new (std::nothrow) KPollFd[watched_fds]{}",
-        'run_poll_wait(poll_fds, watched_fds, timeout_ms, "select")',
+        'run_poll_wait(task, poll_fds, watched_fds, timeout_ms, "select")',
         "WOS_POLLNVAL",
         "return -EBADF",
         "select_fd_zero(readfds)",
@@ -178,7 +178,7 @@ def require_select_is_implemented_on_poll_core() -> None:
         "ker::mod::sys::usercopy::ensure_writable(*task, a1, FDS_BYTES)",
         "new (std::nothrow) KPollFd[NFDS]",
         "ker::mod::sys::usercopy::copy_from_task(*task, a1, fds, FDS_BYTES)",
-        'run_poll_wait(fds, NFDS, timeout, "poll")',
+        'run_poll_wait(subject, fds, NFDS, timeout, "poll")',
         "ker::mod::sys::usercopy::copy_to_task(*task, a1, fds, FDS_BYTES)",
         "delete[] fds",
     )

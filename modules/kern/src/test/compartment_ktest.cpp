@@ -1,3 +1,5 @@
+#include <abi/callnums/net.h>
+
 #include <array>
 #include <cerrno>
 #include <cstdio>
@@ -6,6 +8,7 @@
 #include <initializer_list>
 #include <limits>
 #include <memory>
+#include <net/socket.hpp>
 #include <platform/debug/ptrace.hpp>
 #include <platform/interrupt/gdt.hpp>
 #include <platform/loader/elf_loader.hpp>
@@ -20,8 +23,10 @@
 #include <platform/sched/session.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sched/threading.hpp>
+#include <platform/security/authorization.hpp>
 #include <platform/security/credentials.hpp>
 #include <platform/sys/usercopy.hpp>
+#include <syscalls_impl/net/sys_net.hpp>
 #include <syscalls_impl/process/child_events.hpp>
 #include <syscalls_impl/process/exec.hpp>
 #include <syscalls_impl/process/exit.hpp>
@@ -38,6 +43,8 @@
 #include <vfs/mount.hpp>
 
 namespace abi = ker::abi;
+namespace net_syscall = ker::syscall::net;
+using ker::mod::security::compartment::Network;
 namespace ipc = ker::mod::sched::ipc;
 namespace resource = ker::mod::sched::resource;
 using ker::mod::sched::task::Task;
@@ -4521,4 +4528,188 @@ KTEST(CompartmentProcfs, SameMountForeignPidDirectoryCannotPublishCwdOrNames) {
     KEXPECT_EQ(foreign.task->fd_table.reserved_count(), 0U);
     KREQUIRE_EQ(foreign.close(INHERITED), 0);
     KEXPECT_TRUE(child.destroy());
+}
+
+namespace {
+auto native_net(Task& subject, abi::net::ops op, uint64_t a1 = 0, uint64_t a2 = 0, uint64_t a3 = 0, uint64_t a4 = 0, uint64_t a5 = 0)
+    -> int {
+    auto const RESULT = static_cast<int64_t>(net_syscall::net_selftest_call_as(subject, static_cast<uint64_t>(op), a1, a2, a3, a4, a5));
+    // These cases return bounded FD/count/errno values. KTEST compares the
+    // complete input representation, so check the range before matching its
+    // int-width errno oracle; never silently truncate the syscall result.
+    if (RESULT < std::numeric_limits<int>::min() || RESULT > std::numeric_limits<int>::max()) {
+        KEXPECT_TRUE(false);
+        return -EOVERFLOW;
+    }
+    return static_cast<int>(RESULT);
+}
+constexpr std::array AMBIENT_NET_CONTROLS{
+    abi::net::ops::IOCTL_NET,          abi::net::ops::SET_DEV_CPU_AFFINITY, abi::net::ops::NETCTL_IF_LIST,
+    abi::net::ops::NETCTL_ADDR_LIST,   abi::net::ops::NETCTL_ADDR_SET,      abi::net::ops::NETCTL_ADDR_DEL,
+    abi::net::ops::NETCTL_ADDR_SET_V2, abi::net::ops::NETCTL_ROUTE_LIST,    abi::net::ops::NETCTL_ROUTE_SET,
+    abi::net::ops::NETCTL_ROUTE_DEL,   abi::net::ops::NETCTL_LINK_SET};
+}  // namespace
+
+KTEST(CompartmentNetwork, DeniedNativeSocketsAndGlobalControlsRefuseBeforeEffects) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        NativeTask subject;
+        subject.task->type = sched::task::TaskType::PROCESS;
+        KREQUIRE_TRUE(subject.task->initialize_pid_namespace(scope));
+        KEXPECT_EQ(scope.network(), Network::DENIED);
+        KEXPECT_EQ(ker::mod::security::authorize_network_administration(subject.task->credentials()), 0);
+        constexpr auto NOFILE = static_cast<unsigned>(abi::resource::Id::NOFILE);
+        auto& usage = subject.task->resources.entries[NOFILE];
+        usage.limit = {.soft = 0, .hard = 0};
+        auto const BEFORE = usage;
+        auto const REFERENCES = subject.task->ref_count.load();
+        for (int domain : {2, 10}) {
+            for (int type : {1, 2, 3}) {
+                KEXPECT_EQ(native_net(*subject.task, abi::net::ops::SOCKET, domain, type | ker::net::SOCK_NONBLOCK,
+                                      type == 3 ? (domain == 10 ? 58 : 1) : 0),
+                           -EPERM);
+            }
+        }
+        for (auto op : AMBIENT_NET_CONTROLS) {
+            KEXPECT_EQ(native_net(*subject.task, op, UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX), -EPERM);
+        }
+        KEXPECT_EQ(subject.task->fd_table.size(), 0U);
+        KEXPECT_EQ(subject.task->fd_table.reserved_count(), 0U);
+        KEXPECT_EQ(usage.current, BEFORE.current);
+        KEXPECT_EQ(usage.peak, BEFORE.peak);
+        KEXPECT_EQ(usage.denied, BEFORE.denied);
+        KEXPECT_EQ(usage.reason, BEFORE.reason);
+        KEXPECT_NULL(subject.task->pending_fd_reservations);
+        KEXPECT_EQ(subject.task->ref_count.load(), REFERENCES);
+        {
+            RegistryTask child, thread, unbound;
+            KREQUIRE_TRUE(resource::inherit(*child.task, *subject.task));
+            thread.task->is_thread = true;
+            thread.task->owner_pid = subject.task->pid;
+            KREQUIRE_TRUE(resource::bind_thread_owner(*thread.task, *subject.task));
+            for (auto* inherited : {child.task.get(), thread.task.get()}) {
+                KEXPECT_TRUE(*inherited->pid_namespace() == scope);
+                KEXPECT_EQ(native_net(*inherited, abi::net::ops::SOCKET, 2, 2, 0), -EPERM);
+                KEXPECT_EQ(native_net(*inherited, abi::net::ops::NETCTL_IF_LIST, UINT64_MAX, UINT64_MAX), -EPERM);
+            }
+            unbound.task->is_thread = true;
+            KEXPECT_NULL(unbound.task->pid_namespace());
+            KEXPECT_EQ(native_net(*unbound.task, abi::net::ops::SOCKET, 2, 2, 0), -ESRCH);
+            KEXPECT_EQ(native_net(*unbound.task, abi::net::ops::NETCTL_IF_LIST, UINT64_MAX, UINT64_MAX), -ESRCH);
+        }
+        scope.close();
+        KEXPECT_EQ(native_net(*subject.task, abi::net::ops::SOCKET, 10, 2, 0), -EIDRM);
+        for (auto op : AMBIENT_NET_CONTROLS) KEXPECT_EQ(native_net(*subject.task, op, UINT64_MAX, UINT64_MAX), -EIDRM);
+        KEXPECT_EQ(usage.denied, BEFORE.denied);
+        KEXPECT_EQ(subject.task->ref_count.load(), REFERENCES);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentNetwork, ExplicitSharedGrantCreatesRealSocketsAndKeepsRawCredentials) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef host, scope, denied, output;
+        KREQUIRE_EQ(pid_ns::create_namespace(host, Network::SHARED_HOST, scope), 0);
+        KREQUIRE_EQ(pid_ns::create_namespace(scope, Network::DENIED, denied), 0);
+        KREQUIRE_EQ(scope.retain(output), 0);
+        auto const ORIGINAL = output.generation();
+        KEXPECT_EQ(pid_ns::create_namespace(denied, Network::SHARED_HOST, output), -EPERM);
+        KEXPECT_EQ(output.generation(), ORIGINAL);
+        NativeTask shared, ordinary;
+        shared.task->type = sched::task::TaskType::PROCESS;
+        ordinary.task->type = sched::task::TaskType::PROCESS;
+        KREQUIRE_TRUE(shared.task->initialize_pid_namespace(scope));
+        for (int domain : {2, 10}) {
+            for (int type : {1, 2, 3}) {
+                int const FD = shared.track(static_cast<int>(native_net(
+                    *shared.task, abi::net::ops::SOCKET, domain, type | ker::net::SOCK_NONBLOCK, type == 3 ? (domain == 10 ? 58 : 1) : 0)));
+                KREQUIRE_TRUE(FD >= 0);
+                NativeFile file(vfs::vfs_get_file_retain(shared.task.get(), FD));
+                KREQUIRE_NE(file.get(), nullptr);
+                KEXPECT_EQ(file->fs_type, vfs::FSType::SOCKET);
+                auto* socket = static_cast<ker::net::Socket*>(file->private_data);
+                KREQUIRE_NE(socket, nullptr);
+                KEXPECT_EQ(socket->domain, domain);
+                KEXPECT_EQ(socket->type, type);
+                KEXPECT_EQ(socket->owner_pid, shared.task->pid);
+                KEXPECT_TRUE(socket->nonblock);
+                KEXPECT_TRUE(socket->rcvbuf.capacity > 0);
+            }
+        }
+        int const HOST_FD = ordinary.track(static_cast<int>(native_net(*ordinary.task, abi::net::ops::SOCKET, 2, 2, 0)));
+        KREQUIRE_TRUE(HOST_FD >= 0);
+        KEXPECT_EQ(native_net(*ordinary.task, abi::net::ops::SOCKET, 1, 2, 0), -EAFNOSUPPORT);
+        KEXPECT_EQ(native_net(*ordinary.task, abi::net::ops::SOCKET, 2, 1, 17), -EPROTONOSUPPORT);
+        KREQUIRE_EQ(resource::initialize_credentials(*shared.task, ker::mod::security::Snapshot{}), 0);
+        KEXPECT_EQ(ker::mod::security::authorize_network_administration(shared.task->credentials()), -EPERM);
+        auto const FDS = shared.task->fd_table.size();
+        KEXPECT_EQ(native_net(*shared.task, abi::net::ops::SOCKET, 2, 3, 1), -EPERM);
+        KEXPECT_EQ(shared.task->fd_table.size(), FDS);
+        KREQUIRE_TRUE(shared.track(static_cast<int>(native_net(*shared.task, abi::net::ops::SOCKET, 10, 2, 0))) >= 0);
+        scope.close();
+        KEXPECT_EQ(scope.network(), Network::SHARED_HOST);
+        KEXPECT_EQ(native_net(*shared.task, abi::net::ops::SOCKET, 2, 2, 0), -EIDRM);
+        KEXPECT_EQ(pid_ns::create_namespace(scope, Network::DENIED, output), -EIDRM);
+        KEXPECT_EQ(output.generation(), ORIGINAL);
+        KEXPECT_EQ(shared.task->fd_table.reserved_count(), 0U);
+        KEXPECT_NULL(shared.task->pending_fd_reservations);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentNetwork, InheritedSocketAndMappedOutputsSurviveScopeClosure) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        NativeTask host;
+        host.task->type = sched::task::TaskType::PROCESS;
+        int const HOST_FD = host.track(static_cast<int>(native_net(*host.task, abi::net::ops::SOCKET, 10, 2 | ker::net::SOCK_NONBLOCK, 0)));
+        KREQUIRE_TRUE(HOST_FD >= 0);
+        UserTask subject;
+        KREQUIRE_NE(subject.task->pagemap, nullptr);
+        KREQUIRE_TRUE(subject.task->initialize_pid_namespace(scope));
+        constexpr uint64_t OUTPUT = 0x640000;
+        constexpr uint64_t LENGTH = OUTPUT + 64;
+        KREQUIRE_TRUE(subject.map_zero(OUTPUT));
+        NativeFile file(vfs::vfs_get_file_retain(host.task.get(), HOST_FD));
+        KREQUIRE_NE(file.get(), nullptr);
+        ProcFixtureFd inherited{*subject.task};
+        {
+            vfs::FdReservation reservation(subject.task.get());
+            KREQUIRE_TRUE(reservation.result() >= 0);
+            inherited.fd = reservation.install(file.get());
+            KREQUIRE_TRUE(inherited.fd >= 0);
+            file.release();
+        }
+        auto const SENTINEL = uint64_t{0x123456789abcdef0};
+        KREQUIRE_TRUE(usercopy::copy_value_to_task(*subject.task, OUTPUT, SENTINEL));
+        KREQUIRE_TRUE(usercopy::copy_value_to_task(*subject.task, LENGTH, SENTINEL));
+        KEXPECT_EQ(native_net(*subject.task, abi::net::ops::NETCTL_IF_LIST, OUTPUT, LENGTH), -EPERM);
+        uint64_t unchanged = 0;
+        KREQUIRE_TRUE(usercopy::copy_value_from_task(*subject.task, OUTPUT, unchanged));
+        KEXPECT_EQ(unchanged, SENTINEL);
+        KREQUIRE_TRUE(usercopy::copy_value_from_task(*subject.task, LENGTH, unchanged));
+        KEXPECT_EQ(unchanged, SENTINEL);
+        scope.close();
+        KEXPECT_EQ(native_net(*subject.task, abi::net::ops::NETCTL_IF_LIST, OUTPUT, LENGTH), -EIDRM);
+        KEXPECT_EQ(native_net(*subject.task, abi::net::ops::SOCKET, 10, 2, 0), -EIDRM);
+        KEXPECT_EQ(native_net(*subject.task, abi::net::ops::RECV, inherited.fd, 0, 0, ker::net::SOCKET_MSG_DONTWAIT), 0);
+        size_t capacity = sizeof(int);
+        KREQUIRE_TRUE(usercopy::copy_value_to_task(*subject.task, LENGTH, capacity));
+        KEXPECT_EQ(native_net(*subject.task, abi::net::ops::GETSOCKOPT, inherited.fd, 1, 8, OUTPUT, LENGTH), 0);
+        int buffer_size = 0;
+        KREQUIRE_TRUE(usercopy::copy_value_from_task(*subject.task, OUTPUT, buffer_size));
+        KEXPECT_EQ(buffer_size, static_cast<int>(ker::net::UDP_RCVBUF_SIZE));
+        KREQUIRE_TRUE(usercopy::copy_value_from_task(*subject.task, LENGTH, capacity));
+        KEXPECT_EQ(capacity, sizeof(buffer_size));
+        KEXPECT_EQ(subject.task->fd_table.size(), 1U);
+        KEXPECT_EQ(subject.task->fd_table.reserved_count(), 0U);
+        KEXPECT_EQ(subject.task->usercopy_pagemap_accesses.load(), uint32_t{0});
+        KEXPECT_EQ(host.task->fd_table.size(), 1U);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
 }

@@ -3,8 +3,8 @@
 Goal39 is in progress. Profile preparation, private native SysV IPC namespace
 ownership/lookup, private native mount-table ownership, Task native lookup and
 subject mount administration are implemented. No public compartment creation
-syscall or launcher is enabled. PID, lifecycle and complete network/WKI
-integration remain incomplete. Independent
+syscall or launcher is enabled. Exact-owner ambient network admission is now
+implemented; complete PID, lifecycle and WKI integration remain incomplete. Independent
 service isolation and all ten goal criteria remain unqualified. Goal28 remains
 incomplete at its committed wire-codec checkpoint while this work proceeds.
 
@@ -36,8 +36,10 @@ Network policy defaults to `DENIED`. `SHARED_HOST` requires that the admitted
 parent already carries that permission. It describes shared host networking;
 it provides no independent network stack. A future installer must derive the
 parent profile from retained kernel authority, never from user-supplied parent
-fields. It must enforce network denial in native consumers even when an
-inherited credential has network administration authority. Explicit inherited
+fields. Native socket creation and global network controls now enforce the
+installed PID owner's network policy even when an inherited credential has
+network administration authority. Complete creator installation and other
+device/global consumers remain integration work. Explicit inherited
 socket descriptors remain capabilities and must be reported by the launcher.
 
 The helper allocates nothing, takes no lock and calls no Task, File, VFS,
@@ -863,6 +865,60 @@ services and full lifecycle campaigns remain unqualified. All eight disposable
 images from both runs were verified inactive and pruned; final usage is zero.
 Public creation remains disabled and all ten full criteria remain incomplete.
 
+## Live ambient network policy
+
+The opaque native PID namespace stores an immutable `Network` value before its
+first reference is published. Default private creation uses `DENIED`; Host
+ordinary networking remains shared. A kernel-only exact-reference factory can
+request `SHARED_HOST` only from an open Host or already shared parent. Invalid,
+aliased, denied, closed and exhausted requests preserve the output and owner
+counts. Final publication rechecks the parent's closure under its existing PID
+gate. Reused slots reset policy; generations provide no public join authority.
+Canonical child/thread ownership and exec retain that same policy. This factory
+does not install the full credential/resource profile or enable public creation.
+
+Socket creation checks the canonical subject's exact PID owner before raw
+credential authorization, FD reservation or socket allocation, following existing
+domain/protocol validation. All eleven global interface/address/route/link/queue
+controls check policy before usercopy, device/registry/WKI work or output changes.
+Unknown canonical ownership returns ESRCH, closed private admission EIDRM, and
+live denied admission EPERM. Explicit shared networking retains the existing raw
+NETWORK_ADMIN check and Host argument/backend behavior. No independent network
+stack, Task/File layout, syscall/libc ABI or WKI wire change is introduced.
+
+Already inherited socket Files remain intentional shared capabilities, including
+their protocol operations and sockets accepted from a granted listener. They
+remain usable after namespace closure until final close. Such a descriptor does
+not grant arbitrary global network control. A future launcher must list these
+grants; this checkpoint does not promise revocation of existing capabilities or
+already admitted shared operations. The production syscall and a per-invocation
+native adapter share the same dispatcher and explicit subject helpers. Actual
+executor parking and File operations retain existing semantics; inert native
+fixtures use nonblocking calls without replacing current-task state.
+
+Three native cases exercise real IPv4/IPv6 TCP/UDP/raw socket allocation,
+full-authority default denial with NOFILE zero, all global-control ordinals with
+bad pointers, canonical inheritance, closed/unknown owners, raw credential
+refusal, retained inherited UDP Files and getsockopt into actual mapped user
+memory. FD/reservation/resource/namespace baselines and failed outputs are checked.
+Six production PID-registry host tests cover bounded delegation, closure,
+exhaustion/reuse and concurrent closed-parent refusal. Normal Build WOS,
+isolated fast diagnostics, 38 selected host checks, eight-path formatting and two
+normal clang-tidy units pass. Actual rootless KTEST36 passes 82,083 assertions,
+zero failures, 1,345 cases and all 94 mandatory checks, with normal poweroff and
+64 stable runtime source/artifact pins.
+
+Failed KTEST35 exposed native fixture integer-width comparison and unsupported
+raw protocol zero. Its 39 observed assertions, exact failed sources and audited
+stop remain; the corrected fixture uses checked int results and supported raw
+protocols without changing production policy or expected denials. All eight
+disposable images from failed and passing runs were verified inactive and pruned;
+peak allocated usage was 259,866,624 bytes and final disposable usage is zero.
+Small evidence is retained. WKI compute/export bypasses ordinary socket syscalls
+and still requires exact-subject preeffect gates. Scheduled private services,
+full profile creation, remaining device/global policy and all ten complete goal
+criteria remain unqualified.
+
 ## Verification checkpoint
 
 The initial `compartment_policy_test` suite checks actual production preparation
@@ -871,9 +927,9 @@ inheritance, sealed grants, resource bounds, explicit network permission, failed
 output preservation and set-ID exec suppression. Deterministic four-generation
 profile chains exercise 2,048 independent inputs. Host ASan/UBSan checks and a
 compile probe using the current Normal Build WOS freestanding flags are policy
-evidence only. Native namespace isolation, actual denied network operations,
-Task/File/mount/IPC reference drains and live service behavior require later
-integration and runtime qualification.
+evidence only. Subsequent native namespace, denied-network and owner-drain
+qualification is described above. Full scheduled service behavior and lifecycle
+campaigns still require integration and runtime qualification.
 
 The production IPC registry has host tests for bounded exhaustion, unchanged
 failed output, closure, exact retained ownership, move/alias handling, 1,000

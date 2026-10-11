@@ -322,3 +322,22 @@ references and prune inactive agent-created disposable disks/backings/per-run
 appliances after PASS/FAIL/exceptions. Keep small evidence and user/unrelated
 disks/source/current artifacts. All completed Goal39 KTEST attempts pruned their
 exact-owned inactive disposable images; small logs/configs/manifests/receipts remain.
+
+
+## Checkpoint21 live network qualification (2026-10-11)
+
+Immutable native PID-owner network policy now denies new ambient socket/global
+control effects by default, supports nonescalating exact-parent Shared grants,
+and preserves explicitly inherited socket capabilities. No public creation or
+full profile installer. Normal Build WOS/isolatedfast diagnostics/38hostchecks/
+formatter+tidy and actual --no-setup KTEST36 pass82,083assertions/0failures/
+1,345cases/all94mandatory/normalpoweroff; sources/artifacts pinned. Failed35
+fixture width/raw-protocol evidence retained, corrected without production or
+oracle relaxation, all final checks rerun. Both runs' eight disposable images
+verified inactive/pruned; peak259,866,624B/final0. See progress39 checkpoint21
+record and evidence audit. All ten full criteria remain INCOMPLETE; goal ACTIVE.
+Continue exact-subject WKI preeffect admission and full native service creation.
+Authorized bin/wos-cluster --no-setup and isolated bin/wos-ktest --no-setup;
+one topology20GiB disposable/40GiB free, COW/reflink required seeds/current
+artifacts; preserve user/unrelated disks and small evidence, prune inactive
+agent disposable images after successful AND failed tests. No pause requested.

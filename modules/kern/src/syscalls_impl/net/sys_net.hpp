@@ -2,10 +2,18 @@
 
 #include <cstdint>
 
+namespace ker::mod::sched::task {
+struct Task;
+}
+
 namespace ker::syscall::net {
 uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5);
 
 #if defined(WOS_SELFTEST) && WOS_SELFTEST
+// The real dispatcher with an explicit subject; boot fixtures use only
+// nonblocking operations and never replace scheduler current-task state.
+auto net_selftest_call_as(ker::mod::sched::task::Task& subject, uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+                          uint64_t a5) -> uint64_t;
 auto net_selftest_socket_zero_read_does_not_receive() -> bool;
 auto net_selftest_link_writer_admission() -> bool;
 auto net_selftest_link_open_uses_admitted_snapshot() -> bool;

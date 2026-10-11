@@ -8,6 +8,72 @@
 #include <vector>
 
 namespace pid_ns = ker::mod::sched::pid_ns;
+using ker::mod::security::compartment::Network;
+
+TEST(PidNamespace, SharedNetworkGrantRequiresAnExactOpenParentAndCannotEscalate) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef host, shared, denied, output;
+        EXPECT_EQ(host.network(), Network::SHARED_HOST);
+        ASSERT_EQ(pid_ns::create_namespace(host, Network::SHARED_HOST, shared), 0);
+        ASSERT_EQ(pid_ns::create_namespace(shared, Network::DENIED, denied), 0);
+        ASSERT_EQ(shared.retain(output), 0);
+        auto const ORIGINAL = output.generation();
+        EXPECT_EQ(shared.network(), Network::SHARED_HOST);
+        EXPECT_EQ(denied.network(), Network::DENIED);
+        EXPECT_EQ(pid_ns::create_namespace(denied, Network::SHARED_HOST, output), -EPERM);
+        EXPECT_EQ(output.generation(), ORIGINAL);
+        EXPECT_EQ(pid_ns::live_namespace_count(), BASELINE + 2);
+        EXPECT_EQ(pid_ns::create_namespace(shared, static_cast<Network>(255), output), -EINVAL);
+        EXPECT_EQ(pid_ns::create_namespace(shared, Network::DENIED, shared), -EINVAL);
+        EXPECT_EQ(output.generation(), ORIGINAL);
+        shared.close();
+        EXPECT_EQ(shared.network(), Network::SHARED_HOST);
+        EXPECT_EQ(pid_ns::create_namespace(shared, Network::DENIED, output), -EIDRM);
+        EXPECT_EQ(output.generation(), ORIGINAL);
+        EXPECT_FALSE(denied.closed());
+    }
+    EXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+TEST(PidNamespace, ExhaustionPreservesGrantAndReusedSlotsDefaultToDenied) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef host, shared, output;
+        ASSERT_EQ(pid_ns::create_namespace(host, Network::SHARED_HOST, shared), 0);
+        ASSERT_EQ(shared.retain(output), 0);
+        std::array<pid_ns::NamespaceRef, pid_ns::MAX_NAMESPACES> slots;
+        for (size_t i = 0; i < pid_ns::MAX_NAMESPACES - BASELINE - 1; ++i) ASSERT_EQ(pid_ns::create_namespace(slots[i]), 0);
+        auto const GENERATION = output.generation();
+        EXPECT_EQ(pid_ns::create_namespace(host, Network::SHARED_HOST, output), -ENOSPC);
+        EXPECT_EQ(output.generation(), GENERATION);
+        shared.reset();
+        output.reset();
+        ASSERT_EQ(pid_ns::create_namespace(output), 0);
+        EXPECT_NE(output.generation(), GENERATION);
+        EXPECT_EQ(output.network(), Network::DENIED);
+    }
+    EXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+TEST(PidNamespace, ConcurrentCallsAfterClosurePreserveOutputsAndNamespaceBaseline) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    pid_ns::NamespaceRef host, shared;
+    ASSERT_EQ(pid_ns::create_namespace(host, Network::SHARED_HOST, shared), 0);
+    shared.close();
+    std::vector<std::thread> threads;
+    for (size_t i = 0; i < 16; ++i) {
+        threads.emplace_back([&] {
+            pid_ns::NamespaceRef output;
+            EXPECT_EQ(pid_ns::create_namespace(shared, Network::SHARED_HOST, output), -EIDRM);
+            EXPECT_TRUE(output.is_host());
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    EXPECT_EQ(pid_ns::live_namespace_count(), BASELINE + 1);
+    shared.reset();
+    EXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
 
 TEST(PidNamespace, InitRetirementClosesExactScopeOnceAndPreservesAnAdmittedLease) {
     auto const BASELINE = pid_ns::live_namespace_count();

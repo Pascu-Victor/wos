@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <platform/security/compartment_network.hpp>
 
 namespace ker::mod::sched::pid_ns {
 
@@ -23,6 +24,7 @@ class NamespaceRef {
 
     [[nodiscard]] auto is_host() const -> bool { return namespace_ == nullptr; }
     [[nodiscard]] auto generation() const -> uint64_t;
+    [[nodiscard]] auto network() const -> security::compartment::Network;
     [[nodiscard]] auto closed() const -> bool;
     // Outstanding admitted operations retain this exact slot until cleanup.
     [[nodiscard]] auto operations_drained() const -> bool;
@@ -41,6 +43,7 @@ class NamespaceRef {
 
    private:
     friend auto create_namespace(NamespaceRef& out) -> int;
+    friend auto create_namespace(const NamespaceRef& parent, security::compartment::Network network, NamespaceRef& out) -> int;
     friend class PublicationGuard;
     friend class OperationLease;
     Namespace* namespace_{};
@@ -80,6 +83,10 @@ class PublicationGuard {
 };
 
 [[nodiscard]] auto create_namespace(NamespaceRef& out) -> int;
+// Kernel exact-reference creation only. Private defaults deny ambient network;
+// an explicit shared grant cannot exceed the retained parent's immutable policy.
+// Failed, closed, aliased or exhausted requests preserve out.
+[[nodiscard]] auto create_namespace(const NamespaceRef& parent, security::compartment::Network network, NamespaceRef& out) -> int;
 [[nodiscard]] auto live_namespace_count() -> size_t;
 
 }  // namespace ker::mod::sched::pid_ns

@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <platform/security/compartment_network.hpp>
 #include <platform/security/credentials.hpp>
 
 namespace ker::mod::security::compartment {
@@ -13,7 +14,6 @@ namespace ker::mod::security::compartment {
 // A live installer must retain/revalidate its creator's observations, own the
 // namespace transaction, and enforce this policy in every affected consumer.
 using Limits = std::array<ker::abi::resource::Limit, ker::abi::resource::COUNT>;
-enum class Network : uint8_t { DENIED, SHARED_HOST };
 
 struct Profile {
     Snapshot credentials{};
