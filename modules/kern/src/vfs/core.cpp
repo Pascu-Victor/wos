@@ -31,6 +31,7 @@
 #endif
 #include <platform/sched/task.hpp>
 #include <platform/security/authorization.hpp>
+#include <platform/security/compartment_wki.hpp>
 #include <platform/security/file_policy.hpp>
 #include <platform/sys/mutex.hpp>
 #include <platform/sys/spinlock.hpp>
@@ -5793,8 +5794,7 @@ void maybe_ensure_wki_host_root_mount_for_task(const ker::mod::sched::task::Task
     // Discovery mutates the host mount view. A private or unbound subject
     // cannot cause that effect through compatibility path helpers.
     if (task != nullptr) {
-        auto const* scope = task->mount_namespace();
-        if (scope == nullptr || !scope->is_host()) return;
+        if (ker::mod::security::compartment::remote_namespace_admission(task) != 0) return;
     }
     if (ker::net::wki::g_wki.initialized && resolved_path_may_need_wki_host_root_mount_for_task(task, resolved_path)) {
         ensure_wki_host_root_mount(resolved_path);
@@ -5808,6 +5808,9 @@ auto task_has_common_local_vfs_routing(const ker::mod::sched::task::Task* task) 
     if (task->root[0] != '/') {
         return false;
     }
+    int const SCOPE = ker::mod::security::compartment::remote_namespace_admission(task);
+    if (SCOPE == -ENOTSUP) return true;
+    if (SCOPE != 0) return false;
     // LOCAL stays here, and HOST targets only the submitter. With a local
     // submitter, neither rule can change the path. Rule presence must not
     // bypass the component walk's ancestor authorization.
@@ -7154,6 +7157,7 @@ auto resolve_prefix_symlink_once(char* path, size_t bufsize, bool apply_task_pol
 
 auto choose_task_route(const ker::mod::sched::task::Task* task, const char* path) -> VfsRouteDecision {
     VfsRouteDecision best = {};
+    if (task != nullptr && ker::mod::security::compartment::remote_namespace_admission(task) != 0) return best;
 
     if (task != nullptr) {
         for (const auto& rule : task->wki_vfs_rules) {
@@ -7188,6 +7192,9 @@ auto apply_task_vfs_route(const ker::mod::sched::task::Task* task, const char* p
     if (task == nullptr) {
         return copy_path_string(path, out, out_size);
     }
+    int const SCOPE = ker::mod::security::compartment::remote_namespace_admission(task);
+    if (SCOPE == -ENOTSUP) return copy_path_string(path, out, out_size);
+    if (SCOPE != 0) return SCOPE;
 
     // Each route stage initializes its complete NUL-terminated string before the next stage.
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
@@ -7513,7 +7520,8 @@ void load_vfs_rules_from_buffer(char* buffer) {
 // Convert a possibly-relative path to an absolute path by prepending CWD.
 // If the path is already absolute, copies it as-is.
 // Returns 0 on success, negative on error.
-auto make_absolute(const char* path, char* out, size_t outsize, size_t* out_len) -> int {
+auto make_absolute_for_subject(ker::mod::sched::task::Task* subject, const char* path, char* out, size_t outsize, size_t* out_len,
+                               bool current_subject) -> int {
     if (path == nullptr || out == nullptr || outsize == 0) {
         return -EINVAL;
     }
@@ -7534,7 +7542,7 @@ auto make_absolute(const char* path, char* out, size_t outsize, size_t* out_len)
     }
 
     // Relative path - prepend task CWD
-    auto* task = ker::mod::sched::get_current_task();
+    auto* task = current_subject ? ker::mod::sched::get_current_task() : subject;
     if (task == nullptr) {
         return -ESRCH;
     }
@@ -7562,6 +7570,10 @@ auto make_absolute(const char* path, char* out, size_t outsize, size_t* out_len)
         *out_len = TOTAL - 1;
     }
     return 0;
+}
+
+auto make_absolute(const char* path, char* out, size_t outsize, size_t* out_len) -> int {
+    return make_absolute_for_subject(nullptr, path, out, outsize, out_len, true);
 }
 
 // Canonicalize a path in place: resolve ".", "..", and collapse "//".
@@ -8358,6 +8370,11 @@ auto vfs_open_resolved_for_task(ker::mod::sched::task::Task* task, const char* r
     auto const* scope = task != nullptr ? task->mount_namespace() : nullptr;
     if (task != nullptr && scope == nullptr) return -ESRCH;
     if (scope != nullptr && scope->closed()) return -EIDRM;
+    int const REMOTE_SCOPE = ker::mod::security::compartment::remote_namespace_admission(task);
+    if (REMOTE_SCOPE != 0 && REMOTE_SCOPE != -ENOTSUP) return REMOTE_SCOPE;
+    if (REMOTE_SCOPE == -ENOTSUP &&
+        (stable_lookup == nullptr || stable_lookup->mount() == nullptr || stable_lookup->mount()->fs_type == FSType::REMOTE))
+        return -ENOTSUP;
     if (scope != nullptr && !scope->is_host() &&
         (stable_lookup == nullptr || stable_lookup->mount() == nullptr || stable_lookup->mount()->namespace_owner != *scope ||
          stable_lookup->authorization().mount_namespace_generation != scope->generation()))
@@ -12741,7 +12758,9 @@ auto acquire_local_component_lookup(ker::mod::sched::task::Task* task, int dirfd
     if (scope->closed()) return -EIDRM;
     bool const PRIVATE = !scope->is_host();
     // Owner-side exports do not yet transport private namespace authority.
-    if (PRIVATE && physical_path) return -ENOTSUP;
+    int const REMOTE_SCOPE = ker::mod::security::compartment::remote_namespace_admission(task);
+    if (REMOTE_SCOPE != 0 && REMOTE_SCOPE != -ENOTSUP) return REMOTE_SCOPE;
+    if (REMOTE_SCOPE == -ENOTSUP && physical_path) return -ENOTSUP;
     if (owner_directory != nullptr && (!physical_path || confinement_root == nullptr || pathname[0] == '/')) return -EINVAL;
     if (pathname[0] == '\0') return -ENOENT;
     if (physical_path && ((owner_directory == nullptr && pathname[0] != '/') || apply_task_route || admitted_credentials == nullptr))
@@ -12750,14 +12769,14 @@ auto acquire_local_component_lookup(ker::mod::sched::task::Task* task, int dirfd
     bool const ROUTED_LOCAL = apply_task_route && !task_has_common_local_vfs_routing(task);
     if (PRIVATE && ROUTED_LOCAL) return -ENOTSUP;
     bool const REMOTE_COMPONENTS =
-        !PRIVATE && !physical_path &&
+        REMOTE_SCOPE == 0 && !physical_path &&
         (intent == LookupIntent::OPEN || intent == LookupIntent::STAT || intent == LookupIntent::ACCESS ||
          intent == LookupIntent::READLINK || intent == LookupIntent::CHANGE_MODE || intent == LookupIntent::CHANGE_OWNER ||
          (intent == LookupIntent::CHANGE_TIMES || intent == LookupIntent::XATTR) || intent == LookupIntent::CREATE_DIRECTORY ||
          intent == LookupIntent::CREATE_SYMLINK || intent == LookupIntent::REMOVE || intent == LookupIntent::RENAME_SOURCE ||
          intent == LookupIntent::RENAME_TARGET);
     // Only mapped operations can delegate the original component remainder.
-    if (!PRIVATE && path_is_wki_prefix(pathname) && !REMOTE_COMPONENTS) return physical_path ? -EPERM : RESOLVE_FAST_PATH_DECLINED;
+    if (REMOTE_SCOPE == 0 && path_is_wki_prefix(pathname) && !REMOTE_COMPONENTS) return physical_path ? -EPERM : RESOLVE_FAST_PATH_DECLINED;
     auto* path_owner = task->filesystem_owner();
     if (path_owner == nullptr) return -ESRCH;
     if (serialized != (serialized_references != nullptr)) return -EINVAL;
@@ -12973,6 +12992,7 @@ auto acquire_local_component_lookup(ker::mod::sched::task::Task* task, int dirfd
              (intent == LookupIntent::CHANGE_TIMES || intent == LookupIntent::XATTR) || intent == LookupIntent::CREATE_DIRECTORY ||
              intent == LookupIntent::CREATE_SYMLINK || intent == LookupIntent::REMOVE || intent == LookupIntent::RENAME_SOURCE ||
              intent == LookupIntent::RENAME_TARGET)) {
+            if (!REMOTE_COMPONENTS) return -ENOTSUP;
             if (serialized) return RESOLVE_FAST_PATH_DECLINED;
             auto mount = retain_mount_point(anchor->mount_owner);
             if (!mount || mount->fs_type != FSType::REMOTE) return -EAGAIN;
@@ -13511,8 +13531,9 @@ auto vfs_acquire_lookup(ker::mod::sched::task::Task* task, int dirfd, const char
     auto const* scope = task->mount_namespace();
     if (scope == nullptr) return -ESRCH;
     if (scope->closed()) return -EIDRM;
-    bool const PRIVATE = !scope->is_host();
-    if (PRIVATE && already_resolved) return -ENOTSUP;
+    int const REMOTE_SCOPE = ker::mod::security::compartment::remote_namespace_admission(task);
+    if (REMOTE_SCOPE != 0 && REMOTE_SCOPE != -ENOTSUP) return REMOTE_SCOPE;
+    if (REMOTE_SCOPE == -ENOTSUP && already_resolved) return -ENOTSUP;
     bool const PHYSICAL_OWNER_PATH = already_resolved && admitted_credentials != nullptr;
     // One request keeps its admitted authority through native retries and the
     // routed fallback. In particular, symlink resolution must not recapture a
@@ -13523,7 +13544,7 @@ auto vfs_acquire_lookup(ker::mod::sched::task::Task* task, int dirfd, const char
             int const WALK = acquire_local_component_lookup(task, dirfd, pathname, intent, follow_policy, require_directory,
                                                             apply_task_route, out, &REQUEST_CREDENTIALS, false, PHYSICAL_OWNER_PATH);
             // Explicit owner requests must never retry with ambient authority.
-            if ((PRIVATE || PHYSICAL_OWNER_PATH) && WALK == RESOLVE_FAST_PATH_DECLINED) return -ENOTSUP;
+            if ((REMOTE_SCOPE == -ENOTSUP || PHYSICAL_OWNER_PATH) && WALK == RESOLVE_FAST_PATH_DECLINED) return -ENOTSUP;
             if (WALK == RESOLVE_FAST_PATH_DECLINED) break;
             if (WALK != -EAGAIN || restart == max_restarts) return WALK;
         }
@@ -31080,8 +31101,7 @@ void vfs_wki_load_default_rules() {
     delete[] buffer;
 }
 
-auto vfs_wki_rule_add(const char* prefix, uint32_t route) -> int {
-    auto* task = ker::mod::sched::get_current_task();
+auto vfs_wki_rule_add_for_task(ker::mod::sched::task::Task* task, const char* prefix, uint32_t route) -> int {
     if (task == nullptr || prefix == nullptr) {
         return -EINVAL;
     }
@@ -31090,8 +31110,10 @@ auto vfs_wki_rule_add(const char* prefix, uint32_t route) -> int {
         return -EINVAL;
     }
 
+    int const SCOPE = ker::mod::security::compartment::remote_namespace_admission(task);
+    if (SCOPE != 0) return SCOPE;
     std::array<char, MAX_PATH_LEN> canonical{};
-    int const ABSOLUTE = make_absolute(prefix, canonical.data(), canonical.size());
+    int const ABSOLUTE = make_absolute_for_subject(task, prefix, canonical.data(), canonical.size(), nullptr, false);
     if (ABSOLUTE < 0) {
         return ABSOLUTE;
     }
@@ -31127,11 +31149,17 @@ auto vfs_wki_rule_add(const char* prefix, uint32_t route) -> int {
     return 0;
 }
 
-auto vfs_wki_rule_get(uint32_t index, char* prefix_buf, size_t prefix_buf_size, uint32_t* route_out) -> int {
-    auto* task = ker::mod::sched::get_current_task();
+auto vfs_wki_rule_add(const char* prefix, uint32_t route) -> int {
+    return vfs_wki_rule_add_for_task(ker::mod::sched::get_current_task(), prefix, route);
+}
+
+auto vfs_wki_rule_get_for_task(ker::mod::sched::task::Task* task, uint32_t index, char* prefix_buf, size_t prefix_buf_size,
+                               uint32_t* route_out) -> int {
     if (task == nullptr) {
         return -EINVAL;
     }
+    int const SCOPE = ker::mod::security::compartment::remote_namespace_admission(task);
+    if (SCOPE != 0) return SCOPE;
 
     if (index >= task->wki_vfs_rules.size()) {
         return -ENOENT;
@@ -31148,6 +31176,10 @@ auto vfs_wki_rule_get(uint32_t index, char* prefix_buf, size_t prefix_buf_size, 
         *route_out = rule.route;
     }
     return static_cast<int>(rule.prefix_len);
+}
+
+auto vfs_wki_rule_get(uint32_t index, char* prefix_buf, size_t prefix_buf_size, uint32_t* route_out) -> int {
+    return vfs_wki_rule_get_for_task(ker::mod::sched::get_current_task(), index, prefix_buf, prefix_buf_size, route_out);
 }
 
 auto vfs_wki_default_rule_get(uint32_t index, char* prefix_buf, size_t prefix_buf_size, uint32_t* route_out) -> int {
@@ -31172,20 +31204,34 @@ auto vfs_wki_effective_route_for_path(const ker::mod::sched::task::Task* task, c
     if (path == nullptr || route_out == nullptr) {
         return -EINVAL;
     }
+    if (task != nullptr) {
+        int const SCOPE = ker::mod::security::compartment::remote_namespace_admission(task);
+        if (SCOPE != 0 && SCOPE != -ENOTSUP) return SCOPE;
+    }
 
     VfsRouteDecision const DECISION = choose_task_route(task, path);
     *route_out = DECISION.route;
     return static_cast<int>(DECISION.prefix_len);
 }
 
-auto vfs_wki_rule_clear() -> int {
-    auto* task = ker::mod::sched::get_current_task();
+auto vfs_wki_rule_clear_for_task(ker::mod::sched::task::Task* task) -> int {
     if (task == nullptr) {
         return -EINVAL;
     }
+    int const SCOPE = ker::mod::security::compartment::remote_namespace_admission(task);
+    if (SCOPE != 0) return SCOPE;
 
     task->wki_vfs_rules.clear();
     return 0;
+}
+
+auto vfs_wki_rule_clear() -> int { return vfs_wki_rule_clear_for_task(ker::mod::sched::get_current_task()); }
+
+auto vfs_wki_default_rule_get_for_task(ker::mod::sched::task::Task* task, uint32_t index, char* prefix_buf, size_t prefix_buf_size,
+                                       uint32_t* route_out) -> int {
+    int const SCOPE = ker::mod::security::compartment::remote_namespace_admission(task);
+    if (SCOPE != 0) return SCOPE;
+    return vfs_wki_default_rule_get(index, prefix_buf, prefix_buf_size, route_out);
 }
 
 static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resolve_task_path, bool apply_task_policy,
@@ -31472,6 +31518,8 @@ namespace {
 
 auto open_remote_read_file_as(const LookupHandle& lookup, ker::mod::sched::task::Task& path_context,
                               const ker::mod::security::Snapshot& credentials, File** output) -> int {
+    int const SCOPE = ker::mod::security::compartment::remote_namespace_admission(&path_context);
+    if (SCOPE != 0) return SCOPE;
     auto* mount = lookup.mount();
     MountOpenFileReservation reservation{lookup};
     if (!reservation) return -EAGAIN;

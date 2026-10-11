@@ -1,5 +1,6 @@
 #include <abi/callnums/net.h>
 #include <abi/callnums/power.h>
+#include <abi/callnums/vfs.h>
 
 #include <array>
 #include <cerrno>
@@ -38,6 +39,7 @@
 #include <syscalls_impl/process/exit.hpp>
 #include <syscalls_impl/process/process.hpp>
 #include <syscalls_impl/shm/shm.hpp>
+#include <syscalls_impl/vfs/sys_vfs.hpp>
 #include <syscalls_impl/vmem/sys_vmem.hpp>
 #include <test/ktest.hpp>
 #include <util/hostname.hpp>
@@ -2725,7 +2727,9 @@ KTEST(CompartmentPath, ClosedAndUnsupportedLookupNeverFallsBackToHost) {
                -ENOTSUP);
     KEXPECT_NULL(compatibility.mount());
     std::snprintf(subject.task->wki_submitter_hostname.data(), subject.task->wki_submitter_hostname.size(), "goal39-foreign-submitter");
-    KEXPECT_EQ(task_lookup(*subject.task, "/data", compatibility), -ENOTSUP);
+    KREQUIRE_EQ(task_lookup(*subject.task, "/data", compatibility), 0);
+    KEXPECT_TRUE(compatibility.mount()->namespace_owner == views.first);
+    compatibility.reset();
     KEXPECT_EQ(vfs::get_mount_count(), HOST_COUNT);
     subject.task->wki_submitter_hostname.fill('\0');
     vfs::LookupHandle pinned;
@@ -5098,6 +5102,272 @@ KTEST(CompartmentWki, CanonicalTargetAdmissionAndHostCopiesKeepExistingOwnership
     KEXPECT_EQ(host.task->wki_target_hostname.front(), char{0});
     KEXPECT_EQ(host.task->wki_target_flags, Task::WKI_TARGET_FLAG_BALANCED);
     KEXPECT_EQ(host.task->usercopy_pagemap_accesses.load(), uint32_t{0});
+}
+
+namespace {
+using VfsRuleOp = abi::vfs::ops;
+using VfsRoute = sched::task::WkiVfsRoute;
+auto native_rule_control(Task* subject, VfsRuleOp op, uint64_t a1 = 0, uint64_t a2 = 0, uint64_t a3 = 0, uint64_t a4 = 0) -> int64_t {
+    return ker::syscall::vfs::wki_rules_for_subject(subject, static_cast<uint64_t>(op), a1, a2, a3, a4);
+}
+auto inherit_remote_rule(Task& subject) -> bool {
+    sched::task::WkiVfsRule rule{};
+    std::strcpy(rule.prefix.data(), "/");
+    rule.prefix_len = 1;
+    rule.route = static_cast<uint8_t>(VfsRoute::HOST);
+    std::strcpy(subject.wki_submitter_hostname.data(), "foreign.fixture");
+    return subject.wki_vfs_rules.push_back(rule);
+}
+struct HostRoutingMount {
+    static constexpr const char* PATH = "/__goal39_routing25";
+    bool mounted{};
+    auto install() -> int {
+        int const RESULT = private_mount({}, PATH);
+        mounted = RESULT == 0;
+        return RESULT;
+    }
+    ~HostRoutingMount() {
+        if (mounted) KEXPECT_EQ(vfs::unmount_filesystem(PATH), 0);
+    }
+};
+}  // namespace
+
+KTEST(CompartmentRouting, PrivateRuleControlsRefuseCopiesAndKeepInheritedFields) {
+    auto const PID_BASELINE = pid_ns::live_namespace_count();
+    auto const IPC_BASELINE = ipc::live_namespace_count();
+    auto const MOUNT_BASELINE = mount_ns::live_namespace_count();
+    for (unsigned variant = 1; variant < 8; ++variant) {
+        pid_ns::NamespaceRef host, pids;
+        ipc::NamespaceRef names;
+        mount_ns::NamespaceRef mounts;
+        UserTask subject;
+        KREQUIRE_NE(subject.task->pagemap, nullptr);
+        constexpr uint64_t ADDRESS = 0x670000;
+        constexpr uint64_t ROUTE_OUTPUT = ADDRESS + 128;
+        KREQUIRE_TRUE(subject.map_zero(ADDRESS));
+        constexpr auto PREFIX = std::to_array("/mapped.fixture");
+        KREQUIRE_TRUE(usercopy::copy_to_task(*subject.task, ADDRESS, PREFIX.data(), PREFIX.size()));
+        if ((variant & 1U) != 0) {
+            KREQUIRE_EQ(pid_ns::create_namespace(host, Network::SHARED_HOST, pids), 0);
+            KREQUIRE_TRUE(subject.task->initialize_pid_namespace(pids));
+        }
+        if ((variant & 2U) != 0) {
+            KREQUIRE_EQ(ipc::create_namespace(names), 0);
+            KREQUIRE_TRUE(subject.task->initialize_ipc_namespace(names));
+        }
+        if ((variant & 4U) != 0) {
+            KREQUIRE_EQ(mount_ns::create_namespace(mounts), 0);
+            KREQUIRE_TRUE(subject.task->initialize_mount_namespace(mounts));
+        }
+        KREQUIRE_TRUE(inherit_remote_rule(*subject.task));
+        auto const RULE = subject.task->wki_vfs_rules[0];
+        auto const REFERENCES = subject.task->ref_count.load();
+        auto const RESOURCES = wki::resource_contract::snapshot(subject.task->resources);
+        uint32_t const SENTINEL = 0x76543210;
+        KREQUIRE_TRUE(usercopy::copy_value_to_task(*subject.task, ROUTE_OUTPUT, SENTINEL));
+        KEXPECT_EQ(native_rule_control(subject.task.get(), VfsRuleOp::WKI_RULE_ADD, ADDRESS, 1), int64_t{-ENOTSUP});
+        KEXPECT_EQ(native_rule_control(subject.task.get(), VfsRuleOp::WKI_RULE_ADD, UINT64_MAX, UINT64_MAX), int64_t{-ENOTSUP});
+        for (auto op : {VfsRuleOp::WKI_RULE_GET, VfsRuleOp::WKI_RULE_GET_DEFAULT}) {
+            KEXPECT_EQ(native_rule_control(subject.task.get(), op, 0, ADDRESS, PREFIX.size(), ROUTE_OUTPUT), int64_t{-ENOTSUP});
+            KEXPECT_EQ(native_rule_control(subject.task.get(), op, UINT64_MAX, UINT64_MAX, SIZE_MAX, UINT64_MAX), int64_t{-ENOTSUP});
+        }
+        KEXPECT_EQ(native_rule_control(subject.task.get(), VfsRuleOp::WKI_RULE_CLEAR), int64_t{-ENOTSUP});
+        std::array<char, PREFIX.size()> observed{};
+        uint32_t route = 0;
+        KREQUIRE_TRUE(usercopy::copy_from_task(*subject.task, ADDRESS, observed.data(), observed.size()));
+        KREQUIRE_TRUE(usercopy::copy_value_from_task(*subject.task, ROUTE_OUTPUT, route));
+        KEXPECT_TRUE(observed == PREFIX);
+        KEXPECT_EQ(route, SENTINEL);
+        KEXPECT_EQ(vfs::vfs_wki_rule_add_for_task(subject.task.get(), reinterpret_cast<const char*>(UINTPTR_MAX), 1), -ENOTSUP);
+        KEXPECT_EQ(vfs::vfs_wki_rule_get_for_task(subject.task.get(), 0, observed.data(), observed.size(), &route), -ENOTSUP);
+        KEXPECT_EQ(vfs::vfs_wki_default_rule_get_for_task(subject.task.get(), 0, observed.data(), observed.size(), &route), -ENOTSUP);
+        KEXPECT_EQ(vfs::vfs_wki_rule_clear_for_task(subject.task.get()), -ENOTSUP);
+        KEXPECT_EQ(vfs::vfs_wki_effective_route_for_path(subject.task.get(), "/usr/bin/fixture", &route), 0);
+        KEXPECT_EQ(route, static_cast<uint32_t>(VfsRoute::LOCAL));
+        KEXPECT_EQ(subject.task->wki_vfs_rules.size(), size_t{1});
+        KEXPECT_EQ(std::memcmp(&RULE, &subject.task->wki_vfs_rules[0], sizeof(RULE)), 0);
+        KEXPECT_EQ(subject.task->ref_count.load(), REFERENCES);
+        auto const CURRENT = wki::resource_contract::snapshot(subject.task->resources);
+        KEXPECT_EQ(std::memcmp(&RESOURCES, &CURRENT, sizeof(CURRENT)), 0);
+        KEXPECT_EQ(subject.task->usercopy_pagemap_accesses.load(), uint32_t{0});
+        pids.close();
+        names.close();
+        mounts.close();
+        for (auto op : {VfsRuleOp::WKI_RULE_ADD, VfsRuleOp::WKI_RULE_GET, VfsRuleOp::WKI_RULE_GET_DEFAULT, VfsRuleOp::WKI_RULE_CLEAR})
+            KEXPECT_EQ(native_rule_control(subject.task.get(), op, UINT64_MAX, UINT64_MAX, SIZE_MAX, UINT64_MAX), int64_t{-EIDRM});
+        route = SENTINEL;
+        KEXPECT_EQ(vfs::vfs_wki_effective_route_for_path(subject.task.get(), "/", &route), -EIDRM);
+        KEXPECT_EQ(route, SENTINEL);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PID_BASELINE);
+    KEXPECT_EQ(ipc::live_namespace_count(), IPC_BASELINE);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNT_BASELINE);
+}
+
+KTEST(CompartmentRouting, CanonicalSubjectsAndMappedHostRulesKeepOriginalErrors) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef pids;
+        KREQUIRE_EQ(pid_ns::create_namespace(pids), 0);
+        NativeTask owner, thread, unbound;
+        KREQUIRE_TRUE(owner.task->initialize_pid_namespace(pids));
+        thread.task->is_thread = true;
+        thread.task->owner_pid = owner.task->pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(*thread.task, *owner.task));
+        unbound.task->is_thread = true;
+        unbound.task->owner_pid = owner.task->pid;
+        KREQUIRE_TRUE(inherit_remote_rule(*thread.task));
+        for (auto op : {VfsRuleOp::WKI_RULE_ADD, VfsRuleOp::WKI_RULE_GET, VfsRuleOp::WKI_RULE_GET_DEFAULT, VfsRuleOp::WKI_RULE_CLEAR}) {
+            KEXPECT_EQ(native_rule_control(thread.task.get(), op, UINT64_MAX, UINT64_MAX, SIZE_MAX, UINT64_MAX), int64_t{-ENOTSUP});
+            KEXPECT_EQ(native_rule_control(unbound.task.get(), op), int64_t{-ESRCH});
+            KEXPECT_EQ(native_rule_control(nullptr, op), int64_t{-ESRCH});
+        }
+        KEXPECT_EQ(thread.task->wki_vfs_rules.size(), size_t{1});
+        KEXPECT_EQ(owner.task->wki_vfs_rules.size(), size_t{0});
+        uint32_t route = 17;
+        KEXPECT_EQ(vfs::vfs_wki_effective_route_for_path(unbound.task.get(), "/", &route), -ESRCH);
+        KEXPECT_EQ(route, uint32_t{17});
+        pids.close();
+        KEXPECT_EQ(native_rule_control(thread.task.get(), VfsRuleOp::WKI_RULE_CLEAR), int64_t{-EIDRM});
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+    UserTask host;
+    KREQUIRE_NE(host.task->pagemap, nullptr);
+    constexpr uint64_t INPUT = 0x680000, OUTPUT = INPUT + 128, ROUTE_OUTPUT = INPUT + 256;
+    KREQUIRE_TRUE(host.map_zero(INPUT));
+    constexpr auto PREFIX = std::to_array("a/../b//");
+    KREQUIRE_TRUE(usercopy::copy_to_task(*host.task, INPUT, PREFIX.data(), PREFIX.size()));
+    KEXPECT_EQ(native_rule_control(host.task.get(), VfsRuleOp::WKI_RULE_ADD, INPUT, 1), int64_t{0});
+    KEXPECT_EQ(native_rule_control(host.task.get(), VfsRuleOp::WKI_RULE_GET, 0, OUTPUT, 32, ROUTE_OUTPUT), int64_t{2});
+    std::array<char, 3> observed{};
+    uint32_t route = 0;
+    KREQUIRE_TRUE(usercopy::copy_from_task(*host.task, OUTPUT, observed.data(), observed.size()));
+    KREQUIRE_TRUE(usercopy::copy_value_from_task(*host.task, ROUTE_OUTPUT, route));
+    KEXPECT_EQ(std::strcmp(observed.data(), "/b"), 0);
+    KEXPECT_EQ(route, uint32_t{1});
+    KEXPECT_EQ(native_rule_control(host.task.get(), VfsRuleOp::WKI_RULE_ADD, INPUT, 0), int64_t{0});
+    KEXPECT_EQ(host.task->wki_vfs_rules.size(), size_t{1});
+    KEXPECT_EQ(host.task->wki_vfs_rules[0].route, uint8_t{0});
+    KEXPECT_EQ(native_rule_control(host.task.get(), VfsRuleOp::WKI_RULE_ADD, 0, 0), int64_t{-EFAULT});
+    KEXPECT_EQ(native_rule_control(host.task.get(), VfsRuleOp::WKI_RULE_ADD, UINT64_MAX, 3), int64_t{-EFAULT});
+    KEXPECT_EQ(native_rule_control(host.task.get(), VfsRuleOp::WKI_RULE_ADD, INPUT, 3), int64_t{-EINVAL});
+    uint64_t const SENTINEL = 0x654321abcdef9876;
+    KREQUIRE_TRUE(usercopy::copy_value_to_task(*host.task, OUTPUT, SENTINEL));
+    KREQUIRE_TRUE(usercopy::copy_value_to_task(*host.task, ROUTE_OUTPUT, SENTINEL));
+    KEXPECT_EQ(native_rule_control(host.task.get(), VfsRuleOp::WKI_RULE_GET, 0, OUTPUT, 2, ROUTE_OUTPUT), int64_t{-ERANGE});
+    KEXPECT_EQ(native_rule_control(host.task.get(), VfsRuleOp::WKI_RULE_GET, 0, OUTPUT, 32, UINT64_MAX), int64_t{-EFAULT});
+    KEXPECT_EQ(native_rule_control(host.task.get(), VfsRuleOp::WKI_RULE_GET, UINT64_MAX, UINT64_MAX, 32, 0), int64_t{-EFAULT});
+    KEXPECT_EQ(native_rule_control(host.task.get(), VfsRuleOp::WKI_RULE_GET, UINT64_MAX), int64_t{-ENOENT});
+    uint64_t unchanged = 0;
+    KREQUIRE_TRUE(usercopy::copy_value_from_task(*host.task, OUTPUT, unchanged));
+    KEXPECT_EQ(unchanged, SENTINEL);
+    KREQUIRE_TRUE(usercopy::copy_value_from_task(*host.task, ROUTE_OUTPUT, unchanged));
+    KEXPECT_EQ(unchanged, SENTINEL);
+    std::array<char, Task::CWD_MAX> defaults{};
+    uint32_t default_route = 0;
+    int const DEFAULT = vfs::vfs_wki_default_rule_get(0, defaults.data(), defaults.size(), &default_route);
+    KEXPECT_EQ(native_rule_control(host.task.get(), VfsRuleOp::WKI_RULE_GET_DEFAULT, 0, OUTPUT, defaults.size(), ROUTE_OUTPUT),
+               static_cast<int64_t>(DEFAULT));
+    if (DEFAULT >= 0) {
+        std::array<char, Task::CWD_MAX> output{};
+        KREQUIRE_TRUE(usercopy::copy_from_task(*host.task, OUTPUT, output.data(), static_cast<size_t>(DEFAULT) + 1));
+        KREQUIRE_TRUE(usercopy::copy_value_from_task(*host.task, ROUTE_OUTPUT, route));
+        KEXPECT_EQ(std::strcmp(output.data(), defaults.data()), 0);
+        KEXPECT_EQ(route, default_route);
+    }
+    KEXPECT_EQ(native_rule_control(host.task.get(), VfsRuleOp::WKI_RULE_CLEAR), int64_t{0});
+    KEXPECT_EQ(host.task->wki_vfs_rules.size(), size_t{0});
+    KEXPECT_EQ(native_rule_control(nullptr, VfsRuleOp::OPEN), int64_t{-EINVAL});
+    KEXPECT_EQ(host.task->usercopy_pagemap_accesses.load(), uint32_t{0});
+}
+
+KTEST(CompartmentRouting, PrivateNativeNamesIgnoreRemoteFieldsAndKeepFileCapabilities) {
+    auto const HOST_COUNT = vfs::get_mount_count();
+    auto const PID_BASELINE = pid_ns::live_namespace_count();
+    auto const IPC_BASELINE = ipc::live_namespace_count();
+    auto const MOUNT_BASELINE = mount_ns::live_namespace_count();
+    {
+        HostRoutingMount host_mount;
+        KREQUIRE_EQ(host_mount.install(), 0);
+        for (unsigned variant = 1; variant < 8; ++variant) {
+            PrivateMounts views;
+            pid_ns::NamespaceRef host, pids;
+            ipc::NamespaceRef names;
+            NativeTask subject;
+            if ((variant & 1U) != 0) {
+                KREQUIRE_EQ(pid_ns::create_namespace(host, Network::SHARED_HOST, pids), 0);
+                KREQUIRE_TRUE(subject.task->initialize_pid_namespace(pids));
+            }
+            if ((variant & 2U) != 0) {
+                KREQUIRE_EQ(ipc::create_namespace(names), 0);
+                KREQUIRE_TRUE(subject.task->initialize_ipc_namespace(names));
+            }
+            if ((variant & 4U) != 0) {
+                KREQUIRE_EQ(mount_ns::create_namespace(views.first), 0);
+                KREQUIRE_EQ(private_mount(views.first, "/"), 0);
+                KREQUIRE_TRUE(subject.task->initialize_mount_namespace(views.first));
+            }
+            auto mount = scoped_mount(views.first, (variant & 4U) != 0 ? "/" : HostRoutingMount::PATH);
+            KREQUIRE_TRUE(mount);
+            const char* path = (variant & 4U) != 0 ? "/data" : "/__goal39_routing25/data";
+            int const CREATED = subject.open(path);
+            KREQUIRE_TRUE(CREATED >= 0);
+            NativeFile backing(vfs::vfs_get_file_retain(subject.task.get(), CREATED));
+            KREQUIRE_TRUE(backing);
+            constexpr auto PAYLOAD = std::to_array("retained");
+            KREQUIRE_EQ(vfs::vfs_write_file(backing.get(), PAYLOAD.data(), PAYLOAD.size()), static_cast<ssize_t>(PAYLOAD.size()));
+            KREQUIRE_TRUE(inherit_remote_rule(*subject.task));
+            int const FD = subject.open(path, 0);
+            KREQUIRE_TRUE(FD >= 0);
+            NativeFile retained(vfs::vfs_get_file_retain(subject.task.get(), FD));
+            KREQUIRE_TRUE(retained);
+            KEXPECT_TRUE(retained->mount_owner == mount.get());
+            vfs::LookupHandle lookup;
+            KREQUIRE_EQ(task_lookup(*subject.task, path, lookup), 0);
+            KEXPECT_TRUE(lookup.mount() == mount.get());
+            lookup.reset();
+            // A retained remote directory is an FD capability, not permission
+            // to create child name requests in an unsupported private scope.
+            NativeFile remote(new vfs::File{});
+            remote->refcount.store(1);
+            remote->fs_type = vfs::FSType::REMOTE;
+            remote->is_directory = true;
+            auto* remote_file = remote.get();
+            vfs::FdReservation reservation(subject.task.get());
+            int const REMOTE_FD = reservation.install(remote.get());
+            KREQUIRE_TRUE(REMOTE_FD >= 0);
+            static_cast<void>(remote.release());
+            KREQUIRE_EQ(subject.track(REMOTE_FD), REMOTE_FD);
+            int const REMOTE_ERROR = (variant & 4U) != 0 ? -EXDEV : -ENOTSUP;
+            KEXPECT_EQ(task_lookup(*subject.task, "child", lookup, REMOTE_FD), REMOTE_ERROR);
+            KEXPECT_NULL(lookup.mount());
+            KEXPECT_EQ(remote_file->refcount.load(), 1);
+            KEXPECT_EQ(vfs::vfs_acquire_lookup(subject.task.get(), vfs::AT_FDCWD, "/wki/foreign.fixture/child", vfs::LookupIntent::STAT,
+                                               vfs::LookupFollowPolicy::FOLLOW_FINAL, false, true, &lookup, 0, true),
+                       -ENOTSUP);
+            if ((variant & 4U) != 0) {
+                KREQUIRE_EQ(vfs::vfs_mkdirat(subject.task.get(), vfs::AT_FDCWD, "/wki", 0755), 0);
+                KREQUIRE_EQ(vfs::vfs_mkdirat(subject.task.get(), vfs::AT_FDCWD, "/wki/host", 0755), 0);
+                KREQUIRE_EQ(vfs::vfs_mkdirat(subject.task.get(), vfs::AT_FDCWD, "/wki/host/local", 0755), 0);
+                KREQUIRE_EQ(task_lookup(*subject.task, "/wki/host/local", lookup), 0);
+                KEXPECT_TRUE(lookup.mount() == mount.get());
+                lookup.reset();
+            }
+            pids.close();
+            names.close();
+            views.first.close();
+            vfs::Stat stat{};
+            KEXPECT_EQ(vfs::vfs_statat(subject.task.get(), vfs::AT_FDCWD, path, 0, &stat), -EIDRM);
+            std::array<char, PAYLOAD.size()> observed{};
+            KEXPECT_EQ(retained->fops->vfs_read(retained.get(), observed.data(), observed.size(), 0), static_cast<ssize_t>(PAYLOAD.size()));
+            KEXPECT_TRUE(observed == PAYLOAD);
+            KEXPECT_EQ(vfs::vfs_fstat_file(retained.get(), &stat), 0);
+        }
+    }
+    KEXPECT_EQ(vfs::get_mount_count(), HOST_COUNT);
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PID_BASELINE);
+    KEXPECT_EQ(ipc::live_namespace_count(), IPC_BASELINE);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNT_BASELINE);
 }
 
 namespace {

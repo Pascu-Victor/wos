@@ -15,6 +15,7 @@
 #include <new>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/security/compartment_wki.hpp>
 #include <platform/sys/usercopy.hpp>
 #include <utility>
 #include <vfs/epoll.hpp>
@@ -296,11 +297,15 @@ auto copy_statvfs_result_to_user(int result, ker::vfs::Statvfs* user_buf, const 
     return static_cast<int64_t>(result);
 }
 
-auto copy_wki_rule_to_user(uint32_t index, char* prefix_buf, size_t prefix_buf_size, uint32_t* route_out, bool default_rules) -> int64_t {
+auto copy_wki_rule_to_user(ker::mod::sched::task::Task* subject, uint32_t index, char* prefix_buf, size_t prefix_buf_size,
+                           uint32_t* route_out, bool default_rules) -> int64_t {
     std::array<char, ker::mod::sched::task::Task::CWD_MAX> kernel_prefix{};
-    if ((prefix_buf != nullptr &&
-         !preflight_optional_user_output(reinterpret_cast<uint64_t>(prefix_buf), std::min(prefix_buf_size, kernel_prefix.size()))) ||
-        !preflight_optional_user_output(reinterpret_cast<uint64_t>(route_out), sizeof(uint32_t))) {
+    auto preflight = [subject](uint64_t address, size_t size) {
+        return address == 0 ||
+               (subject != nullptr && subject->pagemap != nullptr && ker::mod::sys::usercopy::ensure_writable(*subject, address, size));
+    };
+    if ((prefix_buf != nullptr && !preflight(reinterpret_cast<uint64_t>(prefix_buf), std::min(prefix_buf_size, kernel_prefix.size()))) ||
+        !preflight(reinterpret_cast<uint64_t>(route_out), sizeof(uint32_t))) {
         return -EFAULT;
     }
     uint32_t route = 0;
@@ -308,8 +313,8 @@ auto copy_wki_rule_to_user(uint32_t index, char* prefix_buf, size_t prefix_buf_s
     size_t const PREFIX_ARG_SIZE = prefix_buf != nullptr ? std::min(prefix_buf_size, kernel_prefix.size()) : static_cast<size_t>(0);
     uint32_t* route_arg = route_out != nullptr ? &route : nullptr;
 
-    int const RET = default_rules ? ker::vfs::vfs_wki_default_rule_get(index, prefix_arg, PREFIX_ARG_SIZE, route_arg)
-                                  : ker::vfs::vfs_wki_rule_get(index, prefix_arg, PREFIX_ARG_SIZE, route_arg);
+    int const RET = default_rules ? ker::vfs::vfs_wki_default_rule_get_for_task(subject, index, prefix_arg, PREFIX_ARG_SIZE, route_arg)
+                                  : ker::vfs::vfs_wki_rule_get_for_task(subject, index, prefix_arg, PREFIX_ARG_SIZE, route_arg);
     if (RET < 0) {
         return static_cast<int64_t>(RET);
     }
@@ -319,11 +324,10 @@ auto copy_wki_rule_to_user(uint32_t index, char* prefix_buf, size_t prefix_buf_s
             return -EOVERFLOW;
         }
         size_t const COPY_SIZE = static_cast<size_t>(RET) + 1;
-        if (int const COPY_RET = copy_buffer_to_user(prefix_buf, kernel_prefix.data(), COPY_SIZE); COPY_RET < 0) {
-            return static_cast<int64_t>(COPY_RET);
-        }
+        if (!ker::mod::sys::usercopy::copy_to_task(*subject, reinterpret_cast<uint64_t>(prefix_buf), kernel_prefix.data(), COPY_SIZE))
+            return -EFAULT;
     }
-    if (int const COPY_RET = copy_value_to_user(route_out, route); COPY_RET < 0) {
+    if (int const COPY_RET = copy_value_to_user_for_task(subject, route_out, route); COPY_RET < 0) {
         return static_cast<int64_t>(COPY_RET);
     }
     return static_cast<int64_t>(RET);
@@ -434,6 +438,32 @@ auto syscall_removexattr(ops op, uint64_t target, uint64_t user_name) -> int64_t
     return ker::vfs::vfs_removexattr(path.data(), name.data(), op == ops::REMOVEXATTR);
 }
 }  // namespace
+
+auto wki_rules_for_subject(ker::mod::sched::task::Task* subject, uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
+    -> int64_t {
+    auto const OP = static_cast<ops>(op_raw);
+    if (OP != ops::WKI_RULE_ADD && OP != ops::WKI_RULE_GET && OP != ops::WKI_RULE_GET_DEFAULT && OP != ops::WKI_RULE_CLEAR) return -EINVAL;
+    int const SCOPE = ker::mod::security::compartment::remote_namespace_admission(subject);
+    if (SCOPE != 0) return SCOPE;
+    switch (OP) {
+        case ops::WKI_RULE_ADD: {
+            if (a1 == 0) return -EFAULT;
+            KernelPath prefix{};
+            auto const STATUS = ker::mod::sys::usercopy::copy_cstring_from_task_status(*subject, a1, prefix.data(), prefix.size());
+            if (STATUS == ker::mod::sys::usercopy::CStringCopyStatus::FAULT) return -EFAULT;
+            if (STATUS == ker::mod::sys::usercopy::CStringCopyStatus::TOO_LONG) return -ENAMETOOLONG;
+            return ker::vfs::vfs_wki_rule_add_for_task(subject, prefix.data(), static_cast<uint32_t>(a2));
+        }
+        case ops::WKI_RULE_GET:
+        case ops::WKI_RULE_GET_DEFAULT:
+            return copy_wki_rule_to_user(subject, static_cast<uint32_t>(a1), reinterpret_cast<char*>(a2), static_cast<size_t>(a3),
+                                         reinterpret_cast<uint32_t*>(a4), OP == ops::WKI_RULE_GET_DEFAULT);
+        case ops::WKI_RULE_CLEAR:
+            return ker::vfs::vfs_wki_rule_clear_for_task(subject);
+        default:
+            return -EINVAL;
+    }
+}
 
 auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) -> int64_t {
     ops op = static_cast<ops>(op_raw);
@@ -1330,31 +1360,11 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             auto* task = ker::mod::sched::get_current_task();
             return static_cast<int64_t>(ker::vfs::vfs_linkat(task, OLDDIRFD, oldpath.data(), NEWDIRFD, newpath.data(), FLAGS));
         }
-        case ops::WKI_RULE_ADD: {
-            KernelPath prefix{};
-            if (int const COPY_RET = copy_path_from_user(a1, prefix); COPY_RET < 0) {
-                return COPY_RET;
-            }
-            auto route = static_cast<uint32_t>(a2);
-            return static_cast<int64_t>(ker::vfs::vfs_wki_rule_add(prefix.data(), route));
-        }
-        case ops::WKI_RULE_GET: {
-            auto index = static_cast<uint32_t>(a1);
-            auto* prefix_buf = reinterpret_cast<char*>(a2);
-            auto prefix_buf_size = static_cast<size_t>(a3);
-            auto* route_out = reinterpret_cast<uint32_t*>(a4);
-            return copy_wki_rule_to_user(index, prefix_buf, prefix_buf_size, route_out, false);
-        }
-        case ops::WKI_RULE_GET_DEFAULT: {
-            auto index = static_cast<uint32_t>(a1);
-            auto* prefix_buf = reinterpret_cast<char*>(a2);
-            auto prefix_buf_size = static_cast<size_t>(a3);
-            auto* route_out = reinterpret_cast<uint32_t*>(a4);
-            return copy_wki_rule_to_user(index, prefix_buf, prefix_buf_size, route_out, true);
-        }
-        case ops::WKI_RULE_CLEAR: {
-            return static_cast<int64_t>(ker::vfs::vfs_wki_rule_clear());
-        }
+        case ops::WKI_RULE_ADD:
+        case ops::WKI_RULE_GET:
+        case ops::WKI_RULE_GET_DEFAULT:
+        case ops::WKI_RULE_CLEAR:
+            return wki_rules_for_subject(ker::mod::sched::get_current_task(), op_raw, a1, a2, a3, a4);
         case ops::PIVOT_ROOT: {
             KernelPath new_root{};
             KernelPath put_old{};

@@ -538,10 +538,16 @@ auto vfs_linkat(ker::mod::sched::task::Task* task, int olddirfd, const char* old
 
 // WKI task-local VFS policy
 auto vfs_wki_rule_add(const char* prefix, uint32_t route) -> int;
+auto vfs_wki_rule_add_for_task(ker::mod::sched::task::Task* task, const char* prefix, uint32_t route) -> int;
 auto vfs_wki_rule_get(uint32_t index, char* prefix_buf, size_t prefix_buf_size, uint32_t* route_out) -> int;
+auto vfs_wki_rule_get_for_task(ker::mod::sched::task::Task* task, uint32_t index, char* prefix_buf, size_t prefix_buf_size,
+                               uint32_t* route_out) -> int;
 auto vfs_wki_default_rule_get(uint32_t index, char* prefix_buf, size_t prefix_buf_size, uint32_t* route_out) -> int;
+auto vfs_wki_default_rule_get_for_task(ker::mod::sched::task::Task* task, uint32_t index, char* prefix_buf, size_t prefix_buf_size,
+                                       uint32_t* route_out) -> int;
 auto vfs_wki_effective_route_for_path(const ker::mod::sched::task::Task* task, const char* path, uint32_t* route_out) -> int;
 auto vfs_wki_rule_clear() -> int;
+auto vfs_wki_rule_clear_for_task(ker::mod::sched::task::Task* task) -> int;
 void vfs_wki_load_default_rules();
 
 // File control. Pointer-bearing record-lock commands receive a kernel-owned

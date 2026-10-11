@@ -1076,7 +1076,10 @@ def test_current_task_stat_scratch_is_initialized_by_dirfd_resolver() -> None:
 def test_stat_impl_path_buffer_is_initialized_by_its_producers() -> None:
     core = VFS_CORE_CPP.read_text()
     stat_impl = function_body(core, "vfs_stat_impl")
-    make_absolute = function_body(core, "make_absolute")
+    make_wrapper = function_body(core, "make_absolute")
+    if make_wrapper.strip() != "return make_absolute_for_subject(nullptr, path, out, outsize, out_len, true);":
+        fail("make_absolute must delegate its unchanged current-subject contract exactly once")
+    make_absolute = function_body(core, "make_absolute_for_subject")
     canonicalize = function_body(core, "canonicalize_path")
     finish_path = function_body(core, "finish_canonical_task_path_raw")
     copy_path = function_body(core, "copy_path_string")
@@ -1207,6 +1210,13 @@ def test_stat_impl_path_buffer_is_initialized_by_its_producers() -> None:
     )
     if return_types != ["int"]:
         fail("make_absolute must preserve its signed integer result domain")
+    shared_return_types = re.findall(
+        r"\bauto\s+make_absolute_for_subject\([^;{]*\)\s*->\s*([A-Za-z0-9_:<>*]+)\s*\{",
+        core,
+        flags=re.DOTALL,
+    )
+    if shared_return_types != ["int"]:
+        fail("explicit-subject make_absolute must preserve the same signed result domain")
     make_returns = [" ".join(value.split()) for value in re.findall(r"\breturn\s+([^;]+);", make_absolute)]
     if make_returns != ["-EINVAL", "-EINVAL", "-ENAMETOOLONG", "0", "-ESRCH", "CWD", "-ENAMETOOLONG", "0"]:
         fail("make_absolute return topology changed; re-audit complete-production success semantics")
@@ -1228,6 +1238,10 @@ def test_stat_impl_path_buffer_is_initialized_by_its_producers() -> None:
     require_order(make_absolute, ["vfs_getcwd_for_task(task, cwd.data(), cwd.size(), &cwd_len)",
                                   "if (CWD != 0) return CWD", "size_t const CWDLEN = cwd_len", "std::memcpy(out, cwd.data(), CWDLEN)"],
                   "retained cwd is completely produced before the caller destination is written")
+    require_order(make_absolute, ["if (path[0] == '/')",
+                                  "auto* task = current_subject ? ker::mod::sched::get_current_task() : subject;",
+                                  "vfs_getcwd_for_task(task, cwd.data(), cwd.size(), &cwd_len)"],
+                  "absolute/error paths must not retrieve scheduler state; relative paths use the selected subject")
     relative_setup = """size_t const CWDLEN = cwd_len;
     // Need: cwd + "/" + path + '\\0'
     bool const NEED_SEP = (CWDLEN > 1);  // Root "/" doesn't need extra /
@@ -1295,6 +1309,8 @@ def test_stat_impl_path_buffer_is_initialized_by_its_producers() -> None:
         "apply_task_vfs_route": [
             "-EINVAL",
             "copy_path_string(path, out, out_size)",
+            "copy_path_string(path, out, out_size)",
+            "SCOPE",
             "LOGICAL_RESULT",
             "alias_result",
             "alias_result",
@@ -1321,6 +1337,14 @@ def test_stat_impl_path_buffer_is_initialized_by_its_producers() -> None:
         actual_returns = [" ".join(value.split()) for value in re.findall(r"\breturn\s+([^;]+);", helper_bodies[helper])]
         if actual_returns != expected_returns:
             fail(f"{helper} return topology changed; re-audit complete path production")
+
+    require_order(
+        route_path,
+        ["remote_namespace_admission(task)",
+         "if (SCOPE == -ENOTSUP) return copy_path_string(path, out, out_size)",
+         "if (SCOPE != 0) return SCOPE", "strip_task_root_prefix", "rewrite_wki_host_alias", "choose_task_route"],
+        "private routing initializes the whole output through copy_path_string before ambient alias/rule effects",
+    )
 
     require_order(
         canonicalize,

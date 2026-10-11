@@ -1045,6 +1045,49 @@ oracle calls. It remains unqualified. Routing, other Host controls, public
 construction/launcher and the complete service/lifecycle campaigns still require
 work; all ten full goal criteria remain incomplete.
 
+## Native VFS routing and forwarding admission
+
+The four ambient WKI VFS rule controls now require open canonical Host PID,
+mount and IPC views before copying user input/output, changing executor rules
+or exposing boot defaults. Private views return ENOTSUP, unbound subjects ESRCH
+and closed views EIDRM. Existing Host signatures delegate to shared explicit
+subject implementations. The trusted boot-default getter and null-subject
+effective-route query remain pure queries without current-task retrieval.
+
+Private native path routing ignores inherited rules, global defaults and
+submitter aliases. Native/public lookup refuses remote name expansion,
+physical/export requests and declined compatibility fallback before discovery
+or remote metadata effects. Remote directory FDs cannot authorize new child
+name requests in an unsupported private scope. Direct inherited File operations
+retain their grants across namespace closure. No syscall selector, wire format,
+Task/File layout or ordinary Host descriptor implementation changes.
+
+Three native cases exercise the actual shared controls with mapped Host/private
+buffers, all seven private scope combinations, retained canonical threads,
+closed/unbound owners, independent TMPFS backing, inherited routing fields,
+literal private `/wki/host` directories and installed File capabilities. The
+remote directory marker is disconnected; these tests do not qualify a live
+peer or public service boundary. An older local-path case now verifies the
+intended exact-mount success while preserving physical and closed refusals.
+
+Final Normal Build WOS, isolated fast diagnostics, formatting/clang-tidy,
+44 focused Host checks and 65 complete-source comparison checks pass. Actual
+rootless KTEST44 passes 84,244 assertions with zero failures across 1,356 cases,
+all 105 mandatory checks, normal poweroff and 95 stable runtime pins. Failed
+attempt42 exposed an obsolete expectation and a raw fixture without file
+operations; attempt43 exposed its disconnected marker's missing owned
+reference. Fixtures were corrected, diagnostics stayed enabled and final
+validation repeated. Both failed sources reconstruct exactly from the committed
+parent and retained patches. All twelve disposable images from the three runs
+were verified inactive and pruned: 515,293,184 allocated bytes total, peak
+260,194,304 bytes and final zero. The unrelated user VM was preserved.
+
+The broader current credential/VFS audit still reports 24 failures in 129
+oracle calls and remains unqualified. Public construction/launcher, global
+controls, actual shared-futex/service/lifecycle campaigns and complete Host
+regression still require work. Goal39 remains active and all ten full criteria
+remain incomplete; see the checkpoint25 evidence and construction map.
+
 ## Verification checkpoint
 
 The initial `compartment_policy_test` suite checks actual production preparation

@@ -47,8 +47,11 @@ FAMILIES = {
     "path.resolve-helper": {"vfs_resolve_dirfd", "vfs_directory_path_beneath"},
     "path.route-policy": {
         "vfs_wki_rule_add",
+        "vfs_wki_rule_add_for_task",
         "vfs_wki_rule_get",
+        "vfs_wki_rule_get_for_task",
         "vfs_wki_default_rule_get",
+        "vfs_wki_default_rule_get_for_task",
         "vfs_wki_effective_route_for_path",
     },
     "path.cache-observer": {"vfs_cache_notify_invalidate_path", "vfs_cache_notify_path_changed"},

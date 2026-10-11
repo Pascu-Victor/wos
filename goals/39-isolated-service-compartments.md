@@ -409,3 +409,34 @@ backing audit andpruningafterPASS/FAIL/exception; retain smallreceipts, notoldVM
 Goal39 ACTIVE, alltenfullcriteriaINCOMPLETE. Continue routing/globaltargets,
 publicconstruction/launcher, actualSHM/sharedfutex/scheduledlifecycle/hostilepaths,
 two2hservice trees+1000fullfailurecycles/allrefs andcompleteHost/init/libcregression.
+
+### Checkpoint25 — VFS routing and forwarding admission (2026-10-11)
+
+All four ambient VFS rule controls now require exact open canonical Host
+PID/mount/IPC views before copies, vector effects or boot-default visibility.
+Private native paths ignore inherited/default rules and aliases; remote name
+producers, discovery, physical/export expansion and compatibility fallback
+refuse before remote effects. Existing inherited File operations, Host bodies,
+trusted boot queries, Task/File layouts and syscall/wire ABI are preserved.
+Public creation remains disabled.
+
+Final Normal Build WOS, isolated fast diagnostics, formatting/tidy, 44 focused
+Host tests and 65 complete-source checks PASS. Actual rootless KTEST44 PASS:
+84,244 assertions, zero failures, 1,356 cases, all 105 mandatory checks and
+95 stable source/artifact pins, normal poweroff. Failed42/43 fixtures were
+corrected without disabling diagnostics or changing production close behavior;
+exact sources reconstruct from retained parent/patches. Twelve inactive
+disposable images across all three attempts were pruned, 515,293,184 allocated
+bytes total, peak 260,194,304 bytes and final zero. User VM preserved.
+
+Current broad credential/VFS census still has 24 failures in 129 calls; no full
+Host/service qualification claim. Goal39 ACTIVE, all ten full criteria still
+INCOMPLETE. Continue native public construction/root population, remaining
+global controls and actual shared mappings/lifecycle/hostile service campaigns,
+two independent service trees for two hours, 1000 full allocation-failure cycles
+and complete Host/init/credential/resource/libc regression. Rootless
+bin/wos-cluster --no-setup and bin/wos-ktest --no-setup remain authorized with
+one active topology, 20GiB disposable/40GiB free floor, shared immutable bases
+and COW/reflink copies; audit exact live ownership/backing refs and prune owned
+inactive disks/appliances after PASS, FAIL and exceptions, retaining small
+receipts and preserving user/unrelated/current/seed/source/sysroot artifacts.
