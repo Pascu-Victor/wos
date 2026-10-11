@@ -6,6 +6,9 @@ subject mount administration are implemented. Checkpoint 32 added the experiment
 versioned public creation syscall and `wos-compartment` launcher. Checkpoint 33
 qualifies two short, sequential nonroot service trees through the public spec
 and actual launcher, including local fork/wait and explicit result capabilities.
+Checkpoint 34 confines priority selectors and scheduling updates to the exact
+private PID view; both actual public modes pass 21 checks. CPU-placement and
+priority inheritance remain incomplete.
 Exact-owner ambient network admission is implemented;
 complete PID, lifecycle and WKI qualification remains incomplete. Independent
 service isolation and all ten goal criteria remain unqualified. Goal28 remains
@@ -1433,6 +1436,51 @@ This qualifies short sequential execution, not two simultaneous two-hour trees,
 1,000complete lifecycles or the full hostile/isolation/regression campaign.
 CPU placement/domain inheritance remains unqualified; restored EEVDF defaults
 do not implement that policy. Goal39 stays ACTIVE/all ten full criteria incomplete.
+
+## Checkpoint34: private priority selection and commit
+
+Private GETPRIORITY/SETPRIORITY resolve positive IDs and the executing thread's
+zero selector in its canonical, retained PID namespace. Same-UID Host and
+sibling physical IDs cannot select a target. Unbound, closed, terminal and
+old-image worker observations refuse; unsupported remote targets fail before
+effects. Existing credential authorization, nice clamping and libc's encoded
+GETPRIORITY result remain. Host physical-ID and zero-selector behavior is
+preserved; no Task/File layout, syscall number, libc or wire format changes.
+
+Private updates hold VM publication, verify actual owner-runqueue membership,
+then hold namespace publication through the weight/deadline and heap-accounting
+commit. Queue refusal leaves those fields unchanged; a registry-only target
+cannot use the Host helper's unlocked fallback. Fresh canonical-owner liveness
+checks precede the read or commit. Rescheduling runs after queue/namespace locks
+are released. These checks do not claim serialization against a later process
+exit that does not take VM publication.
+
+Four actual native cases cover local aliases and Host encoding, canonical
+threads/stale images, closure/authorization/remote refusals, and exclusively
+owned current/handoff/heap/wait queues with exact accounting. Both normal guest
+modes pass all 21 checks, including real libc get/set priority, denied raises,
+raw 64-bit Host-PID guessing and preserved Host nice values.
+
+Normal Build WOS, isolated fast diagnostic build, 48 selected Host tests,
+formatting and 27 preservation checks pass. All 128 credential source tests now
+pass: exactly the previous 24 failing consumers follow their current production
+delegates; the other 104 tests and all 128 test calls are retained. The historical
+129-call census included a display print, not a 129th test. The success message
+now follows the final test, and that affected CTest passed again afterward.
+This source-audit result does not qualify the entire Host/init/libc regression.
+
+Rootless `--no-setup` KTEST62 passes 88,688 assertions with zero failures across
+1,393 cases, including all 142 mandatory cases, with normal selftest poweroff.
+Both runtime source/artifact sets stay stable. Public and diagnostic runs prune
+their four owned images each, leaving zero disposable allocation; the unrelated
+user VM is preserved. Audit `checkpoint-34-audit.json` has SHA256
+`942f018c8ef059e942b29fbab627729f488af1373e2ba66500614cf36e63abda`.
+
+Goal39 remains ACTIVE and all ten full criteria remain incomplete. Native
+nice-0 defaults do not preserve a restricted creator's priority. CPU mask,
+domain and pin inheritance, hostile/shared-futex/init campaigns, simultaneous
+two-hour trees, 1,000 full lifecycles with all reference baselines, and complete
+Host/init/libc regression remain required.
 
 ## Verification checkpoint
 

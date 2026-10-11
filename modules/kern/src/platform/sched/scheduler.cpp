@@ -21,6 +21,10 @@
 #include <platform/sys/userspace.hpp>
 #include <utility>
 
+#ifdef WOS_SELFTEST
+#include <memory>
+#endif
+
 #include "scheduler_transition.hpp"
 // Debug helpers
 #include <net/wki/remote_compute.hpp>
@@ -2366,6 +2370,47 @@ void set_task_nice_impl(task::Task* task, int nice) {
     }
 }
 
+auto namespace_priority_subject_status(task::Task* subject, const pid_ns::NamespaceRef& scope) -> int {
+    if (subject == nullptr || scope.is_host()) return -ESRCH;
+    if (scope.closed()) return -EIDRM;
+    auto const* observed = subject->pid_namespace();
+    if (observed == nullptr || observed->is_host() || *observed != scope || subject->namespace_tid() == 0 ||
+        subject->type != task::TaskType::PROCESS || subject->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE ||
+        subject->has_exited || subject->exit_in_progress.load(std::memory_order_acquire) ||
+        subject->exit_notify_ready.load(std::memory_order_acquire) || subject->gc_queued.load(std::memory_order_acquire))
+        return -ESRCH;
+    auto const* owner = subject->credential_owner();
+    if (owner == nullptr || owner->type != task::TaskType::PROCESS ||
+        owner->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE || owner->has_exited ||
+        owner->exit_in_progress.load(std::memory_order_acquire) || owner->exit_notify_ready.load(std::memory_order_acquire) ||
+        owner->gc_queued.load(std::memory_order_acquire) || (subject->is_thread && subject->pagemap != owner->pagemap))
+        return -ESRCH;
+    return 0;
+}
+
+// Caller retains subject/scope and owns VM publication plus this exact queue.
+// Namespace closure serializes with the weight effect, not merely selection.
+// No registry lookup, sleeping work or wake is permitted under admission.
+auto commit_task_nice_in_namespace_locked(RunQueue* rq, task::Task* subject, const pid_ns::NamespaceRef& scope, int nice) -> int {
+    if (int const STATUS = namespace_priority_subject_status(subject, scope); STATUS != 0) return STATUS;
+    if (!runqueue_owns_task_locked(rq, subject)) return -EAGAIN;
+    pid_ns::PublicationGuard const ADMISSION(scope);
+    if (!ADMISSION.open()) return -EIDRM;
+    if (int const STATUS = namespace_priority_subject_status(subject, scope); STATUS != 0) return STATUS;
+
+    int const NICE = clamp_nice(nice);
+    bool const IN_HEAP = rq->runnable_heap.contains(subject);
+    if (IN_HEAP) remove_from_sums(rq, subject);
+    subject->sched_nice = static_cast<int8_t>(NICE);
+    subject->sched_weight = nice_to_weight(NICE);
+    subject->vdeadline = vdeadline_from_slice(subject->vruntime, subject->slice_ns, subject->sched_weight);
+    if (IN_HEAP) {
+        add_to_sums(rq, subject);
+        rq->runnable_heap.update(subject);
+    }
+    return 0;
+}
+
 // Bursty short-sleep tasks (dropbear/httpd/netpoll style) should stay responsive,
 // but they should not alternate 50/50 with CPU-bound workers just because sleep
 // time freezes vruntime. Charge a small wakeup tax only for short-run + short-sleep
@@ -3884,6 +3929,35 @@ auto owner_cpu_for_task(task::Task* task) -> uint64_t {
         }
     }
     return UINT64_MAX;
+}
+
+auto set_task_nice_in_namespace(task::Task* subject, const pid_ns::NamespaceRef& scope, int nice) -> int {
+    if (int const STATUS = namespace_priority_subject_status(subject, scope); STATUS != 0) return STATUS;
+    if (run_queues == nullptr) return -EAGAIN;
+    uint64_t const CORE_COUNT = smt::get_core_count();
+    if (CORE_COUNT == 0) return -EAGAIN;
+
+    // Two bounded owner scans each revalidate under the selected queue lock.
+    // Do not sample the unlocked CPU field, and never mutate detached targets.
+    for (unsigned attempt = 0; attempt < 2; ++attempt) {
+        uint64_t const OWNER = owner_cpu_for_task(subject);
+        if (OWNER >= CORE_COUNT) continue;
+        int result = -EAGAIN;
+        run_queues->with_lock_void(OWNER, [subject, &scope, nice, &result](RunQueue* rq) {
+            result = commit_task_nice_in_namespace_locked(rq, subject, scope, nice);
+        });
+        if (result == -EAGAIN) continue;
+        if (result != 0) return result;
+
+        // Neither the runqueue nor namespace admission survives the poke.
+        MigrationGuard const CPU_GUARD;
+        if (OWNER == cpu::current_cpu())
+            request_local_reschedule();
+        else
+            wake_cpu(OWNER);
+        return 0;
+    }
+    return scope.closed() ? -EIDRM : -EAGAIN;
 }
 
 namespace {
@@ -9271,6 +9345,116 @@ auto get_expired_task_refcounts(uint64_t cpu_no, uint64_t* pids, uint32_t* refco
 }
 
 #ifdef WOS_SELFTEST
+auto scheduler_selftest_namespace_priority_commit() -> bool {
+    size_t const BASELINE = pid_ns::live_namespace_count();
+    pid_ns::NamespaceRef scope, other;
+    if (pid_ns::create_namespace(scope) != 0 || pid_ns::create_namespace(other) != 0) return false;
+    // These queues and Tasks are exclusively owned fixture state. No global
+    // registry, scheduler publication, real handoff or reschedule is involved.
+    auto owner = std::unique_ptr<RunQueue>(new (std::nothrow) RunQueue{});
+    auto wrong = std::unique_ptr<RunQueue>(new (std::nothrow) RunQueue{});
+    auto subject = std::unique_ptr<task::Task>(new (std::nothrow) task::Task{});
+    auto peer = std::unique_ptr<task::Task>(new (std::nothrow) task::Task{});
+    if (!owner || !wrong || !subject || !peer) return false;
+    for (auto* target : {subject.get(), peer.get()}) {
+        target->type = task::TaskType::PROCESS;
+        if (!target->initialize_pid_namespace(scope)) return false;
+        target->heap_index = -1;
+        target->sched_weight = nice_to_weight(0);
+        target->slice_ns = 1'000'000;
+        target->vruntime = 70;
+        target->vdeadline = vdeadline_from_slice(target->vruntime, target->slice_ns, target->sched_weight);
+    }
+    sys::Spinlock fixture_lock;
+    auto commit = [&](RunQueue* rq, const pid_ns::NamespaceRef& admitted, int nice) {
+        uint64_t const FLAGS = fixture_lock.lock_irqsave();
+        int const RESULT = commit_task_nice_in_namespace_locked(rq, subject.get(), admitted, nice);
+        fixture_lock.unlock_irqrestore(FLAGS);
+        return RESULT;
+    };
+    auto changed_to = [&](int nice) {
+        int const NICE = clamp_nice(nice);
+        return subject->sched_nice == NICE && subject->sched_weight == nice_to_weight(NICE) &&
+               subject->vdeadline == vdeadline_from_slice(subject->vruntime, subject->slice_ns, subject->sched_weight);
+    };
+
+    owner->current_task = subject.get();  // Exclusively owned fixture queue.
+    bool ok = commit(owner.get(), scope, 5) == 0 && changed_to(5) && owner->total_weight == 0 && owner->total_weighted_vruntime == 0;
+    owner->current_task = nullptr;
+    owner->handoff_task = subject.get();  // Exclusively owned fixture queue.
+    ok = commit(owner.get(), scope, 999) == 0 && changed_to(19) && owner->total_weight == 0 && ok;
+    owner->handoff_task = nullptr;
+
+    subject->sched_nice = 0;
+    subject->sched_weight = nice_to_weight(0);
+    subject->vdeadline = vdeadline_from_slice(subject->vruntime, subject->slice_ns, subject->sched_weight);
+    peer->slice_ns = 10'000'000;
+    peer->vruntime = 40;
+    peer->vdeadline = vdeadline_from_slice(peer->vruntime, peer->slice_ns, peer->sched_weight);
+    owner->min_vruntime = 20;
+    bool const SUBJECT_INSERTED = owner->runnable_heap.insert(subject.get());
+    bool const PEER_INSERTED = owner->runnable_heap.insert(peer.get());
+    if (SUBJECT_INSERTED) add_to_sums(owner.get(), subject.get());
+    if (PEER_INSERTED) add_to_sums(owner.get(), peer.get());
+    subject->sched_queue = task::Task::sched_queue::RUNNABLE;
+    peer->sched_queue = task::Task::sched_queue::RUNNABLE;
+    ok = SUBJECT_INSERTED && PEER_INSERTED && owner->runnable_heap.peek_min() == subject.get() && ok;
+    ok = commit(owner.get(), scope, 19) == 0 && changed_to(19) && owner->runnable_heap.peek_min() == peer.get() &&
+         owner->total_weight == static_cast<int64_t>(subject->sched_weight) + peer->sched_weight &&
+         owner->total_weighted_vruntime == (subject->vruntime - owner->min_vruntime) * subject->sched_weight +
+                                               (peer->vruntime - owner->min_vruntime) * peer->sched_weight &&
+         ok;
+    if (owner->runnable_heap.remove(subject.get())) remove_from_sums(owner.get(), subject.get());
+    if (owner->runnable_heap.remove(peer.get())) remove_from_sums(owner.get(), peer.get());
+    subject->sched_queue = task::Task::sched_queue::WAITING;
+    peer->sched_queue = task::Task::sched_queue::NONE;
+    owner->wait_list.push(subject.get());
+    ok = commit(owner.get(), scope, -999) == 0 && changed_to(-20) && owner->total_weight == 0 && owner->total_weighted_vruntime == 0 && ok;
+
+    int const BEFORE_NICE = subject->sched_nice;
+    uint32_t const BEFORE_WEIGHT = subject->sched_weight;
+    int64_t const BEFORE_DEADLINE = subject->vdeadline;
+    auto unchanged = [&]() {
+        return subject->sched_nice == BEFORE_NICE && subject->sched_weight == BEFORE_WEIGHT && subject->vdeadline == BEFORE_DEADLINE &&
+               owner->total_weight == 0 && owner->total_weighted_vruntime == 0 && wrong->total_weight == 0 &&
+               wrong->total_weighted_vruntime == 0;
+    };
+    // WAITING is a global tag; only its exact list owner can admit the effect.
+    ok = commit(wrong.get(), scope, 0) == -EAGAIN && unchanged() && ok;
+    ok = commit(owner.get(), other, 0) == -ESRCH && unchanged() && ok;
+    pid_ns::NamespaceRef const HOST;
+    ok = commit(owner.get(), HOST, 0) == -ESRCH && unchanged() && ok;
+    subject->state.store(task::TaskState::EXITING, std::memory_order_release);
+    ok = commit(owner.get(), scope, 0) == -ESRCH && unchanged() && ok;
+    subject->state.store(task::TaskState::ACTIVE, std::memory_order_release);
+    subject->has_exited = true;
+    ok = commit(owner.get(), scope, 0) == -ESRCH && unchanged() && ok;
+    subject->has_exited = false;
+    subject->exit_in_progress.store(true, std::memory_order_release);
+    ok = commit(owner.get(), scope, 0) == -ESRCH && unchanged() && ok;
+    subject->exit_in_progress.store(false, std::memory_order_release);
+    subject->exit_notify_ready.store(true, std::memory_order_release);
+    ok = commit(owner.get(), scope, 0) == -ESRCH && unchanged() && ok;
+    subject->exit_notify_ready.store(false, std::memory_order_release);
+    subject->gc_queued.store(true, std::memory_order_release);
+    ok = commit(owner.get(), scope, 0) == -ESRCH && unchanged() && ok;
+    subject->gc_queued.store(false, std::memory_order_release);
+    subject->type = task::TaskType::DAEMON;
+    ok = commit(owner.get(), scope, 0) == -ESRCH && unchanged() && ok;
+    subject->type = task::TaskType::PROCESS;
+    scope.close();
+    ok = commit(owner.get(), scope, 0) == -EIDRM && unchanged() && ok;
+    ok = owner->wait_list.remove(subject.get()) && owner->wait_list.count == 0 && ok;
+    subject->sched_queue = task::Task::sched_queue::NONE;
+    subject.reset();
+    peer.reset();
+    owner.reset();
+    wrong.reset();
+    scope.reset();
+    other.reset();
+    return pid_ns::live_namespace_count() == BASELINE && ok;
+}
+
 namespace {
 using SchedulerRunQueueStorage = std::array<std::byte, sizeof(RunQueue)>;
 alignas(RunQueue) SchedulerRunQueueStorage scheduler_reschedule_selftest_first_storage{};   // NOLINT

@@ -35,6 +35,11 @@ auto set_hostname_for_subject(ker::mod::sched::task::Task* task, uint64_t name_a
 // Runtime mask mutation serializes with exec publication and refuses workers
 // still retiring from an older process image. Returns old mask or -errno.
 auto set_creation_mask(ker::mod::sched::task::Task& subject, uint32_t mask) -> int;
+// Borrow the executor. Private names use its exact retained PID scope and who0
+// selects its local TID; Host names retain physical selection. Raw nice reads
+// preserve the libc bias20 encoding. Neither operation forwards through WKI.
+auto set_priority_for_subject(ker::mod::sched::task::Task* subject, int which, int64_t who, int prio) -> uint64_t;
+auto get_priority_for_subject(ker::mod::sched::task::Task* subject, int which, int64_t who) -> uint64_t;
 // Borrow the actual executor. Namespace admission uses its retained canonical
 // process owners; fixed placement fields keep their existing executor ownership.
 auto set_wki_target_for_subject(ker::mod::sched::task::Task* subject, uint64_t hostname_addr, size_t len, uint32_t flags) -> uint64_t;

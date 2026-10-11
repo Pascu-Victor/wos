@@ -280,6 +280,175 @@ auto private_signal(Task& requester, int64_t id, int signum) -> int {
 }
 }  // namespace
 
+namespace {
+auto priority_read(Task* requester, int64_t id, int which = 0) -> int64_t {
+    return static_cast<int64_t>(ker::syscall::process::get_priority_for_subject(requester, which, id));
+}
+auto priority_write(Task* requester, int64_t id, int nice, int which = 0) -> int64_t {
+    return static_cast<int64_t>(ker::syscall::process::set_priority_for_subject(requester, which, id, nice));
+}
+void initialize_priority_fixture(Task& task, int8_t nice) {
+    task.heap_index = -1;
+    task.sched_weight = 1024;
+    task.slice_ns = 10'000'000;
+    task.sched_nice = nice;
+}
+}  // namespace
+
+KTEST(CompartmentPriority, LocalNamesExcludeSameUidPhysicalAliasesAndPreserveHostEncoding) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    auto const ACTIVE = sched::get_active_task_count();
+    auto const INDEXED = sched::get_scoped_pid_task_count();
+    {
+        pid_ns::NamespaceRef a, b;
+        KREQUIRE_EQ(pid_ns::create_namespace(a), 0);
+        KREQUIRE_EQ(pid_ns::create_namespace(b), 0);
+        RegistryTask caller, target, sibling, foreign, host;
+        KREQUIRE_TRUE(caller.task->initialize_pid_namespace(a));
+        KREQUIRE_TRUE(target.task->initialize_pid_namespace(a));
+        KREQUIRE_TRUE(sibling.task->initialize_pid_namespace(b));
+        KREQUIRE_TRUE(foreign.task->initialize_pid_namespace(b));
+        ker::mod::security::Snapshot user;
+        KREQUIRE_EQ(ker::mod::security::Snapshot::restore_fields({.user = {100, 100, 100}, .group = {100, 100, 100}}, user), 0);
+        int8_t nice = 1;
+        for (auto* fixture : {&caller, &target, &sibling, &foreign, &host}) {
+            KREQUIRE_EQ(resource::initialize_credentials(*fixture->task, user), 0);
+            initialize_priority_fixture(*fixture->task, nice++);
+            KREQUIRE_TRUE(fixture->publish());
+        }
+        KEXPECT_EQ(target.task->namespace_tid(), foreign.task->namespace_tid());
+        KEXPECT_EQ(priority_read(caller.task.get(), 0), int64_t{21});
+        KEXPECT_EQ(priority_read(caller.task.get(), 1), int64_t{21});
+        KEXPECT_EQ(priority_read(caller.task.get(), 2), int64_t{22});
+        KEXPECT_EQ(priority_read(sibling.task.get(), 2), int64_t{24});
+        for (auto* excluded : {host.task.get(), sibling.task.get(), foreign.task.get(), target.task.get()}) {
+            KEXPECT_TRUE(excluded->pid > uint64_t{2});
+            KEXPECT_EQ(priority_read(caller.task.get(), static_cast<int64_t>(excluded->pid)), int64_t{-ESRCH});
+            KEXPECT_EQ(priority_write(caller.task.get(), static_cast<int64_t>(excluded->pid), 19), int64_t{-ESRCH});
+        }
+        KEXPECT_EQ(priority_write(caller.task.get(), 2, 1), int64_t{-EACCES});
+        // Registry visibility alone is not proof of exclusive queue ownership.
+        // These inert native fixtures are never posted to a real runqueue.
+        KEXPECT_EQ(priority_write(caller.task.get(), 2, 19), int64_t{-EAGAIN});
+        KEXPECT_EQ(priority_read(caller.task.get(), 2), int64_t{22});
+        KEXPECT_EQ(priority_read(host.task.get(), static_cast<int64_t>(target.task->pid)), int64_t{22});
+        KEXPECT_EQ(priority_write(host.task.get(), 0, 99), int64_t{0});
+        KEXPECT_EQ(priority_read(host.task.get(), 0), int64_t{39});
+        KEXPECT_EQ(priority_write(host.task.get(), 0, -99), int64_t{-EACCES});
+        KEXPECT_EQ(priority_read(host.task.get(), 0), int64_t{39});
+        KEXPECT_EQ(sibling.task->sched_nice, int8_t{3});
+        KEXPECT_EQ(foreign.task->sched_nice, int8_t{4});
+        KEXPECT_EQ(target.task->sched_nice, int8_t{2});
+        for (auto* fixture : {&caller, &target, &sibling, &foreign, &host}) KEXPECT_EQ(fixture->task->ref_count.load(), uint32_t{1});
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+    KEXPECT_EQ(sched::get_active_task_count(), ACTIVE);
+    KEXPECT_EQ(sched::get_scoped_pid_task_count(), INDEXED);
+}
+
+KTEST(CompartmentPriority, ExecutingThreadNamesUseCanonicalScopeAndRejectOldImageWorkers) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    auto const ACTIVE = sched::get_active_task_count();
+    auto const INDEXED = sched::get_scoped_pid_task_count();
+    {
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        RegistryTask owner, worker, host;
+        KREQUIRE_TRUE(owner.task->initialize_pid_namespace(scope));
+        worker.task->is_thread = true;
+        worker.task->owner_pid = owner.task->pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(*worker.task, *owner.task));
+        initialize_priority_fixture(*owner.task, 3);
+        initialize_priority_fixture(*worker.task, 7);
+        initialize_priority_fixture(*host.task, 11);
+        for (auto* fixture : {&owner, &worker, &host}) KREQUIRE_TRUE(fixture->publish());
+        auto const REFERENCES = owner.task->ref_count.load();
+        worker.task->owner_pid = host.task->pid;  // A copied numeric field grants no scope.
+        KEXPECT_EQ(worker.task->namespace_tid(), uint64_t{2});
+        KEXPECT_EQ(priority_read(worker.task.get(), 0), int64_t{27});
+        KEXPECT_EQ(priority_read(worker.task.get(), 1), int64_t{23});
+        KEXPECT_EQ(priority_read(owner.task.get(), 2), int64_t{27});
+        KEXPECT_EQ(priority_read(worker.task.get(), static_cast<int64_t>(host.task->pid)), int64_t{-ESRCH});
+        KEXPECT_EQ(priority_write(worker.task.get(), static_cast<int64_t>(host.task->pid), 19), int64_t{-ESRCH});
+        owner.task->pagemap = reinterpret_cast<ker::mod::mm::paging::PageTable*>(0x1000);
+        KEXPECT_EQ(priority_read(worker.task.get(), 0), int64_t{-ESRCH});
+        KEXPECT_EQ(priority_write(worker.task.get(), 0, 19), int64_t{-ESRCH});
+        KEXPECT_EQ(priority_read(owner.task.get(), 2), int64_t{-ESRCH});
+        KEXPECT_EQ(priority_write(owner.task.get(), 2, 19), int64_t{-ESRCH});
+        owner.task->pagemap = nullptr;
+        worker.task->owner_pid = owner.task->pid;
+        KEXPECT_EQ(priority_read(worker.task.get(), 0), int64_t{27});
+        owner.task->exit_in_progress.store(true, std::memory_order_release);
+        KEXPECT_EQ(priority_read(worker.task.get(), 0), int64_t{-ESRCH});
+        KEXPECT_EQ(priority_write(worker.task.get(), 0, 19), int64_t{-ESRCH});
+        {
+            ker::syscall::vmem::SharedVmemPublicationGuard publication;
+            KEXPECT_EQ(sched::set_task_nice_in_namespace(worker.task.get(), scope, 19), -ESRCH);
+        }
+        owner.task->exit_in_progress.store(false, std::memory_order_release);
+        KEXPECT_EQ(worker.task->sched_nice, int8_t{7});
+        auto unbound = std::make_unique<Task>();
+        unbound->type = sched::task::TaskType::PROCESS;
+        unbound->is_thread = true;
+        unbound->owner_pid = owner.task->pid;
+        KEXPECT_EQ(priority_read(unbound.get(), 0), int64_t{-ESRCH});
+        KEXPECT_EQ(priority_write(unbound.get(), 0, 19), int64_t{-ESRCH});
+        KEXPECT_EQ(owner.task->ref_count.load(), REFERENCES);
+        KEXPECT_EQ(worker.task->ref_count.load(), uint32_t{1});
+        KEXPECT_EQ(host.task->sched_nice, int8_t{11});
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+    KEXPECT_EQ(sched::get_active_task_count(), ACTIVE);
+    KEXPECT_EQ(sched::get_scoped_pid_task_count(), INDEXED);
+}
+
+KTEST(CompartmentPriority, ClosureAuthorizationAndRemoteRefusalsLeaveTargetsUnchanged) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    auto const ACTIVE = sched::get_active_task_count();
+    auto const INDEXED = sched::get_scoped_pid_task_count();
+    {
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        RegistryTask caller, target;
+        KREQUIRE_TRUE(caller.task->initialize_pid_namespace(scope));
+        KREQUIRE_TRUE(target.task->initialize_pid_namespace(scope));
+        ker::mod::security::Snapshot user, other;
+        KREQUIRE_EQ(ker::mod::security::Snapshot::restore_fields({.user = {100, 100, 100}, .group = {100, 100, 100}}, user), 0);
+        KREQUIRE_EQ(ker::mod::security::Snapshot::restore_fields({.user = {200, 200, 200}, .group = {200, 200, 200}}, other), 0);
+        KREQUIRE_EQ(resource::initialize_credentials(*caller.task, user), 0);
+        KREQUIRE_EQ(resource::initialize_credentials(*target.task, other), 0);
+        initialize_priority_fixture(*caller.task, 0);
+        initialize_priority_fixture(*target.task, 2);
+        KREQUIRE_TRUE(caller.publish());
+        KREQUIRE_TRUE(target.publish());
+        KEXPECT_EQ(priority_write(caller.task.get(), 2, 19), int64_t{-EPERM});
+        KEXPECT_EQ(priority_read(caller.task.get(), -1), int64_t{-EINVAL});
+        KEXPECT_EQ(priority_write(caller.task.get(), -1, 19), int64_t{-EINVAL});
+        KEXPECT_EQ(priority_read(caller.task.get(), 0, 1), int64_t{-EINVAL});
+        KEXPECT_EQ(priority_write(caller.task.get(), 0, 19, 1), int64_t{-EINVAL});
+        KEXPECT_EQ(priority_read(nullptr, 0), int64_t{-ESRCH});
+        KEXPECT_EQ(priority_write(nullptr, 0, 19), int64_t{-ESRCH});
+        KEXPECT_EQ(priority_read(caller.task.get(), int64_t{pid_ns::MAX_LOCAL_ID} + 1), int64_t{-ESRCH});
+        target.task->publish_accepted_signal_route(0x7B7F001, 123);
+        KEXPECT_EQ(priority_read(caller.task.get(), 2), int64_t{-ENOTSUP});
+        KEXPECT_EQ(priority_write(caller.task.get(), 2, 19), int64_t{-ENOTSUP});
+        scope.close();
+        KEXPECT_EQ(priority_read(caller.task.get(), 0), int64_t{-EIDRM});
+        KEXPECT_EQ(priority_write(caller.task.get(), 2, 19), int64_t{-EIDRM});
+        KEXPECT_EQ(target.task->sched_nice, int8_t{2});
+        KEXPECT_EQ(caller.task->ref_count.load(), uint32_t{1});
+        KEXPECT_EQ(target.task->ref_count.load(), uint32_t{1});
+        KEXPECT_TRUE(scope.operations_drained());
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+    KEXPECT_EQ(sched::get_active_task_count(), ACTIVE);
+    KEXPECT_EQ(sched::get_scoped_pid_task_count(), INDEXED);
+}
+
+KTEST(CompartmentPriority, ActualQueueCommitPreservesClosureAndWeightAccounting) {
+    KEXPECT_TRUE(sched::scheduler_selftest_namespace_priority_commit());
+}
+
 KTEST(CompartmentSignal, PositiveLocalNamesExcludeSiblingHostAndPhysicalAliases) {
     auto const BASELINE = pid_ns::live_namespace_count();
     auto const ACTIVE = sched::get_active_task_count();

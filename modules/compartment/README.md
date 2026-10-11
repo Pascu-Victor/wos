@@ -56,8 +56,10 @@ refuses before scheduling its synthetic ELF. The actual guest probe, build helpe
 and service fragment are documented in
 [compartment_public_runtime.md](../../tests/fixtures/compartment_public_runtime.md).
 Both public-spec and CLI modes passed with private PID1/parent0, UID100,
-14checks/0failures and successful Host waits. This short sequential test leaves
-CPU-placement inheritance, hostile isolation, two-hour simultaneous service
+21checks/0failures and successful Host waits. Private priority lookup/update uses
+local IDs, preserves Host nice values and rejects guessed physical Host IDs.
+This short sequential test leaves CPU-placement and priority inheritance,
+hostile isolation, two-hour simultaneous service
 trees,1,000full lifecycles and complete Host/init/libc regression unqualified.
 Owned software qualification may use `bin/wos-cluster --no-setup` or isolated
 `bin/wos-ktest --no-setup`, with one topology, a 20GiB disposable storage budget,

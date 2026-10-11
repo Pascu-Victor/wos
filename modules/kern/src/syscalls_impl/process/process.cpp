@@ -1861,82 +1861,90 @@ auto wos_proc_kill(int64_t pid, int sig) -> uint64_t {
 }
 
 auto wos_proc_setpriority(int which, int64_t who, int prio) -> uint64_t {
-    if (which != WOS_PRIO_PROCESS) {
-        return static_cast<uint64_t>(-EINVAL);
-    }
-
-    auto* self = mod::sched::get_current_task();
-    if (self == nullptr) {
-        return static_cast<uint64_t>(-ESRCH);
-    }
-
-    if (who == 0) {
-        who = static_cast<int64_t>(self->pid);
-    }
-    if (who < 0) {
-        return static_cast<uint64_t>(-EINVAL);
-    }
-
-    auto* target = mod::sched::find_task_by_pid_safe(static_cast<uint64_t>(who));
-    if (target == nullptr) {
-        return static_cast<uint64_t>(-ESRCH);
-    }
-
-    int result = 0;
-    {
-        // Serialize policy and scheduler commit with every process nice/ID
-        // change. Trusted daemon priority setters cannot affect process tasks.
-        ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
-        auto const CALLER = self->credentials();
-        auto const TARGET = target->credentials();
-        int const NICE = ker::mod::security::clamp_priority(prio);
-        if (!is_live_signal_target(*target)) {
-            result = -ESRCH;
-        } else if (target->type != mod::sched::task::TaskType::PROCESS && !CALLER.allows(ker::mod::security::Authority::PRIORITY)) {
-            result = -EPERM;
-        } else {
-            result = ker::mod::security::authorize_priority(CALLER, TARGET, target->sched_nice, NICE);
-            if (result == 0) {
-                mod::sched::set_task_nice(target, NICE);
-            }
-        }
-    }
-    target->release();
-    return static_cast<uint64_t>(result);
+    return set_priority_for_subject(mod::sched::get_current_task(), which, who, prio);
 }
 
 auto wos_proc_getpriority(int which, int64_t who) -> uint64_t {
-    if (which != WOS_PRIO_PROCESS) {
-        return static_cast<uint64_t>(-EINVAL);
-    }
-
-    auto* self = mod::sched::get_current_task();
-    if (self == nullptr) {
-        return static_cast<uint64_t>(-ESRCH);
-    }
-
-    if (who == 0) {
-        who = static_cast<int64_t>(self->pid);
-    }
-    if (who < 0) {
-        return static_cast<uint64_t>(-EINVAL);
-    }
-
-    auto* target = mod::sched::find_task_by_pid_safe(static_cast<uint64_t>(who));
-    if (target == nullptr) {
-        return static_cast<uint64_t>(-ESRCH);
-    }
-
-    int encoded_nice = 0;
-    {
-        ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
-        encoded_nice = static_cast<int>(target->sched_nice) + WOS_PRIO_KERNEL_ENCODE_BIAS;
-    }
-    target->release();
-    return static_cast<uint64_t>(encoded_nice);
+    return get_priority_for_subject(mod::sched::get_current_task(), which, who);
 }
 
 }  // namespace
+
+namespace {
+struct PriorityTarget {
+    mod::sched::task::Task* task{};
+    ~PriorityTarget() {
+        if (task != nullptr) task->release();
+    }
+};
+
+auto private_priority_subject_current(const mod::sched::task::Task& subject, const mod::sched::pid_ns::NamespaceRef& scope) -> bool {
+    auto const* owner = subject.credential_owner();
+    auto const* actual_scope = subject.pid_namespace();
+    return subject.type == mod::sched::task::TaskType::PROCESS && is_live_signal_target(subject) &&
+           !subject.exit_in_progress.load(std::memory_order_acquire) && !subject.exit_notify_ready.load(std::memory_order_acquire) &&
+           !subject.gc_queued.load(std::memory_order_acquire) && owner != nullptr && owner->type == mod::sched::task::TaskType::PROCESS &&
+           is_live_signal_target(*owner) && !owner->exit_in_progress.load(std::memory_order_acquire) &&
+           !owner->exit_notify_ready.load(std::memory_order_acquire) && !owner->gc_queued.load(std::memory_order_acquire) &&
+           actual_scope != nullptr && *actual_scope == scope && subject.namespace_tid() != 0 &&
+           (!subject.is_thread || subject.pagemap == owner->pagemap);
+}
+
+// Acquire the sleeping VM guard before retaining a selected target. Private
+// selection never interprets a failed local name as a physical PID. The scope
+// is immutable and owned by the borrowed executor's retained process owner.
+auto priority_for_subject(mod::sched::task::Task* self, int which, int64_t who, int prio, bool set) -> uint64_t {
+    using namespace ker::mod;
+    if (which != WOS_PRIO_PROCESS) return static_cast<uint64_t>(-EINVAL);
+    if (self == nullptr) return static_cast<uint64_t>(-ESRCH);
+    if (who < 0) return static_cast<uint64_t>(-EINVAL);
+    ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+    auto const* scope = self->pid_namespace();
+    if (scope == nullptr) return static_cast<uint64_t>(-ESRCH);
+    bool const PRIVATE = !scope->is_host();
+    if (scope->closed()) return static_cast<uint64_t>(-EIDRM);
+    if (PRIVATE && !private_priority_subject_current(*self, *scope)) return static_cast<uint64_t>(-ESRCH);
+    uint64_t const ID = who == 0 ? self->namespace_tid() : static_cast<uint64_t>(who);
+    PriorityTarget target{sched::find_task_by_pid_namespace_safe(*scope, ID)};
+    if (target.task == nullptr) return static_cast<uint64_t>(scope->closed() ? -EIDRM : -ESRCH);
+    if (PRIVATE) {
+        if (!private_priority_subject_current(*target.task, *scope)) return static_cast<uint64_t>(-ESRCH);
+        if (target.task->signal_admission_identity().remote) return static_cast<uint64_t>(-ENOTSUP);
+    }
+    if (!set) {
+        // No scheduler lock is acquired by this bounded read. All process
+        // priority writers retain VM publication through their weight commit.
+        sched::pid_ns::PublicationGuard const ADMISSION(*scope);
+        if (!ADMISSION.open()) return static_cast<uint64_t>(-EIDRM);
+        if (PRIVATE && (!private_priority_subject_current(*self, *scope) || !private_priority_subject_current(*target.task, *scope)))
+            return static_cast<uint64_t>(-ESRCH);
+        return static_cast<uint64_t>(static_cast<int>(target.task->sched_nice) + WOS_PRIO_KERNEL_ENCODE_BIAS);
+    }
+    auto const CALLER = self->credentials();
+    auto const TARGET = target.task->credentials();
+    int const NICE = security::clamp_priority(prio);
+    if (!is_live_signal_target(*target.task)) return static_cast<uint64_t>(-ESRCH);
+    if (target.task->type != sched::task::TaskType::PROCESS && !CALLER.allows(security::Authority::PRIORITY))
+        return static_cast<uint64_t>(-EPERM);
+    int const AUTHORIZATION = security::authorize_priority(CALLER, TARGET, target.task->sched_nice, NICE);
+    if (AUTHORIZATION != 0) return static_cast<uint64_t>(AUTHORIZATION);
+    if (PRIVATE) {
+        // The scheduler checks closure while its verified owner runqueue is
+        // locked. Never acquire a runqueue beneath a namespace spinlock.
+        return static_cast<uint64_t>(sched::set_task_nice_in_namespace(target.task, *scope, NICE));
+    }
+    sched::set_task_nice(target.task, NICE);
+    return 0;
+}
+}  // namespace
+
+auto set_priority_for_subject(mod::sched::task::Task* subject, int which, int64_t who, int prio) -> uint64_t {
+    return priority_for_subject(subject, which, who, prio, true);
+}
+
+auto get_priority_for_subject(mod::sched::task::Task* subject, int which, int64_t who) -> uint64_t {
+    return priority_for_subject(subject, which, who, 0, false);
+}
 
 auto set_hostname_for_subject(ker::mod::sched::task::Task* task, uint64_t name_addr, size_t len) -> uint64_t {
     if (task == nullptr) {

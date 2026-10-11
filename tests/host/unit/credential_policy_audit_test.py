@@ -149,6 +149,12 @@ def body_after(source, marker):
     raise AssertionError(f"unterminated {marker}")
 
 
+def lookup_request_validator(core):
+    delegate = body_after(core, "auto lookup_request_context_matches(")
+    assert "return lookup_authorization_context_matches(handle.authorization(), task, credentials);" in " ".join(delegate.split())
+    return body_after(core, "auto lookup_authorization_context_matches(")
+
+
 def test_control_authorization_precedes_side_effects():
     process = (ROOT / "modules/kern/src/syscalls_impl/process/process.cpp").read_text()
     kill = body_after(process, "auto wos_proc_kill(")
@@ -170,7 +176,10 @@ def test_control_authorization_precedes_side_effects():
     assert "target.type != sched::task::TaskType::PROCESS" in deliver
     assert "sched::session::same_session(caller_job, JOB)" in deliver
     assert "signal_as(*target, CALLER, CALLER_JOB, sig)" in kill
-    assert "wki_group_signal_as(CALLER, CALLER_JOB, PGRP, pid >= -1, sig)" in kill
+    assert "wki_group_signal_as(CALLER, CALLER_JOB, PGRP, pid >= -1 || INIT_LOCAL_GROUP, sig)" in kill
+    assert "sched::task::process_pid(*self) == 1 && CALLER_JOB.group_origin.local()" in " ".join(kill.split())
+    assert "self->wki_target_flags & sched::task::Task::WKI_TARGET_FLAG_LOCAL" in kill
+    assert kill.index("signal_in_namespace(*self, pid, sig)") < kill.index("self->credentials()") < kill.index("INIT_LOCAL_GROUP")
     assert "get_active_task_at_safe" not in kill
     group = body_after(process, "auto signal_group_local_as(")
     assert group.index("cohort.capture(") < group.index("cohort.take()") < group.index("signal_local_as(")
@@ -181,16 +190,67 @@ def test_control_authorization_precedes_side_effects():
     assert "sched::signal_process_group(" not in kill + group
     assert "RESULT != 0 && RESULT != -ESRCH && (error == -ESRCH || RESULT == -EPERM)" in group
     assert "accepted != 0 ? 0 : error" in group
-    priority = body_after(process, "auto wos_proc_setpriority(")
+    set_wrapper = body_after(process, "auto wos_proc_setpriority(")
+    assert "return set_priority_for_subject(mod::sched::get_current_task(), which, who, prio)" in set_wrapper
+    get_wrapper = body_after(process, "auto wos_proc_getpriority(")
+    assert "return get_priority_for_subject(mod::sched::get_current_task(), which, who)" in get_wrapper
+    assert "return priority_for_subject(subject, which, who, prio, true)" in body_after(process, "auto set_priority_for_subject(")
+    assert "return priority_for_subject(subject, which, who, 0, false)" in body_after(process, "auto get_priority_for_subject(")
+    priority = body_after(process, "auto priority_for_subject(")
     guard = priority.index("SharedVmemPublicationGuard publication_guard")
     check = priority.index("security::authorize_priority(")
-    commit = priority.index("mod::sched::set_task_nice(")
+    commit = priority.index("sched::set_task_nice(")
+    private_commit = priority.index("sched::set_task_nice_in_namespace(")
     assert guard < priority.index("self->credentials()") < check < commit
-    assert guard < priority.index("target->credentials()") < check
-    assert check < priority.index("if (result == 0)") < commit
-    assert "target->pid != self->pid" not in priority
-    getpriority = body_after(process, "auto wos_proc_getpriority(")
-    assert getpriority.index("SharedVmemPublicationGuard publication_guard") < getpriority.index("target->sched_nice")
+    assert guard < priority.index("target.task->credentials()") < check
+    assert check < priority.index("if (AUTHORIZATION != 0) return") < private_commit < commit
+    assert "target->pid != self->pid" not in priority and "target.task->pid != self->pid" not in priority
+    assert guard < priority.index("find_task_by_pid_namespace_safe(*scope, ID)")
+    assert "ID = who == 0 ? self->namespace_tid() : static_cast<uint64_t>(who)" in priority
+    assert "find_task_by_pid_safe" not in priority and "wki_proxy_task_find" not in priority
+    assert priority.index("if (scope->closed())") < priority.index("find_task_by_pid_namespace_safe(")
+    assert priority.index("private_priority_subject_current(*self, *scope)") < priority.index("find_task_by_pid_namespace_safe(")
+    assert priority.index("private_priority_subject_current(*target.task, *scope)") < check
+    assert priority.index("target.task->signal_admission_identity().remote") < check
+    assert "return static_cast<uint64_t>(-ENOTSUP)" in priority
+    current = body_after(process, "auto private_priority_subject_current(")
+    for token in ("subject.credential_owner()", "subject.exit_in_progress", "owner->exit_in_progress",
+                  "*actual_scope == scope", "subject.namespace_tid() != 0", "subject.pagemap == owner->pagemap"):
+        assert token in current
+    retained = body_after(process, "struct PriorityTarget")
+    assert "if (task != nullptr) task->release()" in retained
+    getpriority = body_after(priority, "if (!set)")
+    assert guard < priority.index("target.task->sched_nice")
+    assert getpriority.index("PublicationGuard const ADMISSION(*scope)") < getpriority.index("if (!ADMISSION.open())") < getpriority.index("target.task->sched_nice")
+    assert "WOS_PRIO_KERNEL_ENCODE_BIAS = 20" in process
+
+    scheduler = (ROOT / "modules/kern/src/platform/sched/scheduler.cpp").read_text()
+    scoped = body_after(scheduler, "auto set_task_nice_in_namespace(")
+    assert scoped.index("owner_cpu_for_task(subject)") < scoped.index("with_lock_void(OWNER") < scoped.index("commit_task_nice_in_namespace_locked(")
+    assert "set_task_nice(" not in scoped and "subject->cpu" not in scoped and "subject->sched_nice =" not in scoped
+    actual_commit = body_after(scheduler, "auto commit_task_nice_in_namespace_locked(")
+    assert actual_commit.index("runqueue_owns_task_locked(rq, subject)") < actual_commit.index("PublicationGuard const ADMISSION(scope)") < actual_commit.index("if (!ADMISSION.open())")
+    tokens = ("if (!ADMISSION.open())", "remove_from_sums(rq, subject)", "subject->sched_nice =",
+              "subject->sched_weight =", "subject->vdeadline =", "add_to_sums(rq, subject)", "rq->runnable_heap.update(subject)")
+    positions = [actual_commit.index(token) for token in tokens]
+    assert positions == sorted(positions)
+
+    for path in ("modules/kern/src/abi/callnums/process.h", "toolchain/src/mlibc/sysdeps/wos/include/callnums/process.h"):
+        header = (ROOT / path).read_text()
+        operations = re.sub(r"//[^\n]*|/\*.*?\*/", "", body_after(header, "enum class procmgmt_ops"), flags=re.S)[1:-1]
+        values = {}
+        value = -1
+        for operation in operations.split(","):
+            name, separator, explicit = operation.strip().partition("=")
+            if not name:
+                continue
+            value = int(explicit.strip(), 0) if separator else value + 1
+            values[name.strip()] = value
+        assert values["SETPRIORITY"] == 27 and values["GETPRIORITY"] == 42
+    libc = (ROOT / "toolchain/src/mlibc/sysdeps/wos/generic/sysdeps.cpp").read_text()
+    assert "ker::process::setpriority(which, who, prio)" in body_after(libc, "int Sysdeps<SetPriority>::operator()")
+    libc_get = body_after(libc, "int Sysdeps<GetPriority>::operator()")
+    assert libc_get.index("ker::process::getpriority(which, who)") < libc_get.index("*value = static_cast<int>(r) - 20")
     dispatch = body_after(process, "case abi::process::procmgmt_ops::SETHOSTNAME:")
     assert "set_hostname_for_subject(ker::mod::sched::get_current_task(), a2, static_cast<size_t>(a3))" in dispatch
     hostname = body_after(process, "auto set_hostname_for_subject(")
@@ -970,11 +1030,15 @@ def test_private_procfs_pins_identity_and_revalidates_cache_links_and_enumeratio
     assert "target->release()" in body_after(proc, "ProcFileData::~ProcFileData()")
     assert "pfd->target = retain_target(pid)" in body_after(proc, "auto procfs_lookup_path_as(")
     parser = body_after(proc, "auto procfs_lookup_path_as(")
-    assert "pid == caller_pid && pid == owner->pid" in parser
+    assert "SELF_PID = PRIVATE_VIEW ? ker::mod::sched::task::namespace_process_pid(*caller_task) : caller_pid" in parser
+    assert "pid == SELF_PID && (PRIVATE_VIEW || owner->pid == caller_pid) && task_in_pid_view(*owner, *view)" in parser
     assert "owner->try_acquire() ? owner : nullptr" in parser
     assert "auto* group_target = retain_target(static_cast<uint64_t>(PID))" in parser
     assert "task_group_pid_for(" not in parser
-    assert "return ker::mod::sched::find_task_by_pid_safe(pid)" in parser
+    assert "ker::mod::sched::find_task_by_pid_namespace_safe(*view, pid)" in parser
+    assert "find_task_by_pid_safe(" not in parser
+    assert parser.index("view->closed()") < parser.index("auto retain_target =")
+    assert parser.index("view->retain(pfd->pid_view)") < parser.index("pfd->target = retain_target(pid)")
     policy = body_after(proc, "auto authorize_private_procfs(")
     assert "credential_observation()" in policy and "may_access_process_private(" in policy
     private = body_after(proc, "auto procfs_read_private(")
@@ -999,10 +1063,13 @@ def test_private_procfs_pins_identity_and_revalidates_cache_links_and_enumeratio
     assert entries.index("authorize_private_procfs(") < entries.index("if (count < 2)")
     assert entries.index("revalidate_private_procfs(") < entries.index("*buf = staged")
     outer = body_after(proc, "auto procfs_readdir(")
-    assert outer.index("procfs_readdir_private(") < outer.index("if (count == 0)")
+    assert outer.index("procfs_view_policy(data)") < outer.index("procfs_readdir_in_view(f, &candidate, count)")
+    assert outer.index("procfs_readdir_in_view(f, &candidate, count)") < outer.index("int const VALID = procfs_view_policy(data)") < outer.index("*buf = candidate")
+    enumerate_view = body_after(proc, "auto procfs_readdir_in_view(")
+    assert enumerate_view.index("procfs_readdir_private(") < enumerate_view.index("if (count == 0)")
     listing = body_after(core, "auto vfs_read_dir_entries(")
-    assert "f->fs_type == FSType::PROCFS || std::cmp_equal(f->dir_fs_count, -1)" in listing
-    assert listing.index("f->fs_type == FSType::PROCFS && RET != -ENOENT") < listing.index("f->dir_fs_count = ACTUAL_INDEX")
+    assert "f->fs_type == FSType::PROCFS || f->dir_fs_count == static_cast<size_t>(-1)" in listing
+    assert listing.index("(f->fs_type == FSType::PROCFS || f->fs_type == FSType::REMOTE) && RET != -ENOENT") < listing.index("f->dir_fs_count = ACTUAL_INDEX")
     seek = body_after(proc, "auto procfs_lseek_with_credentials(")
     assert seek.index("authorize_private_procfs(") < seek.index("pfd->content_len") < seek.index("f->pos = new_pos")
     for name in ("vfs_file_set_path", "vfs_file_clear_path"):
@@ -1109,7 +1176,9 @@ def test_public_procfs_uses_pinned_memory_and_bounded_names_before_cache_publica
         body = body_after(proc, f"auto {name}(")
         assert "collect_proc_memory(*task)" in body and "task->pagemap" not in body
         if name in ("generate_status", "generate_stat"):
-            assert "copy_proc_public_comm(*task)" in body and "task->name" not in body and "task->exe_path" not in body
+            assert "copy_proc_public_comm(*task)" in body
+            assert re.search(r"\btask\s*->\s*name\b", body) is None
+            assert re.search(r"\btask\s*->\s*exe_path\b", body) is None
     for name in ("collect_memacc_process_totals", "generate_memacc_procs"):
         body = body_after(proc, f"auto {name}(")
         assert body.index("SharedVmemPublicationGuard") < body.index("ProcPagemapPin pin(*task)") < body.index("task_memacc_layout_locked(*task)")
@@ -1139,7 +1208,14 @@ def test_wki_procfs_identity_copies_pin_tasks_and_release_locks_before_formattin
         body = body_after(proc, f"auto {name}(")
         capture = "wki_proxy_task_remote_info(" if name.endswith("runner") else "wki_execution_identity()"
         assert "find_task_by_pid_safe(" not in body and "task->release()" not in body
-        assert body.index("TaskState::ACTIVE") < body.index(capture) < body.index("procfs_local_wki_hostname()")
+        if name == "generate_wki_launcher":
+            local = body_after(body, "if (local_view)")
+            assert "procfs_local_wki_hostname()" in local and "return format_procfs_hostname(LOCAL.data(), buf, bufsz)" in local
+            assert "wki_execution_identity" not in local and "wki_proxy_task_remote_info" not in local
+            assert body.index("TaskState::ACTIVE") < body.index("if (local_view)") < body.index(capture)
+            assert body.index(capture) < body.rindex("procfs_local_wki_hostname()") < body.rindex("return format_procfs_hostname(")
+        else:
+            assert body.index("TaskState::ACTIVE") < body.index(capture) < body.index("procfs_local_wki_hostname()")
         assert "wki_peer_get_hostname(" not in body
     task = (ROOT / "modules/kern/src/platform/sched/task.cpp").read_text()
     for marker, mutation in (("auto Task::wki_execution_identity(", ".submitter_hostname = wki_submitter_hostname"),
@@ -1244,11 +1320,18 @@ def test_mount_admission_precedes_side_effects():
     core = (ROOT / "modules/kern/src/vfs/core.cpp").read_text()
     boundaries = {
         "auto vfs_mount(": ["const char* effective_fstype", "wki_peer_find_by_hostname(", "vfs_acquire_lookup(", "prepare_mount_filesystem("],
-        "auto vfs_umount(": ["resolve_task_path_raw(", "stream_invalidate_mount_scope(", "unmount_filesystem_if_dev_id("],
+        "auto vfs_umount(": ["resolve_dirfd_task_path_raw(", "stream_invalidate_mount_scope(", "unmount_filesystem_if_dev_id("],
         "auto vfs_pivot_root(": ["snapshot_bounded_path_string(", "wki_remote_vfs_prepare_export_rebuild(", "remap_mounts_for_pivot("],
     }
+    delegates = {
+        "auto vfs_mount(": "return vfs_mount_for_task(task, source, target, fstype, flags, data);",
+        "auto vfs_umount(": "return vfs_umount_for_task(task, target);",
+        "auto vfs_pivot_root(": "return vfs_pivot_root_for_task(task, new_root, put_old);",
+    }
     for name, effects in boundaries.items():
-        body = body_after(core, name)
+        wrapper = body_after(core, name)
+        assert delegates[name] in wrapper
+        body = body_after(core, name[:-1] + "_for_task(")
         assert body.count("->credentials()") == 1
         decision = body.index("authorize_mount_administration(CREDENTIALS)")
         denied = body.index("if (POLICY != 0) return POLICY")
@@ -1259,7 +1342,9 @@ def test_mount_admission_precedes_side_effects():
 
 def test_mount_target_uses_admission_snapshot_before_preparation():
     core = (ROOT / "modules/kern/src/vfs/core.cpp").read_text()
-    mount = body_after(core, "auto vfs_mount(")
+    wrapper = body_after(core, "auto vfs_mount(")
+    assert "return vfs_mount_for_task(task, source, target, fstype, flags, data);" in wrapper
+    mount = body_after(core, "auto vfs_mount_for_task(")
     assert "vfs_mkdir(" not in mount
     assert mount.count("vfs_acquire_lookup(") == 2
     assert "&lookup, 3, false, &CREDENTIALS" in mount
@@ -1451,7 +1536,7 @@ def test_explicit_regular_read_keeps_request_authority_separate_from_process_cre
     assert reader.index("authorize_file_access(admitted") < reader.index("fat32::fat32_open_path(admitted")
     ordinary = body_after(source, "auto vfs_consume_lookup(")
     assert "consume_lookup_locked(handle, namespace_mutation, consumer, context)" in ordinary
-    validator = body_after(source, "auto lookup_request_context_matches(")
+    validator = lookup_request_validator(source)
     for token in ["task->pid != authorization.task_id", "authorization.root_hash", "authorization.cwd_hash",
                   "credentials == authorization.credentials"]:
         assert token in validator
@@ -1507,22 +1592,67 @@ def test_remote_explicit_read_carries_admitted_policy_and_never_downgrades():
     assert "reject_request(-ENOTSUP)" in legacy
     assert "vfs_open_file_resolved_beneath(" not in opening
     assert opening.index("HAS_PREFETCH && ker::mod::security::authorize_file_description_access") < opening.index("vfs_open_file_resolved_beneath_as(")
-    for op in ["READ", "WRITE", "READDIR", "READDIR_BATCH", "READ_RDMA", "WRITE_RDMA", "READ_BULK"]:
+    read_admission = body_after(remote, "auto retain_server_file(")
+    assert read_admission.index("s_vfs_lock.lock()") < read_admission.index("find_remote_fd(identity, fd)") < read_admission.index("row != nullptr && row->file != nullptr")
+    assert "use == ServerFileUse::READ || use == ServerFileUse::DIRECTORY" in read_admission
+    assert read_admission.index("authorize_file_description_access") < read_admission.index("if (result == 0)") < read_admission.index("vfs_retain_file(file)") < read_admission.index("touch_remote_fd(row)")
+    assert read_admission.index("touch_remote_fd(row)") < read_admission.index("output = file") < read_admission.index("s_vfs_lock.unlock()")
+    read_consumers = {
+        "READ": ("ServerFileUse::READ", "read_local_file_windowed("),
+        "READDIR": ("ServerFileUse::DIRECTORY", "local_file->fops->vfs_readdir("),
+        "READDIR_BATCH": ("ServerFileUse::DIRECTORY", "fill_legacy_directory_batch("),
+    }
+    for op in ["READ", "WRITE", "READDIR", "READDIR_BATCH"]:
         body = body_after(owner, f"case OP_VFS_{op}:")
-        if op in ("WRITE", "WRITE_RDMA"):
+        if op == "WRITE":
             assert body.index("retain_server_write_file(") < body.index("vfs_pwrite_file(") < body.index("vfs_put_file(local_file)")
             assert "local_file->fops->vfs_write" not in body
         else:
-            assert body.index("authorize_file_description_access") < body.index("touch_remote_fd(rfd)")
+            use, effect = read_consumers[op]
+            assert f"retain_server_file(channel_identity, fd_id, {use}, local_file" in body
+            assert body.index("retain_server_file(") < body.index("if (ADMISSION != 0)") < body.index(effect) < body.index("vfs_put_file(local_file)")
     write_admission = body_after(remote, "auto retain_server_write_file(")
     assert write_admission.index("find_remote_fd(identity, fd)") < write_admission.index("authorize_file_description_access")
     assert write_admission.index("authorize_file_description_access") < write_admission.index("offset < 0") < write_admission.index("file_mount_read_only(*file)")
     assert write_admission.index("file_mount_read_only(*file)") < write_admission.index("vfs_retain_file(file)") < write_admission.index("touch_remote_fd(row)")
     assert write_admission.index("out = file") < write_admission.index("s_vfs_lock.unlock()")
-    rdma_write = body_after(owner, "case OP_VFS_WRITE_RDMA:")
-    assert "send_rdma_write_err(static_cast<int16_t>(ADMIT))" in rdma_write and "reject_request(" not in rdma_write
-    error = body_after(rdma_write, "auto send_rdma_write_err =")
-    assert error.index("wki_roce_region_finish_tagged_write") < error.index("wki_dev_server_complete_vfs_write") < error.index("send_simple_resp")
+    # Raw staging/cookie requests were retired. They must reject before creating
+    # any loan/File ownership or touching native I/O; a secure binding cannot
+    # grant them authority. This is stronger than authorizing legacy callbacks.
+    retired_start = owner.index("case OP_VFS_READ_RDMA:")
+    retired = owner[retired_start:owner.index("default: {", retired_start)]
+    for op in ("READ_RDMA", "READ_BULK", "WRITE_RDMA"):
+        assert retired.index(f"case OP_VFS_{op}:") < retired.index("reject_request(-ENOTSUP)") < retired.index("break;")
+    for forbidden in ("retain_server_file", "retain_server_write_file", "vfs_read", "vfs_write", "vfs_pread", "vfs_pwrite",
+                      "touch_remote_fd", "wki_roce_", "secure_vfs_", "vfs_retain_file"):
+        assert forbidden not in retired
+
+    secure = body_after(owner, "case OP_VFS_SECURE_IO:")
+    assert secure.index("grant_binding == nullptr") < secure.index("wki_vfs_secure_intent_valid(intent)") < secure.index("secure_vfs_file_locked(")
+    for token in ("intent.binding_id != grant_binding->vfs_open_binding_id",
+                  "intent.owner_boot_epoch != grant_binding->resource_incarnation.owner_boot_epoch",
+                  "intent.resource_incarnation != grant_binding->resource_incarnation.resource_incarnation",
+                  "intent.resource_id != grant_binding->resource_id"):
+        assert secure.index(token) < secure.index("secure_vfs_file_locked(")
+    assert secure.index("s_vfs_lock.lock()") < secure.index("secure_vfs_file_locked(") < secure.index("vfs_retain_file(file)") < secure.index("s_vfs_lock.unlock()")
+    assert secure.index("s_vfs_lock.unlock()") < secure.index("if (admit != 0)") < secure.index("vfs_pwrite_file(") < secure.rindex("vfs_put_file(file)") < secure.index("send_buffered_resp(")
+    assert secure.index("if (admit != 0)") < secure.index("vfs_pread_file(")
+    secure_file = body_after(remote, "auto secure_vfs_file_locked(")
+    assert secure_file.index("grant_binding_matches(*context.binding, context.identity)") < secure_file.index("find_remote_fd(context.identity, intent.fd)")
+    for token in ("row->ordinary_open_token != intent.open_token", "row->ordinary_open_binding_id != intent.binding_id",
+                  "file->is_directory", "file->exec_read_view != nullptr"):
+        assert secure_file.index(token) < secure_file.index("authorize_file_description_access")
+    assert secure_file.index("authorize_file_description_access") < secure_file.index("if (ACCESS != 0) return ACCESS") < secure_file.index("file_mount_read_only(*file)") < secure_file.index("output = file")
+    arm = body_after(remote, "auto secure_vfs_arm(")
+    assert arm.index("secure_vfs_intent_matches(*context, request, intent)") < arm.index("wki_dev_server_retain_vfs_secure_binding(") < arm.index("secure_vfs_file_locked(")
+    assert arm.index("secure_vfs_file_locked(") < arm.index("vfs_retain_file(file)") < arm.index("s_vfs_lock.unlock()") < arm.index("context->file = file")
+    effect = body_after(remote, "auto secure_vfs_effect(")
+    assert effect.index("secure_vfs_request_matches(context->request, request)") < effect.index("secure_vfs_file_locked(") < effect.index("file == context->file")
+    assert effect.index("context->loan_lock.unlock_irqrestore(FLAGS)", effect.index("bool const ADMITTED")) < effect.index("if (!ADMITTED)") < effect.index("vfs_pwrite_file(")
+    assert effect.index("if (!ADMITTED)") < effect.index("vfs_pread_file(")
+    release = body_after(remote, "void secure_vfs_release(")
+    assert release.index("secure_vfs_request_matches(context->request, request)") < release.index("std::exchange(context->file, nullptr)") < release.index("std::exchange(context->binding, nullptr)")
+    assert release.index("context->armed = false") < release.rindex("loan_lock.unlock_irqrestore(FLAGS)") < release.index("vfs_put_file(file)") < release.index("wki_dev_server_release_vfs_secure_binding(binding)")
     client = body_after(remote, "auto wki_remote_vfs_open_path(")
     assert client.index("WKI_CAP_VFS_READ_IDENTITY") < client.index("acquire_vfs_proxy_lane")
     assert "regular_only ? OP_VFS_OPEN_READ_AS : OP_VFS_OPEN_AS" in client
@@ -1651,31 +1781,48 @@ def test_explicit_owner_stat_stages_metadata_under_one_snapshot():
     assert "PHYSICAL_OWNER_PATH = already_resolved && admitted_credentials != nullptr" in acquire
     assert "if (!already_resolved || PHYSICAL_OWNER_PATH)" in acquire
     assert "&REQUEST_CREDENTIALS, false, PHYSICAL_OWNER_PATH" in acquire
-    assert "if (PHYSICAL_OWNER_PATH && WALK == RESOLVE_FAST_PATH_DECLINED) return -ENOTSUP" in acquire
+    assert "if ((REMOTE_SCOPE == -ENOTSUP || PHYSICAL_OWNER_PATH) && WALK == RESOLVE_FAST_PATH_DECLINED) return -ENOTSUP" in acquire
     walker = body_after(source, "auto acquire_local_component_lookup(")
     assert walker.index("authorization.root_hash =") < walker.index("if (physical_path) {")
-    assert "LocalWalkEpoch EPOCH{NAMESPACE, MOUNTS, serialized, physical_path, ker::mod::sched::task::process_pid(*task), task, confined_mount, &references.membership}" in " ".join(walker.split())
+    assert "LocalWalkEpoch EPOCH{NAMESPACE, MOUNTS, serialized, physical_path, ker::mod::sched::task::process_pid(*task), task, confined_mount, &references.membership, scope}" in " ".join(walker.split())
     assert "local_walk_search(current, authorization.credentials)" in walker
     bind = body_after(source, "auto local_walk_bind(")
     assert "epoch.physical_path ? -EPERM : RESOLVE_FAST_PATH_DECLINED" in bind
     assert bind.index("epoch.physical_path && mount->fs_type == FSType::PROCFS") < bind.index("local_walk_read_stat(")
     prefix = body_after(bind, "if (mount == nullptr)")
-    assert "if (!epoch.physical_path) return -ENOENT" in prefix
+    assert "if (PRIVATE || !epoch.physical_path) return -ENOENT" in prefix
     assert prefix.index("if (!epoch.current())") < prefix.index("if (!find_first_mount_child(path))") < prefix.index("fill_synthetic_mount_dir_stat(")
 
 
 def test_remote_fstat_uses_retained_descriptor_and_staged_output():
     source = (ROOT / "modules/kern/src/net/wki/remote_vfs.cpp").read_text()
-    client = body_after(source, "auto wki_remote_vfs_fstat(")
+    wrapper = body_after(source, "auto wki_remote_vfs_fstat(")
+    assert wrapper.index("MutexGuard io_guard(context->io_lock)") < wrapper.index("return remote_vfs_fstat_locked(file, statbuf)")
+    client = body_after(source, "auto remote_vfs_fstat_locked(")
     assert client.index("WKI_CAP_VFS_FD_METADATA") < client.index("flush_write_behind(ctx)") < client.index("OP_VFS_FSTAT")
-    assert client.index("response_length != sizeof(candidate)") < client.index("*statbuf = candidate")
+    legacy_client = client[client.index("uint16_t response_length = 0"):]
+    assert legacy_client.index("response_length != sizeof(candidate)") < legacy_client.index("*statbuf = candidate")
+    observation = body_after(client, "if (FEATURES == 0 &&")
+    assert observation.index("query_remote_owner_observation(") < observation.index("if (STATUS != 0) return STATUS") < observation.index("std::memcpy(&candidate,") < observation.index("*statbuf = candidate")
+    assert "candidate.st_dev = file->mount_dev_id" in observation
+    query = body_after(source, "auto query_remote_owner_observation(")
+    assert query.index("if (length < sizeof(VfsOwnerObserveResponse)) return -EPROTO") < query.index("std::memcpy(&candidate,") < query.index("wki_vfs_owner_observe_response_valid(candidate, REQUEST, length)") < query.index("output = candidate")
+    wire = (ROOT / "modules/kern/src/net/wki/wire.hpp").read_text()
+    framing = body_after(wire, "constexpr auto wki_vfs_owner_observe_response_valid(")
+    for token in ("response.query_id != request.owner.query_id", "response.operation != request.operation",
+                  "length != sizeof(response) + response.body_length", "response.count != 0",
+                  "response.body_length == WKI_VFS_OWNER_STAT_BYTES"):
+        assert token in framing
     assert "candidate.st_dev = file->mount_dev_id" in client
     for forbidden in ("vfs_path", "find_mount_point", "remote_vfs_stat_on_proxy", "remote_vfs_try_copy_cached_stat", "f->pos", "file->pos", "credentials"):
-        assert forbidden not in client
+        assert forbidden not in client + wrapper
     owner = body_after(source, "case OP_VFS_FSTAT: {")
-    assert owner.index("WKI_CAP_VFS_FD_METADATA") < owner.index("data_len != sizeof(int32_t)") < owner.index("find_remote_fd(channel_identity, fd_id)")
-    assert owner.index("if (rfd == nullptr || rfd->file == nullptr)") < owner.index("touch_remote_fd(rfd)")
-    assert owner.index("auto* local_file = rfd->file") < owner.rindex("s_vfs_lock.unlock()") < owner.index("vfs_fstat_file(local_file, &stat)")
+    assert owner.index("WKI_CAP_VFS_FD_METADATA") < owner.index("data_len != sizeof(int32_t)") < owner.index("retain_server_file(channel_identity, fd_id, ServerFileUse::METADATA, local_file)")
+    assert owner.index("retain_server_file(") < owner.index("if (ADMISSION != 0)") < owner.index("vfs_fstat_file(local_file, &stat)") < owner.index("vfs_put_file(local_file)")
+    retained = body_after(source, "auto retain_server_file(")
+    assert retained.index("find_remote_fd(identity, fd)") < retained.index("row != nullptr && row->file != nullptr") < retained.index("auto* file = row->file") < retained.index("vfs_retain_file(file)") < retained.index("touch_remote_fd(row)")
+    assert retained.index("touch_remote_fd(row)") < retained.index("output = file") < retained.index("s_vfs_lock.unlock()")
+    assert "use == ServerFileUse::METADATA || use == ServerFileUse::SYNC" in retained
     assert "authorize_file_description_access" not in owner and "vfs_stat_resolved" not in owner
     reply = body_after(source, "void handle_vfs_op_resp(")
     assert "wki_vfs_fstat_response_valid(resp->status, RESP_DATA_LEN)" in reply
@@ -1921,7 +2068,7 @@ def test_mapped_components_require_negotiation_and_preserve_raw_ancestors():
 def test_initial_mapped_routes_do_not_fall_back_to_normalized_text():
     source = (ROOT / "modules/kern/src/vfs/core.cpp").read_text()
     walker = body_after(source, "auto acquire_local_component_lookup(")
-    assert "REMOTE_COMPONENTS = !physical_path" in " ".join(walker.split())
+    assert "REMOTE_COMPONENTS = REMOTE_SCOPE == 0 && !physical_path" in " ".join(walker.split())
     assert "intent == LookupIntent::CHANGE_MODE" in walker
     for intent in ("OPEN", "STAT", "ACCESS", "READLINK"):
         assert "intent == LookupIntent::" + intent in walker
@@ -1949,7 +2096,7 @@ def test_remote_alias_handoff_selects_complete_raw_export_and_preserves_grants()
     walker = body_after(source, "auto acquire_local_component_lookup(")
     handoff = walker[walker.index("auto publish_remote ="):walker.index("bool route_restarted")]
     assert "copy_path_string(remote_path, full_path.data(), full_path.size())" in handoff
-    assert "auto selected = find_mount_point(full_path.data(), written)" in handoff
+    assert "auto selected = find_mount_point(full_path.data(), written, *scope)" in handoff
     assert "selected->fs_type == FSType::REMOTE" in handoff
     assert "mount = std::move(selected)" in handoff
     assert handoff.index("find_mount_point(") < handoff.index("MutexGuard publication_guard")
@@ -2031,7 +2178,14 @@ def test_remote_open_at_reserves_before_effect_and_never_uses_path_authority():
     assert "apply_open_truncation" not in branch and "metadata_cache" not in branch
     assert "vfs_path_namespace_generation = 0" in branch
     for name in ("void cache_notify_attach_file(", "auto stream_cache_read_eligible("):
-        assert "file->vfs_path_namespace_generation == 0" in body_after(core, name)
+        eligibility = body_after(core, name)
+        if name.startswith("void cache_notify"):
+            assert "file->vfs_path_namespace_generation == 0" in eligibility
+        else:
+            # Every REMOTE File is excluded, including the untrusted zero-epoch
+            # names asserted here before stream caching was disabled remotely.
+            rejection = eligibility[:eligibility.index("return false;")]
+            assert "file->fs_type == FSType::REMOTE" in rejection
     source = (ROOT / "modules/kern/src/net/wki/remote_vfs.cpp").read_text()
     sender = body_after(source, "auto wki_remote_vfs_open_at(")
     assert "auto* state = original->proxy" in sender and "acquire_vfs_proxy_lane" not in sender
@@ -2231,8 +2385,11 @@ def test_exec_nosuid_uses_retained_mount_policy():
     assert "&image.admitted_credentials" in quiescence
     core = (ROOT / "modules/kern/src/vfs/core.cpp").read_text()
     stats = body_after(core, "static auto statvfs_for_file(")
-    assert stats.index("mount = file->mount_owner") < stats.index("find_mount_point(")
+    assert stats.index("mount = file->mount_owner") < stats.index("retain_file_named_mount(")
     assert "mount == nullptr && file->vfs_path != nullptr" in stats
+    fallback = body_after(core, "auto retain_file_named_mount(")
+    assert "find_mount_point(file->vfs_path, path_length, owner->namespace_owner)" in fallback
+    assert fallback.index("find_mount_point(") < fallback.index("if (owner != nullptr && selected.get() != owner) return {}") < fallback.index("return selected")
     assert "statvfs_for_mount(*mount, buf)" in stats
     assert "if (result == 0 && mount.nosuid) buf->f_flag |= ST_NOSUID;" in core
     remote_publish = core.split("struct RemoteMountPublishContext", 1)[1].split("// Check for PARTUUID= prefix", 1)[0]
@@ -2371,7 +2528,7 @@ def test_lookup_context_includes_nonreused_cwd_anchor_identity():
     assert "DirectoryAnchor{}" not in core
     factory = body_after(core, "auto allocate_directory_anchor(")
     assert "IDENTITY != 0" in factory and "DirectoryAnchor(IDENTITY)" in factory
-    validator = body_after(core, "auto lookup_request_context_matches(")
+    validator = lookup_request_validator(core)
     assert validator.index("path_metadata_lock.lock_irqsave()") < validator.index("authorization.cwd_anchor_identity")
     assert validator.index("authorization.cwd_anchor_identity") < validator.index("path_metadata_lock.unlock_irqrestore")
     for signature in ("auto acquire_local_component_lookup(", "auto vfs_acquire_lookup("):
@@ -2391,7 +2548,7 @@ def test_lookup_context_includes_canonical_root_anchor_identity():
     core = (ROOT / "modules/kern/src/vfs/core.cpp").read_text()
     lookup = (ROOT / "modules/kern/src/vfs/lookup.hpp").read_text()
     assert "uint64_t root_anchor_identity{}" in lookup
-    validator = body_after(core, "auto lookup_request_context_matches(")
+    validator = lookup_request_validator(core)
     assert validator.index("path_metadata_lock.lock_irqsave()") < validator.index("authorization.root_anchor_identity") < validator.index("path_metadata_lock.unlock_irqrestore")
     for signature in ("auto acquire_local_component_lookup(", "auto vfs_acquire_lookup("):
         body = body_after(core, signature)
@@ -2423,7 +2580,7 @@ def test_absolute_task_lookup_uses_owned_root_and_preserves_search_semantics():
     assert walk.index("path_metadata_lock.lock_irqsave()") < walk.index("root_anchor = path_owner->root_anchor") < walk.index("path_metadata_lock.unlock_irqrestore")
     assert walk.index("authorization.root_hash =") < walk.index("directory_anchor_path(*root_anchor.get(), root, nullptr)")
     for token in ("view.root() != view.directory()", "authorization.root_identity_view = true", "!authorization.root_identity_view",
-                  "OWNED_ROOT != nullptr ? OWNED_ROOT", "nullptr, nullptr, RESET_ROOT, restart"):
+                  "OWNED_ROOT != nullptr ? OWNED_ROOT", "nullptr, nullptr, reset_root, restart"):
         assert token in walk
     fallback = body_after(core, "auto vfs_acquire_lookup(")
     assert "!already_resolved && authorization.root_anchor_identity != 0" in fallback
@@ -2446,8 +2603,9 @@ def test_relative_owned_root_lookup_intersects_native_views_and_policy():
     for token in ("if (!physical_path && initial_view == nullptr) root_anchor = path_owner->root_anchor", "bool const CWD_MATCH",
                   "previous = process_view.root()", "boundary = process_view.root()", "admit_directory_view(previous, boundary",
                   "references.view.policy().restricted_by(process_view.policy())", "references.view.swap(merged)",
-                  "references.view.root(), anchor.get(), authorization.credentials", "File* const RESET_ROOT"):
+                  "references.view.root(), anchor.get(), authorization.credentials", "File* reset_root"):
         assert token in walk
+    assert "reset_root = references.view.root();" in walk
     bind = body_after(core, "auto local_walk_bind(")
     assert bind.index("anchor->mount_owner != mount") < bind.index("static_cast<ker::vfs::tmpfs::TmpNode*>(anchor->private_data)")
     fixture = body_after(core, "auto vfs_selftest_owned_root_absolute_walk(")
@@ -2558,7 +2716,8 @@ def test_directory_view_lookup_retains_boundary_and_checks_each_consumer():
     assert acquire.index("acquire_local_component_lookup(") < acquire.index("output = std::move(candidate)")
     assert "out->reset" not in acquire and "vfs_acquire_lookup(" not in acquire
     bind = body_after(core, "auto local_walk_bind(")
-    assert bind.index("epoch.confined_mount != nullptr && (mount == nullptr") < bind.index("if (mount == nullptr)")
+    normalized_bind = " ".join(bind.split())
+    assert normalized_bind.index("epoch.confined_mount != nullptr && (mount == nullptr") < normalized_bind.index("if (mount == nullptr)")
     validate = body_after(core[core.index("auto admit_directory_view("):], "auto validate_lookup_directory_view_locked(")
     assert "mount == view.root()->mount_owner" in validate
     assert "view.root(), view.directory(), handle.authorization().credentials, true" in validate
@@ -2585,7 +2744,7 @@ def test_tmpfs_directory_authority_changes_invalidate_prior_component_search():
     assert "tmpfs_search_authority_generation" not in validate
     core = (ROOT / "modules/kern/src/vfs/core.cpp").read_text()
     assert core.count(".tmpfs_search_generation = tmpfs::tmpfs_search_authority_generation()") == 2
-    assert "lookup_search_authority_current(handle)" in body_after(core, "auto lookup_request_context_matches(")
+    assert "lookup_search_authority_current(authorization)" in lookup_request_validator(core)
     assert "lookup_search_authority_current(handle)" in body_after(core, "auto lookup_authorization_still_current(")
     assert "GENERATION == 0 || GENERATION == tmpfs::tmpfs_search_authority_generation()" in body_after(core, "auto lookup_search_authority_current(")
     fixture = body_after((ROOT / "modules/kern/src/vfs/core.cpp").read_text(), "auto vfs_selftest_directory_view_lookup(")
@@ -2613,7 +2772,9 @@ def test_xfs_directory_authority_invalidates_whole_path_across_mounts():
     core = (ROOT / "modules/kern/src/vfs/core.cpp").read_text()
     assert core.count(".xfs_search_generation = xfs::xfs_search_authority_generation()") == 2
     validation = body_after(core, "auto lookup_search_authority_current(")
-    assert "handle.authorization().xfs_search_generation" in validation
+    delegate = body_after(core, "auto lookup_search_authority_current(const LookupHandle& handle)")
+    assert "return lookup_search_authority_current(handle.authorization());" in delegate
+    assert "authorization.xfs_search_generation" in validation
     assert "XFS_GENERATION == 0 || XFS_GENERATION == xfs::xfs_search_authority_generation()" in validation
     prepared = body_after(core, "auto vfs_prepare_filesystem_context(")
     assert prepared.index("auto const XFS_SEARCH") < prepared.index("admit_directory_view(")
@@ -3084,7 +3245,8 @@ def test_scoped_native_walk_proves_selected_objects_and_borrows_open_membership(
     assert "references.view = *initial_view" in walk
     assert "directory_anchor_path(*cwd_anchor.get(), path, nullptr, references.membership.get())" in walk
     bind = body_after(core, "auto local_walk_bind(")
-    assert "if (epoch.confined_mount != nullptr) return -EXDEV" in bind
+    assert "if (PRIVATE || epoch.confined_mount != nullptr) return -EXDEV" in bind
+    assert bind.index("local_walk_cross_native_mount(") < bind.index("if (PRIVATE || epoch.confined_mount != nullptr) return -EXDEV")
     locked = body_after(core, "auto prepare_open_directory_view_locked(")
     assert "static_cast<const NativeDirectoryMembershipReferences*>(lookup.mount_membership())" in locked
     assert "output, false, true, membership" in locked
@@ -3458,10 +3620,12 @@ def test_retained_pin_close_keeps_outer_file_until_cancellation_retires():
     assert global_cleanup.index("finish_or_quiesce_waiter(") < global_cleanup.index("PinCloseOwner::cleanup_for_task(pid)")
     core = (ROOT / "modules/kern/src/vfs/core.cpp").read_text()
     destroy = body_after(core, "auto vfs_destroy_file(")
+    assert destroy.index("OrdinaryFinalCloseOwner owner(f)") < destroy.index("prepare_file_close(f)") < destroy.index("f->fops->vfs_close(f)")
+    assert destroy.index("f->fops->vfs_close(f)") < destroy.index("owner.backend_finished(close_result)") < destroy.index("finish_file_close(f, CLOSE_MAY_CHANGE_METADATA, close_result, &owner)")
+    prefix = body_after(core, "auto prepare_file_close(")
     tokens = ("stream_detach_file(f)", "cache_notify_detach_file(f)", "advisory_release_file_owner_locks(f)",
-              "CLOSE_MAY_CHANGE_METADATA = f->close_may_change_metadata", "f->fops->vfs_close(f)",
-              "finish_file_close(f, CLOSE_MAY_CHANGE_METADATA, close_result)")
-    positions = [destroy.index(token) for token in tokens]
+              "CLOSE_MAY_CHANGE_METADATA = f->close_may_change_metadata", "return CLOSE_MAY_CHANGE_METADATA")
+    positions = [prefix.index(token) for token in tokens]
     assert positions == sorted(positions)
     final = body_after(core, "auto finish_file_close(")
     tokens = ("metadata_cache_note_exact_path_changed", "vfs_file_clear_path(f)", "f->mount_owner = nullptr",
@@ -3674,11 +3838,20 @@ def test_rooted_return_owner_cwd_preserves_declared_root_and_ownership():
 def test_pivot_native_covers_publish_with_paths_and_retire_after_unlock():
     mount = (ROOT / "modules/kern/src/vfs/mount.cpp").read_text()
     core = (ROOT / "modules/kern/src/vfs/core.cpp").read_text()
-    pivot = body_after(core, "auto vfs_pivot_root(")
-    tokens = ("wki_remote_vfs_prepare_export_rebuild()", "PivotMountReferences references", "MutexGuard publication_guard",
-              "remap_mounts_for_pivot(", "t->root.data()", "rebase_wki_mounts_for_new_root(", "g_vfs_namespace_generation.fetch_add")
-    positions = [pivot.index(t) for t in tokens]
+    wrapper = body_after(core, "auto vfs_pivot_root(")
+    assert "return vfs_pivot_root_for_task(task, new_root, put_old);" in wrapper
+    pivot = body_after(core, "auto vfs_pivot_root_for_task(")
+    assert pivot.index("wki_remote_vfs_prepare_export_rebuild()") < pivot.index("PivotMountReferences references")
+    commit = pivot[pivot.index("PivotMountReferences references"):]
+    tokens = ("PivotMountReferences references", "MutexGuard publication_guard",
+              "remap_mounts_for_pivot(", "paths->root.data()", "rebase_wki_mounts_for_new_root(", "g_vfs_namespace_generation.fetch_add")
+    positions = [commit.index(t) for t in tokens]
     assert positions == sorted(positions)
+    update = body_after(pivot, "auto update_root =")
+    assert update.index("*owned_scope != scope") < update.index("subject->filesystem_owner()") < update.index("auto publish =")
+    publish = body_after(update, "auto publish =")
+    assert publish.index("path_metadata_lock.lock_irqsave()") < publish.index("paths->root.data(), stable_new_root.data()") < publish.index("path_metadata_lock.unlock_irqrestore(")
+    assert update.index("publish(owner)") < update.index("owner != subject") < update.index("publish(subject)")
     remap = body_after(mount, "auto remap_mounts_for_pivot(")
     tokens = ("bool target_collision = false", "reference_owner.state_ = cover_state", "pin_pivot_cover(REQUEST_CREDENTIALS",
               "mount_has_active_refs_locked(replacement.mount, cover_state)", "entry.retired = mount->covered_directory",
@@ -3824,8 +3997,6 @@ if __name__ == "__main__":
     test_rename_pair_keeps_explicit_admitted_identity()
     test_linkat_pair_keeps_one_snapshot_through_both_lookups_and_retries()
     test_ptrace_exception_stop_publishes_before_nonreturning_handoff()
-    print("credential policy audit tests passed")
-
     test_owned_root_getcwd_uses_native_metadata_and_intersects_views()
 
     test_owned_root_visible_consumers_pair_capture_and_stage_publication()
@@ -3833,3 +4004,4 @@ if __name__ == "__main__":
     test_procfs_owned_root_and_scoped_fd_metadata_preserve_subject_boundary()
 
     test_procfs_plain_directory_pins_exact_native_file_beneath_owned_root()
+    print("credential policy audit tests passed")

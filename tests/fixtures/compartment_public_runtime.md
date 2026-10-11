@@ -5,6 +5,10 @@ This is an actual WOS userspace probe for process selector 54 and
 one through the public spec, one through the launcher. Its assertions cover
 private PID 1/parent 0, unchanged nonroot identity, Host path refusal, explicit
 asset contents, denied networking, named shared memory and local fork/wait.
+It also checks private self/local-PID nice reads, lowering its own priority,
+refusal to raise it again, and refusal to use the Host's physical PID as a local
+priority target. The Host requires its own nice value to remain unchanged after
+each mode.
 Successful construction alone does not pass: Host wait must report exit 0 and
 the explicitly granted regular result File must contain the service's report.
 This probe does not qualify the two-hour, concurrent-tree, hostile-escape or
@@ -24,6 +28,15 @@ one writable regular File as private FD 9. That File intentionally remains a
 Host capability; private path confinement does not revoke it. No stdin, stdout,
 stderr, directories, devices or sockets enter the private descriptor table.
 Both services inherit UID/GID 100, zero authority, NNP and the creator's limits.
+Both invocation paths pass the Host's decimal physical PID as the explicit
+`--service --host-pid NUM` arguments. The bounded parser accepts only decimal
+IDs greater than 2 and no greater than `INT64_MAX`. This guessed identifier
+grants no Host object capability: the probe creates only private PID 1 and child
+PID 2. Priority selectors must report `ESRCH` for both read and mutation using
+that absent local name. Local nice checks use actual libc error handling; the
+Host-PID checks use raw 64-bit wrappers to avoid truncating the identifier.
+The private initial nice-0 check records the current native default and does
+not qualify creator nice or CPU placement inheritance.
 
 Prepare only an inactive, agent-owned private rootfs COW overlay over the
 current normal rootfs. Install the ELF at
@@ -51,8 +64,12 @@ sysroot or bypass the launch guard. Isolated diagnostics use
 --no-package --no-setup`; `--no-setup` applies only to launch.
 
 The expected final receipt is `PASS public-service modes=2 failures=0`, with
-both mode rows reporting exit status 0, 14 checks, zero failures and failed-mask
-0. The actual private report is seven little-endian uint64 values: magic
+both mode rows reporting exit status 0, 21 checks, zero failures, failed-mask 0
+and `host-nice-preserved=1`. The original 14 checks remain; seven priority checks
+are added. Private self and local PID 1 start at nice 0, self lowers to nice 5,
+local PID 1 reads 5, an attempted increase to nice 4 returns `EACCES`, and both
+Host-PID operations return `ESRCH`. The actual private report is seven
+little-endian uint64 values: magic
 `0x39335055424c4943`, PID, parent, UID, checks, failure count and failed-check
 bitmask. The Host returns 42 on a mode failure, 40 on wrong initial identity or
 local-placement refusal, 41 on asset-open refusal and 43 on invalid arguments.

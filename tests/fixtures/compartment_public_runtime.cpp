@@ -2,6 +2,7 @@
 #include <fcntl.h>
 #include <sys/logging.h>
 #include <sys/process.h>
+#include <sys/resource.h>
 #include <sys/shm.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -48,6 +49,22 @@ struct Report {
     uint64_t magic{}, pid{}, parent{}, uid{}, checks{}, failures{}, failed_checks{};
 };
 auto text(const char* value) -> wire::String { return {reinterpret_cast<uint64_t>(value), std::strlen(value)}; }
+auto parse_host_pid(const char* text, int64_t& result) -> bool {
+    uint64_t value{};
+    for (size_t i = 0; i < 20; ++i) {
+        char const DIGIT = text[i];
+        if (DIGIT == '\0') {
+            if (i == 0 || value <= 2) return false;
+            result = static_cast<int64_t>(value);
+            return true;
+        }
+        if (DIGIT < '0' || DIGIT > '9') return false;
+        auto const NUMBER = static_cast<uint64_t>(DIGIT - '0');
+        if (value > (uint64_t{INT64_MAX} - NUMBER) / 10) return false;
+        value = value * 10 + NUMBER;
+    }
+    return false;
+}
 auto wait(int64_t pid, int& status) -> int64_t {
     int64_t result;
     do {
@@ -55,7 +72,7 @@ auto wait(int64_t pid, int& status) -> int64_t {
     } while (result == -EINTR);
     return result;
 }
-auto service() -> int {
+auto service(int64_t host_pid) -> int {
     Report report{MAGIC, ker::process::getpid(), ker::process::getppid(), getuid()};
     auto expect = [&](bool condition) {
         ++report.checks;
@@ -99,14 +116,34 @@ auto service() -> int {
         int status{};
         expect(wait(CHILD, status) == CHILD && WIFEXITED(status) && WEXITSTATUS(status) == 0);
     }
+    errno = 0;
+    expect(getpriority(PRIO_PROCESS, 0) == 0 && errno == 0);
+    errno = 0;
+    expect(getpriority(PRIO_PROCESS, 1) == 0 && errno == 0);
+    errno = 0;
+    expect(setpriority(PRIO_PROCESS, 0, 5) == 0 && errno == 0);
+    errno = 0;
+    expect(getpriority(PRIO_PROCESS, 1) == 5 && errno == 0);
+    errno = 0;
+    expect(setpriority(PRIO_PROCESS, 0, 4) == -1 && errno == EACCES);
+    // The decimal Host PID is a guessed name, not an object grant. It is >2;
+    // only local PID1 and the completed child PID2 exist in this namespace.
+    // Raw wrappers preserve the full physical ID and return negative errno.
+    expect(ker::process::getpriority(PRIO_PROCESS, host_pid) == -ESRCH);
+    expect(ker::process::setpriority(PRIO_PROCESS, host_pid, 5) == -ESRCH);
     // This deliberately granted Host File lies outside the private path view.
     ++report.checks;
     if (write(RESULT_FD, &report, sizeof(report)) != static_cast<ssize_t>(sizeof(report))) return 33;
     return report.failures == 0 ? 0 : 32;
 }
 auto host() -> int {
-    log::info("BEGIN public-service uid=%u host-pid=%llu", getuid(), static_cast<unsigned long long>(ker::process::getpid()));
-    if (getuid() != 100 || ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_LOCAL) != 0) return 40;
+    auto const HOST_PID = ker::process::getpid();
+    log::info("BEGIN public-service uid=%u host-pid=%llu", getuid(), static_cast<unsigned long long>(HOST_PID));
+    if (getuid() != 100 || HOST_PID <= 2 || HOST_PID > uint64_t{INT64_MAX} ||
+        ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_LOCAL) != 0)
+        return 40;
+    char host_pid[24];
+    std::snprintf(host_pid, sizeof(host_pid), "%llu", static_cast<unsigned long long>(HOST_PID));
     constexpr std::array SOURCE{FIXTURE, "/lib/ld.so", "/usr/lib/libc.so", "/usr/lib/libjournal.so", "/srv/compartment-marker"};
     constexpr std::array DESTINATION{"/app/probe", "/lib/ld.so", "/usr/lib/libc.so", "/usr/lib/libjournal.so", "/same/name"};
     std::array<wire::Asset, SOURCE.size()> assets{};
@@ -121,6 +158,9 @@ auto host() -> int {
     }
     unsigned failures{};
     for (unsigned mode = 0; mode < 2; ++mode) {
+        errno = 0;
+        int const NICE_BEFORE = getpriority(PRIO_PROCESS, 0);
+        bool const NICE_BEFORE_VALID = errno == 0;
         char path[80];
         std::snprintf(path, sizeof(path), "/srv/compartment-results/result-%u", mode);
         int const FD = open(path, O_CREAT | O_EXCL | O_RDWR, 0600);
@@ -141,7 +181,7 @@ auto host() -> int {
                 }
             }
             wire::Descriptor descriptor{FD, RESULT_FD, 0};
-            std::array args{text("/app/probe"), text("--service")};
+            std::array args{text("/app/probe"), text("--service"), text("--host-pid"), text(host_pid)};
             std::array env{text("LD_LIBRARY_PATH=/usr/lib")};
             spec.executable = args[0];
             spec.assets = reinterpret_cast<uint64_t>(assets.data());
@@ -185,6 +225,8 @@ auto host() -> int {
                             "--",
                             "/app/probe",
                             "--service",
+                            "--host-pid",
+                            static_cast<const char*>(host_pid),
                             static_cast<const char*>(nullptr)};
             std::array<const char*, 2> env{"LD_LIBRARY_PATH=/usr/lib", nullptr};
             pid = static_cast<int64_t>(ker::process::exec(args[0], args.data(), env.data()));
@@ -194,12 +236,17 @@ auto host() -> int {
         bool const EXITED = WAITED && WIFEXITED(status) && WEXITSTATUS(status) == 0;
         Report report{};
         bool const READ = pread(FD, &report, sizeof(report), 0) == static_cast<ssize_t>(sizeof(report));
+        errno = 0;
+        int const NICE_AFTER = getpriority(PRIO_PROCESS, 0);
+        bool const NICE_PRESERVED = NICE_BEFORE_VALID && errno == 0 && NICE_AFTER == NICE_BEFORE;
         bool const PASSED = EXITED && READ && report.magic == MAGIC && report.pid == 1 && report.parent == 0 && report.uid == 100 &&
-                            report.checks == 14 && report.failures == 0;
-        log::info("%s mode=%u physical-pid=%lld waited=%u status=%d report=%u checks=%llu failures=%llu failed-mask=0x%llx",
-                  PASSED ? "PASS" : "FAIL", mode, static_cast<long long>(pid), WAITED ? 1U : 0U, status, READ ? 1U : 0U,
-                  static_cast<unsigned long long>(report.checks), static_cast<unsigned long long>(report.failures),
-                  static_cast<unsigned long long>(report.failed_checks));
+                            report.checks == 21 && report.failures == 0 && NICE_PRESERVED;
+        log::info(
+            "%s mode=%u physical-pid=%lld waited=%u status=%d report=%u checks=%llu failures=%llu failed-mask=0x%llx "
+            "host-nice-before=%d host-nice-after=%d host-nice-preserved=%u",
+            PASSED ? "PASS" : "FAIL", mode, static_cast<long long>(pid), WAITED ? 1U : 0U, status, READ ? 1U : 0U,
+            static_cast<unsigned long long>(report.checks), static_cast<unsigned long long>(report.failures),
+            static_cast<unsigned long long>(report.failed_checks), NICE_BEFORE, NICE_AFTER, NICE_PRESERVED ? 1U : 0U);
         if (!PASSED) ++failures;
         (void)fsync(FD);
         close(FD);
@@ -211,7 +258,9 @@ auto host() -> int {
 }  // namespace
 
 auto main(int argc, char** argv) -> int {
-    if (argc == 2 && std::strcmp(argv[1], "--service") == 0) return service();
+    int64_t host_pid{};
+    if (argc == 4 && std::strcmp(argv[1], "--service") == 0 && std::strcmp(argv[2], "--host-pid") == 0 && parse_host_pid(argv[3], host_pid))
+        return service(host_pid);
     if (argc == 2 && std::strcmp(argv[1], "--host") == 0) return host();
     return 43;
 }

@@ -771,7 +771,8 @@ def test_wos_mlibc_priority_sysdeps_are_syscall_backed() -> None:
         [
             "WOS_PRIO_KERNEL_ENCODE_BIAS = 20",
             "auto wos_proc_getpriority(int which, int64_t who) -> uint64_t",
-            "static_cast<int>(target->sched_nice) + WOS_PRIO_KERNEL_ENCODE_BIAS",
+            "return get_priority_for_subject(mod::sched::get_current_task(), which, who);",
+            "static_cast<int>(target.task->sched_nice) + WOS_PRIO_KERNEL_ENCODE_BIAS",
             "case abi::process::procmgmt_ops::GETPRIORITY",
         ],
         "kernel process priority syscalls",

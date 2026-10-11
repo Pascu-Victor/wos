@@ -477,6 +477,13 @@ auto task_has_live_pagemap_sibling(task::Task* subject) -> bool;
 // logical AS current/peak without allocating a task snapshot.
 void record_address_space_usage(task::Task* subject, mm::paging::PageTable* root, uint64_t bytes);
 void set_task_nice(task::Task* task, int nice);  // Update task weight safely on its run queue
+// Caller retains subject and private scope and holds VM publication through
+// authorization/commit. Verify queue ownership before checking namespace
+// closure and changing weight; missing ownership returns EAGAIN without writes.
+auto set_task_nice_in_namespace(task::Task* subject, const pid_ns::NamespaceRef& scope, int nice) -> int;
+#ifdef WOS_SELFTEST
+auto scheduler_selftest_namespace_priority_commit() -> bool;
+#endif
 void revoke_terminal_attachment(security::TerminalIdentity terminal, uint64_t session_id, uint64_t generation, uint64_t foreground,
                                 session::Origin foreground_origin);
 auto signal_terminal_process_group(security::TerminalIdentity terminal, uint64_t session_id, uint64_t generation, uint64_t pgid,

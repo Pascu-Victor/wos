@@ -8,6 +8,11 @@
 
 ## Outcome and scale
 
+Current checkpoint 34 qualifies private priority selection/queue commits and
+both short public modes with 21 checks. Goal39 is ACTIVE; all ten full criteria
+remain incomplete. Launch exact-owned tests with `--no-setup`, maintain one
+topology and prune disposable images after every passing or failing run.
+
 Run two services on the same WOS kernel with independently owned mount, PID and
 named-IPC views, bounded resource budgets, and explicit inherited capabilities.
 **Target: one to two continuous weeks with VFS, process/IPC, and userspace/test
@@ -690,3 +695,55 @@ recorded before future critical patch. Remaining hostile/shared/futex/init,
 two2h trees,1000full lifecycles/all reference baselines and Host/init/libc evidence
 remain required. Use --no-setup on launch, separate build/data/sysroots,one
 topology,20GiB/40GiB budget,COW/reflinks and exact-owned pruning PASS/FAIL.
+
+## Checkpoint34: private priority selectors and queue commits (2026-10-11)
+
+GETPRIORITY/SETPRIORITY use the exact canonical private PID namespace, local
+executing-thread zero selector and retained local targets. Same-UID Host and
+sibling physical aliases cannot select targets. Fresh requester/target/canonical
+liveness, stale-image, closure, authorization and remote refusal checks precede
+reads/effects. Private SET holds VM -> actual owner runqueue -> namespace
+publication through nice/weight/deadline and heap-accounting updates; at most
+two bounded owner scans, no detached/unlocked private fallback. Queue refusal
+preserves fields/sums; rescheduling occurs after queue/namespace unlock. Host
+priority functions, physical selectors, encoded libc result, Task/File layout,
+all ABI/syscall/wire surfaces and old native cases are preserved. Later exit
+without VM publication is not claimed to be serialized by these fresh checks.
+
+Four real native cases cover aliases/Host encoding, canonical threads/stale
+images, closure/authorization/remote refusal and actual exclusively owned
+current/handoff/heap/wait queues/accounting. Actual normal public-spec AND CLI
+modes pass private PID1/parent0/UID100, 21 checks/zero failures, local priority
+reads/updates/denied raises, raw 64-bit guessed Host-PID refusals and unchanged
+Host nice values. Both Host waits return exit0; exact 56-byte reports and durable
+Host assertions are required, not serial-only observer output.
+
+Normal Build WOS PASS51.725s; isolated fast diagnostic build PASS56.438s;
+48 selected Host tests PASS37.420s; affected final credential CTest PASS2.102s;
+format/tidy PASS82.685s; guest fixture build PASS0.282s; 27preservation checks PASS.
+Exactly24 previously failing credential source tests reconcile their real current
+consumers/delegates, all104other bodies unchanged, all128names/calls unchanged.
+Historical129calls included one display print, so there are128tests. Success print
+now follows all tests; final affected CTest re-run passes. No skip/masking and no
+claim of full Host/init/libc regression. Original failing format01 and source
+snapshots01..04/patches retained; format-only fix preceded builds/runtimes.
+Sourceaudit print move preceded VM freeze, required only affected CTest re-run.
+
+Public34-01 PASS39.634s/169stablepins, both21checks. KTEST62 --fast --no-setup
+PASS488.346s, 88,688assertions/0failures/1,393cases/all142mandatory/normalpoweroff,
+149stablepins147distinct. Public and diagnostic four-image prunes remove
+91,242,496B and261,570,560B allocated respectively; final0disposable.
+20GiBdisposablebudget/40GiBfreefloor, one topology, COW/reflinks and exact
+UID/PID/QMP/FD/inode/backing proofs retained. Inventories unreadable0; unrelated
+user13532 UID945 preserved; immutable seeds/current artifacts preserved.
+
+Audit checkpoint-34-audit.json SHA256
+942f018c8ef059e942b29fbab627729f488af1373e2ba66500614cf36e63abda PASS;
+all ten full criteria false. Goal39 remains ACTIVE, no pause/push. CPU/nice
+inheritance is not implemented by priority selectors/defaultnice0. Remaining
+canonical/executor CPU mask/domain/pin observations, coherent setters/descendant
+inheritance/namespace ceilings and every scheduling consumer have read-only
+sequence notes, not implementation claims. Hostile/shared/futex/init evidence,
+two simultaneous2h trees,1000full lifecycles/all references and complete Host/
+init/libc regression still required. Use --no-setup for launches, preserve
+normal/KTEST build/data/sysroot separation and prune PASS/FAIL/exception images.
