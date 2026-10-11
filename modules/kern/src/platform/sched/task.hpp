@@ -306,6 +306,42 @@ struct Task {
     // Thread and recoverable unpublished-process builders fill required fields.
     Task() = default;
 
+    // Scalar CPU/placement access. Each observation is one field, not a
+    // coherent policy tuple or proof of queue ownership or Task lifetime.
+    // Preserve naturally aligned scalar storage and avoid lock fallbacks in
+    // scheduler, IRQ, NAPI and emergency diagnostic contexts.
+    static_assert(std::atomic_ref<uint64_t>::is_always_lock_free);
+    static_assert(std::atomic_ref<uint32_t>::is_always_lock_free);
+    static_assert(std::atomic_ref<bool>::is_always_lock_free);
+    static_assert(alignof(uint64_t) >= std::atomic_ref<uint64_t>::required_alignment);
+    static_assert(alignof(uint32_t) >= std::atomic_ref<uint32_t>::required_alignment);
+    static_assert(alignof(bool) >= std::atomic_ref<bool>::required_alignment);
+
+    auto load_cpu() const noexcept -> uint64_t {
+        return std::atomic_ref<uint64_t>(const_cast<uint64_t&>(cpu)).load(std::memory_order_acquire);
+    }
+    void store_cpu(uint64_t value) noexcept { std::atomic_ref<uint64_t>(cpu).store(value, std::memory_order_release); }
+
+    auto load_domain_mask() const noexcept -> uint64_t {
+        return std::atomic_ref<uint64_t>(const_cast<uint64_t&>(domain_mask)).load(std::memory_order_acquire);
+    }
+    void store_domain_mask(uint64_t value) noexcept { std::atomic_ref<uint64_t>(domain_mask).store(value, std::memory_order_release); }
+
+    auto load_domain_id() const noexcept -> uint32_t {
+        return std::atomic_ref<uint32_t>(const_cast<uint32_t&>(domain_id)).load(std::memory_order_acquire);
+    }
+    void store_domain_id(uint32_t value) noexcept { std::atomic_ref<uint32_t>(domain_id).store(value, std::memory_order_release); }
+
+    auto load_cpu_pinned() const noexcept -> bool {
+        return std::atomic_ref<bool>(const_cast<bool&>(cpu_pinned)).load(std::memory_order_acquire);
+    }
+    void store_cpu_pinned(bool value) noexcept { std::atomic_ref<bool>(cpu_pinned).store(value, std::memory_order_release); }
+
+    auto load_domain_hard() const noexcept -> bool {
+        return std::atomic_ref<bool>(const_cast<bool&>(domain_hard)).load(std::memory_order_acquire);
+    }
+    void store_domain_hard(bool value) noexcept { std::atomic_ref<bool>(domain_hard).store(value, std::memory_order_release); }
+
     struct SigHandler {
         uint64_t handler;   // SIG_DFL=0, SIG_IGN=1, or function pointer
         uint64_t flags;     // SA_SIGINFO, SA_RESTART, etc.
@@ -368,17 +404,16 @@ struct Task {
     uint64_t entry{};
     void (*kthread_entry)(){};  // Kernel thread entry (DAEMON only), nullptr otherwise
     const char* name{};
-    // Authoritative scheduler owner while ACTIVE: for RUNNABLE/WAITING tasks
-    // this names the runqueue holding the task; for current/handoff tasks it
-    // names the CPU whose stack is executing or about to execute it. Updates
-    // happen under the owning runqueue lock or during task construction before
-    // publication.
+    // Scheduler CPU hint; actual current/handoff, heap or wait membership under
+    // the owning queue lock proves ownership. Wake transfers also update this
+    // scalar between source detach and target publication. Production reads
+    // and writes use the scalar accessors after default initialization.
     uint64_t cpu{};
 
     // CPU domain affinity (Phase 1 - CPU domain infrastructure).
-    // domain_id: which domain this task belongs to (0 = ROOT, any CPU allowed)
+    // domain_id: recorded domain identity (0 = ROOT)
     // domain_mask: bitmask of allowed CPUs (all-ones = unrestricted)
-    // domain_hard: when true, task NEVER runs outside domain_mask
+    // domain_hard: inhibits ordinary cross-CPU migration
     uint64_t domain_mask = ~0ULL;
     threading::Thread* thread{};
     uint64_t pid{};
@@ -989,7 +1024,7 @@ struct Task {
     uint16_t program_header_count = 0;     // Number of program headers (AT_PHNUM)
     uint16_t program_header_ent_size = 0;  // Size of each program header entry (AT_PHENT)
 
-    bool cpu_pinned = false;  // When true, scheduler will not migrate this task to another CPU
+    bool cpu_pinned = false;  // Inhibits automatic cross-CPU migration.
     bool domain_hard = false;
     bool has_run{};                     // True once the task has run at least once
     bool is_elf_buffer_shared = false;  // True if buffer is from shared cache, don't delete[]

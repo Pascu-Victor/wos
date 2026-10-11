@@ -9,8 +9,8 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/debug/ptrace.hpp>
 #include <platform/ktime/ktime.hpp>
-#include <platform/mm/mm.hpp>
 #include <platform/mm/kernel_image.hpp>
+#include <platform/mm/mm.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -515,7 +515,7 @@ auto exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) -> void {
         journal::panic("  syscall_kernel_stack: 0x%lx", current_task->context.syscall_kernel_stack);
         journal::panic("  syscall_scratch_area: 0x%lx", current_task->context.syscall_scratch_area);
         journal::panic("Task Scheduler State:");
-        journal::panic("  cpu=%lu queue=%u voluntary=%u wants_block=%u deferred=%u yield=%u", current_task->cpu,
+        journal::panic("  cpu=%lu queue=%u voluntary=%u wants_block=%u deferred=%u yield=%u", current_task->load_cpu(),
                        static_cast<unsigned>(current_task->sched_queue), current_task->is_voluntary_blocked() ? 1U : 0U,
                        current_task->wants_block ? 1U : 0U, current_task->deferred_task_switch ? 1U : 0U,
                        current_task->yield_switch ? 1U : 0U);

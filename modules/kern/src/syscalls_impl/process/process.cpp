@@ -796,7 +796,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->pid = sched::task::get_next_pid();
     uint64_t const CHILD_VISIBLE_PID = child->namespace_tid();
     child->type = sched::task::TaskType::PROCESS;
-    child->cpu = cpu::current_cpu();
+    child->store_cpu(cpu::current_cpu());
     child->has_run = false;
     child->exit_status = 0;
     child->exit_in_progress = false;
@@ -1091,8 +1091,8 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         // a child that is already runnable (or already exited/reaped).
         process_log::error("fork: lifecycle commit completed concurrently for published child PID %x", child->pid);
     }
-    record_fork_child(FORK_STAGE, child->pid, child->cpu, WOS_PERF_CALLSITE());
-    uint64_t const CHILD_CPU = child->cpu;
+    record_fork_child(FORK_STAGE, child->pid, child->load_cpu(), WOS_PERF_CALLSITE());
+    uint64_t const CHILD_CPU = child->load_cpu();
     child->release();
 
     // Return child PID to parent
@@ -1513,7 +1513,7 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
 
     child->pid = sched::task::get_next_pid();
     child->type = sched::task::TaskType::PROCESS;
-    child->cpu = cpu::current_cpu();
+    child->store_cpu(cpu::current_cpu());
 
     // Publish user-visible TID values before the child can become runnable.
     // A later construction failure can leave these output slots changed, but

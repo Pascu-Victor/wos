@@ -94,7 +94,7 @@ void copy_label(std::array<char, N>& dst, const char* value, const char* fallbac
 
     snapshot.found = true;
     snapshot.pid = task->pid;
-    snapshot.cpu = task->cpu;
+    snapshot.cpu = task->load_cpu();
     snapshot.wait_callsite = task_wait_callsite(task);
     snapshot.saved_cs = task->context.frame.cs;
     snapshot.saved_rip = task->context.frame.rip;

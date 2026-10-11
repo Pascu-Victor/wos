@@ -682,7 +682,7 @@ void clear_trace_state_and_wake(Task& target) {
         target.clear_wait_channel();
     }
     if (should_wake_after_trace_clear(target, WAS_STOPPED, WAS_PTRACE_WAIT)) {
-        ker::mod::sched::reschedule_task_for_cpu(target.cpu, &target);
+        ker::mod::sched::reschedule_task_for_cpu(target.load_cpu(), &target);
     }
 }
 
@@ -751,7 +751,7 @@ auto resume_syscall_after_require(Task& tracer, Task& target) -> bool {
     }
     target.ptrace_stop_uses_syscall_snapshot = false;
     if (WAS_STOPPED) {
-        ker::mod::sched::reschedule_task_for_cpu(target.cpu, &target);
+        ker::mod::sched::reschedule_task_for_cpu(target.load_cpu(), &target);
     }
     return true;
 }
@@ -1590,7 +1590,7 @@ auto ptrace_as(ker::mod::sched::task::Task& requester, abi::ptrace::request req,
                 target->ptrace_syscall_in_stop = false;
                 target->ptrace_stop_uses_syscall_snapshot = false;
                 clear_task_trap_flags(*target);
-                ker::mod::sched::reschedule_task_for_cpu(target->cpu, target);
+                ker::mod::sched::reschedule_task_for_cpu(target->load_cpu(), target);
             }
             break;
         }
@@ -1618,7 +1618,7 @@ auto ptrace_as(ker::mod::sched::task::Task& requester, abi::ptrace::request req,
                 }
                 target->ptrace_stop_uses_syscall_snapshot = false;
                 if (WAS_STOPPED) {
-                    ker::mod::sched::reschedule_task_for_cpu(target->cpu, target);
+                    ker::mod::sched::reschedule_task_for_cpu(target->load_cpu(), target);
                 }
             }
             break;
@@ -1655,7 +1655,7 @@ auto ptrace_as(ker::mod::sched::task::Task& requester, abi::ptrace::request req,
                 }
                 target->ptrace_stop_uses_syscall_snapshot = false;
                 if (WAS_STOPPED) {
-                    ker::mod::sched::reschedule_task_for_cpu(target->cpu, target);
+                    ker::mod::sched::reschedule_task_for_cpu(target->load_cpu(), target);
                 }
             }
             break;

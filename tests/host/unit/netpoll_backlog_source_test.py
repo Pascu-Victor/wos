@@ -88,7 +88,7 @@ def test_napi_worker_and_scheduler_lost_wake_guards() -> None:
     require_tokens(
         poke_body,
         [
-            "worker->cpu",
+            "worker->load_cpu()",
             "ker::mod::cpu::current_cpu()",
             "ker::mod::sys::context_switch::request_reschedule()",
             "ker::mod::sched::wake_cpu(WORKER_CPU,",
@@ -191,9 +191,9 @@ def test_backlog_handler_and_enqueue_lost_wake_guards() -> None:
         wake_body,
         [
             "ker::mod::sched::wake_task_from_event(q.handler, ker::mod::sched::EventWakeDeferredSwitch::PRESERVE)",
-            "q.handler->cpu == ker::mod::cpu::current_cpu()",
+            "q.handler->load_cpu() == ker::mod::cpu::current_cpu()",
             "ker::mod::sys::context_switch::request_reschedule()",
-            "ker::mod::sched::wake_cpu(q.handler->cpu,",
+            "ker::mod::sched::wake_cpu(q.handler->load_cpu(),",
             "cpu_wake_mode",
         ],
         "backlog handler wake helper",
@@ -204,9 +204,9 @@ def test_backlog_handler_and_enqueue_lost_wake_guards() -> None:
         wake_body,
         [
             "ker::mod::sched::wake_task_from_event(q.handler, ker::mod::sched::EventWakeDeferredSwitch::PRESERVE)",
-            "q.handler->cpu == ker::mod::cpu::current_cpu()",
+            "q.handler->load_cpu() == ker::mod::cpu::current_cpu()",
             "ker::mod::sys::context_switch::request_reschedule()",
-            "ker::mod::sched::wake_cpu(q.handler->cpu,",
+            "ker::mod::sched::wake_cpu(q.handler->load_cpu(),",
         ],
         "backlog event token precedes local/remote CPU pokes",
     )

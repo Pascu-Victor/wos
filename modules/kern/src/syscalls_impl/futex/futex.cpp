@@ -209,7 +209,7 @@ int64_t futex_wait(uint64_t user_addr, int expected, uint64_t timeout_user_addr)
     }
     waiter->phys_addr = PHYS_ADDR;
     waiter->task_pid = current_task->pid;
-    waiter->task_cpu = current_task->cpu;
+    waiter->task_cpu = current_task->load_cpu();
     waiter->hash_next = nullptr;
 
     if (!futex_table.valid()) {

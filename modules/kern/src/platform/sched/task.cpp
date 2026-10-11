@@ -1172,7 +1172,7 @@ Task::Task(const char* name, uint64_t elf_start, size_t elf_size, uint64_t kerne
         // Idle tasks use the kernel pagemap
         this->pagemap = mm::virt::get_kernel_pagemap();
         this->type = type;
-        this->cpu = cpu::current_cpu();
+        this->store_cpu(cpu::current_cpu());
         this->context.syscall_kernel_stack = kernel_rsp;
 
         // Initialize syscall scratch area even for idle tasks
@@ -1195,7 +1195,7 @@ Task::Task(const char* name, uint64_t elf_start, size_t elf_size, uint64_t kerne
         // Kernel thread: ring 0, kernel pagemap, no user thread/TLS, no ELF
         this->pagemap = mm::virt::get_kernel_pagemap();
         this->type = type;
-        this->cpu = cpu::current_cpu();
+        this->store_cpu(cpu::current_cpu());
         // Daemons are mostly background service work. Give them a much smaller
         // fair-share budget than user compute threads so periodic wakeups do not
         // dominate a CPU and stretch long-running PROCESS benchmarks by 2-4x.
@@ -1235,7 +1235,7 @@ Task::Task(const char* name, uint64_t elf_start, size_t elf_size, uint64_t kerne
     this->context.frame.rsp = 0;
     this->context.regs = cpu::GPRegs();
     this->type = type;
-    this->cpu = cpu::current_cpu();
+    this->store_cpu(cpu::current_cpu());
     this->context.syscall_kernel_stack = kernel_rsp;
 
     this->pid = sched::task::get_next_pid();
@@ -1264,7 +1264,7 @@ auto Task::initialize_unpublished_process_skeleton(Task& owner, const char* proc
     // Establish teardown identity before allocations/reclaim can reschedule.
     type = TaskType::PROCESS;
     pid = get_next_pid();
-    cpu = cpu::current_cpu();
+    store_cpu(cpu::current_cpu());
     // Match ordinary process construction before any reclaiming allocation.
     // A default Task's zero index does not mean detached from a RunHeap.
     heap_index = -1;
@@ -1513,7 +1513,7 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     t->type = TaskType::PROCESS;
     t->is_thread = true;
     t->owner_pid = OWNER_PID;
-    t->cpu = cpu::current_cpu();
+    t->store_cpu(cpu::current_cpu());
 
     // Share the parent's pagemap - do NOT create a new one
     t->pagemap = parent->pagemap;

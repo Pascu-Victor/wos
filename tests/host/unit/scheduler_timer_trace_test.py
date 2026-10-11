@@ -37,7 +37,7 @@ void trace_reader_hook();
 seams = r'''
 namespace ker::mod::sched {
 namespace task {enum class TaskType:uint8_t{DAEMON,PROCESS,IDLE};
- struct Task{uint64_t pid=19;TaskType type=TaskType::PROCESS;bool cpu_pinned=true;};}
+ struct Task{uint64_t pid=19;TaskType type=TaskType::PROCESS;bool cpu_pinned=true; bool load_cpu_pinned() const noexcept { return cpu_pinned; }};}
 namespace time {unsigned reads=0;uint64_t get_us(){++reads;return 91;}}
 namespace smt {uint64_t get_core_count(){return 2;}}
 struct RunQueue{SchedulerTimerTrace timer_trace;};

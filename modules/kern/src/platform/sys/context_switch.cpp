@@ -329,7 +329,7 @@ void validate_timer_stack(const gates::InterruptFrame& frame, const cpu::GPRegs&
         static_cast<unsigned long long>(task->context.syscall_kernel_stack), static_cast<unsigned>(task->type), task->has_run ? 1U : 0U,
         owner != nullptr ? owner->pid : 0UL, (owner != nullptr && owner->name != nullptr) ? owner->name : "?",
         owner != nullptr ? static_cast<unsigned long long>(owner->context.syscall_kernel_stack) : 0ULL,
-        owner != nullptr ? static_cast<unsigned long long>(owner->cpu) : 0ULL,
+        owner != nullptr ? static_cast<unsigned long long>(owner->load_cpu()) : 0ULL,
         owner != nullptr ? static_cast<unsigned>(owner->sched_queue) : 0U, owner != nullptr ? owner->heap_index : -1);
     hcf();
 }
@@ -1728,7 +1728,7 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
                          static_cast<unsigned long>(CPU_NO), static_cast<unsigned long>(return_task->pid),
                          return_task->name != nullptr ? return_task->name : "?", static_cast<unsigned long>(tracker.streak),
                          static_cast<unsigned>(return_task->type), return_task->is_voluntary_blocked() ? 1U : 0U,
-                         return_task->wants_block ? 1U : 0U, return_task->cpu_pinned ? 1U : 0U,
+                         return_task->wants_block ? 1U : 0U, return_task->load_cpu_pinned() ? 1U : 0U,
                          static_cast<unsigned long>(stats.active_task_count), static_cast<unsigned long>(stats.wait_queue_count),
                          static_cast<unsigned>(frame_ptr->cs));
             }

@@ -8,10 +8,11 @@
 
 ## Outcome and scale
 
-Current checkpoint 37 qualifies atomic RQ domain stamps and fresh locked
-hard-domain admission with five actual scheduler cases. Checkpoint 36's immutable
-registry and Normal eight-CPU public ABI evidence, and checkpoint 35's initial
-nice inheritance/private priority evidence remain as qualified historical runs.
+Current checkpoint 38 qualifies atomic access to all five existing Task placement
+scalars with unchanged compiler-measured layout and three actual native cases.
+Checkpoint 37's locked hard-domain admission, checkpoint 36's immutable registry
+and Normal eight-CPU public ABI evidence, and checkpoint 35's initial nice
+inheritance/private priority evidence remain qualified historical runs.
 Goal39 is ACTIVE; all ten full criteria
 remain incomplete. Launch exact-owned tests with `--no-setup`, maintain one
 topology and prune disposable images after every passing or failing run.
@@ -955,3 +956,89 @@ path spelling and the full157-row launcher pin list did not match the checker’
 initial schema. Corrected02 independently binds those actual rows, all execution
 evidence, final boot artifacts, exact four-image pruning and zero disposable
 allocation. No production/runtime evidence was changed or test rerun required.
+
+## Checkpoint38: atomic Task placement scalar access (2026-10-11)
+
+The existing Task cpu, domain_mask, domain_id, cpu_pinned and domain_hard members
+now have ten lock-free acquire/release atomic_ref accessors. All 146 production
+reads/writes in 22 CPP files use those accessors. Types, defaults, visibility,
+member order, evaluation order, branches and existing scheduling behavior stay
+unchanged. The helpers allocate nothing, acquire no lock, block nowhere and
+retain no atomic_ref. An atomic scalar observation does not prove Task lifetime,
+queue ownership or a coherent placement tuple.
+
+Actual Clang 22 before/after measurements for both Normal and isolated fast
+diagnostic compiler shapes match all 22 layout constants and retained command
+arguments: Task size 16208/alignment 8; cpu 48, domain_mask 56, domain_id 8000,
+cpu_pinned 11860, domain_hard 11861, deferred_task_switch 12015. Member widths and
+alignment are unchanged. Task remains non-standard-layout; native member-address
+measurements use integer addresses rather than subtracting unrelated pointers.
+
+Three new TaskPlacementScalar native cases use one exclusively owned actual
+heap Task each. They verify defaults/layout, mutable/const round trips, CPU 63/64/
+maximum values, mask bit 63, maximum IDs, independent booleans and adjacent
+lifecycle/queue/metadata canaries. No Task is registered, posted or executed; no
+Thread or pagemap is borrowed. Existing 174 native CPP bodies and the header
+selftest block remain byte-exact. Independent production preservation PASS 173
+also checks 144 protected sources and all 146 typed access conversions.
+
+Seven Host fixtures were maintained without dropping existing behavior oracles:
+six follow actual atomic scalar spellings in extracted bodies or source checks;
+the network diagnostic fixture adds its missing explicitly Host-only PID-view/
+procfs admission seams. The latter failure was reproduced with the unchanged
+fixture against five exact committed150eceb0 inputs before correction. It is a
+Host extraction seam, not native namespace/lifetime qualification. Independent
+Host preservation PASS 344 binds all seven original/final fixtures and 55 actual
+unique passing CTest entries.
+
+Normal Build WOS PASS 61.611s; isolated fast diagnostic build PASS 71.373s;
+55 selected Host tests PASS 72.563s; full format/tidy PASS 1171.540s. Tidy retains
+existing nonfatal warnings; this is not a strict warning audit. Its read-only
+analysis overlapped runtime after all implementation/fixture sources were frozen,
+and final qualification waited for actual completion. KTEST 67 --fast --no-setup
+PASS 507.005s: 90,570 assertions/0 failures,1,411 unique executed cases, all 160
+mandatory, natural selftest poweroff/launcher0/no forced stop. The exact prior
+1,408-case set plus three new cases passed; the same three disabled BufferCache
+registrations stay outside executed/mandatory counts. All 190 runtime source/
+artifact pins (188 distinct paths) are stable.
+
+Four exact UID 1000 disposable images were proven inactive and pruned, releasing
+262,225,920 allocated bytes. Final disposable allocation is zero. Complete
+before/live/after inventories preserve unrelated VM 13532 UID 945 and its exact
+arguments. Required seeds/current artifacts, small logs/receipts, Normal/KTEST
+isolation, one topology and 20GiB disposable/40GiB free-space bounds remain.
+
+Retained failures include the original canonical include-order preservation
+FAIL01, successful strict preservation02 followed by formatter03 refusal, and
+amended preservation03 accepting only the formatter's exact existing MM include
+permutation. No suppression was added. Initial layout-parser, stale Host fixture
+and Host-review whitespace-parser failures also remain with exact diagnoses;
+actual code, compiler flags and old assertions were not weakened to satisfy them.
+
+Aggregate checkpoint-38-audit.json PASS SHA256
+a4766f572fb5573f4b1680c3b37088859cfc2535000137ac3738c20688c9e714.
+Before/after layout receipts are before-layout38-02.json/after-layout38-01.json;
+source snapshot SHA256 4c0f426274191645762049ce5586ac81551d829dc22309c0b23cfdb9015c5b33.
+The current Normal kernel is bfbd54385f609991dd947e9e971b3df614c5e7fa7fdf846b6a82e62816080125;
+the diagnostic kernel is c37aef52f90cb3f0df12d55ede20536cdccacd0d3124d6841f947f0099397625.
+Earlier checkpoint artifacts are historical receipts, not these rebuilt images.
+
+Goal39 remains ACTIVE; all ten full criteria remain incomplete. KTEST APs are
+parked; these private scalar/layout cases do not qualify simultaneous SMP memory
+ordering, coherent setters/getters, placement inheritance or CPU ceilings.
+Checkpoint38 deliberately preserves SET_DOMAIN's hard-first move failure, unlocked
+policy tuples, target-capacity panic/partial-fairness rollback and wake-owner gaps.
+Next is checked owner-locked admission/movement with real wake-election exclusion,
+complete claim finishing and PROCESS image serialization. Ordinary wake capacity,
+ancestry/worker-exec/WKI policy, hostile/shared/futex/init regression, two
+simultaneous two-hour trees and 1,000 full lifecycle/allocation-failure/reference
+baselines still require qualification. Continue exact-owned --no-setup tests and
+pruning after PASS/FAIL/exception. No goal pause or push.
+
+Independent checkpoint38-evidence-integrity02.json PASS (all 15 sections), SHA256
+72d5d47768df6f9c569cb44c54b0c5272aed8d97f41aa83a33d63438e53f63fb.
+Its original FAIL01 and initial checker remain intact: the generic command gate
+expected seven Python fixtures in the tidy receipt, which correctly pins only
+24 C++ sources. Revision02 binds those exact 24 rows; the separate Host execution,
+source freeze and runtime pins cover all seven Python fixtures. No production or
+execution evidence was changed for this correction.

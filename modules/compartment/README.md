@@ -84,6 +84,15 @@ BufferCache cases stay excluded. The VM powered off naturally and all four
 private images were pruned. Private snapshots do not qualify live hard-stamp
 SMP races, inherited Task placement or compartment CPU ceilings.
 
+Checkpoint 38 converts all five existing Task placement fields to lock-free
+atomic access without changing their types, defaults, offsets or Task layout.
+Normal and diagnostic builds, format/tidy and 55 focused Host tests passed.
+KTEST67 passed 90,570 assertions with zero failures, 1,411 executed cases and
+all 160 mandatory cases; the same three disabled BufferCache cases remain
+excluded. Its four disposable images were pruned. Three private native cases
+and actual compiler measurements qualify scalar access and layout. Coherent
+placement transactions, inheritance and immutable CPU ceilings remain pending.
+
 Owned software qualification may use `bin/wos-cluster --no-setup` or isolated
 `bin/wos-ktest --no-setup`, with one topology, a 20GiB disposable storage budget,
 40GiB free-space floor and exact-owned inactive-image pruning after every run.

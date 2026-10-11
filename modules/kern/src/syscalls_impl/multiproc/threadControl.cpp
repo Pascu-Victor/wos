@@ -218,13 +218,13 @@ auto host_thread_control_for_subject(mod::sched::task::Task* subject, abi::multi
                     task->release();
                     return static_cast<uint64_t>(-EBUSY);
                 }
-                task->domain_mask = MASK;
-                task->domain_hard = false;
+                task->store_domain_mask(MASK);
+                task->store_domain_hard(false);
             } else if (MASK == VALID_MASK) {
                 // Full mask: remove all affinity restrictions
-                task->domain_mask = ~0ULL;
-                task->domain_hard = false;
-                task->cpu_pinned = false;
+                task->store_domain_mask(~0ULL);
+                task->store_domain_hard(false);
+                task->store_cpu_pinned(false);
             } else {
                 // Multi-bit subset: set domain_mask, pick least-loaded CPU within mask
                 uint64_t const TARGET_CPU = mod::sched::get_least_loaded_cpu_in_mask(MASK);
@@ -232,9 +232,9 @@ auto host_thread_control_for_subject(mod::sched::task::Task* subject, abi::multi
                     task->release();
                     return static_cast<uint64_t>(-EBUSY);
                 }
-                task->domain_mask = MASK;
-                task->domain_hard = false;
-                task->cpu_pinned = false;
+                task->store_domain_mask(MASK);
+                task->store_domain_hard(false);
+                task->store_cpu_pinned(false);
             }
 
             task->release();
@@ -254,14 +254,14 @@ auto host_thread_control_for_subject(mod::sched::task::Task* subject, abi::multi
                 task->release();
                 return static_cast<uint64_t>(-ENODEV);
             }
-            if (task->cpu_pinned) {
-                if (task->cpu >= 64) {
+            if (task->load_cpu_pinned()) {
+                if (task->load_cpu() >= 64) {
                     task->release();
                     return static_cast<uint64_t>(-ERANGE);
                 }
-                mask = 1ULL << task->cpu;
-            } else if (task->domain_mask != ~0ULL) {
-                mask = task->domain_mask & online_cpu_mask();
+                mask = 1ULL << task->load_cpu();
+            } else if (task->load_domain_mask() != ~0ULL) {
+                mask = task->load_domain_mask() & online_cpu_mask();
             }
 
             task->release();
@@ -339,10 +339,10 @@ auto host_thread_control_for_subject(mod::sched::task::Task* subject, abi::multi
                 task->release();
                 return static_cast<uint64_t>(-EBUSY);
             }
-            task->domain_id = DOMAIN_ID;
-            task->domain_mask = dom->cpu_mask;
-            task->domain_hard = HARD || dom->hard;
-            task->cpu_pinned = false;
+            task->store_domain_id(DOMAIN_ID);
+            task->store_domain_mask(dom->cpu_mask);
+            task->store_domain_hard(HARD || dom->hard);
+            task->store_cpu_pinned(false);
             uint64_t const TARGET = mod::sched::get_least_loaded_cpu_in_mask(dom->cpu_mask);
             if (!IS_RUNNING && !IS_WAITING) {
                 mod::sched::reschedule_task_for_cpu(TARGET, task);

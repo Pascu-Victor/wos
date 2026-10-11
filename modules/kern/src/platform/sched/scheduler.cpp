@@ -1011,7 +1011,7 @@ auto validate_transition_boundary_locked(RunQueue* rq, TransitionPhase phase, ta
         if (entry->heap_index != static_cast<int32_t>(index)) {
             note(TransitionInvariant::HEAP_INDEX, entry);
         }
-        if (CPU_NO != TRANSITION_CPU_UNKNOWN && entry->cpu != CPU_NO) {
+        if (CPU_NO != TRANSITION_CPU_UNKNOWN && entry->load_cpu() != CPU_NO) {
             note(TransitionInvariant::HEAP_OWNER, entry);
         }
         if (entry->sched_queue != task::Task::sched_queue::RUNNABLE) {
@@ -1047,7 +1047,7 @@ auto validate_transition_boundary_locked(RunQueue* rq, TransitionPhase phase, ta
                            TRANSITION_LIST_SCAN_LIMIT);
     task::Task* wait_task = rq->wait_list.head;
     while (wait_task != nullptr && wait_observed < WAIT_LIMIT) {
-        if (CPU_NO != TRANSITION_CPU_UNKNOWN && wait_task->cpu != CPU_NO) {
+        if (CPU_NO != TRANSITION_CPU_UNKNOWN && wait_task->load_cpu() != CPU_NO) {
             note(TransitionInvariant::WAIT_OWNER, wait_task);
         }
         if (wait_task->sched_queue != task::Task::sched_queue::WAITING) {
@@ -1123,7 +1123,7 @@ auto validate_transition_boundary_locked(RunQueue* rq, TransitionPhase phase, ta
     }
 
     if (rq->current_task != nullptr) {
-        if (CPU_NO != TRANSITION_CPU_UNKNOWN && rq->current_task->cpu != CPU_NO) {
+        if (CPU_NO != TRANSITION_CPU_UNKNOWN && rq->current_task->load_cpu() != CPU_NO) {
             note(TransitionInvariant::CURRENT_OWNER, rq->current_task);
         }
         if (rq->current_task->type == task::TaskType::IDLE && rq->current_task != rq->idle_task) {
@@ -1139,7 +1139,7 @@ auto validate_transition_boundary_locked(RunQueue* rq, TransitionPhase phase, ta
         }
     }
     if (rq->handoff_task != nullptr) {
-        if (CPU_NO != TRANSITION_CPU_UNKNOWN && rq->handoff_task->cpu != CPU_NO) {
+        if (CPU_NO != TRANSITION_CPU_UNKNOWN && rq->handoff_task->load_cpu() != CPU_NO) {
             note(TransitionInvariant::HANDOFF_OWNER, rq->handoff_task);
         }
         if (rq->handoff_task->type == task::TaskType::IDLE && rq->handoff_task != rq->idle_task) {
@@ -1153,7 +1153,7 @@ auto validate_transition_boundary_locked(RunQueue* rq, TransitionPhase phase, ta
         }
     }
     if (rq->idle_task != nullptr) {
-        bool const IDLE_OWNER_BAD = CPU_NO != TRANSITION_CPU_UNKNOWN && rq->idle_task->cpu != CPU_NO;
+        bool const IDLE_OWNER_BAD = CPU_NO != TRANSITION_CPU_UNKNOWN && rq->idle_task->load_cpu() != CPU_NO;
         bool const IDLE_LIFECYCLE_BAD = rq->idle_task->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE ||
                                         !rq->idle_task->scheduler_published.load(std::memory_order_acquire);
         if (IDLE_OWNER_BAD || IDLE_LIFECYCLE_BAD || rq->idle_task->heap_index >= 0 || rq->idle_task->sched_next != nullptr ||
@@ -1174,7 +1174,7 @@ auto validate_transition_boundary_locked(RunQueue* rq, TransitionPhase phase, ta
         .cpu = CPU_NO,
         .task_address = reinterpret_cast<uint64_t>(offender),
         .task_pid = offender != nullptr ? offender->pid : 0,
-        .task_owner_cpu = offender != nullptr ? offender->cpu : UINT64_MAX,
+        .task_owner_cpu = offender != nullptr ? offender->load_cpu() : UINT64_MAX,
         .current_address = reinterpret_cast<uint64_t>(rq->current_task),
         .handoff_address = reinterpret_cast<uint64_t>(rq->handoff_task),
         .idle_address = reinterpret_cast<uint64_t>(rq->idle_task),
@@ -1518,7 +1518,7 @@ void panic_if_task_reserved_on_other_cpu(task::Task* task, const char* path) {
             "queue=%u heap_index=%d state=%u vblk=%u wblk=%u saved_rip=0x%llx saved_rsp=0x%llx",
             path != nullptr ? path : "?", task->pid, task_name_for_log(task), static_cast<unsigned long>(THIS_CPU),
             static_cast<unsigned long>(other_cpu), OTHER_CURRENT == task ? 1U : 0U, OTHER_HANDOFF == task ? 1U : 0U,
-            static_cast<unsigned long>(task->cpu), static_cast<unsigned>(task->sched_queue), task->heap_index,
+            static_cast<unsigned long>(task->load_cpu()), static_cast<unsigned>(task->sched_queue), task->heap_index,
             static_cast<unsigned>(task->state.load(std::memory_order_acquire)), task->is_voluntary_blocked() ? 1U : 0U,
             task->wants_block ? 1U : 0U, static_cast<unsigned long long>(task->context.frame.rip),
             static_cast<unsigned long long>(task->context.frame.rsp));
@@ -1552,11 +1552,11 @@ void maybe_log_preempt_stall(RunQueue* rq, task::Task* current_task, const ker::
         "syscall_start=%lu slice=%u/%u",
         static_cast<unsigned long>(CPU_NO), static_cast<unsigned long>(current_task->pid),
         current_task->name != nullptr ? current_task->name : "?", task::saved_frame_class_name(frame_class),
-        kernel_preemption_block_reason_name(reason), static_cast<unsigned long>(current_task->cpu), static_cast<unsigned long>(CPU_NO),
-        static_cast<unsigned long long>(frame.cs), static_cast<unsigned long long>(frame.rip), static_cast<unsigned long long>(frame.rsp),
-        static_cast<unsigned long>(rq->runnable_heap.size), static_cast<unsigned long>(rq->wait_list.count),
-        static_cast<unsigned long>(rq->next_wait_deadline_us), static_cast<unsigned long>(now_us),
-        current_task->is_voluntary_blocked() ? 1U : 0U, current_task->wants_block ? 1U : 0U,
+        kernel_preemption_block_reason_name(reason), static_cast<unsigned long>(current_task->load_cpu()),
+        static_cast<unsigned long>(CPU_NO), static_cast<unsigned long long>(frame.cs), static_cast<unsigned long long>(frame.rip),
+        static_cast<unsigned long long>(frame.rsp), static_cast<unsigned long>(rq->runnable_heap.size),
+        static_cast<unsigned long>(rq->wait_list.count), static_cast<unsigned long>(rq->next_wait_deadline_us),
+        static_cast<unsigned long>(now_us), current_task->is_voluntary_blocked() ? 1U : 0U, current_task->wants_block ? 1U : 0U,
         current_task->wait_channel != nullptr ? current_task->wait_channel : "-", static_cast<unsigned>(current_task->wait_channel_kind),
         static_cast<unsigned long long>(perf_wait_callsite(current_task)), static_cast<unsigned long long>(current_task->context.frame.rip),
         static_cast<unsigned long>(current_task->wake_at_us), static_cast<unsigned>(current_task->sched_queue),
@@ -1698,7 +1698,7 @@ inline void assert_task_migration_owner_is_current_cpu(task::Task const* task) {
     if (migration_guard_disabled(STATE) && STATE.owner_cpu != cpu::current_cpu()) [[unlikely]] {
         hcf();
     }
-    if (task->context.saved_frame_class == task::SavedFrameClass::TIMER_PREEMPTED_PROCESS_KERNEL && task->cpu != cpu::current_cpu())
+    if (task->context.saved_frame_class == task::SavedFrameClass::TIMER_PREEMPTED_PROCESS_KERNEL && task->load_cpu() != cpu::current_cpu())
         [[unlikely]] {
         hcf();
     }
@@ -2127,13 +2127,13 @@ enum class RunnableTransitionResult : uint8_t { PUBLISHED, INVALID, STALE_INDEX,
     // allocation-free transition primitive itself.
     if (RESULT == RunnableTransitionResult::STALE_INDEX) {
         dbg::logger<"sched">::error("runnable publish refused: reason=%s pid=%lu name=%s cpu=%lu heap_index=%d queue=%d",
-                                    reason != nullptr ? reason : "?", t->pid, task_name_for_log(t), t->cpu, t->heap_index,
+                                    reason != nullptr ? reason : "?", t->pid, task_name_for_log(t), t->load_cpu(), t->heap_index,
                                     static_cast<int>(t->sched_queue));
         dbg::panic_handler("scheduler: runnable publish refused with stale heap index");
         return false;
     }
     dbg::logger<"sched">::error("runnable heap full: reason=%s pid=%lu name=%s cpu=%lu size=%u cap=%u", reason != nullptr ? reason : "?",
-                                t->pid, task_name_for_log(t), t->cpu, rq->runnable_heap.size, PER_CPU_HEAP_CAP);
+                                t->pid, task_name_for_log(t), t->load_cpu(), rq->runnable_heap.size, PER_CPU_HEAP_CAP);
     dbg::panic_handler("scheduler: runnable heap full");
     return false;
 }
@@ -2175,7 +2175,7 @@ inline void transition_reserve_handoff_locked(RunQueue* rq, task::Task* task, ui
     if (rq == nullptr || task == nullptr) {
         return;
     }
-    task->cpu = cpu::current_cpu();
+    task->store_cpu(cpu::current_cpu());
     rq->handoff_task = task;
     rq->current_task_start_us = start_us;
     validate_transition_boundary_locked(rq, TransitionPhase::HANDOFF_RESERVED, task);
@@ -2192,7 +2192,7 @@ inline auto transition_commit_handoff_locked(RunQueue* rq, task::Task* incoming)
         return nullptr;
     }
     task::Task* const OUTGOING = rq->current_task;
-    incoming->cpu = cpu::current_cpu();
+    incoming->store_cpu(cpu::current_cpu());
     transition_publish_current_locked(rq, incoming);
     if (OUTGOING != incoming) {
         record_scheduler_timer_trace(SchedulerTimerTraceKind::HANDOFF, OUTGOING != nullptr ? OUTGOING->pid : 0);
@@ -2329,7 +2329,7 @@ void set_task_nice_impl(task::Task* task, int nice) {
 
     int const CLAMPED_NICE = clamp_nice(nice);
     uint32_t const NEW_WEIGHT = nice_to_weight(CLAMPED_NICE);
-    uint64_t cpu_no = task->cpu;
+    uint64_t cpu_no = task->load_cpu();
     uint64_t const CORE_COUNT = smt::get_core_count();
     if (cpu_no >= CORE_COUNT) {
         cpu_no = cpu::current_cpu();
@@ -2459,7 +2459,7 @@ inline auto task_can_run_on_cpu(task::Task const* task, uint64_t cpu_no, uint64_
     }
 
     uint64_t const ALL_MASK = (core_count >= 64) ? UINT64_MAX : ((1ULL << core_count) - 1ULL);
-    uint64_t allowed_mask = task->domain_mask & ALL_MASK;
+    uint64_t allowed_mask = task->load_domain_mask() & ALL_MASK;
     if (allowed_mask == 0) {
         allowed_mask = ALL_MASK;
     }
@@ -2471,7 +2471,7 @@ inline auto scheduler_single_process_cpu_target(task::Task const* task, uint64_t
     if (!scheduler_single_process_cpu_enabled() || task == nullptr || task->type != task::TaskType::PROCESS) {
         return UINT64_MAX;
     }
-    if (task->cpu_pinned || task->domain_hard || core_count == 0) {
+    if (task->load_cpu_pinned() || task->load_domain_hard() || core_count == 0) {
         return UINT64_MAX;
     }
     uint64_t const TARGET_CPU = scheduler_single_process_cpu_target_value();
@@ -2485,11 +2485,11 @@ inline auto scheduler_process_owner_cpu_if_migration_disabled(task::Task const* 
     if (!scheduler_no_process_migration_enabled() || task == nullptr || task->type != task::TaskType::PROCESS) {
         return UINT64_MAX;
     }
-    if (task->cpu_pinned || task->domain_hard || core_count == 0) {
+    if (task->load_cpu_pinned() || task->load_domain_hard() || core_count == 0) {
         return UINT64_MAX;
     }
 
-    uint64_t const OWNER_CPU = task->cpu;
+    uint64_t const OWNER_CPU = task->load_cpu();
     if (OWNER_CPU >= core_count || !task_can_run_on_cpu(task, OWNER_CPU, core_count)) {
         return UINT64_MAX;
     }
@@ -2519,7 +2519,7 @@ inline void record_migration_rejection(task::Task const* task, uint64_t target_c
     if (task == nullptr || reason == MigrationRejectionReason::NONE) {
         return;
     }
-    record_migration_outcome(task, task->cpu, target_cpu, reason);
+    record_migration_outcome(task, task->load_cpu(), target_cpu, reason);
 }
 
 inline auto migration_guard_placement(task::Task const* task, uint64_t core_count) -> MigrationGuardPlacement {
@@ -2582,9 +2582,9 @@ inline auto task_cross_cpu_migration_decision(task::Task const* task, uint64_t s
         .migration_disabled = MIGRATION_DISABLED,
         .preempt_disabled = task != nullptr && task->preempt_disable_depth != 0,
         .return_transition = task_has_migration_return_transition(task),
-        .cpu_pin_allows_target = explicit_affinity_override || (task != nullptr && !task->cpu_pinned),
-        .domain_allows_target =
-            explicit_affinity_override || (task != nullptr && !task->domain_hard && task_can_run_on_cpu(task, target_cpu, core_count)),
+        .cpu_pin_allows_target = explicit_affinity_override || (task != nullptr && !task->load_cpu_pinned()),
+        .domain_allows_target = explicit_affinity_override ||
+                                (task != nullptr && !task->load_domain_hard() && task_can_run_on_cpu(task, target_cpu, core_count)),
         .wki_owned = task_is_wki_migration_owned(task),
     });
 }
@@ -2704,14 +2704,14 @@ inline auto detach_steal_candidate_locked(RunQueue* victim_rq, uint64_t victim_c
 
     // Claim ownership BEFORE removing from heap - closes the window
     // where reschedule_task_for_cpu could re-insert into victim queue.
-    uint64_t const PREV_CPU = best->cpu;
-    best->cpu = stealing_cpu;
+    uint64_t const PREV_CPU = best->load_cpu();
+    best->store_cpu(stealing_cpu);
 
     // Remove from victim (victim lock still held). The candidate came
     // from a heap-entry scan, so repair a stale heap_index before
     // removal instead of turning hot migration into a publish panic.
     if (!remove_from_heap_by_scan_locked(victim_rq, best)) {
-        best->cpu = PREV_CPU;
+        best->store_cpu(PREV_CPU);
         return nullptr;
     }
     return best;
@@ -3060,7 +3060,7 @@ uint64_t get_least_loaded_cpu_for_task(task::Task const* incoming_task) {
     }
 
     // Respect domain_mask: if the task has a restricted mask, only consider those CPUs.
-    uint64_t allowed_mask = (incoming_task != nullptr) ? incoming_task->domain_mask : ~0ULL;
+    uint64_t allowed_mask = (incoming_task != nullptr) ? incoming_task->load_domain_mask() : ~0ULL;
     uint64_t const ALL_MASK = (CORE_COUNT >= 64) ? UINT64_MAX : ((1ULL << CORE_COUNT) - 1ULL);
     allowed_mask &= ALL_MASK;
     if (allowed_mask == 0) {
@@ -3139,7 +3139,7 @@ bool post_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, bool release_rese
             return false;
         }
 
-        task->cpu = cpu_no;
+        task->store_cpu(cpu_no);
         if (task->start_time_us == 0) {
             task->start_time_us = time::get_us();
         }
@@ -3182,7 +3182,7 @@ bool post_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, bool release_rese
     if (task->type == task::TaskType::DAEMON && kernel_threads_shutdown_requested()) {
         task->kernel_shutdown_requested.store(true, std::memory_order_release);
     }
-    task->cpu = cpu_no;
+    task->store_cpu(cpu_no);
 
     if (task->start_time_us == 0) {
         task->start_time_us = time::get_us();
@@ -3828,7 +3828,7 @@ auto post_task(task::Task* task) -> bool { return post_task_for_cpu_impl(cpu::cu
 bool post_task_for_cpu(uint64_t cpu_no, task::Task* task) { return post_task_for_cpu_impl(cpu_no, task, false); }
 
 auto post_task_pinned_cpu(uint64_t cpu_no, task::Task* task) -> bool {
-    task->cpu_pinned = true;
+    task->store_cpu_pinned(true);
     return post_task_for_cpu(cpu_no, task);
 }
 
@@ -3847,11 +3847,11 @@ auto post_task_waiting(task::Task* task) -> bool {
         return false;
     }
 
-    uint64_t target_cpu = task->cpu;
+    uint64_t target_cpu = task->load_cpu();
     if (target_cpu >= CORE_COUNT) {
         target_cpu = cpu::current_cpu();
     }
-    task->cpu = target_cpu;
+    task->store_cpu(target_cpu);
 
     if (task->start_time_us == 0) {
         task->start_time_us = time::get_us();
@@ -4024,7 +4024,7 @@ struct TaskOwnerMoveResult {
 
 auto hinted_or_scanned_owner_cpu(task::Task* task) -> uint64_t {
     uint64_t const CORE_COUNT = smt::get_core_count();
-    uint64_t const HINTED_CPU = task != nullptr ? task->cpu : UINT64_MAX;
+    uint64_t const HINTED_CPU = task != nullptr ? task->load_cpu() : UINT64_MAX;
     if (task == nullptr || run_queues == nullptr) {
         return UINT64_MAX;
     }
@@ -4056,7 +4056,7 @@ auto move_task_owner_to_cpu(task::Task* task, uint64_t target_cpu, bool pin_to_t
         return result;
     }
 
-    bool const WAS_PINNED = task->cpu_pinned;
+    bool const WAS_PINNED = task->load_cpu_pinned();
     run_queues->with_two_locks_void(
         OWNER_CPU, target_cpu, [task, OWNER_CPU, target_cpu, pin_to_target, WAS_PINNED, &result](RunQueue* owner_rq, RunQueue* target_rq) {
             if (task->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE) {
@@ -4072,9 +4072,9 @@ auto move_task_owner_to_cpu(task::Task* task, uint64_t target_cpu, bool pin_to_t
                     record_migration_rejection(task, target_cpu, MigrationRejectionReason::RETURN_TRANSITION);
                     return;
                 }
-                task->cpu = target_cpu;
+                task->store_cpu(target_cpu);
                 if (pin_to_target) {
-                    task->cpu_pinned = true;
+                    task->store_cpu_pinned(true);
                 }
                 result.moved = true;
                 return;
@@ -4087,9 +4087,9 @@ auto move_task_owner_to_cpu(task::Task* task, uint64_t target_cpu, bool pin_to_t
             }
 
             if (owner_rq == target_rq) {
-                task->cpu = target_cpu;
+                task->store_cpu(target_cpu);
                 if (pin_to_target) {
-                    task->cpu_pinned = true;
+                    task->store_cpu_pinned(true);
                 }
                 result.moved = true;
                 result.runnable = IN_HEAP;
@@ -4111,9 +4111,9 @@ auto move_task_owner_to_cpu(task::Task* task, uint64_t target_cpu, bool pin_to_t
                 return;
             }
 
-            task->cpu = target_cpu;
+            task->store_cpu(target_cpu);
             if (pin_to_target) {
-                task->cpu_pinned = true;
+                task->store_cpu_pinned(true);
             }
 
             if (moved_waiting) {
@@ -4131,8 +4131,8 @@ auto move_task_owner_to_cpu(task::Task* task, uint64_t target_cpu, bool pin_to_t
                 return;
             }
 
-            task->cpu = OWNER_CPU;
-            task->cpu_pinned = WAS_PINNED;
+            task->store_cpu(OWNER_CPU);
+            task->store_cpu_pinned(WAS_PINNED);
             (void)publish_runnable_task_locked(owner_rq, task, "move-rollback");
         });
 
@@ -4171,7 +4171,7 @@ auto commit_kernel_worker_pins_locked(std::span<KernelWorkerPinPlan> plans, uint
         auto& plan = plans[i];
         auto* worker = plan.request.worker;
         if (worker == nullptr || plan.owner == nullptr || plan.target == nullptr || plan.owner_cpu >= core_count ||
-            plan.request.cpu >= core_count || worker->cpu != plan.owner_cpu || worker->type != task::TaskType::DAEMON ||
+            plan.request.cpu >= core_count || worker->load_cpu() != plan.owner_cpu || worker->type != task::TaskType::DAEMON ||
             worker->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE || worker->gc_queued.load(std::memory_order_acquire))
             return false;
         for (size_t j = 0; j < i; ++j) {
@@ -4206,8 +4206,8 @@ auto commit_kernel_worker_pins_locked(std::span<KernelWorkerPinPlan> plans, uint
     }
     for (auto const& plan : plans) {
         auto* worker = plan.request.worker;
-        worker->cpu = plan.request.cpu;
-        worker->cpu_pinned = true;
+        worker->store_cpu(plan.request.cpu);
+        worker->store_cpu_pinned(true);
         if (plan.owner == plan.target) continue;
         if (!plan.runnable) {
             transition_make_waiting_locked(plan.target, worker);
@@ -4488,7 +4488,7 @@ void finish_kernel_wait_accounting(task::Task* subject, KernelWaitAccounting sta
     }
 
     uint64_t const CPU_NO = cpu::current_cpu();
-    if (task->cpu != CPU_NO) [[unlikely]] {
+    if (task->load_cpu() != CPU_NO) [[unlikely]] {
         hcf();
     }
     MigrationGuardState const CURRENT = task->migration_state();
@@ -4523,7 +4523,7 @@ void finish_kernel_wait_accounting(task::Task* subject, KernelWaitAccounting sta
     }
 
     uint64_t const CPU_NO = cpu::current_cpu();
-    if (task->cpu != CPU_NO) [[unlikely]] {
+    if (task->load_cpu() != CPU_NO) [[unlikely]] {
         hcf();
     }
     MigrationGuardState const CURRENT = task->migration_state();
@@ -4668,7 +4668,7 @@ void kern_wake(task::Task* task) {
     // under locks: task RUNNABLE (no-op if currentTask), task WAITING (move to heap),
     // or task migrated to another CPU.
     // The fast path inside reschedule_task_for_cpu checks task->cpu first (O(1) common case).
-    uint64_t preferred_cpu = task->cpu;
+    uint64_t preferred_cpu = task->load_cpu();
     uint64_t const NCPUS = smt::get_core_count();
     if (preferred_cpu >= NCPUS) {
         preferred_cpu = get_least_loaded_cpu();
@@ -4736,7 +4736,7 @@ void wake_kernel_thread_for_shutdown(task::Task* task) {
         return;
     }
 
-    uint64_t const TARGET_CPU = task->cpu;
+    uint64_t const TARGET_CPU = task->load_cpu();
     if (TARGET_CPU >= smt::get_core_count()) {
         return;
     }
@@ -4895,7 +4895,7 @@ void event_wake_poke(uint64_t cpu_no, WakeCpuMode mode, EventWakeDiagnostics* di
 
 inline auto task_allowed_cpu_mask(task::Task const* task, uint64_t core_count) -> uint64_t {
     uint64_t const ALL_MASK = (core_count >= 64) ? UINT64_MAX : ((1ULL << core_count) - 1ULL);
-    uint64_t allowed_mask = task != nullptr ? task->domain_mask : ALL_MASK;
+    uint64_t allowed_mask = task != nullptr ? task->load_domain_mask() : ALL_MASK;
     allowed_mask &= ALL_MASK;
     return allowed_mask != 0 ? allowed_mask : ALL_MASK;
 }
@@ -4910,7 +4910,7 @@ inline auto event_wake_can_rebalance_process(task::Task const* task) -> bool {
     if (task->is_migration_disabled()) {
         return false;
     }
-    if (task->cpu_pinned || task->domain_hard) {
+    if (task->load_cpu_pinned() || task->load_domain_hard()) {
         return false;
     }
     if (task->thread == nullptr || task->pagemap == nullptr) {
@@ -4968,7 +4968,7 @@ auto event_wake_target_cpu(const task::Task* task, uint64_t waker_cpu) -> uint64
     }
 
     uint64_t const CORE_COUNT = smt::get_core_count();
-    uint64_t target_cpu = task->cpu;
+    uint64_t target_cpu = task->load_cpu();
     uint64_t const SINGLE_PROCESS_CPU = scheduler_single_process_cpu_target(task, CORE_COUNT);
     if (SINGLE_PROCESS_CPU != UINT64_MAX) {
         target_cpu = SINGLE_PROCESS_CPU;
@@ -4979,12 +4979,12 @@ auto event_wake_target_cpu(const task::Task* task, uint64_t waker_cpu) -> uint64
         } else {
             bool const WAITING = task->sched_queue == task::Task::sched_queue::WAITING;
             bool const VOLUNTARY_BLOCK = task->is_voluntary_blocked();
-            if (event_wake_prefers_waker_cpu(task->cpu_pinned, WAITING, VOLUNTARY_BLOCK)) {
+            if (event_wake_prefers_waker_cpu(task->load_cpu_pinned(), WAITING, VOLUNTARY_BLOCK)) {
                 target_cpu = event_wake_rebalance_target_cpu(task, waker_cpu);
             }
         }
     }
-    return cross_cpu_migration_target_or_source(task, task->cpu, target_cpu, CORE_COUNT);
+    return cross_cpu_migration_target_or_source(task, task->load_cpu(), target_cpu, CORE_COUNT);
 }
 
 void wake_task_from_event_on_cpu(task::Task* task, uint64_t target_cpu, EventWakeDeferredSwitch deferred_switch,
@@ -5029,7 +5029,7 @@ void wake_task_from_event_on_cpu(task::Task* task, uint64_t target_cpu, EventWak
     if (cpu >= smt::get_core_count()) {
         cpu = get_least_loaded_cpu();
     }
-    cpu = cross_cpu_migration_target_or_source(task, task->cpu, cpu, smt::get_core_count());
+    cpu = cross_cpu_migration_target_or_source(task, task->load_cpu(), cpu, smt::get_core_count());
     if (cpu >= smt::get_core_count()) {
         return;
     }
@@ -5055,7 +5055,7 @@ void wake_task_from_event(task::Task* task, EventWakeDeferredSwitch deferred_swi
             diagnostics->waker_valid = true;
             diagnostics->waker_pid = waker->pid;
             diagnostics->waker_type = static_cast<uint8_t>(waker->type);
-            diagnostics->waker_pinned = waker->cpu_pinned;
+            diagnostics->waker_pinned = waker->load_cpu_pinned();
         }
         if (run_queues != nullptr && diagnostics->cpu_start < smt::get_core_count()) {
             auto* rq = run_queues->that_cpu(diagnostics->cpu_start);
@@ -5156,11 +5156,11 @@ auto debug_stop_task(task::Task* task) -> bool {
     };
 
     uint64_t const NCPUS = smt::get_core_count();
-    if (task->cpu < NCPUS) {
-        try_stop_on_cpu(task->cpu);
+    if (task->load_cpu() < NCPUS) {
+        try_stop_on_cpu(task->load_cpu());
     }
     for (uint64_t cpu_no = 0; cpu_no < NCPUS && !found && !current_on_cpu; ++cpu_no) {
-        if (cpu_no != task->cpu) {
+        if (cpu_no != task->load_cpu()) {
             try_stop_on_cpu(cpu_no);
         }
     }
@@ -5863,7 +5863,7 @@ void start_scheduler() {
         int64_t const AVG = compute_avg_vruntime(rq);
         auto* t = pick_best_eligible_for_switch_locked(rq, AVG, nullptr);
         if (t != nullptr && t->type != task::TaskType::IDLE && (t->type == task::TaskType::DAEMON || t->thread != nullptr)) {
-            t->cpu = cpu::current_cpu();
+            t->store_cpu(cpu::current_cpu());
             transition_publish_current_locked(rq, t);
         }
         return t;
@@ -5901,7 +5901,7 @@ void start_scheduler() {
                     return nullptr;
                 }
 
-                candidate->cpu = cpu::current_cpu();
+                candidate->store_cpu(cpu::current_cpu());
                 transition_publish_current_locked(rq, candidate);
                 return candidate;
             });
@@ -5919,7 +5919,7 @@ void start_scheduler() {
     prepare_first_run_daemon(first_task, "start-first");
     record_local_proc_first_run(first_task, WOS_PERF_CALLSITE());
     first_task->has_run = true;
-    first_task->cpu = cpu::current_cpu();
+    first_task->store_cpu(cpu::current_cpu());
     publish_current_task_boot_exception(rq, first_task);
 
     // Set up GS/FS MSRs for the first task
@@ -6576,7 +6576,7 @@ void reschedule_task_for_cpu_once(uint64_t cpu_no, task::Task* task, EventWakeDi
             return;
         }
     }
-    cpu_no = cross_cpu_migration_target_or_source(task, task->cpu, cpu_no, NCPUS_RESCHED);
+    cpu_no = cross_cpu_migration_target_or_source(task, task->load_cpu(), cpu_no, NCPUS_RESCHED);
     if (cpu_no >= NCPUS_RESCHED) {
         return;
     }
@@ -6618,7 +6618,7 @@ void reschedule_task_for_cpu_once(uint64_t cpu_no, task::Task* task, EventWakeDi
     ReservedTaskWake reserved_wake{};
 
     // Fast path: task's last CPU
-    uint64_t const LAST_CPU = task->cpu;
+    uint64_t const LAST_CPU = task->load_cpu();
     if (LAST_CPU < NCPUS_RESCHED) {
         with_event_wake_runqueue_lock(LAST_CPU, diagnostics,
                                       [task, &is_current_on_some_cpu, &current_cpu_of_task, &found_owner_cpu, &found_and_removed,
@@ -6628,7 +6628,7 @@ void reschedule_task_for_cpu_once(uint64_t cpu_no, task::Task* task, EventWakeDi
                                               is_current_on_some_cpu = true;
                                               current_cpu_of_task = LAST_CPU;
                                               found_owner_cpu = LAST_CPU;
-                                              task->cpu = LAST_CPU;
+                                              task->store_cpu(LAST_CPU);
                                               found_and_removed = true;
                                               return;
                                           }
@@ -6676,7 +6676,7 @@ void reschedule_task_for_cpu_once(uint64_t cpu_no, task::Task* task, EventWakeDi
                             is_current_on_some_cpu = true;
                             current_cpu_of_task = search_cpu;
                             found_owner_cpu = search_cpu;
-                            task->cpu = search_cpu;
+                            task->store_cpu(search_cpu);
 #ifdef SCHED_DEBUG
                             dbg::log("RESCHED: PID %x is currentTask on CPU %d", task->pid, static_cast<int>(search_cpu));
 #endif
@@ -6749,7 +6749,7 @@ void reschedule_task_for_cpu_once(uint64_t cpu_no, task::Task* task, EventWakeDi
     // Guard against concurrent wakers: if another reschedule already inserted
     // the task, only poke the CPU where it landed.
     if (task->heap_index >= 0) {
-        uint64_t const LANDED_CPU = task->cpu;
+        uint64_t const LANDED_CPU = task->load_cpu();
         bool landed_runnable = false;
         if (LANDED_CPU < smt::get_core_count()) {
             with_event_wake_runqueue_lock(LANDED_CPU, diagnostics, [task, &landed_runnable](RunQueue* rq) {
@@ -6771,16 +6771,16 @@ void reschedule_task_for_cpu_once(uint64_t cpu_no, task::Task* task, EventWakeDi
         cpu_no = cross_cpu_migration_target_or_source(task, found_owner_cpu, cpu_no, NCPUS_RESCHED);
     }
 
-    uint64_t const MIGRATION_SOURCE_CPU = found_owner_cpu < NCPUS_RESCHED ? found_owner_cpu : task->cpu;
-    if (task->cpu_pinned) {
-        uint64_t pinned_cpu = task->cpu;
+    uint64_t const MIGRATION_SOURCE_CPU = found_owner_cpu < NCPUS_RESCHED ? found_owner_cpu : task->load_cpu();
+    if (task->load_cpu_pinned()) {
+        uint64_t pinned_cpu = task->load_cpu();
         if (pinned_cpu >= NCPUS_RESCHED) {
             pinned_cpu = found_owner_cpu < NCPUS_RESCHED ? found_owner_cpu : cpu_no;
-            task->cpu = pinned_cpu;
+            task->store_cpu(pinned_cpu);
         }
         cpu_no = pinned_cpu;  // Ignore requested CPU - keep on pinned CPU
     } else {
-        task->cpu = cpu_no;
+        task->store_cpu(cpu_no);
     }
     bool published_runnable = false;
     with_event_wake_runqueue_lock(cpu_no, diagnostics, [task, cpu_no, &published_runnable](RunQueue* rq) {
@@ -7265,11 +7265,11 @@ void wake_task_for_signal(task::Task* task) {
 
     // Nudge the task's current CPU immediately so hlt/deferred paths react fast.
     // For same-CPU delivery we cannot self-IPI, so arm the local timer instead.
-    if (task->cpu == cpu::current_cpu()) {
+    if (task->load_cpu() == cpu::current_cpu()) {
         request_local_reschedule();
     } else {
         // Signal latency should not depend on an earlier coalesced wake timer.
-        wake_cpu(task->cpu, WakeCpuMode::FORCE);
+        wake_cpu(task->load_cpu(), WakeCpuMode::FORCE);
     }
 
     // If the task is blocked or sleeping in a syscall path, put it back on
@@ -7436,9 +7436,9 @@ void insert_into_dead_list(task::Task* task) {
             dbg::logger<"sched">::error(
                 "repaired idle task after dead GC enqueue attempt: task=%p name=%s cpu=%lu pre_state=%u pre_queue=%d "
                 "pre_death_epoch=%lu pre_gc_queued=%u stack=0x%lx scratch=0x%lx thread=%p pagemap=%p",
-                task, task_name_for_log(task), task->cpu, static_cast<unsigned>(PRE_STATE), static_cast<int>(PRE_QUEUE), PRE_DEATH_EPOCH,
-                PRE_GC_QUEUED ? 1U : 0U, task->context.syscall_kernel_stack, task->context.syscall_scratch_area, task->thread,
-                task->pagemap);
+                task, task_name_for_log(task), task->load_cpu(), static_cast<unsigned>(PRE_STATE), static_cast<int>(PRE_QUEUE),
+                PRE_DEATH_EPOCH, PRE_GC_QUEUED ? 1U : 0U, task->context.syscall_kernel_stack, task->context.syscall_scratch_area,
+                task->thread, task->pagemap);
         }
         return;
     }
@@ -7452,7 +7452,7 @@ void insert_into_dead_list(task::Task* task) {
     }
 
     bool found_current = false;
-    uint64_t const LAST_CPU = task->cpu;
+    uint64_t const LAST_CPU = task->load_cpu();
     uint64_t const CORE_COUNT = smt::get_core_count();
 
     auto detach_from_cpu = [task, &found_current](RunQueue* rq) {
@@ -8359,7 +8359,7 @@ void request_gc() {
         return;
     }
 
-    uint64_t target_cpu = task->cpu;
+    uint64_t target_cpu = task->load_cpu();
     if (target_cpu >= smt::get_core_count()) {
         target_cpu = 0;
     }
@@ -8532,7 +8532,7 @@ void record_scheduler_timer_trace(SchedulerTimerTraceKind kind, uint64_t value, 
     auto* current = current_task_for_preempt();
     uint64_t const METADATA =
         static_cast<uint64_t>(kind) | (static_cast<uint64_t>(current != nullptr ? current->type : task::TaskType::IDLE) << 8U) |
-        (static_cast<uint64_t>(current != nullptr && current->cpu_pinned) << 16U) | (static_cast<uint64_t>(detail) << 32U);
+        (static_cast<uint64_t>(current != nullptr && current->load_cpu_pinned()) << 16U) | (static_cast<uint64_t>(detail) << 32U);
     rq->timer_trace.publish(RESERVATION,
                             {.at_us = time::get_us(), .pid = current != nullptr ? current->pid : 0, .value = value, .metadata = METADATA});
 }
@@ -8951,7 +8951,7 @@ void fill_runqueue_task_state(SchedulerRunQueueTaskState& state, task::Task* tas
     state.sched_queue = static_cast<uint8_t>(task->sched_queue);
     state.voluntary_block = task->is_voluntary_blocked();
     state.wants_block = task->wants_block;
-    state.cpu_pinned = task->cpu_pinned;
+    state.cpu_pinned = task->load_cpu_pinned();
     state.saved_frame_class = static_cast<uint8_t>(task->context.saved_frame_class);
     PreemptionDiagnostic const PREEMPTION_DIAGNOSTIC =
         decode_preemption_diagnostic(task->preemption_diagnostic.load(std::memory_order_relaxed));
@@ -8988,7 +8988,7 @@ void fill_runqueue_task_state(SchedulerRunQueueTaskState& state, task::Task* tas
     state.slice_used_ns = task->slice_used_ns;
     state.slice_ns = task->slice_ns;
     state.heap_index = task->heap_index;
-    state.owner_cpu = task->cpu;
+    state.owner_cpu = task->load_cpu();
     state.yield_switch = task->yield_switch;
     state.deferred_task_switch = task->deferred_task_switch;
 }
@@ -9039,8 +9039,8 @@ auto get_scheduler_cpu_state(uint64_t cpu_no) -> SchedulerCpuState {
             state.current_type = static_cast<uint8_t>(current->type);
             state.current_voluntary_block = current->is_voluntary_blocked();
             state.current_wants_block = current->wants_block;
-            state.current_cpu_pinned = current->cpu_pinned;
-            state.current_task_cpu = current->cpu;
+            state.current_cpu_pinned = current->load_cpu_pinned();
+            state.current_task_cpu = current->load_cpu();
             state.current_saved_frame_class = static_cast<uint8_t>(current->context.saved_frame_class);
             PreemptionDiagnostic const PREEMPTION_DIAGNOSTIC =
                 decode_preemption_diagnostic(current->preemption_diagnostic.load(std::memory_order_relaxed));
@@ -9083,8 +9083,8 @@ auto get_scheduler_cpu_state(uint64_t cpu_no) -> SchedulerCpuState {
             state.handoff_type = static_cast<uint8_t>(handoff->type);
             state.handoff_voluntary_block = handoff->is_voluntary_blocked();
             state.handoff_wants_block = handoff->wants_block;
-            state.handoff_cpu_pinned = handoff->cpu_pinned;
-            state.handoff_task_cpu = handoff->cpu;
+            state.handoff_cpu_pinned = handoff->load_cpu_pinned();
+            state.handoff_task_cpu = handoff->load_cpu();
             state.handoff_saved_frame_class = static_cast<uint8_t>(handoff->context.saved_frame_class);
             PreemptionDiagnostic const PREEMPTION_DIAGNOSTIC =
                 decode_preemption_diagnostic(handoff->preemption_diagnostic.load(std::memory_order_relaxed));

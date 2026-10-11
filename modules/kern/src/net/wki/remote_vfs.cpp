@@ -284,7 +284,7 @@ auto perf_current_pid() -> uint64_t {
 
 auto perf_current_cpu() -> uint32_t {
     auto* task = ker::mod::sched::get_current_task();
-    return task != nullptr ? static_cast<uint32_t>(task->cpu) : 0U;
+    return task != nullptr ? static_cast<uint32_t>(task->load_cpu()) : 0U;
 }
 
 struct PreservedExportIdentity {

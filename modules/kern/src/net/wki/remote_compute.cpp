@@ -966,7 +966,7 @@ auto perf_current_pid() -> uint64_t {
 
 auto perf_current_cpu() -> uint32_t {
     auto* task = ker::mod::sched::get_current_task();
-    return task != nullptr ? static_cast<uint32_t>(task->cpu) : 0U;
+    return task != nullptr ? static_cast<uint32_t>(task->load_cpu()) : 0U;
 }
 
 void perf_record_compute_point(ker::mod::perf::WkiPerfComputeOp op, uint16_t peer, uint32_t correlation, int32_t status, uint32_t aux,
@@ -12877,7 +12877,7 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
 #ifdef DEBUG_WKI_COMPUTE
     // post_task_balanced sets task->cpu before returning; capture it here
     // before the task can complete and be reclaimed.
-    launched_cpu = static_cast<int>(new_task->cpu);
+    launched_cpu = static_cast<int>(new_task->load_cpu());
 #endif
 
     // Send TASK_ACCEPT

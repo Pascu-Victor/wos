@@ -246,10 +246,10 @@ void wake_backlog_handler(BacklogQueue& q, ker::mod::sched::WakeCpuMode cpu_wake
     // runnable handler and return without leaving a token; the handler could
     // then resume and park over the newly published packet.
     ker::mod::sched::wake_task_from_event(q.handler, ker::mod::sched::EventWakeDeferredSwitch::PRESERVE);
-    if (q.handler->cpu == ker::mod::cpu::current_cpu()) {
+    if (q.handler->load_cpu() == ker::mod::cpu::current_cpu()) {
         ker::mod::sys::context_switch::request_reschedule();
     } else {
-        ker::mod::sched::wake_cpu(q.handler->cpu, cpu_wake_mode);
+        ker::mod::sched::wake_cpu(q.handler->load_cpu(), cpu_wake_mode);
     }
 }
 
@@ -553,7 +553,7 @@ void backlog_get_snapshot(BacklogSnapshot& out) {
         }
         if (q.handler != nullptr) {
             row.handler_pid = q.handler->pid;
-            row.handler_cpu = q.handler->cpu;
+            row.handler_cpu = q.handler->load_cpu();
         }
         out.total_queued += row.queued;
     }

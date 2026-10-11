@@ -5538,7 +5538,7 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     }
 
 #ifdef EXEC_DEBUG
-    dbg::log("wos_proc_exec: Successfully posted task '%s' to CPU %d", process_name, new_task->cpu);
+    dbg::log("wos_proc_exec: Successfully posted task '%s' to CPU %d", process_name, new_task->load_cpu());
 #endif
 
     if (!sched::task::release_unpublished_process(parent_task, new_task)) {

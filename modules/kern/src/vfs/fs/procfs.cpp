@@ -1253,7 +1253,7 @@ auto generate_status(ProcTask* task, char* buf, size_t bufsz, bool thread_view, 
 
     // Scheduling info
     append("\nCpu:\t");
-    append_int(task->cpu);
+    append_int(task->load_cpu());
     append("\nSchedQueue:\t");
     switch (task->sched_queue) {
         case ker::mod::sched::task::Task::sched_queue::NONE:
@@ -1445,10 +1445,10 @@ auto generate_stat(ProcTask* task, char* buf, size_t bufsz, bool thread_view, bo
         append("0");
     }
     append(" ");
-    append("0 ");           // nswap
-    append("0 ");           // cnswap
-    append("0 ");           // exit_signal
-    append_int(task->cpu);  // processor
+    append("0 ");                  // nswap
+    append("0 ");                  // cnswap
+    append("0 ");                  // exit_signal
+    append_int(task->load_cpu());  // processor
 
     append("\n");
     buf[off] = '\0';
@@ -3417,7 +3417,7 @@ auto generate_memacc_procs(char* buf, size_t bufsz) -> size_t {
             append_memacc_dec(p, end, "gid", CREDENTIALS.group().real);
             append_memacc_str(p, end, "state", task_state_name(task));
             append_memacc_str(p, end, "queue", task_queue_name(task->sched_queue));
-            append_memacc_dec(p, end, "cpu", task->cpu);
+            append_memacc_dec(p, end, "cpu", task->load_cpu());
             append_memacc_str(p, end, "type", task_type_name(task->type));
             auto const NAMES = copy_proc_names_locked(*task);
             append_memacc_str(p, end, "name", NAMES.short_name.data());

@@ -59,6 +59,9 @@ struct Task {
  std::atomic<TaskState> state{TaskState::ACTIVE};
  std::atomic<bool> gc_queued{false},wakeup_pending{false},reschedule_pending{false},reschedule_in_progress{false};
  std::atomic<uint64_t> reschedule_requested_cpu{0};
+ uint64_t load_cpu() const noexcept { return cpu; }
+ void store_cpu(uint64_t value) noexcept { cpu = value; }
+ bool load_cpu_pinned() const noexcept { return cpu_pinned; }
  bool is_voluntary_blocked()const{return voluntary;}
  void set_voluntary_blocked(bool value){voluntary=value;}
  void clear_wait_channel(){wait_channel=nullptr;wait_channel_kind=WaitChannelKind::NONE;}

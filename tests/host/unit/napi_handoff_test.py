@@ -78,6 +78,8 @@ struct Task {
     uint8_t type = 0; bool cpu_pinned = true;
     bool deferred_task_switch = true, wants_block = false, voluntary = false, channel = false;
     std::atomic<bool> wakeup_pending{false};
+    uint64_t load_cpu() const noexcept { return cpu; }
+    bool load_cpu_pinned() const noexcept { return cpu_pinned; }
     bool wait_channel_is(WaitChannelKind) const { return false; }
     bool has_interrupting_signal_pending() const { return false; }
     void set_wait_channel(const char*) { channel = true; }

@@ -1068,9 +1068,9 @@ void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::
     req.task_type = static_cast<uint64_t>(task->type);
     req.task_state = static_cast<uint64_t>(task->state.load(std::memory_order_acquire));
     req.sched_queue = static_cast<uint64_t>(task->sched_queue);
-    req.current_cpu = task->cpu;
-    req.domain_id = task->domain_id;
-    req.domain_mask = task->domain_mask;
+    req.current_cpu = task->load_cpu();
+    req.domain_id = task->load_domain_id();
+    req.domain_mask = task->load_domain_mask();
     req.wki_target_flags = task->wki_target_flags;
     req.wki_proxy_task_id = task->wki_proxy_task_id;
     req.elf_buffer_addr = reinterpret_cast<uint64_t>(task->elf_buffer);
@@ -1114,8 +1114,8 @@ void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::
     req.task_flags |= task->do_sigreturn ? TASK_FLAG_DO_SIGRETURN : 0;
     req.task_flags |= task->wants_block ? TASK_FLAG_WANTS_BLOCK : 0;
     req.task_flags |= task->just_woke ? TASK_FLAG_JUST_WOKE : 0;
-    req.task_flags |= task->cpu_pinned ? TASK_FLAG_CPU_PINNED : 0;
-    req.task_flags |= task->domain_hard ? TASK_FLAG_DOMAIN_HARD : 0;
+    req.task_flags |= task->load_cpu_pinned() ? TASK_FLAG_CPU_PINNED : 0;
+    req.task_flags |= task->load_domain_hard() ? TASK_FLAG_DOMAIN_HARD : 0;
     req.task_flags |= task->wki_prefer_inline ? TASK_FLAG_WKI_PREFER_INLINE : 0;
     req.task_flags |= task->wki_skip_legacy_placement ? TASK_FLAG_WKI_SKIP_LEGACY_PLACEMENT : 0;
     req.at_random_addr = task->at_random_addr;

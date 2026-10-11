@@ -51,6 +51,8 @@ struct Task {
  bool is_voluntary_blocked()const{return false;}
  std::atomic<bool> wakeup_pending{false},reschedule_pending{false},reschedule_in_progress{false};
  std::atomic<uint64_t> reschedule_requested_cpu{0};
+ uint64_t load_cpu() const noexcept { return cpu; }
+ bool load_cpu_pinned() const noexcept { return cpu_pinned; }
  bool wait_channel_is(WaitChannelKind)const{return proxy;}
 }; }
 struct RunQueue { std::atomic<uint64_t> cpu_irq_us{5},scheduler_timer_interrupts{10}; SchedulerTimerTrace timer_trace{}; };

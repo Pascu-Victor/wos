@@ -107,7 +107,7 @@ bool RunHeap::insert(task::Task* t) {
         // expensive scan/log detail for debug builds; production only needs the
         // O(1) refusal below.
         log::error("insert: PID %x already has heap_index=%d (size=%d, cpu=%d); refusing insert", t->pid, t->heap_index, size,
-                   static_cast<int>(t->cpu));
+                   static_cast<int>(t->load_cpu()));
         for (uint32_t i = 0; i < size; i++) {
             if (heap_entry(*this, i) == t) {
                 log::error("task is in this heap at index %d", i);

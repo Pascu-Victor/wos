@@ -2542,7 +2542,7 @@ auto virtio_net_diag_snapshot(VirtIONetDiagSnapshot* out, size_t max) -> size_t 
             row.napi_diag = ker::net::napi_diag_snapshot(&pair.napi);
             if (pair.napi.worker != nullptr) {
                 row.napi_worker_pid = pair.napi.worker->pid;
-                row.napi_worker_cpu = pair.napi.worker->cpu;
+                row.napi_worker_cpu = pair.napi.worker->load_cpu();
             }
             fill_virtqueue_diag(pair.rxq, row.rx);
             fill_virtqueue_diag(pair.txq, row.tx);

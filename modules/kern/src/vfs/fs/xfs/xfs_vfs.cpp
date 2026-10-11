@@ -277,7 +277,7 @@ class XfsMetadataGuard {
 
         auto* task = ker::mod::sched::get_current_task();
         uint64_t const PID = task != nullptr ? task->pid : 0;
-        uint32_t const CPU = task != nullptr ? static_cast<uint32_t>(task->cpu) : 0U;
+        uint32_t const CPU = task != nullptr ? static_cast<uint32_t>(task->load_cpu()) : 0U;
         ker::mod::perf::record_wki_event(CPU, PID, ker::mod::perf::WkiPerfScope::LOCAL_XFS, static_cast<uint8_t>(op),
                                          ker::mod::perf::WkiPerfPhase::END, 0, 0, ker::mod::perf::next_wki_trace_correlation(), 0,
                                          LATENCY_US, callsite);
@@ -331,7 +331,7 @@ auto perf_current_pid() -> uint64_t {
 
 auto perf_current_cpu() -> uint32_t {
     auto* task = ker::mod::sched::get_current_task();
-    return task != nullptr ? static_cast<uint32_t>(task->cpu) : 0U;
+    return task != nullptr ? static_cast<uint32_t>(task->load_cpu()) : 0U;
 }
 
 auto perf_clamp_u16(uint64_t value) -> uint16_t { return value > UINT16_MAX ? UINT16_MAX : static_cast<uint16_t>(value); }

@@ -73,6 +73,10 @@ int authorize_diagnostic(Snapshot s, int, bool) { return s.admitted ? 0 : -EACCE
 }
 namespace ker::mod::sched::task { struct Task { uint64_t pid=1; };
 uint64_t process_pid(Task& t) { return t.pid; } }
+// Host-only view seam; this fixture qualifies network snapshots and I/O.
+namespace ker::mod::sched::pid_ns {
+struct NamespaceRef { bool is_host() const noexcept { return true; } };
+}
 using ProcTask = ker::mod::sched::task::Task;
 struct File { void* private_data = nullptr; };
 namespace ker::net::wki {
@@ -136,6 +140,7 @@ struct WkiChannel : WkiChannelDiag {
     code += r'''
 int diagnostic_access(ProcNodeType) { return 0; }
 bool private_procfs_node(ProcNodeType) { return false; }
+int procfs_view_policy(const ProcFileData& data) { assert(data.pid_view.is_host()); return 0; }
 template<class... T> ssize_t procfs_read_mounts_as(T...) { assert(false); return -1; }
 template<class... T> ssize_t procfs_read_private(T&&...) { assert(false); return -1; }
 template<class... T> ssize_t procfs_read_limits(T&&...) { assert(false); return -1; }

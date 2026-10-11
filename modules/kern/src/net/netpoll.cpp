@@ -315,7 +315,7 @@ void log_tcp_owner_task(uint64_t pid, const char* label, uint16_t local_port, ui
     }
 
     auto const STATE = task->state.load(std::memory_order_acquire);
-    uint64_t const CPU_NO = task->cpu;
+    uint64_t const CPU_NO = task->load_cpu();
     log::warn(
         "net-watchdog tcp_owner label=%s pid=%llu name=%s type=%s state=%s queue=%s cpu=%llu owner_pid=%llu parent=%llu pgid=%llu "
         "vblk=%u wblk=%u pinned=%u preempt=%u/%u preempt_owner=0x%llx preempt_start=%llu preempt_max=%llu wait=%s kind=%u "
@@ -325,7 +325,7 @@ void log_tcp_owner_task(uint64_t pid, const char* label, uint16_t local_port, ui
         task_state_name(STATE), task_queue_name(task->sched_queue), static_cast<unsigned long long>(CPU_NO),
         static_cast<unsigned long long>(task->owner_pid), static_cast<unsigned long long>(task->parent_pid),
         static_cast<unsigned long long>(task->job_identity().pgid), task->is_voluntary_blocked() ? 1U : 0U, task->wants_block ? 1U : 0U,
-        task->cpu_pinned ? 1U : 0U, task->preempt_disable_depth, task->preempt_pending ? 1U : 0U,
+        task->load_cpu_pinned() ? 1U : 0U, task->preempt_disable_depth, task->preempt_pending ? 1U : 0U,
         static_cast<unsigned long long>(task->preempt_disable_owner), static_cast<unsigned long long>(task->preempt_disable_start_us),
         static_cast<unsigned long long>(task->preempt_disable_max_us), task->wait_channel != nullptr ? task->wait_channel : "-",
         static_cast<unsigned>(task->wait_channel_kind), static_cast<unsigned long long>(task->perf_wait_callsite),
@@ -482,7 +482,7 @@ void poke_napi_worker_cpu(ker::mod::sched::task::Task* worker) {
         return;
     }
 
-    uint64_t const WORKER_CPU = worker->cpu;
+    uint64_t const WORKER_CPU = worker->load_cpu();
     if (WORKER_CPU == ker::mod::cpu::current_cpu()) {
         ker::mod::sys::context_switch::request_reschedule();
         return;
