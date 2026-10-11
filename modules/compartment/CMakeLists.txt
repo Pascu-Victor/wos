@@ -1,0 +1,13 @@
+cmake_minimum_required(VERSION 3.28)
+project(compartment LANGUAGES CXX)
+
+add_executable(compartment src/main.cpp)
+set_target_properties(compartment PROPERTIES OUTPUT_NAME "wos-compartment")
+target_compile_features(compartment PRIVATE cxx_std_23)
+target_compile_options(compartment PRIVATE -Wall -Wextra -Werror -fno-sanitize=safe-stack -fno-exceptions)
+target_include_directories(compartment PRIVATE ${WOS_MODULES_DIR}/kern/src)
+target_link_options(compartment PRIVATE -nostdlib++ --unwindlib=none)
+target_link_libraries(compartment PRIVATE c)
+if(WOS_UASAN)
+    target_link_libraries(compartment PRIVATE c++abi c++ unwind)
+endif()

@@ -1146,6 +1146,7 @@ if(WOS_BUILD_DISK_IMAGES)
         $<TARGET_FILE:journal_lib>
         $<TARGET_FILE:wkictl>
         $<TARGET_FILE:wki_run>
+        $<TARGET_FILE:compartment>
         $<TARGET_FILE:powerctl>
         $<TARGET_FILE:servicectl>
         $<TARGET_FILE:renderbench>
@@ -1178,6 +1179,7 @@ if(WOS_BUILD_DISK_IMAGES)
             ${CMAKE_SOURCE_DIR}/configs/wos-services.conf
             ${CMAKE_SOURCE_DIR}/configs/vfstab
             ${WOS_ROOTFS_CONFIG_INPUTS}
+            ${CMAKE_SOURCE_DIR}/modules/kern/src/abi/compartment.hpp
             ${WOS_MODULE_TARGET_FILES}
             ${BUSYBOX_STAMP}
             ${DROPBEAR_STAMP}
@@ -1414,6 +1416,8 @@ set(WOS_ATTEST_ARTIFACT_ARGS
     --artifact libjournal=$<TARGET_FILE:journal_lib>
     --artifact wkictl=$<TARGET_FILE:wkictl>
     --artifact wki-run=$<TARGET_FILE:wki_run>
+    --artifact wos-compartment=$<TARGET_FILE:compartment>
+    --artifact compartment-spec=${CMAKE_SOURCE_DIR}/modules/kern/src/abi/compartment.hpp
     --artifact powerctl=$<TARGET_FILE:powerctl>
     --artifact servicectl=$<TARGET_FILE:servicectl>
     --artifact renderbench=$<TARGET_FILE:renderbench>

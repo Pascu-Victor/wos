@@ -101,6 +101,7 @@ enum class procmgmt_ops : uint64_t {
     SERVICE_RESOURCE_CONFIGURE = 51,
     SERVICE_RESOURCE_SELECT = 52,
     SERVICE_RESOURCE_READ = 53,
+    COMPARTMENT_CREATE = 54,
 };
 
 enum class SpawnFdActionType : uint32_t {

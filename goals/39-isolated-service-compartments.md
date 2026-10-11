@@ -623,3 +623,36 @@ device/indirect consumer policy, actual hostile/fatal/init/futex/two-hour/1000
 full-lifecycle/Host-init-libc campaigns. Use --no-setup, one topology,20GiB
 disposable/40GiBfree,COW/reflinks and exact-owned inactive pruning on PASS/FAIL.
 No autonomous pause or push.
+
+## Checkpoint32: public mapped spec and launcher (2026-10-11)
+
+Process selector54 and a standalone version1/408-byte header accept bounded
+mapped input from the exact canonical Host creator. Persistent staging owns
+partial allocations/File capabilities before usercopy, then reuses native
+creator policy, root import, argument/ELF preparation and local publication.
+All previous selectors/libc/wire/Task/File layouts remain. Descriptors backed
+by WKI block proxies refuse before storage effects, including partition ancestry;
+Host asset imports copy bytes without passing that transport capability.
+
+The new wos-compartment launcher/header are built and registered in rootfs and
+attestation dependencies. Explicit assets/FD grants, lower-only16limits, zero
+authority/serviceprivileges, denied networking, empty environment and no ambient
+FDs are defaults. Help, diagnostics and a manifest describe capabilities;
+foreground raw64bit Host wait or explicit detach preserves supervision semantics.
+Its README describes current invocation and experimental qualification limits.
+
+Normal Build WOS, isolated fast diagnostics,46 selected Host tests, format/tidy
+and43 preservation checks PASS. Rootless --no-setup KTEST60 PASS88,543assertions/
+0failures/1,389cases/all138mandatory/149stablepins147distinct/normalpoweroff.
+Five new actual mapped-input cases and one provider case qualify partial captures,
+invalid specs/FDs/strings, two capture allocation refusals and exact owner recovery.
+The synthetic images deliberately refuse before post; no runnable success claim.
+All129 broader credential calls retain the same24failures. Four exact-owned
+inactive images pruned261,373,952allocatedB; final0disposable, user VM preserved.
+
+Goal39 ACTIVE/all ten full criteria INCOMPLETE. Continue actual runnable public
+publication/root transfer and CPU-placement inheritance census, guest CLI and
+reproducible fixtures, scheduled hostile/fatal/init/futex tests, full FD/indirect
+policy, two independent2h service trees/1000full lifecycles/all baselines and
+Host/init/libc regression. Use --no-setup, one topology,20GiBdisposable/40GiBfree,
+COW/reflinks and exact-owned inactive pruning on PASS/FAIL. No pause or push.

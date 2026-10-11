@@ -6,6 +6,7 @@
 #include <abi/callnums/vmem.h>
 #include <extern/elf.h>
 
+#include <abi/compartment.hpp>
 #include <array>
 #include <cerrno>
 #include <cstdio>
@@ -7198,4 +7199,294 @@ KTEST(CompartmentPublication, ForeignOrMissingChildrenCannotConsumeExactPendingO
     }
     KREQUIRE_TRUE(process.destroy());
     KEXPECT_TRUE(creation_pending_drained(executor));
+}
+
+namespace {
+namespace compartment_wire = ker::abi::compartment;
+struct MappedCompartmentInput {
+    static constexpr uint64_t ADDRESS = 0x710000;
+    NativeCreationFixture source;
+    UserTask caller;
+    compartment_wire::Spec spec;
+    std::array<compartment_wire::Asset, 2> assets{{{3, 0555, {ADDRESS + 0x400, 12}, 0}, {4, 0555, {ADDRESS + 0x420, 6}, 0}}};
+    compartment_wire::Descriptor descriptor{3, 9, 0};
+    std::array<compartment_wire::String, 2> argv{{{ADDRESS + 0x500, 7}, {0, 0}}};
+    compartment_wire::String envp{ADDRESS + 0x520, 12};
+    std::array<bool, 2> installed{};
+    ~MappedCompartmentInput() {
+        if (caller.task->owned_exec_arguments.load() != nullptr)
+            KEXPECT_TRUE(process_exec::abort_native_compartment_preparation(*caller.task));
+        for (unsigned i = 0; i < installed.size(); ++i)
+            if (installed[i]) KEXPECT_EQ(vfs::vfs_close_for_task(caller.task.get(), static_cast<int>(3 + i)), 0);
+    }
+    auto text(uint64_t address, std::string_view value) -> bool {
+        return usercopy::copy_to_task(*caller.task, address, value.data(), value.size());
+    }
+    auto write() -> bool {
+        return usercopy::copy_value_to_task(*caller.task, ADDRESS, spec) &&
+               usercopy::copy_to_task(*caller.task, ADDRESS + 0x200, assets.data(), sizeof(assets)) &&
+               usercopy::copy_value_to_task(*caller.task, ADDRESS + 0x280, descriptor) &&
+               usercopy::copy_to_task(*caller.task, ADDRESS + 0x300, argv.data(), sizeof(argv)) &&
+               usercopy::copy_value_to_task(*caller.task, ADDRESS + 0x340, envp);
+    }
+    auto prepare() -> int {
+        int result = source.prepare(710, 51);
+        if (result != 0) return result;
+        result = resource::initialize_credentials(*caller.task, source.creator.task->credentials());
+        if (result != 0) return result;
+        if (!caller.map_zero(ADDRESS) || !caller.map_zero(ADDRESS + 4096)) return -ENOMEM;
+        for (unsigned i = 0; i < installed.size(); ++i) {
+            auto* file = i == 0 ? source.executable.get() : source.interpreter.get();
+            vfs::FdReservation slot(caller.task.get(), 3 + i);
+            if (slot.result() != static_cast<int>(3 + i)) return -EMFILE;
+            vfs::vfs_retain_file(file);
+            int const FD = slot.install(file, true);
+            if (FD < 0) {
+                vfs::vfs_put_file(file);
+                return FD;
+            }
+            installed[i] = true;
+        }
+        for (size_t i = 0; i < spec.limits.size(); ++i) {
+            auto limit = caller.task->resources.entries[i].limit;
+            spec.limits[i] = {limit.soft, limit.hard};
+        }
+        spec.executable = {ADDRESS + 0x400, 12};
+        spec.assets = ADDRESS + 0x200;
+        spec.asset_count = assets.size();
+        spec.descriptors = ADDRESS + 0x280;
+        spec.descriptor_count = 1;
+        spec.argv = ADDRESS + 0x300;
+        spec.argc = argv.size();
+        spec.envp = ADDRESS + 0x340;
+        spec.envc = 1;
+        return text(ADDRESS + 0x400, "/app/service") && text(ADDRESS + 0x420, "/ld.so") && text(ADDRESS + 0x500, "service") &&
+                       text(ADDRESS + 0x520, "MODE=private") && write()
+                   ? 0
+                   : -EFAULT;
+    }
+};
+struct PublicInputBaseline {
+    MappedCompartmentInput& input;
+    uint64_t pids = pid_ns::live_namespace_count(), ipc_count = ipc::live_namespace_count(), mounts = mount_ns::live_namespace_count();
+    uint64_t threads = threading::get_active_thread_count();
+    uint64_t executable_refs, interpreter_refs;
+    abi::resource::Usage population{};
+    explicit PublicInputBaseline(MappedCompartmentInput& fixture)
+        : input(fixture),
+          executable_refs(fixture.source.executable->refcount.load()),
+          interpreter_refs(fixture.source.interpreter->refcount.load()) {
+        resource::copy_process_observation(*input.caller.task, population);
+    }
+    void expect() {
+        KEXPECT_TRUE(creation_pending_drained(*input.caller.task));
+        KEXPECT_NULL(input.caller.task->child_list_head);
+        KEXPECT_EQ(input.caller.task->ref_count.load(), uint32_t{1});
+        KEXPECT_EQ(input.caller.task->usercopy_pagemap_accesses.load(), uint32_t{0});
+        KEXPECT_EQ(input.source.executable->refcount.load(), executable_refs);
+        KEXPECT_EQ(input.source.interpreter->refcount.load(), interpreter_refs);
+        KEXPECT_EQ(pid_ns::live_namespace_count(), pids);
+        KEXPECT_EQ(ipc::live_namespace_count(), ipc_count);
+        KEXPECT_EQ(mount_ns::live_namespace_count(), mounts);
+        KEXPECT_EQ(threading::get_active_thread_count(), threads);
+        KEXPECT_EQ(input.caller.task->fd_table.size(), size_t{2});
+        abi::resource::Usage after{};
+        resource::copy_process_observation(*input.caller.task, after);
+        KEXPECT_EQ(after.current, population.current);
+    }
+};
+}  // namespace
+
+KTEST(CompartmentPublicInput, MappedNonrootSpecUsesNativeImportAndPostRefusalRecovery) {
+    MappedCompartmentInput input;
+    KREQUIRE_EQ(input.prepare(), 0);
+    PublicInputBaseline baseline(input);
+    auto const CREDENTIALS = input.caller.task->credentials();
+    auto const GENERATION = input.caller.task->credential_observation().generation;
+    using Fault = process_exec::NativeConstructionFault;
+    process_exec::exec_selftest_fail_native_construction_once(Fault::PUBLICATION_BEFORE_POST);
+    KEXPECT_EQ(process_exec::create_native_compartment_for_subject(input.caller.task.get(), input.ADDRESS), int64_t{-EAGAIN});
+    KEXPECT_FALSE(process_exec::exec_selftest_take_native_construction_fault(Fault::PUBLICATION_BEFORE_POST));
+    process_exec::exec_selftest_fail_native_construction_once(Fault::NONE);
+    baseline.expect();
+    KEXPECT_TRUE(input.caller.task->credentials() == CREDENTIALS);
+    KEXPECT_EQ(input.caller.task->credential_observation().generation, GENERATION);
+}
+
+KTEST(CompartmentPublicInput, InvalidVersionCountsFlagsAndBudgetsCreateNoScopes) {
+    MappedCompartmentInput input;
+    KREQUIRE_EQ(input.prepare(), 0);
+    PublicInputBaseline baseline(input);
+    auto const ORIGINAL = input.spec;
+    for (unsigned scenario = 0; scenario < 14; ++scenario) {
+        input.spec = ORIGINAL;
+        int error = -EINVAL;
+        switch (scenario) {
+            case 0:
+                input.spec.size = 0;
+                break;
+            case 1:
+                input.spec.version = 2;
+                break;
+            case 2:
+                input.spec.flags = 1;
+                break;
+            case 3:
+                input.spec.reserved[0] = 1;
+                break;
+            case 4:
+                input.spec.reserved[1] = 1;
+                break;
+            case 5:
+                input.spec.dumpable = 2;
+                break;
+            case 6:
+                input.spec.network = static_cast<compartment_wire::Network>(2);
+                break;
+            case 7:
+                input.spec.asset_count = 0;
+                break;
+            case 8:
+                input.spec.asset_count = compartment_wire::ASSET_MAX + 1;
+                break;
+            case 9:
+                input.spec.descriptor_count = compartment_wire::DESCRIPTOR_MAX + 1;
+                break;
+            case 10:
+                input.spec.root_bytes = 4095;
+                break;
+            case 11:
+                input.spec.root_bytes = compartment_wire::ROOT_BYTES_MAX + 4096;
+                break;
+            case 12:
+                input.spec.argc = compartment_wire::VECTOR_MAX + 1;
+                error = -E2BIG;
+                break;
+            case 13:
+                input.spec.envc = UINT64_MAX;
+                error = -E2BIG;
+                break;
+        }
+        KREQUIRE_TRUE(input.write());
+        KEXPECT_EQ(process_exec::create_native_compartment_for_subject(input.caller.task.get(), input.ADDRESS), int64_t{error});
+        baseline.expect();
+    }
+}
+
+KTEST(CompartmentPublicInput, PartialMappedStringsAndBadFdsDrainOwnedCapture) {
+    for (unsigned scenario = 0; scenario < 12; ++scenario) {
+        MappedCompartmentInput input;
+        KREQUIRE_EQ(input.prepare(), 0);
+        PublicInputBaseline baseline(input);
+        int error = -EINVAL;
+        switch (scenario) {
+            case 0:
+                input.assets[1].source_fd = -1;
+                error = -EBADF;
+                break;
+            case 1:
+                input.descriptor.source_fd = 255;
+                error = -EBADF;
+                break;
+            case 2:
+                input.assets[1].reserved = 1;
+                break;
+            case 3:
+                input.descriptor.reserved = 1;
+                break;
+            case 4:
+                input.assets[1].destination.address = UINT64_MAX;
+                error = -EFAULT;
+                break;
+            case 5:
+                input.argv[0].address = UINT64_MAX;
+                error = -EFAULT;
+                break;
+            case 6:
+                input.argv[0].bytes = compartment_wire::ARGUMENT_BYTES_MAX;
+                error = -E2BIG;
+                break;
+            case 7:
+                input.spec.executable.bytes = compartment_wire::PATH_BYTES_MAX;
+                error = -ENAMETOOLONG;
+                break;
+            case 8:
+                input.descriptor.destination = Task::FD_TABLE_SIZE;
+                error = -EMFILE;
+                break;
+            case 9:
+                input.assets[1].destination = input.assets[0].destination;
+                error = -EEXIST;
+                break;
+            case 10:
+                KREQUIRE_TRUE(input.text(input.ADDRESS + 0x500, std::string_view("s\0rvice", 7)));
+                break;
+            case 11:
+                input.spec.argv = UINT64_MAX;
+                error = -EFAULT;
+                break;
+        }
+        KREQUIRE_TRUE(input.write());
+        KEXPECT_EQ(process_exec::create_native_compartment_for_subject(input.caller.task.get(), input.ADDRESS), int64_t{error});
+        baseline.expect();
+    }
+}
+
+KTEST(CompartmentPublicInput, AllocationRefusalAndForeignScopePreserveExactOwners) {
+    MappedCompartmentInput input;
+    KREQUIRE_EQ(input.prepare(), 0);
+    PublicInputBaseline baseline(input);
+    using Fault = process_exec::NativeConstructionFault;
+    for (auto fault : {Fault::USER_INPUT_STATE, Fault::USER_ARGUMENT_ARENA}) {
+        process_exec::exec_selftest_fail_native_construction_once(fault);
+        KEXPECT_EQ(process_exec::create_native_compartment_for_subject(input.caller.task.get(), input.ADDRESS), int64_t{-ENOMEM});
+        KEXPECT_FALSE(process_exec::exec_selftest_take_native_construction_fault(fault));
+        process_exec::exec_selftest_fail_native_construction_once(Fault::NONE);
+        baseline.expect();
+    }
+    NativeCreationProcess pending{*input.caller.task};
+    int error = 0;
+    pending.child = process_exec::prepare_native_compartment_for_owner(*input.caller.task, input.source.spec, error);
+    KREQUIRE_EQ(error, 0);
+    KREQUIRE_TRUE(pending.child != nullptr);
+    auto* request = input.caller.task->owned_exec_arguments.load();
+    KEXPECT_EQ(process_exec::create_native_compartment_for_subject(input.caller.task.get(), input.ADDRESS), int64_t{-EBUSY});
+    KEXPECT_TRUE(input.caller.task->owned_exec_arguments.load() == request);
+    KEXPECT_TRUE(input.caller.task->owned_unpublished_process.load() == pending.child);
+    KREQUIRE_TRUE(pending.destroy());
+    baseline.expect();
+    KEXPECT_EQ(process_exec::create_native_compartment_for_subject(nullptr, UINT64_MAX), int64_t{-ESRCH});
+    pid_ns::NamespaceRef scope;
+    KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+    KREQUIRE_TRUE(input.caller.task->initialize_pid_namespace(scope));
+    KEXPECT_EQ(process_exec::create_native_compartment_for_subject(input.caller.task.get(), UINT64_MAX), int64_t{-EPERM});
+    scope.close();
+    KEXPECT_EQ(process_exec::create_native_compartment_for_subject(input.caller.task.get(), UINT64_MAX), int64_t{-EIDRM});
+    KEXPECT_TRUE(creation_pending_drained(*input.caller.task));
+    KEXPECT_EQ(input.caller.task->usercopy_pagemap_accesses.load(), uint32_t{0});
+}
+
+KTEST(CompartmentPublicInput, ZeroVectorsAndCrossPageStringsReachActualPublicationAdmission) {
+    for (unsigned scenario = 0; scenario < 2; ++scenario) {
+        MappedCompartmentInput input;
+        KREQUIRE_EQ(input.prepare(), 0);
+        PublicInputBaseline baseline(input);
+        if (scenario == 0) {
+            input.spec.argc = 0;
+            input.spec.envc = 0;
+            input.spec.argv = UINT64_MAX;
+            input.spec.envp = UINT64_MAX;
+        } else {
+            constexpr uint64_t STRING = input.ADDRESS + 4092;
+            KREQUIRE_TRUE(input.text(STRING, "cross-page-string"));
+            input.argv[0] = {STRING, 17};
+        }
+        KREQUIRE_TRUE(input.write());
+        using Fault = process_exec::NativeConstructionFault;
+        process_exec::exec_selftest_fail_native_construction_once(Fault::PUBLICATION_BEFORE_POST);
+        KEXPECT_EQ(process_exec::create_native_compartment_for_subject(input.caller.task.get(), input.ADDRESS), int64_t{-EAGAIN});
+        KEXPECT_FALSE(process_exec::exec_selftest_take_native_construction_fault(Fault::PUBLICATION_BEFORE_POST));
+        process_exec::exec_selftest_fail_native_construction_once(Fault::NONE);
+        baseline.expect();
+    }
 }

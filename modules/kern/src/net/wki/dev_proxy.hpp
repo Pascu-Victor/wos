@@ -238,6 +238,10 @@ void wki_dev_proxy_init();
 auto wki_dev_proxy_block_matches_observation(ker::dev::BlockDevice* bdev, uint16_t owner_node, uint32_t resource_id,
                                              uint64_t resource_generation, const ResourceIncarnationToken& owner_incarnation) -> bool;
 
+// Borrowed retained immutable provider/partition ancestry. No registry, I/O or
+// attach. Fenced/retired proxies and invalid ancestry remain remote/unsupported.
+auto wki_dev_proxy_block_transport_admission(const ker::dev::BlockDevice* device) -> int;
+
 auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, uint64_t expected_resource_generation,
                                 const ResourceIncarnationToken& expected_owner_incarnation, const char* local_name,
                                 WkiBlockAttachRdmaPolicy rdma_policy = WkiBlockAttachRdmaPolicy::ALLOW) -> dev::BlockDevice*;
@@ -317,6 +321,7 @@ auto wki_dev_proxy_selftest_attach_ack_cookie_fences_stale_completion() -> bool;
 auto wki_dev_proxy_selftest_failed_attach_erases_exact_proxy() -> bool;
 #ifdef WOS_SELFTEST
 auto wki_dev_proxy_selftest_existing_block_identity() -> bool;
+auto wki_dev_proxy_selftest_block_transport_admission() -> bool;
 auto wki_dev_proxy_selftest_zone_retention() -> bool;
 auto wki_dev_proxy_selftest_rdma_sq_wait_stops_on_fence() -> bool;
 auto wki_dev_proxy_selftest_batch_validation_is_atomic() -> bool;

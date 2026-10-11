@@ -6,11 +6,14 @@
 #include <bits/ssize_t.h>
 #include <extern/elf.h>
 
+#include <abi/compartment.hpp>
+#include <net/wki/dev_proxy.hpp>
 #include <platform/sched/native_creation_policy.hpp>
 #include <platform/sched/resource.hpp>
 #include <platform/sched/resource_as.hpp>
 #include <platform/sched/resource_process.hpp>
 #include <platform/sched/session.hpp>
+#include <platform/security/compartment_host.hpp>
 
 // #define EXEC_DEBUG
 
@@ -1570,6 +1573,24 @@ struct WorkerExecHandoff {
 namespace {
 // Every owner here survives an abandoned creation stack through the executor's
 // existing arguments slot. A prepared child must retire before this root does.
+struct NativeCompartmentUserInputs {
+    NativeCompartmentSpec spec;
+    std::array<char, abi::compartment::PATH_BYTES_MAX> executable{};
+    std::array<std::array<char, abi::compartment::PATH_BYTES_MAX>, abi::compartment::ASSET_MAX> paths{};
+    std::array<NativeCompartmentAsset, abi::compartment::ASSET_MAX> assets{};
+    std::array<NativeCompartmentDescriptor, abi::compartment::DESCRIPTOR_MAX> descriptors{};
+    std::array<abi::compartment::Asset, abi::compartment::ASSET_MAX> asset_input{};
+    std::array<abi::compartment::Descriptor, abi::compartment::DESCRIPTOR_MAX> descriptor_input{};
+    std::array<abi::compartment::String, abi::compartment::VECTOR_MAX> argv_input{}, envp_input{};
+    std::array<std::string_view, abi::compartment::VECTOR_MAX> argv{}, envp{};
+    std::unique_ptr<char[]> strings;
+    ~NativeCompartmentUserInputs() {
+        for (auto& asset : assets)
+            if (asset.source != nullptr) vfs::vfs_put_file(asset.source);
+        for (auto& descriptor : descriptors)
+            if (descriptor.source != nullptr) vfs::vfs_put_file(descriptor.source);
+    }
+};
 struct NativeCompartmentPreparation {
     static constexpr size_t ASSET_MAX = 64;
     static constexpr size_t DESCRIPTOR_MAX = 256;
@@ -1608,6 +1629,7 @@ struct NativeCompartmentPreparation {
     NativeProcessArguments arguments;
     uint64_t root_bytes{};
     bool published{};
+    std::unique_ptr<NativeCompartmentUserInputs> user_inputs;
     explicit NativeCompartmentPreparation(mod::sched::task::Task& owner) : executor(owner) {}
     ~NativeCompartmentPreparation();
 };
@@ -4097,6 +4119,11 @@ auto native_regular_capability(vfs::File* file, bool readable, vfs::Stat& stat) 
     if (file->is_directory || !((file->fs_type == vfs::FSType::TMPFS && file->fops == vfs::tmpfs::get_tmpfs_fops()) ||
                                 (file->fs_type == vfs::FSType::XFS && file->fops == vfs::xfs::get_xfs_fops())))
         return -ENOTSUP;
+    if (!readable && file->fs_type == vfs::FSType::XFS) {
+        auto* mount = vfs::xfs::xfs_file_mount_context(file);
+        int const TRANSPORT = net::wki::wki_dev_proxy_block_transport_admission(mount != nullptr ? mount->device : nullptr);
+        if (TRANSPORT != 0) return TRANSPORT;
+    }
     int const STATUS = vfs::vfs_fstat_file(file, &stat);
     if (STATUS != 0) return STATUS;
     return (stat.st_mode & vfs::S_IFMT) == vfs::S_IFREG && stat.st_size >= 0 ? 0 : -ENOTSUP;
@@ -4162,6 +4189,108 @@ auto capture_native_compartment_inputs(NativeCompartmentPreparation& root, ExecR
     return 0;
 }
 
+auto capture_user_native_compartment_inputs(NativeCompartmentPreparation& root, ExecRequestArguments& request, uint64_t address) -> int {
+    namespace wire = abi::compartment;
+    static_assert(wire::CREATE_OPERATION == static_cast<uint64_t>(abi::process::procmgmt_ops::COMPARTMENT_CREATE));
+    static_assert(wire::LIMIT_COUNT == abi::resource::COUNT);
+    wire::Spec input;
+    if (!mod::sys::usercopy::copy_value_from_task(root.executor, address, input)) return -EFAULT;
+    if (input.size != sizeof(input) || input.version != wire::VERSION || input.flags != 0 || input.reserved[0] != 0 ||
+        input.reserved[1] != 0 || input.dumpable > 1 ||
+        (input.network != wire::Network::DENIED && input.network != wire::Network::SHARED_HOST) || input.asset_count == 0 ||
+        input.asset_count > wire::ASSET_MAX || input.descriptor_count > wire::DESCRIPTOR_MAX || input.root_bytes < 4096 ||
+        input.root_bytes > wire::ROOT_BYTES_MAX || input.root_bytes % 4096 != 0)
+        return -EINVAL;
+    if (input.argc > wire::VECTOR_MAX || input.envc > wire::VECTOR_MAX) return -E2BIG;
+#ifdef WOS_SELFTEST
+    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::USER_INPUT_STATE)) return -ENOMEM;
+#endif
+    root.user_inputs.reset(new (std::nothrow) NativeCompartmentUserInputs);
+    if (!root.user_inputs) return -ENOMEM;
+    auto& stage = *root.user_inputs;
+    auto copy_records = [&](uint64_t source, auto& records, uint64_t count) -> int {
+        return count == 0 || mod::sys::usercopy::copy_from_task(root.executor, source, records.data(), count * sizeof(records[0]))
+                   ? 0
+                   : -EFAULT;
+    };
+    auto copy_path = [&](wire::String text, auto& destination) -> int {
+        if (text.bytes == 0) return -EINVAL;
+        if (text.bytes >= destination.size()) return -ENAMETOOLONG;
+        if (!mod::sys::usercopy::copy_from_task(root.executor, text.address, destination.data(), text.bytes)) return -EFAULT;
+        if (std::memchr(destination.data(), '\0', text.bytes) != nullptr) return -EINVAL;
+        destination[text.bytes] = '\0';
+        return 0;
+    };
+    int result = copy_path(input.executable, stage.executable);
+    if (result == 0) result = copy_records(input.assets, stage.asset_input, input.asset_count);
+    if (result == 0) result = copy_records(input.descriptors, stage.descriptor_input, input.descriptor_count);
+    if (result == 0) result = copy_records(input.argv, stage.argv_input, input.argc);
+    if (result == 0) result = copy_records(input.envp, stage.envp_input, input.envc);
+    if (result != 0) return result;
+    for (size_t i = 0; i < input.asset_count; ++i) {
+        auto const& asset = stage.asset_input[i];
+        if (asset.reserved != 0) return -EINVAL;
+        if (int const PATH = copy_path(asset.destination, stage.paths[i]); PATH != 0) return PATH;
+        stage.assets[i].destination = {stage.paths[i].data(), static_cast<size_t>(asset.destination.bytes)};
+        stage.assets[i].mode = asset.mode;
+        stage.assets[i].source = vfs::vfs_get_file_retain(&root.executor, asset.source_fd);
+        if (stage.assets[i].source == nullptr) return -EBADF;
+    }
+    for (size_t i = 0; i < input.descriptor_count; ++i) {
+        auto const& descriptor = stage.descriptor_input[i];
+        if (descriptor.reserved != 0) return -EINVAL;
+        stage.descriptors[i].destination = descriptor.destination;
+        stage.descriptors[i].source = vfs::vfs_get_file_retain(&root.executor, descriptor.source_fd);
+        if (stage.descriptors[i].source == nullptr) return -EBADF;
+    }
+    size_t budget = (input.argc + input.envc + 2) * sizeof(uint64_t);
+    size_t bytes = 0;
+    for (auto vector : {std::span(stage.argv_input.data(), input.argc), std::span(stage.envp_input.data(), input.envc)}) {
+        for (auto text : vector) {
+            if (text.bytes >= wire::ARGUMENT_BYTES_MAX - budget) return -E2BIG;
+            budget += text.bytes + 1;
+            bytes += text.bytes + 1;
+        }
+    }
+#ifdef WOS_SELFTEST
+    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::USER_ARGUMENT_ARENA)) return -ENOMEM;
+#endif
+    stage.strings.reset(new (std::nothrow) char[bytes != 0 ? bytes : 1]);
+    if (!stage.strings) return -ENOMEM;
+    char* cursor = stage.strings.get();
+    auto copy_vector = [&](auto const& source, auto& destination, size_t count) -> int {
+        for (size_t i = 0; i < count; ++i) {
+            auto const TEXT = source[i];
+            if (TEXT.bytes != 0 && !mod::sys::usercopy::copy_from_task(root.executor, TEXT.address, cursor, TEXT.bytes)) return -EFAULT;
+            if (std::memchr(cursor, '\0', TEXT.bytes) != nullptr) return -EINVAL;
+            cursor[TEXT.bytes] = '\0';
+            destination[i] = {cursor, static_cast<size_t>(TEXT.bytes)};
+            cursor += TEXT.bytes + 1;
+        }
+        return 0;
+    };
+    result = copy_vector(stage.argv_input, stage.argv, input.argc);
+    if (result == 0) result = copy_vector(stage.envp_input, stage.envp, input.envc);
+    if (result != 0) return result;
+    stage.spec.policy.authority_ceiling = input.authority_ceiling;
+    stage.spec.policy.service_privileges = input.service_privileges;
+    stage.spec.policy.dumpable = input.dumpable != 0;
+    stage.spec.policy.network = input.network == wire::Network::DENIED ? mod::security::compartment::Network::DENIED
+                                                                       : mod::security::compartment::Network::SHARED_HOST;
+    for (size_t i = 0; i < input.limits.size(); ++i) stage.spec.policy.limits[i] = {input.limits[i].soft, input.limits[i].hard};
+    stage.spec.arguments = {.executable_path = {stage.executable.data(), static_cast<size_t>(input.executable.bytes)},
+                            .argv = {stage.argv.data(), input.argc},
+                            .envp = {stage.envp.data(), input.envc}};
+    stage.spec.assets = {stage.assets.data(), input.asset_count};
+    stage.spec.descriptors = {stage.descriptors.data(), input.descriptor_count};
+    stage.spec.root_bytes = input.root_bytes;
+    result = capture_native_compartment_inputs(root, request, stage.spec);
+    // The native request now owns its own strings and File references. Drop
+    // user staging while the executor guard still protects blocking releases.
+    root.user_inputs.reset();
+    return result;
+}
+
 auto populate_native_compartment_root(NativeCompartmentPreparation& root) -> int {
 #ifdef WOS_SELFTEST
     if (exec_selftest_take_native_construction_fault(NativeConstructionFault::CREATION_RESERVATION)) return -ENOMEM;
@@ -4172,6 +4301,12 @@ auto populate_native_compartment_root(NativeCompartmentPreparation& root) -> int
                                mod::sched::resource::ProcessReservation(root.resources, root.policy.admitted.credentials.user().real));
     if (!root.reservation) return -ENOMEM;
     if (root.reservation->result() != 0) return root.reservation->result();
+    // Inherited descriptions must be admitted before any asset import I/O.
+    for (size_t i = 0; i < root.descriptor_count; ++i) {
+        vfs::Stat stat{};
+        int const STATUS = native_regular_capability(root.descriptors[i].source, false, stat);
+        if (STATUS != 0) return STATUS;
+    }
     uint64_t bytes = 0;
     uint64_t const FSIZE = root.policy.admitted.limits[static_cast<unsigned>(mod::sched::resource::Id::FSIZE)].soft;
     for (size_t i = 0; i < root.asset_count; ++i) {
@@ -4187,11 +4322,6 @@ auto populate_native_compartment_root(NativeCompartmentPreparation& root) -> int
         if (static_cast<uint64_t>(asset.stat.st_size) > root.root_bytes) return -E2BIG;
         uint64_t const PAGES = (static_cast<uint64_t>(asset.stat.st_size) + 4095) / 4096;
         if (!mod::sched::resource::add_extent(bytes, PAGES, 4096) || bytes > root.root_bytes) return -E2BIG;
-    }
-    for (size_t i = 0; i < root.descriptor_count; ++i) {
-        vfs::Stat stat{};
-        int const STATUS = native_regular_capability(root.descriptors[i].source, false, stat);
-        if (STATUS != 0) return STATUS;
     }
     int status = vfs::mount_ns::create_namespace(root.context.mounts);
     if (status == 0) status = mod::sched::ipc::create_namespace(root.context.ipc);
@@ -4420,8 +4550,8 @@ auto abort_native_compartment_preparation(mod::sched::task::Task& executor, mod:
     return executor.owned_exec_arguments.load(std::memory_order_acquire) == nullptr;
 }
 
-auto prepare_native_compartment_for_owner(mod::sched::task::Task& executor, const NativeCompartmentSpec& spec, int& error)
-    -> mod::sched::task::Task* {
+static auto prepare_native_compartment_inputs_for_owner(mod::sched::task::Task& executor, const NativeCompartmentSpec* spec,
+                                                        uint64_t user_address, int& error) -> mod::sched::task::Task* {
     error = 0;
     ExecRequestArguments* request = nullptr;
     mod::sched::task::Task* child = nullptr;
@@ -4460,7 +4590,9 @@ auto prepare_native_compartment_for_owner(mod::sched::task::Task& executor, cons
             request->compartment.reset(new (std::nothrow) NativeCompartmentPreparation(executor));
             if (!request->compartment) error = -ENOMEM;
         }
-        if (error == 0) error = capture_native_compartment_inputs(*request->compartment, *request, spec);
+        if (error == 0)
+            error = spec != nullptr ? capture_native_compartment_inputs(*request->compartment, *request, *spec)
+                                    : capture_user_native_compartment_inputs(*request->compartment, *request, user_address);
         if (error == 0) error = populate_native_compartment_root(*request->compartment);
 #ifdef WOS_SELFTEST
         if (error == 0 && exec_selftest_take_native_construction_fault(NativeConstructionFault::CREATION_RECOVERY_IMPORT))
@@ -4538,6 +4670,11 @@ auto prepare_native_compartment_for_owner(mod::sched::task::Task& executor, cons
     return child;
 }
 
+auto prepare_native_compartment_for_owner(mod::sched::task::Task& executor, const NativeCompartmentSpec& spec, int& error)
+    -> mod::sched::task::Task* {
+    return prepare_native_compartment_inputs_for_owner(executor, &spec, 0, error);
+}
+
 auto publish_native_compartment_for_owner(mod::sched::task::Task& executor, mod::sched::task::Task* child) -> int64_t {
     int result = 0;
     uint64_t pid = 0;
@@ -4602,6 +4739,21 @@ auto publish_native_compartment_for_owner(mod::sched::task::Task& executor, mod:
     // cleanup keeps its own persistent/fatal recovery owner until destruction.
     cleanup_exec_preparation(executor);
     return static_cast<int64_t>(pid);
+}
+
+auto create_native_compartment_for_subject(mod::sched::task::Task* executor, uint64_t spec_address) -> int64_t {
+    int const SCOPE = mod::security::compartment::host_namespace_admission(executor);
+    if (SCOPE != 0) return SCOPE;
+    if (mod::power::shutdown_in_progress()) return -ESHUTDOWN;
+    int error = 0;
+    auto* child = prepare_native_compartment_inputs_for_owner(*executor, nullptr, spec_address, error);
+    if (child == nullptr) return error != 0 ? error : -ENOEXEC;
+    int64_t const RESULT = publish_native_compartment_for_owner(*executor, child);
+    if (RESULT < 0 && !abort_native_compartment_preparation(*executor, child)) [[unlikely]] {
+        mod::dbg::panic_handler("native public creation: lost preparation ownership");
+        hcf();
+    }
+    return RESULT;
 }
 
 auto wos_proc_exec(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr) -> uint64_t {

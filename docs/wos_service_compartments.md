@@ -2,9 +2,11 @@
 
 Goal39 is in progress. Profile preparation, private native SysV IPC namespace
 ownership/lookup, private native mount-table ownership, Task native lookup and
-subject mount administration are implemented. No public compartment creation
-syscall or launcher is enabled. Exact-owner ambient network admission is now
-implemented; complete PID, lifecycle and WKI integration remain incomplete. Independent
+subject mount administration are implemented. Checkpoint 32 adds the experimental
+versioned public creation syscall and `wos-compartment` launcher. Mapped-input
+admission and rollback pass native tests; successful scheduled service launch
+remains unqualified. Exact-owner ambient network admission is implemented;
+complete PID, lifecycle and WKI qualification remains incomplete. Independent
 service isolation and all ten goal criteria remain unqualified. Goal28 remains
 incomplete at its committed wire-codec checkpoint while this work proceeds.
 
@@ -57,8 +59,8 @@ table generations, pivot publication and storage remain globally serialized.
 Retained native root/cwd views already enforce object identity and read-only/
 nosuid restrictions. Task ownership, native component lookup and retained lookup
 consumption and mount administration now carry the exact subject mount namespace.
-Remaining root/compatibility helpers and procfs PID/link consumers still require
-integration before public creation can be enabled. Retained File listings and
+Root/compatibility helpers and procfs PID/link consumers have native coverage;
+scheduled public-service qualification remains required. Retained File listings and
 subject mount observations now select their exact namespace. Shared backend
 lifetime must remain distinct from visible mount attachment lifetime before
 cloning existing mount attachments can be supported.
@@ -1178,10 +1180,10 @@ preservation checks pass. KTEST50 was stopped after a fixture supplied the journ
 grant without its required ceiling; only that fixture was corrected before 51.
 Eight proven inactive disposable images from both runs were pruned; final usage 0.
 
-Public creation remains disabled. Checkpoints 29 and 31 add canonical creator
-capture, owned root population and a kernel-only local publisher. Versioned
-public input, explicit shared mapping manifests and scheduled publication still
-require integration and qualification. Other existing image/
+Public creation was disabled at checkpoint 28. Checkpoints 29 and 31 add canonical
+creator capture, owned root population and a kernel-only local publisher;
+checkpoint 32 adds versioned public input and the launcher. Explicit shared
+mapping qualification and scheduled publication remain required. Other image/
 construction allocation paths and actual scheduled fatal races are not covered
 by these nine targeted allocation refusals or transferred recovery hooks.
 Checkpoint 30 supplies private-view admission for DEBUG, service-resource
@@ -1227,13 +1229,14 @@ namespace references, population reservation and partial children drain through
 owned abort/recovery paths. Successful preparation retains root state; ownership
 is not declared transferred before real publication.
 
-Public creation remains disabled. Checkpoint 31 implements kernel-only local
-publication and root ownership transfer; runnable success and scheduled races
-remain unqualified. Versioned userspace spec/launcher, explicit shared mapping
-and complete FD capability manifests remain required. Checkpoint 30
+Public creation was disabled at checkpoint 29. Checkpoint 31 implements native
+local publication and root ownership transfer, and checkpoint 32 supplies a
+versioned userspace spec/launcher. Runnable success, scheduled races, explicit
+shared mappings and complete FD capability qualification remain required. Checkpoint 30
 closes the selected DEBUG, CPU-domain/affinity, swap, init mailbox/status, service
 resource, global sync and log-block/framebuffer gaps. Remaining explicit device/
-FD/indirect consumers still need qualification before public enablement. Scheduled fatal races, actual shared futex/init death, two
+FD/indirect consumers still need qualification for the experimental public interface.
+Scheduled fatal races, actual shared futex/init death, two
 service trees on one kernel for 2 hours and 1,000 full lifecycles remain unqualified.
 The current 129 credential source calls still have 24 unchanged failures. All ten
 full Goal39 criteria remain incomplete and the goal is ACTIVE.
@@ -1337,6 +1340,65 @@ pruned (261,308,416 allocated bytes); final disposable usage is zero. Public
 launcher/spec, scheduled hostile/fatal/init/futex tests, two two-hour service
 trees and 1,000 complete lifecycles remain required. Goal39 is ACTIVE and all ten
 full criteria remain incomplete.
+
+## Versioned public input and launcher (checkpoint 32)
+
+Process operation 54 accepts the executing process's version-1 `Spec` address.
+The standalone header is installed at `/usr/include/wos/compartment.hpp`.
+Its fixed 408-byte layout uses explicit 64-bit addresses/counts, sixteen resource
+limits and zero-required flags/reserved fields. Existing operation numbers,
+libc wrappers, Task/File layouts and WKI wire formats remain unchanged.
+
+The kernel admits the exact canonical local Host creator before copying input.
+It owns bounded staging in the existing persistent preparation request before
+faulting usercopy, retains source FDs from that executor's canonical table, then
+reuses native policy capture, root import, ELF/stack preparation and local
+publication. Refusal aborts the exact owned child/root. A successful call returns
+the physical Host PID for supervision; it exposes no namespace join handle.
+
+Inputs allow 1–64 assets, at most 256 descriptor grants and 256 entries per
+argument/environment vector, with a combined 2MiB string/pointer budget. Imported
+data has a whole-page 4KiB–32MiB budget. Destination paths are canonical absolute
+names below 512 bytes; the existing executable observation currently imposes a
+stricter 255-byte executable-path bound. Empty argument strings are legal;
+embedded NULs, unsupported versions, invalid records and partial copies refuse.
+
+`/usr/bin/wos-compartment` defaults to denied networking, zero retained authority,
+zero service privileges, disabled dumpability, an empty environment and no ambient
+FD inheritance. It reads all sixteen current limits and accepts lower overrides.
+`--asset SOURCE DEST MODE` copies readable regular Files into fresh private TMPFS;
+`--fd SOURCE_FD DEST_FD` retains a local regular File's rights, offset and shared
+mapping identity. Directory, device and socket grants are unsupported. An XFS
+descriptor backed by a WKI block proxy is rejected before `fstat` or import I/O,
+including partition ancestry and inactive/fenced proxy callbacks. Host asset
+imports may read such storage because only copied bytes enter the service root.
+The ancestry classifier performs no transport, registry, allocation or lock work.
+Actual mounted remote-storage and indirect-consumer campaigns remain required.
+
+The launcher prints assets, descriptor grants, network policy, authority,
+dumpability, service privileges and all limits. It opens/owns only its asset FDs
+and borrows explicit grant FDs. Foreground supervision uses the existing raw
+64-bit WAITPID interface; `--detach` requests ordinary Host parent/adoption
+behavior. Help and usage are documented in `modules/compartment/README.md`.
+
+KTEST60 passed 88,543 assertions, zero failures and 1,389 cases, including all
+138 mandatory cases and six new mapped-input/provider cases. Actual nonroot
+mapped creation reaches a deliberate before-post refusal after native import,
+arguments, empty/cross-page strings and explicit retained FD admission. Invalid
+records, pointers, FDs, budgets, allocation failures, busy/foreign/closed owners
+drain exact Task/File/thread/population and mount/PID/IPC owners. This deliberately
+does not schedule the synthetic ELF. The actual launcher parser passes a Host
+ASan/UBSan test with adapted raw syscall boundaries, including a PID above 32 bits;
+that test is not guest execution evidence.
+
+Normal Build WOS, isolated fast diagnostic build, all 46 selected Host tests,
+format/tidy and 43 preservation checks passed. All 149 runtime pins (147 distinct
+paths) stayed frozen through normal selftest poweroff. Four exact-owned inactive
+images were pruned (261,373,952 allocated bytes); final disposable usage is zero.
+The 129 broader credential source calls retain the same 24 failures. Successful
+runnable publication, CPU placement inheritance review, guest CLI, scheduled
+hostile/init/futex tests, two two-hour service trees and 1,000 complete lifecycles
+remain required. Goal39 stays ACTIVE; all ten full criteria remain incomplete.
 
 ## Verification checkpoint
 

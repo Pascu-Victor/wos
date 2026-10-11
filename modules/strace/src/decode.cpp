@@ -121,6 +121,8 @@ auto subop_name(uint64_t callnum, uint64_t op) -> std::string_view {
                     return "exec";
                 case ker::abi::process::procmgmt_ops::SPAWN:
                     return "spawn";
+                case ker::abi::process::procmgmt_ops::COMPARTMENT_CREATE:
+                    return "compartment_create";
                 case ker::abi::process::procmgmt_ops::INIT_CONTROL_SUBMIT:
                     return "init_control_submit";
                 case ker::abi::process::procmgmt_ops::INIT_CONTROL_RECEIVE:

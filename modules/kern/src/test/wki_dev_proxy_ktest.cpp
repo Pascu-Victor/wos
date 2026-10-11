@@ -27,6 +27,10 @@ KTEST(WkiDevProxyReuse, ExistingProviderMatchesSelectedObservation) {
     KEXPECT_TRUE(ker::net::wki::wki_dev_proxy_selftest_existing_block_identity());
 }
 
+KTEST(WkiDevProxyCapability, LocalStorageAdmissionRejectsProxyAndInvalidAncestry) {
+    KEXPECT_TRUE(ker::net::wki::wki_dev_proxy_selftest_block_transport_admission());
+}
+
 KTEST(WkiDevProxyFenceFlags, LifecycleFlagsAreAtomic) {
     using State = ker::net::wki::ProxyBlockState;
 

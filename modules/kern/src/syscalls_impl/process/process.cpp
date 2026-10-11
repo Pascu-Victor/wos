@@ -2947,6 +2947,8 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
         case abi::process::procmgmt_ops::SPAWN: {
             return wos_proc_spawn(a2, a3, a4, a5);
         }
+        case abi::process::procmgmt_ops::COMPARTMENT_CREATE:
+            return static_cast<uint64_t>(create_native_compartment_for_subject(ker::mod::sched::get_current_task(), a2));
         case abi::process::procmgmt_ops::INIT_CONTROL_SUBMIT: {
             return wos_proc_init_control_submit(a2);
         }

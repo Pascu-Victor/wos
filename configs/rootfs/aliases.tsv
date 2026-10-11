@@ -29,6 +29,8 @@ copy-mode	build/modules/sftpserver/sftp-server	/usr/libexec/sftp-server	755
 copy	build/modules/journal/journal	/usr/bin/journalctl
 copy	build/modules/wkictl/wkictl	/usr/bin/wkictl
 copy	build/modules/wkictl/wki-run	/usr/libexec/wki-run
+copy	build/modules/compartment/wos-compartment	/usr/bin/wos-compartment
+copy	modules/kern/src/abi/compartment.hpp	/usr/include/wos/compartment.hpp
 copy	build/modules/powerctl/powerctl	/usr/sbin/powerctl
 copy	build/modules/servicectl/servicectl	/usr/bin/servicectl
 symlink	/usr/sbin/powerctl	/sbin/reboot

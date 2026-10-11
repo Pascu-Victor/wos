@@ -3236,6 +3236,18 @@ void wki_dev_proxy_process_pending_detaches() {
 // Attach / Detach
 // -----------------------------------------------------------------------------
 
+auto wki_dev_proxy_block_transport_admission(const ker::dev::BlockDevice* device) -> int {
+    // Mounted File ownership keeps providers alive; operations/ancestry are
+    // immutable after publication, including retired-in-place proxy rows.
+    for (unsigned depth = 0; depth < 32 && device != nullptr; ++depth) {
+        if (device->read_blocks == remote_block_read || device->write_blocks == remote_block_write || device->flush == remote_block_flush)
+            return -ENOTSUP;
+        if (!device->is_partition) return device->parent_disk == nullptr ? 0 : -ENOTSUP;
+        device = device->parent_disk;
+    }
+    return -ENOTSUP;
+}
+
 auto wki_dev_proxy_block_matches_observation(ker::dev::BlockDevice* bdev, uint16_t owner_node, uint32_t resource_id,
                                              uint64_t resource_generation, const ResourceIncarnationToken& owner_incarnation) -> bool {
     if (bdev == nullptr || resource_generation == 0) {
@@ -4516,6 +4528,28 @@ auto wki_dev_proxy_selftest_failed_attach_erases_exact_proxy() -> bool {
 }
 
 #ifdef WOS_SELFTEST
+auto wki_dev_proxy_selftest_block_transport_admission() -> bool {
+    dev::BlockDevice local, partition, proxy;
+    bool ok = wki_dev_proxy_block_transport_admission(nullptr) == -ENOTSUP && wki_dev_proxy_block_transport_admission(&local) == 0;
+    partition.is_partition = true;
+    partition.parent_disk = &local;
+    ok &= wki_dev_proxy_block_transport_admission(&partition) == 0;
+    for (unsigned operation = 0; operation < 3; ++operation) {
+        proxy.read_blocks = operation == 0 ? remote_block_read : nullptr;
+        proxy.write_blocks = operation == 1 ? remote_block_write : nullptr;
+        proxy.flush = operation == 2 ? remote_block_flush : nullptr;
+        partition.parent_disk = &proxy;
+        ok &=
+            wki_dev_proxy_block_transport_admission(&proxy) == -ENOTSUP && wki_dev_proxy_block_transport_admission(&partition) == -ENOTSUP;
+    }
+    partition.parent_disk = nullptr;
+    ok &= wki_dev_proxy_block_transport_admission(&partition) == -ENOTSUP;
+    partition.parent_disk = &partition;
+    ok &= wki_dev_proxy_block_transport_admission(&partition) == -ENOTSUP;
+    local.parent_disk = &partition;
+    return ok && wki_dev_proxy_block_transport_admission(&local) == -ENOTSUP;
+}
+
 auto wki_dev_proxy_selftest_existing_block_identity() -> bool {
     constexpr uint16_t OWNER = 0x7ffe;
     constexpr uint32_t RESOURCE = 0xffffffe1;

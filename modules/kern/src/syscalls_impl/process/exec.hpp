@@ -110,6 +110,9 @@ auto prepare_native_compartment_for_owner(ker::mod::sched::task::Task& executor,
 // Consumes preparation on success and returns physical PID for Host supervision.
 // Failure leaves the exact child/root owned for explicit abort. No remote post.
 auto publish_native_compartment_for_owner(ker::mod::sched::task::Task& executor, ker::mod::sched::task::Task* child) -> int64_t;
+// Actual mapped versioned ABI input from this executing/retained subject.
+// Returns physical Host child PID or negative errno; owns abort on refusal.
+auto create_native_compartment_for_subject(ker::mod::sched::task::Task* executor, uint64_t spec_address) -> int64_t;
 auto abort_native_compartment_preparation(ker::mod::sched::task::Task& executor, ker::mod::sched::task::Task* child = nullptr) -> bool;
 
 // Internal admitted native construction context, never a userspace join handle.
@@ -166,7 +169,9 @@ enum class NativeConstructionFault : uint8_t {
     CREATION_RECOVERY_IMPORT,
     CREATION_RECOVERY_BUILT,
     PUBLICATION_BEFORE_POST,
-    PUBLICATION_INVALID_CPU
+    PUBLICATION_INVALID_CPU,
+    USER_INPUT_STATE,
+    USER_ARGUMENT_ARENA
 };
 void exec_selftest_fail_native_construction_once(NativeConstructionFault fault);
 auto exec_selftest_take_native_construction_fault(NativeConstructionFault fault) -> bool;
