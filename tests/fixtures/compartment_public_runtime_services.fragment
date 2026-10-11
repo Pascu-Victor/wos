@@ -1,0 +1,33 @@
+# Append to /etc/wos-services.conf only in a disposable validation VM.
+# See compartment_public_runtime.md for ELF/assets/report directory setup.
+
+[service compartment-probe]
+user=httpd
+group=httpd
+supplementary-groups=none
+umask=0077
+authority-ceiling=0
+no-new-privileges=yes
+service-privileges=none
+exec=/usr/libexec/compartment-public-runtime
+arg=/usr/libexec/compartment-public-runtime
+arg=--host
+depends=journald
+type=oneshot
+class=normal
+priority=0
+environment=empty
+env=LD_LIBRARY_PATH=/usr/lib
+readiness=exit-success
+readiness-timeout-ms=150000
+restart=never
+backoff-initial-ms=250
+backoff-max-ms=30000
+restart-budget=1
+restart-window-ms=60000
+stable-run-ms=60000
+stop-term-ms=2000
+stop-kill-ms=1000
+drain-timeout-ms=2000
+stdio=journal
+enable=always

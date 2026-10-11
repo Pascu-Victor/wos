@@ -7124,10 +7124,17 @@ KTEST(CompartmentPublication, MembershipAndRealPostRefusalDrainPreparationExactl
         process.child = process_exec::prepare_native_compartment_for_owner(executor, fixture.spec, error);
         KREQUIRE_EQ(error, 0);
         KREQUIRE_TRUE(process.child != nullptr);
+        KEXPECT_EQ(process.child->heap_index, int32_t{-1});
+        KEXPECT_EQ(process.child->sched_weight, uint32_t{1024});
+        KEXPECT_EQ(process.child->slice_ns, uint32_t{10'000'000});
+        KEXPECT_EQ(process.child->sched_queue, sched::task::Task::sched_queue::NONE);
+        KEXPECT_NULL(process.child->sched_next);
         process_exec::exec_selftest_fail_native_construction_once(fault);
         KEXPECT_EQ(process_exec::publish_native_compartment_for_owner(executor, process.child), int64_t{-EAGAIN});
         process_exec::exec_selftest_fail_native_construction_once(Fault::NONE);
         KEXPECT_FALSE(process.child->scheduler_published.load());
+        KEXPECT_EQ(process.child->heap_index, int32_t{-1});
+        KEXPECT_EQ(process.child->sched_queue, sched::task::Task::sched_queue::NONE);
         KEXPECT_EQ(process.child->child_membership_state.load(), sched::task::ChildMembershipState::UNLINKED);
         KEXPECT_NULL(process.child->child_parent);
         KEXPECT_NULL(executor.child_list_head);

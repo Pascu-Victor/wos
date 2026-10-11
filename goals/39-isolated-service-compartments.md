@@ -656,3 +656,37 @@ reproducible fixtures, scheduled hostile/fatal/init/futex tests, full FD/indirec
 policy, two independent2h service trees/1000full lifecycles/all baselines and
 Host/init/libc regression. Use --no-setup, one topology,20GiBdisposable/40GiBfree,
 COW/reflinks and exact-owned inactive pruning on PASS/FAIL. No pause or push.
+
+## Checkpoint33: actual public runtime and native scheduler initialization (2026-10-11)
+
+The native exclusively owned unpublished skeleton initializes heap_index=-1,
+weight1024 and10ms slice before its first allocation, matching ordinary process
+construction. Actual public attempt05 exposed the previous heap_index0 panic.
+Scheduler corruption diagnostics/transitions, Task/File layouts, Host constructors
+and all public/libc/wire interfaces remain. Existing actual native preparation
+test now checks detached state before/after both publication-refusal paths.
+
+Repository fixture/build helper/service fragment/README exercise process54 and
+the actual CLI with UID/GID100,zeroauthority,NNP, explicit imports and one shared
+regular result FD9. Two sequential private services each report PID1/parent0/
+UID100/14checks/0failures, Host path refusals, marker data, denied networking,
+named shared memory and localPID2 fork/wait. Host waits confirm exit0. These
+are short actual service tests, not two simultaneous two-hour trees.
+
+Normal Build WOS20.387s, isolated fast diagnostic build11.373s,46Host tests
+34.875s, formatting7.779s and30preservation checks PASS. Public07 PASS39.343s,
+169stablepins; public06 durable guest PASS but serial-only observer timeout is
+retained separately. Corrected observer requires both exact binary reports and
+durable Host wait assertions. KTEST61 rootless --no-setup PASS463.504s,
+88,557assertions/0failures/1,389cases/all138mandatory/149stablepins147distinct/
+normalpoweroff. Public07 four images91,242,496allocatedB and KTEST61 four
+images261,439,488B pruned;0disposable, user13532 UID945 preserved.
+
+All129 broader credential oracle calls retain the same24unresolved failures;
+no weakening/masking or full-regression PASS. Goal39 ACTIVE/all ten full criteria
+INCOMPLETE. CPU placement/domain inheritance remains separate from restored
+EEVDF defaults; canonical/executor/setter/scheduler/descendant flow reconnaissance
+recorded before future critical patch. Remaining hostile/shared/futex/init,
+two2h trees,1000full lifecycles/all reference baselines and Host/init/libc evidence
+remain required. Use --no-setup on launch, separate build/data/sysroots,one
+topology,20GiB/40GiB budget,COW/reflinks and exact-owned pruning PASS/FAIL.

@@ -2,10 +2,11 @@
 
 Goal39 is in progress. Profile preparation, private native SysV IPC namespace
 ownership/lookup, private native mount-table ownership, Task native lookup and
-subject mount administration are implemented. Checkpoint 32 adds the experimental
-versioned public creation syscall and `wos-compartment` launcher. Mapped-input
-admission and rollback pass native tests; successful scheduled service launch
-remains unqualified. Exact-owner ambient network admission is implemented;
+subject mount administration are implemented. Checkpoint 32 added the experimental
+versioned public creation syscall and `wos-compartment` launcher. Checkpoint 33
+qualifies two short, sequential nonroot service trees through the public spec
+and actual launcher, including local fork/wait and explicit result capabilities.
+Exact-owner ambient network admission is implemented;
 complete PID, lifecycle and WKI qualification remains incomplete. Independent
 service isolation and all ten goal criteria remain unqualified. Goal28 remains
 incomplete at its committed wire-codec checkpoint while this work proceeds.
@@ -1399,6 +1400,39 @@ The 129 broader credential source calls retain the same 24 failures. Successful
 runnable publication, CPU placement inheritance review, guest CLI, scheduled
 hostile/init/futex tests, two two-hour service trees and 1,000 complete lifecycles
 remain required. Goal39 stays ACTIVE; all ten full criteria remain incomplete.
+
+## Checkpoint33: actual public service execution
+
+The native unpublished skeleton now initializes the detached runqueue index,
+nice-0 weight and 10ms slice before its first allocation, matching ordinary
+process construction. The previous zero heap index caused an actual normal
+guest publication panic. Scheduler corruption checks, Task/File layouts,
+ordinary Host constructors and ABI/wire surfaces remain unchanged. The existing
+publication-refusal case now checks these fields before and after refusal.
+
+The reproducible probe and service fragment in
+`tests/fixtures/compartment_public_runtime.md` use UID/GID 100, zero authority,
+NNP, explicit ELF/interpreter/libraries/data imports and one shared regular
+result File. Each of two actual guest modes reports private PID1/parent0,
+unchanged nonroot IDs, Host path refusal, marker contents, denied networking,
+named shared memory and local child PID2/fork/wait. Both Host waits return
+exit0 and both private reports contain14checks/0failures. The probe keeps
+small fsynced receipts in an explicitly owned persistent directory; `/tmp` is
+root-owned0755tmpfs, so it cannot serve that nonroot diagnostic purpose.
+
+Normal Build WOS, isolated fast diagnostic build,46selected Host tests,
+formatting and30preservation checks PASS. Rootless --no-setup KTEST61 PASS:
+88,557assertions/0failures/1,389cases/all138mandatory,149stablepins147distinct,
+normal selftest poweroff. Normal public attempt07 PASS39.343s/169stablepins;
+attempt06's durable guest reports passed while its serial-only observer timed
+out. Earlier attempts and the publication panic remain recorded. Both completed
+topologies were pruned to0disposable allocation; unrelated user VM preserved.
+All129 broader credential source calls still have the same24unresolved failures.
+
+This qualifies short sequential execution, not two simultaneous two-hour trees,
+1,000complete lifecycles or the full hostile/isolation/regression campaign.
+CPU placement/domain inheritance remains unqualified; restored EEVDF defaults
+do not implement that policy. Goal39 stays ACTIVE/all ten full criteria incomplete.
 
 ## Verification checkpoint
 

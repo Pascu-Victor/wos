@@ -1265,6 +1265,11 @@ auto Task::initialize_unpublished_process_skeleton(Task& owner, const char* proc
     type = TaskType::PROCESS;
     pid = get_next_pid();
     cpu = cpu::current_cpu();
+    // Match ordinary process construction before any reclaiming allocation.
+    // A default Task's zero index does not mean detached from a RunHeap.
+    heap_index = -1;
+    sched_weight = 1024;
+    slice_ns = 10'000'000;
     size_t length = 0;
     while (length < EXE_PATH_MAX && process_name[length] != '\0') ++length;
     if (length == EXE_PATH_MAX) return -ENAMETOOLONG;

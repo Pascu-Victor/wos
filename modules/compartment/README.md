@@ -1,9 +1,9 @@
 # wos-compartment
 
 This experimental WOS launcher creates a fresh native mount/PID/named-IPC view
-through the version-1 public spec. Its mapped kernel input and refusal recovery
-are qualified; successful scheduled guest launch and the full isolation campaign
-are still pending. See `docs/wos_service_compartments.md` for current evidence.
+through the version-1 public spec. Its mapped input/refusal recovery and a short
+nonroot guest launch/fork/wait probe are qualified. The full isolation campaign
+is pending. See `docs/wos_service_compartments.md` for current evidence.
 
 Normal Build WOS installs `/usr/bin/wos-compartment` and the standalone C++ header
 `/usr/include/wos/compartment.hpp`. Use `wos-compartment --help` for the current
@@ -52,7 +52,13 @@ strings and pointers share a 2MiB budget; imported data is 4KiB–32MiB in pages
 Development validation uses the registered `compartment_launcher_test` Host
 test and actual mapped `CompartmentPublicInput` KTEST cases. The Host test adapts
 raw syscall boundaries while compiling the actual launcher; KTEST deliberately
-refuses before scheduling its synthetic ELF. Neither proves a runnable service.
+refuses before scheduling its synthetic ELF. The actual guest probe, build helper
+and service fragment are documented in
+[compartment_public_runtime.md](../../tests/fixtures/compartment_public_runtime.md).
+Both public-spec and CLI modes passed with private PID1/parent0, UID100,
+14checks/0failures and successful Host waits. This short sequential test leaves
+CPU-placement inheritance, hostile isolation, two-hour simultaneous service
+trees,1,000full lifecycles and complete Host/init/libc regression unqualified.
 Owned software qualification may use `bin/wos-cluster --no-setup` or isolated
 `bin/wos-ktest --no-setup`, with one topology, a 20GiB disposable storage budget,
 40GiB free-space floor and exact-owned inactive-image pruning after every run.
