@@ -19,6 +19,7 @@
 #include <platform/sys/spinlock.hpp>
 #include <platform/sys/usercopy.hpp>
 #include <platform/sys/userspace.hpp>
+#include <type_traits>
 #include <utility>
 
 #ifdef WOS_SELFTEST
@@ -2610,6 +2611,120 @@ inline auto task_can_idle_steal(task::Task const* task, uint64_t source_cpu, uin
     return task_cross_cpu_migration_allowed(task, source_cpu, target_cpu, core_count);
 }
 
+static_assert(std::atomic_ref<uint32_t>::is_always_lock_free);
+static_assert(alignof(uint32_t) >= std::atomic_ref<uint32_t>::required_alignment);
+static_assert(std::is_standard_layout_v<RunQueue>);
+static_assert(offsetof(RunQueue, domain_id) % std::atomic_ref<uint32_t>::required_alignment == 0);
+
+inline auto load_runqueue_domain_id(RunQueue* rq) -> uint32_t {
+    return std::atomic_ref<uint32_t>(rq->domain_id).load(std::memory_order_acquire);
+}
+
+inline void store_runqueue_domain_id(RunQueue* rq, uint32_t domain_id) {
+    std::atomic_ref<uint32_t>(rq->domain_id).store(domain_id, std::memory_order_release);
+}
+
+inline auto domain_snapshot_allows_idle_steal(const smt::CpuDomain* domain, uint64_t destination_cpu) -> bool {
+    return domain == nullptr || !domain->hard || cpu_mask_contains(domain->cpu_mask, destination_cpu);
+}
+
+inline auto current_runqueue_domain_snapshot(RunQueue* rq) -> const smt::CpuDomain* {
+    uint32_t const DOMAIN_ID = load_runqueue_domain_id(rq);
+    // Root and missing stamps retain the existing permissive behavior.
+    return DOMAIN_ID != 0 ? smt::get_cpu_domain(DOMAIN_ID) : nullptr;
+}
+
+inline auto runqueue_domain_allows_idle_steal(RunQueue* rq, uint64_t destination_cpu) -> bool {
+    return domain_snapshot_allows_idle_steal(current_runqueue_domain_snapshot(rq), destination_cpu);
+}
+
+inline auto steal_candidate_scan_limit(uint32_t heap_size) -> uint32_t;
+
+// Caller holds the victim RQ lock for the complete admission and detach. The
+// snapshot is immutable and remains valid throughout this synchronous call.
+inline auto detach_steal_candidate_locked(RunQueue* victim_rq, uint64_t victim_cpu, uint64_t stealing_cpu, uint64_t core_count,
+                                          const smt::CpuDomain* victim_domain) -> task::Task* {
+    if (!domain_snapshot_allows_idle_steal(victim_domain, stealing_cpu)) {
+        return nullptr;
+    }
+
+    // Authoritative check under lock
+    uint32_t const VICTIM_HEAP_SIZE = victim_rq->runnable_heap.size;
+    if (VICTIM_HEAP_SIZE == 0) {
+        return nullptr;
+    }
+
+    uint32_t const VICTIM_CURRENT_LOAD = current_task_load_for_incoming(victim_rq->current_task, task::TaskType::PROCESS);
+    if (VICTIM_CURRENT_LOAD == 0 && VICTIM_HEAP_SIZE < 2) {
+        return nullptr;
+    }
+
+    constexpr uint32_t LOCKED_FULL_LOAD = 8;
+    uint32_t const VICTIM_LOAD = victim_rq->cached_load_process.load(std::memory_order_relaxed) + VICTIM_CURRENT_LOAD;
+    uint32_t const MIN_STEAL_LOAD =
+        (victim_rq->daemon_load_penalty.load(std::memory_order_relaxed) > 0) ? LOCKED_FULL_LOAD * 4 : LOCKED_FULL_LOAD * 2;
+    if (VICTIM_LOAD < MIN_STEAL_LOAD) {
+        return nullptr;
+    }
+
+    // Never steal the task currently executing on the victim CPU.
+    task::Task const* victim_current = victim_rq->current_task;
+    task::Task const* victim_handoff = victim_rq->handoff_task;
+
+    // Scan for highest-vdeadline stealable task (least urgent)
+    task::Task* best = nullptr;
+    int64_t best_vd = INT64_MIN;
+    uint32_t const SCAN = steal_candidate_scan_limit(victim_rq->runnable_heap.size);
+    for (uint32_t i = 0; i < SCAN; ++i) {
+        task::Task* t = run_heap_entry(victim_rq->runnable_heap, i);
+        if (t == nullptr) {
+            continue;
+        }
+        if (t == victim_current || t == victim_handoff) {
+            record_migration_rejection(t, stealing_cpu, MigrationRejectionReason::RETURN_TRANSITION);
+            continue;  // Never steal currently-executing or reserved-for-handoff task
+        }
+        if (t->type == task::TaskType::IDLE) {
+            continue;
+        }
+        if (t->type != task::TaskType::PROCESS && !t->has_run) {
+            continue;
+        }
+        if (!task_can_idle_steal(t, victim_cpu, stealing_cpu, core_count)) {
+            continue;
+        }
+        if (t->vdeadline > best_vd) {
+            best_vd = t->vdeadline;
+            best = t;
+        }
+    }
+    if (best == nullptr) {
+        return nullptr;
+    }
+
+    // Claim ownership BEFORE removing from heap - closes the window
+    // where reschedule_task_for_cpu could re-insert into victim queue.
+    uint64_t const PREV_CPU = best->cpu;
+    best->cpu = stealing_cpu;
+
+    // Remove from victim (victim lock still held). The candidate came
+    // from a heap-entry scan, so repair a stale heap_index before
+    // removal instead of turning hot migration into a publish panic.
+    if (!remove_from_heap_by_scan_locked(victim_rq, best)) {
+        best->cpu = PREV_CPU;
+        return nullptr;
+    }
+    return best;
+}
+
+inline auto detach_steal_candidate_in_current_domain_locked(RunQueue* victim_rq, uint64_t source_cpu, uint64_t destination_cpu,
+                                                            uint64_t core_count) -> task::Task* {
+    // Resolve after the victim lock is acquired. Its setter holds this same
+    // lock, so the freshly loaded stamp remains authoritative until detach.
+    const smt::CpuDomain* domain = current_runqueue_domain_snapshot(victim_rq);
+    return detach_steal_candidate_locked(victim_rq, source_cpu, destination_cpu, core_count, domain);
+}
+
 inline auto idle_rebalance_probe_needed_for_idle(uint64_t idle_cpu) -> bool {
     if (run_queues == nullptr) {
         return false;
@@ -2639,12 +2754,8 @@ inline auto idle_rebalance_probe_needed_for_idle(uint64_t idle_cpu) -> bool {
             continue;
         }
 
-        uint32_t const VICTIM_DOM_ID = victim_rq->domain_id;
-        if (VICTIM_DOM_ID != 0) {
-            auto* victim_dom = smt::get_cpu_domain(VICTIM_DOM_ID);
-            if (victim_dom != nullptr && victim_dom->hard && !cpu_mask_contains(victim_dom->cpu_mask, idle_cpu)) {
-                continue;
-            }
+        if (!runqueue_domain_allows_idle_steal(victim_rq, idle_cpu)) {
+            continue;
         }
 
         uint32_t const VICTIM_HEAP_SIZE = victim_rq->runnable_heap.size;
@@ -2802,16 +2913,10 @@ auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
         // Quick racy load peek (no lock needed - heuristic, not authoritative)
         auto* victim_rq_raw = run_queues->that_cpu(VICTIM_CPU);
 
-        // Phase 8a: hard-domain boundary - never steal from a CPU in a hard leaf domain
-        // into a CPU outside that domain. Racy read is intentional (heuristic guard).
-        {
-            uint32_t const VICTIM_DOM_ID = victim_rq_raw->domain_id;
-            if (VICTIM_DOM_ID != 0) {
-                auto* victim_dom = smt::get_cpu_domain(VICTIM_DOM_ID);
-                if (victim_dom != nullptr && victim_dom->hard && !cpu_mask_contains(victim_dom->cpu_mask, stealing_cpu)) {
-                    continue;  // Do not steal across hard-domain boundary
-                }
-            }
+        // Advisory hard-domain guard; authoritative admission is repeated
+        // after acquiring the victim lock.
+        if (!runqueue_domain_allows_idle_steal(victim_rq_raw, stealing_cpu)) {
+            continue;
         }
 
         uint32_t const VICTIM_HEAP_SIZE = victim_rq_raw->runnable_heap.size;
@@ -2840,73 +2945,7 @@ auto try_steal_from_peers(uint64_t stealing_cpu, RunQueue* our_rq) -> bool {
         // task stuck on the victim CPU with a stale cpu field.
         task::Task* stolen = nullptr;
         run_queues->try_with_lock(VICTIM_CPU, [stealing_cpu, &stolen, N, VICTIM_CPU](RunQueue* victim_rq) {
-            // Authoritative check under lock
-            uint32_t const VICTIM_HEAP_SIZE = victim_rq->runnable_heap.size;
-            if (VICTIM_HEAP_SIZE == 0) {
-                return;
-            }
-
-            uint32_t const VICTIM_CURRENT_LOAD = current_task_load_for_incoming(victim_rq->current_task, task::TaskType::PROCESS);
-            if (VICTIM_CURRENT_LOAD == 0 && VICTIM_HEAP_SIZE < 2) {
-                return;
-            }
-
-            constexpr uint32_t LOCKED_FULL_LOAD = 8;
-            uint32_t const VICTIM_LOAD = victim_rq->cached_load_process.load(std::memory_order_relaxed) + VICTIM_CURRENT_LOAD;
-            uint32_t const MIN_STEAL_LOAD =
-                (victim_rq->daemon_load_penalty.load(std::memory_order_relaxed) > 0) ? LOCKED_FULL_LOAD * 4 : LOCKED_FULL_LOAD * 2;
-            if (VICTIM_LOAD < MIN_STEAL_LOAD) {
-                return;
-            }
-
-            // Never steal the task currently executing on the victim CPU.
-            task::Task const* victim_current = victim_rq->current_task;
-            task::Task const* victim_handoff = victim_rq->handoff_task;
-
-            // Scan for highest-vdeadline stealable task (least urgent)
-            task::Task* best = nullptr;
-            int64_t best_vd = INT64_MIN;
-            uint32_t const SCAN = steal_candidate_scan_limit(victim_rq->runnable_heap.size);
-            for (uint32_t i = 0; i < SCAN; ++i) {
-                task::Task* t = run_heap_entry(victim_rq->runnable_heap, i);
-                if (t == nullptr) {
-                    continue;
-                }
-                if (t == victim_current || t == victim_handoff) {
-                    record_migration_rejection(t, stealing_cpu, MigrationRejectionReason::RETURN_TRANSITION);
-                    continue;  // Never steal currently-executing or reserved-for-handoff task
-                }
-                if (t->type == task::TaskType::IDLE) {
-                    continue;
-                }
-                if (t->type != task::TaskType::PROCESS && !t->has_run) {
-                    continue;
-                }
-                if (!task_can_idle_steal(t, VICTIM_CPU, stealing_cpu, N)) {
-                    continue;
-                }
-                if (t->vdeadline > best_vd) {
-                    best_vd = t->vdeadline;
-                    best = t;
-                }
-            }
-            if (best == nullptr) {
-                return;
-            }
-
-            // Claim ownership BEFORE removing from heap - closes the window
-            // where reschedule_task_for_cpu could re-insert into victim queue.
-            uint64_t const PREV_CPU = best->cpu;
-            best->cpu = stealing_cpu;
-
-            // Remove from victim (victim lock still held). The candidate came
-            // from a heap-entry scan, so repair a stale heap_index before
-            // removal instead of turning hot migration into a publish panic.
-            if (!remove_from_heap_by_scan_locked(victim_rq, best)) {
-                best->cpu = PREV_CPU;
-                return;
-            }
-            stolen = best;
+            stolen = detach_steal_candidate_in_current_domain_locked(victim_rq, VICTIM_CPU, stealing_cpu, N);
         });
 
         if (stolen != nullptr) {
@@ -9321,7 +9360,7 @@ void set_cpu_domain_id(uint64_t cpu_no, uint32_t new_domain_id) {
     if (run_queues == nullptr) {
         return;
     }
-    run_queues->with_lock_void(cpu_no, [new_domain_id](RunQueue* rq) { rq->domain_id = new_domain_id; });
+    run_queues->with_lock_void(cpu_no, [new_domain_id](RunQueue* rq) { store_runqueue_domain_id(rq, new_domain_id); });
 }
 
 auto get_cpu_load(uint64_t cpu_no) -> uint32_t {
@@ -10347,6 +10386,496 @@ auto scheduler_selftest_worker_pin_commit() -> bool {
     delete runnable;
     delete target;
     delete source;
+    return ok;
+}
+
+namespace {
+constexpr size_t DOMAIN_STEAL_TASK_COUNT = 6;
+constexpr size_t DOMAIN_STEAL_HEAP_COUNT = 4;
+
+// Only logical fields are compared: no Task/atomic/padding byte copies.
+struct DomainStealTaskSnapshot {
+    task::TaskState state;
+    uint64_t cpu;
+    uint64_t domain_mask;
+    uint32_t domain_id;
+    bool cpu_pinned;
+    bool domain_hard;
+    uint64_t migration_guard;
+    uint64_t migration_diagnostic;
+    uint32_t preempt_depth;
+    bool transition_active;
+    bool gc_queued;
+    bool has_run;
+    bool has_exited;
+    bool wants_block;
+    bool deferred_switch;
+    int64_t vruntime;
+    int64_t deadline;
+    uint32_t weight;
+    int8_t nice;
+    uint32_t slice;
+    uint32_t slice_used;
+    int32_t heap_index;
+    decltype(task::Task::sched_queue) queue;
+    bool published;
+    uint32_t last_run;
+    uint32_t last_sleep;
+    uint64_t sleep_start;
+    uint64_t last_wake;
+    uint64_t user_time;
+    uint64_t system_time;
+    uint64_t resource_cpu_time;
+    task::Task* previous;
+    task::Task* next;
+    IntrusiveTaskList* list_owner;
+    time::TimerState timer_state;
+    uint64_t timer_generation;
+    uint64_t timer_deadline;
+    threading::Thread* thread;
+    mm::paging::PageTable* pagemap;
+    uint64_t kernel_stack;
+    uint64_t scratch;
+    task::SavedFrameClass frame_class;
+    uint64_t rip;
+    uint64_t rsp;
+    uint64_t cs;
+    uint64_t ss;
+    uint64_t flags;
+
+    auto operator==(const DomainStealTaskSnapshot&) const -> bool = default;
+};
+
+auto domain_steal_task_snapshot(const task::Task& t) -> DomainStealTaskSnapshot {
+    return {
+        t.state.load(std::memory_order_acquire),
+        t.cpu,
+        t.domain_mask,
+        t.domain_id,
+        t.cpu_pinned,
+        t.domain_hard,
+        t.migration_guard_state.load(std::memory_order_acquire),
+        t.migration_diagnostic.load(std::memory_order_relaxed),
+        t.preempt_disable_depth,
+        t.scheduler_transition_active.load(std::memory_order_acquire),
+        t.gc_queued.load(std::memory_order_acquire),
+        t.has_run,
+        t.has_exited,
+        t.wants_block,
+        t.deferred_task_switch,
+        t.vruntime,
+        t.vdeadline,
+        t.sched_weight,
+        t.sched_nice,
+        t.slice_ns,
+        t.slice_used_ns,
+        t.heap_index,
+        t.sched_queue,
+        t.scheduler_published.load(std::memory_order_acquire),
+        t.last_run_us,
+        t.last_sleep_us,
+        t.last_sleep_start_us,
+        t.last_wake_us,
+        t.user_time_us,
+        t.system_time_us,
+        t.resources.cpu_time_us,
+        t.sched_previous,
+        t.sched_next,
+        t.sched_list_owner.load(std::memory_order_acquire),
+        t.wait_timer.state(),
+        t.wait_timer.generation(),
+        t.wait_timer.deadline(),
+        t.thread,
+        t.pagemap,
+        t.context.syscall_kernel_stack,
+        t.context.syscall_scratch_area,
+        t.context.saved_frame_class,
+        t.context.frame.rip,
+        t.context.frame.rsp,
+        t.context.frame.cs,
+        t.context.frame.ss,
+        t.context.frame.flags,
+    };
+}
+
+struct DomainStealQueueSnapshot {
+    uint32_t size;
+    int64_t weight;
+    int64_t weighted_vruntime;
+    int64_t floor;
+    uint64_t last_tick;
+    uint64_t next_wait_deadline;
+    task::Task* current;
+    task::Task* handoff;
+    task::Task* idle;
+    task::Task* gc_cursor;
+    task::Task* wait_head;
+    task::Task* dead_head;
+    uint32_t wait_count;
+    uint32_t dead_count;
+    size_t timer_count;
+    bool has_timer_deadline;
+    uint64_t timer_deadline;
+    uint32_t load_default;
+    uint32_t load_process;
+    uint32_t current_load_default;
+    uint32_t current_load_process;
+    uint32_t daemon_penalty;
+
+    auto operator==(const DomainStealQueueSnapshot&) const -> bool = default;
+};
+
+auto domain_steal_queue_snapshot(const RunQueue& rq) -> DomainStealQueueSnapshot {
+    uint64_t deadline = 0;
+    bool const HAS_DEADLINE = rq.wait_timers.next_deadline(deadline);
+    return {
+        rq.runnable_heap.size,
+        rq.total_weight,
+        rq.total_weighted_vruntime,
+        rq.min_vruntime,
+        rq.last_tick_us,
+        rq.next_wait_deadline_us,
+        rq.current_task,
+        rq.handoff_task,
+        rq.idle_task,
+        rq.gc_reclaim_scan_cursor,
+        rq.wait_list.head,
+        rq.dead_list.head,
+        rq.wait_list.count,
+        rq.dead_list.count,
+        rq.wait_timers.size(),
+        HAS_DEADLINE,
+        deadline,
+        rq.cached_load_default.load(std::memory_order_relaxed),
+        rq.cached_load_process.load(std::memory_order_relaxed),
+        rq.cached_current_load_default.load(std::memory_order_relaxed),
+        rq.cached_current_load_process.load(std::memory_order_relaxed),
+        rq.daemon_load_penalty.load(std::memory_order_relaxed),
+    };
+}
+
+struct DomainStealSnapshot {
+    RunHeap::EntryStorage entries{};
+    DomainStealQueueSnapshot queue{};
+    std::array<DomainStealTaskSnapshot, DOMAIN_STEAL_TASK_COUNT> tasks{};
+};
+
+struct DomainStealContextStorage {
+    std::array<uint64_t, 16> stack{};
+    std::array<uint64_t, 8> scratch{};
+};
+
+struct DomainStealFixture {
+    std::unique_ptr<RunQueue> rq{new (std::nothrow) RunQueue{}};
+    std::unique_ptr<task::Task[]> tasks{new (std::nothrow) task::Task[DOMAIN_STEAL_TASK_COUNT]{}};
+    std::unique_ptr<threading::Thread[]> threads{new (std::nothrow) threading::Thread[DOMAIN_STEAL_TASK_COUNT]{}};
+    std::unique_ptr<DomainStealContextStorage[]> contexts{new (std::nothrow) DomainStealContextStorage[DOMAIN_STEAL_TASK_COUNT]{}};
+    std::unique_ptr<DomainStealSnapshot> before{new (std::nothrow) DomainStealSnapshot{}};
+    sys::Spinlock lock;
+
+    ~DomainStealFixture() { clear(); }
+
+    auto ready() const -> bool { return rq && tasks && threads && contexts && before; }
+
+    // No Task is registered or run. Cancel and unlink under fixture exclusion,
+    // then release it before any owned object is destroyed (including failures).
+    void clear() {
+        uint64_t const FLAGS = lock.lock_irqsave();
+        if (rq) {
+            rq->current_task = nullptr;
+            rq->handoff_task = nullptr;
+            rq->idle_task = nullptr;
+            rq->gc_reclaim_scan_cursor = nullptr;
+            if (tasks) {
+                for (size_t i = 0; i < DOMAIN_STEAL_TASK_COUNT; ++i) {
+                    auto& t = tasks[i];
+                    static_cast<void>(rq->wait_timers.cancel(t.wait_timer));
+                    static_cast<void>(rq->wait_list.remove(&t));
+                    static_cast<void>(rq->dead_list.remove(&t));
+                    t.sched_previous = nullptr;
+                    t.sched_next = nullptr;
+                    t.sched_list_owner.store(nullptr, std::memory_order_release);
+                }
+            }
+            // Clear physical entries, including inactive remove tails and a
+            // deliberately stale heap_index, before freeing referenced Tasks.
+            rq->runnable_heap.entries.fill(nullptr);
+            rq->runnable_heap.size = 0;
+            rq->wait_list.init();
+            rq->dead_list.init();
+            rq->total_weight = 0;
+            rq->total_weighted_vruntime = 0;
+            rq->cached_load_default.store(0, std::memory_order_relaxed);
+            rq->cached_load_process.store(0, std::memory_order_relaxed);
+            rq->cached_current_load_default.store(0, std::memory_order_relaxed);
+            rq->cached_current_load_process.store(0, std::memory_order_relaxed);
+        }
+        if (tasks) {
+            for (size_t i = 0; i < DOMAIN_STEAL_TASK_COUNT; ++i) {
+                tasks[i].heap_index = -1;
+                tasks[i].sched_queue = task::Task::sched_queue::NONE;
+                tasks[i].scheduler_published.store(false, std::memory_order_release);
+                tasks[i].thread = nullptr;
+                tasks[i].pagemap = nullptr;
+                tasks[i].context = {};
+            }
+        }
+        lock.unlock_irqrestore(FLAGS);
+    }
+
+    auto prepare() -> bool {
+        clear();
+        if (!ready()) return false;
+        for (size_t i = 0; i < DOMAIN_STEAL_TASK_COUNT; ++i) {
+            auto& t = tasks[i];
+            t.type = task::TaskType::PROCESS;
+            t.pid = i + 1;
+            t.cpu = 0;
+            t.state.store(task::TaskState::ACTIVE, std::memory_order_release);
+            t.gc_queued.store(false, std::memory_order_release);
+            t.has_exited = false;
+            t.has_run = false;
+            t.wants_block = false;
+            t.deferred_task_switch = false;
+            t.scheduler_transition_active.store(false, std::memory_order_release);
+            t.cpu_pinned = false;
+            t.domain_hard = false;
+            t.domain_mask = UINT64_MAX;
+            t.domain_id = 0;
+            t.migration_guard_state.store(encode_migration_guard_state({.depth = 0, .owner_cpu = MIGRATION_CPU_INVALID}),
+                                          std::memory_order_release);
+            t.preempt_disable_depth = 0;
+            t.migration_diagnostic.store(encode_migration_diagnostic({}), std::memory_order_relaxed);
+            t.sched_weight = static_cast<uint32_t>(100 + i * 30);
+            t.vruntime = static_cast<int64_t>(70 + i * 10);
+            t.vdeadline = static_cast<int64_t>(200 + i * 200);
+            t.slice_ns = static_cast<uint32_t>(1'000'000 + i * 100);
+            t.slice_used_ns = static_cast<uint32_t>(i * 10);
+            t.last_run_us = static_cast<uint32_t>(300 + i);
+            t.last_sleep_us = static_cast<uint32_t>(400 + i);
+            t.last_sleep_start_us = 500 + i;
+            t.last_wake_us = 600 + i;
+            t.thread = &threads[i];
+            t.pagemap = mm::virt::get_kernel_pagemap();  // Borrowed; never destroyed or released.
+            // Actual owned storage supplies the nonzero context scalars used
+            // by this eligibility helper. This is never an executable stack.
+            t.context.syscall_kernel_stack = reinterpret_cast<uint64_t>(contexts[i].stack.data() + contexts[i].stack.size());
+            t.context.syscall_scratch_area = reinterpret_cast<uint64_t>(contexts[i].scratch.data());
+            t.context.frame.cs = desc::gdt::GDT_USER_CS;
+            t.context.frame.ss = desc::gdt::GDT_USER_DS;
+            t.context.frame.rip = 0x401000;
+            t.context.frame.rsp = 0x7fff0000;
+            t.context.frame.flags = 0x202;
+            sys::context_switch::record_saved_frame_class(&t, t.context.frame, task::SavedFrameOrigin::SYNTHETIC_USER_RETURN);
+        }
+        uint64_t const FLAGS = lock.lock_irqsave();
+        rq->min_vruntime = 20;
+        rq->last_tick_us = 77;
+        rq->daemon_load_penalty.store(0, std::memory_order_relaxed);
+        store_runqueue_domain_id(rq.get(), 0);
+        bool ok = true;
+        for (size_t i = 0; i < DOMAIN_STEAL_HEAP_COUNT; ++i) {
+            bool const FRAME_VALID = sys::context_switch::saved_frame_class_is_valid(&tasks[i], tasks[i].context.frame);
+            bool const PUBLISHED = publish_runnable_task_locked(rq.get(), &tasks[i], "domain-steal-selftest");
+            ok = FRAME_VALID && PUBLISHED && ok;
+        }
+        // Deliberate owned reserved entries exercise the real exclusion path;
+        // no real handoff/stack execution or global scheduler queue is involved.
+        rq->current_task = &tasks[2];
+        rq->handoff_task = &tasks[3];
+        update_current_load_cache(rq.get(), rq->current_task);
+        tasks[4].sched_queue = task::Task::sched_queue::WAITING;
+        rq->wait_list.push(&tasks[4]);
+        bool const TIMER_ARMED = rq->wait_timers.arm_at(tasks[4].wait_timer, 1'000'000, wait_timer_marker, &tasks[4]);
+        rq->next_wait_deadline_us = 1'000'000;
+        tasks[5].sched_queue = task::Task::sched_queue::DEAD_GC;
+        tasks[5].state.store(task::TaskState::DEAD, std::memory_order_release);
+        tasks[5].gc_queued.store(true, std::memory_order_release);
+        rq->dead_list.push(&tasks[5]);
+        rq->gc_reclaim_scan_cursor = &tasks[5];
+        lock.unlock_irqrestore(FLAGS);
+        return TIMER_ARMED && ok;
+    }
+
+    void capture_locked() {
+        before->entries = rq->runnable_heap.entries;
+        before->queue = domain_steal_queue_snapshot(*rq);
+        for (size_t i = 0; i < DOMAIN_STEAL_TASK_COUNT; ++i) before->tasks[i] = domain_steal_task_snapshot(tasks[i]);
+    }
+
+    auto unchanged_locked(bool compare_diagnostics = true) -> bool {
+        bool ok = before->entries == rq->runnable_heap.entries && before->queue == domain_steal_queue_snapshot(*rq);
+        for (size_t i = 0; i < DOMAIN_STEAL_TASK_COUNT; ++i) {
+            auto observed = domain_steal_task_snapshot(tasks[i]);
+            if (!compare_diagnostics) observed.migration_diagnostic = before->tasks[i].migration_diagnostic;
+            ok = observed == before->tasks[i] && ok;
+        }
+        return ok;
+    }
+
+    auto exact_detachment_locked(task::Task* detached, uint64_t destination_cpu) -> bool {
+        auto expected = before->tasks[1];
+        expected.cpu = destination_cpu;
+        expected.heap_index = -1;
+        bool ok = detached == &tasks[1] && domain_steal_task_snapshot(tasks[1]) == expected &&
+                  tasks[1].sched_queue == task::Task::sched_queue::RUNNABLE && tasks[1].scheduler_published.load() &&
+                  rq->runnable_heap.size == DOMAIN_STEAL_HEAP_COUNT - 1 && !rq->runnable_heap.contains(&tasks[1]) &&
+                  run_heap_entry(rq->runnable_heap, 0) == &tasks[0] && tasks[0].heap_index == 0 &&
+                  run_heap_entry(rq->runnable_heap, 1) == &tasks[3] && tasks[3].heap_index == 1 &&
+                  run_heap_entry(rq->runnable_heap, 2) == &tasks[2] && tasks[2].heap_index == 2 &&
+                  rq->total_weight == before->queue.weight - tasks[1].sched_weight &&
+                  rq->total_weighted_vruntime ==
+                      before->queue.weighted_vruntime - (tasks[1].vruntime - rq->min_vruntime) * tasks[1].sched_weight &&
+                  rq->min_vruntime == before->queue.floor && rq->cached_load_default.load() == before->queue.load_default - 8 &&
+                  rq->cached_load_process.load() == before->queue.load_process - 8 && rq->current_task == &tasks[2] &&
+                  rq->handoff_task == &tasks[3] && rq->cached_current_load_default.load() == before->queue.current_load_default &&
+                  rq->cached_current_load_process.load() == before->queue.current_load_process;
+        for (size_t i : {size_t{0}, size_t{2}, size_t{3}}) {
+            auto observed = domain_steal_task_snapshot(tasks[i]);
+            auto expected_peer = before->tasks[i];
+            expected_peer.heap_index = tasks[i].heap_index;
+            if (i >= 2) {
+                auto const DIAGNOSTIC = decode_migration_diagnostic(observed.migration_diagnostic);
+                ok = DIAGNOSTIC.reason == MigrationRejectionReason::RETURN_TRANSITION && DIAGNOSTIC.source_cpu == 0 &&
+                     DIAGNOSTIC.target_cpu == destination_cpu && ok;
+                expected_peer.migration_diagnostic = observed.migration_diagnostic;
+            }
+            ok = observed == expected_peer && rq->runnable_heap.contains(&tasks[i]) && ok;
+        }
+        for (size_t i = 4; i < DOMAIN_STEAL_TASK_COUNT; ++i) ok = domain_steal_task_snapshot(tasks[i]) == before->tasks[i] && ok;
+        auto queue = domain_steal_queue_snapshot(*rq);
+        auto expected_queue = before->queue;
+        expected_queue.size = queue.size;
+        expected_queue.weight = queue.weight;
+        expected_queue.weighted_vruntime = queue.weighted_vruntime;
+        expected_queue.load_default = queue.load_default;
+        expected_queue.load_process = queue.load_process;
+        return queue == expected_queue && ok;
+    }
+};
+
+auto domain_steal_snapshot(bool hard, uint64_t mask) -> smt::CpuDomain {
+    return {.id = 2,
+            .level = smt::CpuDomainLevel::LEAF,
+            .cpu_mask = mask,
+            .parent_id = 1,
+            .soft_exclusive = !hard,
+            .hard = hard,
+            .name = {'r', 'q', '-', 'f', 'i', 'x', 't', 'u', 'r', 'e', '\0'}};
+}
+}  // namespace
+
+auto scheduler_selftest_domain_stamp_and_hard_mask_boundaries() -> bool {
+    static_assert(std::is_same_v<decltype(RunQueue::domain_id), uint32_t>);
+    DomainStealFixture fixture;
+    if (!fixture.ready()) return false;
+    uint32_t const DOMAIN_COUNT = smt::get_cpu_domain_count();
+    bool ok = load_runqueue_domain_id(fixture.rq.get()) == 0 && smt::get_cpu_domain(0) != nullptr && smt::get_cpu_domain(1) != nullptr;
+    for (uint32_t stamp : {uint32_t{0}, uint32_t{1}, uint32_t{64}, smt::DOMAIN_ID_INVALID}) {
+        bool const PREPARED = fixture.prepare();
+        uint64_t const FLAGS = fixture.lock.lock_irqsave();
+        store_runqueue_domain_id(fixture.rq.get(), stamp);
+        const smt::CpuDomain* expected = stamp == 0 ? nullptr : smt::get_cpu_domain(stamp);
+        ok = load_runqueue_domain_id(fixture.rq.get()) == stamp && current_runqueue_domain_snapshot(fixture.rq.get()) == expected &&
+             runqueue_domain_allows_idle_steal(fixture.rq.get(), 1) && PREPARED && ok;
+        fixture.capture_locked();
+        task::Task* detached = detach_steal_candidate_in_current_domain_locked(fixture.rq.get(), 0, 1, 4);
+        ok = fixture.exact_detachment_locked(detached, 1) && ok;
+        fixture.lock.unlock_irqrestore(FLAGS);
+    }
+    const smt::CpuDomain hard = domain_steal_snapshot(true, (1ULL << 63) | 1ULL);
+    const smt::CpuDomain soft = domain_steal_snapshot(false, 1ULL);
+    ok = domain_snapshot_allows_idle_steal(&hard, 0) && domain_snapshot_allows_idle_steal(&hard, 63) &&
+         !domain_snapshot_allows_idle_steal(&hard, 1) && !domain_snapshot_allows_idle_steal(&hard, 64) &&
+         domain_snapshot_allows_idle_steal(&soft, 64) && domain_snapshot_allows_idle_steal(nullptr, 64) && ok;
+    return smt::get_cpu_domain_count() == DOMAIN_COUNT && ok;
+}
+
+auto scheduler_selftest_changed_domain_snapshot_refuses_detach() -> bool {
+    DomainStealFixture fixture;
+    if (!fixture.ready()) return false;
+    bool ok = fixture.prepare();
+    const smt::CpuDomain soft = domain_steal_snapshot(false, 1ULL);
+    const smt::CpuDomain hard = domain_steal_snapshot(true, 0x5ULL);
+    // Private snapshots test the shared core's changed admission input. They
+    // do not claim a live hard stamp/registry race or consume a global leaf.
+    ok = domain_snapshot_allows_idle_steal(&soft, 1) && fixture.rq->cached_load_process.load() == 32 && ok;
+    uint64_t const FLAGS = fixture.lock.lock_irqsave();
+    fixture.capture_locked();
+    task::Task* detached = detach_steal_candidate_locked(fixture.rq.get(), 0, 1, 4, &hard);
+    ok = detached == nullptr && fixture.unchanged_locked() && ok;
+    fixture.lock.unlock_irqrestore(FLAGS);
+    return ok;
+}
+
+auto scheduler_selftest_hard_domain_snapshot_allows_exact_detach() -> bool {
+    DomainStealFixture fixture;
+    if (!fixture.ready()) return false;
+    const smt::CpuDomain hard = domain_steal_snapshot(true, 0x5ULL | (1ULL << 63));
+    bool ok = true;
+    for (uint64_t destination : {uint64_t{2}, uint64_t{63}}) {
+        bool const PREPARED = fixture.prepare();
+        uint64_t const FLAGS = fixture.lock.lock_irqsave();
+        fixture.capture_locked();
+        task::Task* detached = detach_steal_candidate_locked(fixture.rq.get(), 0, destination, 64, &hard);
+        ok = fixture.exact_detachment_locked(detached, destination) && PREPARED && ok;
+        fixture.lock.unlock_irqrestore(FLAGS);
+    }
+    return ok;
+}
+
+auto scheduler_selftest_domain_compatibility_preserves_task_guards() -> bool {
+    DomainStealFixture fixture;
+    if (!fixture.ready()) return false;
+    const smt::CpuDomain soft = domain_steal_snapshot(false, 1ULL);
+    bool ok = true;
+    for (const smt::CpuDomain* admitted : {&soft, static_cast<const smt::CpuDomain*>(nullptr)}) {
+        bool const PREPARED = fixture.prepare();
+        uint64_t const FLAGS = fixture.lock.lock_irqsave();
+        fixture.capture_locked();
+        task::Task* detached = detach_steal_candidate_locked(fixture.rq.get(), 0, 1, 4, admitted);
+        ok = fixture.exact_detachment_locked(detached, 1) && PREPARED && ok;
+        fixture.lock.unlock_irqrestore(FLAGS);
+    }
+    constexpr std::array REASONS{MigrationRejectionReason::CPU_PINNED, MigrationRejectionReason::DOMAIN_RESTRICTED,
+                                 MigrationRejectionReason::MIGRATION_DISABLED, MigrationRejectionReason::NOT_RUNNABLE};
+    for (auto reason : REASONS) {
+        bool const PREPARED = fixture.prepare();
+        uint64_t const FLAGS = fixture.lock.lock_irqsave();
+        for (size_t i = 0; i < 2; ++i) {
+            auto& t = fixture.tasks[i];
+            if (reason == MigrationRejectionReason::CPU_PINNED) t.cpu_pinned = true;
+            if (reason == MigrationRejectionReason::DOMAIN_RESTRICTED) t.domain_hard = true;
+            if (reason == MigrationRejectionReason::MIGRATION_DISABLED)
+                t.migration_guard_state.store(encode_migration_guard_state({.depth = 1, .owner_cpu = 0}), std::memory_order_release);
+            if (reason == MigrationRejectionReason::NOT_RUNNABLE) t.state.store(task::TaskState::EXITING, std::memory_order_release);
+        }
+        fixture.capture_locked();
+        task::Task* detached = detach_steal_candidate_locked(fixture.rq.get(), 0, 1, 4, &soft);
+        ok = detached == nullptr && fixture.unchanged_locked(false) && PREPARED && ok;
+        for (size_t i = 0; i < DOMAIN_STEAL_HEAP_COUNT; ++i) {
+            auto const DIAGNOSTIC = decode_migration_diagnostic(fixture.tasks[i].migration_diagnostic.load());
+            auto const EXPECTED = i < 2 ? reason : MigrationRejectionReason::RETURN_TRANSITION;
+            ok = DIAGNOSTIC.reason == EXPECTED && DIAGNOSTIC.source_cpu == 0 && DIAGNOSTIC.target_cpu == 1 && ok;
+        }
+        fixture.lock.unlock_irqrestore(FLAGS);
+    }
+    return ok;
+}
+
+auto scheduler_selftest_domain_refusal_preserves_stale_index_then_repairs() -> bool {
+    DomainStealFixture fixture;
+    if (!fixture.ready()) return false;
+    bool ok = fixture.prepare();
+    const smt::CpuDomain hard = domain_steal_snapshot(true, 0x5ULL);
+    uint64_t const FLAGS = fixture.lock.lock_irqsave();
+    fixture.tasks[1].heap_index = -1;  // Physical membership deliberately remains.
+    fixture.capture_locked();
+    task::Task* refused = detach_steal_candidate_locked(fixture.rq.get(), 0, 1, 4, &hard);
+    ok = refused == nullptr && fixture.unchanged_locked() && fixture.tasks[1].heap_index == -1 && ok;
+    task::Task* detached = detach_steal_candidate_locked(fixture.rq.get(), 0, 2, 4, &hard);
+    ok = fixture.exact_detachment_locked(detached, 2) && ok;
+    fixture.lock.unlock_irqrestore(FLAGS);
     return ok;
 }
 

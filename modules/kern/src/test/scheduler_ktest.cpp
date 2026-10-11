@@ -623,3 +623,27 @@ namespace ker::dev::virtio {
 auto virtio_selftest_queue_affinity_batch() -> bool;
 }
 KTEST(Net, QueueAffinityAdmitsBeforeInterruptChanges) { KEXPECT_TRUE(ker::dev::virtio::virtio_selftest_queue_affinity_batch()); }
+
+namespace ker::mod::sched {
+auto scheduler_selftest_domain_stamp_and_hard_mask_boundaries() -> bool;
+auto scheduler_selftest_changed_domain_snapshot_refuses_detach() -> bool;
+auto scheduler_selftest_hard_domain_snapshot_allows_exact_detach() -> bool;
+auto scheduler_selftest_domain_compatibility_preserves_task_guards() -> bool;
+auto scheduler_selftest_domain_refusal_preserves_stale_index_then_repairs() -> bool;
+}  // namespace ker::mod::sched
+
+KTEST(SchedulerDomain, AtomicStampAndHardMaskBoundaries) {
+    KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_domain_stamp_and_hard_mask_boundaries());
+}
+KTEST(SchedulerDomain, ChangedSnapshotRefusesBeforeDetach) {
+    KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_changed_domain_snapshot_refuses_detach());
+}
+KTEST(SchedulerDomain, CurrentHardSnapshotAllowsExactDetachment) {
+    KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_hard_domain_snapshot_allows_exact_detach());
+}
+KTEST(SchedulerDomain, LockedSoftAndInvalidCompatibility) {
+    KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_domain_compatibility_preserves_task_guards());
+}
+KTEST(SchedulerDomain, RefusalDoesNotRepairStaleHeapIndex) {
+    KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_domain_refusal_preserves_stale_index_then_repairs());
+}

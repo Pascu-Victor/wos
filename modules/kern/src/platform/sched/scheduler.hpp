@@ -124,7 +124,9 @@ struct RunQueue {
     std::atomic<bool> resched_timer_pending;
 
     // CPU domain fields (Phase 1)
-    // domain_id: which CpuDomain this RunQueue belongs to (0 = root)
+    // domain_id: which CpuDomain this RunQueue belongs to (0 = root).
+    // Exclusive construction initializes it; all live accesses use the
+    // scheduler's atomic-ref accessors, and stores retain the owning RQ lock.
     // daemon_load_penalty: added to reported load when incoming task is PROCESS type.
     // Positive values make soft-exclusive daemon CPUs less attractive to PROCESS placement.
     uint32_t domain_id = 0;

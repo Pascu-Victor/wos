@@ -75,6 +75,15 @@ See [cpu_domain_runtime.md](../../tests/fixtures/cpu_domain_runtime.md) for the
 standalone fixture, report format and limits. This does not qualify inherited
 CPU placement or compartment CPU ceilings.
 
+Checkpoint 37 adds atomic RunQueue stamps and a fresh hard-domain admission
+check inside the victim lock. Five private native cases exercise the actual
+detach core, heap/accounting, unchanged refusal and exact successful membership.
+Normal/diagnostic builds,48 selected Host tests and KTEST66 passed:89,419
+assertions,0 failures,1,408 executed cases/all157 mandatory; three known disabled
+BufferCache cases stay excluded. The VM powered off naturally and all four
+private images were pruned. Private snapshots do not qualify live hard-stamp
+SMP races, inherited Task placement or compartment CPU ceilings.
+
 Owned software qualification may use `bin/wos-cluster --no-setup` or isolated
 `bin/wos-ktest --no-setup`, with one topology, a 20GiB disposable storage budget,
 40GiB free-space floor and exact-owned inactive-image pruning after every run.

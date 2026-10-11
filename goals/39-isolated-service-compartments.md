@@ -3,14 +3,15 @@
 ## Copy-pastable goal command
 
 ```text
-/goal Implement WOS service compartments with independent mount/PID/IPC visibility, explicit capability inheritance, namespace-aware process lifecycle and a usable compartment launcher. Verify every acceptance criterion in goals/39-isolated-service-compartments.md through executable isolation and escape tests, ABI checks, Normal Build WOS and user-run simultaneous-service evidence. Preserve host init behavior, existing credentials/resource limits, stable VFS lifetime and WKI authority. Bound work to the specified compartment model without claiming Linux container compatibility; use checkpointed bounded subagents and follow the file's evidence and blocked rules.
+/goal Implement WOS service compartments with independent mount/PID/IPC visibility, explicit capability inheritance, namespace-aware process lifecycle and a usable compartment launcher. Verify every acceptance criterion in goals/39-isolated-service-compartments.md through executable isolation and escape tests, ABI checks, Normal Build WOS and actual simultaneous-service evidence. Preserve host init behavior, existing credentials/resource limits, stable VFS lifetime and WKI authority. Agent-owned software qualification may use bin/wos-cluster --no-setup or isolated bin/wos-ktest --no-setup, with one topology and exact-owned inactive-image pruning after every outcome. Bound work to the specified compartment model without claiming Linux container compatibility; use checkpointed bounded subagents and follow the file's evidence and blocked rules.
 ```
 
 ## Outcome and scale
 
-Current checkpoint 36 qualifies immutable CPU-domain publication, five actual
-registry selftests and concurrent public creation/query on a Normal eight-CPU
-kernel. Checkpoint 35's initial nice inheritance and private priority checks remain.
+Current checkpoint 37 qualifies atomic RQ domain stamps and fresh locked
+hard-domain admission with five actual scheduler cases. Checkpoint 36's immutable
+registry and Normal eight-CPU public ABI evidence, and checkpoint 35's initial
+nice inheritance/private priority evidence remain as qualified historical runs.
 Goal39 is ACTIVE; all ten full criteria
 remain incomplete. Launch exact-owned tests with `--no-setup`, maintain one
 topology and prune disposable images after every passing or failing run.
@@ -133,10 +134,14 @@ Prepare isolated diagnostics with `bin/wos-ktest --build-only`, retaining
 `docs/kernel_debug_flags.md` before changing diagnostic flags. Never combine
 report-mode KUBSan with the UBSan trap profile.
 
-Kernel/cluster runtime execution and debugging are user-run under the current
-instructions. Supply exact fixture-specific commands, expected observations,
-and log locations early; analyze returned evidence while continuing independent
-implementation and host validation. Runtime requirements in this file are mandatory,
+The user authorizes agent-owned software qualification and debugging through
+`bin/wos-cluster --no-setup` and isolated `bin/wos-ktest --no-setup`, without root.
+Preserve the shared launch guard, one active test topology and Normal/KTEST
+isolation. Measure storage against the20GiB disposable budget/40GiB free floor;
+prune proven inactive exact-owned images after PASS,FAIL and exceptions, retaining
+small logs/receipts and preserving unrelated VMs/current artifacts/required seeds.
+Supply exact fixture commands, expected observations and log locations.
+Runtime requirements in this file are mandatory,
 not replaced by model tests, source-string tests, a successful build, or a demo
 script that has not run.
 
@@ -881,3 +886,72 @@ with allocation failures/all reference baselines and complete Host/init/libc
 regression remain. Launch only owned tests with --no-setup, preserve Normal/
 KTEST isolation, one topology and20GiB/40GiB storage bounds; prune exact-owned
 inactive images after PASS,FAIL and exceptions. No pause or push.
+
+## Checkpoint37: atomic RQ stamps and locked hard-domain admission (2026-10-11)
+
+RunQueue domain stamps now use lock-free acquire/release atomic_ref access while
+retaining the existing uint32_t member, default, offset and queue layout. Both
+advisory readers use one immutable registry snapshot. The actual victim try-lock
+callback resolves its current stamp after acquiring that lock, then calls the
+shared detach core. The stamp setter holds the same lock. An excluded hard mask
+refuses before candidate diagnostics, CPU changes, stale-index repair, heap
+mutation or accounting. Root, missing and soft stamps retain their existing
+permissive behavior. No allocation, blocking, logging or new lock nesting was
+added to these consumers.
+
+The original candidate selection, scan limits, current/handoff exclusions,
+CPU-before-remove order, rollback and destination publication are preserved.
+The independent preservation audit passed152 checks, including116 protected
+source files,28 original scheduler selftest bodies, the complete original native
+registration prefix and unchanged header/layout tokens. Its initial FAIL01
+remains: the checker assumed an if block where the existing advisory guard uses
+an anonymous scope. Corrected receipt02 verifies the actual baseline boundary;
+no production change was needed for that diagnosis.
+
+Five appended native cases exercise the same production core with private actual
+RunQueues, Tasks, Threads, owned context storage and heap/accounting primitives.
+They verify atomic stamp/root/group/missing binding, CPU0/63/64 hard-mask bounds,
+changed-snapshot refusal, exact successful heap order/indexes and accounting,
+soft/null compatibility, existing Task guards and refusal before stale-index
+repair. Wait/dead lists, timers, current/handoff, caches, fairness and Task fields
+are checked; all borrowed fields and physical heap entries are cleared before
+owned destruction after releasing the fixture lock. No fake Task is PID-registered,
+posted or executed, and no live registry leaves are consumed.
+
+Normal Build WOS PASS53.815s; isolated fast diagnostic build PASS56.594s;
+48 selected Host tests PASS39.561s; final format/tidy check PASS91.114s.
+KTEST66 --fast --no-setup PASS502.650s:89,419 assertions/0 failures,1,408 executed
+cases, all157 mandatory, natural selftest poweroff/launcher0, no forced stop and
+163 stable source/artifact pins (161 distinct paths). The same three pre-existing
+disabled BufferCache registrations remain excluded from executed/mandatory counts.
+The exact prior1,403-case set plus five new cases is preserved.
+
+The four exact-owned private images were pruned, releasing261,832,704 allocated
+bytes. Final disposable allocation is zero. Complete before/live/after inventories
+preserve unrelated user VM13532 UID945; the test alone ran as UID1000. Normal and
+KTEST build/data/sysroot isolation,20GiB disposable budget and40GiB free floor
+remain. Required seeds/current artifacts and small logs/receipts are preserved.
+
+Aggregate checkpoint-37-audit.json PASS SHA256
+492c4e48349ed49aea6058ca21d4bcec623df0b375798106d22268981569a55e.
+Private native snapshots qualify the locked core's effects; actual root/group/
+missing lookup and source audit bind its fresh production delegation. They do
+not qualify a live hard-stamp SMP race. KTEST APs remain parked. Task placement
+transactions/inheritance and immutable CPU ceilings are still unqualified.
+
+Goal39 remains ACTIVE; all ten full criteria remain incomplete. Next is consistent
+atomic access to all five existing Task CPU/placement scalars, preserving layout
+and behavior, then checked owner-locked policy/movement transactions. The current
+SET_DOMAIN hard-first move failure and move-capacity/partial-fairness rollback
+remain open. Worker-exec/ordinary ancestry, WKI, hostile/shared/futex/init evidence,
+two simultaneous2h trees,1,000 full lifecycles with allocation failures/all
+reference baselines and complete Host/init/libc regression remain. Continue owned
+qualification with --no-setup, one topology and pruning after PASS/FAIL/exception.
+
+Independent checkpoint37-evidence-integrity02.json PASS (all11 sections), SHA256
+08bbbfc9a9ac0254849aa7e6ea44f659ee8484beca72d78c542a6a03d8120731.
+Its initial FAIL01 and original checker remain intact: relative/absolute source
+path spelling and the full157-row launcher pin list did not match the checker’s
+initial schema. Corrected02 independently binds those actual rows, all execution
+evidence, final boot artifacts, exact four-image pruning and zero disposable
+allocation. No production/runtime evidence was changed or test rerun required.
