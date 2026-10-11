@@ -32,6 +32,10 @@ class NamespaceRef {
     [[nodiscard]] auto allocate_id(uint32_t& out) const -> int;
     // Serializes with native index publication; no registry lock or teardown.
     void close() const;
+    // Namespace-init retirement is idempotent for this exact retained slot.
+    // First caller closes publication; this does not destroy any owner.
+    [[nodiscard]] auto begin_retirement() const -> bool;
+    [[nodiscard]] auto retiring() const -> bool;
     void reset();
     [[nodiscard]] auto operator==(const NamespaceRef& other) const -> bool { return namespace_ == other.namespace_; }
 

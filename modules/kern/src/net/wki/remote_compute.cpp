@@ -37,6 +37,7 @@
 #include <platform/mm/virt.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/random/entropy.hpp>
+#include <platform/sched/compartment_lifecycle.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/resource.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -3821,6 +3822,10 @@ void finalize_proxy_task(ker::mod::sched::task::Task* proxy, int32_t exit_status
 template <typename Publish>
 void finish_proxy_exit(ker::mod::sched::task::Task& task, Publish&& publish) {
     auto* proxy = &task;
+    if (ker::mod::sched::compartment::begin_init_retirement(task) != 0) [[unlikely]] {
+        ker::mod::dbg::panic_handler("private proxy init: failed to retain retirement owners");
+        hcf();
+    }
     retire_child_queries_for_task(task);
     retire_child_wait_transactions_for_task(task);
     ker::syscall::process::child_events::prepare_process_exit(*proxy);

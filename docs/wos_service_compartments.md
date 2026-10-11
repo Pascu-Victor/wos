@@ -800,8 +800,8 @@ Old parent claims are invalidated; independent tracer claims remain valid.
 Task/namespace/event layouts and syscall/libc/wire ABI are unchanged. Native
 fixtures exercise actual registry selection, ownership/claim transfers and
 reference drains using per-invocation cutovers without a global hook or fake
-runnable Tasks. Bounded namespace-init closure, descendant termination,
-mount/IPC drain and scheduled service qualification still require integration.
+runnable Tasks. The deferred retirement implementation below adds namespace
+closure and exit requests; scheduled service teardown still needs qualification.
 Public creation remains disabled and all ten full criteria remain incomplete.
 
 Normal Build WOS, isolated fast diagnostics, all 35 selected host checks,
@@ -813,6 +813,55 @@ uses production resource accounting, preserving the expected event snapshots.
 Four images from each failed and successful run were verified inactive and
 pruned. Final disposable usage is zero; small failure, source and cleanup
 receipts remain.
+
+## Deferred private-init retirement
+
+Canonical process exit and deferred local proxy exit now start retirement when
+the subject is the exact private local PID 1. The PID publication gate closes
+the view once; private mount and named-IPC views also close. Host views remain
+open, including mixed-view internal fixtures. Late private child membership
+checks closure and parent exit under the lifecycle lock and PID gate. Existing
+construction can abort through its original ownership cleanup.
+
+A kernel worker starts after Host init creation and before user dispatch.
+Its static 64-record pool matches the PID namespace pool. Each occupied record
+retains a distinct PID view and its mount/IPC owners, without retaining Tasks
+or allocating on init death. One dispatch selects one record, retains at most
+16 exact-scope victims, publishes cooperative fatal exit requests, and attempts
+one mount teardown. Registry, lifecycle, PID and record locks are released
+before delivery or backend cleanup. Ordinary executor-owned exit performs
+File, mapping, ptrace, WKI and child cleanup; the worker never forces another
+Task into DEAD. Registry-only construction remains part of the pending drain
+but receives no scheduler wake before runnable publication.
+
+Closed named IPC loses new name admission while inherited attachments retain
+their backing. Private mounts retire leaf first and root last. A busy File,
+mount reference or pivot leaves a retryable closed view; explicitly inherited
+Files keep their existing capabilities until final close. Pending executor
+cleanup and admitted PID operations keep the record alive. Ref drops and
+backend work occur outside service locks. Retry budgets bound each dispatch;
+they do not impose a deadline that frees live capabilities. Task/File/event,
+syscall/libc and WKI wire layouts remain unchanged; the opaque PID registry
+adds an internal retirement bit that resets on slot reuse.
+
+Four native cases exercise closure, 16-victim batches, exact foreign/Host
+exclusion, pending requests, admitted-operation drains, late construction,
+all available PID slots, and retained-File mount/IPC retirement. They share
+production dispatch/request stores with an explicit adapter for inert fixtures.
+Normal Build WOS, isolated fast diagnostics, 36 selected host checks,
+13-path formatting and seven normal clang-tidy units pass. Actual rootless
+KTEST34 passes 81,899 assertions, zero failures, 1,342 cases and all 91 mandatory
+checks, with normal poweroff and stable source/artifact pins.
+
+A separate normal VM reaches Host PID 1, root pivot, journald and netd after
+mandatory worker publication. Its original three-service probe fails because
+the deliberately unmanaged interface supplies no usable address: netd's normal
+readiness condition holds network-dependent services. The failed probe and
+exact-owned stop receipt remain. This provides limited initial Host startup
+evidence; worker-entry execution, scheduled private-init death, complete Host
+services and full lifecycle campaigns remain unqualified. All eight disposable
+images from both runs were verified inactive and pruned; final usage is zero.
+Public creation remains disabled and all ten full criteria remain incomplete.
 
 ## Verification checkpoint
 

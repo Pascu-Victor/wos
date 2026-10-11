@@ -14,6 +14,7 @@
 #include <platform/ktime/process_timer.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/perf/perf_events.hpp>
+#include <platform/sched/compartment_lifecycle.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/resource.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -163,6 +164,23 @@ auto publish_process_exit_request(ker::mod::sched::task::Task* task, int status,
     return true;
 }
 
+template <typename Delivery>
+auto request_compartment_exit_impl(sched_task::Task& subject, const ker::mod::sched::pid_ns::NamespaceRef& scope, Delivery&& deliver)
+    -> bool {
+    auto const* actual = subject.pid_namespace();
+    if (scope.is_host() || !scope.closed() || !scope.retiring() || actual == nullptr || *actual != scope ||
+        subject.type != sched_task::TaskType::PROCESS || subject.state.load(std::memory_order_acquire) != sched_task::TaskState::ACTIVE ||
+        subject.exit_in_progress.load(std::memory_order_acquire) || subject.exit_notify_ready.load(std::memory_order_acquire) ||
+        subject.process_exit_requested.load(std::memory_order_acquire))
+        return false;
+    subject.requested_process_exit_status.store(137, std::memory_order_relaxed);
+    subject.requested_process_exit_wait_status.store(9, std::memory_order_relaxed);
+    subject.process_exit_requested.store(true, std::memory_order_release);
+    subject.signal_add_pending_mask(SIGKILL_MASK);
+    deliver(subject);
+    return true;
+}
+
 struct ThreadGroupExitRequest {
     ker::mod::sched::task::Task* initiator;
     uint64_t process_pid;
@@ -248,6 +266,10 @@ namespace {
         }
     }
     current_task->exit_in_progress = true;
+    if (ker::mod::sched::compartment::begin_init_retirement(*current_task) != 0) [[unlikely]] {
+        ker::mod::dbg::panic_handler("private init: failed to retain retirement owners");
+        hcf();
+    }
     ker::mod::debug::ptrace::cleanup_operations(*current_task);
     cancel_pending_exec_handoff(*current_task);
     ker::vfs::cancel_fd_reservations(*current_task);
@@ -437,6 +459,22 @@ auto inherit_pending_process_exit_request(ker::mod::sched::task::Task* source, k
     ker::mod::sched::wake_task_from_event(new_sibling);
     return true;
 }
+
+auto request_compartment_exit(sched_task::Task& subject, const ker::mod::sched::pid_ns::NamespaceRef& scope) -> bool {
+    return request_compartment_exit_impl(subject, scope, [](sched_task::Task& target) {
+        ker::mod::sched::wake_task_for_signal(&target);
+        ker::mod::sched::wake_task_from_event(&target);
+    });
+}
+
+#ifdef WOS_SELFTEST
+auto selftest_request_compartment_exit(sched_task::Task& subject, const ker::mod::sched::pid_ns::NamespaceRef& scope,
+                                       void (*deliver)(sched_task::Task&, void*), void* context) -> bool {
+    return request_compartment_exit_impl(subject, scope, [deliver, context](sched_task::Task& target) {
+        if (deliver != nullptr) deliver(target, context);
+    });
+}
+#endif
 
 auto request_replaced_exec_thread_retirement(ker::mod::sched::task::Task& subject) -> bool {
     if (!subject.is_thread) return false;

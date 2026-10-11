@@ -824,8 +824,13 @@ auto begin_publication(Task& creator, Task& child) -> bool {
     }
 
     uint64_t const FLAGS = g_lifecycle_lock.lock_irqsave();
-    bool const AVAILABLE =
-        child.child_membership_state.load(std::memory_order_relaxed) == ChildMembershipState::UNLINKED && child.child_parent == nullptr;
+    auto const* scope = child.pid_namespace();
+    std::optional<ker::mod::sched::pid_ns::PublicationGuard> admission;
+    bool const PRIVATE = scope != nullptr && !scope->is_host();
+    if (PRIVATE) admission.emplace(*scope);
+    bool const AVAILABLE = child.child_membership_state.load(std::memory_order_relaxed) == ChildMembershipState::UNLINKED &&
+                           child.child_parent == nullptr &&
+                           (!PRIVATE || (admission->open() && !PARENT->exit_in_progress.load(std::memory_order_acquire)));
     if (AVAILABLE) {
         child.child_publication_established = true;
         child.child_parent = PARENT;
@@ -833,6 +838,7 @@ auto begin_publication(Task& creator, Task& child) -> bool {
         child_list_insert_locked(*PARENT, child);
         child.child_membership_state.store(ChildMembershipState::PUBLISHING, std::memory_order_release);
     }
+    admission.reset();
     g_lifecycle_lock.unlock_irqrestore(FLAGS);
     if (!AVAILABLE) {
         child.release();

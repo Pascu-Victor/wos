@@ -117,6 +117,9 @@ auto unmount_filesystem(const char* path, const mount_ns::NamespaceRef& scope = 
 // keeps backing owners alive for retry after explicit capabilities are dropped.
 // Empty host scope cannot be retired through this interface.
 auto retire_mount_namespace(const mount_ns::NamespaceRef& scope) -> int;
+// Deferred retirement: at most one row, no wait for retained references/files.
+// EAGAIN means more rows; EBUSY preserves capabilities for a later retry.
+auto retire_mount_namespace_step(const mount_ns::NamespaceRef& scope) -> int;
 // Unmount only the exact mount whose private_data still matches the expected
 // owner. This prevents deferred teardown from removing a replacement mounted
 // later at the same path.

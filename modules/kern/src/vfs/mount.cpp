@@ -907,13 +907,16 @@ void rollback_mount_retirement(MountPoint* mount) {
     mount_lock.unlock();
 }
 
-auto complete_retired_mount_teardown(MountPoint* mount, bool bounded_ref_wait, size_t* mount_count_after_remove) -> int {
+auto complete_retired_mount_teardown(MountPoint* mount, bool bounded_ref_wait, size_t* mount_count_after_remove, bool wait_for_refs = true)
+    -> int {
     if (mount == nullptr) {
         return -EINVAL;
     }
 
     bool refs_drained = true;
-    if (bounded_ref_wait) {
+    if (!wait_for_refs) {
+        refs_drained = mount->refs.load(std::memory_order_acquire) == 0;
+    } else if (bounded_ref_wait) {
         refs_drained = wait_for_mount_refs_to_drain_bounded(mount);
     } else {
         wait_for_mount_refs_to_drain(mount);
@@ -1722,7 +1725,8 @@ auto unmount_filesystem(const char* path, const mount_ns::NamespaceRef& scope) -
     return unmount_filesystem_impl(path, nullptr, false, 0, false, scope);
 }
 
-auto retire_mount_namespace(const mount_ns::NamespaceRef& scope) -> int {
+namespace {
+auto retire_mount_namespace_impl(const mount_ns::NamespaceRef& scope, bool single_step) -> int {
     if (scope.is_host()) return -EINVAL;
     // Keep the exact owner pinned across unlocked backend teardown. The caller
     // also owns scope; this API never revokes explicitly retained Files.
@@ -1730,10 +1734,12 @@ auto retire_mount_namespace(const mount_ns::NamespaceRef& scope) -> int {
     int const RETAIN = scope.retain(owner);
     if (RETAIN != 0) return RETAIN;
     while (true) {
-        auto const EPOCH = wait_for_stable_mount_pivot_epoch();
+        auto const EPOCH = single_step ? mount_pivot_epoch.load(std::memory_order_acquire) : wait_for_stable_mount_pivot_epoch();
+        if (single_step && (EPOCH & 1U) != 0) return -EBUSY;
         mount_lock.lock();
         if (mount_pivot_epoch.load(std::memory_order_acquire) != EPOCH) {
             mount_lock.unlock();
+            if (single_step) return -EBUSY;
             continue;
         }
         owner.close();
@@ -1759,13 +1765,23 @@ auto retire_mount_namespace(const mount_ns::NamespaceRef& scope) -> int {
             mount_lock.unlock();
             return 0;
         }
+        if (single_step && (leaf->refs.load(std::memory_order_acquire) != 0 || leaf->open_files.load(std::memory_order_acquire) != 0)) {
+            mount_lock.unlock();
+            return -EBUSY;
+        }
         leaf->retiring.store(true, std::memory_order_release);
         bump_mount_generation_locked();
         mount_lock.unlock();
-        int const DRAIN = complete_retired_mount_teardown(leaf, true, nullptr);
+        int const DRAIN = complete_retired_mount_teardown(leaf, true, nullptr, !single_step);
         if (DRAIN != 0) return DRAIN;
+        if (single_step) return get_mount_count(owner) == 0 ? 0 : -EAGAIN;
     }
 }
+}  // namespace
+
+auto retire_mount_namespace(const mount_ns::NamespaceRef& scope) -> int { return retire_mount_namespace_impl(scope, false); }
+
+auto retire_mount_namespace_step(const mount_ns::NamespaceRef& scope) -> int { return retire_mount_namespace_impl(scope, true); }
 
 auto unmount_filesystem_if_private_data(const char* path, const void* expected_private_data) -> int {
     if (expected_private_data == nullptr) {

@@ -12,6 +12,7 @@ struct Namespace {
     std::atomic<uint64_t> references{};
     uint64_t generation{};
     std::atomic<bool> closed{};
+    std::atomic<bool> retiring{};
     std::atomic<uint32_t> next_id{1};
     std::atomic<uint32_t> operations{};
     sys::Spinlock publication;
@@ -117,6 +118,17 @@ void NamespaceRef::close() const {
     namespace_->publication.unlock_irqrestore(FLAGS);
 }
 
+auto NamespaceRef::begin_retirement() const -> bool {
+    if (namespace_ == nullptr) return false;
+    auto const FLAGS = namespace_->publication.lock_irqsave();
+    namespace_->closed.store(true, std::memory_order_release);
+    bool const FIRST = !namespace_->retiring.exchange(true, std::memory_order_acq_rel);
+    namespace_->publication.unlock_irqrestore(FLAGS);
+    return FIRST;
+}
+
+auto NamespaceRef::retiring() const -> bool { return namespace_ != nullptr && namespace_->retiring.load(std::memory_order_acquire); }
+
 PublicationGuard::PublicationGuard(const NamespaceRef& scope) : namespace_(scope.namespace_) {
     if (namespace_ != nullptr) flags_ = namespace_->publication.lock_irqsave();
 }
@@ -138,6 +150,7 @@ auto create_namespace(NamespaceRef& out) -> int {
         }
         slot.generation = GENERATION;
         slot.closed.store(false, std::memory_order_relaxed);
+        slot.retiring.store(false, std::memory_order_relaxed);
         slot.next_id.store(1, std::memory_order_relaxed);
         slot.operations.store(0, std::memory_order_relaxed);
         slot.references.store(1, std::memory_order_release);

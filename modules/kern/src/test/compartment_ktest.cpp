@@ -12,6 +12,7 @@
 #include <platform/mm/addr.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
+#include <platform/sched/compartment_lifecycle.hpp>
 #include <platform/sched/ipc_namespace.hpp>
 #include <platform/sched/pid_namespace.hpp>
 #include <platform/sched/resource.hpp>
@@ -23,6 +24,7 @@
 #include <platform/sys/usercopy.hpp>
 #include <syscalls_impl/process/child_events.hpp>
 #include <syscalls_impl/process/exec.hpp>
+#include <syscalls_impl/process/exit.hpp>
 #include <syscalls_impl/process/process.hpp>
 #include <syscalls_impl/shm/shm.hpp>
 #include <syscalls_impl/vmem/sys_vmem.hpp>
@@ -44,6 +46,7 @@ namespace pid_ns = ker::mod::sched::pid_ns;
 namespace sched = ker::mod::sched;
 namespace session = ker::mod::sched::session;
 namespace child_events = ker::syscall::process::child_events;
+namespace lifecycle = ker::mod::sched::compartment;
 
 KTEST(CompartmentPid, RetainedPoolAndMonotonicIdsDrainWithoutRetargeting) {
     auto const BASELINE = pid_ns::live_namespace_count();
@@ -1125,6 +1128,180 @@ KTEST(CompartmentLifecycle, PrivateInitDiscardsParentAudienceAndPreservesHostAnd
         KREQUIRE_TRUE(child_events::commit_claim(*host.task, claim.value, event, false));
         KEXPECT_EQ(host.task->ref_count.load(), uint32_t{1});
         KEXPECT_EQ(fixture.init.task->ref_count.load(), uint32_t{1});
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+namespace {
+struct RetirementFixture {
+    pid_ns::NamespaceRef scope;
+    RegistryTask init;
+    size_t baseline{lifecycle::status().pending};
+    ~RetirementFixture() {
+        init.retire();
+        for (size_t i = 0; i < pid_ns::MAX_NAMESPACES && lifecycle::status().pending > baseline; ++i)
+            lifecycle::selftest_dispatch_once(nullptr, nullptr);
+        KEXPECT_EQ(lifecycle::status().pending, baseline);
+    }
+    auto prepare() -> bool { return pid_ns::create_namespace(scope) == 0 && init.task->initialize_pid_namespace(scope); }
+    auto begin() -> int {
+        init.task->exit_in_progress.store(true, std::memory_order_release);
+        return lifecycle::begin_init_retirement(*init.task);
+    }
+};
+struct ExitDelivery {
+    size_t count{};
+    static void observe(Task& target, void* opaque) {
+        auto& self = *static_cast<ExitDelivery*>(opaque);
+        ++self.count;
+        KEXPECT_TRUE(target.ref_count.load() >= 2);
+        KEXPECT_TRUE(target.process_exit_requested.load(std::memory_order_acquire));
+        KEXPECT_EQ(target.requested_process_exit_status.load(), 137);
+        KEXPECT_EQ(target.requested_process_exit_wait_status.load(), 9);
+        KEXPECT_TRUE((target.signal_pending_bits() & (uint64_t{1} << 8)) != 0);
+        KEXPECT_FALSE(target.scheduler_published.load());
+    }
+};
+struct RetirementDrain {
+    size_t baseline{lifecycle::status().pending};
+    ~RetirementDrain() {
+        for (size_t i = 0; i < pid_ns::MAX_NAMESPACES && lifecycle::status().pending > baseline; ++i)
+            lifecycle::selftest_dispatch_once(nullptr, nullptr);
+        KEXPECT_EQ(lifecycle::status().pending, baseline);
+    }
+};
+}  // namespace
+
+KTEST(CompartmentLifecycle, InitClosureRequestsBoundedExactCohortsAndWaitsForOperations) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    auto const REGISTRY = sched::get_scoped_pid_task_count();
+    auto const STATUS = lifecycle::status();
+    {
+        RetirementFixture fixture;
+        KREQUIRE_TRUE(fixture.prepare());
+        KREQUIRE_TRUE(fixture.init.publish());
+        constexpr size_t VICTIMS = lifecycle::EXIT_REQUEST_BUDGET * 2 + 5;
+        std::array<RegistryTask, VICTIMS> victims;
+        for (size_t i = 0; i < victims.size(); ++i) {
+            if (i == victims.size() - 1) {
+                victims[i].task->is_thread = true;
+                victims[i].task->owner_pid = victims[0].task->pid;
+                KREQUIRE_TRUE(resource::bind_thread_owner(*victims[i].task, *victims[0].task));
+            } else
+                KREQUIRE_TRUE(victims[i].task->initialize_pid_namespace(fixture.scope));
+            KREQUIRE_TRUE(victims[i].publish());
+        }
+        victims[5].task->exit_in_progress.store(true);
+        victims[8].task->requested_process_exit_status.store(72);
+        victims[8].task->requested_process_exit_wait_status.store(0x4800);
+        victims[8].task->process_exit_requested.store(true);
+        pid_ns::NamespaceRef foreign_scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(foreign_scope), 0);
+        RegistryTask foreign, host;
+        KREQUIRE_TRUE(foreign.task->initialize_pid_namespace(foreign_scope));
+        KREQUIRE_TRUE(foreign.publish());
+        KREQUIRE_TRUE(host.publish());
+        pid_ns::OperationLease operation;
+        KREQUIRE_EQ(operation.begin(fixture.scope), 0);
+        KREQUIRE_EQ(fixture.begin(), 0);
+        KEXPECT_TRUE(fixture.scope.closed());
+        KEXPECT_TRUE(fixture.scope.retiring());
+        KEXPECT_EQ(lifecycle::status().pending, STATUS.pending + 1);
+        KEXPECT_EQ(fixture.begin(), 0);
+        KEXPECT_EQ(lifecycle::status().pending, STATUS.pending + 1);
+        KEXPECT_TRUE(fixture.init.task->mount_namespace()->is_host());
+        KEXPECT_FALSE(fixture.init.task->mount_namespace()->closed());
+        KEXPECT_FALSE(fixture.init.task->ipc_namespace()->closed());
+        KEXPECT_FALSE(foreign_scope.closed());
+        ExitDelivery delivered;
+        // Production excludes registry-only construction but must retain the
+        // drain record while those visible constructors have not cleaned up.
+        lifecycle::selftest_dispatch_once(ExitDelivery::observe, &delivered);
+        KEXPECT_EQ(delivered.count, size_t{0});
+        KEXPECT_EQ(lifecycle::status().pending, STATUS.pending + 1);
+        fixture.init.retire();
+        lifecycle::selftest_dispatch_once(ExitDelivery::observe, &delivered, true);
+        KEXPECT_EQ(delivered.count, lifecycle::EXIT_REQUEST_BUDGET);
+        lifecycle::selftest_dispatch_once(ExitDelivery::observe, &delivered, true);
+        KEXPECT_EQ(delivered.count, lifecycle::EXIT_REQUEST_BUDGET * 2);
+        lifecycle::selftest_dispatch_once(ExitDelivery::observe, &delivered, true);
+        KEXPECT_EQ(delivered.count, VICTIMS - 2);
+        KEXPECT_FALSE(host.task->process_exit_requested.load());
+        KEXPECT_FALSE(foreign.task->process_exit_requested.load());
+        KEXPECT_FALSE(victims[5].task->process_exit_requested.load());
+        KEXPECT_EQ(victims[8].task->requested_process_exit_status.load(), 72);
+        KEXPECT_EQ(victims[8].task->requested_process_exit_wait_status.load(), 0x4800);
+        KEXPECT_TRUE(victims.back().task->ptrace_termination_pending());
+        for (auto& victim : victims) victim.retire();
+        lifecycle::selftest_dispatch_once(nullptr, nullptr);
+        KEXPECT_EQ(lifecycle::status().pending, STATUS.pending + 1);
+        operation.reset();
+        lifecycle::selftest_dispatch_once(nullptr, nullptr);
+        KEXPECT_EQ(lifecycle::status().pending, STATUS.pending);
+        KEXPECT_EQ(lifecycle::status().exit_requests, STATUS.exit_requests + VICTIMS - 2);
+        KEXPECT_EQ(fixture.begin(), 0);
+        KEXPECT_EQ(lifecycle::status().pending, STATUS.pending);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+    KEXPECT_EQ(sched::get_scoped_pid_task_count(), REGISTRY);
+}
+
+KTEST(CompartmentLifecycle, ClosedLateMembershipCannotPublishAndExistingConstructionAborts) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        RetirementFixture fixture;
+        KREQUIRE_TRUE(fixture.prepare());
+        RegistryTask preparing, late;
+        KREQUIRE_TRUE(preparing.task->initialize_pid_namespace(fixture.scope));
+        KREQUIRE_TRUE(late.task->initialize_pid_namespace(fixture.scope));
+        PublicationRollback rollback{*preparing.task};
+        KREQUIRE_TRUE(child_events::begin_publication(*fixture.init.task, *preparing.task));
+        KREQUIRE_EQ(fixture.begin(), 0);
+        KEXPECT_FALSE(preparing.publish());
+        KEXPECT_FALSE(child_events::begin_publication(*fixture.init.task, *late.task));
+        KEXPECT_NULL(late.task->child_parent);
+        KEXPECT_EQ(late.task->ref_count.load(), uint32_t{1});
+        child_events::abort_publication(*preparing.task);
+        KEXPECT_NULL(fixture.init.task->child_list_head);
+        KEXPECT_EQ(preparing.task->ref_count.load(), uint32_t{1});
+        KEXPECT_EQ(fixture.init.task->ref_count.load(), uint32_t{1});
+        lifecycle::selftest_dispatch_once(nullptr, nullptr);
+        KEXPECT_EQ(lifecycle::status().pending, fixture.baseline);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentLifecycle, EveryPidPoolSlotHasRetirementCapacityAndReusableCleanState) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    auto const STATUS = lifecycle::status();
+    {
+        RetirementDrain drain;
+        std::array<pid_ns::NamespaceRef, pid_ns::MAX_NAMESPACES> scopes;
+        std::array<std::unique_ptr<Task>, pid_ns::MAX_NAMESPACES> inits;
+        auto const AVAILABLE = pid_ns::MAX_NAMESPACES - BASELINE;
+        for (size_t i = 0; i < AVAILABLE; ++i) {
+            KREQUIRE_EQ(pid_ns::create_namespace(scopes[i]), 0);
+            inits[i] = std::make_unique<Task>();
+            inits[i]->pid = sched::task::get_next_pid();
+            inits[i]->type = sched::task::TaskType::PROCESS;
+            KREQUIRE_TRUE(inits[i]->initialize_pid_namespace(scopes[i]));
+            inits[i]->exit_in_progress.store(true);
+            KREQUIRE_EQ(lifecycle::begin_init_retirement(*inits[i]), 0);
+        }
+        KEXPECT_EQ(lifecycle::status().pending, STATUS.pending + AVAILABLE);
+        for (size_t i = 0; i < AVAILABLE; ++i) lifecycle::selftest_dispatch_once(nullptr, nullptr);
+        KEXPECT_EQ(lifecycle::status().pending, STATUS.pending);
+        KEXPECT_EQ(lifecycle::status().completed, STATUS.completed + AVAILABLE);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+    {
+        RetirementFixture fixture;
+        KREQUIRE_TRUE(fixture.prepare());
+        KEXPECT_FALSE(fixture.scope.retiring());
+        KEXPECT_FALSE(fixture.scope.closed());
+        KEXPECT_EQ(fixture.init.task->namespace_tid(), uint64_t{1});
+        KREQUIRE_EQ(fixture.begin(), 0);
+        lifecycle::selftest_dispatch_once(nullptr, nullptr);
     }
     KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
 }
@@ -2803,6 +2980,52 @@ KTEST(CompartmentMount, RetirementKeepsExplicitFileCapabilityUntilDrain) {
         KEXPECT_EQ(vfs::get_mount_count(views.first), 0U);
     }
     KEXPECT_EQ(mount_ns::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentLifecycle, DeferredOwnedMountAndIpcDrainPreservesRetainedFileCapability) {
+    auto const PID_BASELINE = pid_ns::live_namespace_count();
+    auto const MOUNT_BASELINE = mount_ns::live_namespace_count();
+    auto const IPC_BASELINE = ipc::live_namespace_count();
+    {
+        PrivateMounts views;
+        ipc::NamespaceRef names;
+        KREQUIRE_EQ(mount_ns::create_namespace(views.first), 0);
+        KREQUIRE_EQ(ipc::create_namespace(names), 0);
+        RetirementFixture fixture;
+        KREQUIRE_TRUE(fixture.prepare());
+        KREQUIRE_TRUE(fixture.init.task->initialize_mount_namespace(views.first));
+        KREQUIRE_TRUE(fixture.init.task->initialize_ipc_namespace(names));
+        KREQUIRE_EQ(private_mount(views.first, "/"), 0);
+        KREQUIRE_EQ(private_mount(views.first, "/same"), 0);
+        auto mount = scoped_mount(views.first, "/same");
+        KREQUIRE_TRUE(mount);
+        auto file = native_file(mount.get(), "/data");
+        KREQUIRE_TRUE(file);
+        auto const ID = file->mount_dev_id;
+        mount.reset();
+        KREQUIRE_EQ(fixture.begin(), 0);
+        KEXPECT_TRUE(names.closed());
+        KEXPECT_TRUE(views.first.closed());
+        lifecycle::selftest_dispatch_once(nullptr, nullptr);
+        KEXPECT_EQ(lifecycle::status().pending, fixture.baseline + 1);
+        KEXPECT_EQ(vfs::get_mount_count(views.first), 2U);
+        char const VALUE = 'r';
+        KEXPECT_EQ(tmpfs::tmpfs_write(file.get(), &VALUE, 1, 0), 1);
+        char actual = 0;
+        KEXPECT_EQ(tmpfs::tmpfs_read(file.get(), &actual, 1, 0), 1);
+        KEXPECT_EQ(actual, VALUE);
+        KEXPECT_EQ(file->mount_dev_id, ID);
+        file.reset();
+        lifecycle::selftest_dispatch_once(nullptr, nullptr);
+        KEXPECT_EQ(vfs::get_mount_count(views.first), 1U);
+        KEXPECT_EQ(lifecycle::status().pending, fixture.baseline + 1);
+        lifecycle::selftest_dispatch_once(nullptr, nullptr);
+        KEXPECT_EQ(vfs::get_mount_count(views.first), 0U);
+        KEXPECT_EQ(lifecycle::status().pending, fixture.baseline);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PID_BASELINE);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNT_BASELINE);
+    KEXPECT_EQ(ipc::live_namespace_count(), IPC_BASELINE);
 }
 
 KTEST(CompartmentMount, ForeignCoveredDirectoryCannotPublishMountEdge) {

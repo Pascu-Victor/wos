@@ -36,6 +36,7 @@
 #include "platform/mm/reclaim.hpp"
 #include "platform/mm/virt.hpp"
 #include "platform/random/entropy.hpp"
+#include "platform/sched/compartment_lifecycle.hpp"
 #include "platform/sched/scheduler.hpp"
 #include "platform/sched/task.hpp"
 #include "platform/sys/syscall.hpp"
@@ -908,6 +909,10 @@ __attribute__((no_stack_protector)) void start_smt(boot::HandoverModules& module
         dbg::panic_handler("unable to start journal module publisher");
     }
     sched::start_gc_worker();
+    if (!sched::compartment::init()) {
+        dbg::panic_handler("unable to start compartment retirement worker");
+        hcf();
+    }
     if (!time::process_timer::init()) {
         dbg::panic_handler("unable to start process timer worker");
         hcf();
