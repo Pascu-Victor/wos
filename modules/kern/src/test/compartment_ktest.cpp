@@ -1,6 +1,7 @@
 #include <abi/callnums/net.h>
 #include <abi/callnums/power.h>
 #include <abi/callnums/vfs.h>
+#include <extern/elf.h>
 
 #include <array>
 #include <cerrno>
@@ -30,6 +31,7 @@
 #include <platform/sched/threading.hpp>
 #include <platform/security/authorization.hpp>
 #include <platform/security/compartment_host.hpp>
+#include <platform/security/compartment_policy.hpp>
 #include <platform/security/compartment_wki.hpp>
 #include <platform/security/credentials.hpp>
 #include <platform/sys/usercopy.hpp>
@@ -5520,4 +5522,354 @@ KTEST(CompartmentControl, HostValidationAndDroppedAuthorityKeepExistingBehavior)
     KEXPECT_TRUE(hostname::snapshot() == NAME);
     KEXPECT_EQ(power::shutdown_phase(), PHASE);
     KEXPECT_EQ(host.task->usercopy_pagemap_accesses.load(), uint32_t{0});
+}
+
+namespace {
+namespace process_exec = ker::syscall::process;
+namespace compartment_policy = ker::mod::security::compartment;
+constexpr size_t CONSTRUCTION_IMAGE_SIZE = 8 * 1024 * 1024;
+constexpr uint64_t CONSTRUCTION_MAIN = 0x51000000;
+
+// Populate real native Files and feed the production bounded file-backed loader.
+// No current-task override or synthetic loader callback supplies these bytes.
+auto write_construction_elf(NativeTask& source, const char* path, uint64_t base, uint8_t marker, bool main_image) -> int {
+    int const FD = source.track(vfs::vfs_openat(source.task.get(), vfs::AT_FDCWD, path, vfs::O_CREAT | 2, 0755));
+    if (FD < 0) return FD;
+    NativeFile file(vfs::vfs_get_file_retain(source.task.get(), FD));
+    if (!file) return -EBADF;
+    std::array<uint8_t, 8192> bytes{};
+    Elf64_Ehdr header{};
+    header.e_ident[EI_MAG0] = ELFMAG0;
+    header.e_ident[EI_MAG1] = ELFMAG1;
+    header.e_ident[EI_MAG2] = ELFMAG2;
+    header.e_ident[EI_MAG3] = ELFMAG3;
+    header.e_ident[EI_CLASS] = ELFCLASS64;
+    header.e_ident[EI_DATA] = ELFDATA2LSB;
+    header.e_ident[EI_VERSION] = EV_CURRENT;
+    header.e_type = main_image ? ET_EXEC : ET_DYN;
+    header.e_machine = EM_X86_64;
+    header.e_version = EV_CURRENT;
+    header.e_entry = base + 1024;
+    header.e_ehsize = sizeof(header);
+    header.e_phoff = sizeof(header);
+    header.e_phentsize = sizeof(Elf64_Phdr);
+    header.e_phnum = main_image ? 3 : 1;
+    Elf64_Phdr const LOAD{.p_type = PT_LOAD,
+                          .p_flags = PF_R | PF_X,
+                          .p_offset = 0,
+                          .p_vaddr = base,
+                          .p_paddr = 0,
+                          .p_filesz = 4096,
+                          .p_memsz = 4096,
+                          .p_align = 4096};
+    std::memcpy(bytes.data(), &header, sizeof(header));
+    std::memcpy(bytes.data() + sizeof(header), &LOAD, sizeof(LOAD));
+    if (main_image) {
+        // Loader metadata must be covered by a non-executable PT_LOAD.
+        Elf64_Phdr const METADATA{.p_type = PT_LOAD,
+                                  .p_flags = PF_R,
+                                  .p_offset = 4096,
+                                  .p_vaddr = base + 4096,
+                                  .p_paddr = 0,
+                                  .p_filesz = 4096,
+                                  .p_memsz = 4096,
+                                  .p_align = 4096};
+        std::memcpy(bytes.data() + sizeof(header) + sizeof(LOAD), &METADATA, sizeof(METADATA));
+        constexpr char INTERPRETER[] = "/ld.so";
+        Elf64_Phdr const INTERP{.p_type = PT_INTERP,
+                                .p_flags = PF_R,
+                                .p_offset = 4096 + 256,
+                                .p_vaddr = base + 4096 + 256,
+                                .p_paddr = 0,
+                                .p_filesz = sizeof(INTERPRETER),
+                                .p_memsz = sizeof(INTERPRETER),
+                                .p_align = 1};
+        std::memcpy(bytes.data() + sizeof(header) + sizeof(LOAD) + sizeof(Elf64_Phdr), &INTERP, sizeof(INTERP));
+        std::memcpy(bytes.data() + 4096 + 256, INTERPRETER, sizeof(INTERPRETER));
+    }
+    bytes[1024] = marker;
+    if (vfs::vfs_pwrite_file(file.get(), bytes.data(), bytes.size(), 0) != static_cast<ssize_t>(bytes.size())) return -EIO;
+    if (main_image && vfs::vfs_pwrite_file(file.get(), &marker, 1, CONSTRUCTION_IMAGE_SIZE - 1) != 1) return -EIO;
+    alignas(Elf64_Phdr) std::array<uint8_t, 8192> actual{};
+    if (vfs::vfs_pread_file(file.get(), actual.data(), actual.size(), 0) != static_cast<ssize_t>(actual.size())) return -EIO;
+    KEXPECT_EQ(std::memcmp(actual.data(), bytes.data(), bytes.size()), 0);
+    ker::loader::elf::TlsModule tls{};
+    KEXPECT_TRUE(ker::loader::elf::inspect_tls(actual.data(), actual.size(), tls));
+    return FD;
+}
+
+struct ConstructionRoot {
+    PrivateMounts mounts;
+    NativeTask source;
+    process_exec::NativeProcessContext context;
+    vfs::DirectoryViewRef view;
+    vfs::PreparedFilesystemContext filesystem;
+    compartment_policy::Profile profile;
+    resource::State resources;
+    int executable = -1;
+    int interpreter = -1;
+    auto prepare(uint64_t interpreter_base, uint8_t marker) -> int {
+        int result = mount_ns::create_namespace(mounts.first);
+        if (result == 0) result = ipc::create_namespace(context.ipc);
+        if (result == 0) result = pid_ns::create_namespace(context.pids);
+        if (result == 0) result = vfs::mount_filesystem("/", "tmpfs", nullptr, 0, "size=32M", nullptr, nullptr, mounts.first);
+        if (result != 0) return result;
+        result = mounts.first.retain(context.mounts);
+        if (result != 0) return result;
+        source.task->type = sched::task::TaskType::PROCESS;
+        if (!source.task->initialize_mount_namespace(mounts.first)) return -ESRCH;
+        compartment_policy::Profile parent;
+        parent.credentials = source.task->credentials();
+        compartment_policy::Request request;
+        for (size_t i = 0; i < parent.limits.size(); ++i) parent.limits[i] = source.task->resources.entries[i].limit;
+        request.limits = parent.limits;
+        result = compartment_policy::prepare(parent, request, Task::FD_TABLE_SIZE, profile);
+        if (result != 0) return result;
+        for (size_t i = 0; i < profile.limits.size(); ++i) resources.entries[i].limit = profile.limits[i];
+        executable = write_construction_elf(source, "/service", CONSTRUCTION_MAIN, marker, true);
+        if (executable < 0) return executable;
+        interpreter = write_construction_elf(source, "/ld.so", interpreter_base, marker + 1, false);
+        if (interpreter < 0) return interpreter;
+        auto mount = scoped_mount(mounts.first, "/");
+        if (!mount) return -ENOENT;
+        auto pin = pin_procfs_fixture_directory(*source.task, mount.get(), "/");
+        if (!pin) return -ENOMEM;
+        result = vfs::vfs_prepare_directory_view(profile.credentials, pin.get(), pin.get(), {}, view);
+        if (result == 0) result = refresh();
+        return result;
+    }
+    auto refresh() -> int {
+        int const RESULT = vfs::vfs_prepare_filesystem_context(profile.credentials, view, filesystem);
+        if (RESULT == 0) context.filesystem = &filesystem;
+        return RESULT;
+    }
+    auto construct(Task* owner, int& error) -> Task* {
+        NativeFile file(vfs::vfs_get_file_retain(source.task.get(), executable));
+        if (!file) {
+            error = -EBADF;
+            return nullptr;
+        }
+        vfs::Stat stat{};
+        if (vfs::vfs_fstat_file(file.get(), &stat) != 0) {
+            error = -EIO;
+            return nullptr;
+        }
+        auto* stack = mm::phys::kernel_stack_alloc("compartment_construction_fixture");
+        if (stack == nullptr) {
+            error = -ENOMEM;
+            return nullptr;
+        }
+        resource::ProcessReservation reservation(owner != nullptr ? owner : source.task.get(), profile.credentials.user().real);
+        if (reservation.result() != 0) {
+            mm::phys::page_free(stack);
+            error = reservation.result();
+            return nullptr;
+        }
+        return process_exec::create_file_backed_process_task_for_owner(
+            owner, context, "native-service", file.release(), CONSTRUCTION_IMAGE_SIZE, stat,
+            reinterpret_cast<uint64_t>(stack) + mm::KERNEL_STACK_SIZE, resources, profile.credentials, reservation, nullptr, &error);
+    }
+};
+struct ConstructedProcess {
+    Task& owner;
+    Task* child = nullptr;
+    ~ConstructedProcess() {
+        if (child != nullptr) KEXPECT_TRUE(sched::task::destroy_owned_unpublished_process(&owner, child));
+    }
+    auto destroy() -> bool {
+        if (child == nullptr || !sched::task::destroy_owned_unpublished_process(&owner, child)) return false;
+        child = nullptr;
+        return true;
+    }
+};
+auto construction_byte(Task& task, uint64_t address) -> uint8_t {
+    uint8_t value = 0;
+    KEXPECT_TRUE(usercopy::copy_value_from_task(task, address, value));
+    return value;
+}
+}  // namespace
+
+KTEST(CompartmentConstruction, PrivateImageInterpreterAndTcbIgnoreForeignExecutor) {
+    auto const PIDS = pid_ns::live_namespace_count();
+    auto const IPC = ipc::live_namespace_count();
+    auto const MOUNTS = mount_ns::live_namespace_count();
+    auto const THREADS = threading::get_active_thread_count();
+    {
+        ConstructionRoot first, second;
+        KREQUIRE_EQ(first.prepare(0x52000000, 41), 0);
+        KREQUIRE_EQ(second.prepare(0x53000000, 71), 0);
+        KREQUIRE_EQ(first.refresh(), 0);
+        KREQUIRE_EQ(second.refresh(), 0);
+        auto first_mount = scoped_mount(first.mounts.first, "/");
+        auto second_mount = scoped_mount(second.mounts.first, "/");
+        KREQUIRE_TRUE(first_mount && second_mount);
+        auto const FIRST_BUSY = first_mount->open_files.load();
+        auto const SECOND_BUSY = second_mount->open_files.load();
+        int error = 99;
+        ConstructedProcess a{*second.source.task}, b{*first.source.task};
+        a.child = first.construct(&a.owner, error);
+        KREQUIRE_NE(a.child, nullptr);
+        KEXPECT_EQ(error, 0);
+        b.child = second.construct(&b.owner, error);
+        KREQUIRE_NE(b.child, nullptr);
+        KEXPECT_EQ(error, 0);
+        for (auto* child : {a.child, b.child}) {
+            KEXPECT_EQ(child->namespace_tid(), uint64_t{1});
+            KEXPECT_FALSE(child->scheduler_published.load());
+            KEXPECT_TRUE(child->root_anchor && child->cwd_anchor);
+            KEXPECT_TRUE(child->credentials().no_new_privileges());
+            KEXPECT_EQ(child->credentials().authority_ceiling(), uint64_t{0});
+            KEXPECT_TRUE(child->credentials().service_privileges_locked());
+            KEXPECT_EQ(child->fd_table.size(), 0U);
+            KEXPECT_EQ(child->fd_table.reserved_count(), 0U);
+            int tid = -1;
+            KEXPECT_TRUE(usercopy::copy_value_from_task(*child, child->thread->fsbase + threading::MLIBC_TCB_TID_OFFSET, tid));
+            KEXPECT_EQ(tid, 1);
+        }
+        KEXPECT_TRUE(*a.child->mount_namespace() == first.context.mounts);
+        KEXPECT_TRUE(*b.child->mount_namespace() == second.context.mounts);
+        KEXPECT_TRUE(*a.child->ipc_namespace() == first.context.ipc);
+        KEXPECT_TRUE(*b.child->ipc_namespace() == second.context.ipc);
+        KEXPECT_EQ(a.child->context.frame.rip, a.child->interp_base + 0x52000400);
+        KEXPECT_EQ(b.child->context.frame.rip, b.child->interp_base + 0x53000400);
+        KEXPECT_EQ(construction_byte(*a.child, CONSTRUCTION_MAIN + 1024), uint8_t{41});
+        KEXPECT_EQ(construction_byte(*b.child, CONSTRUCTION_MAIN + 1024), uint8_t{71});
+        KEXPECT_EQ(construction_byte(*a.child, a.child->context.frame.rip), uint8_t{42});
+        KEXPECT_EQ(construction_byte(*b.child, b.child->context.frame.rip), uint8_t{72});
+        KEXPECT_TRUE(a.destroy());
+        KEXPECT_TRUE(b.destroy());
+        KEXPECT_NULL(first.source.task->owned_unpublished_process.load());
+        KEXPECT_NULL(second.source.task->owned_unpublished_process.load());
+        KEXPECT_EQ(first_mount->open_files.load(), FIRST_BUSY);
+        KEXPECT_EQ(second_mount->open_files.load(), SECOND_BUSY);
+        KEXPECT_EQ(threading::get_active_thread_count(), THREADS);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
+    KEXPECT_EQ(ipc::live_namespace_count(), IPC);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
+}
+
+KTEST(CompartmentConstruction, ForeignRootsAndClosedScopesConsumeInputsWithoutPublishing) {
+    auto const PIDS = pid_ns::live_namespace_count();
+    auto const IPC = ipc::live_namespace_count();
+    auto const MOUNTS = mount_ns::live_namespace_count();
+    auto const THREADS = threading::get_active_thread_count();
+    {
+        ConstructionRoot first, second;
+        KREQUIRE_EQ(first.prepare(0x52000000, 41), 0);
+        KREQUIRE_EQ(second.prepare(0x53000000, 71), 0);
+        KREQUIRE_EQ(second.refresh(), 0);
+        first.context.filesystem = &second.filesystem;
+        NativeFile retained(vfs::vfs_get_file_retain(first.source.task.get(), first.executable));
+        KREQUIRE_TRUE(retained);
+        auto const REFS = retained->refcount.load();
+        int error = 99;
+        ConstructedProcess failed{*first.source.task};
+        failed.child = first.construct(&failed.owner, error);
+        KEXPECT_NULL(failed.child);
+        KEXPECT_EQ(error, -EXDEV);
+        KEXPECT_EQ(retained->refcount.load(), REFS);
+        KEXPECT_NULL(failed.owner.owned_unpublished_process.load());
+        KEXPECT_EQ(threading::get_active_thread_count(), THREADS);
+        KREQUIRE_EQ(first.refresh(), 0);
+        failed.child = first.construct(nullptr, error);
+        KEXPECT_NULL(failed.child);
+        KEXPECT_EQ(error, -ESRCH);
+        KEXPECT_EQ(retained->refcount.load(), REFS);
+        first.context.ipc.close();
+        failed.child = first.construct(&failed.owner, error);
+        KEXPECT_NULL(failed.child);
+        KEXPECT_EQ(error, -EIDRM);
+        KEXPECT_EQ(retained->refcount.load(), REFS);
+        KEXPECT_NULL(failed.owner.owned_unpublished_process.load());
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
+    KEXPECT_EQ(ipc::live_namespace_count(), IPC);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
+    KEXPECT_EQ(threading::get_active_thread_count(), THREADS);
+}
+
+KTEST(CompartmentConstruction, InterpreterExecuteDenialRecoversOwnedImageAndPopulation) {
+    auto const PIDS = pid_ns::live_namespace_count();
+    auto const IPC = ipc::live_namespace_count();
+    auto const MOUNTS = mount_ns::live_namespace_count();
+    auto const THREADS = threading::get_active_thread_count();
+    {
+        ConstructionRoot root;
+        KREQUIRE_EQ(root.prepare(0x52000000, 41), 0);
+        NativeFile interpreter(vfs::vfs_get_file_retain(root.source.task.get(), root.interpreter));
+        NativeFile executable(vfs::vfs_get_file_retain(root.source.task.get(), root.executable));
+        KREQUIRE_TRUE(interpreter && executable);
+        KREQUIRE_EQ(vfs::vfs_fchmod_file_as(interpreter.get(), root.source.task->credentials(), 0644), 0);
+        KREQUIRE_EQ(root.refresh(), 0);
+        auto mount = scoped_mount(root.mounts.first, "/");
+        KREQUIRE_TRUE(mount);
+        auto const BUSY = mount->open_files.load();
+        auto const REFS = executable->refcount.load();
+        abi::resource::Usage before{}, after{};
+        resource::copy_process_observation(*root.source.task, before);
+        int error = 99;
+        ConstructedProcess failed{*root.source.task};
+        failed.child = root.construct(&failed.owner, error);
+        KEXPECT_NULL(failed.child);
+        KEXPECT_EQ(error, -EACCES);
+        resource::copy_process_observation(*root.source.task, after);
+        KEXPECT_EQ(after.current, before.current);
+        KEXPECT_EQ(executable->refcount.load(), REFS);
+        KEXPECT_EQ(mount->open_files.load(), BUSY);
+        KEXPECT_NULL(failed.owner.owned_unpublished_process.load());
+        KEXPECT_FALSE(failed.owner.unpublished_teardown_in_progress.load());
+        KEXPECT_NULL(failed.owner.pending_process_reservations);
+        KEXPECT_EQ(threading::get_active_thread_count(), THREADS);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
+    KEXPECT_EQ(ipc::live_namespace_count(), IPC);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
+}
+
+KTEST(CompartmentConstruction, ContextInstallRechecksCredentialsSearchAndEmptyOwnership) {
+    auto const PIDS = pid_ns::live_namespace_count();
+    auto const IPC = ipc::live_namespace_count();
+    auto const MOUNTS = mount_ns::live_namespace_count();
+    {
+        ConstructionRoot root;
+        KREQUIRE_EQ(root.prepare(0x52000000, 41), 0);
+        KREQUIRE_EQ(root.refresh(), 0);
+        UnpublishedFixture candidate{*root.source.task};
+        KREQUIRE_TRUE(candidate.claimed);
+        KREQUIRE_TRUE(!candidate.task->root_anchor);
+        auto const ROOT_TEXT = candidate.task->root;
+        auto const CWD_TEXT = candidate.task->cwd;
+        KEXPECT_EQ(vfs::vfs_install_unpublished_filesystem_context(*candidate.task, root.filesystem), -EPERM);
+        KEXPECT_FALSE(candidate.task->root_anchor);
+        KEXPECT_FALSE(candidate.task->cwd_anchor);
+        KEXPECT_TRUE(candidate.task->root == ROOT_TEXT);
+        KEXPECT_TRUE(candidate.task->cwd == CWD_TEXT);
+        KREQUIRE_EQ(resource::initialize_credentials(*candidate.task, root.profile.credentials), 0);
+        KREQUIRE_NE(root.view.root(), nullptr);
+        vfs::vfs_retain_file(root.view.root());
+        NativeFile pin(root.view.root());
+        KREQUIRE_EQ(vfs::vfs_fchmod_file_as(pin.get(), root.source.task->credentials(), 0000), 0);
+        int const DENIED = vfs::vfs_install_unpublished_filesystem_context(*candidate.task, root.filesystem);
+        KEXPECT_TRUE(DENIED == -EACCES || DENIED == -EAGAIN);
+        KEXPECT_FALSE(candidate.task->root_anchor);
+        KEXPECT_FALSE(candidate.task->cwd_anchor);
+        KEXPECT_TRUE(candidate.task->root == ROOT_TEXT);
+        KEXPECT_TRUE(candidate.task->cwd == CWD_TEXT);
+        KREQUIRE_EQ(vfs::vfs_fchmod_file_as(pin.get(), root.source.task->credentials(), 0755), 0);
+        KREQUIRE_EQ(root.refresh(), 0);
+        KREQUIRE_EQ(vfs::vfs_install_unpublished_filesystem_context(*candidate.task, root.filesystem), 0);
+        auto const* INSTALLED_ROOT = candidate.task->root_anchor.get();
+        auto const* INSTALLED_CWD = candidate.task->cwd_anchor.get();
+        KEXPECT_EQ(vfs::vfs_install_unpublished_filesystem_context(*candidate.task, root.filesystem), -EINVAL);
+        KEXPECT_TRUE(candidate.task->root_anchor.get() == INSTALLED_ROOT);
+        KEXPECT_TRUE(candidate.task->cwd_anchor.get() == INSTALLED_CWD);
+        root.context.mounts.close();
+        KEXPECT_EQ(vfs::vfs_install_unpublished_filesystem_context(*candidate.task, root.filesystem), -EIDRM);
+        KEXPECT_TRUE(candidate.destroy());
+        KEXPECT_NULL(root.source.task->owned_unpublished_process.load());
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
+    KEXPECT_EQ(ipc::live_namespace_count(), IPC);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
 }

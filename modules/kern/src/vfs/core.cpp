@@ -32220,6 +32220,49 @@ auto vfs_prepare_filesystem_context(const ker::mod::security::Snapshot& credenti
     return vfs_prepare_filesystem_context(credentials, source, source, output);
 }
 
+auto vfs_install_unpublished_filesystem_context(ker::mod::sched::task::Task& task, const PreparedFilesystemContext& prepared) -> int {
+    using ker::mod::sched::task::TaskState;
+    using ker::mod::sched::task::TaskType;
+    auto const* scope = task.mount_namespace();
+    if (scope == nullptr) return -ESRCH;
+    if (scope->closed()) return -EIDRM;
+    if (scope->is_host() || task.is_thread || task.type != TaskType::PROCESS || task.scheduler_published.load(std::memory_order_acquire) ||
+        task.state.load(std::memory_order_acquire) != TaskState::ACTIVE || task.ref_count.load(std::memory_order_acquire) != 2 ||
+        task.root_anchor || task.cwd_anchor || !prepared)
+        return -EINVAL;
+    auto const CREDENTIALS = task.credentials();
+    if (CREDENTIALS != prepared.credentials()) return -EPERM;
+    auto const& filesystem = prepared.filesystem();
+    auto const& root = *filesystem.root_anchor.get();
+    auto const& cwd = *filesystem.cwd_anchor.get();
+    if (root.mount == nullptr || cwd.mount == nullptr || root.mount->namespace_owner != *scope || cwd.mount->namespace_owner != *scope)
+        return -EXDEV;
+    if (root.remote != nullptr || cwd.remote != nullptr || !root.view || !cwd.view || root.mount->fs_type != FSType::TMPFS ||
+        cwd.mount->fs_type != FSType::TMPFS)
+        return -ENOTSUP;
+    // These owners retire after publication. Copying anchors below only retains
+    // their atomic references; the exclusively owned destination starts empty.
+    NativeDirectoryMembershipReferences membership;
+    ker::mod::sys::MutexGuard publication(g_vfs_namespace_publication_mutex);
+    if (scope->closed()) return -EIDRM;
+    if (prepared.namespace_generation() != g_vfs_namespace_generation.load(std::memory_order_acquire) ||
+        prepared.mount_generation() != mount_table_generation_snapshot() || root.mount->retiring.load(std::memory_order_acquire) ||
+        cwd.mount->retiring.load(std::memory_order_acquire))
+        return -EAGAIN;
+    int result = admit_directory_view(nullptr, root.view.root(), root.view.directory(), CREDENTIALS, true, true, &membership);
+    if (result == 0) result = admit_directory_view(nullptr, cwd.view.root(), cwd.view.directory(), CREDENTIALS, true, true, &membership);
+    if (result != 0) return result;
+    uint64_t const FLAGS = task.path_metadata_lock.lock_irqsave();
+    task.root = filesystem.root;
+    task.cwd = filesystem.cwd;
+    task.root_len = filesystem.root_len;
+    task.cwd_len = filesystem.cwd_len;
+    task.root_anchor = filesystem.root_anchor;
+    task.cwd_anchor = filesystem.cwd_anchor;
+    task.path_metadata_lock.unlock_irqrestore(FLAGS);
+    return 0;
+}
+
 auto vfs_prepare_global_cwd(const ker::mod::security::Snapshot& credentials, const DirectoryViewRef& source,
                             ker::mod::sched::task::Task::FilesystemContext& output) -> int {
     if (!source) return -EINVAL;

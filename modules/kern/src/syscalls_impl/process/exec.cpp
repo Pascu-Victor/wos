@@ -40,6 +40,7 @@
 #include <platform/sched/frame_class.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/security/compartment_wki.hpp>
 #include <platform/security/exec_policy.hpp>
 #include <platform/security/file_policy.hpp>
 #include <platform/sys/context_switch.hpp>
@@ -55,6 +56,7 @@
 #include <utility>
 #include <vfs/fd_reservation.hpp>
 #include <vfs/file.hpp>
+#include <vfs/filesystem_context.hpp>
 #include <vfs/fs/devfs.hpp>
 #include <vfs/mount.hpp>
 #include <vfs/vfs.hpp>
@@ -3534,10 +3536,13 @@ auto supports_file_backed_process(vfs::File* file, size_t file_size) -> bool {
     return prepare_file_backed_elf(file, file_size, prepared_elf) == PrepareFileBackedElfResult::READY;
 }
 
-auto create_file_backed_process_task(const char* name, vfs::File* owned_file, size_t file_size, const vfs::Stat& file_stat,
-                                     uint64_t kernel_rsp, const mod::sched::resource::State& resources,
-                                     const mod::security::Snapshot& credentials, mod::sched::resource::ProcessReservation& reservation,
-                                     mod::sched::resource::State* failure_observations, int* interpreter_error) -> mod::sched::task::Task* {
+namespace {
+auto create_file_backed_process_task_impl(const char* name, vfs::File* owned_file, size_t file_size, const vfs::Stat& file_stat,
+                                          uint64_t kernel_rsp, const mod::sched::resource::State& resources,
+                                          const mod::security::Snapshot& credentials, mod::sched::resource::ProcessReservation& reservation,
+                                          mod::sched::resource::State* failure_observations, int* interpreter_error,
+                                          mod::sched::task::Task* explicit_owner, const NativeProcessContext* native_context,
+                                          bool observe_current_owner) -> mod::sched::task::Task* {
     if (interpreter_error != nullptr) *interpreter_error = 0;
     auto release_inputs = [&]() {
         if (owned_file != nullptr) {
@@ -3549,6 +3554,24 @@ auto create_file_backed_process_task(const char* name, vfs::File* owned_file, si
             kernel_rsp = 0;
         }
     };
+
+    if (!observe_current_owner && (explicit_owner == nullptr || native_context == nullptr)) {
+        if (interpreter_error != nullptr) *interpreter_error = -ESRCH;
+        release_inputs();
+        return nullptr;
+    }
+    if (native_context != nullptr) {
+        int const ERROR = native_context->ipc.closed() || native_context->mounts.closed() || native_context->pids.closed() ? -EIDRM
+                          : native_context->ipc.is_host() || native_context->mounts.is_host() || native_context->pids.is_host() ||
+                                  native_context->filesystem == nullptr
+                              ? -EINVAL
+                              : 0;
+        if (ERROR != 0) {
+            if (interpreter_error != nullptr) *interpreter_error = ERROR;
+            release_inputs();
+            return nullptr;
+        }
+    }
 
     PreparedFileBackedElf prepared_elf;
     if (name == nullptr || owned_file == nullptr || kernel_rsp == 0 ||
@@ -3572,7 +3595,7 @@ auto create_file_backed_process_task(const char* name, vfs::File* owned_file, si
     new_task->exec_image_size = file_size;
     owned_file = nullptr;
 
-    auto* const OWNER = mod::sched::get_current_task();
+    auto* const OWNER = observe_current_owner ? mod::sched::get_current_task() : explicit_owner;
     if (OWNER == nullptr || !mod::sched::task::claim_unpublished_process(OWNER, new_task)) [[unlikely]] {
         mod::dbg::panic_handler("file-backed exec: cannot publish child recovery ownership");
         hcf();
@@ -3594,6 +3617,22 @@ auto create_file_backed_process_task(const char* name, vfs::File* owned_file, si
         return nullptr;
     }
 
+    if (native_context != nullptr) {
+        int context_error = -EIDRM;
+        if (new_task->initialize_ipc_namespace(native_context->ipc) && new_task->initialize_mount_namespace(native_context->mounts) &&
+            new_task->initialize_pid_namespace(native_context->pids))
+            context_error = vfs::vfs_install_unpublished_filesystem_context(*new_task, *native_context->filesystem);
+        if (context_error != 0) {
+            if (interpreter_error != nullptr) *interpreter_error = context_error;
+            preserve_failure_observations();
+            if (!mod::sched::task::destroy_owned_unpublished_process(OWNER, new_task)) [[unlikely]] {
+                mod::dbg::panic_handler("file-backed exec: lost child ownership after native context failure");
+                hcf();
+            }
+            return nullptr;
+        }
+    }
+
     loader::elf::ElfLazyLoadRangeVec loader_lazy_ranges;
     loader::elf::ElfLoadOptions const LOAD_OPTIONS{
         .register_special_symbols = true,
@@ -3602,7 +3641,8 @@ auto create_file_backed_process_task(const char* name, vfs::File* owned_file, si
     };
     if (!new_task->initialize_process_image(prepared_elf.view, LOAD_OPTIONS) ||
         !append_exec_lazy_file_ranges(new_task->lazy_vmem_ranges, loader_lazy_ranges, new_task->exec_image_file, file_stat) ||
-        !mod::sched::task::complete_unpublished_process_construction(new_task, interpreter_error)) {
+        !mod::sched::task::complete_unpublished_process_construction(new_task, interpreter_error, explicit_owner, observe_current_owner) ||
+        (native_context != nullptr && mod::security::compartment::remote_namespace_admission(new_task) != -ENOTSUP)) {
         preserve_failure_observations();
         if (!mod::sched::task::destroy_owned_unpublished_process(OWNER, new_task)) [[unlikely]] {
             mod::dbg::panic_handler("file-backed exec: lost child recovery ownership during teardown");
@@ -3611,6 +3651,25 @@ auto create_file_backed_process_task(const char* name, vfs::File* owned_file, si
         return nullptr;
     }
     return new_task;
+}
+}  // namespace
+
+auto create_file_backed_process_task(const char* name, vfs::File* owned_file, size_t file_size, const vfs::Stat& file_stat,
+                                     uint64_t kernel_rsp, const mod::sched::resource::State& resources,
+                                     const mod::security::Snapshot& credentials, mod::sched::resource::ProcessReservation& reservation,
+                                     mod::sched::resource::State* failure_observations, int* interpreter_error) -> mod::sched::task::Task* {
+    return create_file_backed_process_task_impl(name, owned_file, file_size, file_stat, kernel_rsp, resources, credentials, reservation,
+                                                failure_observations, interpreter_error, nullptr, nullptr, true);
+}
+
+auto create_file_backed_process_task_for_owner(mod::sched::task::Task* owner, const NativeProcessContext& context, const char* name,
+                                               vfs::File* owned_file, size_t file_size, const vfs::Stat& file_stat, uint64_t kernel_rsp,
+                                               const mod::sched::resource::State& resources, const mod::security::Snapshot& credentials,
+                                               mod::sched::resource::ProcessReservation& reservation,
+                                               mod::sched::resource::State* failure_observations, int* construction_error)
+    -> mod::sched::task::Task* {
+    return create_file_backed_process_task_impl(name, owned_file, file_size, file_stat, kernel_rsp, resources, credentials, reservation,
+                                                failure_observations, construction_error, owner, &context, false);
 }
 
 auto wos_proc_exec(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr) -> uint64_t {

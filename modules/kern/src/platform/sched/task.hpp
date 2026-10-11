@@ -1445,7 +1445,11 @@ void destroy_unpublished_user_thread(Task* task);
 // claim an unpublished-process owner that survives any voluntary VFS wait.
 // Optional output reports interpreter execute-admission denial. Other legacy
 // construction failures leave it zero; the child remains unpublished.
-[[nodiscard]] auto complete_unpublished_process_construction(Task* task, int* interpreter_error = nullptr) -> bool;
+// An explicit executor is borrowed only for legacy Host routing. Private image
+// subjects always resolve PT_INTERP in their own exact filesystem view.
+[[nodiscard]] auto complete_unpublished_process_construction(Task* task, int* interpreter_error = nullptr,
+                                                             Task* interpreter_executor = nullptr, bool observe_current_executor = true)
+    -> bool;
 [[nodiscard]] auto clone_lazy_vmem_ranges(Task& dst, Task& src) -> bool;
 void release_lazy_vmem_ranges(Task& task);
 

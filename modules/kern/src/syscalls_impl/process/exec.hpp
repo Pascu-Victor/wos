@@ -5,6 +5,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <platform/asm/cpu.hpp>
+#include <platform/sched/ipc_namespace.hpp>
+#include <platform/sched/pid_namespace.hpp>
+#include <vfs/mount_namespace.hpp>
 
 namespace ker::mod::sched::task {
 struct Task;
@@ -22,6 +25,7 @@ class Snapshot;
 namespace ker::vfs {
 struct File;
 struct Stat;
+class PreparedFilesystemContext;
 }  // namespace ker::vfs
 
 namespace ker::syscall::process {
@@ -58,6 +62,28 @@ auto create_file_backed_process_task(const char* name, ker::vfs::File* owned_fil
                                      ker::mod::sched::resource::ProcessReservation& reservation,
                                      ker::mod::sched::resource::State* failure_observations = nullptr, int* interpreter_error = nullptr)
     -> ker::mod::sched::task::Task*;
+
+// Internal admitted native construction context, never a userspace join handle.
+// The caller retains this preparation throughout the call. All three scopes
+// must be private and open; the filesystem must belong to the exact mount view.
+struct NativeProcessContext {
+    ker::mod::sched::ipc::NamespaceRef ipc;
+    ker::vfs::mount_ns::NamespaceRef mounts;
+    ker::mod::sched::pid_ns::NamespaceRef pids;
+    const ker::vfs::PreparedFilesystemContext* filesystem = nullptr;
+};
+
+// Same consuming builder and recovery path, with an explicit retained executor.
+// Caller exclusively owns its recovery slot; supplied credentials/resources are
+// already admitted. Namespace/context installation precedes ELF/TLS/TCB work.
+// This does not publish a child, admit a public creator or populate a service root.
+auto create_file_backed_process_task_for_owner(ker::mod::sched::task::Task* owner, const NativeProcessContext& context, const char* name,
+                                               ker::vfs::File* owned_file, size_t file_size, const ker::vfs::Stat& file_stat,
+                                               uint64_t kernel_rsp, const ker::mod::sched::resource::State& resources,
+                                               const ker::mod::security::Snapshot& credentials,
+                                               ker::mod::sched::resource::ProcessReservation& reservation,
+                                               ker::mod::sched::resource::State* failure_observations = nullptr,
+                                               int* construction_error = nullptr) -> ker::mod::sched::task::Task*;
 
 #ifdef WOS_SELFTEST
 auto exec_selftest_native_signal_cutover_drains_worker() -> bool;

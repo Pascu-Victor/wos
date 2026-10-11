@@ -1383,7 +1383,10 @@ def test_remote_exec_cannot_erase_restrictions():
     inline = body_after(compute, "auto exec_elf_buffer(")
     assert inline.index("initialize_credentials(*new_task, credentials)") < inline.index("initialize_process_image(")
     file_exec = (ROOT / "modules/kern/src/syscalls_impl/process/exec.cpp").read_text()
-    file_constructor = body_after(file_exec, "auto create_file_backed_process_task(")
+    file_wrapper = body_after(file_exec, "auto create_file_backed_process_task(")
+    assert "return create_file_backed_process_task_impl(" in file_wrapper
+    assert "failure_observations, interpreter_error, nullptr, nullptr, true)" in " ".join(file_wrapper.split())
+    file_constructor = body_after(file_exec, "auto create_file_backed_process_task_impl(")
     assert "initialize_real_uid" not in file_constructor
     assert file_constructor.index("initialize_credentials(*new_task, credentials)") < file_constructor.index("initialize_process_image(")
     assert "new_task, submitted_identity, mapped_credentials," in work

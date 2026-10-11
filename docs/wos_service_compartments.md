@@ -1088,6 +1088,49 @@ controls, actual shared-futex/service/lifecycle campaigns and complete Host
 regression still require work. Goal39 remains active and all ten full criteria
 remain incomplete; see the checkpoint25 evidence and construction map.
 
+## Native unpublished image construction
+
+The internal `create_file_backed_process_task_for_owner` shares the real
+file-backed builder with the existing Host/WKI receiver path. It accepts a
+retained executor, three open private namespace references and an admitted
+`PreparedFilesystemContext`. This is a kernel C++ preparation seam, with no
+userspace Task pointer, integer join handle or public creator permission token.
+
+Resources, the complete immutable credential and UID population charge are
+installed before namespaces. Both root/cwd anchors must belong to the exact
+private native TMPFS mount view. Installation checks matching credentials,
+current namespace/mount epochs, native search/membership and exclusive empty
+unpublished ownership, then retains both anchors under the Task path lock.
+Anchor and membership retirement stays outside publication/path locks. ELF,
+TLS and initial TCB setup run afterward with the child's local process ID.
+
+For every private PID/mount/IPC image subject, PT_INTERP uses the child's
+filesystem and ignores the executor's paths and remote submitter identity.
+Unknown/closed subjects fail before worker selection, VFS or cache access.
+The existing all-Host temporary worker routing and complete read/execute,
+freshness/content-match cache and debug/mapping behavior remain preserved.
+Owned recovery holds the child through potentially blocking failure teardown.
+
+KTEST48 ran four real native construction cases: two independently populated
+TMPFS fixtures with different image/interpreter bytes and a foreign executor;
+local TCB IDs; foreign-root/closed/missing-owner refusal; renewed search and
+credential checks; interpreter execute denial and File/mount/thread/population/
+namespace recovery. Full suite passed84,418 assertions, zero failures,1,360
+cases/all109 mandatory/110 stable pins and normal poweroff. Normal Build WOS,
+isolated fast diagnostics, focused44 Host checks, formatting/tidy and41 complete
+source/body/header/ABI preservation checks pass. Broad129 credential/VFS source
+calls still have24 failures, so full Host regression remains unqualified.
+
+Public creation remains disabled. Live creator capture/revalidation, bounded
+root population/import/non-root ownership, explicit FD/shared mapping manifests,
+init/job/parent and atomic publication, static/small ELF support and recoverable
+metadata/fatal-exit/OOM handling remain required. Current Task construction
+still halts on pagemap allocation failure; pre-recovery metadata preparation
+needs tracked ownership before public use. SYS_DEBUG also needs an explicit
+private-view policy alongside the remaining global/device/swap/perf/WKI census.
+No scheduled service, shared-futex, two-hour or1,000 full lifecycle claim follows
+from these unpublished native cases; all ten Goal39 criteria remain incomplete.
+
 ## Verification checkpoint
 
 The initial `compartment_policy_test` suite checks actual production preparation

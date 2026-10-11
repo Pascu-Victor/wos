@@ -26,6 +26,7 @@
 #include <platform/sched/resource.hpp>
 #include <platform/sched/resource_as.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <platform/security/compartment_wki.hpp>
 #include <platform/security/file_policy.hpp>
 #include <platform/sys/context_switch.hpp>
 #include <platform/sys/mutex.hpp>
@@ -272,7 +273,8 @@ auto clone_user_thread_fds_checked(Task* parent, Task* child) -> bool {
 }
 #endif
 
-auto read_boot_file_fully(Task& image_task, const char* path, uint8_t** out_buf, size_t* out_size, int* interpreter_error) -> bool {
+auto read_boot_file_fully(Task& image_task, const char* path, uint8_t** out_buf, size_t* out_size, int* interpreter_error,
+                          Task* interpreter_executor, bool observe_current_executor) -> bool {
     if (path == nullptr || out_buf == nullptr || out_size == nullptr) {
         return false;
     }
@@ -280,7 +282,15 @@ auto read_boot_file_fully(Task& image_task, const char* path, uint8_t** out_buf,
     *out_buf = nullptr;
     *out_size = 0;
 
-    auto* current_task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    int const SCOPE = security::compartment::remote_namespace_admission(&image_task);
+    if (SCOPE != 0 && SCOPE != -ENOTSUP) {
+        if (interpreter_error != nullptr) *interpreter_error = SCOPE;
+        return false;
+    }
+    auto* current_task = SCOPE == -ENOTSUP ? nullptr
+                         : observe_current_executor
+                             ? (ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr)
+                             : interpreter_executor;
     [[maybe_unused]] auto const* task_name = (current_task != nullptr && current_task->name != nullptr) ? current_task->name : "?";
     [[maybe_unused]] auto const* task_root = (current_task != nullptr) ? current_task->root.data() : "-";
     [[maybe_unused]] auto const* task_cwd = (current_task != nullptr) ? current_task->cwd.data() : "-";
@@ -619,7 +629,8 @@ auto destroy_owned_unpublished_process(Task* owner, Task* child) -> bool {
     return true;
 }
 
-auto complete_unpublished_process_construction(Task* task, int* interpreter_error) -> bool {
+auto complete_unpublished_process_construction(Task* task, int* interpreter_error, Task* interpreter_executor,
+                                               bool observe_current_executor) -> bool {
     if (interpreter_error != nullptr) *interpreter_error = 0;
     if (task == nullptr || task->type != TaskType::PROCESS || task->thread == nullptr || task->pagemap == nullptr) {
         return false;
@@ -630,7 +641,8 @@ auto complete_unpublished_process_construction(Task* task, int* interpreter_erro
 
     uint8_t* interp_buf = nullptr;
     size_t interp_size = 0;
-    if (!read_boot_file_fully(*task, task->pending_interp_path.data(), &interp_buf, &interp_size, interpreter_error)) {
+    if (!read_boot_file_fully(*task, task->pending_interp_path.data(), &interp_buf, &interp_size, interpreter_error, interpreter_executor,
+                              observe_current_executor)) {
         dbg::log("Failed to open interpreter '%s' for task %s", task->pending_interp_path.data(), task->name);
         return false;
     }

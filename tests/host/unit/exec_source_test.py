@@ -388,7 +388,11 @@ def require_bounded_contiguous_loader(loader_source: str) -> None:
     ]:
         if snippet not in header + loader_source + task_source + remote_source:
             fail(f"bounded ELF length propagation missing: {snippet}")
-    file_body = function_body(EXEC_CPP.read_text(), "create_file_backed_process_task")
+    file_source = EXEC_CPP.read_text()
+    wrapper = function_body(file_source, "create_file_backed_process_task")
+    assert "return create_file_backed_process_task_impl(" in wrapper
+    assert "failure_observations, interpreter_error, nullptr, nullptr, true)" in " ".join(wrapper.split())
+    file_body = function_body(file_source, "create_file_backed_process_task_impl")
     ordered = ["claim_unpublished_process(OWNER, new_task)", "new_task->resources = resources",
                "initialize_credentials(*new_task, credentials)", "reservation.attach(*new_task)", "initialize_process_image(prepared_elf.view"]
     positions = [file_body.find(token) for token in ordered]

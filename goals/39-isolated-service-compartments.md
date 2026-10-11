@@ -440,3 +440,26 @@ one active topology, 20GiB disposable/40GiB free floor, shared immutable bases
 and COW/reflink copies; audit exact live ownership/backing refs and prune owned
 inactive disks/appliances after PASS, FAIL and exceptions, retaining small
 receipts and preserving user/unrelated/current/seed/source/sysroot artifacts.
+
+### Checkpoint26 — native process construction (2026-10-11)
+
+The actual shared file-backed builder can install an admitted private IPC/mount/
+PID context and revalidated native root/cwd before ELF/TLS/TCB. Private PT_INTERP
+uses the image subject's filesystem instead of a foreign executor's view. The
+internal helper consumes Files/stacks and keeps existing owned-child recovery;
+Host bodies, Task/File layouts and syscall/libc/wire ABI remain preserved.
+Public creator admission, root population, launcher and publication remain work.
+
+Normal Build WOS, isolated fast diagnostics, format/tidy,44 focused Host and41
+complete-source checks PASS. Rootless KTEST48 PASS84,418 assertions/0 failures/
+1,360 cases/all109 mandatory/110 stable pins/normal poweroff. Three invalid new
+ELF fixture attempts retained exact reconstructible sources; corrected only
+fixture layout while preserving production validation. Sixteen inactive images
+across45..48 audited/pruned846,200,832B, peak260,456,448B/final0; user VM preserved.
+Broad129 credential/VFS source calls still24 failures; full regression unproven.
+Goal39 ACTIVE, all ten full criteria INCOMPLETE. Continue live creation/spec/
+launcher, small/static ELF and recoverable metadata/OOM, remaining global/WKI/
+device consumers, real shared mappings/futexes/scheduled lifecycle/hostile paths,
+two independent service trees2h with Host operational and1000 full failure cycles
+with all references at baseline. Authorized --no-setup launch/debug and20GiB/
+40GiB storage bounds/pruning after every outcome persist; no old VM disk retention.

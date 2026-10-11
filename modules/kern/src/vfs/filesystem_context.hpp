@@ -88,6 +88,12 @@ auto vfs_prepare_filesystem_context(const ker::mod::security::Snapshot& credenti
 auto vfs_prepare_filesystem_context(const ker::mod::security::Snapshot& credentials, const DirectoryViewRef& process_root,
                                     const DirectoryViewRef& cwd, PreparedFilesystemContext& output) -> int;
 
+// Exclusively owned, empty, unpublished process only. Revalidate native search,
+// epochs, credentials and exact private mount ownership before installing both
+// anchors together. No numeric join/public root change; failure leaves Task paths
+// untouched. Caller retains preparation and holds no spin/publication locks.
+auto vfs_install_unpublished_filesystem_context(ker::mod::sched::task::Task& task, const PreparedFilesystemContext& prepared) -> int;
+
 // Bind an explicitly selected legacy physical root for native membership
 // preparation. Identity only: this does not renew root search or install a Task.
 // Caller owns the immutable path; failure preserves the previous view.

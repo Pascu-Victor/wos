@@ -970,10 +970,10 @@ def test_task_exit_retires_remote_compute_wait_owners() -> None:
     )
     complete_construction = function_body(task_source, "complete_unpublished_process_construction")
     require_tokens(
-        complete_construction,
+        " ".join(complete_construction.split()),
         [
             "task->pending_interp_path.front() == '\\0'",
-            "read_boot_file_fully(*task, task->pending_interp_path.data(), &interp_buf, &interp_size, interpreter_error)",
+            "read_boot_file_fully(*task, task->pending_interp_path.data(), &interp_buf, &interp_size, interpreter_error, interpreter_executor, observe_current_executor)",
             "loader::elf::load_elf",
             "task->context.frame.rip = INTERP_RESULT.entry_point",
             "task->interp_base = INTERP_RESULT.load_base",
@@ -1849,7 +1849,11 @@ def test_resource_rejection_preserves_admission_observations() -> None:
     require_tokens(submit, ["resource_observations_valid", "resource_contract::snapshot(submitted_resources)",
                             "discard_unpublished_running_task(current_task, worker_task_ref, rt, &submitted_resources)"],
                    "validated contract observations survive every rejection teardown")
-    file_exec = function_body((ROOT / "modules/kern/src/syscalls_impl/process/exec.cpp").read_text(), "create_file_backed_process_task")
+    file_source = (ROOT / "modules/kern/src/syscalls_impl/process/exec.cpp").read_text()
+    file_wrapper = function_body(file_source, "create_file_backed_process_task")
+    require_tokens(" ".join(file_wrapper.split()), ["return create_file_backed_process_task_impl(",
+                   "failure_observations, interpreter_error, nullptr, nullptr, true)"], "Host builder exact delegation")
+    file_exec = function_body(file_source, "create_file_backed_process_task_impl")
     require_order(file_exec, "*failure_observations = new_task->resources", "destroy_owned_unpublished_process(",
                   "file-backed admission observation output precedes destruction")
     reject = function_body(source, "handle_task_reject")
