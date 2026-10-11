@@ -1068,7 +1068,11 @@ def test_resource_owner_uses_immutable_credential_subject_before_policy():
     assert owner.index("subject->credential_owner()") < owner.index("m_task->try_acquire()") < owner.index("if (!m_retained) m_task = nullptr")
     release = body_after(source, "Owner::~Owner(")
     assert release.index("if (m_retained)") < release.index("m_task->release()")
-    limits = body_after(source, "auto syscall_limit(")
+    wrapper = body_after(source, "auto syscall_limit(")
+    assert "limit_for_subject(get_current_task(), resource, address, version, set, usage)" in wrapper
+    limits = body_after(source, "auto limit_for_subject(")
+    assert limits.index("if (set || IS_AS) publication_guard.emplace()") < limits.index("auto const CREDENTIALS = caller->credentials()")
+    assert "security::compartment::host_namespace_admission(caller) == 0" in limits
     assert limits.index("auto const CREDENTIALS = caller->credentials()") < limits.index("Owner owner(caller)") < limits.index("process->resources.set(")
 
 

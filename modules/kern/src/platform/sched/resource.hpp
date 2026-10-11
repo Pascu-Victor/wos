@@ -84,5 +84,7 @@ class ExecSafeWait {
 void wait_for_exec_quiescence(task::Task& subject);
 // IRQ-safe: fixed state/lock and atomic signal enqueue only.
 void charge_cpu(task::Task* subject, uint64_t elapsed_us, uint64_t user_us = 0);
+// Borrowed retained subject; usercopy stays outside publication serialization.
+auto limit_for_subject(task::Task* caller, uint64_t resource, uint64_t address, uint64_t version, bool set, bool usage = false) -> uint64_t;
 auto syscall_limit(uint64_t resource, uint64_t address, uint64_t version, bool set, bool usage = false) -> uint64_t;
 }  // namespace ker::mod::sched::resource

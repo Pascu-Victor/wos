@@ -1607,6 +1607,7 @@ struct NativeCompartmentPreparation {
     std::array<std::string_view, DESCRIPTOR_MAX> argv{}, envp{};
     NativeProcessArguments arguments;
     uint64_t root_bytes{};
+    bool published{};
     explicit NativeCompartmentPreparation(mod::sched::task::Task& owner) : executor(owner) {}
     ~NativeCompartmentPreparation();
 };
@@ -4052,12 +4053,13 @@ NativeCompartmentPreparation::~NativeCompartmentPreparation() {
     for (auto& asset : assets) drop(asset.source);
     for (auto& descriptor : descriptors) drop(descriptor.source);
     if (kernel_rsp != 0) mod::mm::phys::page_free(reinterpret_cast<void*>(kernel_rsp - mod::mm::KERNEL_STACK_SIZE));
+    // The root pin prevents init retirement from freeing prepared mount state.
+    vfs::finish_prepared_mount(&mount);
     filesystem = {};
     view = {};
     drop(root_pin);
     populator.reset();
-    vfs::finish_prepared_mount(&mount);
-    if (!context.mounts.is_host()) {
+    if (!published && !context.mounts.is_host()) {
         int const RETIRED = vfs::retire_mount_namespace(context.mounts);
         if (RETIRED != 0) [[unlikely]] {
             mod::dbg::panic_handler("native creation: private root retirement failed");
@@ -4065,9 +4067,9 @@ NativeCompartmentPreparation::~NativeCompartmentPreparation() {
         }
     }
     context.mounts.reset();
-    context.ipc.close();
+    if (!published) context.ipc.close();
     context.ipc.reset();
-    context.pids.close();
+    if (!published) context.pids.close();
     context.pids.reset();
     reservation.reset();
     if (creator != nullptr) creator->release();
@@ -4534,6 +4536,72 @@ auto prepare_native_compartment_for_owner(mod::sched::task::Task& executor, cons
         return nullptr;
     }
     return child;
+}
+
+auto publish_native_compartment_for_owner(mod::sched::task::Task& executor, mod::sched::task::Task* child) -> int64_t {
+    int result = 0;
+    uint64_t pid = 0;
+    {
+        NativeConstructionExecutorGuard recovery(executor);
+        if (!recovery.acquired()) return -EBUSY;
+        auto* request = executor.owned_exec_arguments.load(std::memory_order_acquire);
+        auto* root = request != nullptr && request->native_compartment_request ? request->compartment.get() : nullptr;
+        if (root == nullptr || child == nullptr || root->child != child || root->published ||
+            executor.owned_unpublished_process.load(std::memory_order_acquire) != child)
+            return -EINVAL;
+        bool membership = false;
+        {
+            ker::syscall::vmem::SharedVmemPublicationGuard publication;
+            if (executor.exit_in_progress.load(std::memory_order_acquire) || executor.has_exited ||
+                executor.state.load(std::memory_order_acquire) != mod::sched::task::TaskState::ACTIVE)
+                result = -ECANCELED;
+            else if (mod::power::shutdown_in_progress())
+                result = -ESHUTDOWN;
+            else
+                result = mod::sched::resource::revalidate_native_creator_policy(*root->creator, root->policy);
+            if (result == 0 && (child->scheduler_published.load(std::memory_order_acquire) || child->pid_namespace() == nullptr ||
+                                child->mount_namespace() == nullptr || child->ipc_namespace() == nullptr ||
+                                *child->pid_namespace() != root->context.pids || *child->mount_namespace() != root->context.mounts ||
+                                *child->ipc_namespace() != root->context.ipc || child->namespace_tid() != 1))
+                result = -EINVAL;
+            if (result == 0 && (root->context.pids.closed() || root->context.mounts.closed() || root->context.ipc.closed()))
+                result = -EIDRM;
+            if (result == 0 && (child->pid == 0 || child->pid > INT64_MAX)) result = -EOVERFLOW;
+            if (result == 0) {
+                pid = child->pid;
+                membership = child_events::begin_publication(*root->creator, *child);
+                if (!membership) result = -ECANCELED;
+            }
+#ifdef WOS_SELFTEST
+            if (result == 0 && exec_selftest_take_native_construction_fault(NativeConstructionFault::PUBLICATION_BEFORE_POST))
+                result = -EAGAIN;
+#endif
+            if (result == 0) {
+                uint64_t cpu = mod::cpu::current_cpu();
+#ifdef WOS_SELFTEST
+                if (exec_selftest_take_native_construction_fault(NativeConstructionFault::PUBLICATION_INVALID_CPU)) cpu = UINT64_MAX;
+#endif
+                if (!mod::sched::post_task_for_cpu(cpu, child)) result = -EAGAIN;
+            }
+            if (result == 0) {
+                // Post can run/exit immediately. The slot still pins the child;
+                // parent exit may already have transferred its event audience.
+                static_cast<void>(child_events::commit_publication(*child));
+                root->published = true;
+                root->child = nullptr;
+                if (!mod::sched::task::release_unpublished_process(&executor, child)) [[unlikely]] {
+                    mod::dbg::panic_handler("native publication: lost published child slot");
+                    hcf();
+                }
+            }
+        }
+        if (result != 0 && membership) child_events::abort_publication(*child);
+    }
+    if (result != 0) return result;
+    // Preparation File releases may block; transferred scopes stay live and
+    // cleanup keeps its own persistent/fatal recovery owner until destruction.
+    cleanup_exec_preparation(executor);
+    return static_cast<int64_t>(pid);
 }
 
 auto wos_proc_exec(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr) -> uint64_t {

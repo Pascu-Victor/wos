@@ -7056,3 +7056,146 @@ KTEST(CompartmentGlobalControl, HostValidationAndOriginalInitRoleKeepLegacyError
     KEXPECT_EQ(resource::service_read_for_subject(host.task.get(), 0, BUFFER, abi::service_resource::VERSION),
                static_cast<uint64_t>(-EACCES));
 }
+
+KTEST(CompartmentPublication, MappedLimitSettersKeepPrivateHardCeilingsAndHostAuthority) {
+    auto const PIDS = pid_ns::live_namespace_count();
+    {
+        UserTask host, private_owner;
+        pid_ns::NamespaceRef scope;
+        KREQUIRE_EQ(pid_ns::create_namespace(scope), 0);
+        KREQUIRE_TRUE(private_owner.task->initialize_pid_namespace(scope));
+        constexpr uint64_t BUFFER = 0x6A0000;
+        KREQUIRE_TRUE(host.map_zero(BUFFER));
+        KREQUIRE_TRUE(private_owner.map_zero(BUFFER));
+        for (unsigned id = 0; id < abi::resource::COUNT; ++id) {
+            auto value = host.task->resources.entries[id].limit;
+            value.soft = 1;
+            KREQUIRE_TRUE(usercopy::copy_to_task(*host.task, BUFFER, &value, sizeof(value)));
+            KEXPECT_EQ(resource::limit_for_subject(host.task.get(), id, BUFFER, abi::resource::VERSION, true), uint64_t{0});
+            KEXPECT_EQ(host.task->resources.entries[id].limit.soft, uint64_t{1});
+            KEXPECT_EQ(host.task->resources.entries[id].limit.hard, value.hard);
+        }
+        auto const CPU = static_cast<unsigned>(resource::Id::CPU);
+        host.task->resources.entries[CPU].limit = {2, 3};
+        private_owner.task->resources.entries[CPU].limit = {2, 3};
+        KEXPECT_TRUE(private_owner.task->credentials().allows(security::Authority::RESOURCE_LIMIT));
+        abi::resource::Limit value{2, 4};
+        for (auto* subject : {host.task.get(), private_owner.task.get()}) {
+            KREQUIRE_TRUE(usercopy::copy_to_task(*subject, BUFFER, &value, sizeof(value)));
+            KEXPECT_EQ(resource::limit_for_subject(subject, CPU, BUFFER, abi::resource::VERSION, true),
+                       subject == host.task.get() ? uint64_t{0} : static_cast<uint64_t>(-EPERM));
+        }
+        KEXPECT_EQ(private_owner.task->resources.entries[CPU].limit.hard, uint64_t{3});
+        value = {3, 3};
+        KREQUIRE_TRUE(usercopy::copy_to_task(*private_owner.task, BUFFER, &value, sizeof(value)));
+        KEXPECT_EQ(resource::limit_for_subject(private_owner.task.get(), CPU, BUFFER, abi::resource::VERSION, true), uint64_t{0});
+        KEXPECT_EQ(private_owner.task->resources.entries[CPU].limit.soft, uint64_t{3});
+        security::Snapshot nonroot;
+        KREQUIRE_EQ(host.task->credentials().prepare({.change = security::Change::SET_EUID, .effective = 710}, nonroot), 0);
+        KREQUIRE_EQ(resource::initialize_credentials(*host.task, nonroot), 0);
+        value = {2, 5};
+        KREQUIRE_TRUE(usercopy::copy_to_task(*host.task, BUFFER, &value, sizeof(value)));
+        KEXPECT_EQ(resource::limit_for_subject(host.task.get(), CPU, BUFFER, abi::resource::VERSION, true), static_cast<uint64_t>(-EPERM));
+        KEXPECT_EQ(host.task->resources.entries[CPU].limit.hard, uint64_t{4});
+        KEXPECT_EQ(resource::limit_for_subject(nullptr, CPU, BUFFER, abi::resource::VERSION, true), static_cast<uint64_t>(-ESRCH));
+        KEXPECT_EQ(resource::limit_for_subject(host.task.get(), CPU, UINT64_MAX, abi::resource::VERSION, true),
+                   static_cast<uint64_t>(-EFAULT));
+        KEXPECT_EQ(resource::limit_for_subject(host.task.get(), CPU, BUFFER, 0, true), static_cast<uint64_t>(-EINVAL));
+        KEXPECT_EQ(host.task->usercopy_pagemap_accesses.load(), uint32_t{0});
+        KEXPECT_EQ(private_owner.task->usercopy_pagemap_accesses.load(), uint32_t{0});
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
+}
+
+KTEST(CompartmentPublication, MembershipAndRealPostRefusalDrainPreparationExactly) {
+    auto const THREADS = threading::get_active_thread_count();
+    using Fault = process_exec::NativeConstructionFault;
+    for (auto fault : {Fault::PUBLICATION_BEFORE_POST, Fault::PUBLICATION_INVALID_CPU}) {
+        NativeCreationFixture fixture;
+        KREQUIRE_EQ(fixture.prepare(710, 51), 0);
+        auto& executor = *fixture.creator.task;
+        abi::resource::Usage before{}, after{};
+        resource::copy_process_observation(executor, before);
+        auto const PIDS = pid_ns::live_namespace_count(), IPC = ipc::live_namespace_count(), MOUNTS = mount_ns::live_namespace_count();
+        auto const REFS = fixture.executable->refcount.load();
+        NativeCreationProcess process{executor};
+        int error = 99;
+        process.child = process_exec::prepare_native_compartment_for_owner(executor, fixture.spec, error);
+        KREQUIRE_EQ(error, 0);
+        KREQUIRE_TRUE(process.child != nullptr);
+        process_exec::exec_selftest_fail_native_construction_once(fault);
+        KEXPECT_EQ(process_exec::publish_native_compartment_for_owner(executor, process.child), int64_t{-EAGAIN});
+        process_exec::exec_selftest_fail_native_construction_once(Fault::NONE);
+        KEXPECT_FALSE(process.child->scheduler_published.load());
+        KEXPECT_EQ(process.child->child_membership_state.load(), sched::task::ChildMembershipState::UNLINKED);
+        KEXPECT_NULL(process.child->child_parent);
+        KEXPECT_NULL(executor.child_list_head);
+        KEXPECT_EQ(process.child->ref_count.load(), uint32_t{2});
+        KEXPECT_EQ(executor.ref_count.load(), uint32_t{2});
+        KEXPECT_FALSE(executor.unpublished_teardown_in_progress.load());
+        KREQUIRE_TRUE(process.destroy());
+        KEXPECT_TRUE(creation_pending_drained(executor));
+        KEXPECT_EQ(executor.ref_count.load(), uint32_t{1});
+        KEXPECT_EQ(fixture.executable->refcount.load(), REFS);
+        KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
+        KEXPECT_EQ(ipc::live_namespace_count(), IPC);
+        KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
+        KEXPECT_EQ(threading::get_active_thread_count(), THREADS);
+        resource::copy_process_observation(executor, after);
+        KEXPECT_EQ(after.current, before.current);
+    }
+}
+
+KTEST(CompartmentPublication, ChangedPolicyClosedScopesAndExitingCreatorsRefuseBeforePost) {
+    for (unsigned scenario = 0; scenario < 3; ++scenario) {
+        NativeCreationFixture fixture;
+        KREQUIRE_EQ(fixture.prepare(710, 51), 0);
+        auto& executor = *fixture.creator.task;
+        auto const PIDS = pid_ns::live_namespace_count(), IPC = ipc::live_namespace_count(), MOUNTS = mount_ns::live_namespace_count();
+        NativeCreationProcess process{executor};
+        int error = 99;
+        process.child = process_exec::prepare_native_compartment_for_owner(executor, fixture.spec, error);
+        KREQUIRE_EQ(error, 0);
+        KREQUIRE_TRUE(process.child != nullptr);
+        if (scenario == 0)
+            static_cast<void>(executor.exchange_creation_mask(077));
+        else if (scenario == 1)
+            process.child->mount_namespace()->close();
+        else
+            executor.exit_in_progress.store(true);
+        int const EXPECTED = scenario == 0 ? -EAGAIN : scenario == 1 ? -EIDRM : -ECANCELED;
+        KEXPECT_EQ(process_exec::publish_native_compartment_for_owner(executor, process.child), int64_t{EXPECTED});
+        KEXPECT_FALSE(process.child->scheduler_published.load());
+        KEXPECT_NULL(executor.child_list_head);
+        KEXPECT_EQ(process.child->child_membership_state.load(), sched::task::ChildMembershipState::UNLINKED);
+        KEXPECT_FALSE(executor.unpublished_teardown_in_progress.load());
+        executor.exit_in_progress.store(false);
+        KREQUIRE_TRUE(process.destroy());
+        KEXPECT_TRUE(creation_pending_drained(executor));
+        KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
+        KEXPECT_EQ(ipc::live_namespace_count(), IPC);
+        KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
+    }
+}
+
+KTEST(CompartmentPublication, ForeignOrMissingChildrenCannotConsumeExactPendingOwner) {
+    NativeCreationFixture fixture;
+    KREQUIRE_EQ(fixture.prepare(710, 51), 0);
+    auto& executor = *fixture.creator.task;
+    NativeCreationProcess process{executor};
+    NativeTask foreign;
+    int error = 99;
+    process.child = process_exec::prepare_native_compartment_for_owner(executor, fixture.spec, error);
+    KREQUIRE_EQ(error, 0);
+    KREQUIRE_TRUE(process.child != nullptr);
+    auto* request = executor.owned_exec_arguments.load();
+    for (auto* candidate : {static_cast<Task*>(nullptr), foreign.task.get()}) {
+        KEXPECT_EQ(process_exec::publish_native_compartment_for_owner(executor, candidate), int64_t{-EINVAL});
+        KEXPECT_TRUE(executor.owned_unpublished_process.load() == process.child);
+        KEXPECT_TRUE(executor.owned_exec_arguments.load() == request);
+        KEXPECT_FALSE(executor.unpublished_teardown_in_progress.load());
+        KEXPECT_FALSE(process.child->scheduler_published.load());
+    }
+    KREQUIRE_TRUE(process.destroy());
+    KEXPECT_TRUE(creation_pending_drained(executor));
+}

@@ -589,3 +589,37 @@ campaigns. Reconnaissance31 records actual existing mutation guards and remainin
 resource/service coordination plus prepared-mount lifetime requirements. Use
 --no-setup, one topology,20GiBdisposable/40GiBfree,COW/reflinks and exact-owned
 inactive-image/appliance pruning on PASS/FAIL. No pause or push.
+
+## Checkpoint31: native local publication (2026-10-11)
+
+Kernel-only publication revalidates the retained canonical creator under the
+existing VM publication mutex, links child-event membership and uses explicit
+local scheduler post. All sixteen limit setters and service selection coordinate
+with this boundary; credential authorization is fresh after the guard. Private
+root authority cannot raise an admitted hard ceiling. Privileged Host behavior
+and ordinary soft changes within current hard limits remain.
+
+Exact pending ownership pins the child through post/commit. Successful post
+transfers namespace retirement to private init, returns the physical Host PID,
+and finishes prepared mount state before releasing the protecting root pin.
+Parent exit follows existing Host adoption semantics; a runnable child does not
+return a retry result. Failure removes pending membership and leaves preparation
+owned for explicit abort. No Task/File layout, public ABI/libc/wire or scheduler
+primitive changes. Successful runnable publication remains unqualified.
+
+Normal Build WOS, isolated fast diagnostics,44 focused Host tests, format/tidy
+and38 preservation checks PASS. Rootless --no-setup KTEST59 PASS87,822assertions/
+0failures/1,383cases/all132mandatory/137stablepins135distinct/normalpoweroff.
+Four new native cases qualify actual mapped limit consumers, hard-raise refusal,
+changed/closed/exiting/foreign owners and membership/real-post refusal recovery.
+Four exact-owned inactive images pruned261,308,416allocatedB; final0disposable.
+Required seeds/current artifacts and unrelated user VM preserved. Current129
+credential source calls still have the same24failures. Checkpoint audit PASS;
+full regression and all ten full criteria remain INCOMPLETE.
+
+Goal39 ACTIVE. Continue bounded versioned public spec/launcher and scheduled
+service publication/root transfer, explicit shared mappings and complete FD/
+device/indirect consumer policy, actual hostile/fatal/init/futex/two-hour/1000
+full-lifecycle/Host-init-libc campaigns. Use --no-setup, one topology,20GiB
+disposable/40GiBfree,COW/reflinks and exact-owned inactive pruning on PASS/FAIL.
+No autonomous pause or push.

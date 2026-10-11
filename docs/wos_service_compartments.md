@@ -1178,9 +1178,10 @@ preservation checks pass. KTEST50 was stopped after a fixture supplied the journ
 grant without its required ceiling; only that fixture was corrected before 51.
 Eight proven inactive disposable images from both runs were pruned; final usage 0.
 
-Public creation remains disabled. Live creator capture/revalidation, bounded
-root population/import/non-root ownership, explicit FD/shared mapping manifests,
-init/job/parent and atomic publication remain required. Other existing image/
+Public creation remains disabled. Checkpoints 29 and 31 add canonical creator
+capture, owned root population and a kernel-only local publisher. Versioned
+public input, explicit shared mapping manifests and scheduled publication still
+require integration and qualification. Other existing image/
 construction allocation paths and actual scheduled fatal races are not covered
 by these nine targeted allocation refusals or transferred recovery hooks.
 Checkpoint 30 supplies private-view admission for DEBUG, service-resource
@@ -1226,9 +1227,10 @@ namespace references, population reservation and partial children drain through
 owned abort/recovery paths. Successful preparation retains root state; ownership
 is not declared transferred before real publication.
 
-Public creation remains disabled. Atomic creator-policy publication, successful
-root ownership transfer, versioned userspace spec/launcher and explicit shared
-mapping and complete FD capability manifests remain required. Checkpoint 30
+Public creation remains disabled. Checkpoint 31 implements kernel-only local
+publication and root ownership transfer; runnable success and scheduled races
+remain unqualified. Versioned userspace spec/launcher, explicit shared mapping
+and complete FD capability manifests remain required. Checkpoint 30
 closes the selected DEBUG, CPU-domain/affinity, swap, init mailbox/status, service
 resource, global sync and log-block/framebuffer gaps. Remaining explicit device/
 FD/indirect consumers still need qualification before public enablement. Scheduled fatal races, actual shared futex/init death, two
@@ -1296,6 +1298,45 @@ reconciled before correction. Eight exact-owned inactive images were pruned
 (457,211,904 allocated bytes); final disposable usage is 0. Required seeds/current
 artifacts and unrelated user VMs remain. All ten full criteria remain incomplete;
 Goal39 is ACTIVE.
+
+## Native local publication (checkpoint 31)
+
+`publish_native_compartment_for_owner` consumes only the executor's exact pending
+native preparation. Under the existing VM publication mutex it revalidates the
+canonical creator policy, checks live matching scopes and local PID 1, links
+child-event membership and uses the existing explicit local scheduler post.
+It returns the physical PID for Host supervision. Policy changes, closed scopes,
+shutdown and exiting or mismatched owners refuse before publication. Failed
+membership or post leaves preparation owned for explicit abort and removes its
+pending child-event references before destruction.
+
+Successful post transfers namespace retirement to the private init lifecycle.
+The child stays pinned through commit; ordinary Host-parent exit may adopt it
+into Host init. A runnable child never produces a retry result merely because
+its parent audience changed. Request cleanup finishes prepared mount state while
+the root pin protects it, then releases its references outside the publication
+mutex without closing transferred scopes. Task/File layouts, public syscall
+and libc ABI, WKI formats and ordinary Host spawn behavior are unchanged.
+
+All sixteen limit setters and service selection now coordinate with final
+publication. Limit authorization reads fresh credentials after that guard;
+usercopy remains outside it. Private processes can lower hard limits and change
+soft limits within their current hard ceiling. Retained root authority cannot
+raise that ceiling. Existing privileged Host hard-limit behavior is preserved.
+
+KTEST59 passed 87,822 assertions, zero failures and 1,383 cases, including all
+132 mandatory cases. Four new native cases exercise mapped limit setters,
+private hard-raise refusal, policy/scope/owner refusal, actual child membership
+rollback and the real local-post invalid-CPU refusal. These run before normal
+scheduling; successful runnable publication is still unqualified. Normal Build
+WOS, isolated fast diagnostics, all 44 focused Host tests, format/tidy and 38
+preservation checks passed. The broader 129 credential source calls retain the
+same 24 failures. All 137 source/artifact pins (135 distinct paths) remained
+stable through normal selftest poweroff. Four exact-owned inactive images were
+pruned (261,308,416 allocated bytes); final disposable usage is zero. Public
+launcher/spec, scheduled hostile/fatal/init/futex tests, two two-hour service
+trees and 1,000 complete lifecycles remain required. Goal39 is ACTIVE and all ten
+full criteria remain incomplete.
 
 ## Verification checkpoint
 

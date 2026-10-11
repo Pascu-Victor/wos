@@ -11,6 +11,7 @@
 #include <platform/sched/resource_model.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/security/compartment_host.hpp>
 #include <platform/sys/usercopy.hpp>
 #include <syscalls_impl/process/child_events.hpp>
 #include <syscalls_impl/vmem/sys_vmem.hpp>
@@ -287,11 +288,10 @@ auto inherit(task::Task& child, task::Task& parent) -> bool {
     return true;
 }
 
-auto syscall_limit(uint64_t resource, uint64_t address, uint64_t version, bool set, bool usage) -> uint64_t {
+auto limit_for_subject(task::Task* caller, uint64_t resource, uint64_t address, uint64_t version, bool set, bool usage) -> uint64_t {
     if (resource >= abi::resource::COUNT || version != abi::resource::VERSION) {
         return static_cast<uint64_t>(-EINVAL);
     }
-    auto* caller = get_current_task();
     if (caller == nullptr) {
         return static_cast<uint64_t>(-ESRCH);
     }
@@ -299,7 +299,6 @@ auto syscall_limit(uint64_t resource, uint64_t address, uint64_t version, bool s
     if (set && !sys::usercopy::copy_value_from_task(*caller, address, value)) {
         return static_cast<uint64_t>(-EFAULT);
     }
-    auto const CREDENTIALS = caller->credentials();
     int result = 0;
     Usage snapshot{};
     {
@@ -307,12 +306,15 @@ auto syscall_limit(uint64_t resource, uint64_t address, uint64_t version, bool s
         // of that region: fatal syscall exit does not unwind C++ destructors.
         bool const IS_AS = resource == static_cast<unsigned>(Id::AS);
         std::optional<ker::syscall::vmem::SharedVmemPublicationGuard> publication_guard;
+        if (set || IS_AS) publication_guard.emplace();
         if (IS_AS) {
-            publication_guard.emplace();
             if (usage && !observe_address_space(*caller)) {
                 return static_cast<uint64_t>(-ESRCH);
             }
         }
+        auto const CREDENTIALS = caller->credentials();
+        bool const ALLOW_RAISE =
+            CREDENTIALS.allows(security::Authority::RESOURCE_LIMIT) && security::compartment::host_namespace_admission(caller) == 0;
         Owner owner(caller);
         auto* process = owner.get();
         if (process == nullptr) {
@@ -329,8 +331,7 @@ auto syscall_limit(uint64_t resource, uint64_t address, uint64_t version, bool s
             }
         }
         if (set) {
-            result = process->resources.set(static_cast<unsigned>(resource), value, CREDENTIALS.allows(security::Authority::RESOURCE_LIMIT),
-                                            task::Task::FD_TABLE_SIZE);
+            result = process->resources.set(static_cast<unsigned>(resource), value, ALLOW_RAISE, task::Task::FD_TABLE_SIZE);
         }
         snapshot = process->resources.entries[resource];
         process->resource_lock.unlock_irqrestore(FLAGS);
@@ -350,5 +351,8 @@ auto syscall_limit(uint64_t resource, uint64_t address, uint64_t version, bool s
     bool const COPIED = usage ? sys::usercopy::copy_value_to_task(*caller, address, snapshot)
                               : sys::usercopy::copy_value_to_task(*caller, address, snapshot.limit);
     return COPIED ? 0 : static_cast<uint64_t>(-EFAULT);
+}
+auto syscall_limit(uint64_t resource, uint64_t address, uint64_t version, bool set, bool usage) -> uint64_t {
+    return limit_for_subject(get_current_task(), resource, address, version, set, usage);
 }
 }  // namespace ker::mod::sched::resource

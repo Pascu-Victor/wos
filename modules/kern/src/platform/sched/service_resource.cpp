@@ -13,6 +13,7 @@
 #include <platform/security/authorization.hpp>
 #include <platform/security/compartment_host.hpp>
 #include <platform/sys/usercopy.hpp>
+#include <syscalls_impl/vmem/sys_vmem.hpp>
 #include <utility>
 
 namespace ker::mod::sched::resource {
@@ -525,6 +526,9 @@ auto configure_service_for(task::Task* caller, uint64_t address) -> uint64_t {
 }
 
 auto select_service_for(task::Task* caller, uint64_t slot) -> uint64_t {
+    int const SCOPE = service_management_status(caller);
+    if (SCOPE != 0) return static_cast<uint64_t>(SCOPE);
+    ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
     int const AUTHORIZATION = service_management_status(caller);
     if (AUTHORIZATION != 0) return static_cast<uint64_t>(AUTHORIZATION);
     uint64_t const FLAGS = service_lock.lock_irqsave();

@@ -107,6 +107,9 @@ struct NativeCompartmentSpec {
 // A later publisher must revalidate policy and explicitly transfer ownership.
 auto prepare_native_compartment_for_owner(ker::mod::sched::task::Task& executor, const NativeCompartmentSpec& spec, int& error)
     -> ker::mod::sched::task::Task*;
+// Consumes preparation on success and returns physical PID for Host supervision.
+// Failure leaves the exact child/root owned for explicit abort. No remote post.
+auto publish_native_compartment_for_owner(ker::mod::sched::task::Task& executor, ker::mod::sched::task::Task* child) -> int64_t;
 auto abort_native_compartment_preparation(ker::mod::sched::task::Task& executor, ker::mod::sched::task::Task* child = nullptr) -> bool;
 
 // Internal admitted native construction context, never a userspace join handle.
@@ -161,7 +164,9 @@ enum class NativeConstructionFault : uint8_t {
     CREATION_IMPORT_READ,
     CREATION_DESCRIPTORS,
     CREATION_RECOVERY_IMPORT,
-    CREATION_RECOVERY_BUILT
+    CREATION_RECOVERY_BUILT,
+    PUBLICATION_BEFORE_POST,
+    PUBLICATION_INVALID_CPU
 };
 void exec_selftest_fail_native_construction_once(NativeConstructionFault fault);
 auto exec_selftest_take_native_construction_fault(NativeConstructionFault fault) -> bool;
