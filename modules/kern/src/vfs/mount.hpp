@@ -105,7 +105,8 @@ enum class MountPathKind { TASK_VISIBLE, RETAINED_PHYSICAL };
 // the ambient task. Its caller must revalidate that lookup before publication.
 auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device, unsigned long flags, const char* data,
                               void* initial_private_data, FileOperations* initial_fops, PreparedMount* out,
-                              MountPathKind path_kind = MountPathKind::TASK_VISIBLE, const mount_ns::NamespaceRef& scope = {}) -> int;
+                              MountPathKind path_kind = MountPathKind::TASK_VISIBLE, const mount_ns::NamespaceRef& scope = {},
+                              const ker::mod::security::Snapshot* private_root_owner = nullptr) -> int;
 auto publish_prepared_mount(PreparedMount* prepared, const char* expected_physical_path = nullptr, File* covered_directory = nullptr)
     -> int;
 void finish_prepared_mount(PreparedMount* prepared);

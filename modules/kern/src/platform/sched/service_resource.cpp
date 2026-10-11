@@ -1,13 +1,17 @@
 #include "service_resource.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <new>
+#include <platform/sched/native_creation_policy.hpp>
 #include <platform/sched/resource.hpp>
+#include <platform/sched/resource_process.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/service_resource_model.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/security/authorization.hpp>
+#include <platform/security/compartment_host.hpp>
 #include <platform/sys/usercopy.hpp>
 #include <utility>
 
@@ -336,6 +340,118 @@ void ServiceReportTarget::add_current_locked(RemoteServiceObservation& observati
 
 void ServiceReportTarget::observe_reports_locked(ServiceReportTarget* reports, RemoteServiceObservation& observation) {
     for (auto* report = reports; report != nullptr; report = report->next) report->add_current_locked(observation);
+}
+
+namespace {
+auto native_creator_scope_status(task::Task& source) -> int {
+    if (source.is_thread || source.credential_owner() != &source || source.type != task::TaskType::PROCESS) return -EINVAL;
+    int const SCOPE = security::compartment::host_namespace_admission(&source);
+    return SCOPE == -EPERM ? -ENOTSUP : SCOPE;
+}
+
+auto capture_native_creator_locked(task::Task& source, const security::compartment::Request& request, NativeCreatorPolicy& out) -> int {
+    if (source.service_member.remote != nullptr || source.service_member.executing_remotely || source.wki_proxy_task) return -ENOTSUP;
+    bool const INIT = is_init(&source);
+    uint64_t const SLOT = INIT ? source.selected_child_service : source.service_member.slot;
+    State const* service_limits = nullptr;
+    if (SLOT != service_abi::NO_SELECTION) {
+        if (SLOT >= services.size() || !services.at(SLOT).configured) return -EINVAL;
+        if (!INIT && source.service_member.subject != &source) return -EINVAL;
+        auto& service = services.at(SLOT);
+        if (!service.state.admit_start()) return -EDQUOT;
+        if (INIT) service_limits = &service.state.totals;
+    }
+    NativeCreatorPolicy candidate{};
+    int const RESULT = capture_native_creator_fields(source, request, service_limits, candidate);
+    if (RESULT == 0) {
+        candidate.service_slot = SLOT;
+        out = candidate;
+    }
+    return RESULT;
+}
+
+auto revalidate_native_creator_locked(task::Task& source, const NativeCreatorPolicy& policy) -> int {
+    uint64_t const SLOT = is_init(&source) ? source.selected_child_service : source.service_member.slot;
+    if (SLOT != policy.service_slot) return -EAGAIN;
+    security::compartment::Request request{
+        .authority_ceiling = policy.admitted.credentials.authority_ceiling(),
+        .service_privileges = policy.admitted.credentials.service_privileges(),
+        .limits = policy.admitted.limits,
+        .network = policy.admitted.network,
+        .dumpable = policy.admitted.credentials.dumpable(),
+    };
+    NativeCreatorPolicy renewed{};
+    int const RESULT = capture_native_creator_locked(source, request, renewed);
+    if (RESULT != 0) return RESULT == -EPERM ? -EAGAIN : RESULT;
+    bool limits_match = true;
+    for (size_t i = 0; i < policy.admitted.limits.size(); ++i) {
+        auto const BEFORE = policy.admitted.limits[i];
+        auto const AFTER = renewed.admitted.limits[i];
+        limits_match &= BEFORE.soft == AFTER.soft && BEFORE.hard == AFTER.hard;
+        auto const OLD_PARENT = policy.parent.limits[i];
+        auto const NEW_PARENT = renewed.parent.limits[i];
+        limits_match &= OLD_PARENT.soft == NEW_PARENT.soft && OLD_PARENT.hard == NEW_PARENT.hard;
+    }
+    if (policy.observed.generation != renewed.observed.generation || policy.observed.credentials != renewed.observed.credentials ||
+        policy.service_slot != renewed.service_slot || policy.admitted.credentials != renewed.admitted.credentials || !limits_match ||
+        policy.admitted.network != renewed.admitted.network || policy.parent.network != renewed.parent.network ||
+        policy.creation_mask != renewed.creation_mask)
+        return -EAGAIN;
+    return 0;
+}
+}  // namespace
+
+auto capture_native_creator_policy(task::Task& source, const security::compartment::Request& request, NativeCreatorPolicy& out) -> int {
+    if (int const STATUS = native_creator_scope_status(source); STATUS != 0) return STATUS;
+    uint64_t const FLAGS = service_lock.lock_irqsave();
+    int const RESULT = capture_native_creator_locked(source, request, out);
+    service_lock.unlock_irqrestore(FLAGS);
+    return RESULT;
+}
+
+auto revalidate_native_creator_policy(task::Task& source, const NativeCreatorPolicy& policy) -> int {
+    if (int const STATUS = native_creator_scope_status(source); STATUS != 0) return STATUS;
+    uint64_t const FLAGS = service_lock.lock_irqsave();
+    int const RESULT = revalidate_native_creator_locked(source, policy);
+    service_lock.unlock_irqrestore(FLAGS);
+    return RESULT;
+}
+
+auto attach_native_creation_service(task::Task& child, task::Task& source, const NativeCreatorPolicy& policy) -> int {
+    if (int const STATUS = native_creator_scope_status(source); STATUS != 0) return STATUS;
+    if (child.is_thread || child.type != task::TaskType::PROCESS || child.thread != nullptr || child.has_run ||
+        child.scheduler_published.load(std::memory_order_acquire) || child.service_member.subject != nullptr ||
+        child.service_member.slot != service_abi::NO_SELECTION || child.service_member.remote != nullptr)
+        return -EBUSY;
+    auto const* pid = child.pid_namespace();
+    auto const* mounts = child.mount_namespace();
+    auto const* ipc = child.ipc_namespace();
+    if (pid == nullptr || mounts == nullptr || ipc == nullptr) return -ESRCH;
+    if (pid->closed() || mounts->closed() || ipc->closed()) return -EIDRM;
+    if (pid->is_host() || mounts->is_host() || ipc->is_host()) return -EINVAL;
+    uint64_t const FLAGS = service_lock.lock_irqsave();
+    int result = revalidate_native_creator_locked(source, policy);
+    if (result == 0 && child.credentials() != policy.admitted.credentials) result = -EPERM;
+    if (result == 0) {
+        uint64_t const RESOURCE_FLAGS = child.resource_lock.lock_irqsave();
+        for (size_t i = 0; i < policy.admitted.limits.size(); ++i) {
+            auto const CHILD = child.resources.entries[i].limit;
+            auto const ADMITTED = policy.admitted.limits[i];
+            if (CHILD.soft != ADMITTED.soft || CHILD.hard != ADMITTED.hard) result = -EPERM;
+        }
+        child.resource_lock.unlock_irqrestore(RESOURCE_FLAGS);
+    }
+    if (result == 0 && policy.service_slot != service_abi::NO_SELECTION) {
+        auto& service = services.at(policy.service_slot);
+        auto& member = child.service_member;
+        member.subject = &child;
+        member.slot = policy.service_slot;
+        member.next = service.members;
+        if (service.members != nullptr) service.members->previous = &member;
+        service.members = &member;
+    }
+    service_lock.unlock_irqrestore(FLAGS);
+    return result;
 }
 
 void inherit_service(task::Task& child, task::Task& source) {
@@ -797,6 +913,65 @@ auto selftest_service_lifecycle() -> bool {
          service.state.totals.entries[static_cast<unsigned>(Id::AS)].denied == 1 && ok;
     service = {};
     return ok;
+}
+
+auto selftest_native_creator_service_policy() -> bool {
+    // KTEST runs before normal init. Exercise the actual global membership and
+    // aggregate gate, returning the untouched slot after every return path.
+    constexpr uint64_t SLOT = service_abi::MAX_SERVICES - 3;
+    auto& service = services.at(SLOT);
+    if (service.configured || service.members != nullptr || service.reports != nullptr) return false;
+    struct ScopedSlot {
+        ServiceSlot& service;
+        ~ScopedSlot() { service = {}; }
+    } reset{service};
+    service_abi::Configuration config{};
+    for (auto& limit : config.limits) limit = {INFINITY_VALUE, INFINITY_VALUE};
+    config.limits[0] = {1, 2};
+    config.limits[5] = {3, 5};
+    if (!service.state.configure(config)) return false;
+    service.configured = true;
+    task::Task init{};
+    init.pid = 1;
+    init.type = task::TaskType::PROCESS;
+    init.selected_child_service = SLOT;
+    security::compartment::Request request;
+    for (size_t i = 0; i < request.limits.size(); ++i) request.limits[i] = init.resources.entries[i].limit;
+    for (unsigned i = 0; i < service_abi::RESOURCE_COUNT; ++i) {
+        auto const ID = static_cast<unsigned>(service_abi::RESOURCE_IDS[i]);
+        auto const LIMIT = service.state.totals.entries[ID].limit;
+        request.limits[ID].soft = std::min(request.limits[ID].soft, LIMIT.soft);
+        request.limits[ID].hard = std::min(request.limits[ID].hard, LIMIT.hard);
+    }
+    constexpr unsigned NOFILE = static_cast<unsigned>(Id::NOFILE);
+    request.limits[NOFILE] = {1, 2};
+    NativeCreatorPolicy policy;
+    if (capture_native_creator_policy(init, request, policy) != 0 || policy.service_slot != SLOT) return false;
+    bool ok = true;
+    {
+        pid_ns::NamespaceRef pids;
+        ipc::NamespaceRef ipc_scope;
+        vfs::mount_ns::NamespaceRef mounts;
+        if (pid_ns::create_namespace(pids) != 0 || ipc::create_namespace(ipc_scope) != 0 || vfs::mount_ns::create_namespace(mounts) != 0)
+            return false;
+        task::Task child{};
+        child.pid = task::get_next_pid();
+        child.type = task::TaskType::PROCESS;
+        for (size_t i = 0; i < policy.admitted.limits.size(); ++i) child.resources.entries[i].limit = policy.admitted.limits[i];
+        if (initialize_credentials(child, policy.admitted.credentials) != 0 || !child.initialize_pid_namespace(pids) ||
+            !child.initialize_ipc_namespace(ipc_scope) || !child.initialize_mount_namespace(mounts))
+            return false;
+        if (attach_native_creation_service(child, init, policy) != 0) return false;
+        ok = child.service_member.slot == SLOT && service.members == &child.service_member && child.service_member.subject == &child &&
+             child.resources.entries[NOFILE].limit.soft == 1 && child.resources.entries[NOFILE].limit.hard == 2 && ok;
+        init.selected_child_service = service_abi::NO_SELECTION;
+        ok = revalidate_native_creator_policy(init, policy) == -EAGAIN && ok;
+        init.selected_child_service = SLOT;
+        ok = charge_service_cpu(child, 2'000'001) == CpuAction::HARD_KILL && ok;
+        ok = revalidate_native_creator_policy(init, policy) == -EDQUOT && ok;
+        ok = child.resources.entries[NOFILE].limit.soft == 1 && ok;
+    }
+    return service.members == nullptr && service.state.totals.cpu_time_us == 2'000'001 && ok;
 }
 #endif
 }  // namespace ker::mod::sched::resource

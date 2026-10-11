@@ -12760,7 +12760,11 @@ auto acquire_local_component_lookup(ker::mod::sched::task::Task* task, int dirfd
     // Owner-side exports do not yet transport private namespace authority.
     int const REMOTE_SCOPE = ker::mod::security::compartment::remote_namespace_admission(task);
     if (REMOTE_SCOPE != 0 && REMOTE_SCOPE != -ENOTSUP) return REMOTE_SCOPE;
-    if (REMOTE_SCOPE == -ENOTSUP && physical_path) return -ENOTSUP;
+    // Typed private views remain local capabilities. The scope and native
+    // membership checks below still reject foreign roots; untyped exports
+    // cannot transport private namespace authority.
+    bool const PRIVATE_TYPED_VIEW = PRIVATE && initial_view != nullptr && *initial_view;
+    if (REMOTE_SCOPE == -ENOTSUP && physical_path && !PRIVATE_TYPED_VIEW) return -ENOTSUP;
     if (owner_directory != nullptr && (!physical_path || confinement_root == nullptr || pathname[0] == '/')) return -EINVAL;
     if (pathname[0] == '\0') return -ENOENT;
     if (physical_path && ((owner_directory == nullptr && pathname[0] != '/') || apply_task_route || admitted_credentials == nullptr))
@@ -32085,6 +32089,40 @@ auto vfs_prepare_root_directory_view_as(ker::mod::sched::task::Task& task, const
     return PIN != 0 ? PIN : prepare_directory_view({}, REQUEST_CREDENTIALS, file, file, {}, output, false);
 }
 
+auto vfs_pin_private_mount_root_as(const mount_ns::NamespaceRef& scope, const ker::mod::security::Snapshot& credentials, File** output)
+    -> int {
+    if (output == nullptr || *output != nullptr || scope.is_host()) return -EINVAL;
+    if (scope.closed()) return -EIDRM;
+    auto const REQUEST_CREDENTIALS = credentials;
+    // Final native/File/mount release must follow publication unlock, including
+    // backend allocation or attachment failure. Caller guards its executor.
+    MountRef mount;
+    tmpfs::TmpfsLookupHandle lookup;
+    std::unique_ptr<File, LocalWalkFileRelease> pin;
+    {
+        ker::mod::sys::MutexGuard publication(g_vfs_namespace_publication_mutex);
+        if (scope.closed()) return -EIDRM;
+        mount = find_mount_point("/", 1, scope);
+        if (!mount) return -ENOENT;
+        if (mount->namespace_owner != scope || mount->fs_type != FSType::TMPFS) return -ENOTSUP;
+        if (mount->retiring.load(std::memory_order_acquire)) return -EAGAIN;
+        MountOpenFileReservation reservation(mount.get());
+        if (!reservation) return -EAGAIN;
+        int status = tmpfs::tmpfs_acquire_lookup(REQUEST_CREDENTIALS, tmpfs_root_for_mount(mount.get()), "/", &lookup);
+        if (status != 0) return status;
+        pin.reset(tmpfs::tmpfs_pin_directory_lookup(REQUEST_CREDENTIALS, lookup, &status));
+        if (!pin) return status != 0 ? status : -ENOMEM;
+        if (!reservation.attach(pin.get())) return -EAGAIN;
+        vfs_file_clear_path(pin.get());
+        pin->mount_dev_id = mount->dev_id;
+        pin->mount_generation = mount_table_generation_snapshot();
+        pin->vfs_path_namespace_generation = 0;
+        pin->dir_fs_count = static_cast<size_t>(-1);
+    }
+    *output = pin.release();
+    return 0;
+}
+
 auto vfs_narrow_directory_view(const DirectoryViewRef& source, const ker::mod::security::Snapshot& credentials, File* root, File* directory,
                                MountPolicy additional_policy, DirectoryViewRef& output) -> int {
     if (!source) return -EINVAL;
@@ -32298,6 +32336,9 @@ auto vfs_acquire_directory_view_lookup(ker::mod::sched::task::Task& task, const 
     if ((intent == LookupIntent::RENAME_SOURCE || intent == LookupIntent::RENAME_TARGET) && path_has_final_dot_component(relative_path))
         return -EINVAL;
     if ((export_path == nullptr) != (export_name == nullptr)) return -EINVAL;
+    auto const* scope = task.mount_namespace();
+    if (scope == nullptr) return -ESRCH;
+    if (scope->closed()) return -EIDRM;
     std::array<char, MAX_PATH_LEN> physical_origin{}, visible_root{};
     if (export_name != nullptr) {
         int result = normalize_owner_symlink_root(export_name, visible_root);
@@ -32324,7 +32365,7 @@ auto vfs_acquire_directory_view_lookup(ker::mod::sched::task::Task& task, const 
         result = copy_directory_lookup_path(retained_view.root(), NAMESPACE, MOUNTS, root, true);
         if (result != 0) return result;
         auto* mount = retained_view.root()->mount_owner;
-        if (find_mount_point(root.data()).get() != mount) return -EAGAIN;
+        if (find_mount_point(root.data(), UNKNOWN_MOUNT_PATH_LEN, mount->namespace_owner).get() != mount) return -EAGAIN;
         result = acquire_local_component_lookup(&task, AT_FDCWD, relative_path, intent, follow_policy, require_directory, false, &candidate,
                                                 &REQUEST_CREDENTIALS, true, true, root.data(), retained_view.directory(), &references,
                                                 mount, &retained_view, export_name != nullptr ? visible_root.data() : nullptr,

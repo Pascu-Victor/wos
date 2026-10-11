@@ -1189,6 +1189,67 @@ perf/WKI census. The current129 credential source calls still have24 failures.
 No scheduled service, shared-futex, two-hour or1,000 full lifecycle claim follows
 from these unpublished native cases; all ten Goal39 criteria remain incomplete.
 
+## Native creator and fresh-root preparation
+
+`prepare_native_compartment_for_owner` accepts a bounded kernel spec and owns
+the complete unpublished preparation in the executing recovery owner. It retains
+the canonical creator, observes credentials and their generation together with
+all sixteen limits, selected service and creation mask, and revalidates those
+observations after blocking work. Creator/request/service limits intersect;
+aggregate service affiliation is attached before image mapping without replacing
+the admitted limits. Initial creation supports local Host creators. Nested/private
+and remote creators are explicitly refused.
+
+Preparation reserves process population before imports, creates fresh native
+mount/PID/IPC objects, and provisions a TMPFS root owned by the admitted effective
+UID/GID. A nonrunning mount-only populator uses admitted credentials and does not
+consume the service's private PID1. The root is pinned through its exact retained
+mount identity; typed local view lookup retains scope, search, membership, epoch
+and confinement checks. Foreign scopes are refused, closed scopes return EIDRM,
+and untyped physical/remote export remains unsupported.
+
+The spec permits at most 64 imported readable local TMPFS/XFS regular Files and
+256 explicit regular-File descriptor grants. Destination paths are copied,
+canonical absolute, below 512 bytes, at most 16 components and fewer than 256 bytes per component;
+mode is restricted to 0777. The executable name must also fit Task's 256-byte field.
+Rounded import pages fit a page-aligned root budget from 4KiB through 32MiB and
+each asset respects FSIZE. Stable native leases/copies and bounded 8KiB pread/
+pwrite chunks preserve imported bytes against source mutation. Descriptor indices
+are unique, below the actual table capacity and admitted NOFILE soft bound; no
+ambient descriptors or stdio are copied. Existing descriptor rights are explicit
+capabilities, not fresh access granted by path membership.
+
+The existing private main/interpreter/argument-stack builder consumes persistent
+inputs. Fresh job names are local 1, terminal association is empty and creation
+mask comes from the observed creator. Root/import Files, filesystem context,
+namespace references, population reservation and partial children drain through
+owned abort/recovery paths. Successful preparation retains root state; ownership
+is not declared transferred before real publication.
+
+Public creation remains disabled. Atomic creator-policy publication, successful
+root ownership transfer, versioned userspace spec/launcher and explicit shared
+mapping/nonregular FD manifests remain required. The global-control review found
+additional DEBUG, CPU-domain/affinity, swap, init mailbox/status, service-resource
+read, global sync and log-block/framebuffer paths needing scope policy before
+public enablement. Scheduled fatal races, actual shared futex/init death, two
+service trees on one kernel for 2 hours and 1,000 full lifecycles remain unqualified.
+The current 129 credential source calls still have 24 unchanged failures. All ten
+full Goal39 criteria remain incomplete and the goal is ACTIVE.
+
+KTEST56 passed 86,874 assertions/0 failures/1,375 cases, including all 124
+mandatory cases and seven new native creation/service cases, with 127 stable pins
+(125 distinct paths) and normal poweroff. Normal Build WOS, isolated fast
+diagnostics, 44 Host tests, format/tidy and 67 compatibility checks passed. Tests
+cover independent nonroot-owned roots, actual imports/main/interpreter/initial
+stacks, explicit retained descriptors, canonical thread creators and changed
+credentials/limits/umask/service selection, aggregate service membership, eight
+partial allocation/import/recovery faults and invalid capability/path/budget
+refusals. They use unpublished real kernel Tasks; they do not qualify scheduled
+services or scheduled fatal-signal races. Failed attempts 52–55 remain recorded.
+Twenty proven inactive disposable images from all five attempts were pruned;
+final disposable allocation is 0. Required seeds/current artifacts and unrelated
+user VMs were preserved.
+
 ## Verification checkpoint
 
 The initial `compartment_policy_test` suite checks actual production preparation

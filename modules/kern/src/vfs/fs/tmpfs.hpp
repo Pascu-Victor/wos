@@ -184,6 +184,8 @@ void register_tmpfs();
 
 // Root node access (used by initramfs unpacker)
 auto create_root_node() -> TmpNode*;
+// Kernel-owned fresh private root; metadata is set before node registration.
+auto create_root_node_for(const ker::mod::security::Snapshot& owner) -> TmpNode*;
 auto get_root_node() -> TmpNode*;
 auto create_mount_context(TmpNode* root, const char* options, bool root_compat, int* error_out = nullptr) -> TmpfsMount*;
 void destroy_mount_context(TmpfsMount* mount);

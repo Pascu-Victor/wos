@@ -794,7 +794,7 @@ auto tmpfs_resize_locked(TmpNode* n, size_t new_size) -> int {
     return 0;
 }
 
-auto create_root_node_internal() -> TmpNode* {
+auto create_root_node_internal(const ker::mod::security::Snapshot* owner = nullptr) -> TmpNode* {
     auto* node = new TmpNode;
     if (node == nullptr) {
         return nullptr;
@@ -802,6 +802,10 @@ auto create_root_node_internal() -> TmpNode* {
     copy_name(node->name, "/");
     node->type = TmpNodeType::DIRECTORY;
     node->mode = 0755;
+    if (owner != nullptr) {
+        node->uid = owner->user().effective;
+        node->gid = owner->group().effective;
+    }
     assign_node_incarnation(node);
     stamp_new_node(node);
     register_tmp_node(node);
@@ -2156,6 +2160,7 @@ void register_tmpfs() {
 }
 
 auto create_root_node() -> TmpNode* { return create_root_node_internal(); }
+auto create_root_node_for(const ker::mod::security::Snapshot& owner) -> TmpNode* { return create_root_node_internal(&owner); }
 
 auto get_root_node() -> TmpNode* { return root_node; }
 

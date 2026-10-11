@@ -523,3 +523,39 @@ two-hour service/1000 lifecycle/Host/init/libc campaigns. Read-only next-step
 reconnaissance is recorded in goals/progress/39. Keep rootless --no-setup,
 one active topology,20GiB disposable/40GiB free,COW/reflink and exact owned
 inactive pruning after every outcome. No push.
+
+## Checkpoint29: canonical creator and fresh-root preparation (2026-10-11)
+
+Kernel-owned preparation now retains the canonical creator, jointly observes
+credentials/generation and all 16 limits with service selection/network/umask,
+intersects requested/service policy and revalidates after blocking work. It
+reserves population, creates fresh mount/PID/IPC identities, provisions an
+effective-UID/GID-owned TMPFS root, imports bounded stable native regular-File
+assets and installs only explicit regular-File descriptor grants. Service
+affiliation precedes actual private image/interpreter/stack mapping and preserves
+the admitted limits. Owned abort/recovery retires child before root state;
+successful preparation remains unpublished and does not transfer root ownership.
+
+Exact private root pins and local typed views use retained mount identities and
+existing DAC/membership/epoch/confinement policy. Foreign views are rejected,
+closed scopes report EIDRM, and untyped physical/WKI export remains refused.
+Task member layout, public ABI/libc/wire and ordinary Host bodies are preserved.
+
+Normal Build WOS, isolated fast diagnostic build, 44 Host tests, format/tidy and 67
+compatibility checks PASS. Rootless --no-setup KTEST56 PASS 86,874 assertions / 0
+failures / 1,375 cases / all 124 mandatory / 127 stable pins (125 distinct), normal
+poweroff. Seven new native tests cover real roots/imports/explicit FD rights,
+canonical observation changes, actual service aggregate membership, eight
+allocation/import/transferred-recovery failures and invalid inputs. Failed
+attempts 52–55 are retained and reconciled; 20 inactive images pruned, final 0
+disposable allocation and unrelated user VM preserved. Current 129 credential
+source calls still have the same 24 failures; their original tests are unchanged.
+
+Goal39 remains ACTIVE, all ten full criteria INCOMPLETE. Public launcher/spec,
+atomic creator-policy publication/root transfer, explicit shared mappings and
+nonregular FD policy, remaining global controls and actual hostile/2h-service/
+1000-lifecycle/Host-init-libc campaigns remain required. Read-only global-control
+reconnaissance records DEBUG, CPU affinity/domains, swap, init mailbox/status,
+service reads, global sync and log-block/framebuffer gaps before public enablement.
+Continue with --no-setup, one topology, 20GiB disposable / 40GiB free, COW/reflink and
+exact-owned inactive-image/appliance pruning on PASS/FAIL. No pause or push.

@@ -7,6 +7,7 @@
 #include <platform/asm/cpu.hpp>
 #include <platform/sched/ipc_namespace.hpp>
 #include <platform/sched/pid_namespace.hpp>
+#include <platform/security/compartment_policy.hpp>
 #include <span>
 #include <string_view>
 #include <vfs/mount_namespace.hpp>
@@ -17,6 +18,7 @@ struct Task;
 
 namespace ker::mod::sched::resource {
 struct State;
+struct NativeCreatorPolicy;
 class ProcessReservation;
 }  // namespace ker::mod::sched::resource
 
@@ -74,6 +76,39 @@ struct NativeProcessArguments {
     std::span<const std::string_view> envp;
 };
 
+// Kernel-only creation inputs. The public versioned launcher must first copy
+// its spec and extract retained File capabilities from the executing process.
+// Assets are readable local regular Files, copied into fresh native TMPFS;
+// paths are absolute canonical names and modes contain only permission bits.
+struct NativeCompartmentAsset {
+    ker::vfs::File* source = nullptr;
+    std::string_view destination;
+    uint32_t mode = 0600;
+};
+struct NativeCompartmentDescriptor {
+    ker::vfs::File* source = nullptr;
+    unsigned destination = 0;
+};
+struct NativeCompartmentSpec {
+    ker::mod::security::compartment::Request policy;
+    NativeProcessArguments arguments;
+    std::span<const NativeCompartmentAsset> assets;
+    std::span<const NativeCompartmentDescriptor> descriptors;
+    // Whole-page imported data is bounded independently of process mappings.
+    // At most 64 assets, 256 descriptors, 16 path components and 32MiB of data.
+    uint64_t root_bytes = 32 * 1024 * 1024;
+};
+
+// Retains the actual canonical creator and owns preparation on this executor
+// before IO. Requires local Host creator views; no ambient FD/path inheritance.
+// On success the child is exclusively owned/unpublished, with PID1, a fresh
+// nonroot-owned root, admitted image/stack and explicit capabilities. Executor
+// root preparation remains pending; destroy the child before retiring it.
+// A later publisher must revalidate policy and explicitly transfer ownership.
+auto prepare_native_compartment_for_owner(ker::mod::sched::task::Task& executor, const NativeCompartmentSpec& spec, int& error)
+    -> ker::mod::sched::task::Task*;
+auto abort_native_compartment_preparation(ker::mod::sched::task::Task& executor, ker::mod::sched::task::Task* child = nullptr) -> bool;
+
 // Internal admitted native construction context, never a userspace join handle.
 // The caller retains this preparation throughout the call. All three scopes
 // must be private and open; the filesystem must belong to the exact mount view.
@@ -84,6 +119,10 @@ struct NativeProcessContext {
     const ker::vfs::PreparedFilesystemContext* filesystem = nullptr;
     // Null prepares an image only; a runnable launcher must supply arguments.
     const NativeProcessArguments* arguments = nullptr;
+    // Optional live creation transaction; exact retained canonical source and
+    // policy are borrowed together until mapping and publication validation.
+    ker::mod::sched::task::Task* service_creator = nullptr;
+    const ker::mod::sched::resource::NativeCreatorPolicy* creator_policy = nullptr;
 };
 
 // Consuming native builder with an explicit retained executor. Small/static
@@ -114,7 +153,15 @@ enum class NativeConstructionFault : uint8_t {
     INTERPRETER_BUFFER,
     STACK_ADDRESSES,
     RECOVERY_INTERPRETER_READ,
-    RECOVERY_STACK_BUILT
+    RECOVERY_STACK_BUILT,
+    CREATION_STATE,
+    CREATION_RESERVATION,
+    CREATION_ROOT,
+    CREATION_IMPORT_BUFFER,
+    CREATION_IMPORT_READ,
+    CREATION_DESCRIPTORS,
+    CREATION_RECOVERY_IMPORT,
+    CREATION_RECOVERY_BUILT
 };
 void exec_selftest_fail_native_construction_once(NativeConstructionFault fault);
 auto exec_selftest_take_native_construction_fault(NativeConstructionFault fault) -> bool;

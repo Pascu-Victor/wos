@@ -1293,11 +1293,14 @@ auto mounted_block_device_overlaps(const ker::dev::BlockDevice* device) -> bool 
 
 auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device, unsigned long flags, const char* data,
                               void* initial_private_data, FileOperations* initial_fops, PreparedMount* out, MountPathKind path_kind,
-                              const mount_ns::NamespaceRef& scope) -> int {
+                              const mount_ns::NamespaceRef& scope, const ker::mod::security::Snapshot* private_root_owner) -> int {
     if (path == nullptr || fstype == nullptr || out == nullptr || out->state != nullptr) {
         vfs_debug_log("mount_filesystem: invalid arguments\n");
         return -EINVAL;
     }
+    if (private_root_owner != nullptr && (scope.is_host() || path_kind != MountPathKind::RETAINED_PHYSICAL ||
+                                          std::strcmp(fstype, "tmpfs") != 0 || std::strcmp(path, "/") != 0))
+        return -EINVAL;
     if (ker::mod::power::shutdown_in_progress()) {
         vfs_debug_log("mount_filesystem: shutdown in progress\n");
         return -ESHUTDOWN;
@@ -1453,7 +1456,9 @@ auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::Bl
     } else if (std::strcmp(fstype, "tmpfs") == 0) {
         // tmpfs filesystem
         bool const ROOT_COMPAT = scope.is_host() && std::strcmp(resolved.data(), "/") == 0;
-        auto* root = ROOT_COMPAT ? ker::vfs::tmpfs::get_root_node() : ker::vfs::tmpfs::create_root_node();
+        auto* root = ROOT_COMPAT                     ? ker::vfs::tmpfs::get_root_node()
+                     : private_root_owner != nullptr ? ker::vfs::tmpfs::create_root_node_for(*private_root_owner)
+                                                     : ker::vfs::tmpfs::create_root_node();
         int tmpfs_error = 0;
         mount->private_data = ker::vfs::tmpfs::create_mount_context(root, data, ROOT_COMPAT, &tmpfs_error);
         if (mount->private_data == nullptr) {

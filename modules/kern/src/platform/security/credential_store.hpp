@@ -26,6 +26,7 @@ class CredentialStore {
         Transaction(const Transaction&) = delete;
         auto operator=(const Transaction&) -> Transaction& = delete;
         [[nodiscard]] auto current() const -> const Snapshot& { return m_store.m_snapshot; }
+        [[nodiscard]] auto observation() const -> Observation { return {m_store.m_snapshot, m_store.m_generation}; }
         [[nodiscard]] auto can_publish(const Snapshot& next) const -> bool {
             return next == current() || m_store.m_generation != UINT64_MAX;
         }

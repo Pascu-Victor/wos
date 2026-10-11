@@ -100,6 +100,15 @@ auto vfs_install_unpublished_filesystem_context(ker::mod::sched::task::Task& tas
 auto vfs_prepare_root_directory_view_as(ker::mod::sched::task::Task& task, const ker::mod::security::Snapshot& credentials,
                                         const char* physical_root, DirectoryViewRef& output) -> int;
 
+// Kernel private-root preparation from an exact retained opaque MNT reference.
+// Pin the current native TMPFS root with admitted search credentials, without
+// an ambient Task, historical path lookup, Host fallback or numeric join. The
+// output starts empty and remains unchanged on error. Temporary API owners may
+// allocate/block; caller protects its executor until ownership reaches output.
+// Release the returned pathless File outside publication/path locks.
+auto vfs_pin_private_mount_root_as(const mount_ns::NamespaceRef& scope, const ker::mod::security::Snapshot& credentials, File** output)
+    -> int;
+
 // Borrowed from a caller-retained snapshot, never from current Task state.
 // Root transfer support is a separate admission decision. Do not hide a retained
 // object behind that decision and accidentally select legacy pathname fallback.

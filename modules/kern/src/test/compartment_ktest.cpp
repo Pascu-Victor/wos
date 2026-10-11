@@ -23,6 +23,7 @@
 #include <platform/power/power.hpp>
 #include <platform/sched/compartment_lifecycle.hpp>
 #include <platform/sched/ipc_namespace.hpp>
+#include <platform/sched/native_creation_policy.hpp>
 #include <platform/sched/pid_namespace.hpp>
 #include <platform/sched/resource.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -6066,7 +6067,8 @@ void expect_construction_string(Task& child, uint64_t address, std::string_view 
     }
     KEXPECT_EQ(construction_byte(child, address + expected.size()), uint8_t{0});
 }
-void expect_construction_stack(Task& child, std::span<const std::string_view> argv, std::span<const std::string_view> envp, bool secure) {
+void expect_construction_stack(Task& child, std::span<const std::string_view> argv, std::span<const std::string_view> envp, bool secure,
+                               std::string_view executable_path = "/service") {
     auto const RSP = child.context.frame.rsp;
     KEXPECT_EQ(RSP % 16, uint64_t{0});
     KEXPECT_EQ(construction_word(child, RSP), static_cast<uint64_t>(argv.size()));
@@ -6142,7 +6144,7 @@ void expect_construction_stack(Task& child, std::span<const std::string_view> ar
             }
             case 31:
                 bit = 1U << 11;
-                expect_construction_string(child, VALUE, "/service");
+                expect_construction_string(child, VALUE, executable_path);
                 break;
             case 7:
                 bit = 1U << 12;
@@ -6418,6 +6420,389 @@ KTEST(CompartmentConstruction, InvalidLaunchArgumentsRefuseBeforeImageAndPreserv
     }
     KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
     KEXPECT_EQ(ipc::live_namespace_count(), IPC);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
+}
+
+namespace {
+struct NativeCreationFixture {
+    static constexpr uint64_t INTERPRETER_VADDR = 0x52000000;
+    ConstructionRoot source;
+    NativeTask creator;
+    NativeFile executable, interpreter;
+    std::array<std::string_view, 2> argv{"service", "payload"};
+    std::array<std::string_view, 1> envp{"MODE=private"};
+    std::array<process_exec::NativeCompartmentAsset, 2> assets;
+    std::array<process_exec::NativeCompartmentDescriptor, 1> descriptors;
+    process_exec::NativeCompartmentSpec spec;
+    auto prepare(uint32_t uid, uint8_t marker, bool dynamic = true) -> int {
+        int result = source.prepare(INTERPRETER_VADDR, marker, 8192, dynamic);
+        if (result != 0) return result;
+        creator.task->type = sched::task::TaskType::PROCESS;
+        security::Snapshot identity;
+        std::array<uint32_t, 2> groups{uid + 200, uid + 201};
+        result = security::Snapshot::restore_fields(
+            {.user = {uid, uid + 1, uid}, .group = {uid + 100, uid + 101, uid + 100}, .groups = groups}, identity);
+        if (result == 0) result = resource::initialize_credentials(*creator.task, identity);
+        if (result != 0) return result;
+        static_cast<void>(creator.task->exchange_creation_mask(027));
+        for (size_t i = 0; i < spec.policy.limits.size(); ++i) spec.policy.limits[i] = creator.task->resources.entries[i].limit;
+        executable = NativeFile(vfs::vfs_get_file_retain(source.source.task.get(), source.executable));
+        interpreter = NativeFile(vfs::vfs_get_file_retain(source.source.task.get(), source.interpreter));
+        if (!executable || !interpreter) return -EBADF;
+        assets = {{{executable.get(), "/app/service", 0555}, {interpreter.get(), "/ld.so", 0555}}};
+        descriptors = {{{executable.get(), 9}}};
+        spec.arguments = {.executable_path = "/app/service", .argv = argv, .envp = envp};
+        spec.assets = assets;
+        spec.descriptors = descriptors;
+        return 0;
+    }
+};
+struct NativeCreationProcess {
+    Task& executor;
+    Task* child{};
+    ~NativeCreationProcess() {
+        if (executor.owned_exec_arguments.load() != nullptr)
+            KEXPECT_TRUE(process_exec::abort_native_compartment_preparation(executor, child));
+    }
+    auto destroy() -> bool {
+        if (!process_exec::abort_native_compartment_preparation(executor, child)) return false;
+        child = nullptr;
+        return true;
+    }
+};
+auto creation_pending_drained(Task& task) -> bool {
+    return task.owned_exec_arguments.load() == nullptr && task.owned_exec_preparation.load() == nullptr &&
+           task.owned_unpublished_process.load() == nullptr && !task.unpublished_teardown_in_progress.load() &&
+           !task.exec_preparation_teardown_in_progress.load() && task.pending_process_reservations == nullptr &&
+           task.pending_fd_reservations == nullptr;
+}
+}  // namespace
+
+KTEST(CompartmentCreation, FreshNonrootRootsCopyAssetsAndKeepExplicitDescriptors) {
+    auto const PIDS = pid_ns::live_namespace_count(), IPC = ipc::live_namespace_count(), MOUNTS = mount_ns::live_namespace_count();
+    auto const THREADS = threading::get_active_thread_count();
+    {
+        NativeCreationFixture first, second;
+        KREQUIRE_EQ(first.prepare(710, 51), 0);
+        KREQUIRE_EQ(second.prepare(810, 61), 0);
+        NativeCreationProcess left{*first.creator.task}, right{*second.creator.task};
+        int error = 99;
+        left.child = process_exec::prepare_native_compartment_for_owner(left.executor, first.spec, error);
+        KREQUIRE_EQ(error, 0);
+        KREQUIRE_TRUE(left.child != nullptr);
+        right.child = process_exec::prepare_native_compartment_for_owner(right.executor, second.spec, error);
+        KREQUIRE_EQ(error, 0);
+        KREQUIRE_TRUE(right.child != nullptr);
+        KEXPECT_FALSE(*left.child->mount_namespace() == *right.child->mount_namespace());
+        for (auto* process : {&left, &right}) {
+            auto& child = *process->child;
+            auto& fixture = process == &left ? first : second;
+            KEXPECT_EQ(child.namespace_tid(), uint32_t{1});
+            KEXPECT_EQ(child.job_identity_snapshot().visible.session_id, uint64_t{1});
+            KEXPECT_EQ(child.job_identity_snapshot().visible.pgid, uint64_t{1});
+            KEXPECT_EQ(child.job_identity().session_id, child.pid);
+            KEXPECT_EQ(child.job_identity().pgid, child.pid);
+            KEXPECT_EQ(child.controlling_terminal(), security::TerminalIdentity{});
+            KEXPECT_EQ(child.creation_mask(), uint32_t{027});
+            KEXPECT_TRUE(child.credentials().no_new_privileges());
+            KEXPECT_TRUE(child.credentials().service_privileges_locked());
+            KEXPECT_TRUE(child.credentials().user() == fixture.creator.task->credentials().user());
+            KEXPECT_TRUE(child.credentials().group() == fixture.creator.task->credentials().group());
+            KEXPECT_EQ(child.pid_namespace()->network(), Network::DENIED);
+            KEXPECT_EQ(child.fd_table.size(), size_t{1});
+            KEXPECT_TRUE(child.fd_table.lookup(9) == fixture.executable.get());
+            KEXPECT_NULL(child.fd_table.lookup(0));
+            vfs::Stat root{}, image{};
+            KEXPECT_EQ(vfs::vfs_statat(&child, vfs::AT_FDCWD, "/", 0, &root), 0);
+            KEXPECT_EQ(vfs::vfs_statat(&child, vfs::AT_FDCWD, "/app/service", 0, &image), 0);
+            KEXPECT_EQ(root.st_uid, child.credentials().user().effective);
+            KEXPECT_EQ(root.st_gid, child.credentials().group().effective);
+            KEXPECT_EQ(image.st_uid, root.st_uid);
+            KEXPECT_EQ(image.st_gid, root.st_gid);
+            KEXPECT_EQ(image.st_mode & 0777U, uint32_t{0555});
+            expect_construction_stack(child, fixture.spec.arguments.argv, fixture.spec.arguments.envp, true, "/app/service");
+            uint8_t const ORIGINAL = process == &left ? 51 : 61;
+            KEXPECT_EQ(construction_byte(child, CONSTRUCTION_MAIN + 1024), ORIGINAL);
+            KEXPECT_EQ(child.context.frame.rip, child.interp_base + NativeCreationFixture::INTERPRETER_VADDR + 1024);
+            KEXPECT_EQ(construction_byte(child, child.context.frame.rip), uint8_t(ORIGINAL + 1));
+            uint8_t changed = 99;
+            KEXPECT_EQ(vfs::vfs_pwrite_file(fixture.executable.get(), &changed, 1, 1024), ssize_t{1});
+            KEXPECT_EQ(construction_byte(child, CONSTRUCTION_MAIN + 1024), ORIGINAL);
+            uint8_t imported = 0;
+            KEXPECT_EQ(vfs::vfs_pread_file(child.exec_image_file, &imported, 1, 1024), ssize_t{1});
+            KEXPECT_EQ(imported, ORIGINAL);
+            // Explicit sharing sees source updates; copied root bytes remain private.
+            KEXPECT_EQ(vfs::vfs_pread_file(static_cast<vfs::File*>(child.fd_table.lookup(9)), &imported, 1, 1024), ssize_t{1});
+            KEXPECT_EQ(imported, changed);
+            KEXPECT_FALSE(child.scheduler_published.load());
+            KEXPECT_TRUE(process->executor.owned_exec_arguments.load() != nullptr);
+        }
+        KEXPECT_TRUE(left.destroy());
+        KEXPECT_TRUE(right.destroy());
+        KEXPECT_TRUE(creation_pending_drained(*first.creator.task));
+        KEXPECT_TRUE(creation_pending_drained(*second.creator.task));
+        KEXPECT_EQ(first.creator.task->ref_count.load(), uint32_t{1});
+        KEXPECT_EQ(second.creator.task->ref_count.load(), uint32_t{1});
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
+    KEXPECT_EQ(ipc::live_namespace_count(), IPC);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
+    KEXPECT_EQ(threading::get_active_thread_count(), THREADS);
+}
+
+KTEST(CompartmentCreation, CanonicalCreatorObservationRejectsChangedPolicyAndThreadCopies) {
+    NativeCreationFixture fixture;
+    KREQUIRE_EQ(fixture.prepare(710, 51, false), 0);
+    auto& source = *fixture.creator.task;
+    fixture.spec.policy.limits[static_cast<unsigned>(abi::resource::Id::NOFILE)] = {12, 12};
+    resource::NativeCreatorPolicy captured;
+    KREQUIRE_EQ(resource::capture_native_creator_policy(source, fixture.spec.policy, captured), 0);
+    KEXPECT_TRUE(captured.observed.credentials == source.credentials());
+    KEXPECT_EQ(resource::revalidate_native_creator_policy(source, captured), 0);
+    static_cast<void>(source.exchange_creation_mask(077));
+    KEXPECT_EQ(resource::revalidate_native_creator_policy(source, captured), -EAGAIN);
+    KREQUIRE_EQ(resource::capture_native_creator_policy(source, fixture.spec.policy, captured), 0);
+    auto const NOFILE = static_cast<unsigned>(abi::resource::Id::NOFILE);
+    uint64_t flags = source.resource_lock.lock_irqsave();
+    source.resources.entries[NOFILE].limit = {64, 64};
+    source.resource_lock.unlock_irqrestore(flags);
+    KEXPECT_EQ(resource::revalidate_native_creator_policy(source, captured), -EAGAIN);
+    KREQUIRE_EQ(resource::capture_native_creator_policy(source, fixture.spec.policy, captured), 0);
+    security::Snapshot changed;
+    KREQUIRE_EQ(security::Snapshot::restore_fields({.user = {710, 712, 710}, .group = {810, 811, 810}}, changed), 0);
+    KREQUIRE_EQ(resource::initialize_credentials(source, changed), 0);
+    KEXPECT_EQ(resource::revalidate_native_creator_policy(source, captured), -EAGAIN);
+    NativeTask thread;
+    thread.task->is_thread = true;
+    thread.task->owner_pid = source.pid;
+    thread.task->type = sched::task::TaskType::PROCESS;
+    KREQUIRE_TRUE(resource::bind_thread_owner(*thread.task, source));
+    auto const REFS = source.ref_count.load();
+    NativeCreationProcess process{*thread.task};
+    int error = 99;
+    process.child = process_exec::prepare_native_compartment_for_owner(process.executor, fixture.spec, error);
+    KREQUIRE_EQ(error, 0);
+    KREQUIRE_TRUE(process.child != nullptr);
+    KEXPECT_TRUE(process.child->credentials().user() == source.credentials().user());
+    KEXPECT_TRUE(process.child->credentials().group() == source.credentials().group());
+    KEXPECT_EQ(process.child->creation_mask(), uint32_t{077});
+    KEXPECT_NULL(source.owned_unpublished_process.load());
+    KEXPECT_TRUE(process.executor.owned_unpublished_process.load() == process.child);
+    KEXPECT_EQ(source.ref_count.load(), REFS + 1);
+    KEXPECT_TRUE(process.destroy());
+    KEXPECT_EQ(source.ref_count.load(), REFS);
+    KEXPECT_TRUE(creation_pending_drained(process.executor));
+}
+
+KTEST(CompartmentCreation, FailedImportsAndTransferredRecoveryDrainEveryPreparationOwner) {
+    using Fault = process_exec::NativeConstructionFault;
+    auto const PIDS = pid_ns::live_namespace_count(), IPC = ipc::live_namespace_count(), MOUNTS = mount_ns::live_namespace_count();
+    auto const THREADS = threading::get_active_thread_count();
+    for (auto const FAULT :
+         {Fault::CREATION_STATE, Fault::CREATION_RESERVATION, Fault::CREATION_ROOT, Fault::CREATION_IMPORT_BUFFER,
+          Fault::CREATION_IMPORT_READ, Fault::CREATION_DESCRIPTORS, Fault::CREATION_RECOVERY_IMPORT, Fault::CREATION_RECOVERY_BUILT}) {
+        NativeCreationFixture fixture;
+        KREQUIRE_EQ(fixture.prepare(710, 51), 0);
+        auto& executor = *fixture.creator.task;
+        auto mount = scoped_mount(fixture.source.mounts.first, "/");
+        KREQUIRE_TRUE(mount);
+        auto const BUSY = mount->open_files.load();
+        auto const REFS = fixture.executable->refcount.load();
+        auto const PRIVATE_PIDS = pid_ns::live_namespace_count(), PRIVATE_IPC = ipc::live_namespace_count();
+        auto const PRIVATE_MOUNTS = mount_ns::live_namespace_count();
+        abi::resource::Usage before{}, after{};
+        resource::copy_process_observation(executor, before);
+        process_exec::exec_selftest_fail_native_construction_once(FAULT);
+        NativeCreationProcess process{executor};
+        int error = 99;
+        process.child = process_exec::prepare_native_compartment_for_owner(executor, fixture.spec, error);
+        process_exec::exec_selftest_fail_native_construction_once(Fault::NONE);
+        KEXPECT_NULL(process.child);
+        int const EXPECTED = FAULT == Fault::CREATION_IMPORT_READ                                                  ? -EIO
+                             : FAULT == Fault::CREATION_RECOVERY_IMPORT || FAULT == Fault::CREATION_RECOVERY_BUILT ? -ECANCELED
+                                                                                                                   : -ENOMEM;
+        KEXPECT_EQ(error, EXPECTED);
+        KEXPECT_TRUE(creation_pending_drained(executor));
+        KEXPECT_EQ(executor.ref_count.load(), uint32_t{1});
+        KEXPECT_EQ(fixture.executable->refcount.load(), REFS);
+        KEXPECT_EQ(mount->open_files.load(), BUSY);
+        KEXPECT_EQ(pid_ns::live_namespace_count(), PRIVATE_PIDS);
+        KEXPECT_EQ(ipc::live_namespace_count(), PRIVATE_IPC);
+        KEXPECT_EQ(mount_ns::live_namespace_count(), PRIVATE_MOUNTS);
+        KEXPECT_EQ(threading::get_active_thread_count(), THREADS);
+        resource::copy_process_observation(executor, after);
+        KEXPECT_EQ(after.current, before.current);
+        uint8_t marker = 51;
+        KEXPECT_EQ(vfs::vfs_pwrite_file(fixture.executable.get(), &marker, 1, 1024), ssize_t{1});
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
+    KEXPECT_EQ(ipc::live_namespace_count(), IPC);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
+}
+
+KTEST(CompartmentCreation, InvalidCapabilitiesPathsAndBudgetsRefuseWithoutLeakingRoots) {
+    auto const THREADS = threading::get_active_thread_count();
+    for (unsigned mode = 0; mode < 13; ++mode) {
+        NativeCreationFixture fixture;
+        KREQUIRE_EQ(fixture.prepare(710, 51), 0);
+        NativeFile unreadable;
+        int expected = -EINVAL;
+        switch (mode) {
+            case 0:
+                fixture.assets[0].destination = "/app/../service";
+                break;
+            case 1:
+                fixture.assets[1].destination = fixture.assets[0].destination;
+                expected = -EEXIST;
+                break;
+            case 2:
+                fixture.assets[0].mode = 04755;
+                break;
+            case 3:
+                fixture.spec.root_bytes = 8192;
+                expected = -E2BIG;
+                break;
+            case 4:
+                fixture.spec.policy.limits[static_cast<unsigned>(abi::resource::Id::FSIZE)] = {8191, 8191};
+                expected = -EFBIG;
+                break;
+            case 5:
+                fixture.spec.policy.limits[static_cast<unsigned>(abi::resource::Id::NOFILE)] = {9, 9};
+                expected = -EMFILE;
+                break;
+            case 6:
+                fixture.spec.policy.limits[static_cast<unsigned>(abi::resource::Id::NPROC)] = {0, 0};
+                expected = -EAGAIN;
+                break;
+            case 7:
+                fixture.spec.policy.authority_ceiling = uint64_t{1} << static_cast<unsigned>(security::Authority::KERNEL_DEBUG);
+                expected = -EPERM;
+                break;
+            case 8:
+                fixture.spec.arguments.executable_path = "/missing";
+                expected = -ENOENT;
+                break;
+            case 9:
+                fixture.spec.policy.network = static_cast<Network>(99);
+                break;
+            case 10:
+                fixture.assets[0].destination = std::string_view("/bad\0path", 9);
+                break;
+            case 11: {
+                int const FD =
+                    fixture.source.source.track(vfs::vfs_openat(fixture.source.source.task.get(), vfs::AT_FDCWD, "/service", 1, 0));
+                KREQUIRE_TRUE(FD >= 0);
+                unreadable = NativeFile(vfs::vfs_get_file_retain(fixture.source.source.task.get(), FD));
+                KREQUIRE_TRUE(unreadable);
+                fixture.assets[0].source = unreadable.get();
+                expected = -EBADF;
+                break;
+            }
+            case 12:
+                expected = -ENOTSUP;
+                break;
+        }
+        auto const PIDS = pid_ns::live_namespace_count(), IPC = ipc::live_namespace_count(), MOUNTS = mount_ns::live_namespace_count();
+        auto const REFS = fixture.executable->refcount.load();
+        NativeCreationProcess process{mode == 12 ? *fixture.source.source.task : *fixture.creator.task};
+        int error = 99;
+        process.child = process_exec::prepare_native_compartment_for_owner(process.executor, fixture.spec, error);
+        KEXPECT_NULL(process.child);
+        KEXPECT_EQ(error, expected);
+        KEXPECT_TRUE(creation_pending_drained(process.executor));
+        KEXPECT_EQ(process.executor.ref_count.load(), uint32_t{1});
+        KEXPECT_EQ(fixture.executable->refcount.load(), REFS);
+        KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
+        KEXPECT_EQ(ipc::live_namespace_count(), IPC);
+        KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
+        KEXPECT_EQ(threading::get_active_thread_count(), THREADS);
+    }
+}
+
+KTEST(CompartmentCreation, EmptyDescriptorTableAndExplicitNetworkGrantPreserveAdmission) {
+    auto const PIDS = pid_ns::live_namespace_count(), IPC = ipc::live_namespace_count(), MOUNTS = mount_ns::live_namespace_count();
+    auto const THREADS = threading::get_active_thread_count();
+    {
+        NativeCreationFixture fixture;
+        KREQUIRE_EQ(fixture.prepare(710, 51, false), 0);
+        fixture.spec.descriptors = {};
+        fixture.spec.policy.limits[static_cast<unsigned>(abi::resource::Id::NOFILE)] = {0, 0};
+        fixture.spec.policy.network = Network::SHARED_HOST;
+        NativeCreationProcess process{*fixture.creator.task};
+        int error = 99;
+        process.child = process_exec::prepare_native_compartment_for_owner(process.executor, fixture.spec, error);
+        KREQUIRE_EQ(error, 0);
+        KREQUIRE_TRUE(process.child != nullptr);
+        KEXPECT_EQ(process.child->pid_namespace()->network(), Network::SHARED_HOST);
+        KEXPECT_EQ(process.child->fd_table.size(), size_t{0});
+        KEXPECT_EQ(process.child->fd_table.reserved_count(), size_t{0});
+        KEXPECT_FALSE(process.child->credentials().allows(security::Authority::NETWORK_ADMIN));
+        KEXPECT_FALSE(process.child->credentials().allows(security::Authority::KERNEL_DEBUG));
+        expect_construction_stack(*process.child, fixture.argv, fixture.envp, true, "/app/service");
+        KEXPECT_TRUE(process.destroy());
+        KEXPECT_TRUE(creation_pending_drained(process.executor));
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
+    KEXPECT_EQ(ipc::live_namespace_count(), IPC);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
+    KEXPECT_EQ(threading::get_active_thread_count(), THREADS);
+}
+
+KTEST(CompartmentCreation, ExactPrivateRootPinRejectsHostClosedAndUnreadableScopes) {
+    auto const MOUNTS = mount_ns::live_namespace_count();
+    {
+        PrivateMounts views;
+        KREQUIRE_EQ(mount_ns::create_namespace(views.first), 0);
+        KREQUIRE_EQ(private_mount(views.first, "/"), 0);
+        auto const ROOT = security::Snapshot::bootstrap_root();
+        vfs::File* raw = nullptr;
+        mount_ns::NamespaceRef host;
+        KEXPECT_EQ(vfs::vfs_pin_private_mount_root_as(host, ROOT, &raw), -EINVAL);
+        KEXPECT_NULL(raw);
+        KREQUIRE_EQ(vfs::vfs_pin_private_mount_root_as(views.first, ROOT, &raw), 0);
+        NativeFile pin(raw);
+        KEXPECT_NULL(pin->vfs_path);
+        KEXPECT_TRUE(pin->mount_owner != nullptr && pin->mount_owner->namespace_owner == views.first);
+        KEXPECT_EQ(vfs::vfs_pin_private_mount_root_as(views.first, ROOT, &raw), -EINVAL);
+        KEXPECT_TRUE(raw == pin.get());
+        NativeTask writer, foreign;
+        KREQUIRE_TRUE(writer.task->initialize_mount_namespace(views.first));
+        KREQUIRE_EQ(mount_ns::create_namespace(views.second), 0);
+        KREQUIRE_EQ(private_mount(views.second, "/"), 0);
+        KREQUIRE_TRUE(foreign.task->initialize_mount_namespace(views.second));
+        vfs::DirectoryViewRef view;
+        KREQUIRE_EQ(vfs::vfs_prepare_directory_view(ROOT, pin.get(), pin.get(), {}, view), 0);
+        raw = nullptr;
+        KEXPECT_EQ(vfs::vfs_pin_directory_resolved_beneath_as(*writer.task, ROOT, "/", "/", &raw), -ENOTSUP);
+        KEXPECT_NULL(raw);
+        KREQUIRE_EQ(vfs::vfs_mkdirat(writer.task.get(), vfs::AT_FDCWD, "/dir", 0755), 0);
+        raw = nullptr;
+        KREQUIRE_EQ(vfs::vfs_open_directory_view_as(*writer.task, ROOT, view, "dir/file", vfs::O_CREAT | vfs::O_EXCL | 2, 0600, &raw), 0);
+        NativeFile created(raw);
+        uint8_t marker = 73;
+        KEXPECT_EQ(vfs::vfs_pwrite_file(created.get(), &marker, 1, 0), ssize_t{1});
+        raw = nullptr;
+        KREQUIRE_EQ(vfs::vfs_open_directory_view_as(*writer.task, ROOT, view, "dir/file", 0, 0, &raw), 0);
+        NativeFile opened(raw);
+        KEXPECT_TRUE(opened->mount_owner != nullptr && opened->mount_owner->namespace_owner == views.first);
+        marker = 0;
+        KEXPECT_EQ(vfs::vfs_pread_file(opened.get(), &marker, 1, 0), ssize_t{1});
+        KEXPECT_EQ(marker, uint8_t{73});
+        raw = nullptr;
+        KEXPECT_EQ(vfs::vfs_open_directory_view_as(*foreign.task, ROOT, view, "dir/file", 0, 0, &raw), -EXDEV);
+        KEXPECT_NULL(raw);
+        KREQUIRE_EQ(vfs::vfs_fchmod_file_as(pin.get(), ROOT, 0700), 0);
+        security::Snapshot ordinary;
+        KREQUIRE_EQ(security::Snapshot::restore_fields({.user = {700, 700, 700}, .group = {800, 800, 800}}, ordinary), 0);
+        raw = nullptr;
+        KEXPECT_EQ(vfs::vfs_pin_private_mount_root_as(views.first, ordinary, &raw), -EACCES);
+        KEXPECT_NULL(raw);
+        views.first.close();
+        KEXPECT_EQ(vfs::vfs_pin_private_mount_root_as(views.first, ROOT, &raw), -EIDRM);
+        KEXPECT_NULL(raw);
+        KEXPECT_EQ(vfs::vfs_open_directory_view_as(*writer.task, ROOT, view, "dir/file", 0, 0, &raw), -EIDRM);
+        KEXPECT_NULL(raw);
+    }
     KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
 }
 

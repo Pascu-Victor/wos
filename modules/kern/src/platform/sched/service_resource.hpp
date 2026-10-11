@@ -117,6 +117,7 @@ auto syscall_service_read(uint64_t slot, uint64_t address, uint64_t version) -> 
 #ifdef WOS_SELFTEST
 auto selftest_service_management_authority() -> bool;
 auto selftest_service_lifecycle() -> bool;
+auto selftest_native_creator_service_policy() -> bool;
 auto selftest_remote_service_accounting_lifecycle() -> bool;
 auto selftest_service_report_targets() -> bool;
 auto selftest_service_observation_merge() -> bool;

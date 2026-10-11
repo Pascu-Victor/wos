@@ -6,6 +6,7 @@
 #include <bits/ssize_t.h>
 #include <extern/elf.h>
 
+#include <platform/sched/native_creation_policy.hpp>
 #include <platform/sched/resource.hpp>
 #include <platform/sched/resource_as.hpp>
 #include <platform/sched/resource_process.hpp>
@@ -59,6 +60,7 @@
 #include <vfs/filesystem_context.hpp>
 #include <vfs/fs/devfs.hpp>
 #include <vfs/fs/tmpfs.hpp>
+#include <vfs/fs/xfs/xfs_vfs.hpp>
 #include <vfs/mount.hpp>
 #include <vfs/vfs.hpp>
 
@@ -1565,6 +1567,51 @@ struct WorkerExecHandoff {
 
 // Native exec publishes this owner before faulting usercopy. Recursion never
 // owns a forwarded vector or its inline strings only on an abandoned stack.
+namespace {
+// Every owner here survives an abandoned creation stack through the executor's
+// existing arguments slot. A prepared child must retire before this root does.
+struct NativeCompartmentPreparation {
+    static constexpr size_t ASSET_MAX = 64;
+    static constexpr size_t DESCRIPTOR_MAX = 256;
+    struct Asset {
+        vfs::File* source{};
+        std::array<char, EXEC_PATH_MAX> path{};
+        uint32_t mode{};
+        vfs::Stat stat{};
+    };
+    struct Descriptor {
+        vfs::File* source{};
+        unsigned destination{};
+    };
+    mod::sched::task::Task& executor;
+    mod::sched::task::Task* creator{};
+    mod::sched::task::Task* child{};
+    mod::sched::resource::NativeCreatorPolicy policy;
+    mod::sched::resource::State resources;
+    std::unique_ptr<mod::sched::resource::ProcessReservation> reservation;
+    NativeProcessContext context;
+    vfs::PreparedMount mount;
+    std::unique_ptr<mod::sched::task::Task> populator;
+    vfs::File* root_pin{};
+    vfs::DirectoryViewRef view;
+    vfs::PreparedFilesystemContext filesystem;
+    std::array<Asset, ASSET_MAX> assets{};
+    std::array<Descriptor, DESCRIPTOR_MAX> descriptors{};
+    size_t asset_count{};
+    size_t descriptor_count{};
+    std::unique_ptr<uint8_t[]> buffer;
+    vfs::File* target{};
+    vfs::File* executable{};
+    vfs::Stat executable_stat{};
+    uint64_t kernel_rsp{};
+    std::array<std::string_view, DESCRIPTOR_MAX> argv{}, envp{};
+    NativeProcessArguments arguments;
+    uint64_t root_bytes{};
+    explicit NativeCompartmentPreparation(mod::sched::task::Task& owner) : executor(owner) {}
+    ~NativeCompartmentPreparation();
+};
+}  // namespace
+
 class ExecRequestArguments {
    public:
     ExecArgumentsSnapshot snapshot;
@@ -1575,6 +1622,8 @@ class ExecRequestArguments {
     std::unique_ptr<RemoteExecPlan> remote;
     uint32_t remote_proxy_id{};
     bool remote_worker_committed{};
+    std::unique_ptr<NativeCompartmentPreparation> compartment;
+    bool native_compartment_request{};
 
     // Scratch for each recursive native loader invocation. Persistent executable
     // bytes leave prepared_elf through take_task_metadata(); pagemap/Thread belong
@@ -3571,6 +3620,13 @@ class NativeConstructionExecutorGuard {
     NativeConstructionExecutorGuard(const NativeConstructionExecutorGuard&) = delete;
     auto operator=(const NativeConstructionExecutorGuard&) -> NativeConstructionExecutorGuard& = delete;
     [[nodiscard]] auto acquired() const -> bool { return m_acquired; }
+    // The receiving input transaction assumes this exact flag without a gap.
+    // Failure leaves ownership here; only the native builder may use this seam.
+    auto transfer_to(mod::sched::task::Task& owner) -> bool {
+        if (!m_acquired || m_owner != &owner || !owner.unpublished_teardown_in_progress.load(std::memory_order_acquire)) return false;
+        m_acquired = false;
+        return true;
+    }
 
    private:
     mod::sched::task::Task* m_owner;
@@ -3786,8 +3842,8 @@ auto create_native_process_task_impl(mod::sched::task::Task* owner, const Native
                                      vfs::File* owned_file, size_t file_size, const vfs::Stat& file_stat, uint64_t kernel_rsp,
                                      const mod::sched::resource::State& resources, const mod::security::Snapshot& credentials,
                                      mod::sched::resource::ProcessReservation& reservation,
-                                     mod::sched::resource::State* failure_observations, int* construction_error)
-    -> mod::sched::task::Task* {
+                                     mod::sched::resource::State* failure_observations, int* construction_error,
+                                     NativeConstructionExecutorGuard* transferred_guard = nullptr) -> mod::sched::task::Task* {
     if (construction_error != nullptr) *construction_error = 0;
     bool input_guard = false;
     auto refuse_inputs = [&](int error) -> mod::sched::task::Task* {
@@ -3799,8 +3855,10 @@ auto create_native_process_task_impl(mod::sched::task::Task* owner, const Native
     };
     if (owner == nullptr) return refuse_inputs(-ESRCH);
     bool expected = false;
-    if (!owner->unpublished_teardown_in_progress.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
-        return refuse_inputs(-EBUSY);
+    bool const ACQUIRED = transferred_guard != nullptr
+                              ? transferred_guard->transfer_to(*owner)
+                              : owner->unpublished_teardown_in_progress.compare_exchange_strong(expected, true, std::memory_order_acq_rel);
+    if (!ACQUIRED) return refuse_inputs(-EBUSY);
     input_guard = true;
     if (owner->exit_in_progress.load(std::memory_order_acquire) || owner->has_exited ||
         owner->state.load(std::memory_order_acquire) != mod::sched::task::TaskState::ACTIVE)
@@ -3809,6 +3867,7 @@ auto create_native_process_task_impl(mod::sched::task::Task* owner, const Native
     if (context.ipc.closed() || context.mounts.closed() || context.pids.closed()) return refuse_inputs(-EIDRM);
     if (context.ipc.is_host() || context.mounts.is_host() || context.pids.is_host() || context.filesystem == nullptr)
         return refuse_inputs(-EINVAL);
+    if ((context.service_creator == nullptr) != (context.creator_policy == nullptr)) return refuse_inputs(-EINVAL);
     if (name == nullptr || owned_file == nullptr || kernel_rsp < mod::mm::KERNEL_STACK_SIZE || file_stat.st_size <= 0 ||
         static_cast<size_t>(file_stat.st_size) != file_size)
         return refuse_inputs(-EINVAL);
@@ -3851,6 +3910,12 @@ auto create_native_process_task_impl(mod::sched::task::Task* owner, const Native
         return abort_child(-EIDRM);
     if (int const ERROR = vfs::vfs_install_unpublished_filesystem_context(*child, *context.filesystem); ERROR != 0)
         return abort_child(ERROR);
+    if (context.service_creator != nullptr) {
+        if (int const ERROR =
+                mod::sched::resource::attach_native_creation_service(*child, *context.service_creator, *context.creator_policy);
+            ERROR != 0)
+            return abort_child(ERROR);
+    }
 
     // The lease wrapper has temporary backend owners of its own. Defer fatal
     // exit until it has published the replacement File or retired its candidate.
@@ -3972,6 +4037,238 @@ auto create_native_process_task_impl(mod::sched::task::Task* owner, const Native
         ERROR != 0)
         return abort_child(ERROR);
     return child;
+}
+
+NativeCompartmentPreparation::~NativeCompartmentPreparation() {
+    if (child != nullptr && executor.owned_unpublished_process.load(std::memory_order_acquire) == child) [[unlikely]] {
+        mod::dbg::panic_handler("native creation: root retired before unpublished child");
+        hcf();
+    }
+    auto drop = [](vfs::File*& file) {
+        if (auto* owned = std::exchange(file, nullptr); owned != nullptr) vfs::vfs_put_file(owned);
+    };
+    drop(target);
+    drop(executable);
+    for (auto& asset : assets) drop(asset.source);
+    for (auto& descriptor : descriptors) drop(descriptor.source);
+    if (kernel_rsp != 0) mod::mm::phys::page_free(reinterpret_cast<void*>(kernel_rsp - mod::mm::KERNEL_STACK_SIZE));
+    filesystem = {};
+    view = {};
+    drop(root_pin);
+    populator.reset();
+    vfs::finish_prepared_mount(&mount);
+    if (!context.mounts.is_host()) {
+        int const RETIRED = vfs::retire_mount_namespace(context.mounts);
+        if (RETIRED != 0) [[unlikely]] {
+            mod::dbg::panic_handler("native creation: private root retirement failed");
+            hcf();
+        }
+    }
+    context.mounts.reset();
+    context.ipc.close();
+    context.ipc.reset();
+    context.pids.close();
+    context.pids.reset();
+    reservation.reset();
+    if (creator != nullptr) creator->release();
+}
+
+auto validate_native_asset_path(std::string_view path) -> int {
+    if (path.size() < 2 || path.size() >= EXEC_PATH_MAX || path.data() == nullptr || path.front() != '/' || path.back() == '/' ||
+        std::memchr(path.data(), '\0', path.size()) != nullptr)
+        return -EINVAL;
+    size_t start = 1, depth = 0;
+    for (size_t end = 1; end <= path.size(); ++end) {
+        if (end != path.size() && path[end] != '/') continue;
+        auto const NAME = path.substr(start, end - start);
+        if (NAME.empty() || NAME == "." || NAME == "..") return -EINVAL;
+        if (NAME.size() >= 256 || ++depth > 16) return -ENAMETOOLONG;
+        start = end + 1;
+    }
+    return 0;
+}
+
+auto native_regular_capability(vfs::File* file, bool readable, vfs::Stat& stat) -> int {
+    if (file == nullptr) return -EBADF;
+    int const ACCESS = file->open_flags & 3;
+    if (ACCESS > 2 || (readable && ACCESS == 1)) return -EBADF;
+    if (file->is_directory || !((file->fs_type == vfs::FSType::TMPFS && file->fops == vfs::tmpfs::get_tmpfs_fops()) ||
+                                (file->fs_type == vfs::FSType::XFS && file->fops == vfs::xfs::get_xfs_fops())))
+        return -ENOTSUP;
+    int const STATUS = vfs::vfs_fstat_file(file, &stat);
+    if (STATUS != 0) return STATUS;
+    return (stat.st_mode & vfs::S_IFMT) == vfs::S_IFREG && stat.st_size >= 0 ? 0 : -ENOTSUP;
+}
+
+auto capture_native_compartment_inputs(NativeCompartmentPreparation& root, ExecRequestArguments& request, const NativeCompartmentSpec& spec)
+    -> int {
+    using Preparation = NativeCompartmentPreparation;
+    if (spec.assets.empty() || spec.assets.size() > Preparation::ASSET_MAX || spec.assets.data() == nullptr ||
+        spec.descriptors.size() > Preparation::DESCRIPTOR_MAX || (!spec.descriptors.empty() && spec.descriptors.data() == nullptr) ||
+        spec.root_bytes < 4096 || spec.root_bytes > 32 * 1024 * 1024 || spec.root_bytes % 4096 != 0)
+        return -EINVAL;
+    root.root_bytes = spec.root_bytes;
+    {
+        // This temporary retained thread owner is released while the executor
+        // guard is held; only root.creator survives the image-building call.
+        mod::sched::resource::Owner owner(&root.executor);
+        auto* source = owner.get();
+        if (source == nullptr || !source->try_acquire()) return -ESRCH;
+        root.creator = source;
+        int const STATUS = mod::sched::resource::capture_native_creator_policy(*source, spec.policy, root.policy);
+        if (STATUS != 0) return STATUS;
+    }
+    for (size_t i = 0; i < root.policy.admitted.limits.size(); ++i) root.resources.entries[i].limit = root.policy.admitted.limits[i];
+    // Keep the public process image name complete; Task's observation field is
+    // smaller than the private argument/import path buffer. Never truncate it.
+    if (spec.arguments.executable_path.size() >= root.creator->exe_path.size()) return -ENAMETOOLONG;
+    auto* scratch = request.native_scratch(0);
+    int const ARGUMENTS = capture_native_arguments(&spec.arguments, request, *scratch);
+    if (ARGUMENTS != 0) return ARGUMENTS;
+    if (int const PATH = validate_native_asset_path(spec.arguments.executable_path); PATH != 0) return PATH;
+    for (size_t i = 0; i < scratch->argv_count; ++i) root.argv[i] = request.snapshot.argv[i];
+    for (size_t i = 0; i < scratch->envp_count; ++i) root.envp[i] = request.snapshot.envp[i];
+    root.arguments = {.executable_path = request.snapshot.path.data(),
+                      .argv = {root.argv.data(), scratch->argv_count},
+                      .envp = {root.envp.data(), scratch->envp_count}};
+    bool executable = false;
+    for (auto const& input : spec.assets) {
+        if (int const PATH = validate_native_asset_path(input.destination); PATH != 0) return PATH;
+        if ((input.mode & ~0777U) != 0) return -EINVAL;
+        for (size_t i = 0; i < root.asset_count; ++i)
+            if (input.destination == root.assets[i].path.data()) return -EEXIST;
+        auto& asset = root.assets[root.asset_count++];
+        std::memcpy(asset.path.data(), input.destination.data(), input.destination.size());
+        asset.mode = input.mode;
+        if (input.source == nullptr) return -EBADF;
+        vfs::vfs_retain_file(input.source);
+        asset.source = input.source;
+        executable |= input.destination == root.arguments.executable_path;
+    }
+    if (!executable) return -ENOENT;
+    auto const NOFILE = root.policy.admitted.limits[static_cast<unsigned>(mod::sched::resource::Id::NOFILE)].soft;
+    for (auto const& input : spec.descriptors) {
+        if (input.destination >= mod::sched::task::Task::FD_TABLE_SIZE || input.destination >= NOFILE) return -EMFILE;
+        for (size_t i = 0; i < root.descriptor_count; ++i)
+            if (input.destination == root.descriptors[i].destination) return -EEXIST;
+        if (input.source == nullptr) return -EBADF;
+        auto& descriptor = root.descriptors[root.descriptor_count++];
+        descriptor.destination = input.destination;
+        vfs::vfs_retain_file(input.source);
+        descriptor.source = input.source;
+    }
+    return 0;
+}
+
+auto populate_native_compartment_root(NativeCompartmentPreparation& root) -> int {
+#ifdef WOS_SELFTEST
+    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::CREATION_RESERVATION)) return -ENOMEM;
+#endif
+    // The private validated limits include both the live creator and requested
+    // NPROC limit. The reservation is owned before root allocation or import IO.
+    root.reservation.reset(new (std::nothrow)
+                               mod::sched::resource::ProcessReservation(root.resources, root.policy.admitted.credentials.user().real));
+    if (!root.reservation) return -ENOMEM;
+    if (root.reservation->result() != 0) return root.reservation->result();
+    uint64_t bytes = 0;
+    uint64_t const FSIZE = root.policy.admitted.limits[static_cast<unsigned>(mod::sched::resource::Id::FSIZE)].soft;
+    for (size_t i = 0; i < root.asset_count; ++i) {
+        auto& asset = root.assets[i];
+        if (int const STATUS = native_regular_capability(asset.source, true, asset.stat); STATUS != 0) return STATUS;
+        if (static_cast<uint64_t>(asset.stat.st_size) > FSIZE) return -EFBIG;
+        if (static_cast<uint64_t>(asset.stat.st_size) > root.root_bytes) return -E2BIG;
+        // Stable native descriptions pin a lease/copy. Mutable source writes
+        // cannot change bytes halfway through an admitted root import.
+        if (int const STATUS = vfs::vfs_stabilize_exec_file(&asset.source); STATUS != 0) return STATUS;
+        if (int const STATUS = vfs::vfs_fstat_file(asset.source, &asset.stat); STATUS != 0) return STATUS;
+        if (asset.stat.st_size < 0 || static_cast<uint64_t>(asset.stat.st_size) > FSIZE) return -EFBIG;
+        if (static_cast<uint64_t>(asset.stat.st_size) > root.root_bytes) return -E2BIG;
+        uint64_t const PAGES = (static_cast<uint64_t>(asset.stat.st_size) + 4095) / 4096;
+        if (!mod::sched::resource::add_extent(bytes, PAGES, 4096) || bytes > root.root_bytes) return -E2BIG;
+    }
+    for (size_t i = 0; i < root.descriptor_count; ++i) {
+        vfs::Stat stat{};
+        int const STATUS = native_regular_capability(root.descriptors[i].source, false, stat);
+        if (STATUS != 0) return STATUS;
+    }
+    int status = vfs::mount_ns::create_namespace(root.context.mounts);
+    if (status == 0) status = mod::sched::ipc::create_namespace(root.context.ipc);
+    if (status == 0)
+        status = mod::sched::pid_ns::create_namespace(*root.creator->pid_namespace(), root.policy.admitted.network, root.context.pids);
+    if (status != 0) return status;
+#ifdef WOS_SELFTEST
+    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::CREATION_ROOT)) return -ENOMEM;
+#endif
+    status = vfs::prepare_mount_filesystem("/", "tmpfs", nullptr, 0, "size=32M", nullptr, nullptr, &root.mount,
+                                           vfs::MountPathKind::RETAINED_PHYSICAL, root.context.mounts, &root.policy.admitted.credentials);
+    if (status == 0) status = vfs::publish_prepared_mount(&root.mount, "/");
+    vfs::finish_prepared_mount(&root.mount);
+    if (status != 0) return status;
+    root.populator.reset(new (std::nothrow) mod::sched::task::Task{});
+    if (!root.populator) return -ENOMEM;
+    root.populator->pid = mod::sched::task::get_next_pid();
+    root.populator->type = mod::sched::task::TaskType::PROCESS;
+    status = mod::sched::resource::initialize_credentials(*root.populator, root.policy.admitted.credentials);
+    if (status != 0) return status;
+    if (!root.populator->initialize_mount_namespace(root.context.mounts)) return -EIDRM;
+    // Provisioning uses explicit manifest modes, never temporary root authority.
+    // The service receives its creator's observed umask after construction.
+    static_cast<void>(root.populator->exchange_creation_mask(0));
+    status = vfs::vfs_pin_private_mount_root_as(root.context.mounts, root.policy.admitted.credentials, &root.root_pin);
+    if (status == 0)
+        status = vfs::vfs_prepare_directory_view(root.policy.admitted.credentials, root.root_pin, root.root_pin, {}, root.view);
+    if (status != 0) return status;
+#ifdef WOS_SELFTEST
+    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::CREATION_IMPORT_BUFFER)) return -ENOMEM;
+#endif
+    constexpr size_t CHUNK = 8192;
+    root.buffer.reset(new (std::nothrow) uint8_t[CHUNK]);
+    if (!root.buffer) return -ENOMEM;
+    for (size_t i = 0; i < root.asset_count; ++i) {
+        auto& asset = root.assets[i];
+        std::array<char, EXEC_PATH_MAX> directory{};
+        for (size_t end = 1; asset.path[end] != '\0'; ++end) {
+            if (asset.path[end] != '/') continue;
+            std::memcpy(directory.data(), asset.path.data(), end);
+            directory[end] = '\0';
+            status = vfs::vfs_mkdirat(root.populator.get(), vfs::AT_FDCWD, directory.data(), 0755);
+            if (status != 0 && status != -EEXIST) return status;
+        }
+        status = vfs::vfs_open_directory_view_as(*root.populator, root.policy.admitted.credentials, root.view, asset.path.data() + 1,
+                                                 vfs::O_CREAT | vfs::O_EXCL | 2, static_cast<int>(asset.mode), &root.target);
+        if (status != 0) return status;
+        size_t const SIZE = static_cast<size_t>(asset.stat.st_size);
+        for (size_t offset = 0; offset < SIZE;) {
+#ifdef WOS_SELFTEST
+            if (exec_selftest_take_native_construction_fault(NativeConstructionFault::CREATION_IMPORT_READ)) return -EIO;
+#endif
+            size_t const COUNT = std::min(CHUNK, SIZE - offset);
+            ssize_t const READ = vfs::vfs_pread_file(asset.source, root.buffer.get(), COUNT, static_cast<off_t>(offset));
+            if (READ < 0) return static_cast<int>(READ);
+            if (READ == 0 || static_cast<size_t>(READ) > COUNT) return -EIO;
+            ssize_t const WRITTEN =
+                vfs::vfs_pwrite_file(root.target, root.buffer.get(), static_cast<size_t>(READ), static_cast<off_t>(offset));
+            if (WRITTEN < 0) return static_cast<int>(WRITTEN);
+            if (WRITTEN != READ) return -EIO;
+            offset += static_cast<size_t>(READ);
+        }
+        vfs::vfs_put_file(std::exchange(root.target, nullptr));
+        vfs::vfs_put_file(std::exchange(asset.source, nullptr));
+    }
+    status = vfs::vfs_prepare_filesystem_context(root.policy.admitted.credentials, root.view, root.filesystem);
+    if (status == 0)
+        status = vfs::vfs_open_directory_view_as(*root.populator, root.policy.admitted.credentials, root.view,
+                                                 root.arguments.executable_path.data() + 1, 0, 0, &root.executable);
+    if (status == 0) status = vfs::vfs_fstat_file(root.executable, &root.executable_stat);
+    if (status != 0) return status;
+    root.kernel_rsp = reinterpret_cast<uint64_t>(mod::mm::phys::kernel_stack_alloc("native_compartment"));
+    if (root.kernel_rsp == 0) return -ENOMEM;
+    root.kernel_rsp += mod::mm::KERNEL_STACK_SIZE;
+    root.context.filesystem = &root.filesystem;
+    root.context.arguments = &root.arguments;
+    root.context.service_creator = root.creator;
+    root.context.creator_policy = &root.policy;
+    return mod::sched::resource::revalidate_native_creator_policy(*root.creator, root.policy);
 }
 
 auto create_file_backed_process_task_impl(const char* name, vfs::File* owned_file, size_t file_size, const vfs::Stat& file_stat,
@@ -4107,6 +4404,136 @@ auto create_file_backed_process_task_for_owner(mod::sched::task::Task* owner, co
     -> mod::sched::task::Task* {
     return create_native_process_task_impl(owner, context, name, owned_file, file_size, file_stat, kernel_rsp, resources, credentials,
                                            reservation, failure_observations, construction_error);
+}
+
+auto abort_native_compartment_preparation(mod::sched::task::Task& executor, mod::sched::task::Task* child) -> bool {
+    auto* request = executor.owned_exec_arguments.load(std::memory_order_acquire);
+    if (request == nullptr || !request->native_compartment_request) return false;
+    auto* root = request->compartment.get();
+    if (child == nullptr && root != nullptr) child = root->child;
+    if (root != nullptr && root->child != child) return false;
+    if (child != nullptr && !mod::sched::task::destroy_owned_unpublished_process(&executor, child)) return false;
+    if (root != nullptr) root->child = nullptr;
+    cleanup_exec_preparation(executor);
+    return executor.owned_exec_arguments.load(std::memory_order_acquire) == nullptr;
+}
+
+auto prepare_native_compartment_for_owner(mod::sched::task::Task& executor, const NativeCompartmentSpec& spec, int& error)
+    -> mod::sched::task::Task* {
+    error = 0;
+    ExecRequestArguments* request = nullptr;
+    mod::sched::task::Task* child = nullptr;
+    {
+        NativeConstructionExecutorGuard guard(executor);
+        if (!guard.acquired()) {
+            error = -EBUSY;
+            return nullptr;
+        }
+        if (executor.exit_in_progress.load(std::memory_order_acquire) || executor.has_exited ||
+            executor.state.load(std::memory_order_acquire) != mod::sched::task::TaskState::ACTIVE) {
+            error = -ECANCELED;
+            return nullptr;
+        }
+        if (executor.owned_unpublished_process.load(std::memory_order_acquire) != nullptr ||
+            executor.owned_exec_arguments.load(std::memory_order_acquire) != nullptr ||
+            executor.owned_exec_preparation.load(std::memory_order_acquire) != nullptr) {
+            error = -EBUSY;
+            return nullptr;
+        }
+        std::unique_ptr<ExecRequestArguments> pending(new (std::nothrow) ExecRequestArguments);
+        if (!pending) {
+            error = -ENOMEM;
+            return nullptr;
+        }
+        pending->native_compartment_request = true;
+        request = pending.get();
+        if (!adopt_exec_arguments(executor, pending)) {
+            error = -EBUSY;
+            return nullptr;
+        }
+#ifdef WOS_SELFTEST
+        if (exec_selftest_take_native_construction_fault(NativeConstructionFault::CREATION_STATE)) error = -ENOMEM;
+#endif
+        if (error == 0) {
+            request->compartment.reset(new (std::nothrow) NativeCompartmentPreparation(executor));
+            if (!request->compartment) error = -ENOMEM;
+        }
+        if (error == 0) error = capture_native_compartment_inputs(*request->compartment, *request, spec);
+        if (error == 0) error = populate_native_compartment_root(*request->compartment);
+#ifdef WOS_SELFTEST
+        if (error == 0 && exec_selftest_take_native_construction_fault(NativeConstructionFault::CREATION_RECOVERY_IMPORT))
+            error = -ECANCELED;
+#endif
+        if (error == 0) {
+            auto& root = *request->compartment;
+            // Inputs stay owned until this exact guard is transferred to the
+            // builder. Its child slot adopts both before fatal exit can resume.
+            child = create_native_process_task_impl(
+                &executor, root.context, request->snapshot.path.data(), std::exchange(root.executable, nullptr),
+                static_cast<size_t>(root.executable_stat.st_size), root.executable_stat, std::exchange(root.kernel_rsp, 0), root.resources,
+                root.policy.admitted.credentials, *root.reservation, nullptr, &error, &guard);
+            root.child = child;
+            if (child == nullptr && error == 0) error = -ENOEXEC;
+        }
+    }
+    if (error == 0) {
+        NativeConstructionExecutorGuard guard(executor);
+        if (!guard.acquired()) {
+            error = -EBUSY;
+        } else {
+            auto& root = *request->compartment;
+            child->initialize_job_identity({.session_id = child->pid, .pgid = child->pid}, mod::sched::session::Names{1, 1});
+            static_cast<void>(child->exchange_creation_mask(root.policy.creation_mask));
+            std::memcpy(child->exe_path.data(), request->snapshot.path.data(), root.arguments.executable_path.size() + 1);
+            for (size_t i = 0; i < root.descriptor_count && error == 0; ++i) {
+                auto& descriptor = root.descriptors[i];
+                vfs::FdReservation slot(child, descriptor.destination);
+                if (slot.result() < 0) {
+                    error = slot.result();
+                } else if (static_cast<unsigned>(slot.result()) != descriptor.destination) {
+                    error = -EBUSY;
+                } else {
+                    int const INSTALLED = slot.install(descriptor.source);
+                    if (INSTALLED < 0)
+                        error = INSTALLED;
+                    else
+                        descriptor.source = nullptr;
+                }
+#ifdef WOS_SELFTEST
+                if (error == 0 && exec_selftest_take_native_construction_fault(NativeConstructionFault::CREATION_DESCRIPTORS))
+                    error = -ENOMEM;
+#endif
+            }
+            if (error == 0) error = mod::sched::resource::revalidate_native_creator_policy(*root.creator, root.policy);
+            // Imported sources, staging buffers and the populator are retired
+            // before success; root/cwd ownership waits for actual publication.
+            if (error == 0) {
+                root.buffer.reset();
+                root.populator.reset();
+                root.reservation.reset();
+            }
+        }
+    }
+#ifdef WOS_SELFTEST
+    if (error == 0 && exec_selftest_take_native_construction_fault(NativeConstructionFault::CREATION_RECOVERY_BUILT)) {
+        auto* recovered = mod::sched::task::take_unpublished_process(&executor);
+        if (recovered != child || !mod::sched::task::destroy_unpublished_process(recovered)) [[unlikely]] {
+            mod::dbg::panic_handler("native creation: transferred child recovery failed");
+            hcf();
+        }
+        request->compartment->child = nullptr;
+        child = nullptr;
+        error = -ECANCELED;
+    }
+#endif
+    if (error != 0) {
+        if (!abort_native_compartment_preparation(executor, child)) [[unlikely]] {
+            mod::dbg::panic_handler("native creation: lost preparation ownership");
+            hcf();
+        }
+        return nullptr;
+    }
+    return child;
 }
 
 auto wos_proc_exec(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr) -> uint64_t {

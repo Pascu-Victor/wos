@@ -1,6 +1,7 @@
 #include "resource_process.hpp"
 
 #include <cerrno>
+#include <platform/sched/native_creation_policy.hpp>
 #include <platform/sched/resource.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
@@ -10,6 +11,43 @@ namespace ker::mod::sched::resource {
 struct CredentialAccess {
     static auto store(task::Task& subject) -> security::CredentialStore& { return subject.m_credentials; }
 };
+
+auto capture_native_creator_fields(task::Task& source, const security::compartment::Request& request, const State* service_limits,
+                                   NativeCreatorPolicy& out) -> int {
+    if (source.is_thread || source.credential_owner() != &source || source.type != task::TaskType::PROCESS) return -EINVAL;
+    if (source.exit_in_progress.load(std::memory_order_acquire) || source.has_exited ||
+        source.state.load(std::memory_order_acquire) != task::TaskState::ACTIVE)
+        return -ECANCELED;
+    auto const* pids = source.pid_namespace();
+    if (pids == nullptr) return -ESRCH;
+    if (pids->closed()) return -EIDRM;
+    NativeCreatorPolicy candidate{};
+    int result = 0;
+    {
+        // UID publication uses credentials before resource while holding the
+        // population lock. Never reserve population or acquire service here.
+        security::CredentialStore::Transaction transaction(CredentialAccess::store(source));
+        uint64_t const FLAGS = source.resource_lock.lock_irqsave();
+        candidate.observed = transaction.observation();
+        candidate.parent.credentials = candidate.observed.credentials;
+        candidate.parent.network = pids->network();
+        candidate.creation_mask = source.creation_mask();
+        for (size_t i = 0; i < candidate.parent.limits.size(); ++i) {
+            auto limit = source.resources.entries[i].limit;
+            if (service_limits != nullptr) {
+                auto const SERVICE = service_limits->entries[i].limit;
+                if (SERVICE.soft < limit.soft) limit.soft = SERVICE.soft;
+                if (SERVICE.hard < limit.hard) limit.hard = SERVICE.hard;
+            }
+            candidate.parent.limits[i] = limit;
+        }
+        result = security::compartment::prepare(candidate.parent, request, task::Task::FD_TABLE_SIZE, candidate.admitted);
+        source.resource_lock.unlock_irqrestore(FLAGS);
+    }
+    if (result == 0) out = candidate;
+    return result;
+}
+
 namespace {
 constexpr unsigned NPROC = static_cast<unsigned>(Id::NPROC);
 sys::Spinlock population_lock;

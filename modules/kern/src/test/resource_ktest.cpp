@@ -27,6 +27,9 @@ using ker::mod::sched::task::Task;
 }  // namespace
 
 KTEST(Resource, PersistentServiceLifecycleAndThreadCpu) { KEXPECT_TRUE(ker::mod::sched::resource::selftest_service_lifecycle()); }
+KTEST(Resource, NativeCreationKeepsSelectedServiceAndNonEscalatingLimits) {
+    KEXPECT_TRUE(ker::mod::sched::resource::selftest_native_creator_service_policy());
+}
 KTEST(Resource, ServiceManagementRequiresRoleAndRetainedCredentialAuthority) {
     KEXPECT_TRUE(ker::mod::sched::resource::selftest_service_management_authority());
 }
