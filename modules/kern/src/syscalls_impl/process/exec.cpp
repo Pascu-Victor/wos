@@ -1607,6 +1607,11 @@ struct NativeCompartmentPreparation {
     mod::sched::task::Task& executor;
     mod::sched::task::Task* creator{};
     mod::sched::task::Task* child{};
+    int actor_nice{};
+    int creator_nice{};
+    int inherited_nice{};
+    uint32_t inherited_weight{};
+    bool priority_initialized{};
     mod::sched::resource::NativeCreatorPolicy policy;
     mod::sched::resource::State resources;
     std::unique_ptr<mod::sched::resource::ProcessReservation> reservation;
@@ -1633,6 +1638,53 @@ struct NativeCompartmentPreparation {
     explicit NativeCompartmentPreparation(mod::sched::task::Task& owner) : executor(owner) {}
     ~NativeCompartmentPreparation();
 };
+
+// Nice belongs to the executing Task, while policy and lifetime belong to its
+// exact canonical process. Call with VM publication held and no spinlocks.
+auto creation_priority_source_status(mod::sched::task::Task& actor, mod::sched::task::Task* creator) -> int {
+    using namespace ker::mod;
+    if (creator == nullptr || actor.credential_owner() != creator || creator->is_thread || creator->credential_owner() != creator ||
+        actor.type != sched::task::TaskType::PROCESS || creator->type != sched::task::TaskType::PROCESS)
+        return -ESRCH;
+    for (auto* subject : {&actor, creator}) {
+        if (subject->state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE || subject->has_exited ||
+            subject->exit_in_progress.load(std::memory_order_acquire) || subject->exit_notify_ready.load(std::memory_order_acquire) ||
+            subject->gc_queued.load(std::memory_order_acquire))
+            return -ECANCELED;
+    }
+    if (actor.is_thread && actor.pagemap != creator->pagemap) return -ESRCH;
+    return 0;
+}
+
+auto capture_native_creation_priority(NativeCompartmentPreparation& root) -> int {
+    ker::syscall::vmem::SharedVmemPublicationGuard publication;
+    if (int const STATUS = creation_priority_source_status(root.executor, root.creator); STATUS != 0) return STATUS;
+    int const ACTOR = root.executor.sched_nice;
+    int const CREATOR = root.creator->sched_nice;
+    if (ACTOR < -20 || ACTOR > 19 || CREATOR < -20 || CREATOR > 19) return -EINVAL;
+    root.actor_nice = ACTOR;
+    root.creator_nice = CREATOR;
+    root.inherited_nice = std::max(ACTOR, CREATOR);
+    return 0;
+}
+
+// VM publication is already held by initialization/final publication. A copied
+// worker field cannot replace the retained canonical source or its current image.
+auto revalidate_native_creation_priority(const NativeCompartmentPreparation& root) -> int {
+    if (int const STATUS = creation_priority_source_status(root.executor, root.creator); STATUS != 0) return STATUS;
+    return root.executor.sched_nice == root.actor_nice && root.creator->sched_nice == root.creator_nice ? 0 : -EAGAIN;
+}
+
+auto initialize_native_creation_priority(NativeCompartmentPreparation& root, mod::sched::task::Task& child) -> int {
+    ker::syscall::vmem::SharedVmemPublicationGuard publication;
+    if (int const STATUS = revalidate_native_creation_priority(root); STATUS != 0) return STATUS;
+    int const STATUS = mod::sched::initialize_unpublished_task_priority(root.executor, child, root.inherited_nice);
+    if (STATUS == 0) {
+        root.inherited_weight = child.sched_weight;
+        root.priority_initialized = true;
+    }
+    return STATUS;
+}
 }  // namespace
 
 class ExecRequestArguments {
@@ -4144,9 +4196,10 @@ auto capture_native_compartment_inputs(NativeCompartmentPreparation& root, ExecR
         auto* source = owner.get();
         if (source == nullptr || !source->try_acquire()) return -ESRCH;
         root.creator = source;
-        int const STATUS = mod::sched::resource::capture_native_creator_policy(*source, spec.policy, root.policy);
-        if (STATUS != 0) return STATUS;
     }
+    if (int const STATUS = capture_native_creation_priority(root); STATUS != 0) return STATUS;
+    if (int const STATUS = mod::sched::resource::capture_native_creator_policy(*root.creator, spec.policy, root.policy); STATUS != 0)
+        return STATUS;
     for (size_t i = 0; i < root.policy.admitted.limits.size(); ++i) root.resources.entries[i].limit = root.policy.admitted.limits[i];
     // Keep the public process image name complete; Task's observation field is
     // smaller than the private argument/import path buffer. Never truncate it.
@@ -4616,9 +4669,12 @@ static auto prepare_native_compartment_inputs_for_owner(mod::sched::task::Task& 
             error = -EBUSY;
         } else {
             auto& root = *request->compartment;
-            child->initialize_job_identity({.session_id = child->pid, .pgid = child->pid}, mod::sched::session::Names{1, 1});
-            static_cast<void>(child->exchange_creation_mask(root.policy.creation_mask));
-            std::memcpy(child->exe_path.data(), request->snapshot.path.data(), root.arguments.executable_path.size() + 1);
+            error = initialize_native_creation_priority(root, *child);
+            if (error == 0) {
+                child->initialize_job_identity({.session_id = child->pid, .pgid = child->pid}, mod::sched::session::Names{1, 1});
+                static_cast<void>(child->exchange_creation_mask(root.policy.creation_mask));
+                std::memcpy(child->exe_path.data(), request->snapshot.path.data(), root.arguments.executable_path.size() + 1);
+            }
             for (size_t i = 0; i < root.descriptor_count && error == 0; ++i) {
                 auto& descriptor = root.descriptors[i];
                 vfs::FdReservation slot(child, descriptor.destination);
@@ -4683,8 +4739,8 @@ auto publish_native_compartment_for_owner(mod::sched::task::Task& executor, mod:
         if (!recovery.acquired()) return -EBUSY;
         auto* request = executor.owned_exec_arguments.load(std::memory_order_acquire);
         auto* root = request != nullptr && request->native_compartment_request ? request->compartment.get() : nullptr;
-        if (root == nullptr || child == nullptr || root->child != child || root->published ||
-            executor.owned_unpublished_process.load(std::memory_order_acquire) != child)
+        if (root == nullptr || root->creator == nullptr || &root->executor != &executor || child == nullptr || root->child != child ||
+            root->published || executor.owned_unpublished_process.load(std::memory_order_acquire) != child)
             return -EINVAL;
         bool membership = false;
         {
@@ -4696,6 +4752,10 @@ auto publish_native_compartment_for_owner(mod::sched::task::Task& executor, mod:
                 result = -ESHUTDOWN;
             else
                 result = mod::sched::resource::revalidate_native_creator_policy(*root->creator, root->policy);
+            if (result == 0) result = revalidate_native_creation_priority(*root);
+            if (result == 0 &&
+                (!root->priority_initialized || child->sched_nice != root->inherited_nice || child->sched_weight != root->inherited_weight))
+                result = -EAGAIN;
             if (result == 0 && (child->scheduler_published.load(std::memory_order_acquire) || child->pid_namespace() == nullptr ||
                                 child->mount_namespace() == nullptr || child->ipc_namespace() == nullptr ||
                                 *child->pid_namespace() != root->context.pids || *child->mount_namespace() != root->context.mounts ||
@@ -5050,6 +5110,21 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
             hcf();
         }
     };
+
+    int priority_error = 0;
+    {
+        // Ordinary creation inherits the actor at this observation point.
+        // Release before loader IO and WKI placement; later changes to the
+        // parent do not retroactively change this exclusively owned child.
+        ker::syscall::vmem::SharedVmemPublicationGuard publication;
+        priority_error = creation_priority_source_status(*parent_task, parent_task->credential_owner());
+        if (priority_error == 0)
+            priority_error = sched::initialize_unpublished_task_priority(*parent_task, *new_task, parent_task->sched_nice);
+    }
+    if (priority_error != 0) {
+        cleanup_unpublished_task();
+        return static_cast<uint64_t>(priority_error);
+    }
 
     if (!sched::resource::inherit(*new_task, *parent_task)) {
         cleanup_unpublished_task();

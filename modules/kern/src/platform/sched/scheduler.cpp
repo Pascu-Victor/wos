@@ -3659,6 +3659,23 @@ void request_local_timer_recheck() { request_local_reschedule(); }
 
 void set_task_nice(task::Task* task, int nice) { set_task_nice_impl(task, nice); }
 
+auto initialize_unpublished_task_priority(task::Task& owner, task::Task& child, int nice) -> int {
+    if (nice < SCHED_NICE_MIN || nice > SCHED_NICE_MAX) return -EINVAL;
+    if (&owner == &child || owner.owned_unpublished_process.load(std::memory_order_acquire) != &child ||
+        child.ref_count.load(std::memory_order_acquire) != 2 || child.type != task::TaskType::PROCESS || child.is_thread ||
+        child.state.load(std::memory_order_acquire) != task::TaskState::ACTIVE || child.has_run || child.has_exited ||
+        child.exit_in_progress.load(std::memory_order_acquire) || child.exit_notify_ready.load(std::memory_order_acquire) ||
+        child.gc_queued.load(std::memory_order_acquire) || child.scheduler_published.load(std::memory_order_acquire) ||
+        child.sched_queue != task::Task::sched_queue::NONE || child.heap_index != -1 || child.sched_next != nullptr ||
+        child.child_membership_state.load(std::memory_order_acquire) != task::ChildMembershipState::UNLINKED)
+        return -EBUSY;
+    // Exclusive recovery ownership keeps this child off every runqueue. Do
+    // not copy a parent's weight or its accrued runtime/consumed quantum.
+    child.sched_nice = static_cast<int8_t>(nice);
+    child.sched_weight = nice_to_weight(nice);
+    return 0;
+}
+
 // Wake IPI - breaks a CPU out of hlt regardless of scheduler idle state.
 // Used by NAPI to wake worker threads that sleep via sti;hlt as the
 // current_task (so is_idle is false, and wake_idle_cpu would skip them).

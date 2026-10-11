@@ -5,7 +5,8 @@ This is an actual WOS userspace probe for process selector 54 and
 one through the public spec, one through the launcher. Its assertions cover
 private PID 1/parent 0, unchanged nonroot identity, Host path refusal, explicit
 asset contents, denied networking, named shared memory and local fork/wait.
-It also checks private self/local-PID nice reads, lowering its own priority,
+The Host lowers its priority to nice 5 before either mode. It also checks
+private self/local-PID inherited nice reads, lowering its own priority,
 refusal to raise it again, and refusal to use the Host's physical PID as a local
 priority target. The Host requires its own nice value to remain unchanged after
 each mode.
@@ -35,8 +36,11 @@ grants no Host object capability: the probe creates only private PID 1 and child
 PID 2. Priority selectors must report `ESRCH` for both read and mutation using
 that absent local name. Local nice checks use actual libc error handling; the
 Host-PID checks use raw 64-bit wrappers to avoid truncating the identifier.
-The private initial nice-0 check records the current native default and does
-not qualify creator nice or CPU placement inheritance.
+Both services must start at nice 5, including the actual CLI's ordinary spawn
+ancestor, and their private fork must inherit nice 5. Native creation chooses
+the lower priority (larger nice) of its canonical creator and executing actor.
+This fixture explicitly selects LOCAL execution on one kernel; it does not
+qualify WKI priority transport, worker-exec priority or CPU placement inheritance.
 
 Prepare only an inactive, agent-owned private rootfs COW overlay over the
 current normal rootfs. Install the ELF at
@@ -66,13 +70,14 @@ sysroot or bypass the launch guard. Isolated diagnostics use
 The expected final receipt is `PASS public-service modes=2 failures=0`, with
 both mode rows reporting exit status 0, 21 checks, zero failures, failed-mask 0
 and `host-nice-preserved=1`. The original 14 checks remain; seven priority checks
-are added. Private self and local PID 1 start at nice 0, self lowers to nice 5,
-local PID 1 reads 5, an attempted increase to nice 4 returns `EACCES`, and both
+are retained. Private self and local PID 1 start at nice 5, self lowers to nice 7,
+local PID 1 reads 7, an attempted increase to nice 6 returns `EACCES`, and both
 Host-PID operations return `ESRCH`. The actual private report is seven
 little-endian uint64 values: magic
 `0x39335055424c4943`, PID, parent, UID, checks, failure count and failed-check
 bitmask. The Host returns 42 on a mode failure, 40 on wrong initial identity or
-local-placement refusal, 41 on asset-open refusal and 43 on invalid arguments.
+local-placement refusal, 41 on asset-open refusal, 43 on invalid arguments and
+44 on failure to lower the Host to nice 5.
 The persistent `/srv/compartment-results/status` and `result-0`/`result-1` Files
 are small, fsynced diagnostic receipts. Missing stdout is not proof of a boot
 stall; inspect init's published wait status and these Files.

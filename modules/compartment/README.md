@@ -58,9 +58,14 @@ and service fragment are documented in
 Both public-spec and CLI modes passed with private PID1/parent0, UID100,
 21checks/0failures and successful Host waits. Private priority lookup/update uses
 local IDs, preserves Host nice values and rejects guessed physical Host IDs.
-This short sequential test leaves CPU-placement and priority inheritance,
-hostile isolation, two-hour simultaneous service
-trees,1,000full lifecycles and complete Host/init/libc regression unqualified.
+Both services and their local fork start at nice 5 inherited from the Host;
+the service lowers to 7 and cannot raise to 6. Native creation uses the larger
+nice value of the canonical creator and executing actor. Ordinary local spawn
+retains actor nice at its construction snapshot, including the real CLI ancestor.
+This short sequential test leaves CPU placement, worker-exec/WKI priority,
+coherent concurrent fork/thread observations, hostile isolation, two-hour
+simultaneous trees,1,000full lifecycles and complete Host/init/libc regression
+unqualified.
 Owned software qualification may use `bin/wos-cluster --no-setup` or isolated
 `bin/wos-ktest --no-setup`, with one topology, a 20GiB disposable storage budget,
 40GiB free-space floor and exact-owned inactive-image pruning after every run.

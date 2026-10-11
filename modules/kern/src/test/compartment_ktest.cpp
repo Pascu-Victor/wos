@@ -7666,3 +7666,344 @@ KTEST(CompartmentPublicInput, ZeroVectorsAndCrossPageStringsReachActualPublicati
         baseline.expect();
     }
 }
+
+KTEST(CompartmentPriorityInheritance, OwnedInitializerDerivesWeightsAndRefusesIncompatibleState) {
+    NativeTask owner, foreign;
+    owner.task->type = sched::task::TaskType::PROCESS;
+    UnpublishedFixture process{*owner.task};
+    KREQUIRE_TRUE(process.claimed);
+    auto& child = *process.task;
+    child.heap_index = -1;
+    child.vruntime = 73;
+    child.vdeadline = 91;
+    child.slice_ns = 1'234'567;
+    child.slice_used_ns = 456;
+    struct Expected {
+        int nice;
+        uint32_t weight;
+    };
+    for (auto const value : {Expected{-20, 88761}, Expected{-1, 1277}, Expected{0, 1024}, Expected{5, 335}, Expected{19, 15}}) {
+        KEXPECT_EQ(sched::initialize_unpublished_task_priority(*owner.task, child, value.nice), 0);
+        KEXPECT_EQ(child.sched_nice, static_cast<int8_t>(value.nice));
+        KEXPECT_EQ(child.sched_weight, value.weight);
+        KEXPECT_EQ(child.vruntime, int64_t{73});
+        KEXPECT_EQ(child.vdeadline, int64_t{91});
+        KEXPECT_EQ(child.slice_ns, uint32_t{1'234'567});
+        KEXPECT_EQ(child.slice_used_ns, uint32_t{456});
+    }
+    auto refused = [&](Task& claimed_owner, int nice, int expected) {
+        KEXPECT_EQ(sched::initialize_unpublished_task_priority(claimed_owner, child, nice), expected);
+        KEXPECT_EQ(child.sched_nice, int8_t{19});
+        KEXPECT_EQ(child.sched_weight, uint32_t{15});
+        KEXPECT_EQ(child.vruntime, int64_t{73});
+        KEXPECT_EQ(child.vdeadline, int64_t{91});
+        KEXPECT_EQ(child.slice_ns, uint32_t{1'234'567});
+        KEXPECT_EQ(child.slice_used_ns, uint32_t{456});
+    };
+    refused(*owner.task, -21, -EINVAL);
+    refused(*owner.task, 20, -EINVAL);
+    refused(*foreign.task, 5, -EBUSY);
+    // Deliberately forge only fixture metadata; restore it before teardown.
+    child.owned_unpublished_process.store(&child);
+    refused(child, 5, -EBUSY);
+    child.owned_unpublished_process.store(nullptr);
+    KREQUIRE_TRUE(child.try_acquire_lifetime_ref());
+    refused(*owner.task, 5, -EBUSY);
+    child.release();
+    for (unsigned state = 0; state < 12; ++state) {
+        switch (state) {
+            case 0:
+                child.scheduler_published.store(true);
+                break;
+            case 1:
+                child.has_run = true;
+                break;
+            case 2:
+                child.has_exited = true;
+                break;
+            case 3:
+                child.exit_in_progress.store(true);
+                break;
+            case 4:
+                child.exit_notify_ready.store(true);
+                break;
+            case 5:
+                child.gc_queued.store(true);
+                break;
+            case 6:
+                child.state.store(sched::task::TaskState::EXITING);
+                break;
+            case 7:
+                child.type = sched::task::TaskType::DAEMON;
+                break;
+            case 8:
+                child.is_thread = true;
+                break;
+            case 9:
+                child.heap_index = 0;
+                break;
+            case 10:
+                child.child_membership_state.store(sched::task::ChildMembershipState::PUBLISHING);
+                break;
+            case 11:
+                child.sched_next = owner.task.get();
+                break;
+        }
+        refused(*owner.task, 5, -EBUSY);
+        child.scheduler_published.store(false);
+        child.has_run = false;
+        child.has_exited = false;
+        child.exit_in_progress.store(false);
+        child.exit_notify_ready.store(false);
+        child.gc_queued.store(false);
+        child.state.store(sched::task::TaskState::ACTIVE);
+        child.type = sched::task::TaskType::PROCESS;
+        child.is_thread = false;
+        child.heap_index = -1;
+        child.child_membership_state.store(sched::task::ChildMembershipState::UNLINKED);
+        child.sched_next = nullptr;
+    }
+    child.sched_queue = sched::task::Task::sched_queue::WAITING;
+    refused(*owner.task, 5, -EBUSY);
+    child.sched_queue = sched::task::Task::sched_queue::NONE;
+    KEXPECT_TRUE(owner.task->owned_unpublished_process.load() == &child);
+    KEXPECT_EQ(child.ref_count.load(), uint32_t{2});
+    KEXPECT_EQ(owner.task->ref_count.load(), uint32_t{1});
+}
+
+KTEST(CompartmentPriorityInheritance, NativePreparedChildrenKeepSignedNiceAndFreshSchedulingState) {
+    auto const PIDS = pid_ns::live_namespace_count(), IPC = ipc::live_namespace_count(), MOUNTS = mount_ns::live_namespace_count();
+    auto const THREADS = threading::get_active_thread_count();
+    struct Expected {
+        int8_t nice;
+        uint32_t weight;
+    };
+    for (auto const value : {Expected{-20, 88761}, Expected{-1, 1277}, Expected{0, 1024}, Expected{5, 335}, Expected{19, 15}}) {
+        NativeCreationFixture fixture;
+        KREQUIRE_EQ(fixture.prepare(710, 51), 0);
+        auto& executor = *fixture.creator.task;
+        {
+            ker::syscall::vmem::SharedVmemPublicationGuard publication;
+            initialize_priority_fixture(executor, value.nice);
+            executor.sched_weight = 17;  // The child must derive its own actual table weight.
+            executor.vruntime = 73;
+            executor.vdeadline = 91;
+            executor.slice_used_ns = 456;
+        }
+        auto const REFS = fixture.executable->refcount.load();
+        auto const PRIVATE_PIDS = pid_ns::live_namespace_count(), PRIVATE_IPC = ipc::live_namespace_count();
+        auto const PRIVATE_MOUNTS = mount_ns::live_namespace_count();
+        abi::resource::Usage before{}, after{};
+        resource::copy_process_observation(executor, before);
+        NativeCreationProcess process{executor};
+        int error = 99;
+        process.child = process_exec::prepare_native_compartment_for_owner(executor, fixture.spec, error);
+        KREQUIRE_EQ(error, 0);
+        KREQUIRE_TRUE(process.child != nullptr);
+        KEXPECT_EQ(process.child->sched_nice, value.nice);
+        KEXPECT_EQ(process.child->sched_weight, value.weight);
+        KEXPECT_EQ(process.child->slice_ns, uint32_t{10'000'000});
+        KEXPECT_EQ(process.child->slice_used_ns, uint32_t{0});
+        KEXPECT_EQ(process.child->vruntime, int64_t{0});
+        KEXPECT_EQ(process.child->vdeadline, int64_t{0});
+        KEXPECT_EQ(process.child->heap_index, int32_t{-1});
+        KEXPECT_EQ(process.child->sched_queue, sched::task::Task::sched_queue::NONE);
+        KEXPECT_NULL(process.child->sched_next);
+        KEXPECT_FALSE(process.child->scheduler_published.load());
+        using Fault = process_exec::NativeConstructionFault;
+        process_exec::exec_selftest_fail_native_construction_once(Fault::PUBLICATION_INVALID_CPU);
+        KEXPECT_EQ(process_exec::publish_native_compartment_for_owner(executor, process.child), int64_t{-EAGAIN});
+        process_exec::exec_selftest_fail_native_construction_once(Fault::NONE);
+        KEXPECT_FALSE(process.child->scheduler_published.load());
+        KEXPECT_EQ(process.child->child_membership_state.load(), sched::task::ChildMembershipState::UNLINKED);
+        KEXPECT_NULL(executor.child_list_head);
+        KREQUIRE_TRUE(process.destroy());
+        KEXPECT_TRUE(creation_pending_drained(executor));
+        KEXPECT_EQ(executor.ref_count.load(), uint32_t{1});
+        KEXPECT_EQ(fixture.executable->refcount.load(), REFS);
+        KEXPECT_EQ(pid_ns::live_namespace_count(), PRIVATE_PIDS);
+        KEXPECT_EQ(ipc::live_namespace_count(), PRIVATE_IPC);
+        KEXPECT_EQ(mount_ns::live_namespace_count(), PRIVATE_MOUNTS);
+        resource::copy_process_observation(executor, after);
+        KEXPECT_EQ(after.current, before.current);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
+    KEXPECT_EQ(ipc::live_namespace_count(), IPC);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
+    KEXPECT_EQ(threading::get_active_thread_count(), THREADS);
+}
+
+KTEST(CompartmentPriorityInheritance, NativeWorkerUsesConservativeCanonicalAndActorNice) {
+    auto const PIDS = pid_ns::live_namespace_count(), IPC = ipc::live_namespace_count(), MOUNTS = mount_ns::live_namespace_count();
+    auto const THREADS = threading::get_active_thread_count();
+    for (bool actor_lower : {false, true}) {
+        NativeCreationFixture fixture;
+        KREQUIRE_EQ(fixture.prepare(710, 51, false), 0);
+        auto& creator = *fixture.creator.task;
+        NativeTask worker;
+        worker.task->type = sched::task::TaskType::PROCESS;
+        worker.task->is_thread = true;
+        worker.task->owner_pid = creator.pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(*worker.task, creator));
+        {
+            ker::syscall::vmem::SharedVmemPublicationGuard publication;
+            initialize_priority_fixture(creator, actor_lower ? int8_t{3} : int8_t{7});
+            initialize_priority_fixture(*worker.task, actor_lower ? int8_t{7} : int8_t{3});
+        }
+        auto const OWNER_REFS = creator.ref_count.load(), WORKER_REFS = worker.task->ref_count.load();
+        auto const FILE_REFS = fixture.executable->refcount.load();
+        auto const PRIVATE_PIDS = pid_ns::live_namespace_count(), PRIVATE_IPC = ipc::live_namespace_count();
+        auto const PRIVATE_MOUNTS = mount_ns::live_namespace_count();
+        abi::resource::Usage before{}, after{};
+        resource::copy_process_observation(creator, before);
+        NativeCreationProcess process{*worker.task};
+        int error = 99;
+        process.child = process_exec::prepare_native_compartment_for_owner(process.executor, fixture.spec, error);
+        KREQUIRE_EQ(error, 0);
+        KREQUIRE_TRUE(process.child != nullptr);
+        KEXPECT_EQ(process.child->sched_nice, int8_t{7});
+        KEXPECT_EQ(process.child->sched_weight, uint32_t{215});
+        KEXPECT_TRUE(process.child->credentials().user() == creator.credentials().user());
+        KEXPECT_TRUE(process.child->credentials().group() == creator.credentials().group());
+        KEXPECT_EQ(process.child->creation_mask(), uint32_t{027});
+        KEXPECT_EQ(process.child->slice_ns, uint32_t{10'000'000});
+        KEXPECT_EQ(process.child->heap_index, int32_t{-1});
+        KEXPECT_FALSE(process.child->scheduler_published.load());
+        KEXPECT_NULL(creator.owned_unpublished_process.load());
+        KEXPECT_TRUE(worker.task->owned_unpublished_process.load() == process.child);
+        KREQUIRE_TRUE(process.destroy());
+        KEXPECT_TRUE(creation_pending_drained(*worker.task));
+        KEXPECT_EQ(creator.ref_count.load(), OWNER_REFS);
+        KEXPECT_EQ(worker.task->ref_count.load(), WORKER_REFS);
+        KEXPECT_EQ(fixture.executable->refcount.load(), FILE_REFS);
+        KEXPECT_EQ(pid_ns::live_namespace_count(), PRIVATE_PIDS);
+        KEXPECT_EQ(ipc::live_namespace_count(), PRIVATE_IPC);
+        KEXPECT_EQ(mount_ns::live_namespace_count(), PRIVATE_MOUNTS);
+        resource::copy_process_observation(creator, after);
+        KEXPECT_EQ(after.current, before.current);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
+    KEXPECT_EQ(ipc::live_namespace_count(), IPC);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
+    KEXPECT_EQ(threading::get_active_thread_count(), THREADS);
+}
+
+KTEST(CompartmentPriorityInheritance, ChangedSourcesAndChildFieldsRefuseBeforeMembershipAndDrain) {
+    auto const THREADS = threading::get_active_thread_count();
+    for (unsigned change = 0; change < 5; ++change) {
+        NativeCreationFixture fixture;
+        KREQUIRE_EQ(fixture.prepare(710, 51), 0);
+        auto& creator = *fixture.creator.task;
+        NativeTask worker;
+        worker.task->type = sched::task::TaskType::PROCESS;
+        worker.task->is_thread = true;
+        worker.task->owner_pid = creator.pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(*worker.task, creator));
+        {
+            ker::syscall::vmem::SharedVmemPublicationGuard publication;
+            initialize_priority_fixture(creator, 3);
+            initialize_priority_fixture(*worker.task, 7);
+        }
+        auto const OWNER_REFS = creator.ref_count.load(), WORKER_REFS = worker.task->ref_count.load();
+        auto const FILE_REFS = fixture.executable->refcount.load();
+        auto const PIDS = pid_ns::live_namespace_count(), IPC = ipc::live_namespace_count(), MOUNTS = mount_ns::live_namespace_count();
+        abi::resource::Usage before{}, after{};
+        resource::copy_process_observation(creator, before);
+        NativeCreationProcess process{*worker.task};
+        int error = 99;
+        process.child = process_exec::prepare_native_compartment_for_owner(process.executor, fixture.spec, error);
+        KREQUIRE_EQ(error, 0);
+        KREQUIRE_TRUE(process.child != nullptr);
+        auto* const ORIGINAL_MAP = worker.task->pagemap;
+        {
+            ker::syscall::vmem::SharedVmemPublicationGuard publication;
+            switch (change) {
+                case 0:
+                    worker.task->sched_nice = 8;
+                    break;
+                case 1:
+                    creator.sched_nice = 4;
+                    break;  // max stays 7; both observations still matter.
+                case 2:
+                    process.child->sched_nice = 6;
+                    break;
+                case 3:
+                    ++process.child->sched_weight;
+                    break;
+                case 4:
+                    worker.task->pagemap = process.child->pagemap;
+                    break;
+            }
+        }
+        KEXPECT_EQ(process_exec::publish_native_compartment_for_owner(process.executor, process.child),
+                   change == 4 ? int64_t{-ESRCH} : int64_t{-EAGAIN});
+        worker.task->pagemap = ORIGINAL_MAP;
+        KEXPECT_FALSE(process.child->scheduler_published.load());
+        KEXPECT_EQ(process.child->heap_index, int32_t{-1});
+        KEXPECT_EQ(process.child->sched_queue, sched::task::Task::sched_queue::NONE);
+        KEXPECT_EQ(process.child->child_membership_state.load(), sched::task::ChildMembershipState::UNLINKED);
+        KEXPECT_NULL(process.child->child_parent);
+        KEXPECT_NULL(creator.child_list_head);
+        KEXPECT_FALSE(worker.task->unpublished_teardown_in_progress.load());
+        KREQUIRE_TRUE(process.destroy());
+        KEXPECT_TRUE(creation_pending_drained(*worker.task));
+        KEXPECT_EQ(creator.ref_count.load(), OWNER_REFS);
+        KEXPECT_EQ(worker.task->ref_count.load(), WORKER_REFS);
+        KEXPECT_EQ(fixture.executable->refcount.load(), FILE_REFS);
+        KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
+        KEXPECT_EQ(ipc::live_namespace_count(), IPC);
+        KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
+        resource::copy_process_observation(creator, after);
+        KEXPECT_EQ(after.current, before.current);
+    }
+    KEXPECT_EQ(threading::get_active_thread_count(), THREADS);
+}
+
+KTEST(CompartmentPriorityInheritance, InvalidActorRangeAndRetirementRefuseCaptureWithoutLeaks) {
+    auto const THREADS = threading::get_active_thread_count();
+    for (unsigned invalid = 0; invalid < 5; ++invalid) {
+        NativeCreationFixture fixture;
+        KREQUIRE_EQ(fixture.prepare(710, 51, false), 0);
+        auto& creator = *fixture.creator.task;
+        NativeTask worker;
+        worker.task->type = sched::task::TaskType::PROCESS;
+        worker.task->is_thread = true;
+        worker.task->owner_pid = creator.pid;
+        if (invalid != 2) KREQUIRE_TRUE(resource::bind_thread_owner(*worker.task, creator));
+        {
+            ker::syscall::vmem::SharedVmemPublicationGuard publication;
+            switch (invalid) {
+                case 0:
+                    worker.task->sched_nice = 20;
+                    break;
+                case 1:
+                    creator.sched_nice = -21;
+                    break;
+                case 3:
+                    worker.task->pagemap = mm::virt::get_kernel_pagemap();
+                    break;
+                case 4:
+                    creator.exit_in_progress.store(true);
+                    break;
+            }
+        }
+        auto const OWNER_REFS = creator.ref_count.load(), WORKER_REFS = worker.task->ref_count.load();
+        auto const FILE_REFS = fixture.executable->refcount.load();
+        auto const PIDS = pid_ns::live_namespace_count(), IPC = ipc::live_namespace_count(), MOUNTS = mount_ns::live_namespace_count();
+        NativeCreationProcess process{*worker.task};
+        int error = 99;
+        process.child = process_exec::prepare_native_compartment_for_owner(process.executor, fixture.spec, error);
+        KEXPECT_NULL(process.child);
+        KEXPECT_EQ(error, invalid < 2 ? -EINVAL : invalid == 4 ? -ECANCELED : -ESRCH);
+        creator.exit_in_progress.store(false);
+        worker.task->pagemap = nullptr;
+        KEXPECT_TRUE(creation_pending_drained(*worker.task));
+        KEXPECT_EQ(creator.ref_count.load(), OWNER_REFS);
+        KEXPECT_EQ(worker.task->ref_count.load(), WORKER_REFS);
+        KEXPECT_EQ(fixture.executable->refcount.load(), FILE_REFS);
+        KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
+        KEXPECT_EQ(ipc::live_namespace_count(), IPC);
+        KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
+    }
+    KEXPECT_EQ(threading::get_active_thread_count(), THREADS);
+}

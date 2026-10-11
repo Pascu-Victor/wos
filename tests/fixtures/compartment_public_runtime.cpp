@@ -19,6 +19,8 @@ namespace {
 namespace wire = ker::abi::compartment;
 constexpr int RESULT_FD = 9;
 constexpr uint64_t MAGIC = 0x39335055424c4943ULL;
+constexpr int INHERITED_NICE = 5;
+constexpr int LOWERED_NICE = 7;
 constexpr const char* FIXTURE = "/usr/libexec/compartment-public-runtime";
 constexpr const char* STATUS = "/srv/compartment-results/status";
 // Keep a bounded guest receipt as well as init's journal-backed stdout. A
@@ -107,7 +109,9 @@ auto service(int64_t host_pid) -> int {
     if (SHM >= 0) expect(shmctl(SHM, IPC_RMID, nullptr) == 0);
     int64_t const CHILD = ker::process::fork();
     if (CHILD == 0) {
-        bool const IDENTITY = ker::process::getpid() == 2 && ker::process::getppid() == 1 && getuid() == 100;
+        errno = 0;
+        bool const IDENTITY = ker::process::getpid() == 2 && ker::process::getppid() == 1 && getuid() == 100 &&
+                              getpriority(PRIO_PROCESS, 0) == INHERITED_NICE && errno == 0;
         ker::process::exit(IDENTITY ? 0 : 31);
         __builtin_unreachable();
     }
@@ -117,15 +121,15 @@ auto service(int64_t host_pid) -> int {
         expect(wait(CHILD, status) == CHILD && WIFEXITED(status) && WEXITSTATUS(status) == 0);
     }
     errno = 0;
-    expect(getpriority(PRIO_PROCESS, 0) == 0 && errno == 0);
+    expect(getpriority(PRIO_PROCESS, 0) == INHERITED_NICE && errno == 0);
     errno = 0;
-    expect(getpriority(PRIO_PROCESS, 1) == 0 && errno == 0);
+    expect(getpriority(PRIO_PROCESS, 1) == INHERITED_NICE && errno == 0);
     errno = 0;
-    expect(setpriority(PRIO_PROCESS, 0, 5) == 0 && errno == 0);
+    expect(setpriority(PRIO_PROCESS, 0, LOWERED_NICE) == 0 && errno == 0);
     errno = 0;
-    expect(getpriority(PRIO_PROCESS, 1) == 5 && errno == 0);
+    expect(getpriority(PRIO_PROCESS, 1) == LOWERED_NICE && errno == 0);
     errno = 0;
-    expect(setpriority(PRIO_PROCESS, 0, 4) == -1 && errno == EACCES);
+    expect(setpriority(PRIO_PROCESS, 0, LOWERED_NICE - 1) == -1 && errno == EACCES);
     // The decimal Host PID is a guessed name, not an object grant. It is >2;
     // only local PID1 and the completed child PID2 exist in this namespace.
     // Raw wrappers preserve the full physical ID and return negative errno.
@@ -142,6 +146,10 @@ auto host() -> int {
     if (getuid() != 100 || HOST_PID <= 2 || HOST_PID > uint64_t{INT64_MAX} ||
         ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_LOCAL) != 0)
         return 40;
+    // Both direct creation and the real ordinary-spawn CLI ancestor must
+    // retain this lowered priority. This fixture qualifies one local kernel.
+    errno = 0;
+    if (setpriority(PRIO_PROCESS, 0, INHERITED_NICE) != 0 || errno != 0) return 44;
     char host_pid[24];
     std::snprintf(host_pid, sizeof(host_pid), "%llu", static_cast<unsigned long long>(HOST_PID));
     constexpr std::array SOURCE{FIXTURE, "/lib/ld.so", "/usr/lib/libc.so", "/usr/lib/libjournal.so", "/srv/compartment-marker"};
@@ -160,7 +168,7 @@ auto host() -> int {
     for (unsigned mode = 0; mode < 2; ++mode) {
         errno = 0;
         int const NICE_BEFORE = getpriority(PRIO_PROCESS, 0);
-        bool const NICE_BEFORE_VALID = errno == 0;
+        bool const NICE_BEFORE_VALID = errno == 0 && NICE_BEFORE == INHERITED_NICE;
         char path[80];
         std::snprintf(path, sizeof(path), "/srv/compartment-results/result-%u", mode);
         int const FD = open(path, O_CREAT | O_EXCL | O_RDWR, 0600);

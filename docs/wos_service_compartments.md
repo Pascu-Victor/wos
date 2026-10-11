@@ -7,8 +7,10 @@ versioned public creation syscall and `wos-compartment` launcher. Checkpoint 33
 qualifies two short, sequential nonroot service trees through the public spec
 and actual launcher, including local fork/wait and explicit result capabilities.
 Checkpoint 34 confines priority selectors and scheduling updates to the exact
-private PID view; both actual public modes pass 21 checks. CPU-placement and
-priority inheritance remain incomplete.
+private PID view; both actual public modes pass 21 checks. Checkpoint 35
+qualifies same-kernel initial nice inheritance through both modes and their
+private fork. CPU placement, worker-exec and WKI priority inheritance remain
+incomplete.
 Exact-owner ambient network admission is implemented;
 complete PID, lifecycle and WKI qualification remains incomplete. Independent
 service isolation and all ten goal criteria remain unqualified. Goal28 remains
@@ -1514,3 +1516,61 @@ a 20GiB disposable budget and 40GiB free-space floor. Audit exact ownership and
 live references before pruning disposable images after passing and failing
 tests. Retain small evidence and preserve required current/seed artifacts and
 all user or unrelated VM disks.
+
+## Checkpoint35: initial priority inheritance (2026-10-11)
+
+Native creation inherits the larger nice value of the exact canonical creator
+and executing actor. Short VM publication guards capture both live sources,
+derive the exclusively owned unpublished child's weight through the real
+scheduler table, and revalidate both observations plus child nice/weight before
+lifecycle registration or posting. Changed observations return EAGAIN before
+effects. Ordinary local spawn snapshots the actor after claiming child recovery;
+later parent changes do not retroactively change that child. Loader IO, resource
+locks, WKI placement and heavy cleanup remain outside the new short VM scopes.
+
+The construction-only scheduler helper validates ownership, exactly two child
+references, active/unpublished/unlinked/detached state and signed nice range
+before either write. It preserves runtime, deadlines and consumed slices. Task/
+File layouts, public ABI/wire/libc interfaces, Host priority setters, boot and
+remote-file defaults, in-place/worker exec and all 139 old native case bodies remain.
+Fork/clone/pthread already inherited actor nice; this patch preserves that code
+and does not claim coherent observations during concurrent priority changes.
+
+Five actual native cases cover signed values/derived weights, canonical-vs-actor
+priority, changed sources/child fields, invalid state/range/image/CPU refusals
+and exact ownership/population/namespace drain. Both actual normal public-spec
+and real CLI modes start at nice 5 from the Host, their local PID 2 forks retain 5,
+they lower to 7 and receive EACCES for raise 6. Guessed Host physical IDs return
+ESRCH; Host nice 5 remains unchanged, both waits return exit0, and both exact
+56-byte reports pass all 21 checks. This qualifies same-kernel initial inheritance.
+
+Normal Build WOS retry02 PASS 198.486s; isolated fast diagnostic build PASS 63.221s;
+48 selected Host tests PASS 38.980s; format/tidy PASS 95.526s; fixture build PASS 0.297s;
+31 preservation checks PASS. All 128 credential source tests remain present and
+passing in the selected Host run. Public35-01 PASS 38.559s / 169 stable pins. KTEST63
+--fast --no-setup PASS 485.420s, 89,409 assertions / 0 failures / 1,398 cases,
+all 147 mandatory,
+normal poweroff / 149 stable pins (147 distinct paths). Public/diagnostic four-image prunes
+removed 91,242,496 / 261,570,560 allocated bytes; final 0 disposable, user VM
+13532 UID945 preserved, inventories unreadable 0. One topology, 20GiB budget /
+40GiB free-space floor,
+COW/reflinks and exact UID/PID/QMP/FD/inode/backing proofs remain required.
+
+Initial Normal build01 failed after 24.383s in bundled Bash/OpenSSL using a transient
+generated stdint include_next shim. The completed installer restored mlibc's
+complete header; unchanged-source retry02 passed. The graph permits overlapping
+conformance reinstall and port builds; exact overlap is inferred, not traced.
+The failed receipt and read-only diagnosis remain. Before any public35 launch,
+review corrected the runner so serial PASS only triggers stopping; final PASS
+requires durable Host rows and both exact private reports. All other receipts
+and historical failed evidence are preserved.
+
+Audit checkpoint-35-audit.json SHA256
+fc86708187c24ddfff1cb6106220997153892cc07586aec9036bf79ab54f36c6 PASS.
+Goal39 remains ACTIVE/all ten full criteria INCOMPLETE. CPU placement/immutable
+ceilings, worker-exec actor priority, coherent ordinary fork/thread observations,
+WKI nice transport, hostile/shared/futex/init evidence, two simultaneous 2h trees,
+1,000 full lifecycles/all reference baselines and complete Host/init/libc regression
+remain. Continue CPU-domain publication and placement work. Launch with
+--no-setup; preserve normal/KTEST build/data/sysroot isolation and prune images
+after PASS/FAIL/exception. No pause or push.

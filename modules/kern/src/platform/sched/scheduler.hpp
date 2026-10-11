@@ -477,6 +477,10 @@ auto task_has_live_pagemap_sibling(task::Task* subject) -> bool;
 // logical AS current/peak without allocating a task snapshot.
 void record_address_space_usage(task::Task* subject, mm::paging::PageTable* root, uint64_t bytes);
 void set_task_nice(task::Task* task, int nice);  // Update task weight safely on its run queue
+// Construction only: caller owns this exact unpublished child through the
+// owner's recovery slot. Derive weight from nice without touching live queues,
+// runtime history, deadlines or slices. Failure leaves all fields unchanged.
+auto initialize_unpublished_task_priority(task::Task& owner, task::Task& child, int nice) -> int;
 // Caller retains subject and private scope and holds VM publication through
 // authorization/commit. Verify queue ownership before checking namespace
 // closure and changing weight; missing ownership returns EAGAIN without writes.
