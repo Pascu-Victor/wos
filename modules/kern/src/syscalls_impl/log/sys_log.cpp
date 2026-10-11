@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <platform/security/compartment_host.hpp>
 
 #include "abi/callnums/perf_trace.h"
 #include "abi/callnums/sys_log.h"
@@ -236,9 +237,15 @@ auto record_userspace_startup_marker(ker::mod::sched::task::Task* task, uint64_t
 static_assert(static_cast<uint64_t>(ker::abi::callnums::SYS_LOG) == WOS_PERF_TRACE_SYS_LOG);
 static_assert(static_cast<uint64_t>(ker::abi::sys_log::sys_log_ops::PERF_TRACE) == WOS_PERF_TRACE_LOG_OP);
 
-auto sys_log(ker::abi::sys_log::sys_log_ops op, uint64_t str_user_addr, uint64_t len, uint64_t device_or_level, uint64_t module_user_addr,
-             uint64_t cookie) -> uint64_t {
-    auto* current_task = ker::mod::sched::get_current_task();
+auto sys_log_for_subject(ker::mod::sched::task::Task* current_task, ker::abi::sys_log::sys_log_ops op, uint64_t str_user_addr, uint64_t len,
+                         uint64_t device_or_level, uint64_t module_user_addr, uint64_t cookie) -> uint64_t {
+    bool const GLOBAL = op == abi::sys_log::sys_log_ops::LOG_BLOCK_BEGIN || op == abi::sys_log::sys_log_ops::LOG_BLOCK_END ||
+                        ((op == abi::sys_log::sys_log_ops::LOG || op == abi::sys_log::sys_log_ops::LOG_LINE) &&
+                         device_or_level == static_cast<uint64_t>(abi::sys_log::sys_log_device::VGA));
+    if (GLOBAL) {
+        int const SCOPE = mod::security::compartment::host_namespace_admission(current_task);
+        if (SCOPE != 0) return static_cast<uint64_t>(SCOPE);
+    }
     if (op == abi::sys_log::sys_log_ops::PERF_TRACE) {
         return record_userspace_startup_marker(current_task, str_user_addr, len, device_or_level, module_user_addr, cookie);
     }
@@ -428,6 +435,11 @@ auto sys_log(ker::abi::sys_log::sys_log_ops op, uint64_t str_user_addr, uint64_t
             break;
     }
     return 0;
+}
+
+auto sys_log(ker::abi::sys_log::sys_log_ops op, uint64_t str_user_addr, uint64_t len, uint64_t device_or_level, uint64_t module_user_addr,
+             uint64_t cookie) -> uint64_t {
+    return sys_log_for_subject(ker::mod::sched::get_current_task(), op, str_user_addr, len, device_or_level, module_user_addr, cookie);
 }
 
 void sys_log_cleanup_for_task(ker::mod::sched::task::Task* task) {

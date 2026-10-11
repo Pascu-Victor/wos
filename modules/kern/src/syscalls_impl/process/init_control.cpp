@@ -8,6 +8,7 @@
 #include <cstring>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/security/compartment_host.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <platform/sys/usercopy.hpp>
 
@@ -228,11 +229,12 @@ auto validate_status(init_abi::StatusSnapshot& status) -> bool {
 
 }  // namespace
 
-auto wos_proc_init_control_submit(uint64_t request_addr) -> uint64_t {
-    auto* task = current_task();
+auto init_control_submit_for_subject(ker::mod::sched::task::Task* task, uint64_t request_addr) -> uint64_t {
     if (task == nullptr) {
         return static_cast<uint64_t>(-ESRCH);
     }
+    int const SCOPE = ker::mod::security::compartment::host_namespace_admission(task);
+    if (SCOPE != 0) return static_cast<uint64_t>(SCOPE);
     auto const CREDENTIALS = task->credentials();
     if (!CREDENTIALS.allows(ker::mod::security::Authority::INIT_CONTROL)) {
         return static_cast<uint64_t>(-EPERM);
@@ -259,11 +261,12 @@ auto wos_proc_init_control_submit(uint64_t request_addr) -> uint64_t {
     return static_cast<uint64_t>(RESULT);
 }
 
-auto wos_proc_init_control_receive(uint64_t request_addr) -> uint64_t {
-    auto* task = current_task();
+auto init_control_receive_for_subject(ker::mod::sched::task::Task* task, uint64_t request_addr) -> uint64_t {
     if (task == nullptr) {
         return static_cast<uint64_t>(-ESRCH);
     }
+    int const SCOPE = ker::mod::security::compartment::host_namespace_admission(task);
+    if (SCOPE != 0) return static_cast<uint64_t>(SCOPE);
     if (!is_init_process(*task)) {
         return static_cast<uint64_t>(-EPERM);
     }
@@ -290,11 +293,12 @@ auto wos_proc_init_control_receive(uint64_t request_addr) -> uint64_t {
     return COPIED ? 0 : static_cast<uint64_t>(-EFAULT);
 }
 
-auto wos_proc_init_status_publish(uint64_t status_addr) -> uint64_t {
-    auto* task = current_task();
+auto init_status_publish_for_subject(ker::mod::sched::task::Task* task, uint64_t status_addr) -> uint64_t {
     if (task == nullptr) {
         return static_cast<uint64_t>(-ESRCH);
     }
+    int const SCOPE = ker::mod::security::compartment::host_namespace_admission(task);
+    if (SCOPE != 0) return static_cast<uint64_t>(SCOPE);
     if (!is_init_process(*task)) {
         return static_cast<uint64_t>(-EPERM);
     }
@@ -322,11 +326,12 @@ auto wos_proc_init_status_publish(uint64_t status_addr) -> uint64_t {
     return 0;
 }
 
-auto wos_proc_init_status_read(uint64_t status_addr) -> uint64_t {
-    auto* task = current_task();
+auto init_status_read_for_subject(ker::mod::sched::task::Task* task, uint64_t status_addr) -> uint64_t {
     if (task == nullptr) {
         return static_cast<uint64_t>(-ESRCH);
     }
+    int const SCOPE = ker::mod::security::compartment::host_namespace_admission(task);
+    if (SCOPE != 0) return static_cast<uint64_t>(SCOPE);
     if (status_addr == 0) {
         return static_cast<uint64_t>(-EFAULT);
     }
@@ -342,6 +347,15 @@ auto wos_proc_init_status_read(uint64_t status_addr) -> uint64_t {
 
     return ker::mod::sys::usercopy::copy_value_to_task(*task, status_addr, status) ? 0 : static_cast<uint64_t>(-EFAULT);
 }
+
+auto wos_proc_init_control_submit(uint64_t request_addr) -> uint64_t {
+    return init_control_submit_for_subject(current_task(), request_addr);
+}
+auto wos_proc_init_control_receive(uint64_t request_addr) -> uint64_t {
+    return init_control_receive_for_subject(current_task(), request_addr);
+}
+auto wos_proc_init_status_publish(uint64_t status_addr) -> uint64_t { return init_status_publish_for_subject(current_task(), status_addr); }
+auto wos_proc_init_status_read(uint64_t status_addr) -> uint64_t { return init_status_read_for_subject(current_task(), status_addr); }
 
 #ifdef WOS_SELFTEST
 auto init_control_selftest_mailbox() -> bool {

@@ -1,6 +1,9 @@
+#include <abi/callnums/multiproc.h>
 #include <abi/callnums/net.h>
 #include <abi/callnums/power.h>
+#include <abi/callnums/sys_log.h>
 #include <abi/callnums/vfs.h>
+#include <abi/callnums/vmem.h>
 #include <extern/elf.h>
 
 #include <array>
@@ -27,6 +30,7 @@
 #include <platform/sched/pid_namespace.hpp>
 #include <platform/sched/resource.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <platform/sched/service_resource.hpp>
 #include <platform/sched/session.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sched/threading.hpp>
@@ -35,11 +39,15 @@
 #include <platform/security/compartment_policy.hpp>
 #include <platform/security/compartment_wki.hpp>
 #include <platform/security/credentials.hpp>
+#include <platform/sys/syscall.hpp>
 #include <platform/sys/usercopy.hpp>
+#include <syscalls_impl/log/sys_log.hpp>
+#include <syscalls_impl/multiproc/threadControl.hpp>
 #include <syscalls_impl/net/sys_net.hpp>
 #include <syscalls_impl/process/child_events.hpp>
 #include <syscalls_impl/process/exec.hpp>
 #include <syscalls_impl/process/exit.hpp>
+#include <syscalls_impl/process/init_control.hpp>
 #include <syscalls_impl/process/process.hpp>
 #include <syscalls_impl/shm/shm.hpp>
 #include <syscalls_impl/vfs/sys_vfs.hpp>
@@ -6848,4 +6856,203 @@ KTEST(CompartmentConstruction, BusyOwnerAndOversizedStaticSourcePreserveRecovery
     KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
     KEXPECT_EQ(ipc::live_namespace_count(), IPC);
     KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
+}
+
+namespace {
+void expect_global_controls_refused(Task* subject, int expected, uint64_t memory = UINT64_MAX) {
+    auto const ERROR = static_cast<uint64_t>(expected);
+    for (uint64_t op : {0, 1}) KEXPECT_EQ(ker::mod::sys::debug_interrupt_control_for_subject(subject, op), ERROR);
+    using Cpu = abi::multiproc::threadControlOps;
+    for (auto op : {Cpu::SET_AFFINITY, Cpu::GET_AFFINITY, Cpu::CREATE_DOMAIN, Cpu::SET_DOMAIN, Cpu::QUERY_DOMAIN})
+        KEXPECT_EQ(ker::syscall::multiproc::host_thread_control_for_subject(subject, op, memory, memory, memory), ERROR);
+    for (auto op : {abi::vmem::ops::SWAPON, abi::vmem::ops::SWAPOFF})
+        KEXPECT_EQ(ker::syscall::vmem::swap_control_for_subject(subject, static_cast<uint64_t>(op), memory, 0),
+                   subject != nullptr ? ERROR : static_cast<uint64_t>(-EFAULT));
+    KEXPECT_EQ(ker::syscall::process::init_control_submit_for_subject(subject, memory), ERROR);
+    KEXPECT_EQ(ker::syscall::process::init_control_receive_for_subject(subject, memory), ERROR);
+    KEXPECT_EQ(ker::syscall::process::init_status_publish_for_subject(subject, memory), ERROR);
+    KEXPECT_EQ(ker::syscall::process::init_status_read_for_subject(subject, memory), ERROR);
+    auto const MANAGEMENT = subject != nullptr ? ERROR : static_cast<uint64_t>(-EPERM);
+    KEXPECT_EQ(resource::service_configure_for_subject(subject, memory), MANAGEMENT);
+    KEXPECT_EQ(resource::service_select_for_subject(subject, UINT64_MAX), MANAGEMENT);
+    KEXPECT_EQ(resource::service_read_for_subject(subject, 0, memory, abi::service_resource::VERSION), ERROR);
+    using Log = abi::sys_log::sys_log_ops;
+    for (auto op : {Log::LOG_BLOCK_BEGIN, Log::LOG_BLOCK_END, Log::LOG, Log::LOG_LINE})
+        KEXPECT_EQ(ker::syscall::log::sys_log_for_subject(subject, op, memory, 32, static_cast<uint64_t>(abi::sys_log::sys_log_device::VGA),
+                                                          memory, UINT64_MAX),
+                   ERROR);
+    KEXPECT_EQ(ker::syscall::vfs::sync_for_subject(subject), int64_t{expected});
+}
+}  // namespace
+
+KTEST(CompartmentGlobalControl, EveryPrivateViewAndSharedNetworkRefusesHostEffects) {
+    auto const PIDS = pid_ns::live_namespace_count();
+    auto const IPC = ipc::live_namespace_count();
+    auto const MOUNTS = mount_ns::live_namespace_count();
+    for (unsigned mask = 1; mask < 8; ++mask) {
+        for (bool nonroot : {false, true}) {
+            pid_ns::NamespaceRef pids, host;
+            ipc::NamespaceRef names;
+            mount_ns::NamespaceRef mounts;
+            KREQUIRE_EQ(pid_ns::create_namespace(host, Network::SHARED_HOST, pids), 0);
+            KREQUIRE_EQ(ipc::create_namespace(names), 0);
+            KREQUIRE_EQ(mount_ns::create_namespace(mounts), 0);
+            NativeTask subject;
+            subject.task->type = sched::task::TaskType::PROCESS;
+            if ((mask & 1) != 0) KREQUIRE_TRUE(subject.task->initialize_pid_namespace(pids));
+            if ((mask & 2) != 0) KREQUIRE_TRUE(subject.task->initialize_ipc_namespace(names));
+            if ((mask & 4) != 0) KREQUIRE_TRUE(subject.task->initialize_mount_namespace(mounts));
+            if (nonroot) {
+                security::Snapshot identity;
+                KREQUIRE_EQ(subject.task->credentials().prepare({.change = security::Change::SET_EUID, .effective = 710}, identity), 0);
+                KREQUIRE_EQ(resource::initialize_credentials(*subject.task, identity), 0);
+            } else {
+                KEXPECT_TRUE(subject.task->credentials().allows(security::Authority::KERNEL_DEBUG));
+            }
+            subject.task->selected_child_service = 7;
+            auto const REFERENCES = subject.task->ref_count.load();
+            auto const DOMAIN = subject.task->domain_id;
+            auto const MASK = subject.task->domain_mask;
+            expect_global_controls_refused(subject.task.get(), -EPERM);
+            KEXPECT_EQ(subject.task->selected_child_service, uint64_t{7});
+            KEXPECT_EQ(subject.task->domain_id, DOMAIN);
+            KEXPECT_EQ(subject.task->domain_mask, MASK);
+            KEXPECT_EQ(subject.task->ref_count.load(), REFERENCES);
+            KEXPECT_EQ(subject.task->usercopy_pagemap_accesses.load(), uint32_t{0});
+        }
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
+    KEXPECT_EQ(ipc::live_namespace_count(), IPC);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
+}
+
+KTEST(CompartmentGlobalControl, CanonicalThreadsIgnoreShadowFieldsAndCloseBeforeEffects) {
+    auto const PIDS = pid_ns::live_namespace_count();
+    auto const IPC = ipc::live_namespace_count();
+    auto const MOUNTS = mount_ns::live_namespace_count();
+    {
+        ipc::NamespaceRef names;
+        KREQUIRE_EQ(ipc::create_namespace(names), 0);
+        UserTask owner;
+        NativeTask thread, unbound;
+        KREQUIRE_TRUE(owner.task->initialize_ipc_namespace(names));
+        thread.task->is_thread = true;
+        thread.task->owner_pid = owner.task->pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(*thread.task, *owner.task));
+        unbound.task->is_thread = true;
+        unbound.task->owner_pid = owner.task->pid;
+        auto const REFERENCES = owner.task->ref_count.load();
+        expect_global_controls_refused(thread.task.get(), -EPERM);
+        expect_global_controls_refused(unbound.task.get(), -ESRCH);
+        expect_global_controls_refused(nullptr, -ESRCH);
+        names.close();
+        expect_global_controls_refused(owner.task.get(), -EIDRM);
+        expect_global_controls_refused(thread.task.get(), -EIDRM);
+        KEXPECT_EQ(owner.task->ref_count.load(), REFERENCES);
+        KEXPECT_EQ(owner.task->usercopy_pagemap_accesses.load(), uint32_t{0});
+    }
+    {
+        pid_ns::NamespaceRef pids;
+        ipc::NamespaceRef names;
+        mount_ns::NamespaceRef mounts;
+        KREQUIRE_EQ(pid_ns::create_namespace(pids), 0);
+        KREQUIRE_EQ(ipc::create_namespace(names), 0);
+        KREQUIRE_EQ(mount_ns::create_namespace(mounts), 0);
+        UserTask owner;
+        NativeTask shadow;
+        KREQUIRE_TRUE(shadow.task->initialize_pid_namespace(pids));
+        KREQUIRE_TRUE(shadow.task->initialize_ipc_namespace(names));
+        KREQUIRE_TRUE(shadow.task->initialize_mount_namespace(mounts));
+        shadow.task->is_thread = true;
+        shadow.task->owner_pid = owner.task->pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(*shadow.task, *owner.task));
+        pids.close();
+        names.close();
+        mounts.close();
+        KEXPECT_EQ(security::compartment::host_namespace_admission(shadow.task.get()), 0);
+        KEXPECT_EQ(ker::syscall::multiproc::host_thread_control_for_subject(
+                       shadow.task.get(), abi::multiproc::threadControlOps::GET_AFFINITY, UINT64_MAX, 0, 0),
+                   static_cast<uint64_t>(-ESRCH));
+        KEXPECT_EQ(ker::syscall::process::init_status_read_for_subject(shadow.task.get(), 0), static_cast<uint64_t>(-EFAULT));
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
+    KEXPECT_EQ(ipc::live_namespace_count(), IPC);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
+}
+
+KTEST(CompartmentGlobalControl, MappedInputsAndOutputsStayUntouchedOnPrivateRefusal) {
+    auto const PIDS = pid_ns::live_namespace_count();
+    auto const IPC = ipc::live_namespace_count();
+    auto const MOUNTS = mount_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef pids;
+        ipc::NamespaceRef names;
+        mount_ns::NamespaceRef mounts;
+        KREQUIRE_EQ(pid_ns::create_namespace(pids), 0);
+        KREQUIRE_EQ(ipc::create_namespace(names), 0);
+        KREQUIRE_EQ(mount_ns::create_namespace(mounts), 0);
+        UserTask subject;
+        KREQUIRE_TRUE(subject.task->initialize_pid_namespace(pids));
+        KREQUIRE_TRUE(subject.task->initialize_ipc_namespace(names));
+        KREQUIRE_TRUE(subject.task->initialize_mount_namespace(mounts));
+        constexpr uint64_t BUFFER = 0x680000;
+        KREQUIRE_TRUE(subject.map_zero(BUFFER));
+        std::array<uint8_t, 1024> before{}, after{};
+        before.fill(73);
+        KREQUIRE_TRUE(usercopy::copy_to_task(*subject.task, BUFFER, before.data(), before.size()));
+        subject.task->selected_child_service = 7;
+        auto const REFERENCES = subject.task->ref_count.load();
+        expect_global_controls_refused(subject.task.get(), -EPERM, BUFFER);
+        pids.close();
+        expect_global_controls_refused(subject.task.get(), -EIDRM, BUFFER);
+        KREQUIRE_TRUE(usercopy::copy_from_task(*subject.task, BUFFER, after.data(), after.size()));
+        KEXPECT_TRUE(before == after);
+        KEXPECT_EQ(subject.task->selected_child_service, uint64_t{7});
+        KEXPECT_EQ(subject.task->ref_count.load(), REFERENCES);
+        KEXPECT_EQ(subject.task->usercopy_pagemap_accesses.load(), uint32_t{0});
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
+    KEXPECT_EQ(ipc::live_namespace_count(), IPC);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
+}
+
+KTEST(CompartmentGlobalControl, HostValidationAndOriginalInitRoleKeepLegacyErrors) {
+    UserTask host;
+    constexpr uint64_t BUFFER = 0x690000;
+    KREQUIRE_TRUE(host.map_zero(BUFFER));
+    using Cpu = abi::multiproc::threadControlOps;
+    KEXPECT_EQ(ker::syscall::multiproc::host_thread_control_for_subject(host.task.get(), Cpu::CREATE_DOMAIN, BUFFER, 0, 0),
+               static_cast<uint64_t>(-EINVAL));
+    KEXPECT_EQ(ker::syscall::multiproc::host_thread_control_for_subject(host.task.get(), Cpu::SET_DOMAIN, UINT64_MAX, UINT64_MAX, 0),
+               static_cast<uint64_t>(-EINVAL));
+    KEXPECT_EQ(ker::syscall::multiproc::host_thread_control_for_subject(host.task.get(), Cpu::QUERY_DOMAIN, UINT64_MAX, BUFFER, 0),
+               static_cast<uint64_t>(-EINVAL));
+    KEXPECT_EQ(ker::syscall::multiproc::host_thread_control_for_subject(host.task.get(), Cpu::GET_AFFINITY, UINT64_MAX, 0, 0),
+               static_cast<uint64_t>(-ESRCH));
+    for (auto op : {abi::vmem::ops::SWAPON, abi::vmem::ops::SWAPOFF})
+        KEXPECT_EQ(ker::syscall::vmem::swap_control_for_subject(host.task.get(), static_cast<uint64_t>(op), 0, 0),
+                   static_cast<uint64_t>(-EFAULT));
+    KEXPECT_EQ(ker::syscall::process::init_control_submit_for_subject(host.task.get(), 0), static_cast<uint64_t>(-EFAULT));
+    KEXPECT_EQ(ker::syscall::process::init_control_receive_for_subject(host.task.get(), 0), static_cast<uint64_t>(-EPERM));
+    KEXPECT_EQ(ker::syscall::process::init_status_publish_for_subject(host.task.get(), 0), static_cast<uint64_t>(-EPERM));
+    KEXPECT_EQ(ker::syscall::process::init_status_read_for_subject(host.task.get(), 0), static_cast<uint64_t>(-EFAULT));
+    KEXPECT_EQ(resource::service_read_for_subject(host.task.get(), UINT64_MAX, BUFFER, abi::service_resource::VERSION),
+               static_cast<uint64_t>(-EINVAL));
+    KEXPECT_EQ(ker::syscall::log::sys_log_for_subject(host.task.get(), abi::sys_log::sys_log_ops::LOG, 0, 0,
+                                                      static_cast<uint64_t>(abi::sys_log::sys_log_device::SERIAL), 0, 0),
+               static_cast<uint64_t>(-EFAULT));
+    host.task->pid = 1;
+    KEXPECT_EQ(ker::syscall::process::init_control_receive_for_subject(host.task.get(), 0), static_cast<uint64_t>(-EFAULT));
+    KEXPECT_EQ(ker::syscall::process::init_status_publish_for_subject(host.task.get(), 0), static_cast<uint64_t>(-EFAULT));
+    KEXPECT_EQ(resource::service_configure_for_subject(host.task.get(), 0), static_cast<uint64_t>(-EFAULT));
+    host.task->selected_child_service = 7;
+    KEXPECT_EQ(resource::service_select_for_subject(host.task.get(), abi::service_resource::MAX_SERVICES), static_cast<uint64_t>(-EINVAL));
+    KEXPECT_EQ(host.task->selected_child_service, uint64_t{abi::service_resource::NO_SELECTION});
+    security::Snapshot nonroot;
+    KREQUIRE_EQ(host.task->credentials().prepare({.change = security::Change::SET_EUID, .effective = 710}, nonroot), 0);
+    KREQUIRE_EQ(resource::initialize_credentials(*host.task, nonroot), 0);
+    KEXPECT_EQ(ker::mod::sys::debug_interrupt_control_for_subject(host.task.get(), 0), static_cast<uint64_t>(-EPERM));
+    KEXPECT_EQ(ker::syscall::process::init_control_submit_for_subject(host.task.get(), BUFFER), static_cast<uint64_t>(-EPERM));
+    KEXPECT_EQ(resource::service_read_for_subject(host.task.get(), 0, BUFFER, abi::service_resource::VERSION),
+               static_cast<uint64_t>(-EACCES));
 }

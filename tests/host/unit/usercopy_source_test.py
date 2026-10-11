@@ -552,7 +552,14 @@ def require_ptrace_and_mremap_use_stable_pages() -> None:
 
 def require_string_and_ioctl_contracts_are_closed() -> None:
     log = LOG_CPP.read_text()
-    safe_copy = function_body(log, "sys_log")
+    safe_copy = function_body(log, "sys_log_for_subject")
+    wrapper = function_body(log, "sys_log")
+    if "sys_log_for_subject(ker::mod::sched::get_current_task()," not in wrapper:
+        fail("Logging syscall must pass its actual current Task to mapped usercopy")
+    scope = safe_copy.find("host_namespace_admission(current_task)")
+    copy = safe_copy.find("copy_cstring_from_task_strict")
+    if scope < 0 or copy < 0 or scope > copy:
+        fail("Global logging controls must check canonical Host scope before usercopy")
     if "copy_cstring_from_task_strict(*current_task, src_user_addr, dest, dest_size)" not in safe_copy:
         fail("NUL-terminated logging must reject unterminated user strings")
 

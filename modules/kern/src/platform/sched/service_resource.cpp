@@ -33,6 +33,8 @@ auto is_init(task::Task* subject) -> bool { return subject != nullptr && subject
 
 auto service_management_status(task::Task* caller) -> int {
     if (caller == nullptr) return -EPERM;
+    int const SCOPE = security::compartment::host_namespace_admission(caller);
+    if (SCOPE != 0) return SCOPE;
     auto const CREDENTIALS = caller->credentials();
     return security::authorize_service_resource_management(CREDENTIALS, is_init(caller));
 }
@@ -542,13 +544,17 @@ auto select_service_for(task::Task* caller, uint64_t slot) -> uint64_t {
 }
 }  // namespace
 
-auto syscall_service_configure(uint64_t address) -> uint64_t { return configure_service_for(get_current_task(), address); }
+auto service_configure_for_subject(task::Task* caller, uint64_t address) -> uint64_t { return configure_service_for(caller, address); }
+auto service_select_for_subject(task::Task* caller, uint64_t slot) -> uint64_t { return select_service_for(caller, slot); }
 
-auto syscall_service_select(uint64_t slot) -> uint64_t { return select_service_for(get_current_task(), slot); }
+auto syscall_service_configure(uint64_t address) -> uint64_t { return service_configure_for_subject(get_current_task(), address); }
 
-auto syscall_service_read(uint64_t slot, uint64_t address, uint64_t version) -> uint64_t {
-    auto* caller = get_current_task();
+auto syscall_service_select(uint64_t slot) -> uint64_t { return service_select_for_subject(get_current_task(), slot); }
+
+auto service_read_for_subject(task::Task* caller, uint64_t slot, uint64_t address, uint64_t version) -> uint64_t {
     if (caller == nullptr) return static_cast<uint64_t>(-ESRCH);
+    int const SCOPE = security::compartment::host_namespace_admission(caller);
+    if (SCOPE != 0) return static_cast<uint64_t>(SCOPE);
     if (!caller->credentials().allows(ker::mod::security::Authority::RESOURCE_LIMIT)) return static_cast<uint64_t>(-EACCES);
     if (slot >= services.size() || version != service_abi::VERSION) return static_cast<uint64_t>(-EINVAL);
     service_abi::Snapshot snapshot{};
@@ -590,6 +596,10 @@ auto syscall_service_read(uint64_t slot, uint64_t address, uint64_t version) -> 
     return sys::usercopy::copy_value_to_task(*caller, address, snapshot) ? 0 : static_cast<uint64_t>(-EFAULT);
 }
 
+auto syscall_service_read(uint64_t slot, uint64_t address, uint64_t version) -> uint64_t {
+    return service_read_for_subject(get_current_task(), slot, address, version);
+}
+
 #ifdef WOS_SELFTEST
 auto selftest_service_management_authority() -> bool {
     using namespace security;
@@ -620,10 +630,18 @@ auto selftest_service_management_authority() -> bool {
                 return false;
         }
     }
+    task::Task owner{};
     task::Task thread{};
     thread.pid = 1;
     thread.is_thread = true;
     thread.selected_child_service = 7;
+    constexpr uint64_t UNBOUND = static_cast<uint64_t>(-ESRCH);
+    if (configure_service_for(&thread, UINT64_MAX) != UNBOUND || select_service_for(&thread, service_abi::NO_SELECTION) != UNBOUND ||
+        thread.selected_child_service != 7)
+        return false;
+    owner.pid = 1;
+    thread.owner_pid = owner.pid;
+    if (!bind_thread_owner(thread, owner)) return false;
     return configure_service_for(&thread, UINT64_MAX) == DENIED && select_service_for(&thread, service_abi::NO_SELECTION) == DENIED &&
            thread.selected_child_service == 7;
 }

@@ -1183,9 +1183,9 @@ root population/import/non-root ownership, explicit FD/shared mapping manifests,
 init/job/parent and atomic publication remain required. Other existing image/
 construction allocation paths and actual scheduled fatal races are not covered
 by these nine targeted allocation refusals or transferred recovery hooks.
-SYS_DEBUG and global service-resource reads also
-need explicit private-view policy alongside the remaining global/device/swap/
-perf/WKI census. The current129 credential source calls still have24 failures.
+Checkpoint 30 supplies private-view admission for DEBUG, service-resource
+controls and the selected Host-global operations described below. The remaining
+explicit FD/device/perf/indirect WKI consumer census still needs qualification. The current129 credential source calls still have24 failures.
 No scheduled service, shared-futex, two-hour or1,000 full lifecycle claim follows
 from these unpublished native cases; all ten Goal39 criteria remain incomplete.
 
@@ -1228,10 +1228,10 @@ is not declared transferred before real publication.
 
 Public creation remains disabled. Atomic creator-policy publication, successful
 root ownership transfer, versioned userspace spec/launcher and explicit shared
-mapping/nonregular FD manifests remain required. The global-control review found
-additional DEBUG, CPU-domain/affinity, swap, init mailbox/status, service-resource
-read, global sync and log-block/framebuffer paths needing scope policy before
-public enablement. Scheduled fatal races, actual shared futex/init death, two
+mapping and complete FD capability manifests remain required. Checkpoint 30
+closes the selected DEBUG, CPU-domain/affinity, swap, init mailbox/status, service
+resource, global sync and log-block/framebuffer gaps. Remaining explicit device/
+FD/indirect consumers still need qualification before public enablement. Scheduled fatal races, actual shared futex/init death, two
 service trees on one kernel for 2 hours and 1,000 full lifecycles remain unqualified.
 The current 129 credential source calls still have 24 unchanged failures. All ten
 full Goal39 criteria remain incomplete and the goal is ACTIVE.
@@ -1249,6 +1249,53 @@ services or scheduled fatal-signal races. Failed attempts 52–55 remain recorde
 Twenty proven inactive disposable images from all five attempts were pruned;
 final disposable allocation is 0. Required seeds/current artifacts and unrelated
 user VMs were preserved.
+
+## Host-global syscall controls (checkpoint 30)
+
+Private native Tasks cannot use DEBUG interrupt control, physical CPU affinity or
+CPU-domain controls, swap activation/deactivation, the global init mailbox/status
+API, global service configuration/selection/observations, filesystem-wide SYNC,
+userspace log-block ownership, or VGA logging. Each consuming adapter checks the
+exact canonical retained PID, mount and IPC views before usercopy, physical Task
+lookup, global locks or effects. Any private view refuses with EPERM, a closed
+view with EIDRM, and a missing canonical owner with ESRCH. Existing internal null
+exceptions for swap and service management remain. Root credentials and an
+explicit shared-host network grant do not confer Host scope. Thread shadow
+fields neither grant nor revoke its retained process owner's scope.
+
+Syscalls pass their actual current Task into kernel-only consuming adapters.
+Host authority checks, the physical original-init role, validation errors and
+existing implementation bodies remain; the service snapshot helper stays private
+and grants friendship to its consuming reader. No selector, public ABI/libc,
+wire layout, Task/File member, scheduler primitive or swap backend changes.
+Trusted shutdown/swap backends and FSYNC of explicit File capabilities remain.
+
+Ordinary bounded copied logging still writes the shared journal. PERF_TRACE
+retains the existing per-caller startup tracing behavior. This is shared output,
+not a private journal or a qualified producer-rate boundary. VGA and log-block
+controls require Host scope. No broad ban on routine service logging is added.
+
+The existing service-authority fixture now checks an unbound thread, then binds
+a real retained Host owner and preserves its original non-init-thread refusal.
+Four actual native KTEST cases cover all seven private-view combinations with
+root/nonroot identities and shared networking; canonical bound, unbound, null
+and closed owners; copied closed thread fields; mapped input/output sentinels;
+and safe Host validation and original-init errors. They invoke the production
+adapters, retain actual native scopes/Task mappings and check ownership/count
+baselines. They never execute Host raw cli/sti, activate swap, create a CPU domain
+or run a scheduled private service. Full publication/launcher/lifecycle/escape,
+two two-hour trees on one kernel, 1000 complete cycles and broader regression
+qualification remain required. KTEST58 passed 87,570 assertions/0 failures/1,379 cases, all 128 mandatory cases
+with 136 stable pins (134 distinct) and normal poweroff. Normal Build WOS,
+isolated fast diagnostics, all 44 Host tests, format/tidy and 58 compatibility
+checks passed. All 129 current credential-audit calls still report the same 24
+failures; both complete audit source files preserve their original assertions
+and add checks at the new consuming bodies. KTEST57 failed only the service
+sentinel/new fixture and old unbound-role expectation, then was stopped and
+reconciled before correction. Eight exact-owned inactive images were pruned
+(457,211,904 allocated bytes); final disposable usage is 0. Required seeds/current
+artifacts and unrelated user VMs remain. All ten full criteria remain incomplete;
+Goal39 is ACTIVE.
 
 ## Verification checkpoint
 

@@ -198,8 +198,11 @@ def test_control_authorization_precedes_side_effects():
     assert hostname.index("host_namespace_admission(task)") < check
     assert check < hostname.index("copy_from_task") < hostname.index("hostname::set")
     syscall = (ROOT / "modules/kern/src/platform/sys/syscall.cpp").read_text()
-    debug = body_after(syscall, "case abi::callnums::DEBUG:")
+    dispatch = body_after(syscall, "case abi::callnums::DEBUG:")
+    assert "debug_interrupt_control_for_subject(sched::get_current_task(), A1)" in dispatch
+    debug = body_after(syscall, "auto debug_interrupt_control_for_subject(")
     check = debug.index("Authority::KERNEL_DEBUG")
+    assert debug.index("host_namespace_admission(task)") < check
     assert check < debug.index('asm volatile("cli"')
     assert check < debug.index('asm volatile("sti"')
     power = (ROOT / "modules/kern/src/platform/power/power.cpp").read_text()

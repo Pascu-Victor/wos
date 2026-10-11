@@ -559,3 +559,33 @@ reconnaissance records DEBUG, CPU affinity/domains, swap, init mailbox/status,
 service reads, global sync and log-block/framebuffer gaps before public enablement.
 Continue with --no-setup, one topology, 20GiB disposable / 40GiB free, COW/reflink and
 exact-owned inactive-image/appliance pruning on PASS/FAIL. No pause or push.
+
+## Checkpoint30: Host-global consuming admission (2026-10-11)
+
+DEBUG interrupt control, physical CPU affinity/domain controls, swap, global init
+mailbox/status, service configure/select/read, SYNC and log-block/VGA operations
+now refuse private canonical PID/MNT/IPC scope before inputs/lookup/locks/effects.
+Root credentials/shared networking do not grant Host scope. Closed/unbound owners
+and copied thread fields use exact retained canonical ownership. Shared bounded
+journal output/PERF_TRACE, FSYNC capabilities, trusted backends and ordinary Host
+bodies remain; no Task/File layout, public ABI/libc/wire or scheduler primitive
+change. Source audits retain all original assertions and follow consuming bodies.
+
+Normal Build WOS, isolated fast diagnostics,44 Host tests, format/tidy and58
+compatibility checks PASS. Rootless --no-setup KTEST58 PASS87,570assertions/0
+failures/1,379cases/all128mandatory/136stablepins134distinct/normalpoweroff. Four
+new native cases pass private combinations/nonroot/shared networking/canonical
+threads/mapped sentinels/Host errors. Failed57 is retained and reconciled before
+fixture corrections; existing authority helper now verifies unbound refusal and
+original bound-Host non-init role. Eight owned inactive images pruned457,211,904B;
+final0disposable, unrelated user VM and required seeds/current artifacts preserved.
+All129 current credential calls still have the same24failures; broader regression
+remains unqualified. Checkpoint audit PASS, all ten full criteria INCOMPLETE.
+
+Goal39 ACTIVE. Continue atomic creator-policy publication/root ownership transfer
+and versioned launcher/spec, complete FD/device/indirect consumer and shared
+mapping manifests, actual hostile/init/futex/two-hour/1000lifecycle/Host-init-libc
+campaigns. Reconnaissance31 records actual existing mutation guards and remaining
+resource/service coordination plus prepared-mount lifetime requirements. Use
+--no-setup, one topology,20GiBdisposable/40GiBfree,COW/reflinks and exact-owned
+inactive-image/appliance pruning on PASS/FAIL. No pause or push.

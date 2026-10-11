@@ -95,7 +95,7 @@ class ServiceReportTarget {
 
    private:
     friend class RemoteServiceAccounting;
-    friend auto syscall_service_read(uint64_t slot, uint64_t address, uint64_t version) -> uint64_t;
+    friend auto service_read_for_subject(task::Task* caller, uint64_t slot, uint64_t address, uint64_t version) -> uint64_t;
     auto list_head_locked() -> ServiceReportTarget*&;
     void move_from_locked(ServiceReportTarget& other);
     void add_current_locked(RemoteServiceObservation& observation) const;
@@ -111,6 +111,10 @@ class ServiceReportTarget {
 // construction, and the fixed service slot outlives every affiliated task.
 void inherit_service(task::Task& child, task::Task& source);
 auto charge_service_cpu(task::Task& process, uint64_t elapsed_us) -> CpuAction;
+// Caller retains subject; global service observations/control require Host scope.
+auto service_configure_for_subject(task::Task* caller, uint64_t address) -> uint64_t;
+auto service_select_for_subject(task::Task* caller, uint64_t slot) -> uint64_t;
+auto service_read_for_subject(task::Task* caller, uint64_t slot, uint64_t address, uint64_t version) -> uint64_t;
 auto syscall_service_configure(uint64_t address) -> uint64_t;
 auto syscall_service_select(uint64_t slot) -> uint64_t;
 auto syscall_service_read(uint64_t slot, uint64_t address, uint64_t version) -> uint64_t;

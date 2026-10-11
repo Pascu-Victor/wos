@@ -15,6 +15,7 @@
 #include <new>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/security/compartment_host.hpp>
 #include <platform/security/compartment_wki.hpp>
 #include <platform/sys/usercopy.hpp>
 #include <utility>
@@ -463,6 +464,11 @@ auto wki_rules_for_subject(ker::mod::sched::task::Task* subject, uint64_t op_raw
         default:
             return -EINVAL;
     }
+}
+
+auto sync_for_subject(ker::mod::sched::task::Task* subject) -> int64_t {
+    int const SCOPE = ker::mod::security::compartment::host_namespace_admission(subject);
+    return SCOPE != 0 ? SCOPE : static_cast<int64_t>(ker::vfs::vfs_sync());
 }
 
 auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) -> int64_t {
@@ -1332,7 +1338,7 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             return static_cast<int64_t>(ker::vfs::vfs_fsync(FD));
         }
         case ops::SYNC: {
-            return static_cast<int64_t>(ker::vfs::vfs_sync());
+            return sync_for_subject(ker::mod::sched::get_current_task());
         }
         case ops::LINK: {
             KernelPath oldpath{};

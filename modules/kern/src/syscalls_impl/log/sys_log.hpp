@@ -12,6 +12,9 @@ struct Task;
 }
 
 namespace ker::syscall::log {
+// Caller retains subject; Host log-block ownership still belongs to the executing thread.
+auto sys_log_for_subject(ker::mod::sched::task::Task* subject, ker::abi::sys_log::sys_log_ops op, uint64_t str_user_addr, uint64_t len,
+                         uint64_t device_or_level, uint64_t module_user_addr, uint64_t cookie) -> uint64_t;
 auto sys_log(ker::abi::sys_log::sys_log_ops op, uint64_t str_user_addr, uint64_t len, uint64_t device_or_level, uint64_t module_user_addr,
              uint64_t cookie) -> uint64_t;
 void sys_log_cleanup_for_task(ker::mod::sched::task::Task* task);

@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <platform/sched/resource.hpp>
+#include <platform/security/compartment_host.hpp>
 #include <platform/security/credentials.hpp>
 #include <syscalls_impl/futex/futex.hpp>
 #include <syscalls_impl/multiproc/threadControl.hpp>
@@ -85,6 +86,32 @@ auto sysret_bad_return_reason(uint64_t reason) -> const char* {
 }
 }  // namespace
 
+auto debug_interrupt_control_for_subject(sched::task::Task* task, uint64_t op) -> uint64_t {
+    if (task == nullptr) {
+        return static_cast<uint64_t>(-ESRCH);
+    }
+    int const SCOPE = security::compartment::host_namespace_admission(task);
+    if (SCOPE != 0) return static_cast<uint64_t>(SCOPE);
+    auto const CREDENTIALS = task->credentials();
+    if (!CREDENTIALS.allows(security::Authority::KERNEL_DEBUG)) {
+        return static_cast<uint64_t>(-EPERM);
+    }
+    // a1=0: disable interrupts on this CPU; a1=1: re-enable
+    // clang-tidy treats distinct inline asm branches as identical.
+    // NOLINTBEGIN(bugprone-branch-clone)
+    switch (op) {
+        case 0:
+            asm volatile("cli" ::: "memory");
+            break;
+        case 1:
+        default:
+            asm volatile("sti" ::: "memory");
+            break;
+    }
+    // NOLINTEND(bugprone-branch-clone)
+    return 0;
+}
+
 extern "C" auto syscall_handler(cpu::GPRegs* regs) -> uint64_t {
     sched::begin_syscall_accounting();
 
@@ -151,30 +178,7 @@ extern "C" auto syscall_handler(cpu::GPRegs* regs) -> uint64_t {
             result = ker::syscall::power::sys_power(A1, A2);
             break;
         case abi::callnums::DEBUG: {
-            auto* task = sched::get_current_task();
-            if (task == nullptr) {
-                result = static_cast<uint64_t>(-ESRCH);
-                break;
-            }
-            auto const CREDENTIALS = task->credentials();
-            if (!CREDENTIALS.allows(security::Authority::KERNEL_DEBUG)) {
-                result = static_cast<uint64_t>(-EPERM);
-                break;
-            }
-            // a1=0: disable interrupts on this CPU; a1=1: re-enable
-            // clang-tidy treats distinct inline asm branches as identical.
-            // NOLINTBEGIN(bugprone-branch-clone)
-            switch (A1) {
-                case 0:
-                    asm volatile("cli" ::: "memory");
-                    break;
-                case 1:
-                default:
-                    asm volatile("sti" ::: "memory");
-                    break;
-            }
-            // NOLINTEND(bugprone-branch-clone)
-            result = 0;
+            result = debug_interrupt_control_for_subject(sched::get_current_task(), A1);
             break;
         }
 

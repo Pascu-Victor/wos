@@ -15,6 +15,7 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sched/threading.hpp>
+#include <platform/security/compartment_host.hpp>
 #include <platform/sys/context_switch.hpp>
 #include <platform/sys/signal.hpp>
 #include <platform/sys/usercopy.hpp>
@@ -174,6 +175,211 @@ void release_thread_fd_refs(mod::sched::task::Task* task) {
     __builtin_unreachable();
 }
 
+auto host_thread_control_for_subject(mod::sched::task::Task* subject, abi::multiproc::threadControlOps op, uint64_t arg1, uint64_t arg2,
+                                     uint64_t arg3) -> uint64_t {
+    int const SCOPE = mod::security::compartment::host_namespace_admission(subject);
+    if (SCOPE != 0) return static_cast<uint64_t>(SCOPE);
+    switch (op) {
+        case abi::multiproc::threadControlOps::SET_AFFINITY: {
+            auto const TID = arg1;
+            auto const MASK = arg2;
+
+            auto* task = mod::sched::find_task_by_pid_safe(TID);
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
+
+            uint64_t const VALID_MASK = online_cpu_mask();
+            if (VALID_MASK == 0) {
+                task->release();
+                return static_cast<uint64_t>(-ENODEV);
+            }
+            if ((MASK & VALID_MASK) == 0 || (MASK & ~VALID_MASK) != 0) {
+                task->release();
+                return static_cast<uint64_t>(-EINVAL);
+            }
+
+            uint64_t const RUNNING_CPU = mod::sched::current_cpu_for_task(task);
+            bool const IS_RUNNING = RUNNING_CPU != UINT64_MAX;
+            uint64_t const OWNER_CPU = IS_RUNNING ? RUNNING_CPU : mod::sched::owner_cpu_for_task(task);
+            bool const IS_WAITING = task->sched_queue == mod::sched::task::Task::sched_queue::WAITING;
+            if (IS_RUNNING && (MASK & cpu_mask_bit(RUNNING_CPU)) == 0) {
+                task->release();
+                return static_cast<uint64_t>(-EBUSY);
+            }
+            if (IS_WAITING && OWNER_CPU != UINT64_MAX && (MASK & cpu_mask_bit(OWNER_CPU)) == 0) {
+                task->release();
+                return static_cast<uint64_t>(-EBUSY);
+            }
+            if (std::has_single_bit(MASK)) {
+                // Single-CPU pin
+                uint64_t const TARGET_CPU = std::countr_zero(MASK);
+                if (!mod::sched::pin_task_to_cpu(task, TARGET_CPU)) {
+                    task->release();
+                    return static_cast<uint64_t>(-EBUSY);
+                }
+                task->domain_mask = MASK;
+                task->domain_hard = false;
+            } else if (MASK == VALID_MASK) {
+                // Full mask: remove all affinity restrictions
+                task->domain_mask = ~0ULL;
+                task->domain_hard = false;
+                task->cpu_pinned = false;
+            } else {
+                // Multi-bit subset: set domain_mask, pick least-loaded CPU within mask
+                uint64_t const TARGET_CPU = mod::sched::get_least_loaded_cpu_in_mask(MASK);
+                if (!IS_RUNNING && !IS_WAITING && !mod::sched::migrate_task_to_cpu(task, TARGET_CPU)) {
+                    task->release();
+                    return static_cast<uint64_t>(-EBUSY);
+                }
+                task->domain_mask = MASK;
+                task->domain_hard = false;
+                task->cpu_pinned = false;
+            }
+
+            task->release();
+            return 0;
+        }
+
+        case abi::multiproc::threadControlOps::GET_AFFINITY: {
+            auto const TID = arg1;
+
+            auto* task = mod::sched::find_task_by_pid_safe(TID);
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
+
+            uint64_t mask = online_cpu_mask();
+            if (mask == 0) {
+                task->release();
+                return static_cast<uint64_t>(-ENODEV);
+            }
+            if (task->cpu_pinned) {
+                if (task->cpu >= 64) {
+                    task->release();
+                    return static_cast<uint64_t>(-ERANGE);
+                }
+                mask = 1ULL << task->cpu;
+            } else if (task->domain_mask != ~0ULL) {
+                mask = task->domain_mask & online_cpu_mask();
+            }
+
+            task->release();
+            return mask;
+        }
+
+        case abi::multiproc::threadControlOps::CREATE_DOMAIN: {
+            // arg1 = ptr to struct { char name[32]; uint64_t cpu_mask; uint8_t soft_exclusive; uint8_t hard; }
+            constexpr size_t REQUEST_SIZE = 42;
+            std::array<uint8_t, REQUEST_SIZE> request{};
+            auto* current_task = subject;
+            if (current_task == nullptr || !mod::sys::usercopy::copy_from_task(*current_task, arg1, request.data(), request.size())) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+            std::array<char, 32> name{};
+            std::memcpy(name.data(), request.data(), name.size() - 1);
+            name.at(31) = '\0';
+            uint64_t cpu_mask = 0;
+            std::memcpy(&cpu_mask, request.data() + 32, sizeof(cpu_mask));
+            bool const SOFT_EXCLUSIVE = request.at(40) != 0;
+            bool const HARD = request.at(41) != 0;
+            uint64_t const VALID = online_cpu_mask();
+            if ((cpu_mask & VALID) == 0) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
+            cpu_mask &= VALID;
+            uint32_t const DOMAIN_ID = mod::smt::create_leaf_domain(name.data(), cpu_mask, SOFT_EXCLUSIVE, HARD);
+            if (DOMAIN_ID == mod::smt::DOMAIN_ID_INVALID) {
+                return static_cast<uint64_t>(-ENOMEM);
+            }
+            // Apply daemon_load_penalty to each CPU in the new domain if soft_exclusive
+            if (SOFT_EXCLUSIVE) {
+                uint64_t const CPU_COUNT = mod::smt::get_core_count();
+                for (uint64_t cpu = 0; cpu < CPU_COUNT && cpu < 64; ++cpu) {
+                    if ((cpu_mask & (1ULL << cpu)) != 0U) {
+                        mod::sched::set_cpu_daemon_penalty(cpu, SOFT_EXCLUSIVE_DAEMON_PENALTY);
+                    }
+                }
+            }
+            // Phase 8: stamp domain_id on each CPU's RunQueue so work-stealing
+            // checks can enforce hard-domain boundaries without a separate registry lookup.
+            {
+                uint64_t const CPU_COUNT = mod::smt::get_core_count();
+                for (uint64_t cpu = 0; cpu < CPU_COUNT && cpu < 64; ++cpu) {
+                    if ((cpu_mask & (1ULL << cpu)) != 0U) {
+                        mod::sched::set_cpu_domain_id(cpu, DOMAIN_ID);
+                    }
+                }
+            }
+            return DOMAIN_ID;
+        }
+
+        case abi::multiproc::threadControlOps::SET_DOMAIN: {
+            // arg1=tid, arg2=domain_id, arg3=hard (0=soft, 1=hard)
+            auto const TID = arg1;
+            auto const DOMAIN_ID = static_cast<uint32_t>(arg2);
+            bool const HARD = arg3 != 0;
+            auto* dom = mod::smt::get_cpu_domain(DOMAIN_ID);
+            if (dom == nullptr) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
+            auto* task = mod::sched::find_task_by_pid_safe(TID);
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
+            uint64_t const RUNNING_CPU = mod::sched::current_cpu_for_task(task);
+            bool const IS_RUNNING = RUNNING_CPU != UINT64_MAX;
+            uint64_t const OWNER_CPU = IS_RUNNING ? RUNNING_CPU : mod::sched::owner_cpu_for_task(task);
+            bool const IS_WAITING = task->sched_queue == mod::sched::task::Task::sched_queue::WAITING;
+            if (IS_RUNNING && (dom->cpu_mask & cpu_mask_bit(RUNNING_CPU)) == 0) {
+                task->release();
+                return static_cast<uint64_t>(-EBUSY);
+            }
+            if (IS_WAITING && OWNER_CPU != UINT64_MAX && (dom->cpu_mask & cpu_mask_bit(OWNER_CPU)) == 0) {
+                task->release();
+                return static_cast<uint64_t>(-EBUSY);
+            }
+            task->domain_id = DOMAIN_ID;
+            task->domain_mask = dom->cpu_mask;
+            task->domain_hard = HARD || dom->hard;
+            task->cpu_pinned = false;
+            uint64_t const TARGET = mod::sched::get_least_loaded_cpu_in_mask(dom->cpu_mask);
+            if (!IS_RUNNING && !IS_WAITING) {
+                mod::sched::reschedule_task_for_cpu(TARGET, task);
+            }
+            task->release();
+            return 0;
+        }
+
+        case abi::multiproc::threadControlOps::QUERY_DOMAIN: {
+            // arg1=domain_id, arg2=ptr to struct { uint64_t cpu_mask; uint32_t cpu_loads[64]; }
+            auto const DOMAIN_ID = static_cast<uint32_t>(arg1);
+            auto* dom = mod::smt::get_cpu_domain(DOMAIN_ID);
+            if (dom == nullptr) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
+
+            constexpr size_t OUTPUT_SIZE = sizeof(uint64_t) + (64 * sizeof(uint32_t));
+            std::array<uint8_t, OUTPUT_SIZE> output{};
+            std::memcpy(output.data(), &dom->cpu_mask, sizeof(dom->cpu_mask));
+            uint64_t const CPU_COUNT = mod::smt::get_core_count();
+            for (uint64_t cpu = 0; cpu < CPU_COUNT && cpu < 64; ++cpu) {
+                uint32_t const LOAD = ((dom->cpu_mask & (1ULL << cpu)) != 0U) ? mod::sched::get_cpu_load(cpu) : 0;
+                std::memcpy(output.data() + sizeof(uint64_t) + (cpu * sizeof(uint32_t)), &LOAD, sizeof(LOAD));
+            }
+
+            auto* current_task = subject;
+            if (current_task == nullptr || !mod::sys::usercopy::copy_to_task(*current_task, arg2, output.data(), output.size())) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+            return 0;
+        }
+
+        default:
+            return static_cast<uint64_t>(-EINVAL);
+    }
+}
+
 auto thread_control(abi::multiproc::threadControlOps op, uint64_t arg1, uint64_t arg2, uint64_t arg3) -> uint64_t {
     switch (op) {
         case abi::multiproc::threadControlOps::SET_TCB: {
@@ -302,200 +508,12 @@ auto thread_control(abi::multiproc::threadControlOps op, uint64_t arg1, uint64_t
             wos_thread_exit_current();
         }
 
-        case abi::multiproc::threadControlOps::SET_AFFINITY: {
-            auto const TID = arg1;
-            auto const MASK = arg2;
-
-            auto* task = mod::sched::find_task_by_pid_safe(TID);
-            if (task == nullptr) {
-                return static_cast<uint64_t>(-ESRCH);
-            }
-
-            uint64_t const VALID_MASK = online_cpu_mask();
-            if (VALID_MASK == 0) {
-                task->release();
-                return static_cast<uint64_t>(-ENODEV);
-            }
-            if ((MASK & VALID_MASK) == 0 || (MASK & ~VALID_MASK) != 0) {
-                task->release();
-                return static_cast<uint64_t>(-EINVAL);
-            }
-
-            uint64_t const RUNNING_CPU = mod::sched::current_cpu_for_task(task);
-            bool const IS_RUNNING = RUNNING_CPU != UINT64_MAX;
-            uint64_t const OWNER_CPU = IS_RUNNING ? RUNNING_CPU : mod::sched::owner_cpu_for_task(task);
-            bool const IS_WAITING = task->sched_queue == mod::sched::task::Task::sched_queue::WAITING;
-            if (IS_RUNNING && (MASK & cpu_mask_bit(RUNNING_CPU)) == 0) {
-                task->release();
-                return static_cast<uint64_t>(-EBUSY);
-            }
-            if (IS_WAITING && OWNER_CPU != UINT64_MAX && (MASK & cpu_mask_bit(OWNER_CPU)) == 0) {
-                task->release();
-                return static_cast<uint64_t>(-EBUSY);
-            }
-            if (std::has_single_bit(MASK)) {
-                // Single-CPU pin
-                uint64_t const TARGET_CPU = std::countr_zero(MASK);
-                if (!mod::sched::pin_task_to_cpu(task, TARGET_CPU)) {
-                    task->release();
-                    return static_cast<uint64_t>(-EBUSY);
-                }
-                task->domain_mask = MASK;
-                task->domain_hard = false;
-            } else if (MASK == VALID_MASK) {
-                // Full mask: remove all affinity restrictions
-                task->domain_mask = ~0ULL;
-                task->domain_hard = false;
-                task->cpu_pinned = false;
-            } else {
-                // Multi-bit subset: set domain_mask, pick least-loaded CPU within mask
-                uint64_t const TARGET_CPU = mod::sched::get_least_loaded_cpu_in_mask(MASK);
-                if (!IS_RUNNING && !IS_WAITING && !mod::sched::migrate_task_to_cpu(task, TARGET_CPU)) {
-                    task->release();
-                    return static_cast<uint64_t>(-EBUSY);
-                }
-                task->domain_mask = MASK;
-                task->domain_hard = false;
-                task->cpu_pinned = false;
-            }
-
-            task->release();
-            return 0;
-        }
-
-        case abi::multiproc::threadControlOps::GET_AFFINITY: {
-            auto const TID = arg1;
-
-            auto* task = mod::sched::find_task_by_pid_safe(TID);
-            if (task == nullptr) {
-                return static_cast<uint64_t>(-ESRCH);
-            }
-
-            uint64_t mask = online_cpu_mask();
-            if (mask == 0) {
-                task->release();
-                return static_cast<uint64_t>(-ENODEV);
-            }
-            if (task->cpu_pinned) {
-                if (task->cpu >= 64) {
-                    task->release();
-                    return static_cast<uint64_t>(-ERANGE);
-                }
-                mask = 1ULL << task->cpu;
-            } else if (task->domain_mask != ~0ULL) {
-                mask = task->domain_mask & online_cpu_mask();
-            }
-
-            task->release();
-            return mask;
-        }
-
-        case abi::multiproc::threadControlOps::CREATE_DOMAIN: {
-            // arg1 = ptr to struct { char name[32]; uint64_t cpu_mask; uint8_t soft_exclusive; uint8_t hard; }
-            constexpr size_t REQUEST_SIZE = 42;
-            std::array<uint8_t, REQUEST_SIZE> request{};
-            auto* current_task = mod::sched::get_current_task();
-            if (current_task == nullptr || !mod::sys::usercopy::copy_from_task(*current_task, arg1, request.data(), request.size())) {
-                return static_cast<uint64_t>(-EFAULT);
-            }
-            std::array<char, 32> name{};
-            std::memcpy(name.data(), request.data(), name.size() - 1);
-            name.at(31) = '\0';
-            uint64_t cpu_mask = 0;
-            std::memcpy(&cpu_mask, request.data() + 32, sizeof(cpu_mask));
-            bool const SOFT_EXCLUSIVE = request.at(40) != 0;
-            bool const HARD = request.at(41) != 0;
-            uint64_t const VALID = online_cpu_mask();
-            if ((cpu_mask & VALID) == 0) {
-                return static_cast<uint64_t>(-EINVAL);
-            }
-            cpu_mask &= VALID;
-            uint32_t const DOMAIN_ID = mod::smt::create_leaf_domain(name.data(), cpu_mask, SOFT_EXCLUSIVE, HARD);
-            if (DOMAIN_ID == mod::smt::DOMAIN_ID_INVALID) {
-                return static_cast<uint64_t>(-ENOMEM);
-            }
-            // Apply daemon_load_penalty to each CPU in the new domain if soft_exclusive
-            if (SOFT_EXCLUSIVE) {
-                uint64_t const CPU_COUNT = mod::smt::get_core_count();
-                for (uint64_t cpu = 0; cpu < CPU_COUNT && cpu < 64; ++cpu) {
-                    if ((cpu_mask & (1ULL << cpu)) != 0U) {
-                        mod::sched::set_cpu_daemon_penalty(cpu, SOFT_EXCLUSIVE_DAEMON_PENALTY);
-                    }
-                }
-            }
-            // Phase 8: stamp domain_id on each CPU's RunQueue so work-stealing
-            // checks can enforce hard-domain boundaries without a separate registry lookup.
-            {
-                uint64_t const CPU_COUNT = mod::smt::get_core_count();
-                for (uint64_t cpu = 0; cpu < CPU_COUNT && cpu < 64; ++cpu) {
-                    if ((cpu_mask & (1ULL << cpu)) != 0U) {
-                        mod::sched::set_cpu_domain_id(cpu, DOMAIN_ID);
-                    }
-                }
-            }
-            return DOMAIN_ID;
-        }
-
-        case abi::multiproc::threadControlOps::SET_DOMAIN: {
-            // arg1=tid, arg2=domain_id, arg3=hard (0=soft, 1=hard)
-            auto const TID = arg1;
-            auto const DOMAIN_ID = static_cast<uint32_t>(arg2);
-            bool const HARD = arg3 != 0;
-            auto* dom = mod::smt::get_cpu_domain(DOMAIN_ID);
-            if (dom == nullptr) {
-                return static_cast<uint64_t>(-EINVAL);
-            }
-            auto* task = mod::sched::find_task_by_pid_safe(TID);
-            if (task == nullptr) {
-                return static_cast<uint64_t>(-ESRCH);
-            }
-            uint64_t const RUNNING_CPU = mod::sched::current_cpu_for_task(task);
-            bool const IS_RUNNING = RUNNING_CPU != UINT64_MAX;
-            uint64_t const OWNER_CPU = IS_RUNNING ? RUNNING_CPU : mod::sched::owner_cpu_for_task(task);
-            bool const IS_WAITING = task->sched_queue == mod::sched::task::Task::sched_queue::WAITING;
-            if (IS_RUNNING && (dom->cpu_mask & cpu_mask_bit(RUNNING_CPU)) == 0) {
-                task->release();
-                return static_cast<uint64_t>(-EBUSY);
-            }
-            if (IS_WAITING && OWNER_CPU != UINT64_MAX && (dom->cpu_mask & cpu_mask_bit(OWNER_CPU)) == 0) {
-                task->release();
-                return static_cast<uint64_t>(-EBUSY);
-            }
-            task->domain_id = DOMAIN_ID;
-            task->domain_mask = dom->cpu_mask;
-            task->domain_hard = HARD || dom->hard;
-            task->cpu_pinned = false;
-            uint64_t const TARGET = mod::sched::get_least_loaded_cpu_in_mask(dom->cpu_mask);
-            if (!IS_RUNNING && !IS_WAITING) {
-                mod::sched::reschedule_task_for_cpu(TARGET, task);
-            }
-            task->release();
-            return 0;
-        }
-
-        case abi::multiproc::threadControlOps::QUERY_DOMAIN: {
-            // arg1=domain_id, arg2=ptr to struct { uint64_t cpu_mask; uint32_t cpu_loads[64]; }
-            auto const DOMAIN_ID = static_cast<uint32_t>(arg1);
-            auto* dom = mod::smt::get_cpu_domain(DOMAIN_ID);
-            if (dom == nullptr) {
-                return static_cast<uint64_t>(-EINVAL);
-            }
-
-            constexpr size_t OUTPUT_SIZE = sizeof(uint64_t) + (64 * sizeof(uint32_t));
-            std::array<uint8_t, OUTPUT_SIZE> output{};
-            std::memcpy(output.data(), &dom->cpu_mask, sizeof(dom->cpu_mask));
-            uint64_t const CPU_COUNT = mod::smt::get_core_count();
-            for (uint64_t cpu = 0; cpu < CPU_COUNT && cpu < 64; ++cpu) {
-                uint32_t const LOAD = ((dom->cpu_mask & (1ULL << cpu)) != 0U) ? mod::sched::get_cpu_load(cpu) : 0;
-                std::memcpy(output.data() + sizeof(uint64_t) + (cpu * sizeof(uint32_t)), &LOAD, sizeof(LOAD));
-            }
-
-            auto* current_task = mod::sched::get_current_task();
-            if (current_task == nullptr || !mod::sys::usercopy::copy_to_task(*current_task, arg2, output.data(), output.size())) {
-                return static_cast<uint64_t>(-EFAULT);
-            }
-            return 0;
-        }
+        case abi::multiproc::threadControlOps::SET_AFFINITY:
+        case abi::multiproc::threadControlOps::GET_AFFINITY:
+        case abi::multiproc::threadControlOps::CREATE_DOMAIN:
+        case abi::multiproc::threadControlOps::SET_DOMAIN:
+        case abi::multiproc::threadControlOps::QUERY_DOMAIN:
+            return host_thread_control_for_subject(mod::sched::get_current_task(), op, arg1, arg2, arg3);
 
         default:
             mod::dbg::error("Invalid op in syscall thread control");

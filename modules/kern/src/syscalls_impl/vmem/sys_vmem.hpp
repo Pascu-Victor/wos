@@ -27,6 +27,9 @@ struct FileMmapCacheStats {
     uint64_t capacity_pages;
 };
 
+// Caller retains the exact subject; user swap control is Host-only.
+auto swap_control_for_subject(ker::mod::sched::task::Task* subject, uint64_t op, uint64_t address, uint64_t flags) -> uint64_t;
+
 // Virtual memory syscall handler
 // op: operation code (anon_allocate, anon_free)
 // a1: hint address (for allocate) or address to free

@@ -30,6 +30,7 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sched/threading.hpp>
+#include <platform/security/compartment_host.hpp>
 #include <platform/security/file_policy.hpp>
 #include <platform/sys/mutex.hpp>
 #include <platform/sys/usercopy.hpp>
@@ -2991,6 +2992,19 @@ auto mmap_msync(uint64_t addr, uint64_t size, uint64_t /*flags*/) -> uint64_t {
 }
 
 // Main syscall handler
+auto swap_control_for_subject(ker::mod::sched::task::Task* task, uint64_t op, uint64_t address, uint64_t flags) -> uint64_t {
+    auto const OP = static_cast<ker::abi::vmem::ops>(op);
+    if (OP != ker::abi::vmem::ops::SWAPON && OP != ker::abi::vmem::ops::SWAPOFF) return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
+    if (task == nullptr) return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
+    int const SCOPE = ker::mod::security::compartment::host_namespace_admission(task);
+    if (SCOPE != 0) return static_cast<uint64_t>(SCOPE);
+    std::array<char, SWAP_PATH_MAX> path{};
+    if (!ker::mod::sys::usercopy::copy_cstring_from_task_strict(*task, address, path.data(), path.size()))
+        return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
+    return static_cast<uint64_t>(OP == ker::abi::vmem::ops::SWAPON ? ker::mod::mm::swap::swapon_path(path.data(), static_cast<int>(flags))
+                                                                   : ker::mod::mm::swap::swapoff_path(path.data()));
+}
+
 auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -> uint64_t {
     switch (static_cast<ker::abi::vmem::ops>(op)) {
         case ker::abi::vmem::ops::ANON_ALLOCATE: {
@@ -3115,23 +3129,9 @@ auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -
             return mmap_msync(a1, a2, a3);
         }
 
-        case ker::abi::vmem::ops::SWAPON: {
-            auto* task = get_current_task();
-            std::array<char, SWAP_PATH_MAX> path{};
-            if (task == nullptr || !ker::mod::sys::usercopy::copy_cstring_from_task_strict(*task, a1, path.data(), path.size())) {
-                return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
-            }
-            return static_cast<uint64_t>(ker::mod::mm::swap::swapon_path(path.data(), static_cast<int>(a2)));
-        }
-
-        case ker::abi::vmem::ops::SWAPOFF: {
-            auto* task = get_current_task();
-            std::array<char, SWAP_PATH_MAX> path{};
-            if (task == nullptr || !ker::mod::sys::usercopy::copy_cstring_from_task_strict(*task, a1, path.data(), path.size())) {
-                return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
-            }
-            return static_cast<uint64_t>(ker::mod::mm::swap::swapoff_path(path.data()));
-        }
+        case ker::abi::vmem::ops::SWAPON:
+        case ker::abi::vmem::ops::SWAPOFF:
+            return swap_control_for_subject(get_current_task(), op, a1, a2);
 
         default:
             log::warn("invalid operation %llu", op);
