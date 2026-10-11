@@ -680,10 +680,10 @@ advance the VFS publication epoch. Failed output and FD reservations stay intact
 Host, owned-root synthetic-pin, serialized and physical-export refusals remain;
 Task/File/anchor/view, callback, syscall, libc and wire layouts are unchanged.
 
-Owned-root procfs directory pins and cwd publication remain pending. Unpublished
-task teardown requires exactly two references before clearing anchors and FDs;
-self-procfs objects add retained task references. Enabling cwd requires an exact
-internal ownership proof that also rejects external File/view/anchor aliases.
+Owned-root procfs directory pins and cwd publication remain pending. At this
+checkpoint, unpublished teardown required exactly two references before clearing
+anchors and FDs; self-procfs objects added retained task references. The following
+ownership checkpoint addresses that rollback prerequisite.
 
 Three new native cases check registry withdrawal and exact FD capability reopen,
 thread parents/canonical names, stale/closed/foreign views, bounded failed paths
@@ -694,6 +694,47 @@ checks with normal poweroff and stable source/artifact pins. The failed and
 successful runs' inactive images were verified and pruned; disposable usage
 returned to zero. These are unscheduled native fixtures. Public service creation
 and all ten full acceptance criteria remain incomplete.
+
+## Unpublished self-procfs rollback ownership
+
+An unpublished child can open `/proc/self/status`, duplicate that descriptor,
+and then fail a later spawn action. Its procfs metadata retains the child, so
+the previous exact-two teardown check refused cleanup. Rollback now admits those
+self references after proving that their complete ownership graph belongs to
+the constructor. Duplicate descriptors count as File owners; each distinct
+self-target procfs File contributes one Task reference.
+
+The proof observes retained FD, image, lazy-file, root/cwd anchor and detached
+view-pin owners using bounded scratch below 32KiB, without allocating during
+rollback. It rechecks original source identities and lazy ownership, reservations
+and relevant File/view/anchor reference counts. External aliases, unaccounted
+Task owners, changed sources, unsupported graphs and overflow still refuse
+before cleanup, preserving failed output and resources. Temporary owners retire
+outside path, FD and lazy locks. Closed PID views do not prevent ownership drain.
+
+Creator-slot and transferred-owner teardown retain their publication/lifecycle
+guards and existing resource cleanup. Task/File/view/anchor, callback, namespace,
+credential, syscall, libc and wire layouts are unchanged. Ordinary running-task
+exit keeps its existing behavior. Synthetic owned-root pins/cwd and public
+compartment creation remain gated; their typed membership and publication tests
+are separate work.
+
+Five native fixtures exercise distinct and duplicate self objects, image/lazy
+aliases, closed views, external Task/File aliases, reserved descriptors,
+transferred-slot cleanup and a lazy owner moved after capture. A test adapter
+runs the actual spawn OPEN/DUP2 consumer followed by a failed OPEN and checks
+descriptor, process-population and namespace drains. These are unscheduled
+fixtures; they do not qualify user ELF execution, shared mappings/futexes, or
+synthetic self view/anchor aliases.
+
+Normal Build WOS, the isolated fast diagnostic build, all 35 selected host
+checks, six-path formatting and clang-tidy for core/task/exec pass. Actual
+rootless KTEST29 passes 80,800 assertions, zero failures, 1,331 cases and all
+80 mandatory checks with normal poweroff and stable source/artifact pins.
+Its four inactive images (259,342,336 allocated bytes) were verified and pruned;
+disposable usage returned to zero. The initial diagnostic fixture compile error
+and its reproducible source patch remain in the small evidence receipts.
+All ten full acceptance criteria remain incomplete.
 
 ## Verification checkpoint
 

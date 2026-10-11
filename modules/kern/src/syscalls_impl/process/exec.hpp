@@ -77,6 +77,7 @@ auto exec_selftest_stdio_insert_failure_closes_file() -> bool;
 auto exec_selftest_cloexec_snapshot_collects_marked_fds() -> bool;
 auto exec_selftest_spawn_dup2_consumes_cloexec_source() -> bool;
 auto exec_selftest_spawn_open_uses_private_child_authority() -> bool;
+auto exec_selftest_spawn_procfs_failure_drains_child(ker::mod::sched::task::Task& parent) -> bool;
 auto exec_selftest_one_shot_wki_target_consumes_only_on_success() -> bool;
 #endif
 

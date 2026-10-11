@@ -167,6 +167,218 @@ auto DirectoryViewRef::root() const -> File* { return view_ != nullptr ? view_->
 auto DirectoryViewRef::directory() const -> File* { return view_ != nullptr ? view_->directory : nullptr; }
 auto DirectoryViewRef::policy() const -> MountPolicy { return view_ != nullptr ? view_->inherited_policy : MountPolicy{}; }
 
+namespace {
+using UnpublishedTask = ker::mod::sched::task::Task;
+// Constructor graph only. Views own detached pins, never more views. Keep this
+// scratch bounded independently of allocation success during rollback.
+struct UnpublishedSelfReferences {
+    static constexpr size_t MAX_FILES = 3 * UnpublishedTask::FD_TABLE_SIZE + 16;
+    static constexpr size_t MAX_VIEWS = UnpublishedTask::FD_TABLE_SIZE + 4;
+    struct FileEntry {
+        File* file{};
+        uint32_t owned{};
+        uint32_t temporary{};
+        uint32_t lazy_owned{};
+        uint32_t lazy_observed{};
+        bool auxiliary{};
+        bool self{};
+    };
+    struct ViewEntry {
+        const DirectoryView* view{};
+        uint32_t owned{};
+        bool self{};
+    };
+    std::array<File*, UnpublishedTask::FD_TABLE_SIZE> descriptors{};
+    DirectoryAnchorRef root, cwd;
+    File* image{};
+    std::array<FileEntry, MAX_FILES> files{};
+    std::array<ViewEntry, MAX_VIEWS> views{};
+    size_t file_count{}, view_count{};
+    ~UnpublishedSelfReferences() {
+        // Each capture is outer-owned. No path/FD/lazy/publication guard can
+        // cross this possible last close, including failed/shared snapshots.
+        for (size_t i = 0; i < file_count; ++i)
+            if (files[i].auxiliary) vfs_put_file(files[i].file);
+        for (auto* file : descriptors)
+            if (file != nullptr) vfs_put_file(file);
+    }
+    static auto add(uint32_t& value, uint32_t delta) -> bool {
+        if (delta > UINT32_MAX - value) return false;
+        value += delta;
+        return true;
+    }
+    auto find_file_entry(File* file) -> FileEntry* {
+        for (size_t i = 0; i < file_count; ++i)
+            if (files[i].file == file) return &files[i];
+        return nullptr;
+    }
+    auto file_entry(File* file) -> FileEntry* {
+        if (auto* entry = find_file_entry(file)) return entry;
+        if (file == nullptr || file_count == files.size()) return nullptr;
+        auto& entry = files[file_count++];
+        entry.file = file;
+        return &entry;
+    }
+    auto owned_file(File* file, bool temporary = false) -> bool {
+        auto* entry = file_entry(file);
+        return entry != nullptr && add(entry->owned, 1) && (!temporary || add(entry->temporary, 1));
+    }
+    static auto self_target(File* file, const UnpublishedTask& task) -> bool {
+        return file != nullptr && file->fs_type == FSType::PROCFS && file->private_data != nullptr &&
+               static_cast<const procfs::ProcFileData*>(file->private_data)->target == &task;
+    }
+    // Exec/lazy/remote descriptions without a self target or view cannot lead
+    // back to this Task. Their ordinary sharing is unrelated to its lifetime.
+    auto auxiliary_file(File* file, const UnpublishedTask& task, bool lazy = false) -> bool {
+        if (!self_target(file, task) && (file == nullptr || !file->directory_view)) return true;
+        auto* entry = file_entry(file);
+        if (entry == nullptr || !add(entry->owned, 1)) return false;
+        if (lazy && !add(entry->lazy_owned, 1)) return false;
+        if (!entry->auxiliary) {
+            vfs_retain_file(file);
+            entry->auxiliary = true;
+            if (!add(entry->temporary, 1)) return false;
+        }
+        return true;
+    }
+    auto owned_view(const DirectoryViewRef& reference) -> bool {
+        auto const* view = reference.get();
+        if (view == nullptr) return true;
+        for (size_t i = 0; i < view_count; ++i)
+            if (views[i].view == view) return add(views[i].owned, 1);
+        if (view_count == views.size() || view->root == nullptr || view->directory == nullptr || view->root->directory_view ||
+            view->directory->directory_view)
+            return false;
+        views[view_count++] = {.view = view, .owned = 1};
+        // Equal root/directory pins still represent two owned File references.
+        return owned_file(view->root) && owned_file(view->directory);
+    }
+    auto view_is_self(const DirectoryViewRef& reference) const -> bool {
+        for (size_t i = 0; i < view_count; ++i)
+            if (views[i].view == reference.get()) return views[i].self;
+        return false;
+    }
+    auto file_is_self(File* file) const -> bool {
+        for (size_t i = 0; i < file_count; ++i)
+            if (files[i].file == file) return files[i].self || view_is_self(file->directory_view);
+        return false;
+    }
+    auto anchor_is_self(const DirectoryAnchorRef& anchor) const -> bool {
+        return anchor && (view_is_self(anchor.get()->view) || file_is_self(anchor.get()->remote));
+    }
+};
+static_assert(sizeof(UnpublishedSelfReferences) < 32 * 1024);
+}  // namespace
+
+#ifdef WOS_SELFTEST
+void (*unpublished_self_refs_test_hook)(UnpublishedTask&) = nullptr;
+#endif
+
+auto vfs_count_exclusive_unpublished_self_refs(UnpublishedTask& task, uint32_t& out) -> int {
+    if (task.scheduler_published.load(std::memory_order_acquire) || task.gc_queued.load(std::memory_order_acquire) || task.is_thread ||
+        task.state.load(std::memory_order_acquire) != ker::mod::sched::task::TaskState::ACTIVE)
+        return -EBUSY;
+    UnpublishedSelfReferences captured;
+    uint64_t flags = task.path_metadata_lock.lock_irqsave();
+    captured.root = task.root_anchor;
+    captured.cwd = task.cwd_anchor;
+    task.path_metadata_lock.unlock_irqrestore(flags);
+    flags = task.fd_table_lock.lock_irqsave();
+    bool valid = task.fd_table.reserved_count() == 0;
+    if (valid) {
+        for (size_t fd = 0; fd < captured.descriptors.size(); ++fd) {
+            auto* file = static_cast<File*>(task.fd_table.lookup(fd));
+            if (file == nullptr) continue;
+            vfs_retain_file(file);
+            captured.descriptors[fd] = file;
+        }
+    }
+    task.fd_table_lock.unlock_irqrestore(flags);
+    if (!valid) return -EBUSY;
+    for (auto* file : captured.descriptors)
+        if (file != nullptr && !captured.owned_file(file, true)) return -EOVERFLOW;
+    // Stable constructor-owned field: no other executor may mutate the image
+    // without a lifetime reference, which the final Task proof rejects.
+    captured.image = task.exec_image_file;
+    if (!captured.auxiliary_file(captured.image, task)) return -EOVERFLOW;
+    flags = task.lazy_vmem_lock.lock_irqsave();
+    for (auto const& range : task.lazy_vmem_ranges) {
+        if (range.kind == ker::mod::sched::task::LazyVmemKind::FILE_BACKED && !captured.auxiliary_file(range.file, task, true)) {
+            valid = false;
+            break;
+        }
+    }
+    task.lazy_vmem_lock.unlock_irqrestore(flags);
+    if (!valid) return -EOVERFLOW;
+    for (auto const* reference : {&captured.root, &captured.cwd}) {
+        if (!*reference || (reference == &captured.cwd && captured.cwd.get() == captured.root.get())) continue;
+        auto const& anchor = *reference->get();
+        if (!captured.owned_view(anchor.view) || !captured.auxiliary_file(anchor.remote, task)) return -EOVERFLOW;
+    }
+    // Entries are unique File objects, not descriptor aliases. Adding a view
+    // can append its detached pins, which cannot themselves introduce a view.
+    for (size_t i = 0; i < captured.file_count; ++i)
+        if (!captured.owned_view(captured.files[i].file->directory_view)) return -EINVAL;
+    uint32_t self_refs = 0;
+    for (size_t i = 0; i < captured.file_count; ++i) {
+        auto& entry = captured.files[i];
+        entry.self = captured.self_target(entry.file, task);
+        if (!entry.self) continue;
+        auto const& data = *static_cast<const procfs::ProcFileData*>(entry.file->private_data);
+        if (entry.file->fops != procfs::get_procfs_fops() || data.node.pid != task.pid) return -EINVAL;
+        for (size_t previous = 0; previous < i; ++previous)
+            if (captured.files[previous].self && captured.files[previous].file->private_data == entry.file->private_data) return -EINVAL;
+        if (!captured.add(self_refs, 1)) return -EOVERFLOW;
+    }
+#ifdef WOS_SELFTEST
+    if (unpublished_self_refs_test_hook != nullptr) unpublished_self_refs_test_hook(task);
+#endif
+    flags = task.path_metadata_lock.lock_irqsave();
+    valid = task.root_anchor.get() == captured.root.get() && task.cwd_anchor.get() == captured.cwd.get();
+    task.path_metadata_lock.unlock_irqrestore(flags);
+    flags = task.fd_table_lock.lock_irqsave();
+    valid = valid && task.fd_table.reserved_count() == 0;
+    for (size_t fd = 0; valid && fd < captured.descriptors.size(); ++fd) valid = task.fd_table.lookup(fd) == captured.descriptors[fd];
+    task.fd_table_lock.unlock_irqrestore(flags);
+    flags = task.lazy_vmem_lock.lock_irqsave();
+    for (auto const& range : task.lazy_vmem_ranges) {
+        if (!valid || range.kind != ker::mod::sched::task::LazyVmemKind::FILE_BACKED || range.file == nullptr ||
+            (!captured.self_target(range.file, task) && !range.file->directory_view))
+            continue;
+        auto* entry = captured.find_file_entry(range.file);
+        // A new relevant owner was not captured. Never refresh the proof.
+        if (entry == nullptr || entry->lazy_owned == 0 || !captured.add(entry->lazy_observed, 1)) valid = false;
+    }
+    task.lazy_vmem_lock.unlock_irqrestore(flags);
+    for (size_t i = 0; i < captured.file_count; ++i) valid = valid && captured.files[i].lazy_owned == captured.files[i].lazy_observed;
+    if (!valid || task.exec_image_file != captured.image) return -EBUSY;
+    for (size_t i = 0; i < captured.view_count; ++i) {
+        auto& entry = captured.views[i];
+        // Detached pins have no descendants: their direct self metadata is
+        // sufficient, avoiding recursion or an unbounded ownership graph.
+        entry.self = captured.self_target(entry.view->root, task) || captured.self_target(entry.view->directory, task);
+        if (entry.self && entry.view->refs.load(std::memory_order_acquire) != entry.owned) return -EBUSY;
+    }
+    for (size_t i = 0; i < captured.file_count; ++i) {
+        auto const& entry = captured.files[i];
+        if (!captured.file_is_self(entry.file)) continue;
+        uint32_t expected = entry.owned;
+        if (!captured.add(expected, entry.temporary) || expected > INT32_MAX) return -EOVERFLOW;
+        if (entry.file->refcount.load(std::memory_order_acquire) != static_cast<int32_t>(expected)) return -EBUSY;
+    }
+    for (auto const* reference : {&captured.root, &captured.cwd}) {
+        if (!captured.anchor_is_self(*reference)) continue;
+        uint32_t const ALIASES = captured.root.get() == captured.cwd.get() ? 2 : 1;
+        if (reference->get()->refs.load(std::memory_order_acquire) != 2 * ALIASES) return -EBUSY;
+    }
+    if (task.scheduler_published.load(std::memory_order_acquire) || task.gc_queued.load(std::memory_order_acquire) ||
+        task.state.load(std::memory_order_acquire) != ker::mod::sched::task::TaskState::ACTIVE || self_refs > UINT32_MAX - 2 ||
+        task.ref_count.load(std::memory_order_acquire) != 2 + self_refs)
+        return -EBUSY;
+    out = self_refs;
+    return 0;
+}
+
 using log = ker::mod::dbg::logger<"vfs">;
 
 // Keep in sync with userspace fcntl.h (Linux-compatible octal values)

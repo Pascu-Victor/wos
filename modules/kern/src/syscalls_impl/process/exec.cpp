@@ -3457,6 +3457,56 @@ auto exec_selftest_spawn_open_uses_private_child_authority() -> bool {
     return ok;
 }
 
+auto exec_selftest_spawn_procfs_failure_drains_child(ker::mod::sched::task::Task& parent) -> bool {
+    using namespace ker::mod;
+    abi::resource::Usage before{}, after{};
+    sched::resource::copy_process_observation(parent, before);
+    auto candidate = std::make_unique<sched::task::Task>();
+    if (!candidate) return false;
+    candidate->pid = sched::task::get_next_pid();
+    candidate->type = sched::task::TaskType::PROCESS;
+    auto const CREDENTIALS = parent.credentials();
+    sched::resource::ProcessReservation reservation(&parent, CREDENTIALS.user().real);
+    if (reservation.result() != 0 || !sched::resource::inherit(*candidate, parent) ||
+        sched::resource::initialize_credentials(*candidate, CREDENTIALS) != 0 || !reservation.attach(*candidate))
+        return false;
+    sched::task::Task::FilesystemContext filesystem;
+    if (!parent.capture_filesystem_context(filesystem)) return false;
+    candidate->root = filesystem.root;
+    candidate->cwd = filesystem.cwd;
+    candidate->root_len = filesystem.root_len;
+    candidate->cwd_len = filesystem.cwd_len;
+    candidate->root_anchor = std::move(filesystem.root_anchor);
+    candidate->cwd_anchor = std::move(filesystem.cwd_anchor);
+    if (!sched::task::claim_unpublished_process(&parent, candidate.get())) return false;
+    auto* child = candidate.release();
+    std::array<abi::process::SpawnFdAction, 3> actions{};
+    actions[0] = {.type = static_cast<uint32_t>(abi::process::SpawnFdActionType::OPEN), .fd = 30, .path = "/proc/self/status"};
+    actions[1] = {.type = static_cast<uint32_t>(abi::process::SpawnFdActionType::DUP2), .fd = 31, .srcfd = 30};
+    actions[2] = {.type = static_cast<uint32_t>(abi::process::SpawnFdActionType::OPEN), .fd = 32, .path = "/missing-spawn-rollback-path"};
+    abi::process::SpawnOptions options{.size = sizeof(abi::process::SpawnOptions),
+                                       .version = abi::process::SPAWN_OPTIONS_VERSION,
+                                       .actions = actions.data(),
+                                       .action_count = actions.size()};
+    int error = 0;
+    bool const FAILED = !apply_spawn_options(child, &options, &error);
+    auto* source = static_cast<vfs::File*>(child->fd_table.lookup(30));
+    bool const EXACT = FAILED && error == -ENOENT && source != nullptr && source == child->fd_table.lookup(31) &&
+                       source->fs_type == vfs::FSType::PROCFS && source->refcount.load() == 2 && child->fd_table.size() == 2 &&
+                       child->fd_table.reserved_count() == 0 && child->ref_count.load() == 3;
+    bool const DESTROYED = sched::task::destroy_owned_unpublished_process(&parent, child);
+    if (!DESTROYED) {
+        // Test failure recovery only: the fixture owns every descriptor and
+        // has no external alias. Preserve the production refusal, then drain
+        // this fixture explicitly so a failed assertion cannot leak its Task.
+        release_task_fd_table_files(child);
+        static_cast<void>(sched::task::destroy_owned_unpublished_process(&parent, child));
+    }
+    sched::resource::copy_process_observation(parent, after);
+    return EXACT && DESTROYED && parent.owned_unpublished_process.load() == nullptr && !parent.unpublished_teardown_in_progress.load() &&
+           before.current == after.current;
+}
+
 auto exec_selftest_one_shot_wki_target_consumes_only_on_success() -> bool {
     ker::mod::sched::task::Task one_shot{};
     std::strncpy(one_shot.wki_target_hostname.data(), "wos-2", one_shot.wki_target_hostname.size() - 1);

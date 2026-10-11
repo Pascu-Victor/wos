@@ -563,6 +563,14 @@ void vfs_retain_file(struct File* f);
 // final reference, otherwise zero. Final destruction can block; call unlocked.
 auto vfs_put_file_result(struct File* f) -> int;
 void vfs_put_file(struct File* f);
+// Creator-slot protocol only: count distinct self-target metadata in an
+// unpublished candidate's exclusively owned File/view/anchor graph. Readonly,
+// bounded and allocation-free; temporary last releases run outside all locks.
+// External aliases/changed snapshots/unknown graphs refuse without changing out.
+auto vfs_count_exclusive_unpublished_self_refs(ker::mod::sched::task::Task& task, uint32_t& out) -> int;
+#ifdef WOS_SELFTEST
+extern void (*unpublished_self_refs_test_hook)(ker::mod::sched::task::Task&);
+#endif
 auto vfs_release_fd(ker::mod::sched::task::Task* task, int fd) -> int;
 
 // Resolve a dirfd-relative pathname to an absolute path.

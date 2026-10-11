@@ -22,6 +22,7 @@
 #include <platform/security/credentials.hpp>
 #include <platform/sys/usercopy.hpp>
 #include <syscalls_impl/process/child_events.hpp>
+#include <syscalls_impl/process/exec.hpp>
 #include <syscalls_impl/process/process.hpp>
 #include <syscalls_impl/shm/shm.hpp>
 #include <syscalls_impl/vmem/sys_vmem.hpp>
@@ -3692,4 +3693,224 @@ KTEST(CompartmentProcfs, UnscopedDirectoryCoverMutationInvalidatesConsumption) {
     KEXPECT_EQ(calls, 0U);
     KEXPECT_EQ(vfs::vfs_openat(subject.task.get(), DIR, "status", 0, 0), -EAGAIN);
     KEXPECT_EQ(subject.task->fd_table.reserved_count(), 0U);
+}
+
+namespace {
+struct SelfOwnershipFixture {
+    PrivateMounts mounts;
+    pid_ns::NamespaceRef pids;
+    NativeTask parent;
+    auto prepare() -> int {
+        parent.task->type = sched::task::TaskType::PROCESS;
+        int result = mount_ns::create_namespace(mounts.first);
+        if (result == 0) result = pid_ns::create_namespace(pids);
+        if (result == 0) result = private_mount(mounts.first, "/");
+        if (result != 0) return result;
+        if (!parent.task->initialize_mount_namespace(mounts.first) || !parent.task->initialize_pid_namespace(pids)) return -ESRCH;
+        result = vfs::vfs_mkdirat(parent.task.get(), vfs::AT_FDCWD, "/proc", 0755);
+        if (result == 0) result = vfs::vfs_mount_for_task(parent.task.get(), nullptr, "/proc", "procfs");
+        auto mount = scoped_mount(mounts.first, "/");
+        return result != 0 ? result : prepare_procfs_fixture_root(*parent.task, mount.get(), "/", "/");
+    }
+};
+struct UnpublishedFixture {
+    Task& owner;
+    Task* task = new Task{};
+    bool claimed{};
+    explicit UnpublishedFixture(Task& source) : owner(source) {
+        if (task == nullptr) return;
+        task->pid = sched::task::get_next_pid();
+        task->type = sched::task::TaskType::PROCESS;
+        if (!resource::inherit(*task, owner) || resource::initialize_credentials(*task, owner.credentials()) != 0) return;
+        Task::FilesystemContext filesystem;
+        if (!owner.capture_filesystem_context(filesystem)) return;
+        task->root = filesystem.root;
+        task->cwd = filesystem.cwd;
+        task->root_len = filesystem.root_len;
+        task->cwd_len = filesystem.cwd_len;
+        task->root_anchor = std::move(filesystem.root_anchor);
+        task->cwd_anchor = std::move(filesystem.cwd_anchor);
+        claimed = sched::task::claim_unpublished_process(&owner, task);
+    }
+    ~UnpublishedFixture() {
+        if (task == nullptr) return;
+        if (claimed && sched::task::destroy_owned_unpublished_process(&owner, task)) return;
+        // Fixture-only recovery. All outside aliases are scoped after this
+        // owner and have already drained; never delete a shared candidate.
+        task->root_anchor = {};
+        task->cwd_anchor = {};
+        sched::task::release_lazy_vmem_ranges(*task);
+        for (unsigned fd = 0; fd < Task::FD_TABLE_SIZE; ++fd)
+            if (task->fd_table.lookup(fd) != nullptr) KEXPECT_EQ(vfs::vfs_close_for_task(task, fd), 0);
+        if (task->exec_image_file != nullptr) {
+            vfs::vfs_put_file(task->exec_image_file);
+            task->exec_image_file = nullptr;
+        }
+        if (claimed) {
+            KEXPECT_TRUE(sched::task::destroy_owned_unpublished_process(&owner, task));
+        } else {
+            KEXPECT_EQ(task->ref_count.load(), uint32_t{1});
+            if (task->ref_count.load() == 1) delete task;
+        }
+    }
+    auto open() -> int { return vfs::vfs_openat(task, vfs::AT_FDCWD, "/proc/self/status", 0, 0); }
+    auto destroy() -> bool {
+        if (!sched::task::destroy_owned_unpublished_process(&owner, task)) return false;
+        task = nullptr;
+        claimed = false;
+        return true;
+    }
+};
+struct LazyOwnershipCutover {
+    static inline LazyOwnershipCutover* active{};
+    Task& task;
+    NativeFile transferred;
+    explicit LazyOwnershipCutover(Task& source) : task(source) {
+        active = this;
+        vfs::unpublished_self_refs_test_hook = inject;
+    }
+    ~LazyOwnershipCutover() {
+        vfs::unpublished_self_refs_test_hook = nullptr;
+        active = nullptr;
+    }
+    static void inject(Task& target) {
+        if (active == nullptr || &active->task != &target) return;
+        uint64_t const IRQF = target.lazy_vmem_lock.lock_irqsave();
+        auto* file = target.lazy_vmem_ranges.empty() ? nullptr : target.lazy_vmem_ranges[0].file;
+        target.lazy_vmem_ranges.clear();
+        target.lazy_vmem_lock.unlock_irqrestore(IRQF);
+        active->transferred.reset(file);
+    }
+};
+}  // namespace
+
+KTEST(CompartmentOwnership, DistinctSelfFilesAndDuplicateOwnersDrainWhenClosed) {
+    auto const PID_BASELINE = pid_ns::live_namespace_count();
+    auto const MOUNT_BASELINE = mount_ns::live_namespace_count();
+    {
+        SelfOwnershipFixture fixture;
+        KREQUIRE_EQ(fixture.prepare(), 0);
+        UnpublishedFixture child(*fixture.parent.task);
+        KREQUIRE_TRUE(child.claimed);
+        int const FIRST = child.open();
+        KREQUIRE_TRUE(FIRST >= 0);
+        KREQUIRE_EQ(vfs::vfs_dup2_for_task(child.task, FIRST, 17), 17);
+        KREQUIRE_TRUE(child.open() >= 0);
+        auto* file = vfs::vfs_get_file(child.task, FIRST);
+        KREQUIRE_TRUE(file != nullptr);
+        vfs::vfs_retain_file(file);
+        child.task->exec_image_file = file;
+        vfs::vfs_retain_file(file);
+        child.task->lazy_vmem_ranges.push_back({.kind = sched::task::LazyVmemKind::FILE_BACKED, .file = file});
+        KEXPECT_EQ(child.task->ref_count.load(), uint32_t{4});
+        uint32_t count = 91;
+        KEXPECT_EQ(vfs::vfs_count_exclusive_unpublished_self_refs(*child.task, count), 0);
+        KEXPECT_EQ(count, uint32_t{2});
+        KEXPECT_EQ(child.task->ref_count.load(), uint32_t{4});
+        fixture.pids.close();
+        KEXPECT_TRUE(child.destroy());
+        KEXPECT_TRUE(fixture.parent.task->owned_unpublished_process.load() == nullptr);
+        KEXPECT_EQ(fixture.parent.task->ref_count.load(), uint32_t{1});
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PID_BASELINE);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNT_BASELINE);
+}
+
+KTEST(CompartmentOwnership, ExternalTaskFileAndReservationAliasesRefuseWithoutEffects) {
+    SelfOwnershipFixture fixture;
+    KREQUIRE_EQ(fixture.prepare(), 0);
+    UnpublishedFixture child(*fixture.parent.task);
+    KREQUIRE_TRUE(child.claimed);
+    int const FD = child.open();
+    KREQUIRE_TRUE(FD >= 0);
+    NativeFile alias(vfs::vfs_get_file_retain(child.task, FD));
+    KREQUIRE_TRUE(alias);
+    uint32_t count = 91;
+    KEXPECT_EQ(vfs::vfs_count_exclusive_unpublished_self_refs(*child.task, count), -EBUSY);
+    KEXPECT_EQ(count, uint32_t{91});
+    KEXPECT_FALSE(child.destroy());
+    KEXPECT_TRUE(fixture.parent.task->owned_unpublished_process.load() == child.task);
+    KEXPECT_TRUE(vfs::vfs_get_file(child.task, FD) == alias.get());
+    KEXPECT_EQ(child.task->fd_table.size(), 1U);
+    KEXPECT_EQ(child.task->ref_count.load(), uint32_t{3});
+    alias.reset();
+    KREQUIRE_TRUE(child.task->try_acquire());
+    KEXPECT_FALSE(child.destroy());
+    KEXPECT_EQ(child.task->fd_table.size(), 1U);
+    child.task->release();
+    {
+        vfs::FdReservation reservation(child.task);
+        KREQUIRE_TRUE(reservation.result() >= 0);
+        KEXPECT_FALSE(child.destroy());
+        KEXPECT_EQ(child.task->fd_table.size(), 1U);
+        KEXPECT_EQ(child.task->fd_table.reserved_count(), 1U);
+        KEXPECT_FALSE(fixture.parent.task->unpublished_teardown_in_progress.load());
+    }
+    KEXPECT_TRUE(child.destroy());
+}
+
+KTEST(CompartmentOwnership, TransferredRefusalConsumesOnlyOwnerSlotThenDrains) {
+    SelfOwnershipFixture fixture;
+    KREQUIRE_EQ(fixture.prepare(), 0);
+    UnpublishedFixture child(*fixture.parent.task);
+    KREQUIRE_TRUE(child.claimed);
+    int const FD = child.open();
+    KREQUIRE_TRUE(FD >= 0);
+    NativeFile alias(vfs::vfs_get_file_retain(child.task, FD));
+    KREQUIRE_TRUE(alias);
+    auto* transferred = sched::task::take_unpublished_process(fixture.parent.task.get());
+    KREQUIRE_TRUE(transferred == child.task);
+    child.claimed = false;
+    KEXPECT_FALSE(sched::task::destroy_unpublished_process(transferred));
+    KEXPECT_EQ(child.task->ref_count.load(), uint32_t{2});
+    KEXPECT_EQ(child.task->fd_table.size(), 1U);
+    KEXPECT_TRUE(fixture.parent.task->owned_unpublished_process.load() == nullptr);
+    alias.reset();
+    child.claimed = sched::task::claim_unpublished_process(fixture.parent.task.get(), child.task);
+    KREQUIRE_TRUE(child.claimed);
+    fixture.pids.close();
+    transferred = sched::task::take_unpublished_process(fixture.parent.task.get());
+    child.claimed = false;
+    bool const DESTROYED = sched::task::destroy_unpublished_process(transferred);
+    KEXPECT_TRUE(DESTROYED);
+    if (DESTROYED) child.task = nullptr;
+}
+
+KTEST(CompartmentOwnership, LazyOwnerTransferCannotMasqueradeAsInternalReference) {
+    SelfOwnershipFixture fixture;
+    KREQUIRE_EQ(fixture.prepare(), 0);
+    UnpublishedFixture child(*fixture.parent.task);
+    KREQUIRE_TRUE(child.claimed);
+    int const FD = child.open();
+    KREQUIRE_TRUE(FD >= 0);
+    NativeFile file(vfs::vfs_get_file_retain(child.task, FD));
+    KREQUIRE_TRUE(file);
+    KREQUIRE_EQ(vfs::vfs_close_for_task(child.task, FD), 0);
+    child.task->lazy_vmem_ranges.push_back({.kind = sched::task::LazyVmemKind::FILE_BACKED, .file = file.get()});
+    file.release();
+    {
+        LazyOwnershipCutover cutover(*child.task);
+        uint32_t count = 91;
+        KEXPECT_EQ(vfs::vfs_count_exclusive_unpublished_self_refs(*child.task, count), -EBUSY);
+        KEXPECT_EQ(count, uint32_t{91});
+        KEXPECT_TRUE(cutover.transferred);
+        KEXPECT_TRUE(child.task->lazy_vmem_ranges.empty());
+        KEXPECT_EQ(child.task->ref_count.load(), uint32_t{3});
+        KEXPECT_TRUE(fixture.parent.task->owned_unpublished_process.load() == child.task);
+    }
+    KEXPECT_EQ(child.task->ref_count.load(), uint32_t{2});
+    KEXPECT_TRUE(child.destroy());
+}
+
+KTEST(CompartmentOwnership, NativeSpawnActionFailureDrainsSelfDescriptorsAndPopulation) {
+    auto const PID_BASELINE = pid_ns::live_namespace_count();
+    auto const MOUNT_BASELINE = mount_ns::live_namespace_count();
+    {
+        SelfOwnershipFixture fixture;
+        KREQUIRE_EQ(fixture.prepare(), 0);
+        KEXPECT_TRUE(ker::syscall::process::exec_selftest_spawn_procfs_failure_drains_child(*fixture.parent.task));
+        KEXPECT_EQ(fixture.parent.task->ref_count.load(), uint32_t{1});
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PID_BASELINE);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNT_BASELINE);
 }

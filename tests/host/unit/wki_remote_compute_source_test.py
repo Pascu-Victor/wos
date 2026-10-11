@@ -890,12 +890,30 @@ def test_task_exit_retires_remote_compute_wait_owners() -> None:
             "task->state.load(std::memory_order_acquire) != TaskState::ACTIVE",
             "task->gc_queued.load(std::memory_order_acquire)",
             "task->ref_count.load(std::memory_order_acquire) != 2",
+            "vfs_count_exclusive_unpublished_self_refs(*task, self_refs)",
+            "task->ref_count.load(std::memory_order_acquire) != 2 + self_refs",
         ],
         "unpublished-process exclusive lifetime validation",
     )
     for racy_scheduler_field in ["sched_queue", "heap_index", "sched_next"]:
         if racy_scheduler_field in exclusive_check:
             fail(f"unpublished teardown must not inspect unlocked scheduler field {racy_scheduler_field}")
+    require_order(exclusive_check, "vfs_count_exclusive_unpublished_self_refs(*task, self_refs)",
+                  "task->ref_count.load(std::memory_order_acquire) != 2 + self_refs",
+                  "self-reference exception must prove exclusive graph before accepting its Task references")
+    vfs_core = (ROOT / "modules/kern/src/vfs/core.cpp").read_text()
+    self_proof = function_body(vfs_core, "vfs_count_exclusive_unpublished_self_refs")
+    require_tokens(self_proof, ["task.fd_table.reserved_count() == 0", "captured.root.get()", "captured.cwd.get()",
+                               "task.exec_image_file != captured.image", "captured.find_file_entry(range.file)",
+                               "lazy_owned == captured.files[i].lazy_observed",
+                               "entry.file->refcount.load(std::memory_order_acquire)",
+                               "entry.view->refs.load(std::memory_order_acquire)", "2 * ALIASES",
+                               "task.ref_count.load(std::memory_order_acquire) != 2 + self_refs", "out = self_refs"],
+                   "bounded constructor graph and original-source proof")
+    proof_code = re.sub(r"//[^\n]*|/\*[\s\S]*?\*/", "", self_proof)
+    for prohibited in ("new ", "procfs_view_policy(", "find_task_by_", "vfs_open", "vfs_put_file("):
+        if prohibited in proof_code:
+            fail(f"unpublished ownership proof must not perform {prohibited}")
     require_tokens(
         task_header,
         ["std::atomic<bool> scheduler_published{false}"],

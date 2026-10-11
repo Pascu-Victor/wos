@@ -492,12 +492,21 @@ auto unpublished_process_is_exclusively_owned(Task* task) -> bool {
     // turn this recovery helper into an alternate teardown path for a task
     // that another CPU can already find or run.
     if (task == nullptr || task->scheduler_published.load(std::memory_order_acquire) ||
-        task->state.load(std::memory_order_acquire) != TaskState::ACTIVE || task->gc_queued.load(std::memory_order_acquire) ||
-        task->ref_count.load(std::memory_order_acquire) != 2) {
+        task->state.load(std::memory_order_acquire) != TaskState::ACTIVE || task->gc_queued.load(std::memory_order_acquire)) {
         if (task != nullptr) {
             ker::mod::dbg::log("Refusing to destroy published/shared task PID %x as an unpublished process", task->pid);
         }
         return false;
+    }
+    if (task->ref_count.load(std::memory_order_acquire) != 2) {
+        uint32_t self_refs = 0;
+        if (task->type != TaskType::PROCESS || task->is_thread ||
+            ker::vfs::vfs_count_exclusive_unpublished_self_refs(*task, self_refs) != 0 ||
+            task->ref_count.load(std::memory_order_acquire) != 2 + self_refs || task->scheduler_published.load(std::memory_order_acquire) ||
+            task->gc_queued.load(std::memory_order_acquire) || task->state.load(std::memory_order_acquire) != TaskState::ACTIVE) {
+            ker::mod::dbg::log("Refusing to destroy shared/self-referenced unpublished task PID %x", task->pid);
+            return false;
+        }
     }
     return true;
 }
