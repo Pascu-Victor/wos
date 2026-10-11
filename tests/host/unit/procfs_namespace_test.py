@@ -79,7 +79,33 @@ def main():
     assert scoped_validation.index('procfs::procfs_revalidate_lookup_result(file)') < scoped_validation.index('references.capture(')
     assert scoped_validation.index('validate_native_mount_attachment(') < scoped_validation.index('directory_member_path_locked(covered, view.root()')
     pin = body_after(core, 'auto pin_directory_view_lookup(')
-    assert 'file->is_directory ? -ENOTSUP : -ENOTDIR' in pin
+    assert 'if (!file->is_directory) return -ENOTDIR' in pin
+    assert 'procfs::procfs_pin_directory_lookup_as(' in pin
+    assert pin.index('pin.reset(file)') < pin.index('reservation.attach(file)')
+    search_pin = body_after(proc, 'auto procfs_pin_directory_lookup_as(')
+    assert 'FILE_ACCESS_SEARCH_ONLY | O_DIRECTORY' in search_pin
+    assert 'private_directory_policy(directory)' in search_pin
+    assert 'procfs_fill_stat(' in search_pin and 'authorize_file_access(' in search_pin
+    assert 'procfs_revalidate_metadata_result(directory, generation)' in search_pin
+    for prohibited in ('find_task_by_', 'procfs_lookup_path', 'vfs_open', 'directory_view =', 'vfs_put_file'):
+        assert prohibited not in search_pin, prohibited
+    ordinary_open = body_after(proc, 'auto authorize_procfs_open_as(')
+    assert '(flags & 3) == 3' in ordinary_open
+    member = body_after(core, 'auto directory_member_path_locked(')
+    assert 'root->fs_type != FSType::TMPFS && root->fs_type != FSType::XFS' in member
+    assert member.index('procfs::procfs_directory_path(file') < member.index('references.capture(')
+    assert 'validate_native_mount_attachment(' in member
+    cwd_change = body_after(core, 'auto change_directory_at(')
+    assert cwd_change.index('else if (PRIVATE_PROCFS)') < cwd_change.index('vfs_stat_resolved_cache_or_impl(')
+    assert 'procfs::procfs_fill_stat(static_cast<File*>(handle.backend_parent())' in cwd_change
+    assert 'procfs::procfs_revalidate_metadata_result(' in cwd_change
+    opened = body_after(core, 'auto open_procfs_lookup_as(')
+    assert 'file->directory_view = directory_view' in opened
+    assert opened.index('file->directory_view = directory_view') < opened.index('struct Context {')
+    fresh = opened.index('if (result == 0 && !FD_REOPEN) {', opened.index('if (result == 0 && FD_REOPEN)'))
+    assert fresh < opened.index('file->directory_view = directory_view')
+    opened_at = body_after(core, 'static auto open_at_for_task(')
+    assert opened_at.index('if (scope != nullptr && !scope->is_host()) return -EAGAIN') < opened_at.index('return open_local_serialized(')
     root = body_after(core, 'auto vfs_getroot_for_task(')
     cwd = body_after(core, 'auto vfs_getcwd_for_task(')
     assert root.index('recovery == DirectoryRecoveryMode::LOCAL_ONLY') < root.index('anchor = owner->root_anchor')
@@ -119,7 +145,7 @@ def main():
     assert 'PROC_DIRECTORY->private_data == nullptr) return -EBADF' in binding
     assert 'procfs::procfs_lookup_component_as(credentials, epoch.caller_pid, PROC_DIRECTORY' in binding
     assert 'data->pid_view == *pid_view' in walk
-    assert 'PRIVATE_PROC_DIRECTORY = PRIVATE && !serialized && anchor->fs_type == FSType::PROCFS' in walk
+    assert 'PRIVATE_PROC_DIRECTORY = PRIVATE && !serialized && !physical_path && anchor->fs_type == FSType::PROCFS' in walk
     assert 'root_anchor && anchor->fs_type != FSType::TMPFS && anchor->fs_type != FSType::XFS' in walk
     unscoped = validation[validation.index('if (!view) {'):validation.index('if (handle.authorization().root_identity_view')]
     assert unscoped.index('procfs::procfs_revalidate_lookup_result(') < unscoped.index('references.capture(')

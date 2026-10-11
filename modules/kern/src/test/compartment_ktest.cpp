@@ -3247,7 +3247,12 @@ KTEST(CompartmentProcfs, OwnedNativeRootsKeepProcfsNamesPolicyAndDirectoryBounda
             KEXPECT_EQ(fixture->open("/proc/kperfctl", 0), -ENOTSUP);
             KEXPECT_EQ(fixture->open("/new", vfs::O_CREAT | 2), -EROFS);
             auto const FDS = fixture->task->fd_table.size();
-            KEXPECT_EQ(fixture->open("/proc", vfs::O_DIRECTORY), -ENOTSUP);
+            int const PROC_DIR = fixture->open("/proc", vfs::O_DIRECTORY);
+            KREQUIRE_TRUE(PROC_DIR >= 0);
+            auto* directory = vfs::vfs_get_file(fixture->task.get(), PROC_DIR);
+            KREQUIRE_TRUE(directory != nullptr && directory->directory_view);
+            KEXPECT_TRUE(directory->directory_view.policy().read_only && directory->directory_view.policy().nosuid);
+            KREQUIRE_EQ(fixture->close(PROC_DIR), 0);
             int const THROUGH_ROOT = fixture->open("/proc/self/root/data", 0);
             KREQUIRE_TRUE(THROUGH_ROOT >= 0);
             KREQUIRE_EQ(fixture->close(THROUGH_ROOT), 0);
@@ -3913,4 +3918,172 @@ KTEST(CompartmentOwnership, NativeSpawnActionFailureDrainsSelfDescriptorsAndPopu
     }
     KEXPECT_EQ(pid_ns::live_namespace_count(), PID_BASELINE);
     KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNT_BASELINE);
+}
+
+KTEST(CompartmentProcfs, OwnedDirectoryCwdUsesRetainedNamesAndNativeParentBoundary) {
+    auto const PID_BASELINE = pid_ns::live_namespace_count();
+    auto const MOUNT_BASELINE = mount_ns::live_namespace_count();
+    {
+        SelfOwnershipFixture fixture;
+        KREQUIRE_EQ(fixture.prepare(), 0);
+        KREQUIRE_TRUE(fixture.parent.open("/seed") >= 0);
+        UnpublishedFixture child(*fixture.parent.task);
+        KREQUIRE_TRUE(child.claimed);
+        int const DIR = vfs::vfs_openat(child.task, vfs::AT_FDCWD, "/proc/self", vfs::O_DIRECTORY, 0);
+        KREQUIRE_TRUE(DIR >= 0);
+        auto* file = vfs::vfs_get_file(child.task, DIR);
+        KREQUIRE_TRUE(file != nullptr && file->directory_view);
+        KEXPECT_EQ(file->directory_view.root()->fs_type, vfs::FSType::TMPFS);
+        KEXPECT_EQ(file->directory_view.directory()->fs_type, vfs::FSType::PROCFS);
+        KEXPECT_EQ(file->directory_view.directory()->open_flags & 3, vfs::FILE_ACCESS_SEARCH_ONLY);
+        vfs::DirectoryViewRef synthetic_root;
+        KEXPECT_EQ(vfs::vfs_prepare_directory_view(child.task->credentials(), file->directory_view.directory(),
+                                                   file->directory_view.directory(), {}, synthetic_root),
+                   -ENOTSUP);
+        KEXPECT_FALSE(synthetic_root);
+        auto const REFS = child.task->ref_count.load();
+        auto const FDS = child.task->fd_table.size();
+        KEXPECT_EQ(vfs::vfs_openat(child.task, vfs::AT_FDCWD, "/proc/self", vfs::FILE_ACCESS_SEARCH_ONLY | vfs::O_DIRECTORY, 0), -EINVAL);
+        KEXPECT_EQ(child.task->ref_count.load(), REFS);
+        KEXPECT_EQ(child.task->fd_table.size(), FDS);
+        KREQUIRE_EQ(vfs::vfs_fchdir(child.task, DIR), 0);
+        std::array<char, 96> expected{}, path{};
+        std::snprintf(expected.data(), expected.size(), "/proc/%llu",
+                      static_cast<unsigned long long>(sched::task::namespace_process_pid(*child.task)));
+        auto const CREDENTIALS = child.task->credentials();
+        KREQUIRE_EQ(vfs::vfs_getcwd_for_task(child.task, path.data(), path.size(), nullptr, &CREDENTIALS), 0);
+        KEXPECT_EQ(std::strcmp(path.data(), expected.data()), 0);
+        for (int base : {vfs::AT_FDCWD, DIR}) {
+            int const STATUS = vfs::vfs_openat(child.task, base, "status", 0, 0);
+            KREQUIRE_TRUE(STATUS >= 0);
+            auto* status = vfs::vfs_get_file(child.task, STATUS);
+            KREQUIRE_TRUE(status != nullptr);
+            KEXPECT_TRUE(static_cast<procfs::ProcFileData*>(status->private_data)->target == child.task);
+            KREQUIRE_EQ(vfs::vfs_close_for_task(child.task, STATUS), 0);
+        }
+        std::array<char, 96> fd_link{};
+        std::snprintf(fd_link.data(), fd_link.size(), "/proc/self/fd/%d/status", DIR);
+        for (auto* name : std::array<const char*, 2>{"/proc/self/cwd/status", fd_link.data()}) {
+            int const STATUS = vfs::vfs_openat(child.task, vfs::AT_FDCWD, name, 0, 0);
+            KREQUIRE_TRUE(STATUS >= 0);
+            auto* status = vfs::vfs_get_file(child.task, STATUS);
+            KREQUIRE_TRUE(status != nullptr);
+            KEXPECT_TRUE(static_cast<procfs::ProcFileData*>(status->private_data)->target == child.task);
+            KREQUIRE_EQ(vfs::vfs_close_for_task(child.task, STATUS), 0);
+        }
+        int const PROC_ROOT = vfs::vfs_openat(child.task, DIR, "..", vfs::O_DIRECTORY, 0);
+        KREQUIRE_TRUE(PROC_ROOT >= 0);
+        KREQUIRE_EQ(vfs::vfs_fchdir(child.task, PROC_ROOT), 0);
+        int const SEED = vfs::vfs_openat(child.task, vfs::AT_FDCWD, "../../seed", 0, 0);
+        KREQUIRE_TRUE(SEED >= 0);
+        KEXPECT_EQ(vfs::vfs_get_file(child.task, SEED)->fs_type, vfs::FSType::TMPFS);
+        KREQUIRE_EQ(vfs::vfs_close_for_task(child.task, SEED), 0);
+        KREQUIRE_EQ(vfs::vfs_close_for_task(child.task, PROC_ROOT), 0);
+        KREQUIRE_EQ(vfs::vfs_close_for_task(child.task, DIR), 0);
+        KEXPECT_TRUE(child.destroy());
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PID_BASELINE);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNT_BASELINE);
+}
+
+KTEST(CompartmentOwnership, SyntheticSelfCwdRejectsExternalAliasesThenDrainsClosedView) {
+    auto const PID_BASELINE = pid_ns::live_namespace_count();
+    auto const MOUNT_BASELINE = mount_ns::live_namespace_count();
+    {
+        SelfOwnershipFixture fixture;
+        KREQUIRE_EQ(fixture.prepare(), 0);
+        UnpublishedFixture child(*fixture.parent.task);
+        KREQUIRE_TRUE(child.claimed);
+        int const DIR = vfs::vfs_openat(child.task, vfs::AT_FDCWD, "/proc/self", vfs::O_DIRECTORY, 0);
+        KREQUIRE_TRUE(DIR >= 0);
+        KREQUIRE_EQ(vfs::vfs_fchdir(child.task, DIR), 0);
+        KREQUIRE_EQ(vfs::vfs_close_for_task(child.task, DIR), 0);
+        KEXPECT_EQ(child.task->ref_count.load(), uint32_t{3});
+        KEXPECT_TRUE(vfs::vfs_selftest_unpublished_procfs_cwd_aliases(*child.task));
+        fixture.pids.close();
+        std::array<char, 96> unchanged{};
+        unchanged.fill('x');
+        size_t length = 91;
+        auto const CREDENTIALS = child.task->credentials();
+        KEXPECT_EQ(vfs::vfs_getcwd_for_task(child.task, unchanged.data(), unchanged.size(), &length, &CREDENTIALS), -EIDRM);
+        KEXPECT_EQ(unchanged[0], 'x');
+        KEXPECT_EQ(length, size_t{91});
+        KEXPECT_EQ(vfs::vfs_openat(child.task, vfs::AT_FDCWD, "status", 0, 0), -EIDRM);
+        KEXPECT_EQ(child.task->fd_table.reserved_count(), 0U);
+        KEXPECT_TRUE(child.destroy());
+        KEXPECT_TRUE(fixture.parent.task->owned_unpublished_process.load() == nullptr);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PID_BASELINE);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNT_BASELINE);
+}
+
+KTEST(CompartmentProcfs, OwnedSyntheticCwdAndDirfdRefuseRenamedReplacedCover) {
+    SelfOwnershipFixture fixture;
+    KREQUIRE_EQ(fixture.prepare(), 0);
+    UnpublishedFixture child(*fixture.parent.task);
+    KREQUIRE_TRUE(child.claimed);
+    int const DIR = vfs::vfs_openat(child.task, vfs::AT_FDCWD, "/proc/self", vfs::O_DIRECTORY, 0);
+    KREQUIRE_TRUE(DIR >= 0);
+    KREQUIRE_EQ(vfs::vfs_fchdir(child.task, DIR), 0);
+    auto const CREDENTIALS = child.task->credentials();
+    auto root = scoped_mount(fixture.mounts.first, "/");
+    KREQUIRE_TRUE(root);
+    tmpfs::TmpfsLookupHandle old, moved;
+    KREQUIRE_EQ(tmpfs::tmpfs_acquire_lookup(CREDENTIALS, native_root(root.get()), "/proc", &old), 0);
+    KREQUIRE_EQ(tmpfs::tmpfs_acquire_lookup(CREDENTIALS, native_root(root.get()), "/moved-proc", &moved), 0);
+    KREQUIRE_EQ(tmpfs::tmpfs_rename_lookup(CREDENTIALS, old, moved, true, false), 0);
+    KREQUIRE_EQ(tmpfs::tmpfs_mkdir_path(CREDENTIALS, native_root(root.get()), "/proc", 0755), 0);
+    auto* const ANCHOR = child.task->cwd_anchor.get();
+    auto const TEXT = child.task->cwd;
+    std::array<char, 96> unchanged{};
+    unchanged.fill('x');
+    size_t length = 91;
+    KEXPECT_EQ(vfs::vfs_getcwd_for_task(child.task, unchanged.data(), unchanged.size(), &length, &CREDENTIALS), -EAGAIN);
+    KEXPECT_EQ(unchanged[0], 'x');
+    KEXPECT_EQ(length, size_t{91});
+    KEXPECT_EQ(vfs::vfs_fchdir(child.task, DIR), -EAGAIN);
+    KEXPECT_EQ(vfs::vfs_openat(child.task, DIR, "status", 0, 0), -EAGAIN);
+    KEXPECT_TRUE(child.task->cwd_anchor.get() == ANCHOR && child.task->cwd == TEXT);
+    KEXPECT_EQ(child.task->fd_table.size(), 1U);
+    KEXPECT_EQ(child.task->fd_table.reserved_count(), 0U);
+    KEXPECT_TRUE(child.destroy());
+}
+
+KTEST(CompartmentProcfs, SameMountForeignPidDirectoryCannotPublishCwdOrNames) {
+    SelfOwnershipFixture fixture;
+    KREQUIRE_EQ(fixture.prepare(), 0);
+    UnpublishedFixture child(*fixture.parent.task);
+    KREQUIRE_TRUE(child.claimed);
+    int const DIR = vfs::vfs_openat(child.task, vfs::AT_FDCWD, "/proc/self", vfs::O_DIRECTORY, 0);
+    KREQUIRE_TRUE(DIR >= 0);
+    pid_ns::NamespaceRef other;
+    KREQUIRE_EQ(pid_ns::create_namespace(other), 0);
+    NativeTask foreign;
+    foreign.task->type = sched::task::TaskType::PROCESS;
+    KREQUIRE_TRUE(foreign.task->initialize_mount_namespace(fixture.mounts.first));
+    KREQUIRE_TRUE(foreign.task->initialize_pid_namespace(other));
+    auto root = scoped_mount(fixture.mounts.first, "/");
+    KREQUIRE_TRUE(root);
+    KREQUIRE_EQ(prepare_procfs_fixture_root(*foreign.task, root.get(), "/", "/"), 0);
+    NativeFile capability(vfs::vfs_get_file_retain(child.task, DIR));
+    KREQUIRE_TRUE(capability);
+    vfs::FdReservation reservation(foreign.task.get());
+    int const INHERITED = reservation.install(capability.get());
+    KREQUIRE_TRUE(INHERITED >= 0);
+    capability.release();
+    foreign.track(INHERITED);
+    auto* const ANCHOR = foreign.task->cwd_anchor.get();
+    auto const TEXT = foreign.task->cwd;
+    KEXPECT_EQ(vfs::vfs_fchdir(foreign.task.get(), INHERITED), -EXDEV);
+    KEXPECT_EQ(vfs::vfs_openat(foreign.task.get(), INHERITED, "status", 0, 0), -EXDEV);
+    vfs::DirectoryViewRef output;
+    KEXPECT_EQ(vfs::vfs_directory_view_from_file_for_task(*foreign.task, foreign.task->credentials(),
+                                                          vfs::vfs_get_file(foreign.task.get(), INHERITED), output),
+               -EXDEV);
+    KEXPECT_FALSE(output);
+    KEXPECT_TRUE(foreign.task->cwd_anchor.get() == ANCHOR && foreign.task->cwd == TEXT);
+    KEXPECT_EQ(foreign.task->fd_table.size(), 1U);
+    KEXPECT_EQ(foreign.task->fd_table.reserved_count(), 0U);
+    KREQUIRE_EQ(foreign.close(INHERITED), 0);
+    KEXPECT_TRUE(child.destroy());
 }

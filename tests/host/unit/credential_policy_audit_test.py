@@ -845,7 +845,7 @@ def test_procfs_open_retains_identity_and_publishes_only_after_validation():
     for token in ("readlink_resolved", "procfs_open_path", "get_current_task", "task.credentials()", "apply_open_truncation"):
         assert token not in consumed
     opened = body_after(core, "static auto open_at_for_task(")
-    assert "open_procfs_lookup_as(lookup, *task, REQUEST_CREDENTIALS, CALLER_PID, flags, output)" in opened
+    assert "open_procfs_lookup_as(lookup, *task, REQUEST_CREDENTIALS, CALLER_PID, flags, context.directory_view, output)" in opened
     assert "ker::mod::sched::task::process_pid(*task)" in opened
 
 

@@ -677,10 +677,10 @@ selection authorizes before probing the target table; borrowed description
 release stays outside namespace publication. Final consumption revalidates the
 exact native cover and attachment, including direct backend renames that do not
 advance the VFS publication epoch. Failed output and FD reservations stay intact.
-Host, owned-root synthetic-pin, serialized and physical-export refusals remain;
+At that checkpoint, Host, owned-root synthetic-pin, serialized and physical-export refusals remained;
 Task/File/anchor/view, callback, syscall, libc and wire layouts are unchanged.
 
-Owned-root procfs directory pins and cwd publication remain pending. At this
+Owned-root procfs directory pins and cwd publication were pending. At that
 checkpoint, unpublished teardown required exactly two references before clearing
 anchors and FDs; self-procfs objects added retained task references. The following
 ownership checkpoint addresses that rollback prerequisite.
@@ -715,9 +715,10 @@ outside path, FD and lazy locks. Closed PID views do not prevent ownership drain
 Creator-slot and transferred-owner teardown retain their publication/lifecycle
 guards and existing resource cleanup. Task/File/view/anchor, callback, namespace,
 credential, syscall, libc and wire layouts are unchanged. Ordinary running-task
-exit keeps its existing behavior. Synthetic owned-root pins/cwd and public
-compartment creation remain gated; their typed membership and publication tests
-are separate work.
+exit keeps its existing behavior. At that checkpoint, synthetic owned-root
+pins/cwd and public compartment creation remained gated. Typed directory
+membership and publication are implemented in the following checkpoint;
+public compartment creation remains disabled.
 
 Five native fixtures exercise distinct and duplicate self objects, image/lazy
 aliases, closed views, external Task/File aliases, reserved descriptors,
@@ -735,6 +736,48 @@ Its four inactive images (259,342,336 allocated bytes) were verified and pruned;
 disposable usage returned to zero. The initial diagnostic fixture compile error
 and its reproducible source patch remain in the small evidence receipts.
 All ten full acceptance criteria remain incomplete.
+
+## Private procfs cwd under an owned native root
+
+Private procfs directory descriptors now retain a detached search pin and an
+immutable directory view beneath the process's native TMPFS or XFS root.
+The internal pin factory clones the exact retained PID view and target; it
+does not look up a PID string or read process content. Ordinary procfs opens
+still reject access mode 3. A fresh directory File receives its prepared view
+before publication; reopening an inherited descriptor preserves that File's
+existing capability.
+
+Relative cwd and directory-FD walks start from retained procfs metadata.
+Canonical names use its exact target identity. Native membership validation
+checks the private procfs mount's original cover, attachment and ancestry;
+`..` can leave the procfs root through that cover, while the native process
+root remains the boundary. Procfs directories cannot become process roots.
+Renamed or replaced covers, closed views and foreign mount/PID scopes refuse
+before cwd publication or descriptor reservation. Exhausted private lookup
+retries return EAGAIN; Host lookup keeps its serialized fallback.
+
+Cwd search uses typed procfs metadata and the admitted credential generation.
+The anchor retains its mount and immutable view without treating procfs data
+as a native inode. Replaced views, pins, anchors and membership owners retire
+outside publication and path locks. Unpublished rollback counts a self-target
+cwd pin once and refuses external File, view or anchor aliases. Task/File/view/
+anchor layouts, callbacks, syscall/libc/wire ABI and Host behavior are unchanged.
+
+Four new native fixtures cover cwd/dirfd/magic-link traversal, the native parent
+boundary, same-mount foreign PID scopes, replaced covers, closed views and
+self-cwd alias refusal/drain. These are unscheduled native fixtures; scheduled
+service entry, namespace-init teardown, complete WKI/network/resource policy,
+shared-futex user mappings, the launcher and full service campaigns remain
+unqualified. All ten full acceptance criteria remain incomplete.
+
+Normal Build WOS, isolated fast diagnostics, all 35 selected host checks,
+five-path formatting and clang-tidy for core/procfs pass. Actual rootless KTEST31
+passes 80,916 assertions, zero failures, 1,335 cases and all 84 mandatory checks
+with normal poweroff and stable source/artifact pins. An earlier VM exposed a
+missing directory-view attachment and a private lookup entering the Host
+serialized fallback; both were corrected and requalified. Four images from each
+failed and successful run were verified inactive and pruned; final disposable
+usage is zero. Small source reproduction, log and cleanup receipts are retained.
 
 ## Verification checkpoint
 

@@ -146,6 +146,11 @@ auto procfs_lookup_component_as(const ker::mod::security::Snapshot& credentials,
 // Safe under publication: no registry/FD selection, allocation or File release.
 // Reject closed/retired directories before changing output; never grants access.
 auto procfs_directory_path(const File* directory, char* buffer, size_t capacity) -> int;
+// Clone a detached private directory identity for an internal search-only view.
+// Caller retains source; no content, numeric lookup or inherited parent view.
+// Optional search uses this snapshot; failure never changes the source.
+auto procfs_pin_directory_lookup_as(const ker::mod::security::Snapshot& credentials, const File* directory, bool require_target_search,
+                                    int* result_out) -> File*;
 
 // Syntactic detection only: no Task/File lookup or authority is conferred.
 auto procfs_path_is_fd_link(const char* path) -> bool;

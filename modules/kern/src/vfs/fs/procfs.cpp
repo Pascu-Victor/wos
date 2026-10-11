@@ -43,6 +43,7 @@
 #include <platform/sched/resource_process.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/security/authorization.hpp>
+#include <platform/security/file_policy.hpp>
 #include <platform/smt/smt.hpp>
 #include <platform/sys/context_switch.hpp>
 #include <platform/sys/usercopy.hpp>
@@ -8437,6 +8438,39 @@ auto procfs_directory_path(const File* directory, char* buffer, size_t capacity)
     if (CURRENT != 0) return CURRENT;
     std::memcpy(buffer, staged.data(), static_cast<size_t>(length) + 1);
     return 0;
+}
+
+auto procfs_pin_directory_lookup_as(const ker::mod::security::Snapshot& credentials, const File* directory, bool require_target_search,
+                                    int* result_out) -> File* {
+    auto fail = [result_out](int error) -> File* {
+        if (result_out != nullptr) *result_out = error;
+        return nullptr;
+    };
+    int error = private_directory_policy(directory);
+    if (error != 0) return fail(error);
+    Stat metadata{};
+    uint64_t generation = 0;
+    error = procfs_fill_stat(const_cast<File*>(directory), &metadata, 0, &generation);
+    if (error == 0 && require_target_search)
+        error = ker::mod::security::authorize_file_access(credentials, {metadata.st_uid, metadata.st_gid, metadata.st_mode}, 1);
+    if (error != 0) return fail(error);
+    auto const& source = *static_cast<const ProcFileData*>(directory->private_data);
+    auto file = std::unique_ptr<File>(
+        make_private_component(source.pid_view, source.node.type, source.target, true, source.node.thread_view, source.node.fd, error));
+    if (!file) return fail(error);
+    file->fops = get_procfs_fops();
+    file->open_flags = FILE_ACCESS_SEARCH_ONLY | O_DIRECTORY;
+    error = procfs_revalidate_metadata_result(directory, generation);
+    if (error == 0) error = private_directory_policy(directory);
+    if (error == 0) error = private_directory_policy(file.get());
+    if (error != 0) {
+        // Source keeps the same target/view alive. This detached metadata has
+        // no mount, parent view, native pin or remote description to close.
+        procfs_close(file.get());
+        return fail(error);
+    }
+    if (result_out != nullptr) *result_out = 0;
+    return file.release();
 }
 
 auto procfs_lookup_component_as(const ker::mod::security::Snapshot& credentials, uint64_t caller_pid, const File* directory,

@@ -569,6 +569,7 @@ void vfs_put_file(struct File* f);
 // External aliases/changed snapshots/unknown graphs refuse without changing out.
 auto vfs_count_exclusive_unpublished_self_refs(ker::mod::sched::task::Task& task, uint32_t& out) -> int;
 #ifdef WOS_SELFTEST
+auto vfs_selftest_unpublished_procfs_cwd_aliases(ker::mod::sched::task::Task& task) -> bool;
 extern void (*unpublished_self_refs_test_hook)(ker::mod::sched::task::Task&);
 #endif
 auto vfs_release_fd(ker::mod::sched::task::Task* task, int fd) -> int;
