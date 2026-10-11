@@ -917,6 +917,218 @@ KTEST(CompartmentWait, TracedThreadsAndPublicSelectorsUseExactRetainedScope) {
     KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
 }
 
+namespace {
+struct ReparentFixture {
+    pid_ns::NamespaceRef scope, foreign;
+    RegistryTask init, sibling, parent, child, tracer;
+    WaitClaim old_claim, tracer_claim, reap_claim;
+    bool initialized{};
+    ~ReparentFixture() {
+        child_events::cancel_claim(old_claim.value);
+        child_events::cancel_claim(tracer_claim.value);
+        child_events::cancel_claim(reap_claim.value);
+        // Actual ownership may have moved to init. Make every fixture inert,
+        // then drain through the real exit preparation, never raw link edits.
+        for (auto* task : {init.task.get(), sibling.task.get(), parent.task.get(), child.task.get(), tracer.task.get()})
+            if (task->state.load() != sched::task::TaskState::DEAD) task->state.store(sched::task::TaskState::EXITING);
+        if (initialized) {
+            child_events::prepare_process_exit(*parent.task);
+            child_events::prepare_process_exit(*init.task);
+            child_events::prepare_process_exit(*sibling.task);
+            child_events::prepare_process_exit(*tracer.task);
+        }
+        KEXPECT_NULL(child.task->child_parent);
+        KEXPECT_NULL(child.task->child_tracer);
+        KEXPECT_EQ(child.task->child_membership_state.load(), sched::task::ChildMembershipState::UNLINKED);
+    }
+    auto prepare(bool foreign_child = false, bool publish_init = true) -> bool {
+        if (pid_ns::create_namespace(scope) != 0 || pid_ns::create_namespace(foreign) != 0 || !init.task->initialize_pid_namespace(scope) ||
+            !sibling.task->initialize_pid_namespace(foreign) || !parent.task->initialize_pid_namespace(scope) ||
+            !child.task->initialize_pid_namespace(foreign_child ? foreign : scope) ||
+            !tracer.task->initialize_pid_namespace(foreign_child ? foreign : scope))
+            return false;
+        initialized = true;
+        make_wait_fixtures_inert({parent.task.get(), child.task.get(), tracer.task.get()});
+        if ((publish_init && !init.publish()) || !sibling.publish()) return false;
+        auto job = parent.task->job_identity();
+        job.session_id = parent.task->pid;
+        job.pgid = parent.task->pid;
+        child.task->initialize_job_identity(job, session::Names{2, 2});
+        child.task->exit_status = 0x3100;
+        resource::charge_cpu(child.task.get(), 36, 17);
+        return child_events::begin_publication(*parent.task, *child.task) && child_events::commit_publication(*child.task);
+    }
+};
+
+enum class ReaperCutover { NONE, CLOSE, EXIT, REQUEST, NOTIFY, DEAD };
+struct ReparentCutover {
+    ReparentFixture& fixture;
+    ReaperCutover action{ReaperCutover::NONE};
+    Task* selected{};
+    size_t deliveries{};
+    static void run(Task& source, Task* init, bool before_delivery, void* context) {
+        auto& self = *static_cast<ReparentCutover*>(context);
+        KEXPECT_TRUE(&source == self.fixture.parent.task.get());
+        if (before_delivery) {
+            ++self.deliveries;
+            // Commit inspected ACTIVE. Exit can win after that commit; this
+            // also prevents an unscheduled fixture from becoming runnable.
+            if (init != nullptr && init->state.load() == sched::task::TaskState::ACTIVE) init->state.store(sched::task::TaskState::EXITING);
+            return;
+        }
+        self.selected = init;
+        if (init == nullptr) return;
+        KEXPECT_TRUE(init == self.fixture.init.task.get());
+        KEXPECT_TRUE(init->ref_count.load() >= 2);
+        switch (self.action) {
+            case ReaperCutover::NONE:
+                break;
+            case ReaperCutover::CLOSE:
+                self.fixture.scope.close();
+                break;
+            case ReaperCutover::EXIT:
+                init->exit_in_progress.store(true);
+                break;
+            case ReaperCutover::REQUEST:
+                init->process_exit_requested.store(true);
+                break;
+            case ReaperCutover::NOTIFY:
+                init->exit_notify_ready.store(true);
+                break;
+            case ReaperCutover::DEAD:
+                init->state.store(sched::task::TaskState::DEAD);
+                break;
+        }
+    }
+    void execute() { child_events::selftest_prepare_exit_reaper_cutover(*fixture.parent.task, run, this); }
+};
+}  // namespace
+
+KTEST(CompartmentLifecycle, OrphansAdoptExactLocalInitAndFrozenEvents) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    auto const REGISTRY_BASELINE = sched::get_scoped_pid_task_count();
+    for (bool const ZOMBIE : {false, true}) {
+        ReparentFixture fixture;
+        KREQUIRE_TRUE(fixture.prepare());
+        KEXPECT_NE(fixture.init.task->pid, uint64_t{1});
+        KEXPECT_EQ(fixture.init.task->namespace_tid(), uint64_t{1});
+        KEXPECT_EQ(fixture.sibling.task->namespace_tid(), uint64_t{1});
+        child_events::ClaimedEvent old_event;
+        if (ZOMBIE) {
+            KREQUIRE_TRUE(child_events::publish_exit(*fixture.child.task));
+            KREQUIRE_EQ(child_events::try_claim(*fixture.parent.task, fixture.old_claim.value, 3, 0, old_event, child_events::View::PUBLIC),
+                        child_events::ProbeResult::CLAIMED);
+            auto job = fixture.child.task->job_identity();
+            job.pgid = fixture.child.task->pid;
+            KREQUIRE_TRUE(child_events::update_job_identity(*fixture.child.task, job, session::Names{2, 3}));
+        }
+        ReparentCutover cutover{fixture};
+        cutover.execute();
+        KEXPECT_TRUE(cutover.selected == fixture.init.task.get());
+        KEXPECT_EQ(cutover.deliveries, size_t{1});
+        KEXPECT_TRUE(fixture.child.task->child_parent == fixture.init.task.get());
+        KEXPECT_EQ(fixture.child.task->parent_pid, fixture.init.task->pid);
+        KEXPECT_EQ(child_events::namespace_parent_pid(*fixture.child.task), uint64_t{1});
+        KEXPECT_NULL(fixture.parent.task->child_list_head);
+        KEXPECT_NULL(fixture.sibling.task->child_list_head);
+        KEXPECT_EQ(fixture.parent.task->ref_count.load(), uint32_t{1});
+        KEXPECT_NULL(fixture.old_claim.value.event);
+        if (ZOMBIE) KEXPECT_TRUE(!child_events::commit_claim(*fixture.parent.task, fixture.old_claim.value, old_event, false));
+        if (!ZOMBIE) KREQUIRE_TRUE(child_events::publish_exit(*fixture.child.task));
+        child_events::ClaimedEvent event;
+        child_events::Selector const SELECTOR =
+            ZOMBIE ? child_events::Selector{child_events::SELECT_PROCESS_GROUP | 2} : child_events::Selector{3};
+        KREQUIRE_EQ(child_events::try_claim(*fixture.init.task, fixture.reap_claim.value, SELECTOR, 0, event, child_events::View::PUBLIC),
+                    child_events::ProbeResult::CLAIMED);
+        KEXPECT_EQ(event.visible_pid, uint64_t{3});
+        KEXPECT_EQ(event.subject_pid, fixture.child.task->pid);
+        KEXPECT_EQ(event.status, int32_t{0x3100});
+        KEXPECT_EQ(event.user_time_us, uint64_t{17});
+        KEXPECT_EQ(event.system_time_us, uint64_t{19});
+        KEXPECT_EQ(event.process_group, fixture.parent.task->pid);
+        KREQUIRE_TRUE(child_events::commit_claim(*fixture.init.task, fixture.reap_claim.value, event, false));
+        KEXPECT_EQ(fixture.init.task->ref_count.load(), uint32_t{1});
+        KEXPECT_EQ(fixture.child.task->ref_count.load(), uint32_t{1});
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+    KEXPECT_EQ(sched::get_scoped_pid_task_count(), REGISTRY_BASELINE);
+}
+
+KTEST(CompartmentLifecycle, MissingClosedDyingAndForeignReapersNeverAdoptIntoHost) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    auto const REGISTRY_BASELINE = sched::get_scoped_pid_task_count();
+    for (auto const ACTION : {ReaperCutover::NONE, ReaperCutover::CLOSE, ReaperCutover::EXIT, ReaperCutover::REQUEST, ReaperCutover::NOTIFY,
+                              ReaperCutover::DEAD}) {
+        ReparentFixture fixture;
+        KREQUIRE_TRUE(fixture.prepare(false, ACTION != ReaperCutover::NONE));
+        KREQUIRE_TRUE(child_events::publish_exit(*fixture.child.task));
+        ReparentCutover cutover{fixture, ACTION};
+        cutover.execute();
+        KEXPECT_TRUE(cutover.selected == (ACTION == ReaperCutover::NONE ? nullptr : fixture.init.task.get()));
+        KEXPECT_NULL(fixture.child.task->child_parent);
+        KEXPECT_NULL(fixture.init.task->child_list_head);
+        KEXPECT_NULL(fixture.sibling.task->child_list_head);
+        KEXPECT_EQ(child_events::namespace_parent_pid(*fixture.child.task), uint64_t{0});
+        KEXPECT_EQ(fixture.child.task->ref_count.load(), uint32_t{1});
+        KEXPECT_EQ(fixture.init.task->ref_count.load(), uint32_t{1});
+        KEXPECT_EQ(fixture.parent.task->ref_count.load(), uint32_t{1});
+        KEXPECT_EQ(child_events::diagnostics(*fixture.parent.task).owned_event_count, size_t{0});
+        KEXPECT_TRUE(fixture.scope.operations_drained());
+    }
+    {
+        ReparentFixture fixture;
+        KREQUIRE_TRUE(fixture.prepare(true));
+        ReparentCutover cutover{fixture};
+        cutover.execute();
+        KEXPECT_TRUE(cutover.selected == fixture.init.task.get());
+        KEXPECT_NULL(fixture.child.task->child_parent);
+        KEXPECT_NULL(fixture.init.task->child_list_head);
+        KEXPECT_NULL(fixture.sibling.task->child_list_head);
+        KEXPECT_EQ(fixture.child.task->ref_count.load(), uint32_t{1});
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+    KEXPECT_EQ(sched::get_scoped_pid_task_count(), REGISTRY_BASELINE);
+}
+
+KTEST(CompartmentLifecycle, PrivateInitDiscardsParentAudienceAndPreservesHostAndTracerClaims) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        RegistryTask host;
+        host.task->state.store(sched::task::TaskState::EXITING);
+        ReparentFixture fixture;
+        KREQUIRE_TRUE(fixture.prepare());
+        WaitMembership supervision{*host.task, *fixture.init.task};
+        KREQUIRE_TRUE(supervision.publish());
+        KREQUIRE_TRUE(child_events::attach_tracer(*fixture.child.task, *fixture.tracer.task));
+        KREQUIRE_TRUE(child_events::publish_exit(*fixture.child.task));
+        child_events::ClaimedEvent traced;
+        KREQUIRE_EQ(child_events::try_claim(*fixture.tracer.task, fixture.tracer_claim.value, 3, 0, traced, child_events::View::PUBLIC),
+                    child_events::ProbeResult::CLAIMED);
+        ReparentCutover cutover{fixture};
+        cutover.execute();
+        KEXPECT_TRUE(fixture.child.task->child_parent == fixture.init.task.get());
+        child_events::prepare_process_exit(*fixture.init.task);
+        KEXPECT_NULL(fixture.child.task->child_parent);
+        KEXPECT_TRUE(child_events::is_waitable_zombie(*fixture.child.task));
+        KEXPECT_TRUE(fixture.tracer_claim.value.event == traced.node);
+        KEXPECT_TRUE(fixture.init.task->child_parent == host.task.get());
+        KEXPECT_EQ(child_events::namespace_parent_pid(*fixture.init.task), uint64_t{0});
+        KEXPECT_EQ(child_events::diagnostics(*fixture.init.task).owned_event_count, size_t{0});
+        KREQUIRE_TRUE(child_events::commit_claim(*fixture.tracer.task, fixture.tracer_claim.value, traced, false));
+        KEXPECT_EQ(fixture.child.task->ref_count.load(), uint32_t{1});
+        KREQUIRE_TRUE(child_events::publish_exit(*fixture.init.task));
+        WaitClaim claim;
+        child_events::ClaimedEvent event;
+        KREQUIRE_EQ(child_events::try_claim(*host.task, claim.value, fixture.init.task->pid, 0, event, child_events::View::PUBLIC),
+                    child_events::ProbeResult::CLAIMED);
+        KEXPECT_EQ(event.visible_pid, fixture.init.task->pid);
+        KREQUIRE_TRUE(child_events::commit_claim(*host.task, claim.value, event, false));
+        KEXPECT_EQ(host.task->ref_count.load(), uint32_t{1});
+        KEXPECT_EQ(fixture.init.task->ref_count.load(), uint32_t{1});
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
 KTEST(CompartmentIdentity, CanonicalSelfAndParentNamesUseRetainedMembership) {
     auto const BASELINE = pid_ns::live_namespace_count();
     {

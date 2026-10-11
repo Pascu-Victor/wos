@@ -1096,16 +1096,35 @@ void detach_tracer(Task& tracee) {
     }
 }
 
-void prepare_process_exit(Task& process) {
+namespace {
+auto private_reaper_matches(const Task& init, const Task& child, const ker::mod::sched::pid_ns::NamespaceRef& scope) -> bool {
+    auto const* init_scope = init.pid_namespace();
+    auto const* child_scope = child.pid_namespace();
+    return !init.is_thread && init.type == sched_task::TaskType::PROCESS && init_scope != nullptr && *init_scope == scope &&
+           child_scope != nullptr && *child_scope == scope && init.namespace_tid() == 1 &&
+           init.state.load(std::memory_order_acquire) == sched_task::TaskState::ACTIVE &&
+           !init.exit_in_progress.load(std::memory_order_acquire) && !init.process_exit_requested.load(std::memory_order_acquire) &&
+           !init.exit_notify_ready.load(std::memory_order_acquire);
+}
+
+template <typename Selected, typename BeforeDelivery>
+void prepare_process_exit_impl(Task& process, Selected&& selected, BeforeDelivery&& before_delivery) {
     // A process may itself be blocked in waitpid when group exit wins.  Retire
     // its intrusive registration/claim before transferring the queue it was
     // observing.
     cancel_wait(process);
 
+    auto const* scope = process.pid_namespace();
+    bool const PRIVATE = scope != nullptr && !scope->is_host();
     Task* init = nullptr;
-    if (process.pid != 1) {
-        init = ker::mod::sched::find_task_by_pid_safe(1);
+    if (scope != nullptr) {
+        if (PRIVATE) {
+            if (!process.is_thread && process.namespace_tid() > 1) init = ker::mod::sched::find_task_by_pid_namespace_safe(*scope, 1);
+        } else if (process.pid != 1) {
+            init = ker::mod::sched::find_task_by_pid_safe(1);
+        }
     }
+    selected(process, init);
 
     for (;;) {
         Task* child = nullptr;
@@ -1119,7 +1138,11 @@ void prepare_process_exit(Task& process) {
         // Retain a temporary reference before making the child UNLINKED.  The
         // scheduler GC predicate can change immediately with that store.
         bool const CHILD_REF = take_lifetime_ref(child);
-        bool const CAN_REPARENT = init != nullptr && init != child && take_lifetime_ref(init);
+        std::optional<ker::mod::sched::pid_ns::PublicationGuard> admission;
+        if (PRIVATE) admission.emplace(*scope);
+        bool const CAN_REPARENT = init != nullptr && init != child &&
+                                  (!PRIVATE || (admission->open() && private_reaper_matches(*init, *child, *scope))) &&
+                                  take_lifetime_ref(init);
         child_list_remove_locked(process, *child);
         if (CAN_REPARENT) {
             child->child_parent = init;
@@ -1138,8 +1161,10 @@ void prepare_process_exit(Task& process) {
             child->release();
             process.release();
         }
+        admission.reset();
         g_lifecycle_lock.unlock_irqrestore(FLAGS);
 
+        before_delivery(process, init);
         deliver_wake(init_wake);
         if (CHILD_REF) {
             // Transfer the exact selected child reference. A remote child may
@@ -1225,6 +1250,24 @@ void prepare_process_exit(Task& process) {
 
     drop_lifetime_ref(init);
 }
+}  // namespace
+
+void prepare_process_exit(Task& process) {
+    prepare_process_exit_impl(process, [](Task&, Task*) {}, [](Task&, Task*) {});
+}
+
+#ifdef WOS_SELFTEST
+void selftest_prepare_exit_reaper_cutover(Task& process, void (*hook)(Task&, Task*, bool, void*), void* context) {
+    prepare_process_exit_impl(
+        process,
+        [hook, context](Task& source, Task* init) {
+            if (hook != nullptr) hook(source, init, false, context);
+        },
+        [hook, context](Task& source, Task* init) {
+            if (hook != nullptr) hook(source, init, true, context);
+        });
+}
+#endif
 
 void cancel_wait(Task& waiter) {
     WakeSelection wake{};

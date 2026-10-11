@@ -779,6 +779,41 @@ serialized fallback; both were corrected and requalified. Four images from each
 failed and successful run were verified inactive and pruned; final disposable
 usage is zero. Small source reproduction, log and cleanup receipts are retained.
 
+## Private orphan ownership
+
+Orphans from a private PID view now adopt through that view's retained local
+PID 1. Private init does not select a reaper for itself. Missing, closed or
+dying private reapers cause the existing parent-audience cleanup; there is no
+fallback to host PID 1. Host orphan adoption keeps its physical-ID behavior.
+Host supervision of a top-level private init remains an explicit membership.
+
+Registry selection retains the exact reaper before the lifecycle lock. Private
+transfer then holds the PID publication gate through membership and event-owner
+mutation, checking the reaper's exact scope, local name, process type, ACTIVE
+state and exit flags, plus the child's same-scope identity. Namespace closure
+cannot split that commit. Canonical and proxy exit publish their exit flag
+before the final child scan, so a transfer that wins earlier is included in
+that scan. Scheduler wakes and parent-death routing occur after both guards.
+
+Queued group names, status and accounting stay frozen when their owner moves.
+Old parent claims are invalidated; independent tracer claims remain valid.
+Task/namespace/event layouts and syscall/libc/wire ABI are unchanged. Native
+fixtures exercise actual registry selection, ownership/claim transfers and
+reference drains using per-invocation cutovers without a global hook or fake
+runnable Tasks. Bounded namespace-init closure, descendant termination,
+mount/IPC drain and scheduled service qualification still require integration.
+Public creation remains disabled and all ten full criteria remain incomplete.
+
+Normal Build WOS, isolated fast diagnostics, all 35 selected host checks,
+three-path formatting and clang-tidy for child events pass. Actual rootless
+KTEST33 passes 81,243 assertions, zero failures, 1,338 cases and all 87 mandatory
+checks, with normal poweroff and stable source/artifact pins. An earlier run
+exposed fixture CPU accounting populated in cached Task fields; the fixture now
+uses production resource accounting, preserving the expected event snapshots.
+Four images from each failed and successful run were verified inactive and
+pruned. Final disposable usage is zero; small failure, source and cleanup
+receipts remain.
+
 ## Verification checkpoint
 
 The initial `compartment_policy_test` suite checks actual production preparation

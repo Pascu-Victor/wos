@@ -188,7 +188,9 @@ def test_publication_and_reparenting_are_explicit_transactions() -> None:
     begin = function_body(source, "begin_publication")
     commit = function_body(source, "commit_publication")
     abort = function_body(source, "abort_publication")
-    prepare_exit = function_body(source, "prepare_process_exit")
+    require_tokens(function_body(source, "prepare_process_exit"), ["prepare_process_exit_impl(process", "[](Task&, Task*) {}"],
+                   "production reparenting shares the native tested implementation")
+    prepare_exit = function_body(source, "prepare_process_exit_impl")
     require_tokens(
         begin,
         [
@@ -219,6 +221,20 @@ def test_publication_and_reparenting_are_explicit_transactions() -> None:
         ],
         "explicit child/event reparenting",
     )
+    require_tokens(prepare_exit, ["process.pid_namespace()", "process.namespace_tid() > 1",
+                                 "find_task_by_pid_namespace_safe(*scope, 1)", "else if (process.pid != 1)",
+                                 "admission.emplace(*scope)", "admission->open()", "private_reaper_matches(*init, *child, *scope)"],
+                   "private orphan selection and closed-scope commit")
+    require_order(prepare_exit, "selected(process, init)", "g_lifecycle_lock.lock_irqsave()", "selection outside lifecycle lock")
+    require_order(prepare_exit, "admission.emplace(*scope)", "child_list_remove_locked(process", "namespace gate before topology mutation")
+    require_order(prepare_exit, "transfer_parent_events_locked(process, init", "admission.reset()", "event transfer under namespace gate")
+    require_order(prepare_exit, "admission.reset()", "before_delivery(process, init)", "cutover and wakes outside namespace gate")
+    require_order(prepare_exit, "before_delivery(process, init)", "deliver_wake(init_wake)", "fixture cutover before scheduler wake")
+    policy = function_body(source, "private_reaper_matches")
+    require_tokens(policy, ["*init_scope == scope", "*child_scope == scope", "!init.is_thread", "TaskType::PROCESS",
+                           "init.namespace_tid() == 1", "TaskState::ACTIVE", "!init.exit_in_progress.load",
+                           "!init.process_exit_requested.load", "!init.exit_notify_ready.load"], "exact live private reaper")
+    forbid_tokens(policy, ["find_task", "get_current_task", "new ", "wake_", "copy_", "wki_"], "bounded retained reaper validation")
 
     process = PROCESS_CPP.read_text()
     exec_source = EXEC_CPP.read_text()

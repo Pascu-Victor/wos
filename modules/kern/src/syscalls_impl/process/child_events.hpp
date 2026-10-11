@@ -190,7 +190,8 @@ void advance_process_job_control(sched_task::Task& owner);
 void detach_tracer(sched_task::Task& tracee);
 
 // Reparent children/events, cancel registrations owned by a dying process, and
-// detach tracees.  Call before publishing the process's own exit event.
+// detach tracees. Host adopts through physical init; private orphans use only
+// their exact scope's live local init. Call before the process's own exit event.
 void prepare_process_exit(sched_task::Task& process);
 void cancel_wait(sched_task::Task& waiter);
 
@@ -218,6 +219,10 @@ void release_claim(sched_task::Task& waiter, const ClaimedEvent& claimed);
 [[nodiscard]] auto diagnostics(sched_task::Task& task, bool public_names = false) -> Diagnostics;
 
 #ifdef WOS_SELFTEST
+// Per-invocation unlocked cutovers: false after retained reaper selection; true
+// before each wake. No global hook or production callback/layout change.
+void selftest_prepare_exit_reaper_cutover(sched_task::Task& process, void (*hook)(sched_task::Task&, sched_task::Task*, bool, void*),
+                                          void* context);
 [[nodiscard]] auto selftest_native_tracee_queue_versions() -> bool;
 [[nodiscard]] auto selftest_queue_versions() -> bool;
 [[nodiscard]] auto selftest_queue_version_retirement() -> bool;
