@@ -58,6 +58,7 @@
 #include <vfs/file.hpp>
 #include <vfs/filesystem_context.hpp>
 #include <vfs/fs/devfs.hpp>
+#include <vfs/fs/tmpfs.hpp>
 #include <vfs/mount.hpp>
 #include <vfs/vfs.hpp>
 
@@ -3536,7 +3537,169 @@ auto supports_file_backed_process(vfs::File* file, size_t file_size) -> bool {
     return prepare_file_backed_elf(file, file_size, prepared_elf) == PrepareFileBackedElfResult::READY;
 }
 
+#ifdef WOS_SELFTEST
 namespace {
+std::atomic<NativeConstructionFault> g_native_construction_fault{NativeConstructionFault::NONE};
+uint32_t g_native_construction_scratch_destructions{};
+}  // namespace
+void exec_selftest_fail_native_construction_once(NativeConstructionFault fault) {
+    g_native_construction_fault.store(fault, std::memory_order_release);
+}
+auto exec_selftest_take_native_construction_fault(NativeConstructionFault fault) -> bool {
+    return g_native_construction_fault.compare_exchange_strong(fault, NativeConstructionFault::NONE, std::memory_order_acq_rel);
+}
+auto exec_selftest_native_construction_scratch_destructions() -> uint32_t { return g_native_construction_scratch_destructions; }
+#endif
+
+namespace {
+auto create_native_process_task_impl(mod::sched::task::Task* owner, const NativeProcessContext& context, const char* name,
+                                     vfs::File* owned_file, size_t file_size, const vfs::Stat& file_stat, uint64_t kernel_rsp,
+                                     const mod::sched::resource::State& resources, const mod::security::Snapshot& credentials,
+                                     mod::sched::resource::ProcessReservation& reservation,
+                                     mod::sched::resource::State* failure_observations, int* construction_error)
+    -> mod::sched::task::Task* {
+    if (construction_error != nullptr) *construction_error = 0;
+    bool input_guard = false;
+    auto refuse_inputs = [&](int error) -> mod::sched::task::Task* {
+        if (construction_error != nullptr) *construction_error = error;
+        if (owned_file != nullptr) vfs::vfs_put_file(owned_file);
+        if (kernel_rsp != 0) mod::mm::phys::page_free(reinterpret_cast<void*>(kernel_rsp - mod::mm::KERNEL_STACK_SIZE));
+        if (input_guard) owner->unpublished_teardown_in_progress.store(false, std::memory_order_release);
+        return nullptr;
+    };
+    if (owner == nullptr) return refuse_inputs(-ESRCH);
+    bool expected = false;
+    if (!owner->unpublished_teardown_in_progress.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return refuse_inputs(-EBUSY);
+    input_guard = true;
+    if (owner->exit_in_progress.load(std::memory_order_acquire) || owner->has_exited ||
+        owner->state.load(std::memory_order_acquire) != mod::sched::task::TaskState::ACTIVE)
+        return refuse_inputs(-ECANCELED);
+    if (owner->owned_unpublished_process.load(std::memory_order_acquire) != nullptr) return refuse_inputs(-EBUSY);
+    if (context.ipc.closed() || context.mounts.closed() || context.pids.closed()) return refuse_inputs(-EIDRM);
+    if (context.ipc.is_host() || context.mounts.is_host() || context.pids.is_host() || context.filesystem == nullptr)
+        return refuse_inputs(-EINVAL);
+    if (name == nullptr || owned_file == nullptr || kernel_rsp < mod::mm::KERNEL_STACK_SIZE || file_stat.st_size <= 0 ||
+        static_cast<size_t>(file_stat.st_size) != file_size)
+        return refuse_inputs(-EINVAL);
+    if (owned_file->fops != vfs::tmpfs::get_tmpfs_fops() || owned_file->is_directory) return refuse_inputs(-ENOTSUP);
+#ifdef WOS_SELFTEST
+    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::TASK)) return refuse_inputs(-ENOMEM);
+#endif
+    auto* child = new (std::nothrow) mod::sched::task::Task{};
+    if (child == nullptr) return refuse_inputs(-ENOMEM);
+    if (!mod::sched::task::claim_unpublished_process(owner, child)) {
+        delete child;
+        return refuse_inputs(-EBUSY);
+    }
+    // Task allocation can enter reclaim. Fatal exit stays deferred until the
+    // slot owns the child and all input ownership has moved off this stack.
+    child->exec_image_file = std::exchange(owned_file, nullptr);
+    child->exec_image_size = file_size;
+    child->context.syscall_kernel_stack = std::exchange(kernel_rsp, 0);
+    owner->unpublished_teardown_in_progress.store(false, std::memory_order_release);
+    input_guard = false;
+    auto abort_child = [&](int error) -> mod::sched::task::Task* {
+        if (construction_error != nullptr) *construction_error = error;
+        if (failure_observations != nullptr) {
+            uint64_t const FLAGS = child->resource_lock.lock_irqsave();
+            *failure_observations = child->resources;
+            child->resource_lock.unlock_irqrestore(FLAGS);
+        }
+        if (!mod::sched::task::destroy_owned_unpublished_process(owner, child)) [[unlikely]] {
+            mod::dbg::panic_handler("native construction: lost child recovery ownership");
+            hcf();
+        }
+        return nullptr;
+    };
+    if (int const ERROR = child->initialize_unpublished_process_skeleton(*owner, name); ERROR != 0) return abort_child(ERROR);
+    child->resources = resources;
+    if (int const ERROR = mod::sched::resource::initialize_credentials(*child, credentials); ERROR != 0) return abort_child(ERROR);
+    if (!reservation.attach(*child)) return abort_child(-EAGAIN);
+    if (!child->initialize_ipc_namespace(context.ipc) || !child->initialize_mount_namespace(context.mounts) ||
+        !child->initialize_pid_namespace(context.pids))
+        return abort_child(-EIDRM);
+    if (int const ERROR = vfs::vfs_install_unpublished_filesystem_context(*child, *context.filesystem); ERROR != 0)
+        return abort_child(ERROR);
+
+    // The lease wrapper has temporary backend owners of its own. Defer fatal
+    // exit until it has published the replacement File or retired its candidate.
+    expected = false;
+    if (!owner->unpublished_teardown_in_progress.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return abort_child(-EBUSY);
+    int const STABLE = vfs::vfs_stabilize_exec_file(&child->exec_image_file);
+    owner->unpublished_teardown_in_progress.store(false, std::memory_order_release);
+    if (STABLE != 0) return abort_child(STABLE);
+    vfs::Stat fresh{};
+    if (int const ERROR = vfs::vfs_fstat_file(child->exec_image_file, &fresh); ERROR != 0) return abort_child(ERROR);
+    if (fresh.st_size <= 0 || static_cast<size_t>(fresh.st_size) != file_size) return abort_child(-EAGAIN);
+    if (int const ERROR = check_exec_permission_from_stat(credentials, fresh); ERROR != 0) return abort_child(ERROR);
+#ifdef WOS_SELFTEST
+    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::SCRATCH)) return abort_child(-ENOMEM);
+#endif
+    std::unique_ptr<ExecRequestArguments> pending(new (std::nothrow) ExecRequestArguments);
+    if (!pending) return abort_child(-ENOMEM);
+#ifdef WOS_SELFTEST
+    pending->selftest_destructions = &g_native_construction_scratch_destructions;
+#endif
+    auto* scratch = pending->native_scratch(0);
+    if (!adopt_exec_arguments(*child, pending)) return abort_child(-EBUSY);
+    // Memory-only parser tables and lazy staging now survive an abandoned stack
+    // inside the exclusively owned child, alongside its File/stack/pagemap.
+    auto& prepared = scratch->prepared_elf;
+    PrepareFileBackedElfResult const PREPARED = prepare_file_backed_elf(child->exec_image_file, file_size, prepared);
+    if (PREPARED == PrepareFileBackedElfResult::OUT_OF_MEMORY) return abort_child(-ENOMEM);
+    if (PREPARED == PrepareFileBackedElfResult::IO_ERROR) return abort_child(-EIO);
+    if (PREPARED == PrepareFileBackedElfResult::INVALID) return abort_child(-ENOEXEC);
+#ifdef WOS_SELFTEST
+    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::RECOVERY_AFTER_READ)) {
+        // Exercise the same transferred owner-slot cleanup used by ACTIVE exit.
+        auto* recovered = mod::sched::task::take_unpublished_process(owner);
+        if (recovered != child || !mod::sched::task::destroy_unpublished_process(recovered)) [[unlikely]] {
+            mod::dbg::panic_handler("native construction: fatal recovery failed");
+            hcf();
+        }
+        if (construction_error != nullptr) *construction_error = -ECANCELED;
+        return nullptr;
+    }
+#endif
+    bool initialized = false;
+    if (PREPARED == PrepareFileBackedElfResult::READY) {
+        child->elf_buffer = prepared.take_task_metadata();
+        child->elf_buffer_size = prepared.task_metadata_size;
+        child->elf_buffer_complete = false;
+        loader::elf::ElfLoadOptions const OPTIONS{
+            .register_special_symbols = true,
+            .base_address = 0,
+            .lazy_file_ranges = exec_lazy_file_segments_enabled() ? &scratch->main_lazy_ranges : nullptr,
+        };
+        initialized = child->initialize_process_image(prepared.view, OPTIONS) &&
+                      append_exec_lazy_file_ranges(child->lazy_vmem_ranges, scratch->main_lazy_ranges, child->exec_image_file, fresh);
+    } else {
+        constexpr size_t BUFFERED_IMAGE_MAX = 8 * 1024 * 1024;
+        if (file_size > BUFFERED_IMAGE_MAX) return abort_child(-E2BIG);
+        prepared.reset();
+#ifdef WOS_SELFTEST
+        if (exec_selftest_take_native_construction_fault(NativeConstructionFault::BUFFER)) return abort_child(-ENOMEM);
+#endif
+        child->elf_buffer = new (std::nothrow) uint8_t[file_size];
+        if (child->elf_buffer == nullptr) return abort_child(-ENOMEM);
+        child->elf_buffer_size = file_size;
+        child->elf_buffer_complete = true;
+        int read_error = 0;
+        if (!read_exec_file_exact(child->exec_image_file, file_size, 0, child->elf_buffer, file_size, &read_error))
+            return abort_child(read_error != 0 ? read_error : -EIO);
+        initialized = child->initialize_process_image(child->elf_buffer, file_size);
+    }
+    if (!initialized) return abort_child(-ENOEXEC);
+    int interpreter_error = 0;
+    if (!mod::sched::task::complete_unpublished_process_construction(child, &interpreter_error, owner, false))
+        return abort_child(interpreter_error != 0 ? interpreter_error : -ENOEXEC);
+    if (mod::security::compartment::remote_namespace_admission(child) != -ENOTSUP) return abort_child(-EIDRM);
+    cleanup_exec_preparation(*child);
+    return child;
+}
+
 auto create_file_backed_process_task_impl(const char* name, vfs::File* owned_file, size_t file_size, const vfs::Stat& file_stat,
                                           uint64_t kernel_rsp, const mod::sched::resource::State& resources,
                                           const mod::security::Snapshot& credentials, mod::sched::resource::ProcessReservation& reservation,
@@ -3668,8 +3831,8 @@ auto create_file_backed_process_task_for_owner(mod::sched::task::Task* owner, co
                                                mod::sched::resource::ProcessReservation& reservation,
                                                mod::sched::resource::State* failure_observations, int* construction_error)
     -> mod::sched::task::Task* {
-    return create_file_backed_process_task_impl(name, owned_file, file_size, file_stat, kernel_rsp, resources, credentials, reservation,
-                                                failure_observations, construction_error, owner, &context, false);
+    return create_native_process_task_impl(owner, context, name, owned_file, file_size, file_stat, kernel_rsp, resources, credentials,
+                                           reservation, failure_observations, construction_error);
 }
 
 auto wos_proc_exec(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr) -> uint64_t {

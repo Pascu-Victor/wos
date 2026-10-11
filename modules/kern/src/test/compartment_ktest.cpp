@@ -5532,7 +5532,8 @@ constexpr uint64_t CONSTRUCTION_MAIN = 0x51000000;
 
 // Populate real native Files and feed the production bounded file-backed loader.
 // No current-task override or synthetic loader callback supplies these bytes.
-auto write_construction_elf(NativeTask& source, const char* path, uint64_t base, uint8_t marker, bool main_image) -> int {
+auto write_construction_elf(NativeTask& source, const char* path, uint64_t base, uint8_t marker, bool main_image,
+                            size_t logical_size = CONSTRUCTION_IMAGE_SIZE, bool dynamic_main = true) -> int {
     int const FD = source.track(vfs::vfs_openat(source.task.get(), vfs::AT_FDCWD, path, vfs::O_CREAT | 2, 0755));
     if (FD < 0) return FD;
     NativeFile file(vfs::vfs_get_file_retain(source.task.get(), FD));
@@ -5553,7 +5554,7 @@ auto write_construction_elf(NativeTask& source, const char* path, uint64_t base,
     header.e_ehsize = sizeof(header);
     header.e_phoff = sizeof(header);
     header.e_phentsize = sizeof(Elf64_Phdr);
-    header.e_phnum = main_image ? 3 : 1;
+    header.e_phnum = main_image && dynamic_main ? 3 : 1;
     Elf64_Phdr const LOAD{.p_type = PT_LOAD,
                           .p_flags = PF_R | PF_X,
                           .p_offset = 0,
@@ -5564,7 +5565,7 @@ auto write_construction_elf(NativeTask& source, const char* path, uint64_t base,
                           .p_align = 4096};
     std::memcpy(bytes.data(), &header, sizeof(header));
     std::memcpy(bytes.data() + sizeof(header), &LOAD, sizeof(LOAD));
-    if (main_image) {
+    if (main_image && dynamic_main) {
         // Loader metadata must be covered by a non-executable PT_LOAD.
         Elf64_Phdr const METADATA{.p_type = PT_LOAD,
                                   .p_flags = PF_R,
@@ -5589,7 +5590,7 @@ auto write_construction_elf(NativeTask& source, const char* path, uint64_t base,
     }
     bytes[1024] = marker;
     if (vfs::vfs_pwrite_file(file.get(), bytes.data(), bytes.size(), 0) != static_cast<ssize_t>(bytes.size())) return -EIO;
-    if (main_image && vfs::vfs_pwrite_file(file.get(), &marker, 1, CONSTRUCTION_IMAGE_SIZE - 1) != 1) return -EIO;
+    if (main_image && logical_size > bytes.size() && vfs::vfs_pwrite_file(file.get(), &marker, 1, logical_size - 1) != 1) return -EIO;
     alignas(Elf64_Phdr) std::array<uint8_t, 8192> actual{};
     if (vfs::vfs_pread_file(file.get(), actual.data(), actual.size(), 0) != static_cast<ssize_t>(actual.size())) return -EIO;
     KEXPECT_EQ(std::memcmp(actual.data(), bytes.data(), bytes.size()), 0);
@@ -5608,7 +5609,10 @@ struct ConstructionRoot {
     resource::State resources;
     int executable = -1;
     int interpreter = -1;
-    auto prepare(uint64_t interpreter_base, uint8_t marker) -> int {
+    size_t image_size = CONSTRUCTION_IMAGE_SIZE;
+    auto prepare(uint64_t interpreter_base, uint8_t marker, size_t executable_size = CONSTRUCTION_IMAGE_SIZE, bool dynamic_main = true)
+        -> int {
+        image_size = executable_size;
         int result = mount_ns::create_namespace(mounts.first);
         if (result == 0) result = ipc::create_namespace(context.ipc);
         if (result == 0) result = pid_ns::create_namespace(context.pids);
@@ -5626,7 +5630,7 @@ struct ConstructionRoot {
         result = compartment_policy::prepare(parent, request, Task::FD_TABLE_SIZE, profile);
         if (result != 0) return result;
         for (size_t i = 0; i < profile.limits.size(); ++i) resources.entries[i].limit = profile.limits[i];
-        executable = write_construction_elf(source, "/service", CONSTRUCTION_MAIN, marker, true);
+        executable = write_construction_elf(source, "/service", CONSTRUCTION_MAIN, marker, true, image_size, dynamic_main);
         if (executable < 0) return executable;
         interpreter = write_construction_elf(source, "/ld.so", interpreter_base, marker + 1, false);
         if (interpreter < 0) return interpreter;
@@ -5665,9 +5669,9 @@ struct ConstructionRoot {
             error = reservation.result();
             return nullptr;
         }
-        return process_exec::create_file_backed_process_task_for_owner(
-            owner, context, "native-service", file.release(), CONSTRUCTION_IMAGE_SIZE, stat,
-            reinterpret_cast<uint64_t>(stack) + mm::KERNEL_STACK_SIZE, resources, profile.credentials, reservation, nullptr, &error);
+        return process_exec::create_file_backed_process_task_for_owner(owner, context, "native-service", file.release(), image_size, stat,
+                                                                       reinterpret_cast<uint64_t>(stack) + mm::KERNEL_STACK_SIZE, resources,
+                                                                       profile.credentials, reservation, nullptr, &error);
     }
 };
 struct ConstructedProcess {
@@ -5868,6 +5872,203 @@ KTEST(CompartmentConstruction, ContextInstallRechecksCredentialsSearchAndEmptyOw
         KEXPECT_EQ(vfs::vfs_install_unpublished_filesystem_context(*candidate.task, root.filesystem), -EIDRM);
         KEXPECT_TRUE(candidate.destroy());
         KEXPECT_NULL(root.source.task->owned_unpublished_process.load());
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
+    KEXPECT_EQ(ipc::live_namespace_count(), IPC);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
+}
+
+KTEST(CompartmentConstruction, SmallDynamicAndStaticImagesKeepPrivateIdentityAndLeases) {
+    auto const PIDS = pid_ns::live_namespace_count();
+    auto const IPC = ipc::live_namespace_count();
+    auto const MOUNTS = mount_ns::live_namespace_count();
+    auto const THREADS = threading::get_active_thread_count();
+    {
+        ConstructionRoot dynamic, static_root;
+        KREQUIRE_EQ(dynamic.prepare(0x52000000, 51, 8192), 0);
+        KREQUIRE_EQ(static_root.prepare(0x53000000, 81, 8192, false), 0);
+        KREQUIRE_EQ(dynamic.refresh(), 0);
+        KREQUIRE_EQ(static_root.refresh(), 0);
+        NativeFile dynamic_file(vfs::vfs_get_file_retain(dynamic.source.task.get(), dynamic.executable));
+        NativeFile static_file(vfs::vfs_get_file_retain(static_root.source.task.get(), static_root.executable));
+        KREQUIRE_TRUE(dynamic_file && static_file);
+        auto dynamic_mount = scoped_mount(dynamic.mounts.first, "/");
+        auto static_mount = scoped_mount(static_root.mounts.first, "/");
+        KREQUIRE_TRUE(dynamic_mount && static_mount);
+        auto const DYNAMIC_BUSY = dynamic_mount->open_files.load();
+        auto const STATIC_BUSY = static_mount->open_files.load();
+        auto const SCRATCH = process_exec::exec_selftest_native_construction_scratch_destructions();
+        int error = 99;
+        ConstructedProcess a{*static_root.source.task}, b{*dynamic.source.task};
+        a.child = dynamic.construct(&a.owner, error);
+        KREQUIRE_NE(a.child, nullptr);
+        KEXPECT_EQ(error, 0);
+        b.child = static_root.construct(&b.owner, error);
+        KREQUIRE_NE(b.child, nullptr);
+        KEXPECT_EQ(error, 0);
+        for (auto* child : {a.child, b.child}) {
+            KEXPECT_EQ(child->namespace_tid(), uint64_t{1});
+            KEXPECT_FALSE(child->scheduler_published.load());
+            KEXPECT_TRUE(child->elf_buffer_complete);
+            KEXPECT_EQ(child->elf_buffer_size, size_t{8192});
+            KEXPECT_NE(child->exec_image_file->exec_read_view.get(), nullptr);
+            KEXPECT_NULL(child->owned_exec_arguments.load());
+            KEXPECT_FALSE(child->exec_preparation_teardown_in_progress.load());
+            KEXPECT_TRUE(child->root_anchor && child->cwd_anchor);
+            KEXPECT_EQ(child->credentials().authority_ceiling(), uint64_t{0});
+            int tid = -1;
+            KEXPECT_TRUE(usercopy::copy_value_from_task(*child, child->thread->fsbase + threading::MLIBC_TCB_TID_OFFSET, tid));
+            KEXPECT_EQ(tid, 1);
+        }
+        KEXPECT_TRUE(*a.child->mount_namespace() == dynamic.context.mounts);
+        KEXPECT_TRUE(*b.child->mount_namespace() == static_root.context.mounts);
+        KEXPECT_EQ(a.child->context.frame.rip, a.child->interp_base + 0x52000400);
+        KEXPECT_EQ(b.child->context.frame.rip, CONSTRUCTION_MAIN + 1024);
+        KEXPECT_EQ(b.child->interp_base, uint64_t{0});
+        KEXPECT_EQ(construction_byte(*a.child, CONSTRUCTION_MAIN + 1024), uint8_t{51});
+        KEXPECT_EQ(construction_byte(*a.child, a.child->context.frame.rip), uint8_t{52});
+        KEXPECT_EQ(construction_byte(*b.child, b.child->context.frame.rip), uint8_t{81});
+        uint8_t marker = 91;
+        KEXPECT_EQ(vfs::vfs_pwrite_file(dynamic_file.get(), &marker, 1, 1024), ssize_t{-ETXTBSY});
+        KEXPECT_EQ(vfs::vfs_pwrite_file(static_file.get(), &marker, 1, 1024), ssize_t{-ETXTBSY});
+        KEXPECT_EQ(process_exec::exec_selftest_native_construction_scratch_destructions(), SCRATCH + 2);
+        KEXPECT_TRUE(a.destroy());
+        KEXPECT_TRUE(b.destroy());
+        KEXPECT_EQ(vfs::vfs_pwrite_file(dynamic_file.get(), &marker, 1, 1024), ssize_t{1});
+        KEXPECT_EQ(vfs::vfs_pwrite_file(static_file.get(), &marker, 1, 1024), ssize_t{1});
+        KEXPECT_EQ(dynamic_mount->open_files.load(), DYNAMIC_BUSY);
+        KEXPECT_EQ(static_mount->open_files.load(), STATIC_BUSY);
+        KEXPECT_EQ(threading::get_active_thread_count(), THREADS);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
+    KEXPECT_EQ(ipc::live_namespace_count(), IPC);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
+}
+
+KTEST(CompartmentConstruction, NativeAllocationFailuresDrainInputsAndPartialSkeletons) {
+    auto const PIDS = pid_ns::live_namespace_count();
+    auto const IPC = ipc::live_namespace_count();
+    auto const MOUNTS = mount_ns::live_namespace_count();
+    auto const THREADS = threading::get_active_thread_count();
+    using Fault = process_exec::NativeConstructionFault;
+    for (auto fault : {Fault::TASK, Fault::NAME, Fault::PAGEMAP, Fault::SCRATCH, Fault::BUFFER}) {
+        ConstructionRoot root;
+        KREQUIRE_EQ(root.prepare(0x52000000, 41, 8192), 0);
+        NativeFile executable(vfs::vfs_get_file_retain(root.source.task.get(), root.executable));
+        KREQUIRE_TRUE(executable);
+        auto mount = scoped_mount(root.mounts.first, "/");
+        KREQUIRE_TRUE(mount);
+        auto const BUSY = mount->open_files.load();
+        auto const REFS = executable->refcount.load();
+        auto const SCRATCH = process_exec::exec_selftest_native_construction_scratch_destructions();
+        abi::resource::Usage before{}, after{};
+        resource::copy_process_observation(*root.source.task, before);
+        process_exec::exec_selftest_fail_native_construction_once(fault);
+        int error = 99;
+        ConstructedProcess failed{*root.source.task};
+        failed.child = root.construct(&failed.owner, error);
+        process_exec::exec_selftest_fail_native_construction_once(Fault::NONE);
+        KEXPECT_NULL(failed.child);
+        KEXPECT_EQ(error, -ENOMEM);
+        resource::copy_process_observation(*root.source.task, after);
+        KEXPECT_EQ(after.current, before.current);
+        KEXPECT_EQ(executable->refcount.load(), REFS);
+        KEXPECT_EQ(mount->open_files.load(), BUSY);
+        KEXPECT_NULL(failed.owner.owned_unpublished_process.load());
+        KEXPECT_FALSE(failed.owner.unpublished_teardown_in_progress.load());
+        KEXPECT_NULL(failed.owner.owned_exec_arguments.load());
+        KEXPECT_NULL(failed.owner.pending_process_reservations);
+        KEXPECT_EQ(process_exec::exec_selftest_native_construction_scratch_destructions(), SCRATCH + (fault == Fault::BUFFER ? 1 : 0));
+        uint8_t marker = 41;
+        KEXPECT_EQ(vfs::vfs_pwrite_file(executable.get(), &marker, 1, 1024), ssize_t{1});
+        KEXPECT_EQ(threading::get_active_thread_count(), THREADS);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
+    KEXPECT_EQ(ipc::live_namespace_count(), IPC);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
+}
+
+KTEST(CompartmentConstruction, TransferredRecoveryRetiresPreparedMetadataAndExecutableLease) {
+    auto const PIDS = pid_ns::live_namespace_count();
+    auto const IPC = ipc::live_namespace_count();
+    auto const MOUNTS = mount_ns::live_namespace_count();
+    auto const THREADS = threading::get_active_thread_count();
+    {
+        ConstructionRoot root;
+        KREQUIRE_EQ(root.prepare(0x52000000, 41), 0);
+        NativeFile executable(vfs::vfs_get_file_retain(root.source.task.get(), root.executable));
+        KREQUIRE_TRUE(executable);
+        auto mount = scoped_mount(root.mounts.first, "/");
+        KREQUIRE_TRUE(mount);
+        auto const BUSY = mount->open_files.load();
+        auto const REFS = executable->refcount.load();
+        auto const SCRATCH = process_exec::exec_selftest_native_construction_scratch_destructions();
+        abi::resource::Usage before{}, after{};
+        resource::copy_process_observation(*root.source.task, before);
+        root.source.task->process_exit_requested.store(true);
+        process_exec::exec_selftest_fail_native_construction_once(process_exec::NativeConstructionFault::RECOVERY_AFTER_READ);
+        int error = 99;
+        ConstructedProcess recovered{*root.source.task};
+        recovered.child = root.construct(&recovered.owner, error);
+        process_exec::exec_selftest_fail_native_construction_once(process_exec::NativeConstructionFault::NONE);
+        KEXPECT_NULL(recovered.child);
+        KEXPECT_EQ(error, -ECANCELED);
+        KEXPECT_TRUE(root.source.task->process_exit_requested.load());
+        root.source.task->process_exit_requested.store(false);
+        KEXPECT_NULL(root.source.task->owned_unpublished_process.load());
+        KEXPECT_FALSE(root.source.task->unpublished_teardown_in_progress.load());
+        KEXPECT_EQ(process_exec::exec_selftest_native_construction_scratch_destructions(), SCRATCH + 1);
+        resource::copy_process_observation(*root.source.task, after);
+        KEXPECT_EQ(after.current, before.current);
+        KEXPECT_EQ(executable->refcount.load(), REFS);
+        KEXPECT_EQ(mount->open_files.load(), BUSY);
+        uint8_t marker = 41;
+        KEXPECT_EQ(vfs::vfs_pwrite_file(executable.get(), &marker, 1, 1024), ssize_t{1});
+        KEXPECT_EQ(threading::get_active_thread_count(), THREADS);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
+    KEXPECT_EQ(ipc::live_namespace_count(), IPC);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
+}
+
+KTEST(CompartmentConstruction, BusyOwnerAndOversizedStaticSourcePreserveRecoveryAndPopulation) {
+    auto const PIDS = pid_ns::live_namespace_count();
+    auto const IPC = ipc::live_namespace_count();
+    auto const MOUNTS = mount_ns::live_namespace_count();
+    {
+        ConstructionRoot root;
+        KREQUIRE_EQ(root.prepare(0x52000000, 41, CONSTRUCTION_IMAGE_SIZE + 1, false), 0);
+        NativeFile executable(vfs::vfs_get_file_retain(root.source.task.get(), root.executable));
+        KREQUIRE_TRUE(executable);
+        auto mount = scoped_mount(root.mounts.first, "/");
+        KREQUIRE_TRUE(mount);
+        auto const BUSY = mount->open_files.load();
+        auto const REFS = executable->refcount.load();
+        int error = 99;
+        {
+            UnpublishedFixture existing{*root.source.task};
+            KREQUIRE_TRUE(existing.claimed);
+            ConstructedProcess refused{*root.source.task};
+            refused.child = root.construct(&refused.owner, error);
+            KEXPECT_NULL(refused.child);
+            KEXPECT_EQ(error, -EBUSY);
+            KEXPECT_TRUE(root.source.task->owned_unpublished_process.load() == existing.task);
+            KEXPECT_EQ(executable->refcount.load(), REFS);
+            KEXPECT_TRUE(existing.destroy());
+        }
+        abi::resource::Usage before{}, after{};
+        resource::copy_process_observation(*root.source.task, before);
+        ConstructedProcess refused{*root.source.task};
+        refused.child = root.construct(&refused.owner, error);
+        KEXPECT_NULL(refused.child);
+        KEXPECT_EQ(error, -E2BIG);
+        resource::copy_process_observation(*root.source.task, after);
+        KEXPECT_EQ(after.current, before.current);
+        KEXPECT_NULL(root.source.task->owned_unpublished_process.load());
+        KEXPECT_EQ(executable->refcount.load(), REFS);
+        KEXPECT_EQ(mount->open_files.load(), BUSY);
+        uint8_t marker = 41;
+        KEXPECT_EQ(vfs::vfs_pwrite_file(executable.get(), &marker, 1, 1024), ssize_t{1});
     }
     KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
     KEXPECT_EQ(ipc::live_namespace_count(), IPC);

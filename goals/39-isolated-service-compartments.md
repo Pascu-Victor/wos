@@ -463,3 +463,30 @@ device consumers, real shared mappings/futexes/scheduled lifecycle/hostile paths
 two independent service trees2h with Host operational and1000 full failure cycles
 with all references at baseline. Authorized --no-setup launch/debug and20GiB/
 40GiB storage bounds/pruning after every outcome persist; no old VM disk retention.
+
+### Checkpoint27 — owned native construction (2026-10-11)
+
+The admitted private builder now claims a fresh default child and transfers
+File/stack ownership before name/pagemap allocation and main executable reads.
+Task allocation/reclaim and stable File cloning defer fatal recovery around
+temporary input owners. Child-owned parser scratch retires through the existing
+unpublished recovery path. A separate may-fail pagemap API preserves Host
+allocator/constructor semantics. Native small/static complete ELF sources are
+bounded at8MiB; larger dynamic images retain bounded metadata/lazy construction.
+No public creation, initial argument stack, root-population or publication API.
+
+Normal Build WOS, isolated fast diagnostics,44 focused Host tests, formatting/
+tidy and52 source/body/header/ownership checks PASS. Rootless --no-setup KTEST49
+PASS84,669 assertions/0 failures/1,364 cases/all113 mandatory/117 stable pins
+(115 distinct paths)/normal poweroff. New cases cover real small/static images,
+executable leases, five allocation refusals and prepared-metadata recovery.
+Four proven inactive images pruned260,521,984B/final0; unrelated user VM preserved.
+Broad129 current credential/VFS source calls still24 failures.
+
+Goal39 remains ACTIVE, all ten full criteria INCOMPLETE. Next construction work
+includes tracked interpreter File/bytes and runnable argc/argv/envp/auxv;
+live creator capture/revalidation, non-root root ownership/population, explicit
+FD/shared mapping grants, local init/job/parent and atomic publication remain
+required, alongside complete global policies and full service campaigns. Keep
+the authorized --no-setup workflow,20GiB disposable/40GiB free floor and exact
+owned inactive-image pruning after every outcome. No autonomous pause or push.

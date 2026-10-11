@@ -231,6 +231,8 @@ void drain_kernel_vmap_frees();
 // that queue frees under an IRQ lock should retry this after releasing it.
 void drain_kernel_vmap_frees_if_over_limit();
 PageTable* create_pagemap();
+// Recoverable private process construction; retains the page-table pool path.
+auto create_pagemap_may_fail() -> PageTable*;
 // owner_pid is diagnostic provenance only; it grants no teardown authority.
 void release_pagemap(PageTable* pagemap, uint64_t owner_pid = 0);
 void get_page_table_pool_stats_snapshot(PageTablePoolStatsSnapshot& out);

@@ -2531,13 +2531,15 @@ auto try_release_page_table_to_pool(PageTable* table, PageTableReleaseOrigin ori
     return true;
 }
 
-auto alloc_zeroed_page_table() -> PageTable* {
+auto alloc_zeroed_page_table(bool may_fail = false) -> PageTable* {
     auto* pooled_table = try_alloc_page_table_from_pool();
     if (pooled_table != nullptr) {
         return pooled_table;
     }
 
-    auto* table = static_cast<PageTable*>(phys::page_alloc_full_overwrite_page_with_reclaim(PhysicalPageOwner::PAGE_TABLE, "page_table"));
+    auto* table = static_cast<PageTable*>(
+        may_fail ? phys::page_alloc_full_overwrite_page_with_reclaim_may_fail(PhysicalPageOwner::PAGE_TABLE, "page_table")
+                 : phys::page_alloc_full_overwrite_page_with_reclaim(PhysicalPageOwner::PAGE_TABLE, "page_table"));
     if (table == nullptr) {
         return nullptr;
     }
@@ -3801,6 +3803,7 @@ void switch_to_kernel_pagemap() { wrcr3(reinterpret_cast<uint64_t>(addr::get_phy
 auto get_kernel_pagemap() -> PageTable* { return kernel_pagemap; }
 
 auto create_pagemap() -> PageTable* { return alloc_zeroed_page_table(); }
+auto create_pagemap_may_fail() -> PageTable* { return alloc_zeroed_page_table(true); }
 
 void release_pagemap(PageTable* pagemap, uint64_t owner_pid) {
     if (pagemap == nullptr) {

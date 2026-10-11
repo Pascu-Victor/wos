@@ -73,7 +73,9 @@ struct NativeProcessContext {
     const ker::vfs::PreparedFilesystemContext* filesystem = nullptr;
 };
 
-// Same consuming builder and recovery path, with an explicit retained executor.
+// Consuming native builder with an explicit retained executor. Small/static
+// images use a complete source bounded at 8MiB; larger dynamic images retain
+// the bounded-metadata path. Executables must be native TMPFS regular Files.
 // Caller exclusively owns its recovery slot; supplied credentials/resources are
 // already admitted. Namespace/context installation precedes ELF/TLS/TCB work.
 // This does not publish a child, admit a public creator or populate a service root.
@@ -86,6 +88,10 @@ auto create_file_backed_process_task_for_owner(ker::mod::sched::task::Task* owne
                                                int* construction_error = nullptr) -> ker::mod::sched::task::Task*;
 
 #ifdef WOS_SELFTEST
+enum class NativeConstructionFault : uint8_t { NONE, TASK, NAME, PAGEMAP, SCRATCH, BUFFER, RECOVERY_AFTER_READ };
+void exec_selftest_fail_native_construction_once(NativeConstructionFault fault);
+auto exec_selftest_take_native_construction_fault(NativeConstructionFault fault) -> bool;
+auto exec_selftest_native_construction_scratch_destructions() -> uint32_t;
 auto exec_selftest_native_signal_cutover_drains_worker() -> bool;
 auto exec_selftest_remote_signal_cutover_drains_actor() -> bool;
 auto exec_selftest_remote_cutover_refusal_is_atomic() -> bool;

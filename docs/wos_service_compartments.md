@@ -1090,11 +1090,29 @@ remain incomplete; see the checkpoint25 evidence and construction map.
 
 ## Native unpublished image construction
 
-The internal `create_file_backed_process_task_for_owner` shares the real
-file-backed builder with the existing Host/WKI receiver path. It accepts a
-retained executor, three open private namespace references and an admitted
-`PreparedFilesystemContext`. This is a kernel C++ preparation seam, with no
-userspace Task pointer, integer join handle or public creator permission token.
+The internal `create_file_backed_process_task_for_owner` constructs an admitted
+private process image with an explicit recovery executor, three open private
+namespace references and a `PreparedFilesystemContext`. Executables are native
+TMPFS regular Files. This kernel C++ API supplies no public creator permission,
+userspace Task pointer or integer join handle. The production caller must be
+the sole executing recovery owner; unpublished fixtures are not runnable services.
+
+The input guard covers Task allocation/reclaim and failure releases until the
+child slot owns the File and kernel stack. A fresh default Task then initializes
+its name and pagemap through a recoverable skeleton. The separate may-fail
+pagemap API preserves the existing table pool and default allocator behavior.
+Child-owned exec scratch holds main parser tables and lazy staging before reads;
+unpublished teardown retires this scratch before anchors, Files and user memory.
+The native builder obtains a stable executable lease, checks fresh size/execute
+permission, and attaches buffered bytes directly to the owned child before I/O.
+Its short lease-cloning guard covers temporary backend owners as well.
+
+Small dynamic and static images use a complete source bounded at 8MiB. Larger
+dynamic images keep bounded metadata and lazy loading. A static fallback above
+8MiB returns E2BIG; name/pagemap/scratch/buffer allocation refusal is recoverable.
+The existing Host builder, PROCESS constructor, interpreter behavior and Task
+member layout remain preserved. These are internal API changes, not syscall,
+libc or WKI wire changes.
 
 Resources, the complete immutable credential and UID population charge are
 installed before namespaces. Both root/cwd anchors must belong to the exact
@@ -1121,13 +1139,26 @@ isolated fast diagnostics, focused44 Host checks, formatting/tidy and41 complete
 source/body/header/ABI preservation checks pass. Broad129 credential/VFS source
 calls still have24 failures, so full Host regression remains unqualified.
 
+Checkpoint27 KTEST49 additionally qualified small dynamic/static mapped images,
+local TCB identity and foreign-executor interpreter selection, real executable
+write refusal until teardown, five one-shot allocation refusals, transferred
+owner-slot recovery of prepared metadata, busy-owner preservation and oversized
+static refusal. The complete run passed84,669 assertions/0 failures/1,364 cases,
+all113 mandatory and117 stable pins (115 distinct paths), with normal poweroff.
+Normal Build WOS, isolated fast diagnostics,44 focused Host checks, formatting/
+tidy and52 complete-source preservation/ownership checks pass. Four proven
+inactive disposable images were pruned; no completed-run VM disks are retained.
+
 Public creation remains disabled. Live creator capture/revalidation, bounded
 root population/import/non-root ownership, explicit FD/shared mapping manifests,
-init/job/parent and atomic publication, static/small ELF support and recoverable
-metadata/fatal-exit/OOM handling remain required. Current Task construction
-still halts on pagemap allocation failure; pre-recovery metadata preparation
-needs tracked ownership before public use. SYS_DEBUG also needs an explicit
-private-view policy alongside the remaining global/device/swap/perf/WKI census.
+init/job/parent and atomic publication, and a real argc/argv/envp/auxv initial
+stack remain required. Main metadata recovery and recoverable native skeleton
+allocation are implemented; the existing interpreter reader still has local
+File/buffer ownership across reads that requires tracked preparation before
+public use. Other existing construction/image allocation paths are not covered
+by the five new fault points. SYS_DEBUG and global service-resource reads also
+need explicit private-view policy alongside the remaining global/device/swap/
+perf/WKI census. The current129 credential source calls still have24 failures.
 No scheduled service, shared-futex, two-hour or1,000 full lifecycle claim follows
 from these unpublished native cases; all ten Goal39 criteria remain incomplete.
 

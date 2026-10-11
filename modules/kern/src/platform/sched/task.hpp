@@ -282,6 +282,9 @@ struct Task {
     auto operator=(const Task&) -> Task& = delete;
     auto operator=(Task&&) -> Task& = delete;
     Task(const char* name, uint64_t elf_start, size_t elf_size, uint64_t kernel_rsp, TaskType type);
+    // Fresh default Task, already claimed by owner with its kernel stack attached.
+    // Leaves partial name/pagemap ownership in this Task on recoverable failure.
+    auto initialize_unpublished_process_skeleton(Task& owner, const char* process_name) -> int;
     auto initialize_process_image(const uint8_t* elf_data, size_t elf_size) -> bool;
     auto initialize_process_image(const ker::loader::elf::ElfFileView& elf, const ker::loader::elf::ElfLoadOptions& options) -> bool;
 

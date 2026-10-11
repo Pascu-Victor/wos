@@ -30,6 +30,7 @@
 #include <platform/security/file_policy.hpp>
 #include <platform/sys/context_switch.hpp>
 #include <platform/sys/mutex.hpp>
+#include <syscalls_impl/process/exec.hpp>
 #include <syscalls_impl/vmem/sys_vmem.hpp>
 #include <utility>
 #include <vfs/content_match.hpp>
@@ -522,6 +523,9 @@ auto unpublished_process_is_exclusively_owned(Task* task) -> bool {
 }
 
 void teardown_unpublished_process_resources(Task* task) {
+    // A private creator may have attached loader scratch before the first read.
+    // The child is exclusively unpublished; it cannot be another live executor.
+    ker::syscall::process::cleanup_exec_preparation(*task);
     task->root_anchor = {};
     task->cwd_anchor = {};
     loader::debug::unregister_process(task->pid);
@@ -1249,6 +1253,37 @@ Task::Task(const char* name, uint64_t elf_start, size_t elf_size, uint64_t kerne
     }
 
     static_cast<void>(initialize_process_image(reinterpret_cast<const uint8_t*>(elf_start), elf_size));
+}
+
+auto Task::initialize_unpublished_process_skeleton(Task& owner, const char* process_name) -> int {
+    if (owner.owned_unpublished_process.load(std::memory_order_acquire) != this || ref_count.load(std::memory_order_acquire) != 2 ||
+        scheduler_published.load(std::memory_order_acquire) || state.load(std::memory_order_acquire) != TaskState::ACTIVE || is_thread ||
+        has_run || type != TaskType::DAEMON || name != nullptr || pagemap != nullptr || thread != nullptr || entry != 0 || pid != 0 ||
+        context.syscall_kernel_stack < mm::KERNEL_STACK_SIZE || process_name == nullptr)
+        return -EINVAL;
+    // Establish teardown identity before allocations/reclaim can reschedule.
+    type = TaskType::PROCESS;
+    pid = get_next_pid();
+    cpu = cpu::current_cpu();
+    size_t length = 0;
+    while (length < EXE_PATH_MAX && process_name[length] != '\0') ++length;
+    if (length == EXE_PATH_MAX) return -ENAMETOOLONG;
+#ifdef WOS_SELFTEST
+    if (ker::syscall::process::exec_selftest_take_native_construction_fault(ker::syscall::process::NativeConstructionFault::NAME))
+        return -ENOMEM;
+#endif
+    auto* copy = new (std::nothrow) char[length + 1];
+    if (copy == nullptr) return -ENOMEM;
+    name = copy;
+    std::memcpy(copy, process_name, length + 1);
+#ifdef WOS_SELFTEST
+    if (ker::syscall::process::exec_selftest_take_native_construction_fault(ker::syscall::process::NativeConstructionFault::PAGEMAP))
+        return -ENOMEM;
+#endif
+    pagemap = mm::virt::create_pagemap_may_fail();
+    if (pagemap == nullptr) return -ENOMEM;
+    mm::virt::copy_kernel_mappings(this);
+    return 0;
 }
 
 auto Task::initialize_process_image(const uint8_t* elf_data, size_t elf_size) -> bool {
