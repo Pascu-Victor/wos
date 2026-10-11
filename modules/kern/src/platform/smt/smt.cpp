@@ -39,6 +39,7 @@
 #include "platform/sched/compartment_lifecycle.hpp"
 #include "platform/sched/scheduler.hpp"
 #include "platform/sched/task.hpp"
+#include "platform/sys/spinlock.hpp"
 #include "platform/sys/syscall.hpp"
 #include "util/hcf.hpp"
 #include "vfs/file.hpp"
@@ -74,10 +75,102 @@ auto allocate_kernel_stack_top(const char* name) -> uint64_t {
 // ============================================================================
 // CPU Domain registry
 // ============================================================================
-std::array<CpuDomain, MAX_CPU_DOMAINS> domain_table{};
-uint32_t domain_count = 0;
+class CpuDomainRegistry {
+   public:
+    auto initialize(uint64_t cpu_count) -> bool;
+    auto append(const char* name, uint64_t cpu_mask, bool soft_exclusive, bool hard) -> uint32_t;
+    auto count() const -> uint32_t;
+    auto lookup(uint32_t id) const -> const CpuDomain*;
+    auto group_for_cpu(uint64_t cpu_no) const -> uint32_t;
 
-auto domain_at(uint32_t index) -> CpuDomain& { return *std::next(domain_table.begin(), static_cast<std::ptrdiff_t>(index)); }
+   private:
+    std::array<CpuDomain, MAX_CPU_DOMAINS> domains_{};
+    sys::Spinlock writer_lock_{};
+    std::atomic<uint32_t> published_count_{0};
+};
+
+static_assert(std::atomic<uint32_t>::is_always_lock_free);
+constinit CpuDomainRegistry domain_registry;
+
+auto CpuDomainRegistry::initialize(uint64_t cpu_count) -> bool {
+    uint64_t all_mask = 0;
+    for (uint64_t i = 0; i < cpu_count && i < 64; ++i) {
+        all_mask |= (1ULL << i);
+    }
+    CpuDomain const ROOT{.id = 0,
+                         .level = CpuDomainLevel::ROOT,
+                         .cpu_mask = all_mask,
+                         .parent_id = DOMAIN_ID_INVALID,
+                         .soft_exclusive = false,
+                         .hard = false,
+                         .name = {'r', 'o', 'o', 't'}};
+    CpuDomain const GROUP{.id = 1,
+                          .level = CpuDomainLevel::GROUP,
+                          .cpu_mask = all_mask,
+                          .parent_id = 0,
+                          .soft_exclusive = false,
+                          .hard = false,
+                          .name = {'g', 'r', 'o', 'u', 'p', '0'}};
+
+    auto const FLAGS = writer_lock_.lock_irqsave();
+    if (published_count_.load(std::memory_order_relaxed) != 0) {
+        writer_lock_.unlock_irqrestore(FLAGS);
+        return false;
+    }
+    domains_[0] = ROOT;
+    domains_[1] = GROUP;
+    // Publish both complete roots together. Published storage is never reset.
+    published_count_.store(2, std::memory_order_release);
+    writer_lock_.unlock_irqrestore(FLAGS);
+    return true;
+}
+
+auto CpuDomainRegistry::append(const char* name, uint64_t cpu_mask, bool soft_exclusive, bool hard) -> uint32_t {
+    CpuDomain domain{.id = DOMAIN_ID_INVALID,
+                     .level = CpuDomainLevel::LEAF,
+                     .cpu_mask = cpu_mask,
+                     .parent_id = 1,
+                     .soft_exclusive = soft_exclusive,
+                     .hard = hard,
+                     .name = {}};
+    // The trusted kernel name is bounded and copied before disabling IRQs.
+    for (size_t i = 0; i + 1 < domain.name.size() && name[i] != '\0'; ++i) {
+        domain.name[i] = name[i];
+    }
+
+    auto const FLAGS = writer_lock_.lock_irqsave();
+    auto const NEW_ID = published_count_.load(std::memory_order_relaxed);
+    if (NEW_ID < 2 || NEW_ID >= MAX_CPU_DOMAINS) {
+        writer_lock_.unlock_irqrestore(FLAGS);
+        return DOMAIN_ID_INVALID;
+    }
+    domain.id = NEW_ID;
+    domains_[NEW_ID] = domain;
+    published_count_.store(NEW_ID + 1, std::memory_order_release);
+    writer_lock_.unlock_irqrestore(FLAGS);
+    return NEW_ID;
+}
+
+auto CpuDomainRegistry::count() const -> uint32_t { return published_count_.load(std::memory_order_acquire); }
+
+auto CpuDomainRegistry::lookup(uint32_t id) const -> const CpuDomain* {
+    auto const COUNT = count();
+    return id < COUNT ? &domains_[id] : nullptr;
+}
+
+auto CpuDomainRegistry::group_for_cpu(uint64_t cpu_no) const -> uint32_t {
+    if (cpu_no >= 64) {
+        return 0;
+    }
+    auto const COUNT = count();
+    for (uint32_t i = 0; i < COUNT; ++i) {
+        auto const& DOMAIN = domains_[i];
+        if (DOMAIN.level == CpuDomainLevel::GROUP && (DOMAIN.cpu_mask & (1ULL << cpu_no)) != 0) {
+            return DOMAIN.id;
+        }
+    }
+    return 0;
+}
 
 }  // namespace
 
@@ -92,80 +185,185 @@ auto get_apic_id_for_cpu(uint64_t cpu_no) -> uint32_t {
     return cpu_data->that_cpu(cpu_no)->lapic_id;
 }
 
-auto get_cpu_domain_count() -> uint32_t { return domain_count; }
+auto get_cpu_domain_count() -> uint32_t { return domain_registry.count(); }
 
-auto get_cpu_domain(uint32_t id) -> CpuDomain* {
-    for (uint32_t i = 0; i < domain_count; ++i) {
-        auto& domain = domain_at(i);
-        if (domain.id == id) {
-            return &domain;
-        }
-    }
-    return nullptr;
-}
+auto get_cpu_domain(uint32_t id) -> const CpuDomain* { return domain_registry.lookup(id); }
 
-auto find_group_for_cpu(uint64_t cpu_no) -> uint32_t {
-    for (uint32_t i = 0; i < domain_count; ++i) {
-        auto& domain = domain_at(i);
-        if (domain.level == CpuDomainLevel::GROUP && (domain.cpu_mask & (1ULL << cpu_no)) != 0) {
-            return domain.id;
-        }
-    }
-    return 0;  // fall back to ROOT
-}
+auto find_group_for_cpu(uint64_t cpu_no) -> uint32_t { return domain_registry.group_for_cpu(cpu_no); }
 
 auto create_leaf_domain(const char* name, uint64_t cpu_mask, bool soft_exclusive, bool hard) -> uint32_t {
-    if (domain_count >= MAX_CPU_DOMAINS) {
+    auto const NEW_ID = domain_registry.append(name, cpu_mask, soft_exclusive, hard);
+    if (NEW_ID == DOMAIN_ID_INVALID) {
         return DOMAIN_ID_INVALID;
     }
-    uint32_t const NEW_ID = domain_count;
-    CpuDomain& d = domain_at(domain_count++);
-    d.id = NEW_ID;
-    d.level = CpuDomainLevel::LEAF;
-    d.cpu_mask = cpu_mask;
-    d.parent_id = 1;  // child of GROUP_0 by default
-    d.soft_exclusive = soft_exclusive;
-    d.hard = hard;
-    d.name.fill('\0');
-    std::strncpy(d.name.data(), name, d.name.size() - 1);
-    dbg::log("smt: created LEAF domain %u '%s' mask=0x%llx soft_excl=%d hard=%d", NEW_ID, d.name.data(),
+    auto const* DOMAIN = domain_registry.lookup(NEW_ID);
+    dbg::log("smt: created LEAF domain %u '%s' mask=0x%llx soft_excl=%d hard=%d", NEW_ID, DOMAIN->name.data(),
              static_cast<unsigned long long>(cpu_mask), static_cast<int>(soft_exclusive), static_cast<int>(hard));
     return NEW_ID;
 }
 
 void init_cpu_domains() {
-    domain_count = 0;
-
-    // Build full online CPU mask
-    uint64_t all_mask = 0;
-    for (uint64_t i = 0; i < g_cpu_count && i < 64; ++i) {
-        all_mask |= (1ULL << i);
+    if (!domain_registry.initialize(g_cpu_count)) {
+        return;
     }
-
-    // Domain 0: ROOT
-    CpuDomain& root = domain_at(domain_count++);
-    root.id = 0;
-    root.level = CpuDomainLevel::ROOT;
-    root.cpu_mask = all_mask;
-    root.parent_id = DOMAIN_ID_INVALID;
-    root.soft_exclusive = false;
-    root.hard = false;
-    __builtin_memcpy(root.name.data(), "root", 5);
-
-    // Domain 1: single GROUP_0 (flat topology - one socket)
-    // Future NUMA support: parse MADT/SRAT to create one group per proximity domain
-    CpuDomain& grp = domain_at(domain_count++);
-    grp.id = 1;
-    grp.level = CpuDomainLevel::GROUP;
-    grp.cpu_mask = all_mask;
-    grp.parent_id = 0;
-    grp.soft_exclusive = false;
-    grp.hard = false;
-    __builtin_memcpy(grp.name.data(), "group0", 7);
-
-    dbg::log("smt: cpu_domains initialised: root mask=0x%llx group0 mask=0x%llx", static_cast<unsigned long long>(all_mask),
-             static_cast<unsigned long long>(all_mask));
+    auto const ALL_MASK = domain_registry.lookup(0)->cpu_mask;
+    dbg::log("smt: cpu_domains initialised: root mask=0x%llx group0 mask=0x%llx", static_cast<unsigned long long>(ALL_MASK),
+             static_cast<unsigned long long>(ALL_MASK));
 }
+
+#ifdef WOS_SELFTEST
+namespace {
+
+auto domain_has_fields(const CpuDomain* domain, uint32_t id, CpuDomainLevel level, uint64_t cpu_mask, uint32_t parent_id,
+                       bool soft_exclusive, bool hard, const char* name) -> bool {
+    if (domain == nullptr || domain->id != id || domain->level != level || domain->cpu_mask != cpu_mask || domain->parent_id != parent_id ||
+        domain->soft_exclusive != soft_exclusive || domain->hard != hard) {
+        return false;
+    }
+    auto const NAME_LENGTH = std::strlen(name);
+    if (NAME_LENGTH >= domain->name.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < domain->name.size(); ++i) {
+        if (domain->name[i] != (i < NAME_LENGTH ? name[i] : '\0')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+auto same_domain_fields(const CpuDomain& left, const CpuDomain& right) -> bool {
+    return left.id == right.id && left.level == right.level && left.cpu_mask == right.cpu_mask && left.parent_id == right.parent_id &&
+           left.soft_exclusive == right.soft_exclusive && left.hard == right.hard && left.name == right.name;
+}
+
+}  // namespace
+
+auto cpu_domain_registry_selftest_one_shot_roots() -> bool {
+    CpuDomainRegistry registry;
+    if (!registry.initialize(8) || registry.count() != 2) {
+        return false;
+    }
+    auto const* ROOT = registry.lookup(0);
+    auto const* GROUP = registry.lookup(1);
+    if (!domain_has_fields(ROOT, 0, CpuDomainLevel::ROOT, 0xFF, DOMAIN_ID_INVALID, false, false, "root") ||
+        !domain_has_fields(GROUP, 1, CpuDomainLevel::GROUP, 0xFF, 0, false, false, "group0")) {
+        return false;
+    }
+    auto const ROOT_SNAPSHOT = *ROOT;
+    auto const GROUP_SNAPSHOT = *GROUP;
+    if (registry.append("retained", 3, true, true) != 2) {
+        return false;
+    }
+    auto const* LEAF = registry.lookup(2);
+    if (registry.initialize(64) || registry.count() != 3 || ROOT != registry.lookup(0) || GROUP != registry.lookup(1) ||
+        LEAF != registry.lookup(2)) {
+        return false;
+    }
+    return same_domain_fields(*ROOT, ROOT_SNAPSHOT) && same_domain_fields(*GROUP, GROUP_SNAPSHOT) &&
+           domain_has_fields(LEAF, 2, CpuDomainLevel::LEAF, 3, 1, true, true, "retained");
+}
+
+auto cpu_domain_registry_selftest_leaf_snapshots() -> bool {
+    CpuDomainRegistry registry;
+    if (!registry.initialize(64)) {
+        return false;
+    }
+    auto const* ROOT = registry.lookup(0);
+    auto const* GROUP = registry.lookup(1);
+    if (ROOT == nullptr || GROUP == nullptr || registry.append("leaf", 5, true, false) != 2) {
+        return false;
+    }
+    auto const ROOT_SNAPSHOT = *ROOT;
+    auto const GROUP_SNAPSHOT = *GROUP;
+    auto const* FIRST = registry.lookup(2);
+    if (!domain_has_fields(FIRST, 2, CpuDomainLevel::LEAF, 5, 1, true, false, "leaf")) {
+        return false;
+    }
+    auto const FIRST_SNAPSHOT = *FIRST;
+    if (registry.append("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", 1ULL << 63, false, true) != 3 ||
+        registry.append("", 0, false, false) != 4 || registry.append("abcdefghijklmnopqrstuvwxyzABCDE", ~uint64_t{0}, true, true) != 5 ||
+        registry.count() != 6) {
+        return false;
+    }
+    return domain_has_fields(registry.lookup(3), 3, CpuDomainLevel::LEAF, 1ULL << 63, 1, false, true, "abcdefghijklmnopqrstuvwxyzABCDE") &&
+           domain_has_fields(registry.lookup(4), 4, CpuDomainLevel::LEAF, 0, 1, false, false, "") &&
+           domain_has_fields(registry.lookup(5), 5, CpuDomainLevel::LEAF, ~uint64_t{0}, 1, true, true, "abcdefghijklmnopqrstuvwxyzABCDE") &&
+           ROOT == registry.lookup(0) && GROUP == registry.lookup(1) && FIRST == registry.lookup(2) &&
+           same_domain_fields(*ROOT, ROOT_SNAPSHOT) && same_domain_fields(*GROUP, GROUP_SNAPSHOT) &&
+           same_domain_fields(*FIRST, FIRST_SNAPSHOT);
+}
+
+auto cpu_domain_registry_selftest_lookup_boundaries() -> bool {
+    CpuDomainRegistry registry;
+    if (!registry.initialize(~uint64_t{0}) || registry.count() != 2 || registry.lookup(2) != nullptr ||
+        registry.lookup(MAX_CPU_DOMAINS) != nullptr || registry.lookup(DOMAIN_ID_INVALID) != nullptr || registry.group_for_cpu(0) != 1 ||
+        registry.group_for_cpu(63) != 1 || registry.group_for_cpu(64) != 0 || registry.group_for_cpu(255) != 0 ||
+        registry.group_for_cpu(~uint64_t{0}) != 0) {
+        return false;
+    }
+    if (!domain_has_fields(registry.lookup(0), 0, CpuDomainLevel::ROOT, ~uint64_t{0}, DOMAIN_ID_INVALID, false, false, "root") ||
+        !domain_has_fields(registry.lookup(1), 1, CpuDomainLevel::GROUP, ~uint64_t{0}, 0, false, false, "group0")) {
+        return false;
+    }
+    CpuDomainRegistry single_cpu_registry;
+    return single_cpu_registry.initialize(1) && single_cpu_registry.append("outside-group", 1ULL << 63, false, false) == 2 &&
+           single_cpu_registry.group_for_cpu(0) == 1 && single_cpu_registry.group_for_cpu(1) == 0 &&
+           single_cpu_registry.group_for_cpu(63) == 0;
+}
+
+auto cpu_domain_registry_selftest_capacity_refusal() -> bool {
+    CpuDomainRegistry registry;
+    std::array<CpuDomain, MAX_CPU_DOMAINS> snapshots{};
+    std::array<const CpuDomain*, MAX_CPU_DOMAINS> pointers{};
+    if (!registry.initialize(64)) {
+        return false;
+    }
+    for (uint32_t id = 2; id < MAX_CPU_DOMAINS; ++id) {
+        auto const MASK = 1ULL << id;
+        auto const SOFT = (id & 1U) != 0;
+        auto const HARD = (id & 2U) != 0;
+        if (registry.append("capacity", MASK, SOFT, HARD) != id || registry.count() != id + 1 ||
+            !domain_has_fields(registry.lookup(id), id, CpuDomainLevel::LEAF, MASK, 1, SOFT, HARD, "capacity")) {
+            return false;
+        }
+    }
+    for (uint32_t id = 0; id < MAX_CPU_DOMAINS; ++id) {
+        pointers[id] = registry.lookup(id);
+        if (pointers[id] == nullptr) {
+            return false;
+        }
+        snapshots[id] = *pointers[id];
+    }
+    if (registry.append("refused", 0, false, false) != DOMAIN_ID_INVALID ||
+        registry.append("also-refused", ~uint64_t{0}, true, true) != DOMAIN_ID_INVALID || registry.initialize(0) ||
+        registry.count() != MAX_CPU_DOMAINS || registry.lookup(MAX_CPU_DOMAINS) != nullptr) {
+        return false;
+    }
+    for (uint32_t id = 0; id < MAX_CPU_DOMAINS; ++id) {
+        if (pointers[id] != registry.lookup(id) || !same_domain_fields(*pointers[id], snapshots[id])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+auto cpu_domain_registry_selftest_uninitialized_refusal() -> bool {
+    CpuDomainRegistry registry;
+    if (registry.count() != 0 || registry.lookup(0) != nullptr || registry.lookup(1) != nullptr ||
+        registry.lookup(DOMAIN_ID_INVALID) != nullptr || registry.group_for_cpu(0) != 0 || registry.group_for_cpu(63) != 0 ||
+        registry.group_for_cpu(64) != 0 || registry.group_for_cpu(~uint64_t{0}) != 0 ||
+        registry.append("too-early", 1, true, true) != DOMAIN_ID_INVALID || registry.count() != 0 || registry.lookup(0) != nullptr ||
+        registry.lookup(2) != nullptr) {
+        return false;
+    }
+    return registry.initialize(0) && registry.count() == 2 &&
+           domain_has_fields(registry.lookup(0), 0, CpuDomainLevel::ROOT, 0, DOMAIN_ID_INVALID, false, false, "root") &&
+           domain_has_fields(registry.lookup(1), 1, CpuDomainLevel::GROUP, 0, 0, false, false, "group0") &&
+           registry.append("after-init", 1, false, true) == 2 &&
+           domain_has_fields(registry.lookup(2), 2, CpuDomainLevel::LEAF, 1, 1, false, true, "after-init");
+}
+#endif
 
 namespace {
 

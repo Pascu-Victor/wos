@@ -66,6 +66,15 @@ This short sequential test leaves CPU placement, worker-exec/WKI priority,
 coherent concurrent fork/thread observations, hostile isolation, two-hour
 simultaneous trees,1,000full lifecycles and complete Host/init/libc regression
 unqualified.
+
+Checkpoint 36 separately qualifies immutable CPU-domain publication and the
+existing public registry ABI on a fresh Normal eight-CPU kernel. Four creator
+threads produce 62 unique domains and two capacity refusals while two readers
+make 16,384 queries; actual init status independently records the probe's exit0.
+See [cpu_domain_runtime.md](../../tests/fixtures/cpu_domain_runtime.md) for the
+standalone fixture, report format and limits. This does not qualify inherited
+CPU placement or compartment CPU ceilings.
+
 Owned software qualification may use `bin/wos-cluster --no-setup` or isolated
 `bin/wos-ktest --no-setup`, with one topology, a 20GiB disposable storage budget,
 40GiB free-space floor and exact-owned inactive-image pruning after every run.

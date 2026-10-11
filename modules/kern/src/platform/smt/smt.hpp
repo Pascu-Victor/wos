@@ -260,11 +260,20 @@ static_assert(offsetof(CpuDomain, name) == 22);
 static_assert(sizeof(CpuDomain) == 56);
 
 // Domain registry API
-void init_cpu_domains();  // Called from smt::init()
+void init_cpu_domains();  // One-shot publication, called from smt::init().
 auto get_cpu_domain_count() -> uint32_t;
-auto get_cpu_domain(uint32_t id) -> CpuDomain*;                                                            // nullptr if not found
+// Immutable snapshot; valid for the kernel lifetime, nullptr if not published.
+auto get_cpu_domain(uint32_t id) -> const CpuDomain*;
 auto create_leaf_domain(const char* name, uint64_t cpu_mask, bool soft_exclusive, bool hard) -> uint32_t;  // Returns domain id
 auto find_group_for_cpu(uint64_t cpu_no) -> uint32_t;                                                      // Returns GROUP domain id
+
+#ifdef WOS_SELFTEST
+auto cpu_domain_registry_selftest_one_shot_roots() -> bool;
+auto cpu_domain_registry_selftest_leaf_snapshots() -> bool;
+auto cpu_domain_registry_selftest_lookup_boundaries() -> bool;
+auto cpu_domain_registry_selftest_capacity_refusal() -> bool;
+auto cpu_domain_registry_selftest_uninitialized_refusal() -> bool;
+#endif
 
 // Reverse lookup: logical CPU index -> APIC ID
 auto get_apic_id_for_cpu(uint64_t cpu_no) -> uint32_t;

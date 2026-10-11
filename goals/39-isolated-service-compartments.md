@@ -8,8 +8,9 @@
 
 ## Outcome and scale
 
-Current checkpoint 35 qualifies same-kernel initial nice inheritance and
-private priority selection through both short public modes with 21 checks.
+Current checkpoint 36 qualifies immutable CPU-domain publication, five actual
+registry selftests and concurrent public creation/query on a Normal eight-CPU
+kernel. Checkpoint 35's initial nice inheritance and private priority checks remain.
 Goal39 is ACTIVE; all ten full criteria
 remain incomplete. Launch exact-owned tests with `--no-setup`, maintain one
 topology and prune disposable images after every passing or failing run.
@@ -150,7 +151,7 @@ and restart step, and mark the active goal blocked. Missing prerequisites or
 hardware are never completion. Budget and pause controls remain user/system
 controlled.
 
-## Current session checkpoint (2026-10-10)
+## Current session checkpoint (2026-10-11)
 
 Selected after user-requested Goal28 checkpoint commit70bc3fe7 and goal switch.
 Goal28 remains incomplete as a repository checkpoint. The user cleared its
@@ -806,3 +807,77 @@ WKI nice transport, hostile/shared/futex/init evidence, two simultaneous 2h tree
 remain. Continue CPU-domain publication and placement work. Launch with
 --no-setup; preserve normal/KTEST build/data/sysroot isolation and prune images
 after PASS/FAIL/exception. No pause or push.
+
+## Checkpoint36: immutable CPU-domain publication (2026-10-11)
+
+The fixed 64-slot registry now serializes writers with the existing IRQ-safe
+Spinlock and release-publishes the count after every slot is complete. Readers
+acquire one immutable prefix and receive const pointers valid for the registry
+lifetime. Root/group initialization publishes both slots once; exhaustion or
+pre-initialization refusal preserves the count and prior slots. Names are copied
+before the lock, and logging stays outside it. CPU indices64 and above return
+root without shifting a 64-bit mask by an invalid count.
+
+CpuDomain size56/name offset22, IDs0/1/2..63, parent IDs, name truncation, capacity
+and existing CREATE0x106/QUERY0x108 42/264-byte records remain. Task/File/RQ layouts,
+scheduler/placement/priority consumers, syscall/wire/libc and existing native
+case bodies are unchanged. Five selftests use private instances of the actual
+registry methods; they do not consume/reset live registry slots or post fake
+runnable Tasks. KTEST parks APs and supplies no SMP execution evidence.
+
+The separate Normal eight-CPU fixture uses actual UID/EUID/GID100 in its Host
+supervisor and six workers. Four creators perform64 calls over16 waves:62 unique
+IDs2..63 plus2 ENOMEM. Two readers make16,384 queries, checking complete masks,
+immutable observations, ticket correspondence, output guards and excluded load
+rows. Actual ABI probes include exact page-end42/264 records, one-byte-short
+EFAULT and unchanged invalid-ID output. Four further capacity refusals and a
+final64-slot sweep preserve all masks. Creators were observed on four CPUs
+(bitmap0x72); readers on0x0c recorded69 queries during userspace creator activity.
+These samples do not prove overlap inside the writer lock or all interleavings.
+Both hard/soft flags are false; RQ stamping and Task placement remain unqualified.
+
+Ten durable files total15,152 bytes. The Host records exact physical child104
+wait104/status0 and six distinct TIDs105..110. The separate exit-success-dependent
+witness records the existing4160-byte init snapshot: probe103, generation1,
+no restarts, EXITED/READY, wait0/error0 and an actual EXIT transition. Its saved
+sequence7/publication time is independently decoded and bound to init's exact
+probe spawn PID and the pinned service spec. The runner reached its finite120s
+runtime deadline; fixture stdout was absent from serial. PASS requires all
+durable reports after exact-owned stop. Witness's own later exit and natural
+Normal VM shutdown are not qualified by this evidence.
+
+Normal Build WOS PASS44.823s; isolated fast diagnostic build PASS37.980s;
+48 selected Host tests PASS37.774s; final format/tidy check PASS6.087s;
+standalone fixture build02 PASS0.635s;42 preservation checks PASS.
+KTEST65 --fast --no-setup PASS508.530s:89,414 assertions/0 failures/1,403 executed
+cases, all152 mandatory, natural selftest poweroff/launcher0 and151 stable pins
+(149 distinct paths). Normal SMP01 PASS130.508s with184 stable pins. Initial
+KTEST64 could not boot because the sandbox denied QMP socket binding; its FAIL
+receipt remains. Authorized nonroot sandbox escalation enabled the unchanged
+retry. Disposable four-image prunes removed125,714,432 bytes for failed64,
+261,767,168 for65 and91,242,496 for SMP01; final disposable allocation is zero.
+Inventories show only unrelated user VM13532 UID945, with unreadable entries0.
+
+Three pre-existing disabled BufferCache registrations were skipped, matching
+the qualified prior63 serial; they are excluded from executed and mandatory
+counts.
+
+Audit checkpoint-36-audit.json SHA256
+856857fdf39d2d5cda7e1d5aece344f3225f897c21c4e80bd484833471045abb PASS.
+Independent checkpoint36-evidence-integrity03.json PASS, SHA256
+3cc684fcdb4e40af7204ce19306a1d80ef7c823b1ef98605fea5919f223e7d38.
+Initial integrity01/02 FAIL receipts remain intact: the checker assumed a wrong
+serial prefix, rejected the known repository launcher symlinks, assumed a fixed
+last storage event and rejected the three baseline disabled registrations.
+The corrected audit independently verifies the actual execution census, exact
+baseline skips, source/artifact pins, all ten durable SMP files and zero
+disposable images; it does not alter runtime receipts.
+Goal39 remains ACTIVE; all ten full criteria are incomplete. Next work is
+race-free RQ domain stamps and authoritative hard-domain admission under the
+victim lock, then coherent Task placement/inherited immutable CPU ceilings.
+Worker-exec actor priority, general fork/thread coherence, WKI priority transport,
+hostile/shared/futex/init evidence, two simultaneous2h trees,1,000 full lifecycles
+with allocation failures/all reference baselines and complete Host/init/libc
+regression remain. Launch only owned tests with --no-setup, preserve Normal/
+KTEST isolation, one topology and20GiB/40GiB storage bounds; prune exact-owned
+inactive images after PASS,FAIL and exceptions. No pause or push.
