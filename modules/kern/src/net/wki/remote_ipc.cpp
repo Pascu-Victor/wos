@@ -22,6 +22,7 @@
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/security/compartment_wki.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <span>
 #include <utility>
@@ -5062,6 +5063,9 @@ auto wki_ipc_export_task_fds(ker::mod::sched::task::Task* task, uint16_t target_
     if (task == nullptr || map_out == nullptr || count_out == nullptr) {
         return -EINVAL;
     }
+
+    int const SCOPE_ADMISSION = ker::mod::security::compartment::remote_namespace_admission(task);
+    if (SCOPE_ADMISSION != 0) return SCOPE_ADMISSION;
 
     uint16_t count = 0;
     IpcFdSnapshot snapshot(*task);

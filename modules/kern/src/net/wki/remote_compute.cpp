@@ -44,6 +44,7 @@
 #include <platform/sched/task.hpp>
 #include <platform/sched/threading.hpp>
 #include <platform/security/authorization.hpp>
+#include <platform/security/compartment_wki.hpp>
 #include <platform/security/credential_record.hpp>
 #include <platform/security/exec_policy.hpp>
 #include <platform/smt/smt.hpp>
@@ -5197,6 +5198,28 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
         if (spec.error_out != nullptr) *spec.error_out = result == WkiRemoteSpawnResult::FAILED ? placement_error : 0;
         return result;
     };
+    if (task != nullptr) {
+        int const SCOPE_ADMISSION = ker::mod::security::compartment::remote_namespace_admission(task);
+        if (SCOPE_ADMISSION != 0) {
+            placement_error = SCOPE_ADMISSION;
+            if (SCOPE_ADMISSION != -ENOTSUP) return finish_placement(WkiRemoteSpawnResult::FAILED);
+            auto const* candidate = spec.exec_candidate;
+            if (candidate != nullptr && (candidate->path == nullptr || candidate->target == nullptr)) {
+                placement_error = -EINVAL;
+                return finish_placement(WkiRemoteSpawnResult::FAILED);
+            }
+            auto const FLAGS = candidate != nullptr ? candidate->target_flags : task->wki_target_flags;
+            auto const* target = candidate != nullptr ? candidate->target : task->wki_target_hostname.data();
+            // Local execution preserves the actual subject and its owners.
+            // Explicit named/remote/balanced placement is not portable yet,
+            // even when the caller would otherwise allow a local fallback.
+            if ((FLAGS & ker::mod::sched::task::Task::WKI_TARGET_FLAG_LOCAL) == 0 &&
+                (target[0] != '\0' || (FLAGS & (ker::mod::sched::task::Task::WKI_TARGET_FLAG_REMOTE |
+                                                ker::mod::sched::task::Task::WKI_TARGET_FLAG_BALANCED)) != 0))
+                return finish_placement(WkiRemoteSpawnResult::FAILED);
+            return finish_placement(WkiRemoteSpawnResult::LOCAL);
+        }
+    }
     if (!g_remote_compute_initialized || task == nullptr) {
         log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "not-initialized");
         return finish_placement(WkiRemoteSpawnResult::LOCAL);
@@ -5824,6 +5847,11 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
         cleanup_submit_ipc();
         return fail_submit(-ESRCH);
     }
+    int const SCOPE_ADMISSION = ker::mod::security::compartment::remote_namespace_admission(local_task);
+    if (SCOPE_ADMISSION != 0) {
+        cleanup_submit_ipc();
+        return fail_submit(SCOPE_ADMISSION);
+    }
     ker::mod::security::Snapshot read_credentials;
     int const READ_CREDENTIAL_ADMISSION = select_submit_read_credentials(local_task->credentials(), transfer, read_credentials);
     if (READ_CREDENTIAL_ADMISSION != 0) {
@@ -6197,6 +6225,11 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
     if (local_task == nullptr) {
         cleanup_submit_ipc();
         return fail_submit(-ESRCH);
+    }
+    int const SCOPE_ADMISSION = ker::mod::security::compartment::remote_namespace_admission(local_task);
+    if (SCOPE_ADMISSION != 0) {
+        cleanup_submit_ipc();
+        return fail_submit(SCOPE_ADMISSION);
     }
     ker::mod::security::Snapshot read_credentials;
     int const READ_CREDENTIAL_ADMISSION = select_submit_read_credentials(local_task->credentials(), transfer, read_credentials);

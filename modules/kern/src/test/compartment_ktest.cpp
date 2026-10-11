@@ -9,6 +9,8 @@
 #include <limits>
 #include <memory>
 #include <net/socket.hpp>
+#include <net/wki/remote_compute.hpp>
+#include <net/wki/resource_contract_model.hpp>
 #include <platform/debug/ptrace.hpp>
 #include <platform/interrupt/gdt.hpp>
 #include <platform/loader/elf_loader.hpp>
@@ -24,6 +26,7 @@
 #include <platform/sched/task.hpp>
 #include <platform/sched/threading.hpp>
 #include <platform/security/authorization.hpp>
+#include <platform/security/compartment_wki.hpp>
 #include <platform/security/credentials.hpp>
 #include <platform/sys/usercopy.hpp>
 #include <syscalls_impl/net/sys_net.hpp>
@@ -4710,6 +4713,199 @@ KTEST(CompartmentNetwork, InheritedSocketAndMappedOutputsSurviveScopeClosure) {
         KEXPECT_EQ(subject.task->fd_table.reserved_count(), 0U);
         KEXPECT_EQ(subject.task->usercopy_pagemap_accesses.load(), uint32_t{0});
         KEXPECT_EQ(host.task->fd_table.size(), 1U);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+namespace {
+namespace wki = ker::net::wki;
+auto check_private_remote_entrypoints(Task& subject, int expected) -> void {
+    constexpr std::array<uint8_t, 1> BINARY{0x7f};
+    auto const RESOURCES = wki::resource_contract::snapshot(subject.resources);
+    auto const REFERENCES = subject.ref_count.load();
+    auto const FD_COUNT = subject.fd_table.size();
+    wki::WkiIpcPerfSnapshot before{}, after{};
+    wki::wki_ipc_get_perf_snapshot(before);
+    int error = 99;
+    KEXPECT_EQ(wki::wki_task_submit_inline(wki::WKI_NODE_INVALID, BINARY.data(), BINARY.size(), nullptr, nullptr, "/", &subject, nullptr, 0,
+                                           nullptr, UINT8_MAX, &error),
+               uint32_t{0});
+    KEXPECT_EQ(error, expected);
+    error = 99;
+    KEXPECT_EQ(wki::wki_task_submit_vfs_ref(wki::WKI_NODE_INVALID, "/bin/private-fixture", nullptr, nullptr, "/", &subject, nullptr, 0,
+                                            nullptr, UINT8_MAX, &error),
+               uint32_t{0});
+    KEXPECT_EQ(error, expected);
+    std::array<wki::WkiIpcFdEntry, 16> map{};
+    std::memset(map.data(), 0x5a, sizeof(map));
+    auto const MAP = map;
+    std::array<wki::WkiIpcTaskFdHandoff, 16> handoff{};
+    handoff[0].local_fd = 43;
+    uint16_t count = 99;
+    uint8_t mask = 99;
+    KEXPECT_EQ(wki::wki_ipc_export_task_fds(&subject, wki::WKI_NODE_INVALID, {}, map.data(), &count, handoff.data(), &mask), expected);
+    KEXPECT_EQ(count, uint16_t{0});
+    KEXPECT_EQ(mask, uint8_t{0});
+    KEXPECT_EQ(std::memcmp(map.data(), MAP.data(), sizeof(map)), 0);
+    KEXPECT_EQ(handoff[0].local_fd, uint16_t{43});
+    KEXPECT_NULL(handoff[0].file);
+    KEXPECT_EQ(subject.fd_table.size(), FD_COUNT);
+    KEXPECT_EQ(subject.fd_table.reserved_count(), 0U);
+    KEXPECT_EQ(subject.ref_count.load(), REFERENCES);
+    KEXPECT_NULL(subject.pending_wki_filesystems);
+    KEXPECT_NULL(subject.pending_wki_fd_snapshots);
+    auto const CURRENT = wki::resource_contract::snapshot(subject.resources);
+    KEXPECT_EQ(std::memcmp(&RESOURCES, &CURRENT, sizeof(RESOURCES)), 0);
+    wki::wki_ipc_get_perf_snapshot(after);
+    KEXPECT_EQ(after.exports, before.exports);
+    KEXPECT_EQ(after.proxies, before.proxies);
+    KEXPECT_EQ(after.pump_tasks, before.pump_tasks);
+    KEXPECT_EQ(after.pending_chunks, before.pending_chunks);
+    KEXPECT_EQ(after.pending_bytes, before.pending_bytes);
+    KEXPECT_EQ(after.approx_alloc_bytes, before.approx_alloc_bytes);
+}
+auto observe_private_placement_prepare(Task&, void* context) -> int {
+    *static_cast<bool*>(context) = true;
+    return 0;
+}
+}  // namespace
+
+KTEST(CompartmentWki, PrivateViewsRejectActualComputeAndFdExportBeforeEffects) {
+    auto const PID_BASELINE = pid_ns::live_namespace_count();
+    auto const IPC_BASELINE = ipc::live_namespace_count();
+    auto const MOUNT_BASELINE = vfs::mount_ns::live_namespace_count();
+    for (unsigned variant = 1; variant < 8; ++variant) {
+        pid_ns::NamespaceRef host, pids;
+        ipc::NamespaceRef names;
+        vfs::mount_ns::NamespaceRef mounts;
+        NativeTask subject;
+        subject.task->type = sched::task::TaskType::PROCESS;
+        if ((variant & 1U) != 0) {
+            // An explicit shared network grant is still a private process view.
+            KREQUIRE_EQ(pid_ns::create_namespace(host, Network::SHARED_HOST, pids), 0);
+            KREQUIRE_TRUE(subject.task->initialize_pid_namespace(pids));
+        }
+        if ((variant & 2U) != 0) {
+            KREQUIRE_EQ(ipc::create_namespace(names), 0);
+            KREQUIRE_TRUE(subject.task->initialize_ipc_namespace(names));
+        }
+        if ((variant & 4U) != 0) {
+            KREQUIRE_EQ(vfs::mount_ns::create_namespace(mounts), 0);
+            KREQUIRE_TRUE(subject.task->initialize_mount_namespace(mounts));
+        }
+        KEXPECT_EQ(ker::mod::security::compartment::remote_namespace_admission(subject.task.get()), -ENOTSUP);
+        check_private_remote_entrypoints(*subject.task, -ENOTSUP);
+        bool prepared = false;
+        int error = 99;
+        uint32_t deferred = 99;
+        wki::WkiRemoteSpawnSpec spec{
+            .error_out = &error, .prepare = observe_private_placement_prepare, .context = &prepared, .deferred_proxy_id = &deferred};
+        for (uint32_t flags : {uint32_t{0}, Task::WKI_TARGET_FLAG_LOCAL, Task::WKI_TARGET_FLAG_REMOTE, Task::WKI_TARGET_FLAG_BALANCED}) {
+            subject.task->wki_target_flags = flags;
+            auto const EXPECTED =
+                flags == 0 || flags == Task::WKI_TARGET_FLAG_LOCAL ? wki::WkiRemoteSpawnResult::LOCAL : wki::WkiRemoteSpawnResult::FAILED;
+            KEXPECT_EQ(wki::wki_try_remote_spawn(subject.task.get(), spec), EXPECTED);
+            KEXPECT_EQ(error, EXPECTED == wki::WkiRemoteSpawnResult::LOCAL ? 0 : -ENOTSUP);
+            KEXPECT_EQ(deferred, uint32_t{0});
+            KEXPECT_FALSE(prepared);
+            KEXPECT_FALSE(subject.task->wki_skip_legacy_placement);
+        }
+        subject.task->wki_target_flags = 0;
+        std::strcpy(subject.task->wki_target_hostname.data(), "explicit.invalid");
+        KEXPECT_EQ(wki::wki_try_remote_spawn(subject.task.get(), spec), wki::WkiRemoteSpawnResult::FAILED);
+        KEXPECT_EQ(error, -ENOTSUP);
+        KEXPECT_FALSE(prepared);
+        KEXPECT_FALSE(subject.task->wki_skip_legacy_placement);
+        subject.task->wki_target_hostname.front() = '\0';
+        wki::WkiRemoteExecCandidate candidate{.path = "/bin/candidate", .target = "candidate.invalid"};
+        spec.exec_candidate = &candidate;
+        KEXPECT_EQ(wki::wki_try_remote_spawn(subject.task.get(), spec), wki::WkiRemoteSpawnResult::FAILED);
+        KEXPECT_EQ(error, -ENOTSUP);
+        candidate.target_flags = Task::WKI_TARGET_FLAG_LOCAL;
+        KEXPECT_EQ(wki::wki_try_remote_spawn(subject.task.get(), spec), wki::WkiRemoteSpawnResult::LOCAL);
+        KEXPECT_EQ(error, 0);
+        KEXPECT_FALSE(prepared);
+        KEXPECT_FALSE(subject.task->wki_skip_legacy_placement);
+        candidate.target = nullptr;
+        KEXPECT_EQ(wki::wki_try_remote_spawn(subject.task.get(), spec), wki::WkiRemoteSpawnResult::FAILED);
+        KEXPECT_EQ(error, -EINVAL);
+        spec.exec_candidate = nullptr;
+        pids.close();
+        names.close();
+        mounts.close();
+        check_private_remote_entrypoints(*subject.task, -EIDRM);
+        KEXPECT_EQ(wki::wki_try_remote_spawn(subject.task.get(), spec), wki::WkiRemoteSpawnResult::FAILED);
+        KEXPECT_EQ(error, -EIDRM);
+        KEXPECT_FALSE(prepared);
+        KEXPECT_FALSE(subject.task->wki_skip_legacy_placement);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PID_BASELINE);
+    KEXPECT_EQ(ipc::live_namespace_count(), IPC_BASELINE);
+    KEXPECT_EQ(vfs::mount_ns::live_namespace_count(), MOUNT_BASELINE);
+}
+
+KTEST(CompartmentWki, CanonicalClosedOwnersAndExistingHandoffDrainExactly) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef pids;
+        KREQUIRE_EQ(pid_ns::create_namespace(pids), 0);
+        NativeTask subject, thread, unbound, host;
+        subject.task->type = sched::task::TaskType::PROCESS;
+        KREQUIRE_TRUE(subject.task->initialize_pid_namespace(pids));
+        thread.task->is_thread = true;
+        thread.task->owner_pid = subject.task->pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(*thread.task, *subject.task));
+        check_private_remote_entrypoints(*thread.task, -ENOTSUP);
+        unbound.task->is_thread = true;
+        check_private_remote_entrypoints(*unbound.task, -ESRCH);
+        KEXPECT_EQ(ker::mod::security::compartment::remote_namespace_admission(host.task.get()), 0);
+        KEXPECT_EQ(ker::mod::security::compartment::remote_namespace_admission(nullptr), -ESRCH);
+        std::array<int, 2> descriptors{-1, -1};
+        KREQUIRE_EQ(vfs::vfs_selftest_create_pipe(*subject.task, descriptors.data()), 0);
+        for (int fd : descriptors) KREQUIRE_EQ(subject.track(fd), fd);
+        auto* reader = static_cast<vfs::File*>(subject.task->fd_table.lookup(descriptors[0]));
+        auto* writer = static_cast<vfs::File*>(subject.task->fd_table.lookup(descriptors[1]));
+        auto const REFERENCES = reader->refcount.load();
+        constexpr std::array<uint8_t, 2> PAYLOAD{0x31, 0x32};
+        KREQUIRE_EQ(writer->fops->vfs_write(writer, PAYLOAD.data(), PAYLOAD.size(), 0), ssize_t{2});
+        for (bool inline_binary : {false, true}) {
+            std::array<wki::WkiIpcFdEntry, 1> map{};
+            std::array<wki::WkiIpcTaskFdHandoff, 1> handoff{};
+            handoff[0] = {.local_fd = static_cast<uint16_t>(descriptors[0]),
+                          .file = vfs::vfs_get_file_retain(subject.task.get(), descriptors[0])};
+            KREQUIRE_TRUE(handoff[0].file == reader);
+            uint16_t count = 1;
+            // Existing ownership is transferred into direct-submit cleanup.
+            // Invalid target has no export, so cancellation cannot transmit.
+            wki::WkiIpcSubmissionGuard preparation(subject.task.get(), map.data(), handoff.data(), count, wki::WKI_NODE_INVALID);
+            int error = 99;
+            constexpr std::array<uint8_t, 1> BINARY{0x7f};
+            uint32_t const ID =
+                inline_binary
+                    ? wki::wki_task_submit_inline(wki::WKI_NODE_INVALID, BINARY.data(), BINARY.size(), nullptr, nullptr, "/",
+                                                  subject.task.get(), map.data(), count, handoff.data(), UINT8_MAX, &error, &preparation)
+                    : wki::wki_task_submit_vfs_ref(wki::WKI_NODE_INVALID, "/bin/fixture", nullptr, nullptr, "/", subject.task.get(),
+                                                   map.data(), count, handoff.data(), UINT8_MAX, &error, &preparation);
+            KEXPECT_EQ(ID, uint32_t{0});
+            KEXPECT_EQ(error, -ENOTSUP);
+            KEXPECT_NULL(handoff[0].file);
+            KEXPECT_EQ(reader->refcount.load(), REFERENCES);
+            KEXPECT_TRUE(subject.task->fd_table.lookup(descriptors[0]) == reader);
+        }
+        std::array<uint8_t, 2> received{};
+        KEXPECT_EQ(reader->fops->vfs_read(reader, received.data(), received.size(), 0), ssize_t{2});
+        KEXPECT_TRUE(received == PAYLOAD);
+        pids.close();
+        check_private_remote_entrypoints(*thread.task, -EIDRM);
+        int error = 99;
+        wki::WkiRemoteSpawnSpec spec{.error_out = &error};
+        KEXPECT_EQ(wki::wki_try_remote_spawn(thread.task.get(), spec), wki::WkiRemoteSpawnResult::FAILED);
+        KEXPECT_EQ(error, -EIDRM);
+        KEXPECT_EQ(wki::wki_try_remote_spawn(unbound.task.get(), spec), wki::WkiRemoteSpawnResult::FAILED);
+        KEXPECT_EQ(error, -ESRCH);
+        KEXPECT_EQ(wki::wki_try_remote_spawn(host.task.get(), spec), wki::WkiRemoteSpawnResult::LOCAL);
+        KEXPECT_EQ(error, 0);
+        for (int fd : descriptors) KREQUIRE_EQ(subject.close(fd), 0);
     }
     KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
 }

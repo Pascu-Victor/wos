@@ -82,12 +82,13 @@ semaphores currently return ENOSYS, and no WOS message-queue sysdep or AF_UNIX
 implementation was found in the inspected sources. Unsupported interfaces must
 retain explicit failure; this goal cannot qualify a silently global fallback.
 
-WKI placement, IPC forwarding and VFS export must reject restricted namespace
-contexts before remote effects until a negotiated enforceable compartment
-contract exists. Pinning automatic placement local is insufficient for explicit
-remote operations. Captured credentials/root/resource grants cannot silently
-substitute the worker's host namespace. Global host administration also needs
-explicit compartment gates and a reviewed allowed-authority policy.
+WKI rich/direct compute and Task FD export now reject restricted native namespace
+contexts before new remote effects. Remaining routing/VFS export and global
+consumers require integration until a negotiated enforceable compartment
+contract exists. Automatic placement stays local; explicit unsupported placement
+fails. Captured credentials/root/resource grants cannot silently substitute the
+worker's host namespace. Global host administration also needs explicit
+compartment gates and a reviewed allowed-authority policy.
 
 Final namespace/view release can close backend Files and block. Publication,
 path, mount, scheduler, lifecycle, IPC and resource locks cannot span allocation,
@@ -914,10 +915,62 @@ stop remain; the corrected fixture uses checked int results and supported raw
 protocols without changing production policy or expected denials. All eight
 disposable images from failed and passing runs were verified inactive and pruned;
 peak allocated usage was 259,866,624 bytes and final disposable usage is zero.
-Small evidence is retained. WKI compute/export bypasses ordinary socket syscalls
-and still requires exact-subject preeffect gates. Scheduled private services,
+Small evidence is retained. WKI compute/export bypasses ordinary socket syscalls;
+its separate namespace admission is described below. Scheduled private services,
 full profile creation, remaining device/global policy and all ten complete goal
 criteria remain unqualified.
+
+## Private WKI compute and FD export admission
+
+Current WKI contexts have no enforceable import contract for private native PID,
+mount or named-IPC identities. An effect-free helper observes all three exact
+canonical subject owners. Any unknown owner returns ESRCH, any closed owner
+EIDRM, and any open private view ENOTSUP. An explicit shared networking grant
+does not make these process/namespace restrictions portable. Host execution
+keeps its original compute, IPC, wire, argument and lifetime behavior.
+
+Rich placement checks scope before initialization fallback, placement flag writes,
+peer/load reservations, exec callbacks, channel allocation and exports. Ordinary
+automatic or explicit local execution keeps the same private subject local.
+Named, remote-preferred and balanced requests fail ENOTSUP, including requests
+that permit fallback. Named-self spelling is also unsupported; explicit local
+placement is available. Unknown or closed ownership fails before local return.
+Existing result error/deferred-ID outputs retain their defined initialization.
+
+Both direct submission modes retain existing argument/count validation and
+executor-linked guard adoption. Scope refusal then runs the original cleanup
+before credential/filesystem grants, resources or submission effects. Already
+supplied handoff pins and exports are released exactly once; local descriptor
+slots remain owned. Fatal abandoned-stack recovery and unlocked potentially
+blocking cleanup retain their existing protocol. Task FD export refuses before
+snapshot pins, allocations, monotonic IDs and registry/backlog publication.
+Its scalar failure outputs remain zero and map/handoff arrays stay untouched.
+Intentionally inherited local or remote File operations remain capabilities.
+
+Two native cases use all seven combinations of independently installed views,
+explicit Shared network policy, canonical bound/unbound threads and closure.
+They call actual rich/direct/export APIs, check untouched callbacks, fields,
+maps, descriptors, resource and owner baselines, and exercise real pipe handoff
+cancellation with retained File pins and preserved buffered payload. No current
+task replacement, fabricated runnable state or peer mutation is used. These
+fixtures remain unpublished Tasks. Full target/routing/VFS/device/global policy,
+public service creation and all ten complete goal criteria remain unqualified.
+
+Normal Build WOS, isolated fast diagnostic build, 38 selected host regressions,
+current C++ formatting and the two unchanged normal WKI clang-tidy units pass.
+Actual rootless KTEST38 passes 82,797 assertions with zero failures across 1,347
+cases, including all 96 mandatory checks and normal poweroff. All 70 runtime
+source/artifact pins remain stable. Mechanical comparison preserves the complete
+Host compute and IPC implementation apart from the new admission gates, and
+confirms unchanged Task/File ownership, syscall, libc and wire surfaces.
+
+The first run exposed a fixture ownership error: a borrowed pipe File was passed
+to an owning handoff guard. Its two failures and KASan panic remain recorded;
+the fixture now uses the actual retained-file API. Production policy and expected
+errors did not change, and final builds, host checks and runtime were repeated.
+All eight disposable images from failed and passing runs were verified inactive
+and pruned. Peak allocated usage was 259,932,160 bytes; final disposable usage
+is zero. Small reproducible evidence remains in the local Goal39 ledger.
 
 ## Verification checkpoint
 

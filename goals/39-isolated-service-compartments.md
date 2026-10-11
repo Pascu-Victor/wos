@@ -341,3 +341,24 @@ Authorized bin/wos-cluster --no-setup and isolated bin/wos-ktest --no-setup;
 one topology20GiB disposable/40GiB free, COW/reflink required seeds/current
 artifacts; preserve user/unrelated disks and small evidence, prune inactive
 agent disposable images after successful AND failed tests. No pause requested.
+
+## Checkpoint22 WKI admission qualification (2026-10-11)
+
+Actual rich/direct remote compute and Task FD export now refuse unknown, closed
+or unsupported private canonical namespace owners before new remote effects.
+Private automatic/explicit local placement and intentionally inherited File
+capabilities remain available. Existing handoff cleanup, Host behavior and
+Task/File/syscall/libc/wire compatibility are preserved.
+
+Normal Build WOS, isolated fast diagnostics, 38 host checks, formatting and two
+normal WKI clang-tidy units pass. Rootless KTEST38 passes 82,797 assertions,
+zero failures, 1,347 cases and all 96 mandatory checks with normal poweroff and
+70 stable runtime pins. Failed37 fixture ownership/KASan evidence is retained;
+retained-file correction changed no production policy or expected denial.
+Both runs' disposable images were verified inactive and removed; peak allocated
+usage was 259,932,160 bytes, final usage zero. See progress/39 checkpoint22
+record and audit. All ten full acceptance criteria remain incomplete and the
+goal stays ACTIVE. Continue placement/routing/global controls and full native
+service construction. Authorized bin/wos-cluster --no-setup and isolated
+bin/wos-ktest --no-setup persist with one topology, 20GiB disposable budget,
+40GiB free floor and cleanup after passing and failing tests.
