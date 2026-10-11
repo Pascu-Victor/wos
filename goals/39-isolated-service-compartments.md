@@ -362,3 +362,25 @@ goal stays ACTIVE. Continue placement/routing/global controls and full native
 service construction. Authorized bin/wos-cluster --no-setup and isolated
 bin/wos-ktest --no-setup persist with one topology, 20GiB disposable budget,
 40GiB free floor and cleanup after passing and failing tests.
+
+## Checkpoint23 WKI target-control qualification (2026-10-11)
+
+Private canonical views now reject unsupported named/remote/balanced target
+configuration before usercopy or field effects; local/automatic placement,
+modifiers and own configuration reads remain available. Unknown/closed owners
+refuse. Host SET/GET, executor field ownership, fork/clone/exec/one-shot behavior
+and syscall/libc/wire compatibility are preserved.
+
+Normal Build WOS, isolated fast diagnostics, formatting/clang-tidy and 43 focused
+Host checks pass. Actual --no-setup KTEST39 passes 83,210 assertions, zero
+failures, 1,350 cases and all 99 mandatory checks with normal poweroff and 70
+stable runtime pins. Four inactive disposable images were removed; peak
+259,932,160 bytes, final zero. Expanded44Host failure and exact baseline
+reproduction remain recorded: two exec identity checks corrected, broader
+credential/VFS audit's 24 baseline oracle failures still require investigation.
+No full Host regression or full service qualification claim. All ten full
+acceptance criteria remain incomplete; goal ACTIVE. Continue remaining ambient
+controls/routing/positive selectors, public native construction and required
+service campaigns. Authorized bin/wos-cluster --no-setup and isolated
+bin/wos-ktest --no-setup persist with the bounded SSD policy and cleanup after
+successful and failed tests. No pause requested or performed.

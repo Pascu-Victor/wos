@@ -2,6 +2,7 @@
 
 #include <abi/callnums/process.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <platform/asm/cpu.hpp>
@@ -31,6 +32,11 @@ auto personality(uint64_t persona) -> uint64_t;
 // Runtime mask mutation serializes with exec publication and refuses workers
 // still retiring from an older process image. Returns old mask or -errno.
 auto set_creation_mask(ker::mod::sched::task::Task& subject, uint32_t mask) -> int;
+// Borrow the actual executor. Namespace admission uses its retained canonical
+// process owners; fixed placement fields keep their existing executor ownership.
+auto set_wki_target_for_subject(ker::mod::sched::task::Task* subject, uint64_t hostname_addr, size_t len, uint32_t flags) -> uint64_t;
+auto get_wki_target_for_subject(ker::mod::sched::task::Task* subject, uint64_t hostname_out_addr, size_t hostname_out_size,
+                                uint64_t flags_out_addr) -> uint64_t;
 // Consumes one retained target reference on every path.
 void cleanup_signal_targets(ker::mod::sched::task::Task& owner);
 auto signal_as(ker::mod::sched::task::Task& target, const ker::mod::security::Snapshot& caller,

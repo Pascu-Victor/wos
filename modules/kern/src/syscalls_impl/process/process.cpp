@@ -14,6 +14,7 @@
 #include <platform/sched/resource_as.hpp>
 #include <platform/sched/session.hpp>
 #include <platform/security/authorization.hpp>
+#include <platform/security/compartment_wki.hpp>
 #include <platform/sys/mutex.hpp>
 #include <utility>
 
@@ -1934,8 +1935,9 @@ auto wos_proc_getpriority(int which, int64_t who) -> uint64_t {
     return static_cast<uint64_t>(encoded_nice);
 }
 
-auto wos_proc_setwkitarget(uint64_t hostname_addr, size_t len, uint32_t flags) -> uint64_t {
-    auto* task = ker::mod::sched::get_current_task();
+}  // namespace
+
+auto set_wki_target_for_subject(ker::mod::sched::task::Task* task, uint64_t hostname_addr, size_t len, uint32_t flags) -> uint64_t {
     if (task == nullptr) {
         return static_cast<uint64_t>(-ESRCH);
     }
@@ -1952,6 +1954,14 @@ auto wos_proc_setwkitarget(uint64_t hostname_addr, size_t len, uint32_t flags) -
     if (hostname_addr != 0 && len != 0 &&
         (flags & (ker::mod::sched::task::Task::WKI_TARGET_FLAG_LOCAL | ker::mod::sched::task::Task::WKI_TARGET_FLAG_BALANCED)) != 0) {
         return static_cast<uint64_t>(-EINVAL);
+    }
+
+    int const SCOPE_ADMISSION = ker::mod::security::compartment::remote_namespace_admission(task);
+    if (SCOPE_ADMISSION != 0) {
+        if (SCOPE_ADMISSION != -ENOTSUP) return static_cast<uint64_t>(SCOPE_ADMISSION);
+        if ((hostname_addr != 0 && len != 0) ||
+            (flags & (ker::mod::sched::task::Task::WKI_TARGET_FLAG_REMOTE | ker::mod::sched::task::Task::WKI_TARGET_FLAG_BALANCED)) != 0)
+            return static_cast<uint64_t>(-ENOTSUP);
     }
 
     if (hostname_addr == 0 || len == 0) {
@@ -1974,11 +1984,14 @@ auto wos_proc_setwkitarget(uint64_t hostname_addr, size_t len, uint32_t flags) -
     return 0;
 }
 
-auto wos_proc_getwkitarget(uint64_t hostname_out_addr, size_t hostname_out_size, uint64_t flags_out_addr) -> uint64_t {
-    auto* task = ker::mod::sched::get_current_task();
+auto get_wki_target_for_subject(ker::mod::sched::task::Task* task, uint64_t hostname_out_addr, size_t hostname_out_size,
+                                uint64_t flags_out_addr) -> uint64_t {
     if (task == nullptr) {
         return static_cast<uint64_t>(-ESRCH);
     }
+
+    int const SCOPE_ADMISSION = ker::mod::security::compartment::remote_namespace_admission(task);
+    if (SCOPE_ADMISSION != 0 && SCOPE_ADMISSION != -ENOTSUP) return static_cast<uint64_t>(SCOPE_ADMISSION);
 
     auto const HOSTNAME = task->wki_target_hostname;
     uint32_t const FLAGS = task->wki_target_flags;
@@ -2003,7 +2016,6 @@ auto wos_proc_getwkitarget(uint64_t hostname_out_addr, size_t hostname_out_size,
 
     return LEN;
 }
-}  // namespace
 
 namespace {
 auto signal_local_as(ker::mod::sched::task::Task& target, const ker::mod::security::Snapshot& caller,
@@ -3135,10 +3147,10 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             return wos_proc_getpriority(static_cast<int>(a2), static_cast<int64_t>(a3));
         }
         case abi::process::procmgmt_ops::SETWKITARGET: {
-            return wos_proc_setwkitarget(a2, static_cast<size_t>(a3), static_cast<uint32_t>(a4));
+            return set_wki_target_for_subject(ker::mod::sched::get_current_task(), a2, static_cast<size_t>(a3), static_cast<uint32_t>(a4));
         }
         case abi::process::procmgmt_ops::GETWKITARGET: {
-            return wos_proc_getwkitarget(a2, static_cast<size_t>(a3), a4);
+            return get_wki_target_for_subject(ker::mod::sched::get_current_task(), a2, static_cast<size_t>(a3), a4);
         }
         case abi::process::procmgmt_ops::PTRACE: {
             return ker::mod::debug::ptrace::sys_ptrace(static_cast<abi::ptrace::request>(a2), a3, a4, a5, gpr);

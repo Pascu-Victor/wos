@@ -972,6 +972,44 @@ All eight disposable images from failed and passing runs were verified inactive
 and pruned. Peak allocated usage was 259,932,160 bytes; final disposable usage
 is zero. Small reproducible evidence remains in the local Goal39 ledger.
 
+## Private WKI target configuration
+
+The actual target SET/GET implementations borrow the calling executor and observe
+its exact retained canonical PID, mount and IPC owners. Configuration fields keep
+their existing executor ownership; thread namespace admission uses the retained
+process owner. Unknown ownership returns ESRCH and closed ownership EIDRM.
+Existing invalid SET flags retain EINVAL precedence.
+
+Open private views permit automatic or explicit local placement, including
+strict, no-inherit and one-shot modifiers. A null hostname or zero length keeps
+the existing clear semantics. Valid named, remote and balanced requests return
+ENOTSUP before hostname usercopy or field mutation, regardless of fallback.
+Explicit shared networking does not authorize private remote placement. Private
+GET may read its own configuration, with both outputs preflighted before copying;
+closure refuses before observing fields or touching output. Host validation,
+usercopy, output staging, fork/clone inheritance and exec one-shot behavior are
+preserved. The execution and export gates above still independently apply.
+
+Three native cases call those same implementations for every private view
+combination, canonical and unbound threads, mapped local-policy outputs, closed
+output sentinels and real Host hostname copies and errors. They remain
+unpublished fixtures. Forwarding/default-global controls, public creation and
+the complete service boundary still require integration and qualification.
+
+Normal Build WOS, isolated fast diagnostics, formatting/clang-tidy and 43 focused
+Host checks pass. Actual rootless KTEST39 passes 83,210 assertions with zero
+failures across 1,350 cases, all 99 mandatory checks and normal poweroff; all 70
+runtime pins remain stable. Its four inactive disposable images were audited
+and removed, leaving zero disposable usage after a 259,932,160-byte peak.
+
+The expanded 44-check Host selection initially failed two existing source
+audits. Both failures were reproduced against the committed baseline. The exec
+checks now follow namespace-visible child/TCB identities and retain publication
+ownership and duplicate-spawn protection. The broader credential/VFS audit still
+has 24 baseline oracle failures requiring investigation; it is not qualified by
+the focused passing suite. Full Host regression and all ten goal criteria remain
+incomplete. Failed and passing evidence is retained in the local progress ledger.
+
 ## Verification checkpoint
 
 The initial `compartment_policy_test` suite checks actual production preparation

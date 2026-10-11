@@ -4909,3 +4909,189 @@ KTEST(CompartmentWki, CanonicalClosedOwnersAndExistingHandoffDrainExactly) {
     }
     KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
 }
+
+namespace {
+auto set_native_target(Task* subject, uint64_t hostname, size_t length, uint32_t flags) -> int {
+    return static_cast<int>(static_cast<int64_t>(ker::syscall::process::set_wki_target_for_subject(subject, hostname, length, flags)));
+}
+auto get_native_target(Task* subject, uint64_t hostname = 0, size_t capacity = 0, uint64_t flags = 0) -> int {
+    return static_cast<int>(static_cast<int64_t>(ker::syscall::process::get_wki_target_for_subject(subject, hostname, capacity, flags)));
+}
+}  // namespace
+
+KTEST(CompartmentWki, TargetConfigurationRefusesUnsupportedModesBeforeUsercopy) {
+    auto const PID_BASELINE = pid_ns::live_namespace_count();
+    auto const IPC_BASELINE = ipc::live_namespace_count();
+    auto const MOUNT_BASELINE = vfs::mount_ns::live_namespace_count();
+    for (unsigned variant = 1; variant < 8; ++variant) {
+        pid_ns::NamespaceRef host, pids;
+        ipc::NamespaceRef names;
+        vfs::mount_ns::NamespaceRef mounts;
+        NativeTask subject;
+        if ((variant & 1U) != 0) {
+            KREQUIRE_EQ(pid_ns::create_namespace(host, Network::SHARED_HOST, pids), 0);
+            KREQUIRE_TRUE(subject.task->initialize_pid_namespace(pids));
+        }
+        if ((variant & 2U) != 0) {
+            KREQUIRE_EQ(ipc::create_namespace(names), 0);
+            KREQUIRE_TRUE(subject.task->initialize_ipc_namespace(names));
+        }
+        if ((variant & 4U) != 0) {
+            KREQUIRE_EQ(vfs::mount_ns::create_namespace(mounts), 0);
+            KREQUIRE_TRUE(subject.task->initialize_mount_namespace(mounts));
+        }
+        std::strcpy(subject.task->wki_target_hostname.data(), "inherited.fixture");
+        subject.task->wki_target_flags = Task::WKI_TARGET_FLAG_LOCAL;
+        auto const HOSTNAME = subject.task->wki_target_hostname;
+        auto const REFERENCES = subject.task->ref_count.load();
+        auto const RESOURCES = wki::resource_contract::snapshot(subject.task->resources);
+        for (uint32_t flags :
+             {Task::WKI_TARGET_FLAG_REMOTE, Task::WKI_TARGET_FLAG_BALANCED, Task::WKI_TARGET_FLAG_REMOTE | Task::WKI_TARGET_FLAG_STRICT,
+              Task::WKI_TARGET_FLAG_BALANCED | Task::WKI_TARGET_FLAG_STRICT}) {
+            KEXPECT_EQ(set_native_target(subject.task.get(), 0, 0, flags), -ENOTSUP);
+            KEXPECT_TRUE(subject.task->wki_target_hostname == HOSTNAME);
+            KEXPECT_EQ(subject.task->wki_target_flags, Task::WKI_TARGET_FLAG_LOCAL);
+        }
+        KEXPECT_EQ(set_native_target(subject.task.get(), UINT64_MAX, 1, 0), -ENOTSUP);
+        KEXPECT_EQ(set_native_target(subject.task.get(), UINT64_MAX, SIZE_MAX, Task::WKI_TARGET_FLAG_STRICT), -ENOTSUP);
+        KEXPECT_EQ(set_native_target(subject.task.get(), UINT64_MAX, 1, Task::WKI_TARGET_FLAG_REMOTE), -ENOTSUP);
+        KEXPECT_EQ(set_native_target(subject.task.get(), 0, 0, uint32_t{1} << 31), -EINVAL);
+        KEXPECT_EQ(set_native_target(subject.task.get(), 0, 0, Task::WKI_TARGET_FLAG_REMOTE | Task::WKI_TARGET_FLAG_BALANCED), -EINVAL);
+        KEXPECT_EQ(set_native_target(subject.task.get(), UINT64_MAX, 1, Task::WKI_TARGET_FLAG_LOCAL), -EINVAL);
+        KEXPECT_EQ(set_native_target(subject.task.get(), UINT64_MAX, 1, Task::WKI_TARGET_FLAG_BALANCED), -EINVAL);
+        KEXPECT_TRUE(subject.task->wki_target_hostname == HOSTNAME);
+        KEXPECT_EQ(subject.task->wki_target_flags, Task::WKI_TARGET_FLAG_LOCAL);
+        KEXPECT_EQ(subject.task->ref_count.load(), REFERENCES);
+        KEXPECT_EQ(subject.task->fd_table.size(), 0U);
+        KEXPECT_EQ(subject.task->fd_table.reserved_count(), 0U);
+        KEXPECT_EQ(subject.task->usercopy_pagemap_accesses.load(), uint32_t{0});
+        auto const CURRENT = wki::resource_contract::snapshot(subject.task->resources);
+        KEXPECT_EQ(std::memcmp(&RESOURCES, &CURRENT, sizeof(RESOURCES)), 0);
+        pids.close();
+        names.close();
+        mounts.close();
+        KEXPECT_EQ(set_native_target(subject.task.get(), 0, 0, Task::WKI_TARGET_FLAG_LOCAL), -EIDRM);
+        KEXPECT_EQ(get_native_target(subject.task.get(), UINT64_MAX, SIZE_MAX, UINT64_MAX), -EIDRM);
+        KEXPECT_TRUE(subject.task->wki_target_hostname == HOSTNAME);
+        KEXPECT_EQ(subject.task->wki_target_flags, Task::WKI_TARGET_FLAG_LOCAL);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PID_BASELINE);
+    KEXPECT_EQ(ipc::live_namespace_count(), IPC_BASELINE);
+    KEXPECT_EQ(vfs::mount_ns::live_namespace_count(), MOUNT_BASELINE);
+}
+
+KTEST(CompartmentWki, MappedLocalPolicyAndClosedOutputsPreserveSubject) {
+    auto const BASELINE = ipc::live_namespace_count();
+    {
+        ipc::NamespaceRef names;
+        KREQUIRE_EQ(ipc::create_namespace(names), 0);
+        UserTask subject;
+        KREQUIRE_NE(subject.task->pagemap, nullptr);
+        KREQUIRE_TRUE(subject.task->initialize_ipc_namespace(names));
+        constexpr uint64_t OUTPUT = 0x650000;
+        constexpr uint64_t FLAGS_OUTPUT = OUTPUT + 128;
+        KREQUIRE_TRUE(subject.map_zero(OUTPUT));
+        for (uint32_t modifiers = 0; modifiers < 8; ++modifiers) {
+            uint32_t const FLAGS = ((modifiers & 1U) != 0 ? Task::WKI_TARGET_FLAG_STRICT : 0U) |
+                                   ((modifiers & 2U) != 0 ? Task::WKI_TARGET_FLAG_NOINHERIT : 0U) |
+                                   ((modifiers & 4U) != 0 ? Task::WKI_TARGET_FLAG_ONESHOT : 0U);
+            for (uint32_t placement : {uint32_t{0}, Task::WKI_TARGET_FLAG_LOCAL}) {
+                // A zero length keeps the existing clear semantics even with
+                // an unusable hostname pointer. No source copy is necessary.
+                KEXPECT_EQ(set_native_target(subject.task.get(), UINT64_MAX, 0, FLAGS | placement), 0);
+                KEXPECT_EQ(get_native_target(subject.task.get(), OUTPUT, 1, FLAGS_OUTPUT), 0);
+                char name = 99;
+                uint32_t observed = UINT32_MAX;
+                KREQUIRE_TRUE(usercopy::copy_value_from_task(*subject.task, OUTPUT, name));
+                KREQUIRE_TRUE(usercopy::copy_value_from_task(*subject.task, FLAGS_OUTPUT, observed));
+                KEXPECT_EQ(name, char{0});
+                KEXPECT_EQ(observed, FLAGS | placement);
+            }
+        }
+        auto const HOSTNAME = subject.task->wki_target_hostname;
+        auto const FLAGS = subject.task->wki_target_flags;
+        uint64_t const SENTINEL = 0x123456789abcdef0;
+        KREQUIRE_TRUE(usercopy::copy_value_to_task(*subject.task, OUTPUT, SENTINEL));
+        KREQUIRE_TRUE(usercopy::copy_value_to_task(*subject.task, FLAGS_OUTPUT, SENTINEL));
+        names.close();
+        KEXPECT_EQ(get_native_target(subject.task.get(), OUTPUT, 64, FLAGS_OUTPUT), -EIDRM);
+        KEXPECT_EQ(set_native_target(subject.task.get(), 0, 0, 0), -EIDRM);
+        KEXPECT_TRUE(subject.task->wki_target_hostname == HOSTNAME);
+        KEXPECT_EQ(subject.task->wki_target_flags, FLAGS);
+        uint64_t observed = 0;
+        KREQUIRE_TRUE(usercopy::copy_value_from_task(*subject.task, OUTPUT, observed));
+        KEXPECT_EQ(observed, SENTINEL);
+        KREQUIRE_TRUE(usercopy::copy_value_from_task(*subject.task, FLAGS_OUTPUT, observed));
+        KEXPECT_EQ(observed, SENTINEL);
+        KEXPECT_EQ(subject.task->usercopy_pagemap_accesses.load(), uint32_t{0});
+    }
+    KEXPECT_EQ(ipc::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentWki, CanonicalTargetAdmissionAndHostCopiesKeepExistingOwnership) {
+    auto const BASELINE = pid_ns::live_namespace_count();
+    {
+        pid_ns::NamespaceRef pids;
+        KREQUIRE_EQ(pid_ns::create_namespace(pids), 0);
+        NativeTask owner, thread, unbound;
+        KREQUIRE_TRUE(owner.task->initialize_pid_namespace(pids));
+        thread.task->is_thread = true;
+        thread.task->owner_pid = owner.task->pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(*thread.task, *owner.task));
+        unbound.task->is_thread = true;
+        unbound.task->owner_pid = owner.task->pid;
+        auto const OWNER_NAME = owner.task->wki_target_hostname;
+        auto const OWNER_FLAGS = owner.task->wki_target_flags;
+        KEXPECT_EQ(set_native_target(thread.task.get(), UINT64_MAX, 1, 0), -ENOTSUP);
+        KEXPECT_EQ(set_native_target(thread.task.get(), 0, 0, Task::WKI_TARGET_FLAG_LOCAL), 0);
+        KEXPECT_EQ(get_native_target(thread.task.get()), 0);
+        KEXPECT_EQ(thread.task->wki_target_flags, Task::WKI_TARGET_FLAG_LOCAL);
+        KEXPECT_TRUE(owner.task->wki_target_hostname == OWNER_NAME);
+        KEXPECT_EQ(owner.task->wki_target_flags, OWNER_FLAGS);
+        KEXPECT_EQ(set_native_target(unbound.task.get(), 0, 0, 0), -ESRCH);
+        KEXPECT_EQ(get_native_target(unbound.task.get(), UINT64_MAX, SIZE_MAX, UINT64_MAX), -ESRCH);
+        KEXPECT_EQ(set_native_target(nullptr, 0, 0, 0), -ESRCH);
+        KEXPECT_EQ(get_native_target(nullptr), -ESRCH);
+        pids.close();
+        KEXPECT_EQ(set_native_target(thread.task.get(), 0, 0, 0), -EIDRM);
+        KEXPECT_EQ(get_native_target(thread.task.get()), -EIDRM);
+        KEXPECT_EQ(thread.task->wki_target_flags, Task::WKI_TARGET_FLAG_LOCAL);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+    UserTask host;
+    KREQUIRE_NE(host.task->pagemap, nullptr);
+    constexpr uint64_t SOURCE = 0x660000;
+    constexpr uint64_t OUTPUT = SOURCE + 128;
+    constexpr uint64_t FLAGS_OUTPUT = SOURCE + 256;
+    constexpr auto NAME = std::to_array("host.fixture");
+    KREQUIRE_TRUE(host.map_zero(SOURCE));
+    KREQUIRE_TRUE(usercopy::copy_to_task(*host.task, SOURCE, NAME.data(), NAME.size()));
+    uint32_t const FLAGS = Task::WKI_TARGET_FLAG_REMOTE | Task::WKI_TARGET_FLAG_STRICT | Task::WKI_TARGET_FLAG_ONESHOT;
+    KEXPECT_EQ(set_native_target(host.task.get(), SOURCE, NAME.size() - 1, FLAGS), 0);
+    KEXPECT_EQ(get_native_target(host.task.get(), OUTPUT, NAME.size(), FLAGS_OUTPUT), static_cast<int>(NAME.size() - 1));
+    std::array<char, NAME.size()> observed{};
+    uint32_t observed_flags = 0;
+    KREQUIRE_TRUE(usercopy::copy_from_task(*host.task, OUTPUT, observed.data(), observed.size()));
+    KREQUIRE_TRUE(usercopy::copy_value_from_task(*host.task, FLAGS_OUTPUT, observed_flags));
+    KEXPECT_TRUE(observed == NAME);
+    KEXPECT_EQ(observed_flags, FLAGS);
+    auto const HOSTNAME = host.task->wki_target_hostname;
+    KEXPECT_EQ(set_native_target(host.task.get(), UINT64_MAX, 1, 0), -EFAULT);
+    KEXPECT_EQ(set_native_target(host.task.get(), UINT64_MAX, host.task->wki_target_hostname.size(), 0), -ENAMETOOLONG);
+    KEXPECT_TRUE(host.task->wki_target_hostname == HOSTNAME);
+    KEXPECT_EQ(host.task->wki_target_flags, FLAGS);
+    uint64_t const SENTINEL = 0x76543210fedcba98;
+    KREQUIRE_TRUE(usercopy::copy_value_to_task(*host.task, OUTPUT, SENTINEL));
+    KREQUIRE_TRUE(usercopy::copy_value_to_task(*host.task, FLAGS_OUTPUT, SENTINEL));
+    KEXPECT_EQ(get_native_target(host.task.get(), OUTPUT, 1, FLAGS_OUTPUT), -ENAMETOOLONG);
+    KEXPECT_EQ(get_native_target(host.task.get(), OUTPUT, NAME.size(), UINT64_MAX), -EFAULT);
+    uint64_t unchanged = 0;
+    KREQUIRE_TRUE(usercopy::copy_value_from_task(*host.task, OUTPUT, unchanged));
+    KEXPECT_EQ(unchanged, SENTINEL);
+    KREQUIRE_TRUE(usercopy::copy_value_from_task(*host.task, FLAGS_OUTPUT, unchanged));
+    KEXPECT_EQ(unchanged, SENTINEL);
+    KEXPECT_EQ(set_native_target(host.task.get(), 0, SIZE_MAX, Task::WKI_TARGET_FLAG_BALANCED), 0);
+    KEXPECT_EQ(host.task->wki_target_hostname.front(), char{0});
+    KEXPECT_EQ(host.task->wki_target_flags, Task::WKI_TARGET_FLAG_BALANCED);
+    KEXPECT_EQ(host.task->usercopy_pagemap_accesses.load(), uint32_t{0});
+}

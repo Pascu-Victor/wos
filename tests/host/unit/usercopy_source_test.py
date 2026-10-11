@@ -301,8 +301,8 @@ def require_process_syscalls_use_usercopy(source: str) -> None:
         "wos_proc_clone_vm",
         "wos_proc_prctl",
         "wos_proc_arch_prctl",
-        "wos_proc_setwkitarget",
-        "wos_proc_getwkitarget",
+        "set_wki_target_for_subject",
+        "get_wki_target_for_subject",
     ]:
         body = function_body(source, name)
         if "usercopy::" not in body:

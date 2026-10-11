@@ -313,12 +313,20 @@ def require_spawn_actions_snapshot_user_memory_and_preserve_cloexec_sources(sour
 
     if source.count("publication lost child ownership for PID %x") != 2:
         fail("spawn publication ownership diagnostics must cover local and remote children")
+    if "uint64_t const CHILD_VISIBLE_PID = new_task->namespace_tid();" not in exec_impl:
+        fail("spawn publication results must capture the child's exact namespace-visible PID")
     for marker in [
         'dbg::log("wos_proc_exec: remote publication lost child ownership for PID %x", CHILD_PID);',
         'dbg::log("wos_proc_exec: local publication lost child ownership for PID %x", CHILD_PID);',
     ]:
         marker_pos = source.find(marker)
-        if marker_pos < 0 or "return CHILD_PID;" not in source[marker_pos : marker_pos + 450]:
+        failure_if = source.rfind("if (!sched::task::release_unpublished_process(", 0, marker_pos)
+        if marker_pos < 0 or failure_if < 0:
+            fail("published spawn ownership failure branch is missing")
+        brace = source.index("{", failure_if)
+        end = find_matching_brace(source, brace)
+        failure = source[brace:end]
+        if marker_pos >= end or "return CHILD_VISIBLE_PID;" not in failure or "return 0;" in failure or "return static_cast<uint64_t>(remote_error);" in failure:
             fail("published spawn failures must return the child PID instead of triggering duplicate fallback")
 
 
@@ -674,7 +682,7 @@ def require_worker_handoff_ownership_and_exit_order(source: str) -> None:
         if token not in cancel:
             fail("exit must cancel both queued and claimed worker waits")
     prepare = function_body(source, "wos_proc_execve_impl")
-    if prepare.index("if (PROCESS_OWNER == nullptr)") > prepare.index("PROCESS_OWNER->pid"):
+    if prepare.index("if (PROCESS_OWNER == nullptr)") > prepare.index("PROCESS_OWNER->namespace_tid()"):
         fail("native initial TCB identity requires a validated process owner")
     finish = function_body(source, "finish_native_exec_image")
     entry_start = finish.index("if (OWNER_HANDOFF)")
