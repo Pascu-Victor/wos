@@ -5647,6 +5647,25 @@ struct ConstructionRoot {
         if (RESULT == 0) context.filesystem = &filesystem;
         return RESULT;
     }
+    auto admit_identity(const security::Snapshot& credentials) -> int {
+        int result = resource::initialize_credentials(*source.task, credentials);
+        if (result != 0) return result;
+        compartment_policy::Profile parent;
+        parent.credentials = source.task->credentials();
+        compartment_policy::Request request;
+        request.authority_ceiling = credentials.authority_ceiling();
+        request.service_privileges = credentials.effective_service_privileges();
+        for (size_t i = 0; i < parent.limits.size(); ++i) parent.limits[i] = source.task->resources.entries[i].limit;
+        request.limits = parent.limits;
+        result = compartment_policy::prepare(parent, request, Task::FD_TABLE_SIZE, profile);
+        if (result != 0) return result;
+        auto mount = scoped_mount(mounts.first, "/");
+        if (!mount) return -ENOENT;
+        auto pin = pin_procfs_fixture_directory(*source.task, mount.get(), "/");
+        if (!pin) return -ENOMEM;
+        result = vfs::vfs_prepare_directory_view(profile.credentials, pin.get(), pin.get(), {}, view);
+        return result == 0 ? refresh() : result;
+    }
     auto construct(Task* owner, int& error) -> Task* {
         NativeFile file(vfs::vfs_get_file_retain(source.task.get(), executable));
         if (!file) {
@@ -6024,6 +6043,377 @@ KTEST(CompartmentConstruction, TransferredRecoveryRetiresPreparedMetadataAndExec
         KEXPECT_EQ(mount->open_files.load(), BUSY);
         uint8_t marker = 41;
         KEXPECT_EQ(vfs::vfs_pwrite_file(executable.get(), &marker, 1, 1024), ssize_t{1});
+        KEXPECT_EQ(threading::get_active_thread_count(), THREADS);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
+    KEXPECT_EQ(ipc::live_namespace_count(), IPC);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
+}
+
+namespace {
+auto construction_word(Task& child, uint64_t address) -> uint64_t {
+    uint64_t value = 0;
+    KEXPECT_TRUE(usercopy::copy_value_from_task(child, address, value));
+    return value;
+}
+void expect_construction_string(Task& child, uint64_t address, std::string_view expected) {
+    std::array<char, 64> bytes{};
+    for (size_t offset = 0; offset < expected.size();) {
+        size_t const COUNT = std::min(bytes.size(), expected.size() - offset);
+        KEXPECT_TRUE(usercopy::copy_from_task(child, address + offset, bytes.data(), COUNT));
+        KEXPECT_EQ(std::memcmp(bytes.data(), expected.data() + offset, COUNT), 0);
+        offset += COUNT;
+    }
+    KEXPECT_EQ(construction_byte(child, address + expected.size()), uint8_t{0});
+}
+void expect_construction_stack(Task& child, std::span<const std::string_view> argv, std::span<const std::string_view> envp, bool secure) {
+    auto const RSP = child.context.frame.rsp;
+    KEXPECT_EQ(RSP % 16, uint64_t{0});
+    KEXPECT_EQ(construction_word(child, RSP), static_cast<uint64_t>(argv.size()));
+    KEXPECT_EQ(child.context.regs.rdi, static_cast<uint64_t>(argv.size()));
+    KEXPECT_EQ(child.context.regs.rsi, RSP + sizeof(uint64_t));
+    KEXPECT_EQ(child.context.regs.rdx, child.context.regs.rsi + (argv.size() + 1) * sizeof(uint64_t));
+    for (size_t i = 0; i < argv.size(); ++i)
+        expect_construction_string(child, construction_word(child, child.context.regs.rsi + i * sizeof(uint64_t)), argv[i]);
+    for (size_t i = 0; i < envp.size(); ++i)
+        expect_construction_string(child, construction_word(child, child.context.regs.rdx + i * sizeof(uint64_t)), envp[i]);
+    KEXPECT_EQ(construction_word(child, child.context.regs.rsi + argv.size() * sizeof(uint64_t)), uint64_t{0});
+    KEXPECT_EQ(construction_word(child, child.context.regs.rdx + envp.size() * sizeof(uint64_t)), uint64_t{0});
+    uint64_t const AUX = child.context.regs.rdx + (envp.size() + 1) * sizeof(uint64_t);
+    uint32_t seen = 0;
+    bool terminated = false;
+    for (size_t i = 0; i < 14; ++i) {
+        uint64_t const KEY = construction_word(child, AUX + i * 16);
+        uint64_t const VALUE = construction_word(child, AUX + i * 16 + 8);
+        if (KEY == 0) {
+            KEXPECT_EQ(VALUE, uint64_t{0});
+            terminated = true;
+            break;
+        }
+        uint32_t bit = 0;
+        switch (KEY) {
+            case 3:
+                bit = 1U << 0;
+                KEXPECT_EQ(VALUE, child.program_header_addr);
+                break;
+            case 4:
+                bit = 1U << 1;
+                KEXPECT_EQ(VALUE, static_cast<uint64_t>(child.program_header_ent_size));
+                break;
+            case 5:
+                bit = 1U << 2;
+                KEXPECT_EQ(VALUE, static_cast<uint64_t>(child.program_header_count));
+                break;
+            case 6:
+                bit = 1U << 3;
+                KEXPECT_EQ(VALUE, mm::paging::PAGE_SIZE);
+                break;
+            case 9:
+                bit = 1U << 4;
+                KEXPECT_EQ(VALUE, child.entry);
+                break;
+            case 11:
+                bit = 1U << 5;
+                KEXPECT_EQ(VALUE, static_cast<uint64_t>(child.credentials().user().real));
+                break;
+            case 12:
+                bit = 1U << 6;
+                KEXPECT_EQ(VALUE, static_cast<uint64_t>(child.credentials().user().effective));
+                break;
+            case 13:
+                bit = 1U << 7;
+                KEXPECT_EQ(VALUE, static_cast<uint64_t>(child.credentials().group().real));
+                break;
+            case 14:
+                bit = 1U << 8;
+                KEXPECT_EQ(VALUE, static_cast<uint64_t>(child.credentials().group().effective));
+                break;
+            case 23:
+                bit = 1U << 9;
+                KEXPECT_EQ(VALUE, uint64_t{secure ? 1U : 0U});
+                break;
+            case 25: {
+                bit = 1U << 10;
+                KEXPECT_EQ(VALUE, child.at_random_addr);
+                std::array<uint8_t, 16> random{};
+                KEXPECT_TRUE(usercopy::copy_from_task(child, VALUE, random.data(), random.size()));
+                KEXPECT_TRUE(std::any_of(random.begin(), random.end(), [](uint8_t byte) { return byte != 0; }));
+                break;
+            }
+            case 31:
+                bit = 1U << 11;
+                expect_construction_string(child, VALUE, "/service");
+                break;
+            case 7:
+                bit = 1U << 12;
+                KEXPECT_NE(child.interp_base, uint64_t{0});
+                KEXPECT_EQ(VALUE, child.interp_base);
+                break;
+            default:
+                KEXPECT_TRUE(false);
+                break;
+        }
+        KEXPECT_EQ(seen & bit, uint32_t{0});
+        seen |= bit;
+    }
+    KEXPECT_TRUE(terminated);
+    KEXPECT_EQ(seen, uint32_t{0xfffU | (child.interp_base != 0 ? 0x1000U : 0U)});
+}
+auto enlarge_construction_interpreter(ConstructionRoot& root) -> int {
+    NativeFile interpreter(vfs::vfs_get_file_retain(root.source.task.get(), root.interpreter));
+    if (!interpreter) return -EBADF;
+    uint8_t byte = 0;
+    return vfs::vfs_pwrite_file(interpreter.get(), &byte, 1, 1024 * 1024 - 1) == 1 ? 0 : -EIO;
+}
+}  // namespace
+
+KTEST(CompartmentConstruction, MappedLaunchStacksPreserveArgumentsAndNonrootSecureIdentity) {
+    auto const PIDS = pid_ns::live_namespace_count();
+    auto const IPC = ipc::live_namespace_count();
+    auto const MOUNTS = mount_ns::live_namespace_count();
+    auto const THREADS = threading::get_active_thread_count();
+    for (unsigned mode = 0; mode < 4; ++mode) {
+        ConstructionRoot root;
+        KREQUIRE_EQ(root.prepare(0x52000000, 41, 8192, mode == 1 || mode == 2), 0);
+        if (mode == 2) KREQUIRE_EQ(enlarge_construction_interpreter(root), 0);
+        std::array<uint32_t, 2> groups{801, 802};
+        security::Snapshot identity;
+        uint64_t const GRANT = mode == 2 ? 1ULL << static_cast<unsigned>(security::ServicePrivilege::JOURNAL_READ) : 0;
+        KREQUIRE_EQ(security::Snapshot::restore_fields({.user = {700, mode == 1 ? 701U : 700U, 700},
+                                                        .group = {800, 800, 800},
+                                                        .groups = groups,
+                                                        .authority_ceiling = abi::process::service_privilege_ceiling(GRANT),
+                                                        .service_privileges = GRANT,
+                                                        .no_new_privileges = true,
+                                                        .service_privileges_locked = true},
+                                                       identity),
+                    0);
+        KREQUIRE_EQ(root.admit_identity(identity), 0);
+        std::array<char, 8> mutable_name{'s', 'e', 'r', 'v', 'i', 'c', 'e', '\0'};
+        std::array<char, 5000> large{};
+        large.fill('q');
+        std::array<std::string_view, 3> argv{std::string_view(mutable_name.data(), 7), std::string_view(large.data(), large.size()), ""};
+        std::array<std::string_view, 2> envp{"A=alpha", "EMPTY="};
+        process_exec::NativeProcessArguments arguments{.executable_path = "/service", .argv = argv, .envp = envp};
+        if (mode == 3) {
+            arguments.argv = {};
+            arguments.envp = {};
+        }
+        root.context.arguments = &arguments;
+        NativeFile executable(vfs::vfs_get_file_retain(root.source.task.get(), root.executable));
+        NativeFile interpreter(vfs::vfs_get_file_retain(root.source.task.get(), root.interpreter));
+        KREQUIRE_TRUE(executable && interpreter);
+        auto mount = scoped_mount(root.mounts.first, "/");
+        KREQUIRE_TRUE(mount);
+        auto const BUSY = mount->open_files.load();
+        auto const REFS = executable->refcount.load();
+        abi::resource::Usage before{}, after{};
+        resource::copy_process_observation(*root.source.task, before);
+        if (mode == 2) process_exec::exec_selftest_fail_native_construction_once(process_exec::NativeConstructionFault::INTERPRETER_BUFFER);
+        int error = 99;
+        ConstructedProcess process{*root.source.task};
+        process.child = root.construct(&process.owner, error);
+        KREQUIRE_NE(process.child, nullptr);
+        KEXPECT_EQ(error, 0);
+        // A successful sparse interpreter did not allocate the complete buffer.
+        if (mode == 2)
+            KEXPECT_TRUE(
+                process_exec::exec_selftest_take_native_construction_fault(process_exec::NativeConstructionFault::INTERPRETER_BUFFER));
+        auto& child = *process.child;
+        KEXPECT_TRUE(child.credentials() == root.profile.credentials);
+        KEXPECT_EQ(child.credentials().allows_service(security::ServicePrivilege::JOURNAL_READ), mode == 2);
+        KEXPECT_FALSE(child.credentials().allows(security::Authority::KERNEL_DEBUG));
+        KEXPECT_EQ(child.credentials().groups().size(), groups.size());
+        KEXPECT_EQ(child.namespace_tid(), uint64_t{1});
+        KEXPECT_FALSE(child.scheduler_published.load());
+        KEXPECT_NULL(child.owned_exec_arguments.load());
+        KEXPECT_FALSE(process.owner.unpublished_teardown_in_progress.load());
+        mutable_name.front() = 'x';
+        std::array<std::string_view, 3> captured{"service", std::string_view(large.data(), large.size()), ""};
+        expect_construction_stack(child, mode == 3 ? std::span<const std::string_view>{} : captured,
+                                  mode == 3 ? std::span<const std::string_view>{} : envp, mode == 1 || mode == 2);
+        int tid = -1;
+        KEXPECT_TRUE(usercopy::copy_value_from_task(child, child.thread->fsbase + threading::MLIBC_TCB_TID_OFFSET, tid));
+        KEXPECT_EQ(tid, 1);
+        uint8_t marker = 91;
+        KEXPECT_EQ(vfs::vfs_pwrite_file(executable.get(), &marker, 1, 1024), ssize_t{-ETXTBSY});
+        KEXPECT_EQ(vfs::vfs_pwrite_file(interpreter.get(), &marker, 1, 1024), ssize_t{1});
+        if (mode == 1 || mode == 2) KEXPECT_EQ(construction_byte(child, child.context.frame.rip), uint8_t{42});
+        KEXPECT_TRUE(process.destroy());
+        resource::copy_process_observation(*root.source.task, after);
+        KEXPECT_EQ(after.current, before.current);
+        KEXPECT_EQ(executable->refcount.load(), REFS);
+        KEXPECT_EQ(mount->open_files.load(), BUSY);
+        KEXPECT_EQ(threading::get_active_thread_count(), THREADS);
+        KEXPECT_EQ(vfs::vfs_pwrite_file(executable.get(), &marker, 1, 1024), ssize_t{1});
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
+    KEXPECT_EQ(ipc::live_namespace_count(), IPC);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
+}
+
+KTEST(CompartmentConstruction, LaunchAllocationFailuresDrainPartialArgumentsInterpreterAndStack) {
+    auto const PIDS = pid_ns::live_namespace_count();
+    auto const IPC = ipc::live_namespace_count();
+    auto const MOUNTS = mount_ns::live_namespace_count();
+    auto const THREADS = threading::get_active_thread_count();
+    using Fault = process_exec::NativeConstructionFault;
+    for (auto fault : {Fault::ARGUMENT_POINTERS, Fault::ARGUMENT_ARENA, Fault::INTERPRETER_BUFFER, Fault::STACK_ADDRESSES}) {
+        ConstructionRoot root;
+        KREQUIRE_EQ(root.prepare(0x52000000, 41, 8192), 0);
+        std::array<std::string_view, 1> argv{"service"}, envp{"A=alpha"};
+        process_exec::NativeProcessArguments arguments{.executable_path = "/service", .argv = argv, .envp = envp};
+        root.context.arguments = &arguments;
+        NativeFile executable(vfs::vfs_get_file_retain(root.source.task.get(), root.executable));
+        NativeFile interpreter(vfs::vfs_get_file_retain(root.source.task.get(), root.interpreter));
+        KREQUIRE_TRUE(executable && interpreter);
+        auto mount = scoped_mount(root.mounts.first, "/");
+        KREQUIRE_TRUE(mount);
+        auto const BUSY = mount->open_files.load();
+        auto const REFS = executable->refcount.load();
+        auto const INTERP_REFS = interpreter->refcount.load();
+        auto const SCRATCH = process_exec::exec_selftest_native_construction_scratch_destructions();
+        abi::resource::Usage before{}, after{};
+        resource::copy_process_observation(*root.source.task, before);
+        process_exec::exec_selftest_fail_native_construction_once(fault);
+        int error = 99;
+        ConstructedProcess failed{*root.source.task};
+        failed.child = root.construct(&failed.owner, error);
+        process_exec::exec_selftest_fail_native_construction_once(Fault::NONE);
+        KEXPECT_NULL(failed.child);
+        KEXPECT_EQ(error, -ENOMEM);
+        resource::copy_process_observation(*root.source.task, after);
+        KEXPECT_EQ(after.current, before.current);
+        KEXPECT_EQ(executable->refcount.load(), REFS);
+        KEXPECT_EQ(interpreter->refcount.load(), INTERP_REFS);
+        KEXPECT_EQ(mount->open_files.load(), BUSY);
+        KEXPECT_NULL(failed.owner.owned_unpublished_process.load());
+        KEXPECT_FALSE(failed.owner.unpublished_teardown_in_progress.load());
+        KEXPECT_NULL(failed.owner.pending_process_reservations);
+        KEXPECT_EQ(process_exec::exec_selftest_native_construction_scratch_destructions(), SCRATCH + 1);
+        uint8_t marker = 41;
+        KEXPECT_EQ(vfs::vfs_pwrite_file(executable.get(), &marker, 1, 1024), ssize_t{1});
+        KEXPECT_EQ(vfs::vfs_pwrite_file(interpreter.get(), &marker, 1, 1024), ssize_t{1});
+        KEXPECT_EQ(threading::get_active_thread_count(), THREADS);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
+    KEXPECT_EQ(ipc::live_namespace_count(), IPC);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
+}
+
+KTEST(CompartmentConstruction, TransferredLaunchRecoveryRetiresInterpreterViewsAndMappedStacks) {
+    auto const PIDS = pid_ns::live_namespace_count();
+    auto const IPC = ipc::live_namespace_count();
+    auto const MOUNTS = mount_ns::live_namespace_count();
+    auto const THREADS = threading::get_active_thread_count();
+    using Fault = process_exec::NativeConstructionFault;
+    for (auto fault : {Fault::RECOVERY_INTERPRETER_READ, Fault::RECOVERY_STACK_BUILT}) {
+        ConstructionRoot root;
+        KREQUIRE_EQ(root.prepare(0x52000000, 41, 8192), 0);
+        KREQUIRE_EQ(enlarge_construction_interpreter(root), 0);
+        std::array<std::string_view, 1> argv{"service"}, envp{"A=alpha"};
+        process_exec::NativeProcessArguments arguments{.executable_path = "/service", .argv = argv, .envp = envp};
+        root.context.arguments = &arguments;
+        NativeFile executable(vfs::vfs_get_file_retain(root.source.task.get(), root.executable));
+        NativeFile interpreter(vfs::vfs_get_file_retain(root.source.task.get(), root.interpreter));
+        KREQUIRE_TRUE(executable && interpreter);
+        auto mount = scoped_mount(root.mounts.first, "/");
+        KREQUIRE_TRUE(mount);
+        auto const BUSY = mount->open_files.load();
+        auto const REFS = executable->refcount.load();
+        auto const INTERP_REFS = interpreter->refcount.load();
+        auto const SCRATCH = process_exec::exec_selftest_native_construction_scratch_destructions();
+        abi::resource::Usage before{}, after{};
+        resource::copy_process_observation(*root.source.task, before);
+        root.source.task->process_exit_requested.store(true);
+        process_exec::exec_selftest_fail_native_construction_once(fault);
+        int error = 99;
+        ConstructedProcess failed{*root.source.task};
+        failed.child = root.construct(&failed.owner, error);
+        process_exec::exec_selftest_fail_native_construction_once(Fault::NONE);
+        KEXPECT_NULL(failed.child);
+        KEXPECT_EQ(error, -ECANCELED);
+        KEXPECT_TRUE(failed.owner.process_exit_requested.load());
+        failed.owner.process_exit_requested.store(false);
+        resource::copy_process_observation(*root.source.task, after);
+        KEXPECT_EQ(after.current, before.current);
+        KEXPECT_EQ(executable->refcount.load(), REFS);
+        KEXPECT_EQ(interpreter->refcount.load(), INTERP_REFS);
+        KEXPECT_EQ(mount->open_files.load(), BUSY);
+        KEXPECT_NULL(failed.owner.owned_unpublished_process.load());
+        KEXPECT_FALSE(failed.owner.unpublished_teardown_in_progress.load());
+        KEXPECT_NULL(failed.owner.pending_process_reservations);
+        KEXPECT_EQ(process_exec::exec_selftest_native_construction_scratch_destructions(), SCRATCH + 1);
+        uint8_t marker = 41;
+        KEXPECT_EQ(vfs::vfs_pwrite_file(executable.get(), &marker, 1, 1024), ssize_t{1});
+        KEXPECT_EQ(vfs::vfs_pwrite_file(interpreter.get(), &marker, 1, 1024), ssize_t{1});
+        KEXPECT_EQ(threading::get_active_thread_count(), THREADS);
+    }
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);
+    KEXPECT_EQ(ipc::live_namespace_count(), IPC);
+    KEXPECT_EQ(mount_ns::live_namespace_count(), MOUNTS);
+}
+
+KTEST(CompartmentConstruction, InvalidLaunchArgumentsRefuseBeforeImageAndPreservePopulation) {
+    auto const PIDS = pid_ns::live_namespace_count();
+    auto const IPC = ipc::live_namespace_count();
+    auto const MOUNTS = mount_ns::live_namespace_count();
+    auto const THREADS = threading::get_active_thread_count();
+    for (unsigned mode = 0; mode < 6; ++mode) {
+        ConstructionRoot root;
+        KREQUIRE_EQ(root.prepare(0x52000000, 41, 8192), 0);
+        std::array<std::string_view, 257> argv{};
+        std::array<char, 512> long_path{};
+        long_path.fill('p');
+        long_path.front() = '/';
+        std::unique_ptr<char[]> large_argument;
+        if (mode == 4) {
+            large_argument.reset(new (std::nothrow) char[2 * 1024 * 1024]{});
+            KREQUIRE_TRUE(large_argument != nullptr);
+        }
+        process_exec::NativeProcessArguments arguments{.executable_path = "/service", .argv = std::span(argv).first(1)};
+        argv.front() = "service";
+        switch (mode) {
+            case 0:
+                arguments.executable_path = "service";
+                break;
+            case 1:
+                argv.front() = std::string_view("a\0b", 3);
+                break;
+            case 2:
+                arguments.executable_path = std::string_view(long_path.data(), long_path.size());
+                break;
+            case 3:
+                arguments.argv = argv;
+                break;
+            case 4:
+                argv.front() = std::string_view(large_argument.get(), 2 * 1024 * 1024);
+                break;
+            case 5:
+                arguments.executable_path = std::string_view("/a\0b", 4);
+                break;
+        }
+        root.context.arguments = &arguments;
+        NativeFile executable(vfs::vfs_get_file_retain(root.source.task.get(), root.executable));
+        KREQUIRE_TRUE(executable);
+        auto mount = scoped_mount(root.mounts.first, "/");
+        KREQUIRE_TRUE(mount);
+        auto const BUSY = mount->open_files.load();
+        auto const REFS = executable->refcount.load();
+        abi::resource::Usage before{}, after{};
+        resource::copy_process_observation(*root.source.task, before);
+        int error = 99;
+        ConstructedProcess failed{*root.source.task};
+        failed.child = root.construct(&failed.owner, error);
+        KEXPECT_NULL(failed.child);
+        KEXPECT_EQ(error, mode == 3 || mode == 4 ? -E2BIG : -EINVAL);
+        resource::copy_process_observation(*root.source.task, after);
+        KEXPECT_EQ(after.current, before.current);
+        KEXPECT_EQ(executable->refcount.load(), REFS);
+        KEXPECT_EQ(mount->open_files.load(), BUSY);
+        KEXPECT_NULL(failed.owner.owned_unpublished_process.load());
+        KEXPECT_FALSE(failed.owner.unpublished_teardown_in_progress.load());
+        KEXPECT_NULL(failed.owner.pending_process_reservations);
         KEXPECT_EQ(threading::get_active_thread_count(), THREADS);
     }
     KEXPECT_EQ(pid_ns::live_namespace_count(), PIDS);

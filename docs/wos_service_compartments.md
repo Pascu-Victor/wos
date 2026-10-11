@@ -1101,7 +1101,8 @@ The input guard covers Task allocation/reclaim and failure releases until the
 child slot owns the File and kernel stack. A fresh default Task then initializes
 its name and pagemap through a recoverable skeleton. The separate may-fail
 pagemap API preserves the existing table pool and default allocator behavior.
-Child-owned exec scratch holds main parser tables and lazy staging before reads;
+Child-owned exec scratch holds main parser tables, copied launch arguments and
+interpreter File/metadata/bytes before reads;
 unpublished teardown retires this scratch before anchors, Files and user memory.
 The native builder obtains a stable executable lease, checks fresh size/execute
 permission, and attaches buffered bytes directly to the owned child before I/O.
@@ -1110,7 +1111,7 @@ Its short lease-cloning guard covers temporary backend owners as well.
 Small dynamic and static images use a complete source bounded at 8MiB. Larger
 dynamic images keep bounded metadata and lazy loading. A static fallback above
 8MiB returns E2BIG; name/pagemap/scratch/buffer allocation refusal is recoverable.
-The existing Host builder, PROCESS constructor, interpreter behavior and Task
+The existing Host builder, PROCESS constructor, Host interpreter behavior and Task
 member layout remain preserved. These are internal API changes, not syscall,
 libc or WKI wire changes.
 
@@ -1149,14 +1150,40 @@ Normal Build WOS, isolated fast diagnostics,44 focused Host checks, formatting/
 tidy and52 complete-source preservation/ownership checks pass. Four proven
 inactive disposable images were pruned; no completed-run VM disks are retained.
 
+Checkpoint28 prepares native PT_INTERP directly through the child's native
+TMPFS path and admitted credential. Its actual stable File and compact metadata
+or complete bytes belong to child recovery; complete fallback is bounded at 8MiB.
+The executor guard defers fatal abandonment over interpreter VFS/loader locals
+and potentially blocking scratch retirement. Ordinary Host interpreter/cache
+behavior is unchanged.
+
+Optional `NativeProcessArguments` supplies stable kernel path/argv/envp views.
+Capture precedes image reads and rejects relative paths, embedded NUL, paths of
+512 bytes or more, vectors above 256 entries and combined strings/pointers above
+2MiB. Child-owned arrays/arena survive partial preparation. The mapped initial
+stack contains argc, argv/envp sentinels, main ENTRY/PHDR, optional interpreter
+BASE, credential IDs/AT_SECURE, stable EXECFN and 16 entropy bytes. Writes use
+the actual child pagemap and stack policy; rsp is 16-byte aligned and registers
+publish only after completion. Null arguments remain an image-only internal
+option; this is not a public launcher or scheduled service qualification.
+
+KTEST51 passed 85,923 assertions/0 failures/1,368 cases/all 117 mandatory, 122
+stable pins (120 distinct paths), and normal poweroff. Four new cases cover
+multi-page copied arguments and empty vectors, static/small/sparse interpreter
+stacks, nonroot IDs/groups and explicitly inherited sealed journal grants,
+four partial allocation refusals, transferred interpreter/stack recovery and
+invalid argument refusals with File/mount/thread/namespace/population baselines.
+Normal Build WOS, isolated fast diagnostics, 44 Host tests, format/tidy and 56
+preservation checks pass. KTEST50 was stopped after a fixture supplied the journal
+grant without its required ceiling; only that fixture was corrected before 51.
+Eight proven inactive disposable images from both runs were pruned; final usage 0.
+
 Public creation remains disabled. Live creator capture/revalidation, bounded
 root population/import/non-root ownership, explicit FD/shared mapping manifests,
-init/job/parent and atomic publication, and a real argc/argv/envp/auxv initial
-stack remain required. Main metadata recovery and recoverable native skeleton
-allocation are implemented; the existing interpreter reader still has local
-File/buffer ownership across reads that requires tracked preparation before
-public use. Other existing construction/image allocation paths are not covered
-by the five new fault points. SYS_DEBUG and global service-resource reads also
+init/job/parent and atomic publication remain required. Other existing image/
+construction allocation paths and actual scheduled fatal races are not covered
+by these nine targeted allocation refusals or transferred recovery hooks.
+SYS_DEBUG and global service-resource reads also
 need explicit private-view policy alongside the remaining global/device/swap/
 perf/WKI census. The current129 credential source calls still have24 failures.
 No scheduled service, shared-futex, two-hour or1,000 full lifecycle claim follows

@@ -1576,20 +1576,25 @@ class ExecRequestArguments {
     uint32_t remote_proxy_id{};
     bool remote_worker_committed{};
 
-    // Memory-only scratch for each recursive native loader invocation. Persistent
-    // executable bytes leave prepared_elf through take_task_metadata(); File,
-    // pagemap and Thread ownership belong to the image transaction separately.
+    // Scratch for each recursive native loader invocation. Persistent executable
+    // bytes leave prepared_elf through take_task_metadata(); pagemap/Thread belong
+    // to the image transaction. Native construction also owns its interpreter
+    // File here; ordinary exec keeps that File in its existing transaction.
     struct NativeScratch {
         PreparedFileBackedElf prepared_elf;
         PreparedFileBackedElf prepared_interp;
         uint8_t* interp_buf{};
+        vfs::File* interp_file{};
         loader::elf::ElfLazyLoadRangeVec main_lazy_ranges;
         loader::elf::ElfLazyLoadRangeVec interp_lazy_ranges;
         uint64_t* argv_addrs{};
         uint64_t* envp_addrs{};
+        size_t argv_count{};
+        size_t envp_count{};
         void reset_interp_storage() {
             prepared_interp.reset();
             delete[] std::exchange(interp_buf, nullptr);
+            if (auto* file = std::exchange(interp_file, nullptr); file != nullptr) vfs::vfs_put_file(file);
         }
         ~NativeScratch() {
             reset_interp_storage();
@@ -3552,6 +3557,231 @@ auto exec_selftest_native_construction_scratch_destructions() -> uint32_t { retu
 #endif
 
 namespace {
+// Defers fatal stack abandonment, without holding a lock or disabling IRQs.
+// Private construction's sole executor owns the recovery slot throughout.
+class NativeConstructionExecutorGuard {
+   public:
+    explicit NativeConstructionExecutorGuard(mod::sched::task::Task& owner) : m_owner(&owner) {
+        bool expected = false;
+        m_acquired = owner.unpublished_teardown_in_progress.compare_exchange_strong(expected, true, std::memory_order_acq_rel);
+    }
+    ~NativeConstructionExecutorGuard() {
+        if (m_acquired) m_owner->unpublished_teardown_in_progress.store(false, std::memory_order_release);
+    }
+    NativeConstructionExecutorGuard(const NativeConstructionExecutorGuard&) = delete;
+    auto operator=(const NativeConstructionExecutorGuard&) -> NativeConstructionExecutorGuard& = delete;
+    [[nodiscard]] auto acquired() const -> bool { return m_acquired; }
+
+   private:
+    mod::sched::task::Task* m_owner;
+    bool m_acquired{};
+};
+
+auto capture_native_arguments(const NativeProcessArguments* input, ExecRequestArguments& request,
+                              ExecRequestArguments::NativeScratch& scratch) -> int {
+    if (input == nullptr) return 0;
+    auto const PATH = input->executable_path;
+    if (PATH.empty() || PATH.data() == nullptr || PATH.front() != '/' || PATH.size() >= EXEC_PATH_MAX ||
+        std::memchr(PATH.data(), '\0', PATH.size()) != nullptr)
+        return -EINVAL;
+    constexpr size_t COUNT_MAX = 256;
+    if (input->argv.size() > COUNT_MAX || input->envp.size() > COUNT_MAX) return -E2BIG;
+    if ((!input->argv.empty() && input->argv.data() == nullptr) || (!input->envp.empty() && input->envp.data() == nullptr)) return -EINVAL;
+    size_t budget = (input->argv.size() + input->envp.size() + 2) * sizeof(uint64_t);
+    size_t bytes = 0;
+    for (auto const vector : {input->argv, input->envp}) {
+        for (auto const text : vector) {
+            if (text.size() >= EXEC_ARG_BYTES_MAX - budget) return -E2BIG;
+            if (!text.empty() && (text.data() == nullptr || std::memchr(text.data(), '\0', text.size()) != nullptr)) return -EINVAL;
+            budget += text.size() + 1;
+            bytes += text.size() + 1;
+        }
+    }
+    auto& snapshot = request.snapshot;
+    std::memcpy(snapshot.path.data(), PATH.data(), PATH.size());
+    snapshot.argv = new (std::nothrow) const char*[input->argv.size() + 1]{};
+    if (snapshot.argv == nullptr) return -ENOMEM;
+#ifdef WOS_SELFTEST
+    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::ARGUMENT_POINTERS)) return -ENOMEM;
+#endif
+    snapshot.envp = new (std::nothrow) const char*[input->envp.size() + 1]{};
+    if (snapshot.envp == nullptr) return -ENOMEM;
+#ifdef WOS_SELFTEST
+    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::ARGUMENT_ARENA)) return -ENOMEM;
+#endif
+    snapshot.strings = new (std::nothrow) char[bytes != 0 ? bytes : 1];
+    if (snapshot.strings == nullptr) return -ENOMEM;
+    char* cursor = snapshot.strings;
+    auto copy = [&](std::span<const std::string_view> source, const char** destination) {
+        for (size_t i = 0; i < source.size(); ++i) {
+            destination[i] = cursor;
+            if (!source[i].empty()) std::memcpy(cursor, source[i].data(), source[i].size());
+            cursor[source[i].size()] = '\0';
+            cursor += source[i].size() + 1;
+        }
+    };
+    copy(input->argv, snapshot.argv);
+    copy(input->envp, snapshot.envp);
+    snapshot.strings_used = bytes;
+    snapshot.budget_used = budget;
+    scratch.argv_count = input->argv.size();
+    scratch.envp_count = input->envp.size();
+    return 0;
+}
+
+auto prepare_native_interpreter(mod::sched::task::Task& child, ExecRequestArguments::NativeScratch& scratch) -> int {
+    if (child.pending_interp_path.front() == '\0') return 0;
+    if (mod::security::compartment::remote_namespace_admission(&child) != -ENOTSUP) return -EIDRM;
+    auto const CREDENTIALS = child.credentials();
+    int result = vfs::vfs_open_file_as(child, CREDENTIALS, child.pending_interp_path.data(), 0, &scratch.interp_file);
+    if (result != 0) return result;
+    if (scratch.interp_file == nullptr || scratch.interp_file->fops != vfs::tmpfs::get_tmpfs_fops() || scratch.interp_file->is_directory)
+        return -ENOTSUP;
+    result = vfs::vfs_stabilize_exec_file(&scratch.interp_file);
+    if (result != 0) return result;
+    vfs::Stat stat{};
+    result = vfs::vfs_fstat_file(scratch.interp_file, &stat);
+    if (result != 0) return result;
+    result = check_exec_permission_from_stat(CREDENTIALS, stat);
+    if (result != 0) return result;
+    if (stat.st_size <= 0) return -ENOEXEC;
+    auto const SIZE = static_cast<size_t>(stat.st_size);
+    auto& prepared = scratch.prepared_interp;
+    auto const PREPARED = prepare_file_backed_elf(scratch.interp_file, SIZE, prepared, mod::mm::user_layout::ImageRole::INTERPRETER);
+    if (PREPARED == PrepareFileBackedElfResult::OUT_OF_MEMORY) return -ENOMEM;
+    if (PREPARED == PrepareFileBackedElfResult::IO_ERROR) return prepared.read_context.error != 0 ? prepared.read_context.error : -EIO;
+    if (PREPARED == PrepareFileBackedElfResult::INVALID) return -ENOEXEC;
+    if (PREPARED != PrepareFileBackedElfResult::READY) {
+        constexpr size_t BUFFERED_IMAGE_MAX = 8 * 1024 * 1024;
+        if (SIZE > BUFFERED_IMAGE_MAX) return -E2BIG;
+        prepared.reset();
+#ifdef WOS_SELFTEST
+        if (exec_selftest_take_native_construction_fault(NativeConstructionFault::INTERPRETER_BUFFER)) return -ENOMEM;
+#endif
+        scratch.interp_buf = new (std::nothrow) uint8_t[SIZE];
+        if (scratch.interp_buf == nullptr) return -ENOMEM;
+        int read_error = 0;
+        if (!read_exec_file_exact(scratch.interp_file, SIZE, 0, scratch.interp_buf, SIZE, &read_error))
+            return read_error != 0 ? read_error : -EIO;
+    }
+    loader::elf::ElfLoadOptions const OPTIONS{
+        .register_special_symbols = false,
+        .base_address = 0,
+        .lazy_file_ranges = nullptr,
+        .debug_registry_pid = 0,
+        .image_role = mod::mm::user_layout::ImageRole::INTERPRETER,
+        .policy_owner = &child,
+    };
+    auto const IMAGE = PREPARED == PrepareFileBackedElfResult::READY
+                           ? loader::elf::load_elf(prepared.view, child.pagemap, child.pid, "ld.so", OPTIONS)
+                           : loader::elf::load_elf(scratch.interp_buf, SIZE, child.pagemap, child.pid, "ld.so", OPTIONS);
+    if (IMAGE.entry_point == 0) return prepared.read_context.error != 0 ? prepared.read_context.error : -ENOEXEC;
+    child.context.frame.rip = IMAGE.entry_point;
+    child.interp_base = IMAGE.load_base;
+    child.interp_vaddr_start = IMAGE.image_start;
+    child.interp_vaddr_end = IMAGE.image_end;
+    child.pending_interp_path.fill('\0');
+    (void)mod::sched::resource::observe_address_space(child);
+    return 0;
+}
+
+auto prepare_native_stack(mod::sched::task::Task& child, const ExecArgumentsSnapshot& snapshot,
+                          ExecRequestArguments::NativeScratch& scratch) -> int {
+    if (snapshot.path.front() == '\0') return 0;
+    auto* thread = child.thread;
+    if (thread == nullptr || child.pagemap == nullptr || thread->stack <= thread->stack_base_virt) return -EINVAL;
+    uint64_t const TOP = thread->stack;
+    uint64_t const CAPACITY = TOP - thread->stack_base_virt;
+    uint64_t offset = 0;
+    int error = 0;
+    auto push = [&](const void* data, size_t bytes) -> uint64_t {
+        if (offset > CAPACITY || bytes > CAPACITY - offset) {
+            error = -E2BIG;
+            return 0;
+        }
+        uint64_t const ADDRESS = TOP - offset - bytes;
+        if (!mod::sched::threading::ensure_stack_backing(thread, child.pagemap, ADDRESS, ADDRESS + bytes, &child)) {
+            error = -ENOMEM;
+            return 0;
+        }
+        auto const* source = static_cast<const uint8_t*>(data);
+        size_t copied = 0;
+        while (copied < bytes) {
+            uint64_t const VIRTUAL = ADDRESS + copied;
+            uint64_t const PHYSICAL = mod::mm::virt::translate(child.pagemap, VIRTUAL);
+            if (PHYSICAL == mod::mm::virt::PADDR_INVALID) {
+                error = -EFAULT;
+                return 0;
+            }
+            size_t const CHUNK = std::min(bytes - copied, mod::mm::paging::PAGE_SIZE - (VIRTUAL % mod::mm::paging::PAGE_SIZE));
+            std::memcpy(mod::mm::addr::get_virt_pointer(PHYSICAL), source + copied, CHUNK);
+            copied += CHUNK;
+        }
+        offset += bytes;
+        return ADDRESS;
+    };
+    scratch.argv_addrs = new (std::nothrow) uint64_t[scratch.argv_count + 1]{};
+    if (scratch.argv_addrs == nullptr) return -ENOMEM;
+#ifdef WOS_SELFTEST
+    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::STACK_ADDRESSES)) return -ENOMEM;
+#endif
+    scratch.envp_addrs = new (std::nothrow) uint64_t[scratch.envp_count + 1]{};
+    if (scratch.envp_addrs == nullptr) return -ENOMEM;
+    for (size_t i = 0; i < scratch.argv_count; ++i) {
+        scratch.argv_addrs[i] = push(snapshot.argv[i], std::strlen(snapshot.argv[i]) + 1);
+        if (error != 0) return error;
+    }
+    for (size_t i = 0; i < scratch.envp_count; ++i) {
+        scratch.envp_addrs[i] = push(snapshot.envp[i], std::strlen(snapshot.envp[i]) + 1);
+        if (error != 0) return error;
+    }
+    uint64_t const EXECFN = push(snapshot.path.data(), std::strlen(snapshot.path.data()) + 1);
+    if (error != 0) return error;
+    std::array<uint8_t, AT_RANDOM_BYTES> random{};
+    if (!mod::random::entropy::get_bytes(random.data(), random.size())) return -EIO;
+    uint64_t const RANDOM = push(random.data(), random.size());
+    std::memset(random.data(), 0, random.size());
+    if (error != 0) return error;
+    constexpr size_t AUXV_WORDS = 18 + mod::security::exec_policy::IDENTITY_AUXV_WORDS;
+    std::array<uint64_t, AUXV_WORDS> auxv{};
+    size_t words = 0;
+    auto pair = [&](uint64_t key, uint64_t value) {
+        auxv.at(words++) = key;
+        auxv.at(words++) = value;
+    };
+    pair(6, mod::mm::paging::PAGE_SIZE);
+    pair(9, child.entry);
+    pair(3, child.program_header_addr);
+    pair(4, child.program_header_ent_size);
+    pair(5, child.program_header_count);
+    if (child.interp_base != 0) pair(7, child.interp_base);
+    pair(25, RANDOM);
+    pair(31, EXECFN);
+    for (auto const value : mod::security::exec_policy::identity_auxv(child.credentials())) auxv.at(words++) = value;
+    pair(0, 0);
+    // Align the completed argc/argv/envp/auxv area, including its parity.
+    offset += (TOP - offset) % 16;
+    size_t const STRUCTURED_WORDS = words + scratch.argv_count + scratch.envp_count + 3;
+    if ((STRUCTURED_WORDS % 2) != 0) offset += sizeof(uint64_t);
+    if (offset > CAPACITY || STRUCTURED_WORDS > (CAPACITY - offset) / sizeof(uint64_t)) return -E2BIG;
+    push(auxv.data(), words * sizeof(uint64_t));
+    if (error != 0) return error;
+    uint64_t const ENVP = push(scratch.envp_addrs, (scratch.envp_count + 1) * sizeof(uint64_t));
+    if (error != 0) return error;
+    uint64_t const ARGV = push(scratch.argv_addrs, (scratch.argv_count + 1) * sizeof(uint64_t));
+    if (error != 0) return error;
+    uint64_t const ARGC = scratch.argv_count;
+    uint64_t const RSP = push(&ARGC, sizeof(ARGC));
+    if (error != 0) return error;
+    child.at_random_addr = RANDOM;
+    child.context.frame.rsp = RSP;
+    child.context.regs.rdi = ARGC;
+    child.context.regs.rsi = ARGV;
+    child.context.regs.rdx = ENVP;
+    (void)mod::sched::resource::observe_address_space(child);
+    return 0;
+}
+
 auto create_native_process_task_impl(mod::sched::task::Task* owner, const NativeProcessContext& context, const char* name,
                                      vfs::File* owned_file, size_t file_size, const vfs::Stat& file_stat, uint64_t kernel_rsp,
                                      const mod::sched::resource::State& resources, const mod::security::Snapshot& credentials,
@@ -3637,13 +3867,29 @@ auto create_native_process_task_impl(mod::sched::task::Task* owner, const Native
 #ifdef WOS_SELFTEST
     if (exec_selftest_take_native_construction_fault(NativeConstructionFault::SCRATCH)) return abort_child(-ENOMEM);
 #endif
-    std::unique_ptr<ExecRequestArguments> pending(new (std::nothrow) ExecRequestArguments);
-    if (!pending) return abort_child(-ENOMEM);
+    ExecRequestArguments* request = nullptr;
+    ExecRequestArguments::NativeScratch* scratch = nullptr;
+    int arguments_error = 0;
+    {
+        NativeConstructionExecutorGuard guard(*owner);
+        if (!guard.acquired()) {
+            arguments_error = -EBUSY;
+        } else {
+            std::unique_ptr<ExecRequestArguments> pending(new (std::nothrow) ExecRequestArguments);
+            if (!pending) {
+                arguments_error = -ENOMEM;
+            } else {
 #ifdef WOS_SELFTEST
-    pending->selftest_destructions = &g_native_construction_scratch_destructions;
+                pending->selftest_destructions = &g_native_construction_scratch_destructions;
 #endif
-    auto* scratch = pending->native_scratch(0);
-    if (!adopt_exec_arguments(*child, pending)) return abort_child(-EBUSY);
+                request = pending.get();
+                scratch = request->native_scratch(0);
+                arguments_error =
+                    adopt_exec_arguments(*child, pending) ? capture_native_arguments(context.arguments, *request, *scratch) : -EBUSY;
+            }
+        }
+    }
+    if (arguments_error != 0) return abort_child(arguments_error);
     // Memory-only parser tables and lazy staging now survive an abandoned stack
     // inside the exclusively owned child, alongside its File/stack/pagemap.
     auto& prepared = scratch->prepared_elf;
@@ -3692,11 +3938,39 @@ auto create_native_process_task_impl(mod::sched::task::Task* owner, const Native
         initialized = child->initialize_process_image(child->elf_buffer, file_size);
     }
     if (!initialized) return abort_child(-ENOEXEC);
-    int interpreter_error = 0;
-    if (!mod::sched::task::complete_unpublished_process_construction(child, &interpreter_error, owner, false))
-        return abort_child(interpreter_error != 0 ? interpreter_error : -ENOEXEC);
+    auto guarded = [&](auto&& operation) -> int {
+        NativeConstructionExecutorGuard guard(*owner);
+        if (!guard.acquired()) return -EBUSY;
+        return operation();
+    };
+    if (int const ERROR = guarded([&] { return prepare_native_interpreter(*child, *scratch); }); ERROR != 0) return abort_child(ERROR);
+#ifdef WOS_SELFTEST
+    auto recover_if_requested = [&](NativeConstructionFault fault) -> bool {
+        if (!exec_selftest_take_native_construction_fault(fault)) return false;
+        auto* recovered = mod::sched::task::take_unpublished_process(owner);
+        if (recovered != child || !mod::sched::task::destroy_unpublished_process(recovered)) [[unlikely]] {
+            mod::dbg::panic_handler("native launch: transferred recovery failed");
+            hcf();
+        }
+        if (construction_error != nullptr) *construction_error = -ECANCELED;
+        return true;
+    };
+    if (recover_if_requested(NativeConstructionFault::RECOVERY_INTERPRETER_READ)) return nullptr;
+#endif
+    if (int const ERROR = guarded([&] { return prepare_native_stack(*child, request->snapshot, *scratch); }); ERROR != 0)
+        return abort_child(ERROR);
+#ifdef WOS_SELFTEST
+    if (recover_if_requested(NativeConstructionFault::RECOVERY_STACK_BUILT)) return nullptr;
+#endif
     if (mod::security::compartment::remote_namespace_admission(child) != -ENOTSUP) return abort_child(-EIDRM);
-    cleanup_exec_preparation(*child);
+    // Interpreter File release can block; keep the executing owner protected
+    // until the child-owned scratch has retired completely.
+    if (int const ERROR = guarded([&] {
+            cleanup_exec_preparation(*child);
+            return 0;
+        });
+        ERROR != 0)
+        return abort_child(ERROR);
     return child;
 }
 

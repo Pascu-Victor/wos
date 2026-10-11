@@ -303,7 +303,7 @@ struct Task {
     Task(const Task& task) = delete;
 
     // Default constructor - leaves all fields zero/default-initialized.
-    // Used only by createUserThread; callers must fill in all required fields.
+    // Thread and recoverable unpublished-process builders fill required fields.
     Task() = default;
 
     struct SigHandler {

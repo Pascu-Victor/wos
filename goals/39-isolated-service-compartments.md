@@ -490,3 +490,36 @@ FD/shared mapping grants, local init/job/parent and atomic publication remain
 required, alongside complete global policies and full service campaigns. Keep
 the authorized --no-setup workflow,20GiB disposable/40GiB free floor and exact
 owned inactive-image pruning after every outcome. No autonomous pause or push.
+
+## Checkpoint28: native interpreter and initial stack (2026-10-11)
+
+The private builder now owns its actual interpreter File, compact metadata or
+bounded bytes in child recovery, and maps it with the child's admitted policy.
+Stable kernel arguments are copied before image reads: absolute path below512
+bytes, at most256 entries per vector, combined2MiB strings/pointers. The real
+mapped argc/argv/envp/auxv stack includes main ENTRY/PHDR, interpreter BASE,
+credential IDs/AT_SECURE, EXECFN and entropy with16-byte aligned rsp. Registers
+publish after complete stack writes. Executor guards protect interpreter loader
+locals and blocking scratch retirement. Host bodies, Task layout and ABI remain
+unchanged. Null arguments still prepare only an image; public creation is disabled.
+
+Normal Build WOS, isolated fast diagnostics,44 Host tests, format/tidy and56
+preservation checks PASS. Rootless --no-setup KTEST51 PASS85,923 assertions/0
+failures/1,368 cases/all117 mandatory/122 stable pins (120 distinct paths), normal
+poweroff. New cases exercise actual multi-page/empty stacks, small/static/sparse
+interpreters, nonroot/secure identity, four partial allocation failures and
+transferred launch recovery. KTEST50's grant fixture lacked its required ceiling;
+the exact-owned failed VM was stopped, evidence retained, and only the fixture
+corrected before51. Eight inactive disposable images pruned456,359,936allocatedB;
+final0, unrelated user VM preserved. All129 current credential/VFS source calls
+were run again and still have24 failures. Checkpoint audit passes; full regression
+and all ten goal criteria remain INCOMPLETE.
+
+Goal39 remains ACTIVE. No pause requested or performed. Continue actual live
+creator capture/revalidation, owned root population/import/nonroot provisioning,
+explicit FD/shared mappings, init/jobs/parent/atomic publication and a bounded
+versioned launcher/spec; complete global consumer policy and the actual hostile,
+two-hour service/1000 lifecycle/Host/init/libc campaigns. Read-only next-step
+reconnaissance is recorded in goals/progress/39. Keep rootless --no-setup,
+one active topology,20GiB disposable/40GiB free,COW/reflink and exact owned
+inactive pruning after every outcome. No push.

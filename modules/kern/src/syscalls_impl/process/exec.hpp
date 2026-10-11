@@ -7,6 +7,8 @@
 #include <platform/asm/cpu.hpp>
 #include <platform/sched/ipc_namespace.hpp>
 #include <platform/sched/pid_namespace.hpp>
+#include <span>
+#include <string_view>
 #include <vfs/mount_namespace.hpp>
 
 namespace ker::mod::sched::task {
@@ -63,6 +65,15 @@ auto create_file_backed_process_task(const char* name, ker::vfs::File* owned_fil
                                      ker::mod::sched::resource::State* failure_observations = nullptr, int* interpreter_error = nullptr)
     -> ker::mod::sched::task::Task*;
 
+// Stable kernel memory only, copied into child recovery before image reads.
+// Vectors have at most 256 entries each and share the ordinary 2MiB argument
+// strings/pointer budget. Path is absolute, below 512 bytes; embedded NULs fail.
+struct NativeProcessArguments {
+    std::string_view executable_path;
+    std::span<const std::string_view> argv;
+    std::span<const std::string_view> envp;
+};
+
 // Internal admitted native construction context, never a userspace join handle.
 // The caller retains this preparation throughout the call. All three scopes
 // must be private and open; the filesystem must belong to the exact mount view.
@@ -71,6 +82,8 @@ struct NativeProcessContext {
     ker::vfs::mount_ns::NamespaceRef mounts;
     ker::mod::sched::pid_ns::NamespaceRef pids;
     const ker::vfs::PreparedFilesystemContext* filesystem = nullptr;
+    // Null prepares an image only; a runnable launcher must supply arguments.
+    const NativeProcessArguments* arguments = nullptr;
 };
 
 // Consuming native builder with an explicit retained executor. Small/static
@@ -88,7 +101,21 @@ auto create_file_backed_process_task_for_owner(ker::mod::sched::task::Task* owne
                                                int* construction_error = nullptr) -> ker::mod::sched::task::Task*;
 
 #ifdef WOS_SELFTEST
-enum class NativeConstructionFault : uint8_t { NONE, TASK, NAME, PAGEMAP, SCRATCH, BUFFER, RECOVERY_AFTER_READ };
+enum class NativeConstructionFault : uint8_t {
+    NONE,
+    TASK,
+    NAME,
+    PAGEMAP,
+    SCRATCH,
+    BUFFER,
+    RECOVERY_AFTER_READ,
+    ARGUMENT_POINTERS,
+    ARGUMENT_ARENA,
+    INTERPRETER_BUFFER,
+    STACK_ADDRESSES,
+    RECOVERY_INTERPRETER_READ,
+    RECOVERY_STACK_BUILT
+};
 void exec_selftest_fail_native_construction_once(NativeConstructionFault fault);
 auto exec_selftest_take_native_construction_fault(NativeConstructionFault fault) -> bool;
 auto exec_selftest_native_construction_scratch_destructions() -> uint32_t;
