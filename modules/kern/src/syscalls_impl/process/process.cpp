@@ -14,6 +14,7 @@
 #include <platform/sched/resource_as.hpp>
 #include <platform/sched/session.hpp>
 #include <platform/security/authorization.hpp>
+#include <platform/security/compartment_host.hpp>
 #include <platform/security/compartment_wki.hpp>
 #include <platform/sys/mutex.hpp>
 #include <utility>
@@ -1937,6 +1938,31 @@ auto wos_proc_getpriority(int which, int64_t who) -> uint64_t {
 
 }  // namespace
 
+auto set_hostname_for_subject(ker::mod::sched::task::Task* task, uint64_t name_addr, size_t len) -> uint64_t {
+    if (task == nullptr) {
+        return static_cast<uint64_t>(-ESRCH);
+    }
+    int const SCOPE = ker::mod::security::compartment::host_namespace_admission(task);
+    if (SCOPE != 0) return static_cast<uint64_t>(SCOPE);
+    auto const CREDENTIALS = task->credentials();
+    int const AUTHORIZATION = ker::mod::security::authorize_hostname_change(CREDENTIALS);
+    if (AUTHORIZATION != 0) {
+        return static_cast<uint64_t>(AUTHORIZATION);
+    }
+    if (name_addr == 0) {
+        return static_cast<uint64_t>(-EFAULT);
+    }
+    if (len == 0 || len >= ker::util::hostname::HOSTNAME_MAX) {
+        return static_cast<uint64_t>(-EINVAL);
+    }
+    std::array<char, ker::util::hostname::HOSTNAME_MAX> name{};
+    if (!ker::mod::sys::usercopy::copy_from_task(*task, name_addr, name.data(), len)) {
+        return static_cast<uint64_t>(-EFAULT);
+    }
+    int const R = ker::util::hostname::set(name.data(), len);
+    return (R < 0) ? static_cast<uint64_t>(R) : 0;
+}
+
 auto set_wki_target_for_subject(ker::mod::sched::task::Task* task, uint64_t hostname_addr, size_t len, uint32_t flags) -> uint64_t {
     if (task == nullptr) {
         return static_cast<uint64_t>(-ESRCH);
@@ -3117,28 +3143,7 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             return ker::mod::sys::usercopy::copy_to_task(*task, a2, NAME.data(), LEN + 1) ? 0 : static_cast<uint64_t>(-EFAULT);
         }
         case abi::process::procmgmt_ops::SETHOSTNAME: {
-            auto len = static_cast<size_t>(a3);
-            auto* task = ker::mod::sched::get_current_task();
-            if (task == nullptr) {
-                return static_cast<uint64_t>(-ESRCH);
-            }
-            auto const CREDENTIALS = task->credentials();
-            int const AUTHORIZATION = ker::mod::security::authorize_hostname_change(CREDENTIALS);
-            if (AUTHORIZATION != 0) {
-                return static_cast<uint64_t>(AUTHORIZATION);
-            }
-            if (a2 == 0) {
-                return static_cast<uint64_t>(-EFAULT);
-            }
-            if (len == 0 || len >= ker::util::hostname::HOSTNAME_MAX) {
-                return static_cast<uint64_t>(-EINVAL);
-            }
-            std::array<char, ker::util::hostname::HOSTNAME_MAX> name{};
-            if (!ker::mod::sys::usercopy::copy_from_task(*task, a2, name.data(), len)) {
-                return static_cast<uint64_t>(-EFAULT);
-            }
-            int const R = ker::util::hostname::set(name.data(), len);
-            return (R < 0) ? static_cast<uint64_t>(R) : 0;
+            return set_hostname_for_subject(ker::mod::sched::get_current_task(), a2, static_cast<size_t>(a3));
         }
         case abi::process::procmgmt_ops::SETPRIORITY: {
             return wos_proc_setpriority(static_cast<int>(a2), static_cast<int64_t>(a3), static_cast<int>(a4));

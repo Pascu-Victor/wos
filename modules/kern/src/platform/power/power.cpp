@@ -18,6 +18,7 @@
 #include <platform/ktime/ktime.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/security/compartment_host.hpp>
 #include <platform/smt/smt.hpp>
 #include <vfs/vfs.hpp>
 
@@ -61,11 +62,13 @@ auto count_shutdown_targets(uint64_t excluded_pid, uint64_t excluded_owner_pid) 
     return sched::signal_visible_processes_except(excluded_pid, excluded_owner_pid, 0);
 }
 
-auto authorize_current_power() -> int {
-    auto* task = sched::get_current_task();
+auto authorize_current_power(const sched::task::Task* subject) -> int {
+    auto const* task = subject;
     if (task == nullptr) {
         return -ESRCH;
     }
+    int const SCOPE = security::compartment::host_namespace_admission(task);
+    if (SCOPE != 0) return SCOPE;
     if (!task->credentials().allows(ker::mod::security::Authority::POWER)) {
         return -EPERM;
     }
@@ -249,8 +252,10 @@ auto shutdown_in_progress() -> bool { return g_phase.load(std::memory_order_acqu
 
 auto shutdown_phase() -> ShutdownPhase { return g_phase.load(std::memory_order_acquire); }
 
-auto prepare_shutdown() -> int {
-    int const AUTHORITY_RET = authorize_current_power();
+namespace {
+
+auto prepare_shutdown(sched::task::Task* subject) -> int {
+    int const AUTHORITY_RET = authorize_current_power(subject);
     if (AUTHORITY_RET != 0) {
         return AUTHORITY_RET;
     }
@@ -275,13 +280,16 @@ auto prepare_shutdown() -> int {
     return 0;
 }
 
-auto begin_reboot_command(uint64_t cmd) -> int {
+auto begin_reboot_command(sched::task::Task* subject, uint64_t cmd, bool current_subject) -> int {
     ShutdownAction action = ShutdownAction::NONE;
     int const PARSE_RET = command_to_action(cmd, action);
     if (PARSE_RET < 0) {
         return PARSE_RET;
     }
-    int const AUTHORITY_RET = authorize_current_power();
+    // Invalid commands must not observe scheduler state, even before boot has
+    // established run queues. Diagnostic subjects never fall back to current.
+    if (current_subject) subject = sched::get_current_task();
+    int const AUTHORITY_RET = authorize_current_power(subject);
     if (AUTHORITY_RET != 0) {
         return AUTHORITY_RET;
     }
@@ -310,7 +318,19 @@ auto begin_reboot_command(uint64_t cmd) -> int {
     run_finalizer(action);
 }
 
+}  // namespace
+
+auto prepare_shutdown() -> int { return prepare_shutdown(sched::get_current_task()); }
+
+auto begin_reboot_command(uint64_t cmd) -> int { return begin_reboot_command(nullptr, cmd, true); }
+
 #ifdef WOS_SELFTEST
+auto selftest_prepare_shutdown_for_subject(sched::task::Task* subject) -> int { return prepare_shutdown(subject); }
+
+auto selftest_begin_reboot_for_subject(sched::task::Task* subject, uint64_t cmd) -> int {
+    return begin_reboot_command(subject, cmd, false);
+}
+
 [[noreturn]] void selftest_shutdown() {
     g_action.store(ShutdownAction::POWEROFF, std::memory_order_release);
     run_finalizer(ShutdownAction::POWEROFF);

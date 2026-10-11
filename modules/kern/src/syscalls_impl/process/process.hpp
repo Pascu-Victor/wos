@@ -29,6 +29,9 @@ namespace ker::syscall::process {
 auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, ker::mod::cpu::GPRegs& gpr)
     -> uint64_t;
 auto personality(uint64_t persona) -> uint64_t;
+// Borrow the executor; Host-wide publication requires its canonical Host views
+// and existing immutable credential authority before any user pointer access.
+auto set_hostname_for_subject(ker::mod::sched::task::Task* task, uint64_t name_addr, size_t len) -> uint64_t;
 // Runtime mask mutation serializes with exec publication and refuses workers
 // still retiring from an older process image. Returns old mask or -errno.
 auto set_creation_mask(ker::mod::sched::task::Task& subject, uint32_t mask) -> int;

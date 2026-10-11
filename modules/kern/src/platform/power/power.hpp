@@ -2,6 +2,12 @@
 
 #include <cstdint>
 
+#ifdef WOS_SELFTEST
+namespace ker::mod::sched::task {
+struct Task;
+}
+#endif
+
 namespace ker::mod::power {
 
 // NOLINTNEXTLINE(performance-enum-size)
@@ -31,6 +37,10 @@ enum class ShutdownPhase : uint64_t {
 // IF may be clear; an accepted non-returning finalizer enables completion IRQs.
 [[nodiscard]] auto begin_reboot_command(uint64_t cmd) -> int;
 #ifdef WOS_SELFTEST
+// Borrow an unpublished diagnostic subject; share ordinary authorization and
+// effect implementations without replacing the executing scheduler context.
+[[nodiscard]] auto selftest_prepare_shutdown_for_subject(sched::task::Task* subject) -> int;
+[[nodiscard]] auto selftest_begin_reboot_for_subject(sched::task::Task* subject, uint64_t cmd) -> int;
 [[noreturn]] void selftest_poweroff();
 // Task-context live diagnostics use the ordinary finalizer, including VFS and
 // driver retirement. No userspace entrypoint or authority bypass is exposed.

@@ -384,3 +384,28 @@ controls/routing/positive selectors, public native construction and required
 service campaigns. Authorized bin/wos-cluster --no-setup and isolated
 bin/wos-ktest --no-setup persist with the bounded SSD policy and cleanup after
 successful and failed tests. No pause requested or performed.
+
+
+### Checkpoint24 — Host hostname/power admission (2026-10-11)
+
+Exact canonical Host PID/mount/IPC views and existing authority now precede
+hostname publication and power prepare/reboot effects. PrivateRoot/Sharednetwork
+refuses EPERM, unknownESRCH/closedEIDRM; invalidcommandEINVAL remains before
+scheduler retrieval. Actual shared bodies, mapped inputs/canonical threads and
+Host harmless/error validation preserve hostname/phase/resources/refs; Host/trusted
+backends and Task/File/ABI/wire unchanged. Public creation remains disabled.
+
+Final Normal Build WOS, isolatedfastdiagnostics, formatting/tidy,44focusedHost
+checks and71mechanicalpreservation checks PASS. Actual rootlessKTEST41 PASS
+83,682assertions/0failures/1,353cases/all102mandatory/88stablepins/normalpoweroff.
+Nonfinal40passed, revieworderingfix repeatedallfinalvalidation; exact40source
+reconstructedfromparent+patch/hash andtempremoved. Eightinactiveimagesacross40/41
+verified/pruned520,257,536B,peak260,128,768B/final0, unrelateduserVMpreserved.
+Broadercurrent129credential/VFSoraclecalls still24FAIL/unqualified; nofullHost
+claim. See docs/wos_service_compartments.md and progress39/evidence audit24.
+Authorized bin/wos-cluster --no-setup / bin/wos-ktest --no-setup persist; oneactive
+20GiBdisposable/40GiBfree topology, immutablebases+COW/reflink, exactliveownership/
+backing audit andpruningafterPASS/FAIL/exception; retain smallreceipts, notoldVMs.
+Goal39 ACTIVE, alltenfullcriteriaINCOMPLETE. Continue routing/globaltargets,
+publicconstruction/launcher, actualSHM/sharedfutex/scheduledlifecycle/hostilepaths,
+two2hservice trees+1000fullfailurecycles/allrefs andcompleteHost/init/libcregression.

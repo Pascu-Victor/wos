@@ -1010,6 +1010,41 @@ has 24 baseline oracle failures requiring investigation; it is not qualified by
 the focused passing suite. Full Host regression and all ten goal criteria remain
 incomplete. Failed and passing evidence is retained in the local progress ledger.
 
+## Host hostname and power controls
+
+Host-wide hostname publication and shutdown require the caller's exact canonical
+Host PID, mount and IPC views as well as the existing credential authority.
+Any private view returns EPERM, even with full root authority or explicit shared
+networking. Unknown ownership returns ESRCH; closed ownership returns EIDRM.
+Hostname refusal precedes usercopy and global publication. Shutdown preparation
+and valid reboot commands refuse before phase changes, kernel-thread quiescence
+or finalization. Invalid reboot commands retain EINVAL precedence and do not
+observe current-task state. Host hostname reads, power-state reads, ordinary Host
+validation and effects, and trusted boot/selftest backends remain unchanged.
+No syscall selector, wire format or Task/File layout changes.
+
+Three native cases call the shared production implementations through borrowed
+subjects, covering all seven private view combinations, mapped hostname input,
+retained canonical threads, unknown/closed ownership, dropped root authority and
+nonroot credentials. Host error and harmless-command checks preserve the actual
+hostname and shutdown phase. These remain unpublished fixtures; power subject
+adapters exist only in diagnostic builds.
+
+Final Normal Build WOS, isolated fast KTEST build, formatting/clang-tidy, 44
+focused Host checks and 71 mechanical preservation checks pass. Actual rootless
+KTEST41 passes 83,682 assertions with zero failures across 1,353 cases, all 102
+mandatory checks, normal poweroff and 88 stable runtime pins. The earlier run40
+also passed, but review found an invalid-command/current-task ordering change;
+its exact source was preserved and reconstructed, the ordering restored, and all
+validation repeated on final code. Both runs' eight inactive disposable images
+were audited and pruned. Peak disposable usage was 260,128,768 bytes and final
+usage is zero.
+
+The broader credential/VFS source audit still has 24 failures from 129 current
+oracle calls. It remains unqualified. Routing, other Host controls, public
+construction/launcher and the complete service/lifecycle campaigns still require
+work; all ten full goal criteria remain incomplete.
+
 ## Verification checkpoint
 
 The initial `compartment_policy_test` suite checks actual production preparation

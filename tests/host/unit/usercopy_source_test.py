@@ -303,6 +303,7 @@ def require_process_syscalls_use_usercopy(source: str) -> None:
         "wos_proc_arch_prctl",
         "set_wki_target_for_subject",
         "get_wki_target_for_subject",
+        "set_hostname_for_subject",
     ]:
         body = function_body(source, name)
         if "usercopy::" not in body:
@@ -318,10 +319,13 @@ def require_process_syscalls_use_usercopy(source: str) -> None:
         "copy_value_to_task(*task, a4, IDS.saved)",
         "auto const NAME = ker::util::hostname::snapshot()",
         "copy_to_task(*task, a2, NAME.data(), LEN + 1)",
-        "copy_from_task(*task, a2, name.data(), len)",
+        "set_hostname_for_subject(ker::mod::sched::get_current_task(), a2, static_cast<size_t>(a3))",
     ]:
         if snippet not in process_body:
             fail(f"process syscall dispatch still lacks usercopy snippet: {snippet}")
+    hostname = function_body(source, "set_hostname_for_subject")
+    if "copy_from_task(*task, name_addr, name.data(), len)" not in hostname:
+        fail("hostname publication must retain bounded task usercopy")
 
 
 def require_waitpid_outputs_are_preflighted(source: str) -> None:

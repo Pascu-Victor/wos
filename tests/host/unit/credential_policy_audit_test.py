@@ -191,8 +191,11 @@ def test_control_authorization_precedes_side_effects():
     assert "target->pid != self->pid" not in priority
     getpriority = body_after(process, "auto wos_proc_getpriority(")
     assert getpriority.index("SharedVmemPublicationGuard publication_guard") < getpriority.index("target->sched_nice")
-    hostname = body_after(process, "case abi::process::procmgmt_ops::SETHOSTNAME:")
+    dispatch = body_after(process, "case abi::process::procmgmt_ops::SETHOSTNAME:")
+    assert "set_hostname_for_subject(ker::mod::sched::get_current_task(), a2, static_cast<size_t>(a3))" in dispatch
+    hostname = body_after(process, "auto set_hostname_for_subject(")
     check = hostname.index("authorize_hostname_change(CREDENTIALS)")
+    assert hostname.index("host_namespace_admission(task)") < check
     assert check < hostname.index("copy_from_task") < hostname.index("hostname::set")
     syscall = (ROOT / "modules/kern/src/platform/sys/syscall.cpp").read_text()
     debug = body_after(syscall, "case abi::callnums::DEBUG:")
@@ -200,10 +203,16 @@ def test_control_authorization_precedes_side_effects():
     assert check < debug.index('asm volatile("cli"')
     assert check < debug.index('asm volatile("sti"')
     power = (ROOT / "modules/kern/src/platform/power/power.cpp").read_text()
-    assert "Authority::POWER" in body_after(power, "auto authorize_current_power(")
+    power_authority = body_after(power, "auto authorize_current_power(")
+    assert power_authority.index("host_namespace_admission(task)") < power_authority.index("Authority::POWER")
     for name in ["auto prepare_shutdown(", "auto begin_reboot_command("]:
         operation = body_after(power, name)
-        assert operation.index("authorize_current_power()") < operation.index("g_phase.compare_exchange_weak")
+        assert operation.index("authorize_current_power(subject)") < operation.index("g_phase.compare_exchange_weak")
+    assert "return prepare_shutdown(sched::get_current_task());" in power
+    assert "return begin_reboot_command(nullptr, cmd, true);" in power
+    reboot = body_after(power, "auto begin_reboot_command(")
+    assert reboot.index("return PARSE_RET;") < reboot.index("sched::get_current_task()") < reboot.index("authorize_current_power(subject)")
+    assert "return begin_reboot_command(subject, cmd, false);" in power
 
 
 def test_ptrace_and_dumpability_use_shared_policy():

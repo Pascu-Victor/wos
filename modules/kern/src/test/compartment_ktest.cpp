@@ -1,4 +1,5 @@
 #include <abi/callnums/net.h>
+#include <abi/callnums/power.h>
 
 #include <array>
 #include <cerrno>
@@ -17,6 +18,7 @@
 #include <platform/mm/addr.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
+#include <platform/power/power.hpp>
 #include <platform/sched/compartment_lifecycle.hpp>
 #include <platform/sched/ipc_namespace.hpp>
 #include <platform/sched/pid_namespace.hpp>
@@ -26,6 +28,7 @@
 #include <platform/sched/task.hpp>
 #include <platform/sched/threading.hpp>
 #include <platform/security/authorization.hpp>
+#include <platform/security/compartment_host.hpp>
 #include <platform/security/compartment_wki.hpp>
 #include <platform/security/credentials.hpp>
 #include <platform/sys/usercopy.hpp>
@@ -37,6 +40,7 @@
 #include <syscalls_impl/shm/shm.hpp>
 #include <syscalls_impl/vmem/sys_vmem.hpp>
 #include <test/ktest.hpp>
+#include <util/hostname.hpp>
 #include <vfs/fd_reservation.hpp>
 #include <vfs/filesystem_context.hpp>
 #include <vfs/fs/devfs.hpp>
@@ -5093,5 +5097,157 @@ KTEST(CompartmentWki, CanonicalTargetAdmissionAndHostCopiesKeepExistingOwnership
     KEXPECT_EQ(set_native_target(host.task.get(), 0, SIZE_MAX, Task::WKI_TARGET_FLAG_BALANCED), 0);
     KEXPECT_EQ(host.task->wki_target_hostname.front(), char{0});
     KEXPECT_EQ(host.task->wki_target_flags, Task::WKI_TARGET_FLAG_BALANCED);
+    KEXPECT_EQ(host.task->usercopy_pagemap_accesses.load(), uint32_t{0});
+}
+
+namespace {
+namespace power = ker::mod::power;
+namespace hostname = ker::util::hostname;
+namespace security = ker::mod::security;
+auto set_native_hostname(Task* subject, uint64_t address, size_t length) -> int {
+    return static_cast<int>(static_cast<int64_t>(ker::syscall::process::set_hostname_for_subject(subject, address, length)));
+}
+void expect_host_controls_refused(Task* subject, int error) {
+    auto const NAME = hostname::snapshot();
+    auto const PHASE = power::shutdown_phase();
+    KEXPECT_EQ(set_native_hostname(subject, UINT64_MAX, 1), error);
+    KEXPECT_EQ(set_native_hostname(subject, 0, 0), error);
+    KEXPECT_EQ(power::selftest_prepare_shutdown_for_subject(subject), error);
+    for (uint64_t command : {abi::power::RB_AUTOBOOT, abi::power::RB_POWER_OFF, abi::power::RB_HALT_SYSTEM, abi::power::RB_ENABLE_CAD,
+                             abi::power::RB_DISABLE_CAD}) {
+        KEXPECT_EQ(power::selftest_begin_reboot_for_subject(subject, command), error);
+        KEXPECT_EQ(power::shutdown_phase(), PHASE);
+    }
+    // Command decoding keeps its original precedence over subject admission.
+    KEXPECT_EQ(power::selftest_begin_reboot_for_subject(subject, UINT64_MAX), -EINVAL);
+    KEXPECT_TRUE(hostname::snapshot() == NAME);
+    KEXPECT_EQ(power::shutdown_phase(), PHASE);
+}
+}  // namespace
+
+KTEST(CompartmentControl, PrivateRootAndSharedNetworkCannotChangeHostState) {
+    auto const PID_BASELINE = pid_ns::live_namespace_count();
+    auto const IPC_BASELINE = ipc::live_namespace_count();
+    auto const MOUNT_BASELINE = vfs::mount_ns::live_namespace_count();
+    auto const NAME = hostname::snapshot();
+    auto const PHASE = power::shutdown_phase();
+    for (unsigned variant = 1; variant < 8; ++variant) {
+        pid_ns::NamespaceRef host, pids;
+        ipc::NamespaceRef names;
+        vfs::mount_ns::NamespaceRef mounts;
+        NativeTask subject;
+        if ((variant & 1U) != 0) {
+            KREQUIRE_EQ(pid_ns::create_namespace(host, Network::SHARED_HOST, pids), 0);
+            KREQUIRE_TRUE(subject.task->initialize_pid_namespace(pids));
+        }
+        if ((variant & 2U) != 0) {
+            KREQUIRE_EQ(ipc::create_namespace(names), 0);
+            KREQUIRE_TRUE(subject.task->initialize_ipc_namespace(names));
+        }
+        if ((variant & 4U) != 0) {
+            KREQUIRE_EQ(vfs::mount_ns::create_namespace(mounts), 0);
+            KREQUIRE_TRUE(subject.task->initialize_mount_namespace(mounts));
+        }
+        auto const CREDENTIALS = subject.task->credentials();
+        KREQUIRE_TRUE(CREDENTIALS == security::Snapshot::bootstrap_root());
+        auto const REFERENCES = subject.task->ref_count.load();
+        auto const RESOURCES = wki::resource_contract::snapshot(subject.task->resources);
+        KEXPECT_EQ(security::compartment::host_namespace_admission(subject.task.get()), -EPERM);
+        expect_host_controls_refused(subject.task.get(), -EPERM);
+        pids.close();
+        names.close();
+        mounts.close();
+        KEXPECT_EQ(security::compartment::host_namespace_admission(subject.task.get()), -EIDRM);
+        expect_host_controls_refused(subject.task.get(), -EIDRM);
+        KEXPECT_TRUE(subject.task->credentials() == CREDENTIALS);
+        KEXPECT_EQ(subject.task->ref_count.load(), REFERENCES);
+        KEXPECT_EQ(subject.task->fd_table.size(), 0U);
+        KEXPECT_EQ(subject.task->fd_table.reserved_count(), 0U);
+        KEXPECT_EQ(subject.task->usercopy_pagemap_accesses.load(), uint32_t{0});
+        auto const CURRENT = wki::resource_contract::snapshot(subject.task->resources);
+        KEXPECT_EQ(std::memcmp(&RESOURCES, &CURRENT, sizeof(RESOURCES)), 0);
+    }
+    KEXPECT_TRUE(hostname::snapshot() == NAME);
+    KEXPECT_EQ(power::shutdown_phase(), PHASE);
+    KEXPECT_EQ(pid_ns::live_namespace_count(), PID_BASELINE);
+    KEXPECT_EQ(ipc::live_namespace_count(), IPC_BASELINE);
+    KEXPECT_EQ(vfs::mount_ns::live_namespace_count(), MOUNT_BASELINE);
+}
+
+KTEST(CompartmentControl, MappedNamesCanonicalThreadsAndClosedOwnersRefuseEffects) {
+    auto const BASELINE = ipc::live_namespace_count();
+    {
+        ipc::NamespaceRef names;
+        KREQUIRE_EQ(ipc::create_namespace(names), 0);
+        UserTask owner;
+        NativeTask thread, unbound;
+        KREQUIRE_NE(owner.task->pagemap, nullptr);
+        KREQUIRE_TRUE(owner.task->initialize_ipc_namespace(names));
+        thread.task->is_thread = true;
+        thread.task->owner_pid = owner.task->pid;
+        KREQUIRE_TRUE(resource::bind_thread_owner(*thread.task, *owner.task));
+        unbound.task->is_thread = true;
+        unbound.task->owner_pid = owner.task->pid;
+        constexpr uint64_t SOURCE = 0x670000;
+        constexpr auto INPUT = std::to_array("private-escape");
+        KREQUIRE_TRUE(owner.map_zero(SOURCE));
+        KREQUIRE_TRUE(usercopy::copy_to_task(*owner.task, SOURCE, INPUT.data(), INPUT.size()));
+        auto const NAME = hostname::snapshot();
+        auto const PHASE = power::shutdown_phase();
+        auto const REFERENCES = owner.task->ref_count.load();
+        KREQUIRE_TRUE(thread.task->credentials() == security::Snapshot::bootstrap_root());
+        KEXPECT_EQ(set_native_hostname(owner.task.get(), SOURCE, INPUT.size() - 1), -EPERM);
+        KEXPECT_EQ(set_native_hostname(thread.task.get(), SOURCE, INPUT.size() - 1), -EPERM);
+        expect_host_controls_refused(thread.task.get(), -EPERM);
+        expect_host_controls_refused(unbound.task.get(), -ESRCH);
+        expect_host_controls_refused(nullptr, -ESRCH);
+        names.close();
+        KEXPECT_EQ(set_native_hostname(owner.task.get(), SOURCE, INPUT.size() - 1), -EIDRM);
+        KEXPECT_EQ(set_native_hostname(thread.task.get(), SOURCE, INPUT.size() - 1), -EIDRM);
+        expect_host_controls_refused(thread.task.get(), -EIDRM);
+        std::array<char, INPUT.size()> observed{};
+        KREQUIRE_TRUE(usercopy::copy_from_task(*owner.task, SOURCE, observed.data(), observed.size()));
+        KEXPECT_TRUE(observed == INPUT);
+        KEXPECT_TRUE(hostname::snapshot() == NAME);
+        KEXPECT_EQ(power::shutdown_phase(), PHASE);
+        KEXPECT_EQ(owner.task->ref_count.load(), REFERENCES);
+        KEXPECT_EQ(owner.task->usercopy_pagemap_accesses.load(), uint32_t{0});
+        KEXPECT_EQ(thread.task->usercopy_pagemap_accesses.load(), uint32_t{0});
+    }
+    KEXPECT_EQ(ipc::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentControl, HostValidationAndDroppedAuthorityKeepExistingBehavior) {
+    UserTask host;
+    KREQUIRE_NE(host.task->pagemap, nullptr);
+    KREQUIRE_TRUE(host.task->credentials() == security::Snapshot::bootstrap_root());
+    KEXPECT_EQ(security::compartment::host_namespace_admission(host.task.get()), 0);
+    constexpr uint64_t SOURCE = 0x680000;
+    constexpr auto INVALID_NAME = std::to_array("invalid.name");
+    KREQUIRE_TRUE(host.map_zero(SOURCE));
+    KREQUIRE_TRUE(usercopy::copy_to_task(*host.task, SOURCE, INVALID_NAME.data(), INVALID_NAME.size()));
+    auto const NAME = hostname::snapshot();
+    auto const PHASE = power::shutdown_phase();
+    KEXPECT_EQ(set_native_hostname(host.task.get(), SOURCE, INVALID_NAME.size() - 1), -EINVAL);
+    KEXPECT_EQ(set_native_hostname(host.task.get(), UINT64_MAX, 1), -EFAULT);
+    KEXPECT_EQ(set_native_hostname(host.task.get(), 0, 0), -EFAULT);
+    KEXPECT_EQ(set_native_hostname(host.task.get(), SOURCE, 0), -EINVAL);
+    KEXPECT_EQ(set_native_hostname(host.task.get(), SOURCE, hostname::HOSTNAME_MAX), -EINVAL);
+    KEXPECT_EQ(power::selftest_begin_reboot_for_subject(host.task.get(), UINT64_MAX), -EINVAL);
+    KEXPECT_EQ(power::begin_reboot_command(UINT64_MAX), -EINVAL);
+    KEXPECT_EQ(power::selftest_begin_reboot_for_subject(host.task.get(), abi::power::RB_ENABLE_CAD), 0);
+    KEXPECT_EQ(power::selftest_begin_reboot_for_subject(host.task.get(), abi::power::RB_DISABLE_CAD), 0);
+    security::Snapshot restricted;
+    uint64_t const CEILING = security::ALL_AUTHORITY & ~(uint64_t{1} << static_cast<unsigned>(security::Authority::HOSTNAME)) &
+                             ~(uint64_t{1} << static_cast<unsigned>(security::Authority::POWER));
+    KREQUIRE_EQ(host.task->credentials().prepare({.change = security::Change::DROP_AUTHORITY, .authority_ceiling = CEILING}, restricted),
+                0);
+    KREQUIRE_EQ(resource::initialize_credentials(*host.task, restricted), 0);
+    KEXPECT_EQ(host.task->credentials().user().effective, uint32_t{0});
+    expect_host_controls_refused(host.task.get(), -EPERM);
+    KREQUIRE_EQ(resource::initialize_credentials(*host.task, security::Snapshot{}), 0);
+    expect_host_controls_refused(host.task.get(), -EPERM);
+    KEXPECT_TRUE(hostname::snapshot() == NAME);
+    KEXPECT_EQ(power::shutdown_phase(), PHASE);
     KEXPECT_EQ(host.task->usercopy_pagemap_accesses.load(), uint32_t{0});
 }

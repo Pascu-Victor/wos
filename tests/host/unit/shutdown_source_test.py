@@ -314,7 +314,15 @@ def test_kernel_finalizer_sequences_teardown_sync_unmount_and_platform_action() 
         require_order(run_body, first, second, context)
 
     entry = function_body(source, "begin_reboot_command")
-    require_order(entry, "authorize_current_power()", "return -EWOULDBLOCK;", "authority precedes context admission")
+    require_order(entry, "authorize_current_power(subject)", "return -EWOULDBLOCK;", "authority precedes context admission")
+    authority = function_body(source, "authorize_current_power")
+    require_order(authority, "host_namespace_admission(task)", "Authority::POWER", "Host scope precedes credential authority")
+    require_tokens(source, ["return prepare_shutdown(sched::get_current_task());",
+                            "return begin_reboot_command(nullptr, cmd, true);"],
+                   "ordinary power entry uses its current subject and the shared implementation")
+    require_order(entry, "return PARSE_RET;", "sched::get_current_task()", "invalid commands do not observe scheduler state")
+    require_order(entry, "sched::get_current_task()", "authorize_current_power(subject)", "ordinary power resolves subject before authority")
+    require_tokens(source, ["return begin_reboot_command(subject, cmd, false);"], "diagnostic subject never substitutes current")
     require_tokens(entry, ["sched::has_run_queues()", "sched::preempt_count() != 0", "CURRENT == nullptr",
                            "CURRENT->scheduler_transition_active.load", "CURRENT->deferred_task_switch", "CURRENT->wants_block"],
                    "locked and pending-handoff power entry must fail before changing phase")
@@ -437,7 +445,10 @@ def test_shutdown_unmount_is_exact_deepest_first_and_root_last() -> None:
         ],
         "vfs shutdown wrappers",
     )
-    vfs_mount_body = function_body(vfs_source, "vfs_mount")
+    wrapper = function_body(vfs_source, "vfs_mount")
+    require_tokens(wrapper, ["return vfs_mount_for_task(task, source, target, fstype, flags, data);"],
+                   "mount wrapper preserves subject admission")
+    vfs_mount_body = function_body(vfs_source, "vfs_mount_for_task")
     require_order(
         vfs_mount_body,
         "if (ker::mod::power::shutdown_in_progress())",
