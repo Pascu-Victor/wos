@@ -8,6 +8,18 @@
 
 ## Outcome and scale
 
+Checkpoint 46 repairs private READ-to-WRITE promotion for cached and fork-aliased
+pages and revokes COW write authority on READ/NONE, including swapped anonymous
+pages. Normal Build WOS, the isolated fast diagnostic build, 64 Host tests,
+formatting and fresh Task ABI measurements pass. KTEST75 passes all 1,443 cases,
+all 192 mandatory, 93,749 assertions and zero failures, including six new native
+regressions. It shuts down naturally; all four owned images (263,602,176 allocated
+bytes) are pruned, leaving zero disposable allocation and the unrelated VM
+preserved. The independent terminal audit confirms the exact source and serial
+census. Public-spec promotion replay and shared-map coherence/writeback repair
+remain outstanding. Goal39 remains ACTIVE; this bounded qualification completes
+no full criterion.
+
 Checkpoint 45 adds the finite public regular-file mapping characterization.
 Its Normal eight-CPU attempt02 completes the strict execution protocol but
 fails shared-map coherence, writeback and private READ-to-WRITE promotion

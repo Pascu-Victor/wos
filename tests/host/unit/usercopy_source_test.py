@@ -260,7 +260,19 @@ def require_mapping_stable_pin_contract() -> None:
         fail("COW must serialize both its initial leaf decision and final replacement with usercopy pins")
     first_pin_lock = cow.find("user_mapping_pin_lock.lock_irqsave()")
     old_frame_pin = cow.find("phys::page_ref_inc(old_virt, &cow_lookup)")
-    first_pin_unlock = cow.find("user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS)", old_frame_pin)
+    release = cow.find("auto unlock_initial = [&]")
+    release_brace = cow.find("{", release)
+    if release < 0 or release_brace < 0:
+        fail("COW initial lock release helper is missing")
+    release_body = cow[release_brace + 1 : find_matching_brace(cow, release_brace)]
+    pin_unlock = release_body.find("user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS)")
+    lazy_unlock = release_body.find("task->lazy_vmem_lock.unlock_irqrestore(LAZY_LOCK_FLAGS)")
+    cow_unlock = release_body.find("cow_pte_lock.unlock_irqrestore(LOCK_FLAGS)")
+    if min(pin_unlock, lazy_unlock, cow_unlock) < 0 or not (pin_unlock < lazy_unlock < cow_unlock):
+        fail("COW must release pin, optional lazy metadata, and cow locks in reverse order")
+    if "if (CHECK_ANON_RANGE)" not in release_body:
+        fail("COW must release the lazy lock only when it was acquired")
+    first_pin_unlock = cow.find("unlock_initial();", old_frame_pin)
     allocation = cow.find("alloc_cow_destination_page")
     final_pin_lock = cow.find("user_mapping_pin_lock.lock_irqsave()", first_pin_lock + 1)
     final_leaf_write = cow.find("pte = pte_from_raw(raw_now)", final_pin_lock)

@@ -267,6 +267,22 @@ paddr_t translate(PageTable* page_table, vaddr_t vaddr);
 [[nodiscard]] auto user_page_pin_commit_write(const UserPagePin& pin) -> bool;
 void unpin_user_page(UserPagePin& pin);
 #ifdef WOS_SELFTEST
+enum class SelftestCowAction : uint8_t {
+    FAIL_DESTINATION_ALLOCATION,
+    DOWNGRADE_READ_BEFORE_COMMIT,
+    DOWNGRADE_NONE_BEFORE_COMMIT,
+};
+struct SelftestCowObservation {
+    bool admitted{};
+    uint32_t consumed{};
+    void* destination{};
+    bool action_outside_spinlocks{};
+    bool disarmed{};
+};
+// Scoped actual copyout on an owned, unpublished private COW leaf. The action
+// runs once outside the resolver's locks; no allocator-wide failure or callback.
+[[nodiscard]] auto selftest_copy_to_task_cow_action(sched::task::Task& subject, uint64_t address, const void* source, size_t size,
+                                                    SelftestCowAction action, SelftestCowObservation& observation) -> bool;
 // Native callers retain an actual Task-access hold for the exact expected root.
 // Observation is local to this call; production pin signatures are unchanged.
 struct UserPagePinPathObservation {

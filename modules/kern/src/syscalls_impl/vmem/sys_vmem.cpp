@@ -1006,6 +1006,18 @@ auto file_mmap_cached_page_for_file(ker::vfs::File* file, const ker::vfs::Stat& 
     return true;
 }
 
+auto map_file_mmap_cached_page(ker::mod::mm::virt::PageMapBatch* batch, ker::vfs::File* file, const ker::vfs::Stat& st, uint64_t address,
+                               uint64_t offset, uint64_t flags, uint64_t& physical) -> bool {
+    void* page = nullptr;
+    if (!file_mmap_cached_page_for_file(file, st, offset, &page)) {
+        return false;
+    }
+    auto const PADDR = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(page)));
+    ker::mod::mm::virt::map_page_batched(batch, address, PADDR, flags);
+    physical = PADDR;
+    return true;
+}
+
 auto collect_file_mmap_sync_ranges(ker::mod::mm::paging::PageTable* pagemap, uint64_t start, uint64_t length,
                                    ker::util::SmallVec<FileMmapSyncRange, 8>& out) -> int {
     uint64_t end = 0;
@@ -1602,10 +1614,12 @@ auto materialize_lazy_file_page_impl(ker::mod::sched::task::Task* task, const La
 auto anon_zero_page_flags(uint64_t prot) -> uint64_t {
     uint64_t flags = prot_to_page_flags(prot);
 
-    // A shared zero page must stay read-only. PAGE_COW makes the first write
-    // fault allocate a private page, preserving normal anonymous mmap behavior.
+    // A shared zero page stays read-only; only an admitted writable mapping
+    // may resolve its first write by allocating a private page.
     flags &= ~ker::mod::mm::paging::PAGE_WRITE;
-    flags |= ker::mod::mm::paging::PAGE_COW;
+    if ((prot & ker::abi::vmem::PROT_WRITE) != 0U) {
+        flags |= ker::mod::mm::paging::PAGE_COW;
+    }
     return flags;
 }
 
@@ -2110,14 +2124,13 @@ auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t si
 
             uint64_t const CURRENT_VADDR = vaddr + (i * ker::mod::mm::paging::PAGE_SIZE);
             uint64_t const FILE_OFFSET = offset + (i * ker::mod::mm::paging::PAGE_SIZE);
-            void* page = nullptr;
-            if (!file_mmap_cached_page_for_file(file, st, FILE_OFFSET, &page)) {
+            uint64_t physical = 0;
+            if (!map_file_mmap_cached_page(&map_batch, file, st, CURRENT_VADDR, FILE_OFFSET, PAGE_FLAGS, physical)) {
                 cache_ok = false;
                 break;
             }
 
-            auto const PADDR = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(page)));
-            ker::mod::mm::virt::map_page_batched(&map_batch, CURRENT_VADDR, PADDR, PAGE_FLAGS);
+            uint64_t const PADDR = physical;
             mapped_pages++;
 
             if (is_watched_mmap_vaddr(CURRENT_VADDR)) {
@@ -2226,6 +2239,151 @@ auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t si
 }  // anonymous namespace
 
 #ifdef WOS_SELFTEST
+namespace {
+class SelftestImmutableFileHold {
+   public:
+    explicit SelftestImmutableFileHold(ker::vfs::File& file) : file_(&file) { ker::vfs::vfs_retain_file(file_); }
+    ~SelftestImmutableFileHold() { ker::vfs::vfs_put_file(file_); }
+    SelftestImmutableFileHold(const SelftestImmutableFileHold&) = delete;
+    auto operator=(const SelftestImmutableFileHold&) -> SelftestImmutableFileHold& = delete;
+
+   private:
+    ker::vfs::File* file_;
+};
+
+auto selftest_immutable_file_cache_key(ker::vfs::File& file, uint64_t offset, ker::vfs::Stat& stat, FileMmapPageKey& key) -> bool {
+    constexpr uint64_t PAGE = ker::mod::mm::paging::PAGE_SIZE;
+    if (file.exec_read_view == nullptr || file.exec_read_view->content_id == 0 || (file.open_flags & 3) != 0 || file.fops == nullptr ||
+        file.fops->vfs_read == nullptr || (offset & (PAGE - 1)) != 0 || offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) ||
+        ker::vfs::vfs_fstat_file(&file, &stat) != 0 || stat.st_size < static_cast<off_t>(PAGE) ||
+        !file_mmap_can_share(stat, ker::abi::vmem::PROT_READ)) {
+        return false;
+    }
+    key = file_mmap_page_key(stat, offset);
+    key.exec_content_id = file.exec_read_view->content_id;
+    return true;
+}
+
+auto selftest_file_cache_key_has_capacity(const FileMmapPageKey& key) -> bool {
+    size_t const SET_INDEX = file_mmap_key_hash(key) & (FILE_MMAP_CACHE_SET_COUNT - 1);
+    auto& cache_lock = g_file_mmap_cache_locks.at(SET_INDEX & (FILE_MMAP_CACHE_LOCK_COUNT - 1));
+    auto& set = g_file_mmap_cache.at(SET_INDEX);
+    cache_lock.mutex.lock();
+    bool available = false;
+    for (const auto& entry : set.ways) {
+        available = available || entry.page == nullptr || file_mmap_key_equal(entry.key, key);
+    }
+    cache_lock.mutex.unlock();
+    return available;
+}
+
+class SelftestFileMapSubjectHold {
+   public:
+    ~SelftestFileMapSubjectHold() {
+        if (root_ != nullptr) subject_->release_usercopy_pagemap();
+        if (subject_ != nullptr) subject_->release();
+    }
+    SelftestFileMapSubjectHold() = default;
+    SelftestFileMapSubjectHold(const SelftestFileMapSubjectHold&) = delete;
+    auto operator=(const SelftestFileMapSubjectHold&) -> SelftestFileMapSubjectHold& = delete;
+    auto acquire(ker::mod::sched::task::Task& subject) -> bool {
+        namespace task = ker::mod::sched::task;
+        namespace virt = ker::mod::mm::virt;
+        if (subject.type != task::TaskType::PROCESS || subject.is_thread || subject.thread != nullptr || subject.pid != 0 ||
+            subject.scheduler_published.load(std::memory_order_acquire) || subject.shares_user_pagemap.load(std::memory_order_acquire) ||
+            !subject.try_acquire()) {
+            return false;
+        }
+        subject_ = &subject;
+        if (!subject.try_acquire_usercopy_pagemap(root_)) return false;
+        return subject.state.load(std::memory_order_acquire) == task::TaskState::ACTIVE && subject.type == task::TaskType::PROCESS &&
+               !subject.is_thread && subject.thread == nullptr && subject.pid == 0 && subject.pagemap == root_ &&
+               !subject.scheduler_published.load(std::memory_order_acquire) &&
+               !subject.shares_user_pagemap.load(std::memory_order_acquire) && root_ != virt::get_kernel_pagemap() &&
+               !virt::selftest_kernel_page_table_frame(root_) && !virt::active_pagemap_is(root_) &&
+               (!ker::mod::sched::can_query_current_task() || ker::mod::sched::get_current_task() != &subject);
+    }
+    auto root() const -> ker::mod::mm::paging::PageTable* { return root_; }
+
+   private:
+    ker::mod::sched::task::Task* subject_{};
+    ker::mod::mm::paging::PageTable* root_{};
+};
+}  // namespace
+
+auto selftest_observe_file_mmap_cache(ker::vfs::File& file, uint64_t offset, SelftestFileCacheObservation& observation) -> bool {
+    if (observation.retained_frame != nullptr) return false;
+    SelftestImmutableFileHold hold(file);
+    ker::vfs::Stat stat{};
+    FileMmapPageKey key{};
+    if (!selftest_immutable_file_cache_key(file, offset, stat, key)) return false;
+    size_t const SET_INDEX = file_mmap_key_hash(key) & (FILE_MMAP_CACHE_SET_COUNT - 1);
+    auto& cache_lock = g_file_mmap_cache_locks.at(SET_INDEX & (FILE_MMAP_CACHE_LOCK_COUNT - 1));
+    auto& set = g_file_mmap_cache.at(SET_INDEX);
+    SelftestFileCacheObservation result{};
+    cache_lock.mutex.lock();
+    for (const auto& entry : set.ways) {
+        result.vacant_way = result.vacant_way || entry.page == nullptr;
+        if (result.retained_frame == nullptr && entry.page != nullptr && file_mmap_key_equal(entry.key, key)) {
+            ker::mod::mm::phys::page_ref_inc(entry.page);
+            result.retained_frame = entry.page;
+        }
+    }
+    cache_lock.mutex.unlock();
+    observation = result;
+    return true;
+}
+
+auto selftest_map_cached_private_file_page(ker::mod::sched::task::Task& subject, ker::vfs::File& file, uint64_t address, uint64_t offset)
+    -> bool {
+    namespace virt = ker::mod::mm::virt;
+    constexpr uint64_t PAGE = ker::mod::mm::paging::PAGE_SIZE;
+    if ((address & (PAGE - 1)) != 0 || address < USER_SPACE_START || address > USER_SPACE_END - (PAGE - 1)) return false;
+    SelftestFileMapSubjectHold subject_hold;
+    if (!subject_hold.acquire(subject)) return false;
+    SelftestImmutableFileHold file_hold(file);
+    ker::vfs::Stat stat{};
+    FileMmapPageKey key{};
+    if (!selftest_immutable_file_cache_key(file, offset, stat, key) || offset > static_cast<uint64_t>(stat.st_size) - PAGE ||
+        !virt::is_user_virtual_range_free(subject_hold.root(), address, address + PAGE) || !selftest_file_cache_key_has_capacity(key)) {
+        return false;
+    }
+    // Capacity is not reserved across IO: the native fixture is serialized
+    // before SMP and never publishes this root. No wider topology claim.
+    uint64_t const FLAGS = file_mapping_page_flags(ker::abi::vmem::PROT_READ, ker::abi::vmem::MAP_PRIVATE);
+    virt::PageMapBatch batch{};
+    virt::init_page_map_batch(&batch, subject_hold.root(), FLAGS);
+    uint64_t physical = 0;
+    bool const mapped = map_file_mmap_cached_page(&batch, &file, stat, address, offset, FLAGS, physical);
+    virt::flush_page_map_batch(&batch);
+    return mapped;
+}
+
+auto selftest_evict_file_mmap_cache_exact(ker::vfs::File& file, uint64_t offset, void* expected_frame) -> bool {
+    if (expected_frame == nullptr) return false;
+    SelftestImmutableFileHold hold(file);
+    ker::vfs::Stat stat{};
+    FileMmapPageKey key{};
+    if (!selftest_immutable_file_cache_key(file, offset, stat, key)) return false;
+    size_t const SET_INDEX = file_mmap_key_hash(key) & (FILE_MMAP_CACHE_SET_COUNT - 1);
+    auto& cache_lock = g_file_mmap_cache_locks.at(SET_INDEX & (FILE_MMAP_CACHE_LOCK_COUNT - 1));
+    auto& set = g_file_mmap_cache.at(SET_INDEX);
+    void* removed = nullptr;
+    cache_lock.mutex.lock();
+    for (auto& entry : set.ways) {
+        if (entry.page == expected_frame && file_mmap_key_equal(entry.key, key)) {
+            removed = entry.page;
+            entry = {};
+            g_file_mmap_cache_pages.fetch_sub(1, std::memory_order_relaxed);
+            break;
+        }
+    }
+    cache_lock.mutex.unlock();
+    if (removed == nullptr) return false;
+    release_file_mmap_cache_page(removed);
+    return true;
+}
+
 auto selftest_file_mapping_admission(ker::mod::mm::paging::PageTable* pagemap) -> bool {
     namespace vfs = ker::vfs;
     namespace vm = ker::abi::vmem;

@@ -433,7 +433,7 @@ def test_shm_write_limit_survives_mapping_lifetime():
     query = body_after(virt, "auto is_page_write_restricted(")
     assert "present_mapping_entry(page_table, vaddr)" in query
     assert "user_mapping_pin_lock.lock_irqsave()" in query
-    assert "raw = pte_raw(pte);\n        if (paging::shared_write_restricted(raw))" in virt
+    assert "raw = pte_raw(pte);\n        if ((raw & paging::PAGE_USER) == 0U || paging::shared_write_restricted(raw))" in virt
 
 
 def test_tmpfs_metadata_authorizes_locked_object_before_commit():
@@ -2302,7 +2302,10 @@ def test_file_mapping_uses_one_description_and_preflights_policy():
     assert "vfs_fstat(fd," not in mapping and "eager_file" not in mapping
     assert mapping.index("retained_file(") < mapping.index("vfs_fstat_file(file, &st)") < mapping.index("authorize_file_mapping(")
     assert mapping.index("POLICY_RET != 0") < mapping.index("SharedVmemPublicationGuard publication_guard") < mapping.index("release_fixed_mmap_range_locked(")
-    assert "file_mmap_cached_page_for_file(file, st," in mapping
+    assert "map_file_mmap_cached_page(&map_batch, file, st, CURRENT_VADDR, FILE_OFFSET, PAGE_FLAGS, physical)" in mapping
+    cached_mapping = body_after(vmem, "auto map_file_mmap_cached_page(")
+    assert cached_mapping.index("file_mmap_cached_page_for_file(file, st, offset, &page)") < cached_mapping.index("get_phys_pointer(") < cached_mapping.index("map_page_batched(batch, address, PADDR, flags)")
+    assert "vfs_get_file" not in cached_mapping and "vfs_fstat" not in cached_mapping
     assert "read_file_mapping_exact(file," in mapping
     assert mapping.count("register_file_mmap_range(task->pagemap, vaddr, REQUESTED_SIZE, offset, file, WRITEBACK)") == 3
     assert "register_file_mmap_range_from_fd" not in vmem

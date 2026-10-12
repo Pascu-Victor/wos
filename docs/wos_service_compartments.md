@@ -25,6 +25,12 @@ Strict execution completes, but shared-map coherence, writeback and private
 READ-to-WRITE promotion fail. Fresh remapping, ordinary private isolation,
 materialized fork sharing and read-only grant restrictions pass. Kernel repairs
 and fresh qualification remain required.
+Checkpoint 46 repairs private cached/fork-aliased WRITE promotion and READ/NONE
+revocation, including anonymous swap permissions. Six new native regressions
+and the complete diagnostic KTEST75 suite pass: 1,443 cases, 93,749 assertions,
+zero failures. Task layout and public ABI remain unchanged. The public-spec
+promotion replay is pending; coherent mutable SHARED backing and writeback
+remain unimplemented. All disposable test images are pruned after this run.
 Exact-owner ambient network admission is implemented;
 complete PID, lifecycle and WKI qualification remains incomplete. Independent
 service isolation and all ten goal criteria remain unqualified. Goal28 remains

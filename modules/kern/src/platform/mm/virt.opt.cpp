@@ -46,6 +46,10 @@
 #include "util/hcf.hpp"
 #include "vfs/vfs.hpp"
 
+#ifdef WOS_SELFTEST
+#include "platform/sys/usercopy.hpp"
+#endif
+
 extern "C" {
 extern char __kernel_image_start[];                   // NOLINT(readability-identifier-naming)
 extern char __kernel_text_start[];                    // NOLINT(readability-identifier-naming)
@@ -1012,7 +1016,8 @@ auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const pagin
     return false;
 }
 
-auto writable_anonymous_range_contains(sched::task::Task* task, uint64_t vaddr) -> bool {
+// Caller holds task->lazy_vmem_lock through the corresponding leaf update.
+auto writable_anonymous_range_contains_locked(sched::task::Task* task, uint64_t vaddr) -> bool {
     if (task == nullptr) {
         return false;
     }
@@ -1021,14 +1026,12 @@ auto writable_anonymous_range_contains(sched::task::Task* task, uint64_t vaddr) 
     constexpr uint64_t MAP_ANONYMOUS = 0x20ULL;
     uint64_t const PAGE_VADDR = vaddr & ~(paging::PAGE_SIZE - 1);
     bool contains = false;
-    uint64_t const IRQF = task->lazy_vmem_lock.lock_irqsave();
     for (const auto& range : task->lazy_vmem_ranges) {
         if (PAGE_VADDR >= range.start && PAGE_VADDR < range.end && (range.prot & PROT_WRITE) != 0U && (range.flags & MAP_ANONYMOUS) != 0U) {
             contains = true;
             break;
         }
     }
-    task->lazy_vmem_lock.unlock_irqrestore(IRQF);
     return contains;
 }
 
@@ -2997,6 +3000,54 @@ enum class UserWriteFaultStatus : uint8_t {
     NOT_WRITABLE,
 };
 
+#ifdef WOS_SELFTEST
+// Low two bits: idle, ready, consumed, preparing. The retained generation
+// prevents a delayed mismatched hook from consuming a later scope.
+std::atomic<uint64_t> selftest_cow_plan_word{};
+struct SelftestCowPlan {
+    std::atomic<sched::task::Task*> subject{};
+    std::atomic<PageTable*> root{};
+    std::atomic<vaddr_t> address{};
+    std::atomic<paddr_t> frame{};
+    std::atomic<uint64_t> cpu{UINT64_MAX};
+    std::atomic<SelftestCowAction> action{};
+    std::atomic<SelftestCowObservation*> observation{};
+};
+SelftestCowPlan selftest_cow_plan{};
+
+auto selftest_consume_cow_action(sched::task::Task* subject, PageTable* root, vaddr_t address, paddr_t frame, bool before_allocation,
+                                 void* destination) -> bool {
+    uint64_t word = selftest_cow_plan_word.load(std::memory_order_acquire);
+    if ((word & 3U) != 1U || selftest_cow_plan.cpu.load(std::memory_order_relaxed) != cpu::current_cpu() ||
+        selftest_cow_plan.subject.load(std::memory_order_relaxed) != subject ||
+        selftest_cow_plan.root.load(std::memory_order_relaxed) != root ||
+        selftest_cow_plan.address.load(std::memory_order_relaxed) != address ||
+        selftest_cow_plan.frame.load(std::memory_order_relaxed) != frame) {
+        return false;
+    }
+    SelftestCowAction const ACTION = selftest_cow_plan.action.load(std::memory_order_relaxed);
+    if (before_allocation != (ACTION == SelftestCowAction::FAIL_DESTINATION_ALLOCATION)) {
+        return false;
+    }
+    auto* observation = selftest_cow_plan.observation.load(std::memory_order_relaxed);
+    if (observation == nullptr ||
+        !selftest_cow_plan_word.compare_exchange_strong(word, (word & ~3ULL) | 2U, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return false;
+    }
+    // Only the synchronous caller's CPU may consume its borrowed observation.
+    // Other resolver calls never access it, including during disarm/rearm.
+    observation->consumed = 1;
+    observation->destination = destination;
+    observation->action_outside_spinlocks = true;
+    if (!before_allocation) {
+        uint64_t const FLAGS = ACTION == SelftestCowAction::DOWNGRADE_READ_BEFORE_COMMIT ? paging::page_types::USER_READONLY
+                                                                                         : paging::PAGE_PRESENT | paging::PAGE_NX;
+        unify_page_flags(root, address, FLAGS);
+    }
+    return true;
+}
+#endif
+
 auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserWriteFaultStatus {
     if (task == nullptr || task->pagemap == nullptr || vaddr >= 0x0000800000000000ULL) {
         return UserWriteFaultStatus::NOT_WRITABLE;
@@ -3054,17 +3105,24 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
         }
 
         uint64_t raw = pte_raw(pte);
-        bool const WRITABLE_ANON_RANGE = (raw & (paging::PAGE_COW | paging::PAGE_WRITE)) == 0U && (raw & paging::PAGE_USER) != 0U &&
-                                         writable_anonymous_range_contains(task, VADDR);
+        bool const CHECK_ANON_RANGE =
+            (raw & (paging::PAGE_COW | paging::PAGE_WRITE | paging::PAGE_SHARED)) == 0U && (raw & paging::PAGE_USER) != 0U;
+        uint64_t const LAZY_LOCK_FLAGS = CHECK_ANON_RANGE ? task->lazy_vmem_lock.lock_irqsave() : 0;
+        bool const WRITABLE_ANON_RANGE = CHECK_ANON_RANGE && writable_anonymous_range_contains_locked(task, VADDR);
         uint64_t const PIN_LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
-        raw = pte_raw(pte);
-        if (paging::shared_write_restricted(raw)) {
+        auto unlock_initial = [&] {
             user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
+            if (CHECK_ANON_RANGE) {
+                task->lazy_vmem_lock.unlock_irqrestore(LAZY_LOCK_FLAGS);
+            }
             cow_pte_lock.unlock_irqrestore(LOCK_FLAGS);
+        };
+        raw = pte_raw(pte);
+        if ((raw & paging::PAGE_USER) == 0U || paging::shared_write_restricted(raw)) {
+            unlock_initial();
             return UserWriteFaultStatus::NOT_WRITABLE;
         }
-        bool const SYNTHETIC_ANON_COW =
-            (raw & (paging::PAGE_COW | paging::PAGE_WRITE)) == 0U && (raw & paging::PAGE_USER) != 0U && WRITABLE_ANON_RANGE;
+        bool const SYNTHETIC_ANON_COW = (raw & (paging::PAGE_COW | paging::PAGE_WRITE | paging::PAGE_SHARED)) == 0U && WRITABLE_ANON_RANGE;
         if (SYNTHETIC_ANON_COW) {
             owned_frame_untrack_leaf(PAGEMAP, VADDR, pte);
             raw |= paging::PAGE_COW;
@@ -3073,14 +3131,12 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
 
         if ((raw & paging::PAGE_COW) == 0U) {
             if ((raw & paging::PAGE_WRITE) == 0U || (raw & paging::PAGE_USER) == 0U) {
-                user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
-                cow_pte_lock.unlock_irqrestore(LOCK_FLAGS);
+                unlock_initial();
                 return UserWriteFaultStatus::NOT_WRITABLE;
             }
 
             bool const PATH_PROMOTED = promote_user_write_path(pml4e, pml3e, pml2e);
-            user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
-            cow_pte_lock.unlock_irqrestore(LOCK_FLAGS);
+            unlock_initial();
             flush_pagemap_after_update(PAGEMAP, VADDR, PATH_PROMOTED);
             return UserWriteFaultStatus::HANDLED;
         }
@@ -3104,8 +3160,7 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
             raw |= paging::PAGE_WRITE;
             pte = pte_from_raw(raw);
             owned_frame_track_private_mapping(PAGEMAP, VADDR, old_phys, raw);
-            user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
-            cow_pte_lock.unlock_irqrestore(LOCK_FLAGS);
+            unlock_initial();
             flush_pagemap_after_update(PAGEMAP, VADDR, initial_path_promoted);
             record_cow_perf_event(task, cow_op, VADDR, refcount, cow_started_us);
             return UserWriteFaultStatus::HANDLED;
@@ -3115,12 +3170,17 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
         // PTE reference exists. Allocation and memcpy below intentionally run
         // outside the lock; the commit path rechecks the same frame under lock.
         phys::page_ref_inc(old_virt, &cow_lookup);
-        user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
-        cow_pte_lock.unlock_irqrestore(LOCK_FLAGS);
+        unlock_initial();
     }
 
     bool const DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE = !old_is_zero_page;
-    void* new_page = alloc_cow_destination_page(DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE);
+    void* new_page = nullptr;
+#ifdef WOS_SELFTEST
+    if (!selftest_consume_cow_action(task, PAGEMAP, VADDR, old_phys, true, nullptr))
+#endif
+    {
+        new_page = alloc_cow_destination_page(DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE);
+    }
     if (new_page == nullptr) {
         phys::page_ref_dec(old_virt, &cow_lookup);
         log::error("COW fault: OOM allocating new page for vaddr 0x%x", VADDR);
@@ -3130,6 +3190,10 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
     if (DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE) {
         std::memcpy(new_page, old_virt, paging::PAGE_SIZE);
     }
+
+#ifdef WOS_SELFTEST
+    (void)selftest_consume_cow_action(task, PAGEMAP, VADDR, old_phys, false, new_page);
+#endif
 
     bool installed_private_page = false;
     bool final_path_promoted = false;
@@ -3148,7 +3212,8 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
                     PageTableEntry& pte = entry_at(pml1, IDX1);
                     uint64_t raw_now = pte.present ? pte_raw(pte) : 0;
                     paddr_t const CURRENT_PHYS = pte.present ? (pte.frame << paging::PAGE_SHIFT) : 0;
-                    if ((raw_now & paging::PAGE_COW) != 0U && CURRENT_PHYS == old_phys) {
+                    if ((raw_now & (paging::PAGE_USER | paging::PAGE_COW)) == (paging::PAGE_USER | paging::PAGE_COW) &&
+                        !paging::shared_write_restricted(raw_now) && CURRENT_PHYS == old_phys) {
                         final_path_promoted = promote_user_write_path(pml4e, pml3e, pml2e);
                         auto new_phys = reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(new_page)));
                         raw_now &= ~paging::PAGE_COW;
@@ -3807,6 +3872,75 @@ void unpin_user_page(UserPagePin& pin) {
 }
 
 #ifdef WOS_SELFTEST
+auto selftest_copy_to_task_cow_action(sched::task::Task& subject, uint64_t address, const void* source, size_t size,
+                                      SelftestCowAction action, SelftestCowObservation& observation) -> bool {
+    observation = {};
+    observation.disarmed = true;
+    if (source == nullptr || size == 0 || address >= sys::usercopy::USER_ADDR_LIMIT ||
+        size > paging::PAGE_SIZE - (address & (paging::PAGE_SIZE - 1)) ||
+        (action != SelftestCowAction::FAIL_DESTINATION_ALLOCATION && action != SelftestCowAction::DOWNGRADE_READ_BEFORE_COMMIT &&
+         action != SelftestCowAction::DOWNGRADE_NONE_BEFORE_COMMIT) ||
+        subject.state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE || subject.type != sched::task::TaskType::PROCESS ||
+        subject.is_thread || subject.pid != 0 || subject.thread != nullptr || subject.scheduler_published.load(std::memory_order_acquire) ||
+        subject.shares_user_pagemap.load(std::memory_order_acquire) || !subject.try_acquire()) {
+        return false;
+    }
+    PageTable* root = nullptr;
+    if (!subject.try_acquire_usercopy_pagemap(root)) {
+        subject.release();
+        return false;
+    }
+    bool valid =
+        root != nullptr && root == subject.pagemap && root != kernel_pagemap && !is_current_pagemap(root) &&
+        !selftest_kernel_page_table_frame(root) && subject.state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE &&
+        subject.type == sched::task::TaskType::PROCESS && !subject.is_thread && subject.pid == 0 && subject.thread == nullptr &&
+        !subject.scheduler_published.load(std::memory_order_acquire) && !subject.shares_user_pagemap.load(std::memory_order_acquire) &&
+        (!sched::can_query_current_task() || sched::get_current_task() != &subject);
+    paddr_t physical_page = PADDR_INVALID;
+    if (valid) {
+        uint64_t const PIN_FLAGS = user_mapping_pin_lock.lock_irqsave();
+        valid = snapshot_user_page_mapping_locked(root, address, false, physical_page);
+        if (valid) {
+            auto* entry = leaf_entry(root, address);
+            uint64_t const RAW = pte_raw(*entry);
+            void* const FRAME = addr::get_virt_pointer(physical_page);
+            valid = (RAW & (paging::PAGE_USER | paging::PAGE_COW | paging::PAGE_SHARED)) == (paging::PAGE_USER | paging::PAGE_COW) &&
+                    !paging::shared_write_restricted(RAW) && phys::page_ref_get(FRAME) > 1 && !perf::is_local_vmem_zero_page(FRAME);
+        }
+        user_mapping_pin_lock.unlock_irqrestore(PIN_FLAGS);
+    }
+    bool copied = false;
+    uint64_t word = selftest_cow_plan_word.load(std::memory_order_acquire);
+    uint64_t const PREPARING = ((word & ~3ULL) + 4U) | 3U;
+    if (valid && (word & 3U) == 0U &&
+        selftest_cow_plan_word.compare_exchange_strong(word, PREPARING, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        selftest_cow_plan.subject.store(&subject, std::memory_order_relaxed);
+        selftest_cow_plan.root.store(root, std::memory_order_relaxed);
+        selftest_cow_plan.address.store(address, std::memory_order_relaxed);
+        selftest_cow_plan.frame.store(physical_page, std::memory_order_relaxed);
+        selftest_cow_plan.cpu.store(cpu::current_cpu(), std::memory_order_relaxed);
+        selftest_cow_plan.action.store(action, std::memory_order_relaxed);
+        selftest_cow_plan.observation.store(&observation, std::memory_order_relaxed);
+        observation.admitted = true;
+        observation.disarmed = false;
+        selftest_cow_plan_word.store((PREPARING & ~3ULL) | 1U, std::memory_order_release);
+        copied = sys::usercopy::copy_to_task(subject, address, source, size);
+        selftest_cow_plan_word.store(PREPARING, std::memory_order_release);
+        selftest_cow_plan.subject.store(nullptr, std::memory_order_relaxed);
+        selftest_cow_plan.root.store(nullptr, std::memory_order_relaxed);
+        selftest_cow_plan.address.store(0, std::memory_order_relaxed);
+        selftest_cow_plan.frame.store(0, std::memory_order_relaxed);
+        selftest_cow_plan.cpu.store(UINT64_MAX, std::memory_order_relaxed);
+        selftest_cow_plan.action.store(SelftestCowAction::FAIL_DESTINATION_ALLOCATION, std::memory_order_relaxed);
+        selftest_cow_plan.observation.store(nullptr, std::memory_order_relaxed);
+        selftest_cow_plan_word.store(PREPARING & ~3ULL, std::memory_order_release);
+        observation.disarmed = true;
+    }
+    subject.release_usercopy_pagemap();
+    subject.release();
+    return copied;
+}
+
 bool selftest_user_pagemap_exclusive_rejects_mapped_pin(PageTable* pagemap) {
     if (pagemap == nullptr) {
         return false;
@@ -5475,7 +5609,13 @@ void unify_page_flags(PageTable* page_table, vaddr_t vaddr, uint64_t flags) {
 
     auto* raw_entry = reinterpret_cast<uint64_t*>(&entry);
     uint64_t const OLD_RAW = *raw_entry;
-    bool const IS_COW = (OLD_RAW & paging::PAGE_COW) != 0U;
+    bool const PRIVATE_WRITE = (flags & (paging::PAGE_USER | paging::PAGE_WRITE)) == (paging::PAGE_USER | paging::PAGE_WRITE) &&
+                               (OLD_RAW & paging::PAGE_SHARED) == 0U;
+    bool const IS_COW = PRIVATE_WRITE && ((OLD_RAW & paging::PAGE_COW) != 0U ||
+                                          phys::page_ref_get(addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT)) > 1U);
+    // COW authorizes an admitted private write. READ/NONE revoke it; granting
+    // WRITE to a cached or fork-aliased frame defers the write to the resolver.
+    *raw_entry = IS_COW ? (OLD_RAW | paging::PAGE_COW) : (OLD_RAW & ~paging::PAGE_COW);
 
     // Update page table entry flags
     entry.present = (flags & paging::PAGE_PRESENT) != 0U ? 1 : 0;
@@ -5578,8 +5718,9 @@ auto protect_anonymous_swap_page(PageTable* page_table, vaddr_t vaddr, uint64_t 
         return false;
     }
 
-    uint64_t updated = flags & ~PTE_FRAME_MASK;
-    if ((mapping->original_raw & paging::PAGE_COW) != 0U) {
+    uint64_t updated = flags & ~(PTE_FRAME_MASK | paging::PAGE_COW);
+    if ((flags & (paging::PAGE_USER | paging::PAGE_WRITE)) == (paging::PAGE_USER | paging::PAGE_WRITE) &&
+        (mapping->original_raw & paging::PAGE_COW) != 0U) {
         updated |= paging::PAGE_COW;
         updated &= ~paging::PAGE_WRITE;
     }

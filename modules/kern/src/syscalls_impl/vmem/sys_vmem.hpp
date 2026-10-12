@@ -9,6 +9,10 @@ struct LazyVmemRange;
 struct Task;
 }  // namespace ker::mod::sched::task
 
+namespace ker::vfs {
+struct File;
+}
+
 namespace ker::syscall::vmem {
 class SharedVmemPublicationGuard {
    public:
@@ -59,6 +63,15 @@ auto clone_file_mmap_ranges_for_pagemap_locked(ker::mod::mm::paging::PageTable* 
 void release_file_mmap_ranges_for_pagemap(ker::mod::mm::paging::PageTable* pagemap);
 
 #ifdef WOS_SELFTEST
+struct SelftestFileCacheObservation {
+    void* retained_frame{};  // Caller owns one actual frame ref on a hit.
+    bool vacant_way{};       // Pre-SMP admission only, not a reservation.
+};
+[[nodiscard]] auto selftest_observe_file_mmap_cache(ker::vfs::File& file, uint64_t offset, SelftestFileCacheObservation& observation)
+    -> bool;
+[[nodiscard]] auto selftest_map_cached_private_file_page(ker::mod::sched::task::Task& subject, ker::vfs::File& file, uint64_t address,
+                                                         uint64_t offset) -> bool;
+[[nodiscard]] auto selftest_evict_file_mmap_cache_exact(ker::vfs::File& file, uint64_t offset, void* expected_frame) -> bool;
 auto selftest_file_mmap_sync_preflight(ker::mod::mm::paging::PageTable* pagemap) -> bool;
 auto selftest_file_mapping_admission(ker::mod::mm::paging::PageTable* pagemap) -> bool;
 auto selftest_file_writeback_policy() -> bool;
