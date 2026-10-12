@@ -17,7 +17,9 @@ layout. Placement transactions, CPU inheritance/ceilings, worker-exec and WKI
 priority inheritance remain incomplete.
 Checkpoint 43 prevents implicit Host console grants during private legacy
 creation and native execve. Its two new native tests and the full diagnostic
-suite pass; public process-launch and regular-file I/O qualification is pending.
+suite pass. Checkpoint 44 qualifies the finite public process-launch and
+regular-file I/O probe, including complete descriptor observations and an
+actual init-reap witness.
 Exact-owner ambient network admission is implemented;
 complete PID, lifecycle and WKI qualification remains incomplete. Independent
 service isolation and all ten goal criteria remain unqualified. Goal28 remains
@@ -237,11 +239,39 @@ diagnostic build, 64 relevant Host tests, formatting and the two diagnostic
 clang-tidy units pass. Compiler-measured Task and ShmidDs layouts are unchanged.
 
 The [public stdio fixture](../tests/fixtures/implicit_stdio_runtime.md) is admitted
-and compiles with libc-only linkage. It will check actual EXEC, null-options
-SPAWN, explicit-options SPAWN and FORK followed by EXECVE, complete descriptor
-censuses, explicit regular-file I/O and CLOEXEC behavior. Its runtime result is
-pending. Neither these native tests nor the fixture build completes a full
-Goal39 acceptance criterion.
+and compiles with libc-only linkage. Its Normal eight-CPU attempt03 passes actual
+EXEC, null-options SPAWN, explicit-options SPAWN and FORK followed by EXECVE.
+Two sequential UID100 private roots preserve the exact granted descriptor set;
+the replacement after CLOEXEC removes only FD2. Three Host controls preserve
+the original console fallback and explicit-options behavior. Console descriptors
+are inspected with FCNTL/FSTAT only.
+
+All 13 committed rows pass 3,816 row checks; the coordinator passes 59 checks.
+Saved reports retain 3,328 signed descriptor results, 208 guarded resource-limit
+observations, 52 complete 144-byte stat outputs and 78 I/O slots: 66 actual
+PREAD/PWRITE returns and 12 explicit console skips. All 13 specific positive-child
+consuming waits return their owned PID with status0. The 13 durable files total
+62,400 bytes. The independent 4,160-byte init snapshot records generation1,
+no restarts, EXITED/READY, PID/PGID-1, wait0 and an actual EXIT history entry.
+The workload takes 0.559 seconds. The runner stops its exact-owned VM through
+QMP at the 120-second bound; this does not establish natural VM poweroff or the
+witness's own later exit.
+
+Attempts01 and02 remain failed evidence. Attempt02 saved 11 reports and recorded
+one coordinator failure without the init witness. Its original wire omitted the
+first failing check, so the exact cause remains unproven. The narrow fixture
+amendment verifies the harness-prepared DIR0700/UID/GID100 instead of attempting
+parent-directory creation and records a first-failure ordinal. Fresh target
+build and formatting checks pass; production kernel/libc/init sources remain
+unchanged from checkpoint43.
+
+All 12 uploaded objects match both prepared and stopped readbacks. Source and
+artifact hashes remain stable; the unrelated user VM is preserved. All four
+exact-owned disposable images are pruned, leaving zero disposable allocation.
+Receipts are recorded in the Goal39 ledger. These finite native and public checks
+do not complete a full Goal39 criterion. File-mapping coherence, complete
+reference drains, two-hour simultaneous service operation and 1,000 full
+lifecycles remain unqualified.
 
 ## Private native mount ownership
 

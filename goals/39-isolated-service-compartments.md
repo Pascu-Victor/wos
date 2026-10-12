@@ -8,14 +8,19 @@
 
 ## Outcome and scale
 
-Current checkpoint 43 prevents implicit Host console grants during private
+Checkpoint 43 prevents implicit Host console grants during private
 legacy creation and native EXECVE while preserving the original Host fallback.
 The full KTEST74 run passes 1,437 cases, all 186 mandatory, 93,327 assertions
 and zero failures, shuts down naturally and prunes all four disposable images.
 Normal Build WOS, the isolated fast diagnostic build, 64 relevant Host tests,
-formatting and actual Task/ShmidDs ABI measurements pass. The public stdio
-fixture is admitted and compiled; actual process-launch and regular-file I/O
-qualification remains pending.
+formatting and actual Task/ShmidDs ABI measurements pass. Checkpoint 44's Normal
+eight-CPU public stdio attempt03 passes all 13 rows, descriptor/resource/stat/I/O
+observations, exact consuming waits and the actual init-exit snapshot. The
+fixture now observes its prepared result directory and records a first-failure
+ordinal; fresh target build/format checks pass without production changes.
+Both earlier failed attempts remain recorded. All four owned images are pruned,
+with zero disposable allocation and the unrelated VM preserved. This finite
+qualification does not complete a full criterion.
 
 Checkpoint 42 implements generation-scoped SysV creator/operator PID
 metadata while preserving physical attachment ownership and the public ABI.

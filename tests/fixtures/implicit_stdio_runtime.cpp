@@ -660,7 +660,10 @@ auto host() -> int {
     uint64_t failures{};
     auto expect = [&](bool value) {
         ++summary[11];
-        if (!value) ++failures;
+        if (!value) {
+            ++failures;
+            if (summary[13] == 0) summary[13] = summary[11];
+        }
     };
     expect(summary[3] == 100 && summary[4] == 100 && summary[5] == 100 && summary[6] == 100 && pid > 2);
     // The report descriptor is not ambient either: close it before creating this run's files.
@@ -668,7 +671,9 @@ auto host() -> int {
     auto const closed = close_ambient();
     summary[14] = bits(closed);
     expect(closed >= 0);
-    expect(mkdir(RESULTS, 0700) == 0 || errno == EEXIST);
+    struct stat result_directory{};
+    expect(stat(RESULTS, &result_directory) == 0 && S_ISDIR(result_directory.st_mode) && (result_directory.st_mode & 07777U) == 0700U &&
+           result_directory.st_uid == 100 && result_directory.st_gid == 100);
     for (unsigned wave = 1; wave <= 3; ++wave) {
         std::array<char, 64> marker{};
         auto const count = std::snprintf(marker.data(), marker.size(), "implicit-stdio nonce=%llu wave=%u\n",

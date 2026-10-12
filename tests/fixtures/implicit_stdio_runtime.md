@@ -1,17 +1,19 @@
-# Finite public implicit stdio probe (source-only draft)
+# Finite public implicit stdio probe
 
 This fixture exercises real public EXEC/SPAWN creation and FORK followed by native
 EXECVE. Its target is preservation of the exact explicitly admitted descriptor
-set in private compartments. No build or runtime qualification is claimed here.
-The complete preparation/read-pin protocol is
+set in private compartments. Actual target builds, formatting and runtime receipts
+are recorded separately in the goal ledger. Compilation alone does not establish
+public runtime qualification. The complete preparation/read-pin protocol is
 `checkpoint39-implicit-stdio-public-protocol03.json` in ignored evidence.
 
 Install the libc-only fixture as `/usr/libexec/implicit-stdio-runtime`. Run its
-Host service as UID/EUID/GID/EGID 100 with the usual explicit finite sixteen
-limits; NOFILE must admit FD9. The owned result directory is
-`/srv/implicit-stdio-results`, mode0700 and owned by UID100. The future runner must
-create a fresh result directory, exact immutable artifact/config bindings and
-separate rootless disposable images before launch. The fixture refuses existing
+Host service as UID/EUID/GID/EGID 100 with all sixteen inherited limit pairs
+recorded explicitly: fifteen are UINT64_MAX/UINT64_MAX, and NOFILE (resource7) is
+256/256. The runner prepares `/srv/implicit-stdio-results` with mode0700 and
+UID/GID100, fresh output names, exact immutable artifact/config bindings and
+separate rootless disposable images before launch. The coordinator verifies that
+prepared directory type, mode and ownership before creating output. The fixture refuses existing
 output files rather than reusing prior evidence. No directory or device is
 granted into a private compartment.
 
@@ -124,12 +126,14 @@ Each writer writes the whole row with commit0, fsyncs, writes the terminal commi
 word and fsyncs again. The consuming parent reads each completed row twice and
 requires exact equality/fresh guards. Successful check counts derived from source
 are: private absent leaves291/root303; private granted ordinary leaves293/root305;
-private granted case4 leaf292; all three Host leaves291. A future independent
-auditor must derive every actual oracle from saved fields, not trust those counts
+private granted case4 leaf292; all three Host leaves291. The independent
+auditor derives every actual oracle from saved fields, without trusting those counts
 or `failures==0` alone.
 
 The2048-byte Host summary has words0–12: magic/version/nonce/four IDs/PID/start/
-end/globaldeadline/checks/failures. Word13 is zero. Words14–22 record initial
+end/globaldeadline/checks/failures. Word13 is the first failing Host check ordinal
+(one-based), or zero on success. The successful wire and check count are unchanged.
+Words14–22 record initial
 ambient closes, roots created/consumed, Host children created/consumed, root rows
 read, total rows read13, final ambient closes and two final regular tokens checked.
 Words23/24 are actual final stdout/stderr read returns;25/26 their64-byte hashes.
@@ -156,7 +160,7 @@ three Host waits. Words62–253 are zero,254 guard(selector `0x484F5354`, wave/c
 | stderr-regular | 64 |
 
 The exact aggregate is62400 bytes, below65536. No config/proc/serial endpoint is
-silently part of this guest durable budget; future runner host logs/configs are
+silently part of this guest durable budget; runner host logs/configs are
 separate small immutable evidence. Every qualifying guest file has the exact
 length above. Missing, partial, stale, duplicate or uncommitted outputs fail.
 
@@ -170,6 +174,6 @@ and full Goal39 acceptance remain separate questions.
 
 The builder uses the current WOS clang++ target/sysroot, C++23/O2/debug info,
 Wall/Wextra/Werror, no exceptions/RTTI and libc-only linkage. It rejects an
-existing output and supports an explicit ignored draft source for root-owned
-future compilation. This preparation has not invoked it, formatted or compiled
-the fixture, launched a VM, or changed existing StageB files.
+existing output and supports an explicit source for a separate build. Each fixture
+revision requires fresh target build and formatting receipts before runtime
+qualification. Existing production and StageB evidence is recorded separately.
