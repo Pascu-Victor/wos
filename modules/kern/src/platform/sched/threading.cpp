@@ -206,6 +206,31 @@ auto has_automatic_stack(const Thread* thread) -> bool {
            thread->stack_base_virt == thread->layout_base_virt + mm::paging::PAGE_SIZE && thread->stack_size < thread->layout_size;
 }
 
+auto user_stack_return_address_is_admitted(const Thread* thread, mm::paging::PageTable* page_table, uint64_t address) noexcept -> bool {
+    constexpr uint64_t USER_LIMIT = 0x0000800000000000ULL;
+    constexpr uint64_t PAGE = mm::paging::PAGE_SIZE;
+    constexpr uint64_t PAGE_MASK = PAGE - 1;
+    if (page_table == nullptr || address == 0 || address >= USER_LIMIT || !has_automatic_stack(thread)) return false;
+    if (thread->layout_base_virt == 0 || thread->stack_base_virt == 0 || thread->tls_base_virt == 0 ||
+        ((thread->layout_base_virt | thread->layout_size | thread->stack_base_virt | thread->stack_size | thread->tls_base_virt) &
+         PAGE_MASK) != 0)
+        return false;
+
+    uint64_t layout_end = 0;
+    uint64_t stack_base = 0;
+    uint64_t top = 0;
+    uint64_t tls_base = 0;
+    if (!checked_add(thread->layout_base_virt, thread->layout_size, layout_end) ||
+        !checked_add(thread->layout_base_virt, PAGE, stack_base) || !checked_add(thread->stack_base_virt, thread->stack_size, top) ||
+        !checked_add(top, PAGE, tls_base) || layout_end >= USER_LIMIT || top >= USER_LIMIT || stack_base != thread->stack_base_virt ||
+        tls_base != thread->tls_base_virt || tls_base >= layout_end || address < stack_base || address >= top)
+        return false;
+
+    // A return can precede the first touch of a reserved stack page. This
+    // admits that address only; the unchanged fault path owns backing policy.
+    return mm::virt::is_page_mapped_or_reserved(page_table, address);
+}
+
 void record_stack_usage(task::Task& subject) {
     resource::Owner owner(&subject);
     if (owner.get() == nullptr) {

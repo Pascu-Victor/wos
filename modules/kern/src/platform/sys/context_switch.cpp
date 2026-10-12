@@ -17,6 +17,7 @@
 #include <platform/sched/frame_class.hpp>
 #include <platform/sched/preemption_policy.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <platform/sched/threading.hpp>
 #include <util/hcf.hpp>
 #ifdef WOS_KASAN
 #include <sanitizer/kasan.hpp>
@@ -197,8 +198,10 @@ inline void validate_user_frame(const gates::InterruptFrame& frame, sched::task:
     const bool RIP_LAZY_BACKED = RIP_UNMAPPED && !TASK_BAD && !RIP_BAD && lazy_user_range_allows(task, frame.rip, LazyUserAccess::EXECUTE);
     const bool RSP_LAZY_BACKED =
         RSP_UNMAPPED && !TASK_BAD && !RSP_BAD && lazy_user_range_allows(task, frame.rsp, LazyUserAccess::WRITE_STACK);
+    const bool RSP_RESERVED_STACK = RSP_UNMAPPED && !TASK_BAD && !RSP_BAD && !RSP_LAZY_BACKED &&
+                                    sched::threading::user_stack_return_address_is_admitted(task->thread, task->pagemap, frame.rsp);
     if (!TASK_BAD && !CS_BAD && !SS_BAD && !RIP_BAD && !RSP_BAD && !FLAGS_BAD && (!RIP_UNMAPPED || RIP_LAZY_BACKED) &&
-        (!RSP_UNMAPPED || RSP_LAZY_BACKED)) {
+        (!RSP_UNMAPPED || RSP_LAZY_BACKED || RSP_RESERVED_STACK)) {
         return;
     }
 

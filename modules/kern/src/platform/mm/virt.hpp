@@ -267,6 +267,20 @@ paddr_t translate(PageTable* page_table, vaddr_t vaddr);
 [[nodiscard]] auto user_page_pin_commit_write(const UserPagePin& pin) -> bool;
 void unpin_user_page(UserPagePin& pin);
 #ifdef WOS_SELFTEST
+// Native callers retain an actual Task-access hold for the exact expected root.
+// Observation is local to this call; production pin signatures are unchanged.
+struct UserPagePinPathObservation {
+    uint32_t early_attempts{};
+    uint32_t early_successes{};
+    uint32_t writable_resolution_calls{};
+};
+[[nodiscard]] auto selftest_pin_user_page_for_task_observed(sched::task::Task* task, PageTable* expected_pagemap, vaddr_t vaddr,
+                                                            bool require_writable, bool fault_in, UserPagePin& out,
+                                                            UserPagePinPathObservation& observation) -> bool;
+[[nodiscard]] auto selftest_user_pagemap_reader_count(PageTable* pagemap) -> uint32_t;
+// Permission-only exchange in an exclusively owned, never-active native root.
+[[nodiscard]] auto selftest_exchange_unpublished_user_entry(sched::task::Task& task, PageTable* expected_pagemap, vaddr_t vaddr,
+                                                            unsigned level, uint64_t expected_raw, uint64_t replacement_raw) -> bool;
 // Arms one exact recoverable kernel page fault. KTEST parks secondary CPUs;
 // the caller must also mask local interrupts around the probe. A mismatched
 // fault is deliberately not consumed and therefore follows the normal panic

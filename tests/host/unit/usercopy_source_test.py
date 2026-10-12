@@ -170,8 +170,19 @@ def require_mapping_stable_pin_contract() -> None:
 
     pin = function_body(virt_cpp, "pin_user_page")
     pin_common = function_body(virt_cpp, "pin_user_page_common")
+    pin_attempt = function_body(virt_cpp, "try_pin_current_user_page_mapping")
+    acquire = "acquire_user_pagemap_access(pagemap, wait_for_teardown, access_gate_index)"
+    attempt = "try_pin_current_user_page_mapping(pagemap, vaddr, require_writable, access_gate_index, out)"
+    early = "task != nullptr && require_writable && fault_in && task->pagemap == pagemap"
+    ready = "bool const READY = task == nullptr"
+    if acquire not in pin_common or pin_common.count(attempt) != 2 or early not in pin_common or ready not in pin_common:
+        fail("VM user-page pin must retain the root gate through its actual early and fallback attempts")
+    if not (
+        pin_common.index("out = {}") < pin_common.index(acquire) < pin_common.index(early)
+        < pin_common.index(attempt) < pin_common.index(ready) < pin_common.rindex(attempt)
+    ):
+        fail("VM user-page pin must acquire root lifetime before either pin attempt or fault resolution")
     for snippet in [
-        "acquire_user_pagemap_access(pagemap, wait_for_teardown, access_gate_index)",
         "user_mapping_pin_lock.lock_irqsave()",
         "snapshot_user_page_mapping_locked",
         "phys::page_ref_try_inc",
@@ -179,8 +190,24 @@ def require_mapping_stable_pin_contract() -> None:
         ".require_writable = require_writable",
         "user_mapping_pin_lock.unlock_irqrestore",
     ]:
-        if snippet not in pin_common:
+        if snippet not in pin_attempt:
             fail(f"VM user-page pin is not mapping-stable: {snippet}")
+    if not (
+        pin_attempt.index("user_mapping_pin_lock.lock_irqsave()")
+        < pin_attempt.index("phys::page_ref_try_inc")
+        < pin_attempt.index("confirmed_page == physical_page")
+        < pin_attempt.index("user_mapping_pin_lock.unlock_irqrestore")
+        < pin_attempt.index("if (!pinned)") < pin_attempt.index("phys::page_ref_dec")
+        < pin_attempt.index("out = {")
+    ) or "release_user_pagemap_access" in pin_attempt:
+        fail("VM pin attempt must restore IRQs before dropping a failed frame and retain the caller's root gate")
+    if ".access_gate_index = held_access_gate_index" not in pin_attempt:
+        fail("VM pin success must transfer its actual held root gate")
+
+    snapshot = function_body(virt_cpp, "snapshot_user_page_mapping_locked")
+    leaf = snapshot.index("PageTableEntry const& entry = entry_at(table, index_of(vaddr, 1))")
+    if "shared_write_restricted" in snapshot[:leaf] or "paging::shared_write_restricted(RAW)" not in snapshot[leaf:]:
+        fail("VM writable pin must enforce the final leaf's maximum permission independently of ancestor software tags")
 
     task_pin = function_body(virt_cpp, "pin_user_page_for_task")
     if "pin_user_page_common(task, expected_pagemap" not in task_pin:
@@ -190,11 +217,18 @@ def require_mapping_stable_pin_contract() -> None:
     for snippet in [
         "user_mapping_pin_lock.lock_irqsave()",
         "CURRENT_PAGE == pin.physical_page",
+        "!paging::shared_write_restricted(RAW)",
         "__atomic_fetch_or(raw_entry, PTE_DIRTY_BIT, __ATOMIC_ACQ_REL)",
         "user_mapping_pin_lock.unlock_irqrestore",
     ]:
         if snippet not in write_commit:
             fail(f"stable usercopy write commit is incomplete: {snippet}")
+    if not (
+        write_commit.index("!paging::shared_write_restricted(RAW)")
+        < write_commit.index("__atomic_fetch_or(raw_entry, PTE_DIRTY_BIT, __ATOMIC_ACQ_REL)")
+        < write_commit.index("user_mapping_pin_lock.unlock_irqrestore")
+    ):
+        fail("stable usercopy write must check maximum leaf permission before marking the current frame dirty")
 
     for snippet in [
         "USER_PAGEMAP_ACCESS_GATE_COUNT = 4096",

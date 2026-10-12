@@ -2952,7 +2952,8 @@ auto snapshot_user_page_mapping_locked(PageTable* pagemap, vaddr_t vaddr, bool r
 
     PageTableEntry const& entry = entry_at(table, index_of(vaddr, 1));
     uint64_t const RAW = pte_raw(entry);
-    if (entry.present == 0 || entry.user == 0 || (require_writable && (entry.writable == 0 || (RAW & paging::PAGE_COW) != 0U))) {
+    if (entry.present == 0 || entry.user == 0 ||
+        (require_writable && (entry.writable == 0 || (RAW & paging::PAGE_COW) != 0U || paging::shared_write_restricted(RAW)))) {
         return false;
     }
 
@@ -3638,22 +3639,8 @@ bool user_page_writable_now(PageTable* pagemap, vaddr_t vaddr) { return user_pag
 
 namespace {
 
-auto pin_user_page_common(sched::task::Task* task, PageTable* pagemap, vaddr_t vaddr, bool require_writable, bool fault_in,
-                          bool wait_for_teardown, UserPagePin& out) -> bool {
-    out = {};
-    size_t access_gate_index = USER_PAGEMAP_ACCESS_GATE_NONE;
-    if (!acquire_user_pagemap_access(pagemap, wait_for_teardown, access_gate_index)) {
-        return false;
-    }
-
-    bool const READY = task == nullptr ||
-                       (task->pagemap == pagemap &&
-                        (!fault_in || (require_writable ? ensure_user_page_writable(task, vaddr) : ensure_user_page_mapped(task, vaddr))));
-    if (!READY || (task != nullptr && task->pagemap != pagemap)) {
-        release_user_pagemap_access(access_gate_index);
-        return false;
-    }
-
+auto try_pin_current_user_page_mapping(PageTable* pagemap, vaddr_t vaddr, bool require_writable, size_t held_access_gate_index,
+                                       UserPagePin& out) -> bool {
     paddr_t physical_page = PADDR_INVALID;
     paddr_t confirmed_page = PADDR_INVALID;
     void* hhdm_page = nullptr;
@@ -3675,7 +3662,6 @@ auto pin_user_page_common(sched::task::Task* task, PageTable* pagemap, vaddr_t v
         if (ref_acquired) {
             phys::page_ref_dec(hhdm_page, &lookup_hint);
         }
-        release_user_pagemap_access(access_gate_index);
         return false;
     }
 
@@ -3685,10 +3671,59 @@ auto pin_user_page_common(sched::task::Task* task, PageTable* pagemap, vaddr_t v
         .physical_page = physical_page,
         .hhdm_page = hhdm_page,
         .lookup_hint = lookup_hint,
-        .access_gate_index = access_gate_index,
+        .access_gate_index = held_access_gate_index,
         .require_writable = require_writable,
         .dirty = dirty,
     };
+    return true;
+}
+
+auto pin_user_page_common(sched::task::Task* task, PageTable* pagemap, vaddr_t vaddr, bool require_writable, bool fault_in,
+                          bool wait_for_teardown, UserPagePin& out
+#ifdef WOS_SELFTEST
+                          ,
+                          UserPagePinPathObservation* observation = nullptr
+#endif
+                          ) -> bool {
+    out = {};
+    size_t access_gate_index = USER_PAGEMAP_ACCESS_GATE_NONE;
+    if (!acquire_user_pagemap_access(pagemap, wait_for_teardown, access_gate_index)) {
+        return false;
+    }
+
+    if (task != nullptr && require_writable && fault_in && task->pagemap == pagemap) {
+#ifdef WOS_SELFTEST
+        if (observation != nullptr) {
+            ++observation->early_attempts;
+        }
+#endif
+        if (try_pin_current_user_page_mapping(pagemap, vaddr, require_writable, access_gate_index, out)) {
+#ifdef WOS_SELFTEST
+            if (observation != nullptr) {
+                ++observation->early_successes;
+            }
+#endif
+            return true;
+        }
+    }
+
+#ifdef WOS_SELFTEST
+    if (observation != nullptr && task != nullptr && task->pagemap == pagemap && fault_in && require_writable) {
+        ++observation->writable_resolution_calls;
+    }
+#endif
+    bool const READY = task == nullptr ||
+                       (task->pagemap == pagemap &&
+                        (!fault_in || (require_writable ? ensure_user_page_writable(task, vaddr) : ensure_user_page_mapped(task, vaddr))));
+    if (!READY || (task != nullptr && task->pagemap != pagemap)) {
+        release_user_pagemap_access(access_gate_index);
+        return false;
+    }
+
+    if (!try_pin_current_user_page_mapping(pagemap, vaddr, require_writable, access_gate_index, out)) {
+        release_user_pagemap_access(access_gate_index);
+        return false;
+    }
     return true;
 }
 
@@ -3747,7 +3782,7 @@ auto user_page_pin_commit_write(const UserPagePin& pin) -> bool {
         uint64_t const RAW = pte_raw(entry);
         paddr_t const CURRENT_PAGE = static_cast<paddr_t>(entry.frame) << paging::PAGE_SHIFT;
         if (entry.present != 0 && entry.user != 0 && entry.writable != 0 && (RAW & paging::PAGE_COW) == 0U &&
-            CURRENT_PAGE == pin.physical_page) {
+            !paging::shared_write_restricted(RAW) && CURRENT_PAGE == pin.physical_page) {
             // Preserve Accessed/Dirty updates that hardware may publish while
             // this CPU holds the software leaf-mutation lock.
             constexpr uint64_t PTE_DIRTY_BIT = 1ULL << 6U;
@@ -3779,6 +3814,65 @@ bool selftest_user_pagemap_exclusive_rejects_mapped_pin(PageTable* pagemap) {
     UserPagemapExclusiveScope exclusive(pagemap);
     UserPagePin pin{};
     return !pin_user_page(pagemap, 0, false, pin, false) && pin.pagemap == nullptr && pin.hhdm_page == nullptr;
+}
+
+auto selftest_pin_user_page_for_task_observed(sched::task::Task* task, PageTable* expected_pagemap, vaddr_t vaddr, bool require_writable,
+                                              bool fault_in, UserPagePin& out, UserPagePinPathObservation& observation) -> bool {
+    observation = {};
+    if (task == nullptr) {
+        out = {};
+        return false;
+    }
+    return pin_user_page_common(task, expected_pagemap, vaddr, require_writable, fault_in, fault_in, out, &observation);
+}
+
+auto selftest_user_pagemap_reader_count(PageTable* pagemap) -> uint32_t {
+    if (pagemap == nullptr) {
+        return UINT32_MAX;
+    }
+    return user_pagemap_access_gates.at(user_pagemap_access_gate_index(pagemap)).readers.load(std::memory_order_acquire);
+}
+
+auto selftest_exchange_unpublished_user_entry(sched::task::Task& task, PageTable* expected_pagemap, vaddr_t vaddr, unsigned level,
+                                              uint64_t expected_raw, uint64_t replacement_raw) -> bool {
+    if (task.state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE || task.pid != 0 ||
+        task.scheduler_published.load(std::memory_order_acquire) || task.thread != nullptr || expected_pagemap == nullptr ||
+        task.pagemap != expected_pagemap || expected_pagemap == kernel_pagemap || is_current_pagemap(expected_pagemap) ||
+        vaddr >= 0x0000800000000000ULL || level < 1 || level > 4) {
+        return false;
+    }
+    uint64_t allowed = paging::PAGE_PRESENT | paging::PAGE_USER | paging::PAGE_WRITE | paging::PAGE_COW;
+    if (level == 2 || level == 3) {
+        allowed |= 1ULL << 7U;
+    }
+    if (level == 1) {
+        allowed |= paging::PAGE_SHARED | paging::PAGE_WRITE_RESTRICTED;
+    }
+    if (((expected_raw ^ replacement_raw) & ~allowed) != 0U) {
+        return false;
+    }
+
+    uint64_t const LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
+    PageTable* table = expected_pagemap;
+    bool valid_path = true;
+    for (unsigned current = 4; current > level; --current) {
+        PageTableEntry& entry = entry_at(table, index_of(vaddr, static_cast<int>(current)));
+        if (entry.present == 0 || entry.user == 0 || (current < 4 && entry.pagesize != 0)) {
+            valid_path = false;
+            break;
+        }
+        table = reinterpret_cast<PageTable*>(addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT));
+    }
+    bool exchanged = false;
+    if (valid_path) {
+        PageTableEntry& entry = entry_at(table, index_of(vaddr, static_cast<int>(level)));
+        if (pte_raw(entry) == expected_raw) {
+            entry = pte_from_raw(replacement_raw);
+            exchanged = true;
+        }
+    }
+    user_mapping_pin_lock.unlock_irqrestore(LOCK_FLAGS);
+    return exchanged;
 }
 #endif
 

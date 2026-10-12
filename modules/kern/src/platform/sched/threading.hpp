@@ -59,6 +59,10 @@ Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTa
                       const ker::loader::elf::TlsModule& tls_info, task::Task* policy_owner);
 void destroy_thread(Thread* thread);
 auto has_automatic_stack(const Thread* thread) -> bool;
+// Borrowed selected-image metadata/root; no backing, owner lookup or locks.
+// The existing leaf query is not a general concurrent mapping snapshot.
+[[nodiscard]] auto user_stack_return_address_is_admitted(const Thread* thread, mm::paging::PageTable* page_table, uint64_t address) noexcept
+    -> bool;
 void record_stack_usage(task::Task& subject);
 bool ensure_stack_backing(Thread* thread, mm::paging::PageTable* page_table, uint64_t start, uint64_t end, task::Task* policy_owner);
 bool handle_lazy_stack_fault(Thread* thread, mm::paging::PageTable* page_table, uint64_t fault_addr, uint64_t rsp,

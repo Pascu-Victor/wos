@@ -278,6 +278,32 @@ void* race_mapper(void* raw_context) {
     return nullptr;
 }
 
+[[noreturn]] void fail_race_join(int join_result) {
+    constexpr char PREFIX[] = "usercopy-negative: FAIL COMMON/race pthread_join: ";
+    std::array<char, sizeof(PREFIX) + 21> message{};
+    size_t size = sizeof(PREFIX) - 1;
+    std::memcpy(message.data(), PREFIX, size);
+
+    int64_t const DETAIL = -static_cast<int64_t>(join_result);
+    uint64_t magnitude = static_cast<uint64_t>(DETAIL);
+    if (DETAIL < 0) {
+        message[size++] = '-';
+        magnitude = uint64_t{0} - magnitude;
+    }
+    std::array<char, 20> digits{};
+    size_t digit_count = 0;
+    do {
+        digits[digit_count++] = static_cast<char>('0' + magnitude % 10);
+        magnitude /= 10;
+    } while (magnitude != 0);
+    while (digit_count != 0) {
+        message[size++] = digits[--digit_count];
+    }
+    message[size++] = '\n';
+    static_cast<void>(write(STDERR_FILENO, message.data(), size));
+    _Exit(1);
+}
+
 void probe_concurrent_unmap(ProbeState& state) {
     RaceContext context{};
     context.address = mmap(nullptr, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -297,7 +323,10 @@ void probe_concurrent_unmap(ProbeState& state) {
         state.fail("COMMON", "race setup munmap", -errno);
         context.stop.store(true, std::memory_order_release);
         context.start.store(true, std::memory_order_release);
-        pthread_join(worker, nullptr);
+        int const JOIN_RESULT = pthread_join(worker, nullptr);
+        if (JOIN_RESULT != 0) {
+            fail_race_join(JOIN_RESULT);
+        }
         return;
     }
 
@@ -315,7 +344,7 @@ void probe_concurrent_unmap(ProbeState& state) {
     context.stop.store(true, std::memory_order_release);
     int const JOIN_RESULT = pthread_join(worker, nullptr);
     if (JOIN_RESULT != 0) {
-        state.fail("COMMON", "race pthread_join", -JOIN_RESULT);
+        fail_race_join(JOIN_RESULT);
     }
     state.expect("VMEM", "concurrent mapper errors", context.map_failures.load(std::memory_order_relaxed), 0);
     static_cast<void>(munmap(context.address, PAGE_SIZE));
