@@ -181,8 +181,36 @@ All 12 current uploaded objects match prepared and stopped read-only hashes;
 all 886 source/artifact pins stay unchanged. The workload completes in 0.590s;
 the runner stops its exact-owned VM at the existing 120s wall timeout because
 service output uses the journal. Four disposable images are pruned. This does
-not qualify child-operator/history observation, successful foreign PID
+not by itself qualify child-operator/history observation, successful foreign PID
 projection, complete reference drains, two-hour operation or 1,000 lifecycles.
+
+The subsequent Normal eight-CPU StageB run qualifies public child-operator and
+retained-history observation. Each private root captures full guarded 120-byte
+`ShmidDs` values around its child's extra attach/detach and its own extra
+attach/detach. Creator/operator/attachment tuples are `1/1/2`, `1/2/3`,
+`1/2/2`, `1/1/3`, `1/1/2`. B's actual PID 2 child creates a distinct object
+and writes a run-specific marker. B observes `2/2/1` before attaching and
+`2/1/2` afterward. Only after the original consuming wait returns local PID 2
+with status 0 does it verify the retained marker and `2/1/1`, then detach and
+verify `2/1/0`. Removal succeeds; the subsequent rejected STAT preserves all
+120 sentinel bytes and both guards. The Host object separately reports physical
+creator/operator PID 103. All status padding, permissions, sizes and reserved
+fields are checked, including the failed observation.
+
+All original sharing, refusal, credential and FD checks pass. A's child
+disappears 1,101 microseconds after its init is killed, before its 30-second
+sleep expires; B continues and exits successfully. The independent init
+snapshot confirms the Host probe's actual exit 0. All 17 durable files total
+57,222 bytes, within the 64,640-byte cap. All 12 uploaded objects match both
+prepared and stopped read-only hashes; all 984 current runtime input paths
+remain unchanged. The actual workload takes 0.649s. The runner reaches its
+existing 120s wall timeout and stops only its owned VM through QMP, then checks
+the saved reports; this is not natural poweroff. All four disposable images
+are pruned, releasing 197,279,744 allocated bytes, while the unrelated VM is
+preserved. See the [fixture protocol](../tests/fixtures/compartment_shared_runtime.md)
+and its explicit-output builder for reproduction. Successful foreign-view
+projection, writable File coherence/cache eviction, complete reference drains,
+two-hour operation and 1,000 full lifecycles remain unqualified.
 
 ## Private native mount ownership
 

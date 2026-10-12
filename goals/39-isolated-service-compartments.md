@@ -12,11 +12,13 @@ Current checkpoint 42 implements generation-scoped SysV creator/operator PID
 metadata while preserving physical attachment ownership and the public ABI.
 Seven new native cases passed in KTEST73: 1,435 executed cases, all 184 mandatory,
 93,325 assertions and zero failures. The Normal eight-CPU public StageA run
-also verifies both private roots' creator/operator PID 1/1 and preserves all
-32 mutable, 32 read-only and two negative sharing rounds plus actual init
-retirement and sibling progress. Public child-operator/history observation,
-the SMP workload and complete reference drains remain unqualified; this does
-not complete a full criterion.
+also verifies both private roots' creator/operator PID 1/1. The subsequent
+Normal eight-CPU StageB run qualifies actual local PID 2 attach/detach operators
+and a child-created object's retained PID 2 history after actual wait/reaping.
+Full guarded 120-byte status observations preserve all 32 mutable, 32 read-only
+and two negative sharing rounds, init retirement and sibling progress. Successful
+foreign-view PID projection, the SMP workload and complete reference drains
+remain unqualified; these bounded runs do not complete a full criterion.
 Historical checkpoint 38 qualifies atomic access to all five Task placement
 scalars with unchanged compiler-measured layout and three actual native cases.
 Checkpoint 37's locked hard-domain admission, checkpoint 36's immutable registry
@@ -166,7 +168,7 @@ and restart step, and mark the active goal blocked. Missing prerequisites or
 hardware are never completion. Budget and pause controls remain user/system
 controlled.
 
-## Current session checkpoint (2026-10-11)
+## Current session checkpoint (2026-10-12)
 
 Selected after user-requested Goal28 checkpoint commit70bc3fe7 and goal switch.
 Goal28 remains incomplete as a repository checkpoint. The user cleared its
@@ -1051,3 +1053,45 @@ expected seven Python fixtures in the tidy receipt, which correctly pins only
 24 C++ sources. Revision02 binds those exact 24 rows; the separate Host execution,
 source freeze and runtime pins cover all seven Python fixtures. No production or
 execution evidence was changed for this correction.
+
+
+## Checkpoint42: public SysV operator and history qualification (2026-10-12)
+
+The scheduled Normal eight-CPU StageB run passes actual child attach/detach
+operator changes and retained child-created history after consuming local
+wait2/status0. Five guarded original-object status snapshots per tree and B's
+five history/removal snapshots check every120-byte field and both guards; the
+Host reports its physical creator/operator identity separately. No kernel,
+libc, syscall or wire change is introduced by this public fixture. Its original
+32 mutable,32 read-only and2 negative rounds, refused foreign names, exact
+FD/credential policy, A init retirement and B survivor progress remain required.
+
+Actual17 durable outputs total57222 bytes below the64640-byte cap. Independent
+terminal review passes10150 checks with1026 unique current inputs/errors[]:
+checkpoint42-sharing-stageb-independent-terminal01.json SHA256
+b27db65a38e61989310b6ed2d9300edba323da8267f558dfc8a6ad001691cece.
+Actual init4160 snapshot records probe generation1/restarts0/EXITED6/READY2/
+wait0/error0. All12 prepared and12 stopped uploaded objects match. The984 inner
+and978 outer source rows remain stable at execution. Prior Native73/StageA
+fixture bytes remain complete historical archives; current executable sources
+and the production kernel are held. A later README-only qualification note is
+explicitly distinguished from the executed README hash.
+
+Normal Build WOS, actual cross-target fixture compile and repository format
+check pass. The format selection has no matching clang-tidy compilation unit;
+this is not a fixture tidy claim. See tests/fixtures/compartment_shared_runtime.md
+and its explicit-output builder for the protocol and reproduction requirements.
+The runner uses --no-setup and exact-owned QMP quit at its existing120s external
+wall deadline, followed by stopped read-only evidence validation; natural guest
+poweroff is not claimed. Four proven inactive agent-owned disks are pruned,
+releasing197279744 allocated bytes, final disposable0. Before/live/after retains
+user VM13532/UID945/startticks428227/exactargv and the20GiB/40GiB bounds.
+
+Goal39 remains ACTIVE; all ten full criteria remain incomplete. This campaign
+does not qualify successful foreign-view PID projection, writable File coherence
+or cache eviction, the unresolved SMP workload, full reference/GC drains,
+two-hour simultaneous services or1000 complete lifecycle/fault cycles. The next
+consumer review found an implicit Host console-capability grant in ordinary
+legacy spawn and native execve. Fix it under a new critical patch contract,
+preserving exact Host fallbacks and explicit inherited private descriptors;
+then qualify actual public WKI refusal/local execution. No pause or push.
