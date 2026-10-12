@@ -626,6 +626,11 @@ auto ensure_exec_stdio_fallbacks(ker::mod::sched::task::Task* task) -> bool {
         return false;
     }
 
+    // Live private views preserve only inherited or explicitly granted FDs.
+    // Closed or unbound views refuse before any Host device or table effect.
+    int const SCOPE = ker::mod::security::compartment::host_namespace_admission(task);
+    if (SCOPE != 0) return SCOPE == -EPERM;
+
     constexpr int STDIN_OPEN_FLAGS = 0;   // O_RDONLY
     constexpr int STDOUT_OPEN_FLAGS = 1;  // O_WRONLY
 
@@ -6952,6 +6957,319 @@ auto exec_selftest_remote_request_claim_and_cancel() -> bool {
     }
     return ok;
 }
+// BEGIN EXEC STDIO SCOPE SELFTESTS — append before the final WOS_SELFTEST endif.
+namespace {
+using StdioScopeTask = ker::mod::sched::task::Task;
+namespace stdio_pid = ker::mod::sched::pid_ns;
+namespace stdio_ipc = ker::mod::sched::ipc;
+namespace stdio_mount = ker::vfs::mount_ns;
+namespace stdio_resource = ker::mod::sched::resource;
+namespace stdio_security = ker::mod::security;
+
+struct StdioScopeFixture {
+    std::unique_ptr<StdioScopeTask> task{new (std::nothrow) StdioScopeTask};
+    uint64_t reserved_fd = UINT64_MAX;
+
+    StdioScopeFixture() {
+        if (task) {
+            task->pid = ker::mod::sched::task::get_next_pid();
+            task->type = ker::mod::sched::task::TaskType::PROCESS;
+        }
+    }
+    ~StdioScopeFixture() {
+        if (!task) return;
+        // Exclusively owned, unpublished tables; close outside every IRQ lock.
+        if (reserved_fd != UINT64_MAX) static_cast<void>(task->fd_table.cancel(reserved_fd, this));
+        for (unsigned fd = 0; fd < StdioScopeTask::FD_TABLE_SIZE; ++fd) {
+            auto* file = static_cast<vfs::File*>(task->fd_table.remove(fd));
+            if (file != nullptr) vfs::vfs_put_file(file);
+        }
+    }
+    auto add_control(unsigned fd) -> bool {
+        if (!task) return false;
+        auto* file = exec_selftest_make_file();
+        if (file == nullptr) return false;
+        file->fd = static_cast<int>(fd);
+        file->open_flags = 1 | 0x800;
+        file->fd_flags = 1;
+        file->pos = 137;
+        if (!task->fd_table.insert(fd, file)) {
+            vfs::vfs_put_file(file);
+            return false;
+        }
+        task->set_fd_cloexec(fd);
+        return true;
+    }
+    auto reserve(unsigned fd) -> bool {
+        if (!task || reserved_fd != UINT64_MAX) return false;
+        reserved_fd = task->fd_table.reserve(fd, StdioScopeTask::FD_TABLE_SIZE, this);
+        return reserved_fd == fd;
+    }
+};
+
+struct StdioScopeFileObservation {
+    vfs::File* file{};
+    vfs::FileOperations* operations{};
+    void* private_data{};
+    off_t position{};
+    int descriptor{}, flags{}, descriptor_flags{}, references{};
+    vfs::FSType backend{};
+    bool reserved{};
+    auto operator==(const StdioScopeFileObservation&) const -> bool = default;
+};
+
+struct StdioScopeObservation {
+    std::unique_ptr<std::array<StdioScopeFileObservation, StdioScopeTask::FD_TABLE_SIZE>> files{
+        new (std::nothrow) std::array<StdioScopeFileObservation, StdioScopeTask::FD_TABLE_SIZE>{}};
+    StdioScopeTask::FdCloexecBitmap cloexec{};
+    stdio_resource::State resources{};
+    stdio_security::Snapshot credentials{};
+    size_t descriptors{}, reservations{};
+    uint32_t task_references{};
+    uint64_t thread_owners{}, cpu_threads{};
+    int control_closes{};
+
+    explicit StdioScopeObservation(StdioScopeTask& subject)
+        : cloexec(subject.fd_cloexec),
+          resources(subject.resources),
+          credentials(subject.credentials()),
+          descriptors(subject.fd_table.size()),
+          reservations(subject.fd_table.reserved_count()),
+          task_references(subject.ref_count.load()),
+          thread_owners(subject.resource_thread_owners.load()),
+          cpu_threads(subject.resource_cpu_threads.load()),
+          control_closes(g_exec_selftest_close_count.load()) {
+        if (!files) return;
+        for (unsigned fd = 0; fd < StdioScopeTask::FD_TABLE_SIZE; ++fd) {
+            auto& row = (*files)[fd];
+            row.reserved = subject.fd_table.reserved(fd);
+            row.file = static_cast<vfs::File*>(subject.fd_table.lookup(fd));
+            if (row.file == nullptr) continue;
+            row.operations = row.file->fops;
+            row.private_data = row.file->private_data;
+            row.position = row.file->pos;
+            row.descriptor = row.file->fd;
+            row.flags = row.file->open_flags;
+            row.descriptor_flags = row.file->fd_flags;
+            row.references = row.file->refcount.load();
+            row.backend = row.file->fs_type;
+        }
+    }
+    auto unchanged(StdioScopeTask& subject) const -> bool {
+        if (!files || cloexec != subject.fd_cloexec || credentials != subject.credentials() || descriptors != subject.fd_table.size() ||
+            reservations != subject.fd_table.reserved_count() || task_references != subject.ref_count.load() ||
+            thread_owners != subject.resource_thread_owners.load() || cpu_threads != subject.resource_cpu_threads.load() ||
+            control_closes != g_exec_selftest_close_count.load())
+            return false;
+        for (unsigned fd = 0; fd < StdioScopeTask::FD_TABLE_SIZE; ++fd) {
+            StdioScopeFileObservation row{};
+            row.reserved = subject.fd_table.reserved(fd);
+            row.file = static_cast<vfs::File*>(subject.fd_table.lookup(fd));
+            if (row.file != nullptr) {
+                row.operations = row.file->fops;
+                row.private_data = row.file->private_data;
+                row.position = row.file->pos;
+                row.descriptor = row.file->fd;
+                row.flags = row.file->open_flags;
+                row.descriptor_flags = row.file->fd_flags;
+                row.references = row.file->refcount.load();
+                row.backend = row.file->fs_type;
+            }
+            if ((*files)[fd] != row) return false;
+        }
+        for (unsigned id = 0; id < resources.entries.size(); ++id) {
+            auto const& a = resources.entries[id];
+            auto const& b = subject.resources.entries[id];
+            if (a.limit.soft != b.limit.soft || a.limit.hard != b.limit.hard || a.current != b.current || a.peak != b.peak ||
+                a.denied != b.denied || a.reason != b.reason || a.reserved != b.reserved)
+                return false;
+        }
+        return resources.cpu_time_us == subject.resources.cpu_time_us && resources.cpu_user_time_us == subject.resources.cpu_user_time_us &&
+               resources.cpu_system_time_us == subject.resources.cpu_system_time_us &&
+               resources.cpu_last_soft_second == subject.resources.cpu_last_soft_second &&
+               resources.cpu_hard_notified == subject.resources.cpu_hard_notified;
+    }
+};
+
+struct StdioScopeNamespaceBaseline {
+    size_t pids = stdio_pid::live_namespace_count();
+    size_t ipc = stdio_ipc::live_namespace_count();
+    size_t mounts = stdio_mount::live_namespace_count();
+    auto restored() const -> bool {
+        return pids == stdio_pid::live_namespace_count() && ipc == stdio_ipc::live_namespace_count() &&
+               mounts == stdio_mount::live_namespace_count();
+    }
+};
+
+auto stdio_scope_console_file(vfs::File* file, unsigned fd) -> bool {
+    vfs::Stat stat{};
+    return file != nullptr && file->fs_type == vfs::FSType::DEVFS && file->fops == vfs::devfs::get_devfs_fops() &&
+           file->refcount.load() == 1 && file->fd == static_cast<int>(fd) && file->open_flags == (fd == 0 ? 0 : 1) && file->fd_flags == 0 &&
+           vfs::vfs_fstat_file(file, &stat) == 0 && (stat.st_mode & vfs::S_IFMT) == vfs::S_IFCHR;
+}
+
+auto stdio_scope_initialize_views(StdioScopeTask& task, unsigned mask, const stdio_pid::NamespaceRef& pids,
+                                  const stdio_ipc::NamespaceRef& names, const stdio_mount::NamespaceRef& mounts) -> bool {
+    return ((mask & 1) == 0 || task.initialize_pid_namespace(pids)) && ((mask & 2) == 0 || task.initialize_ipc_namespace(names)) &&
+           ((mask & 4) == 0 || task.initialize_mount_namespace(mounts));
+}
+}  // namespace
+
+auto exec_selftest_stdio_host_and_private_views() -> bool {
+    StdioScopeNamespaceBaseline const BASELINE;
+    int const CONTROL_CLOSES = g_exec_selftest_close_count.load();
+    // Console/devfs are genuinely initialized in phase3, before --selftest.
+    // Require real opens: a missing backend must not make private tests pass.
+    for (uint64_t limit : {uint64_t{256}, uint64_t{0}, uint64_t{1}, uint64_t{2}, uint64_t{3}}) {
+        StdioScopeFixture host;
+        if (!host.task || host.task->resources.set(static_cast<unsigned>(ker::abi::resource::Id::NOFILE), {limit, limit}, true,
+                                                   StdioScopeTask::FD_TABLE_SIZE) != 0)
+            return false;
+        for (unsigned fd = 0; fd < 3; ++fd) host.task->set_fd_cloexec(fd);
+        if (!ensure_exec_stdio_fallbacks(host.task.get()) || host.task->fd_table.size() != std::min(limit, uint64_t{3})) return false;
+        for (unsigned fd = 0; fd < 3; ++fd) {
+            auto* file = static_cast<vfs::File*>(host.task->fd_table.lookup(fd));
+            if (fd < limit) {
+                if (!stdio_scope_console_file(file, fd) || host.task->get_fd_cloexec(fd)) return false;
+            } else if (file != nullptr || !host.task->get_fd_cloexec(fd)) {
+                return false;
+            }
+        }
+    }
+    {
+        StdioScopeFixture reserved;
+        if (!reserved.reserve(0)) return false;
+        StdioScopeObservation const BEFORE(*reserved.task);
+        if (ensure_exec_stdio_fallbacks(reserved.task.get()) || !BEFORE.unchanged(*reserved.task)) return false;
+    }
+    using Network = stdio_security::compartment::Network;
+    for (unsigned mask = 1; mask < 8; ++mask) {
+        for (auto network : {Network::DENIED, Network::SHARED_HOST}) {
+            for (bool nonroot : {false, true}) {
+                stdio_pid::NamespaceRef pids, host;
+                stdio_ipc::NamespaceRef names;
+                stdio_mount::NamespaceRef mounts;
+                if (stdio_pid::create_namespace(host, network, pids) != 0 || stdio_ipc::create_namespace(names) != 0 ||
+                    stdio_mount::create_namespace(mounts) != 0)
+                    return false;
+                StdioScopeFixture parent, child;
+                if (!parent.task || !child.task || !stdio_scope_initialize_views(*child.task, mask, pids, names, mounts)) return false;
+                if (nonroot) {
+                    stdio_security::Snapshot credentials;
+                    if (stdio_security::Snapshot::restore_fields({.user = {100, 100, 100}, .group = {100, 100, 100}}, credentials) != 0 ||
+                        stdio_resource::initialize_credentials(*child.task, credentials) != 0)
+                        return false;
+                }
+                if ((mask & 1) != 0 && child.task->pid_namespace()->network() != network) return false;
+                StdioScopeObservation const EMPTY(*child.task);
+                if (!ensure_exec_stdio_fallbacks(child.task.get()) || !EMPTY.unchanged(*child.task)) return false;
+                if (!parent.add_control(1) || !clone_exec_fd_table_checked(parent.task.get(), child.task.get(), true) ||
+                    !child.reserve(7) ||
+                    child.task->resources.set(static_cast<unsigned>(ker::abi::resource::Id::NOFILE), {0, 0}, true,
+                                              StdioScopeTask::FD_TABLE_SIZE) != 0)
+                    return false;
+                auto* inherited = static_cast<vfs::File*>(child.task->fd_table.lookup(1));
+                if (inherited == nullptr || inherited != parent.task->fd_table.lookup(1) || inherited->refcount.load() != 2 ||
+                    !child.task->get_fd_cloexec(1))
+                    return false;
+                StdioScopeObservation const BEFORE(*child.task);
+                StdioScopeObservation const PARENT(*parent.task);
+                if (!ensure_exec_stdio_fallbacks(child.task.get()) || !BEFORE.unchanged(*child.task) || !PARENT.unchanged(*parent.task))
+                    return false;
+            }
+        }
+    }
+    return BASELINE.restored() && g_exec_selftest_close_count.load() == CONTROL_CLOSES + 28;
+}
+
+auto exec_selftest_stdio_canonical_and_closed_views() -> bool {
+    StdioScopeNamespaceBaseline const BASELINE;
+    int const CONTROL_CLOSES = g_exec_selftest_close_count.load();
+    if (ensure_exec_stdio_fallbacks(nullptr)) return false;
+    {
+        StdioScopeFixture unbound;
+        if (!unbound.task || !unbound.add_control(7)) return false;
+        unbound.task->is_thread = true;
+        unbound.task->owner_pid = unbound.task->pid + 1;
+        StdioScopeObservation const BEFORE(*unbound.task);
+        if (ensure_exec_stdio_fallbacks(unbound.task.get()) || !BEFORE.unchanged(*unbound.task)) return false;
+    }
+    {
+        stdio_pid::NamespaceRef pids;
+        stdio_ipc::NamespaceRef names;
+        stdio_mount::NamespaceRef mounts;
+        if (stdio_pid::create_namespace(pids) != 0 || stdio_ipc::create_namespace(names) != 0 || stdio_mount::create_namespace(mounts) != 0)
+            return false;
+        StdioScopeFixture owner;
+        if (!owner.task || !stdio_scope_initialize_views(*owner.task, 7, pids, names, mounts) || !owner.add_control(1)) return false;
+        stdio_security::Snapshot credentials;
+        if (stdio_security::Snapshot::restore_fields({.user = {100, 100, 100}, .group = {100, 100, 100}}, credentials) != 0 ||
+            stdio_resource::initialize_credentials(*owner.task, credentials) != 0)
+            return false;
+        {
+            StdioScopeFixture worker;
+            if (!worker.task || !worker.add_control(7)) return false;
+            worker.task->is_thread = true;
+            worker.task->owner_pid = owner.task->pid;
+            if (!stdio_resource::bind_thread_owner(*worker.task, *owner.task)) return false;
+            owner.task->main_thread_retired.store(true);
+            StdioScopeObservation const OWNER(*owner.task);
+            StdioScopeObservation const WORKER(*worker.task);
+            if (owner.task->ref_count.load() != 2 || worker.task->credential_owner() != owner.task.get() ||
+                !ensure_exec_stdio_fallbacks(worker.task.get()) || !OWNER.unchanged(*owner.task) || !WORKER.unchanged(*worker.task))
+                return false;
+        }
+        if (owner.task->ref_count.load() != 1 || owner.task->resource_cpu_threads.load() != 0 ||
+            owner.task->resource_thread_owners.load() != 0)
+            return false;
+    }
+    {
+        stdio_pid::NamespaceRef pids;
+        stdio_ipc::NamespaceRef names;
+        stdio_mount::NamespaceRef mounts;
+        if (stdio_pid::create_namespace(pids) != 0 || stdio_ipc::create_namespace(names) != 0 || stdio_mount::create_namespace(mounts) != 0)
+            return false;
+        StdioScopeFixture owner;
+        if (!owner.task) return false;
+        {
+            StdioScopeFixture shadow;
+            if (!shadow.task || !stdio_scope_initialize_views(*shadow.task, 7, pids, names, mounts) || !shadow.add_control(7)) return false;
+            shadow.task->is_thread = true;
+            shadow.task->owner_pid = owner.task->pid;
+            if (!stdio_resource::bind_thread_owner(*shadow.task, *owner.task)) return false;
+            pids.close();
+            names.close();
+            mounts.close();
+            StdioScopeObservation const SHADOW(*shadow.task);
+            if (!ensure_exec_stdio_fallbacks(shadow.task.get()) || owner.task->fd_table.size() != 3 || !SHADOW.unchanged(*shadow.task))
+                return false;
+            for (unsigned fd = 0; fd < 3; ++fd)
+                if (!stdio_scope_console_file(static_cast<vfs::File*>(owner.task->fd_table.lookup(fd)), fd)) return false;
+        }
+        if (owner.task->ref_count.load() != 1 || owner.task->resource_cpu_threads.load() != 0 ||
+            owner.task->resource_thread_owners.load() != 0)
+            return false;
+    }
+    for (unsigned closed = 0; closed < 3; ++closed) {
+        stdio_pid::NamespaceRef pids;
+        stdio_ipc::NamespaceRef names;
+        stdio_mount::NamespaceRef mounts;
+        if (stdio_pid::create_namespace(pids) != 0 || stdio_ipc::create_namespace(names) != 0 || stdio_mount::create_namespace(mounts) != 0)
+            return false;
+        StdioScopeFixture subject;
+        if (!subject.task || !stdio_scope_initialize_views(*subject.task, 7, pids, names, mounts) || !subject.add_control(1) ||
+            !subject.reserve(7))
+            return false;
+        if (closed == 0) pids.close();
+        if (closed == 1) names.close();
+        if (closed == 2) mounts.close();
+        StdioScopeObservation const BEFORE(*subject.task);
+        if (ensure_exec_stdio_fallbacks(subject.task.get()) || !BEFORE.unchanged(*subject.task)) return false;
+    }
+    return BASELINE.restored() && g_exec_selftest_close_count.load() == CONTROL_CLOSES + 7;
+}
+// END EXEC STDIO SCOPE SELFTESTS
+
 #endif
 
 void service_pending_exec_handoff() {

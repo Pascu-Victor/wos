@@ -15,6 +15,9 @@ Checkpoint 37 qualifies fresh locked hard-domain admission. Checkpoint 38 qualif
 atomic access to the existing Task placement scalars with unchanged measured
 layout. Placement transactions, CPU inheritance/ceilings, worker-exec and WKI
 priority inheritance remain incomplete.
+Checkpoint 43 prevents implicit Host console grants during private legacy
+creation and native execve. Its two new native tests and the full diagnostic
+suite pass; public process-launch and regular-file I/O qualification is pending.
 Exact-owner ambient network admission is implemented;
 complete PID, lifecycle and WKI qualification remains incomplete. Independent
 service isolation and all ten goal criteria remain unqualified. Goal28 remains
@@ -211,6 +214,34 @@ preserved. See the [fixture protocol](../tests/fixtures/compartment_shared_runti
 and its explicit-output builder for reproduction. Successful foreign-view
 projection, writable File coherence/cache eviction, complete reference drains,
 two-hour operation and 1,000 full lifecycles remain unqualified.
+
+## Implicit stdio and explicit descriptor capabilities
+
+Legacy creation and committed native execve share `ensure_exec_stdio_fallbacks`.
+It resolves the canonical process owner before checking its exact namespace
+scope. A live private PID, mount or IPC view preserves only existing descriptors
+and succeeds without opening Host `/dev/console`. Closed views and unbound
+owners refuse before credentials, FD-table or device effects. Host scope keeps
+the existing fallback behavior and descriptor-limit handling. No caller order,
+syscall layout, resource state or descriptor ownership rules change.
+
+KTEST74 passes all 1,437 executed cases, including all 186 mandatory cases,
+with 93,327 assertions and zero failures. The two new cases exercise actual
+Host console fallback, all seven private-view combinations, root and UID100,
+DENIED and SHARED_HOST networking, retained descriptors, canonical process
+owners and closed-view refusal. Their synthetic close-only File controls cover
+ownership; they do not establish regular-file I/O behavior. The diagnostic VM
+shuts down naturally, and all four exact-owned disposable images are pruned.
+The unrelated user VM remains intact. Normal Build WOS, the isolated fast
+diagnostic build, 64 relevant Host tests, formatting and the two diagnostic
+clang-tidy units pass. Compiler-measured Task and ShmidDs layouts are unchanged.
+
+The [public stdio fixture](../tests/fixtures/implicit_stdio_runtime.md) is admitted
+and compiles with libc-only linkage. It will check actual EXEC, null-options
+SPAWN, explicit-options SPAWN and FORK followed by EXECVE, complete descriptor
+censuses, explicit regular-file I/O and CLOEXEC behavior. Its runtime result is
+pending. Neither these native tests nor the fixture build completes a full
+Goal39 acceptance criterion.
 
 ## Private native mount ownership
 

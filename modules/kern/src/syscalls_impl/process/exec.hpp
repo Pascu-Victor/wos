@@ -195,6 +195,10 @@ auto exec_selftest_spawn_dup2_consumes_cloexec_source() -> bool;
 auto exec_selftest_spawn_open_uses_private_child_authority() -> bool;
 auto exec_selftest_spawn_procfs_failure_drains_child(ker::mod::sched::task::Task& parent) -> bool;
 auto exec_selftest_one_shot_wki_target_consumes_only_on_success() -> bool;
+// Append inside the existing WOS_SELFTEST declarations, before its endif.
+auto exec_selftest_stdio_host_and_private_views() -> bool;
+auto exec_selftest_stdio_canonical_and_closed_views() -> bool;
+
 #endif
 
 }  // namespace ker::syscall::process

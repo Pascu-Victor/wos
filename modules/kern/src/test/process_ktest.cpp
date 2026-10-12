@@ -94,3 +94,10 @@ KTEST(WorkerExecHandoff, SignalTransferDrainsAdmissionsAfterRootPublication) {
 KTEST(ExecSpawnFdActions, OpenUsesPrivateChildAuthorityAndReservedDescriptor) {
     KEXPECT_TRUE(ker::syscall::process::exec_selftest_spawn_open_uses_private_child_authority());
 }
+
+// Append after all original process_ktest.cpp registrations.
+KTEST(ExecStdioScope, HostFallbackAndPrivateViews) { KEXPECT_TRUE(ker::syscall::process::exec_selftest_stdio_host_and_private_views()); }
+
+KTEST(ExecStdioScope, CanonicalOwnerAndClosedViewsRefuse) {
+    KEXPECT_TRUE(ker::syscall::process::exec_selftest_stdio_canonical_and_closed_views());
+}

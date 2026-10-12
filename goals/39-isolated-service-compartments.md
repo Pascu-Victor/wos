@@ -8,7 +8,16 @@
 
 ## Outcome and scale
 
-Current checkpoint 42 implements generation-scoped SysV creator/operator PID
+Current checkpoint 43 prevents implicit Host console grants during private
+legacy creation and native EXECVE while preserving the original Host fallback.
+The full KTEST74 run passes 1,437 cases, all 186 mandatory, 93,327 assertions
+and zero failures, shuts down naturally and prunes all four disposable images.
+Normal Build WOS, the isolated fast diagnostic build, 64 relevant Host tests,
+formatting and actual Task/ShmidDs ABI measurements pass. The public stdio
+fixture is admitted and compiled; actual process-launch and regular-file I/O
+qualification remains pending.
+
+Checkpoint 42 implements generation-scoped SysV creator/operator PID
 metadata while preserving physical attachment ownership and the public ABI.
 Seven new native cases passed in KTEST73: 1,435 executed cases, all 184 mandatory,
 93,325 assertions and zero failures. The Normal eight-CPU public StageA run
