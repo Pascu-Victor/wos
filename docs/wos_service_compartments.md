@@ -20,6 +20,11 @@ creation and native execve. Its two new native tests and the full diagnostic
 suite pass. Checkpoint 44 qualifies the finite public process-launch and
 regular-file I/O probe, including complete descriptor observations and an
 actual init-reap witness.
+Checkpoint 45 characterizes regular-file mappings through the public spec.
+Strict execution completes, but shared-map coherence, writeback and private
+READ-to-WRITE promotion fail. Fresh remapping, ordinary private isolation,
+materialized fork sharing and read-only grant restrictions pass. Kernel repairs
+and fresh qualification remain required.
 Exact-owner ambient network admission is implemented;
 complete PID, lifecycle and WKI qualification remains incomplete. Independent
 service isolation and all ten goal criteria remain unqualified. Goal28 remains
@@ -272,6 +277,44 @@ Receipts are recorded in the Goal39 ledger. These finite native and public check
 do not complete a full Goal39 criterion. File-mapping coherence, complete
 reference drains, two-hour simultaneous service operation and 1,000 full
 lifecycles remain unqualified.
+
+## Finite regular-file mapping characterization
+
+The [File mapping fixture](../tests/fixtures/compartment_filemap_runtime.md)
+creates two simultaneous UID100 private roots with DENIED networking and only
+their own control FD plus explicit mutable/read-only grants of the same regular
+backing File. One root forks after materializing its mappings. The fixture
+separates execution completion from seven payload-based semantic groups.
+
+Normal eight-CPU attempt02 completes the strict protocol. All 13 durable files
+total 236,631 bytes, with 768 signed descriptor observations, 64 limit pairs,
+nine partial grant-stat records, 83 positional calls and 83 guard records.
+All 16 futex waits record exactly 5,000,000 microseconds and return 0; all 16
+wakes return 1. Three exact consuming waits return status 0, and the 4,160-byte
+init snapshot records generation 1, no restarts, sequence 52, EXITED6/READY2
+and actual reap 0.
+
+The independently recomputed semantic mask is 35: independent shared-map
+coherence, writeback and private READ-to-WRITE promotion fail. Fresh remapping,
+ordinary private isolation, materialized fork sharing and read-only grant
+restrictions pass. The probe's exit0 denotes completed characterization;
+it does not turn those semantic failures into successful isolation evidence.
+
+Attempt01 remains failed evidence because the producer's two clock samples
+yielded a timeout slightly over the strict 5-second bound. The corrected producer
+uses one sample for its remaining timeout; the validator stays unchanged.
+Fresh target build, format and complete external dependency checks pass for
+the corrected executed artifact. No new Normal kernel or diagnostic build
+was required for these fixture changes; production remains at checkpoint43.
+
+All 12 prepared and 12 stopped artifact readbacks match. The rootless
+`--no-setup` runner stops only its owned VM through QMP at the 120-second bound.
+All four disposable images are pruned, releasing 200,163,328 allocated bytes and
+leaving zero disposable allocation. The unrelated user VM is unchanged.
+Independent terminal receipt SHA256 is
+`fe7285b505362dce2a8d28e9449bf765e3fbab7b61953884ad9f7a0f87892b71`.
+Kernel promotion/coherence/writeback repairs, cache-eviction qualification,
+complete reference drains, two-hour operation and 1,000 lifecycles remain open.
 
 ## Private native mount ownership
 

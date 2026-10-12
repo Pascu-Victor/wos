@@ -8,6 +8,17 @@
 
 ## Outcome and scale
 
+Checkpoint 45 adds the finite public regular-file mapping characterization.
+Its Normal eight-CPU attempt02 completes the strict execution protocol but
+fails shared-map coherence, writeback and private READ-to-WRITE promotion
+(semantic mask35). Fresh remapping, ordinary private isolation, materialized
+fork sharing and read-only grant restrictions pass. Attempt01's strict timeout
+failure remains recorded; the producer correction uses one clock sample while
+preserving the five-second validator. All four owned images were pruned,
+leaving zero disposable allocation; the unrelated VM is preserved. Kernel,
+libc and init sources were unchanged. These findings require kernel repairs
+and do not complete criterion4 or any other full criterion.
+
 Checkpoint 43 prevents implicit Host console grants during private
 legacy creation and native EXECVE while preserving the original Host fallback.
 The full KTEST74 run passes 1,437 cases, all 186 mandatory, 93,327 assertions
@@ -1109,3 +1120,33 @@ consumer review found an implicit Host console-capability grant in ordinary
 legacy spawn and native execve. Fix it under a new critical patch contract,
 preserving exact Host fallbacks and explicit inherited private descriptors;
 then qualify actual public WKI refusal/local execution. No pause or push.
+
+## Checkpoint45: public File mapping characterization (2026-10-12)
+
+The [finite fixture](../tests/fixtures/compartment_filemap_runtime.md) and its
+explicit-output target builder are admitted. Attempt01 remains failed evidence
+because the producer's two clock samples could exceed the strict five-second
+futex bound. The one-clock correction preserves that validator. Fresh target
+compile, repository format, ELF and complete external dependency checks pass;
+no production kernel, libc or init changes were needed for this campaign.
+
+Normal eight-CPU attempt02 completes strict execution, with all 13 durable
+files totaling 236,631 bytes, 16 actual futex WAIT0/WAKE1 pairs, three exact
+consuming waits/status0 and the actual init snapshot/reap0. The independently
+recomputed mask35 reports shared-map coherence, writeback and private WRITE
+promotion failures. Fresh remapping, ordinary private isolation, materialized
+fork sharing and read-only grant restrictions pass. The probe's exit0 records
+completed characterization, not successful semantics for every group.
+
+Independent terminal receipt `checkpoint39-criterion4-filemap-independent-terminal02.json`
+has SHA256 `fe7285b505362dce2a8d28e9449bf765e3fbab7b61953884ad9f7a0f87892b71`.
+All 12 prepared and 12 stopped readbacks match. The `--no-setup` runner stops
+only its owned VM through QMP at 120 seconds; natural poweroff is not claimed.
+All four owned images are pruned, releasing 200,163,328 allocated bytes, with
+zero disposable allocation and the unrelated user VM preserved.
+
+Goal39 remains ACTIVE; all ten full criteria remain incomplete. Next: repair
+private promotion and permission downgrades under the MM patch contract with
+actual cache/ref/permission regressions, then address shared coherence/writeback
+under a separate contract. Two-hour helper drafts are source-only preparation;
+they are not criterion8 evidence.
