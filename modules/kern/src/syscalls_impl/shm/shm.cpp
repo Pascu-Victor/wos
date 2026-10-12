@@ -11,6 +11,7 @@
 #include <utility>
 #ifdef WOS_SELFTEST
 #include <memory>
+#include <new>
 #include <platform/sched/resource.hpp>
 #endif
 #include <platform/dbg/dbg.hpp>
@@ -51,6 +52,10 @@ struct ShmSegment {
     uint64_t creator_pid = 0;
     uint64_t owner_pid = 0;
     uint64_t last_pid = 0;
+    // Historical value-only names: physical attachment ownership stays separate.
+    uint64_t creator_pid_scope_generation = 0;
+    uint64_t visible_creator_pid = 0;
+    uint64_t visible_last_pid = 0;
     uint64_t attach_count = 0;
     bool marked_destroy = false;
     NamespaceRef ipc_namespace{};
@@ -89,6 +94,25 @@ auto process_pid_for_task(const ker::mod::sched::task::Task* task) -> uint64_t {
         return 0;
     }
     return ker::mod::sched::task::process_pid(*task);
+}
+
+// Caller already owns the live actor; a bound thread retains its immutable
+// canonical metadata owner. No retain/drop, registry join, lock or allocation.
+struct ShmPidIdentity {
+    uint64_t generation = 0;
+    uint64_t process_name = 0;
+    bool valid = false;
+};
+
+auto pid_identity_for_task(const ker::mod::sched::task::Task* task) -> ShmPidIdentity {
+    auto const* scope = task != nullptr ? task->pid_namespace() : nullptr;
+    if (scope == nullptr) return {};
+    uint64_t const NAME = scope->is_host() ? process_pid_for_task(task) : ker::mod::sched::task::namespace_process_pid(*task);
+    return {.generation = scope->generation(), .process_name = NAME, .valid = NAME != 0};
+}
+
+auto visible_pid(const ShmSegment& segment, const ShmPidIdentity& reader, uint64_t name) -> uint64_t {
+    return reader.valid && reader.generation == segment.creator_pid_scope_generation ? name : 0;
 }
 
 auto backing_page(const ShmSegment& segment, uint64_t index) -> void* {
@@ -324,6 +348,7 @@ auto create_segment(int key, uint64_t size, int shmflg, ker::mod::sched::task::T
 
     int const ID = static_cast<int>(g_next_id++);
     uint64_t const PROCESS_PID = process_pid_for_task(task);
+    auto const PID_IDENTITY = pid_identity_for_task(task);
     *slot = {
         .active = true,
         .id = ID,
@@ -339,6 +364,9 @@ auto create_segment(int key, uint64_t size, int shmflg, ker::mod::sched::task::T
         .creator_pid = PROCESS_PID,
         .owner_pid = PROCESS_PID,
         .last_pid = PROCESS_PID,
+        .creator_pid_scope_generation = PID_IDENTITY.generation,
+        .visible_creator_pid = PID_IDENTITY.process_name,
+        .visible_last_pid = PID_IDENTITY.process_name,
         .attach_count = 0,
         .marked_destroy = false,
         .ipc_namespace = std::move(scope),
@@ -410,6 +438,7 @@ auto shmat_impl(ker::mod::sched::task::Task* task, int shmid, uint64_t shmaddr, 
     // construction may reclaim/yield, so g_lock is released before mapping.
     ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
     auto const CREDENTIALS = task->credentials();
+    auto const PID_IDENTITY = pid_identity_for_task(task);
     ker::mod::sched::resource::AddressSpaceObservation observation(task);
     uint64_t const FLAGS = g_lock.lock_irqsave();
     if (ipc_namespace->closed()) {
@@ -490,25 +519,27 @@ auto shmat_impl(ker::mod::sched::task::Task* task, int shmid, uint64_t shmaddr, 
     attachment->publishing = false;
     attachment->active = true;
     segment->last_pid = PROCESS_PID;
+    segment->visible_last_pid = visible_pid(*segment, PID_IDENTITY, PID_IDENTITY.process_name);
     g_lock.unlock_irqrestore(COMMIT_FLAGS);
     return ADDR;
 }
 
 void detach_attachment_locked(ShmAttachment& attachment, ker::mod::sched::task::Task* task) {
+    auto const PID_IDENTITY = pid_identity_for_task(task);
     auto* segment = find_retained_segment_by_id(attachment.shmid);
     if (segment != nullptr) {
         if (segment->attach_count > 0) {
             segment->attach_count--;
         }
         segment->last_pid = task != nullptr ? process_pid_for_task(task) : attachment.pid;
+        segment->visible_last_pid = visible_pid(*segment, PID_IDENTITY, PID_IDENTITY.process_name);
         maybe_release_destroyed_segment(*segment);
     }
 
     attachment = {};
 }
 
-auto shmdt_impl(uint64_t shmaddr) -> uint64_t {
-    auto* task = current_task();
+auto shmdt_impl(ker::mod::sched::task::Task* task, uint64_t shmaddr) -> uint64_t {
     if (task == nullptr) {
         return to_errno(ESRCH);
     }
@@ -542,7 +573,7 @@ auto shmdt_impl(uint64_t shmaddr) -> uint64_t {
     return 0;
 }
 
-void fill_stat(const ShmSegment& segment, ker::abi::shm::ShmidDs& out) {
+void fill_stat(const ShmSegment& segment, const ShmPidIdentity& reader, ker::abi::shm::ShmidDs& out) {
     out = {};
     out.shm_perm.key = segment.key;
     out.shm_perm.uid = segment.ownership.uid;
@@ -555,8 +586,8 @@ void fill_stat(const ShmSegment& segment, ker::abi::shm::ShmidDs& out) {
     out.shm_atime = 0;
     out.shm_dtime = 0;
     out.shm_ctime = 0;
-    out.shm_cpid = static_cast<int64_t>(segment.creator_pid);
-    out.shm_lpid = static_cast<int64_t>(segment.last_pid);
+    out.shm_cpid = static_cast<int64_t>(visible_pid(segment, reader, segment.visible_creator_pid));
+    out.shm_lpid = static_cast<int64_t>(visible_pid(segment, reader, segment.visible_last_pid));
     out.shm_nattch = segment.attach_count;
 }
 
@@ -566,6 +597,7 @@ auto shmctl_impl(ker::mod::sched::task::Task* task, int shmid, int cmd, uint64_t
         return to_errno(ESRCH);
     }
     auto const CREDENTIALS = task->credentials();
+    auto const PID_IDENTITY = pid_identity_for_task(task);
     uint64_t const FLAGS = g_lock.lock_irqsave();
     if (ipc_namespace->closed()) {
         g_lock.unlock_irqrestore(FLAGS);
@@ -593,7 +625,7 @@ auto shmctl_impl(ker::mod::sched::task::Task* task, int shmid, int cmd, uint64_t
                 return to_errno(EACCES);
             }
             ker::abi::shm::ShmidDs stat{};
-            fill_stat(*segment, stat);
+            fill_stat(*segment, PID_IDENTITY, stat);
             g_lock.unlock_irqrestore(FLAGS);
             if (buf_addr == 0) {
                 return to_errno(EFAULT);
@@ -615,7 +647,7 @@ auto sys_shm(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t /*a4*/
         case ker::abi::shm::ops::ATTACH:
             return shmat_impl(current_task(), static_cast<int>(a1), a2, static_cast<int>(a3));
         case ker::abi::shm::ops::DETACH:
-            return shmdt_impl(a1);
+            return shmdt_impl(current_task(), a1);
         case ker::abi::shm::ops::CTL:
             return shmctl_impl(current_task(), static_cast<int>(a1), static_cast<int>(a2), a3);
         default:
@@ -810,6 +842,556 @@ auto shm_selftest_namespace_retirement() -> bool {
         ok &= !host.closed();
     }
     return ok && segment_count() == SEGMENTS && ker::mod::sched::ipc::live_namespace_count() == NAMESPACES;
+}
+
+// Native-only page-table observer is defined in the native test translation unit.
+auto visible_leaf_raw(ker::mod::mm::paging::PageTable* root, uint64_t address) -> uint64_t;
+
+namespace {
+namespace visible_task = ker::mod::sched::task;
+namespace visible_pid_scope = ker::mod::sched::pid_ns;
+namespace visible_ipc = ker::mod::sched::ipc;
+namespace visible_resource = ker::mod::sched::resource;
+namespace visible_mm = ker::mod::mm;
+namespace visible_phys = ker::mod::mm::phys;
+namespace visible_virt = ker::mod::mm::virt;
+namespace visible_paging = ker::mod::mm::paging;
+namespace visible_copy = ker::mod::sys::usercopy;
+namespace visible_security = ker::mod::security;
+namespace visible_abi = ker::abi::shm;
+
+constexpr uint64_t VISIBLE_PAGE = visible_paging::PAGE_SIZE;
+constexpr uint64_t VISIBLE_OUTPUT = 0x49000000ULL;
+constexpr uint64_t VISIBLE_ATTACHMENT = 0x4B000000ULL;
+constexpr uint64_t VISIBLE_STAT = VISIBLE_OUTPUT + 128;
+constexpr uint8_t VISIBLE_GUARD = 0xA7;
+
+auto visible_physical(const void* page) -> uint64_t {
+    return reinterpret_cast<uint64_t>(visible_mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(page)));
+}
+
+// These quiescent BSP tests count actual objects, not seeded table entries or
+// globally free pages (the page-table allocator may retain its warm pool).
+struct VisiblePidBaseline {
+    size_t segments = segment_count();
+    size_t active_attachments{};
+    size_t publishing_attachments{};
+    size_t pid_scopes = visible_pid_scope::live_namespace_count();
+    size_t ipc_scopes = visible_ipc::live_namespace_count();
+    visible_phys::PhysicalOwnerSnapshot shared{};
+
+    VisiblePidBaseline() {
+        uint64_t const FLAGS = g_lock.lock_irqsave();
+        for (auto const& attachment : g_attachments) {
+            active_attachments += attachment.active ? 1 : 0;
+            publishing_attachments += attachment.publishing ? 1 : 0;
+        }
+        g_lock.unlock_irqrestore(FLAGS);
+        visible_phys::PhysicalBalanceSnapshot balance{};
+        visible_phys::get_physical_balance_snapshot(balance);
+        shared = balance.owners[static_cast<size_t>(visible_mm::PhysicalPageOwner::USER_SHARED_MEMORY)];
+    }
+
+    auto equals(const VisiblePidBaseline& other) const -> bool {
+        return segments == other.segments && active_attachments == other.active_attachments &&
+               publishing_attachments == other.publishing_attachments && pid_scopes == other.pid_scopes && ipc_scopes == other.ipc_scopes &&
+               shared.pages == other.shared.pages && shared.objects == other.shared.objects;
+    }
+};
+
+// Own the mutable Task and optionally its private user root. A bound thread
+// borrows only another fixture member's root; it dies before that member.
+struct VisiblePidOwnedTask {
+    std::unique_ptr<visible_task::Task> subject{new (std::nothrow) visible_task::Task{}};
+    visible_paging::PageTable* root{};
+    bool owns_root{};
+    bool& cleanup_ok;
+
+    explicit VisiblePidOwnedTask(bool& clean) : cleanup_ok(clean) {}
+    VisiblePidOwnedTask(const VisiblePidOwnedTask&) = delete;
+    auto operator=(const VisiblePidOwnedTask&) -> VisiblePidOwnedTask& = delete;
+    ~VisiblePidOwnedTask() { clear(); }
+
+    auto init(bool private_root = true, bool output_page = true, uint32_t uid = 100) -> bool {
+        if (subject == nullptr) return false;
+        subject->pid = visible_task::get_next_pid();
+        subject->type = visible_task::TaskType::PROCESS;
+        visible_security::Snapshot credentials;
+        if (visible_security::Snapshot::restore_fields(
+                {.user = {uid, uid, uid}, .group = {uid, uid, uid}, .authority_ceiling = 0, .no_new_privileges = true}, credentials) != 0 ||
+            visible_resource::initialize_credentials(*subject, credentials) != 0)
+            return false;
+        if (!private_root) return true;
+        root = visible_virt::create_pagemap_may_fail();
+        if (root == nullptr) return false;
+        owns_root = true;
+        subject->pagemap = root;
+        return !output_page || map(VISIBLE_OUTPUT, VISIBLE_GUARD) != nullptr;
+    }
+
+    auto map(uint64_t address, uint8_t fill) -> uint8_t* {
+        if (root == nullptr || visible_virt::is_page_mapped_or_reserved(root, address)) return nullptr;
+        auto* page = static_cast<uint8_t*>(
+            visible_phys::page_alloc(visible_mm::PhysicalPageOwner::SELFTEST, VISIBLE_PAGE, "sysv-visible-pid-ktest"));
+        if (page == nullptr) return nullptr;
+        std::memset(page, fill, VISIBLE_PAGE);
+        // Allocation's single reference transfers into this actual PTE.
+        visible_virt::map_page(root, address, visible_physical(page), visible_paging::page_types::USER);
+        return page;
+    }
+
+    void clear() {
+        if (subject == nullptr) return;
+        // Metadata is detached first; root teardown later releases PTE refs.
+        shm_cleanup_for_task(subject.get());
+        cleanup_ok &= subject->usercopy_pagemap_accesses.load(std::memory_order_acquire) == 0;
+        cleanup_ok &= subject->ref_count.load(std::memory_order_acquire) == 1;
+        if (root != nullptr) {
+            cleanup_ok &= subject->detach_pagemap_after_usercopy_quiescence() == root;
+            if (owns_root) {
+                visible_virt::destroy_user_space(root, subject->pid, "sysv-visible-pid-ktest", "private-fixture");
+                visible_virt::release_pagemap(root, subject->pid);
+            }
+        }
+        root = nullptr;
+        owns_root = false;
+        subject.reset();
+    }
+};
+
+struct VisiblePidFixture {
+    bool& cleanup_ok;
+    visible_pid_scope::NamespaceRef first_pid, second_pid;
+    visible_ipc::NamespaceRef first_ipc, second_ipc;
+    std::array<std::unique_ptr<VisiblePidOwnedTask>, 4> actors{};
+    std::unique_ptr<visible_task::Task> host_cleanup{new (std::nothrow) visible_task::Task{}};
+    std::array<int, 4> host_ids{-1, -1, -1, -1};
+    size_t host_id_count{};
+
+    explicit VisiblePidFixture(bool& clean) : cleanup_ok(clean) {}
+    ~VisiblePidFixture() {
+        // Reverse creation order also releases every bound canonical owner.
+        for (size_t index = actors.size(); index != 0; --index) actors[index - 1].reset();
+        if (host_cleanup != nullptr) {
+            for (size_t index = 0; index < host_id_count; ++index)
+                cleanup_ok &= shmctl_impl(host_cleanup.get(), host_ids[index], visible_abi::IPC_RMID, 0) == 0;
+        }
+        shm_retire_namespace(first_ipc);
+        shm_retire_namespace(second_ipc);
+    }
+
+    auto scopes(bool second = false) -> bool {
+        return host_cleanup != nullptr && visible_pid_scope::create_namespace(first_pid) == 0 &&
+               visible_ipc::create_namespace(first_ipc) == 0 &&
+               (!second || (visible_pid_scope::create_namespace(second_pid) == 0 && visible_ipc::create_namespace(second_ipc) == 0));
+    }
+
+    auto make(size_t index, bool root = true, bool output = true, uint32_t uid = 100) -> VisiblePidOwnedTask* {
+        if (index >= actors.size() || actors[index] != nullptr) return nullptr;
+        actors[index].reset(new (std::nothrow) VisiblePidOwnedTask(cleanup_ok));
+        return actors[index] != nullptr && actors[index]->init(root, output, uid) ? actors[index].get() : nullptr;
+    }
+
+    auto private_actor(size_t index, bool second = false, uint32_t uid = 100) -> VisiblePidOwnedTask* {
+        auto* actor = make(index, true, true, uid);
+        if (actor == nullptr || !actor->subject->initialize_pid_namespace(second ? second_pid : first_pid) ||
+            !actor->subject->initialize_ipc_namespace(second ? second_ipc : first_ipc))
+            return nullptr;
+        return actor;
+    }
+
+    auto bound_thread(size_t index, VisiblePidOwnedTask& parent) -> VisiblePidOwnedTask* {
+        auto* actor = make(index, false);
+        if (actor == nullptr) return nullptr;
+        actor->subject->is_thread = true;
+        actor->subject->owner_pid = parent.subject->pid;
+        if (!visible_resource::bind_thread_owner(*actor->subject, *parent.subject)) return nullptr;
+        actor->root = parent.root;
+        actor->subject->pagemap = parent.root;
+        return actor;
+    }
+
+    auto create(VisiblePidOwnedTask& actor, int mode = 0600, int key = visible_abi::IPC_PRIVATE) -> int {
+        int64_t const RESULT = static_cast<int64_t>(shmget_impl(actor.subject.get(), key, VISIBLE_PAGE, mode | visible_abi::IPC_CREAT));
+        if (RESULT <= 0) return -1;
+        if (actor.subject->ipc_namespace()->is_host()) {
+            if (host_id_count == host_ids.size()) {
+                cleanup_ok &= shmctl_impl(actor.subject.get(), static_cast<int>(RESULT), visible_abi::IPC_RMID, 0) == 0;
+                return -1;
+            }
+            host_ids[host_id_count++] = static_cast<int>(RESULT);
+        }
+        return static_cast<int>(RESULT);
+    }
+};
+
+template <class Case>
+auto run_visible_pid_case(Case&& run) -> bool {
+    VisiblePidBaseline const BEFORE;
+    bool cleanup_ok = true;
+    bool ok = false;
+    {
+        VisiblePidFixture fixture(cleanup_ok);
+        ok = run(fixture);
+    }
+    VisiblePidBaseline const AFTER;
+    return ok && cleanup_ok && BEFORE.equals(AFTER);
+}
+
+// Observe private metadata under its real lock, without changing table slots.
+struct VisiblePidSegmentState {
+    bool found{};
+    uint64_t creator{}, owner{}, last{}, generation{}, visible_creator{}, visible_last{}, attachments{};
+    void* backing{};
+    bool marked{};
+};
+
+auto visible_segment_state(int id) -> VisiblePidSegmentState {
+    VisiblePidSegmentState out;
+    uint64_t const FLAGS = g_lock.lock_irqsave();
+    if (auto const* segment = find_retained_segment_by_id(id); segment != nullptr) {
+        out = {.found = true,
+               .creator = segment->creator_pid,
+               .owner = segment->owner_pid,
+               .last = segment->last_pid,
+               .generation = segment->creator_pid_scope_generation,
+               .visible_creator = segment->visible_creator_pid,
+               .visible_last = segment->visible_last_pid,
+               .attachments = segment->attach_count,
+               .backing = segment->backing,
+               .marked = segment->marked_destroy};
+    }
+    g_lock.unlock_irqrestore(FLAGS);
+    return out;
+}
+
+auto visible_attachment_owned(const visible_task::Task& actor, int id, uint64_t address) -> bool {
+    uint64_t const FLAGS = g_lock.lock_irqsave();
+    auto const* attachment = find_attachment(visible_task::process_pid(actor), address);
+    bool const OWNED = attachment != nullptr && attachment->active && !attachment->publishing && attachment->shmid == id &&
+                       attachment->pid == visible_task::process_pid(actor) && attachment->size == VISIBLE_PAGE;
+    g_lock.unlock_irqrestore(FLAGS);
+    return OWNED;
+}
+
+auto visible_expected_stat(const VisiblePidOwnedTask& reader, int id, uint64_t creator, uint64_t last, uint64_t attachments,
+                           int mode = 0600, int key = visible_abi::IPC_PRIVATE) -> visible_abi::ShmidDs {
+    visible_abi::ShmidDs expected;
+    // Initialize padding too; successful STAT's complete120-byte output is
+    // compared with this independently specified old ABI image and guards.
+    std::memset(&expected, 0, sizeof(expected));
+    expected.shm_perm.key = key;
+    expected.shm_perm.uid = 100;
+    expected.shm_perm.gid = 100;
+    expected.shm_perm.cuid = 100;
+    expected.shm_perm.cgid = 100;
+    expected.shm_perm.mode = static_cast<uint32_t>(mode);
+    expected.shm_perm.seq = id;
+    expected.shm_segsz = VISIBLE_PAGE;
+    expected.shm_cpid = static_cast<int64_t>(creator);
+    expected.shm_lpid = static_cast<int64_t>(last);
+    expected.shm_nattch = attachments;
+    static_cast<void>(reader);
+    return expected;
+}
+
+auto visible_fill_output(VisiblePidOwnedTask& actor) -> bool {
+    std::array<uint8_t, sizeof(visible_abi::ShmidDs) + 32> bytes{};
+    bytes.fill(VISIBLE_GUARD);
+    return visible_copy::copy_to_task(*actor.subject, VISIBLE_STAT - 16, bytes.data(), bytes.size());
+}
+
+auto visible_stat_matches(VisiblePidOwnedTask& actor, int id, uint64_t creator, uint64_t last, uint64_t attachments, int mode = 0600,
+                          int key = visible_abi::IPC_PRIVATE) -> bool {
+    uint32_t const TASK_REFS = actor.subject->ref_count.load(std::memory_order_acquire);
+    uint32_t const ROOT_REFS = visible_phys::page_ref_get(actor.root);
+    uint32_t const ROOT_READERS = visible_virt::selftest_user_pagemap_reader_count(actor.root);
+    if (!visible_fill_output(actor) || shmctl_impl(actor.subject.get(), id, visible_abi::IPC_STAT, VISIBLE_STAT) != 0) return false;
+    std::array<uint8_t, sizeof(visible_abi::ShmidDs) + 32> bytes{};
+    if (!visible_copy::copy_from_task(*actor.subject, VISIBLE_STAT - 16, bytes.data(), bytes.size())) return false;
+    auto const EXPECTED = visible_expected_stat(actor, id, creator, last, attachments, mode, key);
+    bool ok = std::memcmp(bytes.data() + 16, &EXPECTED, sizeof(EXPECTED)) == 0;
+    for (size_t index = 0; index < 16; ++index) ok &= bytes[index] == VISIBLE_GUARD && bytes[bytes.size() - 1 - index] == VISIBLE_GUARD;
+    return ok && actor.subject->usercopy_pagemap_accesses.load(std::memory_order_acquire) == 0 &&
+           actor.subject->ref_count.load(std::memory_order_acquire) == TASK_REFS && visible_phys::page_ref_get(actor.root) == ROOT_REFS &&
+           visible_virt::selftest_user_pagemap_reader_count(actor.root) == ROOT_READERS;
+}
+
+auto visible_denied_stat(VisiblePidOwnedTask& actor, int id, int error) -> bool {
+    if (!visible_fill_output(actor) || shmctl_impl(actor.subject.get(), id, visible_abi::IPC_STAT, VISIBLE_STAT) != to_errno(error))
+        return false;
+    std::array<uint8_t, sizeof(visible_abi::ShmidDs) + 32> bytes{};
+    if (!visible_copy::copy_from_task(*actor.subject, VISIBLE_STAT - 16, bytes.data(), bytes.size())) return false;
+    return std::ranges::all_of(bytes, [](uint8_t byte) { return byte == VISIBLE_GUARD; });
+}
+
+auto visible_attach(VisiblePidOwnedTask& actor, int id, uint64_t address = VISIBLE_ATTACHMENT) -> bool {
+    auto const BEFORE = visible_segment_state(id);
+    if (!BEFORE.found || shmat_impl(actor.subject.get(), id, address, 0) != address) return false;
+    return visible_attachment_owned(*actor.subject, id, address) &&
+           visible_copy::mapped_physical_address(*actor.subject, address) == visible_physical(BEFORE.backing) &&
+           visible_phys::page_ref_get(BEFORE.backing) == BEFORE.attachments + 2;
+}
+
+auto visible_detach(VisiblePidOwnedTask& actor, uint64_t address = VISIBLE_ATTACHMENT) -> bool {
+    return shmdt_impl(actor.subject.get(), address) == 0 &&
+           visible_copy::mapped_physical_address(*actor.subject, address) == visible_virt::PADDR_INVALID;
+}
+}  // namespace
+
+auto shm_selftest_visible_pid_host() -> bool {
+    for (bool private_ipc : {false, true}) {
+        if (!run_visible_pid_case([private_ipc](VisiblePidFixture& fixture) {
+                if (!fixture.scopes()) return false;
+                auto* process = fixture.make(0);
+                if (process == nullptr || (private_ipc && !process->subject->initialize_ipc_namespace(fixture.first_ipc))) return false;
+                auto* thread = fixture.bound_thread(1, *process);
+                if (thread == nullptr || thread->subject->pid == process->subject->pid ||
+                    thread->subject->credential_owner() != process->subject.get() ||
+                    process->subject->ref_count.load(std::memory_order_acquire) != 2)
+                    return false;
+                int const ID = fixture.create(*process);
+                if (ID < 0 || !visible_stat_matches(*process, ID, process->subject->pid, process->subject->pid, 0) ||
+                    !visible_attach(*thread, ID) || !visible_stat_matches(*thread, ID, process->subject->pid, process->subject->pid, 1))
+                    return false;
+                auto const STATE = visible_segment_state(ID);
+                if (STATE.generation != 0 || STATE.creator != process->subject->pid || STATE.owner != process->subject->pid ||
+                    STATE.last != process->subject->pid || !visible_detach(*thread) ||
+                    !visible_stat_matches(*process, ID, process->subject->pid, process->subject->pid, 0))
+                    return false;
+                fixture.actors[1].reset();
+                return process->subject->ref_count.load(std::memory_order_acquire) == 1;
+            }))
+            return false;
+    }
+    return true;
+}
+
+auto shm_selftest_visible_pid_private() -> bool {
+    return run_visible_pid_case([](VisiblePidFixture& fixture) {
+        if (!fixture.scopes()) return false;
+        auto* creator = fixture.private_actor(0);
+        auto* child = fixture.make(1);
+        if (creator == nullptr || child == nullptr || !visible_resource::inherit(*child->subject, *creator->subject)) return false;
+        auto* thread = fixture.bound_thread(2, *creator);
+        if (thread == nullptr || creator->subject->namespace_tid() != 1 || child->subject->namespace_tid() != 2 ||
+            thread->subject->namespace_tid() != 3 || visible_task::namespace_process_pid(*thread->subject) != 1)
+            return false;
+        int const ID = fixture.create(*creator);
+        if (ID < 0 || !visible_stat_matches(*creator, ID, 1, 1, 0) || !visible_attach(*child, ID) ||
+            !visible_stat_matches(*creator, ID, 1, 2, 1))
+            return false;
+        auto const CHILD = visible_segment_state(ID);
+        if (CHILD.last != child->subject->pid || !visible_detach(*child) || !visible_stat_matches(*creator, ID, 1, 2, 0) ||
+            !visible_attach(*thread, ID) || !visible_stat_matches(*child, ID, 1, 1, 1))
+            return false;
+        auto const THREAD = visible_segment_state(ID);
+        return THREAD.creator == creator->subject->pid && THREAD.owner == creator->subject->pid && THREAD.last == creator->subject->pid &&
+               THREAD.generation == fixture.first_pid.generation() && visible_detach(*thread) &&
+               visible_stat_matches(*creator, ID, 1, 1, 0);
+    });
+}
+
+auto shm_selftest_visible_pid_historical_creator() -> bool {
+    return run_visible_pid_case([](VisiblePidFixture& fixture) {
+        if (!fixture.scopes()) return false;
+        auto* creator = fixture.private_actor(0);
+        auto* reader = fixture.make(1);
+        if (creator == nullptr || reader == nullptr || !visible_resource::inherit(*reader->subject, *creator->subject)) return false;
+        int const ID = fixture.create(*creator);
+        if (ID < 0 || !visible_attach(*creator, ID) || !visible_detach(*creator)) return false;
+        uint64_t const CREATOR_PHYSICAL = creator->subject->pid;
+        uint64_t const GENERATION = fixture.first_pid.generation();
+        fixture.actors[0].reset();
+        auto const STATE = visible_segment_state(ID);
+        // The actual creator Task and root are gone; only value history and
+        // the independently inherited reader/IPC references remain.
+        return STATE.found && STATE.creator == CREATOR_PHYSICAL && STATE.generation == GENERATION && STATE.visible_creator == 1 &&
+               STATE.visible_last == 1 && visible_stat_matches(*reader, ID, 1, 1, 0);
+    });
+}
+
+auto shm_selftest_visible_pid_foreign_scopes() -> bool {
+    for (bool private_ipc : {false, true}) {
+        if (!run_visible_pid_case([private_ipc](VisiblePidFixture& fixture) {
+                if (!fixture.scopes(true)) return false;
+                auto* creator = fixture.make(0);
+                auto* foreign = fixture.make(1);
+                if (creator == nullptr || foreign == nullptr || !creator->subject->initialize_pid_namespace(fixture.first_pid) ||
+                    !foreign->subject->initialize_pid_namespace(fixture.second_pid) ||
+                    (private_ipc && (!creator->subject->initialize_ipc_namespace(fixture.first_ipc) ||
+                                     !foreign->subject->initialize_ipc_namespace(fixture.first_ipc))) ||
+                    creator->subject->namespace_tid() != 1 || foreign->subject->namespace_tid() != 1 ||
+                    fixture.first_pid.generation() == fixture.second_pid.generation())
+                    return false;
+                int const ID = fixture.create(*creator);
+                if (ID < 0 || !visible_stat_matches(*foreign, ID, 0, 0, 0) || !visible_attach(*foreign, ID) ||
+                    !visible_stat_matches(*creator, ID, 1, 0, 1) || !visible_stat_matches(*foreign, ID, 0, 0, 1) ||
+                    !visible_detach(*foreign) || !visible_stat_matches(*creator, ID, 1, 0, 0))
+                    return false;
+                auto const FOREIGN = visible_segment_state(ID);
+                if (FOREIGN.last != foreign->subject->pid || FOREIGN.visible_last != 0 || !visible_attach(*creator, ID) ||
+                    !visible_detach(*creator) || !visible_stat_matches(*creator, ID, 1, 1, 0))
+                    return false;
+                // PID closure alone does not revoke independently open IPC identity.
+                fixture.first_pid.close();
+                return !fixture.first_ipc.closed() && visible_stat_matches(*creator, ID, 1, 1, 0) &&
+                       visible_stat_matches(*foreign, ID, 0, 0, 0);
+            }))
+            return false;
+    }
+    return true;
+}
+
+auto shm_selftest_visible_pid_scope_reuse() -> bool {
+    return run_visible_pid_case([](VisiblePidFixture& fixture) {
+        size_t const PID_BASELINE = visible_pid_scope::live_namespace_count();
+        if (!fixture.scopes()) return false;
+        auto* creator = fixture.private_actor(0);
+        auto* reader = fixture.make(1);
+        if (creator == nullptr || reader == nullptr || !visible_resource::inherit(*reader->subject, *creator->subject)) return false;
+        auto* thread = fixture.bound_thread(2, *creator);
+        int const ID = fixture.create(*creator);
+        if (thread == nullptr || ID < 0 || !visible_stat_matches(*reader, ID, 1, 1, 0)) return false;
+        uint64_t const OLD_GENERATION = fixture.first_pid.generation();
+        for (size_t index = fixture.actors.size(); index != 0; --index) fixture.actors[index - 1].reset();
+        fixture.first_pid.reset();
+        // Only the IPC scope and value-only segment remain. Every old Task,
+        // bound owner and PID reference has actually been destroyed.
+        if (visible_pid_scope::live_namespace_count() != PID_BASELINE || !visible_segment_state(ID).found ||
+            visible_pid_scope::create_namespace(fixture.first_pid) != 0)
+            return false;
+        auto* fresh = fixture.private_actor(0);
+        return fresh != nullptr && fresh->subject->namespace_tid() == 1 && fixture.first_pid.generation() != OLD_GENERATION &&
+               visible_stat_matches(*fresh, ID, 0, 0, 0) && visible_segment_state(ID).generation == OLD_GENERATION;
+    });
+}
+
+auto shm_selftest_visible_pid_fork_retirement() -> bool {
+    return run_visible_pid_case([](VisiblePidFixture& fixture) {
+        if (!fixture.scopes(true)) return false;
+        auto* parent = fixture.private_actor(0);
+        auto* child = fixture.make(1, true, false);
+        auto* foreign_parent = fixture.private_actor(2, true);
+        auto* retained = fixture.make(3, true, false);
+        if (parent == nullptr || child == nullptr || foreign_parent == nullptr || retained == nullptr ||
+            !visible_resource::inherit(*child->subject, *parent->subject) ||
+            !visible_resource::inherit(*retained->subject, *foreign_parent->subject))
+            return false;
+        int const ID = fixture.create(*parent);
+        if (ID < 0 || !visible_attach(*parent, ID)) return false;
+        auto const ORIGINAL = visible_segment_state(ID);
+        {
+            ker::syscall::vmem::SharedVmemPublicationGuard publication;
+            if (!visible_virt::deep_copy_user_pagemap_cow(parent->root, child->root) ||
+                !shm_clone_for_fork_locked(parent->subject.get(), child->subject.get()) ||
+                !visible_virt::deep_copy_user_pagemap_cow(parent->root, retained->root) ||
+                !shm_clone_for_fork_locked(parent->subject.get(), retained->subject.get()))
+                return false;
+        }
+        auto const CLONED = visible_segment_state(ID);
+        uint64_t const PRIVATE_PHYSICAL = visible_copy::mapped_physical_address(*parent->subject, VISIBLE_OUTPUT);
+        uint64_t const SHARED_BITS = visible_paging::PAGE_SHARED | visible_paging::PAGE_WRITE;
+        for (auto* actor : {parent, child, retained}) {
+            uint64_t const SHARED_LEAF = visible_leaf_raw(actor->root, VISIBLE_ATTACHMENT);
+            uint64_t const PRIVATE_LEAF = visible_leaf_raw(actor->root, VISIBLE_OUTPUT);
+            if ((SHARED_LEAF & SHARED_BITS) != SHARED_BITS || (SHARED_LEAF & visible_paging::PAGE_COW) != 0 ||
+                (PRIVATE_LEAF & visible_paging::PAGE_COW) == 0 || (PRIVATE_LEAF & visible_paging::PAGE_WRITE) != 0 ||
+                visible_copy::mapped_physical_address(*actor->subject, VISIBLE_OUTPUT) != PRIVATE_PHYSICAL)
+                return false;
+        }
+        if (CLONED.attachments != 3 || CLONED.last != ORIGINAL.last || CLONED.visible_last != ORIGINAL.visible_last ||
+            visible_phys::page_ref_get(ORIGINAL.backing) != 4 ||
+            visible_copy::mapped_physical_address(*child->subject, VISIBLE_ATTACHMENT, true) != visible_physical(ORIGINAL.backing) ||
+            visible_copy::mapped_physical_address(*retained->subject, VISIBLE_ATTACHMENT, true) != visible_physical(ORIGINAL.backing) ||
+            !visible_attachment_owned(*child->subject, ID, VISIBLE_ATTACHMENT) ||
+            !visible_attachment_owned(*retained->subject, ID, VISIBLE_ATTACHMENT) || !visible_stat_matches(*child, ID, 1, 1, 3))
+            return false;
+        // STAT copyout genuinely resolves the child's private COW scratch,
+        // while the SysV PTE remains the exact shared backing in all roots.
+        if (visible_copy::mapped_physical_address(*child->subject, VISIBLE_OUTPUT) == PRIVATE_PHYSICAL ||
+            visible_copy::mapped_physical_address(*parent->subject, VISIBLE_OUTPUT) != PRIVATE_PHYSICAL ||
+            visible_copy::mapped_physical_address(*child->subject, VISIBLE_ATTACHMENT) != visible_physical(ORIGINAL.backing))
+            return false;
+        // Ordinary fork COW keeps the shared mapping shared. Verify actual
+        // cross-root writable bytes, not merely coincident page translations.
+        uint64_t const MARKER = 0xB42C001122334455ULL;
+        uint64_t observed = 0;
+        if (!visible_copy::copy_value_to_task(*parent->subject, VISIBLE_ATTACHMENT, MARKER) ||
+            !visible_copy::copy_value_from_task(*child->subject, VISIBLE_ATTACHMENT, observed) || observed != MARKER)
+            return false;
+        fixture.actors[1].reset();
+        fixture.actors[0].reset();
+        auto const LAST = visible_segment_state(ID);
+        if (LAST.attachments != 1 || LAST.last != ORIGINAL.last || LAST.visible_last != ORIGINAL.visible_last ||
+            visible_phys::page_ref_get(ORIGINAL.backing) != 2)
+            return false;
+        shm_retire_namespace(fixture.first_ipc);
+        auto const RETIRED = visible_segment_state(ID);
+        if (!fixture.first_ipc.closed() || !RETIRED.marked || RETIRED.attachments != 1 ||
+            shmctl_impl(retained->subject.get(), ID, visible_abi::IPC_STAT, VISIBLE_STAT) != to_errno(EINVAL) ||
+            !visible_detach(*retained) || visible_segment_state(ID).found || visible_phys::page_ref_get(ORIGINAL.backing) != 0)
+            return false;
+        return true;
+    });
+}
+
+auto shm_selftest_visible_pid_denial_guards() -> bool {
+    return run_visible_pid_case([](VisiblePidFixture& fixture) {
+        if (!fixture.scopes(true)) return false;
+        auto* owner = fixture.private_actor(0);
+        auto* denied = fixture.make(1, true, true, 200);
+        auto* foreign = fixture.private_actor(2, true);
+        auto* unbound = fixture.make(3);
+        if (owner == nullptr || denied == nullptr || foreign == nullptr || unbound == nullptr ||
+            !visible_resource::inherit(*denied->subject, *owner->subject) || owner->subject->credentials().authority_ceiling() != 0 ||
+            denied->subject->credentials().authority_ceiling() != 0)
+            return false;
+        unbound->subject->is_thread = true;
+        if (pid_identity_for_task(nullptr).valid || pid_identity_for_task(unbound->subject.get()).valid ||
+            !visible_denied_stat(*unbound, 1, ESRCH) ||
+            shmget_impl(nullptr, visible_abi::IPC_PRIVATE, VISIBLE_PAGE, 0600) != to_errno(ESRCH) ||
+            shmat_impl(nullptr, 1, VISIBLE_ATTACHMENT, 0) != to_errno(ESRCH) ||
+            shmdt_impl(nullptr, VISIBLE_ATTACHMENT) != to_errno(ESRCH) ||
+            shmctl_impl(nullptr, 1, visible_abi::IPC_STAT, 0) != to_errno(ESRCH))
+            return false;
+        int const KEY = unused_fixture_key();
+        int const ID = fixture.create(*owner, 0600, KEY);
+        if (ID < 0 || !visible_denied_stat(*foreign, ID, EINVAL) || !visible_denied_stat(*denied, ID, EACCES) ||
+            shmat_impl(foreign->subject.get(), ID, VISIBLE_ATTACHMENT, 0) != to_errno(EINVAL) ||
+            shmat_impl(denied->subject.get(), ID, VISIBLE_ATTACHMENT, 0) != to_errno(EACCES) ||
+            shmctl_impl(denied->subject.get(), ID, visible_abi::IPC_RMID, 0) != to_errno(EPERM) ||
+            shmget_impl(denied->subject.get(), KEY, 0, 0400) != to_errno(EACCES) || !visible_stat_matches(*owner, ID, 1, 1, 0, 0600, KEY))
+            return false;
+        // An unmapped suffix may leave the existing successfully copied prefix;
+        // this test deliberately does not assert all-or-nothing EFAULT.
+        uint64_t const PARTIAL = VISIBLE_OUTPUT + VISIBLE_PAGE - 64;
+        if (shmctl_impl(owner->subject.get(), ID, visible_abi::IPC_STAT, PARTIAL) != to_errno(EFAULT)) return false;
+        std::array<uint8_t, 64> prefix{};
+        auto const EXPECTED = visible_expected_stat(*owner, ID, 1, 1, 0, 0600, KEY);
+        if (!visible_copy::copy_from_task(*owner->subject, PARTIAL, prefix.data(), prefix.size()) ||
+            std::memcmp(prefix.data(), &EXPECTED, prefix.size()) != 0)
+            return false;
+        // Replacing a retained attachment's PTE must not let DETACH unmap the
+        // new, unrelated frame. The old segment mapping ref was already dropped.
+        if (!visible_attach(*owner, ID)) return false;
+        auto const ATTACHED = visible_segment_state(ID);
+        visible_virt::unmap_page(owner->root, VISIBLE_ATTACHMENT);
+        auto* replacement = owner->map(VISIBLE_ATTACHMENT, 0xD2);
+        if (replacement == nullptr || shmdt_impl(owner->subject.get(), VISIBLE_ATTACHMENT) != 0 ||
+            visible_copy::mapped_physical_address(*owner->subject, VISIBLE_ATTACHMENT) != visible_physical(replacement) ||
+            visible_segment_state(ID).attachments != 0 || visible_phys::page_ref_get(ATTACHED.backing) != 1)
+            return false;
+        visible_virt::unmap_page(owner->root, VISIBLE_ATTACHMENT);
+        if (!visible_attach(*owner, ID)) return false;
+        shm_retire_namespace(fixture.first_ipc);
+        if (!visible_denied_stat(*owner, ID, EIDRM) ||
+            shmget_impl(owner->subject.get(), visible_abi::IPC_PRIVATE, VISIBLE_PAGE, 0600) != to_errno(EIDRM) ||
+            shmat_impl(owner->subject.get(), ID, VISIBLE_ATTACHMENT + VISIBLE_PAGE, 0) != to_errno(EIDRM) ||
+            shmctl_impl(owner->subject.get(), ID, visible_abi::IPC_RMID, 0) != to_errno(EIDRM) || !visible_detach(*owner))
+            return false;
+        return !visible_segment_state(ID).found;
+    });
 }
 #endif
 

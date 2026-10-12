@@ -132,6 +132,21 @@ stop at the signed 32-bit limit instead of wrapping into stale capabilities.
 Explicit inherited mappings remain backing capabilities without granting name
 or control access in another namespace. Shared futex keying is unchanged.
 
+`IPC_STAT` reports historical creator and last-operator process names only to
+readers in the creator's exact PID namespace generation. Host-created segments
+retain canonical Host process IDs. Private creators use local process names,
+including when a bound thread performs the operation. A foreign PID view sees
+zero, even when its IPC capability allows access and its local numeric PID
+matches the creator's name. Successful explicit attach/detach updates the last
+name; a foreign-generation operator records zero. Fork inheritance, process
+cleanup and IPC retirement preserve that history.
+
+Segments store these names and the creator's generation as numeric history;
+they retain no Task or PID namespace. Destroying the creator or reusing a PID
+namespace slot cannot bind old metadata to a new process. Physical segment and
+attachment ownership stays separate. The syscall selectors, errors, libc
+interface and 120-byte `ShmidDs` layout are unchanged.
+
 `shm_retire_namespace` closes private admission under the SysV registry lock
 and marks only its exact segments for destruction. New GET/ATTACH/CTL return
 EIDRM. Attached backing stays until the final attachment drains; retirement
@@ -140,8 +155,18 @@ This hook still needs the future compartment-init teardown coordinator.
 
 Physical segment allocation/release retains the existing SysV lock/context
 behavior. The new namespace's final release never performs heavy cleanup under
-that lock. Namespace-init policy, namespace-local stat PIDs, aggregate IPC
-budgets and real user mapping/futex tests remain integration work.
+that lock. Complete namespace-init policy, aggregate IPC budgets and scheduled
+user mapping/futex qualification remain integration work.
+
+Seven native tests exercise actual owned Tasks, private user page tables,
+guarded STAT copies, attach/detach, canonical threads, creator/scope destruction,
+colliding names, real fork COW and retained mappings across IPC retirement.
+KTEST73 passed 1,435 cases and 93,325 assertions with zero failures; all 184
+mandatory cases passed and the three existing disabled BufferCache cases stayed
+disabled. Normal Build WOS, the isolated fast diagnostic build, 64 host tests,
+format/tidy and both compiler profiles' ABI checks passed. These native fixtures
+do not qualify scheduled public PID observation, namespace-init death, the
+unresolved SMP workload or the full Goal39 service/lifecycle requirements.
 
 ## Private native mount ownership
 

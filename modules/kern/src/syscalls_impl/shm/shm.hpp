@@ -27,6 +27,13 @@ void shm_retire_namespace(const ker::mod::sched::ipc::NamespaceRef& ipc_namespac
 #ifdef WOS_SELFTEST
 auto shm_selftest_namespace_isolation() -> bool;
 auto shm_selftest_namespace_retirement() -> bool;
+auto shm_selftest_visible_pid_host() -> bool;
+auto shm_selftest_visible_pid_private() -> bool;
+auto shm_selftest_visible_pid_historical_creator() -> bool;
+auto shm_selftest_visible_pid_foreign_scopes() -> bool;
+auto shm_selftest_visible_pid_scope_reuse() -> bool;
+auto shm_selftest_visible_pid_fork_retirement() -> bool;
+auto shm_selftest_visible_pid_denial_guards() -> bool;
 #endif
 
 }  // namespace ker::syscall::shm

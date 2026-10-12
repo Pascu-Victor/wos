@@ -8,7 +8,12 @@
 
 ## Outcome and scale
 
-Current checkpoint 38 qualifies atomic access to all five existing Task placement
+Current checkpoint 42 implements generation-scoped SysV creator/operator PID
+metadata while preserving physical attachment ownership and the public ABI.
+Seven new native cases passed in KTEST73: 1,435 executed cases, all 184 mandatory,
+93,325 assertions and zero failures. Scheduled public metadata observation and
+the SMP workload remain unqualified; this does not complete a full criterion.
+Historical checkpoint 38 qualifies atomic access to all five Task placement
 scalars with unchanged compiler-measured layout and three actual native cases.
 Checkpoint 37's locked hard-domain admission, checkpoint 36's immutable registry
 and Normal eight-CPU public ABI evidence, and checkpoint 35's initial nice
