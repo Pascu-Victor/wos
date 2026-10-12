@@ -21,16 +21,17 @@ suite pass. Checkpoint 44 qualifies the finite public process-launch and
 regular-file I/O probe, including complete descriptor observations and an
 actual init-reap witness.
 Checkpoint 45 characterizes regular-file mappings through the public spec.
-Strict execution completes, but shared-map coherence, writeback and private
-READ-to-WRITE promotion fail. Fresh remapping, ordinary private isolation,
-materialized fork sharing and read-only grant restrictions pass. Kernel repairs
-and fresh qualification remain required.
+Attempt02 completes strict execution, but shared-map coherence, writeback and
+private READ-to-WRITE promotion fail. Fresh remapping, ordinary private
+isolation, materialized fork sharing and read-only grant restrictions pass.
 Checkpoint 46 repairs private cached/fork-aliased WRITE promotion and READ/NONE
 revocation, including anonymous swap permissions. Six new native regressions
 and the complete diagnostic KTEST75 suite pass: 1,443 cases, 93,749 assertions,
-zero failures. Task layout and public ABI remain unchanged. The public-spec
-promotion replay is pending; coherent mutable SHARED backing and writeback
-remain unimplemented. All disposable test images are pruned after this run.
+zero failures. Task layout and public ABI remain unchanged. Fresh public
+attempt03 also passes promotion and peer isolation (5/5 comparisons), with
+strict execution and independent raw-data audit complete. Shared-map coherence
+and writeback still fail (mask3); coherent mutable SHARED backing remains
+unimplemented. All disposable images are pruned after both runs.
 Exact-owner ambient network admission is implemented;
 complete PID, lifecycle and WKI qualification remains incomplete. Independent
 service isolation and all ten goal criteria remain unqualified. Goal28 remains
@@ -319,8 +320,30 @@ All four disposable images are pruned, releasing 200,163,328 allocated bytes and
 leaving zero disposable allocation. The unrelated user VM is unchanged.
 Independent terminal receipt SHA256 is
 `fe7285b505362dce2a8d28e9449bf765e3fbab7b61953884ad9f7a0f87892b71`.
-Kernel promotion/coherence/writeback repairs, cache-eviction qualification,
-complete reference drains, two-hour operation and 1,000 lifecycles remain open.
+These are attempt02's historical observations. Checkpoint46 subsequently
+repairs private promotion and permission revocation in local commit `c9af3ed6`.
+Normal/isolated diagnostic builds, 64 Host tests, formatting, fresh Task layout
+measurements and all 1,443 KTEST75 cases pass, including six new native tests.
+
+Fresh Normal eight-CPU attempt03 repeats the same strict public protocol using
+the repaired kernel. All 13 durable files total 236,632 bytes; all 12 prepared
+and 12 stopped readbacks match. Independent raw decoding reconstructs 550
+events and 222 semantic comparisons. Promotion passes 5/5; remapping, private
+isolation, materialized fork sharing and rights/retention pass. Independent
+shared-map coherence fails 64/80 comparisons; writeback fails 1/33, at the final
+Host positional read after one private root exits. The source permits stale
+unmap writeback, but this campaign captures no individual backend write trace
+that establishes causation. The semantic failure mask is3.
+
+Independent terminal receipt SHA256 is
+`328278f0d1b763ddd1602f497334ed10b599a5ca1d14d85e7683b1c348a60ba0`.
+It binds strict raw producer/init proofs, current sources/build/dependencies,
+exact artifact readbacks and fresh Host cleanup. The owned VM is stopped by
+QMP at the existing 120-second bound. Four inactive owned images are pruned
+(200,163,328 allocated bytes), leaving zero disposable allocation and the
+unrelated user VM unchanged. Shared coherence/writeback, complete reference
+drains, two-hour operation and 1,000 lifecycles remain open; no full criterion
+is qualified.
 
 ## Private native mount ownership
 

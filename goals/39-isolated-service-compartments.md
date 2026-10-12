@@ -16,9 +16,12 @@ all 192 mandatory, 93,749 assertions and zero failures, including six new native
 regressions. It shuts down naturally; all four owned images (263,602,176 allocated
 bytes) are pruned, leaving zero disposable allocation and the unrelated VM
 preserved. The independent terminal audit confirms the exact source and serial
-census. Public-spec promotion replay and shared-map coherence/writeback repair
-remain outstanding. Goal39 remains ACTIVE; this bounded qualification completes
-no full criterion.
+census. Fresh Normal eight-CPU public attempt03 also passes private promotion
+and peer isolation (5/5 comparisons). Shared-map coherence and writeback still
+fail (semantic mask3); strict execution and independent raw-data audit pass.
+All four replay images (200,163,328 allocated bytes) are pruned, with zero
+disposable allocation and the unrelated VM preserved. Goal39 remains ACTIVE;
+these bounded qualifications complete no full criterion.
 
 Checkpoint 45 adds the finite public regular-file mapping characterization.
 Its Normal eight-CPU attempt02 completes the strict execution protocol but
@@ -1157,8 +1160,36 @@ only its owned VM through QMP at 120 seconds; natural poweroff is not claimed.
 All four owned images are pruned, releasing 200,163,328 allocated bytes, with
 zero disposable allocation and the unrelated user VM preserved.
 
-Goal39 remains ACTIVE; all ten full criteria remain incomplete. Next: repair
-private promotion and permission downgrades under the MM patch contract with
-actual cache/ref/permission regressions, then address shared coherence/writeback
-under a separate contract. Two-hour helper drafts are source-only preparation;
-they are not criterion8 evidence.
+Goal39 remains ACTIVE; all ten full criteria remain incomplete. Checkpoint46
+below records the subsequent private promotion repair and public replay.
+Two-hour helper drafts are source-only preparation; they are not criterion8
+evidence.
+
+## Checkpoint46: private promotion repair and public replay (2026-10-13)
+
+Local commit `c9af3ed6` repairs private WRITE promotion and READ/NONE revocation.
+Normal Build WOS, isolated fast diagnostic build, 64 Host tests, formatting,
+fresh Task layout measurements and all 1,443 actual KTEST75 cases pass.
+
+Fresh public Filemap attempt03 uses the repaired Normal kernel, eight CPUs and
+`--no-setup`. Its strict protocol completes with 13 durable files (236,632
+bytes), 16 actual WAIT0/WAKE1 pairs, three consuming waits/status0 and the
+actual original-init exit/reap proof. Independent raw decoding reconstructs
+550 events and 222 semantic comparisons. Private promotion passes 5/5;
+fresh remapping, ordinary private isolation, materialized fork sharing and
+rights/retention also pass. Independent shared-map coherence and writeback
+remain failures, yielding mask3. Earlier masks35 and the failed strict
+attempt01 remain historical evidence of their executed source cohorts.
+
+Independent terminal receipt `checkpoint46-filemap-runtime03-independent-terminal01.json`
+has SHA256 `328278f0d1b763ddd1602f497334ed10b599a5ca1d14d85e7683b1c348a60ba0`:
+138 checks, 1,207 direct pins, 1,971 raw predicates and no audit errors.
+All 12 prepared and 12 stopped artifact readbacks match. The owned VM is
+stopped through exact QMP quit at the existing 120-second bound; natural
+poweroff is not claimed. All four images are pruned (200,163,328 allocated
+bytes), leaving zero disposable allocation and the unrelated VM unchanged.
+
+Next: repair caller pin-order hazards under their separate critical contract,
+then implement coherent mutable shared backing and writeback. Complete
+reference drains, two-hour simultaneous services and 1,000 lifecycle/fault
+cycles remain unqualified. Goal39 stays ACTIVE; all ten full criteria are open.
