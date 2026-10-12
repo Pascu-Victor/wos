@@ -151,7 +151,9 @@ interface and 120-byte `ShmidDs` layout are unchanged.
 and marks only its exact segments for destruction. New GET/ATTACH/CTL return
 EIDRM. Attached backing stays until the final attachment drains; retirement
 does not unmap intentionally inherited memory. Host retirement is ignored.
-This hook still needs the future compartment-init teardown coordinator.
+The deferred compartment-init retirement worker calls this hook after
+requesting exits from retained members. Complete scheduled reference and
+retirement-drain qualification remains open.
 
 Physical segment allocation/release retains the existing SysV lock/context
 behavior. The new namespace's final release never performs heavy cleanup under
@@ -167,6 +169,20 @@ disabled. Normal Build WOS, the isolated fast diagnostic build, 64 host tests,
 format/tidy and both compiler profiles' ABI checks passed. These native fixtures
 do not qualify scheduled public PID observation, namespace-init death, the
 unresolved SMP workload or the full Goal39 service/lifecycle requirements.
+
+The separate Normal eight-CPU public StageA run verifies creator/operator
+`1/1` in both private PID 1 roots through actual `IPC_STAT`. It preserves all
+32 mutable SysV rounds, 32 read-only File futex rounds, two foreign-backing
+negative rounds, guarded foreign IPC rejection and refused signal names.
+Host supervision kills and reaps A's init with status 9, observes its child
+disappear, and confirms B continues before its local PID 2 reap with status 0.
+The independent init-exit snapshot records the Host probe's actual exit 0.
+All 12 current uploaded objects match prepared and stopped read-only hashes;
+all 886 source/artifact pins stay unchanged. The workload completes in 0.590s;
+the runner stops its exact-owned VM at the existing 120s wall timeout because
+service output uses the journal. Four disposable images are pruned. This does
+not qualify child-operator/history observation, successful foreign PID
+projection, complete reference drains, two-hour operation or 1,000 lifecycles.
 
 ## Private native mount ownership
 
