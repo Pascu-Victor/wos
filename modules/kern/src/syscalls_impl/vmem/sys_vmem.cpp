@@ -3093,31 +3093,35 @@ auto anon_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size, uint64
         uint64_t const SRC_VA = old_addr + off;
         uint64_t const DST_VA = NEW_ADDR + off;
 
-        ker::mod::sys::usercopy::StableUserPage src_page;
-        if (!ker::mod::sys::usercopy::pin_task_user_page(*task, SRC_VA, false, true, src_page)) {
-            anon_free(NEW_ADDR, NEW_SIZE);
-            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
-        }
-        if (!ker::mod::mm::virt::ensure_user_page_writable(task, DST_VA)) {
-            anon_free(NEW_ADDR, NEW_SIZE);
-            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
-        }
+        // Complete both pins before cleanup can reacquire VM publication.
+        uint64_t const COPY_RESULT = [&]() -> uint64_t {
+            ker::mod::sys::usercopy::StableUserPage src_page;
+            if (!ker::mod::sys::usercopy::pin_task_user_page(*task, SRC_VA, false, true, src_page)) {
+                return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
+            }
+            if (!ker::mod::mm::virt::ensure_user_page_writable(task, DST_VA)) {
+                return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+            }
 
-        ker::mod::sys::usercopy::StableUserPage dst_page;
-        if (!ker::mod::sys::usercopy::pin_task_user_page(*task, DST_VA, true, false, dst_page)) {
-            anon_free(NEW_ADDR, NEW_SIZE);
-            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
-        }
+            ker::mod::sys::usercopy::StableUserPage dst_page;
+            if (!ker::mod::sys::usercopy::pin_task_user_page(*task, DST_VA, true, false, dst_page)) {
+                return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
+            }
 
-        {
-            ker::mod::sys::usercopy::UserAccessGuard const ACCESS{};
-            std::memcpy(dst_page.kernel_address(), src_page.kernel_address(), ker::mod::mm::paging::PAGE_SIZE);
-        }
-        bool const SOURCE_STILL_MAPPED = src_page.still_mapped();
-        bool const DESTINATION_COMMITTED = dst_page.commit_write();
-        if (!SOURCE_STILL_MAPPED || !DESTINATION_COMMITTED) {
+            {
+                ker::mod::sys::usercopy::UserAccessGuard const ACCESS{};
+                std::memcpy(dst_page.kernel_address(), src_page.kernel_address(), ker::mod::mm::paging::PAGE_SIZE);
+            }
+            bool const SOURCE_STILL_MAPPED = src_page.still_mapped();
+            bool const DESTINATION_COMMITTED = dst_page.commit_write();
+            if (!SOURCE_STILL_MAPPED || !DESTINATION_COMMITTED) {
+                return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
+            }
+            return 0;
+        }();
+        if (static_cast<int64_t>(COPY_RESULT) < 0) {
             anon_free(NEW_ADDR, NEW_SIZE);
-            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
+            return COPY_RESULT;
         }
     }
 

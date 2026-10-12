@@ -32,6 +32,13 @@ attempt03 also passes promotion and peer isolation (5/5 comparisons), with
 strict execution and independent raw-data audit complete. Shared-map coherence
 and writeback still fail (mask3); coherent mutable SHARED backing remains
 unimplemented. All disposable images are pruned after both runs.
+Checkpoint 47 removes nested timeout usercopy under the futex word pin and
+ends MREMAP copy pins before error cleanup takes VM publication. Error priority
+and insertion-time deadlines remain unchanged; timeout prefault/sampling moves
+earlier. Normal/isolated diagnostic builds, formatting, seven existing Host
+checks and 42 compiled caller regression vectors pass. The regression catches
+both hazards in archived old bodies. These are Host ordering/lifetime checks;
+broader root/reclaim drain safety and new guest execution remain unqualified.
 Exact-owner ambient network admission is implemented;
 complete PID, lifecycle and WKI qualification remains incomplete. Independent
 service isolation and all ten goal criteria remain unqualified. Goal28 remains

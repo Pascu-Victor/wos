@@ -8,6 +8,15 @@
 
 ## Outcome and scale
 
+Checkpoint 47 removes two caller pin-order hazards: FUTEX_WAIT stages timeout
+usercopy before retaining its word pin, and failed MREMAP iterations release
+both copy pins before VM cleanup. Error priority and insertion-time deadlines
+are preserved; timeout prefault/sampling occurs earlier. Normal and isolated
+fast diagnostic builds, formatting, seven focused Host checks and 42 compiled
+caller regression vectors pass. The same regression detects both hazards in
+the archived old code. These Host checks qualify caller ordering, not general
+root-drain safety, SMP interleavings or a fresh guest run. Goal39 stays ACTIVE.
+
 Checkpoint 46 repairs private READ-to-WRITE promotion for cached and fork-aliased
 pages and revokes COW write authority on READ/NONE, including swapped anonymous
 pages. Normal Build WOS, the isolated fast diagnostic build, 64 Host tests,
@@ -1189,7 +1198,35 @@ stopped through exact QMP quit at the existing 120-second bound; natural
 poweroff is not claimed. All four images are pruned (200,163,328 allocated
 bytes), leaving zero disposable allocation and the unrelated VM unchanged.
 
-Next: repair caller pin-order hazards under their separate critical contract,
-then implement coherent mutable shared backing and writeback. Complete
+Checkpoint47 below repairs the caller pin-order hazards under their separate
+critical contract. Coherent mutable shared backing and writeback, complete
 reference drains, two-hour simultaneous services and 1,000 lifecycle/fault
 cycles remain unqualified. Goal39 stays ACTIVE; all ten full criteria are open.
+
+## Checkpoint47: caller pin lifetime ordering (2026-10-13)
+
+FUTEX_WAIT copies and validates its relative timeout before acquiring the first
+futex mapping pin. It returns a staged timeout error only after the original
+mapping admission, preserving EFAULT priority, zero/mismatched-word errors,
+duration rounding and the queue-insertion deadline. Timeout prefault effects
+and the sample of concurrently edited timeout memory occur earlier.
+
+MREMAP copies each page in a lexical scope that destroys destination/source
+pins before any failed iteration calls `anon_free`. Error values, post-copy
+mapping/write checks, partial-destination cleanup and final source-free behavior
+remain unchanged. No new blocking root drain or shared backing policy is added.
+
+The compiled Host regression extracts the actual five caller/timeout function
+bodies and checks 42 vectors (23 futex, 19 MREMAP), with zero failures and zero
+live-pin cleanup/copy observations. Its primitive Host backends model pin
+lifetimes and deterministic failures; they do not model hardware PTEs or SMP.
+The exact archived old bodies compile and fail the same test, observing 12
+timeout-copy and nine cleanup pin-order violations. CTest registers the new
+test with a 60-second timeout. Two stale VM source assertions are corrected
+while preserving allocation/reference ordering and namespace-TID checks.
+
+Normal Build WOS, `bin/wos-ktest --fast --build-only`, repository formatting
+and seven existing focused Host checks pass. No new guest or KTEST execution
+is claimed for this patch. The earlier Native75 and public Filemap03 receipts
+remain evidence of their exact earlier source cohort. Shared coherence,
+broader root/reclaim dependencies and all ten full goal criteria remain open.

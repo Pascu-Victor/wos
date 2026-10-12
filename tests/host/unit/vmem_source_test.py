@@ -462,7 +462,8 @@ def test_cow_write_resolution_serializes_pte_reference_consumption() -> None:
         [
             "cow_pte_lock.lock_irqsave()",
             "phys::page_ref_inc(old_virt, &cow_lookup);",
-            "void* new_page = alloc_cow_destination_page(DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE);",
+            "void* new_page = nullptr;",
+            "new_page = alloc_cow_destination_page(DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE);",
             "CURRENT_PHYS == old_phys",
             "installed_private_page = true;",
             "phys::page_ref_dec(old_virt, &cow_lookup);",
@@ -478,7 +479,7 @@ def test_cow_write_resolution_serializes_pte_reference_consumption() -> None:
     )
     require_order(
         resolver_body,
-        "void* new_page = alloc_cow_destination_page(DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE);",
+        "new_page = alloc_cow_destination_page(DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE);",
         "CURRENT_PHYS == old_phys",
         "COW resolver must allocate/copy before the locked same-frame commit check",
     )
@@ -833,12 +834,13 @@ def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
             "ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;",
             "Task::create_user_thread(parent, tcb_va, user_sp, enter_va, prepared_stack_words.at(0),",
             "prepared_stack_words.at(1), &stack_exhausted);",
+            "uint64_t const NEW_TID = t->namespace_tid();",
             "post_task_for_cpu(TARGET_CPU, t)",
         ],
         "thread lazy-range clone through scheduler publication",
     )
     inherited_exit_pos = create_case.find("inherit_pending_process_exit_request(parent, t)")
-    saved_pid_pos = create_case.find("thread_pid = t->pid;", inherited_exit_pos)
+    saved_pid_pos = create_case.find("thread_pid = NEW_TID;", inherited_exit_pos)
     guard_scope_end = create_case.find("\n            }\n", saved_pid_pos)
     current_exit_pos = create_case.find("exit_current_if_process_exit_requested();", saved_pid_pos)
     if (

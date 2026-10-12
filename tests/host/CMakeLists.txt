@@ -750,6 +750,13 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/futex_source_test.py
 )
 add_test(
+    NAME caller_pin_order_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/caller_pin_order_runtime_test.py
+)
+set_tests_properties(caller_pin_order_runtime_test PROPERTIES
+    LABELS "host;unit;source;integration" TIMEOUT 60
+)
+add_test(
     NAME waitpid_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/waitpid_source_test.py
 )

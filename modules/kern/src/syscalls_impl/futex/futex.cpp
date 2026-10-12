@@ -180,15 +180,17 @@ int64_t futex_wait(uint64_t user_addr, int expected, uint64_t timeout_user_addr)
         return -EFAULT;
     }
 
+    // Stage timeout usercopy without retaining a first root-gate reader.
+    // Futex mapping failure keeps priority over the staged timeout error.
+    uint64_t timeout_us = 0;
+    int64_t const TIMEOUT_STATUS = relative_timeout_us(*current_task, timeout_user_addr, timeout_us);
+
     mod::sys::usercopy::StableUserPage futex_page{};
     if (!mod::sys::usercopy::pin_task_user_page(*current_task, user_addr, false, true, futex_page)) {
         return -EFAULT;
     }
     uint64_t const PHYS_ADDR = futex_page.physical_address();
     auto const* kernel_addr = static_cast<const int*>(futex_page.kernel_address());
-
-    uint64_t timeout_us = 0;
-    int64_t const TIMEOUT_STATUS = relative_timeout_us(*current_task, timeout_user_addr, timeout_us);
     if (TIMEOUT_STATUS != 0) {
         return TIMEOUT_STATUS;
     }
