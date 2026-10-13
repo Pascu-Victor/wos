@@ -1102,6 +1102,14 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_ialloc_source_test.py
 )
 add_test(
+    NAME xfs_sparse_inode_allocation_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_sparse_inode_allocation_runtime_test.py
+)
+set_tests_properties(xfs_sparse_inode_allocation_runtime_test PROPERTIES
+    LABELS "host;unit;source;integration" TIMEOUT 70
+    ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}"
+)
+add_test(
     NAME xfs_inode_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_inode_source_test.py
 )

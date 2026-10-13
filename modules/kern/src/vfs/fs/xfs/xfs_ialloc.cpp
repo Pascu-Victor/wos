@@ -244,6 +244,18 @@ auto allocate_inode_chunk(XfsMountContext* mount, XfsTransaction* tp) -> xfs_ino
     return ialloc_ag(mount, tp, result.agno);
 }
 
+auto inobt_present_free_mask(const XfsInobtTraits::IRec& rec) -> uint64_t {
+    uint64_t free_mask = rec.free_mask;
+    if (rec.sparse_format) {
+        for (uint32_t hole_bit = 0; hole_bit < XFS_INODES_PER_CHUNK / XFS_INODES_PER_HOLEMASK_BIT; ++hole_bit) {
+            if ((static_cast<uint32_t>(rec.holemask) & (uint32_t{1} << hole_bit)) != 0) {
+                free_mask &= ~(uint64_t{0xF} << (hole_bit * XFS_INODES_PER_HOLEMASK_BIT));
+            }
+        }
+    }
+    return free_mask;
+}
+
 auto first_free_inode_bit(uint64_t free_mask) -> int {
     if (free_mask == 0) {
         return -1;
@@ -297,9 +309,13 @@ auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) 
         while (true) {
             XfsInobtTraits::IRec rec = xfs_btree_get_rec(&cur);
 
-            if (rec.freecount > 0 && rec.free_mask != 0) {
-                // Found a chunk with free inodes
-                int const BIT = first_free_inode_bit(rec.free_mask);
+            if (rec.freecount > 0) {
+                // Sparse holes may retain free bits but have no physical inode.
+                int const BIT = first_free_inode_bit(inobt_present_free_mask(rec));
+                if (BIT < 0) {
+                    tp->error = -EIO;
+                    return NULLFSINO;
+                }
                 if (BIT >= 0 && std::cmp_less(BIT, XFS_INODES_PER_CHUNK)) {
                     xfs_agino_t const AGINO = rec.startino + static_cast<xfs_agino_t>(BIT);
                     xfs_ino_t const INO = (static_cast<xfs_ino_t>(agno) << mount->agino_log) | AGINO;
