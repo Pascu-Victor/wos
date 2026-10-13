@@ -2319,8 +2319,9 @@ auto dir2_leaf_prepare_stale_insert(const XfsDir3LeafHdr* hdr, xfs_dahash_t hash
 
     const auto* lep = dir2_leaf_entries(hdr);
     int insert_pos = 0;
+    // Stale slots retain their hashes and must stay in sorted order too.
     for (int i = 0; std::cmp_less(i, LEAF_COUNT); i++) {
-        if (lep[i].address.to_cpu() != XFS_DIR2_NULL_DATAPTR && lep[i].hashval.to_cpu() <= hash) {
+        if (lep[i].hashval.to_cpu() <= hash) {
             insert_pos = i + 1;
         }
     }
@@ -3387,8 +3388,9 @@ auto dir2_block_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_in
     int stale_idx = -1;
     int insert_pos = 0;
     if (STALE_COUNT != 0) {
+        // Include stale hashes when finding the sorted insertion position.
         for (int i = 0; std::cmp_less(i, leaf_count); i++) {
-            if (blp[i].address.to_cpu() != XFS_DIR2_NULL_DATAPTR && blp[i].hashval.to_cpu() <= HASH) {
+            if (blp[i].hashval.to_cpu() <= HASH) {
                 insert_pos = i + 1;
             }
         }

@@ -1110,6 +1110,14 @@ set_tests_properties(xfs_sparse_inode_allocation_runtime_test PROPERTIES
     ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}"
 )
 add_test(
+    NAME xfs_block_stale_leaf_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_block_stale_leaf_runtime_test.py
+)
+set_tests_properties(xfs_block_stale_leaf_runtime_test PROPERTIES
+    LABELS "host;unit;runtime;integration" TIMEOUT 130
+    ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}"
+)
+add_test(
     NAME xfs_inode_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_inode_source_test.py
 )
