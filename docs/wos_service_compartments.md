@@ -57,7 +57,15 @@ aligned span exceeds signed positional-I/O range fail before publication with
 the existing overflow error. The Host regression passes 253 cases and 52,777
 assertions and detects all three original rewrite defects. Normal and isolated
 fast diagnostic builds, formatting and six focused Host tests pass. The new
-native real-PTE regression is compiled and enabled; execution remains pending.
+native real-PTE regression is compiled and enabled. Its first execution fails;
+source review finds a fixture mismatch: it supplies a writable description to
+an immutable-cache observer that requires read-only access. The original boolean
+failure does not identify its first failing mode. Checkpoint 51 corrects the
+description for the two read-protection modes and records the first failing
+stage after cleanup, preserving every assertion and the writable overflow
+vectors. Normal and isolated fast builds and formatting pass; corrected native
+execution remains pending. All four failed-run disposable disks were pruned,
+leaving zero disposable allocation; the unrelated VM was preserved.
 Existing references, rollback, locking, Task/File layouts and syscall ABI are
 preserved. Complete native mapping retirement and shared coherence remain open.
 Exact-owner ambient network admission is implemented;

@@ -2663,14 +2663,14 @@ auto selftest_lazy_file_projection(ker::mod::mm::paging::PageTable* pagemap) -> 
         state.close_unlocked = state.close_unlocked && UNLOCKED;
         return 0;
     };
-    auto const MAKE_FILE = [&](State& state) -> vfs::File* {
+    auto const MAKE_FILE = [&](State& state, int open_flags) -> vfs::File* {
         auto* file = new (std::nothrow) vfs::File{};
         if (file == nullptr) return nullptr;
         file->fs_type = vfs::FSType::SOCKET;
         file->fops = &operations;
         file->private_data = &state;
         file->pos = 19;
-        file->open_flags = 2;
+        file->open_flags = open_flags;
         file->refcount.store(1);
         file->exec_read_view.reset(new (std::nothrow) vfs::ExecReadView{});
         if (file->exec_read_view == nullptr) {
@@ -2694,8 +2694,10 @@ auto selftest_lazy_file_projection(ker::mod::mm::paging::PageTable* pagemap) -> 
     // synthetic read backend. No native filesystem or shared-coherence claim.
     for (unsigned mode = 0; mode < 9; ++mode) {
         State first{.seed = 0x21}, second{.seed = 0xa3};
-        auto* file = MAKE_FILE(first);
-        auto* replacement = MAKE_FILE(second);
+        // The immutable cache observer requires a read-only description;
+        // private writable mappings do not require a writable description.
+        auto* file = MAKE_FILE(first, mode == 6 || mode == 7 ? 0 : 2);
+        auto* replacement = MAKE_FILE(second, 2);
         if (file == nullptr || replacement == nullptr) {
             vfs::vfs_put_file(file);
             vfs::vfs_put_file(replacement);
@@ -2706,6 +2708,14 @@ auto selftest_lazy_file_projection(ker::mod::mm::paging::PageTable* pagemap) -> 
         std::array<CachedPage, 8> cached{};
         size_t cached_count = 0;
         bool ok = true;
+        const char* failure_stage = nullptr;
+        uint64_t failure_address = 0;
+        auto const RECORD_FAILURE = [&](const char* stage, uint64_t address = 0) {
+            if (!ok && failure_stage == nullptr) {
+                failure_stage = stage;
+                failure_address = address;
+            }
+        };
         bool const PREFIX = mode == 0 || mode == 2 || mode == 4 || mode == 6;
         uint64_t const CUT_START = PREFIX ? BASE : BASE + 2 * PAGE;
         uint64_t const CUT_SIZE = mode == 0 ? PAGE : 2 * PAGE;
@@ -2714,6 +2724,7 @@ auto selftest_lazy_file_projection(ker::mod::mm::paging::PageTable* pagemap) -> 
             SharedVmemPublicationGuard guard;
             ok = add_lazy_file_vmem_range(&task, BASE, SIZE, vm::PROT_READ | vm::PROT_WRITE, vm::MAP_PRIVATE, file, OFFSET,
                                           file->exec_read_view->metadata);
+            RECORD_FAILURE("initial-range");
             if (mode <= 1) {
                 ok = remove_lazy_vmem_range(&task, CUT_START, CUT_SIZE) && ok;
             } else if (mode <= 3) {
@@ -2729,11 +2740,14 @@ auto selftest_lazy_file_projection(ker::mod::mm::paging::PageTable* pagemap) -> 
                     ok = protect_lazy_vmem_range(&task, CUT_START, CUT_SIZE, vm::PROT_READ | vm::PROT_WRITE) && ok;
                 }
             }
+            RECORD_FAILURE("rewrite");
             ok = ok && first.reads == 0 && second.reads == 0;
+            RECORD_FAILURE("cold-read-count");
             for (uint64_t address = BASE; ok && address < BASE + SIZE; address += PAGE) {
                 bool const CUT = address >= CUT_START && address < CUT_END;
                 if (CUT && mode <= 1) {
                     ok = !first_lazy_vmem_overlap(&task, address, address + PAGE).found;
+                    RECORD_FAILURE("removed-range", address);
                     continue;
                 }
                 if (CUT && (mode == 4 || mode == 5)) {
@@ -2744,6 +2758,7 @@ auto selftest_lazy_file_projection(ker::mod::mm::paging::PageTable* pagemap) -> 
                         }
                     }
                     ok = found;
+                    RECORD_FAILURE("anonymous-range", address);
                     continue;
                 }
                 bool const REPLACED = CUT && (mode == 2 || mode == 3);
@@ -2755,15 +2770,18 @@ auto selftest_lazy_file_projection(ker::mod::mm::paging::PageTable* pagemap) -> 
                     if (address < range.start || address >= range.end) continue;
                     found = true;
                     ok = range.file == expected_file && range.file_offset + address - range.start == EXPECTED_OFFSET;
+                    RECORD_FAILURE("file-projection", address);
                     bool const CACHED = (range.prot & vm::PROT_WRITE) == 0;
                     if (CACHED) {
                         SelftestFileCacheObservation before{};
                         ok = selftest_observe_file_mmap_cache(*expected_file, EXPECTED_OFFSET, before) && ok;
                         if (before.retained_frame != nullptr) mm::phys::page_ref_dec(before.retained_frame);
                         ok = before.retained_frame == nullptr && before.vacant_way && ok;
+                        RECORD_FAILURE("cache-before", address);
                     }
                     mm::paging::PageFault fault{};
                     if (ok) ok = materialize_lazy_file_page_impl(&task, range, address, fault);
+                    RECORD_FAILURE("materialize", address);
                     if (CACHED) {
                         SelftestFileCacheObservation after{};
                         bool const OBSERVED = selftest_observe_file_mmap_cache(*expected_file, EXPECTED_OFFSET, after);
@@ -2771,19 +2789,24 @@ auto selftest_lazy_file_projection(ker::mod::mm::paging::PageTable* pagemap) -> 
                             cached.at(cached_count++) = {expected_file, EXPECTED_OFFSET, after.retained_frame};
                         }
                         ok = OBSERVED && after.retained_frame != nullptr && ok;
+                        RECORD_FAILURE("cache-after", address);
                     }
                     auto const PHYSICAL = mm::virt::translate(pagemap, address);
                     if (PHYSICAL == mm::virt::PADDR_INVALID) {
                         ok = false;
+                        RECORD_FAILURE("pte", address);
                         break;
                     }
                     auto const* bytes = reinterpret_cast<const uint8_t*>(mm::addr::get_virt_pointer(PHYSICAL));
                     for (size_t i = 0; i < PAGE; ++i) ok = BYTE(SEED, EXPECTED_OFFSET + i) == bytes[i] && ok;
+                    RECORD_FAILURE("cold-bytes", address);
                     break;
                 }
                 ok = found && ok;
+                RECORD_FAILURE("missing-range", address);
             }
             ok = remove_lazy_vmem_range(&task, BASE, SIZE) && ok;
+            RECORD_FAILURE("remove-cleanup");
             rollback_mapped_pages(&task, BASE, SIZE / PAGE);
         }
         for (size_t i = 0; i < cached_count; ++i) {
@@ -2791,16 +2814,22 @@ auto selftest_lazy_file_projection(ker::mod::mm::paging::PageTable* pagemap) -> 
             ok = selftest_evict_file_mmap_cache_exact(*page.file, page.offset, page.frame) && ok;
             mm::phys::page_ref_dec(page.frame);
             ok = mm::phys::page_ref_get(page.frame) == 0 && ok;
+            RECORD_FAILURE("cache-cleanup", BASE + page.offset - OFFSET);
         }
         ok = task.lazy_vmem_ranges.empty() && file->refcount.load() == 1 && replacement->refcount.load() == 1 && file->pos == 19 &&
              replacement->pos == 19 && ok;
+        RECORD_FAILURE("file-references");
         vfs::vfs_put_file(file);
         vfs::vfs_put_file(replacement);
-        if (!ok || first.closes != 1 || second.closes != 1 || !first.close_unlocked || !second.close_unlocked) return false;
+        if (!ok || first.closes != 1 || second.closes != 1 || !first.close_unlocked || !second.close_unlocked) {
+            log::warn("lazy file projection selftest failed: mode=%u stage=%s address=0x%llx", mode,
+                      failure_stage == nullptr ? "close" : failure_stage, static_cast<unsigned long long>(failure_address));
+            return false;
+        }
     }
     // Invalid unsigned offsets fail before reservations, lazy rows or PTEs.
     State state{.seed = 0x21};
-    auto* file = MAKE_FILE(state);
+    auto* file = MAKE_FILE(state, 2);
     if (file == nullptr) return false;
     ker::mod::sched::task::Task task;
     task.pagemap = pagemap;

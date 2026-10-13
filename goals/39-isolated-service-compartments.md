@@ -14,9 +14,14 @@ spans fail with the existing overflow error before VM publication. The compiled
 Host regression passes 253 cases and 52,777 assertions; independently compiled
 original remove, replacement and protection bodies fail the projection checks.
 Normal Build WOS, isolated fast KTEST build-only, formatting and six focused
-Host tests pass. A real-PTE native regression is compiled and enabled, with
-execution pending. Mapping lifetime, mutable shared coherence and all ten full
-criteria remain incomplete; Goal39 is ACTIVE.
+Host tests pass. A real-PTE native regression is compiled and enabled; its first
+native execution failed the new mapping fixture. Checkpoint 51 corrects
+the fixture's writable description where its immutable cache observer requires
+read-only access, retaining writable access for shared-write overflow checks.
+Failure diagnostics emit the first failed stage after cleanup. Normal and isolated
+fast builds and formatting pass; corrected native execution remains pending.
+Mapping lifetime, mutable shared coherence and all ten full criteria remain
+incomplete; Goal39 is ACTIVE.
 
 Checkpoint 49 releases finished root-reader and Task usercopy leases before
 the lazy file-fault worker drops its retained File. Task ownership, the issued
