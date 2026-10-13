@@ -39,6 +39,17 @@ earlier. Normal/isolated diagnostic builds, formatting, seven existing Host
 checks and 42 compiled caller regression vectors pass. The regression catches
 both hazards in archived old bodies. These are Host ordering/lifetime checks;
 broader root/reclaim drain safety and new guest execution remain unqualified.
+Checkpoint 48 repairs XFS directory-index insertion around stale slots. The
+fresh Normal finite replay passes cases 29/82/83 with the full 53,248-byte FD
+report retrieved and strictly decoded; all eight disposable images are pruned.
+Checkpoint 49 ends root-reader and Task usercopy leases before the lazy
+file-fault worker enters a potentially blocking File close. Its retained Task,
+issued work slot and existing shutdown hold span close; completion remains
+after callback return. Twenty compiled Host regression cases pass and detect
+the original ordering in all twenty negative controls. Normal Build WOS,
+isolated fast KTEST build-only, formatting and eight focused Host tests pass.
+These checks qualify caller ordering; native SMP/root-drain behavior, complete
+mapped-file ownership and coherent mutable SHARED backing remain unqualified.
 Exact-owner ambient network admission is implemented;
 complete PID, lifecycle and WKI qualification remains incomplete. Independent
 service isolation and all ten goal criteria remain unqualified. Goal28 remains

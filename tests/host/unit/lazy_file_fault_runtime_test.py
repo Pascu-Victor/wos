@@ -210,7 +210,7 @@ int main(){
   assert(handle_file_fault(&f.task,0x10000,Fault{}));assert(parks==1&&f.file.refs==2&&f.task.refs==2);
   uint64_t g=0;assert(probe_lazy_file_fault(&f.task,0x10000,Fault{},true,g)==LazyFileFaultDisposition::PARK);
   assert(g==1&&f.file.refs==2&&f.task.refs==2);
-  put_hook=[&]{assert(f.task.lazy_file_fault_completion_generation.load()==0&&f.map.gates==1&&f.task.pins==1);};
+  put_hook=[&]{assert(f.task.lazy_file_fault_completion_generation.load()==0&&f.map.gates==0&&f.task.pins==0);};
   one();put_hook={};assert(f.map.page&&f.task.lazy_file_fault_status==0&&f.task.lazy_file_fault_completion_generation.load()==1);
   assert(reads==1&&static_cast<uint8_t*>(f.map.page)[0]==f.file.id);
   assert(handle_file_fault(&f.task,0x10000,Fault{}));assert(parks==1);}
@@ -246,7 +246,7 @@ int main(){
   assert(probe_lazy_file_fault(&f.task,0x10000,Fault{},true,g)==LazyFileFaultDisposition::PARK);
   f.task.lazy_vmem_ranges.clear();ker::vfs::vfs_put_file(&f.file);f.owns_file_ref=false;assert(f.file.refs==1);
   put_hook=[&]{assert(sched::current->type==sched::task::TaskType::DAEMON&&sched::current->holds>0);
-   assert(f.task.lazy_file_fault_completion_generation.load()==0&&f.task.pins==1&&f.map.gates==1);};
+   assert(f.task.lazy_file_fault_completion_generation.load()==0&&f.task.pins==0&&f.map.gates==0);};
   drain();put_hook={};assert(f.file.refs==0&&!f.map.page&&f.task.lazy_file_fault_status==-EFAULT);}
  reset();start();{Fixture f;int unlocks=0;auto*worker=sched::posted_worker;
   unlock_hook=[&](Lock*lock){if(lock==&lazy_file_fault_lock&&++unlocks==2){unlock_hook={};

@@ -8,6 +8,22 @@
 
 ## Outcome and scale
 
+Checkpoint 49 releases finished root-reader and Task usercopy leases before
+the lazy file-fault worker drops its retained File. Task ownership, the issued
+work slot and the worker shutdown hold remain live through backend close;
+completion is published after close returns. Twenty compiled Host regression
+cases pass, while the same checks detect the original ordering in all twenty
+cases. Normal Build WOS, isolated fast KTEST build-only, formatting and eight
+focused Host tests pass. Native root-drain/SMP behavior and complete mapped-file
+lifetime remain unqualified.
+
+Checkpoint 48 also repairs XFS insertion around stale directory-index slots.
+Fresh Normal native cases 29/82/83 pass, including retrieval and strict decoding
+of the complete 53,248-byte FD report. All eight disposable replay images are
+pruned, leaving zero disposable allocation and the unrelated VM preserved.
+The earlier failed readback remains recorded. These finite checks do not
+complete the two-hour qualification or any full goal criterion. Goal39 is ACTIVE.
+
 Checkpoint 47 removes two caller pin-order hazards: FUTEX_WAIT stages timeout
 usercopy before retaining its word pin, and failed MREMAP iterations release
 both copy pins before VM cleanup. Error priority and insertion-time deadlines

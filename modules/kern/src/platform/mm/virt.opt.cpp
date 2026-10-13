@@ -830,9 +830,11 @@ auto take_lazy_file_fault(LazyFileFaultWork& work, size_t& index) -> bool {
 
 void finish_lazy_file_fault(const LazyFileFaultWork& work, size_t index, int status) {
     auto* task = work.task;
-    ker::vfs::vfs_put_file(work.range.file);
     release_user_pagemap_access(work.access_gate);
     task->release_usercopy_pagemap();
+    // Backend close may wait for MM readers to drain. Keep the work's File and
+    // Task ownership, but release finished MM leases before entering close.
+    ker::vfs::vfs_put_file(work.range.file);
     uint64_t const FLAGS = lazy_file_fault_lock.lock_irqsave();
     task->lazy_file_fault_status = status;
     lazy_file_fault_work[index] = {};
