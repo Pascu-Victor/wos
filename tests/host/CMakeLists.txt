@@ -208,6 +208,13 @@ set_tests_properties(lazy_file_fault_close_order_runtime_test PROPERTIES
     LABELS "host;unit;runtime;integration" TIMEOUT 130
     ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}"
 )
+add_test(NAME lazy_vmem_offset_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/lazy_vmem_offset_runtime_test.py
+)
+set_tests_properties(lazy_vmem_offset_runtime_test PROPERTIES
+    LABELS "host;unit;runtime;integration" TIMEOUT 130
+    ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}"
+)
 add_test(NAME ahci_async_integration_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/ahci_async_integration_test.py
 )

@@ -8,6 +8,16 @@
 
 ## Outcome and scale
 
+Checkpoint 50 preserves the original file-byte projection when partial unmap,
+replacement or protection changes split a lazy file mapping. Invalid offset
+spans fail with the existing overflow error before VM publication. The compiled
+Host regression passes 253 cases and 52,777 assertions; independently compiled
+original remove, replacement and protection bodies fail the projection checks.
+Normal Build WOS, isolated fast KTEST build-only, formatting and six focused
+Host tests pass. A real-PTE native regression is compiled and enabled, with
+execution pending. Mapping lifetime, mutable shared coherence and all ten full
+criteria remain incomplete; Goal39 is ACTIVE.
+
 Checkpoint 49 releases finished root-reader and Task usercopy leases before
 the lazy file-fault worker drops its retained File. Task ownership, the issued
 work slot and the worker shutdown hold remain live through backend close;

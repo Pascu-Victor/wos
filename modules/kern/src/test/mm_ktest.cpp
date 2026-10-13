@@ -1622,6 +1622,15 @@ KTEST(MM, FileSyncPreflightsEveryRangeBeforeWriting) {
     cleanup_test_user_tree(tree);
 }
 
+KTEST(MM, LazyFileSplitsPreserveColdBytesAndRejectOffsetOverflow) {
+    TestUserTree tree;
+    KREQUIRE_TRUE(init_test_user_tree(tree));
+    tree.pml2->entries.at(0) = {};
+    tree.pml2->entries.at(2) = entry_for_page(tree.pml1);
+    KEXPECT_TRUE(ker::syscall::vmem::selftest_lazy_file_projection(tree.root));
+    cleanup_test_user_tree(tree);
+}
+
 KTEST(MM, RelocatedKernelCatalogAndRawDebuggerMetadataAreExact) {
     std::array<runtime_images::RuntimeImage, runtime_images::MAX_IMAGES> images{};
     size_t count = 0;

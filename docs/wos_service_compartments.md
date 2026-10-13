@@ -50,6 +50,16 @@ the original ordering in all twenty negative controls. Normal Build WOS,
 isolated fast KTEST build-only, formatting and eight focused Host tests pass.
 These checks qualify caller ordering; native SMP/root-drain behavior, complete
 mapped-file ownership and coherent mutable SHARED backing remain unqualified.
+Checkpoint 50 fixes lazy file-range slicing: every retained fragment keeps its
+original virtual-address-to-file-offset relationship, including cold faults
+after partial unmap, replacement or protection changes. File offsets whose
+aligned span exceeds signed positional-I/O range fail before publication with
+the existing overflow error. The Host regression passes 253 cases and 52,777
+assertions and detects all three original rewrite defects. Normal and isolated
+fast diagnostic builds, formatting and six focused Host tests pass. The new
+native real-PTE regression is compiled and enabled; execution remains pending.
+Existing references, rollback, locking, Task/File layouts and syscall ABI are
+preserved. Complete native mapping retirement and shared coherence remain open.
 Exact-owner ambient network admission is implemented;
 complete PID, lifecycle and WKI qualification remains incomplete. Independent
 service isolation and all ten goal criteria remain unqualified. Goal28 remains
