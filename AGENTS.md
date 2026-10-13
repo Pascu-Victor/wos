@@ -1,3 +1,26 @@
+# Persistent user preferences
+
+## WOS test-instance storage
+
+The user explicitly requires that WOS testing must not fill or wear out the SSD
+with hundreds of gigabytes of old VM instances (recorded 2026-10-07).
+
+- Keep only the active test topology and the immutable seed/current artifacts
+  required for the next run. Do not retain full VM disks for completed runs.
+- Clean up proven inactive, agent-created disposable boot/rootfs copies,
+  overlays and obsolete per-run guestfs appliances after successful AND failed
+  tests. Preserve small logs, scripts, configs, hashes and qualification receipts.
+- Use read-only shared bases with private overlays or copy-on-write/reflink
+  copies where compatible, instead of repeatedly writing full disk copies.
+- Measure allocated disk usage/free space before batches, set a bounded storage
+  budget, and enforce pruning between cases. Stop creating images when the
+  budget is exceeded; do not accumulate hundreds of GB for evidence retention.
+- Verify exact ownership and that no live process references an image before
+  deletion. Preserve user VM disks, active/unrelated VMs, required seeds,
+  source trees and current build/sysroot artifacts.
+
+---
+
 # WOS Agent Instructions
 
 This file is the root entrypoint for agents working in WOS. The detailed project context lives in `.github/instructions/*.instructions.md`.

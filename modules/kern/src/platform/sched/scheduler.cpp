@@ -8236,6 +8236,7 @@ auto gc_pass_needs_followup(GcPassResult const& result, uint32_t reclaim_budget)
 
 auto run_gc_reclaim_pass_exclusive(uint32_t reclaim_budget, uint64_t work_budget_us, uint32_t pagemap_step_budget,
                                    uint64_t scan_budget = UINT64_MAX, GcPressureDiagnostics* diagnostics = nullptr) -> GcPassResult {
+    auto const SHUTDOWN_HOLD = hold_kernel_shutdown();
     bool expected = false;
     if (!scheduler_gc_reclaim_active.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
         return {};
