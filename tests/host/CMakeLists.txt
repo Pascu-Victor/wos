@@ -215,6 +215,13 @@ set_tests_properties(lazy_vmem_offset_runtime_test PROPERTIES
     LABELS "host;unit;runtime;integration" TIMEOUT 130
     ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}"
 )
+add_test(NAME file_mmap_registry_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/file_mmap_registry_runtime_test.py
+        --cxx ${CMAKE_CXX_COMPILER}
+)
+set_tests_properties(file_mmap_registry_runtime_test PROPERTIES
+    LABELS "host;unit;runtime;integration" TIMEOUT 130
+)
 add_test(NAME ahci_async_integration_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/ahci_async_integration_test.py
 )

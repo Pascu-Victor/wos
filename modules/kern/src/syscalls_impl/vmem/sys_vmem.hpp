@@ -74,6 +74,7 @@ struct SelftestFileCacheObservation {
 [[nodiscard]] auto selftest_evict_file_mmap_cache_exact(ker::vfs::File& file, uint64_t offset, void* expected_frame) -> bool;
 auto selftest_file_mmap_sync_preflight(ker::mod::mm::paging::PageTable* pagemap) -> bool;
 auto selftest_file_mapping_admission(ker::mod::mm::paging::PageTable* pagemap) -> bool;
+auto selftest_file_mapping_registry_growth(ker::mod::mm::paging::PageTable* pagemap) -> bool;
 auto selftest_lazy_file_projection(ker::mod::mm::paging::PageTable* pagemap) -> bool;
 auto selftest_file_writeback_policy() -> bool;
 #endif

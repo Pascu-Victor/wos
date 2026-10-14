@@ -8,6 +8,19 @@
 
 ## Outcome and scale
 
+Checkpoint 54 repairs a use-after-free when splitting a heap-backed shared-file
+mapping registry row. It preserves the original byte projection, File/writeback
+policy and allocation-failure rollback by reacquiring the row after insertion.
+Normal Build WOS, isolated fast KTEST build-only, formatting and eight registered
+Host checks pass. The actual-body ASan/UBSan regression passes 576 cases; the
+complete archived predecessor compiles and then fails with the original heap
+use-after-free. A native registry-growth case is compiled and enabled but has
+not run in a VM. No VM or disposable images were created for this checkpoint.
+Canonical mutable backing, complete owner drains, two-hour services and 1,000
+full lifecycle/failure cycles remain unfinished. All ten full criteria remain
+open; Goal39 is ACTIVE. Continue exact-owned `--no-setup` qualification and
+all-outcome pruning; Native79 remains evidence of its earlier exact cohort.
+
 Checkpoint 53 keys private futex words by a nonreused page-root incarnation and
 virtual address. Explicit shared leaves retain common-frame keying. Root creation,
 final retirement and all six fork rollback paths now maintain the same growable

@@ -1360,13 +1360,16 @@ auto unregister_one_file_mmap_overlap(ker::mod::mm::paging::PageTable* pagemap, 
         right.start = OVERLAP_END;
         right.length = RANGE_END - OVERLAP_END;
         right.file_offset = range.file_offset + (OVERLAP_END - range.start);
+        uint64_t const LEFT_LENGTH = OVERLAP_START - range.start;
         ker::vfs::vfs_retain_file(right.file);
         if (!g_file_mmap_ranges.push_back(right)) {
             ker::vfs::vfs_put_file(right.file);
             g_file_mmap_ranges_lock.unlock();
             return -ENOMEM;
         }
-        range.length = OVERLAP_START - range.start;
+        // Appending can relocate heap-backed rows. The mutex keeps the index
+        // stable, so reacquire the left row after the append succeeds.
+        g_file_mmap_ranges.at(i).length = LEFT_LENGTH;
         g_file_mmap_ranges_lock.unlock();
         if (removed_any != nullptr) {
             *removed_any = true;
@@ -2617,6 +2620,120 @@ auto selftest_file_mapping_admission(ker::mod::mm::paging::PageTable* pagemap) -
     vfs::vfs_put_file(denied);
     vfs::vfs_put_file(allowed);
     return ok && denied_state.closes == 1 && allowed_state.closes == 1 && denied_state.close_unlocked && allowed_state.close_unlocked;
+}
+
+auto selftest_file_mapping_registry_growth(ker::mod::mm::paging::PageTable* pagemap) -> bool {
+    namespace vfs = ker::vfs;
+    namespace vm = ker::abi::vmem;
+    constexpr uint64_t BASE = USER_SPACE_START;
+    constexpr uint64_t PAGE = ker::mod::mm::paging::PAGE_SIZE;
+    struct State {
+        unsigned closes{};
+        bool close_unlocked = true;
+    } state;
+    vfs::FileOperations operations{};
+    operations.vfs_close = [](vfs::File* file) -> int {
+        auto& state = *static_cast<State*>(file->private_data);
+        ++state.closes;
+        bool const PUBLICATION_UNLOCKED = g_shared_vmem_publication_lock.try_lock();
+        if (PUBLICATION_UNLOCKED) g_shared_vmem_publication_lock.unlock();
+        bool const REGISTRY_UNLOCKED = g_file_mmap_ranges_lock.try_lock();
+        if (REGISTRY_UNLOCKED) g_file_mmap_ranges_lock.unlock();
+        state.close_unlocked = PUBLICATION_UNLOCKED && REGISTRY_UNLOCKED;
+        return 0;
+    };
+    auto* file = new (std::nothrow) vfs::File{};
+    if (file == nullptr || pagemap == nullptr) {
+        delete file;
+        return false;
+    }
+    file->fs_type = vfs::FSType::SOCKET;
+    file->fops = &operations;
+    file->private_data = &state;
+    file->mount_policy.read_only = true;
+    file->refcount.store(1);
+    bool ok = true;
+    {
+        SharedVmemPublicationGuard guard;
+        ker::util::SmallVec<FileMmapRange, 32> saved_empty_registry;
+        g_file_mmap_ranges_lock.lock();
+        bool const EMPTY = g_file_mmap_ranges.empty();
+        // Preserve any retained capacity from prior tests. Foreign rows are
+        // never hidden or removed; this fixture requires an empty registry.
+        if (EMPTY) saved_empty_registry = std::move(g_file_mmap_ranges);
+        g_file_mmap_ranges_lock.unlock();
+        ok = EMPTY;
+        if (EMPTY) {
+            for (size_t const COUNT : {33U, 64U, 128U}) {
+                uint64_t const TARGET = BASE + (COUNT - 1) * 4 * PAGE;
+                uint64_t const OFFSET = 0x2171;
+                uint64_t const LENGTH = 3 * PAGE - 1;
+                for (size_t i = 0; i < COUNT; ++i) {
+                    int const RET = register_file_mmap_range(pagemap, BASE + i * 4 * PAGE, i + 1 == COUNT ? LENGTH : PAGE,
+                                                             i + 1 == COUNT ? OFFSET : 0x5000 + i, file, i + 1 == COUNT);
+                    if (RET != 0) {
+                        ok = false;
+                        break;
+                    }
+                }
+                uintptr_t original_row = 0;
+                g_file_mmap_ranges_lock.lock();
+                bool const SEEDED = g_file_mmap_ranges.size() == COUNT;
+                if (SEEDED) original_row = reinterpret_cast<uintptr_t>(&g_file_mmap_ranges.at(COUNT - 1));
+                g_file_mmap_ranges_lock.unlock();
+                ok = ok && SEEDED;
+                if (SEEDED) {
+                    int const RET = unregister_file_mmap_range(pagemap, TARGET + PAGE, PAGE);
+                    ok = RET == 0 && ok;
+                    g_file_mmap_ranges_lock.lock();
+                    bool const SPLIT = g_file_mmap_ranges.size() == COUNT + 1;
+                    ok = SPLIT && ok;
+                    if (SPLIT) {
+                        const auto& left = g_file_mmap_ranges.at(COUNT - 1);
+                        const auto& right = g_file_mmap_ranges.at(COUNT);
+                        ok = reinterpret_cast<uintptr_t>(&left) != original_row && left.pagemap == pagemap && right.pagemap == pagemap &&
+                             left.file == file && right.file == file && left.writeback && right.writeback && left.start == TARGET &&
+                             left.length == PAGE && left.file_offset == OFFSET && right.start == TARGET + 2 * PAGE &&
+                             right.length == PAGE - 1 && right.file_offset == OFFSET + 2 * PAGE && ok;
+                        // Derive each surviving byte from the original mapping,
+                        // independent of the split implementation's arithmetic.
+                        for (const auto* fragment : {&left, &right}) {
+                            for (uint64_t n = 0; n < fragment->length; ++n) {
+                                uint64_t const ADDRESS = fragment->start + n;
+                                ok = fragment->file_offset + n == OFFSET + ADDRESS - TARGET && ok;
+                            }
+                        }
+                        for (size_t i = 0; i + 1 < COUNT; ++i) {
+                            const auto& row = g_file_mmap_ranges.at(i);
+                            ok = row.pagemap == pagemap && row.start == BASE + i * 4 * PAGE && row.length == PAGE &&
+                                 row.file_offset == 0x5000 + i && row.file == file && !row.writeback && ok;
+                        }
+                    }
+                    g_file_mmap_ranges_lock.unlock();
+                    ok = file->refcount.load() == static_cast<int>(COUNT + 2) && ok;
+                    ok = authorize_shared_file_protection_locked(pagemap, TARGET, PAGE, vm::PROT_WRITE) == -EACCES &&
+                         authorize_shared_file_protection_locked(pagemap, TARGET + PAGE, PAGE, vm::PROT_WRITE) == 0 &&
+                         authorize_shared_file_protection_locked(pagemap, TARGET + 2 * PAGE, PAGE - 1, vm::PROT_WRITE) == -EACCES && ok;
+                }
+                // The independent File owner prevents final close in cleanup.
+                ok = unregister_file_mmap_range(pagemap, BASE, COUNT * 4 * PAGE) == 0 && ok;
+                ok = file->refcount.load() == 1 && ok;
+                g_file_mmap_ranges_lock.lock();
+                bool const DRAINED = g_file_mmap_ranges.empty();
+                if (DRAINED) g_file_mmap_ranges = {};
+                g_file_mmap_ranges_lock.unlock();
+                ok = DRAINED && ok;
+                if (!ok) break;
+            }
+            g_file_mmap_ranges_lock.lock();
+            bool const DRAINED = g_file_mmap_ranges.empty();
+            if (DRAINED) g_file_mmap_ranges = std::move(saved_empty_registry);
+            g_file_mmap_ranges_lock.unlock();
+            ok = DRAINED && ok;
+        }
+    }
+    vfs::vfs_put_file(file);
+    return ok && state.closes == 1 && state.close_unlocked;
 }
 
 auto selftest_lazy_file_projection(ker::mod::mm::paging::PageTable* pagemap) -> bool {

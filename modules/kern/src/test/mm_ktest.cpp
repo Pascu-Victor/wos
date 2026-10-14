@@ -1622,6 +1622,13 @@ KTEST(MM, FileSyncPreflightsEveryRangeBeforeWriting) {
     cleanup_test_user_tree(tree);
 }
 
+KTEST(MM, FileMappingSplitSurvivesRegistryHeapGrowth) {
+    TestUserTree tree;
+    KREQUIRE_TRUE(init_test_user_tree(tree));
+    KEXPECT_TRUE(ker::syscall::vmem::selftest_file_mapping_registry_growth(tree.root));
+    cleanup_test_user_tree(tree);
+}
+
 KTEST(MM, LazyFileSplitsPreserveColdBytesAndRejectOffsetOverflow) {
     TestUserTree tree;
     KREQUIRE_TRUE(init_test_user_tree(tree));

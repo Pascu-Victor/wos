@@ -2207,3 +2207,48 @@ mutable shared-file object/offset identity and coherence, full native owner drai
 simultaneous two-hour services and every full acceptance criterion remain open.
 Goal39 stays ACTIVE. Continue exact-owned `--no-setup` tests and pruning after
 passing, failing and exceptional outcomes; no full VM disks are retained.
+
+## Checkpoint54: shared-file registry growth (2026-10-14)
+
+Splitting a heap-backed file-mapping row could append a right fragment, relocate
+the registry storage, and then read/write the freed left row. The production
+path now saves the left length before insertion and reacquires the left row by
+index after insertion succeeds, under the existing registry mutex. Failed
+allocation preserves the original row and File reference balance. File/root
+identity, writeback policy, byte offsets, lock order and ABI remain unchanged.
+
+The registered ASan/UBSan Host regression compiles complete actual registry
+functions and the unchanged SmallVec implementation. It passes 576 cases and
+18,108,589 assertions, including growth at 33/64/128 rows, all cut geometries,
+seven injected allocation failures, retry, clone and reference/close ordering.
+Independent byte coverage and offset oracles preserve the original mapping
+projection. The complete archived predecessor compiles and fails with an ASan
+heap-use-after-free in the split and SmallVec growth paths. Earlier compiler
+selection and fixture name-resolution failures are preserved; the fixture-only
+correction qualifies its `puts` counter. The Host File/Mutex/PageTable primitives
+observe reference/final-close ordering and retained row policy, not real backend
+destruction, protection authorization, PTEs or canonical shared-file data.
+
+Normal Build WOS, isolated `bin/wos-ktest --fast --build-only`, formatting and all
+eight selected registered Host checks pass with their watched sources unchanged.
+The new native case uses actual registry storage, allocator growth, an owned
+pagemap and retained File. It checks three real heap relocations, every surviving
+byte projection, neighboring rows, access policy and final close outside both
+locks; it preserves prior empty registry capacity and refuses a foreign nonempty
+registry. It is compiled and enabled, with VM execution still pending. No VM was
+launched and no disposable VM images were created for this checkpoint. Native79
+remains historical evidence of its exact earlier source/artifact cohort.
+
+Independent production/native review passes ten source checks; independent Host
+review passes eleven checks over 53 held current and saved subjects. Source-only
+TMPFS/XFS maps establish the next integration work: canonical frame ownership,
+quota and inode retirement, actual changed-write prefixes, EOF mutation ordering,
+all-root resize fencing and backend dirty/retry ownership. Those maps are not
+runtime evidence or an installed backing implementation. Existing production
+final close under the publication guard remains a broader owner-drain issue.
+
+Goal39 remains ACTIVE. No full acceptance criterion closes: mutable shared-file
+coherence, complete native reference drains, simultaneous two-hour services and
+1,000 full create/exec/kill/destroy/OOM cycles remain required. Continue using
+`--no-setup`, one topology, the 20GiB disposable budget/40GiB free floor and
+exact-owned inactive-image pruning after every outcome.
