@@ -63,9 +63,15 @@ an immutable-cache observer that requires read-only access. The original boolean
 failure does not identify its first failing mode. Checkpoint 51 corrects the
 description for the two read-protection modes and records the first failing
 stage after cleanup, preserving every assertion and the writable overflow
-vectors. Normal and isolated fast builds and formatting pass; corrected native
-execution remains pending. All four failed-run disposable disks were pruned,
-leaving zero disposable allocation; the unrelated VM was preserved.
+vectors. Normal and isolated fast builds and formatting pass. Corrected KTEST77
+passes all 1,444 enabled tests, including 193 mandatory cases, with 93,751
+assertions and zero failures. Three existing disabled tests remain disabled.
+Natural poweroff and launcher exit 0 are observed; all five prepared and stopped
+payload readbacks match. All four disposable disks are pruned after both runs,
+leaving zero disposable allocation; the unrelated VM is preserved. All 792
+current launch inputs remain unchanged after the successful run. The mapping
+fixture uses a synthetic read backend with real Files, PTEs and frame references;
+it does not qualify mutable filesystem coherence or SMP ownership retirement.
 Existing references, rollback, locking, Task/File layouts and syscall ABI are
 preserved. Complete native mapping retirement and shared coherence remain open.
 Exact-owner ambient network admission is implemented;
