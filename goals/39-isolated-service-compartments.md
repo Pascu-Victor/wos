@@ -8,6 +8,15 @@
 
 ## Outcome and scale
 
+Checkpoint 52 retains a checked allocator-frame owner for queued futex waiters,
+without retaining a Task or page-root access lease across sleep. Actual KTEST78
+passes all 1,446 enabled cases and 93,753 assertions with zero failures, including
+both new frame-lifetime fixtures, then powers off naturally. All four disposable
+images are pruned; 844 admitted inputs remain unchanged and the unrelated VM is
+preserved. The independent terminal audit passes. Private futex key identity,
+canonical shared-file coherence, complete reference drains and all ten full
+criteria remain incomplete; Goal39 is ACTIVE.
+
 Checkpoint 50 preserves the original file-byte projection when partial unmap,
 replacement or protection changes split a lazy file mapping. Invalid offset
 spans fail with the existing overflow error before VM publication. The compiled
@@ -1291,22 +1300,51 @@ retained, and the wider manifest checks are not reported as passing. The raw VM
 access test now enumerates the earlier private lazy-projection fixture exactly,
 with guard, bounds, translation validity and cleanup checks preserved.
 
-Two new native futex fixtures compile and await execution. They use actual page
-roots/frames, retain a private oracle reference through teardown, and clean up
-both fixture waiter owners on failures. Final frame-count observations happen
-while the oracle still owns the frame; the last decrement itself checks zero.
-Native physical zero-free under the bucket IRQ lock remains source-reviewed,
-with the analogous Host IRQ primitive exercised. No new native runtime pass is
-claimed. Native77 remains evidence of its earlier exact source/artifact cohort.
+Both new native futex fixtures pass in KTEST78, using actual page roots/frames
+and both waiter-owner retirement orders. They retain a private oracle reference
+through teardown and clean up both fixture owners on failures. Final frame-count
+observations happen while the oracle still owns the frame; the last decrement
+itself checks zero. Native physical zero-free under the bucket IRQ lock remains
+source-reviewed, with the analogous Host IRQ primitive exercised. Native77
+remains evidence of its earlier exact source/artifact cohort.
+
+The actual isolated `bin/wos-ktest --fast --no-build --no-package --no-setup`
+run passes all 1,446 enabled cases, all 195 mandatory cases and 93,753 assertions
+with zero failures; three disabled BufferCache cases remain excluded. It powers
+off naturally, with launcher/worker/outer exit0 and no forced stop. VM runtime
+is 466.239s; the outer command completes in 497.102s. All eight packaging/readback
+commands succeed and all five prepared and five stopped payload readbacks match.
+All 844 admitted inputs remain unchanged; this is a selected source domain,
+not a complete compiler dependency claim or simultaneous SMP qualification.
+
+The independent observer records 1,665 identity observations with a maximum
+receive gap of 330.899ms. All 3,267 storage samples satisfy the 20GiB disposable
+budget and 40GiB free floor; peak allocation is 394,547,200 bytes. All four owned
+images are proven inactive and pruned (391,987,200 allocated bytes), leaving zero
+disposable allocation. A separate physical postcheck confirms the four run PIDs,
+sockets and images are absent, the original shared lock is released and the
+unrelated UID945 VM is unchanged. Small logs/receipts and required readonly
+seeds/current artifacts remain.
+
+Runner source-name findings and the initial admission failure are retained:
+the genuine build receipt omitted required command exit fields and used a
+launcher spelling the preserved gate rejected. Corrected metadata derives from
+actual saved results and a fresh watched relative-spelling build. The gate and
+production sources were unchanged; the subsequent full gate and native run pass.
 
 Independent production/native source review03 is CLEAR (10 checks/35 subjects),
 SHA256 `97fada9029f5281b40952746f71462510b65320d2de165c19014d1b303cf0f2d`.
 Independent saved Host audit01 is CLEAR (9 checks), SHA256
 `6c3139ef4ba52dc44985b820bf0764b7c179d644cbb88d02205460ff504f0f90`.
-Root rehashes all retained subjects. Earlier fixture failures/findings are kept.
+Independent Native78 terminal review01 is CLEAR (12 checks), SHA256
+`fe10c25d9fe7ae5e4089eec5619d249e7cbe4f5f2a130bc97ae5a253d6630c4c`.
+Root rehashes all 889 combined current inputs and retained terminal subjects.
+Earlier fixture failures/findings are kept.
 
-Goal39 remains ACTIVE with all ten full acceptance criteria open. Continue with
-fresh current source/build/artifact binding and exact-owned native qualification
-using `bin/wos-ktest --no-setup`; retain the shared launch guard, isolated sysroot,
-one topology, 20GiB budget/40GiB free-space floor and all-outcome pruning. No new
-VM images were created for this patch's build/Host checks. No pause or push.
+Goal39 remains ACTIVE with all ten full acceptance criteria open. Next is
+connected private futex address-space identity and sharing provenance, including
+actual root creation, retirement and all six fork rollback paths. Its source-only
+design is not implementation or runtime evidence. Canonical shared-file backing,
+complete owner drains, two-hour services and 1,000 lifecycle/failure cycles remain
+unqualified. Continue exact-owned `--no-setup` qualification with the shared launch
+guard, isolated sysroot, one topology and all-outcome pruning. No pause or push.
