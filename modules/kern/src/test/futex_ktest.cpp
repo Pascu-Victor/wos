@@ -15,4 +15,12 @@ KTEST(Futex, QueuedFrameSurvivesRootRetirement) {
 
 KTEST(Futex, FrameRefMovesPreserveOwnership) { KEXPECT_TRUE(ker::syscall::futex::futex_selftest_frame_ref_moves_preserve_ownership()); }
 
+KTEST(Futex, PrivateKeysSeparatePhysicalAliases) {
+    KEXPECT_TRUE(ker::syscall::futex::futex_selftest_private_keys_separate_physical_aliases());
+}
+
+KTEST(Futex, SharedAliasAndPrivateReplacementKeys) {
+    KEXPECT_TRUE(ker::syscall::futex::futex_selftest_shared_alias_and_private_replacement_keys());
+}
+
 KTEST(Futex, WakeCountLimitIsValidated) { KEXPECT_TRUE(ker::syscall::futex::futex_selftest_wake_count_limit()); }

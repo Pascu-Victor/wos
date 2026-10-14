@@ -48,6 +48,7 @@ enum class PhysicalPageOwner : uint8_t {
     IOMMU_TABLE,
     DMA_BUFFER,
     KVM_CLOCK,
+    USER_ROOT_CONTROL,
     COUNT,
 };
 

@@ -74,6 +74,16 @@ fixture uses a synthetic read backend with real Files, PTEs and frame references
 it does not qualify mutable filesystem coherence or SMP ownership retirement.
 Existing references, rollback, locking, Task/File layouts and syscall ABI are
 preserved. Complete native mapping retirement and shared coherence remain open.
+Checkpoint 53 makes private futex identity follow a nonreused page-root incarnation
+and virtual word, so unrelated private physical aliases cannot wake each other
+and a same-root frame replacement keeps its wake key. Explicit shared leaves keep
+common-frame keys. Root creation, retirement and six fork rollback paths maintain
+the same growable registry. Normal/isolated diagnostic builds, formatting and
+11 focused Host checks pass. KTEST79 passes all 1,455 enabled cases and 101,101
+assertions with zero failures, including nine new root/key fixtures, then powers
+off naturally. All four disposable disks are pruned; the independent terminal
+audit passes. Canonical shared-file coherence and complete owner drains remain
+open, along with the two-hour services and full lifecycle/failure qualification.
 Exact-owner ambient network admission is implemented;
 complete PID, lifecycle and WKI qualification remains incomplete. Independent
 service isolation and all ten goal criteria remain unqualified. Goal28 remains
@@ -2127,3 +2137,73 @@ design is not implementation or runtime evidence. Canonical shared-file backing,
 complete owner drains, two-hour services and 1,000 lifecycle/failure cycles remain
 unqualified. Continue exact-owned `--no-setup` qualification with the shared launch
 guard, isolated sysroot, one topology and all-outcome pruning. No pause or push.
+
+
+## Checkpoint53: connected private futex identity (2026-10-14)
+
+Private futex words now use `(root incarnation, virtual word)` keys. Different
+roots or virtual aliases cannot communicate merely because they share a zero,
+COW or cached physical frame. A same-root private frame replacement keeps the
+key, so a wake can find a waiter that still retains its older frame. Leaves with
+`PAGE_SHARED` use the retained physical word instead; intentional common-frame
+sharing continues across roots and virtual aliases. Full equality compares the
+key kind, owner and word; hashes select buckets only. The physical wake helper
+can address only shared-frame keys.
+
+Every public user-root factory admits an exact root association before returning.
+A globally monotonic nonzero serial saturates instead of wrapping. Controls grow
+in 96-slot physical pages with no fixed root-count cap. Existing mapping IRQ
+locking protects associations, slots and counters; allocation, logging and page
+freeing stay outside that lock. Final release preserves the existing exclusive
+root gate and validates the sole allocator owner before detaching its association.
+Empty metadata pages are freed. All six fork rollback frees use the matching public
+release after mapping cleanup. Kernel and intermediate tables remain unregistered;
+unknown futex provenance refuses capture rather than falling back to a physical
+private key. The low-level release API still requires its real last owner; a
+copied serial is not permission to free a recycled raw pointer.
+
+Capture and revalidation use the original live page pin and actual leaf flags,
+frame and word bounds. Queued waiters retain only their existing allocator-frame
+owner and scalar key, with no Task, root-control or root-reader lease across sleep.
+Task/File/pin layouts, syscall and wire ABI, count/error/timeout ordering and the
+existing two-owner wake/cancellation election are preserved. `USER_ROOT_CONTROL`
+appends one physical accounting owner without changing earlier owner values.
+
+Normal Build WOS and isolated `bin/wos-ktest --fast --build-only` pass, as do
+formatting and all 11 focused registered Host checks. The new ASan/UBSan actual-body
+regression passes 27 vectors; the complete archived physical-key futex unit
+compiles and fails the private-alias and replacement-wake oracles. Existing 42
+caller-order and 22 frame-lifetime vectors remain intact and pass. The two stale
+Host adapters found during validation are corrected without weakening count,
+claim, lock, zeroing, pool or null-failure checks; initial failures are retained.
+
+Actual `bin/wos-ktest --fast --no-build --no-package --no-setup` qualification
+passes 1,455 unique RUN/PASS pairs, all 204 mandatory cases, three disabled skips
+and 101,101 assertions with zero failures. The seven actual RootIdentity cases
+qualify admission/retirement, recycled root addresses, 4,097 live roots, exact PTE
+provenance and metadata/physical baselines. Two additional Futex cases use real
+local hash tables, pins and frame owners to check private and shared key matching.
+The VM powers off naturally; launcher, worker and outer command exit 0 with no
+forced stop. All eight packaging/readback commands and all five prepared plus five
+stopped payload readbacks match. The VM runs 466.179s; the outer command takes
+496.956s. All 831 admitted inputs remain held through the terminal snapshot.
+
+The observer records 1,664 identity samples with a maximum 365.117ms receive gap.
+All 3,267 storage samples obey the 20GiB disposable budget and 40GiB free floor;
+peak allocation is 394,743,808 bytes. Four exact-owned inactive images are pruned,
+releasing 392,183,808 allocated bytes. Terminal disposable allocation is zero.
+A separate physical check confirms all four run PIDs, sockets and images are gone,
+the original shared lock is released and the unrelated UID945 VM is preserved.
+Required readonly seeds/current artifacts and small logs/receipts remain.
+Independent terminal review02 passes ten checks; its 876 retained subjects are
+rehashed twice by the reviewer and again by Root before documentation changes.
+The Native79 source/artifact cohort is preserved in its postrun closure; Native78
+remains historical evidence of the earlier frame-lifetime patch.
+
+The native fixtures use parked KTEST APs and local tables; they do not qualify
+full public futex syscall concurrency or SMP wake/teardown. Their 1,000 empty-root
+transactions are not the goal's 1,000 create/exec/kill/destroy/OOM cycles. Canonical
+mutable shared-file object/offset identity and coherence, full native owner drains,
+simultaneous two-hour services and every full acceptance criterion remain open.
+Goal39 stays ACTIVE. Continue exact-owned `--no-setup` tests and pruning after
+passing, failing and exceptional outcomes; no full VM disks are retained.

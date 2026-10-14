@@ -122,6 +122,8 @@ auto get_us() -> uint64_t {
 }
 }
 namespace ker::mod::mm::paging { constexpr uint64_t PAGE_SIZE = PAGE; }
+// Actual additive identity declaration is inserted by the extraction driver.
+/* ACTUAL_USER_FUTEX_IDENTITY */
 namespace ker::mod::sys::usercopy {
 class UserAccessGuard {
  public:
@@ -150,6 +152,16 @@ class StableUserPage {
         if (state.futex_mode) return ++state.futex_still_calls != state.futex_still_fail_call;
         require(state.access == 0, "mapping check performed inside the memcpy access window");
         return writable || index != state.still_fail;
+    }
+    bool capture_futex_identity(ker::mod::mm::virt::UserFutexIdentity& out) const {
+        if (!held || out.root_incarnation != 0) return false;
+        out = {.root_incarnation = 0x123, .virtual_word = WORD,
+               .physical_word = physical_address(), .shared = false};
+        return true;
+    }
+    bool futex_identity_still_mapped(const ker::mod::mm::virt::UserFutexIdentity& identity) const {
+        return still_mapped() && identity.root_incarnation == 0x123 && identity.virtual_word == WORD &&
+               identity.physical_word == physical_address() && !identity.shared;
     }
     bool commit_write() const {
         require(held && writable, "write commit without writable pin");
@@ -202,10 +214,12 @@ bool ensure_user_page_writable(sched::task::Task*, uint64_t va) {
     return static_cast<int>((va - NEW) / PAGE) != state.ensure_fail;
 }
 }
+/* ACTUAL_FUTEX_KEY_HELPERS */
 struct FutexWaiter {
     uint64_t phys_addr = 0, task_pid = 0, task_cpu = 0;
     FutexWaiter* hash_next = nullptr;
     ker::mod::sys::usercopy::UserPageFrameRef frame;
+    ker::syscall::futex::FutexKey key{};
     FutexWaiter() { ++state.waiter_live; }
     ~FutexWaiter() { --state.waiter_live; }
 };
@@ -408,7 +422,28 @@ def main():
         name: hashlib.sha256(text.encode()).hexdigest() for name, text in extracted
     }}, sort_keys=True))
     futex_bodies = "\n\n".join(text for name, text in extracted if name != "anon_mremap")
-    code = (PRELUDE + "\nnamespace ker::syscall::futex {\n" + futex_bodies + "\n}\n"
+    # Archived callers may not use typed keys; compile the current exact
+    # helpers as unused interface declarations in that explicit mode.
+    key_source = fs if "enum class FutexKeyKind" in fs else FUTEX.read_text()
+    key_anchors = [("enum class FutexKeyKind", True), ("struct FutexKey {", True),
+                   ("auto shared_futex_key(", False), ("auto futex_key(", False),
+                   ("struct FutexKeyHash {", True), ("struct FutexKeyEqual {", True)]
+    key_bodies = [function(key_source, anchor) + (";" if declaration else "")
+                  for anchor, declaration in key_anchors]
+    hash_source = (ROOT / "modules/kern/src/util/hashtable.hpp").read_text()
+    integer_hash = function(hash_source, "struct IntHash {") + ";"
+    identity_source = (ROOT / "modules/kern/src/platform/mm/virt.hpp").read_text()
+    identity = function(identity_source, "struct UserFutexIdentity {") + ";"
+    prelude = PRELUDE.replace("/* ACTUAL_USER_FUTEX_IDENTITY */",
+                             "namespace ker::mod::mm::virt { using vaddr_t=uint64_t; using paddr_t=uint64_t;\n" + identity + "\n}")
+    prelude = prelude.replace("/* ACTUAL_FUTEX_KEY_HELPERS */",
+                             "namespace ker::util {\n" + integer_hash + "\n}\n"
+                             + "namespace ker::syscall::futex { namespace mod = ker::mod;\n" + "\n".join(key_bodies) + "\n}")
+    print(json.dumps({"actual_key_helper_sha256": [hashlib.sha256(body.encode()).hexdigest() for body in key_bodies],
+                      "key_helper_source_sha256": hashlib.sha256(key_source.encode()).hexdigest(),
+                      "actual_integer_hash_sha256": hashlib.sha256(integer_hash.encode()).hexdigest(),
+                      "actual_identity_declaration_sha256": hashlib.sha256(identity.encode()).hexdigest()}, sort_keys=True))
+    code = (prelude + "\nnamespace ker::syscall::futex {\n" + futex_bodies + "\n}\n"
             + "\nnamespace ker::syscall::vmem {\n" + extracted[-1][1] + "\n}\n" + CASES)
     with tempfile.TemporaryDirectory(prefix="wos-caller-pin-order-") as folder:
         work = Path(folder)

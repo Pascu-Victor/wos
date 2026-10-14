@@ -181,7 +181,7 @@ def require_futex_wake_honors_count_argument(source: str) -> None:
         if snippet not in limit_body:
             fail(f"futex wake count validation is missing snippet: {snippet}")
 
-    for name, key in [("futex_wake", "PHYS_ADDR"), ("futex_wake_by_phys", "phys_addr")]:
+    for name, key in [("futex_wake", "futex_key(identity)"), ("futex_wake_by_phys", "shared_futex_key(phys_addr)")]:
         signature_start = source.find(f"int64_t {name}(")
         signature_end = source.find("{", signature_start)
         if signature_start < 0 or signature_end < 0 or "int count" not in source[signature_start:signature_end]:

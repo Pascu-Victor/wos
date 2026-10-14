@@ -147,6 +147,14 @@ auto StableUserPage::retain_frame(UserPageFrameRef& out) const -> bool {
     return true;
 }
 
+auto StableUserPage::capture_futex_identity(mm::virt::UserFutexIdentity& out) const -> bool {
+    return valid() && mm::virt::capture_user_futex_identity(m_pin, m_user_address, out);
+}
+
+auto StableUserPage::futex_identity_still_mapped(const mm::virt::UserFutexIdentity& identity) const -> bool {
+    return valid() && identity.virtual_word == m_user_address && mm::virt::user_futex_identity_still_mapped(m_pin, identity);
+}
+
 void StableUserPage::reset() {
     auto* task = m_task;
     m_task = nullptr;

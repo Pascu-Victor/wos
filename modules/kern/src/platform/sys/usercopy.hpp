@@ -85,6 +85,8 @@ class StableUserPage {
     [[nodiscard]] auto still_mapped() const -> bool;
     [[nodiscard]] auto commit_write() const -> bool;
     [[nodiscard]] auto retain_frame(UserPageFrameRef& out) const -> bool;
+    [[nodiscard]] auto capture_futex_identity(mm::virt::UserFutexIdentity& out) const -> bool;
+    [[nodiscard]] auto futex_identity_still_mapped(const mm::virt::UserFutexIdentity& identity) const -> bool;
 
    private:
     friend auto pin_task_user_page(sched::task::Task&, uint64_t, bool, bool, StableUserPage&) -> bool;

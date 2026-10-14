@@ -25,11 +25,40 @@
 namespace ker::syscall::futex {
 namespace {
 // ============================================================================
-// Futex wait queue implementation — hash table keyed by physical address
+// Private words follow an address-space incarnation and VA; genuine shared
+// leaves follow their retained common frame. Hashes only choose a bucket.
 // ============================================================================
 
+enum class FutexKeyKind : uint8_t { PRIVATE, SHARED_FRAME };
+struct FutexKey {
+    FutexKeyKind kind{};
+    uint64_t owner{};
+    uint64_t word{};
+};
+
+auto shared_futex_key(uint64_t physical_word) -> FutexKey {
+    return {.kind = FutexKeyKind::SHARED_FRAME, .owner = 0, .word = physical_word};
+}
+
+auto futex_key(const mod::mm::virt::UserFutexIdentity& identity) -> FutexKey {
+    if (identity.shared) return shared_futex_key(identity.physical_word);
+    return {.kind = FutexKeyKind::PRIVATE, .owner = identity.root_incarnation, .word = identity.virtual_word};
+}
+
+struct FutexKeyHash {
+    auto operator()(const FutexKey& key) const -> uint64_t {
+        uint64_t const VALUE = ker::util::IntHash{}(key.owner) ^ ker::util::IntHash{}(key.word) ^ static_cast<uint64_t>(key.kind);
+        return ker::util::IntHash{}(VALUE ^ (VALUE >> 32U));
+    }
+};
+struct FutexKeyEqual {
+    auto operator()(const FutexKey& left, const FutexKey& right) const -> bool {
+        return left.kind == right.kind && left.owner == right.owner && left.word == right.word;
+    }
+};
+
 struct FutexWaiter {
-    uint64_t phys_addr{};              // Physical address of the futex (for uniqueness across processes)
+    uint64_t phys_addr{};              // Pinned physical word; private identity is independent of this address.
     uint64_t task_pid{};               // PID of the waiting task
     uint64_t task_cpu{};               // CPU the task was running on
     FutexWaiter* hash_next = nullptr;  // intrusive chain for hash table
@@ -37,12 +66,13 @@ struct FutexWaiter {
     // entry and Task::futex_waiter. Wake and cancellation paths can retire
     // those owners concurrently, so deletion belongs to the final releaser.
     std::atomic<uint32_t> ref_count{2};
-    // The physical key cannot be recycled while either published owner lives.
+    // The pinned frame cannot be recycled while either published owner lives.
     mod::sys::usercopy::UserPageFrameRef frame;
+    FutexKey key{};
 };
 
 struct FutexKeyExtract {
-    uint64_t operator()(const FutexWaiter& w) const { return w.phys_addr; }
+    auto operator()(const FutexWaiter& w) const -> FutexKey { return w.key; }
 };
 
 constexpr long NSEC_PER_SEC = 1000000000L;
@@ -50,7 +80,7 @@ constexpr uint64_t USEC_PER_SEC = 1000000ULL;
 
 // 256 buckets — per-bucket spinlocks replace the single global lock.
 // Default-constructed (no allocation); init() called on first use.
-ker::util::IntrHashTable<FutexWaiter, FutexKeyExtract, ker::util::IntHash, ker::util::IntEqual> futex_table;
+ker::util::IntrHashTable<FutexWaiter, FutexKeyExtract, FutexKeyHash, FutexKeyEqual> futex_table;
 ker::mod::sys::Spinlock futex_init_lock;
 std::atomic<bool> futex_table_initialized{false};
 
@@ -234,6 +264,12 @@ int64_t futex_wait(uint64_t user_addr, int expected, uint64_t timeout_user_addr)
         delete waiter;
         return -ENOMEM;
     }
+    mod::mm::virt::UserFutexIdentity identity{};
+    if (!futex_page.capture_futex_identity(identity)) {
+        delete waiter;
+        return -EFAULT;
+    }
+    waiter->key = futex_key(identity);
 
     void* previous_waiter = nullptr;
     bool const INSERTED = futex_table.insert_if(
@@ -249,7 +285,7 @@ int64_t futex_wait(uint64_t user_addr, int expected, uint64_t timeout_user_addr)
             current_task->deferred_task_switch = true;
             previous_waiter = current_task->futex_waiter.exchange(waiter, std::memory_order_acq_rel);
         });
-    bool const MAPPING_STILL_VALID = futex_page.still_mapped();
+    bool const MAPPING_STILL_VALID = futex_page.futex_identity_still_mapped(identity);
     if (!INSERTED) {
         delete waiter;
         return MAPPING_STILL_VALID ? -EAGAIN : -EFAULT;
@@ -304,14 +340,15 @@ int64_t futex_wake(uint64_t user_addr, int count) {
     if (!mod::sys::usercopy::pin_task_user_page(*current_task, user_addr, false, true, futex_page)) {
         return -EFAULT;
     }
-    uint64_t const PHYS_ADDR = futex_page.physical_address();
     if (!futex_page.still_mapped()) {
         return -EFAULT;
     }
+    mod::mm::virt::UserFutexIdentity identity{};
+    if (!futex_page.capture_futex_identity(identity)) return -EFAULT;
 
     int woken_count = 0;
 
-    futex_table.remove_by_key_limit(PHYS_ADDR, wake_limit, [&](FutexWaiter* waiter) -> bool {
+    futex_table.remove_by_key_limit(futex_key(identity), wake_limit, [&](FutexWaiter* waiter) -> bool {
         bool claimed_waiter = false;
         auto* waiter_task = mod::sched::find_task_by_pid_safe(waiter->task_pid);
         if (waiter_task != nullptr) {
@@ -362,7 +399,7 @@ int64_t futex_wake_by_phys(uint64_t phys_addr, int count) {
     }
 
     int woken_count = 0;
-    futex_table.remove_by_key_limit(phys_addr, wake_limit, [&](FutexWaiter* waiter) -> bool {
+    futex_table.remove_by_key_limit(shared_futex_key(phys_addr), wake_limit, [&](FutexWaiter* waiter) -> bool {
         bool claimed_waiter = false;
         auto* waiter_task = mod::sched::find_task_by_pid_safe(waiter->task_pid);
         if (waiter_task != nullptr) {
@@ -456,6 +493,49 @@ struct SelftestFutexWaiterOwners {
         }
     }
 };
+
+auto selftest_publish_key_waiter(decltype(futex_table)& table, SelftestFutexFrame& subject) -> FutexWaiter* {
+    auto* waiter = new (std::nothrow) FutexWaiter{};
+    if (waiter == nullptr) return nullptr;
+    bool published = false;
+    {
+        mod::sys::usercopy::StableUserPage pin;
+        mod::mm::virt::UserFutexIdentity identity{};
+        if (mod::sys::usercopy::pin_task_user_page(subject.task, subject.ADDRESS, false, false, pin) &&
+            pin.capture_futex_identity(identity) && pin.retain_frame(waiter->frame)) {
+            waiter->phys_addr = pin.physical_address();
+            waiter->key = futex_key(identity);
+            auto* word = static_cast<const int*>(pin.kernel_address());
+            published = table.insert_if(
+                waiter,
+                [word] {
+                    mod::sys::usercopy::UserAccessGuard const ACCESS{};
+                    return __atomic_load_n(word, __ATOMIC_ACQUIRE) == 0;
+                },
+                [&] { subject.task.futex_waiter.store(waiter, std::memory_order_release); });
+        }
+    }
+    if (!published) {
+        delete waiter;
+        return nullptr;
+    }
+    return waiter;
+}
+
+auto selftest_remove_key(decltype(futex_table)& table, const FutexKey& key, SelftestFutexWaiterOwners& owners) -> size_t {
+    return table.remove_by_key_limit(key, 1, [&](FutexWaiter* waiter) {
+        if (waiter != owners.waiter) return false;
+        owners.table_owned = false;
+        static_cast<void>(release_waiter_ref(waiter));
+        return true;
+    });
+}
+
+auto selftest_capture_key(SelftestFutexFrame& subject, uint64_t address, mod::mm::virt::UserFutexIdentity& identity) -> bool {
+    mod::sys::usercopy::StableUserPage pin;
+    return mod::sys::usercopy::pin_task_user_page(subject.task, address, false, false, pin) && pin.capture_futex_identity(identity) &&
+           pin.futex_identity_still_mapped(identity);
+}
 }  // namespace
 
 auto futex_selftest_queued_frame_survives_root_retirement() -> bool {
@@ -469,9 +549,11 @@ auto futex_selftest_queued_frame_survives_root_retirement() -> bool {
         bool published = false;
         {
             mod::sys::usercopy::StableUserPage pin;
+            mod::mm::virt::UserFutexIdentity identity{};
             if (mod::sys::usercopy::pin_task_user_page(subject.task, subject.ADDRESS, false, false, pin) && pin.still_mapped() &&
-                pin.retain_frame(waiter->frame)) {
+                pin.retain_frame(waiter->frame) && pin.capture_futex_identity(identity)) {
                 waiter->phys_addr = pin.physical_address();
+                waiter->key = futex_key(identity);
                 published = table.insert_if(
                     waiter, [] { return true; }, [&] { subject.task.futex_waiter.store(waiter, std::memory_order_release); });
             }
@@ -495,7 +577,7 @@ auto futex_selftest_queued_frame_survives_root_retirement() -> bool {
             bool const FIRST_DELETED = release_waiter_ref(waiter);
             ok = !FIRST_DELETED && ok;
             // Final deletion happens inside the real bucket IRQ-lock callback.
-            size_t const REMOVED = table.remove_by_key_limit(waiter->phys_addr, 1, [&](FutexWaiter* entry) {
+            size_t const REMOVED = table.remove_by_key_limit(waiter->key, 1, [&](FutexWaiter* entry) {
                 bool const FRAME_HELD = mod::mm::phys::page_ref_get(subject.frame) == 2;
                 owners.table_owned = false;
                 bool const DELETED = release_waiter_ref(entry);
@@ -554,6 +636,80 @@ auto futex_selftest_frame_ref_moves_preserve_ownership() -> bool {
     subject.retire_mapping();
     ok = mod::mm::phys::page_ref_get(subject.frame) == 1 && ok;
     return subject.release_oracle() && ok;
+}
+
+auto futex_selftest_private_keys_separate_physical_aliases() -> bool {
+    SelftestFutexFrame first;
+    SelftestFutexFrame second;
+    if (!first.initialize() || !second.initialize()) return false;
+    uint64_t const PHYSICAL = reinterpret_cast<uint64_t>(mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(first.frame)));
+    uint64_t const PRIVATE_FLAGS = mod::mm::paging::page_types::USER_READONLY;
+    mod::mm::virt::map_page(first.root, first.ADDRESS, PHYSICAL, PRIVATE_FLAGS);  // Same-frame flag change owns no extra ref.
+    if (!mod::mm::phys::page_ref_try_inc(first.frame)) return false;
+    mod::mm::virt::map_page(second.root, second.ADDRESS, PHYSICAL, PRIVATE_FLAGS);
+    uint64_t const ALIAS = first.ADDRESS + mod::mm::paging::PAGE_SIZE;
+    if (!mod::mm::phys::page_ref_try_inc(first.frame)) return false;
+    mod::mm::virt::map_page(first.root, ALIAS, PHYSICAL, PRIVATE_FLAGS);
+    mod::mm::virt::UserFutexIdentity own{};
+    mod::mm::virt::UserFutexIdentity other_root{};
+    mod::mm::virt::UserFutexIdentity other_word{};
+    if (!selftest_capture_key(first, first.ADDRESS, own) || !selftest_capture_key(second, second.ADDRESS, other_root) ||
+        !selftest_capture_key(first, ALIAS, other_word) || own.shared || other_root.shared || other_word.shared ||
+        own.physical_word != other_root.physical_word || own.physical_word != other_word.physical_word ||
+        own.root_incarnation == other_root.root_incarnation || own.root_incarnation != other_word.root_incarnation) {
+        return false;
+    }
+    decltype(futex_table) table;
+    if (!table.init(8)) return false;
+    auto* waiter = selftest_publish_key_waiter(table, first);
+    if (waiter == nullptr) return false;
+    SelftestFutexWaiterOwners owners{table, first.task, waiter};
+    return selftest_remove_key(table, futex_key(other_root), owners) == 0 &&
+           selftest_remove_key(table, futex_key(other_word), owners) == 0 &&
+           selftest_remove_key(table, shared_futex_key(own.physical_word), owners) == 0 &&
+           selftest_remove_key(table, futex_key(own), owners) == 1;
+}
+
+auto futex_selftest_shared_alias_and_private_replacement_keys() -> bool {
+    SelftestFutexFrame first;
+    SelftestFutexFrame second;
+    if (!first.initialize() || !second.initialize()) return false;
+    uint64_t const FIRST_PHYSICAL = reinterpret_cast<uint64_t>(mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(first.frame)));
+    uint64_t const SECOND_PHYSICAL = reinterpret_cast<uint64_t>(mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(second.frame)));
+    if (!mod::mm::phys::page_ref_try_inc(first.frame)) return false;
+    mod::mm::virt::map_page(second.root, second.ADDRESS, FIRST_PHYSICAL, mod::mm::paging::page_types::USER | mod::mm::paging::PAGE_SHARED);
+    mod::mm::virt::UserFutexIdentity shared_own{};
+    mod::mm::virt::UserFutexIdentity shared_peer{};
+    if (!selftest_capture_key(first, first.ADDRESS, shared_own) || !selftest_capture_key(second, second.ADDRESS, shared_peer) ||
+        !shared_own.shared || !shared_peer.shared || shared_own.root_incarnation == shared_peer.root_incarnation ||
+        !FutexKeyEqual{}(futex_key(shared_own), futex_key(shared_peer))) {
+        return false;
+    }
+    {
+        decltype(futex_table) table;
+        if (!table.init(8)) return false;
+        auto* waiter = selftest_publish_key_waiter(table, first);
+        if (waiter == nullptr) return false;
+        SelftestFutexWaiterOwners owners{table, first.task, waiter};
+        if (selftest_remove_key(table, futex_key(shared_peer), owners) != 1) return false;
+    }
+    mod::mm::virt::map_page(first.root, first.ADDRESS, FIRST_PHYSICAL, mod::mm::paging::page_types::USER_READONLY);
+    mod::mm::virt::UserFutexIdentity before{};
+    if (!selftest_capture_key(first, first.ADDRESS, before) || before.shared) return false;
+    decltype(futex_table) table;
+    if (!table.init(8)) return false;
+    auto* waiter = selftest_publish_key_waiter(table, first);
+    if (waiter == nullptr) return false;
+    SelftestFutexWaiterOwners owners{table, first.task, waiter};
+    if (!mod::mm::phys::page_ref_try_inc(second.frame)) return false;
+    mod::mm::virt::map_page(first.root, first.ADDRESS, SECOND_PHYSICAL, mod::mm::paging::page_types::USER_READONLY);
+    mod::mm::virt::UserFutexIdentity after{};
+    if (!selftest_capture_key(first, first.ADDRESS, after) || after.shared || after.physical_word == before.physical_word ||
+        !FutexKeyEqual{}(futex_key(before), futex_key(after))) {
+        return false;
+    }
+    return selftest_remove_key(table, shared_futex_key(before.physical_word), owners) == 0 &&
+           selftest_remove_key(table, futex_key(after), owners) == 1;
 }
 
 auto futex_selftest_table_init_is_serialized() -> bool {

@@ -8,6 +8,19 @@
 
 ## Outcome and scale
 
+Checkpoint 53 keys private futex words by a nonreused page-root incarnation and
+virtual address. Explicit shared leaves retain common-frame keying. Root creation,
+final retirement and all six fork rollback paths now maintain the same growable
+root-control registry. Normal Build WOS, isolated fast KTEST build-only, formatting
+and all 11 focused Host checks pass. Actual rootless KTEST79 passes all 1,455 enabled
+cases, all 204 mandatory cases and 101,101 assertions with zero failures, including
+the nine new root/key fixtures, then powers off naturally. All four disposable
+disks are pruned, leaving zero disposable allocation; the unrelated VM is preserved.
+The independent terminal audit passes. Canonical shared-file coherence, complete
+owner drains, two-hour services and 1,000 full lifecycle/failure cycles remain
+incomplete. All ten full criteria remain open; Goal39 is ACTIVE. Continue exact-owned
+`--no-setup` qualification with the shared launch guard and all-outcome pruning.
+
 Checkpoint 52 retains a checked allocator-frame owner for queued futex waiters,
 without retaining a Task or page-root access lease across sleep. Actual KTEST78
 passes all 1,446 enabled cases and 93,753 assertions with zero failures, including

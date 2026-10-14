@@ -297,6 +297,8 @@ constexpr std::array<PhysicalOwnerDescriptor, PHYSICAL_PAGE_OWNER_COUNT> PHYSICA
      "exclusive coherent/bounce backing retained until hardware retirement and mapping invalidation"},
     {PhysicalPageOwner::KVM_CLOCK, "kvm_clock", "boot-to-shutdown hypervisor clock record lifetime", PhysicalOwnerReclaimability::PERMANENT,
      "at most one page per configured vCPU, retained after MSR registration even on clock qualification failure"},
+    {PhysicalPageOwner::USER_ROOT_CONTROL, "user_root_control", "admitted user-root lifetime", PhysicalOwnerReclaimability::OWNER_TEARDOWN,
+     "one control slot per live user root; empty 96-slot pages are released"},
 }};
 
 static_assert(PHYSICAL_OWNER_DESCRIPTORS.size() == PHYSICAL_PAGE_OWNER_COUNT);

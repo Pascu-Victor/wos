@@ -74,6 +74,21 @@ struct UserPagePin {
     bool dirty{};
 };
 
+// A value snapshot from a live pin; it owns no Task, root or backing lease.
+// Shared-frame identity deliberately excludes the requesting address space.
+struct UserFutexIdentity {
+    uint64_t root_incarnation{};
+    vaddr_t virtual_word{};
+    paddr_t physical_word{};
+    bool shared{};
+};
+
+struct UserRootControlStats {
+    uint64_t active_roots{};
+    uint64_t control_pages{};
+    uint64_t last_serial{};
+};
+
 struct DestroyUserSpaceStats {
     uint64_t calls;
     uint64_t collect_frames_us_total;
@@ -235,6 +250,7 @@ PageTable* create_pagemap();
 auto create_pagemap_may_fail() -> PageTable*;
 // owner_pid is diagnostic provenance only; it grants no teardown authority.
 void release_pagemap(PageTable* pagemap, uint64_t owner_pid = 0);
+void get_user_root_control_stats_snapshot(UserRootControlStats& out);
 void get_page_table_pool_stats_snapshot(PageTablePoolStatsSnapshot& out);
 void get_owned_frame_stats_snapshot(OwnedFrameStatsSnapshot& out);
 // Refresh only the kernel half using the current kernel root. Caller retains
@@ -262,11 +278,18 @@ paddr_t translate(PageTable* page_table, vaddr_t vaddr);
 [[nodiscard]] auto pin_user_page_for_task(sched::task::Task* task, PageTable* expected_pagemap, vaddr_t vaddr, bool require_writable,
                                           bool fault_in, UserPagePin& out) -> bool;
 [[nodiscard]] auto user_page_pin_still_mapped(const UserPagePin& pin) -> bool;
+// Futex-only provenance. Caller keeps the original pin live; a busy output is
+// unchanged on refusal. Capture/revalidation allocate nothing and never sleep.
+[[nodiscard]] auto capture_user_futex_identity(const UserPagePin& pin, vaddr_t word, UserFutexIdentity& out) -> bool;
+[[nodiscard]] auto user_futex_identity_still_mapped(const UserPagePin& pin, const UserFutexIdentity& identity) -> bool;
 // Linearizes an HHDM write against leaf replacement and records the same PTE
 // dirty state that a hardware write through the user mapping would set.
 [[nodiscard]] auto user_page_pin_commit_write(const UserPagePin& pin) -> bool;
 void unpin_user_page(UserPagePin& pin);
 #ifdef WOS_SELFTEST
+// Caller owns an actual live root, or uses the permanent kernel root. Only the
+// scalar escapes; this is not an authority handle for a later raw release.
+[[nodiscard]] auto selftest_user_root_incarnation(PageTable* owned_root) -> uint64_t;
 enum class SelftestCowAction : uint8_t {
     FAIL_DESTINATION_ALLOCATION,
     DOWNGRADE_READ_BEFORE_COMMIT,
@@ -312,6 +335,9 @@ bool selftest_direct_map_contains(const void* ptr);
 // kernel hierarchy. The registry is append-only so an illegal release remains
 // detectable even after the frame has been returned to the buddy allocator.
 bool selftest_kernel_page_table_frame(const void* ptr);
+// Counts the actual append-only permanent-kernel table registry. Native owner
+// baselines use its exact growth to distinguish KASan shadow hierarchy pages.
+[[nodiscard]] auto selftest_kernel_page_table_count() -> uint64_t;
 // Models the teardown/fork writer side of the shared-pagemap gate and proves
 // an IRQ/scheduler-style mapped pin fails closed instead of waiting or walking.
 bool selftest_user_pagemap_exclusive_rejects_mapped_pin(PageTable* pagemap);

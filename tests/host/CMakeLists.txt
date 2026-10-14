@@ -778,6 +778,14 @@ set_tests_properties(futex_frame_lifetime_runtime_test PROPERTIES
     LABELS "host;unit;source;integration" TIMEOUT 60
 )
 add_test(
+    NAME futex_root_identity_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/futex_root_identity_runtime_test.py
+        --cxx ${CMAKE_CXX_COMPILER}
+)
+set_tests_properties(futex_root_identity_runtime_test PROPERTIES
+    LABELS "host;unit;source;integration" TIMEOUT 70
+)
+add_test(
     NAME waitpid_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/waitpid_source_test.py
 )

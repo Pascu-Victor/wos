@@ -932,7 +932,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(child->pagemap);
         sched::task::release_lazy_vmem_ranges(*child);
         mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-vm-snapshot-fail");
-        mm::phys::page_free(child->pagemap);
+        mm::virt::release_pagemap(child->pagemap, child->pid);
         delete[] child->name;
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         delete child;
@@ -951,7 +951,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
             ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(child->pagemap);
             sched::task::release_lazy_vmem_ranges(*child);
             mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-thread-alloc-fail");
-            mm::phys::page_free(child->pagemap);
+            mm::virt::release_pagemap(child->pagemap, child->pid);
             delete[] child->name;
             mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
             delete child;
@@ -975,7 +975,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
             ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(child->pagemap);
             sched::task::release_lazy_vmem_ranges(*child);
             mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-tcb-publication-fail");
-            mm::phys::page_free(child->pagemap);
+            mm::virt::release_pagemap(child->pagemap, child->pid);
             delete[] child->name;
             mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
             delete child;
@@ -1040,7 +1040,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(child->pagemap);
         sched::task::release_lazy_vmem_ranges(*child);
         mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-fd-clone-fail");
-        mm::phys::page_free(child->pagemap);
+        mm::virt::release_pagemap(child->pagemap, child->pid);
         delete[] child->name;
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         delete child;
@@ -1058,7 +1058,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(child->pagemap);
         sched::task::release_lazy_vmem_ranges(*child);
         mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-child-publication-fail");
-        mm::phys::page_free(child->pagemap);
+        mm::virt::release_pagemap(child->pagemap, child->pid);
         delete[] child->name;
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         delete child;
@@ -1079,7 +1079,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(child->pagemap);
         sched::task::release_lazy_vmem_ranges(*child);
         mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-post-task-fail");
-        mm::phys::page_free(child->pagemap);
+        mm::virt::release_pagemap(child->pagemap, child->pid);
         delete[] child->name;
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         delete child;

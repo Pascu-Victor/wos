@@ -223,6 +223,21 @@ inline auto user_page_pin_still_mapped(const UserPagePin& pin) -> bool {
            pin.pagemap->mapping.load()!=nullptr && pin.pagemap->mapping.load()->bytes.data()==pin.hhdm_page;
 }
 inline auto user_page_pin_commit_write(const UserPagePin& pin) -> bool { return user_page_pin_still_mapped(pin); }
+// These vectors qualify physical-frame lifetime. Their explicitly shared
+// identity seam leaves private/root key policy to the separate actual-body
+// futex_root_identity_runtime_test, and preserves the original check hooks.
+inline auto capture_user_futex_identity(const UserPagePin& pin,vaddr_t word,UserFutexIdentity& out) -> bool {
+    if(out.root_incarnation!=0 || pin.pagemap==nullptr || pin.hhdm_page==nullptr || word<pin.user_page ||
+       word-pin.user_page>paging::PAGE_SIZE-sizeof(int) || word%alignof(int)!=0 ||
+       pin.pagemap->mapping.load()==nullptr || pin.pagemap->mapping.load()->bytes.data()!=pin.hhdm_page) return false;
+    out={.root_incarnation=1,.virtual_word=word,.physical_word=pin.physical_page+word-pin.user_page,.shared=true};
+    return true;
+}
+inline auto user_futex_identity_still_mapped(const UserPagePin& pin,const UserFutexIdentity& identity) -> bool {
+    return user_page_pin_still_mapped(pin) && identity.root_incarnation==1 && identity.shared &&
+           identity.virtual_word>=pin.user_page && identity.virtual_word-pin.user_page<paging::PAGE_SIZE &&
+           identity.physical_word==pin.physical_page+identity.virtual_word-pin.user_page;
+}
 inline void unpin_user_page(UserPagePin& pin) {
     auto old=pin;pin={};
     if(old.hhdm_page!=nullptr) phys::page_ref_dec(old.hhdm_page,&old.lookup_hint);
@@ -582,13 +597,16 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
     write("fixture-common.hpp", common)
     virt = (KERN / "platform/mm/virt.hpp").read_text()
     user_pin, row = capture(virt, "struct UserPagePin {", declaration=True); actual.append(row)
+    futex_identity, row = capture(virt, "struct UserFutexIdentity {", declaration=True); actual.append(row)
     write("platform/mm/virt.hpp", '#pragma once\n#include "fixture-common.hpp"\n'
           'namespace ker::mod::sched::task { struct Task; }\n'
           'namespace ker::mod::mm::virt { using PageTable=paging::PageTable; inline constexpr uint64_t PADDR_INVALID=UINT64_MAX;\n'
-          + user_pin + '\n'
+          + user_pin + '\n' + futex_identity + '\n'
           'auto pin_user_page_for_task(sched::task::Task*,PageTable*,vaddr_t,bool,bool,UserPagePin&) -> bool;\n'
           'auto user_page_pin_still_mapped(const UserPagePin&) -> bool;\n'
           'auto user_page_pin_commit_write(const UserPagePin&) -> bool;\n'
+          'auto capture_user_futex_identity(const UserPagePin&,vaddr_t,UserFutexIdentity&) -> bool;\n'
+          'auto user_futex_identity_still_mapped(const UserPagePin&,const UserFutexIdentity&) -> bool;\n'
           'void unpin_user_page(UserPagePin&); }\n')
     write("platform/sched/task.hpp", TASK)
     write("platform/sched/scheduler.hpp", SCHEDULER)
@@ -621,6 +639,7 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
                "StableUserPage::~StableUserPage()", "StableUserPage::valid()", "StableUserPage::kernel_address()",
                "StableUserPage::physical_address()", "StableUserPage::was_dirty()", "StableUserPage::still_mapped()",
                "StableUserPage::commit_write()", "StableUserPage::retain_frame(UserPageFrameRef&", "StableUserPage::reset()",
+               "StableUserPage::capture_futex_identity(", "StableUserPage::futex_identity_still_mapped(",
                "auto pin_task_user_page(", "auto range_valid("]
     bodies = []
     for anchor in anchors:

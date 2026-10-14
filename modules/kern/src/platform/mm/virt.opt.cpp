@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <platform/acpi/apic/apic.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/init/limine_requests.hpp>
@@ -82,6 +83,32 @@ sys::Spinlock cow_pte_lock;
 // Serializes leaf publication/removal with usercopy frame pin acquisition.
 // Never hold this across allocation, fault resolution, memcpy, or shootdown.
 sys::Spinlock user_mapping_pin_lock;
+
+// Exact root associations use the same lock as pinned mapping snapshots. Only
+// copied serials escape; queued futexes never retain a control or root reader.
+constexpr size_t USER_ROOT_CONTROL_BUCKET_COUNT = 256;
+constexpr size_t USER_ROOT_CONTROLS_PER_PAGE = 96;
+struct UserRootControlChunk;
+struct UserRootControl {
+    PageTable* root{};
+    uint64_t serial{};
+    UserRootControl* hash_next{};
+    UserRootControl* free_next{};
+    UserRootControlChunk* chunk{};
+};
+struct UserRootControlChunk {
+    UserRootControlChunk* available_next{};
+    UserRootControl* free_list{};
+    size_t active_count{};
+    std::array<UserRootControl, USER_ROOT_CONTROLS_PER_PAGE> controls{};
+};
+static_assert(sizeof(UserRootControlChunk) <= paging::PAGE_SIZE);
+static_assert((USER_ROOT_CONTROL_BUCKET_COUNT & (USER_ROOT_CONTROL_BUCKET_COUNT - 1)) == 0);
+std::array<UserRootControl*, USER_ROOT_CONTROL_BUCKET_COUNT> user_root_control_buckets{};
+UserRootControlChunk* user_root_control_available{};
+uint64_t user_root_control_last_serial{};
+uint64_t user_root_control_active_roots{};
+uint64_t user_root_control_pages{};
 
 enum class AnonymousSwapRuntimeState : uint8_t {
     PAGEOUT,
@@ -2556,6 +2583,149 @@ auto alloc_zeroed_page_table(bool may_fail = false) -> PageTable* {
     return table;
 }
 
+auto user_root_control_bucket(PageTable* root) -> size_t {
+    uint64_t const PAGE = reinterpret_cast<uint64_t>(root) >> paging::PAGE_SHIFT;
+    return static_cast<size_t>((PAGE ^ (PAGE >> 16U) ^ (PAGE >> 32U)) & (USER_ROOT_CONTROL_BUCKET_COUNT - 1));
+}
+
+auto find_user_root_control_locked(PageTable* root) -> UserRootControl* {
+    for (auto* control = user_root_control_buckets[user_root_control_bucket(root)]; control != nullptr; control = control->hash_next) {
+        if (control->root == root) return control;
+    }
+    return nullptr;
+}
+
+auto next_user_root_serial(uint64_t& last_serial, uint64_t& serial) -> bool {
+    if (last_serial == UINT64_MAX) return false;
+    serial = ++last_serial;
+    return true;
+}
+
+enum class UserRootAttachResult : uint8_t {
+    ATTACHED,
+    NEED_CHUNK,
+    SERIAL_EXHAUSTED,
+    DUPLICATE,
+};
+
+auto attach_user_root_control_locked(PageTable* root, UserRootControlChunk*& spare) -> UserRootAttachResult {
+    if (find_user_root_control_locked(root) != nullptr) return UserRootAttachResult::DUPLICATE;
+    if (user_root_control_last_serial == UINT64_MAX) return UserRootAttachResult::SERIAL_EXHAUSTED;
+    if (user_root_control_available == nullptr) {
+        if (spare == nullptr) return UserRootAttachResult::NEED_CHUNK;
+        user_root_control_available = spare;
+        spare = nullptr;  // Ownership transfers only with the locked admission.
+        ++user_root_control_pages;
+    }
+    auto* chunk = user_root_control_available;
+    auto* control = chunk->free_list;
+    chunk->free_list = control->free_next;
+    ++chunk->active_count;
+    if (chunk->free_list == nullptr) {
+        user_root_control_available = chunk->available_next;
+        chunk->available_next = nullptr;
+    }
+    uint64_t serial = 0;
+    static_cast<void>(next_user_root_serial(user_root_control_last_serial, serial));
+    control->root = root;
+    control->serial = serial;
+    control->free_next = nullptr;
+    auto& bucket = user_root_control_buckets[user_root_control_bucket(root)];
+    control->hash_next = bucket;
+    bucket = control;
+    ++user_root_control_active_roots;
+    return UserRootAttachResult::ATTACHED;
+}
+
+auto allocate_user_root_control_chunk() -> UserRootControlChunk* {
+    // This raw fallible allocator does not directly reclaim/yield, but can
+    // pressure-wake a worker. It must remain outside every mapping/bucket lock.
+    void* page = phys::page_alloc_full_overwrite_page_may_fail(PhysicalPageOwner::USER_ROOT_CONTROL, "user_root_control");
+    if (page == nullptr) return nullptr;
+    std::memset(page, 0, paging::PAGE_SIZE);
+    auto* chunk = new (page) UserRootControlChunk{};
+    for (auto& control : chunk->controls) {
+        control.chunk = chunk;
+        control.free_next = chunk->free_list;
+        chunk->free_list = &control;
+    }
+    return chunk;
+}
+
+void release_unregistered_user_root(PageTable* root) {
+    // The factory owns this zeroed, unpublished root; it has never returned a
+    // pointer or registered a control. No reader/exclusive gate can be needed.
+    if (!try_release_page_table_to_pool(root, {__builtin_return_address(0), 0})) phys::page_free(root);
+}
+
+auto create_user_root_common(bool may_fail) -> PageTable* {
+    auto* root = alloc_zeroed_page_table(may_fail);
+    if (root == nullptr) return nullptr;
+    UserRootControlChunk* spare = nullptr;
+    for (;;) {
+        uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
+        auto const RESULT = attach_user_root_control_locked(root, spare);
+        user_mapping_pin_lock.unlock_irqrestore(FLAGS);
+        if (RESULT == UserRootAttachResult::ATTACHED) {
+            if (spare != nullptr) phys::page_free(spare);  // Another creator supplied capacity.
+            return root;
+        }
+        if (RESULT == UserRootAttachResult::DUPLICATE) {
+            // A duplicate contradicts the root allocator's private ownership.
+            // Never recycle a page whose existing control may own a live root.
+            log::critical("duplicate user-root admission root=%p", root);
+            hcf();
+        }
+        if (RESULT == UserRootAttachResult::SERIAL_EXHAUSTED) {
+            if (spare != nullptr) phys::page_free(spare);
+            release_unregistered_user_root(root);
+            return nullptr;
+        }
+        spare = allocate_user_root_control_chunk();
+        if (spare == nullptr) {
+            release_unregistered_user_root(root);
+            return nullptr;
+        }
+    }
+}
+
+auto retire_user_root_control_locked(PageTable* root, UserRootControlChunk*& empty) -> bool {
+    auto** link = &user_root_control_buckets[user_root_control_bucket(root)];
+    while (*link != nullptr && (*link)->root != root) link = &(*link)->hash_next;
+    if (*link == nullptr || empty != nullptr) return false;
+    auto* control = *link;
+    auto* chunk = control->chunk;
+    if (control->serial == 0 || chunk == nullptr || chunk->active_count == 0 || chunk->active_count > USER_ROOT_CONTROLS_PER_PAGE ||
+        user_root_control_active_roots == 0 || user_root_control_pages == 0) {
+        return false;
+    }
+    bool const WAS_FULL = chunk->free_list == nullptr;
+    if (WAS_FULL != (chunk->active_count == USER_ROOT_CONTROLS_PER_PAGE)) return false;
+    auto** available_link = &user_root_control_available;
+    if (!WAS_FULL) {
+        while (*available_link != nullptr && *available_link != chunk) available_link = &(*available_link)->available_next;
+        if (*available_link == nullptr) return false;
+    }
+    *link = control->hash_next;
+    control->root = nullptr;
+    control->serial = 0;
+    control->hash_next = nullptr;
+    control->free_next = chunk->free_list;
+    chunk->free_list = control;
+    --chunk->active_count;
+    --user_root_control_active_roots;
+    if (chunk->active_count == 0) {
+        *available_link = chunk->available_next;
+        chunk->available_next = nullptr;
+        --user_root_control_pages;
+        empty = chunk;  // No bucket/free-list/creator can still name this page.
+    } else if (WAS_FULL) {
+        chunk->available_next = user_root_control_available;
+        user_root_control_available = chunk;
+    }
+    return true;
+}
+
 auto pte_raw(const paging::PageTableEntry& e) -> uint64_t {
     uint64_t val = 0;
     std::memcpy(&val, &e, sizeof(val));
@@ -2931,7 +3101,7 @@ auto user_page_writable_now_impl(PageTable* pagemap, vaddr_t vaddr) -> bool {
 }
 
 auto snapshot_user_page_mapping_locked(PageTable* pagemap, vaddr_t vaddr, bool require_writable, paddr_t& physical_page,
-                                       bool* dirty = nullptr) -> bool {
+                                       bool* dirty = nullptr, uint64_t* leaf_flags = nullptr) -> bool {
     physical_page = PADDR_INVALID;
     if (dirty != nullptr) {
         *dirty = false;
@@ -2965,6 +3135,9 @@ auto snapshot_user_page_mapping_locked(PageTable* pagemap, vaddr_t vaddr, bool r
     physical_page = static_cast<paddr_t>(entry.frame) << paging::PAGE_SHIFT;
     if (dirty != nullptr) {
         *dirty = entry.dirty != 0;
+    }
+    if (leaf_flags != nullptr) {
+        *leaf_flags = RAW;
     }
     return true;
 }
@@ -3823,6 +3996,39 @@ auto user_page_pin_still_mapped(const UserPagePin& pin) -> bool {
     return MATCHES;
 }
 
+auto capture_user_futex_identity(const UserPagePin& pin, vaddr_t word, UserFutexIdentity& out) -> bool {
+    if (out.root_incarnation != 0 || pin.pagemap == nullptr || pin.hhdm_page == nullptr || pin.physical_page == PADDR_INVALID ||
+        pin.access_gate_index == USER_PAGEMAP_ACCESS_GATE_NONE || page_align_down(word) != pin.user_page ||
+        (word % alignof(uint32_t)) != 0 || (word - pin.user_page) > paging::PAGE_SIZE - sizeof(uint32_t)) {
+        return false;
+    }
+    paddr_t current_page = PADDR_INVALID;
+    uint64_t leaf_flags = 0;
+    UserFutexIdentity captured{};
+    uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
+    auto* control = find_user_root_control_locked(pin.pagemap);
+    bool const MATCHES = control != nullptr && control->serial != 0 &&
+                         snapshot_user_page_mapping_locked(pin.pagemap, word, pin.require_writable, current_page, nullptr, &leaf_flags) &&
+                         current_page == pin.physical_page;
+    if (MATCHES) {
+        captured = {.root_incarnation = control->serial,
+                    .virtual_word = word,
+                    .physical_word = current_page + (word - pin.user_page),
+                    .shared = (leaf_flags & paging::PAGE_SHARED) != 0};
+    }
+    user_mapping_pin_lock.unlock_irqrestore(FLAGS);
+    if (MATCHES) out = captured;
+    return MATCHES;
+}
+
+auto user_futex_identity_still_mapped(const UserPagePin& pin, const UserFutexIdentity& identity) -> bool {
+    if (identity.root_incarnation == 0) return false;
+    UserFutexIdentity current{};
+    return capture_user_futex_identity(pin, identity.virtual_word, current) && current.root_incarnation == identity.root_incarnation &&
+           current.virtual_word == identity.virtual_word && current.physical_word == identity.physical_word &&
+           current.shared == identity.shared;
+}
+
 auto user_page_pin_commit_write(const UserPagePin& pin) -> bool {
     if (pin.pagemap == nullptr || pin.hhdm_page == nullptr || pin.physical_page == PADDR_INVALID || !pin.require_writable ||
         pin.access_gate_index == USER_PAGEMAP_ACCESS_GATE_NONE) {
@@ -4032,8 +4238,8 @@ void switch_to_kernel_pagemap() { wrcr3(reinterpret_cast<uint64_t>(addr::get_phy
 
 auto get_kernel_pagemap() -> PageTable* { return kernel_pagemap; }
 
-auto create_pagemap() -> PageTable* { return alloc_zeroed_page_table(); }
-auto create_pagemap_may_fail() -> PageTable* { return alloc_zeroed_page_table(true); }
+auto create_pagemap() -> PageTable* { return create_user_root_common(false); }
+auto create_pagemap_may_fail() -> PageTable* { return create_user_root_common(true); }
 
 void release_pagemap(PageTable* pagemap, uint64_t owner_pid) {
     if (pagemap == nullptr) {
@@ -4059,6 +4265,22 @@ void release_pagemap(PageTable* pagemap, uint64_t owner_pid) {
     }
 #endif
 
+    // Validate the original sole allocator owner before irrevocably detaching
+    // its control. A copied serial is not authority to release a reused root.
+    if (phys::page_kind_get(pagemap) != PageKind::PAGE_TABLE || phys::page_ref_get(pagemap) != 1U) {
+        log::critical("invalid final user-root owner root=%p owner_pid=%lu", pagemap, owner_pid);
+        hcf();
+    }
+    UserRootControlChunk* empty = nullptr;
+    uint64_t const CONTROL_FLAGS = user_mapping_pin_lock.lock_irqsave();
+    bool const RETIRED = retire_user_root_control_locked(pagemap, empty);
+    user_mapping_pin_lock.unlock_irqrestore(CONTROL_FLAGS);
+    if (!RETIRED) {
+        log::critical("unregistered or corrupt user-root retirement root=%p owner_pid=%lu", pagemap, owner_pid);
+        hcf();
+    }
+    if (empty != nullptr) phys::page_free(empty);
+
     owned_frame_purge_pagemap(pagemap);
 
     if (try_release_page_table_to_pool(pagemap, {__builtin_return_address(0), owner_pid})) {
@@ -4067,6 +4289,27 @@ void release_pagemap(PageTable* pagemap, uint64_t owner_pid) {
 
     phys::page_free(pagemap);
 }
+
+void get_user_root_control_stats_snapshot(UserRootControlStats& out) {
+    uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
+    out = {.active_roots = user_root_control_active_roots,
+           .control_pages = user_root_control_pages,
+           .last_serial = user_root_control_last_serial};
+    user_mapping_pin_lock.unlock_irqrestore(FLAGS);
+}
+
+#ifdef WOS_SELFTEST
+auto selftest_user_root_incarnation(PageTable* owned_root) -> uint64_t {
+    size_t gate = USER_PAGEMAP_ACCESS_GATE_NONE;
+    if (!acquire_user_pagemap_access(owned_root, false, gate)) return 0;
+    uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
+    auto* control = find_user_root_control_locked(owned_root);
+    uint64_t const SERIAL = control != nullptr ? control->serial : 0;
+    user_mapping_pin_lock.unlock_irqrestore(FLAGS);
+    release_user_pagemap_access(gate);
+    return SERIAL;
+}
+#endif
 
 void get_page_table_pool_stats_snapshot(PageTablePoolStatsSnapshot& out) {
     uint64_t const FLAGS = page_table_pool.lock.lock_irqsave();
@@ -4422,6 +4665,14 @@ __attribute__((no_sanitize("address"))) bool selftest_kernel_page_table_frame(co
         slot = (slot + 1U) & (SELFTEST_KERNEL_PAGE_TABLE_REGISTRY_CAPACITY - 1U);
     }
     return false;
+}
+
+__attribute__((no_sanitize("address"))) auto selftest_kernel_page_table_count() -> uint64_t {
+    uint64_t count = 0;
+    for (const auto& frame : selftest_kernel_page_table_registry) {
+        if (frame.load(std::memory_order_acquire) != 0) ++count;
+    }
+    return count;
 }
 
 namespace {

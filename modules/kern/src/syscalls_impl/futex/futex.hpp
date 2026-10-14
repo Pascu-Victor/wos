@@ -25,7 +25,8 @@ int64_t futex_wake(uint64_t user_addr, int count);
 // Detach and free the current task's waiter if it exits while blocked in futex_wait().
 void futex_wait_cleanup_for_task(ker::mod::sched::task::Task* task);
 
-// Wake threads waiting on a futex physical address (no virtual→physical translation needed).
+// Wake genuine shared-frame waiters by physical word; private keys cannot be
+// addressed by a physical alias (no virtual→physical translation needed).
 // Kernel-internal helper; an address supplied by a remote peer is not a grant.
 // Returns the number of threads woken, or -EINVAL if phys_addr == 0 or count < 0.
 int64_t futex_wake_by_phys(uint64_t phys_addr, int count);
@@ -33,6 +34,8 @@ int64_t futex_wake_by_phys(uint64_t phys_addr, int count);
 #ifdef WOS_SELFTEST
 auto futex_selftest_queued_frame_survives_root_retirement() -> bool;
 auto futex_selftest_frame_ref_moves_preserve_ownership() -> bool;
+auto futex_selftest_private_keys_separate_physical_aliases() -> bool;
+auto futex_selftest_shared_alias_and_private_replacement_keys() -> bool;
 auto futex_selftest_table_init_is_serialized() -> bool;
 auto futex_selftest_addr_alignment_guard() -> bool;
 auto futex_selftest_stale_wake_does_not_claim_waiter() -> bool;
