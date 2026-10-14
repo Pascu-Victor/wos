@@ -196,10 +196,10 @@ KTEST(TaskPlacementScalar, DefaultsAndExactLayout) {
     if (task == nullptr) return;
     const Task& view = *task;
 
-    // Actual Normal and fast diagnostic compiler probes measured this layout
-    // before introducing the scalar API. Task is not standard-layout: inspect
-    // the live object's bytes instead of adding offsetof extension warnings.
-    KEXPECT_EQ(sizeof(Task), size_t{16208});
+    // Keep the original scalar/assembly offsets after appending the native
+    // retirement pointer. Task is not standard-layout: inspect the live
+    // object's bytes instead of adding offsetof extension warnings.
+    KEXPECT_EQ(sizeof(Task), size_t{16216});
     KEXPECT_EQ(alignof(Task), size_t{8});
     KEXPECT_EQ(member_offset(view, view.cpu), size_t{48});
     KEXPECT_EQ(member_offset(view, view.domain_mask), size_t{56});
@@ -207,6 +207,9 @@ KTEST(TaskPlacementScalar, DefaultsAndExactLayout) {
     KEXPECT_EQ(member_offset(view, view.cpu_pinned), size_t{11860});
     KEXPECT_EQ(member_offset(view, view.domain_hard), size_t{11861});
     KEXPECT_EQ(member_offset(view, view.deferred_task_switch), size_t{12015});
+    KEXPECT_EQ(member_offset(view, view.native_file_mapping_retirement), size_t{16208});
+    KEXPECT_EQ(sizeof(view.native_file_mapping_retirement), size_t{8});
+    KEXPECT_TRUE(view.native_file_mapping_retirement.load(std::memory_order_relaxed) == nullptr);
     KEXPECT_EQ(sizeof(view.cpu), size_t{8});
     KEXPECT_EQ(sizeof(view.domain_mask), size_t{8});
     KEXPECT_EQ(sizeof(view.domain_id), size_t{4});

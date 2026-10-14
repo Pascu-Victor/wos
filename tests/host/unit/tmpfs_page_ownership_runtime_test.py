@@ -53,6 +53,9 @@ VECTORS = (
     "node_scan_budget", "global_scan_budget", "lookup_deferred_free",
     "guard_before_owner_destruction", "aliases_bounded_skip_unread_target",
     "aliases_public_skip_unread_target", "aliases_migration_skip_unread_target",
+    "resize_array_oom", "resize_port_resident_oom", "resize_port_swapped_oom",
+    "resize_port_hole_oom", "resize_port_grow_oom", "resize_swap_read_failure",
+    "resize_swap_success", "resize_nonallocating", "resize_admission",
 )
 
 LOCKS = r'''
@@ -125,7 +128,9 @@ PRELUDE = r'''
 #include <sys/mman.h>
 #include <unistd.h>
 #include <util/smallvec.hpp>
+#include <platform/sched/file_growth.hpp>
 #include <vfs/exec_content.hpp>
+#include <vfs/file_operations.hpp>
 #include <vfs/native_coherency.hpp>
 #include "actual-types.hpp"
 
@@ -141,6 +146,13 @@ std::map<void*, Frame> frames;
 struct Slot { ker::mod::mm::swap::SwapSlot id{}; std::array<unsigned char, BS> bytes{}; };
 std::map<uint64_t, Slot> slots;
 uint64_t next_slot{};
+std::map<void*, size_t> arrays;
+uint64_t array_allocations{}, array_frees{}, array_faults{}, predecessor_throws{};
+size_t fail_array_bytes{};
+bool fail_array_armed{};
+uint64_t epoch_ns = 1000000000ULL, fsize_limit = UINT64_MAX;
+uint64_t growth_commits{}, growth_denials{}, last_committed_size{};
+uintptr_t growth_inode_lock{};
 void check(bool value, const char* expression, int line) {
     ++assertions;
     if (!value) {
@@ -160,6 +172,53 @@ void fill_bytes(void* page, unsigned char seed) {
     for (size_t i = 0; i < BS; ++i) data[i] = static_cast<unsigned char>(seed + i * 17U);
 }
 auto refs(void* page) -> uint32_t { auto it = frames.find(page); return it == frames.end() ? 0 : it->second.refs; }
+}
+
+// Complete actual descriptor allocation sites use these explicit Host array
+// primitives. Throwing old new[] fails with defined hosted C++ semantics;
+// nothrow new[] returns null. Ledger changes are independent of TMPFS code.
+auto operator new[](size_t bytes) -> void* {
+    if (fixture::fail_array_armed && fixture::fail_array_bytes == bytes) {
+        fixture::fail_array_armed = false;
+        ++fixture::array_faults;
+        throw std::bad_alloc();
+    }
+    void* memory = std::malloc(bytes == 0 ? 1 : bytes);
+    if (memory == nullptr) throw std::bad_alloc();
+    CHECK(fixture::arrays.emplace(memory, bytes).second);
+    ++fixture::array_allocations;
+    return memory;
+}
+void operator delete[](void* memory) noexcept {
+    if (memory == nullptr) return;
+    CHECK(fixture::arrays.erase(memory) == 1);
+    ++fixture::array_frees;
+    std::free(memory);
+}
+void operator delete[](void* memory, size_t) noexcept { ::operator delete[](memory); }
+auto operator new[](size_t bytes, const std::nothrow_t&) noexcept -> void* {
+    try { return ::operator new[](bytes); } catch (const std::bad_alloc&) { return nullptr; }
+}
+void operator delete[](void* memory, const std::nothrow_t&) noexcept { ::operator delete[](memory); }
+
+// Host File identity/table and FileGrowth ownership are primitive boundaries.
+// Real File layout, Task credentials/resource ownership and native close are
+// not qualified by this facade. Native tests use actual retained Files.
+namespace ker::vfs {
+struct File { void* private_data{}; FileOperations* fops{}; int open_flags{2}; FSType fs_type{FSType::TMPFS}; };
+namespace tmpfs { auto get_tmpfs_fops() -> FileOperations*; }
+}
+namespace ker::mod::time { auto get_epoch_ns() -> uint64_t { return ++fixture::epoch_ns; } }
+namespace ker::mod::sched::resource {
+FileGrowth::FileGrowth() : m_caller(nullptr), m_limit(fixture::fsize_limit) {}
+FileGrowth::~FileGrowth() {
+    if (fixture::growth_inode_lock != 0) {
+        auto it = fixture::locks.find(fixture::growth_inode_lock);
+        CHECK(it != fixture::locks.end() && !it->second);
+    }
+    if (m_committed) { ++fixture::growth_commits; fixture::last_committed_size = m_size; }
+    if (m_denied) ++fixture::growth_denials;
+}
 }
 
 // Named primitive boundaries only. The complete TMPFS functions follow below.
@@ -272,6 +331,7 @@ void empty_baseline() {
     CHECK(frames.empty() && slots.empty() && allocations == frees);
     CHECK(destroy_held == 0 && invalid_unlock == 0 && lock_errors == 0);
     CHECK(locks.size() == 1); // Only the complete actual global registry mutex.
+    CHECK(arrays.empty() && array_allocations == array_frees);
     for (auto [_, held] : locks) CHECK(!held);
 }
 void materialize_owner() {
@@ -478,6 +538,158 @@ void aliases_skip_unread_target(unsigned kind) {
     target->~TmpNode();
     CHECK(::munmap(memory, BS) == 0);
 }
+
+struct ResizeSnapshot {
+    size_t size{}, count{}, charged{}, resident{}, used{}, live_arrays{};
+    uintptr_t identity{};
+    std::array<TmpPage, 3> pages{};
+    std::array<std::array<unsigned char, BS>, 3> bytes{};
+    ker::vfs::Timespec mtime{}, ctime{};
+    ker::vfs::coherency::Stamp stamp{};
+};
+auto resize_snapshot(Node& f) -> ResizeSnapshot {
+    ker::mod::sys::MutexGuard guard(f.node->io_lock);
+    ResizeSnapshot s{};
+    s.size=f.node->size; s.count=f.node->page_count; s.charged=f.node->charged_pages;
+    s.resident=f.node->resident_pages; s.used=f.mount.used_bytes; s.live_arrays=arrays.size();
+    s.identity=reinterpret_cast<uintptr_t>(f.node->pages); s.mtime=f.node->mtime; s.ctime=f.node->ctime;
+    CHECK(f.node->coherency.snapshot(s.stamp));
+    for(size_t i=0;i<std::min(s.count,s.pages.size());++i) {
+        s.pages[i]=f.node->pages[i];
+        if(s.pages[i].state==TmpPageState::RESIDENT) {
+            CHECK(refs(s.pages[i].data)>0);
+            std::memcpy(s.bytes[i].data(),s.pages[i].data,BS);
+        }
+    }
+    return s;
+}
+void unchanged_resize(Node& f,const ResizeSnapshot& before) {
+    auto after=resize_snapshot(f);
+    CHECK(after.size==before.size && after.count==before.count && after.identity==before.identity);
+    CHECK(after.charged==before.charged && after.resident==before.resident && after.used==before.used);
+    CHECK(after.live_arrays==before.live_arrays);
+    CHECK(after.mtime.tv_sec==before.mtime.tv_sec && after.mtime.tv_nsec==before.mtime.tv_nsec);
+    CHECK(after.ctime.tv_sec==before.ctime.tv_sec && after.ctime.tv_nsec==before.ctime.tv_nsec);
+    CHECK(after.stamp.object==before.stamp.object && after.stamp.directory==before.stamp.directory);
+    CHECK(after.stamp.content>=before.stamp.content && after.stamp.metadata>=before.stamp.metadata);
+    for(size_t i=0;i<std::min(before.count,before.pages.size());++i) {
+        auto const&a=after.pages[i];auto const&b=before.pages[i];
+        CHECK(a.state==b.state && a.data==b.data && a.swap_slot.area==b.swap_slot.area &&
+              a.swap_slot.index==b.swap_slot.index && a.swap_slot.generation==b.swap_slot.generation);
+        if(b.state==TmpPageState::RESIDENT) CHECK(after.bytes[i]==before.bytes[i]);
+    }
+}
+auto resize_file(Node& f) -> ker::vfs::File {
+    ker::vfs::File file{};
+    file.private_data=f.node; file.fops=get_tmpfs_fops();
+    return file;
+}
+void resize_setup(Node& f,unsigned kind) {
+    if(kind!=0) { f.page(0,0x51); f.page(2,0x73); }
+    { ker::mod::sys::MutexGuard guard(f.node->io_lock);
+      CHECK(ensure_page_descriptors(f.node,3));f.node->size=3*BS;
+      f.node->mtime={12,34};f.node->ctime={56,78};
+      if(kind==2) CHECK(evict_page_locked(f.node,0)==0);
+    }
+}
+auto truncate(ker::vfs::File& file,off_t length,bool inject=false,TmpfsResizeDescriptorObservation* output=nullptr) -> int {
+    auto* node=static_cast<TmpNode*>(file.private_data);
+    growth_inode_lock=node!=nullptr?reinterpret_cast<uintptr_t>(&node->io_lock):0;
+    int result{};
+    try {
+        if(inject) {
+#if HAS_NATIVE_RESIZE_PORT
+            CHECK(output!=nullptr);
+            result=selftest_tmpfs_truncate_descriptor_oom(file,length,*output);
+#else
+            // No invented predecessor implementation of the new native port.
+            result=-4243;
+#endif
+        } else result=file.fops->vfs_truncate(&file,length);
+    } catch(const std::bad_alloc&) {
+        ++predecessor_throws;
+        // An explicit Host exception observation, never an old native errno.
+        std::fprintf(stderr,"NOTE actual_predecessor_array_throw=1 native_errno_unqualified=1\n");
+        result=-4242;
+    }
+    growth_inode_lock=0;
+    return result;
+}
+void resize_array_oom() {
+    Node f;resize_setup(f,1);auto file=resize_file(f);auto before=resize_snapshot(f);
+    fail_array_bytes=sizeof(TmpPage);fail_array_armed=true;
+    int ret=truncate(file,127);fail_array_armed=false;
+    CHECK(ret==-ENOMEM && array_faults==1 && predecessor_throws==0);
+    unchanged_resize(f,before);
+    CHECK(growth_commits==0 && growth_denials==0 && slot_reads==0 && slot_writes==0);
+    verify_bytes(f.node->pages[0].data,0x51);
+}
+void resize_port_oom(unsigned kind,bool grow) {
+    Node f;resize_setup(f,kind);auto file=resize_file(f);auto before=resize_snapshot(f);
+    auto reads=slot_reads,writes=slot_writes,allocated=slot_allocations,freed=slot_frees;
+    TmpfsResizeDescriptorObservation out{};
+    CHECK(truncate(file,grow?7*BS:127,true,&out)==-ENOMEM);
+    CHECK(out.admitted && out.allocation_attempts==1 && out.injected_failures==1);
+    unchanged_resize(f,before);
+    CHECK(slot_reads==reads && slot_writes==writes && slot_allocations==allocated && slot_frees==freed);
+    CHECK(growth_commits==0 && growth_denials==0);
+}
+void resize_swap_read_failure() {
+    Node f;resize_setup(f,2);auto file=resize_file(f);auto before=resize_snapshot(f);
+    slot_read_error=-EIO;
+    CHECK(truncate(file,127)==-EIO);
+    unchanged_resize(f,before);
+    CHECK(slot_reads==1 && slots.size()==1 && growth_commits==0);
+    slot_read_error=0;
+}
+void resize_swap_success() {
+    Node f;resize_setup(f,2);auto file=resize_file(f);
+    CHECK(truncate(file,127)==0);
+    CHECK(f.node->size==127 && f.node->page_count==1 && f.node->charged_pages==1 && f.node->resident_pages==1);
+    CHECK(f.mount.used_bytes==BS && slots.empty() && slot_reads==1 && slot_frees==1);
+    auto const&p=f.node->pages[0];
+    CHECK(p.state==TmpPageState::RESIDENT && refs(p.data)==1 && !swap::slot_valid(p.swap_slot));
+    auto* data=static_cast<unsigned char*>(p.data);
+    for(size_t i=0;i<BS;++i) CHECK(data[i]==(i<127?static_cast<unsigned char>(0x51+i*17U):0));
+    CHECK(growth_commits==1 && last_committed_size==127);
+}
+void resize_nonallocating() {
+    Node f;resize_setup(f,1);auto file=resize_file(f);TmpfsResizeDescriptorObservation out{};
+    auto live=arrays.size(),allocated=array_allocations;
+    CHECK(truncate(file,3*BS-1,true,&out)==0);
+    CHECK(out.admitted && out.allocation_attempts==0 && out.injected_failures==0);
+    CHECK(arrays.size()==live && array_allocations==allocated && f.node->size==3*BS-1);
+    auto* tail=static_cast<const unsigned char*>(f.node->pages[2].data);
+    for(size_t i=0;i<BS;++i) CHECK(tail[i]==(i<BS-1?static_cast<unsigned char>(0x73+i*17U):0));
+    CHECK(truncate(file,3*BS,true,&out)==0 && out.allocation_attempts==0);
+    CHECK(truncate(file,0,true,&out)==0 && out.allocation_attempts==0);
+    CHECK(f.node->page_count==0 && f.node->charged_pages==0 && f.mount.used_bytes==0 && frames.empty());
+    CHECK(growth_commits==3 && last_committed_size==0);
+}
+void resize_admission() {
+    Node f;resize_setup(f,1);auto file=resize_file(f);auto before=resize_snapshot(f);
+    TmpfsResizeDescriptorObservation out{};
+    CHECK(truncate(file,-1,true,&out)==-EINVAL && out.allocation_attempts==0);
+    unchanged_resize(f,before);
+    file.open_flags=3;
+    CHECK(truncate(file,127,true,&out)==-EBADF && out.allocation_attempts==0);
+    file.open_flags=2;f.node->type=TmpNodeType::DIRECTORY;
+    CHECK(truncate(file,127,true,&out)==-EISDIR && out.allocation_attempts==0);
+    f.node->type=TmpNodeType::FILE;fsize_limit=16;
+    CHECK(truncate(file,127,true,&out)==-EFBIG && out.allocation_attempts==0);
+    fsize_limit=UINT64_MAX;
+    CHECK(growth_denials==1 && growth_commits==0);
+    ker::vfs::ExecReadView view{};
+    {ker::mod::sys::MutexGuard guard(f.node->io_lock);CHECK(f.node->exec_content.acquire(view)==0);}
+    CHECK(truncate(file,127,true,&out)==-ETXTBSY && out.allocation_attempts==0);
+    {ker::mod::sys::MutexGuard guard(f.node->io_lock);f.node->exec_content.release();
+      CHECK(tmpfs_resize_locked(f.node,SIZE_MAX)==-EFBIG);}
+    unchanged_resize(f,before);
+    file.fs_type=ker::vfs::FSType::FAT32;
+    CHECK(truncate(file,127,true,&out)==-EINVAL && !out.admitted && out.allocation_attempts==0);
+    file.fs_type=ker::vfs::FSType::TMPFS;
+    CHECK(growth_commits==0 && array_faults==0);
+}
 }
 int main(int argc, char** argv) {
     using namespace fixture;
@@ -504,6 +716,15 @@ int main(int argc, char** argv) {
     else if (name == "aliases_bounded_skip_unread_target") aliases_skip_unread_target(0);
     else if (name == "aliases_public_skip_unread_target") aliases_skip_unread_target(1);
     else if (name == "aliases_migration_skip_unread_target") aliases_skip_unread_target(2);
+    else if (name == "resize_array_oom") resize_array_oom();
+    else if (name == "resize_port_resident_oom") resize_port_oom(1,false);
+    else if (name == "resize_port_swapped_oom") resize_port_oom(2,false);
+    else if (name == "resize_port_hole_oom") resize_port_oom(0,false);
+    else if (name == "resize_port_grow_oom") { for(unsigned kind=0;kind<3;++kind) resize_port_oom(kind,true); }
+    else if (name == "resize_swap_read_failure") resize_swap_read_failure();
+    else if (name == "resize_swap_success") resize_swap_success();
+    else if (name == "resize_nonallocating") resize_nonallocating();
+    else if (name == "resize_admission") resize_admission();
     else return 2;
     empty_baseline();
     std::printf("%s case=%s assertions=%llu failures=%llu frames=%zu slots=%zu resident=%llu registry=%zu destroy_held=%llu invalid_unlock=%llu real_tmpfs=1 real_smallvec=1\n",
@@ -516,7 +737,7 @@ int main(int argc, char** argv) {
 
 REAL_HEADERS = (
     "util/smallvec.hpp", "vfs/exec_content.hpp", "vfs/native_coherency.hpp",
-    "vfs/coherency.hpp", "vfs/stat.hpp",
+    "vfs/coherency.hpp", "vfs/stat.hpp", "vfs/file_operations.hpp", "platform/sched/file_growth.hpp",
 )
 
 
@@ -550,10 +771,18 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
     for path, namespace, anchors in (
         (KERN / "platform/mm/page_alloc.hpp", "ker::mod::mm", ["enum class PhysicalPageOwner : uint8_t {"]),
         (KERN / "platform/mm/swap.hpp", "ker::mod::mm::swap", ["struct SwapSlot {", "constexpr auto invalid_slot()", "constexpr auto slot_valid("]),
-        (HEADER, "ker::vfs::tmpfs", ["enum class TmpNodeType : uint8_t {", "enum class TmpPageState : uint8_t {", "struct TmpPage {", "struct TmpNode {", "struct TmpfsMount {"]),
+        (KERN / "vfs/file.hpp", "ker::vfs", ["enum class FSType : uint8_t {"]),
+        (HEADER, "ker::vfs::tmpfs", ["enum class TmpNodeType : uint8_t {", "enum class TmpPageState : uint8_t {", "struct TmpPage {", "struct TmpNode {", "struct TmpfsMount {", "struct TmpfsResizeDescriptorObservation {"]),
     ):
         text = path.read_text()
         types.append(f"namespace {namespace} {{\n")
+        if namespace == "ker::vfs":
+            values = [line for line in text.splitlines() if line.startswith("constexpr unsigned FILE_ACCESS_SEARCH_ONLY =")]
+            if len(values) != 1:
+                raise ValueError("unique actual FILE_ACCESS_SEARCH_ONLY declaration unavailable")
+            types.append(values[0] + "\n")
+            actual.append({"source": str(path), "name": "FILE_ACCESS_SEARCH_ONLY", "bytes": len(values[0].encode()),
+                           "sha256": hashlib.sha256(values[0].encode()).hexdigest()})
         if namespace == "ker::vfs::tmpfs":
             names = [line for line in text.splitlines() if line.startswith("constexpr size_t TMPFS_NAME_MAX =")]
             if len(names) != 1:
@@ -568,9 +797,15 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
         types.append("}\n")
     (include / "actual-types.hpp").write_text("\n".join(types))
     source = selected.read_text()
-    chunks = [PRELUDE, "namespace ker::vfs::tmpfs {\n"]
+    chunks = [PRELUDE, "namespace ker::mod::sched::resource {\n"]
+    growth_source = KERN / "platform/sched/file_growth.cpp"
+    for anchor in ("auto FileGrowth::allow_resize(", "void FileGrowth::committed("):
+        body, row = runner.capture(growth_source.read_text(), anchor)
+        actual.append({"source": str(growth_source), **row})
+        chunks.append(f'#line {row["line"]} "actual-file-growth.cpp"\n' + body + "\n")
+    chunks.extend(["}\n", "namespace ker::vfs::tmpfs {\n"])
     constants = ("constexpr size_t DEFAULT_TMPFS_BLOCK_SIZE", "constexpr uint64_t TMPFS_MIN_FREE_RESERVE_BYTES",
-                 "constexpr uint64_t TMPFS_MAX_FREE_RESERVE_BYTES", "constexpr uint64_t TMPFS_FREE_RESERVE_DIVISOR")
+                 "constexpr uint64_t TMPFS_MAX_FREE_RESERVE_BYTES", "constexpr uint64_t TMPFS_FREE_RESERVE_DIVISOR", "constexpr uint64_t NS_PER_SEC")
     globals_ = ("ker::mod::sys::Mutex tmpfs_node_registry_lock;", "ker::util::SmallVec<TmpNode*, 64> tmpfs_nodes;",
                 "std::atomic<uint64_t> tmpfs_resident_pages", "std::atomic<uint64_t> tmpfs_reclaim_node_cursor",
                 "uint64_t tmpfs_node_registry_generation")
@@ -582,7 +817,8 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
         chunks.append(body + "\n")
         actual.append({"name": anchor, "bytes": len(body.encode()), "sha256": hashlib.sha256(body.encode()).hexdigest()})
     anchors = (
-        "auto tmpfs_canonical_node(TmpNode* node)", "auto tmpfs_free_reserve_bytes()", "auto tmpfs_can_allocate_page()",
+        "auto tmpfs_canonical_node(TmpNode* node)", "auto current_timespec()", "void touch_modified(", "auto page_count_for_size(",
+        "auto tmpfs_free_reserve_bytes()", "auto tmpfs_can_allocate_page()",
         "void register_tmp_node(", "void unregister_tmp_node(", "auto mount_try_charge(", "void mount_uncharge(",
         "auto ensure_page_descriptors(", "void release_page_locked(", "auto evict_page_locked(",
         "struct TmpfsReclaimResult {", "auto reclaim_from_node_locked_bounded(", "auto reclaim_from_node_locked(",
@@ -593,6 +829,19 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
         body, row = runner.capture(source, anchor, declaration=anchor.startswith("struct "))
         actual.append({"source": str(selected), **row})
         chunks.append(f'#line {row["line"]} "actual-selected-tmpfs.cpp"\n' + body + "\n")
+    current_port = "struct ResizeDescriptorAllocation {" in source
+    resize_anchors = (["struct ResizeDescriptorAllocation {"] if current_port else []) + ["auto tmpfs_resize_locked("]
+    if current_port:
+        resize_anchors.append("auto tmpfs_truncate_with_allocation(")
+    resize_anchors.append("auto tmpfs_fops_truncate(")
+    if current_port:
+        resize_anchors.append("auto selftest_tmpfs_truncate_descriptor_oom(")
+    for anchor in resize_anchors:
+        body, row = runner.capture(source, anchor, declaration=anchor.startswith("struct "))
+        actual.append({"source": str(selected), **row})
+        chunks.append(f'#line {row["line"]} "actual-selected-tmpfs.cpp"\n' + body + "\n")
+    chunks.append("auto get_tmpfs_fops() -> FileOperations* { static FileOperations table{}; table.vfs_truncate=tmpfs_fops_truncate; return &table; }\n")
+    chunks.append(f"#define HAS_NATIVE_RESIZE_PORT {int(current_port)}\n")
     chunks.extend(["}\n", '#line 1 "independent-tmpfs-fixture-oracles"\n', CASES])
     (scratch / "harness.cpp").write_text("\n".join(chunks))
     return actual
@@ -650,6 +899,7 @@ def main() -> int:
                 raise ValueError("--evidence-dir needs an existing canonical parent and a fresh exclusive directory")
             evidence.mkdir(mode=0o700)
         watched = [selected, HEADER, KERN / "platform/mm/page_alloc.hpp", KERN / "platform/mm/swap.hpp", KERN / "platform/mm/paging.hpp",
+                   KERN / "vfs/file.hpp", KERN / "platform/sched/file_growth.cpp",
                    *(KERN / name for name in REAL_HEADERS), RUNNER, Path(__file__).resolve(), compiler]
         before = [runner.pin(path) for path in watched]
         runner_pin = runner.pin(RUNNER)
@@ -661,6 +911,9 @@ def main() -> int:
         result["primitive_seams"] = ["Host physical frame allocation/reference count/direct-free refusal",
                                      "Host swap slot ownership and injected I/O failures", "Host mutex lifetime/try-lock registry",
                                      "Host protected still-owned target memory", "Host memory policy reports total bytes zero"]
+        result["primitive_seams"].extend(["Host File facade/operations table; not real native File layout or lifetime",
+                                          "Host FileGrowth owner capture/destruction; actual allow_resize/committed bodies",
+                                          "Host throwing/nothrow array allocation ledger and scoped failure", "Host epoch clock"])
         runner.subreaper()
         scratch = Path(tempfile.mkdtemp(prefix="wos-tmpfs-ownership-", dir="/tmp"))
         info = scratch.stat()
@@ -674,7 +927,7 @@ def main() -> int:
         result["staged_sources_before"] = staged_before
         binary = scratch / "tmpfs-ownership-test"
         depfile = scratch / "dependencies.d"
-        argv = [str(compiler), "-std=c++23", "-O1", "-g0", "-pipe", "-fsanitize=address,undefined",
+        argv = [str(compiler), "-std=c++23", "-O1", "-g0", "-pipe", "-DWOS_SELFTEST=1", "-fsanitize=address,undefined",
                 "-fno-omit-frame-pointer", "-MD", "-MF", str(depfile), "-I", str(scratch / "include"),
                 str(scratch / "harness.cpp"), "-o", str(binary)]
         compile_log = scratch / "command-0.log"

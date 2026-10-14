@@ -8,6 +8,20 @@
 
 ## Outcome and scale
 
+Checkpoint 56 connects typed File-family, binding, pin and installer ownership
+for bounded unpublished native mappings, with real queued retirement and an
+actual callback-return barrier before Task deletion. The fresh scheduled
+32-CPU Native84 run passes six cases, 2,930 assertions and 15 callback returns;
+its four disposable disks are pruned. TMPFS resize descriptor preparation now
+precedes retained-tail changes. Normal Build WOS, isolated diagnostic builds
+and all 11 selected Host checks pass. Native82 exposed a missed Task-size fixture
+update; that failure is retained and the corrected fixture preserves the earlier
+offset checks. Fresh Native85 passes all 1,463 cases, 212 mandatory cases and
+113,976 assertions with natural shutdown and all four disposable disks pruned.
+Public mapping integration, canonical shared backing, two-hour services
+and 1,000 full lifecycle/failure cycles remain unfinished. Goal39 stays ACTIVE
+with all ten full criteria open; `--no-setup` and all-outcome pruning continue.
+
 Checkpoint 55 preserves TMPFS resident frame ownership through reclaim and
 inode retirement, retains sparse-file quota charges, excludes hardlink aliases
 from reclaim/migration scans, and ends the inode mutex guard before deletion.

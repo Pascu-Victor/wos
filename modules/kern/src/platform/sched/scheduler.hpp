@@ -547,6 +547,7 @@ void insert_into_dead_list(task::Task* task);                              // Pl
 void gc_expired_tasks();                                                   // Garbage collect dead tasks from dead lists
 auto gc_expired_tasks_budgeted(uint32_t max_tasks) -> uint32_t;            // Budgeted task GC for scheduler GC daemon
 void request_gc();                                                         // Request deferred scheduler GC from IRQ-safe paths
+[[nodiscard]] auto is_current_gc_worker() -> bool;  // Exact current GC Task and its private entry; no borrowed dereference.
 void request_gc_memory_pressure();                                         // Request aggressive GC from allocation pressure paths
 // Optional observations from one exclusive pressure pass. These are local to
 // the caller; guard counters describe scanned entries, not a global snapshot.

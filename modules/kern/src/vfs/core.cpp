@@ -37,6 +37,7 @@
 #include <platform/sys/spinlock.hpp>
 #include <platform/sys/usercopy.hpp>
 #include <string_view>
+#include <syscalls_impl/vmem/sys_vmem.hpp>
 #include <util/smallvec.hpp>
 #include <utility>
 #include <vfs/directory_view.hpp>
@@ -279,6 +280,7 @@ auto vfs_count_exclusive_unpublished_self_refs(UnpublishedTask& task, uint32_t& 
     if (task.scheduler_published.load(std::memory_order_acquire) || task.gc_queued.load(std::memory_order_acquire) || task.is_thread ||
         task.state.load(std::memory_order_acquire) != ker::mod::sched::task::TaskState::ACTIVE)
         return -EBUSY;
+    if (!ker::syscall::vmem::validate_native_unpublished_mapping_owners(task)) return -EBUSY;
     UnpublishedSelfReferences captured;
     uint64_t flags = task.path_metadata_lock.lock_irqsave();
     captured.root = task.root_anchor;
@@ -304,7 +306,8 @@ auto vfs_count_exclusive_unpublished_self_refs(UnpublishedTask& task, uint32_t& 
     if (!captured.auxiliary_file(captured.image, task)) return -EOVERFLOW;
     flags = task.lazy_vmem_lock.lock_irqsave();
     for (auto const& range : task.lazy_vmem_ranges) {
-        if (range.kind == ker::mod::sched::task::LazyVmemKind::FILE_BACKED && !captured.auxiliary_file(range.file, task, true)) {
+        if (ker::mod::sched::task::lazy_vmem_is_file(range) &&
+            !captured.auxiliary_file(ker::mod::sched::task::lazy_vmem_file(range), task, true)) {
             valid = false;
             break;
         }
@@ -343,10 +346,9 @@ auto vfs_count_exclusive_unpublished_self_refs(UnpublishedTask& task, uint32_t& 
     task.fd_table_lock.unlock_irqrestore(flags);
     flags = task.lazy_vmem_lock.lock_irqsave();
     for (auto const& range : task.lazy_vmem_ranges) {
-        if (!valid || range.kind != ker::mod::sched::task::LazyVmemKind::FILE_BACKED || range.file == nullptr ||
-            (!captured.self_target(range.file, task) && !range.file->directory_view))
-            continue;
-        auto* entry = captured.find_file_entry(range.file);
+        auto* file = ker::mod::sched::task::lazy_vmem_file(range);
+        if (!valid || file == nullptr || (!captured.self_target(file, task) && !file->directory_view)) continue;
+        auto* entry = captured.find_file_entry(file);
         // A new relevant owner was not captured. Never refresh the proof.
         if (entry == nullptr || entry->lazy_owned == 0 || !captured.add(entry->lazy_observed, 1)) valid = false;
     }
@@ -374,7 +376,8 @@ auto vfs_count_exclusive_unpublished_self_refs(UnpublishedTask& task, uint32_t& 
     }
     if (task.scheduler_published.load(std::memory_order_acquire) || task.gc_queued.load(std::memory_order_acquire) ||
         task.state.load(std::memory_order_acquire) != ker::mod::sched::task::TaskState::ACTIVE || self_refs > UINT32_MAX - 2 ||
-        task.ref_count.load(std::memory_order_acquire) != 2 + self_refs)
+        task.ref_count.load(std::memory_order_acquire) != 2 + self_refs ||
+        !ker::syscall::vmem::validate_native_unpublished_mapping_owners(task))
         return -EBUSY;
     out = self_refs;
     return 0;

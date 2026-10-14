@@ -83,6 +83,7 @@ sys::Spinlock cow_pte_lock;
 // Serializes leaf publication/removal with usercopy frame pin acquisition.
 // Never hold this across allocation, fault resolution, memcpy, or shootdown.
 sys::Spinlock user_mapping_pin_lock;
+file_mapping::FileMappingIndex file_mapping_index;
 
 // Exact root associations use the same lock as pinned mapping snapshots. Only
 // copied serials escape; queued futexes never retain a control or root reader.
@@ -273,6 +274,21 @@ void release_user_pagemap_access(size_t gate_index) {
     return INDEX;
 }
 
+[[nodiscard]] auto try_begin_user_pagemap_exclusive(PageTable* pagemap) -> size_t {
+    size_t const INDEX = user_pagemap_access_gate_index(pagemap);
+    auto& gate = user_pagemap_access_gates.at(INDEX);
+    bool expected = false;
+    if (!gate.teardown.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire))
+        return USER_PAGEMAP_ACCESS_GATE_NONE;
+    if (gate.readers.load(std::memory_order_acquire) != 0) {
+        // Only release the exclusive bit acquired by this exact attempt. The
+        // single GC worker must remain free to advance a colliding held walk.
+        gate.teardown.store(false, std::memory_order_release);
+        return USER_PAGEMAP_ACCESS_GATE_NONE;
+    }
+    return INDEX;
+}
+
 void end_user_pagemap_exclusive(size_t gate_index) {
     user_pagemap_access_gates.at(gate_index).teardown.store(false, std::memory_order_release);
 }
@@ -280,7 +296,12 @@ void end_user_pagemap_exclusive(size_t gate_index) {
 class UserPagemapExclusiveScope {
    public:
     explicit UserPagemapExclusiveScope(PageTable* pagemap) : gate_index(begin_user_pagemap_exclusive(pagemap)) {}
-    ~UserPagemapExclusiveScope() { end_user_pagemap_exclusive(gate_index); }
+    ~UserPagemapExclusiveScope() { finish(); }
+    void finish() {
+        if (gate_index == USER_PAGEMAP_ACCESS_GATE_NONE) return;
+        end_user_pagemap_exclusive(gate_index);
+        gate_index = USER_PAGEMAP_ACCESS_GATE_NONE;
+    }
 
     UserPagemapExclusiveScope(const UserPagemapExclusiveScope&) = delete;
     UserPagemapExclusiveScope(UserPagemapExclusiveScope&&) = delete;
@@ -693,9 +714,11 @@ auto anonymous_lazy_range_allows_fault(sched::task::Task* task, uint64_t page_va
 }
 
 auto lazy_file_range_matches(const sched::task::LazyVmemRange& lhs, const sched::task::LazyVmemRange& rhs, uint64_t page_vaddr) -> bool {
-    return lhs.kind == sched::task::LazyVmemKind::FILE_BACKED && lhs.start == rhs.start && lhs.end == rhs.end && lhs.prot == rhs.prot &&
-           lhs.flags == rhs.flags && lhs.file == rhs.file && lhs.file_offset == rhs.file_offset && lhs.file_dev == rhs.file_dev &&
-           lhs.file_ino == rhs.file_ino && page_vaddr >= lhs.start && page_vaddr < lhs.end;
+    return (lhs.kind == sched::task::LazyVmemKind::FILE_BACKED || lhs.kind == sched::task::LazyVmemKind::NATIVE_FILE_BACKED) &&
+           lhs.kind == rhs.kind && lhs.start == rhs.start && lhs.end == rhs.end && lhs.prot == rhs.prot && lhs.flags == rhs.flags &&
+           (lhs.kind == sched::task::LazyVmemKind::NATIVE_FILE_BACKED ? lhs.lifetime == rhs.lifetime : lhs.file == rhs.file) &&
+           lhs.file_offset == rhs.file_offset && lhs.file_dev == rhs.file_dev && lhs.file_ino == rhs.file_ino && page_vaddr >= lhs.start &&
+           page_vaddr < lhs.end;
 }
 
 #ifdef WOS_ASYNC_BLOCK_IO
@@ -739,7 +762,7 @@ auto probe_lazy_file_fault(sched::task::Task* task, uint64_t vaddr, const paging
     bool found = false;
     uint64_t flags = task->lazy_vmem_lock.lock_irqsave();
     for (auto const& range : task->lazy_vmem_ranges) {
-        if (PAGE_VADDR >= range.start && PAGE_VADDR < range.end && range.kind == sched::task::LazyVmemKind::FILE_BACKED) {
+        if (PAGE_VADDR >= range.start && PAGE_VADDR < range.end && sched::task::lazy_vmem_is_file(range)) {
             snapshot = range;
             found = true;
             break;
@@ -750,7 +773,8 @@ auto probe_lazy_file_fault(sched::task::Task* task, uint64_t vaddr, const paging
     // The existing exception-wait frame classifier accepts a user PROCESS
     // fault. A kernel PROCESS fault is not a timer frame and cannot be parked
     // through that protocol. Ordinary software-prefault usercopy is unchanged.
-    if (!user_frame || task->type != sched::task::TaskType::PROCESS || task->preempt_disable_depth != 0 || snapshot.file == nullptr ||
+    if (!user_frame || task->type != sched::task::TaskType::PROCESS || task->preempt_disable_depth != 0 ||
+        (snapshot.kind == sched::task::LazyVmemKind::NATIVE_FILE_BACKED ? snapshot.lifetime == nullptr : snapshot.file == nullptr) ||
         snapshot.prot == 0 || (fault.writable != 0U && (snapshot.prot & 2U) == 0) || (fault.fetch != 0U && (snapshot.prot & 4U) == 0))
         return LazyFileFaultDisposition::FAILED;
     if (!task->try_acquire()) return LazyFileFaultDisposition::FAILED;
@@ -815,8 +839,12 @@ auto probe_lazy_file_fault(sched::task::Task* task, uint64_t vaddr, const paging
     for (auto const& range : task->lazy_vmem_ranges) {
         if (task->pagemap == pagemap && lazy_file_range_matches(range, snapshot, PAGE_VADDR)) {
             snapshot = range;
-            ker::vfs::vfs_retain_file(snapshot.file);
-            current = true;
+            if (snapshot.kind == sched::task::LazyVmemKind::NATIVE_FILE_BACKED)
+                current = snapshot.lifetime != nullptr && snapshot.lifetime->try_acquire(file_mapping::FamilyOwner::SNAPSHOT);
+            else {
+                ker::vfs::vfs_retain_file(snapshot.file);
+                current = true;
+            }
             break;
         }
     }
@@ -861,7 +889,10 @@ void finish_lazy_file_fault(const LazyFileFaultWork& work, size_t index, int sta
     task->release_usercopy_pagemap();
     // Backend close may wait for MM readers to drain. Keep the work's File and
     // Task ownership, but release finished MM leases before entering close.
-    ker::vfs::vfs_put_file(work.range.file);
+    if (work.range.kind == sched::task::LazyVmemKind::NATIVE_FILE_BACKED)
+        work.range.lifetime->release(file_mapping::FamilyOwner::SNAPSHOT);
+    else
+        ker::vfs::vfs_put_file(work.range.file);
     uint64_t const FLAGS = lazy_file_fault_lock.lock_irqsave();
     task->lazy_file_fault_status = status;
     lazy_file_fault_work[index] = {};
@@ -970,7 +1001,7 @@ auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const pagin
             return false;
         }
 
-        if (range.kind == sched::task::LazyVmemKind::FILE_BACKED) {
+        if (sched::task::lazy_vmem_is_file(range)) {
             // A range can become file-backed after the hardware fault's
             // deferred probe missed it. Never fall back to synchronous file
             // I/O from that exception context.
@@ -979,7 +1010,12 @@ auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const pagin
                 return false;
             }
             auto file_range = range;
-            if (file_range.file != nullptr) {
+            if (file_range.kind == sched::task::LazyVmemKind::NATIVE_FILE_BACKED) {
+                if (file_range.lifetime == nullptr || !file_range.lifetime->try_acquire(file_mapping::FamilyOwner::SNAPSHOT)) {
+                    task->lazy_vmem_lock.unlock_irqrestore(IRQF);
+                    return false;
+                }
+            } else if (file_range.file != nullptr) {
                 ker::vfs::vfs_retain_file(file_range.file);
             }
             task->lazy_vmem_lock.unlock_irqrestore(IRQF);
@@ -993,7 +1029,9 @@ auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const pagin
             }
 #endif
             bool const OK = ker::syscall::vmem::materialize_lazy_file_page(task, file_range, PAGE_VADDR, fault);
-            if (file_range.file != nullptr) {
+            if (file_range.kind == sched::task::LazyVmemKind::NATIVE_FILE_BACKED) {
+                file_range.lifetime->release(file_mapping::FamilyOwner::SNAPSHOT);
+            } else if (file_range.file != nullptr) {
                 ker::vfs::vfs_put_file(file_range.file);
             }
             return OK;
@@ -3888,13 +3926,21 @@ auto try_pin_current_user_page_mapping(PageTable* pagemap, vaddr_t vaddr, bool r
     bool ref_acquired = false;
     bool pinned = false;
     bool dirty = false;
+    file_mapping::FileMappingBinding* binding = nullptr;
+    uint64_t root_incarnation = 0;
 
     uint64_t const LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
+    auto* control = find_user_root_control_locked(pagemap);
+    if (control != nullptr) root_incarnation = control->serial;
     if (snapshot_user_page_mapping_locked(pagemap, vaddr, require_writable, physical_page)) {
         hhdm_page = reinterpret_cast<void*>(addr::get_virt_pointer(physical_page));
         ref_acquired = phys::page_ref_try_inc(hhdm_page, &lookup_hint);
         pinned = ref_acquired && snapshot_user_page_mapping_locked(pagemap, vaddr, require_writable, confirmed_page, &dirty) &&
                  confirmed_page == physical_page;
+        if (pinned) {
+            auto const RESULT = file_mapping_index.retain_for_pin_locked(pagemap, root_incarnation, vaddr, binding);
+            pinned = RESULT != file_mapping::FileMappingPinResult::REFUSE;
+        }
     }
     user_mapping_pin_lock.unlock_irqrestore(LOCK_FLAGS);
 
@@ -3914,6 +3960,8 @@ auto try_pin_current_user_page_mapping(PageTable* pagemap, vaddr_t vaddr, bool r
         .access_gate_index = held_access_gate_index,
         .require_writable = require_writable,
         .dirty = dirty,
+        .file_binding = binding,
+        .root_incarnation = root_incarnation,
     };
     return true;
 }
@@ -3990,8 +4038,11 @@ auto user_page_pin_still_mapped(const UserPagePin& pin) -> bool {
 
     paddr_t current_page = PADDR_INVALID;
     uint64_t const LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
+    auto* control = find_user_root_control_locked(pin.pagemap);
+    uint64_t const SERIAL = control != nullptr ? control->serial : 0;
     bool const MATCHES = snapshot_user_page_mapping_locked(pin.pagemap, pin.user_page, pin.require_writable, current_page) &&
-                         current_page == pin.physical_page;
+                         current_page == pin.physical_page && SERIAL == pin.root_incarnation &&
+                         file_mapping_index.matches_pin_locked(pin.pagemap, SERIAL, pin.user_page, pin.file_binding);
     user_mapping_pin_lock.unlock_irqrestore(LOCK_FLAGS);
     return MATCHES;
 }
@@ -4007,7 +4058,8 @@ auto capture_user_futex_identity(const UserPagePin& pin, vaddr_t word, UserFutex
     UserFutexIdentity captured{};
     uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
     auto* control = find_user_root_control_locked(pin.pagemap);
-    bool const MATCHES = control != nullptr && control->serial != 0 &&
+    bool const MATCHES = control != nullptr && control->serial != 0 && control->serial == pin.root_incarnation &&
+                         file_mapping_index.matches_pin_locked(pin.pagemap, control->serial, word, pin.file_binding) &&
                          snapshot_user_page_mapping_locked(pin.pagemap, word, pin.require_writable, current_page, nullptr, &leaf_flags) &&
                          current_page == pin.physical_page;
     if (MATCHES) {
@@ -4037,8 +4089,11 @@ auto user_page_pin_commit_write(const UserPagePin& pin) -> bool {
 
     uint64_t const LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
     PageTable* table = pin.pagemap;
-    bool valid_path = true;
-    for (int level = 4; level > 1; --level) {
+    auto* control = find_user_root_control_locked(pin.pagemap);
+    uint64_t const SERIAL = control != nullptr ? control->serial : 0;
+    bool valid_path =
+        SERIAL == pin.root_incarnation && file_mapping_index.matches_pin_locked(pin.pagemap, SERIAL, pin.user_page, pin.file_binding);
+    for (int level = 4; valid_path && level > 1; --level) {
         PageTableEntry& entry = entry_at(table, index_of(pin.user_page, level));
         uint64_t const RAW = pte_raw(entry);
         if (entry.present == 0 || entry.user == 0 || entry.writable == 0 || (RAW & paging::PAGE_COW) != 0U ||
@@ -4072,11 +4127,13 @@ void unpin_user_page(UserPagePin& pin) {
     void* const PAGE = pin.hhdm_page;
     phys::PageLookupHint lookup_hint = pin.lookup_hint;
     size_t const ACCESS_GATE_INDEX = pin.access_gate_index;
+    auto* binding = pin.file_binding;
     pin = {};
     if (PAGE != nullptr) {
         phys::page_ref_dec(PAGE, &lookup_hint);
     }
     release_user_pagemap_access(ACCESS_GATE_INDEX);
+    if (binding != nullptr) binding->release(file_mapping::BindingOwner::PIN);
 }
 
 #ifdef WOS_SELFTEST
@@ -4241,18 +4298,10 @@ auto get_kernel_pagemap() -> PageTable* { return kernel_pagemap; }
 auto create_pagemap() -> PageTable* { return create_user_root_common(false); }
 auto create_pagemap_may_fail() -> PageTable* { return create_user_root_common(true); }
 
-void release_pagemap(PageTable* pagemap, uint64_t owner_pid) {
-    if (pagemap == nullptr) {
-        return;
-    }
-
-    if (pagemap == kernel_pagemap || is_current_pagemap(pagemap)) {
-        page_table_pool_rejects.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-
-    UserPagemapExclusiveScope teardown_scope(pagemap);
-
+namespace {
+// Requires this exact root's existing exclusive lease and sole allocator owner.
+// Caller provenance is passed through so the ordinary wrapper keeps its trace.
+void release_pagemap_exclusive_owned(PageTable* pagemap, uint64_t owner_pid, void* caller) {
 #ifdef WOS_SELFTEST
     // Root pages are recycled directly into the page-table pool, so they do
     // not necessarily pass through page_free() or page_ref_dec(). Catch a
@@ -4260,7 +4309,7 @@ void release_pagemap(PageTable* pagemap, uint64_t owner_pid) {
     // live child of the permanent kernel hierarchy.
     if (selftest_kernel_page_table_frame(pagemap)) {
         dbg::emergency_log("illegal kernel page-table root release page=0x%lx caller=0x%lx\n", reinterpret_cast<uint64_t>(pagemap),
-                           reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+                           reinterpret_cast<uint64_t>(caller));
         ker::mod::dbg::panic_handler("attempted to recycle a permanent kernel page table as a user root");
     }
 #endif
@@ -4273,7 +4322,7 @@ void release_pagemap(PageTable* pagemap, uint64_t owner_pid) {
     }
     UserRootControlChunk* empty = nullptr;
     uint64_t const CONTROL_FLAGS = user_mapping_pin_lock.lock_irqsave();
-    bool const RETIRED = retire_user_root_control_locked(pagemap, empty);
+    bool const RETIRED = file_mapping_index.root_empty_locked(pagemap) && retire_user_root_control_locked(pagemap, empty);
     user_mapping_pin_lock.unlock_irqrestore(CONTROL_FLAGS);
     if (!RETIRED) {
         log::critical("unregistered or corrupt user-root retirement root=%p owner_pid=%lu", pagemap, owner_pid);
@@ -4283,11 +4332,26 @@ void release_pagemap(PageTable* pagemap, uint64_t owner_pid) {
 
     owned_frame_purge_pagemap(pagemap);
 
-    if (try_release_page_table_to_pool(pagemap, {__builtin_return_address(0), owner_pid})) {
+    if (try_release_page_table_to_pool(pagemap, {caller, owner_pid})) {
         return;
     }
 
     phys::page_free(pagemap);
+}
+}  // namespace
+
+void release_pagemap(PageTable* pagemap, uint64_t owner_pid) {
+    if (pagemap == nullptr) {
+        return;
+    }
+
+    if (pagemap == kernel_pagemap || is_current_pagemap(pagemap)) {
+        page_table_pool_rejects.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    UserPagemapExclusiveScope teardown_scope(pagemap);
+    release_pagemap_exclusive_owned(pagemap, owner_pid, __builtin_return_address(0));
 }
 
 void get_user_root_control_stats_snapshot(UserRootControlStats& out) {
@@ -4296,6 +4360,155 @@ void get_user_root_control_stats_snapshot(UserRootControlStats& out) {
            .control_pages = user_root_control_pages,
            .last_serial = user_root_control_last_serial};
     user_mapping_pin_lock.unlock_irqrestore(FLAGS);
+}
+
+auto unpublished_user_root_empty(PageTable* root) -> bool {
+    if (root == nullptr || root == kernel_pagemap || is_current_pagemap(root)) return false;
+    size_t gate = USER_PAGEMAP_ACCESS_GATE_NONE;
+    if (!acquire_user_pagemap_access(root, false, gate)) return false;
+    bool empty = false;
+    if (phys::page_kind_get(root) == PageKind::PAGE_TABLE && phys::page_ref_get(root) == 1U) {
+        uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
+        auto* control = find_user_root_control_locked(root);
+        empty = control != nullptr && control->serial != 0 && file_mapping_index.root_empty_locked(root);
+        for (size_t i = 0; empty && i < 256; ++i) empty = pte_raw(entry_at(root, i)) == 0;
+        user_mapping_pin_lock.unlock_irqrestore(FLAGS);
+    }
+    release_user_pagemap_access(gate);
+    return empty;
+}
+
+auto prepare_unpublished_file_mapping_tables(PageTable* root, uint64_t start, uint64_t length, uint64_t owner_pid) -> bool {
+    constexpr uint64_t USER_END = 0x0000800000000000ULL;
+    constexpr uint64_t MAX_PAGES = 64;
+    constexpr size_t MAX_TABLES = 6;
+    constexpr uint64_t TABLE_FLAGS = paging::PAGE_PRESENT | paging::PAGE_USER | paging::PAGE_WRITE;
+    if (root == nullptr || root == kernel_pagemap || is_current_pagemap(root) || !sched::interrupts_enabled() ||
+        sched::preempt_count() != 0 || start < paging::PAGE_SIZE || start >= USER_END || length == 0 ||
+        length > MAX_PAGES * paging::PAGE_SIZE || length > USER_END - start || ((start | length) & (paging::PAGE_SIZE - 1)) != 0)
+        return false;
+
+    // A <=64-page interval needs at most two tables at each upper level,
+    // including an interval crossing a PML4 boundary. Allocate before taking
+    // a root reader: reclaim may need to progress a colliding root teardown.
+    std::array<PageTable*, MAX_TABLES> spares{};
+    bool prepared = true;
+    for (auto& spare : spares) {
+        spare = alloc_zeroed_page_table(true);
+        if (spare == nullptr) {
+            prepared = false;
+            break;
+        }
+    }
+
+    size_t gate = USER_PAGEMAP_ACCESS_GATE_NONE;
+    if (prepared) prepared = acquire_user_pagemap_access(root, false, gate);
+    if (prepared) {
+        prepared = phys::page_kind_get(root) == PageKind::PAGE_TABLE && phys::page_ref_get(root) == 1U;
+        if (prepared) {
+            uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
+            auto* control = find_user_root_control_locked(root);
+            prepared = control != nullptr && control->serial != 0;
+            size_t used = 0;
+            for (uint64_t address = start; prepared && address < start + length; address += paging::PAGE_SIZE) {
+                auto* table = root;
+                for (int level = 4; prepared && level > 1; --level) {
+                    auto& entry = entry_at(table, index_of(address, level));
+                    if (!entry.present) {
+                        if (pte_raw(entry) != 0 || used == spares.size()) {
+                            prepared = false;
+                            break;
+                        }
+                        auto* spare = std::exchange(spares.at(used++), nullptr);
+                        auto const PHYSICAL = reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(spare)));
+                        // Transfer this sole table owner to the root. A later
+                        // refusal preserves the prefix for ordinary teardown.
+                        entry = paging::create_page_table_entry(PHYSICAL, TABLE_FLAGS);
+                        table = spare;
+                    } else {
+                        if (entry.pagesize || !entry.user || !entry.writable || entry.no_execute || entry.frame == 0) {
+                            prepared = false;
+                            break;
+                        }
+                        table = reinterpret_cast<PageTable*>(addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT));
+                        if (phys::page_kind_get(table) != PageKind::PAGE_TABLE || phys::page_ref_get(table) != 1U) {
+                            prepared = false;
+                            break;
+                        }
+                    }
+                }
+                if (prepared && pte_raw(entry_at(table, index_of(address, 1))) != 0) prepared = false;
+            }
+            user_mapping_pin_lock.unlock_irqrestore(FLAGS);
+        }
+    }
+    release_user_pagemap_access(gate);
+
+    // Only private unused spares remain here. No pool operation, zeroing,
+    // physical free or reclaim runs under the root reader or MM pin lock.
+    for (auto* spare : spares) {
+        if (spare != nullptr && !try_release_page_table_to_pool(spare, {__builtin_return_address(0), owner_pid})) phys::page_free(spare);
+    }
+    return prepared;
+}
+
+auto attach_unpublished_file_binding(file_mapping::FileMappingBinding*& prepared, PageTable* root, uint64_t start, uint64_t end,
+                                     uint64_t file_offset) -> bool {
+    if (prepared == nullptr || root == nullptr) return false;
+    uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
+    auto* control = find_user_root_control_locked(root);
+    bool const ATTACHED = control != nullptr && prepared->configure_unpublished(root, control->serial, start, end, file_offset) &&
+                          file_mapping_index.attach_locked(prepared, control->serial);
+    user_mapping_pin_lock.unlock_irqrestore(FLAGS);
+    return ATTACHED;
+}
+
+auto snapshot_file_mapping_bindings(PageTable* root, file_mapping::FileMappingBinding** output, size_t capacity, size_t& owned_count)
+    -> bool {
+    size_t gate = USER_PAGEMAP_ACCESS_GATE_NONE;
+    if (!acquire_user_pagemap_access(root, false, gate)) return false;
+    uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
+    auto* control = find_user_root_control_locked(root);
+    bool const CAPTURED =
+        control != nullptr && file_mapping_index.snapshot_root_locked(root, control->serial, output, capacity, owned_count);
+    user_mapping_pin_lock.unlock_irqrestore(FLAGS);
+    release_user_pagemap_access(gate);
+    return CAPTURED;
+}
+
+FileMappingInstallerLease::~FileMappingInstallerLease() {
+    release_user_pagemap_access(access_gate_);
+    if (binding_ != nullptr) binding_->release(file_mapping::BindingOwner::INSTALLER);
+}
+
+auto FileMappingInstallerLease::acquire(sched::task::Task& task, const sched::task::LazyVmemRange& range, uint64_t address) -> bool {
+    if (binding_ != nullptr || access_gate_ != USER_PAGEMAP_ACCESS_GATE_NONE || range.kind != sched::task::LazyVmemKind::NATIVE_FILE_BACKED)
+        return false;
+    auto* root = task.pagemap;
+    if (!acquire_user_pagemap_access(root, false, access_gate_)) return false;
+    uint64_t const RANGE_FLAGS = task.lazy_vmem_lock.lock_irqsave();
+    bool current = false;
+    for (auto const& candidate : task.lazy_vmem_ranges) {
+        if (task.pagemap != root || !lazy_file_range_matches(candidate, range, address)) continue;
+        uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
+        auto* control = find_user_root_control_locked(root);
+        auto const RESULT = control != nullptr ? file_mapping_index.retain_for_pin_locked(root, control->serial, address, binding_)
+                                               : file_mapping::FileMappingPinResult::REFUSE;
+        if (RESULT == file_mapping::FileMappingPinResult::ACQUIRED) {
+            current = binding_->lifetime() == candidate.lifetime &&
+                      binding_->reclassify(file_mapping::BindingOwner::PIN, file_mapping::BindingOwner::INSTALLER);
+        }
+        user_mapping_pin_lock.unlock_irqrestore(FLAGS);
+        break;
+    }
+    task.lazy_vmem_lock.unlock_irqrestore(RANGE_FLAGS);
+    if (!current) {
+        release_user_pagemap_access(access_gate_);
+        access_gate_ = USER_PAGEMAP_ACCESS_GATE_NONE;
+        if (binding_ != nullptr) binding_->release(file_mapping::BindingOwner::PIN);
+        binding_ = nullptr;
+    }
+    return current;
 }
 
 #ifdef WOS_SELFTEST
@@ -4836,7 +5049,8 @@ __attribute__((no_sanitize("address"))) void selftest_audit_boot_direct_map_boun
 #endif
 
 auto install_lazy_file_page_if_current(sched::task::Task* task, const sched::task::LazyVmemRange& range, vaddr_t page_vaddr,
-                                       paddr_t page_paddr, uint64_t page_flags) -> LazyFilePageInstallResult {
+                                       paddr_t page_paddr, uint64_t page_flags, file_mapping::FileMappingBinding* expected_binding)
+    -> LazyFilePageInstallResult {
     if (task == nullptr || task->pagemap == nullptr) {
         return LazyFilePageInstallResult::STALE_RANGE;
     }
@@ -4847,6 +5061,16 @@ auto install_lazy_file_page_if_current(sched::task::Task* task, const sched::tas
     for (const auto& candidate : task->lazy_vmem_ranges) {
         if (!lazy_file_range_matches(candidate, range, page_vaddr)) {
             continue;
+        }
+        if (candidate.kind == sched::task::LazyVmemKind::NATIVE_FILE_BACKED) {
+            uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
+            auto* control = find_user_root_control_locked(task->pagemap);
+            bool const CURRENT = expected_binding != nullptr && control != nullptr && expected_binding->lifetime() == candidate.lifetime &&
+                                 file_mapping_index.matches_pin_locked(task->pagemap, control->serial, page_vaddr, expected_binding);
+            user_mapping_pin_lock.unlock_irqrestore(FLAGS);
+            if (!CURRENT) break;
+        } else if (expected_binding != nullptr) {
+            break;
         }
         if (translate(task->pagemap, page_vaddr) != PADDR_INVALID) {
             result = LazyFilePageInstallResult::ALREADY_MAPPED;
@@ -6602,11 +6826,16 @@ auto classify_live_allocator_frame(uint64_t phys_addr, PageKind kind, DestroyUse
 struct PageTableFrameSet {
     util::SmallVec<uint64_t, 64> frames;
     bool complete{true};
+    bool allow_growth{true};  // RAW keeps its original allocation/fallback path.
 
     auto add(uint64_t phys_addr) -> bool {
         phys_addr &= ~(paging::PAGE_SIZE - 1);
         if (phys_addr == 0 || frames.contains(phys_addr)) {
             return true;
+        }
+        if (!allow_growth && frames.size() >= 64) {
+            complete = false;
+            return false;  // Never reach an allocating SmallVec growth.
         }
         if (!frames.push_back(phys_addr)) {
             complete = false;
@@ -6647,6 +6876,7 @@ struct DestroyUserSpaceBudgetState {
     RefdecBatch page_table_refdec_batch{};
     size_t stack_size = 0;
     size_t access_gate_index = USER_PAGEMAP_ACCESS_GATE_NONE;
+    file_mapping::FileMappingTlbRetirement file_retirement{};
 };
 
 namespace {
@@ -6831,7 +7061,9 @@ auto advance_collect_frames_budgeted(DestroyUserSpaceBudgetState& state, Destroy
             return true;
         }
 
-        state.page_table_frames.add(PHYS_ADDR);
+        bool const ADDED = state.page_table_frames.add(PHYS_ADDR);
+        if (!ADDED && !state.page_table_frames.allow_growth)
+            dbg::panic_handler("native root table census exceeded inline capacity before mutation");
         auto* next_level = reinterpret_cast<PageTable*>(phys_to_hhdm_checked(PHYS_ADDR, &state.frame_probe_cache));
         if (next_level != nullptr) {
             (void)destroy_state_push(state, next_level, frame.level - 1, 0, PHYS_ADDR);
@@ -6839,6 +7071,8 @@ auto advance_collect_frames_budgeted(DestroyUserSpaceBudgetState& state, Destroy
         return true;
     }
 
+    if (!state.page_table_frames.allow_growth && !state.page_table_frames.complete)
+        dbg::panic_handler("native incomplete root table census before free-data");
     destroy_state_reset_walk(state, DestroyUserSpacePhase::FREE_DATA);
     return false;
 }
@@ -7370,27 +7604,39 @@ void free_page_table_pages(PageTable* table, int level, DestroyRefdecBatch& page
 
 }  // namespace
 
-auto create_destroy_user_space_budget_state(PageTable* pagemap, uint64_t owner_pid, const char* owner_name, const char* reason)
-    -> DestroyUserSpaceBudgetState* {
-    if (pagemap == nullptr) {
-        return nullptr;
-    }
+auto prepare_destroy_user_space_budget_state() -> DestroyUserSpaceBudgetState* { return new (std::nothrow) DestroyUserSpaceBudgetState{}; }
 
-    auto* state = new DestroyUserSpaceBudgetState{};
-    if (state == nullptr) {
-        return nullptr;
-    }
-
-    state->access_gate_index = begin_user_pagemap_exclusive(pagemap);
+auto begin_prepared_destroy_user_space(DestroyUserSpaceBudgetState& state, PageTable* pagemap, uint64_t owner_pid, const char* owner_name,
+                                       const char* reason, bool wait_for_gate) -> bool {
+    if (pagemap == nullptr || state.pagemap != nullptr || state.access_gate_index != USER_PAGEMAP_ACCESS_GATE_NONE) return false;
+    size_t const GATE = wait_for_gate ? begin_user_pagemap_exclusive(pagemap) : try_begin_user_pagemap_exclusive(pagemap);
+    if (GATE == USER_PAGEMAP_ACCESS_GATE_NONE) return false;
+    state.access_gate_index = GATE;
+    state.page_table_frames.allow_growth = wait_for_gate;
     purge_anonymous_swap_mappings(pagemap);
     owned_frame_purge_pagemap(pagemap);
-    state->pagemap = pagemap;
-    state->owner_pid = owner_pid;
-    state->owner_name = owner_name;
-    state->reason = reason;
-    state->phase = DestroyUserSpacePhase::COLLECT_FRAMES;
-    state->page_table_frames.add(reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(pagemap))));
-    destroy_state_reset_walk(*state, DestroyUserSpacePhase::COLLECT_FRAMES);
+    state.pagemap = pagemap;
+    state.owner_pid = owner_pid;
+    state.owner_name = owner_name;
+    state.reason = reason;
+    state.phase = DestroyUserSpacePhase::COLLECT_FRAMES;
+    bool const ROOT_ADDED =
+        state.page_table_frames.add(reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(pagemap))));
+    if (!ROOT_ADDED && !state.page_table_frames.allow_growth)
+        dbg::panic_handler("native root seed exceeded inline table census before mutation");
+    destroy_state_reset_walk(state, DestroyUserSpacePhase::COLLECT_FRAMES);
+    return true;
+}
+
+auto create_destroy_user_space_budget_state(PageTable* pagemap, uint64_t owner_pid, const char* owner_name, const char* reason)
+    -> DestroyUserSpaceBudgetState* {
+    if (pagemap == nullptr) return nullptr;
+    auto* state = prepare_destroy_user_space_budget_state();
+    if (state == nullptr) return nullptr;
+    if (!begin_prepared_destroy_user_space(*state, pagemap, owner_pid, owner_name, reason)) {
+        delete state;
+        return nullptr;
+    }
     return state;
 }
 
@@ -7431,6 +7677,15 @@ auto destroy_user_space_budgeted(DestroyUserSpaceBudgetState* state, uint32_t ma
                 break;
             case DestroyUserSpacePhase::TLB_FLUSH:
                 flush_pagemap_after_update(state->pagemap, 0, true);
+                {
+                    uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
+                    auto* control = find_user_root_control_locked(state->pagemap);
+                    bool const DETACHED =
+                        control == nullptr ? file_mapping_index.root_empty_locked(state->pagemap)
+                                           : file_mapping_index.detach_root_locked(state->pagemap, control->serial, state->file_retirement);
+                    user_mapping_pin_lock.unlock_irqrestore(FLAGS);
+                    if (!DETACHED) dbg::panic_handler("native binding root retirement mismatch");
+                }
                 state->phase = DestroyUserSpacePhase::DONE;
                 consumed_step = true;
                 break;
@@ -7456,9 +7711,29 @@ void destroy_user_space_budget_state_destroy(DestroyUserSpaceBudgetState* state)
     }
     destroy_state_flush_refdec_batch(*state, nullptr);
     destroy_state_flush_page_table_refdec_batch(*state, nullptr);
+    if (state->access_gate_index != USER_PAGEMAP_ACCESS_GATE_NONE) end_user_pagemap_exclusive(state->access_gate_index);
+    state->access_gate_index = USER_PAGEMAP_ACCESS_GATE_NONE;
+    state->file_retirement.release_after_completed_tlb();
+    delete state;
+}
+
+auto finish_destroy_user_space_and_release_pagemap(DestroyUserSpaceBudgetState* state) -> bool {
+    if (state == nullptr || state->phase != DestroyUserSpacePhase::DONE || state->pagemap == nullptr || state->pagemap == kernel_pagemap ||
+        is_current_pagemap(state->pagemap) || state->access_gate_index == USER_PAGEMAP_ACCESS_GATE_NONE ||
+        state->access_gate_index != user_pagemap_access_gate_index(state->pagemap) ||
+        !user_pagemap_access_gates.at(state->access_gate_index).teardown.load(std::memory_order_acquire))
+        return false;
+    destroy_state_flush_refdec_batch(*state, nullptr);
+    destroy_state_flush_page_table_refdec_batch(*state, nullptr);
+    // DONE already completed the actual TLB ACK and detached the exact binding
+    // batch. Keep the original exclusive lease through control/pool retirement.
+    release_pagemap_exclusive_owned(state->pagemap, state->owner_pid, __builtin_return_address(0));
+    state->pagemap = nullptr;
     end_user_pagemap_exclusive(state->access_gate_index);
     state->access_gate_index = USER_PAGEMAP_ACCESS_GATE_NONE;
+    state->file_retirement.release_after_completed_tlb();
     delete state;
+    return true;
 }
 
 void destroy_user_space(PageTable* pagemap, uint64_t owner_pid, const char* owner_name, const char* reason) {
@@ -7502,6 +7777,15 @@ void destroy_user_space(PageTable* pagemap, uint64_t owner_pid, const char* owne
     phase_start_us = time::get_us();
     flush_pagemap_after_update(pagemap, 0, true);
     stats.tlb_flush_us = elapsed_us_since(phase_start_us, time::get_us());
+    file_mapping::FileMappingTlbRetirement file_retirement;
+    uint64_t const FILE_FLAGS = user_mapping_pin_lock.lock_irqsave();
+    auto* control = find_user_root_control_locked(pagemap);
+    bool const FILE_DETACHED = control == nullptr ? file_mapping_index.root_empty_locked(pagemap)
+                                                  : file_mapping_index.detach_root_locked(pagemap, control->serial, file_retirement);
+    user_mapping_pin_lock.unlock_irqrestore(FILE_FLAGS);
+    if (!FILE_DETACHED) dbg::panic_handler("native binding root retirement mismatch");
+    teardown_scope.finish();
+    file_retirement.release_after_completed_tlb();
     note_destroy_user_space_stats(stats);
 #ifdef ELF_DEBUG
     if (owner_pid != 0) {

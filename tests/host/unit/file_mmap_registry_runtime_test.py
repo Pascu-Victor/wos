@@ -5,6 +5,9 @@ The complete FileMmapRange/register/remove/clone/range definitions and unchanged
 SmallVec header are compiled. Mutex, File retain/close and PageTable are explicit
 Host primitives. This checks registry geometry, policy and owner transactions,
 not real PTE/TLB, backing I/O, dirty writeback, Task GC or shared-file coherence.
+The real pure native entry declarations are imported so the unchanged clone
+guard compiles; its native head stays empty in these RAW-only vectors. No native
+entry, callback, worker or retirement is modeled or qualified here.
 --vmem-source selects a complete archived predecessor for a real negative control.
 """
 from __future__ import annotations
@@ -29,6 +32,8 @@ ROOT = next(path for path in Path(__file__).resolve().parents
 KERN = ROOT / "modules/kern/src"
 SOURCE = KERN / "syscalls_impl/vmem/sys_vmem.cpp"
 SMALLVEC = KERN / "util/smallvec.hpp"
+FAMILY_HEADER = KERN / "platform/mm/file_mapping_lifetime.hpp"
+NATIVE_HEADER = KERN / "platform/mm/unpublished_mapping_retirement.hpp"
 SCRATCH_BUDGET = 64 * 1024 * 1024
 LOG_BUDGET = 1024 * 1024
 FILE_BUDGET = 8 * 1024 * 1024
@@ -70,6 +75,7 @@ void* operator new[](std::size_t bytes, const std::nothrow_t&) noexcept {
     catch (...) { ++fixture::failed_growth; return nullptr; }
 }
 #include <util/smallvec.hpp>
+#include <platform/mm/unpublished_mapping_retirement.hpp>
 namespace ker::mod::sys { using Mutex=fixture::Mutex; }
 namespace ker::mod::mm::paging { struct PageTable { unsigned identity{}; }; }
 namespace ker::vfs {
@@ -109,6 +115,9 @@ struct World {
     std::array<std::array<Cell,BYTES>,3> expected{};
     unsigned initial_retains{retains}, initial_puts{puts}, initial_closes{final_closes};
     World() {
+#if HAVE_NATIVE_REGISTRY_HEAD
+        check(actual::g_native_file_mmap_ranges == nullptr, "RAW-only Host never owns native registry entries");
+#endif
         check(actual::g_file_mmap_ranges.empty(), "previous fixture registry fully drained");
         actual::g_file_mmap_ranges=decltype(actual::g_file_mmap_ranges){};
         for(unsigned i=0;i<roots.size();++i) roots[i].identity=i;
@@ -341,12 +350,16 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
     include = scratch / "include"
     actual = []
     for name, data in [("util/smallvec.hpp", SMALLVEC.read_bytes()),
+                       ("platform/mm/file_mapping_lifetime.hpp", FAMILY_HEADER.read_bytes()),
+                       ("platform/mm/unpublished_mapping_retirement.hpp", NATIVE_HEADER.read_bytes()),
                        ("platform/mm/dyn/kmalloc.hpp", b"#pragma once\n"),
                        ("util/hcf.hpp", b"#pragma once\n#include <cstdlib>\n[[noreturn]] inline void hcf(){std::abort();}\n")]:
         path = include / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
     actual.append({"name": "whole-real-util/smallvec.hpp", **pin(SMALLVEC)})
+    for header in [FAMILY_HEADER, NATIVE_HEADER]:
+        actual.append({"name": "whole-real-" + header.name, **pin(header)})
     source = selected.read_text()
     chunks = [PRELUDE, "\nnamespace ker::syscall::vmem {\n"]
     for anchor, declaration in [("struct FileMmapRange {", True),
@@ -362,12 +375,23 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
             raise ValueError("whole real registry declaration unavailable")
         chunks.append(anchor + "\n")
         actual.append({"name": anchor, "bytes": len(anchor), "sha256": hashlib.sha256(anchor.encode()).hexdigest()})
+    native = "g_native_file_mmap_ranges" in source
+    if native:
+        for pattern in [r"^using NativeMappingEntry = [^\n]+", r"^NativeMappingEntry\* g_native_file_mmap_ranges[^\n]+"]:
+            matches = re.findall(pattern, source, re.M)
+            if len(matches) != 1:
+                raise ValueError("whole real native registry declaration unavailable")
+            declaration = matches[0]
+            chunks.append(declaration + "\n")
+            actual.append({"name": "actual-native-type-boundary", "bytes": len(declaration.encode()),
+                           "sha256": hashlib.sha256(declaration.encode()).hexdigest()})
     for anchor in ["auto register_file_mmap_range(", "auto unregister_one_file_mmap_overlap(",
                    "auto unregister_file_mmap_range(", "auto clone_file_mmap_ranges_for_pagemap_locked("]:
         body, row = capture(source, anchor)
         actual.append(row)
         chunks.append(f'#line {row["line"]} "actual-selected-sys_vmem.cpp"\n' + body + "\n")
-    chunks.extend(["}\n", '#line 1 "independent-fixture-oracles"\n', CASES])
+    chunks.extend(["}\n", f"#define HAVE_NATIVE_REGISTRY_HEAD {int(native)}\n",
+                   '#line 1 "independent-fixture-oracles"\n', CASES])
     (scratch / "harness.cpp").write_text("\n".join(chunks))
     return actual
 
@@ -546,11 +570,13 @@ def main() -> int:
             if evidence.parent.resolve(strict=True) != evidence.parent or os.path.lexists(evidence):
                 raise ValueError("--evidence-dir needs an existing canonical parent and a fresh exclusive directory")
             evidence.mkdir(mode=0o700)
-        watched = [selected, SMALLVEC, Path(__file__).resolve(), compiler]
+        watched = [selected, SMALLVEC, FAMILY_HEADER, NATIVE_HEADER, Path(__file__).resolve(), compiler]
         before = [pin(path) for path in watched]
         result["source_before"] = before
         result["selected_vmem_source"] = before[0]
         result["primitive_seams"] = ["Mutex", "File retain/destructive close", "PageTable identity", "nothrow array growth failure"]
+        result["raw_registry_vectors_only"] = True
+        result["native_registry_boundary"] = "actual pure types and empty native head; no native entries or worker modeled"
         subreaper()
         scratch = Path(tempfile.mkdtemp(prefix="wos-file-registry-", dir="/tmp"))
         info = scratch.stat()

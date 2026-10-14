@@ -30,6 +30,7 @@
 #include "platform/interrupt/idt.hpp"
 #include "platform/mm/addr.hpp"
 #include "platform/mm/dyn/kmalloc.hpp"
+#include "platform/mm/lifetime_retirement_executor.hpp"
 #include "platform/mm/mm.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/phys.hpp"
@@ -1103,6 +1104,12 @@ __attribute__((no_stack_protector)) void start_smt(boot::HandoverModules& module
     sched::percpu_init();
     dbg::log("Creating init task(s) from handover modules");
     create_init_tasks(modules);
+    // PID1 is established before this permanent retirement worker is posted.
+    // Failure keeps new native mapping preparation unavailable; RAW paths keep
+    // their existing behavior. No secondary CPU/user producer has started yet.
+    if (!mm::file_mapping::LifetimeRetirementExecutor::initialize_boot()) {
+        dbg::logger<"file-retire">::warn("native mapping retirement executor unavailable");
+    }
     if (!dbg::journal::start_module_publisher()) {
         dbg::panic_handler("unable to start journal module publisher");
     }

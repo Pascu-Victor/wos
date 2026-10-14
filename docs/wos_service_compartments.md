@@ -2318,3 +2318,71 @@ complete family/File/Task shutdown drain. TMPFS resize failure atomicity and the
 connected native-owner installation have source-only next-step maps. Those maps
 do not qualify implementation. Two simultaneous two-hour services and1,000 full
 create/exec/kill/destroy/OOM cycles remain required. Goal39 stays ACTIVE.
+
+## Checkpoint56: native mapping ownership and TMPFS resize preparation (2026-10-15)
+
+A typed mapping family owns one checked File reference; lazy and registry rows,
+root bindings, pins and installers hold explicit owners. Pre-reserved callbacks
+run on the real scheduler's dedicated retirement worker, outside MM, owner and
+queue guards. Root retirement waits for actual PTE removal and TLB acknowledgment.
+Task deletion waits for the destructive File callback to return, including the
+ProcFS self-target case. Transferred ownership can recover through the real GC
+worker after a pin initially refuses retirement. Shutdown closes admission and
+preserves providers while native records or callbacks remain live.
+
+This internal producer admits initially empty, exclusively owned unpublished
+roots and at most eight 64-page bindings. It preallocates upper tables before
+publication and uses an inline census for at most 512 leaves and 49 table frames.
+The native retirement gate is held with preemption disabled until it is released;
+the admitted walk must finish within 2,048 steps. This prevents the source-found
+same-CPU dependency on an IRQ-off RAW caller waiting for a preempted gate owner.
+It supplies no wall-clock latency bound for global scans or remote TLB progress.
+Existing public RAW mappings remain compatible; native publication, fork/exec,
+canonical shared bytes, dirty retry and all-root EOF fencing remain unfinished.
+
+TMPFS resize prepares fallible replacement descriptors before materializing or
+zeroing a retained tail. Preparation failure preserves size, bytes, descriptors,
+quota and frame/swap ownership. Successful commit copies the current descriptors
+after page-in. All 29 actual-body ASan/UBSan Host vectors pass, with 66,507
+assertions; the genuine archived predecessor compiles and fails the resize oracle.
+All 11 selected registered Host checks pass. Normal Build WOS and isolated fast
+diagnostic builds pass with their watched sources held. The explicit capture
+contains 686 kernel sources and inherited build/qualification inputs, 1,155 in
+all; it is not a compiler dependency census.
+
+Native83 completed six scheduled cases and 15 callback returns but remains FAIL:
+the collector rejected an incomplete ordinary UART record after the finalizer.
+The separately reviewed successor accepts only a bounded ordinary trailing
+fragment after every required complete protocol record; the fragment supplies
+no protocol credit. Fresh Native84 passes all six cases and 2,930 assertions on
+32 online CPUs, with 15 callback returns, ordinary finalizer action2, natural
+launcher exit0 and no forced stop. Its 129/129 Task census is context only.
+This short scheduled test does not qualify the ordinary init/service workload.
+
+Default Native82 stopped on the old Task-size expectation after the retirement
+pointer was appended. The corrected fixture checks size16216 and the new pointer
+at offset16208, width8 and initial null, preserving all previous scalar offsets,
+alignment and cases. Fresh default Native85 passes all 1,463 enabled cases,
+all 212 mandatory cases and 113,976 assertions with zero failures; the same three
+BufferCache cases remain disabled. It powers off naturally after 476.218s, with
+launcher, worker and outer exit0 and no forced stop. The three new real TMPFS
+resize cases and the corrected layout case pass. This default suite runs with
+parked APs; the separate scheduled84 run supplies the stated SMP evidence.
+
+Native82,83,84 and85 each prune all four exact-owned inactive images. Their saved
+prune receipts leave zero disposable allocation; separate real-host checks for82
+and84/85 preserve the unrelated VM and original shared lock. The initial83 extra
+blanket FD check failed on an inaccessible desktop process; later observers
+retain the canonical scoped prune evidence and explicitly limit that FD claim.
+All physical observations use the real host process view. Earlier sandbox-only
+absence inference is superseded by the real-host protected-VM observation.
+Small logs/receipts and required readonly seeds/current artifacts remain.
+
+Builds and native results cover the combined local workspace. All 22 pre-existing
+user edits are preserved; the scheduler's goal-only patch is separated by exact
+forward/inverse reconstruction. Its clean-HEAD candidate is not independently
+built or runtime-qualified. Goal39 remains ACTIVE with all ten full criteria open.
+Continue `--no-setup`, one topology, a 20GiB disposable budget, a 40GiB free floor
+and exact-owned pruning after every outcome. Next is connected canonical TMPFS
+backing, followed by complete public ownership and the required service/lifecycle
+qualification.

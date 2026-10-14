@@ -6,6 +6,9 @@ are compiled unchanged; actual Task usercopy acquire/release bodies are too.
 Scheduler, materialization, File/backend close, locks and root-exclusive wait are
 explicit controlled Host boundaries. This qualifies close ordering and owned
 callback return, not native mapping bytes, hardware TLBs or complete lifetime.
+The real range/ownership declarations are imported, but all vectors select RAW
+FILE_BACKED. Native owner methods are fatal unreachable Host boundaries; this
+driver does not model or qualify the permanent native retirement executor.
 --virt-source accepts a complete unmodified predecessor and its actual old finish
 body must compile then fail the lease oracle. No source-string order assertion.
 """
@@ -31,6 +34,8 @@ ROOT = next(path for path in Path(__file__).resolve().parents
             if (path / "modules/kern/src").is_dir() and (path / ".github/instructions").is_dir())
 SOURCE = ROOT / "modules/kern/src/platform/mm/virt.opt.cpp"
 TASK = ROOT / "modules/kern/src/platform/sched/task.cpp"
+TASK_HEADER = ROOT / "modules/kern/src/platform/sched/task.hpp"
+FAMILY_HEADER = ROOT / "modules/kern/src/platform/mm/file_mapping_lifetime.hpp"
 
 PRELUDE = r'''
 #include <array>
@@ -42,9 +47,12 @@ PRELUDE = r'''
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <platform/mm/file_mapping_lifetime.hpp>
+namespace ker::mod::mm::paging { struct PageTable { size_t gate_index{}; }; }
 namespace fixture {
 std::atomic<unsigned> failures{}, assertions{}, order_failures{}, cases{}, close_calls{}, nonfinal_puts{};
 std::mutex output_lock;
@@ -68,9 +76,19 @@ struct Gate {
     std::atomic<uint32_t> readers{};
     std::atomic<bool> teardown{};
 };
-struct PageTable { size_t gate_index{}; };
+using PageTable = ker::mod::mm::paging::PageTable;
 struct State;
 State* state{};  // Cases are sequential; worker threads are joined before reset.
+}
+namespace ker::mod::mm::file_mapping {
+// Link-only boundaries for branches excluded by every RAW fixture. A native
+// path is an error here, never a substitute for the real scheduled executor.
+auto FileMappingLifetime::try_acquire(FamilyOwner) noexcept -> bool {
+    fixture::check(false, "RAW-only Host entered native family acquire"); std::abort();
+}
+void FileMappingLifetime::release(FamilyOwner) noexcept {
+    fixture::check(false, "RAW-only Host entered native family release"); std::abort();
+}
 }
 namespace ker::mod::sys { using Spinlock = fixture::Lock; }
 namespace ker::vfs { struct File; void vfs_retain_file(File*); void vfs_put_file(File*); }
@@ -78,13 +96,7 @@ namespace ker::mod::mm::paging { struct PageFault { unsigned writable{}, fetch{}
 namespace ker::mod::sched::task {
 enum class TaskType { PROCESS, DAEMON };
 enum class TaskState { ACTIVE, EXITING, DEAD };
-enum class LazyVmemKind { ANONYMOUS, FILE_BACKED };
-struct LazyVmemRange {
-    uint64_t start{0x10000}, end{0x11000}, prot{3}, flags{};
-    LazyVmemKind kind{LazyVmemKind::FILE_BACKED};
-    ker::vfs::File* file{};
-    uint64_t file_offset{}, file_dev{1}, file_ino{2};
-};
+// ACTUAL_RAW_RANGE_TYPES
 struct Task {
     TaskType type{TaskType::PROCESS};
     std::atomic<TaskState> state{TaskState::ACTIVE};
@@ -274,7 +286,8 @@ void one(unsigned disposition, int close_result, bool self_target, bool final_pu
     local.self_target = self_target; local.final_put = final_put; local.materialize_ok = disposition == 0;
     auto* file = new ker::vfs::File;
     if (self_target) { file->target = &subject; ++subject.ref_count; }
-    sched::task::LazyVmemRange range; range.file = file;
+    sched::task::LazyVmemRange range{.start=0x10000, .end=0x11000, .prot=3,
+        .kind=sched::task::LazyVmemKind::FILE_BACKED, .file=file, .file_dev=1, .file_ino=2};
     subject.lazy_vmem_ranges.push_back(range);
     check(virt::user_pagemap_access_gates.at(0).readers.load() == 0 &&
           virt::user_pagemap_access_gates.at(1).readers.load() == 0, "previous root lease leaked");
@@ -381,8 +394,13 @@ def capture(source: str, name: str) -> tuple[str, dict]:
     raise ValueError(f"unterminated actual definition: {name}")
 
 
-def generate(virt: str, task: str, virt_path: Path) -> tuple[str, list[dict]]:
-    actual = []
+def generate(virt: str, task: str, virt_path: Path, task_header: str) -> tuple[str, list[dict]]:
+    begin = task_header.index("enum class LazyVmemKind")
+    end = task_header.index("using LazyVmemRangeVec", begin)
+    types = task_header[begin:end]
+    actual = [{"name": "actual-LazyVmemKind-Range-and-pure-helpers", "bytes": len(types.encode()),
+               "sha256": hashlib.sha256(types.encode()).hexdigest()},
+              {"name": "whole-real-file_mapping_lifetime.hpp", **pin(FAMILY_HEADER)}]
     prefix = virt.index("enum class LazyFileFaultDisposition")
     suffix = virt.index("void wake_lazy_file_fault_worker()", prefix)
     declarations = virt[prefix:suffix]
@@ -401,7 +419,7 @@ def generate(virt: str, task: str, virt_path: Path) -> tuple[str, list[dict]]:
         task_bodies.append(body)
     # The complete actual Task methods use the fixture PageTable declaration,
     # aliased through the same namespace names; no body/type-name replacement.
-    text = PRELUDE + "\nnamespace ker::mod::mm::paging { using PageTable = fixture::PageTable; }\n"
+    text = PRELUDE.replace("// ACTUAL_RAW_RANGE_TYPES", types)
     text += "namespace ker::mod::sched::task { namespace mm = ker::mod::mm;\n" + "\n".join(task_bodies) + "\n}\n"
     text += "namespace ker::mod::mm::virt {\n" + declarations + "\n" + "\n\n".join(bodies) + "\n}\n"
     return text + CASES, actual
@@ -548,7 +566,9 @@ def main() -> int:
     scratch = None
     groups = []
     watched, before = [], []
-    result = {"pass": False, "commands": [], "scratch_removed": False}
+    result = {"pass": False, "commands": [], "scratch_removed": False,
+              "raw_file_backed_vectors_only": True, "native_runtime_qualified": False,
+              "native_owner_method_seams": "fatal unreachable branches, never a native executor model"}
     try:
         virt_path, task_path = args.virt_source.resolve(strict=True), args.task_source.resolve(strict=True)
         compiler = Path(args.cxx).resolve(strict=True)
@@ -558,18 +578,21 @@ def main() -> int:
             if executable.read(4) != b"\x7fELF":
                 raise ValueError("--cxx/CXX must name one host ELF compiler executable")
         subreaper()
-        watched = [virt_path, task_path, Path(__file__).resolve(), compiler]
+        watched = [virt_path, task_path, TASK_HEADER, FAMILY_HEADER, Path(__file__).resolve(), compiler]
         before = [pin(path) for path in watched]
         result["virt_source"] = before[0]
-        harness, actual = generate(virt_path.read_text(), task_path.read_text(), virt_path)
+        harness, actual = generate(virt_path.read_text(), task_path.read_text(), virt_path, TASK_HEADER.read_text())
         result["actual_definitions"] = actual
         scratch = Path(tempfile.mkdtemp(prefix="wos-lazy-file-close-", dir="/tmp"))
         result["scratch"] = str(scratch)
         source, binary = scratch / "close.cpp", scratch / "close-test"
+        family = scratch / "include/platform/mm/file_mapping_lifetime.hpp"
+        family.parent.mkdir(parents=True)
+        family.write_bytes(FAMILY_HEADER.read_bytes())
         source.write_text(harness)
         commands = [
             [str(compiler), "-std=c++23", "-O1", "-g0", "-pipe", "-pthread", "-fsanitize=address,undefined",
-             "-fno-omit-frame-pointer", str(source), "-o", str(binary)],
+             "-fno-omit-frame-pointer", "-I", str(scratch / "include"), str(source), "-o", str(binary)],
             [str(binary)],
         ]
         for index, argv in enumerate(commands):

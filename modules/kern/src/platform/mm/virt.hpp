@@ -6,6 +6,7 @@
 #include <platform/acpi/acpi.hpp>
 #include <platform/asm/tlb.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/file_mapping_lifetime.hpp>
 #include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
@@ -35,6 +36,33 @@ struct PageMapBatch {
     uint64_t table_flags{};
     bool dirty{};
 };
+
+class FileMappingInstallerLease {
+   public:
+    FileMappingInstallerLease() = default;
+    ~FileMappingInstallerLease();
+    FileMappingInstallerLease(const FileMappingInstallerLease&) = delete;
+    auto operator=(const FileMappingInstallerLease&) -> FileMappingInstallerLease& = delete;
+    [[nodiscard]] auto acquire(sched::task::Task& task, const sched::task::LazyVmemRange& range, uint64_t address) -> bool;
+    [[nodiscard]] auto binding() const -> file_mapping::FileMappingBinding* { return binding_; }
+
+   private:
+    file_mapping::FileMappingBinding* binding_{};
+    size_t access_gate_{static_cast<size_t>(-1)};
+};
+
+[[nodiscard]] auto attach_unpublished_file_binding(file_mapping::FileMappingBinding*& prepared, PageTable* root, uint64_t start,
+                                                   uint64_t end, uint64_t file_offset) -> bool;
+// Caller owns the unpublished root. Bounded nonwaiting observation of all 256
+// user PML4 slots; upper kernel mappings stay outside the first-native profile.
+[[nodiscard]] auto unpublished_user_root_empty(PageTable* root) -> bool;
+// Ordinary preparation only: the caller owns a stable, exclusively unpublished
+// root and its retirement record. Failure may leave root-owned empty upper
+// tables; no leaf is published. Do not hold publication/lazy/cow/MM guards.
+[[nodiscard]] auto prepare_unpublished_file_mapping_tables(PageTable* root, uint64_t start, uint64_t length, uint64_t owner_pid) -> bool;
+// Caller owns the actual root. Snapshot references must be released outside MM guards.
+[[nodiscard]] auto snapshot_file_mapping_bindings(PageTable* root, file_mapping::FileMappingBinding** output, size_t capacity,
+                                                  size_t& owned_count) -> bool;
 
 struct UserMemoryStats {
     uint64_t virtual_pages;
@@ -72,6 +100,8 @@ struct UserPagePin {
     size_t access_gate_index{static_cast<size_t>(-1)};
     bool require_writable{};
     bool dirty{};
+    file_mapping::FileMappingBinding* file_binding{};  // One exact PIN role.
+    uint64_t root_incarnation{};
 };
 
 // A value snapshot from a live pin; it owns no Task, root or backing lease.
@@ -348,7 +378,8 @@ bool selftest_anonymous_swap_pagein(PageTable* pagemap, vaddr_t vaddr);
 bool selftest_anonymous_swap_is_swapped(PageTable* pagemap, vaddr_t vaddr);
 #endif
 auto install_lazy_file_page_if_current(sched::task::Task* task, const sched::task::LazyVmemRange& range, vaddr_t page_vaddr,
-                                       paddr_t page_paddr, uint64_t page_flags) -> LazyFilePageInstallResult;
+                                       paddr_t page_paddr, uint64_t page_flags,
+                                       file_mapping::FileMappingBinding* expected_binding = nullptr) -> LazyFilePageInstallResult;
 bool ensure_user_page_writable(sched::task::Task* task, vaddr_t vaddr);
 bool ensure_user_page_mapped(sched::task::Task* task, vaddr_t vaddr);
 auto collect_user_memory_stats(PageTable* page_table) -> UserMemoryStats;
@@ -366,10 +397,18 @@ void get_anonymous_swap_stats_snapshot(AnonymousSwapStatsSnapshot& out);
 void register_anonymous_swap_shrinker();
 void start_anonymous_swap_worker();
 auto get_destroy_user_space_stats(uint64_t cpu_no) -> DestroyUserSpaceStats;
+auto prepare_destroy_user_space_budget_state() -> DestroyUserSpaceBudgetState*;
+[[nodiscard]] auto begin_prepared_destroy_user_space(DestroyUserSpaceBudgetState& state, PageTable* pagemap, uint64_t owner_pid,
+                                                     const char* owner_name, const char* reason, bool wait_for_gate = true) -> bool;
 auto create_destroy_user_space_budget_state(PageTable* pagemap, uint64_t owner_pid = 0, const char* owner_name = nullptr,
                                             const char* reason = nullptr) -> DestroyUserSpaceBudgetState*;
 auto destroy_user_space_budgeted(DestroyUserSpaceBudgetState* state, uint32_t max_steps) -> bool;
 void destroy_user_space_budget_state_destroy(DestroyUserSpaceBudgetState* state);
+// Native continuation only: DONE and an actual held root-exclusive gate. Success
+// consumes the walk and original sole root owner without dropping/reacquiring the
+// striped gate, then retires completed-TLB bindings outside that gate. Refusal
+// preserves state. Do not separately destroy the walk or release its root.
+[[nodiscard]] auto finish_destroy_user_space_and_release_pagemap(DestroyUserSpaceBudgetState* state) -> bool;
 
 // Free all user-space pages and page tables in a pagemap
 // Only frees the lower half (user space), keeps kernel mappings intact

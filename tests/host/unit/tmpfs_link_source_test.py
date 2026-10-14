@@ -115,6 +115,24 @@ def test_tmpfs_file_operations_use_canonical_node() -> None:
     write_body = function_body(source, r"auto\s+tmpfs_write\(ker::vfs::File\*\s+f,\s*const\s+void\*\s+buf,\s*size_t\s+count,\s*size_t\s+offset\)\s*->\s+ssize_t", "tmpfs_write")
     close_body = function_body(source, r"auto\s+tmpfs_fops_close\(ker::vfs::File\*\s+f\)\s*->\s+int", "tmpfs_fops_close")
     truncate_body = function_body(source, r"auto\s+tmpfs_fops_truncate\(ker::vfs::File\*\s+f,\s*off_t\s+length\)\s*->\s+int", "tmpfs_fops_truncate")
+    truncate_worker = function_body(
+        source,
+        r"auto\s+tmpfs_truncate_with_allocation\(ker::vfs::File\*\s+f,\s*off_t\s+length,\s*const\s+ResizeDescriptorAllocation&\s+allocation\s*=\s*\{\}\)\s*->\s*int",
+        "tmpfs_truncate_with_allocation",
+    )
+    if truncate_body.strip() != "return tmpfs_truncate_with_allocation(f, length);":
+        fail("public tmpfs truncate must delegate exactly to the canonical allocation worker")
+    require_order(truncate_worker, ["tmpfs_canonical_node(static_cast<TmpNode*>(f->private_data))",
+                                   "n->type != TmpNodeType::FILE", "length < 0",
+                                   "ker::mod::sched::resource::FileGrowth growth", "growth.allow_resize(NEW_SIZE)",
+                                   "ker::mod::sys::MutexGuard guard(n->io_lock)",
+                                   "tmpfs_resize_locked(n, NEW_SIZE, allocation)",
+                                   "if (RET == 0)", "growth.committed(n->size)", "return RET"],
+                  "canonical truncate keeps FileGrowth admission before I/O guard and success-only commit")
+    require(truncate_worker, "if (RET == 0) {\n        growth.committed(n->size);\n    }",
+            "truncate publishes the size observation only after backend success")
+    if truncate_worker.count("growth.committed(") != 1:
+        fail("tmpfs truncate worker must publish exactly one success-only size observation")
 
     require_order(open_lookup, ["MutexGuard guard(tmpfs_lock)", "tmpfs_validate_lookup_locked(handle)",
                                 "TmpNode* node = tmpfs_canonical_node(handle.target())", "authorize_file_open(credentials,",
@@ -128,7 +146,7 @@ def test_tmpfs_file_operations_use_canonical_node() -> None:
         (read_body, "tmpfs read"),
         (write_body, "tmpfs write"),
         (close_body, "tmpfs close"),
-        (truncate_body, "tmpfs truncate"),
+        (truncate_worker, "tmpfs common truncate worker reached by public callback"),
     ]:
         require(body, "tmpfs_canonical_node(static_cast<TmpNode*>(f->private_data))", context)
 

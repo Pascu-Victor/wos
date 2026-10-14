@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstddef>
@@ -63,12 +64,13 @@ struct FrameHold {
     FrameHold(const FrameHold&) = delete;
     auto operator=(const FrameHold&) -> FrameHold& = delete;
     ~FrameHold() { static_cast<void>(reset()); }
-    auto acquire(tmpfs::TmpNode& node) -> bool {
+    auto acquire(tmpfs::TmpNode& node, size_t index = 0) -> bool {
         if (page != nullptr) return false;
         MutexGuard guard(node.io_lock);
-        if (node.page_count == 0 || node.pages[0].state != tmpfs::TmpPageState::RESIDENT || node.pages[0].data == nullptr) return false;
-        if (!phys::page_ref_try_inc(node.pages[0].data)) return false;
-        page = node.pages[0].data;
+        if (index >= node.page_count || node.pages[index].state != tmpfs::TmpPageState::RESIDENT || node.pages[index].data == nullptr)
+            return false;
+        if (!phys::page_ref_try_inc(node.pages[index].data)) return false;
+        page = node.pages[index].data;
         return true;
     }
     auto reset() -> uint32_t {
@@ -107,11 +109,11 @@ struct TmpFile {
     TmpFile(const TmpFile&) = delete;
     auto operator=(const TmpFile&) -> TmpFile& = delete;
     ~TmpFile() { reset(); }
-    auto init() -> bool {
+    auto init(const char* options = "size=4K") -> bool {
         root = tmpfs::create_root_node();
         if (root == nullptr) return false;
         int error = 0;
-        mount = tmpfs::create_mount_context(root, "size=4K", false, &error);
+        mount = tmpfs::create_mount_context(root, options, false, &error);
         if (mount == nullptr || error != 0) return false;
         file = tmpfs::tmpfs_open_path(security::Snapshot::bootstrap_root(), root, "owned-page", vfs::O_CREAT | 2, 0600, &error);
         if (file == nullptr || error != 0) return false;
@@ -217,6 +219,60 @@ struct FaultSwap {
         return true;
     }
 };
+
+struct ResizeSnapshot {
+    NodeSnapshot node{};
+    uintptr_t array_identity{};
+    std::array<tmpfs::TmpPage, 3> pages{};
+    vfs::Timespec mtime{}, ctime{};
+    vfs::coherency::Stamp stamp{};
+    bool stamped{};
+};
+
+auto resize_snapshot(tmpfs::TmpNode& node) -> ResizeSnapshot {
+    MutexGuard guard(node.io_lock);
+    ResizeSnapshot out{};
+    out.node = {.size = node.size, .descriptors = node.page_count, .charged = node.charged_pages, .resident = node.resident_pages};
+    out.array_identity = reinterpret_cast<uintptr_t>(node.pages);
+    for (size_t i = 0; i < std::min(node.page_count, out.pages.size()); ++i) out.pages.at(i) = node.pages[i];
+    out.mtime = node.mtime;
+    out.ctime = node.ctime;
+    out.stamped = node.coherency.snapshot(out.stamp);
+    return out;
+}
+
+void expect_failed_resize_unchanged(const ResizeSnapshot& before, const ResizeSnapshot& after) {
+    KEXPECT_EQ(after.node.size, before.node.size);
+    KEXPECT_EQ(after.node.descriptors, before.node.descriptors);
+    KEXPECT_EQ(after.node.charged, before.node.charged);
+    KEXPECT_EQ(after.node.resident, before.node.resident);
+    KEXPECT_EQ(after.array_identity, before.array_identity);
+    for (size_t i = 0; i < std::min(before.node.descriptors, before.pages.size()); ++i) {
+        auto const& a = before.pages.at(i);
+        auto const& b = after.pages.at(i);
+        KEXPECT_EQ(b.state, a.state);
+        KEXPECT_EQ(b.data, a.data);
+        KEXPECT_EQ(b.swap_slot.area, a.swap_slot.area);
+        KEXPECT_EQ(b.swap_slot.index, a.swap_slot.index);
+        KEXPECT_EQ(b.swap_slot.generation, a.swap_slot.generation);
+    }
+    KEXPECT_EQ(after.mtime.tv_sec, before.mtime.tv_sec);
+    KEXPECT_EQ(after.mtime.tv_nsec, before.mtime.tv_nsec);
+    KEXPECT_EQ(after.ctime.tv_sec, before.ctime.tv_sec);
+    KEXPECT_EQ(after.ctime.tv_nsec, before.ctime.tv_nsec);
+    KEXPECT_TRUE(before.stamped && after.stamped);
+    KEXPECT_EQ(after.stamp.object, before.stamp.object);
+    KEXPECT_EQ(after.stamp.directory, before.stamp.directory);
+    // Existing conservative invalidation can advance on an admitted error.
+    KEXPECT_TRUE(after.stamp.content >= before.stamp.content);
+    KEXPECT_TRUE(after.stamp.metadata >= before.stamp.metadata);
+}
+
+auto resize_pattern() -> std::array<uint8_t, 3 * PAGE> {
+    std::array<uint8_t, 3 * PAGE> bytes{};
+    for (size_t i = 0; i < bytes.size(); ++i) bytes.at(i) = static_cast<uint8_t>(11U + i * 37U);
+    return bytes;
+}
 }  // namespace
 
 KTEST(TmpfsPageOwnership, SparseTailShrinkKeepsRetainedCharge) {
@@ -386,5 +442,136 @@ KTEST(TmpfsPageOwnership, UnlinkedNodeFinalRetirementEndsMutexLifetime) {
         node.reset();
         KEXPECT_EQ(owner.used_bytes(), 0U);
         owner.reset();
+    }
+}
+
+KTEST(TmpfsPageOwnership, ResizeDescriptorOomPreservesResidentBytesAndOwners) {
+    PageBalance balance;
+    FrameHold retained;
+    FrameHold suffix;
+    TmpFile owner;
+    KREQUIRE_TRUE(owner.init("size=16K"));
+    auto const bytes = resize_pattern();
+    KREQUIRE_EQ(tmpfs::tmpfs_write(owner.file, bytes.data(), bytes.size(), 0), static_cast<ssize_t>(bytes.size()));
+    KREQUIRE_TRUE(retained.acquire(*owner.node));
+    KREQUIRE_TRUE(suffix.acquire(*owner.node, 2));
+    auto const before = resize_snapshot(*owner.node);
+    tmpfs::TmpfsResizeDescriptorObservation observation{};
+    KEXPECT_EQ(tmpfs::selftest_tmpfs_truncate_descriptor_oom(*owner.file, 127, observation), -ENOMEM);
+    KEXPECT_TRUE(observation.admitted);
+    KEXPECT_EQ(observation.allocation_attempts, 1U);
+    KEXPECT_EQ(observation.injected_failures, 1U);
+    expect_failed_resize_unchanged(before, resize_snapshot(*owner.node));
+    KEXPECT_EQ(owner.used_bytes(), 3 * PAGE);
+    KEXPECT_EQ(phys::page_ref_get(retained.page), 2U);
+    KEXPECT_EQ(phys::page_ref_get(suffix.page), 2U);
+    std::array<uint8_t, 3 * PAGE> output{};
+    KREQUIRE_EQ(tmpfs::tmpfs_read(owner.file, output.data(), output.size(), 0), static_cast<ssize_t>(output.size()));
+    KEXPECT_TRUE(output == bytes);
+    KREQUIRE_EQ(owner.truncate(127), 0);
+    auto const committed = snapshot(*owner.node);
+    KEXPECT_EQ(committed.size, 127U);
+    KEXPECT_EQ(committed.descriptors, 1U);
+    KEXPECT_EQ(committed.resident, 1U);
+    KEXPECT_EQ(committed.charged, 1U);
+    KEXPECT_EQ(owner.used_bytes(), PAGE);
+    KEXPECT_EQ(phys::page_ref_get(retained.page), 2U);
+    KEXPECT_EQ(phys::page_ref_get(suffix.page), 1U);
+    KEXPECT_TRUE(std::memcmp(suffix.page, bytes.data() + 2 * PAGE, PAGE) == 0);
+    auto* data = static_cast<const uint8_t*>(retained.page);
+    for (size_t i = 0; i < PAGE; ++i) KEXPECT_EQ(data[i], i < 127 ? bytes.at(i) : uint8_t{0});
+    KREQUIRE_EQ(tmpfs::selftest_tmpfs_truncate_descriptor_oom(*owner.file, 63, observation), 0);
+    KEXPECT_EQ(observation.allocation_attempts, 0U);
+    KEXPECT_EQ(observation.injected_failures, 0U);
+    for (size_t i = 0; i < PAGE; ++i) KEXPECT_EQ(data[i], i < 63 ? bytes.at(i) : uint8_t{0});
+}
+
+KTEST(TmpfsPageOwnership, ResizeDescriptorOomPrecedesSwapIoAndRetryKeepsCurrentOwner) {
+    PageBalance balance;
+    FaultSwap swap_owner;
+    KREQUIRE_TRUE(swap_owner.init());
+    FrameHold retained;
+    TmpFile owner;
+    KREQUIRE_TRUE(owner.init("size=16K"));
+    auto const bytes = resize_pattern();
+    KREQUIRE_EQ(tmpfs::tmpfs_write(owner.file, bytes.data(), bytes.size(), 0), static_cast<ssize_t>(bytes.size()));
+    KREQUIRE_EQ(tmpfs::selftest_tmpfs_evict_page(owner.node, 0), 0);
+    auto const before = resize_snapshot(*owner.node);
+    auto const before_swap = swap_stats();
+    swap_owner.device->clear_history();
+    tmpfs::TmpfsResizeDescriptorObservation observation{};
+    KEXPECT_EQ(tmpfs::selftest_tmpfs_truncate_descriptor_oom(*owner.file, 127, observation), -ENOMEM);
+    KEXPECT_TRUE(observation.admitted);
+    KEXPECT_EQ(observation.injected_failures, 1U);
+    expect_failed_resize_unchanged(before, resize_snapshot(*owner.node));
+    KEXPECT_TRUE(same_swap_stats(before_swap, swap_stats()));
+    KEXPECT_EQ(swap_owner.device->event_count(), 0U);
+    KEXPECT_EQ(owner.used_bytes(), 3 * PAGE);
+    KREQUIRE_TRUE(swap_owner.device->fail_read_prefix(1, 7, -EIO));
+    KEXPECT_EQ(owner.truncate(127), -EIO);
+    expect_failed_resize_unchanged(before, resize_snapshot(*owner.node));
+    KEXPECT_TRUE(same_swap_stats(before_swap, swap_stats()));
+    swap_owner.device->clear_fault();
+    KREQUIRE_EQ(owner.truncate(127), 0);
+    auto const committed = snapshot(*owner.node);
+    KEXPECT_EQ(committed.size, 127U);
+    KEXPECT_EQ(committed.descriptors, 1U);
+    KEXPECT_EQ(committed.charged, 1U);
+    KEXPECT_EQ(committed.resident, 1U);
+    KEXPECT_EQ(committed.state, tmpfs::TmpPageState::RESIDENT);
+    KEXPECT_FALSE(swap::slot_valid(committed.slot));
+    KEXPECT_EQ(owner.used_bytes(), PAGE);
+    KEXPECT_EQ(swap_stats().used_bytes, 0U);
+    KEXPECT_EQ(swap_stats().free_bytes, before_swap.free_bytes + PAGE);
+    // A swapped same-page shrink still pages in, but needs no descriptor array
+    // and therefore cannot consume this allocation-only fault control.
+    KREQUIRE_EQ(tmpfs::selftest_tmpfs_evict_page(owner.node, 0), 0);
+    swap_owner.device->clear_history();
+    KREQUIRE_EQ(tmpfs::selftest_tmpfs_truncate_descriptor_oom(*owner.file, 63, observation), 0);
+    KEXPECT_EQ(observation.allocation_attempts, 0U);
+    KEXPECT_EQ(observation.injected_failures, 0U);
+    KEXPECT_EQ(swap_owner.device->operation_count(ker::test::FaultBlockOperation::READ), 1U);
+    KREQUIRE_TRUE(retained.acquire(*owner.node));
+    KEXPECT_EQ(phys::page_ref_get(retained.page), 2U);
+    auto* data = static_cast<const uint8_t*>(retained.page);
+    for (size_t i = 0; i < PAGE; ++i) KEXPECT_EQ(data[i], i < 63 ? bytes.at(i) : uint8_t{0});
+    owner.reset();
+    KEXPECT_EQ(retained.reset(), 0U);
+    KEXPECT_TRUE(swap_owner.reset());
+}
+
+KTEST(TmpfsPageOwnership, SparseGrowthAndNonallocatingResizeKeepScopedFaultLocal) {
+    PageBalance balance;
+    for (bool resident : {false, true}) {
+        TmpFile owner;
+        KREQUIRE_TRUE(owner.init("size=16K"));
+        if (resident) {
+            KREQUIRE_EQ(tmpfs::tmpfs_write(owner.file, CONTENT.data(), CONTENT.size(), 0), static_cast<ssize_t>(CONTENT.size()));
+        }
+        KREQUIRE_EQ(owner.truncate(3 * PAGE), 0);
+        auto const before = resize_snapshot(*owner.node);
+        size_t const charge = owner.used_bytes();
+        tmpfs::TmpfsResizeDescriptorObservation observation{};
+        KEXPECT_EQ(tmpfs::selftest_tmpfs_truncate_descriptor_oom(*owner.file, 127, observation), -ENOMEM);
+        KEXPECT_EQ(observation.allocation_attempts, 1U);
+        expect_failed_resize_unchanged(before, resize_snapshot(*owner.node));
+        KEXPECT_EQ(tmpfs::selftest_tmpfs_truncate_descriptor_oom(*owner.file, 7 * PAGE, observation), -ENOMEM);
+        KEXPECT_EQ(observation.allocation_attempts, 1U);
+        expect_failed_resize_unchanged(before, resize_snapshot(*owner.node));
+        KEXPECT_EQ(owner.used_bytes(), charge);
+        KREQUIRE_EQ(tmpfs::selftest_tmpfs_truncate_descriptor_oom(*owner.file, 3 * PAGE - 1, observation), 0);
+        KEXPECT_TRUE(observation.admitted);
+        KEXPECT_EQ(observation.allocation_attempts, 0U);
+        KEXPECT_EQ(observation.injected_failures, 0U);
+        KEXPECT_EQ(snapshot(*owner.node).size, 3 * PAGE - 1);
+        KEXPECT_EQ(owner.used_bytes(), charge);
+        auto const valid = resize_snapshot(*owner.node);
+        KEXPECT_EQ(tmpfs::selftest_tmpfs_truncate_descriptor_oom(*owner.file, -1, observation), -EINVAL);
+        KEXPECT_EQ(observation.allocation_attempts, 0U);
+        expect_failed_resize_unchanged(valid, resize_snapshot(*owner.node));
+        KREQUIRE_EQ(tmpfs::selftest_tmpfs_truncate_descriptor_oom(*owner.file, 0, observation), 0);
+        KEXPECT_EQ(observation.allocation_attempts, 0U);
+        KEXPECT_EQ(snapshot(*owner.node).descriptors, 0U);
+        KEXPECT_EQ(owner.used_bytes(), 0U);
     }
 }

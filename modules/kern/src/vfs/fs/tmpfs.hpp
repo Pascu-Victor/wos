@@ -196,6 +196,14 @@ auto tmpfs_reclaim_pages(std::size_t target_pages) -> std::size_t;
 #ifdef WOS_SELFTEST
 // Caller keeps the exact canonical node alive; invokes its real eviction path.
 auto selftest_tmpfs_evict_page(TmpNode* owned_node, size_t index) -> int;
+struct TmpfsResizeDescriptorObservation {
+    bool admitted{};
+    uint32_t allocation_attempts{};
+    uint32_t injected_failures{};
+};
+// Caller owns this native File through synchronous return. Injects only its
+// required resize descriptor allocation; all ordinary truncate policy remains.
+auto selftest_tmpfs_truncate_descriptor_oom(File& owned_file, off_t length, TmpfsResizeDescriptorObservation& observation) -> int;
 #endif
 
 // Node operations

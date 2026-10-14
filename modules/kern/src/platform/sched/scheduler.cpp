@@ -33,6 +33,7 @@
 #include <platform/loader/debug_info.hpp>
 #include <platform/loader/gdb_interface.hpp>
 #include <platform/mm/kernel_image.hpp>
+#include <platform/mm/lifetime_retirement_executor.hpp>
 #include <platform/mm/mm.hpp>
 #include <platform/mm/reclaim.hpp>
 #include <platform/mm/virt.hpp>
@@ -565,6 +566,11 @@ uint32_t active_task_count = 0;
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<bool> kernel_thread_shutdown_requested{false};
 
+// One exact retained executor Task; a name or PID never grants exemption.
+std::atomic<task::Task*> file_retirement_executor_task{nullptr};
+void (*file_retirement_executor_entry)(){};
+void* file_retirement_executor_context{};
+
 ker::mod::sys::Spinlock global_task_registry_lock;
 
 // Private entries borrow the physical registry's Task lifetime. Each Task
@@ -621,7 +627,8 @@ inline auto active_task_slot(uint32_t index) -> task::Task*& {
 }
 
 auto is_kernel_thread_shutdown_target(task::Task* task, task::Task* current) -> bool {
-    return task != nullptr && task != current && task->type == task::TaskType::DAEMON &&
+    return task != nullptr && task != current && task != file_retirement_executor_task.load(std::memory_order_acquire) &&
+           task->type == task::TaskType::DAEMON &&
            task->state.load(std::memory_order_acquire) == task::TaskState::ACTIVE && !task->has_exited && task->kthread_entry != nullptr &&
            task->context.syscall_kernel_stack != 0;
 }
@@ -653,6 +660,10 @@ auto active_list_insert(task::Task* t) -> bool {
         return false;
     }
     uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
+    if (t->native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr) {
+        global_task_registry_lock.unlock_irqrestore(FLAGS);
+        return false;
+    }
     if (t->active_registry_index != task::Task::ACTIVE_REGISTRY_INDEX_INVALID) {
         uint32_t const INDEX = t->active_registry_index;
         if (INDEX < active_task_count && active_task_slot(INDEX) == t) {
@@ -717,7 +728,7 @@ inline auto pid_hash(uint64_t pid) -> uint32_t {
 // and do not call back into scheduler/runqueue code while the registry lock is
 // held. Any PID or active-list collision means the task was not fresh.
 auto register_fresh_task_visibility(task::Task* task) -> bool {
-    if (task == nullptr || task->pid == 0) {
+    if (task == nullptr || task->pid == 0 || task->native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr) {
         return false;
     }
 
@@ -727,6 +738,10 @@ auto register_fresh_task_visibility(task::Task* task) -> bool {
     if (!scope->is_host() && (LOCAL_ID == 0 || LOCAL_ID > pid_ns::MAX_LOCAL_ID)) return false;
 
     uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
+    if (task->native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr) {
+        global_task_registry_lock.unlock_irqrestore(FLAGS);
+        return false;
+    }
     if (task->active_registry_index != ::ker::mod::sched::task::Task::ACTIVE_REGISTRY_INDEX_INVALID) [[unlikely]] {
         global_task_registry_lock.unlock_irqrestore(FLAGS);
         dbg::panic_handler("scheduler: fresh task already present in active registry");
@@ -786,6 +801,10 @@ auto register_fresh_task_visibility(task::Task* task) -> bool {
 
 auto pid_table_insert(task::Task* t) -> bool {
     uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
+    if (t == nullptr || t->native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr) {
+        global_task_registry_lock.unlock_irqrestore(FLAGS);
+        return false;
+    }
     uint32_t const SLOT = pid_hash(t->pid);
     for (uint32_t i = 0; i < MAX_PIDS; i++) {
         uint32_t const IDX = (SLOT + i) & (MAX_PIDS - 1);
@@ -3126,6 +3145,11 @@ bool post_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, bool release_rese
         return false;
     }
 
+    if (task->native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr) {
+        release_reservation_if_needed();
+        return false;
+    }
+
     if (run_queues == nullptr || cpu_no >= smt::get_core_count()) {
         log_rejected_task_publication("invalid target cpu", cpu_no, task);
         release_reservation_if_needed();
@@ -3179,7 +3203,8 @@ bool post_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, bool release_rese
     dbg::log("POST: PID %x '%s' -> CPU %d (heapIdx=%d, from CPU %d)", task->pid, (task->name != nullptr) ? task->name : "?",
              static_cast<int>(cpu_no), task->heap_index, static_cast<int>(cpu::current_cpu()));
 #endif
-    if (task->type == task::TaskType::DAEMON && kernel_threads_shutdown_requested()) {
+    if (task->type == task::TaskType::DAEMON && kernel_threads_shutdown_requested() &&
+        task != file_retirement_executor_task.load(std::memory_order_acquire)) {
         task->kernel_shutdown_requested.store(true, std::memory_order_release);
     }
     task->store_cpu(cpu_no);
@@ -3828,12 +3853,14 @@ auto post_task(task::Task* task) -> bool { return post_task_for_cpu_impl(cpu::cu
 bool post_task_for_cpu(uint64_t cpu_no, task::Task* task) { return post_task_for_cpu_impl(cpu_no, task, false); }
 
 auto post_task_pinned_cpu(uint64_t cpu_no, task::Task* task) -> bool {
+    if (task == nullptr || task->native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr) return false;
     task->store_cpu_pinned(true);
     return post_task_for_cpu(cpu_no, task);
 }
 
 auto post_task_waiting(task::Task* task) -> bool {
-    if (task == nullptr || run_queues == nullptr || task->pid == 0 || task->sched_queue != task::Task::sched_queue::NONE ||
+    if (task == nullptr || task->native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr ||
+        run_queues == nullptr || task->pid == 0 || task->sched_queue != task::Task::sched_queue::NONE ||
         task->heap_index >= 0 || task->sched_next != nullptr || task == get_current_task()) {
         return false;
     }
@@ -3908,6 +3935,7 @@ auto post_task_balanced(task::Task* task) -> bool {
         log_rejected_task_publication("null balanced task", cpu::current_cpu(), task);
         return false;
     }
+    if (task->native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr) return false;
 
     // D17: Try remote placement if WKI is active and task is a user process
     if (wki_try_remote_placement_fn != nullptr && task->type == task::TaskType::PROCESS) {
@@ -4678,6 +4706,60 @@ void kern_wake(task::Task* task) {
 
 auto kernel_threads_shutdown_requested() -> bool { return kernel_thread_shutdown_requested.load(std::memory_order_acquire); }
 
+auto FileRetirementSchedulerPort::install(task::Task& worker, void (*entry)(), void* context) noexcept -> bool {
+    uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
+    bool const FRESH = !kernel_thread_shutdown_requested.load(std::memory_order_acquire) &&
+        file_retirement_executor_task.load(std::memory_order_acquire) == nullptr && entry != nullptr && context != nullptr &&
+        worker.type == task::TaskType::DAEMON && worker.state.load(std::memory_order_acquire) == task::TaskState::ACTIVE &&
+        !worker.has_exited && !worker.exit_in_progress && !worker.scheduler_published.load(std::memory_order_acquire) &&
+        worker.active_registry_index == task::Task::ACTIVE_REGISTRY_INDEX_INVALID &&
+        worker.sched_list_owner.load(std::memory_order_acquire) == nullptr &&
+        worker.sched_queue == task::Task::sched_queue::NONE && worker.heap_index == -1 && worker.pid != 0 &&
+        worker.pagemap == mm::virt::get_kernel_pagemap() && worker.context.syscall_kernel_stack != 0 &&
+        worker.kthread_entry == entry && worker.kernel_thread_context == context &&
+        !worker.kernel_shutdown_requested.load(std::memory_order_acquire) &&
+        (!can_query_current_task() || get_current_task() != &worker);
+    bool acquired = false;
+    if (FRESH) {
+        uint32_t refs = worker.ref_count.load(std::memory_order_acquire);
+        while (refs != 0 && refs != UINT32_MAX) {
+            if (worker.ref_count.compare_exchange_weak(refs, refs + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                acquired = true;
+                break;
+            }
+        }
+    }
+    if (acquired) {
+        file_retirement_executor_entry = entry;
+        file_retirement_executor_context = context;
+        file_retirement_executor_task.store(&worker, std::memory_order_release);
+    }
+    global_task_registry_lock.unlock_irqrestore(FLAGS);
+    return acquired;
+}
+
+auto FileRetirementSchedulerPort::remove(task::Task& worker) noexcept -> bool {
+    uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
+    bool const UNPOSTED = !worker.scheduler_published.load(std::memory_order_acquire) &&
+        worker.state.load(std::memory_order_acquire) == task::TaskState::ACTIVE &&
+        worker.active_registry_index == task::Task::ACTIVE_REGISTRY_INDEX_INVALID &&
+        worker.sched_queue == task::Task::sched_queue::NONE && worker.heap_index == -1 &&
+        worker.sched_list_owner.load(std::memory_order_acquire) == nullptr;
+    bool const FINISHED = worker.state.load(std::memory_order_acquire) == task::TaskState::DEAD &&
+        worker.kernel_thread_context == nullptr;
+    bool const REMOVE = file_retirement_executor_task.load(std::memory_order_acquire) == &worker &&
+        worker.kthread_entry == file_retirement_executor_entry &&
+        ((UNPOSTED && worker.kernel_thread_context == file_retirement_executor_context) || FINISHED);
+    if (REMOVE) {
+        file_retirement_executor_task.store(nullptr, std::memory_order_release);
+        file_retirement_executor_entry = nullptr;
+        file_retirement_executor_context = nullptr;
+    }
+    global_task_registry_lock.unlock_irqrestore(FLAGS);
+    if (REMOVE) worker.release();  // Exact scheduler lease, outside the registry gate.
+    return REMOVE;
+}
+
 auto hold_kernel_shutdown() -> KernelShutdownHold {
     auto* owner = can_query_current_task() ? get_current_task() : nullptr;
     return KernelShutdownHold(owner != nullptr ? &owner->kernel_shutdown_ownership : nullptr);
@@ -4696,7 +4778,8 @@ void maybe_exit_current_kernel_thread_for_shutdown() {
     }
 
     auto* task = get_current_task();
-    if (task == nullptr || task->type != task::TaskType::DAEMON || task->exit_in_progress ||
+    if (task == nullptr || task == file_retirement_executor_task.load(std::memory_order_acquire) ||
+        task->type != task::TaskType::DAEMON || task->exit_in_progress ||
         !task->kernel_shutdown_requested.load(std::memory_order_acquire)) {
         return;
     }
@@ -4789,7 +4872,9 @@ void wake_kernel_thread_for_shutdown(task::Task* task) {
 }  // namespace
 
 auto request_kernel_threads_shutdown(uint64_t timeout_us) -> KernelThreadShutdownResult {
+    uint64_t const SHUTDOWN_FLAGS = global_task_registry_lock.lock_irqsave();
     kernel_thread_shutdown_requested.store(true, std::memory_order_release);
+    global_task_registry_lock.unlock_irqrestore(SHUTDOWN_FLAGS);
 
     auto* current = get_current_task();
     bool const WAKE_TARGETS = timeout_us != 0;
@@ -8333,6 +8418,21 @@ void scheduler_gc_thread_main() {
             pagemap_step_budget = SCHED_GC_DEFERRED_PAGEMAP_STEP_BUDGET;
         }
 
+        bool native_pending = false;
+        bool native_root_active = false;
+        {
+            // Real Task retirement may yield through provider teardown. Keep
+            // it outside this worker's exclusive allocator-reclaim domain.
+            auto const SHUTDOWN_HOLD = hold_kernel_shutdown();
+            native_pending = task::process_native_unpublished_retirements_slice(native_root_active);
+        }
+        if (native_root_active) {
+            // Defensively exclude ordinary teardown while a native record
+            // reports an active root gate. Normal native polls release it.
+            scheduler_gc_requested.store(true, std::memory_order_release);
+            kern_yield();
+            continue;
+        }
         GcPassResult const PASS = run_gc_reclaim_pass_exclusive(reclaim_budget, work_budget_us, pagemap_step_budget);
         if (!PASS.ran) {
             scheduler_gc_requested.store(true, std::memory_order_release);
@@ -8343,7 +8443,7 @@ void scheduler_gc_thread_main() {
         if (PRESSURE_RECLAIM && PASS.has_pending_work) {
             scheduler_gc_memory_pressure_requested.store(true, std::memory_order_release);
         }
-        if (gc_pass_needs_followup(PASS, reclaim_budget)) {
+        if (native_pending || gc_pass_needs_followup(PASS, reclaim_budget)) {
             scheduler_gc_requested.store(true, std::memory_order_release);
             kern_yield();
         }
@@ -8351,6 +8451,12 @@ void scheduler_gc_thread_main() {
 }
 
 }  // namespace
+
+auto is_current_gc_worker() -> bool {
+    auto* const CURRENT = can_query_current_task() ? get_current_task() : nullptr;
+    return CURRENT != nullptr && CURRENT == scheduler_gc_task.load(std::memory_order_acquire) &&
+           CURRENT->kthread_entry == scheduler_gc_thread_main;
+}
 
 void request_gc() {
     scheduler_gc_requested.store(true, std::memory_order_release);

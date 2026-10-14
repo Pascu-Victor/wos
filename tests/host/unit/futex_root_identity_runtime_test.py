@@ -230,7 +230,7 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
     write("fixture-common.hpp",common)
     vh=(KERN/"platform/mm/virt.hpp").read_text()
     declarations='\n'.join(definition(vh,a,True) for a in ["struct UserPagePin {","struct UserFutexIdentity {","struct UserRootControlStats {"])
-    write("platform/mm/virt.hpp",'#pragma once\n#include "fixture-common.hpp"\nnamespace ker::mod::sched::task {struct Task;}\nnamespace ker::mod::mm::virt { using PageTable=paging::PageTable; using PageTableEntry=paging::PageTableEntry; inline constexpr paddr_t PADDR_INVALID=UINT64_MAX;\n'+declarations+'''
+    write("platform/mm/virt.hpp",'#pragma once\n#include "fixture-common.hpp"\n#include <platform/mm/file_mapping_lifetime.hpp>\nnamespace ker::mod::sched::task {struct Task;}\nnamespace ker::mod::mm::virt { using PageTable=paging::PageTable; using PageTableEntry=paging::PageTableEntry; inline constexpr paddr_t PADDR_INVALID=UINT64_MAX;\n'+declarations+'''
     auto pin_user_page(PageTable*,vaddr_t,bool,UserPagePin&,bool) -> bool;
     auto pin_user_page_for_task(sched::task::Task*,PageTable*,vaddr_t,bool,bool,UserPagePin&) -> bool;
     auto user_page_pin_still_mapped(const UserPagePin&) -> bool;
@@ -244,7 +244,7 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
     write("platform/sched/task.hpp",TASK);write("platform/sched/scheduler.hpp",SCHEDULER)
     for name in ["platform/sys/spinlock.hpp","platform/mm/phys.hpp"]:write(name,'#pragma once\n#include "fixture-common.hpp"\n')
     write("platform/asm/cpu.hpp","#pragma once\n");write("platform/mm/dyn/kmalloc.hpp","#pragma once\n");write("platform/ktime/ktime.hpp",'#pragma once\n#include "fixture-common.hpp"\nnamespace ker::mod::time{inline uint64_t get_us(){return fixture::now_us;}}\n')
-    for name in ["platform/sys/usercopy.hpp","util/hashtable.hpp","abi/callnums/futex.h","syscalls_impl/futex/futex.hpp"]:
+    for name in ["platform/sys/usercopy.hpp","platform/mm/file_mapping_lifetime.hpp","util/hashtable.hpp","abi/callnums/futex.h","syscalls_impl/futex/futex.hpp"]:
         data=(KERN/name).read_bytes();write(name,data.decode());actual.append({"name":"whole-"+name,"bytes":len(data),"sha256":hashlib.sha256(data).hexdigest()})
     (scratch/"futex.hpp").write_bytes((KERN/"syscalls_impl/futex/futex.hpp").read_bytes());(scratch/"actual-futex.cpp").write_bytes(selected.read_bytes())
     actual.append({"name":"whole-selected-futex.cpp",**pin(selected)})
@@ -254,9 +254,23 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
     pool_globals=span(source,'constexpr size_t PAGE_TABLE_POOL_CAPACITY','constexpr size_t OWNED_FRAME_TABLE_CAPACITY','whole-page-table-pool-declarations-and-globals')
     private_anchors=['[[nodiscard]] auto user_pagemap_access_gate_index','void service_user_pagemap_gate_wait','[[nodiscard]] auto acquire_user_pagemap_access','void release_user_pagemap_access','[[nodiscard]] auto begin_user_pagemap_exclusive','void end_user_pagemap_exclusive','class UserPagemapExclusiveScope {','void zero_page_table_for_pool','auto try_alloc_page_table_from_pool','auto try_release_page_table_to_pool','auto alloc_zeroed_page_table','auto user_root_control_bucket','auto find_user_root_control_locked','auto next_user_root_serial','enum class UserRootAttachResult','auto attach_user_root_control_locked','auto allocate_user_root_control_chunk','void release_unregistered_user_root','auto create_user_root_common','auto retire_user_root_control_locked','auto pte_raw(const paging::PageTableEntry& e)','auto index_of(','auto entry_at(PageTable*','auto entry_at(const PageTable*','auto snapshot_user_page_mapping_locked','auto try_pin_current_user_page_mapping','auto pin_user_page_common']
     private='\n'.join(definition(source,a,a.startswith(('class ','enum '))) for a in private_anchors)
+    private+='\n'+definition(source,'void release_pagemap_exclusive_owned(')
+    # No native file bindings are installed by these root/futex vectors. Compile
+    # the actual empty-index paths and their complete checked binding-owner
+    # dependencies; never replace the production index with permissive stubs.
+    core=(KERN/"platform/mm/file_mapping_lifetime.cpp").read_text()
+    owner_helpers=span(core,'constinit sys::Spinlock owner_count_lock{};',
+                       'template <typename Counts, typename Role>\nauto reclassify_owner',
+                       'actual-permanent-owner-guard-and-checked-acquire-release-templates')
+    core_anchors=['auto FileMappingBinding::try_acquire(', 'void FileMappingBinding::release(',
+                  'auto FileMappingIndex::bucket(', 'auto FileMappingIndex::root_matches_locked(',
+                  'auto FileMappingIndex::find_locked(', 'auto FileMappingIndex::root_empty_locked(',
+                  'auto FileMappingIndex::retain_for_pin_locked(', 'auto FileMappingIndex::matches_pin_locked(']
+    core_bodies='\n'.join(definition(core,a) for a in core_anchors)
+    core_unit='#include <platform/mm/file_mapping_lifetime.hpp>\nnamespace ker::mod::mm::file_mapping { namespace {\n'+owner_helpers+'\n}\n'+core_bodies+'\n}\n'
     public_anchors=['auto create_pagemap()','auto create_pagemap_may_fail()','void release_pagemap(','void get_user_root_control_stats_snapshot','auto selftest_user_root_incarnation(','auto pin_user_page(','auto pin_user_page_for_task(','auto user_page_pin_still_mapped(','auto capture_user_futex_identity(','auto user_futex_identity_still_mapped(','void unpin_user_page(']
     public='\n'.join(definition(source,a) for a in public_anchors)
-    mm='#include "fixture-common.hpp"\n#include <platform/mm/virt.hpp>\n#include <platform/sched/scheduler.hpp>\nnamespace ker::mod::mm::virt { namespace {\nusing log=HostLog; using namespace paging; PageTable* kernel_pagemap{}; sys::Spinlock user_mapping_pin_lock;\ninline uint64_t fake_cr3{}; inline uint64_t rdcr3(){return fake_cr3;} inline void wrcr3(uint64_t x){fake_cr3=x;} inline bool is_current_pagemap(PageTable*){return false;} inline void service_pending_tlb_shootdowns(){} inline void owned_frame_purge_pagemap(PageTable*){}\n'+root_globals+gate_globals+pool_globals+private+'\n}\n'+public+'\n}\n'
+    mm='#include "fixture-common.hpp"\n#include <platform/mm/virt.hpp>\n#include <platform/sched/scheduler.hpp>\n'+core_unit+'\nnamespace ker::mod::mm::virt { namespace {\nusing log=HostLog; using namespace paging; PageTable* kernel_pagemap{}; sys::Spinlock user_mapping_pin_lock; file_mapping::FileMappingIndex file_mapping_index;\ninline uint64_t fake_cr3{}; inline uint64_t rdcr3(){return fake_cr3;} inline void wrcr3(uint64_t x){fake_cr3=x;} inline bool is_current_pagemap(PageTable*){return false;} inline void service_pending_tlb_shootdowns(){} inline void owned_frame_purge_pagemap(PageTable*){}\n'+root_globals+gate_globals+pool_globals+private+'\n}\n'+public+'\n}\n'
     (scratch/"actual-mm.cpp").write_text(mm)
     user=(KERN/"platform/sys/usercopy.cpp").read_text()
     user_anchors=["UserPageFrameRef::~UserPageFrameRef()","UserPageFrameRef::UserPageFrameRef(UserPageFrameRef&&","UserPageFrameRef::operator=(UserPageFrameRef&&","UserPageFrameRef::valid()","UserPageFrameRef::reset()","StableUserPage::~StableUserPage()","StableUserPage::valid()","StableUserPage::kernel_address()","StableUserPage::physical_address()","StableUserPage::was_dirty()","StableUserPage::still_mapped()","StableUserPage::commit_write()","StableUserPage::retain_frame(UserPageFrameRef&","StableUserPage::capture_futex_identity(","StableUserPage::futex_identity_still_mapped(","StableUserPage::reset()","auto pin_task_user_page(","auto range_valid("]
@@ -291,7 +305,8 @@ def main() -> int:
         watched = [selected, Path(__file__).resolve(), compiler, *[KERN / name for name in
                    ["platform/sys/usercopy.hpp", "platform/sys/usercopy.cpp", "platform/mm/phys.hpp",
                     "platform/mm/phys.opt.cpp", "platform/mm/page_alloc.hpp", "platform/mm/paging.hpp",
-                    "platform/mm/virt.hpp", "platform/mm/virt.opt.cpp", "util/hashtable.hpp",
+                    "platform/mm/virt.hpp", "platform/mm/virt.opt.cpp", "platform/mm/file_mapping_lifetime.hpp",
+                    "platform/mm/file_mapping_lifetime.cpp", "util/hashtable.hpp",
                     "abi/callnums/futex.h", "syscalls_impl/futex/futex.hpp"]]]
         before = [pin(p) for p in watched]
         result["input_pins"] = before

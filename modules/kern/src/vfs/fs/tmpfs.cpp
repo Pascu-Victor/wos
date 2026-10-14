@@ -748,7 +748,24 @@ auto tmpfs_write_locked(TmpNode* n, const void* buf, size_t count, size_t offset
     return static_cast<ssize_t>(total_written);
 }
 
-auto tmpfs_resize_locked(TmpNode* n, size_t new_size) -> int {
+struct ResizeDescriptorAllocation {
+#ifdef WOS_SELFTEST
+    TmpfsResizeDescriptorObservation* observation{};
+#endif
+
+    auto allocate(size_t count) const -> TmpPage* {
+#ifdef WOS_SELFTEST
+        if (observation != nullptr) {
+            observation->allocation_attempts++;
+            observation->injected_failures++;
+            return nullptr;
+        }
+#endif
+        return new (std::nothrow) TmpPage[count];
+    }
+};
+
+auto tmpfs_resize_locked(TmpNode* n, size_t new_size, const ResizeDescriptorAllocation& allocation = {}) -> int {
     if (n == nullptr) {
         return -EINVAL;
     }
@@ -760,12 +777,21 @@ auto tmpfs_resize_locked(TmpNode* n, size_t new_size) -> int {
 
     coherency::Publication publication(n->coherency, coherency::Domain::CONTENT);
 
+    // Keep old bytes and ownership intact if replacement metadata cannot be
+    // prepared. These fresh holes own no frames or swap slots yet.
+    TmpPage* prepared = nullptr;
+    if (new_pages != 0 && new_pages != n->page_count) {
+        prepared = allocation.allocate(new_pages);
+        if (prepared == nullptr) return -ENOMEM;
+    }
+
     if (new_size < n->size && new_pages != 0 && (new_size % DEFAULT_TMPFS_BLOCK_SIZE) != 0 && new_pages <= n->page_count) {
         TmpPage& existing_tail = n->pages[new_pages - 1];
         if (existing_tail.state != TmpPageState::HOLE) {
             TmpPage* tail = nullptr;
             int const RET = ensure_page_resident_locked(n, new_pages - 1, &tail);
             if (RET < 0) {
+                delete[] prepared;
                 return RET;
             }
             size_t const TAIL_OFF = new_size % DEFAULT_TMPFS_BLOCK_SIZE;
@@ -782,18 +808,16 @@ auto tmpfs_resize_locked(TmpNode* n, size_t new_size) -> int {
             n->pages = nullptr;
             n->page_count = 0;
         } else {
-            auto* pages = new TmpPage[new_pages];
-            if (pages == nullptr) {
-                return -ENOMEM;
-            }
+            // Page-in can replace the retained tail's Slot with a frame.
+            // Copy only its current owner state after that succeeds.
             for (size_t i = 0; i < std::min(new_pages, n->page_count); ++i) {
-                pages[i] = n->pages[i];
+                prepared[i] = n->pages[i];
             }
             for (size_t i = new_pages; i < n->page_count; ++i) {
                 release_page_locked(n, n->pages[i], true);
             }
             delete[] n->pages;
-            n->pages = pages;
+            n->pages = prepared;
             n->page_count = new_pages;
         }
     }
@@ -2815,7 +2839,7 @@ auto tmpfs_fops_readlink(ker::vfs::File* f, char* buf, size_t bufsize) -> ssize_
 
 // --- FileOperations instance ---
 
-auto tmpfs_fops_truncate(ker::vfs::File* f, off_t length) -> int {
+auto tmpfs_truncate_with_allocation(ker::vfs::File* f, off_t length, const ResizeDescriptorAllocation& allocation = {}) -> int {
     if (f != nullptr && (static_cast<unsigned>(f->open_flags) & 3U) == FILE_ACCESS_SEARCH_ONLY) return -EBADF;
     if (f == nullptr || f->private_data == nullptr) {
         return -EBADF;
@@ -2836,12 +2860,14 @@ auto tmpfs_fops_truncate(ker::vfs::File* f, off_t length) -> int {
         return -EFBIG;
     }
     ker::mod::sys::MutexGuard guard(n->io_lock);
-    int const RET = tmpfs_resize_locked(n, NEW_SIZE);
+    int const RET = tmpfs_resize_locked(n, NEW_SIZE, allocation);
     if (RET == 0) {
         growth.committed(n->size);
     }
     return RET;
 }
+
+auto tmpfs_fops_truncate(ker::vfs::File* f, off_t length) -> int { return tmpfs_truncate_with_allocation(f, length); }
 
 ker::vfs::FileOperations tmpfs_fops_instance = {
     .vfs_open = nullptr,
@@ -2860,6 +2886,15 @@ ker::vfs::FileOperations tmpfs_fops_instance = {
 }  // namespace
 
 auto get_tmpfs_fops() -> ker::vfs::FileOperations* { return &tmpfs_fops_instance; }
+
+#ifdef WOS_SELFTEST
+auto selftest_tmpfs_truncate_descriptor_oom(File& owned_file, off_t length, TmpfsResizeDescriptorObservation& observation) -> int {
+    observation = {};
+    if (owned_file.fops != get_tmpfs_fops() || owned_file.fs_type != FSType::TMPFS || owned_file.private_data == nullptr) return -EINVAL;
+    observation.admitted = true;
+    return tmpfs_truncate_with_allocation(&owned_file, length, ResizeDescriptorAllocation{.observation = &observation});
+}
+#endif
 
 auto tmpfs_readdir_file_native(File* file, DirEntry* out, size_t index) -> int {
     if (file == nullptr || out == nullptr || file->fops != get_tmpfs_fops()) return -EINVAL;

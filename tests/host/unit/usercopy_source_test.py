@@ -237,10 +237,53 @@ def require_mapping_stable_pin_contract() -> None:
         "begin_user_pagemap_exclusive(pagemap)",
         "while (gate.readers.load(std::memory_order_acquire) != 0)",
         "UserPagemapExclusiveScope teardown_scope(pagemap)",
-        "state->access_gate_index = begin_user_pagemap_exclusive(pagemap)",
     ]:
         if snippet not in virt_cpp:
             fail(f"shared pagemap usercopy lifetime gate is missing: {snippet}")
+
+    prepared_begin = function_body(virt_cpp, "begin_prepared_destroy_user_space")
+    begin_tokens = [
+        "state.pagemap != nullptr", "state.access_gate_index != USER_PAGEMAP_ACCESS_GATE_NONE",
+        "wait_for_gate ? begin_user_pagemap_exclusive(pagemap) : try_begin_user_pagemap_exclusive(pagemap)",
+        "if (GATE == USER_PAGEMAP_ACCESS_GATE_NONE) return false;", "state.access_gate_index = GATE;",
+        "state.page_table_frames.allow_growth = wait_for_gate;", "state.pagemap = pagemap;",
+    ]
+    if any(token not in prepared_begin for token in begin_tokens):
+        fail("prepared teardown must preserve its exact acquired gate and refuse before state mutation")
+    if not (prepared_begin.index(begin_tokens[2]) < prepared_begin.index(begin_tokens[3])
+            < prepared_begin.index(begin_tokens[4]) < prepared_begin.index(begin_tokens[-1])):
+        fail("failed native nonwaiting teardown must leave the prepared state unstarted")
+    if "bool wait_for_gate = true" not in virt_hpp:
+        fail("ordinary budgeted teardown must preserve its default waiting gate")
+    finish = function_body(virt_cpp, "finish_destroy_user_space_and_release_pagemap")
+    finish_tokens = ["state->phase != DestroyUserSpacePhase::DONE",
+                     "state->access_gate_index != user_pagemap_access_gate_index(state->pagemap)",
+                     "release_pagemap_exclusive_owned(state->pagemap, state->owner_pid, __builtin_return_address(0));",
+                     "end_user_pagemap_exclusive(state->access_gate_index);",
+                     "state->file_retirement.release_after_completed_tlb();", "delete state;"]
+    if any(token not in finish for token in finish_tokens) or not (
+            finish.index(finish_tokens[2]) < finish.index(finish_tokens[3])
+            < finish.index(finish_tokens[4]) < finish.index(finish_tokens[5])):
+        fail("native final root release must retain the same gate, then release TLB binding owners outside it")
+
+    for snippet in ["find_user_root_control_locked(pagemap)", "control->serial",
+                    "file_mapping_index.retain_for_pin_locked(pagemap, root_incarnation, vaddr, binding)",
+                    "pinned = RESULT != file_mapping::FileMappingPinResult::REFUSE;",
+                    ".file_binding = binding", ".root_incarnation = root_incarnation"]:
+        if snippet not in pin_attempt:
+            fail(f"VM pin must retain its exact native association and root incarnation: {snippet}")
+    revalidate = function_body(virt_cpp, "user_page_pin_still_mapped")
+    for snippet in ["current_page == pin.physical_page", "SERIAL == pin.root_incarnation",
+                    "file_mapping_index.matches_pin_locked(pin.pagemap, SERIAL, pin.user_page, pin.file_binding)"]:
+        if snippet not in revalidate:
+            fail(f"VM pin revalidation must preserve frame/root/binding identity: {snippet}")
+    unpin = function_body(virt_cpp, "unpin_user_page")
+    if not (unpin.index("phys::page_ref_dec(PAGE, &lookup_hint);")
+            < unpin.index("release_user_pagemap_access(ACCESS_GATE_INDEX);")
+            < unpin.index("binding->release(file_mapping::BindingOwner::PIN)")):
+        fail("final binding release must follow frame/root-reader release outside the mapping lock")
+    if "user_mapping_pin_lock.lock_irqsave()" in unpin:
+        fail("unpin must not run a final binding release under the mapping lock")
 
     for name, mutation in [
         ("map_page", "entry = paging::create_page_table_entry"),

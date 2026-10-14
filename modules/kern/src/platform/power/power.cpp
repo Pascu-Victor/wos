@@ -16,6 +16,7 @@
 #include <platform/acpi/power.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
+#include <platform/mm/lifetime_retirement_executor.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/security/compartment_host.hpp>
@@ -83,6 +84,31 @@ void quiesce_kernel_threads(uint64_t timeout_us) {
     if (RESULT.remaining != 0) {
         log::warn("shutdown continuing with %lu kernel threads still active", static_cast<unsigned long>(RESULT.remaining));
     }
+}
+
+auto drain_file_retirement_before_provider_stop() -> int {
+    using mm::file_mapping::LifetimeRetirementExecutor;
+    auto const BEFORE = LifetimeRetirementExecutor::snapshot();
+    if (!BEFORE.initialized) return 0;  // Existing pre-scheduler diagnostic path.
+    bool const ROOTS_DRAINED = sched::task::close_native_file_mapping_admission();
+    LifetimeRetirementExecutor::close_new_reservations();
+    // Native publication is closed. Its exact unpublished owner must finish
+    // root/producer retirement before shutdown may stop the required services.
+    // Refusal preserves every existing queue/Task/provider owner for a retry.
+    if (!ROOTS_DRAINED || LifetimeRetirementExecutor::snapshot().outstanding != 0 || sched::task::native_unpublished_retirements_pending())
+        return -EBUSY;
+    auto* current = sched::can_query_current_task() ? sched::get_current_task() : nullptr;
+    if (current == nullptr || sched::preempt_count() != 0 || current->scheduler_transition_active.load(std::memory_order_acquire) ||
+        current->deferred_task_switch || current->wants_block)
+        return -EWOULDBLOCK;
+    bool const IRQ_ENABLED = sched::interrupts_enabled();
+    if (!IRQ_ENABLED) asm volatile("sti" ::: "memory");
+    auto const DRAIN = LifetimeRetirementExecutor::finish_shutdown(100'000);
+    if (!IRQ_ENABLED) asm volatile("cli" ::: "memory");
+    if (!DRAIN.joined) return DRAIN.result == -ETIMEDOUT || DRAIN.result == -EAGAIN ? -EBUSY : DRAIN.result;
+    if (DRAIN.snapshot.protocol_errors != 0) return -EPROTO;
+    if (DRAIN.result != 0) log::warn("file retirement completed with destructive close result %d", DRAIN.result);
+    return 0;
 }
 
 void clear_current_finalizer_sched_state() {
@@ -176,6 +202,8 @@ void io_delay_loop() {
 }
 
 [[noreturn]] void run_finalizer(ShutdownAction action) {
+    if (drain_file_retirement_before_provider_stop() != 0)
+        dbg::panic_handler("shutdown finalizer entered before native File retirement completed");
     g_phase.store(ShutdownPhase::FINALIZING, std::memory_order_release);
     log::info("system shutdown finalizer starting action=%lu", static_cast<unsigned long>(action));
 
@@ -259,6 +287,8 @@ auto prepare_shutdown(sched::task::Task* subject) -> int {
     if (AUTHORITY_RET != 0) {
         return AUTHORITY_RET;
     }
+    int const FILE_DRAIN = drain_file_retirement_before_provider_stop();
+    if (FILE_DRAIN != 0) return FILE_DRAIN;
 
     ShutdownPhase phase = g_phase.load(std::memory_order_acquire);
     for (;;) {
@@ -304,6 +334,8 @@ auto begin_reboot_command(sched::task::Task* subject, uint64_t cmd, bool current
         CURRENT->scheduler_transition_active.load(std::memory_order_acquire) || CURRENT->deferred_task_switch || CURRENT->wants_block) {
         return -EWOULDBLOCK;
     }
+    int const FILE_DRAIN = drain_file_retirement_before_provider_stop();
+    if (FILE_DRAIN != 0) return FILE_DRAIN;
 
     ShutdownPhase phase = g_phase.load(std::memory_order_acquire);
     for (;;) {

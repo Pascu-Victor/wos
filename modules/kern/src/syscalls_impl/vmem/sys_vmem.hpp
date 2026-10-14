@@ -62,6 +62,17 @@ auto clone_file_mmap_ranges_for_pagemap_locked(ker::mod::mm::paging::PageTable* 
 // completed usercopy quiescence before teardown starts.
 void release_file_mmap_ranges_for_pagemap(ker::mod::mm::paging::PageTable* pagemap);
 
+// Internal first native transaction: exact caller-owned unpublished process,
+// private mapping only. No public mmap/loader/exec/fork admission is implied.
+// Even preparation failure can leave a stable observed cleanup continuation;
+// destroy the child through its ordinary unpublished cleanup protocol.
+[[nodiscard]] auto prepare_unpublished_file_mapping(ker::mod::sched::task::Task& owner, ker::mod::sched::task::Task& child,
+                                                    ker::vfs::File& file, uint64_t address, uint64_t length, uint64_t offset, uint64_t prot)
+    -> int;
+// Enumerates actual lazy/registry/index holders. Unknown owners refuse before
+// Task mutation; exact typed totals are checked only against that enumeration.
+[[nodiscard]] auto validate_native_unpublished_mapping_owners(ker::mod::sched::task::Task& task) -> bool;
+
 #ifdef WOS_SELFTEST
 struct SelftestFileCacheObservation {
     void* retained_frame{};  // Caller owns one actual frame ref on a hit.

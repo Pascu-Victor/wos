@@ -206,8 +206,8 @@ def test_raw_translation_exceptions_are_only_unpublished_images() -> None:
 
     vmem_source = translation_files[str(VMEM_CPP.relative_to(ROOT))]
     table_from_entry = function_body(vmem_source, "auto table_from_entry(")
-    # Only these two named private-root native helpers are exempted. Production
-    # and every other native helper keep the page-table-only closed world.
+    # Two named private-root native fixtures and the bounded vacancy observation
+    # of the explicitly unpublished producer are the only additional sites.
     start = vmem_source.find("auto selftest_file_mapping_admission(")
     if start < 0 or vmem_source.rfind("#ifdef WOS_SELFTEST", 0, start) <= vmem_source.rfind("#endif", 0, start):
         fail("VMEM named fixture must remain inside WOS_SELFTEST")
@@ -223,10 +223,45 @@ def test_raw_translation_exceptions_are_only_unpublished_images() -> None:
     projection_end = find_matching_brace(remaining, projection_brace) + 1
     projection = remaining[projection_brace + 1 : projection_end - 1]
     remaining = remaining[:projection_start] + remaining[projection_end:]
+    producer_start = remaining.find("auto prepare_unpublished_file_mapping(")
+    if producer_start < 0:
+        fail("VMEM unpublished mapping producer must remain explicitly named")
+    producer_brace = remaining.find("{", producer_start)
+    producer_end = find_matching_brace(remaining, producer_brace) + 1
+    producer = remaining[producer_brace + 1 : producer_end - 1]
+    remaining = remaining[:producer_start] + remaining[producer_end:]
     if (fixture.count("virt::translate(pagemap, BASE)") != 2 or fixture.count("get_virt_pointer(PADDR)") != 1
             or fixture.count("translate(") != 2 or fixture.count("get_virt_pointer(") != 1
-            or vmem_source.count("translate(") != 4 or vmem_source.count("get_virt_pointer(") != 3):
+            or vmem_source.count("translate(") != 5 or vmem_source.count("get_virt_pointer(") != 3):
         fail("VMEM named fixture raw access must remain its exact marker/content checks")
+    if (producer.count("ker::mod::mm::virt::translate(child.pagemap, page)") != 1
+            or producer.count("translate(") != 1 or "get_virt_pointer(" in producer):
+        fail("VMEM unpublished producer permits one exact translation site and no raw data access")
+    require_code(producer, ["constexpr uint64_t MAX_NATIVE_PAGES = 64;", "get_current_task() != &owner",
+                           "owner.owned_unpublished_process.load(std::memory_order_acquire) != &child",
+                           "child.thread != nullptr", "child.is_thread", "child.shares_user_pagemap.load()",
+                           "child.scheduler_published.load(std::memory_order_acquire)",
+                           "child.gc_queued.load(std::memory_order_acquire)",
+                           "length > USER_SPACE_END + 1 - address", "(address % PAGE) != 0", "(length % PAGE) != 0",
+                           "if (length / PAGE > MAX_NATIVE_PAGES) return -E2BIG;"],
+                 "VMEM raw vacancy observation fixed private Task and bounded geometry")
+    vacancy_start = producer.find("auto range_vacant_locked = [&]")
+    vacancy_brace = producer.find("{", vacancy_start)
+    if vacancy_start < 0 or vacancy_brace < 0 or producer.count("range_vacant_locked()") != 2:
+        fail("VMEM vacancy lambda must retain exactly its initial and publication-locked callers")
+    vacancy = producer[vacancy_brace + 1 : find_matching_brace(producer, vacancy_brace)]
+    require_order(vacancy, ["child.pagemap != nullptr && child.lazy_vmem_ranges.size() < 8",
+                            "for (uint64_t page = address; vacant && page < address + length; page += PAGE)",
+                            "ker::mod::mm::virt::translate(child.pagemap, page) == ker::mod::mm::virt::PADDR_INVALID;"],
+                  "VMEM at-most64-page vacancy-only translation")
+    for forbidden in ["map_page(", "get_virt_pointer(", "memcpy(", "create_page_table_entry("]:
+        if forbidden in producer:
+            fail(f"VMEM unpublished producer cannot write a raw File leaf or data frame: {forbidden}")
+    require_order(producer, ["uint64_t const VACANCY_FLAGS = child.lazy_vmem_lock.lock_irqsave();",
+                            "bool const VACANT = range_vacant_locked();", "child.lazy_vmem_lock.unlock_irqrestore(VACANCY_FLAGS);",
+                            "prepare_unpublished_file_mapping_tables(child.pagemap, address, length, child.pid)",
+                            "SharedVmemPublicationGuard publication;", "child.lazy_vmem_lock.lock_irqsave()",
+                            "if (range_vacant_locked())"], "VMEM private vacancy checks and prepared-table publication order")
     if (projection.count("mm::virt::translate(pagemap, address)") != 1
             or projection.count("mm::virt::translate(pagemap, BASE)") != 1
             or projection.count("mm::addr::get_virt_pointer(PHYSICAL)") != 1

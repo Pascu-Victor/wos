@@ -71,6 +71,7 @@
 #ifdef WOS_SELFTEST
 #include <cstring>
 #include <platform/power/power.hpp>
+#include <test/file_mapping_lifetime_runtime_ktest.hpp>
 #include <test/ktest.hpp>
 #endif
 
@@ -391,6 +392,10 @@ void sched_init() {
 void kernel_start() {
 #ifdef WOS_ASYNC_BLOCK_IO
     dev::block_request_start_workers();
+#endif
+#ifdef WOS_SELFTEST
+    if (cmdline_has_token(get_kernel_cmdline(), "--selftest-file-mapping") && !ker::test::start_file_mapping_runtime_selftest())
+        mod::dbg::panic_handler("unable to post scheduled native File mapping selftest");
 #endif
     mod::sched::start_scheduler();
 }

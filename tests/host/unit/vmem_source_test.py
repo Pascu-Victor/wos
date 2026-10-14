@@ -515,6 +515,7 @@ def test_page_table_pool_duplicate_release_does_not_fall_through_to_page_free() 
     source = VIRT_CPP.read_text()
     release_body = function_body(source, "try_release_page_table_to_pool")
     release_pagemap_body = function_body(source, "release_pagemap")
+    release_owned = function_body(source, "release_pagemap_exclusive_owned")
 
     require_tokens(
         release_body,
@@ -535,14 +536,29 @@ def test_page_table_pool_duplicate_release_does_not_fall_through_to_page_free() 
         "page-table pool duplicate detection must run before zeroing/reinserting",
     )
     require_tokens(
-        release_pagemap_body,
+        release_owned,
         [
-            "if (try_release_page_table_to_pool(pagemap, {__builtin_return_address(0), owner_pid}))",
+            "if (try_release_page_table_to_pool(pagemap, {caller, owner_pid}))",
             "return;",
             "phys::page_free(pagemap);",
         ],
-        "release_pagemap pool handoff",
+        "exclusive-owned root release pool handoff",
     )
+    require_ordered_tokens(release_owned,
+                           ["phys::page_kind_get(pagemap) != PageKind::PAGE_TABLE", "phys::page_ref_get(pagemap) != 1U",
+                            "user_mapping_pin_lock.lock_irqsave()", "file_mapping_index.root_empty_locked(pagemap)",
+                            "retire_user_root_control_locked(pagemap, empty)",
+                            "user_mapping_pin_lock.unlock_irqrestore(CONTROL_FLAGS)",
+                            "if (empty != nullptr) phys::page_free(empty);", "owned_frame_purge_pagemap(pagemap)",
+                            "if (try_release_page_table_to_pool(pagemap, {caller, owner_pid}))", "return;",
+                            "phys::page_free(pagemap);"], "sole-owner/root-index/control/pool retirement order")
+    require_ordered_tokens(release_pagemap_body,
+                           ["if (pagemap == nullptr)", "pagemap == kernel_pagemap || is_current_pagemap(pagemap)",
+                            "return;", "UserPagemapExclusiveScope teardown_scope(pagemap);",
+                            "release_pagemap_exclusive_owned(pagemap, owner_pid, __builtin_return_address(0));"],
+                           "RAW root release keeps its gate and original caller provenance")
+    if "phys::page_free" in release_pagemap_body or "try_release_page_table_to_pool" in release_pagemap_body:
+        fail("RAW wrapper must not bypass the shared exact-owned release helper")
 
 
 def test_mapping_replacement_releases_displaced_reference_after_tlb_flush() -> None:
@@ -666,6 +682,9 @@ def test_kasan_excluded_lazy_file_snapshot_is_unpoisoned_after_unlock() -> None:
         lazy_body,
         [
             "auto file_range = range;",
+            "if (file_range.kind == sched::task::LazyVmemKind::NATIVE_FILE_BACKED)",
+            "file_range.lifetime->try_acquire(file_mapping::FamilyOwner::SNAPSHOT)",
+            "} else if (file_range.file != nullptr)",
             "ker::vfs::vfs_retain_file(file_range.file);",
             "task->lazy_vmem_lock.unlock_irqrestore(IRQF);",
             "if (kasan::is_enabled())",
@@ -674,6 +693,12 @@ def test_kasan_excluded_lazy_file_snapshot_is_unpoisoned_after_unlock() -> None:
         ],
         "KASAN-excluded lazy file snapshot boundary",
     )
+    require_ordered_tokens(lazy_body,
+                           ["ker::syscall::vmem::materialize_lazy_file_page(task, file_range, PAGE_VADDR, fault)",
+                            "if (file_range.kind == sched::task::LazyVmemKind::NATIVE_FILE_BACKED)",
+                            "file_range.lifetime->release(file_mapping::FamilyOwner::SNAPSHOT);",
+                            "} else if (file_range.file != nullptr)", "ker::vfs::vfs_put_file(file_range.file);", "return OK;"],
+                           "native family versus RAW File snapshot releases after materialization")
 
 
 def test_file_mmap_cache_is_sharded_without_changing_page_ownership() -> None:

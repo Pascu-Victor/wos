@@ -7,6 +7,9 @@ File reference operations are explicit Host seams; real SmallVec nothrow growth
 has a deterministic failure boundary. This checks single-Task metadata/ref
 transactions and cold byte offsets, not native PTEs, backing I/O or shared-root
 multi-Task atomicity. --vmem-source accepts a complete unmodified predecessor:
+The actual pure ownership header supplies the native union declaration only;
+every vector remains explicit RAW FILE_BACKED/ANONYMOUS, with no native worker
+or lifetime qualification from this driver.
 it must compile and fail the independent projection oracle. --only isolates
 remove/add/protect negative controls. Never substitutes a rewritten algorithm.
 """
@@ -32,6 +35,7 @@ ROOT = next(path for path in Path(__file__).resolve().parents
 SOURCE = ROOT / "modules/kern/src/syscalls_impl/vmem/sys_vmem.cpp"
 TASK = ROOT / "modules/kern/src/platform/sched/task.hpp"
 SMALLVEC = ROOT / "modules/kern/src/util/smallvec.hpp"
+FAMILY_HEADER = ROOT / "modules/kern/src/platform/mm/file_mapping_lifetime.hpp"
 
 PRELUDE = r'''
 #include <algorithm>
@@ -74,6 +78,7 @@ void* operator new[](std::size_t size, const std::nothrow_t&) noexcept {
     try { return ::operator new[](size); } catch (...) { return nullptr; }
 }
 #include <util/smallvec.hpp>
+#include <platform/mm/file_mapping_lifetime.hpp>
 namespace ker::vfs {
 struct File { std::atomic<int> refcount{1}; };
 void vfs_retain_file(File* file) {
@@ -320,7 +325,8 @@ def generate(source: str, task: str, source_path: Path) -> tuple[str, list[dict]
     end = task.index("enum class TaskType", begin)
     types = task[begin:end]
     definitions = [{"name": "actual-LazyVmemKind-Range-Vec", "bytes": len(types.encode()),
-                    "sha256": hashlib.sha256(types.encode()).hexdigest()}]
+                    "sha256": hashlib.sha256(types.encode()).hexdigest()},
+                   {"name": "whole-real-file_mapping_lifetime.hpp", **pin(FAMILY_HEADER)}]
     names = ["ranges_overlap", "push_lazy_vmem_range", "lazy_vmem_range_has_file", "retain_lazy_vmem_range_file",
              "release_lazy_vmem_range_file", "release_lazy_vmem_range_files", "push_lazy_vmem_range_copy"]
     # Old source genuinely has no slice helper. Only extraction availability is
@@ -488,7 +494,8 @@ def main() -> int:
     args = parser.parse_args()
     started = time.monotonic(); deadline = started + 120
     scratch = None; groups = []; watched = []; before = []
-    result = {"pass": False, "commands": [], "scratch_removed": False, "only": args.only}
+    result = {"pass": False, "commands": [], "scratch_removed": False, "only": args.only,
+              "raw_lazy_vectors_only": True, "native_runtime_qualified": False}
     try:
         source_path = args.vmem_source.resolve(strict=True); task_path = args.task_header.resolve(strict=True)
         compiler = Path(args.cxx).resolve(strict=True)
@@ -496,7 +503,7 @@ def main() -> int:
             raise ValueError("--cxx/CXX must name one host ELF compiler executable")
         with compiler.open("rb") as executable:
             if executable.read(4) != b"\x7fELF": raise ValueError("--cxx/CXX must name one host ELF compiler executable")
-        watched = [source_path, task_path, SMALLVEC, Path(__file__).resolve(), compiler]
+        watched = [source_path, task_path, SMALLVEC, FAMILY_HEADER, Path(__file__).resolve(), compiler]
         before = [pin(path) for path in watched]; result["source"] = before[0]
         harness, actual = generate(source_path.read_text(), task_path.read_text(), source_path)
         result["actual_definitions"] = actual

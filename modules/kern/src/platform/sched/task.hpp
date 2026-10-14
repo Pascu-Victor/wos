@@ -10,7 +10,9 @@
 #include <optional>
 #include <platform/asm/cpu.hpp>
 #include <platform/interrupt/gdt.hpp>
+#include <platform/mm/file_mapping_lifetime.hpp>
 #include <platform/mm/paging.hpp>
+#include <platform/mm/unpublished_mapping_retirement.hpp>
 // #include <platform/sys/context_switch.hpp>
 #include <platform/interrupt/gates.hpp>
 #include <platform/ktime/interval_timer_model.hpp>
@@ -44,6 +46,11 @@ namespace ker::vfs {
 struct File;
 class FdReservation;
 }  // namespace ker::vfs
+
+namespace ker::mod::mm::file_mapping {
+class FileMappingLifetime;
+struct UnpublishedMappingRetirement;
+}  // namespace ker::mod::mm::file_mapping
 
 namespace ker::net::wki {
 class IpcFdSnapshot;
@@ -92,6 +99,7 @@ struct WkiVfsRule {
 enum class LazyVmemKind : uint8_t {
     ANONYMOUS,
     FILE_BACKED,
+    NATIVE_FILE_BACKED,
 };
 
 struct LazyVmemRange {
@@ -100,7 +108,10 @@ struct LazyVmemRange {
     uint64_t prot = 0;
     uint64_t flags = 0;
     LazyVmemKind kind = LazyVmemKind::ANONYMOUS;
-    ker::vfs::File* file = nullptr;
+    union {
+        ker::vfs::File* file = nullptr;                   // FILE_BACKED owns one raw File ref.
+        mm::file_mapping::FileMappingLifetime* lifetime;  // NATIVE_FILE_BACKED owns one LAZY role.
+    };
     uint64_t file_offset = 0;
     uint64_t file_dev = 0;
     uint64_t file_ino = 0;
@@ -110,6 +121,17 @@ struct LazyVmemRange {
     int64_t file_ctime_sec = 0;
     int64_t file_ctime_nsec = 0;
 };
+// The inline SmallVec below is embedded in Task. Growing its rows would move
+// subsequent Task fields used by assembly and existing kernel consumers.
+static_assert(sizeof(LazyVmemRange) == 112);
+static_assert(offsetof(LazyVmemRange, file) == 40);
+[[nodiscard]] inline auto lazy_vmem_is_file(const LazyVmemRange& range) -> bool {
+    return range.kind == LazyVmemKind::FILE_BACKED || range.kind == LazyVmemKind::NATIVE_FILE_BACKED;
+}
+[[nodiscard]] inline auto lazy_vmem_file(const LazyVmemRange& range) -> ker::vfs::File* {
+    if (range.kind == LazyVmemKind::NATIVE_FILE_BACKED) return range.lifetime != nullptr ? range.lifetime->file() : nullptr;
+    return range.kind == LazyVmemKind::FILE_BACKED ? range.file : nullptr;
+}
 using LazyVmemRangeVec = ker::util::SmallVec<LazyVmemRange, 8>;
 
 enum class TaskType : uint8_t {
@@ -1442,6 +1464,10 @@ struct Task {
         }
         return nullptr;
     }
+    // Native mapping cleanup is a stable continuation. Appended at the absolute
+    // end: every preceding Task/assembly offset remains unchanged. Presence
+    // closes scheduler publication until all native cleanup modes are supported.
+    std::atomic<mm::file_mapping::UnpublishedMappingRetirement*> native_file_mapping_retirement{nullptr};
 };
 
 [[nodiscard]] inline auto process_pid(const Task& task) -> uint64_t { return task.owner_pid != 0 ? task.owner_pid : task.pid; }
@@ -1478,6 +1504,20 @@ void destroy_unpublished_user_thread(Task* task);
 // Destroy an exclusively owned child while keeping it discoverable through
 // owner until all potentially blocking cleanup has completed.
 [[nodiscard]] auto destroy_owned_unpublished_process(Task* owner, Task* child) -> bool;
+// PENDING preserves the exact creator/slot continuation and defers fatal exit
+// on owner. Poll from the same ordinary scheduler context until COMPLETE.
+[[nodiscard]] auto retire_native_unpublished_process(Task* owner, Task* child, mm::file_mapping::UnpublishedRetirementMode mode,
+                                                     int* close_result = nullptr) -> mm::file_mapping::UnpublishedRetirementResult;
+// Ordinary scheduler GC worker only, outside its exclusive pass. Each call
+// claims one pre-reserved continuation; true requests another slice.
+[[nodiscard]] auto process_native_unpublished_retirements_slice(bool& root_active) -> bool;
+[[nodiscard]] auto native_unpublished_retirements_pending() -> bool;
+// Construction is admitted before any VFS/backend work. Shutdown closes this
+// gate and checks the actual stable-record list as well as in-flight scopes.
+[[nodiscard]] auto begin_native_file_mapping_construction() -> bool;
+void end_native_file_mapping_construction();
+void register_native_file_mapping_record(Task& child, mm::file_mapping::UnpublishedMappingRetirement& record);
+[[nodiscard]] auto close_native_file_mapping_admission() -> bool;
 // Complete the PT_INTERP stage deliberately omitted from Task's constructor.
 // Runtime callers must first transfer the ELF/kernel stack to the Task and
 // claim an unpublished-process owner that survives any voluntary VFS wait.

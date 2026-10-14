@@ -17,6 +17,7 @@
 #include <platform/loader/elf_loader.hpp>
 #include <platform/loader/gdb_interface.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/lifetime_retirement_executor.hpp>
 #include <platform/mm/mm.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
@@ -460,7 +461,8 @@ void destroy_unpublished_user_thread(Task* task) {
 }
 
 auto claim_unpublished_process(Task* owner, Task* child) -> bool {
-    if (owner == nullptr || child == nullptr || owner == child) {
+    if (owner == nullptr || child == nullptr || owner == child ||
+        child->native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr) {
         return false;
     }
     if (!child->try_acquire_lifetime_ref()) {
@@ -475,7 +477,7 @@ auto claim_unpublished_process(Task* owner, Task* child) -> bool {
 }
 
 auto release_unpublished_process(Task* owner, Task* child) -> bool {
-    if (owner == nullptr || child == nullptr) {
+    if (owner == nullptr || child == nullptr || child->native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr) {
         return false;
     }
     Task* expected = child;
@@ -490,6 +492,14 @@ auto release_unpublished_process(Task* owner, Task* child) -> bool {
 auto take_unpublished_process(Task* owner) -> Task* {
     if (owner == nullptr) {
         return nullptr;
+    }
+    auto* child = owner->owned_unpublished_process.load(std::memory_order_acquire);
+    auto* record = child != nullptr ? child->native_file_mapping_retirement.load(std::memory_order_acquire) : nullptr;
+    if (record != nullptr) {
+        if (record->controller != owner) dbg::panic_handler("native unpublished slot changed controller without retirement");
+        // A begun retirement owns this slot until COMPLETE. Fatal handoffs
+        // already defer on the owner's teardown flag; do not detach it again.
+        if (record->state != mm::file_mapping::UnpublishedRetirementState::PREPARED) return nullptr;
     }
     // Transfer, rather than drop, the slot's lifetime reference. Exit cleanup
     // must keep the child alive from the atomic detach through the final
@@ -509,7 +519,8 @@ auto unpublished_process_is_exclusively_owned(Task* task) -> bool {
         }
         return false;
     }
-    if (task->ref_count.load(std::memory_order_acquire) != 2) {
+    if (task->native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr ||
+        task->ref_count.load(std::memory_order_acquire) != 2) {
         uint32_t self_refs = 0;
         if (task->type != TaskType::PROCESS || task->is_thread ||
             ker::vfs::vfs_count_exclusive_unpublished_self_refs(*task, self_refs) != 0 ||
@@ -522,7 +533,7 @@ auto unpublished_process_is_exclusively_owned(Task* task) -> bool {
     return true;
 }
 
-void teardown_unpublished_process_resources(Task* task) {
+void teardown_unpublished_process_resources(Task* task, mm::file_mapping::UnpublishedMappingRetirement* native = nullptr) {
     // A private creator may have attached loader scratch before the first read.
     // The child is exclusively unpublished; it cannot be another live executor.
     ker::syscall::process::cleanup_exec_preparation(*task);
@@ -570,10 +581,15 @@ void teardown_unpublished_process_resources(Task* task) {
     if (task->pagemap != nullptr && task->pagemap != mm::virt::get_kernel_pagemap()) {
         auto* pagemap = task->detach_pagemap_after_usercopy_quiescence();
         ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(pagemap);
-        mm::virt::destroy_user_space(pagemap, task->pid, task->name, "unpublished-process");
-        mm::virt::release_pagemap(pagemap);
+        if (native != nullptr) {
+            native->retired_root = pagemap;
+        } else {
+            mm::virt::destroy_user_space(pagemap, task->pid, task->name, "unpublished-process");
+            mm::virt::release_pagemap(pagemap);
+        }
     }
 
+    if (native != nullptr) return;  // Root provenance/name survive resumable walking.
     delete[] task->name;
     task->name = nullptr;
     if (task->context.syscall_kernel_stack >= ker::mod::mm::KERNEL_STACK_SIZE) {
@@ -583,9 +599,245 @@ void teardown_unpublished_process_resources(Task* task) {
 }
 }  // namespace
 
+namespace {
+sys::Spinlock native_retirement_queue_lock;
+mm::file_mapping::UnpublishedMappingRetirement* native_retirement_queue_head{};
+mm::file_mapping::UnpublishedMappingRetirement* native_retirement_queue_tail{};
+size_t native_retirement_queue_outstanding{};  // Includes the single GC-claimed prefix.
+sys::Spinlock native_mapping_admission_lock;
+mm::file_mapping::UnpublishedMappingRetirement* native_mapping_active_records{};
+size_t native_mapping_constructions{};
+bool native_mapping_construction_closed{};
+
+void unregister_native_file_mapping_record(Task& child, mm::file_mapping::UnpublishedMappingRetirement& record) {
+    uint64_t const FLAGS = native_mapping_admission_lock.lock_irqsave();
+    auto** link = &native_mapping_active_records;
+    while (*link != nullptr && *link != &record) link = &(*link)->active_next;
+    if (*link != &record || record.active_subject != &child) __builtin_trap();
+    *link = record.active_next;
+    record.active_next = nullptr;
+    record.active_subject = nullptr;
+    native_mapping_admission_lock.unlock_irqrestore(FLAGS);
+}
+
+void append_native_retirement_locked(mm::file_mapping::UnpublishedMappingRetirement& record) {
+    record.deferred_next = nullptr;
+    if (native_retirement_queue_tail != nullptr)
+        native_retirement_queue_tail->deferred_next = &record;
+    else
+        native_retirement_queue_head = &record;
+    native_retirement_queue_tail = &record;
+}
+
+auto advance_native_unpublished_process(Task* owner, Task* child, mm::file_mapping::UnpublishedRetirementMode mode, int* close_result,
+                                        bool detached) -> mm::file_mapping::UnpublishedRetirementResult {
+    namespace fm = mm::file_mapping;
+    using Result = fm::UnpublishedRetirementResult;
+    if (owner == nullptr || child == nullptr || owner == child || !sched::can_query_current_task() || sched::get_current_task() != owner ||
+        !sched::interrupts_enabled() || sched::preempt_count() != 0 || fm::LifetimeRetirementExecutor::is_current_worker())
+        return Result::REFUSED;
+    auto* record = child->native_file_mapping_retirement.load(std::memory_order_acquire);
+    if (record == nullptr || (detached ? record->controller != nullptr || record->deferred_subject != child || !record->deferred_claimed ||
+                                             mode != fm::UnpublishedRetirementMode::DEFERRED_TRANSFERRED
+                                       : record->controller != owner || mode == fm::UnpublishedRetirementMode::DEFERRED_TRANSFERRED))
+        return Result::REFUSED;
+    auto const HOLD = sched::hold_kernel_shutdown();
+    if (record->state == fm::UnpublishedRetirementState::PREPARED) {
+        bool expected = false;
+        if (!detached && !owner->unpublished_teardown_in_progress.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+            return Result::REFUSED;
+        bool const SLOT = owner->owned_unpublished_process.load(std::memory_order_acquire) == child;
+        if ((!detached && (mode == fm::UnpublishedRetirementMode::OWNED_SLOT ? !SLOT : SLOT)) ||
+            !unpublished_process_is_exclusively_owned(child)) {
+            if (!detached) owner->unpublished_teardown_in_progress.store(false, std::memory_order_release);
+            return Result::REFUSED;
+        }
+        record->mode = mode;
+        record->state = fm::UnpublishedRetirementState::RETIRING;
+        teardown_unpublished_process_resources(child, record);
+    } else if (record->mode != mode || (!detached && !owner->unpublished_teardown_in_progress.load(std::memory_order_acquire))) {
+        return Result::REFUSED;
+    }
+    if (record->state == fm::UnpublishedRetirementState::RETIRING) {
+        // A RAW fork may wait IRQ-off on a colliding root stripe. Keep this
+        // gate's owner running until release; never park it behind that waiter.
+        // The admitted <=49 tables/512 leaves consume <=1217 walker steps.
+        // Empty-first-root file-only construction has no anonymous swap rows.
+        sched::PreemptGuard const ROOT_RETIREMENT;
+        if (record->retired_root != nullptr) {
+            if (!record->root_walk_started) {
+                if (!mm::virt::begin_prepared_destroy_user_space(*record->root_walk, record->retired_root, child->pid, child->name,
+                                                                 "native-unpublished-process", false))
+                    return Result::PENDING;
+                record->root_walk_started = true;
+            }
+            if (!mm::virt::destroy_user_space_budgeted(record->root_walk, 2048))
+                dbg::panic_handler("native root exceeded bounded nonpreemptible retirement profile");
+            if (!mm::virt::finish_destroy_user_space_and_release_pagemap(record->root_walk))
+                dbg::panic_handler("native completed root continuation lost final owner");
+        } else {
+            mm::virt::destroy_user_space_budget_state_destroy(record->root_walk);
+        }
+        record->root_walk = nullptr;
+        record->retired_root = nullptr;
+        record->root_walk_started = false;
+        record->state = fm::UnpublishedRetirementState::WAITING_RETURN;
+    }
+    for (size_t i = 0; i < record->count; ++i) {
+        auto const& completion = record->entries.at(i).completion;
+        if (completion.empty()) dbg::panic_handler("native counted File retirement observer missing");
+        auto const RETURN = completion.query();
+        if (RETURN.state == fm::RetirementReturnState::INVALID || RETURN.state == fm::RetirementReturnState::EMPTY)
+            dbg::panic_handler("native counted File retirement observer invalid");
+        if (RETURN.state != fm::RetirementReturnState::RETURNED) return Result::PENDING;
+        if (record->first_close_result == 0 && RETURN.callback_result != 0) record->first_close_result = RETURN.callback_result;
+    }
+    if (child->ref_count.load(std::memory_order_acquire) != 2) return Result::PENDING;
+    if (mode == fm::UnpublishedRetirementMode::OWNED_SLOT) {
+        Task* expected = child;
+        if (!owner->owned_unpublished_process.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel))
+            dbg::panic_handler("native unpublished process lost exact owner slot");
+    }
+    if (close_result != nullptr) *close_result = record->first_close_result;
+    child->native_file_mapping_retirement.store(nullptr, std::memory_order_release);
+    unregister_native_file_mapping_record(*child, *record);
+    delete[] child->name;
+    child->name = nullptr;
+    if (child->context.syscall_kernel_stack >= mm::KERNEL_STACK_SIZE)
+        mm::phys::page_free(reinterpret_cast<void*>(child->context.syscall_kernel_stack - mm::KERNEL_STACK_SIZE));
+    child->context.syscall_kernel_stack = 0;
+    delete record;
+    child->release();  // Consume the exact slot/transferred owner, then creator.
+    delete child;
+    if (!detached) owner->unpublished_teardown_in_progress.store(false, std::memory_order_release);
+    return Result::COMPLETE;
+}
+}  // namespace
+
+auto retire_native_unpublished_process(Task* owner, Task* child, mm::file_mapping::UnpublishedRetirementMode mode, int* close_result)
+    -> mm::file_mapping::UnpublishedRetirementResult {
+    return advance_native_unpublished_process(owner, child, mode, close_result, false);
+}
+
+auto begin_native_file_mapping_construction() -> bool {
+    uint64_t const FLAGS = native_mapping_admission_lock.lock_irqsave();
+    bool const ADMITTED = !native_mapping_construction_closed && native_mapping_constructions != SIZE_MAX;
+    if (ADMITTED) ++native_mapping_constructions;
+    native_mapping_admission_lock.unlock_irqrestore(FLAGS);
+    return ADMITTED;
+}
+
+void end_native_file_mapping_construction() {
+    uint64_t const FLAGS = native_mapping_admission_lock.lock_irqsave();
+    if (native_mapping_constructions == 0) __builtin_trap();
+    --native_mapping_constructions;
+    native_mapping_admission_lock.unlock_irqrestore(FLAGS);
+}
+
+void register_native_file_mapping_record(Task& child, mm::file_mapping::UnpublishedMappingRetirement& record) {
+    uint64_t const FLAGS = native_mapping_admission_lock.lock_irqsave();
+    if (native_mapping_constructions == 0 || record.active_subject != nullptr) __builtin_trap();
+    record.active_subject = &child;
+    record.active_next = native_mapping_active_records;
+    native_mapping_active_records = &record;
+    native_mapping_admission_lock.unlock_irqrestore(FLAGS);
+}
+
+auto close_native_file_mapping_admission() -> bool {
+    uint64_t const FLAGS = native_mapping_admission_lock.lock_irqsave();
+    native_mapping_construction_closed = true;
+    bool const DRAINED = native_mapping_constructions == 0 && native_mapping_active_records == nullptr;
+    native_mapping_admission_lock.unlock_irqrestore(FLAGS);
+    return DRAINED;
+}
+
+auto native_unpublished_retirements_pending() -> bool {
+    uint64_t const FLAGS = native_retirement_queue_lock.lock_irqsave();
+    bool const PENDING = native_retirement_queue_outstanding != 0;
+    native_retirement_queue_lock.unlock_irqrestore(FLAGS);
+    return PENDING;
+}
+
+auto process_native_unpublished_retirements_slice(bool& root_active) -> bool {
+    root_active = false;
+    if (!sched::is_current_gc_worker() || !sched::interrupts_enabled() || sched::preempt_count() != 0)
+        return native_unpublished_retirements_pending();
+    uint64_t flags = native_retirement_queue_lock.lock_irqsave();
+    auto* record = native_retirement_queue_head;
+    if (record != nullptr) {
+        native_retirement_queue_head = record->deferred_next;
+        if (native_retirement_queue_head == nullptr) native_retirement_queue_tail = nullptr;
+        record->deferred_next = nullptr;
+        record->deferred_claimed = true;
+    }
+    native_retirement_queue_lock.unlock_irqrestore(flags);
+    if (record == nullptr) return native_unpublished_retirements_pending();
+    auto const RESULT =
+        advance_native_unpublished_process(sched::get_current_task(), record->deferred_subject,
+                                           mm::file_mapping::UnpublishedRetirementMode::DEFERRED_TRANSFERRED, nullptr, true);
+    flags = native_retirement_queue_lock.lock_irqsave();
+    if (RESULT == mm::file_mapping::UnpublishedRetirementResult::COMPLETE) {
+        // COMPLETE deleted the record; only permanent queue accounting remains.
+        if (native_retirement_queue_outstanding == 0) __builtin_trap();
+        --native_retirement_queue_outstanding;
+    } else {
+        root_active = record->state == mm::file_mapping::UnpublishedRetirementState::RETIRING && record->root_walk_started;
+        record->deferred_claimed = false;
+        if (root_active) {
+            // Hashed root gates remain exclusive across slices. Finish this
+            // exact walk before another native or ordinary GC root can wait
+            // for a gate whose only progressing owner is this same worker.
+            record->deferred_next = native_retirement_queue_head;
+            native_retirement_queue_head = record;
+            if (native_retirement_queue_tail == nullptr) native_retirement_queue_tail = record;
+        } else {
+            append_native_retirement_locked(*record);
+        }
+    }
+    bool const PENDING = native_retirement_queue_outstanding != 0;
+    native_retirement_queue_lock.unlock_irqrestore(flags);
+    return PENDING;
+}
+
+namespace {
+void defer_transferred_native_unpublished_process(Task& owner, Task& child) {
+    auto* record = child.native_file_mapping_retirement.load(std::memory_order_acquire);
+    if (record == nullptr || record->controller != &owner || record->state != mm::file_mapping::UnpublishedRetirementState::PREPARED ||
+        owner.owned_unpublished_process.load(std::memory_order_acquire) == &child || record->deferred_subject != nullptr)
+        dbg::panic_handler("native transfer refusal lost exact recoverable owner");
+    record->controller = nullptr;
+    record->deferred_subject = &child;  // Transfer the caller's existing ref; never drop it.
+    record->mode = mm::file_mapping::UnpublishedRetirementMode::DEFERRED_TRANSFERRED;
+    uint64_t const FLAGS = native_retirement_queue_lock.lock_irqsave();
+    if (native_retirement_queue_outstanding == SIZE_MAX) __builtin_trap();
+    ++native_retirement_queue_outstanding;
+    append_native_retirement_locked(*record);
+    native_retirement_queue_lock.unlock_irqrestore(FLAGS);
+    sched::request_gc();  // Ordinary ACTIVE caller, outside all queue/MM guards.
+}
+
+auto drain_native_unpublished_process(Task* owner, Task* child, mm::file_mapping::UnpublishedRetirementMode mode) -> bool {
+    for (;;) {
+        auto const RESULT = retire_native_unpublished_process(owner, child, mode);
+        if (RESULT == mm::file_mapping::UnpublishedRetirementResult::COMPLETE) return true;
+        if (RESULT == mm::file_mapping::UnpublishedRetirementResult::REFUSED) return false;
+        sched::kern_yield();
+    }
+}
+}  // namespace
+
 auto destroy_unpublished_process(Task* task) -> bool {
     if (task == nullptr) {
         return true;
+    }
+    if (task->native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr) {
+        auto* owner = sched::can_query_current_task() ? sched::get_current_task() : nullptr;
+        bool const COMPLETE = drain_native_unpublished_process(owner, task, mm::file_mapping::UnpublishedRetirementMode::TRANSFERRED_SLOT);
+        if (!COMPLETE) {
+            if (owner == nullptr) dbg::panic_handler("native transferred cleanup outside its actual controller");
+            defer_transferred_native_unpublished_process(*owner, *task);
+        }
+        return COMPLETE;
     }
     if (!unpublished_process_is_exclusively_owned(task)) {
         // take_unpublished_process() transferred one reference to this caller.
@@ -604,6 +856,8 @@ auto destroy_owned_unpublished_process(Task* owner, Task* child) -> bool {
     if (owner == nullptr || child == nullptr || owner == child) {
         return false;
     }
+    if (child->native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr)
+        return drain_native_unpublished_process(owner, child, mm::file_mapping::UnpublishedRetirementMode::OWNED_SLOT);
 
     bool expected_teardown = false;
     if (!owner->unpublished_teardown_in_progress.compare_exchange_strong(expected_teardown, true, std::memory_order_acq_rel,
@@ -636,6 +890,7 @@ auto destroy_owned_unpublished_process(Task* owner, Task* child) -> bool {
 auto complete_unpublished_process_construction(Task* task, int* interpreter_error, Task* interpreter_executor,
                                                bool observe_current_executor) -> bool {
     if (interpreter_error != nullptr) *interpreter_error = 0;
+    if (task != nullptr && task->native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr) return false;
     if (task == nullptr || task->type != TaskType::PROCESS || task->thread == nullptr || task->pagemap == nullptr) {
         return false;
     }
@@ -678,6 +933,10 @@ auto complete_unpublished_process_construction(Task* task, int* interpreter_erro
 
 auto clone_lazy_vmem_ranges(Task& dst, Task& src) -> bool {
     uint64_t const IRQF = src.lazy_vmem_lock.lock_irqsave();
+    if (src.native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr) {
+        src.lazy_vmem_lock.unlock_irqrestore(IRQF);
+        return false;
+    }
     bool const OK = dst.lazy_vmem_ranges.clone_from(src.lazy_vmem_ranges);
     if (OK) {
         for (const auto& range : dst.lazy_vmem_ranges) {
@@ -698,7 +957,9 @@ void release_lazy_vmem_ranges(Task& task) {
     task.lazy_vmem_lock.unlock_irqrestore(IRQF);
 
     for (const auto& range : ranges) {
-        if (range.kind == LazyVmemKind::FILE_BACKED && range.file != nullptr) {
+        if (range.kind == LazyVmemKind::NATIVE_FILE_BACKED && range.lifetime != nullptr) {
+            range.lifetime->release(mm::file_mapping::FamilyOwner::LAZY);
+        } else if (range.kind == LazyVmemKind::FILE_BACKED && range.file != nullptr) {
             ker::vfs::vfs_put_file(range.file);
         }
     }

@@ -34,6 +34,13 @@ kernel bounce-buffer capacity; an over-report is `-EOVERFLOW`.
 identify mappings or execution addresses. They still receive canonical-range,
 alignment, overflow, and ownership validation before page-table mutation.
 
+The internal `prepare_unpublished_file_mapping` producer also uses bounded
+page-table translation to reject occupied addresses before installing a private
+file mapping. It accepts only the current construction owner's unpublished,
+unshared process, checks at most 64 aligned user pages, and performs no raw
+access to page contents. This vacancy check adds no syscall or usercopy bypass;
+the raw-access audit enumerates it separately from diagnostic fixtures.
+
 ## Logging
 
 | ABI family | Operation | Access | Maximum / bound | Nullable | Partial progress | Irreversible-effect ordering |
