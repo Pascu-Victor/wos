@@ -222,6 +222,13 @@ add_test(NAME file_mmap_registry_runtime_test
 set_tests_properties(file_mmap_registry_runtime_test PROPERTIES
     LABELS "host;unit;runtime;integration" TIMEOUT 130
 )
+add_test(NAME tmpfs_page_ownership_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/tmpfs_page_ownership_runtime_test.py
+        --cxx ${CMAKE_CXX_COMPILER}
+)
+set_tests_properties(tmpfs_page_ownership_runtime_test PROPERTIES
+    LABELS "host;unit;runtime;integration" TIMEOUT 80
+)
 add_test(NAME ahci_async_integration_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/ahci_async_integration_test.py
 )

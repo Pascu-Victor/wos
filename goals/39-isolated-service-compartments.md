@@ -8,6 +8,21 @@
 
 ## Outcome and scale
 
+Checkpoint 55 preserves TMPFS resident frame ownership through reclaim and
+inode retirement, retains sparse-file quota charges, excludes hardlink aliases
+from reclaim/migration scans, and ends the inode mutex guard before deletion.
+Normal Build WOS, isolated fast diagnostic compilation, formatting and all 11
+selected Host checks pass. Actual rootless KTEST81 passes all 1,460 enabled
+cases, all 209 mandatory cases and 101,314 assertions with zero failures,
+including the registry-growth case from checkpoint54 and four new TMPFS cases.
+It powers off naturally; all four disposable images are pruned, leaving zero
+disposable allocation and the unrelated VM preserved. Native80's two test-only
+errno-width failures remain recorded; only their expected types were corrected.
+Canonical mutable backing, complete owner drains, two-hour services and 1,000
+full lifecycle/failure cycles remain unfinished. All ten full criteria remain
+open; Goal39 stays ACTIVE. Continue exact-owned `--no-setup` qualification with
+the original shared guard, one topology and all-outcome storage pruning.
+
 Checkpoint 54 repairs a use-after-free when splitting a heap-backed shared-file
 mapping registry row. It preserves the original byte projection, File/writeback
 policy and allocation-failure rollback by reacquiring the row after insertion.

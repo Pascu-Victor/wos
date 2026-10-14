@@ -142,7 +142,8 @@ def test_tmpfs_page_model_keeps_sparse_pages_and_swaps_cold_resident_pages() -> 
         "tmpfs sparse/read/swap page flow",
     )
     evict_body = function_body(source, r"auto\s+evict_page_locked\([^)]*\)\s*->\s*int")
-    require_order(evict_body, "swap::write_slot(slot, page.data)", "phys::page_free(page.data)", "tmpfs evicts only after swap write")
+    require_order(evict_body, "phys::page_ref_get(page.data) != 1", "swap::allocate_slot(&slot)", "tmpfs retains borrowed frames before swap admission")
+    require_order(evict_body, "swap::write_slot(slot, page.data)", "phys::page_ref_dec(page.data)", "tmpfs drops its frame owner only after swap write")
 
 
 def test_swap_backings_are_local_block_or_xfs_and_swapoff_drains_use() -> None:
@@ -214,12 +215,24 @@ def test_swapon_swapoff_are_appended_kernel_and_mlibc_abi_ops() -> None:
         [
             "case ker::abi::vmem::ops::SWAPON:",
             "case ker::abi::vmem::ops::SWAPOFF:",
-            "copy_cstring_from_task_strict(*task, a1, path.data(), path.size())",
-            "ker::mod::mm::swap::swapon_path(path.data(), static_cast<int>(a2))",
-            "ker::mod::mm::swap::swapoff_path(path.data())",
+            "return swap_control_for_subject(get_current_task(), op, a1, a2);",
         ],
         "kernel VMEM swap syscall dispatch",
     )
+    control = function_body(sys_vmem, r"auto\s+swap_control_for_subject\([^)]*\)\s*->\s*uint64_t")
+    require_tokens(
+        control,
+        [
+            "host_namespace_admission(task)",
+            "if (SCOPE != 0) return static_cast<uint64_t>(SCOPE);",
+            "copy_cstring_from_task_strict(*task, address, path.data(), path.size())",
+            "ker::mod::mm::swap::swapon_path(path.data(), static_cast<int>(flags))",
+            "ker::mod::mm::swap::swapoff_path(path.data())",
+        ],
+        "subject-owned swap admission and unchanged path/flags ABI",
+    )
+    require_order(control, "host_namespace_admission(task)", "copy_cstring_from_task_strict", "swap scope admission before usercopy")
+    require_order(control, "copy_cstring_from_task_strict", "swap::swapon_path", "swap usercopy before backend effects")
     require_tokens(
         sysdeps_cpp + sysdeps_hpp + swap_h + strace,
         [

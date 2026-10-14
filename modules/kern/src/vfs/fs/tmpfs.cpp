@@ -346,9 +346,10 @@ auto ensure_page_descriptors(TmpNode* node, size_t required_pages) -> bool {
 }
 
 void release_page_locked(TmpNode* node, TmpPage& page, bool uncharge) {
+    bool const MATERIALIZED = page.state == TmpPageState::RESIDENT || page.state == TmpPageState::SWAPPED;
     if (page.state == TmpPageState::RESIDENT) {
         if (page.data != nullptr) {
-            ker::mod::mm::phys::page_free(page.data);
+            ker::mod::mm::phys::page_ref_dec(page.data);
         }
         if (node != nullptr && node->resident_pages != 0) {
             node->resident_pages--;
@@ -362,7 +363,7 @@ void release_page_locked(TmpNode* node, TmpPage& page, bool uncharge) {
     page.state = TmpPageState::HOLE;
     page.data = nullptr;
     page.swap_slot = ker::mod::mm::swap::invalid_slot();
-    if (uncharge && node != nullptr && node->charged_pages != 0) {
+    if (uncharge && MATERIALIZED && node != nullptr && node->charged_pages != 0) {
         node->charged_pages--;
         mount_uncharge(node);
     }
@@ -376,6 +377,12 @@ auto evict_page_locked(TmpNode* node, size_t index) -> int {
     if (page.state != TmpPageState::RESIDENT || page.data == nullptr) {
         return -EAGAIN;
     }
+    // First canonical borrowers acquire their frame ref under this io_lock.
+    // Existing borrowers may duplicate their own refs, but cannot reach 1 until
+    // their last reference is gone. Keep their canonical storage resident.
+    if (ker::mod::mm::phys::page_ref_get(page.data) != 1) {
+        return -EAGAIN;
+    }
     ker::mod::mm::swap::SwapSlot slot{};
     int ret = ker::mod::mm::swap::allocate_slot(&slot);
     if (ret < 0) {
@@ -386,7 +393,7 @@ auto evict_page_locked(TmpNode* node, size_t index) -> int {
         static_cast<void>(ker::mod::mm::swap::free_slot(slot));
         return ret;
     }
-    ker::mod::mm::phys::page_free(page.data);
+    ker::mod::mm::phys::page_ref_dec(page.data);
     page.data = nullptr;
     page.swap_slot = slot;
     page.state = TmpPageState::SWAPPED;
@@ -456,8 +463,9 @@ auto tmpfs_reclaim_bounded(size_t target_pages, size_t scan_budget) -> TmpfsRecl
         if (node == nullptr) {
             continue;
         }
-        TmpNode* canonical = tmpfs_canonical_node(node);
-        if (canonical == node && node->type == TmpNodeType::FILE) {
+        // During exclusive tree teardown a later alias can outlive its target.
+        // Aliases own no pages; eligibility needs no target dereference.
+        if (node->hardlink_target == nullptr && node->type == TmpNodeType::FILE) {
             TmpfsReclaimResult const NODE_RESULT =
                 reclaim_from_node_locked_bounded(node, target_pages - result.reclaimed, scan_budget - result.scanned);
             result.reclaimed += NODE_RESULT.reclaimed;
@@ -573,7 +581,7 @@ auto ensure_page_resident_locked(TmpNode* node, size_t page_index, TmpPage** out
 }
 
 auto migrate_node_swap_area_locked(TmpNode* node, uint32_t area_id) -> int {
-    if (node == nullptr || node->type != TmpNodeType::FILE || tmpfs_canonical_node(node) != node) {
+    if (node == nullptr || node->type != TmpNodeType::FILE || node->hardlink_target != nullptr) {
         return 0;
     }
     for (size_t i = 0; i < node->page_count; ++i) {
@@ -821,14 +829,16 @@ void tmpfs_free_node(TmpNode* node) {
         node->unlinked = true;
         return;
     }
-    ker::mod::sys::MutexGuard guard(node->io_lock);
-    unregister_tmp_node(node);
-    for (size_t i = 0; i < node->page_count; ++i) {
-        release_page_locked(node, node->pages[i], true);
+    {
+        ker::mod::sys::MutexGuard guard(node->io_lock);
+        unregister_tmp_node(node);
+        for (size_t i = 0; i < node->page_count; ++i) {
+            release_page_locked(node, node->pages[i], true);
+        }
+        delete[] node->pages;
+        delete[] node->symlink_target;
+        delete[] node->children;
     }
-    delete[] node->pages;
-    delete[] node->symlink_target;
-    delete[] node->children;
     delete node;
 }
 
@@ -2280,14 +2290,21 @@ auto tmpfs_reclaim_pages(size_t target_pages) -> size_t {
         if (node == nullptr) {
             continue;
         }
-        TmpNode* canonical = tmpfs_canonical_node(node);
-        if (canonical != nullptr && canonical->type == TmpNodeType::FILE && canonical == node) {
-            reclaimed += reclaim_from_node_locked(canonical, target_pages - reclaimed);
+        if (node->hardlink_target == nullptr && node->type == TmpNodeType::FILE) {
+            reclaimed += reclaim_from_node_locked(node, target_pages - reclaimed);
         }
         node->io_lock.unlock();
     }
     return reclaimed;
 }
+
+#ifdef WOS_SELFTEST
+auto selftest_tmpfs_evict_page(TmpNode* owned_node, size_t index) -> int {
+    if (owned_node == nullptr || owned_node->type != TmpNodeType::FILE || owned_node->hardlink_target != nullptr) return -EINVAL;
+    ker::mod::sys::MutexGuard guard(owned_node->io_lock);
+    return evict_page_locked(owned_node, index);
+}
+#endif
 
 // --- File-level operations ---
 

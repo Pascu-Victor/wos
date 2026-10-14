@@ -1,0 +1,765 @@
+#!/usr/bin/env python3
+"""Compile complete TMPFS page ownership bodies against bounded Host primitives.
+
+Actual node/page/mount declarations, SmallVec, content/coherency declarations,
+allocation/materialization, accounting, registry, release, eviction, migration,
+bounded/public scan and final node-free bodies are compiled without rewriting
+their bytes. Physical frame allocation/refcounts, swap and mutex operations are
+named Host seams with independent byte/reference/quota/lifetime oracles. This
+does not qualify real MM aliases, devices, concurrency or native coherence.
+
+The bounded process/scratch runner is shared with the actual file-registry
+regression. --tmpfs-source accepts a complete archived predecessor; --only
+selects one genuine compiled vector for an independent negative control.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import resource
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+ROOT = next(path for path in Path(__file__).resolve().parents
+            if (path / "modules/kern/src").is_dir() and (path / ".github/instructions").is_dir())
+KERN = ROOT / "modules/kern/src"
+SOURCE = KERN / "vfs/fs/tmpfs.cpp"
+HEADER = KERN / "vfs/fs/tmpfs.hpp"
+RUNNER = Path(__file__).with_name("file_mmap_registry_runtime_test.py")
+RUNNER_BYTES = RUNNER.read_bytes()
+SPEC = importlib.util.spec_from_file_location("wos_tmpfs_bounded_host_runner", RUNNER)
+if SPEC is None or SPEC.loader is None:
+    raise RuntimeError("bounded actual file-registry Host runner is unavailable")
+runner = importlib.util.module_from_spec(SPEC)
+# Execute the exact captured complete runner bytes, avoiding a separate loader
+# read that could diverge from the evidence of the reused implementation.
+exec(compile(RUNNER_BYTES, str(RUNNER), "exec"), runner.__dict__)
+
+VECTORS = (
+    "materialize_owner", "retained_release", "hole_quota", "uncharged_release",
+    "descriptor_relocation", "exclusive_eviction", "borrowed_eviction",
+    "allocate_slot_failure", "write_slot_failure", "rehydration",
+    "read_slot_failure", "free_slot_failure", "physical_allocation_failure",
+    "node_scan_budget", "global_scan_budget", "lookup_deferred_free",
+    "guard_before_owner_destruction", "aliases_bounded_skip_unread_target",
+    "aliases_public_skip_unread_target", "aliases_migration_skip_unread_target",
+)
+
+LOCKS = r'''
+#pragma once
+#include <cstdint>
+#include <map>
+namespace fixture {
+inline std::map<uintptr_t, bool> locks;
+inline uint64_t destroy_held{}, invalid_unlock{}, lock_errors{}, try_attempts{};
+}
+namespace ker::mod::sys {
+class Spinlock {
+public:
+    Spinlock() { if (!fixture::locks.emplace(reinterpret_cast<uintptr_t>(this), false).second) ++fixture::lock_errors; }
+    ~Spinlock() {
+        auto it = fixture::locks.find(reinterpret_cast<uintptr_t>(this));
+        if (it == fixture::locks.end()) { ++fixture::lock_errors; return; }
+        if (it->second) ++fixture::destroy_held;
+        fixture::locks.erase(it);
+    }
+    Spinlock(const Spinlock&) = delete;
+    auto operator=(const Spinlock&) -> Spinlock& = delete;
+    void lock() {
+        auto it = fixture::locks.find(reinterpret_cast<uintptr_t>(this));
+        if (it == fixture::locks.end() || it->second) { ++fixture::lock_errors; return; }
+        it->second = true;
+    }
+    auto try_lock() -> bool {
+        ++fixture::try_attempts;
+        auto it = fixture::locks.find(reinterpret_cast<uintptr_t>(this));
+        if (it == fixture::locks.end()) { ++fixture::lock_errors; return false; }
+        if (it->second) return false;
+        it->second = true;
+        return true;
+    }
+    void unlock() {
+        // External lifetime authority detects an unlock after owner deletion
+        // without dereferencing the dead mutex's storage in this Host seam.
+        auto it = fixture::locks.find(reinterpret_cast<uintptr_t>(this));
+        if (it == fixture::locks.end()) { ++fixture::invalid_unlock; return; }
+        if (!it->second) { ++fixture::lock_errors; return; }
+        it->second = false;
+    }
+};
+class Mutex : public Spinlock {};
+class MutexGuard {
+    Mutex& mutex_;
+public:
+    explicit MutexGuard(Mutex& mutex) : mutex_(mutex) { mutex_.lock(); }
+    ~MutexGuard() { mutex_.unlock(); }
+    MutexGuard(const MutexGuard&) = delete;
+    auto operator=(const MutexGuard&) -> MutexGuard& = delete;
+};
+}
+'''
+
+PRELUDE = r'''
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cerrno>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <new>
+#include <string_view>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <util/smallvec.hpp>
+#include <vfs/exec_content.hpp>
+#include <vfs/native_coherency.hpp>
+#include "actual-types.hpp"
+
+namespace fixture {
+constexpr size_t BS = 4096;
+const char* current_case = "initialization";
+uint64_t assertions{}, failures{}, allocations{}, frees{}, increments{}, decrements{}, direct_free_refused{};
+uint64_t slot_allocations{}, slot_frees{}, slot_writes{}, slot_reads{};
+bool allocation_failure{}, available = true;
+int slot_allocate_error{}, slot_write_error{}, slot_read_error{}, slot_free_error{};
+struct Frame { uint32_t refs{1}; };
+std::map<void*, Frame> frames;
+struct Slot { ker::mod::mm::swap::SwapSlot id{}; std::array<unsigned char, BS> bytes{}; };
+std::map<uint64_t, Slot> slots;
+uint64_t next_slot{};
+void check(bool value, const char* expression, int line) {
+    ++assertions;
+    if (!value) {
+        if (failures < 64) std::fprintf(stderr, "ASSERT case=%s line=%d expression=%s\n", current_case, line, expression);
+        ++failures;
+    }
+}
+#define CHECK(expression) fixture::check(bool(expression), #expression, __LINE__)
+void verify_bytes(const void* page, unsigned char seed) {
+    CHECK(frames.contains(const_cast<void*>(page)));
+    if (!frames.contains(const_cast<void*>(page))) return;
+    auto* data = static_cast<const unsigned char*>(page);
+    for (size_t i = 0; i < BS; ++i) CHECK(data[i] == static_cast<unsigned char>(seed + i * 17U));
+}
+void fill_bytes(void* page, unsigned char seed) {
+    auto* data = static_cast<unsigned char*>(page);
+    for (size_t i = 0; i < BS; ++i) data[i] = static_cast<unsigned char>(seed + i * 17U);
+}
+auto refs(void* page) -> uint32_t { auto it = frames.find(page); return it == frames.end() ? 0 : it->second.refs; }
+}
+
+// Named primitive boundaries only. The complete TMPFS functions follow below.
+namespace ker::mod::mm::phys {
+auto get_total_mem_bytes() -> uint64_t { return 0; }
+auto page_alloc_can_satisfy(uint64_t, uint64_t) -> bool { return true; }
+auto page_alloc_may_fail(PhysicalPageOwner owner, uint64_t size, std::string_view) -> void* {
+    CHECK(owner == PhysicalPageOwner::TMPFS_DATA && size == fixture::BS);
+    if (fixture::allocation_failure) return nullptr;
+    void* p = std::aligned_alloc(fixture::BS, fixture::BS);
+    CHECK(p != nullptr);
+    if (p == nullptr) return nullptr;
+    CHECK(fixture::frames.emplace(p, fixture::Frame{}).second);
+    ++fixture::allocations;
+    std::memset(p, 0xa5, fixture::BS);
+    return p;
+}
+auto page_ref_get(void* p) -> uint32_t { return fixture::refs(p); }
+void page_ref_inc(void* p) {
+    auto it = fixture::frames.find(p);
+    CHECK(it != fixture::frames.end() && it->second.refs != 0);
+    if (it != fixture::frames.end()) { ++it->second.refs; ++fixture::increments; }
+}
+auto page_ref_dec(void* p) -> uint32_t {
+    auto it = fixture::frames.find(p);
+    CHECK(it != fixture::frames.end() && it->second.refs != 0);
+    if (it == fixture::frames.end() || it->second.refs == 0) return 0;
+    ++fixture::decrements;
+    uint32_t const remaining = --it->second.refs;
+    if (remaining == 0) { fixture::frames.erase(it); ++fixture::frees; std::free(p); }
+    return remaining;
+}
+void page_free(void* p) {
+    auto it = fixture::frames.find(p);
+    CHECK(it != fixture::frames.end() && it->second.refs != 0);
+    if (it == fixture::frames.end()) return;
+    // Match the physical allocator's direct-free refusal while borrowed.
+    if (it->second.refs > 1) { ++fixture::direct_free_refused; return; }
+    fixture::frames.erase(it); ++fixture::frees; std::free(p);
+}
+}
+namespace ker::mod::mm::swap {
+auto swap_available() -> bool { return fixture::available; }
+auto allocate_slot(SwapSlot* out) -> int {
+    ++fixture::slot_allocations;
+    CHECK(out != nullptr);
+    if (fixture::slot_allocate_error != 0) return fixture::slot_allocate_error;
+    uint64_t const index = ++fixture::next_slot;
+    *out = {.area = 7, .index = index, .generation = index + 100};
+    CHECK(fixture::slots.emplace(index, fixture::Slot{.id = *out}).second);
+    return 0;
+}
+auto free_slot(SwapSlot slot) -> int {
+    ++fixture::slot_frees;
+    auto it = fixture::slots.find(slot.index);
+    CHECK(it != fixture::slots.end() && it->second.id.area == slot.area && it->second.id.generation == slot.generation);
+    if (fixture::slot_free_error != 0) return fixture::slot_free_error;
+    if (it == fixture::slots.end()) return -EINVAL;
+    fixture::slots.erase(it);
+    return 0;
+}
+auto write_slot(SwapSlot slot, const void* page) -> int {
+    ++fixture::slot_writes;
+    auto it = fixture::slots.find(slot.index);
+    CHECK(it != fixture::slots.end() && it->second.id.generation == slot.generation && fixture::frames.contains(const_cast<void*>(page)));
+    if (fixture::slot_write_error != 0) return fixture::slot_write_error;
+    if (it == fixture::slots.end()) return -EINVAL;
+    std::memcpy(it->second.bytes.data(), page, fixture::BS);
+    return 0;
+}
+auto read_slot(SwapSlot slot, void* page) -> int {
+    ++fixture::slot_reads;
+    auto it = fixture::slots.find(slot.index);
+    CHECK(it != fixture::slots.end() && it->second.id.generation == slot.generation && fixture::frames.contains(page));
+    if (fixture::slot_read_error != 0) return fixture::slot_read_error;
+    if (it == fixture::slots.end()) return -EINVAL;
+    std::memcpy(page, it->second.bytes.data(), fixture::BS);
+    return 0;
+}
+}
+'''
+
+CASES = r'''
+namespace fixture {
+using namespace ker::vfs::tmpfs;
+namespace phys = ker::mod::mm::phys;
+namespace swap = ker::mod::mm::swap;
+struct Node {
+    TmpfsMount mount{};
+    TmpNode* node{new TmpNode};
+    Node() {
+        mount.max_bytes = 32 * BS;
+        node->mount = &mount;
+        register_tmp_node(node);
+    }
+    ~Node() { dispose(); CHECK(mount.used_bytes == 0); }
+    void dispose() { if (node != nullptr) { tmpfs_free_node(node); node = nullptr; } }
+    auto page(size_t index, unsigned char seed = 0x3b) -> void* {
+        ker::mod::sys::MutexGuard guard(node->io_lock);
+        TmpPage* out = nullptr;
+        CHECK(ensure_page_resident_locked(node, index, &out) == 0 && out != nullptr);
+        if (out == nullptr) return nullptr;
+        CHECK(out == &node->pages[index] && out->state == TmpPageState::RESIDENT && refs(out->data) == 1);
+        fill_bytes(out->data, seed);
+        return out->data;
+    }
+};
+void empty_baseline() {
+    CHECK(tmpfs_nodes.size() == 0 && tmpfs_resident_pages.load() == 0);
+    CHECK(frames.empty() && slots.empty() && allocations == frees);
+    CHECK(destroy_held == 0 && invalid_unlock == 0 && lock_errors == 0);
+    CHECK(locks.size() == 1); // Only the complete actual global registry mutex.
+    for (auto [_, held] : locks) CHECK(!held);
+}
+void materialize_owner() {
+    Node f;
+    ker::mod::sys::MutexGuard guard(f.node->io_lock);
+    TmpPage* p = nullptr;
+    CHECK(ensure_page_resident_locked(f.node, 3, &p) == 0 && p != nullptr);
+    CHECK(f.node->page_count == 4 && f.node->charged_pages == 1 && f.node->resident_pages == 1 && f.mount.used_bytes == BS);
+    CHECK(tmpfs_resident_pages.load() == 1 && allocations == 1 && refs(p->data) == 1);
+    auto* bytes = static_cast<unsigned char*>(p->data);
+    for (size_t i = 0; i < BS; ++i) CHECK(bytes[i] == 0);
+    TmpPage* again = nullptr;
+    CHECK(ensure_page_resident_locked(f.node, 3, &again) == 0 && again == p && allocations == 1 && refs(p->data) == 1);
+}
+void retained_release() {
+    Node f;
+    void* data = f.page(0, 0x67);
+    { ker::mod::sys::MutexGuard guard(f.node->io_lock); phys::page_ref_inc(data); release_page_locked(f.node, f.node->pages[0], true); }
+    CHECK(refs(data) == 1 && decrements == 1 && direct_free_refused == 0);
+    CHECK(f.node->pages[0].state == TmpPageState::HOLE && f.node->pages[0].data == nullptr && !swap::slot_valid(f.node->pages[0].swap_slot));
+    CHECK(f.node->resident_pages == 0 && f.node->charged_pages == 0 && f.mount.used_bytes == 0 && tmpfs_resident_pages.load() == 0);
+    verify_bytes(data, 0x67);
+    CHECK(phys::page_ref_dec(data) == 0);
+}
+void hole_quota() {
+    Node f;
+    void* data = f.page(5);
+    { ker::mod::sys::MutexGuard guard(f.node->io_lock); for (size_t i = 0; i < 5; ++i) release_page_locked(f.node, f.node->pages[i], true); }
+    CHECK(f.node->charged_pages == 1 && f.mount.used_bytes == BS && f.node->resident_pages == 1 && refs(data) == 1);
+    verify_bytes(data, 0x3b);
+}
+void uncharged_release() {
+    Node f;
+    f.page(0);
+    { ker::mod::sys::MutexGuard guard(f.node->io_lock); release_page_locked(f.node, f.node->pages[0], false); }
+    CHECK(f.node->charged_pages == 1 && f.mount.used_bytes == BS && f.node->resident_pages == 0 && frames.empty());
+    // Explicit caller-owned charge transfer, not another descriptor retirement.
+    { ker::mod::sys::MutexGuard guard(f.node->io_lock); --f.node->charged_pages; mount_uncharge(f.node); }
+}
+void descriptor_relocation() {
+    Node f;
+    void* data = f.page(0, 0x41);
+    phys::page_ref_inc(data);
+    TmpPage* old = f.node->pages;
+    { ker::mod::sys::MutexGuard guard(f.node->io_lock); CHECK(ensure_page_descriptors(f.node, 17)); }
+    CHECK(f.node->pages != old && f.node->pages[0].data == data && refs(data) == 2 && f.node->charged_pages == 1);
+    f.dispose();
+    CHECK(refs(data) == 1);
+    verify_bytes(data, 0x41);
+    CHECK(phys::page_ref_dec(data) == 0);
+}
+void exclusive_eviction() {
+    Node f;
+    void* data = f.page(0, 0x29);
+    { ker::mod::sys::MutexGuard guard(f.node->io_lock); CHECK(evict_page_locked(f.node, 0) == 0); }
+    CHECK(refs(data) == 0 && frames.empty() && slot_allocations == 1 && slot_writes == 1 && slots.size() == 1);
+    CHECK(f.node->pages[0].state == TmpPageState::SWAPPED && f.node->resident_pages == 0 && f.node->charged_pages == 1 && f.mount.used_bytes == BS);
+    auto& bytes = slots.begin()->second.bytes;
+    for (size_t i = 0; i < BS; ++i) CHECK(bytes[i] == static_cast<unsigned char>(0x29 + i * 17U));
+    f.dispose();
+    CHECK(slot_frees == 1 && slots.empty());
+}
+void borrowed_eviction() {
+    Node f;
+    void* data = f.page(0, 0x99);
+    { ker::mod::sys::MutexGuard guard(f.node->io_lock); phys::page_ref_inc(data); phys::page_ref_inc(data); }
+    { ker::mod::sys::MutexGuard guard(f.node->io_lock); CHECK(evict_page_locked(f.node, 0) == -EAGAIN); }
+    CHECK(refs(data) == 3 && f.node->pages[0].data == data && f.node->pages[0].state == TmpPageState::RESIDENT);
+    CHECK(slot_allocations == 0 && slot_writes == 0 && slot_frees == 0 && slots.empty());
+    CHECK(f.node->resident_pages == 1 && f.node->charged_pages == 1 && f.mount.used_bytes == BS);
+    verify_bytes(data, 0x99);
+    CHECK(phys::page_ref_dec(data) == 2);
+    { ker::mod::sys::MutexGuard guard(f.node->io_lock); CHECK(evict_page_locked(f.node, 0) == -EAGAIN); }
+    CHECK(slot_allocations == 0 && slot_writes == 0);
+    CHECK(phys::page_ref_dec(data) == 1);
+    { ker::mod::sys::MutexGuard guard(f.node->io_lock); CHECK(evict_page_locked(f.node, 0) == 0); }
+    CHECK(refs(data) == 0 && slot_allocations == 1 && slot_writes == 1);
+}
+void eviction_failure(bool allocate) {
+    Node f;
+    void* data = f.page(0, 0x57);
+    slot_allocate_error = allocate ? -ENOSPC : 0;
+    slot_write_error = allocate ? 0 : -EIO;
+    { ker::mod::sys::MutexGuard guard(f.node->io_lock); CHECK(evict_page_locked(f.node, 0) == (allocate ? -ENOSPC : -EIO)); }
+    CHECK(refs(data) == 1 && frames.size() == 1 && slots.empty() && f.node->pages[0].data == data);
+    CHECK(f.node->pages[0].state == TmpPageState::RESIDENT && f.node->resident_pages == 1 && tmpfs_resident_pages.load() == 1);
+    CHECK(f.node->charged_pages == 1 && f.mount.used_bytes == BS && slot_allocations == 1 && slot_writes == (allocate ? 0 : 1));
+    CHECK(slot_frees == (allocate ? 0 : 1));
+    verify_bytes(data, 0x57);
+    slot_allocate_error = slot_write_error = 0;
+}
+void rehydrate(int fault) {
+    Node f;
+    f.page(0, 0x6a);
+    { ker::mod::sys::MutexGuard guard(f.node->io_lock); CHECK(evict_page_locked(f.node, 0) == 0); }
+    auto const id = f.node->pages[0].swap_slot;
+    slot_read_error = fault == 1 ? -EIO : 0;
+    slot_free_error = fault == 2 ? -EIO : 0;
+    TmpPage* out = nullptr;
+    { ker::mod::sys::MutexGuard guard(f.node->io_lock); CHECK(ensure_page_resident_locked(f.node, 0, &out) == (fault ? -EIO : 0)); }
+    if (fault) {
+        CHECK(out == nullptr && frames.empty() && slots.size() == 1 && f.node->pages[0].state == TmpPageState::SWAPPED);
+        CHECK(f.node->pages[0].swap_slot.index == id.index && f.node->pages[0].swap_slot.generation == id.generation);
+        CHECK(f.node->resident_pages == 0 && tmpfs_resident_pages.load() == 0 && f.node->charged_pages == 1 && f.mount.used_bytes == BS);
+        slot_read_error = slot_free_error = 0;
+        { ker::mod::sys::MutexGuard guard(f.node->io_lock); CHECK(ensure_page_resident_locked(f.node, 0, &out) == 0 && out != nullptr); }
+    }
+    CHECK(out != nullptr && out->state == TmpPageState::RESIDENT && refs(out->data) == 1 && slots.empty());
+    CHECK(f.node->charged_pages == 1 && f.mount.used_bytes == BS && f.node->resident_pages == 1 && tmpfs_resident_pages.load() == 1);
+    verify_bytes(out->data, 0x6a);
+}
+void physical_allocation_failure() {
+    Node f;
+    allocation_failure = true;
+    TmpPage* out = nullptr;
+    { ker::mod::sys::MutexGuard guard(f.node->io_lock); CHECK(ensure_page_resident_locked(f.node, 4, &out) == -ENOSPC); }
+    CHECK(out == nullptr && f.node->page_count == 5 && f.node->charged_pages == 0 && f.node->resident_pages == 0 && f.mount.used_bytes == 0);
+    CHECK(frames.empty() && allocations == 0 && slots.empty() && slot_allocations == 0);
+    allocation_failure = false;
+}
+void node_scan_budget() {
+    Node f;
+    void* borrowed = f.page(2, 0x7c);
+    f.page(6);
+    phys::page_ref_inc(borrowed);
+    { ker::mod::sys::MutexGuard guard(f.node->io_lock);
+      auto a = reclaim_from_node_locked_bounded(f.node, 8, 3);
+      CHECK(a.scanned == 3 && a.reclaimed == 0 && f.node->reclaim_cursor == 3 && slot_allocations == 0);
+      auto b = reclaim_from_node_locked_bounded(f.node, 8, 3);
+      CHECK(b.scanned == 3 && b.reclaimed == 0 && f.node->reclaim_cursor == 6);
+      auto c = reclaim_from_node_locked_bounded(f.node, 1, 99);
+      CHECK(c.scanned == 1 && c.reclaimed == 1 && f.node->reclaim_cursor == 0);
+      auto d = reclaim_from_node_locked_bounded(f.node, 2, 7, 2);
+      CHECK(d.scanned == 7 && d.reclaimed == 0 && f.node->reclaim_cursor == 0);
+      auto e = reclaim_from_node_locked_bounded(f.node, 0, 7);
+      CHECK(e.scanned == 0 && e.reclaimed == 0);
+    }
+    verify_bytes(borrowed, 0x7c);
+    CHECK(phys::page_ref_dec(borrowed) == 1);
+}
+void global_scan_budget() {
+    Node busy, ready;
+    busy.page(0); ready.page(3);
+    busy.node->io_lock.lock();
+    auto const before = try_attempts;
+    auto a = tmpfs_reclaim_bounded(2, 2);
+    CHECK(a.scanned == 2 && a.reclaimed == 0 && try_attempts - before <= 2 && slot_allocations == 0);
+    busy.node->io_lock.unlock();
+    auto b = tmpfs_reclaim_bounded(1, 8);
+    CHECK(b.scanned <= 8 && b.reclaimed == 1);
+    CHECK(tmpfs_reclaim_pages(8) == 1 && tmpfs_resident_pages.load() == 0 && frames.empty());
+    CHECK(tmpfs_reclaim_pages(0) == 0);
+    available = false;
+    auto c = tmpfs_reclaim_bounded(8, 8);
+    CHECK(c.scanned == 0 && c.reclaimed == 0 && tmpfs_reclaim_pages(8) == 0);
+    available = true;
+}
+void lookup_deferred_free() {
+    Node f;
+    void* data = f.page(0);
+    f.node->lookup_ref_count.store(1);
+    auto const generation = tmpfs_node_registry_generation;
+    tmpfs_free_node(f.node);
+    CHECK(f.node->unlinked && f.node->reclaim_registered && refs(data) == 1);
+    CHECK(tmpfs_node_registry_generation == generation && f.node->charged_pages == 1 && f.mount.used_bytes == BS);
+    f.node->lookup_ref_count.store(0);
+    f.dispose();
+    CHECK(tmpfs_node_registry_generation == generation + 1 && frames.empty());
+}
+void guard_before_owner_destruction() {
+    Node f;
+    void* data = f.page(1, 0x83);
+    phys::page_ref_inc(data);
+    f.node->symlink_target = new char[9];
+    f.node->children = new TmpNode*[3]{};
+    f.dispose();
+    CHECK(destroy_held == 0 && invalid_unlock == 0 && lock_errors == 0 && refs(data) == 1);
+    verify_bytes(data, 0x83);
+    CHECK(phys::page_ref_dec(data) == 0);
+}
+void aliases_skip_unread_target(unsigned kind) {
+    // A still-owned real Host TmpNode has temporarily unreadable bytes. This
+    // tests absence of target access; it creates no dangling kernel object.
+    CHECK(sizeof(TmpNode) <= BS);
+    void* memory = ::mmap(nullptr, BS, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(memory != MAP_FAILED);
+    if (memory == MAP_FAILED) return;
+    auto* target = new (memory) TmpNode;
+    Node alias;
+    alias.node->hardlink_target = target;
+    CHECK(::mprotect(memory, BS, PROT_NONE) == 0);
+    if (kind == 0) {
+        auto a = tmpfs_reclaim_bounded(8, 8);
+        CHECK(a.scanned == 0 && a.reclaimed == 0);
+    } else if (kind == 1) {
+        CHECK(tmpfs_reclaim_pages(8) == 0);
+    } else {
+        ker::mod::sys::MutexGuard guard(alias.node->io_lock);
+        CHECK(migrate_node_swap_area_locked(alias.node, 7) == 0);
+    }
+    CHECK(slot_allocations == 0 && slot_writes == 0 && slot_reads == 0);
+    CHECK(::mprotect(memory, BS, PROT_READ | PROT_WRITE) == 0);
+    alias.node->hardlink_target = nullptr;
+    target->~TmpNode();
+    CHECK(::munmap(memory, BS) == 0);
+}
+}
+int main(int argc, char** argv) {
+    using namespace fixture;
+    if (argc != 2) return 2;
+    current_case = argv[1];
+    std::string_view name(argv[1]);
+    if (name == "materialize_owner") materialize_owner();
+    else if (name == "retained_release") retained_release();
+    else if (name == "hole_quota") hole_quota();
+    else if (name == "uncharged_release") uncharged_release();
+    else if (name == "descriptor_relocation") descriptor_relocation();
+    else if (name == "exclusive_eviction") exclusive_eviction();
+    else if (name == "borrowed_eviction") borrowed_eviction();
+    else if (name == "allocate_slot_failure") eviction_failure(true);
+    else if (name == "write_slot_failure") eviction_failure(false);
+    else if (name == "rehydration") rehydrate(0);
+    else if (name == "read_slot_failure") rehydrate(1);
+    else if (name == "free_slot_failure") rehydrate(2);
+    else if (name == "physical_allocation_failure") physical_allocation_failure();
+    else if (name == "node_scan_budget") node_scan_budget();
+    else if (name == "global_scan_budget") global_scan_budget();
+    else if (name == "lookup_deferred_free") lookup_deferred_free();
+    else if (name == "guard_before_owner_destruction") guard_before_owner_destruction();
+    else if (name == "aliases_bounded_skip_unread_target") aliases_skip_unread_target(0);
+    else if (name == "aliases_public_skip_unread_target") aliases_skip_unread_target(1);
+    else if (name == "aliases_migration_skip_unread_target") aliases_skip_unread_target(2);
+    else return 2;
+    empty_baseline();
+    std::printf("%s case=%s assertions=%llu failures=%llu frames=%zu slots=%zu resident=%llu registry=%zu destroy_held=%llu invalid_unlock=%llu real_tmpfs=1 real_smallvec=1\n",
+                failures == 0 ? "PASS" : "FAIL", current_case, (unsigned long long)assertions, (unsigned long long)failures,
+                frames.size(), slots.size(), (unsigned long long)ker::vfs::tmpfs::tmpfs_resident_pages.load(),
+                ker::vfs::tmpfs::tmpfs_nodes.size(), (unsigned long long)destroy_held, (unsigned long long)invalid_unlock);
+    return failures == 0 ? 0 : 3;
+}
+'''
+
+REAL_HEADERS = (
+    "util/smallvec.hpp", "vfs/exec_content.hpp", "vfs/native_coherency.hpp",
+    "vfs/coherency.hpp", "vfs/stat.hpp",
+)
+
+
+def generate(scratch: Path, selected: Path) -> list[dict]:
+    include = scratch / "include"
+    actual = []
+    for name in REAL_HEADERS:
+        path = include / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes((KERN / name).read_bytes())
+        actual.append({"name": "whole-real-" + name, **runner.pin(KERN / name)})
+    seams = {
+        "platform/sys/mutex.hpp": LOCKS,
+        "platform/sys/spinlock.hpp": '#pragma once\n#include "mutex.hpp"\n',
+        "platform/mm/dyn/kmalloc.hpp": "#pragma once\n",
+        "util/hcf.hpp": "#pragma once\n#include <cstdlib>\n[[noreturn]] inline void hcf(){std::abort();}\n",
+        "bits/off_t.h": "#pragma once\n#include <sys/types.h>\n",
+    }
+    for name, text in seams.items():
+        path = include / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    types = ["#pragma once\n#include <cstdint>\n#include <cstddef>\n"]
+    paging = KERN / "platform/mm/paging.hpp"
+    lines = [line for line in paging.read_text().splitlines() if line.startswith("constexpr uint64_t PAGE_SIZE =")]
+    if len(lines) != 1:
+        raise ValueError("unique real MM PAGE_SIZE declaration unavailable")
+    types.append("namespace ker::mod::mm::paging {\n" + lines[0] + "\n}\n")
+    actual.append({"source": str(paging), "name": "PAGE_SIZE", "bytes": len(lines[0].encode()),
+                   "sha256": hashlib.sha256(lines[0].encode()).hexdigest()})
+    for path, namespace, anchors in (
+        (KERN / "platform/mm/page_alloc.hpp", "ker::mod::mm", ["enum class PhysicalPageOwner : uint8_t {"]),
+        (KERN / "platform/mm/swap.hpp", "ker::mod::mm::swap", ["struct SwapSlot {", "constexpr auto invalid_slot()", "constexpr auto slot_valid("]),
+        (HEADER, "ker::vfs::tmpfs", ["enum class TmpNodeType : uint8_t {", "enum class TmpPageState : uint8_t {", "struct TmpPage {", "struct TmpNode {", "struct TmpfsMount {"]),
+    ):
+        text = path.read_text()
+        types.append(f"namespace {namespace} {{\n")
+        if namespace == "ker::vfs::tmpfs":
+            names = [line for line in text.splitlines() if line.startswith("constexpr size_t TMPFS_NAME_MAX =")]
+            if len(names) != 1:
+                raise ValueError("unique actual TMPFS_NAME_MAX declaration unavailable")
+            types.append(names[0] + "\nstruct TmpfsMount;\n")
+            actual.append({"source": str(path), "name": "TMPFS_NAME_MAX", "bytes": len(names[0].encode()),
+                           "sha256": hashlib.sha256(names[0].encode()).hexdigest()})
+        for anchor in anchors:
+            body, row = runner.capture(text, anchor, declaration=anchor.startswith(("struct ", "enum ")))
+            actual.append({"source": str(path), **row})
+            types.append(f'#line {row["line"]} "{path}"\n' + body + "\n")
+        types.append("}\n")
+    (include / "actual-types.hpp").write_text("\n".join(types))
+    source = selected.read_text()
+    chunks = [PRELUDE, "namespace ker::vfs::tmpfs {\n"]
+    constants = ("constexpr size_t DEFAULT_TMPFS_BLOCK_SIZE", "constexpr uint64_t TMPFS_MIN_FREE_RESERVE_BYTES",
+                 "constexpr uint64_t TMPFS_MAX_FREE_RESERVE_BYTES", "constexpr uint64_t TMPFS_FREE_RESERVE_DIVISOR")
+    globals_ = ("ker::mod::sys::Mutex tmpfs_node_registry_lock;", "ker::util::SmallVec<TmpNode*, 64> tmpfs_nodes;",
+                "std::atomic<uint64_t> tmpfs_resident_pages", "std::atomic<uint64_t> tmpfs_reclaim_node_cursor",
+                "uint64_t tmpfs_node_registry_generation")
+    for anchor in (*constants, *globals_):
+        lines = [line for line in source.splitlines() if line.startswith(anchor)]
+        if len(lines) != 1:
+            raise ValueError(f"missing unique actual declaration: {anchor}")
+        body = lines[0]
+        chunks.append(body + "\n")
+        actual.append({"name": anchor, "bytes": len(body.encode()), "sha256": hashlib.sha256(body.encode()).hexdigest()})
+    anchors = (
+        "auto tmpfs_canonical_node(TmpNode* node)", "auto tmpfs_free_reserve_bytes()", "auto tmpfs_can_allocate_page()",
+        "void register_tmp_node(", "void unregister_tmp_node(", "auto mount_try_charge(", "void mount_uncharge(",
+        "auto ensure_page_descriptors(", "void release_page_locked(", "auto evict_page_locked(",
+        "struct TmpfsReclaimResult {", "auto reclaim_from_node_locked_bounded(", "auto reclaim_from_node_locked(",
+        "auto tmpfs_reclaim_bounded(", "auto allocate_resident_page(", "auto ensure_page_resident_locked(",
+        "auto migrate_node_swap_area_locked(", "void tmpfs_free_node(", "auto tmpfs_reclaim_pages(",
+    )
+    for anchor in anchors:
+        body, row = runner.capture(source, anchor, declaration=anchor.startswith("struct "))
+        actual.append({"source": str(selected), **row})
+        chunks.append(f'#line {row["line"]} "actual-selected-tmpfs.cpp"\n' + body + "\n")
+    chunks.extend(["}\n", '#line 1 "independent-tmpfs-fixture-oracles"\n', CASES])
+    (scratch / "harness.cpp").write_text("\n".join(chunks))
+    return actual
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tmpfs-source", type=Path, default=SOURCE)
+    parser.add_argument("--cxx", default=os.environ.get("WOS_HOST_CXX", "/usr/bin/clang++"))
+    parser.add_argument("--evidence-dir", type=Path)
+    parser.add_argument("--only", choices=VECTORS)
+    args = parser.parse_args()
+    started = time.monotonic()
+    deadline = started + 60
+    scratch = None
+    scratch_identity = None
+    evidence = None
+    groups = []
+    watched = []
+    before = []
+    staged = []
+    staged_before = []
+    vectors = (args.only,) if args.only else VECTORS
+    result = {"pass": False, "errors": [], "commands": [], "runtime_census": [], "scratch_removed": False,
+              "whole_budget_seconds": 60, "scratch_budget_bytes": runner.SCRATCH_BUDGET,
+              "command_log_budget_bytes": runner.LOG_BUDGET, "core_dump_limit_bytes": 0,
+              "compiler_external_dependencies_before": False, "compiler_external_dependencies_after_only": True,
+              "native_runtime_qualified": False, "shared_coherence_qualified": False, "full_goal_complete": False}
+    result["imported_runner_source_snapshot"] = {
+        "path": str(RUNNER.resolve()), "bytes": len(RUNNER_BYTES),
+        "sha256": hashlib.sha256(RUNNER_BYTES).hexdigest(),
+        "execution": "compile exact captured bytes then exec in module namespace",
+        "module_name": runner.__name__, "module_file": runner.__file__,
+        "source_loader_or_pycache_executed": False,
+    }
+    handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+
+    def interrupted(signum, _frame):
+        raise KeyboardInterrupt(f"interrupted by signal {signum}")
+
+    try:
+        for sig in handlers:
+            signal.signal(sig, interrupted)
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        selected = args.tmpfs_source.resolve(strict=True)
+        compiler = Path(args.cxx).resolve(strict=True)
+        if not compiler.is_file() or not os.access(compiler, os.X_OK):
+            raise ValueError("--cxx must be a single executable compiler path")
+        with compiler.open("rb") as stream:
+            if stream.read(4) != b"\x7fELF":
+                raise ValueError("--cxx must resolve to a real Host ELF compiler")
+        if args.evidence_dir is not None:
+            evidence = args.evidence_dir.absolute()
+            if evidence.parent.resolve(strict=True) != evidence.parent or os.path.lexists(evidence):
+                raise ValueError("--evidence-dir needs an existing canonical parent and a fresh exclusive directory")
+            evidence.mkdir(mode=0o700)
+        watched = [selected, HEADER, KERN / "platform/mm/page_alloc.hpp", KERN / "platform/mm/swap.hpp", KERN / "platform/mm/paging.hpp",
+                   *(KERN / name for name in REAL_HEADERS), RUNNER, Path(__file__).resolve(), compiler]
+        before = [runner.pin(path) for path in watched]
+        runner_pin = runner.pin(RUNNER)
+        if runner_pin["bytes"] != len(RUNNER_BYTES) or runner_pin["sha256"] != hashlib.sha256(RUNNER_BYTES).hexdigest():
+            raise ValueError("reused bounded runner changed after exact import capture")
+        result["imported_runner_live_source_held_before_commands"] = True
+        result["source_before"] = before
+        result["selected_tmpfs_source"] = before[0]
+        result["primitive_seams"] = ["Host physical frame allocation/reference count/direct-free refusal",
+                                     "Host swap slot ownership and injected I/O failures", "Host mutex lifetime/try-lock registry",
+                                     "Host protected still-owned target memory", "Host memory policy reports total bytes zero"]
+        runner.subreaper()
+        scratch = Path(tempfile.mkdtemp(prefix="wos-tmpfs-ownership-", dir="/tmp"))
+        info = scratch.stat()
+        scratch_identity = (info.st_dev, info.st_ino, info.st_uid)
+        if info.st_uid != os.getuid() or scratch.is_symlink():
+            raise ValueError("fresh scratch ownership changed")
+        result["scratch"] = str(scratch)
+        result["actual_definitions"] = generate(scratch, selected)
+        staged = sorted(path for path in scratch.rglob("*") if path.is_file())
+        staged_before = [runner.pin(path) for path in staged]
+        result["staged_sources_before"] = staged_before
+        binary = scratch / "tmpfs-ownership-test"
+        depfile = scratch / "dependencies.d"
+        argv = [str(compiler), "-std=c++23", "-O1", "-g0", "-pipe", "-fsanitize=address,undefined",
+                "-fno-omit-frame-pointer", "-MD", "-MF", str(depfile), "-I", str(scratch / "include"),
+                str(scratch / "harness.cpp"), "-o", str(binary)]
+        compile_log = scratch / "command-0.log"
+        row = runner.command(argv, compile_log, scratch, deadline, groups)
+        result["commands"].append(row)
+        if depfile.exists():
+            result["emitted_dependency_pins_after"] = runner.dependency_pins(depfile)
+            result["dependency_file"] = runner.pin(depfile)
+        if row["exit"] != 0:
+            print(compile_log.read_text(errors="replace")[-32768:], end="", flush=True)
+            raise ValueError(f"actual compile/link failed with exit {row['exit']}")
+        result["compiled_binary"] = runner.pin(binary)
+        for index, vector in enumerate(vectors, 1):
+            log = scratch / f"command-{index}.log"
+            row = runner.command([str(binary), vector], log, scratch, deadline, groups)
+            result["commands"].append(row)
+            text = log.read_text(errors="replace")
+            print(text[-32768:], end="", flush=True)
+            pattern = (rf"^PASS case={re.escape(vector)} assertions=(\d+) failures=0 frames=0 slots=0 resident=0 "
+                       r"registry=0 destroy_held=0 invalid_unlock=0 real_tmpfs=1 real_smallvec=1\n$")
+            match = re.fullmatch(pattern, text)
+            if row["exit"] != 0 or match is None or int(match[1]) == 0:
+                result["errors"].append(f"actual compiled vector {vector} failed with exit {row['exit']}")
+            else:
+                result["runtime_census"].append({"case": vector, "assertions": int(match[1]), "exit": row["exit"]})
+        result["pass"] = not result["errors"] and len(result["runtime_census"]) == len(vectors)
+    except (OSError, ValueError, TimeoutError, subprocess.TimeoutExpired, KeyboardInterrupt) as error:
+        result["errors"].append(f"{type(error).__name__}: {error}")
+    finally:
+        for sig in handlers:
+            signal.signal(sig, signal.SIG_IGN)
+        try:
+            if staged_before:
+                result["staged_sources_after"] = [runner.pin(path) for path in staged]
+                result["staged_sources_held"] = result["staged_sources_after"] == staged_before
+                if not result["staged_sources_held"]:
+                    result["errors"].append("compiled staged source bytes changed")
+            if before:
+                result["source_after"] = [runner.pin(path) for path in watched]
+                result["source_held"] = result["source_after"] == before
+                if not result["source_held"]:
+                    result["errors"].append("selected actual sources/compiler/shared runner changed")
+            if scratch is not None:
+                result["scratch_allocated_bytes_before_cleanup"] = runner.allocated(scratch)
+                result["owned_sessions_pending"] = list(groups)
+                if evidence is not None:
+                    saved = []
+                    for path in [*staged, *sorted(scratch.glob("command-*.log")), scratch / "dependencies.d"]:
+                        if not path.is_file():
+                            continue
+                        if path.stat().st_size > runner.LOG_BUDGET:
+                            raise ValueError("saved small evidence file exceeds 1MiB")
+                        destination = evidence / path.relative_to(scratch)
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        with destination.open("xb") as stream:
+                            stream.write(path.read_bytes())
+                        saved.append(runner.pin(destination))
+                    result["retained_small_evidence"] = saved
+                info = scratch.stat()
+                exact_owned = not scratch.is_symlink() and (info.st_dev, info.st_ino, info.st_uid) == scratch_identity
+                if groups or not exact_owned:
+                    result["errors"].append("owned session/scratch identity unproven; preserve small scratch")
+                else:
+                    shutil.rmtree(scratch)
+                    result["scratch_removed"] = not os.path.lexists(scratch)
+                    if not result["scratch_removed"]:
+                        result["errors"].append("owned scratch remains after cleanup")
+            result["elapsed_seconds"] = time.monotonic() - started
+            if result["elapsed_seconds"] >= 60:
+                result["errors"].append("whole 60s actual cleanup/publication budget expired")
+        except (OSError, ValueError, TimeoutError) as error:
+            result["errors"].append(f"cleanup: {type(error).__name__}: {error}")
+        finally:
+            for sig, handler in handlers.items():
+                signal.signal(sig, handler)
+    result["pass"] = result["pass"] and not result["errors"] and result["scratch_removed"]
+    result["qualification"] = "PASS_ACTUAL_HOST_TMPFS_PAGE_OWNERSHIP_ONLY" if result["pass"] else "FAIL"
+    if evidence is not None:
+        result["evidence_directory"] = str(evidence)
+        with (evidence / "result.json").open("x") as stream:
+            json.dump(result, stream, sort_keys=True, indent=2)
+            stream.write("\n")
+    print(json.dumps(result, sort_keys=True), flush=True)
+    return 0 if result["pass"] and time.monotonic() < deadline else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

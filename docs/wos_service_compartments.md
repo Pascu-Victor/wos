@@ -2252,3 +2252,69 @@ coherence, complete native reference drains, simultaneous two-hour services and
 1,000 full create/exec/kill/destroy/OOM cycles remain required. Continue using
 `--no-setup`, one topology, the 20GiB disposable budget/40GiB free floor and
 exact-owned inactive-image pruning after every outcome.
+
+
+## Checkpoint55: TMPFS page ownership (2026-10-14)
+
+Resident descriptors now drop exactly their inode-owned physical reference;
+remaining frame owners survive truncation and final inode retirement. Reclaim
+refuses externally referenced pages before swap-slot allocation or I/O and drops
+only the inode reference after successful pageout. Hole descriptors do not
+uncharge retained pages. Both reclaim scans and swap migration skip hardlink
+aliases instead of following their borrowed target during exclusive teardown.
+Final inode cleanup unregisters/releases owned state under io_lock, ends its
+guard, then deletes the inode. Ordinary canonical File I/O, quota/swap rollback,
+lock order, object layouts and syscall/wire ABI remain unchanged. A single-node
+selftest-only hook delegates exact owned-page eviction under the real inode lock.
+
+The registered actual-body ASan/UBSan Host regression passes 20 independent
+vectors and 53,661 assertions, covering quota/frame/slot accounting, swap failures,
+retry, alias scans and mutex destruction. The complete archived predecessor
+compiles, then fails the same oracles: 17 processes report the shared old guard
+lifetime defect and three protected-alias cases report ASan faults. These are not
+17 distinct production defects. All owned scratch/process sessions are retired.
+Host physical/swap/mutex primitives do not qualify hardware PTEs or SMP behavior.
+
+Normal Build WOS passes (initial30.629s, final1.179s); isolated fast diagnostics
+pass (initial29.883s, final watched727 rebuild3.920s). Formatting and all11 selected
+registered Host checks pass. Initial CTest10/11 exposed a stale swap-dispatch
+source assertion; its helper-aware correction preserves syscall/ABI checks and
+Host admission before usercopy. No production dispatch or errno change was made.
+
+Actual KTEST80 fails two fixture assertions because KEXPECT_EQ compares raw-width
+representations: correct ssize_t negative returns differed from int expected
+operands. It is stopped promptly, with no full census, summary or natural poweroff
+claim. Six packaging/readback commands and five prepared payloads succeed; no
+stopped readbacks are claimed. Its four images (327,237,632 allocated bytes)
+are pruned and physical postcheck passes. The exact old fixture and failed run
+remain immutable. The successor changes only two expected operands to ssize_t;
+every actual call, errno, assertion, failure injection and cleanup is preserved.
+
+Corrected isolated `bin/wos-ktest --fast --no-build --no-package --no-setup`
+KTEST81 passes all1,460 enabled cases, all209 mandatory cases and 101,314
+assertions with zero failures; the same three BufferCache cases stay disabled.
+The checkpoint54 registry-growth case and all four real TMPFS ownership cases
+pass. The VM powers off naturally, with launcher/worker/outer exit0 and no forced
+stop. VM time is 471.277s; outer command time is 502.790s. All eight commands
+and five prepared plus five stopped payload readbacks pass. All893 admitted
+inputs remain held; this is an explicit source domain, not a complete compiler
+dependency or SMP qualification. Native frame, quota, swap and final File/inode
+retirement are exercised with parked KTEST APs and owned private fixtures.
+
+All four exact-owned inactive disks are pruned (392,445,952 allocated bytes),
+leaving zero disposable allocation. The separate physical postcheck confirms
+run PIDs/sockets/images absent, original shared lock39:197 released and protected
+UID945 VM13532 unchanged. Small logs/receipts and required readonly seeds/current
+artifacts remain. Keep20GiB disposable budget,40GiB free floor and all-outcome
+pruning. No full VM disks are retained. The provisional review/preflight refusal
+is preserved; fresh admission uses final frozen reviews. The auxiliary offline
+producer's inherited80 execution label is documented, while operative81 role01
+qualifiers/data are correct; later role02 outputs are retained history only.
+
+The independent source, Host, build/artifact and terminal reviews pass their
+stated checks. No full Goal39 criterion closes. There is no new native mapping
+loan API, canonical shared-file layer, all-root EOF fence, dirty/retry owner or
+complete family/File/Task shutdown drain. TMPFS resize failure atomicity and the
+connected native-owner installation have source-only next-step maps. Those maps
+do not qualify implementation. Two simultaneous two-hour services and1,000 full
+create/exec/kill/destroy/OOM cycles remain required. Goal39 stays ACTIVE.

@@ -31,7 +31,7 @@ class TmpfsLookupHandle;
 
 struct TmpPage {
     TmpPageState state = TmpPageState::HOLE;
-    void* data = nullptr;
+    void* data = nullptr;  // RESIDENT owns one physical-frame ref; descriptors may move.
     ker::mod::mm::swap::SwapSlot swap_slot{};
 };
 
@@ -192,6 +192,11 @@ void destroy_mount_context(TmpfsMount* mount);
 auto mount_root(TmpfsMount* mount) -> TmpNode*;
 auto tmpfs_statvfs(TmpfsMount* mount, ker::vfs::Statvfs* buf) -> int;
 auto tmpfs_reclaim_pages(std::size_t target_pages) -> std::size_t;
+
+#ifdef WOS_SELFTEST
+// Caller keeps the exact canonical node alive; invokes its real eviction path.
+auto selftest_tmpfs_evict_page(TmpNode* owned_node, size_t index) -> int;
+#endif
 
 // Node operations
 auto tmpfs_lookup(TmpNode* dir, const char* name) -> TmpNode*;
