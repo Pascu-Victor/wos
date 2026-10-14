@@ -128,6 +128,9 @@ class UserAccessGuard {
     UserAccessGuard() { ++state.access; }
     ~UserAccessGuard() { --state.access; }
 };
+// Frame ownership is qualified by futex_frame_lifetime_runtime_test. This
+// caller-order seam keeps frame retention separate from mapping/access pins.
+struct UserPageFrameRef { bool held = false; };
 class StableUserPage {
  public:
     StableUserPage() = default;
@@ -138,6 +141,11 @@ class StableUserPage {
     }
     void* kernel_address() const { return bytes; }
     uint64_t physical_address() const { return 0xa51000; }
+    bool retain_frame(UserPageFrameRef& out) const {
+        if (!held || out.held) return false;
+        out.held = true;
+        return true;
+    }
     bool still_mapped() const {
         if (state.futex_mode) return ++state.futex_still_calls != state.futex_still_fail_call;
         require(state.access == 0, "mapping check performed inside the memcpy access window");
@@ -197,6 +205,7 @@ bool ensure_user_page_writable(sched::task::Task*, uint64_t va) {
 struct FutexWaiter {
     uint64_t phys_addr = 0, task_pid = 0, task_cpu = 0;
     FutexWaiter* hash_next = nullptr;
+    ker::mod::sys::usercopy::UserPageFrameRef frame;
     FutexWaiter() { ++state.waiter_live; }
     ~FutexWaiter() { --state.waiter_live; }
 };

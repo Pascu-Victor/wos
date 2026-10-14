@@ -9,4 +9,10 @@ KTEST(Futex, StaleWakeDoesNotClaimWaiter) { KEXPECT_TRUE(ker::syscall::futex::fu
 
 KTEST(Futex, WaiterRetiresAfterBothOwners) { KEXPECT_TRUE(ker::syscall::futex::futex_selftest_waiter_two_owner_retirement()); }
 
+KTEST(Futex, QueuedFrameSurvivesRootRetirement) {
+    KEXPECT_TRUE(ker::syscall::futex::futex_selftest_queued_frame_survives_root_retirement());
+}
+
+KTEST(Futex, FrameRefMovesPreserveOwnership) { KEXPECT_TRUE(ker::syscall::futex::futex_selftest_frame_ref_moves_preserve_ownership()); }
+
 KTEST(Futex, WakeCountLimitIsValidated) { KEXPECT_TRUE(ker::syscall::futex::futex_selftest_wake_count_limit()); }

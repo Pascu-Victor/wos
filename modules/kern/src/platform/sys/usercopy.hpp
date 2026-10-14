@@ -43,6 +43,26 @@ class UserAccessGuard {
 
 [[nodiscard]] auto access_window_active() -> bool;
 
+// Owns one allocator frame reference independently of Task/pagemap access
+// leases. A live StableUserPage supplies the checked aligned frame and hint.
+class UserPageFrameRef {
+   public:
+    UserPageFrameRef() = default;
+    ~UserPageFrameRef();
+    UserPageFrameRef(const UserPageFrameRef&) = delete;
+    auto operator=(const UserPageFrameRef&) -> UserPageFrameRef& = delete;
+    UserPageFrameRef(UserPageFrameRef&& other) noexcept;
+    auto operator=(UserPageFrameRef&& other) noexcept -> UserPageFrameRef&;
+
+    [[nodiscard]] auto valid() const noexcept -> bool;
+    void reset() noexcept;
+
+   private:
+    friend class StableUserPage;
+    void* m_page{};
+    mm::phys::PageLookupHint m_lookup_hint{};
+};
+
 // Holds both the target Task pagemap-access gate and one allocator frame
 // reference. The HHDM address therefore remains safe even if another thread
 // removes the mapping; still_mapped() supplies the operation's final
@@ -64,6 +84,7 @@ class StableUserPage {
     [[nodiscard]] auto was_dirty() const -> bool;
     [[nodiscard]] auto still_mapped() const -> bool;
     [[nodiscard]] auto commit_write() const -> bool;
+    [[nodiscard]] auto retain_frame(UserPageFrameRef& out) const -> bool;
 
    private:
     friend auto pin_task_user_page(sched::task::Task&, uint64_t, bool, bool, StableUserPage&) -> bool;

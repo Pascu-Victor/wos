@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <utility>
 
 #include "platform/asm/cpu.hpp"
 #include "platform/mm/paging.hpp"
@@ -83,6 +84,30 @@ auto access_window_active() -> bool {
     return (flags & RFLAGS_AC) != 0U;
 }
 
+UserPageFrameRef::~UserPageFrameRef() { reset(); }
+
+UserPageFrameRef::UserPageFrameRef(UserPageFrameRef&& other) noexcept
+    : m_page(std::exchange(other.m_page, nullptr)), m_lookup_hint(std::exchange(other.m_lookup_hint, mm::phys::PageLookupHint{})) {}
+
+auto UserPageFrameRef::operator=(UserPageFrameRef&& other) noexcept -> UserPageFrameRef& {
+    if (this != &other) {
+        reset();
+        m_page = std::exchange(other.m_page, nullptr);
+        m_lookup_hint = std::exchange(other.m_lookup_hint, mm::phys::PageLookupHint{});
+    }
+    return *this;
+}
+
+auto UserPageFrameRef::valid() const noexcept -> bool { return m_page != nullptr; }
+
+void UserPageFrameRef::reset() noexcept {
+    void* const PAGE = std::exchange(m_page, nullptr);
+    mm::phys::PageLookupHint hint = std::exchange(m_lookup_hint, mm::phys::PageLookupHint{});
+    if (PAGE != nullptr) {
+        mm::phys::page_ref_dec(PAGE, &hint);
+    }
+}
+
 StableUserPage::~StableUserPage() { reset(); }
 
 auto StableUserPage::valid() const -> bool { return m_task != nullptr && m_pin.hhdm_page != nullptr; }
@@ -106,6 +131,21 @@ auto StableUserPage::was_dirty() const -> bool { return valid() && m_pin.dirty; 
 auto StableUserPage::still_mapped() const -> bool { return valid() && mm::virt::user_page_pin_still_mapped(m_pin); }
 
 auto StableUserPage::commit_write() const -> bool { return valid() && mm::virt::user_page_pin_commit_write(m_pin); }
+
+auto StableUserPage::retain_frame(UserPageFrameRef& out) const -> bool {
+    if (!valid() || out.valid()) {
+        return false;
+    }
+    mm::phys::PageLookupHint hint = m_pin.lookup_hint;
+    // The live pin already owns this frame across concurrent unmap. Duplicate
+    // only its allocator reference; the new owner never keeps a root reader.
+    if (!mm::phys::page_ref_try_inc(m_pin.hhdm_page, &hint)) {
+        return false;
+    }
+    out.m_page = m_pin.hhdm_page;
+    out.m_lookup_hint = hint;
+    return true;
+}
 
 void StableUserPage::reset() {
     auto* task = m_task;

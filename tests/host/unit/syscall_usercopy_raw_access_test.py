@@ -206,8 +206,8 @@ def test_raw_translation_exceptions_are_only_unpublished_images() -> None:
 
     vmem_source = translation_files[str(VMEM_CPP.relative_to(ROOT))]
     table_from_entry = function_body(vmem_source, "auto table_from_entry(")
-    # Only this named private-root native helper is exempted. Production and
-    # every other native helper keep the original page-table-only closed world.
+    # Only these two named private-root native helpers are exempted. Production
+    # and every other native helper keep the page-table-only closed world.
     start = vmem_source.find("auto selftest_file_mapping_admission(")
     if start < 0 or vmem_source.rfind("#ifdef WOS_SELFTEST", 0, start) <= vmem_source.rfind("#endif", 0, start):
         fail("VMEM named fixture must remain inside WOS_SELFTEST")
@@ -215,10 +215,23 @@ def test_raw_translation_exceptions_are_only_unpublished_images() -> None:
     end = find_matching_brace(vmem_source, brace) + 1
     fixture = vmem_source[brace + 1 : end - 1]
     remaining = vmem_source[:start] + vmem_source[end:]
+    projection_start = remaining.find("auto selftest_lazy_file_projection(")
+    if (projection_start < 0 or remaining.rfind("#ifdef WOS_SELFTEST", 0, projection_start)
+            <= remaining.rfind("#endif", 0, projection_start)):
+        fail("VMEM projection fixture must remain inside WOS_SELFTEST")
+    projection_brace = remaining.find("{", projection_start)
+    projection_end = find_matching_brace(remaining, projection_brace) + 1
+    projection = remaining[projection_brace + 1 : projection_end - 1]
+    remaining = remaining[:projection_start] + remaining[projection_end:]
     if (fixture.count("virt::translate(pagemap, BASE)") != 2 or fixture.count("get_virt_pointer(PADDR)") != 1
             or fixture.count("translate(") != 2 or fixture.count("get_virt_pointer(") != 1
-            or vmem_source.count("translate(") != 2 or vmem_source.count("get_virt_pointer(") != 2):
+            or vmem_source.count("translate(") != 4 or vmem_source.count("get_virt_pointer(") != 3):
         fail("VMEM named fixture raw access must remain its exact marker/content checks")
+    if (projection.count("mm::virt::translate(pagemap, address)") != 1
+            or projection.count("mm::virt::translate(pagemap, BASE)") != 1
+            or projection.count("mm::addr::get_virt_pointer(PHYSICAL)") != 1
+            or projection.count("translate(") != 2 or projection.count("get_virt_pointer(") != 1):
+        fail("VMEM projection fixture raw access must remain exact cold-byte/no-effect checks")
     if "get_virt_pointer" not in table_from_entry or remaining.count("get_virt_pointer(") != 1 or "translate(" in remaining:
         fail("VMEM raw access must remain limited to walking kernel page-table frames")
     require_code(fixture, ["constexpr uint64_t BASE = USER_SPACE_START;", "constexpr uint64_t SIZE = paging::PAGE_SIZE;", "task.pagemap = pagemap;",
@@ -227,6 +240,26 @@ def test_raw_translation_exceptions_are_only_unpublished_images() -> None:
                           "remove_lazy_vmem_range(&task, BASE, SIZE);", "unregister_file_mmap_range(pagemap, BASE, SIZE);", "rollback_mapped_pages(&task, BASE, 1);",
                           "vfs::vfs_release_fd(&task, FD);", "vfs::vfs_put_file(file);"], "private VMEM fixture identity/effects/cleanup")
     require_order(fixture, ["auto const PADDR = virt::translate(pagemap, BASE);", "if (PADDR != virt::PADDR_INVALID)", "get_virt_pointer(PADDR)"], "VMEM content read after valid translation")
+    require_code(projection, ["constexpr uint64_t BASE = 0x400000;", "constexpr uint64_t PAGE = mm::paging::PAGE_SIZE;",
+                             "constexpr uint64_t SIZE = 6 * PAGE;", "task.pagemap = pagemap;",
+                             "file->fs_type = vfs::FSType::SOCKET;", "remove_lazy_vmem_range(&task, BASE, SIZE)",
+                             "rollback_mapped_pages(&task, BASE, SIZE / PAGE);", "selftest_evict_file_mmap_cache_exact(*page.file, page.offset, page.frame)",
+                             "mm::phys::page_ref_dec(page.frame);", "vfs::vfs_put_file(file);", "vfs::vfs_put_file(replacement);",
+                             "mm::virt::translate(pagemap, BASE) == mm::virt::PADDR_INVALID && state.reads == 0 && state.closes == 0",
+                             "unregister_file_mmap_range(pagemap, BASE, PAGE)", "rollback_mapped_pages(&task, BASE, 1);",
+                             "vfs::vfs_release_fd(&task, FD);"], "private VMEM projection fixture ownership/no-effects/cleanup")
+    guard_start = projection.find("SharedVmemPublicationGuard guard;")
+    guard_brace = projection.rfind("{", 0, guard_start)
+    if guard_start < 0 or guard_brace < 0 or projection[guard_brace + 1 : guard_start].strip():
+        fail("VMEM projection byte checks must keep their explicit publication guard")
+    guarded = projection[guard_brace + 1 : find_matching_brace(projection, guard_brace)]
+    if guarded.count("translate(") != 1 or guarded.count("get_virt_pointer(") != 1:
+        fail("VMEM projection content translation/dereference must stay inside publication guard")
+    require_order(guarded, ["for (uint64_t address = BASE; ok && address < BASE + SIZE; address += PAGE)",
+                           "auto const PHYSICAL = mm::virt::translate(pagemap, address);",
+                           "if (PHYSICAL == mm::virt::PADDR_INVALID)", "break;", "mm::addr::get_virt_pointer(PHYSICAL)",
+                           "for (size_t i = 0; i < PAGE; ++i)", "BYTE(SEED, EXPECTED_OFFSET + i) == bytes[i]",
+                           "rollback_mapped_pages(&task, BASE, SIZE / PAGE);"], "VMEM bounded guarded projection byte access")
     native = MM_KTEST_CPP.read_text()
     if native.count("selftest_file_mapping_admission(") != 1:
         fail("VMEM fixture must retain exactly one private native caller")
@@ -235,6 +268,11 @@ def test_raw_translation_exceptions_are_only_unpublished_images() -> None:
     require_code(function_body(native, "auto init_test_user_tree("), ["tree.root = alloc_test_page_table();", "cleanup_test_user_tree(tree);"], "VMEM owned test root")
     require_code(function_body(native, "auto alloc_test_page_table("), ["alloc_test_pages()", "phys::page_mark_kind(table, mm::PageKind::PAGE_TABLE)"], "VMEM test page-table allocation")
     require_code(function_body(native, "auto alloc_test_pages("), ["phys::page_alloc(mm::PhysicalPageOwner::SELFTEST, size,"], "VMEM test physical ownership")
+    if native.count("selftest_lazy_file_projection(") != 1:
+        fail("VMEM projection fixture must retain exactly one private native caller")
+    projection_caller = function_body(native, "KTEST(MM, LazyFileSplitsPreserveColdBytesAndRejectOffsetOverflow)")
+    require_order(projection_caller, ["TestUserTree tree;", "KREQUIRE_TRUE(init_test_user_tree(tree));",
+                                    "selftest_lazy_file_projection(tree.root)", "cleanup_test_user_tree(tree);"], "VMEM projection owned private root caller")
 
 
 def test_transitive_address_consumers_do_not_raw_access_userspace() -> None:

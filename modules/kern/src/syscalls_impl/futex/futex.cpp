@@ -16,6 +16,12 @@
 #include <platform/sys/usercopy.hpp>
 #include <util/hashtable.hpp>
 
+#ifdef WOS_SELFTEST
+#include <platform/mm/addr.hpp>
+#include <platform/mm/phys.hpp>
+#include <utility>
+#endif
+
 namespace ker::syscall::futex {
 namespace {
 // ============================================================================
@@ -31,6 +37,8 @@ struct FutexWaiter {
     // entry and Task::futex_waiter. Wake and cancellation paths can retire
     // those owners concurrently, so deletion belongs to the final releaser.
     std::atomic<uint32_t> ref_count{2};
+    // The physical key cannot be recycled while either published owner lives.
+    mod::sys::usercopy::UserPageFrameRef frame;
 };
 
 struct FutexKeyExtract {
@@ -222,6 +230,10 @@ int64_t futex_wait(uint64_t user_addr, int expected, uint64_t timeout_user_addr)
         delete waiter;
         return -EFAULT;
     }
+    if (!futex_page.retain_frame(waiter->frame)) {
+        delete waiter;
+        return -ENOMEM;
+    }
 
     void* previous_waiter = nullptr;
     bool const INSERTED = futex_table.insert_if(
@@ -369,6 +381,181 @@ int64_t futex_wake_by_phys(uint64_t phys_addr, int count) {
 }
 
 #ifdef WOS_SELFTEST
+namespace {
+// Exclusively owned, never active or scheduler-published. Mapping retirement
+// runs after every lexical stable pin has ended, while a queued frame may live.
+struct SelftestFutexFrame {
+    static constexpr uint64_t ADDRESS = 0x49000040;
+    mod::sched::task::Task task{};
+    mod::mm::paging::PageTable* root{};
+    void* frame{};
+    bool oracle_owned{};
+
+    ~SelftestFutexFrame() {
+        retire_mapping();
+        static_cast<void>(release_oracle());
+    }
+
+    auto initialize() -> bool {
+        root = mod::mm::virt::create_pagemap_may_fail();
+        if (root == nullptr) return false;
+        task.type = mod::sched::task::TaskType::PROCESS;
+        task.pagemap = root;
+        frame = mod::mm::phys::page_alloc_with_reclaim_may_fail(mod::mm::PhysicalPageOwner::SELFTEST, mod::mm::paging::PAGE_SIZE,
+                                                                "futex-frame-owner");
+        if (frame == nullptr) return false;
+        if (!mod::mm::phys::page_ref_try_inc(frame)) {
+            mod::mm::phys::page_ref_dec(frame);
+            frame = nullptr;
+            return false;
+        }
+        oracle_owned = true;
+        uint64_t const PHYSICAL = reinterpret_cast<uint64_t>(mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(frame)));
+        // map_page transfers this initial frame reference into the owned root.
+        mod::mm::virt::map_page(root, ADDRESS & ~(mod::mm::paging::PAGE_SIZE - 1), PHYSICAL,
+                                mod::mm::paging::page_types::USER | mod::mm::paging::PAGE_SHARED);
+        // The following real stable pin verifies this mapping before retain;
+        // the fixture needs no raw translation at the syscall entrypoint.
+        return true;
+    }
+
+    void retire_mapping() {
+        if (root == nullptr) return;
+        auto* detached = task.detach_pagemap_after_usercopy_quiescence();
+        mod::mm::virt::destroy_user_space(detached, 0, "futex_ktest", "frame-owner");
+        mod::mm::virt::release_pagemap(detached);
+        root = nullptr;
+    }
+
+    auto release_oracle() -> bool {
+        if (!oracle_owned) return false;
+        oracle_owned = false;
+        // Observe the final decrement itself; never query an already free
+        // frame that another CPU could have allocated in the meantime.
+        return mod::mm::phys::page_ref_dec(frame) == 0;
+    }
+};
+
+struct SelftestFutexWaiterOwners {
+    decltype(futex_table)& table;
+    mod::sched::task::Task& task;
+    FutexWaiter* waiter;
+    bool table_owned{true};
+    bool slot_owned{true};
+
+    ~SelftestFutexWaiterOwners() {
+        // This local table and unpublished Task have no external actors.
+        // Retire both known fixture owners even when a test predicate fails.
+        if (slot_owned) {
+            task.futex_waiter.store(nullptr, std::memory_order_release);
+            static_cast<void>(release_waiter_ref(waiter));
+        }
+        if (table_owned) {
+            static_cast<void>(table.remove(waiter));
+            static_cast<void>(release_waiter_ref(waiter));
+        }
+    }
+};
+}  // namespace
+
+auto futex_selftest_queued_frame_survives_root_retirement() -> bool {
+    for (bool slot_first : {false, true}) {
+        SelftestFutexFrame subject;
+        if (!subject.initialize()) return false;
+        decltype(futex_table) table;
+        if (!table.init(8)) return false;
+        auto* waiter = new (std::nothrow) FutexWaiter{};
+        if (waiter == nullptr) return false;
+        bool published = false;
+        {
+            mod::sys::usercopy::StableUserPage pin;
+            if (mod::sys::usercopy::pin_task_user_page(subject.task, subject.ADDRESS, false, false, pin) && pin.still_mapped() &&
+                pin.retain_frame(waiter->frame)) {
+                waiter->phys_addr = pin.physical_address();
+                published = table.insert_if(
+                    waiter, [] { return true; }, [&] { subject.task.futex_waiter.store(waiter, std::memory_order_release); });
+            }
+        }
+        if (!published) {
+            delete waiter;
+            return false;
+        }
+        SelftestFutexWaiterOwners owners{table, subject.task, waiter};
+        bool ok =
+            subject.task.usercopy_pagemap_accesses.load(std::memory_order_acquire) == 0 && mod::mm::phys::page_ref_get(subject.frame) == 3;
+        subject.retire_mapping();
+        ok = subject.task.pagemap == nullptr && mod::mm::phys::page_ref_get(subject.frame) == 2 && ok;
+        if (slot_first) {
+            bool const CLAIMED = claim_task_waiter(&subject.task, waiter);
+            ok = CLAIMED && ok;
+            // This unpublished Task and local table have no external actors;
+            // the fixture owns both references even when an assertion fails.
+            subject.task.futex_waiter.store(nullptr, std::memory_order_release);
+            owners.slot_owned = false;
+            bool const FIRST_DELETED = release_waiter_ref(waiter);
+            ok = !FIRST_DELETED && ok;
+            // Final deletion happens inside the real bucket IRQ-lock callback.
+            size_t const REMOVED = table.remove_by_key_limit(waiter->phys_addr, 1, [&](FutexWaiter* entry) {
+                bool const FRAME_HELD = mod::mm::phys::page_ref_get(subject.frame) == 2;
+                owners.table_owned = false;
+                bool const DELETED = release_waiter_ref(entry);
+                ok = FRAME_HELD && DELETED && ok;
+                return true;
+            });
+            ok = REMOVED == 1 && ok;
+        } else {
+            bool const REMOVED = table.remove(waiter);
+            ok = REMOVED && ok;
+            if (REMOVED) {
+                owners.table_owned = false;
+                ok = !release_waiter_ref(waiter) && ok;
+            }
+            bool const CLAIMED = claim_task_waiter(&subject.task, waiter);
+            ok = CLAIMED && ok;
+            subject.task.futex_waiter.store(nullptr, std::memory_order_release);
+            owners.slot_owned = false;
+            bool const DELETED = release_waiter_ref(waiter);
+            ok = DELETED && ok;
+        }
+        ok = mod::mm::phys::page_ref_get(subject.frame) == 1 && ok;
+        ok = subject.release_oracle() && ok;
+        if (!ok) return false;
+    }
+    return true;
+}
+
+auto futex_selftest_frame_ref_moves_preserve_ownership() -> bool {
+    SelftestFutexFrame subject;
+    if (!subject.initialize()) return false;
+    bool ok = true;
+    {
+        mod::sys::usercopy::StableUserPage pin;
+        mod::sys::usercopy::StableUserPage empty_pin;
+        mod::sys::usercopy::UserPageFrameRef first;
+        mod::sys::usercopy::UserPageFrameRef empty;
+        ok = mod::sys::usercopy::pin_task_user_page(subject.task, subject.ADDRESS, false, false, pin) && pin.retain_frame(first) &&
+             mod::mm::phys::page_ref_get(subject.frame) == 4;
+        ok = !pin.retain_frame(first) && first.valid() && !empty_pin.retain_frame(empty) && !empty.valid() &&
+             mod::mm::phys::page_ref_get(subject.frame) == 4 && ok;
+        mod::sys::usercopy::UserPageFrameRef moved(std::move(first));
+        ok = !first.valid() && moved.valid() && mod::mm::phys::page_ref_get(subject.frame) == 4 && ok;
+        auto* same = &moved;
+        moved = std::move(*same);
+        ok = moved.valid() && mod::mm::phys::page_ref_get(subject.frame) == 4 && ok;
+        ok = pin.retain_frame(first) && mod::mm::phys::page_ref_get(subject.frame) == 5 && ok;
+        moved = std::move(first);
+        ok = !first.valid() && moved.valid() && mod::mm::phys::page_ref_get(subject.frame) == 4 && ok;
+        moved.reset();
+        moved.reset();
+        ok = !moved.valid() && mod::mm::phys::page_ref_get(subject.frame) == 3 && ok;
+    }
+    ok = subject.task.usercopy_pagemap_accesses.load(std::memory_order_acquire) == 0 && mod::mm::phys::page_ref_get(subject.frame) == 2 &&
+         ok;
+    subject.retire_mapping();
+    ok = mod::mm::phys::page_ref_get(subject.frame) == 1 && ok;
+    return subject.release_oracle() && ok;
+}
+
 auto futex_selftest_table_init_is_serialized() -> bool {
     bool const FIRST = ensure_futex_table();
     bool const SECOND = ensure_futex_table();

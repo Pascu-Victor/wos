@@ -1263,3 +1263,50 @@ and seven existing focused Host checks pass. No new guest or KTEST execution
 is claimed for this patch. The earlier Native75 and public Filemap03 receipts
 remain evidence of their exact earlier source cohort. Shared coherence,
 broader root/reclaim dependencies and all ten full goal criteria remain open.
+
+
+## Checkpoint52: queued futex frame ownership (2026-10-14)
+
+A queued futex waiter now owns one checked allocator-frame reference after its
+scoped mapping pin ends. Final table/Task-slot retirement releases that reference,
+including wake, timeout, cancellation and unpublished failure paths. The owner
+keeps no Task, pagemap or usercopy lease across sleep. Existing physical-word keys,
+timeout/error ordering and the two-owner election are preserved; checked extra-ref
+admission can additionally return ENOMEM. Private/COW/shared-zero key policy and
+canonical mutable file backing remain open.
+
+The new registered ASan/UBSan Host regression compiles the complete real futex
+translation unit and hash table, actual frame/stable-pin methods and checked ref
+increment against explicit Host primitives. All 22 vectors, 4,176 assertions and
+128 wake/cancellation races pass. The complete archived old futex unit genuinely
+compiles, then fails the same pending-frame oracle with two premature-reuse
+failures. Both runs retire their owned processes and remove private scratch.
+The existing 42 caller-order vectors pass unchanged.
+
+Final Normal Build WOS, isolated `bin/wos-ktest --fast --build-only` and formatting
+pass. Ten related registered Host checks pass. The wider Host/KTEST manifest
+checks fail on existing standalone KCOV and eight indirect Credentials wrappers;
+the failing files/checkers are byte-identical to HEAD. Their failed receipts are
+retained, and the wider manifest checks are not reported as passing. The raw VM
+access test now enumerates the earlier private lazy-projection fixture exactly,
+with guard, bounds, translation validity and cleanup checks preserved.
+
+Two new native futex fixtures compile and await execution. They use actual page
+roots/frames, retain a private oracle reference through teardown, and clean up
+both fixture waiter owners on failures. Final frame-count observations happen
+while the oracle still owns the frame; the last decrement itself checks zero.
+Native physical zero-free under the bucket IRQ lock remains source-reviewed,
+with the analogous Host IRQ primitive exercised. No new native runtime pass is
+claimed. Native77 remains evidence of its earlier exact source/artifact cohort.
+
+Independent production/native source review03 is CLEAR (10 checks/35 subjects),
+SHA256 `97fada9029f5281b40952746f71462510b65320d2de165c19014d1b303cf0f2d`.
+Independent saved Host audit01 is CLEAR (9 checks), SHA256
+`6c3139ef4ba52dc44985b820bf0764b7c179d644cbb88d02205460ff504f0f90`.
+Root rehashes all retained subjects. Earlier fixture failures/findings are kept.
+
+Goal39 remains ACTIVE with all ten full acceptance criteria open. Continue with
+fresh current source/build/artifact binding and exact-owned native qualification
+using `bin/wos-ktest --no-setup`; retain the shared launch guard, isolated sysroot,
+one topology, 20GiB budget/40GiB free-space floor and all-outcome pruning. No new
+VM images were created for this patch's build/Host checks. No pause or push.

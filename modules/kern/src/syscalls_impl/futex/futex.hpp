@@ -31,6 +31,8 @@ void futex_wait_cleanup_for_task(ker::mod::sched::task::Task* task);
 int64_t futex_wake_by_phys(uint64_t phys_addr, int count);
 
 #ifdef WOS_SELFTEST
+auto futex_selftest_queued_frame_survives_root_retirement() -> bool;
+auto futex_selftest_frame_ref_moves_preserve_ownership() -> bool;
 auto futex_selftest_table_init_is_serialized() -> bool;
 auto futex_selftest_addr_alignment_guard() -> bool;
 auto futex_selftest_stale_wake_does_not_claim_waiter() -> bool;
