@@ -141,6 +141,9 @@ void record_demand_candidate(const DemandContext&,bool){assert(guards==0);}
 bool demand_is_observed(const DemandContext&){assert(guards==0);return false;}
 void record_demand_result(const DemandContext&,DemandBacking,numa::NodeId,numa::NodeId,bool,bool,bool){assert(guards==0);}
 using PageTable=::PageTable;Lock cow_pte_lock;
+// RAW file-only fixture: anonymous swap lookup is deliberately unreachable.
+struct AnonymousSwapMapping;
+auto find_anonymous_swap_mapping_locked(PageTable*,uint64_t)->AnonymousSwapMapping*{std::abort();}
 namespace log{template<class...Args>void error(const char*,Args...){}}
 void log_lazy_vmem_fault_state(sched::task::Task*,uint64_t,const paging::PageFault&,const char*,uint64_t,uint64_t){}
 uint64_t lazy_user_vmem_flags(uint64_t prot){return prot;}

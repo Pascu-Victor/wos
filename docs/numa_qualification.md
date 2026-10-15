@@ -213,3 +213,43 @@ original guard and unrelated VM were preserved. Its peak disposable allocation
 was also 268,910,592 bytes and its owned images/auth files were removed. The
 receipt is `build/goal40-evidence/native-uma13/result.json`. This qualifies the
 same internal paths on UMA, with the prescheduler limitations above.
+
+## Swap preservation and teardown ordering, 2026-10-15
+
+Generic anonymous software fault-in now refuses a tracked swap marker instead
+of installing fresh zero backing over saved bytes. Two native tests exercise
+both generic ensure and usercopy refusal, preserve the real swap slot and
+marker, then recover and compare every byte through the existing page-in path.
+This does not add blocking swap preparation to arbitrary usercopy callers.
+
+Both teardown walkers detach a valid data leaf before enqueueing its owner.
+Every nonempty data or page-table batch retains the actual root and completes
+its full-root TLB flush before decrementing references. This includes the
+immediate capacity flush and budget slices/disposal. Existing page-table parent
+detachment and final binding retirement remain in place. SMP initialization or
+CPU online publication now fails if its required shootdown vector is absent.
+Callers still own the no-future-root-publisher precondition; disposing a partial
+budget state does not finish the remaining tree.
+
+Normal Build WOS, isolated fast KTEST build, all 24 registered relevant Host
+entries and the changed C++ formatting/clang-tidy check passed. New executable
+Host adapters exercise actual teardown/readiness bodies through disclosed
+physical/TLB primitives. Their ordering assertions reject the original code;
+they do not model an actual remote CPU acknowledging an IPI.
+
+Fresh virtual NUMA passed 1,495 cases and 129,429 assertions, with zero failures
+and natural poweroff, using kernel SHA-256
+`f14ebe9beae60cd76c5548978a5e7dc89c11400db629b26944dacda32b5a95f8`.
+Both new swap tests and the earlier demand/WKI cases passed. Watched sources,
+the host launch guard and the unrelated VM stayed unchanged. Disposable image
+allocation peaked at 268,976,128 bytes and returned to zero after exact-owned
+inactivity/reference/backing checks. The receipt is
+`build/goal40-evidence/native-numa14/result.json`.
+
+UMA control of the same kernel passed 1,495 cases and 129,266 assertions, with
+zero failures and natural poweroff. Watched sources, the original guard and
+unrelated VM stayed unchanged. Its disposable allocation also peaked at
+268,976,128 bytes and returned to zero. The receipt is
+`build/goal40-evidence/native-uma15/result.json`. These prescheduler tests do
+not qualify ordinary SMP teardown/reuse, IF-off cross-CPU shootdown progress,
+scheduled CPL3 first touch or general huge-page lifetime.

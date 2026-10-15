@@ -919,6 +919,15 @@ add_test(
     NAME tlb_shootdown_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/tlb_shootdown_source_test.py
 )
+
+foreach(_wos_tlb_runtime_test IN ITEMS teardown_tlb_runtime_test tlb_shootdown_readiness_runtime_test)
+    add_test(NAME ${_wos_tlb_runtime_test}
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/${_wos_tlb_runtime_test}.py
+    )
+    set_tests_properties(${_wos_tlb_runtime_test} PROPERTIES
+        LABELS "host;unit;runtime;integration" TIMEOUT 90
+    )
+endforeach()
 add_test(
     NAME wki_timer_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_timer_source_test.py

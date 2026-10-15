@@ -14,6 +14,22 @@ mappings have correct COW, pinning, teardown and pressure behavior.
 **Target: one to two continuous weeks with topology, MM-lifecycle and
 benchmark/test subagents.** Topology labels alone do not meet this goal.
 
+User-directed execution override, 2026-10-15: use virtualized NUMA on the
+available single-node host. For criterion 9, collect the ten paired, CPU-pinned
+local-versus-remote placement runs on an accepted emulated topology, verify
+actual page placement, and report raw samples, variance and median latency.
+Report the original real-hardware 10% threshold as unverified; virtual SLIT
+distances cannot establish physical remote-memory latency. Large-page mapping
+and TLB-sensitive measurements remain separate requirements. All other
+acceptance criteria retain their scope.
+
+The user authorizes agent-run WOS qualification through `bin/wos-cluster
+--no-setup` and isolated `bin/wos-ktest --no-setup`; root setup is unnecessary.
+Keep one disposable topology, a 20 GiB disposable-storage budget and at least
+40 GiB free. After successful and failed runs, remove only proven inactive,
+agent-owned disposable disks, overlays and obsolete appliances. Preserve logs,
+receipts, required current artifacts/seeds and user or unrelated VM disks.
+
 This goal can start independently of virtualization. If native guest-memory
 slots exist by execution time, integrate their supported placement policy and
 pin lifecycle; do not invent a dependency on an unfinished VMM.
@@ -81,7 +97,9 @@ placement consumes locality hints while retaining affinity and fairness.
 8. User-run UMA and at least two-domain NUMA fixtures exercise first touch,
    interleave, strict exhaustion and 1,000 map/fork/pin/unmap cycles. No physical
    ownership mismatch or monotonic retained-memory growth remains.
-9. On a real NUMA fixture, a fixed CPU-pinned pointer-chase benchmark improves
+9. Original real-hardware criterion (superseded for this execution by the
+   user-directed virtual fixture above): on a real NUMA fixture, a fixed
+   CPU-pinned pointer-chase benchmark improves
    median access latency by at least 10% over deliberate remote placement across
    10 paired runs. Large-page evidence verifies mappings and TLB-sensitive
    workload results separately; emulated topology is not real NUMA performance
@@ -126,8 +144,8 @@ Prepare isolated diagnostics with `bin/wos-ktest --build-only`, retaining
 `docs/kernel_debug_flags.md` before changing diagnostic flags. Never combine
 report-mode KUBSan with the UBSan trap profile.
 
-Kernel/cluster runtime execution and debugging are user-run under the current
-instructions. Supply exact fixture-specific commands, expected observations,
+Kernel/cluster runtime execution follows the user's rootless agent-run
+authorization above. Supply exact fixture-specific commands, expected observations,
 and log locations early; analyze returned evidence while continuing independent
 implementation and host validation. Runtime requirements in this file are mandatory,
 not replaced by model tests, source-string tests, a successful build, or a demo

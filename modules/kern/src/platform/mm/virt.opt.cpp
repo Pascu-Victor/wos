@@ -1273,6 +1273,8 @@ void start_lazy_file_fault_worker() {
 }
 #endif
 
+auto find_anonymous_swap_mapping_locked(PageTable* pagemap, vaddr_t vaddr) -> AnonymousSwapMapping*;
+
 auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const paging::PageFault& fault, const DemandContext& demand,
                             uint64_t fault_rip = 0, uint64_t fault_rsp = 0, bool allow_file_io = true) -> bool {
     if (task == nullptr || task->pagemap == nullptr) {
@@ -1365,7 +1367,10 @@ auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const pagin
             sched::PreemptGuard const PREEMPT;
             observed = demand_is_observed(demand);
             uint64_t const PTE_IRQF = cow_pte_lock.lock_irqsave();
-            allowed = anonymous_lazy_range_allows_fault(task, PAGE_VADDR, fault, current_prot);
+            // A non-present tracked swap leaf still owns saved bytes. Generic
+            // software fault-in must not replace it with fresh zero backing.
+            allowed = find_anonymous_swap_mapping_locked(task->pagemap, PAGE_VADDR) == nullptr &&
+                      anonymous_lazy_range_allows_fault(task, PAGE_VADDR, fault, current_prot);
             already_mapped = translate(task->pagemap, PAGE_VADDR) != PADDR_INVALID;
             if (allowed && !already_mapped) {
                 map_page(task->pagemap, PAGE_VADDR, PADDR, lazy_user_vmem_flags(current_prot));
@@ -4273,6 +4278,7 @@ void init_tlb_shootdown() {
         gates::set_interrupt_handler(tlb_shootdown_vector, tlb_shootdown_handler);
         dbg::log("Registered TLB shootdown IPI handler at vector 0x%x", tlb_shootdown_vector);
     } else {
+        if (smt::get_core_count() > 1) dbg::panic_handler("SMP requires a TLB shootdown vector");
         dbg::log("WARNING: No free interrupt vector for TLB shootdown IPI");
     }
 }
@@ -4733,6 +4739,8 @@ void note_tlb_shootdown_cpu_online() {
     if (!cpu_slot_valid(CPU_NO)) {
         return;
     }
+    if (tlb_shootdown_vector == 0 && (smt::get_core_count() > 1 || CPU_NO != 0))
+        dbg::panic_handler("CPU cannot enter SMP scheduling without TLB shootdown");
     tlb_active_pagemaps[static_cast<size_t>(CPU_NO)].store(kernel_pagemap, std::memory_order_release);
     tlb_shootdown_cpu_online[static_cast<size_t>(CPU_NO)].store(1U, std::memory_order_release);
 }
@@ -7802,6 +7810,7 @@ struct DestroyUserSpaceBudgetState {
         std::array<void*, DESTROY_REFDEC_BATCH_CAP> pages{};
         phys::PageLookupHint lookup{};
         size_t count = 0;
+        PageTable* root = nullptr;  // Original owner/gate outlives every queued ref and ACK.
     };
 
     PageTable* pagemap = nullptr;
@@ -7845,6 +7854,10 @@ void destroy_refdec_batch_flush(DestroyRefdecBatch& batch, DestroyUserSpaceCallS
         return;
     }
 
+    if (batch.root == nullptr) dbg::panic_handler("teardown refdec batch lost retained root");
+    // Every queued owner is already detached. Keep the original root/gate held
+    // through the existing full-root local/remote completion protocol.
+    flush_pagemap_after_update(batch.root, 0, true);
     phys::PageRefBatchStats const BATCH_STATS =
         phys::page_ref_dec_batch(std::span<void* const>{batch.pages.data(), batch.count}, &batch.lookup);
     note_destroy_refdec_batch_stats(stats, BATCH_STATS, kind);
@@ -8090,6 +8103,7 @@ auto advance_free_data_budgeted(DestroyUserSpaceBudgetState& state, DestroyUserS
             uint64_t const VIRT_RAW = PHYS_ADDR + addr::get_hhdm_offset();
             if ((VIRT_RAW >> CANONICAL_SIGN_BIT) == CANONICAL_KERNEL_UPPER) {
                 void* page_virt = reinterpret_cast<void*>(VIRT_RAW);
+                entry = paging::purge_page_table_entry();
                 destroy_state_queue_refdec(state, page_virt, stats);
             } else {
                 note_destroy_corrupt_skip(&stats);
@@ -8444,6 +8458,7 @@ void free_user_data_pages(PageTable* table, int level, PageTable* root, const Pa
                 uint64_t const VIRT_RAW = PHYS_ADDR + addr::get_hhdm_offset();
                 if ((VIRT_RAW >> CANONICAL_SIGN_BIT) == CANONICAL_KERNEL_UPPER) {
                     void* page_virt = reinterpret_cast<void*>(VIRT_RAW);
+                    entry = paging::purge_page_table_entry();
                     destroy_refdec_batch_queue(refdec_batch, page_virt, stats, DestroyRefdecBatchKind::DATA);
                 } else {
                     note_destroy_corrupt_skip(stats);
@@ -8556,6 +8571,8 @@ auto begin_prepared_destroy_user_space(DestroyUserSpaceBudgetState& state, PageT
     purge_anonymous_swap_mappings(pagemap);
     owned_frame_purge_pagemap(pagemap);
     state.pagemap = pagemap;
+    state.refdec_batch.root = pagemap;
+    state.page_table_refdec_batch.root = pagemap;
     state.owner_pid = owner_pid;
     state.owner_name = owner_name;
     state.reason = reason;
@@ -8701,14 +8718,14 @@ void destroy_user_space(PageTable* pagemap, uint64_t owner_pid, const char* owne
     stats.collect_frames_us = elapsed_us_since(phase_start_us, time::get_us());
 
     phase_start_us = time::get_us();
-    DestroyRefdecBatch refdec_batch{};
+    DestroyRefdecBatch refdec_batch{.root = pagemap};
     free_user_data_pages(pagemap, 4, pagemap, page_table_frames, refdec_batch, &stats, 0, owner_pid, owner_name, reason,
                          &frame_probe_cache);
     destroy_refdec_batch_flush(refdec_batch, &stats, DestroyRefdecBatchKind::DATA);
     stats.free_data_us = elapsed_us_since(phase_start_us, time::get_us());
 
     phase_start_us = time::get_us();
-    DestroyRefdecBatch page_table_refdec_batch{};
+    DestroyRefdecBatch page_table_refdec_batch{.root = pagemap};
     free_page_table_pages(pagemap, 4, page_table_refdec_batch, &stats, 0, &frame_probe_cache, pagemap, owner_pid, reason);
     destroy_refdec_batch_flush(page_table_refdec_batch, &stats, DestroyRefdecBatchKind::PAGE_TABLE);
     stats.free_pt_us = elapsed_us_since(phase_start_us, time::get_us());

@@ -126,6 +126,11 @@ void record_demand_result(const DemandContext&,DemandBacking,numa::NodeId,numa::
 constexpr uint64_t PADDR_INVALID=UINT64_MAX;
 enum class LazyFilePageInstallResult{MAPPED,ALREADY_MAPPED,STALE_RANGE};
 model::Lock cow_pte_lock{1};
+// This harness has no swap records; genuine saved-byte preservation is native.
+struct AnonymousSwapMapping;
+auto find_anonymous_swap_mapping_locked(void*,uint64_t)->AnonymousSwapMapping*{
+ assert(!model::locks.empty()&&model::locks.front()==1);return nullptr;
+}
 uint64_t translate(void*,uint64_t){assert(!model::locks.empty()&&model::locks.front()==1);return model::mapping?model::mapping:PADDR_INVALID;}
 void map_page(void*,uint64_t,uint64_t p,uint64_t flags){assert(!model::locks.empty()&&model::locks.front()==1&&!model::mapping&&model::live&&model::unpoisoned);
  assert(p==reinterpret_cast<uint64_t>(model::bytes.data())&&flags==model::expected_flags);

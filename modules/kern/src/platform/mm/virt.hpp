@@ -496,6 +496,10 @@ void get_anonymous_swap_stats_snapshot(AnonymousSwapStatsSnapshot& out);
 void register_anonymous_swap_shrinker();
 void start_anonymous_swap_worker();
 auto get_destroy_user_space_stats(uint64_t cpu_no) -> DestroyUserSpaceStats;
+// Caller retains the actual original root owner and withdraws future hardware
+// publishers; the exclusive software-pin gate alone cannot prove that condition.
+// Keep this owner through every slice/ACK and final root retirement. Disposing a
+// partial walk flushes queued detached refs but does not finish the remaining tree.
 auto prepare_destroy_user_space_budget_state() -> DestroyUserSpaceBudgetState*;
 [[nodiscard]] auto begin_prepared_destroy_user_space(DestroyUserSpaceBudgetState& state, PageTable* pagemap, uint64_t owner_pid,
                                                      const char* owner_name, const char* reason, bool wait_for_gate = true) -> bool;
@@ -511,6 +515,8 @@ void destroy_user_space_budget_state_destroy(DestroyUserSpaceBudgetState* state)
 
 // Free all user-space pages and page tables in a pagemap
 // Only frees the lower half (user space), keeps kernel mappings intact
+// Caller retains the original root and prevents future hardware publication;
+// full-root flush requires initialized shootdown or no possible remote user.
 // After calling this, the root pagemap itself should be released with release_pagemap().
 void destroy_user_space(PageTable* pagemap, uint64_t owner_pid = 0, const char* owner_name = nullptr, const char* reason = nullptr);
 
