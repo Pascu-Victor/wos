@@ -989,6 +989,8 @@ void init() {
         topology_cpus[i] = {.logical_index = static_cast<uint32_t>(i), .apic_id = response->cpus[i]->lapic_id};
     }
     acpi::numa::initialize_boot_topology({topology_cpus.data(), static_cast<size_t>(g_cpu_count)});
+    if (mm::phys::initialize_node_counters_after_topology() != mm::NodeCounterError::NONE)
+        dbg::panic_handler("physical node counter binding failed before AP startup");
     if (mm::numa::root_reserve::initialize_after_topology() != mm::numa::root_reserve::Error::NONE)
         dbg::panic_handler("emergency root reserve initialization failed");
 

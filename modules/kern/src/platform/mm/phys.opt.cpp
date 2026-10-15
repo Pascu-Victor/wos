@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <platform/acpi/numa_boot.hpp>
 #include <platform/asm/cpu.hpp>
 #include <platform/smt/smt.hpp>
 #include <sanitizer/kasan.hpp>
@@ -854,6 +855,87 @@ auto physical_owner_descriptors() -> std::span<const PhysicalOwnerDescriptor> {
 
 auto physical_reserve_descriptors() -> std::span<const PhysicalReserveDescriptor> {
     return std::span<const PhysicalReserveDescriptor>{PHYSICAL_RESERVE_DESCRIPTORS};
+}
+
+namespace {
+std::atomic<bool> node_counter_ready{false};
+node_counters::BootstrapWorkspace node_counter_boot_scratch;
+
+auto collect_node_counter_views(node_counters::Workspace& scratch, size_t& count) noexcept -> NodeCounterError {
+    count = 0;
+    uint64_t const HHDM = addr::get_hhdm_offset();
+    for (auto* zone = zones; zone != nullptr; zone = zone->next) {
+        if (count >= node_counters::MAX_ALLOCATORS - 1) return NodeCounterError::CAPACITY;
+        if (zone->allocator == nullptr || zone->start < HHDM || zone->start != zone->allocator->base ||
+            reinterpret_cast<uint64_t>(zone->allocator) != zone->start ||
+            zone->len != static_cast<uint64_t>(zone->allocator->total_pages) * paging::PAGE_SIZE)
+            return NodeCounterError::INVALID_INPUT;
+        for (size_t i = 0; i < count; ++i)
+            if (scratch.views[i].allocator == zone->allocator) return NodeCounterError::INVALID_INPUT;
+        scratch.views[count].allocator = zone->allocator;
+        scratch.views[count].physical_base = zone->start - HHDM;
+        ++count;
+    }
+    if (huge_page_zone != nullptr) {
+        auto* zone = huge_page_zone;
+        if (zone->allocator == nullptr || zone->start < HHDM || zone->start != zone->allocator->base ||
+            zone->len != static_cast<uint64_t>(zone->allocator->total_pages) * paging::PAGE_SIZE)
+            return NodeCounterError::INVALID_INPUT;
+        bool duplicate = false;
+        for (size_t i = 0; i < count; ++i)
+            if (scratch.views[i].allocator == zone->allocator) {
+                if (scratch.views[i].physical_base != zone->start - HHDM) return NodeCounterError::INVALID_INPUT;
+                duplicate = true;
+            }
+        if (!duplicate) {
+            if (count == node_counters::MAX_ALLOCATORS) return NodeCounterError::CAPACITY;
+            scratch.views[count].allocator = zone->allocator;
+            scratch.views[count].physical_base = zone->start - HHDM;
+            ++count;
+        }
+    }
+    return count != 0 ? NodeCounterError::NONE : NodeCounterError::INVALID_INPUT;
+}
+}  // namespace
+
+auto initialize_node_counters_after_topology() noexcept -> NodeCounterError {
+    // Exclusive BSP boot, before subsequent allocations/AP startup. A failure
+    // never publishes a prefix, and is fatal at the unlocked smt caller.
+    if (node_counter_ready.load(std::memory_order_acquire)) return NodeCounterError::ALREADY_BOUND;
+    auto const* topology = acpi::numa::boot_topology();
+    if (topology == nullptr) return NodeCounterError::NOT_READY;
+    size_t count = 0;
+    auto error = collect_node_counter_views(node_counter_boot_scratch.locks, count);
+    if (error != NodeCounterError::NONE) return error;
+    error = node_counters::initialize(node_counter_boot_scratch.locks.views, count, topology->memory.data(), topology->memory_range_count,
+                                      topology->node_count, node_counter_boot_scratch);
+    if (error == NodeCounterError::NONE) node_counter_ready.store(true, std::memory_order_release);
+    return error;
+}
+
+auto node_counters_ready() noexcept -> bool { return node_counter_ready.load(std::memory_order_acquire); }
+
+auto snapshot_node_counters(NodeCounterSnapshot& out, NodeCounterWorkspace& scratch) noexcept -> NodeCounterError {
+    auto const* topology = acpi::numa::boot_topology();
+    if (!node_counters_ready() || topology == nullptr) {
+        out.complete = false;
+        out.error = NodeCounterError::NOT_READY;
+        out.node_count = out.allocator_count = out.reserved = 0;
+        out.global.usable = out.global.free_inclusive = out.global.cached = out.global.buddy_free = 0;
+        for (size_t i = 0; i < PAGE_ALLOCATOR_MAX_NODES; ++i)
+            out.nodes[i].usable = out.nodes[i].free_inclusive = out.nodes[i].cached = out.nodes[i].buddy_free = 0;
+        return NodeCounterError::NOT_READY;
+    }
+    size_t count = 0;
+    auto const error = collect_node_counter_views(scratch, count);
+    if (error != NodeCounterError::NONE) {
+        // Let the real core clear every output row without touching metadata.
+        (void)node_counters::snapshot(nullptr, 0, nullptr, 0, 0, out, scratch);
+        out.error = error;
+        return error;
+    }
+    return node_counters::snapshot(scratch.views, count, topology->memory.data(), topology->memory_range_count, topology->node_count, out,
+                                   scratch);
 }
 
 void get_physical_balance_snapshot(PhysicalBalanceSnapshot& out) {

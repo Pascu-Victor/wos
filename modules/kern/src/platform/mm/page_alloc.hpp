@@ -5,6 +5,10 @@
 #include <cstddef>
 #include <cstdint>
 
+namespace ker::mod::acpi::numa {
+struct MemoryRange;
+}
+
 namespace ker::mod::mm {
 
 enum class PhysicalPageOwner : uint8_t {
@@ -101,6 +105,33 @@ enum class PageKind : uint8_t {
     }
 }
 
+inline constexpr size_t PAGE_ALLOCATOR_MAX_NODES = 64;
+inline constexpr size_t PAGE_ALLOCATOR_MAX_NODE_RANGES = 512;
+
+enum class NodeCounterError : uint8_t { NONE, NOT_READY, INVALID_INPUT, CAPACITY, ALREADY_BOUND, COVERAGE, METADATA, COUNTERS, OVERFLOW };
+struct NodeCounterSeed {
+    uint32_t usable[PAGE_ALLOCATOR_MAX_NODES];
+    uint32_t free_inclusive[PAGE_ALLOCATOR_MAX_NODES];
+    uint32_t cached[PAGE_ALLOCATOR_MAX_NODES];
+};
+struct NodeCounts32 {
+    uint32_t usable;
+    uint32_t free_inclusive;
+    uint32_t cached;
+    uint32_t buddy_free;
+};
+struct NodeCounterStore {
+    uint32_t usable[PAGE_ALLOCATOR_MAX_NODES];
+    uint32_t free_inclusive[PAGE_ALLOCATOR_MAX_NODES];
+    uint32_t cached[PAGE_ALLOCATOR_MAX_NODES];
+    uint64_t physical_base;
+    const acpi::numa::MemoryRange* ranges;
+    uint16_t range_count;
+    uint16_t node_count;  // Zero only during unbound bootstrap.
+    uint32_t reserved;
+};
+static_assert(sizeof(NodeCounterStore) == 792 && alignof(NodeCounterStore) == 8);
+
 // Linux-style free-list buddy page allocator.
 // Manages a contiguous physical memory zone. Metadata is embedded at the
 // beginning of the zone (this struct + side tables), consuming a small fixed
@@ -151,6 +182,16 @@ struct PageAllocator {
     uint32_t metadata_pages = 0;  // pages consumed by metadata
     std::array<uint64_t, PHYSICAL_PAGE_OWNER_COUNT> owner_pages{};
     std::array<uint64_t, PHYSICAL_PAGE_OWNER_COUNT> owner_objects{};
+    NodeCounterStore node_counters;  // Appended private metadata; init clears it explicitly.
+
+    // Owning allocator lock held; immutable ranges outlive this allocator.
+    // Prepare may alter only disposable scratch. Commit is boot-transaction-only
+    // after every allocator prepares successfully under the same held locks.
+    [[nodiscard]] auto prepare_node_counters_locked(uint64_t physical_base, const acpi::numa::MemoryRange* ranges, uint16_t range_count,
+                                                    uint16_t node_count, NodeCounterSeed& scratch) const noexcept -> NodeCounterError;
+    void commit_node_counters_locked(uint64_t physical_base, const acpi::numa::MemoryRange* ranges, uint16_t range_count,
+                                     uint16_t node_count, const NodeCounterSeed& prepared) noexcept;
+    [[nodiscard]] auto node_counts_locked(uint16_t node, NodeCounts32& out) const noexcept -> NodeCounterError;
 
     // Initialise this allocator over the zone starting at `zoneBase`
     // (HHDM address) with `sizeBytes` total bytes.  Metadata is placed at
@@ -214,5 +255,49 @@ struct PageAllocator {
     [[nodiscard]] __attribute__((no_sanitize("address"))) uint32_t get_free_pages() const { return free_count; }
     [[nodiscard]] __attribute__((no_sanitize("address"))) uint32_t get_usable_pages() const { return usable_pages; }
 };
+
+static_assert(sizeof(PageAllocator) <= 4096, "huge allocator object owns one ordinary page");
+
+// Internal bounded counter core. Views are immutable for the complete call;
+// regular-list order followed by distinct huge allocator is the production
+// lock order. No caller allocator/cache/VM locks may be held.
+namespace node_counters {
+inline constexpr size_t MAX_ALLOCATORS = 129;
+struct AllocatorView {
+    PageAllocator* allocator;
+    uint64_t physical_base;
+};
+struct Counts {
+    uint64_t usable, free_inclusive, cached, buddy_free;
+};
+struct Snapshot {
+    bool complete;
+    NodeCounterError error;
+    uint16_t node_count;
+    uint16_t allocator_count;
+    uint16_t reserved;
+    Counts global;
+    Counts nodes[PAGE_ALLOCATOR_MAX_NODES];
+};
+struct Workspace {
+    AllocatorView views[MAX_ALLOCATORS];
+    uint64_t lock_flags[MAX_ALLOCATORS];
+};
+struct BootstrapWorkspace {
+    Workspace locks;
+    NodeCounterSeed seeds[MAX_ALLOCATORS];
+};
+static_assert(sizeof(Snapshot) <= 3 * 1024);
+static_assert(sizeof(Workspace) <= 4 * 1024);
+static_assert(sizeof(BootstrapWorkspace) <= 112 * 1024);
+// BSP only: all seeds validate under all locks before the first scalar commit.
+// Caller publishes readiness only on NONE; refusal changes no allocator.
+[[nodiscard]] auto initialize(const AllocatorView* views, size_t count, const acpi::numa::MemoryRange* ranges, uint16_t range_count,
+                              uint16_t node_count, BootstrapWorkspace& scratch) noexcept -> NodeCounterError;
+// Exact simultaneous counter sample, never a metadata/free-list scan or repair.
+// Exclusive output/workspace must not alias allocators, topology or each other.
+[[nodiscard]] auto snapshot(const AllocatorView* views, size_t count, const acpi::numa::MemoryRange* ranges, uint16_t range_count,
+                            uint16_t node_count, Snapshot& out, Workspace& scratch) noexcept -> NodeCounterError;
+}  // namespace node_counters
 
 }  // namespace ker::mod::mm

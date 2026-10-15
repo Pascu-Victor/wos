@@ -18,14 +18,15 @@ ACPI initialization still requires a usable RSDP.
 The parser supports 256 CPU identities and 64 proximity domains. The current
 scheduler/affinity ABI supports 1–64 online CPUs and requires the BSP at logical
 index zero; boot explicitly rejects unsupported enumeration before publishing
-partial masks. NUMA allocation policy and general 2 MiB user mappings are still
-under implementation. Topology discovery alone does not qualify either feature.
+partial masks. Public preferred/bind/interleave policy and general 2 MiB user mappings remain
+gated. Topology discovery alone does not qualify either feature.
 
 Task defaults are stored per executor under a short IRQ-safe snapshot lock.
 Creation copies the initiating executor's value independently of its credential
 owner. Owned exec preparation carries the value to successful canonical image
 commit; failed or canceled preparation preserves the existing default. These
-internal paths have no public policy selector yet.
+internal paths support saved policy values. The public setter currently admits
+only LOCAL with an empty node mask; other well-formed modes return ENOTSUP.
 
 The internal placed allocator supports preferred, strict-bind and deterministic
 virtual-page interleave selection. A checked interval claim returns either one
@@ -35,7 +36,7 @@ consume the supplied executor's copied policy and a captured CPU-node value.
 Hardware origin uses the saved exception CPL; software ensures remain separately
 classified. Installed private-copy frames, zero-COW and new anonymous pages have
 separate counters; remote fallback remains a miss in an eligible locality count.
-This internal routing has no public policy selector or large user mapping yet.
+Public non-LOCAL selection and large user mappings remain gated.
 
 Domain-constrained claims bypass unfiltered CPU caches, so cached capacity can
 cause conservative allocation failure. Allocation-pressure bookkeeping can wake
@@ -307,3 +308,58 @@ cycles also ran. All watched inputs, the original guard and unrelated VM stayed
 unchanged. Its disposable allocation peaked at 269,434,880 bytes and returned
 to zero. The receipt is `build/goal40-evidence/native-uma17/result.json`;
 the same prescheduler limitations apply.
+
+
+## Cheap node counters and userspace observation
+
+Each physical allocator binds its node counters after topology publication and
+before AP startup. Binding prepares every allocator before committing any;
+malformed or incomplete coverage refuses publication. Fixed simultaneous
+snapshots expose usable, inclusive free, cached free and buddy free pages.
+Cached free is a subset of inclusive free; buddy free is their difference.
+Usable excludes allocator metadata and zone descriptors, unlike firmware managed
+coverage. These snapshots do not scan frame metadata or count per-node owners;
+the bounded full balance diagnostic remains the ownership authority.
+
+The installed WOS `sys/numa.h` records and `sys/vmem.h` wrappers provide immutable
+topology/CPU masks, the actor's policy and at most 64 resident-page node rows per
+request. Target-page observation does not fault absent payload into memory;
+request/output transport follows ordinary checked usercopy rules and may fault.
+It exports no physical address or kernel root identity. The LOCAL-only setter
+updates the actual executor, independently of its credential/quota owner.
+Version, size, geometry and reserved fields are checked. Public non-LOCAL modes
+remain unavailable while connected placement/pressure qualification continues.
+The existing strace decoder names both appended operations.
+
+`testprog numa-first-touch` uses real pinned pthread workers, verifies all pages
+are absent before volatile CPL3 writes, checks zero tails and records every
+resident page in its local 95% denominator. `testprog numa-lifecycle` defaults to
+1,000 fresh mmap/fork/COW/cross-page pipe-usercopy/wait/unmap cycles, with checked
+FD/map cleanup and bounded waits. These commands are built; their scheduled
+qualification is pending. Their own-resource ledger explicitly does not claim
+a global Task/File/pin/physical census, persistent pins, huge pages or pressure.
+
+Current counter/query integration passes Normal Build WOS, isolated fast KTEST,
+33 selected Host tests and C++ formatting/tidy. The repaired counter fixture
+prepares its diagnostic buffers before sampling, records the real cold BIND
+allocation and proves its return, then claims 512 individual physical pages in
+that warmed extent. It checks exact per-node/global free, cached and owner
+totals before, during and after these claims. A counted scoped owner releases
+every successful page claim, including on an early assertion return.
+
+The original NUMA18, NUMA22 and NUMA24 failures are retained. They exposed errno
+expectation width mismatches, cold diagnostic shadow allocation, an unsupported
+factory address-reuse assumption and an unsupported single-buddy-block claim.
+Contiguous free pages can span multiple buddy blocks. These fixture repairs
+change no production allocation policy or counter logic and introduce no numeric
+tolerance, guessed shadow offset or sanitizer suppression.
+
+Fresh virtual NUMA26 passes all 1,512 native cases and 160,138 assertions with
+zero failures and natural poweroff. All watched sources stayed unchanged; its
+disposable images peaked at 270,090,240 bytes and were removed after reference
+and backing-chain checks. UMA27 passes the same 1,512 cases and 152,600
+assertions with zero failures and natural poweroff; its peak was also
+270,090,240 bytes and its disposable images returned to zero. Both runs
+preserved the original launch guard and unrelated VM. These are native kernel
+tests; scheduled userspace, pressure, huge-page lifetime and performance
+qualification remain separate requirements.

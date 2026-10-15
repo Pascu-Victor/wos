@@ -278,6 +278,15 @@ auto get_total_mem_bytes() -> uint64_t;
 
 void get_alloc_stats_snapshot(AllocStatsSnapshot& out);
 void get_physical_balance_snapshot(PhysicalBalanceSnapshot& out);
+using NodeCounterSnapshot = node_counters::Snapshot;
+using NodeCounterWorkspace = node_counters::Workspace;
+// BSP only after permanent topology publication, before APs/subsequent work.
+[[nodiscard]] auto initialize_node_counters_after_topology() noexcept -> NodeCounterError;
+[[nodiscard]] auto node_counters_ready() noexcept -> bool;
+// Counter-only simultaneous sample. Exclusive addressable BSS/caller buffers;
+// no incoming allocator/cache/VM locks or reclaim/IRQ/panic context.
+[[nodiscard]] auto snapshot_node_counters(NodeCounterSnapshot& out, NodeCounterWorkspace& scratch) noexcept -> NodeCounterError;
+
 auto physical_owner_descriptors() -> std::span<const PhysicalOwnerDescriptor>;
 auto physical_reserve_descriptors() -> std::span<const PhysicalReserveDescriptor>;
 auto snapshot_zones(ZoneSnapshot* out, size_t max_rows) -> size_t;

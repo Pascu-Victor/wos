@@ -42,6 +42,7 @@
 #include "mandelbench/mandelbench_wki.hpp"
 #include "memory_pressure.hpp"
 #include "netbench.hpp"
+#include "numa_locality.hpp"
 #include "perfbench.hpp"
 #include "resource_limits.hpp"
 #include "tests/blockbench_mmap.hpp"
@@ -633,6 +634,13 @@ auto main(int argc, char** argv, char** envp) -> int {
 
     if (command != nullptr && std::strcmp(command, "ipv6-net") == 0) {
         return run_ipv6_net(argc - 1, argv + 1);
+    }
+
+    if (command != nullptr && std::strcmp(command, "numa-first-touch") == 0) {
+        return run_numa_first_touch(argc - 2, argv + 2);
+    }
+    if (command != nullptr && std::strcmp(command, "numa-lifecycle") == 0) {
+        return run_numa_lifecycle(argc - 2, argv + 2);
     }
 
     if (command != nullptr && (std::strcmp(command, "fork-cow") == 0 || std::strcmp(command, "cow") == 0)) {

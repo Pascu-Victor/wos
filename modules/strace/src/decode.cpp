@@ -482,6 +482,10 @@ auto subop_name(uint64_t callnum, uint64_t op) -> std::string_view {
                     return "swapon";
                 case ker::abi::vmem::ops::SWAPOFF:
                     return "swapoff";
+                case ker::abi::vmem::ops::QUERY_NUMA:
+                    return "query_numa";
+                case ker::abi::vmem::ops::SET_MEMORY_POLICY:
+                    return "set_memory_policy";
             }
             break;
         case ker::abi::callnums::debug:

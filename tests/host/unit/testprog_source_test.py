@@ -242,9 +242,17 @@ def test_netbench_io_is_deadline_bounded() -> None:
             "accept_timeout(SERVER_FD, options.timeout_ms)",
             "recv_all_timeout(CLIENT_FD, &header, sizeof(header), options.timeout_ms)",
             "handle_pingpong_server(CLIENT_FD, header, options.timeout_ms)",
-            "handle_stream_server(CLIENT_FD, header, options.timeout_ms)",
+            "handle_stream_server(CLIENT_FD, header, options)",
         ],
         "netbench server timeout plumbing",
+    )
+    require_tokens(
+        function_body(source, "handle_stream_server"),
+        [
+            "recv_all_timeout(client_fd, buf.data(), chunk, options.timeout_ms)",
+            "send_all_timeout(client_fd, &ack, sizeof(ack), options.timeout_ms)",
+        ],
+        "netbench stream options preserve receive and acknowledgement deadlines",
     )
 
     client_body = function_body(source, "run_client")
@@ -252,11 +260,19 @@ def test_netbench_io_is_deadline_bounded() -> None:
         client_body,
         [
             "parse_timeout_ms(argv[++i], &options.timeout_ms)",
-            "connect_to_host(options.host, options.port, options.timeout_ms)",
+            "connect_to_host(options.host, options.port, options.timeout_ms, options.scope)",
             "send_all_timeout(FD, &header, sizeof(header), options.timeout_ms)",
             "recv_all_timeout(FD, &ack, sizeof(ack), options.timeout_ms)",
         ],
         "netbench client timeout plumbing",
+    )
+    require_tokens(
+        function_body(source, "connect_to_host"),
+        [
+            "benchmark_address(host, FAMILY, port, scope, addr, length)",
+            "connect_timeout(FD, reinterpret_cast<sockaddr*>(&addr), length, timeout_ms)",
+        ],
+        "netbench IPv4/IPv6 endpoint retains its bounded connect deadline",
     )
 
 

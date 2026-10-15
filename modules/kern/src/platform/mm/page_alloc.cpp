@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <platform/acpi/numa_topology.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/tlb_shootdown.hpp>
@@ -145,6 +146,203 @@ void zero_page_refcounts(std::atomic<uint32_t>* refcounts, uint32_t count) {
         return;
     }
     std::memset(refcounts, 0, static_cast<size_t>(count) * sizeof(std::atomic<uint32_t>));
+}
+
+// Raw counter helpers stay in this allocator TU's existing diagnostic profile.
+// Counter arrays are raw; the owner view and compiler clear provider are audited separately.
+struct NodeDelta {
+    uint32_t pages[PAGE_ALLOCATOR_MAX_NODES];  // Only mask-selected slots initialized/read.
+    uint64_t mask;
+};
+
+// Existing owner totals retain their std::array layout. Obtain the standard
+// contiguous view, then use built-in indexing. The existing kernel std/header
+// sanitizer ignorelist and generated provider proof cover this one accessor;
+// no pointer reinterpretation or new diagnostic exclusion is needed.
+auto owner_page_totals(const PageAllocator* alloc) noexcept -> const uint64_t* { return alloc->owner_pages.data(); }
+
+auto valid_node_ranges(const acpi::numa::MemoryRange* ranges, uint16_t range_count, uint16_t node_count) noexcept -> NodeCounterError {
+    if (ranges == nullptr || range_count == 0 || node_count == 0) return NodeCounterError::INVALID_INPUT;
+    if (range_count > PAGE_ALLOCATOR_MAX_NODE_RANGES || node_count > PAGE_ALLOCATOR_MAX_NODES) return NodeCounterError::CAPACITY;
+    uint64_t previous_end = 0;
+    for (uint16_t i = 0; i < range_count; ++i) {
+        auto const& range = ranges[i];
+        if (range.length == 0 || ((range.base | range.length) & (paging::PAGE_SIZE - 1)) != 0 || range.length > UINT64_MAX - range.base ||
+            range.node >= node_count || (i != 0 && range.base < previous_end))
+            return NodeCounterError::INVALID_INPUT;
+        previous_end = range.base + range.length;
+    }
+    return NodeCounterError::NONE;
+}
+
+auto node_span_pages(uint64_t physical_base, uint32_t first, uint32_t count, const acpi::numa::MemoryRange* ranges, uint16_t range_count,
+                     uint16_t node_count, NodeDelta& delta) noexcept -> bool {
+    delta.mask = 0;
+    if (count == 0) return true;
+    uint64_t const OFFSET = static_cast<uint64_t>(first) * paging::PAGE_SIZE;
+    uint64_t const BYTES = static_cast<uint64_t>(count) * paging::PAGE_SIZE;
+    if (OFFSET > UINT64_MAX - physical_base || BYTES > UINT64_MAX - physical_base - OFFSET) return false;
+    uint64_t cursor = physical_base + OFFSET;
+    uint64_t const END = cursor + BYTES;
+    size_t low = 0, high = range_count;
+    while (low < high) {
+        size_t const MID = low + (high - low) / 2;
+        if (ranges[MID].base + ranges[MID].length <= cursor)
+            low = MID + 1;
+        else
+            high = MID;
+    }
+    while (cursor < END) {
+        if (low >= range_count) return false;
+        auto const& range = ranges[low];
+        if (range.base > cursor || range.node >= node_count || range.node >= PAGE_ALLOCATOR_MAX_NODES) return false;
+        uint64_t const RANGE_END = range.base + range.length;
+        if (RANGE_END <= cursor) return false;
+        uint64_t const NEXT = RANGE_END < END ? RANGE_END : END;
+        uint64_t const PAGES = (NEXT - cursor) / paging::PAGE_SIZE;
+        uint64_t const BIT = uint64_t{1} << range.node;
+        if ((delta.mask & BIT) == 0) {
+            delta.pages[range.node] = 0;
+            delta.mask |= BIT;
+        }
+        if (PAGES > UINT32_MAX - delta.pages[range.node]) return false;
+        delta.pages[range.node] += static_cast<uint32_t>(PAGES);
+        cursor = NEXT;
+        ++low;
+    }
+    return true;
+}
+
+auto node_binding_sane(const PageAllocator* alloc) noexcept -> bool {
+    auto const& store = alloc->node_counters;
+    if (store.node_count == 0) return store.ranges == nullptr && store.range_count == 0 && store.reserved == 0;
+    uint64_t const BYTES = static_cast<uint64_t>(alloc->total_pages) * paging::PAGE_SIZE;
+    return store.node_count <= PAGE_ALLOCATOR_MAX_NODES && store.ranges != nullptr && store.range_count != 0 &&
+           store.range_count <= PAGE_ALLOCATOR_MAX_NODE_RANGES && store.reserved == 0 &&
+           (store.physical_base & (paging::PAGE_SIZE - 1)) == 0 && BYTES <= UINT64_MAX - store.physical_base;
+}
+
+auto prepare_node_delta(const PageAllocator* alloc, uint32_t first, uint32_t count, int free_sign, int cached_sign,
+                        NodeDelta& delta) noexcept -> bool {
+    delta.mask = 0;
+    auto const& store = alloc->node_counters;
+    if (store.node_count == 0) return true;  // Exact legacy bootstrap before topology.
+    if (store.node_count > PAGE_ALLOCATOR_MAX_NODES || store.range_count == 0 || store.range_count > PAGE_ALLOCATOR_MAX_NODE_RANGES ||
+        store.ranges == nullptr || store.reserved != 0 || first > alloc->total_pages || count > alloc->total_pages - first)
+        return false;
+    int64_t const FREE = static_cast<int64_t>(alloc->free_count) + static_cast<int64_t>(free_sign) * count;
+    int64_t const CACHED = static_cast<int64_t>(alloc->cached_order0_count) + static_cast<int64_t>(cached_sign) * count;
+    if (FREE < 0 || CACHED < 0 || CACHED > FREE || FREE > alloc->usable_pages ||
+        !node_span_pages(store.physical_base, first, count, store.ranges, store.range_count, store.node_count, delta))
+        return false;
+    uint64_t mask = delta.mask;
+    while (mask != 0) {
+        unsigned const NODE = static_cast<unsigned>(__builtin_ctzll(mask));
+        mask &= mask - 1;
+        int64_t const NODE_FREE = static_cast<int64_t>(store.free_inclusive[NODE]) + static_cast<int64_t>(free_sign) * delta.pages[NODE];
+        int64_t const NODE_CACHED = static_cast<int64_t>(store.cached[NODE]) + static_cast<int64_t>(cached_sign) * delta.pages[NODE];
+        if (NODE_FREE < 0 || NODE_CACHED < 0 || NODE_CACHED > NODE_FREE || NODE_FREE > store.usable[NODE]) return false;
+    }
+    return true;
+}
+
+void apply_node_delta(PageAllocator* alloc, const NodeDelta& delta, int free_sign, int cached_sign) noexcept {
+    uint64_t mask = delta.mask;
+    while (mask != 0) {
+        unsigned const NODE = static_cast<unsigned>(__builtin_ctzll(mask));
+        mask &= mask - 1;
+        alloc->node_counters.free_inclusive[NODE] = static_cast<uint32_t>(static_cast<int64_t>(alloc->node_counters.free_inclusive[NODE]) +
+                                                                          static_cast<int64_t>(free_sign) * delta.pages[NODE]);
+        alloc->node_counters.cached[NODE] = static_cast<uint32_t>(static_cast<int64_t>(alloc->node_counters.cached[NODE]) +
+                                                                  static_cast<int64_t>(cached_sign) * delta.pages[NODE]);
+    }
+}
+
+void clear_node_seed(NodeCounterSeed& seed) noexcept {
+    for (size_t node = 0; node < PAGE_ALLOCATOR_MAX_NODES; ++node) seed.usable[node] = seed.free_inclusive[node] = seed.cached[node] = 0;
+}
+
+auto prepare_node_seed(const PageAllocator* alloc, uint64_t physical_base, const acpi::numa::MemoryRange* ranges, uint16_t range_count,
+                       uint16_t node_count, NodeCounterSeed& seed) noexcept -> NodeCounterError {
+    auto const VIEW = valid_node_ranges(ranges, range_count, node_count);
+    if (VIEW != NodeCounterError::NONE) return VIEW;
+    uint64_t const BYTES = static_cast<uint64_t>(alloc->total_pages) * paging::PAGE_SIZE;
+    if (alloc->total_pages == 0 || ((physical_base | alloc->base) & (paging::PAGE_SIZE - 1)) != 0 || BYTES > UINT64_MAX - physical_base ||
+        BYTES > UINT64_MAX - alloc->base || alloc->metadata_pages > alloc->total_pages ||
+        alloc->usable_pages != alloc->total_pages - alloc->metadata_pages || alloc->page_flags == nullptr || alloc->page_kinds == nullptr ||
+        alloc->page_owners == nullptr || alloc->page_refcounts == nullptr)
+        return NodeCounterError::INVALID_INPUT;
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+    if (alloc->page_callers == nullptr) return NodeCounterError::INVALID_INPUT;
+#endif
+    uint64_t owned = 0;
+    auto const* owner_pages = owner_page_totals(alloc);
+    for (size_t owner = 1; owner < PHYSICAL_PAGE_OWNER_COUNT; ++owner) {
+        if (owner_pages[owner] > alloc->usable_pages - owned) return NodeCounterError::COUNTERS;
+        owned += owner_pages[owner];
+    }
+    if (alloc->free_count > alloc->usable_pages || owned + alloc->free_count != alloc->usable_pages) return NodeCounterError::COUNTERS;
+    NodeDelta delta;
+    if (!node_span_pages(physical_base, 0, alloc->total_pages, ranges, range_count, node_count, delta)) return NodeCounterError::COVERAGE;
+    clear_node_seed(seed);
+    if (!node_span_pages(physical_base, alloc->metadata_pages, alloc->usable_pages, ranges, range_count, node_count, delta))
+        return NodeCounterError::COVERAGE;
+    uint64_t mask = delta.mask;
+    while (mask != 0) {
+        unsigned const NODE = static_cast<unsigned>(__builtin_ctzll(mask));
+        mask &= mask - 1;
+        seed.usable[NODE] = delta.pages[NODE];
+    }
+    for (uint32_t i = 0; i < alloc->metadata_pages; ++i)
+        if (alloc->page_flags[i] != PageAllocator::FLAG_RESERVED ||
+            alloc->page_kinds[i].load(std::memory_order_relaxed) != static_cast<uint8_t>(PageKind::RESERVED) ||
+            alloc->page_owners[i] != 0 || alloc->page_refcounts[i].load(std::memory_order_relaxed) != 0)
+            return NodeCounterError::METADATA;
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+    for (uint32_t i = 0; i < alloc->metadata_pages; ++i)
+        if (alloc->page_callers[i] != 0) return NodeCounterError::METADATA;
+#endif
+    uint64_t total_free = 0, total_cached = 0;
+    for (uint32_t first = alloc->metadata_pages; first < alloc->total_pages;) {
+        uint8_t const FLAGS = alloc->page_flags[first];
+        bool const CACHED = FLAGS == PageAllocator::FLAG_CACHED_ORDER0;
+        bool const FREE = (FLAGS & 0xC0) == PageAllocator::FLAG_FREE_HEAD;
+        bool const ALLOCATED = (FLAGS & 0xC0) == PageAllocator::FLAG_ALLOC_HEAD;
+        unsigned const ORDER = CACHED ? 0 : FLAGS & 0x1F;
+        if ((!CACHED && !FREE && !ALLOCATED) || ORDER > PageAllocator::MAX_ORDER ||
+            (!CACHED && FLAGS != ((FREE ? PageAllocator::FLAG_FREE_HEAD : PageAllocator::FLAG_ALLOC_HEAD) | ORDER)))
+            return NodeCounterError::METADATA;
+        uint32_t const COUNT = 1U << ORDER;
+        if (COUNT > alloc->total_pages - first || (first & (COUNT - 1)) != 0) return NodeCounterError::METADATA;
+        for (uint32_t j = 0; j < COUNT; ++j) {
+            if (j != 0 && alloc->page_flags[first + j] != (FREE ? PageAllocator::FLAG_FREE_INTERIOR : PageAllocator::FLAG_ALLOC_CONT))
+                return NodeCounterError::METADATA;
+            if (FREE || CACHED) {
+                if (alloc->page_kinds[first + j].load(std::memory_order_relaxed) != static_cast<uint8_t>(PageKind::FREE) ||
+                    alloc->page_owners[first + j] != 0 || alloc->page_refcounts[first + j].load(std::memory_order_relaxed) != 0)
+                    return NodeCounterError::METADATA;
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+                if (alloc->page_callers[first + j] != 0) return NodeCounterError::METADATA;
+#endif
+            }
+        }
+        if (FREE || CACHED) {
+            if (!node_span_pages(physical_base, first, COUNT, ranges, range_count, node_count, delta)) return NodeCounterError::COVERAGE;
+            mask = delta.mask;
+            while (mask != 0) {
+                unsigned const NODE = static_cast<unsigned>(__builtin_ctzll(mask));
+                mask &= mask - 1;
+                seed.free_inclusive[NODE] += delta.pages[NODE];
+                if (CACHED) seed.cached[NODE] += delta.pages[NODE];
+            }
+            total_free += COUNT;
+            if (CACHED) total_cached += COUNT;
+        }
+        first += COUNT;
+    }
+    if (total_free != alloc->free_count || total_cached != alloc->cached_order0_count || total_cached > total_free)
+        return NodeCounterError::COUNTERS;
+    return NodeCounterError::NONE;
 }
 
 auto free_head_is_valid(const PageAllocator* alloc, PageAllocator::FreeBlock* block, int order, uint32_t& page_idx) -> bool {
@@ -339,6 +537,17 @@ void rebuild_free_lists_from_flags(PageAllocator* alloc, const char* reason) {
     uint64_t const TOTAL_FREE_PAGES = linked_free_pages + cached_order0_pages;
     alloc->cached_order0_count = cached_order0_pages > alloc->total_pages ? alloc->total_pages : static_cast<uint32_t>(cached_order0_pages);
     alloc->free_count = TOTAL_FREE_PAGES > alloc->total_pages ? alloc->total_pages : static_cast<uint32_t>(TOTAL_FREE_PAGES);
+    if (alloc->node_counters.node_count != 0) {
+        NodeCounterSeed seed;
+        auto const ERROR = prepare_node_seed(alloc, alloc->node_counters.physical_base, alloc->node_counters.ranges,
+                                             alloc->node_counters.range_count, alloc->node_counters.node_count, seed);
+        if (ERROR != NodeCounterError::NONE) dbg::panic_handler("node counter repair rejected metadata");
+        for (size_t node = 0; node < PAGE_ALLOCATOR_MAX_NODES; ++node) {
+            if (seed.usable[node] != alloc->node_counters.usable[node]) dbg::panic_handler("node counter capacity changed during repair");
+            alloc->node_counters.free_inclusive[node] = seed.free_inclusive[node];
+            alloc->node_counters.cached[node] = seed.cached[node];
+        }
+    }
 }
 
 auto free_block_is_reachable(PageAllocator* alloc, int order, PageAllocator::FreeBlock* block) -> bool {
@@ -452,6 +661,8 @@ auto free_allocated_block(PageAllocator* alloc, uint32_t page_idx, int order, bo
         return 0;
     }
 
+    NodeDelta node_delta;
+    if (!prepare_node_delta(alloc, page_idx, BLOCK_SIZE, 1, 0, node_delta)) dbg::panic_handler("node counter free contradiction");
     uint64_t const FREED_BYTES = static_cast<uint64_t>(BLOCK_SIZE) * paging::PAGE_SIZE;
     if (release_owner) {
         PhysicalPageOwner const OWNER = load_page_owner(alloc->page_owners[page_idx]);
@@ -514,6 +725,7 @@ auto free_allocated_block(PageAllocator* alloc, uint32_t page_idx, int order, bo
     // Credit only the original allocation before any possible recount. The
     // completed head now covers every previously unlinked buddy as well.
     alloc->free_count += BLOCK_SIZE;
+    apply_node_delta(alloc, node_delta, 1, 0);
     if (repair_needed) {
         rebuild_free_lists_from_flags(alloc, "free coalesce unlink");
     } else {
@@ -528,6 +740,156 @@ auto free_allocated_block(PageAllocator* alloc, uint32_t page_idx, int order, bo
 // ============================================================================
 // init
 // ============================================================================
+
+auto PageAllocator::prepare_node_counters_locked(uint64_t physical_base, const acpi::numa::MemoryRange* ranges, uint16_t range_count,
+                                                 uint16_t node_count, NodeCounterSeed& scratch) const noexcept -> NodeCounterError {
+    if (node_counters.node_count != 0) return NodeCounterError::ALREADY_BOUND;
+    if (!node_binding_sane(this)) return NodeCounterError::INVALID_INPUT;
+    return prepare_node_seed(this, physical_base, ranges, range_count, node_count, scratch);
+}
+
+void PageAllocator::commit_node_counters_locked(uint64_t physical_base, const acpi::numa::MemoryRange* ranges, uint16_t range_count,
+                                                uint16_t node_count, const NodeCounterSeed& prepared) noexcept {
+    for (size_t node = 0; node < PAGE_ALLOCATOR_MAX_NODES; ++node) {
+        node_counters.usable[node] = prepared.usable[node];
+        node_counters.free_inclusive[node] = prepared.free_inclusive[node];
+        node_counters.cached[node] = prepared.cached[node];
+    }
+    node_counters.physical_base = physical_base;
+    node_counters.ranges = ranges;
+    node_counters.range_count = range_count;
+    node_counters.reserved = 0;
+    node_counters.node_count = node_count;
+}
+
+namespace {
+auto validate_node_store(const PageAllocator* alloc) noexcept -> NodeCounterError {
+    if (!node_binding_sane(alloc)) return NodeCounterError::INVALID_INPUT;
+    auto const& store = alloc->node_counters;
+    if (store.node_count == 0) return NodeCounterError::NOT_READY;
+    uint64_t usable = 0, free = 0, cached = 0;
+    for (size_t node = 0; node < PAGE_ALLOCATOR_MAX_NODES; ++node) {
+        if (store.cached[node] > store.free_inclusive[node] || store.free_inclusive[node] > store.usable[node] ||
+            (node >= store.node_count && (store.usable[node] != 0 || store.free_inclusive[node] != 0 || store.cached[node] != 0)))
+            return NodeCounterError::COUNTERS;
+        usable += store.usable[node];
+        free += store.free_inclusive[node];
+        cached += store.cached[node];
+    }
+    if (usable != alloc->usable_pages || free != alloc->free_count || cached != alloc->cached_order0_count)
+        return NodeCounterError::COUNTERS;
+    uint64_t owned = 0;
+    auto const* owner_pages = owner_page_totals(alloc);
+    for (size_t owner = 1; owner < PHYSICAL_PAGE_OWNER_COUNT; ++owner) {
+        if (owner_pages[owner] > alloc->usable_pages - owned) return NodeCounterError::COUNTERS;
+        owned += owner_pages[owner];
+    }
+    return owned + free == usable ? NodeCounterError::NONE : NodeCounterError::COUNTERS;
+}
+}  // namespace
+
+auto PageAllocator::node_counts_locked(uint16_t node, NodeCounts32& out) const noexcept -> NodeCounterError {
+    auto const ERROR = validate_node_store(this);
+    if (ERROR != NodeCounterError::NONE) return ERROR;
+    if (node >= node_counters.node_count) return NodeCounterError::INVALID_INPUT;
+    out.usable = node_counters.usable[node];
+    out.free_inclusive = node_counters.free_inclusive[node];
+    out.cached = node_counters.cached[node];
+    out.buddy_free = out.free_inclusive - out.cached;
+    return NodeCounterError::NONE;
+}
+
+namespace node_counters {
+namespace {
+auto validate_views(const AllocatorView* views, size_t count) noexcept -> NodeCounterError {
+    if (views == nullptr || count == 0) return NodeCounterError::INVALID_INPUT;
+    if (count > MAX_ALLOCATORS) return NodeCounterError::CAPACITY;
+    for (size_t i = 0; i < count; ++i) {
+        if (views[i].allocator == nullptr || views[i].allocator->total_pages == 0 ||
+            (views[i].physical_base & (paging::PAGE_SIZE - 1)) != 0)
+            return NodeCounterError::INVALID_INPUT;
+        uint64_t const BYTES = static_cast<uint64_t>(views[i].allocator->total_pages) * paging::PAGE_SIZE;
+        if (BYTES > UINT64_MAX - views[i].physical_base) return NodeCounterError::OVERFLOW;
+        for (size_t j = 0; j < i; ++j) {
+            uint64_t const OTHER_END = views[j].physical_base + static_cast<uint64_t>(views[j].allocator->total_pages) * paging::PAGE_SIZE;
+            if (views[i].allocator == views[j].allocator ||
+                (views[i].physical_base < OTHER_END && views[j].physical_base < views[i].physical_base + BYTES))
+                return NodeCounterError::INVALID_INPUT;
+        }
+    }
+    return NodeCounterError::NONE;
+}
+void clear_snapshot(Snapshot& out, NodeCounterError error) noexcept {
+    out.complete = false;
+    out.error = error;
+    out.node_count = out.allocator_count = out.reserved = 0;
+    out.global.usable = out.global.free_inclusive = out.global.cached = out.global.buddy_free = 0;
+    for (size_t node = 0; node < PAGE_ALLOCATOR_MAX_NODES; ++node)
+        out.nodes[node].usable = out.nodes[node].free_inclusive = out.nodes[node].cached = out.nodes[node].buddy_free = 0;
+}
+}  // namespace
+
+auto initialize(const AllocatorView* views, size_t count, const acpi::numa::MemoryRange* ranges, uint16_t range_count, uint16_t node_count,
+                BootstrapWorkspace& scratch) noexcept -> NodeCounterError {
+    auto error = validate_views(views, count);
+    if (error != NodeCounterError::NONE) return error;
+    error = valid_node_ranges(ranges, range_count, node_count);
+    if (error != NodeCounterError::NONE) return error;
+    for (size_t i = 0; i < count; ++i) scratch.locks.lock_flags[i] = views[i].allocator->lock_irq();
+    for (size_t i = 0; i < count; ++i) {
+        error = views[i].allocator->prepare_node_counters_locked(views[i].physical_base, ranges, range_count, node_count, scratch.seeds[i]);
+        if (error != NodeCounterError::NONE) break;
+    }
+    if (error == NodeCounterError::NONE)
+        for (size_t i = 0; i < count; ++i)
+            views[i].allocator->commit_node_counters_locked(views[i].physical_base, ranges, range_count, node_count, scratch.seeds[i]);
+    for (size_t i = count; i != 0; --i) views[i - 1].allocator->unlock_irq(scratch.locks.lock_flags[i - 1]);
+    return error;
+}
+
+auto snapshot(const AllocatorView* views, size_t count, const acpi::numa::MemoryRange* ranges, uint16_t range_count, uint16_t node_count,
+              Snapshot& out, Workspace& scratch) noexcept -> NodeCounterError {
+    clear_snapshot(out, NodeCounterError::NOT_READY);
+    auto error = validate_views(views, count);
+    if (error == NodeCounterError::NONE) error = valid_node_ranges(ranges, range_count, node_count);
+    if (error != NodeCounterError::NONE) {
+        out.error = error;
+        return error;
+    }
+    for (size_t i = 0; i < count; ++i) scratch.lock_flags[i] = views[i].allocator->lock_irq();
+    for (size_t i = 0; i < count; ++i) {
+        auto const* alloc = views[i].allocator;
+        error = validate_node_store(alloc);
+        if (error != NodeCounterError::NONE) break;
+        auto const& store = alloc->node_counters;
+        if (store.physical_base != views[i].physical_base || store.ranges != ranges || store.range_count != range_count ||
+            store.node_count != node_count) {
+            error = NodeCounterError::INVALID_INPUT;
+            break;
+        }
+        out.global.usable += alloc->usable_pages;
+        out.global.free_inclusive += alloc->free_count;
+        out.global.cached += alloc->cached_order0_count;
+        out.global.buddy_free += alloc->free_count - alloc->cached_order0_count;
+        for (size_t node = 0; node < node_count; ++node) {
+            out.nodes[node].usable += store.usable[node];
+            out.nodes[node].free_inclusive += store.free_inclusive[node];
+            out.nodes[node].cached += store.cached[node];
+            out.nodes[node].buddy_free += store.free_inclusive[node] - store.cached[node];
+        }
+    }
+    for (size_t i = count; i != 0; --i) views[i - 1].allocator->unlock_irq(scratch.lock_flags[i - 1]);
+    if (error != NodeCounterError::NONE) {
+        clear_snapshot(out, error);
+        return error;
+    }
+    out.node_count = node_count;
+    out.allocator_count = static_cast<uint16_t>(count);
+    out.error = NodeCounterError::NONE;
+    out.complete = true;
+    return NodeCounterError::NONE;
+}
+}  // namespace node_counters
 
 auto PageAllocator::lock_irq() -> uint64_t {
     uint64_t flags = 0;
@@ -572,6 +934,12 @@ void PageAllocator::unlock_irq(uint64_t flags) {
 void PageAllocator::init(uint64_t zone_base, uint64_t size_bytes) {
     lock_held.store(false, std::memory_order_release);
     base = zone_base;
+    for (size_t node = 0; node < PAGE_ALLOCATOR_MAX_NODES; ++node)
+        node_counters.usable[node] = node_counters.free_inclusive[node] = node_counters.cached[node] = 0;
+    node_counters.physical_base = 0;
+    node_counters.ranges = nullptr;
+    node_counters.range_count = node_counters.node_count = 0;
+    node_counters.reserved = 0;
     total_pages = static_cast<uint32_t>(size_bytes / paging::PAGE_SIZE);
 
     // --- lay out metadata at the beginning of the zone ---
@@ -679,6 +1047,7 @@ void PageAllocator::init(uint64_t zone_base, uint64_t size_bytes) {
 // ============================================================================
 
 void* PageAllocator::alloc(uint64_t size_bytes, PhysicalPageOwner owner, uint64_t caller) {
+    if (!node_binding_sane(this)) return nullptr;
 #ifndef WOS_PHYS_ALLOC_CALLER_STATS
     (void)caller;
 #endif
@@ -692,6 +1061,7 @@ void* PageAllocator::alloc(uint64_t size_bytes, PhysicalPageOwner owner, uint64_
     uint32_t page_idx = 0;
     FreeBlock* block = nullptr;
     bool repaired_free_lists = false;
+    NodeDelta node_delta;
     while (k <= MAX_ORDER) {
         block = free_list[static_cast<size_t>(k)];
         if (block == nullptr) {
@@ -709,6 +1079,8 @@ void* PageAllocator::alloc(uint64_t size_bytes, PhysicalPageOwner owner, uint64_
             k = order;
             continue;
         }
+
+        if (!prepare_node_delta(this, page_idx, 1U << order, -1, 0, node_delta)) return nullptr;
 
         // Pop head of free_list[k].
         if (!remove_free_block_with_repair(this, k, block, "alloc unlink")) {
@@ -768,15 +1140,18 @@ void* PageAllocator::alloc(uint64_t size_bytes, PhysicalPageOwner owner, uint64_
 
     account_owner_alloc(this, owner, BLOCK_SIZE);
     free_count -= BLOCK_SIZE;
+    apply_node_delta(this, node_delta, -1, 0);
     return reinterpret_cast<void*>(base + (static_cast<uint64_t>(page_idx) * paging::PAGE_SIZE));
 }
 
 auto PageAllocator::alloc_order0_span_in_range(uint64_t physical_base, uint64_t range_start, uint64_t range_end, uint32_t pages,
                                                uint64_t alignment_bytes, PhysicalPageOwner owner, uint64_t caller) -> void* {
+    if (!node_binding_sane(this)) return nullptr;
 #ifndef WOS_PHYS_ALLOC_CALLER_STATS
     (void)caller;
 #endif
     constexpr uint64_t PAGE_MASK = paging::PAGE_SIZE - 1;
+    if (node_counters.node_count != 0 && physical_base != node_counters.physical_base) return nullptr;
     uint64_t const ZONE_BYTES = static_cast<uint64_t>(total_pages) * paging::PAGE_SIZE;
     if (!physical_page_owner_is_valid(owner) || pages == 0 || pages > (1U << MAX_ORDER) || pages > total_pages ||
         alignment_bytes < paging::PAGE_SIZE || (alignment_bytes & (alignment_bytes - 1)) != 0 || base == 0 ||
@@ -826,9 +1201,11 @@ auto PageAllocator::alloc_order0_span_in_range(uint64_t physical_base, uint64_t 
                     return nullptr;
             }
             if (!free_block_pages_are_reusable(this, block_index, order, "interval span candidate")) return nullptr;
+            uint32_t const FIRST = static_cast<uint32_t>((START - physical_base) / paging::PAGE_SIZE);
+            NodeDelta node_delta;
+            if (!prepare_node_delta(this, FIRST, pages, -1, 0, node_delta)) return nullptr;
             if (!remove_free_block(this, order, block)) return nullptr;
 
-            uint32_t const FIRST = static_cast<uint32_t>((START - physical_base) / paging::PAGE_SIZE);
             uint32_t const END = FIRST + pages;
             for (uint32_t i = block_index; i < block_index + BLOCK_PAGES; ++i) page_flags[i] = FLAG_FREE_INTERIOR;
             auto return_free_run = [this](uint32_t first, uint32_t count) {
@@ -854,6 +1231,7 @@ auto PageAllocator::alloc_order0_span_in_range(uint64_t physical_base, uint64_t 
             }
             account_owner_alloc(this, owner, pages, pages);
             free_count -= pages;
+            apply_node_delta(this, node_delta, -1, 0);
             return page_to_ptr(base, FIRST);
         }
     }
@@ -861,6 +1239,7 @@ auto PageAllocator::alloc_order0_span_in_range(uint64_t physical_base, uint64_t 
 }
 
 void* PageAllocator::alloc_order0(PhysicalPageOwner owner, uint64_t caller) {
+    if (!node_binding_sane(this)) return nullptr;
 #ifndef WOS_PHYS_ALLOC_CALLER_STATS
     (void)caller;
 #endif
@@ -879,6 +1258,9 @@ void* PageAllocator::alloc_order0(PhysicalPageOwner owner, uint64_t caller) {
         }
     }
 
+    NodeDelta node_delta;
+    if (!prepare_node_delta(this, page_idx, 1, -1, 0, node_delta)) return nullptr;
+
     if (!remove_free_block_with_repair(this, 0, block, "alloc_order0 unlink")) {
         return nullptr;
     }
@@ -892,10 +1274,12 @@ void* PageAllocator::alloc_order0(PhysicalPageOwner owner, uint64_t caller) {
 #endif
     account_owner_alloc(this, owner, 1);
     free_count -= 1;
+    apply_node_delta(this, node_delta, -1, 0);
     return page_to_ptr(base, page_idx);
 }
 
 void* PageAllocator::claim_free_order0_for_cache(uint32_t& out_page_idx) {
+    if (!node_binding_sane(this)) return nullptr;
     out_page_idx = 0;
     auto* block = free_list[0];
     if (block == nullptr) {
@@ -911,6 +1295,9 @@ void* PageAllocator::claim_free_order0_for_cache(uint32_t& out_page_idx) {
         }
     }
 
+    NodeDelta node_delta;
+    if (!prepare_node_delta(this, page_idx, 1, 0, 1, node_delta)) return nullptr;
+
     if (!remove_free_block_with_repair(this, 0, block, "cache claim unlink")) {
         return nullptr;
     }
@@ -923,11 +1310,13 @@ void* PageAllocator::claim_free_order0_for_cache(uint32_t& out_page_idx) {
     page_callers[page_idx] = 0;
 #endif
     cached_order0_count += 1;
+    apply_node_delta(this, node_delta, 0, 1);
     out_page_idx = page_idx;
     return page_to_ptr(base, page_idx);
 }
 
 auto PageAllocator::cache_allocated_order0(void* ptr, uint32_t& out_page_idx) -> bool {
+    if (!node_binding_sane(this)) return false;
     out_page_idx = 0;
     if (ptr == nullptr || !ptr_in_zone(this, ptr)) {
         return false;
@@ -955,6 +1344,9 @@ auto PageAllocator::cache_allocated_order0(void* ptr, uint32_t& out_page_idx) ->
         ker::mod::dbg::panic_handler("page_free called on live kmalloc large alloc");
     }
 
+    NodeDelta node_delta;
+    if (!prepare_node_delta(this, PAGE_IDX, 1, 1, 1, node_delta)) return false;
+
     PhysicalPageOwner const OWNER = load_page_owner(page_owners[PAGE_IDX]);
     account_owner_free(this, OWNER, 1);
     page_flags[PAGE_IDX] = FLAG_CACHED_ORDER0;
@@ -966,11 +1358,13 @@ auto PageAllocator::cache_allocated_order0(void* ptr, uint32_t& out_page_idx) ->
 #endif
     free_count += 1;
     cached_order0_count += 1;
+    apply_node_delta(this, node_delta, 1, 1);
     out_page_idx = PAGE_IDX;
     return true;
 }
 
 auto PageAllocator::alloc_cached_order0_at(uint32_t page_idx, PhysicalPageOwner owner, uint64_t caller) -> void* {
+    if (!node_binding_sane(this)) return nullptr;
 #ifndef WOS_PHYS_ALLOC_CALLER_STATS
     (void)caller;
 #endif
@@ -990,6 +1384,9 @@ auto PageAllocator::alloc_cached_order0_at(uint32_t page_idx, PhysicalPageOwner 
         return nullptr;
     }
 
+    NodeDelta node_delta;
+    if (!prepare_node_delta(this, page_idx, 1, -1, -1, node_delta)) return nullptr;
+
     page_flags[page_idx] = FLAG_ALLOC_HEAD;
     store_page_kind(page_kinds[page_idx], PageKind::NORMAL);
     store_page_owner(page_owners[page_idx], owner);
@@ -1000,10 +1397,12 @@ auto PageAllocator::alloc_cached_order0_at(uint32_t page_idx, PhysicalPageOwner 
     account_owner_alloc(this, owner, 1);
     free_count -= 1;
     cached_order0_count -= 1;
+    apply_node_delta(this, node_delta, -1, -1);
     return page_to_ptr(base, page_idx);
 }
 
 auto PageAllocator::release_cached_order0_at(uint32_t page_idx) -> uint64_t {
+    if (!node_binding_sane(this)) return 0;
     if (page_idx >= total_pages || page_flags[page_idx] != FLAG_CACHED_ORDER0) {
         return 0;
     }
@@ -1017,8 +1416,12 @@ auto PageAllocator::release_cached_order0_at(uint32_t page_idx) -> uint64_t {
         return 0;
     }
 
+    NodeDelta node_delta;
+    if (!prepare_node_delta(this, page_idx, 1, -1, -1, node_delta)) return 0;
+
     cached_order0_count -= 1;
     free_count -= 1;
+    apply_node_delta(this, node_delta, -1, -1);
     page_flags[page_idx] = FLAG_ALLOC_HEAD;
     // cache_allocated_order0() already removed the former allocation owner
     // and counted this page as free. Draining only changes its free-list

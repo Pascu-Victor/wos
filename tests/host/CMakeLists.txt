@@ -316,6 +316,9 @@ target_include_directories(numa_alloc_test BEFORE PRIVATE ${WOS_KERN_SRC})
 add_test(NAME numa_root_reserve_runtime_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_root_reserve_runtime_test.py --cxx ${CMAKE_CXX_COMPILER})
 set_tests_properties(numa_root_reserve_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 120)
+add_test(NAME numa_observation_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_observation_runtime_test.py --cxx ${CMAKE_CXX_COMPILER})
+set_tests_properties(numa_observation_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 120)
 wos_add_unit_test(vtd_capability_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vtd_capability_test.cpp
 )
@@ -1824,6 +1827,17 @@ wos_add_unit_test(page_allocator_interval_provenance_test
     KERN_SOURCES ${WOS_KERN_SRC}/platform/mm/page_alloc.cpp
 )
 target_compile_definitions(page_allocator_interval_provenance_test PRIVATE WOS_HOST_TEST=1 WOS_PHYS_ALLOC_CALLER_STATS=1)
+
+wos_add_unit_test(page_allocator_node_counters_test
+    SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/page_allocator_node_counters_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/platform/mm/page_alloc.cpp
+)
+target_compile_definitions(page_allocator_node_counters_test PRIVATE WOS_HOST_TEST=1)
+wos_add_unit_test(page_allocator_node_counters_provenance_test
+    SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/page_allocator_node_counters_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/platform/mm/page_alloc.cpp
+)
+target_compile_definitions(page_allocator_node_counters_provenance_test PRIVATE WOS_HOST_TEST=1 WOS_PHYS_ALLOC_CALLER_STATS=1)
 
 wos_add_unit_test(numa_balance_test
     SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_balance_test.cpp

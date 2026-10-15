@@ -47,6 +47,8 @@
 #include <vfs/stat.hpp>
 #include <vfs/vfs.hpp>
 
+#include "numa.hpp"
+
 namespace ker::syscall::vmem {
 using log = ker::mod::dbg::logger<"vmem">;
 namespace numa = ker::mod::mm::numa;
@@ -4545,6 +4547,16 @@ auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -
             // a2: size
             // a3: flags
             return mmap_msync(a1, a2, a3);
+        }
+
+        case ker::abi::vmem::ops::QUERY_NUMA:
+        case ker::abi::vmem::ops::SET_MEMORY_POLICY: {
+            bool const QUERY = op == static_cast<uint64_t>(ker::abi::vmem::ops::QUERY_NUMA);
+            uint64_t const BYTES = QUERY ? sizeof(ker::abi::vmem::numa::QueryRequest) : sizeof(ker::abi::vmem::numa::PolicyRequest);
+            if (a2 != BYTES || a3 != 0 || a4 != 0) return static_cast<uint64_t>(-EINVAL);
+            auto* const ACTOR = get_current_task();
+            if (ACTOR == nullptr) return static_cast<uint64_t>(-EFAULT);
+            return QUERY ? query_numa_for_task(*ACTOR, a1, a2, a3, a4) : set_memory_policy_for_task(*ACTOR, a1, a2, a3, a4);
         }
 
         case ker::abi::vmem::ops::SWAPON:
