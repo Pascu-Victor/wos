@@ -70,6 +70,16 @@ class TimerQueue {
         return true;
     }
 
+    // Both synchronous queues are locked. Check that canceling on this queue
+    // can leave the node ready for an infallible destination rearm, before a
+    // scheduler transfer changes list ownership or timer metadata.
+    [[nodiscard]] auto can_transfer_after_cancel(const TimerNode& node, const TimerQueue& target, uint64_t deadline) const -> bool {
+        if (dispatch_ != TimerDispatch::SYNCHRONOUS || target.dispatch_ != TimerDispatch::SYNCHRONOUS) return false;
+        bool const OWNED_ARM = node.state_ == TimerState::ARMED && node.owner_ == this;
+        bool const UNASSOCIATED_IDLE = node.state_ == TimerState::IDLE && node.owner_ == nullptr;
+        return (OWNED_ARM || UNASSOCIATED_IDLE) && (deadline == 0 || node.generation_ != UINT64_MAX);
+    }
+
     // Rearming READY invalidates its token. RUNNING must first finish. Failed
     // arms leave existing state unchanged, including at generation exhaustion.
     [[nodiscard]] auto arm_at(TimerNode& node, uint64_t deadline, void (*callback)(void*), void* context = nullptr, uint64_t period = 0)

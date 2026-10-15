@@ -88,13 +88,6 @@ auto online_cpu_mask() -> uint64_t {
     return (1ULL << CPU_COUNT) - 1ULL;
 }
 
-auto cpu_mask_bit(uint64_t cpu) -> uint64_t {
-    if (cpu >= 64) {
-        return 0;
-    }
-    return 1ULL << cpu;
-}
-
 void release_thread_fd_refs(mod::sched::task::Task* task) {
     if (task == nullptr) {
         return;
@@ -202,46 +195,9 @@ auto host_thread_control_for_subject(mod::sched::task::Task* subject, abi::multi
                 return static_cast<uint64_t>(-EINVAL);
             }
 
-            uint64_t const RUNNING_CPU = mod::sched::current_cpu_for_task(task);
-            bool const IS_RUNNING = RUNNING_CPU != UINT64_MAX;
-            uint64_t const OWNER_CPU = IS_RUNNING ? RUNNING_CPU : mod::sched::owner_cpu_for_task(task);
-            bool const IS_WAITING = task->sched_queue == mod::sched::task::Task::sched_queue::WAITING;
-            if (IS_RUNNING && (MASK & cpu_mask_bit(RUNNING_CPU)) == 0) {
-                task->release();
-                return static_cast<uint64_t>(-EBUSY);
-            }
-            if (IS_WAITING && OWNER_CPU != UINT64_MAX && (MASK & cpu_mask_bit(OWNER_CPU)) == 0) {
-                task->release();
-                return static_cast<uint64_t>(-EBUSY);
-            }
-            if (std::has_single_bit(MASK)) {
-                // Single-CPU pin
-                uint64_t const TARGET_CPU = std::countr_zero(MASK);
-                if (!mod::sched::pin_task_to_cpu(task, TARGET_CPU)) {
-                    task->release();
-                    return static_cast<uint64_t>(-EBUSY);
-                }
-                task->store_domain_mask(MASK);
-                task->store_domain_hard(false);
-            } else if (MASK == VALID_MASK) {
-                // Full mask: remove all affinity restrictions
-                task->store_domain_mask(~0ULL);
-                task->store_domain_hard(false);
-                task->store_cpu_pinned(false);
-            } else {
-                // Multi-bit subset: set domain_mask, pick least-loaded CPU within mask
-                uint64_t const TARGET_CPU = mod::sched::get_least_loaded_cpu_in_mask(MASK);
-                if (!IS_RUNNING && !IS_WAITING && !mod::sched::migrate_task_to_cpu(task, TARGET_CPU)) {
-                    task->release();
-                    return static_cast<uint64_t>(-EBUSY);
-                }
-                task->store_domain_mask(MASK);
-                task->store_domain_hard(false);
-                task->store_cpu_pinned(false);
-            }
-
+            int const RESULT = mod::sched::set_task_affinity_checked(task, MASK);
             task->release();
-            return 0;
+            return static_cast<uint64_t>(RESULT);
         }
 
         case abi::multiproc::threadControlOps::GET_AFFINITY: {
@@ -257,18 +213,9 @@ auto host_thread_control_for_subject(mod::sched::task::Task* subject, abi::multi
                 task->release();
                 return static_cast<uint64_t>(-ENODEV);
             }
-            if (task->load_cpu_pinned()) {
-                if (task->load_cpu() >= 64) {
-                    task->release();
-                    return static_cast<uint64_t>(-ERANGE);
-                }
-                mask = 1ULL << task->load_cpu();
-            } else if (task->load_domain_mask() != ~0ULL) {
-                mask = task->load_domain_mask() & online_cpu_mask();
-            }
-
+            int const RESULT = mod::sched::get_task_affinity_checked(task, mask);
             task->release();
-            return mask;
+            return RESULT == 0 ? mask : static_cast<uint64_t>(RESULT);
         }
 
         case abi::multiproc::threadControlOps::CREATE_DOMAIN: {
@@ -330,28 +277,9 @@ auto host_thread_control_for_subject(mod::sched::task::Task* subject, abi::multi
             if (task == nullptr) {
                 return static_cast<uint64_t>(-ESRCH);
             }
-            uint64_t const RUNNING_CPU = mod::sched::current_cpu_for_task(task);
-            bool const IS_RUNNING = RUNNING_CPU != UINT64_MAX;
-            uint64_t const OWNER_CPU = IS_RUNNING ? RUNNING_CPU : mod::sched::owner_cpu_for_task(task);
-            bool const IS_WAITING = task->sched_queue == mod::sched::task::Task::sched_queue::WAITING;
-            if (IS_RUNNING && (dom->cpu_mask & cpu_mask_bit(RUNNING_CPU)) == 0) {
-                task->release();
-                return static_cast<uint64_t>(-EBUSY);
-            }
-            if (IS_WAITING && OWNER_CPU != UINT64_MAX && (dom->cpu_mask & cpu_mask_bit(OWNER_CPU)) == 0) {
-                task->release();
-                return static_cast<uint64_t>(-EBUSY);
-            }
-            task->store_domain_id(DOMAIN_ID);
-            task->store_domain_mask(dom->cpu_mask);
-            task->store_domain_hard(HARD || dom->hard);
-            task->store_cpu_pinned(false);
-            uint64_t const TARGET = mod::sched::get_least_loaded_cpu_in_mask(dom->cpu_mask);
-            if (!IS_RUNNING && !IS_WAITING) {
-                mod::sched::reschedule_task_for_cpu(TARGET, task);
-            }
+            int const RESULT = mod::sched::set_task_domain_checked(task, *dom, HARD);
             task->release();
-            return 0;
+            return static_cast<uint64_t>(RESULT);
         }
 
         case abi::multiproc::threadControlOps::QUERY_DOMAIN: {

@@ -92,6 +92,7 @@ void reschedule_task_for_cpu(uint64_t,task::Task*,EventWakeDiagnostics*);
 for name in ("event_wake_clock", "batch_local_event_wake", "event_wake_poke", "queue_reschedule_request",
              "consume_reschedule_request", "retain_or_reacquire_reschedule_leader"):
     code += function(name) + "\n"
+code += "template <typename Dispatch>\n" + function("drain_reschedule_leader") + "\n"
 code += "template <typename Func>\n" + function("with_event_wake_runqueue_lock") + "\n"
 code += r'''
 void reschedule_task_for_cpu_once(uint64_t c,task::Task* t,EventWakeDiagnostics* d){

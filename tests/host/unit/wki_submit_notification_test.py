@@ -134,6 +134,7 @@ enum class SchedulerHaltWaitKind { YIELD,BLOCK,PROCESS_PARK };
 '''
 for name in ['runqueue_task_is_reserved_locked', 'publish_reserved_task_wakeup_locked', 'event_wake_clock', 'queue_reschedule_request', 'consume_reschedule_request', 'retain_or_reacquire_reschedule_leader']:
     code += function(sched, name) + '\n'
+code += 'template <typename Dispatch>\n' + function(sched, 'drain_reschedule_leader') + '\n'
 code += 'template <typename Func>\n' + function(sched, 'with_event_wake_runqueue_lock') + '\n'
 for name in ['reschedule_task_for_cpu_once', 'reschedule_task_for_cpu', 'kern_wake', 'event_wake_target_cpu', 'wake_task_from_event_on_cpu', 'wake_task_from_event']:
     code += function(sched, name) + '\n'

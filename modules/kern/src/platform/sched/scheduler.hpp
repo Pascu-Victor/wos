@@ -18,6 +18,10 @@
 #include <platform/sys/spinlock.hpp>
 #include <span>
 
+namespace ker::mod::smt {
+struct CpuDomain;
+}
+
 namespace ker::mod::sched {
 
 // Maximum PIDs system-wide (2^24)
@@ -439,8 +443,19 @@ auto get_current_task() -> task::Task*;
 auto get_return_task() -> task::Task*;
 auto current_cpu_for_task(task::Task* task) -> uint64_t;
 auto owner_cpu_for_task(task::Task* task) -> uint64_t;
+// Caller retains the subject throughout the call. PROCESS placement changes
+// require task context with no incoming VM/RQ or unsafe blocking lock; their
+// VM publication guard is released before pending wake work is drained.
+// DAEMON pin/migrate callers retain their nonblocking VM-free operation.
 auto migrate_task_to_cpu(task::Task* task, uint64_t target_cpu) -> bool;
 auto pin_task_to_cpu(task::Task* task, uint64_t target_cpu) -> bool;
+// Checked administrative commits; negative errno on refusal. All policy and
+// movement effects follow final queue admission. Caller retains the subject.
+auto set_task_affinity_checked(task::Task* task, uint64_t mask) -> int;
+auto set_task_domain_checked(task::Task* task, const smt::CpuDomain& domain, bool hard) -> int;
+// A coherent observation at the proved owner lock; output is untouched on
+// refusal. No frame read, VM guard, wake election or pending-work drain.
+auto get_task_affinity_checked(task::Task* task, uint64_t& mask) -> int;
 
 struct KernelWorkerCpuPin {
     task::Task* worker{};

@@ -2,8 +2,11 @@
 """Execute WOS wait/accounting bodies and real RunHeap with controlled IRQ time.
 
 Only hardware clock, CLI/HLT, CPU migration and resource notification endpoints
-are adapted. Actual arithmetic, wait wrappers, bookkeeping and heap methods are
-compiled under ASan/UBSan. --source-root tests saved pre-patch scheduler sources.
+are adapted, plus completed-wait membership admission for already-runnable
+subjects. That endpoint asserts real heap membership and cannot repair a waiter;
+the native scheduler tests exercise that separate transition. Actual arithmetic,
+wait wrappers, bookkeeping and heap methods are compiled under ASan/UBSan.
+--source-root tests saved pre-patch scheduler sources.
 """
 import argparse
 import os
@@ -78,6 +81,13 @@ struct RunQueue {
  int64_t total_weight=0,total_weighted_vruntime=0,min_vruntime=0;
  std::atomic<uint64_t> irq_uncharged_us{0},cpu_idle_us{0},cpu_system_us{0},cpu_user_us{0},cpu_nice_us{0};
 };
+enum class KernelWaitCompletionResult {UNCHANGED,REQUEUED,STALE_INDEX,HEAP_FULL};
+KernelWaitCompletionResult complete_current_kernel_wait_locked(RunQueue* rq,task::Task* subject,uint64_t){
+ assert(rq && rq->current_task==subject && rq->runnable_heap.contains(subject));
+ return KernelWaitCompletionResult::UNCHANGED;
+}
+bool publish_runnable_task_locked(RunQueue*,task::Task*,const char*){assert(false);return false;}
+void hcf(){assert(false);}
 struct Queues {
  std::array<RunQueue,2> rows;unsigned cpu=0,locks=0;bool locked=false;
  template<class F>auto this_cpu_locked(F f){

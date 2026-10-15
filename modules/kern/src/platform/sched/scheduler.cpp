@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -99,6 +100,9 @@ namespace {
 using wait_log = ker::mod::dbg::logger<"wait">;
 using resume_log = ker::mod::dbg::logger<"resume">;
 using preempt_log = ker::mod::dbg::logger<"preempt">;
+
+auto try_claim_task_placement(task::Task* subject) -> bool;
+void finish_task_placement(task::Task* subject);
 
 // PID hash table for O(1) amortized lookups.
 // Open-addressing with linear probing, backward-shift deletion.
@@ -2238,6 +2242,44 @@ inline auto transition_cancel_handoff_locked(RunQueue* rq, task::Task* expected)
 
 inline auto compute_wakeup_floor_vruntime(RunQueue* rq, task::Task* t, uint64_t now_us, task::WaitChannelKind wait_channel) -> int64_t;
 
+enum class KernelWaitCompletionResult : uint8_t { UNCHANGED, REQUEUED, STALE_INDEX, HEAP_FULL };
+
+[[nodiscard]] auto complete_current_kernel_wait_locked(RunQueue* rq, task::Task* subject, uint64_t now_us) -> KernelWaitCompletionResult {
+    // The executing outer wait has completed. Its cancellation check may have
+    // consumed a reserved wake before a later handoff can requeue it. Restore
+    // only this exact current owner's membership, never an arbitrary waiter.
+    if (rq == nullptr || subject == nullptr || rq->current_task != subject ||
+        subject->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE || subject->has_exited ||
+        subject->exit_in_progress.load(std::memory_order_acquire) || subject->gc_queued.load(std::memory_order_acquire) ||
+        subject->scheduler_transition_active.load(std::memory_order_acquire) || subject->deferred_task_switch ||
+        subject->jobctl_stopped.load(std::memory_order_acquire) || subject->ptrace_stop_blocks_execution() || subject->wki_proxy_task ||
+        subject->wki_proxy_task_id != 0 || subject->pending_exec_handoff.load(std::memory_order_acquire) != nullptr ||
+        subject->wants_block || subject->wake_at_us != 0 || subject->is_voluntary_blocked() ||
+        subject->wait_channel_kind != task::WaitChannelKind::NONE || subject->sched_queue != task::Task::sched_queue::WAITING ||
+        !wait_list_contains_locked(rq, subject) || rq->runnable_heap.contains(subject)) {
+        return KernelWaitCompletionResult::UNCHANGED;
+    }
+    // Admission precedes every timer/list/fairness mutation. The production
+    // caller fails closed on these invariant errors; private tests can inspect
+    // the unchanged refusal without invoking the panic path.
+    if (subject->heap_index >= 0) {
+        return KernelWaitCompletionResult::STALE_INDEX;
+    }
+    if (rq->runnable_heap.size >= PER_CPU_HEAP_CAP) {
+        return KernelWaitCompletionResult::HEAP_FULL;
+    }
+
+    transition_detach_all_wait_locked(rq, subject);
+    subject->just_woke = true;
+    subject->vruntime = std::max(subject->vruntime, compute_wakeup_floor_vruntime(rq, subject, now_us, task::WaitChannelKind::NONE));
+    subject->vdeadline = vdeadline_from_slice(subject->vruntime, subject->slice_ns, subject->sched_weight);
+    subject->slice_used_ns = 0;
+    static_cast<void>(publish_runnable_task_locked(rq, subject, "completed-kernel-wait"));
+    // Leave a still-pending token for its ordinary consumer: a later event
+    // must survive this completed wait just as it does for a runnable owner.
+    return KernelWaitCompletionResult::REQUEUED;
+}
+
 void requeue_woken_outgoing_task_locked(RunQueue* rq, task::Task* outgoing, uint64_t now_us) {
     if (rq == nullptr || outgoing == nullptr || outgoing->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE) {
         return;
@@ -4045,9 +4087,28 @@ auto set_task_nice_in_namespace(task::Task* subject, const pid_ns::NamespaceRef&
 }
 
 namespace {
-struct TaskOwnerMoveResult {
-    bool moved{false};
+enum class TaskPlacementKind : uint8_t { AFFINITY, DOMAIN, MIGRATE, PIN };
+
+struct TaskPlacementRequest {
+    TaskPlacementKind kind{TaskPlacementKind::AFFINITY};
+    uint64_t mask{UINT64_MAX};
+    uint64_t target_cpu{UINT64_MAX};
+    uint32_t domain_id{};
+    bool hard{};
+};
+
+struct TaskPlacementResult {
+    int status{-EBUSY};
+    uint64_t source_cpu{UINT64_MAX};
+    uint64_t target_cpu{UINT64_MAX};
     bool runnable{false};
+    bool moved{false};
+};
+
+struct TaskPlacementOwnership {
+    bool reserved{};
+    bool runnable{};
+    bool waiting{};
 };
 
 auto hinted_or_scanned_owner_cpu(task::Task* task) -> uint64_t {
@@ -4066,121 +4127,255 @@ auto hinted_or_scanned_owner_cpu(task::Task* task) -> uint64_t {
     return owner_cpu_for_task(task);
 }
 
-auto move_task_owner_to_cpu(task::Task* task, uint64_t target_cpu, bool pin_to_target) -> TaskOwnerMoveResult {
-    TaskOwnerMoveResult result{};
-    if (task == nullptr || run_queues == nullptr || target_cpu >= smt::get_core_count()) {
-        return result;
-    }
-    if (task->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE) {
-        return result;
-    }
+auto task_placement_online_mask(uint64_t core_count) -> uint64_t {
+    return core_count >= 64 ? UINT64_MAX : ((uint64_t{1} << core_count) - 1);
+}
 
-    uint64_t const OWNER_CPU = hinted_or_scanned_owner_cpu(task);
-    if (OWNER_CPU == UINT64_MAX) {
-        return result;
-    }
+auto task_placement_subject_is_live(task::Task const* subject) -> bool {
+    return subject != nullptr && (subject->type == task::TaskType::PROCESS || subject->type == task::TaskType::DAEMON) &&
+           subject->state.load(std::memory_order_acquire) == task::TaskState::ACTIVE &&
+           !subject->exit_in_progress.load(std::memory_order_acquire) && !subject->gc_queued.load(std::memory_order_acquire);
+}
 
-    if (!task_cross_cpu_migration_allowed(task, OWNER_CPU, target_cpu, smt::get_core_count(), true)) {
-        return result;
-    }
+// Only actual indexed/list/reserved ownership is accepted. Do not repair a
+// stale index or conflicting ordinary membership as part of admission.
+auto task_placement_ownership_locked(RunQueue* owner, task::Task* subject, TaskPlacementOwnership& out) -> bool {
+    if (owner == nullptr || !task_placement_subject_is_live(subject) || owner->runnable_heap.size > PER_CPU_HEAP_CAP ||
+        subject->heap_index < -1)
+        return false;
+    TaskPlacementOwnership const OWNERSHIP{
+        .reserved = runqueue_task_is_reserved_locked(owner, subject),
+        .runnable = owner->runnable_heap.contains(subject),
+        .waiting = wait_list_contains_locked(owner, subject),
+    };
+    auto* const LIST_OWNER = subject->sched_list_owner.load(std::memory_order_acquire);
+    if ((LIST_OWNER != nullptr && LIST_OWNER != &owner->wait_list) || (subject->heap_index >= 0 && !OWNERSHIP.runnable) ||
+        (!OWNERSHIP.reserved && OWNERSHIP.runnable && OWNERSHIP.waiting) ||
+        (!OWNERSHIP.reserved && !OWNERSHIP.runnable && !OWNERSHIP.waiting))
+        return false;
+    if (!OWNERSHIP.reserved && ((OWNERSHIP.runnable && subject->sched_queue != task::Task::sched_queue::RUNNABLE) ||
+                                (OWNERSHIP.waiting && subject->sched_queue != task::Task::sched_queue::WAITING)))
+        return false;
+    out = OWNERSHIP;
+    return true;
+}
 
-    bool const WAS_PINNED = task->load_cpu_pinned();
-    run_queues->with_two_locks_void(
-        OWNER_CPU, target_cpu, [task, OWNER_CPU, target_cpu, pin_to_target, WAS_PINNED, &result](RunQueue* owner_rq, RunQueue* target_rq) {
-            if (task->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE) {
-                return;
-            }
-
-            if (!task_cross_cpu_migration_allowed(task, OWNER_CPU, target_cpu, smt::get_core_count(), true)) {
-                return;
-            }
-
-            if (runqueue_task_is_reserved_locked(owner_rq, task)) {
-                if (owner_rq != target_rq) {
-                    record_migration_rejection(task, target_cpu, MigrationRejectionReason::RETURN_TRANSITION);
-                    return;
-                }
-                task->store_cpu(target_cpu);
-                if (pin_to_target) {
-                    task->store_cpu_pinned(true);
-                }
-                result.moved = true;
-                return;
-            }
-
-            bool const IN_HEAP = owner_rq->runnable_heap.contains(task);
-            bool const IN_WAIT = wait_list_contains_locked(owner_rq, task);
-            if (!IN_HEAP && !IN_WAIT) {
-                return;
-            }
-
-            if (owner_rq == target_rq) {
-                task->store_cpu(target_cpu);
-                if (pin_to_target) {
-                    task->store_cpu_pinned(true);
-                }
-                result.moved = true;
-                result.runnable = IN_HEAP;
-                return;
-            }
-
-            bool moved_waiting = false;
-            bool moved_runnable = false;
-            if (IN_WAIT) {
-                moved_waiting = transition_detach_wait_locked(owner_rq, task);
-            }
-            if (IN_HEAP) {
-                moved_runnable = transition_detach_runnable_locked(owner_rq, task);
-                if (moved_runnable) {
-                    moved_waiting = false;
-                }
-            }
-            if (!moved_waiting && !moved_runnable) {
-                return;
-            }
-
-            task->store_cpu(target_cpu);
-            if (pin_to_target) {
-                task->store_cpu_pinned(true);
-            }
-
-            if (moved_waiting) {
-                transition_make_waiting_locked(target_rq, task);
-                result.moved = true;
-                return;
-            }
-
-            int64_t const FAIR_VRUNTIME = std::max(target_rq->min_vruntime, compute_avg_vruntime(target_rq));
-            task->vruntime = std::max(task->vruntime, FAIR_VRUNTIME);
-            task->vdeadline = vdeadline_from_slice(task->vruntime, task->slice_ns, task->sched_weight);
-            if (publish_runnable_task_locked(target_rq, task, "move-target")) {
-                result.moved = true;
-                result.runnable = true;
-                return;
-            }
-
-            task->store_cpu(OWNER_CPU);
-            task->store_cpu_pinned(WAS_PINNED);
-            (void)publish_runnable_task_locked(owner_rq, task, "move-rollback");
-        });
-
-    if (result.moved && OWNER_CPU != target_cpu) {
-        record_migration_outcome(task, OWNER_CPU, target_cpu, MigrationRejectionReason::NONE);
-    }
-    if (result.moved && result.runnable) {
-        if (target_cpu == cpu::current_cpu()) {
-            request_local_reschedule();
-        } else {
-            wake_cpu(target_cpu);
+void install_task_placement_policy(task::Task* subject, uint64_t target_cpu, uint64_t core_count, const TaskPlacementRequest& request) {
+    subject->store_cpu(target_cpu);
+    switch (request.kind) {
+        case TaskPlacementKind::AFFINITY: {
+            bool const SINGLE = std::has_single_bit(request.mask);
+            uint64_t const MASK = !SINGLE && request.mask == task_placement_online_mask(core_count) ? UINT64_MAX : request.mask;
+            subject->store_domain_mask(MASK);
+            subject->store_domain_hard(false);
+            subject->store_cpu_pinned(SINGLE);
+            break;
         }
+        case TaskPlacementKind::DOMAIN:
+            subject->store_domain_id(request.domain_id);
+            subject->store_domain_mask(request.mask);
+            subject->store_domain_hard(request.hard);
+            subject->store_cpu_pinned(false);
+            break;
+        case TaskPlacementKind::PIN:
+            subject->store_cpu_pinned(true);
+            break;
+        case TaskPlacementKind::MIGRATE:
+            break;
+    }
+}
+
+// Caller holds the actual source/target locks and, for a live PROCESS cross
+// move, the VM publication guard. Policy-only paths never inspect its image.
+auto commit_task_placement_locked(RunQueue* owner, RunQueue* target, task::Task* subject, uint64_t owner_cpu, uint64_t target_cpu,
+                                  uint64_t core_count, const TaskPlacementRequest& request) -> TaskPlacementResult {
+    TaskPlacementResult result;
+    if (owner == nullptr || target == nullptr || owner_cpu >= core_count || target_cpu >= core_count ||
+        ((owner_cpu == target_cpu) != (owner == target)) || target->runnable_heap.size > PER_CPU_HEAP_CAP)
+        return result;
+    TaskPlacementOwnership ownership;
+    if (!task_placement_ownership_locked(owner, subject, ownership)) return result;
+
+    bool const HOST_POLICY = request.kind == TaskPlacementKind::AFFINITY || request.kind == TaskPlacementKind::DOMAIN;
+    uint64_t destination = target_cpu;
+    if (HOST_POLICY) {
+        uint64_t const ONLINE = task_placement_online_mask(core_count);
+        if ((request.mask & ONLINE) == 0 || (request.mask & ~ONLINE) != 0) return result;
+        if (ownership.reserved || ownership.waiting) {
+            if (!cpu_mask_contains(request.mask, owner_cpu)) return result;
+            destination = owner_cpu;
+        } else if (request.kind == TaskPlacementKind::AFFINITY && !std::has_single_bit(request.mask) && request.mask == ONLINE) {
+            destination = owner_cpu;
+        }
+        if (!cpu_mask_contains(request.mask, destination)) return result;
+    }
+    if (ownership.reserved && destination != owner_cpu) return result;
+    if (destination == owner_cpu) {
+        install_task_placement_policy(subject, owner_cpu, core_count, request);
+        return {.status = 0,
+                .source_cpu = owner_cpu,
+                .target_cpu = owner_cpu,
+                .runnable = ownership.runnable && !ownership.reserved,
+                .moved = true};
+    }
+
+    // An independently reserved target could be writing the saved context.
+    // Reject duplicate target ownership and full/invalid transfers before any
+    // eager migration frame/resource read as well as before scheduler effects.
+    if (runqueue_task_is_reserved_locked(target, subject) || target->runnable_heap.contains(subject) ||
+        wait_list_contains_locked(target, subject))
+        return result;
+    if (ownership.runnable) {
+        if (target->runnable_heap.size >= PER_CPU_HEAP_CAP) return result;
+    } else if (!owner->wait_timers.can_transfer_after_cancel(subject->wait_timer, target->wait_timers, subject->wake_at_us)) {
+        return result;
+    }
+    // Explicit administration overrides old pin/hard/mask, not safety guards.
+    if (!task_cross_cpu_migration_decision(subject, owner_cpu, destination, core_count, true).can_migrate) return result;
+
+    bool const DETACHED =
+        ownership.runnable ? transition_detach_runnable_locked(owner, subject) : transition_detach_wait_locked(owner, subject);
+    if (!DETACHED) {
+        dbg::panic_handler("scheduler: admitted placement lost its owner");
+        return result;
+    }
+    install_task_placement_policy(subject, destination, core_count, request);
+    if (ownership.waiting) {
+        transition_make_waiting_locked(target, subject);
+    } else {
+        int64_t const FAIR_VRUNTIME = std::max(target->min_vruntime, compute_avg_vruntime(target));
+        subject->vruntime = std::max(subject->vruntime, FAIR_VRUNTIME);
+        subject->vdeadline = vdeadline_from_slice(subject->vruntime, subject->slice_ns, subject->sched_weight);
+        if (transition_make_runnable_locked(target, subject) != RunnableTransitionResult::PUBLISHED) {
+            dbg::panic_handler("scheduler: admitted placement could not publish");
+            return result;
+        }
+    }
+    // Image and actual owner locks still protect this diagnostic frame read.
+    record_migration_outcome(subject, owner_cpu, destination, MigrationRejectionReason::NONE);
+    return {.status = 0, .source_cpu = owner_cpu, .target_cpu = destination, .runnable = ownership.runnable, .moved = true};
+}
+
+auto observe_task_affinity_locked(RunQueue* owner, task::Task* subject, uint64_t owner_cpu, uint64_t core_count, uint64_t& out) -> int {
+    if (owner_cpu >= core_count) return -EBUSY;
+    TaskPlacementOwnership ownership;
+    if (!task_placement_ownership_locked(owner, subject, ownership)) return -EBUSY;
+    uint64_t const ONLINE = task_placement_online_mask(core_count);
+    if (ONLINE == 0) return -ENODEV;
+    bool const PINNED = subject->load_cpu_pinned();
+    uint64_t const MASK = subject->load_domain_mask();
+    if (PINNED && owner_cpu >= 64) return -ERANGE;
+    out = PINNED ? (uint64_t{1} << owner_cpu) : (MASK == UINT64_MAX ? ONLINE : MASK & ONLINE);
+    return 0;
+}
+
+auto commit_task_placement_request(task::Task* subject, uint64_t core_count, const TaskPlacementRequest& request) -> TaskPlacementResult {
+    TaskPlacementResult result;
+    // A producer can move the subject after each proposal, but the final
+    // ordered locks revalidate actual ownership before admission or effects.
+    for (unsigned attempt = 0; attempt < 2; ++attempt) {
+        uint64_t const OWNER = hinted_or_scanned_owner_cpu(subject);
+        if (OWNER >= core_count) continue;
+        uint64_t const TARGET = request.kind == TaskPlacementKind::AFFINITY && !std::has_single_bit(request.mask) &&
+                                        request.mask == task_placement_online_mask(core_count)
+                                    ? OWNER
+                                    : request.target_cpu;
+        if (TARGET >= core_count) return result;
+        bool owner_found = false;
+        run_queues->with_two_locks_void(
+            OWNER, TARGET, [subject, core_count, &request, OWNER, TARGET, &owner_found, &result](RunQueue* owner, RunQueue* target) {
+                owner_found = runqueue_owns_task_locked(owner, subject);
+                if (owner_found) result = commit_task_placement_locked(owner, target, subject, OWNER, TARGET, core_count, request);
+            });
+        if (owner_found) return result;
+    }
+    return result;
+}
+
+// The retained caller owns this entire task-context operation. The PROCESS
+// guard can sleep only before claiming leadership; DAEMON never takes it.
+auto apply_task_placement_request(task::Task* subject, const TaskPlacementRequest& request) -> TaskPlacementResult {
+    TaskPlacementResult result;
+    if (!task_placement_subject_is_live(subject) || run_queues == nullptr) return result;
+    uint64_t const CORE_COUNT = smt::get_core_count();
+    if (CORE_COUNT == 0) return result;
+    if ((request.kind == TaskPlacementKind::MIGRATE || request.kind == TaskPlacementKind::PIN) && request.target_cpu >= CORE_COUNT)
+        return result;
+    bool claimed = false;
+    auto commit = [&] {
+        if (!try_claim_task_placement(subject)) return;
+        claimed = true;
+        result = commit_task_placement_request(subject, CORE_COUNT, request);
+    };
+    if (subject->type == task::TaskType::PROCESS) {
+        ker::syscall::vmem::SharedVmemPublicationGuard publication;
+        commit();
+    } else {
+        commit();
+    }
+    if (claimed) {
+        // No queue or VM publication guard survives either notification or
+        // the uncapped drain of requests left by actual losing wake producers.
+        if (result.status == 0 && result.runnable) {
+            MigrationGuard const CPU_GUARD;
+            if (result.target_cpu == cpu::current_cpu())
+                request_local_reschedule();
+            else
+                wake_cpu(result.target_cpu);
+        }
+        finish_task_placement(subject);
     }
     return result;
 }
 }  // namespace
 
-auto migrate_task_to_cpu(task::Task* task, uint64_t target_cpu) -> bool { return move_task_owner_to_cpu(task, target_cpu, false).moved; }
+auto set_task_affinity_checked(task::Task* subject, uint64_t mask) -> int {
+    if (subject == nullptr) return -ESRCH;
+    uint64_t const CORE_COUNT = smt::get_core_count();
+    uint64_t const ONLINE = task_placement_online_mask(CORE_COUNT);
+    if (ONLINE == 0) return -ENODEV;
+    if ((mask & ONLINE) == 0 || (mask & ~ONLINE) != 0) return -EINVAL;
+    uint64_t const TARGET = std::has_single_bit(mask) ? static_cast<uint64_t>(std::countr_zero(mask))
+                                                      : (mask == ONLINE ? UINT64_MAX : get_least_loaded_cpu_in_mask(mask));
+    return apply_task_placement_request(subject, {.kind = TaskPlacementKind::AFFINITY, .mask = mask, .target_cpu = TARGET}).status;
+}
 
-auto pin_task_to_cpu(task::Task* task, uint64_t target_cpu) -> bool { return move_task_owner_to_cpu(task, target_cpu, true).moved; }
+auto set_task_domain_checked(task::Task* subject, const smt::CpuDomain& domain, bool hard) -> int {
+    if (subject == nullptr) return -ESRCH;
+    return apply_task_placement_request(subject, {.kind = TaskPlacementKind::DOMAIN,
+                                                  .mask = domain.cpu_mask,
+                                                  .target_cpu = get_least_loaded_cpu_in_mask(domain.cpu_mask),
+                                                  .domain_id = domain.id,
+                                                  .hard = hard || domain.hard})
+        .status;
+}
+
+auto get_task_affinity_checked(task::Task* subject, uint64_t& out) -> int {
+    if (subject == nullptr) return -ESRCH;
+    uint64_t const CORE_COUNT = smt::get_core_count();
+    if (CORE_COUNT == 0) return -ENODEV;
+    if (run_queues == nullptr) return -EBUSY;
+    for (unsigned attempt = 0; attempt < 2; ++attempt) {
+        uint64_t const OWNER = hinted_or_scanned_owner_cpu(subject);
+        if (OWNER >= CORE_COUNT) continue;
+        bool owner_found = false;
+        int status = -EBUSY;
+        run_queues->with_lock_void(OWNER, [subject, CORE_COUNT, OWNER, &out, &owner_found, &status](RunQueue* owner) {
+            owner_found = runqueue_owns_task_locked(owner, subject);
+            if (owner_found) status = observe_task_affinity_locked(owner, subject, OWNER, CORE_COUNT, out);
+        });
+        if (owner_found) return status;
+    }
+    return -EBUSY;
+}
+
+auto migrate_task_to_cpu(task::Task* subject, uint64_t target_cpu) -> bool {
+    return apply_task_placement_request(subject, {.kind = TaskPlacementKind::MIGRATE, .target_cpu = target_cpu}).status == 0;
+}
+
+auto pin_task_to_cpu(task::Task* subject, uint64_t target_cpu) -> bool {
+    return apply_task_placement_request(subject, {.kind = TaskPlacementKind::PIN, .target_cpu = target_cpu}).status == 0;
+}
 
 namespace {
 struct KernelWorkerPinPlan {
@@ -4420,6 +4615,15 @@ void finish_kernel_wait_accounting(task::Task* subject, KernelWaitAccounting sta
             uint64_t const NOW_US = time::get_us();
             account_kernel_wait_boundary_locked(rq, subject, NOW_US, false);
             subject->set_voluntary_blocked(state.was_blocked);
+            if (!state.was_blocked) {
+                auto const COMPLETION = complete_current_kernel_wait_locked(rq, subject, NOW_US);
+                if (COMPLETION == KernelWaitCompletionResult::STALE_INDEX || COMPLETION == KernelWaitCompletionResult::HEAP_FULL) {
+                    // Preflight left the task unchanged, so the established
+                    // publication diagnostics identify the same invariant.
+                    static_cast<void>(publish_runnable_task_locked(rq, subject, "completed-kernel-wait"));
+                    hcf();
+                }
+            }
             if (state.paused_syscall && subject->type == task::TaskType::PROCESS && subject->syscall_account_start_us == 0 &&
                 !subject->cpu_accounting_finalized.load(std::memory_order_acquire)) {
                 subject->syscall_account_start_us = NOW_US;
@@ -6630,6 +6834,35 @@ inline auto retain_or_reacquire_reschedule_leader(task::Task* task) -> bool {
     }
 }
 
+auto try_claim_task_placement(task::Task* subject) -> bool {
+    bool expected = false;
+    return subject != nullptr &&
+           subject->reschedule_in_progress.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire);
+}
+
+template <typename Dispatch>
+void drain_reschedule_leader(task::Task* task, EventWakeDiagnostics* diagnostics, Dispatch&& dispatch) {
+    uint64_t const DRAIN_START = event_wake_clock(diagnostics);
+
+    // Losing producers return immediately, so the leader must drain until a
+    // quiescent handoff. Each pass services real coalesced work; a finite cap
+    // would strand the last request without a deferred executor.
+    bool keep_leadership = true;
+    while (keep_leadership) {
+        uint64_t requested_cpu = 0;
+        if (consume_reschedule_request(task, requested_cpu)) {
+            if (diagnostics != nullptr) {
+                ++diagnostics->passes;
+            }
+            dispatch(requested_cpu);
+        }
+        keep_leadership = retain_or_reacquire_reschedule_leader(task);
+    }
+    if (diagnostics != nullptr) {
+        diagnostics->reschedule_us = time::get_us() - DRAIN_START;
+    }
+}
+
 void reschedule_task_for_cpu_once(uint64_t cpu_no, task::Task* task, EventWakeDiagnostics* diagnostics) {
     if (task == nullptr || run_queues == nullptr) {
         return;
@@ -6945,6 +7178,13 @@ void reschedule_task_for_cpu_once(uint64_t cpu_no, task::Task* task, EventWakeDi
     dbg::log("RESCHED: PID %x DONE -> CPU %d (heapIdx=%d)", task->pid, static_cast<int>(cpu_no), task->heap_index);
 #endif
 }
+void finish_task_placement(task::Task* subject) {
+    // The claimant retains subject and has released every VM/runqueue guard.
+    // Dispatch only genuine work left by a losing producer; an administrative
+    // placement request does not itself wake the subject.
+    drain_reschedule_leader(subject, nullptr,
+                            [subject](uint64_t requested_cpu) { reschedule_task_for_cpu_once(requested_cpu, subject, nullptr); });
+}
 }  // namespace
 
 void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task, EventWakeDiagnostics* diagnostics) {
@@ -6960,25 +7200,8 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task, EventWakeDiagnos
     if (!LEADER) {
         return;
     }
-    uint64_t const DRAIN_START = event_wake_clock(diagnostics);
-
-    // Losing producers return immediately, so the leader must drain until a
-    // quiescent handoff. Each pass services real coalesced work; a finite cap
-    // would strand the last request without a deferred executor.
-    bool keep_leadership = true;
-    while (keep_leadership) {
-        uint64_t requested_cpu = 0;
-        if (consume_reschedule_request(task, requested_cpu)) {
-            if (diagnostics != nullptr) {
-                ++diagnostics->passes;
-            }
-            reschedule_task_for_cpu_once(requested_cpu, task, diagnostics);
-        }
-        keep_leadership = retain_or_reacquire_reschedule_leader(task);
-    }
-    if (diagnostics != nullptr) {
-        diagnostics->reschedule_us = time::get_us() - DRAIN_START;
-    }
+    drain_reschedule_leader(
+        task, diagnostics, [task, diagnostics](uint64_t requested_cpu) { reschedule_task_for_cpu_once(requested_cpu, task, diagnostics); });
 }
 
 // ============================================================================
@@ -10987,6 +11210,1094 @@ auto scheduler_selftest_domain_refusal_preserves_stale_index_then_repairs() -> b
     task::Task* detached = detach_steal_candidate_locked(fixture.rq.get(), 0, 2, 4, &hard);
     ok = fixture.exact_detachment_locked(detached, 2) && ok;
     fixture.lock.unlock_irqrestore(FLAGS);
+    return ok;
+}
+
+namespace {
+constexpr size_t PLACEMENT_NATIVE_TASKS = 6;
+
+struct PlacementNativeTaskSnapshot {
+    DomainStealTaskSnapshot core;
+    task::TaskType type;
+    uint32_t references;
+    uint32_t registry_index;
+    task::ChildMembershipState child_membership;
+    uint64_t requested_cpu;
+    bool pending;
+    bool leader;
+    uint64_t wake_at;
+    const char* wait_channel;
+    task::WaitChannelKind wait_kind;
+    bool wakeup_pending;
+    bool voluntary;
+    bool exiting;
+    int exit_status;
+    bool is_thread;
+    bool wki_proxy;
+    uint32_t wki_id;
+    const task::Task* resource_owner;
+    task::Task* unpublished_child;
+
+    auto operator==(const PlacementNativeTaskSnapshot&) const -> bool = default;
+};
+
+auto placement_native_task_snapshot(const task::Task& t) -> PlacementNativeTaskSnapshot {
+    auto core = domain_steal_task_snapshot(t);
+    core.cpu = t.load_cpu();
+    core.domain_mask = t.load_domain_mask();
+    core.domain_id = t.load_domain_id();
+    core.cpu_pinned = t.load_cpu_pinned();
+    core.domain_hard = t.load_domain_hard();
+    return {core,
+            t.type,
+            t.ref_count.load(std::memory_order_acquire),
+            t.active_registry_index,
+            t.child_membership_state.load(std::memory_order_acquire),
+            t.reschedule_requested_cpu.load(std::memory_order_acquire),
+            t.reschedule_pending.load(std::memory_order_acquire),
+            t.reschedule_in_progress.load(std::memory_order_acquire),
+            t.wake_at_us,
+            t.wait_channel,
+            t.wait_channel_kind,
+            t.wakeup_pending.load(std::memory_order_acquire),
+            t.is_voluntary_blocked(),
+            t.exit_in_progress.load(std::memory_order_acquire),
+            t.exit_status,
+            t.is_thread,
+            t.wki_proxy_task,
+            t.wki_proxy_task_id,
+            t.resource_owner.get(),
+            t.owned_unpublished_process};
+}
+
+struct PlacementNativeQueueSnapshot {
+    DomainStealQueueSnapshot core;
+    uint32_t stamp;
+    uint32_t reservations;
+    uint64_t current_start;
+    bool timer_pending;
+    bool idle;
+    std::array<uint64_t, 8> cpu_accounting;
+    std::array<uint64_t, 3> timer_counters;
+
+    auto operator==(const PlacementNativeQueueSnapshot&) const -> bool = default;
+};
+
+auto placement_native_queue_snapshot(RunQueue& rq) -> PlacementNativeQueueSnapshot {
+    return {domain_steal_queue_snapshot(rq),
+            load_runqueue_domain_id(&rq),
+            rq.placement_reservations.load(std::memory_order_relaxed),
+            rq.current_task_start_us,
+            rq.resched_timer_pending.load(std::memory_order_relaxed),
+            rq.is_idle.load(std::memory_order_relaxed),
+            {rq.cpu_user_us.load(), rq.cpu_nice_us.load(), rq.cpu_system_us.load(), rq.cpu_idle_us.load(), rq.cpu_iowait_us.load(),
+             rq.cpu_irq_us.load(), rq.cpu_softirq_us.load(), rq.cpu_steal_us.load()},
+            {rq.wait_timer_extractions.load(), rq.wait_timer_budget_exhaustions.load(), rq.wait_timer_late_us_max.load()}};
+}
+
+struct PlacementNativeSnapshot {
+    std::array<RunHeap::EntryStorage, 2> entries{};
+    std::array<PlacementNativeQueueSnapshot, 2> queues{};
+    std::array<PlacementNativeTaskSnapshot, PLACEMENT_NATIVE_TASKS> tasks{};
+};
+
+// One private exclusion protects both private queues. This does not emulate
+// the global ascending per-CPU locks; their binding is audited separately.
+struct PlacementNativeFixture {
+    std::unique_ptr<RunQueue[]> queues{new (std::nothrow) RunQueue[2]{}};
+    std::unique_ptr<task::Task[]> tasks{new (std::nothrow) task::Task[PLACEMENT_NATIVE_TASKS]{}};
+    std::unique_ptr<threading::Thread[]> threads{new (std::nothrow) threading::Thread[PLACEMENT_NATIVE_TASKS]{}};
+    std::unique_ptr<DomainStealContextStorage[]> contexts{new (std::nothrow) DomainStealContextStorage[PLACEMENT_NATIVE_TASKS]{}};
+    std::unique_ptr<PlacementNativeSnapshot> before{new (std::nothrow) PlacementNativeSnapshot{}};
+    time::TimerQueue foreign_timer{time::TimerDispatch::SYNCHRONOUS};
+    sys::Spinlock lock;
+
+    ~PlacementNativeFixture() { clear(); }
+    auto ready() const -> bool { return queues && tasks && threads && contexts && before; }
+    auto queue(size_t i) -> RunQueue* { return &queues[i]; }
+
+    void clear() {
+        uint64_t const FLAGS = lock.lock_irqsave();
+        if (tasks) {
+            for (size_t i = 0; i < PLACEMENT_NATIVE_TASKS; ++i) {
+                auto& t = tasks[i];
+                static_cast<void>(foreign_timer.cancel(t.wait_timer));
+                if (queues) {
+                    for (size_t q = 0; q < 2; ++q) {
+                        static_cast<void>(queues[q].wait_timers.cancel(t.wait_timer));
+                        static_cast<void>(queues[q].wait_list.remove(&t));
+                        static_cast<void>(queues[q].dead_list.remove(&t));
+                    }
+                }
+                t.sched_previous = nullptr;
+                t.sched_next = nullptr;
+                t.sched_list_owner.store(nullptr, std::memory_order_release);
+                t.heap_index = -1;
+                t.sched_queue = task::Task::sched_queue::NONE;
+                t.scheduler_published.store(false, std::memory_order_release);
+                t.thread = nullptr;
+                t.pagemap = nullptr;
+                t.context = {};
+            }
+        }
+        if (queues) {
+            for (size_t q = 0; q < 2; ++q) {
+                auto& rq = queues[q];
+                rq.runnable_heap.entries.fill(nullptr);
+                rq.runnable_heap.size = 0;
+                rq.wait_list.init();
+                rq.dead_list.init();
+                rq.current_task = nullptr;
+                rq.handoff_task = nullptr;
+                rq.idle_task = nullptr;
+                rq.gc_reclaim_scan_cursor = nullptr;
+                rq.total_weight = 0;
+                rq.total_weighted_vruntime = 0;
+                rq.cached_load_default.store(0);
+                rq.cached_load_process.store(0);
+                rq.cached_current_load_default.store(0);
+                rq.cached_current_load_process.store(0);
+                rq.next_wait_deadline_us = 0;
+            }
+        }
+        lock.unlock_irqrestore(FLAGS);
+    }
+
+    auto prepare() -> bool {
+        clear();
+        if (!ready()) return false;
+        for (size_t i = 0; i < PLACEMENT_NATIVE_TASKS; ++i) {
+            auto& t = tasks[i];
+            t.type = task::TaskType::PROCESS;
+            t.pid = i + 1;  // Local fixture label; never registered or allocated.
+            t.store_cpu(i == 2 || i == 4 ? 1 : 0);
+            t.store_domain_mask(UINT64_MAX);
+            t.store_domain_id(55);
+            t.store_cpu_pinned(false);
+            t.store_domain_hard(false);
+            t.state.store(task::TaskState::ACTIVE);
+            t.gc_queued.store(false);
+            t.has_exited = false;
+            t.has_run = false;
+            t.exit_in_progress.store(false);
+            t.wants_block = false;
+            t.deferred_task_switch = false;
+            t.scheduler_transition_active.store(false);
+            t.preempt_disable_depth = 0;
+            t.migration_guard_state.store(encode_migration_guard_state({.depth = 0, .owner_cpu = MIGRATION_CPU_INVALID}));
+            t.migration_diagnostic.store(encode_migration_diagnostic({}));
+            t.reschedule_requested_cpu.store(0);
+            t.reschedule_pending.store(false);
+            t.reschedule_in_progress.store(false);
+            t.wakeup_pending.store(false);
+            t.set_voluntary_blocked(false);
+            t.wake_at_us = 0;
+            t.clear_wait_channel();
+            t.wki_proxy_task = false;
+            t.wki_proxy_task_id = 0;
+            t.sched_weight = i == 1 ? 512 : 1024;
+            t.sched_nice = i == 1 ? 3 : 0;
+            t.vruntime = i == 2 ? 110 : 20 + static_cast<int64_t>(i * 10);
+            t.vdeadline = static_cast<int64_t>((i + 1) * 1000);
+            t.slice_ns = 1'024'000;
+            t.slice_used_ns = static_cast<uint32_t>(17 + i);
+            t.last_run_us = static_cast<uint32_t>(30 + i);
+            t.last_sleep_us = static_cast<uint32_t>(40 + i);
+            t.last_sleep_start_us = 0;
+            t.last_wake_us = 60 + i;
+            t.thread = &threads[i];
+            t.pagemap = mm::virt::get_kernel_pagemap();  // Borrowed; never released.
+            // Owned scalar context eligibility, never an executable stack.
+            t.context.syscall_kernel_stack = reinterpret_cast<uint64_t>(contexts[i].stack.data() + contexts[i].stack.size());
+            t.context.syscall_scratch_area = reinterpret_cast<uint64_t>(contexts[i].scratch.data());
+            t.context.frame.cs = desc::gdt::GDT_USER_CS;
+            t.context.frame.ss = desc::gdt::GDT_USER_DS;
+            t.context.frame.rip = 0x401000;
+            t.context.frame.rsp = 0x7fff0000;
+            t.context.frame.flags = 0x202;
+            sys::context_switch::record_saved_frame_class(&t, t.context.frame, task::SavedFrameOrigin::SYNTHETIC_USER_RETURN);
+        }
+        uint64_t const FLAGS = lock.lock_irqsave();
+        queue(0)->min_vruntime = 10;
+        queue(1)->min_vruntime = 100;
+        bool ok = true;
+        for (size_t i = 0; i < 3; ++i) {
+            bool const VALID = sys::context_switch::saved_frame_class_is_valid(&tasks[i], tasks[i].context.frame);
+            bool const PUBLISHED = publish_runnable_task_locked(queue(i == 2 ? 1 : 0), &tasks[i], "placement-native");
+            ok = VALID && PUBLISHED && ok;
+        }
+        tasks[5].state.store(task::TaskState::DEAD);
+        tasks[5].gc_queued.store(true);
+        tasks[5].sched_queue = task::Task::sched_queue::DEAD_GC;
+        tasks[5].scheduler_published.store(true);
+        queue(0)->dead_list.push(&tasks[5]);
+        queue(0)->gc_reclaim_scan_cursor = &tasks[5];
+        bool const SOURCE_VALID = validate_transition_boundary_locked(queue(0), TransitionPhase::STABLE) == 0;
+        bool const TARGET_VALID = validate_transition_boundary_locked(queue(1), TransitionPhase::STABLE) == 0;
+        ok = SOURCE_VALID && TARGET_VALID && ok;
+        lock.unlock_irqrestore(FLAGS);
+        return ok;
+    }
+
+    void capture_locked() {
+        for (size_t q = 0; q < 2; ++q) {
+            before->entries[q] = queues[q].runnable_heap.entries;
+            before->queues[q] = placement_native_queue_snapshot(queues[q]);
+        }
+        for (size_t i = 0; i < PLACEMENT_NATIVE_TASKS; ++i) before->tasks[i] = placement_native_task_snapshot(tasks[i]);
+    }
+    auto queues_unchanged_locked() const -> bool {
+        bool ok = true;
+        for (size_t q = 0; q < 2; ++q)
+            ok = before->entries[q] == queues[q].runnable_heap.entries && before->queues[q] == placement_native_queue_snapshot(queues[q]) &&
+                 ok;
+        return ok;
+    }
+    auto unchanged_locked() const -> bool {
+        bool ok = queues_unchanged_locked();
+        for (size_t i = 0; i < PLACEMENT_NATIVE_TASKS; ++i) ok = placement_native_task_snapshot(tasks[i]) == before->tasks[i] && ok;
+        return ok;
+    }
+    void make_waiting_locked(size_t i, size_t q, uint64_t deadline) {
+        auto& t = tasks[i];
+        static_cast<void>(transition_detach_runnable_locked(queue(q), &t));
+        t.wake_at_us = deadline;
+        t.set_wait_channel("placement-native-wait");
+        t.scheduler_published.store(true);
+        transition_make_waiting_locked(queue(q), &t);
+    }
+};
+
+constexpr size_t PLACEMENT_COMPACT_PAYLOAD = sizeof(RunQueue) * 2 + sizeof(task::Task) * PLACEMENT_NATIVE_TASKS +
+                                             sizeof(threading::Thread) * PLACEMENT_NATIVE_TASKS +
+                                             sizeof(DomainStealContextStorage) * PLACEMENT_NATIVE_TASKS + sizeof(PlacementNativeSnapshot);
+static_assert(PLACEMENT_COMPACT_PAYLOAD < 1024 * 1024);
+
+auto placement_finish_without_pending(task::Task* subject) -> bool {
+    size_t unexpected_dispatches = 0;
+    drain_reschedule_leader(subject, nullptr, [&unexpected_dispatches](uint64_t) { ++unexpected_dispatches; });
+    return unexpected_dispatches == 0 && !subject->reschedule_pending.load() && !subject->reschedule_in_progress.load();
+}
+
+auto placement_native_domain_request(uint64_t mask, uint64_t target) -> TaskPlacementRequest {
+    return {.kind = TaskPlacementKind::DOMAIN, .mask = mask, .target_cpu = target, .domain_id = 77, .hard = true};
+}
+}  // namespace
+
+auto scheduler_selftest_placement_claim_and_uncapped_drain() -> bool {
+    PlacementNativeFixture fixture;
+    if (!fixture.ready()) return false;
+    bool ok = fixture.prepare();
+    auto* const SUBJECT = &fixture.tasks[0];
+    bool const RETAINED = SUBJECT->try_acquire();
+    ok = RETAINED && SUBJECT->ref_count.load() == 2 && ok;
+
+    // A real producer already owns the election. Failed administrative CAS
+    // must preserve its requested/pending/leader words and all queue effects.
+    bool const PRODUCER_LEADER = queue_reschedule_request(SUBJECT, 0);
+    uint64_t flags = fixture.lock.lock_irqsave();
+    fixture.capture_locked();
+    fixture.lock.unlock_irqrestore(flags);
+    bool const BUSY_CLAIM = try_claim_task_placement(SUBJECT);
+    flags = fixture.lock.lock_irqsave();
+    ok = PRODUCER_LEADER && !BUSY_CLAIM && fixture.unchanged_locked() && ok;
+    fixture.lock.unlock_irqrestore(flags);
+    size_t first_dispatches = 0;
+    drain_reschedule_leader(SUBJECT, nullptr, [&](uint64_t requested) {
+        ++first_dispatches;
+        uint64_t const FLAGS = fixture.lock.lock_irqsave();
+        TaskPlacementRequest const REQUEST{.kind = TaskPlacementKind::MIGRATE, .target_cpu = requested};
+        auto const RESULT = commit_task_placement_locked(fixture.queue(0), fixture.queue(0), SUBJECT, 0, 0, 2, REQUEST);
+        ok = requested == 0 && RESULT.status == 0 && ok;
+        fixture.lock.unlock_irqrestore(FLAGS);
+    });
+    ok = first_dispatches == 1 && !SUBJECT->reschedule_pending.load() && !SUBJECT->reschedule_in_progress.load() && ok;
+
+    bool const EMPTY_CLAIM = try_claim_task_placement(SUBJECT);
+    bool const EMPTY_FINISH = placement_finish_without_pending(SUBJECT);
+    ok = EMPTY_CLAIM && EMPTY_FINISH && ok;
+
+    bool const CLAIMED = try_claim_task_placement(SUBJECT);
+    bool const LOSING_PRODUCER = !queue_reschedule_request(SUBJECT, 1);
+    constexpr size_t PASSES = 40;  // Requires more than a proposed finite32-pass cap.
+    size_t dispatches = 0;
+    EventWakeDiagnostics diagnostics{};
+    drain_reschedule_leader(SUBJECT, &diagnostics, [&](uint64_t requested) {
+        if (requested >= 2) {
+            ok = false;
+            ++dispatches;
+            return;
+        }
+        uint64_t const FLAGS = fixture.lock.lock_irqsave();
+        bool const IN_FIRST = fixture.queue(0)->runnable_heap.contains(SUBJECT);
+        uint64_t const OWNER = IN_FIRST ? 0 : 1;
+        TaskPlacementRequest const REQUEST{.kind = TaskPlacementKind::MIGRATE, .target_cpu = requested};
+        auto const RESULT =
+            commit_task_placement_locked(fixture.queue(OWNER), fixture.queue(requested), SUBJECT, OWNER, requested, 2, REQUEST);
+        ok = requested < 2 && RESULT.status == 0 && RESULT.target_cpu == requested && ok;
+        fixture.lock.unlock_irqrestore(FLAGS);
+        ++dispatches;
+        // Real pending publication during an admitted dispatch, not a final
+        // fabricated flag. The shared uncapped loop must service another pass.
+        if (dispatches < PASSES) ok = !queue_reschedule_request(SUBJECT, 1 - requested) && ok;
+    });
+    flags = fixture.lock.lock_irqsave();
+    ok = CLAIMED && LOSING_PRODUCER && dispatches == PASSES && diagnostics.passes == PASSES &&
+         fixture.queue(0)->runnable_heap.contains(SUBJECT) && !fixture.queue(1)->runnable_heap.contains(SUBJECT) &&
+         SUBJECT->load_cpu() == 0 && !SUBJECT->reschedule_pending.load() && !SUBJECT->reschedule_in_progress.load() &&
+         SUBJECT->ref_count.load() == 2 && validate_transition_boundary_locked(fixture.queue(0), TransitionPhase::STABLE) == 0 &&
+         validate_transition_boundary_locked(fixture.queue(1), TransitionPhase::STABLE) == 0 && ok;
+    fixture.lock.unlock_irqrestore(flags);
+    if (RETAINED) SUBJECT->release();
+    return SUBJECT->ref_count.load() == 1 && ok;
+}
+
+auto scheduler_selftest_placement_owner_and_policy_only() -> bool {
+    PlacementNativeFixture fixture;
+    if (!fixture.ready()) return false;
+    bool ok = true;
+    // Detached, stale index, wrong proposed owner and conflicting wait/heap
+    // each use actual private physical state, with no repair on refusal.
+    for (unsigned axis = 0; axis < 4; ++axis) {
+        bool const PREPARED = fixture.prepare();
+        auto* const SUBJECT = &fixture.tasks[0];
+        bool const CLAIMED = try_claim_task_placement(SUBJECT);
+        uint64_t const FLAGS = fixture.lock.lock_irqsave();
+        if (axis == 0) {
+            static_cast<void>(transition_detach_runnable_locked(fixture.queue(0), SUBJECT));
+            SUBJECT->sched_queue = task::Task::sched_queue::NONE;
+        }
+        if (axis == 1) SUBJECT->heap_index = -1;
+        if (axis == 3) fixture.queue(0)->wait_list.push(SUBJECT);
+        fixture.capture_locked();
+        auto const RESULT = commit_task_placement_locked(fixture.queue(axis == 2 ? 1 : 0), fixture.queue(1), SUBJECT, axis == 2 ? 1 : 0, 1,
+                                                         2, placement_native_domain_request(2, 1));
+        ok = PREPARED && CLAIMED && RESULT.status == -EBUSY && fixture.unchanged_locked() && ok;
+        fixture.lock.unlock_irqrestore(FLAGS);
+        bool const FINISHED = placement_finish_without_pending(SUBJECT);
+        ok = FINISHED && ok;
+    }
+    // Current/handoff may overlap either real heap or real waiting ownership.
+    // Unavailable image resources must not veto an in-owner policy update.
+    for (unsigned axis = 0; axis < 5; ++axis) {
+        bool const PREPARED = fixture.prepare();
+        auto* const SUBJECT = &fixture.tasks[0];
+        bool const CLAIMED = try_claim_task_placement(SUBJECT);
+        uint64_t const FLAGS = fixture.lock.lock_irqsave();
+        if (axis >= 2) fixture.make_waiting_locked(0, 0, 300);
+        if (axis == 0 || axis == 2) fixture.queue(0)->current_task = SUBJECT;
+        if (axis == 1 || axis == 3) fixture.queue(0)->handoff_task = SUBJECT;
+        update_current_load_cache(fixture.queue(0), fixture.queue(0)->current_task);
+        SUBJECT->thread = nullptr;
+        SUBJECT->pagemap = nullptr;
+        SUBJECT->context.saved_frame_class = task::SavedFrameClass::INVALID;
+        SUBJECT->store_cpu_pinned(true);
+        SUBJECT->store_domain_hard(true);
+        SUBJECT->store_domain_mask(1);
+        fixture.capture_locked();
+        TaskPlacementRequest const REQUEST{.kind = TaskPlacementKind::AFFINITY, .mask = 3, .target_cpu = 1};
+        auto const RESULT = commit_task_placement_locked(fixture.queue(0), fixture.queue(1), SUBJECT, 0, 1, 2, REQUEST);
+        auto expected = fixture.before->tasks[0];
+        expected.core.domain_mask = UINT64_MAX;
+        expected.core.cpu_pinned = false;
+        expected.core.domain_hard = false;
+        ok = PREPARED && CLAIMED && RESULT.status == 0 && RESULT.target_cpu == 0 && placement_native_task_snapshot(*SUBJECT) == expected &&
+             fixture.queues_unchanged_locked() && ok;
+        for (size_t i = 1; i < PLACEMENT_NATIVE_TASKS; ++i)
+            ok = placement_native_task_snapshot(fixture.tasks[i]) == fixture.before->tasks[i] && ok;
+        fixture.capture_locked();
+        auto const REFUSED =
+            commit_task_placement_locked(fixture.queue(0), fixture.queue(1), SUBJECT, 0, 1, 2, placement_native_domain_request(2, 1));
+        ok = REFUSED.status == -EBUSY && fixture.unchanged_locked() && ok;
+        fixture.lock.unlock_irqrestore(FLAGS);
+        bool const FINISHED = placement_finish_without_pending(SUBJECT);
+        ok = FINISHED && ok;
+    }
+
+    bool const PREPARED = fixture.prepare();
+    auto* const SUBJECT = &fixture.tasks[0];
+    uint64_t const FLAGS = fixture.lock.lock_irqsave();
+    SUBJECT->store_cpu(7);  // Hint is deliberately unrelated to proved owner.
+    SUBJECT->store_cpu_pinned(true);
+    fixture.capture_locked();
+    uint64_t out = 0x12345678;
+    int const AT63 = observe_task_affinity_locked(fixture.queue(0), SUBJECT, 63, 65, out);
+    ok = PREPARED && AT63 == 0 && out == (1ULL << 63) && fixture.unchanged_locked() && ok;
+    out = 0x12345678;
+    int const AT64 = observe_task_affinity_locked(fixture.queue(0), SUBJECT, 64, 65, out);
+    ok = AT64 == -ERANGE && out == 0x12345678 && fixture.unchanged_locked() && ok;
+    SUBJECT->store_cpu_pinned(false);
+    SUBJECT->store_domain_mask(1ULL << 63);
+    fixture.capture_locked();
+    int const UNPINNED64 = observe_task_affinity_locked(fixture.queue(0), SUBJECT, 64, 65, out);
+    ok = UNPINNED64 == 0 && out == (1ULL << 63) && fixture.unchanged_locked() && ok;
+    static_cast<void>(transition_detach_runnable_locked(fixture.queue(0), SUBJECT));
+    SUBJECT->sched_queue = task::Task::sched_queue::NONE;
+    fixture.capture_locked();
+    out = 0x12345678;
+    int const DETACHED = observe_task_affinity_locked(fixture.queue(0), SUBJECT, 0, 2, out);
+    ok = DETACHED == -EBUSY && out == 0x12345678 && fixture.unchanged_locked() && ok;
+    fixture.lock.unlock_irqrestore(FLAGS);
+    return ok;
+}
+
+auto scheduler_selftest_placement_hard_move_and_refusals() -> bool {
+    PlacementNativeFixture fixture;
+    if (!fixture.ready()) return false;
+    bool ok = fixture.prepare();
+    auto* const SUBJECT = &fixture.tasks[0];
+    SUBJECT->store_cpu_pinned(true);
+    SUBJECT->store_domain_hard(true);
+    SUBJECT->store_domain_mask(1);
+    bool const CLAIMED = try_claim_task_placement(SUBJECT);
+    uint64_t flags = fixture.lock.lock_irqsave();
+    fixture.capture_locked();
+    auto const RESULT =
+        commit_task_placement_locked(fixture.queue(0), fixture.queue(1), SUBJECT, 0, 1, 2, placement_native_domain_request(2, 1));
+    auto expected = fixture.before->tasks[0];
+    expected.core.cpu = 1;
+    expected.core.domain_mask = 2;
+    expected.core.domain_id = 77;
+    expected.core.cpu_pinned = false;
+    expected.core.domain_hard = true;
+    expected.core.vruntime = 110;
+    expected.core.deadline = 1'024'110;
+    expected.core.heap_index = 1;
+    expected.core.migration_diagnostic = encode_migration_diagnostic(
+        {.frame_class = task::SavedFrameClass::USER_RETURN, .reason = MigrationRejectionReason::NONE, .source_cpu = 0, .target_cpu = 1});
+    ok = CLAIMED && RESULT.status == 0 && RESULT.source_cpu == 0 && RESULT.target_cpu == 1 && RESULT.runnable && RESULT.moved &&
+         placement_native_task_snapshot(*SUBJECT) == expected && ok;
+    for (size_t q = 0; q < 2; ++q) {
+        auto expected_queue = fixture.before->queues[q];
+        expected_queue.core.size = q == 0 ? 1 : 2;
+        expected_queue.core.weight = q == 0 ? 512 : 2048;
+        expected_queue.core.weighted_vruntime = q == 0 ? 10'240 : 20'480;
+        expected_queue.core.load_default = q == 0 ? 8 : 16;
+        expected_queue.core.load_process = q == 0 ? 8 : 16;
+        ok = placement_native_queue_snapshot(*fixture.queue(q)) == expected_queue && ok;
+        for (size_t i = 0; i < PER_CPU_HEAP_CAP; ++i) {
+            auto* expected_entry = fixture.before->entries[q][i];
+            if (q == 0 && i < 2) expected_entry = &fixture.tasks[1];
+            if (q == 1 && i == 1) expected_entry = SUBJECT;
+            ok = fixture.queue(q)->runnable_heap.entries[i] == expected_entry && ok;
+        }
+    }
+    for (size_t i = 1; i < PLACEMENT_NATIVE_TASKS; ++i) {
+        auto expected_peer = fixture.before->tasks[i];
+        if (i == 1) expected_peer.core.heap_index = 0;
+        ok = placement_native_task_snapshot(fixture.tasks[i]) == expected_peer && ok;
+    }
+    ok = fixture.tasks[1].heap_index == 0 && fixture.tasks[2].heap_index == 0 && SUBJECT->heap_index == 1 &&
+         validate_transition_boundary_locked(fixture.queue(0), TransitionPhase::STABLE) == 0 &&
+         validate_transition_boundary_locked(fixture.queue(1), TransitionPhase::STABLE) == 0 && ok;
+    fixture.lock.unlock_irqrestore(flags);
+    bool const FINISHED = placement_finish_without_pending(SUBJECT);
+    ok = FINISHED && ok;
+
+    // Each changed fact is observed at final locked admission. Refusal must
+    // preserve physical heaps, all peers, diagnostics, history and policy.
+    for (unsigned axis = 0; axis < 16; ++axis) {
+        bool const PREPARED = fixture.prepare();
+        bool const AXIS_CLAIMED = try_claim_task_placement(SUBJECT);
+        flags = fixture.lock.lock_irqsave();
+        switch (axis) {
+            case 0:
+                SUBJECT->state.store(task::TaskState::EXITING);
+                break;
+            case 1:
+                SUBJECT->exit_in_progress.store(true);
+                break;
+            case 2:
+                SUBJECT->gc_queued.store(true);
+                break;
+            case 3:
+                SUBJECT->preempt_disable_depth = 1;
+                break;
+            case 4:
+                SUBJECT->migration_guard_state.store(encode_migration_guard_state({.depth = 1, .owner_cpu = 0}));
+                break;
+            case 5:
+                SUBJECT->scheduler_transition_active.store(true);
+                break;
+            case 6:
+                SUBJECT->deferred_task_switch = true;
+                break;
+            case 7:
+                SUBJECT->wants_block = true;
+                break;
+            case 8:
+                SUBJECT->wki_proxy_task_id = 1;
+                break;
+            case 9:
+                SUBJECT->context.saved_frame_class = task::SavedFrameClass::INVALID;
+                break;
+            case 10:
+                SUBJECT->thread = nullptr;
+                break;
+            case 11:
+                SUBJECT->pagemap = nullptr;
+                break;
+            case 12:
+                SUBJECT->context.syscall_kernel_stack = 0;
+                break;
+            case 13:
+                fixture.queue(1)->current_task = SUBJECT;
+                break;
+            case 14:
+                fixture.queue(1)->handoff_task = SUBJECT;
+                break;
+            case 15:
+                SUBJECT->type = task::TaskType::IDLE;
+                break;
+        }
+        fixture.capture_locked();
+        auto const REFUSED =
+            commit_task_placement_locked(fixture.queue(0), fixture.queue(1), SUBJECT, 0, 1, 2, placement_native_domain_request(2, 1));
+        ok = PREPARED && AXIS_CLAIMED && REFUSED.status == -EBUSY && fixture.unchanged_locked() && ok;
+        fixture.lock.unlock_irqrestore(flags);
+        bool const AXIS_FINISHED = placement_finish_without_pending(SUBJECT);
+        ok = AXIS_FINISHED && ok;
+    }
+    return ok;
+}
+
+auto scheduler_selftest_placement_wait_timer_transfer() -> bool {
+    PlacementNativeFixture fixture;
+    if (!fixture.ready()) return false;
+    bool ok = fixture.prepare();
+    auto* const SUBJECT = &fixture.tasks[0];
+    bool const CLAIMED = try_claim_task_placement(SUBJECT);
+    uint64_t flags = fixture.lock.lock_irqsave();
+    fixture.make_waiting_locked(0, 0, 300);
+    fixture.make_waiting_locked(3, 0, 900);
+    fixture.make_waiting_locked(4, 1, 500);
+    fixture.capture_locked();
+    TaskPlacementRequest const PIN{.kind = TaskPlacementKind::PIN, .target_cpu = 1};
+    auto const RESULT = commit_task_placement_locked(fixture.queue(0), fixture.queue(1), SUBJECT, 0, 1, 2, PIN);
+    auto expected = fixture.before->tasks[0];
+    expected.core.cpu = 1;
+    expected.core.cpu_pinned = true;
+    expected.core.previous = nullptr;
+    expected.core.next = &fixture.tasks[4];
+    expected.core.list_owner = &fixture.queue(1)->wait_list;
+    ++expected.core.timer_generation;
+    expected.core.migration_diagnostic = encode_migration_diagnostic(
+        {.frame_class = task::SavedFrameClass::USER_RETURN, .reason = MigrationRejectionReason::NONE, .source_cpu = 0, .target_cpu = 1});
+    ok = CLAIMED && RESULT.status == 0 && RESULT.moved && !RESULT.runnable && RESULT.target_cpu == 1 &&
+         placement_native_task_snapshot(*SUBJECT) == expected && ok;
+    for (size_t q = 0; q < 2; ++q) {
+        auto expected_queue = fixture.before->queues[q];
+        expected_queue.core.wait_count = q == 0 ? 1 : 2;
+        expected_queue.core.wait_head = q == 0 ? &fixture.tasks[3] : SUBJECT;
+        expected_queue.core.timer_count = q == 0 ? 1 : 2;
+        expected_queue.core.timer_deadline = q == 0 ? 900 : 300;
+        expected_queue.core.next_wait_deadline = q == 0 ? 900 : 300;
+        ok = placement_native_queue_snapshot(*fixture.queue(q)) == expected_queue &&
+             fixture.queue(q)->runnable_heap.entries == fixture.before->entries[q] && ok;
+    }
+    for (size_t i = 1; i < PLACEMENT_NATIVE_TASKS; ++i) {
+        auto peer = fixture.before->tasks[i];
+        if (i == 3) peer.core.next = nullptr;
+        if (i == 4) peer.core.previous = SUBJECT;
+        ok = placement_native_task_snapshot(fixture.tasks[i]) == peer && ok;
+    }
+    fixture.lock.unlock_irqrestore(flags);
+    bool const FINISHED = placement_finish_without_pending(SUBJECT);
+    ok = FINISHED && ok;
+
+    bool const PREPARED = fixture.prepare();
+    bool const AGAIN_CLAIMED = try_claim_task_placement(SUBJECT);
+    flags = fixture.lock.lock_irqsave();
+    fixture.make_waiting_locked(0, 0, 300);
+    static_cast<void>(fixture.queue(0)->wait_timers.cancel(SUBJECT->wait_timer));
+    recompute_wait_deadline_locked(fixture.queue(0));
+    bool const FOREIGN_ARM = fixture.foreign_timer.arm_at(SUBJECT->wait_timer, 300, wait_timer_marker, SUBJECT);
+    fixture.capture_locked();
+    auto const REFUSED = commit_task_placement_locked(fixture.queue(0), fixture.queue(1), SUBJECT, 0, 1, 2, PIN);
+    uint64_t foreign_deadline = 0;
+    bool const FOREIGN_DEADLINE = fixture.foreign_timer.next_deadline(foreign_deadline);
+    ok = PREPARED && AGAIN_CLAIMED && FOREIGN_ARM && REFUSED.status == -EBUSY && fixture.unchanged_locked() &&
+         fixture.foreign_timer.size() == 1 && FOREIGN_DEADLINE && foreign_deadline == 300 && ok;
+    fixture.lock.unlock_irqrestore(flags);
+    bool const REFUSAL_FINISHED = placement_finish_without_pending(SUBJECT);
+    ok = REFUSAL_FINISHED && ok;
+
+    // Actual reachable TimerQueue states, under private exclusion. The
+    // UINT64_MAX generation branch remains source-only: no private byte seed.
+    time::TimerQueue source{time::TimerDispatch::SYNCHRONOUS};
+    time::TimerQueue target{time::TimerDispatch::SYNCHRONOUS};
+    time::TimerQueue deferred;
+    time::TimerNode idle;
+    time::TimerNode deferred_node;
+    std::array<time::TimerToken, 1> tokens{};
+    time::TimerInvocation invocation{};
+    flags = fixture.lock.lock_irqsave();
+    ok = source.can_transfer_after_cancel(idle, target, 0) && source.can_transfer_after_cancel(idle, target, 30) &&
+         !source.can_transfer_after_cancel(idle, deferred, 30) && !deferred.can_transfer_after_cancel(idle, target, 30) && ok;
+    bool const ARMED = source.arm_at(idle, 30, wait_timer_marker);
+    ok = ARMED && source.can_transfer_after_cancel(idle, target, 30) && !target.can_transfer_after_cancel(idle, source, 30) && ok;
+    static_cast<void>(source.cancel(idle));
+    bool const DEFERRED_ARMED = deferred.arm_at(deferred_node, 30, wait_timer_marker);
+    size_t const EXTRACTED = deferred.extract_due(30, tokens);
+    ok = DEFERRED_ARMED && EXTRACTED == 1 && deferred_node.state() == time::TimerState::READY &&
+         !source.can_transfer_after_cancel(deferred_node, target, 30) && ok;
+    bool const RUNNING = deferred.claim(tokens[0], invocation);
+    ok =
+        RUNNING && deferred_node.state() == time::TimerState::RUNNING && !source.can_transfer_after_cancel(deferred_node, target, 30) && ok;
+    bool const DONE = deferred.finish(tokens[0], 30);
+    ok = DONE && deferred_node.state() == time::TimerState::IDLE && !source.can_transfer_after_cancel(deferred_node, target, 30) &&
+         source.size() == 0 && target.size() == 0 && deferred.size() == 0 && ok;
+    fixture.lock.unlock_irqrestore(flags);
+    return ok;
+}
+
+namespace {
+// Actual full physical capacity, with compact named logical snapshots. No
+// filler borrows a Thread/image, runs or enters a global scheduler registry.
+constexpr size_t PLACEMENT_CAPACITY_PAYLOAD =
+    PLACEMENT_COMPACT_PAYLOAD + (sizeof(task::Task) + sizeof(PlacementNativeTaskSnapshot)) * PER_CPU_HEAP_CAP;
+static_assert(PLACEMENT_CAPACITY_PAYLOAD < 192 * 1024 * 1024);
+
+struct PlacementCapacityFixture {
+    PlacementNativeFixture compact;
+    std::unique_ptr<task::Task[]> fillers{new (std::nothrow) task::Task[PER_CPU_HEAP_CAP]{}};
+    std::unique_ptr<PlacementNativeTaskSnapshot[]> before{new (std::nothrow) PlacementNativeTaskSnapshot[PER_CPU_HEAP_CAP]{}};
+
+    ~PlacementCapacityFixture() {
+        uint64_t const FLAGS = compact.lock.lock_irqsave();
+        if (compact.queues) {
+            auto* const TARGET = compact.queue(1);
+            TARGET->runnable_heap.entries.fill(nullptr);
+            TARGET->runnable_heap.size = 0;
+            TARGET->total_weight = 0;
+            TARGET->total_weighted_vruntime = 0;
+            TARGET->cached_load_default.store(0);
+            TARGET->cached_load_process.store(0);
+        }
+        if (fillers) {
+            for (size_t i = 0; i < PER_CPU_HEAP_CAP; ++i) {
+                fillers[i].heap_index = -1;
+                fillers[i].sched_queue = task::Task::sched_queue::NONE;
+                fillers[i].scheduler_published.store(false);
+                fillers[i].sched_previous = nullptr;
+                fillers[i].sched_next = nullptr;
+                fillers[i].sched_list_owner.store(nullptr);
+            }
+        }
+        compact.lock.unlock_irqrestore(FLAGS);
+        // Clear compact borrows/queues while fillers still live, then every
+        // owned array is destroyed outside IRQ exclusion, including failures.
+        compact.clear();
+    }
+    auto ready() const -> bool { return compact.ready() && fillers && before; }
+    void capture_fillers_locked() {
+        for (size_t i = 0; i < PER_CPU_HEAP_CAP; ++i) before[i] = placement_native_task_snapshot(fillers[i]);
+    }
+    auto fillers_unchanged_locked() const -> bool {
+        bool ok = true;
+        for (size_t i = 0; i < PER_CPU_HEAP_CAP; ++i) ok = placement_native_task_snapshot(fillers[i]) == before[i] && ok;
+        return ok;
+    }
+};
+}  // namespace
+
+auto scheduler_selftest_placement_full_capacity() -> bool {
+    PlacementCapacityFixture fixture;
+    if (!fixture.ready()) return false;
+    auto& compact = fixture.compact;
+    bool ok = compact.prepare();
+    // Allocate/construct every large object before IRQ exclusion. Initialize
+    // exclusive fillers before the bounded heap/accounting setup as well.
+    for (size_t i = 0; i < PER_CPU_HEAP_CAP; ++i) {
+        auto& t = fixture.fillers[i];
+        t.type = task::TaskType::PROCESS;
+        t.pid = 100 + i;
+        t.store_cpu(1);
+        t.heap_index = -1;
+        t.sched_queue = task::Task::sched_queue::RUNNABLE;
+        t.scheduler_published.store(true);
+        t.sched_weight = 1024;
+        t.sched_nice = 0;
+        t.slice_ns = 1'024'000;
+        t.slice_used_ns = 17;
+        t.vruntime = 100 + static_cast<int64_t>(i % 7);
+        t.vdeadline = 1000 + static_cast<int64_t>(i);
+    }
+    auto* const SUBJECT = &compact.tasks[0];
+    bool const CLAIMED = try_claim_task_placement(SUBJECT);
+    uint64_t flags = compact.lock.lock_irqsave();
+    auto* const TARGET = compact.queue(1);
+    bool const PEER_REMOVED = transition_detach_runnable_locked(TARGET, &compact.tasks[2]);
+    compact.tasks[2].sched_queue = task::Task::sched_queue::NONE;
+    int64_t independent_weighted_sum = 0;
+    for (size_t i = 0; i < PER_CPU_HEAP_CAP; ++i) {
+        auto& t = fixture.fillers[i];
+        bool const INSERTED = TARGET->runnable_heap.insert(&t);
+        if (INSERTED) add_to_sums(TARGET, &t);
+        independent_weighted_sum += static_cast<int64_t>(i % 7) * 1024;
+        ok = INSERTED && t.heap_index == static_cast<int32_t>(i) && TARGET->runnable_heap.entries[i] == &t && ok;
+    }
+    ok = PEER_REMOVED && CLAIMED && TARGET->runnable_heap.size == PER_CPU_HEAP_CAP &&
+         TARGET->total_weight == static_cast<int64_t>(PER_CPU_HEAP_CAP) * 1024 &&
+         TARGET->total_weighted_vruntime == independent_weighted_sum && TARGET->cached_load_default.load() == PER_CPU_HEAP_CAP * 8 &&
+         TARGET->cached_load_process.load() == PER_CPU_HEAP_CAP * 8 &&
+         validate_transition_boundary_locked(TARGET, TransitionPhase::STABLE) == 0 && ok;
+    // One final diagnostic validation, rather than8192 growing full scans.
+    compact.capture_locked();
+    fixture.capture_fillers_locked();
+    auto const REFUSED = commit_task_placement_locked(compact.queue(0), TARGET, SUBJECT, 0, 1, 2, placement_native_domain_request(2, 1));
+    ok = REFUSED.status == -EBUSY && compact.unchanged_locked() && fixture.fillers_unchanged_locked() && ok;
+    compact.lock.unlock_irqrestore(flags);
+    bool const FINISHED = placement_finish_without_pending(SUBJECT);
+    ok = FINISHED && ok;
+
+    auto* const MEMBER = &fixture.fillers[0];
+    MEMBER->store_domain_id(91);
+    MEMBER->store_domain_mask(2);
+    MEMBER->store_domain_hard(true);
+    MEMBER->store_cpu_pinned(true);
+    bool const MEMBER_CLAIMED = try_claim_task_placement(MEMBER);
+    flags = compact.lock.lock_irqsave();
+    compact.capture_locked();
+    fixture.capture_fillers_locked();
+    TaskPlacementRequest const FULL_ONLINE{.kind = TaskPlacementKind::AFFINITY, .mask = 3, .target_cpu = 0};
+    auto const UPDATED = commit_task_placement_locked(TARGET, compact.queue(0), MEMBER, 1, 0, 2, FULL_ONLINE);
+    ok = MEMBER_CLAIMED && UPDATED.status == 0 && UPDATED.target_cpu == 1 && UPDATED.runnable && UPDATED.moved &&
+         compact.unchanged_locked() && ok;
+    for (size_t i = 0; i < PER_CPU_HEAP_CAP; ++i) {
+        auto expected = fixture.before[i];
+        if (i == 0) {
+            expected.core.domain_mask = UINT64_MAX;
+            expected.core.cpu_pinned = false;
+            expected.core.domain_hard = false;
+        }
+        ok = placement_native_task_snapshot(fixture.fillers[i]) == expected && ok;
+    }
+    compact.lock.unlock_irqrestore(flags);
+    bool const MEMBER_FINISHED = placement_finish_without_pending(MEMBER);
+    return MEMBER_FINISHED && ok;
+}
+
+auto scheduler_selftest_placement_refusal_finishes_pending() -> bool {
+    PlacementNativeFixture fixture;
+    if (!fixture.ready()) return false;
+    bool ok = fixture.prepare();
+    auto* const SUBJECT = &fixture.tasks[0];
+    uint64_t flags = fixture.lock.lock_irqsave();
+    fixture.make_waiting_locked(0, 0, 300);
+    fixture.make_waiting_locked(3, 0, 900);
+    fixture.queue(0)->current_task = SUBJECT;
+    update_current_load_cache(fixture.queue(0), SUBJECT);
+    SUBJECT->wants_block = true;
+    SUBJECT->deferred_task_switch = true;
+    fixture.lock.unlock_irqrestore(flags);
+    bool const CLAIMED = try_claim_task_placement(SUBJECT);
+    bool const LOSING_PRODUCER = !queue_reschedule_request(SUBJECT, 1);
+    flags = fixture.lock.lock_irqsave();
+    fixture.capture_locked();
+    auto const REFUSED =
+        commit_task_placement_locked(fixture.queue(0), fixture.queue(1), SUBJECT, 0, 1, 2, placement_native_domain_request(2, 1));
+    ok = CLAIMED && LOSING_PRODUCER && REFUSED.status == -EBUSY && fixture.unchanged_locked() && ok;
+    fixture.lock.unlock_irqrestore(flags);
+
+    size_t dispatches = 0;
+    // These are genuine outstanding requests handled by the exact shared
+    // loop and real reserved-wakeup primitive. They are deterministic private
+    // interleavings, not simultaneous SMP or the entire global once-wake path.
+    drain_reschedule_leader(SUBJECT, nullptr, [&](uint64_t requested) {
+        uint64_t const FLAGS = fixture.lock.lock_irqsave();
+        auto const WAKE = publish_reserved_task_wakeup_locked(fixture.queue(0), SUBJECT);
+        ok = requested == (dispatches == 0 ? 1 : 0) && WAKE.wake_at_us == (dispatches == 0 ? 300 : 0) &&
+             WAKE.was_blocking == (dispatches == 0) && ok;
+        fixture.lock.unlock_irqrestore(FLAGS);
+        ++dispatches;
+        if (dispatches == 1) ok = !queue_reschedule_request(SUBJECT, 0) && ok;
+    });
+    flags = fixture.lock.lock_irqsave();
+    auto expected = fixture.before->tasks[0];
+    expected.core.wants_block = false;
+    expected.core.timer_state = time::TimerState::IDLE;
+    expected.wake_at = 0;
+    expected.wakeup_pending = true;
+    expected.requested_cpu = 0;
+    expected.pending = false;
+    expected.leader = false;
+    ok = dispatches == 2 && REFUSED.status == -EBUSY && placement_native_task_snapshot(*SUBJECT) == expected && ok;
+    for (size_t q = 0; q < 2; ++q) {
+        auto expected_queue = fixture.before->queues[q];
+        if (q == 0) {
+            expected_queue.core.timer_count = 1;
+            expected_queue.core.timer_deadline = 900;
+            expected_queue.core.next_wait_deadline = 900;
+        }
+        ok = placement_native_queue_snapshot(*fixture.queue(q)) == expected_queue &&
+             fixture.queue(q)->runnable_heap.entries == fixture.before->entries[q] && ok;
+    }
+    for (size_t i = 1; i < PLACEMENT_NATIVE_TASKS; ++i)
+        ok = placement_native_task_snapshot(fixture.tasks[i]) == fixture.before->tasks[i] && ok;
+    fixture.lock.unlock_irqrestore(flags);
+    return ok;
+}
+
+// Completed outer kernel waits: private real queue/token interleavings.
+auto scheduler_selftest_completed_current_wait_membership() -> bool {
+    PlacementNativeFixture fixture;
+    if (!fixture.ready()) return false;
+    bool ok = true;
+    for (unsigned mode = 0; mode < 4; ++mode) {
+        bool const PREPARED = fixture.prepare();
+        auto* const SUBJECT = &fixture.tasks[0];
+        auto* const SUCCESSOR = &fixture.tasks[1];
+        SUBJECT->process_exit_requested.store(false);
+        uint64_t const FLAGS = fixture.lock.lock_irqsave();
+        auto* const OWNER = fixture.queue(0);
+        fixture.make_waiting_locked(0, 0, 300);
+        fixture.make_waiting_locked(4, 1, 900);
+        OWNER->current_task = SUBJECT;
+        SUBJECT->set_voluntary_blocked(true);
+        SUBJECT->wants_block = true;
+        bool cancelled = false;
+        if (mode < 2) {
+            auto const WAKE = publish_reserved_task_wakeup_locked(OWNER, SUBJECT);
+            cancelled = scheduler_wait_should_cancel(SUBJECT, SchedulerHaltWaitKind::PROCESS_PARK);
+            ok = WAKE.was_blocking && WAKE.wake_at_us == 300 && cancelled && !SUBJECT->wakeup_pending.load() &&
+                 SUBJECT->sched_queue == task::Task::sched_queue::WAITING && wait_list_contains_locked(OWNER, SUBJECT) && ok;
+        } else if (mode == 2) {
+            // A completed deadline/block cancellation need not have a token.
+            SUBJECT->wants_block = false;
+            SUBJECT->wake_at_us = 0;
+            cancelled = scheduler_wait_should_cancel(SUBJECT, SchedulerHaltWaitKind::BLOCK);
+        } else {
+            SUBJECT->process_exit_requested.store(true);
+            cancelled = scheduler_wait_should_cancel(SUBJECT, SchedulerHaltWaitKind::PROCESS_PARK);
+        }
+        // The real park cleanup, followed by final outer accounting's prior
+        // voluntary state restoration. No global current task is substituted.
+        SUBJECT->wants_block = false;
+        SUBJECT->wake_at_us = 0;
+        SUBJECT->clear_wait_channel();
+        SUBJECT->set_voluntary_blocked(false);
+        update_current_load_cache(OWNER, SUBJECT);
+        if (mode == 1) {
+            // A distinct late reserved event remains pending through completion
+            // and the later handoff, rather than being consumed by the repair.
+            auto const LATE = publish_reserved_task_wakeup_locked(OWNER, SUBJECT);
+            ok = !LATE.was_blocking && LATE.wake_at_us == 0 && SUBJECT->wakeup_pending.load() && ok;
+        }
+        fixture.capture_locked();
+        auto const RESULT = complete_current_kernel_wait_locked(OWNER, SUBJECT, 400);
+        auto expected = fixture.before->tasks[0];
+        expected.core.vruntime = 30;
+        expected.core.deadline = 1'024'030;
+        expected.core.slice_used = 0;
+        expected.core.heap_index = 1;
+        expected.core.queue = task::Task::sched_queue::RUNNABLE;
+        expected.core.previous = nullptr;
+        expected.core.next = nullptr;
+        expected.core.list_owner = nullptr;
+        expected.core.timer_state = time::TimerState::IDLE;
+        auto expected_queue = fixture.before->queues[0];
+        expected_queue.core.size = 2;
+        expected_queue.core.weight = 1536;
+        expected_queue.core.weighted_vruntime = 30'720;
+        expected_queue.core.wait_head = nullptr;
+        expected_queue.core.wait_count = 0;
+        expected_queue.core.timer_count = 0;
+        expected_queue.core.has_timer_deadline = false;
+        expected_queue.core.timer_deadline = 0;
+        expected_queue.core.next_wait_deadline = 0;
+        expected_queue.core.load_default = 16;
+        expected_queue.core.load_process = 16;
+        expected_queue.core.current_load_default = 0;
+        expected_queue.core.current_load_process = 0;
+        ok = PREPARED && cancelled && RESULT == KernelWaitCompletionResult::REQUEUED &&
+             placement_native_task_snapshot(*SUBJECT) == expected && placement_native_queue_snapshot(*OWNER) == expected_queue &&
+             SUBJECT->just_woke && SUBJECT->wait_timer.state() == time::TimerState::IDLE && OWNER->runnable_heap.entries[0] == SUCCESSOR &&
+             SUCCESSOR->heap_index == 0 && OWNER->runnable_heap.entries[1] == SUBJECT && SUBJECT->heap_index == 1 &&
+             !wait_list_contains_locked(OWNER, SUBJECT) && SUBJECT->wakeup_pending.load() == (mode == 1) &&
+             validate_transition_boundary_locked(OWNER, TransitionPhase::STABLE) == 0 && ok;
+        for (size_t i = 2; i < PER_CPU_HEAP_CAP; ++i) ok = OWNER->runnable_heap.entries[i] == fixture.before->entries[0][i] && ok;
+        ok = fixture.queue(1)->runnable_heap.entries == fixture.before->entries[1] &&
+             placement_native_queue_snapshot(*fixture.queue(1)) == fixture.before->queues[1] && ok;
+        for (size_t i = 1; i < PLACEMENT_NATIVE_TASKS; ++i)
+            ok = placement_native_task_snapshot(fixture.tasks[i]) == fixture.before->tasks[i] && ok;
+
+        // Exercise the actual locked return-boundary primitives without running
+        // assembly on fixture buffers or publishing private tasks globally.
+        transition_reserve_handoff_locked(OWNER, SUCCESSOR, 401);
+        auto* const OUTGOING = transition_commit_handoff_locked(OWNER, SUCCESSOR);
+        requeue_woken_outgoing_task_locked(OWNER, OUTGOING, 402);
+        ok = OUTGOING == SUBJECT && OWNER->current_task == SUCCESSOR && OWNER->handoff_task == nullptr &&
+             OWNER->runnable_heap.contains(SUBJECT) && OWNER->runnable_heap.contains(SUCCESSOR) &&
+             placement_native_task_snapshot(*SUBJECT) == expected && SUBJECT->wakeup_pending.load() == (mode == 1) &&
+             OWNER->total_weight == 1536 && OWNER->total_weighted_vruntime == 30'720 &&
+             validate_transition_boundary_locked(OWNER, TransitionPhase::STABLE) == 0 && ok;
+        fixture.capture_locked();
+        auto const ALREADY_RUNNABLE = complete_current_kernel_wait_locked(OWNER, SUCCESSOR, 403);
+        ok = ALREADY_RUNNABLE == KernelWaitCompletionResult::UNCHANGED && fixture.unchanged_locked() && ok;
+        fixture.lock.unlock_irqrestore(FLAGS);
+    }
+    return ok;
+}
+
+auto scheduler_selftest_completed_current_wait_refusals() -> bool {
+    bool ok = true;
+    {
+        PlacementNativeFixture fixture;
+        if (!fixture.ready()) return false;
+        for (unsigned axis = 0; axis < 22; ++axis) {
+            bool const PREPARED = fixture.prepare();
+            auto* const SUBJECT = &fixture.tasks[0];
+            SUBJECT->jobctl_stopped.store(false);
+            SUBJECT->ptrace_stopped.store(false);
+            SUBJECT->process_exit_requested.store(false);
+            uint64_t const FLAGS = fixture.lock.lock_irqsave();
+            auto* const OWNER = fixture.queue(0);
+            fixture.make_waiting_locked(0, 0, 0);
+            OWNER->current_task = SUBJECT;
+            SUBJECT->clear_wait_channel();
+            SUBJECT->wakeup_pending.store(true);
+            RunQueue* admitted_owner = OWNER;
+            task::Task* admitted_subject = SUBJECT;
+            switch (axis) {
+                case 0:
+                    admitted_owner = nullptr;
+                    break;
+                case 1:
+                    admitted_subject = nullptr;
+                    break;
+                case 2:
+                    OWNER->current_task = nullptr;
+                    break;
+                case 3:
+                    OWNER->current_task = &fixture.tasks[1];
+                    OWNER->handoff_task = SUBJECT;
+                    break;
+                case 4:
+                    SUBJECT->state.store(task::TaskState::EXITING);
+                    break;
+                case 5:
+                    SUBJECT->has_exited = true;
+                    break;
+                case 6:
+                    SUBJECT->exit_in_progress.store(true);
+                    break;
+                case 7:
+                    SUBJECT->gc_queued.store(true);
+                    break;
+                case 8:
+                    SUBJECT->scheduler_transition_active.store(true);
+                    break;
+                case 9:
+                    SUBJECT->deferred_task_switch = true;
+                    break;
+                case 10:
+                    SUBJECT->jobctl_stopped.store(true);
+                    break;
+                case 11:
+                    SUBJECT->ptrace_stopped.store(true);
+                    break;
+                case 12:
+                    SUBJECT->wki_proxy_task = true;
+                    break;
+                case 13:
+                    SUBJECT->wki_proxy_task_id = 1;
+                    break;
+                case 14:
+                    SUBJECT->wants_block = true;
+                    break;
+                case 15:
+                    SUBJECT->wake_at_us = 123;
+                    break;
+                case 16:
+                    SUBJECT->set_voluntary_blocked(true);
+                    break;
+                case 17:
+                    SUBJECT->set_wait_channel("still-waiting");
+                    break;
+                case 18:
+                    SUBJECT->sched_queue = task::Task::sched_queue::NONE;
+                    break;
+                case 19:
+                    admitted_owner = fixture.queue(1);
+                    admitted_owner->current_task = SUBJECT;
+                    break;
+                case 20: {
+                    // Real indexed heap plus retained wait membership is an
+                    // exclusion, never repaired by this final-wait helper.
+                    bool const INSERTED = OWNER->runnable_heap.insert(SUBJECT);
+                    if (INSERTED) add_to_sums(OWNER, SUBJECT);
+                    ok = INSERTED && ok;
+                    break;
+                }
+                case 21:
+                    SUBJECT->heap_index = 17;
+                    break;
+            }
+            update_current_load_cache(OWNER, OWNER->current_task);
+            bool const JOB_STOP = SUBJECT->jobctl_stopped.load();
+            bool const PTRACE_STOP = SUBJECT->ptrace_stopped.load();
+            bool const JUST_WOKE = SUBJECT->just_woke;
+            fixture.capture_locked();
+            auto const RESULT = complete_current_kernel_wait_locked(admitted_owner, admitted_subject, 400);
+            auto const EXPECTED = axis == 21 ? KernelWaitCompletionResult::STALE_INDEX : KernelWaitCompletionResult::UNCHANGED;
+            ok = PREPARED && RESULT == EXPECTED && fixture.unchanged_locked() && SUBJECT->wakeup_pending.load() &&
+                 SUBJECT->jobctl_stopped.load() == JOB_STOP && SUBJECT->ptrace_stopped.load() == PTRACE_STOP &&
+                 SUBJECT->just_woke == JUST_WOKE && ok;
+            fixture.lock.unlock_irqrestore(FLAGS);
+        }
+    }
+
+    // The opaque WorkerExecHandoff is defined only in exec.cpp. Its nonnull
+    // exclusion is source-checked; do not invent a pointer or global exec plan.
+    PlacementCapacityFixture fixture;
+    if (!fixture.ready()) return false;
+    auto& compact = fixture.compact;
+    bool const PREPARED = compact.prepare();
+    for (size_t i = 0; i < PER_CPU_HEAP_CAP; ++i) {
+        auto& t = fixture.fillers[i];
+        t.type = task::TaskType::PROCESS;
+        t.pid = 100 + i;
+        t.store_cpu(1);
+        t.heap_index = -1;
+        t.sched_queue = task::Task::sched_queue::RUNNABLE;
+        t.scheduler_published.store(true);
+        t.sched_weight = 1024;
+        t.vruntime = 100 + static_cast<int64_t>(i % 7);
+        t.vdeadline = 1000 + static_cast<int64_t>(i);
+    }
+    auto* const SUBJECT = &compact.tasks[0];
+    uint64_t const FLAGS = compact.lock.lock_irqsave();
+    auto* const OWNER = compact.queue(1);
+    bool const PEER_REMOVED = transition_detach_runnable_locked(OWNER, &compact.tasks[2]);
+    compact.tasks[2].sched_queue = task::Task::sched_queue::NONE;
+    bool const SUBJECT_REMOVED = transition_detach_runnable_locked(compact.queue(0), SUBJECT);
+    SUBJECT->store_cpu(1);
+    SUBJECT->sched_queue = task::Task::sched_queue::NONE;
+    SUBJECT->scheduler_published.store(true);
+    SUBJECT->wants_block = false;
+    SUBJECT->wake_at_us = 0;
+    SUBJECT->clear_wait_channel();
+    transition_make_waiting_locked(OWNER, SUBJECT);
+    OWNER->current_task = SUBJECT;
+    SUBJECT->wakeup_pending.store(true);
+    update_current_load_cache(OWNER, SUBJECT);
+    int64_t independent_sum = 0;
+    for (size_t i = 0; i < PER_CPU_HEAP_CAP; ++i) {
+        auto& t = fixture.fillers[i];
+        bool const INSERTED = OWNER->runnable_heap.insert(&t);
+        if (INSERTED) add_to_sums(OWNER, &t);
+        independent_sum += static_cast<int64_t>(i % 7) * 1024;
+        ok = INSERTED && t.heap_index == static_cast<int32_t>(i) && OWNER->runnable_heap.entries[i] == &t && ok;
+    }
+    compact.capture_locked();
+    fixture.capture_fillers_locked();
+    auto const RESULT = complete_current_kernel_wait_locked(OWNER, SUBJECT, 400);
+    ok = PREPARED && PEER_REMOVED && SUBJECT_REMOVED && RESULT == KernelWaitCompletionResult::HEAP_FULL && compact.unchanged_locked() &&
+         fixture.fillers_unchanged_locked() && SUBJECT->wakeup_pending.load() && OWNER->runnable_heap.size == PER_CPU_HEAP_CAP &&
+         OWNER->total_weight == static_cast<int64_t>(PER_CPU_HEAP_CAP) * 1024 && OWNER->total_weighted_vruntime == independent_sum &&
+         wait_list_contains_locked(OWNER, SUBJECT) && !OWNER->runnable_heap.contains(SUBJECT) && ok;
+    compact.lock.unlock_irqrestore(FLAGS);
     return ok;
 }
 
