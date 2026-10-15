@@ -5902,6 +5902,11 @@ KTEST(CompartmentConstruction, PrivateImageInterpreterAndTcbIgnoreForeignExecuto
         KREQUIRE_EQ(second.prepare(0x53000000, 71), 0);
         KREQUIRE_EQ(first.refresh(), 0);
         KREQUIRE_EQ(second.refresh(), 0);
+        namespace numa = ker::mod::mm::numa;
+        constexpr numa::Policy FIRST_POLICY{.nodes = 1, .mode = numa::Mode::PREFERRED};
+        constexpr numa::Policy SECOND_POLICY{.nodes = 1, .mode = numa::Mode::BIND};
+        KREQUIRE_TRUE(first.source.task->selftest_set_memory_policy(FIRST_POLICY));
+        KREQUIRE_TRUE(second.source.task->selftest_set_memory_policy(SECOND_POLICY));
         auto first_mount = scoped_mount(first.mounts.first, "/");
         auto second_mount = scoped_mount(second.mounts.first, "/");
         KREQUIRE_TRUE(first_mount && second_mount);
@@ -5915,6 +5920,13 @@ KTEST(CompartmentConstruction, PrivateImageInterpreterAndTcbIgnoreForeignExecuto
         b.child = second.construct(&b.owner, error);
         KREQUIRE_NE(b.child, nullptr);
         KEXPECT_EQ(error, 0);
+        // The explicit recovery executor, rather than the File/root source or
+        // ambient boot executor, supplies the child's independent policy value.
+        KEXPECT_TRUE(a.child->memory_policy_snapshot() == SECOND_POLICY);
+        KEXPECT_TRUE(b.child->memory_policy_snapshot() == FIRST_POLICY);
+        KEXPECT_TRUE(a.child->selftest_set_memory_policy({}));
+        KEXPECT_TRUE(a.owner.memory_policy_snapshot() == SECOND_POLICY);
+        KEXPECT_TRUE(b.child->memory_policy_snapshot() == FIRST_POLICY);
         for (auto* child : {a.child, b.child}) {
             KEXPECT_EQ(child->namespace_tid(), uint64_t{1});
             KEXPECT_FALSE(child->scheduler_published.load());

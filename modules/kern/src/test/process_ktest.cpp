@@ -27,6 +27,10 @@ KTEST(ExecPreparedImage, OutlivesStagingAndDiscardsReferencesOnce) {
     KEXPECT_TRUE(ker::syscall::process::exec_selftest_owned_image_outlives_staging_and_discards_once());
 }
 
+KTEST(ExecPreparedImage, WorkerPolicyChangesOwnerOnlyOnCanonicalCommit) {
+    KEXPECT_TRUE(ker::syscall::process::exec_selftest_worker_policy_reaches_canonical_commit());
+}
+
 KTEST(ExecPreparedImage, TaskCleanupIsReentrantAndExclusive) {
     KEXPECT_TRUE(ker::syscall::process::exec_selftest_tracked_image_cleanup_is_reentrant_and_exclusive());
 }

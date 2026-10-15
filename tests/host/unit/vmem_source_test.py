@@ -866,7 +866,8 @@ def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
             "ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;",
             "if (!lazy_snapshot.matches(*parent))",
             "Task::create_user_thread(parent, tcb_va, user_sp, enter_va, prepared_stack_words.at(0),",
-            "prepared_stack_words.at(1), &stack_exhausted, &lazy_snapshot);",
+            "prepared_stack_words.at(1), MEMORY_POLICY, &stack_exhausted,",
+            "&lazy_snapshot);",
             "uint64_t const NEW_TID = t->namespace_tid();",
             "post_task_for_cpu(TARGET_CPU, t)",
         ],
@@ -892,6 +893,7 @@ def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
         task_source,
         [
             "Task* Task::create_user_thread(Task* parent",
+            "t->publish_memory_policy_snapshot(memory_policy);",
             "prepared_lazy != nullptr ? !prepared_lazy->matches(*parent) : !clone_lazy_vmem_ranges(*t, *parent)",
             "parent->shares_user_pagemap.store(true, std::memory_order_release);",
             "t->shares_user_pagemap.store(true, std::memory_order_release);",
@@ -930,6 +932,38 @@ def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
          'if (restore_enabled_) asm volatile("sti"'],
         "legacy constructor interval restores preparation IF before deferred owner cleanup",
     )
+
+
+def test_process_memory_policy_is_captured_before_creation_and_retry() -> None:
+    process = PROCESS_CPP.read_text()
+    thread_control = THREAD_CONTROL_CPP.read_text()
+    create_case = block_between(
+        thread_control,
+        "case abi::multiproc::threadControlOps::THREAD_CREATE:",
+        "case abi::multiproc::threadControlOps::THREAD_EXIT:",
+        "thread creation syscall case",
+    )
+    capture = "auto const MEMORY_POLICY = parent->memory_policy_snapshot();"
+    if create_case.count(capture) != 1:
+        fail("thread creation must capture the actual parent policy once across retries")
+    require_ordered_tokens(
+        create_case,
+        [capture, "ensure_writable(*parent", "for (uint32_t attempt = 0; attempt < 2; ++attempt)",
+         "SharedVmemPublicationGuard publication_guard;", "prepared_stack_words.at(1), MEMORY_POLICY,"],
+        "thread policy capture before prefault, retry and publication",
+    )
+    for name in ("wos_proc_fork", "wos_proc_clone_vm"):
+        body = function_body(process, name)
+        if body.count(capture) != 1:
+            fail(f"{name} must capture the actual parent policy exactly once")
+        require_ordered_tokens(
+            body,
+            [capture, "child->publish_memory_policy_snapshot(MEMORY_POLICY);",
+             "resource::inherit(*child, *parent)", "SharedVmemPublicationGuard publication_guard;"],
+            f"{name} copied policy before resource-owner binding and VM publication",
+        )
+    clone = function_body(process, "wos_proc_clone_vm")
+    require_order(clone, capture, "copy_value_from_task(*parent", "clone policy capture before user input")
 
 
 def test_fork_snapshots_all_vm_surfaces_under_one_publication_guard() -> None:
@@ -1049,6 +1083,7 @@ def main() -> None:
     test_default_writable_anon_mmap_is_demand_paged()
     test_file_mmap_cache_is_sharded_without_changing_page_ownership()
     test_thread_publication_is_serialized_with_shared_vmem_updates()
+    test_process_memory_policy_is_captured_before_creation_and_retry()
     test_fork_snapshots_all_vm_surfaces_under_one_publication_guard()
     test_fork_child_registers_use_immutable_syscall_entry_snapshot()
     print("vmem mmap, owned-frame, and COW invariants hold")

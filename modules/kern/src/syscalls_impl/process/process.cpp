@@ -745,6 +745,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
 #ifdef WOS_SELFTEST
     ker::test::lifecycle60::before_selected_service_fork(*parent);
 #endif
+    auto const MEMORY_POLICY = parent->memory_policy_snapshot();
 
     LocalProcStage FORK_STAGE = begin_local_proc_stage(parent, perf::WkiPerfLocalProcOp::FORK, 0, WOS_PERF_CALLSITE());
     auto finish_fork = [&](int64_t result, uint64_t bytes = 0, const char* failure_stage = nullptr) -> uint64_t {
@@ -786,6 +787,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         return finish_fork(-ENOMEM, 0, "task");
     }
+    child->publish_memory_policy_snapshot(MEMORY_POLICY);
     if (!sched::resource::inherit(*child, *parent)) {
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         delete child;
@@ -1461,6 +1463,7 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
         return static_cast<uint64_t>(-ESRCH);
     }
 
+    auto const MEMORY_POLICY = parent->memory_policy_snapshot();
     CloneVmArgs args{};
     if (!sys::usercopy::copy_value_from_task(*parent, args_addr, args)) {
         return static_cast<uint64_t>(-EFAULT);
@@ -1524,6 +1527,7 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
         return static_cast<uint64_t>(-ENOMEM);
     }
 
+    child->publish_memory_policy_snapshot(MEMORY_POLICY);
     if (!sched::resource::inherit(*child, *parent)) {
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         delete child;

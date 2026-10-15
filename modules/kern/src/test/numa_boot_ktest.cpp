@@ -79,7 +79,10 @@ KTEST(NumaBoot, ManagedRamAndNodeTotalsReconcile) {
     }
     for (size_t node = 0; node < topology->node_count; ++node) KEXPECT_EQ(bytes[node], topology->nodes[node].usable_bytes);
     uint64_t managed = 0;
-    for (auto const* zone = phys::get_zones(); zone != nullptr; zone = zone->next) managed += zone->len;
+    for (auto const* zone = phys::get_zones(); zone != nullptr; zone = zone->next) managed += zone->len + numa::PAGE_BYTES;
     if (auto const* huge = phys::get_huge_page_zone(); huge != nullptr) managed += huge->len;
     KEXPECT_EQ(covered, managed);
+    phys::PhysicalBalanceSnapshot balance{};
+    phys::get_physical_balance_snapshot(balance);
+    KEXPECT_EQ(covered / numa::PAGE_BYTES, balance.managed_pages);
 }

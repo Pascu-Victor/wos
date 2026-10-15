@@ -17,6 +17,7 @@
 #include <platform/asm/cpu.hpp>
 #include <platform/interrupt/gdt.hpp>
 #include <platform/mm/file_mapping_lifetime.hpp>
+#include <platform/mm/numa_policy.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/unpublished_mapping_retirement.hpp>
 // #include <platform/sys/context_switch.hpp>
@@ -359,7 +360,8 @@ struct Task {
     // enterThreadVa: virtual address of __mlibc_enter_thread in the process image.
     // stack_exhausted: optional kernel-only failure classification for bounded reclaim.
     static auto create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_sp, uint64_t enter_thread_va, uint64_t entry_va,
-                                   uint64_t user_arg_va, bool* stack_exhausted = nullptr, LazyVmemClone* prepared_lazy = nullptr) -> Task*;
+                                   uint64_t user_arg_va, mm::numa::Policy memory_policy, bool* stack_exhausted = nullptr,
+                                   LazyVmemClone* prepared_lazy = nullptr) -> Task*;
 
     Task(const Task& task) = delete;
 
@@ -1507,6 +1509,22 @@ struct Task {
     // end: every preceding Task/assembly offset remains unchanged. Presence
     // closes scheduler publication until all native cleanup modes are supported.
     std::atomic<mm::file_mapping::UnpublishedMappingRetirement*> native_file_mapping_retirement{nullptr};
+
+    // Per executing Task, independently of credential/resource process ownership.
+    // Callers hold the actual Task lifetime; snapshots carry no borrowed state.
+    [[nodiscard]] auto memory_policy_snapshot() const noexcept -> mm::numa::Policy;
+    // Trusted copied/default value only. Requires current execution, exclusive
+    // unpublished ownership, or the quiescent image-commit transaction.
+    void publish_memory_policy_snapshot(mm::numa::Policy value) noexcept;
+#ifdef WOS_SELFTEST
+    // Internal diagnostic admission only; no userspace policy control exists.
+    [[nodiscard]] auto selftest_set_memory_policy(mm::numa::Policy candidate) noexcept -> bool;
+#endif
+
+   private:
+    // Absolute tail: every preceding Task/assembly member offset is preserved.
+    mutable sys::Spinlock m_memory_policy_lock{};
+    mm::numa::Policy m_memory_policy{};
 };
 
 [[nodiscard]] inline auto process_pid(const Task& task) -> uint64_t { return task.owner_pid != 0 ? task.owner_pid : task.pid; }

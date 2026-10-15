@@ -3,7 +3,9 @@
 
 GC and the remaining task construction are host seams; this checks bounded retries, ownership
 lock ordering and the real IRQ-off syscall context, not live epoch reclamation or the
-128-thread runtime gate. Hardware IF instructions and journal output are host seams.
+128-thread runtime gate. Hardware IF instructions, preparation/lazy-clone context and
+journal output are host seams. The actual Policy header supplies the captured value;
+the retry oracle changes the parent policy during GC and requires the original value.
 """
 import os
 from pathlib import Path
@@ -20,8 +22,14 @@ PRELUDE = r'''
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
+#include <platform/mm/numa_policy.hpp>
 int publication_depth=0, pool_depth=0, calls=0, reclaims=0, attached=0, posted=0, destroyed=0, exits=0, pending_checks=0;
-int failures=0, reservation_error=0, pressure_logs=0, gc_requests=0;
+int failures=0, reservation_error=0, pressure_logs=0, gc_requests=0, policy_snapshots=0;
+using Policy = ker::mod::mm::numa::Policy;
+using PolicyMode = ker::mod::mm::numa::Mode;
+Policy expected_policy{uint64_t{1} << 63, PolicyMode::PREFERRED};
+bool gc_changes_policy=false;
 bool pass_ran=true, pass_time=false, pass_pending=false;
 bool irq=false, entry_irq=false, queues=true, query=true, panic=false, wrong_current=false;
 void enable_interrupts() { assert(publication_depth==0 && pool_depth==0); irq=true; }
@@ -42,13 +50,14 @@ void log(const char*) {}
 struct FixedString { template<size_t N> consteval FixedString(const char (&)[N]) {} };
 template<FixedString Tag> struct logger {
  template<class... Args> static void info(const char*,Args...) {
-  assert(publication_depth==0 && pool_depth==0 && irq==entry_irq); ++pressure_logs;
+  assert(publication_depth==0 && pool_depth==0 && !irq); ++pressure_logs;
  }
 };
 }
 namespace ker::mod::sched::task {
 struct User { uint32_t real=0; }; struct Cred { User user() const { return {}; } };
 enum class TaskType { PROCESS, DAEMON };
+class LazyVmemClone;
 struct Task {
  TaskType type=TaskType::PROCESS;
  uint64_t syscall_account_start_us=1;
@@ -57,8 +66,16 @@ struct Task {
  bool is_voluntary_blocked() const { return voluntary; }
  uint64_t pid=0x1234567887654321ULL;
  Cred credentials() const { return {}; }
- static Task* create_user_thread(Task*,uint64_t tcb,uint64_t sp,uint64_t enter,uint64_t entry,uint64_t arg,bool* stack_exhausted) {
-  assert(irq==entry_irq);
+ Policy policy{};
+ Policy memory_policy_snapshot() const {
+  assert(publication_depth==0 && pool_depth==0); ++policy_snapshots; return policy;
+ }
+ uint64_t namespace_tid() const { return pid; }
+ bool try_acquire_lifetime_ref() { assert(publication_depth==1); return true; }
+ void release() { assert(publication_depth==1); }
+ static Task* create_user_thread(Task*,uint64_t tcb,uint64_t sp,uint64_t enter,uint64_t entry,uint64_t arg,
+                                 Policy memory_policy,bool* stack_exhausted,LazyVmemClone* prepared_lazy) {
+  assert(!irq && prepared_lazy && policy_snapshots==1 && memory_policy==expected_policy);
   assert(publication_depth==1 && pool_depth==0 && tcb==256 && sp==512 && enter==768 && entry==1024 && arg==1280);
   ++calls;
   PROLOGUE
@@ -66,8 +83,13 @@ struct Task {
   static Task child; return &child;
  }
 };
+class LazyVmemClone {
+ public:
+ int prepare(Task&) { assert(publication_depth==0 && pool_depth==0 && irq); return 0; }
+ bool matches(Task&) const { assert(publication_depth==1 && !irq); return true; }
+};
 Task parent, other;
-void destroy_unpublished_user_thread(Task* t) { assert(publication_depth==1 && t); ++destroyed; published_tid=0; }
+void destroy_unpublished_user_thread(Task* t) { assert(publication_depth==0 && pool_depth==0 && irq && t); ++destroyed; published_tid=0; }
 }
 namespace ker::mod::sched {
 auto get_current_task() -> task::Task* { return wrong_current ? &task::other : &task::parent; }
@@ -90,6 +112,7 @@ GcPassResult run_gc_reclaim_pass_exclusive(uint32_t tasks,uint64_t time,uint32_t
  if(!pass_ran) return {};
  if(recover || concurrently_freed) failures=0;
  if(gc_changes_if) irq=!entry_irq;
+ if(gc_changes_policy) task::parent.policy={3,PolicyMode::BIND};
  if(d) { d->epoch_skips=3;d->current_skips=2;d->refcount_skips=1; }
  return {.reclaimed=recover ? 1U : 0U,.scanned=7,.time_budget_exhausted=pass_time,.has_pending_work=pass_pending,.ran=true};
 }
@@ -106,6 +129,32 @@ struct ProcessReservation {
 }
 }
 namespace ker::mod::smt { uint64_t get_core_count() { return cpus; } }
+// Explicit host context seams; the THREAD_CREATE body and pressure helper below
+// remain production extractions. Model the IF scopes used by ordinary staging.
+namespace ker::mod::sys {
+class SyscallPreparationScope {
+ bool original_;
+ public:
+ explicit SyscallPreparationScope(sched::task::Task&) : original_(irq) {
+  assert(publication_depth==0 && pool_depth==0); irq=true;
+ }
+ ~SyscallPreparationScope() { assert(publication_depth==0 && pool_depth==0); irq=original_; }
+ bool ready() const { return true; }
+ class LegacyInterval {
+  bool original_;
+  public:
+  explicit LegacyInterval(SyscallPreparationScope&) : original_(irq) {
+   assert(publication_depth==0 && pool_depth==0); irq=false;
+  }
+  ~LegacyInterval() { assert(publication_depth==0 && pool_depth==0); irq=original_; }
+ };
+};
+}
+namespace ker::mod::sched::threading {
+bool publish_tid_to_tcb(task::Task&,uint64_t,uint64_t pid,bool touch) {
+ assert(publication_depth==1 && !touch); if(pid && !publish_ok) return false; published_tid=pid; return true;
+}
+}
 namespace ker::mod::sys::usercopy {
 bool range_valid(uint64_t,size_t) { return copy_ok; }
 bool ensure_writable(ker::mod::sched::task::Task&,uint64_t,size_t) { return copy_ok; }
@@ -139,11 +188,12 @@ BODY
 }
 void reset() {
  assert(publication_depth==0 && pool_depth==0);
- calls=reclaims=attached=posted=destroyed=exits=pending_checks=failures=reservation_error=pressure_logs=gc_requests=0;
+ calls=reclaims=attached=posted=destroyed=exits=pending_checks=failures=reservation_error=pressure_logs=gc_requests=policy_snapshots=0;
+ gc_changes_policy=false;
  pass_ran=true;pass_time=pass_pending=false;ker::mod::sched::scheduler_gc_memory_pressure_requested=false;
  safe=stack_pressure=recover=publish_ok=post_ok=copy_ok=true;concurrently_freed=gc_changes_if=false;cpus=8;published_tid=0;
  irq=entry_irq=false;queues=query=true;panic=wrong_current=false;
- auto& p=ker::mod::sched::task::parent;p.type=ker::mod::sched::task::TaskType::PROCESS;
+ auto& p=ker::mod::sched::task::parent;p.type=ker::mod::sched::task::TaskType::PROCESS;p.policy=expected_policy;
  p.syscall_account_start_us=1;p.scheduler_transition_active=false;p.deferred_task_switch=p.wants_block=p.voluntary=false;
 }
 auto run() -> int64_t { return static_cast<int64_t>(ker::syscall::multiproc::execute()); }
@@ -189,7 +239,16 @@ int main() {
   assert(d.time_budget_exhausted==pass_time && d.deferred_pending==pass_pending);
   assert(gc_requests==(scenario==1 ? 0 : 1));
  }
- puts("PASS actual THREAD_CREATE IRQ-off/IRQ-on pressure recovery, unsafe contexts and publication/ownership checks");
+ // Actual THREAD_CREATE must snapshot before staging/PUB, once across GC retry.
+ // Check all modes and high-bit masks using the actual production value type.
+ for(Policy policy : {Policy{},Policy{uint64_t{1} << 63,PolicyMode::PREFERRED},
+                      Policy{3,PolicyMode::BIND},Policy{5,PolicyMode::INTERLEAVE}}) {
+  expected_policy=policy; reset(); failures=1;gc_changes_policy=true;
+  assert(static_cast<uint64_t>(run())==ker::mod::sched::task::parent.pid);
+  assert(calls==2 && reclaims==1 && policy_snapshots==1);
+  assert(ker::mod::sched::task::parent.policy==Policy(3,PolicyMode::BIND));
+ }
+ puts("PASS actual THREAD_CREATE IRQ-off/IRQ-on pressure recovery, unsafe contexts, publication and captured-policy retry checks");
 }
 '''
 
@@ -242,6 +301,7 @@ def main():
     assert compiler, 'host compiler missing'
     actual = source()
     mutations = {
+        'retry_policy_resnapshot': actual.replace('prepared_stack_words.at(1), MEMORY_POLICY,', 'prepared_stack_words.at(1), (static_cast<void>(MEMORY_POLICY), parent->memory_policy_snapshot()),'),
         'retry_bound': actual.replace('attempt != 0 ||', 'false ||'),
         'failure_reason_gate': actual.replace('!stack_exhausted ||', 'stack_exhausted ||'),
         'unsafe_context': actual.replace('mod::sched::preempt_count() != 0 || ', ''),
@@ -256,7 +316,7 @@ def main():
             assert name == 'actual' or content != actual, name
             cpp, binary = d / (name + '.cpp'), d / name
             cpp.write_text(content)
-            subprocess.run([compiler, '-std=c++23', '-O1', '-g', '-Wall', '-Wextra', '-Werror', '-fno-pie', '-no-pie', '-fsanitize=address,undefined', str(cpp), '-o', str(binary)], check=True)
+            subprocess.run([compiler, '-std=c++23', '-O1', '-g', '-Wall', '-Wextra', '-Werror', '-fno-pie', '-no-pie', '-fsanitize=address,undefined', '-I', str(ROOT / 'modules/kern/src'), str(cpp), '-o', str(binary)], check=True)
             r = subprocess.run([str(binary)], capture_output=True, text=True)
             if name == 'actual':
                 assert r.returncode == 0 and not r.stderr, r

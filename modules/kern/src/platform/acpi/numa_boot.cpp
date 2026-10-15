@@ -22,10 +22,26 @@ constinit std::array<RamRange, MAX_RAM_RANGES> ram;
 constinit std::atomic<bool> published{false};
 static_assert(std::atomic<bool>::is_always_lock_free);
 
-auto append_zone(const mm::paging::PageZone& zone, size_t& count) -> bool {
+auto append_zone(const mm::paging::PageZone& zone, size_t& count, bool embedded_descriptor) -> bool {
+    static_assert(sizeof(mm::paging::PageZone) <= PAGE_BYTES);
     uint64_t const HHDM = mm::addr::get_hhdm_offset();
-    if (count == ram.size() || zone.allocator == nullptr || zone.start < HHDM || zone.len == 0) return false;
-    ram[count++] = {.base = zone.start - HHDM, .length = zone.len};
+    if (count == ram.size() || zone.allocator == nullptr || zone.start < HHDM || zone.len == 0 || zone.allocator->base != zone.start ||
+        zone.len != static_cast<uint64_t>(zone.allocator->total_pages) * PAGE_BYTES || zone.start % PAGE_BYTES != 0 ||
+        zone.len % PAGE_BYTES != 0)
+        return false;
+    uint64_t base = zone.start - HHDM;
+    uint64_t length = zone.len;
+    if (embedded_descriptor) {
+        // init_page_zone embeds the descriptor in the immediately preceding
+        // page. Global PMM balance includes it; retain its actual SRAT affinity,
+        // even when a node boundary separates it from the allocator's first page.
+        if (base < PAGE_BYTES || reinterpret_cast<uint64_t>(&zone) != zone.start - PAGE_BYTES || length > UINT64_MAX - PAGE_BYTES)
+            return false;
+        base -= PAGE_BYTES;
+        length += PAGE_BYTES;
+    }
+    if (length > UINT64_MAX - base) return false;
+    ram[count++] = {.base = base, .length = length};
     return true;
 }
 }  // namespace
@@ -35,9 +51,9 @@ void initialize_boot_topology(std::span<const CpuInput> cpus) {
 
     size_t count = 0;
     for (auto const* zone = mm::phys::get_zones(); zone != nullptr; zone = zone->next) {
-        if (!append_zone(*zone, count)) dbg::panic_handler("NUMA managed RAM exceeds supported topology input");
+        if (!append_zone(*zone, count, true)) dbg::panic_handler("NUMA managed RAM exceeds supported topology input");
     }
-    if (auto const* huge = mm::phys::get_huge_page_zone(); huge != nullptr && !append_zone(*huge, count))
+    if (auto const* huge = mm::phys::get_huge_page_zone(); huge != nullptr && !append_zone(*huge, count, false))
         dbg::panic_handler("NUMA huge RAM exceeds supported topology input");
     if (count == 0) dbg::panic_handler("NUMA boot has no managed physical RAM");
     std::sort(ram.begin(), ram.begin() + count, [](const RamRange& left, const RamRange& right) { return left.base < right.base; });

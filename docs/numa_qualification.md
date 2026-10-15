@@ -10,9 +10,9 @@ Malformed tables are rejected with a diagnostic and explicit UMA fallback.
 Missing SRAT yields UMA. Missing SLIT uses labelled default distances (10 local,
 20 remote). CPU-only and memory-only nodes remain visible. RAM affinity ranges
 cover initialized physical zones, excluding holes; their byte totals include
-allocator metadata and describe managed coverage, not free capacity. The regular
-zone descriptor page is currently outside those ranges, although global physical
-balance counts it; these topology totals are not the global PMM balance. Existing
+allocator metadata and regular zone descriptor pages. They describe managed
+coverage, not free capacity. Firmware reserves and per-CPU cache storage remain
+separate from the managed identity. Existing
 ACPI initialization still requires a usable RSDP.
 
 The parser supports 256 CPU identities and 64 proximity domains. The current
@@ -21,14 +21,37 @@ index zero; boot explicitly rejects unsupported enumeration before publishing
 partial masks. NUMA allocation policy and general 2 MiB user mappings are still
 under implementation. Topology discovery alone does not qualify either feature.
 
+Task defaults are stored per executor under a short IRQ-safe snapshot lock.
+Creation copies the initiating executor's value independently of its credential
+owner. Owned exec preparation carries the value to successful canonical image
+commit; failed or canceled preparation preserves the existing default. These
+internal paths have no public policy selector yet.
+
 The internal placed allocator supports preferred, strict-bind and deterministic
 virtual-page interleave selection. A checked interval claim returns either one
 frame or 512 absolutely aligned, independently owned order-0 frames. Move-only
 ownership frees an uncommitted span. This helper has no public selector and is
-not yet connected to task inheritance, anonymous faults or large user mappings.
+not yet connected to anonymous faults or large user mappings.
 It bypasses unfiltered CPU caches for domain-constrained claims; cached capacity
 can therefore cause conservative allocation failure. Allocation-pressure
 bookkeeping can wake reclaim, but the attempt itself does not reclaim or wait.
+
+The explicit per-node balance diagnostic scans bounded physical metadata and
+collects global and node owner totals during one allocator-lock interval. Its
+fixed buffers belong in BSS; `max_frames` refuses excess work before acquiring
+allocator locks. It is unsuitable for an allocation hot path. Refcounts remain
+sampled telemetry because they can change outside allocator locks; a transient
+zero reference does not turn an allocated frame into free capacity.
+
+The collector translation unit excludes KASAN checks: a first shadow-page fault
+can allocate and recursively wait for the allocator locks being observed.
+KCFI, report-mode UBSan and KCOV remain enabled in the diagnostic profile, and
+the actual metadata scanner's Host tests retain ASan/UBSan. This boundary does
+not alter shadow poison, page ownership or the rest of the kernel's diagnostics.
+Generated-code checks at configured optimization and O0 also cover shared weak
+atomic/array helpers from instrumented callers. Their existing libc++ sanitizer
+ignorelist exclusions are part of the current safety boundary; the translation
+unit flag alone does not establish that every selected helper is uninstrumented.
 
 ## Virtual NUMA
 
@@ -105,6 +128,33 @@ and generated authentication file were removed after inactivity/reference and
 retained-backing checks. Current artifacts and the unrelated VM were preserved.
 Small local receipts are retained under `build/goal40-evidence/native-numa03/`.
 
+The corresponding UMA foundation run passed 1,473 cases and 128,239 assertions
+with the same kernel, zero failures and natural poweroff. Its private images
+were also removed, with the shared guard and unrelated VM preserved. These
+foundation runs precede Task-policy inheritance and the per-node collector.
+
+The first native collector run exposed a KASAN shadow fault while holding the
+allocator locks. A bounded stack capture identified recursive physical allocation
+waiting for those locks. That run remains failed evidence; its disks were removed.
+
+After the narrow fix, fresh virtual NUMA qualification passed 1,480 cases and
+128,439 assertions with zero failures and natural poweroff, using kernel SHA-256
+`56b64ccaa6ee87a77982f4ae97c29938df8c4c7aad23ecc0b27a5133d53b3f19`.
+The new tests cover actual per-node/global managed ownership, placed-frame
+owner closure, Task-policy state and exec publication. Full scans of 1,877,360
+frames took 245–250 ms. This IRQ-disabled diagnostic cost is unsuitable for hot
+allocation paths. All watched inputs stayed fixed; the original guard and
+unrelated VM stayed unchanged. Disposable images peaked at 268,320,768 bytes and
+were removed after reference/backing checks. The receipt is
+`build/goal40-evidence/native-numa06/result.json`.
+
+UMA qualification of the same fixed kernel passed 1,480 cases and 128,335
+assertions with zero failures and natural poweroff. Its receipt is
+`build/goal40-evidence/native-uma07/result.json`; watched inputs, original guard
+and unrelated VM stayed unchanged, and all disposable images were removed.
+Ordinary KTEST parks secondary CPUs, so these runs do not qualify SMP races or
+CPU-pinned userspace locality benchmarks.
+
 These checks establish the internal foundation. User first touch, per-node
-reserves/accounting, 2 MiB mapping lifetime, map/fork/pin/unmap stress and paired
+reserves and pressure policy, 2 MiB mapping lifetime, map/fork/pin/unmap stress and paired
 locality/UMA throughput measurements remain required.

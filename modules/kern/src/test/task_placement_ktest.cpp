@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <memory>
 #include <new>
+#include <platform/mm/virt.hpp>
+#include <platform/sched/resource.hpp>
 #include <platform/sched/task.hpp>
 #include <test/ktest.hpp>
 #include <type_traits>
@@ -196,10 +198,10 @@ KTEST(TaskPlacementScalar, DefaultsAndExactLayout) {
     if (task == nullptr) return;
     const Task& view = *task;
 
-    // Keep the original scalar/assembly offsets after appending the native
-    // retirement pointer. Task is not standard-layout: inspect the live
+    // Keep the original scalar/assembly offsets after appending per-Task
+    // memory policy. Task is not standard-layout: inspect the live
     // object's bytes instead of adding offsetof extension warnings.
-    KEXPECT_EQ(sizeof(Task), size_t{16216});
+    KEXPECT_EQ(sizeof(Task), size_t{16248});
     KEXPECT_EQ(alignof(Task), size_t{8});
     KEXPECT_EQ(member_offset(view, view.cpu), size_t{48});
     KEXPECT_EQ(member_offset(view, view.domain_mask), size_t{56});
@@ -232,6 +234,86 @@ KTEST(TaskPlacementScalar, DefaultsAndExactLayout) {
     KEXPECT_NULL(task->pagemap);
     KEXPECT_NULL(task->thread);
     KEXPECT_NULL(task->owned_unpublished_process.load(std::memory_order_relaxed));
+    KEXPECT_TRUE(task->memory_policy_snapshot() == ker::mod::mm::numa::Policy{});
+}
+
+KTEST(TaskMemoryPolicy, DiagnosticAdmissionRejectsWithoutChangingState) {
+    namespace numa = ker::mod::mm::numa;
+    const auto task = std::unique_ptr<Task>{new (std::nothrow) Task{}};
+    KREQUIRE_TRUE(task != nullptr);
+    constexpr numa::Policy PREFERRED{.nodes = 1, .mode = numa::Mode::PREFERRED};
+    KREQUIRE_TRUE(task->selftest_set_memory_policy(PREFERRED));
+    for (auto const INVALID :
+         {numa::Policy{.nodes = 1, .mode = numa::Mode::LOCAL}, numa::Policy{.nodes = 3, .mode = numa::Mode::PREFERRED},
+          numa::Policy{.nodes = 0, .mode = numa::Mode::BIND}, numa::Policy{.nodes = 0, .mode = static_cast<numa::Mode>(255)}}) {
+        KEXPECT_FALSE(task->selftest_set_memory_policy(INVALID));
+        KEXPECT_TRUE(task->memory_policy_snapshot() == PREFERRED);
+    }
+    KEXPECT_TRUE(task->selftest_set_memory_policy({}));
+    KEXPECT_TRUE(task->memory_policy_snapshot() == numa::Policy{});
+}
+
+KTEST(TaskMemoryPolicy, ThreadSnapshotUsesActorAndDoesNotShareDefault) {
+    namespace numa = ker::mod::mm::numa;
+    const auto owner = std::unique_ptr<Task>{new (std::nothrow) Task{}};
+    const auto worker = std::unique_ptr<Task>{new (std::nothrow) Task{}};
+    const auto child = std::unique_ptr<Task>{new (std::nothrow) Task{}};
+    KREQUIRE_TRUE(owner && worker && child);
+    owner->pid = 0x7B90;
+    worker->is_thread = true;
+    worker->owner_pid = owner->pid;
+    KREQUIRE_TRUE(ker::mod::sched::resource::bind_thread_owner(*worker, *owner));
+    constexpr numa::Policy OWNER{.nodes = 1, .mode = numa::Mode::PREFERRED};
+    constexpr numa::Policy ACTOR{.nodes = 1, .mode = numa::Mode::BIND};
+    KREQUIRE_TRUE(owner->selftest_set_memory_policy(OWNER));
+    KREQUIRE_TRUE(worker->selftest_set_memory_policy(ACTOR));
+    auto const SNAPSHOT = worker->memory_policy_snapshot();
+    child->publish_memory_policy_snapshot(SNAPSHOT);
+    KEXPECT_TRUE(child->memory_policy_snapshot() == ACTOR);
+    KEXPECT_TRUE(owner->memory_policy_snapshot() == OWNER);
+    KEXPECT_TRUE(worker->selftest_set_memory_policy({}));
+    KEXPECT_TRUE(worker->memory_policy_snapshot() == numa::Policy{});
+    KEXPECT_TRUE(child->memory_policy_snapshot() == ACTOR);
+    KEXPECT_TRUE(owner->memory_policy_snapshot() == OWNER);
+}
+
+KTEST(TaskMemoryPolicy, UserThreadFactoryInheritsCallingThreadPolicy) {
+    namespace numa = ker::mod::mm::numa;
+    namespace virt = ker::mod::mm::virt;
+    const auto owner = std::unique_ptr<Task>{new (std::nothrow) Task{}};
+    const auto worker = std::unique_ptr<Task>{new (std::nothrow) Task{}};
+    KREQUIRE_TRUE(owner && worker);
+    owner->pid = ker::mod::sched::task::get_next_pid();
+    owner->type = TaskType::PROCESS;
+    worker->is_thread = true;
+    worker->owner_pid = owner->pid;
+    worker->type = TaskType::PROCESS;
+    KREQUIRE_TRUE(ker::mod::sched::resource::bind_thread_owner(*worker, *owner));
+    constexpr numa::Policy OWNER{.nodes = 1, .mode = numa::Mode::PREFERRED};
+    constexpr numa::Policy ACTOR{.nodes = 1, .mode = numa::Mode::BIND};
+    KREQUIRE_TRUE(owner->selftest_set_memory_policy(OWNER));
+    KREQUIRE_TRUE(worker->selftest_set_memory_policy(ACTOR));
+    auto* root = virt::create_pagemap_may_fail();
+    KREQUIRE_TRUE(root != nullptr);
+    virt::copy_kernel_mappings_to(root);
+    owner->pagemap = worker->pagemap = root;
+    // Exercise the actual unpublished factory, with no user return or CPU post.
+    // Supplied entry/TCB/stack addresses are metadata; the syscall preflight is
+    // separately covered by the extracted THREAD_CREATE Host fixture.
+    auto* child = Task::create_user_thread(worker.get(), 0x60000000, 0x60001000, 0x400100, 0x400200, 0, worker->memory_policy_snapshot());
+    KEXPECT_TRUE(child != nullptr);
+    if (child != nullptr) {
+        KEXPECT_TRUE(child->pagemap == root);
+        KEXPECT_TRUE(child->credential_owner() == owner.get());
+        KEXPECT_TRUE(child->memory_policy_snapshot() == ACTOR);
+        KEXPECT_TRUE(child->selftest_set_memory_policy({}));
+        KEXPECT_TRUE(worker->memory_policy_snapshot() == ACTOR);
+        KEXPECT_TRUE(owner->memory_policy_snapshot() == OWNER);
+        ker::mod::sched::task::destroy_unpublished_user_thread(child);
+    }
+    owner->pagemap = worker->pagemap = nullptr;
+    virt::destroy_user_space(root, owner->pid, nullptr, "policy-thread-factory-selftest");
+    virt::release_pagemap(root, owner->pid);
 }
 
 KTEST(TaskPlacementScalar, MutableAndConstRoundTrips) {

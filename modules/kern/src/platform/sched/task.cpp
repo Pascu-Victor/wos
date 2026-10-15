@@ -13,6 +13,9 @@
 #include <memory>
 #include <net/wki/remote_compute.hpp>
 #include <new>
+#ifdef WOS_SELFTEST
+#include <platform/acpi/numa_boot.hpp>
+#endif
 #include <platform/loader/debug_info.hpp>
 #include <platform/loader/elf_loader.hpp>
 #include <platform/loader/gdb_interface.hpp>
@@ -1752,8 +1755,32 @@ auto Task::initialize_process_image(const ker::loader::elf::ElfFileView& elf, co
     return true;
 }
 
+auto Task::memory_policy_snapshot() const noexcept -> mm::numa::Policy {
+    uint64_t const FLAGS = m_memory_policy_lock.lock_irqsave();
+    auto const VALUE = m_memory_policy;
+    m_memory_policy_lock.unlock_irqrestore(FLAGS);
+    return VALUE;
+}
+
+void Task::publish_memory_policy_snapshot(mm::numa::Policy value) noexcept {
+    uint64_t const FLAGS = m_memory_policy_lock.lock_irqsave();
+    m_memory_policy = value;
+    m_memory_policy_lock.unlock_irqrestore(FLAGS);
+}
+
+#ifdef WOS_SELFTEST
+auto Task::selftest_set_memory_policy(mm::numa::Policy candidate) noexcept -> bool {
+    auto const* topology = acpi::numa::boot_topology();
+    if (!mm::numa::valid_policy(candidate, topology != nullptr ? topology->node_count : 1) ||
+        (topology == nullptr && candidate.mode != mm::numa::Mode::LOCAL))
+        return false;
+    publish_memory_policy_snapshot(candidate);
+    return true;
+}
+#endif
+
 Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_sp, uint64_t enter_thread_va, uint64_t entry_va,
-                               uint64_t user_arg_va, bool* stack_exhausted, LazyVmemClone* prepared_lazy) {
+                               uint64_t user_arg_va, mm::numa::Policy memory_policy, bool* stack_exhausted, LazyVmemClone* prepared_lazy) {
     if (stack_exhausted != nullptr) {
         *stack_exhausted = false;
     }
@@ -1768,6 +1795,7 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     uint64_t const K_RSP = KSTACK_BASE + ker::mod::mm::KERNEL_STACK_SIZE;
 
     auto* t = new Task{};  // default-constructed; all fields set explicitly below
+    t->publish_memory_policy_snapshot(memory_policy);
 
     // Copy name from parent
     if (parent->name != nullptr) {

@@ -349,6 +349,7 @@ auto thread_control(abi::multiproc::threadControlOps op, uint64_t arg1, uint64_t
             if (parent == nullptr || tcb_va == 0) {
                 return static_cast<uint64_t>(-EINVAL);
             }
+            auto const MEMORY_POLICY = parent->memory_policy_snapshot();
             ker::syscall::process::exit_current_if_process_exit_requested();
             mod::sched::resource::ProcessReservation process_reservation(parent, parent->credentials().user().real);
             if (process_reservation.result() < 0) {
@@ -385,7 +386,8 @@ auto thread_control(abi::multiproc::threadControlOps op, uint64_t arg1, uint64_t
                     ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
                     if (!lazy_snapshot.matches(*parent)) return static_cast<uint64_t>(-EAGAIN);
                     auto* t = mod::sched::task::Task::create_user_thread(parent, tcb_va, user_sp, enter_va, prepared_stack_words.at(0),
-                                                                         prepared_stack_words.at(1), &stack_exhausted, &lazy_snapshot);
+                                                                         prepared_stack_words.at(1), MEMORY_POLICY, &stack_exhausted,
+                                                                         &lazy_snapshot);
                     if (t == nullptr) {
                         creation_failed = true;
                     } else {

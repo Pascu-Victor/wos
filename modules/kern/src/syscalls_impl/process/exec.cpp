@@ -90,7 +90,7 @@ namespace ker::syscall::process {
 namespace {
 auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* const* envp,
                         const ker::abi::process::SpawnOptions* spawn_options, int shebang_depth,
-                        const ker::mod::security::Snapshot& admitted_credentials) -> uint64_t;
+                        const ker::mod::security::Snapshot& admitted_credentials, ker::mod::mm::numa::Policy memory_policy) -> uint64_t;
 auto wos_proc_execve_impl(const char* path, const char* const* argv, const char* const* envp, ker::mod::cpu::GPRegs& gpr, int shebang_depth)
     -> uint64_t;
 
@@ -1422,6 +1422,7 @@ struct NativeExecImage {
     LazyVmemRangeVec& lazy_ranges;
     const vfs::Stat& stat;
     bool nosuid{};
+    ker::mod::mm::numa::Policy memory_policy{};
     bool one_shot_wki_target{};
     ker::mod::security::Snapshot admitted_credentials{};
     ker::mod::security::Snapshot stack_credentials{};
@@ -1707,6 +1708,7 @@ class ExecRequestArguments {
    public:
     ExecArgumentsSnapshot snapshot;
     ker::mod::security::Snapshot admitted_credentials;
+    ker::mod::mm::numa::Policy memory_policy{};
     NativeExecCompletion completion;
     ExecTraceState trace;
     WorkerExecHandoff handoff;
@@ -1839,6 +1841,7 @@ class PreparedNativeExecImage {
               .lazy_ranges = m_lazy_ranges,
               .stat = m_stat,
               .nosuid = image.nosuid,
+              .memory_policy = image.memory_policy,
               .one_shot_wki_target = image.one_shot_wki_target,
               .admitted_credentials = image.admitted_credentials,
               .stack_credentials = image.stack_credentials,
@@ -2444,6 +2447,7 @@ auto commit_native_exec_image(ker::mod::sched::task::Task* task, PreparedNativeE
         retired.exec_image_file = task->exec_image_file;
         retired.thread = task->thread;
         task->mark_exec_completed();
+        task->publish_memory_policy_snapshot(image.memory_policy);
         task->entry = image.entry;
         task->program_header_addr = image.program_header_addr;
         task->elf_header_addr = image.elf_header_addr;
@@ -2790,7 +2794,8 @@ auto exec_shebang_script(const char* script_path, const char* const* argv, const
 
 #ifdef WOS_SELFTEST
 namespace {
-auto make_exec_selftest_owned_image(bool& consumed) -> std::unique_ptr<PreparedNativeExecImage> {
+auto make_exec_selftest_owned_image(bool& consumed, ker::mod::mm::numa::Policy memory_policy = {}, uint64_t staging_pid = 0)
+    -> std::unique_ptr<PreparedNativeExecImage> {
     std::unique_ptr<PreparedNativeExecImage> prepared;
     {
         auto* file = exec_selftest_make_file();
@@ -2841,7 +2846,7 @@ auto make_exec_selftest_owned_image(bool& consumed) -> std::unique_ptr<PreparedN
             .mmap_next = 0,
             .name = name,
             .path = path.data(),
-            .debug_staging_pid = 0,
+            .debug_staging_pid = staging_pid,
             .initial_rip = 0,
             .initial_rsp = 0,
             .registers = registers,
@@ -2850,7 +2855,9 @@ auto make_exec_selftest_owned_image(bool& consumed) -> std::unique_ptr<PreparedN
             .lazy_ranges = ranges,
             .stat = stat,
             .nosuid = true,
+            .memory_policy = memory_policy,
             .admitted_credentials = ker::mod::security::Snapshot::bootstrap_root(),
+            .stack_credentials = ker::mod::security::Snapshot::bootstrap_root(),
         };
         prepared.reset(new (std::nothrow) PreparedNativeExecImage(IMAGE, 0x7B60));
         if (!prepared) {
@@ -2865,6 +2872,7 @@ auto make_exec_selftest_owned_image(bool& consumed) -> std::unique_ptr<PreparedN
         path.fill('x');
         registers.rdi = 0;
         stat.st_uid = 0;
+        memory_policy = {};
     }
     return prepared;
 }
@@ -3199,10 +3207,14 @@ auto exec_selftest_worker_handoff_claim_and_cancel() -> bool {
     owner.has_exited = worker.has_exited = false;
     owner.resource_cpu_admission_closed = false;
     g_exec_selftest_close_count.store(0);
+    namespace numa = ker::mod::mm::numa;
+    constexpr numa::Policy OWNER_POLICY{.nodes = 1, .mode = numa::Mode::PREFERRED};
+    constexpr numa::Policy WORKER_POLICY{.nodes = 1, .mode = numa::Mode::BIND};
+    if (!owner.selftest_set_memory_policy(OWNER_POLICY) || !worker.selftest_set_memory_policy(WORKER_POLICY)) return false;
     bool consumed = false;
     bool ok = true;
     for (bool const CLAIM : {false, true}) {
-        auto image = make_exec_selftest_owned_image(consumed);
+        auto image = make_exec_selftest_owned_image(consumed, worker.memory_policy_snapshot());
         if (!image) return false;
         auto* raw = image.get();
         if (!image->admission().begin(owner)) return false;
@@ -3217,6 +3229,7 @@ auto exec_selftest_worker_handoff_claim_and_cancel() -> bool {
                   owner.owned_exec_preparation.load() == raw && owner.active_exec_handoff.load() == &handoff &&
                   !owner.pending_exec_handoff.load();
         }
+        ok &= raw->view().memory_policy == WORKER_POLICY && owner.memory_policy_snapshot() == OWNER_POLICY;
         cancel_pending_exec_handoff(owner);
         ok &= handoff.result.load() == -ECANCELED && !owner.pending_exec_handoff.load() && !owner.active_exec_handoff.load();
         // Pending cancellation keeps worker ownership; claimed cancellation
@@ -3224,27 +3237,88 @@ auto exec_selftest_worker_handoff_claim_and_cancel() -> bool {
         ok &= (CLAIM ? owner.owned_exec_preparation.load() : worker.owned_exec_preparation.load()) == raw;
         cleanup_exec_preparation(owner);
         cleanup_exec_preparation(worker);
-        ok &= !owner.resource_exec_admission_closed;
+        ok &= !owner.resource_exec_admission_closed && owner.memory_policy_snapshot() == OWNER_POLICY;
     }
     ok &= g_exec_selftest_close_count.load() == 2 && ker::mod::sched::resource::close_idle_thread_cpu_admission(owner);
     owner.resource_cpu_admission_closed = false;
+    owner.publish_memory_policy_snapshot({});
+    worker.publish_memory_policy_snapshot({});
     return ok;
 }
 
 auto exec_selftest_owned_image_outlives_staging_and_discards_once() -> bool {
     g_exec_selftest_close_count.store(0, std::memory_order_relaxed);
     bool consumed = false;
-    auto prepared = make_exec_selftest_owned_image(consumed);
+    constexpr ker::mod::mm::numa::Policy POLICY{.nodes = 1, .mode = ker::mod::mm::numa::Mode::PREFERRED};
+    auto prepared = make_exec_selftest_owned_image(consumed, POLICY);
     if (!prepared) return false;
     auto const& IMAGE = prepared->view();
     bool const SNAPSHOT_OK = consumed && std::strcmp(IMAGE.path, "/owned/image") == 0 && std::strcmp(IMAGE.name, "owned") == 0 &&
                              IMAGE.registers.rdi == 0x123456 && IMAGE.stat.st_uid == 37 && IMAGE.lazy_ranges.size() == 1 &&
-                             IMAGE.exec_image_file->refcount.load() == 2 && IMAGE.nosuid &&
+                             IMAGE.exec_image_file->refcount.load() == 2 && IMAGE.nosuid && IMAGE.memory_policy == POLICY &&
                              IMAGE.admitted_credentials == ker::mod::security::Snapshot::bootstrap_root();
     prepared->discard();
     prepared->discard();
     prepared.reset();
     return SNAPSHOT_OK && g_exec_selftest_close_count.load(std::memory_order_relaxed) == 1;
+}
+
+auto exec_selftest_worker_policy_reaches_canonical_commit() -> bool {
+    using ker::mod::sched::task::Task;
+    namespace numa = ker::mod::mm::numa;
+    auto owner = std::unique_ptr<Task>{new (std::nothrow) Task{}};
+    auto worker = std::unique_ptr<Task>{new (std::nothrow) Task{}};
+    if (!owner || !worker) return false;
+    owner->pid = ker::mod::sched::task::get_next_pid();
+    owner->type = ker::mod::sched::task::TaskType::PROCESS;
+    worker->is_thread = true;
+    worker->type = ker::mod::sched::task::TaskType::PROCESS;
+    worker->owner_pid = owner->pid;
+    if (!ker::mod::sched::resource::bind_thread_owner(*worker, *owner)) return false;
+    constexpr numa::Policy OWNER_POLICY{.nodes = 1, .mode = numa::Mode::PREFERRED};
+    constexpr numa::Policy WORKER_POLICY{.nodes = 1, .mode = numa::Mode::BIND};
+    if (!owner->selftest_set_memory_policy(OWNER_POLICY) || !worker->selftest_set_memory_policy(WORKER_POLICY)) return false;
+    bool consumed = false;
+    uint64_t const STAGING_PID = owner->pid | EXEC_DEBUG_STAGING_BIT;
+    auto prepared = make_exec_selftest_owned_image(consumed, worker->memory_policy_snapshot(), STAGING_PID);
+    if (!prepared || !prepared->admission().begin(*worker)) return false;
+    auto* const IMAGE = prepared.get();
+    if (!adopt_exec_preparation(*worker, prepared)) return false;
+    WorkerExecHandoff handoff;
+    handoff.worker = worker.get();
+    owner->pending_exec_handoff.store(&handoff);
+    bool ok = claim_pending_exec_handoff(*owner) == &handoff && !worker->owned_exec_preparation.load() &&
+              owner->owned_exec_preparation.load() == IMAGE;
+    if (!ok) {
+        cancel_pending_exec_handoff(*owner);
+        cleanup_exec_preparation(*worker);
+        cleanup_exec_preparation(*owner);
+        return false;
+    }
+    // The real publication helper must preserve A when its actual debug-stage
+    // prerequisite is absent, then install B when that prerequisite is present.
+    ok = commit_native_exec_image(owner.get(), *IMAGE) == -EIO && owner->memory_policy_snapshot() == OWNER_POLICY;
+    loader::debug::register_process(STAGING_PID, IMAGE->view().name, 0, 0);
+    int const COMMITTED = commit_native_exec_image(owner.get(), *IMAGE);
+    ok = COMMITTED == 0 && owner->memory_policy_snapshot() == WORKER_POLICY && worker->memory_policy_snapshot() == WORKER_POLICY && ok;
+    if (COMMITTED == 0) {
+        // This existing metadata-only image fixture never enters userspace or
+        // switches CR3. Complete its ownership phase after the real Task commit.
+        IMAGE->mark_activated();
+        acknowledge_worker_exec(*owner, handoff, 0);
+    } else {
+        cancel_pending_exec_handoff(*owner);
+    }
+    cleanup_exec_preparation(*owner);
+    cleanup_exec_preparation(*worker);
+    if (COMMITTED == 0) {
+        loader::debug::unregister_process(owner->pid);
+        ker::mod::sched::task::release_lazy_vmem_ranges(*owner);
+        vfs::vfs_put_file(std::exchange(owner->exec_image_file, nullptr));
+        delete[] std::exchange(owner->elf_buffer, nullptr);
+        delete[] std::exchange(owner->name, nullptr);
+    }
+    return ok && !owner->owned_exec_preparation.load() && !owner->active_exec_handoff.load();
 }
 
 auto exec_selftest_tracked_image_cleanup_is_reentrant_and_exclusive() -> bool {
@@ -3955,7 +4029,8 @@ auto create_native_process_task_impl(mod::sched::task::Task* owner, const Native
                                      const mod::sched::resource::State& resources, const mod::security::Snapshot& credentials,
                                      mod::sched::resource::ProcessReservation& reservation,
                                      mod::sched::resource::State* failure_observations, int* construction_error,
-                                     NativeConstructionExecutorGuard* transferred_guard = nullptr) -> mod::sched::task::Task* {
+                                     mod::mm::numa::Policy memory_policy, NativeConstructionExecutorGuard* transferred_guard = nullptr)
+    -> mod::sched::task::Task* {
     if (construction_error != nullptr) *construction_error = 0;
     bool input_guard = false;
     auto refuse_inputs = [&](int error) -> mod::sched::task::Task* {
@@ -3996,6 +4071,7 @@ auto create_native_process_task_impl(mod::sched::task::Task* owner, const Native
         delete child;
         return refuse_inputs(-EBUSY);
     }
+    child->publish_memory_policy_snapshot(memory_policy);
     // Task allocation can enter reclaim. Fatal exit stays deferred until the
     // slot owns the child and all input ownership has moved off this stack.
     child->exec_image_file = std::exchange(owned_file, nullptr);
@@ -4064,6 +4140,7 @@ auto create_native_process_task_impl(mod::sched::task::Task* owner, const Native
             if (!pending) {
                 arguments_error = -ENOMEM;
             } else {
+                pending->memory_policy = memory_policy;
 #ifdef WOS_SELFTEST
                 pending->selftest_destructions = &g_native_construction_scratch_destructions;
 #endif
@@ -4631,6 +4708,8 @@ auto create_file_backed_process_task(const char* name, vfs::File* owned_file, si
                                      uint64_t kernel_rsp, const mod::sched::resource::State& resources,
                                      const mod::security::Snapshot& credentials, mod::sched::resource::ProcessReservation& reservation,
                                      mod::sched::resource::State* failure_observations, int* interpreter_error) -> mod::sched::task::Task* {
+    // WKI receiver path: machine-local node policies are not transported.
+    // Its newly constructed Task deliberately keeps the default LOCAL value.
     return create_file_backed_process_task_impl(name, owned_file, file_size, file_stat, kernel_rsp, resources, credentials, reservation,
                                                 failure_observations, interpreter_error, nullptr, nullptr, true);
 }
@@ -4641,8 +4720,9 @@ auto create_file_backed_process_task_for_owner(mod::sched::task::Task* owner, co
                                                mod::sched::resource::ProcessReservation& reservation,
                                                mod::sched::resource::State* failure_observations, int* construction_error)
     -> mod::sched::task::Task* {
+    auto const MEMORY_POLICY = owner != nullptr ? owner->memory_policy_snapshot() : mod::mm::numa::Policy{};
     return create_native_process_task_impl(owner, context, name, owned_file, file_size, file_stat, kernel_rsp, resources, credentials,
-                                           reservation, failure_observations, construction_error);
+                                           reservation, failure_observations, construction_error, MEMORY_POLICY);
 }
 
 auto abort_native_compartment_preparation(mod::sched::task::Task& executor, mod::sched::task::Task* child) -> bool {
@@ -4690,6 +4770,7 @@ static auto prepare_native_compartment_inputs_for_owner(mod::sched::task::Task& 
             return nullptr;
         }
         pending->native_compartment_request = true;
+        pending->memory_policy = executor.memory_policy_snapshot();
 #ifdef WOS_SELFTEST
         pending->fault_token = fault_token;
 #endif
@@ -4725,7 +4806,7 @@ static auto prepare_native_compartment_inputs_for_owner(mod::sched::task::Task& 
             child = create_native_process_task_impl(
                 &executor, root.context, request->snapshot.path.data(), std::exchange(root.executable, nullptr),
                 static_cast<size_t>(root.executable_stat.st_size), root.executable_stat, std::exchange(root.kernel_rsp, 0), root.resources,
-                root.policy.admitted.credentials, *root.reservation, nullptr, &error, &guard);
+                root.policy.admitted.credentials, *root.reservation, nullptr, &error, request->memory_policy, &guard);
             root.child = child;
             if (child == nullptr && error == 0) error = -ENOEXEC;
         }
@@ -4928,12 +5009,13 @@ auto wos_proc_exec(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr) -
     }
 
     auto const ADMITTED_CREDENTIALS = parent->credentials();
+    auto const MEMORY_POLICY = parent->memory_policy_snapshot();
     ExecArgumentsSnapshot snapshot;
     int const SNAPSHOT_RESULT = snapshot_exec_arguments(*parent, path_addr, argv_addr, envp_addr, snapshot);
     if (SNAPSHOT_RESULT < 0) {
         return static_cast<uint64_t>(SNAPSHOT_RESULT);
     }
-    return wos_proc_exec_impl(snapshot.path.data(), snapshot.argv, snapshot.envp, nullptr, 0, ADMITTED_CREDENTIALS);
+    return wos_proc_exec_impl(snapshot.path.data(), snapshot.argv, snapshot.envp, nullptr, 0, ADMITTED_CREDENTIALS, MEMORY_POLICY);
 }
 
 auto wos_proc_spawn(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr, uint64_t options_addr) -> uint64_t {
@@ -4946,13 +5028,14 @@ auto wos_proc_spawn(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr, 
     }
 
     auto const ADMITTED_CREDENTIALS = parent->credentials();
+    auto const MEMORY_POLICY = parent->memory_policy_snapshot();
     ExecArgumentsSnapshot arguments;
     int const ARGUMENT_RESULT = snapshot_exec_arguments(*parent, path_addr, argv_addr, envp_addr, arguments);
     if (ARGUMENT_RESULT < 0) {
         return static_cast<uint64_t>(ARGUMENT_RESULT);
     }
     if (options_addr == 0) {
-        return wos_proc_exec_impl(arguments.path.data(), arguments.argv, arguments.envp, nullptr, 0, ADMITTED_CREDENTIALS);
+        return wos_proc_exec_impl(arguments.path.data(), arguments.argv, arguments.envp, nullptr, 0, ADMITTED_CREDENTIALS, MEMORY_POLICY);
     }
 
     auto* snapshot = new (std::nothrow) SpawnOptionsSnapshot;
@@ -4964,8 +5047,8 @@ auto wos_proc_spawn(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr, 
         delete snapshot;
         return static_cast<uint64_t>(OPTIONS_RESULT);
     }
-    uint64_t const RESULT =
-        wos_proc_exec_impl(arguments.path.data(), arguments.argv, arguments.envp, &snapshot->options, 0, ADMITTED_CREDENTIALS);
+    uint64_t const RESULT = wos_proc_exec_impl(arguments.path.data(), arguments.argv, arguments.envp, &snapshot->options, 0,
+                                               ADMITTED_CREDENTIALS, MEMORY_POLICY);
     delete snapshot;
     return RESULT;
 }
@@ -4973,7 +5056,7 @@ auto wos_proc_spawn(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr, 
 namespace {
 auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* const* envp,
                         const ker::abi::process::SpawnOptions* spawn_options, int shebang_depth,
-                        const ker::mod::security::Snapshot& admitted_credentials) -> uint64_t {
+                        const ker::mod::security::Snapshot& admitted_credentials, ker::mod::mm::numa::Policy memory_policy) -> uint64_t {
     if (ker::mod::power::shutdown_in_progress()) {
         return static_cast<uint64_t>(-ESHUTDOWN);
     }
@@ -5099,9 +5182,10 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
             return 0;
         }
         return exec_shebang_script(path, argv, envp, argv_count, shebang, shebang_depth,
-                                   [spawn_options, &PARENT_CREDENTIALS](const char* interp, const char* const* argv2,
-                                                                        const char* const* envp2, int depth) -> uint64_t {
-                                       return wos_proc_exec_impl(interp, argv2, envp2, spawn_options, depth, PARENT_CREDENTIALS);
+                                   [spawn_options, &PARENT_CREDENTIALS, memory_policy](const char* interp, const char* const* argv2,
+                                                                                       const char* const* envp2, int depth) -> uint64_t {
+                                       return wos_proc_exec_impl(interp, argv2, envp2, spawn_options, depth, PARENT_CREDENTIALS,
+                                                                 memory_policy);
                                    });
     }
 
@@ -5185,6 +5269,8 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         delete[] elf_buffer;
         return 0;
     }
+
+    new_task->publish_memory_policy_snapshot(memory_policy);
 
     // The constructor deliberately performs no PT_INTERP VFS I/O. Transfer
     // every caller-owned resource and publish fatal-exit recovery before the
@@ -5669,6 +5755,7 @@ auto wos_proc_execve(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr,
         std::unique_ptr<ExecRequestArguments> pending(new (std::nothrow) ExecRequestArguments);
         if (!pending) return static_cast<uint64_t>(-ENOMEM);
         pending->admitted_credentials = task->credentials();
+        pending->memory_policy = task->memory_policy_snapshot();
         request = pending.get();
         if (!adopt_exec_arguments(*task, pending)) return static_cast<uint64_t>(-EAGAIN);
     }
@@ -6482,6 +6569,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
             .lazy_ranges = new_lazy_ranges,
             .stat = exec_stat,
             .nosuid = EXEC_NOSUID,
+            .memory_policy = request->memory_policy,
             .one_shot_wki_target = (task->wki_target_flags & sched::task::Task::WKI_TARGET_FLAG_ONESHOT) != 0,
             .admitted_credentials = request->admitted_credentials,
             .stack_credentials = stack_credentials,

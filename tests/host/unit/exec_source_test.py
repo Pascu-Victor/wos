@@ -282,18 +282,18 @@ def require_spawn_actions_snapshot_user_memory_and_preserve_cloexec_sources(sour
         "snapshot_exec_arguments(*parent, path_addr, argv_addr, envp_addr, arguments)",
         "new (std::nothrow) SpawnOptionsSnapshot",
         "snapshot_spawn_options(*parent, options_addr, *snapshot)",
-        "wos_proc_exec_impl(arguments.path.data(), arguments.argv, arguments.envp, &snapshot->options, 0, ADMITTED_CREDENTIALS)",
+        "wos_proc_exec_impl(arguments.path.data(), arguments.argv, arguments.envp, &snapshot->options, 0, ADMITTED_CREDENTIALS, MEMORY_POLICY)",
         "delete snapshot",
     ]:
-        if snippet not in spawn:
+        if snippet not in " ".join(spawn.split()):
             fail(f"spawn syscall must own its options snapshot: {snippet}")
 
     exec_entry = function_body(source, "wos_proc_exec")
     for snippet in [
         "snapshot_exec_arguments(*parent, path_addr, argv_addr, envp_addr, snapshot)",
-        "wos_proc_exec_impl(snapshot.path.data(), snapshot.argv, snapshot.envp, nullptr, 0, ADMITTED_CREDENTIALS)",
+        "wos_proc_exec_impl(snapshot.path.data(), snapshot.argv, snapshot.envp, nullptr, 0, ADMITTED_CREDENTIALS, MEMORY_POLICY)",
     ]:
-        if snippet not in exec_entry:
+        if snippet not in " ".join(exec_entry.split()):
             fail(f"exec syscall must deep-snapshot user path/vector memory: {snippet}")
 
     exec_impl = function_body(source, "wos_proc_exec_impl")
@@ -812,6 +812,47 @@ def require_exec_credential_admission(source: str) -> None:
     assert prepare.index("before != *admitted") < prepare.index("before.prepare_exec")
 
 
+def require_exec_memory_policy_capture_and_commit(source: str) -> None:
+    # Source ordering complements native tests: it verifies the value travels
+    # with owned inputs rather than being resampled by a loader/worker.
+    for name in ("wos_proc_exec", "wos_proc_spawn"):
+        body = function_body(source, name)
+        capture = "auto const MEMORY_POLICY = parent->memory_policy_snapshot();"
+        assert body.count(capture) == 1
+        assert body.index(capture) < body.index("snapshot_exec_arguments(*parent")
+        assert "ADMITTED_CREDENTIALS, MEMORY_POLICY)" in body
+    impl = function_body(source, "wos_proc_exec_impl")
+    assert "->memory_policy_snapshot(" not in impl and ".memory_policy_snapshot(" not in impl
+    assert "[spawn_options, &PARENT_CREDENTIALS, memory_policy]" in impl
+    assert "wos_proc_exec_impl(interp, argv2, envp2, spawn_options, depth, PARENT_CREDENTIALS, memory_policy)" in " ".join(impl.split())
+    assert impl.index("new_task->publish_memory_policy_snapshot(memory_policy);") < impl.index("new_task->initialize_process_image(")
+
+    wrapper = function_body(source, "wos_proc_execve")
+    capture = "pending->memory_policy = task->memory_policy_snapshot();"
+    assert wrapper.count(capture) == 1
+    assert wrapper.index(capture) < wrapper.index("adopt_exec_arguments(*task") < wrapper.index("snapshot_exec_arguments(*task")
+    native = function_body(source, "wos_proc_execve_impl")
+    assert "->memory_policy_snapshot(" not in native and ".memory_policy_snapshot(" not in native
+    assert ".memory_policy = request->memory_policy" in native
+    assert ".memory_policy = image.memory_policy" in source  # owned PreparedNativeExecImage copy
+
+    preparation = function_body(source, "prepare_native_compartment_inputs_for_owner")
+    assert preparation.count("pending->memory_policy = executor.memory_policy_snapshot();") == 1
+    assert preparation.index("pending->memory_policy = executor.memory_policy_snapshot();") < preparation.index("adopt_exec_arguments(executor")
+    assert "&error, request->memory_policy, &guard)" in preparation
+    creation = function_body(source, "create_native_process_task_impl")
+    assert creation.index("child->publish_memory_policy_snapshot(memory_policy);") < creation.index("child->initialize_process_image(")
+
+    commit = function_body(source, "commit_native_exec_image")
+    publication = "task->publish_memory_policy_snapshot(image.memory_policy);"
+    assert commit.count(publication) == 1
+    committed = commit.index("if (commit_published)")
+    brace = commit.index("{", committed)
+    end = find_matching_brace(commit, brace)
+    assert publication in commit[brace:end]
+    assert commit.index("publish_staged_process(") < committed < commit.index(publication)
+
+
 def require_remote_exec_uses_canonical_owned_request(source: str) -> None:
     prepare = function_body(source, "prepare_remote_exec_owner")
     order = ["SharedVmemPublicationGuard", "owner.credentials() != plan.credentials", "plan.admission.begin(owner)",
@@ -917,6 +958,7 @@ def main() -> None:
     loader_source = ELF_LOADER_CPP.read_text()
     require_spawn_open_child_context(source)
     require_exec_credential_admission(source)
+    require_exec_memory_policy_capture_and_commit(source)
     require_local_exec_content_views(source)
     require_sparse_exec_reads(source)
     require_callers_use_sparse_reader(source)

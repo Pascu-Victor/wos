@@ -373,6 +373,13 @@ if(WOS_KASAN)
         )
     endforeach()
 
+    # The diagnostic walks PMM side metadata while holding every allocator
+    # lock. A first KASAN shadow touch can allocate and re-enter those locks.
+    # Keep this raw metadata reader outside KASAN, as with the allocator;
+    # retain KCFI, KUBSan and KCOV, plus instrumented Host scanner tests.
+    set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/mm/numa_balance.cpp
+        APPEND PROPERTY COMPILE_OPTIONS -fno-sanitize=kernel-address)
+
     message(STATUS "[WOS] KASan enabled (requires shadow memory setup)")
     message(STATUS "[WOS] KASan ignorelist enabled: ${KERNEL_SANITIZER_IGNORELIST}")
 endif()

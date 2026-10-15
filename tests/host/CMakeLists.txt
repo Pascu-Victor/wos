@@ -1807,6 +1807,17 @@ wos_add_unit_test(page_allocator_interval_provenance_test
 )
 target_compile_definitions(page_allocator_interval_provenance_test PRIVATE WOS_HOST_TEST=1 WOS_PHYS_ALLOC_CALLER_STATS=1)
 
+wos_add_unit_test(numa_balance_test
+    SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_balance_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/platform/mm/page_alloc.cpp
+)
+target_compile_definitions(numa_balance_test PRIVATE WOS_HOST_TEST=1)
+wos_add_unit_test(numa_balance_provenance_test
+    SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_balance_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/platform/mm/page_alloc.cpp
+)
+target_compile_definitions(numa_balance_provenance_test PRIVATE WOS_HOST_TEST=1 WOS_PHYS_ALLOC_CALLER_STATS=1)
+
 wos_add_unit_test(reclaim_policy_test
     SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/reclaim_policy_test.cpp
 )
