@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <new>
+#include <optional>
 #include <platform/acpi/apic/apic.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/init/limine_requests.hpp>
@@ -26,6 +27,7 @@
 
 #include "platform/sched/task.hpp"
 #include "platform/sys/spinlock.hpp"
+#include "platform/sys/syscall_preparation.hpp"
 
 #ifdef WOS_KASAN
 #include <sanitizer/kasan.hpp>
@@ -46,6 +48,7 @@
 #include "platform/sched/threading.hpp"
 #include "syscalls_impl/vmem/sys_vmem.hpp"
 #include "util/hcf.hpp"
+#include "vfs/fs/tmpfs.hpp"
 #include "vfs/vfs.hpp"
 
 #ifdef WOS_SELFTEST
@@ -177,6 +180,7 @@ std::atomic<bool> anonymous_swap_shrinker_registered{};
 std::atomic<bool> anonymous_swap_worker_started{};
 std::atomic<sched::task::Task*> anonymous_swap_worker_task{};
 
+auto find_user_root_control_locked(PageTable* root) -> UserRootControl*;
 auto pte_raw(const paging::PageTableEntry& entry) -> uint64_t;
 auto pte_from_raw(uint64_t raw) -> paging::PageTableEntry;
 auto is_reserved_leaf(const PageTableEntry& entry) -> bool;
@@ -715,12 +719,22 @@ auto anonymous_lazy_range_allows_fault(sched::task::Task* task, uint64_t page_va
 }
 
 auto lazy_file_range_matches(const sched::task::LazyVmemRange& lhs, const sched::task::LazyVmemRange& rhs, uint64_t page_vaddr) -> bool {
-    return (lhs.kind == sched::task::LazyVmemKind::FILE_BACKED || lhs.kind == sched::task::LazyVmemKind::NATIVE_FILE_BACKED) &&
-           lhs.kind == rhs.kind && lhs.start == rhs.start && lhs.end == rhs.end && lhs.prot == rhs.prot && lhs.flags == rhs.flags &&
-           (lhs.kind == sched::task::LazyVmemKind::NATIVE_FILE_BACKED ? lhs.lifetime == rhs.lifetime : lhs.file == rhs.file) &&
+    return sched::task::lazy_vmem_is_file(lhs) && lhs.kind == rhs.kind && lhs.start == rhs.start && lhs.end == rhs.end &&
+           lhs.prot == rhs.prot && lhs.flags == rhs.flags &&
+           (sched::task::lazy_vmem_has_lifetime(lhs) ? lhs.lifetime == rhs.lifetime : lhs.file == rhs.file) &&
            lhs.file_offset == rhs.file_offset && lhs.file_dev == rhs.file_dev && lhs.file_ino == rhs.file_ino && page_vaddr >= lhs.start &&
            page_vaddr < lhs.end;
 }
+
+auto file_binding_matches_range(const file_mapping::FileMappingBinding& binding, const sched::task::LazyVmemRange& range) -> bool {
+    if (binding.lifetime() != range.lifetime || range.start < binding.start() || range.end > binding.end() || range.start >= range.end)
+        return false;
+    uint64_t const DELTA = range.start - binding.start();
+    return binding.file_offset() <= UINT64_MAX - DELTA && range.file_offset == binding.file_offset() + DELTA;
+}
+
+auto prepare_captured_tmpfs_read_shared_page(sched::task::Task& task, const sched::task::LazyVmemRange& range, uint64_t address,
+                                             uint64_t root_incarnation, file_mapping::FileMappingBinding& binding) -> bool;
 
 #ifdef WOS_ASYNC_BLOCK_IO
 enum class LazyFileFaultDisposition : uint8_t { NOT_TRACKED, RESOLVED, PARK, FAILED };
@@ -735,6 +749,8 @@ struct LazyFileFaultWork {
     uint64_t sequence{};
     size_t access_gate{USER_PAGEMAP_ACCESS_GATE_NONE};
     bool issued{};
+    uint64_t root_incarnation{};                         // Public demand work never owns/dereferences an old root.
+    file_mapping::FileMappingBinding* demand_binding{};  // One exact SNAPSHOT, no root lease.
 };
 constexpr size_t LAZY_FILE_FAULT_CAPACITY = 64;
 std::array<LazyFileFaultWork, LAZY_FILE_FAULT_CAPACITY> lazy_file_fault_work;
@@ -775,8 +791,8 @@ auto probe_lazy_file_fault(sched::task::Task* task, uint64_t vaddr, const paging
     // fault. A kernel PROCESS fault is not a timer frame and cannot be parked
     // through that protocol. Ordinary software-prefault usercopy is unchanged.
     if (!user_frame || task->type != sched::task::TaskType::PROCESS || task->preempt_disable_depth != 0 ||
-        (snapshot.kind == sched::task::LazyVmemKind::NATIVE_FILE_BACKED ? snapshot.lifetime == nullptr : snapshot.file == nullptr) ||
-        snapshot.prot == 0 || (fault.writable != 0U && (snapshot.prot & 2U) == 0) || (fault.fetch != 0U && (snapshot.prot & 4U) == 0))
+        (sched::task::lazy_vmem_has_lifetime(snapshot) ? snapshot.lifetime == nullptr : snapshot.file == nullptr) || snapshot.prot == 0 ||
+        (fault.writable != 0U && (snapshot.prot & 2U) == 0) || (fault.fetch != 0U && (snapshot.prot & 4U) == 0))
         return LazyFileFaultDisposition::FAILED;
     if (!task->try_acquire()) return LazyFileFaultDisposition::FAILED;
     PageTable* pagemap = nullptr;
@@ -785,7 +801,7 @@ auto probe_lazy_file_fault(sched::task::Task* task, uint64_t vaddr, const paging
         return LazyFileFaultDisposition::FAILED;
     }
     size_t gate = USER_PAGEMAP_ACCESS_GATE_NONE;
-    if (!acquire_user_pagemap_access(pagemap, false, gate)) {
+    if (!acquire_user_pagemap_access(pagemap, false, gate) && snapshot.kind != sched::task::LazyVmemKind::TMPFS_READ_SHARED) {
         task->release_usercopy_pagemap();
         task->release();
         return LazyFileFaultDisposition::FAILED;
@@ -795,10 +811,13 @@ auto probe_lazy_file_fault(sched::task::Task* task, uint64_t vaddr, const paging
         task->release_usercopy_pagemap();
         task->release();
     };
-    uint64_t const PTE_FLAGS = cow_pte_lock.lock_irqsave();
-    bool const MAPPED = task->pagemap == pagemap && translate(pagemap, PAGE_VADDR) != PADDR_INVALID;
-    cow_pte_lock.unlock_irqrestore(PTE_FLAGS);
-    if (MAPPED) {
+    bool mapped = false;
+    if (gate != USER_PAGEMAP_ACCESS_GATE_NONE) {
+        uint64_t const PTE_FLAGS = cow_pte_lock.lock_irqsave();
+        mapped = task->pagemap == pagemap && translate(pagemap, PAGE_VADDR) != PADDR_INVALID;
+        cow_pte_lock.unlock_irqrestore(PTE_FLAGS);
+    }
+    if (mapped) {
         release_leases();
         return LazyFileFaultDisposition::RESOLVED;
     }
@@ -837,12 +856,29 @@ auto probe_lazy_file_fault(sched::task::Task* task, uint64_t vaddr, const paging
     // put/close from the hardware fault. retain_file is an atomic increment.
     uint64_t const RANGE_FLAGS = task->lazy_vmem_lock.lock_irqsave();
     bool current = false;
+    bool family_owned = false;
+    file_mapping::FileMappingBinding* demand_binding = nullptr;
+    uint64_t root_incarnation = 0;
     for (auto const& range : task->lazy_vmem_ranges) {
         if (task->pagemap == pagemap && lazy_file_range_matches(range, snapshot, PAGE_VADDR)) {
             snapshot = range;
-            if (snapshot.kind == sched::task::LazyVmemKind::NATIVE_FILE_BACKED)
-                current = snapshot.lifetime != nullptr && snapshot.lifetime->try_acquire(file_mapping::FamilyOwner::SNAPSHOT);
-            else {
+            if (sched::task::lazy_vmem_has_lifetime(snapshot)) {
+                current = family_owned =
+                    snapshot.lifetime != nullptr && snapshot.lifetime->try_acquire(file_mapping::FamilyOwner::SNAPSHOT);
+                if (current && snapshot.kind == sched::task::LazyVmemKind::TMPFS_READ_SHARED) {
+                    uint64_t const PIN_FLAGS = user_mapping_pin_lock.lock_irqsave();
+                    auto* control = find_user_root_control_locked(pagemap);
+                    current = control != nullptr &&
+                              file_mapping_index.retain_for_pin_locked(pagemap, control->serial, PAGE_VADDR, demand_binding) ==
+                                  file_mapping::FileMappingPinResult::ACQUIRED;
+                    if (current) {
+                        root_incarnation = control->serial;
+                        current = file_binding_matches_range(*demand_binding, snapshot) &&
+                                  demand_binding->reclassify(file_mapping::BindingOwner::PIN, file_mapping::BindingOwner::SNAPSHOT);
+                    }
+                    user_mapping_pin_lock.unlock_irqrestore(PIN_FLAGS);
+                }
+            } else {
                 ker::vfs::vfs_retain_file(snapshot.file);
                 current = true;
             }
@@ -851,8 +887,17 @@ auto probe_lazy_file_fault(sched::task::Task* task, uint64_t vaddr, const paging
     }
     if (current) {
         generation = PREVIOUS + 1;
-        lazy_file_fault_work[index] = {task, pagemap, snapshot, fault, PAGE_VADDR, generation, lazy_file_fault_next_sequence++,
-                                       gate, false};
+        if (snapshot.kind == sched::task::LazyVmemKind::TMPFS_READ_SHARED) {
+            // Make the work runnable only after both teardown-blocking leases
+            // have gone. The retained Task/family/binding are root-independent.
+            release_user_pagemap_access(gate);
+            gate = USER_PAGEMAP_ACCESS_GATE_NONE;
+            task->release_usercopy_pagemap();
+            pagemap = nullptr;
+        }
+        lazy_file_fault_work[index] = {
+            task, pagemap, snapshot,         fault,         PAGE_VADDR, generation, lazy_file_fault_next_sequence++,
+            gate, false,   root_incarnation, demand_binding};
         task->lazy_file_fault_vaddr = PAGE_VADDR;
         task->lazy_file_fault_status = 0;
         task->lazy_file_fault_generation = generation;
@@ -860,7 +905,11 @@ auto probe_lazy_file_fault(sched::task::Task* task, uint64_t vaddr, const paging
     task->lazy_vmem_lock.unlock_irqrestore(RANGE_FLAGS);
     lazy_file_fault_lock.unlock_irqrestore(flags);
     if (!current) {
-        release_leases();
+        release_user_pagemap_access(gate);
+        task->release_usercopy_pagemap();
+        if (demand_binding != nullptr) demand_binding->release(file_mapping::BindingOwner::PIN);
+        if (family_owned) snapshot.lifetime->release(file_mapping::FamilyOwner::SNAPSHOT);
+        task->release();
         return LazyFileFaultDisposition::FAILED;
     }
     wake_lazy_file_fault_worker();
@@ -886,11 +935,14 @@ auto take_lazy_file_fault(LazyFileFaultWork& work, size_t& index) -> bool {
 
 void finish_lazy_file_fault(const LazyFileFaultWork& work, size_t index, int status) {
     auto* task = work.task;
-    release_user_pagemap_access(work.access_gate);
-    task->release_usercopy_pagemap();
+    if (work.access_gate != USER_PAGEMAP_ACCESS_GATE_NONE) {
+        release_user_pagemap_access(work.access_gate);
+        task->release_usercopy_pagemap();
+    }
     // Backend close may wait for MM readers to drain. Keep the work's File and
     // Task ownership, but release finished MM leases before entering close.
-    if (work.range.kind == sched::task::LazyVmemKind::NATIVE_FILE_BACKED)
+    if (work.demand_binding != nullptr) work.demand_binding->release(file_mapping::BindingOwner::SNAPSHOT);
+    if (sched::task::lazy_vmem_has_lifetime(work.range))
         work.range.lifetime->release(file_mapping::FamilyOwner::SNAPSHOT);
     else
         ker::vfs::vfs_put_file(work.range.file);
@@ -916,9 +968,14 @@ void lazy_file_fault_worker_loop() {
 #ifdef WOS_KASAN
             if (kasan::is_enabled()) kasan::unpoison_range(&work, sizeof(work));
 #endif
-            bool const LIVE =
-                work.task->state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE && work.task->pagemap == work.pagemap;
-            bool const OK = LIVE && ker::syscall::vmem::materialize_lazy_file_page(work.task, work.range, work.vaddr, work.fault);
+            bool const DEMAND = work.range.kind == sched::task::LazyVmemKind::TMPFS_READ_SHARED;
+            bool const LIVE = work.task->state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE &&
+                              (DEMAND || work.task->pagemap == work.pagemap);
+            bool const OK =
+                LIVE && (DEMAND ? work.demand_binding != nullptr &&
+                                      prepare_captured_tmpfs_read_shared_page(*work.task, work.range, work.vaddr, work.root_incarnation,
+                                                                              *work.demand_binding)
+                                : ker::syscall::vmem::materialize_lazy_file_page(work.task, work.range, work.vaddr, work.fault));
             finish_lazy_file_fault(work, index, OK ? 0 : -EFAULT);
             continue;
         }
@@ -1003,6 +1060,12 @@ auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const pagin
         }
 
         if (sched::task::lazy_vmem_is_file(range)) {
+            // Public demand I/O has its own prepare-before-every-root-lease
+            // route. Generic fault-in can already be beneath an outer pin.
+            if (range.kind == sched::task::LazyVmemKind::TMPFS_READ_SHARED) {
+                task->lazy_vmem_lock.unlock_irqrestore(IRQF);
+                return false;
+            }
             // A range can become file-backed after the hardware fault's
             // deferred probe missed it. Never fall back to synchronous file
             // I/O from that exception context.
@@ -4483,8 +4546,7 @@ FileMappingInstallerLease::~FileMappingInstallerLease() {
 }
 
 auto FileMappingInstallerLease::acquire(sched::task::Task& task, const sched::task::LazyVmemRange& range, uint64_t address) -> bool {
-    if (binding_ != nullptr || access_gate_ != USER_PAGEMAP_ACCESS_GATE_NONE || range.kind != sched::task::LazyVmemKind::NATIVE_FILE_BACKED)
-        return false;
+    if (binding_ != nullptr || access_gate_ != USER_PAGEMAP_ACCESS_GATE_NONE || !sched::task::lazy_vmem_has_lifetime(range)) return false;
     auto* root = task.pagemap;
     if (!acquire_user_pagemap_access(root, false, access_gate_)) return false;
     uint64_t const RANGE_FLAGS = task.lazy_vmem_lock.lock_irqsave();
@@ -4496,7 +4558,7 @@ auto FileMappingInstallerLease::acquire(sched::task::Task& task, const sched::ta
         auto const RESULT = control != nullptr ? file_mapping_index.retain_for_pin_locked(root, control->serial, address, binding_)
                                                : file_mapping::FileMappingPinResult::REFUSE;
         if (RESULT == file_mapping::FileMappingPinResult::ACQUIRED) {
-            current = binding_->lifetime() == candidate.lifetime &&
+            current = file_binding_matches_range(*binding_, candidate) &&
                       binding_->reclassify(file_mapping::BindingOwner::PIN, file_mapping::BindingOwner::INSTALLER);
         }
         user_mapping_pin_lock.unlock_irqrestore(FLAGS);
@@ -4510,6 +4572,452 @@ auto FileMappingInstallerLease::acquire(sched::task::Task& task, const sched::ta
         binding_ = nullptr;
     }
     return current;
+}
+
+namespace {
+
+// Always nested inside a short PreemptGuard. Never carried across preparation,
+// backend I/O or a scheduling boundary, including Task's local root lease.
+class DemandRootAccess {
+   public:
+    explicit DemandRootAccess(sched::task::Task& task) : task_(task) {
+        local_ = task_.try_acquire_usercopy_pagemap(root_);
+        if (local_ && !acquire_user_pagemap_access(root_, false, gate_)) root_ = nullptr;
+    }
+    ~DemandRootAccess() {
+        release_user_pagemap_access(gate_);
+        if (local_) task_.release_usercopy_pagemap();
+    }
+    [[nodiscard]] auto root() const -> PageTable* { return root_; }
+    [[nodiscard]] auto reader_refused() const -> bool { return local_ && gate_ == USER_PAGEMAP_ACCESS_GATE_NONE; }
+    DemandRootAccess(const DemandRootAccess&) = delete;
+    auto operator=(const DemandRootAccess&) -> DemandRootAccess& = delete;
+
+   private:
+    sched::task::Task& task_;
+    PageTable* root_{};
+    size_t gate_{USER_PAGEMAP_ACCESS_GATE_NONE};
+    bool local_{};
+};
+
+struct DemandPageSnapshot {
+    sched::task::LazyVmemRange range{};
+    file_mapping::FileMappingLifetime* family{};
+    file_mapping::FileMappingBinding* binding{};
+    file_mapping::BindingOwner binding_role{file_mapping::BindingOwner::PIN};
+    uint64_t incarnation{};
+    bool mapped{};
+    bool retry{};
+    ~DemandPageSnapshot() {
+        if (binding != nullptr) binding->release(binding_role);
+        if (family != nullptr) family->release(file_mapping::FamilyOwner::SNAPSHOT);
+    }
+};
+
+auto capture_demand_page(sched::task::Task& task, uint64_t address, bool writable, DemandPageSnapshot& out) -> PublicReadPrepareResult {
+    sched::PreemptGuard const PREEMPT;
+    DemandRootAccess access(task);
+    auto* root = access.root();
+    if (root == nullptr) {
+        out.retry = access.reader_refused();
+        return PublicReadPrepareResult::REFUSED;
+    }
+    auto result = PublicReadPrepareResult::NOT_TRACKED;
+    uint64_t const RANGE_FLAGS = task.lazy_vmem_lock.lock_irqsave();
+    for (auto const& range : task.lazy_vmem_ranges) {
+        if (address < range.start || address >= range.end) continue;
+        if (range.kind != sched::task::LazyVmemKind::TMPFS_READ_SHARED) break;
+        result = PublicReadPrepareResult::REFUSED;
+        if (writable || range.prot != ker::abi::vmem::PROT_READ || range.flags != ker::abi::vmem::MAP_SHARED || range.lifetime == nullptr ||
+            range.lifetime->backing_mode() != file_mapping::FileMappingBackingMode::TMPFS_DEMAND_READ_SHARED)
+            break;
+        uint64_t const PIN_FLAGS = user_mapping_pin_lock.lock_irqsave();
+        auto* control = find_user_root_control_locked(root);
+        file_mapping::FileMappingBinding* binding = nullptr;
+        if (control != nullptr && file_mapping_index.retain_for_pin_locked(root, control->serial, address, binding) ==
+                                      file_mapping::FileMappingPinResult::ACQUIRED) {
+            out.binding = binding;
+            if (file_binding_matches_range(*binding, range) &&
+                binding->reclassify(file_mapping::BindingOwner::PIN, file_mapping::BindingOwner::SNAPSHOT)) {
+                out.binding_role = file_mapping::BindingOwner::SNAPSHOT;
+                if (range.lifetime->try_acquire(file_mapping::FamilyOwner::SNAPSHOT)) {
+                    out.family = range.lifetime;
+                    out.range = range;
+                    out.incarnation = control->serial;
+                    paddr_t physical = PADDR_INVALID;
+                    out.mapped = snapshot_user_page_mapping_locked(root, address, false, physical);
+                    result = PublicReadPrepareResult::READY;
+                }
+            }
+        }
+        user_mapping_pin_lock.unlock_irqrestore(PIN_FLAGS);
+        break;
+    }
+    task.lazy_vmem_lock.unlock_irqrestore(RANGE_FLAGS);
+    return result;
+}
+
+struct DemandTableSpares {
+    std::array<PageTable*, 3> pages{};
+    ~DemandTableSpares() {
+        for (auto* table : pages) {
+            if (table != nullptr && !try_release_page_table_to_pool(table, {__builtin_return_address(0), 0})) phys::page_free(table);
+        }
+    }
+    auto prepare() -> bool {
+        for (auto*& table : pages) {
+            table = alloc_zeroed_page_table(true);
+            if (table == nullptr) return false;
+        }
+        return true;
+    }
+};
+
+// cow+pin held. An absent literal-zero path is valid/cold without spares. Every
+// adopted table already owns its frame; no allocation/promotion occurs here.
+auto demand_leaf_locked(PageTable* root, uint64_t address, DemandTableSpares* spares, bool& valid, bool& changed) -> PageTableEntry* {
+    valid = false;
+    auto* table = root;
+    size_t used = 0;
+    for (int level = 4; level > 1; --level) {
+        auto& entry = entry_at(table, index_of(address, level));
+        if (!entry.present) {
+            if (pte_raw(entry) != 0) return nullptr;
+            if (spares == nullptr) {
+                valid = true;
+                return nullptr;
+            }
+            if (used == spares->pages.size()) return nullptr;
+            auto* spare = std::exchange(spares->pages.at(used++), nullptr);
+            if (spare == nullptr) return nullptr;
+            auto const physical = reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(spare)));
+            entry = paging::create_page_table_entry(physical, paging::PAGE_PRESENT | paging::PAGE_USER | paging::PAGE_WRITE);
+            table = spare;
+            changed = true;
+        } else {
+            if (entry.pagesize || !entry.user || entry.frame == 0) return nullptr;
+            table = reinterpret_cast<PageTable*>(addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT));
+            if (phys::page_kind_get(table) != PageKind::PAGE_TABLE || phys::page_ref_get(table) != 1U) return nullptr;
+        }
+    }
+    valid = true;
+    return &entry_at(table, index_of(address, 1));
+}
+
+auto prepare_captured_tmpfs_read_shared_page(sched::task::Task& task, const sched::task::LazyVmemRange& range, uint64_t address,
+                                             uint64_t root_incarnation, file_mapping::FileMappingBinding& binding) -> bool {
+    if (!sched::interrupts_enabled() || sched::preempt_count() != 0 || root_incarnation == 0 ||
+        range.kind != sched::task::LazyVmemKind::TMPFS_READ_SHARED || range.lifetime == nullptr ||
+        !file_binding_matches_range(binding, range) || range.prot != ker::abi::vmem::PROT_READ ||
+        range.flags != ker::abi::vmem::MAP_SHARED || address < range.start || address >= range.end ||
+        range.file_offset > UINT64_MAX - (address - range.start))
+        return false;
+    auto const* backing = range.lifetime->demand_read_shared_backing();
+    if (backing == nullptr || range.file_size != backing->eof()) return false;
+
+    DemandTableSpares spares;
+    if (!spares.prepare()) return false;
+    ker::vfs::tmpfs::TmpfsPageLoan loan;
+#ifdef WOS_KASAN
+    if (kasan::is_enabled()) kasan::unpoison_range(&loan, sizeof(loan));
+#endif
+    if (backing->prepare_page(range.file_offset + (address - range.start), loan) != 0) return false;
+    auto const PHYSICAL = reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(loan.frame())));
+    bool mapped = false;
+    bool installer_owned = false;
+    bool retry = false;
+    do {
+        retry = false;
+        {
+            sched::PreemptGuard const PREEMPT;
+            DemandRootAccess access(task);
+            auto* root = access.root();
+            retry = access.reader_refused();
+            if (root != nullptr && task.pagemap == root && binding.root_incarnation() == root_incarnation) {
+                bool changed = false;
+                uint64_t const COW_FLAGS = cow_pte_lock.lock_irqsave();
+                uint64_t const RANGE_FLAGS = task.lazy_vmem_lock.lock_irqsave();
+                for (auto const& candidate : task.lazy_vmem_ranges) {
+                    if (task.pagemap != root || !lazy_file_range_matches(candidate, range, address)) continue;
+                    uint64_t const PIN_FLAGS = user_mapping_pin_lock.lock_irqsave();
+                    auto* control = find_user_root_control_locked(root);
+                    if (control != nullptr && control->serial == root_incarnation &&
+                        file_mapping_index.matches_pin_locked(root, root_incarnation, address, &binding) &&
+                        find_anonymous_swap_mapping_locked(root, address) == nullptr &&
+                        binding.try_acquire(file_mapping::BindingOwner::INSTALLER)) {
+                        installer_owned = true;
+                        bool valid = false;
+                        auto* leaf = demand_leaf_locked(root, address, &spares, valid, changed);
+                        if (valid && leaf != nullptr) {
+                            uint64_t const RAW = pte_raw(*leaf);
+                            constexpr uint64_t FLAGS = paging::PAGE_PRESENT | paging::PAGE_USER | paging::PAGE_SHARED |
+                                                       paging::PAGE_WRITE_RESTRICTED | paging::PAGE_NX;
+                            if (RAW == 0) {
+                                *leaf = paging::create_page_table_entry(PHYSICAL, FLAGS);
+                                (void)loan.release_to_pte();
+                                mapped = changed = true;
+                            } else if ((RAW & (paging::PAGE_PRESENT | paging::PAGE_USER | paging::PAGE_SHARED | paging::PAGE_WRITE |
+                                               paging::PAGE_COW | paging::PAGE_WRITE_RESTRICTED | paging::PAGE_NX)) == FLAGS) {
+                                mapped = true;
+                            }
+                        }
+                    }
+                    user_mapping_pin_lock.unlock_irqrestore(PIN_FLAGS);
+                    break;
+                }
+                task.lazy_vmem_lock.unlock_irqrestore(RANGE_FLAGS);
+                cow_pte_lock.unlock_irqrestore(COW_FLAGS);
+                if (changed) flush_pagemap_after_update(root, address, true);
+            }
+        }
+        if (retry) sched::kern_yield();
+    } while (retry);
+    if (installer_owned) binding.release(file_mapping::BindingOwner::INSTALLER);
+    // Loan and unused spare owners retire only after installer/local/root leases.
+    return mapped;
+}
+
+auto current_process_root(sched::task::Task& task) -> bool {
+    return sched::can_query_current_task() && sched::get_current_task() == &task && task.type == sched::task::TaskType::PROCESS &&
+           task.state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE && task.pagemap != nullptr &&
+           task.pagemap != kernel_pagemap;
+}
+
+}  // namespace
+
+auto prepare_tmpfs_read_shared_page(sched::task::Task& task, uint64_t address, bool require_writable) -> PublicReadPrepareResult {
+    if (address >= 0x0000800000000000ULL || !task.try_acquire()) return PublicReadPrepareResult::REFUSED;
+    bool demand = false, allowed = false;
+    uint64_t const FLAGS = task.lazy_vmem_lock.lock_irqsave();
+    for (auto const& range : task.lazy_vmem_ranges) {
+        if (address < range.start || address >= range.end) continue;
+        demand = range.kind == sched::task::LazyVmemKind::TMPFS_READ_SHARED;
+        allowed = !require_writable && range.prot == ker::abi::vmem::PROT_READ;
+        break;
+    }
+    task.lazy_vmem_lock.unlock_irqrestore(FLAGS);
+    if (!demand || !allowed) {
+        task.release();
+        return demand ? PublicReadPrepareResult::REFUSED : PublicReadPrepareResult::NOT_TRACKED;
+    }
+    PublicReadPrepareResult result;
+    {
+        std::optional<sys::SyscallPreparationScope> preparation;
+        if (!sched::interrupts_enabled()) {
+            if (!sched::can_query_current_task() || sched::get_current_task() == nullptr) {
+                task.release();
+                return PublicReadPrepareResult::REFUSED;
+            }
+            preparation.emplace(*sched::get_current_task());
+            if (!preparation->ready()) {
+                task.release();
+                return PublicReadPrepareResult::REFUSED;
+            }
+        }
+        DemandPageSnapshot snapshot;
+        uint64_t const PAGE = page_align_down(address);
+        do {
+            snapshot.retry = false;
+            result = capture_demand_page(task, PAGE, require_writable, snapshot);
+            if (snapshot.retry) sched::kern_yield();
+        } while (snapshot.retry);
+        if (result == PublicReadPrepareResult::READY && !snapshot.mapped &&
+            !prepare_captured_tmpfs_read_shared_page(task, snapshot.range, PAGE, snapshot.incarnation, *snapshot.binding))
+            result = PublicReadPrepareResult::REFUSED;
+    }
+    task.release();
+    return result;
+}
+
+auto capture_user_root_incarnation(PageTable* root, uint64_t& empty) noexcept -> bool {
+    if (root == nullptr || empty != 0) return false;
+    uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
+    auto* control = find_user_root_control_locked(root);
+    if (control != nullptr) empty = control->serial;
+    user_mapping_pin_lock.unlock_irqrestore(FLAGS);
+    return empty != 0;
+}
+
+auto current_user_root_incarnation(sched::task::Task& task) -> uint64_t {
+    if (!current_process_root(task)) return 0;
+    sched::PreemptGuard const PREEMPT;
+    DemandRootAccess access(task);
+    uint64_t serial = 0;
+    if (access.root() != nullptr) (void)capture_user_root_incarnation(access.root(), serial);
+    return serial;
+}
+
+auto attach_current_file_binding(sched::task::Task& task, file_mapping::FileMappingBinding*& prepared, uint64_t start, uint64_t end,
+                                 uint64_t file_offset, uint64_t expected_serial) -> bool {
+    if (!current_process_root(task) || prepared == nullptr || expected_serial == 0) return false;
+    sched::PreemptGuard const PREEMPT;
+    DemandRootAccess access(task);
+    auto* root = access.root();
+    if (root == nullptr) return false;
+    uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
+    auto* control = find_user_root_control_locked(root);
+    bool const attached = control != nullptr && control->serial == expected_serial &&
+                          prepared->configure_unpublished(root, expected_serial, start, end, file_offset) &&
+                          file_mapping_index.attach_locked(prepared, expected_serial);
+    user_mapping_pin_lock.unlock_irqrestore(FLAGS);
+    return attached;
+}
+
+auto query_current_file_binding(sched::task::Task& task, uint64_t start, uint64_t end, file_mapping::FileMappingBinding*& owned,
+                                bool& exact) -> bool {
+    if (!current_process_root(task) || owned != nullptr) return false;
+    sched::PreemptGuard const PREEMPT;
+    DemandRootAccess access(task);
+    auto* root = access.root();
+    if (root == nullptr) return false;
+    uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
+    auto* control = find_user_root_control_locked(root);
+    bool const captured = control != nullptr && file_mapping_index.overlap_locked(root, control->serial, start, end, owned, exact);
+    user_mapping_pin_lock.unlock_irqrestore(FLAGS);
+    return captured;
+}
+
+namespace {
+
+auto demand_binding_matches_locked(PageTable* root, file_mapping::FileMappingBinding& binding, uint64_t address) -> bool {
+    auto* control = find_user_root_control_locked(root);
+    return control != nullptr && binding.root() == root && control->serial == binding.root_incarnation() &&
+           binding.lifetime()->backing_mode() == file_mapping::FileMappingBackingMode::TMPFS_DEMAND_READ_SHARED &&
+           file_mapping_index.matches_pin_locked(root, control->serial, address, &binding);
+}
+
+auto demand_leaf_valid_locked(PageTable* root, uint64_t address, PageTableEntry*& leaf) -> bool {
+    if (find_anonymous_swap_mapping_locked(root, address) != nullptr) return false;
+    bool valid = false, changed = false;
+    leaf = demand_leaf_locked(root, address, nullptr, valid, changed);
+    if (!valid || leaf == nullptr) return valid;
+    uint64_t const RAW = pte_raw(*leaf);
+    constexpr uint64_t MASK = paging::PAGE_PRESENT | paging::PAGE_SHARED | paging::PAGE_WRITE_RESTRICTED | paging::PAGE_NX |
+                              paging::PAGE_WRITE | paging::PAGE_COW;
+    constexpr uint64_t REQUIRED = paging::PAGE_PRESENT | paging::PAGE_SHARED | paging::PAGE_WRITE_RESTRICTED | paging::PAGE_NX;
+    return RAW == 0 || ((RAW & MASK) == REQUIRED && leaf->frame != 0);
+}
+
+// A complete nonmutating pass precedes the first PTE effect. The current
+// executing publisher plus caller's publication guard keep this root alive
+// between slices; this is intentionally not an arbitrary-Task/root API.
+auto preflight_current_demand_binding(sched::task::Task& task, file_mapping::FileMappingBinding& binding) -> bool {
+    if (!current_process_root(task) || task.pagemap != binding.root() || binding.start() >= binding.end()) return false;
+    for (uint64_t cursor = binding.start(); cursor < binding.end();) {
+        uint64_t const END = cursor + std::min<uint64_t>(binding.end() - cursor, 64 * paging::PAGE_SIZE);
+        bool valid = false;
+        {
+            sched::PreemptGuard const PREEMPT;
+            DemandRootAccess access(task);
+            auto* root = access.root();
+            if (root == nullptr) return false;
+            uint64_t const COW_FLAGS = cow_pte_lock.lock_irqsave();
+            uint64_t const PIN_FLAGS = user_mapping_pin_lock.lock_irqsave();
+            valid = demand_binding_matches_locked(root, binding, cursor);
+            for (uint64_t page = cursor; valid && page < END; page += paging::PAGE_SIZE) {
+                PageTableEntry* leaf = nullptr;
+                valid = demand_leaf_valid_locked(root, page, leaf);
+            }
+            user_mapping_pin_lock.unlock_irqrestore(PIN_FLAGS);
+            cow_pte_lock.unlock_irqrestore(COW_FLAGS);
+        }
+        if (!valid) return false;
+        cursor = END;
+    }
+    return true;
+}
+
+auto mutate_current_demand_binding(sched::task::Task& task, file_mapping::FileMappingBinding& binding, bool remove, uint64_t prot,
+                                   file_mapping::FileMappingTlbRetirement& retirement) -> bool {
+    if (!retirement.empty() || !current_process_root(task) || task.pagemap != binding.root() ||
+        (!remove && prot != 0 && prot != ker::abi::vmem::PROT_READ))
+        dbg::panic_handler("public TMPFS mutation entered without validated current authority");
+    for (uint64_t cursor = binding.start(); cursor < binding.end();) {
+        uint64_t const END = cursor + std::min<uint64_t>(binding.end() - cursor, 64 * paging::PAGE_SIZE);
+        std::array<PageTableEntry, 64> old{};
+        size_t count = 0;
+        bool acquired = false;
+        {
+            sched::PreemptGuard const PREEMPT;
+            DemandRootAccess access(task);
+            auto* root = access.root();
+            if (root != nullptr) {
+                acquired = true;
+                uint64_t const COW_FLAGS = cow_pte_lock.lock_irqsave();
+                uint64_t const PIN_FLAGS = user_mapping_pin_lock.lock_irqsave();
+                if (!current_process_root(task) || !demand_binding_matches_locked(root, binding, cursor))
+                    dbg::panic_handler("public TMPFS mutation lost current root/binding authority");
+                for (uint64_t page = cursor; page < END; page += paging::PAGE_SIZE) {
+                    PageTableEntry* leaf = nullptr;
+                    if (!demand_leaf_valid_locked(root, page, leaf))
+                        dbg::panic_handler("public TMPFS leaf changed after withdrawal preflight");
+                    if (leaf == nullptr || !leaf->present) continue;
+                    if (remove) {
+                        old.at(count++) = *leaf;
+                        owned_frame_untrack_leaf(root, page, *leaf);
+                        *leaf = {};
+                    } else {
+                        // Hardware can update A/D concurrently. Preserve those
+                        // bits with the actual atomic permission operation.
+                        auto* raw = reinterpret_cast<uint64_t*>(leaf);
+                        if (prot == ker::abi::vmem::PROT_READ)
+                            __atomic_fetch_or(raw, paging::PAGE_USER, __ATOMIC_ACQ_REL);
+                        else
+                            __atomic_fetch_and(raw, ~paging::PAGE_USER, __ATOMIC_ACQ_REL);
+                    }
+                }
+                user_mapping_pin_lock.unlock_irqrestore(PIN_FLAGS);
+                cow_pte_lock.unlock_irqrestore(COW_FLAGS);
+                flush_pagemap_after_update(root, 0, true);
+            }
+        }
+        if (!acquired) {
+            // Same-root fork requires publication, and current execution is a
+            // live publisher, so only an unrelated hashed exclusive can refuse.
+            // No reader survives this yield; never expose partial EAGAIN.
+            sched::kern_yield();
+            continue;
+        }
+        for (size_t i = 0; i < count; ++i) drop_present_leaf_ref(old.at(i));
+        cursor = END;
+    }
+    if (remove) {
+        bool detached = false;
+        while (!detached) {
+            {
+                sched::PreemptGuard const PREEMPT;
+                DemandRootAccess access(task);
+                auto* root = access.root();
+                if (root != nullptr) {
+                    uint64_t const PIN_FLAGS = user_mapping_pin_lock.lock_irqsave();
+                    if (!current_process_root(task) || !demand_binding_matches_locked(root, binding, binding.start()) ||
+                        !file_mapping_index.detach_locked(binding, retirement))
+                        dbg::panic_handler("public TMPFS final index retirement lost authority");
+                    user_mapping_pin_lock.unlock_irqrestore(PIN_FLAGS);
+                    flush_pagemap_after_update(root, 0, true);
+                    detached = true;
+                }
+            }
+            if (!detached) sched::kern_yield();
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+auto preflight_current_file_binding(sched::task::Task& task, file_mapping::FileMappingBinding& binding) -> bool {
+    return preflight_current_demand_binding(task, binding);
+}
+
+auto retire_current_file_binding(sched::task::Task& task, file_mapping::FileMappingBinding& binding,
+                                 file_mapping::FileMappingTlbRetirement& after_tlb) -> bool {
+    return mutate_current_demand_binding(task, binding, true, 0, after_tlb);
+}
+
+auto protect_current_file_binding(sched::task::Task& task, file_mapping::FileMappingBinding& binding, uint64_t prot) -> bool {
+    file_mapping::FileMappingTlbRetirement empty;
+    return mutate_current_demand_binding(task, binding, false, prot, empty);
 }
 
 #ifdef WOS_SELFTEST
@@ -5063,14 +5571,19 @@ auto install_lazy_file_page_if_current(sched::task::Task* task, const sched::tas
         if (!lazy_file_range_matches(candidate, range, page_vaddr)) {
             continue;
         }
-        if (candidate.kind == sched::task::LazyVmemKind::NATIVE_FILE_BACKED) {
+        // Demand canonical frames are published only by the prepared-spare
+        // consumer. This legacy mapper may allocate/promote upper tables.
+        if (candidate.kind == sched::task::LazyVmemKind::TMPFS_READ_SHARED) break;
+        if (sched::task::lazy_vmem_has_lifetime(candidate)) {
             uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
             auto* control = find_user_root_control_locked(task->pagemap);
-            bool const CURRENT = expected_binding != nullptr && control != nullptr && expected_binding->lifetime() == candidate.lifetime &&
+            bool const CURRENT = expected_binding != nullptr && control != nullptr &&
+                                 file_binding_matches_range(*expected_binding, candidate) &&
                                  file_mapping_index.matches_pin_locked(task->pagemap, control->serial, page_vaddr, expected_binding);
             user_mapping_pin_lock.unlock_irqrestore(FLAGS);
             if (!CURRENT) break;
-            if (candidate.lifetime->backing_mode() == file_mapping::FileMappingBackingMode::TMPFS_READ_SHARED) {
+            if (candidate.lifetime->backing_mode() == file_mapping::FileMappingBackingMode::TMPFS_READ_SHARED ||
+                candidate.lifetime->backing_mode() == file_mapping::FileMappingBackingMode::TMPFS_DEMAND_READ_SHARED) {
                 constexpr uint64_t REQUIRED =
                     paging::PAGE_PRESENT | paging::PAGE_USER | paging::PAGE_SHARED | paging::PAGE_WRITE_RESTRICTED | paging::PAGE_NX;
                 if (candidate.flags != ker::abi::vmem::MAP_SHARED || candidate.prot != ker::abi::vmem::PROT_READ || page_flags != REQUIRED)
@@ -8005,6 +8518,14 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
                         continue;
                     }
 
+                    // Acquire the child's actual owner before publishing its
+                    // leaf (including readonly canonical shared mappings).
+                    // Refusal must not leave an unowned PTE in fork rollback.
+                    if (!phys::page_ref_try_inc(data_virt, &ref_lookup)) {
+                        flush_pagemap_after_update(src, 0, true);
+                        return false;
+                    }
+
                     // Only writable mappings need COW. Shared read-only mappings
                     // (text/debug metadata) can stay read-only in both address
                     // spaces and simply share the backing page.
@@ -8017,9 +8538,7 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
                         dst_pml1e = src_pml1e;
                     }
 
-                    // Increment refcount on the shared data page
                     owned_frame_untrack_mapping(src, VADDR, DATA_PHYS);
-                    phys::page_ref_inc(data_virt, &ref_lookup);
                     if (is_watched_mmap_vaddr(VADDR)) {
                         log::warn("watch mmap-cow: src=%p dst=%p vaddr=0x%llx phys=0x%llx writable=%u cow=%u ref=%llu",
                                   static_cast<void*>(src), static_cast<void*>(dst), static_cast<unsigned long long>(VADDR),

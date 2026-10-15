@@ -9,7 +9,8 @@ named Host seams with independent byte/reference/quota/lifetime oracles. This
 does not qualify real MM aliases, devices, concurrency or native coherence.
 Actual write/append/copy EOF guards and complete NodeRef acquisition/cleanup
 bodies are also compiled. Owned Host inode EOF/counter-limit inputs exercise
-those guards; native backing preparation/anchors/mount graphs are separate.
+those guards. Demand backing/loan bodies are compiled against an explicit Host
+File and checked mount-pin primitive; native mount graphs/MM remain separate.
 
 The bounded process/scratch runner is shared with the actual file-registry
 regression. --tmpfs-source accepts a complete archived predecessor; --only
@@ -62,12 +63,17 @@ VECTORS = (
     "eof_write_guard", "eof_resize_guard", "eof_copy_guard",
     "checked_node_pins", "checked_alias_pins", "node_pin_real_deferred_free",
     "checked_lookup_transactions",
+    "descriptor_growth_oom", "descriptor_growth_overflow",
+    "demand_cold_extent", "demand_resident_loans", "demand_sparse_high_offset",
+    "demand_swapped_page", "demand_page_failures", "demand_admission_failures",
+    "demand_fixed_eof_guards", "demand_unlinked_cleanup",
 )
 
 LOCKS = r'''
 #pragma once
 #include <cstdint>
 #include <map>
+#include <memory>
 namespace fixture {
 inline std::map<uintptr_t, bool> locks;
 inline uint64_t destroy_held{}, invalid_unlock{}, lock_errors{}, try_attempts{};
@@ -147,6 +153,10 @@ const char* current_case = "initialization";
 uint64_t assertions{}, failures{}, allocations{}, frees{}, increments{}, decrements{}, direct_free_refused{};
 uint64_t slot_allocations{}, slot_frees{}, slot_writes{}, slot_reads{};
 bool allocation_failure{}, available = true;
+bool ref_failure{}, host_interrupts_enabled = true;
+uint32_t host_preempt_count{};
+uint64_t mount_pins{}, mount_acquires{}, mount_releases{};
+int mount_acquire_error{};
 int slot_allocate_error{}, slot_write_error{}, slot_read_error{}, slot_free_error{};
 struct Frame { uint32_t refs{1}; };
 std::map<void*, Frame> frames;
@@ -185,6 +195,9 @@ auto refs(void* page) -> uint32_t { auto it = frames.find(page); return it == fr
 // primitives. Throwing old new[] fails with defined hosted C++ semantics;
 // nothrow new[] returns null. Ledger changes are independent of TMPFS code.
 auto operator new[](size_t bytes) -> void* {
+    // Refuse malformed predecessor extents within this fixture's 64MiB budget
+    // before hosted malloc/ASan can terminate without the cleanup oracles.
+    if(bytes>64U*1024U*1024U)throw std::bad_alloc();
     if (fixture::fail_array_armed && fixture::fail_array_bytes == bytes) {
         fixture::fail_array_armed = false;
         ++fixture::array_faults;
@@ -212,8 +225,44 @@ void operator delete[](void* memory, const std::nothrow_t&) noexcept { ::operato
 // Real File layout, Task credentials/resource ownership and native close are
 // not qualified by this facade. Native tests use actual retained Files.
 namespace ker::vfs {
-struct File { void* private_data{}; FileOperations* fops{}; int open_flags{2}; FSType fs_type{FSType::TMPFS}; };
+struct MountPoint { const void* private_data{}; uint32_t pins{}; bool require_frames_empty{}; };
+struct HostFileCount {
+    int value{1};
+    auto load(std::memory_order = std::memory_order_seq_cst) const -> int {return value;}
+    void store(int next,std::memory_order = std::memory_order_seq_cst){value=next;}
+};
+struct File {
+    void* private_data{}; FileOperations* fops{}; int open_flags{2}; FSType fs_type{FSType::TMPFS};
+    HostFileCount refcount{}; bool is_directory{}; MountPoint* mount_owner{};
+    ExecReadView* exec_read_view{}; void* stream_cache_attachment{}; void* cache_notify_attachment{};
+};
 namespace tmpfs { auto get_tmpfs_fops() -> FileOperations*; }
+// Named checked mount-pin primitive, not the actual mount table/graph validator.
+NativeFileMappingMountPin::~NativeFileMappingMountPin() { reset(); }
+NativeFileMappingMountPin::NativeFileMappingMountPin(NativeFileMappingMountPin&& other) noexcept
+    : mount_(std::exchange(other.mount_,nullptr)) {}
+auto NativeFileMappingMountPin::operator=(NativeFileMappingMountPin&& other) noexcept -> NativeFileMappingMountPin& {
+    if(this!=&other){reset();mount_=std::exchange(other.mount_,nullptr);}return *this;
+}
+auto NativeFileMappingMountPin::acquire_tmpfs(File& file,const void* context,NativeFileMappingMountPin& out)->int {
+    for(auto [_,held]:fixture::locks)CHECK(!held);
+    ++fixture::mount_acquires;
+    if(fixture::mount_acquire_error)return fixture::mount_acquire_error;
+    if(!out.empty() || file.mount_owner==nullptr || file.mount_owner->private_data!=context)return -EOPNOTSUPP;
+    if(file.mount_owner->pins==UINT32_MAX)return -EOVERFLOW;
+    ++file.mount_owner->pins;++fixture::mount_pins;out.mount_=file.mount_owner;return 0;
+}
+void NativeFileMappingMountPin::reset() noexcept {
+    if(mount_==nullptr)return;
+    for(auto [_,held]:fixture::locks)CHECK(!held);
+    if(mount_->require_frames_empty)CHECK(fixture::frames.empty());
+    CHECK(mount_->pins>0 && fixture::mount_pins>0);
+    --mount_->pins;--fixture::mount_pins;++fixture::mount_releases;mount_=nullptr;
+}
+}
+namespace ker::mod::sched {
+auto interrupts_enabled()->bool{return fixture::host_interrupts_enabled;}
+auto preempt_count()->uint32_t{return fixture::host_preempt_count;}
 }
 // This test isolates pin transactions after search authorization. Credential
 // policy is an explicit Host primitive; production FileIdentity is imported.
@@ -253,6 +302,11 @@ auto page_alloc_may_fail(PhysicalPageOwner owner, uint64_t size, std::string_vie
     return p;
 }
 auto page_ref_get(void* p) -> uint32_t { return fixture::refs(p); }
+auto page_ref_try_inc(void* p) -> bool {
+    auto it=fixture::frames.find(p);
+    if(fixture::ref_failure || it==fixture::frames.end() || it->second.refs==0 || it->second.refs==UINT32_MAX)return false;
+    ++it->second.refs;++fixture::increments;return true;
+}
 void page_ref_inc(void* p) {
     auto it = fixture::frames.find(p);
     CHECK(it != fixture::frames.end() && it->second.refs != 0);
@@ -348,6 +402,7 @@ void empty_baseline() {
     CHECK(destroy_held == 0 && invalid_unlock == 0 && lock_errors == 0);
     CHECK(locks.size() == 2); // Complete actual global tree and registry mutexes.
     CHECK(arrays.empty() && array_allocations == array_frees);
+    CHECK(mount_pins==0 && mount_acquires>=mount_releases);
     for (auto [_, held] : locks) CHECK(!held);
 }
 void materialize_owner() {
@@ -851,6 +906,150 @@ void checked_lookup_transactions() {
     root.node->children[0]=nullptr;
     CHECK(lock_errors==0 && invalid_unlock==0);
 }
+void descriptor_growth_failure(bool overflow) {
+    Node f;void* frame=f.page(0,0x52);
+    auto* descriptors=f.node->pages;auto allocated=array_allocations;
+    size_t const required=overflow?SIZE_MAX/sizeof(TmpPage)+1:19;
+    if(!overflow){fail_array_bytes=required*sizeof(TmpPage);fail_array_armed=true;}
+    bool result=true,threw=false;
+    try {ker::mod::sys::MutexGuard guard(f.node->io_lock);result=ensure_page_descriptors(f.node,required);}
+    catch(const std::bad_alloc&){threw=true;++predecessor_throws;}
+    fail_array_armed=false;
+    CHECK(!result && !threw);
+    CHECK(f.node->pages==descriptors && f.node->page_count==1 && f.node->pages[0].data==frame);
+    CHECK(array_allocations==allocated && refs(frame)==1 && f.node->charged_pages==1 && f.mount.used_bytes==BS);
+    verify_bytes(frame,0x52);
+}
+#if HAS_DEMAND_BACKING
+struct Demand {
+    Node inode;
+    ker::vfs::MountPoint mounted{.private_data=&inode.mount};
+    ker::vfs::File file;
+    std::unique_ptr<TmpfsDemandReadSharedBacking> backing;
+    Demand() {
+        file.private_data=inode.node;file.fops=get_tmpfs_fops();
+        file.open_flags=ker::vfs::O_NO_CACHE;file.mount_owner=&mounted;
+    }
+    void prepare(uint64_t offset,uint64_t length) {
+        CHECK(TmpfsDemandReadSharedBacking::prepare(file,offset,length,backing)==0 && backing);
+        CHECK(inode.node->lookup_ref_count.load()==1 && inode.node->read_shared_eof_leases==1);
+        CHECK(mounted.pins==1 && mount_pins==1);
+    }
+};
+void demand_cold_extent() {
+    Demand f;f.inode.node->size=10000*BS+3;
+    f.prepare(4096*BS,5000*BS);
+    CHECK(f.backing->file_offset()==4096*BS && f.backing->length()==5000*BS);
+    CHECK(f.backing->eof()==10000*BS+3 && f.backing->object_identity()==f.inode.node->coherency.identity());
+    CHECK(f.inode.node->pages==nullptr && f.inode.node->page_count==0 && allocations==0 && arrays.empty());
+    CHECK(f.inode.mount.used_bytes==0 && f.inode.node->charged_pages==0 && slot_reads==0 && slot_writes==0);
+    f.backing.reset();CHECK(f.inode.node->lookup_ref_count.load()==0 && f.inode.node->read_shared_eof_leases==0);
+    CHECK(mount_pins==0 && mount_acquires==mount_releases);
+}
+void demand_resident_loans() {
+    Demand f;f.inode.node->size=BS;void* frame=f.inode.page(0,0x64);f.prepare(0,BS);
+    TmpfsPageLoan first,second;
+    CHECK(f.backing->prepare_page(0,first)==0 && first.frame()==frame && refs(frame)==2);
+    CHECK(first.object_identity()==f.backing->object_identity() && first.file_offset()==0 && first.eof()==BS);
+    CHECK(f.backing->prepare_page(0,second)==0 && second.frame()==frame && refs(frame)==3);
+    TmpfsPageLoan moved(std::move(first));CHECK(first.frame()==nullptr && first.eof()==0 && moved.frame()==frame);
+    second=std::move(moved);CHECK(moved.frame()==nullptr && second.frame()==frame && refs(frame)==2);
+    {ker::mod::sys::MutexGuard guard(f.inode.node->io_lock);CHECK(evict_page_locked(f.inode.node,0)==-EAGAIN);}
+    CHECK(slot_allocations==0 && slot_writes==0);verify_bytes(second.frame(),0x64);
+    void* pte_owner=second.release_to_pte();CHECK(second.frame()==nullptr && refs(pte_owner)==2);
+    f.backing.reset();CHECK(refs(pte_owner)==2 && mount_pins==0);
+    CHECK(phys::page_ref_dec(pte_owner)==1);
+}
+void demand_sparse_high_offset() {
+    Demand f;f.inode.node->size=5001*BS;f.inode.mount.max_bytes=BS;f.prepare(4999*BS,2*BS);
+    TmpfsPageLoan loan;CHECK(f.backing->prepare_page(5000*BS,loan)==0 && loan.frame()!=nullptr);
+    CHECK(f.inode.node->page_count==5001 && f.inode.node->charged_pages==1 && f.inode.mount.used_bytes==BS);
+    CHECK(f.inode.node->pages[4999].state==TmpPageState::HOLE && refs(loan.frame())==2);
+    for(size_t i=0;i<BS;++i)CHECK(static_cast<unsigned char*>(loan.frame())[i]==0);
+    TmpfsPageLoan denied;CHECK(f.backing->prepare_page(4999*BS,denied)==-ENOSPC && denied.frame()==nullptr);
+    CHECK(f.inode.node->charged_pages==1 && f.inode.mount.used_bytes==BS && refs(loan.frame())==2);
+}
+void demand_swapped_page() {
+    Demand f;f.inode.node->size=BS;f.inode.page(0,0x75);
+    {ker::mod::sys::MutexGuard guard(f.inode.node->io_lock);CHECK(evict_page_locked(f.inode.node,0)==0);}
+    f.prepare(0,BS);TmpfsPageLoan loan;auto slot=f.inode.node->pages[0].swap_slot;
+    slot_read_error=-EIO;CHECK(f.backing->prepare_page(0,loan)==-EIO && loan.frame()==nullptr);
+    CHECK(f.inode.node->pages[0].state==TmpPageState::SWAPPED && slots.contains(slot.index) && frames.empty());
+    slot_read_error=0;slot_free_error=-EIO;
+    CHECK(f.backing->prepare_page(0,loan)==-EIO && loan.frame()==nullptr);
+    CHECK(f.inode.node->pages[0].state==TmpPageState::SWAPPED && slots.contains(slot.index) && frames.empty());
+    slot_free_error=0;CHECK(f.backing->prepare_page(0,loan)==0 && loan.frame()!=nullptr);
+    CHECK(slots.empty() && refs(loan.frame())==2 && f.inode.node->charged_pages==1);
+    verify_bytes(loan.frame(),0x75);
+}
+void demand_page_failures() {
+    Demand f;f.inode.node->size=4*BS;f.prepare(0,4*BS);TmpfsPageLoan loan;
+    fail_array_bytes=4*sizeof(TmpPage);fail_array_armed=true;
+    CHECK(f.backing->prepare_page(3*BS,loan)==-ENOMEM && loan.frame()==nullptr);
+    CHECK(!fail_array_armed && f.inode.node->page_count==0 && arrays.empty() && allocations==0);
+    allocation_failure=true;CHECK(f.backing->prepare_page(3*BS,loan)==-ENOSPC && loan.frame()==nullptr);
+    allocation_failure=false;CHECK(f.inode.node->page_count==4 && f.inode.node->charged_pages==0 && frames.empty());
+    ref_failure=true;CHECK(f.backing->prepare_page(3*BS,loan)==-EOVERFLOW && loan.frame()==nullptr);
+    ref_failure=false;CHECK(f.inode.node->charged_pages==1 && refs(f.inode.node->pages[3].data)==1);
+    CHECK(f.backing->prepare_page(3*BS,loan)==0 && refs(loan.frame())==2);
+    auto alloc=allocations,reads=slot_reads,arr=array_allocations;void* frame=loan.frame();
+    CHECK(f.backing->prepare_page(3*BS,loan)==-EINVAL && loan.frame()==frame && refs(frame)==2);
+    loan.reset();CHECK(refs(frame)==1);
+    CHECK(f.backing->prepare_page(1,loan)==-EINVAL && f.backing->prepare_page(4*BS,loan)==-EINVAL);
+    host_interrupts_enabled=false;CHECK(f.backing->prepare_page(3*BS,loan)==-EWOULDBLOCK);host_interrupts_enabled=true;
+    host_preempt_count=1;CHECK(f.backing->prepare_page(3*BS,loan)==-EWOULDBLOCK);host_preempt_count=0;
+    CHECK(loan.frame()==nullptr && allocations==alloc && slot_reads==reads && array_allocations==arr);
+}
+void demand_admission_failures() {
+    Demand f;f.inode.node->size=BS;
+    auto denied=[&](int expected){
+        CHECK(TmpfsDemandReadSharedBacking::prepare(f.file,0,2*BS,f.backing)==expected && !f.backing);
+        CHECK(f.inode.node->lookup_ref_count.load()==0 && f.inode.node->read_shared_eof_leases==0 && mount_pins==0);
+    };
+    f.file.open_flags=0;denied(-EOPNOTSUPP);f.file.open_flags=ker::vfs::O_NO_CACHE|1;denied(-EBADF);
+    f.file.open_flags=ker::vfs::O_NO_CACHE;f.file.refcount.store(0);denied(-EBADF);f.file.refcount.store(1);
+    f.file.stream_cache_attachment=&f;denied(-EOPNOTSUPP);f.file.stream_cache_attachment=nullptr;
+    f.file.mount_owner=nullptr;denied(-EOPNOTSUPP);f.file.mount_owner=&f.mounted;
+    ker::vfs::ExecReadView view;f.file.exec_read_view=&view;denied(-ETXTBSY);f.file.exec_read_view=nullptr;
+    f.inode.node->exec_content.readers=1;denied(-ETXTBSY);f.inode.node->exec_content.readers=0;
+    f.inode.node->lookup_ref_count.store(UINT32_MAX);
+    CHECK(TmpfsDemandReadSharedBacking::prepare(f.file,0,BS,f.backing)==-EOVERFLOW && !f.backing);
+    CHECK(f.inode.node->lookup_ref_count.load()==UINT32_MAX && mount_pins==0);f.inode.node->lookup_ref_count.store(0);
+    f.inode.node->read_shared_eof_leases=UINT64_MAX;
+    CHECK(TmpfsDemandReadSharedBacking::prepare(f.file,0,BS,f.backing)==-EOVERFLOW && !f.backing);
+    CHECK(f.inode.node->read_shared_eof_leases==UINT64_MAX && f.inode.node->lookup_ref_count.load()==0 && mount_pins==0);
+    f.inode.node->read_shared_eof_leases=0;mount_acquire_error=-EAGAIN;denied(-EAGAIN);mount_acquire_error=0;
+    host_interrupts_enabled=false;denied(-EWOULDBLOCK);host_interrupts_enabled=true;
+    host_preempt_count=1;denied(-EWOULDBLOCK);host_preempt_count=0;
+    CHECK(TmpfsDemandReadSharedBacking::prepare(f.file,1,BS,f.backing)==-EINVAL);
+    CHECK(TmpfsDemandReadSharedBacking::prepare(f.file,0,0,f.backing)==-EINVAL);
+    CHECK(TmpfsDemandReadSharedBacking::prepare(f.file,INT64_MAX-4095,2*BS,f.backing)==-EINVAL);
+    f.prepare(0,2*BS);TmpfsPageLoan loan;CHECK(f.backing->prepare_page(BS,loan)==-EFAULT && !loan.frame());
+    auto* old=f.backing.get();CHECK(TmpfsDemandReadSharedBacking::prepare(f.file,0,BS,f.backing)==-EINVAL && f.backing.get()==old);
+    CHECK(allocations==0 && arrays.empty() && slot_reads==0 && slot_writes==0);
+}
+void demand_fixed_eof_guards() {
+    Demand f;f.inode.node->size=BS;void* frame=f.inode.page(0,0x35);f.prepare(0,2*BS);
+    TmpfsPageLoan loan;CHECK(f.backing->prepare_page(0,loan)==0);
+    std::array<unsigned char,3> bytes{0x22,0x56,0x76};
+    CHECK(tmpfs_write(&f.file,bytes.data(),bytes.size(),17)==3);
+    CHECK(std::memcmp(static_cast<unsigned char*>(loan.frame())+17,bytes.data(),bytes.size())==0);
+    Node source;source.node->size=BS;source.page(0,0x38);
+    auto before=resize_snapshot(f.inode);
+    CHECK(tmpfs_write(&f.file,bytes.data(),bytes.size(),BS)==-EBUSY);
+    CHECK(truncate(f.file,BS+1)==-EBUSY && truncate(f.file,BS-1)==-EBUSY);
+    CHECK(tmpfs_copy_file_contents(f.inode.node,source.node)==-EBUSY);unchanged_eof(f.inode,before);
+    f.backing.reset();CHECK(f.inode.node->read_shared_eof_leases==0 && refs(frame)==2);
+    CHECK(truncate(f.file,BS-1)==0 && loan.eof()==BS && loan.frame()==frame);
+}
+void demand_unlinked_cleanup() {
+    Demand f;f.inode.node->size=BS;f.inode.page(0,0x46);f.prepare(0,BS);
+    f.inode.node->unlinked=true;f.inode.node->link_count.store(0);f.mounted.require_frames_empty=true;
+    f.inode.dispose();CHECK(frames.size()==1 && f.inode.mount.used_bytes==BS && mount_pins==1);
+    f.backing.reset();CHECK(frames.empty() && f.inode.mount.used_bytes==0 && tmpfs_nodes.size()==0 && mount_pins==0);
+    CHECK(mount_acquires==mount_releases && invalid_unlock==0 && destroy_held==0);
+}
+#endif
 }
 int main(int argc, char** argv) {
     using namespace fixture;
@@ -893,6 +1092,18 @@ int main(int argc, char** argv) {
     else if (name == "checked_alias_pins") checked_alias_pins();
     else if (name == "node_pin_real_deferred_free") node_pin_real_deferred_free();
     else if (name == "checked_lookup_transactions") checked_lookup_transactions();
+    else if (name == "descriptor_growth_oom") descriptor_growth_failure(false);
+    else if (name == "descriptor_growth_overflow") descriptor_growth_failure(true);
+#if HAS_DEMAND_BACKING
+    else if (name == "demand_cold_extent") demand_cold_extent();
+    else if (name == "demand_resident_loans") demand_resident_loans();
+    else if (name == "demand_sparse_high_offset") demand_sparse_high_offset();
+    else if (name == "demand_swapped_page") demand_swapped_page();
+    else if (name == "demand_page_failures") demand_page_failures();
+    else if (name == "demand_admission_failures") demand_admission_failures();
+    else if (name == "demand_fixed_eof_guards") demand_fixed_eof_guards();
+    else if (name == "demand_unlinked_cleanup") demand_unlinked_cleanup();
+#endif
     else return 2;
     empty_baseline();
     std::printf("%s case=%s assertions=%llu failures=%llu frames=%zu slots=%zu resident=%llu registry=%zu destroy_held=%llu invalid_unlock=%llu real_tmpfs=1 real_smallvec=1\n",
@@ -928,7 +1139,8 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
         path = include / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
-    types = ["#pragma once\n#include <cstdint>\n#include <cstddef>\nnamespace ker::mod::security { class Snapshot; }\n"]
+    types = ["#pragma once\n#include <cstdint>\n#include <cstddef>\nnamespace ker::mod::security { class Snapshot; }\n"
+             "namespace ker::vfs { struct File; struct MountPoint; }\n"]
     paging = KERN / "platform/mm/paging.hpp"
     lines = [line for line in paging.read_text().splitlines() if line.startswith("constexpr uint64_t PAGE_SIZE =")]
     if len(lines) != 1:
@@ -940,18 +1152,21 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
         (KERN / "platform/mm/page_alloc.hpp", "ker::mod::mm", ["enum class PhysicalPageOwner : uint8_t {"]),
         (KERN / "platform/mm/swap.hpp", "ker::mod::mm::swap", ["struct SwapSlot {", "constexpr auto invalid_slot()", "constexpr auto slot_valid("]),
         (KERN / "vfs/file.hpp", "ker::vfs", ["enum class FSType : uint8_t {"]),
+        (KERN / "vfs/mount.hpp", "ker::vfs", ["class NativeFileMappingMountPin {"]),
         (KERN / "platform/security/file_policy.hpp", "ker::mod::security", ["struct FileIdentity {"]),
-        (HEADER, "ker::vfs::tmpfs", ["enum class TmpNodeType : uint8_t {", "enum class TmpPageState : uint8_t {", "struct TmpPage {", "struct TmpNode {", "struct TmpfsMount {", "class TmpfsNodeRef {", "class TmpfsLookupHandle {", "struct TmpfsResizeDescriptorObservation {"]),
+        (HEADER, "ker::vfs::tmpfs", ["enum class TmpNodeType : uint8_t {", "enum class TmpPageState : uint8_t {", "struct TmpPage {", "struct TmpNode {", "struct TmpfsMount {", "class TmpfsNodeRef {", "class TmpfsPageLoan {", "class TmpfsDemandReadSharedBacking {", "class TmpfsLookupHandle {", "struct TmpfsResizeDescriptorObservation {"]),
     ):
         text = path.read_text()
         types.append(f"namespace {namespace} {{\n")
-        if namespace == "ker::vfs":
-            values = [line for line in text.splitlines() if line.startswith("constexpr unsigned FILE_ACCESS_SEARCH_ONLY =")]
-            if len(values) != 1:
-                raise ValueError("unique actual FILE_ACCESS_SEARCH_ONLY declaration unavailable")
-            types.append(values[0] + "\n")
-            actual.append({"source": str(path), "name": "FILE_ACCESS_SEARCH_ONLY", "bytes": len(values[0].encode()),
-                           "sha256": hashlib.sha256(values[0].encode()).hexdigest()})
+        if path == KERN / "vfs/file.hpp":
+            for prefix in ("constexpr unsigned FILE_ACCESS_SEARCH_ONLY =", "constexpr int O_NO_CACHE =",
+                           "constexpr int O_ALWAYS_CACHE =", "constexpr int O_NOTIFY_CACHE_CHANGE ="):
+                values = [line for line in text.splitlines() if line.startswith(prefix)]
+                if len(values) != 1:
+                    raise ValueError(f"unique actual {prefix} declaration unavailable")
+                types.append(values[0] + "\n")
+                actual.append({"source": str(path), "name": prefix, "bytes": len(values[0].encode()),
+                               "sha256": hashlib.sha256(values[0].encode()).hexdigest()})
         if namespace == "ker::vfs::tmpfs":
             names = [line for line in text.splitlines() if line.startswith("constexpr size_t TMPFS_NAME_MAX =")]
             if len(names) != 1:
@@ -1023,6 +1238,16 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
         actual.append({"source": str(selected), **row})
         chunks.append(f'#line {row["line"]} "actual-selected-tmpfs.cpp"\n' + body + "\n")
     chunks.append("auto get_tmpfs_fops() -> FileOperations* { static FileOperations table{}; table.vfs_truncate=tmpfs_fops_truncate; return &table; }\n")
+    current_demand = "auto TmpfsDemandReadSharedBacking::prepare(" in source
+    if current_demand:
+        for anchor in ("TmpfsPageLoan::TmpfsPageLoan(", "auto TmpfsPageLoan::operator=(", "TmpfsPageLoan::~TmpfsPageLoan(",
+                       "auto TmpfsPageLoan::release_to_pte(", "void TmpfsPageLoan::reset(",
+                       "TmpfsDemandReadSharedBacking::~TmpfsDemandReadSharedBacking(",
+                       "auto TmpfsDemandReadSharedBacking::prepare(", "auto TmpfsDemandReadSharedBacking::prepare_page("):
+            body, row = runner.capture(source, anchor)
+            actual.append({"source": str(selected), **row})
+            chunks.append(f'#line {row["line"]} "actual-selected-tmpfs.cpp"\n' + body + "\n")
+    chunks.append(f"#define HAS_DEMAND_BACKING {int(current_demand)}\n")
     chunks.append(f"#define HAS_NATIVE_RESIZE_PORT {int(current_port)}\n")
     chunks.extend(["}\n", '#line 1 "independent-tmpfs-fixture-oracles"\n', CASES])
     (scratch / "harness.cpp").write_text("\n".join(chunks))
@@ -1081,7 +1306,7 @@ def main() -> int:
                 raise ValueError("--evidence-dir needs an existing canonical parent and a fresh exclusive directory")
             evidence.mkdir(mode=0o700)
         watched = [selected, HEADER, KERN / "platform/mm/page_alloc.hpp", KERN / "platform/mm/swap.hpp", KERN / "platform/mm/paging.hpp",
-                   KERN / "vfs/file.hpp", KERN / "platform/security/file_policy.hpp", KERN / "platform/sched/file_growth.cpp", KERN / "platform/sched/resource_model.hpp",
+                   KERN / "vfs/file.hpp", KERN / "vfs/mount.hpp", KERN / "platform/security/file_policy.hpp", KERN / "platform/sched/file_growth.cpp", KERN / "platform/sched/resource_model.hpp",
                    *(KERN / name for name in REAL_HEADERS), RUNNER, Path(__file__).resolve(), compiler]
         before = [runner.pin(path) for path in watched]
         runner_pin = runner.pin(RUNNER)
@@ -1095,8 +1320,9 @@ def main() -> int:
                                      "Host protected still-owned target memory", "Host memory policy reports total bytes zero"]
         result["primitive_seams"].extend(["Host File facade/operations table; not real native File layout or lifetime",
                                           "Host FileGrowth owner capture/destruction; actual allow_resize/committed bodies",
-                                          "Host throwing/nothrow array allocation ledger and scoped failure", "Host epoch clock"])
-        result["primitive_seams"].append("Owned Host inode EOF interval and lookup counter exhaustion inputs; not native backing prepare")
+                                          "Host throwing/nothrow array allocation ledger, 64MiB per-array ceiling and scoped failure", "Host epoch clock"])
+        result["primitive_seams"].append("Owned Host inode EOF interval and lookup counter exhaustion inputs")
+        result["primitive_seams"].append("Host checked mount-pin and IF/preempt primitives; actual demand preparation/loan bodies, no native mount graph or MM qualification")
         result["primitive_seams"].append("Always-admitted Host search credentials; actual FileIdentity/lookup transaction, not security policy qualification")
         runner.subreaper()
         scratch = Path(tempfile.mkdtemp(prefix="wos-tmpfs-ownership-", dir="/tmp"))

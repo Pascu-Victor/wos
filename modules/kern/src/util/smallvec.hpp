@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <new>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <util/hcf.hpp>
@@ -149,18 +150,34 @@ class SmallVec {
 
     // Append element. Returns false on OOM (element NOT added).
     [[nodiscard]] auto push_back(const T& val) -> bool {
-        if (m_size < InlineN) {
-            *std::next(m_inline.begin(), static_cast<ptrdiff_t>(m_size)) = val;
-            m_size++;
-            return true;
-        }
-        // Need heap
-        if (m_size >= m_capacity) {
+        if (m_size >= capacity()) {
             if (!grow()) {
                 return false;
             }
         }
-        *std::next(m_heap, static_cast<ptrdiff_t>(m_size - InlineN)) = val;
+        return push_back_no_grow(val);
+    }
+
+    // Reservation is ordinary allocation context; refusal leaves all storage
+    // and elements intact. Publication can then use no-growth appends.
+    [[nodiscard]] auto reserve(size_t total) -> bool {
+        if (total <= capacity()) return true;
+        constexpr size_t MAX_ELEMENTS = static_cast<size_t>(std::numeric_limits<ptrdiff_t>::max()) / sizeof(T);
+        if (total > MAX_ELEMENTS || total < InlineN) return false;
+        size_t const HEAP_CAPACITY = total - InlineN;
+        auto* replacement = new (std::nothrow) T[HEAP_CAPACITY];
+        if (replacement == nullptr) return false;
+        if (m_size > InlineN) std::copy_n(m_heap, m_size - InlineN, replacement);
+        delete[] m_heap;
+        m_heap = replacement;
+        m_capacity = HEAP_CAPACITY;
+        return true;
+    }
+
+    // No allocator, destruction or capacity mutation, including on refusal.
+    [[nodiscard]] auto push_back_no_grow(const T& val) -> bool {
+        if (m_size >= capacity()) return false;
+        at_mut(m_size) = val;
         m_size++;
         return true;
     }
@@ -287,21 +304,11 @@ class SmallVec {
     }
 
     [[nodiscard]] auto grow() -> bool {
-        size_t const NEW_CAP = m_capacity == 0 ? InlineN : m_capacity * 2;
-        auto* new_buf = new (std::nothrow) T[NEW_CAP];
-        if (new_buf == nullptr) {
-            return false;  // OOM
-        }
-
-        // Copy existing heap elements
-        if (m_heap && m_capacity > 0) {
-            size_t const HEAP_USED = m_size - InlineN;
-            std::copy_n(m_heap, HEAP_USED, new_buf);
-            delete[] m_heap;
-        }
-        m_heap = new_buf;
-        m_capacity = NEW_CAP;
-        return true;
+        constexpr size_t MAX_ELEMENTS = static_cast<size_t>(std::numeric_limits<ptrdiff_t>::max()) / sizeof(T);
+        size_t const CURRENT = capacity();
+        if (CURRENT >= MAX_ELEMENTS) return false;
+        size_t const NEXT = CURRENT > MAX_ELEMENTS / 2 ? MAX_ELEMENTS : (CURRENT == 0 ? 1 : CURRENT * 2);
+        return reserve(NEXT);
     }
 
     void move_from(SmallVec& other) {

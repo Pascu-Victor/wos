@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <climits>
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>
@@ -9573,6 +9574,29 @@ auto vfs_get_file_retain(ker::mod::sched::task::Task* task, int fd) -> File* {
     file->refcount.fetch_add(1, std::memory_order_acq_rel);
     table_task->fd_table_lock.unlock_irqrestore(IRQF);
     return file;
+}
+
+auto vfs_try_retain_file(File* file) noexcept -> bool {
+    if (file == nullptr) return false;
+    int refs = file->refcount.load(std::memory_order_relaxed);
+    while (refs > 0 && refs < INT_MAX) {
+        if (file->refcount.compare_exchange_weak(refs, refs + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) return true;
+    }
+    return false;
+}
+
+auto vfs_get_file_retain_checked(ker::mod::sched::task::Task* task, int fd, File*& empty) -> int {
+    if (empty != nullptr) return -EINVAL;
+    if (task == nullptr || fd < 0) return -EBADF;
+    auto fd_owner = fd_table_task_for(task);
+    auto* table_task = fd_owner.task;
+    if (table_task == nullptr) return -EBADF;
+    uint64_t const IRQF = table_task->fd_table_lock.lock_irqsave();
+    auto* file = reinterpret_cast<File*>(table_task->fd_table.lookup(static_cast<uint64_t>(fd)));
+    int const RESULT = file == nullptr ? -EBADF : (vfs_try_retain_file(file) ? 0 : -EOVERFLOW);
+    if (RESULT == 0) empty = file;
+    table_task->fd_table_lock.unlock_irqrestore(IRQF);
+    return RESULT;
 }
 
 auto vfs_put_file_result(File* f) -> int {

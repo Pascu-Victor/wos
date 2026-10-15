@@ -51,6 +51,31 @@ class FileMappingInstallerLease {
     size_t access_gate_{static_cast<size_t>(-1)};
 };
 
+enum class PublicReadPrepareResult : uint8_t { NOT_TRACKED, READY, REFUSED };
+// Ordinary pre-pin preparation only. No caller-owned root/pin/publication guard
+// may span this potentially blocking demand backing operation.
+[[nodiscard]] auto prepare_tmpfs_read_shared_page(sched::task::Task& task, uint64_t address, bool require_writable = false)
+    -> PublicReadPrepareResult;
+// Scalar lookup only: no root dereference or root lifetime acquisition. Caller
+// holds actual Task/publication authority, or treats root only as an identity.
+[[nodiscard]] auto capture_user_root_incarnation(PageTable* root, uint64_t& empty) noexcept -> bool;
+[[nodiscard]] auto current_user_root_incarnation(sched::task::Task& task) -> uint64_t;
+// Caller holds publication and the staged final cold-VA/lazy-row transaction.
+[[nodiscard]] auto attach_current_file_binding(sched::task::Task& task, file_mapping::FileMappingBinding*& prepared, uint64_t start,
+                                               uint64_t end, uint64_t file_offset, uint64_t expected_serial) -> bool;
+[[nodiscard]] auto query_current_file_binding(sched::task::Task& task, uint64_t start, uint64_t end,
+                                              file_mapping::FileMappingBinding*& owned, bool& exact) -> bool;
+// Exact current ACTIVE process only; publication remains held by caller.
+// Preflight BEFORE changing any mirrored row; refusal has no metadata effects.
+[[nodiscard]] auto preflight_current_file_binding(sched::task::Task& task, file_mapping::FileMappingBinding& binding) -> bool;
+// Final operations follow successful preflight plus infallible mirrored-row
+// withdrawal/rewrite. Contention retries; broken premises panic, never EAGAIN.
+// Caller owns binding SNAPSHOT. after_tlb starts empty and must be released
+// outside publication after successful retirement; its actual ACK is complete.
+[[nodiscard]] auto retire_current_file_binding(sched::task::Task& task, file_mapping::FileMappingBinding& binding,
+                                               file_mapping::FileMappingTlbRetirement& after_tlb) -> bool;
+[[nodiscard]] auto protect_current_file_binding(sched::task::Task& task, file_mapping::FileMappingBinding& binding, uint64_t prot) -> bool;
+
 [[nodiscard]] auto attach_unpublished_file_binding(file_mapping::FileMappingBinding*& prepared, PageTable* root, uint64_t start,
                                                    uint64_t end, uint64_t file_offset) -> bool;
 // Caller owns the unpublished root. Bounded nonwaiting observation of all 256

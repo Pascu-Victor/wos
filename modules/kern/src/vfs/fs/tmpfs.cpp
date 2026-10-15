@@ -332,7 +332,10 @@ auto ensure_page_descriptors(TmpNode* node, size_t required_pages) -> bool {
     if (node == nullptr || required_pages <= node->page_count) {
         return true;
     }
-    auto* pages = new TmpPage[required_pages];
+    if (required_pages > SIZE_MAX / sizeof(TmpPage)) {
+        return false;
+    }
+    auto* pages = new (std::nothrow) TmpPage[required_pages];
     if (pages == nullptr) {
         return false;
     }
@@ -1307,6 +1310,94 @@ auto TmpfsReadSharedBacking::loan_page(uint64_t absolute_aligned_offset, TmpfsPa
     empty.file_offset_ = absolute_aligned_offset;
     empty.eof_ = eof_;
     return true;
+}
+
+TmpfsDemandReadSharedBacking::~TmpfsDemandReadSharedBacking() {
+    if (eof_lease_) {
+        auto* node = node_.get();
+        if (node == nullptr) __builtin_trap();
+        ker::mod::sys::MutexGuard guard(node->io_lock);
+        if (node->read_shared_eof_leases == 0) __builtin_trap();
+        --node->read_shared_eof_leases;
+        eof_lease_ = false;
+    }
+    // The family's File put has returned before these owners retire. A node
+    // reset can reclaim its canonical pages, so keep mount accounting last.
+    node_.reset();
+    mount_pin_.reset();
+}
+
+auto TmpfsDemandReadSharedBacking::prepare(File& file, uint64_t file_offset, uint64_t length,
+                                           std::unique_ptr<TmpfsDemandReadSharedBacking>& empty) -> int {
+    constexpr uint64_t PAGE = DEFAULT_TMPFS_BLOCK_SIZE;
+    if (empty != nullptr || length == 0 || file_offset % PAGE != 0 || length % PAGE != 0 ||
+        file_offset > static_cast<uint64_t>(INT64_MAX) || length - 1 > static_cast<uint64_t>(INT64_MAX) - file_offset)
+        return -EINVAL;
+    if (!ker::mod::sched::interrupts_enabled() || ker::mod::sched::preempt_count() != 0) return -EWOULDBLOCK;
+    if (file.fs_type != FSType::TMPFS || file.fops != get_tmpfs_fops() || file.is_directory || file.private_data == nullptr ||
+        file.mount_owner == nullptr || (file.open_flags & O_NO_CACHE) == 0 ||
+        (file.open_flags & (O_ALWAYS_CACHE | O_NOTIFY_CACHE_CHANGE)) != 0 || file.stream_cache_attachment != nullptr ||
+        file.cache_notify_attachment != nullptr)
+        return -EOPNOTSUPP;
+    if (file.refcount.load(std::memory_order_acquire) <= 0 || (static_cast<unsigned>(file.open_flags) & 3U) == 1U ||
+        (static_cast<unsigned>(file.open_flags) & 3U) == FILE_ACCESS_SEARCH_ONLY)
+        return -EBADF;
+    if (file.exec_read_view != nullptr) return -ETXTBSY;
+
+    TmpNode* canonical = nullptr;
+    TmpfsMount* context = nullptr;
+    {
+        ker::mod::sys::MutexGuard tree_guard(tmpfs_lock);
+        canonical = tmpfs_canonical_node(static_cast<TmpNode*>(file.private_data));
+        if (canonical == nullptr || canonical->type != TmpNodeType::FILE || canonical->mount == nullptr) return -EOPNOTSUPP;
+        context = canonical->mount;
+    }
+    std::unique_ptr<TmpfsDemandReadSharedBacking> prepared(new (std::nothrow) TmpfsDemandReadSharedBacking{});
+    if (prepared == nullptr) return -ENOMEM;
+    int const MOUNT = NativeFileMappingMountPin::acquire_tmpfs(file, context, prepared->mount_pin_);
+    if (MOUNT != 0) return MOUNT;
+    {
+        ker::mod::sys::MutexGuard tree_guard(tmpfs_lock);
+        if (tmpfs_canonical_node(static_cast<TmpNode*>(file.private_data)) != canonical || canonical->mount != context) return -ESTALE;
+        prepared->node_ = TmpfsNodeRef::acquire_locked(canonical);
+        if (!prepared->node_) return -EOVERFLOW;
+    }
+    {
+        ker::mod::sys::MutexGuard io_guard(canonical->io_lock);
+        if (canonical->size > static_cast<uint64_t>(INT64_MAX)) return -EFBIG;
+        if (!canonical->exec_content.can_mutate()) return -ETXTBSY;
+        uint64_t const ID = canonical->coherency.identity();
+        if (ID == 0 || canonical->read_shared_eof_leases == UINT64_MAX) return -EOVERFLOW;
+        prepared->object_identity_ = ID;
+        prepared->eof_ = canonical->size;
+        prepared->file_offset_ = file_offset;
+        prepared->length_ = length;
+        ++canonical->read_shared_eof_leases;
+        prepared->eof_lease_ = true;
+    }
+    empty = std::move(prepared);
+    return 0;
+}
+
+auto TmpfsDemandReadSharedBacking::prepare_page(uint64_t absolute_aligned_offset, TmpfsPageLoan& empty) const -> int {
+    constexpr uint64_t PAGE = DEFAULT_TMPFS_BLOCK_SIZE;
+    if (empty.frame_ != nullptr || absolute_aligned_offset % PAGE != 0 || absolute_aligned_offset < file_offset_ ||
+        absolute_aligned_offset - file_offset_ >= length_)
+        return -EINVAL;
+    if (absolute_aligned_offset >= eof_) return -EFAULT;
+    if (!ker::mod::sched::interrupts_enabled() || ker::mod::sched::preempt_count() != 0) return -EWOULDBLOCK;
+    auto* node = node_.get();
+    if (node == nullptr || !eof_lease_) return -ESTALE;
+    ker::mod::sys::MutexGuard io_guard(node->io_lock);
+    TmpPage* page = nullptr;
+    int const RESULT = ensure_page_resident_locked(node, static_cast<size_t>(absolute_aligned_offset / PAGE), &page);
+    if (RESULT != 0) return RESULT;
+    if (!ker::mod::mm::phys::page_ref_try_inc(page->data)) return -EOVERFLOW;
+    empty.frame_ = page->data;
+    empty.object_identity_ = object_identity_;
+    empty.file_offset_ = absolute_aligned_offset;
+    empty.eof_ = eof_;
+    return 0;
 }
 
 auto tmpfs_acquire_lookup(const ker::mod::security::Snapshot& credentials, TmpNode* root, const char* path, TmpfsLookupHandle* out) -> int {

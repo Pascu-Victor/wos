@@ -6,6 +6,7 @@
 
 namespace ker::mod::sched::task {
 struct LazyVmemRange;
+class LazyVmemClone;
 struct Task;
 }  // namespace ker::mod::sched::task
 
@@ -23,6 +24,30 @@ class SharedVmemPublicationGuard {
     SharedVmemPublicationGuard(SharedVmemPublicationGuard&&) = delete;
     auto operator=(const SharedVmemPublicationGuard&) -> SharedVmemPublicationGuard& = delete;
     auto operator=(SharedVmemPublicationGuard&&) -> SharedVmemPublicationGuard& = delete;
+};
+
+// Prepare outside publication. Owns exact parent binding snapshots and fresh
+// unbound child bindings; destroy only after the publication guard has ended.
+// Fork consumes prepared rows separately, copies checked PTE owners, then
+// attaches these child-root identities before making the child visible.
+class PublicFileForkPreparation {
+   public:
+    PublicFileForkPreparation() = default;
+    ~PublicFileForkPreparation();
+    PublicFileForkPreparation(const PublicFileForkPreparation&) = delete;
+    auto operator=(const PublicFileForkPreparation&) -> PublicFileForkPreparation& = delete;
+    [[nodiscard]] auto prepare(ker::mod::sched::task::Task& parent, const ker::mod::sched::task::LazyVmemClone& source) -> int;
+    // Caller holds publication and has revalidated the exact source rows.
+    [[nodiscard]] auto matches(ker::mod::sched::task::Task& parent) -> bool;
+    // Child is still exclusively unpublished. Failure may attach a prefix;
+    // ordinary child-root destruction must retire that prefix before deletion.
+    [[nodiscard]] auto attach(ker::mod::sched::task::Task& child) -> bool;
+
+   private:
+    struct Entry;
+    Entry* entries_{};
+    size_t count_{};
+    bool prepared_{};
 };
 
 struct FileMmapCacheStats {

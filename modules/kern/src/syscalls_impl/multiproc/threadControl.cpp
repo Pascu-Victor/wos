@@ -7,17 +7,20 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <mod/io/serial/serial.hpp>
 #include <net/wki/remote_compute.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/debug/ptrace.hpp>
 #include <platform/sched/epoch.hpp>
+#include <platform/sched/lazy_vmem.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sched/threading.hpp>
 #include <platform/security/compartment_host.hpp>
 #include <platform/sys/context_switch.hpp>
 #include <platform/sys/signal.hpp>
+#include <platform/sys/syscall_preparation.hpp>
 #include <platform/sys/usercopy.hpp>
 #include <vfs/fd_reservation.hpp>
 #include <vfs/vfs.hpp>
@@ -436,6 +439,14 @@ auto thread_control(abi::multiproc::threadControlOps op, uint64_t arg1, uint64_t
 
             uint64_t thread_pid = 0;
             for (uint32_t attempt = 0; attempt < 2; ++attempt) {
+                mod::sys::SyscallPreparationScope preparation(*parent);
+                if (!preparation.ready()) return static_cast<uint64_t>(-EWOULDBLOCK);
+                mod::sched::task::LazyVmemClone lazy_snapshot;
+                int const LAZY_PREPARATION = lazy_snapshot.prepare(*parent);
+                if (LAZY_PREPARATION != 0) return static_cast<uint64_t>(LAZY_PREPARATION);
+                std::unique_ptr<mod::sched::task::Task, decltype(&mod::sched::task::destroy_unpublished_user_thread)> abandoned(
+                    nullptr, &mod::sched::task::destroy_unpublished_user_thread);
+                mod::sys::SyscallPreparationScope::LegacyInterval legacy_context(preparation);
                 bool creation_failed = false;
                 bool stack_exhausted = false;
                 {
@@ -444,21 +455,21 @@ auto thread_control(abi::multiproc::threadControlOps op, uint64_t arg1, uint64_t
                     // The new thread must either clone a completed update or be visible
                     // to the next update's active-task snapshot.
                     ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+                    if (!lazy_snapshot.matches(*parent)) return static_cast<uint64_t>(-EAGAIN);
                     auto* t = mod::sched::task::Task::create_user_thread(parent, tcb_va, user_sp, enter_va, prepared_stack_words.at(0),
-                                                                         prepared_stack_words.at(1), &stack_exhausted);
+                                                                         prepared_stack_words.at(1), &stack_exhausted, &lazy_snapshot);
                     if (t == nullptr) {
                         creation_failed = true;
                     } else {
+                        abandoned.reset(t);
                         uint64_t const CPU_COUNT = mod::smt::get_core_count();
                         if (CPU_COUNT == 0) {
-                            mod::sched::task::destroy_unpublished_user_thread(t);
                             return static_cast<uint64_t>(-ENOMEM);
                         }
                         uint64_t const TARGET_CPU = next_thread_cpu.fetch_add(1, std::memory_order_relaxed) % CPU_COUNT;
 
                         uint64_t const NEW_TID = t->namespace_tid();
                         if (!mod::sched::threading::publish_tid_to_tcb(*parent, tcb_va, NEW_TID, false)) {
-                            mod::sched::task::destroy_unpublished_user_thread(t);
                             return static_cast<uint64_t>(-EFAULT);
                         }
                         mod::sys::signal::sync_task_signal_mask_cache_mapped(t);
@@ -471,9 +482,9 @@ auto thread_control(abi::multiproc::threadControlOps op, uint64_t arg1, uint64_t
                         if (!POSTED) {
                             if (PUBLICATION_REF) t->release();
                             (void)mod::sched::threading::publish_tid_to_tcb(*parent, tcb_va, 0, false);
-                            mod::sched::task::destroy_unpublished_user_thread(t);
                             return static_cast<uint64_t>(-ENOMEM);
                         }
+                        (void)abandoned.release();
 
                         // Group exit can race with THREAD_CREATE after its active-registry
                         // scan has passed this creator but before the new sibling is

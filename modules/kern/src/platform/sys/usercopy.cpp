@@ -171,6 +171,13 @@ auto pin_task_user_page(sched::task::Task& task, uint64_t user_addr, bool requir
         return false;
     }
 
+    // Demand TMPFS may allocate/page-in. Prepare it before either output lease;
+    // the generic fault-in route refuses public I/O beneath its root reader.
+    if (fault_in &&
+        mm::virt::prepare_tmpfs_read_shared_page(task, user_addr, require_writable) == mm::virt::PublicReadPrepareResult::REFUSED) {
+        return false;
+    }
+
     mm::paging::PageTable* pagemap = nullptr;
     if (!task.try_acquire_usercopy_pagemap(pagemap)) {
         return false;

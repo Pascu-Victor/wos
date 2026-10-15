@@ -2453,3 +2453,81 @@ Continue exact-owned `--no-setup` qualification, one topology, the 20GiB disposa
 budget, the 40GiB free floor and pruning after successful and failed runs. Public
 canonical mapping ownership, writable backing, two-hour simultaneous services
 and 1,000 full lifecycle/allocation-failure cycles remain required.
+
+## Checkpoint58: public demand read-only TMPFS mappings (2026-10-15)
+
+Public shared READ/NONE mappings of regular TMPFS Files now retain a canonical
+inode, fixed EOF and mount owner, with demand page loans rather than a copied
+file cache. Current admission requires `O_NO_CACHE` and the strict retained
+TMPFS mount graph used by the earlier backing. Unsupported cached or attached
+File state is refused before publication. This does not yet provide ordinary
+cached-File or writable shared mapping support. The public backing has no
+64-page construction cap; descriptor growth, quotas and memory remain fallible.
+
+Preparation stages mirrored lazy rows outside publication and root guards.
+Hardware and software faults retain root-independent snapshots through backend
+I/O, then revalidate the exact binding, page-root incarnation and affine offset
+before installing a read-only shared leaf. No backend I/O or allocation occurs
+under the installer or root-reader guards. Whole READ/NONE protection and unmap
+use bounded PTE/TLB batches, with actual acknowledgement before frame release.
+Partial managed cuts, occupied fixed replacement and remap return unsupported
+errors before effects; WRITE and EXEC cannot exceed the retained read ceiling.
+Resize remains blocked by the fixed-EOF backing.
+
+Fork prepares fresh child bindings and checked frame references. Shared-root
+clones and threads prepare their lazy metadata before publication. Exec and
+failed creation release typed owners outside publication. Syscall preparation
+restores schedulable context for fallible work, while legacy task construction
+keeps its prior exclusive-MM assumptions. File, Task, 112-byte lazy-row and
+syscall/wire layouts remain unchanged; no Task backedge or new reaper is added.
+
+Normal Build WOS and the isolated fast diagnostic build pass, as do formatting
+and all 16 selected registered Host checks. Actual-body Host coverage includes
+144 staging/fork/context cases, 17 demand-MM cases and 46 TMPFS ownership cases.
+Fresh default Native89 passes all 1,463 enabled cases, all 212 mandatory cases
+and 113,976 assertions with zero failures. It powers off naturally, with all
+five prepared and five stopped payloads matching. The earlier Native88 failure
+is retained: its test incorrectly required a 33-entry vector with spare
+capacity to relocate. The test-only correction preserves the forced-growth
+64/128-entry cases and every byte, reference, policy and cleanup check.
+
+Native89's four disposable images are pruned. The real-host postcheck confirms
+zero disposable allocation, absent owned processes/sockets/images, the original
+shared launch guard and the unchanged unrelated VM. Its independent terminal
+audit verifies all 1,258 admitted source/artifact inputs. These checks cover the
+combined workspace; the 22 pre-existing user edits are preserved, including the
+separate goal-only reconstruction for the mixed thread-control file.
+
+The separate public retry02 passes on the normal eight-CPU kernel, using a
+129-page sparse backing. Actual thread and fork inheritance, different-address
+canonical mappings, cold software and hardware faults, in-EOF VFS write
+visibility, immutable read permissions, whole READ/NONE protection and unmap,
+unsupported-operation refusals and FD close/reuse are checked. A real read-only
+futex WAIT0/WAKE1 exchange completes between roots. Forked children exec and
+exit, consuming waits succeed, and the original init records the probe's exit.
+Successful growth after final unmap witnesses eventual EOF-lease release; it
+does not prove executor callback return or global reference balance.
+
+The VM interval lasts 9.861 seconds; the outer command completes in 49.083
+seconds. All nine bounded reports (316,480 bytes), 80 protocol events and all
+13 prepared and 13 stopped artifact readbacks validate. The observer stops only
+the owned VM through QMP after the completion witness; natural poweroff is not
+claimed. Four disposable images totaling 116,146,176 allocated bytes are pruned.
+The strict real-host postcheck passes with zero images/allocation, absent owned
+processes/sockets and the protected VM and original guard unchanged. The
+independent saved guest-terminal audit verifies all 80 raw events, all 1,931
+admitted input hashes, ten successful commands and both artifact readback sets.
+
+The earlier attempt remains failed evidence: it stops before VM launch when
+libguestfs refreshes appliance-cache timestamps. All 1,916 input content and
+alias hashes remain unchanged. Its one boot copy and an inactive guestfs socket
+are cleaned up; the unchanged strict postcheck then passes. The retry permits
+timestamp refreshes only for the three exact current appliance-cache files,
+preserving their other identity/ownership metadata, all other source metadata
+and complete content checks before and after execution.
+
+Goal39 remains ACTIVE with all ten full criteria open. Ordinary cached-File and
+writable shared mappings, full owner drains, two-hour simultaneous services and
+1,000 lifecycle/allocation-failure cycles remain required. Continue `--no-setup`,
+one topology, the 20GiB disposable budget, 40GiB free floor and exact-owned
+pruning after every outcome.

@@ -564,6 +564,10 @@ auto vfs_is_socket_file(const File* f) -> bool;
 auto vfs_alloc_fd(ker::mod::sched::task::Task* task, struct File* file) -> int;
 auto vfs_get_file(ker::mod::sched::task::Task* task, int fd) -> struct File*;
 auto vfs_get_file_retain(ker::mod::sched::task::Task* task, int fd) -> struct File*;
+// Retain the exact FD description without wrapping its signed owner count.
+// empty must be null. Failure leaves it null and acquires no reference.
+auto vfs_get_file_retain_checked(ker::mod::sched::task::Task* task, int fd, struct File*& empty) -> int;
+[[nodiscard]] auto vfs_try_retain_file(struct File* file) noexcept -> bool;
 void vfs_retain_file(struct File* f);
 // Drop one owned reference. Return the backend close result if this was the
 // final reference, otherwise zero. Final destruction can block; call unlocked.

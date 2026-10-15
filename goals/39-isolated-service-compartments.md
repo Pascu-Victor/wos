@@ -8,6 +8,33 @@
 
 ## Outcome and scale
 
+Checkpoint 58 connects public read-only shared canonical TMPFS mappings to
+demand faults, mirrored thread metadata and fresh fork bindings. The current
+admission requires an explicitly uncached File and a strict retained TMPFS
+mount graph; ordinary cached descriptions and writable sharing remain work.
+Whole READ/NONE protection and unmap are supported; partial managed operations,
+replacement and remap remain unsupported. Fixed-EOF ownership prevents resize
+while a backing is live. Task, File, lazy-row and syscall/wire layouts are
+unchanged. Normal Build WOS, isolated fast diagnostic compilation, formatting
+and 16 selected Host checks pass. Fresh Native89 passes all 1,463 enabled cases,
+212 mandatory cases and 113,976 assertions with zero failures and natural
+shutdown. Its four disposable images are pruned, with zero allocation and the
+unrelated VM confirmed by the real-host postcheck and independent audit.
+Native88's stale test assertion remains failed evidence; the correction retains
+the original growth cohorts and byte/reference/protection/cleanup checks.
+The first public attempt stops before VM launch because libguestfs cache
+timestamp refreshes trip the harness metadata check; its boot copy and inactive
+socket are cleaned up. Fresh retry02 passes the 129-page read-only public
+mapping, thread/fork inheritance, cold hardware/software faults, actual futex
+exchange, exec/exit, whole protection/unmap and eventual EOF-lease release on
+the normal eight-CPU kernel. All nine reports and 13 prepared/stopped artifacts
+validate. Its four disposable images are pruned and the strict real-host
+postcheck passes with zero allocation. The independent guest-terminal audit
+verifies all 80 raw events and all 1,931 admitted inputs. This is no
+writable-sharing or full reference-drain claim.
+All ten full criteria remain open and Goal39 stays ACTIVE; continue `--no-setup`,
+one topology, bounded storage and pruning after every outcome.
+
 Checkpoint 57 adds canonical readonly shared TMPFS backing to the bounded
 unpublished native mapping producer. Actual scheduled Native86 passes seven
 cases, 3,429 assertions and 20 callback returns, including two-root write

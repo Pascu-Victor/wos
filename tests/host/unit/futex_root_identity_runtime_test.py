@@ -57,23 +57,22 @@ def capture(source: str, anchor: str, *, declaration: bool = False) -> tuple[str
     """Capture one complete actual definition, retaining every original byte."""
     clean = re.sub(r'//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'',
                    lambda match: " " * len(match[0]), source)
-    starts = [m.start() for m in re.finditer(re.escape(anchor), clean)]
-    if len(starts) != 1:
-        raise ValueError(f"expected one actual definition for {anchor}, found {len(starts)}")
-    start = clean.rfind("\n", 0, starts[0]) + 1
-    parentheses = 0
-    opening = None
-    for index in range(starts[0], len(clean)):
-        char = clean[index]
-        if char == "(": parentheses += 1
-        elif char == ")": parentheses -= 1
-        elif char == "{" and parentheses == 0:
-            opening = index
-            break
-        elif char == ";" and parentheses == 0:
-            raise ValueError(f"declaration without a body: {anchor}")
-    if opening is None:
-        raise ValueError(f"no actual body: {anchor}")
+    definitions = []
+    for match in re.finditer(re.escape(anchor), clean):
+        parentheses = 0
+        for index in range(match.start(), len(clean)):
+            char = clean[index]
+            if char == "(": parentheses += 1
+            elif char == ")": parentheses -= 1
+            elif char == ";" and parentheses == 0:
+                break  # A prototype cannot borrow a later function's body.
+            elif char == "{" and parentheses == 0:
+                definitions.append((match.start(), index))
+                break
+    if len(definitions) != 1:
+        raise ValueError(f"expected one actual definition for {anchor}, found {len(definitions)}")
+    definition, opening = definitions[0]
+    start = clean.rfind("\n", 0, definition) + 1
     depth = 0
     for index in range(opening, len(clean)):
         if clean[index] == "{": depth += 1
@@ -238,6 +237,12 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
     auto capture_user_futex_identity(const UserPagePin&,vaddr_t,UserFutexIdentity&) -> bool;
     auto user_futex_identity_still_mapped(const UserPagePin&,const UserFutexIdentity&) -> bool;
     void unpin_user_page(UserPagePin&);
+    // These vectors have no typed public lazy rows; demand preparation is an
+    // explicit untracked boundary, not a modeled backend or native claim.
+    enum class PublicReadPrepareResult { NOT_TRACKED, READY, REFUSED };
+    inline auto prepare_tmpfs_read_shared_page(sched::task::Task&,uint64_t,bool) -> PublicReadPrepareResult {
+        return PublicReadPrepareResult::NOT_TRACKED;
+    }
     bool ensure_user_page_mapped(sched::task::Task*,vaddr_t);
     bool ensure_user_page_writable(sched::task::Task*,vaddr_t);
     }\n''')

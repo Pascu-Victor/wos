@@ -599,6 +599,7 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
     user_pin, row = capture(virt, "struct UserPagePin {", declaration=True); actual.append(row)
     futex_identity, row = capture(virt, "struct UserFutexIdentity {", declaration=True); actual.append(row)
     write("platform/mm/virt.hpp", '#pragma once\n#include "fixture-common.hpp"\n'
+          'namespace ker::mod::mm::file_mapping { class FileMappingBinding; }\n'
           'namespace ker::mod::sched::task { struct Task; }\n'
           'namespace ker::mod::mm::virt { using PageTable=paging::PageTable; inline constexpr uint64_t PADDR_INVALID=UINT64_MAX;\n'
           + user_pin + '\n' + futex_identity + '\n'
@@ -607,6 +608,9 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
           'auto user_page_pin_commit_write(const UserPagePin&) -> bool;\n'
           'auto capture_user_futex_identity(const UserPagePin&,vaddr_t,UserFutexIdentity&) -> bool;\n'
           'auto user_futex_identity_still_mapped(const UserPagePin&,const UserFutexIdentity&) -> bool;\n'
+          '// No typed public rows exist in these frame-only fixtures.\n'
+          'enum class PublicReadPrepareResult { NOT_TRACKED, READY, REFUSED };\n'
+          'inline auto prepare_tmpfs_read_shared_page(sched::task::Task&,uint64_t,bool) -> PublicReadPrepareResult { return PublicReadPrepareResult::NOT_TRACKED; }\n'
           'void unpin_user_page(UserPagePin&); }\n')
     write("platform/sched/task.hpp", TASK)
     write("platform/sched/scheduler.hpp", SCHEDULER)

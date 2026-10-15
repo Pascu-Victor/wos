@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+from raw_typed_file_seams import extend_raw_fixture
 from exec_trace_ownership_test import function
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -187,6 +188,7 @@ int run(){
 }
 int main(){return model::run();}
 '''
+code = extend_raw_fixture(code, 'model::Lock user_mapping_pin_lock{3};')
 replacements = {
     'PREPARE': function(phys, 'prepare_allocated_block'),
     'WRAPPERS': '\n'.join(function(phys, n) for n in ['page_alloc_may_fail', 'page_alloc_full_overwrite_may_fail', 'page_alloc_with_reclaim_may_fail', 'page_alloc_full_overwrite_page_with_reclaim_may_fail']),

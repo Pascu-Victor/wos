@@ -100,6 +100,7 @@ enum class LazyVmemKind : uint8_t {
     ANONYMOUS,
     FILE_BACKED,
     NATIVE_FILE_BACKED,
+    TMPFS_READ_SHARED,
 };
 
 struct LazyVmemRange {
@@ -110,7 +111,7 @@ struct LazyVmemRange {
     LazyVmemKind kind = LazyVmemKind::ANONYMOUS;
     union {
         ker::vfs::File* file = nullptr;                   // FILE_BACKED owns one raw File ref.
-        mm::file_mapping::FileMappingLifetime* lifetime;  // NATIVE_FILE_BACKED owns one LAZY role.
+        mm::file_mapping::FileMappingLifetime* lifetime;  // Typed file kinds own one LAZY role.
     };
     uint64_t file_offset = 0;
     uint64_t file_dev = 0;
@@ -125,14 +126,18 @@ struct LazyVmemRange {
 // subsequent Task fields used by assembly and existing kernel consumers.
 static_assert(sizeof(LazyVmemRange) == 112);
 static_assert(offsetof(LazyVmemRange, file) == 40);
+[[nodiscard]] inline auto lazy_vmem_has_lifetime(const LazyVmemRange& range) -> bool {
+    return range.kind == LazyVmemKind::NATIVE_FILE_BACKED || range.kind == LazyVmemKind::TMPFS_READ_SHARED;
+}
 [[nodiscard]] inline auto lazy_vmem_is_file(const LazyVmemRange& range) -> bool {
-    return range.kind == LazyVmemKind::FILE_BACKED || range.kind == LazyVmemKind::NATIVE_FILE_BACKED;
+    return range.kind == LazyVmemKind::FILE_BACKED || lazy_vmem_has_lifetime(range);
 }
 [[nodiscard]] inline auto lazy_vmem_file(const LazyVmemRange& range) -> ker::vfs::File* {
-    if (range.kind == LazyVmemKind::NATIVE_FILE_BACKED) return range.lifetime != nullptr ? range.lifetime->file() : nullptr;
+    if (lazy_vmem_has_lifetime(range)) return range.lifetime != nullptr ? range.lifetime->file() : nullptr;
     return range.kind == LazyVmemKind::FILE_BACKED ? range.file : nullptr;
 }
 using LazyVmemRangeVec = ker::util::SmallVec<LazyVmemRange, 8>;
+class LazyVmemClone;
 
 enum class TaskType : uint8_t {
     DAEMON,
@@ -320,7 +325,7 @@ struct Task {
     // enterThreadVa: virtual address of __mlibc_enter_thread in the process image.
     // stack_exhausted: optional kernel-only failure classification for bounded reclaim.
     static auto create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_sp, uint64_t enter_thread_va, uint64_t entry_va,
-                                   uint64_t user_arg_va, bool* stack_exhausted = nullptr) -> Task*;
+                                   uint64_t user_arg_va, bool* stack_exhausted = nullptr, LazyVmemClone* prepared_lazy = nullptr) -> Task*;
 
     Task(const Task& task) = delete;
 

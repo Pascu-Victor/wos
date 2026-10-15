@@ -8,7 +8,8 @@ has a deterministic failure boundary. This checks single-Task metadata/ref
 transactions and cold byte offsets, not native PTEs, backing I/O or shared-root
 multi-Task atomicity. --vmem-source accepts a complete unmodified predecessor:
 The actual pure ownership header supplies the native union declaration only;
-every vector remains explicit RAW FILE_BACKED/ANONYMOUS, with no native worker
+complete checked ownership bodies are compiled against explicit File primitives;
+typed family entrances abort. Every vector remains RAW FILE_BACKED/ANONYMOUS, with no native worker
 or lifetime qualification from this driver.
 it must compile and fail the independent projection oracle. --only isolates
 remove/add/protect negative controls. Never substitutes a rewritten algorithm.
@@ -36,6 +37,7 @@ SOURCE = ROOT / "modules/kern/src/syscalls_impl/vmem/sys_vmem.cpp"
 TASK = ROOT / "modules/kern/src/platform/sched/task.hpp"
 SMALLVEC = ROOT / "modules/kern/src/util/smallvec.hpp"
 FAMILY_HEADER = ROOT / "modules/kern/src/platform/mm/file_mapping_lifetime.hpp"
+LAZY_SOURCE = ROOT / "modules/kern/src/platform/sched/lazy_vmem.cpp"
 
 PRELUDE = r'''
 #include <algorithm>
@@ -52,7 +54,7 @@ PRELUDE = r'''
 #include <utility>
 #include <vector>
 namespace fixture {
-unsigned failures{}, assertions{}, cases{}, projection_failures{}, retains{}, puts{}, lock_depth{};
+unsigned failures{}, assertions{}, cases{}, projection_failures{}, retains{}, puts{}, lock_depth{}, locked_nonfinal_puts{};
 int fail_growth_after{-1};
 unsigned attempted_growth{};
 void check(bool value, const char* message) {
@@ -85,9 +87,18 @@ void vfs_retain_file(File* file) {
     fixture::check(file != nullptr && file->refcount.load() > 0, "retain without File owner");
     ++fixture::retains; ++file->refcount;
 }
+bool vfs_try_retain_file(File* file) {
+    if (file == nullptr || file->refcount.load() <= 0 || file->refcount.load() == INT32_MAX) return false;
+    vfs_retain_file(file); return true;
+}
 void vfs_put_file(File* file) {
-    fixture::check(fixture::lock_depth == 0, "File put under lazy lock");
-    fixture::check(file != nullptr && file->refcount.fetch_sub(1) > 1, "File ownership underflow/lost fixture baseline");
+    fixture::check(file != nullptr, "put requires exact File");
+    int const old=file->refcount.fetch_sub(1);
+    // The real checked push rollback may return its just-acquired owner while
+    // locked. Its original row/caller still owns File: final close is forbidden.
+    fixture::check(fixture::lock_depth == 0 || old > 1, "final File close under lazy lock");
+    fixture::check(old > 1, "File ownership underflow/lost fixture baseline");
+    if(fixture::lock_depth != 0 && old > 1) ++fixture::locked_nonfinal_puts;
     ++fixture::puts;
 }
 }
@@ -287,6 +298,9 @@ int main(int argc,char** argv) {
     }
     if(std::strcmp(mode,"all")==0) { fixture::sequence();fixture::helper_boundaries(); }
     fixture::check(fixture::retains==fixture::puts,"suite File ownership balance");
+#if HAVE_CHECKED_OWNER_HELPERS
+    fixture::check(fixture::locked_nonfinal_puts!=0,"real failed checked push rolls back a nonfinal owner");
+#endif
     std::printf("%s cases=%u assertions=%u retains=%u puts=%u projection_failures=%u failures=%u actual_rewrites=3 actual_smallvec=1\n",
         fixture::failures==0 ? "PASS" : "FAIL",fixture::cases,fixture::assertions,fixture::retains,fixture::puts,
         fixture::projection_failures,fixture::failures);
@@ -327,8 +341,21 @@ def generate(source: str, task: str, source_path: Path) -> tuple[str, list[dict]
     definitions = [{"name": "actual-LazyVmemKind-Range-Vec", "bytes": len(types.encode()),
                     "sha256": hashlib.sha256(types.encode()).hexdigest()},
                    {"name": "whole-real-file_mapping_lifetime.hpp", **pin(FAMILY_HEADER)}]
-    names = ["ranges_overlap", "push_lazy_vmem_range", "lazy_vmem_range_has_file", "retain_lazy_vmem_range_file",
-             "release_lazy_vmem_range_file", "release_lazy_vmem_range_files", "push_lazy_vmem_range_copy"]
+    names = ["ranges_overlap", "push_lazy_vmem_range"]
+    legacy_owners = bool(re.search(r"^auto lazy_vmem_range_has_file\(", source, re.M))
+    ownership = []
+    if legacy_owners:
+        names += ["lazy_vmem_range_has_file", "retain_lazy_vmem_range_file"]
+    else:
+        # Compile the complete real checked ownership functions. Their RAW File
+        # primitive is explicit; entering a typed family fails this fixture.
+        lazy_source = LAZY_SOURCE.read_text()
+        for name in ["try_retain_lazy_vmem_range", "release_lazy_vmem_range"]:
+            body, row = capture(lazy_source, name)
+            row["path"] = str(LAZY_SOURCE)
+            definitions.append(row)
+            ownership.append(f'#line {row["line"]} {json.dumps(str(LAZY_SOURCE))}\n{body}')
+    names += ["release_lazy_vmem_range_file", "release_lazy_vmem_range_files", "push_lazy_vmem_range_copy"]
     # Old source genuinely has no slice helper. Only extraction availability is
     # tested here; correctness is always the compiled byte-projection oracle.
     helper = bool(re.search(r"^auto slice_lazy_vmem_range\(", source, re.M))
@@ -352,7 +379,25 @@ using LazyVmemRange=ker::mod::sched::task::LazyVmemRange;
 using LazyVmemKind=ker::mod::sched::task::LazyVmemKind;
 using LazyVmemRangeVec=ker::mod::sched::task::LazyVmemRangeVec;
 '''
-    flags = f"#define HAVE_SLICE_HELPER {int(helper)}\n#define HAVE_OFFSET_SPAN_HELPER {int(span_helper)}\n"
+    if not legacy_owners:
+        prefix = prefix.rsplit("namespace ker::syscall::vmem {", 1)[0] + r'''
+namespace ker::mod::mm::file_mapping {
+bool FileMappingLifetime::try_acquire(FamilyOwner) noexcept { std::abort(); }
+void FileMappingLifetime::release(FamilyOwner) noexcept { std::abort(); }
+}
+namespace ker::mod::sched::task {
+''' + "\n".join(ownership) + r'''
+}
+namespace ker::syscall::vmem {
+using LazyVmemRange=ker::mod::sched::task::LazyVmemRange;
+using LazyVmemKind=ker::mod::sched::task::LazyVmemKind;
+using LazyVmemRangeVec=ker::mod::sched::task::LazyVmemRangeVec;
+// Original RAW seed callsite adapter; real checked retain body compiled above.
+void retain_lazy_vmem_range_file(const LazyVmemRange& range) {
+    fixture::check(ker::mod::sched::task::try_retain_lazy_vmem_range(range), "RAW seed retains checked File owner");
+}
+'''
+    flags = f"#define HAVE_SLICE_HELPER {int(helper)}\n#define HAVE_OFFSET_SPAN_HELPER {int(span_helper)}\n#define HAVE_CHECKED_OWNER_HELPERS {int(not legacy_owners)}\n"
     return prefix + "\n".join(bodies) + "\n}\n" + flags + CASES, definitions
 
 
@@ -503,7 +548,7 @@ def main() -> int:
             raise ValueError("--cxx/CXX must name one host ELF compiler executable")
         with compiler.open("rb") as executable:
             if executable.read(4) != b"\x7fELF": raise ValueError("--cxx/CXX must name one host ELF compiler executable")
-        watched = [source_path, task_path, SMALLVEC, FAMILY_HEADER, Path(__file__).resolve(), compiler]
+        watched = [source_path, task_path, SMALLVEC, FAMILY_HEADER, LAZY_SOURCE, Path(__file__).resolve(), compiler]
         before = [pin(path) for path in watched]; result["source"] = before[0]
         harness, actual = generate(source_path.read_text(), task_path.read_text(), source_path)
         result["actual_definitions"] = actual

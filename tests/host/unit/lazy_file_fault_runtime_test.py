@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+from raw_typed_file_seams import extend_raw_fixture
 
 from exec_trace_ownership_test import block, function
 
@@ -127,7 +128,8 @@ uint64_t translate(PageTable*p,uint64_t va){return p&&p->page&&p->address==va?re
 void map_page(PageTable*p,uint64_t va,uint64_t pa,uint64_t){assert(guards==2&&p&&!p->page);p->address=va;p->page=reinterpret_cast<void*>(pa);}
 void invalidate_local_tlb_if_current(PageTable*,uint64_t,bool){assert(guards==0);}
 bool lazy_file_range_matches(const sched::task::LazyVmemRange&,const sched::task::LazyVmemRange&,uint64_t);
-LazyFilePageInstallResult install_lazy_file_page_if_current(sched::task::Task*,const sched::task::LazyVmemRange&,uint64_t,uint64_t,uint64_t);
+LazyFilePageInstallResult install_lazy_file_page_if_current(sched::task::Task*,const sched::task::LazyVmemRange&,uint64_t,uint64_t,uint64_t,
+                                                         file_mapping::FileMappingBinding* = nullptr);
 }}
 }
 namespace syscall::vmem{
@@ -263,6 +265,7 @@ int main(){
  return 0;
 }
 '''
+code = extend_raw_fixture(code, 'Lock user_mapping_pin_lock;')
 for key, value in {
     "CLEAN_EXIT": block(scheduler, r'^\[\[noreturn\]\] void exit_current_kernel_thread\([^;{]*\{'),
     "MATCH": function(virt, "lazy_file_range_matches"),

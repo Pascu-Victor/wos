@@ -27,6 +27,7 @@
 #include <platform/mm/unpublished_mapping_retirement.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/perf/perf_events.hpp>
+#include <platform/sched/lazy_vmem.hpp>
 #include <platform/sched/resource_as.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
@@ -34,6 +35,7 @@
 #include <platform/security/compartment_host.hpp>
 #include <platform/security/file_policy.hpp>
 #include <platform/sys/mutex.hpp>
+#include <platform/sys/syscall_preparation.hpp>
 #include <platform/sys/usercopy.hpp>
 #include <util/smallvec.hpp>
 #include <utility>
@@ -392,7 +394,7 @@ auto slice_lazy_vmem_range(const LazyVmemRange& range, uint64_t start, uint64_t 
         return false;
     }
     auto sliced = range;
-    if (range.kind == LazyVmemKind::FILE_BACKED) {
+    if (ker::mod::sched::task::lazy_vmem_is_file(range)) {
         uint64_t const DELTA = start - range.start;
         if (DELTA > UINT64_MAX - range.file_offset) {
             return false;
@@ -412,21 +414,7 @@ auto push_lazy_vmem_range(LazyVmemRangeVec& ranges, const LazyVmemRange& range) 
     return ranges.push_back(range);
 }
 
-auto lazy_vmem_range_has_file(const LazyVmemRange& range) -> bool {
-    return range.kind == LazyVmemKind::FILE_BACKED && range.file != nullptr;
-}
-
-void retain_lazy_vmem_range_file(const LazyVmemRange& range) {
-    if (lazy_vmem_range_has_file(range)) {
-        ker::vfs::vfs_retain_file(range.file);
-    }
-}
-
-void release_lazy_vmem_range_file(const LazyVmemRange& range) {
-    if (lazy_vmem_range_has_file(range)) {
-        ker::vfs::vfs_put_file(range.file);
-    }
-}
+void release_lazy_vmem_range_file(const LazyVmemRange& range) { ker::mod::sched::task::release_lazy_vmem_range(range); }
 
 void release_lazy_vmem_range_files(const LazyVmemRangeVec& ranges) {
     for (const auto& range : ranges) {
@@ -435,15 +423,169 @@ void release_lazy_vmem_range_files(const LazyVmemRangeVec& ranges) {
 }
 
 auto push_lazy_vmem_range_copy(LazyVmemRangeVec& ranges, const LazyVmemRange& range) -> bool {
-    size_t const BEFORE = ranges.size();
-    if (!push_lazy_vmem_range(ranges, range)) {
-        return false;
-    }
-    if (ranges.size() != BEFORE) {
-        retain_lazy_vmem_range_file(ranges.at(BEFORE));
-    }
-    return true;
+    if (range.start >= range.end) return true;
+    if (!ker::mod::sched::task::try_retain_lazy_vmem_range(range)) return false;
+    if (push_lazy_vmem_range(ranges, range)) return true;
+    // The original row/caller still owns its reference. This rollback cannot
+    // be the final File/family release, even in the legacy locked callers.
+    release_lazy_vmem_range_file(range);
+    return false;
 }
+
+// Canonical public transactions prepare complete sibling row sets outside the
+// publication mutex. The final recheck/commit neither allocates nor releases a
+// File. Legacy RAW mutation entrances keep their existing behavior.
+void advance_mmap_cursor(ker::mod::sched::task::Task* task, uint64_t vaddr, uint64_t size);
+auto public_shared_file_overlap(ker::mod::sched::task::Task& task, uint64_t start, uint64_t length) -> bool;
+class SharedLazyVmemUpdate {
+    using Task = ker::mod::sched::task::Task;
+    using Clone = ker::mod::sched::task::LazyVmemClone;
+    struct Slot {
+        Task* task{};  // Protected by the retained cohort and clone snapshot.
+        Clone source;
+        LazyVmemRangeVec next, retired;
+        ~Slot() {
+            ker::mod::sched::task::release_lazy_vmem_range_refs(next);
+            ker::mod::sched::task::release_lazy_vmem_range_refs(retired);
+        }
+    };
+
+   public:
+    enum class Change : uint8_t { ADD, REMOVE, PROTECT };
+    ~SharedLazyVmemUpdate() {
+        for (size_t i = 0; i < cohort_count_; ++i) cohort_[i]->release();
+        for (size_t i = 0; i < validation_count_; ++i) validation_[i]->release();
+    }
+    auto prepare(Task& task) -> int {
+        if (slots_ || &task != get_current_task() || task.type != ker::mod::sched::task::TaskType::PROCESS) return -EBUSY;
+        capacity_ = static_cast<size_t>(ker::mod::sched::get_active_task_count()) + 1;
+        if (capacity_ > SIZE_MAX / sizeof(Task*)) return -EOVERFLOW;
+        cohort_.reset(new (std::nothrow) Task*[capacity_]{});
+        validation_.reset(new (std::nothrow) Task*[capacity_]{});
+        if (!cohort_ || !validation_) return -ENOMEM;
+        {
+            SharedVmemPublicationGuard publication;
+            root_ = task.pagemap;
+            if (root_ == nullptr || task.usercopy_pagemap_closing.load(std::memory_order_acquire) ||
+                !ker::mod::mm::virt::capture_user_root_incarnation(root_, serial_))
+                return -EBUSY;
+            size_t const EXPECTED = ker::mod::sched::snapshot_active_task_lifetime_refs_if(matches_root, root_, nullptr, 0);
+            if (EXPECTED > capacity_) return -EAGAIN;
+            cohort_count_ = ker::mod::sched::snapshot_active_task_lifetime_refs_if(matches_root, root_, cohort_.get(), capacity_);
+            if (cohort_count_ > capacity_) {
+                cohort_count_ = 0;  // Insufficient-capacity snapshots own no refs.
+                return -EAGAIN;
+            }
+            if (cohort_count_ != EXPECTED) return -EAGAIN;
+        }
+        bool contains_current = false;
+        for (size_t i = 0; i < cohort_count_; ++i) contains_current |= cohort_[i] == &task;
+        if (!contains_current) return -EBUSY;
+        slots_.reset(new (std::nothrow) Slot[cohort_count_]);
+        if (!slots_) return -ENOMEM;
+        for (size_t i = 0; i < cohort_count_; ++i) {
+            auto& slot = slots_[i];
+            slot.task = cohort_[i];
+            int const RESULT = slot.source.prepare(*slot.task);
+            if (RESULT != 0) return RESULT;
+            if (slot.source.root() != root_ || slot.source.root_incarnation() != serial_) return -EAGAIN;
+        }
+        return 0;
+    }
+
+    auto stage(Change change, uint64_t start, uint64_t end, const LazyVmemRange* added = nullptr, uint64_t prot = 0) -> int {
+        if (!slots_ || start >= end || (change == Change::ADD && added == nullptr)) return -EINVAL;
+        for (size_t i = 0; i < cohort_count_; ++i) {
+            auto& slot = slots_[i];
+            auto const& source = slot.source.ranges();
+            if (source.size() > SIZE_MAX - 3 || !slot.next.reserve(source.size() + 3)) return -ENOMEM;
+            auto append = [&](const LazyVmemRange& row) {
+                if (!ker::mod::sched::task::try_retain_lazy_vmem_range(row)) return false;
+                if (slot.next.push_back_no_grow(row)) return true;
+                release_lazy_vmem_range_file(row);
+                return false;
+            };
+            for (auto const& row : source) {
+                if (!ranges_overlap(start, end, row.start, row.end)) {
+                    if (!append(row)) return -EOVERFLOW;
+                    continue;
+                }
+                if (change == Change::ADD) return -EAGAIN;
+                LazyVmemRange part;
+                if (row.start < start && (!slice_lazy_vmem_range(row, row.start, start, part) || !append(part))) return -EOVERFLOW;
+                if (change == Change::PROTECT) {
+                    if (!slice_lazy_vmem_range(row, std::max(row.start, start), std::min(row.end, end), part)) return -EOVERFLOW;
+                    part.prot = prot;
+                    if (!append(part)) return -EOVERFLOW;
+                }
+                if (row.end > end && (!slice_lazy_vmem_range(row, end, row.end, part) || !append(part))) return -EOVERFLOW;
+            }
+            if (added != nullptr && !append(*added)) return -EOVERFLOW;
+        }
+        staged_ = true;
+        return 0;
+    }
+
+    auto matches(Task& task) -> bool {
+        if (!staged_ || committed_ || validation_count_ != 0 || task.pagemap != root_ ||
+            task.state.load(std::memory_order_acquire) != ker::mod::sched::task::TaskState::ACTIVE ||
+            task.usercopy_pagemap_closing.load(std::memory_order_acquire))
+            return false;
+        uint64_t serial = 0;
+        if (!ker::mod::mm::virt::capture_user_root_incarnation(root_, serial) || serial != serial_) return false;
+        size_t const EXPECTED = ker::mod::sched::snapshot_active_task_lifetime_refs_if(matches_root, root_, nullptr, 0);
+        if (EXPECTED > capacity_) return false;
+        validation_count_ = ker::mod::sched::snapshot_active_task_lifetime_refs_if(matches_root, root_, validation_.get(), capacity_);
+        if (validation_count_ > capacity_) {
+            validation_count_ = 0;
+            return false;
+        }
+        if (validation_count_ != EXPECTED) return false;
+        if (validation_count_ != cohort_count_) return false;
+        for (size_t i = 0; i < cohort_count_; ++i) {
+            bool found = false;
+            for (size_t j = 0; j < validation_count_; ++j) found |= slots_[i].task == validation_[j];
+            if (!found || !slots_[i].source.matches(*slots_[i].task)) return false;
+        }
+        return true;
+    }
+
+    void commit() {
+        if (!staged_ || committed_) ker::mod::dbg::panic_handler("shared lazy transaction committed without staging");
+        for (size_t i = 0; i < cohort_count_; ++i) {
+            auto& slot = slots_[i];
+            uint64_t const FLAGS = slot.task->lazy_vmem_lock.lock_irqsave();
+            // Exit can quiesce without the publication mutex. Never repopulate
+            // a closing executor; its current image no longer accepts faults.
+            if (!slot.task->usercopy_pagemap_closing.load(std::memory_order_acquire)) {
+                slot.retired = std::move(slot.task->lazy_vmem_ranges);
+                slot.task->lazy_vmem_ranges = std::move(slot.next);
+            }
+            slot.task->lazy_vmem_lock.unlock_irqrestore(FLAGS);
+        }
+        committed_ = true;
+    }
+
+    void advance_cursor(uint64_t address, uint64_t length) {
+        for (size_t i = 0; i < cohort_count_; ++i) advance_mmap_cursor(slots_[i].task, address, length);
+    }
+    auto serial() const -> uint64_t { return serial_; }
+
+   private:
+    static auto matches_root(Task* task, void* root) -> bool {
+        // Keep this census independent of transient closing flags. Under
+        // publication, existing root membership may retire but cannot grow;
+        // a count-only census followed by exactly that many retained owners
+        // therefore detects every silently refused lifetime acquisition.
+        return task != nullptr && task->pagemap == root && task->type == ker::mod::sched::task::TaskType::PROCESS;
+    }
+    std::unique_ptr<Task*[]> cohort_, validation_;
+    std::unique_ptr<Slot[]> slots_;
+    ker::mod::mm::paging::PageTable* root_{};
+    uint64_t serial_{};
+    size_t capacity_{}, cohort_count_{}, validation_count_{};
+    bool staged_{}, committed_{};
+};
 
 auto pte_raw(const ker::mod::mm::paging::PageTableEntry& entry) -> uint64_t {
     uint64_t raw = 0;
@@ -1578,6 +1720,9 @@ auto materialize_lazy_file_page_impl(ker::mod::sched::task::Task* task, const La
     if (task == nullptr || task->pagemap == nullptr || !ker::mod::sched::task::lazy_vmem_is_file(range)) {
         return false;
     }
+    // Demand canonical pages use the two-phase MM worker/pre-pin entrance.
+    // This legacy materializer can be called with outer root readers held.
+    if (range.kind == LazyVmemKind::TMPFS_READ_SHARED) return false;
     ker::mod::mm::virt::FileMappingInstallerLease installer;
     bool const NATIVE = range.kind == LazyVmemKind::NATIVE_FILE_BACKED;
     if (NATIVE && !installer.acquire(*task, range, page_vaddr)) return false;
@@ -1867,6 +2012,7 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
         if (overlaps_kernel_managed_user_layout_locked(task, hint, size)) {
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
         }
+        if (public_shared_file_overlap(*task, hint, size)) return static_cast<uint64_t>(-EOPNOTSUPP);
         vaddr = hint;
         if (!observation.admit_mapping(task->pagemap, size, hint, size)) {
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
@@ -1984,6 +2130,136 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
     return vaddr;
 }
 
+auto public_shared_file_overlap(ker::mod::sched::task::Task& task, uint64_t start, uint64_t length) -> bool {
+    if (length == 0 || start > UINT64_MAX - length) return false;
+    bool found = false;
+    uint64_t const FLAGS = task.lazy_vmem_lock.lock_irqsave();
+    for (auto const& row : task.lazy_vmem_ranges) {
+        found |= row.kind == LazyVmemKind::TMPFS_READ_SHARED && ranges_overlap(start, start + length, row.start, row.end);
+    }
+    task.lazy_vmem_lock.unlock_irqrestore(FLAGS);
+    return found;
+}
+
+// Whole-binding operations for the public readonly profile. Metadata and all
+// fallible preparation precede withdrawal. The MM continuation cannot refuse
+// after that point; it completes bounded purge/ACK slices with INDEX retained.
+auto change_public_shared_file(ker::mod::sched::task::Task& task, uint64_t start, uint64_t length, bool protect, uint64_t prot = 0)
+    -> uint64_t {
+    namespace fm = ker::mod::mm::file_mapping;
+    if (protect && (prot & ~static_cast<uint64_t>(ker::abi::vmem::PROT_READ)) != 0) return static_cast<uint64_t>(-EACCES);
+    ker::mod::sys::SyscallPreparationScope preparation(task);
+    if (!preparation.ready()) return static_cast<uint64_t>(-EWOULDBLOCK);
+    auto release_snapshot = [](fm::FileMappingBinding* binding) {
+        if (binding) binding->release(fm::BindingOwner::SNAPSHOT);
+    };
+    std::unique_ptr<fm::FileMappingBinding, decltype(release_snapshot)> binding(nullptr, release_snapshot);
+    fm::FileMappingTlbRetirement after_tlb;
+    SharedLazyVmemUpdate metadata;
+    int result = metadata.prepare(task);
+    if (result != 0) return static_cast<uint64_t>(result);
+    result = metadata.stage(protect ? SharedLazyVmemUpdate::Change::PROTECT : SharedLazyVmemUpdate::Change::REMOVE, start, start + length,
+                            nullptr, prot);
+    if (result != 0) return static_cast<uint64_t>(result);
+    {
+        SharedVmemPublicationGuard publication;
+        if (!metadata.matches(task)) return static_cast<uint64_t>(-EAGAIN);
+        if (overlaps_kernel_managed_user_layout_locked(&task, start, length)) return static_cast<uint64_t>(-EINVAL);
+        fm::FileMappingBinding* captured = nullptr;
+        bool exact = false;
+        if (!ker::mod::mm::virt::query_current_file_binding(task, start, start + length, captured, exact))
+            return static_cast<uint64_t>(-EAGAIN);
+        binding.reset(captured);
+        if (!binding) return static_cast<uint64_t>(-EAGAIN);
+        if (!exact || binding->lifetime()->backing_mode() != fm::FileMappingBackingMode::TMPFS_DEMAND_READ_SHARED)
+            return static_cast<uint64_t>(-EOPNOTSUPP);
+        if (!ker::mod::mm::virt::preflight_current_file_binding(task, *binding)) return static_cast<uint64_t>(-EAGAIN);
+        metadata.commit();
+        bool const COMPLETED = protect ? ker::mod::mm::virt::protect_current_file_binding(task, *binding, prot)
+                                       : ker::mod::mm::virt::retire_current_file_binding(task, *binding, after_tlb);
+        if (!COMPLETED) ker::mod::dbg::panic_handler("validated public mapping mutation failed after withdrawal");
+    }
+    after_tlb.release_after_completed_tlb();
+    return 0;
+}
+
+auto allocate_public_shared_tmpfs(ker::mod::sched::task::Task& task, ker::vfs::File& file, const ker::vfs::Stat& st, uint64_t hint,
+                                  uint64_t length, uint64_t prot, uint64_t flags, uint64_t offset) -> uint64_t {
+    namespace fm = ker::mod::mm::file_mapping;
+    ker::mod::sys::SyscallPreparationScope preparation(task);
+    if (!preparation.ready()) return static_cast<uint64_t>(-EWOULDBLOCK);
+    bool const FIXED = (flags & ker::abi::vmem::MAP_FIXED) != 0 && hint != 0;
+    if (FIXED && (hint < USER_SPACE_START || hint > USER_SPACE_END - length || (hint & (ker::mod::mm::paging::PAGE_SIZE - 1)) != 0))
+        return static_cast<uint64_t>(-EINVAL);
+    auto const shutdown_hold = ker::mod::sched::hold_kernel_shutdown();
+    auto release_family = [](fm::FileMappingLifetime* family) {
+        if (family) family->release(fm::FamilyOwner::PREPARED);
+    };
+    int error = -ENOMEM;
+    std::unique_ptr<fm::FileMappingLifetime, decltype(release_family)> family(
+        fm::FileMappingLifetime::prepare_demand_read_shared_tmpfs(file, offset, length, error), release_family);
+    if (!family) return static_cast<uint64_t>(error);
+    auto release_binding = [](fm::FileMappingBinding* binding) {
+        if (binding) binding->release(fm::BindingOwner::PREPARED);
+    };
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        SharedLazyVmemUpdate metadata;
+        int const PREPARED = metadata.prepare(task);
+        if (PREPARED != 0) {
+            if (PREPARED == -EAGAIN) continue;
+            return static_cast<uint64_t>(PREPARED);
+        }
+        std::unique_ptr<fm::FileMappingBinding, decltype(release_binding)> binding(fm::FileMappingBinding::prepare_unbound(*family),
+                                                                                   release_binding);
+        if (!binding) return static_cast<uint64_t>(-ENOMEM);
+        uint64_t address = 0;
+        {
+            SharedVmemPublicationGuard publication;
+            address = FIXED ? hint : find_free_range(&task, length, hint);
+            if (address == 0) return static_cast<uint64_t>(-ENOMEM);
+            if (overlaps_kernel_managed_user_layout_locked(&task, address, length)) return static_cast<uint64_t>(-EINVAL);
+            if (!mmap_range_is_free(&task, address, length)) {
+                if (FIXED) return static_cast<uint64_t>(-EOPNOTSUPP);
+                continue;
+            }
+        }
+        LazyVmemRange const ROW{.start = address,
+                                .end = address + length,
+                                .prot = prot,
+                                .flags = ker::abi::vmem::MAP_SHARED,
+                                .kind = LazyVmemKind::TMPFS_READ_SHARED,
+                                .lifetime = family.get(),
+                                .file_offset = offset,
+                                .file_dev = st.st_dev,
+                                .file_ino = st.st_ino,
+                                .file_size = family->demand_read_shared_backing()->eof(),
+                                .file_mtime_sec = st.st_mtim.tv_sec,
+                                .file_mtime_nsec = st.st_mtim.tv_nsec,
+                                .file_ctime_sec = st.st_ctim.tv_sec,
+                                .file_ctime_nsec = st.st_ctim.tv_nsec};
+        int const STAGED = metadata.stage(SharedLazyVmemUpdate::Change::ADD, address, address + length, &ROW);
+        if (STAGED != 0) {
+            if (STAGED == -EAGAIN) continue;
+            return static_cast<uint64_t>(STAGED);
+        }
+        {
+            SharedVmemPublicationGuard publication;
+            if (!metadata.matches(task) || !mmap_range_is_free(&task, address, length)) continue;
+            ker::mod::sched::resource::AddressSpaceObservation observation(&task);
+            if (!observation.admit_mapping(task.pagemap, length)) return static_cast<uint64_t>(-ENOMEM);
+            auto* prepared = binding.get();
+            if (!ker::mod::mm::virt::attach_current_file_binding(task, prepared, address, address + length, offset, metadata.serial()))
+                continue;
+            (void)binding.release();  // INDEX now owns the prepared binding.
+            metadata.commit();
+            metadata.advance_cursor(address, length);
+            observation.commit_mapping();
+        }
+        return address;
+    }
+    return static_cast<uint64_t>(-EAGAIN);
+}
+
 // Free anonymous memory
 auto anon_free(uint64_t addr, uint64_t size) -> uint64_t {
     // Get current task
@@ -2023,9 +2299,12 @@ auto anon_free(uint64_t addr, uint64_t size) -> uint64_t {
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
     }
 
+    if (public_shared_file_overlap(*task, addr, size)) return change_public_shared_file(*task, addr, size, false);
+
     // Fork must observe either the complete mapping or the complete removal,
     // including file-range and lazy-range metadata.
     SharedVmemPublicationGuard publication_guard;
+    if (public_shared_file_overlap(*task, addr, size)) return static_cast<uint64_t>(-EAGAIN);
     ker::mod::sched::resource::AddressSpaceObservation observation(task);
     if (overlaps_kernel_managed_user_layout_locked(task, addr, size)) {
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
@@ -2087,7 +2366,10 @@ auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t si
     // Declared before publication_guard so even rollback's last File close
     // happens after shared VM publication unlocks. FD reuse cannot retarget us.
     auto release_file = [](ker::vfs::File* file) { ker::vfs::vfs_put_file(file); };
-    std::unique_ptr<ker::vfs::File, decltype(release_file)> retained_file(ker::vfs::vfs_get_file_retain(task, fd), release_file);
+    ker::vfs::File* captured_file = nullptr;
+    int const RETAIN = ker::vfs::vfs_get_file_retain_checked(task, fd, captured_file);
+    if (RETAIN == -EOVERFLOW) return static_cast<uint64_t>(RETAIN);
+    std::unique_ptr<ker::vfs::File, decltype(release_file)> retained_file(captured_file, release_file);
     auto* file = retained_file.get();
     ker::vfs::Stat st{};
     int const STAT_RET = ker::vfs::vfs_fstat_file(file, &st);
@@ -2113,6 +2395,12 @@ auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t si
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EOVERFLOW);
     }
 
+    if (get_current_task() == task && task->type == ker::mod::sched::task::TaskType::PROCESS && file->fs_type == ker::vfs::FSType::TMPFS &&
+        file->fops == ker::vfs::tmpfs::get_tmpfs_fops() && file->mount_owner != nullptr && (file->open_flags & 3) == 0 &&
+        (flags & ker::abi::vmem::MAP_SHARED) != 0 && (prot & ~static_cast<uint64_t>(ker::abi::vmem::PROT_READ)) == 0 &&
+        (st.st_mode & ker::vfs::S_IFMT) == ker::vfs::S_IFREG)
+        return allocate_public_shared_tmpfs(*task, *file, st, hint, size, prot, flags, offset);
+
     // Keep reservation, page-table construction, lazy/file metadata, and
     // rollback indivisible with respect to fork's address-space snapshot.
     SharedVmemPublicationGuard publication_guard;
@@ -2130,6 +2418,7 @@ auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t si
         if (overlaps_kernel_managed_user_layout_locked(task, hint, size)) {
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
         }
+        if (public_shared_file_overlap(*task, hint, size)) return static_cast<uint64_t>(-EOPNOTSUPP);
         vaddr = hint;
         if (!observation.admit_mapping(task->pagemap, size, hint, size)) {
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
@@ -2714,9 +3003,13 @@ auto selftest_file_mapping_registry_growth(ker::mod::mm::paging::PageTable* page
                     }
                 }
                 uintptr_t original_row = 0;
+                bool requires_relocation = false;
                 g_file_mmap_ranges_lock.lock();
                 bool const SEEDED = g_file_mmap_ranges.size() == COUNT;
-                if (SEEDED) original_row = reinterpret_cast<uintptr_t>(&g_file_mmap_ranges.at(COUNT - 1));
+                if (SEEDED) {
+                    original_row = reinterpret_cast<uintptr_t>(&g_file_mmap_ranges.at(COUNT - 1));
+                    requires_relocation = g_file_mmap_ranges.size() == g_file_mmap_ranges.capacity();
+                }
                 g_file_mmap_ranges_lock.unlock();
                 ok = ok && SEEDED;
                 if (SEEDED) {
@@ -2728,10 +3021,10 @@ auto selftest_file_mapping_registry_growth(ker::mod::mm::paging::PageTable* page
                     if (SPLIT) {
                         const auto& left = g_file_mmap_ranges.at(COUNT - 1);
                         const auto& right = g_file_mmap_ranges.at(COUNT);
-                        ok = reinterpret_cast<uintptr_t>(&left) != original_row && left.pagemap == pagemap && right.pagemap == pagemap &&
-                             left.file == file && right.file == file && left.writeback && right.writeback && left.start == TARGET &&
-                             left.length == PAGE && left.file_offset == OFFSET && right.start == TARGET + 2 * PAGE &&
-                             right.length == PAGE - 1 && right.file_offset == OFFSET + 2 * PAGE && ok;
+                        ok = (reinterpret_cast<uintptr_t>(&left) != original_row) == requires_relocation && left.pagemap == pagemap &&
+                             right.pagemap == pagemap && left.file == file && right.file == file && left.writeback && right.writeback &&
+                             left.start == TARGET && left.length == PAGE && left.file_offset == OFFSET &&
+                             right.start == TARGET + 2 * PAGE && right.length == PAGE - 1 && right.file_offset == OFFSET + 2 * PAGE && ok;
                         // Derive each surviving byte from the original mapping,
                         // independent of the split implementation's arithmetic.
                         for (const auto* fragment : {&left, &right}) {
@@ -3262,6 +3555,86 @@ SharedVmemPublicationGuard::SharedVmemPublicationGuard() { g_shared_vmem_publica
 
 SharedVmemPublicationGuard::~SharedVmemPublicationGuard() { g_shared_vmem_publication_lock.unlock(); }
 
+struct PublicFileForkPreparation::Entry {
+    ker::mod::mm::file_mapping::FileMappingBinding* source{};      // SNAPSHOT
+    ker::mod::mm::file_mapping::FileMappingBinding* validation{};  // SNAPSHOT
+    ker::mod::mm::file_mapping::FileMappingBinding* child{};       // PREPARED until attach
+    ker::mod::mm::file_mapping::FileMappingLifetime* family{};     // Borrowed from the source snapshot/child binding.
+    uint64_t start{}, end{}, offset{};
+};
+
+PublicFileForkPreparation::~PublicFileForkPreparation() {
+    namespace fm = ker::mod::mm::file_mapping;
+    for (size_t i = 0; i < count_; ++i) {
+        auto& entry = entries_[i];
+        if (entry.child) entry.child->release(fm::BindingOwner::PREPARED);
+        if (entry.validation) entry.validation->release(fm::BindingOwner::SNAPSHOT);
+        if (entry.source) entry.source->release(fm::BindingOwner::SNAPSHOT);
+    }
+    delete[] entries_;
+}
+
+auto PublicFileForkPreparation::prepare(ker::mod::sched::task::Task& parent, const ker::mod::sched::task::LazyVmemClone& source) -> int {
+    namespace fm = ker::mod::mm::file_mapping;
+    if (prepared_ || entries_ != nullptr) return -EBUSY;
+    if (!ker::mod::sched::interrupts_enabled() || ker::mod::sched::preempt_count() != 0) return -EWOULDBLOCK;
+    size_t count = 0;
+    for (auto const& row : source.ranges()) count += row.kind == LazyVmemKind::TMPFS_READ_SHARED;
+    if (count > SIZE_MAX / sizeof(Entry)) return -EOVERFLOW;
+    if (count != 0) {
+        entries_ = new (std::nothrow) Entry[count]{};
+        if (entries_ == nullptr) return -ENOMEM;
+    }
+    count_ = count;
+    {
+        SharedVmemPublicationGuard publication;
+        if (!source.matches(parent)) return -EAGAIN;
+        size_t index = 0;
+        for (auto const& row : source.ranges()) {
+            if (row.kind != LazyVmemKind::TMPFS_READ_SHARED) continue;
+            auto& entry = entries_[index++];
+            entry.start = row.start;
+            entry.end = row.end;
+            entry.offset = row.file_offset;
+            entry.family = row.lifetime;
+            bool exact = false;
+            if (!entry.family || entry.family->backing_mode() != fm::FileMappingBackingMode::TMPFS_DEMAND_READ_SHARED ||
+                !ker::mod::mm::virt::query_current_file_binding(parent, row.start, row.end, entry.source, exact) || !exact ||
+                !entry.source || entry.source->lifetime() != entry.family || entry.source->file_offset() != row.file_offset)
+                return -EAGAIN;
+        }
+    }
+    for (size_t i = 0; i < count_; ++i) {
+        entries_[i].child = fm::FileMappingBinding::prepare_unbound(*entries_[i].family);
+        if (entries_[i].child == nullptr) return -ENOMEM;
+    }
+    prepared_ = true;
+    return 0;
+}
+
+auto PublicFileForkPreparation::matches(ker::mod::sched::task::Task& parent) -> bool {
+    if (!prepared_) return false;
+    for (size_t i = 0; i < count_; ++i) {
+        auto& entry = entries_[i];
+        bool exact = false;
+        if (entry.validation || !ker::mod::mm::virt::query_current_file_binding(parent, entry.start, entry.end, entry.validation, exact) ||
+            !exact || entry.validation != entry.source)
+            return false;
+    }
+    return true;
+}
+
+auto PublicFileForkPreparation::attach(ker::mod::sched::task::Task& child) -> bool {
+    if (!prepared_ || child.pagemap == nullptr) return false;
+    for (size_t i = 0; i < count_; ++i) {
+        auto& entry = entries_[i];
+        if (!ker::mod::mm::virt::attach_unpublished_file_binding(entry.child, child.pagemap, entry.start, entry.end, entry.offset))
+            return false;
+    }
+    prepared_ = false;
+    return true;
+}
+
 auto validate_native_unpublished_mapping_owners(ker::mod::sched::task::Task& task) -> bool {
     namespace fm = ker::mod::mm::file_mapping;
     auto* record = task.native_file_mapping_retirement.load(std::memory_order_acquire);
@@ -3767,6 +4140,10 @@ auto anon_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size, uint64
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
     }
 
+    // This first public profile has no managed relocation/split transaction.
+    // Refuse before allocating a destination or acquiring either copy pin.
+    if (public_shared_file_overlap(*task, old_addr, OLD_SIZE)) return static_cast<uint64_t>(-EOPNOTSUPP);
+
     if (NEW_SIZE == OLD_SIZE) {
         return old_addr;
     }
@@ -3910,7 +4287,10 @@ auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -
                 return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
             }
 
+            if (public_shared_file_overlap(*task, ADDR, size)) return change_public_shared_file(*task, ADDR, size, true, PROT);
+
             SharedVmemPublicationGuard publication_guard;
+            if (public_shared_file_overlap(*task, ADDR, size)) return static_cast<uint64_t>(-EAGAIN);
             if (overlaps_kernel_managed_user_layout_locked(task, ADDR, size)) {
                 return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
             }

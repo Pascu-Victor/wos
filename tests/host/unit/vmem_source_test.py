@@ -17,6 +17,7 @@ THREADING_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "thre
 SHM_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "shm" / "shm.cpp"
 VMEM_ABI_HPP = ROOT / "modules" / "kern" / "src" / "abi" / "callnums" / "vmem.h"
 DEBUG_FLAGS_DOC = ROOT / "docs" / "kernel_debug_flags.md"
+SYSCALL_PREPARATION_HPP = ROOT / "modules/kern/src/platform/sys/syscall_preparation.hpp"
 
 
 def fail(message: str) -> None:
@@ -856,9 +857,16 @@ def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
         [
             "std::array<uint64_t, 2> prepared_stack_words{};",
             "copy_from_task(*parent, user_sp, prepared_stack_words.data(), sizeof(prepared_stack_words))",
+            "SyscallPreparationScope preparation(*parent);",
+            "if (!preparation.ready())",
+            "LazyVmemClone lazy_snapshot;",
+            "lazy_snapshot.prepare(*parent)",
+            "abandoned(",
+            "LegacyInterval legacy_context(preparation);",
             "ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;",
+            "if (!lazy_snapshot.matches(*parent))",
             "Task::create_user_thread(parent, tcb_va, user_sp, enter_va, prepared_stack_words.at(0),",
-            "prepared_stack_words.at(1), &stack_exhausted);",
+            "prepared_stack_words.at(1), &stack_exhausted, &lazy_snapshot);",
             "uint64_t const NEW_TID = t->namespace_tid();",
             "post_task_for_cpu(TARGET_CPU, t)",
         ],
@@ -884,9 +892,12 @@ def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
         task_source,
         [
             "Task* Task::create_user_thread(Task* parent",
-            "clone_lazy_vmem_ranges(*t, *parent)",
+            "prepared_lazy != nullptr ? !prepared_lazy->matches(*parent) : !clone_lazy_vmem_ranges(*t, *parent)",
             "parent->shares_user_pagemap.store(true, std::memory_order_release);",
             "t->shares_user_pagemap.store(true, std::memory_order_release);",
+            "resource::bind_thread_owner(*t, *parent)",
+            "prepared_lazy != nullptr && !prepared_lazy->consume(*t)",
+            "destroy_unpublished_user_thread(t)",
         ],
         "thread shared-pagemap marking",
     )
@@ -895,14 +906,29 @@ def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
     require_ordered_tokens(
         clone_vm,
         [
+            "SyscallPreparationScope preparation(*parent);",
+            "if (!preparation.ready())",
+            "LazyVmemClone lazy_snapshot;",
+            "lazy_snapshot.prepare(*parent)",
+            "LegacyInterval legacy_context(preparation);",
             "ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;",
+            "if (!lazy_snapshot.matches(*parent))",
             "child->pagemap = parent->pagemap;",
-            "clone_lazy_vmem_ranges(*child, *parent)",
+            "!lazy_snapshot.consume(*child)",
             "parent->shares_user_pagemap.store(true, std::memory_order_release);",
             "child->shares_user_pagemap.store(true, std::memory_order_release);",
             "post_task_balanced(child)",
         ],
-        "clone-VM lazy-range clone through scheduler publication",
+        "clone-VM prepared lazy rows through scheduler publication",
+    )
+    if "clone_lazy_vmem_ranges(*child, *parent)" in clone_vm:
+        fail("CLONE_VM must consume prepared owners rather than allocate a row clone under publication")
+    require_ordered_tokens(
+        SYSCALL_PREPARATION_HPP.read_text(),
+        ["class LegacyInterval", "restore_enabled_(preparation.ready() && sched::interrupts_enabled())",
+         'if (restore_enabled_) asm volatile("cli"', "~LegacyInterval()",
+         'if (restore_enabled_) asm volatile("sti"'],
+        "legacy constructor interval restores preparation IF before deferred owner cleanup",
     )
 
 
@@ -912,17 +938,25 @@ def test_fork_snapshots_all_vm_surfaces_under_one_publication_guard() -> None:
     fork = function_body(process, "wos_proc_fork")
     snapshot = block_between(
         fork,
-        "bool fork_vm_snapshot_ok = false;",
+        "sys::SyscallPreparationScope preparation(*parent);",
         "if (!fork_vm_snapshot_ok)",
         "regular fork VM snapshot",
     )
     require_ordered_tokens(
         snapshot,
         [
+            "LazyVmemClone lazy_snapshot;",
+            "PublicFileForkPreparation public_bindings;",
+            "preparation.ready() ? lazy_snapshot.prepare(*parent)",
+            "public_bindings.prepare(*parent, lazy_snapshot)",
+            "LegacyInterval legacy_context(preparation);",
             "SharedVmemPublicationGuard publication_guard;",
+            "!lazy_snapshot.matches(*parent) || !public_bindings.matches(*parent)",
             "child->mmap_next.store(parent->mmap_next.load(std::memory_order_relaxed)",
-            "clone_lazy_vmem_ranges(*child, *parent)",
+            "lazy_snapshot.consume(*child)",
+            "sched::PreemptGuard const COW_PREEMPT;",
             "deep_copy_user_pagemap_cow(parent->pagemap, child->pagemap)",
+            "public_bindings.attach(*child)",
             "shm_clone_for_fork_locked(parent, child)",
             "clone_file_mmap_ranges_for_pagemap_locked(parent->pagemap, child->pagemap)",
         ],
@@ -930,6 +964,8 @@ def test_fork_snapshots_all_vm_surfaces_under_one_publication_guard() -> None:
     )
     if "release_file_mmap_ranges_for_pagemap" in snapshot or "shm_cleanup_for_task" in snapshot:
         fail("regular fork rollback must run after dropping the shared VM publication guard")
+    if "clone_lazy_vmem_ranges(*child, *parent)" in snapshot:
+        fail("fork must consume prepared rows before COW and attach fresh child bindings afterward")
 
     failed_snapshot = block_between(
         fork,

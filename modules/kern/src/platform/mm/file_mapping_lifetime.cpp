@@ -158,6 +158,24 @@ auto FileMappingLifetime::prepare_read_shared_tmpfs(ker::vfs::File& borrowed_fil
     return owner;
 }
 
+auto FileMappingLifetime::prepare_demand_read_shared_tmpfs(ker::vfs::File& borrowed_file, uint64_t file_offset, uint64_t length, int& error)
+    -> FileMappingLifetime* {
+    std::unique_ptr<ker::vfs::tmpfs::TmpfsDemandReadSharedBacking> backing;
+    error = ker::vfs::tmpfs::TmpfsDemandReadSharedBacking::prepare(borrowed_file, file_offset, length, backing);
+    if (error != 0) return nullptr;
+    auto* owner = prepare(borrowed_file);
+    if (owner == nullptr) {
+        error = -ENOMEM;
+        return nullptr;
+    }
+    // The strict backend graph owns no Task. Only the actual permanent
+    // executor supplies this unobserved callback and accounts through return.
+    owner->demand_read_shared_backing_ = std::move(backing);
+    owner->backing_mode_ = FileMappingBackingMode::TMPFS_DEMAND_READ_SHARED;
+    error = 0;
+    return owner;
+}
+
 auto FileMappingLifetime::try_acquire(FamilyOwner role) noexcept -> bool {
     OwnerCountGuard const GUARD;
     return acquire_owner(owners_, role);
@@ -209,6 +227,7 @@ auto FileMappingLifetime::finish(void* argument) noexcept -> int {
     // The actual close has returned. Release canonical frames, EOF/node owners
     // and finally mount busy ownership before the executor publishes RETURNED.
     owner->read_shared_backing_.reset();
+    owner->demand_read_shared_backing_.reset();
     delete owner;
     return RESULT;
 }
@@ -438,6 +457,31 @@ auto FileMappingIndex::count_root_locked(paging::PageTable* root, uint64_t root_
         ++found;
     }
     count = found;
+    return true;
+}
+
+auto FileMappingIndex::overlap_locked(paging::PageTable* root, uint64_t root_incarnation, uint64_t start, uint64_t end,
+                                      FileMappingBinding*& owned, bool& exact) noexcept -> bool {
+    constexpr uint64_t PAGE_MASK = paging::PAGE_SIZE - 1;
+    if (owned != nullptr || root_incarnation == 0 || start >= end || end > sys::usercopy::USER_ADDR_LIMIT ||
+        ((start | end) & PAGE_MASK) != 0 || !root_matches_locked(root, root_incarnation))
+        return false;
+    FileMappingBinding* first = nullptr;
+    bool one_exact = true;
+    for (auto* current = heads_[bucket(root)]; current != nullptr; current = current->index_next_) {
+        if (current->root_ != root || current->start_ >= end || start >= current->end_) continue;
+        if (first == nullptr) {
+            first = current;
+            one_exact = current->start_ == start && current->end_ == end;
+        } else {
+            one_exact = false;
+        }
+    }
+    // Finish validation before acquiring the sole result owner. Failure never
+    // needs a terminal release under the caller's actual pin lock.
+    if (first != nullptr && !first->try_acquire(BindingOwner::SNAPSHOT)) return false;
+    owned = first;
+    exact = one_exact;
     return true;
 }
 

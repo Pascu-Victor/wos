@@ -107,6 +107,7 @@ class TmpfsNodeRef {
    private:
     friend class TmpfsLookupHandle;
     friend class TmpfsReadSharedBacking;
+    friend class TmpfsDemandReadSharedBacking;
     friend auto tmpfs_acquire_node(TmpNode* node) -> TmpfsNodeRef;
     friend auto tmpfs_acquire_lookup(const ker::mod::security::Snapshot& credentials, TmpNode* root, const char* path,
                                      TmpfsLookupHandle* out) -> int;
@@ -137,6 +138,7 @@ class TmpfsPageLoan {
 
    private:
     friend class TmpfsReadSharedBacking;
+    friend class TmpfsDemandReadSharedBacking;
     void* frame_ = nullptr;
     uint64_t object_identity_ = 0;
     uint64_t file_offset_ = 0;
@@ -165,6 +167,37 @@ class TmpfsReadSharedBacking {
     NativeFileMappingMountPin mount_pin_{};
     TmpfsNodeRef node_{};
     std::array<void*, MAX_NATIVE_BACKING_PAGES> anchors_{};
+    uint64_t object_identity_ = 0;
+    uint64_t eof_ = 0;
+    uint64_t file_offset_ = 0;
+    uint64_t length_ = 0;
+    bool eof_lease_ = false;
+};
+
+// Public demand preparation is sleepable: never enter either method while
+// holding MM/root/publication/IRQ guards or a persistent usercopy/page pin.
+// Admission owns fixed EOF and backend identity without prefaulting pages.
+class TmpfsDemandReadSharedBacking {
+   public:
+    TmpfsDemandReadSharedBacking(const TmpfsDemandReadSharedBacking&) = delete;
+    auto operator=(const TmpfsDemandReadSharedBacking&) -> TmpfsDemandReadSharedBacking& = delete;
+    TmpfsDemandReadSharedBacking(TmpfsDemandReadSharedBacking&&) = delete;
+    auto operator=(TmpfsDemandReadSharedBacking&&) -> TmpfsDemandReadSharedBacking& = delete;
+    ~TmpfsDemandReadSharedBacking();
+
+    static auto prepare(File& file, uint64_t file_offset, uint64_t length, std::unique_ptr<TmpfsDemandReadSharedBacking>& empty) -> int;
+    auto object_identity() const -> uint64_t { return object_identity_; }
+    auto eof() const -> uint64_t { return eof_; }
+    auto file_offset() const -> uint64_t { return file_offset_; }
+    auto length() const -> uint64_t { return length_; }
+    // Requires a retained backing owner. Output must be empty and is unchanged
+    // on refusal. Success owns one frame ref; no relocating descriptor escapes.
+    auto prepare_page(uint64_t absolute_aligned_offset, TmpfsPageLoan& empty) const -> int;
+
+   private:
+    TmpfsDemandReadSharedBacking() = default;
+    NativeFileMappingMountPin mount_pin_{};
+    TmpfsNodeRef node_{};
     uint64_t object_identity_ = 0;
     uint64_t eof_ = 0;
     uint64_t file_offset_ = 0;

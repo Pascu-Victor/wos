@@ -89,6 +89,10 @@ auto FileMappingLifetime::try_acquire(FamilyOwner) noexcept -> bool {
 void FileMappingLifetime::release(FamilyOwner) noexcept {
     fixture::check(false, "RAW-only Host entered native family release"); std::abort();
 }
+auto FileMappingBinding::reclassify(BindingOwner, BindingOwner) noexcept -> bool { std::abort(); }
+void FileMappingBinding::release(BindingOwner) noexcept { std::abort(); }
+auto FileMappingIndex::retain_for_pin_locked(paging::PageTable*, uint64_t, uint64_t, FileMappingBinding*&) noexcept
+    -> FileMappingPinResult { std::abort(); }
 }
 namespace ker::mod::sys { using Spinlock = fixture::Lock; }
 namespace ker::vfs { struct File; void vfs_retain_file(File*); void vfs_put_file(File*); }
@@ -139,6 +143,12 @@ constexpr uint64_t PADDR_INVALID = UINT64_MAX;
 constexpr size_t USER_PAGEMAP_ACCESS_GATE_NONE = SIZE_MAX;
 std::array<fixture::Gate, 2> user_pagemap_access_gates;
 fixture::Lock cow_pte_lock;
+fixture::Lock user_mapping_pin_lock;
+file_mapping::FileMappingIndex file_mapping_index;
+struct RawExcludedRootControl { uint64_t serial{}; };
+auto find_user_root_control_locked(PageTable*) -> RawExcludedRootControl* { std::abort(); }
+auto prepare_captured_tmpfs_read_shared_page(sched::task::Task&,const sched::task::LazyVmemRange&,uint64_t,uint64_t,
+                                            file_mapping::FileMappingBinding&) -> bool { std::abort(); }
 uint64_t page_align_down(uint64_t address) { return address & ~uint64_t{4095}; }
 uint64_t translate(PageTable*, uint64_t) { return PADDR_INVALID; }
 bool acquire_user_pagemap_access(PageTable* root, bool, size_t& index) {
@@ -407,8 +417,10 @@ def generate(virt: str, task: str, virt_path: Path, task_header: str) -> tuple[s
     actual.append({"name": "actual-work-pool-declarations", "bytes": len(declarations.encode()),
                    "sha256": hashlib.sha256(declarations.encode()).hexdigest()})
     bodies = []
-    for name in ["lazy_file_range_matches", "release_user_pagemap_access", "wake_lazy_file_fault_worker",
+    for name in ["lazy_file_range_matches", "file_binding_matches_range", "release_user_pagemap_access", "wake_lazy_file_fault_worker",
                  "probe_lazy_file_fault", "take_lazy_file_fault", "finish_lazy_file_fault", "lazy_file_fault_worker_loop"]:
+        if name == "file_binding_matches_range" and "auto file_binding_matches_range(" not in virt:
+            continue  # Genuine older whole sources have no demand binding branch.
         body, row = capture(virt, name)
         actual.append(row)
         bodies.append(f'#line {row["line"]} {json.dumps(str(virt_path))}\n{body}')

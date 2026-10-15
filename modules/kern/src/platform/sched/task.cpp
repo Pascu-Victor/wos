@@ -24,6 +24,7 @@
 #include <platform/mm/user_layout.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/frame_class.hpp>
+#include <platform/sched/lazy_vmem.hpp>
 #include <platform/sched/resource.hpp>
 #include <platform/sched/resource_as.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -932,21 +933,31 @@ auto complete_unpublished_process_construction(Task* task, int* interpreter_erro
 }
 
 auto clone_lazy_vmem_ranges(Task& dst, Task& src) -> bool {
+    if (!dst.lazy_vmem_ranges.empty()) return false;
+    size_t retained = 0;
     uint64_t const IRQF = src.lazy_vmem_lock.lock_irqsave();
     if (src.native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr) {
         src.lazy_vmem_lock.unlock_irqrestore(IRQF);
         return false;
     }
-    bool const OK = dst.lazy_vmem_ranges.clone_from(src.lazy_vmem_ranges);
-    if (OK) {
+    bool ok = true;
+    for (auto const& range : src.lazy_vmem_ranges) ok &= !lazy_vmem_has_lifetime(range);
+    if (ok) ok = dst.lazy_vmem_ranges.clone_from(src.lazy_vmem_ranges);
+    if (ok) {
         for (const auto& range : dst.lazy_vmem_ranges) {
-            if (range.kind == LazyVmemKind::FILE_BACKED && range.file != nullptr) {
-                ker::vfs::vfs_retain_file(range.file);
+            if (!try_retain_lazy_vmem_range(range)) {
+                ok = false;
+                break;
             }
+            ++retained;
         }
     }
     src.lazy_vmem_lock.unlock_irqrestore(IRQF);
-    return OK;
+    if (!ok) {
+        for (size_t i = 0; i < retained; ++i) release_lazy_vmem_range(dst.lazy_vmem_ranges.at(i));
+        dst.lazy_vmem_ranges.clear();
+    }
+    return ok;
 }
 
 void release_lazy_vmem_ranges(Task& task) {
@@ -956,13 +967,7 @@ void release_lazy_vmem_ranges(Task& task) {
     task.lazy_vmem_ranges = LazyVmemRangeVec{};
     task.lazy_vmem_lock.unlock_irqrestore(IRQF);
 
-    for (const auto& range : ranges) {
-        if (range.kind == LazyVmemKind::NATIVE_FILE_BACKED && range.lifetime != nullptr) {
-            range.lifetime->release(mm::file_mapping::FamilyOwner::LAZY);
-        } else if (range.kind == LazyVmemKind::FILE_BACKED && range.file != nullptr) {
-            ker::vfs::vfs_put_file(range.file);
-        }
-    }
+    release_lazy_vmem_range_refs(ranges);
 }
 
 #ifdef WOS_SELFTEST
@@ -1741,7 +1746,7 @@ auto Task::initialize_process_image(const ker::loader::elf::ElfFileView& elf, co
 }
 
 Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_sp, uint64_t enter_thread_va, uint64_t entry_va,
-                               uint64_t user_arg_va, bool* stack_exhausted) {
+                               uint64_t user_arg_va, bool* stack_exhausted, LazyVmemClone* prepared_lazy) {
     if (stack_exhausted != nullptr) {
         *stack_exhausted = false;
     }
@@ -1791,7 +1796,7 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     t->interp_vaddr_end = parent->interp_vaddr_end;
     t->at_random_addr = parent->at_random_addr;
     t->mmap_next.store(parent->mmap_next.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    if (!clone_lazy_vmem_ranges(*t, *parent)) {
+    if (prepared_lazy != nullptr ? !prepared_lazy->matches(*parent) : !clone_lazy_vmem_ranges(*t, *parent)) {
         delete[] t->name;
         mm::phys::page_free(reinterpret_cast<void*>(KSTACK_BASE));
         delete t;
@@ -1804,7 +1809,7 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     auto* thr = new threading::Thread{};
     uint64_t stack_base = 0;
     uint64_t stack_size = 0;
-    (void)infer_user_stack_range(t, user_sp, stack_base, stack_size);
+    (void)infer_user_stack_range(prepared_lazy != nullptr ? parent : t, user_sp, stack_base, stack_size);
     thr->magic = 0xDEADBEEF;
     thr->fsbase = tcb_vaddr;
     thr->gsbase = 0;
@@ -1926,6 +1931,10 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     t->precharged_syscall_time_us = 0;
 
     if (!resource::bind_thread_owner(*t, *parent)) {
+        destroy_unpublished_user_thread(t);
+        return nullptr;
+    }
+    if (prepared_lazy != nullptr && !prepared_lazy->consume(*t)) {
         destroy_unpublished_user_thread(t);
         return nullptr;
     }

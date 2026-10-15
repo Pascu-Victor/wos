@@ -17,6 +17,7 @@
 #include <platform/security/compartment_host.hpp>
 #include <platform/security/compartment_wki.hpp>
 #include <platform/sys/mutex.hpp>
+#include <platform/sys/syscall_preparation.hpp>
 #include <utility>
 
 #include "abi/callnums/process.h"
@@ -36,6 +37,7 @@
 #include "platform/perf/perf_events.hpp"
 #include "platform/power/power.hpp"
 #include "platform/sched/frame_class.hpp"
+#include "platform/sched/lazy_vmem.hpp"
 #include "platform/sched/resource.hpp"
 #include "platform/sched/scheduler.hpp"
 #include "platform/sched/task.hpp"
@@ -906,26 +908,43 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     // Snapshot every address-space surface under one publication boundary.
     // Cleanup is deliberately deferred until after the sleepable guard drops:
     // file-range release may perform VFS writeback.
+    sys::SyscallPreparationScope preparation(*parent);
+    sched::task::LazyVmemClone lazy_snapshot;
+    ker::syscall::vmem::PublicFileForkPreparation public_bindings;
+    int fork_vm_error = preparation.ready() ? lazy_snapshot.prepare(*parent) : -EWOULDBLOCK;
+    if (fork_vm_error == 0) fork_vm_error = public_bindings.prepare(*parent, lazy_snapshot);
+    sys::SyscallPreparationScope::LegacyInterval legacy_context(preparation);
     bool fork_vm_snapshot_ok = false;
-    {
+    if (fork_vm_error == 0) {
         ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
-        child->entry = parent->entry;
-        child->program_header_addr = parent->program_header_addr;
-        child->elf_header_addr = parent->elf_header_addr;
-        child->image_load_base = parent->image_load_base;
-        child->image_vaddr_start = parent->image_vaddr_start;
-        child->image_vaddr_end = parent->image_vaddr_end;
-        child->program_header_count = parent->program_header_count;
-        child->program_header_ent_size = parent->program_header_ent_size;
-        child->interp_base = parent->interp_base;
-        child->interp_vaddr_start = parent->interp_vaddr_start;
-        child->interp_vaddr_end = parent->interp_vaddr_end;
-        child->at_random_addr = parent->at_random_addr;
-        child->mmap_next.store(parent->mmap_next.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        fork_vm_snapshot_ok = sched::task::clone_lazy_vmem_ranges(*child, *parent) &&
-                              mm::virt::deep_copy_user_pagemap_cow(parent->pagemap, child->pagemap) &&
-                              ker::syscall::shm::shm_clone_for_fork_locked(parent, child) &&
-                              ker::syscall::vmem::clone_file_mmap_ranges_for_pagemap_locked(parent->pagemap, child->pagemap);
+        if (!lazy_snapshot.matches(*parent) || !public_bindings.matches(*parent)) {
+            fork_vm_error = -EAGAIN;
+        } else {
+            child->entry = parent->entry;
+            child->program_header_addr = parent->program_header_addr;
+            child->elf_header_addr = parent->elf_header_addr;
+            child->image_load_base = parent->image_load_base;
+            child->image_vaddr_start = parent->image_vaddr_start;
+            child->image_vaddr_end = parent->image_vaddr_end;
+            child->program_header_count = parent->program_header_count;
+            child->program_header_ent_size = parent->program_header_ent_size;
+            child->interp_base = parent->interp_base;
+            child->interp_vaddr_start = parent->interp_vaddr_start;
+            child->interp_vaddr_end = parent->interp_vaddr_end;
+            child->at_random_addr = parent->at_random_addr;
+            child->mmap_next.store(parent->mmap_next.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            bool copied = false;
+            if (lazy_snapshot.consume(*child)) {
+                // Preparation enabled IF before taking publication. Preserve the
+                // legacy COW interval's no-preemption/no-direct-reclaim premise:
+                // it owns a striped exclusive gate across page-table allocation.
+                sched::PreemptGuard const COW_PREEMPT;
+                copied = mm::virt::deep_copy_user_pagemap_cow(parent->pagemap, child->pagemap);
+            }
+            fork_vm_snapshot_ok = copied && public_bindings.attach(*child) && ker::syscall::shm::shm_clone_for_fork_locked(parent, child) &&
+                                  ker::syscall::vmem::clone_file_mmap_ranges_for_pagemap_locked(parent->pagemap, child->pagemap);
+            if (!fork_vm_snapshot_ok) fork_vm_error = -ENOMEM;
+        }
     }
     if (!fork_vm_snapshot_ok) {
         ker::syscall::shm::shm_cleanup_for_task(child);
@@ -936,7 +955,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         delete[] child->name;
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         delete child;
-        return finish_fork(-ENOMEM, 0, "vm-snapshot");
+        return finish_fork(fork_vm_error, 0, "vm-snapshot");
     }
 
     (void)sched::resource::observe_address_space(*child);
@@ -1471,6 +1490,12 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
         if (ADMISSION != 0) return static_cast<uint64_t>(ADMISSION);
     }
 
+    sys::SyscallPreparationScope preparation(*parent);
+    if (!preparation.ready()) return static_cast<uint64_t>(-EWOULDBLOCK);
+    sched::task::LazyVmemClone lazy_snapshot;
+    int const LAZY_PREPARATION = lazy_snapshot.prepare(*parent);
+    if (LAZY_PREPARATION != 0) return static_cast<uint64_t>(LAZY_PREPARATION);
+
     auto const KERNEL_STACK_BASE = alloc_fork_kernel_stack_with_reclaim();
     if (KERNEL_STACK_BASE == 0) {
         return static_cast<uint64_t>(-ENOMEM);
@@ -1496,15 +1521,19 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
         delete reinterpret_cast<cpu::PerCpu*>(child->context.syscall_scratch_area);
         delete[] child->name;
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
+        // This unpublished child never owns the shared root. Its counted
+        // row owners and heap storage require explicit outside-guard cleanup.
+        sched::task::release_lazy_vmem_ranges(*child);
         child->pagemap = nullptr;
         delete child;
     };
+    auto abandon_child = [&](sched::task::Task*) { cleanup_child(); };
+    std::unique_ptr<sched::task::Task, decltype(abandon_child)> child_owner(child, abandon_child);
 
     if (parent->name != nullptr) {
         size_t const NAME_LEN = std::strlen(parent->name);
         char* name_copy = new char[NAME_LEN + 1];
         if (name_copy == nullptr) {
-            cleanup_child();
             return static_cast<uint64_t>(-ENOMEM);
         }
         std::memcpy(name_copy, parent->name, NAME_LEN + 1);
@@ -1524,7 +1553,6 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
     int const CHILD_PID = static_cast<int>(CHILD_VISIBLE_PID);
     if ((args.parent_tidptr != 0 && !sys::usercopy::copy_value_to_task(*parent, args.parent_tidptr, CHILD_PID)) ||
         (args.child_tidptr != 0 && !sys::usercopy::copy_value_to_task(*parent, args.child_tidptr, CHILD_PID))) {
-        cleanup_child();
         return static_cast<uint64_t>(-EFAULT);
     }
 
@@ -1532,10 +1560,11 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
     // atomic with respect to mmap/munmap/mprotect propagation. Otherwise a
     // WOS_CLONE_VM child can clone the old range set after an update's task
     // snapshot and then publish with permanently stale lazy-fault metadata.
+    sys::SyscallPreparationScope::LegacyInterval legacy_context(preparation);
     ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+    if (!lazy_snapshot.matches(*parent)) return static_cast<uint64_t>(-EAGAIN);
     int const TCB_ADMISSION = sched::threading::clone_tcb_admission(*parent, args.newtls);
     if (TCB_ADMISSION != 0) {
-        cleanup_child();
         return static_cast<uint64_t>(TCB_ADMISSION);
     }
     child->pagemap = parent->pagemap;
@@ -1584,8 +1613,7 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
     child->wki_target_flags = sched::task::Task::WKI_TARGET_FLAG_LOCAL;
 
     if (sched::resource::initialize_credentials(*child, PARENT_CREDENTIALS) != 0 ||
-        !child->wki_vfs_rules.clone_from(parent->wki_vfs_rules) || !sched::task::clone_lazy_vmem_ranges(*child, *parent)) {
-        cleanup_child();
+        !child->wki_vfs_rules.clone_from(parent->wki_vfs_rules) || !lazy_snapshot.consume(*child)) {
         return static_cast<uint64_t>(-ENOMEM);
     }
     parent->shares_user_pagemap.store(true, std::memory_order_release);
@@ -1594,7 +1622,6 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
 
     auto* child_thread = new sched::threading::Thread();
     if (child_thread == nullptr) {
-        cleanup_child();
         return static_cast<uint64_t>(-ENOMEM);
     }
     if (parent->thread != nullptr) {
@@ -1609,7 +1636,6 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
     child_thread->stack_lowest_backed = 0;
     child->thread = child_thread;
     if (PRIVATE_CLONE && !sched::threading::publish_tid_to_tcb(*child, child_fsbase, CHILD_VISIBLE_PID, false)) {
-        cleanup_child();
         return static_cast<uint64_t>(-EFAULT);
     }
     ker::mod::sys::signal::sync_task_signal_mask_cache_mapped(child);
@@ -1617,7 +1643,6 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
     child->context.syscall_kernel_stack = KERNEL_RSP;
     auto* per_cpu = new cpu::PerCpu();
     if (per_cpu == nullptr) {
-        cleanup_child();
         return static_cast<uint64_t>(-ENOMEM);
     }
     per_cpu->syscall_stack = KERNEL_RSP;
@@ -1639,19 +1664,16 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
                                                             ker::mod::sched::task::SavedFrameOrigin::SYNTHETIC_USER_RETURN);
 
     if (!clone_fd_table_shared_checked(parent, child)) {
-        cleanup_child();
         return static_cast<uint64_t>(-ENOMEM);
     }
 
     if (!child_events::begin_publication(*parent, *child)) {
-        cleanup_child();
         return static_cast<uint64_t>(-ENOMEM);
     }
 
     bool const PUBLICATION_REF = child->try_acquire_lifetime_ref();
     if (!PUBLICATION_REF || !process_reservation.attach(*child) || !sched::post_task_balanced(child)) {
         if (PUBLICATION_REF) child->release();
-        cleanup_child();
         return static_cast<uint64_t>(-ENOMEM);
     }
     if (!child_events::commit_publication(*child)) [[unlikely]] {
@@ -1660,6 +1682,7 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
         process_log::error("clone-vm: lifecycle commit completed concurrently for published child PID %x", child->pid);
     }
 
+    (void)child_owner.release();
     child->release();
     return CHILD_VISIBLE_PID;
 }

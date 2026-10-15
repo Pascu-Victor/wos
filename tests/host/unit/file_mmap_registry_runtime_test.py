@@ -129,7 +129,7 @@ struct World {
             expected.at(root).at(va-BASE)={static_cast<int>(origin)};
     }
     void seed(unsigned count,bool one_root=false) {
-        for(unsigned i=0;i<count;++i) {
+        for(unsigned i=anchors.size();i<count;++i) {
             Range anchor{.pagemap=&roots.at(one_root?0:i%roots.size()), .start=BASE+i*STRIDE,
                          .length=32, .file_offset=1000+i*127, .file=&files.at(i%files.size()),
                          .writeback=(i%2)!=0};
@@ -225,15 +225,20 @@ void growth_case(unsigned count,unsigned index,Cut cut) {
         case Cut::NONE: first=last+1; last=first+4; break;
     }
     unsigned grows=successful_growth;
+    bool const FULL=actual::g_file_mmap_ranges.size()==actual::g_file_mmap_ranges.capacity();
     bool changed=false;
     check(actual::unregister_one_file_mmap_overlap(anchor.pagemap,first,last,&changed)==0,"actual overlap transaction succeeds");
     check(changed==(cut!=Cut::NONE),"actual removed_any exact affected-row outcome");
-    if(cut==Cut::MIDDLE) check(successful_growth==grows+1,"real SmallVec heap reallocation forced");
-    else check(successful_growth==grows,"trim/remove/no-match needs no allocation");
+    if(cut==Cut::MIDDLE && FULL) check(successful_growth==grows+1,"full real SmallVec heap reallocation forced");
+    else check(successful_growth==grows,"spare-capacity split/trim/remove/no-match needs no allocation");
     world.erase(anchor.pagemap->identity,first,last); world.verify();
 }
 void allocation_failure(unsigned count,unsigned index) {
     World world; world.seed(count); Range anchor=world.anchors.at(index);
+    // Preserve the original target and byte oracle, then fill actual spare
+    // capacity so this failure seam necessarily reaches real SmallVec growth.
+    check(actual::g_file_mmap_ranges.capacity()<=MAX_ROWS,"bounded real registry capacity");
+    world.seed(actual::g_file_mmap_ranges.capacity());
     auto before=world.snapshot(); auto refs=world.references(); unsigned failures_before=failed_growth;
     fail_growth_after=0; bool changed=true;
     int result=actual::unregister_one_file_mmap_overlap(anchor.pagemap,anchor.start+8,anchor.start+24,&changed);
@@ -251,15 +256,15 @@ void all_geometries() {
 }
 void clone(bool oom) {
     World world; world.seed(33,true); auto before=world.snapshot(); unsigned failed_before=failed_growth;
-    fail_growth_after=oom?1:-1;
+    fail_growth_after=oom?0:-1;
     bool ok=actual::clone_file_mmap_ranges_for_pagemap_locked(&world.roots.at(0),&world.roots.at(1));
     fail_growth_after=-1;
     check(ok==!oom,"actual clone success/OOM result");
-    // Real current SmallVec has heap capacity32 at seed33. The first clone
-    // grow succeeds to64; exactly31 new child rows precede the next grow.
+    // Total capacity includes 32 inline rows plus 32 heap rows at seed33.
+    // Exactly31 child rows fit before the first clone growth is refused.
     unsigned child_rows=oom?31:33;
     check(actual::g_file_mmap_ranges.size()==33+child_rows,"clone exact owned prefix on allocation failure");
-    if(oom) check(failed_growth==failed_before+1,"clone controlled second growth failed");
+    if(oom) check(failed_growth==failed_before+1,"clone controlled first growth failed");
     for(unsigned i=0;i<child_rows;++i) world.paint(1,i);
     for(unsigned i=0;i<before.size();++i) check(same(before.at(i),actual::g_file_mmap_ranges.at(i)),"clone preserves source rows");
     world.verify();
@@ -284,8 +289,8 @@ void invalid_inputs() {
 }
 int main() {
     using namespace fixture;
-    // The archived predecessor reaches this real heap-row split first. Its
-    // complete body compiles, then ASan reports the post-growth stale access.
+    // Preserve the original33-row split with corrected inline+heap capacity;
+    // the full64/128-row cases below force real heap-row invalidation.
     growth_case(33,32,Cut::MIDDLE);
     for(unsigned count:std::array<unsigned,3>{33,64,128}) {
         for(unsigned index:std::array<unsigned,2>{32,count-1}) {

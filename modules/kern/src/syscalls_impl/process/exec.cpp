@@ -42,6 +42,7 @@
 #include <platform/power/power.hpp>
 #include <platform/random/entropy.hpp>
 #include <platform/sched/frame_class.hpp>
+#include <platform/sched/lazy_vmem.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/security/compartment_wki.hpp>
@@ -1312,14 +1313,7 @@ auto read_exec_load_segment_for_loader(vfs::File* fd, uint8_t* dst, size_t file_
     return 0;
 }
 
-void release_lazy_file_refs(LazyVmemRangeVec& ranges) {
-    for (const auto& range : ranges) {
-        if (range.kind == LazyVmemKind::FILE_BACKED && range.file != nullptr) {
-            vfs::vfs_put_file(range.file);
-        }
-    }
-    ranges.clear();
-}
+void release_lazy_file_refs(LazyVmemRangeVec& ranges) { ker::mod::sched::task::release_lazy_vmem_range_refs(ranges); }
 
 auto append_exec_lazy_file_ranges(LazyVmemRangeVec& out, const loader::elf::ElfLazyLoadRangeVec& loader_ranges, vfs::File* file,
                                   const vfs::Stat& st) -> bool {
