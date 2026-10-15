@@ -3,6 +3,7 @@
 #include <net/wki/remote_compute.hpp>
 #include <platform/dbg/coredump.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/numa_alloc.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/file_growth.hpp>
@@ -367,6 +368,8 @@ KTEST(Resource, StackAdmissionAndAllocationRollback) {
     KREQUIRE_NE(pagemap, nullptr);
     virt::reserve_page_range(pagemap, BASE, 16);
     Task task{};
+    ker::mod::mm::numa::AllocationContext allocation_context{};
+    KREQUIRE_EQ(ker::mod::mm::numa::capture_allocation_context({}, allocation_context), ker::mod::mm::numa::AllocationError::NONE);
     threading::Thread thread{};
     thread.stack_base_virt = BASE;
     thread.stack_size = TOP - BASE;
@@ -376,7 +379,7 @@ KTEST(Resource, StackAdmissionAndAllocationRollback) {
     task.pagemap = pagemap;
     task.thread = &thread;
     KEXPECT_EQ(task.resources.set(STACK, {2 * PAGE, UINT64_MAX}, true, 256), 0);
-    KEXPECT_FALSE(threading::ensure_stack_backing(&thread, pagemap, TOP - 3 * PAGE, TOP, &task));
+    KEXPECT_FALSE(threading::ensure_stack_backing(&thread, pagemap, TOP - 3 * PAGE, TOP, &task, allocation_context));
     KEXPECT_EQ(task.resources.entries[STACK].denied, 1);
     KEXPECT_EQ(task.resources.entries[STACK].current, 0);
     KEXPECT_EQ(thread.stack_lowest_backed, TOP);
@@ -389,12 +392,12 @@ KTEST(Resource, StackAdmissionAndAllocationRollback) {
     KEXPECT_EQ(virt::translate(pagemap, TOP - 2 * PAGE), virt::PADDR_INVALID);
     KEXPECT_EQ(virt::translate(pagemap, TOP - PAGE), virt::PADDR_INVALID);
     KEXPECT_EQ(task.resources.entries[STACK].current, 0);
-    KEXPECT_TRUE(threading::ensure_stack_backing(&thread, pagemap, TOP - 2 * PAGE, TOP, &task));
+    KEXPECT_TRUE(threading::ensure_stack_backing(&thread, pagemap, TOP - 2 * PAGE, TOP, &task, allocation_context));
     KEXPECT_EQ(task.resources.entries[STACK].current, 2 * PAGE);
     auto const EXISTING = virt::translate(pagemap, TOP - 2 * PAGE);
     KEXPECT_NE(EXISTING, virt::PADDR_INVALID);
     KEXPECT_EQ(task.resources.set(STACK, {0, UINT64_MAX}, true, 256), 0);
-    KEXPECT_TRUE(threading::ensure_stack_backing(&thread, pagemap, TOP - 2 * PAGE, TOP, &task));
+    KEXPECT_TRUE(threading::ensure_stack_backing(&thread, pagemap, TOP - 2 * PAGE, TOP, &task, allocation_context));
     KEXPECT_EQ(virt::translate(pagemap, TOP - 2 * PAGE), EXISTING);
     KEXPECT_FALSE(threading::handle_lazy_stack_fault(&thread, pagemap, TOP - 3 * PAGE, TOP - 3 * PAGE, &task));
     KEXPECT_EQ(task.resources.set(STACK, {3 * PAGE, UINT64_MAX}, true, 256), 0);

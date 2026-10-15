@@ -891,8 +891,8 @@ auto destroy_owned_unpublished_process(Task* owner, Task* child) -> bool {
     return true;
 }
 
-auto complete_unpublished_process_construction(Task* task, int* interpreter_error, Task* interpreter_executor,
-                                               bool observe_current_executor) -> bool {
+auto complete_unpublished_process_construction(Task* task, const mm::numa::AllocationContext& allocation_context, int* interpreter_error,
+                                               Task* interpreter_executor, bool observe_current_executor) -> bool {
     if (interpreter_error != nullptr) *interpreter_error = 0;
     if (task != nullptr && task->native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr) return false;
     if (task == nullptr || task->type != TaskType::PROCESS || task->thread == nullptr || task->pagemap == nullptr) {
@@ -917,12 +917,15 @@ auto complete_unpublished_process_construction(Task* task, int* interpreter_erro
         .debug_registry_pid = 0,
         .image_role = mm::user_layout::ImageRole::INTERPRETER,
         .policy_owner = task,
+        .allocation_context = allocation_context,
+        .allocation_origin = loader::elf::ElfAllocationOrigin::EXECUTOR_CAPTURE,
     };
     loader::elf::ElfLoadResult const INTERP_RESULT =
         loader::elf::load_elf(interp_buf, interp_size, task->pagemap, task->pid, "ld.so", INTERP_OPTIONS);
     delete[] interp_buf;
     if (INTERP_RESULT.entry_point == 0) {
         dbg::log("Failed to load interpreter ELF '%s'", task->pending_interp_path.data());
+        if (interpreter_error != nullptr && INTERP_RESULT.error != 0) *interpreter_error = INTERP_RESULT.error;
         return false;
     }
 
@@ -1521,7 +1524,14 @@ Task::Task(const char* name, uint64_t elf_start, size_t elf_size, uint64_t kerne
         return;
     }
 
-    static_cast<void>(initialize_process_image(reinterpret_cast<const uint8_t*>(elf_start), elf_size));
+    // Compatibility raw constructor is explicit trusted LOCAL. Production boot
+    // uses a skeleton and passes one saved context through main + interpreter.
+    mm::numa::AllocationContext allocation_context{};
+    if (mm::numa::capture_allocation_context({}, allocation_context) != mm::numa::AllocationError::NONE) return;
+    loader::elf::ElfLoadOptions const OPTIONS{.policy_owner = this,
+                                              .allocation_context = allocation_context,
+                                              .allocation_origin = loader::elf::ElfAllocationOrigin::TRUSTED_LOCAL};
+    static_cast<void>(initialize_process_image(reinterpret_cast<const uint8_t*>(elf_start), elf_size, OPTIONS));
 }
 
 auto Task::initialize_unpublished_process_skeleton(Task& owner, const char* process_name
@@ -1567,7 +1577,9 @@ auto Task::initialize_unpublished_process_skeleton(Task& owner, const char* proc
     return 0;
 }
 
-auto Task::initialize_process_image(const uint8_t* elf_data, size_t elf_size) -> bool {
+auto Task::initialize_process_image(const uint8_t* elf_data, size_t elf_size, const loader::elf::ElfLoadOptions& options,
+                                    int* construction_error) -> bool {
+    if (construction_error != nullptr) *construction_error = 0;
     if (type != TaskType::PROCESS || pagemap == nullptr || thread != nullptr || entry != 0 || elf_data == nullptr) {
         return false;
     }
@@ -1589,8 +1601,13 @@ auto Task::initialize_process_image(const uint8_t* elf_data, size_t elf_size) ->
         return false;
     }
 
-    this->thread = threading::create_thread(ker::mod::mm::USER_STACK_SIZE, actual_tls_info.tls_size, this->pagemap,
-                                            namespace_process_pid(*this), actual_tls_info, this);
+    if (int const ERROR = loader::elf::image_allocation_context_error(options); ERROR != 0) {
+        if (construction_error != nullptr) *construction_error = ERROR;
+        return false;
+    }
+    this->thread =
+        threading::create_thread(ker::mod::mm::USER_STACK_SIZE, actual_tls_info.tls_size, this->pagemap, namespace_process_pid(*this),
+                                 actual_tls_info, this, options.allocation_context, construction_error);
     if (this->thread == nullptr) {
         dbg::log("Failed to create thread for task %s - OOM", name);
         // Preserve the pagemap for unpublished-process cleanup.
@@ -1616,10 +1633,12 @@ auto Task::initialize_process_image(const uint8_t* elf_data, size_t elf_size) ->
 
     this->context.frame.rsp = this->thread->stack;
 
-    loader::elf::ElfLoadOptions const LOAD_OPTIONS{.policy_owner = this};
+    auto LOAD_OPTIONS = options;
+    LOAD_OPTIONS.policy_owner = this;
     loader::elf::ElfLoadResult elf_result = loader::elf::load_elf(elf_data, elf_size, this->pagemap, this->pid, this->name, LOAD_OPTIONS);
     if (elf_result.entry_point == 0) {
         dbg::log("Failed to load ELF for task %s", name);
+        if (construction_error != nullptr && elf_result.error != 0) *construction_error = elf_result.error;
         fail_process_construction();
         return false;
     }
@@ -1673,7 +1692,9 @@ auto Task::initialize_process_image(const uint8_t* elf_data, size_t elf_size) ->
     return true;
 }
 
-auto Task::initialize_process_image(const ker::loader::elf::ElfFileView& elf, const ker::loader::elf::ElfLoadOptions& options) -> bool {
+auto Task::initialize_process_image(const ker::loader::elf::ElfFileView& elf, const ker::loader::elf::ElfLoadOptions& options,
+                                    int* construction_error) -> bool {
+    if (construction_error != nullptr) *construction_error = 0;
     if (type != TaskType::PROCESS || pagemap == nullptr || thread != nullptr || entry != 0) {
         return false;
     }
@@ -1683,8 +1704,12 @@ auto Task::initialize_process_image(const ker::loader::elf::ElfFileView& elf, co
         dbg::log("Invalid file-backed ELF for task %s", name);
         return false;
     }
-    thread =
-        threading::create_thread(ker::mod::mm::USER_STACK_SIZE, TLS_INFO.tls_size, pagemap, namespace_process_pid(*this), TLS_INFO, this);
+    if (int const ERROR = loader::elf::image_allocation_context_error(options); ERROR != 0) {
+        if (construction_error != nullptr) *construction_error = ERROR;
+        return false;
+    }
+    thread = threading::create_thread(ker::mod::mm::USER_STACK_SIZE, TLS_INFO.tls_size, pagemap, namespace_process_pid(*this), TLS_INFO,
+                                      this, options.allocation_context, construction_error);
     if (thread == nullptr) {
         dbg::log("Failed to create thread for task %s - OOM", name);
         return false;
@@ -1711,6 +1736,7 @@ auto Task::initialize_process_image(const ker::loader::elf::ElfFileView& elf, co
     loader::elf::ElfLoadResult const ELF_RESULT = loader::elf::load_elf(elf, pagemap, pid, name, load_options);
     if (ELF_RESULT.entry_point == 0) {
         dbg::log("Failed to load file-backed ELF for task %s", name);
+        if (construction_error != nullptr && ELF_RESULT.error != 0) *construction_error = ELF_RESULT.error;
         return false;
     }
     entry = ELF_RESULT.entry_point;

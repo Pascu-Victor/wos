@@ -17,7 +17,9 @@ import subprocess
 import tempfile
 import time
 
-R = Path(__file__).resolve().parents[3]
+from exec_trace_ownership_test import function
+
+R = Path(os.environ.get("WOS_INTERPRETER_VIEW_TEST_ROOT", Path(__file__).resolve().parents[3]))
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--elf", type=Path)
 parser.add_argument("--main-elf", type=Path)
@@ -84,10 +86,20 @@ namespace ker::mod::mm {
  uint64_t translate(PageTable*,uint64_t a){return a^0x100000000ULL;}
  template<class...T>void map_page(T...){assert(false);}}
  namespace paging {constexpr uint64_t PAGE_SIZE=4096,PAGE_NX=1ULL<<63;namespace page_types {constexpr uint64_t USER_READONLY=5;} }
- namespace phys {template<class...T>void* page_alloc_may_fail(T...){assert(false);return nullptr;} }
+ namespace phys {enum class PageInitialization:uint8_t{ZERO,FULL_OVERWRITE};template<class...T>void* page_alloc_may_fail(T...){assert(false);return nullptr;} }
+ namespace numa {
+ // Registry-only path never allocates; this parameter endpoint exposes only
+ // the destination index used in the forbidden physical-allocation branches.
+ struct AllocationContext {uint64_t virtual_page_index{};};enum class AllocationError:uint8_t{NONE,EXHAUSTED};enum class ReclaimMode:uint8_t{NEVER};
+ struct Span {bool empty()const{assert(false);return true;}void*data(){assert(false);return nullptr;}void*release(){assert(false);return nullptr;}};
+ struct AllocationResult{Span span;AllocationError error{};};
+ template<class...T>auto try_allocate_pages(T...)->AllocationResult{assert(false);return {};}
+ }
+
 }
 namespace ker::vfs {
-struct File {void* exec_read_view=reinterpret_cast<void*>(1);std::vector<uint8_t>* bytes{};size_t max_read=SIZE_MAX,calls=0;std::vector<ssize_t> plan;size_t plan_index=0;};
+struct File {void* exec_read_view=reinterpret_cast<void*>(1);std::vector<uint8_t>* bytes{};size_t max_read=SIZE_MAX,calls=0;std::vector<ssize_t> plan;size_t plan_index=0;unsigned puts{};};
+void vfs_put_file(File*f){assert(f&&f->puts==0);++f->puts;}
 ssize_t vfs_pread_file(File* f,void* dst,size_t n,off_t offset){
  ++f->calls;assert(offset>=0);assert(static_cast<uint64_t>(offset)<=f->bytes->size());
  if(f->plan_index<f->plan.size()){ssize_t x=f->plan[f->plan_index++];if(x<=0)return x;n=std::min(n,static_cast<size_t>(x));}
@@ -112,7 +124,7 @@ template<class...T>void set_section_headers(T...){assert(false);}template<class.
 '''
 types=span(h,'struct TlsModule {','struct ElfLazyLoadRange {')+span(h,'using ElfReadAt =','auto load_elf(')
 types+=span(h,'struct ElfLazyLoadRange {','using ElfLazyLoadRangeVec =')+'using ElfLazyLoadRangeVec = std::vector<ElfLazyLoadRange>;\n'
-loader=span(lold,'auto header_is_valid(','auto hhdm_to_phys(')+span(lold,'auto parse_elf(','auto view_elf(')+span(lold,'auto view_elf(','auto source_is_valid(').replace('auto view_elf(','auto baseline_view_elf(',1)+span(lnew,'auto view_elf(','auto source_is_valid(')+span(lold,'auto source_is_valid(','constexpr uint32_t SHT_RELR_VALUE')+span(lnew,'constexpr uint64_t HEADER_COPY_VADDR','struct LoadImageExtent {')
+loader=function(lnew,'image_allocation_error')+'\n'+span(lold,'auto header_is_valid(','auto hhdm_to_phys(')+span(lold,'auto parse_elf(','auto view_elf(')+span(lold,'auto view_elf(','auto source_is_valid(').replace('auto view_elf(','auto baseline_view_elf(',1)+span(lnew,'auto view_elf(','auto source_is_valid(')+span(lold,'auto source_is_valid(','constexpr uint32_t SHT_RELR_VALUE')+span(lnew,'constexpr uint64_t HEADER_COPY_VADDR','struct LoadImageExtent {')
 def prep(s):return span(s,'constexpr size_t EXEC_SPARSE_ELF_MIN_SIZE','struct ExecImageReadResult {')+span(s,'auto exec_range_in_file(','auto read_file_range_fully(')
 code=('#define HAS_BASELINE\n' if args.baseline_exec else '')+prelude+types+loader+'\n}\n'
 for label,s in [('baseline',old),('candidate',new)]:
@@ -126,6 +138,7 @@ code+='namespace candidate {\n'+span(new,'    struct NativeScratch {','    auto 
 code+=span(new,'constexpr int MAX_SHEBANG_DEPTH =','\n')+'\n'
 code+=r'''
 using namespace ker::loader::elf;
+ker::mod::mm::numa::AllocationContext allocation_context{};int allocation_error=0;
 using Role=ker::mod::mm::user_layout::ImageRole;
 size_t cases=0,ready=0,fallback=0,invalid=0;
 std::vector<uint8_t> payload;
@@ -146,7 +159,7 @@ void compare(std::vector<uint8_t> b,const char* label){
  for(size_t off:{size_t(0),size_t(64),b.size()/2,b.size()-1}){std::array<uint8_t,33> a{},z{};size_t n=std::min(a.size(),b.size()-off);assert(read_source(original,off,a.data(),n));assert(read_source(view,off,z.data(),n));assert(a==z);}
  std::array<uint8_t,4> tmp{};assert(!read_source(view,UINT64_MAX,tmp.data(),4));assert(!read_source(view,b.size(),tmp.data(),1));assert(read_source(view,UINT64_MAX,nullptr,0));
  DebugMetadataPlan op{},vp{};assert(make_debug_metadata_plan(original,false,op));assert(make_debug_metadata_plan(view,false,vp));assert(!op.install&&!vp.install);
- debug::unregister_process(47);debug::register_process(47,"probe",0,0);assert(load_section_headers(original,nullptr,47,op));auto rows=debug::snapshot(47);debug::unregister_process(47);debug::register_process(47,"probe",0,0);assert(load_section_headers(view,nullptr,47,vp));assert(debug::snapshot(47)==rows);
+ debug::unregister_process(47);debug::register_process(47,"probe",0,0);assert(load_section_headers(original,nullptr,47,op,allocation_context,allocation_error));auto rows=debug::snapshot(47);debug::unregister_process(47);debug::register_process(47,"probe",0,0);assert(load_section_headers(view,nullptr,47,vp,allocation_context,allocation_error));assert(debug::snapshot(47)==rows);
  if(std::string(label)=="actual-ld") {std::printf("actual_ld logical=%zu metadata_and_registry=%zu largest=%zu bytes_read=%zu debug_rows=%zu\n",b.size(),live_bytes,largest,p.bytes_read,rows.size());assert(live_bytes<b.size()/100);assert(!rows.empty());}
  size_t const kept=p.view.section_names_size;p.reset();assert(live_bytes==kept&&live_count==(kept?1:0));assert(debug::snapshot(47)==rows);p.reset();assert(p.view.read_at==nullptr&&p.read_context.file==nullptr);
  }}else if(outcome==candidate::PrepareFileBackedElfResult::FALLBACK){++fallback;p.reset();assert(live_bytes==0);}else if(outcome==candidate::PrepareFileBackedElfResult::INVALID){++invalid;assert(!valid);}else{std::fprintf(stderr,"Unexpected outcome %s %d\n",label,int(outcome));std::abort();}}
@@ -194,8 +207,8 @@ void compact_compatibility(std::vector<uint8_t> b,const char* label){
  TlsModule a{},z{};assert(validated_tls_info(original,a)&&validated_tls_info(view,z));assert(std::memcmp(&a,&z,sizeof(a))==0);
  for(size_t off:{size_t(0),size_t(64),b.size()/2,b.size()-1}){std::array<uint8_t,33> a{},z{};size_t n=std::min(a.size(),b.size()-off);assert(read_source(original,off,a.data(),n)&&read_source(view,off,z.data(),n));assert(a==z);}
  DebugMetadataPlan op{},vp{};assert(make_debug_metadata_plan(original,false,op)&&make_debug_metadata_plan(view,false,vp));
- debug::register_process(48,"main",0,0);assert(load_section_headers(original,nullptr,48,op));auto rows=debug::snapshot(48);debug::unregister_process(48);
- debug::register_process(48,"main",0,0);assert(load_section_headers(view,nullptr,48,vp));assert(debug::snapshot(48)==rows);
+ debug::register_process(48,"main",0,0);assert(load_section_headers(original,nullptr,48,op,allocation_context,allocation_error));auto rows=debug::snapshot(48);debug::unregister_process(48);
+ debug::register_process(48,"main",0,0);assert(load_section_headers(view,nullptr,48,vp,allocation_context,allocation_error));assert(debug::snapshot(48)==rows);
  std::printf("compact_main %s logical=%zu task_metadata=%zu scratch_and_registry=%zu largest=%zu bytes_read=%zu debug_rows=%zu\n",label,b.size(),p.task_metadata_size,live_bytes,largest,p.bytes_read,rows.size());
  assert(live_bytes<b.size()/10&&largest<b.size()/10);
  size_t kept=p.view.section_names_size;auto transferred=p.take_task_metadata();size_t transferred_size=p.task_metadata_size;
@@ -271,6 +284,8 @@ int main(int argc,char**argv){
  }
  for(int failure=0;failure<7;++failure){clear_stats();fail_after=failure;{candidate::NativeScratch frame;frame.prepared_interp.program_headers=new Elf64_Phdr[2]{};frame.prepared_interp.section_headers=new Elf64_Shdr[2]{};frame.prepared_interp.section_names=new char[16]{};frame.interp_buf=new uint8_t[64]{};frame.argv_addrs=new uint64_t[8]{};frame.envp_addrs=new uint64_t[8]{};frame.prepared_elf.task_metadata=new uint8_t[8]{};}assert(live_count==0);++cases;}
  clear_stats();
+ // The actual interpreter scratch now owns and releases its retained File.
+ {ker::vfs::File file;{candidate::NativeScratch frame;frame.interp_file=&file;frame.reset_interp_storage();frame.reset_interp_storage();assert(frame.interp_file==nullptr&&file.puts==1);}assert(file.puts==1);++cases;}
  assert(live_count==0);std::printf("PASS cases=%zu ready=%zu fallback=%zu invalid=%zu main_policy_oracle=1 debug_rows_copied=1\n",cases,ready,fallback,invalid);
 }
 '''
@@ -279,7 +294,9 @@ ld=args.elf
 if ld is not None: inputs[str(ld)]=hashlib.sha256(ld.read_bytes()).hexdigest()
 if args.main_elf is not None: inputs[str(args.main_elf)]=hashlib.sha256(args.main_elf.read_bytes()).hexdigest()
 (O/'inputs.json').write_text(json.dumps(inputs,indent=2)+'\n')
-env=os.environ.copy();env['TMPDIR']=str(O);env['ASAN_OPTIONS']='detect_leaks=1:abort_on_error=1';env['UBSAN_OPTIONS']='halt_on_error=1:print_stacktrace=1'
+# Host runners can execute under ptrace, where LSan refuses to run. Exact
+# allocation/registry ownership assertions above remain active in every vector.
+env=os.environ.copy();env['TMPDIR']=str(O);env['ASAN_OPTIONS']='detect_leaks=0:abort_on_error=1';env['UBSAN_OPTIONS']='halt_on_error=1:print_stacktrace=1'
 compiler=os.environ.get('WOS_HOST_CXX','/usr/bin/g++')
 compile_flags=[compiler,'-std=c++23','-O1','-g','-fcheck-new','-fno-exceptions','-fsanitize=address,undefined','-fno-omit-frame-pointer','-I'+str(O/'include'),'-I'+str(R/'modules')]
 fixture_args=[str(ld) if ld is not None else '-',str(args.main_elf) if args.main_elf is not None else '-']

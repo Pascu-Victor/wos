@@ -6,6 +6,7 @@
 #include <defines/defines.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/mm.hpp>
+#include <platform/mm/numa_alloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/user_layout.hpp>
 #include <platform/mm/virt.hpp>
@@ -58,6 +59,8 @@ struct ElfLazyLoadRange {
 
 using ElfLazyLoadRangeVec = ker::util::SmallVec<ElfLazyLoadRange, 16>;
 
+enum class ElfAllocationOrigin : uint8_t { MISSING = 0, EXECUTOR_CAPTURE = 1, TRUSTED_LOCAL = 2 };
+
 struct ElfLoadOptions {
     bool register_special_symbols = true;
     uint64_t base_address = 0;
@@ -67,7 +70,11 @@ struct ElfLoadOptions {
     uint64_t debug_registry_pid = 0;
     ker::mod::mm::user_layout::ImageRole image_role = ker::mod::mm::user_layout::ImageRole::MAIN;
     ker::mod::sched::task::Task* policy_owner = nullptr;
+    ker::mod::mm::numa::AllocationContext allocation_context{};
+    ElfAllocationOrigin allocation_origin{ElfAllocationOrigin::MISSING};
 };
+// Value validation only; no allocation, CPU capture or Task policy lookup.
+[[nodiscard]] auto image_allocation_context_error(const ElfLoadOptions& options) noexcept -> int;
 
 // Exact, positional read used by file-backed ELF views. Implementations must
 // either fill the complete destination range and return true, or return false.
@@ -114,11 +121,13 @@ struct ElfFile {
 };
 
 auto load_elf(const uint8_t* data, size_t size, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid, const char* process_name,
-              bool register_special_symbols = true, uint64_t base_address = 0) -> ElfLoadResult;
+              const ker::mod::mm::numa::AllocationContext& context, bool register_special_symbols = true, uint64_t base_address = 0)
+    -> ElfLoadResult;
 auto load_elf(const uint8_t* data, size_t size, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid, const char* process_name,
               const ElfLoadOptions& options) -> ElfLoadResult;
 auto load_elf(const ElfFileView& elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid, const char* process_name,
-              bool register_special_symbols = true, uint64_t base_address = 0) -> ElfLoadResult;
+              const ker::mod::mm::numa::AllocationContext& context, bool register_special_symbols = true, uint64_t base_address = 0)
+    -> ElfLoadResult;
 auto load_elf(const ElfFileView& elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid, const char* process_name,
               const ElfLoadOptions& options) -> ElfLoadResult;
 

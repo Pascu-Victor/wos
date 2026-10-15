@@ -1,5 +1,8 @@
 #include "smt.hpp"
 
+#include <platform/loader/elf_loader.hpp>
+#include <platform/mm/numa_alloc.hpp>
+
 #ifdef WOS_SELFTEST
 #include <test/compartment_lifecycle_runtime.hpp>
 #endif
@@ -565,13 +568,20 @@ void create_init_tasks(boot::HandoverModules& mod_struct) {
         const auto& module = mod_struct.modules[i];
         sched::resource::ProcessReservation process_reservation(nullptr, 0);
         uint64_t const TASK_KERNEL_RSP = allocate_kernel_stack_top("init-task-stack");
-        auto* new_task = new sched::task::Task(module.name, reinterpret_cast<uint64_t>(module.entry), module.size, TASK_KERNEL_RSP,
-                                               sched::task::TaskType::PROCESS);
+        mm::numa::AllocationContext allocation_context{};
+        if (mm::numa::capture_allocation_context({}, allocation_context) != mm::numa::AllocationError::NONE) {
+            dbg::log("FATAL: Cannot capture boot image placement");
+            hcf();
+        }
+        auto* new_task = new sched::task::Task(module.name, 0, 0, TASK_KERNEL_RSP, sched::task::TaskType::PROCESS);
+        ker::loader::elf::ElfLoadOptions const LOAD_OPTIONS{.allocation_context = allocation_context,
+                                                            .allocation_origin = ker::loader::elf::ElfAllocationOrigin::TRUSTED_LOCAL};
 
         // The pre-scheduler boot path cannot receive a fatal task handoff, but
         // it must still run the PT_INTERP stage split out of Task construction.
         if (new_task == nullptr || !process_reservation.attach(*new_task) ||
-            !sched::task::complete_unpublished_process_construction(new_task) || new_task->thread == nullptr ||
+            !new_task->initialize_process_image(static_cast<const uint8_t*>(module.entry), module.size, LOAD_OPTIONS) ||
+            !sched::task::complete_unpublished_process_construction(new_task, allocation_context) || new_task->thread == nullptr ||
             new_task->pagemap == nullptr || new_task->entry == 0) {
             dbg::log("FATAL: Failed to create handover task %s", module.name);
             hcf();

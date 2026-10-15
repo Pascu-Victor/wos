@@ -607,8 +607,11 @@ def test_timestamp_policy_precedes_locked_mutation_and_transaction():
     guard = body_after(core, "auto validate_retained_metadata_file(")
     assert "get_tmpfs_fops()" in guard and "file_mount_read_only(*file)" in guard
     assert "mutation && MUTABLE_NATIVE" in guard
-    path = body_after(core, "auto vfs_utimensat(")
+    wrapper = body_after(core, "auto vfs_utimensat(")
+    assert "return vfs_utimensat_nonempty_lookup(task, dirfd, pathname, times, flags)" in wrapper
+    path = body_after(core, "auto vfs_utimensat_nonempty_lookup(")
     assert "handle.authorization().credentials" in path and "&args.resolved" in path
+    assert path.index("REQUEST_CREDENTIALS = task->credentials()") < path.index("resolve_utimens_times(") < path.index("vfs_acquire_lookup(")
 
 
 def test_remote_directory_references_map_admission_and_keep_cleanup_ownership():
@@ -702,6 +705,13 @@ def test_directory_pins_use_search_authority_without_data_grants():
         for operation in (("tmpfs_read", "tmpfs_write", "tmpfs_fops_readdir", "tmpfs_fops_truncate") if name == "tmpfs" else
                           ("xfs_vfs_read", "xfs_vfs_write", "xfs_vfs_readdir", "xfs_vfs_truncate")):
             body = body_after(source, "auto " + operation + "(")
+            if operation == "tmpfs_fops_truncate":
+                assert " ".join(body.split()) == "{ return tmpfs_truncate_with_allocation(f, length); }"
+                signature = source.index("auto tmpfs_truncate_with_allocation(")
+                # The default allocation={} is part of the signature, not the body.
+                definition = source.index("-> int", signature)
+                body = body_after(source[definition:], "-> int")
+                assert body.index("FILE_ACCESS_SEARCH_ONLY) return -EBADF") < body.index("FileGrowth growth") < body.index("tmpfs_resize_locked(")
             assert "FILE_ACCESS_SEARCH_ONLY) return -EBADF" in " ".join(body.split())
     directory_read = body_after(core, "auto vfs_read_dir_entries(")
     assert directory_read.index("FILE_ACCESS_SEARCH_ONLY") < directory_read.index("HAS_FS_READDIR")
@@ -1467,7 +1477,7 @@ def test_remote_exec_cannot_erase_restrictions():
         handler = body_after(compute, marker)
         assert handler.index("capture_compute_peer_identity(") < handler.index("s_compute_lock.lock()")
         assert "rx_channel_generation, IDENTITY)" in handler
-    assert "submitted_resources, mapped_credentials, stdio_mask" in work
+    assert "submitted_resources, mapped_credentials, stdio_mask, receiver_context)" in " ".join(work.split())
     for marker in ["auto exec_elf_buffer(", "auto exec_elf_file("]:
         constructor = body_after(compute, marker)
         assert "ProcessReservation process_reservation(resources, credentials.user().real)" in constructor
@@ -1477,7 +1487,7 @@ def test_remote_exec_cannot_erase_restrictions():
     file_exec = (ROOT / "modules/kern/src/syscalls_impl/process/exec.cpp").read_text()
     file_wrapper = body_after(file_exec, "auto create_file_backed_process_task(")
     assert "return create_file_backed_process_task_impl(" in file_wrapper
-    assert "failure_observations, interpreter_error, nullptr, nullptr, true)" in " ".join(file_wrapper.split())
+    assert "receiver_context, failure_observations, interpreter_error, nullptr, nullptr, true)" in " ".join(file_wrapper.split())
     file_constructor = body_after(file_exec, "auto create_file_backed_process_task_impl(")
     assert "initialize_real_uid" not in file_constructor
     assert file_constructor.index("initialize_credentials(*new_task, credentials)") < file_constructor.index("initialize_process_image(")
@@ -1861,7 +1871,9 @@ def test_remote_path_stat_preserves_caller_identity_and_no_legacy_fallback():
         body = body_after(core, "auto " + name + "(")
         assert body.count("task->credentials()") == 1
         assert "false, &REQUEST_CREDENTIALS" in body
-        assert body.index("wki_remote_vfs_stat(") < body.index("metadata_cache_lookup(")
+        assert body.count("metadata_cache_lookup_retained_stat(handle,") == 1
+        assert "metadata_cache_lookup(" not in body
+        assert body.index("wki_remote_vfs_stat(") < body.index("metadata_cache_lookup_retained_stat(handle,")
         assert "handle.authorization().credentials" in body
     resolver = body_after(core, "auto resolve_symlinks(")
     assert resolver.index("stop_at_remote_mount && mount != nullptr") < resolver.index("resolve_prefix_symlink_once(") < resolver.index("wki_remote_vfs_readlink_path(")
@@ -2298,7 +2310,9 @@ def test_replaced_exec_worker_cannot_publish_credentials():
 def test_file_mapping_uses_one_description_and_preflights_policy():
     vmem = (ROOT / "modules/kern/src/syscalls_impl/vmem/sys_vmem.cpp").read_text()
     mapping = body_after(vmem, "auto file_allocate(")
-    assert mapping.count("vfs_get_file_retain(task, fd)") == 1
+    assert mapping.count("vfs_get_file_retain_checked(task, fd, captured_file)") == 1
+    assert "vfs_get_file_retain(task, fd)" not in mapping
+    assert mapping.index("vfs_get_file_retain_checked(task, fd, captured_file)") < mapping.index("if (RETAIN == -EOVERFLOW) return static_cast<uint64_t>(RETAIN)") < mapping.index("retained_file(captured_file, release_file)")
     assert "vfs_fstat(fd," not in mapping and "eager_file" not in mapping
     assert mapping.index("retained_file(") < mapping.index("vfs_fstat_file(file, &st)") < mapping.index("authorize_file_mapping(")
     assert mapping.index("POLICY_RET != 0") < mapping.index("SharedVmemPublicationGuard publication_guard") < mapping.index("release_fixed_mmap_range_locked(")
@@ -2333,7 +2347,10 @@ def test_sync_preflights_all_ranges_and_serializes_mapping_identity():
     assert msync.index("SharedVmemPublicationGuard publication_guard") < msync.index("sync_file_mmap_range(*task,")
     teardown = body_after(vmem, "void release_file_mmap_ranges_for_pagemap(")
     assert teardown.count("sync_file_mmap_range_quiesced(") == 1
-    assert teardown.index("sync_file_mmap_range_quiesced(pagemap, 0, USER_SPACE_END + 1)") < teardown.index("for (;;)") < teardown.index("unregister_file_mmap_range(")
+    sync_position = teardown.index("sync_file_mmap_range_quiesced(pagemap, 0, USER_SPACE_END + 1)")
+    legacy_loop = teardown.index("for (;;)", sync_position)
+    assert teardown.count("unregister_file_mmap_range(") == 1
+    assert sync_position < legacy_loop < teardown.index("FileMmapRange range{}", legacy_loop) < teardown.index("unregister_file_mmap_range(")
     assert "selftest_file_mmap_sync_preflight" in (ROOT / "modules/kern/src/test/mm_ktest.cpp").read_text()
 
 

@@ -185,7 +185,7 @@ def test_raw_translation_exceptions_are_only_unpublished_images() -> None:
     if stack.count("::translate(") != 1 or stack.count("::get_virt_pointer(") != 1 or exec_source.count("prepare_native_stack(") != 2:
         fail("native stack raw access must remain one bounded pair with one owned builder caller")
     require_order(stack, ["offset > CAPACITY || bytes > CAPACITY - offset", "uint64_t const ADDRESS = TOP - offset - bytes;",
-                         "ensure_stack_backing(thread, child.pagemap, ADDRESS, ADDRESS + bytes, &child)",
+                         "ensure_stack_backing(thread, child.pagemap, ADDRESS, ADDRESS + bytes, &child, allocation_context)",
                          "translate(child.pagemap, VIRTUAL)", "PHYSICAL == mod::mm::virt::PADDR_INVALID",
                          "std::min(bytes - copied, mod::mm::paging::PAGE_SIZE - (VIRTUAL % mod::mm::paging::PAGE_SIZE))",
                          "std::memcpy(mod::mm::addr::get_virt_pointer(PHYSICAL), source + copied, CHUNK)"], "native stack capacity/backing/page copy")
@@ -196,7 +196,7 @@ def test_raw_translation_exceptions_are_only_unpublished_images() -> None:
     builder = function_body(exec_source, "auto create_native_process_task_impl(")
     require_order(builder, ["auto* child = new (std::nothrow) mod::sched::task::Task{};", "claim_unpublished_process(owner, child)",
                            "adopt_exec_arguments(*child, pending) ? capture_native_arguments(context.arguments, *request, *scratch)",
-                           "child->initialize_process_image", "guarded([&] { return prepare_native_stack(*child, request->snapshot, *scratch); })"], "unpublished native stack ownership")
+                           "child->initialize_process_image", "guarded([&] { return prepare_native_stack(*child, request->snapshot, *scratch, request->allocation_context); })"], "unpublished native stack ownership")
     require_code(builder, ["NativeConstructionExecutorGuard guard(*owner);", "if (!guard.acquired()) return -EBUSY;", "return operation();"], "native stack construction guard")
     if "post_task_for_cpu(" in builder:
         fail("native stack builder must not publish its private child")

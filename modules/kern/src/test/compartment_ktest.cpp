@@ -1716,8 +1716,10 @@ KTEST(CompartmentIdentity, NativeImageTcbKeepsCanonicalProcessName) {
         worker.task->owner_pid = owner.task->pid;
         KREQUIRE_TRUE(resource::bind_thread_owner(*worker.task, *owner.task));
         ker::loader::elf::TlsModule const TLS{};
+        mm::numa::AllocationContext allocation_context{};
+        KREQUIRE_EQ(mm::numa::capture_allocation_context({}, allocation_context), mm::numa::AllocationError::NONE);
         owner.created_thread = threading::create_thread(32 * 1024, 0, owner.task->pagemap, sched::task::namespace_process_pid(*worker.task),
-                                                        TLS, owner.task.get());
+                                                        TLS, owner.task.get(), allocation_context);
         KREQUIRE_NE(owner.created_thread, nullptr);
         owner.task->thread = owner.created_thread;
         KEXPECT_EQ(owner.tid(owner.created_thread->fsbase), 1);
@@ -5925,7 +5927,15 @@ struct ConstructionRoot {
         result = vfs::vfs_prepare_directory_view(profile.credentials, pin.get(), pin.get(), {}, view);
         return result == 0 ? refresh() : result;
     }
-    auto construct(Task* owner, int& error) -> Task* {
+    auto construct(Task* owner, int& error, Task& initiating_actor) -> Task* {
+        mm::numa::AllocationContext allocation_context{};
+        // Supplied fixture actor and actual BSP materializer CPU. File/root
+        // source and recovery/quota owner do not define this initiating policy.
+        if (mm::numa::capture_allocation_context(initiating_actor.memory_policy_snapshot(), allocation_context) !=
+            mm::numa::AllocationError::NONE) {
+            error = -EINVAL;
+            return nullptr;
+        }
         NativeFile file(vfs::vfs_get_file_retain(source.task.get(), executable));
         if (!file) {
             error = -EBADF;
@@ -5947,9 +5957,13 @@ struct ConstructionRoot {
             error = reservation.result();
             return nullptr;
         }
-        return process_exec::create_file_backed_process_task_for_owner(owner, context, "native-service", file.release(), image_size, stat,
-                                                                       reinterpret_cast<uint64_t>(stack) + mm::KERNEL_STACK_SIZE, resources,
-                                                                       profile.credentials, reservation, nullptr, &error);
+        return process_exec::create_file_backed_process_task_for_owner(
+            owner, context, allocation_context, "native-service", file.release(), image_size, stat,
+            reinterpret_cast<uint64_t>(stack) + mm::KERNEL_STACK_SIZE, resources, profile.credentials, reservation, nullptr, &error);
+    }
+    auto construct(Task* owner, int& error) -> Task* {
+        // Other native fixtures explicitly use their retained source as actor.
+        return construct(owner, error, *source.task);
     }
 };
 struct ConstructedProcess {
@@ -5994,14 +6008,14 @@ KTEST(CompartmentConstruction, PrivateImageInterpreterAndTcbIgnoreForeignExecuto
         auto const SECOND_BUSY = second_mount->open_files.load();
         int error = 99;
         ConstructedProcess a{*second.source.task}, b{*first.source.task};
-        a.child = first.construct(&a.owner, error);
+        a.child = first.construct(&a.owner, error, a.owner);
         KREQUIRE_NE(a.child, nullptr);
         KEXPECT_EQ(error, 0);
-        b.child = second.construct(&b.owner, error);
+        b.child = second.construct(&b.owner, error, b.owner);
         KREQUIRE_NE(b.child, nullptr);
         KEXPECT_EQ(error, 0);
-        // The explicit recovery executor, rather than the File/root source or
-        // ambient boot executor, supplies the child's independent policy value.
+        // Here each declared actor also owns recovery. Source/root and ambient
+        // boot execution do not replace the explicitly supplied actor value.
         KEXPECT_TRUE(a.child->memory_policy_snapshot() == SECOND_POLICY);
         KEXPECT_TRUE(b.child->memory_policy_snapshot() == FIRST_POLICY);
         KEXPECT_TRUE(a.child->selftest_set_memory_policy({}));
@@ -6032,6 +6046,26 @@ KTEST(CompartmentConstruction, PrivateImageInterpreterAndTcbIgnoreForeignExecuto
         KEXPECT_EQ(construction_byte(*b.child, b.child->context.frame.rip), uint8_t{72});
         KEXPECT_TRUE(a.destroy());
         KEXPECT_TRUE(b.destroy());
+        // The owner has one recovery slot; close A/B before constructing C.
+        // C separates the actual initiating actor from its recovery owner.
+        ConstructedProcess c{*second.source.task};
+        c.child = first.construct(&c.owner, error, *first.source.task);
+        KREQUIRE_NE(c.child, nullptr);
+        KEXPECT_EQ(error, 0);
+        KEXPECT_TRUE(c.child->memory_policy_snapshot() == FIRST_POLICY);
+        KEXPECT_TRUE(c.owner.memory_policy_snapshot() == SECOND_POLICY);
+        KEXPECT_TRUE(first.source.task->memory_policy_snapshot() == FIRST_POLICY);
+        KEXPECT_FALSE(c.child->scheduler_published.load());
+        KEXPECT_TRUE(*c.child->mount_namespace() == first.context.mounts);
+        KEXPECT_TRUE(*c.child->ipc_namespace() == first.context.ipc);
+        KEXPECT_EQ(construction_byte(*c.child, CONSTRUCTION_MAIN + 1024), uint8_t{41});
+        KEXPECT_EQ(c.child->context.frame.rip, c.child->interp_base + 0x52000400);
+        KEXPECT_EQ(construction_byte(*c.child, c.child->context.frame.rip), uint8_t{42});
+        int child_tid = -1;
+        KEXPECT_TRUE(usercopy::copy_value_from_task(*c.child, c.child->thread->fsbase + threading::MLIBC_TCB_TID_OFFSET, child_tid));
+        KEXPECT_TRUE(c.child->namespace_tid() != 0);
+        KEXPECT_EQ(static_cast<uint64_t>(child_tid), c.child->namespace_tid());
+        KEXPECT_TRUE(c.destroy());
         KEXPECT_NULL(first.source.task->owned_unpublished_process.load());
         KEXPECT_NULL(second.source.task->owned_unpublished_process.load());
         KEXPECT_EQ(first_mount->open_files.load(), FIRST_BUSY);

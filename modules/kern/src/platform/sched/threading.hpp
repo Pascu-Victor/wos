@@ -3,6 +3,10 @@
 #include <defines/defines.hpp>
 #include <platform/mm/paging.hpp>
 
+namespace ker::mod::mm::numa {
+struct AllocationContext;
+}
+
 // Forward declaration to avoid circular dependency
 namespace ker::loader::elf {
 struct TlsModule;
@@ -53,10 +57,16 @@ inline constexpr uint64_t MLIBC_TCB_TID_OFFSET = 0x18;
 [[nodiscard]] auto clone_tcb_admission(task::Task& parent, uint64_t child_tcb) -> int;
 #ifdef WOS_SELFTEST
 auto selftest_back_stack_pages(mm::paging::PageTable* page_table, uint64_t low, uint64_t high, int fail_after) -> bool;
+auto selftest_back_stack_pages(mm::paging::PageTable* page_table, uint64_t low, uint64_t high,
+                               const mm::numa::AllocationContext& allocation_context, int fail_after) -> bool;
 #endif
 
 Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTable* page_table, uint64_t initial_tid,
                       const ker::loader::elf::TlsModule& tls_info, task::Task* policy_owner);
+// Explicit saved construction context; policy_owner governs quota only.
+Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTable* page_table, uint64_t initial_tid,
+                      const ker::loader::elf::TlsModule& tls_info, task::Task* policy_owner,
+                      const mm::numa::AllocationContext& allocation_context, int* allocation_error = nullptr);
 void destroy_thread(Thread* thread);
 auto has_automatic_stack(const Thread* thread) -> bool;
 // Borrowed selected-image metadata/root; no backing, owner lookup or locks.
@@ -65,6 +75,8 @@ auto has_automatic_stack(const Thread* thread) -> bool;
     -> bool;
 void record_stack_usage(task::Task& subject);
 bool ensure_stack_backing(Thread* thread, mm::paging::PageTable* page_table, uint64_t start, uint64_t end, task::Task* policy_owner);
+bool ensure_stack_backing(Thread* thread, mm::paging::PageTable* page_table, uint64_t start, uint64_t end, task::Task* policy_owner,
+                          const mm::numa::AllocationContext& allocation_context, int* allocation_error = nullptr);
 bool handle_lazy_stack_fault(Thread* thread, mm::paging::PageTable* page_table, uint64_t fault_addr, uint64_t rsp,
                              task::Task* policy_owner);
 auto range_overlaps_initial_layout(const Thread* thread, uint64_t start, uint64_t size) -> bool;

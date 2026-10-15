@@ -4,6 +4,10 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <platform/acpi/numa_boot.hpp>
+#include <platform/dbg/dbg.hpp>
+#include <platform/mm/addr.hpp>
+#include <platform/mm/numa_alloc.hpp>
 #include <platform/sched/task.hpp>
 
 #include "platform/loader/debug_info.hpp"
@@ -24,6 +28,12 @@ namespace layout = ker::mod::mm::user_layout;
 namespace virt = ker::mod::mm::virt;
 
 namespace {
+
+auto trusted_local_image_context() -> ker::mod::mm::numa::AllocationContext {
+    ker::mod::mm::numa::AllocationContext context{};
+    KEXPECT_EQ(ker::mod::mm::numa::capture_allocation_context({}, context), ker::mod::mm::numa::AllocationError::NONE);
+    return context;
+}
 
 constexpr size_t ELF_FIXTURE_SIZE = paging::PAGE_SIZE;
 
@@ -110,14 +120,15 @@ auto load_fixture(ElfFixture& fixture, uint64_t pid) -> elf::ElfLoadResult {
         .logical_size = fixture.bytes.size(),
         .contiguous_base = fixture.bytes.data(),
     };
-    return load_with_temporary_pagemap(
-        pid, [&](virt::PageTable* page_table) { return elf::load_elf(VIEW, page_table, pid, "address_space_ktest"); });
+    return load_with_temporary_pagemap(pid, [&](virt::PageTable* page_table) {
+        return elf::load_elf(VIEW, page_table, pid, "address_space_ktest", trusted_local_image_context());
+    });
 }
 
 auto load_contiguous_fixture(ElfFixture& fixture, uint64_t pid, size_t size = ELF_FIXTURE_SIZE) -> elf::ElfLoadResult {
     sync_fixture(fixture);
     return load_with_temporary_pagemap(pid, [&](virt::PageTable* page_table) {
-        return elf::load_elf(fixture.bytes.data(), size, page_table, pid, "address_space_ktest");
+        return elf::load_elf(fixture.bytes.data(), size, page_table, pid, "address_space_ktest", trusted_local_image_context());
     });
 }
 
@@ -532,7 +543,9 @@ KTEST(AddressSpace, ResourceAdmissionDeduplicatesSharedLoadBoundary) {
     sync_fixture(fixture);
     ker::mod::sched::task::Task owner{};
     constexpr unsigned AS = static_cast<unsigned>(ker::abi::resource::Id::AS);
-    elf::ElfLoadOptions const OPTIONS{.policy_owner = &owner};
+    elf::ElfLoadOptions const OPTIONS{.policy_owner = &owner,
+                                      .allocation_context = trusted_local_image_context(),
+                                      .allocation_origin = elf::ElfAllocationOrigin::TRUSTED_LOCAL};
     auto result = load_with_temporary_pagemap(PID, [&](virt::PageTable* root) {
         KEXPECT_EQ(owner.resources.set(AS, {8191, UINT64_MAX}, true, 256), 0);
         auto denied = elf::load_elf(fixture.bytes.data(), fixture.bytes.size(), root, PID, "resource-elf-test", OPTIONS);
@@ -567,6 +580,8 @@ KTEST(AddressSpace, LazyElfPagesReserveAddressSpaceBeforeFault) {
         .lazy_file_ranges = &ranges,
         .image_role = layout::ImageRole::INTERPRETER,
         .policy_owner = &owner,
+        .allocation_context = trusted_local_image_context(),
+        .allocation_origin = elf::ElfAllocationOrigin::TRUSTED_LOCAL,
     };
     auto result = load_with_temporary_pagemap(PID, [&](virt::PageTable* root) {
         KEXPECT_EQ(owner.resources.set(AS, {8191, UINT64_MAX}, true, 256), 0);
@@ -586,4 +601,58 @@ KTEST(AddressSpace, LazyElfPagesReserveAddressSpaceBeforeFault) {
         return accepted;
     });
     KEXPECT_NE(result.entry_point, 0);
+}
+
+KTEST(AddressSpace, CopiedPlacementAndMissingOriginRefuseBeforeMapping) {
+    namespace numa = ker::mod::mm::numa;
+    namespace phys = ker::mod::mm::phys;
+    auto const* topology = ker::mod::acpi::numa::boot_topology();
+    KREQUIRE_NE(topology, nullptr);
+    numa::NodeId chosen = 0;
+    for (numa::NodeId node = 1; node < topology->node_count; ++node)
+        if (topology->nodes[node].usable_bytes >= 1024 * 1024) {
+            chosen = node;
+            break;
+        }
+    numa::AllocationContext captured{};
+    KREQUIRE_EQ(numa::capture_allocation_context({uint64_t{1} << chosen, numa::Mode::BIND}, captured), numa::AllocationError::NONE);
+    auto fixture = make_executable_fixture(ET_EXEC, 0x400000);
+    fixture.program_headers[0].p_memsz = 2 * paging::PAGE_SIZE;
+    sync_fixture(fixture);
+    constexpr uint64_t PID = 0x722003;
+    auto result = load_with_temporary_pagemap(PID, [&](virt::PageTable* root) {
+        elf::ElfLoadOptions missing{};
+        auto const REJECTED = elf::load_elf(fixture.bytes.data(), fixture.bytes.size(), root, PID, "placement-missing", missing);
+        KEXPECT_EQ(REJECTED.entry_point, 0U);
+        KEXPECT_EQ(REJECTED.error, -EINVAL);
+        uint64_t bytes = UINT64_MAX;
+        KEXPECT_TRUE(virt::count_user_virtual_bytes(root, 0, 0x0000800000000000ULL, bytes));
+        KEXPECT_EQ(bytes, 0U);
+        elf::ElfLoadOptions options{.allocation_context = captured, .allocation_origin = elf::ElfAllocationOrigin::EXECUTOR_CAPTURE};
+        auto invalid = options;
+        invalid.allocation_context.local_node = numa::INVALID_NODE;
+        auto const BAD = elf::load_elf(fixture.bytes.data(), fixture.bytes.size(), root, PID, "placement-invalid", invalid);
+        KEXPECT_EQ(BAD.entry_point, 0U);
+        KEXPECT_EQ(BAD.error, -EINVAL);
+        KEXPECT_TRUE(virt::count_user_virtual_bytes(root, 0, 0x0000800000000000ULL, bytes));
+        KEXPECT_EQ(bytes, 0U);
+        auto const LOADED = elf::load_elf(fixture.bytes.data(), fixture.bytes.size(), root, PID, "placement-explicit", options);
+        KEXPECT_NE(LOADED.entry_point, 0U);
+        for (uint64_t address : {uint64_t{0x1000}, uint64_t{0x400000}, uint64_t{0x401000}}) {
+            auto const physical = virt::translate(root, address);
+            KEXPECT_NE(physical, virt::PADDR_INVALID);
+            if (physical == virt::PADDR_INVALID) return LOADED;
+            KEXPECT_EQ(numa::physical_node(physical), chosen);
+            KEXPECT_EQ(phys::page_ref_get(ker::mod::mm::addr::get_virt_pointer(physical)), 1U);
+        }
+        auto const physical = virt::translate(root, 0x401000);
+        auto const* zero_page = reinterpret_cast<const uint8_t*>(ker::mod::mm::addr::get_virt_pointer(physical));
+        bool zero = true;
+        for (size_t i = 0; i < paging::PAGE_SIZE; ++i) zero &= zero_page[i] == 0;
+        KEXPECT_TRUE(zero);
+        return LOADED;
+    });
+    KEXPECT_NE(result.entry_point, 0U);
+    ker::mod::dbg::log("C16B2 raw ELF headers/PT_LOAD/BSS node=%u; supplied context, no public exec or scheduled worker credit", chosen);
+    if (chosen == 0) ker::mod::dbg::log("C16B2 no usable node1 ELF contrast; UMA/node0 branch only");
 }

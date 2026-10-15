@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <platform/acpi/numa_boot.hpp>
 #include <platform/sched/resource_as.hpp>
 #include <vector>
 
@@ -61,7 +62,28 @@ constexpr uint64_t SHF_TLS = 0x400;
 #endif
 
 namespace ker::loader::elf {
+auto image_allocation_context_error(const ElfLoadOptions& options) noexcept -> int {
+    auto const* topology = mod::acpi::numa::boot_topology();
+    if (topology == nullptr) return -ENODEV;
+    auto const& context = options.allocation_context;
+    if (!mod::mm::numa::valid_policy(context.policy, topology->node_count) || context.local_node >= topology->node_count ||
+        context.virtual_page_index != 0)
+        return -EINVAL;
+    switch (options.allocation_origin) {
+        case ElfAllocationOrigin::EXECUTOR_CAPTURE:
+            return 0;
+        case ElfAllocationOrigin::TRUSTED_LOCAL:
+            return context.policy == mod::mm::numa::Policy{} ? 0 : -EINVAL;
+        case ElfAllocationOrigin::MISSING:
+            return -EINVAL;
+    }
+    return -EINVAL;
+}
 namespace {
+auto image_allocation_error(mod::mm::numa::AllocationError error) -> int {
+    return error == mod::mm::numa::AllocationError::EXHAUSTED ? -ENOMEM : -EINVAL;
+}
+
 using log = mod::dbg::logger<"elf">;
 
 auto header_is_valid(const Elf64_Ehdr& ehdr) -> bool {
@@ -1021,10 +1043,12 @@ struct LoadSegmentPageStats {
     bool allocated{};
     bool read_succeeded{};
     uint64_t bytes_copied{};
+    int error{};
 };
 
 auto load_segment(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagemap, const Elf64_Phdr* program_header, uint64_t page_no,
-                  uint64_t base_offset, ker::mod::mm::virt::PageMapBatch* map_batch = nullptr) -> LoadSegmentPageStats {
+                  uint64_t base_offset, const mod::mm::numa::AllocationContext& allocation_context,
+                  ker::mod::mm::virt::PageMapBatch* map_batch = nullptr) -> LoadSegmentPageStats {
     // Compute aligned virtual address for this page and in-page offset of the segment start
     const uint64_t SEG_START_VA = program_header->p_vaddr + base_offset;
     const uint64_t FIRST_PAGE_OFFSET = SEG_START_VA & (mod::mm::virt::PAGE_SIZE - 1);
@@ -1051,11 +1075,13 @@ auto load_segment(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagemap, co
         page_hhdm_ptr = reinterpret_cast<uint64_t>(mod::mm::addr::get_virt_pointer(PADDR));
     } else {
         // Allocate a new physical page; allocator returns an HHDM pointer to the page memory
-        auto const NEW_PAGE_HHDM_PTR = reinterpret_cast<uint64_t>(mod::mm::phys::page_alloc_may_fail(
-            mod::mm::PhysicalPageOwner::USER_EXECUTABLE_MAPPING, mod::mm::paging::PAGE_SIZE, "elf_segment"));
-        if (NEW_PAGE_HHDM_PTR == 0) {
-            return {};
-        }
+        auto page_context = allocation_context;
+        page_context.virtual_page_index = PAGE_VA / mod::mm::paging::PAGE_SIZE;
+        auto allocation = mod::mm::numa::try_allocate_pages(
+            page_context, 1, mod::mm::paging::PAGE_SIZE, mod::mm::PhysicalPageOwner::USER_EXECUTABLE_MAPPING,
+            mod::mm::phys::PageInitialization::ZERO, mod::mm::numa::ReclaimMode::NEVER, "elf_segment");
+        if (allocation.span.empty()) return {.error = image_allocation_error(allocation.error)};
+        auto const NEW_PAGE_HHDM_PTR = reinterpret_cast<uint64_t>(allocation.span.data());
         page_hhdm_ptr = NEW_PAGE_HHDM_PTR;
         // Map using the physical address corresponding to that HHDM pointer
         auto const PAGE_FLAGS = page_flags_for_program_header(program_header);
@@ -1065,6 +1091,7 @@ auto load_segment(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagemap, co
         } else {
             mod::mm::virt::map_page(pagemap, PAGE_VA, static_cast<mod::mm::addr::paddr_t>(hhdm_to_phys(NEW_PAGE_HHDM_PTR)), PAGE_FLAGS);
         }
+        static_cast<void>(allocation.span.release());
         // Zero freshly mapped page to handle bss/holes
         std::memset(ptr_from_addr<void>(page_hhdm_ptr), 0, mod::mm::virt::PAGE_SIZE);
     }
@@ -1148,7 +1175,9 @@ auto make_debug_metadata_plan(const ElfFile& elf, bool install_primary_image_met
 }
 
 auto load_section_headers(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagemap, const uint64_t& pid,
-                          const DebugMetadataPlan& metadata_plan) -> bool {
+                          const DebugMetadataPlan& metadata_plan, const mod::mm::numa::AllocationContext& allocation_context,
+                          int& allocation_error) -> bool {
+    allocation_error = 0;
     (void)pid;
     if (elf.elf_head.e_shnum == 0 || elf.se_head == nullptr || elf.sct_head_str_tab == nullptr || elf.section_names == nullptr) {
         return true;
@@ -1174,15 +1203,21 @@ auto load_section_headers(const ElfFile& elf, ker::mod::mm::virt::PageTable* pag
     // header pointers.
     if (metadata_plan.install) {
         for (uint64_t i = 0; i < metadata_plan.section_headers_pages; i++) {
-            auto* const PAGE = mod::mm::phys::page_alloc_may_fail(mod::mm::PhysicalPageOwner::USER_EXECUTABLE_MAPPING,
-                                                                  mod::mm::paging::PAGE_SIZE, "elf_debug_sections");
-            if (PAGE == nullptr) {
+            auto page_context = allocation_context;
+            page_context.virtual_page_index = (DEBUG_SECTION_HEADERS_VADDR + i * mod::mm::paging::PAGE_SIZE) / mod::mm::paging::PAGE_SIZE;
+            auto allocation = mod::mm::numa::try_allocate_pages(
+                page_context, 1, mod::mm::paging::PAGE_SIZE, mod::mm::PhysicalPageOwner::USER_EXECUTABLE_MAPPING,
+                mod::mm::phys::PageInitialization::ZERO, mod::mm::numa::ReclaimMode::NEVER, "elf_debug_sections");
+            if (allocation.span.empty()) {
+                allocation_error = image_allocation_error(allocation.error);
                 return false;
             }
+            auto* const PAGE = allocation.span.data();
             auto const PAGE_HHDM = reinterpret_cast<uint64_t>(PAGE);
             std::memset(PAGE, 0, mod::mm::virt::PAGE_SIZE);
             mod::mm::virt::map_page(pagemap, DEBUG_SECTION_HEADERS_VADDR + (i * mod::mm::virt::PAGE_SIZE), hhdm_to_phys(PAGE_HHDM),
                                     mod::mm::paging::page_types::USER_READONLY | mod::mm::paging::PAGE_NX);
+            static_cast<void>(allocation.span.release());
             uint64_t const SOURCE_OFFSET = i * mod::mm::virt::PAGE_SIZE;
             uint64_t const BYTES_LEFT = metadata_plan.section_headers_size - SOURCE_OFFSET;
             auto const COPY_SIZE = static_cast<size_t>(BYTES_LEFT < mod::mm::virt::PAGE_SIZE ? BYTES_LEFT : mod::mm::virt::PAGE_SIZE);
@@ -1192,15 +1227,21 @@ auto load_section_headers(const ElfFile& elf, ker::mod::mm::virt::PageTable* pag
                                    elf.elf_head.e_shnum);
 
         for (uint64_t i = 0; i < metadata_plan.string_table_pages; i++) {
-            auto* const PAGE = mod::mm::phys::page_alloc_may_fail(mod::mm::PhysicalPageOwner::USER_EXECUTABLE_MAPPING,
-                                                                  mod::mm::paging::PAGE_SIZE, "elf_debug_strings");
-            if (PAGE == nullptr) {
+            auto page_context = allocation_context;
+            page_context.virtual_page_index = (DEBUG_STRING_TABLE_VADDR + i * mod::mm::paging::PAGE_SIZE) / mod::mm::paging::PAGE_SIZE;
+            auto allocation = mod::mm::numa::try_allocate_pages(
+                page_context, 1, mod::mm::paging::PAGE_SIZE, mod::mm::PhysicalPageOwner::USER_EXECUTABLE_MAPPING,
+                mod::mm::phys::PageInitialization::ZERO, mod::mm::numa::ReclaimMode::NEVER, "elf_debug_strings");
+            if (allocation.span.empty()) {
+                allocation_error = image_allocation_error(allocation.error);
                 return false;
             }
+            auto* const PAGE = allocation.span.data();
             auto const PAGE_HHDM = reinterpret_cast<uint64_t>(PAGE);
             std::memset(PAGE, 0, mod::mm::virt::PAGE_SIZE);
             mod::mm::virt::map_page(pagemap, DEBUG_STRING_TABLE_VADDR + (i * mod::mm::virt::PAGE_SIZE), hhdm_to_phys(PAGE_HHDM),
                                     mod::mm::paging::page_types::USER_READONLY | mod::mm::paging::PAGE_NX);
+            static_cast<void>(allocation.span.release());
             uint64_t const SOURCE_OFFSET = i * mod::mm::virt::PAGE_SIZE;
             uint64_t const BYTES_LEFT = metadata_plan.string_table_size - SOURCE_OFFSET;
             auto const COPY_SIZE = static_cast<size_t>(BYTES_LEFT < mod::mm::virt::PAGE_SIZE ? BYTES_LEFT : mod::mm::virt::PAGE_SIZE);
@@ -1498,13 +1539,15 @@ auto load_elf_impl(ElfFile elf_file, ker::mod::mm::virt::PageTable* pagemap, uin
 }
 
 auto load_elf(const uint8_t* data, size_t size, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid, const char* process_name,
-              bool register_special_symbols, uint64_t base_address) -> ElfLoadResult {
+              const mod::mm::numa::AllocationContext& context, bool register_special_symbols, uint64_t base_address) -> ElfLoadResult {
     ElfLoadOptions const OPTIONS{
         .register_special_symbols = register_special_symbols,
         .base_address = base_address,
         .lazy_file_ranges = nullptr,
         .debug_registry_pid = 0,
         .image_role = base_address == 0 ? mod::mm::user_layout::ImageRole::MAIN : mod::mm::user_layout::ImageRole::INTERPRETER,
+        .allocation_context = context,
+        .allocation_origin = ElfAllocationOrigin::TRUSTED_LOCAL,
     };
     return load_elf(data, size, pagemap, pid, process_name, OPTIONS);
 }
@@ -1520,13 +1563,15 @@ auto load_elf(const uint8_t* data, size_t size, ker::mod::mm::virt::PageTable* p
 }
 
 auto load_elf(const ElfFileView& elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid, const char* process_name,
-              bool register_special_symbols, uint64_t base_address) -> ElfLoadResult {
+              const mod::mm::numa::AllocationContext& context, bool register_special_symbols, uint64_t base_address) -> ElfLoadResult {
     ElfLoadOptions const OPTIONS{
         .register_special_symbols = register_special_symbols,
         .base_address = base_address,
         .lazy_file_ranges = nullptr,
         .debug_registry_pid = 0,
         .image_role = base_address == 0 ? mod::mm::user_layout::ImageRole::MAIN : mod::mm::user_layout::ImageRole::INTERPRETER,
+        .allocation_context = context,
+        .allocation_origin = ElfAllocationOrigin::TRUSTED_LOCAL,
     };
     return load_elf(elf, pagemap, pid, process_name, OPTIONS);
 }
@@ -1607,6 +1652,8 @@ auto load_elf_impl(ElfFile elf_file, ker::mod::mm::virt::PageTable* pagemap, uin
         }
     }
 
+    if (int const ERROR = image_allocation_context_error(options); ERROR != 0) return {.error = ERROR};
+
     if (!reserve_image_address_space(elf_file, pagemap, options, debug_metadata_plan, IS_PRIMARY_IMAGE)) {
         return {.error = -ENOMEM};
     }
@@ -1652,15 +1699,17 @@ auto load_elf_impl(ElfFile elf_file, ker::mod::mm::virt::PageTable* pagemap, uin
         // Allocate physical pages for both ELF and program headers
         std::vector<uint64_t> header_phys_addrs;
         for (uint64_t i = 0; i < TOTAL_HEADERS_PAGES; i++) {
-            auto const PADDR = reinterpret_cast<uint64_t>(mod::mm::phys::page_alloc_may_fail(
-                mod::mm::PhysicalPageOwner::USER_EXECUTABLE_MAPPING, mod::mm::paging::PAGE_SIZE, "elf_headers"));
-            if (PADDR == 0) {
-                mod::dbg::log("ERROR: Failed to allocate physical page for headers");
-                return {.entry_point = 0, .program_header_addr = 0, .elf_header_addr = 0};
-            }
+            auto page_context = options.allocation_context;
+            page_context.virtual_page_index = (HEADER_COPY_VADDR + i * mod::mm::paging::PAGE_SIZE) / mod::mm::paging::PAGE_SIZE;
+            auto allocation = mod::mm::numa::try_allocate_pages(
+                page_context, 1, mod::mm::paging::PAGE_SIZE, mod::mm::PhysicalPageOwner::USER_EXECUTABLE_MAPPING,
+                mod::mm::phys::PageInitialization::ZERO, mod::mm::numa::ReclaimMode::NEVER, "elf_headers");
+            if (allocation.span.empty()) return {.error = image_allocation_error(allocation.error)};
+            auto const PADDR = reinterpret_cast<uint64_t>(allocation.span.data());
             std::memset(ptr_from_addr<void>(PADDR), 0, mod::mm::virt::PAGE_SIZE);
             mod::mm::virt::map_page(pagemap, HEADER_COPY_VADDR + (i * mod::mm::virt::PAGE_SIZE), hhdm_to_phys(PADDR),
                                     mod::mm::paging::page_types::USER);
+            static_cast<void>(allocation.span.release());
             header_phys_addrs.push_back(PADDR);
         }
 
@@ -1753,6 +1802,7 @@ auto load_elf_impl(ElfFile elf_file, ker::mod::mm::virt::PageTable* pagemap, uin
                     uint64_t already_mapped_pages = 0;
                     uint64_t bytes_copied = 0;
                     bool segment_read_succeeded = true;
+                    int segment_allocation_error = 0;
                     mod::mm::virt::PageMapBatch map_batch{};
                     mod::mm::virt::init_page_map_batch(&map_batch, pagemap, page_flags_for_program_header(current_header));
                     for (uint64_t j = 0; j < NUM_PAGES; j++) {
@@ -1766,9 +1816,10 @@ auto load_elf_impl(ElfFile elf_file, ker::mod::mm::virt::PageTable* pagemap, uin
                             }
                         }
                         LoadSegmentPageStats const PAGE_STATS =
-                            load_segment(elf_file, pagemap, current_header, j, elf_file.load_base, &map_batch);
+                            load_segment(elf_file, pagemap, current_header, j, elf_file.load_base, options.allocation_context, &map_batch);
                         if (!PAGE_STATS.read_succeeded) {
                             segment_read_succeeded = false;
+                            segment_allocation_error = PAGE_STATS.error;
                             break;
                         }
                         if (!PAGE_STATS.mapped) {
@@ -1784,7 +1835,7 @@ auto load_elf_impl(ElfFile elf_file, ker::mod::mm::virt::PageTable* pagemap, uin
                     mod::mm::virt::flush_page_map_batch(&map_batch);
                     if (!segment_read_succeeded) {
                         mod::dbg::log("ERROR: Failed reading PT_LOAD bytes at file offset 0x%lx (pid=%d)", current_header->p_offset, pid);
-                        return {.entry_point = 0, .program_header_addr = 0, .elf_header_addr = 0};
+                        return {.entry_point = 0, .program_header_addr = 0, .elf_header_addr = 0, .error = segment_allocation_error};
                     }
                     record_loader_event(pid, loader_pt_load_op(options.image_role), NUM_PAGES, static_cast<uint16_t>(i),
                                         pack_loader_page_counts(allocated_pages, already_mapped_pages),
@@ -1833,9 +1884,10 @@ auto load_elf_impl(ElfFile elf_file, ker::mod::mm::virt::PageTable* pagemap, uin
     }
 
     // Load section headers with debug info
-    if (!load_section_headers(elf_file, pagemap, DEBUG_PID, debug_metadata_plan)) {
+    int metadata_allocation_error = 0;
+    if (!load_section_headers(elf_file, pagemap, DEBUG_PID, debug_metadata_plan, options.allocation_context, metadata_allocation_error)) {
         mod::dbg::log("ERROR: Failed to install bounded ELF debug metadata (pid=%d)", pid);
-        return {.entry_point = 0, .program_header_addr = 0, .elf_header_addr = 0};
+        return {.entry_point = 0, .program_header_addr = 0, .elf_header_addr = 0, .error = metadata_allocation_error};
     }
 
     // Only process relocations for statically-linked binaries.

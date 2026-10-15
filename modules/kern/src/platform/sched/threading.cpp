@@ -4,8 +4,10 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <platform/acpi/numa_boot.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/loader/elf_loader.hpp>
+#include <platform/mm/numa_alloc.hpp>
 #include <platform/mm/user_layout.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/random/entropy.hpp>
@@ -81,18 +83,47 @@ void free_mapped_user_range(mm::paging::PageTable* page_table, uint64_t start, u
     }
 }
 
-auto map_zeroed_user_range(mm::paging::PageTable* page_table, uint64_t start, uint64_t size, const char* allocation_name) -> bool {
+auto backing_context_error(const mm::numa::AllocationContext& context) -> int {
+    auto const* topology = acpi::numa::boot_topology();
+    if (topology == nullptr) return -ENODEV;
+    if (!mm::numa::valid_policy(context.policy, topology->node_count) || context.local_node >= topology->node_count ||
+        context.virtual_page_index != 0)
+        return -EINVAL;
+    return 0;
+}
+
+auto backing_allocation_error(mm::numa::AllocationError error) -> int {
+    return error == mm::numa::AllocationError::EXHAUSTED ? -ENOMEM : -EINVAL;
+}
+
+void set_backing_error(int* output, int error) {
+    if (output != nullptr) *output = error;
+}
+
+auto capture_target_backing_context(task::Task* target, mm::numa::AllocationContext& context) -> bool {
+    return target != nullptr &&
+           mm::numa::capture_allocation_context(target->memory_policy_snapshot(), context) == mm::numa::AllocationError::NONE;
+}
+
+auto map_zeroed_user_range(mm::paging::PageTable* page_table, uint64_t start, uint64_t size, const char* allocation_name,
+                           const mm::numa::AllocationContext& allocation_context, int* allocation_error) -> bool {
     for (uint64_t offset = 0; offset < size; offset += mm::paging::PAGE_SIZE) {
         // Fully clear private backing before publishing its user PTE. Avoid
         // an allocator zero/CR3 round trip followed by the same full clear.
-        void* page =
-            mm::phys::page_alloc_full_overwrite_page_with_reclaim_may_fail(mm::PhysicalPageOwner::USER_THREAD_TLS, allocation_name);
-        if (page == nullptr) {
+        auto page_context = allocation_context;
+        page_context.virtual_page_index = (start + offset) / mm::paging::PAGE_SIZE;
+        auto result =
+            mm::numa::try_allocate_pages(page_context, 1, mm::paging::PAGE_SIZE, mm::PhysicalPageOwner::USER_THREAD_TLS,
+                                         mm::phys::PageInitialization::FULL_OVERWRITE, mm::numa::ReclaimMode::LEGACY_UMA, allocation_name);
+        if (result.span.empty()) {
+            set_backing_error(allocation_error, backing_allocation_error(result.error));
             return false;
         }
+        void* const page = result.span.data();
         std::memset(page, 0, mm::paging::PAGE_SIZE);
         auto const PHYS = reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(page)));
         mm::virt::map_page(page_table, start + offset, PHYS, mm::paging::page_types::USER | mm::paging::PAGE_NX);
+        static_cast<void>(result.span.release());
     }
     return true;
 }
@@ -137,12 +168,17 @@ void deny_stack(task::Task* subject) {
 
 // No reclaim/yield while pages are temporarily outside pagemap ownership.
 // Every PTE in this kernel-managed stack range was reserved at construction.
-auto back_stack_pages(mm::paging::PageTable* page_table, uint64_t low, uint64_t high
+auto back_stack_pages(mm::paging::PageTable* page_table, uint64_t low, uint64_t high, const mm::numa::AllocationContext& allocation_context,
+                      int* allocation_error
 #ifdef WOS_SELFTEST
                       ,
                       int fail_after = -1
 #endif
                       ) -> bool {
+    // Instrumented caller-owned storage is alive/addressable before the
+    // persistent no-yield guard and every factory call in the pending loop.
+    auto page_context = allocation_context;
+    mm::numa::AllocationResult result;
     PreemptGuard guard;
     struct PendingPage {
         PendingPage* next;
@@ -161,10 +197,14 @@ auto back_stack_pages(mm::paging::PageTable* page_table, uint64_t low, uint64_t 
 #else
         constexpr bool INJECT_FAILURE = false;
 #endif
-        auto* page = INJECT_FAILURE ? nullptr
-                                    : static_cast<PendingPage*>(mm::phys::page_alloc_full_overwrite_may_fail(
-                                          mm::PhysicalPageOwner::USER_THREAD_STACK, mm::paging::PAGE_SIZE, "thread_stack_lazy"));
+        page_context.virtual_page_index = addr / mm::paging::PAGE_SIZE;
+        if (!INJECT_FAILURE)
+            mm::numa::try_allocate_pages_into(result, page_context, 1, mm::paging::PAGE_SIZE, mm::PhysicalPageOwner::USER_THREAD_STACK,
+                                              mm::phys::PageInitialization::FULL_OVERWRITE, mm::numa::ReclaimMode::NEVER,
+                                              "thread_stack_lazy");
+        auto* page = static_cast<PendingPage*>(result.span.data());
         if (page == nullptr) {
+            set_backing_error(allocation_error, INJECT_FAILURE ? -ENOMEM : backing_allocation_error(result.error));
             while (pending != nullptr) {
                 auto* next = pending->next;
                 mm::phys::page_free(pending);
@@ -175,6 +215,8 @@ auto back_stack_pages(mm::paging::PageTable* page_table, uint64_t low, uint64_t 
         page->next = pending;
         page->vaddr = addr;
         pending = page;
+        // Intrusive pending ownership takes the one order-0 frame reference.
+        static_cast<void>(result.span.release());
     }
     while (pending != nullptr) {
         auto* page = pending;
@@ -197,7 +239,14 @@ void init_threading() {}
 
 #ifdef WOS_SELFTEST
 auto selftest_back_stack_pages(mm::paging::PageTable* page_table, uint64_t low, uint64_t high, int fail_after) -> bool {
-    return back_stack_pages(page_table, low, high, fail_after);
+    mm::numa::AllocationContext context{};
+    if (mm::numa::capture_allocation_context({}, context) != mm::numa::AllocationError::NONE) return false;
+    return selftest_back_stack_pages(page_table, low, high, context, fail_after);
+}
+auto selftest_back_stack_pages(mm::paging::PageTable* page_table, uint64_t low, uint64_t high,
+                               const mm::numa::AllocationContext& allocation_context, int fail_after) -> bool {
+    if (backing_context_error(allocation_context) != 0) return false;
+    return back_stack_pages(page_table, low, high, allocation_context, nullptr, fail_after);
 }
 #endif
 
@@ -246,6 +295,21 @@ void record_stack_usage(task::Task& subject) {
 }
 
 bool ensure_stack_backing(Thread* thread, mm::paging::PageTable* page_table, uint64_t start, uint64_t end, task::Task* policy_owner) {
+    // Preserve no-work legacy results without demanding a placement capture.
+    if (!has_automatic_stack(thread) || page_table == nullptr || start > end) return false;
+    if (start == end) return true;
+    mm::numa::AllocationContext context{};
+    if (!capture_target_backing_context(policy_owner, context)) return false;
+    return ensure_stack_backing(thread, page_table, start, end, policy_owner, context);
+}
+
+bool ensure_stack_backing(Thread* thread, mm::paging::PageTable* page_table, uint64_t start, uint64_t end, task::Task* policy_owner,
+                          const mm::numa::AllocationContext& allocation_context, int* allocation_error) {
+    set_backing_error(allocation_error, 0);
+    if (int const error = backing_context_error(allocation_context); error != 0) {
+        set_backing_error(allocation_error, error);
+        return false;
+    }
     if (!has_automatic_stack(thread) || page_table == nullptr || start > end) {
         return false;
     }
@@ -268,7 +332,7 @@ bool ensure_stack_backing(Thread* thread, mm::paging::PageTable* page_table, uin
             return false;
         }
     }
-    if (!back_stack_pages(page_table, LOW, HIGH)) {
+    if (!back_stack_pages(page_table, LOW, HIGH, allocation_context, allocation_error)) {
         return false;
     }
     if (thread->stack_lowest_backed == 0 || LOW < thread->stack_lowest_backed) {
@@ -292,6 +356,10 @@ bool handle_lazy_stack_fault(Thread* thread, mm::paging::PageTable* page_table, 
         return false;
     }
 
+    // The supplied target policy and actual materializer CPU are frozen before
+    // any quota snapshot/lock. Do not resnapshot through the growth delegate.
+    mm::numa::AllocationContext allocation_context{};
+    if (!capture_target_backing_context(policy_owner, allocation_context)) return false;
     uint64_t const FAULT_PAGE = page_align_down(fault_addr);
     uint64_t const RSP_PAGE = (rsp >= BASE && rsp < TOP) ? page_align_down(rsp) : FAULT_PAGE;
     uint64_t const LOWEST_BACKED = thread->stack_lowest_backed != 0 ? thread->stack_lowest_backed : TOP;
@@ -322,7 +390,7 @@ bool handle_lazy_stack_fault(Thread* thread, mm::paging::PageTable* page_table, 
         return false;
     }
     low = max_u64(low, FLOOR);
-    return ensure_stack_backing(thread, page_table, low, high, policy_owner);
+    return ensure_stack_backing(thread, page_table, low, high, policy_owner, allocation_context);
 }
 
 auto publish_tid_to_tcb(task::Task& address_owner, uint64_t tcb, uint64_t tid, bool fault_in) -> bool {
@@ -376,6 +444,20 @@ auto clone_tcb_admission(task::Task& parent, uint64_t child_tcb) -> int {
 
 Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTable* page_table, uint64_t initial_tid,
                       const ker::loader::elf::TlsModule& tls_info, task::Task* policy_owner) {
+    if (page_table == nullptr) return nullptr;
+    mm::numa::AllocationContext context{};
+    if (!capture_target_backing_context(policy_owner, context)) return nullptr;
+    return create_thread(stack_size, tls_size, page_table, initial_tid, tls_info, policy_owner, context);
+}
+
+Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTable* page_table, uint64_t initial_tid,
+                      const ker::loader::elf::TlsModule& tls_info, task::Task* policy_owner,
+                      const mm::numa::AllocationContext& allocation_context, int* allocation_error) {
+    set_backing_error(allocation_error, 0);
+    if (int const error = backing_context_error(allocation_context); error != 0) {
+        set_backing_error(allocation_error, error);
+        return nullptr;
+    }
     if (page_table == nullptr) {
         return nullptr;
     }
@@ -451,8 +533,9 @@ Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTa
     // pages remain occupied address space, while the four designated guard
     // pages stay permanently non-present.
     mm::virt::reserve_page_range(page_table, layout_base, layout_size / mm::paging::PAGE_SIZE);
-    if (!map_zeroed_user_range(page_table, TLS_VIRT_ADDR, aligned_tls_size, "thread_tls_page") ||
-        !map_zeroed_user_range(page_table, SAFESTACK_VIRT_ADDR, SAFESTACK_SIZE, "thread_safestack_page")) {
+    if (!map_zeroed_user_range(page_table, TLS_VIRT_ADDR, aligned_tls_size, "thread_tls_page", allocation_context, allocation_error) ||
+        !map_zeroed_user_range(page_table, SAFESTACK_VIRT_ADDR, SAFESTACK_SIZE, "thread_safestack_page", allocation_context,
+                               allocation_error)) {
         log::error("create_thread: failed to allocate TLS/SafeStack pages");
         free_mapped_user_range(page_table, layout_base, layout_base + layout_size);
         delete thread;
@@ -539,8 +622,10 @@ Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTa
     thread->stack_phys_ptr = 0;
 
     uint64_t const INITIAL_STACK_BYTES = min_u64(STACK_INITIAL_BACKING_BYTES, BACKING_BUDGET);
-    bool const INITIAL_STACK_OK = ensure_stack_backing(thread, page_table, STACK_TOP - INITIAL_STACK_BYTES, STACK_TOP, policy_owner) &&
-                                  back_stack_pages(page_table, STACK_VIRT_ADDR, STACK_VIRT_ADDR + mm::paging::PAGE_SIZE);
+    bool const INITIAL_STACK_OK =
+        ensure_stack_backing(thread, page_table, STACK_TOP - INITIAL_STACK_BYTES, STACK_TOP, policy_owner, allocation_context,
+                             allocation_error) &&
+        back_stack_pages(page_table, STACK_VIRT_ADDR, STACK_VIRT_ADDR + mm::paging::PAGE_SIZE, allocation_context, allocation_error);
     if (!INITIAL_STACK_OK) {
         log::error("create_thread: failed to lazily back initial stack windows stack=0x%llx size=%llu initial=%llu",
                    static_cast<unsigned long long>(STACK_VIRT_ADDR), static_cast<unsigned long long>(stack_size),

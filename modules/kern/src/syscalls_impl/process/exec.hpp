@@ -15,6 +15,10 @@
 #include <string_view>
 #include <vfs/mount_namespace.hpp>
 
+namespace ker::mod::mm::numa {
+struct AllocationContext;
+}
+
 namespace ker::mod::sched::task {
 struct Task;
 }
@@ -67,6 +71,7 @@ auto create_file_backed_process_task(const char* name, ker::vfs::File* owned_fil
                                      uint64_t kernel_rsp, const ker::mod::sched::resource::State& resources,
                                      const ker::mod::security::Snapshot& credentials,
                                      ker::mod::sched::resource::ProcessReservation& reservation,
+                                     const ker::mod::mm::numa::AllocationContext& receiver_context,
                                      ker::mod::sched::resource::State* failure_observations = nullptr, int* interpreter_error = nullptr)
     -> ker::mod::sched::task::Task*;
 
@@ -147,7 +152,8 @@ struct NativeProcessContext {
 // Caller exclusively owns its recovery slot; supplied credentials/resources are
 // already admitted. Namespace/context installation precedes ELF/TLS/TCB work.
 // This does not publish a child, admit a public creator or populate a service root.
-auto create_file_backed_process_task_for_owner(ker::mod::sched::task::Task* owner, const NativeProcessContext& context, const char* name,
+auto create_file_backed_process_task_for_owner(ker::mod::sched::task::Task* owner, const NativeProcessContext& context,
+                                               const ker::mod::mm::numa::AllocationContext& initiating_context, const char* name,
                                                ker::vfs::File* owned_file, size_t file_size, const ker::vfs::Stat& file_stat,
                                                uint64_t kernel_rsp, const ker::mod::sched::resource::State& resources,
                                                const ker::mod::security::Snapshot& credentials,

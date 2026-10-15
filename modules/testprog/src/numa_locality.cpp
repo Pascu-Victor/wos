@@ -160,6 +160,19 @@ auto page_nodes(QueryBuffers& io, const void* address, uint32_t count) -> int64_
     return query(io, abi::QueryKind::PAGE_NODES, io.pages.data(), count * sizeof(abi::PageNode), 0, reinterpret_cast<uint64_t>(address),
                  count);
 }
+auto source_page_nodes(QueryBuffers& io, const void* mapping, const Topology& topo, Selection parent, uint16_t (&observed)[2]) -> int64_t {
+    auto const rc = page_nodes(io, mapping, 2);
+    if (rc != 0) return rc;
+    for (uint32_t i = 0; i < 2; ++i) {
+        auto const& row = io.pages[i];
+        if (row.status != static_cast<uint16_t>(abi::PageStatus::RESIDENT) || row.reserved32 || row.node >= topo.summary.node_count ||
+            row.node != parent.node)
+            return -EPROTO;
+    }
+    observed[0] = io.pages[0].node;
+    observed[1] = io.pages[1].node;
+    return 0;
+}
 auto topology(Topology& out, uint32_t required) -> int64_t {
     QueryBuffers io;
     initialize_transport(io);
@@ -212,20 +225,90 @@ auto topology(Topology& out, uint32_t required) -> int64_t {
                 s.node_count, s.cpu_count, out.selected_count);
     return 0;
 }
-auto pin_cpu(uint16_t cpu, uint64_t deadline) -> int64_t {
-    uint64_t const tid = ker::multiproc::currentThreadId();
+// Cross-CPU HOST_POLICY cannot move its currently reserved subject. Only the
+// controller places another cooperatively runnable TID; EBUSY is transient.
+auto set_thread_cpu(uint64_t tid, uint16_t cpu, uint64_t deadline) -> int64_t {
+    if (tid == 0 || raw_error(tid) || cpu >= 64) return -EINVAL;
+    while (before(deadline)) {
+        auto const rc = ker::multiproc::setThreadAffinityMask(tid, uint64_t{1} << cpu);
+        if (rc != -EBUSY) return rc;
+        if (raw_error(ker::multiproc::yield())) return -EIO;
+    }
+    return -ETIMEDOUT;
+}
+// Pthreads cannot proceed past placed until this exact getter completes.
+// Fork children instead prove their placement in their own record: they can
+// legitimately exit after SET commits but before a parent-side GET returns.
+auto place_thread(uint64_t tid, uint16_t cpu, uint64_t deadline) -> int64_t {
     if (tid == 0 || raw_error(tid) || cpu >= 64) return -EINVAL;
     uint64_t const mask = uint64_t{1} << cpu;
-    auto const rc = ker::multiproc::setThreadAffinityMask(tid, mask);
-    if (rc != 0) return rc;
-    // Exact bit equality handles CPU63 correctly despite this wrapper's signed
-    // return type. Only setters/other scalar returns use negative errno tests.
-    if (static_cast<uint64_t>(ker::multiproc::getThreadAffinityMask(tid)) != mask) return -EPROTO;
-    do {
-        if (ker::multiproc::getcurrent_cpu() == cpu) return 0;
+    while (before(deadline)) {
+        auto const rc = set_thread_cpu(tid, cpu, deadline);
+        if (rc != 0) return rc;
+        auto const actual = static_cast<uint64_t>(ker::multiproc::getThreadAffinityMask(tid));
+        // Compare bits before interpreting errno so CPU63 remains valid.
+        if (actual == mask) return 0;
+        if (actual != static_cast<uint64_t>(-EBUSY)) return raw_error(actual) ? static_cast<int64_t>(actual) : -EPROTO;
         if (raw_error(ker::multiproc::yield())) return -EIO;
-    } while (before(deadline));
+    }
     return -ETIMEDOUT;
+}
+auto await_cpu(uint16_t cpu, uint64_t deadline, const std::atomic<bool>* cancel = nullptr, uint64_t pending_online_mask = 0) -> int64_t {
+    auto const tid = ker::multiproc::currentThreadId();
+    if (tid == 0 || raw_error(tid) || cpu >= 64) return -EINVAL;
+    uint64_t const mask = uint64_t{1} << cpu;
+    while (before(deadline)) {
+        if (cancel != nullptr && cancel->load(std::memory_order_acquire)) return -ECANCELED;
+        auto const actual = static_cast<uint64_t>(ker::multiproc::getThreadAffinityMask(tid));
+        if (actual == mask) {
+            auto const current = ker::multiproc::getcurrent_cpu();
+            if (current == cpu) return 0;
+            if (raw_error(current)) return -EIO;
+        } else if (pending_online_mask != 0 && actual == pending_online_mask) {
+            // Verified unrestricted ONLINE may look like -1 for >=64 CPUs.
+            // It is only pending; exact target mask+CPU above grants success.
+        } else if (raw_error(actual) && actual != static_cast<uint64_t>(-EBUSY)) {
+            return static_cast<int64_t>(actual);
+        }
+        if (raw_error(ker::multiproc::yield())) return -EIO;
+    }
+    return -ETIMEDOUT;
+}
+auto pin_current_cpu(const Topology& topo, Selection& selected, uint64_t deadline) -> int64_t {
+    auto const tid = ker::multiproc::currentThreadId();
+    if (tid == 0 || raw_error(tid)) return -EINVAL;
+    while (before(deadline)) {
+        auto const cpu = ker::multiproc::getcurrent_cpu();
+        if (raw_error(cpu)) return -EIO;
+        if (cpu >= 64 || cpu >= topo.summary.cpu_count) return -ENOTSUP;
+        auto const rc = ker::multiproc::setThreadAffinityMask(tid, uint64_t{1} << cpu);
+        if (rc == -EBUSY) {
+            if (raw_error(ker::multiproc::yield())) return -EIO;
+            continue;  // Recapture actual CPU; never self-request a remote move.
+        }
+        if (rc != 0) return rc;
+        auto const observed = await_cpu(static_cast<uint16_t>(cpu), deadline);
+        if (observed != 0) return observed;
+        for (uint16_t node = 0; node < topo.summary.node_count; ++node)
+            if ((topo.nodes[node].cpu_words[cpu / 64] & (uint64_t{1} << (cpu % 64))) != 0) {
+                if (topo.nodes[node].managed_bytes == 0) return -ENOTSUP;
+                selected = {node, static_cast<uint16_t>(cpu)};
+                return 0;
+            }
+        return -EPROTO;
+    }
+    return -ETIMEDOUT;
+}
+auto valid_selection(const Topology& topo, Selection selected) -> bool {
+    return selected.node < topo.summary.node_count && selected.cpu < 64 && selected.cpu < topo.summary.cpu_count &&
+           topo.nodes[selected.node].managed_bytes != 0 && (topo.nodes[selected.node].cpu_words[0] & (uint64_t{1} << selected.cpu)) != 0;
+}
+auto lifecycle_coverage(const Topology& topo, uint32_t completed, uint32_t same_node, uint32_t cross_node, uint32_t cross_node_cow,
+                        uint64_t local_pages, uint64_t resident_pages) -> bool {
+    return static_cast<uint64_t>(same_node) + cross_node == completed && cross_node_cow <= cross_node &&
+           resident_pages == static_cast<uint64_t>(completed) * 2 && resident_pages != 0 && local_pages <= resident_pages &&
+           local_pages * 100 >= resident_pages * 95 && (topo.selected_count < 2 || (cross_node != 0 && cross_node_cow != 0)) &&
+           (topo.summary.node_count != 1 || cross_node == 0);
 }
 auto cpu_still(uint16_t cpu) -> bool {
     auto const tid = ker::multiproc::currentThreadId();
@@ -242,9 +325,13 @@ struct FirstWorker {
     uint32_t node_count = 0;
     std::atomic<bool>* go = nullptr;
     std::atomic<bool>* cancel = nullptr;
+    std::atomic<uint64_t> tid{0};
+    std::atomic<bool> started{false};
+    std::atomic<bool> placed{false};
     std::atomic<bool> ready{false};
     std::atomic<bool> done{false};
     int64_t error = 0;
+    const char* phase = "start";
     uint64_t histogram[64]{};
     uint64_t elapsed_ns = 0;
     uint64_t cpu_before = UINT64_MAX;
@@ -252,16 +339,26 @@ struct FirstWorker {
     bool unmapped = true;
 };
 auto first_body(FirstWorker& w, QueryBuffers& io, void*& mapping, size_t bytes, uint64_t deadline) -> int64_t {
-    auto rc = local_policy(io);
+    w.phase = "await_controller_placement";
+    while (!w.placed.load(std::memory_order_acquire)) {
+        if (w.cancel->load(std::memory_order_acquire)) return -ECANCELED;
+        if (!before(deadline)) return -ETIMEDOUT;
+        if (raw_error(ker::multiproc::yield())) return -EIO;
+    }
+    w.phase = "observe_placement";
+    auto rc = await_cpu(w.selection.cpu, deadline, w.cancel);
     if (rc != 0) return rc;
-    rc = pin_cpu(w.selection.cpu, deadline);
+    w.phase = "local_policy";
+    rc = local_policy(io);
     if (rc != 0) return rc;
+    w.phase = "virgin_map";
     mapping = map_private(bytes);
     if (mapping == MAP_FAILED) {
         mapping = nullptr;
         return -errno;
     }
     if ((reinterpret_cast<uint64_t>(mapping) & (PAGE - 1)) != 0) return -EPROTO;
+    w.phase = "virgin_query";
     for (uint32_t first = 0; first < w.opts->pages; first += abi::MAX_PAGE_NODES) {
         uint32_t count = w.opts->pages - first;
         if (count > abi::MAX_PAGE_NODES) count = abi::MAX_PAGE_NODES;
@@ -273,6 +370,7 @@ auto first_body(FirstWorker& w, QueryBuffers& io, void*& mapping, size_t bytes, 
                 return -EPROTO;
         if (!before(deadline) || w.cancel->load(std::memory_order_acquire)) return -ETIMEDOUT;
     }
+    w.phase = "await_go";
     w.ready.store(true, std::memory_order_release);
     while (!w.go->load(std::memory_order_acquire)) {
         if (!before(deadline) || w.cancel->load(std::memory_order_acquire)) return -ETIMEDOUT;
@@ -282,11 +380,13 @@ auto first_body(FirstWorker& w, QueryBuffers& io, void*& mapping, size_t bytes, 
     w.cpu_before = ker::multiproc::getcurrent_cpu();
     uint64_t start, end;
     if (w.cpu_before != w.selection.cpu || !now_ns(start)) return -EPROTO;
+    w.phase = "virgin_touch";
     auto* payload = static_cast<volatile uint8_t*>(mapping);
     for (uint32_t page = 0; page < w.opts->pages; ++page) {
         payload[static_cast<size_t>(page) * PAGE] = static_cast<uint8_t>(1 + ((w.opts->seed ^ page) & 127));
         if ((page % 64) == 0 && (!before(deadline) || w.cancel->load(std::memory_order_acquire))) return -ETIMEDOUT;
     }
+    w.phase = "verify_payload";
     for (uint32_t page = 0; page < w.opts->pages; ++page) {
         size_t base = static_cast<size_t>(page) * PAGE;
         if (payload[base] != static_cast<uint8_t>(1 + ((w.opts->seed ^ page) & 127))) return -EILSEQ;
@@ -298,6 +398,7 @@ auto first_body(FirstWorker& w, QueryBuffers& io, void*& mapping, size_t bytes, 
     w.elapsed_ns = end - start;
     w.cpu_after = ker::multiproc::getcurrent_cpu();
     if (w.cpu_after != w.selection.cpu || !cpu_still(w.selection.cpu)) return -EPROTO;
+    w.phase = "resident_query";
     for (uint32_t first = 0; first < w.opts->pages; first += abi::MAX_PAGE_NODES) {
         uint32_t count = w.opts->pages - first;
         if (count > abi::MAX_PAGE_NODES) count = abi::MAX_PAGE_NODES;
@@ -313,7 +414,9 @@ auto first_body(FirstWorker& w, QueryBuffers& io, void*& mapping, size_t bytes, 
     }
     uint64_t total = 0;
     for (uint64_t n : w.histogram) total += n;
-    return total == w.opts->pages && w.histogram[w.selection.node] * 100 >= total * 95 ? 0 : -ERANGE;
+    if (total != w.opts->pages || w.histogram[w.selection.node] * 100 < total * 95) return -ERANGE;
+    w.phase = "complete";
+    return 0;
 }
 auto first_worker(void* arg) -> void* {
     auto& w = *static_cast<FirstWorker*>(arg);
@@ -322,7 +425,12 @@ auto first_worker(void* arg) -> void* {
     void* mapping = nullptr;
     size_t bytes = static_cast<size_t>(w.opts->pages) * PAGE;
     uint64_t deadline;
-    w.error = deadline_after(w.opts->timeout_ms, deadline) ? first_body(w, io, mapping, bytes, deadline) : -EIO;
+    auto const tid = ker::multiproc::currentThreadId();
+    w.tid.store(tid, std::memory_order_relaxed);
+    w.started.store(true, std::memory_order_release);
+    w.error = tid == 0 || raw_error(tid)                     ? -EINVAL
+              : deadline_after(w.opts->timeout_ms, deadline) ? first_body(w, io, mapping, bytes, deadline)
+                                                             : -EIO;
     if (mapping != nullptr) {
         w.unmapped = munmap(mapping, bytes) == 0;
         if (!w.unmapped) w.error = -errno;
@@ -411,11 +519,13 @@ struct ChildRecord {
     uint16_t selected_node;
     uint16_t selected_cpu;
     uint32_t reserved;
+    uint32_t phase;
+    uint32_t reserved2;
 };
-static_assert(std::is_trivially_copyable_v<ChildRecord> && sizeof(ChildRecord) == 128);
+enum class ChildPhase : uint32_t { PIN_CURRENT_CPU = 1, INHERITED_POLICY, ORIGINAL_BYTES, COW, RESIDENT_QUERY, FINAL_CPU, COMPLETE };
+static_assert(std::is_trivially_copyable_v<ChildRecord> && sizeof(ChildRecord) == 136);
 
-auto child_cycle(uint8_t* mapping, int fd, const Options& opts, Selection selected, uint32_t cycle, uint32_t node_count, uint64_t deadline)
-    -> int {
+auto child_cycle(uint8_t* mapping, int fd, const Options& opts, const Topology& topo, uint32_t cycle, uint64_t deadline) -> int {
     ChildRecord record;
     initialize_transport(record);
     QueryBuffers io;
@@ -427,31 +537,45 @@ auto child_cycle(uint8_t* mapping, int fd, const Options& opts, Selection select
     record.cycle = cycle;
     record.pid = static_cast<uint32_t>(getpid());
     record.tid = ker::multiproc::currentThreadId();
+    Selection selected{abi::INVALID_NODE, UINT16_MAX};
+    uint64_t start = 0, end = 0;
+    record.phase = static_cast<uint32_t>(ChildPhase::PIN_CURRENT_CPU);
+    auto rc = pin_current_cpu(topo, selected, deadline);  // Same-owner pin only; never request a remote self move.
     record.selected_cpu = selected.cpu;
     record.selected_node = selected.node;
-    uint64_t start = 0, end = 0;
-    auto rc = self_policy(io, record.policy);  // Observe inheritance before any setter; child never resets policy.
-    if (rc == 0) rc = pin_cpu(selected.cpu, deadline);
     record.cpu_before = ker::multiproc::getcurrent_cpu();
-    if (rc == 0 && (record.cpu_before != selected.cpu || record.tid == 0 || raw_error(record.tid) || !now_ns(start))) rc = -EPROTO;
-    if (rc == 0 && !verify_cycle(mapping, opts.seed, cycle, false)) rc = -EILSEQ;
+    if (rc == 0 && (record.cpu_before != selected.cpu || record.tid != record.pid || raw_error(record.tid) || !now_ns(start))) rc = -EPROTO;
     if (rc == 0) {
+        record.phase = static_cast<uint32_t>(ChildPhase::INHERITED_POLICY);
+        rc = self_policy(io, record.policy);  // Observe inheritance before payload; child never resets policy.
+    }
+    if (rc == 0) {
+        record.phase = static_cast<uint32_t>(ChildPhase::ORIGINAL_BYTES);
+        if (!verify_cycle(mapping, opts.seed, cycle, false)) rc = -EILSEQ;
+    }
+    if (rc == 0) {
+        record.phase = static_cast<uint32_t>(ChildPhase::COW);
         auto* payload = static_cast<volatile uint8_t*>(mapping);
         for (size_t i = CROSS_START; i < CROSS_START + CROSS_BYTES; ++i) payload[i] = pattern(opts.seed, cycle, i, true);
         if (!verify_cycle(payload, opts.seed, cycle, true)) rc = -EILSEQ;
     }
-    if (rc == 0) rc = page_nodes(io, mapping, 2);
+    if (rc == 0) {
+        record.phase = static_cast<uint32_t>(ChildPhase::RESIDENT_QUERY);
+        rc = page_nodes(io, mapping, 2);
+    }
     if (rc == 0)
         for (uint32_t i = 0; i < 2; ++i) {
             record.pages[i] = io.pages[i];
             if (record.pages[i].reserved32 || record.pages[i].status != static_cast<uint16_t>(abi::PageStatus::RESIDENT) ||
-                record.pages[i].node >= node_count)
+                record.pages[i].node >= topo.summary.node_count)
                 rc = -EPROTO;
         }
+    if (rc == 0) record.phase = static_cast<uint32_t>(ChildPhase::FINAL_CPU);
     record.cpu_after = ker::multiproc::getcurrent_cpu();
     if (rc == 0 && (!cpu_still(selected.cpu) || !now_ns(end) || end < start)) rc = -EPROTO;
     record.elapsed_ns = end >= start ? end - start : 0;
     record.error = rc;
+    if (rc == 0) record.phase = static_cast<uint32_t>(ChildPhase::COMPLETE);
     if (!transfer(fd, &record, sizeof(record), true, deadline)) return 60;
     if (rc != 0) return 61;
     // Both source and parent's destination cross the actual4KiB boundary.
@@ -552,7 +676,20 @@ auto run_numa_first_touch(int argc, char** argv) -> int {
         ++created;
     }
     if (created != topo.selected_count) ok = false;
-    for (uint32_t i = 0; i < created; ++i)
+    for (uint32_t i = 0; i < created && ok; ++i) {
+        auto& w = workers[i];
+        int64_t placement =
+            wait_flag(w.started, deadline) ? place_thread(w.tid.load(std::memory_order_acquire), w.selection.cpu, deadline) : -ETIMEDOUT;
+        if (placement != 0) {
+            std::fprintf(stderr, "NUMA_FIRST_TOUCH_FAIL phase=controller_placement worker=%u tid=%llu cpu=%u error=%lld\n", i,
+                         static_cast<unsigned long long>(w.tid.load(std::memory_order_acquire)), w.selection.cpu,
+                         static_cast<long long>(placement));
+            ok = false;
+        } else {
+            w.placed.store(true, std::memory_order_release);
+        }
+    }
+    for (uint32_t i = 0; i < created && ok; ++i)
         if (!wait_flag(workers[i].ready, deadline)) ok = false;
     if (!ok) cancel.store(true, std::memory_order_release);
     go.store(true, std::memory_order_release);
@@ -575,11 +712,12 @@ auto run_numa_first_touch(int argc, char** argv) -> int {
         if (w.error != 0 || !w.unmapped) ok = false;
         std::printf(
             "NUMA_FIRST_TOUCH worker=%u seed=%llu pages=%u node=%u cpu=%u before=%llu after=%llu local=%llu elapsed_ns=%llu error=%lld "
-            "unmapped=%u\n",
+            "unmapped=%u phase=%s tid=%llu\n",
             i, static_cast<unsigned long long>(opts.seed), opts.pages, w.selection.node, w.selection.cpu,
             static_cast<unsigned long long>(w.cpu_before), static_cast<unsigned long long>(w.cpu_after),
             static_cast<unsigned long long>(w.histogram[w.selection.node]), static_cast<unsigned long long>(w.elapsed_ns),
-            static_cast<long long>(w.error), static_cast<unsigned>(w.unmapped));
+            static_cast<long long>(w.error), static_cast<unsigned>(w.unmapped), w.phase,
+            static_cast<unsigned long long>(w.tid.load(std::memory_order_acquire)));
         for (uint32_t n = 0; n < topo.summary.node_count; ++n)
             std::printf("NUMA_RESIDENT worker=%u node=%u pages=%llu\n", i, n, static_cast<unsigned long long>(w.histogram[n]));
     }
@@ -606,14 +744,23 @@ auto run_numa_lifecycle(int argc, char** argv) -> int {
     initialize_transport(io);
     uint64_t deadline;
     if (!deadline_after(opts.timeout_ms, deadline)) return 1;
+    Selection parent_selection{};
+    const char* setup_phase = "local_policy";
     rc = local_policy(io);
-    if (rc == 0) rc = pin_cpu(topo.selected[0].cpu, deadline);
+    if (rc == 0) {
+        setup_phase = "pin_current_cpu";
+        rc = pin_current_cpu(topo, parent_selection, deadline);
+    }
     if (rc != 0) {
-        std::fprintf(stderr, "numa-lifecycle: setup error=%lld\n", static_cast<long long>(rc));
+        std::fprintf(stderr, "numa-lifecycle: setup phase=%s error=%lld\n", setup_phase, static_cast<long long>(rc));
         return 1;
     }
+    std::printf("NUMA_LIFECYCLE_PLACEMENT parent=%u:%u child=observed_current_cpu method=child_same_owner_pin\n", parent_selection.node,
+                parent_selection.cpu);
     std::fflush(stdout);
     uint32_t completed = 0;
+    uint32_t same_node_cycles = 0, cross_node_cycles = 0, cross_node_cow_cycles = 0;
+    uint64_t cow_local_pages = 0, cow_resident_pages = 0;
     OwnResources own;
     report_own(own, 0, "begin");
     for (uint32_t cycle = 0; cycle < opts.cycles; ++cycle) {
@@ -635,10 +782,19 @@ auto run_numa_lifecycle(int argc, char** argv) -> int {
         int opened_fds[2]{-1, -1};
         pid_t pid = -1;
         bool owned = false, ok = true;
-        if ((reinterpret_cast<uint64_t>(raw) & (PAGE - 1)) || !cpu_still(topo.selected[0].cpu)) ok = false;
+        const char* phase = "parent_original_bytes";
+        int64_t source_query_error = 0;
+        uint16_t source_nodes[2]{abi::INVALID_NODE, abi::INVALID_NODE};
+        if ((reinterpret_cast<uint64_t>(raw) & (PAGE - 1)) || !cpu_still(parent_selection.cpu)) ok = false;
         if (ok)
             for (size_t i = 0; i < CYCLE_BYTES; ++i) payload[i] = pattern(opts.seed, cycle, i, false);
         if (ok) {
+            phase = "source_node_query";
+            source_query_error = source_page_nodes(io, mapping, topo, parent_selection, source_nodes);
+            if (source_query_error != 0) ok = false;
+        }
+        if (ok) {
+            phase = "pipe";
             if (pipe(fds) != 0)
                 ok = false;
             else {
@@ -650,12 +806,12 @@ auto run_numa_lifecycle(int argc, char** argv) -> int {
                 if (!nonblocking(fds[0]) || !nonblocking(fds[1])) ok = false;
             }
         }
-        Selection child_selection = topo.selected[topo.selected_count == 2 ? 1 : 0];
         if (ok) {
+            phase = "fork";
             pid = fork();
             if (pid == 0) {
                 if (close(fds[0]) != 0) _exit(63);
-                int child_error = child_cycle(mapping, fds[1], opts, child_selection, cycle, topo.summary.node_count, child_deadline);
+                int child_error = child_cycle(mapping, fds[1], opts, topo, cycle, child_deadline);
                 if (close(fds[1]) != 0 && child_error == 0) child_error = 64;
                 _exit(child_error);
             }
@@ -667,25 +823,41 @@ auto run_numa_lifecycle(int argc, char** argv) -> int {
         if (!close_fd(fds[1], own)) ok = false;
         ChildRecord record;
         initialize_transport(record);
-        if (ok && !transfer(fds[0], &record, sizeof(record), false, child_deadline)) ok = false;
-        if (ok && (record.magic != RECORD_MAGIC || record.version != 1 || record.bytes != sizeof(record) || record.seed != opts.seed ||
-                   record.cycle != cycle || record.pid != static_cast<uint32_t>(pid) || record.tid == 0 || raw_error(record.tid) ||
-                   record.error != 0 || record.selected_node != child_selection.node || record.selected_cpu != child_selection.cpu ||
-                   record.cpu_before != child_selection.cpu || record.cpu_after != child_selection.cpu || record.reserved ||
-                   record.policy.version != abi::VERSION || record.policy.bytes != sizeof(record.policy) ||
-                   record.policy.mode != static_cast<uint32_t>(abi::PolicyMode::LOCAL) || record.policy.nodes || record.policy.reserved32 ||
-                   record.policy.reserved64))
+        if (ok) {
+            phase = "child_record";
+            if (!transfer(fds[0], &record, sizeof(record), false, child_deadline)) ok = false;
+        }
+        if (ok &&
+            (record.magic != RECORD_MAGIC || record.version != 1 || record.bytes != sizeof(record) || record.seed != opts.seed ||
+             record.cycle != cycle || record.pid != static_cast<uint32_t>(pid) || record.tid != static_cast<uint64_t>(pid) ||
+             raw_error(record.tid) || record.error != 0 || !valid_selection(topo, {record.selected_node, record.selected_cpu}) ||
+             record.cpu_before != record.selected_cpu || record.cpu_after != record.selected_cpu || record.reserved || record.reserved2 ||
+             record.phase != static_cast<uint32_t>(ChildPhase::COMPLETE) || record.policy.version != abi::VERSION ||
+             record.policy.bytes != sizeof(record.policy) || record.policy.mode != static_cast<uint32_t>(abi::PolicyMode::LOCAL) ||
+             record.policy.nodes || record.policy.reserved32 || record.policy.reserved64))
             ok = false;
         if (ok)
             for (auto const& page : record.pages)
                 if (page.status != static_cast<uint16_t>(abi::PageStatus::RESIDENT) || page.node >= topo.summary.node_count ||
                     page.reserved32)
                     ok = false;
-        if (ok && !verify_cycle(payload, opts.seed, cycle, false)) ok = false;
-        if (ok && !transfer(fds[0], mapping + CROSS_START, CROSS_BYTES, false, child_deadline)) ok = false;
-        if (ok && !verify_cycle(payload, opts.seed, cycle, true)) ok = false;
+        if (ok) {
+            phase = "parent_pre_copyout";
+            if (!verify_cycle(payload, opts.seed, cycle, false)) ok = false;
+        }
+        if (ok) {
+            phase = "crosspage_copyout";
+            if (!transfer(fds[0], mapping + CROSS_START, CROSS_BYTES, false, child_deadline)) ok = false;
+        }
+        if (ok) {
+            phase = "parent_post_copyout";
+            if (!verify_cycle(payload, opts.seed, cycle, true)) ok = false;
+        }
         int status = -1;
-        if (ok && !wait_child(pid, child_deadline, status, owned)) ok = false;
+        if (ok) {
+            phase = "wait0";
+            if (!wait_child(pid, child_deadline, status, owned)) ok = false;
+        }
         if (!close_fd(fds[0], own)) ok = false;
         bool const reaped = terminate_and_reap(pid, owned);
         bool const unmapped = munmap(mapping, CYCLE_BYTES) == 0;
@@ -705,26 +877,44 @@ auto run_numa_lifecycle(int argc, char** argv) -> int {
         }
         if (!fds_absent || !mapping_absent) own.complete = false;
         if (!ok || !reaped || owned || !unmapped || !fds_absent || !mapping_absent || own.fds || own.maps || !own.complete) {
-            std::fprintf(stderr, "NUMA_LIFECYCLE_FAIL cycle=%u pid=%d child_error=%lld wait_status=%d reaped=%u unmapped=%u errno=%d\n",
-                         cycle, static_cast<int>(pid), static_cast<long long>(record.error), status,
-                         static_cast<unsigned>(reaped && !owned), static_cast<unsigned>(unmapped), errno);
+            std::fprintf(stderr,
+                         "NUMA_LIFECYCLE_FAIL cycle=%u pid=%d phase=%s source_query_error=%lld child_phase=%u child_error=%lld "
+                         "wait_status=%d reaped=%u unmapped=%u errno=%d\n",
+                         cycle, static_cast<int>(pid), phase, static_cast<long long>(source_query_error), record.phase,
+                         static_cast<long long>(record.error), status, static_cast<unsigned>(reaped && !owned),
+                         static_cast<unsigned>(unmapped), errno);
             break;
         }
         ++completed;
+        if (record.selected_node == parent_selection.node) {
+            ++same_node_cycles;
+        } else {
+            ++cross_node_cycles;
+            if (record.pages[0].node != source_nodes[0] && record.pages[1].node != source_nodes[1]) ++cross_node_cow_cycles;
+        }
+        for (auto const& page : record.pages) {
+            ++cow_resident_pages;
+            if (page.node == record.selected_node) ++cow_local_pages;
+        }
         if (completed % 128 == 0 || completed == opts.cycles) report_own(own, completed, "settled");
         std::printf(
             "NUMA_CHILD cycle=%u pid=%u tid=%llu seed=%llu cpu=%llu:%llu target=%u:%u nodes=%u:%u policy=LOCAL elapsed_ns=%llu wait0=1 "
-            "unmapped=1\n",
+            "unmapped=1 source_nodes=%u:%u\n",
             cycle, record.pid, static_cast<unsigned long long>(record.tid), static_cast<unsigned long long>(record.seed),
             static_cast<unsigned long long>(record.cpu_before), static_cast<unsigned long long>(record.cpu_after), record.selected_node,
-            record.selected_cpu, record.pages[0].node, record.pages[1].node, static_cast<unsigned long long>(record.elapsed_ns));
+            record.selected_cpu, record.pages[0].node, record.pages[1].node, static_cast<unsigned long long>(record.elapsed_ns),
+            source_nodes[0], source_nodes[1]);
     }
     report_own(own, completed, "final");
-    bool const ok = completed == opts.cycles && own.complete && own.fds == 0 && own.maps == 0;
+    bool const ok = completed == opts.cycles && own.complete && own.fds == 0 && own.maps == 0 &&
+                    lifecycle_coverage(topo, completed, same_node_cycles, cross_node_cycles, cross_node_cow_cycles, cow_local_pages,
+                                       cow_resident_pages);
     std::printf(
-        "NUMA_LIFECYCLE_RESULT pass=%u completed=%u requested=%u seed=%llu parent_cpu=%u child_cpu=%u "
+        "NUMA_LIFECYCLE_RESULT pass=%u completed=%u requested=%u seed=%llu parent_cpu=%u "
+        "same_node=%u cross_node=%u cross_node_cow=%u cow_local=%llu cow_resident=%llu cow_local_percent_min=95 "
         "scope=map_fork_cow_crosspage_pipe_wait_unmap_only\n",
-        static_cast<unsigned>(ok), completed, opts.cycles, static_cast<unsigned long long>(opts.seed), topo.selected[0].cpu,
-        topo.selected[topo.selected_count == 2 ? 1 : 0].cpu);
+        static_cast<unsigned>(ok), completed, opts.cycles, static_cast<unsigned long long>(opts.seed), parent_selection.cpu,
+        same_node_cycles, cross_node_cycles, cross_node_cow_cycles, static_cast<unsigned long long>(cow_local_pages),
+        static_cast<unsigned long long>(cow_resident_pages));
     return ok ? 0 : 1;
 }

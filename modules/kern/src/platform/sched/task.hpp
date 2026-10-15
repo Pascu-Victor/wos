@@ -347,8 +347,10 @@ struct Task {
                                                  ker::syscall::process::NativeConstructionToken fault_token = {}
 #endif
                                                  ) -> int;
-    auto initialize_process_image(const uint8_t* elf_data, size_t elf_size) -> bool;
-    auto initialize_process_image(const ker::loader::elf::ElfFileView& elf, const ker::loader::elf::ElfLoadOptions& options) -> bool;
+    auto initialize_process_image(const uint8_t* elf_data, size_t elf_size, const ker::loader::elf::ElfLoadOptions& options,
+                                  int* construction_error = nullptr) -> bool;
+    auto initialize_process_image(const ker::loader::elf::ElfFileView& elf, const ker::loader::elf::ElfLoadOptions& options,
+                                  int* construction_error = nullptr) -> bool;
 
     // Factory for kernel threads (DAEMON tasks).
     // entryFunc: [[noreturn]] void func() - the kernel thread body.
@@ -1582,9 +1584,9 @@ void register_native_file_mapping_record(Task& child, mm::file_mapping::Unpublis
 // construction failures leave it zero; the child remains unpublished.
 // An explicit executor is borrowed only for legacy Host routing. Private image
 // subjects always resolve PT_INTERP in their own exact filesystem view.
-[[nodiscard]] auto complete_unpublished_process_construction(Task* task, int* interpreter_error = nullptr,
-                                                             Task* interpreter_executor = nullptr, bool observe_current_executor = true)
-    -> bool;
+[[nodiscard]] auto complete_unpublished_process_construction(Task* task, const mm::numa::AllocationContext& allocation_context,
+                                                             int* interpreter_error = nullptr, Task* interpreter_executor = nullptr,
+                                                             bool observe_current_executor = true) -> bool;
 [[nodiscard]] auto clone_lazy_vmem_ranges(Task& dst, Task& src) -> bool;
 void release_lazy_vmem_ranges(Task& task);
 

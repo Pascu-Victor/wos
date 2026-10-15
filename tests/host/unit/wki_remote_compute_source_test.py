@@ -809,7 +809,7 @@ def test_task_exit_retires_remote_compute_wait_owners() -> None:
     )
 
     require_tokens(
-        task_header,
+        " ".join(task_header.split()),
         [
             "std::atomic<Task*> owned_unpublished_process{nullptr}",
             "claim_unpublished_process(Task* owner, Task* child)",
@@ -817,7 +817,7 @@ def test_task_exit_retires_remote_compute_wait_owners() -> None:
             "take_unpublished_process(Task* owner)",
             "destroy_unpublished_process(Task* task)",
             "destroy_owned_unpublished_process(Task* owner, Task* child)",
-            "complete_unpublished_process_construction(Task* task, int* interpreter_error",
+            "complete_unpublished_process_construction(Task* task, const mm::numa::AllocationContext& allocation_context, int* interpreter_error",
             "std::atomic<bool> unpublished_teardown_in_progress{false}",
         ],
         "persistent unpublished-process owner API",
@@ -1662,11 +1662,11 @@ def test_large_vfs_ref_exec_keeps_a_file_backed_source() -> None:
 
     submit_body = function_body(source, "handle_task_submit_work")
     require_tokens(
-        submit_body,
+        " ".join(submit_body.split()),
         [
             "vfs_result.buffer == nullptr && vfs_result.file == nullptr",
             "elf_file = vfs_result.file",
-            "exec_elf_file(elf_file, binary_len, elf_file_stat, submitted_resources, mapped_credentials, stdio_mask)",
+            "exec_elf_file(elf_file, binary_len, elf_file_stat, submitted_resources, mapped_credentials, stdio_mask, receiver_context)",
         ],
         "large VFS_REF file-backed execution",
     )
@@ -1907,7 +1907,7 @@ def test_receiver_child_owner_spans_interpreter_output_and_publication() -> None
     require_tokens(
         exec_body,
         [
-            "!new_task->initialize_process_image(elf_buffer, binary_len)",
+            "!new_task->initialize_process_image(elf_buffer, binary_len, LOAD_OPTIONS)",
             'panic_handler("WKI remote compute: cannot publish receiver child recovery ownership")',
             'destroy_unpublished_remote_process(OWNER, new_task, nullptr, "wki-exec-construction", &resources)',
             'destroy_unpublished_remote_process(OWNER, new_task, nullptr, "wki-exec-interpreter", &resources)',
@@ -1918,9 +1918,9 @@ def test_receiver_child_owner_spans_interpreter_output_and_publication() -> None
         fail("exec_elf_buffer must return with the receiver child owner slot intact")
     require_order(exec_body, "ProcessReservation process_reservation(resources, credentials.user().real)",
                   'kernel_stack_alloc("wki_exec_kstack")', "receiver NPROC admission before kernel stack")
-    require_order(exec_body, "new_task->resources = resources", "initialize_process_image(elf_buffer, binary_len)",
+    require_order(exec_body, "new_task->resources = resources", "initialize_process_image(elf_buffer, binary_len, LOAD_OPTIONS)",
                   "receiver policy before image/stack allocation")
-    require_order(exec_body, "process_reservation.attach(*new_task)", "initialize_process_image(elf_buffer, binary_len)",
+    require_order(exec_body, "process_reservation.attach(*new_task)", "initialize_process_image(elf_buffer, binary_len, LOAD_OPTIONS)",
                   "receiver population charge before image/stack allocation")
 
     boot_read = function_body(TASK_CPP.read_text(), "read_boot_file_fully")

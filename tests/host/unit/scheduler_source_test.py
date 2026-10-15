@@ -33,12 +33,19 @@ def fail(message: str) -> None:
     raise AssertionError(message)
 
 
-def function_body(source: str, name: str) -> str:
-    match = re.search(
+def compact_cpp(source: str) -> str:
+    # Ignore source layout, preserving all bytes inside C++ string/char literals.
+    return re.sub(r'//[^\n]*|/\*[\s\S]*?\*/|("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')|\s+', lambda match: match.group(1) or "", source)
+
+
+def function_body(source: str, name: str, signature_contains: str = "") -> str:
+    matches = re.finditer(
         rf"(?:\[\[[^\]]+\]\]\s+)*(?:inline\s+)?(?:auto|bool|void|Task\*|Thread\*|uint32_t)\s+{name}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>,\s*&]+)?\s*\{{",
         source,
         flags=re.DOTALL,
     )
+    match = next((candidate for candidate in matches
+                  if compact_cpp(signature_contains) in compact_cpp(candidate.group(0))), None)
     if match is None:
         fail(f"missing function {name}")
 
@@ -69,13 +76,17 @@ def asm_macro(source: str, name: str) -> str:
     return asm_region(source, f"%macro {name}", "%endmacro")
 
 
-def require_tokens(source: str, tokens: list[str], context: str) -> None:
+def require_tokens(source: str, tokens: list[str], context: str, compact: bool = False) -> None:
+    if compact:
+        source, tokens = compact_cpp(source), [compact_cpp(token) for token in tokens]
     missing = [token for token in tokens if token not in source]
     if missing:
         fail(f"{context}: missing {', '.join(missing)}")
 
 
-def require_order(source: str, first: str, second: str, context: str) -> None:
+def require_order(source: str, first: str, second: str, context: str, compact: bool = False) -> None:
+    if compact:
+        source, first, second = compact_cpp(source), compact_cpp(first), compact_cpp(second)
     first_index = source.find(first)
     second_index = source.find(second)
     if first_index < 0:
@@ -453,27 +464,27 @@ def test_user_thread_tcbs_publish_nonzero_tid_before_user_execution() -> None:
         ["create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTable* page_table, uint64_t initial_tid"],
         "threading create_thread TID contract",
     )
-    create_thread_body = function_body(threading_source, "create_thread")
+    create_thread_body = function_body(threading_source, "create_thread", "const mm::numa::AllocationContext& allocation_context")
     map_zeroed_body = function_body(threading_source, "map_zeroed_user_range")
     require_tokens(
         create_thread_body,
         [
-            'map_zeroed_user_range(page_table, TLS_VIRT_ADDR, aligned_tls_size, "thread_tls_page")',
+            'map_zeroed_user_range(page_table, TLS_VIRT_ADDR, aligned_tls_size, "thread_tls_page", allocation_context, allocation_error)',
             "free_mapped_user_range(page_table, layout_base, layout_base + layout_size)",
             "auto const INITIAL_TID = static_cast<uint32_t>(initial_tid);",
             "write_mapped_user_value(page_table, TCB_VIRT_ADDR + 0x18, INITIAL_TID)",
             "thread->tls_phys_ptr = 0;",
         ],
-        "fragmentation-safe initial user TLS and TCB construction",
+        "fragmentation-safe initial user TLS and TCB construction", compact=True,
     )
     require_tokens(
         map_zeroed_body,
         [
-            "mm::phys::page_alloc_full_overwrite_page_with_reclaim_may_fail(mm::PhysicalPageOwner::USER_THREAD_TLS, allocation_name)",
+            "mm::numa::try_allocate_pages(page_context, 1, mm::paging::PAGE_SIZE, mm::PhysicalPageOwner::USER_THREAD_TLS, mm::phys::PageInitialization::FULL_OVERWRITE, mm::numa::ReclaimMode::LEGACY_UMA, allocation_name)",
             "std::memset(page, 0, mm::paging::PAGE_SIZE)",
             "mm::paging::page_types::USER | mm::paging::PAGE_NX",
         ],
-        "page-granular NX TLS and SafeStack construction",
+        "page-granular NX TLS and SafeStack construction", compact=True,
     )
     require_order(map_zeroed_body, "std::memset(page, 0, mm::paging::PAGE_SIZE)", "mm::virt::map_page",
                   "TLS and SafeStack backing must be cleared before user PTE publication")
@@ -487,8 +498,8 @@ def test_user_thread_tcbs_publish_nonzero_tid_before_user_execution() -> None:
     require_order(
         task_source,
         "this->pid = sched::task::get_next_pid();",
-        "namespace_process_pid(*this), actual_tls_info, this)",
-        "fresh process must allocate a PID before building the initial TCB",
+        "namespace_process_pid(*this), actual_tls_info, this, options.allocation_context,",
+        "fresh process must allocate a PID before building the initial TCB", compact=True,
     )
     require_tokens(
         exec_source,
@@ -497,7 +508,7 @@ def test_user_thread_tcbs_publish_nonzero_tid_before_user_execution() -> None:
             "mod::sched::threading::create_thread(ker::mod::mm::USER_STACK_SIZE, tls_info.tls_size",
             "PROCESS_OWNER->namespace_tid(), tls_info",
         ],
-        "execve replacement TCB tid publication",
+        "execve replacement TCB tid publication", compact=True,
     )
     require_order(
         thread_control_source,
@@ -545,20 +556,20 @@ def test_default_user_stack_reservation_covers_native_toolchain_links() -> None:
         fail("default user stack must reserve at least 64MiB for native WOS toolchain links")
 
     threading_source = THREADING_CPP.read_text()
-    create_thread_body = function_body(threading_source, "create_thread")
+    create_thread_body = function_body(threading_source, "create_thread", "const mm::numa::AllocationContext& allocation_context")
     require_tokens(
         create_thread_body,
         [
             "thread->stack_phys_ptr = 0;",
-            "ensure_stack_backing(thread, page_table, STACK_TOP - INITIAL_STACK_BYTES, STACK_TOP, policy_owner)",
+            "ensure_stack_backing(thread, page_table, STACK_TOP - INITIAL_STACK_BYTES, STACK_TOP, policy_owner, allocation_context, allocation_error)",
         ],
-        "large user stacks must remain lazily backed",
+        "large user stacks must remain lazily backed", compact=True,
     )
     require_tokens(
         threading_source,
         ["bool handle_lazy_stack_fault(Thread* thread, mm::paging::PageTable* page_table, uint64_t fault_addr, uint64_t rsp,",
          "task::Task* policy_owner)"],
-        "large user stacks must retain lazy fault backing",
+        "large user stacks must retain lazy fault backing", compact=True,
     )
 
 

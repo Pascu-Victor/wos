@@ -282,7 +282,7 @@ def require_spawn_actions_snapshot_user_memory_and_preserve_cloexec_sources(sour
         "snapshot_exec_arguments(*parent, path_addr, argv_addr, envp_addr, arguments)",
         "new (std::nothrow) SpawnOptionsSnapshot",
         "snapshot_spawn_options(*parent, options_addr, *snapshot)",
-        "wos_proc_exec_impl(arguments.path.data(), arguments.argv, arguments.envp, &snapshot->options, 0, ADMITTED_CREDENTIALS, MEMORY_POLICY)",
+        "wos_proc_exec_impl(arguments.path.data(), arguments.argv, arguments.envp, &snapshot->options, 0, ADMITTED_CREDENTIALS, MEMORY_POLICY, allocation_context)",
         "delete snapshot",
     ]:
         if snippet not in " ".join(spawn.split()):
@@ -291,7 +291,7 @@ def require_spawn_actions_snapshot_user_memory_and_preserve_cloexec_sources(sour
     exec_entry = function_body(source, "wos_proc_exec")
     for snippet in [
         "snapshot_exec_arguments(*parent, path_addr, argv_addr, envp_addr, snapshot)",
-        "wos_proc_exec_impl(snapshot.path.data(), snapshot.argv, snapshot.envp, nullptr, 0, ADMITTED_CREDENTIALS, MEMORY_POLICY)",
+        "wos_proc_exec_impl(snapshot.path.data(), snapshot.argv, snapshot.envp, nullptr, 0, ADMITTED_CREDENTIALS, MEMORY_POLICY, allocation_context)",
     ]:
         if snippet not in " ".join(exec_entry.split()):
             fail(f"exec syscall must deep-snapshot user path/vector memory: {snippet}")
@@ -352,7 +352,7 @@ def require_loader_does_not_scan_unread_symbol_payloads(loader_source: str) -> N
 
 def require_interpreter_preserves_primary_debug_mappings(loader_source: str) -> None:
     load_body = function_body_containing(loader_source, "load_elf_impl", "REGISTER_SPECIAL_SYMBOLS")
-    if "load_section_headers(elf_file, pagemap, DEBUG_PID, debug_metadata_plan)" not in load_body:
+    if "load_section_headers(elf_file, pagemap, DEBUG_PID, debug_metadata_plan, options.allocation_context, metadata_allocation_error)" not in load_body:
         fail("ELF loader must route primary-image debug mappings through the selected registry PID")
     for snippet in [
         "uint64_t const DEBUG_PID = options.debug_registry_pid != 0 ? options.debug_registry_pid : pid",
@@ -384,7 +384,7 @@ def require_bounded_contiguous_loader(loader_source: str) -> None:
         "parse_elf(const uint8_t* base, uint64_t size, ElfFile& elf)",
         "inspect_tls(const uint8_t* data, size_t size, TlsModule& out)",
         "load_elf(interp_buf, interp_size",
-        "new_task->initialize_process_image(elf_buffer, binary_len)",
+        "new_task->initialize_process_image(elf_buffer, binary_len, LOAD_OPTIONS)",
     ]:
         if snippet not in header + loader_source + task_source + remote_source:
             fail(f"bounded ELF length propagation missing: {snippet}")
@@ -776,7 +776,7 @@ def require_interpreter_execute_admission(source: str) -> None:
     complete = function_body(task, "complete_unpublished_process_construction")
     assert "&interp_size, interpreter_error" in complete
     spawn = function_body(source, "wos_proc_exec_impl")
-    assert "complete_unpublished_process_construction(new_task, &interpreter_error)" in spawn
+    assert "complete_unpublished_process_construction(new_task, allocation_context, &interpreter_error)" in spawn
     assert "return static_cast<uint64_t>(interpreter_error)" in spawn
     remote = REMOTE_COMPUTE_CPP.read_text()
     for name in ("exec_elf_buffer", "exec_elf_file"):
@@ -819,27 +819,35 @@ def require_exec_memory_policy_capture_and_commit(source: str) -> None:
         body = function_body(source, name)
         capture = "auto const MEMORY_POLICY = parent->memory_policy_snapshot();"
         assert body.count(capture) == 1
-        assert body.index(capture) < body.index("snapshot_exec_arguments(*parent")
-        assert "ADMITTED_CREDENTIALS, MEMORY_POLICY)" in body
+        assert body.index(capture) < body.index("capture_exec_allocation_context(MEMORY_POLICY, allocation_context)") < body.index("snapshot_exec_arguments(*parent")
+        assert "ADMITTED_CREDENTIALS, MEMORY_POLICY, allocation_context)" in " ".join(body.split())
     impl = function_body(source, "wos_proc_exec_impl")
     assert "->memory_policy_snapshot(" not in impl and ".memory_policy_snapshot(" not in impl
-    assert "[spawn_options, &PARENT_CREDENTIALS, memory_policy]" in impl
-    assert "wos_proc_exec_impl(interp, argv2, envp2, spawn_options, depth, PARENT_CREDENTIALS, memory_policy)" in " ".join(impl.split())
+    assert "[spawn_options, &PARENT_CREDENTIALS, memory_policy, allocation_context]" in impl
+    assert "wos_proc_exec_impl(interp, argv2, envp2, spawn_options, depth, PARENT_CREDENTIALS, memory_policy, allocation_context)" in " ".join(impl.split())
     assert impl.index("new_task->publish_memory_policy_snapshot(memory_policy);") < impl.index("new_task->initialize_process_image(")
 
     wrapper = function_body(source, "wos_proc_execve")
     capture = "pending->memory_policy = task->memory_policy_snapshot();"
     assert wrapper.count(capture) == 1
-    assert wrapper.index(capture) < wrapper.index("adopt_exec_arguments(*task") < wrapper.index("snapshot_exec_arguments(*task")
+    assert wrapper.index(capture) < wrapper.index("capture_exec_allocation_context(pending->memory_policy, pending->allocation_context)") < wrapper.index("adopt_exec_arguments(*task") < wrapper.index("snapshot_exec_arguments(*task")
     native = function_body(source, "wos_proc_execve_impl")
     assert "->memory_policy_snapshot(" not in native and ".memory_policy_snapshot(" not in native
     assert ".memory_policy = request->memory_policy" in native
+    assert "request->allocation_context.policy != request->memory_policy" in native
+    assert native.count(".allocation_context = request->allocation_context") == 3
+    assert "task, request->allocation_context)" in native
+    assert "holder->allocation_context = request->allocation_context;" in source
+    assert "holder->allocation_origin = request->allocation_origin;" in source
     assert ".memory_policy = image.memory_policy" in source  # owned PreparedNativeExecImage copy
 
     preparation = function_body(source, "prepare_native_compartment_inputs_for_owner")
-    assert preparation.count("pending->memory_policy = executor.memory_policy_snapshot();") == 1
-    assert preparation.index("pending->memory_policy = executor.memory_policy_snapshot();") < preparation.index("adopt_exec_arguments(executor")
-    assert "&error, request->memory_policy, &guard)" in preparation
+    capture = "auto const MEMORY_POLICY = executor.memory_policy_snapshot();"
+    assert preparation.count(capture) == 1
+    assert preparation.index(capture) < preparation.index("capture_exec_allocation_context(MEMORY_POLICY, allocation_context)") < preparation.index("adopt_exec_arguments(executor")
+    assert "pending->memory_policy = MEMORY_POLICY;" in preparation
+    assert "pending->allocation_context = allocation_context;" in preparation
+    assert "&error, request->memory_policy, request->allocation_context, &guard)" in " ".join(preparation.split())
     creation = function_body(source, "create_native_process_task_impl")
     assert creation.index("child->publish_memory_policy_snapshot(memory_policy);") < creation.index("child->initialize_process_image(")
 

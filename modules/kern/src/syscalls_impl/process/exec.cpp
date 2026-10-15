@@ -40,6 +40,7 @@
 #include <platform/loader/debug_info.hpp>
 #include <platform/loader/elf_loader.hpp>
 #include <platform/mm/mm.hpp>
+#include <platform/mm/numa_alloc.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/user_layout.hpp>
 #include <platform/perf/perf_events.hpp>
@@ -90,7 +91,8 @@ namespace ker::syscall::process {
 namespace {
 auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* const* envp,
                         const ker::abi::process::SpawnOptions* spawn_options, int shebang_depth,
-                        const ker::mod::security::Snapshot& admitted_credentials, ker::mod::mm::numa::Policy memory_policy) -> uint64_t;
+                        const ker::mod::security::Snapshot& admitted_credentials, ker::mod::mm::numa::Policy memory_policy,
+                        const ker::mod::mm::numa::AllocationContext& allocation_context) -> uint64_t;
 auto wos_proc_execve_impl(const char* path, const char* const* argv, const char* const* envp, ker::mod::cpu::GPRegs& gpr, int shebang_depth)
     -> uint64_t;
 
@@ -1704,11 +1706,20 @@ auto initialize_native_creation_priority(NativeCompartmentPreparation& root, mod
 }
 }  // namespace
 
+auto capture_exec_allocation_context(ker::mod::mm::numa::Policy policy, ker::mod::mm::numa::AllocationContext& output) -> int {
+    auto const error = ker::mod::mm::numa::capture_allocation_context(policy, output);
+    return error == ker::mod::mm::numa::AllocationError::NONE          ? 0
+           : error == ker::mod::mm::numa::AllocationError::NO_TOPOLOGY ? -ENODEV
+                                                                       : -EINVAL;
+}
+
 class ExecRequestArguments {
    public:
     ExecArgumentsSnapshot snapshot;
     ker::mod::security::Snapshot admitted_credentials;
     ker::mod::mm::numa::Policy memory_policy{};
+    ker::mod::mm::numa::AllocationContext allocation_context{};
+    loader::elf::ElfAllocationOrigin allocation_origin{loader::elf::ElfAllocationOrigin::MISSING};
     NativeExecCompletion completion;
     ExecTraceState trace;
     WorkerExecHandoff handoff;
@@ -2241,6 +2252,8 @@ auto try_process_remote_exec(ker::mod::sched::task::Task& actor, const uint8_t* 
         return WkiRemoteSpawnResult::FAILED;
     }
     holder->memory_policy = request->memory_policy;
+    holder->allocation_context = request->allocation_context;
+    holder->allocation_origin = request->allocation_origin;
     holder->remote = std::move(plan);
     auto& handoff = request->handoff;
     {
@@ -3873,7 +3886,8 @@ auto capture_native_arguments(const NativeProcessArguments* input, ExecRequestAr
     return 0;
 }
 
-auto prepare_native_interpreter(mod::sched::task::Task& child, ExecRequestArguments::NativeScratch& scratch) -> int {
+auto prepare_native_interpreter(mod::sched::task::Task& child, ExecRequestArguments::NativeScratch& scratch,
+                                const mod::mm::numa::AllocationContext& allocation_context) -> int {
     if (child.pending_interp_path.front() == '\0') return 0;
     if (mod::security::compartment::remote_namespace_admission(&child) != -ENOTSUP) return -EIDRM;
     auto const CREDENTIALS = child.credentials();
@@ -3915,11 +3929,14 @@ auto prepare_native_interpreter(mod::sched::task::Task& child, ExecRequestArgume
         .debug_registry_pid = 0,
         .image_role = mod::mm::user_layout::ImageRole::INTERPRETER,
         .policy_owner = &child,
+        .allocation_context = allocation_context,
+        .allocation_origin = loader::elf::ElfAllocationOrigin::EXECUTOR_CAPTURE,
     };
     auto const IMAGE = PREPARED == PrepareFileBackedElfResult::READY
                            ? loader::elf::load_elf(prepared.view, child.pagemap, child.pid, "ld.so", OPTIONS)
                            : loader::elf::load_elf(scratch.interp_buf, SIZE, child.pagemap, child.pid, "ld.so", OPTIONS);
-    if (IMAGE.entry_point == 0) return prepared.read_context.error != 0 ? prepared.read_context.error : -ENOEXEC;
+    if (IMAGE.entry_point == 0)
+        return prepared.read_context.error != 0 ? prepared.read_context.error : IMAGE.error != 0 ? IMAGE.error : -ENOEXEC;
     child.context.frame.rip = IMAGE.entry_point;
     child.interp_base = IMAGE.load_base;
     child.interp_vaddr_start = IMAGE.image_start;
@@ -3930,7 +3947,7 @@ auto prepare_native_interpreter(mod::sched::task::Task& child, ExecRequestArgume
 }
 
 auto prepare_native_stack(mod::sched::task::Task& child, const ExecArgumentsSnapshot& snapshot,
-                          ExecRequestArguments::NativeScratch& scratch) -> int {
+                          ExecRequestArguments::NativeScratch& scratch, const mod::mm::numa::AllocationContext& allocation_context) -> int {
     if (snapshot.path.front() == '\0') return 0;
     auto* thread = child.thread;
     if (thread == nullptr || child.pagemap == nullptr || thread->stack <= thread->stack_base_virt) return -EINVAL;
@@ -3944,7 +3961,7 @@ auto prepare_native_stack(mod::sched::task::Task& child, const ExecArgumentsSnap
             return 0;
         }
         uint64_t const ADDRESS = TOP - offset - bytes;
-        if (!mod::sched::threading::ensure_stack_backing(thread, child.pagemap, ADDRESS, ADDRESS + bytes, &child)) {
+        if (!mod::sched::threading::ensure_stack_backing(thread, child.pagemap, ADDRESS, ADDRESS + bytes, &child, allocation_context)) {
             error = -ENOMEM;
             return 0;
         }
@@ -4031,8 +4048,8 @@ auto create_native_process_task_impl(mod::sched::task::Task* owner, const Native
                                      const mod::sched::resource::State& resources, const mod::security::Snapshot& credentials,
                                      mod::sched::resource::ProcessReservation& reservation,
                                      mod::sched::resource::State* failure_observations, int* construction_error,
-                                     mod::mm::numa::Policy memory_policy, NativeConstructionExecutorGuard* transferred_guard = nullptr)
-    -> mod::sched::task::Task* {
+                                     mod::mm::numa::Policy memory_policy, const mod::mm::numa::AllocationContext& allocation_context,
+                                     NativeConstructionExecutorGuard* transferred_guard = nullptr) -> mod::sched::task::Task* {
     if (construction_error != nullptr) *construction_error = 0;
     bool input_guard = false;
     auto refuse_inputs = [&](int error) -> mod::sched::task::Task* {
@@ -4049,6 +4066,10 @@ auto create_native_process_task_impl(mod::sched::task::Task* owner, const Native
                               : owner->unpublished_teardown_in_progress.compare_exchange_strong(expected, true, std::memory_order_acq_rel);
     if (!ACQUIRED) return refuse_inputs(-EBUSY);
     input_guard = true;
+    loader::elf::ElfLoadOptions const CONTEXT_OPTIONS{.allocation_context = allocation_context,
+                                                      .allocation_origin = loader::elf::ElfAllocationOrigin::EXECUTOR_CAPTURE};
+    if (int const ERROR = loader::elf::image_allocation_context_error(CONTEXT_OPTIONS); ERROR != 0) return refuse_inputs(ERROR);
+    if (allocation_context.policy != memory_policy) return refuse_inputs(-EINVAL);
     if (owner->exit_in_progress.load(std::memory_order_acquire) || owner->has_exited ||
         owner->state.load(std::memory_order_acquire) != mod::sched::task::TaskState::ACTIVE)
         return refuse_inputs(-ECANCELED);
@@ -4143,6 +4164,8 @@ auto create_native_process_task_impl(mod::sched::task::Task* owner, const Native
                 arguments_error = -ENOMEM;
             } else {
                 pending->memory_policy = memory_policy;
+                pending->allocation_context = allocation_context;
+                pending->allocation_origin = loader::elf::ElfAllocationOrigin::EXECUTOR_CAPTURE;
 #ifdef WOS_SELFTEST
                 pending->selftest_destructions = &g_native_construction_scratch_destructions;
 #endif
@@ -4177,6 +4200,7 @@ auto create_native_process_task_impl(mod::sched::task::Task* owner, const Native
     }
 #endif
     bool initialized = false;
+    int image_allocation_error = 0;
     if (PREPARED == PrepareFileBackedElfResult::READY) {
         child->elf_buffer = prepared.take_task_metadata();
         child->elf_buffer_size = prepared.task_metadata_size;
@@ -4185,8 +4209,10 @@ auto create_native_process_task_impl(mod::sched::task::Task* owner, const Native
             .register_special_symbols = true,
             .base_address = 0,
             .lazy_file_ranges = exec_lazy_file_segments_enabled() ? &scratch->main_lazy_ranges : nullptr,
+            .allocation_context = request->allocation_context,
+            .allocation_origin = request->allocation_origin,
         };
-        initialized = child->initialize_process_image(prepared.view, OPTIONS) &&
+        initialized = child->initialize_process_image(prepared.view, OPTIONS, &image_allocation_error) &&
                       append_exec_lazy_file_ranges(child->lazy_vmem_ranges, scratch->main_lazy_ranges, child->exec_image_file, fresh);
     } else {
         constexpr size_t BUFFERED_IMAGE_MAX = 8 * 1024 * 1024;
@@ -4202,15 +4228,18 @@ auto create_native_process_task_impl(mod::sched::task::Task* owner, const Native
         int read_error = 0;
         if (!read_exec_file_exact(child->exec_image_file, file_size, 0, child->elf_buffer, file_size, &read_error))
             return abort_child(read_error != 0 ? read_error : -EIO);
-        initialized = child->initialize_process_image(child->elf_buffer, file_size);
+        loader::elf::ElfLoadOptions const OPTIONS{.allocation_context = request->allocation_context,
+                                                  .allocation_origin = request->allocation_origin};
+        initialized = child->initialize_process_image(child->elf_buffer, file_size, OPTIONS, &image_allocation_error);
     }
-    if (!initialized) return abort_child(-ENOEXEC);
+    if (!initialized) return abort_child(image_allocation_error != 0 ? image_allocation_error : -ENOEXEC);
     auto guarded = [&](auto&& operation) -> int {
         NativeConstructionExecutorGuard guard(*owner);
         if (!guard.acquired()) return -EBUSY;
         return operation();
     };
-    if (int const ERROR = guarded([&] { return prepare_native_interpreter(*child, *scratch); }); ERROR != 0) return abort_child(ERROR);
+    if (int const ERROR = guarded([&] { return prepare_native_interpreter(*child, *scratch, request->allocation_context); }); ERROR != 0)
+        return abort_child(ERROR);
 #ifdef WOS_SELFTEST
     auto recover_if_requested = [&](NativeConstructionFault fault) -> bool {
         if (!exec_selftest_take_native_construction_fault(fault, context.fault_token)) return false;
@@ -4224,7 +4253,8 @@ auto create_native_process_task_impl(mod::sched::task::Task* owner, const Native
     };
     if (recover_if_requested(NativeConstructionFault::RECOVERY_INTERPRETER_READ)) return nullptr;
 #endif
-    if (int const ERROR = guarded([&] { return prepare_native_stack(*child, request->snapshot, *scratch); }); ERROR != 0)
+    if (int const ERROR = guarded([&] { return prepare_native_stack(*child, request->snapshot, *scratch, request->allocation_context); });
+        ERROR != 0)
         return abort_child(ERROR);
 #ifdef WOS_SELFTEST
     if (recover_if_requested(NativeConstructionFault::RECOVERY_STACK_BUILT)) return nullptr;
@@ -4592,6 +4622,7 @@ auto populate_native_compartment_root(NativeCompartmentPreparation& root) -> int
 auto create_file_backed_process_task_impl(const char* name, vfs::File* owned_file, size_t file_size, const vfs::Stat& file_stat,
                                           uint64_t kernel_rsp, const mod::sched::resource::State& resources,
                                           const mod::security::Snapshot& credentials, mod::sched::resource::ProcessReservation& reservation,
+                                          const mod::mm::numa::AllocationContext& receiver_context,
                                           mod::sched::resource::State* failure_observations, int* interpreter_error,
                                           mod::sched::task::Task* explicit_owner, const NativeProcessContext* native_context,
                                           bool observe_current_owner) -> mod::sched::task::Task* {
@@ -4628,6 +4659,14 @@ auto create_file_backed_process_task_impl(const char* name, vfs::File* owned_fil
     PreparedFileBackedElf prepared_elf;
     if (name == nullptr || owned_file == nullptr || kernel_rsp == 0 ||
         prepare_file_backed_elf(owned_file, file_size, prepared_elf) != PrepareFileBackedElfResult::READY) {
+        release_inputs();
+        return nullptr;
+    }
+
+    loader::elf::ElfLoadOptions const CONTEXT_OPTIONS{.allocation_context = receiver_context,
+                                                      .allocation_origin = loader::elf::ElfAllocationOrigin::TRUSTED_LOCAL};
+    if (int const ERROR = loader::elf::image_allocation_context_error(CONTEXT_OPTIONS); ERROR != 0) {
+        if (interpreter_error != nullptr) *interpreter_error = ERROR;
         release_inputs();
         return nullptr;
     }
@@ -4690,11 +4729,16 @@ auto create_file_backed_process_task_impl(const char* name, vfs::File* owned_fil
         .register_special_symbols = true,
         .base_address = 0,
         .lazy_file_ranges = exec_lazy_file_segments_enabled() ? &loader_lazy_ranges : nullptr,
+        .allocation_context = receiver_context,
+        .allocation_origin = loader::elf::ElfAllocationOrigin::TRUSTED_LOCAL,
     };
-    if (!new_task->initialize_process_image(prepared_elf.view, LOAD_OPTIONS) ||
+    int image_allocation_error = 0;
+    if (!new_task->initialize_process_image(prepared_elf.view, LOAD_OPTIONS, &image_allocation_error) ||
         !append_exec_lazy_file_ranges(new_task->lazy_vmem_ranges, loader_lazy_ranges, new_task->exec_image_file, file_stat) ||
-        !mod::sched::task::complete_unpublished_process_construction(new_task, interpreter_error, explicit_owner, observe_current_owner) ||
+        !mod::sched::task::complete_unpublished_process_construction(new_task, receiver_context, interpreter_error, explicit_owner,
+                                                                     observe_current_owner) ||
         (native_context != nullptr && mod::security::compartment::remote_namespace_admission(new_task) != -ENOTSUP)) {
+        if (interpreter_error != nullptr && image_allocation_error != 0) *interpreter_error = image_allocation_error;
         preserve_failure_observations();
         if (!mod::sched::task::destroy_owned_unpublished_process(OWNER, new_task)) [[unlikely]] {
             mod::dbg::panic_handler("file-backed exec: lost child recovery ownership during teardown");
@@ -4709,22 +4753,24 @@ auto create_file_backed_process_task_impl(const char* name, vfs::File* owned_fil
 auto create_file_backed_process_task(const char* name, vfs::File* owned_file, size_t file_size, const vfs::Stat& file_stat,
                                      uint64_t kernel_rsp, const mod::sched::resource::State& resources,
                                      const mod::security::Snapshot& credentials, mod::sched::resource::ProcessReservation& reservation,
+                                     const mod::mm::numa::AllocationContext& receiver_context,
                                      mod::sched::resource::State* failure_observations, int* interpreter_error) -> mod::sched::task::Task* {
     // WKI receiver path: machine-local node policies are not transported.
     // Its newly constructed Task deliberately keeps the default LOCAL value.
     return create_file_backed_process_task_impl(name, owned_file, file_size, file_stat, kernel_rsp, resources, credentials, reservation,
-                                                failure_observations, interpreter_error, nullptr, nullptr, true);
+                                                receiver_context, failure_observations, interpreter_error, nullptr, nullptr, true);
 }
 
-auto create_file_backed_process_task_for_owner(mod::sched::task::Task* owner, const NativeProcessContext& context, const char* name,
+auto create_file_backed_process_task_for_owner(mod::sched::task::Task* owner, const NativeProcessContext& context,
+                                               const mod::mm::numa::AllocationContext& initiating_context, const char* name,
                                                vfs::File* owned_file, size_t file_size, const vfs::Stat& file_stat, uint64_t kernel_rsp,
                                                const mod::sched::resource::State& resources, const mod::security::Snapshot& credentials,
                                                mod::sched::resource::ProcessReservation& reservation,
                                                mod::sched::resource::State* failure_observations, int* construction_error)
     -> mod::sched::task::Task* {
-    auto const MEMORY_POLICY = owner != nullptr ? owner->memory_policy_snapshot() : mod::mm::numa::Policy{};
+    auto const MEMORY_POLICY = initiating_context.policy;
     return create_native_process_task_impl(owner, context, name, owned_file, file_size, file_stat, kernel_rsp, resources, credentials,
-                                           reservation, failure_observations, construction_error, MEMORY_POLICY);
+                                           reservation, failure_observations, construction_error, MEMORY_POLICY, initiating_context);
 }
 
 auto abort_native_compartment_preparation(mod::sched::task::Task& executor, mod::sched::task::Task* child) -> bool {
@@ -4747,6 +4793,9 @@ static auto prepare_native_compartment_inputs_for_owner(mod::sched::task::Task& 
 #endif
                                                         ) -> mod::sched::task::Task* {
     error = 0;
+    auto const MEMORY_POLICY = executor.memory_policy_snapshot();
+    mod::mm::numa::AllocationContext allocation_context{};
+    if ((error = capture_exec_allocation_context(MEMORY_POLICY, allocation_context)) != 0) return nullptr;
     ExecRequestArguments* request = nullptr;
     mod::sched::task::Task* child = nullptr;
     {
@@ -4772,7 +4821,9 @@ static auto prepare_native_compartment_inputs_for_owner(mod::sched::task::Task& 
             return nullptr;
         }
         pending->native_compartment_request = true;
-        pending->memory_policy = executor.memory_policy_snapshot();
+        pending->memory_policy = MEMORY_POLICY;
+        pending->allocation_context = allocation_context;
+        pending->allocation_origin = loader::elf::ElfAllocationOrigin::EXECUTOR_CAPTURE;
 #ifdef WOS_SELFTEST
         pending->fault_token = fault_token;
 #endif
@@ -4808,7 +4859,8 @@ static auto prepare_native_compartment_inputs_for_owner(mod::sched::task::Task& 
             child = create_native_process_task_impl(
                 &executor, root.context, request->snapshot.path.data(), std::exchange(root.executable, nullptr),
                 static_cast<size_t>(root.executable_stat.st_size), root.executable_stat, std::exchange(root.kernel_rsp, 0), root.resources,
-                root.policy.admitted.credentials, *root.reservation, nullptr, &error, request->memory_policy, &guard);
+                root.policy.admitted.credentials, *root.reservation, nullptr, &error, request->memory_policy, request->allocation_context,
+                &guard);
             root.child = child;
             if (child == nullptr && error == 0) error = -ENOEXEC;
         }
@@ -5012,12 +5064,16 @@ auto wos_proc_exec(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr) -
 
     auto const ADMITTED_CREDENTIALS = parent->credentials();
     auto const MEMORY_POLICY = parent->memory_policy_snapshot();
+    mod::mm::numa::AllocationContext allocation_context{};
+    if (int const ERROR = capture_exec_allocation_context(MEMORY_POLICY, allocation_context); ERROR != 0)
+        return static_cast<uint64_t>(ERROR);
     ExecArgumentsSnapshot snapshot;
     int const SNAPSHOT_RESULT = snapshot_exec_arguments(*parent, path_addr, argv_addr, envp_addr, snapshot);
     if (SNAPSHOT_RESULT < 0) {
         return static_cast<uint64_t>(SNAPSHOT_RESULT);
     }
-    return wos_proc_exec_impl(snapshot.path.data(), snapshot.argv, snapshot.envp, nullptr, 0, ADMITTED_CREDENTIALS, MEMORY_POLICY);
+    return wos_proc_exec_impl(snapshot.path.data(), snapshot.argv, snapshot.envp, nullptr, 0, ADMITTED_CREDENTIALS, MEMORY_POLICY,
+                              allocation_context);
 }
 
 auto wos_proc_spawn(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr, uint64_t options_addr) -> uint64_t {
@@ -5031,13 +5087,17 @@ auto wos_proc_spawn(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr, 
 
     auto const ADMITTED_CREDENTIALS = parent->credentials();
     auto const MEMORY_POLICY = parent->memory_policy_snapshot();
+    mod::mm::numa::AllocationContext allocation_context{};
+    if (int const ERROR = capture_exec_allocation_context(MEMORY_POLICY, allocation_context); ERROR != 0)
+        return static_cast<uint64_t>(ERROR);
     ExecArgumentsSnapshot arguments;
     int const ARGUMENT_RESULT = snapshot_exec_arguments(*parent, path_addr, argv_addr, envp_addr, arguments);
     if (ARGUMENT_RESULT < 0) {
         return static_cast<uint64_t>(ARGUMENT_RESULT);
     }
     if (options_addr == 0) {
-        return wos_proc_exec_impl(arguments.path.data(), arguments.argv, arguments.envp, nullptr, 0, ADMITTED_CREDENTIALS, MEMORY_POLICY);
+        return wos_proc_exec_impl(arguments.path.data(), arguments.argv, arguments.envp, nullptr, 0, ADMITTED_CREDENTIALS, MEMORY_POLICY,
+                                  allocation_context);
     }
 
     auto* snapshot = new (std::nothrow) SpawnOptionsSnapshot;
@@ -5050,7 +5110,7 @@ auto wos_proc_spawn(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr, 
         return static_cast<uint64_t>(OPTIONS_RESULT);
     }
     uint64_t const RESULT = wos_proc_exec_impl(arguments.path.data(), arguments.argv, arguments.envp, &snapshot->options, 0,
-                                               ADMITTED_CREDENTIALS, MEMORY_POLICY);
+                                               ADMITTED_CREDENTIALS, MEMORY_POLICY, allocation_context);
     delete snapshot;
     return RESULT;
 }
@@ -5058,7 +5118,8 @@ auto wos_proc_spawn(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr, 
 namespace {
 auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* const* envp,
                         const ker::abi::process::SpawnOptions* spawn_options, int shebang_depth,
-                        const ker::mod::security::Snapshot& admitted_credentials, ker::mod::mm::numa::Policy memory_policy) -> uint64_t {
+                        const ker::mod::security::Snapshot& admitted_credentials, ker::mod::mm::numa::Policy memory_policy,
+                        const ker::mod::mm::numa::AllocationContext& allocation_context) -> uint64_t {
     if (ker::mod::power::shutdown_in_progress()) {
         return static_cast<uint64_t>(-ESHUTDOWN);
     }
@@ -5184,10 +5245,10 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
             return 0;
         }
         return exec_shebang_script(path, argv, envp, argv_count, shebang, shebang_depth,
-                                   [spawn_options, &PARENT_CREDENTIALS, memory_policy](const char* interp, const char* const* argv2,
-                                                                                       const char* const* envp2, int depth) -> uint64_t {
+                                   [spawn_options, &PARENT_CREDENTIALS, memory_policy, allocation_context](
+                                       const char* interp, const char* const* argv2, const char* const* envp2, int depth) -> uint64_t {
                                        return wos_proc_exec_impl(interp, argv2, envp2, spawn_options, depth, PARENT_CREDENTIALS,
-                                                                 memory_policy);
+                                                                 memory_policy, allocation_context);
                                    });
     }
 
@@ -5342,25 +5403,31 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         new_task->cwd_anchor = std::move(filesystem.cwd_anchor);
     }
 
+    int image_allocation_error = 0;
     if (FILE_BACKED_ELF) {
         loader::elf::ElfLazyLoadRangeVec loader_lazy_ranges;
         loader::elf::ElfLoadOptions const LOAD_OPTIONS{
             .register_special_symbols = true,
             .base_address = 0,
             .lazy_file_ranges = exec_lazy_file_segments_enabled() ? &loader_lazy_ranges : nullptr,
+            .allocation_context = allocation_context,
+            .allocation_origin = loader::elf::ElfAllocationOrigin::EXECUTOR_CAPTURE,
         };
-        if (!new_task->initialize_process_image(prepared_elf.view, LOAD_OPTIONS) ||
+        if (!new_task->initialize_process_image(prepared_elf.view, LOAD_OPTIONS, &image_allocation_error) ||
             !append_exec_lazy_file_ranges(new_task->lazy_vmem_ranges, loader_lazy_ranges, new_task->exec_image_file, exec_stat)) {
             dbg::log("wos_proc_exec: Failed to initialize file-backed process image");
             cleanup_unpublished_task();
-            return 0;
+            return static_cast<uint64_t>(image_allocation_error);
         }
     }
 
+    loader::elf::ElfLoadOptions const RAW_LOAD_OPTIONS{.allocation_context = allocation_context,
+                                                       .allocation_origin = loader::elf::ElfAllocationOrigin::EXECUTOR_CAPTURE};
     if (!FILE_BACKED_ELF &&
-        !new_task->initialize_process_image(reinterpret_cast<const uint8_t*>(new_task->elf_buffer), static_cast<size_t>(FILE_SIZE))) {
+        !new_task->initialize_process_image(reinterpret_cast<const uint8_t*>(new_task->elf_buffer), static_cast<size_t>(FILE_SIZE),
+                                            RAW_LOAD_OPTIONS, &image_allocation_error)) {
         cleanup_unpublished_task();
-        return 0;
+        return static_cast<uint64_t>(image_allocation_error);
     }
 
     if (new_task->thread == nullptr || new_task->pagemap == nullptr || new_task->entry == 0) {
@@ -5369,7 +5436,7 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         return 0;
     }
     int interpreter_error = 0;
-    if (!sched::task::complete_unpublished_process_construction(new_task, &interpreter_error)) {
+    if (!sched::task::complete_unpublished_process_construction(new_task, allocation_context, &interpreter_error)) {
         cleanup_unpublished_task();
         return static_cast<uint64_t>(interpreter_error);
     }
@@ -5466,7 +5533,7 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         if (END < vaddr) {
             return false;
         }
-        if (!mod::sched::threading::ensure_stack_backing(new_task->thread, new_task->pagemap, vaddr, END, new_task)) {
+        if (!mod::sched::threading::ensure_stack_backing(new_task->thread, new_task->pagemap, vaddr, END, new_task, allocation_context)) {
             exec_log::error("copyToStack: failed to back stack range [0x%llx,0x%llx)", static_cast<unsigned long long>(vaddr),
                             static_cast<unsigned long long>(END));
             return false;
@@ -5759,6 +5826,9 @@ auto wos_proc_execve(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr,
         if (!pending) return static_cast<uint64_t>(-ENOMEM);
         pending->admitted_credentials = task->credentials();
         pending->memory_policy = task->memory_policy_snapshot();
+        if (int const ERROR = capture_exec_allocation_context(pending->memory_policy, pending->allocation_context); ERROR != 0)
+            return static_cast<uint64_t>(ERROR);
+        pending->allocation_origin = loader::elf::ElfAllocationOrigin::EXECUTOR_CAPTURE;
         request = pending.get();
         if (!adopt_exec_arguments(*task, pending)) return static_cast<uint64_t>(-EAGAIN);
     }
@@ -6011,6 +6081,14 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         return static_cast<uint64_t>(-EOVERFLOW);
     }
     loader::debug::unregister_process(DEBUG_STAGING_PID);
+    loader::elf::ElfLoadOptions const CONTEXT_OPTIONS{.allocation_context = request->allocation_context,
+                                                      .allocation_origin = request->allocation_origin};
+    int const CONTEXT_ERROR = loader::elf::image_allocation_context_error(CONTEXT_OPTIONS);
+    if (CONTEXT_ERROR != 0 || request->allocation_context.policy != request->memory_policy) {
+        release_exec_file_once();
+        delete[] elf_buffer;
+        return static_cast<uint64_t>(CONTEXT_ERROR != 0 ? CONTEXT_ERROR : -EINVAL);
+    }
     auto* new_pagemap = mm::virt::create_pagemap();
     if (new_pagemap == nullptr) {
         end_local_proc_stage(task, perf::WkiPerfLocalProcOp::NEW_IMAGE, NEW_IMAGE_STAGE, -ENOMEM, 0, WOS_PERF_CALLSITE());
@@ -6024,10 +6102,10 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     ker::loader::elf::TlsModule tls_info{};
     bool const ELF_CONTRACT_VALID = FILE_BACKED_ELF ? loader::elf::inspect_tls(prepared_elf.view, tls_info)
                                                     : loader::elf::inspect_tls(elf_buffer, static_cast<size_t>(FILE_SIZE), tls_info);
-    auto* new_thread = ELF_CONTRACT_VALID
-                           ? mod::sched::threading::create_thread(ker::mod::mm::USER_STACK_SIZE, tls_info.tls_size, new_pagemap,
-                                                                  PROCESS_OWNER->namespace_tid(), tls_info, task)
-                           : nullptr;
+    auto* new_thread = ELF_CONTRACT_VALID ? mod::sched::threading::create_thread(ker::mod::mm::USER_STACK_SIZE, tls_info.tls_size,
+                                                                                 new_pagemap, PROCESS_OWNER->namespace_tid(), tls_info,
+                                                                                 task, request->allocation_context)
+                                          : nullptr;
     uint64_t new_mmap_cursor = 0;
     char* new_name = nullptr;
     LazyVmemRangeVec new_lazy_ranges;
@@ -6084,6 +6162,8 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         .debug_registry_pid = DEBUG_STAGING_PID,
         .image_role = mod::mm::user_layout::ImageRole::MAIN,
         .policy_owner = task,
+        .allocation_context = request->allocation_context,
+        .allocation_origin = request->allocation_origin,
     };
     loader::elf::ElfLoadResult elf_result =
         FILE_BACKED_ELF
@@ -6214,6 +6294,8 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
             .debug_registry_pid = DEBUG_STAGING_PID,
             .image_role = mod::mm::user_layout::ImageRole::INTERPRETER,
             .policy_owner = task,
+            .allocation_context = request->allocation_context,
+            .allocation_origin = request->allocation_origin,
         };
         loader::elf::ElfLoadResult const INTERP_RESULT =
             FILE_BACKED_INTERP
@@ -6289,7 +6371,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         if (END < vaddr) {
             return false;
         }
-        if (!mod::sched::threading::ensure_stack_backing(new_thread, new_pagemap, vaddr, END, task)) {
+        if (!mod::sched::threading::ensure_stack_backing(new_thread, new_pagemap, vaddr, END, task, request->allocation_context)) {
             exec_log::error("copyToStack: failed to back stack range [0x%llx,0x%llx)", static_cast<unsigned long long>(vaddr),
                             static_cast<unsigned long long>(END));
             return false;

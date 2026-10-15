@@ -4,8 +4,11 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <platform/acpi/numa_boot.hpp>
+#include <platform/dbg/dbg.hpp>
 #include <platform/loader/elf_loader.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/numa_alloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
@@ -31,6 +34,7 @@ constexpr size_t MAX_LAYOUT_PAGES = 128;
 // Real initial/exec stack constructor and private root. Nothing is scheduled,
 // registered by PID, executed or attached to a borrowed address space.
 struct PrivateStack {
+    ker::mod::mm::numa::AllocationContext allocation_context{};
     std::unique_ptr<task::Task> owner{new (std::nothrow) task::Task{}};
     paging::PageTable* root{};
     threading::Thread* thread{};
@@ -56,14 +60,18 @@ struct PrivateStack {
         KEXPECT_EQ(threading::get_active_thread_count(), initial_threads);
     }
 
-    auto init() -> bool {
+    auto init(const ker::mod::mm::numa::AllocationContext* supplied = nullptr) -> bool {
         if (owner == nullptr) return false;
         root = virt::create_pagemap_may_fail();
         if (root == nullptr) return false;
         owner->type = task::TaskType::PROCESS;
         owner->pagemap = root;
         ker::loader::elf::TlsModule const TLS{};
-        thread = threading::create_thread(STACK_SIZE, 0, root, 0, TLS, owner.get());
+        if (supplied != nullptr)
+            allocation_context = *supplied;
+        else if (ker::mod::mm::numa::capture_allocation_context({}, allocation_context) != ker::mod::mm::numa::AllocationError::NONE)
+            return false;
+        thread = threading::create_thread(STACK_SIZE, 0, root, 0, TLS, owner.get(), allocation_context);
         if (thread == nullptr) return false;
         owner->thread = thread;
         threading::record_stack_usage(*owner);
@@ -184,7 +192,8 @@ KTEST(UserStackReturn, ReservedInteriorAndSequentialBacking) {
 
     // Earlier-unmapped -> genuine backing -> current mapped admission. This
     // is sequential, not an assertion about arbitrary live SMP leaf writers.
-    KREQUIRE_TRUE(threading::ensure_stack_backing(fixture.thread, fixture.root, TARGET, TARGET + PAGE, fixture.owner.get()));
+    KREQUIRE_TRUE(threading::ensure_stack_backing(fixture.thread, fixture.root, TARGET, TARGET + PAGE, fixture.owner.get(),
+                                                  fixture.allocation_context));
     KEXPECT_NE(virt::translate(fixture.root, TARGET), virt::PADDR_INVALID);
     KEXPECT_FALSE(virt::is_page_reserved(fixture.root, TARGET));
     KEXPECT_EQ(mapped_ref(fixture.root, TARGET), 1U);
@@ -284,9 +293,85 @@ KTEST(UserStackReturn, FaultBudgetAndAdmissionAreSeparate) {
     // Lowering the limit preserves already admitted backing. The actual
     // helper still accepts the existing page; return admission changes none.
     KREQUIRE_EQ(owner.resources.set(STACK_RESOURCE, {0, UINT64_MAX}, true, 256), 0);
-    KREQUIRE_TRUE(threading::ensure_stack_backing(fixture.thread, fixture.root, TARGET, TARGET + PAGE, &owner));
+    KREQUIRE_TRUE(threading::ensure_stack_backing(fixture.thread, fixture.root, TARGET, TARGET + PAGE, &owner, fixture.allocation_context));
     KEXPECT_EQ(virt::translate(fixture.root, TARGET), PHYSICAL);
     AdmissionSnapshot const LOWERED(fixture);
     KEXPECT_TRUE(fixture.admitted(TARGET));
     LOWERED.expect_unchanged(fixture);
+}
+
+namespace {
+auto stack_placement_owner(ker::mod::mm::PhysicalPageOwner owner) -> phys::PhysicalOwnerSnapshot {
+    phys::PhysicalBalanceSnapshot snapshot{};
+    phys::get_physical_balance_snapshot(snapshot);
+    return snapshot.owners[static_cast<size_t>(owner)];
+}
+}  // namespace
+
+KTEST(UserStackReturn, SavedPlacementCoversTlsSafeStackGrowthAndPendingRollback) {
+    namespace numa = ker::mod::mm::numa;
+    auto const* topology = ker::mod::acpi::numa::boot_topology();
+    KREQUIRE_NE(topology, nullptr);
+    numa::NodeId chosen = 0;
+    for (numa::NodeId node = 1; node < topology->node_count; ++node) {
+        if (topology->nodes[node].usable_bytes >= 1024 * 1024) {
+            chosen = node;
+            break;
+        }
+    }
+    auto const STACK_BEFORE = stack_placement_owner(ker::mod::mm::PhysicalPageOwner::USER_THREAD_STACK);
+    auto const TLS_BEFORE = stack_placement_owner(ker::mod::mm::PhysicalPageOwner::USER_THREAD_TLS);
+    {
+        PrivateStack fixture;
+        KREQUIRE_NE(fixture.owner.get(), nullptr);
+        KREQUIRE_TRUE(fixture.owner->selftest_set_memory_policy({uint64_t{1} << chosen, numa::Mode::BIND}));
+        numa::AllocationContext captured{};
+        KREQUIRE_EQ(numa::capture_allocation_context(fixture.owner->memory_policy_snapshot(), captured), numa::AllocationError::NONE);
+        KREQUIRE_TRUE(fixture.owner->selftest_set_memory_policy({}));
+        KREQUIRE_TRUE(fixture.init(&captured));
+        size_t present = 0;
+        for (uint64_t address = fixture.thread->layout_base_virt; address < fixture.thread->layout_base_virt + fixture.thread->layout_size;
+             address += PAGE) {
+            auto const physical = virt::translate(fixture.root, address);
+            if (physical == virt::PADDR_INVALID) continue;
+            ++present;
+            KEXPECT_EQ(numa::physical_node(physical), chosen);
+            KEXPECT_EQ(phys::page_ref_get(addr::get_virt_pointer(physical)), 1U);
+        }
+        KEXPECT_TRUE(present >= 25);
+        uint64_t const SAFESTACK_START = fixture.thread->tls_base_virt + 2 * PAGE;
+        for (uint64_t address = SAFESTACK_START; address < SAFESTACK_START + 16 * PAGE; address += PAGE) {
+            auto const physical = virt::translate(fixture.root, address);
+            KREQUIRE_NE(physical, virt::PADDR_INVALID);
+            auto const* bytes = reinterpret_cast<const uint8_t*>(addr::get_virt_pointer(physical));
+            bool zero = true;
+            for (size_t i = 0; i < PAGE; ++i) zero &= bytes[i] == 0;
+            KEXPECT_TRUE(zero);
+        }
+        uint64_t const TARGET = fixture.top() - 24 * PAGE;
+        KREQUIRE_TRUE(threading::ensure_stack_backing(fixture.thread, fixture.root, TARGET, TARGET + PAGE, fixture.owner.get(), captured));
+        KEXPECT_EQ(numa::physical_node(virt::translate(fixture.root, TARGET)), chosen);
+        uint64_t const LOW = fixture.thread->stack_base_virt + 8 * PAGE;
+        KEXPECT_EQ(virt::translate(fixture.root, LOW), virt::PADDR_INVALID);
+        KEXPECT_EQ(virt::translate(fixture.root, LOW + PAGE), virt::PADDR_INVALID);
+        auto const PENDING_BEFORE = stack_placement_owner(ker::mod::mm::PhysicalPageOwner::USER_THREAD_STACK);
+        KEXPECT_FALSE(threading::selftest_back_stack_pages(fixture.root, LOW, LOW + 2 * PAGE, captured, 1));
+        auto const PENDING_AFTER = stack_placement_owner(ker::mod::mm::PhysicalPageOwner::USER_THREAD_STACK);
+        KEXPECT_EQ(PENDING_AFTER.pages, PENDING_BEFORE.pages);
+        KEXPECT_EQ(PENDING_AFTER.objects, PENDING_BEFORE.objects);
+        KEXPECT_EQ(virt::translate(fixture.root, LOW), virt::PADDR_INVALID);
+        KEXPECT_EQ(virt::translate(fixture.root, LOW + PAGE), virt::PADDR_INVALID);
+        auto invalid = captured;
+        invalid.local_node = numa::INVALID_NODE;
+        KEXPECT_FALSE(threading::selftest_back_stack_pages(fixture.root, LOW, LOW + PAGE, invalid, -1));
+        KEXPECT_EQ(virt::translate(fixture.root, LOW), virt::PADDR_INVALID);
+        ker::mod::dbg::log("C16B2 private managed stack/TLS node=%u; no scheduled hardware-growth or worker-current credit", chosen);
+        if (chosen == 0) ker::mod::dbg::log("C16B2 no usable node1 contrast; UMA/node0 branch only");
+    }
+    auto const STACK_AFTER = stack_placement_owner(ker::mod::mm::PhysicalPageOwner::USER_THREAD_STACK);
+    auto const TLS_AFTER = stack_placement_owner(ker::mod::mm::PhysicalPageOwner::USER_THREAD_TLS);
+    KEXPECT_EQ(STACK_AFTER.pages, STACK_BEFORE.pages);
+    KEXPECT_EQ(STACK_AFTER.objects, STACK_BEFORE.objects);
+    KEXPECT_EQ(TLS_AFTER.pages, TLS_BEFORE.pages);
+    KEXPECT_EQ(TLS_AFTER.objects, TLS_BEFORE.objects);
 }

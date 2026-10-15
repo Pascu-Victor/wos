@@ -31,8 +31,10 @@
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/init/limine_requests.hpp>
+#include <platform/loader/elf_loader.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/mm.hpp>
+#include <platform/mm/numa_alloc.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/perf/perf_events.hpp>
@@ -11057,7 +11059,8 @@ auto finish_remote_exec_task(ker::mod::sched::task::Task* new_task, uint8_t stdi
 }
 
 auto exec_elf_buffer(uint8_t* elf_buffer, uint32_t binary_len, bool shared_elf_buffer, ker::mod::sched::resource::State& resources,
-                     const ker::mod::security::Snapshot& credentials, uint8_t stdio_mask) -> ExecResult {
+                     const ker::mod::security::Snapshot& credentials, uint8_t stdio_mask,
+                     const ker::mod::mm::numa::AllocationContext& receiver_context) -> ExecResult {
     ExecResult result;
 
     // Validate ELF magic
@@ -11116,14 +11119,16 @@ auto exec_elf_buffer(uint8_t* elf_buffer, uint32_t binary_len, bool shared_elf_b
     }
 
     new_task->resources = resources;
+    ker::loader::elf::ElfLoadOptions const LOAD_OPTIONS{.allocation_context = receiver_context,
+                                                        .allocation_origin = ker::loader::elf::ElfAllocationOrigin::TRUSTED_LOCAL};
     if (ker::mod::sched::resource::initialize_credentials(*new_task, credentials) != 0 || !process_reservation.attach(*new_task) ||
-        !new_task->initialize_process_image(elf_buffer, binary_len)) {
+        !new_task->initialize_process_image(elf_buffer, binary_len, LOAD_OPTIONS)) {
         destroy_unpublished_remote_process(OWNER, new_task, nullptr, "wki-exec-construction", &resources);
         result.reject_reason = TaskRejectReason::NO_MEM;
         return result;
     }
     int interpreter_error = 0;
-    if (!ker::mod::sched::task::complete_unpublished_process_construction(new_task, &interpreter_error)) {
+    if (!ker::mod::sched::task::complete_unpublished_process_construction(new_task, receiver_context, &interpreter_error)) {
         destroy_unpublished_remote_process(OWNER, new_task, nullptr, "wki-exec-interpreter", &resources);
         result.reject_reason = interpreter_error == -EACCES ? TaskRejectReason::UNAUTHORIZED : TaskRejectReason::FETCH_FAILED;
         return result;
@@ -11133,8 +11138,8 @@ auto exec_elf_buffer(uint8_t* elf_buffer, uint32_t binary_len, bool shared_elf_b
 }
 
 auto exec_elf_file(ker::vfs::File* owned_file, uint32_t binary_len, const ker::vfs::Stat& file_stat,
-                   ker::mod::sched::resource::State& resources, const ker::mod::security::Snapshot& credentials, uint8_t stdio_mask)
-    -> ExecResult {
+                   ker::mod::sched::resource::State& resources, const ker::mod::security::Snapshot& credentials, uint8_t stdio_mask,
+                   const ker::mod::mm::numa::AllocationContext& receiver_context) -> ExecResult {
     ker::mod::sched::resource::ProcessReservation process_reservation(resources, credentials.user().real);
     if (process_reservation.result() != 0) {
         ker::vfs::vfs_put_file(owned_file);
@@ -11151,9 +11156,9 @@ auto exec_elf_file(ker::vfs::File* owned_file, uint32_t binary_len, const ker::v
     }
 
     int interpreter_error = 0;
-    auto* task = ker::syscall::process::create_file_backed_process_task("wki-remote", owned_file, binary_len, file_stat,
-                                                                        stack_base + ker::mod::mm::KERNEL_STACK_SIZE, resources,
-                                                                        credentials, process_reservation, &resources, &interpreter_error);
+    auto* task = ker::syscall::process::create_file_backed_process_task(
+        "wki-remote", owned_file, binary_len, file_stat, stack_base + ker::mod::mm::KERNEL_STACK_SIZE, resources, credentials,
+        process_reservation, receiver_context, &resources, &interpreter_error);
     if (task == nullptr && interpreter_error == -EACCES) {
         ExecResult result;
         result.reject_reason = TaskRejectReason::UNAUTHORIZED;
@@ -12299,10 +12304,22 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
         return;
     }
 
-    ExecResult const EXEC =
-        elf_file != nullptr
-            ? exec_elf_file(elf_file, binary_len, elf_file_stat, submitted_resources, mapped_credentials, stdio_mask)
-            : exec_elf_buffer(elf_buffer, binary_len, elf_buffer_shared, submitted_resources, mapped_credentials, stdio_mask);
+    // Receiver-local node identities never come from the sender wire. Preserve
+    // this one copy through main/interpreter and later argument-stack backing.
+    ker::mod::mm::numa::AllocationContext receiver_context{};
+    if (ker::mod::mm::numa::capture_allocation_context({}, receiver_context) != ker::mod::mm::numa::AllocationError::NONE) {
+        release_elf_source();
+        TaskResponsePayload reject{};
+        reject.task_id = submit->task_id;
+        reject.status = static_cast<uint8_t>(TaskRejectReason::NO_MEM);
+        send_submit_response(MsgType::TASK_REJECT, reject);
+        handle_measure.finish(perf_compute_reject_status(TaskRejectReason::NO_MEM), binary_len);
+        return;
+    }
+    ExecResult const EXEC = elf_file != nullptr ? exec_elf_file(elf_file, binary_len, elf_file_stat, submitted_resources,
+                                                                mapped_credentials, stdio_mask, receiver_context)
+                                                : exec_elf_buffer(elf_buffer, binary_len, elf_buffer_shared, submitted_resources,
+                                                                  mapped_credentials, stdio_mask, receiver_context);
     elf_file = nullptr;
     elf_buffer = nullptr;
     if (EXEC.task == nullptr) {
@@ -12520,7 +12537,8 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
             if (END < vaddr) {
                 return false;
             }
-            if (!ker::mod::sched::threading::ensure_stack_backing(new_task->thread, new_task->pagemap, vaddr, END, new_task)) {
+            if (!ker::mod::sched::threading::ensure_stack_backing(new_task->thread, new_task->pagemap, vaddr, END, new_task,
+                                                                  receiver_context)) {
                 mod::dbg::log("remote_compute: failed to back stack range [0x%llx,0x%llx)", static_cast<unsigned long long>(vaddr),
                               static_cast<unsigned long long>(END));
                 return false;
