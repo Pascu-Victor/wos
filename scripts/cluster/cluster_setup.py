@@ -1160,7 +1160,8 @@ class LaunchConflictError(RuntimeError):
 
 def cluster_launch_lock_path() -> Path:
     """Return the per-user, host-wide lock shared by all WOS launch modes."""
-    return Path(tempfile.gettempdir()) / f"wos-cluster-{os.getuid()}.lock"
+    # Packaging and guestfs use private TMPDIRs; they must share the host guard.
+    return Path("/tmp") / f"wos-cluster-{os.getuid()}.lock"
 
 
 def absolute_runtime_path(path: str | Path) -> Path:

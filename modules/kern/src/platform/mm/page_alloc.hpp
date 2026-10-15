@@ -165,6 +165,14 @@ struct PageAllocator {
     // failure.
     void* alloc(uint64_t size_bytes, PhysicalPageOwner owner, uint64_t caller = 0);
 
+    // Caller holds this allocator's lock. physical_base corresponds to base,
+    // independently of its HHDM/Host mapping. Return exactly pages contiguous
+    // pages inside [range_start, range_end), aligned in physical address space.
+    // Each returned page is an independent order-0 owner/ref, not a buddy
+    // allocation continuation. No zeroing/reclaim; null leaves state unchanged.
+    auto alloc_order0_span_in_range(uint64_t physical_base, uint64_t range_start, uint64_t range_end, uint32_t pages,
+                                    uint64_t alignment_bytes, PhysicalPageOwner owner, uint64_t caller = 0) -> void*;
+
     // Allocate exactly one physical page from an already-split order-0 free
     // list head. The caller must hold this allocator's lock. Returns nullptr
     // when no proven order-0 page is immediately available.

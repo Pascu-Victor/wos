@@ -4,6 +4,8 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
+import select
 import struct
 import subprocess
 import sys
@@ -374,6 +376,96 @@ def test_cluster_launch_guard_rejects_second_launcher(module) -> None:
 
     if "another WOS cluster launcher is active" not in message:
         raise AssertionError(f"missing launch conflict diagnostic in {message!r}")
+
+
+def test_cluster_launch_guard_is_host_wide_across_tmpdirs(module) -> None:
+    expected = Path("/tmp") / f"wos-cluster-{os.getuid()}.lock"
+    old_tmpdir = os.environ.get("TMPDIR")
+    old_gettempdir = module.tempfile.gettempdir
+    try:
+        os.environ["TMPDIR"] = "/private-packaging-scratch"
+        module.tempfile.gettempdir = lambda: "/different-cached-scratch"
+        assert_equal(module.cluster_launch_lock_path(), expected, "scratch variables never relocate the shared launch guard")
+    finally:
+        module.tempfile.gettempdir = old_gettempdir
+        if old_tmpdir is None:
+            os.environ.pop("TMPDIR", None)
+        else:
+            os.environ["TMPDIR"] = old_tmpdir
+
+    def guard_snapshot():
+        if not expected.exists():
+            return None
+        info = expected.lstat()
+        assert_equal(expected.is_symlink(), False, "shared guard is not a symlink")
+        return (info.st_dev, info.st_ino, info.st_uid, info.st_gid, info.st_mode,
+                info.st_nlink, info.st_mtime_ns, info.st_ctime_ns, expected.read_bytes())
+
+    before = guard_snapshot()
+    # Import the real resolver in independent fresh TMPDIR environments. Use
+    # flock directly so this probe never truncates the launcher's PID text.
+    probe = r'''
+import fcntl, importlib.util, json, os, select, stat, sys, tempfile
+from pathlib import Path
+source = Path(sys.argv[1])
+sys.path.insert(0, str(source.parent))
+spec = importlib.util.spec_from_file_location("cluster_setup_probe", source)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+path = module.cluster_launch_lock_path()
+assert path == Path("/tmp") / f"wos-cluster-{os.getuid()}.lock"
+fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+try:
+    info = os.fstat(fd)
+    assert stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink == 1
+    row = {"path": str(path), "device": info.st_dev, "inode": info.st_ino, "tmpdir": tempfile.gettempdir()}
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(json.dumps(dict(row, result="contended")), flush=True)
+        sys.exit(75)
+    print(json.dumps(dict(row, result="acquired")), flush=True)
+    if sys.argv[2] == "hold":
+        assert select.select([sys.stdin], [], [], 5)[0], "bounded parent release timed out"
+        assert sys.stdin.readline() == "release\n"
+finally:
+    os.close(fd)
+'''
+    with tempfile.TemporaryDirectory(prefix="wos-lock-tmpdirs-") as temporary:
+        first_tmp = Path(temporary) / "packaging"
+        second_tmp = Path(temporary) / "guestfs"
+        first_tmp.mkdir()
+        second_tmp.mkdir()
+        first_env = dict(os.environ, TMPDIR=str(first_tmp))
+        second_env = dict(os.environ, TMPDIR=str(second_tmp))
+        command = [sys.executable, "-c", probe, str(CLUSTER_SETUP)]
+        first = subprocess.Popen(command + ["hold"], env=first_env, stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            if not select.select([first.stdout], [], [], 3)[0]:
+                raise AssertionError("shared guard holder did not report within three seconds")
+            first_row = json.loads(first.stdout.readline())
+            assert_equal(first_row["result"], "acquired", "first process obtains the actual shared guard without forcing")
+            second = subprocess.run(command + ["try"], env=second_env, text=True, capture_output=True, timeout=3)
+            assert_equal(second.returncode, 75, "different TMPDIR process contends on the shared guard")
+            second_row = json.loads(second.stdout)
+            assert_equal(second_row["result"], "contended", "second process reports real nonblocking contention")
+            for key in ("path", "device", "inode"):
+                assert_equal(second_row[key], first_row[key], f"different TMPDIRs share the same guard {key}")
+            assert_equal(first_row["tmpdir"], str(first_tmp), "first process really has a private TMPDIR")
+            assert_equal(second_row["tmpdir"], str(second_tmp), "second process really has a different TMPDIR")
+            _stdout, stderr = first.communicate("release\n", timeout=3)
+            assert_equal((first.returncode, stderr), (0, ""), "holder releases and exits normally")
+            released = subprocess.run(command + ["try"], env=second_env, text=True, capture_output=True, timeout=3)
+            assert_equal((released.returncode, released.stderr), (0, ""), "shared guard is available after release")
+            released_row = json.loads(released.stdout)
+            assert_equal(released_row["inode"], first_row["inode"], "reacquisition preserves the same guard inode")
+        finally:
+            if first.poll() is None:
+                first.kill()  # Only this test's exact owned Python child.
+            first.communicate(timeout=3)
+    if before is not None:
+        assert_equal(guard_snapshot(), before, "existing guard bytes, metadata and inode remain unchanged")
 
 
 def test_cluster_launch_guard_rejects_preexisting_wos_qemu(module) -> None:
@@ -1658,9 +1750,189 @@ def test_disk_cache_modes_are_validated_before_disk_work(module) -> None:
         node.prepare_node_overlays, node.cleanup_node_logs = old_prepare, old_cleanup
 
 
+def numa_fixture_vm() -> dict:
+    return {
+        "memory": "8G",
+        "cpus": 8,
+        "numa": {
+            "nodes": [
+                {"id": 0, "cpus": [0, 1, 2, 3], "memoryMiB": 4096},
+                {"id": 1, "cpus": [4, 5, 6, 7], "memoryMiB": 4096},
+            ],
+            "distances": [[10, 20], [30, 10]],
+        },
+    }
+
+
+def test_numa_arguments_are_explicit_and_preserve_uma(module) -> None:
+    node = module.node_setup
+    expected = [
+        "-object", "memory-backend-ram,id=wos_numa_mem0,size=4096M",
+        "-object", "memory-backend-ram,id=wos_numa_mem1,size=4096M",
+        "-numa", "node,nodeid=0,cpus=0-3,memdev=wos_numa_mem0",
+        "-numa", "node,nodeid=1,cpus=4-7,memdev=wos_numa_mem1",
+        "-numa", "dist,src=0,dst=0,val=10",
+        "-numa", "dist,src=0,dst=1,val=20",
+        "-numa", "dist,src=1,dst=0,val=30",
+        "-numa", "dist,src=1,dst=1,val=10",
+    ]
+    assert_equal(node.build_numa_qemu_args({}), [], "UMA has no optional NUMA arguments")
+    original = numa_fixture_vm()
+    snapshot = json.dumps(original, sort_keys=True)
+    normalized = node.normalize_node_spec({"vm": original})
+    assert_equal(json.dumps(original, sort_keys=True), snapshot, "NUMA normalization leaves caller values unchanged")
+    assert_equal(node.build_numa_qemu_args(normalized["vm"]), expected, "actual complete memory/node/asymmetric-distance arguments")
+    normalized["vm"]["numa"]["nodes"][0]["cpus"].append(7)
+    assert_equal(json.dumps(original, sort_keys=True), snapshot, "normalized CPU arrays are owned copies")
+
+    old_prepare, old_cleanup = node.prepare_node_overlays, node.cleanup_node_logs
+    node.prepare_node_overlays = lambda _spec, log=print: (Path("disk0-overlay"), Path("disk1-overlay"))
+    node.cleanup_node_logs = lambda _spec: None
+    try:
+        with tempfile.TemporaryDirectory(prefix="wos-numa-args-") as temporary:
+            for tcg in (None, "none"):
+                vm = numa_fixture_vm()
+                vm.update(serial_log=str(Path(temporary) / "serial.log"), qemu_log=str(Path(temporary) / "qemu.log"),
+                          tcg_log=str(Path(temporary) / "tcg-cpu%d.log"))
+                uma = dict(vm)
+                del uma["numa"]
+                baseline = node.build_qemu_args({"vm": uma}, tcg_level=tcg, log=lambda _line: None)
+                actual = node.build_qemu_args({"vm": vm}, tcg_level=tcg, log=lambda _line: None)
+                at = baseline.index("-drive")
+                assert_equal(actual, baseline[:at] + expected + baseline[at:], "NUMA only adds reviewed arguments for KVM/TCG")
+                assert_equal(baseline[baseline.index("-smp") + 1], "8", "numeric existing vCPU geometry is unchanged")
+                assert_equal(any("host-nodes" in value or "mem-path" in value or "prealloc" in value for value in actual), False,
+                             "guest NUMA requires no host binding or file-backed RAM")
+    finally:
+        node.prepare_node_overlays, node.cleanup_node_logs = old_prepare, old_cleanup
+
+
+def test_numa_memory_only_ranges_and_config_roundtrip(module) -> None:
+    node = module.node_setup
+    vm = numa_fixture_vm()
+    del vm["numa"]["distances"]
+    vm["numa"]["nodes"][0]["cpus"] = list(range(8))
+    vm["numa"]["nodes"][1]["cpus"] = []
+    args = node.build_numa_qemu_args(vm)
+    assert_equal(args[-2:], ["-numa", "node,nodeid=1,memdev=wos_numa_mem1"], "memory-only node has no invented CPU")
+    assert_equal(any("dist," in value for value in args), False, "absent distance matrix emits no distance arguments")
+    vm["numa"]["nodes"][0]["cpus"] = [0, 2, 4, 6]
+    vm["numa"]["nodes"][1]["cpus"] = [1, 3, 5, 7]
+    args = node.build_numa_qemu_args(vm)
+    assert_equal(args[5], "node,nodeid=0,cpus=0,cpus=2,cpus=4,cpus=6,memdev=wos_numa_mem0", "noncontiguous CPUs remain explicit")
+    spec = json.loads(ROOTLESS_KTEST_CONFIG.read_text())
+    spec["node"]["vm"].update(numa_fixture_vm())
+    original = json.dumps(spec, sort_keys=True)
+    cluster = node.cluster_config_from_node_spec(spec)
+    members = module.collect_unique_nodes(cluster)
+    restored = module.cluster_node_spec(0, members[0], cluster)
+    assert_equal(restored["vm"]["numa"], spec["node"]["vm"]["numa"], "KTEST to cluster to node retains exact topology")
+    assert_equal(restored["vm"]["cpus"], 8, "cluster CPU accounting stays numeric")
+    assert_equal(json.dumps(spec, sort_keys=True), original, "configuration conversion does not mutate caller")
+    replacement = {"nodes": [{"id": 0, "cpus": list(range(8)), "memoryMiB": 8192}]}
+    effective = module.resolve_config({"vm": numa_fixture_vm()}, {"vm": {"numa": replacement}})
+    assert_equal(node.normalize_node_spec(effective)["vm"]["numa"], replacement, "zone override replaces whole topology without stale distances")
+
+
+def test_numa_cpu_only_node_omits_memory_backend(module) -> None:
+    node = module.node_setup
+    vm = {
+        "memory": "16M",
+        "cpus": 2,
+        "numa": {
+            "nodes": [
+                {"id": 0, "cpus": [0], "memoryMiB": 16},
+                {"id": 1, "cpus": [1], "memoryMiB": 0},
+            ],
+        },
+    }
+    assert_equal(node.build_numa_qemu_args(vm), [
+        "-object", "memory-backend-ram,id=wos_numa_mem0,size=16M",
+        "-numa", "node,nodeid=0,cpus=0,memdev=wos_numa_mem0",
+        "-numa", "node,nodeid=1,cpus=1",
+    ], "CPU-only node omits both RAM object and memdev")
+    vm["numa"]["nodes"][0]["cpus"] = []
+    vm["numa"]["nodes"][1]["cpus"] = [0, 1]
+    assert_equal(node.normalize_node_spec({"vm": vm})["vm"]["numa"], vm["numa"],
+                 "CPU-only and memory-only nodes retain the complete CPU and RAM partition")
+    assert_equal(node.build_numa_qemu_args(vm), [
+        "-object", "memory-backend-ram,id=wos_numa_mem0,size=16M",
+        "-numa", "node,nodeid=0,memdev=wos_numa_mem0",
+        "-numa", "node,nodeid=1,cpus=0-1",
+    ], "memory-only and CPU-only nodes have independent CPU and RAM arguments")
+
+
+def test_invalid_numa_refuses_before_overlay_or_log_work(module) -> None:
+    node = module.node_setup
+    invalid = []
+    for value in (None, True, [], {}, {"nodes": []}, {"nodes": [False]}, {"nodes": [], "extra": 1}):
+        vm = numa_fixture_vm(); vm["numa"] = value; invalid.append(vm)
+    changes = [
+        lambda vm: vm.__setitem__("cpus", True),
+        lambda vm: vm.__setitem__("cpus", 0),
+        lambda vm: vm.__setitem__("cpus", 65),
+        lambda vm: vm.__setitem__("memory", "08G"),
+        lambda vm: vm.__setitem__("memory", "8g"),
+        lambda vm: vm.__setitem__("memory", "8G,share=on"),
+        lambda vm: vm.__setitem__("memory", 8192),
+        lambda vm: vm.__setitem__("memory", str(1 << 64) + "G"),
+        lambda vm: vm["numa"]["nodes"][0].__setitem__("id", True),
+        lambda vm: vm["numa"]["nodes"][1].__setitem__("id", 0),
+        lambda vm: vm["numa"]["nodes"][1].__setitem__("id", 2),
+        lambda vm: vm["numa"]["nodes"][0].__setitem__("cpus", [0, 1, 1, 2, 3]),
+        lambda vm: vm["numa"]["nodes"][0].__setitem__("cpus", [1, 0, 2, 3]),
+        lambda vm: vm["numa"]["nodes"][0].__setitem__("cpus", [False, 1, 2, 3]),
+        lambda vm: vm["numa"]["nodes"][0].__setitem__("cpus", [0, 1, 2]),
+        lambda vm: vm["numa"]["nodes"][1].__setitem__("cpus", [3, 4, 5, 6, 7]),
+        lambda vm: vm["numa"]["nodes"][1].__setitem__("cpus", [4, 5, 6, 8]),
+        lambda vm: vm["numa"]["nodes"][1].__setitem__("cpus", [-1, 4, 5, 6, 7]),
+        lambda vm: vm["numa"]["nodes"][1].__setitem__("cpus", "4-7"),
+        lambda vm: vm["numa"]["nodes"][0].__setitem__("memoryMiB", True),
+        lambda vm: vm["numa"]["nodes"][0].__setitem__("memoryMiB", 0),
+        lambda vm: vm["numa"]["nodes"][0].__setitem__("memoryMiB", -1),
+        lambda vm: vm["numa"]["nodes"][0].__setitem__("memoryMiB", "4096"),
+        lambda vm: vm["numa"]["nodes"][0].__setitem__("memoryMiB", 8192),
+        lambda vm: vm["numa"]["nodes"][0].__setitem__("unexpected", 1),
+        lambda vm: vm["numa"].__setitem__("distances", [[10, 20]]),
+        lambda vm: vm["numa"].__setitem__("distances", [[10, 20], [30]]),
+        lambda vm: vm["numa"].__setitem__("distances", [[20, 20], [30, 10]]),
+        lambda vm: vm["numa"].__setitem__("distances", [[10, 10], [30, 10]]),
+        lambda vm: vm["numa"].__setitem__("distances", [[10, 256], [30, 10]]),
+        lambda vm: vm["numa"].__setitem__("distances", [[10, True], [30, 10]]),
+    ]
+    for change in changes:
+        vm = numa_fixture_vm(); change(vm); invalid.append(vm)
+    invalid.append({
+        "memory": "16M",
+        "cpus": 2,
+        "numa": {"nodes": [
+            {"id": 0, "cpus": [0, 1], "memoryMiB": 16},
+            {"id": 1, "cpus": [], "memoryMiB": 0},
+        ]},
+    })
+    old_prepare, old_cleanup = node.prepare_node_overlays, node.cleanup_node_logs
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("invalid NUMA specification reached disk/log work")
+    node.prepare_node_overlays = node.cleanup_node_logs = forbidden
+    try:
+        for vm in invalid:
+            try:
+                node.build_qemu_args({"vm": vm}, log=lambda _line: None)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"invalid NUMA specification accepted: {vm!r}")
+    finally:
+        node.prepare_node_overlays, node.cleanup_node_logs = old_prepare, old_cleanup
+
+
 def main() -> None:
     module = load_module()
     tests = [
+        test_numa_arguments_are_explicit_and_preserve_uma,
+        test_numa_memory_only_ranges_and_config_roundtrip,
+        test_numa_cpu_only_node_omits_memory_backend,
+        test_invalid_numa_refuses_before_overlay_or_log_work,
         test_disk_cache_modes_are_validated_before_disk_work,
         test_ivshmem_modes_share_the_node_launcher,
         test_node_cpu_model_override_is_exact,
@@ -1672,6 +1944,7 @@ def main() -> None:
         test_no_setup_topology_uses_only_explicit_zone_members,
         test_running_wos_qemu_probe_filters_unrelated_processes,
         test_cluster_launch_guard_rejects_second_launcher,
+        test_cluster_launch_guard_is_host_wide_across_tmpdirs,
         test_cluster_launch_guard_rejects_preexisting_wos_qemu,
         test_fixed_resource_benchmark_topologies,
         test_node_overlay_creation_failure_aborts_launch_prep,

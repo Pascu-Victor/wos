@@ -182,8 +182,19 @@ struct PageLookupHint {
 void init(limine_memmap_response* memmap_response);
 void set_kernel_cr3(uint64_t cr3);    // Call after initPagemap to set kernel CR3 for safe memset
 void init_huge_page_zone_deferred();  // Call after initPagemap to initialize huge page zone
-void init_kernel_stack_pool();        // Reserve contiguous stack slots before runtime fragmentation
-void enable_per_cpu_allocations();    // Call after cpuParamInit to enable per-CPU page caches
+
+enum class PageInitialization : uint8_t { ZERO, FULL_OVERWRITE };
+
+// Internal nonwaiting attempt. Each returned page owns one independent ref;
+// release each with page_ref_dec unless ownership is transferred to a mapping.
+// The caller owns placement/reserve/quota admission. No cache/reclaim fallback
+// outside the supplied physical interval occurs. FULL_OVERWRITE requires the
+// complete span to be initialized before any user-visible publication.
+[[nodiscard]] auto page_alloc_order0_span_in_range_may_fail(PhysicalPageOwner owner, uint64_t range_start, uint64_t range_end,
+                                                            uint32_t pages, uint64_t alignment_bytes,
+                                                            PageInitialization initialization = PageInitialization::ZERO) -> void*;
+void init_kernel_stack_pool();      // Reserve contiguous stack slots before runtime fragmentation
+void enable_per_cpu_allocations();  // Call after cpuParamInit to enable per-CPU page caches
 auto page_alloc(PhysicalPageOwner owner, uint64_t size = ker::mod::mm::paging::PAGE_SIZE, std::string_view name = {}) -> void*;
 auto page_alloc_full_overwrite(PhysicalPageOwner owner, uint64_t size = ker::mod::mm::paging::PAGE_SIZE, std::string_view name = {})
     -> void*;

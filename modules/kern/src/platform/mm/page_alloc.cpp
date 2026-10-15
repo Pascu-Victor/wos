@@ -764,6 +764,95 @@ void* PageAllocator::alloc(uint64_t size_bytes, PhysicalPageOwner owner, uint64_
     return reinterpret_cast<void*>(base + (static_cast<uint64_t>(page_idx) * paging::PAGE_SIZE));
 }
 
+auto PageAllocator::alloc_order0_span_in_range(uint64_t physical_base, uint64_t range_start, uint64_t range_end, uint32_t pages,
+                                               uint64_t alignment_bytes, PhysicalPageOwner owner, uint64_t caller) -> void* {
+#ifndef WOS_PHYS_ALLOC_CALLER_STATS
+    (void)caller;
+#endif
+    constexpr uint64_t PAGE_MASK = paging::PAGE_SIZE - 1;
+    uint64_t const ZONE_BYTES = static_cast<uint64_t>(total_pages) * paging::PAGE_SIZE;
+    if (!physical_page_owner_is_valid(owner) || pages == 0 || pages > (1U << MAX_ORDER) || pages > total_pages ||
+        alignment_bytes < paging::PAGE_SIZE || (alignment_bytes & (alignment_bytes - 1)) != 0 || base == 0 ||
+        ((base | physical_base) & PAGE_MASK) != 0 || ZONE_BYTES > UINT64_MAX - physical_base || ZONE_BYTES > UINT64_MAX - base ||
+        range_start >= range_end || page_flags == nullptr || page_kinds == nullptr || page_owners == nullptr || page_refcounts == nullptr)
+        return nullptr;
+
+    uint64_t const LOW = std::max(physical_base, range_start);
+    uint64_t const HIGH = std::min(physical_base + ZONE_BYTES, range_end);
+    uint64_t const BYTES = static_cast<uint64_t>(pages) * paging::PAGE_SIZE;
+    if (LOW >= HIGH || BYTES > HIGH - LOW || free_count < pages || free_count > total_pages || cached_order0_count > free_count)
+        return nullptr;
+    size_t const OWNER_INDEX = owner_index(owner);
+    if (owner_pages[OWNER_INDEX] > UINT64_MAX - pages || owner_objects[OWNER_INDEX] > UINT64_MAX - pages) return nullptr;
+
+    int minimum_order = 0;
+    while ((1U << minimum_order) < pages) ++minimum_order;
+    for (int order = minimum_order; order <= MAX_ORDER; ++order) {
+        FreeBlock* previous = nullptr;
+        uint32_t visited = 0;
+        for (auto* block = free_list[static_cast<size_t>(order)]; block != nullptr; block = block->next) {
+            uint32_t block_index = 0;
+            uint32_t const BLOCK_PAGES = 1U << order;
+            if (visited++ >= total_pages || !free_head_is_valid(this, block, order, block_index) ||
+                BLOCK_PAGES > total_pages - block_index || (block_index & (BLOCK_PAGES - 1)) != 0 || block->prev != previous)
+                return nullptr;
+            previous = block;
+
+            uint64_t const BLOCK_START = physical_base + static_cast<uint64_t>(block_index) * paging::PAGE_SIZE;
+            uint64_t const BLOCK_END = BLOCK_START + static_cast<uint64_t>(BLOCK_PAGES) * paging::PAGE_SIZE;
+            uint64_t const WINDOW_LOW = std::max(LOW, BLOCK_START);
+            uint64_t const WINDOW_END = std::min(HIGH, BLOCK_END);
+            uint64_t const ALIGN_MASK = alignment_bytes - 1;
+            if (WINDOW_LOW >= WINDOW_END || WINDOW_LOW > UINT64_MAX - ALIGN_MASK) continue;
+            uint64_t const START = (WINDOW_LOW + ALIGN_MASK) & ~ALIGN_MASK;
+            if (START >= WINDOW_END || BYTES > WINDOW_END - START) continue;
+
+            // Carving never needs a block as large as the original. Validate
+            // every possible destination head before unlinking; the unchecked
+            // insertion below cannot trigger a list repair after mutation.
+            for (int destination = 0; destination < order; ++destination) {
+                auto* head = free_list[static_cast<size_t>(destination)];
+                uint32_t head_index = 0;
+                uint32_t const HEAD_PAGES = 1U << destination;
+                if (head != nullptr && (!free_head_is_valid(this, head, destination, head_index) || HEAD_PAGES > total_pages - head_index ||
+                                        (head_index & (HEAD_PAGES - 1)) != 0 || head->prev != nullptr))
+                    return nullptr;
+            }
+            if (!free_block_pages_are_reusable(this, block_index, order, "interval span candidate")) return nullptr;
+            if (!remove_free_block(this, order, block)) return nullptr;
+
+            uint32_t const FIRST = static_cast<uint32_t>((START - physical_base) / paging::PAGE_SIZE);
+            uint32_t const END = FIRST + pages;
+            for (uint32_t i = block_index; i < block_index + BLOCK_PAGES; ++i) page_flags[i] = FLAG_FREE_INTERIOR;
+            auto return_free_run = [this](uint32_t first, uint32_t count) {
+                while (count != 0) {
+                    int const ORDER = largest_order_for_aligned_run(first, count);
+                    uint32_t const BLOCK_SIZE = 1U << ORDER;
+                    page_flags[first] = FLAG_FREE_HEAD | static_cast<uint8_t>(ORDER);
+                    link_free_block_unchecked(this, ORDER, static_cast<FreeBlock*>(page_to_ptr(base, first)));
+                    first += BLOCK_SIZE;
+                    count -= BLOCK_SIZE;
+                }
+            };
+            return_free_run(block_index, FIRST - block_index);
+            return_free_run(END, block_index + BLOCK_PAGES - END);
+            for (uint32_t i = FIRST; i < END; ++i) {
+                page_flags[i] = FLAG_ALLOC_HEAD;
+                store_page_kind(page_kinds[i], PageKind::NORMAL);
+                store_page_owner(page_owners[i], owner);
+                page_refcounts[i].store(1, std::memory_order_release);
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+                page_callers[i] = caller;
+#endif
+            }
+            account_owner_alloc(this, owner, pages, pages);
+            free_count -= pages;
+            return page_to_ptr(base, FIRST);
+        }
+    }
+    return nullptr;
+}
+
 void* PageAllocator::alloc_order0(PhysicalPageOwner owner, uint64_t caller) {
 #ifndef WOS_PHYS_ALLOC_CALLER_STATS
     (void)caller;

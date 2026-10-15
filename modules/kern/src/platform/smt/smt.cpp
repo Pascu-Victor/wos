@@ -15,6 +15,7 @@
 #include <cstring>
 #include <iterator>
 #include <new>
+#include <platform/acpi/numa_boot.hpp>
 #include <platform/dbg/journal.hpp>
 #include <platform/ktime/kvmclock.hpp>
 #include <platform/ktime/process_timer.hpp>
@@ -771,6 +772,11 @@ auto get_early_cpu_count() -> uint64_t {
         return g_cpu_count;
     }
     if (SMP_REQUEST.response != nullptr) {
+        // PMM sizes its per-CPU caches before phase-3 smt::init(). Refuse an
+        // unsupported count here too, before that sizing arithmetic occurs.
+        if (SMP_REQUEST.response->cpu_count == 0 || SMP_REQUEST.response->cpu_count > 64 || SMP_REQUEST.response->cpus == nullptr) {
+            dbg::panic_handler("unsupported boot CPU count: scheduler supports 1..64 CPUs");
+        }
         return SMP_REQUEST.response->cpu_count;
     }
     return 1;
@@ -959,9 +965,29 @@ void init() {
     if (response == nullptr) {
         hcf();
     }
+    // The public affinity ABI and current scheduler masks are 64 bits. Reject
+    // unsupported machines before constructing any partial scheduler mask.
+    // get_early_cpu_count() enforces this before PMM's per-CPU cache sizing.
+    if (response->cpu_count == 0 || response->cpu_count > 64 || response->cpus == nullptr) {
+        dbg::panic_handler("unsupported boot CPU count: scheduler supports 1..64 CPUs");
+    }
     flags = response->flags;
     bsp_lapic_id = response->bsp_lapic_id;
     g_cpu_count = response->cpu_count;
+
+    // Existing BSP descriptor/GS startup uses logical CPU zero, while APs use
+    // their Limine array index. Refuse inconsistent enumeration explicitly
+    // instead of publishing an affinity map that aliases another CPU's state.
+    if (response->cpus[0] == nullptr || response->cpus[0]->lapic_id != bsp_lapic_id) {
+        dbg::panic_handler("unsupported boot CPU ordering: BSP must be logical CPU zero");
+    }
+
+    std::array<acpi::numa::CpuInput, 64> topology_cpus{};
+    for (size_t i = 0; i < g_cpu_count; ++i) {
+        if (response->cpus[i] == nullptr) dbg::panic_handler("missing boot CPU identity");
+        topology_cpus[i] = {.logical_index = static_cast<uint32_t>(i), .apic_id = response->cpus[i]->lapic_id};
+    }
+    acpi::numa::initialize_boot_topology({topology_cpus.data(), static_cast<size_t>(g_cpu_count)});
 
     // Allocate the kernel PerCpu pointers array
     kernel_per_cpu_ptrs = new cpu::PerCpu*[g_cpu_count];

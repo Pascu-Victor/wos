@@ -13,6 +13,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import re
 import subprocess
 import tempfile
 from copy import deepcopy
@@ -104,6 +105,93 @@ def normalize_qemu_netdev(raw: dict, *, queues: int, vhost: bool, where: str) ->
     return normalized
 
 
+def _numa_memory_mib(value: object) -> int:
+    if not isinstance(value, str) or (match := re.fullmatch(r"([1-9][0-9]*)([MG])", value)) is None:
+        raise ValueError("NUMA vm.memory must be a canonical positive M or G size")
+    memory = int(match[1]) * (1024 if match[2] == "G" else 1)
+    if memory > ((1 << 64) - 1) // (1 << 20):
+        raise ValueError("NUMA vm.memory exceeds the QEMU byte-size range")
+    return memory
+
+
+def normalize_numa_spec(raw: object, *, cpus: object, memory: object) -> dict:
+    """Validate a bounded guest topology without touching host resources."""
+    if not isinstance(raw, dict) or not {"nodes"} <= raw.keys() or not raw.keys() <= {"nodes", "distances"}:
+        raise ValueError("vm.numa must contain nodes and optional distances only")
+    if type(cpus) is not int or not 1 <= cpus <= 64:
+        raise ValueError("NUMA vm.cpus must be an integer in [1, 64]")
+    total_memory = _numa_memory_mib(memory)
+    nodes = raw["nodes"]
+    if not isinstance(nodes, list) or not 1 <= len(nodes) <= 64:
+        raise ValueError("vm.numa.nodes must contain between 1 and 64 nodes")
+    normalized = []
+    assigned: set[int] = set()
+    for index, node in enumerate(nodes):
+        if not isinstance(node, dict) or set(node) != {"id", "cpus", "memoryMiB"}:
+            raise ValueError(f"vm.numa.nodes[{index}] requires exactly id, cpus and memoryMiB")
+        if type(node["id"]) is not int or node["id"] != index:
+            raise ValueError("NUMA node IDs must be contiguous and match their array positions")
+        members = node["cpus"]
+        if not isinstance(members, list) or any(type(cpu) is not int or not 0 <= cpu < cpus for cpu in members):
+            raise ValueError(f"vm.numa.nodes[{index}].cpus must contain in-range integer CPU indexes")
+        if members != sorted(set(members)) or assigned.intersection(members):
+            raise ValueError("NUMA CPU lists must be sorted, unique and nonoverlapping")
+        size = node["memoryMiB"]
+        if type(size) is not int or not 0 <= size <= total_memory:
+            raise ValueError("NUMA memoryMiB must be a nonnegative integer within vm.memory")
+        if size == 0 and not members:
+            raise ValueError("NUMA nodes must contain CPUs or positive memoryMiB")
+        assigned.update(members)
+        normalized.append({"id": index, "cpus": list(members), "memoryMiB": size})
+    if assigned != set(range(cpus)):
+        raise ValueError("NUMA nodes must assign every configured CPU exactly once")
+    if sum(node["memoryMiB"] for node in normalized) != total_memory:
+        raise ValueError("NUMA node memoryMiB must sum exactly to vm.memory")
+    result = {"nodes": normalized}
+    if "distances" in raw:
+        distances = raw["distances"]
+        count = len(nodes)
+        if not isinstance(distances, list) or len(distances) != count:
+            raise ValueError("NUMA distances must be a complete node-by-node matrix")
+        for src, row in enumerate(distances):
+            if not isinstance(row, list) or len(row) != count:
+                raise ValueError("NUMA distances must be a complete node-by-node matrix")
+            for dst, value in enumerate(row):
+                if type(value) is not int or (value != 10 if src == dst else not 10 < value <= 255):
+                    raise ValueError("NUMA distances require diagonal 10 and off-diagonal integers in [11, 255]")
+        result["distances"] = [list(row) for row in distances]
+    return result
+
+
+def build_numa_qemu_args(vm: dict) -> list[str]:
+    """Pure optional guest NUMA arguments; no host NUMA binding is implied."""
+    if "numa" not in vm:
+        return []
+    numa = normalize_numa_spec(vm["numa"], cpus=vm.get("cpus"), memory=vm.get("memory"))
+    args = []
+    for node in numa["nodes"]:
+        if node["memoryMiB"]:
+            args.extend(["-object", f"memory-backend-ram,id=wos_numa_mem{node['id']},size={node['memoryMiB']}M"])
+    for node in numa["nodes"]:
+        options = [f"node,nodeid={node['id']}"]
+        members = node["cpus"]
+        first = 0
+        while first < len(members):
+            last = first
+            while last + 1 < len(members) and members[last + 1] == members[last] + 1:
+                last += 1
+            interval = str(members[first]) if first == last else f"{members[first]}-{members[last]}"
+            options.append(f"cpus={interval}")
+            first = last + 1
+        if node["memoryMiB"]:
+            options.append(f"memdev=wos_numa_mem{node['id']}")
+        args.extend(["-numa", ",".join(options)])
+    for src, row in enumerate(numa.get("distances", [])):
+        for dst, distance in enumerate(row):
+            args.extend(["-numa", f"dist,src={src},dst={dst},val={distance}"])
+    return args
+
+
 def normalize_node_spec(raw: dict) -> dict:
     """Return a node spec with defaults applied.
 
@@ -126,6 +214,10 @@ def normalize_node_spec(raw: dict) -> dict:
         raise ValueError("vm.iommu must be a boolean")
     if iommu and spec["vm"].get("machine", "q35").split(",", 1)[0] != "q35":
         raise ValueError("vm.iommu requires the q35 machine")
+    if "numa" in spec["vm"]:
+        spec["vm"]["numa"] = normalize_numa_spec(
+            spec["vm"]["numa"], cpus=spec["vm"]["cpus"], memory=spec["vm"]["memory"]
+        )
     spec["nics"] = [deepcopy(nic) for nic in spec.get("nics", [])]
     for nic_index, nic in enumerate(spec["nics"]):
         backend = nic.get("qemu_netdev")
@@ -333,6 +425,7 @@ def build_qemu_args(
 
     memory = vm_cfg.get("memory", "4G")
     cpus = vm_cfg.get("cpus", 2)
+    numa_args = build_numa_qemu_args(vm_cfg)
     overlay0, overlay1 = prepare_node_overlays(spec, log=log)
     cleanup_node_logs(spec)
 
@@ -360,6 +453,7 @@ def build_qemu_args(
         str(memory),
         "-smp",
         str(cpus),
+        *numa_args,
         "-drive",
         f"file={overlay0},if=none,id=drive0,format=qcow2,cache={vm_cfg['disk_cache']}",
         "-device",

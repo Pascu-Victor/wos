@@ -301,6 +301,12 @@ wos_add_unit_test(vtd_page_table_test
 wos_add_unit_test(acpi_bounded_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/acpi_bounded_test.cpp
 )
+wos_add_unit_test(numa_topology_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_topology_test.cpp
+)
+wos_add_unit_test(numa_policy_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_policy_test.cpp
+)
 wos_add_unit_test(vtd_capability_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vtd_capability_test.cpp
 )
@@ -1789,6 +1795,17 @@ wos_add_unit_test(physical_balance_test
     KERN_SOURCES ${WOS_KERN_SRC}/platform/mm/page_alloc.cpp
 )
 target_compile_definitions(physical_balance_test PRIVATE WOS_HOST_TEST=1)
+
+wos_add_unit_test(page_allocator_interval_test
+    SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/page_allocator_interval_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/platform/mm/page_alloc.cpp
+)
+target_compile_definitions(page_allocator_interval_test PRIVATE WOS_HOST_TEST=1)
+wos_add_unit_test(page_allocator_interval_provenance_test
+    SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/page_allocator_interval_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/platform/mm/page_alloc.cpp
+)
+target_compile_definitions(page_allocator_interval_provenance_test PRIVATE WOS_HOST_TEST=1 WOS_PHYS_ALLOC_CALLER_STATS=1)
 
 wos_add_unit_test(reclaim_policy_test
     SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/reclaim_policy_test.cpp

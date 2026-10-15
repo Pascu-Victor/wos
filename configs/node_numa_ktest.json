@@ -1,0 +1,74 @@
+{
+    "build": {
+        "dir": "build-ktest",
+        "state_root": "ktest-data",
+        "sysroot": "ktest-data/sysroot"
+    },
+    "package": {
+        "kernel_cmdline": "--selftest --numa-test-two-nodes"
+    },
+    "node": {
+        "id": 0,
+        "hostname": "wos-numa-ktest",
+        "debug": false,
+        "mtu": 1500,
+        "vm": {
+            "memory": "8G",
+            "cpus": 8,
+            "numa": {
+                "nodes": [
+                    {"id": 0, "cpus": [0, 1, 2, 3], "memoryMiB": 4096},
+                    {"id": 1, "cpus": [4, 5, 6, 7], "memoryMiB": 4096}
+                ],
+                "distances": [[10, 20], [20, 10]]
+            },
+            "disk0": "ktest-data/disk.qcow2",
+            "disk1": "ktest-data/mountfs.qcow2",
+            "overlay_dir": "ktest-data/numa-overlays",
+            "serial_log": "ktest-data/serial-numa-vm0.log",
+            "qemu_log": "ktest-data/qemu-numa-vm0.log",
+            "tcg_log": "ktest-data/qemu-numa-vm0-cpu%d.log",
+            "usb_hotplug": {
+                "enabled": true,
+                "controller_id": "xhci",
+                "usb2_ports": 4,
+                "usb3_ports": 4,
+                "qmp_socket": "ktest-data/qmp-numa-vm0.sock"
+            }
+        },
+        "nics": [
+            {
+                "name": "lan",
+                "zone_id": 0,
+                "mac": "52:54:00:40:00:00",
+                "model": "virtio-net-pci",
+                "queues": 1,
+                "vhost": false,
+                "driver": "dhcp",
+                "qemu_netdev": {
+                    "type": "socket-mcast",
+                    "address": "239.192.40.1",
+                    "port": 61400,
+                    "localaddr": "127.0.0.1"
+                },
+                "bridge": {"stp": false, "ip": "10.40.0.100/24", "dns": "10.40.0.1"}
+            },
+            {
+                "name": "wki",
+                "zone_id": 1,
+                "mac": "52:54:00:40:01:00",
+                "model": "virtio-net-pci",
+                "queues": 1,
+                "vhost": false,
+                "driver": "wki",
+                "qemu_netdev": {
+                    "type": "socket-mcast",
+                    "address": "239.192.40.2",
+                    "port": 61401,
+                    "localaddr": "127.0.0.1"
+                },
+                "bridge": {"stp": false, "ip": null}
+            }
+        ]
+    }
+}

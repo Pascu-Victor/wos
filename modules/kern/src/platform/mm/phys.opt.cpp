@@ -1924,6 +1924,53 @@ auto page_alloc_may_fail(PhysicalPageOwner owner, uint64_t size, std::string_vie
     return page_alloc_impl(owner, size, name, ReturnedPageZeroing::ZERO, __builtin_return_address(0), false);
 }
 
+auto page_alloc_order0_span_in_range_may_fail(PhysicalPageOwner owner, uint64_t range_start, uint64_t range_end, uint32_t pages,
+                                              uint64_t alignment_bytes, PageInitialization initialization) -> void* {
+    if (!physical_page_owner_is_valid(owner) || pages == 0 || pages > (1U << PageAllocator::MAX_ORDER) || range_start >= range_end ||
+        (initialization != PageInitialization::ZERO && initialization != PageInitialization::FULL_OVERWRITE))
+        return nullptr;
+    uint64_t const BYTES = static_cast<uint64_t>(pages) * paging::PAGE_SIZE;
+    [[maybe_unused]] void* const CALLER = __builtin_return_address(0);
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+    uint64_t const CALLER_TAG = caller_stats_runtime_enabled.load(std::memory_order_relaxed) ? reinterpret_cast<uint64_t>(CALLER) : 0;
+#else
+    uint64_t const CALLER_TAG = 0;
+#endif
+    uint64_t const HHDM = addr::get_hhdm_offset();
+    auto try_zone = [&](paging::PageZone* zone) -> void* {
+        if (zone == nullptr || zone->allocator == nullptr || zone->start < HHDM || zone->len < BYTES) return nullptr;
+#ifdef WOS_SELFTEST
+        if (!virt::selftest_direct_map_contains(zone)) dbg::panic_handler("placed allocation zone lost its HHDM translation");
+#endif
+        uint64_t const FLAGS = zone->allocator->lock_irq();
+        void* const BLOCK = zone->allocator->alloc_order0_span_in_range(zone->start - HHDM, range_start, range_end, pages, alignment_bytes,
+                                                                        owner, CALLER_TAG);
+        zone->allocator->unlock_irq(FLAGS);
+        return BLOCK;
+    };
+    void* block = nullptr;
+    for (auto* zone = zones; zone != nullptr && block == nullptr; zone = zone->next) block = try_zone(zone);
+    if (block == nullptr) block = try_zone(huge_page_zone);
+    if (block == nullptr) return nullptr;
+
+#ifdef WOS_SELFTEST
+    for (uint32_t i = 0; i < pages; ++i) {
+        if (virt::selftest_kernel_page_table_frame(static_cast<uint8_t*>(block) + static_cast<uint64_t>(i) * paging::PAGE_SIZE))
+            dbg::panic_handler("placed allocator reissued a permanent kernel page table");
+    }
+#endif
+    note_physical_alloc(BYTES);
+    prepare_allocated_block(block, BYTES,
+                            initialization == PageInitialization::ZERO ? ReturnedPageZeroing::ZERO : ReturnedPageZeroing::FULL_OVERWRITE);
+#ifdef WOS_PHYS_ALLOC_CALLER_STATS
+    record_page_alloc_caller(CALLER, pages);
+#endif
+    uint8_t order = 0;
+    while ((uint32_t{1} << order) < pages) ++order;
+    reclaim::note_allocation(order, pages);
+    return block;
+}
+
 auto page_alloc_full_overwrite_page_may_fail(PhysicalPageOwner owner, std::string_view name) -> void* {
     return page_alloc_impl(owner, paging::PAGE_SIZE, name, ReturnedPageZeroing::FULL_OVERWRITE, __builtin_return_address(0), false);
 }
