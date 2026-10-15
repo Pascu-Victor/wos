@@ -237,8 +237,8 @@ constexpr std::array<PhysicalOwnerDescriptor, PHYSICAL_PAGE_OWNER_COUNT> PHYSICA
      PhysicalOwnerReclaimability::PERMANENT, "exactly one page after first anonymous read mapping"},
     {PhysicalPageOwner::PAGE_TABLE, "page_table", "address-space or kernel-map lifetime", PhysicalOwnerReclaimability::OWNER_TEARDOWN,
      "bounded by mapped virtual-address topology"},
-    {PhysicalPageOwner::PAGE_TABLE_POOL_RESERVE, "page_table_pool_reserve", "cached root-page-table lifetime",
-     PhysicalOwnerReclaimability::PERMANENT, "at most 64 pages globally"},
+    {PhysicalPageOwner::PAGE_TABLE_POOL_RESERVE, "page_table_pool_reserve", "cached tables and boot emergency root reserves",
+     PhysicalOwnerReclaimability::PERMANENT, "ordinary cache at most 64 plus emergency roots at most 64 per published node"},
     {PhysicalPageOwner::PHYSICAL_ALLOCATOR_METADATA, "physical_allocator_runtime_metadata", "allocator lifetime",
      PhysicalOwnerReclaimability::PERMANENT, "two pages per optional huge-page zone"},
     {PhysicalPageOwner::KERNEL_STACK, "kernel_stack", "kernel task lifetime", PhysicalOwnerReclaimability::OWNER_TEARDOWN,
@@ -2373,6 +2373,26 @@ auto page_reassign_owner(void* page, PhysicalPageOwner owner) -> bool {
     bool const OK = alloc->reassign_allocated_block_owner(page, owner);
     alloc->unlock_irq(FLAGS);
     return OK;
+}
+
+auto page_table_owner_transition_if_exclusive(void* page, PhysicalPageOwner expected, PhysicalPageOwner desired) -> bool {
+    auto const TABLE_OWNER = [](PhysicalPageOwner owner) {
+        return owner == PhysicalPageOwner::PAGE_TABLE || owner == PhysicalPageOwner::PAGE_TABLE_POOL_RESERVE;
+    };
+    if (page == nullptr || (reinterpret_cast<uint64_t>(page) & (paging::PAGE_SIZE - 1)) != 0 || !TABLE_OWNER(expected) ||
+        !TABLE_OWNER(desired))
+        return false;
+    PageAllocator* alloc = nullptr;
+    uint32_t index = 0;
+    if (!find_allocator_for_page(page, alloc, index) || alloc == nullptr) return false;
+    uint64_t const FLAGS = alloc->lock_irq();
+    bool const EXCLUSIVE = index < alloc->total_pages && alloc->page_flags[index] == PageAllocator::FLAG_ALLOC_HEAD &&
+                           alloc->page_owners[index] == static_cast<uint8_t>(expected) &&
+                           alloc->page_kinds[index].load(std::memory_order_acquire) == static_cast<uint8_t>(PageKind::PAGE_TABLE) &&
+                           alloc->page_refcounts[index].load(std::memory_order_acquire) == 1;
+    bool const TRANSFERRED = EXCLUSIVE && alloc->reassign_allocated_block_owner(page, desired);
+    alloc->unlock_irq(FLAGS);
+    return TRANSFERRED;
 }
 
 auto page_kind_get(void* page) -> PageKind { return page_kind_get(page, nullptr); }

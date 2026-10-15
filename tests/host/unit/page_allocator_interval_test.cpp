@@ -385,4 +385,209 @@ TEST(PageAllocatorIntervalInput, UninitializedAllocatorRefusesWithoutDereference
     EXPECT_EQ(allocator.alloc_order0_span_in_range(0, 0, LARGE, 1, PAGE, OWNER), nullptr);
 }
 
+// Additional repair-order vectors use an event ledger independent of allocator
+// flags/lists. The physical split is test attribution only, not C19 counters.
+class PageAllocatorFreeRepair : public PageAllocatorInterval {
+   protected:
+    std::vector<uint8_t> ledger;  // 0 buddy free, 1 live, 2 cached, 3 metadata.
+    uint32_t domain_boundary{};
+
+    void SetUp() override {
+        PageAllocatorInterval::SetUp();
+        ASSERT_FALSE(HasFatalFailure());
+        ledger.assign(allocator->total_pages, 0);
+        for (uint32_t i = 0; i < allocator->metadata_pages; ++i) ledger[i] = 3;
+        domain_boundary = allocator->total_pages / 2;
+    }
+    auto tracked_allocate(uint32_t first, uint32_t pages) -> void* {
+        void* span = allocate(address(first), address(first + pages), pages, PAGE, 0xC19A0);
+        EXPECT_EQ(span, pointer(first));
+        if (span != pointer(first)) return nullptr;
+        for (uint32_t i = first; i < first + pages; ++i) {
+            EXPECT_EQ(ledger[i], 0U);
+            ledger[i] = 1;
+        }
+        return span;
+    }
+    void tracked_free(uint32_t page) {
+        EXPECT_EQ(ledger[page], 1U);
+        AllocatorLock const LOCK(*allocator);
+        uint64_t const FREED = allocator->free(pointer(page));
+        EXPECT_EQ(FREED, PAGE);
+        if (FREED == PAGE) ledger[page] = 0;
+    }
+    void tracked_cache(uint32_t page) {
+        EXPECT_EQ(ledger[page], 1U);
+        AllocatorLock const LOCK(*allocator);
+        uint32_t cached = UINT32_MAX;
+        bool const ACCEPTED = allocator->cache_allocated_order0(pointer(page), cached);
+        EXPECT_TRUE(ACCEPTED);
+        EXPECT_EQ(cached, page);
+        if (ACCEPTED) ledger[page] = 2;
+    }
+    void tracked_drain(uint32_t page) {
+        EXPECT_EQ(ledger[page], 2U);
+        AllocatorLock const LOCK(*allocator);
+        uint64_t const FREED = allocator->release_cached_order0_at(page);
+        EXPECT_EQ(FREED, PAGE);
+        if (FREED == PAGE) ledger[page] = 0;
+    }
+    auto expected_node_free() const -> std::array<uint64_t, 2> {
+        std::array<uint64_t, 2> result{};
+        for (uint32_t i = 0; i < allocator->total_pages; ++i)
+            if (ledger[i] == 0 || ledger[i] == 2) ++result[address(i) < address(domain_boundary) ? 0 : 1];
+        return result;
+    }
+    void check_event_ledger() const {
+        check_invariants();
+        std::vector<uint8_t> actual_free(allocator->total_pages, 0);
+        for (uint32_t i = allocator->metadata_pages; i < allocator->total_pages;) {
+            uint8_t const FLAGS = allocator->page_flags[i];
+            if (FLAGS == mm::PageAllocator::FLAG_CACHED_ORDER0) {
+                actual_free[i++] = 2;
+            } else if ((FLAGS & 0xC0) == mm::PageAllocator::FLAG_FREE_HEAD) {
+                uint32_t const COUNT = 1U << (FLAGS & 0x1F);
+                ASSERT_LE(COUNT, allocator->total_pages - i);
+                for (uint32_t j = i; j < i + COUNT; ++j) actual_free[j] = 1;
+                i += COUNT;
+            } else {
+                ++i;
+            }
+        }
+        std::array<uint64_t, 2> actual_nodes{}, cached_nodes{}, live_nodes{};
+        uint64_t live = 0;
+        for (uint32_t i = allocator->metadata_pages; i < allocator->total_pages; ++i) {
+            size_t const NODE = address(i) < address(domain_boundary) ? 0 : 1;
+            EXPECT_EQ(actual_free[i], ledger[i] == 0 ? 1 : ledger[i] == 2 ? 2 : 0) << "page=" << i;
+            if (actual_free[i] != 0) ++actual_nodes[NODE];
+            if (ledger[i] == 2) ++cached_nodes[NODE];
+            if (ledger[i] == 1) {
+                ++live;
+                ++live_nodes[NODE];
+            }
+        }
+        EXPECT_EQ(actual_nodes, expected_node_free());
+        EXPECT_EQ(allocator->free_count, actual_nodes[0] + actual_nodes[1]);
+        EXPECT_EQ(allocator->cached_order0_count, cached_nodes[0] + cached_nodes[1]);
+        EXPECT_EQ(allocator->owner_pages[OWNER_INDEX], live);
+        EXPECT_EQ(allocator->owner_objects[OWNER_INDEX], live);
+        EXPECT_EQ(live_nodes[0] + live_nodes[1] + actual_nodes[0] + actual_nodes[1], allocator->usable_pages);
+    }
+    auto block_for(uint32_t pages) -> uint32_t {
+        uint32_t first = 0, count = 0;
+        EXPECT_TRUE(free_block(4, first, count));
+        EXPECT_GE(count, pages);
+        return first;
+    }
+};
+
+TEST_F(PageAllocatorFreeRepair, FinalInsertionRepairDoesNotDoubleCreditOriginalSpan) {
+    uint32_t const FIRST = block_for(4);
+    ASSERT_NE(tracked_allocate(FIRST, 4), nullptr);
+    domain_boundary = FIRST + 1;
+    auto const BEFORE = expected_node_free();
+    {
+        AllocatorLock const LOCK(*allocator);
+        // Invalid list pointer identity, valid arena address: do not mutate the
+        // live buddy's metadata or manufacture a free flag.
+        allocator->free_list[0] = reinterpret_cast<mm::PageAllocator::FreeBlock*>(pointer(FIRST + 1));
+    }
+    tracked_free(FIRST);
+    EXPECT_EQ(expected_node_free()[0], BEFORE[0] + 1);
+    EXPECT_EQ(expected_node_free()[1], BEFORE[1]);
+    check_event_ledger();
+    for (uint32_t i = 1; i < 4; ++i) tracked_free(FIRST + i);
+    check_event_ledger();
+}
+
+TEST_F(PageAllocatorFreeRepair, LaterUnlinkRepairPreservesEarlierMergedBuddiesAcrossBoundary) {
+    for (unsigned failed_order : {1U, 2U}) {
+        SCOPED_TRACE(failed_order);
+        uint32_t const FIRST = block_for(8);
+        ASSERT_NE(tracked_allocate(FIRST, 8), nullptr);
+        domain_boundary = FIRST + 1;
+        for (uint32_t i = 8; i > 1; --i) tracked_free(FIRST + i - 1);
+        check_event_ledger();
+        auto const BEFORE = expected_node_free();
+        uint32_t const BAD = FIRST + (1U << failed_order);
+        ASSERT_EQ(allocator->page_flags[BAD], mm::PageAllocator::FLAG_FREE_HEAD | failed_order);
+        {
+            AllocatorLock const LOCK(*allocator);
+            auto* buddy = reinterpret_cast<mm::PageAllocator::FreeBlock*>(pointer(BAD));
+            buddy->prev = reinterpret_cast<mm::PageAllocator::FreeBlock*>(pointer(FIRST));
+        }
+        tracked_free(FIRST);  // Earlier lower-order merges run before this refusal.
+        EXPECT_EQ(expected_node_free()[0], BEFORE[0] + 1);
+        EXPECT_EQ(expected_node_free()[1], BEFORE[1]);
+        check_event_ledger();
+    }
+}
+
+TEST_F(PageAllocatorFreeRepair, HealthyLowerAndUpperBuddyMergesKeepTheSameCoverage) {
+    for (bool lower_first : {false, true}) {
+        SCOPED_TRACE(lower_first);
+        uint32_t const FIRST = block_for(4);
+        ASSERT_NE(tracked_allocate(FIRST, 4), nullptr);
+        domain_boundary = FIRST + 1;
+        tracked_free(FIRST + (lower_first ? 0 : 1));
+        check_event_ledger();
+        tracked_free(FIRST + (lower_first ? 1 : 0));
+        check_event_ledger();
+        tracked_free(FIRST + 3);
+        tracked_free(FIRST + 2);
+        check_event_ledger();
+    }
+}
+
+TEST_F(PageAllocatorFreeRepair, CachedDrainRepairKeepsInclusiveFreeAndOwnerTotalsExact) {
+    uint32_t const FIRST = block_for(4);
+    ASSERT_NE(tracked_allocate(FIRST, 4), nullptr);
+    tracked_cache(FIRST);
+    check_event_ledger();
+    auto const BEFORE = expected_node_free();
+    {
+        AllocatorLock const LOCK(*allocator);
+        allocator->free_list[0] = reinterpret_cast<mm::PageAllocator::FreeBlock*>(pointer(FIRST + 1));
+    }
+    tracked_drain(FIRST);
+    EXPECT_EQ(expected_node_free(), BEFORE);
+    check_event_ledger();
+    for (uint32_t i = 1; i < 4; ++i) tracked_free(FIRST + i);
+    check_event_ledger();
+}
+
+TEST_F(PageAllocatorFreeRepair, RepeatedAllocFreeCacheEventsMatchIndependentPhysicalLedger) {
+    uint32_t const FIRST = block_for(16);
+    uint32_t state = 0x9E3779B9;
+    domain_boundary = FIRST + 7;
+    for (uint32_t step = 0; step < 1000; ++step) {
+        state = state * 1664525U + 1013904223U;
+        uint32_t const PAGE_IDX = FIRST + ((state >> 8) % 16);
+        if (ledger[PAGE_IDX] == 0) {
+            ASSERT_NE(tracked_allocate(PAGE_IDX, 1), nullptr);
+        } else if (ledger[PAGE_IDX] == 1) {
+            if ((state & 1U) != 0)
+                tracked_cache(PAGE_IDX);
+            else
+                tracked_free(PAGE_IDX);
+        } else {
+            ASSERT_EQ(ledger[PAGE_IDX], 2U);
+            if ((state & 1U) != 0) {
+                AllocatorLock const LOCK(*allocator);
+                ASSERT_EQ(allocator->alloc_cached_order0_at(PAGE_IDX, OWNER, 0xC19A0), pointer(PAGE_IDX));
+                ledger[PAGE_IDX] = 1;
+            } else
+                tracked_drain(PAGE_IDX);
+        }
+        check_event_ledger();
+    }
+    for (uint32_t i = FIRST; i < FIRST + 16; ++i) {
+        if (ledger[i] == 1)
+            tracked_free(i);
+        else if (ledger[i] == 2)
+            tracked_drain(i);
+    }
+    check_event_ledger();
+}
+
 }  // namespace

@@ -1,7 +1,9 @@
 #include "numa_alloc.hpp"
 
 #include <platform/acpi/numa_boot.hpp>
+#include <platform/asm/cpu.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/sched/scheduler.hpp>
 #include <utility>
 
 namespace ker::mod::mm::numa {
@@ -37,6 +39,26 @@ void OwnedSpan::reset() noexcept {
     auto* const DATA = static_cast<uint8_t*>(std::exchange(data_, nullptr));
     uint32_t const PAGES = std::exchange(pages_, 0);
     for (uint32_t i = 0; i < PAGES; ++i) phys::page_ref_dec(DATA + static_cast<uint64_t>(i) * paging::PAGE_SIZE);
+}
+
+auto capture_allocation_context(Policy copied_policy, AllocationContext& output) noexcept -> AllocationError {
+    auto const* topology = acpi::numa::boot_topology();
+    if (topology == nullptr || topology->node_count == 0 || topology->node_count > MAX_NODES || topology->cpu_count == 0 ||
+        topology->cpu_count > topology->cpu_nodes.size())
+        return AllocationError::NO_TOPOLOGY;
+    if (!valid_policy(copied_policy, topology->node_count)) return AllocationError::INVALID_POLICY;
+    NodeId local = INVALID_NODE;
+    {
+        sched::PreemptGuard const PREEMPT;
+        uint64_t const CPU = cpu::current_cpu();
+        if (CPU >= topology->cpu_count || CPU >= topology->cpu_nodes.size()) return AllocationError::INVALID_LOCAL_NODE;
+        local = topology->cpu_nodes[CPU];
+        if (local >= topology->node_count) return AllocationError::INVALID_LOCAL_NODE;
+    }
+    output.policy = copied_policy;
+    output.local_node = local;
+    output.virtual_page_index = 0;
+    return AllocationError::NONE;
 }
 
 auto physical_node(uint64_t physical_address) noexcept -> NodeId {

@@ -190,11 +190,20 @@ def test_buddy_free_list_repair_rebuilds_from_flags() -> None:
     require_order(
         free_body,
         [
-            "insert_free_block(alloc, k, free_block);",
+            "bool repair_needed = false;",
+            "if (!remove_free_block(alloc, k, buddy_block))",
+            "repair_needed = true;",
+            "break;",
+            "alloc->page_flags[page_idx] = PageAllocator::FLAG_FREE_HEAD | static_cast<uint8_t>(k);",
             "alloc->free_count += BLOCK_SIZE;",
+            "if (repair_needed)",
+            "rebuild_free_lists_from_flags(alloc, \"free coalesce unlink\");",
+            "insert_free_block(alloc, k, free_block);",
         ],
-        "free_count must be updated after rebuilt/coalesced free-head publication",
+        "complete the merged free head and original credit before any possible recount",
     )
+    if "remove_free_block_with_repair(" in free_body or free_body.count("alloc->free_count += BLOCK_SIZE;") != 1:
+        fail("free-side repair must defer recount and credit the original allocation exactly once")
     require_tokens(
         alloc_body,
         [

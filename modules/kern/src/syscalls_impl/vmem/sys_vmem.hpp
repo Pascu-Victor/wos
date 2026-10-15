@@ -108,6 +108,16 @@ void release_file_mmap_ranges_for_pagemap(ker::mod::mm::paging::PageTable* pagem
 // Caller exclusively owns a never-active unpublished Task/root and address.
 // Maps through the real anonymous zero reserve, not a synthetic registered page.
 [[nodiscard]] auto selftest_map_anonymous_zero_page(ker::mod::sched::task::Task& subject, uint64_t address) -> bool;
+// Bounded actual private helper calls on the same exclusive never-active
+// target contract. These do not impersonate currentTask or exercise public
+// syscall AS admission. A finite failure index is a controlled test operand,
+// not a claim of physical pressure. Maximum length is sixteen pages.
+[[nodiscard]] auto selftest_allocate_private_anonymous(ker::mod::sched::task::Task& subject, uint64_t address, uint64_t length,
+                                                       uint64_t prot, uint64_t fail_before_page = UINT64_MAX) -> uint64_t;
+// Exact absent/reserved leaf owned by the caller, with no swap/file owner.
+// Failure operand only covers the private (non-NONE/no-WRITE) allocation.
+[[nodiscard]] auto selftest_materialize_anonymous_reserved(ker::mod::sched::task::Task& subject, uint64_t address, uint64_t prot,
+                                                           bool fail_private_allocation = false) -> bool;
 struct SelftestFileCacheObservation {
     void* retained_frame{};  // Caller owns one actual frame ref on a hit.
     bool vacant_way{};       // Pre-SMP admission only, not a reservation.

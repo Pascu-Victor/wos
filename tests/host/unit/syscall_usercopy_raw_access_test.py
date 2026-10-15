@@ -251,6 +251,40 @@ def test_raw_translation_exceptions_are_only_unpublished_images() -> None:
     for forbidden in ["map_page(", "get_anon_zero_page(", "get_virt_pointer(", "memcpy(", "page_ref_inc("]:
         if forbidden in zero:
             fail(f"VMEM genuine-zero fixture must delegate real singleton ownership: {forbidden}")
+    reserved_start = remaining.find("auto selftest_materialize_anonymous_reserved(")
+    if (reserved_start < 0 or remaining.rfind("#ifdef WOS_SELFTEST", 0, reserved_start)
+            <= remaining.rfind("#endif", 0, reserved_start)):
+        fail("VMEM reserved-page fixture must remain inside WOS_SELFTEST")
+    reserved_brace = remaining.find("{", reserved_start)
+    reserved_end = find_matching_brace(remaining, reserved_brace) + 1
+    reserved = remaining[reserved_brace + 1 : reserved_end - 1]
+    remaining = remaining[:reserved_start] + remaining[reserved_end:]
+    if (reserved.count("mm::virt::translate(subject.pagemap, address)") != 1
+            or reserved.count("translate(") != 1 or "get_virt_pointer(" in reserved):
+        fail("VMEM reserved fixture permits one exact vacancy check and no raw data access")
+    require_order(reserved, ["selftest_owned_anonymous_target(subject, address, mm::paging::PAGE_SIZE)",
+                            "mm::virt::translate(subject.pagemap, address) != mm::virt::PADDR_INVALID)",
+                            "return false;", "subject.memory_policy_snapshot()",
+                            "numa::capture_allocation_context(MEMORY_POLICY, placement)",
+                            "SharedVmemPublicationGuard publication;",
+                            "return materialize_reserved_page(&subject, address, prot, placement, fail_private_allocation);"],
+                  "VMEM reserved vacancy and captured policy precede real private materialization")
+    target = function_body(vmem_source, "auto selftest_owned_anonymous_target(")
+    require_code(target, ["ROOT != nullptr", "ROOT != mm::virt::get_kernel_pagemap()", "address >= USER_SPACE_START",
+                          "length != 0", "length <= 16 * mm::paging::PAGE_SIZE", "address <= USER_SPACE_END - length",
+                          "(address | length) % mm::paging::PAGE_SIZE == 0", "subject.type == task::TaskType::PROCESS",
+                          "subject.pid == 0", "!subject.is_thread", "subject.thread == nullptr",
+                          "subject.state.load(std::memory_order_acquire) == task::TaskState::ACTIVE",
+                          "!subject.scheduler_published.load(std::memory_order_acquire)",
+                          "!subject.shares_user_pagemap.load(std::memory_order_acquire)",
+                          "subject.native_file_mapping_retirement.load(std::memory_order_acquire) == nullptr",
+                          "subject.usercopy_pagemap_accesses.load(std::memory_order_acquire) == 0",
+                          "!ker::mod::sched::can_query_current_task() || ker::mod::sched::get_current_task() != &subject",
+                          "!mm::virt::active_pagemap_is(ROOT)", "mm::virt::selftest_user_pagemap_reader_count(ROOT) == 0"],
+                 "VMEM reserved fixed owned inactive target and bounded aligned geometry")
+    for forbidden in ["map_page(", "get_virt_pointer(", "memcpy(", "page_ref_inc(", "create_page_table_entry("]:
+        if forbidden in reserved or forbidden in target:
+            fail(f"VMEM reserved fixture must delegate backing ownership: {forbidden}")
     producer_start = remaining.find("auto prepare_unpublished_file_mapping_impl(")
     if producer_start < 0:
         fail("VMEM unpublished mapping producer must remain explicitly named")
@@ -266,7 +300,7 @@ def test_raw_translation_exceptions_are_only_unpublished_images() -> None:
             fail(f"VMEM {name} must only select its fixed native backing mode")
     if (fixture.count("virt::translate(pagemap, BASE)") != 2 or fixture.count("get_virt_pointer(PADDR)") != 1
             or fixture.count("translate(") != 2 or fixture.count("get_virt_pointer(") != 1
-            or vmem_source.count("translate(") != 6 or vmem_source.count("get_virt_pointer(") != 3):
+            or vmem_source.count("translate(") != 7 or vmem_source.count("get_virt_pointer(") != 3):
         fail("VMEM named fixture raw access must remain its exact marker/content checks")
     if (producer.count("ker::mod::mm::virt::translate(child.pagemap, page)") != 1
             or producer.count("translate(") != 1 or "get_virt_pointer(" in producer):

@@ -19,6 +19,7 @@
 #include <platform/dbg/journal.hpp>
 #include <platform/ktime/kvmclock.hpp>
 #include <platform/ktime/process_timer.hpp>
+#include <platform/mm/numa_root_reserve.hpp>
 
 #include "mod/io/serial/serial.hpp"
 #include "net/proto/ndp.hpp"
@@ -988,6 +989,8 @@ void init() {
         topology_cpus[i] = {.logical_index = static_cast<uint32_t>(i), .apic_id = response->cpus[i]->lapic_id};
     }
     acpi::numa::initialize_boot_topology({topology_cpus.data(), static_cast<size_t>(g_cpu_count)});
+    if (mm::numa::root_reserve::initialize_after_topology() != mm::numa::root_reserve::Error::NONE)
+        dbg::panic_handler("emergency root reserve initialization failed");
 
     // Allocate the kernel PerCpu pointers array
     kernel_per_cpu_ptrs = new cpu::PerCpu*[g_cpu_count];

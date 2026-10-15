@@ -48,6 +48,12 @@ enum class AllocationError : uint8_t {
     EXHAUSTED
 };
 
+// Capture from an already copied policy before publication/MM locks. No Task
+// or root lifetime travels here. Output must already be addressable; failure
+// leaves it unchanged. Success sets virtual_page_index to zero for the caller
+// to replace with each destination VA's page index.
+[[nodiscard]] auto capture_allocation_context(Policy copied_policy, AllocationContext& output) noexcept -> AllocationError;
+
 struct AllocationResult {
     OwnedSpan span{};
     NodeId requested{INVALID_NODE};

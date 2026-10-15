@@ -19,6 +19,7 @@
 #include <platform/init/limine_requests.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/numa_alloc.hpp>
 #include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
@@ -48,6 +49,7 @@
 
 namespace ker::syscall::vmem {
 using log = ker::mod::dbg::logger<"vmem">;
+namespace numa = ker::mod::mm::numa;
 
 // Linux x86_64 user space address range
 // User space: 0x0000000000000000 - 0x00007FFFFFFFFFFF (128TB)
@@ -1834,7 +1836,12 @@ auto anon_zero_page_flags(uint64_t prot) -> uint64_t {
     return flags;
 }
 
-auto materialize_reserved_page(ker::mod::sched::task::Task* task, uint64_t vaddr, uint64_t prot) -> bool {
+auto materialize_reserved_page(ker::mod::sched::task::Task* task, uint64_t vaddr, uint64_t prot, const numa::AllocationContext& placement
+#ifdef WOS_SELFTEST
+                               ,
+                               bool fail_private_allocation = false
+#endif
+                               ) -> bool {
     if (task == nullptr || task->pagemap == nullptr) {
         return false;
     }
@@ -1853,8 +1860,17 @@ auto materialize_reserved_page(ker::mod::sched::task::Task* task, uint64_t vaddr
         return true;
     }
 
-    void* const PHYS_PAGE = ker::mod::mm::phys::page_alloc_with_reclaim_may_fail(ker::mod::mm::PhysicalPageOwner::USER_PRIVATE_MAPPING,
-                                                                                 ker::mod::mm::paging::PAGE_SIZE, "vmem-reserve");
+    auto page_context = placement;
+    page_context.virtual_page_index = vaddr / ker::mod::mm::paging::PAGE_SIZE;
+    numa::AllocationResult allocation;
+#ifdef WOS_SELFTEST
+    if (!fail_private_allocation)
+#endif
+        numa::try_allocate_pages_into(allocation, page_context, 1, ker::mod::mm::paging::PAGE_SIZE,
+                                      ker::mod::mm::PhysicalPageOwner::USER_PRIVATE_MAPPING, ker::mod::mm::phys::PageInitialization::ZERO,
+                                      numa::ReclaimMode::LEGACY_UMA, "vmem-reserve");
+    void* const PHYS_PAGE =
+        allocation.error == numa::AllocationError::NONE && allocation.actual != numa::INVALID_NODE ? allocation.span.data() : nullptr;
     if (PHYS_PAGE == nullptr) {
         return false;
     }
@@ -1862,6 +1878,7 @@ auto materialize_reserved_page(ker::mod::sched::task::Task* task, uint64_t vaddr
 
     auto const PADDR = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(PHYS_PAGE)));
     ker::mod::mm::virt::map_page(task->pagemap, vaddr, PADDR, prot_to_page_flags(prot));
+    (void)allocation.span.release();
     return true;
 }
 
@@ -1908,15 +1925,29 @@ void release_fixed_mmap_range_locked(ker::mod::sched::task::Task* task, uint64_t
 }
 
 auto private_anon_allocate_locked(ker::mod::sched::task::Task* task, uint64_t vaddr, uint64_t size, uint64_t prot, uint64_t hint,
-                                  uint64_t flags) -> uint64_t {
+                                  uint64_t flags, const numa::AllocationContext& placement
+#ifdef WOS_SELFTEST
+                                  ,
+                                  uint64_t fail_before_page = UINT64_MAX
+#endif
+                                  ) -> uint64_t {
     auto const PAGE_FLAGS = prot_to_page_flags(prot);
     auto const NUM_PAGES = size / ker::mod::mm::paging::PAGE_SIZE;
     uint64_t mapped_pages = 0;
 
     for (uint64_t i = 0; i < NUM_PAGES; i++) {
         auto current_vaddr = vaddr + (i * ker::mod::mm::paging::PAGE_SIZE);
-        void* const PHYS_PAGE = ker::mod::mm::phys::page_alloc_with_reclaim_may_fail(ker::mod::mm::PhysicalPageOwner::USER_PRIVATE_MAPPING,
-                                                                                     ker::mod::mm::paging::PAGE_SIZE, "vmem-anon");
+        auto page_context = placement;
+        page_context.virtual_page_index = current_vaddr / ker::mod::mm::paging::PAGE_SIZE;
+        numa::AllocationResult allocation;
+#ifdef WOS_SELFTEST
+        if (i != fail_before_page)
+#endif
+            numa::try_allocate_pages_into(allocation, page_context, 1, ker::mod::mm::paging::PAGE_SIZE,
+                                          ker::mod::mm::PhysicalPageOwner::USER_PRIVATE_MAPPING,
+                                          ker::mod::mm::phys::PageInitialization::ZERO, numa::ReclaimMode::LEGACY_UMA, "vmem-anon");
+        void* const PHYS_PAGE =
+            allocation.error == numa::AllocationError::NONE && allocation.actual != numa::INVALID_NODE ? allocation.span.data() : nullptr;
         if (PHYS_PAGE == nullptr) {
             log::error("out of physical memory after mapping %llu/%llu anon pages", static_cast<unsigned long long>(mapped_pages),
                        static_cast<unsigned long long>(NUM_PAGES));
@@ -1927,6 +1958,7 @@ auto private_anon_allocate_locked(ker::mod::sched::task::Task* task, uint64_t va
 
         auto const PADDR = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(PHYS_PAGE)));
         ker::mod::mm::virt::map_page(task->pagemap, current_vaddr, PADDR, PAGE_FLAGS);
+        (void)allocation.span.release();
         mapped_pages++;
 
         if (is_watched_mmap_vaddr(current_vaddr)) {
@@ -2003,6 +2035,21 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EOVERFLOW);
     }
 
+    // Freeze the existing backing decision before publication. MAP_POPULATE
+    // bypasses lazy backing, but still adopts the shared zero reserve when
+    // zero-COW is enabled. Only a genuinely private route needs placement.
+    bool const RESERVE_ONLY = is_prot_none(prot) || (flags & ker::abi::vmem::MAP_NORESERVE) != 0;
+    bool const PRIVATE_READ = !RESERVE_ONLY && (prot & ker::abi::vmem::PROT_WRITE) == 0;
+    bool const USE_LAZY = !RESERVE_ONLY && !PRIVATE_READ && lazy_anon_mmap_enabled() && (flags & ker::abi::vmem::MAP_POPULATE) == 0;
+    bool const PRIVATE_EAGER = PRIVATE_READ || (!RESERVE_ONLY && !USE_LAZY && !anon_zero_cow_enabled());
+    numa::AllocationContext placement;
+    if (PRIVATE_EAGER) {
+        auto const MEMORY_POLICY = task->memory_policy_snapshot();
+        auto const CAPTURE = numa::capture_allocation_context(MEMORY_POLICY, placement);
+        if (CAPTURE != numa::AllocationError::NONE)
+            return static_cast<uint64_t>(CAPTURE == numa::AllocationError::INVALID_POLICY ? -EINVAL : -ENOMEM);
+    }
+
     // Keep address selection/reservation, PTE installation, shared lazy-range
     // metadata, cursor publication, and every rollback in one fork-visible
     // transaction.
@@ -2048,7 +2095,7 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
         release_fixed_mmap_range_locked(task, vaddr, size);
     }
 
-    if (is_prot_none(prot) || (flags & ker::abi::vmem::MAP_NORESERVE) != 0) {
+    if (RESERVE_ONLY) {
         if (!add_shared_vmem_range_locked(task, vaddr, size, prot, flags)) {
             release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
@@ -2060,8 +2107,8 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
         return vaddr;
     }
 
-    if ((prot & ker::abi::vmem::PROT_WRITE) == 0) {
-        uint64_t const RESULT = private_anon_allocate_locked(task, vaddr, size, prot, hint, flags);
+    if (PRIVATE_READ) {
+        uint64_t const RESULT = private_anon_allocate_locked(task, vaddr, size, prot, hint, flags, placement);
         int const RESULT_STATUS = perf_status_from_vmem_result(RESULT);
         record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::ANON_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES, 0,
                                 RESULT_STATUS, vmem_latency_since(PERF_STARTED_US), RESULT_STATUS == 0 ? RESULT : hint, size, true);
@@ -2071,7 +2118,7 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
         return RESULT;
     }
 
-    if (lazy_anon_mmap_enabled() && (flags & ker::abi::vmem::MAP_POPULATE) == 0) {
+    if (USE_LAZY) {
         if (!add_shared_vmem_range_locked(task, vaddr, size, prot, flags)) {
             release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
@@ -2083,8 +2130,8 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
         return vaddr;
     }
 
-    if (!anon_zero_cow_enabled()) {
-        uint64_t const RESULT = private_anon_allocate_locked(task, vaddr, size, prot, hint, flags);
+    if (PRIVATE_EAGER) {
+        uint64_t const RESULT = private_anon_allocate_locked(task, vaddr, size, prot, hint, flags, placement);
         int const RESULT_STATUS = perf_status_from_vmem_result(RESULT);
         record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::ANON_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES, 2,
                                 RESULT_STATUS, vmem_latency_since(PERF_STARTED_US), RESULT_STATUS == 0 ? RESULT : hint, size, true);
@@ -2700,7 +2747,62 @@ auto selftest_map_anonymous_zero_page(ker::mod::sched::task::Task& subject, uint
         (ker::mod::sched::can_query_current_task() && ker::mod::sched::get_current_task() == &subject) ||
         mm::virt::active_pagemap_is(ROOT) || mm::virt::translate(ROOT, address) != mm::virt::PADDR_INVALID)
         return false;
-    return materialize_reserved_page(&subject, address, ker::abi::vmem::PROT_READ | ker::abi::vmem::PROT_WRITE);
+    auto const MEMORY_POLICY = subject.memory_policy_snapshot();
+    numa::AllocationContext placement;
+    if (numa::capture_allocation_context(MEMORY_POLICY, placement) != numa::AllocationError::NONE) return false;
+    return materialize_reserved_page(&subject, address, ker::abi::vmem::PROT_READ | ker::abi::vmem::PROT_WRITE, placement);
+}
+
+namespace {
+auto selftest_owned_anonymous_target(ker::mod::sched::task::Task& subject, uint64_t address, uint64_t length) -> bool {
+    namespace mm = ker::mod::mm;
+    namespace task = ker::mod::sched::task;
+    auto* const ROOT = subject.pagemap;
+    return ROOT != nullptr && ROOT != mm::virt::get_kernel_pagemap() && address >= USER_SPACE_START && length != 0 &&
+           length <= 16 * mm::paging::PAGE_SIZE && address <= USER_SPACE_END - length && (address | length) % mm::paging::PAGE_SIZE == 0 &&
+           subject.type == task::TaskType::PROCESS && subject.pid == 0 && !subject.is_thread && subject.thread == nullptr &&
+           subject.state.load(std::memory_order_acquire) == task::TaskState::ACTIVE &&
+           !subject.scheduler_published.load(std::memory_order_acquire) && !subject.shares_user_pagemap.load(std::memory_order_acquire) &&
+           subject.native_file_mapping_retirement.load(std::memory_order_acquire) == nullptr &&
+           subject.usercopy_pagemap_accesses.load(std::memory_order_acquire) == 0 &&
+           (!ker::mod::sched::can_query_current_task() || ker::mod::sched::get_current_task() != &subject) &&
+           !mm::virt::active_pagemap_is(ROOT) && mm::virt::selftest_user_pagemap_reader_count(ROOT) == 0;
+}
+}  // namespace
+
+auto selftest_allocate_private_anonymous(ker::mod::sched::task::Task& subject, uint64_t address, uint64_t length, uint64_t prot,
+                                         uint64_t fail_before_page) -> uint64_t {
+    namespace vmabi = ker::abi::vmem;
+    constexpr uint64_t VALID_PROT = vmabi::PROT_READ | vmabi::PROT_WRITE | vmabi::PROT_EXEC;
+    if (!selftest_owned_anonymous_target(subject, address, length) || is_prot_none(prot) || (prot & ~VALID_PROT) != 0 ||
+        (fail_before_page != UINT64_MAX && fail_before_page >= length / ker::mod::mm::paging::PAGE_SIZE) ||
+        !ker::mod::mm::virt::is_user_virtual_range_free(subject.pagemap, address, address + length))
+        return static_cast<uint64_t>(-EINVAL);
+    auto const MEMORY_POLICY = subject.memory_policy_snapshot();
+    numa::AllocationContext placement;
+    auto const CAPTURE = numa::capture_allocation_context(MEMORY_POLICY, placement);
+    if (CAPTURE != numa::AllocationError::NONE)
+        return static_cast<uint64_t>(CAPTURE == numa::AllocationError::INVALID_POLICY ? -EINVAL : -ENOMEM);
+    SharedVmemPublicationGuard publication;
+    return private_anon_allocate_locked(&subject, address, length, prot, address, vmabi::MAP_PRIVATE | vmabi::MAP_ANONYMOUS, placement,
+                                        fail_before_page);
+}
+
+auto selftest_materialize_anonymous_reserved(ker::mod::sched::task::Task& subject, uint64_t address, uint64_t prot,
+                                             bool fail_private_allocation) -> bool {
+    namespace mm = ker::mod::mm;
+    namespace vmabi = ker::abi::vmem;
+    constexpr uint64_t VALID_PROT = vmabi::PROT_READ | vmabi::PROT_WRITE | vmabi::PROT_EXEC;
+    if (!selftest_owned_anonymous_target(subject, address, mm::paging::PAGE_SIZE) || (prot & ~VALID_PROT) != 0 ||
+        mm::virt::translate(subject.pagemap, address) != mm::virt::PADDR_INVALID)
+        return false;
+    // Trusted fixture precondition: the exact empty/reserved leaf has no
+    // independent swap/file owner. Registration alone does not prove this.
+    auto const MEMORY_POLICY = subject.memory_policy_snapshot();
+    numa::AllocationContext placement;
+    if (numa::capture_allocation_context(MEMORY_POLICY, placement) != numa::AllocationError::NONE) return false;
+    SharedVmemPublicationGuard publication;
+    return materialize_reserved_page(&subject, address, prot, placement, fail_private_allocation);
 }
 
 auto selftest_observe_file_mmap_cache(ker::vfs::File& file, uint64_t offset, SelftestFileCacheObservation& observation) -> bool {
@@ -4354,6 +4456,14 @@ auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -
 
             if (public_shared_file_overlap(*task, ADDR, size)) return change_public_shared_file(*task, ADDR, size, true, PROT);
 
+            numa::AllocationContext placement;
+            if (!is_prot_none(PROT) && (PROT & ker::abi::vmem::PROT_WRITE) == 0) {
+                auto const MEMORY_POLICY = task->memory_policy_snapshot();
+                auto const CAPTURE = numa::capture_allocation_context(MEMORY_POLICY, placement);
+                if (CAPTURE != numa::AllocationError::NONE)
+                    return static_cast<uint64_t>(CAPTURE == numa::AllocationError::INVALID_POLICY ? -EINVAL : -ENOMEM);
+            }
+
             SharedVmemPublicationGuard publication_guard;
             if (public_shared_file_overlap(*task, ADDR, size)) return static_cast<uint64_t>(-EAGAIN);
             if (overlaps_kernel_managed_user_layout_locked(task, ADDR, size)) {
@@ -4407,7 +4517,7 @@ auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -
                     if (ker::mod::mm::virt::is_page_mapped(task->pagemap, current_vaddr)) {
                         ker::mod::mm::virt::unify_page_flags(task->pagemap, current_vaddr, page_flags);
                     } else if (ker::mod::mm::virt::is_page_reserved(task->pagemap, current_vaddr) &&
-                               !materialize_reserved_page(task, current_vaddr, PROT)) {
+                               !materialize_reserved_page(task, current_vaddr, PROT, placement)) {
                         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
                     }
                 }

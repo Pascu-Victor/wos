@@ -2,6 +2,7 @@
 
 #ifdef WOS_SELFTEST
 #include <platform/mm/lifecycle_census.hpp>
+#include <platform/mm/numa_root_reserve.hpp>
 #endif
 
 #include <extern/limine.h>
@@ -307,10 +308,35 @@ void drain_kernel_vmap_frees_if_over_limit();
 PageTable* create_pagemap();
 // Recoverable private process construction; retains the page-table pool path.
 auto create_pagemap_may_fail() -> PageTable*;
-// owner_pid is diagnostic provenance only; it grants no teardown authority.
+// Exact sole owner of a never-active private root OR fully retired root with
+// no future hardware publishers and completed teardown/ACK. owner_pid is only
+// diagnostic provenance; the software access gate alone cannot prove retirement.
 void release_pagemap(PageTable* pagemap, uint64_t owner_pid = 0);
 void get_user_root_control_stats_snapshot(UserRootControlStats& out);
 #ifdef WOS_SELFTEST
+// Synchronous diagnostic operands only. Caller owns initialized, addressable,
+// mutually nonaliasing options/output throughout the call. No pointer escapes.
+struct SelftestRootFactoryOptions {
+    bool force_ordinary_failure{};
+    bool use_node_override{};
+    numa::NodeId node_override{numa::INVALID_NODE};
+    bool fail_needed_control_chunk{};
+};
+struct SelftestRootFactoryOutput {
+    uint64_t captured_cpu{UINT64_MAX};
+    numa::NodeId captured_local{numa::INVALID_NODE};
+    numa::NodeId requested{numa::INVALID_NODE};
+    bool override_used{};
+    bool ordinary_allocator_called{};
+    bool ordinary_failure_injected{};
+    bool reserve_attempted{};
+    numa::root_reserve::Error reserve_error{numa::root_reserve::Error::NOT_READY};
+    bool need_chunk_seen{};
+    bool control_failure_injected{};
+    bool control_registered{};
+    bool rollback_returned{};
+};
+[[nodiscard]] auto selftest_create_pagemap(const SelftestRootFactoryOptions& options, SelftestRootFactoryOutput& output) -> PageTable*;
 struct SelftestRootCensus {
     ker::mod::mm::lifecycle_census::Stamp stamp{};
     UserRootControlStats roots{};

@@ -478,7 +478,8 @@ auto free_allocated_block(PageAllocator* alloc, uint32_t page_idx, int order, bo
 #endif
     }
 
-    // Coalesce with buddies.
+    // Coalesce without recounting an incompletely represented merged span.
+    bool repair_needed = false;
     int k = order;
     while (k < PageAllocator::MAX_ORDER) {
         uint32_t const BUDDY_IDX = page_idx ^ (1U << k);
@@ -493,7 +494,8 @@ auto free_allocated_block(PageAllocator* alloc, uint32_t page_idx, int order, bo
 
         // Remove buddy from its free list.
         auto* buddy_block = reinterpret_cast<PageAllocator::FreeBlock*>(page_to_ptr(alloc->base, BUDDY_IDX));
-        if (!remove_free_block_with_repair(alloc, k, buddy_block, "free coalesce unlink")) {
+        if (!remove_free_block(alloc, k, buddy_block)) {
+            repair_needed = true;
             break;
         }
 
@@ -509,10 +511,15 @@ auto free_allocated_block(PageAllocator* alloc, uint32_t page_idx, int order, bo
     // Mark the (possibly merged) block as a free head.
     alloc->page_flags[page_idx] = PageAllocator::FLAG_FREE_HEAD | static_cast<uint8_t>(k);
 
-    // Prepend to the free list.
-    auto* free_block = reinterpret_cast<PageAllocator::FreeBlock*>(page_to_ptr(alloc->base, page_idx));
-    insert_free_block(alloc, k, free_block);
+    // Credit only the original allocation before any possible recount. The
+    // completed head now covers every previously unlinked buddy as well.
     alloc->free_count += BLOCK_SIZE;
+    if (repair_needed) {
+        rebuild_free_lists_from_flags(alloc, "free coalesce unlink");
+    } else {
+        auto* free_block = reinterpret_cast<PageAllocator::FreeBlock*>(page_to_ptr(alloc->base, page_idx));
+        insert_free_block(alloc, k, free_block);
+    }
     return FREED_BYTES;
 }
 

@@ -253,3 +253,57 @@ unrelated VM stayed unchanged. Its disposable allocation also peaked at
 `build/goal40-evidence/native-uma15/result.json`. These prescheduler tests do
 not qualify ordinary SMP teardown/reuse, IF-off cross-CPU shootdown progress,
 scheduled CPL3 first touch or general huge-page lifetime.
+
+## Eager placement, root reserves and free repair, 2026-10-15
+
+Private eager anonymous and read-only reserved-page backing now use the placed
+frame factory. The initiating Task's copied policy and actual CPU node are
+captured before VM publication; each page uses its destination virtual index.
+Metadata-only, lazy and genuine shared-zero routes retain their existing
+semantics. Native tests cover zeroing, bind/interleave, prefix-allocation
+rollback, reserved-leaf refusal and genuine zero-COW adoption. These helper
+tests do not establish full current-process syscall OOM atomicity.
+
+Boot seeds up to 64 independently owned emergency root frames per memory node.
+Only failed ordinary root allocation can borrow a frame from its exact local
+reserve. Registered/raw/budget root disposal returns it to its original slot
+after the existing ownership and TLB retirement protocol. Intermediate page
+tables cannot borrow it. Capacity shortfalls remain explicit; no cross-node
+reserve borrowing or local reclaim progress is claimed.
+
+Free-side buddy repair now completes the merged metadata and credits only the
+original freed span before recounting. This fixes double credit during final
+insertion repair and lost credit during a later coalescing repair. Actual
+allocator Host tests reproduce the original failures, check both repair
+windows and close a deterministic allocation/cache/free sequence.
+
+Normal Build WOS, isolated fast KTEST, all 26 relevant registered Host entries
+and changed C++ formatting/clang-tidy passed. Earlier Host adapter failures
+remain recorded: two extraction boundaries needed the newly inserted context
+builder excluded, and a source oracle still required the old repair order.
+The corrected adapters retain their previous behavioral vectors. Final linked
+KTEST inspection also checked the healthy reserve lock/helper closure; this
+does not establish arbitrary panic/corruption or remote-CPU progress.
+
+Fresh virtual NUMA passed 1,507 cases and 150,787 assertions with zero failures
+and natural poweroff, using kernel SHA-256
+`1b81f2ab1101d9c8da8994d363c310c0dedc9f252776fa2ec5625c5f9fb257c8`.
+All five eager-placement and seven root-reserve cases passed. Both memory
+nodes supplied their 64-frame reserves. The real control-provisioning rollback
+branch ran, and 1,000 actual root factory/registration cycles returned their
+reserve debt and ordinary free count. Those root cycles are separate from the
+still-required userspace map/fork/pin/unmap stress.
+
+All 81 watched inputs stayed fixed; the original launch guard and unrelated
+VM were preserved. Disposable allocation peaked at 269,434,880 bytes and
+returned to zero after exact-owned inactivity/reference/backing checks. The
+receipt is `build/goal40-evidence/native-numa16/result.json`. These
+prescheduler checks do not qualify scheduled CPL3 first touch, SMP races,
+domain pressure/reclaim, general 2 MiB lifetime or paired performance results.
+
+UMA control of the same kernel passed 1,507 cases and 147,604 assertions with
+zero failures and natural poweroff. The real reserve rollback and 1,000 root
+cycles also ran. All watched inputs, the original guard and unrelated VM stayed
+unchanged. Its disposable allocation peaked at 269,434,880 bytes and returned
+to zero. The receipt is `build/goal40-evidence/native-uma17/result.json`;
+the same prescheduler limitations apply.

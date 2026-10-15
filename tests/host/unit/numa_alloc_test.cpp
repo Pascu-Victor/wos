@@ -8,9 +8,11 @@
 #include <cstring>
 #include <memory>
 #include <platform/acpi/numa_boot.hpp>
+#include <platform/asm/cpu.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/numa_alloc.hpp>
 #include <platform/mm/phys.hpp>
+#include <platform/sched/scheduler.hpp>
 #include <string>
 #include <utility>
 #include <vector>
@@ -58,6 +60,30 @@ struct Backend {
     std::vector<Call> calls{};
     std::vector<Block> blocks{};
     std::vector<void*> decremented{};
+
+    // CPU/preemption primitives are Host seams; the production builder and
+    // authoritative inline scheduler::PreemptGuard are compiled unchanged.
+    uint64_t current_cpu{};
+    uint32_t preempt_depth{};
+    uint32_t expected_cpu_depth{1};
+    uint32_t preempt_disables{};
+    uint32_t preempt_enables{};
+    uint32_t cpu_reads{};
+    const numa::AllocationContext* output_during_guard{};
+    numa::AllocationContext output_before_guard{};
+    numa::Policy* caller_policy_to_change{};
+    bool migrate_after_guard{};
+    uint64_t next_cpu{};
+
+    void observe_context(numa::AllocationContext& output, uint32_t incoming_depth = 0) {
+        preempt_depth = incoming_depth;
+        expected_cpu_depth = incoming_depth + 1;
+        preempt_disables = preempt_enables = cpu_reads = 0;
+        output_during_guard = &output;
+        output_before_guard = output;
+        caller_policy_to_change = nullptr;
+        migrate_after_guard = false;
+    }
 
     void domains(uint16_t nodes) {
         topology = {};
@@ -129,6 +155,8 @@ class NumaAllocation : public ::testing::Test {
     }
     void TearDown() override {
         EXPECT_EQ(model.live_refs(), 0U);
+        EXPECT_EQ(model.preempt_depth, 0U);
+        EXPECT_EQ(model.preempt_disables, model.preempt_enables);
         active_backend = nullptr;
     }
     static auto context(numa::Mode mode = numa::Mode::LOCAL, numa::NodeMask mask = 0, numa::NodeId local = 0, uint64_t index = 0)
@@ -149,6 +177,36 @@ class NumaAllocation : public ::testing::Test {
 namespace ker::mod::acpi::numa {
 auto boot_topology() noexcept -> const Topology* { return backend().published ? &backend().topology : nullptr; }
 }  // namespace ker::mod::acpi::numa
+
+namespace ker::mod::cpu {
+auto current_cpu() -> uint64_t {
+    auto& state = backend();
+    ++state.cpu_reads;
+    EXPECT_EQ(state.preempt_depth, state.expected_cpu_depth);
+    if (state.caller_policy_to_change != nullptr) *state.caller_policy_to_change = numa::Policy{};
+    return state.current_cpu;
+}
+}  // namespace ker::mod::cpu
+
+namespace ker::mod::sched {
+void preempt_disable() {
+    auto& state = backend();
+    ++state.preempt_disables;
+    ++state.preempt_depth;
+}
+void preempt_enable() {
+    auto& state = backend();
+    EXPECT_GT(state.preempt_depth, 0U);
+    if (state.output_during_guard != nullptr) {
+        EXPECT_EQ(state.output_during_guard->policy, state.output_before_guard.policy);
+        EXPECT_EQ(state.output_during_guard->local_node, state.output_before_guard.local_node);
+        EXPECT_EQ(state.output_during_guard->virtual_page_index, state.output_before_guard.virtual_page_index);
+    }
+    --state.preempt_depth;
+    ++state.preempt_enables;
+    if (state.migrate_after_guard) state.current_cpu = state.next_cpu;
+}
+}  // namespace ker::mod::sched
 
 namespace ker::mod::mm::addr {
 auto get_phys_pointer(paddr_t pointer) -> paddr_t* {
@@ -427,5 +485,186 @@ TEST_F(NumaAllocation, ReleaseTransfersExactlyOneReferencePerPageToCaller) {
     for (uint32_t page = 0; page < 512; ++page)
         EXPECT_EQ(mm::phys::page_ref_dec(static_cast<std::byte*>(released) + static_cast<uint64_t>(page) * PAGE), 0U);
     EXPECT_EQ(model.live_refs(), 0U);
+}
+
+// Copy the complete initialized representation so early failures cannot silently
+// clear/reset a pre-existing context. Context has scalar/trivial value members.
+auto context_representation(const numa::AllocationContext& value) -> std::array<std::byte, sizeof(numa::AllocationContext)> {
+    std::array<std::byte, sizeof(numa::AllocationContext)> bytes{};
+    std::memcpy(bytes.data(), &value, bytes.size());
+    return bytes;
+}
+auto sentinel_context() -> numa::AllocationContext {
+    numa::AllocationContext result;
+    std::memset(&result, 0x5a, sizeof(result));
+    result.policy = {3, numa::Mode::INTERLEAVE};
+    result.local_node = 23;
+    result.virtual_page_index = 0x123456789abcdef0ULL;
+    return result;
+}
+
+TEST_F(NumaAllocation, ContextRejectsMissingAndMalformedTopologyWithoutCPUOrGuard) {
+    auto output = sentinel_context();
+    auto const BEFORE = context_representation(output);
+    for (unsigned scenario = 0; scenario < 6; ++scenario) {
+        SCOPED_TRACE(scenario);
+        model.domains(2);
+        model.published = scenario != 0;
+        if (scenario == 1) model.topology.node_count = 0;
+        if (scenario == 2) model.topology.node_count = numa::MAX_NODES + 1;
+        if (scenario == 3) model.topology.cpu_count = 0;
+        if (scenario == 4) model.topology.cpu_count = static_cast<uint16_t>(model.topology.cpu_nodes.size() + 1);
+        if (scenario == 5) model.topology.cpu_count = UINT16_MAX;
+        model.observe_context(output, 3);
+        EXPECT_EQ(numa::capture_allocation_context({}, output), numa::AllocationError::NO_TOPOLOGY);
+        EXPECT_EQ(context_representation(output), BEFORE);
+        EXPECT_EQ(model.preempt_depth, 3U);
+        EXPECT_EQ(model.preempt_disables, 0U);
+        EXPECT_EQ(model.preempt_enables, 0U);
+        EXPECT_EQ(model.cpu_reads, 0U);
+        EXPECT_TRUE(model.calls.empty());
+    }
+    model.preempt_depth = 0;
+}
+
+TEST_F(NumaAllocation, ContextRejectsInvalidCopiedPolicyBeforeCPUOrGuard) {
+    model.domains(3);
+    auto output = sentinel_context();
+    auto const BEFORE = context_representation(output);
+    for (auto policy :
+         {numa::Policy{1, numa::Mode::LOCAL}, numa::Policy{0, numa::Mode::BIND}, numa::Policy{8, numa::Mode::BIND},
+          numa::Policy{3, numa::Mode::PREFERRED}, numa::Policy{0, numa::Mode::INTERLEAVE}, numa::Policy{0, static_cast<numa::Mode>(255)}}) {
+        SCOPED_TRACE(static_cast<unsigned>(policy.mode));
+        model.observe_context(output, 2);
+        EXPECT_EQ(numa::capture_allocation_context(policy, output), numa::AllocationError::INVALID_POLICY);
+        EXPECT_EQ(context_representation(output), BEFORE);
+        EXPECT_EQ(model.preempt_depth, 2U);
+        EXPECT_EQ(model.preempt_disables, 0U);
+        EXPECT_EQ(model.preempt_enables, 0U);
+        EXPECT_EQ(model.cpu_reads, 0U);
+        EXPECT_TRUE(model.calls.empty());
+    }
+    model.preempt_depth = 0;
+}
+
+TEST_F(NumaAllocation, ContextCPUAndMappedNodeFailuresRestoreExactNestedDepth) {
+    for (uint32_t incoming_depth : {0U, 4U}) {
+        for (unsigned scenario = 0; scenario < 5; ++scenario) {
+            SCOPED_TRACE(incoming_depth);
+            SCOPED_TRACE(scenario);
+            model.domains(2);
+            auto output = sentinel_context();
+            auto const BEFORE = context_representation(output);
+            model.current_cpu = scenario == 0   ? model.topology.cpu_count
+                                : scenario == 1 ? model.topology.cpu_nodes.size()
+                                : scenario == 2 ? UINT64_MAX
+                                                : 1;
+            if (scenario == 3) model.topology.cpu_nodes[1] = numa::INVALID_NODE;
+            if (scenario == 4) model.topology.cpu_nodes[1] = model.topology.node_count;
+            model.observe_context(output, incoming_depth);
+            EXPECT_EQ(numa::capture_allocation_context({}, output), numa::AllocationError::INVALID_LOCAL_NODE);
+            EXPECT_EQ(context_representation(output), BEFORE);
+            EXPECT_EQ(model.preempt_depth, incoming_depth);
+            EXPECT_EQ(model.preempt_disables, 1U);
+            EXPECT_EQ(model.preempt_enables, 1U);
+            EXPECT_EQ(model.cpu_reads, 1U);
+            EXPECT_TRUE(model.calls.empty());
+        }
+    }
+    model.preempt_depth = 0;
+}
+
+TEST_F(NumaAllocation, ContextCapturesMappedCPUAndCommitsOnlyAfterGuardRestoration) {
+    model.domains(3);
+    model.topology.cpu_nodes[2] = 1;
+    for (uint32_t incoming_depth : {0U, 5U}) {
+        auto output = sentinel_context();
+        model.current_cpu = 2;
+        model.observe_context(output, incoming_depth);
+        model.migrate_after_guard = true;
+        model.next_cpu = 0;
+        EXPECT_EQ(numa::capture_allocation_context({}, output), numa::AllocationError::NONE);
+        EXPECT_EQ(output.policy, numa::Policy{});
+        EXPECT_EQ(output.local_node, 1);
+        EXPECT_EQ(output.virtual_page_index, 0U);
+        EXPECT_EQ(model.current_cpu, 0U);
+        EXPECT_EQ(model.preempt_depth, incoming_depth);
+        EXPECT_EQ(model.preempt_disables, 1U);
+        EXPECT_EQ(model.preempt_enables, 1U);
+        EXPECT_EQ(model.cpu_reads, 1U);
+        EXPECT_TRUE(model.calls.empty());
+    }
+    model.preempt_depth = 0;
+}
+
+TEST_F(NumaAllocation, ContextPreservesEveryValidPolicyModeAndCopiedValue) {
+    model.domains(3);
+    model.current_cpu = 2;
+    for (auto policy : {numa::Policy{}, numa::Policy{2, numa::Mode::PREFERRED}, numa::Policy{5, numa::Mode::BIND},
+                        numa::Policy{5, numa::Mode::INTERLEAVE}}) {
+        auto const COPIED = policy;
+        auto output = sentinel_context();
+        model.observe_context(output);
+        model.caller_policy_to_change = &policy;
+        EXPECT_EQ(numa::capture_allocation_context(policy, output), numa::AllocationError::NONE);
+        EXPECT_EQ(output.policy, COPIED);
+        EXPECT_EQ(policy, numa::Policy{});
+        EXPECT_EQ(output.local_node, 2);
+        EXPECT_EQ(output.virtual_page_index, 0U);
+        EXPECT_EQ(model.preempt_depth, 0U);
+        EXPECT_EQ(model.preempt_disables, 1U);
+        EXPECT_EQ(model.preempt_enables, 1U);
+        EXPECT_EQ(model.cpu_reads, 1U);
+        EXPECT_TRUE(model.calls.empty());
+    }
+}
+
+TEST_F(NumaAllocation, ContextAcceptsLastCPUArrayEntryAndNode63WithoutSubstitution) {
+    model.domains(64);
+    model.topology.cpu_count = static_cast<uint16_t>(model.topology.cpu_nodes.size());
+    model.topology.cpu_nodes.back() = 63;
+    model.current_cpu = model.topology.cpu_nodes.size() - 1;
+    auto output = sentinel_context();
+    model.observe_context(output);
+    auto const POLICY = numa::Policy{uint64_t{1} << 63, numa::Mode::BIND};
+    EXPECT_EQ(numa::capture_allocation_context(POLICY, output), numa::AllocationError::NONE);
+    EXPECT_EQ(output.policy, POLICY);
+    EXPECT_EQ(output.local_node, 63);
+    EXPECT_EQ(output.virtual_page_index, 0U);
+    EXPECT_EQ(model.cpu_reads, 1U);
+    EXPECT_EQ(model.preempt_depth, 0U);
+    EXPECT_TRUE(model.calls.empty());
+}
+
+TEST_F(NumaAllocation, ContextRetainsMemorylessLocalForRealFactoryFallbackOrStrictExhaustion) {
+    model.domains(2);
+    model.topology.memory_range_count = 1;
+    model.topology.nodes[1].usable_bytes = 0;
+    model.current_cpu = 1;
+    numa::AllocationContext local;
+    model.observe_context(local);
+    ASSERT_EQ(numa::capture_allocation_context({}, local), numa::AllocationError::NONE);
+    EXPECT_EQ(local.local_node, 1);
+    EXPECT_EQ(local.virtual_page_index, 0U);
+    EXPECT_TRUE(model.calls.empty());
+    auto fallback = numa::try_allocate_pages(local, 1, PAGE, OWNER);
+    ASSERT_EQ(fallback.error, numa::AllocationError::NONE);
+    EXPECT_EQ(fallback.requested, 1);
+    EXPECT_EQ(fallback.actual, 0);
+    EXPECT_TRUE(fallback.used_fallback());
+    ASSERT_EQ(model.calls.size(), 1U);
+    EXPECT_EQ(model.calls[0].dispatch, Dispatch::RANGE);
+    EXPECT_EQ(model.calls[0].first, model.topology.memory[0].base);
+
+    numa::AllocationContext bound;
+    model.observe_context(bound);
+    ASSERT_EQ(numa::capture_allocation_context({2, numa::Mode::BIND}, bound), numa::AllocationError::NONE);
+    EXPECT_EQ(bound.local_node, 1);
+    auto failed = numa::try_allocate_pages(bound, 1, PAGE, OWNER);
+    expect_empty(failed, numa::AllocationError::EXHAUSTED);
+    EXPECT_EQ(failed.requested, 1);
+    EXPECT_EQ(model.calls.size(), 1U);
+    EXPECT_EQ(model.cpu_reads, 1U);
+    EXPECT_EQ(model.preempt_depth, 0U);
 }
 }  // namespace

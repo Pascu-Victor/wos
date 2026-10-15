@@ -4,7 +4,7 @@
 The current root-control types/arrays, complete create/retire/pool/pin/key methods,
 actual frame-owner/stable methods, selected whole futex TU, and actual hash/paging
 headers are compiled unchanged. Raw physical allocator, CPU/IRQ/Task/scheduler,
-PTE fixture publication and page-fault admission are explicit controlled seams.
+absent topology/emergency-reserve compatibility, PTE fixture publication and page-fault admission are explicit controlled seams.
 Independent roots/control allocations/frame counts and exact wake outcomes are
 oracles. This is Host regression, not native MM, physical allocator or Goal39
 lifecycle/coherence qualification. Full archived old futex is a genuine selectable
@@ -52,6 +52,9 @@ CASES = 'namespace fixture {\nnamespace mm=ker::mod::mm;namespace virt=mm::virt;
 def pin(path: Path) -> dict:
     data = path.read_bytes()
     return {"path": str(path.resolve()), "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+
+ROOT_RESERVE_SEAMS = '\n// Explicit compatibility seam: these existing futex vectors have no published\n// topology/emergency reserve. They test the ordinary factory/control path.\nnamespace fixture { inline thread_local unsigned locality_capture_depth{}; }\nnamespace ker::mod::mm::numa {\nusing NodeId=uint16_t;\ninline constexpr NodeId INVALID_NODE=UINT16_MAX;\nnamespace root_reserve {\nenum class Error:uint8_t {NONE,NOT_READY,NO_TOPOLOGY,ALREADY_INITIALIZED,INVALID_NODE,EMPTY,CORRUPT};\nstruct TakeResult {paging::PageTable* table{};Error error{Error::NOT_READY};};\nenum class ReturnResult:uint8_t {NOT_MEMBER,RETURNED,CORRUPT};\ninline auto try_take(NodeId)->TakeResult {\n fixture::check(false,"no published reserve in futex compatibility fixture");return {};\n}\ninline auto try_return(paging::PageTable*,void(*)(paging::PageTable*))->ReturnResult {\n fixture::check(fixture::locality_capture_depth==0,"return outside locality capture");return ReturnResult::NOT_MEMBER;\n}\n}\n}\nnamespace ker::mod::acpi::numa {\nstruct Topology {uint16_t cpu_count{},node_count{};std::array<uint16_t,256>cpu_nodes{};};\ninline auto boot_topology()->const Topology* {return nullptr;}\n}\nnamespace ker::mod::cpu {\ninline auto get_current_cpu_id_safe()->uint64_t {\n fixture::check(fixture::locality_capture_depth==1,"CPU capture under short preemption guard");return 0;\n}\n}\nnamespace ker::mod::sched {\nstruct PreemptGuard {\n PreemptGuard(){fixture::check(fixture::irq_depth==0,"locality capture outside MM IRQ locks");++fixture::locality_capture_depth;}\n ~PreemptGuard(){fixture::check(fixture::locality_capture_depth==1,"balanced locality capture");--fixture::locality_capture_depth;}\n};\n}\nnamespace ker::mod::dbg {[[noreturn]]inline void panic_handler(const char*){throw fixture::InvariantStop{};}}\n'
+
 
 def capture(source: str, anchor: str, *, declaration: bool = False) -> tuple[str, dict]:
     """Capture one complete actual definition, retaining every original byte."""
@@ -224,7 +227,7 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
     paging=(KERN/"platform/mm/paging.hpp").read_bytes();write("platform/mm/paging.hpp",paging.decode());write("defines/defines.hpp","#pragma once\n")
     actual.append({"name":"whole-platform/mm/paging.hpp","bytes":len(paging),"sha256":hashlib.sha256(paging).hexdigest()})
     phys_h=(KERN/"platform/mm/phys.hpp").read_text();owner_h=(KERN/"platform/mm/page_alloc.hpp").read_text()
-    common=COMMON+'\nnamespace ker::mod::mm {\n'+definition(owner_h,"enum class PhysicalPageOwner",True)+'\n'+definition(owner_h,"enum class PageKind",True)+'\n}\n'
+    common=COMMON+ROOT_RESERVE_SEAMS+'\nnamespace ker::mod::mm {\n'+definition(owner_h,"enum class PhysicalPageOwner",True)+'\n'+definition(owner_h,"enum class PageKind",True)+'\n}\n'
     common+='namespace ker::mod::mm::phys {\n'+definition(phys_h,"enum class PageLookupOwner",True)+'\n'+definition(phys_h,"struct PageLookupHint",True)+'\n}\n'+PHYS_TAIL+RAW_PHYS
     write("fixture-common.hpp",common)
     vh=(KERN/"platform/mm/virt.hpp").read_text()
@@ -257,8 +260,8 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
     root_globals=span(source,'constexpr size_t USER_ROOT_CONTROL_BUCKET_COUNT','enum class AnonymousSwapRuntimeState','whole-root-control-declarations-and-globals')
     gate_globals=span(source,'constexpr size_t USER_PAGEMAP_ACCESS_GATE_COUNT','[[nodiscard]] auto user_pagemap_access_gate_index','whole-root-reader-gate-declarations-and-globals')
     pool_globals=span(source,'constexpr size_t PAGE_TABLE_POOL_CAPACITY','constexpr size_t OWNED_FRAME_TABLE_CAPACITY','whole-page-table-pool-declarations-and-globals')
-    private_anchors=['[[nodiscard]] auto user_pagemap_access_gate_index','void service_user_pagemap_gate_wait','[[nodiscard]] auto acquire_user_pagemap_access','void release_user_pagemap_access','[[nodiscard]] auto begin_user_pagemap_exclusive','void end_user_pagemap_exclusive','class UserPagemapExclusiveScope {','void zero_page_table_for_pool','auto try_alloc_page_table_from_pool','auto try_release_page_table_to_pool','auto alloc_zeroed_page_table','auto user_root_control_bucket','auto find_user_root_control_locked','auto next_user_root_serial','enum class UserRootAttachResult','auto attach_user_root_control_locked','auto allocate_user_root_control_chunk','void release_unregistered_user_root','auto create_user_root_common','auto retire_user_root_control_locked','auto pte_raw(const paging::PageTableEntry& e)','auto index_of(','auto entry_at(PageTable*','auto entry_at(const PageTable*','auto snapshot_user_page_mapping_locked','auto try_pin_current_user_page_mapping','auto pin_user_page_common']
-    private='\n'.join(definition(source,a,a.startswith(('class ','enum '))) for a in private_anchors)
+    private_anchors=['[[nodiscard]] auto user_pagemap_access_gate_index','void service_user_pagemap_gate_wait','[[nodiscard]] auto acquire_user_pagemap_access','void release_user_pagemap_access','[[nodiscard]] auto begin_user_pagemap_exclusive','void end_user_pagemap_exclusive','class UserPagemapExclusiveScope {','void zero_page_table_for_pool','auto try_alloc_page_table_from_pool','auto try_release_page_table_to_pool','auto alloc_zeroed_page_table','auto user_root_control_bucket','auto find_user_root_control_locked','auto next_user_root_serial','enum class UserRootAttachResult','auto attach_user_root_control_locked','auto allocate_user_root_control_chunk','struct RootReserveLocality {','auto capture_root_reserve_locality','auto return_root_to_emergency_reserve','void release_unregistered_user_root','auto create_user_root_common','auto retire_user_root_control_locked','auto pte_raw(const paging::PageTableEntry& e)','auto index_of(','auto entry_at(PageTable*','auto entry_at(const PageTable*','auto snapshot_user_page_mapping_locked','auto try_pin_current_user_page_mapping','auto pin_user_page_common']
+    private='\n'.join(definition(source,a,a.startswith(('class ','enum ','struct '))) for a in private_anchors)
     private+='\n'+definition(source,'void release_pagemap_exclusive_owned(')
     # No native file bindings are installed by these root/futex vectors. Compile
     # the actual empty-index paths and their complete checked binding-owner
@@ -317,7 +320,7 @@ def main() -> int:
         result["input_pins"] = before
         result["futex_source"] = before[0]
         result["root_transactions_not_full_goal_lifecycles"] = True
-        result["primitive_seams"] = ["raw physical allocator", "CPU/IRQ", "Task/scheduler", "fixture PTE publication", "page-fault admission"]
+        result["primitive_seams"] = ["raw physical allocator", "CPU/IRQ", "Task/scheduler", "fixture PTE publication", "page-fault admission", "no published topology/emergency reserve; ordinary factory compatibility only"]
         subreaper()
         scratch = Path(tempfile.mkdtemp(prefix="wos-futex-root-", dir="/tmp"))
         result["scratch"] = str(scratch)

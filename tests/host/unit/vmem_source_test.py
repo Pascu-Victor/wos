@@ -217,8 +217,8 @@ def test_nonfixed_mmap_address_selection_is_reserved_before_mapping() -> None:
 
     noreserve_block = block_between(
         anon_body,
-        "if (is_prot_none(prot) || (flags & ker::abi::vmem::MAP_NORESERVE) != 0)",
-        "if ((prot & ker::abi::vmem::PROT_WRITE) == 0)",
+        "if (RESERVE_ONLY)",
+        "if (PRIVATE_READ)",
         "anonymous PROT_NONE/MAP_NORESERVE branch",
     )
     require_ordered_tokens(
@@ -234,7 +234,7 @@ def test_nonfixed_mmap_address_selection_is_reserved_before_mapping() -> None:
     require_ordered_tokens(
         anon_body,
         [
-            "uint64_t const RESULT = private_anon_allocate_locked(task, vaddr, size, prot, hint, flags)",
+            "uint64_t const RESULT = private_anon_allocate_locked(task, vaddr, size, prot, hint, flags, placement)",
             "int const RESULT_STATUS = perf_status_from_vmem_result(RESULT)",
             "record_local_vmem_event",
             "if (RESULT_STATUS != 0)",
@@ -821,8 +821,8 @@ def test_default_writable_anon_mmap_is_demand_paged() -> None:
     anon_body = function_body(vmem, "anon_allocate")
     lazy_branch = block_between(
         anon_body,
-        "if (lazy_anon_mmap_enabled() && (flags & ker::abi::vmem::MAP_POPULATE) == 0)",
-        "if (!anon_zero_cow_enabled())",
+        "if (USE_LAZY)",
+        "if (PRIVATE_EAGER)",
         "default writable anonymous lazy branch",
     )
 
@@ -857,6 +857,76 @@ def test_default_writable_anon_mmap_is_demand_paged() -> None:
         ["`vmem.no_lazy_anon`"],
         "lazy anonymous mmap diagnostic documentation",
     )
+
+
+def test_eager_and_reserved_placement_use_copied_actor_before_publication() -> None:
+    source = SYS_VMEM_CPP.read_text()
+    anon = function_body(source, "anon_allocate")
+    require_ordered_tokens(
+        anon,
+        [
+            "bool const RESERVE_ONLY = is_prot_none(prot) || (flags & ker::abi::vmem::MAP_NORESERVE) != 0;",
+            "bool const PRIVATE_READ = !RESERVE_ONLY && (prot & ker::abi::vmem::PROT_WRITE) == 0;",
+            "bool const USE_LAZY = !RESERVE_ONLY && !PRIVATE_READ && lazy_anon_mmap_enabled() && (flags & ker::abi::vmem::MAP_POPULATE) == 0;",
+            "bool const PRIVATE_EAGER = PRIVATE_READ || (!RESERVE_ONLY && !USE_LAZY && !anon_zero_cow_enabled());",
+            "auto const MEMORY_POLICY = task->memory_policy_snapshot();",
+            "numa::capture_allocation_context(MEMORY_POLICY, placement)",
+            "if (CAPTURE != numa::AllocationError::NONE)",
+            "SharedVmemPublicationGuard publication_guard;",
+            "AddressSpaceObservation observation(task);",
+            "observation.admit_mapping(task->pagemap, size, hint, size)",
+            "release_fixed_mmap_range_locked(task, vaddr, size);",
+        ],
+        "private eager backing decision and actor capture before admission/replacement",
+    )
+    if anon.count("numa::capture_allocation_context(MEMORY_POLICY, placement)") != 1:
+        fail("anonymous private preparation must capture exactly once")
+    for name in ("private_anon_allocate_locked", "materialize_reserved_page"):
+        body = function_body(source, name)
+        require_ordered_tokens(
+            body,
+            [
+                "auto page_context = placement;",
+                "page_context.virtual_page_index =",
+                "numa::try_allocate_pages_into(allocation, page_context, 1,",
+                "ker::mod::mm::phys::PageInitialization::ZERO",
+                "numa::ReclaimMode::LEGACY_UMA",
+                "allocation.actual != numa::INVALID_NODE",
+                "std::memset(PHYS_PAGE, 0, ker::mod::mm::paging::PAGE_SIZE)",
+                "map_page(task->pagemap,",
+                "(void)allocation.span.release();",
+            ],
+            name + " actual placed ZERO/legacy-UMA allocation and adoption",
+        )
+    materialize = function_body(source, "materialize_reserved_page")
+    require_ordered_tokens(
+        materialize,
+        ["if (is_prot_none(prot))", "get_anon_zero_page()", "page_ref_inc(ZERO_PAGE)",
+         "anon_zero_page_flags(prot)", "auto page_context = placement;"],
+        "NONE and genuine shared-zero branches precede private allocation",
+    )
+    protect = block_between(source, "case ker::abi::vmem::ops::PROTECT:", "case ker::abi::vmem::ops::MREMAP:", "mprotect dispatch")
+    require_ordered_tokens(
+        protect,
+        ["change_public_shared_file(*task, ADDR, size, true, PROT)",
+         "auto const MEMORY_POLICY = task->memory_policy_snapshot();",
+         "numa::capture_allocation_context(MEMORY_POLICY, placement)",
+         "SharedVmemPublicationGuard publication_guard;", "authorize_shared_file_protection_locked",
+         "protect_shared_vmem_range_locked", "protect_anonymous_swap_page", "unify_page_flags",
+         "materialize_reserved_page(task, current_vaddr, PROT, placement)"],
+        "reserved placement preserves protection/metadata/swap/leaf transaction order",
+    )
+    zero = function_body(source, "selftest_map_anonymous_zero_page")
+    require_ordered_tokens(zero,
+                          ["subject.memory_policy_snapshot()", "numa::capture_allocation_context(MEMORY_POLICY, placement)",
+                           "materialize_reserved_page(&subject, address, ker::abi::vmem::PROT_READ | ker::abi::vmem::PROT_WRITE, placement)"],
+                          "genuine zero delegate keeps explicit supplied actor")
+    for name in ("selftest_allocate_private_anonymous", "selftest_materialize_anonymous_reserved"):
+        body = function_body(source, name)
+        require_ordered_tokens(body,
+                              ["subject.memory_policy_snapshot()", "numa::capture_allocation_context(MEMORY_POLICY, placement)",
+                               "SharedVmemPublicationGuard publication;"],
+                              name + " never borrows ambient current policy")
 
 
 def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
@@ -1145,6 +1215,7 @@ def main() -> None:
     test_user_memory_pressure_does_not_enter_fatal_oom()
     test_kasan_excluded_lazy_file_snapshot_is_unpoisoned_after_unlock()
     test_default_writable_anon_mmap_is_demand_paged()
+    test_eager_and_reserved_placement_use_copied_actor_before_publication()
     test_file_mmap_cache_is_sharded_without_changing_page_ownership()
     test_thread_publication_is_serialized_with_shared_vmem_updates()
     test_process_memory_policy_is_captured_before_creation_and_retry()

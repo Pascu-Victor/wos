@@ -227,6 +227,11 @@ auto can_wait_for_reclaim() -> bool;
 auto page_split_to_order0(void* page) -> bool;
 auto page_mark_kind(void* page, PageKind kind) -> bool;
 auto page_reassign_owner(void* page, PhysicalPageOwner owner) -> bool;
+// Exact sole order-0 PAGE_TABLE owner validation/transfer. Caller owns the
+// exclusive frame; allocator lock does not authorize concurrent ref acquisition.
+// Only PAGE_TABLE/POOL_RESERVE tags are accepted; equal tags validate without
+// retagging. No reserve lock, allocation, zeroing, reclaim or logging inside.
+auto page_table_owner_transition_if_exclusive(void* page, PhysicalPageOwner expected, PhysicalPageOwner desired) -> bool;
 auto page_kind_get(void* page) -> PageKind;
 auto page_kind_get(void* page, PageLookupHint* hint) -> PageKind;
 auto page_alloc_can_satisfy(uint64_t size, uint64_t reserve_bytes = 0) -> bool;

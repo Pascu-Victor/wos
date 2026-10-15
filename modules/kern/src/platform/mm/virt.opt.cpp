@@ -23,6 +23,7 @@
 #include <platform/interrupt/gdt.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/numa_alloc.hpp>
+#include <platform/mm/numa_root_reserve.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/smt/smt.hpp>
@@ -3004,19 +3005,96 @@ auto allocate_user_root_control_chunk() -> UserRootControlChunk* {
     return chunk;
 }
 
+struct RootReserveLocality {
+    uint64_t cpu{UINT64_MAX};
+    numa::NodeId node{numa::INVALID_NODE};
+};
+
+auto capture_root_reserve_locality() -> RootReserveLocality {
+    RootReserveLocality result;
+    {
+        sched::PreemptGuard const PREEMPT;
+        auto const* topology = acpi::numa::boot_topology();
+        result.cpu = cpu::get_current_cpu_id_safe();
+        if (topology != nullptr && result.cpu < topology->cpu_count && result.cpu < topology->cpu_nodes.size()) {
+            auto const NODE = topology->cpu_nodes[static_cast<size_t>(result.cpu)];
+            if (NODE < topology->node_count) result.node = NODE;
+        }
+    }  // Never carry preemption exclusion into reclaim, allocation or TLB work.
+    return result;
+}
+
+auto return_root_to_emergency_reserve(PageTable* root) -> bool {
+    auto const RETURNED = numa::root_reserve::try_return(root, zero_page_table_for_pool);
+    if (RETURNED == numa::root_reserve::ReturnResult::CORRUPT) dbg::panic_handler("corrupt emergency root return");
+    return RETURNED == numa::root_reserve::ReturnResult::RETURNED;
+}
+
 void release_unregistered_user_root(PageTable* root) {
     // The factory owns this zeroed, unpublished root; it has never returned a
     // pointer or registered a control. No reader/exclusive gate can be needed.
+    if (return_root_to_emergency_reserve(root)) return;
     if (!try_release_page_table_to_pool(root, {__builtin_return_address(0), 0})) phys::page_free(root);
 }
 
-auto create_user_root_common(bool may_fail) -> PageTable* {
+auto create_user_root_common(bool may_fail
+#ifdef WOS_SELFTEST
+                             ,
+                             const SelftestRootFactoryOptions* options = nullptr, SelftestRootFactoryOutput* output = nullptr
+#endif
+                             ) -> PageTable* {
 #ifdef WOS_SELFTEST
     ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_root_epoch);
 #endif
-
-    auto* root = alloc_zeroed_page_table(may_fail);
+    auto const LOCALITY = capture_root_reserve_locality();
+    auto requested = LOCALITY.node;
+    bool inject_ordinary_failure = false;
+#ifdef WOS_SELFTEST
+    if (output != nullptr) {
+        output->captured_cpu = LOCALITY.cpu;
+        output->captured_local = LOCALITY.node;
+    }
+    if (options != nullptr) {
+        inject_ordinary_failure = options->force_ordinary_failure;
+        if (options->use_node_override) {
+            auto const* topology = acpi::numa::boot_topology();
+            if (output != nullptr) output->override_used = true;
+            if (topology == nullptr || options->node_override >= topology->node_count) {
+                if (output != nullptr) output->reserve_error = numa::root_reserve::Error::INVALID_NODE;
+                return nullptr;
+            }
+            requested = options->node_override;
+        }
+    }
+    if (output != nullptr) {
+        output->requested = requested;
+        output->ordinary_failure_injected = inject_ordinary_failure;
+        output->ordinary_allocator_called = !inject_ordinary_failure;
+    }
+#endif
+    // Ordinary global pool/fallible PMM is always first. The scoped diagnostic
+    // branch skips that actual call without consuming or draining the old pool.
+    auto* root = inject_ordinary_failure ? nullptr : alloc_zeroed_page_table(true);
+    bool from_reserve = false;
+    if (root == nullptr && requested != numa::INVALID_NODE) {
+        auto const RESULT = numa::root_reserve::try_take(requested);
+#ifdef WOS_SELFTEST
+        if (output != nullptr) {
+            output->reserve_attempted = true;
+            output->reserve_error = RESULT.error;
+        }
+#endif
+        if (RESULT.error == numa::root_reserve::Error::CORRUPT || RESULT.error == numa::root_reserve::Error::INVALID_NODE ||
+            (RESULT.error == numa::root_reserve::Error::NONE) != (RESULT.table != nullptr))
+            dbg::panic_handler("corrupt emergency root take");
+        root = RESULT.table;
+        from_reserve = root != nullptr;
+    }
+    if (root == nullptr && !may_fail) root = alloc_zeroed_page_table(false);
     if (root == nullptr) return nullptr;
+#ifndef WOS_SELFTEST
+    static_cast<void>(from_reserve);
+#endif
     UserRootControlChunk* spare = nullptr;
     for (;;) {
         uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
@@ -3024,6 +3102,9 @@ auto create_user_root_common(bool may_fail) -> PageTable* {
         user_mapping_pin_lock.unlock_irqrestore(FLAGS);
         if (RESULT == UserRootAttachResult::ATTACHED) {
             if (spare != nullptr) phys::page_free(spare);  // Another creator supplied capacity.
+#ifdef WOS_SELFTEST
+            if (output != nullptr) output->control_registered = true;
+#endif
             return root;
         }
         if (RESULT == UserRootAttachResult::DUPLICATE) {
@@ -3035,11 +3116,26 @@ auto create_user_root_common(bool may_fail) -> PageTable* {
         if (RESULT == UserRootAttachResult::SERIAL_EXHAUSTED) {
             if (spare != nullptr) phys::page_free(spare);
             release_unregistered_user_root(root);
+#ifdef WOS_SELFTEST
+            if (output != nullptr) output->rollback_returned = from_reserve;
+#endif
             return nullptr;
         }
+#ifdef WOS_SELFTEST
+        if (output != nullptr) output->need_chunk_seen = true;
+        if (options != nullptr && options->fail_needed_control_chunk) {
+            if (output != nullptr) output->control_failure_injected = true;
+            release_unregistered_user_root(root);
+            if (output != nullptr) output->rollback_returned = from_reserve;
+            return nullptr;
+        }
+#endif
         spare = allocate_user_root_control_chunk();
         if (spare == nullptr) {
             release_unregistered_user_root(root);
+#ifdef WOS_SELFTEST
+            if (output != nullptr) output->rollback_returned = from_reserve;
+#endif
             return nullptr;
         }
     }
@@ -4759,6 +4855,13 @@ auto get_kernel_pagemap() -> PageTable* { return kernel_pagemap; }
 auto create_pagemap() -> PageTable* { return create_user_root_common(false); }
 auto create_pagemap_may_fail() -> PageTable* { return create_user_root_common(true); }
 
+#ifdef WOS_SELFTEST
+auto selftest_create_pagemap(const SelftestRootFactoryOptions& options, SelftestRootFactoryOutput& output) -> PageTable* {
+    output = {};
+    return create_user_root_common(true, &options, &output);
+}
+#endif
+
 namespace {
 // Requires this exact root's existing exclusive lease and sole allocator owner.
 // Caller provenance is passed through so the ordinary wrapper keeps its trace.
@@ -4797,6 +4900,7 @@ void release_pagemap_exclusive_owned(PageTable* pagemap, uint64_t owner_pid, voi
 
     owned_frame_purge_pagemap(pagemap);
 
+    if (return_root_to_emergency_reserve(pagemap)) return;
     if (try_release_page_table_to_pool(pagemap, {caller, owner_pid})) {
         return;
     }
