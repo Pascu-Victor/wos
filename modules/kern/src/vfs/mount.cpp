@@ -1226,12 +1226,23 @@ auto NativeFileMappingMountPin::operator=(NativeFileMappingMountPin&& other) noe
 }
 
 auto NativeFileMappingMountPin::acquire_tmpfs(File& borrowed, const void* expected_private, NativeFileMappingMountPin& empty) -> int {
+    return acquire_tmpfs_checked(borrowed, expected_private, empty, false);
+}
+
+auto NativeFileMappingMountPin::acquire_tmpfs_demand(File& borrowed, const void* expected_private, NativeFileMappingMountPin& empty)
+    -> int {
+    return acquire_tmpfs_checked(borrowed, expected_private, empty, true);
+}
+
+auto NativeFileMappingMountPin::acquire_tmpfs_checked(File& borrowed, const void* expected_private, NativeFileMappingMountPin& empty,
+                                                      bool demand) -> int {
     if (!empty.empty() || expected_private == nullptr) return -EINVAL;
     if (borrowed.refcount.load(std::memory_order_acquire) <= 0) return -EBADF;
     if ((borrowed.open_flags & 3) != 0 && (borrowed.open_flags & 3) != 2) return -EACCES;
     if (borrowed.mount_owner == nullptr || borrowed.fs_type != FSType::TMPFS || borrowed.fops != tmpfs::get_tmpfs_fops() ||
-        borrowed.is_directory || borrowed.private_data == nullptr || (borrowed.open_flags & O_NO_CACHE) == 0 || borrowed.exec_read_view ||
-        borrowed.stream_cache_attachment != nullptr || borrowed.cache_notify_attachment != nullptr)
+        borrowed.is_directory || borrowed.private_data == nullptr || borrowed.exec_read_view ||
+        (!demand && ((borrowed.open_flags & O_NO_CACHE) == 0 || borrowed.stream_cache_attachment != nullptr)) ||
+        (demand && (borrowed.open_flags & (O_ALWAYS_CACHE | O_NOTIFY_CACHE_CHANGE)) != 0) || borrowed.cache_notify_attachment != nullptr)
         return -EOPNOTSUPP;
     mount_lock.lock();
     auto* mount = borrowed.mount_owner;

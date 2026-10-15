@@ -553,6 +553,9 @@ KTEST(VFS, XattrBeneathRejectsSymlinkAndRemoteEscape) {
 }
 
 KTEST(VFS, UtimensatUpdatesTmpfsTimestamps) {
+    ker::mod::sched::task::Task requester{};
+    std::memcpy(requester.root.data(), "/", 2);
+    std::memcpy(requester.cwd.data(), "/", 2);
     ker::vfs::vfs_mkdir("/tmp", 0755);
 
     constexpr const char* PATH = "/tmp/ktest_utimensat";
@@ -567,13 +570,13 @@ KTEST(VFS, UtimensatUpdatesTmpfsTimestamps) {
         {.tv_sec = 1234, .tv_nsec = 567},
         {.tv_sec = 2345, .tv_nsec = 678},
     };
-    KEXPECT_EQ(ker::vfs::vfs_utimensat(ker::vfs::AT_FDCWD, PATH, times, 0), 0);
+    KEXPECT_EQ(ker::vfs::vfs_selftest_utimensat_nonempty_as(requester, ker::vfs::AT_FDCWD, PATH, times, 0), 0);
 
     ker::vfs::VfsCachePerfSnapshot before_first_stat{};
     ker::vfs::VfsCachePerfSnapshot after_first_stat{};
     ker::vfs::Stat st{};
     ker::vfs::vfs_get_cache_perf_snapshot(before_first_stat);
-    KEXPECT_EQ(ker::vfs::vfs_stat(PATH, &st), 0);
+    KEXPECT_EQ(ker::vfs::vfs_statat(&requester, ker::vfs::AT_FDCWD, PATH, 0, &st), 0);
     ker::vfs::vfs_get_cache_perf_snapshot(after_first_stat);
     KEXPECT_TRUE(after_first_stat.metadata_hits > before_first_stat.metadata_hits);
     KEXPECT_EQ(st.st_atim.tv_sec, static_cast<int64_t>(1234));
@@ -585,12 +588,12 @@ KTEST(VFS, UtimensatUpdatesTmpfsTimestamps) {
         {.tv_sec = 0, .tv_nsec = UTIME_OMIT_VALUE},
         {.tv_sec = 3456, .tv_nsec = 789},
     };
-    KEXPECT_EQ(ker::vfs::vfs_utimensat(ker::vfs::AT_FDCWD, PATH, omit_atime, 0), 0);
+    KEXPECT_EQ(ker::vfs::vfs_selftest_utimensat_nonempty_as(requester, ker::vfs::AT_FDCWD, PATH, omit_atime, 0), 0);
 
     ker::vfs::VfsCachePerfSnapshot before_omit_stat{};
     ker::vfs::VfsCachePerfSnapshot after_omit_stat{};
     ker::vfs::vfs_get_cache_perf_snapshot(before_omit_stat);
-    KEXPECT_EQ(ker::vfs::vfs_stat(PATH, &st), 0);
+    KEXPECT_EQ(ker::vfs::vfs_statat(&requester, ker::vfs::AT_FDCWD, PATH, 0, &st), 0);
     ker::vfs::vfs_get_cache_perf_snapshot(after_omit_stat);
     KEXPECT_TRUE(after_omit_stat.metadata_hits > before_omit_stat.metadata_hits);
     KEXPECT_EQ(st.st_atim.tv_sec, static_cast<int64_t>(1234));
@@ -603,12 +606,12 @@ KTEST(VFS, UtimensatUpdatesTmpfsTimestamps) {
         {.tv_sec = 5678, .tv_nsec = 901},
     };
     constexpr int BOGUS_DIRFD = 9999;
-    KEXPECT_EQ(ker::vfs::vfs_utimensat(BOGUS_DIRFD, PATH, abs_times, 0), 0);
+    KEXPECT_EQ(ker::vfs::vfs_selftest_utimensat_nonempty_as(requester, BOGUS_DIRFD, PATH, abs_times, 0), 0);
 
     ker::vfs::VfsCachePerfSnapshot before_abs_stat{};
     ker::vfs::VfsCachePerfSnapshot after_abs_stat{};
     ker::vfs::vfs_get_cache_perf_snapshot(before_abs_stat);
-    KEXPECT_EQ(ker::vfs::vfs_stat(PATH, &st), 0);
+    KEXPECT_EQ(ker::vfs::vfs_statat(&requester, ker::vfs::AT_FDCWD, PATH, 0, &st), 0);
     ker::vfs::vfs_get_cache_perf_snapshot(after_abs_stat);
     KEXPECT_TRUE(after_abs_stat.metadata_hits > before_abs_stat.metadata_hits);
     KEXPECT_EQ(st.st_atim.tv_sec, static_cast<int64_t>(4567));
@@ -620,6 +623,9 @@ KTEST(VFS, UtimensatUpdatesTmpfsTimestamps) {
 }
 
 KTEST(VFS, MetadataCacheInvalidatesPathMutation) {
+    ker::mod::sched::task::Task requester{};
+    std::memcpy(requester.root.data(), "/", 2);
+    std::memcpy(requester.cwd.data(), "/", 2);
     ker::vfs::vfs_mkdir("/tmp", 0755);
 
     constexpr const char* PATH = "/tmp/ktest_meta_cache";
@@ -628,26 +634,29 @@ KTEST(VFS, MetadataCacheInvalidatesPathMutation) {
     ker::vfs::vfs_unlink(RENAMED);
 
     ker::vfs::Stat st{};
-    KEXPECT_NE(ker::vfs::vfs_stat(PATH, &st), 0);
-    KEXPECT_NE(ker::vfs::vfs_stat(PATH, &st), 0);
+    KEXPECT_NE(ker::vfs::vfs_statat(&requester, ker::vfs::AT_FDCWD, PATH, 0, &st), 0);
+    KEXPECT_NE(ker::vfs::vfs_statat(&requester, ker::vfs::AT_FDCWD, PATH, 0, &st), 0);
 
     ker::vfs::File* f = ker::vfs::vfs_open_file(PATH, ker::vfs::O_CREAT | 1, 0644);
     KREQUIRE_NE(f, nullptr);
     static_cast<void>(ker::vfs::vfs_close_file(f));
 
-    KEXPECT_EQ(ker::vfs::vfs_stat(PATH, &st), 0);
+    KEXPECT_EQ(ker::vfs::vfs_statat(&requester, ker::vfs::AT_FDCWD, PATH, 0, &st), 0);
     KEXPECT_TRUE((st.st_mode & ker::vfs::S_IFREG) != 0U);
-    KEXPECT_EQ(ker::vfs::vfs_stat(PATH, &st), 0);
+    KEXPECT_EQ(ker::vfs::vfs_statat(&requester, ker::vfs::AT_FDCWD, PATH, 0, &st), 0);
 
     KEXPECT_EQ(ker::vfs::vfs_rename(PATH, RENAMED), 0);
-    KEXPECT_NE(ker::vfs::vfs_stat(PATH, &st), 0);
-    KEXPECT_EQ(ker::vfs::vfs_stat(RENAMED, &st), 0);
+    KEXPECT_NE(ker::vfs::vfs_statat(&requester, ker::vfs::AT_FDCWD, PATH, 0, &st), 0);
+    KEXPECT_EQ(ker::vfs::vfs_statat(&requester, ker::vfs::AT_FDCWD, RENAMED, 0, &st), 0);
 
     KEXPECT_EQ(ker::vfs::vfs_unlink(RENAMED), 0);
-    KEXPECT_NE(ker::vfs::vfs_stat(RENAMED, &st), 0);
+    KEXPECT_NE(ker::vfs::vfs_statat(&requester, ker::vfs::AT_FDCWD, RENAMED, 0, &st), 0);
 }
 
 KTEST(VFS, MetadataCacheRepeatedStatRecordsHit) {
+    ker::mod::sched::task::Task requester{};
+    std::memcpy(requester.root.data(), "/", 2);
+    std::memcpy(requester.cwd.data(), "/", 2);
     ker::vfs::vfs_mkdir("/tmp", 0755);
 
     constexpr const char* PATH = "/tmp/ktest_meta_counter";
@@ -658,16 +667,24 @@ KTEST(VFS, MetadataCacheRepeatedStatRecordsHit) {
     ker::vfs::vfs_put_file(f);
     ker::vfs::vfs_cache_notify_path_changed(PATH, nullptr);
 
+    ker::vfs::LookupHandle retained{};
+    KREQUIRE_EQ(ker::vfs::vfs_acquire_lookup(&requester, ker::vfs::AT_FDCWD, PATH, ker::vfs::LookupIntent::STAT,
+                                             ker::vfs::LookupFollowPolicy::FOLLOW_FINAL, false, false, &retained),
+                0);
+
     ker::vfs::VfsCachePerfSnapshot before{};
     ker::vfs::vfs_get_cache_perf_snapshot(before);
 
     ker::vfs::Stat st{};
-    KEXPECT_EQ(ker::vfs::vfs_stat(PATH, &st), 0);
+    KEXPECT_EQ(ker::vfs::vfs_statat(&requester, ker::vfs::AT_FDCWD, PATH, 0, &st), 0);
 
     ker::vfs::VfsCachePerfSnapshot after_first{};
     ker::vfs::vfs_get_cache_perf_snapshot(after_first);
 
-    KEXPECT_EQ(ker::vfs::vfs_stat(PATH, &st), 0);
+    auto cached = [](const ker::vfs::LookupHandle& handle, void* output) -> int {
+        return ker::vfs::vfs_selftest_cached_retained_stat(handle, static_cast<ker::vfs::Stat*>(output));
+    };
+    KEXPECT_EQ(ker::vfs::vfs_consume_lookup(retained, false, cached, &st), 0);
 
     ker::vfs::VfsCachePerfSnapshot after{};
     ker::vfs::vfs_get_cache_perf_snapshot(after);
@@ -679,6 +696,9 @@ KTEST(VFS, MetadataCacheRepeatedStatRecordsHit) {
 }
 
 KTEST(VFS, MetadataCachePathMutationKeepsSiblingStatHot) {
+    ker::mod::sched::task::Task requester{};
+    std::memcpy(requester.root.data(), "/", 2);
+    std::memcpy(requester.cwd.data(), "/", 2);
     ker::vfs::vfs_mkdir("/tmp", 0755);
 
     constexpr const char* HOT_PATH = "/tmp/ktest_meta_hot_sibling";
@@ -691,8 +711,8 @@ KTEST(VFS, MetadataCachePathMutationKeepsSiblingStatHot) {
     ker::vfs::vfs_put_file(hot);
 
     ker::vfs::Stat st{};
-    KEXPECT_EQ(ker::vfs::vfs_stat(HOT_PATH, &st), 0);
-    KEXPECT_EQ(ker::vfs::vfs_stat(HOT_PATH, &st), 0);
+    KEXPECT_EQ(ker::vfs::vfs_statat(&requester, ker::vfs::AT_FDCWD, HOT_PATH, 0, &st), 0);
+    KEXPECT_EQ(ker::vfs::vfs_statat(&requester, ker::vfs::AT_FDCWD, HOT_PATH, 0, &st), 0);
 
     ker::vfs::VfsCachePerfSnapshot before{};
     ker::vfs::vfs_get_cache_perf_snapshot(before);
@@ -701,7 +721,7 @@ KTEST(VFS, MetadataCachePathMutationKeepsSiblingStatHot) {
     KREQUIRE_NE(churn, nullptr);
     ker::vfs::vfs_put_file(churn);
 
-    KEXPECT_EQ(ker::vfs::vfs_stat(HOT_PATH, &st), 0);
+    KEXPECT_EQ(ker::vfs::vfs_statat(&requester, ker::vfs::AT_FDCWD, HOT_PATH, 0, &st), 0);
 
     ker::vfs::VfsCachePerfSnapshot after{};
     ker::vfs::vfs_get_cache_perf_snapshot(after);

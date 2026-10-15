@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import re
+import resource
 import shutil
 import sys
 import tempfile
@@ -65,7 +66,7 @@ PRELUDE = r'''
 #include <vector>
 #include <platform/mm/paging.hpp>
 namespace fixture {
-inline unsigned assertions{},cases{},irq{},preempt{},task_leases{},root_leases{},io_calls{},table_allocs{},table_frees{},acks{},yields{};
+inline unsigned assertions{},cases{},irq{},preempt{},task_leases{},root_leases{},io_calls{},metadata_calls{},table_allocs{},table_frees{},acks{},yields{};
 inline unsigned fail_table_at{},refuse_readers{};
 inline bool publication{},stop{};
 inline bool interrupts=true;inline unsigned enabled_interrupts{},restored_interrupts{};
@@ -78,7 +79,7 @@ struct Frame {alignas(4096)std::array<unsigned char,4096>bytes{};unsigned refs{1
 inline std::map<void*,Frame*> frames;
 inline std::map<void*,bool> tables;
 }
-namespace ker::abi::vmem {constexpr uint64_t PROT_READ=1,MAP_SHARED=1;}
+namespace ker::abi::vmem {constexpr uint64_t PROT_READ=1,PROT_WRITE=2,MAP_SHARED=1;}
 namespace ker::vfs {struct File;}
 namespace ker::mod::mm {using vaddr_t=uint64_t;using paddr_t=uint64_t;enum class PageKind{PAGE_TABLE,NORMAL};}
 namespace ker::mod::mm::addr {
@@ -96,13 +97,15 @@ inline void page_ref_dec(void*p){auto*f=fixture::frames.at(p);fixture::check(!fi
 namespace ker::vfs::tmpfs {
 class TmpfsPageLoan { public: fixture::Frame*frame_{};~TmpfsPageLoan(){if(frame_)ker::mod::mm::phys::page_ref_dec(frame_->bytes.data());}
  void* frame()const{return frame_?frame_->bytes.data():nullptr;}void* release_to_pte(){auto*p=frame();frame_=nullptr;return p;} };
-class TmpfsDemandReadSharedBacking { public:
+class TmpfsDemandSharedBacking { public:
  std::map<uint64_t,std::unique_ptr<fixture::Frame>>pages;uint64_t limit=1ULL<<30;
+ bool write_capable{}; bool writable()const{return write_capable;}
+ int sync_metadata()const{++fixture::metadata_calls;fixture::check(fixture::interrupts&&!fixture::irq&&!fixture::preempt&&!fixture::publication&&!fixture::root_leases&&!fixture::task_leases,"metadata IO outside all leases");return 0;}
  uint64_t eof()const{return limit;}
  int prepare_page(uint64_t offset,TmpfsPageLoan&out)const{
   fixture::check(fixture::interrupts&&!fixture::irq&&!fixture::preempt&&!fixture::publication&&!fixture::task_leases&&!fixture::root_leases,"IO before ALL teardown-blocking leases");
   ++fixture::io_calls;if(fixture::io_hook)fixture::io_hook();if(fixture::io_error)return fixture::io_error;
-  auto&self=*const_cast<TmpfsDemandReadSharedBacking*>(this);auto&f=self.pages[offset];if(!f){f=std::make_unique<fixture::Frame>();
+  auto&self=*const_cast<TmpfsDemandSharedBacking*>(this);auto&f=self.pages[offset];if(!f){f=std::make_unique<fixture::Frame>();
    for(size_t i=0;i<4096;++i)f->bytes[i]=static_cast<unsigned char>((offset/4096+i*13)%251);fixture::frames[f->bytes.data()]=f.get();}
   ++f->refs;out.frame_=f.get();return 0;
  }
@@ -110,10 +113,11 @@ class TmpfsDemandReadSharedBacking { public:
 }
 namespace ker::mod::mm::file_mapping {
 enum class FamilyOwner{SNAPSHOT};enum class BindingOwner{PREPARED,INDEX,PIN,INSTALLER,SNAPSHOT,TLB};
-enum class FileMappingBackingMode{PRIVATE_COPY,TMPFS_READ_SHARED,TMPFS_DEMAND_READ_SHARED};
-struct FileMappingLifetime{ker::vfs::tmpfs::TmpfsDemandReadSharedBacking backend;unsigned refs=1;
+enum class FileMappingBackingMode{PRIVATE_COPY,TMPFS_READ_SHARED,TMPFS_DEMAND_READ_SHARED,TMPFS_DEMAND_WRITE_SHARED};
+struct FileMappingLifetime{ker::vfs::tmpfs::TmpfsDemandSharedBacking backend;unsigned refs=1;
  bool try_acquire(FamilyOwner){++refs;return true;}void release(FamilyOwner){fixture::check(!fixture::irq&&!fixture::root_leases&&!fixture::task_leases,"family release outside leases");fixture::check(refs>1,"family snapshot once");--refs;}
- FileMappingBackingMode backing_mode()const{return FileMappingBackingMode::TMPFS_DEMAND_READ_SHARED;}
+ bool is_demand_shared()const{return true;}bool shared_writable()const{return backend.writable();}
+ FileMappingBackingMode backing_mode()const{return shared_writable()?FileMappingBackingMode::TMPFS_DEMAND_WRITE_SHARED:FileMappingBackingMode::TMPFS_DEMAND_READ_SHARED;}
  ker::vfs::File*file()const{std::abort();}
  const auto*demand_read_shared_backing()const{return &backend;}};
 struct FileMappingBinding{FileMappingLifetime*family{};paging::PageTable*root_{};uint64_t serial{},begin{},last{},offset{};
@@ -300,6 +304,38 @@ void run(){
   for(auto page:{0U,64U,129U})check(!f.leaf(page)->present,"all actual PTEs purged");check(held->refs==2,"retained PIN survives PTE retirement");
   publication=false;after.release_after_completed_tlb();f.binding.release(fm::BindingOwner::PIN);mm::phys::page_ref_dec(held->bytes.data());
   for(auto&[off,p]:f.family.backend.pages){(void)off;check(p->refs==1,"inode-only final canonical owners");}}
+
+ {Fixture f;f.family.backend.write_capable=true;auto&r=f.task.lazy_vmem_ranges[0];r.kind=s::task::LazyVmemKind::TMPFS_WRITE_SHARED;r.prot=3;
+  check(v::prepare_tmpfs_read_shared_page(f.task,f.address(),true)==v::PublicReadPrepareResult::READY,"cold software writable preparation");
+  auto*e=f.leaf();check(e&&e->present&&e->user&&e->writable&&e->no_execute,"actual writable shared NX leaf");
+  check((v::pte_raw(*e)&(mm::paging::PAGE_SHARED|mm::paging::PAGE_WRITE_RESTRICTED|mm::paging::PAGE_COW))==mm::paging::PAGE_SHARED,"writable shared never COW/restricted");
+  auto*data=reinterpret_cast<unsigned char*>(e->frame<<12);data[81]=0x37;check(f.family.backend.pages.at(0)->bytes[81]==0x37,"CPU store changes canonical backend bytes");
+  e->accessed=1;e->dirty=1;auto*frame=f.family.backend.pages.at(0).get();unsigned refs=frame->refs;
+  publication=true;r.prot=1;check(v::preflight_current_file_binding(f.task,f.binding),"writable whole preflight");
+  check(v::protect_current_file_binding(f.task,f.binding,1),"revoke write from write-capable binding");
+  check(e->user&&!e->writable&&e->accessed&&e->dirty&&frame->refs==refs,"READ downgrade preserves actual AD/frame owners");
+  publication=false;check(v::prepare_tmpfs_read_shared_page(f.task,f.address(),true)==v::PublicReadPrepareResult::REFUSED,"software WRITE obeys downgraded row");
+  publication=true;r.prot=0;check(v::protect_current_file_binding(f.task,f.binding,0),"write-capable NONE");check(!e->user&&!e->writable&&e->accessed&&e->dirty,"NONE revokes both user/write atomically");
+  r.prot=3;check(v::protect_current_file_binding(f.task,f.binding,3),"restore granted WRITE without backend IO under root guards");
+  check(e->user&&e->writable&&e->dirty&&frame->refs==refs,"WRITE restore keeps canonical owner and AD");publication=false;
+  ker::mod::sys::usercopy::StableUserPage pin;check(ker::mod::sys::usercopy::pin_task_user_page(f.task,f.address(),true,true,pin),"actual writable software output pin");
+  static_cast<unsigned char*>(pin.m_pin.hhdm_page)[82]=0x42;check(frame->bytes[82]==0x42,"software output shares canonical frame");pin.reset();}
+ {Fixture f;f.task.lazy_vmem_ranges[0].kind=s::task::LazyVmemKind::TMPFS_WRITE_SHARED;unsigned before=io_calls;
+  check(!f.prepare()&&io_calls==before,"write-kind cannot upgrade immutable readonly family");}
+ {Fixture f;f.family.backend.write_capable=true;auto&r=f.task.lazy_vmem_ranges[0];r.kind=s::task::LazyVmemKind::TMPFS_WRITE_SHARED;r.prot=3;
+  s::task::Task worker;worker.type=s::task::TaskType::DAEMON;worker.refs=2;v::lazy_file_fault_worker=&worker;v::lazy_file_fault_admission=true;
+  uint64_t generation=0;mm::paging::PageFault fault{};fault.writable=1;
+  check(v::probe_lazy_file_fault(&f.task,f.address(),fault,true,generation)==v::LazyFileFaultDisposition::PARK,"hardware WRITE cold work captured");
+  check(!task_leases&&!root_leases,"writable work runnable without root leases");s::current=&worker;v::lazy_file_fault_worker_loop();s::current=&f.task;
+  check(f.task.lazy_file_fault_status==0&&f.task.lazy_file_fault_completion_generation==generation&&f.leaf()->writable,"hardware worker installs canonical writable leaf");}
+ {Fixture f;check(f.prepare(),"canonical duplicate validation setup");auto snapshot=f.task.lazy_vmem_ranges[0];auto*e=f.leaf();uint64_t original=e->frame;
+  // Same legal policy but wrong physical word must never pass the duplicate install path.
+  e->frame=original+1;check(!v::prepare_captured_tmpfs_read_shared_page(f.task,snapshot,f.address(),17,f.binding),"wrong-frame duplicate refused despite identical flags");e->frame=original;}
+
+ {Fixture f;f.family.backend.write_capable=true;auto&r=f.task.lazy_vmem_ranges[0];r.kind=s::task::LazyVmemKind::TMPFS_WRITE_SHARED;r.prot=3;
+  unsigned before=metadata_calls;io_hook=[&]{f.task.lazy_vmem_ranges.clear();};
+  check(!f.prepare()&&metadata_calls==before,"withdrawn writable installer performs no metadata publication");
+  auto*leaf=f.leaf();check(!leaf||!leaf->present,"withdrawn writable preparation installs no leaf");}
  std::printf("PASS demand_mm cases=%u assertions=%u IO=%u ACK=%u yields=%u failures=0\n",cases,assertions,io_calls,acks,yields);
 }
 }
@@ -307,8 +343,8 @@ int main(){fixture::run();}
 '''
 
 
-def generate() -> tuple[str, list[dict]]:
-    virt = (KERN / 'platform/mm/virt.opt.cpp').read_text()
+def generate(virt_source: Path) -> tuple[str, list[dict]]:
+    virt = virt_source.read_text()
     task = (KERN / 'platform/sched/task.hpp').read_text()
     start, end = task.index('enum class LazyVmemKind'), task.index('using LazyVmemRangeVec')
     types = task[start:end]
@@ -316,7 +352,7 @@ def generate() -> tuple[str, list[dict]]:
     # its typed family declaration is supplied before the range declarations.
     actual = [dict(anchor='actual-LazyVmemKind-Range-and-helpers', bytes=len(types.encode()), sha256=hashlib.sha256(types.encode()).hexdigest())]
     bodies = []
-    for anchor in ['auto lazy_file_range_matches(', 'auto file_binding_matches_range(',
+    for anchor in ['auto lazy_file_range_matches(', 'auto file_binding_matches_range(', 'auto demand_range_policy_valid(',
                    'FileMappingInstallerLease::~FileMappingInstallerLease()', 'auto FileMappingInstallerLease::acquire(',
                    'class DemandRootAccess {', 'struct DemandPageSnapshot {', 'auto capture_demand_page(',
                    'struct DemandTableSpares {', 'auto demand_leaf_locked(', 'auto prepare_captured_tmpfs_read_shared_page(',
@@ -363,6 +399,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cxx', default=os.environ.get('WOS_HOST_CXX', '/usr/bin/clang++'))
     parser.add_argument('--evidence-dir', type=Path)
+    parser.add_argument('--virt-source', type=Path, default=KERN / 'platform/mm/virt.opt.cpp')
     args = parser.parse_args()
     start = time.monotonic()
     scratch = None
@@ -370,7 +407,7 @@ def main() -> int:
     result = dict(pass_=False, commands=[], native_runtime_qualified=False, hardware_TLB_qualified=False,
                   backend_and_index_are_explicit_Host_primitives=True)
     watched = [Path(__file__).resolve(), Path(__file__).with_name('lazy_file_fault_close_order_runtime_test.py'),
-               KERN / 'platform/mm/virt.opt.cpp', KERN / 'platform/mm/virt.hpp', KERN / 'platform/sched/task.hpp',
+               args.virt_source.resolve(strict=True), KERN / 'platform/mm/virt.hpp', KERN / 'platform/sched/task.hpp',
                KERN / 'platform/sys/usercopy.cpp',
                KERN / 'platform/sys/syscall_preparation.hpp',
                KERN / 'platform/mm/paging.hpp', KERN / 'platform/mm/paging.opt.cpp']
@@ -379,8 +416,9 @@ def main() -> int:
         compiler = Path(args.cxx).resolve(strict=True)
         watched.append(compiler)
         before = [pin(path) for path in watched]
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         subreaper()
-        code, actual = generate()
+        code, actual = generate(args.virt_source)
         result['actual_definitions'] = actual
         scratch = Path(tempfile.mkdtemp(prefix='wos-demand-mm-', dir='/tmp'))
         source, binary = scratch / 'demand.cpp', scratch / 'demand-test'

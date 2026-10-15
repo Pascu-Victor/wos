@@ -160,8 +160,13 @@ auto FileMappingLifetime::prepare_read_shared_tmpfs(ker::vfs::File& borrowed_fil
 
 auto FileMappingLifetime::prepare_demand_read_shared_tmpfs(ker::vfs::File& borrowed_file, uint64_t file_offset, uint64_t length, int& error)
     -> FileMappingLifetime* {
-    std::unique_ptr<ker::vfs::tmpfs::TmpfsDemandReadSharedBacking> backing;
-    error = ker::vfs::tmpfs::TmpfsDemandReadSharedBacking::prepare(borrowed_file, file_offset, length, backing);
+    return prepare_demand_shared_tmpfs(borrowed_file, file_offset, length, false, error);
+}
+
+auto FileMappingLifetime::prepare_demand_shared_tmpfs(ker::vfs::File& borrowed_file, uint64_t file_offset, uint64_t length,
+                                                      bool write_capable, int& error) -> FileMappingLifetime* {
+    std::unique_ptr<ker::vfs::tmpfs::TmpfsDemandSharedBacking> backing;
+    error = ker::vfs::tmpfs::TmpfsDemandSharedBacking::prepare(borrowed_file, file_offset, length, write_capable, backing);
     if (error != 0) return nullptr;
     auto* owner = prepare(borrowed_file);
     if (owner == nullptr) {
@@ -171,7 +176,8 @@ auto FileMappingLifetime::prepare_demand_read_shared_tmpfs(ker::vfs::File& borro
     // The strict backend graph owns no Task. Only the actual permanent
     // executor supplies this unobserved callback and accounts through return.
     owner->demand_read_shared_backing_ = std::move(backing);
-    owner->backing_mode_ = FileMappingBackingMode::TMPFS_DEMAND_READ_SHARED;
+    owner->backing_mode_ =
+        write_capable ? FileMappingBackingMode::TMPFS_DEMAND_WRITE_SHARED : FileMappingBackingMode::TMPFS_DEMAND_READ_SHARED;
     error = 0;
     return owner;
 }

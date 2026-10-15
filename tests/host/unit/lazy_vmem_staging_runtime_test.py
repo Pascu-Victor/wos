@@ -424,15 +424,16 @@ struct ForkWorld {
     Root root{501},child_root{9001};st::Task parent{},child{};ker::vfs::File file{};
     fm::FileMappingLifetime* family{};
     std::array<fm::FileMappingBinding*,8> bindings{};size_t count{};
-    explicit ForkWorld(size_t n=3):count(n){
+    explicit ForkWorld(size_t n=3,bool writable=false):count(n){
         parent.pagemap=&root;child.pagemap=&child_root;ker::mod::sched::current_task=&parent;
         if(!n)return;
         demand_constructor_allowed=true;int error=-1;
-        family=fm::FileMappingLifetime::prepare_demand_read_shared_tmpfs(file,7*4096,64*4096,error);
+        family=writable?fm::FileMappingLifetime::prepare_demand_shared_tmpfs(file,7*4096,64*4096,true,error):
+            fm::FileMappingLifetime::prepare_demand_read_shared_tmpfs(file,7*4096,64*4096,error);
         demand_constructor_allowed=false;check(family&&error==0,"real demand-mode family via declared constructor primitive");
         check(parent.lazy_vmem_ranges.reserve(n),"parent public rows reserve");
         for(size_t i=0;i<n;++i){Row r{};r.start=0x10000+i*0x4000;r.end=r.start+0x2000;r.prot=i%2?0:1;r.flags=1;
-            r.kind=Kind::TMPFS_READ_SHARED;r.lifetime=family;r.file_offset=(7+i*3)*4096;
+            r.kind=writable?Kind::TMPFS_WRITE_SHARED:Kind::TMPFS_READ_SHARED;r.prot=writable?3:r.prot;r.lifetime=family;r.file_offset=(7+i*3)*4096;
             check(st::try_retain_lazy_vmem_range(r),"parent owns public LAZY");check(parent.lazy_vmem_ranges.push_back_no_grow(r),"parent public append");
             auto* prepared=fm::FileMappingBinding::prepare(*family,&root,root.serial,r.start,r.end,r.file_offset);bindings.at(i)=prepared;
             check(prepared,"real parent binding reservation");
@@ -464,6 +465,14 @@ struct SaturateBinding {
     ~SaturateBinding(){*counts=saved;}
 };
 void fork_vectors(){
+    {ForkWorld w(3,true);Clone source;Fork f;check(source.prepare(w.parent)==0,"writable fork source captures typed owner");
+        fork_test(w.family->shared_writable()&&f.prepare(w.parent,source)==0,"writable family prepares fresh child bindings");
+        {ker::syscall::vmem::SharedVmemPublicationGuard p;check(source.matches(w.parent)&&f.matches(w.parent),"writable parent exact revalidation");
+            check(source.consume(w.child)&&f.attach(w.child),"writable rows and index published together");}
+        fork_test(w.child_bindings()==3,"all writable child bindings installed");
+        for(size_t i=0;i<3;++i){auto const&r=w.child.lazy_vmem_ranges.at(i);
+            fork_test(r.kind==Kind::TMPFS_WRITE_SHARED&&r.prot==3&&r.lifetime==w.family&&r.lifetime->shared_writable(),"fork preserves immutable writable grant and same family");}}
+
     {ForkWorld w;{
         Clone source;Fork f;check(source.prepare(w.parent)==0,"public clone captures READ/NONE cold rows");
         fork_test(f.prepare(w.parent,source)==0,"actual fork prepares all cold public intervals");
@@ -528,7 +537,7 @@ void fork_vectors(){
     {World w;ker::mod::sched::current_task=&w.source;unsigned enabled=enabled_interrupts,restored=restored_interrupts;
         {ker::mod::sys::SyscallPreparationScope p(w.source);check(p.ready()&&irq_enabled,"already enabled preparation accepted");}
         fork_test(irq_enabled&&enabled==enabled_interrupts&&restored==restored_interrupts,"already IF-on scope preserves caller state");ker::mod::sched::current_task=nullptr;}
-    check(fork_cases==45,"complete public preparation and IF scope vector census");
+    check(fork_cases==50,"complete public preparation and IF scope vector census");
 }
 }
 '''
@@ -593,7 +602,7 @@ void release_lazy_vmem_ranges(Task&);
     write("util/hcf.hpp", "#pragma once\n#include <cstdlib>\n[[noreturn]] inline void hcf(){std::abort();}\n")
     write("platform/sys/usercopy.hpp", "#pragma once\n#include <cstdint>\nnamespace ker::mod::sys::usercopy {constexpr uint64_t USER_ADDR_LIMIT=0x800000000000ULL;}\n")
     write("platform/mm/lifetime_retirement_executor.hpp", "#pragma once\n#include <platform/mm/file_mapping_lifetime.hpp>\nnamespace ker::mod::mm::file_mapping { struct LifetimeRetirementTicket { LifetimeRetirementRun run{}; void* argument{}; bool ready{}; }; class LifetimeRetirementExecutor { public: static auto port() noexcept -> const LifetimeRetirementPort*; }; }\n")
-    write("vfs/fs/tmpfs.hpp", "#pragma once\n#include <fixture_common.hpp>\nnamespace ker::vfs::tmpfs {class TmpfsReadSharedBacking { public: static int prepare(File&,uint64_t,uint64_t,std::unique_ptr<TmpfsReadSharedBacking>&){return -EOPNOTSUPP;} }; class TmpfsDemandReadSharedBacking { public: static int prepare(File&,uint64_t,uint64_t,std::unique_ptr<TmpfsDemandReadSharedBacking>&out){if(!fixture::demand_constructor_allowed)return -EOPNOTSUPP;out.reset(new(std::nothrow) TmpfsDemandReadSharedBacking);return out?0:-ENOMEM;} }; }\n")
+    write("vfs/fs/tmpfs.hpp", "#pragma once\n#include <fixture_common.hpp>\nnamespace ker::vfs::tmpfs {class TmpfsReadSharedBacking { public: static int prepare(File&,uint64_t,uint64_t,std::unique_ptr<TmpfsReadSharedBacking>&){return -EOPNOTSUPP;} }; class TmpfsDemandSharedBacking { public: static int prepare(File&,uint64_t,uint64_t,bool,std::unique_ptr<TmpfsDemandSharedBacking>&out){if(!fixture::demand_constructor_allowed)return -EOPNOTSUPP;out.reset(new(std::nothrow) TmpfsDemandSharedBacking);return out?0:-ENOMEM;} }; }\n")
     # Whole current production translation units, never rewritten staging logic.
     (scratch / "lazy_vmem.cpp").write_bytes((KERN / "platform/sched/lazy_vmem.cpp").read_bytes())
     (scratch / "family.cpp").write_bytes((KERN / "platform/mm/file_mapping_lifetime.cpp").read_bytes())
@@ -838,7 +847,7 @@ def main():
                 raise ValueError(f"actual {'compile/link' if index == 0 else 'runtime'} exit {row['exit']}")
             if index == 1:
                 match = re.fullmatch(r"PASS cases=(\d+) assertions=(\d+) failures=0 allocations=(\d+) callbacks=(\d+) real_smallvec=1 real_staging=1 real_family_core=1 real_shared_transaction=1 shared_cases=(\d+) real_public_fork_preparation=1 fork_cases=(\d+)\n", text)
-                if match is None or int(match[1]) != 144 or int(match[5]) != 46 or int(match[6]) != 45 or int(match[2]) < 1000 or int(match[4]) < 4:
+                if match is None or int(match[1]) != 149 or int(match[5]) != 46 or int(match[6]) != 50 or int(match[2]) < 1000 or int(match[4]) < 4:
                     raise ValueError("complete actual positive vector census missing")
                 result["runtime_census"] = dict(zip(["cases", "assertions", "allocations", "callbacks", "shared_cases", "fork_cases"], map(int, match.groups())))
                 print(text, end="", flush=True)

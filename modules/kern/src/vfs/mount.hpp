@@ -101,10 +101,13 @@ class NativeFileMappingMountPin {
     auto operator=(NativeFileMappingMountPin&& other) noexcept -> NativeFileMappingMountPin&;
 
     [[nodiscard]] static auto acquire_tmpfs(File& borrowed, const void* expected_private, NativeFileMappingMountPin& empty) -> int;
+    // Public demand mappings retain ordinary File-owned stream attachments.
+    [[nodiscard]] static auto acquire_tmpfs_demand(File& borrowed, const void* expected_private, NativeFileMappingMountPin& empty) -> int;
     [[nodiscard]] auto empty() const noexcept -> bool { return mount_ == nullptr; }
     void reset() noexcept;
 
    private:
+    static auto acquire_tmpfs_checked(File& borrowed, const void* expected_private, NativeFileMappingMountPin& empty, bool demand) -> int;
     MountPoint* mount_{};
 };
 

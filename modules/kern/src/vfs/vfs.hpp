@@ -711,6 +711,9 @@ auto vfs_selftest_linkat_dirfd_creates_relative_hardlink() -> bool;
 auto vfs_selftest_chdir_common_local_fast_path_uses_metadata_cache() -> bool;
 auto vfs_selftest_fchmodat_dirfd_changes_relative_file_mode() -> bool;
 auto vfs_selftest_fchownat_dirfd_changes_relative_file_owner() -> bool;
+auto vfs_selftest_utimensat_nonempty_as(ker::mod::sched::task::Task& task, int dirfd, const char* pathname, const Timespec* times,
+                                        int flags) -> int;
+auto vfs_selftest_cached_retained_stat(const LookupHandle& handle, Stat* output) -> int;
 auto vfs_selftest_stat_lstat_share_non_symlink_cache() -> bool;
 auto vfs_selftest_readdir_seeds_non_symlink_hints() -> bool;
 auto vfs_selftest_readlink_uses_metadata_negative_cache() -> bool;

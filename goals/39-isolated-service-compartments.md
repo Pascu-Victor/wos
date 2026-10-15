@@ -8,10 +8,34 @@
 
 ## Outcome and scale
 
+Checkpoint 59 implements canonical writable sharing for ordinary TMPFS-backed
+shared mappings, including cached File descriptions. Independent mappings and
+ordinary file I/O use the same frames; per-inode cache authority prevents stale
+metadata, stream and copied-page reuse after writable admission. Actual File
+access and captured mount policy bound later protection changes. Fixed EOF,
+whole-binding operations, tail sanitation, Task/File/lazy-row layouts and the
+syscall/wire ABI are preserved. Normal Build WOS, isolated fast diagnostic
+compilation, formatting and all 18 selected Host checks pass. The public
+five-role writable probe passes on the earlier checkpoint59 build, including
+70 events, real shared futex exchange, fork/exec and EOF-tail checks. Native90
+and Native91 remain failed evidence. The subsequent repair preserves retained
+requester authority in cache stores and replaces stale taskless cache fixtures
+with real owners. Fresh Native92 passes all 1,463 enabled tests, 212 mandatory
+cases and 113,977 assertions with zero failures and natural shutdown. Its four
+disposable images are pruned; the separate real-host postcheck confirms zero
+allocation and the protected VM and original guard unchanged. Current-source
+public run03 also passes all 70 events and nine reports, including the original
+init-reap witness. Its separate real-host postcheck confirms zero remaining
+disposable images and unchanged protected VM and guard. Complete owner drains,
+two-hour simultaneous services and 1,000 lifecycle/allocation-failure cycles
+remain required.
+Goal39 stays ACTIVE; all ten full criteria remain open. Continue `--no-setup`,
+one topology, bounded storage and exact-owned pruning after every outcome.
+
 Checkpoint 58 connects public read-only shared canonical TMPFS mappings to
-demand faults, mirrored thread metadata and fresh fork bindings. The current
+demand faults, mirrored thread metadata and fresh fork bindings. Its
 admission requires an explicitly uncached File and a strict retained TMPFS
-mount graph; ordinary cached descriptions and writable sharing remain work.
+mount graph; ordinary cached descriptions and writable sharing were then pending.
 Whole READ/NONE protection and unmap are supported; partial managed operations,
 replacement and remap remain unsupported. Fixed-EOF ownership prevents resize
 while a backing is live. Task, File, lazy-row and syscall/wire layouts are

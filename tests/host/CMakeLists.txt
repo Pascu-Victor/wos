@@ -1879,6 +1879,9 @@ set_tests_properties(lazy_vmem_staging_runtime_test PROPERTIES LABELS "unit;host
 add_test(NAME tmpfs_demand_mm_runtime_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/tmpfs_demand_mm_runtime_test.py --cxx ${CMAKE_CXX_COMPILER})
 set_tests_properties(tmpfs_demand_mm_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 70)
+add_test(NAME tmpfs_mutable_cache_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/tmpfs_mutable_cache_runtime_test.py --cxx ${CMAKE_CXX_COMPILER})
+set_tests_properties(tmpfs_mutable_cache_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 70)
 
 add_test(NAME perf_capture_kernel_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/perf_capture_kernel_test.py)

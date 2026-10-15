@@ -101,6 +101,7 @@ enum class LazyVmemKind : uint8_t {
     FILE_BACKED,
     NATIVE_FILE_BACKED,
     TMPFS_READ_SHARED,
+    TMPFS_WRITE_SHARED,
 };
 
 struct LazyVmemRange {
@@ -126,8 +127,11 @@ struct LazyVmemRange {
 // subsequent Task fields used by assembly and existing kernel consumers.
 static_assert(sizeof(LazyVmemRange) == 112);
 static_assert(offsetof(LazyVmemRange, file) == 40);
+[[nodiscard]] inline auto lazy_vmem_is_tmpfs_shared(const LazyVmemRange& range) -> bool {
+    return range.kind == LazyVmemKind::TMPFS_READ_SHARED || range.kind == LazyVmemKind::TMPFS_WRITE_SHARED;
+}
 [[nodiscard]] inline auto lazy_vmem_has_lifetime(const LazyVmemRange& range) -> bool {
-    return range.kind == LazyVmemKind::NATIVE_FILE_BACKED || range.kind == LazyVmemKind::TMPFS_READ_SHARED;
+    return range.kind == LazyVmemKind::NATIVE_FILE_BACKED || lazy_vmem_is_tmpfs_shared(range);
 }
 [[nodiscard]] inline auto lazy_vmem_is_file(const LazyVmemRange& range) -> bool {
     return range.kind == LazyVmemKind::FILE_BACKED || lazy_vmem_has_lifetime(range);

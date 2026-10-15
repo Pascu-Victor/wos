@@ -1113,16 +1113,22 @@ auto file_mmap_cached_page_for_file(ker::vfs::File* file, const ker::vfs::Stat& 
     bool const TRACE_CACHE = ker::mod::perf::is_wki_recording_enabled();
     auto* task = TRACE_CACHE ? get_current_task() : nullptr;
     FileMmapPageKey key = file_mmap_page_key(st, file_offset);
+    auto const TMPFS_AUTHORITY = ker::vfs::tmpfs::tmpfs_file_cache_authority(*file);
+    if (TMPFS_AUTHORITY.object_identity != 0) key.exec_content_id = TMPFS_AUTHORITY.object_identity;
     if (file->exec_read_view != nullptr) key.exec_content_id = file->exec_read_view->content_id;
     FileMmapPageKey const KEY = key;
     uint64_t const LOOKUP_STARTED_US = TRACE_CACHE ? ker::mod::time::get_us() : 0;
-    if (void* const CACHED_PAGE = file_mmap_cache_lookup(KEY); CACHED_PAGE != nullptr) {
-        *page_out = CACHED_PAGE;
-        if (TRACE_CACHE) {
-            record_local_vmem_cache_event(task, ker::mod::perf::WkiPerfLocalVmemOp::FILE_CACHE_HIT, file_offset,
-                                          vmem_latency_since(LOOKUP_STARTED_US), true);
+    if (void* const CACHED_PAGE = TMPFS_AUTHORITY.bypass ? nullptr : file_mmap_cache_lookup(KEY); CACHED_PAGE != nullptr) {
+        if (ker::vfs::tmpfs::tmpfs_file_mutable_cache_bypass(*file)) {
+            ker::mod::mm::phys::page_ref_dec(CACHED_PAGE);
+        } else {
+            *page_out = CACHED_PAGE;
+            if (TRACE_CACHE) {
+                record_local_vmem_cache_event(task, ker::mod::perf::WkiPerfLocalVmemOp::FILE_CACHE_HIT, file_offset,
+                                              vmem_latency_since(LOOKUP_STARTED_US), true);
+            }
+            return true;
         }
-        return true;
     }
     if (TRACE_CACHE) {
         record_local_vmem_cache_event(task, ker::mod::perf::WkiPerfLocalVmemOp::FILE_CACHE_MISS, file_offset,
@@ -1157,6 +1163,12 @@ auto file_mmap_cached_page_for_file(ker::vfs::File* file, const ker::vfs::Stat& 
         }
     }
 
+    if (ker::vfs::tmpfs::tmpfs_file_mutable_cache_bypass(*file)) {
+        if (!ker::mod::mm::phys::page_reassign_owner(NEW_PAGE, ker::mod::mm::PhysicalPageOwner::USER_FILE_MAPPING))
+            ker::mod::dbg::panic_handler("uncached private file page could not transfer ownership");
+        *page_out = NEW_PAGE;  // One private snapshot owner; no reusable cache owner.
+        return true;
+    }
     FileMmapCacheInsertResult const INSERT_RESULT = file_mmap_cache_insert_or_discard(KEY, NEW_PAGE, page_out);
     if (TRACE_CACHE) {
         uint32_t const FILL_US = vmem_latency_since(FILL_STARTED_US);
@@ -1722,7 +1734,7 @@ auto materialize_lazy_file_page_impl(ker::mod::sched::task::Task* task, const La
     }
     // Demand canonical pages use the two-phase MM worker/pre-pin entrance.
     // This legacy materializer can be called with outer root readers held.
-    if (range.kind == LazyVmemKind::TMPFS_READ_SHARED) return false;
+    if (ker::mod::sched::task::lazy_vmem_is_tmpfs_shared(range)) return false;
     ker::mod::mm::virt::FileMappingInstallerLease installer;
     bool const NATIVE = range.kind == LazyVmemKind::NATIVE_FILE_BACKED;
     if (NATIVE && !installer.acquire(*task, range, page_vaddr)) return false;
@@ -2135,7 +2147,7 @@ auto public_shared_file_overlap(ker::mod::sched::task::Task& task, uint64_t star
     bool found = false;
     uint64_t const FLAGS = task.lazy_vmem_lock.lock_irqsave();
     for (auto const& row : task.lazy_vmem_ranges) {
-        found |= row.kind == LazyVmemKind::TMPFS_READ_SHARED && ranges_overlap(start, start + length, row.start, row.end);
+        found |= ker::mod::sched::task::lazy_vmem_is_tmpfs_shared(row) && ranges_overlap(start, start + length, row.start, row.end);
     }
     task.lazy_vmem_lock.unlock_irqrestore(FLAGS);
     return found;
@@ -2147,7 +2159,8 @@ auto public_shared_file_overlap(ker::mod::sched::task::Task& task, uint64_t star
 auto change_public_shared_file(ker::mod::sched::task::Task& task, uint64_t start, uint64_t length, bool protect, uint64_t prot = 0)
     -> uint64_t {
     namespace fm = ker::mod::mm::file_mapping;
-    if (protect && (prot & ~static_cast<uint64_t>(ker::abi::vmem::PROT_READ)) != 0) return static_cast<uint64_t>(-EACCES);
+    if (protect && (prot & ~static_cast<uint64_t>(ker::abi::vmem::PROT_READ | ker::abi::vmem::PROT_WRITE)) != 0)
+        return static_cast<uint64_t>(-EACCES);
     ker::mod::sys::SyscallPreparationScope preparation(task);
     if (!preparation.ready()) return static_cast<uint64_t>(-EWOULDBLOCK);
     auto release_snapshot = [](fm::FileMappingBinding* binding) {
@@ -2171,8 +2184,9 @@ auto change_public_shared_file(ker::mod::sched::task::Task& task, uint64_t start
             return static_cast<uint64_t>(-EAGAIN);
         binding.reset(captured);
         if (!binding) return static_cast<uint64_t>(-EAGAIN);
-        if (!exact || binding->lifetime()->backing_mode() != fm::FileMappingBackingMode::TMPFS_DEMAND_READ_SHARED)
-            return static_cast<uint64_t>(-EOPNOTSUPP);
+        if (protect && (prot & ker::abi::vmem::PROT_WRITE) != 0 && !binding->lifetime()->shared_writable())
+            return static_cast<uint64_t>(-EACCES);
+        if (!exact || !binding->lifetime()->is_demand_shared()) return static_cast<uint64_t>(-EOPNOTSUPP);
         if (!ker::mod::mm::virt::preflight_current_file_binding(task, *binding)) return static_cast<uint64_t>(-EAGAIN);
         metadata.commit();
         bool const COMPLETED = protect ? ker::mod::mm::virt::protect_current_file_binding(task, *binding, prot)
@@ -2180,15 +2194,21 @@ auto change_public_shared_file(ker::mod::sched::task::Task& task, uint64_t start
         if (!COMPLETED) ker::mod::dbg::panic_handler("validated public mapping mutation failed after withdrawal");
     }
     after_tlb.release_after_completed_tlb();
+    if (binding->lifetime()->demand_read_shared_backing()->sync_metadata() != 0)
+        ker::mod::dbg::panic_handler("public TMPFS metadata commit lost prepared context");
     return 0;
 }
 
 auto allocate_public_shared_tmpfs(ker::mod::sched::task::Task& task, ker::vfs::File& file, const ker::vfs::Stat& st, uint64_t hint,
                                   uint64_t length, uint64_t prot, uint64_t flags, uint64_t offset) -> uint64_t {
     namespace fm = ker::mod::mm::file_mapping;
+    constexpr uint64_t SUPPORTED = ker::abi::vmem::MAP_SHARED | ker::abi::vmem::MAP_FIXED | ker::abi::vmem::MAP_NORESERVE;
+    if ((flags & ker::abi::vmem::MAP_SHARED) == 0 || (flags & ker::abi::vmem::MAP_PRIVATE) != 0) return static_cast<uint64_t>(-EINVAL);
+    if ((flags & ~SUPPORTED) != 0) return static_cast<uint64_t>(-EOPNOTSUPP);
+    if ((flags & ker::abi::vmem::MAP_FIXED) != 0 && hint == 0) return static_cast<uint64_t>(-EINVAL);
     ker::mod::sys::SyscallPreparationScope preparation(task);
     if (!preparation.ready()) return static_cast<uint64_t>(-EWOULDBLOCK);
-    bool const FIXED = (flags & ker::abi::vmem::MAP_FIXED) != 0 && hint != 0;
+    bool const FIXED = (flags & ker::abi::vmem::MAP_FIXED) != 0;
     if (FIXED && (hint < USER_SPACE_START || hint > USER_SPACE_END - length || (hint & (ker::mod::mm::paging::PAGE_SIZE - 1)) != 0))
         return static_cast<uint64_t>(-EINVAL);
     auto const shutdown_hold = ker::mod::sched::hold_kernel_shutdown();
@@ -2197,7 +2217,9 @@ auto allocate_public_shared_tmpfs(ker::mod::sched::task::Task& task, ker::vfs::F
     };
     int error = -ENOMEM;
     std::unique_ptr<fm::FileMappingLifetime, decltype(release_family)> family(
-        fm::FileMappingLifetime::prepare_demand_read_shared_tmpfs(file, offset, length, error), release_family);
+        fm::FileMappingLifetime::prepare_demand_shared_tmpfs(file, offset, length,
+                                                             (file.open_flags & 3) == 2 && !ker::vfs::file_mount_read_only(file), error),
+        release_family);
     if (!family) return static_cast<uint64_t>(error);
     auto release_binding = [](fm::FileMappingBinding* binding) {
         if (binding) binding->release(fm::BindingOwner::PREPARED);
@@ -2227,7 +2249,7 @@ auto allocate_public_shared_tmpfs(ker::mod::sched::task::Task& task, ker::vfs::F
                                 .end = address + length,
                                 .prot = prot,
                                 .flags = ker::abi::vmem::MAP_SHARED,
-                                .kind = LazyVmemKind::TMPFS_READ_SHARED,
+                                .kind = family->shared_writable() ? LazyVmemKind::TMPFS_WRITE_SHARED : LazyVmemKind::TMPFS_READ_SHARED,
                                 .lifetime = family.get(),
                                 .file_offset = offset,
                                 .file_dev = st.st_dev,
@@ -2255,6 +2277,8 @@ auto allocate_public_shared_tmpfs(ker::mod::sched::task::Task& task, ker::vfs::F
             metadata.advance_cursor(address, length);
             observation.commit_mapping();
         }
+        if ((prot & ker::abi::vmem::PROT_WRITE) != 0 && family->demand_read_shared_backing()->sync_metadata() != 0)
+            ker::mod::dbg::panic_handler("public TMPFS map metadata lost committed context");
         return address;
     }
     return static_cast<uint64_t>(-EAGAIN);
@@ -2396,10 +2420,12 @@ auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t si
     }
 
     if (get_current_task() == task && task->type == ker::mod::sched::task::TaskType::PROCESS && file->fs_type == ker::vfs::FSType::TMPFS &&
-        file->fops == ker::vfs::tmpfs::get_tmpfs_fops() && file->mount_owner != nullptr && (file->open_flags & 3) == 0 &&
-        (flags & ker::abi::vmem::MAP_SHARED) != 0 && (prot & ~static_cast<uint64_t>(ker::abi::vmem::PROT_READ)) == 0 &&
-        (st.st_mode & ker::vfs::S_IFMT) == ker::vfs::S_IFREG)
+        file->fops == ker::vfs::tmpfs::get_tmpfs_fops() && file->mount_owner != nullptr && (flags & ker::abi::vmem::MAP_SHARED) != 0 &&
+        (st.st_mode & ker::vfs::S_IFMT) == ker::vfs::S_IFREG) {
+        if ((prot & ~static_cast<uint64_t>(ker::abi::vmem::PROT_READ | ker::abi::vmem::PROT_WRITE)) != 0)
+            return static_cast<uint64_t>(-EACCES);
         return allocate_public_shared_tmpfs(*task, *file, st, hint, size, prot, flags, offset);
+    }
 
     // Keep reservation, page-table construction, lazy/file metadata, and
     // rollback indivisible with respect to fork's address-space snapshot.
@@ -3579,7 +3605,7 @@ auto PublicFileForkPreparation::prepare(ker::mod::sched::task::Task& parent, con
     if (prepared_ || entries_ != nullptr) return -EBUSY;
     if (!ker::mod::sched::interrupts_enabled() || ker::mod::sched::preempt_count() != 0) return -EWOULDBLOCK;
     size_t count = 0;
-    for (auto const& row : source.ranges()) count += row.kind == LazyVmemKind::TMPFS_READ_SHARED;
+    for (auto const& row : source.ranges()) count += ker::mod::sched::task::lazy_vmem_is_tmpfs_shared(row);
     if (count > SIZE_MAX / sizeof(Entry)) return -EOVERFLOW;
     if (count != 0) {
         entries_ = new (std::nothrow) Entry[count]{};
@@ -3591,14 +3617,14 @@ auto PublicFileForkPreparation::prepare(ker::mod::sched::task::Task& parent, con
         if (!source.matches(parent)) return -EAGAIN;
         size_t index = 0;
         for (auto const& row : source.ranges()) {
-            if (row.kind != LazyVmemKind::TMPFS_READ_SHARED) continue;
+            if (!ker::mod::sched::task::lazy_vmem_is_tmpfs_shared(row)) continue;
             auto& entry = entries_[index++];
             entry.start = row.start;
             entry.end = row.end;
             entry.offset = row.file_offset;
             entry.family = row.lifetime;
             bool exact = false;
-            if (!entry.family || entry.family->backing_mode() != fm::FileMappingBackingMode::TMPFS_DEMAND_READ_SHARED ||
+            if (!entry.family || !entry.family->is_demand_shared() ||
                 !ker::mod::mm::virt::query_current_file_binding(parent, row.start, row.end, entry.source, exact) || !exact ||
                 !entry.source || entry.source->lifetime() != entry.family || entry.source->file_offset() != row.file_offset)
                 return -EAGAIN;
@@ -4209,7 +4235,30 @@ auto anon_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size, uint64
     return NEW_ADDR;
 }
 
-auto mmap_msync(uint64_t addr, uint64_t size, uint64_t /*flags*/) -> uint64_t {
+auto sync_public_shared_tmpfs(ker::mod::sched::task::Task& task, uint64_t addr, uint64_t size, uint64_t flags) -> uint64_t {
+    namespace fm = ker::mod::mm::file_mapping;
+    constexpr uint64_t ASYNC = 1, INVALIDATE = 2, SYNC = 4;
+    if ((flags & ~(ASYNC | INVALIDATE | SYNC)) != 0 || (flags & (ASYNC | SYNC)) == (ASYNC | SYNC)) return static_cast<uint64_t>(-EINVAL);
+    ker::mod::sys::SyscallPreparationScope preparation(task);
+    if (!preparation.ready()) return static_cast<uint64_t>(-EWOULDBLOCK);
+    auto release_snapshot = [](fm::FileMappingBinding* value) {
+        if (value) value->release(fm::BindingOwner::SNAPSHOT);
+    };
+    std::unique_ptr<fm::FileMappingBinding, decltype(release_snapshot)> binding(nullptr, release_snapshot);
+    {
+        SharedVmemPublicationGuard publication;
+        fm::FileMappingBinding* value = nullptr;
+        bool exact = false;
+        if (!ker::mod::mm::virt::query_current_file_binding(task, addr, addr + size, value, exact)) return static_cast<uint64_t>(-EAGAIN);
+        binding.reset(value);
+        if (!binding || !binding->lifetime()->is_demand_shared() || addr < binding->start() || addr + size > binding->end())
+            return static_cast<uint64_t>(-EOPNOTSUPP);
+    }
+    // Canonical TMPFS data already belongs to the inode. No copied-page writeback.
+    return static_cast<uint64_t>(binding->lifetime()->demand_read_shared_backing()->sync_metadata());
+}
+
+auto mmap_msync(uint64_t addr, uint64_t size, uint64_t flags) -> uint64_t {
     auto* task = get_current_task();
     if (task == nullptr || task->pagemap == nullptr) {
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
@@ -4222,6 +4271,8 @@ auto mmap_msync(uint64_t addr, uint64_t size, uint64_t /*flags*/) -> uint64_t {
     if (align_user_vmem_size(size, &size) < 0 || addr > USER_SPACE_END - size) {
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
     }
+
+    if (public_shared_file_overlap(*task, addr, size)) return sync_public_shared_tmpfs(*task, addr, size, flags);
 
     // Keep the collected File identity bound to its pages until snapshots and
     // writes finish, matching munmap and MAP_FIXED's existing serialization.

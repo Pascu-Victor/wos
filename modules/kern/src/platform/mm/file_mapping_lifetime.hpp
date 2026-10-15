@@ -10,7 +10,7 @@ struct File;
 }
 namespace ker::vfs::tmpfs {
 class TmpfsReadSharedBacking;
-class TmpfsDemandReadSharedBacking;
+class TmpfsDemandSharedBacking;
 }  // namespace ker::vfs::tmpfs
 namespace ker::mod::mm::paging {
 struct PageTable;
@@ -88,7 +88,7 @@ struct BindingOwnerCounts {
 };
 
 class FileMappingBinding;
-enum class FileMappingBackingMode : uint8_t { PRIVATE_COPY, TMPFS_READ_SHARED, TMPFS_DEMAND_READ_SHARED };
+enum class FileMappingBackingMode : uint8_t { PRIVATE_COPY, TMPFS_READ_SHARED, TMPFS_DEMAND_READ_SHARED, TMPFS_DEMAND_WRITE_SHARED };
 
 // One family owns exactly one File reference, independent of its typed consumers.
 // The explicit readonly TMPFS mode also owns its fixed-EOF canonical backing.
@@ -113,6 +113,8 @@ class FileMappingLifetime {
     // accounted by the real executor even after the publishing Task is gone.
     [[nodiscard]] static auto prepare_demand_read_shared_tmpfs(ker::vfs::File& borrowed_file, uint64_t file_offset, uint64_t length,
                                                                int& error) -> FileMappingLifetime*;
+    [[nodiscard]] static auto prepare_demand_shared_tmpfs(ker::vfs::File& borrowed_file, uint64_t file_offset, uint64_t length,
+                                                          bool write_capable, int& error) -> FileMappingLifetime*;
     // Caller already owns/protects a live owner; a bare pointer cannot resurrect.
     [[nodiscard]] auto try_acquire(FamilyOwner role) noexcept -> bool;
     void release(FamilyOwner role) noexcept;
@@ -124,11 +126,18 @@ class FileMappingLifetime {
     [[nodiscard]] auto observe_return(RetirementCompletion& empty) noexcept -> bool;
     [[nodiscard]] auto file() const noexcept -> ker::vfs::File* { return file_; }
     [[nodiscard]] auto backing_mode() const noexcept -> FileMappingBackingMode { return backing_mode_; }
+    [[nodiscard]] auto is_demand_shared() const noexcept -> bool {
+        return backing_mode_ == FileMappingBackingMode::TMPFS_DEMAND_READ_SHARED ||
+               backing_mode_ == FileMappingBackingMode::TMPFS_DEMAND_WRITE_SHARED;
+    }
+    [[nodiscard]] auto shared_writable() const noexcept -> bool {
+        return backing_mode_ == FileMappingBackingMode::TMPFS_DEMAND_WRITE_SHARED;
+    }
     // Borrowed only while a real family/binding/installer owner is held.
     [[nodiscard]] auto read_shared_backing() const noexcept -> const ker::vfs::tmpfs::TmpfsReadSharedBacking* {
         return read_shared_backing_.get();
     }
-    [[nodiscard]] auto demand_read_shared_backing() const noexcept -> const ker::vfs::tmpfs::TmpfsDemandReadSharedBacking* {
+    [[nodiscard]] auto demand_read_shared_backing() const noexcept -> const ker::vfs::tmpfs::TmpfsDemandSharedBacking* {
         return demand_read_shared_backing_.get();
     }
 
@@ -146,7 +155,7 @@ class FileMappingLifetime {
     ker::vfs::File* file_{};
     FileMappingBackingMode backing_mode_{FileMappingBackingMode::PRIVATE_COPY};
     std::unique_ptr<ker::vfs::tmpfs::TmpfsReadSharedBacking> read_shared_backing_{};
-    std::unique_ptr<ker::vfs::tmpfs::TmpfsDemandReadSharedBacking> demand_read_shared_backing_{};
+    std::unique_ptr<ker::vfs::tmpfs::TmpfsDemandSharedBacking> demand_read_shared_backing_{};
 };
 
 class FileMappingIndex;

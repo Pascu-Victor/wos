@@ -1,5 +1,13 @@
 # WOS service compartment design
 
+Checkpoint59 adds canonical writable sharing for ordinary TMPFS-backed
+`MAP_SHARED` mappings. Normal and isolated diagnostic builds, formatting and
+18 selected Host checks pass. The first public writable probe passes on the
+earlier checkpoint59 build. Fresh Native92 and current-source public run03 pass
+after retained-requester cache fixes. Full reference
+drain, two-hour simultaneous services and 1,000 lifecycle/failure cycles remain
+unqualified. The dated checkpoint sections below retain their original scope.
+
 Goal39 is in progress. Profile preparation, private native SysV IPC namespace
 ownership/lookup, private native mount-table ownership, Task native lookup and
 subject mount administration are implemented. Checkpoint 32 added the experimental
@@ -2458,7 +2466,7 @@ and 1,000 full lifecycle/allocation-failure cycles remain required.
 
 Public shared READ/NONE mappings of regular TMPFS Files now retain a canonical
 inode, fixed EOF and mount owner, with demand page loans rather than a copied
-file cache. Current admission requires `O_NO_CACHE` and the strict retained
+file cache. Checkpoint58 admission requires `O_NO_CACHE` and the strict retained
 TMPFS mount graph used by the earlier backing. Unsupported cached or attached
 File state is refused before publication. This does not yet provide ordinary
 cached-File or writable shared mapping support. The public backing has no
@@ -2533,3 +2541,90 @@ writable shared mappings, full owner drains, two-hour simultaneous services and
 1,000 lifecycle/allocation-failure cycles remain required. Continue `--no-setup`,
 one topology, the 20GiB disposable budget, 40GiB free floor and exact-owned
 pruning after every outcome.
+
+## Checkpoint59: ordinary writable shared TMPFS mappings (2026-10-15)
+
+Public shared mappings of regular TMPFS Files use retained canonical page loans
+for read-only and writable capabilities. Ordinary cached descriptions and
+existing stream attachments are admitted through a separate checked mount-pin
+entry. Explicit always-cache/notification policies and executable views remain
+unsupported. Admission retains the actual inode, File and mount ownership; it
+does not reopen a pathname or derive authority from a later caller.
+
+An `O_RDONLY` description retains a read ceiling. A readable/writable
+description on an admitted writable mount may start READ/NONE and later gain
+WRITE. EXEC is refused. Unsupported selected operations fail before publication
+without falling back to copied RAW pages. Whole-binding protection and unmap
+remain supported; partial managed cuts, occupied replacement and remap remain
+unsupported. The backing retains fixed EOF without an arbitrary page-count cap.
+
+Independent families, fork bindings and ordinary file I/O share canonical
+frames. Fault preparation runs outside publication/root guards; installation
+revalidates the exact binding, root incarnation, mode, offset and prepared
+frame. Shared leaves remain NX and avoid private COW; READ/NONE transitions
+preserve hardware access/dirty bits. Removed frame references remain held
+through actual TLB acknowledgement. File, Task, 112-byte lazy-row and public
+syscall/wire layouts are unchanged.
+
+Writable admission permanently marks the canonical inode to bypass stale
+metadata, stream and copied-page caches. Other inodes retain caching. Retained
+stat/access and metadata mutations publish cache observations using their
+actual lookup authority. Legacy path-only positive regular-TMPFS cache access
+still misses without a current Task. Canonical inode/object identity and bypass
+validation finish outside cache IRQ locks; cached inode numbers never become
+owner pointers. Stream reads preserve positive prefixes when bypass starts
+during a read.
+
+Each write-capable family covering a partial EOF retains a real tail-page
+anchor before publication. The last such family zeros padding before dropping
+its anchor and EOF lease, including when non-tail writers remain. Final cleanup
+does not allocate or depend on a successful page-in. Metadata publication
+follows successful installation; failed installation does not falsely update
+timestamps. Typed `msync` validates the requested span/flags and updates
+canonical metadata without copying a file onto itself or claiming persistence.
+Actual File close returns before backing cleanup and family callback return.
+
+Normal Build WOS05, isolated fast KTEST04 compilation and all 18 registered
+Host regressions pass on current capture04. Three changed VFS paths pass the
+formatter/tidy check with its external cache disabled. The cache harness
+preserves all 18 earlier vectors and adds five retained-requester guard vectors,
+passing 23 cases and 282 assertions. The actual legacy store compiles and fails
+the new taskless retained-requester oracle as expected. These Host tests use
+explicit backend/lookup seams and do not qualify native execution.
+
+The earlier public writable run01 passes its five-role, 70-event protocol,
+including ordinary cached-file coherence, independent RW/RO mappings,
+READ/NONE/RW transitions, shared futex WAIT/WAKE, fork/exec and EOF-tail behavior.
+All nine reports total 58,432 bytes; the original init-exit witness validates.
+Its four disposable images are pruned and its real-host postcheck verifies
+zero disposable allocation, absent owned processes/sockets and the protected
+VM and original shared guard unchanged. This earlier public run does not
+qualify the later cache-store repair or complete global reference drainage.
+
+Native90 fails two stale cache fixtures; their owner-corrected replacements
+pass in Native91. Native91 then reports 14 assertions across ten VFS cases.
+The repair preserves retained requester authority and meaningful cache-hit,
+timestamp-prefill, symlink-elision and real-inode fixture oracles. Both failed
+runs retain their failure status; cleanup and independent real-host postchecks
+verify zero disposable allocation after each. Fresh Native92 passes all 1,463
+enabled tests, 212 mandatory cases and 113,977 assertions with zero failures.
+Natural shutdown and launcher exit0 are observed; all five prepared and five
+stopped payloads validate. Its four disposable images are pruned, and the
+separate real-host postcheck verifies zero allocation, absent owned processes
+and sockets, the protected VM unchanged and original guard39:197 preserved.
+Current-source public run03 also passes all 70 events and nine reports
+(58,432 bytes), including shared futex exchange and the original init-reap
+witness. All 13 prepared and 13 stopped artifact readbacks validate. The VM
+interval is 10.187 seconds and the outer command takes 49.297 seconds; the
+observer stops the exact owned VM through QMP after completion. All four
+disposable images are pruned. Its separate real-host postcheck verifies zero
+images/allocation, absent owned processes and sockets, and the protected VM
+and original guard unchanged. These checks cover the combined local workspace;
+all 22 pre-existing user paths remain byte-identical. Full reference drainage
+is not qualified by the public protocol.
+
+Goal39 remains ACTIVE with all ten full criteria open. Continue rootless
+`--no-setup`, one topology, the 20GiB disposable budget, 40GiB free floor and
+exact-owned pruning after successful and failed runs. Two-hour services,
+1,000 complete lifecycle/failure cycles and complete owner-drain evidence
+remain required.

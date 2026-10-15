@@ -67,6 +67,12 @@ VECTORS = (
     "demand_cold_extent", "demand_resident_loans", "demand_sparse_high_offset",
     "demand_swapped_page", "demand_page_failures", "demand_admission_failures",
     "demand_fixed_eof_guards", "demand_unlinked_cleanup",
+    "shared_ordinary_admission", "shared_independent_writes", "shared_tail_nontail",
+    "shared_multiple_tail", "shared_tail_swapped", "shared_tail_failures",
+    "shared_counter_limits", "shared_access_refusals", "shared_sync_metadata",
+    "shared_reverse_exec", "shared_file_cache_authority", "shared_lookup_cache_authority",
+    "shared_unlinked_tail_cleanup",
+    "shared_staging_metadata_rollback",
 )
 
 LOCKS = r'''
@@ -153,7 +159,8 @@ const char* current_case = "initialization";
 uint64_t assertions{}, failures{}, allocations{}, frees{}, increments{}, decrements{}, direct_free_refused{};
 uint64_t slot_allocations{}, slot_frees{}, slot_writes{}, slot_reads{};
 bool allocation_failure{}, available = true;
-bool ref_failure{}, host_interrupts_enabled = true;
+bool ref_failure{}, backing_alloc_failure{}, host_interrupts_enabled = true;
+uint64_t backing_allocation_faults{};
 uint32_t host_preempt_count{};
 uint64_t mount_pins{}, mount_acquires{}, mount_releases{};
 int mount_acquire_error{};
@@ -221,6 +228,15 @@ auto operator new[](size_t bytes, const std::nothrow_t&) noexcept -> void* {
 }
 void operator delete[](void* memory, const std::nothrow_t&) noexcept { ::operator delete[](memory); }
 
+// Only the actual backing's nothrow scalar allocation has a scoped Host fault.
+auto operator new(size_t bytes, const std::nothrow_t&) noexcept -> void* {
+    if(fixture::backing_alloc_failure && bytes==sizeof(ker::vfs::tmpfs::TmpfsDemandSharedBacking)) {
+        fixture::backing_alloc_failure=false;++fixture::backing_allocation_faults;return nullptr;
+    }
+    try { return ::operator new(bytes); } catch(const std::bad_alloc&) { return nullptr; }
+}
+void operator delete(void* memory,const std::nothrow_t&) noexcept { ::operator delete(memory); }
+
 // Host File identity/table and FileGrowth ownership are primitive boundaries.
 // Real File layout, Task credentials/resource ownership and native close are
 // not qualified by this facade. Native tests use actual retained Files.
@@ -230,11 +246,13 @@ struct HostFileCount {
     int value{1};
     auto load(std::memory_order = std::memory_order_seq_cst) const -> int {return value;}
     void store(int next,std::memory_order = std::memory_order_seq_cst){value=next;}
+    auto operator=(int next)->HostFileCount&{value=next;return *this;}
 };
 struct File {
     void* private_data{}; FileOperations* fops{}; int open_flags{2}; FSType fs_type{FSType::TMPFS};
     HostFileCount refcount{}; bool is_directory{}; MountPoint* mount_owner{};
-    ExecReadView* exec_read_view{}; void* stream_cache_attachment{}; void* cache_notify_attachment{};
+    std::unique_ptr<ExecReadView> exec_read_view{}; void* stream_cache_attachment{}; void* cache_notify_attachment{};
+    MountPolicy mount_policy{};uint32_t mount_dev_id{};int fd{-1};
 };
 namespace tmpfs { auto get_tmpfs_fops() -> FileOperations*; }
 // Named checked mount-pin primitive, not the actual mount table/graph validator.
@@ -251,6 +269,9 @@ auto NativeFileMappingMountPin::acquire_tmpfs(File& file,const void* context,Nat
     if(!out.empty() || file.mount_owner==nullptr || file.mount_owner->private_data!=context)return -EOPNOTSUPP;
     if(file.mount_owner->pins==UINT32_MAX)return -EOVERFLOW;
     ++file.mount_owner->pins;++fixture::mount_pins;out.mount_=file.mount_owner;return 0;
+}
+auto NativeFileMappingMountPin::acquire_tmpfs_demand(File& file,const void* context,NativeFileMappingMountPin& out)->int {
+    return acquire_tmpfs(file,context,out);
 }
 void NativeFileMappingMountPin::reset() noexcept {
     if(mount_==nullptr)return;
@@ -925,13 +946,13 @@ struct Demand {
     Node inode;
     ker::vfs::MountPoint mounted{.private_data=&inode.mount};
     ker::vfs::File file;
-    std::unique_ptr<TmpfsDemandReadSharedBacking> backing;
+    std::unique_ptr<TmpfsDemandSharedBacking> backing;
     Demand() {
         file.private_data=inode.node;file.fops=get_tmpfs_fops();
         file.open_flags=ker::vfs::O_NO_CACHE;file.mount_owner=&mounted;
     }
     void prepare(uint64_t offset,uint64_t length) {
-        CHECK(TmpfsDemandReadSharedBacking::prepare(file,offset,length,backing)==0 && backing);
+        CHECK(TmpfsDemandSharedBacking::prepare(file,offset,length,backing)==0 && backing);
         CHECK(inode.node->lookup_ref_count.load()==1 && inode.node->read_shared_eof_leases==1);
         CHECK(mounted.pins==1 && mount_pins==1);
     }
@@ -1003,29 +1024,29 @@ void demand_page_failures() {
 void demand_admission_failures() {
     Demand f;f.inode.node->size=BS;
     auto denied=[&](int expected){
-        CHECK(TmpfsDemandReadSharedBacking::prepare(f.file,0,2*BS,f.backing)==expected && !f.backing);
+        CHECK(TmpfsDemandSharedBacking::prepare(f.file,0,2*BS,f.backing)==expected && !f.backing);
         CHECK(f.inode.node->lookup_ref_count.load()==0 && f.inode.node->read_shared_eof_leases==0 && mount_pins==0);
     };
-    f.file.open_flags=0;denied(-EOPNOTSUPP);f.file.open_flags=ker::vfs::O_NO_CACHE|1;denied(-EBADF);
+    f.file.open_flags=ker::vfs::O_ALWAYS_CACHE;denied(-EOPNOTSUPP);f.file.open_flags=ker::vfs::O_NO_CACHE|1;denied(-EBADF);
     f.file.open_flags=ker::vfs::O_NO_CACHE;f.file.refcount.store(0);denied(-EBADF);f.file.refcount.store(1);
-    f.file.stream_cache_attachment=&f;denied(-EOPNOTSUPP);f.file.stream_cache_attachment=nullptr;
+    f.file.cache_notify_attachment=&f;denied(-EOPNOTSUPP);f.file.cache_notify_attachment=nullptr;
     f.file.mount_owner=nullptr;denied(-EOPNOTSUPP);f.file.mount_owner=&f.mounted;
-    ker::vfs::ExecReadView view;f.file.exec_read_view=&view;denied(-ETXTBSY);f.file.exec_read_view=nullptr;
+    f.file.exec_read_view.reset(new ker::vfs::ExecReadView{});denied(-ETXTBSY);f.file.exec_read_view.reset();
     f.inode.node->exec_content.readers=1;denied(-ETXTBSY);f.inode.node->exec_content.readers=0;
     f.inode.node->lookup_ref_count.store(UINT32_MAX);
-    CHECK(TmpfsDemandReadSharedBacking::prepare(f.file,0,BS,f.backing)==-EOVERFLOW && !f.backing);
+    CHECK(TmpfsDemandSharedBacking::prepare(f.file,0,BS,f.backing)==-EOVERFLOW && !f.backing);
     CHECK(f.inode.node->lookup_ref_count.load()==UINT32_MAX && mount_pins==0);f.inode.node->lookup_ref_count.store(0);
     f.inode.node->read_shared_eof_leases=UINT64_MAX;
-    CHECK(TmpfsDemandReadSharedBacking::prepare(f.file,0,BS,f.backing)==-EOVERFLOW && !f.backing);
+    CHECK(TmpfsDemandSharedBacking::prepare(f.file,0,BS,f.backing)==-EOVERFLOW && !f.backing);
     CHECK(f.inode.node->read_shared_eof_leases==UINT64_MAX && f.inode.node->lookup_ref_count.load()==0 && mount_pins==0);
     f.inode.node->read_shared_eof_leases=0;mount_acquire_error=-EAGAIN;denied(-EAGAIN);mount_acquire_error=0;
     host_interrupts_enabled=false;denied(-EWOULDBLOCK);host_interrupts_enabled=true;
     host_preempt_count=1;denied(-EWOULDBLOCK);host_preempt_count=0;
-    CHECK(TmpfsDemandReadSharedBacking::prepare(f.file,1,BS,f.backing)==-EINVAL);
-    CHECK(TmpfsDemandReadSharedBacking::prepare(f.file,0,0,f.backing)==-EINVAL);
-    CHECK(TmpfsDemandReadSharedBacking::prepare(f.file,INT64_MAX-4095,2*BS,f.backing)==-EINVAL);
+    CHECK(TmpfsDemandSharedBacking::prepare(f.file,1,BS,f.backing)==-EINVAL);
+    CHECK(TmpfsDemandSharedBacking::prepare(f.file,0,0,f.backing)==-EINVAL);
+    CHECK(TmpfsDemandSharedBacking::prepare(f.file,INT64_MAX-4095,2*BS,f.backing)==-EINVAL);
     f.prepare(0,2*BS);TmpfsPageLoan loan;CHECK(f.backing->prepare_page(BS,loan)==-EFAULT && !loan.frame());
-    auto* old=f.backing.get();CHECK(TmpfsDemandReadSharedBacking::prepare(f.file,0,BS,f.backing)==-EINVAL && f.backing.get()==old);
+    auto* old=f.backing.get();CHECK(TmpfsDemandSharedBacking::prepare(f.file,0,BS,f.backing)==-EINVAL && f.backing.get()==old);
     CHECK(allocations==0 && arrays.empty() && slot_reads==0 && slot_writes==0);
 }
 void demand_fixed_eof_guards() {
@@ -1048,6 +1069,230 @@ void demand_unlinked_cleanup() {
     f.inode.dispose();CHECK(frames.size()==1 && f.inode.mount.used_bytes==BS && mount_pins==1);
     f.backing.reset();CHECK(frames.empty() && f.inode.mount.used_bytes==0 && tmpfs_nodes.size()==0 && mount_pins==0);
     CHECK(mount_acquires==mount_releases && invalid_unlock==0 && destroy_held==0);
+}
+auto shared_prepare(Demand& f,uint64_t offset,uint64_t length)->std::unique_ptr<TmpfsDemandSharedBacking> {
+    std::unique_ptr<TmpfsDemandSharedBacking> out;
+    CHECK(TmpfsDemandSharedBacking::prepare(f.file,offset,length,true,out)==0 && out);
+    CHECK(out && out->writable() && out->eof()==f.inode.node->size);
+    return out;
+}
+void shared_ordinary_admission() {
+    Demand f;f.inode.node->size=2*BS;f.file.open_flags=0;f.file.stream_cache_attachment=&f;
+    auto before=tmpfs_file_cache_authority(f.file);
+    CHECK(!before.bypass && before.inode==reinterpret_cast<uintptr_t>(f.inode.node));
+    f.prepare(0,2*BS);CHECK(!f.backing->writable() && f.file.open_flags==0 && f.file.stream_cache_attachment==&f);
+    CHECK(f.inode.node->mapped_writer_families==0 && f.inode.node->tail_writer_families==0);
+    f.backing.reset();CHECK(!tmpfs_file_cache_authority(f.file).bypass);
+    f.file.open_flags=2;f.backing=shared_prepare(f,0,2*BS);
+    CHECK(f.file.open_flags==2 && f.file.stream_cache_attachment==&f && f.inode.node->exec_content.direct_writers==0);
+    CHECK(f.inode.node->mapped_writer_families==1 && f.inode.node->tail_writer_families==0);
+    auto marked=tmpfs_file_cache_authority(f.file);
+    CHECK(marked.bypass && marked.inode==before.inode && marked.object_identity==before.object_identity);
+    f.backing.reset();CHECK(f.inode.node->mapped_writer_families==0 && f.inode.node->read_shared_eof_leases==0);
+    CHECK(tmpfs_file_cache_authority(f.file).bypass);
+}
+void shared_independent_writes() {
+    Demand f;f.inode.node->size=2*BS+17;f.file.open_flags=2;
+    f.backing=shared_prepare(f,0,BS);auto peer=shared_prepare(f,0,BS);
+    TmpfsPageLoan first,second;CHECK(f.backing->prepare_page(0,first)==0 && peer->prepare_page(0,second)==0);
+    CHECK(first.frame()==second.frame() && refs(first.frame())==3 && first.object_identity()==second.object_identity());
+    static_cast<unsigned char*>(first.frame())[27]=0x73;
+    CHECK(static_cast<unsigned char*>(second.frame())[27]==0x73);
+    std::array<unsigned char,3> bytes{0x91,0x57,0x33};
+    CHECK(tmpfs_write(&f.file,bytes.data(),bytes.size(),26)==3);
+    CHECK(std::memcmp(static_cast<unsigned char*>(second.frame())+26,bytes.data(),bytes.size())==0);
+    CHECK(tmpfs_write(&f.file,bytes.data(),bytes.size(),f.inode.node->size)==-EBUSY);
+    CHECK(f.inode.node->mapped_writer_families==2 && f.inode.node->tail_writer_families==0);
+    CHECK(f.inode.node->exec_content.direct_writers==0);
+    second.reset();first.reset();peer.reset();f.backing.reset();
+    CHECK(f.inode.node->mapped_writer_families==0 && f.inode.node->read_shared_eof_leases==0);
+}
+void shared_tail_nontail() {
+    Demand f;f.inode.node->size=BS+13;f.file.open_flags=2;
+    f.backing=shared_prepare(f,BS,BS);auto nontail=shared_prepare(f,0,BS);
+    void* tail=f.inode.node->pages[1].data;CHECK(refs(tail)==2 && f.inode.node->tail_writer_families==1);
+    TmpfsPageLoan writer;CHECK(f.backing->prepare_page(BS,writer)==0 && writer.frame()==tail);
+    auto* bytes=static_cast<unsigned char*>(writer.frame());std::memset(bytes,0x62,BS);writer.reset();
+    auto slots_before=slot_allocations;{ker::mod::sys::MutexGuard guard(f.inode.node->io_lock);CHECK(evict_page_locked(f.inode.node,1)==-EAGAIN);}
+    CHECK(slot_allocations==slots_before);f.backing.reset();
+    CHECK(f.inode.node->mapped_writer_families==1 && f.inode.node->tail_writer_families==0 && refs(tail)==1);
+    for(size_t i=0;i<BS;++i)CHECK(bytes[i]==(i<13?0x62:0));
+    {ker::mod::sys::MutexGuard guard(f.inode.node->io_lock);CHECK(evict_page_locked(f.inode.node,1)==0);}
+    CHECK(f.inode.node->pages[1].state==TmpPageState::SWAPPED);
+    nontail.reset();CHECK(truncate(f.file,BS+100)==0);
+    {ker::mod::sys::MutexGuard guard(f.inode.node->io_lock);TmpPage* page=nullptr;CHECK(ensure_page_resident_locked(f.inode.node,1,&page)==0);
+     for(size_t i=13;i<BS;++i)CHECK(static_cast<unsigned char*>(page->data)[i]==0);}
+}
+void shared_multiple_tail() {
+    Demand f;f.inode.node->size=19;f.file.open_flags=2;
+    f.backing=shared_prepare(f,0,BS);auto peer=shared_prepare(f,0,BS);void* tail=f.inode.node->pages[0].data;
+    CHECK(refs(tail)==3 && f.inode.node->tail_writer_families==2);std::memset(tail,0x68,BS);
+    f.backing.reset();CHECK(refs(tail)==2 && f.inode.node->tail_writer_families==1);
+    CHECK(static_cast<unsigned char*>(tail)[20]==0x68);
+    auto a=allocations,arr=array_allocations,reads=slot_reads,writes=slot_writes,slots_before=slot_allocations;
+    allocation_failure=true;ref_failure=true;slot_read_error=-EIO;slot_write_error=-EIO;
+    peer.reset();allocation_failure=false;ref_failure=false;slot_read_error=slot_write_error=0;
+    CHECK(refs(tail)==1 && f.inode.node->tail_writer_families==0 && f.inode.node->mapped_writer_families==0);
+    CHECK(allocations==a && array_allocations==arr && slot_reads==reads && slot_writes==writes && slot_allocations==slots_before);
+    for(size_t i=0;i<BS;++i)CHECK(static_cast<unsigned char*>(tail)[i]==(i<19?0x68:0));
+}
+void shared_tail_swapped() {
+    Demand f;f.inode.node->size=BS+7;f.file.open_flags=2;f.inode.page(1,0x5a);
+    {ker::mod::sys::MutexGuard guard(f.inode.node->io_lock);CHECK(evict_page_locked(f.inode.node,1)==0);}
+    CHECK(frames.empty() && slots.size()==1);f.backing=shared_prepare(f,BS,BS);
+    void* frame=f.inode.node->pages[1].data;CHECK(slots.empty() && refs(frame)==2 && f.inode.node->tail_writer_families==1);
+    verify_bytes(frame,0x5a);f.backing.reset();
+    for(size_t i=7;i<BS;++i)CHECK(static_cast<unsigned char*>(frame)[i]==0);
+}
+void shared_tail_failures() {
+    for(unsigned kind=0;kind<7;++kind) {
+        Demand f;f.inode.node->size=BS+7;f.file.open_flags=2;
+        if(kind>=5){f.inode.page(1,0x48);ker::mod::sys::MutexGuard guard(f.inode.node->io_lock);CHECK(evict_page_locked(f.inode.node,1)==0);}
+        if(kind==0)backing_alloc_failure=true;
+        if(kind==1){fail_array_bytes=2*sizeof(TmpPage);fail_array_armed=true;}
+        if(kind==2)allocation_failure=true;
+        if(kind==3)f.inode.mount.max_bytes=BS-1;
+        if(kind==4)ref_failure=true;
+        if(kind==5)slot_read_error=-EIO;
+        if(kind==6)slot_free_error=-EIO;
+        int expected=kind<=1?-ENOMEM:kind<=3?-ENOSPC:kind==4?-EOVERFLOW:-EIO;
+        CHECK(TmpfsDemandSharedBacking::prepare(f.file,BS,BS,true,f.backing)==expected && !f.backing);
+        backing_alloc_failure=fail_array_armed=allocation_failure=ref_failure=false;slot_read_error=slot_free_error=0;
+        CHECK(f.inode.node->lookup_ref_count.load()==0 && f.inode.node->read_shared_eof_leases==0);
+        CHECK(f.inode.node->mapped_writer_families==0 && f.inode.node->tail_writer_families==0 && mount_pins==0);
+        CHECK(!tmpfs_file_cache_authority(f.file).bypass && f.inode.node->size==BS+7);
+        if(kind==4)CHECK(f.inode.node->charged_pages==1 && refs(f.inode.node->pages[1].data)==1);
+        if(kind>=5)CHECK(f.inode.node->pages[1].state==TmpPageState::SWAPPED && slots.size()==1 && frames.empty());
+    }
+    CHECK(backing_allocation_faults==1);
+}
+void shared_counter_limits() {
+    Demand f;f.inode.node->size=7;f.file.open_flags=2;
+    for(unsigned which=0;which<4;++which) {
+        f.inode.node->read_shared_eof_leases=which==0?UINT64_MAX:0;
+        f.inode.node->mapped_writer_families=which==1||which==2?UINT64_MAX:0;
+        f.inode.node->tail_writer_families=which==2?UINT64_MAX:which==3?1:0;
+        CHECK(TmpfsDemandSharedBacking::prepare(f.file,0,BS,true,f.backing)==(which==3?-EIO:-EOVERFLOW) && !f.backing);
+        CHECK(allocations==0 && arrays.empty() && mount_pins==0 && !tmpfs_file_cache_authority(f.file).bypass);
+    }
+    f.inode.node->tail_writer_families=0;f.inode.node->size=BS;
+    f.inode.node->read_shared_eof_leases=UINT64_MAX-1;f.inode.node->mapped_writer_families=UINT64_MAX-1;
+    f.backing=shared_prepare(f,0,BS);
+    CHECK(f.inode.node->read_shared_eof_leases==UINT64_MAX && f.inode.node->mapped_writer_families==UINT64_MAX);
+    f.backing.reset();CHECK(f.inode.node->read_shared_eof_leases==UINT64_MAX-1 && f.inode.node->mapped_writer_families==UINT64_MAX-1);
+    // Restore only this owned Host counter-limit input, after the real owner drained.
+    f.inode.node->read_shared_eof_leases=f.inode.node->mapped_writer_families=0;
+}
+void shared_access_refusals() {
+    Demand f;f.inode.node->size=BS;
+    auto denied=[&](int expected){CHECK(TmpfsDemandSharedBacking::prepare(f.file,0,BS,true,f.backing)==expected && !f.backing);
+        CHECK(f.inode.node->lookup_ref_count.load()==0 && f.inode.node->read_shared_eof_leases==0 && mount_pins==0);};
+    f.file.open_flags=0;denied(-EACCES);f.file.open_flags=1;denied(-EBADF);
+    f.file.open_flags=2;f.file.mount_policy.read_only=true;denied(-EROFS);f.file.mount_policy.read_only=false;
+    f.inode.node->exec_content.readers=1;denied(-ETXTBSY);f.inode.node->exec_content.readers=0;
+    f.file.open_flags=2|ker::vfs::O_ALWAYS_CACHE;denied(-EOPNOTSUPP);
+    f.file.open_flags=2|ker::vfs::O_NOTIFY_CACHE_CHANGE;denied(-EOPNOTSUPP);
+    f.file.open_flags=0;f.file.mount_policy.read_only=true;f.prepare(0,BS);CHECK(!f.backing->writable());
+    CHECK(f.backing->sync_metadata()==0 && !tmpfs_file_cache_authority(f.file).bypass);
+}
+void shared_sync_metadata() {
+    Demand f;f.inode.node->size=BS;f.file.open_flags=2;f.backing=shared_prepare(f,0,BS);
+    auto epoch=epoch_ns;auto a=allocations,arr=array_allocations,reads=slot_reads;
+    ker::vfs::coherency::Stamp before{},after{};CHECK(f.inode.node->coherency.snapshot(before));
+    CHECK(f.backing->sync_metadata()==0 && epoch_ns>epoch && f.inode.node->mtime.tv_nsec==epoch_ns%1000000000ULL);
+    CHECK(f.inode.node->coherency.snapshot(after) && after.content>before.content && after.metadata>before.metadata);
+    epoch=epoch_ns;host_interrupts_enabled=false;CHECK(f.backing->sync_metadata()==-EWOULDBLOCK);host_interrupts_enabled=true;
+    host_preempt_count=1;CHECK(f.backing->sync_metadata()==-EWOULDBLOCK);host_preempt_count=0;
+    CHECK(epoch_ns==epoch && allocations==a && array_allocations==arr && slot_reads==reads);
+}
+void shared_reverse_exec() {
+    Demand f;f.inode.node->size=BS;f.file.open_flags=2;f.backing=shared_prepare(f,0,BS);
+    ker::vfs::File* output=&f.file;CHECK(tmpfs_clone_exec_file(&f.file,&output)==-ETXTBSY && output==&f.file);
+    f.backing.reset();f.prepare(0,BS);CHECK(tmpfs_clone_exec_file(&f.file,&output)==-ETXTBSY && output==&f.file);
+    f.backing.reset();output=nullptr;CHECK(tmpfs_clone_exec_file(&f.file,&output)==0 && output!=nullptr);
+    CHECK(f.inode.node->exec_content.readers==1 && f.inode.node->open_count.load()==1);
+    CHECK(TmpfsDemandSharedBacking::prepare(f.file,0,BS,true,f.backing)==-ETXTBSY && !f.backing);
+    CHECK(tmpfs_fops_close(output)==0);delete output;
+    CHECK(f.inode.node->exec_content.readers==0 && f.inode.node->open_count.load()==0);
+}
+void shared_file_cache_authority() {
+    Demand f;f.inode.node->size=BS;auto expected=tmpfs_file_cache_authority(f.file);
+    CHECK(!expected.bypass && expected.object_identity==f.inode.node->coherency.identity());
+    {ker::mod::sys::MutexGuard tree(tmpfs_lock);ker::mod::sys::MutexGuard io(f.inode.node->io_lock);
+     auto value=tmpfs_file_cache_authority(f.file);CHECK(value.inode==expected.inode && value.object_identity==expected.object_identity);}
+    f.file.private_data=nullptr;CHECK(tmpfs_file_cache_authority(f.file).bypass);f.file.private_data=f.inode.node;
+    f.file.fs_type=ker::vfs::FSType::FAT32;CHECK(!tmpfs_file_cache_authority(f.file).bypass);f.file.fs_type=ker::vfs::FSType::TMPFS;
+    ker::vfs::FileOperations unrelated{};f.file.fops=&unrelated;CHECK(tmpfs_file_cache_authority(f.file).object_identity==0);f.file.fops=get_tmpfs_fops();
+    f.file.open_flags=2;f.backing=shared_prepare(f,0,BS);CHECK(tmpfs_file_cache_authority(f.file).bypass);
+    f.backing.reset();CHECK(tmpfs_file_cache_authority(f.file).bypass && f.inode.node->mapped_writer_families==0);
+    // Final public-ref release transfers exclusive File ownership to close;
+    // zero public refs do not invalidate the still-owned backend association.
+    // The Host File facade supplies this transition, then actual TMPFS close
+    // consumes its real backend open owner. No native VFS close claim is made.
+    Demand closing;closing.inode.node->open_count.store(1);
+    struct HostExclusiveCloseOwner {
+        ker::vfs::File& file;
+        explicit HostExclusiveCloseOwner(ker::vfs::File& owned):file(owned) {
+            CHECK(file.refcount.load()==1);file.refcount.store(0);
+        }
+        ~HostExclusiveCloseOwner(){CHECK(tmpfs_fops_close(&file)==0);}
+    };
+    {
+        HostExclusiveCloseOwner owner(closing.file);
+        auto authority=tmpfs_file_cache_authority(closing.file);
+        CHECK(!authority.bypass && authority.inode==reinterpret_cast<uintptr_t>(closing.inode.node));
+        CHECK(authority.object_identity==closing.inode.node->coherency.identity());
+        CHECK(closing.inode.node->open_count.load()==1 && closing.file.private_data==closing.inode.node);
+    }
+    CHECK(closing.file.private_data==nullptr && closing.inode.node->open_count.load()==0);
+}
+void shared_lookup_cache_authority() {
+    Node root,alias,canonical;root.node->type=TmpNodeType::DIRECTORY;root.node->mode=0755;
+    alias.node->hardlink_target=canonical.node;std::memcpy(alias.node->name.data(),"alias",6);
+    root.node->children=new TmpNode*[1]{alias.node};root.node->children_count=1;
+    ker::mod::security::Snapshot credentials{};TmpfsLookupHandle handle;
+    CHECK(tmpfs_acquire_lookup(credentials,root.node,"alias",&handle)==0);
+    TmpfsCacheAuthority value{};CHECK(tmpfs_lookup_cache_authority(handle,value)==0);
+    CHECK(!value.bypass && value.inode==reinterpret_cast<uintptr_t>(canonical.node) && value.object_identity==canonical.node->coherency.identity());
+    canonical.node->mutable_mapping_cache_bypass.store(true);CHECK(tmpfs_lookup_cache_authority(handle,value)==0 && value.bypass);
+    ++root.node->directory_generation;TmpfsCacheAuthority sentinel{true,11,12};value=sentinel;
+    CHECK(tmpfs_lookup_cache_authority(handle,value)==-EAGAIN && value.bypass && value.inode==11 && value.object_identity==12);
+    handle=TmpfsLookupHandle{};TmpfsLookupHandle missing;
+    CHECK(tmpfs_acquire_lookup(credentials,root.node,"missing",&missing)==0);
+    CHECK(tmpfs_lookup_cache_authority(missing,value)==-ENOENT && value.inode==11 && value.object_identity==12);
+    missing=TmpfsLookupHandle{};root.node->children[0]=nullptr;alias.node->hardlink_target=nullptr;
+    CHECK(alias.node->lookup_ref_count.load()==0 && canonical.node->lookup_ref_count.load()==0);
+}
+void shared_unlinked_tail_cleanup() {
+    Demand f;f.inode.node->size=7;f.file.open_flags=2;f.backing=shared_prepare(f,0,BS);
+    f.inode.node->unlinked=true;f.inode.node->link_count.store(0);f.mounted.require_frames_empty=true;
+    f.inode.dispose();CHECK(frames.size()==1 && mount_pins==1);
+    f.backing.reset();CHECK(frames.empty() && tmpfs_nodes.size()==0 && f.inode.mount.used_bytes==0 && mount_pins==0);
+}
+void shared_staging_metadata_rollback() {
+    for(bool resident:{false,true}) {
+        Demand f;f.file.open_flags=2;CHECK(truncate(f.file,BS+73)==0);
+        std::array<unsigned char,73> prefix{};
+        if(resident){prefix.fill(0x46);CHECK(tmpfs_write(&f.file,prefix.data(),prefix.size(),BS)==73);}
+        auto mtime=f.inode.node->mtime,ctime=f.inode.node->ctime;auto epoch=epoch_ns;
+        auto same_times=[&](){return f.inode.node->mtime.tv_sec==mtime.tv_sec && f.inode.node->mtime.tv_nsec==mtime.tv_nsec &&
+            f.inode.node->ctime.tv_sec==ctime.tv_sec && f.inode.node->ctime.tv_nsec==ctime.tv_nsec;};
+        // Real backend staging succeeds, but no VM publication/sync occurs.
+        // Caller abandonment must keep ordinary visible metadata unchanged.
+        f.backing=shared_prepare(f,BS,BS);TmpfsPageLoan staged;
+        CHECK(f.backing->prepare_page(BS,staged)==0 && same_times() && epoch_ns==epoch);
+        void* frame=staged.frame();staged.reset();f.backing.reset();
+        CHECK(same_times() && epoch_ns==epoch && f.inode.node->size==BS+73);
+        CHECK(f.inode.node->read_shared_eof_leases==0 && f.inode.node->mapped_writer_families==0 && f.inode.node->tail_writer_families==0);
+        CHECK(f.inode.node->lookup_ref_count.load()==0 && mount_pins==0 && refs(frame)==1);
+        CHECK(tmpfs_file_cache_authority(f.file).bypass && std::memcmp(frame,prefix.data(),prefix.size())==0);
+        for(size_t i=73;i<BS;++i)CHECK(static_cast<unsigned char*>(frame)[i]==0);
+        // Explicit post-publication metadata sync is the positive contrast;
+        // this Host call models only the caller boundary, never a VM commit.
+        f.backing=shared_prepare(f,BS,BS);CHECK(same_times() && epoch_ns==epoch);
+        CHECK(f.backing->sync_metadata()==0 && epoch_ns>epoch && !same_times());
+        auto synced=epoch_ns;f.backing.reset();CHECK(epoch_ns>synced);
+    }
 }
 #endif
 }
@@ -1103,6 +1348,20 @@ int main(int argc, char** argv) {
     else if (name == "demand_admission_failures") demand_admission_failures();
     else if (name == "demand_fixed_eof_guards") demand_fixed_eof_guards();
     else if (name == "demand_unlinked_cleanup") demand_unlinked_cleanup();
+    else if (name == "shared_ordinary_admission") shared_ordinary_admission();
+    else if (name == "shared_independent_writes") shared_independent_writes();
+    else if (name == "shared_tail_nontail") shared_tail_nontail();
+    else if (name == "shared_multiple_tail") shared_multiple_tail();
+    else if (name == "shared_tail_swapped") shared_tail_swapped();
+    else if (name == "shared_tail_failures") shared_tail_failures();
+    else if (name == "shared_counter_limits") shared_counter_limits();
+    else if (name == "shared_access_refusals") shared_access_refusals();
+    else if (name == "shared_sync_metadata") shared_sync_metadata();
+    else if (name == "shared_reverse_exec") shared_reverse_exec();
+    else if (name == "shared_file_cache_authority") shared_file_cache_authority();
+    else if (name == "shared_lookup_cache_authority") shared_lookup_cache_authority();
+    else if (name == "shared_unlinked_tail_cleanup") shared_unlinked_tail_cleanup();
+    else if (name == "shared_staging_metadata_rollback") shared_staging_metadata_rollback();
 #endif
     else return 2;
     empty_baseline();
@@ -1151,10 +1410,10 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
     for path, namespace, anchors in (
         (KERN / "platform/mm/page_alloc.hpp", "ker::mod::mm", ["enum class PhysicalPageOwner : uint8_t {"]),
         (KERN / "platform/mm/swap.hpp", "ker::mod::mm::swap", ["struct SwapSlot {", "constexpr auto invalid_slot()", "constexpr auto slot_valid("]),
-        (KERN / "vfs/file.hpp", "ker::vfs", ["enum class FSType : uint8_t {"]),
+        (KERN / "vfs/file.hpp", "ker::vfs", ["enum class FSType : uint8_t {", "struct MountPolicy {"]),
         (KERN / "vfs/mount.hpp", "ker::vfs", ["class NativeFileMappingMountPin {"]),
         (KERN / "platform/security/file_policy.hpp", "ker::mod::security", ["struct FileIdentity {"]),
-        (HEADER, "ker::vfs::tmpfs", ["enum class TmpNodeType : uint8_t {", "enum class TmpPageState : uint8_t {", "struct TmpPage {", "struct TmpNode {", "struct TmpfsMount {", "class TmpfsNodeRef {", "class TmpfsPageLoan {", "class TmpfsDemandReadSharedBacking {", "class TmpfsLookupHandle {", "struct TmpfsResizeDescriptorObservation {"]),
+        (HEADER, "ker::vfs::tmpfs", ["enum class TmpNodeType : uint8_t {", "enum class TmpPageState : uint8_t {", "struct TmpPage {", "struct TmpNode {", "struct TmpfsMount {", "class TmpfsNodeRef {", "class TmpfsPageLoan {", "class TmpfsDemandSharedBacking {", "class TmpfsLookupHandle {", "struct TmpfsCacheAuthority {", "struct TmpfsObjectMetadata {", "struct TmpfsResizeDescriptorObservation {"]),
     ):
         text = path.read_text()
         types.append(f"namespace {namespace} {{\n")
@@ -1238,12 +1497,17 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
         actual.append({"source": str(selected), **row})
         chunks.append(f'#line {row["line"]} "actual-selected-tmpfs.cpp"\n' + body + "\n")
     chunks.append("auto get_tmpfs_fops() -> FileOperations* { static FileOperations table{}; table.vfs_truncate=tmpfs_fops_truncate; return &table; }\n")
-    current_demand = "auto TmpfsDemandReadSharedBacking::prepare(" in source
+    current_demand = "auto TmpfsDemandSharedBacking::prepare(" in source
     if current_demand:
         for anchor in ("TmpfsPageLoan::TmpfsPageLoan(", "auto TmpfsPageLoan::operator=(", "TmpfsPageLoan::~TmpfsPageLoan(",
                        "auto TmpfsPageLoan::release_to_pte(", "void TmpfsPageLoan::reset(",
-                       "TmpfsDemandReadSharedBacking::~TmpfsDemandReadSharedBacking(",
-                       "auto TmpfsDemandReadSharedBacking::prepare(", "auto TmpfsDemandReadSharedBacking::prepare_page("):
+                       "TmpfsDemandSharedBacking::~TmpfsDemandSharedBacking(",
+                       "auto TmpfsDemandSharedBacking::prepare(", "auto TmpfsDemandSharedBacking::prepare_page(",
+                       "auto TmpfsDemandSharedBacking::sync_metadata(", "auto tmpfs_file_cache_authority(",
+                       "auto tmpfs_validate_lookup_locked(", "auto tmpfs_lookup_target_locked(", "auto tmpfs_lookup_cache_authority(",
+                       "auto tmpfs_canonical_node(const TmpNode* node)", "auto tmpfs_link_count(",
+                       "void tmpfs_fill_metadata_locked(", "void tmpfs_metadata_to_stat_impl(", "void tmpfs_fill_stat_locked(",
+                       "auto tmpfs_clone_exec_file(", "auto tmpfs_fops_close("):
             body, row = runner.capture(source, anchor)
             actual.append({"source": str(selected), **row})
             chunks.append(f'#line {row["line"]} "actual-selected-tmpfs.cpp"\n' + body + "\n")

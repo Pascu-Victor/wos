@@ -453,6 +453,7 @@ auto readlink_resolved(const char* abs_path, char* buf, size_t bufsize, size_t k
 auto strip_mount_prefix(const MountPoint* mount, const char* path) -> const char*;
 auto strip_mount_prefix_len(const MountPoint* mount, const char* path, size_t path_len) -> size_t;
 auto tmpfs_root_for_mount(const MountPoint* mount) -> ker::vfs::tmpfs::TmpNode*;
+auto metadata_cache_tmpfs_path_current(const char* path, const MountPoint* mount, const Stat& candidate) -> bool;
 auto path_is_under_mount(const MountPoint* mount, const char* path, size_t path_len) -> bool;
 auto vfs_set_fd_cloexec_for_task(ker::mod::sched::task::Task* task, int fd, bool cloexec) -> int;
 auto vfs_check_permission_for_task(const ker::mod::sched::task::Task* task, uint32_t file_mode, uint32_t file_uid, uint32_t file_gid,
@@ -1969,8 +1970,13 @@ auto file_stat_snapshot_path_cacheable_fs(FSType fs_type) -> bool {
     return metadata_cacheable_fs(fs_type) || fs_type == FSType::DEVFS || fs_type == FSType::REMOTE;
 }
 
+auto file_mutable_mapping_cache_bypass(const File* file) -> bool {
+    return file != nullptr && ker::vfs::tmpfs::tmpfs_file_mutable_cache_bypass(*file);
+}
+
 auto file_stat_snapshot_cacheable(const File* file) -> bool {
-    if (file == nullptr || file->fs_type == FSType::REMOTE || (file->open_flags & ker::vfs::O_NO_CACHE) != 0) {
+    if (file == nullptr || file->fs_type == FSType::REMOTE || (file->open_flags & ker::vfs::O_NO_CACHE) != 0 ||
+        file_mutable_mapping_cache_bypass(file)) {
         return false;
     }
     if (file->vfs_path == nullptr) {
@@ -2011,7 +2017,7 @@ auto file_stat_snapshot_prefetchable(const File* file) -> bool {
 
 auto file_stat_snapshot_created_open_prefill_eligible(const File* file) -> bool {
     return file != nullptr && file->open_create_result_known && file->created_by_open && (file->open_flags & ker::vfs::O_CREAT) != 0 &&
-           (file->open_flags & ker::vfs::O_NO_CACHE) == 0;
+           (file->open_flags & ker::vfs::O_NO_CACHE) == 0 && !file_mutable_mapping_cache_bypass(file);
 }
 
 auto file_stat_snapshot_open_prefill_safe(const File* file) -> bool {
@@ -2224,7 +2230,8 @@ auto file_stat_snapshot_promote_created_open_prefill(File* file) -> bool {
 // Requires file->stat_cache_mutex (open-time cache publication).
 auto file_stat_snapshot_promote_open_prefill_for_path(File* file, size_t path_len, MetadataSnapshotStamp stamp) -> bool {
     if (file == nullptr || path_len == 0 || !file->stat_cache_valid || file->stat_cache_path_len != 0 ||
-        !file_stat_snapshot_result_cacheable(file, file->stat_cache.st_mode) || file->stat_cache_generation != stamp.cache_generation) {
+        !file_stat_snapshot_result_cacheable(file, file->stat_cache.st_mode) || file->stat_cache_generation != stamp.cache_generation ||
+        file_mutable_mapping_cache_bypass(file)) {
         return false;
     }
 
@@ -2246,6 +2253,11 @@ auto file_stat_snapshot_lookup(File* file, Stat* statbuf) -> bool {
         return false;
     }
     ker::mod::sys::MutexGuard cache_guard(file->stat_cache_mutex);
+    if (file_mutable_mapping_cache_bypass(file)) {
+        file_stat_snapshot_invalidate_locked(file);
+        g_vfs_fstat_snapshot_misses.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     if (cache_notify_file_dirty_impl(file)) {
         file_stat_snapshot_invalidate_locked(file);
         g_vfs_fstat_snapshot_miss_invalidated.fetch_add(1, std::memory_order_relaxed);
@@ -2979,6 +2991,7 @@ void metadata_cache_refresh_file_data_on_close(File* file) {
         return;
     }
     file->metadata_data_close_refresh_pending = false;
+    if (file_mutable_mapping_cache_bypass(file)) return;
     FilePathCachePublicationGuard publication_guard(file);
     if (!publication_guard) return;
 
@@ -3042,6 +3055,7 @@ void metadata_cache_store_known_path_stat_on_current_mount(const char* path, Mou
     if (path == nullptr || mount == nullptr || !metadata_cacheable_fs(mount->fs_type)) {
         return;
     }
+    if (!metadata_cache_tmpfs_path_current(path, mount, statbuf)) return;
     metadata_cache_store_known_stat_variants(path, mount->fs_type, mount->dev_id, statbuf, metadata_snapshot_stamp(), known_path_len, mount,
                                              known_raw_path_hash);
 }
@@ -3073,6 +3087,10 @@ void metadata_cache_store_known_file_stat_after_metadata_change(File* file, cons
     }
 
     metadata_cache_invalidate_hardlink_aliases(statbuf);
+    if (file_mutable_mapping_cache_bypass(file)) {
+        file_stat_snapshot_invalidate(file);
+        return;
+    }
     MetadataSnapshotStamp const STAMP = metadata_snapshot_stamp();
     file_stat_snapshot_store(file, statbuf, STAMP);
     FilePathCachePublicationGuard publication_guard(file, true);
@@ -4190,7 +4208,7 @@ void cache_notify_detach_file(File* file) {
 auto cache_notify_try_copy_snapshot(File* file, StreamCacheIdentity* identity, StreamFreshnessStamp* freshness, bool* can_reuse_detached,
                                     bool* retain_full_file) -> bool {
     if (file == nullptr || file->cache_notify_attachment == nullptr || identity == nullptr || freshness == nullptr ||
-        can_reuse_detached == nullptr || retain_full_file == nullptr) {
+        can_reuse_detached == nullptr || retain_full_file == nullptr || file_mutable_mapping_cache_bypass(file)) {
         return false;
     }
 
@@ -4217,7 +4235,7 @@ auto cache_notify_try_copy_snapshot(File* file, StreamCacheIdentity* identity, S
 
 void cache_notify_store_snapshot(File* file, const StreamCacheIdentity& identity, const StreamFreshnessStamp& freshness,
                                  bool can_reuse_detached, bool retain_full_file) {
-    if (file == nullptr || file->cache_notify_attachment == nullptr) {
+    if (file == nullptr || file->cache_notify_attachment == nullptr || file_mutable_mapping_cache_bypass(file)) {
         return;
     }
 
@@ -4928,8 +4946,8 @@ auto stream_build_identity(File* file, const Stat& statbuf, StreamCacheIdentity*
     return 0;
 }
 
-auto stream_copy_available_locked(StreamReaderAttachment* attachment, uint64_t offset, uint8_t* dst, size_t len) -> size_t {
-    if (attachment == nullptr || attachment->island == nullptr || attachment->island->retired) {
+auto stream_copy_available_locked(File* file, StreamReaderAttachment* attachment, uint64_t offset, uint8_t* dst, size_t len) -> size_t {
+    if (attachment == nullptr || attachment->island == nullptr || attachment->island->retired || file_mutable_mapping_cache_bypass(file)) {
         return 0;
     }
 
@@ -4950,6 +4968,7 @@ auto stream_copy_available_locked(StreamReaderAttachment* attachment, uint64_t o
         auto const IN_CHUNK = static_cast<size_t>(cursor - chunk->offset);
         size_t const AVAILABLE = chunk->size - IN_CHUNK;
         size_t const TO_COPY = std::min(len - total, AVAILABLE);
+        if (file_mutable_mapping_cache_bypass(file)) break;
         std::memcpy(dst + total, chunk->data.data() + IN_CHUNK, TO_COPY);
         total += TO_COPY;
         cursor += TO_COPY;
@@ -4996,7 +5015,7 @@ auto stream_select_island_locked(StreamReaderAttachment* attachment, uint64_t of
 }
 
 auto stream_attach_file(File* file) -> StreamReaderAttachment* {
-    if (file == nullptr) {
+    if (file == nullptr || file_mutable_mapping_cache_bypass(file)) {
         return nullptr;
     }
 
@@ -5004,6 +5023,10 @@ auto stream_attach_file(File* file) -> StreamReaderAttachment* {
     if (existing != nullptr) {
         uint64_t const NOW_US = stream_now_us();
         g_stream_cache_lock.lock();
+        if (file_mutable_mapping_cache_bypass(file)) {
+            g_stream_cache_lock.unlock();
+            return nullptr;
+        }
 
         bool entry_alive = false;
         for (auto& entry : g_stream_cache) {
@@ -5063,6 +5086,11 @@ auto stream_attach_file(File* file) -> StreamReaderAttachment* {
 
     uint64_t const NOW_US = stream_now_us();
     g_stream_cache_lock.lock();
+    if (file_mutable_mapping_cache_bypass(file)) {
+        g_stream_cache_lock.unlock();
+        delete attachment;
+        return nullptr;
+    }
     stream_gc_locked(NOW_US);
 
     StreamCacheEntry* entry = stream_find_entry_locked(identity);
@@ -5172,7 +5200,8 @@ void stream_invalidate_file(File* file) {
 }
 
 auto stream_cache_read_eligible(const File* file) -> bool {
-    if (file == nullptr || file->vfs_path == nullptr || (file->open_flags & ker::vfs::O_NO_CACHE) != 0 || file->fs_type == FSType::REMOTE) {
+    if (file == nullptr || file->vfs_path == nullptr || (file->open_flags & ker::vfs::O_NO_CACHE) != 0 || file->fs_type == FSType::REMOTE ||
+        file_mutable_mapping_cache_bypass(file)) {
         return false;
     }
     if ((file->open_flags & 3) != 0) {
@@ -5376,7 +5405,8 @@ void refresh_created_file_stat_snapshot_after_write(File* file) {
 }
 
 auto vfs_stream_cache_try_read(File* file, void* buf, size_t count, uint64_t start_offset, size_t* actual_size, ssize_t* result) -> bool {
-    if (result == nullptr || file == nullptr || buf == nullptr || count == 0 || file->fops == nullptr || file->fops->vfs_read == nullptr) {
+    if (result == nullptr || file == nullptr || buf == nullptr || count == 0 || file->fops == nullptr || file->fops->vfs_read == nullptr ||
+        file_mutable_mapping_cache_bypass(file)) {
         return false;
     }
 
@@ -5394,6 +5424,11 @@ auto vfs_stream_cache_try_read(File* file, void* buf, size_t count, uint64_t sta
         uint64_t const OFFSET = start_offset + total;
 
         g_stream_cache_lock.lock();
+        if (file_mutable_mapping_cache_bypass(file)) {
+            g_stream_cache_lock.unlock();
+            if (total == 0) return false;
+            break;
+        }
         auto* island = stream_select_island_locked(attachment, OFFSET);
         if (island == nullptr) {
             g_stream_cache_lock.unlock();
@@ -5404,7 +5439,7 @@ auto vfs_stream_cache_try_read(File* file, void* buf, size_t count, uint64_t sta
         attachment->entry->last_used_us = stream_now_us();
         island->last_access_us = attachment->entry->last_used_us;
 
-        size_t const COPIED = stream_copy_available_locked(attachment, OFFSET, dst + total, count - total);
+        size_t const COPIED = stream_copy_available_locked(file, attachment, OFFSET, dst + total, count - total);
         if (COPIED > 0) {
             attachment->desired_offset = OFFSET + COPIED;
             stream_trim_island_front_locked(attachment->entry, island);
@@ -5414,6 +5449,11 @@ auto vfs_stream_cache_try_read(File* file, void* buf, size_t count, uint64_t sta
             g_vfs_stream_copied_bytes.fetch_add(COPIED, std::memory_order_relaxed);
             total += COPIED;
             continue;
+        }
+        if (file_mutable_mapping_cache_bypass(file)) {
+            g_stream_cache_lock.unlock();
+            if (total == 0) return false;
+            break;
         }
 
         if (island->error != 0) {
@@ -5453,6 +5493,11 @@ auto vfs_stream_cache_try_read(File* file, void* buf, size_t count, uint64_t sta
 
         g_stream_cache_lock.lock();
         island->producer_active = false;
+        if (file_mutable_mapping_cache_bypass(file)) {
+            g_stream_cache_lock.unlock();
+            if (total == 0) return false;
+            break;
+        }
         bool retry_premature_eof = false;
         if (READ_RET > 0) {
             chunk->size = static_cast<uint32_t>(READ_RET);
@@ -10726,7 +10771,7 @@ void vfs_prefill_file_stat_snapshot(File* file, const Stat& statbuf) {
 
     if (file == nullptr || !file_stat_snapshot_path_cacheable_fs(file->fs_type) ||
         !file_stat_snapshot_result_cacheable(file, statbuf.st_mode) || (file->open_flags & ker::vfs::O_NO_CACHE) != 0 ||
-        !file_stat_snapshot_open_prefill_safe(file)) {
+        !file_stat_snapshot_open_prefill_safe(file) || file_mutable_mapping_cache_bypass(file)) {
         file_stat_snapshot_invalidate_locked(file);
         return;
     }
@@ -11800,6 +11845,64 @@ auto common_local_relative_resolver_fast_path_selftest_impl() -> bool {
 }
 #endif
 
+// A cached inode number is only a scalar candidate. The retained backend
+// lookup supplies both the live canonical owner and its cache authority.
+auto metadata_cache_tmpfs_lookup_current(const tmpfs::TmpfsLookupHandle& lookup, const Stat& candidate) -> bool {
+    tmpfs::TmpfsCacheAuthority authority{};
+    return tmpfs::tmpfs_lookup_cache_authority(lookup, authority) == 0 && !authority.bypass && authority.object_identity != 0 &&
+           authority.inode == static_cast<uint64_t>(candidate.st_ino);
+}
+
+auto metadata_cache_tmpfs_path_current(const char* path, const MountPoint* mount, const Stat& candidate) -> bool {
+    if (mount == nullptr || mount->fs_type != FSType::TMPFS ||
+        (candidate.st_mode & static_cast<mode_t>(S_IFMT)) != static_cast<mode_t>(S_IFREG))
+        return true;
+    if (path == nullptr) return false;
+    auto* task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    if (task == nullptr) return false;
+    auto const credentials = task->credentials();
+    tmpfs::TmpfsLookupHandle lookup{};
+    if (tmpfs::tmpfs_acquire_lookup(credentials, tmpfs_root_for_mount(mount), strip_mount_prefix(mount, path), &lookup) != 0) return false;
+    return metadata_cache_tmpfs_lookup_current(lookup, candidate);
+}
+
+// Caller owns the consumed lookup through this cache publication. Its backend
+// authority validates the exact subject; an ambient Task is not a substitute.
+void metadata_cache_store_retained_stat(const LookupHandle& handle, const Stat& statbuf) {
+    MountPoint const* mount = handle.mount();
+    if (handle.path() == nullptr || mount == nullptr || !metadata_cacheable_fs(mount->fs_type) ||
+        !lookup_path_cache_key_still_stable(handle)) {
+        return;
+    }
+    MetadataSnapshotStamp const STAMP = metadata_snapshot_stamp();
+    if (handle.mount_generation() != STAMP.mount_generation) return;
+    if (mount->fs_type == FSType::TMPFS && (statbuf.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFREG) &&
+        (handle.backend_parent() == nullptr ||
+         !metadata_cache_tmpfs_lookup_current(*static_cast<tmpfs::TmpfsLookupHandle*>(handle.backend_parent()), statbuf))) {
+        return;
+    }
+    metadata_cache_store_known_stat_variants(handle.path(), mount->fs_type, mount->dev_id, statbuf, STAMP, handle.path_length(), mount);
+}
+
+void metadata_cache_store_retained_stat_after_metadata_change(const LookupHandle& handle, const Stat& statbuf) {
+    metadata_cache_invalidate_hardlink_aliases(statbuf);
+    metadata_cache_store_retained_stat(handle, statbuf);
+}
+
+auto metadata_cache_lookup_retained_stat(const LookupHandle& handle, Stat* output) -> int {
+    Stat candidate{};
+    int const CACHED = metadata_cache_lookup(handle.path(), handle.mount()->fs_type, handle.mount()->dev_id,
+                                             handle.follow_policy() == LookupFollowPolicy::FOLLOW_FINAL, handle.requires_directory(),
+                                             &candidate, true, handle.path_length());
+    if (CACHED == 0 && handle.mount()->fs_type == FSType::TMPFS &&
+        (candidate.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFREG) &&
+        (handle.backend_parent() == nullptr ||
+         !metadata_cache_tmpfs_lookup_current(*static_cast<tmpfs::TmpfsLookupHandle*>(handle.backend_parent()), candidate)))
+        return -EAGAIN;
+    if (CACHED == 0) *output = candidate;
+    return CACHED;
+}
+
 auto metadata_cache_lookup_mount_stat(const char* resolved_path, MountPoint const* mount, bool follow_final_symlink, bool require_directory,
                                       Stat* statbuf, size_t known_path_len, uint64_t known_raw_path_hash) -> int {
     if (resolved_path == nullptr || mount == nullptr || statbuf == nullptr || mount->fs_type == FSType::REMOTE) {
@@ -11813,8 +11916,14 @@ auto metadata_cache_lookup_mount_stat(const char* resolved_path, MountPoint cons
     uint64_t const RAW_HASH = known_raw_path_hash != UNKNOWN_PATH_HASH && known_path_len != UNKNOWN_PATH_LEN
                                   ? known_raw_path_hash
                                   : metadata_path_hash_raw(resolved_path, PATH_LEN);
-    return metadata_cache_lookup_prehashed(resolved_path, PATH_LEN, RAW_HASH, mount->fs_type, mount->dev_id,
-                                           follow_final_symlink || require_directory, require_directory, statbuf, false);
+    Stat candidate{};
+    int const CACHED = metadata_cache_lookup_prehashed(resolved_path, PATH_LEN, RAW_HASH, mount->fs_type, mount->dev_id,
+                                                       follow_final_symlink || require_directory, require_directory, &candidate, false);
+    // Both cache-set IRQ lock and backend tree lock have ended before copying
+    // the accepted value. A mark racing this read can linearize after it.
+    if (CACHED == 0 && !metadata_cache_tmpfs_path_current(resolved_path, mount, candidate)) return -EAGAIN;
+    if (CACHED == 0) *statbuf = candidate;
+    return CACHED;
 }
 
 }  // namespace
@@ -15547,7 +15656,7 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
                                                       EFFECTIVE_FOLLOW_FINAL_SYMLINK, REQUIRE_DIRECTORY, statbuf, true)
                     : metadata_cache_lookup(current_path, mount->fs_type, mount->dev_id, EFFECTIVE_FOLLOW_FINAL_SYMLINK, REQUIRE_DIRECTORY,
                                             statbuf, true, current_path_len);
-            if (CACHED_RESULT != -EAGAIN) {
+            if (CACHED_RESULT != -EAGAIN && (CACHED_RESULT != 0 || metadata_cache_tmpfs_path_current(current_path, mount, *statbuf))) {
                 log_loader_path_event(CACHED_RESULT == 0 ? "stat-cache-hit-pre-symlink" : "stat-cache-negative-hit-pre-symlink", path,
                                       current_path, mount, CACHED_RESULT);
                 return CACHED_RESULT;
@@ -15645,7 +15754,7 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
                                                   EFFECTIVE_FOLLOW_FINAL_SYMLINK, REQUIRE_DIRECTORY, statbuf, true)
                 : metadata_cache_lookup(current_path, mount->fs_type, mount->dev_id, EFFECTIVE_FOLLOW_FINAL_SYMLINK, REQUIRE_DIRECTORY,
                                         statbuf, true, current_path_len);
-        if (CACHED_RESULT != -EAGAIN) {
+        if (CACHED_RESULT != -EAGAIN && (CACHED_RESULT != 0 || metadata_cache_tmpfs_path_current(current_path, mount, *statbuf))) {
             log_loader_path_event(CACHED_RESULT == 0 ? "stat-cache-hit" : "stat-cache-negative-hit", path, current_path, mount,
                                   CACHED_RESULT);
             return CACHED_RESULT;
@@ -15745,7 +15854,7 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
         statbuf->st_mode |= S_WOSLINK;
     }
 
-    if (!is_wki_entry && !synthetic_stat) {
+    if (!is_wki_entry && !synthetic_stat && (result != 0 || metadata_cache_tmpfs_path_current(current_path, mount, *statbuf))) {
         if (result == 0 && (statbuf->st_mode & static_cast<mode_t>(S_IFMT)) != static_cast<mode_t>(S_IFLNK)) {
             metadata_cache_store_non_symlink_stat_variants(current_path, mount->fs_type, mount->dev_id, *statbuf, STAT_STAMP,
                                                            current_path_len, mount, current_path_hash);
@@ -16015,9 +16124,7 @@ auto vfs_statat(ker::mod::sched::task::Task* task, int dirfd, const char* pathna
             return RESULT;
         }
         if (lookup_path_cache_key_still_stable(handle)) {
-            bool const FOLLOW_FINAL = handle.follow_policy() == LookupFollowPolicy::FOLLOW_FINAL;
-            int const CACHED = metadata_cache_lookup(handle.path(), handle.mount()->fs_type, handle.mount()->dev_id, FOLLOW_FINAL,
-                                                     handle.requires_directory(), args.output, true, handle.path_length());
+            int const CACHED = metadata_cache_lookup_retained_stat(handle, args.output);
             if (CACHED != -EAGAIN) {
                 return CACHED;
             }
@@ -16041,7 +16148,7 @@ auto vfs_statat(ker::mod::sched::task::Task* task, int dirfd, const char* pathna
         }
         if (result == 0 && lookup_path_cache_key_still_stable(handle) &&
             (handle.mount()->fs_type == FSType::TMPFS || handle.mount()->fs_type == FSType::XFS)) {
-            metadata_cache_store_known_path_stat_on_current_mount(handle.path(), handle.mount(), *args.output, handle.path_length());
+            metadata_cache_store_retained_stat(handle, *args.output);
         } else if (result == -ENOENT && lookup_path_cache_key_still_stable(handle)) {
             metadata_cache_store_missing_path_on_current_mount(handle.path(), handle.mount(), handle.path_length(), UNKNOWN_PATH_HASH);
         }
@@ -16212,7 +16319,7 @@ auto file_stat_snapshot_fast_current(File* file, Stat* statbuf) -> bool {
     // Called under fd_table_lock: never sleep waiting for a cache publisher.
     if (!file->stat_cache_mutex.try_lock()) return false;
     auto copy_current = [&]() -> bool {
-        if (file->cache_notify_attachment != nullptr || !file->stat_cache_valid) {
+        if (file->cache_notify_attachment != nullptr || !file->stat_cache_valid || file_mutable_mapping_cache_bypass(file)) {
             return false;
         }
         if (file->vfs_path == nullptr) {
@@ -18675,9 +18782,7 @@ auto vfs_faccessat(ker::mod::sched::task::Task* task, int dirfd, const char* pat
                                                                            {stat.st_uid, stat.st_gid, stat.st_mode}, args.mode);
         }
         if (lookup_path_cache_key_still_stable(handle)) {
-            bool const FOLLOW_FINAL = handle.follow_policy() == LookupFollowPolicy::FOLLOW_FINAL;
-            int const CACHED = metadata_cache_lookup(handle.path(), handle.mount()->fs_type, handle.mount()->dev_id, FOLLOW_FINAL,
-                                                     handle.requires_directory(), &stat, true, handle.path_length());
+            int const CACHED = metadata_cache_lookup_retained_stat(handle, &stat);
             if (CACHED != -EAGAIN) {
                 return CACHED < 0 ? CACHED
                                   : ker::mod::security::authorize_file_access(handle.authorization().credentials,
@@ -18697,7 +18802,7 @@ auto vfs_faccessat(ker::mod::sched::task::Task* task, int dirfd, const char* pat
         }
         if (result == 0 && lookup_path_cache_key_still_stable(handle) &&
             (handle.mount()->fs_type == FSType::TMPFS || handle.mount()->fs_type == FSType::XFS)) {
-            metadata_cache_store_known_path_stat_on_current_mount(handle.path(), handle.mount(), stat, handle.path_length());
+            metadata_cache_store_retained_stat(handle, stat);
         } else if (result == -ENOENT && lookup_path_cache_key_still_stable(handle)) {
             metadata_cache_store_missing_path_on_current_mount(handle.path(), handle.mount(), handle.path_length(), UNKNOWN_PATH_HASH);
         }
@@ -19971,7 +20076,7 @@ auto vfs_fchmodat(ker::mod::sched::task::Task* task, int dirfd, const char* path
                 cache_notify_path_data_changed_impl(handle.path(), handle.mount()->fs_type);
                 Stat updated{};
                 ker::vfs::tmpfs::tmpfs_metadata_to_stat(updated_metadata, handle.mount()->dev_id, &updated);
-                metadata_cache_store_known_path_stat_after_metadata_change(handle.path(), handle.mount(), updated, handle.path_length());
+                metadata_cache_store_retained_stat_after_metadata_change(handle, updated);
             }
             return result;
         }
@@ -19982,7 +20087,7 @@ auto vfs_fchmodat(ker::mod::sched::task::Task* task, int dirfd, const char* path
                                                 handle.authorization().credentials, args.mode, &updated, handle.mount_policy().read_only);
             if (result == 0 && lookup_path_cache_key_still_stable(handle)) {
                 cache_notify_path_data_changed_impl(handle.path(), handle.mount()->fs_type);
-                metadata_cache_store_known_path_stat_after_metadata_change(handle.path(), handle.mount(), updated, handle.path_length());
+                metadata_cache_store_retained_stat_after_metadata_change(handle, updated);
             }
             return result;
         }
@@ -20216,7 +20321,7 @@ auto consume_chown_lookup(const LookupHandle& handle, void* opaque) -> int {
             cache_notify_path_data_changed_impl(handle.path(), handle.mount()->fs_type);
             Stat updated{};
             ker::vfs::tmpfs::tmpfs_metadata_to_stat(updated_metadata, handle.mount()->dev_id, &updated);
-            metadata_cache_store_known_path_stat_after_metadata_change(handle.path(), handle.mount(), updated, handle.path_length());
+            metadata_cache_store_retained_stat_after_metadata_change(handle, updated);
         }
         return result;
     }
@@ -20227,7 +20332,7 @@ auto consume_chown_lookup(const LookupHandle& handle, void* opaque) -> int {
                                                            handle.mount_policy().read_only);
         if (result == 0 && lookup_path_cache_key_still_stable(handle)) {
             cache_notify_path_data_changed_impl(handle.path(), handle.mount()->fs_type);
-            metadata_cache_store_known_path_stat_after_metadata_change(handle.path(), handle.mount(), updated, handle.path_length());
+            metadata_cache_store_retained_stat_after_metadata_change(handle, updated);
         }
         return result;
     }
@@ -20499,23 +20604,9 @@ auto vfs_apply_utimens_to_path(const char* path, const Timespec* times, bool fol
 }
 }  // namespace
 
-auto vfs_utimensat(int dirfd, const char* pathname, const Timespec* times, int flags) -> int {
-    constexpr int ALLOWED_FLAGS = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
-    if (pathname == nullptr || (flags & ~ALLOWED_FLAGS) != 0) {
-        return -EINVAL;
-    }
-
-    if ((flags & AT_EMPTY_PATH) != 0 && pathname[0] == '\0') {
-        return vfs_futimens(dirfd, times);
-    }
-
-    auto* task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
-    if (task == nullptr) {
-        if (dirfd == AT_FDCWD || pathname[0] == '/') {
-            return vfs_apply_utimens_to_path(pathname, times, (flags & AT_SYMLINK_NOFOLLOW) == 0);
-        }
-        return -ESRCH;
-    }
+namespace {
+auto vfs_utimensat_nonempty_lookup(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, const Timespec* times, int flags)
+    -> int {
     if (pathname[0] == '\0') {
         return -ENOENT;
     }
@@ -20559,7 +20650,7 @@ auto vfs_utimensat(int dirfd, const char* pathname, const Timespec* times, int f
                 cache_notify_path_data_changed_impl(handle.path(), handle.mount()->fs_type);
                 Stat updated{};
                 ker::vfs::tmpfs::tmpfs_metadata_to_stat(updated_metadata, handle.mount()->dev_id, &updated);
-                metadata_cache_store_known_path_stat_after_metadata_change(handle.path(), handle.mount(), updated, handle.path_length());
+                metadata_cache_store_retained_stat_after_metadata_change(handle, updated);
             }
             return result;
         }
@@ -20570,7 +20661,7 @@ auto vfs_utimensat(int dirfd, const char* pathname, const Timespec* times, int f
                                                                  handle.mount_policy().read_only);
             if (result == 0 && (args.resolved.set_atime() || args.resolved.set_mtime()) && lookup_path_cache_key_still_stable(handle)) {
                 cache_notify_path_data_changed_impl(handle.path(), handle.mount()->fs_type);
-                metadata_cache_store_known_path_stat_after_metadata_change(handle.path(), handle.mount(), updated, handle.path_length());
+                metadata_cache_store_retained_stat_after_metadata_change(handle, updated);
             }
             return result;
         }
@@ -20605,6 +20696,43 @@ auto vfs_utimensat(int dirfd, const char* pathname, const Timespec* times, int f
     }
     return -EAGAIN;
 }
+}  // namespace
+
+auto vfs_utimensat(int dirfd, const char* pathname, const Timespec* times, int flags) -> int {
+    constexpr int ALLOWED_FLAGS = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
+    if (pathname == nullptr || (flags & ~ALLOWED_FLAGS) != 0) {
+        return -EINVAL;
+    }
+
+    if ((flags & AT_EMPTY_PATH) != 0 && pathname[0] == '\0') {
+        return vfs_futimens(dirfd, times);
+    }
+
+    auto* task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    if (task == nullptr) {
+        if (dirfd == AT_FDCWD || pathname[0] == '/') {
+            return vfs_apply_utimens_to_path(pathname, times, (flags & AT_SYMLINK_NOFOLLOW) == 0);
+        }
+        return -ESRCH;
+    }
+    return vfs_utimensat_nonempty_lookup(task, dirfd, pathname, times, flags);
+}
+
+#ifdef WOS_SELFTEST
+// Exercises the ordinary retained consumer with a real explicit requester.
+// This diagnostic entrance accepts nonempty paths only; no ambient Task override.
+auto vfs_selftest_utimensat_nonempty_as(ker::mod::sched::task::Task& task, int dirfd, const char* pathname, const Timespec* times,
+                                        int flags) -> int {
+    constexpr int ALLOWED_FLAGS = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;
+    if (pathname == nullptr || (flags & ~ALLOWED_FLAGS) != 0) return -EINVAL;
+    return vfs_utimensat_nonempty_lookup(&task, dirfd, pathname, times, flags);
+}
+
+auto vfs_selftest_cached_retained_stat(const LookupHandle& handle, Stat* output) -> int {
+    if (output == nullptr || handle.mount() == nullptr || !lookup_path_cache_key_still_stable(handle)) return -EINVAL;
+    return metadata_cache_lookup_retained_stat(handle, output);
+}
+#endif
 
 #ifdef WOS_SELFTEST
 auto vfs_selftest_remote_readonly_resolved(const ker::mod::security::Snapshot& credentials, const char* path, int expected) -> int {
@@ -23110,6 +23238,8 @@ auto vfs_selftest_remote_fstat_rejects_path_snapshot() -> bool {
 }
 
 auto vfs_selftest_fstat_seeds_path_metadata_cache() -> bool {
+    ker::mod::sched::task::Task requester{};
+    if (!vfs_selftest_initialize_task_paths(requester)) return false;
     vfs_mkdir("/tmp", 0755);
 
     constexpr const char* PATH = "/tmp/ktest_fstat_seeds_path_metadata_cache";
@@ -23135,7 +23265,8 @@ auto vfs_selftest_fstat_seeds_path_metadata_cache() -> bool {
     ok = ok && after_fstat.fstat_snapshot_stores > before_fstat.fstat_snapshot_stores &&
          after_fstat.metadata_stores > before_fstat.metadata_stores && mount_lookup_calls_for_test() == MOUNT_LOOKUPS_BEFORE_FSTAT;
 
-    ok = ok && vfs_lstat(PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFREG);
+    ok = ok && vfs_statat(&requester, AT_FDCWD, PATH, AT_SYMLINK_NOFOLLOW, &st) == 0 &&
+         (st.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFREG);
     vfs_get_cache_perf_snapshot(after_lstat);
     ok = ok && after_lstat.metadata_hits > after_fstat.metadata_hits;
 
@@ -23177,6 +23308,8 @@ auto vfs_selftest_file_path_storage() -> bool {
 }
 
 auto vfs_selftest_file_data_write_invalidates_path_stat() -> bool {
+    ker::mod::sched::task::Task requester{};
+    if (!vfs_selftest_initialize_task_paths(requester)) return false;
     vfs_mkdir("/tmp", 0755);
 
     constexpr const char* PATH = "/tmp/ktest_file_data_stat_invalidation";
@@ -23193,21 +23326,61 @@ auto vfs_selftest_file_data_write_invalidates_path_stat() -> bool {
     cache_notify_file_data_changed_impl(file);
 
     Stat st{};
-    ok = ok && vfs_stat(PATH, &st) == 0 && st.st_size == static_cast<off_t>(sizeof(FIRST) - 1);
-    ok = ok && vfs_stat(PATH, &st) == 0 && st.st_size == static_cast<off_t>(sizeof(FIRST) - 1);
+    ok = ok && vfs_statat(&requester, AT_FDCWD, PATH, 0, &st) == 0 && st.st_size == static_cast<off_t>(sizeof(FIRST) - 1);
+    ok = ok && vfs_statat(&requester, AT_FDCWD, PATH, 0, &st) == 0 && st.st_size == static_cast<off_t>(sizeof(FIRST) - 1);
 
     constexpr size_t SECOND_OFFSET = sizeof(FIRST) - 1;
     ok = ok && file->fops->vfs_write(file, SECOND, sizeof(SECOND) - 1, SECOND_OFFSET) == static_cast<ssize_t>(sizeof(SECOND) - 1);
     cache_notify_file_data_changed_impl(file);
 
-    ok = ok && vfs_stat(PATH, &st) == 0 && st.st_size == static_cast<off_t>((sizeof(FIRST) - 1) + (sizeof(SECOND) - 1));
+    ok = ok && vfs_statat(&requester, AT_FDCWD, PATH, 0, &st) == 0 &&
+         st.st_size == static_cast<off_t>((sizeof(FIRST) - 1) + (sizeof(SECOND) - 1));
 
     vfs_put_file(file);
     ok = ok && vfs_unlink(PATH) == 0;
     return ok;
 }
 
+namespace {
+enum class CacheFixtureStatMode { BACKEND, CACHED, REFILL };
+
+// A test-owned requester supplies actual lookup authority; it never becomes
+// current. Positive cache observations still use the real retained backend.
+auto cache_fixture_tmpfs_stat(ker::mod::sched::task::Task& requester, const char* path, Stat* output, CacheFixtureStatMode mode) -> int {
+    LookupHandle lookup{};
+    int const ACQUIRED =
+        vfs_acquire_lookup(&requester, AT_FDCWD, path, LookupIntent::STAT, LookupFollowPolicy::FOLLOW_FINAL, false, false, &lookup);
+    if (ACQUIRED != 0) return ACQUIRED;
+    struct Context {
+        Stat* output;
+        CacheFixtureStatMode mode;
+    } context{output, mode};
+    auto consume = [](const LookupHandle& handle, void* opaque) -> int {
+        auto& args = *static_cast<Context*>(opaque);
+        auto* mount = handle.mount();
+        if (args.output == nullptr || mount == nullptr || mount->fs_type != FSType::TMPFS || handle.backend_parent() == nullptr)
+            return -EINVAL;
+        if (args.mode == CacheFixtureStatMode::CACHED) return metadata_cache_lookup_retained_stat(handle, args.output);
+        auto const& backend = *static_cast<const tmpfs::TmpfsLookupHandle*>(handle.backend_parent());
+        Stat candidate{};
+        int const RESULT = tmpfs::tmpfs_stat_lookup(backend, false, mount->dev_id, &candidate);
+        if (RESULT != 0) return RESULT;
+        if (!metadata_cache_tmpfs_lookup_current(backend, candidate)) return -EAGAIN;
+        if (args.mode == CacheFixtureStatMode::REFILL) {
+            metadata_cache_store_non_symlink_stat_variants(handle.path(), mount->fs_type, mount->dev_id, candidate,
+                                                           metadata_snapshot_stamp(), handle.path_length(), mount);
+            return metadata_cache_lookup_retained_stat(handle, args.output);
+        }
+        *args.output = candidate;
+        return 0;
+    };
+    return vfs_consume_lookup(lookup, false, consume, &context);
+}
+}  // namespace
+
 auto vfs_selftest_file_data_write_skips_uncached_path_invalidation() -> bool {
+    ker::mod::sched::task::Task requester{};
+    if (!vfs_selftest_initialize_task_paths(requester)) return false;
     vfs_mkdir("/tmp", 0755);
 
     constexpr const char* PATH = "/tmp/ktest_file_data_uncached_path_invalidation";
@@ -23243,18 +23416,22 @@ auto vfs_selftest_file_data_write_skips_uncached_path_invalidation() -> bool {
     VfsCachePerfSnapshot after_refill_stat{};
     int const STAT_RET = vfs_stat(PATH, &st);
     ok = ok && STAT_RET == 0;
+    // Taskless boot stat correctly avoids positive path-cache authority. Seed
+    // an actual retained lookup observation for this invalidation fixture.
+    ok = ok && cache_fixture_tmpfs_stat(requester, PATH, &st, CacheFixtureStatMode::REFILL) == 0;
     vfs_get_cache_perf_snapshot(after_first_stat);
 
     bool const HAD_PATH_OBSERVATION_AFTER_STAT = metadata_cache_has_file_data_observation(file);
     ok = ok && HAD_PATH_OBSERVATION_AFTER_STAT;
-    ok = ok && vfs_stat(PATH, &st) == 0;
+    ok = ok && cache_fixture_tmpfs_stat(requester, PATH, &st, CacheFixtureStatMode::CACHED) == 0;
     vfs_get_cache_perf_snapshot(after_second_stat);
     bool const CACHED_OBSERVED_PATH = after_second_stat.metadata_hits > after_first_stat.metadata_hits;
     ok = ok && CACHED_OBSERVED_PATH;
 
     metadata_cache_note_file_data_changed(file);
     vfs_get_cache_perf_snapshot(after_observed_write);
-    ok = ok && vfs_stat(PATH, &st) == 0;
+    ok = ok && cache_fixture_tmpfs_stat(requester, PATH, &st, CacheFixtureStatMode::CACHED) == -EAGAIN;
+    ok = ok && cache_fixture_tmpfs_stat(requester, PATH, &st, CacheFixtureStatMode::REFILL) == 0;
     vfs_get_cache_perf_snapshot(after_refill_stat);
     bool const REFILLED_OBSERVED_PATH = after_refill_stat.metadata_misses > after_observed_write.metadata_misses &&
                                         after_refill_stat.metadata_stores > after_observed_write.metadata_stores;
@@ -23266,6 +23443,8 @@ auto vfs_selftest_file_data_write_skips_uncached_path_invalidation() -> bool {
 }
 
 auto vfs_selftest_file_data_close_refreshes_created_path_stat() -> bool {
+    ker::mod::sched::task::Task requester{};
+    if (!vfs_selftest_initialize_task_paths(requester)) return false;
     vfs_mkdir("/tmp", 0755);
 
     constexpr const char* PATH = "/tmp/ktest_file_data_close_refresh";
@@ -23298,7 +23477,7 @@ auto vfs_selftest_file_data_close_refreshes_created_path_stat() -> bool {
 
     Stat st{};
     ok = ok && after_close.metadata_stores > before_close.metadata_stores;
-    ok = ok && vfs_lstat(PATH, &st) == 0 && st.st_size == static_cast<off_t>(sizeof(DATA) - 1);
+    ok = ok && vfs_statat(&requester, AT_FDCWD, PATH, AT_SYMLINK_NOFOLLOW, &st) == 0 && st.st_size == static_cast<off_t>(sizeof(DATA) - 1);
     vfs_get_cache_perf_snapshot(after_lstat);
     ok = ok && after_lstat.metadata_hits > after_close.metadata_hits;
 
@@ -23324,7 +23503,8 @@ auto vfs_selftest_file_data_close_refreshes_created_path_stat() -> bool {
     vfs_get_cache_perf_snapshot(after_empty_close);
 
     ok = ok && after_empty_close.metadata_stores > before_empty_close.metadata_stores;
-    ok = ok && vfs_lstat(EMPTY_PATH, &st) == 0 && st.st_size == 0 && (st.st_mode & 07777) == 0755;
+    ok = ok && vfs_statat(&requester, AT_FDCWD, EMPTY_PATH, AT_SYMLINK_NOFOLLOW, &st) == 0 && st.st_size == 0 &&
+         (st.st_mode & 07777) == 0755;
     vfs_get_cache_perf_snapshot(after_empty_lstat);
     ok = ok && after_empty_lstat.metadata_hits > after_empty_close.metadata_hits;
     ok = ok && vfs_unlink(EMPTY_PATH) == 0;
@@ -23380,6 +23560,8 @@ auto vfs_selftest_file_data_close_does_not_resurrect_removed_path() -> bool {
 }
 
 auto vfs_selftest_created_open_prefill_seeds_path_stat() -> bool {
+    ker::mod::sched::task::Task requester{};
+    if (!vfs_selftest_initialize_task_paths(requester)) return false;
     vfs_mkdir("/tmp", 0755);
 
     constexpr const char* PATH = "/tmp/ktest_created_open_prefill_stat";
@@ -23404,14 +23586,8 @@ auto vfs_selftest_created_open_prefill_seeds_path_stat() -> bool {
     MountPoint const* mount = mount_ref.get();
     bool ok = file->created_by_open && mount != nullptr;
     Stat opened_stat{};
-    if (mount != nullptr) {
-        opened_stat.st_dev = mount->dev_id;
-    }
-    opened_stat.st_ino = 12345;
-    opened_stat.st_mode = S_IFREG | 0644;
-    opened_stat.st_nlink = 1;
-    opened_stat.st_size = 0;
-    opened_stat.st_blksize = 4096;
+    ok = ok && cache_fixture_tmpfs_stat(requester, PATH, &opened_stat, CacheFixtureStatMode::BACKEND) == 0;
+    ok = ok && tmpfs::tmpfs_file_cache_authority(*file).inode == static_cast<uint64_t>(opened_stat.st_ino);
 
     vfs_prefill_file_stat_snapshot(file, opened_stat);
     ok = ok && file->stat_cache_valid && file->stat_cache_path_len == 0;
@@ -23420,12 +23596,20 @@ auto vfs_selftest_created_open_prefill_seeds_path_stat() -> bool {
 
     if (mount != nullptr) {
         Stat cached{};
-        ok = ok && metadata_cache_lookup_mount_stat(PATH, mount, true, false, &cached) == 0;
+        ok = ok && cache_fixture_tmpfs_stat(requester, PATH, &cached, CacheFixtureStatMode::CACHED) == 0;
         ok = ok && cached.st_ino == opened_stat.st_ino && cached.st_size == opened_stat.st_size &&
              (cached.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFREG);
+        if (!ker::mod::sched::can_query_current_task()) {
+            Stat refused{};
+            std::memset(&refused, 0x5a, sizeof(refused));
+            std::array<unsigned char, sizeof(Stat)> original{};
+            std::memcpy(original.data(), &refused, sizeof(refused));
+            ok = ok && metadata_cache_lookup_mount_stat(PATH, mount, true, false, &refused) == -EAGAIN &&
+                 std::memcmp(original.data(), &refused, sizeof(refused)) == 0;
+        }
 
         cache_notify_file_data_changed_impl(file);
-        ok = ok && metadata_cache_lookup_mount_stat(PATH, mount, true, false, &cached) == -EAGAIN;
+        ok = ok && cache_fixture_tmpfs_stat(requester, PATH, &cached, CacheFixtureStatMode::CACHED) == -EAGAIN;
     }
 
     vfs_put_file(file);
@@ -23434,6 +23618,11 @@ auto vfs_selftest_created_open_prefill_seeds_path_stat() -> bool {
     auto* seed_file = vfs_open_file(WRITE_PATH, ker::vfs::O_CREAT | 1, 0644);
     ok = ok && seed_file != nullptr;
     if (seed_file != nullptr) {
+        constexpr char BYTES[] = "1234567";
+        bool const WROTE = seed_file->fops != nullptr && seed_file->fops->vfs_write != nullptr &&
+                           seed_file->fops->vfs_write(seed_file, BYTES, sizeof(BYTES) - 1, 0) == static_cast<ssize_t>(sizeof(BYTES) - 1);
+        ok = WROTE && ok;
+        if (WROTE) cache_notify_file_data_changed_impl(seed_file);
         vfs_put_file(seed_file);
     }
     vfs_cache_notify_path_changed(WRITE_PATH, nullptr);
@@ -23446,24 +23635,21 @@ auto vfs_selftest_created_open_prefill_seeds_path_stat() -> bool {
 
     if (write_file != nullptr && write_mount != nullptr) {
         Stat write_opened_stat{};
-        write_opened_stat.st_dev = write_mount->dev_id;
-        write_opened_stat.st_ino = 23456;
-        write_opened_stat.st_mode = S_IFREG | 0644;
-        write_opened_stat.st_nlink = 1;
-        write_opened_stat.st_size = 7;
-        write_opened_stat.st_blksize = 4096;
+        ok = ok && cache_fixture_tmpfs_stat(requester, WRITE_PATH, &write_opened_stat, CacheFixtureStatMode::BACKEND) == 0;
+        ok = ok && tmpfs::tmpfs_file_cache_authority(*write_file).inode == static_cast<uint64_t>(write_opened_stat.st_ino);
+        ok = ok && write_opened_stat.st_size == 7;
 
         vfs_prefill_file_stat_snapshot(write_file, write_opened_stat);
         ok = ok && write_file->stat_cache_valid && write_file->stat_cache_path_len == 0;
         ok = ok && metadata_cache_store_opened_file_stat(write_file, write_mount);
 
         Stat cached{};
-        ok = ok && metadata_cache_lookup_mount_stat(WRITE_PATH, write_mount, true, false, &cached) == 0;
+        ok = ok && cache_fixture_tmpfs_stat(requester, WRITE_PATH, &cached, CacheFixtureStatMode::CACHED) == 0;
         ok = ok && cached.st_ino == write_opened_stat.st_ino && cached.st_size == write_opened_stat.st_size &&
              (cached.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFREG);
 
         cache_notify_file_data_changed_impl(write_file);
-        ok = ok && metadata_cache_lookup_mount_stat(WRITE_PATH, write_mount, true, false, &cached) == -EAGAIN;
+        ok = ok && cache_fixture_tmpfs_stat(requester, WRITE_PATH, &cached, CacheFixtureStatMode::CACHED) == -EAGAIN;
     }
 
     if (write_file != nullptr) {
@@ -23474,6 +23660,12 @@ auto vfs_selftest_created_open_prefill_seeds_path_stat() -> bool {
     auto* existing_seed = vfs_open_file(EXISTING_CREAT_PATH, ker::vfs::O_CREAT | 1, 0644);
     ok = ok && existing_seed != nullptr;
     if (existing_seed != nullptr) {
+        constexpr char BYTES[] = "12345678901";
+        bool const WROTE =
+            existing_seed->fops != nullptr && existing_seed->fops->vfs_write != nullptr &&
+            existing_seed->fops->vfs_write(existing_seed, BYTES, sizeof(BYTES) - 1, 0) == static_cast<ssize_t>(sizeof(BYTES) - 1);
+        ok = WROTE && ok;
+        if (WROTE) cache_notify_file_data_changed_impl(existing_seed);
         vfs_put_file(existing_seed);
     }
     vfs_cache_notify_path_changed(EXISTING_CREAT_PATH, nullptr);
@@ -23485,19 +23677,16 @@ auto vfs_selftest_created_open_prefill_seeds_path_stat() -> bool {
     ok = ok && existing_mount != nullptr;
     if (existing_creat_file != nullptr && existing_mount != nullptr) {
         Stat existing_opened_stat{};
-        existing_opened_stat.st_dev = existing_mount->dev_id;
-        existing_opened_stat.st_ino = 34567;
-        existing_opened_stat.st_mode = S_IFREG | 0644;
-        existing_opened_stat.st_nlink = 1;
-        existing_opened_stat.st_size = 11;
-        existing_opened_stat.st_blksize = 4096;
+        ok = ok && cache_fixture_tmpfs_stat(requester, EXISTING_CREAT_PATH, &existing_opened_stat, CacheFixtureStatMode::BACKEND) == 0;
+        ok = ok && tmpfs::tmpfs_file_cache_authority(*existing_creat_file).inode == static_cast<uint64_t>(existing_opened_stat.st_ino);
+        ok = ok && existing_opened_stat.st_size == 11;
 
         vfs_prefill_file_stat_snapshot(existing_creat_file, existing_opened_stat);
         ok = ok && existing_creat_file->stat_cache_valid && existing_creat_file->stat_cache_path_len == 0;
         ok = ok && metadata_cache_store_opened_file_stat(existing_creat_file, existing_mount);
 
         Stat cached{};
-        ok = ok && metadata_cache_lookup_mount_stat(EXISTING_CREAT_PATH, existing_mount, true, false, &cached) == 0;
+        ok = ok && cache_fixture_tmpfs_stat(requester, EXISTING_CREAT_PATH, &cached, CacheFixtureStatMode::CACHED) == 0;
         ok = ok && cached.st_ino == existing_opened_stat.st_ino && cached.st_size == existing_opened_stat.st_size &&
              (cached.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFREG);
     }
@@ -23519,12 +23708,9 @@ auto vfs_selftest_created_open_prefill_seeds_path_stat() -> bool {
     MountPoint const* trunc_mount = trunc_mount_ref.get();
     if (trunc_file != nullptr && trunc_mount != nullptr) {
         Stat stale_trunc_stat{};
-        stale_trunc_stat.st_dev = trunc_mount->dev_id;
-        stale_trunc_stat.st_ino = 45678;
-        stale_trunc_stat.st_mode = S_IFREG | 0644;
-        stale_trunc_stat.st_nlink = 1;
-        stale_trunc_stat.st_size = 17;
-        stale_trunc_stat.st_blksize = 4096;
+        ok = ok && cache_fixture_tmpfs_stat(requester, TRUNC_PATH, &stale_trunc_stat, CacheFixtureStatMode::BACKEND) == 0;
+        ok = ok && tmpfs::tmpfs_file_cache_authority(*trunc_file).inode == static_cast<uint64_t>(stale_trunc_stat.st_ino);
+        stale_trunc_stat.st_size = 17;  // Deliberately stale payload; actual inode identity is retained.
 
         vfs_prefill_file_stat_snapshot(trunc_file, stale_trunc_stat);
         ok = ok && !trunc_file->stat_cache_valid;
@@ -23538,6 +23724,8 @@ auto vfs_selftest_created_open_prefill_seeds_path_stat() -> bool {
 }
 
 auto vfs_selftest_file_metadata_change_invalidates_path_stat() -> bool {
+    ker::mod::sched::task::Task requester{};
+    if (!vfs_selftest_initialize_task_paths(requester)) return false;
     vfs_mkdir("/tmp", 0755);
 
     constexpr const char* PATH = "/tmp/ktest_file_metadata_stat_invalidation";
@@ -23549,8 +23737,8 @@ auto vfs_selftest_file_metadata_change_invalidates_path_stat() -> bool {
     }
 
     Stat st{};
-    bool ok = vfs_stat(PATH, &st) == 0 && (st.st_mode & 07777) == 0644;
-    ok = ok && vfs_stat(PATH, &st) == 0 && (st.st_mode & 07777) == 0644;
+    bool ok = vfs_statat(&requester, AT_FDCWD, PATH, 0, &st) == 0 && (st.st_mode & 07777) == 0644;
+    ok = ok && vfs_statat(&requester, AT_FDCWD, PATH, 0, &st) == 0 && (st.st_mode & 07777) == 0644;
 
     auto* node = static_cast<ker::vfs::tmpfs::TmpNode*>(file->private_data);
     node->mode = 0755;
@@ -23562,7 +23750,7 @@ auto vfs_selftest_file_metadata_change_invalidates_path_stat() -> bool {
     vfs_get_cache_perf_snapshot(after);
 
     ok = ok && after.stream_invalidate_empty_skips == before.stream_invalidate_empty_skips;
-    ok = ok && vfs_stat(PATH, &st) == 0 && (st.st_mode & 07777) == 0755;
+    ok = ok && vfs_statat(&requester, AT_FDCWD, PATH, 0, &st) == 0 && (st.st_mode & 07777) == 0755;
 
     vfs_put_file(file);
     ok = ok && vfs_unlink(PATH) == 0;
@@ -23793,7 +23981,7 @@ auto vfs_selftest_open_success_seeds_metadata_cache() -> bool {
 
     Stat st{};
     VfsCachePerfSnapshot after_lstat{};
-    ok = vfs_lstat(PATH, &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG && ok;
+    ok = vfs_statat(&task, AT_FDCWD, PATH, AT_SYMLINK_NOFOLLOW, &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG && ok;
     vfs_get_cache_perf_snapshot(after_lstat);
     ok = after_lstat.metadata_hits > after_open.metadata_hits && ok;
 
@@ -25624,6 +25812,8 @@ auto vfs_selftest_unlinkat_renameat_dirfd_mutations() -> bool {
 }
 
 auto vfs_selftest_rename_seeds_metadata_cache() -> bool {
+    ker::mod::sched::task::Task requester{};
+    if (!vfs_selftest_initialize_task_paths(requester)) return false;
     vfs_mkdir("/tmp", 0755);
 
     constexpr const char* DIR_PATH = "/tmp/ktest_rename_metadata_cache";
@@ -25660,8 +25850,8 @@ auto vfs_selftest_rename_seeds_metadata_cache() -> bool {
     ok = ok && vfs_lstat(OLD_PATH, &st) == -ENOENT;
     vfs_get_cache_perf_snapshot(after_old_lstat);
     ok = ok && after_old_lstat.metadata_hits > after_rename.metadata_hits;
-    ok = ok && vfs_lstat(NEW_PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG &&
-         st.st_size == static_cast<off_t>(sizeof(DATA) - 1);
+    ok = ok && vfs_statat(&requester, AT_FDCWD, NEW_PATH, AT_SYMLINK_NOFOLLOW, &st) == 0 &&
+         (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG && st.st_size == static_cast<off_t>(sizeof(DATA) - 1);
     vfs_get_cache_perf_snapshot(after_lstat);
     ok = ok && after_lstat.metadata_hits > after_old_lstat.metadata_hits;
 
@@ -25682,6 +25872,8 @@ auto vfs_selftest_metadata_cache_rejects_stale_negative_store() -> bool {
 }
 
 auto vfs_selftest_resolved_stat_cache_rejects_mount_generation_change() -> bool {
+    ker::mod::sched::task::Task requester{};
+    if (!vfs_selftest_initialize_task_paths(requester)) return false;
     vfs_mkdir("/tmp", 0755);
 
     constexpr const char* MOUNT_PATH = "/tmp/ktest_stat_mount_generation";
@@ -25708,16 +25900,16 @@ auto vfs_selftest_resolved_stat_cache_rejects_mount_generation_change() -> bool 
     VfsCachePerfSnapshot after_second{};
     Stat st{};
     if (ok) {
-        ok = vfs_stat(FILE_PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG;
+        ok = vfs_statat(&requester, AT_FDCWD, FILE_PATH, 0, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG;
         vfs_get_cache_perf_snapshot(after_first);
     }
     if (ok) {
-        ok = vfs_stat(FILE_PATH, &st) == 0;
+        ok = vfs_statat(&requester, AT_FDCWD, FILE_PATH, 0, &st) == 0;
         vfs_get_cache_perf_snapshot(after_second);
     }
     ok = ok && after_second.metadata_hits > after_first.metadata_hits;
     ok = (unmount_filesystem(MOUNT_PATH) == 0) && ok;
-    ok = vfs_stat(FILE_PATH, &st) == -ENOENT && ok;
+    ok = vfs_statat(&requester, AT_FDCWD, FILE_PATH, 0, &st) == -ENOENT && ok;
     ok = (vfs_rmdir(MOUNT_PATH) == 0) && ok;
     return ok;
 }
@@ -26530,6 +26722,7 @@ auto vfs_selftest_fchmodat_dirfd_changes_relative_file_mode() -> bool {
     vfs_put_file(created);
 
     ker::mod::sched::task::Task task{};
+    bool const TASK_PATHS_OK = vfs_selftest_initialize_task_paths(task);
     auto* dir = vfs_open_file(DIR_PATH, 0, 0);
     if (dir == nullptr) {
         vfs_unlink(FILE_PATH);
@@ -26538,7 +26731,7 @@ auto vfs_selftest_fchmodat_dirfd_changes_relative_file_mode() -> bool {
     }
 
     int const DIRFD = vfs_alloc_fd(&task, dir);
-    bool ok = DIRFD >= 0;
+    bool ok = TASK_PATHS_OK && DIRFD >= 0;
     if (ok) {
         ok = vfs_fchmodat(&task, DIRFD, FILE_NAME, EXPECTED_MODE, 0) == 0;
     }
@@ -26554,13 +26747,13 @@ auto vfs_selftest_fchmodat_dirfd_changes_relative_file_mode() -> bool {
     Stat st{};
     if (ok) {
         vfs_get_cache_perf_snapshot(before_file_stat);
-        ok = vfs_stat(FILE_PATH, &st) == 0 && (st.st_mode & 07777) == EXPECTED_MODE;
+        ok = vfs_statat(&task, AT_FDCWD, FILE_PATH, 0, &st) == 0 && (st.st_mode & 07777) == EXPECTED_MODE;
         vfs_get_cache_perf_snapshot(after_file_stat);
         ok = ok && after_file_stat.metadata_hits > before_file_stat.metadata_hits;
     }
     if (ok) {
         vfs_get_cache_perf_snapshot(before_abs_stat);
-        ok = vfs_stat(ABS_FILE_PATH, &st) == 0 && (st.st_mode & 07777) == EXPECTED_ABS_MODE;
+        ok = vfs_statat(&task, AT_FDCWD, ABS_FILE_PATH, 0, &st) == 0 && (st.st_mode & 07777) == EXPECTED_ABS_MODE;
         vfs_get_cache_perf_snapshot(after_abs_stat);
         ok = ok && after_abs_stat.metadata_hits > before_abs_stat.metadata_hits;
     }
@@ -26610,6 +26803,7 @@ auto vfs_selftest_fchownat_dirfd_changes_relative_file_owner() -> bool {
     vfs_put_file(created);
 
     ker::mod::sched::task::Task task{};
+    bool const TASK_PATHS_OK = vfs_selftest_initialize_task_paths(task);
     auto* dir = vfs_open_file(DIR_PATH, 0, 0);
     if (dir == nullptr) {
         vfs_unlink(FILE_PATH);
@@ -26618,7 +26812,7 @@ auto vfs_selftest_fchownat_dirfd_changes_relative_file_owner() -> bool {
     }
 
     int const DIRFD = vfs_alloc_fd(&task, dir);
-    bool ok = DIRFD >= 0;
+    bool ok = TASK_PATHS_OK && DIRFD >= 0;
     if (ok) {
         ok = vfs_fchownat(&task, DIRFD, FILE_NAME, EXPECTED_UID, EXPECTED_GID, 0) == 0;
     }
@@ -26634,13 +26828,13 @@ auto vfs_selftest_fchownat_dirfd_changes_relative_file_owner() -> bool {
     Stat st{};
     if (ok) {
         vfs_get_cache_perf_snapshot(before_file_stat);
-        ok = vfs_stat(FILE_PATH, &st) == 0 && st.st_uid == EXPECTED_UID && st.st_gid == EXPECTED_GID;
+        ok = vfs_statat(&task, AT_FDCWD, FILE_PATH, 0, &st) == 0 && st.st_uid == EXPECTED_UID && st.st_gid == EXPECTED_GID;
         vfs_get_cache_perf_snapshot(after_file_stat);
         ok = ok && after_file_stat.metadata_hits > before_file_stat.metadata_hits;
     }
     if (ok) {
         vfs_get_cache_perf_snapshot(before_abs_stat);
-        ok = vfs_stat(ABS_FILE_PATH, &st) == 0 && st.st_uid == EXPECTED_ABS_UID && st.st_gid == EXPECTED_ABS_GID;
+        ok = vfs_statat(&task, AT_FDCWD, ABS_FILE_PATH, 0, &st) == 0 && st.st_uid == EXPECTED_ABS_UID && st.st_gid == EXPECTED_ABS_GID;
         vfs_get_cache_perf_snapshot(after_abs_stat);
         ok = ok && after_abs_stat.metadata_hits > before_abs_stat.metadata_hits;
     }
@@ -26657,6 +26851,8 @@ auto vfs_selftest_fchownat_dirfd_changes_relative_file_owner() -> bool {
 }
 
 auto vfs_selftest_stat_lstat_share_non_symlink_cache() -> bool {
+    ker::mod::sched::task::Task requester{};
+    if (!vfs_selftest_initialize_task_paths(requester)) return false;
     vfs_mkdir("/tmp", 0755);
 
     constexpr const char* PATH = "/tmp/ktest_stat_lstat_shared_cache";
@@ -26679,6 +26875,16 @@ auto vfs_selftest_stat_lstat_share_non_symlink_cache() -> bool {
     }
     vfs_put_file(created);
 
+    auto* cache_only = vfs_open_file(CACHE_ONLY_PATH, O_CREAT | O_EXCL | 2, 0644);
+    bool const CACHE_ONLY_SEEDED = cache_only != nullptr && cache_only->fops != nullptr && cache_only->fops->vfs_truncate != nullptr &&
+                                   cache_only->fops->vfs_truncate(cache_only, 424242) == 0;
+    if (cache_only != nullptr) vfs_put_file(cache_only);
+    if (!CACHE_ONLY_SEEDED) {
+        vfs_unlink(CACHE_ONLY_PATH);
+        vfs_unlink(PATH);
+        return false;
+    }
+
     std::array<char, MAX_PATH_LEN> symlink_resolved{};
     size_t symlink_resolved_len = UNKNOWN_PATH_LEN;
     symlink_resolved.fill('x');
@@ -26695,10 +26901,11 @@ auto vfs_selftest_stat_lstat_share_non_symlink_cache() -> bool {
     VfsCachePerfSnapshot after_stat{};
     Stat st{};
     vfs_get_cache_perf_snapshot(before);
-    bool ok = RESOLVER_OUTPUT_OK && vfs_lstat(PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG;
+    bool ok = RESOLVER_OUTPUT_OK && vfs_statat(&requester, AT_FDCWD, PATH, AT_SYMLINK_NOFOLLOW, &st) == 0 &&
+              (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG;
     vfs_get_cache_perf_snapshot(after_lstat);
     if (ok) {
-        ok = ok && vfs_stat(PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG;
+        ok = ok && vfs_statat(&requester, AT_FDCWD, PATH, 0, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG;
         vfs_get_cache_perf_snapshot(after_stat);
     }
     ok = ok && after_lstat.metadata_stores > before.metadata_stores && after_stat.metadata_hits > after_lstat.metadata_hits;
@@ -26715,9 +26922,8 @@ auto vfs_selftest_stat_lstat_share_non_symlink_cache() -> bool {
     vfs_cache_notify_path_changed(CACHE_ONLY_PATH, nullptr);
     if (cache_only_mount != nullptr) {
         Stat cache_only_stat{};
-        cache_only_stat.st_mode = static_cast<mode_t>(S_IFREG | 0644);
-        cache_only_stat.st_dev = cache_only_mount->dev_id;
-        cache_only_stat.st_size = 424242;
+        ok = ok && cache_fixture_tmpfs_stat(requester, CACHE_ONLY_PATH, &cache_only_stat, CacheFixtureStatMode::BACKEND) == 0 &&
+             cache_only_stat.st_size == 424242 && cache_only_stat.st_ino != 0;
         uint64_t const CACHE_ONLY_HASH = metadata_path_hash_raw(CACHE_ONLY_PATH, CACHE_ONLY_PATH_LEN);
         metadata_cache_store_known_stat_variants(CACHE_ONLY_PATH, cache_only_mount->fs_type, cache_only_mount->dev_id, cache_only_stat,
                                                  metadata_snapshot_stamp(), CACHE_ONLY_PATH_LEN, cache_only_mount, CACHE_ONLY_HASH);
@@ -26735,9 +26941,17 @@ auto vfs_selftest_stat_lstat_share_non_symlink_cache() -> bool {
         VfsCachePerfSnapshot after_cache_only_resolved_stat{};
         Stat cache_only_out{};
         vfs_get_cache_perf_snapshot(before_cache_only_resolved_stat);
-        int const CACHE_ONLY_STAT_RET =
-            vfs_stat_resolved_cache_or_impl(CACHE_ONLY_PATH, true, false, true, &cache_only_out, CACHE_ONLY_PATH_LEN, CACHE_ONLY_HASH);
-        ok = ok && CACHE_ONLY_STAT_RET == 0 && cache_only_out.st_size == cache_only_stat.st_size;
+        // The legacy path-only entrance still refuses positive regular TMPFS
+        // authority without a current Task, leaving the output untouched.
+        if (!ker::mod::sched::can_query_current_task()) {
+            cache_only_out.st_size = -1;
+            int const LEGACY_CACHE_ONLY_RET = metadata_cache_lookup_mount_stat(CACHE_ONLY_PATH, cache_only_mount, true, false,
+                                                                               &cache_only_out, CACHE_ONLY_PATH_LEN, CACHE_ONLY_HASH);
+            ok = ok && LEGACY_CACHE_ONLY_RET == -EAGAIN && cache_only_out.st_size == -1;
+        }
+        int const CACHE_ONLY_STAT_RET = cache_fixture_tmpfs_stat(requester, CACHE_ONLY_PATH, &cache_only_out, CacheFixtureStatMode::CACHED);
+        ok = ok && CACHE_ONLY_STAT_RET == 0 && cache_only_out.st_size == cache_only_stat.st_size &&
+             cache_only_out.st_ino == cache_only_stat.st_ino;
         vfs_get_cache_perf_snapshot(after_cache_only_resolved_stat);
         ok = ok && after_cache_only_resolved_stat.metadata_hits > before_cache_only_resolved_stat.metadata_hits;
         vfs_cache_notify_path_changed(CACHE_ONLY_PATH, nullptr);
@@ -26797,6 +27011,7 @@ auto vfs_selftest_stat_lstat_share_non_symlink_cache() -> bool {
              after_existence_only_missing_stat.symlink_misses == before_existence_only_missing_stat.symlink_misses;
     }
 
+    ok = (vfs_unlink(CACHE_ONLY_PATH) == 0) && ok;
     ok = (vfs_unlink(PATH) == 0) && ok;
     return ok;
 }

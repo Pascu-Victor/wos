@@ -15,12 +15,13 @@ class TmpfsReadSharedBacking { public: uint64_t eof() const { std::abort(); }
 namespace ker::mod::mm::file_mapping {
 enum class FamilyOwner { SNAPSHOT };
 enum class BindingOwner { PIN, SNAPSHOT, INSTALLER };
-enum class FileMappingBackingMode { PRIVATE_COPY, TMPFS_READ_SHARED, TMPFS_DEMAND_READ_SHARED };
+enum class FileMappingBackingMode { PRIVATE_COPY, TMPFS_READ_SHARED, TMPFS_DEMAND_READ_SHARED, TMPFS_DEMAND_WRITE_SHARED };
 class FileMappingLifetime { public:
  bool try_acquire(FamilyOwner) { std::abort(); }
  void release(FamilyOwner) { std::abort(); }
  ker::vfs::File* file() const { std::abort(); }
  FileMappingBackingMode backing_mode() const { std::abort(); }
+ bool is_demand_shared() const { std::abort(); }
  const ker::vfs::tmpfs::TmpfsReadSharedBacking* read_shared_backing() const { std::abort(); }
 };
 class FileMappingBinding { public:
@@ -39,8 +40,11 @@ struct FileMappingIndex {
 '''
 
 RANGE_HELPERS = r'''
+inline bool lazy_vmem_is_tmpfs_shared(const LazyVmemRange& r) {
+ return r.kind==LazyVmemKind::TMPFS_READ_SHARED||r.kind==LazyVmemKind::TMPFS_WRITE_SHARED;
+}
 inline bool lazy_vmem_has_lifetime(const LazyVmemRange& r) {
- return r.kind==LazyVmemKind::NATIVE_FILE_BACKED||r.kind==LazyVmemKind::TMPFS_READ_SHARED;
+ return r.kind==LazyVmemKind::NATIVE_FILE_BACKED||lazy_vmem_is_tmpfs_shared(r);
 }
 inline bool lazy_vmem_is_file(const LazyVmemRange& r) {
  return r.kind==LazyVmemKind::FILE_BACKED||lazy_vmem_has_lifetime(r);
@@ -73,7 +77,7 @@ def extend_raw_fixture(code: str, lock: str) -> str:
     code = '#include <cstdlib>\n' + code[:match.start()] + DECLARATIONS + code[match.start():]
     old = 'enum class LazyVmemKind{ANONYMOUS,FILE_BACKED};'
     assert code.count(old) == 1
-    code = code.replace(old, 'enum class LazyVmemKind{ANONYMOUS,FILE_BACKED,NATIVE_FILE_BACKED,TMPFS_READ_SHARED};')
+    code = code.replace(old, 'enum class LazyVmemKind{ANONYMOUS,FILE_BACKED,NATIVE_FILE_BACKED,TMPFS_READ_SHARED,TMPFS_WRITE_SHARED};')
     old = 'ker::vfs::File*file=nullptr;'
     assert code.count(old) == 1
     code = code.replace(old, old + 'ker::mod::mm::file_mapping::FileMappingLifetime*lifetime=nullptr;')

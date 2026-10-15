@@ -74,6 +74,12 @@ struct TmpNode {
     ker::vfs::ExecContentState exec_content;
     // Fixed-EOF canonical mapping intervals; protected by io_lock.
     uint64_t read_shared_eof_leases = 0;
+    // Writable demand families are distinct from executable direct writers:
+    // ordinary in-EOF writes remain permitted. Both counts use io_lock.
+    uint64_t mapped_writer_families = 0;
+    uint64_t tail_writer_families = 0;
+    // Once writable canonical bytes exist, copied caches never regain authority.
+    std::atomic<bool> mutable_mapping_cache_bypass{false};
     ker::vfs::coherency::Object coherency{};
 
     // Reference counting for POSIX unlink semantics
@@ -107,7 +113,7 @@ class TmpfsNodeRef {
    private:
     friend class TmpfsLookupHandle;
     friend class TmpfsReadSharedBacking;
-    friend class TmpfsDemandReadSharedBacking;
+    friend class TmpfsDemandSharedBacking;
     friend auto tmpfs_acquire_node(TmpNode* node) -> TmpfsNodeRef;
     friend auto tmpfs_acquire_lookup(const ker::mod::security::Snapshot& credentials, TmpNode* root, const char* path,
                                      TmpfsLookupHandle* out) -> int;
@@ -138,7 +144,7 @@ class TmpfsPageLoan {
 
    private:
     friend class TmpfsReadSharedBacking;
-    friend class TmpfsDemandReadSharedBacking;
+    friend class TmpfsDemandSharedBacking;
     void* frame_ = nullptr;
     uint64_t object_identity_ = 0;
     uint64_t file_offset_ = 0;
@@ -177,32 +183,51 @@ class TmpfsReadSharedBacking {
 // Public demand preparation is sleepable: never enter either method while
 // holding MM/root/publication/IRQ guards or a persistent usercopy/page pin.
 // Admission owns fixed EOF and backend identity without prefaulting pages.
-class TmpfsDemandReadSharedBacking {
+class TmpfsDemandSharedBacking {
    public:
-    TmpfsDemandReadSharedBacking(const TmpfsDemandReadSharedBacking&) = delete;
-    auto operator=(const TmpfsDemandReadSharedBacking&) -> TmpfsDemandReadSharedBacking& = delete;
-    TmpfsDemandReadSharedBacking(TmpfsDemandReadSharedBacking&&) = delete;
-    auto operator=(TmpfsDemandReadSharedBacking&&) -> TmpfsDemandReadSharedBacking& = delete;
-    ~TmpfsDemandReadSharedBacking();
+    TmpfsDemandSharedBacking(const TmpfsDemandSharedBacking&) = delete;
+    auto operator=(const TmpfsDemandSharedBacking&) -> TmpfsDemandSharedBacking& = delete;
+    TmpfsDemandSharedBacking(TmpfsDemandSharedBacking&&) = delete;
+    auto operator=(TmpfsDemandSharedBacking&&) -> TmpfsDemandSharedBacking& = delete;
+    ~TmpfsDemandSharedBacking();
 
-    static auto prepare(File& file, uint64_t file_offset, uint64_t length, std::unique_ptr<TmpfsDemandReadSharedBacking>& empty) -> int;
+    static auto prepare(File& file, uint64_t file_offset, uint64_t length, bool write_capable,
+                        std::unique_ptr<TmpfsDemandSharedBacking>& empty) -> int;
+    static auto prepare(File& file, uint64_t file_offset, uint64_t length, std::unique_ptr<TmpfsDemandSharedBacking>& empty) -> int {
+        return prepare(file, file_offset, length, false, empty);
+    }
     auto object_identity() const -> uint64_t { return object_identity_; }
     auto eof() const -> uint64_t { return eof_; }
     auto file_offset() const -> uint64_t { return file_offset_; }
     auto length() const -> uint64_t { return length_; }
+    auto writable() const noexcept -> bool { return writable_; }
     // Requires a retained backing owner. Output must be empty and is unchanged
     // on refusal. Success owns one frame ref; no relocating descriptor escapes.
     auto prepare_page(uint64_t absolute_aligned_offset, TmpfsPageLoan& empty) const -> int;
+    // Canonical bytes need no copy-back. Conservatively publish timestamps in
+    // ordinary context outside every MM/root/publication/IRQ guard.
+    auto sync_metadata() const -> int;
 
    private:
-    TmpfsDemandReadSharedBacking() = default;
+    TmpfsDemandSharedBacking() = default;
     NativeFileMappingMountPin mount_pin_{};
     TmpfsNodeRef node_{};
+    void* tail_anchor_ = nullptr;
     uint64_t object_identity_ = 0;
     uint64_t eof_ = 0;
     uint64_t file_offset_ = 0;
     uint64_t length_ = 0;
+    bool writable_ = false;
+    // Protected by the retained canonical inode's io_lock. Only a successful
+    // post-publication sync may make final cleanup update visible timestamps.
+    mutable bool write_exposed_ = false;
     bool eof_lease_ = false;
+};
+
+struct TmpfsCacheAuthority {
+    bool bypass{};
+    uint64_t inode{};
+    uint64_t object_identity{};
 };
 
 class TmpfsLookupHandle {
@@ -333,6 +358,12 @@ auto tmpfs_directory_path_beneath(TmpNode* root, TmpNode* directory, char* out, 
 auto tmpfs_lookup_directory_path_beneath(TmpNode* root, const TmpfsLookupHandle& lookup, char* out, size_t capacity) -> int;
 auto tmpfs_validate_lookup_locked(const TmpfsLookupHandle& handle) -> bool;
 auto tmpfs_validate_lookup(const TmpfsLookupHandle& handle) -> bool;
+// File query requires a retained actual File and never locks, allocates or
+// follows a cached inode pointer. Lookup query validates under the tree lock;
+// call outside cache/IRQ locks. Failure leaves output unchanged.
+auto tmpfs_file_cache_authority(const File& file) noexcept -> TmpfsCacheAuthority;
+inline auto tmpfs_file_mutable_cache_bypass(const File& file) noexcept -> bool { return tmpfs_file_cache_authority(file).bypass; }
+auto tmpfs_lookup_cache_authority(const TmpfsLookupHandle& handle, TmpfsCacheAuthority& output) -> int;
 auto tmpfs_namespace_generation_locked() -> uint64_t;
 auto tmpfs_namespace_generation() -> uint64_t;
 // VFS path-search admission epoch, separate from backend handle membership.
