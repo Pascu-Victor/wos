@@ -1,3 +1,4 @@
+#include <cerrno>
 #include <climits>
 #include <new>
 #include <platform/mm/file_mapping_lifetime.hpp>
@@ -7,6 +8,7 @@
 #include <platform/sys/usercopy.hpp>
 #include <utility>
 #include <vfs/file.hpp>
+#include <vfs/fs/tmpfs.hpp>
 #include <vfs/vfs.hpp>
 
 namespace ker::mod::mm::file_mapping {
@@ -91,6 +93,8 @@ FileMappingLifetime::FileMappingLifetime(const LifetimeRetirementPort& port) noe
     owners_.total = 1;
 }
 
+FileMappingLifetime::~FileMappingLifetime() = default;
+
 auto FileMappingLifetime::prepare(ker::vfs::File& borrowed_file) -> FileMappingLifetime* {
     auto const* port = LifetimeRetirementExecutor::port();
     if (port == nullptr || !port_valid(*port)) return nullptr;
@@ -130,6 +134,28 @@ auto FileMappingLifetime::prepare(ker::vfs::File& borrowed_file, RetirementCompl
     delete owner;
     ker::vfs::vfs_put_file(&borrowed_file);  // Caller still owns its borrowed ref.
     return nullptr;
+}
+
+auto FileMappingLifetime::prepare_read_shared_tmpfs(ker::vfs::File& borrowed_file, uint64_t file_offset, uint64_t length,
+                                                    RetirementCompletion& empty, int& error) -> FileMappingLifetime* {
+    if (!empty.empty()) {
+        error = -EINVAL;
+        return nullptr;
+    }
+    std::unique_ptr<ker::vfs::tmpfs::TmpfsReadSharedBacking> backing;
+    error = ker::vfs::tmpfs::TmpfsReadSharedBacking::prepare(borrowed_file, file_offset, length, backing);
+    if (error != 0) return nullptr;
+    auto* owner = prepare(borrowed_file, empty);
+    if (owner == nullptr) {
+        error = -ENOMEM;
+        return nullptr;
+    }
+    // The sole PREPARED owner is still unpublished. No fallible operation or
+    // cleanup occurs after observer capture and before adoption.
+    owner->read_shared_backing_ = std::move(backing);
+    owner->backing_mode_ = FileMappingBackingMode::TMPFS_READ_SHARED;
+    error = 0;
+    return owner;
 }
 
 auto FileMappingLifetime::try_acquire(FamilyOwner role) noexcept -> bool {
@@ -180,6 +206,9 @@ auto FileMappingLifetime::finish(void* argument) noexcept -> int {
     // All MM/owner/queue guards have ended. Close may destroy File even on error;
     // its result is recorded once after return, never retried with a freed arg.
     int const RESULT = ker::vfs::vfs_put_file_result(file);
+    // The actual close has returned. Release canonical frames, EOF/node owners
+    // and finally mount busy ownership before the executor publishes RETURNED.
+    owner->read_shared_backing_.reset();
     delete owner;
     return RESULT;
 }

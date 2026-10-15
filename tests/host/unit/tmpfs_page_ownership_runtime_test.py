@@ -7,6 +7,9 @@ bounded/public scan and final node-free bodies are compiled without rewriting
 their bytes. Physical frame allocation/refcounts, swap and mutex operations are
 named Host seams with independent byte/reference/quota/lifetime oracles. This
 does not qualify real MM aliases, devices, concurrency or native coherence.
+Actual write/append/copy EOF guards and complete NodeRef acquisition/cleanup
+bodies are also compiled. Owned Host inode EOF/counter-limit inputs exercise
+those guards; native backing preparation/anchors/mount graphs are separate.
 
 The bounded process/scratch runner is shared with the actual file-registry
 regression. --tmpfs-source accepts a complete archived predecessor; --only
@@ -56,6 +59,9 @@ VECTORS = (
     "resize_array_oom", "resize_port_resident_oom", "resize_port_swapped_oom",
     "resize_port_hole_oom", "resize_port_grow_oom", "resize_swap_read_failure",
     "resize_swap_success", "resize_nonallocating", "resize_admission",
+    "eof_write_guard", "eof_resize_guard", "eof_copy_guard",
+    "checked_node_pins", "checked_alias_pins", "node_pin_real_deferred_free",
+    "checked_lookup_transactions",
 )
 
 LOCKS = r'''
@@ -126,6 +132,7 @@ PRELUDE = r'''
 #include <new>
 #include <string_view>
 #include <sys/mman.h>
+#include <utility>
 #include <unistd.h>
 #include <util/smallvec.hpp>
 #include <platform/sched/file_growth.hpp>
@@ -207,6 +214,15 @@ void operator delete[](void* memory, const std::nothrow_t&) noexcept { ::operato
 namespace ker::vfs {
 struct File { void* private_data{}; FileOperations* fops{}; int open_flags{2}; FSType fs_type{FSType::TMPFS}; };
 namespace tmpfs { auto get_tmpfs_fops() -> FileOperations*; }
+}
+// This test isolates pin transactions after search authorization. Credential
+// policy is an explicit Host primitive; production FileIdentity is imported.
+namespace ker::mod::security {
+class Snapshot {};
+auto authorize_file_access(const Snapshot&,const FileIdentity& object,int access) -> int {
+    CHECK((object.mode & 0170000U)==0040000U && access==1);
+    return 0;
+}
 }
 namespace ker::mod::time { auto get_epoch_ns() -> uint64_t { return ++fixture::epoch_ns; } }
 namespace ker::mod::sched::resource {
@@ -330,7 +346,7 @@ void empty_baseline() {
     CHECK(tmpfs_nodes.size() == 0 && tmpfs_resident_pages.load() == 0);
     CHECK(frames.empty() && slots.empty() && allocations == frees);
     CHECK(destroy_held == 0 && invalid_unlock == 0 && lock_errors == 0);
-    CHECK(locks.size() == 1); // Only the complete actual global registry mutex.
+    CHECK(locks.size() == 2); // Complete actual global tree and registry mutexes.
     CHECK(arrays.empty() && array_allocations == array_frees);
     for (auto [_, held] : locks) CHECK(!held);
 }
@@ -690,6 +706,151 @@ void resize_admission() {
     file.fs_type=ker::vfs::FSType::TMPFS;
     CHECK(growth_commits==0 && array_faults==0);
 }
+void unchanged_eof(Node& f,const ResizeSnapshot& before) {
+    unchanged_resize(f,before);
+    auto after=resize_snapshot(f);
+    CHECK(after.stamp.content==before.stamp.content && after.stamp.metadata==before.stamp.metadata);
+}
+void eof_write_guard() {
+    Node f;resize_setup(f,1);auto file=resize_file(f);
+    auto* frame=f.node->pages[0].data;phys::page_ref_inc(frame);
+    f.node->read_shared_eof_leases=1;
+    std::array<unsigned char,8> bytes{0x31,0x72,0x19,0x93,0x42,0x51,0x87,0x22};
+    growth_inode_lock=reinterpret_cast<uintptr_t>(&f.node->io_lock);
+    CHECK(tmpfs_write(&file,bytes.data(),bytes.size(),17)==static_cast<ssize_t>(bytes.size()));
+    growth_inode_lock=0;
+    CHECK(f.node->pages[0].data==frame && refs(frame)==2 && f.node->size==3*BS);
+    CHECK(std::memcmp(static_cast<unsigned char*>(frame)+17,bytes.data(),bytes.size())==0);
+    auto before=resize_snapshot(f);auto alloc=allocations,slots_before=slot_allocations;
+    auto reads=slot_reads,writes=slot_writes,arrays_before=array_allocations,commits=growth_commits;
+    growth_inode_lock=reinterpret_cast<uintptr_t>(&f.node->io_lock);
+    CHECK(tmpfs_write(&file,bytes.data(),bytes.size(),3*BS-4)==-EBUSY);
+    size_t append_offset=999;
+    CHECK(tmpfs_write_append(&file,bytes.data(),bytes.size(),&append_offset)==-EBUSY && append_offset==999);
+    growth_inode_lock=0;
+    unchanged_eof(f,before);
+    CHECK(allocations==alloc && slot_allocations==slots_before && slot_reads==reads && slot_writes==writes);
+    CHECK(array_allocations==arrays_before && growth_commits==commits && refs(frame)==2);
+    CHECK(tmpfs_write(&file,bytes.data(),0,3*BS+100)==0);
+    f.node->read_shared_eof_leases=0;
+    CHECK(tmpfs_write(&file,bytes.data(),bytes.size(),3*BS-4)==static_cast<ssize_t>(bytes.size()));
+    CHECK(f.node->size==3*BS+4);
+    CHECK(phys::page_ref_dec(frame)==1);
+}
+void eof_resize_guard() {
+    for(unsigned kind=0;kind<3;++kind) {
+        Node f;resize_setup(f,kind);auto file=resize_file(f);f.node->read_shared_eof_leases=1;
+        auto before=resize_snapshot(f);auto alloc=allocations,reads=slot_reads,writes=slot_writes;
+        auto arrays_before=array_allocations,commits=growth_commits;
+        CHECK(truncate(file,127)==-EBUSY);
+        unchanged_eof(f,before);
+        CHECK(truncate(file,4*BS)==-EBUSY);
+        unchanged_eof(f,before);
+        CHECK(allocations==alloc && array_allocations==arrays_before && slot_reads==reads && slot_writes==writes);
+        CHECK(growth_commits==commits);
+        CHECK(truncate(file,3*BS)==0 && f.node->size==3*BS);
+        f.node->read_shared_eof_leases=0;
+        CHECK(truncate(file,127)==0 && f.node->size==127);
+    }
+}
+void eof_copy_guard() {
+    Node dst,src;resize_setup(dst,1);resize_setup(src,1);
+    fill_bytes(src.node->pages[0].data,0x21);
+    fill_bytes(src.node->pages[2].data,0x45);
+    dst.node->read_shared_eof_leases=1;
+    auto before=resize_snapshot(dst),source=resize_snapshot(src);
+    auto alloc=allocations,decs=decrements,reads=slot_reads,writes=slot_writes;
+    auto arrays_before=array_allocations;
+    CHECK(tmpfs_copy_file_contents(dst.node,src.node)==-EBUSY);
+    unchanged_eof(dst,before);unchanged_eof(src,source);
+    CHECK(allocations==alloc && decrements==decs && slot_reads==reads && slot_writes==writes);
+    CHECK(array_allocations==arrays_before && tmpfs_copy_file_contents(dst.node,dst.node)==0);
+    unchanged_eof(dst,before);
+    dst.node->read_shared_eof_leases=0;
+    CHECK(tmpfs_copy_file_contents(dst.node,src.node)==0);
+    CHECK(dst.node->size==src.node->size && dst.node->charged_pages==2);
+    CHECK(std::memcmp(dst.node->pages[0].data,src.node->pages[0].data,BS)==0);
+    CHECK(std::memcmp(dst.node->pages[2].data,src.node->pages[2].data,BS)==0);
+}
+void checked_node_pins() {
+    Node f;
+    f.node->lookup_ref_count.store(UINT32_MAX);
+    auto denied=tmpfs_acquire_node(f.node);
+    CHECK(!denied && f.node->lookup_ref_count.load()==UINT32_MAX);
+    // A genuine old unchecked body may wrap. Normalize only this owned Host
+    // fault-input counter before releasing any unexpectedly acquired owner.
+    if(denied)f.node->lookup_ref_count.store(1);
+    denied.reset();f.node->lookup_ref_count.store(0);
+    f.node->lookup_ref_count.store(UINT32_MAX-1);
+    auto pin=tmpfs_acquire_node(f.node);
+    CHECK(pin && pin.get()==f.node && f.node->lookup_ref_count.load()==UINT32_MAX);
+    pin.reset();CHECK(f.node->lookup_ref_count.load()==UINT32_MAX-1);
+    f.node->lookup_ref_count.store(0);
+}
+void checked_alias_pins() {
+    Node alias,canonical;alias.node->hardlink_target=canonical.node;
+    for(unsigned which=0;which<2;++which) {
+        alias.node->lookup_ref_count.store(which==0?UINT32_MAX:0);
+        canonical.node->lookup_ref_count.store(which==1?UINT32_MAX:0);
+        auto denied=tmpfs_acquire_node(alias.node);
+        CHECK(!denied && alias.node->lookup_ref_count.load()==(which==0?UINT32_MAX:0));
+        CHECK(canonical.node->lookup_ref_count.load()==(which==1?UINT32_MAX:0));
+        if(denied) {alias.node->lookup_ref_count.store(1);canonical.node->lookup_ref_count.store(1);}
+        denied.reset();alias.node->lookup_ref_count.store(0);canonical.node->lookup_ref_count.store(0);
+    }
+    alias.node->lookup_ref_count.store(UINT32_MAX-1);canonical.node->lookup_ref_count.store(UINT32_MAX-1);
+    auto pin=tmpfs_acquire_node(alias.node);
+    CHECK(pin && pin.get()==alias.node && alias.node->lookup_ref_count.load()==UINT32_MAX);
+    CHECK(canonical.node->lookup_ref_count.load()==UINT32_MAX);
+    TmpfsNodeRef moved(std::move(pin));CHECK(!pin && moved);
+    TmpfsNodeRef assigned;assigned=std::move(moved);CHECK(!moved && assigned);
+    assigned.reset();
+    CHECK(alias.node->lookup_ref_count.load()==UINT32_MAX-1 && canonical.node->lookup_ref_count.load()==UINT32_MAX-1);
+    alias.node->lookup_ref_count.store(0);canonical.node->lookup_ref_count.store(0);
+    alias.node->hardlink_target=nullptr;
+}
+void node_pin_real_deferred_free() {
+    Node f;f.page(0,0x29);
+    auto pin=tmpfs_acquire_node(f.node);
+    CHECK(pin && f.node->lookup_ref_count.load()==1);
+    f.node->unlinked=true;f.node->link_count.store(0);
+    f.dispose();CHECK(frames.size()==1 && f.mount.used_bytes==BS);
+    pin.reset();CHECK(frames.empty() && f.mount.used_bytes==0 && tmpfs_nodes.size()==0);
+}
+void checked_lookup_transactions() {
+    Node root,child;root.node->type=TmpNodeType::DIRECTORY;root.node->mode=0755;
+    std::memcpy(child.node->name.data(),"leaf",5);
+    root.node->children=new TmpNode*[1]{child.node};root.node->children_count=1;
+    ker::mod::security::Snapshot credentials{};
+    for(const char* path:{"/","."}) {
+        root.node->lookup_ref_count.store(UINT32_MAX-1);
+        TmpfsLookupHandle out{};
+        CHECK(tmpfs_acquire_lookup(credentials,root.node,path,&out)==-EOVERFLOW);
+        CHECK(out.parent()==nullptr && out.target()==nullptr && root.node->lookup_ref_count.load()==UINT32_MAX-1);
+        if(out.parent()!=nullptr || out.target()!=nullptr)root.node->lookup_ref_count.store(2);
+        out=TmpfsLookupHandle{};root.node->lookup_ref_count.store(0);
+        CHECK(lock_errors==0 && invalid_unlock==0);
+    }
+    child.node->lookup_ref_count.store(UINT32_MAX);
+    TmpfsLookupHandle denied{};
+    CHECK(tmpfs_acquire_lookup(credentials,root.node,"leaf",&denied)==-EOVERFLOW);
+    CHECK(denied.parent()==nullptr && denied.target()==nullptr && root.node->lookup_ref_count.load()==0);
+    CHECK(child.node->lookup_ref_count.load()==UINT32_MAX);
+    if(denied.parent()!=nullptr)root.node->lookup_ref_count.store(1);
+    if(denied.target()!=nullptr)child.node->lookup_ref_count.store(1);
+    denied=TmpfsLookupHandle{};root.node->lookup_ref_count.store(0);child.node->lookup_ref_count.store(0);
+    TmpfsLookupHandle missing{};
+    CHECK(tmpfs_acquire_lookup(credentials,root.node,"missing",&missing)==0);
+    CHECK(missing.parent()==root.node && missing.target()==nullptr && !missing.target_existed());
+    missing=TmpfsLookupHandle{};CHECK(root.node->lookup_ref_count.load()==0);
+    root.node->lookup_ref_count.store(UINT32_MAX);
+    CHECK(tmpfs_acquire_lookup(credentials,root.node,"missing",&missing)==-EOVERFLOW);
+    CHECK(missing.parent()==nullptr && root.node->lookup_ref_count.load()==UINT32_MAX);
+    if(missing.parent()!=nullptr)root.node->lookup_ref_count.store(1);
+    missing=TmpfsLookupHandle{};root.node->lookup_ref_count.store(0);
+    root.node->children[0]=nullptr;
+    CHECK(lock_errors==0 && invalid_unlock==0);
+}
 }
 int main(int argc, char** argv) {
     using namespace fixture;
@@ -725,6 +886,13 @@ int main(int argc, char** argv) {
     else if (name == "resize_swap_success") resize_swap_success();
     else if (name == "resize_nonallocating") resize_nonallocating();
     else if (name == "resize_admission") resize_admission();
+    else if (name == "eof_write_guard") eof_write_guard();
+    else if (name == "eof_resize_guard") eof_resize_guard();
+    else if (name == "eof_copy_guard") eof_copy_guard();
+    else if (name == "checked_node_pins") checked_node_pins();
+    else if (name == "checked_alias_pins") checked_alias_pins();
+    else if (name == "node_pin_real_deferred_free") node_pin_real_deferred_free();
+    else if (name == "checked_lookup_transactions") checked_lookup_transactions();
     else return 2;
     empty_baseline();
     std::printf("%s case=%s assertions=%llu failures=%llu frames=%zu slots=%zu resident=%llu registry=%zu destroy_held=%llu invalid_unlock=%llu real_tmpfs=1 real_smallvec=1\n",
@@ -760,7 +928,7 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
         path = include / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
-    types = ["#pragma once\n#include <cstdint>\n#include <cstddef>\n"]
+    types = ["#pragma once\n#include <cstdint>\n#include <cstddef>\nnamespace ker::mod::security { class Snapshot; }\n"]
     paging = KERN / "platform/mm/paging.hpp"
     lines = [line for line in paging.read_text().splitlines() if line.startswith("constexpr uint64_t PAGE_SIZE =")]
     if len(lines) != 1:
@@ -772,7 +940,8 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
         (KERN / "platform/mm/page_alloc.hpp", "ker::mod::mm", ["enum class PhysicalPageOwner : uint8_t {"]),
         (KERN / "platform/mm/swap.hpp", "ker::mod::mm::swap", ["struct SwapSlot {", "constexpr auto invalid_slot()", "constexpr auto slot_valid("]),
         (KERN / "vfs/file.hpp", "ker::vfs", ["enum class FSType : uint8_t {"]),
-        (HEADER, "ker::vfs::tmpfs", ["enum class TmpNodeType : uint8_t {", "enum class TmpPageState : uint8_t {", "struct TmpPage {", "struct TmpNode {", "struct TmpfsMount {", "struct TmpfsResizeDescriptorObservation {"]),
+        (KERN / "platform/security/file_policy.hpp", "ker::mod::security", ["struct FileIdentity {"]),
+        (HEADER, "ker::vfs::tmpfs", ["enum class TmpNodeType : uint8_t {", "enum class TmpPageState : uint8_t {", "struct TmpPage {", "struct TmpNode {", "struct TmpfsMount {", "class TmpfsNodeRef {", "class TmpfsLookupHandle {", "struct TmpfsResizeDescriptorObservation {"]),
     ):
         text = path.read_text()
         types.append(f"namespace {namespace} {{\n")
@@ -787,11 +956,11 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
             names = [line for line in text.splitlines() if line.startswith("constexpr size_t TMPFS_NAME_MAX =")]
             if len(names) != 1:
                 raise ValueError("unique actual TMPFS_NAME_MAX declaration unavailable")
-            types.append(names[0] + "\nstruct TmpfsMount;\n")
+            types.append(names[0] + "\nstruct TmpfsMount;\nclass TmpfsLookupHandle;\n")
             actual.append({"source": str(path), "name": "TMPFS_NAME_MAX", "bytes": len(names[0].encode()),
                            "sha256": hashlib.sha256(names[0].encode()).hexdigest()})
         for anchor in anchors:
-            body, row = runner.capture(text, anchor, declaration=anchor.startswith(("struct ", "enum ")))
+            body, row = runner.capture(text, anchor, declaration=anchor.startswith(("struct ", "enum ", "class ")))
             actual.append({"source": str(path), **row})
             types.append(f'#line {row["line"]} "{path}"\n' + body + "\n")
         types.append("}\n")
@@ -799,16 +968,20 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
     source = selected.read_text()
     chunks = [PRELUDE, "namespace ker::mod::sched::resource {\n"]
     growth_source = KERN / "platform/sched/file_growth.cpp"
-    for anchor in ("auto FileGrowth::allow_resize(", "void FileGrowth::committed("):
+    budget_source = KERN / "platform/sched/resource_model.hpp"
+    body, row = runner.capture(budget_source.read_text(), "constexpr auto file_write_budget(")
+    actual.append({"source": str(budget_source), **row})
+    chunks.append(f'#line {row["line"]} "actual-file-write-budget.hpp"\n' + body + "\n")
+    for anchor in ("auto FileGrowth::bound_write(", "auto FileGrowth::allow_resize(", "void FileGrowth::committed("):
         body, row = runner.capture(growth_source.read_text(), anchor)
         actual.append({"source": str(growth_source), **row})
         chunks.append(f'#line {row["line"]} "actual-file-growth.cpp"\n' + body + "\n")
     chunks.extend(["}\n", "namespace ker::vfs::tmpfs {\n"])
     constants = ("constexpr size_t DEFAULT_TMPFS_BLOCK_SIZE", "constexpr uint64_t TMPFS_MIN_FREE_RESERVE_BYTES",
                  "constexpr uint64_t TMPFS_MAX_FREE_RESERVE_BYTES", "constexpr uint64_t TMPFS_FREE_RESERVE_DIVISOR", "constexpr uint64_t NS_PER_SEC")
-    globals_ = ("ker::mod::sys::Mutex tmpfs_node_registry_lock;", "ker::util::SmallVec<TmpNode*, 64> tmpfs_nodes;",
+    globals_ = ("ker::mod::sys::Mutex tmpfs_lock;", "ker::mod::sys::Mutex tmpfs_node_registry_lock;", "ker::util::SmallVec<TmpNode*, 64> tmpfs_nodes;",
                 "std::atomic<uint64_t> tmpfs_resident_pages", "std::atomic<uint64_t> tmpfs_reclaim_node_cursor",
-                "uint64_t tmpfs_node_registry_generation")
+                "uint64_t tmpfs_node_registry_generation", "std::atomic<uint64_t> tmpfs_namespace_generation_value")
     for anchor in (*constants, *globals_):
         lines = [line for line in source.splitlines() if line.startswith(anchor)]
         if len(lines) != 1:
@@ -838,6 +1011,15 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
         resize_anchors.append("auto selftest_tmpfs_truncate_descriptor_oom(")
     for anchor in resize_anchors:
         body, row = runner.capture(source, anchor, declaration=anchor.startswith("struct "))
+        actual.append({"source": str(selected), **row})
+        chunks.append(f'#line {row["line"]} "actual-selected-tmpfs.cpp"\n' + body + "\n")
+    node_retain = "auto tmpfs_retain_node_locked(" if "auto tmpfs_retain_node_locked(" in source else "void tmpfs_retain_node_locked("
+    for anchor in ("auto tmpfs_write_locked(", "auto tmpfs_write(", "auto tmpfs_write_append(", "auto tmpfs_copy_file_contents(",
+                   node_retain, "auto tmpfs_node_can_be_freed_locked(", "void tmpfs_release_node_ref_locked(",
+                   "auto TmpfsNodeRef::acquire_locked(", "TmpfsNodeRef::TmpfsNodeRef(", "auto TmpfsNodeRef::operator=(",
+                   "TmpfsNodeRef::~TmpfsNodeRef(", "void TmpfsNodeRef::reset(", "auto tmpfs_acquire_node(",
+                   "auto kstrcmp(", "auto tmpfs_lookup(", "auto tmpfs_namespace_generation_locked(", "auto tmpfs_acquire_lookup("):
+        body, row = runner.capture(source, anchor)
         actual.append({"source": str(selected), **row})
         chunks.append(f'#line {row["line"]} "actual-selected-tmpfs.cpp"\n' + body + "\n")
     chunks.append("auto get_tmpfs_fops() -> FileOperations* { static FileOperations table{}; table.vfs_truncate=tmpfs_fops_truncate; return &table; }\n")
@@ -899,7 +1081,7 @@ def main() -> int:
                 raise ValueError("--evidence-dir needs an existing canonical parent and a fresh exclusive directory")
             evidence.mkdir(mode=0o700)
         watched = [selected, HEADER, KERN / "platform/mm/page_alloc.hpp", KERN / "platform/mm/swap.hpp", KERN / "platform/mm/paging.hpp",
-                   KERN / "vfs/file.hpp", KERN / "platform/sched/file_growth.cpp",
+                   KERN / "vfs/file.hpp", KERN / "platform/security/file_policy.hpp", KERN / "platform/sched/file_growth.cpp", KERN / "platform/sched/resource_model.hpp",
                    *(KERN / name for name in REAL_HEADERS), RUNNER, Path(__file__).resolve(), compiler]
         before = [runner.pin(path) for path in watched]
         runner_pin = runner.pin(RUNNER)
@@ -914,6 +1096,8 @@ def main() -> int:
         result["primitive_seams"].extend(["Host File facade/operations table; not real native File layout or lifetime",
                                           "Host FileGrowth owner capture/destruction; actual allow_resize/committed bodies",
                                           "Host throwing/nothrow array allocation ledger and scoped failure", "Host epoch clock"])
+        result["primitive_seams"].append("Owned Host inode EOF interval and lookup counter exhaustion inputs; not native backing prepare")
+        result["primitive_seams"].append("Always-admitted Host search credentials; actual FileIdentity/lookup transaction, not security policy qualification")
         runner.subreaper()
         scratch = Path(tempfile.mkdtemp(prefix="wos-tmpfs-ownership-", dir="/tmp"))
         info = scratch.stat()

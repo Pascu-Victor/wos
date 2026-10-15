@@ -36,7 +36,8 @@ struct MountPoint {
     // capture_mount_covered_directory(); pivot invalidates this relationship.
     File* covered_directory{};
     std::atomic<uint32_t> refs{0};        // Active users that outlive mount_lock
-    std::atomic<uint32_t> open_files{0};  // File objects whose backend state belongs to this mount
+    std::atomic<uint32_t> open_files{0};  // File and native owners whose backend state belongs to this mount
+    uint32_t native_backing_pins{};       // Checked subset of open_files; mount_lock only.
     std::atomic<bool> retiring{false};
 };
 
@@ -84,6 +85,27 @@ class MountRef {
 
    private:
     MountPoint* mount_{nullptr};
+};
+
+// A native backing owns one real open_files busy pin through File put and all
+// backend cleanup. It retains no MountRef, File or Task. Acquire/reset in ordinary
+// context outside tree/io/MM guards; the borrowed File keeps its row live while
+// acquiring. Failure preserves an empty output and both checked mount counters.
+class NativeFileMappingMountPin {
+   public:
+    NativeFileMappingMountPin() = default;
+    ~NativeFileMappingMountPin();
+    NativeFileMappingMountPin(const NativeFileMappingMountPin&) = delete;
+    auto operator=(const NativeFileMappingMountPin&) -> NativeFileMappingMountPin& = delete;
+    NativeFileMappingMountPin(NativeFileMappingMountPin&& other) noexcept;
+    auto operator=(NativeFileMappingMountPin&& other) noexcept -> NativeFileMappingMountPin&;
+
+    [[nodiscard]] static auto acquire_tmpfs(File& borrowed, const void* expected_private, NativeFileMappingMountPin& empty) -> int;
+    [[nodiscard]] auto empty() const noexcept -> bool { return mount_ == nullptr; }
+    void reset() noexcept;
+
+   private:
+    MountPoint* mount_{};
 };
 
 // Opaque two-phase mount construction. Filesystem/device initialization is

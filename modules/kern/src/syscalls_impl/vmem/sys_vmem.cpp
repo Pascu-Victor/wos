@@ -1596,6 +1596,28 @@ auto materialize_lazy_file_page_impl(ker::mod::sched::task::Task* task, const La
     }
     uint64_t const FILE_OFFSET = range.file_offset + DELTA;
 
+    if (NATIVE && range.lifetime->backing_mode() == ker::mod::mm::file_mapping::FileMappingBackingMode::TMPFS_READ_SHARED) {
+        auto const* backing = range.lifetime->read_shared_backing();
+        if (backing == nullptr || fault.fetch != 0U || range.flags != ker::abi::vmem::MAP_SHARED ||
+            range.prot != ker::abi::vmem::PROT_READ || range.file_size != backing->eof())
+            return false;
+        // Construction already acquired every canonical anchor. This duplicate
+        // cannot page-in, allocate, take backend locks or block beneath readers.
+        ker::vfs::tmpfs::TmpfsPageLoan loan;
+        if (!backing->loan_page(FILE_OFFSET, loan)) return false;
+        auto const PADDR = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(loan.frame())));
+        constexpr uint64_t FLAGS = ker::mod::mm::paging::PAGE_PRESENT | ker::mod::mm::paging::PAGE_USER |
+                                   ker::mod::mm::paging::PAGE_SHARED | ker::mod::mm::paging::PAGE_WRITE_RESTRICTED |
+                                   ker::mod::mm::paging::PAGE_NX;
+        auto const RESULT =
+            ker::mod::mm::virt::install_lazy_file_page_if_current(task, range, page_vaddr, PADDR, FLAGS, installer.binding());
+        if (RESULT == ker::mod::mm::virt::LazyFilePageInstallResult::MAPPED) {
+            (void)loan.release_to_pte();
+            return true;
+        }
+        return RESULT == ker::mod::mm::virt::LazyFilePageInstallResult::ALREADY_MAPPED;
+    }
+
     ker::vfs::Stat st{};
     st.st_dev = range.file_dev;
     st.st_ino = range.file_ino;
@@ -1795,6 +1817,9 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
         ker::mod::dbg::error("vmem: task has no pagemap");
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
     }
+    // Native unpublished roots have an exclusive, bounded construction and
+    // retirement protocol. Generic allocation/replacement cannot extend it.
+    if (task->native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr) return static_cast<uint64_t>(-EBUSY);
 
     // Validate pagemap pointer is in valid HHDM range (not kernel static range)
     auto pm_addr = reinterpret_cast<uintptr_t>(task->pagemap);
@@ -1972,6 +1997,7 @@ auto anon_free(uint64_t addr, uint64_t size) -> uint64_t {
         log::error("vmem: task has no pagemap for free");
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
     }
+    if (task->native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr) return static_cast<uint64_t>(-EBUSY);
 
     // Validate address
     if (addr == 0) {
@@ -2050,6 +2076,7 @@ auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t si
     if (task == nullptr || task->pagemap == nullptr) {
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
     }
+    if (task->native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr) return static_cast<uint64_t>(-EBUSY);
 
     uint64_t const PERF_STARTED_US = ker::mod::time::get_us();
 
@@ -3308,8 +3335,9 @@ auto validate_native_unpublished_mapping_owners(ker::mod::sched::task::Task& tas
     return valid && active == captured.count;
 }
 
-auto prepare_unpublished_file_mapping(ker::mod::sched::task::Task& owner, ker::mod::sched::task::Task& child, ker::vfs::File& file,
-                                      uint64_t address, uint64_t length, uint64_t offset, uint64_t prot) -> int {
+static auto prepare_unpublished_file_mapping_impl(ker::mod::sched::task::Task& owner, ker::mod::sched::task::Task& child,
+                                                  ker::vfs::File& file, uint64_t address, uint64_t length, uint64_t offset, uint64_t prot,
+                                                  bool read_shared_tmpfs) -> int {
     namespace fm = ker::mod::mm::file_mapping;
     using ker::mod::sched::task::TaskState;
     constexpr uint64_t PAGE = ker::mod::mm::paging::PAGE_SIZE;
@@ -3327,13 +3355,15 @@ auto prepare_unpublished_file_mapping(ker::mod::sched::task::Task& owner, ker::m
         length - 1 > static_cast<uint64_t>(INT64_MAX) - offset || (prot & ~7ULL) != 0)
         return -EINVAL;
     if (length / PAGE > MAX_NATIVE_PAGES) return -E2BIG;
-    // This first internal selector knows these native close graphs only. A
-    // retained mount can lead through covered-directory pins; refuse that
-    // unsupported graph rather than treating its filesystem number as proof.
+    if (read_shared_tmpfs && (prot & ~static_cast<uint64_t>(ker::abi::vmem::PROT_READ)) != 0) return -EACCES;
+    // The private selector retains its original close-graph limits. The new
+    // shared selector admits its mounted graph through a checked backend pin.
     bool const KNOWN_BACKEND = (file.fs_type == ker::vfs::FSType::TMPFS && file.fops == ker::vfs::tmpfs::get_tmpfs_fops()) ||
                                (file.fs_type == ker::vfs::FSType::PROCFS && file.fops == ker::vfs::procfs::get_procfs_fops());
-    if (!KNOWN_BACKEND || file.mount_owner != nullptr || file.is_directory || file.refcount.load() <= 0) return -EOPNOTSUPP;
-    if (file.directory_view) {
+    if (!KNOWN_BACKEND || (!read_shared_tmpfs && file.mount_owner != nullptr) || file.is_directory || file.refcount.load() <= 0)
+        return -EOPNOTSUPP;
+    if (read_shared_tmpfs && file.fs_type != ker::vfs::FSType::TMPFS) return -EOPNOTSUPP;
+    if (!read_shared_tmpfs && file.directory_view) {
         auto* root = file.directory_view.root();
         auto* directory = file.directory_view.directory();
         if (root == nullptr || directory == nullptr || root->mount_owner != nullptr || directory->mount_owner != nullptr ||
@@ -3363,8 +3393,9 @@ auto prepare_unpublished_file_mapping(ker::mod::sched::task::Task& owner, ker::m
     int const STAT = ker::vfs::vfs_fstat_file(&file, &st);
     if (STAT < 0) return STAT;
     if ((st.st_mode & ker::vfs::S_IFMT) != ker::vfs::S_IFREG || st.st_size < 0) return -ENODEV;
-    int const ACCESS = ker::mod::security::authorize_file_mapping(
-        static_cast<unsigned>(file.open_flags & 3), false, (prot & ker::abi::vmem::PROT_WRITE) != 0, ker::vfs::file_mount_read_only(file));
+    int const ACCESS =
+        ker::mod::security::authorize_file_mapping(static_cast<unsigned>(file.open_flags & 3), read_shared_tmpfs,
+                                                   (prot & ker::abi::vmem::PROT_WRITE) != 0, ker::vfs::file_mount_read_only(file));
     if (ACCESS != 0) return ACCESS;
     auto* record = child.native_file_mapping_retirement.load(std::memory_order_acquire);
     if (record == nullptr) {
@@ -3382,8 +3413,11 @@ auto prepare_unpublished_file_mapping(ker::mod::sched::task::Task& owner, ker::m
     if (record->controller != &owner || record->state != fm::UnpublishedRetirementState::PREPARED) return -EBUSY;
     if (record->count == record->entries.size()) return -ENOSPC;
     auto& entry = record->entries.at(record->count);
-    auto* lifetime = fm::FileMappingLifetime::prepare(file, entry.completion);
-    if (lifetime == nullptr) return -ENOMEM;
+    int prepare_error = -ENOMEM;
+    auto* lifetime = read_shared_tmpfs
+                         ? fm::FileMappingLifetime::prepare_read_shared_tmpfs(file, offset, length, entry.completion, prepare_error)
+                         : fm::FileMappingLifetime::prepare(file, entry.completion);
+    if (lifetime == nullptr) return prepare_error;
     ++record->count;  // The return observer remains owned even if later staging fails.
     auto* binding = fm::FileMappingBinding::prepare_unbound(*lifetime);
     if (binding == nullptr) {
@@ -3429,20 +3463,21 @@ auto prepare_unpublished_file_mapping(ker::mod::sched::task::Task& owner, ker::m
                 // is exposed until the index and actual lazy/registry owners exist.
                 if (!lifetime->reclassify(fm::FamilyOwner::PREPARED, fm::FamilyOwner::LAZY))
                     ker::mod::dbg::panic_handler("native mapping prepared owner transfer failed");
-                LazyVmemRange const RANGE{.start = address,
-                                          .end = address + length,
-                                          .prot = prot,
-                                          .flags = ker::abi::vmem::MAP_PRIVATE,
-                                          .kind = LazyVmemKind::NATIVE_FILE_BACKED,
-                                          .lifetime = lifetime,
-                                          .file_offset = offset,
-                                          .file_dev = st.st_dev,
-                                          .file_ino = st.st_ino,
-                                          .file_size = static_cast<uint64_t>(st.st_size),
-                                          .file_mtime_sec = st.st_mtim.tv_sec,
-                                          .file_mtime_nsec = st.st_mtim.tv_nsec,
-                                          .file_ctime_sec = st.st_ctim.tv_sec,
-                                          .file_ctime_nsec = st.st_ctim.tv_nsec};
+                LazyVmemRange const RANGE{
+                    .start = address,
+                    .end = address + length,
+                    .prot = prot,
+                    .flags = read_shared_tmpfs ? ker::abi::vmem::MAP_SHARED : ker::abi::vmem::MAP_PRIVATE,
+                    .kind = LazyVmemKind::NATIVE_FILE_BACKED,
+                    .lifetime = lifetime,
+                    .file_offset = offset,
+                    .file_dev = st.st_dev,
+                    .file_ino = st.st_ino,
+                    .file_size = read_shared_tmpfs ? lifetime->read_shared_backing()->eof() : static_cast<uint64_t>(st.st_size),
+                    .file_mtime_sec = st.st_mtim.tv_sec,
+                    .file_mtime_nsec = st.st_mtim.tv_nsec,
+                    .file_ctime_sec = st.st_ctim.tv_sec,
+                    .file_ctime_nsec = st.st_ctim.tv_nsec};
                 if (!child.lazy_vmem_ranges.push_back(RANGE)) ker::mod::dbg::panic_handler("native mapping staged lazy capacity lost");
                 entry.lifetime = lifetime;
                 entry.binding = binding;
@@ -3466,6 +3501,17 @@ auto prepare_unpublished_file_mapping(ker::mod::sched::task::Task& owner, ker::m
         discard_prepared();
     }
     return result;
+}
+
+auto prepare_unpublished_file_mapping(ker::mod::sched::task::Task& owner, ker::mod::sched::task::Task& child, ker::vfs::File& file,
+                                      uint64_t address, uint64_t length, uint64_t offset, uint64_t prot) -> int {
+    return prepare_unpublished_file_mapping_impl(owner, child, file, address, length, offset, prot, false);
+}
+
+auto prepare_unpublished_read_shared_tmpfs_mapping(ker::mod::sched::task::Task& owner, ker::mod::sched::task::Task& child,
+                                                   ker::vfs::File& file, uint64_t address, uint64_t length, uint64_t offset, uint64_t prot)
+    -> int {
+    return prepare_unpublished_file_mapping_impl(owner, child, file, address, length, offset, prot, true);
 }
 
 auto materialize_lazy_file_page(ker::mod::sched::task::Task* task, const ker::mod::sched::task::LazyVmemRange& range, uint64_t page_vaddr,
@@ -3707,6 +3753,7 @@ auto anon_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size, uint64
     if (task == nullptr || task->pagemap == nullptr) {
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
     }
+    if (task->native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr) return static_cast<uint64_t>(-EBUSY);
     if (old_addr == 0 || old_size == 0 || new_size == 0 || (old_addr % ker::mod::mm::paging::PAGE_SIZE) != 0) {
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
     }
@@ -3790,6 +3837,7 @@ auto mmap_msync(uint64_t addr, uint64_t size, uint64_t /*flags*/) -> uint64_t {
     if (task == nullptr || task->pagemap == nullptr) {
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
     }
+    if (task->native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr) return static_cast<uint64_t>(-EBUSY);
     if (addr == 0 || size == 0 || (addr % ker::mod::mm::paging::PAGE_SIZE) != 0) {
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
     }
@@ -3843,6 +3891,7 @@ auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -
             if (task == nullptr || task->pagemap == nullptr) {
                 return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
             }
+            if (task->native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr) return static_cast<uint64_t>(-EBUSY);
 
             uint64_t const ADDR = a1;
             uint64_t size = a2;

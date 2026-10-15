@@ -223,13 +223,19 @@ def test_raw_translation_exceptions_are_only_unpublished_images() -> None:
     projection_end = find_matching_brace(remaining, projection_brace) + 1
     projection = remaining[projection_brace + 1 : projection_end - 1]
     remaining = remaining[:projection_start] + remaining[projection_end:]
-    producer_start = remaining.find("auto prepare_unpublished_file_mapping(")
+    producer_start = remaining.find("auto prepare_unpublished_file_mapping_impl(")
     if producer_start < 0:
         fail("VMEM unpublished mapping producer must remain explicitly named")
     producer_brace = remaining.find("{", producer_start)
     producer_end = find_matching_brace(remaining, producer_brace) + 1
     producer = remaining[producer_brace + 1 : producer_end - 1]
     remaining = remaining[:producer_start] + remaining[producer_end:]
+    for name, mode in (("prepare_unpublished_file_mapping", "false"),
+                       ("prepare_unpublished_read_shared_tmpfs_mapping", "true")):
+        wrapper = function_body(remaining, f"auto {name}(")
+        expected = f"return prepare_unpublished_file_mapping_impl(owner, child, file, address, length, offset, prot, {mode});"
+        if wrapper.strip() != expected:
+            fail(f"VMEM {name} must only select its fixed native backing mode")
     if (fixture.count("virt::translate(pagemap, BASE)") != 2 or fixture.count("get_virt_pointer(PADDR)") != 1
             or fixture.count("translate(") != 2 or fixture.count("get_virt_pointer(") != 1
             or vmem_source.count("translate(") != 5 or vmem_source.count("get_virt_pointer(") != 3):

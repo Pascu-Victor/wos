@@ -2386,3 +2386,70 @@ Continue `--no-setup`, one topology, a 20GiB disposable budget, a 40GiB free flo
 and exact-owned pruning after every outcome. Next is connected canonical TMPFS
 backing, followed by complete public ownership and the required service/lifecycle
 qualification.
+
+## Checkpoint57: canonical readonly TMPFS backing (2026-10-15)
+
+The bounded unpublished producer now has an explicit readonly shared TMPFS mode.
+Preparation retains the mounted inode, a fixed-EOF lease and canonical frame
+anchors before taking root or installer guards. Lazy faults borrow an anchored
+frame without backend I/O or allocation; successful installation transfers one
+reference to a readonly, shared, non-executable PTE. The existing private-copy
+producer is unchanged. File, lazy-range and Task layouts and syscall/wire formats
+are unchanged.
+
+Ordinary writes within the captured EOF remain visible through both roots and
+hardlink aliases. A live backing refuses size changes, content replacement and
+reverse executable admission before mutation. Its checked mount busy owner
+survives unlink and final File close; ordinary unmount returns EBUSY. A scoped
+mount fence prevents pivot or backend rebinding from invalidating its ancestry.
+Real family retirement keeps the backing through the one terminal File put,
+then releases frames, EOF/inode owners and finally the mount pin before reporting
+callback return. Negative close is terminal and is never retried.
+
+This producer retains the existing eight-bindings-by-64-pages limit and admits
+only initially empty, exclusively owned unpublished roots. Construction checks
+the dense TMPFS descriptor bound before prefaulting. Failed preparation may warm
+cache or materialize a sparse prefix, but releases every newly acquired owner.
+Generic VM operations refuse unsupported native operations before mutation.
+Public mapping publication, writable sharing, fork inheritance, truncate
+invalidation and complete exec/exit ownership remain separate work.
+
+Normal Build WOS, the isolated fast diagnostic build, repository formatting and
+all 11 selected registered Host checks pass. The actual-body TMPFS Host harness
+passes 36 vectors and 67,001 assertions. Five genuine archived predecessor
+variants compile and fail the corresponding regression checks, with scratch
+owners cleaned up. Independent source reviews cover the backing, mounted owner,
+consumer, installer and retirement ordering.
+
+Fresh scheduled Native86 passes seven cases, 3,429 assertions and 20 callback
+returns on 32 CPUs. The added case uses actual controller Tasks, two roots,
+distinct File descriptions, a hardlink and an equal-byte distinct inode. It
+checks canonical frames, cross-page VFS write visibility, readonly permissions,
+fixed-EOF refusal, quota-failure rollback and mount lifetime after unlink and
+final File close. Its direct frame/key observations do not qualify a blocking
+userspace futex exchange. The exact paused family-callback interval is not
+instrumented; the direct backing lifetime and callback ordering are separately
+qualified. The independent terminal audit confirms the protocol, payloads,
+natural exit and unchanged admitted inputs.
+
+Native86 shuts down naturally and prunes all four disposable images, releasing
+263,077,888 allocated bytes. Its real-host postcheck reports zero disposable
+images and preserves the unrelated VM and original shared launch guard. Ordinary
+init/XFS errors after the scheduled finalizer remain recorded context; this run
+does not qualify a healthy ordinary rootfs boot or service workload.
+
+Fresh default Native87 passes all 1,463 enabled cases, all 212 mandatory cases
+and 113,976 assertions with zero failures, using the same freshly built
+checkpoint57 kernel. The three BufferCache cases remain disabled. It powers off
+naturally after 475.396 seconds, with launcher, worker and outer exit0 and no
+forced stop. All four disposable images are pruned, and its real-host postcheck
+reports zero disposable allocation with the unrelated VM and shared guard intact.
+This default suite parks secondary CPUs; Native86 supplies the stated scheduled
+32-CPU evidence. Neither run supplies the required two-hour service evidence.
+
+These results cover the combined local workspace; all 22 pre-existing user edits
+remain byte-identical. Goal39 remains ACTIVE with all ten full criteria open.
+Continue exact-owned `--no-setup` qualification, one topology, the 20GiB disposable
+budget, the 40GiB free floor and pruning after successful and failed runs. Public
+canonical mapping ownership, writable backing, two-hour simultaneous services
+and 1,000 full lifecycle/allocation-failure cycles remain required.

@@ -17,6 +17,7 @@
 #include <platform/mm/virt.hpp>
 #include <platform/power/power.hpp>
 #include <platform/sched/pid_namespace.hpp>
+#include <platform/sched/resource.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/security/credentials.hpp>
@@ -27,6 +28,8 @@
 #include <vfs/file.hpp>
 #include <vfs/fs/procfs.hpp>
 #include <vfs/fs/tmpfs.hpp>
+#include <vfs/mount.hpp>
+#include <vfs/mount_namespace.hpp>
 #include <vfs/vfs.hpp>
 
 namespace ker::test {
@@ -660,6 +663,482 @@ void maximum_native_shape_retires_without_census_growth(Checks& checks, task::Ta
     checks.pass("maximum_native_shape_retires_without_census_growth");
 }
 
+// These are actual scheduled owners, not ambient-current substitutions. Each
+// controller alone owns/mutates its unpublished child and publishes only scalar
+// observations after every real UserPagePin/root reader has ended.
+constexpr size_t SHARED_BYTES = 2 * PAGE + 73;
+constexpr uint64_t SHARED_ALIAS = 0x800000;
+constexpr uint64_t SHARED_OTHER = 0xa00000;
+constexpr uint64_t SHARED_COLD = 0xc00000;
+enum class SharedCommand : uint8_t { NONE, PREPARE, READ, RETIRE, STOP };
+
+struct SharedReport {
+    uint64_t assertions{}, returned{}, root_serial{};
+    std::array<uint64_t, 3> frames{};
+    virt::UserFutexIdentity data_key{}, offset_key{}, alias_key{}, other_key{};
+    std::array<uint8_t, SHARED_BYTES> bytes{};
+    std::array<uint8_t, PAGE> alias{}, other{};
+    bool pin_free{}, cold{};
+};
+
+struct SharedController {
+    std::atomic<uint32_t> request{}, acknowledged{};
+    SharedCommand command{SharedCommand::NONE};
+    bool first{};
+    uint64_t deadline{};
+    std::array<vfs::File*, 3> input{};  // Borrowed only through PREPARE acknowledgement.
+    SharedReport report{};
+    task::Task* retained{};  // Coordinator's exact fresh-factory join reference.
+    uint32_t sequence{};
+};
+
+struct SharedFilePut {
+    void operator()(vfs::File* file) const { vfs::vfs_put_file(file); }
+};
+using SharedFile = std::unique_ptr<vfs::File, SharedFilePut>;
+
+struct SharedMountedContext {
+    vfs::mount_ns::NamespaceRef scope{};
+    std::unique_ptr<task::Task> paths{};
+    std::array<SharedController, 2> controllers{};
+    std::array<SharedFile, 5> inputs{};
+    SharedFile writer{}, other{};
+    std::array<uint8_t, SHARED_BYTES> expected{};
+};
+
+auto shared_leaf_flags(Checks& checks, const virt::UserPagePin& pin) -> uint64_t {
+    auto* table = pin.pagemap;
+    checks.require(table != nullptr && pin.hhdm_page != nullptr, "leaf observation owns actual root/frame pin");
+    for (unsigned shift : {39U, 30U, 21U, 12U}) {
+        auto const& entry = table->entries.at(static_cast<size_t>((pin.user_page >> shift) & 511));
+        uint64_t flags = 0;
+        std::memcpy(&flags, &entry, sizeof(flags));
+        checks.require(entry.present != 0 && entry.user != 0, "actual user page-table path is present");
+        if (shift == 12) {
+            checks.require((entry.frame << mm::paging::PAGE_SHIFT) == pin.physical_page, "observed leaf is exact pinned physical frame");
+            return flags;
+        }
+        checks.require(entry.pagesize == 0, "actual shared fixture uses ordinary page tables");
+        table = reinterpret_cast<mm::paging::PageTable*>((entry.frame << mm::paging::PAGE_SHIFT) + mm::addr::get_hhdm_offset());
+    }
+    __builtin_unreachable();
+}
+
+void shared_controller_entry() {
+    auto* const owner = sched::get_current_task();
+    auto* const box = owner != nullptr ? static_cast<SharedController*>(owner->kernel_thread_context) : nullptr;
+    Checks checks{};
+    checks.require(owner != nullptr && box != nullptr && box->retained == owner && owner->type == task::TaskType::DAEMON &&
+                       sched::interrupts_enabled() && sched::preempt_count() == 0 && !fm::LifetimeRetirementExecutor::is_current_worker(),
+                   "shared controller is actual posted ordinary Task with retained context");
+    {
+        auto const HOLD = sched::hold_kernel_shutdown();
+        task::Task* child = nullptr;
+        std::array<fm::RetirementCompletion, 3> observers{};
+        size_t count = 0;
+        uint32_t seen = 0;
+        uint64_t const BASE = box->first ? 0x600000 : 0x1600000;
+        for (;;) {
+            uint32_t const REQUEST = box->request.load(std::memory_order_acquire);
+            if (REQUEST == seen) {
+                checks.require(ker::mod::time::get_us() < box->deadline, "shared controller whole deadline preserves owned state");
+                sched::kern_sleep_us(1000);
+                continue;
+            }
+            checks.require(REQUEST == seen + 1, "one exact ordered shared command");
+            seen = REQUEST;
+            SharedCommand const COMMAND = box->command;
+            if (COMMAND == SharedCommand::PREPARE) {
+                checks.require(child == nullptr && owner->owned_unpublished_process.load(std::memory_order_acquire) == nullptr,
+                               "real controller slot starts empty");
+                child = new (std::nothrow) task::Task{};
+                checks.require(child != nullptr, "allocate shared child Task");
+                child->type = task::TaskType::PROCESS;
+                child->state.store(task::TaskState::ACTIVE, std::memory_order_release);
+                child->pid = task::get_next_pid();
+                checks.require(
+                    sched::resource::inherit(*child, *owner) && sched::resource::initialize_credentials(*child, owner->credentials()) == 0,
+                    "shared child inherits actual namespace/resource and credential capability");
+                checks.require(task::claim_unpublished_process(owner, child), "actual controller claims its one child slot");
+                child->pagemap = virt::create_pagemap();
+                checks.require(child->pagemap != nullptr && mm::phys::page_ref_get(child->pagemap) == 1,
+                               "shared child owns registered sole-ref root");
+                auto* const ROOT = child->pagemap;
+                checks.require(box->input.at(0) != nullptr, "negative shared admission borrows real mounted File");
+                auto const FILE_REFS = box->input.at(0)->refcount.load(std::memory_order_acquire);
+                for (uint64_t prot :
+                     {ker::abi::vmem::PROT_READ | ker::abi::vmem::PROT_WRITE, ker::abi::vmem::PROT_READ | ker::abi::vmem::PROT_EXEC}) {
+                    checks.require(vmem::prepare_unpublished_read_shared_tmpfs_mapping(*owner, *child, *box->input.at(0), BASE, 3 * PAGE, 0,
+                                                                                       prot) == -EACCES,
+                                   "actual shared producer rejects WRITE and EXEC before family admission");
+                    checks.require(child->pagemap == ROOT &&
+                                       child->native_file_mapping_retirement.load(std::memory_order_acquire) == nullptr &&
+                                       child->lazy_vmem_ranges.empty() && virt::unpublished_user_root_empty(ROOT) &&
+                                       virt::translate(ROOT, BASE) == virt::PADDR_INVALID &&
+                                       box->input.at(0)->refcount.load(std::memory_order_acquire) == FILE_REFS &&
+                                       child->ref_count.load(std::memory_order_acquire) == 2,
+                                   "WRITE/EXEC refusal preserves empty native root lazy registry File and Task owners");
+                }
+                count = box->first ? 3 : 2;
+                for (size_t i = 0; i < count; ++i) {
+                    uint64_t const VA = i == 0 ? BASE : box->first ? (i == 1 ? SHARED_ALIAS : SHARED_OTHER) : SHARED_COLD;
+                    uint64_t const LENGTH = i == 0 ? 3 * PAGE : PAGE;
+                    uint64_t const OFFSET = !box->first && i == 1 ? PAGE : 0;
+                    uint64_t const PROT = !box->first && i == 1 ? ker::abi::vmem::PROT_NONE : ker::abi::vmem::PROT_READ;
+                    checks.require(box->input.at(i) != nullptr && vmem::prepare_unpublished_read_shared_tmpfs_mapping(
+                                                                      *owner, *child, *box->input.at(i), VA, LENGTH, OFFSET, PROT) == 0,
+                                   "actual mounted readonly-shared native producer");
+                    auto* const record = child->native_file_mapping_retirement.load(std::memory_order_acquire);
+                    checks.require(record != nullptr && record->count == i + 1 && record->entries.at(i).lifetime != nullptr &&
+                                       record->entries.at(i).lifetime->observe_return(observers.at(i)),
+                                   "capture actual exact-generation shared callback return");
+                    checks.require(observers.at(i).query().state == fm::RetirementReturnState::PENDING &&
+                                       virt::translate(child->pagemap, VA) == virt::PADDR_INVALID,
+                                   "shared and NONE families remain PTE-cold after backend anchoring");
+                    box->input.at(i) = nullptr;
+                }
+                checks.require(vmem::validate_native_unpublished_mapping_owners(*child), "actual shared typed containers validate");
+                box->report.root_serial = virt::selftest_user_root_incarnation(child->pagemap);
+                checks.require(box->report.root_serial != 0, "shared child actual root incarnation");
+                box->report.cold = true;
+            } else if (COMMAND == SharedCommand::READ) {
+                checks.require(child != nullptr, "shared read owns exact child");
+                auto read_page = [&](uint64_t va, uint8_t* output, size_t length, virt::UserFutexIdentity* identity) -> uint64_t {
+                    virt::UserPagePin pin{};
+                    checks.require(virt::pin_user_page_for_task(child, child->pagemap, va, false, true, pin),
+                                   "actual shared lazy pin materializes canonical page");
+                    uint64_t const FLAGS = shared_leaf_flags(checks, pin);
+                    uint64_t const REQUIRED =
+                        mm::paging::PAGE_PRESENT | mm::paging::PAGE_USER | mm::paging::PAGE_SHARED | mm::paging::PAGE_NX;
+                    checks.require((FLAGS & REQUIRED) == REQUIRED && (FLAGS & (mm::paging::PAGE_WRITE | mm::paging::PAGE_COW)) == 0,
+                                   "actual canonical leaf is RO shared NX without writable COW");
+                    checks.require(pin.root_incarnation == box->report.root_serial && pin.file_binding != nullptr,
+                                   "actual shared pin retains native root/binding");
+                    std::memcpy(output, pin.hhdm_page, length);
+                    if (identity != nullptr) {
+                        *identity = {};  // Each read captures into the API's required empty output.
+                        checks.require(virt::capture_user_futex_identity(pin, va + 16, *identity) && identity->shared &&
+                                           identity->physical_word == pin.physical_page + 16 &&
+                                           virt::user_futex_identity_still_mapped(pin, *identity),
+                                       "actual MM classifies retained shared physical word");
+                    }
+                    uint64_t const FRAME = pin.physical_page;
+                    virt::unpin_user_page(pin);
+                    checks.require(pin.pagemap == nullptr && pin.file_binding == nullptr && pin.hhdm_page == nullptr,
+                                   "shared response retains no pin/frame/root reader");
+                    return FRAME;
+                };
+                for (size_t page = 0; page < 3; ++page) {
+                    size_t const LENGTH = page == 2 ? 73 : PAGE;
+                    box->report.frames.at(page) = read_page(BASE + page * PAGE, box->report.bytes.data() + page * PAGE, LENGTH,
+                                                            page == 0   ? &box->report.data_key
+                                                            : page == 1 ? &box->report.offset_key
+                                                                        : nullptr);
+                }
+                checks.require(box->report.frames.at(0) != box->report.frames.at(1) &&
+                                   box->report.frames.at(0) != box->report.frames.at(2) &&
+                                   box->report.frames.at(1) != box->report.frames.at(2) &&
+                                   box->report.data_key.physical_word != box->report.offset_key.physical_word,
+                               "actual distinct canonical file pages and offset words never collapse to one frame/key");
+                if (box->first) {
+                    uint64_t const ALIAS = read_page(SHARED_ALIAS, box->report.alias.data(), PAGE, &box->report.alias_key);
+                    uint64_t const OTHER = read_page(SHARED_OTHER, box->report.other.data(), PAGE, &box->report.other_key);
+                    checks.require(ALIAS == box->report.frames.at(0) && OTHER != ALIAS,
+                                   "real hardlink aliases canonical frame while distinct inode does not");
+                } else {
+                    virt::UserPagePin denied{};
+                    bool const NONE = virt::pin_user_page_for_task(child, child->pagemap, SHARED_COLD, false, true, denied);
+                    if (NONE) virt::unpin_user_page(denied);
+                    checks.require(!NONE && virt::translate(child->pagemap, SHARED_COLD) == virt::PADDR_INVALID,
+                                   "actual PROT_NONE remains cold and denies pin");
+                }
+                virt::UserPagePin denied{};
+                bool const WRITABLE = virt::pin_user_page_for_task(child, child->pagemap, BASE, true, true, denied);
+                if (WRITABLE) virt::unpin_user_page(denied);
+                checks.require(!WRITABLE, "actual shared readonly ceiling refuses writable pin");
+            } else if (COMMAND == SharedCommand::RETIRE) {
+                checks.require(child != nullptr, "retirement owns exact shared child");
+                int close_result = 12345;
+                uint64_t const LIMIT = sched::saturating_deadline_us(ker::mod::time::get_us(), WAIT_US);
+                for (;;) {
+                    auto const result =
+                        task::retire_native_unpublished_process(owner, child, fm::UnpublishedRetirementMode::OWNED_SLOT, &close_result);
+                    if (result == Result::COMPLETE) {
+                        child = nullptr;
+                        break;
+                    }
+                    checks.require(
+                        result == Result::PENDING && ker::mod::time::get_us() < LIMIT && ker::mod::time::get_us() < box->deadline,
+                        "shared retirement preserves actual owned continuation within deadline");
+                    sched::kern_sleep_us(1000);
+                }
+                checks.require(close_result == 0 && owner->owned_unpublished_process.load(std::memory_order_acquire) == nullptr,
+                               "shared retirement consumed child only after real callbacks");
+                for (size_t i = 0; i < count; ++i) {
+                    auto const RETURN = observers.at(i).query();
+                    checks.require(RETURN.state == fm::RetirementReturnState::RETURNED && RETURN.callback_result == 0,
+                                   "shared independent callback actually RETURNED");
+                    observers.at(i).reset();
+                    ++checks.returned;
+                }
+            } else {
+                checks.require(COMMAND == SharedCommand::STOP && child == nullptr &&
+                                   owner->owned_unpublished_process.load(std::memory_order_acquire) == nullptr &&
+                                   !owner->unpublished_teardown_in_progress.load(std::memory_order_acquire),
+                               "shared STOP owns no live child continuation");
+                for (auto const& observer : observers) checks.require(observer.empty(), "shared STOP owns no pending observer");
+                break;
+            }
+            box->report.assertions = checks.assertions;
+            box->report.returned = checks.returned;
+            box->report.pin_free = true;
+            box->acknowledged.store(seen, std::memory_order_release);
+        }
+    }
+    owner->kernel_thread_context = nullptr;
+    box->report.assertions = checks.assertions;
+    box->report.pin_free = true;
+    box->acknowledged.store(box->request.load(std::memory_order_relaxed), std::memory_order_release);
+    // This was the final context access; the retained Task joins actual DEAD.
+    sched::exit_current_kernel_thread();
+}
+
+void shared_command(Checks& checks, SharedController& box, SharedCommand command) {
+    uint64_t const BEFORE = box.report.assertions;
+    uint64_t const RETURNED = box.report.returned;
+    box.command = command;
+    uint32_t const SEQUENCE = ++box.sequence;
+    box.request.store(SEQUENCE, std::memory_order_release);
+    uint64_t const LIMIT = sched::saturating_deadline_us(ker::mod::time::get_us(), WAIT_US);
+    while (box.acknowledged.load(std::memory_order_acquire) != SEQUENCE) {
+        checks.require(ker::mod::time::get_us() < LIMIT && ker::mod::time::get_us() < box.deadline,
+                       "shared command finite wait preserves live mailbox and owners");
+        sched::kern_sleep_us(1000);
+    }
+    checks.require(box.report.pin_free, "coordinator receives only pin-free scalar observations");
+    checks.assertions += box.report.assertions - BEFORE;
+    checks.returned += box.report.returned - RETURNED;
+}
+
+void readonly_shared_mounted_aliases(Checks& checks) {
+    uint64_t const DEADLINE = sched::saturating_deadline_us(ker::mod::time::get_us(), 30'000'000);
+    auto context = std::unique_ptr<SharedMountedContext>(new (std::nothrow) SharedMountedContext{});
+    checks.require(context != nullptr, "allocate bounded stable real controller context");
+    auto& ctx = *context;
+    ctx.paths.reset(new (std::nothrow) task::Task{});
+    checks.require(ctx.paths != nullptr && vfs::mount_ns::create_namespace(ctx.scope) == 0, "actual private path namespace");
+    ctx.paths->pid = task::get_next_pid();
+    checks.require(ctx.paths->initialize_mount_namespace(ctx.scope), "explicit real VFS path subject owns namespace");
+    checks.require(vfs::mount_filesystem("/", "tmpfs", nullptr, 0, "size=1M", nullptr, nullptr, ctx.scope) == 0 &&
+                       vfs::vfs_mkdirat(ctx.paths.get(), vfs::AT_FDCWD, "/shared", 0755) == 0 &&
+                       vfs::vfs_mount_for_task(ctx.paths.get(), nullptr, "/shared", "tmpfs", 0, "size=1M") == 0,
+                   "actual registered private root and mounted TMPFS leaf");
+    auto open_writer = [&](const char* path, int flags) -> SharedFile {
+        int const FD = vfs::vfs_openat(ctx.paths.get(), vfs::AT_FDCWD, path, flags | vfs::O_NO_CACHE, 0600);
+        checks.require(FD >= 0, "actual VFS writer FD");
+        SharedFile file(vfs::vfs_get_file_retain(ctx.paths.get(), FD));
+        checks.require(file != nullptr && vfs::vfs_close_for_task(ctx.paths.get(), FD) == 0, "retain actual File and close explicit FD");
+        return file;
+    };
+    auto open_reader = [&](const char* path) -> SharedFile {
+        vfs::File* file = nullptr;
+        checks.require(vfs::vfs_open_file_as(*ctx.paths, ctx.paths->credentials(), path, vfs::O_NO_CACHE, &file) == 0 && file != nullptr,
+                       "actual VFS readonly no-cache description");
+        checks.require(file->fops == tmpfs::get_tmpfs_fops() && file->mount_owner != nullptr && file->fs_type == vfs::FSType::TMPFS &&
+                           file->mount_owner->namespace_owner == ctx.scope && !file->directory_view &&
+                           (file->open_flags & vfs::O_NO_CACHE) != 0,
+                       "VFS supplies registered real TMPFS File without fixture reassignment");
+        return SharedFile(file);
+    };
+    ctx.writer = open_writer("/shared/data", vfs::O_CREAT | 2);
+    ctx.other = open_writer("/shared/other", vfs::O_CREAT | 2);
+    for (size_t i = 0; i < ctx.expected.size(); ++i) ctx.expected.at(i) = static_cast<uint8_t>((i * 37 + 19) % 251);
+    for (auto* file : {ctx.writer.get(), ctx.other.get()})
+        checks.require(vfs::vfs_pwrite_file(file, ctx.expected.data(), ctx.expected.size(), 0) == static_cast<ssize_t>(ctx.expected.size()),
+                       "real VFS seeds exact equal bytes on distinct canonical inodes");
+    checks.require(vfs::vfs_linkat(ctx.paths.get(), vfs::AT_FDCWD, "/shared/data", vfs::AT_FDCWD, "/shared/alias", 0) == 0,
+                   "actual VFS hardlink alias");
+    {
+        auto reader = open_reader("/shared/data");
+        std::unique_ptr<tmpfs::TmpfsReadSharedBacking> refused{};
+        checks.require(tmpfs::TmpfsReadSharedBacking::prepare(*reader, 4096 * PAGE, PAGE, refused) == -E2BIG && refused == nullptr,
+                       "actual mounted backing refuses descriptor extent4097 with empty output");
+        checks.require(tmpfs::TmpfsReadSharedBacking::prepare(*reader, 0, 65 * PAGE, refused) == -E2BIG && refused == nullptr,
+                       "actual mounted backing refuses65 anchor pages with empty output");
+    }
+    checks.require(vfs::vfs_mkdirat(ctx.paths.get(), vfs::AT_FDCWD, "/prefix", 0755) == 0 &&
+                       vfs::vfs_mount_for_task(ctx.paths.get(), nullptr, "/prefix", "tmpfs", 0, "size=4K") == 0,
+                   "real separate one-page-quota TMPFS mount");
+    {
+        auto sparse = open_writer("/prefix/sparse", vfs::O_CREAT | 2);
+        checks.require(vfs::vfs_ftruncate_file(sparse.get(), 2 * PAGE) == 0, "actual VFS creates two-page sparse file without data charge");
+        auto reader = open_reader("/prefix/sparse");
+        std::unique_ptr<tmpfs::TmpfsReadSharedBacking> refused{};
+        checks.require(tmpfs::TmpfsReadSharedBacking::prepare(*reader, 0, 2 * PAGE, refused) == -ENOSPC && refused == nullptr,
+                       "real second canonical page quota failure rolls back all escaped backing owners");
+        bool prefix = false;
+        {
+            auto* const node = static_cast<tmpfs::TmpNode*>(reader->private_data);
+            ker::mod::sys::MutexGuard guard(node->io_lock);
+            prefix = node->size == 2 * PAGE && node->page_count == 2 && node->resident_pages == 1 && node->charged_pages == 1 &&
+                     node->read_shared_eof_leases == 0 && node->pages != nullptr && node->pages[0].state == tmpfs::TmpPageState::RESIDENT &&
+                     node->pages[0].data != nullptr && mm::phys::page_ref_get(node->pages[0].data) == 1 &&
+                     node->pages[1].state == tmpfs::TmpPageState::HOLE;
+        }
+        checks.require(prefix, "real first-page warming remains inode-owned while failed lease and frame anchors drain");
+        // Successful first-page warming is allowed. Only the actual failed
+        // lease's EOF/native/node/anchor owners must have drained here.
+        checks.require(vfs::vfs_ftruncate_file(sparse.get(), 0) == 0, "failed real prefault releases EOF lease before ordinary truncate");
+        checks.require(vfs::vfs_ftruncate_file(sparse.get(), PAGE) == 0, "real backing tail fixture has one sparse canonical page");
+        std::unique_ptr<tmpfs::TmpfsReadSharedBacking> backing{};
+        checks.require(tmpfs::TmpfsReadSharedBacking::prepare(*reader, 0, PAGE, backing) == 0 && backing != nullptr,
+                       "real mounted backing owns canonical page independently of Files");
+        {
+            tmpfs::TmpfsPageLoan loan{};
+            checks.require(backing->loan_page(0, loan) && loan.frame() != nullptr && loan.eof() == PAGE &&
+                               loan.object_identity() == backing->object_identity(),
+                           "actual checked loan duplicates prepared backing frame");
+        }
+        checks.require(vfs::vfs_unlinkat(ctx.paths.get(), vfs::AT_FDCWD, "/prefix/sparse", 0) == 0,
+                       "actual VFS unlinks inode before final real File close");
+        reader.reset();
+        sparse.reset();
+        // No File, lookup, MountRef or raw node/frame borrow survives. The
+        // backing's checked native/open pin alone now prevents mount teardown.
+        checks.require(vfs::vfs_umount_for_task(ctx.paths.get(), "/prefix") == -EBUSY,
+                       "real backing keeps unlinked node and mount busy after last File close");
+        backing.reset();  // Ordinary context releases anchors, EOF/node, mount pin last.
+    }
+    checks.require(vfs::vfs_umount_for_task(ctx.paths.get(), "/prefix") == 0,
+                   "failed-prefix mounted busy owners drain before actual unmount");
+    for (size_t i = 0; i < ctx.inputs.size(); ++i)
+        ctx.inputs.at(i) = open_reader(i == 1 ? "/shared/alias" : i == 2 ? "/shared/other" : "/shared/data");
+    auto const DATA_ID = tmpfs::tmpfs_coherency_identity(ctx.writer.get());
+    checks.require(DATA_ID != 0 && tmpfs::tmpfs_coherency_identity(ctx.inputs.at(1).get()) == DATA_ID &&
+                       tmpfs::tmpfs_coherency_identity(ctx.other.get()) != DATA_ID,
+                   "actual backend canonical identity follows hardlink and distinguishes equal-byte inode");
+    checks.require(ker::mod::time::get_us() < DEADLINE, "shared fixture setup finishes before bounded controller admission");
+    for (size_t i = 0; i < ctx.controllers.size(); ++i) {
+        auto& box = ctx.controllers.at(i);
+        box.first = i == 0;
+        box.deadline = DEADLINE;
+        box.input = i == 0 ? std::array<vfs::File*, 3>{ctx.inputs.at(0).get(), ctx.inputs.at(1).get(), ctx.inputs.at(2).get()}
+                           : std::array<vfs::File*, 3>{ctx.inputs.at(3).get(), ctx.inputs.at(4).get(), nullptr};
+        box.retained = task::Task::create_kernel_thread(i == 0 ? "shared-map-a" : "shared-map-b", shared_controller_entry);
+        checks.require(box.retained != nullptr && box.retained->initialize_mount_namespace(ctx.scope),
+                       "real unpublished controller owns private mount namespace");
+        uint32_t refs = 1;
+        checks.require(box.retained->ref_count.compare_exchange_strong(refs, 2, std::memory_order_acq_rel, std::memory_order_acquire),
+                       "exact fresh controller ref reserves coordinator join ownership");
+        box.retained->kernel_thread_context = &box;
+        if (!sched::post_task_balanced(box.retained)) {
+            box.retained->kernel_thread_context = nullptr;
+            box.retained->release();
+            task::destroy_unpublished_user_thread(box.retained);
+            box.retained = nullptr;
+            // An earlier controller has not received PREPARE yet.
+            for (size_t prior = 0; prior < i; ++prior) shared_command(checks, ctx.controllers.at(prior), SharedCommand::STOP);
+            checks.require(false, "real shared controller post failed with owned rollback");
+        }
+    }
+    for (auto& box : ctx.controllers) shared_command(checks, box, SharedCommand::PREPARE);
+    auto& first = ctx.controllers.at(0);
+    auto& second = ctx.controllers.at(1);
+    checks.require(first.report.cold && second.report.cold && first.report.root_serial != second.report.root_serial,
+                   "two actual distinct roots are cold while backend EOF leases already exist");
+    uint8_t const DENIED_BYTE = 0xa5;
+    checks.require(vfs::vfs_pwrite_file(ctx.inputs.at(0).get(), &DENIED_BYTE, 1, 0) == -EBADF,
+                   "actual readonly VFS File refuses writes without mutating canonical bytes");
+    auto require_eof_busy = [&] {
+        checks.require(vfs::vfs_ftruncate_file(ctx.writer.get(), SHARED_BYTES + 1) == -EBUSY &&
+                           vfs::vfs_ftruncate_file(ctx.writer.get(), SHARED_BYTES - 1) == -EBUSY,
+                       "cold canonical backing refuses actual VFS grow and shrink");
+        checks.require(tmpfs::tmpfs_copy_file_contents(static_cast<tmpfs::TmpNode*>(ctx.writer->private_data),
+                                                       static_cast<tmpfs::TmpNode*>(ctx.other->private_data)) == -EBUSY,
+                       "actual backend copy replacement refuses while EOF lease is live");
+        auto exec = open_reader("/shared/data");
+        auto* before = exec.get();
+        vfs::File* owned = exec.release();
+        int const RESULT = vfs::vfs_stabilize_exec_file(&owned);
+        exec.reset(owned);
+        checks.require(RESULT == -ETXTBSY && exec.get() == before, "actual reverse exec refuses and preserves owned File");
+        vfs::Stat stat{};
+        checks.require(vfs::vfs_fstat_file(ctx.writer.get(), &stat) == 0 && stat.st_size == static_cast<off_t>(SHARED_BYTES),
+                       "refused cold EOF operations preserve exact file length");
+    };
+    require_eof_busy();
+    for (auto& file : ctx.inputs) file.reset();
+    ctx.writer.reset();
+    ctx.other.reset();
+    checks.require(vfs::vfs_umount_for_task(ctx.paths.get(), "/shared") == -EBUSY,
+                   "only cold genuine families/backing owners keep ordinary mounted leaf busy");
+    ctx.writer = open_writer("/shared/data", 2);
+    ctx.other = open_writer("/shared/other", 2);
+    auto require_read = [&] {
+        for (auto& box : ctx.controllers) shared_command(checks, box, SharedCommand::READ);
+        checks.require(first.report.bytes == ctx.expected && second.report.bytes == ctx.expected &&
+                           std::memcmp(first.report.alias.data(), ctx.expected.data(), PAGE) == 0,
+                       "both roots and hardlink pin exact actual canonical bytes");
+        checks.require(first.report.frames == second.report.frames &&
+                           first.report.data_key.virtual_word != second.report.data_key.virtual_word &&
+                           first.report.data_key.physical_word == second.report.data_key.physical_word &&
+                           first.report.offset_key.physical_word == second.report.offset_key.physical_word &&
+                           first.report.data_key.physical_word == first.report.alias_key.physical_word &&
+                           first.report.data_key.physical_word != first.report.other_key.physical_word,
+                       "actual shared frame/word identity crosses roots and VAs but not distinct inode");
+    };
+    require_read();
+    auto const FRAMES = first.report.frames;
+    auto const OTHER_BYTES = first.report.other;
+    // Both acknowledgements established that no child pin or root reader is
+    // retained. This actual VFS write cannot be hidden behind a copied page.
+    constexpr size_t CHANGE_START = PAGE - 31;
+    std::array<uint8_t, 100> patch{};
+    patch.fill(0xe7);
+    checks.require(vfs::vfs_pwrite_file(ctx.writer.get(), patch.data(), patch.size(), CHANGE_START) == static_cast<ssize_t>(patch.size()),
+                   "actual ordinary VFS in-EOF cross-page canonical write");
+    std::memcpy(ctx.expected.data() + CHANGE_START, patch.data(), patch.size());
+    require_read();
+    checks.require(first.report.frames == FRAMES && first.report.other == OTHER_BYTES,
+                   "canonical mutation preserves exact frames and equal-byte distinct inode control");
+    auto* const NODE = static_cast<tmpfs::TmpNode*>(ctx.writer->private_data);
+    checks.require(tmpfs::selftest_tmpfs_evict_page(NODE, 0) == -EAGAIN, "real canonical ref owner refuses reclaim before swap admission");
+    ctx.writer.reset();
+    ctx.other.reset();
+    shared_command(checks, first, SharedCommand::RETIRE);
+    shared_command(checks, second, SharedCommand::READ);
+    checks.require(second.report.bytes == ctx.expected && vfs::vfs_umount_for_task(ctx.paths.get(), "/shared") == -EBUSY,
+                   "one returned root cannot destroy other canonical aliases or mounted backing");
+    shared_command(checks, second, SharedCommand::RETIRE);
+    for (auto& box : ctx.controllers) {
+        shared_command(checks, box, SharedCommand::STOP);
+        while (box.retained->state.load(std::memory_order_acquire) != task::TaskState::DEAD) {
+            checks.require(ker::mod::time::get_us() < DEADLINE, "actual retained controller DEAD join deadline");
+            sched::kern_sleep_us(1000);
+        }
+        checks.require(box.retained->kernel_thread_context == nullptr, "actual finished controller stopped using stable mailbox");
+        box.retained->release();  // Last Task access; scheduler/epoch GC owns its stack.
+        box.retained = nullptr;
+    }
+    ctx.writer = open_writer("/shared/data", 2);
+    checks.require(vfs::vfs_ftruncate_file(ctx.writer.get(), SHARED_BYTES + 1) == 0, "last actual RETURNED releases scoped EOF fence");
+    auto exec = open_reader("/shared/data");
+    vfs::File* owned = exec.release();
+    int const EXEC = vfs::vfs_stabilize_exec_file(&owned);
+    exec.reset(owned);
+    checks.require(EXEC == 0 && exec->exec_read_view != nullptr, "last actual RETURNED permits genuine immutable exec admission");
+    exec.reset();
+    ctx.writer.reset();
+    checks.require(ctx.paths->fd_table.size() == 0 && ctx.paths->fd_table.reserved_count() == 0 &&
+                       vfs::vfs_umount_for_task(ctx.paths.get(), "/shared") == 0,
+                   "all callbacks/pins/Files drain before successful ordinary mounted teardown");
+    ctx.paths.reset();
+    checks.require(vfs::unmount_filesystem("/", ctx.scope) == 0, "actual private root mount teardown");
+    ctx.scope.reset();
+    checks.require(ker::mod::time::get_us() < DEADLINE, "shared fixture cleanup finishes before whole-case success deadline");
+    checks.pass("readonly_shared_mounted_aliases_return");
+}
+
 void runtime_entry() {
     {
         auto const HOLD = sched::hold_kernel_shutdown();
@@ -677,8 +1156,9 @@ void runtime_entry() {
         transferred_pin_refusal_recovers(checks, *owner);
         procfs_self_target_returns_before_delete(checks, *owner);
         maximum_native_shape_retires_without_census_growth(checks, *owner);
+        readonly_shared_mounted_aliases(checks);
         checks.require(owner->owned_unpublished_process.load(std::memory_order_acquire) == nullptr, "all child transactions retired");
-        checks.require(checks.cases == 6 && checks.returned == 15, "all scheduled cases and actual callbacks completed");
+        checks.require(checks.cases == 7 && checks.returned == 20, "all scheduled cases and actual callbacks completed");
         log::info("FILE_MAPPING_RUNTIME PASS cases=%lu assertions=%lu callback_returned=%lu", checks.cases, checks.assertions,
                   checks.returned);
     }

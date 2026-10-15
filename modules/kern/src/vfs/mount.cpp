@@ -21,6 +21,7 @@
 #include <platform/security/credentials.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <util/smallvec.hpp>
+#include <utility>
 #include <vfs/fs/fat32.hpp>
 #include <vfs/fs/xfs/xfs_mount.hpp>
 #include <vfs/fs/xfs/xfs_vfs.hpp>
@@ -439,6 +440,75 @@ auto mount_path_is_descendant(const char* child, const char* parent) -> bool {
     if (parent[0] == '/' && parent[1] == '\0') return child[0] == '/' && child[1] != '\0';
     auto const LENGTH = std::strlen(parent);
     return std::strncmp(child, parent, LENGTH) == 0 && child[LENGTH] == '/';
+}
+
+auto native_backing_in_scope_locked(const mount_ns::NamespaceRef& scope) -> bool {
+    for (auto* mount : mounts)
+        if (mount != nullptr && mount->namespace_owner == scope && mount->native_backing_pins != 0) return true;
+    return false;
+}
+
+// Borrowed immutable descriptions only: never acquire backend/tree/io locks or
+// retain a File while mount_lock is held. Every edge already owns an open pin.
+auto native_simple_directory(const File* file) -> bool {
+    return file != nullptr && file->refcount.load(std::memory_order_acquire) > 0 && file->is_directory && file->fs_type == FSType::TMPFS &&
+           file->fops == tmpfs::get_tmpfs_fops() && file->private_data != nullptr && file->mount_owner != nullptr &&
+           (file->open_flags & 3) == FILE_ACCESS_SEARCH_ONLY && (file->open_flags & O_DIRECTORY) != 0 &&
+           (file->open_flags & O_NO_CACHE) != 0 && !file->directory_view && !file->exec_read_view && file->vfs_path == nullptr &&
+           file->stream_cache_attachment == nullptr && file->cache_notify_attachment == nullptr;
+}
+
+auto native_directory_mount_locked(const File* file) -> const MountPoint* {
+    if (!native_simple_directory(file)) return nullptr;
+    auto* row = file->mount_owner;
+    if (mount_index_locked(row) == MOUNT_INDEX_NONE || row->private_data == nullptr || row->fs_type != FSType::TMPFS ||
+        row->fops != file->fops || row->dev_id != file->mount_dev_id)
+        return nullptr;
+    // A published native directory File pins this node and its mount. The
+    // association is assigned before publication and cleared only at teardown
+    // after all open_files pins drain; no backend lock or lookup is needed.
+    auto const* node = static_cast<const tmpfs::TmpNode*>(file->private_data);
+    if (node->type != tmpfs::TmpNodeType::DIRECTORY || node->mount != row->private_data) return nullptr;
+    return row;
+}
+
+auto native_mount_graph_locked(const File& file, const mount_ns::NamespaceRef& scope) -> bool {
+    constexpr size_t LIMIT = 64;
+    std::array<const MountPoint*, LIMIT> proven{};
+    size_t proven_count = 0;
+    auto chain = [&](const MountPoint* row) {
+        std::array<const MountPoint*, LIMIT> path{};
+        size_t depth = 0;
+        while (row != nullptr) {
+            for (size_t i = 0; i < depth; ++i)
+                if (path[i] == row) return false;
+            if (depth == LIMIT || mount_index_locked(row) == MOUNT_INDEX_NONE) return false;
+            if (row->namespace_owner != scope || row->path == nullptr || row->fs_type != FSType::TMPFS ||
+                row->fops != tmpfs::get_tmpfs_fops() || row->retiring.load(std::memory_order_acquire))
+                return false;
+            bool already_proven = false;
+            for (size_t i = 0; i < proven_count; ++i)
+                if (proven[i] == row) already_proven = true;
+            if (already_proven) break;
+            if (proven_count == LIMIT) return false;
+            path[depth++] = row;
+            auto* cover = row->covered_directory;
+            if (cover == nullptr) break;
+            auto const* parent = native_directory_mount_locked(cover);
+            if (parent == nullptr || !mount_path_is_descendant(row->path, parent->path)) return false;
+            row = parent;
+        }
+        if (depth > LIMIT - proven_count) return false;
+        for (size_t i = 0; i < depth; ++i) proven[proven_count++] = path[i];
+        return true;
+    };
+    if (!chain(file.mount_owner)) return false;
+    if (!file.directory_view) return true;
+    for (auto* pin : {file.directory_view.root(), file.directory_view.directory()}) {
+        auto const* row = native_directory_mount_locked(pin);
+        if (row == nullptr || !chain(row)) return false;
+    }
+    return true;
 }
 
 auto mount_path_has_descendants_locked(const char* path, const mount_ns::NamespaceRef& scope) -> bool {
@@ -1131,13 +1201,84 @@ auto retain_mount_for_open_file(MountPoint* mount) -> bool {
     }
 
     mount_lock.lock();
-    bool const RETAINED =
+    bool retained =
         mount_index_locked(mount) != MOUNT_INDEX_NONE && mount->path != nullptr && !mount->retiring.load(std::memory_order_acquire);
-    if (RETAINED) {
-        mount->open_files.fetch_add(1, std::memory_order_acq_rel);
+    if (retained) {
+        uint32_t const COUNT = mount->open_files.load(std::memory_order_acquire);
+        retained = COUNT != UINT32_MAX;
+        if (retained) mount->open_files.store(COUNT + 1, std::memory_order_release);
     }
     mount_lock.unlock();
-    return RETAINED;
+    return retained;
+}
+
+NativeFileMappingMountPin::~NativeFileMappingMountPin() { reset(); }
+
+NativeFileMappingMountPin::NativeFileMappingMountPin(NativeFileMappingMountPin&& other) noexcept
+    : mount_(std::exchange(other.mount_, nullptr)) {}
+
+auto NativeFileMappingMountPin::operator=(NativeFileMappingMountPin&& other) noexcept -> NativeFileMappingMountPin& {
+    if (this != &other) {
+        reset();
+        mount_ = std::exchange(other.mount_, nullptr);
+    }
+    return *this;
+}
+
+auto NativeFileMappingMountPin::acquire_tmpfs(File& borrowed, const void* expected_private, NativeFileMappingMountPin& empty) -> int {
+    if (!empty.empty() || expected_private == nullptr) return -EINVAL;
+    if (borrowed.refcount.load(std::memory_order_acquire) <= 0) return -EBADF;
+    if ((borrowed.open_flags & 3) != 0 && (borrowed.open_flags & 3) != 2) return -EACCES;
+    if (borrowed.mount_owner == nullptr || borrowed.fs_type != FSType::TMPFS || borrowed.fops != tmpfs::get_tmpfs_fops() ||
+        borrowed.is_directory || borrowed.private_data == nullptr || (borrowed.open_flags & O_NO_CACHE) == 0 || borrowed.exec_read_view ||
+        borrowed.stream_cache_attachment != nullptr || borrowed.cache_notify_attachment != nullptr)
+        return -EOPNOTSUPP;
+    mount_lock.lock();
+    auto* mount = borrowed.mount_owner;
+    int result = 0;
+    if ((mount_pivot_epoch.load(std::memory_order_acquire) & 1) != 0)
+        result = -EAGAIN;
+    else if (mount_index_locked(mount) == MOUNT_INDEX_NONE)
+        result = -EOPNOTSUPP;
+    else if (mount->namespace_owner.closed())
+        result = -EIDRM;
+    else if (mount->retiring.load(std::memory_order_acquire))
+        result = -EAGAIN;
+    else if (mount->private_data != expected_private || mount->fs_type != FSType::TMPFS || mount->fops != borrowed.fops ||
+             mount->dev_id != borrowed.mount_dev_id || !native_mount_graph_locked(borrowed, mount->namespace_owner))
+        result = -EOPNOTSUPP;
+    if (result == 0) {
+        uint32_t const COUNT = mount->open_files.load(std::memory_order_acquire);
+        if (COUNT <= mount->native_backing_pins)
+            result = -EIO;
+        else if (COUNT == UINT32_MAX || mount->native_backing_pins == UINT32_MAX)
+            result = -EOVERFLOW;
+        else {
+            mount->open_files.store(COUNT + 1, std::memory_order_release);
+            ++mount->native_backing_pins;
+            empty.mount_ = mount;
+        }
+    }
+    mount_lock.unlock();
+    return result;
+}
+
+void NativeFileMappingMountPin::reset() noexcept {
+    auto* mount = std::exchange(mount_, nullptr);
+    if (mount == nullptr) return;
+    mount_lock.lock();
+    if (mount_index_locked(mount) == MOUNT_INDEX_NONE) {
+        mount_lock.unlock();
+        __builtin_trap();
+    }
+    uint32_t const COUNT = mount->open_files.load(std::memory_order_acquire);
+    if (mount->native_backing_pins == 0 || COUNT < mount->native_backing_pins) {
+        mount_lock.unlock();
+        __builtin_trap();
+    }
+    --mount->native_backing_pins;
+    mount->open_files.store(COUNT - 1, std::memory_order_release);
+    mount_lock.unlock();
 }
 
 void release_mount_from_open_file(MountPoint* mount) {
@@ -2065,6 +2206,10 @@ auto configure_mount_point_exact(const char* path, FSType expected_type, void* p
                 continue;
             }
 
+            if (native_backing_in_scope_locked(scope)) {
+                mount_lock.unlock();
+                return false;
+            }
             mp->private_data = private_data;
             mp->fops = fops;
             mount_lock.unlock();
@@ -2112,6 +2257,12 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old, const ker
     if (scope.closed()) {
         mount_lock.unlock();
         return -EIDRM;
+    }
+    // This precedes the odd epoch and every covered-directory rewrite. Native
+    // admission checks the even epoch under this same lock.
+    if (native_backing_in_scope_locked(scope)) {
+        mount_lock.unlock();
+        return -EBUSY;
     }
     // A foreign teardown also mutates the shared row storage while its heavy
     // close runs unlocked. Keep the old global publication barrier: no row

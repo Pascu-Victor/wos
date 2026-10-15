@@ -4,9 +4,11 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <platform/mm/swap.hpp>
 #include <platform/sys/mutex.hpp>
 #include <vfs/exec_content.hpp>
+#include <vfs/mount.hpp>
 #include <vfs/native_coherency.hpp>
 #include <vfs/timestamps.hpp>
 
@@ -22,12 +24,15 @@ class Snapshot;
 namespace ker::vfs::tmpfs {
 
 constexpr size_t TMPFS_NAME_MAX = 256;
+constexpr size_t MAX_NATIVE_BACKING_PAGES = 64;
+constexpr size_t MAX_NATIVE_BACKING_DESCRIPTORS = 4096;
 
 enum class TmpNodeType : uint8_t { FILE, DIRECTORY, SYMLINK };
 enum class TmpPageState : uint8_t { HOLE, RESIDENT, SWAPPED };
 
 struct TmpfsMount;
 class TmpfsLookupHandle;
+class TmpfsReadSharedBacking;
 
 struct TmpPage {
     TmpPageState state = TmpPageState::HOLE;
@@ -67,6 +72,8 @@ struct TmpNode {
     // Serializes file data/size updates for regular file I/O.
     ker::mod::sys::Mutex io_lock;
     ker::vfs::ExecContentState exec_content;
+    // Fixed-EOF canonical mapping intervals; protected by io_lock.
+    uint64_t read_shared_eof_leases = 0;
     ker::vfs::coherency::Object coherency{};
 
     // Reference counting for POSIX unlink semantics
@@ -99,6 +106,7 @@ class TmpfsNodeRef {
 
    private:
     friend class TmpfsLookupHandle;
+    friend class TmpfsReadSharedBacking;
     friend auto tmpfs_acquire_node(TmpNode* node) -> TmpfsNodeRef;
     friend auto tmpfs_acquire_lookup(const ker::mod::security::Snapshot& credentials, TmpNode* root, const char* path,
                                      TmpfsLookupHandle* out) -> int;
@@ -108,6 +116,60 @@ class TmpfsNodeRef {
 
     TmpNode* node_ = nullptr;
     TmpNode* canonical_ = nullptr;
+};
+
+// One checked physical-frame owner. No relocating TmpPage address escapes.
+class TmpfsPageLoan {
+   public:
+    TmpfsPageLoan() = default;
+    TmpfsPageLoan(const TmpfsPageLoan&) = delete;
+    auto operator=(const TmpfsPageLoan&) -> TmpfsPageLoan& = delete;
+    TmpfsPageLoan(TmpfsPageLoan&& other) noexcept;
+    auto operator=(TmpfsPageLoan&& other) noexcept -> TmpfsPageLoan&;
+    ~TmpfsPageLoan();
+
+    auto frame() const -> void* { return frame_; }
+    auto object_identity() const -> uint64_t { return object_identity_; }
+    auto file_offset() const -> uint64_t { return file_offset_; }
+    auto eof() const -> uint64_t { return eof_; }
+    auto release_to_pte() -> void*;
+    void reset();
+
+   private:
+    friend class TmpfsReadSharedBacking;
+    void* frame_ = nullptr;
+    uint64_t object_identity_ = 0;
+    uint64_t file_offset_ = 0;
+    uint64_t eof_ = 0;
+};
+
+// Prepare in ordinary construction context, outside every MM/root guard.
+// Fault loans only duplicate preanchored refs: no backend lock or allocation.
+class TmpfsReadSharedBacking {
+   public:
+    TmpfsReadSharedBacking(const TmpfsReadSharedBacking&) = delete;
+    auto operator=(const TmpfsReadSharedBacking&) -> TmpfsReadSharedBacking& = delete;
+    TmpfsReadSharedBacking(TmpfsReadSharedBacking&&) = delete;
+    auto operator=(TmpfsReadSharedBacking&&) -> TmpfsReadSharedBacking& = delete;
+    ~TmpfsReadSharedBacking();
+
+    static auto prepare(File& file, uint64_t file_offset, uint64_t length, std::unique_ptr<TmpfsReadSharedBacking>& empty) -> int;
+    auto object_identity() const -> uint64_t { return object_identity_; }
+    auto eof() const -> uint64_t { return eof_; }
+    auto file_offset() const -> uint64_t { return file_offset_; }
+    auto length() const -> uint64_t { return length_; }
+    auto loan_page(uint64_t absolute_aligned_offset, TmpfsPageLoan& empty) const noexcept -> bool;
+
+   private:
+    TmpfsReadSharedBacking() = default;
+    NativeFileMappingMountPin mount_pin_{};
+    TmpfsNodeRef node_{};
+    std::array<void*, MAX_NATIVE_BACKING_PAGES> anchors_{};
+    uint64_t object_identity_ = 0;
+    uint64_t eof_ = 0;
+    uint64_t file_offset_ = 0;
+    uint64_t length_ = 0;
+    bool eof_lease_ = false;
 };
 
 class TmpfsLookupHandle {

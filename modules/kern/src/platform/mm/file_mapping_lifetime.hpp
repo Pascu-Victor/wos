@@ -3,9 +3,13 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 
 namespace ker::vfs {
 struct File;
+}
+namespace ker::vfs::tmpfs {
+class TmpfsReadSharedBacking;
 }
 namespace ker::mod::mm::paging {
 struct PageTable;
@@ -83,9 +87,10 @@ struct BindingOwnerCounts {
 };
 
 class FileMappingBinding;
+enum class FileMappingBackingMode : uint8_t { PRIVATE_COPY, TMPFS_READ_SHARED };
 
 // One family owns exactly one File reference, independent of its typed consumers.
-// It supplies ownership only, not canonical data, dirty state or EOF coherence.
+// The explicit readonly TMPFS mode also owns its fixed-EOF canonical backing.
 class FileMappingLifetime {
    public:
     // Ordinary allocation context, outside MM/root/publication/IRQ guards. Caller
@@ -98,6 +103,10 @@ class FileMappingLifetime {
     // observer. Refusal cancels the unused reservation before synchronous rollback;
     // it never queues an unobserved File callback. The output starts empty.
     [[nodiscard]] static auto prepare(ker::vfs::File& borrowed_file, RetirementCompletion& empty) -> FileMappingLifetime*;
+    // Backend preparation may allocate/block before any MM/root guard or return
+    // observer exists. Failure leaves no queued family and preserves empty.
+    [[nodiscard]] static auto prepare_read_shared_tmpfs(ker::vfs::File& borrowed_file, uint64_t file_offset, uint64_t length,
+                                                        RetirementCompletion& empty, int& error) -> FileMappingLifetime*;
     // Caller already owns/protects a live owner; a bare pointer cannot resurrect.
     [[nodiscard]] auto try_acquire(FamilyOwner role) noexcept -> bool;
     void release(FamilyOwner role) noexcept;
@@ -108,6 +117,11 @@ class FileMappingLifetime {
     [[nodiscard]] auto owners_match(const FamilyOwnerCounts& expected) const noexcept -> bool;
     [[nodiscard]] auto observe_return(RetirementCompletion& empty) noexcept -> bool;
     [[nodiscard]] auto file() const noexcept -> ker::vfs::File* { return file_; }
+    [[nodiscard]] auto backing_mode() const noexcept -> FileMappingBackingMode { return backing_mode_; }
+    // Borrowed only while a real family/binding/installer owner is held.
+    [[nodiscard]] auto read_shared_backing() const noexcept -> const ker::vfs::tmpfs::TmpfsReadSharedBacking* {
+        return read_shared_backing_.get();
+    }
 
     FileMappingLifetime(const FileMappingLifetime&) = delete;
     auto operator=(const FileMappingLifetime&) -> FileMappingLifetime& = delete;
@@ -115,12 +129,14 @@ class FileMappingLifetime {
    private:
     friend class FileMappingBinding;
     explicit FileMappingLifetime(const LifetimeRetirementPort& port) noexcept;
-    ~FileMappingLifetime() = default;
+    ~FileMappingLifetime();
     static auto finish(void* argument) noexcept -> int;
     FamilyOwnerCounts owners_{};  // Permanent owner-count IRQ lock, never a member lock.
     const LifetimeRetirementPort* port_{};
     LifetimeRetirementTicket* ticket_{};
     ker::vfs::File* file_{};
+    FileMappingBackingMode backing_mode_{FileMappingBackingMode::PRIVATE_COPY};
+    std::unique_ptr<ker::vfs::tmpfs::TmpfsReadSharedBacking> read_shared_backing_{};
 };
 
 class FileMappingIndex;

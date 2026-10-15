@@ -69,6 +69,12 @@ void release_file_mmap_ranges_for_pagemap(ker::mod::mm::paging::PageTable* pagem
 [[nodiscard]] auto prepare_unpublished_file_mapping(ker::mod::sched::task::Task& owner, ker::mod::sched::task::Task& child,
                                                     ker::vfs::File& file, uint64_t address, uint64_t length, uint64_t offset, uint64_t prot)
     -> int;
+// Explicit bounded canonical TMPFS profile: registered mounted backend,
+// READ/NONE only, fixed EOF and prepared canonical anchors. Still unpublished;
+// generic VM mutation, public execution and fork remain unsupported.
+[[nodiscard]] auto prepare_unpublished_read_shared_tmpfs_mapping(ker::mod::sched::task::Task& owner, ker::mod::sched::task::Task& child,
+                                                                 ker::vfs::File& file, uint64_t address, uint64_t length, uint64_t offset,
+                                                                 uint64_t prot) -> int;
 // Enumerates actual lazy/registry/index holders. Unknown owners refuse before
 // Task mutation; exact typed totals are checked only against that enumeration.
 [[nodiscard]] auto validate_native_unpublished_mapping_owners(ker::mod::sched::task::Task& task) -> bool;

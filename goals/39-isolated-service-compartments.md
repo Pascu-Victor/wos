@@ -8,6 +8,24 @@
 
 ## Outcome and scale
 
+Checkpoint 57 adds canonical readonly shared TMPFS backing to the bounded
+unpublished native mapping producer. Actual scheduled Native86 passes seven
+cases, 3,429 assertions and 20 callback returns, including two-root write
+visibility, readonly PTEs, quota rollback and mount lifetime after unlink and
+final File close. Normal Build WOS, isolated fast diagnostic compilation,
+formatting and all 11 selected Host checks pass; the actual-body TMPFS harness
+passes 36 vectors and 67,001 assertions. All four disposable Native86 images
+are pruned and the real-host postcheck reports zero disposable allocation.
+Its post-finalizer init/XFS errors remain context, without a healthy ordinary
+rootfs boot claim. Fresh default Native87 passes all 1,463 enabled cases,
+212 mandatory cases and 113,976 assertions with zero failures and natural
+shutdown; its four disposable images are also pruned, with zero disposable
+allocation confirmed by the real-host postcheck. Public mapping ownership,
+writable shared backing, two-hour
+services and 1,000 full lifecycle/failure cycles remain unfinished. Goal39 stays
+ACTIVE with all ten full criteria open; continue `--no-setup`, one topology,
+bounded storage and exact-owned pruning after every outcome.
+
 Checkpoint 56 connects typed File-family, binding, pin and installer ownership
 for bounded unpublished native mappings, with real queued retirement and an
 actual callback-return barrier before Task deletion. The fresh scheduled

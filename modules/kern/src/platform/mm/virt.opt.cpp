@@ -1,5 +1,6 @@
 #include "virt.hpp"
 
+#include <abi/callnums/vmem.h>
 #include <extern/limine.h>
 
 #include <algorithm>
@@ -5069,6 +5070,12 @@ auto install_lazy_file_page_if_current(sched::task::Task* task, const sched::tas
                                  file_mapping_index.matches_pin_locked(task->pagemap, control->serial, page_vaddr, expected_binding);
             user_mapping_pin_lock.unlock_irqrestore(FLAGS);
             if (!CURRENT) break;
+            if (candidate.lifetime->backing_mode() == file_mapping::FileMappingBackingMode::TMPFS_READ_SHARED) {
+                constexpr uint64_t REQUIRED =
+                    paging::PAGE_PRESENT | paging::PAGE_USER | paging::PAGE_SHARED | paging::PAGE_WRITE_RESTRICTED | paging::PAGE_NX;
+                if (candidate.flags != ker::abi::vmem::MAP_SHARED || candidate.prot != ker::abi::vmem::PROT_READ || page_flags != REQUIRED)
+                    break;
+            }
         } else if (expected_binding != nullptr) {
             break;
         }
