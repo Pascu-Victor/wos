@@ -18,6 +18,7 @@ SHM_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "shm" / "shm.cpp
 VMEM_ABI_HPP = ROOT / "modules" / "kern" / "src" / "abi" / "callnums" / "vmem.h"
 DEBUG_FLAGS_DOC = ROOT / "docs" / "kernel_debug_flags.md"
 SYSCALL_PREPARATION_HPP = ROOT / "modules/kern/src/platform/sys/syscall_preparation.hpp"
+NUMA_ALLOC_CPP = ROOT / "modules/kern/src/platform/mm/numa_alloc.cpp"
 
 
 def fail(message: str) -> None:
@@ -26,7 +27,7 @@ def fail(message: str) -> None:
 
 def function_body(source: str, name: str) -> str:
     match = re.search(
-        rf"\b(?:auto|void)\s+{name}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>,\s*&]+)?\s*\{{",
+        rf"\b(?:auto|void)\s+{name}\([^)]*\)\s*(?:noexcept\s*)?(?:->\s*[A-Za-z0-9_:<>,\s*&]+)?\s*\{{",
         source,
         flags=re.DOTALL,
     )
@@ -52,6 +53,11 @@ def require_tokens(source: str, tokens: list[str], context: str) -> None:
         fail(f"{context}: missing {', '.join(missing)}")
 
 
+def require_cpp_tokens(source: str, tokens: list[str], context: str) -> None:
+    # Exact argument/operation spelling, independent of clang-format line wraps.
+    require_tokens(re.sub(r"\s+", "", source), [re.sub(r"\s+", "", token) for token in tokens], context)
+
+
 def require_order(source: str, first: str, second: str, context: str) -> None:
     first_index = source.find(first)
     second_index = source.find(second)
@@ -61,6 +67,10 @@ def require_order(source: str, first: str, second: str, context: str) -> None:
         fail(f"{context}: missing {second}")
     if first_index >= second_index:
         fail(f"{context}: expected {first} before {second}")
+
+
+def require_cpp_order(source: str, first: str, second: str, context: str) -> None:
+    require_order(re.sub(r"\s+", "", source), re.sub(r"\s+", "", first), re.sub(r"\s+", "", second), context)
 
 
 def require_ordered_tokens(source: str, tokens: list[str], context: str) -> None:
@@ -446,25 +456,27 @@ def test_owned_frame_tracking_is_disabled_off_the_fault_path() -> None:
 def test_cow_write_resolution_serializes_pte_reference_consumption() -> None:
     source = VIRT_CPP.read_text()
     resolver_body = function_body(source, "resolve_user_write_mapping")
-    ensure_body = function_body(source, "ensure_user_page_writable_for_task")
+    ensure_entry = function_body(source, "ensure_user_page_writable_for_task")
+    ensure_body = function_body(source, "ensure_user_page_writable_with_context")
     fault_body = function_body(source, "pagefault_handler")
 
-    require_tokens(
+    require_cpp_tokens(
         source,
         [
             "sys::Spinlock cow_pte_lock;",
             "enum class UserWriteFaultStatus",
-            "auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserWriteFaultStatus",
+            "auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr, const DemandContext& demand) -> UserWriteFaultStatus",
         ],
         "COW write resolver surface",
     )
-    require_tokens(
+    require_cpp_tokens(
         resolver_body,
         [
             "cow_pte_lock.lock_irqsave()",
             "phys::page_ref_inc(old_virt, &cow_lookup);",
             "void* new_page = nullptr;",
-            "new_page = alloc_cow_destination_page(DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE);",
+            "alloc_cow_destination_page(DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE, demand, allocation);",
+            "new_page = allocation.span.data();",
             "CURRENT_PHYS == old_phys",
             "installed_private_page = true;",
             "phys::page_ref_dec(old_virt, &cow_lookup);",
@@ -478,9 +490,9 @@ def test_cow_write_resolution_serializes_pte_reference_consumption() -> None:
         "bool const DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE = !old_is_zero_page;",
         "COW resolver must pin the old frame before allocating outside the PTE lock",
     )
-    require_order(
+    require_cpp_order(
         resolver_body,
-        "new_page = alloc_cow_destination_page(DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE);",
+        "alloc_cow_destination_page(DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE, demand, allocation);",
         "CURRENT_PHYS == old_phys",
         "COW resolver must allocate/copy before the locked same-frame commit check",
     )
@@ -490,26 +502,65 @@ def test_cow_write_resolution_serializes_pte_reference_consumption() -> None:
         "pte = pte_from_raw(raw_now);",
         "COW resolver must recheck the old frame before consuming the PTE reference",
     )
-    if source.count("alloc_cow_destination_page(DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE)") != 1:
+    if re.sub(r"\s+", "", source).count("alloc_cow_destination_page(DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE,") != 1:
         fail("COW destination allocation must be centralized in resolve_user_write_mapping")
 
-    require_tokens(
+    require_cpp_tokens(
         ensure_body,
         [
-            "switch (resolve_user_write_mapping(task, vaddr))",
+            "switch (resolve_user_write_mapping(task, vaddr, demand))",
             "case UserWriteFaultStatus::NEED_LAZY_BACKING:",
-            "handle_lazy_vmem_fault(task, vaddr, WRITE_FAULT)",
+            "handle_lazy_vmem_fault(task, vaddr, WRITE_FAULT, demand)",
         ],
         "syscall copy COW path must share the serialized resolver",
     )
-    require_tokens(
+    require_cpp_tokens(
+        ensure_entry,
+        ["capture_demand_context(task, vaddr, DemandOrigin::SoftwareEnsure, false, demand)",
+         "ensure_user_page_writable_with_context(task, vaddr, demand)"],
+        "software entry captures target policy and preserves its explicit origin",
+    )
+    require_cpp_tokens(
         fault_body,
         [
-            "resolve_user_write_mapping(current_task, control_register) == UserWriteFaultStatus::HANDLED",
+            "resolve_user_write_mapping(current_task, control_register, demand) == UserWriteFaultStatus::HANDLED",
+            "DemandOrigin::HardwareFault",
+            "(frame.cs & 3U) == 3U",
             "return true;",
         ],
         "page fault COW path must share the serialized resolver",
     )
+
+
+def test_private_demand_observer_uses_supplied_root_incarnation() -> None:
+    source = VIRT_CPP.read_text()
+    capture = function_body(source, "capture_demand_context")
+    require_cpp_tokens(capture, ["uint64_t observer_root_serial = 0;",
+                                "capture_user_root_incarnation(target->pagemap, observer_root_serial)",
+                                "demand_observer.root_serial.load(std::memory_order_relaxed) == observer_root_serial"],
+                       "foreign demand observer requires exact supplied root incarnation")
+    require_cpp_order(capture, "demand_observer.root.load(std::memory_order_relaxed) == target->pagemap",
+                      "capture_user_root_incarnation(target->pagemap, observer_root_serial)",
+                      "cheap supplied-root identity precedes exact incarnation lookup")
+    require_cpp_order(capture, "demand_observer.root_serial.load(std::memory_order_relaxed) == observer_root_serial",
+                      "output.observer_cookie = WORD;", "stale incarnation must refuse observation before consuming cookie")
+    if "current_user_root_incarnation" in capture:
+        fail("foreign demand observation cannot use a current-process-only incarnation helper")
+    exact = function_body(source, "capture_user_root_incarnation")
+    require_cpp_tokens(exact, ["if (root == nullptr || empty != 0) return false;",
+                              "user_mapping_pin_lock.lock_irqsave()", "find_user_root_control_locked(root)",
+                              "if (control != nullptr) empty = control->serial;",
+                              "user_mapping_pin_lock.unlock_irqrestore(FLAGS)", "return empty != 0;"],
+                       "exact root lookup returns only a copied registered nonzero serial")
+    current = function_body(source, "current_user_root_incarnation")
+    require_cpp_tokens(current, ["if (!current_process_root(task)) return 0;"],
+                       "current-process incarnation API must retain its original admission")
+    observer = function_body(source, "selftest_observe_private_demand")
+    require_cpp_order(observer, "subject.try_acquire_usercopy_pagemap(root)",
+                      "capture_user_root_incarnation(root, serial)", "observer owns target root through initial capture")
+    require_cpp_order(observer, "demand_observer.root_serial.store(serial, std::memory_order_relaxed)",
+                      "demand_observer.word.store(READY, std::memory_order_release)",
+                      "fully bound exact root serial precedes observer publication")
 
 
 def test_page_table_pool_duplicate_release_does_not_fall_through_to_page_free() -> None:
@@ -623,14 +674,24 @@ def test_user_memory_pressure_does_not_enter_fatal_oom() -> None:
         ],
         "file mmap cache allocation pressure",
     )
-    require_tokens(
+    require_cpp_tokens(
         function_body(virt, "alloc_cow_destination_page"),
         [
-            'page_alloc_full_overwrite_page_with_reclaim_may_fail(PhysicalPageOwner::USER_PRIVATE_MAPPING, "cow_copy")',
-            'page_alloc_with_reclaim_may_fail(PhysicalPageOwner::USER_PRIVATE_MAPPING, paging::PAGE_SIZE, "cow_zero")',
+            "numa::try_allocate_pages_into(output, demand.allocation, 1, paging::PAGE_SIZE, PhysicalPageOwner::USER_PRIVATE_MAPPING,",
+            "full_overwrite ? phys::PageInitialization::FULL_OVERWRITE : phys::PageInitialization::ZERO",
+            'numa::ReclaimMode::LEGACY_UMA, full_overwrite ? "cow_copy" : "cow_zero"',
         ],
         "COW destination allocation pressure",
     )
+    factory = function_body(NUMA_ALLOC_CPP.read_text(), "try_allocate_pages")
+    require_cpp_tokens(factory, [
+        "topology->node_count == 1 && context.policy.mode == Mode::LOCAL && pages == 1 && alignment_bytes == paging::PAGE_SIZE",
+        "reclaim == ReclaimMode::LEGACY_UMA",
+        "phys::page_alloc_with_reclaim_may_fail(owner, paging::PAGE_SIZE, SITE)",
+        "phys::page_alloc_full_overwrite_page_with_reclaim_may_fail(owner, SITE)",
+        "phys::page_alloc_may_fail(owner, paging::PAGE_SIZE, SITE)",
+        "phys::page_alloc_full_overwrite_page_may_fail(owner, SITE)",
+    ], "exact UMA compatibility delegates to existing fallible physical helpers")
     cow_body = function_body(virt, "resolve_user_write_mapping")
     require_tokens(
         cow_body,
@@ -644,23 +705,25 @@ def test_user_memory_pressure_does_not_enter_fatal_oom() -> None:
     cow_failure = block_between(cow_body, "if (new_page == nullptr)", "if (DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE)", "COW OOM branch")
     if "hcf()" in cow_failure:
         fail("recoverable COW allocation failure must not halt the kernel")
-    require_tokens(
+    require_cpp_tokens(
         function_body(virt, "handle_lazy_vmem_fault"),
         [
-            'page_alloc_full_overwrite_may_fail(PhysicalPageOwner::USER_PRIVATE_MAPPING, paging::PAGE_SIZE, "lazy-vmem")',
+            "numa::try_allocate_pages_into(allocation, demand.allocation, 1, paging::PAGE_SIZE,",
+            'PhysicalPageOwner::USER_PRIVATE_MAPPING, phys::PageInitialization::FULL_OVERWRITE, numa::ReclaimMode::NEVER, "lazy-vmem")',
             "cow_pte_lock.lock_irqsave()",
             "anonymous_lazy_range_allows_fault(task, PAGE_VADDR, fault, current_prot)",
             "translate(task->pagemap, PAGE_VADDR) != PADDR_INVALID",
             "if (ALLOWED && !ALREADY_MAPPED)",
-            "phys::page_ref_dec(PAGE);",
+            "allocation.span.release()",
+            "allocation.span.reset()",
         ],
         "IRQ-disabled anonymous lazy fault allocation and shared-pagemap install",
     )
     lazy_body = function_body(virt, "handle_lazy_vmem_fault")
-    require_order(
+    require_cpp_order(
         lazy_body,
         "task->lazy_vmem_lock.unlock_irqrestore(IRQF);",
-        'page_alloc_full_overwrite_may_fail(PhysicalPageOwner::USER_PRIVATE_MAPPING, paging::PAGE_SIZE, "lazy-vmem")',
+        "numa::try_allocate_pages_into(allocation, demand.allocation, 1, paging::PAGE_SIZE,",
         "lazy anonymous allocation must happen outside the task range lock",
     )
     require_order(
@@ -1076,6 +1139,7 @@ def main() -> None:
     test_sysv_shm_publication_respects_vm_reservations_and_guards()
     test_owned_frame_tracking_is_disabled_off_the_fault_path()
     test_cow_write_resolution_serializes_pte_reference_consumption()
+    test_private_demand_observer_uses_supplied_root_incarnation()
     test_page_table_pool_duplicate_release_does_not_fall_through_to_page_free()
     test_mapping_replacement_releases_displaced_reference_after_tlb_flush()
     test_user_memory_pressure_does_not_enter_fatal_oom()

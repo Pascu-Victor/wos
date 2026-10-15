@@ -2145,6 +2145,7 @@ auto run_remote_exec_owner(ker::mod::sched::task::Task& owner, ExecRequestArgume
         .filesystem = &plan.filesystem,
         .exec_credentials = &plan.credential_transition,
         .exec_candidate = &CANDIDATE,
+        .memory_policy = request.memory_policy,
     };
     outcome.result = ker::net::wki::wki_try_remote_spawn(&owner, SPEC);
     outcome.pending = plan.handoff;
@@ -2239,6 +2240,7 @@ auto try_process_remote_exec(ker::mod::sched::task::Task& actor, const uint8_t* 
         error = -ENOMEM;
         return WkiRemoteSpawnResult::FAILED;
     }
+    holder->memory_policy = request->memory_policy;
     holder->remote = std::move(plan);
     auto& handoff = request->handoff;
     {
@@ -5683,6 +5685,7 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         .error_out = &remote_error,
         .exec_credentials = &SPAWN_TRANSITION,
         .image_credentials = &PARENT_CREDENTIALS,
+        .memory_policy = memory_policy,
     };
     new_task->mark_exec_completed();
     if (!child_events::begin_publication(*parent_task, *new_task)) {
@@ -7138,6 +7141,87 @@ auto exec_selftest_remote_request_claim_and_cancel() -> bool {
             acknowledge_worker_exec(owner, handoff, -EAGAIN);
             ok &= owner.owned_exec_arguments.load() == nullptr && owner.active_exec_handoff.load() == nullptr &&
                   handoff.result.load() == -EAGAIN;
+        }
+    }
+    return ok;
+}
+
+auto exec_selftest_remote_request_memory_policy() -> bool {
+    using Task = ker::mod::sched::task::Task;
+    namespace numa = ker::mod::mm::numa;
+    using ker::net::wki::WkiRemoteSpawnResult;
+    constexpr numa::Policy NONLOCAL{.nodes = 1, .mode = numa::Mode::BIND};
+    bool ok = true;
+    for (bool nonlocal_actor : {false, true}) {
+        for (bool cancel : {false, true}) {
+            auto owner = std::unique_ptr<Task>{new (std::nothrow) Task{}};
+            auto worker = std::unique_ptr<Task>{new (std::nothrow) Task{}};
+            if (!owner || !worker) return false;
+            owner->type = worker->type = ker::mod::sched::task::TaskType::PROCESS;
+            owner->pid = ker::mod::sched::task::get_next_pid();
+            worker->pid = ker::mod::sched::task::get_next_pid();
+            worker->is_thread = true;
+            worker->owner_pid = owner->pid;
+            if (!ker::mod::sched::resource::bind_thread_owner(*worker, *owner)) return false;
+            struct Cleanup {
+                Task& owner;
+                Task& worker;
+                ~Cleanup() {
+                    cancel_pending_exec_handoff(owner);
+                    cleanup_exec_preparation(owner);
+                    cleanup_exec_preparation(worker);
+                }
+            } cleanup{*owner, *worker};
+            numa::Policy const OWNER_POLICY = nonlocal_actor ? numa::Policy{} : NONLOCAL;
+            numa::Policy const ACTOR_POLICY = nonlocal_actor ? NONLOCAL : numa::Policy{};
+            if (!owner->selftest_set_memory_policy(OWNER_POLICY) || !worker->selftest_set_memory_policy(ACTOR_POLICY)) return false;
+            auto original = std::unique_ptr<ExecRequestArguments>{new (std::nothrow) ExecRequestArguments};
+            auto holder = std::unique_ptr<ExecRequestArguments>{new (std::nothrow) ExecRequestArguments};
+            if (!original || !holder) return false;
+            original->memory_policy = worker->memory_policy_snapshot();
+            holder->memory_policy = original->memory_policy;
+            holder->remote.reset(new (std::nothrow) RemoteExecPlan);
+            if (!holder->remote || !worker->try_acquire()) return false;
+            holder->remote->actor = worker.get();
+            holder->remote->target_flags = Task::WKI_TARGET_FLAG_REMOTE;
+            if (nonlocal_actor) std::strcpy(holder->remote->path.data(), "/candidate");
+            // Reverse control has no executable payload: captured LOCAL must
+            // reach the original LOCAL shortcut, despite the owner's BIND.
+            auto* const REQUEST = original.get();
+            if (!adopt_exec_arguments(*worker, original)) return false;
+            if (!worker->selftest_set_memory_policy(OWNER_POLICY)) return false;
+            auto const CREDENTIALS = owner->credentials();
+            auto const OWNER_REFS = owner->ref_count.load();
+            auto& handoff = REQUEST->handoff;
+            handoff.remote = true;
+            handoff.worker = worker.get();
+            handoff.remote_request = holder.release();
+            auto* const HELD = handoff.remote_request;
+            owner->pending_exec_handoff.store(&handoff);
+            ok &= HELD->memory_policy == ACTOR_POLICY && REQUEST->memory_policy == ACTOR_POLICY;
+            if (cancel) {
+                cancel_pending_exec_handoff(*owner);
+                ok &= owner->pending_exec_handoff.load() == nullptr && handoff.result.load() == -ECANCELED &&
+                      handoff.remote_request == HELD && HELD->memory_policy == ACTOR_POLICY;
+            } else {
+                if (claim_pending_exec_handoff(*owner) != &handoff) return false;
+                ok &= handoff.remote_request == nullptr && owner->owned_exec_arguments.load() == HELD &&
+                      owner->active_exec_handoff.load() == &handoff;
+                auto const OUTCOME = run_remote_exec_owner(*owner, *HELD, &handoff);
+                int const EXPECTED_ERROR = nonlocal_actor ? -ENOTSUP : 0;
+                ok &= OUTCOME.result == (nonlocal_actor ? WkiRemoteSpawnResult::FAILED : WkiRemoteSpawnResult::LOCAL) &&
+                      OUTCOME.error == EXPECTED_ERROR && OUTCOME.pending == &handoff && !HELD->remote &&
+                      HELD->memory_policy == ACTOR_POLICY && HELD->remote_proxy_id == 0;
+                cleanup_exec_preparation_with_status(*owner, EXPECTED_ERROR);
+                acknowledge_worker_exec(*owner, handoff, EXPECTED_ERROR);
+                ok &= !owner->owned_exec_arguments.load() && !owner->active_exec_handoff.load() && handoff.result.load() == EXPECTED_ERROR;
+            }
+            cleanup_exec_preparation(*worker);  // Also owns an unclaimed canceled holder.
+            ok &= worker->ref_count.load() == 1 && owner->ref_count.load() == OWNER_REFS &&
+                  owner->memory_policy_snapshot() == OWNER_POLICY && worker->memory_policy_snapshot() == OWNER_POLICY &&
+                  owner->credentials() == CREDENTIALS && !owner->wki_proxy_task && !owner->wki_skip_legacy_placement &&
+                  owner->wki_execution_identity().proxy_task_id == 0 && !owner->resource_exec_admission_closed &&
+                  owner->elf_buffer == nullptr && owner->exec_image_file == nullptr && owner->fd_table.empty();
         }
     }
     return ok;

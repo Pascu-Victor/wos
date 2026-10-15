@@ -16,6 +16,9 @@ ROOT = Path(__file__).resolve().parents[3]
 virt = (ROOT / "modules/kern/src/platform/mm/virt.opt.cpp").read_text()
 vmem = (ROOT / "modules/kern/src/syscalls_impl/vmem/sys_vmem.cpp").read_text()
 scheduler = (ROOT / "modules/kern/src/platform/sched/scheduler.cpp").read_text()
+allocator = (ROOT / "modules/kern/src/platform/mm/numa_alloc.cpp").read_text()
+allocator_header = (ROOT / "modules/kern/src/platform/mm/numa_alloc.hpp").read_text()
+virt_header = (ROOT / "modules/kern/src/platform/mm/virt.hpp").read_text()
 start = virt.index("enum class LazyFileFaultDisposition")
 end = virt.index("\n#endif\n", virt.index("void start_lazy_file_fault_worker()", start))
 region = virt[start:end]
@@ -23,7 +26,7 @@ branch_start = virt.index("        auto const FILE_FAULT = probe_lazy_file_fault
 branch_end = virt.index("\n#endif", branch_start)
 branch = virt[branch_start:branch_end]
 fallback_start = virt.index("        constexpr bool ALLOW_FILE_IO = false;", branch_end)
-fallback_end = virt.index("        if (current_task != nullptr", fallback_start)
+fallback_end = virt.index("        if (current_task != nullptr && current_task->pagemap != nullptr && current_task->thread != nullptr", fallback_start)
 fallback = virt[fallback_start:fallback_end]
 fallback = fallback[:fallback.index("#else")] + fallback[fallback.index("#endif") + len("#endif"):]
 code = r'''
@@ -36,6 +39,8 @@ code = r'''
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <new>
+#include <utility>
 #include <vector>
 #include <cerrno>
 using vaddr_t=uint64_t; using paddr_t=uint64_t;
@@ -88,6 +93,7 @@ struct Task{TaskType type=TaskType::PROCESS;std::atomic<TaskState>state{TaskStat
 void destroy_unpublished_user_thread(Task*t){assert(guards==0&&t->refs==1&&!t->posted);delete t;++destroyed;}
 }
 namespace sched{
+struct PreemptGuard{PreemptGuard(){assert(guards==0);}~PreemptGuard(){assert(guards==0);}};
 task::Task*current=nullptr;task::Task*posted_worker=nullptr;
 task::Task*get_current_task(){return current;}
 bool kernel_threads_shutdown_requested(){return shutdown_requested;}
@@ -108,6 +114,7 @@ namespace mm{
 namespace paging{constexpr uint64_t PAGE_SIZE=4096;struct PageFault{unsigned writable=0,fetch=0;};}
 enum class PhysicalPageOwner{USER_FILE_MAPPING,USER_PRIVATE_MAPPING};
 namespace phys{
+enum class PageInitialization:uint8_t{ZERO,FULL_OVERWRITE};
 void*page_alloc_full_overwrite_page_with_reclaim_may_fail(PhysicalPageOwner,const char*){assert(guards==0);
  if(fail_alloc)return nullptr;++allocated;auto*p=new uint8_t[4096];std::memset(p,0xa5,4096);return p;}
 void*page_alloc_full_overwrite_may_fail(PhysicalPageOwner owner,size_t bytes,const char*name){assert(bytes==4096);
@@ -115,8 +122,24 @@ void*page_alloc_full_overwrite_may_fail(PhysicalPageOwner owner,size_t bytes,con
 void page_ref_dec(void*p){assert(guards==0);delete[]static_cast<uint8_t*>(p);++dropped;}
 }
 namespace addr{void*get_phys_pointer(uint64_t p){return reinterpret_cast<void*>(p);}}
+namespace numa{
+@NUMA_DECLARATIONS@
+@NUMA_METHODS@
+// This fixture executes RAW file paths only. The new anonymous allocator
+// endpoint is explicitly unreachable; factory dispatch has its own real test.
+auto try_allocate_pages(const AllocationContext&,uint32_t,uint64_t,PhysicalPageOwner,phys::PageInitialization,ReclaimMode,const char*)
+ ->AllocationResult{std::abort();}
+@NUMA_ADAPTER@
+}
 namespace virt{
 namespace sched=ker::mod::sched;namespace sys=ker::mod::sys;
+@DEMAND_TYPES@
+@DEMAND_STORAGE@
+bool capture_demand_context(sched::task::Task*t,uint64_t,DemandOrigin origin,bool user,DemandContext&output){
+ assert(guards==0);output.origin=origin;output.hardware_user=user;output.allocation.local_node=0;return t&&t->pagemap;}
+void record_demand_candidate(const DemandContext&,bool){assert(guards==0);}
+bool demand_is_observed(const DemandContext&){assert(guards==0);return false;}
+void record_demand_result(const DemandContext&,DemandBacking,numa::NodeId,numa::NodeId,bool,bool,bool){assert(guards==0);}
 using PageTable=::PageTable;Lock cow_pte_lock;
 namespace log{template<class...Args>void error(const char*,Args...){}}
 void log_lazy_vmem_fault_state(sched::task::Task*,uint64_t,const paging::PageFault&,const char*,uint64_t,uint64_t){}
@@ -151,6 +174,10 @@ namespace ker::mod::mm::virt{
 @INSTALL@
 @ANONYMOUS_RANGE@
 @LAZY_HELPER@
+bool exercise_lazy_fault(sched::task::Task*t,uint64_t address,const paging::PageFault&fault,uint64_t rip=0,uint64_t rsp=0,bool file_io=true){
+ DemandContextStorage storage;auto&demand=storage.get();demand.allocation.local_node=0;
+ return handle_lazy_vmem_fault(t,address,fault,demand,rip,rsp,file_io);
+}
 bool handle_file_fault(sched::task::Task*current_task,uint64_t control_register,paging::PageFault PAGEFAULT,sched::Frame frame={}){
  sched::GPRegs gpr;uint64_t wait_generation=0;
 @BRANCH@
@@ -189,9 +216,9 @@ int main(){
  reset();{Fixture f;sched::current=&f.task;f.task.lazy_vmem_ranges.clear();uint64_t g=0;
   assert(probe_lazy_file_fault(&f.task,0x10000,Fault{},true,g)==LazyFileFaultDisposition::NOT_TRACKED);
   Range inserted;inserted.file=&f.file;f.task.lazy_vmem_ranges.push_back(inserted);
-  assert(!handle_lazy_vmem_fault(&f.task,0x10000,Fault{},0,0,false));
+  assert(!exercise_lazy_fault(&f.task,0x10000,Fault{},0,0,false));
   assert(reads==0&&puts==0&&f.file.refs==1&&f.task.refs==1&&f.task.pins==0&&f.map.gates==0&&!f.map.page);
-  software_prefault=true;assert(handle_lazy_vmem_fault(&f.task,0x10000,Fault{}));software_prefault=false;
+  software_prefault=true;assert(exercise_lazy_fault(&f.task,0x10000,Fault{}));software_prefault=false;
   assert(reads==1&&puts==1&&f.file.refs==1&&f.map.page);}
  reset();{Fixture f;sched::current=&f.task;f.task.lazy_vmem_ranges.clear();
   unlock_hook=[&](Lock*lock){if(lock==&f.task.lazy_vmem_lock){unlock_hook={};Range inserted;inserted.file=&f.file;
@@ -265,6 +292,13 @@ int main(){
  return 0;
 }
 '''
+namespace_start = allocator_header.index('namespace ker::mod::mm::numa {') + len('namespace ker::mod::mm::numa {')
+numa_declarations = allocator_header[namespace_start:allocator_header.rindex('}  // namespace ker::mod::mm::numa')]
+numa_methods = allocator[allocator.index('OwnedSpan::~OwnedSpan()'):allocator.index('auto physical_node(')]
+demand_storage = virt[virt.index('struct DemandContext {'):virt.index('struct DemandCounters {')]
+demand_types = '\n'.join(block(virt_header, rf'^enum class {name}[^;]*\{{') + ';'
+                         for name in ['DemandOrigin', 'DemandBacking'])
+code = '#include "' + str(ROOT / 'modules/kern/src/platform/mm/numa_policy.hpp') + '"\n' + code
 code = extend_raw_fixture(code, 'Lock user_mapping_pin_lock;')
 for key, value in {
     "CLEAN_EXIT": block(scheduler, r'^\[\[noreturn\]\] void exit_current_kernel_thread\([^;{]*\{'),
@@ -276,6 +310,11 @@ for key, value in {
     "BRANCH": branch,
     "FALLBACK": fallback,
     "MATERIALIZE": function(vmem, "materialize_lazy_file_page_impl"),
+    "NUMA_DECLARATIONS": numa_declarations,
+    "NUMA_METHODS": numa_methods,
+    "NUMA_ADAPTER": block(allocator, r'^\[\[gnu::noinline\]\] void try_allocate_pages_into\([^;{]*\{'),
+    "DEMAND_TYPES": demand_types,
+    "DEMAND_STORAGE": demand_storage,
 }.items():
     code = code.replace(f"@{key}@", value)
 
@@ -285,7 +324,8 @@ with tempfile.TemporaryDirectory(prefix="wos-file-fault-") as temporary:
     source.write_text(code)
     subprocess.run(
         [os.environ.get("WOS_HOST_CXX", "/usr/bin/clang++"), "-std=c++23", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
-         "-fsanitize=address,undefined", "-fno-omit-frame-pointer", str(source), "-o", str(binary)],
+         "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-I", str(ROOT / "modules/kern/src"),
+         "-I", str(ROOT / "modules"), str(source), "-o", str(binary)],
         check=True,
     )
     subprocess.run([str(binary)], check=True, timeout=30)

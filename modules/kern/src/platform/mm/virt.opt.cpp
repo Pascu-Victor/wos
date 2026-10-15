@@ -16,11 +16,13 @@
 #include <new>
 #include <optional>
 #include <platform/acpi/apic/apic.hpp>
+#include <platform/acpi/numa_boot.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/init/limine_requests.hpp>
 #include <platform/interrupt/gates.hpp>
 #include <platform/interrupt/gdt.hpp>
 #include <platform/ktime/ktime.hpp>
+#include <platform/mm/numa_alloc.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/smt/smt.hpp>
@@ -86,6 +88,216 @@ using log = ker::mod::dbg::logger<"virt">;
 constexpr uint64_t LARGE_PAGE_2M_BYTES = paging::PAGE_SIZE * paging::PAGE_TABLE_ENTRIES;
 constexpr uint64_t LARGE_PAGE_1G_BYTES = LARGE_PAGE_2M_BYTES * paging::PAGE_TABLE_ENTRIES;
 constexpr uint64_t PTE_FRAME_MASK = 0x000FFFFFFFFFF000ULL;
+
+// All objects passed from this excluded TU into the instrumented allocator
+// start their lifetime only after their exact storage is addressable. In
+// particular, default construction and hidden sret writes can be checked at O0.
+struct DemandContext {
+    numa::AllocationContext allocation{};
+    DemandOrigin origin{DemandOrigin::SoftwareEnsure};
+    uint64_t cpu{};
+    bool hardware_user{};
+    bool local_has_ram{};
+    bool foreign_target{};
+#ifdef WOS_SELFTEST
+    uint64_t observer_cookie{};
+#endif
+};
+static_assert(alignof(DemandContext) >= 8 && sizeof(DemandContext) % 8 == 0);
+static_assert(alignof(numa::AllocationResult) >= 8 && sizeof(numa::AllocationResult) % 8 == 0);
+
+class DemandContextStorage {
+   public:
+    DemandContextStorage() {
+#ifdef WOS_KASAN
+        if (kasan::is_enabled()) kasan::unpoison_range(storage_, sizeof(storage_));
+#endif
+        value_ = ::new (static_cast<void*>(storage_)) DemandContext{};
+    }
+    ~DemandContextStorage() { value_->~DemandContext(); }
+    DemandContextStorage(const DemandContextStorage&) = delete;
+    auto operator=(const DemandContextStorage&) -> DemandContextStorage& = delete;
+    auto get() -> DemandContext& { return *value_; }
+
+   private:
+    alignas(DemandContext) uint8_t storage_[sizeof(DemandContext)];
+    DemandContext* value_;
+};
+
+class DemandResultStorage {
+   public:
+    DemandResultStorage() {
+#ifdef WOS_KASAN
+        if (kasan::is_enabled()) kasan::unpoison_range(storage_, sizeof(storage_));
+#endif
+        value_ = ::new (static_cast<void*>(storage_)) numa::AllocationResult{};
+    }
+    ~DemandResultStorage() { value_->~AllocationResult(); }
+    DemandResultStorage(const DemandResultStorage&) = delete;
+    auto operator=(const DemandResultStorage&) -> DemandResultStorage& = delete;
+    auto get() -> numa::AllocationResult& { return *value_; }
+
+   private:
+    alignas(numa::AllocationResult) uint8_t storage_[sizeof(numa::AllocationResult)];
+    numa::AllocationResult* value_;
+};
+
+struct DemandCounters {
+    std::atomic<uint64_t> candidates{}, allocation_failures{}, discarded{}, promotions{}, installed{};
+    std::atomic<uint64_t> anonymous{}, zero_cow{}, private_cow{}, software{}, hardware_user{}, hardware_kernel{};
+    std::atomic<uint64_t> eligible{}, local{}, locality_misses{}, fallbacks{};
+    std::atomic<bool> overflow{};
+};
+DemandCounters demand_counters{};
+void demand_increment(std::atomic<uint64_t>& counter) {
+    uint64_t value = counter.load(std::memory_order_relaxed);
+    while (value != UINT64_MAX) {
+        if (counter.compare_exchange_weak(value, value + 1, std::memory_order_relaxed)) return;
+    }
+    demand_counters.overflow.store(true, std::memory_order_relaxed);
+}
+
+auto classify_private_demand(DemandOrigin origin, bool hardware_user, DemandBacking backing, const numa::Policy& policy, bool local_has_ram)
+    -> DemandExclusion {
+    if (origin == DemandOrigin::SoftwareEnsure) return DemandExclusion::Software;
+    if (!hardware_user) return DemandExclusion::KernelFault;
+    if (backing == DemandBacking::PrivateCowCopy) return DemandExclusion::PrivateCopy;
+    if (policy.mode != numa::Mode::LOCAL || policy.nodes != 0) return DemandExclusion::ExplicitPolicy;
+    return local_has_ram ? DemandExclusion::Eligible : DemandExclusion::NoLocalRam;
+}
+
+#ifdef WOS_SELFTEST
+struct DemandObserverPlan {
+    std::atomic<uint64_t> word{};
+    std::atomic<sched::task::Task*> subject{};
+    std::atomic<PageTable*> root{};
+    std::atomic<uint64_t> root_serial{};
+    std::atomic<uint64_t> address{};
+    std::atomic<uint64_t> cpu{};
+    std::atomic<SelftestDemandObservation*> output{};
+    std::atomic<SelftestDemandAction> action{};
+    std::atomic<numa::NodeMask> replacement_nodes{};
+    std::atomic<numa::Mode> replacement_mode{};
+};
+DemandObserverPlan demand_observer{};
+
+auto demand_observation(const DemandContext& context) -> SelftestDemandObservation* {
+    if (context.observer_cookie == 0 || demand_observer.word.load(std::memory_order_acquire) != context.observer_cookie ||
+        cpu::current_cpu() != context.cpu)
+        return nullptr;
+    return demand_observer.output.load(std::memory_order_relaxed);
+}
+#endif
+
+auto capture_demand_context(sched::task::Task* target, uint64_t address, DemandOrigin origin, bool hardware_user, DemandContext& output)
+    -> bool {
+    if (target == nullptr || target->pagemap == nullptr || address >= 0x0000800000000000ULL) return false;
+    {
+        sched::PreemptGuard const PREEMPT;
+        output.allocation.policy = target->memory_policy_snapshot();
+        output.cpu = cpu::current_cpu();
+        auto const* topology = acpi::numa::boot_topology();
+        if (topology == nullptr || output.cpu >= topology->cpu_count || output.cpu >= topology->cpu_nodes.size()) return false;
+        output.allocation.local_node = topology->cpu_nodes[output.cpu];
+        if (output.allocation.local_node >= topology->node_count) return false;
+        output.local_has_ram = topology->nodes[output.allocation.local_node].usable_bytes != 0;
+    }  // Preserve the allocator's real can_wait_for_reclaim predicate.
+    output.allocation.virtual_page_index = address / paging::PAGE_SIZE;
+    output.origin = origin;
+    output.hardware_user = hardware_user;
+    output.foreign_target = sched::can_query_current_task() && sched::get_current_task() != target;
+#ifdef WOS_SELFTEST
+    uint64_t const WORD = demand_observer.word.load(std::memory_order_acquire);
+    uint64_t observer_root_serial = 0;
+    if ((WORD & 3U) == 1U && demand_observer.subject.load(std::memory_order_relaxed) == target &&
+        demand_observer.root.load(std::memory_order_relaxed) == target->pagemap &&
+        capture_user_root_incarnation(target->pagemap, observer_root_serial) &&
+        demand_observer.root_serial.load(std::memory_order_relaxed) == observer_root_serial &&
+        demand_observer.address.load(std::memory_order_relaxed) == (address & ~(paging::PAGE_SIZE - 1)) &&
+        demand_observer.cpu.load(std::memory_order_relaxed) == output.cpu) {
+        output.observer_cookie = WORD;
+        auto* observation = demand_observer.output.load(std::memory_order_relaxed);
+        observation->captured_policy = output.allocation.policy;
+        observation->local_node = output.allocation.local_node;
+        observation->origin = origin;
+        observation->foreign_target = output.foreign_target;
+        ++observation->captures;
+        if (demand_observer.action.load(std::memory_order_relaxed) == SelftestDemandAction::ChangePolicyAfterCapture &&
+            !observation->action_consumed) {
+            observation->action_consumed =
+                target->selftest_set_memory_policy({demand_observer.replacement_nodes.load(std::memory_order_relaxed),
+                                                    demand_observer.replacement_mode.load(std::memory_order_relaxed)});
+        }
+    }
+#endif
+    return true;
+}
+
+void record_demand_candidate(const DemandContext& context, bool failed) {
+    demand_increment(demand_counters.candidates);
+    if (failed) demand_increment(demand_counters.allocation_failures);
+#ifdef WOS_SELFTEST
+    if (auto* observation = demand_observation(context); observation != nullptr) {
+        ++observation->candidates;
+        if (failed) ++observation->allocation_failures;
+    }
+#else
+    (void)context;
+#endif
+}
+
+// Call only after the final lock interval, with frozen classification values.
+void record_demand_result(const DemandContext& context, DemandBacking backing, numa::NodeId requested, numa::NodeId actual, bool installed,
+                          bool promoted, bool observed) {
+    if (promoted)
+        demand_increment(demand_counters.promotions);
+    else if (!installed)
+        demand_increment(demand_counters.discarded);
+    else {
+        demand_increment(demand_counters.installed);
+        if (actual != requested) demand_increment(demand_counters.fallbacks);
+        demand_increment(backing == DemandBacking::Anonymous ? demand_counters.anonymous
+                         : backing == DemandBacking::ZeroCow ? demand_counters.zero_cow
+                                                             : demand_counters.private_cow);
+        demand_increment(context.origin == DemandOrigin::SoftwareEnsure ? demand_counters.software
+                         : context.hardware_user                        ? demand_counters.hardware_user
+                                                                        : demand_counters.hardware_kernel);
+        if (classify_private_demand(context.origin, context.hardware_user, backing, context.allocation.policy, context.local_has_ram) ==
+            DemandExclusion::Eligible) {
+            demand_increment(demand_counters.eligible);
+            demand_increment(actual == context.allocation.local_node ? demand_counters.local : demand_counters.locality_misses);
+        }
+    }
+#ifdef WOS_SELFTEST
+    if (observed) {
+        auto* observation = demand_observer.output.load(std::memory_order_relaxed);
+        observation->backing = backing;
+        observation->requested = requested;
+        observation->actual = actual;
+        observation->used_fallback = installed && actual != requested;
+        observation->exclusion =
+            classify_private_demand(context.origin, context.hardware_user, backing, context.allocation.policy, context.local_has_ram);
+        if (promoted)
+            ++observation->promotions;
+        else if (installed)
+            ++observation->installed;
+        else
+            ++observation->discarded;
+    }
+#else
+    (void)requested;
+    (void)observed;
+#endif
+}
+
+auto demand_is_observed(const DemandContext& context) -> bool {
+#ifdef WOS_SELFTEST
+    return demand_observation(context) != nullptr;
+#else
+    (void)context;
+    return false;
+#endif
+}
 
 sys::Spinlock cow_pte_lock;
 // Serializes leaf publication/removal with usercopy frame pin acquisition.
@@ -1061,8 +1273,8 @@ void start_lazy_file_fault_worker() {
 }
 #endif
 
-auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const paging::PageFault& fault, uint64_t fault_rip = 0,
-                            uint64_t fault_rsp = 0, bool allow_file_io = true) -> bool {
+auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const paging::PageFault& fault, const DemandContext& demand,
+                            uint64_t fault_rip = 0, uint64_t fault_rsp = 0, bool allow_file_io = true) -> bool {
     if (task == nullptr || task->pagemap == nullptr) {
         return false;
     }
@@ -1123,11 +1335,14 @@ auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const pagin
 
         task->lazy_vmem_lock.unlock_irqrestore(IRQF);
 
-        // This may run from a hardware page fault with interrupts disabled.
-        // Failure is process-local; never enter the fatal allocator dump or a
-        // yielding reclaim loop from this context.
-        void* const PAGE =
-            phys::page_alloc_full_overwrite_may_fail(PhysicalPageOwner::USER_PRIVATE_MAPPING, paging::PAGE_SIZE, "lazy-vmem");
+        // The output storage is addressable before construction/callee sret.
+        // Lazy backing remains one plain fallible attempt, even on UMA.
+        DemandResultStorage storage;
+        auto& allocation = storage.get();
+        numa::try_allocate_pages_into(allocation, demand.allocation, 1, paging::PAGE_SIZE, PhysicalPageOwner::USER_PRIVATE_MAPPING,
+                                      phys::PageInitialization::FULL_OVERWRITE, numa::ReclaimMode::NEVER, "lazy-vmem");
+        void* const PAGE = allocation.span.data();
+        record_demand_candidate(demand, PAGE == nullptr);
         if (PAGE == nullptr) {
             log::error("lazy vmem fault: OOM pid=%lu vaddr=0x%llx", task->pid, static_cast<unsigned long long>(PAGE_VADDR));
             return false;
@@ -1140,18 +1355,30 @@ auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const pagin
         // so two simultaneous faults cannot expose different pages at the
         // same virtual address. Keep the established PTE -> lazy-range lock
         // order and revalidate metadata after allocating outside both locks.
+        auto const REQUESTED = allocation.requested;
+        auto const ACTUAL = allocation.actual;
         uint64_t current_prot = 0;
-        uint64_t const PTE_IRQF = cow_pte_lock.lock_irqsave();
-        bool const ALLOWED = anonymous_lazy_range_allows_fault(task, PAGE_VADDR, fault, current_prot);
-        bool const ALREADY_MAPPED = translate(task->pagemap, PAGE_VADDR) != PADDR_INVALID;
-        if (ALLOWED && !ALREADY_MAPPED) {
-            map_page(task->pagemap, PAGE_VADDR, PADDR, lazy_user_vmem_flags(current_prot));
+        bool allowed = false;
+        bool already_mapped = false;
+        bool observed = false;
+        {
+            sched::PreemptGuard const PREEMPT;
+            observed = demand_is_observed(demand);
+            uint64_t const PTE_IRQF = cow_pte_lock.lock_irqsave();
+            allowed = anonymous_lazy_range_allows_fault(task, PAGE_VADDR, fault, current_prot);
+            already_mapped = translate(task->pagemap, PAGE_VADDR) != PADDR_INVALID;
+            if (allowed && !already_mapped) {
+                map_page(task->pagemap, PAGE_VADDR, PADDR, lazy_user_vmem_flags(current_prot));
+            }
+            cow_pte_lock.unlock_irqrestore(PTE_IRQF);
         }
-        cow_pte_lock.unlock_irqrestore(PTE_IRQF);
-
-        if (!ALLOWED || ALREADY_MAPPED) {
-            phys::page_ref_dec(PAGE);
-        }
+        bool const ALLOWED = allowed;
+        bool const ALREADY_MAPPED = already_mapped;
+        if (ALLOWED && !ALREADY_MAPPED)
+            (void)allocation.span.release();
+        else
+            allocation.span.reset();
+        record_demand_result(demand, DemandBacking::Anonymous, REQUESTED, ACTUAL, ALLOWED && !ALREADY_MAPPED, false, observed);
         if (!ALLOWED) {
             log_lazy_vmem_fault_state(task, PAGE_VADDR, fault, "stale", fault_rip, fault_rsp);
             return false;
@@ -1200,14 +1427,12 @@ void record_cow_perf_event(sched::task::Task* task, perf::WkiPerfLocalVmemOp op,
                              paging::PAGE_SIZE);
 }
 
-auto alloc_cow_destination_page(bool full_overwrite) -> void* {
-    void* const PAGE = full_overwrite
-                           ? phys::page_alloc_full_overwrite_page_with_reclaim_may_fail(PhysicalPageOwner::USER_PRIVATE_MAPPING, "cow_copy")
-                           : phys::page_alloc_with_reclaim_may_fail(PhysicalPageOwner::USER_PRIVATE_MAPPING, paging::PAGE_SIZE, "cow_zero");
-    if (PAGE != nullptr && !full_overwrite) {
-        std::memset(PAGE, 0, paging::PAGE_SIZE);
-    }
-    return PAGE;
+void alloc_cow_destination_page(bool full_overwrite, const DemandContext& demand, numa::AllocationResult& output) {
+    numa::try_allocate_pages_into(output, demand.allocation, 1, paging::PAGE_SIZE, PhysicalPageOwner::USER_PRIVATE_MAPPING,
+                                  full_overwrite ? phys::PageInitialization::FULL_OVERWRITE : phys::PageInitialization::ZERO,
+                                  numa::ReclaimMode::LEGACY_UMA, full_overwrite ? "cow_copy" : "cow_zero");
+    void* const PAGE = output.span.data();
+    if (PAGE != nullptr && !full_overwrite) std::memset(PAGE, 0, paging::PAGE_SIZE);
 }
 
 void anonymous_swap_add(std::atomic<uint64_t>& counter, uint64_t amount = 1) {
@@ -3349,7 +3574,7 @@ auto selftest_consume_cow_action(sched::task::Task* subject, PageTable* root, va
 }
 #endif
 
-auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserWriteFaultStatus {
+auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr, const DemandContext& demand) -> UserWriteFaultStatus {
     if (task == nullptr || task->pagemap == nullptr || vaddr >= 0x0000800000000000ULL) {
         return UserWriteFaultStatus::NOT_WRITABLE;
     }
@@ -3376,7 +3601,12 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
     bool initial_path_promoted = false;
 
     {
+        // Hand CPU stability to the existing PTE lock's preemption hold;
+        // no extra guard spans the later shootdown/perf or allocator call.
+        sched::preempt_disable();
+        bool const OBSERVED = demand_is_observed(demand);
         uint64_t const LOCK_FLAGS = cow_pte_lock.lock_irqsave();
+        sched::preempt_enable();
 
         PageTableEntry& pml4e = entry_at(PAGEMAP, IDX4);
         if (!pml4e.present) {
@@ -3464,6 +3694,7 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
             unlock_initial();
             flush_pagemap_after_update(PAGEMAP, VADDR, initial_path_promoted);
             record_cow_perf_event(task, cow_op, VADDR, refcount, cow_started_us);
+            record_demand_result(demand, DemandBacking::PrivateCowCopy, numa::INVALID_NODE, numa::INVALID_NODE, false, true, OBSERVED);
             return UserWriteFaultStatus::HANDLED;
         }
 
@@ -3475,13 +3706,17 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
     }
 
     bool const DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE = !old_is_zero_page;
+    DemandResultStorage storage;
+    auto& allocation = storage.get();
     void* new_page = nullptr;
 #ifdef WOS_SELFTEST
     if (!selftest_consume_cow_action(task, PAGEMAP, VADDR, old_phys, true, nullptr))
 #endif
     {
-        new_page = alloc_cow_destination_page(DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE);
+        alloc_cow_destination_page(DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE, demand, allocation);
+        new_page = allocation.span.data();
     }
+    record_demand_candidate(demand, new_page == nullptr);
     if (new_page == nullptr) {
         phys::page_ref_dec(old_virt, &cow_lookup);
         log::error("COW fault: OOM allocating new page for vaddr 0x%x", VADDR);
@@ -3496,9 +3731,15 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
     (void)selftest_consume_cow_action(task, PAGEMAP, VADDR, old_phys, false, new_page);
 #endif
 
+    auto const REQUESTED = allocation.requested;
+    auto const ACTUAL = allocation.actual;
     bool installed_private_page = false;
     bool final_path_promoted = false;
+    bool observed = false;
+    auto const NEW_PHYS = reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(new_page)));
     {
+        sched::PreemptGuard const PREEMPT;
+        observed = demand_is_observed(demand);
         uint64_t const LOCK_FLAGS = cow_pte_lock.lock_irqsave();
         uint64_t const PIN_LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
         PageTableEntry& pml4e = entry_at(PAGEMAP, IDX4);
@@ -3516,13 +3757,12 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
                     if ((raw_now & (paging::PAGE_USER | paging::PAGE_COW)) == (paging::PAGE_USER | paging::PAGE_COW) &&
                         !paging::shared_write_restricted(raw_now) && CURRENT_PHYS == old_phys) {
                         final_path_promoted = promote_user_write_path(pml4e, pml3e, pml2e);
-                        auto new_phys = reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(new_page)));
                         raw_now &= ~paging::PAGE_COW;
                         raw_now |= paging::PAGE_WRITE;
                         raw_now &= ~(0xFFFFFFFFFFULL << 12);
-                        raw_now |= (new_phys & ~0xFFFULL);
+                        raw_now |= (NEW_PHYS & ~0xFFFULL);
                         pte = pte_from_raw(raw_now);
-                        owned_frame_track_fresh_normal_mapping(PAGEMAP, VADDR, new_phys, raw_now);
+                        owned_frame_track_fresh_normal_mapping(PAGEMAP, VADDR, NEW_PHYS, raw_now);
                         installed_private_page = true;
                     }
                 }
@@ -3532,8 +3772,13 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
         cow_pte_lock.unlock_irqrestore(LOCK_FLAGS);
     }
 
+    if (installed_private_page)
+        (void)allocation.span.release();
+    else
+        allocation.span.reset();
+    record_demand_result(demand, old_is_zero_page ? DemandBacking::ZeroCow : DemandBacking::PrivateCowCopy, REQUESTED, ACTUAL,
+                         installed_private_page, false, observed);
     if (!installed_private_page) {
-        phys::page_ref_dec(new_page);
         phys::page_ref_dec(old_virt, &cow_lookup);
         flush_pagemap_after_update(PAGEMAP, VADDR, initial_path_promoted);
         record_cow_perf_event(task, cow_op, VADDR, refcount, cow_started_us);
@@ -3552,13 +3797,13 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
     return UserWriteFaultStatus::HANDLED;
 }
 
-auto ensure_user_page_writable_for_task(sched::task::Task* task, vaddr_t vaddr) -> bool {
+auto ensure_user_page_writable_with_context(sched::task::Task* task, vaddr_t vaddr, const DemandContext& demand) -> bool {
     if (task == nullptr || task->pagemap == nullptr || vaddr >= 0x0000800000000000ULL) {
         return false;
     }
 
     for (unsigned attempt = 0; attempt < 2; ++attempt) {
-        switch (resolve_user_write_mapping(task, vaddr)) {
+        switch (resolve_user_write_mapping(task, vaddr, demand)) {
             case UserWriteFaultStatus::HANDLED:
                 return true;
             case UserWriteFaultStatus::NOT_WRITABLE:
@@ -3568,7 +3813,7 @@ auto ensure_user_page_writable_for_task(sched::task::Task* task, vaddr_t vaddr) 
         }
 
         paging::PageFault const WRITE_FAULT = paging::create_page_fault(1ULL << paging::error_flags::WRITE, true);
-        if (!handle_lazy_vmem_fault(task, vaddr, WRITE_FAULT)) {
+        if (!handle_lazy_vmem_fault(task, vaddr, WRITE_FAULT, demand)) {
             return false;
         }
     }
@@ -3576,7 +3821,7 @@ auto ensure_user_page_writable_for_task(sched::task::Task* task, vaddr_t vaddr) 
     return false;
 }
 
-auto ensure_user_page_mapped_for_task(sched::task::Task* task, vaddr_t vaddr) -> bool {
+auto ensure_user_page_mapped_with_context(sched::task::Task* task, vaddr_t vaddr, const DemandContext& demand) -> bool {
     if (task == nullptr || task->pagemap == nullptr || vaddr >= 0x0000800000000000ULL) {
         return false;
     }
@@ -3587,14 +3832,49 @@ auto ensure_user_page_mapped_for_task(sched::task::Task* task, vaddr_t vaddr) ->
         }
 
         paging::PageFault const READ_FAULT = paging::create_page_fault(0, true);
-        if (!handle_lazy_vmem_fault(task, vaddr, READ_FAULT)) {
+        if (!handle_lazy_vmem_fault(task, vaddr, READ_FAULT, demand)) {
             return false;
         }
     }
 
     return translate(task->pagemap, vaddr) != PADDR_INVALID;
 }
+auto ensure_user_page_writable_for_task(sched::task::Task* task, vaddr_t vaddr) -> bool {
+    if (task == nullptr || task->pagemap == nullptr || vaddr >= 0x0000800000000000ULL) return false;
+    DemandContextStorage storage;
+    auto& demand = storage.get();
+    return capture_demand_context(task, vaddr, DemandOrigin::SoftwareEnsure, false, demand) &&
+           ensure_user_page_writable_with_context(task, vaddr, demand);
+}
+
+auto ensure_user_page_mapped_for_task(sched::task::Task* task, vaddr_t vaddr) -> bool {
+    if (task == nullptr || task->pagemap == nullptr || vaddr >= 0x0000800000000000ULL) return false;
+    DemandContextStorage storage;
+    auto& demand = storage.get();
+    return capture_demand_context(task, vaddr, DemandOrigin::SoftwareEnsure, false, demand) &&
+           ensure_user_page_mapped_with_context(task, vaddr, demand);
+}
+
 }  // namespace
+
+void get_private_demand_snapshot(PrivateDemandSnapshot& output) noexcept {
+    output.candidates = demand_counters.candidates.load(std::memory_order_relaxed);
+    output.allocation_failures = demand_counters.allocation_failures.load(std::memory_order_relaxed);
+    output.discarded = demand_counters.discarded.load(std::memory_order_relaxed);
+    output.promotions = demand_counters.promotions.load(std::memory_order_relaxed);
+    output.installed = demand_counters.installed.load(std::memory_order_relaxed);
+    output.anonymous = demand_counters.anonymous.load(std::memory_order_relaxed);
+    output.zero_cow = demand_counters.zero_cow.load(std::memory_order_relaxed);
+    output.private_cow = demand_counters.private_cow.load(std::memory_order_relaxed);
+    output.software = demand_counters.software.load(std::memory_order_relaxed);
+    output.hardware_user = demand_counters.hardware_user.load(std::memory_order_relaxed);
+    output.hardware_kernel = demand_counters.hardware_kernel.load(std::memory_order_relaxed);
+    output.eligible = demand_counters.eligible.load(std::memory_order_relaxed);
+    output.local = demand_counters.local.load(std::memory_order_relaxed);
+    output.locality_misses = demand_counters.locality_misses.load(std::memory_order_relaxed);
+    output.fallbacks = demand_counters.fallbacks.load(std::memory_order_relaxed);
+    output.overflow = demand_counters.overflow.load(std::memory_order_relaxed);
+}
 
 void service_pending_tlb_shootdowns() {
     if (tlb_shootdown_vector == 0 || !smt::has_cpu_data()) {
@@ -4225,6 +4505,91 @@ void unpin_user_page(UserPagePin& pin) {
 }
 
 #ifdef WOS_SELFTEST
+auto selftest_classify_private_demand(DemandOrigin origin, bool hardware_user, DemandBacking backing, numa::Policy policy,
+                                      bool local_has_ram) noexcept -> DemandExclusion {
+    return classify_private_demand(origin, hardware_user, backing, policy, local_has_ram);
+}
+
+auto selftest_observe_private_demand(sched::task::Task& subject, uint64_t address, bool writable, SelftestDemandObservation& output,
+                                     SelftestDemandAction action, numa::Policy replacement) -> bool {
+#ifdef WOS_KASAN
+    if (kasan::is_enabled()) kasan::unpoison_range(&output, sizeof(output));
+#endif
+    output = {};
+    output.disarmed = true;
+    auto const* topology = acpi::numa::boot_topology();
+    if (action == SelftestDemandAction::ChangePolicyAfterCapture &&
+        (topology == nullptr || !numa::valid_policy(replacement, topology->node_count)))
+        return false;
+    if (address >= 0x0000800000000000ULL || subject.type != sched::task::TaskType::PROCESS || subject.is_thread || subject.pid != 0 ||
+        subject.thread != nullptr || subject.state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE ||
+        subject.scheduler_published.load(std::memory_order_acquire) || subject.shares_user_pagemap.load(std::memory_order_acquire) ||
+        !subject.try_acquire())
+        return false;
+    PageTable* root = nullptr;
+    if (!subject.try_acquire_usercopy_pagemap(root)) {
+        subject.release();
+        return false;
+    }
+    uint64_t serial = 0;
+    bool const VALID =
+        root != nullptr && root == subject.pagemap && root != kernel_pagemap && !is_current_pagemap(root) &&
+        !selftest_kernel_page_table_frame(root) && capture_user_root_incarnation(root, serial) &&
+        (!sched::can_query_current_task() || sched::get_current_task() != &subject) &&
+        (action == SelftestDemandAction::None || action == SelftestDemandAction::ChangePolicyAfterCapture ||
+         (writable && (action == SelftestDemandAction::FailCowAllocation || action == SelftestDemandAction::DowngradeCowRead ||
+                       action == SelftestDemandAction::DowngradeCowNone)));
+    uint64_t word = demand_observer.word.load(std::memory_order_acquire);
+    bool result = false;
+    if (VALID && word <= UINT64_MAX - 7 && (word & 3U) == 0U &&
+        demand_observer.word.compare_exchange_strong(word, word + 3, std::memory_order_acq_rel)) {
+        uint64_t const READY = word + 5;
+        demand_observer.subject.store(&subject, std::memory_order_relaxed);
+        demand_observer.root.store(root, std::memory_order_relaxed);
+        demand_observer.root_serial.store(serial, std::memory_order_relaxed);
+        demand_observer.address.store(address & ~(paging::PAGE_SIZE - 1), std::memory_order_relaxed);
+        demand_observer.cpu.store(cpu::current_cpu(), std::memory_order_relaxed);
+        demand_observer.output.store(&output, std::memory_order_relaxed);
+        demand_observer.action.store(action, std::memory_order_relaxed);
+        demand_observer.replacement_nodes.store(replacement.nodes, std::memory_order_relaxed);
+        demand_observer.replacement_mode.store(replacement.mode, std::memory_order_relaxed);
+        output.admitted = true;
+        output.disarmed = false;
+        output.cookie = READY;
+        demand_observer.word.store(READY, std::memory_order_release);
+        if (action == SelftestDemandAction::FailCowAllocation || action == SelftestDemandAction::DowngradeCowRead ||
+            action == SelftestDemandAction::DowngradeCowNone) {
+            alignas(SelftestCowObservation) uint8_t bytes[sizeof(SelftestCowObservation)];
+            uint8_t value = 0;
+#ifdef WOS_KASAN
+            if (kasan::is_enabled()) {
+                kasan::unpoison_range(bytes, sizeof(bytes));
+                kasan::unpoison_range(&value, sizeof(value));
+            }
+#endif
+            auto* cow = ::new (static_cast<void*>(bytes)) SelftestCowObservation{};
+            SelftestCowAction const COW_ACTION =
+                action == SelftestDemandAction::FailCowAllocation  ? SelftestCowAction::FAIL_DESTINATION_ALLOCATION
+                : action == SelftestDemandAction::DowngradeCowRead ? SelftestCowAction::DOWNGRADE_READ_BEFORE_COMMIT
+                                                                   : SelftestCowAction::DOWNGRADE_NONE_BEFORE_COMMIT;
+            result = selftest_copy_to_task_cow_action(subject, address, &value, sizeof(value), COW_ACTION, *cow);
+            output.action_consumed = cow->consumed == 1;
+            cow->~SelftestCowObservation();
+        } else {
+            result = writable ? ensure_user_page_writable_for_task(&subject, address) : ensure_user_page_mapped_for_task(&subject, address);
+        }
+        demand_observer.word.store(word + 7, std::memory_order_release);
+        demand_observer.output.store(nullptr, std::memory_order_relaxed);
+        demand_observer.subject.store(nullptr, std::memory_order_relaxed);
+        demand_observer.root.store(nullptr, std::memory_order_relaxed);
+        demand_observer.word.store(word + 4, std::memory_order_release);
+        output.disarmed = true;
+    }
+    subject.release_usercopy_pagemap();
+    subject.release();
+    return result;
+}
+
 auto selftest_copy_to_task_cow_action(sched::task::Task& subject, uint64_t address, const void* source, size_t size,
                                       SelftestCowAction action, SelftestCowObservation& observation) -> bool {
     observation = {};
@@ -5218,8 +5583,12 @@ auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, 
 #else
         constexpr bool ALLOW_FILE_IO = true;
 #endif
-        if (handle_lazy_vmem_fault(current_task, control_register, PAGEFAULT, frame.rip, frame.rsp, ALLOW_FILE_IO)) {
-            return true;
+        if (current_task != nullptr && current_task->pagemap != nullptr) {
+            DemandContextStorage demand_storage;
+            auto& demand = demand_storage.get();
+            if (capture_demand_context(current_task, control_register, DemandOrigin::HardwareFault, (frame.cs & 3U) == 3U, demand) &&
+                handle_lazy_vmem_fault(current_task, control_register, PAGEFAULT, demand, frame.rip, frame.rsp, ALLOW_FILE_IO))
+                return true;
         }
         if (current_task != nullptr && current_task->pagemap != nullptr && current_task->thread != nullptr &&
             sched::threading::handle_lazy_stack_fault(current_task->thread, current_task->pagemap, control_register, frame.rsp,
@@ -5241,7 +5610,10 @@ auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, 
             return false;
         }
 
-        if (resolve_user_write_mapping(current_task, control_register) == UserWriteFaultStatus::HANDLED) {
+        DemandContextStorage demand_storage;
+        auto& demand = demand_storage.get();
+        if (capture_demand_context(current_task, control_register, DemandOrigin::HardwareFault, (frame.cs & 3U) == 3U, demand) &&
+            resolve_user_write_mapping(current_task, control_register, demand) == UserWriteFaultStatus::HANDLED) {
             return true;
         }
     }

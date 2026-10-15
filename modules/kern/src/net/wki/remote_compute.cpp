@@ -4264,6 +4264,18 @@ auto prepare_spawn_read_credentials(const ker::mod::security::Snapshot& original
     return 0;
 }
 
+auto capture_submission_memory_policy(const ker::mod::sched::task::Task& subject, const WkiRemoteSpawnSpec* transfer,
+                                      ker::mod::mm::numa::Policy& output) noexcept -> int {
+    if (transfer != nullptr && transfer->memory_policy.has_value()) {
+        output = *transfer->memory_policy;
+        return 0;
+    }
+    // The process owner is not the initiating actor of a worker exec.
+    if (transfer != nullptr && (transfer->exec_candidate != nullptr || transfer->cutover != nullptr)) return -EINVAL;
+    output = subject.memory_policy_snapshot();
+    return 0;
+}
+
 auto select_submit_read_credentials(const ker::mod::security::Snapshot& current, const WkiRemoteSpawnSpec* transfer,
                                     ker::mod::security::Snapshot& output) -> int {
     if (transfer != nullptr) {
@@ -5220,6 +5232,33 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
             return finish_placement(WkiRemoteSpawnResult::LOCAL);
         }
     }
+    if (task != nullptr) {
+        ker::mod::mm::numa::Policy memory_policy;
+        int const POLICY_ADMISSION = capture_submission_memory_policy(*task, &spec, memory_policy);
+        if (POLICY_ADMISSION != 0) {
+            placement_error = POLICY_ADMISSION;
+            return finish_placement(WkiRemoteSpawnResult::FAILED);
+        }
+        if (memory_policy != ker::mod::mm::numa::Policy{}) {
+            auto const* candidate = spec.exec_candidate;
+            if (candidate != nullptr && (candidate->path == nullptr || candidate->target == nullptr)) {
+                placement_error = -EINVAL;
+                return finish_placement(WkiRemoteSpawnResult::FAILED);
+            }
+            auto const FLAGS = candidate != nullptr ? candidate->target_flags : task->wki_target_flags;
+            auto const* target = candidate != nullptr ? candidate->target : task->wki_target_hostname.data();
+            // Dense memory-node identities cannot be interpreted by a peer.
+            // Automatic placement stays local; explicit remote intent refuses
+            // before even the uninitialized/no-payload shortcuts below.
+            if ((FLAGS & ker::mod::sched::task::Task::WKI_TARGET_FLAG_LOCAL) == 0 &&
+                (target[0] != '\0' || (FLAGS & (ker::mod::sched::task::Task::WKI_TARGET_FLAG_REMOTE |
+                                                ker::mod::sched::task::Task::WKI_TARGET_FLAG_BALANCED)) != 0)) {
+                placement_error = -ENOTSUP;
+                return finish_placement(WkiRemoteSpawnResult::FAILED);
+            }
+            return finish_placement(WkiRemoteSpawnResult::LOCAL);
+        }
+    }
     if (!g_remote_compute_initialized || task == nullptr) {
         log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "not-initialized");
         return finish_placement(WkiRemoteSpawnResult::LOCAL);
@@ -5852,6 +5891,12 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
         cleanup_submit_ipc();
         return fail_submit(SCOPE_ADMISSION);
     }
+    ker::mod::mm::numa::Policy memory_policy;
+    int const POLICY_ADMISSION = capture_submission_memory_policy(*local_task, transfer, memory_policy);
+    if (POLICY_ADMISSION != 0 || memory_policy != ker::mod::mm::numa::Policy{}) {
+        cleanup_submit_ipc();
+        return fail_submit(POLICY_ADMISSION != 0 ? POLICY_ADMISSION : -ENOTSUP);
+    }
     ker::mod::security::Snapshot read_credentials;
     int const READ_CREDENTIAL_ADMISSION = select_submit_read_credentials(local_task->credentials(), transfer, read_credentials);
     if (READ_CREDENTIAL_ADMISSION != 0) {
@@ -6230,6 +6275,12 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
     if (SCOPE_ADMISSION != 0) {
         cleanup_submit_ipc();
         return fail_submit(SCOPE_ADMISSION);
+    }
+    ker::mod::mm::numa::Policy memory_policy;
+    int const POLICY_ADMISSION = capture_submission_memory_policy(*local_task, transfer, memory_policy);
+    if (POLICY_ADMISSION != 0 || memory_policy != ker::mod::mm::numa::Policy{}) {
+        cleanup_submit_ipc();
+        return fail_submit(POLICY_ADMISSION != 0 ? POLICY_ADMISSION : -ENOTSUP);
     }
     ker::mod::security::Snapshot read_credentials;
     int const READ_CREDENTIAL_ADMISSION = select_submit_read_credentials(local_task->credentials(), transfer, read_credentials);
@@ -8387,6 +8438,118 @@ void wki_remote_compute_cleanup_retired_for_peer(uint16_t node_id) {
 }
 
 #ifdef WOS_SELFTEST
+auto wki_remote_compute_selftest_nonlocal_memory_policy() -> bool {
+    using Task = ker::mod::sched::task::Task;
+    namespace numa = ker::mod::mm::numa;
+    auto subject = std::unique_ptr<Task>{new (std::nothrow) Task{}};
+    if (!subject) return false;
+    subject->type = ker::mod::sched::task::TaskType::PROCESS;
+    struct Callbacks {
+        unsigned prepare{}, accepted{}, cutover{};
+    } callbacks;
+    int error = 99;
+    uint32_t deferred = 99;
+    WkiRemoteSpawnSpec spec{
+        .error_out = &error,
+        .prepare = [](Task&, void* p) -> int {
+            ++static_cast<Callbacks*>(p)->prepare;
+            return 0;
+        },
+        .accepted = [](Task&, void* p) { ++static_cast<Callbacks*>(p)->accepted; },
+        .cutover = [](Task&, uint32_t, uint64_t, TaskExecSignals&, void* p) -> int {
+            ++static_cast<Callbacks*>(p)->cutover;
+            return 0;
+        },
+        .context = &callbacks,
+        .deferred_proxy_id = &deferred,
+    };
+    auto const RESOURCES = resource_contract::snapshot(subject->resources);
+    bool ok = true;
+    for (auto mode : {numa::Mode::PREFERRED, numa::Mode::BIND, numa::Mode::INTERLEAVE}) {
+        numa::Policy const POLICY{.nodes = 1, .mode = mode};
+        if (!subject->selftest_set_memory_policy(POLICY)) return false;
+        for (bool candidate_route : {false, true}) {
+            for (bool named : {false, true}) {
+                for (uint32_t flags = 0; flags <= Task::WKI_TARGET_FLAGS_ALL; ++flags) {
+                    subject->wki_target_flags = candidate_route ? Task::WKI_TARGET_FLAG_LOCAL : flags;
+                    std::strcpy(subject->wki_target_hostname.data(), candidate_route || named ? "subject.invalid" : "");
+                    WkiRemoteExecCandidate candidate{.path = "", .target = named ? "candidate.invalid" : "", .target_flags = flags};
+                    spec.exec_candidate = candidate_route ? &candidate : nullptr;
+                    spec.memory_policy = subject->memory_policy_snapshot();
+                    // Also exercise fallback capture on non-exec legacy specs.
+                    auto* const CUTOVER = spec.cutover;
+                    if (!candidate_route) {
+                        spec.cutover = nullptr;
+                        spec.memory_policy.reset();
+                    }
+                    bool const REFUSED = (flags & Task::WKI_TARGET_FLAG_LOCAL) == 0 &&
+                                         (named || (flags & (Task::WKI_TARGET_FLAG_REMOTE | Task::WKI_TARGET_FLAG_BALANCED)) != 0);
+                    auto const TARGET = subject->wki_target_hostname;
+                    error = 99;
+                    deferred = 99;
+                    auto const RESULT = wki_try_remote_spawn(subject.get(), spec);
+                    spec.cutover = CUTOVER;
+                    ok &= RESULT == (REFUSED ? WkiRemoteSpawnResult::FAILED : WkiRemoteSpawnResult::LOCAL) &&
+                          error == (REFUSED ? -ENOTSUP : 0) && deferred == 0 && subject->wki_target_hostname == TARGET &&
+                          subject->wki_target_flags == (candidate_route ? Task::WKI_TARGET_FLAG_LOCAL : flags) &&
+                          subject->memory_policy_snapshot() == POLICY && !subject->wki_skip_legacy_placement && !subject->wki_proxy_task &&
+                          subject->wki_execution_identity().proxy_task_id == 0 && !subject->resource_exec_admission_closed &&
+                          subject->fd_table.empty() && subject->pending_wki_submissions == nullptr &&
+                          subject->pending_wki_filesystems == nullptr;
+                }
+            }
+        }
+    }
+    WkiRemoteExecCandidate candidate{.path = "", .target = ""};
+    spec.exec_candidate = &candidate;
+    spec.memory_policy.reset();
+    ok &= wki_try_remote_spawn(subject.get(), spec) == WkiRemoteSpawnResult::FAILED && error == -EINVAL;
+    spec.exec_candidate = nullptr;  // Cutover also requires a captured origin.
+    ok &= wki_try_remote_spawn(subject.get(), spec) == WkiRemoteSpawnResult::FAILED && error == -EINVAL;
+    spec.exec_candidate = &candidate;
+    spec.memory_policy = subject->memory_policy_snapshot();
+    candidate.path = nullptr;
+    ok &= wki_try_remote_spawn(subject.get(), spec) == WkiRemoteSpawnResult::FAILED && error == -EINVAL;
+    candidate.path = "";
+    candidate.target = nullptr;
+    ok &= wki_try_remote_spawn(subject.get(), spec) == WkiRemoteSpawnResult::FAILED && error == -EINVAL;
+    candidate.path = "/local-control";
+    candidate.target = "";
+    candidate.target_flags = Task::WKI_TARGET_FLAG_LOCAL;
+    subject->publish_memory_policy_snapshot({});
+    spec.memory_policy = subject->memory_policy_snapshot();
+    ok &= wki_try_remote_spawn(subject.get(), spec) == WkiRemoteSpawnResult::LOCAL && error == 0;
+    auto const AFTER = resource_contract::snapshot(subject->resources);
+    return ok && callbacks.prepare == 0 && callbacks.accepted == 0 && callbacks.cutover == 0 &&
+           std::memcmp(&RESOURCES, &AFTER, sizeof(RESOURCES)) == 0 && subject->ref_count.load() == 1;
+}
+
+auto wki_remote_compute_selftest_legacy_memory_policy_exits() -> bool {
+    using Task = ker::mod::sched::task::Task;
+    auto subject = std::unique_ptr<Task>{new (std::nothrow) Task{}};
+    if (!subject || !subject->selftest_set_memory_policy({.nodes = 1, .mode = ker::mod::mm::numa::Mode::BIND})) return false;
+    subject->type = ker::mod::sched::task::TaskType::PROCESS;
+    std::array<uint8_t, 1> bytes{0x7f};
+    subject->wki_target_flags = Task::WKI_TARGET_FLAG_REMOTE | Task::WKI_TARGET_FLAG_STRICT;
+    subject->wki_skip_legacy_placement = true;
+    subject->elf_buffer = bytes.data();
+    subject->elf_buffer_size = bytes.size();
+    subject->elf_buffer_complete = true;
+    bool ok = try_remote_placement(subject.get()) == ker::mod::sched::RemotePlacementResult::LOCAL;
+    subject->wki_skip_legacy_placement = false;
+    subject->elf_buffer = nullptr;
+    ok &= try_remote_placement(subject.get()) == ker::mod::sched::RemotePlacementResult::LOCAL;
+    subject->elf_buffer = bytes.data();
+    subject->elf_buffer_size = 0;
+    ok &= try_remote_placement(subject.get()) == ker::mod::sched::RemotePlacementResult::LOCAL;
+    subject->elf_buffer_size = bytes.size();
+    subject->wki_target_flags = 0;
+    ok &= try_remote_placement(subject.get()) == ker::mod::sched::RemotePlacementResult::LOCAL && !subject->wki_skip_legacy_placement;
+    subject->elf_buffer = nullptr;  // The fixture owns this synchronous byte view.
+    subject->elf_buffer_size = 0;
+    return ok && !subject->wki_proxy_task && subject->ref_count.load() == 1;
+}
+
 auto wki_remote_compute_selftest_submission_errors() -> bool {
     constexpr std::array<int, 10> REJECTIONS{0, -EAGAIN, -ENOMEM, -ENOENT, -EIO, -EACCES, -EAGAIN, -ENOTSUP, -EINVAL, -EDQUOT};
     constexpr std::array<int, 10> TRANSPORT{0, -ENOMEM, -EHOSTUNREACH, -EHOSTDOWN, -EAGAIN, -ETIMEDOUT, -EINVAL, -ENOENT, -EBUSY, -EIO};
@@ -15803,7 +15966,7 @@ auto wki_remote_compute_selftest_exec_cutover_retirement() -> bool {
         s_compute_lock.unlock();
         if (stored == nullptr) return false;
 
-        WkiRemoteSpawnSpec transfer;
+        WkiRemoteSpawnSpec transfer{.memory_policy = source.memory_policy_snapshot()};
         transfer.context = &scenario;
         transfer.cutover = [](sched::task::Task& task, uint32_t id, uint64_t, TaskExecSignals&, void* context) -> int {
             auto& state = *static_cast<Scenario*>(context);

@@ -4,6 +4,14 @@
 
 KTEST(WkiRemoteCompute, SubmissionErrorsPreserveErrno) { KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_submission_errors()); }
 
+KTEST(WkiRemoteCompute, NonLocalMemoryPolicyNeverSubmits) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_nonlocal_memory_policy());
+}
+
+KTEST(WkiRemoteCompute, LegacyPlacementKeepsForkAndSkippedTasksLocal) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_legacy_memory_policy_exits());
+}
+
 KTEST(WkiRemoteCompute, StdioPresenceAndAtomicRollback) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_stdio_presence_and_rollback());
 }

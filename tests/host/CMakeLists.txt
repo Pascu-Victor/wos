@@ -307,6 +307,11 @@ wos_add_unit_test(numa_topology_test
 wos_add_unit_test(numa_policy_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_policy_test.cpp
 )
+wos_add_unit_test(numa_alloc_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_alloc_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/platform/mm/numa_alloc.cpp
+)
+target_include_directories(numa_alloc_test BEFORE PRIVATE ${WOS_KERN_SRC})
 wos_add_unit_test(vtd_capability_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vtd_capability_test.cpp
 )

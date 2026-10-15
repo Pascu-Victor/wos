@@ -433,6 +433,9 @@ struct WkiRemoteSpawnSpec {
     // identity. Borrowed only for synchronous preparation and serialization.
     const ker::mod::security::Snapshot* image_credentials = nullptr;
     const WkiRemoteExecCandidate* exec_candidate = nullptr;
+    // Local admission only. Exec carries the initiating executor's captured
+    // value even when the synchronous submitter is its canonical owner.
+    std::optional<ker::mod::mm::numa::Policy> memory_policy{};
 };
 
 auto wki_exec_signal_snapshot(const ker::mod::sched::task::Task& task) -> TaskExecSignals;
@@ -614,6 +617,8 @@ auto wki_remote_compute_selftest_installed_cwd(const ker::vfs::DirectoryViewRef&
                                                const char* expected_path, const char* root_path = nullptr) -> bool;
 auto wki_remote_compute_selftest_filesystem_context(const ker::mod::sched::task::Task::FilesystemContext* owned = nullptr) -> bool;
 auto wki_remote_compute_selftest_submission_errors() -> bool;
+auto wki_remote_compute_selftest_nonlocal_memory_policy() -> bool;
+auto wki_remote_compute_selftest_legacy_memory_policy_exits() -> bool;
 auto wki_remote_compute_selftest_cloexec_commit_preserves_other_fds() -> bool;
 auto wki_remote_compute_selftest_cache_content_is_verified() -> bool;
 auto wki_remote_compute_selftest_stdio_presence_and_rollback() -> bool;

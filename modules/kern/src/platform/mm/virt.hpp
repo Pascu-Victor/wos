@@ -354,10 +354,71 @@ paddr_t translate(PageTable* page_table, vaddr_t vaddr);
 // dirty state that a hardware write through the user mapping would set.
 [[nodiscard]] auto user_page_pin_commit_write(const UserPagePin& pin) -> bool;
 void unpin_user_page(UserPagePin& pin);
+// Kernel-internal placement telemetry. Samples are independently monotonic
+// scalars, not a globally atomic census. Only winning new private installs
+// enter the locality denominator; software materialization is distinguished.
+enum class DemandOrigin : uint8_t { HardwareFault, SoftwareEnsure };
+enum class DemandBacking : uint8_t { Anonymous, ZeroCow, PrivateCowCopy };
+enum class DemandExclusion : uint8_t { Eligible, Software, KernelFault, ExplicitPolicy, PrivateCopy, NoLocalRam };
+struct PrivateDemandSnapshot {
+    uint64_t candidates{};
+    uint64_t allocation_failures{};
+    uint64_t discarded{};
+    uint64_t promotions{};
+    uint64_t installed{};
+    uint64_t anonymous{};
+    uint64_t zero_cow{};
+    uint64_t private_cow{};
+    uint64_t software{};
+    uint64_t hardware_user{};
+    uint64_t hardware_kernel{};
+    uint64_t eligible{};
+    uint64_t local{};
+    uint64_t locality_misses{};
+    uint64_t fallbacks{};
+    bool overflow{};
+};
+void get_private_demand_snapshot(PrivateDemandSnapshot& output) noexcept;
 #ifdef WOS_SELFTEST
 // Caller owns an actual live root, or uses the permanent kernel root. Only the
 // scalar escapes; this is not an authority handle for a later raw release.
 [[nodiscard]] auto selftest_user_root_incarnation(PageTable* owned_root) -> uint64_t;
+enum class SelftestDemandAction : uint8_t {
+    None,
+    ChangePolicyAfterCapture,
+    FailCowAllocation,
+    DowngradeCowRead,
+    DowngradeCowNone,
+};
+struct SelftestDemandObservation {
+    numa::Policy captured_policy{};
+    numa::NodeId local_node{numa::INVALID_NODE};
+    numa::NodeId requested{numa::INVALID_NODE};
+    numa::NodeId actual{numa::INVALID_NODE};
+    DemandOrigin origin{DemandOrigin::SoftwareEnsure};
+    DemandBacking backing{DemandBacking::Anonymous};
+    DemandExclusion exclusion{DemandExclusion::Software};
+    uint64_t cookie{};
+    uint64_t captures{};
+    uint64_t candidates{};
+    uint64_t allocation_failures{};
+    uint64_t installed{};
+    uint64_t discarded{};
+    uint64_t promotions{};
+    bool admitted{};
+    bool disarmed{};
+    bool foreign_target{};
+    bool action_consumed{};
+    bool used_fallback{};
+};
+// Synchronous actual software ensure/copy on an exclusively owned unpublished
+// Task/root. A hardware-origin classifier test does not synthesize a CPL3 trap.
+[[nodiscard]] auto selftest_observe_private_demand(sched::task::Task& subject, uint64_t address, bool writable,
+                                                   SelftestDemandObservation& output,
+                                                   SelftestDemandAction action = SelftestDemandAction::None, numa::Policy replacement = {})
+    -> bool;
+[[nodiscard]] auto selftest_classify_private_demand(DemandOrigin origin, bool hardware_user, DemandBacking backing, numa::Policy policy,
+                                                    bool local_has_ram) noexcept -> DemandExclusion;
 enum class SelftestCowAction : uint8_t {
     FAIL_DESTINATION_ALLOCATION,
     DOWNGRADE_READ_BEFORE_COMMIT,

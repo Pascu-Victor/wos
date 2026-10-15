@@ -105,6 +105,9 @@ void release_file_mmap_ranges_for_pagemap(ker::mod::mm::paging::PageTable* pagem
 [[nodiscard]] auto validate_native_unpublished_mapping_owners(ker::mod::sched::task::Task& task) -> bool;
 
 #ifdef WOS_SELFTEST
+// Caller exclusively owns a never-active unpublished Task/root and address.
+// Maps through the real anonymous zero reserve, not a synthetic registered page.
+[[nodiscard]] auto selftest_map_anonymous_zero_page(ker::mod::sched::task::Task& subject, uint64_t address) -> bool;
 struct SelftestFileCacheObservation {
     void* retained_frame{};  // Caller owns one actual frame ref on a hit.
     bool vacant_way{};       // Pre-SMP admission only, not a reservation.

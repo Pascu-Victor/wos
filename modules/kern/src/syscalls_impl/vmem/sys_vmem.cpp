@@ -2689,6 +2689,20 @@ class SelftestFileMapSubjectHold {
 };
 }  // namespace
 
+auto selftest_map_anonymous_zero_page(ker::mod::sched::task::Task& subject, uint64_t address) -> bool {
+    namespace mm = ker::mod::mm;
+    namespace task = ker::mod::sched::task;
+    auto* const ROOT = subject.pagemap;
+    if (ROOT == nullptr || ROOT == mm::virt::get_kernel_pagemap() || address < USER_SPACE_START || address >= USER_SPACE_END ||
+        address % mm::paging::PAGE_SIZE != 0 || subject.type != task::TaskType::PROCESS || subject.pid != 0 || subject.is_thread ||
+        subject.thread != nullptr || subject.state.load(std::memory_order_acquire) != task::TaskState::ACTIVE ||
+        subject.scheduler_published.load(std::memory_order_acquire) || subject.shares_user_pagemap.load(std::memory_order_acquire) ||
+        (ker::mod::sched::can_query_current_task() && ker::mod::sched::get_current_task() == &subject) ||
+        mm::virt::active_pagemap_is(ROOT) || mm::virt::translate(ROOT, address) != mm::virt::PADDR_INVALID)
+        return false;
+    return materialize_reserved_page(&subject, address, ker::abi::vmem::PROT_READ | ker::abi::vmem::PROT_WRITE);
+}
+
 auto selftest_observe_file_mmap_cache(ker::vfs::File& file, uint64_t offset, SelftestFileCacheObservation& observation) -> bool {
     if (observation.retained_frame != nullptr) return false;
     SelftestImmutableFileHold hold(file);

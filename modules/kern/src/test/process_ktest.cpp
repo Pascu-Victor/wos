@@ -87,6 +87,10 @@ KTEST(RemoteExecRequest, ClaimAndCancelPreserveCanonicalOwnership) {
     KEXPECT_TRUE(ker::syscall::process::exec_selftest_remote_request_claim_and_cancel());
 }
 
+KTEST(RemoteExecRequest, CapturedWorkerPolicyControlsOwnerAdmission) {
+    KEXPECT_TRUE(ker::syscall::process::exec_selftest_remote_request_memory_policy());
+}
+
 KTEST(WorkerExecHandoff, ClaimAndCancelPreserveSingleOwnership) {
     KEXPECT_TRUE(ker::syscall::process::exec_selftest_worker_handoff_claim_and_cancel());
 }

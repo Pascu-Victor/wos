@@ -45,12 +45,12 @@ auto physical_node(uint64_t physical_address) noexcept -> NodeId {
 }
 
 auto try_allocate_pages(const AllocationContext& context, uint32_t pages, uint64_t alignment_bytes, PhysicalPageOwner owner,
-                        phys::PageInitialization initialization) -> AllocationResult {
+                        phys::PageInitialization initialization, ReclaimMode reclaim, const char* name) -> AllocationResult {
     AllocationResult result;
     // Validate every argument before the legacy UMA shortcut. In particular,
     // the old allocator requires a concrete owner rather than returning null.
     if ((pages != 1 && pages != 512) || alignment_bytes < paging::PAGE_SIZE || (alignment_bytes & (alignment_bytes - 1)) != 0 ||
-        !physical_page_owner_is_valid(owner) ||
+        !physical_page_owner_is_valid(owner) || (reclaim != ReclaimMode::NEVER && reclaim != ReclaimMode::LEGACY_UMA) ||
         (initialization != phys::PageInitialization::ZERO && initialization != phys::PageInitialization::FULL_OVERWRITE)) {
         result.error = AllocationError::INVALID_ARGUMENT;
         return result;
@@ -67,13 +67,23 @@ auto try_allocate_pages(const AllocationContext& context, uint32_t pages, uint64
     result.error = AllocationError::EXHAUSTED;
 
     if (topology->node_count == 1 && context.policy.mode == Mode::LOCAL && pages == 1 && alignment_bytes == paging::PAGE_SIZE) {
-        void* const PAGE = initialization == phys::PageInitialization::ZERO
-                               ? phys::page_alloc_may_fail(owner, paging::PAGE_SIZE, "numa-uma")
-                               : phys::page_alloc_full_overwrite_page_may_fail(owner, "numa-uma");
+        const char* const SITE = name != nullptr ? name : "numa-uma";
+        void* const PAGE =
+            reclaim == ReclaimMode::LEGACY_UMA
+                ? (initialization == phys::PageInitialization::ZERO
+                       ? phys::page_alloc_with_reclaim_may_fail(owner, paging::PAGE_SIZE, SITE)
+                       : phys::page_alloc_full_overwrite_page_with_reclaim_may_fail(owner, SITE))
+                : (initialization == phys::PageInitialization::ZERO ? phys::page_alloc_may_fail(owner, paging::PAGE_SIZE, SITE)
+                                                                    : phys::page_alloc_full_overwrite_page_may_fail(owner, SITE));
         if (PAGE == nullptr) return result;
         result.span = OwnedSpan{PAGE, 1};
         auto const ADDRESS = reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<uint64_t>(PAGE)));
         result.actual = node_for_address(*topology, ADDRESS);
+        if (result.actual == INVALID_NODE) {
+            result.span.reset();
+            result.error = AllocationError::INVALID_PLACEMENT;
+            return result;
+        }
         result.error = AllocationError::NONE;
         return result;
     }
@@ -95,6 +105,14 @@ auto try_allocate_pages(const AllocationContext& context, uint32_t pages, uint64
         }
     }
     return result;
+}
+
+// Kept out of line even with LTO: an excluded TU must never become the caller
+// owning the factory's instrumented hidden return storage.
+[[gnu::noinline]] void try_allocate_pages_into(AllocationResult& output, const AllocationContext& context, uint32_t pages,
+                                               uint64_t alignment_bytes, PhysicalPageOwner owner, phys::PageInitialization initialization,
+                                               ReclaimMode reclaim, const char* name) {
+    output = try_allocate_pages(context, pages, alignment_bytes, owner, initialization, reclaim, name);
 }
 
 }  // namespace ker::mod::mm::numa

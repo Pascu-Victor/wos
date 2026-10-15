@@ -904,12 +904,15 @@ def test_task_exit_retires_remote_compute_wait_owners() -> None:
     vfs_core = (ROOT / "modules/kern/src/vfs/core.cpp").read_text()
     self_proof = function_body(vfs_core, "vfs_count_exclusive_unpublished_self_refs")
     require_tokens(self_proof, ["task.fd_table.reserved_count() == 0", "captured.root.get()", "captured.cwd.get()",
-                               "task.exec_image_file != captured.image", "captured.find_file_entry(range.file)",
+                               "task.exec_image_file != captured.image", "auto* file = ker::mod::sched::task::lazy_vmem_file(range)",
+                               "captured.find_file_entry(file)",
                                "lazy_owned == captured.files[i].lazy_observed",
                                "entry.file->refcount.load(std::memory_order_acquire)",
                                "entry.view->refs.load(std::memory_order_acquire)", "2 * ALIASES",
                                "task.ref_count.load(std::memory_order_acquire) != 2 + self_refs", "out = self_refs"],
                    "bounded constructor graph and original-source proof")
+    require_order(self_proof, "auto* file = ker::mod::sched::task::lazy_vmem_file(range)", "captured.find_file_entry(file)",
+                  "canonical lazy File precedes exclusive owner lookup")
     proof_code = re.sub(r"//[^\n]*|/\*[\s\S]*?\*/", "", self_proof)
     for prohibited in ("new ", "procfs_view_policy(", "find_task_by_", "vfs_open", "vfs_put_file("):
         if prohibited in proof_code:
@@ -3177,7 +3180,69 @@ def test_exec_candidate_stays_private_until_cutover() -> None:
     assert "detail::handle_task_reject" in native and "remote_pid == (exec ? 7 : 0)" in native
 
 
+def require_local_only_memory_policy(source: str) -> None:
+    resolver = multiline_function_body(source, "capture_submission_memory_policy")
+    require_order(resolver, "transfer->memory_policy.has_value()", "subject.memory_policy_snapshot()", "captured origin wins")
+    require_tokens(resolver, ["output = *transfer->memory_policy", "transfer->exec_candidate != nullptr || transfer->cutover != nullptr",
+                              "return -EINVAL", "output = subject.memory_policy_snapshot()"], "copied submission policy")
+    for forbidden in ["value_or", "get_current_task", "credential_owner", "resource_lock", "new "]:
+        assert forbidden not in resolver
+    spawn = function_body(source, "wki_try_remote_spawn")
+    capture = "capture_submission_memory_policy(*task, &spec, memory_policy)"
+    require_order(spawn, "remote_namespace_admission(task)", capture, "namespace errno precedence")
+    require_order(spawn, capture, "if (!g_remote_compute_initialized || task == nullptr)", "policy before shortcuts")
+    gate = spawn[spawn.index("ker::mod::mm::numa::Policy memory_policy;"):spawn.index("if (!g_remote_compute_initialized")]
+    require_tokens(gate, ["memory_policy != ker::mod::mm::numa::Policy{}", "candidate->path == nullptr", "candidate->target == nullptr",
+                         "candidate->target_flags : task->wki_target_flags", "candidate->target : task->wki_target_hostname.data()",
+                         "WKI_TARGET_FLAG_LOCAL", "WKI_TARGET_FLAG_REMOTE", "WKI_TARGET_FLAG_BALANCED", "placement_error = -ENOTSUP",
+                         "return finish_placement(WkiRemoteSpawnResult::LOCAL)"], "local-only memory admission")
+    for forbidden in ["log_spawn_diag", "spec.prepare(", "spec.accepted(", "spec.cutover(", "wki_skip_legacy_placement =",
+                      "wki_ipc_export_task_fds", "wki_peer_find"]:
+        assert forbidden not in gate
+    for name in ["wki_task_submit_inline", "wki_task_submit_vfs_ref"]:
+        submit = multiline_function_body(source, name)
+        capture = "capture_submission_memory_policy(*local_task, transfer, memory_policy)"
+        order = ["WkiIpcSubmissionGuard ipc_guard", "preparation->disarm()", "remote_namespace_admission(local_task)", capture,
+                 "select_submit_read_credentials", "TaskFilesystemPreparation"]
+        assert [submit.index(t) for t in order] == sorted(submit.index(t) for t in order)
+        refusal = submit[submit.index("if (POLICY_ADMISSION != 0 || memory_policy !="):submit.index("ker::mod::security::Snapshot read_credentials")]
+        require_tokens(refusal, ["cleanup_submit_ipc()", "return fail_submit(POLICY_ADMISSION != 0 ? POLICY_ADMISSION : -ENOTSUP)"],
+                       "direct submit cancels transferred pins")
+    # A policy-only transfer would change the credential-transition contract.
+    assert spawn.count("(spec.cutover != nullptr || spec.image_credentials != nullptr) ? &spec : nullptr") == 2
+    legacy = function_body(source, "try_remote_placement")
+    require_order(legacy, "task->wki_skip_legacy_placement", "task->elf_buffer == nullptr", "skip before fork gate")
+    require_order(legacy, "task->elf_buffer_size == 0", "wki_try_remote_spawn(task, SPEC)", "fork gate before capture")
+    assert "memory_policy_snapshot" not in legacy and "WkiRemoteSpawnSpec const SPEC = {}" in legacy
+    process = (ROOT / "modules/kern/src/syscalls_impl/process/process.cpp").read_text()
+    assert process.index("child->elf_buffer = nullptr") < process.index("sched::post_task_balanced(child)")
+    clone = process[process.index("child->wki_skip_legacy_placement = true"):]
+    assert clone.index("child->wki_skip_legacy_placement = true") < clone.index("sched::post_task_balanced(child)")
+    assert 'sizeof(TaskSubmitPayload) == 20' in (ROOT / "modules/kern/src/net/wki/wire.hpp").read_text()
+    assert "sizeof(WkiRemoteSpawnSpec)" not in source
+
+
+def test_local_only_memory_policy_and_mutants() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    require_local_only_memory_policy(source)
+    for before, after in [
+        ("output = subject.memory_policy_snapshot();", "output = ker::mod::sched::get_current_task()->memory_policy_snapshot();"),
+        ("if (memory_policy != ker::mod::mm::numa::Policy{})", "if (false)"),
+        ("capture_submission_memory_policy(*local_task, transfer, memory_policy)", "0 /* bypass direct policy */"),
+        ("transfer->exec_candidate != nullptr || transfer->cutover != nullptr", "transfer->exec_candidate != nullptr"),
+        ("(spec.cutover != nullptr || spec.image_credentials != nullptr) ? &spec : nullptr", "&spec"),
+    ]:
+        assert before in source
+        mutant = source.replace(before, after, 1)
+        try:
+            require_local_only_memory_policy(mutant)
+        except (AssertionError, ValueError):
+            continue
+        fail(f"memory-policy source oracle accepted mutant: {before}")
+
+
 def main() -> None:
+    test_local_only_memory_policy_and_mutants()
     test_exec_candidate_stays_private_until_cutover()
     test_secure_exec_capability_binds_the_actual_submission_generation()
     test_exec_transition_preserves_original_fetch_authority()

@@ -4987,8 +4987,11 @@ KTEST(CompartmentWki, PrivateViewsRejectActualComputeAndFdExportBeforeEffects) {
         bool prepared = false;
         int error = 99;
         uint32_t deferred = 99;
-        wki::WkiRemoteSpawnSpec spec{
-            .error_out = &error, .prepare = observe_private_placement_prepare, .context = &prepared, .deferred_proxy_id = &deferred};
+        wki::WkiRemoteSpawnSpec spec{.error_out = &error,
+                                     .prepare = observe_private_placement_prepare,
+                                     .context = &prepared,
+                                     .deferred_proxy_id = &deferred,
+                                     .memory_policy = subject.task->memory_policy_snapshot()};
         for (uint32_t flags : {uint32_t{0}, Task::WKI_TARGET_FLAG_LOCAL, Task::WKI_TARGET_FLAG_REMOTE, Task::WKI_TARGET_FLAG_BALANCED}) {
             subject.task->wki_target_flags = flags;
             auto const EXPECTED =
@@ -5097,6 +5100,83 @@ KTEST(CompartmentWki, CanonicalClosedOwnersAndExistingHandoffDrainExactly) {
         for (int fd : descriptors) KREQUIRE_EQ(subject.close(fd), 0);
     }
     KEXPECT_EQ(pid_ns::live_namespace_count(), BASELINE);
+}
+
+KTEST(CompartmentWki, NonLocalDirectSubmitCancelsPreparation) {
+    namespace numa = ker::mod::mm::numa;
+    NativeTask subject;
+    subject.task->type = sched::task::TaskType::PROCESS;
+    KREQUIRE_EQ(ker::mod::security::compartment::remote_namespace_admission(subject.task.get()), 0);
+    std::array<int, 2> descriptors{-1, -1};
+    KREQUIRE_EQ(vfs::vfs_selftest_create_pipe(*subject.task, descriptors.data()), 0);
+    for (int fd : descriptors) KREQUIRE_EQ(subject.track(fd), fd);
+    auto* reader = static_cast<vfs::File*>(subject.task->fd_table.lookup(descriptors[0]));
+    auto* writer = static_cast<vfs::File*>(subject.task->fd_table.lookup(descriptors[1]));
+    subject.task->set_fd_cloexec(static_cast<unsigned>(descriptors[0]));
+    constexpr std::array<uint8_t, 2> PAYLOAD{0x39, 0xA7};
+    KREQUIRE_EQ(writer->fops->vfs_write(writer, PAYLOAD.data(), PAYLOAD.size(), 0), ssize_t{2});
+    auto const REFERENCES = reader->refcount.load();
+    auto const RESOURCES = wki::resource_contract::snapshot(subject.task->resources);
+    constexpr numa::Policy NONLOCAL{.nodes = 1, .mode = numa::Mode::BIND};
+    for (bool inline_binary : {false, true}) {
+        for (unsigned variant = 0; variant < 3; ++variant) {
+            for (uint16_t number : {uint16_t{0}, uint16_t{1}, uint16_t{16}}) {
+                KREQUIRE_TRUE(subject.task->selftest_set_memory_policy(NONLOCAL));
+                wki::WkiRemoteSpawnSpec transfer{.memory_policy = subject.task->memory_policy_snapshot()};
+                wki::WkiRemoteExecCandidate candidate{.path = "/unused", .target = ""};
+                if (variant != 0) subject.task->publish_memory_policy_snapshot({});
+                if (variant == 2) {
+                    transfer.exec_candidate = &candidate;
+                    transfer.memory_policy.reset();
+                }
+                // Direct submission never treats LOCAL routing as permission
+                // to erase a nonportable captured memory policy.
+                subject.task->wki_target_flags = Task::WKI_TARGET_FLAG_LOCAL;
+                std::array<wki::WkiIpcFdEntry, 16> map{};
+                std::array<wki::WkiIpcTaskFdHandoff, 16> handoff{};
+                uint16_t count = 0;
+                auto* executor = sched::can_query_current_task() ? sched::get_current_task() : subject.task.get();
+                if (executor == nullptr) executor = subject.task.get();
+                auto* const PENDING = executor->pending_wki_submissions;
+                wki::WkiIpcSubmissionGuard preparation(subject.task.get(), map.data(), handoff.data(), count, wki::WKI_NODE_INVALID);
+                for (; count < number; ++count) {
+                    handoff[count] = {.local_fd = static_cast<uint16_t>(descriptors[0]),
+                                      .file = vfs::vfs_get_file_retain(subject.task.get(), descriptors[0])};
+                    KREQUIRE_TRUE(handoff[count].file == reader);
+                }
+                int error = 99;
+                constexpr std::array<uint8_t, 1> BINARY{0x7f};
+                auto const* const TRANSFER = variant == 0 ? nullptr : &transfer;
+                uint32_t const ID = inline_binary
+                                        ? wki::wki_task_submit_inline(wki::WKI_NODE_INVALID, BINARY.data(), BINARY.size(), nullptr, nullptr,
+                                                                      "/", subject.task.get(), map.data(), count, handoff.data(), UINT8_MAX,
+                                                                      &error, &preparation, nullptr, TRANSFER)
+                                        : wki::wki_task_submit_vfs_ref(wki::WKI_NODE_INVALID, "/bin/fixture", nullptr, nullptr, "/",
+                                                                       subject.task.get(), map.data(), count, handoff.data(), UINT8_MAX,
+                                                                       &error, &preparation, nullptr, TRANSFER);
+                KEXPECT_EQ(ID, uint32_t{0});
+                KEXPECT_EQ(error, variant == 2 ? -EINVAL : -ENOTSUP);
+                for (uint16_t i = 0; i < count; ++i) KEXPECT_NULL(handoff[i].file);
+                KEXPECT_EQ(reader->refcount.load(), REFERENCES);
+                KEXPECT_TRUE(executor->pending_wki_submissions == PENDING);
+                preparation.cancel();
+                preparation.cancel();
+                KEXPECT_EQ(reader->refcount.load(), REFERENCES);
+                KEXPECT_TRUE(subject.task->fd_table.lookup(descriptors[0]) == reader);
+                KEXPECT_TRUE(subject.task->get_fd_cloexec(static_cast<unsigned>(descriptors[0])));
+                KEXPECT_EQ(subject.task->fd_table.size(), size_t{2});
+                KEXPECT_NULL(subject.task->pending_wki_filesystems);
+                KEXPECT_NULL(subject.task->pending_wki_submit_buffers);
+                KEXPECT_FALSE(subject.task->wki_proxy_task);
+                KEXPECT_FALSE(subject.task->wki_skip_legacy_placement);
+            }
+        }
+    }
+    auto const AFTER = wki::resource_contract::snapshot(subject.task->resources);
+    KEXPECT_EQ(std::memcmp(&RESOURCES, &AFTER, sizeof(RESOURCES)), 0);
+    std::array<uint8_t, 2> received{};
+    KEXPECT_EQ(reader->fops->vfs_read(reader, received.data(), received.size(), 0), ssize_t{2});
+    KEXPECT_TRUE(received == PAYLOAD);
 }
 
 namespace {

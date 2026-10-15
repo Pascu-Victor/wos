@@ -951,10 +951,54 @@ def require_exec_trace_ownership(source: str) -> None:
     assert "depth != 0; --depth" in trace
 
 
+def require_remote_exec_memory_policy_origin(source: str) -> None:
+    run = function_body(source, "run_remote_exec_owner")
+    assert ".memory_policy = request.memory_policy" in run
+    for forbidden in ["owner.memory_policy_snapshot()", "plan.actor->memory_policy_snapshot()", "get_current_task()"]:
+        assert forbidden not in run
+    remote = function_body(source, "try_process_remote_exec")
+    order = ["auto holder = std::unique_ptr<ExecRequestArguments>", "holder->memory_policy = request->memory_policy",
+             "holder->remote = std::move(plan)", "owner->pending_exec_handoff.store"]
+    assert [remote.index(t) for t in order] == sorted(remote.index(t) for t in order)
+    copy = remote[remote.index(order[0]):remote.index(order[2])]
+    assert "memory_policy_snapshot()" not in copy
+    spawn = function_body(source, "wos_proc_exec_impl")
+    spec = spawn[spawn.index("WkiRemoteSpawnSpec const REMOTE_SPAWN"):spawn.index("new_task->mark_exec_completed()")]
+    assert ".memory_policy = memory_policy" in spec and "memory_policy_snapshot()" not in spec
+    capture = function_body(source, "wos_proc_execve")
+    assert capture.index("pending->memory_policy = task->memory_policy_snapshot()") < capture.index("adopt_exec_arguments(*task, pending)")
+    one_shot = function_body(source, "consume_successful_one_shot_wki_target")
+    assert one_shot.index("result == ker::net::wki::WkiRemoteSpawnResult::FAILED") < one_shot.index("pin_completed_exec_locally")
+
+
+def require_remote_exec_memory_policy_mutants(source: str) -> None:
+    require_remote_exec_memory_policy_origin(source)
+    for before, after in [
+        (".memory_policy = request.memory_policy", ".memory_policy = owner.memory_policy_snapshot()"),
+        ("holder->memory_policy = request->memory_policy", "holder->memory_policy = actor.memory_policy_snapshot()"),
+        ("holder->memory_policy = request->memory_policy;", ""),
+        (".memory_policy = memory_policy,", ".memory_policy = parent_task->memory_policy_snapshot(),"),
+    ]:
+        assert before in source
+        # Last token is specific to spawn; mutate its actual spec rather than
+        # an earlier owned-image aggregate with the same member name.
+        if before == ".memory_policy = memory_policy,":
+            start = source.index("WkiRemoteSpawnSpec const REMOTE_SPAWN")
+            mutant = source[:start] + source[start:].replace(before, after, 1)
+        else:
+            mutant = source.replace(before, after, 1)
+        try:
+            require_remote_exec_memory_policy_origin(mutant)
+        except (AssertionError, ValueError):
+            continue
+        fail(f"remote policy source oracle accepted mutant: {before}")
+
+
 def main() -> None:
     require_exec_trace_ownership(EXEC_CPP.read_text())
     require_exec_auxv_matches_committed_snapshot()
     source = EXEC_CPP.read_text()
+    require_remote_exec_memory_policy_mutants(source)
     loader_source = ELF_LOADER_CPP.read_text()
     require_spawn_open_child_context(source)
     require_exec_credential_admission(source)

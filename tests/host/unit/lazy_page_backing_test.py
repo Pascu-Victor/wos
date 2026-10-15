@@ -10,7 +10,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 from raw_typed_file_seams import extend_raw_fixture
-from exec_trace_ownership_test import function
+from exec_trace_ownership_test import block, function
 
 ROOT = Path(__file__).resolve().parents[3]
 # A detached test can override ROOT without relocating imported extraction code.
@@ -18,6 +18,10 @@ ROOT = Path(os.environ.get("WOS_LAZY_BACKING_ROOT", ROOT))
 virt = Path(os.environ.get("WOS_LAZY_BACKING_VIRT_SOURCE", ROOT / "modules/kern/src/platform/mm/virt.opt.cpp")).read_text()
 vmem = Path(os.environ.get("WOS_LAZY_BACKING_VMEM_SOURCE", ROOT / "modules/kern/src/syscalls_impl/vmem/sys_vmem.cpp")).read_text()
 phys = (ROOT / "modules/kern/src/platform/mm/phys.opt.cpp").read_text()
+allocator = (ROOT / "modules/kern/src/platform/mm/numa_alloc.cpp").read_text()
+allocator_header = (ROOT / "modules/kern/src/platform/mm/numa_alloc.hpp").read_text()
+demand_virt = (ROOT / "modules/kern/src/platform/mm/virt.opt.cpp").read_text()
+virt_header = (ROOT / "modules/kern/src/platform/mm/virt.hpp").read_text()
 code = r'''
 #define WOS_KASAN 1
 #include <algorithm>
@@ -28,10 +32,13 @@ code = r'''
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <new>
 #include <string_view>
+#include <utility>
 #include <vector>
 using vaddr_t=uint64_t;using paddr_t=uint64_t;
 namespace model {
+bool expected_stack_size(size_t);
 std::vector<int> locks;
 alignas(4096) std::array<uint8_t,4096> bytes;
 bool live=false,unpoisoned=false,fail_alloc=false,fail_read=false,share=true,fail_cache=false;
@@ -58,6 +65,7 @@ void vfs_retain_file(File*f){assert(!model::locks.empty()&&model::locks.back()==
 void vfs_put_file(File*f){assert(model::locks.empty()&&f->refs>1);--f->refs;}
 }
 namespace mod {
+namespace sched{struct PreemptGuard{PreemptGuard(){assert(model::locks.empty());}~PreemptGuard(){assert(model::locks.empty());}};}
 namespace sched::task {
 enum class LazyVmemKind{ANONYMOUS,FILE_BACKED};
 struct LazyVmemRange{uint64_t start=0x10000,end=0x12000,prot=3,flags=0x20;LazyVmemKind kind=LazyVmemKind::ANONYMOUS;
@@ -72,9 +80,10 @@ namespace addr{auto get_phys_pointer(uint64_t p)->void*{return reinterpret_cast<
 namespace kasan{
 bool is_enabled(){return true;}bool in_shadow_fault(){return false;}
 void unpoison_range(void*p,uint64_t s){if(p==model::bytes.data()){assert(s==4096&&model::live);model::unpoisoned=true;++model::unpoison_calls;}
- else assert(s==sizeof(sched::task::LazyVmemRange));}
+ else assert(s==sizeof(sched::task::LazyVmemRange)||model::expected_stack_size(s));}
 }
 namespace phys {
+enum class PageInitialization:uint8_t{ZERO,FULL_OVERWRITE};
 constexpr uint32_t PAGE_ALLOC_RECLAIM_RETRY_DEFAULT=8;
 uint64_t kernel_cr3=0x222;
 uint64_t rdcr3(){return model::current_cr3;}void wrcr3(uint64_t c){model::current_cr3=c;++model::cr3_writes;}
@@ -92,8 +101,28 @@ void* page_alloc_with_reclaim_impl(PhysicalPageOwner o,uint64_t s,std::string_vi
 WRAPPERS
 void page_ref_dec(void*p){assert(p==model::bytes.data()&&model::live&&model::locks.empty());model::live=false;++model::drops;}
 }
+namespace numa {
+NUMA_DECLARATIONS
+NUMA_METHODS
+// Fixed RAW/default endpoint only. Actual policy selection/reclaim dispatch is
+// independently compiled in numa_alloc_test; no second placement model here.
+auto try_allocate_pages(const AllocationContext& context,uint32_t pages,uint64_t alignment,PhysicalPageOwner owner,
+                        phys::PageInitialization initialization,ReclaimMode reclaim,const char*name)->AllocationResult{
+ assert(model::locks.empty()&&context.policy==Policy{}&&context.local_node==0&&pages==1&&alignment==4096);
+ assert(owner==PhysicalPageOwner::USER_PRIVATE_MAPPING&&initialization==phys::PageInitialization::FULL_OVERWRITE&&reclaim==ReclaimMode::NEVER);
+ AllocationResult result;void*page=phys::page_alloc_full_overwrite_page_may_fail(owner,name);
+ if(!page){result.error=AllocationError::EXHAUSTED;return result;}
+ result.span=OwnedSpan{page,1};result.requested=result.actual=0;result.error=AllocationError::NONE;return result;
+}
+NUMA_ADAPTER
+}
 namespace virt {
 using namespace ker::mod;
+DEMAND_TYPES
+DEMAND_STORAGE
+void record_demand_candidate(const DemandContext&,bool){assert(model::locks.empty());}
+bool demand_is_observed(const DemandContext&){assert(model::locks.empty());return false;}
+void record_demand_result(const DemandContext&,DemandBacking,numa::NodeId,numa::NodeId,bool,bool,bool){assert(model::locks.empty());}
 constexpr uint64_t PADDR_INVALID=UINT64_MAX;
 enum class LazyFilePageInstallResult{MAPPED,ALREADY_MAPPED,STALE_RANGE};
 model::Lock cow_pte_lock{1};
@@ -128,10 +157,15 @@ bool materialize_lazy_file_page(ker::mod::sched::task::Task*t,const LazyVmemRang
 }
 namespace mod::mm::virt {
 FAULT
+bool exercise_lazy_fault(sched::task::Task*task,uint64_t address,const paging::PageFault&fault){
+ DemandContextStorage storage;auto&demand=storage.get();demand.allocation.local_node=0;
+ return handle_lazy_vmem_fault(task,address,fault DEMAND_ARGUMENT);
+}
 }
 }
 namespace model {
 using namespace ker::mod;using namespace ker::mod::sched::task;
+bool expected_stack_size(size_t size){return size==sizeof(mm::virt::DemandContext)||size==sizeof(mm::numa::AllocationResult);}
 void final_alloc_check(){assert(locks.empty()&&current_cr3==0x111);
 #ifdef FUNCTIONAL_ONLY
  assert(cr3_writes==2*zero_calls);
@@ -141,29 +175,29 @@ void final_alloc_check(){assert(locks.empty()&&current_cr3==0x111);
 }
 Task make_task(const LazyVmemRange&r){Task t;t.lazy_vmem_ranges.push_back(r);return t;}
 int run(){
- using mm::paging::PageFault;using mm::virt::handle_lazy_vmem_fault;
+ using mm::paging::PageFault;using mm::virt::exercise_lazy_fault;
  LazyVmemRange anon;ker::vfs::File file;LazyVmemRange fr=anon;fr.kind=LazyVmemKind::FILE_BACKED;fr.file=&file;fr.flags=2;
  // Null/outside/protection failures must not allocate or retain a file.
  for(bool file_kind:{false,true})for(unsigned w:{0U,1U})for(uint64_t prot:{0ULL,1ULL,3ULL}){
   reset();auto r=file_kind?fr:anon;r.prot=prot;auto t=make_task(r);PageFault f{w};expected_flags=prot|(file_kind?r.flags<<8:0);
-  assert(!handle_lazy_vmem_fault(nullptr,0x10000,f));t.pagemap=nullptr;assert(!handle_lazy_vmem_fault(&t,0x10000,f));t.pagemap=reinterpret_cast<void*>(1);
-  assert(!handle_lazy_vmem_fault(&t,0xfff,f)&&!handle_lazy_vmem_fault(&t,r.end,f));
-  if(prot==0||(prot==1&&w)){assert(!handle_lazy_vmem_fault(&t,0x10001,f)&&attempts==0&&caches==0);}
-  else{assert(handle_lazy_vmem_fault(&t,0x10001,f));expect_zero();assert(installs==1&&file.refs==1);assert(file_kind?(prot==1?caches==1&&reclaim_calls==0:reclaim_calls==1):reclaim_calls==0);}
+  assert(!exercise_lazy_fault(nullptr,0x10000,f));t.pagemap=nullptr;assert(!exercise_lazy_fault(&t,0x10000,f));t.pagemap=reinterpret_cast<void*>(1);
+  assert(!exercise_lazy_fault(&t,0xfff,f)&&!exercise_lazy_fault(&t,r.end,f));
+  if(prot==0||(prot==1&&w)){assert(!exercise_lazy_fault(&t,0x10001,f)&&attempts==0&&caches==0);}
+  else{assert(exercise_lazy_fault(&t,0x10001,f));expect_zero();assert(installs==1&&file.refs==1);assert(file_kind?(prot==1?caches==1&&reclaim_calls==0:reclaim_calls==1):reclaim_calls==0);}
   final_alloc_check();
  }
  for(int mode=0;mode<6;++mode){reset();auto t=make_task(anon);expected_flags=3;PageFault f{1};
   if(mode==1)fail_alloc=true;
   if(mode>=2)allocation_hook=[&]{if(mode==2)t.lazy_vmem_ranges.clear();if(mode==3)t.lazy_vmem_ranges[0].prot=1;if(mode==4)mapping=0xdead;if(mode==5){t.lazy_vmem_ranges[0].prot=1;expected_flags=1;}};
   if(mode==5)f.writable=0;
-  bool ok=handle_lazy_vmem_fault(&t,0x1000f,f);
+  bool ok=exercise_lazy_fault(&t,0x1000f,f);
   assert(ok==(mode==0||mode==4||mode==5));assert(attempts==1&&reclaim_calls==0);
   assert(drops==((mode>=2&&mode<=4)?1:0));assert(installs==((mode==0||mode==5)?1:0));assert(tlbs==(mode==4?1:0));
   if(installs)expect_zero();final_alloc_check();
  }
  // Full pages, every EOF tail length and pages beyond EOF. IO sees zeroed bytes.
  for(size_t n=0;n<=4096;++n){reset();auto r=fr;r.file_offset=83;r.file_size=83+n;read_offset=83;read_size=n;expected_flags=r.prot|(r.flags<<8);auto t=make_task(r);
-  assert(handle_lazy_vmem_fault(&t,0x10003,PageFault{1}));check_data(83,n);assert(installs==1&&attempts==1&&reclaim_calls==1&&reads==(n?1:0)&&file.refs==1);final_alloc_check();}
+  assert(exercise_lazy_fault(&t,0x10003,PageFault{1}));check_data(83,n);assert(installs==1&&attempts==1&&reclaim_calls==1&&reads==(n?1:0)&&file.refs==1);final_alloc_check();}
  for(int mode=0;mode<8;++mode){reset();auto r=fr;r.file_size=1000;read_size=1000;expected_flags=r.prot|(r.flags<<8);auto t=make_task(r);
   if(mode==0)fail_alloc=true;if(mode==1)fail_read=true;
   if(mode==2)read_hook=[&]{t.lazy_vmem_ranges.clear();};
@@ -172,13 +206,13 @@ int run(){
   if(mode==5)read_hook=[&]{mapping=0xbeef;};
   if(mode==6){r.file_offset=static_cast<uint64_t>(std::numeric_limits<off_t>::max())+1;r.file_size=r.file_offset+1000;read_offset=r.file_offset;t.lazy_vmem_ranges[0]=r;}
   if(mode==7){r.file_offset=UINT64_MAX-5;t.lazy_vmem_ranges[0]=r;assert(!ker::syscall::vmem::materialize_lazy_file_page_impl(&t,r,0x11000,PageFault{}));assert(attempts==0);final_alloc_check();continue;}
-  bool ok=handle_lazy_vmem_fault(&t,0x10000,PageFault{1});assert(ok==(mode==5));
+  bool ok=exercise_lazy_fault(&t,0x10000,PageFault{1});assert(ok==(mode==5));
   assert(installs==0&&drops==(mode==0?0:1)&&attempts==1&&file.refs==1&&tlbs==(mode==5?1:0));final_alloc_check();
  }
  // Unchanged readonly cache ownership and install/discard branches.
  for(int mode=0;mode<5;++mode){reset();auto r=fr;r.prot=1;r.file_size=123;read_size=123;expected_flags=r.prot|(r.flags<<8);auto t=make_task(r);
   if(mode==1)fail_cache=true;if(mode==2)mapping=0xcafe;if(mode==3){share=false;fail_read=true;}if(mode==4)share=false;
-  bool ok=handle_lazy_vmem_fault(&t,0x10000,PageFault{});assert(ok==(mode==0||mode==2||mode==4));assert(file.refs==1);
+  bool ok=exercise_lazy_fault(&t,0x10000,PageFault{});assert(ok==(mode==0||mode==2||mode==4));assert(file.refs==1);
   assert(caches==(mode<3?1:0)&&attempts==(mode>=3?1:0)&&reclaim_calls==(mode>=3?1:0));
   assert(drops==((mode==2||mode==3)?1:0)&&tlbs==(mode==2?1:0));if(installs)check_data(0,123);final_alloc_check();
  }
@@ -188,18 +222,36 @@ int run(){
 }
 int main(){return model::run();}
 '''
+# Compile actual typed carriers/owners/storage, with scalar demand counters and
+# the fixed default allocation endpoint disclosed above. Old --virt source
+# overrides keep their real function body/signature through the explicit wrapper.
+namespace_start = allocator_header.index('namespace ker::mod::mm::numa {') + len('namespace ker::mod::mm::numa {')
+numa_declarations = allocator_header[namespace_start:allocator_header.rindex('}  // namespace ker::mod::mm::numa')]
+numa_methods = allocator[allocator.index('OwnedSpan::~OwnedSpan()'):allocator.index('auto physical_node(')]
+demand_storage = demand_virt[demand_virt.index('struct DemandContext {'):demand_virt.index('struct DemandCounters {')]
+demand_types = '\n'.join(block(virt_header, rf'^enum class {name}[^;]*\{{') + ';'
+                         for name in ['DemandOrigin', 'DemandBacking'])
+actual_fault = function(virt, 'handle_lazy_vmem_fault')
+demand_argument = ', demand' if 'DemandContext' in actual_fault[:actual_fault.index('{')] else ''
+code = '#include "' + str(ROOT / 'modules/kern/src/platform/mm/numa_policy.hpp') + '"\n' + code
 code = extend_raw_fixture(code, 'model::Lock user_mapping_pin_lock{3};')
 replacements = {
     'PREPARE': function(phys, 'prepare_allocated_block'),
-    'WRAPPERS': '\n'.join(function(phys, n) for n in ['page_alloc_may_fail', 'page_alloc_full_overwrite_may_fail', 'page_alloc_with_reclaim_may_fail', 'page_alloc_full_overwrite_page_with_reclaim_may_fail']),
+    'WRAPPERS': '\n'.join(function(phys, n) for n in ['page_alloc_may_fail', 'page_alloc_full_overwrite_may_fail', 'page_alloc_full_overwrite_page_may_fail', 'page_alloc_with_reclaim_may_fail', 'page_alloc_full_overwrite_page_with_reclaim_may_fail']),
     'ANON_REVALIDATE': function(virt, 'anonymous_lazy_range_allows_fault'),
     'FILE_MATCH': function(virt, 'lazy_file_range_matches'),
     'INSTALL': function(virt, 'install_lazy_file_page_if_current'),
     'FILE_MATERIALIZE': function(vmem, 'materialize_lazy_file_page_impl'),
-    'FAULT': function(virt, 'handle_lazy_vmem_fault'),
+    'FAULT': actual_fault,
+    'NUMA_DECLARATIONS': numa_declarations,
+    'NUMA_METHODS': numa_methods,
+    'NUMA_ADAPTER': block(allocator, r'^\[\[gnu::noinline\]\] void try_allocate_pages_into\([^;{]*\{'),
+    'DEMAND_TYPES': demand_types,
+    'DEMAND_STORAGE': demand_storage,
 }
 # C++ default arguments are in phys.hpp, outside the extracted definitions.
 replacements['WRAPPERS'] = replacements['WRAPPERS'].replace('uint32_t retry_count)', 'uint32_t retry_count = PAGE_ALLOC_RECLAIM_RETRY_DEFAULT)')
+code = code.replace('DEMAND_ARGUMENT', demand_argument)
 for name, text in replacements.items():
     code = code.replace('\n' + name + '\n', '\n' + text + '\n')
 with tempfile.TemporaryDirectory(prefix='wos-lazy-page-backing-') as directory:
@@ -207,7 +259,8 @@ with tempfile.TemporaryDirectory(prefix='wos-lazy-page-backing-') as directory:
     binary = Path(directory) / 'test'
     source.write_text(code)
     flags = ['-DFUNCTIONAL_ONLY'] if os.environ.get('WOS_LAZY_BACKING_FUNCTIONAL_ONLY') == '1' else []
-    subprocess.run(['/usr/bin/clang++', '-std=c++23', '-O1', '-g', '-fsanitize=address,undefined', *flags, str(source), '-o', str(binary)], check=True)
+    subprocess.run(['/usr/bin/clang++', '-std=c++23', '-O1', '-g', '-fsanitize=address,undefined', *flags,
+                    '-I', str(ROOT / 'modules/kern/src'), '-I', str(ROOT / 'modules'), str(source), '-o', str(binary)], check=True)
     environment = os.environ.copy()
     environment['ASAN_OPTIONS'] = 'detect_leaks=0'
     subprocess.run([str(binary)], env=environment, check=True)

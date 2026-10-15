@@ -30,11 +30,24 @@ internal paths have no public policy selector yet.
 The internal placed allocator supports preferred, strict-bind and deterministic
 virtual-page interleave selection. A checked interval claim returns either one
 frame or 512 absolutely aligned, independently owned order-0 frames. Move-only
-ownership frees an uncommitted span. This helper has no public selector and is
-not yet connected to anonymous faults or large user mappings.
-It bypasses unfiltered CPU caches for domain-constrained claims; cached capacity
-can therefore cause conservative allocation failure. Allocation-pressure
-bookkeeping can wake reclaim, but the attempt itself does not reclaim or wait.
+ownership frees an uncommitted span. Private lazy anonymous and COW allocation
+consume the supplied executor's copied policy and a captured CPU-node value.
+Hardware origin uses the saved exception CPL; software ensures remain separately
+classified. Installed private-copy frames, zero-COW and new anonymous pages have
+separate counters; remote fallback remains a miss in an eligible locality count.
+This internal routing has no public policy selector or large user mapping yet.
+
+Domain-constrained claims bypass unfiltered CPU caches, so cached capacity can
+cause conservative allocation failure. Allocation-pressure bookkeeping can wake
+reclaim, but these attempts do not reclaim or wait. Only the exact UMA LOCAL
+one-page/4 KiB compatibility path can delegate to the existing reclaim helpers;
+private lazy anonymous allocation retains its nonwaiting behavior.
+
+WKI keeps non-LOCAL memory policies on the originating machine: automatic
+placement stays local and explicit remote placement returns ENOTSUP. Queued
+worker exec uses the initiating request's saved policy. Direct submission also
+refuses non-LOCAL policy and releases transferred preparation ownership. These
+rules do not put local node IDs into the wire protocol.
 
 The explicit per-node balance diagnostic scans bounded physical metadata and
 collects global and node owner totals during one allocator-lock interval. Its
@@ -155,6 +168,48 @@ and unrelated VM stayed unchanged, and all disposable images were removed.
 Ordinary KTEST parks secondary CPUs, so these runs do not qualify SMP races or
 CPU-pinned userspace locality benchmarks.
 
-These checks establish the internal foundation. User first touch, per-node
+These checks establish the internal foundation. Later demand/WKI validation is
+recorded separately below; the foundation results do not qualify those changes.
+User first touch, per-node
 reserves and pressure policy, 2 MiB mapping lifetime, map/fork/pin/unmap stress and paired
 locality/UMA throughput measurements remain required.
+
+## Private demand and WKI admission, 2026-10-15
+
+Normal Build WOS, isolated fast KTEST build, all 18 registered relevant Host
+entries and changed C++ formatting/clang-tidy passed. The factory Host target
+executes the actual placed allocation implementation with 13 dispatch,
+validation, zeroing and ownership cases; its physical seams do not qualify the
+native buddy or reclaim behavior.
+
+The first native demand run failed because its observer used a current-process
+root helper for a deliberately unpublished target. The failed run and assertion
+summary are retained; its images were removed. The correction uses the exact
+supplied root's registered incarnation while preserving the current-process
+API's admission checks. A subsequent driver attempt stopped on the prior run's
+log before guest launch; its unused image was removed and serial freshness was
+added to the driver. Neither attempt is passing runtime evidence.
+
+Fresh emulated NUMA qualification passed 1,493 cases and 129,241 assertions,
+with zero failures and natural poweroff, using kernel SHA-256
+`17fc27ec2f9264663228aa074dcd62d1c1478110bd572aba5ed0da42cf8c6f0c`.
+The nine demand cases exercise actual private anonymous, genuine zero-COW and
+private COW installs, physical bind/interleave confinement, copied-policy
+stability, sole-reference promotion, allocation/protection rollback and owned
+frame closure. Four WKI cases exercise sender admission, direct-submit
+cancellation and captured worker policy.
+
+The prescheduler suite has no queryable current executor. It therefore does not
+qualify scheduled foreign-executor access, real CPL3 first touch, IF-on reclaim
+progress, network transmission or SMP races. Native tests report these limits
+explicitly. Peak disposable disk allocation was 268,910,592 bytes; all owned
+boot/overlay/auth files were removed after inactivity/reference/backing checks.
+The original host guard and unrelated VM remained unchanged. The receipt is
+`build/goal40-evidence/native-numa12/result.json`.
+
+UMA control of the same kernel passed 1,493 cases and 129,078 assertions with
+zero failures and natural poweroff. All watched sources stayed fixed; the
+original guard and unrelated VM were preserved. Its peak disposable allocation
+was also 268,910,592 bytes and its owned images/auth files were removed. The
+receipt is `build/goal40-evidence/native-uma13/result.json`. This qualifies the
+same internal paths on UMA, with the prescheduler limitations above.
