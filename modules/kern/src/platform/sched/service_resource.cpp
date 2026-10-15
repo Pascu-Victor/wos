@@ -1,5 +1,12 @@
 #include "service_resource.hpp"
 
+#ifdef WOS_SELFTEST
+#include <platform/mm/lifecycle_census.hpp>
+#endif
+#ifdef WOS_SELFTEST
+#include <test/compartment_lifecycle_runtime.hpp>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -28,7 +35,59 @@ struct ServiceSlot {
     bool configured = false;
 };
 std::array<ServiceSlot, service_abi::MAX_SERVICES> services{};
+#ifdef WOS_SELFTEST
+ker::mod::mm::lifecycle_census::Epoch selftest_service_epoch{};
+using ker::mod::mm::lifecycle_census::Epoch;
+class SelftestServiceLock final {
+   public:
+    constexpr explicit SelftestServiceLock(Epoch& epoch) noexcept : epoch_(epoch) {}
+    void lock() {
+        epoch_.begin();
+        lock_.lock();
+    }
+    [[nodiscard]] auto try_lock() -> bool {
+        epoch_.begin();
+        if (lock_.try_lock()) return true;
+        epoch_.end();
+        return false;
+    }
+    void unlock() {
+        lock_.unlock();
+        epoch_.end();
+    }
+    [[nodiscard]] auto lock_irqsave() -> uint64_t {
+        epoch_.begin();
+        return lock_.lock_irqsave();
+    }
+    void unlock_irqrestore(uint64_t flags) {
+        lock_.unlock_irqrestore(flags);
+        epoch_.end();
+    }
+
+    // Only census readers use these. Other production helpers remain on the
+    // ownership path except the explicitly separate CPU-accounting pair below.
+    [[nodiscard]] auto observe_lock_irqsave() -> uint64_t { return lock_.lock_irqsave(); }
+    void observe_unlock_irqrestore(uint64_t flags) { lock_.unlock_irqrestore(flags); }
+    // CPU billing changes no field read by SelftestServiceCensus. These methods
+    // retain the same actual lock, IRQ state and preemption-owner semantics.
+    [[nodiscard]] auto cpu_accounting_lock_irqsave() -> uint64_t { return lock_.lock_irqsave(); }
+    void cpu_accounting_unlock_irqrestore(uint64_t flags) { lock_.unlock_irqrestore(flags); }
+    SelftestServiceLock(const SelftestServiceLock&) = delete;
+    auto operator=(const SelftestServiceLock&) -> SelftestServiceLock& = delete;
+
+   private:
+    Epoch& epoch_;
+    sys::Spinlock lock_;
+};
+
+SelftestServiceLock service_lock{selftest_service_epoch};
+#else
 sys::Spinlock service_lock;
+#endif
+#ifdef WOS_SELFTEST
+std::atomic<uint64_t> selftest_remote_objects{0}, selftest_remote_references{0}, selftest_remote_creations{0};
+uint64_t selftest_remote_members = 0, selftest_remote_reports = 0;  // service_lock
+#endif
 
 auto is_init(task::Task* subject) -> bool { return subject != nullptr && subject->pid == 1 && !subject->is_thread; }
 
@@ -88,6 +147,67 @@ void ServiceResourceMerge::exclude_reported_denials() {
     }
 }
 
+#ifdef WOS_SELFTEST
+namespace {
+auto selftest_selected_slot_locked(task::Task& parent, const char* expected) noexcept -> bool {
+    if (!is_init(&parent) || expected == nullptr || parent.selected_child_service >= services.size()) return false;
+    auto const& row = services.at(parent.selected_child_service);
+    if (!row.configured) return false;
+    for (size_t i = 0; i < row.name.size(); ++i) {
+        if (row.name.at(i) != expected[i]) return false;
+        if (row.name.at(i) == '\0') return true;
+    }
+    return false;
+}
+}  // namespace
+auto selftest_exact_selected_service(task::Task& parent, const char* expected) noexcept -> bool {
+    uint64_t const FLAGS = service_lock.lock_irqsave();
+    bool const MATCH = selftest_selected_slot_locked(parent, expected);
+    service_lock.unlock_irqrestore(FLAGS);
+    return MATCH;
+}
+auto selftest_exact_unselected_service_slot(task::Task& parent, uint64_t slot, const char* expected) noexcept -> bool {
+    if (!is_init(&parent) || expected == nullptr) return false;
+    uint64_t const FLAGS = service_lock.lock_irqsave();
+    bool match = parent.selected_child_service == service_abi::NO_SELECTION && slot < services.size();
+    if (match) {
+        auto const& row = services.at(slot);
+        match = row.configured;
+        bool ended = false;
+        for (size_t i = 0; match && i < row.name.size(); ++i) {
+            if (row.name.at(i) != expected[i])
+                match = false;
+            else if (row.name.at(i) == '\0') {
+                ended = true;
+                break;
+            }
+        }
+        match = match && ended;
+    }
+    service_lock.unlock_irqrestore(FLAGS);
+    return match;
+}
+auto selftest_exact_service_child(task::Task& parent, task::Task& child, const char* expected) noexcept -> bool {
+    uint64_t const FLAGS = service_lock.lock_irqsave();
+    bool match = selftest_selected_slot_locked(parent, expected);
+    auto const& member = child.service_member;
+    match = match && !child.is_thread && member.subject == &child && member.slot == parent.selected_child_service &&
+            member.remote == nullptr && !member.executing_remotely;
+    bool found = false;
+    if (match) {
+        size_t visited = 0;
+        for (auto* node = services.at(member.slot).members; node != nullptr && visited < 4096; node = node->next, ++visited) {
+            if (node == &member) {
+                found = true;
+                break;
+            }
+        }
+    }
+    service_lock.unlock_irqrestore(FLAGS);
+    return match && found;
+}
+#endif
+
 void mark_service_remote_execution(task::Task& process) {
     uint64_t const FLAGS = service_lock.lock_irqsave();
     process.service_member.executing_remotely = true;
@@ -95,6 +215,10 @@ void mark_service_remote_execution(task::Task& process) {
 }
 
 ServiceMember::~ServiceMember() {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_service_epoch);
+#endif
+
     if (remote != nullptr) {
         auto* accounting = remote;
         uint64_t const FLAGS = service_lock.lock_irqsave();
@@ -110,6 +234,10 @@ ServiceMember::~ServiceMember() {
         else
             accounting->members = next;
         if (next != nullptr) next->previous = previous;
+#ifdef WOS_SELFTEST
+        if (selftest_remote_members == 0) __builtin_trap();
+        --selftest_remote_members;
+#endif
         service_lock.unlock_irqrestore(FLAGS);
         accounting->release();
         return;
@@ -132,6 +260,45 @@ ServiceMember::~ServiceMember() {
     service_lock.unlock_irqrestore(FLAGS);
 }
 
+#ifdef WOS_SELFTEST
+auto RemoteServiceAccounting::create() -> RemoteServiceAccounting* {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_service_epoch);
+#endif
+
+    if (selftest_remote_creations.fetch_add(1, std::memory_order_acq_rel) == UINT64_MAX) __builtin_trap();
+    auto* result = new (std::nothrow) RemoteServiceAccounting();
+    if (result != nullptr) {
+        if (selftest_remote_objects.fetch_add(1, std::memory_order_relaxed) == UINT64_MAX) __builtin_trap();
+        if (selftest_remote_references.fetch_add(1, std::memory_order_relaxed) == UINT64_MAX) __builtin_trap();
+    }
+    if (selftest_remote_creations.fetch_sub(1, std::memory_order_release) == 0) __builtin_trap();
+    return result;
+}
+
+void RemoteServiceAccounting::retain() {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_service_epoch);
+#endif
+
+    references.fetch_add(1, std::memory_order_relaxed);
+    if (selftest_remote_references.fetch_add(1, std::memory_order_relaxed) == UINT64_MAX) __builtin_trap();
+}
+
+void RemoteServiceAccounting::release() {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_service_epoch);
+#endif
+
+    bool const LAST = references.fetch_sub(1, std::memory_order_acq_rel) == 1;
+    if (selftest_remote_references.fetch_sub(1, std::memory_order_release) == 0) __builtin_trap();
+    if (LAST) {
+        delete this;
+        if (selftest_remote_objects.fetch_sub(1, std::memory_order_release) == 0) __builtin_trap();
+    }
+}
+
+#else
 auto RemoteServiceAccounting::create() -> RemoteServiceAccounting* { return new (std::nothrow) RemoteServiceAccounting(); }
 
 void RemoteServiceAccounting::retain() { references.fetch_add(1, std::memory_order_relaxed); }
@@ -139,6 +306,8 @@ void RemoteServiceAccounting::retain() { references.fetch_add(1, std::memory_ord
 void RemoteServiceAccounting::release() {
     if (references.fetch_sub(1, std::memory_order_acq_rel) == 1) delete this;
 }
+
+#endif
 
 auto RemoteServiceAccounting::attach_locked(task::Task& process, const State* imported_history) -> bool {
     auto& member = process.service_member;
@@ -162,6 +331,10 @@ auto RemoteServiceAccounting::attach_locked(task::Task& process, const State* im
     member.next = members;
     if (members != nullptr) members->previous = &member;
     members = &member;
+#ifdef WOS_SELFTEST
+    if (selftest_remote_members == UINT64_MAX) __builtin_trap();
+    ++selftest_remote_members;
+#endif
     retain();
     return true;
 }
@@ -241,6 +414,10 @@ ServiceReportTarget::ServiceReportTarget(ServiceReportTarget&& other) noexcept {
 }
 
 auto ServiceReportTarget::operator=(ServiceReportTarget&& other) noexcept -> ServiceReportTarget& {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_service_epoch);
+#endif
+
     if (this == &other) return *this;
     cancel();
     uint64_t const FLAGS = service_lock.lock_irqsave();
@@ -290,6 +467,12 @@ auto ServiceReportTarget::bind(task::Task& process) -> int {
         next = head;
         if (head != nullptr) head->previous = this;
         head = this;
+#ifdef WOS_SELFTEST
+        if (remote != nullptr) {
+            if (selftest_remote_reports == UINT64_MAX) __builtin_trap();
+            ++selftest_remote_reports;
+        }
+#endif
     }
     service_lock.unlock_irqrestore(FLAGS);
     return result;
@@ -309,6 +492,10 @@ auto ServiceReportTarget::apply(uint64_t sequence, const RemoteServiceObservatio
 }
 
 void ServiceReportTarget::cancel(bool incomplete) {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_service_epoch);
+#endif
+
     uint64_t const FLAGS = service_lock.lock_irqsave();
     auto* retained = remote;
     if (remote != nullptr || slot != service_abi::NO_SELECTION) {
@@ -323,6 +510,12 @@ void ServiceReportTarget::cancel(bool incomplete) {
         else
             list_head_locked() = next;
         if (next != nullptr) next->previous = previous;
+#ifdef WOS_SELFTEST
+        if (remote != nullptr) {
+            if (selftest_remote_reports == 0) __builtin_trap();
+            --selftest_remote_reports;
+        }
+#endif
     }
     previous = nullptr;
     next = nullptr;
@@ -487,19 +680,35 @@ void inherit_service(task::Task& child, task::Task& source) {
 
 auto charge_service_cpu(task::Task& process, uint64_t elapsed_us) -> CpuAction {
     if (auto* remote = process.service_member.remote; remote != nullptr) {
+#ifdef WOS_SELFTEST
+        uint64_t const FLAGS = service_lock.cpu_accounting_lock_irqsave();
+#else
         uint64_t const FLAGS = service_lock.lock_irqsave();
+#endif
         // The domain records work actually charged to this execution site.
         // Its CPU limit remains infinite; origin aggregate admission is a
         // separate protocol contract, never a copied per-process allowance.
         static_cast<void>(remote->totals.charge_cpu(elapsed_us));
+#ifdef WOS_SELFTEST
+        service_lock.cpu_accounting_unlock_irqrestore(FLAGS);
+#else
         service_lock.unlock_irqrestore(FLAGS);
+#endif
         return CpuAction::NONE;
     }
     uint64_t const SLOT = process.service_member.slot;
     if (SLOT == service_abi::NO_SELECTION) return CpuAction::NONE;
+#ifdef WOS_SELFTEST
+    uint64_t const FLAGS = service_lock.cpu_accounting_lock_irqsave();
+#else
     uint64_t const FLAGS = service_lock.lock_irqsave();
+#endif
     auto const ACTION = services.at(SLOT).state.totals.charge_cpu(elapsed_us);
+#ifdef WOS_SELFTEST
+    service_lock.cpu_accounting_unlock_irqrestore(FLAGS);
+#else
     service_lock.unlock_irqrestore(FLAGS);
+#endif
     return ACTION;
 }
 
@@ -601,7 +810,15 @@ auto service_read_for_subject(task::Task* caller, uint64_t slot, uint64_t addres
 }
 
 auto syscall_service_read(uint64_t slot, uint64_t address, uint64_t version) -> uint64_t {
+#ifdef WOS_SELFTEST
+    auto* caller = get_current_task();
+    auto const result = service_read_for_subject(caller, slot, address, version);
+    // The actual service lock and all copyout leases ended in the callee.
+    if (caller != nullptr) ker::test::lifecycle60::service_resource_read_completed(*caller, slot, result);
+    return result;
+#else
     return service_read_for_subject(get_current_task(), slot, address, version);
+#endif
 }
 
 #ifdef WOS_SELFTEST
@@ -996,4 +1213,41 @@ auto selftest_native_creator_service_policy() -> bool {
     return service.members == nullptr && service.state.totals.cpu_time_us == 2'000'001 && ok;
 }
 #endif
+#ifdef WOS_SELFTEST
+auto selftest_service_census() -> SelftestServiceCensus {
+    auto const selftest_before = selftest_service_epoch.snapshot();
+    SelftestServiceCensus out{.complete = true};
+    uint64_t const FLAGS = service_lock.observe_lock_irqsave();
+    uint64_t scanned = 0;
+    for (const auto& service : services) {
+        if (service.configured) ++out.configured_slots;
+        for (auto* member = service.members; member != nullptr; member = member->next) {
+            if (scanned++ >= 4096) {
+                out.complete = false;
+                break;
+            }
+            ++out.local_members;
+        }
+        for (auto* report = service.reports; report != nullptr; report = report->next) {
+            if (scanned++ >= 4096) {
+                out.complete = false;
+                break;
+            }
+            ++out.local_reports;
+            if (!report->state.finished) ++out.unfinished_local_reports;
+        }
+        if (!out.complete) break;
+    }
+    out.remote_members = selftest_remote_members;
+    out.remote_reports = selftest_remote_reports;
+    service_lock.observe_unlock_irqrestore(FLAGS);
+    out.remote_objects = selftest_remote_objects.load(std::memory_order_acquire);
+    out.remote_references = selftest_remote_references.load(std::memory_order_acquire);
+    out.remote_creations = selftest_remote_creations.load(std::memory_order_acquire);
+    out.stamp = selftest_service_epoch.snapshot();
+    out.complete = out.complete && ker::mod::mm::lifecycle_census::unchanged(selftest_before, out.stamp);
+    return out;
+}
+#endif
+
 }  // namespace ker::mod::sched::resource

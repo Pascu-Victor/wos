@@ -1,5 +1,9 @@
 #pragma once
 
+#ifdef WOS_SELFTEST
+#include <platform/mm/lifecycle_census.hpp>
+#endif
+
 #include <cstdint>
 #include <optional>
 #include <platform/sched/session.hpp>
@@ -245,6 +249,26 @@ void selftest_prepare_exit_reaper_cutover(sched_task::Task& process, void (*hook
 [[nodiscard]] auto selftest_stop_continue_order_and_backpressure() -> bool;
 [[nodiscard]] auto selftest_parent_event_transfer() -> bool;
 [[nodiscard]] auto selftest_parent_exit_discards_without_reaper() -> bool;
+#endif
+
+#ifdef WOS_SELFTEST
+struct SelftestLifecycleCensus {
+    ker::mod::mm::lifecycle_census::Stamp stamp{};
+    uint64_t child_links{}, tracee_links{}, queued_events{}, wait_registrations{}, event_claims{};
+    bool complete{};
+    auto operator==(const SelftestLifecycleCensus&) const -> bool = default;
+};
+[[nodiscard]] auto selftest_lifecycle_census() -> SelftestLifecycleCensus;
+struct SelftestOwnerLifecycleCensus {
+    ker::mod::mm::lifecycle_census::Stamp stamp{};
+    uint64_t children{}, publishing_children{}, live_children{}, zombie_children{};
+    uint64_t tracees{}, events{}, claimed_events{}, waiters{}, notified_waiters{};
+    bool parent_link{}, tracer_link{}, own_wait_registration{}, own_claim{}, complete{};
+    auto operator==(const SelftestOwnerLifecycleCensus&) const -> bool = default;
+};
+// Caller retains owner; no Task/queue pointers escape. Global edge census above
+// includes unpublished owners; this local view explains the parked driver's debt.
+[[nodiscard]] auto selftest_owner_lifecycle_census(sched_task::Task& owner) -> SelftestOwnerLifecycleCensus;
 #endif
 
 }  // namespace ker::syscall::process::child_events

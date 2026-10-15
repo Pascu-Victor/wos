@@ -17,6 +17,11 @@ set(CXXFILES
 
 add_executable(${TARGET} ${CXXFILES})
 
+# Private qualification hooks only; the Normal init translation is unchanged.
+if(WOS_SELFTEST)
+    target_compile_definitions(${TARGET} PRIVATE WOS_SELFTEST)
+endif()
+
 # Set target-specific compile options to ensure -O0 is respected
 target_compile_options(${TARGET} PRIVATE
     -g

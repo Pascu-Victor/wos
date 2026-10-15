@@ -1,5 +1,9 @@
 #include "child_events.hpp"
 
+#ifdef WOS_SELFTEST
+#include <platform/mm/lifecycle_census.hpp>
+#endif
+
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
@@ -30,10 +34,26 @@ constexpr int32_t CONTINUED_STATUS = 0xffff;
 // No caller may hold a runqueue or WKI compute/channel/RX spinlock. A retained
 // peer lifecycle admission may span bounded inspection/validation/claim/commit;
 // those paths never send or wait on a peer. Wakes occur after lifecycle unlock.
-ker::mod::sys::Spinlock g_lifecycle_lock;      // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+#ifdef WOS_SELFTEST
+ker::mod::mm::lifecycle_census::Epoch selftest_child_epoch{};
+ker::mod::mm::lifecycle_census::OwnerLock g_lifecycle_lock{selftest_child_epoch};
+#else
+ker::mod::sys::Spinlock g_lifecycle_lock;
+#endif                                         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<uint64_t> g_event_sequence{1};     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<uint64_t> g_claim_cookie{1};       // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<uint64_t> g_waiter_generation{1};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+#ifdef WOS_SELFTEST
+SelftestLifecycleCensus selftest_lifecycle_edges{};  // g_lifecycle_lock
+void selftest_edge_add(uint64_t& value) {
+    if (value == UINT64_MAX) __builtin_trap();
+    ++value;
+}
+void selftest_edge_remove(uint64_t& value) {
+    if (value == 0) __builtin_trap();
+    --value;
+}
+#endif
 
 // Conservative invalidation for inherited groups, including native tracees.
 // Lifecycle protected; never wraps. Unrelated group changes may cause a retry.
@@ -48,6 +68,10 @@ struct WakeSelection {
 [[nodiscard]] auto take_lifetime_ref(Task* task) -> bool { return task != nullptr && task->try_acquire_lifetime_ref(); }
 
 void drop_lifetime_ref(Task* task) {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
+#endif
+
     if (task != nullptr) {
         task->release();
     }
@@ -76,6 +100,9 @@ void advance_queue_version_locked(Task& owner) { advance_version_locked(owner.ch
 }
 
 void child_list_insert_locked(Task& parent, Task& child) {
+#ifdef WOS_SELFTEST
+    selftest_edge_add(selftest_lifecycle_edges.child_links);
+#endif
     advance_queue_version_locked(parent);
     child.child_sibling_prev = nullptr;
     child.child_sibling_next = parent.child_list_head;
@@ -86,6 +113,9 @@ void child_list_insert_locked(Task& parent, Task& child) {
 }
 
 void child_list_remove_locked(Task& parent, Task& child) {
+#ifdef WOS_SELFTEST
+    selftest_edge_remove(selftest_lifecycle_edges.child_links);
+#endif
     advance_queue_version_locked(parent);
     if (child.child_sibling_prev != nullptr) {
         child.child_sibling_prev->child_sibling_next = child.child_sibling_next;
@@ -100,6 +130,9 @@ void child_list_remove_locked(Task& parent, Task& child) {
 }
 
 void queue_insert_locked(Task& owner, ChildEvent& event) {
+#ifdef WOS_SELFTEST
+    selftest_edge_add(selftest_lifecycle_edges.queued_events);
+#endif
     advance_queue_version_locked(owner);
     ChildEvent* previous = nullptr;
     ChildEvent* cursor = owner.child_event_head;
@@ -199,6 +232,9 @@ void publish_subject_claim_locked(ChildEvent& event) {
 
 void clear_event_claim_locked(ChildEvent& event) {
     Claim* const CLAIMANT = event.claimed_by;
+#ifdef WOS_SELFTEST
+    if (CLAIMANT != nullptr) selftest_edge_remove(selftest_lifecycle_edges.event_claims);
+#endif
     if (CLAIMANT != nullptr && event.queue_owner != nullptr) advance_queue_version_locked(*event.queue_owner);
     Task* const WAITER = CLAIMANT != nullptr ? CLAIMANT->waiter : nullptr;
     if (event.subject != nullptr) {
@@ -235,6 +271,9 @@ void queue_unlink_locked(Task& owner, ChildEvent& event) {
         owner.child_event_tail = previous;
     }
     event.next = nullptr;
+#ifdef WOS_SELFTEST
+    selftest_edge_remove(selftest_lifecycle_edges.queued_events);
+#endif
     advance_queue_version_locked(owner);
 }
 
@@ -411,6 +450,9 @@ void waiter_unlink_locked(ChildWaitRegistration& registration) {
             OWNER->child_waiter_head = registration.next;
         }
     }
+#ifdef WOS_SELFTEST
+    selftest_edge_remove(selftest_lifecycle_edges.wait_registrations);
+#endif
     registration = {};
     drop_lifetime_ref(WAITER);
     drop_lifetime_ref(OWNER);
@@ -444,6 +486,9 @@ void waiter_unlink_locked(ChildWaitRegistration& registration) {
     registration.registered = true;
     registration.notified = false;
     owner.child_waiter_head = &registration;
+#ifdef WOS_SELFTEST
+    selftest_edge_add(selftest_lifecycle_edges.wait_registrations);
+#endif
     return true;
 }
 
@@ -488,6 +533,10 @@ void waiter_unlink_locked(ChildWaitRegistration& registration) {
 }
 
 void deliver_wake(WakeSelection wake) {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
+#endif
+
     if (wake.signal_owner != nullptr) {
         signal_child_event(*wake.signal_owner, ker::net::wki::WKI_CHILD_SIGNAL_HOPS);
     }
@@ -509,6 +558,10 @@ void deliver_wake(WakeSelection wake) {
 }
 
 void wake_no_child_waiters(Task& owner) {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
+#endif
+
     for (;;) {
         uint64_t const FLAGS = g_lifecycle_lock.lock_irqsave();
         Task* const WAITER = select_no_child_waiter_locked(owner);
@@ -522,6 +575,9 @@ void wake_no_child_waiters(Task& owner) {
 }
 
 void tracee_list_insert_locked(Task& tracer, Task& tracee) {
+#ifdef WOS_SELFTEST
+    selftest_edge_add(selftest_lifecycle_edges.tracee_links);
+#endif
     advance_queue_version_locked(tracer);
     tracee.child_tracee_prev = nullptr;
     tracee.child_tracee_next = tracer.child_tracee_head;
@@ -532,6 +588,9 @@ void tracee_list_insert_locked(Task& tracer, Task& tracee) {
 }
 
 void tracee_list_remove_locked(Task& tracer, Task& tracee) {
+#ifdef WOS_SELFTEST
+    selftest_edge_remove(selftest_lifecycle_edges.tracee_links);
+#endif
     advance_queue_version_locked(tracer);
     if (tracee.child_tracee_prev != nullptr) {
         tracee.child_tracee_prev->child_tracee_next = tracee.child_tracee_next;
@@ -750,6 +809,10 @@ auto import_live_reaped_cpu_times(Task& process, uint64_t user_us, uint64_t syst
 
 auto update_job_identity(Task& process, const ker::mod::sched::session::Identity& identity,
                          std::optional<ker::mod::sched::session::Names> names) -> bool {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
+#endif
+
     auto const* scope = process.pid_namespace();
     if (scope == nullptr) return false;
     Task* parent = nullptr;
@@ -814,6 +877,10 @@ auto selector_matches(Selector selector, uint64_t pid, uint64_t process_group, k
 }
 
 auto begin_publication(Task& creator, Task& child) -> bool {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
+#endif
+
     if (child.is_thread) {
         return true;
     }
@@ -850,6 +917,10 @@ auto begin_publication(Task& creator, Task& child) -> bool {
 }
 
 auto commit_publication(Task& child) -> bool {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
+#endif
+
     uint64_t const FLAGS = g_lifecycle_lock.lock_irqsave();
     auto const STATE = child.child_membership_state.load(std::memory_order_relaxed);
     bool const COMMITTED = child.is_thread || child.child_publication_established;
@@ -861,6 +932,10 @@ auto commit_publication(Task& child) -> bool {
 }
 
 void abort_publication(Task& child) {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
+#endif
+
     Task* parent = nullptr;
     bool release_child = false;
     uint64_t const FLAGS = g_lifecycle_lock.lock_irqsave();
@@ -886,6 +961,10 @@ void abort_publication(Task& child) {
 }
 
 auto publish_exit(Task& child) -> bool {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
+#endif
+
     WakeSelection parent_wake{};
     WakeSelection tracer_wake{};
     bool parent_required = false;
@@ -940,6 +1019,10 @@ auto publish_exit(Task& child) -> bool {
 }
 
 void advance_process_job_control(Task& owner) {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
+#endif
+
     WakeSelection stop_wake{}, continue_wake{};
     bool released = false;
     uint64_t const FLAGS = g_lifecycle_lock.lock_irqsave();
@@ -990,6 +1073,10 @@ void advance_process_job_control(Task& owner) {
 }
 
 auto publish_job_control_stop(Task& child, uint32_t signal) -> bool {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
+#endif
+
     WakeSelection wake{};
     bool published = true;
     uint64_t const FLAGS = g_lifecycle_lock.lock_irqsave();
@@ -1012,6 +1099,10 @@ auto publish_job_control_stop(Task& child, uint32_t signal) -> bool {
 }
 
 auto publish_continued(Task& child) -> bool {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
+#endif
+
     WakeSelection wake{};
     bool published = true;
     uint64_t const FLAGS = g_lifecycle_lock.lock_irqsave();
@@ -1028,6 +1119,10 @@ auto publish_continued(Task& child) -> bool {
 }
 
 auto publish_ptrace_stop(Task& tracee, int32_t status) -> bool {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
+#endif
+
     WakeSelection wake{};
     bool published = false;
     uint64_t const FLAGS = g_lifecycle_lock.lock_irqsave();
@@ -1044,6 +1139,10 @@ auto publish_ptrace_stop(Task& tracee, int32_t status) -> bool {
 }
 
 auto acknowledge_ptrace_stop(Task& tracee, Task& tracer) -> bool {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
+#endif
+
     uint64_t const FLAGS = g_lifecycle_lock.lock_irqsave();
     ChildEvent& event = tracee.child_ptrace_stop_event;
     bool const ACKNOWLEDGED = event.queued && event.queue_owner == &tracer && event.subject == &tracee &&
@@ -1057,6 +1156,10 @@ auto acknowledge_ptrace_stop(Task& tracee, Task& tracer) -> bool {
 }
 
 auto attach_tracer(Task& tracee, Task& tracer) -> bool {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
+#endif
+
     if (&tracee == &tracer) {
         return false;
     }
@@ -1091,6 +1194,10 @@ auto attach_tracer(Task& tracee, Task& tracer) -> bool {
 }
 
 void detach_tracer(Task& tracee) {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
+#endif
+
     uint64_t const FLAGS = g_lifecycle_lock.lock_irqsave();
     Task* const TRACER = tracee.child_tracer;
     bool const TRACER_REF = take_lifetime_ref(TRACER);
@@ -1115,6 +1222,10 @@ auto private_reaper_matches(const Task& init, const Task& child, const ker::mod:
 
 template <typename Selected, typename BeforeDelivery>
 void prepare_process_exit_impl(Task& process, Selected&& selected, BeforeDelivery&& before_delivery) {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
+#endif
+
     // A process may itself be blocked in waitpid when group exit wins.  Retire
     // its intrusive registration/claim before transferring the queue it was
     // observing.
@@ -1276,6 +1387,10 @@ void selftest_prepare_exit_reaper_cutover(Task& process, void (*hook)(Task&, Tas
 #endif
 
 void cancel_wait(Task& waiter) {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
+#endif
+
     WakeSelection wake{};
     Task* owner = nullptr;
     uint64_t const FLAGS = g_lifecycle_lock.lock_irqsave();
@@ -1313,6 +1428,9 @@ auto claim_locked(Task& owner, Claim& claim, Selector selector, int32_t options,
             return ProbeResult::WOULD_BLOCK;
         }
         EVENT->claimed_by = &claim;
+#ifdef WOS_SELFTEST
+        selftest_edge_add(selftest_lifecycle_edges.event_claims);
+#endif
         EVENT->claim_cookie = g_claim_cookie.fetch_add(1, std::memory_order_relaxed);
         publish_subject_claim_locked(*EVENT);
         claim.event = EVENT;
@@ -1391,6 +1509,10 @@ auto claim_or_register(Task& owner, Task& waiter, Selector selector, int32_t opt
 }
 
 void cancel_claim(Claim& claim) {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
+#endif
+
     WakeSelection wake{};
     uint64_t const FLAGS = g_lifecycle_lock.lock_irqsave();
     ChildEvent* const EVENT = claim.event;
@@ -1406,6 +1528,10 @@ void cancel_claim(Claim& claim) {
 }
 
 void release_claim(Claim& claim, const ClaimedEvent& claimed) {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
+#endif
+
     WakeSelection wake{};
     uint64_t const FLAGS = g_lifecycle_lock.lock_irqsave();
     // The copied token may outlive event removal and Task reclamation. Only
@@ -1424,6 +1550,10 @@ void release_claim(Claim& claim, const ClaimedEvent& claimed) {
 }
 
 auto commit_claim(Task& owner, Claim& claim, const ClaimedEvent& claimed, bool keep_event) -> bool {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
+#endif
+
     WakeSelection wake{};
     bool reaped = false;
     uint64_t const FLAGS = g_lifecycle_lock.lock_irqsave();
@@ -1482,9 +1612,18 @@ auto commit_claim(Task& owner, Claim& claim, const ClaimedEvent& claimed, bool k
     return true;
 }
 
-void release_claim(Task& waiter, const ClaimedEvent& claimed) { release_claim(waiter.child_claim, claimed); }
+void release_claim(Task& waiter, const ClaimedEvent& claimed) {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
+#endif
+    release_claim(waiter.child_claim, claimed);
+}
 
 auto commit_claim(Task& owner, Task& waiter, const ClaimedEvent& claimed, bool keep_event) -> bool {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
+#endif
+
     return commit_claim(owner, waiter.child_claim, claimed, keep_event);
 }
 
@@ -2458,6 +2597,71 @@ auto selftest_parent_exit_discards_without_reaper() -> bool {
     prepare_process_exit(parent);
     return fixture_is_unlinked(child) && diagnostics(parent).owned_event_count == 0 && parent.child_list_head == nullptr &&
            parent.ref_count.load(std::memory_order_acquire) == 1 && child.ref_count.load(std::memory_order_acquire) == 1;
+}
+#endif
+
+#ifdef WOS_SELFTEST
+auto selftest_lifecycle_census() -> SelftestLifecycleCensus {
+    auto const selftest_before = selftest_child_epoch.snapshot();
+    uint64_t const FLAGS = g_lifecycle_lock.observe_lock_irqsave();
+    auto out = selftest_lifecycle_edges;
+    out.complete = true;
+    g_lifecycle_lock.observe_unlock_irqrestore(FLAGS);
+    out.stamp = selftest_child_epoch.snapshot();
+    out.complete = out.complete && ker::mod::mm::lifecycle_census::unchanged(selftest_before, out.stamp);
+    return out;
+}
+auto selftest_owner_lifecycle_census(Task& owner) -> SelftestOwnerLifecycleCensus {
+    auto const selftest_before = selftest_child_epoch.snapshot();
+    SelftestOwnerLifecycleCensus out{.complete = true};
+    uint64_t const FLAGS = g_lifecycle_lock.observe_lock_irqsave();
+    for (auto* child = owner.child_list_head; child != nullptr; child = child->child_sibling_next) {
+        if (out.children == 4096) {
+            out.complete = false;
+            break;
+        }
+        ++out.children;
+        auto const state = child->child_membership_state.load(std::memory_order_relaxed);
+        if (state == ChildMembershipState::PUBLISHING)
+            ++out.publishing_children;
+        else if (state == ChildMembershipState::LIVE)
+            ++out.live_children;
+        else if (state == ChildMembershipState::ZOMBIE)
+            ++out.zombie_children;
+        else
+            out.complete = false;  // Linked but unlinked state must not qualify.
+    }
+    for (auto* tracee = owner.child_tracee_head; tracee != nullptr; tracee = tracee->child_tracee_next) {
+        if (out.tracees == 4096) {
+            out.complete = false;
+            break;
+        }
+        ++out.tracees;
+    }
+    for (auto* event = owner.child_event_head; event != nullptr; event = event->next) {
+        if (out.events == 4096) {
+            out.complete = false;
+            break;
+        }
+        ++out.events;
+        if (event->claimed_by != nullptr) ++out.claimed_events;
+    }
+    for (auto* waiter = owner.child_waiter_head; waiter != nullptr; waiter = waiter->next) {
+        if (out.waiters == 4096) {
+            out.complete = false;
+            break;
+        }
+        ++out.waiters;
+        if (waiter->notified) ++out.notified_waiters;
+    }
+    out.parent_link = owner.child_parent != nullptr;
+    out.tracer_link = owner.child_tracer != nullptr;
+    out.own_wait_registration = owner.child_wait_registration.registered;
+    out.own_claim = owner.child_claim.event != nullptr;
+    g_lifecycle_lock.observe_unlock_irqrestore(FLAGS);
+    out.stamp = selftest_child_epoch.snapshot();
+    out.complete = out.complete && ker::mod::mm::lifecycle_census::unchanged(selftest_before, out.stamp);
+    return out;
 }
 #endif
 

@@ -1,5 +1,9 @@
 // Init wrapper functions for the kernel initialization dependency system
 // Each wrapper calls the actual init function from the appropriate module
+#ifdef WOS_SELFTEST
+#include <test/compartment_lifecycle_runtime.hpp>
+#endif
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -350,6 +354,11 @@ void sched_init() {
 
     mod::sched::setup_queues();
 #ifdef WOS_SELFTEST
+    bool const LIFECYCLE = cmdline_has_token(get_kernel_cmdline(), "--selftest-compartment-lifecycle");
+    if (LIFECYCLE &&
+        (cmdline_has_token(get_kernel_cmdline(), "--selftest") || cmdline_has_token(get_kernel_cmdline(), "--selftest-file-mapping")))
+        mod::dbg::panic_handler("conflicting scheduled lifecycle diagnostic boot modes");
+    if (LIFECYCLE) ker::test::lifecycle60::enable_boot_capture(true);
     if (cmdline_has_token(get_kernel_cmdline(), "--selftest")) {
         mod::smt::park_secondary_cpus_for_selftest();
         if (cmdline_has_token(get_kernel_cmdline(), "--selftest-stack-canary-fail")) {
@@ -396,6 +405,11 @@ void kernel_start() {
 #ifdef WOS_SELFTEST
     if (cmdline_has_token(get_kernel_cmdline(), "--selftest-file-mapping") && !ker::test::start_file_mapping_runtime_selftest())
         mod::dbg::panic_handler("unable to post scheduled native File mapping selftest");
+#endif
+#ifdef WOS_SELFTEST
+    if (cmdline_has_token(get_kernel_cmdline(), "--selftest-compartment-lifecycle") &&
+        !ker::test::lifecycle60::start_scheduled_controller())
+        mod::dbg::panic_handler("unable to post scheduled compartment lifecycle controller");
 #endif
     mod::sched::start_scheduler();
 }

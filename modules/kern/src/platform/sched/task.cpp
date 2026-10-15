@@ -1521,7 +1521,12 @@ Task::Task(const char* name, uint64_t elf_start, size_t elf_size, uint64_t kerne
     static_cast<void>(initialize_process_image(reinterpret_cast<const uint8_t*>(elf_start), elf_size));
 }
 
-auto Task::initialize_unpublished_process_skeleton(Task& owner, const char* process_name) -> int {
+auto Task::initialize_unpublished_process_skeleton(Task& owner, const char* process_name
+#ifdef WOS_SELFTEST
+                                                   ,
+                                                   [[maybe_unused]] ker::syscall::process::NativeConstructionToken fault_token
+#endif
+                                                   ) -> int {
     if (owner.owned_unpublished_process.load(std::memory_order_acquire) != this || ref_count.load(std::memory_order_acquire) != 2 ||
         scheduler_published.load(std::memory_order_acquire) || state.load(std::memory_order_acquire) != TaskState::ACTIVE || is_thread ||
         has_run || type != TaskType::DAEMON || name != nullptr || pagemap != nullptr || thread != nullptr || entry != 0 || pid != 0 ||
@@ -1540,7 +1545,8 @@ auto Task::initialize_unpublished_process_skeleton(Task& owner, const char* proc
     while (length < EXE_PATH_MAX && process_name[length] != '\0') ++length;
     if (length == EXE_PATH_MAX) return -ENAMETOOLONG;
 #ifdef WOS_SELFTEST
-    if (ker::syscall::process::exec_selftest_take_native_construction_fault(ker::syscall::process::NativeConstructionFault::NAME))
+    if (ker::syscall::process::exec_selftest_take_native_construction_fault(ker::syscall::process::NativeConstructionFault::NAME,
+                                                                            fault_token))
         return -ENOMEM;
 #endif
     auto* copy = new (std::nothrow) char[length + 1];
@@ -1548,7 +1554,8 @@ auto Task::initialize_unpublished_process_skeleton(Task& owner, const char* proc
     name = copy;
     std::memcpy(copy, process_name, length + 1);
 #ifdef WOS_SELFTEST
-    if (ker::syscall::process::exec_selftest_take_native_construction_fault(ker::syscall::process::NativeConstructionFault::PAGEMAP))
+    if (ker::syscall::process::exec_selftest_take_native_construction_fault(ker::syscall::process::NativeConstructionFault::PAGEMAP,
+                                                                            fault_token))
         return -ENOMEM;
 #endif
     pagemap = mm::virt::create_pagemap_may_fail();

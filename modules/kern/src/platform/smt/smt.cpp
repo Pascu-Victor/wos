@@ -1,5 +1,9 @@
 #include "smt.hpp"
 
+#ifdef WOS_SELFTEST
+#include <test/compartment_lifecycle_runtime.hpp>
+#endif
+
 #include <bits/ssize_t.h>
 #include <extern/limine.h>
 
@@ -740,7 +744,12 @@ void create_init_tasks(boot::HandoverModules& mod_struct) {
         dbg::log("  userStackVirt=0x%x, currentVirtOffset=0x%x, argv0=0x%x", user_stack_virt, current_virt_offset, argv0);
 #endif
 
+#ifdef WOS_SELFTEST
+        bool const POSTED = sched::post_task_balanced(new_task);
+        if (POSTED) ker::test::lifecycle60::original_init_posted(*new_task);
+#else
         sched::post_task_balanced(new_task);
+#endif
     }
 #ifdef TASK_DEBUG
     dbg::log("Posted init task(s)");

@@ -1,4 +1,7 @@
 #include "ntp.hpp"
+#ifdef WOS_SELFTEST
+#include <test/compartment_lifecycle_runtime.hpp>
+#endif
 
 #include <bits/ssize_t.h>
 
@@ -211,6 +214,9 @@ void ntp_sync_thread() {
                 log::info("sync successful on attempt %d", attempt + 1);
                 // Subsequent measurements replace the remaining slew target;
                 // only the first accepted correction may step the wall clock.
+#ifdef WOS_SELFTEST
+                ker::test::lifecycle60::ntp_boot_periodic();
+#endif
                 for (;;) {
                     ker::mod::sched::kern_sleep_us(60000000);
                     if (!try_sync(SERVER_IP)) log::debug("periodic sync failed; retaining disciplined wall clock");
@@ -222,6 +228,9 @@ void ntp_sync_thread() {
     }
 
     log::warn("all sync attempts exhausted; using RTC wall clock only");
+#ifdef WOS_SELFTEST
+    ker::test::lifecycle60::ntp_boot_exiting();
+#endif
     terminate_ntp_thread();
 }
 
@@ -232,13 +241,35 @@ void ntp_sync_thread() {
 // ---------------------------------------------------------------------------
 
 void init() {
+#ifdef WOS_SELFTEST
+    ker::test::lifecycle60::ntp_boot_initializing();
+#endif
     auto* task = ker::mod::sched::task::Task::create_kernel_thread("ntp_sync", ntp_sync_thread);
     if (task == nullptr) {
         log::error("failed to create sync thread (OOM)");
+#ifdef WOS_SELFTEST
+        ker::test::lifecycle60::ntp_boot_creation_failed();
+#endif
         return;
     }
+#ifdef WOS_SELFTEST
+    uint64_t const PUBLISHED_PID = task->pid;  // Caller still owns the unpublished Task.
+    ker::test::lifecycle60::ntp_boot_will_post(*task);
+    bool const POSTED = ker::mod::sched::post_task_balanced(task);
+    ker::test::lifecycle60::ntp_boot_posted(POSTED);
+    if (!POSTED) {
+        // Failed publication leaves this exact private Task with its caller.
+        ker::mod::sched::task::destroy_unpublished_user_thread(task);
+        return;
+    }
+#else
     ker::mod::sched::post_task_balanced(task);
+#endif
+#ifdef WOS_SELFTEST
+    log::info("sync thread started (PID %d)", static_cast<int>(PUBLISHED_PID));
+#else
     log::info("sync thread started (PID %d)", static_cast<int>(task->pid));
+#endif
 }
 
 }  // namespace ker::mod::ntp

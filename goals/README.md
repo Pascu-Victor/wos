@@ -37,7 +37,7 @@ an explicit pause/block rule.
 | 36 | [VM checkpoints and live migration](36-wki-vm-checkpoint-migration.md) | dirty tracking, device quiescence, state transfer, ownership | 33, 35, 38, 40 on VM/MM/wire state | Not started |
 | 37 | [Replicated VM volumes](37-wki-replicated-vm-volumes.md) | durable quorum log, block leases, snapshots, recovery | 20, 25, 30 on block transport; 35–38 on WKI | Not started |
 | 38 | [Disaggregated guest memory](38-wki-disaggregated-guest-memory.md) | remote RAM providers, EPT/NPT cache, page ownership | 25 on transport; 33, 36, 40 on MM/EPT/NPT | Not started |
-| 39 | [Isolated service compartments](39-isolated-service-compartments.md) | mount/PID/IPC namespaces, lifecycle, authority, launcher | 19 on credentials; 26 on VFS policy | In progress |
+| 39 | [Isolated service compartments](39-isolated-service-compartments.md) | mount/PID/IPC namespaces, lifecycle, authority, launcher | 19 on credentials; 26 on VFS policy | Complete |
 | 40 | [NUMA placement and safe large pages](40-numa-memory-locality.md) | SRAT/SLIT, CPU domains, page policy, compound lifetime | 33, 36, 38 on VM/MM/Task state | Not started |
 | 41 | [Physical GPU platform](41-physical-gpu-platform.md) | PCI resources/reset, firmware, device mmap, AMD-Vi, IRQ remap | 20 on DMA/IOMMU; 40 on VM/page lifetime | Not started |
 | 42 | [DRM-compatible GPU kernel core](42-drm-gpu-kernel-core.md) | DRM uAPI, GEM/GPUVM, dma-buf, syncobj, scheduler, KMS | 21, 22, 41 on MM/security/device state | Not started |
@@ -56,10 +56,19 @@ production rollout; see [the qualification record](../docs/wki_secure_rdma.md).
 ## New platform goals: 33–40
 
 Goal 28 is paused and incomplete at its tested wire-codec checkpoint
-`70bc3fe7`. At the user's request, current work selects Goal 39. Its native
-isolation, launcher and runtime criteria remain outstanding; the local progress
-ledger records source reconnaissance and qualification. The user cleared the previous goal-manager record on 2026-10-08,
-and Goal 39 is now the active Goal Mode objective. Private native IPC and mount
+`70bc3fe7`.
+
+Goal 39 is complete within its documented native-compartment boundaries. Its
+[accepted outcome](39-isolated-service-compartments.md#outcome-and-scale)
+records the ten-criterion evidence, exact source/runtime cohorts and limitations,
+including simultaneous two-hour services with an operational Host and the full
+lifecycle/fault campaign with covered ownership baselines. Unsupported remote
+namespace transport and interfaces remain explicit refusals; this is not a
+Linux-container compatibility or independent network-stack claim.
+
+The user selected Goal 39 after clearing the previous goal-manager record on
+2026-10-08. The following native API observations are historical intermediate
+checkpoints, not the current outstanding-work list. Private native IPC and mount
 ownership, Task native lookup/consumption and subject mount/unmount/repeatable
 pivot, retained File listings and subject procfs mount observations are qualified
 at the kernel API checkpoint. Native PID owner/local-name inheritance, exact
@@ -78,10 +87,9 @@ exact admission and closure/route interleavings now pass native production tests
 Scoped ptrace now preserves private selectors, retained parents, local outputs
 and ordinary/fatal ownership (79,819 assertions, zero failures,
 1,310 cases; all 58 compartment cases). Disposable test images were audited
-and pruned on both failed and passing runs; Goal39 remains active.
-Public compartment admission, remaining procfs/positive PID/resource, namespace-
-init lifecycle, complete WKI/network enforcement and full service/runtime
-criteria remain incomplete. Goal39 remains active with all ten criteria required.
+and pruned on both failed and passing runs. Subsequent public admission,
+namespace-init teardown and full service/lifecycle qualification are recorded in
+the accepted Goal39 outcome; the earlier checkpoint limits remain historical.
 
 The [local virtualization manual corpus](../docs/virtualization-manuals.md)
 provides pinned source downloads, Docling PDF text and offline search. Check its
@@ -145,11 +153,11 @@ current repository instructions.
 
 ## Status authority
 
-The portfolio lists unfinished goals only. Its `Status` column is the
-canonical selection filter. Completed and superseded contracts were removed
-on 2026-10-05; their historical summaries below are not active objectives.
-Select a row marked `Not started` or `In progress` and verify its premises
-against the current source before starting work.
+The portfolio's `Status` column is the canonical selection filter. Rows marked
+`Complete` are retained references, not active objectives. Earlier completed and
+superseded contracts were removed on 2026-10-05; their historical summaries below
+are not active objectives. Select a row marked `Not started` or `In progress`
+and verify its premises against the current source before starting work.
 
 ## How to use a goal
 

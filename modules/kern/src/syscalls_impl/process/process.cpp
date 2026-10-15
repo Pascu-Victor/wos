@@ -1,4 +1,6 @@
-#include "process.hpp"
+#ifdef WOS_SELFTEST
+#include <test/compartment_lifecycle_runtime.hpp>
+#endif
 
 #include <bits/posix/posix_string.h>
 
@@ -46,6 +48,7 @@
 #include "platform/sys/context_switch.hpp"
 #include "platform/sys/signal.hpp"
 #include "platform/sys/usercopy.hpp"
+#include "process.hpp"
 #include "release.hpp"
 #include "syscalls_impl/process/child_events.hpp"
 #include "syscalls_impl/process/exec.hpp"
@@ -739,6 +742,10 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         return static_cast<uint64_t>(-ESHUTDOWN);
     }
 
+#ifdef WOS_SELFTEST
+    ker::test::lifecycle60::before_selected_service_fork(*parent);
+#endif
+
     LocalProcStage FORK_STAGE = begin_local_proc_stage(parent, perf::WkiPerfLocalProcOp::FORK, 0, WOS_PERF_CALLSITE());
     auto finish_fork = [&](int64_t result, uint64_t bytes = 0, const char* failure_stage = nullptr) -> uint64_t {
         int32_t const STATUS = result < 0 ? static_cast<int32_t>(result) : 0;
@@ -1086,7 +1093,13 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
 
     // --- Enqueue child ---
     bool const PUBLICATION_REF = child->try_acquire_lifetime_ref();
+#ifdef WOS_SELFTEST
+    if (PUBLICATION_REF) ker::test::lifecycle60::fork_will_publish(*parent, *child);
+#endif
     if (!PUBLICATION_REF || !process_reservation.attach(*child) || !sched::post_task_balanced(child)) {
+#ifdef WOS_SELFTEST
+        ker::test::lifecycle60::fork_publication_failed(*parent, *child);
+#endif
         if (PUBLICATION_REF) child->release();
         child_events::abort_publication(*child);
         // Undo FD refcount increments
@@ -1110,6 +1123,9 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         // a child that is already runnable (or already exited/reaped).
         process_log::error("fork: lifecycle commit completed concurrently for published child PID %x", child->pid);
     }
+#ifdef WOS_SELFTEST
+    ker::test::lifecycle60::successful_fork(*parent, *child);
+#endif
     record_fork_child(FORK_STAGE, child->pid, child->load_cpu(), WOS_PERF_CALLSITE());
     uint64_t const CHILD_CPU = child->load_cpu();
     child->release();

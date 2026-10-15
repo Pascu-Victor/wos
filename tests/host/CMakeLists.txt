@@ -1982,3 +1982,17 @@ wos_add_unit_test(pid_namespace_test
 wos_add_unit_test(vfs_advisory_client_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vfs_advisory_client_test.cpp
 )
+
+# Synthetic wire codec only: no target binary, VM or kernel census execution.
+add_test(
+    NAME compartment_lifecycle_codec_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/compartment_lifecycle_codec_test.py
+)
+set_tests_properties(compartment_lifecycle_codec_test PROPERTIES LABELS "host;unit" TIMEOUT 120)
+
+# Actual service CPU/ownership bodies with explicit sequential Host primitives.
+add_test(
+    NAME service_owner_epoch_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/service_owner_epoch_runtime_test.py
+)
+set_tests_properties(service_owner_epoch_runtime_test PROPERTIES LABELS "host;unit" TIMEOUT 120)

@@ -250,6 +250,10 @@ class FileMappingIndex {
     [[nodiscard]] auto matches_pin_locked(paging::PageTable* root, uint64_t root_incarnation, uint64_t address,
                                           const FileMappingBinding* binding) const noexcept -> bool;
     [[nodiscard]] auto count_root_locked(paging::PageTable* root, uint64_t root_incarnation, size_t& count) const noexcept -> bool;
+#ifdef WOS_SELFTEST
+    // Same real user_mapping_pin_lock as attach/detach; refusal preserves out.
+    [[nodiscard]] auto selftest_count_all_locked(uint64_t& empty_count) const noexcept -> bool;
+#endif
     // Empty owned required. Retain the first overlapping binding as SNAPSHOT;
     // exact means one equal interval, or no overlap (owned remains null).
     // Refusal changes neither output and acquires no owner. Drop success's

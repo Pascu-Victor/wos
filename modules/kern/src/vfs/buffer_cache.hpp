@@ -85,6 +85,12 @@ static_assert((BUFFER_CACHE_HASH_BUCKETS & (BUFFER_CACHE_HASH_BUCKETS - 1)) == 0
 
 // Initialize the buffer cache subsystem. Call once at kernel init.
 void buffer_cache_init();
+#ifdef WOS_SELFTEST
+enum class SelftestWritebackPreparation : uint8_t { WAIT, READY, FAILED };
+// Ordinary context only: prestart the genuine permanent worker before baseline.
+// No dummy work, extra Task owner, backend under guard, or Normal API change.
+auto selftest_prepare_dirty_writeback_worker() noexcept -> SelftestWritebackPreparation;
+#endif
 
 // Read a block from the cache (or disk if not cached).
 // Returns a referenced BufHead* with valid data. Caller must call brelse() when done.

@@ -1,5 +1,9 @@
 #pragma once
 
+#ifdef WOS_SELFTEST
+#include <platform/mm/lifecycle_census.hpp>
+#endif
+
 #include <abi/service_resource.hpp>
 #include <atomic>
 #include <platform/sched/service_resource_model.hpp>
@@ -9,6 +13,10 @@ struct Task;
 }
 
 namespace ker::mod::sched::resource {
+#ifdef WOS_SELFTEST
+struct SelftestServiceCensus;
+[[nodiscard]] auto selftest_service_census() -> SelftestServiceCensus;
+#endif
 class RemoteServiceAccounting;
 class ServiceReportTarget;
 struct ServiceMember {
@@ -44,6 +52,11 @@ class ServiceResourceMerge {
 };
 
 void mark_service_remote_execution(task::Task& process);
+#ifdef WOS_SELFTEST
+[[nodiscard]] auto selftest_exact_selected_service(task::Task&, const char* expected) noexcept -> bool;
+[[nodiscard]] auto selftest_exact_unselected_service_slot(task::Task&, uint64_t slot, const char* expected) noexcept -> bool;
+[[nodiscard]] auto selftest_exact_service_child(task::Task&, task::Task&, const char* expected) noexcept -> bool;
+#endif
 // Read-only admission, before exporting descriptors or publishing a stream.
 [[nodiscard]] auto service_remote_admission(task::Task& process) -> int;
 
@@ -94,6 +107,9 @@ class ServiceReportTarget {
     void cancel(bool incomplete = true);
 
    private:
+#ifdef WOS_SELFTEST
+    friend auto selftest_service_census() -> SelftestServiceCensus;
+#endif
     friend class RemoteServiceAccounting;
     friend auto service_read_for_subject(task::Task* caller, uint64_t slot, uint64_t address, uint64_t version) -> uint64_t;
     auto list_head_locked() -> ServiceReportTarget*&;
@@ -126,4 +142,15 @@ auto selftest_remote_service_accounting_lifecycle() -> bool;
 auto selftest_service_report_targets() -> bool;
 auto selftest_service_observation_merge() -> bool;
 #endif
+#ifdef WOS_SELFTEST
+struct SelftestServiceCensus {
+    ker::mod::mm::lifecycle_census::Stamp stamp{};
+    uint64_t configured_slots{}, local_members{}, local_reports{}, unfinished_local_reports{};
+    uint64_t remote_objects{}, remote_references{}, remote_members{}, remote_reports{}, remote_creations{};
+    bool complete{};
+    auto operator==(const SelftestServiceCensus&) const -> bool = default;
+};
+[[nodiscard]] auto selftest_service_census() -> SelftestServiceCensus;
+#endif
+
 }  // namespace ker::mod::sched::resource

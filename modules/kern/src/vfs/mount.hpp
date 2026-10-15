@@ -1,5 +1,9 @@
 #pragma once
 
+#ifdef WOS_SELFTEST
+#include <platform/mm/lifecycle_census.hpp>
+#endif
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -228,6 +232,20 @@ auto mount_point_open_file_count_for_test(const MountPoint* mount) -> uint32_t;
 void mount_lookup_cache_reset_for_test();
 auto mount_lookup_cache_hits_for_test() -> uint64_t;
 auto mount_lookup_calls_for_test() -> uint64_t;
+#endif
+
+#ifdef WOS_SELFTEST
+struct SelftestMountCensus {
+    ker::mod::mm::lifecycle_census::Stamp stamp{};
+    uint64_t initializing{}, initializing_private{}, published{}, published_private{}, retiring{}, retiring_private{};
+    uint64_t refs{}, open_files{}, native_backing_pins{}, covered_directory_owners{};
+    uint64_t mount_storage{}, preparation_storage{}, preparing_operations{}, generation{}, pivot_epoch{};
+    bool complete{};
+    auto operator==(const SelftestMountCensus&) const -> bool = default;
+};
+// All namespaces. No MountRef/File/namespace acquisition; no callbacks. Not a
+// global transaction with the independent storage-tail atomic observations.
+[[nodiscard]] auto selftest_mount_census() -> SelftestMountCensus;
 #endif
 
 }  // namespace ker::vfs

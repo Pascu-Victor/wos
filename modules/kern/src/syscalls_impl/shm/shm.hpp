@@ -1,5 +1,9 @@
 #pragma once
 
+#ifdef WOS_SELFTEST
+#include <platform/mm/lifecycle_census.hpp>
+#endif
+
 #include <cstdint>
 
 namespace ker::mod::sched::task {
@@ -34,6 +38,17 @@ auto shm_selftest_visible_pid_foreign_scopes() -> bool;
 auto shm_selftest_visible_pid_scope_reuse() -> bool;
 auto shm_selftest_visible_pid_fork_retirement() -> bool;
 auto shm_selftest_visible_pid_denial_guards() -> bool;
+#endif
+
+#ifdef WOS_SELFTEST
+struct SelftestShmCensus {
+    ker::mod::mm::lifecycle_census::Stamp stamp{};
+    uint64_t active_segments{}, marked_segments{}, backing_pages{}, segment_attachment_pins{};
+    uint64_t active_attachments{}, publishing_attachments{}, private_segments{}, private_pages{};
+    bool complete{};
+    auto operator==(const SelftestShmCensus&) const -> bool = default;
+};
+[[nodiscard]] auto selftest_shm_census() -> SelftestShmCensus;
 #endif
 
 }  // namespace ker::syscall::shm

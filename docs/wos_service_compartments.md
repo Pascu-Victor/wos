@@ -1,16 +1,21 @@
 # WOS service compartment design
 
-Checkpoint59 adds canonical writable sharing for ordinary TMPFS-backed
-`MAP_SHARED` mappings. Normal and isolated diagnostic builds, formatting and
-18 selected Host checks pass. The first public writable probe passes on the
-earlier checkpoint59 build. Fresh Native92 and current-source public run03 pass
-after retained-requester cache fixes. Full reference
-drain, two-hour simultaneous services and 1,000 lifecycle/failure cycles remain
-unqualified. The dated checkpoint sections below retain their original scope.
+The public creation syscall and `wos-compartment` launcher install bounded
+private mount, PID and IPC views with explicit descriptor and mapping grants.
+The implementation includes requester-aware process operations, deferred
+namespace-init teardown, pre-effect remote refusals and canonical readonly or
+writable TMPFS shared mappings. Unsupported operations fail explicitly.
 
-Goal39 is in progress. Profile preparation, private native SysV IPC namespace
-ownership/lookup, private native mount-table ownership, Task native lookup and
-subject mount administration are implemented. Checkpoint 32 added the experimental
+Current qualification is recorded in the
+[Goal39 outcome](../goals/39-isolated-service-compartments.md#outcome-and-scale).
+The checkpoint records below retain their original source cohorts, results and
+then-open work; they are not the current integration checklist.
+
+## Historical checkpoint overview
+
+Earlier checkpoints implemented profile preparation, private native SysV IPC
+namespace ownership/lookup, private native mount tables, Task native lookup and
+subject mount administration. Checkpoint 32 added the experimental
 versioned public creation syscall and `wos-compartment` launcher. Checkpoint 33
 qualifies two short, sequential nonroot service trees through the public spec
 and actual launcher, including local fork/wait and explicit result capabilities.
@@ -92,12 +97,12 @@ assertions with zero failures, including nine new root/key fixtures, then powers
 off naturally. All four disposable disks are pruned; the independent terminal
 audit passes. Canonical shared-file coherence and complete owner drains remain
 open, along with the two-hour services and full lifecycle/failure qualification.
-Exact-owner ambient network admission is implemented;
-complete PID, lifecycle and WKI qualification remains incomplete. Independent
-service isolation and all ten goal criteria remain unqualified. Goal28 remains
-incomplete at its committed wire-codec checkpoint while this work proceeds.
+Those checkpoints did not yet qualify the full service boundary. The latest
+Goal39 outcome records the current acceptance evidence.
+Goal28 remains incomplete at its committed wire-codec checkpoint; its placement,
+CPU inheritance/ceilings and worker/WKI priority work are separate from Goal39.
 
-## Current policy preparation
+## Admission policy and publication
 
 `platform/security/compartment_policy.hpp` prepares a private `Profile` from
 one admitted parent profile and an explicit request. Its credentials use the
@@ -123,23 +128,25 @@ resources unsupported by the current kernel.
 
 Network policy defaults to `DENIED`. `SHARED_HOST` requires that the admitted
 parent already carries that permission. It describes shared host networking;
-it provides no independent network stack. A future installer must derive the
-parent profile from retained kernel authority, never from user-supplied parent
-fields. Native socket creation and global network controls now enforce the
-installed PID owner's network policy even when an inherited credential has
-network administration authority. Complete creator installation and other
-device/global consumers remain integration work. Explicit inherited
-socket descriptors remain capabilities and must be reported by the launcher.
+it provides no independent network stack. Native creation derives the parent
+profile from retained kernel authority, never from user-supplied parent fields.
+Socket creation and global network controls enforce the installed PID owner's
+policy even when an inherited credential has network administration authority.
+Unsupported private device/global operations refuse through their subject-aware
+admission gates. Explicit inherited socket descriptors remain capabilities and
+are reported by the launcher.
 
 The helper allocates nothing, takes no lock and calls no Task, File, VFS,
 usercopy, clock, logger, scheduler or network operation. Failed preparation
 leaves the output and parent unchanged, including when output aliases parent.
-It neither installs credentials nor revokes descriptors or mappings. A live
-installer must retain and revalidate the exact credential, resource and namespace
-observations before publication. Existing resource consumption, process/service
-membership and aggregate budgets cannot be reset by entering a compartment.
+It neither installs credentials nor revokes descriptors or mappings. The native
+creation path captures retained creator policy, prepares the unpublished image,
+and revalidates credential, resource and namespace observations before publication.
+Public CREATE admits only the exact canonical Host views; it provides no integer
+join interface. Existing resource consumption, process/service membership and
+aggregate budgets cannot be reset by entering a compartment.
 
-## Native integration requirements
+## Installed namespace and capability contract
 
 The mount table now partitions native rows by exact retained namespace, while
 table generations, pivot publication and storage remain globally serialized.
@@ -147,18 +154,19 @@ Retained native root/cwd views already enforce object identity and read-only/
 nosuid restrictions. Task ownership, native component lookup and retained lookup
 consumption and mount administration now carry the exact subject mount namespace.
 Root/compatibility helpers and procfs PID/link consumers have native coverage;
-scheduled public-service qualification remains required. Retained File listings and
-subject mount observations now select their exact namespace. Shared backend
-lifetime must remain distinct from visible mount attachment lifetime before
-cloning existing mount attachments can be supported.
+public fixtures exercise scheduled private roots and retained capabilities.
+Retained File listings and subject mount observations select their exact namespace.
+Backend lifetime is distinct from visible mount attachment lifetime. Cloning
+existing mount attachments is outside the supported public creation contract.
 
 Kernel Task IDs remain internal. Public PID/TID, parent, session and process
-group values need one requester-aware translation policy. Safe lookup retains
-the exact Task before signal, ptrace or wait effects. Native child publication,
-exit claims, tracer ownership, thread-owner references and namespace-init death
-must drain without stale PID authority or lifetime cycles. Fork, clone, thread
-creation, spawn and every exec preparation path must preserve the subject's
-namespace before scheduler visibility. Worker context cannot select its view.
+group values use requester-aware namespace translation. Safe lookup retains the
+exact Task before signal, ptrace or wait effects. Native child publication,
+exit claims, tracer ownership and thread-owner references retain exact identities.
+Namespace-init death closes admission and requests descendant exits; deferred
+retirement waits for retained owners to drain. Fork, clone, thread creation,
+spawn and exec preparation preserve the subject's namespace before scheduler
+visibility. Worker context cannot select its view.
 
 SysV shared-memory storage remains bounded and shared, while public key and ID
 lookup now selects the subject process's retained IPC namespace before access
@@ -172,18 +180,26 @@ implementation was found in the inspected sources. Unsupported interfaces must
 retain explicit failure; this goal cannot qualify a silently global fallback.
 
 WKI rich/direct compute and Task FD export now reject restricted native namespace
-contexts before new remote effects. Remaining routing/VFS export and global
-consumers require integration until a negotiated enforceable compartment
-contract exists. Automatic placement stays local; explicit unsupported placement
-fails. Captured credentials/root/resource grants cannot silently substitute the
-worker's host namespace. Global host administration also needs explicit
-compartment gates and a reviewed allowed-authority policy.
+contexts before new remote effects. Private routing/forwarding configuration
+and unsupported VFS/FD exports likewise refuse before remote effects; no private
+remote-namespace transport is admitted. Automatic placement stays local and
+explicit unsupported placement fails. Captured credentials/root/resource grants
+cannot substitute the worker's Host namespace. Host-wide administration requires
+the subject's exact canonical Host views as well as its ordinary authority.
 
 Final namespace/view release can close backend Files and block. Publication,
 path, mount, scheduler, lifecycle, IPC and resource locks cannot span allocation,
 usercopy faults, network waits, final destruction or backend close. Exact owners
 must remain retained across blocking work. Preserve the root host/init path
 through rollback and drain existing compartments before removing their state.
+
+## Historical implementation and evidence record
+
+The following sections record each checkpoint's implementation and validation
+at that time. This includes the early undated namespace, procfs, lifecycle and
+WKI sections: their future-integration, disabled-public-creation and incomplete
+qualification statements describe the original checkpoint. The installed contract
+above and the latest Goal39 outcome govern current behavior and acceptance.
 
 ## Private native IPC ownership
 

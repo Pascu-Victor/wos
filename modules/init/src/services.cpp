@@ -125,6 +125,12 @@ struct SupervisorRuntime {
 };
 
 SupervisorRuntime runtime{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+#ifdef WOS_SELFTEST
+bool lifecycle_diagnostic_enabled{};
+bool lifecycle_before_read{};
+bool lifecycle_after_read{};
+void publish_status(uint64_t now_ms);
+#endif
 
 auto restore_init_wki_target() -> bool {
     for (uint8_t attempt = 0; attempt < 3; ++attempt) {
@@ -684,6 +690,69 @@ void child_setup_stdio(const ServiceSpec& service, const std::array<int, 2>& out
     }
 }
 
+#ifdef WOS_SELFTEST
+// No /proc inference or ambient service-name activation: the explicit root-owned
+// binary manifest must be installed by the admitted private qualification image.
+// Its File is closed before any baseline. Kernel evidence gates additionally
+// authenticate actual manifest/image bytes and the exact original init/service.
+auto lifecycle_manifest_enabled() -> bool {
+    int const FD = ::open("/etc/wos-lifecycle60-manifest.bin", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (FD < 0) return false;
+    struct stat status{};
+    std::array<uint64_t, 128> manifest{};
+    bool valid = ::fstat(FD, &status) == 0 && S_ISREG(status.st_mode) && status.st_uid == 0 && status.st_gid == 0 &&
+                 (status.st_mode & 07777) == 0444 && status.st_size == static_cast<off_t>(sizeof(manifest));
+    size_t total = 0;
+    while (valid && total != sizeof(manifest)) {
+        auto const amount = ::read(FD, reinterpret_cast<char*>(manifest.data()) + total, sizeof(manifest) - total);
+        if (amount < 0 && errno == EINTR) continue;
+        if (amount <= 0) {
+            valid = false;
+            break;
+        }
+        total += static_cast<size_t>(amount);
+    }
+    int const CLOSED = ::close(FD);
+    return valid && CLOSED == 0 && manifest[0] == 0x43394d414e494645ULL && manifest[1] == 1 && manifest[2] == 1024 && manifest[3] == 4 &&
+           manifest[4] != 0 && manifest[5] == 8 && manifest[6] == 24 && manifest[7] == 1000;
+}
+auto lifecycle_before_service_pipes(uint8_t service, uint32_t generation) -> bool {
+    if (!lifecycle_diagnostic_enabled || runtime.manifest.services.at(service).name.view() != "lifecycle-raw-pilot") return true;
+    auto const& spec = runtime.manifest.services.at(service);
+    auto const& slot = runtime.services.at(service);
+    if (lifecycle_before_read || generation != 1 || slot.ever_spawned || runtime.manifest.service_count != 2 ||
+        spec.type != ServiceType::DAEMON || spec.readiness != ReadinessKind::IMMEDIATE || spec.restart != RestartPolicy::NEVER ||
+        spec.dependency_count != 1 || spec.dependency_names[0].view() != "journald")
+        return false;
+    // Source census proves these two diagnostic calls are init's ONLY service
+    // READs. Status additionally makes kernel eligibility generation/phase exact.
+    publish_status(runtime.now_ms);
+    resource_abi::Snapshot observed{};
+    lifecycle_before_read = true;
+    return ker::process::service_resource_read(service, &observed) == 0;
+}
+void lifecycle_after_supervisor_cleanup() {
+    if (!lifecycle_diagnostic_enabled || !lifecycle_before_read || lifecycle_after_read || runtime.failed) return;
+    for (uint8_t service = 0; service < runtime.manifest.service_count; ++service) {
+        if (runtime.manifest.services.at(service).name.view() != "lifecycle-raw-pilot") continue;
+        auto const& slot = runtime.services.at(service);
+        auto const& model = runtime.model.services.at(service);
+        if (!slot.ever_spawned || slot.pid != -1 || slot.pgid != -1 || slot.exec_report_fd >= 0 || slot.output_fd >= 0 ||
+            slot.session_ack[PIPE_READ] >= 0 || slot.session_ack[PIPE_WRITE] >= 0 || slot.probe.socket_fd >= 0 || !slot.leader_reaped ||
+            !slot.exec_resolved || !slot.output_complete || !slot.quiescence_reported || slot.cleanup_only || slot.exit_pending ||
+            slot.last_wait_status != 0 || slot.generation != 1 || model.state != ServiceState::EXITED || model.completion_success ||
+            model.last_exit_kind != SupervisorExitKind::EXIT_CODE || model.last_detail != 0 || model.process_present ||
+            model.desired_running || !model.quiesced || model.spawn_result_pending || model.exec_result_pending ||
+            model.restart_scheduled || model.generation != 1 || model.spawn_attempts != 1)
+            return;
+        resource_abi::Snapshot observed{};
+        lifecycle_after_read = true;
+        if (ker::process::service_resource_read(service, &observed) != 0) runtime.failed = true;
+        return;
+    }
+}
+#endif
+
 auto spawn_service(uint8_t service, uint32_t generation, int32_t& failure, bool& fatal) -> bool {
     auto& slot = runtime.services.at(service);
     auto const& spec = runtime.manifest.services.at(service);
@@ -720,6 +789,13 @@ auto spawn_service(uint8_t service, uint32_t generation, int32_t& failure, bool&
     }
     environment.at(environment_count) = nullptr;
 
+#ifdef WOS_SELFTEST
+    if (!lifecycle_before_service_pipes(service, generation)) {
+        failure = EPROTO;
+        fatal = true;
+        return false;
+    }
+#endif
     std::array<int, 2> exec_pipe{-1, -1};
     if (!create_parent_read_pipe(exec_pipe)) {
         failure = errno;
@@ -1567,6 +1643,9 @@ auto start_service_supervisor() -> bool {
         return false;
     }
 
+#ifdef WOS_SELFTEST
+    lifecycle_diagnostic_enabled = lifecycle_manifest_enabled();
+#endif
     runtime.model_ready = true;
     init_log::info("init supervisor: loaded %u services from %s", static_cast<unsigned>(runtime.manifest.service_count),
                    SERVICE_MANIFEST_PATH);
@@ -1598,6 +1677,9 @@ void service_supervisor_tick() {
     drain_control_mailbox(NOW_MS);
     advance_model(NOW_MS);
     publish_status(NOW_MS);
+#ifdef WOS_SELFTEST
+    lifecycle_after_supervisor_cleanup();
+#endif
 }
 
 void stop_services_for_shutdown() {

@@ -1,5 +1,9 @@
 #include "waitpid.hpp"
 
+#ifdef WOS_SELFTEST
+#include <test/compartment_lifecycle_runtime.hpp>
+#endif
+
 #include <cerrno>
 #include <cstdint>
 #include <net/wki/remote_compute.hpp>
@@ -191,6 +195,12 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
             }
             events::cancel_wait(*waiter);
             OWNER->release();
+#ifdef WOS_SELFTEST
+            // claim was consumed; node is borrowed and never dereferenced.
+            ker::test::lifecycle60::consumed_wait(
+                *waiter, claimed.subject_pid, claimed.visible_pid, claimed.status,
+                claimed.kind == sched_task::ChildEventKind::EXIT && claimed.audience == sched_task::ChildEventAudience::PARENT, NOWAIT);
+#endif
             return finish_wait(claimed.visible_pid, claimed.subject_pid);
         }
         if (PROBE == events::ProbeResult::NO_CHILD || PROBE == events::ProbeResult::CLOSED) {

@@ -1,5 +1,9 @@
 #pragma once
 
+#ifdef WOS_SELFTEST
+#include <platform/mm/lifecycle_census.hpp>
+#endif
+
 #include <extern/limine.h>
 
 #include <cstdint>
@@ -306,6 +310,15 @@ auto create_pagemap_may_fail() -> PageTable*;
 // owner_pid is diagnostic provenance only; it grants no teardown authority.
 void release_pagemap(PageTable* pagemap, uint64_t owner_pid = 0);
 void get_user_root_control_stats_snapshot(UserRootControlStats& out);
+#ifdef WOS_SELFTEST
+struct SelftestRootCensus {
+    ker::mod::mm::lifecycle_census::Stamp stamp{};
+    UserRootControlStats roots{};
+    uint64_t indexed_bindings{};
+    bool complete{};
+};
+[[nodiscard]] auto selftest_root_census() -> SelftestRootCensus;
+#endif
 void get_page_table_pool_stats_snapshot(PageTablePoolStatsSnapshot& out);
 void get_owned_frame_stats_snapshot(OwnedFrameStatsSnapshot& out);
 // Refresh only the kernel half using the current kernel root. Caller retains

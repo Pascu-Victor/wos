@@ -3357,17 +3357,34 @@ auto dirty_bytes_above_target_locked() -> bool { return cache_dirty_bytes > dirt
 
 auto dirty_bytes_above_writeback_resume_locked() -> bool { return cache_dirty_bytes > dirty_writeback_resume_bytes_locked(); }
 
+#ifdef WOS_SELFTEST
+auto ensure_dirty_writeback_wq(bool* creation_failed = nullptr) -> ker::mod::sched::Workqueue* {
+    // Publish already uses this lock. Diagnostic prewarm must not introduce a
+    // new unlocked read racing an ordinary writer's first factory publication.
+    uint64_t const READY_FLAGS = cache_lock.lock_irqsave();
+    auto* const READY = dirty_writeback_wq;
+    cache_lock.unlock_irqrestore(READY_FLAGS);
+    if (READY != nullptr) return READY;
+#else
 auto ensure_dirty_writeback_wq() -> ker::mod::sched::Workqueue* {
     if (dirty_writeback_wq != nullptr) {
         return dirty_writeback_wq;
     }
+#endif
     if (!ker::mod::sched::has_run_queues()) {
         return nullptr;
     }
 
     bool expected = false;
     if (!dirty_writeback_wq_creating.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+#ifdef WOS_SELFTEST
+        uint64_t const BUSY_FLAGS = cache_lock.lock_irqsave();
+        auto* const READY = dirty_writeback_wq;
+        cache_lock.unlock_irqrestore(BUSY_FLAGS);
+        return READY;  // Null means another actual creator is still in flight.
+#else
         return dirty_writeback_wq;
+#endif
     }
 
     auto* wq = ker::mod::sched::Workqueue::create("bcache_wb");
@@ -3375,9 +3392,17 @@ auto ensure_dirty_writeback_wq() -> ker::mod::sched::Workqueue* {
     if (dirty_writeback_wq == nullptr) {
         dirty_writeback_wq = wq;
     }
+#ifdef WOS_SELFTEST
+    auto* const PUBLISHED = dirty_writeback_wq;
+    if (creation_failed != nullptr && wq == nullptr) *creation_failed = true;
+#endif
     cache_lock.unlock_irqrestore(IRQFLAGS);
     dirty_writeback_wq_creating.store(false, std::memory_order_release);
+#ifdef WOS_SELFTEST
+    return PUBLISHED;
+#else
     return dirty_writeback_wq;
+#endif
 }
 
 auto request_dirty_writeback() -> bool {
@@ -3515,6 +3540,20 @@ void register_buffer_cache_shrinker() {
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+#ifdef WOS_SELFTEST
+auto selftest_prepare_dirty_writeback_worker() noexcept -> SelftestWritebackPreparation {
+    if (!ker::mod::sched::interrupts_enabled() || ker::mod::sched::preempt_count() != 0 || !ker::mod::sched::has_run_queues() ||
+        ker::mod::sched::kernel_threads_shutdown_requested())
+        return SelftestWritebackPreparation::FAILED;
+    bool creation_failed = false;
+    // The existing factory allocates/posts outside cache_lock. Its nullptr
+    // failure signal belongs only to this actual CAS-winning create attempt.
+    auto* const READY = ensure_dirty_writeback_wq(&creation_failed);
+    if (READY != nullptr) return SelftestWritebackPreparation::READY;
+    return creation_failed ? SelftestWritebackPreparation::FAILED : SelftestWritebackPreparation::WAIT;
+}
+#endif
 
 void buffer_cache_init() {
     if (cache_initialized) {

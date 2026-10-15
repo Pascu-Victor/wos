@@ -1,5 +1,9 @@
 #include "fd_reservation.hpp"
 
+#ifdef WOS_SELFTEST
+#include <test/compartment_lifecycle_runtime.hpp>
+#endif
+
 #include <abi/resource.hpp>
 #include <cerrno>
 #include <platform/perf/perf_events.hpp>
@@ -161,4 +165,83 @@ void cancel_fd_reservations(mod::sched::task::Task& executor) {
         executor.pending_fd_reservations->cancel();
     }
 }
+
+#ifdef WOS_SELFTEST
+auto selftest_fd_census_parked(const ker::test::lifecycle60::CensusLease& lease) -> SelftestFdCensus {
+    static_assert(mod::sched::task::Task::FD_TABLE_SIZE == 256);
+    SelftestFdCensus out{};
+    auto* subject = lease.subject();
+    if (!lease || subject == nullptr) return out;
+    auto& driver = *subject;
+    out.executor_cookie = lease.cookie();
+    out.complete = !driver.is_thread && driver.type == mod::sched::task::TaskType::PROCESS;
+    if (!out.complete) return out;
+    // Parked-executor premise, not table lock: a reservation can target a
+    // different table. Only copy scalars; never acquire/drop any of its refs.
+    for (auto* node = driver.pending_fd_reservations; node != nullptr; node = node->m_next) {
+        if (out.executor_pending == 256) {
+            out.complete = false;
+            break;
+        }
+        ++out.executor_pending;
+    }
+    uint64_t const FLAGS = driver.fd_table_lock.lock_irqsave();
+    out.installed = driver.fd_table.size();
+    out.reserved = driver.fd_table.reserved_count();
+    for (unsigned fd = 0; fd < mod::sched::task::Task::FD_TABLE_SIZE; ++fd) {
+        auto& slot = out.slots[fd];
+        slot.reserved = driver.fd_table.reserved(fd);
+        slot.cloexec = driver.get_fd_cloexec(fd);
+        auto* file = static_cast<File*>(driver.fd_table.lookup(fd));
+        if (file == nullptr) continue;
+        slot.file_identity = reinterpret_cast<uint64_t>(file);
+        auto const references = file->refcount.load(std::memory_order_acquire);
+        if (references <= 0)
+            out.complete = false;
+        else
+            slot.file_references = static_cast<uint64_t>(references);
+    }
+    driver.fd_table_lock.unlock_irqrestore(FLAGS);
+    // Fixed scalar array only; the O(256^2) multiplicity pass is OUTSIDE IRQ.
+    uint64_t installed = 0, reserved = 0;
+    for (size_t i = 0; i < out.slots.size(); ++i) {
+        auto& slot = out.slots[i];
+        if (slot.reserved) ++reserved;
+        if (slot.file_identity == 0) continue;
+        ++installed;
+        bool first = true;
+        for (size_t j = 0; j < out.slots.size(); ++j) {
+            if (out.slots[j].file_identity == slot.file_identity) {
+                ++slot.multiplicity;
+                if (out.slots[j].file_references != slot.file_references) out.complete = false;
+                if (j < i) first = false;
+            }
+        }
+        if (slot.file_references < slot.multiplicity) out.complete = false;
+        if (first) ++out.distinct_files;
+    }
+    out.complete &= installed == out.installed && reserved == out.reserved;
+    // Presence, not borrowed pointer authority. Exact private queue owners must
+    // supply their own census; every bit is required empty at cycle baseline.
+    auto present = [&](unsigned bit, bool value) {
+        if (value) out.recovery_presence |= uint64_t{1} << bit;
+    };
+    present(0, driver.owned_unpublished_process.load(std::memory_order_acquire) != nullptr);
+    present(1, driver.unpublished_teardown_in_progress.load(std::memory_order_acquire));
+    present(2, driver.owned_exec_arguments.load(std::memory_order_acquire) != nullptr);
+    present(3, driver.owned_exec_preparation.load(std::memory_order_acquire) != nullptr);
+    present(4, driver.exec_preparation_teardown_in_progress.load(std::memory_order_acquire));
+    present(5, driver.pending_exec_handoff.load(std::memory_order_acquire) != nullptr);
+    present(6, driver.active_exec_handoff.load(std::memory_order_acquire) != nullptr);
+    present(7, driver.pending_wki_fd_snapshots != nullptr);
+    present(8, driver.pending_wki_submissions != nullptr);
+    present(9, driver.pending_signal_targets != nullptr);
+    present(10, driver.pending_wki_submit_buffers != nullptr);
+    present(11, driver.pending_wki_filesystems != nullptr);
+    present(12, driver.pending_fd_reservations != nullptr);
+    present(13, driver.pending_process_reservations != nullptr);
+    return out;
+}
+#endif
+
 }  // namespace ker::vfs

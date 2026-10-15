@@ -5,6 +5,9 @@
 #include <array>
 #include <atomic>
 #include <cstddef>
+#ifdef WOS_SELFTEST
+#include <new>
+#endif
 #include <cstdint>
 #include <memory>
 #include <platform/sys/mutex.hpp>
@@ -73,6 +76,25 @@ struct MountPolicy {
 };
 
 struct File {
+#ifdef WOS_SELFTEST
+    // Typed heap storage debt survives all member destruction and actual free.
+    // Placement/embedded storage is owned by its caller and is not counted.
+    static auto operator new(std::size_t size) -> void*;
+    static auto operator new[](std::size_t size) -> void*;
+    static auto operator new(std::size_t size, const std::nothrow_t& tag) noexcept -> void*;
+    static auto operator new[](std::size_t size, const std::nothrow_t& tag) noexcept -> void*;
+    static auto operator new(std::size_t size, void* place) noexcept -> void*;
+    static auto operator new[](std::size_t size, void* place) noexcept -> void*;
+    static void operator delete(void* memory) noexcept;
+    static void operator delete[](void* memory) noexcept;
+    static void operator delete(void* memory, std::size_t size) noexcept;
+    static void operator delete[](void* memory, std::size_t size) noexcept;
+    static void operator delete(void* memory, const std::nothrow_t& tag) noexcept;
+    static void operator delete[](void* memory, const std::nothrow_t& tag) noexcept;
+    static void operator delete(void* memory, void* place) noexcept;
+    static void operator delete[](void* memory, void* place) noexcept;
+#endif
+
     static constexpr size_t INLINE_VFS_PATH_CAPACITY = 256;
 
     // Set only on a private native directory File before publication. Owns

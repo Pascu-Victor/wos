@@ -1,5 +1,9 @@
 #include "mount.hpp"
 
+#ifdef WOS_SELFTEST
+#include <platform/mm/lifecycle_census.hpp>
+#endif
+
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -45,8 +49,30 @@ struct MountInitialization {
 };
 constexpr size_t MAX_MOUNT_INITIALIZATIONS = 64;
 std::array<MountInitialization, MAX_MOUNT_INITIALIZATIONS> mount_initializations{};
-mod::sys::Spinlock mount_lock;  // Protects mounts and mount_count
+#ifdef WOS_SELFTEST
+ker::mod::mm::lifecycle_census::Epoch selftest_mount_epoch{};
+ker::mod::mm::lifecycle_census::OwnerLock mount_lock{selftest_mount_epoch};
+#else
+mod::sys::Spinlock mount_lock;
+#endif  // Protects mounts and mount_count
 std::atomic<uint64_t> mount_generation{1};
+#ifdef WOS_SELFTEST
+std::atomic<uint64_t> selftest_mount_storage{0};
+std::atomic<uint64_t> selftest_mount_preparations{0}, selftest_mount_preparing{0};
+class SelftestMountPreparing {
+   public:
+    SelftestMountPreparing() {
+        selftest_mount_epoch.begin();
+        if (selftest_mount_preparing.fetch_add(1, std::memory_order_acq_rel) == UINT64_MAX) __builtin_trap();
+    }
+    ~SelftestMountPreparing() {
+        if (selftest_mount_preparing.fetch_sub(1, std::memory_order_release) == 0) __builtin_trap();
+        selftest_mount_epoch.end();
+    }
+    SelftestMountPreparing(const SelftestMountPreparing&) = delete;
+    auto operator=(const SelftestMountPreparing&) -> SelftestMountPreparing& = delete;
+};
+#endif
 // Even values admit mount-table publication. remap_mounts_for_pivot() makes
 // this odd until task roots are updated and rebase_wki_mounts_for_new_root()
 // completes the namespace transition.
@@ -871,6 +897,10 @@ void mount_root_fallback_cache_store(const char* path, size_t component_len, Mou
 }
 
 auto destroy_mount_private_data(MountPoint* mount, bool force) -> int {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_mount_epoch);
+#endif
+
     if (mount == nullptr || mount->private_data == nullptr) {
         return 0;
     }
@@ -904,6 +934,10 @@ auto destroy_mount_private_data(MountPoint* mount, bool force) -> int {
 }
 
 void destroy_mount_storage(MountPoint* mount) {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_mount_epoch);
+#endif
+
     if (mount == nullptr) {
         return;
     }
@@ -913,9 +947,16 @@ void destroy_mount_storage(MountPoint* mount) {
     delete[] mount->path;
     delete[] mount->fstype;
     delete mount;
+#ifdef WOS_SELFTEST
+    if (selftest_mount_storage.fetch_sub(1, std::memory_order_release) == 0) __builtin_trap();
+#endif
 }
 
 auto destroy_mount(MountPoint* mount, bool force = false) -> int {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_mount_epoch);
+#endif
+
     if (mount == nullptr) {
         return 0;
     }
@@ -979,6 +1020,10 @@ void rollback_mount_retirement(MountPoint* mount) {
 
 auto complete_retired_mount_teardown(MountPoint* mount, bool bounded_ref_wait, size_t* mount_count_after_remove, bool wait_for_refs = true)
     -> int {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_mount_epoch);
+#endif
+
     if (mount == nullptr) {
         return -EINVAL;
     }
@@ -1126,6 +1171,10 @@ void sort_shutdown_mounts(MountPoint** mounts_to_unmount, size_t count, const ch
 }  // namespace
 
 void put_mount_point(MountPoint* mount) {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_mount_epoch);
+#endif
+
     if (mount == nullptr) {
         return;
     }
@@ -1446,6 +1495,9 @@ auto mounted_block_device_overlaps(const ker::dev::BlockDevice* device) -> bool 
 auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device, unsigned long flags, const char* data,
                               void* initial_private_data, FileOperations* initial_fops, PreparedMount* out, MountPathKind path_kind,
                               const mount_ns::NamespaceRef& scope, const ker::mod::security::Snapshot* private_root_owner) -> int {
+#ifdef WOS_SELFTEST
+    SelftestMountPreparing selftest_operation;
+#endif
     if (path == nullptr || fstype == nullptr || out == nullptr || out->state != nullptr) {
         vfs_debug_log("mount_filesystem: invalid arguments\n");
         return -EINVAL;
@@ -1502,17 +1554,32 @@ auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::Bl
     if (state == nullptr) {
         return -ENOMEM;
     }
+#ifdef WOS_SELFTEST
+    if (selftest_mount_preparations.fetch_add(1, std::memory_order_relaxed) == UINT64_MAX) __builtin_trap();
+#endif
     auto* mount = new (std::nothrow) MountPoint;
     if (mount == nullptr) {
         delete state;
+#ifdef WOS_SELFTEST
+        if (selftest_mount_preparations.fetch_sub(1, std::memory_order_release) == 0) __builtin_trap();
+#endif
         return -ENOMEM;
     }
+#ifdef WOS_SELFTEST
+    if (selftest_mount_storage.fetch_add(1, std::memory_order_relaxed) == UINT64_MAX) __builtin_trap();
+#endif
     state->mount = mount;
     state->pivot_epoch = PIVOT_EPOCH;
     int const RETAIN_SCOPE = scope.retain(mount->namespace_owner);
     if (RETAIN_SCOPE != 0) {
         delete mount;
+#ifdef WOS_SELFTEST
+        if (selftest_mount_storage.fetch_sub(1, std::memory_order_release) == 0) __builtin_trap();
+#endif
         delete state;
+#ifdef WOS_SELFTEST
+        if (selftest_mount_preparations.fetch_sub(1, std::memory_order_release) == 0) __builtin_trap();
+#endif
         return RETAIN_SCOPE;
     }
 
@@ -1523,6 +1590,9 @@ auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::Bl
         static_cast<void>(destroy_mount(mount, true));
         state->mount = nullptr;
         delete state;
+#ifdef WOS_SELFTEST
+        if (selftest_mount_preparations.fetch_sub(1, std::memory_order_release) == 0) __builtin_trap();
+#endif
         return -ENOMEM;
     }
     std::memcpy(path_copy, resolved.data(), PATH_LEN + 1);
@@ -1534,6 +1604,9 @@ auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::Bl
         static_cast<void>(destroy_mount(mount, true));
         state->mount = nullptr;
         delete state;
+#ifdef WOS_SELFTEST
+        if (selftest_mount_preparations.fetch_sub(1, std::memory_order_release) == 0) __builtin_trap();
+#endif
         return RESERVATION_RET;
     }
 
@@ -1543,6 +1616,9 @@ auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::Bl
         static_cast<void>(destroy_mount(mount, true));
         state->mount = nullptr;
         delete state;
+#ifdef WOS_SELFTEST
+        if (selftest_mount_preparations.fetch_sub(1, std::memory_order_release) == 0) __builtin_trap();
+#endif
         return -ENOMEM;
     }
     std::memcpy(fstype_copy, fstype, FSTYPE_LEN + 1);
@@ -1563,6 +1639,9 @@ auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::Bl
         static_cast<void>(destroy_mount(mount, true));
         state->mount = nullptr;
         delete state;
+#ifdef WOS_SELFTEST
+        if (selftest_mount_preparations.fetch_sub(1, std::memory_order_release) == 0) __builtin_trap();
+#endif
         return -EBUSY;
     }
 
@@ -1574,6 +1653,9 @@ auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::Bl
             static_cast<void>(destroy_mount(mount, true));
             state->mount = nullptr;
             delete state;
+#ifdef WOS_SELFTEST
+            if (selftest_mount_preparations.fetch_sub(1, std::memory_order_release) == 0) __builtin_trap();
+#endif
             return -EINVAL;
         }
 
@@ -1598,6 +1680,9 @@ auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::Bl
             static_cast<void>(destroy_mount(mount, true));
             state->mount = nullptr;
             delete state;
+#ifdef WOS_SELFTEST
+            if (selftest_mount_preparations.fetch_sub(1, std::memory_order_release) == 0) __builtin_trap();
+#endif
             return -EIO;
         }
 
@@ -1621,6 +1706,9 @@ auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::Bl
             static_cast<void>(destroy_mount(mount, true));
             state->mount = nullptr;
             delete state;
+#ifdef WOS_SELFTEST
+            if (selftest_mount_preparations.fetch_sub(1, std::memory_order_release) == 0) __builtin_trap();
+#endif
             return tmpfs_error != 0 ? tmpfs_error : -ENOMEM;
         }
         mount->fops = ker::vfs::tmpfs::get_tmpfs_fops();
@@ -1642,6 +1730,9 @@ auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::Bl
             static_cast<void>(destroy_mount(mount, true));
             state->mount = nullptr;
             delete state;
+#ifdef WOS_SELFTEST
+            if (selftest_mount_preparations.fetch_sub(1, std::memory_order_release) == 0) __builtin_trap();
+#endif
             return -EINVAL;
         }
         auto* xfs_ctx = ker::vfs::xfs::xfs_vfs_init_device(device, mount->read_only);
@@ -1650,6 +1741,9 @@ auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::Bl
             static_cast<void>(destroy_mount(mount, true));
             state->mount = nullptr;
             delete state;
+#ifdef WOS_SELFTEST
+            if (selftest_mount_preparations.fetch_sub(1, std::memory_order_release) == 0) __builtin_trap();
+#endif
             return -EIO;
         }
         mount->private_data = xfs_ctx;
@@ -1659,6 +1753,9 @@ auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::Bl
         static_cast<void>(destroy_mount(mount, true));
         state->mount = nullptr;
         delete state;
+#ifdef WOS_SELFTEST
+        if (selftest_mount_preparations.fetch_sub(1, std::memory_order_release) == 0) __builtin_trap();
+#endif
         return -ENODEV;
     }
 
@@ -1669,6 +1766,10 @@ auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::Bl
 namespace {
 auto publish_prepared_mount_with_identity(PreparedMount* prepared, const char* expected_physical_path, File* covered_directory,
                                           uint32_t& next_identity) -> int {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_mount_epoch);
+#endif
+
     if (prepared == nullptr || prepared->state == nullptr) {
         return -EINVAL;
     }
@@ -1753,6 +1854,10 @@ auto publish_prepared_mount(PreparedMount* prepared, const char* expected_physic
 }
 
 void finish_prepared_mount(PreparedMount* prepared) {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_mount_epoch);
+#endif
+
     if (prepared == nullptr || prepared->state == nullptr) {
         return;
     }
@@ -1763,6 +1868,9 @@ void finish_prepared_mount(PreparedMount* prepared) {
         static_cast<void>(destroy_mount(mount, true));
         state->mount = nullptr;
         delete state;
+#ifdef WOS_SELFTEST
+        if (selftest_mount_preparations.fetch_sub(1, std::memory_order_release) == 0) __builtin_trap();
+#endif
         return;
     }
 
@@ -1784,6 +1892,9 @@ void finish_prepared_mount(PreparedMount* prepared) {
 
     state->mount = nullptr;
     delete state;
+#ifdef WOS_SELFTEST
+    if (selftest_mount_preparations.fetch_sub(1, std::memory_order_release) == 0) __builtin_trap();
+#endif
 }
 
 auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device, unsigned long flags, const char* data,
@@ -3011,6 +3122,50 @@ auto mount_selftest_descendant_lifetime(bool disk) -> bool {
     if (!check(unmount_filesystem(BASE) == 0, __LINE__)) return false;
     auto sibling = find_mount_point(SIBLING);
     return check(sibling && std::strcmp(sibling->path, SIBLING) == 0, __LINE__);
+}
+#endif
+
+#ifdef WOS_SELFTEST
+auto selftest_mount_census() -> SelftestMountCensus {
+    auto const selftest_before = selftest_mount_epoch.snapshot();
+    SelftestMountCensus out{.complete = true};
+    uint64_t const FLAGS = mount_lock.observe_lock_irqsave();
+    for (const auto& initialization : mount_initializations) {
+        if (!initialization.active) continue;
+        ++out.initializing;
+        if (!initialization.namespace_owner.is_host()) ++out.initializing_private;
+    }
+    // A saturated/invalid bound refuses qualification, never truncates silently.
+    if (mounts.size() > 4096) out.complete = false;
+    for (size_t i = 0; i < mounts.size() && i < 4096; ++i) {
+        auto* mount = mounts[i];
+        if (mount == nullptr) {
+            out.complete = false;
+            continue;
+        }
+        bool const PRIVATE = !mount->namespace_owner.is_host();
+        if (mount->retiring.load(std::memory_order_relaxed)) {
+            ++out.retiring;
+            if (PRIVATE) ++out.retiring_private;
+        } else {
+            ++out.published;
+            if (PRIVATE) ++out.published_private;
+        }
+        out.refs += mount->refs.load(std::memory_order_acquire);
+        out.open_files += mount->open_files.load(std::memory_order_acquire);
+        out.native_backing_pins += mount->native_backing_pins;
+        if (mount->covered_directory != nullptr) ++out.covered_directory_owners;
+    }
+    out.generation = mount_generation.load(std::memory_order_relaxed);
+    out.pivot_epoch = mount_pivot_epoch.load(std::memory_order_acquire);
+    if ((out.pivot_epoch & 1U) != 0) out.complete = false;
+    mount_lock.observe_unlock_irqrestore(FLAGS);
+    out.mount_storage = selftest_mount_storage.load(std::memory_order_acquire);
+    out.preparation_storage = selftest_mount_preparations.load(std::memory_order_acquire);
+    out.preparing_operations = selftest_mount_preparing.load(std::memory_order_acquire);
+    out.stamp = selftest_mount_epoch.snapshot();
+    out.complete = out.complete && ker::mod::mm::lifecycle_census::unchanged(selftest_before, out.stamp);
+    return out;
 }
 #endif
 

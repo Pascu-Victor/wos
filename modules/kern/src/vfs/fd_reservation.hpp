@@ -1,6 +1,12 @@
 #pragma once
 
 #include <cstdint>
+#ifdef WOS_SELFTEST
+#include <array>
+namespace ker::test::lifecycle60 {
+class CensusLease;
+}
+#endif
 
 namespace ker::mod::sched::task {
 struct Task;
@@ -8,6 +14,24 @@ struct Task;
 
 namespace ker::vfs {
 struct File;
+#ifdef WOS_SELFTEST
+struct SelftestFdSlot {
+    uint64_t file_identity{}, file_references{}, multiplicity{};
+    bool cloexec{}, reserved{};
+    auto operator==(const SelftestFdSlot&) const -> bool = default;
+};
+struct SelftestFdCensus {
+    std::array<SelftestFdSlot, 256> slots{};
+    uint64_t installed{}, reserved{}, distinct_files{}, executor_pending{}, recovery_presence{}, executor_cookie{};
+    bool complete{};
+    auto operator==(const SelftestFdCensus&) const -> bool = default;
+};
+// Requires the exact controller-issued executor ACK lease, including no live
+// shared FD/table writer. A retained Task or caller bool is insufficient. Pending
+// executor list is not protected by the driver's fd_table_lock (targets vary).
+// No File retain/drop; file_identity is comparison-only, never dereference it.
+[[nodiscard]] auto selftest_fd_census_parked(const ker::test::lifecycle60::CensusLease& lease) -> SelftestFdCensus;
+#endif
 
 // Reserve before backend effects. Slot publication cannot fail from EMFILE
 // after reservation succeeds, even if another thread lowers the soft limit.
@@ -23,6 +47,9 @@ class FdReservation {
     void cancel();
 
    private:
+#ifdef WOS_SELFTEST
+    friend auto selftest_fd_census_parked(const ker::test::lifecycle60::CensusLease&) -> SelftestFdCensus;
+#endif
     mod::sched::task::Task* m_table = nullptr;
     mod::sched::task::Task* m_executor = nullptr;
     FdReservation* m_previous = nullptr;

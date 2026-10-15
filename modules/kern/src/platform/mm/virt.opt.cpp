@@ -1,5 +1,9 @@
 #include "virt.hpp"
 
+#ifdef WOS_SELFTEST
+#include <platform/mm/lifecycle_census.hpp>
+#endif
+
 #include <abi/callnums/vmem.h>
 #include <extern/limine.h>
 
@@ -86,7 +90,12 @@ constexpr uint64_t PTE_FRAME_MASK = 0x000FFFFFFFFFF000ULL;
 sys::Spinlock cow_pte_lock;
 // Serializes leaf publication/removal with usercopy frame pin acquisition.
 // Never hold this across allocation, fault resolution, memcpy, or shootdown.
+#ifdef WOS_SELFTEST
+ker::mod::mm::lifecycle_census::Epoch selftest_root_epoch{};
+ker::mod::mm::lifecycle_census::OwnerLock user_mapping_pin_lock{selftest_root_epoch};
+#else
 sys::Spinlock user_mapping_pin_lock;
+#endif
 file_mapping::FileMappingIndex file_mapping_index;
 
 // Exact root associations use the same lock as pinned mapping snapshots. Only
@@ -2772,6 +2781,10 @@ void release_unregistered_user_root(PageTable* root) {
 }
 
 auto create_user_root_common(bool may_fail) -> PageTable* {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_root_epoch);
+#endif
+
     auto* root = alloc_zeroed_page_table(may_fail);
     if (root == nullptr) return nullptr;
     UserRootControlChunk* spare = nullptr;
@@ -4378,6 +4391,10 @@ namespace {
 // Caller provenance is passed through so the ordinary wrapper keeps its trace.
 void release_pagemap_exclusive_owned(PageTable* pagemap, uint64_t owner_pid, void* caller) {
 #ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_root_epoch);
+#endif
+
+#ifdef WOS_SELFTEST
     // Root pages are recycled directly into the page-table pool, so they do
     // not necessarily pass through page_free() or page_ref_dec(). Catch a
     // stale/corrupt root pointer before zero_page_table_for_pool() can erase a
@@ -4436,6 +4453,22 @@ void get_user_root_control_stats_snapshot(UserRootControlStats& out) {
            .last_serial = user_root_control_last_serial};
     user_mapping_pin_lock.unlock_irqrestore(FLAGS);
 }
+
+#ifdef WOS_SELFTEST
+auto selftest_root_census() -> SelftestRootCensus {
+    auto const selftest_before = selftest_root_epoch.snapshot();
+    SelftestRootCensus out{};
+    uint64_t const FLAGS = user_mapping_pin_lock.observe_lock_irqsave();
+    out.roots = {.active_roots = user_root_control_active_roots,
+                 .control_pages = user_root_control_pages,
+                 .last_serial = user_root_control_last_serial};
+    out.complete = file_mapping_index.selftest_count_all_locked(out.indexed_bindings);
+    user_mapping_pin_lock.observe_unlock_irqrestore(FLAGS);
+    out.stamp = selftest_root_epoch.snapshot();
+    out.complete = out.complete && ker::mod::mm::lifecycle_census::unchanged(selftest_before, out.stamp);
+    return out;
+}
+#endif
 
 auto unpublished_user_root_empty(PageTable* root) -> bool {
     if (root == nullptr || root == kernel_pagemap || is_current_pagemap(root)) return false;

@@ -4,7 +4,13 @@
 #include <array>
 #include <atomic>
 #include <cstddef>
+#ifdef WOS_SELFTEST
+#include <new>
+#endif
 #include <cstdint>
+#ifdef WOS_SELFTEST
+#include <syscalls_impl/process/native_construction_token.hpp>
+#endif
 #include <defines/defines.hpp>
 #include <iterator>
 #include <optional>
@@ -309,13 +315,37 @@ struct FxState {
 // lifecycle-heavy type harder to audit for little memory win.
 // NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding)
 struct Task {
+#ifdef WOS_SELFTEST
+    // Typed heap storage debt survives all member destruction and actual free.
+    // Placement/embedded storage is owned by its caller and is not counted.
+    static auto operator new(std::size_t size) -> void*;
+    static auto operator new[](std::size_t size) -> void*;
+    static auto operator new(std::size_t size, const std::nothrow_t& tag) noexcept -> void*;
+    static auto operator new[](std::size_t size, const std::nothrow_t& tag) noexcept -> void*;
+    static auto operator new(std::size_t size, void* place) noexcept -> void*;
+    static auto operator new[](std::size_t size, void* place) noexcept -> void*;
+    static void operator delete(void* memory) noexcept;
+    static void operator delete[](void* memory) noexcept;
+    static void operator delete(void* memory, std::size_t size) noexcept;
+    static void operator delete[](void* memory, std::size_t size) noexcept;
+    static void operator delete(void* memory, const std::nothrow_t& tag) noexcept;
+    static void operator delete[](void* memory, const std::nothrow_t& tag) noexcept;
+    static void operator delete(void* memory, void* place) noexcept;
+    static void operator delete[](void* memory, void* place) noexcept;
+#endif
+
     Task(Task&&) = delete;
     auto operator=(const Task&) -> Task& = delete;
     auto operator=(Task&&) -> Task& = delete;
     Task(const char* name, uint64_t elf_start, size_t elf_size, uint64_t kernel_rsp, TaskType type);
     // Fresh default Task, already claimed by owner with its kernel stack attached.
     // Leaves partial name/pagemap ownership in this Task on recoverable failure.
-    auto initialize_unpublished_process_skeleton(Task& owner, const char* process_name) -> int;
+    auto initialize_unpublished_process_skeleton(Task& owner, const char* process_name
+#ifdef WOS_SELFTEST
+                                                 ,
+                                                 ker::syscall::process::NativeConstructionToken fault_token = {}
+#endif
+                                                 ) -> int;
     auto initialize_process_image(const uint8_t* elf_data, size_t elf_size) -> bool;
     auto initialize_process_image(const ker::loader::elf::ElfFileView& elf, const ker::loader::elf::ElfLoadOptions& options) -> bool;
 

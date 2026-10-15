@@ -4,6 +4,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#ifdef WOS_SELFTEST
+#include <syscalls_impl/process/native_construction_token.hpp>
+#endif
 #include <platform/asm/cpu.hpp>
 #include <platform/sched/ipc_namespace.hpp>
 #include <platform/sched/pid_namespace.hpp>
@@ -105,8 +108,12 @@ struct NativeCompartmentSpec {
 // nonroot-owned root, admitted image/stack and explicit capabilities. Executor
 // root preparation remains pending; destroy the child before retiring it.
 // A later publisher must revalidate policy and explicitly transfer ownership.
-auto prepare_native_compartment_for_owner(ker::mod::sched::task::Task& executor, const NativeCompartmentSpec& spec, int& error)
-    -> ker::mod::sched::task::Task*;
+auto prepare_native_compartment_for_owner(ker::mod::sched::task::Task& executor, const NativeCompartmentSpec& spec, int& error
+#ifdef WOS_SELFTEST
+                                          ,
+                                          NativeConstructionToken fault_token = {}
+#endif
+                                          ) -> ker::mod::sched::task::Task*;
 // Consumes preparation on success and returns physical PID for Host supervision.
 // Failure leaves the exact child/root owned for explicit abort. No remote post.
 auto publish_native_compartment_for_owner(ker::mod::sched::task::Task& executor, ker::mod::sched::task::Task* child) -> int64_t;
@@ -129,6 +136,9 @@ struct NativeProcessContext {
     // policy are borrowed together until mapping and publication validation.
     ker::mod::sched::task::Task* service_creator = nullptr;
     const ker::mod::sched::resource::NativeCreatorPolicy* creator_policy = nullptr;
+#ifdef WOS_SELFTEST
+    NativeConstructionToken fault_token{};
+#endif
 };
 
 // Consuming native builder with an explicit retained executor. Small/static
@@ -175,6 +185,8 @@ enum class NativeConstructionFault : uint8_t {
 };
 void exec_selftest_fail_native_construction_once(NativeConstructionFault fault);
 auto exec_selftest_take_native_construction_fault(NativeConstructionFault fault) -> bool;
+// Explicit invocation first; unchanged boot-global consumer is the fallback.
+auto exec_selftest_take_native_construction_fault(NativeConstructionFault fault, NativeConstructionToken token) noexcept -> bool;
 auto exec_selftest_native_construction_scratch_destructions() -> uint32_t;
 auto exec_selftest_native_signal_cutover_drains_worker() -> bool;
 auto exec_selftest_remote_signal_cutover_drains_actor() -> bool;

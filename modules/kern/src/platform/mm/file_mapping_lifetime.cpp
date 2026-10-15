@@ -3,6 +3,9 @@
 #include <new>
 #include <platform/mm/file_mapping_lifetime.hpp>
 #include <platform/mm/lifetime_retirement_executor.hpp>
+#ifdef WOS_SELFTEST
+#include <platform/mm/lifecycle_storage.hpp>
+#endif
 #include <platform/mm/paging.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <platform/sys/usercopy.hpp>
@@ -98,10 +101,19 @@ FileMappingLifetime::~FileMappingLifetime() = default;
 auto FileMappingLifetime::prepare(ker::vfs::File& borrowed_file) -> FileMappingLifetime* {
     auto const* port = LifetimeRetirementExecutor::port();
     if (port == nullptr || !port_valid(*port)) return nullptr;
+#ifdef WOS_SELFTEST
+    lifecycle_storage::begin_allocation(lifecycle_storage::Kind::FAMILY);
+#endif
     auto* owner = new (std::nothrow) FileMappingLifetime(*port);
+#ifdef WOS_SELFTEST
+    lifecycle_storage::finish_allocation(lifecycle_storage::Kind::FAMILY, owner != nullptr);
+#endif
     if (owner == nullptr) return nullptr;
     if (!retain_file_checked(borrowed_file)) {
         delete owner;
+#ifdef WOS_SELFTEST
+        lifecycle_storage::finish_deallocation(lifecycle_storage::Kind::FAMILY);
+#endif
         return nullptr;
     }
     owner->file_ = &borrowed_file;
@@ -110,6 +122,9 @@ auto FileMappingLifetime::prepare(ker::vfs::File& borrowed_file) -> FileMappingL
         // Caller still owns borrowed_file. No reservation can invoke this owner.
         owner->file_ = nullptr;
         delete owner;
+#ifdef WOS_SELFTEST
+        lifecycle_storage::finish_deallocation(lifecycle_storage::Kind::FAMILY);
+#endif
         ker::vfs::vfs_put_file(&borrowed_file);
         return nullptr;
     }
@@ -132,6 +147,9 @@ auto FileMappingLifetime::prepare(ker::vfs::File& borrowed_file, RetirementCompl
     owner->ticket_ = nullptr;
     owner->file_ = nullptr;
     delete owner;
+#ifdef WOS_SELFTEST
+    lifecycle_storage::finish_deallocation(lifecycle_storage::Kind::FAMILY);
+#endif
     ker::vfs::vfs_put_file(&borrowed_file);  // Caller still owns its borrowed ref.
     return nullptr;
 }
@@ -235,6 +253,9 @@ auto FileMappingLifetime::finish(void* argument) noexcept -> int {
     owner->read_shared_backing_.reset();
     owner->demand_read_shared_backing_.reset();
     delete owner;
+#ifdef WOS_SELFTEST
+    lifecycle_storage::finish_deallocation(lifecycle_storage::Kind::FAMILY);
+#endif
     return RESULT;
 }
 
@@ -245,7 +266,13 @@ FileMappingBinding::FileMappingBinding(FileMappingLifetime& lifetime) noexcept :
 
 auto FileMappingBinding::prepare_unbound(FileMappingLifetime& lifetime) -> FileMappingBinding* {
     if (!lifetime.try_acquire(FamilyOwner::BINDING)) return nullptr;
+#ifdef WOS_SELFTEST
+    lifecycle_storage::begin_allocation(lifecycle_storage::Kind::BINDING);
+#endif
     auto* binding = new (std::nothrow) FileMappingBinding(lifetime);
+#ifdef WOS_SELFTEST
+    lifecycle_storage::finish_allocation(lifecycle_storage::Kind::BINDING, binding != nullptr);
+#endif
     if (binding == nullptr) {
         lifetime.release(FamilyOwner::BINDING);
         return nullptr;
@@ -254,6 +281,9 @@ auto FileMappingBinding::prepare_unbound(FileMappingLifetime& lifetime) -> FileM
     binding->ticket_ = PORT->reserve(PORT->context, finish, binding);
     if (binding->ticket_ == nullptr) {
         delete binding;
+#ifdef WOS_SELFTEST
+        lifecycle_storage::finish_deallocation(lifecycle_storage::Kind::BINDING);
+#endif
         lifetime.release(FamilyOwner::BINDING);
         return nullptr;
     }
@@ -334,6 +364,9 @@ auto FileMappingBinding::finish(void* argument) noexcept -> int {
         if (lifetime == nullptr) __builtin_trap();
     }
     delete binding;
+#ifdef WOS_SELFTEST
+    lifecycle_storage::finish_deallocation(lifecycle_storage::Kind::BINDING);
+#endif
     lifetime->release(FamilyOwner::BINDING);  // Separate pre-reserved callback.
     return 0;
 }
@@ -502,5 +535,20 @@ auto FileMappingIndex::snapshot_root_locked(paging::PageTable* root, uint64_t ro
     }
     return true;
 }
+
+#ifdef WOS_SELFTEST
+auto FileMappingIndex::selftest_count_all_locked(uint64_t& empty_count) const noexcept -> bool {
+    if (empty_count != 0) return false;
+    uint64_t count = 0;
+    for (auto* head : heads_) {
+        for (auto* binding = head; binding != nullptr; binding = binding->index_next_) {
+            if (count == 65536 || binding->index_state_ != FileMappingBinding::IndexState::INDEXED) return false;
+            ++count;
+        }
+    }
+    empty_count = count;
+    return true;
+}
+#endif
 
 }  // namespace ker::mod::mm::file_mapping

@@ -1,5 +1,9 @@
 #include "exit.hpp"
 
+#ifdef WOS_SELFTEST
+#include <test/compartment_lifecycle_runtime.hpp>
+#endif
+
 #include <atomic>
 #include <cerrno>
 #include <cstddef>
@@ -235,6 +239,9 @@ namespace {
         log::error("process exit without current task: status=%d wait_status=%d", status, wait_status);
         hcf();
     }
+#ifdef WOS_SELFTEST
+    ker::test::lifecycle60::driver_exit_begin(*current_task);
+#endif
     if (!ker::mod::sched::resource::close_thread_cpu_admission(*current_task)) [[unlikely]] {
         ker::mod::dbg::panic_handler("process exit: missing CPU owner");
         hcf();

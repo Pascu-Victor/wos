@@ -4323,6 +4323,10 @@ auto pin_kernel_workers_to_cpus(std::span<const KernelWorkerCpuPin> requests) ->
     return (scheduler_task_context_ready_mask.load(std::memory_order_acquire) & (1ULL << CPU_NO)) != 0;
 }
 
+#ifdef WOS_SELFTEST
+auto selftest_task_context_ready_mask() noexcept -> uint64_t { return scheduler_task_context_ready_mask.load(std::memory_order_acquire); }
+#endif
+
 auto has_run_queues() -> bool { return run_queues != nullptr; }
 
 void begin_syscall_accounting() {

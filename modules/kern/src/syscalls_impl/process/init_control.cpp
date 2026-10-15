@@ -358,6 +358,40 @@ auto wos_proc_init_status_publish(uint64_t status_addr) -> uint64_t { return ini
 auto wos_proc_init_status_read(uint64_t status_addr) -> uint64_t { return init_status_read_for_subject(current_task(), status_addr); }
 
 #ifdef WOS_SELFTEST
+auto selftest_lifecycle_init_boundary(uint64_t slot, bool after, SelftestLifecycleInitBoundary& empty) noexcept -> bool {
+    if (empty.generation != 0 || empty.status_sequence != 0 || empty.journal_pid != 0 || empty.journal_generation != 0) return false;
+    auto matches = [](const char* value, const char* expected) {
+        for (size_t i = 0; i < init_abi::SERVICE_NAME_CAPACITY; ++i) {
+            if (value[i] != expected[i]) return false;
+            if (value[i] == '\0') return true;
+        }
+        return false;
+    };
+    SelftestLifecycleInitBoundary out{};
+    uint64_t const FLAGS = g_init_control_lock.lock_irqsave();
+    bool match = g_status_available && g_status.sequence != 0 && g_status.service_count == 2 && slot < 2 && g_status.flags == 0 &&
+                 (g_status.state == init_abi::SupervisorState::STARTING || g_status.state == init_abi::SupervisorState::RUNNING);
+    if (match) {
+        auto const& driver = g_status.services[slot];
+        auto const& journal = g_status.services[slot == 0 ? 1 : 0];
+        match = matches(driver.service, "lifecycle-raw-pilot") && matches(journal.service, "journald") && driver.generation == 1 &&
+                driver.restart_count == 0 && driver.last_wait_status == 0 && driver.last_error == 0 && driver.pid == -1 &&
+                driver.pgid == -1 && (driver.flags & init_abi::SERVICE_FLAG_RESTART_PENDING) == 0 && journal.generation == 1 &&
+                journal.restart_count == 0 && journal.pid > 1 && journal.pgid == journal.pid &&
+                journal.state == init_abi::ServiceState::RUNNING && journal.readiness == init_abi::ReadinessState::READY &&
+                (journal.flags & init_abi::SERVICE_FLAG_RESTART_PENDING) == 0 &&
+                driver.state == (after ? init_abi::ServiceState::EXITED : init_abi::ServiceState::STARTING) &&
+                driver.readiness == init_abi::ReadinessState::NOT_READY;
+        if (match)
+            out = {.generation = driver.generation,
+                   .status_sequence = g_status.sequence,
+                   .journal_pid = static_cast<uint64_t>(journal.pid),
+                   .journal_generation = journal.generation};
+    }
+    g_init_control_lock.unlock_irqrestore(FLAGS);
+    if (match) empty = out;
+    return match;
+}
 auto init_control_selftest_mailbox() -> bool {
     InitControlMailbox mailbox;
     init_abi::Request output{};

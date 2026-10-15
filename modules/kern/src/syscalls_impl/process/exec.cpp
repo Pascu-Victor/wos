@@ -1,5 +1,9 @@
 #include "exec.hpp"
 
+#ifdef WOS_SELFTEST
+#include <test/compartment_lifecycle_runtime.hpp>
+#endif
+
 #include <abi/callnums/perf_trace.h>
 #include <abi/callnums/process.h>
 #include <bits/off_t.h>
@@ -1574,6 +1578,9 @@ namespace {
 // existing arguments slot. A prepared child must retire before this root does.
 struct NativeCompartmentUserInputs {
     NativeCompartmentSpec spec;
+#ifdef WOS_SELFTEST
+    NativeConstructionToken fault_token{};
+#endif
     std::array<char, abi::compartment::PATH_BYTES_MAX> executable{};
     std::array<std::array<char, abi::compartment::PATH_BYTES_MAX>, abi::compartment::ASSET_MAX> paths{};
     std::array<NativeCompartmentAsset, abi::compartment::ASSET_MAX> assets{};
@@ -1604,6 +1611,9 @@ struct NativeCompartmentPreparation {
         unsigned destination{};
     };
     mod::sched::task::Task& executor;
+#ifdef WOS_SELFTEST
+    NativeConstructionToken fault_token{};
+#endif
     mod::sched::task::Task* creator{};
     mod::sched::task::Task* child{};
     int actor_nice{};
@@ -1634,7 +1644,14 @@ struct NativeCompartmentPreparation {
     uint64_t root_bytes{};
     bool published{};
     std::unique_ptr<NativeCompartmentUserInputs> user_inputs;
+#ifdef WOS_SELFTEST
+    explicit NativeCompartmentPreparation(mod::sched::task::Task& owner, NativeConstructionToken token)
+        : executor(owner), fault_token(token) {
+        context.fault_token = token;
+    }
+#else
     explicit NativeCompartmentPreparation(mod::sched::task::Task& owner) : executor(owner) {}
+#endif
     ~NativeCompartmentPreparation();
 };
 
@@ -1698,12 +1715,18 @@ class ExecRequestArguments {
     bool remote_worker_committed{};
     std::unique_ptr<NativeCompartmentPreparation> compartment;
     bool native_compartment_request{};
+#ifdef WOS_SELFTEST
+    NativeConstructionToken fault_token{};
+#endif
 
     // Scratch for each recursive native loader invocation. Persistent executable
     // bytes leave prepared_elf through take_task_metadata(); pagemap/Thread belong
     // to the image transaction. Native construction also owns its interpreter
     // File here; ordinary exec keeps that File in its existing transaction.
     struct NativeScratch {
+#ifdef WOS_SELFTEST
+        NativeConstructionToken fault_token{};
+#endif
         PreparedFileBackedElf prepared_elf;
         PreparedFileBackedElf prepared_interp;
         uint8_t* interp_buf{};
@@ -2090,6 +2113,9 @@ auto cutover_remote_exec_owner(ker::mod::sched::task::Task& owner, uint32_t task
         plan.publish_metadata(owner);
     }
     plan.committed = true;
+#ifdef WOS_SELFTEST
+    ker::test::lifecycle60::image_committed(owner, true);
+#endif
     capture_remote_exec_cutover_signals(owner, *plan.actor, task_id, remote_pid, signals, [] { ker::mod::sched::kern_yield(); });
     accept_remote_exec_owner(owner, context);
     return 0;
@@ -2483,6 +2509,9 @@ auto commit_native_exec_image(ker::mod::sched::task::Task* task, PreparedNativeE
         // Exit recovery may remove the wrapper but must never discard this image.
         prepared.release_after_commit();
         (void)mod::sched::resource::observe_address_space(*task);
+#ifdef WOS_SELFTEST
+        ker::test::lifecycle60::image_committed(*task, false);
+#endif
     }
     if (commit_published) {
         return 0;
@@ -3676,6 +3705,12 @@ void exec_selftest_fail_native_construction_once(NativeConstructionFault fault) 
 auto exec_selftest_take_native_construction_fault(NativeConstructionFault fault) -> bool {
     return g_native_construction_fault.compare_exchange_strong(fault, NativeConstructionFault::NONE, std::memory_order_acq_rel);
 }
+auto exec_selftest_take_native_construction_fault(NativeConstructionFault fault, NativeConstructionToken token) noexcept -> bool {
+    if (token.actor != nullptr && token.cookie != 0 && exec_selftest_consume_scoped_native_construction_fault(token, fault)) return true;
+    // Existing preboot tests retain their exact global fault semantics. The
+    // scheduled controller never arms this independent boot-only selector.
+    return exec_selftest_take_native_construction_fault(fault);
+}
 auto exec_selftest_native_construction_scratch_destructions() -> uint32_t { return g_native_construction_scratch_destructions; }
 #endif
 
@@ -3709,6 +3744,9 @@ class NativeConstructionExecutorGuard {
 
 auto capture_native_arguments(const NativeProcessArguments* input, ExecRequestArguments& request,
                               ExecRequestArguments::NativeScratch& scratch) -> int {
+#ifdef WOS_SELFTEST
+    scratch.fault_token = request.fault_token;
+#endif
     if (input == nullptr) return 0;
     auto const PATH = input->executable_path;
     if (PATH.empty() || PATH.data() == nullptr || PATH.front() != '/' || PATH.size() >= EXEC_PATH_MAX ||
@@ -3732,12 +3770,12 @@ auto capture_native_arguments(const NativeProcessArguments* input, ExecRequestAr
     snapshot.argv = new (std::nothrow) const char*[input->argv.size() + 1]{};
     if (snapshot.argv == nullptr) return -ENOMEM;
 #ifdef WOS_SELFTEST
-    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::ARGUMENT_POINTERS)) return -ENOMEM;
+    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::ARGUMENT_POINTERS, request.fault_token)) return -ENOMEM;
 #endif
     snapshot.envp = new (std::nothrow) const char*[input->envp.size() + 1]{};
     if (snapshot.envp == nullptr) return -ENOMEM;
 #ifdef WOS_SELFTEST
-    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::ARGUMENT_ARENA)) return -ENOMEM;
+    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::ARGUMENT_ARENA, request.fault_token)) return -ENOMEM;
 #endif
     snapshot.strings = new (std::nothrow) char[bytes != 0 ? bytes : 1];
     if (snapshot.strings == nullptr) return -ENOMEM;
@@ -3786,7 +3824,7 @@ auto prepare_native_interpreter(mod::sched::task::Task& child, ExecRequestArgume
         if (SIZE > BUFFERED_IMAGE_MAX) return -E2BIG;
         prepared.reset();
 #ifdef WOS_SELFTEST
-        if (exec_selftest_take_native_construction_fault(NativeConstructionFault::INTERPRETER_BUFFER)) return -ENOMEM;
+        if (exec_selftest_take_native_construction_fault(NativeConstructionFault::INTERPRETER_BUFFER, scratch.fault_token)) return -ENOMEM;
 #endif
         scratch.interp_buf = new (std::nothrow) uint8_t[SIZE];
         if (scratch.interp_buf == nullptr) return -ENOMEM;
@@ -3853,7 +3891,7 @@ auto prepare_native_stack(mod::sched::task::Task& child, const ExecArgumentsSnap
     scratch.argv_addrs = new (std::nothrow) uint64_t[scratch.argv_count + 1]{};
     if (scratch.argv_addrs == nullptr) return -ENOMEM;
 #ifdef WOS_SELFTEST
-    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::STACK_ADDRESSES)) return -ENOMEM;
+    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::STACK_ADDRESSES, scratch.fault_token)) return -ENOMEM;
 #endif
     scratch.envp_addrs = new (std::nothrow) uint64_t[scratch.envp_count + 1]{};
     if (scratch.envp_addrs == nullptr) return -ENOMEM;
@@ -3947,10 +3985,13 @@ auto create_native_process_task_impl(mod::sched::task::Task* owner, const Native
         return refuse_inputs(-EINVAL);
     if (owned_file->fops != vfs::tmpfs::get_tmpfs_fops() || owned_file->is_directory) return refuse_inputs(-ENOTSUP);
 #ifdef WOS_SELFTEST
-    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::TASK)) return refuse_inputs(-ENOMEM);
+    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::TASK, context.fault_token)) return refuse_inputs(-ENOMEM);
 #endif
     auto* child = new (std::nothrow) mod::sched::task::Task{};
     if (child == nullptr) return refuse_inputs(-ENOMEM);
+#ifdef WOS_SELFTEST
+    ker::test::lifecycle60::allocated_attempt_task(context.fault_token, child);
+#endif
     if (!mod::sched::task::claim_unpublished_process(owner, child)) {
         delete child;
         return refuse_inputs(-EBUSY);
@@ -3975,7 +4016,12 @@ auto create_native_process_task_impl(mod::sched::task::Task* owner, const Native
         }
         return nullptr;
     };
+#ifdef WOS_SELFTEST
+    if (int const ERROR = child->initialize_unpublished_process_skeleton(*owner, name, context.fault_token); ERROR != 0)
+        return abort_child(ERROR);
+#else
     if (int const ERROR = child->initialize_unpublished_process_skeleton(*owner, name); ERROR != 0) return abort_child(ERROR);
+#endif
     child->resources = resources;
     if (int const ERROR = mod::sched::resource::initialize_credentials(*child, credentials); ERROR != 0) return abort_child(ERROR);
     if (!reservation.attach(*child)) return abort_child(-EAGAIN);
@@ -4004,7 +4050,7 @@ auto create_native_process_task_impl(mod::sched::task::Task* owner, const Native
     if (fresh.st_size <= 0 || static_cast<size_t>(fresh.st_size) != file_size) return abort_child(-EAGAIN);
     if (int const ERROR = check_exec_permission_from_stat(credentials, fresh); ERROR != 0) return abort_child(ERROR);
 #ifdef WOS_SELFTEST
-    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::SCRATCH)) return abort_child(-ENOMEM);
+    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::SCRATCH, context.fault_token)) return abort_child(-ENOMEM);
 #endif
     ExecRequestArguments* request = nullptr;
     ExecRequestArguments::NativeScratch* scratch = nullptr;
@@ -4020,6 +4066,9 @@ auto create_native_process_task_impl(mod::sched::task::Task* owner, const Native
             } else {
 #ifdef WOS_SELFTEST
                 pending->selftest_destructions = &g_native_construction_scratch_destructions;
+#endif
+#ifdef WOS_SELFTEST
+                pending->fault_token = context.fault_token;
 #endif
                 request = pending.get();
                 scratch = request->native_scratch(0);
@@ -4037,7 +4086,7 @@ auto create_native_process_task_impl(mod::sched::task::Task* owner, const Native
     if (PREPARED == PrepareFileBackedElfResult::IO_ERROR) return abort_child(-EIO);
     if (PREPARED == PrepareFileBackedElfResult::INVALID) return abort_child(-ENOEXEC);
 #ifdef WOS_SELFTEST
-    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::RECOVERY_AFTER_READ)) {
+    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::RECOVERY_AFTER_READ, context.fault_token)) {
         // Exercise the same transferred owner-slot cleanup used by ACTIVE exit.
         auto* recovered = mod::sched::task::take_unpublished_process(owner);
         if (recovered != child || !mod::sched::task::destroy_unpublished_process(recovered)) [[unlikely]] {
@@ -4065,7 +4114,7 @@ auto create_native_process_task_impl(mod::sched::task::Task* owner, const Native
         if (file_size > BUFFERED_IMAGE_MAX) return abort_child(-E2BIG);
         prepared.reset();
 #ifdef WOS_SELFTEST
-        if (exec_selftest_take_native_construction_fault(NativeConstructionFault::BUFFER)) return abort_child(-ENOMEM);
+        if (exec_selftest_take_native_construction_fault(NativeConstructionFault::BUFFER, context.fault_token)) return abort_child(-ENOMEM);
 #endif
         child->elf_buffer = new (std::nothrow) uint8_t[file_size];
         if (child->elf_buffer == nullptr) return abort_child(-ENOMEM);
@@ -4085,7 +4134,7 @@ auto create_native_process_task_impl(mod::sched::task::Task* owner, const Native
     if (int const ERROR = guarded([&] { return prepare_native_interpreter(*child, *scratch); }); ERROR != 0) return abort_child(ERROR);
 #ifdef WOS_SELFTEST
     auto recover_if_requested = [&](NativeConstructionFault fault) -> bool {
-        if (!exec_selftest_take_native_construction_fault(fault)) return false;
+        if (!exec_selftest_take_native_construction_fault(fault, context.fault_token)) return false;
         auto* recovered = mod::sched::task::take_unpublished_process(owner);
         if (recovered != child || !mod::sched::task::destroy_unpublished_process(recovered)) [[unlikely]] {
             mod::dbg::panic_handler("native launch: transferred recovery failed");
@@ -4255,11 +4304,14 @@ auto capture_user_native_compartment_inputs(NativeCompartmentPreparation& root, 
         return -EINVAL;
     if (input.argc > wire::VECTOR_MAX || input.envc > wire::VECTOR_MAX) return -E2BIG;
 #ifdef WOS_SELFTEST
-    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::USER_INPUT_STATE)) return -ENOMEM;
+    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::USER_INPUT_STATE, root.fault_token)) return -ENOMEM;
 #endif
     root.user_inputs.reset(new (std::nothrow) NativeCompartmentUserInputs);
     if (!root.user_inputs) return -ENOMEM;
     auto& stage = *root.user_inputs;
+#ifdef WOS_SELFTEST
+    stage.fault_token = root.fault_token;
+#endif
     auto copy_records = [&](uint64_t source, auto& records, uint64_t count) -> int {
         return count == 0 || mod::sys::usercopy::copy_from_task(root.executor, source, records.data(), count * sizeof(records[0]))
                    ? 0
@@ -4305,7 +4357,7 @@ auto capture_user_native_compartment_inputs(NativeCompartmentPreparation& root, 
         }
     }
 #ifdef WOS_SELFTEST
-    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::USER_ARGUMENT_ARENA)) return -ENOMEM;
+    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::USER_ARGUMENT_ARENA, stage.fault_token)) return -ENOMEM;
 #endif
     stage.strings.reset(new (std::nothrow) char[bytes != 0 ? bytes : 1]);
     if (!stage.strings) return -ENOMEM;
@@ -4345,7 +4397,7 @@ auto capture_user_native_compartment_inputs(NativeCompartmentPreparation& root, 
 
 auto populate_native_compartment_root(NativeCompartmentPreparation& root) -> int {
 #ifdef WOS_SELFTEST
-    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::CREATION_RESERVATION)) return -ENOMEM;
+    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::CREATION_RESERVATION, root.fault_token)) return -ENOMEM;
 #endif
     // The private validated limits include both the live creator and requested
     // NPROC limit. The reservation is owned before root allocation or import IO.
@@ -4381,7 +4433,7 @@ auto populate_native_compartment_root(NativeCompartmentPreparation& root) -> int
         status = mod::sched::pid_ns::create_namespace(*root.creator->pid_namespace(), root.policy.admitted.network, root.context.pids);
     if (status != 0) return status;
 #ifdef WOS_SELFTEST
-    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::CREATION_ROOT)) return -ENOMEM;
+    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::CREATION_ROOT, root.fault_token)) return -ENOMEM;
 #endif
     status = vfs::prepare_mount_filesystem("/", "tmpfs", nullptr, 0, "size=32M", nullptr, nullptr, &root.mount,
                                            vfs::MountPathKind::RETAINED_PHYSICAL, root.context.mounts, &root.policy.admitted.credentials);
@@ -4390,6 +4442,9 @@ auto populate_native_compartment_root(NativeCompartmentPreparation& root) -> int
     if (status != 0) return status;
     root.populator.reset(new (std::nothrow) mod::sched::task::Task{});
     if (!root.populator) return -ENOMEM;
+#ifdef WOS_SELFTEST
+    ker::test::lifecycle60::allocated_attempt_task(root.fault_token, root.populator.get());
+#endif
     root.populator->pid = mod::sched::task::get_next_pid();
     root.populator->type = mod::sched::task::TaskType::PROCESS;
     status = mod::sched::resource::initialize_credentials(*root.populator, root.policy.admitted.credentials);
@@ -4403,7 +4458,7 @@ auto populate_native_compartment_root(NativeCompartmentPreparation& root) -> int
         status = vfs::vfs_prepare_directory_view(root.policy.admitted.credentials, root.root_pin, root.root_pin, {}, root.view);
     if (status != 0) return status;
 #ifdef WOS_SELFTEST
-    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::CREATION_IMPORT_BUFFER)) return -ENOMEM;
+    if (exec_selftest_take_native_construction_fault(NativeConstructionFault::CREATION_IMPORT_BUFFER, root.fault_token)) return -ENOMEM;
 #endif
     constexpr size_t CHUNK = 8192;
     root.buffer.reset(new (std::nothrow) uint8_t[CHUNK]);
@@ -4424,7 +4479,7 @@ auto populate_native_compartment_root(NativeCompartmentPreparation& root) -> int
         size_t const SIZE = static_cast<size_t>(asset.stat.st_size);
         for (size_t offset = 0; offset < SIZE;) {
 #ifdef WOS_SELFTEST
-            if (exec_selftest_take_native_construction_fault(NativeConstructionFault::CREATION_IMPORT_READ)) return -EIO;
+            if (exec_selftest_take_native_construction_fault(NativeConstructionFault::CREATION_IMPORT_READ, root.fault_token)) return -EIO;
 #endif
             size_t const COUNT = std::min(CHUNK, SIZE - offset);
             ssize_t const READ = vfs::vfs_pread_file(asset.source, root.buffer.get(), COUNT, static_cast<off_t>(offset));
@@ -4603,7 +4658,12 @@ auto abort_native_compartment_preparation(mod::sched::task::Task& executor, mod:
 }
 
 static auto prepare_native_compartment_inputs_for_owner(mod::sched::task::Task& executor, const NativeCompartmentSpec* spec,
-                                                        uint64_t user_address, int& error) -> mod::sched::task::Task* {
+                                                        uint64_t user_address, int& error
+#ifdef WOS_SELFTEST
+                                                        ,
+                                                        NativeConstructionToken fault_token = {}
+#endif
+                                                        ) -> mod::sched::task::Task* {
     error = 0;
     ExecRequestArguments* request = nullptr;
     mod::sched::task::Task* child = nullptr;
@@ -4630,16 +4690,23 @@ static auto prepare_native_compartment_inputs_for_owner(mod::sched::task::Task& 
             return nullptr;
         }
         pending->native_compartment_request = true;
+#ifdef WOS_SELFTEST
+        pending->fault_token = fault_token;
+#endif
         request = pending.get();
         if (!adopt_exec_arguments(executor, pending)) {
             error = -EBUSY;
             return nullptr;
         }
 #ifdef WOS_SELFTEST
-        if (exec_selftest_take_native_construction_fault(NativeConstructionFault::CREATION_STATE)) error = -ENOMEM;
+        if (exec_selftest_take_native_construction_fault(NativeConstructionFault::CREATION_STATE, request->fault_token)) error = -ENOMEM;
 #endif
         if (error == 0) {
+#ifdef WOS_SELFTEST
+            request->compartment.reset(new (std::nothrow) NativeCompartmentPreparation(executor, request->fault_token));
+#else
             request->compartment.reset(new (std::nothrow) NativeCompartmentPreparation(executor));
+#endif
             if (!request->compartment) error = -ENOMEM;
         }
         if (error == 0)
@@ -4647,7 +4714,8 @@ static auto prepare_native_compartment_inputs_for_owner(mod::sched::task::Task& 
                                     : capture_user_native_compartment_inputs(*request->compartment, *request, user_address);
         if (error == 0) error = populate_native_compartment_root(*request->compartment);
 #ifdef WOS_SELFTEST
-        if (error == 0 && exec_selftest_take_native_construction_fault(NativeConstructionFault::CREATION_RECOVERY_IMPORT))
+        if (error == 0 &&
+            exec_selftest_take_native_construction_fault(NativeConstructionFault::CREATION_RECOVERY_IMPORT, request->fault_token))
             error = -ECANCELED;
 #endif
         if (error == 0) {
@@ -4689,7 +4757,8 @@ static auto prepare_native_compartment_inputs_for_owner(mod::sched::task::Task& 
                         descriptor.source = nullptr;
                 }
 #ifdef WOS_SELFTEST
-                if (error == 0 && exec_selftest_take_native_construction_fault(NativeConstructionFault::CREATION_DESCRIPTORS))
+                if (error == 0 &&
+                    exec_selftest_take_native_construction_fault(NativeConstructionFault::CREATION_DESCRIPTORS, root.fault_token))
                     error = -ENOMEM;
 #endif
             }
@@ -4704,7 +4773,8 @@ static auto prepare_native_compartment_inputs_for_owner(mod::sched::task::Task& 
         }
     }
 #ifdef WOS_SELFTEST
-    if (error == 0 && exec_selftest_take_native_construction_fault(NativeConstructionFault::CREATION_RECOVERY_BUILT)) {
+    if (error == 0 &&
+        exec_selftest_take_native_construction_fault(NativeConstructionFault::CREATION_RECOVERY_BUILT, request->fault_token)) {
         auto* recovered = mod::sched::task::take_unpublished_process(&executor);
         if (recovered != child || !mod::sched::task::destroy_unpublished_process(recovered)) [[unlikely]] {
             mod::dbg::panic_handler("native creation: transferred child recovery failed");
@@ -4725,9 +4795,17 @@ static auto prepare_native_compartment_inputs_for_owner(mod::sched::task::Task& 
     return child;
 }
 
-auto prepare_native_compartment_for_owner(mod::sched::task::Task& executor, const NativeCompartmentSpec& spec, int& error)
-    -> mod::sched::task::Task* {
+auto prepare_native_compartment_for_owner(mod::sched::task::Task& executor, const NativeCompartmentSpec& spec, int& error
+#ifdef WOS_SELFTEST
+                                          ,
+                                          NativeConstructionToken fault_token
+#endif
+                                          ) -> mod::sched::task::Task* {
+#ifdef WOS_SELFTEST
+    return prepare_native_compartment_inputs_for_owner(executor, &spec, 0, error, fault_token);
+#else
     return prepare_native_compartment_inputs_for_owner(executor, &spec, 0, error);
+#endif
 }
 
 auto publish_native_compartment_for_owner(mod::sched::task::Task& executor, mod::sched::task::Task* child) -> int64_t {
@@ -4769,13 +4847,15 @@ auto publish_native_compartment_for_owner(mod::sched::task::Task& executor, mod:
                 if (!membership) result = -ECANCELED;
             }
 #ifdef WOS_SELFTEST
-            if (result == 0 && exec_selftest_take_native_construction_fault(NativeConstructionFault::PUBLICATION_BEFORE_POST))
+            if (result == 0 &&
+                exec_selftest_take_native_construction_fault(NativeConstructionFault::PUBLICATION_BEFORE_POST, root->fault_token))
                 result = -EAGAIN;
 #endif
             if (result == 0) {
                 uint64_t cpu = mod::cpu::current_cpu();
 #ifdef WOS_SELFTEST
-                if (exec_selftest_take_native_construction_fault(NativeConstructionFault::PUBLICATION_INVALID_CPU)) cpu = UINT64_MAX;
+                if (exec_selftest_take_native_construction_fault(NativeConstructionFault::PUBLICATION_INVALID_CPU, root->fault_token))
+                    cpu = UINT64_MAX;
 #endif
                 if (!mod::sched::post_task_for_cpu(cpu, child)) result = -EAGAIN;
             }
@@ -4804,14 +4884,37 @@ auto create_native_compartment_for_subject(mod::sched::task::Task* executor, uin
     int const SCOPE = mod::security::compartment::host_namespace_admission(executor);
     if (SCOPE != 0) return SCOPE;
     if (mod::power::shutdown_in_progress()) return -ESHUTDOWN;
+#ifdef WOS_SELFTEST
+    NativeConstructionToken fault_token{};
+#endif
+#ifdef WOS_SELFTEST
+    // The controller owns attempt/death/disarm state; fatal usercopy can abandon
+    // this stack. Do not install a stack-only cleanup guard or infer an actor.
+    fault_token = exec_selftest_begin_native_construction_attempt(*executor);
+#endif
     int error = 0;
+#ifdef WOS_SELFTEST
+    auto* child = prepare_native_compartment_inputs_for_owner(*executor, nullptr, spec_address, error, fault_token);
+#else
     auto* child = prepare_native_compartment_inputs_for_owner(*executor, nullptr, spec_address, error);
+#endif
+#ifdef WOS_SELFTEST
+    if (child == nullptr) {
+        int64_t const RESULT = error != 0 ? error : -ENOEXEC;
+        ker::test::lifecycle60::create_returned(fault_token, RESULT);
+        return RESULT;
+    }
+#else
     if (child == nullptr) return error != 0 ? error : -ENOEXEC;
+#endif
     int64_t const RESULT = publish_native_compartment_for_owner(*executor, child);
     if (RESULT < 0 && !abort_native_compartment_preparation(*executor, child)) [[unlikely]] {
         mod::dbg::panic_handler("native public creation: lost preparation ownership");
         hcf();
     }
+#ifdef WOS_SELFTEST
+    ker::test::lifecycle60::create_returned(fault_token, RESULT);
+#endif
     return RESULT;
 }
 

@@ -8,6 +8,88 @@
 
 ## Outcome and scale
 
+Goal 39 is complete within the native compartment contract below. The ten
+acceptance criteria are verified by native production-entrypoint tests, public
+userspace fixtures, the full lifecycle/fault campaign and the actual two-hour
+service run. Existing syscall/wire contracts and root Host/init behavior are
+preserved. Network access defaults to denied; explicitly granted shared Host
+networking and inherited descriptors remain capabilities. Unsupported interfaces
+and private remote operations fail explicitly.
+
+Checkpoint 60 adds diagnostic ownership and storage census, scoped construction
+faults, public lifecycle and two-hour fixtures, and a bounded ordinary-shutdown
+witness. Root-aware diagnostic readers and ownership epochs allow the census to
+observe real drained owners without treating CPU billing as an ownership change.
+Billing locks, quotas and ordinary production semantics remain unchanged.
+
+The actual D07 campaign completes 1,000 create/exec/work/kill/destroy successes,
+24 kernel-consumed allocation faults and eight warmups. All 1,032 saved attempts,
+1,008 consuming wait-status-9 rows, original-init reap and covered ownership
+baselines validate. The kernel census accepts 2,066 boundaries in 2,171 calls;
+105 honest retries and zero refusals are recorded. Retained Host/init owners
+return to their real baseline rather than an invented zero count.
+
+Natural03's five UID100 roles complete 7,215 samples with a common guest interval
+of 7,210.000061 seconds and an independently received Host interval of
+7,210.371461437 seconds. All 13 durable reports total 2,390,784 bytes. Original
+init consumes controller status 0; ordinary poweroff, successful Linux stopped
+FAT/XFS mounts and whole payload/security-metadata readback are verified. Both
+campaigns prune all four owned images. Separate real-host checks confirm zero
+disposable allocation, absent original processes/sockets and the original launch
+guard and unrelated VM preserved. Continue rootless qualification with
+`bin/wos-cluster --no-setup` or isolated `bin/wos-ktest --no-setup`, one topology,
+the 20 GiB image budget, 40 GiB free-space floor and pruning after every outcome.
+
+Natural03's original Host checker remains failed: it incorrectly demanded the
+full durable `init-exit-status` line on serial, although the guest saves that
+line to disk and emits a nonce/sequence-bound commit marker. The separate
+real-host saved-evidence recovery02 exits 0 with all 19 gates passing, including
+the complete original timing, work, init, readback, ownership and cleanup checks.
+It preserves the original failed records and timestamps. The initial audit and
+recovery01 refusals also remain recorded; no failed command is renamed passed.
+
+### Acceptance signoff (2026-10-15)
+
+| Criterion | Verified evidence |
+| --- | --- |
+| 1. Independent mounts and Host view | Native93 exercises distinct backing objects at the same path, subject-aware mount/unmount and repeated pivot, with unchanged sibling and Host observations. |
+| 2. Local process identity and authorization | Native93 covers PID/PPID/TGID, groups, procfs, signals, consuming/nonconsuming wait and ptrace, including retained stale bindings and PID reuse. |
+| 3. Namespace-init death and teardown | Native lifecycle cases prove bounded descendant retirement and closed admission; D07 verifies actual scheduled owner/reference/storage and executor-return drains. |
+| 4. Scoped IPC and explicit sharing | Native SysV lookup and inherited-capability cases pass. Public59 run03 verifies 70 writable-sharing events, ordinary File/map coherence, real shared futex exchange and FD close/reuse. |
+| 5. No credential, authority or limit increase | Native mapped CREATE/refusal cases preserve credentials, authority and all 16 inherited limit pairs; creation requires canonical Host views and offers no integer join handle. |
+| 6. Path escapes and explicit grants | Native cases cover every named escape surface, including deterministic rename/publication interleavings, stale anchors, procfs links and device refusal; public manifests distinguish copied assets and retained FD grants. |
+| 7. Remote restrictions | Native WKI/routing cases verify refusal before remote effects for unsupported private execution, IPC/VFS/FD export and global controls, with no Host fallback. |
+| 8. Launcher, fixtures and two hours | Version-1 launcher parsing/help and public CREATE are checked. Actual Natural03 raw reports, both intervals over 7,200 seconds, Host work, init wait 0, natural shutdown and stopped readback pass the corrected saved-data audit. |
+| 9. 1,000 lifecycles with faults | Actual D07 completes all 1,000 successes and 24 consumed faults; task, mount, IPC, FD, namespace and covered mapping/returned-work ownership return to baseline. |
+| 10. Ordinary regressions | Native93 passes 1,463 enabled cases, 212 mandatory cases and 113,977 assertions. Current Normal/isolated fast KTEST builds and 21 Host checks pass; D07 and Natural03 exercise ordinary init, FS, child, credential, resource and libc paths. |
+
+The detailed final audit is retained locally as
+`build/goal39-evidence/checkpoint60-ten-criterion-final-evidence-audit05.{md,json}`;
+the JSON SHA256 is
+`b0d8a7c65998caa0c0e8eb792bcc680daabfa547dd898720e4f3072ef6c84b16`.
+D07's terminal audit SHA256 is
+`aa23c07017fd02ca97848dc2a3271deabebe24ba06eae4eca0174a427e06fc73`.
+Natural03's corrected saved-evidence audit SHA256 is
+`cef501984168925ed4cc0388230227750b930e3bb91ce2a89c79569fe863fcc5`;
+it holds all 2,662 admitted inputs and 2,717 total current inputs twice. Reproduce
+the public campaigns with the committed [lifecycle fixture](../tests/fixtures/compartment_lifecycle_runtime.md)
+and [two-hour fixture](../tests/fixtures/compartment_twohour_runtime.md).
+
+Native93 is historical runtime evidence on its recorded diagnostic kernel, with
+current source applicability independently checked; it is not a fresh default
+suite run on the final binary. Three declared BufferCache concurrency cases were
+skipped. Builds and execution used the combined workspace with pre-existing user
+work preserved; an owned-only clean HEAD was not separately built. The census
+covers the produced compartment graph and named owners, not a whole-kernel zero
+census. Rename races use deterministic interleavings, not an SMP rename storm.
+These limits do not add Linux-container compatibility, full POSIX mmap/IPC,
+independent networking, negotiated private remote transport or Goal 28 completion.
+
+### Earlier checkpoint outcomes (historical)
+
+The following checkpoint outcomes retain their original then-open criteria.
+The acceptance signoff above supersedes their incomplete status statements.
+
 Checkpoint 59 implements canonical writable sharing for ordinary TMPFS-backed
 shared mappings, including cached File descriptions. Independent mappings and
 ordinary file I/O use the same frames; per-inode cache authority prevents stale
@@ -385,7 +467,7 @@ and restart step, and mark the active goal blocked. Missing prerequisites or
 hardware are never completion. Budget and pause controls remain user/system
 controlled.
 
-## Current session checkpoint (2026-10-12)
+## Historical session checkpoint (2026-10-12)
 
 Selected after user-requested Goal28 checkpoint commit70bc3fe7 and goal switch.
 Goal28 remains incomplete as a repository checkpoint. The user cleared its

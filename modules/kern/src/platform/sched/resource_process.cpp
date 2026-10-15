@@ -1,5 +1,10 @@
 #include "resource_process.hpp"
 
+#ifdef WOS_SELFTEST
+#include <platform/mm/lifecycle_census.hpp>
+#include <test/compartment_lifecycle_runtime.hpp>
+#endif
+
 #include <cerrno>
 #include <platform/sched/native_creation_policy.hpp>
 #include <platform/sched/resource.hpp>
@@ -50,7 +55,12 @@ auto capture_native_creator_fields(task::Task& source, const security::compartme
 
 namespace {
 constexpr unsigned NPROC = static_cast<unsigned>(Id::NPROC);
+#ifdef WOS_SELFTEST
+ker::mod::mm::lifecycle_census::Epoch selftest_population_epoch{};
+ker::mod::mm::lifecycle_census::OwnerLock population_lock{selftest_population_epoch};
+#else
 sys::Spinlock population_lock;
+#endif
 ProcessCharge* population = nullptr;
 
 auto count_locked(uint32_t uid) -> uint64_t {
@@ -303,4 +313,43 @@ void copy_process_observation(task::Task& subject, abi::resource::Usage& usage) 
     subject.resource_lock.unlock_irqrestore(RESOURCE_FLAGS);
     population_lock.unlock_irqrestore(FLAGS);
 }
+#ifdef WOS_SELFTEST
+auto selftest_population_census(const ker::test::lifecycle60::CensusLease& lease) -> SelftestPopulationCensus {
+    auto const selftest_before = selftest_population_epoch.snapshot();
+    SelftestPopulationCensus out{.complete = true};
+    auto* executor = lease.subject();
+    if (!lease || executor == nullptr) {
+        out.complete = false;
+        return out;
+    }
+    out.executor_cookie = lease.cookie();
+    uint64_t const FLAGS = population_lock.observe_lock_irqsave();
+    uint64_t scanned = 0;
+    for (auto* node = population; node != nullptr; node = node->next) {
+        if (scanned++ == 65536) {
+            out.complete = false;
+            break;
+        }
+        if (node->subject == nullptr) {
+            ++out.reservations;
+            if (node->uid == 100) ++out.uid100_reservations;
+        } else {
+            ++out.attached_charges;
+            if (node->uid == 100) ++out.uid100_attached;
+        }
+    }
+    for (auto* node = executor != nullptr ? executor->pending_process_reservations : nullptr; node != nullptr; node = node->m_next) {
+        if (out.executor_pending == 65536) {
+            out.complete = false;
+            break;
+        }
+        ++out.executor_pending;
+    }
+    population_lock.observe_unlock_irqrestore(FLAGS);
+    out.stamp = selftest_population_epoch.snapshot();
+    out.complete = out.complete && ker::mod::mm::lifecycle_census::unchanged(selftest_before, out.stamp);
+    return out;
+}
+#endif
+
 }  // namespace ker::mod::sched::resource

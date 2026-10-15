@@ -451,6 +451,9 @@ inline constexpr size_t MAX_KERNEL_WORKER_CPU_PINS = 8;
 // of their scheduler state. For DAEMON workers only, from task context.
 auto pin_kernel_workers_to_cpus(std::span<const KernelWorkerCpuPin> requests) -> bool;
 bool can_query_current_task();
+#ifdef WOS_SELFTEST
+[[nodiscard]] auto selftest_task_context_ready_mask() noexcept -> uint64_t;
+#endif
 void remove_current_task();                               // Remove current task from runqueue (for exit)
 auto find_task_by_pid(uint64_t pid) -> task::Task*;       // Find a task by PID (O(1) via PID registry)
 auto find_task_by_pid_safe(uint64_t pid) -> task::Task*;  // Find task by PID with refcount (caller must release!)

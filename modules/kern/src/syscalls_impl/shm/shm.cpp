@@ -1,5 +1,9 @@
 #include "shm.hpp"
 
+#ifdef WOS_SELFTEST
+#include <platform/mm/lifecycle_census.hpp>
+#endif
+
 #include <abi/callnums/shm.h>
 
 #include <algorithm>
@@ -70,7 +74,12 @@ struct ShmAttachment {
     uint64_t size = 0;
 };
 
+#ifdef WOS_SELFTEST
+ker::mod::mm::lifecycle_census::Epoch selftest_shm_epoch{};
+ker::mod::mm::lifecycle_census::OwnerLock g_lock{selftest_shm_epoch};
+#else
 ker::mod::sys::Spinlock g_lock;
+#endif
 std::array<ShmSegment, MAX_SHM_SEGMENTS> g_segments{};
 std::array<ShmAttachment, MAX_SHM_ATTACHMENTS> g_attachments{};
 uint64_t g_next_id = 1;
@@ -376,6 +385,10 @@ auto create_segment(int key, uint64_t size, int shmflg, ker::mod::sched::task::T
 }
 
 auto shmget_impl(ker::mod::sched::task::Task* task, int key, uint64_t size, int shmflg) -> uint64_t {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_shm_epoch);
+#endif
+
     auto const* ipc_namespace = task != nullptr ? task->ipc_namespace() : nullptr;
     if (ipc_namespace == nullptr) {
         return to_errno(ESRCH);
@@ -429,6 +442,10 @@ auto shmget_impl(ker::mod::sched::task::Task* task, int key, uint64_t size, int 
 }
 
 auto shmat_impl(ker::mod::sched::task::Task* task, int shmid, uint64_t shmaddr, int shmflg) -> uint64_t {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_shm_epoch);
+#endif
+
     auto const* ipc_namespace = task != nullptr ? task->ipc_namespace() : nullptr;
     if (ipc_namespace == nullptr || task->pagemap == nullptr) {
         return to_errno(ESRCH);
@@ -540,6 +557,10 @@ void detach_attachment_locked(ShmAttachment& attachment, ker::mod::sched::task::
 }
 
 auto shmdt_impl(ker::mod::sched::task::Task* task, uint64_t shmaddr) -> uint64_t {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_shm_epoch);
+#endif
+
     if (task == nullptr) {
         return to_errno(ESRCH);
     }
@@ -656,6 +677,10 @@ auto sys_shm(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t /*a4*/
 }
 
 auto shm_clone_for_fork_locked(ker::mod::sched::task::Task* parent, ker::mod::sched::task::Task* child) -> bool {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_shm_epoch);
+#endif
+
     if (parent == nullptr || child == nullptr) {
         return true;
     }
@@ -683,6 +708,10 @@ auto shm_clone_for_fork_locked(ker::mod::sched::task::Task* parent, ker::mod::sc
 }
 
 void shm_cleanup_for_task(ker::mod::sched::task::Task* task) {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_shm_epoch);
+#endif
+
     if (task == nullptr || task->is_thread) {
         return;
     }
@@ -695,6 +724,10 @@ void shm_cleanup_for_task(ker::mod::sched::task::Task* task) {
 }
 
 void shm_retire_namespace(const NamespaceRef& ipc_namespace) {
+#ifdef WOS_SELFTEST
+    ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_shm_epoch);
+#endif
+
     if (ipc_namespace.is_host()) return;
     uint64_t const FLAGS = g_lock.lock_irqsave();
     ipc_namespace.close();
@@ -1392,6 +1425,33 @@ auto shm_selftest_visible_pid_denial_guards() -> bool {
             return false;
         return !visible_segment_state(ID).found;
     });
+}
+#endif
+
+#ifdef WOS_SELFTEST
+auto selftest_shm_census() -> SelftestShmCensus {
+    auto const selftest_before = selftest_shm_epoch.snapshot();
+    SelftestShmCensus out{.complete = true};
+    uint64_t const FLAGS = g_lock.observe_lock_irqsave();
+    for (const auto& segment : g_segments) {
+        if (!segment.active) continue;
+        ++out.active_segments;
+        if (segment.marked_destroy) ++out.marked_segments;
+        out.backing_pages += segment.page_count;
+        out.segment_attachment_pins += segment.attach_count;
+        if (!segment.ipc_namespace.is_host()) {
+            ++out.private_segments;
+            out.private_pages += segment.page_count;
+        }
+    }
+    for (const auto& attachment : g_attachments) {
+        if (attachment.active) ++out.active_attachments;
+        if (attachment.publishing) ++out.publishing_attachments;
+    }
+    g_lock.observe_unlock_irqrestore(FLAGS);
+    out.stamp = selftest_shm_epoch.snapshot();
+    out.complete = out.complete && ker::mod::mm::lifecycle_census::unchanged(selftest_before, out.stamp);
+    return out;
 }
 #endif
 

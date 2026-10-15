@@ -1,5 +1,12 @@
 #pragma once
 
+#ifdef WOS_SELFTEST
+#include <platform/mm/lifecycle_census.hpp>
+namespace ker::test::lifecycle60 {
+class CensusLease;
+}
+#endif
+
 #include <abi/resource.hpp>
 #include <cstdint>
 #include <platform/security/credentials.hpp>
@@ -27,6 +34,18 @@ struct ProcessCharge {
     bool linked = false;
 };
 
+#ifdef WOS_SELFTEST
+struct SelftestPopulationCensus {
+    ker::mod::mm::lifecycle_census::Stamp stamp{};
+    uint64_t reservations{}, attached_charges{}, uid100_reservations{}, uid100_attached{}, executor_pending{}, executor_cookie{};
+    bool complete{};
+    auto operator==(const SelftestPopulationCensus&) const -> bool = default;
+};
+// The controller-issued ACK lease authorizes executor observation. The
+// reservation list is additionally protected by population_lock; no raw Task overload.
+[[nodiscard]] auto selftest_population_census(const ker::test::lifecycle60::CensusLease& lease) -> SelftestPopulationCensus;
+#endif
+
 class ProcessReservation {
    public:
     // A null policy is reserved for trusted boot/receiver seeding. It still
@@ -43,6 +62,9 @@ class ProcessReservation {
     void cancel();
 
    private:
+#ifdef WOS_SELFTEST
+    friend auto selftest_population_census(const ker::test::lifecycle60::CensusLease&) -> SelftestPopulationCensus;
+#endif
     void reserve(task::Task* policy, State* private_policy, uint32_t uid, task::Task* executor_fallback);
     void unlink_executor_locked();
     ProcessCharge m_charge;

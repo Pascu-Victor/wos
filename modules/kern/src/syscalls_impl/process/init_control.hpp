@@ -20,6 +20,11 @@ auto wos_proc_init_status_publish(uint64_t status_addr) -> uint64_t;
 auto wos_proc_init_status_read(uint64_t status_addr) -> uint64_t;
 
 #ifdef WOS_SELFTEST
+// Diagnostic-only scalar observation, never a user-selected stage/authority.
+struct SelftestLifecycleInitBoundary {
+    uint64_t generation{}, status_sequence{}, journal_pid{}, journal_generation{};
+};
+auto selftest_lifecycle_init_boundary(uint64_t slot, bool after, SelftestLifecycleInitBoundary& empty) noexcept -> bool;
 auto init_control_selftest_mailbox() -> bool;
 auto init_control_selftest_validation() -> bool;
 auto init_control_selftest_process_role() -> bool;
