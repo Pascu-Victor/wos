@@ -22,9 +22,11 @@ shutdown. Its four disposable images are pruned, with zero allocation and the
 unrelated VM confirmed by the real-host postcheck and independent audit.
 Native88's stale test assertion remains failed evidence; the correction retains
 the original growth cohorts and byte/reference/protection/cleanup checks.
-The first public attempt stops before VM launch because libguestfs cache
-timestamp refreshes trip the harness metadata check; its boot copy and inactive
-socket are cleaned up. Fresh retry02 passes the 129-page read-only public
+The first public attempt stops at the observer's metadata check before VM
+launch. Appliance-cache timestamp refreshes are consistent with the diagnosis;
+the original metadata baseline was not saved, so the exact triggering difference
+cannot be replayed. Its boot copy and inactive socket are cleaned up. Fresh
+retry02 passes the 129-page read-only public
 mapping, thread/fork inheritance, cold hardware/software faults, actual futex
 exchange, exec/exit, whole protection/unmap and eventual EOF-lease release on
 the normal eight-CPU kernel. All nine reports and 13 prepared/stopped artifacts

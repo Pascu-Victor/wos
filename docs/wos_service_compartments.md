@@ -2518,9 +2518,11 @@ processes/sockets and the protected VM and original guard unchanged. The
 independent saved guest-terminal audit verifies all 80 raw events, all 1,931
 admitted input hashes, ten successful commands and both artifact readback sets.
 
-The earlier attempt remains failed evidence: it stops before VM launch when
-libguestfs refreshes appliance-cache timestamps. All 1,916 input content and
-alias hashes remain unchanged. Its one boot copy and an inactive guestfs socket
+The earlier attempt remains failed evidence: its metadata observer stops it
+before VM launch. Appliance-cache timestamp refreshes are consistent with the
+diagnosis, but the original metadata baseline was not saved and the exact
+triggering difference cannot be replayed. All 1,916 input content and alias
+hashes remain unchanged. Its one boot copy and an inactive guestfs socket
 are cleaned up; the unchanged strict postcheck then passes. The retry permits
 timestamp refreshes only for the three exact current appliance-cache files,
 preserving their other identity/ownership metadata, all other source metadata
