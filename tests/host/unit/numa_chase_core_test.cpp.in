@@ -1,0 +1,86 @@
+#include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
+#include "ACTUAL_CORE_HEADER"
+unsigned checks{};
+void check(bool v, const char* reason) {
+    ++checks;
+    if (!v) {
+        std::fprintf(stderr, "FAIL actual core: %s\n", reason);
+        std::exit(1);
+    }
+}
+int main() {
+    using namespace numa_bench;
+    for (uint32_t n : {1U, 3U, 17U, 4096U})
+        for (uint64_t seed : {uint64_t{0}, uint64_t{0x402109}, UINT64_MAX}) {
+            size_t bytes = static_cast<size_t>(n) * 64;
+            void* m = std::aligned_alloc(64, bytes);
+            check(m != nullptr, "own actual aligned payload");
+            std::vector<uint32_t> order(n);
+            permutation(order.data(), n, seed);
+            initialize_cycle(m, bytes, order.data(), n);
+            std::vector<bool> seen(n);
+            uintptr_t base = reinterpret_cast<uintptr_t>(m), cursor = base + static_cast<uintptr_t>(order[0]) * 64;
+            for (uint32_t step = 0; step < n; ++step) {
+                uint64_t index;
+                check(consumed_index(base, bytes, cursor, index) && !seen[index], "exact one cycle visits each distinct element");
+                seen[index] = true;
+                cursor = *reinterpret_cast<const volatile uintptr_t*>(cursor);
+            }
+            check(cursor == base + static_cast<uintptr_t>(order[0]) * 64, "full cycle returns start");
+            for (uint32_t i = 0; i < n; ++i)
+                for (uint32_t byte = sizeof(uintptr_t); byte < 64; ++byte)
+                    check(static_cast<uint8_t*>(m)[static_cast<size_t>(i) * 64 + byte] == 0xa5, "every non-link byte initialized");
+            for (uint64_t loads : {uint64_t{1}, uint64_t{19}, uint64_t{31}}) {
+                uint64_t index;
+                check(consumed_index(base, bytes, dependent_loads(base + static_cast<uintptr_t>(order[0]) * 64, loads), index) &&
+                          index == order[loads % n],
+                      "actual dependent loop consumes requested chain depth");
+            }
+            uint64_t ignored;
+            check(!consumed_index(base, bytes, base - 1, ignored) && !consumed_index(base, bytes, base + bytes, ignored) &&
+                      !consumed_index(base, bytes, base + 1, ignored),
+                  "consumed pointer bounds");
+            std::free(m);
+        }
+    Options o;
+    check(parse_options(0, nullptr, o) && o.pairs == 10 && o.bytes == 67108864 && o.loads == 16777216 && o.seed == 0x402109,
+          "exact frozen defaults");
+    auto parse = [&](std::initializer_list<const char*> values, bool expected) {
+        std::vector<char*> args;
+        for (auto* p : values) args.push_back(const_cast<char*>(p));
+        Options out;
+        out.seed = 17;
+        bool ok = parse_options(args.size(), args.data(), out);
+        check(ok == expected, "option acceptance");
+        if (!ok) check(out.seed == 17, "parse failure does not mutate output");
+    };
+    parse({"--pairs", "1", "--bytes", "1048576", "--loads", "1", "--seed", "0xffffffffffffffff", "--chase-cpu", "63", "--stride", "64",
+           "--timeout-ms", "1000"},
+          true);
+    parse({"--bytes", "3145728"}, true);
+    for (auto name :
+         {"--pairs", "--bytes", "--loads", "--seed", "--chase-cpu", "--local-init-cpu", "--remote-init-cpu", "--stride", "--timeout-ms"})
+        parse({name, "1", name, "1"}, false);
+    parse({"--seed", "18446744073709551616"}, false);
+    parse({"--seed", "-1"}, false);
+    parse({"--seed", "+1"}, false);
+    parse({"--seed", "1x"}, false);
+    parse({"--wat", "1"}, false);
+    parse({"--pairs"}, false);
+    parse({"--pairs", "0"}, false);
+    parse({"--pairs", "11"}, false);
+    parse({"--bytes", "1048577"}, false);
+    parse({"--bytes", "67112960"}, false);
+    parse({"--loads", "268435457"}, false);
+    parse({"--chase-cpu", "64"}, false);
+    parse({"--stride", "128"}, false);
+    parse({"--timeout-ms", "999"}, false);
+    check(exact_mask(uint64_t{1} << 63, 63) && !raw_error(uint64_t{1} << 63) && !exact_mask(static_cast<uint64_t>(-EPERM), 63) &&
+              raw_error(static_cast<uint64_t>(-EPERM)),
+          "CPU63 bits precede errno");
+    std::printf("PASS actual permutation/dependent/options helpers checks=%u\n", checks);
+}

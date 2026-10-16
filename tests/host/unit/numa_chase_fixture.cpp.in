@@ -1,0 +1,359 @@
+// Actual userspace benchmark TU + real Linux pthread/mmap/monotonic ports.
+// WOS topology/affinity/policy/resident metadata are explicit Host seams.
+// Host resident queries observe initialized bytes and attribute first observation
+// to the initializer; they do NOT qualify Linux/WOS physical NUMA or nofault.
+#include <pthread.h>
+#include <sched.h>
+#include <sys/mman.h>
+#include <sys/numa.h>
+#include <time.h>
+
+#include <array>
+#include <atomic>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <new>
+#include <vector>
+
+#include "ACTUAL_BENCH_HEADER"
+namespace model {
+namespace abi = ker::abi::vmem::numa;
+struct Thread {
+    uint64_t tid{};
+    std::atomic<uint64_t> mask{};
+    std::atomic<uint64_t> cpu{UINT64_MAX};
+    unsigned busy{2};
+};
+struct Region {
+    void* pointer{};
+    size_t bytes{};
+    uint16_t node{abi::INVALID_NODE};
+};
+std::mutex lock;
+std::vector<std::unique_ptr<Thread>> threads;
+std::vector<Region> regions;
+thread_local Thread* current{};
+std::atomic<unsigned> created{}, joined{}, maps{}, unmaps{};
+unsigned create_attempts{}, map_attempts{}, cpu_count{8}, condition_attempts{}, fail_condition_at{};
+std::atomic<unsigned> mutex_live{}, condition_live{};
+bool bad_node{}, bad_reserved{}, fail_clock{}, fail_scratch{}, always_busy{}, early_unmap{};
+unsigned fail_create_at{}, fail_map_at{};
+bool late_broadcast{}, late_unlock{};
+std::atomic<unsigned> chase_completions{};
+std::atomic<bool> final_completion_unlocked{}, controller_observed_completion{};
+thread_local bool await_controller_after_unlock{};
+uint16_t node_for(uint64_t cpu) { return cpu < cpu_count / 2 ? 0 : 1; }
+struct Start {
+    void* (*function)(void*);
+    void* arg;
+    Thread* subject;
+};
+void* start(void* arg) {
+    std::unique_ptr<Start> owned(static_cast<Start*>(arg));
+    current = owned->subject;
+    return owned->function(owned->arg);
+}
+void require(bool condition, const char* reason) {
+    if (!condition) {
+        std::fprintf(stderr, "FAIL Host endpoint: %s\n", reason);
+        std::exit(9);
+    }
+}
+}  // namespace model
+extern "C" int __real_pthread_create(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*);
+extern "C" int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attributes, void* (*function)(void*), void* arg) {
+    ++model::create_attempts;
+    if (model::fail_create_at == model::create_attempts) return EAGAIN;
+    auto subject = std::make_unique<model::Thread>();
+    subject->tid = 100 + model::create_attempts;
+    auto* raw = subject.get();
+    {
+        std::lock_guard guard(model::lock);
+        model::threads.push_back(std::move(subject));
+    }
+    auto* start = new model::Start{function, arg, raw};
+    int rc = __real_pthread_create(thread, attributes, model::start, start);
+    if (rc == 0)
+        ++model::created;
+    else
+        delete start;
+    return rc;
+}
+extern "C" int __real_pthread_join(pthread_t, void**);
+extern "C" int __wrap_pthread_join(pthread_t thread, void** value) {
+    int rc = __real_pthread_join(thread, value);
+    if (rc == 0) ++model::joined;
+    return rc;
+}
+extern "C" void* __real_mmap(void*, size_t, int, int, int, off_t);
+extern "C" void* __wrap_mmap(void* hint, size_t bytes, int prot, int flags, int fd, off_t offset) {
+    ++model::map_attempts;
+    if (model::fail_map_at == model::map_attempts) {
+        errno = ENOMEM;
+        return MAP_FAILED;
+    }
+    model::require(hint == nullptr && prot == (PROT_READ | PROT_WRITE) && flags == (MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE) &&
+                       fd == -1 && offset == 0,
+                   "actual virgin map arguments");
+    void* p = __real_mmap(hint, bytes, prot, flags, fd, offset);
+    if (p != MAP_FAILED) {
+        std::lock_guard guard(model::lock);
+        model::regions.push_back({p, bytes});
+        ++model::maps;
+    }
+    return p;
+}
+extern "C" int __real_munmap(void*, size_t);
+extern "C" int __wrap_munmap(void* pointer, size_t bytes) {
+    std::lock_guard guard(model::lock);
+    if (model::joined != model::created) model::early_unmap = true;
+    for (auto i = model::regions.begin(); i != model::regions.end(); ++i)
+        if (i->pointer == pointer && i->bytes == bytes) {
+            int rc = __real_munmap(pointer, bytes);
+            if (rc == 0) {
+                model::regions.erase(i);
+                ++model::unmaps;
+            }
+            return rc;
+        }
+    model::require(false, "unmap exact owned region");
+    return -1;
+}
+extern "C" int __real_clock_getres(clockid_t, timespec*);
+extern "C" int __wrap_clock_getres(clockid_t clock, timespec* output) {
+    if (model::fail_clock) {
+        errno = EIO;
+        return -1;
+    }
+    return __real_clock_getres(clock, output);
+}
+extern "C" void* __real__ZnamRKSt9nothrow_t(size_t, const std::nothrow_t&) noexcept;
+extern "C" void* __wrap__ZnamRKSt9nothrow_t(size_t bytes, const std::nothrow_t& tag) noexcept {
+    return model::fail_scratch ? nullptr : __real__ZnamRKSt9nothrow_t(bytes, tag);
+}
+extern "C" int __real_pthread_mutex_init(pthread_mutex_t*, const pthread_mutexattr_t*);
+extern "C" int __wrap_pthread_mutex_init(pthread_mutex_t* mutex, const pthread_mutexattr_t* attr) {
+    int const rc = __real_pthread_mutex_init(mutex, attr);
+    if (rc == 0) ++model::mutex_live;
+    return rc;
+}
+extern "C" int __real_pthread_cond_init(pthread_cond_t*, const pthread_condattr_t*);
+extern "C" int __wrap_pthread_cond_init(pthread_cond_t* condition, const pthread_condattr_t* attr) {
+    ++model::condition_attempts;
+    if (model::condition_attempts == model::fail_condition_at) return ENOMEM;
+    int const rc = __real_pthread_cond_init(condition, attr);
+    if (rc == 0) ++model::condition_live;
+    return rc;
+}
+extern "C" int __real_pthread_mutex_destroy(pthread_mutex_t*);
+extern "C" int __wrap_pthread_mutex_destroy(pthread_mutex_t* mutex) {
+    int const rc = __real_pthread_mutex_destroy(mutex);
+    if (rc == 0) --model::mutex_live;
+    return rc;
+}
+extern "C" int __real_pthread_cond_destroy(pthread_cond_t*);
+extern "C" int __wrap_pthread_cond_destroy(pthread_cond_t* condition) {
+    int const rc = __real_pthread_cond_destroy(condition);
+    if (rc == 0) --model::condition_live;
+    return rc;
+}
+// Completion is already published by the actual worker when it calls this
+// endpoint. Keep real pthread wake/unlock effects, then inject a return error.
+extern "C" int __real_pthread_cond_broadcast(pthread_cond_t*);
+extern "C" int __wrap_pthread_cond_broadcast(pthread_cond_t* condition) {
+    int const rc = __real_pthread_cond_broadcast(condition);
+    if (model::current != nullptr && model::current->tid == 101 && ++model::chase_completions == 4 &&
+        (model::late_broadcast || model::late_unlock)) {
+        model::await_controller_after_unlock = true;
+        return model::late_broadcast ? EIO : rc;
+    }
+    return rc;
+}
+extern "C" int __real_pthread_mutex_unlock(pthread_mutex_t*);
+extern "C" int __wrap_pthread_mutex_unlock(pthread_mutex_t* mutex) {
+    int const rc = __real_pthread_mutex_unlock(mutex);
+    if (model::await_controller_after_unlock) {
+        model::await_controller_after_unlock = false;
+        model::final_completion_unlocked.store(true, std::memory_order_release);
+        timespec start{}, now{};
+        model::require(clock_gettime(CLOCK_MONOTONIC, &start) == 0, "endpoint clock");
+        while (!model::controller_observed_completion.load(std::memory_order_acquire)) {
+            model::require(clock_gettime(CLOCK_MONOTONIC, &now) == 0 && now.tv_sec - start.tv_sec < 3,
+                           "controller must actually observe final completion before late error");
+            sched_yield();
+        }
+        if (model::late_unlock) return EPERM;
+    }
+    return rc;
+}
+extern "C" int __real_fflush(FILE*);
+extern "C" int __wrap_fflush(FILE* stream) {
+    int const rc = __real_fflush(stream);
+    if (stream == stdout && model::current == nullptr && model::final_completion_unlocked.load(std::memory_order_acquire))
+        model::controller_observed_completion.store(true, std::memory_order_release);
+    return rc;
+}
+namespace ker::multiproc {
+uint64_t currentThreadId() { return model::current ? model::current->tid : 1; }
+uint64_t getcurrent_cpu() { return model::current ? model::current->cpu.load() : 0; }
+uint64_t yield() { return sched_yield() == 0 ? 0 : static_cast<uint64_t>(-errno); }
+int64_t setThreadAffinityMask(uint64_t tid, uint64_t mask) {
+    std::lock_guard guard(model::lock);
+    for (auto& state : model::threads)
+        if (state->tid == tid) {
+            if (model::always_busy || state->busy) {
+                if (state->busy) --state->busy;
+                return -EBUSY;
+            }
+            if (mask == 0 || (mask & (mask - 1))) return -EINVAL;
+            auto cpu = static_cast<uint64_t>(__builtin_ctzll(mask));
+            if (cpu >= model::cpu_count) return -EINVAL;
+            if (model::current == state.get() && state->cpu != cpu) return -EBUSY;
+            state->mask = mask;
+            state->cpu = cpu;
+            return 0;
+        }
+    return -ESRCH;
+}
+int64_t getThreadAffinityMask(uint64_t tid) {
+    std::lock_guard guard(model::lock);
+    for (auto& state : model::threads)
+        if (state->tid == tid) return static_cast<int64_t>(state->mask.load());
+    return -ESRCH;
+}
+}  // namespace ker::multiproc
+namespace ker::vmem {
+int64_t set_memory_policy(const model::abi::PolicyRequest& request) {
+    return request.version == 1 && request.bytes == sizeof(request) && request.mode == 0 && request.flags == 0 && request.nodes == 0 &&
+                   request.reserved64 == 0
+               ? 0
+               : -EINVAL;
+}
+int64_t query_numa(const model::abi::QueryRequest& request) {
+    using namespace model;
+    using namespace model::abi;
+    require(request.version == VERSION && request.bytes == sizeof(request) && request.flags == 0 && request.reserved32_a == 0 &&
+                request.reserved32_b == 0 && request.reserved64 == 0,
+            "zeroed actual query transport");
+    void* output = reinterpret_cast<void*>(request.output_address);
+    switch (static_cast<QueryKind>(request.kind)) {
+        case QueryKind::SUMMARY: {
+            require(request.output_bytes == sizeof(Summary), "summary extent");
+            auto& o = *static_cast<Summary*>(output);
+            o = {};
+            o.version = VERSION;
+            o.bytes = sizeof(o);
+            o.features = FEATURES_V1;
+            o.provenance = 2;
+            o.node_count = 2;
+            o.cpu_count = cpu_count;
+            o.page_bytes = 4096;
+            o.max_page_nodes = 64;
+            o.cpu_mask_words = 4;
+            return 0;
+        }
+        case QueryKind::NODE: {
+            require(request.index < 2 && request.output_bytes == sizeof(Node), "node extent");
+            auto& o = *static_cast<Node*>(output);
+            o = {};
+            o.version = VERSION;
+            o.bytes = sizeof(o);
+            o.node = static_cast<uint16_t>(request.index);
+            o.managed_bytes = 1ULL << 30;
+            for (unsigned cpu = 0; cpu < cpu_count; ++cpu)
+                if (node_for(cpu) == o.node) o.cpu_words[cpu / 64] |= uint64_t{1} << (cpu % 64);
+            return 0;
+        }
+        case QueryKind::SELF_POLICY: {
+            require(current != nullptr && request.output_bytes == sizeof(SelfPolicy), "actual thread policy context");
+            auto& o = *static_cast<SelfPolicy*>(output);
+            o = {};
+            o.version = VERSION;
+            o.bytes = sizeof(o);
+            return 0;
+        }
+        case QueryKind::PAGE_NODES: {
+            require(request.count >= 1 && request.count <= 64 && request.address % 4096 == 0 &&
+                        request.output_bytes == request.count * sizeof(PageNode),
+                    "page query extent");
+            std::lock_guard guard(lock);
+            auto* rows = static_cast<PageNode*>(output);
+            for (uint32_t i = 0; i < request.count; ++i) {
+                uintptr_t address = request.address + static_cast<uint64_t>(i) * 4096;
+                Region* found = nullptr;
+                for (auto& region : regions)
+                    if (address >= reinterpret_cast<uintptr_t>(region.pointer) &&
+                        address - reinterpret_cast<uintptr_t>(region.pointer) < region.bytes) {
+                        found = &region;
+                        break;
+                    }
+                require(found != nullptr, "query actual live mapping");
+                auto* bytes = reinterpret_cast<const volatile uint8_t*>(address);
+                bool const initialized = bytes[sizeof(uintptr_t)] == 0xa5;
+                if (initialized && found->node == INVALID_NODE) {
+                    require(current != nullptr && current->cpu < cpu_count, "initializer actor");
+                    found->node = node_for(current->cpu);
+                }
+                rows[i] = {INVALID_NODE, static_cast<uint16_t>(PageStatus::UNAVAILABLE), bad_reserved ? 1U : 0U};
+                if (initialized) {
+                    uint16_t const node = bad_node ? static_cast<uint16_t>(1 - found->node) : found->node;
+                    rows[i].node = node;
+                    rows[i].status = static_cast<uint16_t>(PageStatus::RESIDENT);
+                }
+            }
+            return 0;
+        }
+    }
+    return -EINVAL;
+}
+}  // namespace ker::vmem
+int main(int argc, char** argv) {
+    const char* kind = argc == 2 ? argv[1] : "happy";
+    bool success = std::strcmp(kind, "happy") == 0 || std::strcmp(kind, "cpu63") == 0;
+    if (std::strcmp(kind, "cpu63") == 0)
+        model::cpu_count = 64;
+    else if (std::strcmp(kind, "control-init") == 0)
+        model::fail_condition_at = 2;
+    else if (std::strcmp(kind, "partial-create") == 0)
+        model::fail_create_at = 2;
+    else if (std::strcmp(kind, "map-oom") == 0)
+        model::fail_map_at = 1;
+    else if (std::strcmp(kind, "bad-node") == 0)
+        model::bad_node = true;
+    else if (std::strcmp(kind, "bad-reserved") == 0)
+        model::bad_reserved = true;
+    else if (std::strcmp(kind, "clock-error") == 0)
+        model::fail_clock = true;
+    else if (std::strcmp(kind, "scratch-oom") == 0)
+        model::fail_scratch = true;
+    else if (std::strcmp(kind, "placement-timeout") == 0)
+        model::always_busy = true;
+    else if (std::strcmp(kind, "late-broadcast") == 0)
+        model::late_broadcast = true;
+    else if (std::strcmp(kind, "late-unlock") == 0)
+        model::late_unlock = true;
+    else
+        model::require(std::strcmp(kind, "happy") == 0, "known case");
+    std::vector<const char*> words{"--pairs", "2",     "--bytes",      "1048576",
+                                   "--loads", "65539", "--timeout-ms", model::always_busy ? "1000" : "10000"};
+    if (model::cpu_count == 64) {
+        words.insert(words.end(), {"--chase-cpu", "63", "--local-init-cpu", "63", "--remote-init-cpu", "0"});
+    }
+    std::vector<char*> args;
+    for (auto* p : words) args.push_back(const_cast<char*>(p));
+    int rc = run_numa_chase(static_cast<int>(args.size()), args.data());
+    if (model::late_broadcast || model::late_unlock)
+        model::require(model::controller_observed_completion.load(std::memory_order_acquire),
+                       "actual controller observed completed last job before injected worker error");
+    model::require((rc == 0) == success, "actual run status against injected endpoint");
+    model::require(model::created == model::joined && !model::early_unmap && model::regions.empty() && model::maps == model::unmaps &&
+                       model::mutex_live == 0 && model::condition_live == 0,
+                   "real joins precede all owned mapping returns");
+    if (success) model::require(model::created == 3 && model::maps == 4, "actual successful prefix ledger");
+    std::fprintf(stderr, "PASS actual benchmark Host ports case=%s created=%u joined=%u maps=%u unmaps=%u\n", kind, model::created.load(),
+                 model::joined.load(), model::maps.load(), model::unmaps.load());
+}

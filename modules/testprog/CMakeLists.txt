@@ -33,6 +33,7 @@ set(SOURCES
     src/memory_pressure.cpp
     src/netbench.cpp
     src/numa_locality.cpp
+    src/numa_bench.cpp
     src/perfbench.cpp
     src/resource_limits.cpp
     src/thread_exit_stress.cpp
