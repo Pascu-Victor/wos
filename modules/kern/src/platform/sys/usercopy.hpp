@@ -90,6 +90,7 @@ class StableUserPage {
 
    private:
     friend auto pin_task_user_page(sched::task::Task&, uint64_t, bool, bool, StableUserPage&) -> bool;
+    friend auto pin_current_task_user_page(sched::task::Task&, uint64_t, bool, StableUserPage&) -> bool;
     void reset();
 
     sched::task::Task* m_task{};
@@ -100,6 +101,14 @@ class StableUserPage {
 [[nodiscard]] auto range_valid(uint64_t user_addr, size_t size) -> bool;
 [[nodiscard]] auto pin_task_user_page(sched::task::Task& task, uint64_t user_addr, bool require_writable, bool fault_in,
                                       StableUserPage& out) -> bool;
+// Opt in only at audited ordinary syscall pre-owner frontiers. The short
+// preparation scope ends before the old pin; nonordinary/foreign callers keep
+// the old generic behavior. No caller MM/publication/backend/access guard.
+[[nodiscard]] auto pin_current_task_user_page(sched::task::Task& task, uint64_t user_addr, bool require_writable, StableUserPage& out)
+    -> bool;
+[[nodiscard]] auto copy_from_current_task_partial(sched::task::Task& task, uint64_t user_addr, void* dst, size_t size) -> CopyResult;
+[[nodiscard]] auto copy_to_current_task_partial(sched::task::Task& task, uint64_t user_addr, const void* src, size_t size) -> CopyResult;
+[[nodiscard]] auto ensure_current_task_writable(sched::task::Task& task, uint64_t user_addr, size_t size) -> bool;
 // Stable no-fault translation for diagnostics only. The returned physical
 // address is a snapshot and must never be dereferenced after this function
 // releases its pin.

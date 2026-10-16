@@ -63,6 +63,7 @@ struct PlainStorage {
     MmActivitySnapshot activity_a{}, activity_b{};
     MmActivityRelation activity_relation{};
     uint64_t physical_clock_us[4]{}, physical_clock_valid{};
+    MmDebtCaptureScratch mm_capture_a{}, mm_capture_b{};
 };
 static_assert(std::is_trivially_copyable_v<PlainStorage>);
 static_assert(sizeof(PlainStorage) <= 2 * 1024 * 1024);
@@ -275,6 +276,21 @@ auto mm_settled(const MmDebtSnapshot& m, const RegistrySnapshot& registry) noexc
            m.retained_frame_refs == 0 && m.task_usercopy_accesses == 0 && m.pin_returns == 0 && m.lazy_returns == 0 && m.swap_queued == 0 &&
            m.swap_pageins == 0 && m.swap_pageouts == 0 && m.swap_waiters == 0 && m.swap_returns == 0 && m.registry_returns == 0 &&
            m.legacy_file_registry_rows == registry.legacy_rows && m.native_file_registry_rows == registry.native_rows;
+}
+// This TU is instrumented. Prefault actual caller-owned MM/Stamp outputs
+// before the excluded physical collector or any allocator lock is entered.
+// The ignored provider capture separately preflights its selected input graph.
+void prepare_mm_capture(MmDebtSnapshot& mm, MmDebtCaptureScratch& capture) noexcept {
+    auto* mm_bytes = reinterpret_cast<volatile unsigned char*>(&mm);
+    for (size_t i = 0; i < sizeof(mm); ++i) mm_bytes[i] = 0;
+    auto* capture_bytes = reinterpret_cast<volatile unsigned char*>(&capture);
+    for (size_t i = 0; i < sizeof(capture); ++i) capture_bytes[i] = 0;
+}
+auto coherent_registry_mm(const RegistrySnapshot& registry, const MmDebtSnapshot& mm) noexcept -> bool {
+    // The locked registry copy precedes the physical-lock MM point. Exact
+    // nonwrapping version equality closes every intervening covered mutation.
+    return registry_complete(registry) && mm_complete(mm) && mm.version_begin != 0 && mm.version_begin != UINT64_MAX &&
+           registry.stamp.version == mm.version_begin;
 }
 auto same_physical_counts(const balance::Counts& a, const balance::Counts& b) noexcept -> bool {
     if (a.managed_pages != b.managed_pages || a.free_pages != b.free_pages || a.cached_free_pages != b.cached_free_pages ||
@@ -516,25 +532,27 @@ class CensusHandler final {
         // No retained roots, locks, frame pins or usercopy scopes. The typed
         // permission authorizes only this actual current accounted executor.
         CurrentCensusScope scope{actor, s.cookie, s.root_serial};
+        prepare_mm_capture(plain.mm_a, plain.mm_capture_a);
+        prepare_mm_capture(plain.mm_b, plain.mm_capture_b);
         bool const owner_a = collect_owners(scope, plain.owner_a);
         collect_scalars(scope, plain.scalar_a);
         sched::task::selftest_current_native_debt_snapshot(plain.native_a);
         syscall::vmem::selftest_file_registry_snapshot(plain.registry_a);
-        mm_debt::snapshot(plain.mm_a);
         mm_debt::activity_snapshot(plain.activity_a);
         plain.physical_clock_us[0] = mod::time::get_us();
-        auto const physical_a = balance::snapshot(plain.physical_a, plain.physical_work, MAX_FRAMES);
+        auto const physical_a =
+            balance::selftest_snapshot_with_mm(plain.physical_a, plain.physical_work, plain.mm_a, plain.mm_capture_a, MAX_FRAMES);
         plain.physical_clock_us[1] = mod::time::get_us();
+        syscall::vmem::selftest_file_registry_snapshot(plain.registry_b);
         plain.physical_clock_us[2] = mod::time::get_us();
-        auto const physical_b = balance::snapshot(plain.physical_b, plain.physical_work, MAX_FRAMES);
+        auto const physical_b =
+            balance::selftest_snapshot_with_mm(plain.physical_b, plain.physical_work, plain.mm_b, plain.mm_capture_b, MAX_FRAMES);
         plain.physical_clock_us[3] = mod::time::get_us();
         plain.physical_clock_valid = plain.physical_clock_us[0] <= plain.physical_clock_us[1] &&
                                      plain.physical_clock_us[1] <= plain.physical_clock_us[2] &&
                                      plain.physical_clock_us[2] <= plain.physical_clock_us[3];
-        mm_debt::snapshot(plain.mm_b);
         mm_debt::activity_snapshot(plain.activity_b);
         mm_debt::interpret_activity(plain.mm_a, plain.mm_b, plain.activity_a, plain.activity_b, plain.activity_relation);
-        syscall::vmem::selftest_file_registry_snapshot(plain.registry_b);
         sched::task::selftest_current_native_debt_snapshot(plain.native_b);
         collect_scalars(scope, plain.scalar_b);
         bool const owner_b = collect_owners(scope, plain.owner_b);
@@ -563,9 +581,8 @@ class CensusHandler final {
         }
         if (!same_scalars(plain.scalar_a, plain.scalar_b) || !native_settled(plain.native_a) || !native_settled(plain.native_b) ||
             !mod::mm::lifecycle_census::unchanged(plain.native_a.stamp, plain.native_b.stamp) ||
-            !same_registry_rows(plain.registry_a, plain.registry_b) ||
-            !mod::mm::lifecycle_census::unchanged(plain.registry_a.stamp, plain.registry_b.stamp) ||
-            !same_mm_debt(plain.mm_a, plain.mm_b) || plain.mm_a.version_begin != plain.mm_b.version_end) {
+            !same_registry_rows(plain.registry_a, plain.registry_b) || !coherent_registry_mm(plain.registry_a, plain.mm_a) ||
+            !coherent_registry_mm(plain.registry_b, plain.mm_b) || !same_mm_debt(plain.mm_a, plain.mm_b)) {
             reason = Reason::MM_CHURN;
             return Outcome::WAIT;
         }

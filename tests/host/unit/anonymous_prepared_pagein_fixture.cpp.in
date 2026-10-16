@@ -22,6 +22,8 @@
 namespace model {
 unsigned checks{}, cases{}, allocations{}, reclaim_calls{}, releases{}, reads{}, slot_frees{}, wakes{}, yields{}, captures{};
 unsigned cow{}, pin{}, queue{}, gates{}, preempt{}, noio{}, last_alloc_noio{};
+unsigned preparation_scopes{}; bool interrupts{true}, missing_leaf{};
+unsigned current_usercopy_accesses();
 bool fail_alloc{}, fail_gate{}, fail_capture{}, published{true};
 bool shutdown{}, enabled{true}, fail_create{}, post_result{true}, corrupt_failed_post{}, waiting{};
 unsigned created{}, destroyed{}, thread_deletes{}, stack_frees{}, lazy_returns{}, fd_returns{}, posts{}, block_calls{}, deferred_exit_checks{};
@@ -64,6 +66,7 @@ struct Lock {
 };
 void* allocate(uint64_t physical) {
     check(cow == 0 && pin == 0 && queue == 0, "allocation outside metadata locks");
+    if (preparation_scopes) check(current_usercopy_accesses()==0 && gates==0 && preempt==0,"ordinary allocation before caller owners");
     ++allocations;
     last_alloc_noio = noio;
     if (allocation_hook) {
@@ -123,6 +126,11 @@ struct Task {
     Task* sched_next{};std::atomic<void*>sched_list_owner{};
     uint32_t active_registry_index{ACTIVE_REGISTRY_INDEX_INVALID};
     std::atomic<uint32_t> usercopy_pagemap_accesses{};
+    std::atomic<bool> usercopy_pagemap_closing{},scheduler_transition_active{},exit_in_progress{};
+    uint64_t syscall_account_start_us{}; bool has_exited{};
+    auto memory_policy_snapshot() const noexcept -> mm::numa::Policy { return policy; }
+    auto try_acquire_usercopy_pagemap(mm::paging::PageTable*& out) -> bool;
+    void release_usercopy_pagemap();
     std::atomic<Task*> owned_unpublished_process{};
     std::atomic<void*> native_file_mapping_retirement{};
     void (*kthread_entry)(){};
@@ -136,6 +144,7 @@ struct Task {
     static auto create_kernel_thread(const char*,void(*)())->Task*;
     ~Task(){if(thread||name){model::check(!has_lazy&&!has_fds,"real full destructor returned lazy/FD owners");++model::destroyed;}}
 };
+ACTUAL_USERCOPY_TASK_METHODS
 void release_lazy_vmem_ranges(Task&t){t.has_lazy=false;++model::lazy_returns;}
 void release_cloned_fd_table_refs(Task*t){t->has_fds=false;++model::fd_returns;}
 void destroy_unpublished_user_thread(Task*);
@@ -144,6 +153,8 @@ task::Task* current{};
 auto can_query_current_task()->bool{return current!=nullptr;}
 auto get_current_task()->task::Task*{return current;}
 auto kernel_threads_shutdown_requested()->bool{return model::shutdown;}
+auto interrupts_enabled()->bool{return model::interrupts;}
+auto preempt_count()->uint32_t{return model::preempt;}
 void wake_task_from_event(task::Task*t){model::check(!model::cow&&!model::queue&&!model::pin,"canonical wake outside metadata locks");++model::wakes;t->wakeup_pending=true;model::waiting=false;}
 void kern_yield(){++model::yields;model::check(model::yields<20,"bounded migrate progress");if(model::yield_hook){auto h=std::move(model::yield_hook);h();}model::checkpoint();}
 auto hold_kernel_shutdown()->KernelShutdownHold{return KernelShutdownHold(current?&current->kernel_shutdown_ownership:nullptr);}
@@ -158,6 +169,22 @@ auto post_task_for_cpu(uint64_t cpu,task::Task*t)->bool{model::check(cpu==0&&t==
  if(model::corrupt_failed_post)t->scheduler_published=true;return false;}
 auto get_active_task_count()->uint32_t{return 1;}
 auto get_active_task_at_safe(uint32_t)->task::Task*;
+}
+namespace model {unsigned current_usercopy_accesses(){auto*t=ker::mod::sched::current;return t?t->usercopy_pagemap_accesses.load():0;}}
+// Privileged IF/current/process admission is a finite Host port. Actual Scope
+// target bodies and genuine scheduled entrance are separate qualification.
+namespace ker::mod::sys {
+class SyscallPreparationScope {
+ public:
+  explicit SyscallPreparationScope(sched::task::Task&t):incoming_(model::interrupts){
+   ready_=sched::current==&t&&t.type==sched::task::TaskType::PROCESS&&t.syscall_account_start_us!=0&&
+     t.state.load()==sched::task::TaskState::ACTIVE&&!t.scheduler_transition_active&&model::preempt==0;
+   if(ready_)model::interrupts=true; ++model::preparation_scopes;
+  }
+  ~SyscallPreparationScope(){model::interrupts=incoming_;--model::preparation_scopes;}
+  auto ready()const->bool{return ready_;}
+ private:bool incoming_{},ready_{};
+};
 }
 namespace model {void checkpoint(){if(shutdown){++deferred_exit_checks;if(ker::mod::sched::current&&!ker::mod::sched::current->kernel_shutdown_ownership.held())throw AutomaticExit{};}}}
 namespace ker::mod::dbg {[[noreturn]]void panic_handler(const char*){throw model::Panic{};}}
@@ -234,6 +261,7 @@ struct SwapStats{uint64_t free_bytes{4096};};void get_stats(SwapStats*out){*out=
 auto swap_available()->bool{return true;}
 auto submit_slot_io(SlotIo& io, SwapSlot s, void* p, bool write) -> int {
     model::check(!model::cow && !model::pin && !write, "read outside locks");
+    if(model::preparation_scopes)model::check(model::current_usercopy_accesses()==0 && model::gates==1 && model::preempt==0,"I/O owns only real operation root gate");
     io.slot = s;
     io.page = p;
     io.active = true;
@@ -270,6 +298,7 @@ std::atomic<uint64_t> anonymous_reclaim_cursor{};
 bool anonymous_swap_admission{},anonymous_swap_service_closed{};
 auto anonymous_swap_enabled()->bool{return model::enabled;}
 PageTable kernel_root{};
+PageTable* kernel_pagemap=&kernel_root;
 auto get_kernel_pagemap()->PageTable*{return &kernel_root;}
 struct Entries {std::map<std::pair<PageTable*,uint64_t>,PageTableEntry> table;
  auto at(PageTable*r,uint64_t va)->PageTableEntry&{return table[{r,va}];}
@@ -284,7 +313,7 @@ auto pte_from_raw(uint64_t r) -> PageTableEntry {
 auto is_reserved_leaf(const PageTableEntry& e) -> bool { return e.present == 0; }
 auto leaf_entry(PageTable* r, vaddr_t va) -> PageTableEntry* {
     model::check(model::cow == 1, "PTE under COW");
-    return &entries.at(r,va);
+    return model::missing_leaf?nullptr:&entries.at(r,va);
 }
 auto capture_user_root_incarnation(PageTable*, uint64_t& out) -> bool {
     model::check(model::cow == 1, "root registry via COW");
@@ -292,7 +321,7 @@ auto capture_user_root_incarnation(PageTable*, uint64_t& out) -> bool {
     return out != 0;
 }
 auto acquire_user_pagemap_access(PageTable*, bool, size_t& out) -> bool {
-    model::check(model::cow == 1, "gate under COW");
+    model::check(model::cow == 1 || model::current_usercopy_accesses()!=0, "operation gate under COW or short caller Task lease");
     if (model::fail_gate) return false;
     out = ++model::gates;
     return true;
@@ -325,6 +354,7 @@ OPERATION_TYPES
 ACTUAL_WINDOW
 #undef WOS_ASYNC_BLOCK_IO
 PAGEIN_FUNCTIONS
+CURRENT_PREPARE_FUNCTIONS
 MIGRATE_CLONE_PURGE
 PAGEOUT_TYPES
 SNAPSHOT_ENDPOINT
@@ -620,4 +650,5 @@ void run() {
 }  // namespace fixture
 STARTUP_TASK_ENDPOINTS
 STARTUP_CASES
-int main(int argc,char**argv) { if(argc==2&&std::strcmp(argv[1],"--post-write-only")==0){fixture::run_postwrite_control();return 0;}fixture::run(); fixture::run_readiness(); }
+CURRENT_PREPARE_CASES
+int main(int argc,char**argv) { if(argc==2&&std::strcmp(argv[1],"--post-write-only")==0){fixture::run_postwrite_control();return 0;}fixture::run(); fixture::run_readiness(); fixture::run_current_preparation(); }

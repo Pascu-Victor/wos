@@ -95,7 +95,8 @@ namespace {
 auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* const* envp,
                         const ker::abi::process::SpawnOptions* spawn_options, int shebang_depth,
                         const ker::mod::security::Snapshot& admitted_credentials, ker::mod::mm::numa::Policy memory_policy,
-                        const ker::mod::mm::numa::AllocationContext& allocation_context) -> uint64_t;
+                        const ker::mod::mm::numa::AllocationContext& allocation_context,
+                        const ker::mod::sched::TaskPlacementSnapshot& inherited_placement) -> uint64_t;
 auto wos_proc_execve_impl(const char* path, const char* const* argv, const char* const* envp, ker::mod::cpu::GPRegs& gpr, int shebang_depth)
     -> uint64_t;
 
@@ -1624,6 +1625,7 @@ struct NativeCompartmentPreparation {
         unsigned destination{};
     };
     mod::sched::task::Task& executor;
+    const mod::sched::TaskPlacementSnapshot inherited_placement;
 #ifdef WOS_SELFTEST
     NativeConstructionToken fault_token{};
 #endif
@@ -1658,12 +1660,14 @@ struct NativeCompartmentPreparation {
     bool published{};
     std::unique_ptr<NativeCompartmentUserInputs> user_inputs;
 #ifdef WOS_SELFTEST
-    explicit NativeCompartmentPreparation(mod::sched::task::Task& owner, NativeConstructionToken token)
-        : executor(owner), fault_token(token) {
+    explicit NativeCompartmentPreparation(mod::sched::task::Task& owner, const mod::sched::TaskPlacementSnapshot& placement,
+                                          NativeConstructionToken token)
+        : executor(owner), inherited_placement(placement), fault_token(token) {
         context.fault_token = token;
     }
 #else
-    explicit NativeCompartmentPreparation(mod::sched::task::Task& owner) : executor(owner) {}
+    explicit NativeCompartmentPreparation(mod::sched::task::Task& owner, const mod::sched::TaskPlacementSnapshot& placement)
+        : executor(owner), inherited_placement(placement) {}
 #endif
     ~NativeCompartmentPreparation();
 };
@@ -4800,7 +4804,8 @@ auto abort_native_compartment_preparation(mod::sched::task::Task& executor, mod:
 }
 
 static auto prepare_native_compartment_inputs_for_owner(mod::sched::task::Task& executor, const NativeCompartmentSpec* spec,
-                                                        uint64_t user_address, int& error
+                                                        uint64_t user_address, int& error,
+                                                        const mod::sched::TaskPlacementSnapshot& inherited_placement
 #ifdef WOS_SELFTEST
                                                         ,
                                                         NativeConstructionToken fault_token = {}
@@ -4851,9 +4856,10 @@ static auto prepare_native_compartment_inputs_for_owner(mod::sched::task::Task& 
 #endif
         if (error == 0) {
 #ifdef WOS_SELFTEST
-            request->compartment.reset(new (std::nothrow) NativeCompartmentPreparation(executor, request->fault_token));
+            request->compartment.reset(new (std::nothrow)
+                                           NativeCompartmentPreparation(executor, inherited_placement, request->fault_token));
 #else
-            request->compartment.reset(new (std::nothrow) NativeCompartmentPreparation(executor));
+            request->compartment.reset(new (std::nothrow) NativeCompartmentPreparation(executor, inherited_placement));
 #endif
             if (!request->compartment) error = -ENOMEM;
         }
@@ -4885,7 +4891,8 @@ static auto prepare_native_compartment_inputs_for_owner(mod::sched::task::Task& 
             error = -EBUSY;
         } else {
             auto& root = *request->compartment;
-            error = initialize_native_creation_priority(root, *child);
+            error = mod::sched::initialize_inherited_task_placement(child, root.inherited_placement);
+            if (error == 0) error = initialize_native_creation_priority(root, *child);
             if (error == 0) {
                 child->initialize_job_identity({.session_id = child->pid, .pgid = child->pid}, mod::sched::session::Names{1, 1});
                 static_cast<void>(child->exchange_creation_mask(root.policy.creation_mask));
@@ -4944,16 +4951,17 @@ static auto prepare_native_compartment_inputs_for_owner(mod::sched::task::Task& 
     return child;
 }
 
-auto prepare_native_compartment_for_owner(mod::sched::task::Task& executor, const NativeCompartmentSpec& spec, int& error
+auto prepare_native_compartment_for_owner(mod::sched::task::Task& executor, const NativeCompartmentSpec& spec, int& error,
+                                          const mod::sched::TaskPlacementSnapshot& inherited_placement
 #ifdef WOS_SELFTEST
                                           ,
                                           NativeConstructionToken fault_token
 #endif
                                           ) -> mod::sched::task::Task* {
 #ifdef WOS_SELFTEST
-    return prepare_native_compartment_inputs_for_owner(executor, &spec, 0, error, fault_token);
+    return prepare_native_compartment_inputs_for_owner(executor, &spec, 0, error, inherited_placement, fault_token);
 #else
-    return prepare_native_compartment_inputs_for_owner(executor, &spec, 0, error);
+    return prepare_native_compartment_inputs_for_owner(executor, &spec, 0, error, inherited_placement);
 #endif
 }
 
@@ -5001,12 +5009,13 @@ auto publish_native_compartment_for_owner(mod::sched::task::Task& executor, mod:
                 result = -EAGAIN;
 #endif
             if (result == 0) {
-                uint64_t cpu = mod::cpu::current_cpu();
+                auto publication_placement = root->inherited_placement;
 #ifdef WOS_SELFTEST
                 if (exec_selftest_take_native_construction_fault(NativeConstructionFault::PUBLICATION_INVALID_CPU, root->fault_token))
-                    cpu = UINT64_MAX;
+                    publication_placement.owner_cpu = UINT64_MAX;
 #endif
-                if (!mod::sched::post_task_for_cpu(cpu, child)) result = -EAGAIN;
+                if (!mod::sched::post_task_round_robin_inherited(child, publication_placement, root->inherited_placement.owner_cpu))
+                    result = -EAGAIN;
             }
             if (result == 0) {
                 // Post can run/exit immediately. The slot still pins the child;
@@ -5033,6 +5042,18 @@ auto create_native_compartment_for_subject(mod::sched::task::Task* executor, uin
     int const SCOPE = mod::security::compartment::host_namespace_admission(executor);
     if (SCOPE != 0) return SCOPE;
     if (mod::power::shutdown_in_progress()) return -ESHUTDOWN;
+    mod::sched::TaskPlacementSnapshot inherited_placement{};
+    if (int const ERROR = mod::sched::capture_task_placement_snapshot(executor, inherited_placement); ERROR != 0) return ERROR;
+    return create_native_compartment_for_subject(executor, spec_address, inherited_placement);
+}
+
+// Kernel-only copied-input core. The actual syscall entry above always captures
+// its scheduled actor; explicit fixture tuples do not prove queue ownership.
+auto create_native_compartment_for_subject(mod::sched::task::Task* executor, uint64_t spec_address,
+                                           const mod::sched::TaskPlacementSnapshot& inherited_placement) -> int64_t {
+    int const SCOPE = mod::security::compartment::host_namespace_admission(executor);
+    if (SCOPE != 0) return SCOPE;
+    if (mod::power::shutdown_in_progress()) return -ESHUTDOWN;
 #ifdef WOS_SELFTEST
     NativeConstructionToken fault_token{};
 #endif
@@ -5043,9 +5064,9 @@ auto create_native_compartment_for_subject(mod::sched::task::Task* executor, uin
 #endif
     int error = 0;
 #ifdef WOS_SELFTEST
-    auto* child = prepare_native_compartment_inputs_for_owner(*executor, nullptr, spec_address, error, fault_token);
+    auto* child = prepare_native_compartment_inputs_for_owner(*executor, nullptr, spec_address, error, inherited_placement, fault_token);
 #else
-    auto* child = prepare_native_compartment_inputs_for_owner(*executor, nullptr, spec_address, error);
+    auto* child = prepare_native_compartment_inputs_for_owner(*executor, nullptr, spec_address, error, inherited_placement);
 #endif
 #ifdef WOS_SELFTEST
     if (child == nullptr) {
@@ -5076,6 +5097,9 @@ auto wos_proc_exec(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr) -
         return static_cast<uint64_t>(-ESRCH);
     }
 
+    mod::sched::TaskPlacementSnapshot inherited_placement{};
+    if (int const ERROR = mod::sched::capture_task_placement_snapshot(parent, inherited_placement); ERROR != 0)
+        return static_cast<uint64_t>(ERROR);
     auto const ADMITTED_CREDENTIALS = parent->credentials();
     auto const MEMORY_POLICY = parent->memory_policy_snapshot();
     mod::mm::numa::AllocationContext allocation_context{};
@@ -5087,7 +5111,7 @@ auto wos_proc_exec(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr) -
         return static_cast<uint64_t>(SNAPSHOT_RESULT);
     }
     return wos_proc_exec_impl(snapshot.path.data(), snapshot.argv, snapshot.envp, nullptr, 0, ADMITTED_CREDENTIALS, MEMORY_POLICY,
-                              allocation_context);
+                              allocation_context, inherited_placement);
 }
 
 auto wos_proc_spawn(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr, uint64_t options_addr) -> uint64_t {
@@ -5099,6 +5123,9 @@ auto wos_proc_spawn(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr, 
         return static_cast<uint64_t>(-ESRCH);
     }
 
+    mod::sched::TaskPlacementSnapshot inherited_placement{};
+    if (int const ERROR = mod::sched::capture_task_placement_snapshot(parent, inherited_placement); ERROR != 0)
+        return static_cast<uint64_t>(ERROR);
     auto const ADMITTED_CREDENTIALS = parent->credentials();
     auto const MEMORY_POLICY = parent->memory_policy_snapshot();
     mod::mm::numa::AllocationContext allocation_context{};
@@ -5111,7 +5138,7 @@ auto wos_proc_spawn(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr, 
     }
     if (options_addr == 0) {
         return wos_proc_exec_impl(arguments.path.data(), arguments.argv, arguments.envp, nullptr, 0, ADMITTED_CREDENTIALS, MEMORY_POLICY,
-                                  allocation_context);
+                                  allocation_context, inherited_placement);
     }
 
     auto* snapshot = new (std::nothrow) SpawnOptionsSnapshot;
@@ -5124,7 +5151,7 @@ auto wos_proc_spawn(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr, 
         return static_cast<uint64_t>(OPTIONS_RESULT);
     }
     uint64_t const RESULT = wos_proc_exec_impl(arguments.path.data(), arguments.argv, arguments.envp, &snapshot->options, 0,
-                                               ADMITTED_CREDENTIALS, MEMORY_POLICY, allocation_context);
+                                               ADMITTED_CREDENTIALS, MEMORY_POLICY, allocation_context, inherited_placement);
     delete snapshot;
     return RESULT;
 }
@@ -5133,7 +5160,8 @@ namespace {
 auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* const* envp,
                         const ker::abi::process::SpawnOptions* spawn_options, int shebang_depth,
                         const ker::mod::security::Snapshot& admitted_credentials, ker::mod::mm::numa::Policy memory_policy,
-                        const ker::mod::mm::numa::AllocationContext& allocation_context) -> uint64_t {
+                        const ker::mod::mm::numa::AllocationContext& allocation_context,
+                        const ker::mod::sched::TaskPlacementSnapshot& inherited_placement) -> uint64_t {
     if (ker::mod::power::shutdown_in_progress()) {
         return static_cast<uint64_t>(-ESHUTDOWN);
     }
@@ -5259,10 +5287,10 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
             return 0;
         }
         return exec_shebang_script(path, argv, envp, argv_count, shebang, shebang_depth,
-                                   [spawn_options, &PARENT_CREDENTIALS, memory_policy, allocation_context](
+                                   [spawn_options, &PARENT_CREDENTIALS, memory_policy, allocation_context, inherited_placement](
                                        const char* interp, const char* const* argv2, const char* const* envp2, int depth) -> uint64_t {
                                        return wos_proc_exec_impl(interp, argv2, envp2, spawn_options, depth, PARENT_CREDENTIALS,
-                                                                 memory_policy, allocation_context);
+                                                                 memory_policy, allocation_context, inherited_placement);
                                    });
     }
 
@@ -5375,6 +5403,11 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
             hcf();
         }
     };
+
+    if (int const ERROR = sched::initialize_inherited_task_placement(new_task, inherited_placement); ERROR != 0) {
+        cleanup_unpublished_task();
+        return static_cast<uint64_t>(ERROR);
+    }
 
     int priority_error = 0;
     {
@@ -5796,8 +5829,8 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     dbg::log("wos_proc_exec: Task entry field = 0x%x", new_task->entry);
 #endif
 
-    // Use load-balanced task posting to distribute across CPUs
-    if (!sched::post_task_balanced(new_task)) {
+    // Publish within the initiating actor's copied placement policy.
+    if (!sched::post_task_balanced_inherited(new_task, inherited_placement)) {
         dbg::log("wos_proc_exec: Failed to post task to scheduler");
         cleanup_unpublished_task();
         return 0;

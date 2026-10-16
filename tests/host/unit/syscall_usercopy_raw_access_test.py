@@ -284,7 +284,7 @@ def test_raw_translation_exceptions_are_only_unpublished_images() -> None:
         fail("native stack builder must not publish its private child")
     publication = function_body(exec_source, "auto publish_native_compartment_for_owner(")
     require_order(publication, ["executor.owned_unpublished_process.load(std::memory_order_acquire) != child",
-                               "child->scheduler_published.load(std::memory_order_acquire)", "mod::sched::post_task_for_cpu(cpu, child)"], "separate checked native publication")
+                               "child->scheduler_published.load(std::memory_order_acquire)", "mod::sched::post_task_round_robin_inherited(child, publication_placement, root->inherited_placement.owner_cpu)"], "separate checked native publication")
 
     vmem_source = translation_files[str(VMEM_CPP.relative_to(ROOT))]
     table_from_entry = function_body(vmem_source, "auto table_from_entry(")

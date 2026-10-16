@@ -7,6 +7,9 @@
 #include <type_traits>
 
 #include "phys.hpp"
+#ifdef WOS_SELFTEST
+#include <test/numa_lifecycle_mm_debt.hpp>
+#endif
 
 namespace ker::mod::mm::numa::balance {
 
@@ -101,5 +104,15 @@ static_assert(sizeof(Snapshot) + sizeof(Workspace) <= 96 * 1024);
 // All mutable global/node counts share one all-allocator-lock interval. Only
 // boot-immutable peripheral reserves come from an earlier ordinary snapshot.
 [[nodiscard]] auto snapshot(Snapshot& out, Workspace& scratch, uint64_t max_frames) noexcept -> Result;
+
+#ifdef WOS_SELFTEST
+// The caller owns exclusive nonaliasing named output/workspace/MM/scratch.
+// MM/scratch must already be addressable, prepared by an instrumented caller.
+// Preflight occurs before locks; the authoritative MM point is after the last
+// physical lock. Both paths run the entire unchanged per-frame scanner.
+[[nodiscard]] auto selftest_snapshot_with_mm(Snapshot& out, Workspace& scratch, ::ker::test::numa_lifecycle::MmDebtSnapshot& mm,
+                                             ::ker::test::numa_lifecycle::MmDebtCaptureScratch& capture, uint64_t max_frames) noexcept
+    -> Result;
+#endif
 
 }  // namespace ker::mod::mm::numa::balance

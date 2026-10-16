@@ -11,6 +11,7 @@
 #include "platform/mm/paging.hpp"
 #include "platform/mm/virt.hpp"
 #include "platform/sched/task.hpp"
+#include "platform/sys/syscall_preparation.hpp"
 #include "util/fast_copy.hpp"
 
 namespace ker::mod::sys::usercopy {
@@ -28,8 +29,8 @@ constexpr uint64_t RFLAGS_AC = uint64_t{1} << 18U;
     return remaining < PAGE_REMAINING ? remaining : static_cast<size_t>(PAGE_REMAINING);
 }
 
-[[nodiscard]] auto copy_to_task_common(sched::task::Task& task, uint64_t user_addr, const void* src, size_t size, bool fault_in)
-    -> CopyResult {
+[[nodiscard]] auto copy_to_task_common(sched::task::Task& task, uint64_t user_addr, const void* src, size_t size, bool fault_in,
+                                       bool prepare_current = false) -> CopyResult {
     if (size == 0) {
         return {};
     }
@@ -43,7 +44,9 @@ constexpr uint64_t RFLAGS_AC = uint64_t{1} << 18U;
         uint64_t const CUR = user_addr + copied;
         size_t const CHUNK = copy_chunk(size - copied, CUR);
         StableUserPage pin{};
-        if (!pin_task_user_page(task, CUR, true, fault_in, pin)) {
+        bool const PINNED =
+            prepare_current ? pin_current_task_user_page(task, CUR, true, pin) : pin_task_user_page(task, CUR, true, fault_in, pin);
+        if (!PINNED) {
             return {.bytes_copied = copied, .fault = true};
         }
         {
@@ -231,6 +234,18 @@ auto pin_task_user_page(sched::task::Task& task, uint64_t user_addr, bool requir
     return true;
 }
 
+auto pin_current_task_user_page(sched::task::Task& task, uint64_t user_addr, bool require_writable, StableUserPage& out) -> bool {
+    // A reused old pin must not survive preparation's allocation/I/O interval.
+    out.reset();
+    if (!range_valid(user_addr, 1)) return false;
+    {
+        SyscallPreparationScope preparation{task};
+        if (preparation.ready() && mm::virt::prepare_current_anonymous_user_page(task, user_addr, require_writable, preparation) != 0)
+            return false;
+    }  // Restore incoming IF before the existing pin/copy/backend interval.
+    return pin_task_user_page(task, user_addr, require_writable, true, out);
+}
+
 auto mapped_physical_address(sched::task::Task& task, uint64_t user_addr, bool require_writable) -> uint64_t {
     StableUserPage pin;
     if (!pin_task_user_page(task, user_addr, require_writable, false, pin) || !pin.still_mapped()) {
@@ -275,7 +290,32 @@ auto ensure_writable(sched::task::Task& task, uint64_t user_addr, size_t size) -
     return true;
 }
 
-[[nodiscard]] auto copy_from_task_common(sched::task::Task& task, uint64_t user_addr, void* dst, size_t size, bool fault_in) -> CopyResult {
+auto ensure_current_task_writable(sched::task::Task& task, uint64_t user_addr, size_t size) -> bool {
+    if (size == 0) {
+        return range_valid(user_addr, size);
+    }
+    if (!range_valid(user_addr, size)) {
+        return false;
+    }
+
+    uint64_t const END = user_addr + static_cast<uint64_t>(size);
+    for (uint64_t page = user_addr; page < END;) {
+        StableUserPage pin{};
+        if (!pin_current_task_user_page(task, page, true, pin) || !pin.still_mapped()) {
+            return false;
+        }
+
+        uint64_t const NEXT_PAGE = (page + mm::paging::PAGE_SIZE) & ~(mm::paging::PAGE_SIZE - 1);
+        if (NEXT_PAGE <= page) {
+            return false;
+        }
+        page = NEXT_PAGE;
+    }
+    return true;
+}
+
+[[nodiscard]] auto copy_from_task_common(sched::task::Task& task, uint64_t user_addr, void* dst, size_t size, bool fault_in,
+                                         bool prepare_current = false) -> CopyResult {
     if (size == 0) {
         return {};
     }
@@ -289,7 +329,9 @@ auto ensure_writable(sched::task::Task& task, uint64_t user_addr, size_t size) -
         uint64_t const CUR = user_addr + copied;
         size_t const CHUNK = copy_chunk(size - copied, CUR);
         StableUserPage pin{};
-        if (!pin_task_user_page(task, CUR, false, fault_in, pin)) {
+        bool const PINNED =
+            prepare_current ? pin_current_task_user_page(task, CUR, false, pin) : pin_task_user_page(task, CUR, false, fault_in, pin);
+        if (!PINNED) {
             return {.bytes_copied = copied, .fault = true};
         }
         {
@@ -303,6 +345,14 @@ auto ensure_writable(sched::task::Task& task, uint64_t user_addr, size_t size) -
         copied += CHUNK;
     }
     return {.bytes_copied = copied, .fault = false};
+}
+
+auto copy_from_current_task_partial(sched::task::Task& task, uint64_t user_addr, void* dst, size_t size) -> CopyResult {
+    return copy_from_task_common(task, user_addr, dst, size, true, true);
+}
+
+auto copy_to_current_task_partial(sched::task::Task& task, uint64_t user_addr, const void* src, size_t size) -> CopyResult {
+    return copy_to_task_common(task, user_addr, src, size, true, true);
 }
 
 auto copy_from_task_partial(sched::task::Task& task, uint64_t user_addr, void* dst, size_t size) -> CopyResult {

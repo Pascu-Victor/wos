@@ -2020,6 +2020,8 @@ struct AnonymousPageinCompletion {
 };
 static_assert(sizeof(AnonymousPageinCompletion) == 8);
 
+enum class AnonymousPageinAdmission : uint8_t { COMPATIBILITY, ORDINARY };
+
 auto finish_anonymous_pagein(AnonymousPageinOperation& operation) -> AnonymousPageinCompletion {
 #ifdef WOS_SELFTEST
     debt::add(DebtField::SWAP_RETURNS);
@@ -2140,8 +2142,8 @@ auto finish_anonymous_pagein(AnonymousPageinOperation& operation) -> AnonymousPa
 
 // Migration and BSP selftests retain the one-page bridge; only the dedicated
 // worker owns the permanent window above.
-auto service_anonymous_pagein(const AnonymousPageinSnapshot& snapshot, const numa::AllocationContext& placement)
-    -> AnonymousPageinCompletion {
+auto service_anonymous_pagein(const AnonymousPageinSnapshot& snapshot, const numa::AllocationContext& placement,
+                              AnonymousPageinAdmission admission = AnonymousPageinAdmission::COMPATIBILITY) -> AnonymousPageinCompletion {
     AnonymousShutdownHoldStorage const SHUTDOWN_OWNERSHIP;
     if (!valid_anonymous_placement(placement) || placement.virtual_page_index != snapshot.vaddr / paging::PAGE_SIZE)
         return {-EINVAL, false, false};
@@ -2165,6 +2167,9 @@ auto service_anonymous_pagein(const AnonymousPageinSnapshot& snapshot, const num
         } else if (mapping->generation != snapshot.generation || mapping->pagein_queued ||
                    mapping->state != AnonymousSwapRuntimeState::SWAPPED) {
             completion = {-EAGAIN, false, true};
+        } else if (admission == AnonymousPageinAdmission::ORDINARY &&
+                   (anonymous_swap_service_closed || sched::kernel_threads_shutdown_requested())) {
+            completion = {-EWOULDBLOCK, false, false};
         } else if (prepared.span.empty()) {
             completion = {anonymous_allocation_error(prepared.error), false, false};
         } else {
@@ -6958,6 +6963,70 @@ auto prepare_captured_tmpfs_read_shared_page(sched::task::Task& task, const sche
     return mapped;
 }
 
+// A scalar snapshot grants no owner after return. Only the actual current
+// continuation supplies Task lifetime; every caller lease ends before I/O.
+auto capture_current_anonymous_user_page(sched::task::Task& actor, uint64_t page, bool writable, AnonymousPageinSnapshot& snapshot,
+                                         const AnonymousPageinSnapshot* expected_root = nullptr) -> int {
+    PageTable* root = nullptr;
+#ifdef WOS_KASAN
+    // Task's instrumented output store must see addressable caller storage.
+    if (kasan::is_enabled()) kasan::unpoison_range(&root, sizeof(root));
+#endif
+    if (!actor.try_acquire_usercopy_pagemap(root)) return -EAGAIN;
+    size_t access_gate = USER_PAGEMAP_ACCESS_GATE_NONE;
+    if (root == nullptr || root == kernel_pagemap || !acquire_user_pagemap_access(root, false, access_gate)) {
+        actor.release_usercopy_pagemap();
+        return -EAGAIN;
+    }
+    int result = -EAGAIN;
+    {
+        uint64_t const FLAGS = cow_pte_lock.lock_irqsave();
+        uint64_t serial = 0;
+        if (actor.pagemap == root && capture_user_root_incarnation(root, serial) &&
+            (expected_root == nullptr ||
+             (expected_root->root_address == reinterpret_cast<uint64_t>(root) && expected_root->root_serial == serial))) {
+            auto* mapping = find_anonymous_swap_mapping_locked(root, page);
+            if (mapping == nullptr) {
+                result = 0;
+            } else if (mapping->cancelled) {
+                result = -ECANCELED;
+            } else if (mapping->state == AnonymousSwapRuntimeState::FAILED || mapping->error < 0) {
+                result = mapping->error < 0 ? mapping->error : -EIO;
+            } else if (mapping->pagein_queued || mapping->state != AnonymousSwapRuntimeState::SWAPPED) {
+                result = -EAGAIN;
+            } else if ((mapping->original_raw & paging::PAGE_USER) == 0U || (mapping->original_raw & paging::PAGE_SHARED) != 0U ||
+                       (writable && (mapping->original_raw & (paging::PAGE_WRITE | paging::PAGE_COW)) == 0U)) {
+                result = -EFAULT;
+            } else if (mapping->object == nullptr || mapping->object->mapping_refs == 0 || mapping->frame != nullptr ||
+                       mapping->pagein_access_gate != USER_PAGEMAP_ACCESS_GATE_NONE || mapping->generation == 0 ||
+                       mapping->generation == UINT64_MAX) {
+                result = -EIO;
+            } else if (anonymous_swap_service_closed || sched::kernel_threads_shutdown_requested()) {
+                result = -EWOULDBLOCK;
+            } else {
+                uint64_t const PIN_FLAGS = user_mapping_pin_lock.lock_irqsave();
+                auto* entry = leaf_entry(root, page);
+                bool const MARKER = entry != nullptr && entry->present == 0 && is_reserved_leaf(*entry) &&
+                                    pte_raw(*entry) == anonymous_swap_marker_raw(mapping->original_raw);
+                user_mapping_pin_lock.unlock_irqrestore(PIN_FLAGS);
+                if (MARKER) {
+                    snapshot.root_address = reinterpret_cast<uint64_t>(root);
+                    snapshot.root_serial = serial;
+                    snapshot.generation = mapping->generation;
+                    snapshot.vaddr = page;
+                    result = 1;
+                } else {
+                    result = -EAGAIN;
+                }
+            }
+        }
+        cow_pte_lock.unlock_irqrestore(FLAGS);
+    }
+    release_user_pagemap_access(access_gate);
+    actor.release_usercopy_pagemap();
+    return result;
+}
+
 auto current_process_root(sched::task::Task& task) -> bool {
     return sched::can_query_current_task() && sched::get_current_task() == &task && task.type == sched::task::TaskType::PROCESS &&
            task.state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE && task.pagemap != nullptr &&
@@ -7009,6 +7078,49 @@ auto prepare_tmpfs_read_shared_page(sched::task::Task& task, uint64_t address, b
     }
     task.release();
     return result;
+}
+
+auto prepare_current_anonymous_user_page(sched::task::Task& actor, uint64_t address, bool writable,
+                                         const sys::SyscallPreparationScope& preparation) -> int {
+    if (address >= 0x0000800000000000ULL) return -EFAULT;
+    if (!preparation.ready() || !sched::can_query_current_task() || sched::get_current_task() != &actor ||
+        actor.type != sched::task::TaskType::PROCESS || actor.syscall_account_start_us == 0 ||
+        actor.state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE ||
+        actor.scheduler_transition_active.load(std::memory_order_acquire) || actor.exit_in_progress.load(std::memory_order_acquire) ||
+        actor.has_exited || actor.usercopy_pagemap_closing.load(std::memory_order_acquire) || !sched::interrupts_enabled() ||
+        sched::preempt_count() != 0)
+        return -EWOULDBLOCK;
+    {
+        uint64_t const FLAGS = cow_pte_lock.lock_irqsave();
+        bool const EMPTY = anonymous_swap_mappings == nullptr;
+        cow_pte_lock.unlock_irqrestore(FLAGS);
+        // This is an actual tracked-row observation, never a boot-flag bypass.
+        // A later insertion is still refused by the old generic lazy install.
+        if (EMPTY) return 0;
+    }
+    uint64_t const PAGE = page_align_down(address);
+    DemandContextStorage context_storage;
+    auto& placement = context_storage.get().allocation;
+    // The actual Task policy result returns in registers into this named storage.
+    // Make the copied value addressable before the instrumented builder reads it.
+    alignas(numa::Policy) uint8_t policy_storage[sizeof(numa::Policy)];
+#ifdef WOS_KASAN
+    if (kasan::is_enabled()) kasan::unpoison_range(policy_storage, sizeof(policy_storage));
+#endif
+    auto* copied_policy = ::new (static_cast<void*>(policy_storage)) numa::Policy(actor.memory_policy_snapshot());
+    auto const CAPTURE = numa::capture_allocation_context(*copied_policy, placement);
+    placement.virtual_page_index = PAGE / paging::PAGE_SIZE;
+    AnonymousPageinSnapshot snapshot{};
+    int const SURVEY = capture_current_anonymous_user_page(actor, PAGE, writable, snapshot);
+    if (SURVEY <= 0) return SURVEY;
+    if (CAPTURE != numa::AllocationError::NONE) return anonymous_allocation_error(CAPTURE);
+    // No caller Task/root/pin/CPU lease survives this single issue attempt.
+    auto const completion = service_anonymous_pagein(snapshot, placement, AnonymousPageinAdmission::ORDINARY);
+    if (completion.status != 0) return completion.status < 0 ? completion.status : -EIO;
+    if (completion.retry || completion.retired) return -EAGAIN;
+    AnonymousPageinSnapshot confirmed{};
+    int const CURRENT = capture_current_anonymous_user_page(actor, PAGE, writable, confirmed, &snapshot);
+    return CURRENT == 0 ? 0 : (CURRENT < 0 ? CURRENT : -EAGAIN);
 }
 
 auto capture_user_root_incarnation(PageTable* root, uint64_t& empty) noexcept -> bool {
@@ -11397,6 +11509,39 @@ void collect(CounterState& state, MmDebtSnapshot& out) noexcept {
     out.inflight = BEFORE.inflight > AFTER.inflight ? BEFORE.inflight : AFTER.inflight;
     out.valid = state.arithmetic_valid.load(std::memory_order_seq_cst) && BEFORE.valid && AFTER.valid && BEFORE.version == AFTER.version;
 }
+
+void collect_addressable(CounterState& state, MmDebtSnapshot& out, MmDebtCaptureScratch& scratch) noexcept {
+    state.epoch.snapshot_into(scratch.before);
+    out.access_readers = state.values[static_cast<size_t>(CounterField::ACCESS_READERS)].load(std::memory_order_seq_cst);
+    out.access_exclusives = state.values[static_cast<size_t>(CounterField::ACCESS_EXCLUSIVES)].load(std::memory_order_seq_cst);
+    out.user_page_pins = state.values[static_cast<size_t>(CounterField::USER_PAGE_PINS)].load(std::memory_order_seq_cst);
+    out.stable_handles = state.values[static_cast<size_t>(CounterField::STABLE_HANDLES)].load(std::memory_order_seq_cst);
+    out.retained_frame_refs = state.values[static_cast<size_t>(CounterField::RETAINED_FRAME_REFS)].load(std::memory_order_seq_cst);
+    out.task_usercopy_accesses = state.values[static_cast<size_t>(CounterField::TASK_USERCOPY_ACCESSES)].load(std::memory_order_seq_cst);
+    out.pin_returns = state.values[static_cast<size_t>(CounterField::PIN_RETURNS)].load(std::memory_order_seq_cst);
+    out.lazy_rows[0] = state.values[static_cast<size_t>(CounterField::LAZY_ANONYMOUS)].load(std::memory_order_seq_cst);
+    out.lazy_rows[1] = state.values[static_cast<size_t>(CounterField::LAZY_FILE)].load(std::memory_order_seq_cst);
+    out.lazy_rows[2] = state.values[static_cast<size_t>(CounterField::LAZY_NATIVE_FILE)].load(std::memory_order_seq_cst);
+    out.lazy_rows[3] = state.values[static_cast<size_t>(CounterField::LAZY_TMPFS_READ_SHARED)].load(std::memory_order_seq_cst);
+    out.lazy_rows[4] = state.values[static_cast<size_t>(CounterField::LAZY_TMPFS_WRITE_SHARED)].load(std::memory_order_seq_cst);
+    out.lazy_returns = state.values[static_cast<size_t>(CounterField::LAZY_RETURNS)].load(std::memory_order_seq_cst);
+    out.swap_objects = state.values[static_cast<size_t>(CounterField::SWAP_OBJECTS)].load(std::memory_order_seq_cst);
+    out.swap_mappings = state.values[static_cast<size_t>(CounterField::SWAP_MAPPINGS)].load(std::memory_order_seq_cst);
+    out.swap_queued = state.values[static_cast<size_t>(CounterField::SWAP_QUEUED)].load(std::memory_order_seq_cst);
+    out.swap_pageins = state.values[static_cast<size_t>(CounterField::SWAP_PAGEINS)].load(std::memory_order_seq_cst);
+    out.swap_pageouts = state.values[static_cast<size_t>(CounterField::SWAP_PAGEOUTS)].load(std::memory_order_seq_cst);
+    out.swap_waiters = state.values[static_cast<size_t>(CounterField::SWAP_WAITERS)].load(std::memory_order_seq_cst);
+    out.swap_returns = state.values[static_cast<size_t>(CounterField::SWAP_RETURNS)].load(std::memory_order_seq_cst);
+    out.legacy_file_registry_rows = state.values[static_cast<size_t>(CounterField::LEGACY_FILE_REGISTRY)].load(std::memory_order_seq_cst);
+    out.native_file_registry_rows = state.values[static_cast<size_t>(CounterField::NATIVE_FILE_REGISTRY)].load(std::memory_order_seq_cst);
+    out.registry_returns = state.values[static_cast<size_t>(CounterField::REGISTRY_RETURNS)].load(std::memory_order_seq_cst);
+    state.epoch.snapshot_into(scratch.after);
+    out.version_begin = scratch.before.version;
+    out.version_end = scratch.after.version;
+    out.inflight = scratch.before.inflight > scratch.after.inflight ? scratch.before.inflight : scratch.after.inflight;
+    out.valid = state.arithmetic_valid.load(std::memory_order_seq_cst) && scratch.before.valid && scratch.after.valid &&
+                scratch.before.version != 0 && scratch.before.version != UINT64_MAX && scratch.before.version == scratch.after.version;
+}
 }  // namespace
 void begin_change() noexcept {
     current.epoch.begin();
@@ -11419,6 +11564,7 @@ void drop_lazy_row(uint8_t copied_kind) noexcept {
     adjust(current, FIELD, false);
 }
 void snapshot(MmDebtSnapshot& output) noexcept { collect(current, output); }
+void snapshot_addressable(MmDebtSnapshot& output, MmDebtCaptureScratch& scratch) noexcept { collect_addressable(current, output, scratch); }
 void activity_snapshot(MmActivitySnapshot& output) noexcept { collect_activity(current, output); }
 void interpret_activity(const MmDebtSnapshot& a, const MmDebtSnapshot& b, const MmActivitySnapshot& activity_a,
                         const MmActivitySnapshot& activity_b, MmActivityRelation& output) noexcept {

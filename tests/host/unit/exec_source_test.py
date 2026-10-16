@@ -282,7 +282,7 @@ def require_spawn_actions_snapshot_user_memory_and_preserve_cloexec_sources(sour
         "snapshot_exec_arguments(*parent, path_addr, argv_addr, envp_addr, arguments)",
         "new (std::nothrow) SpawnOptionsSnapshot",
         "snapshot_spawn_options(*parent, options_addr, *snapshot)",
-        "wos_proc_exec_impl(arguments.path.data(), arguments.argv, arguments.envp, &snapshot->options, 0, ADMITTED_CREDENTIALS, MEMORY_POLICY, allocation_context)",
+        "wos_proc_exec_impl(arguments.path.data(), arguments.argv, arguments.envp, &snapshot->options, 0, ADMITTED_CREDENTIALS, MEMORY_POLICY, allocation_context, inherited_placement)",
         "delete snapshot",
     ]:
         if snippet not in " ".join(spawn.split()):
@@ -291,7 +291,7 @@ def require_spawn_actions_snapshot_user_memory_and_preserve_cloexec_sources(sour
     exec_entry = function_body(source, "wos_proc_exec")
     for snippet in [
         "snapshot_exec_arguments(*parent, path_addr, argv_addr, envp_addr, snapshot)",
-        "wos_proc_exec_impl(snapshot.path.data(), snapshot.argv, snapshot.envp, nullptr, 0, ADMITTED_CREDENTIALS, MEMORY_POLICY, allocation_context)",
+        "wos_proc_exec_impl(snapshot.path.data(), snapshot.argv, snapshot.envp, nullptr, 0, ADMITTED_CREDENTIALS, MEMORY_POLICY, allocation_context, inherited_placement)",
     ]:
         if snippet not in " ".join(exec_entry.split()):
             fail(f"exec syscall must deep-snapshot user path/vector memory: {snippet}")
@@ -820,11 +820,11 @@ def require_exec_memory_policy_capture_and_commit(source: str) -> None:
         capture = "auto const MEMORY_POLICY = parent->memory_policy_snapshot();"
         assert body.count(capture) == 1
         assert body.index(capture) < body.index("capture_exec_allocation_context(MEMORY_POLICY, allocation_context)") < body.index("snapshot_exec_arguments(*parent")
-        assert "ADMITTED_CREDENTIALS, MEMORY_POLICY, allocation_context)" in " ".join(body.split())
+        assert "ADMITTED_CREDENTIALS, MEMORY_POLICY, allocation_context, inherited_placement)" in " ".join(body.split())
     impl = function_body(source, "wos_proc_exec_impl")
     assert "->memory_policy_snapshot(" not in impl and ".memory_policy_snapshot(" not in impl
-    assert "[spawn_options, &PARENT_CREDENTIALS, memory_policy, allocation_context]" in impl
-    assert "wos_proc_exec_impl(interp, argv2, envp2, spawn_options, depth, PARENT_CREDENTIALS, memory_policy, allocation_context)" in " ".join(impl.split())
+    assert "[spawn_options, &PARENT_CREDENTIALS, memory_policy, allocation_context, inherited_placement]" in impl
+    assert "wos_proc_exec_impl(interp, argv2, envp2, spawn_options, depth, PARENT_CREDENTIALS, memory_policy, allocation_context, inherited_placement)" in " ".join(impl.split())
     assert impl.index("new_task->publish_memory_policy_snapshot(memory_policy);") < impl.index("new_task->initialize_process_image(")
 
     wrapper = function_body(source, "wos_proc_execve")
@@ -859,6 +859,53 @@ def require_exec_memory_policy_capture_and_commit(source: str) -> None:
     end = find_matching_brace(commit, brace)
     assert publication in commit[brace:end]
     assert commit.index("publish_staged_process(") < committed < commit.index(publication)
+
+
+def require_creation_cpu_snapshot_and_same_owner_exec(source: str) -> None:
+    for name in ("wos_proc_exec", "wos_proc_spawn"):
+        body = function_body(source, name)
+        capture = "capture_task_placement_snapshot(parent, inherited_placement)"
+        assert body.count(capture) == 1
+        assert body.index(capture) < body.index("capture_exec_allocation_context(") < body.index("snapshot_exec_arguments(*parent")
+        assert "ADMITTED_CREDENTIALS, MEMORY_POLICY, allocation_context, inherited_placement)" in " ".join(body.split())
+    impl = function_body(source, "wos_proc_exec_impl")
+    assert "capture_task_placement_snapshot(" not in impl
+    assert "[spawn_options, &PARENT_CREDENTIALS, memory_policy, allocation_context, inherited_placement]" in impl
+    assert "memory_policy, allocation_context, inherited_placement)" in " ".join(impl.split())
+    ordered = ["claim_unpublished_process(parent_task, new_task)", "auto cleanup_unpublished_task",
+               "initialize_inherited_task_placement(new_task, inherited_placement)", "new_task->initialize_process_image(",
+               "wki_try_remote_spawn(new_task, REMOTE_SPAWN)", "post_task_balanced_inherited(new_task, inherited_placement)"]
+    assert [impl.index(token) for token in ordered] == sorted(impl.index(token) for token in ordered)
+    initializer = impl[impl.index("if (int const ERROR = sched::initialize_inherited_task_placement("):impl.index("int priority_error = 0;")]
+    assert "cleanup_unpublished_task();" in initializer and "return static_cast<uint64_t>(ERROR);" in initializer
+
+    public = function_body_containing(source, "create_native_compartment_for_subject", "capture_task_placement_snapshot(")
+    assert public.index("host_namespace_admission(executor)") < public.index("capture_task_placement_snapshot(executor, inherited_placement)")
+    assert "return create_native_compartment_for_subject(executor, spec_address, inherited_placement);" in public
+    assert "prepare_native_compartment_inputs_for_owner(" not in public
+    core = function_body_containing(source, "create_native_compartment_for_subject", "prepare_native_compartment_inputs_for_owner(")
+    assert "capture_task_placement_snapshot(" not in core
+    assert "spec_address, error, inherited_placement" in core
+    assert "abort_native_compartment_preparation(*executor, child)" in core
+    preparation = function_body(source, "prepare_native_compartment_inputs_for_owner")
+    copied = "NativeCompartmentPreparation(executor, inherited_placement"
+    assert preparation.count(copied) == 2  # Exact SELFTEST and ordinary constructor branches.
+    assert preparation.index(copied) < preparation.index("capture_user_native_compartment_inputs(")
+    assert "inherited_placement(placement)" in source
+    assert preparation.index("create_native_process_task_impl(") < preparation.index("initialize_inherited_task_placement(child, root.inherited_placement)")
+    assert preparation.index("initialize_inherited_task_placement(child, root.inherited_placement)") < preparation.index("initialize_native_creation_priority(root, *child)")
+    assert "if (error != 0)" in preparation and "abort_native_compartment_preparation(executor, child)" in preparation
+    publication = function_body(source, "publish_native_compartment_for_owner")
+    assert "auto publication_placement = root->inherited_placement;" in publication
+    assert "publication_placement.owner_cpu = UINT64_MAX;" in publication
+    post = "post_task_round_robin_inherited(child, publication_placement, root->inherited_placement.owner_cpu)"
+    assert post in " ".join(publication.split())
+    assert "current_cpu()" not in publication and "post_task_balanced(" not in publication
+    for name in ("wos_proc_execve", "wos_proc_execve_impl", "handoff_worker_exec", "commit_native_exec_image", "service_pending_exec_handoff"):
+        body = function_body(source, name)
+        assert "TaskPlacementSnapshot" not in body and "initialize_inherited_task_placement(" not in body
+        for field in ("cpu", "domain_mask", "domain_id", "cpu_pinned", "domain_hard"):
+            assert "store_" + field + "(" not in body
 
 
 def require_remote_exec_uses_canonical_owned_request(source: str) -> None:
@@ -1011,6 +1058,7 @@ def main() -> None:
     require_spawn_open_child_context(source)
     require_exec_credential_admission(source)
     require_exec_memory_policy_capture_and_commit(source)
+    require_creation_cpu_snapshot_and_same_owner_exec(source)
     require_local_exec_content_views(source)
     require_sparse_exec_reads(source)
     require_callers_use_sparse_reader(source)

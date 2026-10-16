@@ -86,7 +86,7 @@ def require_futex_user_word_alignment_is_validated(source: str) -> None:
         "addr % alignof(int)",
         "futex_selftest_addr_alignment_guard",
         "StableUserPage futex_page",
-        "pin_task_user_page(*current_task, user_addr, false, true, futex_page)",
+        "pin_current_task_user_page(*current_task, user_addr, false, futex_page)",
         "futex_page.physical_address()",
         "futex_page.still_mapped()",
         "__atomic_load_n(kernel_addr, __ATOMIC_ACQUIRE)",
@@ -97,7 +97,7 @@ def require_futex_user_word_alignment_is_validated(source: str) -> None:
     for name in ["futex_wait", "futex_wake"]:
         body = function_body(source, name)
         guard = body.find("if (!futex_addr_is_aligned(user_addr))")
-        pin = body.find("pin_task_user_page")
+        pin = body.find("pin_current_task_user_page")
         init = body.find("if (!ensure_futex_table())")
         if guard < 0:
             fail(f"{name} must reject unaligned futex words")

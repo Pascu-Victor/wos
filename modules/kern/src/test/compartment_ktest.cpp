@@ -6767,6 +6767,9 @@ KTEST(CompartmentConstruction, InvalidLaunchArgumentsRefuseBeforeImageAndPreserv
 }
 
 namespace {
+// Controlled input for never-published construction/input fixtures. This tuple
+// is not an owning-runqueue observation; the real syscall captures its actor.
+auto native_fixture_placement() -> sched::TaskPlacementSnapshot { return {.owner_cpu = 0, .domain_mask = UINT64_MAX}; }
 struct NativeCreationFixture {
     static constexpr uint64_t INTERPRETER_VADDR = 0x52000000;
     ConstructionRoot source;
@@ -6821,6 +6824,15 @@ auto creation_pending_drained(Task& task) -> bool {
 }
 }  // namespace
 
+KTEST(CompartmentCreation, PublicEntryRejectsUnownedActorBeforeUsercopy) {
+    NativeCreationFixture fixture;
+    KREQUIRE_EQ(fixture.prepare(710, 51), 0);
+    auto& executor = *fixture.creator.task;
+    KEXPECT_EQ(process_exec::create_native_compartment_for_subject(&executor, UINT64_MAX), int64_t{-EBUSY});
+    KEXPECT_TRUE(creation_pending_drained(executor));
+    KEXPECT_EQ(executor.usercopy_pagemap_accesses.load(), uint32_t{0});
+}
+
 KTEST(CompartmentCreation, FreshNonrootRootsCopyAssetsAndKeepExplicitDescriptors) {
     auto const PIDS = pid_ns::live_namespace_count(), IPC = ipc::live_namespace_count(), MOUNTS = mount_ns::live_namespace_count();
     auto const THREADS = threading::get_active_thread_count();
@@ -6830,10 +6842,10 @@ KTEST(CompartmentCreation, FreshNonrootRootsCopyAssetsAndKeepExplicitDescriptors
         KREQUIRE_EQ(second.prepare(810, 61), 0);
         NativeCreationProcess left{*first.creator.task}, right{*second.creator.task};
         int error = 99;
-        left.child = process_exec::prepare_native_compartment_for_owner(left.executor, first.spec, error);
+        left.child = process_exec::prepare_native_compartment_for_owner(left.executor, first.spec, error, native_fixture_placement());
         KREQUIRE_EQ(error, 0);
         KREQUIRE_TRUE(left.child != nullptr);
-        right.child = process_exec::prepare_native_compartment_for_owner(right.executor, second.spec, error);
+        right.child = process_exec::prepare_native_compartment_for_owner(right.executor, second.spec, error, native_fixture_placement());
         KREQUIRE_EQ(error, 0);
         KREQUIRE_TRUE(right.child != nullptr);
         KEXPECT_FALSE(*left.child->mount_namespace() == *right.child->mount_namespace());
@@ -6923,7 +6935,7 @@ KTEST(CompartmentCreation, CanonicalCreatorObservationRejectsChangedPolicyAndThr
     auto const REFS = source.ref_count.load();
     NativeCreationProcess process{*thread.task};
     int error = 99;
-    process.child = process_exec::prepare_native_compartment_for_owner(process.executor, fixture.spec, error);
+    process.child = process_exec::prepare_native_compartment_for_owner(process.executor, fixture.spec, error, native_fixture_placement());
     KREQUIRE_EQ(error, 0);
     KREQUIRE_TRUE(process.child != nullptr);
     KEXPECT_TRUE(process.child->credentials().user() == source.credentials().user());
@@ -6958,7 +6970,7 @@ KTEST(CompartmentCreation, FailedImportsAndTransferredRecoveryDrainEveryPreparat
         process_exec::exec_selftest_fail_native_construction_once(FAULT);
         NativeCreationProcess process{executor};
         int error = 99;
-        process.child = process_exec::prepare_native_compartment_for_owner(executor, fixture.spec, error);
+        process.child = process_exec::prepare_native_compartment_for_owner(executor, fixture.spec, error, native_fixture_placement());
         process_exec::exec_selftest_fail_native_construction_once(Fault::NONE);
         KEXPECT_NULL(process.child);
         int const EXPECTED = FAULT == Fault::CREATION_IMPORT_READ                                                  ? -EIO
@@ -7049,7 +7061,8 @@ KTEST(CompartmentCreation, InvalidCapabilitiesPathsAndBudgetsRefuseWithoutLeakin
         auto const REFS = fixture.executable->refcount.load();
         NativeCreationProcess process{mode == 12 ? *fixture.source.source.task : *fixture.creator.task};
         int error = 99;
-        process.child = process_exec::prepare_native_compartment_for_owner(process.executor, fixture.spec, error);
+        process.child =
+            process_exec::prepare_native_compartment_for_owner(process.executor, fixture.spec, error, native_fixture_placement());
         KEXPECT_NULL(process.child);
         KEXPECT_EQ(error, expected);
         KEXPECT_TRUE(creation_pending_drained(process.executor));
@@ -7073,7 +7086,8 @@ KTEST(CompartmentCreation, EmptyDescriptorTableAndExplicitNetworkGrantPreserveAd
         fixture.spec.policy.network = Network::SHARED_HOST;
         NativeCreationProcess process{*fixture.creator.task};
         int error = 99;
-        process.child = process_exec::prepare_native_compartment_for_owner(process.executor, fixture.spec, error);
+        process.child =
+            process_exec::prepare_native_compartment_for_owner(process.executor, fixture.spec, error, native_fixture_placement());
         KREQUIRE_EQ(error, 0);
         KREQUIRE_TRUE(process.child != nullptr);
         KEXPECT_EQ(process.child->pid_namespace()->network(), Network::SHARED_HOST);
@@ -7455,7 +7469,7 @@ KTEST(CompartmentPublication, MembershipAndRealPostRefusalDrainPreparationExactl
         auto const REFS = fixture.executable->refcount.load();
         NativeCreationProcess process{executor};
         int error = 99;
-        process.child = process_exec::prepare_native_compartment_for_owner(executor, fixture.spec, error);
+        process.child = process_exec::prepare_native_compartment_for_owner(executor, fixture.spec, error, native_fixture_placement());
         KREQUIRE_EQ(error, 0);
         KREQUIRE_TRUE(process.child != nullptr);
         KEXPECT_EQ(process.child->heap_index, int32_t{-1});
@@ -7496,7 +7510,7 @@ KTEST(CompartmentPublication, ChangedPolicyClosedScopesAndExitingCreatorsRefuseB
         auto const PIDS = pid_ns::live_namespace_count(), IPC = ipc::live_namespace_count(), MOUNTS = mount_ns::live_namespace_count();
         NativeCreationProcess process{executor};
         int error = 99;
-        process.child = process_exec::prepare_native_compartment_for_owner(executor, fixture.spec, error);
+        process.child = process_exec::prepare_native_compartment_for_owner(executor, fixture.spec, error, native_fixture_placement());
         KREQUIRE_EQ(error, 0);
         KREQUIRE_TRUE(process.child != nullptr);
         if (scenario == 0)
@@ -7527,7 +7541,7 @@ KTEST(CompartmentPublication, ForeignOrMissingChildrenCannotConsumeExactPendingO
     NativeCreationProcess process{executor};
     NativeTask foreign;
     int error = 99;
-    process.child = process_exec::prepare_native_compartment_for_owner(executor, fixture.spec, error);
+    process.child = process_exec::prepare_native_compartment_for_owner(executor, fixture.spec, error, native_fixture_placement());
     KREQUIRE_EQ(error, 0);
     KREQUIRE_TRUE(process.child != nullptr);
     auto* request = executor.owned_exec_arguments.load();
@@ -7646,7 +7660,8 @@ KTEST(CompartmentPublicInput, MappedNonrootSpecUsesNativeImportAndPostRefusalRec
     auto const GENERATION = input.caller.task->credential_observation().generation;
     using Fault = process_exec::NativeConstructionFault;
     process_exec::exec_selftest_fail_native_construction_once(Fault::PUBLICATION_BEFORE_POST);
-    KEXPECT_EQ(process_exec::create_native_compartment_for_subject(input.caller.task.get(), input.ADDRESS), int64_t{-EAGAIN});
+    KEXPECT_EQ(process_exec::create_native_compartment_for_subject(input.caller.task.get(), input.ADDRESS, native_fixture_placement()),
+               int64_t{-EAGAIN});
     KEXPECT_FALSE(process_exec::exec_selftest_take_native_construction_fault(Fault::PUBLICATION_BEFORE_POST));
     process_exec::exec_selftest_fail_native_construction_once(Fault::NONE);
     baseline.expect();
@@ -7709,7 +7724,8 @@ KTEST(CompartmentPublicInput, InvalidVersionCountsFlagsAndBudgetsCreateNoScopes)
                 break;
         }
         KREQUIRE_TRUE(input.write());
-        KEXPECT_EQ(process_exec::create_native_compartment_for_subject(input.caller.task.get(), input.ADDRESS), int64_t{error});
+        KEXPECT_EQ(process_exec::create_native_compartment_for_subject(input.caller.task.get(), input.ADDRESS, native_fixture_placement()),
+                   int64_t{error});
         baseline.expect();
     }
 }
@@ -7768,7 +7784,8 @@ KTEST(CompartmentPublicInput, PartialMappedStringsAndBadFdsDrainOwnedCapture) {
                 break;
         }
         KREQUIRE_TRUE(input.write());
-        KEXPECT_EQ(process_exec::create_native_compartment_for_subject(input.caller.task.get(), input.ADDRESS), int64_t{error});
+        KEXPECT_EQ(process_exec::create_native_compartment_for_subject(input.caller.task.get(), input.ADDRESS, native_fixture_placement()),
+                   int64_t{error});
         baseline.expect();
     }
 }
@@ -7780,18 +7797,21 @@ KTEST(CompartmentPublicInput, AllocationRefusalAndForeignScopePreserveExactOwner
     using Fault = process_exec::NativeConstructionFault;
     for (auto fault : {Fault::USER_INPUT_STATE, Fault::USER_ARGUMENT_ARENA}) {
         process_exec::exec_selftest_fail_native_construction_once(fault);
-        KEXPECT_EQ(process_exec::create_native_compartment_for_subject(input.caller.task.get(), input.ADDRESS), int64_t{-ENOMEM});
+        KEXPECT_EQ(process_exec::create_native_compartment_for_subject(input.caller.task.get(), input.ADDRESS, native_fixture_placement()),
+                   int64_t{-ENOMEM});
         KEXPECT_FALSE(process_exec::exec_selftest_take_native_construction_fault(fault));
         process_exec::exec_selftest_fail_native_construction_once(Fault::NONE);
         baseline.expect();
     }
     NativeCreationProcess pending{*input.caller.task};
     int error = 0;
-    pending.child = process_exec::prepare_native_compartment_for_owner(*input.caller.task, input.source.spec, error);
+    pending.child =
+        process_exec::prepare_native_compartment_for_owner(*input.caller.task, input.source.spec, error, native_fixture_placement());
     KREQUIRE_EQ(error, 0);
     KREQUIRE_TRUE(pending.child != nullptr);
     auto* request = input.caller.task->owned_exec_arguments.load();
-    KEXPECT_EQ(process_exec::create_native_compartment_for_subject(input.caller.task.get(), input.ADDRESS), int64_t{-EBUSY});
+    KEXPECT_EQ(process_exec::create_native_compartment_for_subject(input.caller.task.get(), input.ADDRESS, native_fixture_placement()),
+               int64_t{-EBUSY});
     KEXPECT_TRUE(input.caller.task->owned_exec_arguments.load() == request);
     KEXPECT_TRUE(input.caller.task->owned_unpublished_process.load() == pending.child);
     KREQUIRE_TRUE(pending.destroy());
@@ -7825,7 +7845,8 @@ KTEST(CompartmentPublicInput, ZeroVectorsAndCrossPageStringsReachActualPublicati
         KREQUIRE_TRUE(input.write());
         using Fault = process_exec::NativeConstructionFault;
         process_exec::exec_selftest_fail_native_construction_once(Fault::PUBLICATION_BEFORE_POST);
-        KEXPECT_EQ(process_exec::create_native_compartment_for_subject(input.caller.task.get(), input.ADDRESS), int64_t{-EAGAIN});
+        KEXPECT_EQ(process_exec::create_native_compartment_for_subject(input.caller.task.get(), input.ADDRESS, native_fixture_placement()),
+                   int64_t{-EAGAIN});
         KEXPECT_FALSE(process_exec::exec_selftest_take_native_construction_fault(Fault::PUBLICATION_BEFORE_POST));
         process_exec::exec_selftest_fail_native_construction_once(Fault::NONE);
         baseline.expect();
@@ -7962,7 +7983,7 @@ KTEST(CompartmentPriorityInheritance, NativePreparedChildrenKeepSignedNiceAndFre
         resource::copy_process_observation(executor, before);
         NativeCreationProcess process{executor};
         int error = 99;
-        process.child = process_exec::prepare_native_compartment_for_owner(executor, fixture.spec, error);
+        process.child = process_exec::prepare_native_compartment_for_owner(executor, fixture.spec, error, native_fixture_placement());
         KREQUIRE_EQ(error, 0);
         KREQUIRE_TRUE(process.child != nullptr);
         KEXPECT_EQ(process.child->sched_nice, value.nice);
@@ -8023,7 +8044,8 @@ KTEST(CompartmentPriorityInheritance, NativeWorkerUsesConservativeCanonicalAndAc
         resource::copy_process_observation(creator, before);
         NativeCreationProcess process{*worker.task};
         int error = 99;
-        process.child = process_exec::prepare_native_compartment_for_owner(process.executor, fixture.spec, error);
+        process.child =
+            process_exec::prepare_native_compartment_for_owner(process.executor, fixture.spec, error, native_fixture_placement());
         KREQUIRE_EQ(error, 0);
         KREQUIRE_TRUE(process.child != nullptr);
         KEXPECT_EQ(process.child->sched_nice, int8_t{7});
@@ -8076,7 +8098,8 @@ KTEST(CompartmentPriorityInheritance, ChangedSourcesAndChildFieldsRefuseBeforeMe
         resource::copy_process_observation(creator, before);
         NativeCreationProcess process{*worker.task};
         int error = 99;
-        process.child = process_exec::prepare_native_compartment_for_owner(process.executor, fixture.spec, error);
+        process.child =
+            process_exec::prepare_native_compartment_for_owner(process.executor, fixture.spec, error, native_fixture_placement());
         KREQUIRE_EQ(error, 0);
         KREQUIRE_TRUE(process.child != nullptr);
         auto* const ORIGINAL_MAP = worker.task->pagemap;
@@ -8157,7 +8180,8 @@ KTEST(CompartmentPriorityInheritance, InvalidActorRangeAndRetirementRefuseCaptur
         auto const PIDS = pid_ns::live_namespace_count(), IPC = ipc::live_namespace_count(), MOUNTS = mount_ns::live_namespace_count();
         NativeCreationProcess process{*worker.task};
         int error = 99;
-        process.child = process_exec::prepare_native_compartment_for_owner(process.executor, fixture.spec, error);
+        process.child =
+            process_exec::prepare_native_compartment_for_owner(process.executor, fixture.spec, error, native_fixture_placement());
         KEXPECT_NULL(process.child);
         KEXPECT_EQ(error, invalid < 2 ? -EINVAL : invalid == 4 ? -ECANCELED : -ESRCH);
         creator.exit_in_progress.store(false);

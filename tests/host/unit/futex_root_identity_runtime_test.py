@@ -649,7 +649,7 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
         "StableUserPage::capture_futex_identity(",
         "StableUserPage::futex_identity_still_mapped(",
         "StableUserPage::reset()",
-        "auto pin_task_user_page(",
+        "auto pin_task_user_page(", "auto pin_current_task_user_page(",
         "auto range_valid(",
     ]
     user_bodies = "\n".join(definition(user, a) for a in user_anchors)
@@ -667,6 +667,7 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
         + increment
         + '\n}\n#include "actual-mm.cpp"\n'
         + MAP_SEAMS
+        + 'namespace ker::mod::sys {\nclass SyscallPreparationScope {\n public:\n  explicit SyscallPreparationScope(sched::task::Task&) {}\n  auto ready() const -> bool { return false; }\n};\n}\nnamespace ker::mod::mm::virt {\ninline auto prepare_current_anonymous_user_page(sched::task::Task&,uint64_t,bool,\n const sys::SyscallPreparationScope&) -> int {\n fixture::check(false,"ordinary preparation unsupported in frame/root-only fixtures"); return -EWOULDBLOCK;\n}\n}\nnamespace ker::mod::sys::usercopy {\nauto copy_from_current_task_partial(sched::task::Task&task,uint64_t address,void*dst,size_t size)->CopyResult {\n bool const ok=copy_from_task(task,address,dst,size);return {ok?size:0,!ok};\n}\n}\n'
         + "\nnamespace ker::mod::sys::usercopy{\n"
         + user_bodies
         + '\n}\n#include "actual-futex.cpp"\n'

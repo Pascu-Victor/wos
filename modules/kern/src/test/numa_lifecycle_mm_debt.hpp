@@ -43,6 +43,12 @@ struct MmDebtSnapshot {
 };
 static_assert(sizeof(MmDebtSnapshot) == 216 && alignof(MmDebtSnapshot) == 8);
 static_assert(offsetof(MmDebtSnapshot, lazy_rows) == 88 && offsetof(MmDebtSnapshot, registry_returns) == 208);
+// Named caller-owned epoch storage for the coherent physical collector.
+// Construct and make both objects addressable before any allocator lock.
+struct MmDebtCaptureScratch {
+    mod::mm::lifecycle_census::Stamp before, after;
+};
+static_assert(sizeof(MmDebtCaptureScratch) == 48 && alignof(MmDebtCaptureScratch) == 8);
 // Diagnostic only. Existing MM acceptance uses MmDebtSnapshot unchanged.
 struct MmActivitySnapshot {
     mod::mm::lifecycle_census::Stamp before, after;
@@ -69,6 +75,10 @@ void drop_lazy_row(uint8_t copied_kind) noexcept;
 // Exclusive addressable output, by-ref, no hidden return and no owner refs.
 // valid means stable arithmetic/stamp sampling; acceptance ALSO needs inflight==0.
 void snapshot(MmDebtSnapshot& output) noexcept;
+// Same fixed atomic observation with explicit caller-born epoch scratch. The
+// collector preflights this exact provider outside locks, then overwrites all
+// fields in its one authoritative capture while all allocator locks are held.
+void snapshot_addressable(MmDebtSnapshot& output, MmDebtCaptureScratch& scratch) noexcept;
 // Caller-born addressable output; snapshots/counters grant no acceptance.
 void activity_snapshot(MmActivitySnapshot& output) noexcept;
 // Reconciled only for unchanged, nonsaturated stamps matching both old MM

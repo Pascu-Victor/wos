@@ -19,6 +19,10 @@ namespace ker::mod::mm::numa {
 struct AllocationContext;
 }
 
+namespace ker::mod::sched {
+struct TaskPlacementSnapshot;
+}
+
 namespace ker::mod::sched::task {
 struct Task;
 }
@@ -109,11 +113,14 @@ struct NativeCompartmentSpec {
 
 // Retains the actual canonical creator and owns preparation on this executor
 // before IO. Requires local Host creator views; no ambient FD/path inheritance.
+// Caller supplies the actual initiating actor's owner-lock snapshot; this copy
+// survives in the persistent preparation and initializes the fresh child.
 // On success the child is exclusively owned/unpublished, with PID1, a fresh
 // nonroot-owned root, admitted image/stack and explicit capabilities. Executor
 // root preparation remains pending; destroy the child before retiring it.
 // A later publisher must revalidate policy and explicitly transfer ownership.
-auto prepare_native_compartment_for_owner(ker::mod::sched::task::Task& executor, const NativeCompartmentSpec& spec, int& error
+auto prepare_native_compartment_for_owner(ker::mod::sched::task::Task& executor, const NativeCompartmentSpec& spec, int& error,
+                                          const ker::mod::sched::TaskPlacementSnapshot& inherited_placement
 #ifdef WOS_SELFTEST
                                           ,
                                           NativeConstructionToken fault_token = {}
@@ -125,6 +132,11 @@ auto publish_native_compartment_for_owner(ker::mod::sched::task::Task& executor,
 // Actual mapped versioned ABI input from this executing/retained subject.
 // Returns physical Host child PID or negative errno; owns abort on refusal.
 auto create_native_compartment_for_subject(ker::mod::sched::task::Task* executor, uint64_t spec_address) -> int64_t;
+// Kernel-only explicit copied-input core. Caller captured the actual initiating
+// actor before preparation; controlled fixture tuples are finite input ports.
+// No scheduler ownership is inferred from a never-published fixture executor.
+auto create_native_compartment_for_subject(ker::mod::sched::task::Task* executor, uint64_t spec_address,
+                                           const ker::mod::sched::TaskPlacementSnapshot& inherited_placement) -> int64_t;
 auto abort_native_compartment_preparation(ker::mod::sched::task::Task& executor, ker::mod::sched::task::Task* child = nullptr) -> bool;
 
 // Internal admitted native construction context, never a userspace join handle.

@@ -569,6 +569,16 @@ auto snapshot(Snapshot& out, Workspace&, uint64_t max) noexcept -> Result {
     }
     return out.result;
 }
+// Disclosed physical/MM endpoint for the complete handler fixture. Actual
+// all-allocator-lock scanning and named MM capture have their separate actual-
+// body coherent-census test; this wrapper preserves this fixture's old vectors.
+auto selftest_snapshot_with_mm(Snapshot& out, Workspace& work, ker::test::numa_lifecycle::MmDebtSnapshot& mm,
+                               ker::test::numa_lifecycle::MmDebtCaptureScratch& capture, uint64_t max) noexcept -> Result {
+    fixture::outside();
+    mm = fixture::mm;
+    capture.before = capture.after = {mm.version_end, mm.inflight, mm.valid != 0};
+    return snapshot(out, work, max);
+}
 }  // namespace ker::mod::mm::numa::balance
 /* @HANDLER@ */
 namespace fixture {

@@ -644,7 +644,7 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
                "StableUserPage::physical_address()", "StableUserPage::was_dirty()", "StableUserPage::still_mapped()",
                "StableUserPage::commit_write()", "StableUserPage::retain_frame(UserPageFrameRef&", "StableUserPage::reset()",
                "StableUserPage::capture_futex_identity(", "StableUserPage::futex_identity_still_mapped(",
-               "auto pin_task_user_page(", "auto range_valid("]
+               "auto pin_task_user_page(", "auto pin_current_task_user_page(", "auto range_valid("]
     bodies = []
     for anchor in anchors:
         body, row = capture(cpp, anchor); actual.append(row)
@@ -653,6 +653,7 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
     increment, row = capture(phys_cpp, "auto page_ref_try_inc(void* page, PageLookupHint* hint)"); actual.append(row)
     text = '#include "fixture-common.hpp"\n#include <platform/sys/usercopy.hpp>\n#include <platform/sched/scheduler.hpp>\n'
     text += 'namespace ker::mod::mm::phys {\n' + increment + '\n}\n' + PIN_SEAMS
+    text += 'namespace ker::mod::sys {\nclass SyscallPreparationScope {\n public:\n  explicit SyscallPreparationScope(sched::task::Task&) {}\n  auto ready() const -> bool { return false; }\n};\n}\nnamespace ker::mod::mm::virt {\ninline auto prepare_current_anonymous_user_page(sched::task::Task&,uint64_t,bool,\n const sys::SyscallPreparationScope&) -> int {\n fixture::check(false,"ordinary preparation unsupported in frame/root-only fixtures"); return -EWOULDBLOCK;\n}\n}\nnamespace ker::mod::sys::usercopy {\nauto copy_from_current_task_partial(sched::task::Task&task,uint64_t address,void*dst,size_t size)->CopyResult {\n bool const ok=copy_from_task(task,address,dst,size);return {ok?size:0,!ok};\n}\n}\n'
     text += '\nnamespace ker::mod::sys::usercopy {\n' + '\n\n'.join(bodies) + '\n}\n'
     text += '#include "actual-futex.cpp"\n' + CASES
     (scratch / "harness.cpp").write_text(text)

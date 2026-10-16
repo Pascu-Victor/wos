@@ -106,7 +106,7 @@ auto relative_timeout_us(mod::sched::task::Task& task, uint64_t timeout_user_add
     }
 
     timespec ts{};
-    if (!mod::sys::usercopy::copy_value_from_task(task, timeout_user_addr, ts)) {
+    if (!mod::sys::usercopy::copy_from_current_task_partial(task, timeout_user_addr, &ts, sizeof(ts)).complete(sizeof(ts))) {
         return -EFAULT;
     }
     if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= NSEC_PER_SEC) {
@@ -224,7 +224,7 @@ int64_t futex_wait(uint64_t user_addr, int expected, uint64_t timeout_user_addr)
     int64_t const TIMEOUT_STATUS = relative_timeout_us(*current_task, timeout_user_addr, timeout_us);
 
     mod::sys::usercopy::StableUserPage futex_page{};
-    if (!mod::sys::usercopy::pin_task_user_page(*current_task, user_addr, false, true, futex_page)) {
+    if (!mod::sys::usercopy::pin_current_task_user_page(*current_task, user_addr, false, futex_page)) {
         return -EFAULT;
     }
     uint64_t const PHYS_ADDR = futex_page.physical_address();
@@ -337,7 +337,7 @@ int64_t futex_wake(uint64_t user_addr, int count) {
     }
 
     mod::sys::usercopy::StableUserPage futex_page{};
-    if (!mod::sys::usercopy::pin_task_user_page(*current_task, user_addr, false, true, futex_page)) {
+    if (!mod::sys::usercopy::pin_current_task_user_page(*current_task, user_addr, false, futex_page)) {
         return -EFAULT;
     }
     if (!futex_page.still_mapped()) {

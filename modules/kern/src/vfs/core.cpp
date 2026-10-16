@@ -9275,7 +9275,7 @@ auto vfs_read_user_bounced(ker::mod::sched::task::Task& task, File* file, void* 
 
     while (total < count) {
         size_t const TO_READ = std::min(count - total, BOUNCE_CAPACITY);
-        if (!ker::mod::sys::usercopy::ensure_writable(task, USER_BASE + total, TO_READ)) {
+        if (!ker::mod::sys::usercopy::ensure_current_task_writable(task, USER_BASE + total, TO_READ)) {
             return total > 0 ? finish(static_cast<ssize_t>(total)) : -EFAULT;
         }
 
@@ -9288,7 +9288,7 @@ auto vfs_read_user_bounced(ker::mod::sched::task::Task& task, File* file, void* 
         }
 
         auto const BYTES_READ = static_cast<size_t>(READ_RET);
-        auto const COPY = ker::mod::sys::usercopy::copy_to_task_partial(task, USER_BASE + total, BOUNCE_BUFFER, BYTES_READ);
+        auto const COPY = ker::mod::sys::usercopy::copy_to_current_task_partial(task, USER_BASE + total, BOUNCE_BUFFER, BYTES_READ);
         total += COPY.bytes_copied;
         if (COPY.fault) {
             return total > 0 ? finish(static_cast<ssize_t>(total)) : -EFAULT;
@@ -9476,7 +9476,7 @@ auto vfs_write_user_bounced(ker::mod::sched::task::Task& task, File* file, const
 
     while (total < count) {
         size_t const TO_WRITE = std::min(count - total, BOUNCE_CAPACITY);
-        auto const COPY = ker::mod::sys::usercopy::copy_from_task_partial(task, USER_BASE + total, BOUNCE_BUFFER, TO_WRITE);
+        auto const COPY = ker::mod::sys::usercopy::copy_from_current_task_partial(task, USER_BASE + total, BOUNCE_BUFFER, TO_WRITE);
         if (COPY.bytes_copied == 0 && COPY.fault) {
             return total > 0 ? finish(static_cast<ssize_t>(total)) : -EFAULT;
         }
@@ -18876,7 +18876,7 @@ auto vfs_pwrite_user_bounced(ker::mod::sched::task::Task& task, File* file, cons
 
     while (total < count) {
         size_t const TO_WRITE = std::min(count - total, BOUNCE_CAPACITY);
-        auto const COPY = ker::mod::sys::usercopy::copy_from_task_partial(task, USER_BASE + total, BOUNCE_BUFFER, TO_WRITE);
+        auto const COPY = ker::mod::sys::usercopy::copy_from_current_task_partial(task, USER_BASE + total, BOUNCE_BUFFER, TO_WRITE);
         if (COPY.bytes_copied == 0 && COPY.fault) {
             return total > 0 ? static_cast<ssize_t>(total) : -EFAULT;
         }

@@ -103,6 +103,12 @@ class FileMappingInstallerLease {
     size_t access_gate_{static_cast<size_t>(-1)};
 };
 
+// Ordinary current-PROCESS preparation before caller-owned MM/publication,
+// stable-pin, backend or access-window guards. Zero is advisory only: the
+// subsequent ordinary pin must still validate the current mapping.
+[[nodiscard]] auto prepare_current_anonymous_user_page(sched::task::Task& actor, uint64_t address, bool writable,
+                                                       const sys::SyscallPreparationScope& preparation) -> int;
+
 enum class PublicReadPrepareResult : uint8_t { NOT_TRACKED, READY, REFUSED };
 // Ordinary pre-pin preparation only. No caller-owned root/pin/publication guard
 // may span this potentially blocking demand backing operation.

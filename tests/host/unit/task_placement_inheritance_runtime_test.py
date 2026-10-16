@@ -55,12 +55,37 @@ def generate(root, source_root, capture):
              "auto capture_task_placement_snapshot(", "auto initialize_inherited_task_placement(",
              "auto post_task_balanced_inherited(", "auto post_task_round_robin_inherited("]
     functions = "\n\n".join(definition(scheduler, name) for name in names)
+    creation = text("modules/kern/src/syscalls_impl/process/exec.cpp")
+    wrappers = "\n".join(definition(creation, anchor) for anchor in [
+        "auto wos_proc_exec(", "auto wos_proc_spawn(",
+        "auto create_native_compartment_for_subject(mod::sched::task::Task* executor, uint64_t spec_address) -> int64_t {"])
+    legacy_initializer = definition(creation, "if (int const ERROR = sched::initialize_inherited_task_placement(new_task, inherited_placement)")
+    legacy_publication = definition(creation, "if (!sched::post_task_balanced_inherited(new_task, inherited_placement))")
+    native_publication = definition(creation, "if (result == 0) {\n                auto publication_placement")
+    shebang_continuation = definition(creation, "[spawn_options, &PARENT_CREDENTIALS, memory_policy, allocation_context, inherited_placement](")
+    native_constructor = definition(creation, "explicit NativeCompartmentPreparation(mod::sched::task::Task& owner, const mod::sched::TaskPlacementSnapshot& placement)\n")
+    native_member = "const mod::sched::TaskPlacementSnapshot inherited_placement;"
+    if creation.count(native_member) != 1:
+        raise ValueError("native persistent placement field changed")
+    native_initializer = "error = mod::sched::initialize_inherited_task_placement(child, root.inherited_placement);\n            if (error == 0) error = initialize_native_creation_priority(root, *child);"
+    if creation.count(native_initializer) != 1:
+        raise ValueError("native initializer/refusal ordering changed")
+    for anchor, body in [(native_member, native_member), (native_initializer, native_initializer)]:
+        fragments.append({"name": anchor, "line": creation.count("\n", 0, creation.index(body)) + 1,
+                          "bytes": len(body.encode()), "sha256": hashlib.sha256(body.encode()).hexdigest()})
+    preparation = capture(creation, "static auto prepare_native_compartment_inputs_for_owner(")[0]
+    native_failure_tail = definition(preparation, "if (error != 0) {")
     shell_path = Path(__file__).with_name("task_placement_inheritance_cases.inc")
     inputs[str(shell_path)] = hashlib.sha256(shell_path.read_bytes()).hexdigest()
     result = shell_path.read_text()
     pieces = {"SNAPSHOT": snapshot, "OWNERSHIP": ownership, "ACCESSORS": "\n".join(accessors),
               "HEAP_ENTRY": definition(heap, "inline auto heap_entry(RunHeap const&"),
-              "CONTAINS": definition(heap, "bool RunHeap::contains("), "FUNCTIONS": functions}
+              "CONTAINS": definition(heap, "bool RunHeap::contains("), "FUNCTIONS": functions,
+              "CREATION_WRAPPERS": wrappers, "LEGACY_INITIALIZER": legacy_initializer, "LEGACY_PUBLICATION": legacy_publication,
+              "SHEBANG_CONTINUATION": shebang_continuation,
+              "NATIVE_PLACEMENT_MEMBER": native_member, "NATIVE_PLACEMENT_CONSTRUCTOR": native_constructor,
+              "NATIVE_INITIALIZER": native_initializer, "NATIVE_FAILURE_TAIL": native_failure_tail,
+              "NATIVE_PUBLICATION": native_publication}
     for key, value in pieces.items():
         assert result.count("// INJECT_"+key) == 1
         result = result.replace("// INJECT_"+key, value)
@@ -109,6 +134,19 @@ def main():
             "wrong-publisher": ("return snapshot.cpu_pinned ? post_task_for_cpu(snapshot.owner_cpu, subject) : post_task_balanced(subject);",
                                 "return post_task_balanced(subject);"),
         }
+        native_wrapper = owned.capture(source, "auto create_native_compartment_for_subject(mod::sched::task::Task* executor, uint64_t spec_address) -> int64_t {")[0]
+        capture_line = "    if (int const ERROR = mod::sched::capture_task_placement_snapshot(executor, inherited_placement); ERROR != 0) return ERROR;"
+        if native_wrapper.count(capture_line) != 1:
+            raise ValueError("actual native public capture changed")
+        changes.update({
+            "uncaptured-native-actor": (native_wrapper, native_wrapper.replace(capture_line, "    // Genuine control: omitted actual public capture.")),
+            "lost-native-copy": ("inherited_placement(placement) {}", "inherited_placement{} { (void)placement; }"),
+            "lost-shebang-copy": ("[spawn_options, &PARENT_CREDENTIALS, memory_policy, allocation_context, inherited_placement](",
+                                  "[spawn_options, &PARENT_CREDENTIALS, memory_policy, allocation_context, &inherited_placement]("),
+            "old-legacy-publisher": ("!sched::post_task_balanced_inherited(new_task, inherited_placement)", "!(static_cast<void>(inherited_placement), sched::post_task_balanced(new_task))"),
+            "ambient-native-publisher": ("!mod::sched::post_task_round_robin_inherited(child, publication_placement, root->inherited_placement.owner_cpu)",
+                                          "!(static_cast<void>(publication_placement), mod::sched::post_task_for_cpu(mod::cpu::current_cpu(), child))"),
+        })
         for label, (old, new) in changes.items():
             if source.count(old) != 1:
                 raise ValueError("genuine mutation anchor is ambiguous: "+label)
@@ -153,7 +191,7 @@ def main():
         if after != before:
             raise ValueError("source bytes/metadata changed during validation")
         result = dict(source_before=before, source_after=after, fragments=fragments, dependency_inputs=dependency_inputs,
-                      variants=list(variants), limitations="Explicit Host Task/IRQ-queue transport/final publication endpoints; LSan off; no live kernel/SMP/public creation qualification")
+                      variants=list(variants), limitations="Explicit Host Task/IRQ-queue/final publication plus creation credential/NUMA/input/image-core/cleanup endpoints; actual new caller/initializer/post slices only, LSan off; no whole syscall/GS/root/live kernel/SMP/public creation qualification")
     except BaseException as exc:
         errors.append(type(exc).__name__+": "+str(exc))
         if args.evidence_dir is None and last_log is not None:

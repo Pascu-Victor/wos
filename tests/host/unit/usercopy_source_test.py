@@ -129,6 +129,32 @@ def require_common_usercopy_helper(header: str, source: str) -> None:
             fail(f"usercopy must never dereference an active userspace VA directly: {forbidden}")
 
 
+def require_current_preparation_is_before_the_legacy_pin(source: str) -> None:
+    body = function_body(source, "pin_current_task_user_page")
+    reset = body.find("out.reset()")
+    scope = body.find("SyscallPreparationScope preparation{task}")
+    prepare = body.find("prepare_current_anonymous_user_page(task, user_addr, require_writable, preparation)")
+    pin = body.find("return pin_task_user_page(task, user_addr, require_writable, true, out)")
+    if min(reset, scope, prepare, pin) < 0 or not reset < scope < prepare < pin:
+        fail("ordinary preparation must reset reused pins and precede the legacy pin")
+    scope_body, scope_end = braced_current_scope(body)
+    if "preparation.ready()" not in scope_body or scope_end > pin:
+        fail("the preparation IF scope must end before legacy pinning; unready callers keep the old path")
+    for name, call in [("copy_from_current_task_partial", "copy_from_task_common"),
+                       ("copy_to_current_task_partial", "copy_to_task_common")]:
+        if call not in function_body(source, name) or "true, true" not in function_body(source, name):
+            fail("only explicit current-copy wrappers may opt into preparation")
+    if "pin_current_task_user_page(task, page, true, pin)" not in function_body(source, "ensure_current_task_writable"):
+        fail("current writable preflight must use current stable pins")
+
+
+def braced_current_scope(body: str) -> tuple[str, int]:
+    scope = body.find("SyscallPreparationScope preparation{task}")
+    brace = body.rfind("{", 0, scope)
+    end = find_matching_brace(body, brace)
+    return body[brace + 1:end], end
+
+
 def require_mapping_stable_pin_contract() -> None:
     phys_hpp = PHYS_HPP.read_text()
     phys_cpp = PHYS_CPP.read_text()
@@ -549,7 +575,7 @@ def require_futex_timeout_and_address_usercopy(source: str) -> None:
     if signature_start < 0 or signature_end < 0 or "mod::sched::task::Task& task" not in source[signature_start:signature_end]:
         fail("futex timeout helper must accept the current task for usercopy")
     for snippet in [
-        "mod::sys::usercopy::copy_value_from_task(task, timeout_user_addr, ts)",
+        "mod::sys::usercopy::copy_from_current_task_partial(task, timeout_user_addr, &ts, sizeof(ts)).complete(sizeof(ts))",
         "return -EFAULT;",
     ]:
         if snippet not in timeout_body:
@@ -558,7 +584,7 @@ def require_futex_timeout_and_address_usercopy(source: str) -> None:
     for name in ["futex_wait", "futex_wake"]:
         body = function_body(source, name)
         guard = body.find("mod::sys::usercopy::range_valid(user_addr, sizeof(int))")
-        pin = body.find("mod::sys::usercopy::pin_task_user_page")
+        pin = body.find("mod::sys::usercopy::pin_current_task_user_page")
         if guard < 0 or pin < 0 or guard > pin:
             fail(f"{name} must reject non-user futex addresses before stable pinning")
         for forbidden in ["mod::mm::virt::translate", "mod::mm::addr::get_virt_pointer"]:
@@ -804,6 +830,7 @@ def require_thread_publication_uses_preflighted_mapped_usercopy() -> None:
 
 def main() -> None:
     require_common_usercopy_helper(USERCOPY_HPP.read_text(), USERCOPY_CPP.read_text())
+    require_current_preparation_is_before_the_legacy_pin(USERCOPY_CPP.read_text())
     require_mapping_stable_pin_contract()
     require_process_syscalls_use_usercopy(PROCESS_CPP.read_text())
     require_waitpid_outputs_are_preflighted(WAITPID_CPP.read_text())
