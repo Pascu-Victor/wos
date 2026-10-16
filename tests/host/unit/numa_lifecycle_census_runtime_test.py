@@ -158,6 +158,10 @@ def generate(root, source_root):
             "void defer_transferred_native_unpublished_process(",
         ]
     )
+    activity_helpers = "namespace ker::test::numa_lifecycle::mm_debt {\n" + "\n".join(
+        capture(text("platform/mm/virt.opt.cpp"), signature)
+        for signature in ["auto activity_anchor(", "auto activity_delta(", "auto activity_sum(", "void interpret_activity("]
+    ) + "\n}\n"
     registry_reader = capture(text("syscalls_impl/vmem/sys_vmem.cpp"), "void selftest_file_registry_snapshot(")
     shell = Path(__file__).with_suffix(".inc").read_text()
     for marker, value in [
@@ -170,6 +174,7 @@ def generate(root, source_root):
         ("@POP_READERS@", pop_readers),
         ("@NATIVE_READERS@", native_readers),
         ("@REGISTRY_READER@", registry_reader),
+        ("@ACTIVITY_HELPERS@", activity_helpers),
     ]:
         marker = "/* " + marker + " */"
         assert shell.count(marker) == 1
@@ -221,6 +226,7 @@ def main():
         "syscalls_impl/process/child_events.hpp",
         "syscalls_impl/shm/shm.hpp",
         "platform/mm/virt.hpp",
+        "platform/mm/virt.opt.cpp",
         "platform/mm/phys.hpp",
         "platform/mm/lifetime_retirement_executor.hpp",
         "platform/mm/numa_balance.hpp",

@@ -11282,14 +11282,77 @@ static_assert(sizeof(CounterState) == 216 && alignof(CounterState) == 8);
 static_assert(offsetof(CounterState, values) == 24 && offsetof(CounterState, arithmetic_valid) == 208);
 constinit CounterState current{};
 
+// Separate diagnostic state: never changes the216-byte acceptance state.
+struct ActivityState {
+    std::atomic<uint64_t> explicit_begins{}, explicit_ends{};
+    std::atomic<uint64_t> add_attempts[static_cast<size_t>(CounterField::COUNT)]{};
+    std::atomic<uint64_t> drop_attempts[static_cast<size_t>(CounterField::COUNT)]{};
+    std::atomic<uint64_t> invalid_selectors{};
+    std::atomic<bool> invalid{};
+};
+static_assert(sizeof(ActivityState) == 400 && alignof(ActivityState) == 8);
+static_assert(sizeof(ActivityState) + 2 * sizeof(MmActivitySnapshot) + sizeof(MmActivityRelation) + 5 * sizeof(uint64_t) <= 2048);
+constinit ActivityState activity{};
+
+void increment_activity(std::atomic<uint64_t>& counter) noexcept {
+    uint64_t value = counter.load(std::memory_order_seq_cst);
+    for (;;) {
+        if (value == UINT64_MAX) {
+            activity.invalid.store(true, std::memory_order_seq_cst);
+            return;
+        }
+        if (counter.compare_exchange_weak(value, value + 1, std::memory_order_seq_cst)) {
+            if (value + 1 == UINT64_MAX) activity.invalid.store(true, std::memory_order_seq_cst);
+            return;
+        }
+    }
+}
+
+void collect_activity(CounterState& state, MmActivitySnapshot& out) noexcept {
+    // Outputs are caller-born/prefaulted. No raw-stack Stamp or aggregate sret.
+    state.epoch.snapshot_into(out.before);
+    out.explicit_begins = activity.explicit_begins.load(std::memory_order_seq_cst);
+    out.explicit_ends = activity.explicit_ends.load(std::memory_order_seq_cst);
+    for (size_t i = 0; i < static_cast<size_t>(CounterField::COUNT); ++i) {
+        out.add_attempts[i] = activity.add_attempts[i].load(std::memory_order_seq_cst);
+        out.drop_attempts[i] = activity.drop_attempts[i].load(std::memory_order_seq_cst);
+    }
+    out.invalid_selectors = activity.invalid_selectors.load(std::memory_order_seq_cst);
+    state.epoch.snapshot_into(out.after);
+    out.valid = !activity.invalid.load(std::memory_order_seq_cst) && out.before.valid && out.after.valid && out.before.version != 0 &&
+                out.before.version != UINT64_MAX && out.before.version == out.after.version && out.before.inflight == 0 &&
+                out.after.inflight == 0;
+}
+
+auto activity_anchor(const MmDebtSnapshot& mm, const MmActivitySnapshot& sample) noexcept -> bool {
+    return mm.valid == 1 && mm.inflight == 0 && mm.version_begin != 0 && mm.version_begin != UINT64_MAX &&
+           mm.version_begin == mm.version_end && sample.valid == 1 && sample.before.valid && sample.after.valid &&
+           sample.before.inflight == 0 && sample.after.inflight == 0 && sample.before.version == mm.version_begin &&
+           sample.after.version == mm.version_end;
+}
+
+auto activity_delta(uint64_t before, uint64_t after, uint64_t& output) noexcept -> bool {
+    if (before == UINT64_MAX || after == UINT64_MAX || after < before) return false;
+    output = after - before;
+    return true;
+}
+
+auto activity_sum(uint64_t& output, uint64_t addend) noexcept -> bool {
+    if (addend >= UINT64_MAX - output) return false;
+    output += addend;
+    return true;
+}
+
 void adjust(CounterState& state, CounterField field, bool increase) noexcept {
     state.epoch.begin();
     size_t const INDEX = static_cast<size_t>(field);
     if (INDEX >= static_cast<size_t>(CounterField::COUNT)) {
+        increment_activity(activity.invalid_selectors);
         state.arithmetic_valid.store(false, std::memory_order_seq_cst);
         state.epoch.end();
         return;
     }
+    increment_activity(increase ? activity.add_attempts[INDEX] : activity.drop_attempts[INDEX]);
     auto& counter = state.values[INDEX];
     uint64_t value = counter.load(std::memory_order_seq_cst);
     for (;;) {
@@ -11335,8 +11398,14 @@ void collect(CounterState& state, MmDebtSnapshot& out) noexcept {
     out.valid = state.arithmetic_valid.load(std::memory_order_seq_cst) && BEFORE.valid && AFTER.valid && BEFORE.version == AFTER.version;
 }
 }  // namespace
-void begin_change() noexcept { current.epoch.begin(); }
-void end_change() noexcept { current.epoch.end(); }
+void begin_change() noexcept {
+    current.epoch.begin();
+    increment_activity(activity.explicit_begins);
+}
+void end_change() noexcept {
+    increment_activity(activity.explicit_ends);
+    current.epoch.end();
+}
 void add(CounterField field) noexcept { adjust(current, field, true); }
 void drop(CounterField field) noexcept { adjust(current, field, false); }
 void add_lazy_row(uint8_t copied_kind) noexcept {
@@ -11350,5 +11419,37 @@ void drop_lazy_row(uint8_t copied_kind) noexcept {
     adjust(current, FIELD, false);
 }
 void snapshot(MmDebtSnapshot& output) noexcept { collect(current, output); }
+void activity_snapshot(MmActivitySnapshot& output) noexcept { collect_activity(current, output); }
+void interpret_activity(const MmDebtSnapshot& a, const MmDebtSnapshot& b, const MmActivitySnapshot& activity_a,
+                        const MmActivitySnapshot& activity_b, MmActivityRelation& output) noexcept {
+    // Explicit stores avoid a raw excluded-stack aggregate/hidden return.
+    output.reconciled = 0;
+    output.mm_delta = 0;
+    output.accounted_delta = 0;
+    output.begin_delta = 0;
+    output.end_delta = 0;
+    output.adjust_calls = 0;
+    if (!activity_anchor(a, activity_a) || !activity_anchor(b, activity_b)) return;
+    uint64_t mm_delta = 0, begins = 0, ends = 0, calls = 0, delta = 0, accounted = 0;
+    if (!activity_delta(a.version_begin, b.version_end, mm_delta) ||
+        !activity_delta(activity_a.explicit_begins, activity_b.explicit_begins, begins) ||
+        !activity_delta(activity_a.explicit_ends, activity_b.explicit_ends, ends) || !activity_sum(accounted, begins) ||
+        !activity_sum(accounted, ends))
+        return;
+    for (size_t i = 0; i < static_cast<size_t>(CounterField::COUNT); ++i) {
+        if (!activity_delta(activity_a.add_attempts[i], activity_b.add_attempts[i], delta) || !activity_sum(calls, delta) ||
+            !activity_delta(activity_a.drop_attempts[i], activity_b.drop_attempts[i], delta) || !activity_sum(calls, delta))
+            return;
+    }
+    if (!activity_delta(activity_a.invalid_selectors, activity_b.invalid_selectors, delta) || !activity_sum(calls, delta) ||
+        calls > (UINT64_MAX - 1) / 2 || !activity_sum(accounted, calls * 2))
+        return;
+    output.mm_delta = mm_delta;
+    output.accounted_delta = accounted;
+    output.begin_delta = begins;
+    output.end_delta = ends;
+    output.adjust_calls = calls;
+    output.reconciled = mm_delta == accounted;
+}
 }  // namespace ker::test::numa_lifecycle::mm_debt
 #endif

@@ -349,6 +349,9 @@ auto thread_control(abi::multiproc::threadControlOps op, uint64_t arg1, uint64_t
             if (parent == nullptr || tcb_va == 0) {
                 return static_cast<uint64_t>(-EINVAL);
             }
+            mod::sched::TaskPlacementSnapshot inherited_placement{};
+            if (int const ERROR = mod::sched::capture_task_placement_snapshot(parent, inherited_placement); ERROR != 0)
+                return static_cast<uint64_t>(ERROR);
             auto const MEMORY_POLICY = parent->memory_policy_snapshot();
             ker::syscall::process::exit_current_if_process_exit_requested();
             mod::sched::resource::ProcessReservation process_reservation(parent, parent->credentials().user().real);
@@ -396,7 +399,9 @@ auto thread_control(abi::multiproc::threadControlOps op, uint64_t arg1, uint64_t
                         if (CPU_COUNT == 0) {
                             return static_cast<uint64_t>(-ENOMEM);
                         }
-                        uint64_t const TARGET_CPU = next_thread_cpu.fetch_add(1, std::memory_order_relaxed) % CPU_COUNT;
+                        if (int const ERROR = mod::sched::initialize_inherited_task_placement(t, inherited_placement); ERROR != 0)
+                            return static_cast<uint64_t>(ERROR);
+                        uint64_t const PLACEMENT_SEED = next_thread_cpu.fetch_add(1, std::memory_order_relaxed);
 
                         uint64_t const NEW_TID = t->namespace_tid();
                         if (!mod::sched::threading::publish_tid_to_tcb(*parent, tcb_va, NEW_TID, false)) {
@@ -407,8 +412,8 @@ auto thread_control(abi::multiproc::threadControlOps op, uint64_t arg1, uint64_t
                         // Keep the subject alive through exit propagation even
                         // if it runs and retires immediately after posting.
                         bool const PUBLICATION_REF = t->try_acquire_lifetime_ref();
-                        bool const POSTED =
-                            PUBLICATION_REF && process_reservation.attach(*t) && mod::sched::post_task_for_cpu(TARGET_CPU, t);
+                        bool const POSTED = PUBLICATION_REF && process_reservation.attach(*t) &&
+                                            mod::sched::post_task_round_robin_inherited(t, inherited_placement, PLACEMENT_SEED);
                         if (!POSTED) {
                             if (PUBLICATION_REF) t->release();
                             (void)mod::sched::threading::publish_tid_to_tcb(*parent, tcb_va, 0, false);

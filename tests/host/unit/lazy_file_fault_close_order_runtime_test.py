@@ -36,6 +36,10 @@ SOURCE = ROOT / "modules/kern/src/platform/mm/virt.opt.cpp"
 TASK = ROOT / "modules/kern/src/platform/sched/task.cpp"
 TASK_HEADER = ROOT / "modules/kern/src/platform/sched/task.hpp"
 FAMILY_HEADER = ROOT / "modules/kern/src/platform/mm/file_mapping_lifetime.hpp"
+NUMA_HEADER = ROOT / "modules/kern/src/platform/mm/numa_alloc.hpp"
+POLICY_HEADER = ROOT / "modules/kern/src/platform/mm/numa_policy.hpp"
+TOPOLOGY_HEADER = ROOT / "modules/kern/src/platform/acpi/numa_topology.hpp"
+VIRT_HEADER = ROOT / "modules/kern/src/platform/mm/virt.hpp"
 
 PRELUDE = r'''
 #include <array>
@@ -49,9 +53,14 @@ PRELUDE = r'''
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <new>
 #include <thread>
 #include <vector>
 #include <platform/mm/file_mapping_lifetime.hpp>
+#include <platform/mm/numa_policy.hpp>
+namespace ker::mod::mm::numa {
+// ACTUAL_ALLOCATION_CONTEXT
+}
 namespace ker::mod::mm::paging { struct PageTable { size_t gate_index{}; }; }
 namespace fixture {
 std::atomic<unsigned> failures{}, assertions{}, order_failures{}, cases{}, close_calls{}, nonfinal_puts{};
@@ -138,6 +147,7 @@ void kern_block();
 namespace ker::mod::mm::virt {
 namespace sched = ker::mod::sched;
 namespace sys = ker::mod::sys;
+// ACTUAL_DEMAND_DECLARATIONS
 using PageTable = fixture::PageTable;
 constexpr uint64_t PADDR_INVALID = UINT64_MAX;
 constexpr size_t USER_PAGEMAP_ACCESS_GATE_NONE = SIZE_MAX;
@@ -163,6 +173,16 @@ void release_user_pagemap_access(size_t);
 namespace ker::syscall::vmem {
 bool materialize_lazy_file_page(ker::mod::sched::task::Task*, const ker::mod::sched::task::LazyVmemRange&,
                                 uint64_t, const ker::mod::mm::paging::PageFault&);
+// RAW-only controlled materialization endpoint; real allocator/policy dispatch
+// belongs to the other actual-factory tests. Keep the old overload for genuine
+// predecessor worker bodies and preserve every existing close-order assertion.
+bool materialize_lazy_file_page(ker::mod::sched::task::Task* task,
+    const ker::mod::sched::task::LazyVmemRange& range, uint64_t address,
+    const ker::mod::mm::paging::PageFault& fault, const ker::mod::mm::numa::AllocationContext& placement) {
+    fixture::check(placement.policy == ker::mod::mm::numa::Policy{} && placement.local_node == 0 &&
+                   placement.virtual_page_index == address / 4096, "worker lost supplied captured placement value");
+    return materialize_lazy_file_page(task, range, address, fault);
+}
 }
 '''
 
@@ -411,6 +431,33 @@ def generate(virt: str, task: str, virt_path: Path, task_header: str) -> tuple[s
     actual = [{"name": "actual-LazyVmemKind-Range-and-pure-helpers", "bytes": len(types.encode()),
                "sha256": hashlib.sha256(types.encode()).hexdigest()},
               {"name": "whole-real-file_mapping_lifetime.hpp", **pin(FAMILY_HEADER)}]
+    allocator_header = NUMA_HEADER.read_text()
+    context = allocator_header[allocator_header.index("struct AllocationContext {"):
+                               allocator_header.index("enum class ReclaimMode :")]
+    demand = ""
+    if "struct DemandContext {" in virt:
+        origins = re.findall(r"^enum class DemandOrigin[^;]+;", VIRT_HEADER.read_text(), re.M)
+        if len(origins) != 1:
+            raise ValueError("expected one actual DemandOrigin declaration")
+        value = virt[virt.index("struct DemandContext {"):virt.index("static_assert(alignof(DemandContext)")]
+        storage = virt[virt.index("class DemandContextStorage {"):virt.index("class DemandResultStorage {")]
+        demand = origins[0] + "\n" + value + storage + r'''
+// Successful RAW capture is an explicit Host endpoint, not native actor/CPU or
+// policy authority. The complete actual probe still owns admission and cleanup.
+auto capture_demand_context(sched::task::Task* target, uint64_t address,
+    DemandOrigin origin, bool user, DemandContext& output) -> bool {
+    fixture::check(fixture::lock_depth == 0 && target != nullptr && target->pagemap != nullptr &&
+                   target->usercopy_pagemap_accesses.load() == 0 && origin == DemandOrigin::HardwareFault && user,
+                   "capture endpoint entered after MM lease or outside supplied RAW fault");
+    output.allocation = {{}, 0, address / 4096};
+    output.origin = origin;
+    output.hardware_user = user;
+    return target != nullptr && target->pagemap != nullptr;
+}
+'''
+    for name, declaration in (("actual-AllocationContext", context), ("actual-Demand-types-storage-with-capture-endpoint", demand)):
+        actual.append({"name": name, "bytes": len(declaration.encode()),
+                       "sha256": hashlib.sha256(declaration.encode()).hexdigest()})
     prefix = virt.index("enum class LazyFileFaultDisposition")
     suffix = virt.index("void wake_lazy_file_fault_worker()", prefix)
     declarations = virt[prefix:suffix]
@@ -432,6 +479,7 @@ def generate(virt: str, task: str, virt_path: Path, task_header: str) -> tuple[s
     # The complete actual Task methods use the fixture PageTable declaration,
     # aliased through the same namespace names; no body/type-name replacement.
     text = PRELUDE.replace("// ACTUAL_RAW_RANGE_TYPES", types)
+    text = text.replace("// ACTUAL_ALLOCATION_CONTEXT", context).replace("// ACTUAL_DEMAND_DECLARATIONS", demand)
     text += "namespace ker::mod::sched::task { namespace mm = ker::mod::mm;\n" + "\n".join(task_bodies) + "\n}\n"
     text += "namespace ker::mod::mm::virt {\n" + declarations + "\n" + "\n\n".join(bodies) + "\n}\n"
     return text + CASES, actual
@@ -590,7 +638,8 @@ def main() -> int:
             if executable.read(4) != b"\x7fELF":
                 raise ValueError("--cxx/CXX must name one host ELF compiler executable")
         subreaper()
-        watched = [virt_path, task_path, TASK_HEADER, FAMILY_HEADER, Path(__file__).resolve(), compiler]
+        watched = [virt_path, task_path, TASK_HEADER, FAMILY_HEADER, NUMA_HEADER, POLICY_HEADER, TOPOLOGY_HEADER,
+                   VIRT_HEADER, Path(__file__).resolve(), compiler]
         before = [pin(path) for path in watched]
         result["virt_source"] = before[0]
         harness, actual = generate(virt_path.read_text(), task_path.read_text(), virt_path, TASK_HEADER.read_text())
@@ -604,7 +653,8 @@ def main() -> int:
         source.write_text(harness)
         commands = [
             [str(compiler), "-std=c++23", "-O1", "-g0", "-pipe", "-pthread", "-fsanitize=address,undefined",
-             "-fno-omit-frame-pointer", "-I", str(scratch / "include"), str(source), "-o", str(binary)],
+             "-fno-omit-frame-pointer", "-I", str(scratch / "include"), "-I", str(ROOT / "modules/kern/src"),
+             str(source), "-o", str(binary)],
             [str(binary)],
         ]
         for index, argv in enumerate(commands):

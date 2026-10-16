@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import ast
 import re
 from pathlib import Path
 
@@ -11,6 +12,13 @@ ROOT_CMAKE = ROOT / "tests" / "CMakeLists.txt"
 RUN_TESTS = ROOT / "scripts" / "test" / "run_tests.sh"
 GTEST_MACRO_RE = re.compile(r"\b(?:TEST|TEST_F|TEST_P|TYPED_TEST|TYPED_TEST_P)\s*\(")
 FUZZ_ENTRYPOINT_RE = re.compile(r"\bLLVMFuzzerTestOneInput\s*\(")
+# These fixtures are compiled by their named Python owners rather than direct
+# wos_add_unit_test targets. Each must retain its real checked-main or GTest cases.
+DRIVER_COMPANIONS = {
+    "kcov_runtime_test.cpp": "kcov_runtime_test",
+    "numa_root_reserve_test.cpp": "numa_root_reserve_runtime_test",
+    "managed_huge_test.cpp": "managed_huge_runtime_test",
+}
 PYTHON_TEST_RE = re.compile(r"^\s*def\s+test_[A-Za-z0-9_]+\s*\(", flags=re.MULTILINE)
 
 
@@ -20,6 +28,28 @@ def fail(message: str) -> None:
 
 def strip_comments(source: str) -> str:
     return "\n".join(line.split("#", 1)[0] for line in source.splitlines())
+
+
+def expand_literal_foreach(source: str) -> str:
+    """Read the finite literal lists used by this manifest, without evaluating CMake."""
+    pattern = re.compile(
+        r"\bforeach\(\s*(?P<variable>[A-Za-z_]\w*)\s+"
+        r"(?:IN\s+ITEMS\s+)?(?P<items>[^)]*)\)(?P<body>.*?)\bendforeach\(\)",
+        flags=re.DOTALL,
+    )
+
+    def expand(match: re.Match) -> str:
+        items = match["items"].split()
+        if not items or any(re.fullmatch(r"[A-Za-z_]\w*", item) is None for item in items):
+            fail("host manifest foreach must use a finite literal item list")
+        if re.search(r"\bforeach\(", match["body"]):
+            fail("host manifest does not support nested foreach lists")
+        return "\n".join(match["body"].replace("${" + match["variable"] + "}", item) for item in items)
+
+    expanded = pattern.sub(expand, source)
+    if re.search(r"\b(?:foreach|endforeach)\(", expanded):
+        fail("host manifest contains an unsupported foreach registration")
+    return expanded
 
 
 def registered_calls(source: str, function_name: str) -> dict[str, str]:
@@ -215,9 +245,103 @@ def mask_cxx_non_code(source: str) -> str:
     return "".join(out)
 
 
-def require_registered_test_sources_define_entrypoints(unit_cpp_files: list[Path], fuzz_cpp_files: list[Path]) -> None:
+def require_companion_program(filename: str, cpp: str, driver: str) -> None:
+    code = mask_cxx_non_code(cpp)
+    if filename == "managed_huge_test.cpp":
+        if GTEST_MACRO_RE.search(code) is None:
+            fail("driver-owned managed_huge_test.cpp must define real GTest cases")
+    else:
+        if re.search(r"\bint\s+main\s*\([^;{}]*\)\s*\{", code) is None:
+            fail(f"driver-owned companion {filename} must define a real main")
+        if re.search(r"\b(?:assert|host::require)\s*\(", code) is None:
+            fail(f"driver-owned companion {filename} must execute assertion checks")
+
+    tree = ast.parse(driver)
+    if filename == "kcov_runtime_test.cpp":
+        expected = ast.dump(ast.parse("ROOT / 'tests/host/unit/kcov_runtime_test.cpp'", mode="eval").body)
+        # The actual compiler command directly contains the fixture path.
+        linked = any(
+            isinstance(call, ast.Call)
+            and ast.unparse(call.func) == "subprocess.run"
+            and call.args and isinstance(call.args[0], ast.List)
+            and call.args[0].elts and isinstance(call.args[0].elts[0], ast.Constant)
+            and call.args[0].elts[0].value == "clang++"
+            and any(ast.dump(node) == expected for node in ast.walk(call.args[0]))
+            and any(keyword.arg == "check" and isinstance(keyword.value, ast.Constant)
+                    and keyword.value.value is True for keyword in call.keywords)
+            for call in ast.walk(tree)
+        )
+    elif filename == "numa_root_reserve_test.cpp":
+        expected = ast.dump(ast.parse("here / 'numa_root_reserve_test.cpp'", mode="eval").body)
+        selected = any(
+            isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "sources"
+                                                for target in node.targets)
+            and isinstance(node.value, ast.List)
+            and any(ast.dump(element) == expected for element in node.value.elts)
+            for node in ast.walk(tree)
+        )
+        # The named source list reaches the actual per-source compiler command.
+        compiled = any(
+            isinstance(loop, ast.For) and ast.unparse(loop.iter) == "enumerate(sources)"
+            and ast.unparse(loop.target) == "(i, src)"
+            and any(isinstance(call, ast.Call) and ast.unparse(call.func) == "run"
+                    and len(call.args) == 2
+                    and ast.unparse(call.args[1]) == "common + flags + ['-c', src, '-o', obj]"
+                    for call in ast.walk(loop))
+            for loop in ast.walk(tree)
+        )
+        compiler = any(isinstance(node, ast.Assign)
+                       and any(isinstance(target, ast.Name) and target.id == "common" for target in node.targets)
+                       and isinstance(node.value, ast.List) and node.value.elts
+                       and ast.unparse(node.value.elts[0]) == "str(cxx)" for node in ast.walk(tree))
+        linked = selected and compiled and compiler
+    elif filename == "managed_huge_test.cpp":
+        fixture = any(isinstance(node, ast.Assign)
+                      and any(isinstance(target, ast.Name) and target.id == "fixture" for target in node.targets)
+                      and ast.unparse(node.value) == "support / 'managed_huge_test.cpp'" for node in ast.walk(tree))
+        composed = any(isinstance(call, ast.Call) and ast.unparse(call.func) == "composite.write_text"
+                       and any(isinstance(node, ast.Call) and ast.unparse(node.func) == "fixture.read_text"
+                               for node in ast.walk(call)) for call in ast.walk(tree))
+        selected = any(isinstance(node, ast.Assign)
+                       and any(isinstance(target, ast.Name) and target.id == "sources" for target in node.targets)
+                       and isinstance(node.value, ast.BinOp) and isinstance(node.value.left, ast.List)
+                       and any(isinstance(element, ast.Name) and element.id == "composite"
+                               for element in node.value.left.elts) for node in ast.walk(tree))
+        compiled = any(isinstance(loop, ast.For) and ast.unparse(loop.iter) == "enumerate(sources)"
+                       and ast.unparse(loop.target) == "(index, path)"
+                       and any(isinstance(call, ast.Call) and ast.unparse(call.func) == "run"
+                               and len(call.args) == 2
+                               and ast.unparse(call.args[1]) == "flags + ['-c', path, '-o', obj]"
+                               for call in ast.walk(loop)) for loop in ast.walk(tree))
+        linked = fixture and composed and selected and compiled
+    else:
+        fail(f"unowned standalone companion: {filename}")
+    if not linked:
+        fail(f"driver-owned companion {filename} is missing its actual compiler-source linkage")
+
+
+def require_driver_owned_companions(unit_cpp_files: list[Path], py_regs: dict[str, str]) -> set[Path]:
+    companions: set[Path] = set()
+    by_name = {path.name: path for path in unit_cpp_files}
+    for filename, owner in DRIVER_COMPANIONS.items():
+        if filename not in by_name:
+            fail(f"missing driver-owned companion: {filename}")
+        if py_regs.get(owner) != owner + ".py":
+            fail(f"driver-owned companion {filename} requires its registered Python compiler owner {owner}")
+        path = by_name[filename]
+        driver = HOST_DIR / "unit" / (owner + ".py")
+        require_companion_program(filename, path.read_text(), driver.read_text())
+        companions.add(path)
+    return companions
+
+
+def require_registered_test_sources_define_entrypoints(
+    unit_cpp_files: list[Path], fuzz_cpp_files: list[Path], companions: set[Path] | None = None,
+) -> None:
     empty_unit_tests = []
     for path in unit_cpp_files:
+        if companions is not None and path in companions:
+            continue
         source = mask_cxx_non_code(path.read_text())
         if GTEST_MACRO_RE.search(source) is None:
             empty_unit_tests.append(str(path.relative_to(ROOT)))
@@ -323,10 +447,11 @@ def require_run_tests_lists_current(unit_targets: set[str], fuzz_targets: set[st
 
 def require_python_tests_ctest_labels(source: str, py_tests: set[str]) -> None:
     labels = registered_test_labels(source)
-    required = {"host", "source"}
-    missing = sorted(test for test in py_tests if not required.issubset(labels.get(test, set())))
+    missing = sorted(test for test in py_tests
+                     if "host" not in labels.get(test, set())
+                     or not ({"source", "unit", "runtime"} & labels.get(test, set())))
     if missing:
-        fail("Python host tests must be labeled host;source in CTest: " + ", ".join(missing))
+        fail("Python host tests need host and a source/unit/runtime CTest category: " + ", ".join(missing))
 
 
 def require_raw_ctest_entries_are_registered_python_tests(source: str, py_tests: set[str]) -> None:
@@ -352,7 +477,7 @@ def require_sets_equal(left: set[str], right: set[str], left_name: str, right_na
 
 
 def main() -> None:
-    source = strip_comments(HOST_CMAKE.read_text())
+    source = expand_literal_foreach(strip_comments(HOST_CMAKE.read_text()))
 
     require_composite_source_registration_checks()
     require_discoverable_test_source_names()
@@ -361,18 +486,23 @@ def main() -> None:
     unit_bench_files = sorted((HOST_DIR / "unit").glob("*_bench.cpp"))
     unit_py_files = sorted((HOST_DIR / "unit").glob("*_test.py"))
     fuzz_cpp_files = sorted((HOST_DIR / "fuzz").glob("*_fuzz.cpp"))
+    # Registered compiler/extractor helper scripts need not have test entrypoint names.
+    # Discoverability checks above still reject hidden test cases; every CMake source
+    # reference must point to a real flat source/helper file.
     existing = {
         str(path.relative_to(HOST_DIR))
-        for path in unit_cpp_files + unit_bench_files + unit_py_files + fuzz_cpp_files
+        for directory in (HOST_DIR / "unit", HOST_DIR / "fuzz")
+        for pattern in ("*.cpp", "*.py") for path in directory.glob(pattern)
     }
-
-    require_registered_test_sources_define_entrypoints(unit_cpp_files, fuzz_cpp_files)
 
     unit_regs = registered_calls(source, "wos_add_unit_test")
     fuzz_regs = registered_calls(source, "wos_add_fuzz_target")
     py_regs = registered_python_tests(source)
 
-    require_registered_files(unit_cpp_files, unit_regs, "unit", "C++ host unit test")
+    companions = require_driver_owned_companions(unit_cpp_files, py_regs)
+    require_registered_test_sources_define_entrypoints(unit_cpp_files, fuzz_cpp_files, companions)
+    require_registered_files([path for path in unit_cpp_files if path not in companions],
+                             unit_regs, "unit", "C++ host unit test")
     require_registered_files(fuzz_cpp_files, fuzz_regs, "fuzz", "host fuzz target")
 
     missing_py = []
@@ -397,7 +527,8 @@ def main() -> None:
     require_raw_ctest_entries_are_registered_python_tests(source, set(py_regs))
     require_run_tests_lists_current(set(unit_regs) | set(py_regs), set(fuzz_regs))
     print(
-        f"{len(unit_cpp_files)} C++ unit tests, {len(unit_py_files)} Python tests, "
+        f"{len(unit_cpp_files) - len(companions)} direct GTest sources, {len(companions)} driver-owned fixtures, "
+        f"{len(unit_py_files)} Python tests, "
         f"and {len(fuzz_cpp_files)} fuzz targets are registered"
     )
 

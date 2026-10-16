@@ -4268,6 +4268,84 @@ auto observe_task_affinity_locked(RunQueue* owner, task::Task* subject, uint64_t
     return 0;
 }
 
+// The caller retains the source Task and the actual queue lock proves its
+// placement. No output is published until the complete tuple is admitted.
+auto inherited_task_placement_mask(const TaskPlacementSnapshot& snapshot, uint64_t core_count, uint64_t& out) -> int {
+    if (core_count == 0) return -ENODEV;
+    if (core_count > 64) return -ERANGE;
+    uint64_t const ONLINE = task_placement_online_mask(core_count);
+    if (snapshot.owner_cpu >= core_count || snapshot.domain_mask == 0 ||
+        (snapshot.domain_mask != UINT64_MAX && (snapshot.domain_mask & ~ONLINE) != 0))
+        return -EINVAL;
+    uint64_t const MASK = snapshot.cpu_pinned ? uint64_t{1} << snapshot.owner_cpu : snapshot.domain_mask & ONLINE;
+    if (MASK == 0 || (!snapshot.cpu_pinned && !cpu_mask_contains(MASK, snapshot.owner_cpu))) return -EINVAL;
+    out = MASK;
+    return 0;
+}
+
+auto observe_task_placement_locked(RunQueue* owner, task::Task* subject, uint64_t owner_cpu, uint64_t core_count,
+                                   TaskPlacementSnapshot& out) -> int {
+    if (core_count == 0) return -ENODEV;
+    if (core_count > 64) return -ERANGE;
+    if (owner_cpu >= core_count) return -EBUSY;
+    TaskPlacementOwnership ownership;
+    if (!task_placement_ownership_locked(owner, subject, ownership)) return -EBUSY;
+    TaskPlacementSnapshot const SNAPSHOT{.owner_cpu = owner_cpu,
+                                         .domain_mask = subject->load_domain_mask(),
+                                         .domain_id = subject->load_domain_id(),
+                                         .cpu_pinned = subject->load_cpu_pinned(),
+                                         .domain_hard = subject->load_domain_hard()};
+    uint64_t allowed = 0;
+    int const ERROR = inherited_task_placement_mask(SNAPSHOT, core_count, allowed);
+    if (ERROR != 0) return ERROR;
+    out = SNAPSHOT;
+    return 0;
+}
+
+// Admission checks do not prove creation history. Every caller must own a
+// genuine fresh, never-published allocation through construction/publication.
+auto inherited_task_is_fresh(const task::Task* subject) -> bool {
+    return subject != nullptr && subject->type == task::TaskType::PROCESS && subject->pid != 0 &&
+           subject->state.load(std::memory_order_acquire) == task::TaskState::ACTIVE && !subject->has_run && !subject->has_exited &&
+           !subject->exit_in_progress.load(std::memory_order_acquire) && !subject->gc_queued.load(std::memory_order_acquire) &&
+           !subject->scheduler_published.load(std::memory_order_acquire) && subject->active_registry_index == UINT32_MAX &&
+           subject->sched_queue == task::Task::sched_queue::NONE && subject->heap_index == -1 && subject->sched_previous == nullptr &&
+           subject->sched_next == nullptr && subject->sched_list_owner.load(std::memory_order_acquire) == nullptr;
+}
+
+auto initialize_inherited_task_placement_for_cores(task::Task* subject, const TaskPlacementSnapshot& snapshot, uint64_t core_count) -> int {
+    if (!inherited_task_is_fresh(subject)) return -EBUSY;
+    uint64_t allowed = 0;
+    int const ERROR = inherited_task_placement_mask(snapshot, core_count, allowed);
+    if (ERROR != 0) return ERROR;
+    subject->store_cpu(snapshot.owner_cpu);
+    subject->store_domain_mask(snapshot.domain_mask);
+    subject->store_domain_id(snapshot.domain_id);
+    subject->store_cpu_pinned(snapshot.cpu_pinned);
+    subject->store_domain_hard(snapshot.domain_hard);
+    return 0;
+}
+
+auto inherited_task_placement_matches(const task::Task* subject, const TaskPlacementSnapshot& snapshot, uint64_t core_count,
+                                      uint64_t& allowed) -> bool {
+    if (!inherited_task_is_fresh(subject) || inherited_task_placement_mask(snapshot, core_count, allowed) != 0) return false;
+    return subject->load_cpu() == snapshot.owner_cpu && subject->load_domain_mask() == snapshot.domain_mask &&
+           subject->load_domain_id() == snapshot.domain_id && subject->load_cpu_pinned() == snapshot.cpu_pinned &&
+           subject->load_domain_hard() == snapshot.domain_hard;
+}
+
+auto inherited_round_robin_cpu(const TaskPlacementSnapshot& snapshot, uint64_t core_count, uint64_t seed) -> uint64_t {
+    uint64_t allowed = 0;
+    if (inherited_task_placement_mask(snapshot, core_count, allowed) != 0) return UINT64_MAX;
+    if (snapshot.cpu_pinned) return snapshot.owner_cpu;
+    uint64_t const START = seed % core_count;
+    for (uint64_t offset = 0; offset < core_count; ++offset) {
+        uint64_t const CPU = (START + offset) % core_count;
+        if (cpu_mask_contains(allowed, CPU)) return CPU;
+    }
+    return UINT64_MAX;
+}
+
 auto commit_task_placement_request(task::Task* subject, uint64_t core_count, const TaskPlacementRequest& request) -> TaskPlacementResult {
     TaskPlacementResult result;
     // A producer can move the subject after each proposal, but the final
@@ -4366,6 +4444,44 @@ auto get_task_affinity_checked(task::Task* subject, uint64_t& out) -> int {
         if (owner_found) return status;
     }
     return -EBUSY;
+}
+
+auto capture_task_placement_snapshot(task::Task* subject, TaskPlacementSnapshot& out) -> int {
+    if (subject == nullptr) return -ESRCH;
+    uint64_t const CORE_COUNT = smt::get_core_count();
+    if (CORE_COUNT == 0) return -ENODEV;
+    if (CORE_COUNT > 64) return -ERANGE;
+    if (run_queues == nullptr) return -EBUSY;
+    for (unsigned attempt = 0; attempt < 2; ++attempt) {
+        uint64_t const OWNER = hinted_or_scanned_owner_cpu(subject);
+        if (OWNER >= CORE_COUNT) continue;
+        bool owner_found = false;
+        int status = -EBUSY;
+        run_queues->with_lock_void(OWNER, [subject, CORE_COUNT, OWNER, &out, &owner_found, &status](RunQueue* owner) {
+            owner_found = runqueue_owns_task_locked(owner, subject);
+            if (owner_found) status = observe_task_placement_locked(owner, subject, OWNER, CORE_COUNT, out);
+        });
+        if (owner_found) return status;
+    }
+    return -EBUSY;
+}
+
+auto initialize_inherited_task_placement(task::Task* subject, const TaskPlacementSnapshot& snapshot) -> int {
+    return initialize_inherited_task_placement_for_cores(subject, snapshot, smt::get_core_count());
+}
+
+auto post_task_balanced_inherited(task::Task* subject, const TaskPlacementSnapshot& snapshot) -> bool {
+    uint64_t allowed = 0;
+    if (!inherited_task_placement_matches(subject, snapshot, smt::get_core_count(), allowed)) return false;
+    return snapshot.cpu_pinned ? post_task_for_cpu(snapshot.owner_cpu, subject) : post_task_balanced(subject);
+}
+
+auto post_task_round_robin_inherited(task::Task* subject, const TaskPlacementSnapshot& snapshot, uint64_t seed) -> bool {
+    uint64_t const CORE_COUNT = smt::get_core_count();
+    uint64_t allowed = 0;
+    if (!inherited_task_placement_matches(subject, snapshot, CORE_COUNT, allowed)) return false;
+    uint64_t const TARGET = inherited_round_robin_cpu(snapshot, CORE_COUNT, seed);
+    return TARGET < CORE_COUNT && post_task_for_cpu(TARGET, subject);
 }
 
 auto migrate_task_to_cpu(task::Task* subject, uint64_t target_cpu) -> bool {
@@ -11526,6 +11642,81 @@ auto placement_native_domain_request(uint64_t mask, uint64_t target) -> TaskPlac
     return {.kind = TaskPlacementKind::DOMAIN, .mask = mask, .target_cpu = target, .domain_id = 77, .hard = true};
 }
 }  // namespace
+
+auto scheduler_selftest_inherited_placement_owned_snapshot() -> bool {
+    PlacementNativeFixture fixture;
+    if (!fixture.ready()) return false;
+    bool ok = fixture.prepare();
+    auto* const SOURCE = &fixture.tasks[0];
+    TaskPlacementSnapshot out{.owner_cpu = 9, .domain_mask = 0x1234, .domain_id = 17, .cpu_pinned = true, .domain_hard = true};
+    uint64_t const FLAGS = fixture.lock.lock_irqsave();
+    SOURCE->store_cpu(7);  // A stale scalar hint is not snapshot ownership.
+    SOURCE->store_domain_mask(3);
+    SOURCE->store_domain_id(71);
+    SOURCE->store_domain_hard(true);
+    fixture.capture_locked();
+    int const OBSERVED = observe_task_placement_locked(fixture.queue(0), SOURCE, 0, 2, out);
+    TaskPlacementSnapshot const EXPECTED{.owner_cpu = 0, .domain_mask = 3, .domain_id = 71, .domain_hard = true};
+    ok = OBSERVED == 0 && out == EXPECTED && fixture.unchanged_locked() && ok;
+
+    // Explicit PIN can retain a different raw domain mask. Keep both the raw
+    // policy and the proved pin CPU, instead of manufacturing a new mask.
+    SOURCE->store_domain_mask(2);
+    SOURCE->store_cpu_pinned(true);
+    fixture.capture_locked();
+    int const PINNED = observe_task_placement_locked(fixture.queue(0), SOURCE, 0, 2, out);
+    ok = PINNED == 0 && out.owner_cpu == 0 && out.domain_mask == 2 && out.cpu_pinned && out.domain_hard && fixture.unchanged_locked() && ok;
+    TaskPlacementSnapshot const HELD = out;
+    SOURCE->store_domain_mask(0);
+    fixture.capture_locked();
+    ok = observe_task_placement_locked(fixture.queue(0), SOURCE, 0, 2, out) == -EINVAL && out == HELD && fixture.unchanged_locked() && ok;
+    SOURCE->store_domain_mask(3);
+    fixture.capture_locked();
+    ok = observe_task_placement_locked(fixture.queue(0), SOURCE, 0, 65, out) == -ERANGE && out == HELD && fixture.unchanged_locked() && ok;
+    SOURCE->heap_index = -1;  // Actual heap entry remains, its index is stale.
+    fixture.capture_locked();
+    ok = observe_task_placement_locked(fixture.queue(0), SOURCE, 0, 2, out) == -EBUSY && out == HELD && fixture.unchanged_locked() && ok;
+    fixture.lock.unlock_irqrestore(FLAGS);
+    return ok;
+}
+
+auto scheduler_selftest_inherited_placement_initial_eligibility() -> bool {
+    // This is a genuine exclusively owned, never-published allocation. The
+    // private pid is a label only; no global registry or current Task is faked.
+    std::unique_ptr<task::Task> child(new (std::nothrow) task::Task{});
+    if (!child) return false;
+    child->type = task::TaskType::PROCESS;
+    child->pid = 1;
+    child->heap_index = -1;
+    TaskPlacementSnapshot const HARD{.owner_cpu = 1, .domain_mask = 0xA, .domain_id = 73, .domain_hard = true};
+    bool ok = initialize_inherited_task_placement_for_cores(child.get(), HARD, 4) == 0;
+    uint64_t allowed = 0;
+    ok = inherited_task_placement_matches(child.get(), HARD, 4, allowed) && allowed == 0xA && ok;
+    std::array<uint64_t, 4> counts{};
+    constexpr std::array<uint64_t, 4> EXPECTED{1, 1, 3, 3};
+    for (uint64_t seed = 0; seed < 1000; ++seed) {
+        uint64_t const CPU = inherited_round_robin_cpu(HARD, 4, seed);
+        if (CPU >= counts.size()) return false;
+        ++counts[CPU];
+        ok = CPU == EXPECTED[seed % EXPECTED.size()] && ok;
+    }
+    ok = counts[0] == 0 && counts[1] == 500 && counts[2] == 0 && counts[3] == 500 && inherited_round_robin_cpu(HARD, 4, UINT64_MAX) == 3 &&
+         ok;
+    TaskPlacementSnapshot const PIN{.owner_cpu = 63, .domain_mask = 1, .domain_id = 99, .cpu_pinned = true, .domain_hard = true};
+    ok = initialize_inherited_task_placement_for_cores(child.get(), PIN, 64) == 0 && inherited_round_robin_cpu(PIN, 64, 0) == 63 &&
+         inherited_round_robin_cpu(PIN, 64, UINT64_MAX) == 63 && ok;
+    auto const BEFORE = placement_native_task_snapshot(*child);
+    auto invalid = PIN;
+    invalid.domain_mask = 0;
+    ok = initialize_inherited_task_placement_for_cores(child.get(), invalid, 64) == -EINVAL &&
+         placement_native_task_snapshot(*child) == BEFORE && ok;
+    child->scheduler_published.store(true);
+    auto const PUBLISHED = placement_native_task_snapshot(*child);
+    ok = initialize_inherited_task_placement_for_cores(child.get(), HARD, 4) == -EBUSY &&
+         placement_native_task_snapshot(*child) == PUBLISHED && ok;
+    child->scheduler_published.store(false);
+    return ok;
+}
 
 auto scheduler_selftest_placement_claim_and_uncapped_drain() -> bool {
     PlacementNativeFixture fixture;

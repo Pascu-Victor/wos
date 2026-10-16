@@ -200,7 +200,7 @@ def main():
     assert helper.count(sti) == 2 and helper.count(cli) == 1
     helper = helper.replace(sti, 'enable_interrupts();').replace(cli, 'disable_interrupts();')
     fork = function(process, 'wos_proc_fork')
-    assert fork.index('GPRegs const FORK_ENTRY_REGS = gpr') < fork.index('alloc_fork_kernel_stack_from_syscall(parent)') < fork.index('new sched::task::Task{}')
+    assert fork.index('GPRegs const FORK_ENTRY_REGS = gpr') < fork.index('alloc_fork_kernel_stack_from_syscall(parent)') < fork.index('new (std::nothrow) sched::task::Task{}')
     scheduler = (ROOT / 'modules/kern/src/platform/sched/scheduler.cpp').read_text()
     header = (ROOT / 'modules/kern/src/platform/sched/scheduler.hpp').read_text()
     source = PRELUDE.replace('REPORT', block(header, r'^struct GcPressureDiagnostics \{') + ';')

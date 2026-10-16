@@ -9,10 +9,11 @@ import tempfile
 
 from exec_trace_ownership_test import block, function
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(os.environ.get("WOS_FORK_DIAGNOSTICS_ROOT", Path(__file__).resolve().parents[3]))
+PROCESS_SOURCE = Path(os.environ.get("WOS_FORK_DIAGNOSTICS_SOURCE", ROOT / "modules/kern/src/syscalls_impl/process/process.cpp"))
 STAGES = (
-    'pressure-admission', 'kernel-stack', 'task', 'vfs-rules', 'credentials',
-    'pagemap', 'vm-snapshot', 'thread', 'fd-table', 'child-publication',
+    'pressure-admission', 'kernel-stack', 'task', 'name', 'vfs-rules', 'credentials',
+    'pagemap', 'vm-snapshot', 'thread', 'per-cpu', 'fd-table', 'child-publication',
     'scheduler-publication',
 )
 PRELUDE = r'''
@@ -69,6 +70,9 @@ struct process_log {
   assert(length>=0 && static_cast<size_t>(length)<sizeof(data)); message=data;
  }
 };
+namespace detail {
+TRANSLATOR
+}
 DIAGNOSTIC
 void end_local_proc_stage(ker::mod::sched::task::Task*, ker::mod::perf::WkiPerfLocalProcOp,
  int&, int32_t status, uint64_t bytes, uint64_t callsite) {
@@ -114,6 +118,23 @@ int main() {
   assert(message.find("stack_cap=256 stack_free=0 stack_high=256")!=std::string::npos);
   assert(message.find("phys_free_pages=123456 dead=10 runnable=16 waiting=22 gc_deferred=9")!=std::string::npos);
  }
+ // The actual scalar translator feeds the actual dynamic VM diagnostic route.
+ using Point=ker::syscall::process::detail::ForkVmFailurePoint;
+ struct DynamicCase {Point point;int status;int expected;};
+ DynamicCase const dynamic[]={
+  {Point::Copy,-EAGAIN,-ENOMEM},{Point::LazyPrepare,-EBUSY,-EBUSY},
+  {Point::GeometryPrepare,-EOPNOTSUPP,-EOPNOTSUPP},{Point::Complete,0,0},
+  {Point::LegacyMatch,-EFAULT,-EINVAL},{static_cast<Point>(255),-ENOMEM,-EINVAL}};
+ for(auto const& item:dynamic){
+  calls.clear();auto before=logs;
+  auto mapped=ker::syscall::process::detail::public_fork_vm_error(item.point,item.status);
+  assert(mapped==item.expected);
+  assert(finish(&parent,mapped,42,"vm-snapshot")==static_cast<uint64_t>(item.expected));
+  assert(recorded_bytes==42 && recorded_status==item.expected);
+  assert(logs==before+(mapped==-ENOMEM?1U:0U));
+  if(mapped==-ENOMEM)assert(message.find("stage=vm-snapshot status=-12")!=std::string::npos);
+  else assert((calls==std::vector<std::string>{"end"}));
+ }
  // A zero-core snapshot skips queue access; no GC request/reclaim is a dependency.
  calls.clear(); smt::cores=0; finish(&parent,-ENOMEM,0,"task");
  assert((calls==std::vector<std::string>{"end","pool-lock","pool-unlock","physical","cores","journal"}));
@@ -124,22 +145,44 @@ int main() {
  pool.high_watermark=max; mm::phys::free_pages=max; sched::queues[0]={max,max,max}; sched::deferred=max;
  finish(&parent,-ENOMEM,0,"scheduler-publication");
  assert(message.size()<512 && message.ends_with("gc_deferred=18446744073709551615"));
- puts("PASS actual fork failure getter/helper/finish: 11 stages, errno/bytes, success silence, lock ordering, CPU bounds, 512-byte journal bound");
+ puts("PASS actual fork failure getter/helper/finish: 13 stages + 6 dynamic VM cases, errno/bytes, success silence, lock ordering, CPU bounds, 512-byte journal bound");
 }
 '''
 
 
+def validate_dynamic_vm_route(fork):
+    """Keep the one explicit dynamic status alongside the exact literal labels."""
+    exact = re.sub(r"\s+", "", fork)
+    call = "detail::prepare_fork_vm_snapshot(*parent,*child,preparation,EAGER_COPY?&fork_placement:nullptr,EAGER_COPY?&fork_page:nullptr,&point)"
+    result = 'returnfinish_fork(detail::public_fork_vm_error(point,FORK_VM_ERROR),0,"vm-snapshot");'
+    assert exact.count("detail::ForkVmFailurePointpoint{};") == 1
+    assert exact.count(call) == 1
+    assert exact.count(result) == 1
+    cursor = 0
+    for token in ("sys::SyscallPreparationScopepreparation(*parent);", "detail::ForkVmFailurePointpoint{};",
+                  "intconstFORK_VM_ERROR=" + call, "if(FORK_VM_ERROR!=0)",
+                  "shm_cleanup_for_task(child)", "release_file_mmap_ranges_for_pagemap(child->pagemap)",
+                  "release_lazy_vmem_ranges(*child)", "destroy_user_space(child->pagemap", "deletechild;", result):
+        position = exact.find(token, cursor)
+        assert position >= 0, token
+        cursor = position + len(token)
+
+
 def main():
-    process = (ROOT / 'modules/kern/src/syscalls_impl/process/process.cpp').read_text()
+    process = PROCESS_SOURCE.read_text()
     fork = function(process, 'wos_proc_fork')
     labels = re.findall(r'finish_fork\(-ENOMEM, 0, "([^"]+)"\)', fork)
-    assert tuple(labels) == STAGES
-    assert fork.count('finish_fork(-ENOMEM') == len(STAGES)
+    literal_stages = tuple(stage for stage in STAGES if stage != 'vm-snapshot')
+    assert tuple(labels) == literal_stages
+    assert fork.count('finish_fork(-ENOMEM') == len(literal_stages)
+    validate_dynamic_vm_route(fork)
     snapshot = block((ROOT / 'modules/kern/src/platform/mm/phys.hpp').read_text(),
                      r'^struct KernelStackPoolStatsSnapshot \{') + ';'
     getter = function((ROOT / 'modules/kern/src/platform/mm/phys.opt.cpp').read_text(),
                       'get_kernel_stack_pool_stats')
     source = PRELUDE.replace('SNAPSHOT', snapshot).replace('GETTER', getter)
+    translator = block(process, r'^enum class ForkVmFailurePoint :') + ';\n' + function(process, 'public_fork_vm_error')
+    source = source.replace('TRANSLATOR', translator)
     source = source.replace('DIAGNOSTIC', function(process, 'note_fork_failure'))
     source = source.replace('LAMBDA', block(fork, r'^    auto finish_fork ='))
     source += CASES.replace('STAGE_STRINGS', ','.join('"' + s + '"' for s in STAGES))

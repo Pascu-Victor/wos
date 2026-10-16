@@ -13,6 +13,7 @@
 #include <memory>
 #include <mod/io/serial/serial.hpp>
 #include <new>
+#include <platform/mm/managed_huge.hpp>
 #include <platform/mm/numa_alloc.hpp>
 #include <platform/sched/resource_as.hpp>
 #include <platform/sched/session.hpp>
@@ -732,6 +733,179 @@ void note_fork_failure(ker::mod::sched::task::Task* parent, const char* stage, i
         PHYS_FREE_PAGES, dead, runnable, waiting, GC_DEFERRED);
 }
 
+}  // namespace
+
+namespace detail {
+enum class ForkVmFailurePoint : uint8_t {
+    Context,
+    LazyPrepare,
+    TmpfsPrepare,
+    LegacyPrepare,
+    SwapPrepare,
+    ShmPrepare,
+    GeometryPrepare,
+    FinalLazyTmpfsMatch,
+    LegacyMatch,
+    ShmMatch,
+    LazyConsume,
+    Copy,
+    TmpfsAttach,
+    ShmCommit,
+    LegacyCommit,
+    Complete,
+};
+
+// Preserve public fork errno independently of the prepared components' exact
+// private result. A phase is a scalar witness, never snapshot authority.
+auto public_fork_vm_error(ForkVmFailurePoint point, int status) -> int {
+    if (status == 0) return 0;
+    switch (point) {
+        case ForkVmFailurePoint::LazyConsume:
+        case ForkVmFailurePoint::Copy:
+        case ForkVmFailurePoint::TmpfsAttach:
+        case ForkVmFailurePoint::ShmPrepare:
+        case ForkVmFailurePoint::ShmMatch:
+        case ForkVmFailurePoint::ShmCommit:
+        case ForkVmFailurePoint::LegacyCommit:
+            return -ENOMEM;
+        case ForkVmFailurePoint::Context:
+        case ForkVmFailurePoint::LazyPrepare:
+        case ForkVmFailurePoint::TmpfsPrepare:
+            return status < 0 ? status : -EINVAL;
+        case ForkVmFailurePoint::LegacyPrepare:
+            if (status == -EOPNOTSUPP || status == -ENOMEM || status == -EOVERFLOW) return -ENOMEM;
+            return status < 0 ? status : -EINVAL;
+        case ForkVmFailurePoint::SwapPrepare:
+            if (status == -ENOMEM || status == -EOVERFLOW) return -ENOMEM;
+            return status < 0 ? status : -EINVAL;
+        case ForkVmFailurePoint::FinalLazyTmpfsMatch:
+        case ForkVmFailurePoint::LegacyMatch:
+            return status == -EAGAIN ? status : -EINVAL;
+        case ForkVmFailurePoint::GeometryPrepare:
+            switch (status) {
+                case -EINVAL:
+                case -EOPNOTSUPP:
+                case -EOVERFLOW:
+                case -ENOMEM:
+                case -EAGAIN:
+                    return status;
+                default:
+                    return -EINVAL;
+            }
+        case ForkVmFailurePoint::Complete:
+        default:
+            return -EINVAL;
+    }
+}
+
+// The caller exclusively owns an initialized, never-active
+// child/root and every non-VM resource. Eager storage is caller-born before all
+// final owners. Any adopted child prefix belongs to ordinary caller rollback.
+auto prepare_fork_vm_snapshot(ker::mod::sched::task::Task& actor, ker::mod::sched::task::Task& child,
+                              const ker::mod::sys::SyscallPreparationScope& preparation,
+                              ker::mod::mm::numa::AllocationContext* eager_context, ker::mod::mm::numa::AllocationResult* empty_result,
+                              ForkVmFailurePoint* failure_point = nullptr) -> int {
+    using namespace ker::mod;
+    auto fail_at = [failure_point](ForkVmFailurePoint point) {
+        if (failure_point != nullptr) *failure_point = point;
+    };
+    fail_at(ForkVmFailurePoint::Context);
+    if (!preparation.ready() || !sched::can_query_current_task() || sched::get_current_task() != &actor ||
+        actor.type != sched::task::TaskType::PROCESS || actor.syscall_account_start_us == 0 ||
+        actor.state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE ||
+        actor.scheduler_transition_active.load(std::memory_order_acquire) || !sched::interrupts_enabled() || sched::preempt_count() != 0)
+        return -EWOULDBLOCK;
+
+    // Every fallible owner is instrumented here, before PUB/IRQ/root ownership.
+    sched::task::LazyVmemClone lazy;
+    ker::syscall::vmem::PublicFileForkPreparation tmpfs;
+    ker::syscall::vmem::LegacyFileForkPreparation legacy_file;
+    mm::virt::PreparedAnonymousSwapFork swap;
+    ker::syscall::shm::ShmForkPreparation shm;
+    mm::huge::RangeSplitSurvey survey;
+    mm::huge::PreparedTables tables;
+
+    fail_at(ForkVmFailurePoint::LazyPrepare);
+    int status = lazy.prepare(actor);
+    if (status != 0) return status;
+    fail_at(ForkVmFailurePoint::TmpfsPrepare);
+    status = tmpfs.prepare(actor, lazy);
+    if (status != 0) return status;
+    fail_at(ForkVmFailurePoint::LegacyPrepare);
+    status = legacy_file.prepare(actor, child, preparation);
+    if (status != 0) return status;
+    fail_at(ForkVmFailurePoint::SwapPrepare);
+    status = swap.prepare(actor, child, preparation);
+    if (status != 0) return status;
+    fail_at(ForkVmFailurePoint::ShmPrepare);
+    status = shm.prepare(actor, child, preparation);
+    if (status != 0) return status;
+    constexpr uint64_t USER_END = uint64_t{1} << 47;
+    fail_at(ForkVmFailurePoint::GeometryPrepare);
+    auto const GEOMETRY = mm::huge::prepare_current_range_split(actor, preparation, 0, USER_END, survey, tables);
+    if (GEOMETRY != mm::huge::Error::None) {
+        switch (GEOMETRY) {
+            case mm::huge::Error::Invalid:
+                return -EINVAL;
+            case mm::huge::Error::Unsupported:
+                return -EOPNOTSUPP;
+            case mm::huge::Error::GenerationExhausted:
+                return -EOVERFLOW;
+            case mm::huge::Error::Capacity:
+            case mm::huge::Error::Exhausted:
+                return -ENOMEM;
+            default:
+                return -EAGAIN;
+        }
+    }
+    {
+        // Acquire blocking PUB with IF enabled. TMPFS matches retains a SNAPSHOT
+        // once; its short striped reader ends before the copier's exclusive.
+        fail_at(ForkVmFailurePoint::FinalLazyTmpfsMatch);
+        ker::syscall::vmem::SharedVmemPublicationGuard publication;
+        if (!lazy.matches(actor) || !tmpfs.matches(actor)) return -EAGAIN;
+        fail_at(ForkVmFailurePoint::LegacyMatch);
+        status = legacy_file.matches(actor, child, preparation, publication);
+        if (status != 0) return status;
+        fail_at(ForkVmFailurePoint::ShmMatch);
+        status = shm.matches(actor, child, preparation, publication);
+        if (status != 0) return status;
+        {
+            sys::SyscallPreparationScope::LegacyInterval legacy_context(preparation);
+            child.entry = actor.entry;
+            child.program_header_addr = actor.program_header_addr;
+            child.elf_header_addr = actor.elf_header_addr;
+            child.image_load_base = actor.image_load_base;
+            child.image_vaddr_start = actor.image_vaddr_start;
+            child.image_vaddr_end = actor.image_vaddr_end;
+            child.program_header_count = actor.program_header_count;
+            child.program_header_ent_size = actor.program_header_ent_size;
+            child.interp_base = actor.interp_base;
+            child.interp_vaddr_start = actor.interp_vaddr_start;
+            child.interp_vaddr_end = actor.interp_vaddr_end;
+            child.at_random_addr = actor.at_random_addr;
+            child.mmap_next.store(actor.mmap_next.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            fail_at(ForkVmFailurePoint::LazyConsume);
+            if (!lazy.consume(child)) return -EAGAIN;
+            fail_at(ForkVmFailurePoint::Copy);
+            status = mm::virt::deep_copy_current_user_pagemap_prepared(actor, child.pagemap, preparation, publication, survey, tables,
+                                                                       eager_context, empty_result, swap);
+            if (status != 0) return status;
+            fail_at(ForkVmFailurePoint::TmpfsAttach);
+            if (!tmpfs.attach(child)) return -EAGAIN;
+            fail_at(ForkVmFailurePoint::ShmCommit);
+            status = shm.commit(actor, child, preparation, publication);
+            if (status != 0) return status;
+            fail_at(ForkVmFailurePoint::LegacyCommit);
+            status = legacy_file.commit(actor, child, preparation, publication);
+        }  // Restore IF before PUB release and every prepared-owner destructor.
+    }
+    if (status == 0) fail_at(ForkVmFailurePoint::Complete);
+    return status;
+}
+}  // namespace detail
+
+namespace {
 auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     using namespace ker::mod;
 
@@ -746,6 +920,9 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
 #ifdef WOS_SELFTEST
     ker::test::lifecycle60::before_selected_service_fork(*parent);
 #endif
+    sched::TaskPlacementSnapshot inherited_placement{};
+    if (int const ERROR = sched::capture_task_placement_snapshot(parent, inherited_placement); ERROR != 0)
+        return static_cast<uint64_t>(ERROR);
     auto const MEMORY_POLICY = parent->memory_policy_snapshot();
     bool const EAGER_COPY = mm::virt::fork_eager_copy_requested();
     // Instrumented caller storage exists before every reservation/PUB/root owner;
@@ -793,7 +970,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     uint64_t const KERNEL_RSP = KERNEL_STACK_BASE + ker::mod::mm::KERNEL_STACK_SIZE;
 
     // --- Allocate child Task without the ELF-loading constructor ---
-    auto* child = new sched::task::Task{};
+    auto* child = new (std::nothrow) sched::task::Task{};
     if (child == nullptr) {
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         return finish_fork(-ENOMEM, 0, "task");
@@ -810,7 +987,12 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     // Copy name
     if (parent->name != nullptr) {
         size_t const NAME_LEN = std::strlen(parent->name);
-        char* name_copy = new char[NAME_LEN + 1];
+        char* name_copy = new (std::nothrow) char[NAME_LEN + 1];
+        if (name_copy == nullptr) {
+            mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
+            delete child;
+            return finish_fork(-ENOMEM, 0, "name");
+        }
         std::memcpy(name_copy, parent->name, NAME_LEN + 1);
         child->name = name_copy;
     }
@@ -848,6 +1030,13 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->heap_index = -1;
     child->sched_queue = sched::task::Task::sched_queue::NONE;
     child->sched_next = nullptr;
+    // This exact allocation is still exclusively owned by this constructor.
+    if (int const ERROR = sched::initialize_inherited_task_placement(child, inherited_placement); ERROR != 0) {
+        delete[] child->name;
+        mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
+        delete child;
+        return finish_fork(ERROR);
+    }
 
     // Copy fixed per-process path storage.
     {
@@ -925,59 +1114,25 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     // Copy kernel mappings
     mm::virt::copy_kernel_mappings(child);
 
-    // Snapshot every address-space surface under one publication boundary.
-    // Cleanup is deliberately deferred until after the sleepable guard drops:
-    // file-range release may perform VFS writeback.
-    sys::SyscallPreparationScope preparation(*parent);
-    sched::task::LazyVmemClone lazy_snapshot;
-    ker::syscall::vmem::PublicFileForkPreparation public_bindings;
-    int fork_vm_error = preparation.ready() ? lazy_snapshot.prepare(*parent) : -EWOULDBLOCK;
-    if (fork_vm_error == 0) fork_vm_error = public_bindings.prepare(*parent, lazy_snapshot);
-    sys::SyscallPreparationScope::LegacyInterval legacy_context(preparation);
-    bool fork_vm_snapshot_ok = false;
-    if (fork_vm_error == 0) {
-        ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
-        if (!lazy_snapshot.matches(*parent) || !public_bindings.matches(*parent)) {
-            fork_vm_error = -EAGAIN;
-        } else {
-            child->entry = parent->entry;
-            child->program_header_addr = parent->program_header_addr;
-            child->elf_header_addr = parent->elf_header_addr;
-            child->image_load_base = parent->image_load_base;
-            child->image_vaddr_start = parent->image_vaddr_start;
-            child->image_vaddr_end = parent->image_vaddr_end;
-            child->program_header_count = parent->program_header_count;
-            child->program_header_ent_size = parent->program_header_ent_size;
-            child->interp_base = parent->interp_base;
-            child->interp_vaddr_start = parent->interp_vaddr_start;
-            child->interp_vaddr_end = parent->interp_vaddr_end;
-            child->at_random_addr = parent->at_random_addr;
-            child->mmap_next.store(parent->mmap_next.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            bool copied = false;
-            if (lazy_snapshot.consume(*child)) {
-                // Preparation enabled IF before taking publication. Preserve the
-                // legacy COW interval's no-preemption/no-direct-reclaim premise:
-                // it owns a striped exclusive gate across page-table allocation.
-                sched::PreemptGuard const COW_PREEMPT;
-                copied = EAGER_COPY ? mm::virt::deep_copy_user_pagemap_cow(parent->pagemap, child->pagemap, fork_placement, fork_page)
-                                    : mm::virt::deep_copy_user_pagemap_cow(parent->pagemap, child->pagemap);
-            }
-            fork_vm_snapshot_ok = copied && public_bindings.attach(*child) && ker::syscall::shm::shm_clone_for_fork_locked(parent, child) &&
-                                  ker::syscall::vmem::clone_file_mmap_ranges_for_pagemap_locked(parent->pagemap, child->pagemap);
-            if (!fork_vm_snapshot_ok) fork_vm_error = -ENOMEM;
+    // Preparation and every unpublished VM rollback remain ordinary. The
+    // coordinator drops its final guards and prepared owners before returning.
+    {
+        sys::SyscallPreparationScope preparation(*parent);
+        detail::ForkVmFailurePoint point{};
+        int const FORK_VM_ERROR = detail::prepare_fork_vm_snapshot(*parent, *child, preparation, EAGER_COPY ? &fork_placement : nullptr,
+                                                                   EAGER_COPY ? &fork_page : nullptr, &point);
+        if (FORK_VM_ERROR != 0) {
+            ker::syscall::shm::shm_cleanup_for_task(child);
+            ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(child->pagemap);
+            sched::task::release_lazy_vmem_ranges(*child);
+            mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-vm-snapshot-fail");
+            mm::virt::release_pagemap(child->pagemap, child->pid);
+            delete[] child->name;
+            mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
+            delete child;
+            return finish_fork(detail::public_fork_vm_error(point, FORK_VM_ERROR), 0, "vm-snapshot");
         }
-    }
-    if (!fork_vm_snapshot_ok) {
-        ker::syscall::shm::shm_cleanup_for_task(child);
-        ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(child->pagemap);
-        sched::task::release_lazy_vmem_ranges(*child);
-        mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-vm-snapshot-fail");
-        mm::virt::release_pagemap(child->pagemap, child->pid);
-        delete[] child->name;
-        mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
-        delete child;
-        return finish_fork(fork_vm_error, 0, "vm-snapshot");
-    }
+    }  // Restore syscall-entry IF before the unchanged successful post-VM tail.
 
     (void)sched::resource::observe_address_space(*child);
 
@@ -985,8 +1140,9 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     // The child shares the same user-space layout (stack, TLS) via COW.
     // Allocate a Thread struct for the child that mirrors the parent's.
     if (parent->thread != nullptr) {
-        auto* child_thread = new sched::threading::Thread();
+        auto* child_thread = new (std::nothrow) sched::threading::Thread();
         if (child_thread == nullptr) {
+            sys::SyscallPreparationScope rollback(*parent);
             ker::syscall::shm::shm_cleanup_for_task(child);
             ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(child->pagemap);
             sched::task::release_lazy_vmem_ranges(*child);
@@ -1010,6 +1166,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         // Write only this unpublished child's COW view, outside VM publication.
         if (!child->pid_namespace()->is_host() && child_thread->fsbase != 0 &&
             !sched::threading::publish_tid_to_tcb(*child, child_thread->fsbase, CHILD_VISIBLE_PID, true)) {
+            sys::SyscallPreparationScope rollback(*parent);
             delete child->thread;
             ker::syscall::shm::shm_cleanup_for_task(child);
             ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(child->pagemap);
@@ -1029,7 +1186,20 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     // Child's kernel stack and per-CPU scratch area
     child->context.syscall_kernel_stack = KERNEL_RSP;
 
-    auto* per_cpu = new cpu::PerCpu();
+    auto* per_cpu = new (std::nothrow) cpu::PerCpu();
+    if (per_cpu == nullptr) {
+        sys::SyscallPreparationScope rollback(*parent);
+        delete child->thread;
+        ker::syscall::shm::shm_cleanup_for_task(child);
+        ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(child->pagemap);
+        sched::task::release_lazy_vmem_ranges(*child);
+        mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-percpu-alloc-fail");
+        mm::virt::release_pagemap(child->pagemap, child->pid);
+        delete[] child->name;
+        mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
+        delete child;
+        return finish_fork(-ENOMEM, 0, "per-cpu");
+    }
     per_cpu->syscall_stack = KERNEL_RSP;
     per_cpu->cpu_id = cpu::current_cpu();
     child->context.syscall_scratch_area = reinterpret_cast<uint64_t>(per_cpu);
@@ -1073,6 +1243,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
 
     // --- Clone file descriptors ---
     if (!clone_fd_table_shared_checked(parent, child)) {
+        sys::SyscallPreparationScope rollback(*parent);
         release_cloned_fd_table_refs(child);
         delete child->thread;
         delete reinterpret_cast<cpu::PerCpu*>(child->context.syscall_scratch_area);
@@ -1090,6 +1261,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     // Establish authoritative process ownership before either scheduler or
     // legacy WKI placement can make the child visible.
     if (!child_events::begin_publication(*parent, *child)) {
+        sys::SyscallPreparationScope rollback(*parent);
         child_events::abort_publication(*child);
         release_cloned_fd_table_refs(child);
         delete child->thread;
@@ -1110,7 +1282,8 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
 #ifdef WOS_SELFTEST
     if (PUBLICATION_REF) ker::test::lifecycle60::fork_will_publish(*parent, *child);
 #endif
-    if (!PUBLICATION_REF || !process_reservation.attach(*child) || !sched::post_task_balanced(child)) {
+    if (!PUBLICATION_REF || !process_reservation.attach(*child) || !sched::post_task_balanced_inherited(child, inherited_placement)) {
+        sys::SyscallPreparationScope rollback(*parent);
 #ifdef WOS_SELFTEST
         ker::test::lifecycle60::fork_publication_failed(*parent, *child);
 #endif
@@ -1475,6 +1648,9 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
         return static_cast<uint64_t>(-ESRCH);
     }
 
+    sched::TaskPlacementSnapshot inherited_placement{};
+    if (int const ERROR = sched::capture_task_placement_snapshot(parent, inherited_placement); ERROR != 0)
+        return static_cast<uint64_t>(ERROR);
     auto const MEMORY_POLICY = parent->memory_policy_snapshot();
     CloneVmArgs args{};
     if (!sys::usercopy::copy_value_from_task(*parent, args_addr, args)) {
@@ -1618,6 +1794,8 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
     child->slice_ns = parent->slice_ns;
     child->heap_index = -1;
     child->sched_queue = sched::task::Task::sched_queue::NONE;
+    if (int const ERROR = sched::initialize_inherited_task_placement(child, inherited_placement); ERROR != 0)
+        return static_cast<uint64_t>(ERROR);
     {
         auto* filesystem_parent = parent->filesystem_owner();
         uint64_t const PATH_IRQF = filesystem_parent->path_metadata_lock.lock_irqsave();
@@ -1704,7 +1882,7 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
     }
 
     bool const PUBLICATION_REF = child->try_acquire_lifetime_ref();
-    if (!PUBLICATION_REF || !process_reservation.attach(*child) || !sched::post_task_balanced(child)) {
+    if (!PUBLICATION_REF || !process_reservation.attach(*child) || !sched::post_task_balanced_inherited(child, inherited_placement)) {
         if (PUBLICATION_REF) child->release();
         return static_cast<uint64_t>(-ENOMEM);
     }

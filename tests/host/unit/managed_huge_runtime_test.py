@@ -237,6 +237,7 @@ def main() -> int:
         "--kernel-overlay", type=Path, help="optional explicit staged modules/kern/src include/source overlay"
     )
     parser.add_argument("--fork-contract-only", action="store_true", help="run all old positive cases plus the focused fork cases and two fork controls")
+    parser.add_argument("--fork-vm-coordinator-only", action="store_true", help="exercise the private actual-owner fork VM composition")
     parser.add_argument("--gtest-main", type=Path)
     parser.add_argument("--gtest", type=Path)
     parser.add_argument("--output", type=Path, help="fresh directory for small logs/results; scratch is always removed")
@@ -350,6 +351,12 @@ def main() -> int:
         (output / "actual-host-command-row.json").write_text(json.dumps(row, indent=2) + "\n")
         context, context_methods, context_sources, context_map = context_overlay(scratch, kernel_file, root)
         selected.extend(pin(path) for path in context_sources)
+        coordinator = None
+        if options.fork_vm_coordinator_only:
+            import fork_vm_coordinator_fixture
+            coordinator = fork_vm_coordinator_fixture.Builder(kernel_file, support, definition)
+            coordinator.extend_context(context)
+            selected.extend(pin(path) for path in coordinator.inputs)
         flags = compile_flags(row, overlay)
         flags.insert(1, f"-I{context}")
         selected.append(pin(Path(shutil.which(flags[0]) or flags[0])))
@@ -390,7 +397,15 @@ def main() -> int:
         selected.extend([pin(fork_support), pin(fork_cases)])
         selected.append(pin(range_cases))
         composite = scratch / "actual-source.cpp"
-        composite.write_text(
+        if coordinator is not None:
+            composite.write_text(coordinator.compose(fixture.read_text(), prelude.read_text(), context_methods,
+                fork_support.read_text(), user_pin, exclusive, epoch, index, resolver, private, copier, commit,
+                adapters, cases.read_text(), range_cases.read_text(), fork_cases.read_text()))
+            public_source = scratch / "actual-public-caller.cpp"
+            public_source.write_text(coordinator.public.caller_source())
+            shutil.copy2(public_source, output / public_source.name)
+        else:
+            composite.write_text(
             "\n".join(
                 [
                     fixture.read_text(),
@@ -428,6 +443,29 @@ def main() -> int:
             "adapters": adapters,
             **context_map,
         }
+        if coordinator is not None:
+            shutil.copy2(composite, output / "actual-source.cpp")
+            for path in context.rglob("*"):
+                if path.is_file():
+                    retained = output / "generated-context" / path.relative_to(context)
+                    retained.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(path, retained)
+            (output / "coordinator-source-map.json").write_text(
+                json.dumps(
+                    {
+                        "actual_components": coordinator.extractions,
+                        "inputs": [pin(path) for path in coordinator.inputs],
+                        "limits": [
+                            "Actual Normal owner bodies and full original-exclusive copier in one Host fixture; no WOS runtime/TLB/backend qualification.",
+                            "Actual family/binding constructors/counting/index/finish; strict typed fixture seed and queued callback Host port, not permanent-executor qualification.",
+                            "Existing54 pin vectors preserve their binding-match refusal port; fork binding attach/query/overlap/detach use real index bodies.",
+                            "Host-only metadata allocation ledger; actual target configured/O0 instrumentation requires separate evidence.",
+                        ],
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
         (output / "extraction-map.json").write_text(
             json.dumps(
                 {
@@ -444,7 +482,7 @@ def main() -> int:
             + "\n"
         )
 
-        sources = [module, factory, composite]
+        sources = [module, factory, composite] + ([public_source] if coordinator is not None else [])
         dependencies: set[Path] = set()
         for index, path in enumerate(sources):
             depfile = scratch / f"deps-{index}.d"
@@ -466,15 +504,15 @@ def main() -> int:
         binary = link("current", objects)
         run("run-current", [binary, f"--gtest_output=json:{output / 'current.json'}"])
         tests = json.loads((output / "current.json").read_text())
-        if tests["failures"] != 0 or tests["tests"] != EXPECTED_TESTS:
+        if tests["failures"] != 0 or tests["tests"] != (EXPECTED_TESTS + coordinator.test_count if coordinator is not None else EXPECTED_TESTS):
             raise RuntimeError("actual range/legacy suite did not pass")
 
-        def mutant(label: str, text: str, test: str) -> None:
+        def mutant(label: str, text: str, test: str, replace_index: int = 2) -> None:
             path = scratch / f"{label}.cpp"
             path.write_text(text)
             obj = scratch / f"{label}.o"
             run(f"compile-{label}", flags + ["-c", path, "-o", obj])
-            binary = link(label, [objects[0], objects[1], obj])
+            binary = link(label, [*objects[:replace_index], obj, *objects[replace_index + 1:]])
             controls.append({"label": label, "source": pin(path), "object": pin(obj), "binary": pin(binary)})
             run(f"run-{label}", [binary, f"--gtest_filter={test}"], expected_success=False)
             binary.unlink()
@@ -482,7 +520,12 @@ def main() -> int:
             path.unlink()
 
         actual = CppText(composite.read_text())
-        if options.fork_contract_only:
+        if coordinator is not None:
+            for label, bad, test in coordinator.controls(composite.read_text()):
+                mutant(label, bad, test)
+            for label, bad, test in coordinator.public.controls(public_source.read_text()):
+                mutant(label, bad, test, replace_index=3)
+        elif options.fork_contract_only:
             owner_check = "if (!exclusive.owns(src)) return false;"
             if composite.read_text().count(owner_check) != 1:
                 raise RuntimeError("held-owner control changed")

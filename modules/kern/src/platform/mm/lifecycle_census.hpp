@@ -3,26 +3,10 @@
 #ifdef WOS_SELFTEST
 #include <atomic>
 #include <cstdint>
+#include <platform/mm/lifecycle_stamp.hpp>
 #include <platform/sys/spinlock.hpp>
 
 namespace ker::mod::mm::lifecycle_census {
-
-// A version is compared only within one complete double collect, never to the
-// original baseline. Invalid/exhausted stamps permanently refuse acceptance.
-struct Stamp {
-    uint64_t version{};
-    uint64_t inflight{};
-    bool valid{};
-    auto operator==(const Stamp&) const -> bool = default;
-};
-
-[[nodiscard]] inline auto quiescent(const Stamp& value) noexcept -> bool {
-    return value.valid && value.version != 0 && value.inflight == 0;
-}
-
-[[nodiscard]] inline auto unchanged(const Stamp& before, const Stamp& after) noexcept -> bool {
-    return quiescent(before) && quiescent(after) && before.version == after.version;
-}
 
 // Diagnostic arithmetic is lock-free and never wraps. It takes no owner or
 // diagnostic lock, including when called with an existing IRQ lock held.

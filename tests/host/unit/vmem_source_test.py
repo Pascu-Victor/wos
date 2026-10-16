@@ -1003,7 +1003,7 @@ def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
             "prepared_stack_words.at(1), MEMORY_POLICY, &stack_exhausted,",
             "&lazy_snapshot);",
             "uint64_t const NEW_TID = t->namespace_tid();",
-            "post_task_for_cpu(TARGET_CPU, t)",
+            "post_task_round_robin_inherited(t, inherited_placement, PLACEMENT_SEED)",
         ],
         "thread lazy-range clone through scheduler publication",
     )
@@ -1053,7 +1053,7 @@ def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
             "!lazy_snapshot.consume(*child)",
             "parent->shares_user_pagemap.store(true, std::memory_order_release);",
             "child->shares_user_pagemap.store(true, std::memory_order_release);",
-            "post_task_balanced(child)",
+            "post_task_balanced_inherited(child, inherited_placement)",
         ],
         "clone-VM prepared lazy rows through scheduler publication",
     )
@@ -1093,11 +1093,60 @@ def test_process_memory_policy_is_captured_before_creation_and_retry() -> None:
         require_ordered_tokens(
             body,
             [capture, "child->publish_memory_policy_snapshot(MEMORY_POLICY);",
-             "resource::inherit(*child, *parent)", "SharedVmemPublicationGuard publication_guard;"],
+             "resource::inherit(*child, *parent)",
+             "detail::prepare_fork_vm_snapshot(" if name == "wos_proc_fork" else "SharedVmemPublicationGuard publication_guard;"],
             f"{name} copied policy before resource-owner binding and VM publication",
         )
     clone = function_body(process, "wos_proc_clone_vm")
     require_order(clone, capture, "copy_value_from_task(*parent", "clone policy capture before user input")
+
+
+def test_cpu_placement_capture_precedes_creation_and_reuses_legacy_publishers() -> None:
+    process = PROCESS_CPP.read_text()
+    control = THREAD_CONTROL_CPP.read_text()
+    capture = "capture_task_placement_snapshot(parent, inherited_placement)"
+    initialize = "initialize_inherited_task_placement(child, inherited_placement)"
+    for name in ("wos_proc_fork", "wos_proc_clone_vm"):
+        body = function_body(process, name)
+        if body.count(capture) != 1:
+            fail(f"{name} must capture the actual caller CPU placement once")
+        require_cpp_order(body, capture, "ProcessReservation process_reservation", "CPU capture before reservation")
+        require_cpp_order(body, capture, "auto const MEMORY_POLICY = parent->memory_policy_snapshot();", "CPU tuple before creation")
+        require_cpp_order(body, "child->sched_queue = sched::task::Task::sched_queue::NONE;", initialize,
+                          "fresh scheduling state before exclusive initialization")
+        require_cpp_order(body, initialize, "post_task_balanced_inherited(child, inherited_placement)",
+                          "copied CPU tuple before visibility")
+        require_cpp_tokens(body, ["if (int const ERROR = sched::initialize_inherited_task_placement(child, inherited_placement); ERROR != 0)"],
+                           "exact initialization error admission")
+    fork = function_body(process, "wos_proc_fork")
+    failed = block_between(fork, "if (int const ERROR = sched::initialize_inherited_task_placement(child, inherited_placement);",
+                           "// Copy fixed per-process path storage.", "fork initialization failure prefix")
+    require_ordered_tokens(failed, ["delete[] child->name;", "mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));",
+                                  "delete child;", "return finish_fork(ERROR);"], "owned fresh prefix rollback")
+    clone = function_body(process, "wos_proc_clone_vm")
+    require_cpp_order(clone, "child_owner(child", initialize, "clone RAII owns initialized prefix")
+    require_cpp_tokens(clone, ["if (int const ERROR = sched::initialize_inherited_task_placement(child, inherited_placement); ERROR != 0) return static_cast<uint64_t>(ERROR);"],
+                       "clone initialization errors survive ordinary cleanup")
+    create = block_between(control, "case abi::multiproc::threadControlOps::THREAD_CREATE:",
+                           "case abi::multiproc::threadControlOps::THREAD_EXIT:", "thread CPU placement")
+    if create.count(capture) != 1:
+        fail("THREAD_CREATE must retain one caller CPU tuple through retry")
+    require_cpp_order(create, capture, "ProcessReservation process_reservation", "thread capture before quota/prefault")
+    require_cpp_order(create, capture, "for (uint32_t attempt = 0; attempt < 2; ++attempt)", "thread capture before retry")
+    require_cpp_order(create, "abandoned.reset(t);", "initialize_inherited_task_placement(t, inherited_placement)", "actual owner before initializer")
+    require_cpp_order(create, "initialize_inherited_task_placement(t, inherited_placement)", "uint64_t const NEW_TID = t->namespace_tid();",
+                      "initializer failure before TCB/visibility")
+    require_cpp_tokens(create, ["if (int const ERROR = mod::sched::initialize_inherited_task_placement(t, inherited_placement); ERROR != 0) return static_cast<uint64_t>(ERROR);",
+                               "post_task_round_robin_inherited(t, inherited_placement, PLACEMENT_SEED)"], "same copied tuple and exact errors")
+    scheduler = (ROOT / "modules/kern/src/platform/sched/scheduler.cpp").read_text()
+    balanced = function_body(scheduler, "post_task_balanced_inherited")
+    require_cpp_tokens(balanced, ["inherited_task_placement_matches(subject, snapshot, smt::get_core_count(), allowed)",
+                                  "return snapshot.cpu_pinned ? post_task_for_cpu(snapshot.owner_cpu, subject) : post_task_balanced(subject);"],
+                       "fresh tuple validation delegates the original publishers")
+    rr = function_body(scheduler, "post_task_round_robin_inherited")
+    require_cpp_tokens(rr, ["inherited_task_placement_matches(subject, snapshot, CORE_COUNT, allowed)",
+                           "inherited_round_robin_cpu(snapshot, CORE_COUNT, seed)", "post_task_for_cpu(TARGET, subject)"],
+                       "allowed RR selection retains the original CPU publisher")
 
 
 def test_eager_fork_uses_copied_policy_and_caller_storage_before_owners() -> None:
@@ -1109,8 +1158,12 @@ def test_eager_fork_uses_copied_policy_and_caller_storage_before_owners() -> Non
     require_cpp_order(fork, "mm::numa::capture_allocation_context(MEMORY_POLICY, fork_placement)",
                       "ProcessReservation process_reservation", "placement capture before pressure/owners")
     require_cpp_tokens(fork, ["if (EAGER_COPY)",
-        "copied = EAGER_COPY ? mm::virt::deep_copy_user_pagemap_cow(parent->pagemap, child->pagemap, fork_placement, fork_page)",
-        ": mm::virt::deep_copy_user_pagemap_cow(parent->pagemap, child->pagemap);"], "conditional typed route with unchanged legacy call")
+        "detail::prepare_fork_vm_snapshot(*parent, *child, preparation, EAGER_COPY ? &fork_placement : nullptr,",
+        "EAGER_COPY ? &fork_page : nullptr, &point)"], "prepared route borrows caller-born eager storage only when requested")
+    coordinator = function_body(source, "prepare_fork_vm_snapshot")
+    require_cpp_tokens(coordinator, [
+        "deep_copy_current_user_pagemap_prepared(actor, child.pagemap, preparation, publication, survey, tables, eager_context, empty_result, swap)"
+    ], "prepared coordinator transfers the same borrowed eager context and result")
     virt = VIRT_CPP.read_text()
     wrapper = function_body(virt, "deep_copy_user_pagemap_cow_impl")
     require_cpp_order(wrapper, "UserPagemapExclusiveScope source_usercopy_scope(src);",
@@ -1144,61 +1197,117 @@ def test_eager_fork_uses_copied_policy_and_caller_storage_before_owners() -> Non
 
 def test_fork_snapshots_all_vm_surfaces_under_one_publication_guard() -> None:
     process = PROCESS_CPP.read_text()
-    vmem = SYS_VMEM_CPP.read_text()
     fork = function_body(process, "wos_proc_fork")
-    snapshot = block_between(
-        fork,
-        "sys::SyscallPreparationScope preparation(*parent);",
-        "if (!fork_vm_snapshot_ok)",
-        "regular fork VM snapshot",
-    )
-    require_ordered_tokens(
-        snapshot,
-        [
-            "LazyVmemClone lazy_snapshot;",
-            "PublicFileForkPreparation public_bindings;",
-            "preparation.ready() ? lazy_snapshot.prepare(*parent)",
-            "public_bindings.prepare(*parent, lazy_snapshot)",
-            "LegacyInterval legacy_context(preparation);",
-            "SharedVmemPublicationGuard publication_guard;",
-            "!lazy_snapshot.matches(*parent) || !public_bindings.matches(*parent)",
-            "child->mmap_next.store(parent->mmap_next.load(std::memory_order_relaxed)",
-            "lazy_snapshot.consume(*child)",
-            "sched::PreemptGuard const COW_PREEMPT;",
-            "deep_copy_user_pagemap_cow(parent->pagemap, child->pagemap)",
-            "public_bindings.attach(*child)",
-            "shm_clone_for_fork_locked(parent, child)",
-            "clone_file_mmap_ranges_for_pagemap_locked(parent->pagemap, child->pagemap)",
-        ],
-        "coherent regular fork VM snapshot",
-    )
-    if "release_file_mmap_ranges_for_pagemap" in snapshot or "shm_cleanup_for_task" in snapshot:
-        fail("regular fork rollback must run after dropping the shared VM publication guard")
-    if "clone_lazy_vmem_ranges(*child, *parent)" in snapshot:
-        fail("fork must consume prepared rows before COW and attach fresh child bindings afterward")
-
-    failed_snapshot = block_between(
-        fork,
-        "if (!fork_vm_snapshot_ok)",
-        "// --- Clone thread metadata ---",
-        "regular fork VM snapshot rollback",
-    )
-    require_ordered_tokens(
-        failed_snapshot,
-        [
-            "shm_cleanup_for_task(child)",
-            "release_file_mmap_ranges_for_pagemap(child->pagemap)",
-            "release_lazy_vmem_ranges(*child)",
-            "destroy_user_space(child->pagemap",
-        ],
-        "regular fork VM snapshot rollback",
-    )
-    if fork.count("sched::task::release_lazy_vmem_ranges(*child);") < 5:
-        fail("every post-snapshot regular fork failure must release cloned lazy VM references")
-
-    file_clone = function_body(vmem, "clone_file_mmap_ranges_for_pagemap_locked")
+    snapshot = function_body(process, "prepare_fork_vm_snapshot")
+    require_ordered_tokens(snapshot, [
+        "LazyVmemClone lazy;", "PublicFileForkPreparation tmpfs;",
+        "LegacyFileForkPreparation legacy_file;", "PreparedAnonymousSwapFork swap;",
+        "ShmForkPreparation shm;", "RangeSplitSurvey survey;", "PreparedTables tables;",
+        "lazy.prepare(actor)", "tmpfs.prepare(actor, lazy)",
+        "legacy_file.prepare(actor, child, preparation)", "swap.prepare(actor, child, preparation)",
+        "shm.prepare(actor, child, preparation)",
+        "prepare_current_range_split(actor, preparation, 0, USER_END, survey, tables)",
+        "SharedVmemPublicationGuard publication;",
+        "!lazy.matches(actor) || !tmpfs.matches(actor)",
+        "legacy_file.matches(actor, child, preparation, publication)",
+        "shm.matches(actor, child, preparation, publication)",
+        "LegacyInterval legacy_context(preparation);",
+        "child.mmap_next.store(actor.mmap_next.load(std::memory_order_relaxed)",
+        "lazy.consume(child)", "deep_copy_current_user_pagemap_prepared(",
+        "tmpfs.attach(child)", "shm.commit(actor, child, preparation, publication)",
+        "legacy_file.commit(actor, child, preparation, publication)",
+    ], "all five actual owners and geometry prepared before the one final PUB then legacy interval")
+    if snapshot.count("tmpfs.matches(actor)") != 1 or snapshot.count("SharedVmemPublicationGuard publication;") != 1:
+        fail("final snapshot must take one PUB and retain only one TMPFS snapshot")
+    for forbidden in ("release_file_mmap_ranges_for_pagemap", "shm_cleanup_for_task",
+                      "clone_lazy_vmem_ranges", "UserPagemapReadScope", "UserPagemapExclusiveScope", "PreemptGuard"):
+        if forbidden in snapshot:
+            fail(f"coordinator must leave reader/exclusive ownership and caller rollback to their actual owners: {forbidden}")
+    caller = block_between(fork, "sys::SyscallPreparationScope preparation(*parent);",
+                           "// --- Clone thread metadata ---", "ordinary regular fork VM caller")
+    require_cpp_tokens(caller, ["detail::ForkVmFailurePoint point{};",
+        "detail::prepare_fork_vm_snapshot(*parent, *child, preparation, EAGER_COPY ? &fork_placement : nullptr, EAGER_COPY ? &fork_page : nullptr, &point)",
+        'return finish_fork(detail::public_fork_vm_error(point, FORK_VM_ERROR), 0, "vm-snapshot");'],
+        "public caller passes borrowed storage and translates the witnessed private refusal")
+    require_ordered_tokens(caller, ["detail::prepare_fork_vm_snapshot(", "if (FORK_VM_ERROR != 0)",
+        "shm_cleanup_for_task(child)", "release_file_mmap_ranges_for_pagemap(child->pagemap)",
+        "release_lazy_vmem_ranges(*child)", "destroy_user_space(child->pagemap",
+        "release_pagemap(child->pagemap", "delete[] child->name", "page_free(", "delete child;",
+        "public_fork_vm_error(point, FORK_VM_ERROR)", "observe_address_space(*child)"],
+        "all adopted prefixes roll back after coordinator owners drop and before successful frontier")
+    for forbidden in ("SharedVmemPublicationGuard", "LegacyInterval", "PreemptGuard", "deep_copy_user_pagemap_cow"):
+        if forbidden in caller:
+            fail(f"public caller must use only the prepared coordinator: {forbidden}")
+    if fork.count("sys::SyscallPreparationScope rollback(*parent);") != 6:
+        fail("each existing later failure and the new PerCpu denial must open its own ordinary rollback scope")
+    for anchor in ("if (child_thread == nullptr)", "if (!child->pid_namespace()->is_host()",
+                   "if (per_cpu == nullptr)", "if (!clone_fd_table_shared_checked(parent, child))",
+                   "if (!child_events::begin_publication(*parent, *child))",
+                   "if (!PUBLICATION_REF || !process_reservation.attach(*child)"):
+        branch = fork[fork.index(anchor):]
+        opening = branch.index("{")
+        if not branch[opening + 1:].lstrip().startswith("sys::SyscallPreparationScope rollback(*parent);"):
+            fail(f"ordinary rollback must be the first owner of failure branch {anchor}")
+    if fork.count("sched::task::release_lazy_vmem_ranges(*child);") != 7:
+        fail("VM refusal, the existing five later failures and PerCpu denial must release lazy references")
+    require_ordered_tokens(fork, ["observe_address_space(*child)", "// --- Clone thread metadata ---",
+        "if (!child_events::begin_publication(*parent, *child))", "child->try_acquire_lifetime_ref()",
+        "post_task_balanced_inherited(child, inherited_placement)", "child_events::commit_publication(*child)",
+        "uint64_t const CHILD_CPU = child->load_cpu();", "child->release();",
+        "finish_fork(static_cast<int64_t>(CHILD_VISIBLE_PID), CHILD_CPU)"], "unchanged successful publication tail")
+    file_clone = function_body(SYS_VMEM_CPP.read_text(), "clone_file_mmap_ranges_for_pagemap_locked")
     if "release_file_mmap_ranges_for_pagemap(dst)" in file_clone:
-        fail("file mmap clone rollback may block and must not run under the fork publication guard")
+        fail("file mmap clone rollback may block and must not run under PUB")
+
+
+def test_fork_failure_phase_is_scalar_and_precedes_each_refusal() -> None:
+    source = PROCESS_CPP.read_text()
+    coordinator = function_body(source, "prepare_fork_vm_snapshot")
+    require_cpp_tokens(source, ["ForkVmFailurePoint* failure_point = nullptr"],
+                       "old five-argument coordinator calls remain source compatible")
+    require_cpp_tokens(coordinator, ["if (failure_point != nullptr) *failure_point = point;"],
+                       "phase is an optional borrowed scalar witness")
+    require_ordered_tokens(coordinator, [
+        "fail_at(ForkVmFailurePoint::Context);", "if (!preparation.ready()",
+        "fail_at(ForkVmFailurePoint::LazyPrepare);", "lazy.prepare(actor)",
+        "fail_at(ForkVmFailurePoint::TmpfsPrepare);", "tmpfs.prepare(actor, lazy)",
+        "fail_at(ForkVmFailurePoint::LegacyPrepare);", "legacy_file.prepare(actor, child, preparation)",
+        "fail_at(ForkVmFailurePoint::SwapPrepare);", "swap.prepare(actor, child, preparation)",
+        "fail_at(ForkVmFailurePoint::ShmPrepare);", "shm.prepare(actor, child, preparation)",
+        "fail_at(ForkVmFailurePoint::GeometryPrepare);", "prepare_current_range_split(",
+        "fail_at(ForkVmFailurePoint::FinalLazyTmpfsMatch);", "SharedVmemPublicationGuard publication;",
+        "fail_at(ForkVmFailurePoint::LegacyMatch);", "legacy_file.matches(",
+        "fail_at(ForkVmFailurePoint::ShmMatch);", "shm.matches(",
+        "fail_at(ForkVmFailurePoint::LazyConsume);", "lazy.consume(child)",
+        "fail_at(ForkVmFailurePoint::Copy);", "deep_copy_current_user_pagemap_prepared(",
+        "fail_at(ForkVmFailurePoint::TmpfsAttach);", "tmpfs.attach(child)",
+        "fail_at(ForkVmFailurePoint::ShmCommit);", "shm.commit(",
+        "fail_at(ForkVmFailurePoint::LegacyCommit);", "legacy_file.commit(",
+        "if (status == 0) fail_at(ForkVmFailurePoint::Complete);", "return status;"
+    ], "phase identifies the operation which can refuse without granting authority")
+
+
+def test_fork_allocation_denial_precedes_initialization_and_preserves_prefixes() -> None:
+    fork = function_body(PROCESS_CPP.read_text(), "wos_proc_fork")
+    for expression in ("new (std::nothrow) sched::task::Task{}", "new (std::nothrow) char[NAME_LEN + 1]",
+                       "new (std::nothrow) sched::threading::Thread()", "new (std::nothrow) cpu::PerCpu()"):
+        if fork.count(expression) != 1:
+            fail(f"fork must use the supported nonthrowing allocation expression exactly once: {expression}")
+    name = block_between(fork, "char* name_copy = new (std::nothrow)", "child->pid =", "name refusal prefix")
+    require_ordered_tokens(name, ["if (name_copy == nullptr)", "page_free(", "delete child;",
+        'finish_fork(-ENOMEM, 0, "name")', "std::memcpy(name_copy", "child->name = name_copy"],
+        "name refusal frees only the exact early stack/Task prefix before memcpy/adoption")
+    for forbidden in ("destroy_user_space", "release_lazy_vmem_ranges", "abort_publication", "release_cloned_fd_table_refs"):
+        if forbidden in name:fail("name denial cannot clean an unacquired VM/publication prefix: " + forbidden)
+    per_cpu = block_between(fork, "auto* per_cpu = new (std::nothrow)", "// Resume from the immutable", "PerCpu refusal prefix")
+    require_ordered_tokens(per_cpu, ["if (per_cpu == nullptr)", "SyscallPreparationScope rollback(*parent)",
+        "delete child->thread;", "shm_cleanup_for_task(child)", "release_file_mmap_ranges_for_pagemap(child->pagemap)",
+        "release_lazy_vmem_ranges(*child)", "destroy_user_space(child->pagemap", "release_pagemap(child->pagemap",
+        "delete[] child->name", "page_free(", "delete child;", 'finish_fork(-ENOMEM, 0, "per-cpu")',
+        "per_cpu->syscall_stack", "per_cpu->cpu_id", "child->context.syscall_scratch_area"],
+        "PerCpu denial cleans the exact ordinary VM+optional Thread prefix before first member access")
+    for forbidden in ("abort_publication", "release_cloned_fd_table_refs", "child->release()", "delete per_cpu"):
+        if forbidden in per_cpu:fail("PerCpu denial cannot return an unacquired prefix: " + forbidden)
 
 
 def test_fork_child_registers_use_immutable_syscall_entry_snapshot() -> None:
@@ -1210,7 +1319,7 @@ def test_fork_child_registers_use_immutable_syscall_entry_snapshot() -> None:
             "ker::mod::cpu::GPRegs const FORK_ENTRY_REGS = gpr;",
             "auto const KERNEL_STACK_BASE = alloc_fork_kernel_stack_from_syscall(parent);",
             "child->context.regs = fork_child_return_regs(FORK_ENTRY_REGS);",
-            "post_task_balanced(child)",
+            "post_task_balanced_inherited(child, inherited_placement)",
         ],
         "immutable fork syscall-entry register snapshot",
     )
@@ -1262,8 +1371,11 @@ def main() -> None:
     test_file_mmap_cache_is_sharded_without_changing_page_ownership()
     test_thread_publication_is_serialized_with_shared_vmem_updates()
     test_process_memory_policy_is_captured_before_creation_and_retry()
+    test_cpu_placement_capture_precedes_creation_and_reuses_legacy_publishers()
     test_eager_fork_uses_copied_policy_and_caller_storage_before_owners()
     test_fork_snapshots_all_vm_surfaces_under_one_publication_guard()
+    test_fork_failure_phase_is_scalar_and_precedes_each_refusal()
+    test_fork_allocation_denial_precedes_initialization_and_preserves_prefixes()
     test_fork_child_registers_use_immutable_syscall_entry_snapshot()
     print("vmem mmap, owned-frame, and COW invariants hold")
 

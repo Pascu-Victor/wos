@@ -278,6 +278,7 @@ def generate(root: Path, scratch: Path, fixture):
     for rel in [
         "test/numa_lifecycle_mm_debt.hpp",
         "platform/mm/lifecycle_census.hpp",
+        "platform/mm/lifecycle_stamp.hpp",
         "abi/callnums/vmem.h",
     ]:
         path = include / rel
@@ -448,6 +449,7 @@ def main() -> int:
             "platform/mm/virt.opt.cpp",
             "test/numa_lifecycle_mm_debt.hpp",
             "platform/mm/lifecycle_census.hpp",
+        "platform/mm/lifecycle_stamp.hpp",
             "util/smallvec.hpp",
             "platform/sched/lazy_vmem.hpp",
             "platform/sched/lazy_vmem.cpp",

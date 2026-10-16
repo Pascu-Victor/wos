@@ -513,7 +513,7 @@ def test_user_thread_tcbs_publish_nonzero_tid_before_user_execution() -> None:
     require_order(
         thread_control_source,
         "mod::sched::threading::publish_tid_to_tcb(*parent, tcb_va, NEW_TID, false)",
-        "mod::sched::post_task_for_cpu(TARGET_CPU, t)",
+        "mod::sched::post_task_round_robin_inherited(t, inherited_placement, PLACEMENT_SEED)",
         "secondary pthread TCB tid must be published before scheduling",
     )
     require_order(

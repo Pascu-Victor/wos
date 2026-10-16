@@ -59,6 +59,10 @@ struct PlainStorage {
     balance::Snapshot physical_a{}, physical_b{}, physical_baseline{};
     balance::Workspace physical_work{};
     Report report{};
+    // Failure-only copied diagnostics, appended after every old member.
+    MmActivitySnapshot activity_a{}, activity_b{};
+    MmActivityRelation activity_relation{};
+    uint64_t physical_clock_us[4]{}, physical_clock_valid{};
 };
 static_assert(std::is_trivially_copyable_v<PlainStorage>);
 static_assert(sizeof(PlainStorage) <= 2 * 1024 * 1024);
@@ -517,9 +521,19 @@ class CensusHandler final {
         sched::task::selftest_current_native_debt_snapshot(plain.native_a);
         syscall::vmem::selftest_file_registry_snapshot(plain.registry_a);
         mm_debt::snapshot(plain.mm_a);
+        mm_debt::activity_snapshot(plain.activity_a);
+        plain.physical_clock_us[0] = mod::time::get_us();
         auto const physical_a = balance::snapshot(plain.physical_a, plain.physical_work, MAX_FRAMES);
+        plain.physical_clock_us[1] = mod::time::get_us();
+        plain.physical_clock_us[2] = mod::time::get_us();
         auto const physical_b = balance::snapshot(plain.physical_b, plain.physical_work, MAX_FRAMES);
+        plain.physical_clock_us[3] = mod::time::get_us();
+        plain.physical_clock_valid = plain.physical_clock_us[0] <= plain.physical_clock_us[1] &&
+                                     plain.physical_clock_us[1] <= plain.physical_clock_us[2] &&
+                                     plain.physical_clock_us[2] <= plain.physical_clock_us[3];
         mm_debt::snapshot(plain.mm_b);
+        mm_debt::activity_snapshot(plain.activity_b);
+        mm_debt::interpret_activity(plain.mm_a, plain.mm_b, plain.activity_a, plain.activity_b, plain.activity_relation);
         syscall::vmem::selftest_file_registry_snapshot(plain.registry_b);
         sched::task::selftest_current_native_debt_snapshot(plain.native_b);
         collect_scalars(scope, plain.scalar_b);

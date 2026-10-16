@@ -3215,9 +3215,10 @@ def require_local_only_memory_policy(source: str) -> None:
     require_order(legacy, "task->elf_buffer_size == 0", "wki_try_remote_spawn(task, SPEC)", "fork gate before capture")
     assert "memory_policy_snapshot" not in legacy and "WkiRemoteSpawnSpec const SPEC = {}" in legacy
     process = (ROOT / "modules/kern/src/syscalls_impl/process/process.cpp").read_text()
-    assert process.index("child->elf_buffer = nullptr") < process.index("sched::post_task_balanced(child)")
-    clone = process[process.index("child->wki_skip_legacy_placement = true"):]
-    assert clone.index("child->wki_skip_legacy_placement = true") < clone.index("sched::post_task_balanced(child)")
+    fork = multiline_function_body(process, "wos_proc_fork")
+    assert fork.index("child->elf_buffer = nullptr") < fork.index("sched::post_task_balanced_inherited(child, inherited_placement)")
+    clone = multiline_function_body(process, "wos_proc_clone_vm")
+    assert clone.index("child->wki_skip_legacy_placement = true") < clone.index("sched::post_task_balanced_inherited(child, inherited_placement)")
     assert 'sizeof(TaskSubmitPayload) == 20' in (ROOT / "modules/kern/src/net/wki/wire.hpp").read_text()
     assert "sizeof(WkiRemoteSpawnSpec)" not in source
 

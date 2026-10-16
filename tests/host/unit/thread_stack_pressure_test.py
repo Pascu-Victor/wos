@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[3]
+SOURCE_ROOT = ROOT
 PRELUDE = r'''
 #include <array>
 #include <atomic>
@@ -28,6 +29,13 @@ int publication_depth=0, pool_depth=0, calls=0, reclaims=0, attached=0, posted=0
 int failures=0, reservation_error=0, pressure_logs=0, gc_requests=0, policy_snapshots=0;
 using Policy = ker::mod::mm::numa::Policy;
 using PolicyMode = ker::mod::mm::numa::Mode;
+namespace ker::mod::sched { PLACEMENT_TYPE }
+using Placement = ker::mod::sched::TaskPlacementSnapshot;
+Placement expected_placement{3,8,17,true,true};
+int placement_snapshots=0, placement_initialized=0, placement_capture_error=0, placement_init_error=0;
+int gc_context_after_capture=-1;
+bool lose_topology_after_capture=false, gc_changes_placement=false;
+void apply_late_gc_context();
 Policy expected_policy{uint64_t{1} << 63, PolicyMode::PREFERRED};
 bool gc_changes_policy=false;
 bool pass_ran=true, pass_time=false, pass_pending=false;
@@ -67,6 +75,7 @@ struct Task {
  uint64_t pid=0x1234567887654321ULL;
  Cred credentials() const { return {}; }
  Policy policy{};
+ Placement placement{};
  Policy memory_policy_snapshot() const {
   assert(publication_depth==0 && pool_depth==0); ++policy_snapshots; return policy;
  }
@@ -78,9 +87,11 @@ struct Task {
   assert(!irq && prepared_lazy && policy_snapshots==1 && memory_policy==expected_policy);
   assert(publication_depth==1 && pool_depth==0 && tcb==256 && sp==512 && enter==768 && entry==1024 && arg==1280);
   ++calls;
+  apply_late_gc_context();
   PROLOGUE
   if (failures && !stack_pressure) { --failures; return nullptr; }
-  static Task child; return &child;
+  if(lose_topology_after_capture) cpus=0;
+  static Task child; child.placement={}; return &child;
  }
 };
 class LazyVmemClone {
@@ -93,6 +104,20 @@ void destroy_unpublished_user_thread(Task* t) { assert(publication_depth==0 && p
 }
 namespace ker::mod::sched {
 auto get_current_task() -> task::Task* { return wrong_current ? &task::other : &task::parent; }
+int capture_task_placement_snapshot(task::Task* subject, TaskPlacementSnapshot& output) {
+ assert(subject==&task::parent && publication_depth==0 && pool_depth==0 && !calls && !placement_snapshots);
+ ++placement_snapshots;
+ if(placement_capture_error) return placement_capture_error;
+ if(cpus==0) return -ENODEV;
+ if(cpus>64) return -ERANGE;
+ output=subject->placement; return 0;
+}
+int initialize_inherited_task_placement(task::Task* child,const TaskPlacementSnapshot& copied) {
+ assert(publication_depth==1 && placement_snapshots==1 && copied==expected_placement);
+ ++placement_initialized;
+ if(placement_init_error) return placement_init_error;
+ child->placement=copied; return 0;
+}
 bool has_run_queues() { return queues; }
 bool can_query_current_task() { return query; }
 uint32_t preempt_count() { return safe ? 0 : 1; }
@@ -113,13 +138,18 @@ GcPassResult run_gc_reclaim_pass_exclusive(uint32_t tasks,uint64_t time,uint32_t
  if(recover || concurrently_freed) failures=0;
  if(gc_changes_if) irq=!entry_irq;
  if(gc_changes_policy) task::parent.policy={3,PolicyMode::BIND};
+ if(gc_changes_placement) task::parent.placement={1,3,203,false,false};
  if(d) { d->epoch_skips=3;d->current_skips=2;d->refcount_skips=1; }
  return {.reclaimed=recover ? 1U : 0U,.scanned=7,.time_budget_exhausted=pass_time,.has_pending_work=pass_pending,.ran=true};
 }
 FOLLOWUP
 uint32_t reclaim_memory_pressure(GcPressureDiagnostics* diagnostics=nullptr);
 WRAPPER
-bool post_task_for_cpu(uint64_t cpu,task::Task*) { assert(publication_depth==1 && cpu<cpus); ++posted; return post_ok; }
+bool post_task_round_robin_inherited(task::Task* child,const TaskPlacementSnapshot& copied,uint64_t) {
+ assert(publication_depth==1 && placement_snapshots==1 && placement_initialized==1);
+ assert(copied==expected_placement && child->placement==copied);
+ assert(copied.owner_cpu<cpus); ++posted; return post_ok;
+}
 namespace resource {
 struct ProcessReservation {
  ProcessReservation(task::Task*,uint32_t) {}
@@ -186,14 +216,28 @@ auto execute() -> uint64_t {
 BODY
 }
 }
+// Finite endpoint controls change context only AFTER successful entry capture.
+// They preserve old GC refusal boundaries; they do not model production hotplug.
+void apply_late_gc_context() {
+ assert(placement_snapshots==1);
+ int const field=gc_context_after_capture; auto& p=ker::mod::sched::task::parent;
+ switch(field) {
+   case 0:queues=false;break;case 1:query=false;break;case 2:panic=true;break;
+   case 3:p.type=ker::mod::sched::task::TaskType::DAEMON;break;
+   case 4:p.syscall_account_start_us=0;break;case 5:p.scheduler_transition_active=true;break;
+   case 6:p.deferred_task_switch=true;break;case 7:p.wants_block=true;break;case 8:p.voluntary=true;break;
+ }
+}
 void reset() {
  assert(publication_depth==0 && pool_depth==0);
  calls=reclaims=attached=posted=destroyed=exits=pending_checks=failures=reservation_error=pressure_logs=gc_requests=policy_snapshots=0;
  gc_changes_policy=false;
+ placement_snapshots=placement_initialized=placement_capture_error=placement_init_error=0;
+ gc_context_after_capture=-1;lose_topology_after_capture=gc_changes_placement=false;
  pass_ran=true;pass_time=pass_pending=false;ker::mod::sched::scheduler_gc_memory_pressure_requested=false;
  safe=stack_pressure=recover=publish_ok=post_ok=copy_ok=true;concurrently_freed=gc_changes_if=false;cpus=8;published_tid=0;
  irq=entry_irq=false;queues=query=true;panic=wrong_current=false;
- auto& p=ker::mod::sched::task::parent;p.type=ker::mod::sched::task::TaskType::PROCESS;p.policy=expected_policy;
+ auto& p=ker::mod::sched::task::parent;p.type=ker::mod::sched::task::TaskType::PROCESS;p.policy=expected_policy;p.placement=expected_placement;
  p.syscall_account_start_us=1;p.scheduler_transition_active=false;p.deferred_task_switch=p.wants_block=p.voluntary=false;
 }
 auto run() -> int64_t { return static_cast<int64_t>(ker::syscall::multiproc::execute()); }
@@ -205,7 +249,7 @@ int main() {
  reset(); failures=1; stack_pressure=false; assert(run()==-ENOMEM); assert(calls==1 && !reclaims && !attached);
  reset(); publish_ok=false; assert(run()==-EFAULT); assert(calls==1 && !reclaims && destroyed==1 && !attached && !posted && !published_tid);
  reset(); post_ok=false; assert(run()==-ENOMEM); assert(calls==1 && !reclaims && destroyed==1 && attached==1 && posted==1 && !published_tid);
- reset(); cpus=0; assert(run()==-ENOMEM); assert(calls==1 && !reclaims && destroyed==1 && !attached && !posted);
+ reset(); lose_topology_after_capture=true; assert(run()==-ENOMEM); assert(calls==1 && !reclaims && destroyed==1 && !attached && !posted);
  reset(); copy_ok=false; assert(run()==-EFAULT); assert(!calls && !reclaims && !attached);
  reset(); reservation_error=-EAGAIN; assert(run()==-EAGAIN); assert(!calls && !reclaims && !attached);
  reset(); failures=1;recover=false;concurrently_freed=true;assert(static_cast<uint64_t>(run())==ker::mod::sched::task::parent.pid);assert(calls==2 && reclaims==1 && attached==1 && posted==1);
@@ -216,13 +260,7 @@ int main() {
   assert(static_cast<uint64_t>(run())==ker::mod::sched::task::parent.pid && irq==original_if && reclaims==1);
  }
  for(int field=0;field<9;++field) {
-  reset();failures=1;auto& p=ker::mod::sched::task::parent;
-  switch(field) {
-   case 0:queues=false;break;case 1:query=false;break;case 2:panic=true;break;
-   case 3:p.type=ker::mod::sched::task::TaskType::DAEMON;break;
-   case 4:p.syscall_account_start_us=0;break;case 5:p.scheduler_transition_active=true;break;
-   case 6:p.deferred_task_switch=true;break;case 7:p.wants_block=true;break;case 8:p.voluntary=true;break;
-  }
+  reset();failures=1;gc_context_after_capture=field;
   assert(run()==-ENOMEM && calls==1 && !reclaims && !pressure_logs && !irq);
  }
  reset();assert(!ker::syscall::multiproc::reclaim_thread_stack_from_syscall(nullptr));
@@ -248,13 +286,27 @@ int main() {
   assert(calls==2 && reclaims==1 && policy_snapshots==1);
   assert(ker::mod::sched::task::parent.policy==Policy(3,PolicyMode::BIND));
  }
+ reset();cpus=0;assert(run()==-ENODEV && !calls && !attached && placement_snapshots==1);
+ reset();cpus=65;assert(run()==-ERANGE && !calls && !attached);
+ reset();placement_capture_error=-EBUSY;assert(run()==-EBUSY && !calls && !attached);
+ reset();placement_init_error=-EINVAL;assert(run()==-EINVAL && calls==1 && destroyed==1 && !attached && !published_tid);
+ for(Placement placement : {Placement{3,8,17,true,true},Placement{1,10,73,false,true},Placement{63,UINT64_MAX,91,true,false}}) {
+  expected_placement=placement;reset();if(placement.owner_cpu==63)cpus=64;
+  failures=1;gc_changes_placement=true;
+  assert(static_cast<uint64_t>(run())==ker::mod::sched::task::parent.pid);
+  assert(calls==2 && reclaims==1 && placement_snapshots==1 && placement_initialized==1);
+  assert(ker::mod::sched::task::parent.placement==Placement(1,3,203,false,false));
+ }
  puts("PASS actual THREAD_CREATE IRQ-off/IRQ-on pressure recovery, unsafe contexts, publication and captured-policy retry checks");
 }
 '''
 
 
 def source():
-    text = (ROOT / 'modules/kern/src/syscalls_impl/multiproc/threadControl.cpp').read_text()
+    def read(relative):
+        path = SOURCE_ROOT / relative
+        return (path if path.is_file() else ROOT / relative).read_text()
+    text = read('modules/kern/src/syscalls_impl/multiproc/threadControl.cpp')
     start = text.index('case abi::multiproc::threadControlOps::THREAD_CREATE: {')
     begin = text.index('{', start) + 1
     end, depth = begin, 1
@@ -272,17 +324,17 @@ def source():
     sti, cli = 'asm volatile("sti" ::: "memory");', 'asm volatile("cli" ::: "memory");'
     assert helper.count(sti) == 2 and helper.count(cli) == 1
     helper = helper.replace(sti, 'enable_interrupts();').replace(cli, 'disable_interrupts();')
-    factory = (ROOT / 'modules/kern/src/platform/sched/task.cpp').read_text()
+    factory = read('modules/kern/src/platform/sched/task.cpp')
     a = factory.index('{', factory.index('Task* Task::create_user_thread(')) + 1
     b = factory.index('    uint64_t const K_RSP', a)
-    header = (ROOT / 'modules/kern/src/platform/sched/scheduler.hpp').read_text()
+    header = read('modules/kern/src/platform/sched/scheduler.hpp')
     aa = header.index('struct GcPressureDiagnostics {')
     bb, depth = header.index('{', aa) + 1, 1
     while depth:
         depth += (header[bb] == '{') - (header[bb] == '}')
         bb += 1
     bb += 1
-    scheduler = (ROOT / 'modules/kern/src/platform/sched/scheduler.cpp').read_text()
+    scheduler = read('modules/kern/src/platform/sched/scheduler.cpp')
     def function(name):
         aa = scheduler.index('auto ' + name + '(')
         brace = scheduler.index('{', aa)
@@ -291,7 +343,9 @@ def source():
             depth += (scheduler[bb] == '{') - (scheduler[bb] == '}')
             bb += 1
         return scheduler[aa:bb]
-    return (PRELUDE.replace('PROLOGUE', factory[a:b]).replace('BODY', body).replace('HELPER', helper)
+    pa = header.index('struct TaskPlacementSnapshot {')
+    pb = header.index('\n};', pa) + 3
+    return (PRELUDE.replace('PLACEMENT_TYPE', header[pa:pb]).replace('PROLOGUE', factory[a:b]).replace('BODY', body).replace('HELPER', helper)
             .replace('REPORT', header[aa:bb]).replace('WRAPPER', function('reclaim_memory_pressure'))
             .replace('FOLLOWUP', function('gc_pass_needs_followup')))
 
@@ -302,6 +356,8 @@ def main():
     actual = source()
     mutations = {
         'retry_policy_resnapshot': actual.replace('prepared_stack_words.at(1), MEMORY_POLICY,', 'prepared_stack_words.at(1), (static_cast<void>(MEMORY_POLICY), parent->memory_policy_snapshot()),'),
+        'retry_placement_resnapshot': actual.replace('if (int const ERROR = mod::sched::initialize_inherited_task_placement(t, inherited_placement);', 'if (int const ERROR = (static_cast<void>(mod::sched::capture_task_placement_snapshot(parent, inherited_placement)), mod::sched::initialize_inherited_task_placement(t, inherited_placement));'),
+        'lost_placement_value': actual.replace('post_task_round_robin_inherited(t, inherited_placement, PLACEMENT_SEED)', 'post_task_round_robin_inherited(t, mod::sched::TaskPlacementSnapshot{}, PLACEMENT_SEED)'),
         'retry_bound': actual.replace('attempt != 0 ||', 'false ||'),
         'failure_reason_gate': actual.replace('!stack_exhausted ||', 'stack_exhausted ||'),
         'unsafe_context': actual.replace('mod::sched::preempt_count() != 0 || ', ''),

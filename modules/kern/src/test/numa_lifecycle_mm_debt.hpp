@@ -2,6 +2,7 @@
 #ifdef WOS_SELFTEST
 #include <cstddef>
 #include <cstdint>
+#include <platform/mm/lifecycle_stamp.hpp>
 namespace ker::test::numa_lifecycle {
 enum class CounterField : size_t {
     ACCESS_READERS = 0,
@@ -42,6 +43,19 @@ struct MmDebtSnapshot {
 };
 static_assert(sizeof(MmDebtSnapshot) == 216 && alignof(MmDebtSnapshot) == 8);
 static_assert(offsetof(MmDebtSnapshot, lazy_rows) == 88 && offsetof(MmDebtSnapshot, registry_returns) == 208);
+// Diagnostic only. Existing MM acceptance uses MmDebtSnapshot unchanged.
+struct MmActivitySnapshot {
+    mod::mm::lifecycle_census::Stamp before, after;
+    uint64_t explicit_begins, explicit_ends;
+    uint64_t add_attempts[static_cast<size_t>(CounterField::COUNT)];
+    uint64_t drop_attempts[static_cast<size_t>(CounterField::COUNT)];
+    uint64_t invalid_selectors, valid;
+};
+struct MmActivityRelation {
+    uint64_t reconciled, mm_delta, accounted_delta, begin_delta, end_delta, adjust_calls;
+};
+static_assert(sizeof(MmActivitySnapshot) == 448 && alignof(MmActivitySnapshot) == 8);
+static_assert(sizeof(MmActivityRelation) == 48 && alignof(MmActivityRelation) == 8);
 namespace mm_debt {
 // Internal scalar hooks. No lock, allocation, callback, backend or usercopy.
 // Change brackets are explicit, never stack RAII spanning fatal usercopy/I/O.
@@ -55,6 +69,12 @@ void drop_lazy_row(uint8_t copied_kind) noexcept;
 // Exclusive addressable output, by-ref, no hidden return and no owner refs.
 // valid means stable arithmetic/stamp sampling; acceptance ALSO needs inflight==0.
 void snapshot(MmDebtSnapshot& output) noexcept;
+// Caller-born addressable output; snapshots/counters grant no acceptance.
+void activity_snapshot(MmActivitySnapshot& output) noexcept;
+// Reconciled only for unchanged, nonsaturated stamps matching both old MM
+// samples. UNKNOWN on any mismatch/overflow; this is not producer identity.
+void interpret_activity(const MmDebtSnapshot& a, const MmDebtSnapshot& b, const MmActivitySnapshot& activity_a,
+                        const MmActivitySnapshot& activity_b, MmActivityRelation& output) noexcept;
 // This checkpoint has NO handler or coverage authority. Disconnected fields
 // remain required integration work, never zero-valued qualification evidence.
 }  // namespace mm_debt

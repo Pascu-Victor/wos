@@ -457,6 +457,26 @@ auto set_task_domain_checked(task::Task* task, const smt::CpuDomain& domain, boo
 // refusal. No frame read, VM guard, wake election or pending-work drain.
 auto get_task_affinity_checked(task::Task* task, uint64_t& mask) -> int;
 
+// Coherent copied policy, captured while the actual owning queue is locked.
+// The retained caller owns source lifetime and supplies addressable output;
+// failure leaves output unchanged. No Task/domain pointer survives capture.
+struct TaskPlacementSnapshot {
+    uint64_t owner_cpu{UINT64_MAX};
+    uint64_t domain_mask{UINT64_MAX};
+    uint32_t domain_id{};
+    bool cpu_pinned{};
+    bool domain_hard{};
+    auto operator==(const TaskPlacementSnapshot&) const -> bool = default;
+};
+auto capture_task_placement_snapshot(task::Task* task, TaskPlacementSnapshot& output) -> int;
+// Creation-only APIs: the caller owns a genuine fresh, never-published child
+// through ordinary prefix cleanup, then its existing publication reference.
+// Detached/scheduler flags are sanity checks, not proof of lifetime/history.
+// Initial hard-domain placement may select any CPU within the inherited mask.
+auto initialize_inherited_task_placement(task::Task* child, const TaskPlacementSnapshot& snapshot) -> int;
+auto post_task_balanced_inherited(task::Task* child, const TaskPlacementSnapshot& snapshot) -> bool;
+auto post_task_round_robin_inherited(task::Task* child, const TaskPlacementSnapshot& snapshot, uint64_t seed) -> bool;
+
 struct KernelWorkerCpuPin {
     task::Task* worker{};
     uint64_t cpu{};

@@ -494,7 +494,14 @@ auto copy_to_task(ker::mod::sched::task::Task&, uint64_t, const void*, size_t) {
 }
 }  // namespace usercopy
 }  // namespace ker::mod::sys
+/* @ACTIVITY_HELPERS@ */
 namespace ker::test::numa_lifecycle::mm_debt {
+// Controlled diagnostic endpoint: no live hook stream in this handler fixture.
+// Actual checked interpreter is extracted above; UNKNOWN grants no authority.
+void activity_snapshot(MmActivitySnapshot& out) noexcept {
+    fixture::outside();
+    out = {};
+}
 void snapshot(MmDebtSnapshot& out) noexcept {
     fixture::outside();
     out = fixture::mm;

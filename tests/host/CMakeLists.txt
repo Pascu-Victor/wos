@@ -338,6 +338,17 @@ add_test(NAME managed_huge_fork_runtime_test
         --host-build ${CMAKE_BINARY_DIR} --fork-contract-only
         --gtest-main $<TARGET_FILE:gtest_main> --gtest $<TARGET_FILE:gtest>)
 set_tests_properties(managed_huge_fork_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 150)
+add_test(NAME fork_vm_coordinator_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/managed_huge_runtime_test.py
+        --host-build ${CMAKE_BINARY_DIR} --fork-vm-coordinator-only
+        --gtest-main $<TARGET_FILE:gtest_main> --gtest $<TARGET_FILE:gtest>)
+set_tests_properties(fork_vm_coordinator_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 150)
+add_test(NAME task_placement_inheritance_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/task_placement_inheritance_runtime_test.py
+        --repo-root ${CMAKE_CURRENT_SOURCE_DIR}/../.. --source-root ${CMAKE_CURRENT_SOURCE_DIR}/../..
+        --host-cxx ${CMAKE_CXX_COMPILER})
+set_tests_properties(task_placement_inheritance_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 150)
+
 add_test(NAME kernel_direct_map_runtime_test
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/kernel_direct_map_runtime_test.py
         --cxx ${CMAKE_CXX_COMPILER} --negative-controls)
@@ -359,6 +370,10 @@ add_test(NAME numa_lifecycle_census_runtime_test
     COMMAND ${CMAKE_COMMAND} -E env WOS_HOST_CXX=${CMAKE_CXX_COMPILER}
         ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_lifecycle_census_runtime_test.py)
 set_tests_properties(numa_lifecycle_census_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 120)
+add_test(NAME numa_mm_activity_runtime_test
+    COMMAND ${CMAKE_COMMAND} -E env WOS_HOST_CXX=${CMAKE_CXX_COMPILER}
+        ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_mm_activity_runtime_test.py)
+set_tests_properties(numa_mm_activity_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 140)
 add_test(NAME numa_lifecycle_census_codec_test
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_lifecycle_census_codec_test.py)
 set_tests_properties(numa_lifecycle_census_codec_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 60)
@@ -492,6 +507,10 @@ add_test(
     NAME semantic_regression_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/semantic_regression_test.py
 )
+add_test(NAME kcov_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/kcov_runtime_test.py)
+set_tests_properties(kcov_runtime_test PROPERTIES LABELS "host;unit;runtime" TIMEOUT 90)
+
 add_test(
     NAME ktest_cov_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/ktest_cov_test.py
@@ -2143,3 +2162,7 @@ add_test(NAME prepared_fork_metadata_runtime_test
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/prepared_fork_metadata_runtime_test.py
         --cxx ${CMAKE_CXX_COMPILER})
 set_tests_properties(prepared_fork_metadata_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 120)
+
+# Python-owned unit programs retain their actual category; source checks are separate.
+set_tests_properties(rootfs_directory_policy_test serial_fifo_test
+    ptrace_deferred_yield_test ptrace_namespace_test PROPERTIES LABELS "host;unit")

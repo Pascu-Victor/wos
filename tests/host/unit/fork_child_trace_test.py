@@ -113,7 +113,7 @@ def main():
     args = parser.parse_args()
     source = (ROOT/'modules/kern/src/syscalls_impl/process/process.cpp').read_text()
     fork = function(source, 'wos_proc_fork')
-    assert fork.index('uint64_t const CHILD_VISIBLE_PID = child->namespace_tid();') < fork.index('sched::post_task_balanced(child)')
+    assert fork.index('uint64_t const CHILD_VISIBLE_PID = child->namespace_tid();') < fork.index('sched::post_task_balanced_inherited(child, inherited_placement)')
     assert fork.index('child_events::commit_publication(*child)') < fork.index('record_fork_child(FORK_STAGE, child->pid, child->load_cpu()') < fork.index('return finish_fork(static_cast<int64_t>(CHILD_VISIBLE_PID)')
     assert fork.count('record_fork_child(') == 1
     assert 'record_fork_child' not in fork[:fork.index('if (!child_events::commit_publication')]

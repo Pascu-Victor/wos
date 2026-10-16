@@ -39,3 +39,15 @@ KTEST(TaskPlacementTransaction, CompletedCurrentWaitRestoresMembership) {
 KTEST(TaskPlacementTransaction, CompletedCurrentWaitRefusalsAndCapacity) {
     KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_completed_current_wait_refusals());
 }
+
+namespace ker::mod::sched {
+auto scheduler_selftest_inherited_placement_owned_snapshot() -> bool;
+auto scheduler_selftest_inherited_placement_initial_eligibility() -> bool;
+}  // namespace ker::mod::sched
+
+KTEST(TaskPlacementInheritance, ActualQueueTupleAndRefusal) {
+    KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_inherited_placement_owned_snapshot());
+}
+KTEST(TaskPlacementInheritance, FreshChildAndAllowedInitialCpu) {
+    KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_inherited_placement_initial_eligibility());
+}
