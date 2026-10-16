@@ -3874,6 +3874,12 @@ SharedVmemPublicationGuard::SharedVmemPublicationGuard() { g_shared_vmem_publica
 
 SharedVmemPublicationGuard::~SharedVmemPublicationGuard() { g_shared_vmem_publication_lock.unlock(); }
 
+SharedVmemPublicationTryGuard::SharedVmemPublicationTryGuard() noexcept : acquired_(g_shared_vmem_publication_lock.try_lock()) {}
+
+SharedVmemPublicationTryGuard::~SharedVmemPublicationTryGuard() noexcept {
+    if (acquired_) g_shared_vmem_publication_lock.unlock();
+}
+
 struct PublicFileForkPreparation::Entry {
     ker::mod::mm::file_mapping::FileMappingBinding* source{};      // SNAPSHOT
     ker::mod::mm::file_mapping::FileMappingBinding* validation{};  // SNAPSHOT

@@ -25,6 +25,12 @@ class ManagedResolver : public HugeOwnership {
         publication_depth = cow_depth = pin_depth = root_readers = 0;
         actual_flushes = tracked_pages = 0;
         binding_matches = true;
+        virt::host_root_control = {};
+        host_range::interrupts = host_range::queryable = true;
+        host_range::reader_busy = host_range::exclusive = false;
+        host_range::yields = host_range::tries = host_range::unlocks = host_range::blocking = 0;
+        host_range::current = nullptr;
+        host_range::on_yield = nullptr;
         span_at_flush = nullptr;
         plan_at_flush = nullptr;
     }
@@ -195,7 +201,7 @@ TEST_F(ManagedResolver, WholeTwoLeafPreflightRejectsLateConflictBeforeAnyStore) 
     EXPECT_EQ(split(plan), huge::Error::Again);
     storage->descriptors[1].semantic_word ^= 2;
     auto saved_end = storage->end;
-    storage->end = TEST_VA + 65 * LARGE;
+    storage->end = uint64_t{1} << 48;
     EXPECT_EQ(split(plan), huge::Error::Invalid);
     storage->end = saved_end;
     auto& second = slot_at(runtime_root, TEST_VA + LARGE, 2);

@@ -1,0 +1,623 @@
+// Actual extracted page-in transactions + unchanged numa_alloc.cpp/OwnedSpan.
+// Host endpoints model Task references, root serials, COW/queue serialization,
+// one-page physical ownership, PTEs and slot I/O. No native/TLB/SMP claim.
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cassert>
+#include <cerrno>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <map>
+#include <new>
+#include <platform/acpi/numa_boot.hpp>
+#include <platform/mm/numa_alloc.hpp>
+#include <platform/mm/reclaim.hpp>
+#include <platform/asm/cpu.hpp>
+#include <platform/sched/shutdown_ownership.hpp>
+#include <vector>
+namespace model {
+unsigned checks{}, cases{}, allocations{}, reclaim_calls{}, releases{}, reads{}, slot_frees{}, wakes{}, yields{}, captures{};
+unsigned cow{}, pin{}, queue{}, gates{}, preempt{}, noio{}, last_alloc_noio{};
+bool fail_alloc{}, fail_gate{}, fail_capture{}, published{true};
+bool shutdown{}, enabled{true}, fail_create{}, post_result{true}, corrupt_failed_post{}, waiting{};
+unsigned created{}, destroyed{}, thread_deletes{}, stack_frees{}, lazy_returns{}, fd_returns{}, posts{}, block_calls{}, deferred_exit_checks{};
+std::function<void()> post_hook, block_hook, slot_hook, write_hook, free_hook, yield_hook;
+struct WorkerExit {}; struct WorkerPark {}; struct Panic {}; struct AutomaticExit {};
+void checkpoint();
+int io_error{};
+uint64_t serial{7}, ticks{}, cpu{};
+std::function<void()> allocation_hook;
+ker::mod::acpi::numa::Topology topology{};
+struct Block {
+    void* p{};
+    uint64_t physical{};
+    unsigned refs{};
+};
+std::vector<Block> blocks;
+void check(bool v, const char* what) {
+    ++checks;
+    if (!v) {
+        std::fprintf(stderr, "FAIL %s case=%u\n", what, cases);
+        std::abort();
+    }
+}
+unsigned live() {
+    unsigned n = 0;
+    for (auto& b : blocks) n += b.refs;
+    return n;
+}
+struct Lock {
+    unsigned* depth;
+    uint64_t lock_irqsave() {
+        check(*depth == 0, "nonrecursive lock");
+        ++*depth;
+        return 0;
+    }
+    void unlock_irqrestore(uint64_t) {
+        check(*depth == 1, "held lock");
+        --*depth;
+    }
+};
+void* allocate(uint64_t physical) {
+    check(cow == 0 && pin == 0 && queue == 0, "allocation outside metadata locks");
+    ++allocations;
+    last_alloc_noio = noio;
+    if (allocation_hook) {
+        auto h = std::move(allocation_hook);
+        h();
+    }
+    if (fail_alloc) return nullptr;
+    void* p = std::aligned_alloc(4096, 4096);
+    check(p != nullptr, "Host page");
+    std::memset(p, 0xa5, 4096);
+    blocks.push_back({p, physical + blocks.size() * 4096, 1});
+    return p;
+}
+void domains(unsigned n) {
+    topology = {};
+    topology.node_count = n;
+    topology.cpu_count = n;
+    topology.memory_range_count = n;
+    for (unsigned i = 0; i < n; ++i) {
+        topology.cpu_nodes[i] = i;
+        topology.nodes[i].usable_bytes = 0x100000;
+        topology.memory[i] = {0x10000000ULL + i * 0x100000ULL, 0x100000, static_cast<uint16_t>(i), 0};
+        for (unsigned j = 0; j < n; ++j) topology.distances[i][j] = i == j ? 10 : 20;
+    }
+}
+}  // namespace model
+namespace ker::mod::acpi::numa {
+auto boot_topology() noexcept -> const Topology* { return model::published ? &model::topology : nullptr; }
+}  // namespace ker::mod::acpi::numa
+namespace ker::mod::cpu {
+auto current_cpu() -> uint64_t { return model::cpu; }
+auto stack_protector_guard()->uint64_t{return 0x12345678abcdef01ULL;}
+}  // namespace ker::mod::cpu
+namespace ker::mod::sched {
+void preempt_disable() { ++model::preempt; }
+void preempt_enable() {
+    model::check(model::preempt > 0, "preempt balance");
+    --model::preempt;
+}
+namespace task {
+enum class TaskState { ACTIVE, EXITING, DEAD };
+enum class TaskType { DAEMON, PROCESS };
+struct Thread { ~Thread() { ++model::thread_deletes; } };
+struct Task {
+    static constexpr uint32_t ACTIVE_REGISTRY_INDEX_INVALID=UINT32_MAX;
+    mm::paging::PageTable* pagemap{};
+    Task* anonymous_swap_wait_next{};
+    void* anonymous_swap_wait_mapping{};
+    uint64_t anonymous_swap_wait_generation{};
+    std::atomic<uint64_t> anonymous_swap_completion_generation{};
+    std::atomic<uint32_t> ref_count{1};
+    std::atomic<uint32_t>& refs=ref_count; // One count; alias preserves old25 oracles.
+    std::atomic<TaskState> state{TaskState::ACTIVE};
+    TaskType type{TaskType::DAEMON};
+    std::atomic<bool> scheduler_published{},gc_queued{},wakeup_pending{};
+    int heap_index{-1};enum class Queue { NONE, WAITING, RUNNABLE };Queue sched_queue{Queue::NONE};
+    Task* sched_next{};std::atomic<void*>sched_list_owner{};
+    uint32_t active_registry_index{ACTIVE_REGISTRY_INDEX_INVALID};
+    std::atomic<uint32_t> usercopy_pagemap_accesses{};
+    std::atomic<Task*> owned_unpublished_process{};
+    std::atomic<void*> native_file_mapping_retirement{};
+    void (*kthread_entry)(){};
+    ShutdownOwnership kernel_shutdown_ownership;
+    mm::numa::Policy policy{};
+    Thread* thread{};char* name{};
+    struct Context {uintptr_t syscall_scratch_area{};uint64_t syscall_kernel_stack{};}context;
+    bool has_lazy{},has_fds{};
+    ACTUAL_TRY_ACQUIRE
+    void release() { ref_count.fetch_sub(1,std::memory_order_acq_rel); }
+    static auto create_kernel_thread(const char*,void(*)())->Task*;
+    ~Task(){if(thread||name){model::check(!has_lazy&&!has_fds,"real full destructor returned lazy/FD owners");++model::destroyed;}}
+};
+void release_lazy_vmem_ranges(Task&t){t.has_lazy=false;++model::lazy_returns;}
+void release_cloned_fd_table_refs(Task*t){t->has_fds=false;++model::fd_returns;}
+void destroy_unpublished_user_thread(Task*);
+}
+task::Task* current{};
+auto can_query_current_task()->bool{return current!=nullptr;}
+auto get_current_task()->task::Task*{return current;}
+auto kernel_threads_shutdown_requested()->bool{return model::shutdown;}
+void wake_task_from_event(task::Task*t){model::check(!model::cow&&!model::queue&&!model::pin,"canonical wake outside metadata locks");++model::wakes;t->wakeup_pending=true;model::waiting=false;}
+void kern_yield(){++model::yields;model::check(model::yields<20,"bounded migrate progress");if(model::yield_hook){auto h=std::move(model::yield_hook);h();}model::checkpoint();}
+auto hold_kernel_shutdown()->KernelShutdownHold{return KernelShutdownHold(current?&current->kernel_shutdown_ownership:nullptr);}
+[[noreturn]]void exit_current_kernel_thread(){model::check(current&&!current->kernel_shutdown_ownership.held(),"all worker drain holds released before exit");current->state=task::TaskState::DEAD;throw model::WorkerExit{};}
+void kern_block(){++model::block_calls;model::checkpoint();auto*t=current;model::check(t!=nullptr,"real modeled worker identity");model::waiting=true;
+ if(model::block_hook){auto h=std::move(model::block_hook);h();}
+ if(t->wakeup_pending.exchange(false)){model::waiting=false;return;}throw model::WorkerPark{};}
+auto post_task_for_cpu(uint64_t cpu,task::Task*t)->bool{model::check(cpu==0&&t==current,"exact CPU0 post subject");++model::posts;
+ model::check(t->refs==2&&t->kernel_shutdown_ownership.held(),"private boot ref and shutdown hold before post");
+ if(model::post_hook){auto h=std::move(model::post_hook);h();}
+ if(model::post_result){t->scheduler_published=true;return true;}
+ if(model::corrupt_failed_post)t->scheduler_published=true;return false;}
+auto get_active_task_count()->uint32_t{return 1;}
+auto get_active_task_at_safe(uint32_t)->task::Task*;
+}
+namespace model {void checkpoint(){if(shutdown){++deferred_exit_checks;if(ker::mod::sched::current&&!ker::mod::sched::current->kernel_shutdown_ownership.held())throw AutomaticExit{};}}}
+namespace ker::mod::dbg {[[noreturn]]void panic_handler(const char*){throw model::Panic{};}}
+namespace ker::mod::mm::addr {
+auto get_phys_pointer(paddr_t p) -> paddr_t* {
+    for (auto& b : model::blocks)
+        if (b.p == reinterpret_cast<void*>(p)) return reinterpret_cast<paddr_t*>(b.physical);
+    std::abort();
+}
+}  // namespace ker::mod::mm::addr
+namespace ker::mod::mm {inline constexpr size_t KERNEL_STACK_SIZE=STACK_BYTES;}
+namespace ker::mod::mm::phys {
+void page_free(void*p){model::check(!model::cow&&!model::queue,"stack free outside locks");++model::stack_frees;std::free(p);}
+void page_ref_inc(void*p){for(auto&b:model::blocks)if(b.p==p){model::check(b.refs>0,"pin real modeled frame");++b.refs;return;}std::abort();}
+auto page_alloc_may_fail(PhysicalPageOwner, uint64_t, std::string_view) -> void* { return model::allocate(model::topology.memory[0].base); }
+auto page_alloc_full_overwrite_page_may_fail(PhysicalPageOwner, std::string_view) -> void* {
+    return model::allocate(model::topology.memory[0].base);
+}
+auto page_alloc_with_reclaim_may_fail(PhysicalPageOwner, uint64_t, std::string_view, uint32_t) -> void* {
+    ++model::reclaim_calls;
+    return model::allocate(model::topology.memory[0].base);
+}
+auto page_alloc_full_overwrite_page_with_reclaim_may_fail(PhysicalPageOwner, std::string_view, uint32_t) -> void* {
+    ++model::reclaim_calls;
+    return model::allocate(model::topology.memory[0].base);
+}
+auto page_alloc_order0_span_in_range_may_fail(PhysicalPageOwner, uint64_t first, uint64_t, uint32_t pages, uint64_t, PageInitialization)
+    -> void* {
+    model::check(pages == 1, "one page factory");
+    return model::allocate(first);
+}
+auto page_ref_dec(void* p) -> uint32_t {
+    model::check(!model::cow && !model::pin && !model::queue, "ref return after locks");
+    for (auto& b : model::blocks)
+        if (b.p == p) {
+            model::check(b.refs > 0, "exact ref return");
+            --b.refs;
+            ++model::releases;
+            return b.refs;
+        }
+    std::abort();
+}
+}  // namespace ker::mod::mm::phys
+namespace ker::mod::mm::reclaim {
+auto notify_order0_node_failure(uint16_t) noexcept -> NodeReclaimStatus { return NodeReclaimStatus::NONE; }
+NoIoScope::NoIoScope() { ++model::noio; }
+NoIoScope::~NoIoScope() { --model::noio; }
+}  // namespace ker::mod::mm::reclaim
+#include "ACTUAL_FACTORY"
+namespace ker::mod::time {
+auto get_us() -> uint64_t { return ++model::ticks; }
+}  // namespace ker::mod::time
+namespace ker::dev {
+void block_queue_wait_for_capacity(void*) { std::abort(); }
+}  // namespace ker::dev
+namespace ker::mod::mm::swap {
+struct SwapSlot {
+    uint32_t area{1};
+    uint64_t index{3}, generation{1};
+};
+struct SlotIo {
+    SwapSlot slot{};
+    void* page{};
+    void* device{};
+    bool active{};
+};
+auto free_slot(SwapSlot) -> int {
+    model::check(!model::cow && !model::pin, "slot free after locks");
+    if(model::free_hook){auto h=std::move(model::free_hook);h();}model::checkpoint();++model::slot_frees;return 0;
+}
+auto allocate_slot(SwapSlot*out)->int {if(model::slot_hook){auto h=std::move(model::slot_hook);h();}model::checkpoint();*out={};return 0;}
+auto write_slot(SwapSlot,const void*)->int {auto const HOLD=ker::mod::sched::hold_kernel_shutdown();if(model::write_hook){auto h=std::move(model::write_hook);h();}model::checkpoint();return model::io_error;}
+struct SwapStats{uint64_t free_bytes{4096};};void get_stats(SwapStats*out){*out={};}
+auto swap_available()->bool{return true;}
+auto submit_slot_io(SlotIo& io, SwapSlot s, void* p, bool write) -> int {
+    model::check(!model::cow && !model::pin && !write, "read outside locks");
+    io.slot = s;
+    io.page = p;
+    io.active = true;
+    ++model::reads;
+    return 0;
+}
+auto finish_slot_io(SlotIo& io) -> int {
+    io.active = false;
+    if (!model::io_error) std::memset(io.page, 0x3c, 4096);
+    return model::io_error;
+}
+}  // namespace ker::mod::mm::swap
+namespace ker::mod::mm::virt {
+using addr::paddr_t;
+using addr::vaddr_t;
+using paging::PageTable;
+using paging::PageTableEntry;
+using namespace ker::mod;
+constexpr size_t USER_PAGEMAP_ACCESS_GATE_NONE = static_cast<size_t>(-1);
+constexpr uint64_t PTE_FRAME_MASK = 0x000FFFFFFFFFF000ULL;
+model::Lock cow_pte_lock{&model::cow}, user_mapping_pin_lock{&model::pin}, anonymous_pagein_queue_lock{&model::queue};
+DEMAND_TYPES
+DEMAND_STORAGE
+SWAP_TYPES
+constexpr size_t ANONYMOUS_PAGEIN_QUEUE_CAPACITY = 256;
+std::array<AnonymousSwapMapping*, ANONYMOUS_PAGEIN_QUEUE_CAPACITY> anonymous_pagein_queue{};
+size_t anonymous_pagein_queue_head{}, anonymous_pagein_queue_tail{}, anonymous_pagein_queue_count{};
+AnonymousSwapMapping* anonymous_swap_mappings{};
+AnonymousSwapAtomicStats anonymous_swap_stats{};
+std::atomic<uint64_t> anonymous_swap_generation{1};
+std::atomic<sched::task::Task*> anonymous_swap_worker_task{};
+std::atomic<bool> anonymous_swap_worker_started{};
+std::atomic<uint64_t> anonymous_reclaim_cursor{};
+bool anonymous_swap_admission{},anonymous_swap_service_closed{};
+auto anonymous_swap_enabled()->bool{return model::enabled;}
+PageTable kernel_root{};
+auto get_kernel_pagemap()->PageTable*{return &kernel_root;}
+struct Entries {std::map<std::pair<PageTable*,uint64_t>,PageTableEntry> table;
+ auto at(PageTable*r,uint64_t va)->PageTableEntry&{return table[{r,va}];}
+ auto operator[](PageTable*r)->PageTableEntry&{return at(r,0x400000);}}entries;
+auto page_align_down(uint64_t v) -> uint64_t { return v & ~4095ULL; }
+auto pte_from_raw(uint64_t r) -> PageTableEntry {
+    PageTableEntry e;
+    static_assert(sizeof(e) == sizeof(r));
+    std::memcpy(&e, &r, 8);
+    return e;
+}
+auto is_reserved_leaf(const PageTableEntry& e) -> bool { return e.present == 0; }
+auto leaf_entry(PageTable* r, vaddr_t va) -> PageTableEntry* {
+    model::check(model::cow == 1, "PTE under COW");
+    return &entries.at(r,va);
+}
+auto capture_user_root_incarnation(PageTable*, uint64_t& out) -> bool {
+    model::check(model::cow == 1, "root registry via COW");
+    out = model::serial;
+    return out != 0;
+}
+auto acquire_user_pagemap_access(PageTable*, bool, size_t& out) -> bool {
+    model::check(model::cow == 1, "gate under COW");
+    if (model::fail_gate) return false;
+    out = ++model::gates;
+    return true;
+}
+void release_user_pagemap_access(size_t g) {
+    if (g != USER_PAGEMAP_ACCESS_GATE_NONE) {
+        model::check(model::gates > 0, "gate owned");
+        --model::gates;
+    }
+}
+auto pte_raw(const PageTableEntry&e)->uint64_t{uint64_t raw;std::memcpy(&raw,&e,8);return raw;}
+void owned_frame_untrack_leaf(PageTable*,uint64_t,const PageTableEntry&){}
+void owned_frame_track_fresh_normal_mapping(PageTable*, vaddr_t, uint64_t, uint64_t) {
+    model::check(model::cow && model::pin, "tracked install locking");
+}
+void flush_pagemap_after_update(PageTable*, vaddr_t, bool) { model::check(!model::cow && !model::pin, "flush outside metadata locks"); }
+void anonymous_swap_add(std::atomic<uint64_t>& v, uint64_t n = 1) { v.fetch_add(n); }
+void anonymous_swap_update_max(std::atomic<uint64_t>& v, uint64_t n) { v.store(std::max(v.load(), n)); }
+auto capture_demand_context(sched::task::Task* t, uint64_t va, DemandOrigin, bool, DemandContext& out) -> bool {
+    model::check(!model::cow && !model::pin && !model::queue && t->anonymous_swap_wait_mapping == nullptr, "actor capture before new caller leases");
+    ++model::captures;
+    if (model::fail_capture) return false;
+    if (numa::capture_allocation_context(t->policy, out.allocation) != numa::AllocationError::NONE) return false;
+    out.allocation.virtual_page_index = va / 4096;
+    return true;
+}
+CORE_FUNCTIONS
+OPERATION_TYPES
+#define WOS_ASYNC_BLOCK_IO 1
+ACTUAL_WINDOW
+#undef WOS_ASYNC_BLOCK_IO
+PAGEIN_FUNCTIONS
+MIGRATE_CLONE_PURGE
+PAGEOUT_TYPES
+SNAPSHOT_ENDPOINT
+PAGEOUT_FUNCTIONS
+namespace log {template<class...T>void warn(const char*,T...){model::check(!model::cow&&!model::queue,"log after unlock");}}
+[[noreturn]]void anonymous_pagein_worker_main();
+WORKER_FUNCTIONS
+}  // namespace ker::mod::mm::virt
+namespace fixture {
+namespace v = ker::mod::mm::virt;
+namespace n = ker::mod::mm::numa;
+namespace p = ker::mod::mm::paging;
+namespace s = ker::mod::sched;
+constexpr uint64_t VA = 0x400000;
+p::PageTable roots[2]{};
+s::task::Task actor{};
+auto context(n::Mode mode = n::Mode::LOCAL, n::NodeMask mask = 0, n::NodeId local = 0) -> n::AllocationContext {
+    return {{mask, mode}, local, VA / 4096};
+}
+void reset(unsigned nodes = 2) {
+    model::check(v::anonymous_swap_mappings == nullptr && model::live() == 0 && model::gates == 0, "case closure");
+    for (auto& b : model::blocks) std::free(b.p);
+    model::blocks.clear();
+    model::domains(nodes);
+    model::cow = model::pin = model::queue = 0;
+    model::fail_alloc = model::fail_gate = model::fail_capture = false;
+    model::published = true;
+    model::io_error = 0;
+    model::serial = 7;
+    model::allocation_hook = {};
+    model::allocations = model::reclaim_calls = model::reads = model::slot_frees = model::yields = model::captures = 0;
+    v::anonymous_pagein_queue_count = v::anonymous_pagein_queue_head = v::anonymous_pagein_queue_tail = 0;
+    v::anonymous_pagein_queue.fill(nullptr);
+    v::anonymous_swap_stats.swapped_pages = 0;
+    v::anonymous_swap_stats.pagein_inflight = 0;
+    actor.pagemap = &roots[0];
+    actor.policy = {};
+    actor.anonymous_swap_wait_mapping = nullptr;
+    actor.anonymous_swap_wait_next = nullptr;
+    actor.refs = 1;
+    v::entries[&roots[0]] = v::pte_from_raw(p::PAGE_USER | p::PAGE_RESERVED);
+    v::entries[&roots[1]] = v::pte_from_raw(p::PAGE_USER | p::PAGE_RESERVED);
+    model::shutdown=false;model::cpu=0;
+    v::anonymous_swap_service_closed=false;v::anonymous_swap_admission=true;
+    static s::task::Task ready_worker;
+    ready_worker.state=s::task::TaskState::ACTIVE;ready_worker.ref_count=2;
+    v::anonymous_swap_worker_task=&ready_worker;
+    ++model::cases;
+}
+auto row() -> v::AnonymousSwapMapping* {
+    auto* r = new v::AnonymousSwapMapping{};
+    r->pagemap = &roots[0];
+    r->vaddr = VA;
+    r->generation = 3;
+    r->state = v::AnonymousSwapRuntimeState::SWAPPED;
+    r->object = new v::AnonymousSwapObject{};
+    r->object->mapping_refs = 1;
+    r->original_raw = p::PAGE_USER | p::PAGE_WRITE;
+    r->maintenance_placement = context();
+    r->maintenance_valid = true;
+    v::insert_anonymous_swap_mapping_locked(r);
+    ++v::anonymous_swap_stats.swapped_pages;
+    return r;
+}
+auto snapshot(v::AnonymousSwapMapping* r) -> v::AnonymousPageinSnapshot {
+    return {reinterpret_cast<uint64_t>(r->pagemap), model::serial, r->generation, r->vaddr};
+}
+auto fault(bool user = true) -> v::AnonymousSwapFaultDisposition {
+    uint64_t gen = 0;
+    return v::probe_anonymous_swap_fault(&actor, VA, p::PageFault{}, user, gen);
+}
+void process(bool cancelled = false) {
+    auto* r = v::anonymous_pagein_dequeue();
+    model::check(r != nullptr, "actual queued row");
+    r->cancelled = cancelled;
+    v::AnonymousPageinOperation op;
+    v::begin_anonymous_pagein(r, op);
+    v::finish_anonymous_pagein(op);
+}
+void close_installed() {
+    for (auto& b : model::blocks) {
+        if (!b.refs) continue;
+        auto const& entry = v::entries[&roots[0]];
+        model::check(entry.present && (static_cast<uint64_t>(entry.frame) << 12) == b.physical, "installed exact owned physical frame");
+        for (unsigned i = 0; i < 4096; ++i) model::check(static_cast<unsigned char*>(b.p)[i] == 0x3c, "restored full stored bytes");
+        ker::mod::mm::phys::page_ref_dec(b.p);
+    }
+}
+void purge() {
+    v::purge_anonymous_swap_mappings(&roots[0]);
+    v::purge_anonymous_swap_mappings(&roots[1]);
+}
+void check_failed_backing(v::AnonymousSwapMapping* r, int e) {
+    model::check(r->state == v::AnonymousSwapRuntimeState::FAILED && r->error == e && r->object && r->object->mapping_refs == 1,
+                 "terminal failure retains stored ref");
+    model::check(
+        model::slot_frees == 0 && v::anonymous_swap_stats.swapped_pages == 0 && !r->pagein_queued && model::gates == 0 && actor.refs == 1,
+        "exact pending debt drain");
+}
+void run() {
+    reset();
+    auto* r = row();
+    model::check(!v::legacy_anonymous_worker(context()), "NUMA default prepares");
+    model::check(fault() == v::AnonymousSwapFaultDisposition::PARK, "NUMA prepared parks");
+    model::check(model::allocations == 1 && r->frame && model::live() == 1, "candidate owned in row");
+    process();
+    model::check(model::reads == 1 && model::slot_frees == 1 && actor.refs == 1 && model::gates == 0, "success drains");
+    close_installed();
+    reset(1);
+    r = row();
+    model::check(v::legacy_anonymous_worker(context()), "UMA local keeps worker");
+    model::check(fault() == v::AnonymousSwapFaultDisposition::PARK && model::allocations == 0 && r->frame == nullptr,
+                 "legacy publish allocates none");
+    model::cpu = 0;
+    process();
+    model::check(model::allocations == 1 && model::reclaim_calls == 1 && model::reads == 1, "real factory legacy reclaim dispatch");
+    close_installed();
+    reset(1);
+    r = row();
+    actor.policy = {1, n::Mode::BIND};
+    model::check(fault() == v::AnonymousSwapFaultDisposition::PARK && model::allocations == 1 && model::reclaim_calls == 0,
+                 "UMA explicit BIND prepared");
+    process();
+    close_installed();
+    reset();
+    r = row();
+    model::fail_alloc = true;
+    model::check(fault() == v::AnonymousSwapFaultDisposition::FAILED, "prequeue ENOMEM current fault");
+    model::check(r->state == v::AnonymousSwapRuntimeState::SWAPPED && r->object && r->error == 0 && !r->pagein_queued && model::gates == 0,
+                 "no mutation on capacity refusal");
+    model::fail_alloc = false;
+    model::check(fault() == v::AnonymousSwapFaultDisposition::PARK, "retry after refusal");
+    process();
+    close_installed();
+    reset();
+    r = row();
+    v::anonymous_pagein_queue_count = 256;
+    model::check(fault() == v::AnonymousSwapFaultDisposition::FAILED && model::live() == 0 && model::gates == 0,
+                 "queue refusal returns candidate");
+    model::check(r->frame == nullptr && r->object && r->error == 0, "queue rollback retains slot");
+    v::anonymous_pagein_queue_count = 0;
+    purge();
+    reset();
+    r = row();
+    model::fail_gate = true;
+    model::check(fault() == v::AnonymousSwapFaultDisposition::FAILED && model::live() == 0, "gate refusal returns candidate");
+    model::fail_gate = false;
+    purge();
+    reset();
+    r = row();
+    model::allocation_hook = [] { ++model::serial; };
+    model::check(fault() == v::AnonymousSwapFaultDisposition::FAILED && model::live() == 0 && !r->pagein_queued,
+                 "root serial race rejects candidate");
+    purge();
+    reset();
+    r = row();
+    model::allocation_hook = [r] { ++r->generation; };
+    model::check(fault() == v::AnonymousSwapFaultDisposition::FAILED && model::live() == 0, "row generation race rejects");
+    purge();
+    reset();
+    r = row();
+    model::check(fault(false) == v::AnonymousSwapFaultDisposition::FAILED && model::allocations == 0 && !r->pagein_queued,
+                 "new CPL0 boundary");
+    purge();
+    reset();
+    r = row();
+    model::check(fault() == v::AnonymousSwapFaultDisposition::PARK, "first waiter");
+    s::task::Task second;
+    second.pagemap = &roots[0];
+    uint64_t gen = 0;
+    model::check(v::probe_anonymous_swap_fault(&second, VA, p::PageFault{}, true, gen) == v::AnonymousSwapFaultDisposition::PARK &&
+                     model::allocations == 1 && model::captures == 1,
+                 "duplicate joins winner without allocation/context");
+    process();
+    model::check(second.refs == 1 && second.anonymous_swap_wait_mapping == nullptr, "duplicate ref released");
+    close_installed();
+    reset();
+    r = row();
+    model::check(fault() == v::AnonymousSwapFaultDisposition::PARK, "cancel preparation");
+    process(true);
+    model::check(model::live() == 0 && model::reads == 0 && model::slot_frees == 1 && actor.refs == 1 && model::gates == 0,
+                 "cancel before begin returns exact prepared frame");
+    reset(1);
+    r = row();
+    model::check(fault() == v::AnonymousSwapFaultDisposition::PARK, "legacy OOM job");
+    model::fail_alloc = true;
+    process();
+    check_failed_backing(r, -ENOMEM);
+    model::check(v::migrate_anonymous_swap_area(nullptr, 1) == -ENOMEM && model::yields == 0, "migration returns retained FAILED errno");
+    model::check(v::clone_anonymous_swap_mappings(&roots[0], &roots[1]) && r->object->mapping_refs == 2,
+                 "retained FAILED clone shares charged object");
+    v::purge_anonymous_swap_mappings(&roots[0]);
+    model::check(model::slot_frees == 0, "first teardown retains slot");
+    v::purge_anonymous_swap_mappings(&roots[1]);
+    model::check(model::slot_frees == 1, "last clone frees slot");
+    reset();
+    r = row();
+    auto snap = snapshot(r);
+    model::fail_alloc = true;
+    auto c = v::service_anonymous_pagein(snap, context());
+    model::check(c.status == -ENOMEM && !c.retry && !c.retired && !r->pagein_queued && r->state == v::AnonymousSwapRuntimeState::SWAPPED &&
+                     r->object && r->error == 0 && model::gates == 0,
+                 "sync ENOMEM unjoinable and retryable");
+    model::fail_alloc = false;
+    c = v::service_anonymous_pagein(snap, context());
+    model::check(c.status == 0 && !c.retired && !c.retry && model::reads == 1, "sync exact own completion");
+    close_installed();
+    reset();
+    r = row();
+    snap = snapshot(r);
+    auto invalid = context();
+    invalid.policy.mode = static_cast<n::Mode>(255);
+    c = v::service_anonymous_pagein(snap, invalid);
+    model::check(c.status == -EINVAL && model::allocations == 0 && r->object, "invalid context no effects");
+    purge();
+    reset();
+    r = row();
+    snap = snapshot(r);
+    model::allocation_hook = [r] { ++r->generation; };
+    c = v::service_anonymous_pagein(snap, context());
+    model::check(c.status == -EAGAIN && c.retry && model::live() == 0 && !r->pagein_queued, "sync raced candidate exact retry");
+    purge();
+    for (int error : {-EIO, -EILSEQ, -ENOMEM}) {
+        reset();
+        r = row();
+        model::io_error = error;
+        model::check(fault() == v::AnonymousSwapFaultDisposition::PARK, "IO failure job");
+        process();
+        model::check(r->state == v::AnonymousSwapRuntimeState::FAILED && r->error == error && !r->object && model::slot_frees == 1 &&
+                         model::live() == 0,
+                     "completed IO failure old detach semantics");
+        purge();
+    }
+    reset();
+    r = row();
+    r->pagein_allocation = v::AnonymousPageinAllocation::PREPARED;
+    r->pagein_placement_valid = true;
+    r->pagein_placement = context();
+    r->pagein_queued = true;
+    r->pagein_access_gate = ++model::gates;
+    v::AnonymousPageinOperation op;
+    v::begin_anonymous_pagein(r, op);
+    v::finish_anonymous_pagein(op);
+    check_failed_backing(r, -EIO);
+    model::check(model::allocations == 0, "missing prepared never worker fallback");
+    purge();
+    reset();
+    r = row();
+    actor.policy = {2, n::Mode::BIND};
+    model::check(fault() == v::AnonymousSwapFaultDisposition::PARK, "copied BIND winner");
+    actor.policy = {1, n::Mode::BIND};
+    model::cpu = 0;
+    process();
+    model::check(model::blocks.back().physical == model::topology.memory[1].base, "worker cannot recapture foreign policy/CPU");
+    close_installed();
+    reset();
+    r = row();
+    model::allocation_hook = [] { purge(); };
+    model::check(fault() == v::AnonymousSwapFaultDisposition::NOT_TRACKED && model::live() == 0 && model::slot_frees == 1,
+                 "removed row returns candidate without escaped pointer");
+    reset();
+    r = row();
+    snap = snapshot(r);
+    model::allocation_hook = [] { purge(); };
+    c = v::service_anonymous_pagein(snap, context());
+    model::check(c.status == -ECANCELED && c.retired && !c.retry && model::live() == 0, "sync removed row exact retired result");
+    reset(1);
+    r = row();
+    model::check(fault() == v::AnonymousSwapFaultDisposition::PARK, "legacy noio later batch");
+    {
+        ker::mod::mm::reclaim::NoIoScope scope;
+        process();
+    }
+    model::check(model::reclaim_calls == 1 && model::noio == 0 && model::last_alloc_noio == 1,
+                 "legacy NoIo nesting preserved at factory seam");
+    close_installed();
+    reset();
+    r = row();
+    model::check(fault() == v::AnonymousSwapFaultDisposition::PARK, "cancel after begin job");
+    auto* issued = v::anonymous_pagein_dequeue();
+    v::AnonymousPageinOperation cancelled;
+    v::begin_anonymous_pagein(issued, cancelled);
+    model::check(cancelled.should_read, "real issued IO before cancellation");
+    issued->cancelled = true;
+    c = v::finish_anonymous_pagein(cancelled);
+    model::check(
+        c.retired && c.status == -ECANCELED && model::live() == 0 && model::slot_frees == 1 && actor.refs == 1 && model::gates == 0,
+        "cancelled in-flight page exact frame/slot/waiter/gate return");
+    reset();
+    model::check(model::live() == 0 && model::preempt == 0 && model::gates == 0, "final closure");
+    std::printf("PASS actual anonymous pagein cases=%u checks=%u\n", model::cases, model::checks);
+}
+}  // namespace fixture
+STARTUP_TASK_ENDPOINTS
+STARTUP_CASES
+int main(int argc,char**argv) { if(argc==2&&std::strcmp(argv[1],"--post-write-only")==0){fixture::run_postwrite_control();return 0;}fixture::run(); fixture::run_readiness(); }

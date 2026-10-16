@@ -332,7 +332,7 @@ numa_declarations = allocator_header[namespace_start:allocator_header.rindex('} 
 # Only the real owner methods belong to this backing fixture. CPU/context
 # capture is exercised by the actual factory target, not this fixed endpoint.
 numa_methods = allocator[allocator.index('OwnedSpan::~OwnedSpan()'):allocator.index('auto capture_allocation_context(')]
-demand_storage = demand_virt[demand_virt.index('struct DemandContext {'):demand_virt.index('struct DemandCounters {')]
+demand_storage = demand_virt[demand_virt.index('struct DemandContext {'):demand_virt.index('class AnonymousShutdownHoldStorage {')]
 demand_types = '\n'.join(block(virt_header, rf'^enum class {name}[^;]*\{{') + ';'
                          for name in ['DemandOrigin', 'DemandBacking'])
 actual_fault = function(virt, 'handle_lazy_vmem_fault')

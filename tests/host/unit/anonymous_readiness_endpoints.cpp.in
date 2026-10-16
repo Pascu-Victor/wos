@@ -1,0 +1,34 @@
+// Task fields, allocation and scheduler ports are explicit Host endpoints.
+// The Task retain body, shutdown ownership and full destroy function are actual.
+namespace model {
+ker::mod::sched::task::Task* created_task{};
+void* source_frame{};
+unsigned snapshot_mode{};
+}
+namespace ker::mod::sched::task {
+ACTUAL_FULL_DESTROY
+
+auto Task::create_kernel_thread(const char*, void (*entry)()) -> Task* {
+    ++model::created;
+    if (model::fail_create) return nullptr;
+    auto* t = new Task{};
+    t->pagemap = mm::virt::get_kernel_pagemap();
+    t->kthread_entry = entry;
+    t->thread = new Thread{};
+    t->name = new char[8]{};
+    t->context.syscall_scratch_area = reinterpret_cast<uintptr_t>(new cpu::PerCpu{});
+    auto* stack = std::aligned_alloc(4096, mm::KERNEL_STACK_SIZE);
+    model::check(stack != nullptr, "Host kernel-stack endpoint");
+    t->context.syscall_kernel_stack = reinterpret_cast<uint64_t>(stack) + mm::KERNEL_STACK_SIZE;
+    t->has_lazy = t->has_fds = true;
+    model::created_task = current = t;
+    return t;
+}
+auto get_active_task_at_safe_dummy() -> Task* { return nullptr; }
+}
+namespace ker::mod::sched {
+auto get_active_task_at_safe(uint32_t) -> task::Task* {
+    model::check(fixture::actor.try_acquire(), "actual source Task retain");
+    return &fixture::actor;
+}
+}

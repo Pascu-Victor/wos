@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import shutil
@@ -20,7 +21,7 @@ import subprocess
 import tempfile
 import time
 
-
+EXPECTED_TESTS = 40
 OVERALL_SECONDS = 120
 COMMAND_SECONDS = 35
 SCRATCH_BYTES = 128 * 1024 * 1024
@@ -35,16 +36,20 @@ def pin(path: Path) -> dict:
     if identity(before) != identity(after):
         raise RuntimeError(f"input changed while reading: {path}")
     return {
-        "path": str(path), "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
-        "device": after.st_dev, "inode": after.st_ino,
-        "mtime_ns": after.st_mtime_ns, "ctime_ns": after.st_ctime_ns,
+        "path": str(path),
+        "bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "device": after.st_dev,
+        "inode": after.st_ino,
+        "mtime_ns": after.st_mtime_ns,
+        "ctime_ns": after.st_ctime_ns,
     }
 
 
 def bounded(text: str, first: str, last: str) -> str:
     if text.count(first) != 1 or text.count(last) != 1:
         raise RuntimeError(f"actual extraction boundary changed: {first!r}, {last!r}")
-    return text[text.index(first):text.index(last) + len(last)]
+    return text[text.index(first) : text.index(last) + len(last)]
 
 
 def compile_flags(row: dict, overlay: Path | None) -> list[str]:
@@ -67,13 +72,166 @@ def compile_flags(row: dict, overlay: Path | None) -> list[str]:
     return result + ["-fno-strict-aliasing"]
 
 
+class CppText(str):
+    """Unique token sequence replacement tolerates canonical C++ wrapping."""
+
+    @staticmethod
+    def pattern(needle):
+        tokens = re.findall(
+            r'"(?:\\.|[^"\\])*"|//[^\n]*|[A-Za-z_][A-Za-z_0-9]*|0[xX][0-9a-fA-F]+|[0-9]+|::|->|==|!=|>=|<=|&&|\|\||[^\s]',
+            needle,
+        )
+        return r"(?<![A-Za-z_0-9])" + r"\s*".join(re.escape(token) for token in tokens) + r"(?![A-Za-z_0-9])"
+
+    def count(self, needle):
+        return len(re.findall(self.pattern(needle), self))
+
+    def replace(self, needle, replacement):
+        return CppText(re.sub(self.pattern(needle), lambda _: replacement, self))
+
+
+def definition(text: str, anchor: str) -> str:
+    if text.count(anchor) != 1:
+        raise RuntimeError(f"actual definition changed: {anchor}")
+    first = text.index(anchor)
+    body = text.index("{", first)
+    depth = 1
+    end = body + 1
+    while depth:
+        depth += (text[end] == "{") - (text[end] == "}")
+        end += 1
+    if end < len(text) and text[end] == ";":
+        end += 1
+    return text[first:end]
+
+
+def context_overlay(scratch: Path, kernel_file, source_root: Path) -> tuple[Path, str, list[Path], dict]:
+    """Actual guards/Task lease methods; only privileged CPU and backend ports are Host seams."""
+    overlay = scratch / "context-include"
+    sources = {
+        name: kernel_file(name)
+        for name in (
+            "platform/sched/scheduler.hpp",
+            "platform/sched/task.cpp",
+            "platform/sys/syscall_preparation.hpp",
+            "platform/sys/mutex.cpp",
+            "syscalls_impl/vmem/sys_vmem.hpp",
+            "syscalls_impl/vmem/sys_vmem.cpp",
+        )
+    }
+    scheduler = sources["platform/sched/scheduler.hpp"].read_text()
+    guard = definition(scheduler, "struct PreemptGuard {")
+    common = """#pragma once
+#include <atomic>
+#include <cstdint>
+namespace ker::mod::sched::task { struct Task; }
+namespace host_range {
+inline bool interrupts = true, queryable = true, reader_busy = false, exclusive = false;
+inline unsigned yields = 0, tries = 0, unlocks = 0, blocking = 0;
+inline ker::mod::sched::task::Task* current = nullptr;
+inline void (*on_yield)() = nullptr;
+void check_yield_boundary();
+}
+namespace ker::mod::sched {
+void preempt_disable(); void preempt_enable(); auto preempt_count() -> uint32_t;
+inline auto interrupts_enabled() -> bool { return host_range::interrupts; }
+inline auto can_query_current_task() -> bool { return host_range::queryable; }
+inline auto get_current_task() -> task::Task* { return host_range::current; }
+void kern_yield();
+""" + guard + "\n}\n"
+    task = """#pragma once
+#include <atomic>
+#include <cstdint>
+#include <platform/mm/paging.hpp>
+namespace ker::mod::sched::task {
+enum class TaskType { PROCESS, THREAD, DAEMON };
+enum class TaskState { ACTIVE, EXITED };
+// Explicit layout seam: only fields read by actual extracted methods/guards.
+struct Task {
+ TaskType type{TaskType::PROCESS}; std::atomic<TaskState> state{TaskState::ACTIVE};
+ std::atomic<bool> scheduler_transition_active{false}, exit_in_progress{false}, usercopy_pagemap_closing{false};
+ std::atomic<uint32_t> usercopy_pagemap_accesses{0}; uint64_t syscall_account_start_us{1};
+ mm::paging::PageTable* pagemap{};
+ auto try_acquire_usercopy_pagemap(mm::paging::PageTable*&) -> bool;
+ void release_usercopy_pagemap();
+};
+}
+"""
+    preparation = sources["platform/sys/syscall_preparation.hpp"].read_text()
+    count_cli, count_sti = preparation.count('asm volatile("cli" ::: "memory");'), preparation.count(
+        'asm volatile("sti" ::: "memory");'
+    )
+    if (count_cli, count_sti) != (2, 2):
+        raise RuntimeError("privileged preparation endpoints changed")
+    preparation = preparation.replace('asm volatile("cli" ::: "memory");', "host_range::interrupts = false;")
+    preparation = preparation.replace('asm volatile("sti" ::: "memory");', "host_range::interrupts = true;")
+    header = sources["syscalls_impl/vmem/sys_vmem.hpp"].read_text()
+    classes = [
+        definition(header, f"class {name} {{")
+        for name in ("SharedVmemPublicationGuard", "SharedVmemPublicationTryGuard")
+    ]
+    publication = "#pragma once\nnamespace ker::syscall::vmem {\n" + "\n".join(classes) + "\n}\n"
+    for name, text in (
+        ("platform/sched/scheduler.hpp", common),
+        ("platform/sched/task.hpp", task),
+        ("platform/sys/syscall_preparation.hpp", preparation),
+        ("syscalls_impl/vmem/sys_vmem.hpp", publication),
+    ):
+        path = overlay / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    tasks = sources["platform/sched/task.cpp"].read_text()
+    methods = (
+        "namespace ker::mod::sched::task {\n"
+        + "\n".join(
+            definition(tasks, anchor)
+            for anchor in ("auto Task::try_acquire_usercopy_pagemap(", "void Task::release_usercopy_pagemap()")
+        )
+        + "\n}\n"
+    )
+    mutex = sources["platform/sys/mutex.cpp"].read_text()
+    mutex_methods = (
+        "namespace ker::mod::sys {\n"
+        + "\n".join(definition(mutex, anchor) for anchor in ("auto Mutex::try_lock()", "void Mutex::unlock()"))
+        + "\n}\n"
+    )
+    cpp = sources["syscalls_impl/vmem/sys_vmem.cpp"].read_text()
+    constructors = (
+        "namespace ker::syscall::vmem {\n"
+        + "\n".join(
+            definition(cpp, anchor)
+            for anchor in (
+                "SharedVmemPublicationGuard::SharedVmemPublicationGuard()",
+                "SharedVmemPublicationGuard::~SharedVmemPublicationGuard()",
+                "SharedVmemPublicationTryGuard::SharedVmemPublicationTryGuard()",
+                "SharedVmemPublicationTryGuard::~SharedVmemPublicationTryGuard()",
+            )
+        )
+        + "\n}\n"
+    )
+    mapping = {
+        "preempt_guard": guard,
+        "task_methods": methods,
+        "mutex_methods": mutex_methods,
+        "publication_classes": publication,
+        "publication_methods": constructors,
+        "preparation_host_ports": preparation,
+    }
+    return overlay, methods + mutex_methods + constructors, list(sources.values()), mapping
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--host-build", type=Path, required=True,
-                        help="existing configured Host tree containing compile_commands.json and lib/libgtest*.a")
+    parser.add_argument(
+        "--host-build",
+        type=Path,
+        required=True,
+        help="existing configured Host tree containing compile_commands.json and lib/libgtest*.a",
+    )
     parser.add_argument("--source-root", type=Path, default=Path(__file__).resolve().parents[3])
-    parser.add_argument("--kernel-overlay", type=Path,
-                        help="optional explicit staged modules/kern/src include/source overlay")
+    parser.add_argument(
+        "--kernel-overlay", type=Path, help="optional explicit staged modules/kern/src include/source overlay"
+    )
     parser.add_argument("--gtest-main", type=Path)
     parser.add_argument("--gtest", type=Path)
     parser.add_argument("--output", type=Path, help="fresh directory for small logs/results; scratch is always removed")
@@ -88,14 +246,20 @@ def main() -> int:
     scratch = Path(tempfile.mkdtemp(prefix="scratch-", dir=output))
     started = time.monotonic()
     commands: list[dict] = []
+    controls: list[dict] = []
     groups: list[int] = []
     processes: list[subprocess.Popen] = []
     errors: list[str] = []
     selected: list[dict] = []
     emitted: list[dict] = []
-    environment = dict(os.environ, TMPDIR=str(scratch), TMP=str(scratch), TEMP=str(scratch),
-                       ASAN_OPTIONS="detect_leaks=0:halt_on_error=1",
-                       UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1")
+    environment = dict(
+        os.environ,
+        TMPDIR=str(scratch),
+        TMP=str(scratch),
+        TEMP=str(scratch),
+        ASAN_OPTIONS="detect_leaks=0:halt_on_error=1",
+        UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1",
+    )
 
     def kernel_file(relative: str) -> Path:
         staged = overlay / relative if overlay else None
@@ -112,8 +276,9 @@ def main() -> int:
         log = output / f"{label}.log"
         before = time.monotonic()
         with log.open("wb") as stream:
-            process = subprocess.Popen(argv, cwd=root, env=environment, stdout=stream,
-                                       stderr=subprocess.STDOUT, start_new_session=True)
+            process = subprocess.Popen(
+                argv, cwd=root, env=environment, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True
+            )
             groups.append(process.pid)
             processes.append(process)
             try:
@@ -127,11 +292,29 @@ def main() -> int:
             absent = False
         except ProcessLookupError:
             absent = True
-        commands.append({"label": label, "argv": argv, "exit": code,
-                         "seconds": time.monotonic() - before, "leader_reaped": True,
-                         "owned_group_absent": absent, "log": pin(log)})
+        if absent:
+            groups.remove(process.pid)
+        commands.append(
+            {
+                "label": label,
+                "argv": argv,
+                "exit": code,
+                "seconds": time.monotonic() - before,
+                "leader_reaped": True,
+                "owned_group_absent": absent,
+                "log": pin(log),
+            }
+        )
         if not absent or (code == 0) != expected_success:
             raise RuntimeError(f"{label}: unexpected exit {code}")
+
+    saved_signals = {}
+
+    def interrupted(number, _frame):
+        raise KeyboardInterrupt(f"received signal {number}")
+
+    for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        saved_signals[number] = signal.signal(number, interrupted)
 
     try:
         module = kernel_file("platform/mm/managed_huge.cpp")
@@ -141,31 +324,105 @@ def main() -> int:
         fixture = support / "managed_huge_test.cpp"
         prelude = support / "managed_huge_resolver_prelude.inc"
         cases = support / "managed_huge_resolver_cases.inc"
-        libraries = [path.resolve() for path in
-                     [options.gtest_main or host_build / "lib/libgtest_main.a",
-                      options.gtest or host_build / "lib/libgtest.a"]]
-        selected = [pin(path) for path in [Path(__file__), module, factory, virt, header, fixture, prelude, cases, *libraries]]
+        libraries = [
+            path.resolve()
+            for path in [
+                options.gtest_main or host_build / "lib/libgtest_main.a",
+                options.gtest or host_build / "lib/libgtest.a",
+            ]
+        ]
+        selected = [
+            pin(path) for path in [Path(__file__), module, factory, virt, header, fixture, prelude, cases, *libraries]
+        ]
 
         rows = json.loads((host_build / "compile_commands.json").read_text())
-        row = next(item for item in rows if item["file"].endswith("/tests/host/unit/numa_alloc_test.cpp")
-                   and "numa_alloc_test.dir" in item["command"])
+        row = next(
+            item
+            for item in rows
+            if item["file"].endswith("/tests/host/unit/numa_alloc_test.cpp")
+            and "numa_alloc_test.dir" in item["command"]
+        )
         (output / "actual-host-command-row.json").write_text(json.dumps(row, indent=2) + "\n")
+        context, context_methods, context_sources, context_map = context_overlay(scratch, kernel_file, root)
+        selected.extend(pin(path) for path in context_sources)
         flags = compile_flags(row, overlay)
+        flags.insert(1, f"-I{context}")
         selected.append(pin(Path(shutil.which(flags[0]) or flags[0])))
         source = virt.read_text()
         resolver = bounded(source, "// BEGIN managed user-leaf scalar core.", "// END managed user-leaf scalar core.")
-        private = bounded(source, "// BEGIN private managed publication/split.", "// END private managed publication/split.")
-        commit = bounded(source, "auto user_page_pin_commit_write(const UserPagePin& pin) -> bool {",
-                         "void unpin_user_page(UserPagePin& pin) {").rsplit("void unpin_user_page", 1)[0]
+        private = bounded(
+            source, "// BEGIN private managed publication/split.", "// END private managed publication/split."
+        )
+        commit = bounded(
+            source,
+            "auto user_page_pin_commit_write(const UserPagePin& pin) -> bool {",
+            "void unpin_user_page(UserPagePin& pin) {",
+        ).rsplit("void unpin_user_page", 1)[0]
         index = next(line for line in source.splitlines() if line.startswith("auto index_of("))
+        user_pin = definition(header.read_text(), "struct UserPagePin {")
+        exclusive = definition(source, "class UserPagemapExclusiveScope {")
+        epoch = definition(source, "[[gnu::always_inline]] void advance_ps_geometry_epoch_locked(")
+        adapters = "\n".join(
+            definition(source, anchor)
+            for anchor in (
+                "auto acquire_current_range_root(sched::task::Task&",
+                "void release_current_range_root(CurrentRangeRootAccess&",
+                "auto survey_range_chunk(paging::PageTable*",
+                "auto commit_range_split(paging::PageTable*",
+            )
+        )
+        range_cases = support / "managed_huge_range_cases.inc"
+        selected.append(pin(range_cases))
         composite = scratch / "actual-source.cpp"
-        composite.write_text("\n".join([fixture.read_text(), prelude.read_text(), index, resolver, private, commit, cases.read_text()]))
-        segments = {"resolver": resolver, "private": private, "commit": commit, "index": index}
-        (output / "extraction-map.json").write_text(json.dumps({
-            "virt": pin(virt), "header": pin(header), "composite": pin(composite),
-            "segments": [{"name": name, "bytes": len(text.encode()), "sha256": hashlib.sha256(text.encode()).hexdigest()}
-                         for name, text in segments.items()],
-        }, indent=2) + "\n")
+        composite.write_text(
+            "\n".join(
+                [
+                    fixture.read_text(),
+                    prelude.read_text(),
+                    context_methods,
+                    "namespace ker::mod::mm::virt {",
+                    user_pin,
+                    exclusive,
+                    epoch,
+                    index,
+                    resolver,
+                    private,
+                    commit,
+                    "} namespace ker::mod::mm::huge::detail {",
+                    adapters,
+                    "}",
+                    "namespace ker::mod::mm::virt {",
+                    cases.read_text(),
+                    range_cases.read_text(),
+                ]
+            )
+        )
+        segments = {
+            "resolver": resolver,
+            "private": private,
+            "commit": commit,
+            "index": index,
+            "user_pin": user_pin,
+            "exclusive": exclusive,
+            "epoch": epoch,
+            "adapters": adapters,
+            **context_map,
+        }
+        (output / "extraction-map.json").write_text(
+            json.dumps(
+                {
+                    "virt": pin(virt),
+                    "header": pin(header),
+                    "composite": pin(composite),
+                    "segments": [
+                        {"name": name, "bytes": len(text.encode()), "sha256": hashlib.sha256(text.encode()).hexdigest()}
+                        for name, text in segments.items()
+                    ],
+                },
+                indent=2,
+            )
+            + "\n"
+        )
 
         sources = [module, factory, composite]
         dependencies: set[Path] = set()
@@ -189,8 +446,8 @@ def main() -> int:
         binary = link("current", objects)
         run("run-current", [binary, f"--gtest_output=json:{output / 'current.json'}"])
         tests = json.loads((output / "current.json").read_text())
-        if tests["failures"] != 0 or tests["tests"] != 21:
-            raise RuntimeError("actual 21-case suite did not pass")
+        if tests["failures"] != 0 or tests["tests"] != EXPECTED_TESTS:
+            raise RuntimeError("actual range/legacy suite did not pass")
 
         def mutant(label: str, text: str, test: str) -> None:
             path = scratch / f"{label}.cpp"
@@ -198,36 +455,126 @@ def main() -> int:
             obj = scratch / f"{label}.o"
             run(f"compile-{label}", flags + ["-c", path, "-o", obj])
             binary = link(label, [objects[0], objects[1], obj])
+            controls.append({"label": label, "source": pin(path), "object": pin(obj), "binary": pin(binary)})
             run(f"run-{label}", [binary, f"--gtest_filter={test}"], expected_success=False)
+            binary.unlink()
+            obj.unlink()
+            path.unlink()
 
-        actual = composite.read_text()
-        needle = ("if (level != 2 ||\n                managed_huge_registry.lookup_mapped(key, "
-                  "address & ~(huge::LEAF_BYTES - 1), raw, result.managed) != huge::Error::None)")
+        actual = CppText(composite.read_text())
+        needle = (
+            "if (level != 2 ||\n                managed_huge_registry.lookup_mapped(key, "
+            "address & ~(huge::LEAF_BYTES - 1), raw, result.managed) != huge::Error::None)"
+        )
         if actual.count(needle) != 1:
             raise RuntimeError("unknown-PS mutation boundary changed")
-        mutant("unknown-ps-authority", actual.replace(needle, "if (level != 2)"),
-               "ManagedResolver.UnknownTwoMegabyteOneGigabyteAndAbaNeverGrantProvenance")
+        mutant(
+            "unknown-ps-authority",
+            actual.replace(needle, "if (level != 2)"),
+            "ManagedResolver.UnknownTwoMegabyteOneGigabyteAndAbaNeverGrantProvenance",
+        )
 
         needle = "current.mark_dirty();  // CURRENT PS or PML1 slot, never a saved PDE."
         if actual.count(needle) != 1:
             raise RuntimeError("dirty mutation boundary changed")
-        replacement = ("MutableUserEntrySlot stale; if (managed_pml2_slot_locked(pin.pagemap,pin.user_page,stale)"
-                       "==Pml2Walk::Slot) stale.mark_dirty();")
-        mutant("stale-pde-dirty", actual.replace(needle, replacement),
-               "ManagedResolver.ExactCurrentLeafDirtyCommitSurvivesPureSplitWithNoRefChange")
+        replacement = (
+            "MutableUserEntrySlot stale; if (managed_pml2_slot_locked(pin.pagemap,pin.user_page,stale)"
+            "==Pml2Walk::Slot) stale.mark_dirty();"
+        )
+        mutant(
+            "stale-pde-dirty",
+            actual.replace(needle, replacement),
+            "ManagedResolver.ExactCurrentLeafDirtyCommitSurvivesPureSplitWithNoRefChange",
+        )
 
-        needle = ("flush_pagemap_after_update(root, 0, true);\n"
-                  "    // Only this lexical post-real-flush completion returns managed capacity.")
+        needle = "    flush_pagemap_after_update(root, 0, true);\n    for (uint16_t i = 0; i < storage->descriptor_count; ++i) {"
         if actual.count(needle) != 1:
             raise RuntimeError("ACK mutation boundary changed")
-        early = ("for (uint16_t i=0;i<storage->descriptor_count;++i) "
-                 "(void)managed_huge_registry.complete_split_after_ack(storage->descriptors[i].handle);\n    ")
+        early = "    for (uint16_t i=0;i<storage->descriptor_count;++i) (void)managed_huge_registry.complete_split_after_ack(storage->descriptors[i].handle);\n"
         bad = actual.replace(needle, early + needle)
         needle = "managed_huge_registry.complete_split_after_ack(d.handle) != huge::Error::None"
         if bad.count(needle) != 1:
             raise RuntimeError("post-ACK mutation boundary changed")
-        mutant("capacity-before-ack", bad.replace(needle, "false"),
-               "ManagedResolver.ActualPublisherTransfersDataOnceAndCleanupRetainsChargeThroughAck")
+        mutant(
+            "capacity-before-ack",
+            bad.replace(needle, "false"),
+            "ManagedResolver.ActualPublisherTransfersDataOnceAndCleanupRetainsChargeThroughAck",
+        )
+
+        for label, needle, replacement in (
+            (
+                "try-blocks",
+                "acquired_(g_shared_vmem_publication_lock.try_lock())",
+                "acquired_((g_shared_vmem_publication_lock.lock(), true))",
+            ),
+            ("try-forgets-owner", "acquired_(g_shared_vmem_publication_lock.try_lock())", "acquired_(false)"),
+            (
+                "failed-try-unlocks",
+                "if (acquired_) g_shared_vmem_publication_lock.unlock();",
+                "g_shared_vmem_publication_lock.unlock();",
+            ),
+        ):
+            if actual.count(needle) != 1:
+                raise RuntimeError(f"actual try-guard mutation boundary changed: {label}")
+            mutant(
+                label,
+                actual.replace(needle, replacement),
+                "ManagedRange.RealTryGuardContentionNestedFailureAndUnlockOwnership",
+            )
+        needle = "else if (control->ps_geometry_epoch == survey.stamp().epoch) error = Error::None;"
+        if actual.count(needle) != 1:
+            raise RuntimeError("zero proof mutation boundary changed")
+        mutant(
+            "zero-ignores-epoch",
+            actual.replace(needle, "else error = Error::None;"),
+            "ManagedRange.HideRevealAndZeroThenPublicationCannotReuseAnOldProof",
+        )
+        needle = "        // All512 real tracker invocations precede this exact leaf's cap credit."
+        credit = "managed_huge_registry.complete_split_after_ack(d.handle) != huge::Error::None"
+        if actual.count(needle) != 1 or actual.count(credit) != 1:
+            raise RuntimeError("tracker credit mutation boundary changed")
+        early = "        (void)managed_huge_registry.complete_split_after_ack(d.handle);\n"
+        marker = "        for (uint64_t page = 0; page < huge::LEAF_PAGES; ++page)\n            owned_frame_track_fresh_normal_mapping"
+        if actual.count(marker) != 1:
+            raise RuntimeError("tracker loop mutation boundary changed")
+        mutant(
+            "credit-before-tracking",
+            actual.replace(marker, early + marker).replace(credit, "false"),
+            "ManagedResolver.ActualPublisherTransfersDataOnceAndCleanupRetainsChargeThroughAck",
+        )
+
+        needle = "if (!exclusive.owns(root)) return huge::Error::Invalid;"
+        if actual.count(needle) != 1:
+            raise RuntimeError("typed exclusive mutation boundary changed")
+        mutant(
+            "nested-exclusive-reader",
+            actual.replace(
+                needle, needle + " ManagedRootReader nested(root); if (!nested.valid()) return huge::Error::Again;"
+            ),
+            "ManagedRange.HeldOriginalExclusiveCommitsWithoutAcquiringAReader",
+        )
+
+        def module_mutant(label: str, text: str, test: str) -> None:
+            path = scratch / f"{label}.cpp"
+            path.write_text(text)
+            obj = scratch / f"{label}.o"
+            run(f"compile-{label}", flags + ["-iquote", module.parent, "-c", path, "-o", obj])
+            binary = link(label, [obj, objects[1], objects[2]])
+            controls.append({"label": label, "source": pin(path), "object": pin(obj), "binary": pin(binary)})
+            run(f"run-{label}", [binary, f"--gtest_filter={test}"], expected_success=False)
+            binary.unlink()
+            obj.unlink()
+            path.unlink()
+
+        module_text = CppText(module.read_text())
+        needle = "error = pass(target, preparation, unpublished, final, count.count != 0 ? RangeSurveyMode::Verify : RangeSurveyMode::Count, storage);"
+        if module_text.count(needle) != 1:
+            raise RuntimeError("independent final pass mutation boundary changed")
+        module_mutant(
+            "omitted-final-pass",
+            module_text.replace(needle, "{ error = Error::None; final.count = count.count; }"),
+            "ManagedRange.IndependentFinalZeroPassDetectsPublicationAndRebuildsAllDescriptors",
+        )
 
         text = module.read_text()
         needle = "(void)owner.span_.release();"
@@ -238,9 +585,15 @@ def main() -> int:
         obj = scratch / "drop-adopted-data.o"
         run("compile-drop-adopted-data", flags + ["-iquote", module.parent, "-c", bad_module, "-o", obj])
         binary = link("drop-adopted-data", [obj, objects[1], objects[2]])
-        run("run-drop-adopted-data", [binary, "--gtest_filter=ManagedResolver.ActualPublisherTransfersDataOnceAndCleanupRetainsChargeThroughAck"],
-            expected_success=False)
-    except Exception as error:
+        run(
+            "run-drop-adopted-data",
+            [
+                binary,
+                "--gtest_filter=ManagedResolver.ActualPublisherTransfersDataOnceAndCleanupRetainsChargeThroughAck",
+            ],
+            expected_success=False,
+        )
+    except BaseException as error:
         errors.append(str(error))
     finally:
         try:
@@ -251,31 +604,56 @@ def main() -> int:
         except Exception as error:
             selected_after, emitted_after = [], []
             errors.append(f"input resampling: {error}")
-        for group in groups:
+        for group in list(groups):
             try:
                 os.killpg(group, 0)
             except ProcessLookupError:
+                groups.remove(group)
                 continue
             os.killpg(group, signal.SIGKILL)
             errors.append(f"owned group remained after leader reap: {group}")
         for process in processes:
             if process.poll() is None:
                 process.wait(timeout=5)
+        for group in list(groups):
+            try:
+                os.killpg(group, 0)
+            except ProcessLookupError:
+                groups.remove(group)
         removed = allocated_bytes()
-        shutil.rmtree(scratch)
+        if not groups:
+            shutil.rmtree(scratch)
+        else:
+            errors.append(f"unproven owned groups; preserving {scratch}")
+        for number, handler in saved_signals.items():
+            signal.signal(number, handler)
         result = {
-            "qualification": "PASS_ACTUAL_MANAGED_HUGE_HOST_ONLY" if not errors else "FAIL_ACTUAL_MANAGED_HUGE_HOST_ONLY",
-            "errors": errors, "seconds": time.monotonic() - started, "commands": commands,
-            "input_pins": selected, "input_pins_after": selected_after,
-            "emitted_inputs_before": emitted, "emitted_inputs_after": emitted_after,
-            "emitted_input_count": len(emitted), "scratch_removed": not scratch.exists(),
+            "qualification": (
+                "PASS_ACTUAL_MANAGED_HUGE_HOST_ONLY" if not errors else "FAIL_ACTUAL_MANAGED_HUGE_HOST_ONLY"
+            ),
+            "errors": errors,
+            "seconds": time.monotonic() - started,
+            "commands": commands,
+            "compiled_controls": controls,
+            "input_pins": selected,
+            "input_pins_after": selected_after,
+            "emitted_inputs_before": emitted,
+            "emitted_inputs_after": emitted_after,
+            "emitted_input_count": len(emitted),
+            "scratch_removed": not scratch.exists(),
             "scratch_allocated_bytes_removed": removed,
-            "limits": ["Actual C++ source with explicit Host root/PUB/lock/frame/table/flush endpoints.",
-                       "No Native, PMM/buddy, actual TLB ACK, CPL3/SMP, pressure or goal qualification.",
-                       "ASan/UBSan enabled; LSan disabled for the configured Host environment."],
+            "limits": [
+                "Actual C++ source with explicit Host root/PUB/lock/frame/table/flush endpoints.",
+                "No Native, PMM/buddy, actual TLB ACK, CPL3/SMP, pressure or goal qualification.",
+                "ASan/UBSan enabled; LSan disabled for the configured Host environment.",
+            ],
         }
         (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
-        print(json.dumps({"result": str(output / "result.json"), "qualification": result["qualification"], "errors": errors}))
+        print(
+            json.dumps(
+                {"result": str(output / "result.json"), "qualification": result["qualification"], "errors": errors}
+            )
+        )
     return bool(errors)
 
 

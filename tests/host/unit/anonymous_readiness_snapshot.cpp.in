@@ -1,0 +1,30 @@
+// Snapshot is an explicit resident-PTE/ref endpoint. The actual scan and whole
+// pageout transaction execute unchanged, with real OwnedSpan/factory frames.
+namespace readiness_endpoint {
+inline void* source_frame{};
+inline unsigned snapshot_mode{};
+}
+auto snapshot_anonymous_candidate(sched::task::Task* task, uint64_t, AnonymousPageoutCandidate& out)
+    -> AnonymousCandidateDisposition {
+    if (readiness_endpoint::snapshot_mode == 1) return AnonymousCandidateDisposition::NONE;
+    if (readiness_endpoint::snapshot_mode == 2) {
+        readiness_endpoint::snapshot_mode = 1;
+        return AnonymousCandidateDisposition::AGED;
+    }
+    uint64_t const FLAGS = cow_pte_lock.lock_irqsave();
+    auto* entry = leaf_entry(task->pagemap, 0x400000);
+    model::check(entry->present != 0, "real modeled resident source PTE");
+    size_t gate = USER_PAGEMAP_ACCESS_GATE_NONE;
+    model::check(acquire_user_pagemap_access(task->pagemap, false, gate), "source read gate");
+    auto* page = readiness_endpoint::source_frame;
+    phys::page_ref_inc(page);
+    out.pagemap = task->pagemap;
+    out.vaddr = 0x400000;
+    out.frame = page;
+    out.raw = pte_raw(*entry);
+    out.access_gate = gate;
+    out.copied_policy = task->policy;
+    out.source_physical = reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<uint64_t>(page)));
+    cow_pte_lock.unlock_irqrestore(FLAGS);
+    return AnonymousCandidateDisposition::SELECTED;
+}

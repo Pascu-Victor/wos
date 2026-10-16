@@ -3,6 +3,8 @@
 #include <new>
 #include <platform/acpi/numa_boot.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/sys/syscall_preparation.hpp>
+#include <syscalls_impl/vmem/sys_vmem.hpp>
 #include <utility>
 
 namespace ker::mod::mm::huge {
@@ -194,4 +196,176 @@ void detail::PreparationAccess::tables_transferred_after_publish(PreparedTables&
             owner.storage_->tables[i] = nullptr;
         }
 }
+namespace {
+auto range_current_context(sched::task::Task& target, const sys::SyscallPreparationScope& preparation, bool interrupts) noexcept -> bool {
+    return preparation.ready() && sched::can_query_current_task() && sched::get_current_task() == &target &&
+           target.type == sched::task::TaskType::PROCESS &&
+           target.state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE &&
+           !target.scheduler_transition_active.load(std::memory_order_acquire) &&
+           !target.exit_in_progress.load(std::memory_order_acquire) && target.syscall_account_start_us != 0 &&
+           sched::preempt_count() == 0 && sched::interrupts_enabled() == interrupts;
+}
+auto range_tables_valid(const SplitPlanStorage& storage, uint16_t count) noexcept -> bool {
+    constexpr uint64_t FRAME = 0x000ffffffffff000ULL;
+    if (storage.table_count != count || count == 0 || count > MAX_PLAN_TABLES) return false;
+    for (uint16_t i = 0; i < count; ++i) {
+        auto* table = storage.tables[i];
+        if (table == nullptr || (reinterpret_cast<uint64_t>(table) & (PAGE_BYTES - 1)) != 0 ||
+            phys::page_kind_get(table) != PageKind::PAGE_TABLE || phys::page_ref_get(table) != 1 ||
+            (storage.table_physical[i] & ~FRAME) != 0 ||
+            storage.table_physical[i] != reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<uint64_t>(table))))
+            return false;
+        for (uint16_t j = 0; j < i; ++j)
+            if (table == storage.tables[j]) return false;
+    }
+    return true;
+}
+}  // namespace
+struct detail::RangePreparationDriver {
+    static auto pass(sched::task::Task* target, const sys::SyscallPreparationScope* preparation, paging::PageTable* unpublished,
+                     RangeSplitCursor& cursor, RangeSurveyMode mode, SplitPlanStorage* storage) noexcept -> Error {
+        while (!cursor.complete) {
+            if (target != nullptr && (preparation == nullptr || !range_current_context(*target, *preparation, true))) return Error::Invalid;
+            CurrentRangeRootAccess access;
+            Error error = Error::Again;
+            {
+                sched::PreemptGuard preempt;
+                ker::syscall::vmem::SharedVmemPublicationTryGuard publication;
+                if (publication.acquired()) {
+                    if (target == nullptr)
+                        error = survey_range_chunk(unpublished, cursor, mode, storage);
+                    else {
+                        error = acquire_current_range_root(*target, access);
+                        if (error == Error::None) error = survey_range_chunk(access.root, cursor, mode, storage);
+                        // Even a post-acquire identity refusal owns the local lease.
+                        release_current_range_root(access);
+                    }
+                }
+            }
+            // No actual Task/control/PT/PTE/root-reader/PUB/preempt owner remains.
+            if (error != Error::None) return error;
+            if (!cursor.complete && target != nullptr) sched::kern_yield();
+        }
+        return Error::None;
+    }
+    static auto prepare(sched::task::Task* target, const sys::SyscallPreparationScope* preparation, paging::PageTable* unpublished,
+                        uint64_t start, uint64_t end, RangeSplitSurvey& survey, PreparedTables& tables, uint16_t fail_before_table) noexcept
+        -> Error {
+        constexpr uint64_t LIMIT = uint64_t{1} << 47;
+        if (start >= end || end > LIMIT || ((start | end) & (PAGE_BYTES - 1)) != 0 || survey.complete_ ||
+            survey.stamp_.root.incarnation != 0 || !tables.empty() || PreparationAccess::plan_storage(tables) != nullptr)
+            return Error::Invalid;
+        for (unsigned attempt = 0; attempt < 3; ++attempt) {
+            RangeSplitCursor count{};
+            count.start = start;
+            count.end = end;
+            Error error = pass(target, preparation, unpublished, count, RangeSurveyMode::Count, nullptr);
+            if (error != Error::None) {
+                if (error == Error::Again && count.epoch_changed) continue;
+                return error;  // Busy is immediate; no hidden contention retries.
+            }
+            if (count.count != 0) {
+#ifdef WOS_SELFTEST
+                error = PreparationAccess::prepare_tables_for_test(tables, count.count, fail_before_table);
+#else
+                (void)fail_before_table;
+                error = tables.prepare(count.count);
+#endif
+                if (error != Error::None) return error;
+            }
+            auto* storage = PreparationAccess::plan_storage(tables);
+            if (count.count != 0 && (storage == nullptr || !range_tables_valid(*storage, count.count))) {
+                tables.reset();
+                return Error::Invalid;
+            }
+            RangeSplitCursor fill{};
+            fill.stamp = count.stamp;
+            fill.start = start;
+            fill.end = end;
+            error =
+                pass(target, preparation, unpublished, fill, count.count != 0 ? RangeSurveyMode::Fill : RangeSurveyMode::Count, storage);
+            if (error == Error::None && fill.count != count.count) error = Error::Again;
+            if (error == Error::None && storage != nullptr) {
+                constexpr uint64_t PERMISSIONS = paging::PAGE_PRESENT | paging::PAGE_WRITE | paging::PAGE_USER | paging::PAGE_NX;
+                constexpr uint64_t AD = (uint64_t{1} << 5) | (uint64_t{1} << 6);
+                for (uint16_t i = 0; i < count.count; ++i) {
+                    auto const& descriptor = storage->descriptors[i];
+                    auto* words = reinterpret_cast<uint64_t*>(storage->tables[i]);
+                    for (uint64_t page = 0; page < LEAF_PAGES; ++page)
+                        words[page] = (descriptor.key.pa_2m + page * PAGE_BYTES) | (descriptor.semantic_word & PERMISSIONS) | AD;
+                }
+            }
+            // An independent complete final pass is required even for count0.
+            RangeSplitCursor final{};
+            final.stamp = count.stamp;
+            final.start = start;
+            final.end = end;
+            if (error == Error::None)
+                error = pass(target, preparation, unpublished, final, count.count != 0 ? RangeSurveyMode::Verify : RangeSurveyMode::Count,
+                             storage);
+            if (error == Error::None && final.count != count.count) error = Error::Again;
+            if (error != Error::None) {
+                tables.reset();  // All chunk guards ended before actual owner resets.
+                if (error == Error::Again && (fill.epoch_changed || final.epoch_changed)) continue;
+                return error;
+            }
+            if (storage != nullptr) {
+                storage->root = count.stamp.root;
+                storage->geometry_epoch = count.stamp.epoch;
+                storage->start = start;
+                storage->end = end;
+                storage->descriptor_count = count.count;
+                storage->purpose = PlanPurpose::Split;
+                storage->surveyed = true;
+            }
+            survey.stamp_ = count.stamp;
+            survey.start_ = start;
+            survey.end_ = end;
+            survey.count_ = count.count;
+            survey.complete_ = true;
+            return Error::None;
+        }
+        return Error::Again;
+    }
+};
+auto prepare_current_range_split(sched::task::Task& target, const sys::SyscallPreparationScope& preparation, uint64_t start, uint64_t end,
+                                 RangeSplitSurvey& survey, PreparedTables& tables) noexcept -> Error {
+    if (!range_current_context(target, preparation, true)) return Error::Invalid;
+    return detail::RangePreparationDriver::prepare(&target, &preparation, nullptr, start, end, survey, tables, UINT16_MAX);
+}
+auto detail::prepare_unpublished_range_split(paging::PageTable* root, uint64_t start, uint64_t end, RangeSplitSurvey& survey,
+                                             PreparedTables& tables, uint16_t fail_before_table) noexcept -> Error {
+    if (root == nullptr) return Error::Invalid;
+    return RangePreparationDriver::prepare(nullptr, nullptr, root, start, end, survey, tables, fail_before_table);
+}
+CurrentRangeSplitAdmission::CurrentRangeSplitAdmission(sched::task::Task& target, const sys::SyscallPreparationScope& preparation,
+                                                       const ker::syscall::vmem::SharedVmemPublicationTryGuard& publication) noexcept
+    : subject_(&target), preparation_(&preparation), publication_(&publication) {
+    if (!publication.acquired() || !range_current_context(target, preparation, false)) return;
+    detail::CurrentRangeRootAccess access;
+    auto const error = detail::acquire_current_range_root(target, access);
+    // Transfer both successful and partially acquired lifetimes immediately.
+    local_ = access.local;
+    gate_ = access.gate;
+    if (error == Error::None) root_ = access.root;
+}
+CurrentRangeSplitAdmission::~CurrentRangeSplitAdmission() noexcept {
+    detail::CurrentRangeRootAccess access{subject_, root_, gate_, local_};
+    detail::release_current_range_root(access);
+}
+auto CurrentRangeSplitAdmission::validate_split_and_arm(const RangeSplitSurvey& survey, PreparedTables& tables) noexcept -> Error {
+    if (!acquired() || armed_ || !publication_->acquired() || !range_current_context(*subject_, *preparation_, false))
+        return Error::Invalid;
+    auto const error = detail::commit_range_split(root_, survey, tables);
+    if (error != Error::None) return error;
+    start_ = survey.start();
+    end_ = survey.end();
+    armed_ = true;
+    return Error::None;
+}
+auto CurrentRangeSplitAdmission::allows(const sched::task::Task& target, uint64_t start, uint64_t end) const noexcept -> bool {
+    return armed_ && subject_ == &target && root_ != nullptr && root_ == target.pagemap && start_ == start && end_ == end &&
+           publication_->acquired() && range_current_context(*subject_, *preparation_, false);
+}
+
 }  // namespace ker::mod::mm::huge

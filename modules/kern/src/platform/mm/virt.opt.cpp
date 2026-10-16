@@ -150,6 +150,26 @@ class DemandResultStorage {
     numa::AllocationResult* value_;
 };
 
+// This excluded TU prepares the exact returned hold before invoking its
+// instrumented constructor. Keep it before acquiring any candidate owner.
+class AnonymousShutdownHoldStorage {
+   public:
+    AnonymousShutdownHoldStorage() {
+#ifdef WOS_KASAN
+        if (kasan::is_enabled()) kasan::unpoison_range(storage_, sizeof(storage_));
+#endif
+        value_ = ::new (static_cast<void*>(storage_)) sched::KernelShutdownHold(sched::hold_kernel_shutdown());
+    }
+    ~AnonymousShutdownHoldStorage() { value_->~KernelShutdownHold(); }
+    AnonymousShutdownHoldStorage(const AnonymousShutdownHoldStorage&) = delete;
+    auto operator=(const AnonymousShutdownHoldStorage&) -> AnonymousShutdownHoldStorage& = delete;
+
+   private:
+    alignas(sched::KernelShutdownHold) uint8_t storage_[sizeof(sched::KernelShutdownHold)];
+    sched::KernelShutdownHold* value_;
+};
+static_assert(sizeof(sched::KernelShutdownHold) == 8 && alignof(sched::KernelShutdownHold) == 8);
+
 struct DemandCounters {
     std::atomic<uint64_t> candidates{}, allocation_failures{}, discarded{}, promotions{}, installed{};
     std::atomic<uint64_t> anonymous{}, zero_cow{}, private_cow{}, software{}, hardware_user{}, hardware_kernel{};
@@ -322,7 +342,7 @@ constinit huge::RegistryCore managed_huge_registry{};
 // Exact root associations use the same lock as pinned mapping snapshots. Only
 // copied serials escape; queued futexes never retain a control or root reader.
 constexpr size_t USER_ROOT_CONTROL_BUCKET_COUNT = 256;
-constexpr size_t USER_ROOT_CONTROLS_PER_PAGE = 96;
+constexpr size_t USER_ROOT_CONTROLS_PER_PAGE = 84;
 struct UserRootControlChunk;
 struct UserRootControl {
     PageTable* root{};
@@ -330,14 +350,16 @@ struct UserRootControl {
     UserRootControl* hash_next{};
     UserRootControl* free_next{};
     UserRootControlChunk* chunk{};
+    uint64_t ps_geometry_epoch{};  // Pin-locked, sticky saturation; zero only while unattached.
 };
+static_assert(sizeof(UserRootControl) == 48);
 struct UserRootControlChunk {
     UserRootControlChunk* available_next{};
     UserRootControl* free_list{};
     size_t active_count{};
     std::array<UserRootControl, USER_ROOT_CONTROLS_PER_PAGE> controls{};
 };
-static_assert(sizeof(UserRootControlChunk) <= paging::PAGE_SIZE);
+static_assert(sizeof(UserRootControlChunk) == 4056 && sizeof(UserRootControlChunk) <= paging::PAGE_SIZE);
 static_assert((USER_ROOT_CONTROL_BUCKET_COUNT & (USER_ROOT_CONTROL_BUCKET_COUNT - 1)) == 0);
 std::array<UserRootControl*, USER_ROOT_CONTROL_BUCKET_COUNT> user_root_control_buckets{};
 UserRootControlChunk* user_root_control_available{};
@@ -357,6 +379,8 @@ struct AnonymousSwapObject {
     uint32_t mapping_refs{};  // Serialized by cow_pte_lock.
 };
 
+enum class AnonymousPageinAllocation : uint8_t { PREPARED, LEGACY_UMA_WORKER };
+
 struct AnonymousSwapMapping {
     PageTable* pagemap{};
     vaddr_t vaddr{};
@@ -375,6 +399,12 @@ struct AnonymousSwapMapping {
     size_t pagein_access_gate{static_cast<size_t>(-1)};
     sched::task::Task* waiters{};
     AnonymousSwapMapping* next{};
+    // Existing backing authority and winning-demand authority are independent.
+    numa::AllocationContext maintenance_placement{};
+    numa::AllocationContext pagein_placement{};
+    AnonymousPageinAllocation pagein_allocation{AnonymousPageinAllocation::PREPARED};
+    bool maintenance_valid{};
+    bool pagein_placement_valid{};
 };
 
 struct AnonymousSwapAtomicStats {
@@ -409,6 +439,10 @@ std::atomic<uint64_t> anonymous_reclaim_cursor{};
 std::atomic<bool> anonymous_swap_shrinker_registered{};
 std::atomic<bool> anonymous_swap_worker_started{};
 std::atomic<sched::task::Task*> anonymous_swap_worker_task{};
+// COW serializes every admission/publication/close transition. Closed is
+// permanent: a starter may return after its already-posted worker has exited.
+bool anonymous_swap_admission{};
+bool anonymous_swap_service_closed{};
 
 auto find_user_root_control_locked(PageTable* root) -> UserRootControl*;
 auto pte_raw(const paging::PageTableEntry& entry) -> uint64_t;
@@ -591,12 +625,14 @@ void end_user_pagemap_exclusive(size_t gate_index) {
 
 class UserPagemapExclusiveScope {
    public:
-    explicit UserPagemapExclusiveScope(PageTable* pagemap) : gate_index(begin_user_pagemap_exclusive(pagemap)) {}
+    explicit UserPagemapExclusiveScope(PageTable* pagemap) : gate_index(begin_user_pagemap_exclusive(pagemap)), root_(pagemap) {}
+    [[nodiscard]] auto owns(PageTable* root) const noexcept -> bool { return gate_index != USER_PAGEMAP_ACCESS_GATE_NONE && root_ == root; }
     ~UserPagemapExclusiveScope() { finish(); }
     void finish() {
         if (gate_index == USER_PAGEMAP_ACCESS_GATE_NONE) return;
         end_user_pagemap_exclusive(gate_index);
         gate_index = USER_PAGEMAP_ACCESS_GATE_NONE;
+        root_ = nullptr;
     }
 
     UserPagemapExclusiveScope(const UserPagemapExclusiveScope&) = delete;
@@ -606,6 +642,7 @@ class UserPagemapExclusiveScope {
 
    private:
     size_t gate_index;
+    PageTable* root_;
 };
 
 void invalidate_local_tlb_if_current(PageTable* pagemap, vaddr_t vaddr, bool reload_cr3);
@@ -1548,6 +1585,19 @@ auto anonymous_swap_enabled() -> bool {
     return VALUE;
 }
 
+auto anonymous_swap_worker_admitted_locked() -> bool {
+    auto* const WORKER = anonymous_swap_worker_task.load(std::memory_order_acquire);
+    return anonymous_swap_admission && !anonymous_swap_service_closed && !sched::kernel_threads_shutdown_requested() && WORKER != nullptr &&
+           WORKER->state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE;
+}
+
+auto anonymous_swap_worker_admitted() -> bool {
+    uint64_t const FLAGS = cow_pte_lock.lock_irqsave();
+    bool const ADMITTED = anonymous_swap_worker_admitted_locked();
+    cow_pte_lock.unlock_irqrestore(FLAGS);
+    return ADMITTED;
+}
+
 auto next_anonymous_swap_generation() -> uint64_t {
     uint64_t generation = anonymous_swap_generation.fetch_add(1, std::memory_order_relaxed);
     if (generation == 0 || generation == UINT64_MAX) {
@@ -1710,37 +1760,82 @@ void wake_anonymous_swap_waiters(sched::task::Task* waiters) {
     }
 }
 
+struct AnonymousPageinSnapshot {
+    uint64_t root_address{};
+    uint64_t root_serial{};
+    uint64_t generation{};
+    vaddr_t vaddr{};
+};
+
+auto valid_anonymous_placement(const numa::AllocationContext& context) -> bool {
+    auto const* topology = acpi::numa::boot_topology();
+    return topology != nullptr && context.local_node < topology->node_count && numa::valid_policy(context.policy, topology->node_count);
+}
+auto legacy_anonymous_worker(const numa::AllocationContext& context) -> bool {
+    auto const* topology = acpi::numa::boot_topology();
+    return topology != nullptr && topology->node_count == 1 && context.policy.mode == numa::Mode::LOCAL && context.policy.nodes == 0 &&
+           valid_anonymous_placement(context);
+}
+auto anonymous_allocation_error(numa::AllocationError error) -> int {
+    if (error == numa::AllocationError::EXHAUSTED) return -ENOMEM;
+    if (error == numa::AllocationError::NO_TOPOLOGY) return -ENODEV;
+    return -EINVAL;
+}
+auto capture_anonymous_snapshot_locked(const AnonymousSwapMapping& mapping, AnonymousPageinSnapshot& out) -> bool {
+    uint64_t serial = 0;
+    if (!capture_user_root_incarnation(mapping.pagemap, serial)) return false;
+    out = {reinterpret_cast<uint64_t>(mapping.pagemap), serial, mapping.generation, mapping.vaddr};
+    return true;
+}
+auto anonymous_root_matches_locked(const AnonymousPageinSnapshot& snapshot) -> bool {
+    uint64_t serial = 0;
+    return snapshot.root_serial != 0 && capture_user_root_incarnation(reinterpret_cast<PageTable*>(snapshot.root_address), serial) &&
+           serial == snapshot.root_serial;
+}
+
 enum class AnonymousSwapFaultDisposition : uint8_t {
     NOT_TRACKED,
     RESOLVED,
     PARK,
     FAILED,
+    NEEDS_PREPARE,
 };
 
-auto probe_anonymous_swap_fault_locked(sched::task::Task* task, vaddr_t vaddr, const paging::PageFault& fault, uint64_t& wait_generation)
+auto probe_anonymous_swap_fault_locked(sched::task::Task* task, vaddr_t vaddr, const paging::PageFault& fault, bool user_frame,
+                                       uint64_t& wait_generation, AnonymousPageinSnapshot& snapshot,
+                                       const numa::AllocationContext* placement, numa::AllocationResult* prepared,
+                                       AnonymousPageinAllocation allocation, sched::task::Task*& worker_to_wake)
     -> AnonymousSwapFaultDisposition {
-    auto* mapping = find_anonymous_swap_mapping_locked(task->pagemap, vaddr);
-    if (mapping == nullptr) {
-        return AnonymousSwapFaultDisposition::NOT_TRACKED;
-    }
-    if (mapping->state == AnonymousSwapRuntimeState::FAILED || mapping->cancelled || mapping->error < 0) {
+    if (placement != nullptr &&
+        (reinterpret_cast<uint64_t>(task->pagemap) != snapshot.root_address || !anonymous_root_matches_locked(snapshot)))
         return AnonymousSwapFaultDisposition::FAILED;
-    }
-    if (mapping->state == AnonymousSwapRuntimeState::PAGEOUT) {
-        return AnonymousSwapFaultDisposition::RESOLVED;
-    }
+    auto* mapping = find_anonymous_swap_mapping_locked(task->pagemap, vaddr);
+    if (mapping == nullptr) return AnonymousSwapFaultDisposition::NOT_TRACKED;
+    if (mapping->state == AnonymousSwapRuntimeState::FAILED || mapping->cancelled || mapping->error < 0)
+        return AnonymousSwapFaultDisposition::FAILED;
+    if (mapping->state == AnonymousSwapRuntimeState::PAGEOUT) return AnonymousSwapFaultDisposition::RESOLVED;
     bool const WRITABLE = (mapping->original_raw & (paging::PAGE_WRITE | paging::PAGE_COW)) != 0U;
     if ((mapping->original_raw & paging::PAGE_USER) == 0U || (fault.writable != 0U && !WRITABLE) ||
-        (fault.fetch != 0U && (mapping->original_raw & paging::PAGE_NX) != 0U)) {
+        (fault.fetch != 0U && (mapping->original_raw & paging::PAGE_NX) != 0U))
         return AnonymousSwapFaultDisposition::FAILED;
-    }
-
     if (!mapping->pagein_queued) {
-        size_t access_gate = USER_PAGEMAP_ACCESS_GATE_NONE;
-        if (!acquire_user_pagemap_access(mapping->pagemap, false, access_gate)) {
+        if (!anonymous_swap_worker_admitted_locked()) return AnonymousSwapFaultDisposition::FAILED;
+        if (placement == nullptr)
+            return capture_anonymous_snapshot_locked(*mapping, snapshot) ? AnonymousSwapFaultDisposition::NEEDS_PREPARE
+                                                                         : AnonymousSwapFaultDisposition::FAILED;
+        if (mapping->generation != snapshot.generation || mapping->state != AnonymousSwapRuntimeState::SWAPPED ||
+            mapping->object == nullptr)
             return AnonymousSwapFaultDisposition::FAILED;
-        }
+        bool const PREPARED = allocation == AnonymousPageinAllocation::PREPARED;
+        if (PREPARED && (!user_frame || prepared == nullptr || prepared->span.data() == nullptr || prepared->span.pages() != 1))
+            return AnonymousSwapFaultDisposition::FAILED;
+        size_t access_gate = USER_PAGEMAP_ACCESS_GATE_NONE;
+        if (!acquire_user_pagemap_access(mapping->pagemap, false, access_gate)) return AnonymousSwapFaultDisposition::FAILED;
         mapping->generation = next_anonymous_swap_generation();
+        mapping->pagein_placement = *placement;
+        mapping->pagein_placement_valid = true;
+        mapping->pagein_allocation = allocation;
+        mapping->frame = PREPARED ? prepared->span.data() : nullptr;
 #ifdef WOS_SELFTEST
         debt::add(DebtField::SWAP_PAGEINS);
 #endif
@@ -1748,21 +1843,25 @@ auto probe_anonymous_swap_fault_locked(sched::task::Task* task, vaddr_t vaddr, c
         mapping->pagein_access_gate = access_gate;
         if (!anonymous_pagein_enqueue(mapping)) {
             mapping->pagein_queued = false;
+            mapping->pagein_placement_valid = false;
+            mapping->frame = nullptr;
             mapping->pagein_access_gate = USER_PAGEMAP_ACCESS_GATE_NONE;
             release_user_pagemap_access(access_gate);
 #ifdef WOS_SELFTEST
             debt::drop(DebtField::SWAP_PAGEINS);
 #endif
-            mapping->error = -EAGAIN;
             return AnonymousSwapFaultDisposition::FAILED;
         }
+        // The consumer must take COW before touching the prepared frame. It
+        // cannot progress past that lock until this exact owner is released.
+        if (PREPARED) (void)prepared->span.release();
         anonymous_swap_add(anonymous_swap_stats.pagein_attempts);
-        auto* const WORKER = anonymous_swap_worker_task.load(std::memory_order_acquire);
-        if (WORKER != nullptr) {
-            sched::wake_task_from_event(WORKER);
-        }
+        // The module's boot reference makes this scalar safe after unlock,
+        // including shutdown. Canonical RQ wake must not run under COW.
+        worker_to_wake = anonymous_swap_worker_task.load(std::memory_order_acquire);
+    } else if (!user_frame && mapping->pagein_allocation == AnonymousPageinAllocation::PREPARED) {
+        return AnonymousSwapFaultDisposition::FAILED;
     }
-
 #ifdef WOS_SELFTEST
     debt::begin_change();
 #endif
@@ -1787,16 +1886,40 @@ auto probe_anonymous_swap_fault_locked(sched::task::Task* task, vaddr_t vaddr, c
     return AnonymousSwapFaultDisposition::PARK;
 }
 
-auto probe_anonymous_swap_fault(sched::task::Task* task, vaddr_t vaddr, const paging::PageFault& fault, uint64_t& wait_generation)
-    -> AnonymousSwapFaultDisposition {
-    if (task == nullptr || task->pagemap == nullptr) {
-        return AnonymousSwapFaultDisposition::NOT_TRACKED;
-    }
+auto probe_anonymous_swap_fault(sched::task::Task* task, vaddr_t vaddr, const paging::PageFault& fault, bool user_frame,
+                                uint64_t& wait_generation) -> AnonymousSwapFaultDisposition {
+    if (task == nullptr || task->pagemap == nullptr) return AnonymousSwapFaultDisposition::NOT_TRACKED;
     uint64_t const PAGE_VADDR = page_align_down(vaddr);
-    uint64_t const FLAGS = cow_pte_lock.lock_irqsave();
-    auto const RESULT = probe_anonymous_swap_fault_locked(task, PAGE_VADDR, fault, wait_generation);
-    cow_pte_lock.unlock_irqrestore(FLAGS);
-    return RESULT;
+    AnonymousPageinSnapshot snapshot{};
+    sched::task::Task* worker_to_wake = nullptr;
+    uint64_t flags = cow_pte_lock.lock_irqsave();
+    auto disposition = probe_anonymous_swap_fault_locked(task, PAGE_VADDR, fault, user_frame, wait_generation, snapshot, nullptr, nullptr,
+                                                         AnonymousPageinAllocation::PREPARED, worker_to_wake);
+    cow_pte_lock.unlock_irqrestore(flags);
+    if (worker_to_wake != nullptr) sched::wake_task_from_event(worker_to_wake);
+    if (disposition != AnonymousSwapFaultDisposition::NEEDS_PREPARE) return disposition;
+    DemandContextStorage context_storage;
+    auto& context = context_storage.get();
+    if (!capture_demand_context(task, PAGE_VADDR, DemandOrigin::HardwareFault, user_frame, context) ||
+        !valid_anonymous_placement(context.allocation))
+        return AnonymousSwapFaultDisposition::FAILED;
+    bool const LEGACY = legacy_anonymous_worker(context.allocation);
+    if (!LEGACY && !user_frame) return AnonymousSwapFaultDisposition::FAILED;
+    DemandResultStorage prepared_storage;
+    auto& prepared = prepared_storage.get();
+    if (!LEGACY) {
+        numa::try_allocate_pages_into(prepared, context.allocation, 1, paging::PAGE_SIZE, PhysicalPageOwner::USER_PRIVATE_MAPPING,
+                                      phys::PageInitialization::FULL_OVERWRITE, numa::ReclaimMode::NEVER, "anon-swapin");
+        if (prepared.span.empty()) return AnonymousSwapFaultDisposition::FAILED;
+    }
+    flags = cow_pte_lock.lock_irqsave();
+    disposition = probe_anonymous_swap_fault_locked(
+        task, PAGE_VADDR, fault, user_frame, wait_generation, snapshot, &context.allocation, &prepared,
+        LEGACY ? AnonymousPageinAllocation::LEGACY_UMA_WORKER : AnonymousPageinAllocation::PREPARED, worker_to_wake);
+    cow_pte_lock.unlock_irqrestore(flags);
+    if (worker_to_wake != nullptr) sched::wake_task_from_event(worker_to_wake);
+    // Raced, rejected or unused candidates destruct only after COW unlock.
+    return disposition;
 }
 
 // Every window entry owns its access gate, mapping/frame and slot I/O until
@@ -1824,39 +1947,66 @@ void begin_anonymous_pagein(AnonymousSwapMapping* mapping, AnonymousPageinOperat
     operation.generation = 0;
     operation.should_read = false;
     operation.started_us = time::get_us();
-    operation.access_gate = mapping->pagein_access_gate;
-    size_t const ACCESS_GATE = operation.access_gate;
-    bool const ACCESS = ACCESS_GATE != USER_PAGEMAP_ACCESS_GATE_NONE;
-    auto& page = operation.page;
-    auto& generation = operation.generation;
-    auto& should_read = operation.should_read;
-    swap::SwapSlot slot{};
-    if (ACCESS) {
-        page = phys::page_alloc_full_overwrite_page_with_reclaim_may_fail(PhysicalPageOwner::USER_PRIVATE_MAPPING, "anon-swapin");
-    }
+    operation.access_gate = USER_PAGEMAP_ACCESS_GATE_NONE;
+    operation.result = -ECANCELED;
+    DemandContextStorage context_storage;
+    auto& context = context_storage.get().allocation;
+    bool allocate_legacy = false;
     {
         uint64_t const FLAGS = cow_pte_lock.lock_irqsave();
+        // Queue publication alone does not transfer prepared ownership. COW
+        // also joins the producer's typed span release before any field read.
+        operation.access_gate = mapping->pagein_access_gate;
         mapping->pagein_access_gate = USER_PAGEMAP_ACCESS_GATE_NONE;
-        if (ACCESS && page != nullptr && mapping->pagein_queued && !mapping->cancelled &&
-            mapping->state == AnonymousSwapRuntimeState::SWAPPED && mapping->object != nullptr) {
+        operation.generation = mapping->generation;
+        if (mapping->state == AnonymousSwapRuntimeState::SWAPPED && mapping->pagein_queued) {
+            if (mapping->pagein_allocation == AnonymousPageinAllocation::PREPARED) {
+                operation.page = mapping->frame;
+                mapping->frame = nullptr;
+                if (operation.page == nullptr && !mapping->cancelled) operation.result = -EIO;
+            } else if (!mapping->cancelled && mapping->pagein_placement_valid) {
+                context = mapping->pagein_placement;
+                allocate_legacy = true;
+            }
+        }
+        cow_pte_lock.unlock_irqrestore(FLAGS);
+    }
+    bool const ACCESS = operation.access_gate != USER_PAGEMAP_ACCESS_GATE_NONE;
+    if (ACCESS && allocate_legacy) {
+        DemandResultStorage result_storage;
+        auto& result = result_storage.get();
+        // Mode was selected by the initiating actor, never by this worker.
+        numa::try_allocate_pages_into(result, context, 1, paging::PAGE_SIZE, PhysicalPageOwner::USER_PRIVATE_MAPPING,
+                                      phys::PageInitialization::FULL_OVERWRITE, numa::ReclaimMode::LEGACY_UMA, "anon-swapin");
+        operation.page = result.span.release();
+        operation.result = operation.page != nullptr ? -ECANCELED : anonymous_allocation_error(result.error);
+    }
+    swap::SwapSlot slot{};
+    {
+        uint64_t const FLAGS = cow_pte_lock.lock_irqsave();
+        if (ACCESS && operation.page != nullptr && mapping->pagein_queued && !mapping->cancelled &&
+            mapping->generation == operation.generation && mapping->state == AnonymousSwapRuntimeState::SWAPPED &&
+            mapping->object != nullptr) {
             mapping->state = AnonymousSwapRuntimeState::PAGEIN;
-            mapping->frame = page;
+            mapping->frame = operation.page;
             slot = mapping->object->slot;
-            generation = mapping->generation;
-            should_read = true;
+            operation.should_read = true;
             anonymous_swap_stats.swapped_pages.fetch_sub(1, std::memory_order_relaxed);
             anonymous_swap_add(anonymous_swap_stats.pagein_inflight);
         }
         cow_pte_lock.unlock_irqrestore(FLAGS);
     }
-
-    operation.result = page == nullptr ? -ENOMEM : -ECANCELED;
-    if (should_read) {
-        operation.result = swap::submit_slot_io(operation.io, slot, page, false);
-    }
+    if (operation.should_read) operation.result = swap::submit_slot_io(operation.io, slot, operation.page, false);
 }
 
-void finish_anonymous_pagein(AnonymousPageinOperation& operation) {
+struct AnonymousPageinCompletion {
+    int status{};
+    bool retired{};
+    bool retry{};
+};
+static_assert(sizeof(AnonymousPageinCompletion) == 8);
+
+auto finish_anonymous_pagein(AnonymousPageinOperation& operation) -> AnonymousPageinCompletion {
 #ifdef WOS_SELFTEST
     debt::add(DebtField::SWAP_RETURNS);
 #endif
@@ -1927,15 +2077,22 @@ void finish_anonymous_pagein(AnonymousPageinOperation& operation) {
                 remove_anonymous_swap_mapping_locked(mapping);
                 delete_mapping_after = true;
             } else if (mapping->state == AnonymousSwapRuntimeState::SWAPPED) {
-                object_to_release = detach_anonymous_swap_object_locked(mapping);
+                // A legacy allocation miss is terminal for this fault, but is
+                // not corruption of stored bytes. Keep its charged slot until
+                // real unmap/last-clone teardown; no retryable parked failure.
+                mapping->frame = nullptr;
                 mapping->state = AnonymousSwapRuntimeState::FAILED;
                 mapping->error = result < 0 ? result : -EIO;
                 anonymous_swap_stats.swapped_pages.fetch_sub(1, std::memory_order_relaxed);
                 anonymous_swap_add(anonymous_swap_stats.pagein_failures);
             }
         }
+        mapping->pagein_placement_valid = false;
+        mapping->frame = nullptr;
         cow_pte_lock.unlock_irqrestore(FLAGS);
     }
+    AnonymousPageinCompletion const completion{installed ? 0 : (result < 0 ? result : -ECANCELED), delete_mapping_after && !installed,
+                                               false};
 
     if (installed) {
         flush_pagemap_after_update(mapping->pagemap, mapping->vaddr, false);
@@ -1964,23 +2121,83 @@ void finish_anonymous_pagein(AnonymousPageinOperation& operation) {
     debt::drop(DebtField::SWAP_PAGEINS);
     debt::drop(DebtField::SWAP_RETURNS);
 #endif
+    return completion;
 }
 
 // Migration and BSP selftests retain the one-page bridge; only the dedicated
 // worker owns the permanent window above.
-void service_anonymous_pagein(AnonymousSwapMapping* mapping) {
-    if (mapping == nullptr) return;
-    auto const HOLD = sched::hold_kernel_shutdown();
+auto service_anonymous_pagein(const AnonymousPageinSnapshot& snapshot, const numa::AllocationContext& placement)
+    -> AnonymousPageinCompletion {
+    AnonymousShutdownHoldStorage const SHUTDOWN_OWNERSHIP;
+    if (!valid_anonymous_placement(placement) || placement.virtual_page_index != snapshot.vaddr / paging::PAGE_SIZE)
+        return {-EINVAL, false, false};
+    DemandResultStorage prepared_storage;
+    auto& prepared = prepared_storage.get();
+    // No row pointer or root gate escapes the scalar capture while this can
+    // reclaim. A synchronous refusal cannot expose a joinable generation.
+    numa::try_allocate_pages_into(prepared, placement, 1, paging::PAGE_SIZE, PhysicalPageOwner::USER_PRIVATE_MAPPING,
+                                  phys::PageInitialization::FULL_OVERWRITE, numa::ReclaimMode::LEGACY_UMA, "anon-swapin");
+    AnonymousSwapMapping* issued = nullptr;
+    AnonymousPageinCompletion completion{};
+    {
+        uint64_t const FLAGS = cow_pte_lock.lock_irqsave();
+        auto* mapping = anonymous_root_matches_locked(snapshot)
+                            ? find_anonymous_swap_mapping_locked(reinterpret_cast<PageTable*>(snapshot.root_address), snapshot.vaddr)
+                            : nullptr;
+        if (mapping == nullptr || mapping->cancelled) {
+            completion = {-ECANCELED, true, false};
+        } else if (mapping->state == AnonymousSwapRuntimeState::FAILED) {
+            completion = {mapping->error < 0 ? mapping->error : -EIO, false, false};
+        } else if (mapping->generation != snapshot.generation || mapping->pagein_queued ||
+                   mapping->state != AnonymousSwapRuntimeState::SWAPPED) {
+            completion = {-EAGAIN, false, true};
+        } else if (prepared.span.empty()) {
+            completion = {anonymous_allocation_error(prepared.error), false, false};
+        } else {
+            size_t access_gate = USER_PAGEMAP_ACCESS_GATE_NONE;
+            if (!acquire_user_pagemap_access(mapping->pagemap, false, access_gate)) {
+                completion = {-EAGAIN, false, true};
+            } else {
+                mapping->generation = next_anonymous_swap_generation();
+                mapping->pagein_placement = placement;
+                mapping->pagein_placement_valid = true;
+                mapping->pagein_allocation = AnonymousPageinAllocation::PREPARED;
+                mapping->frame = prepared.span.data();
+                mapping->pagein_access_gate = access_gate;
+#ifdef WOS_SELFTEST
+                debt::add(DebtField::SWAP_PAGEINS);
+#endif
+                mapping->pagein_queued = true;
+                (void)prepared.span.release();
+                anonymous_swap_add(anonymous_swap_stats.pagein_attempts);
+                issued = mapping;
+            }
+        }
+        cow_pte_lock.unlock_irqrestore(FLAGS);
+    }
+    if (issued == nullptr) return completion;
     AnonymousPageinOperation operation;
-    begin_anonymous_pagein(mapping, operation);
-    finish_anonymous_pagein(operation);
+    begin_anonymous_pagein(issued, operation);
+    return finish_anonymous_pagein(operation);
 }
 
 [[noreturn]] void anonymous_pagein_worker_main() {
+    auto* const SELF = sched::get_current_task();
+    if (SELF == nullptr || SELF->kthread_entry != anonymous_pagein_worker_main || !SELF->kernel_shutdown_ownership.held()) {
+        dbg::panic_handler("anonymous swap: invalid posted worker drain ownership");
+        __builtin_trap();
+    }
     for (;;) {
+        uint64_t const FLAGS = cow_pte_lock.lock_irqsave();
+        if (sched::kernel_threads_shutdown_requested()) {
+            anonymous_swap_admission = false;
+            anonymous_swap_service_closed = true;
+        }
+        bool const CLOSED = anonymous_swap_service_closed;
+        cow_pte_lock.unlock_irqrestore(FLAGS);
         bool empty = true;
         {
-            auto const HOLD = sched::hold_kernel_shutdown();
+            // The pre-post service hold spans every batch and park edge.
             size_t count = 0;
             while (count < anonymous_pagein_operations.size()) {
                 auto* mapping = anonymous_pagein_dequeue();
@@ -2001,9 +2218,24 @@ void service_anonymous_pagein(AnonymousSwapMapping* mapping) {
             empty = count == 0;
             for (size_t i = 0; i < count; ++i) finish_anonymous_pagein(anonymous_pagein_operations[i]);
         }
-        if (empty) sched::kern_block();
+        if (empty) {
+            if (CLOSED) {
+                // Admission was closed under COW before draining. No producer
+                // can enqueue behind this final empty observation.
+                SELF->kernel_shutdown_ownership.release();
+                sched::exit_current_kernel_thread();
+            }
+            sched::kern_block();
+        }
     }
 }
+
+enum class AnonymousPageoutOrigin : uint8_t {
+    BACKGROUND,
+#ifdef WOS_SELFTEST
+    SYNCHRONOUS_SELFTEST,
+#endif
+};
 
 struct AnonymousPageoutCandidate {
     PageTable* pagemap{};
@@ -2012,7 +2244,17 @@ struct AnonymousPageoutCandidate {
     uint64_t raw{};
     uint64_t prot{};
     size_t access_gate{USER_PAGEMAP_ACCESS_GATE_NONE};
+    numa::Policy copied_policy{};
+    uint64_t source_physical{};
+    AnonymousPageoutOrigin origin{AnonymousPageoutOrigin::BACKGROUND};
 };
+
+auto anonymous_pageout_permitted_locked([[maybe_unused]] const AnonymousPageoutCandidate& candidate) -> bool {
+#ifdef WOS_SELFTEST
+    if (candidate.origin == AnonymousPageoutOrigin::SYNCHRONOUS_SELFTEST) return true;
+#endif
+    return anonymous_swap_worker_admitted_locked();
+}
 
 enum class AnonymousCandidateDisposition : uint8_t {
     NONE,
@@ -2025,6 +2267,9 @@ auto snapshot_anonymous_candidate(sched::task::Task* task, uint64_t cursor, Anon
     if (task == nullptr) {
         return AnonymousCandidateDisposition::NONE;
     }
+    numa::Policy const POLICY = task->memory_policy_snapshot();
+    auto const* topology = acpi::numa::boot_topology();
+    if (topology == nullptr || !numa::valid_policy(POLICY, topology->node_count)) return AnonymousCandidateDisposition::NONE;
     PageTable* const PAGEMAP = task->pagemap;
     size_t access_gate = USER_PAGEMAP_ACCESS_GATE_NONE;
     if (PAGEMAP == nullptr || !acquire_user_pagemap_access(PAGEMAP, false, access_gate) || task->pagemap != PAGEMAP) {
@@ -2088,8 +2333,14 @@ auto snapshot_anonymous_candidate(sched::task::Task* task, uint64_t cursor, Anon
                 debt::add(DebtField::SWAP_PAGEOUTS);
 #endif
                 phys::page_ref_inc(FRAME, &lookup);
-                out = {
-                    .pagemap = PAGEMAP, .vaddr = VADDR, .frame = FRAME, .raw = pte_raw(*entry), .prot = prot, .access_gate = access_gate};
+                out = {.pagemap = PAGEMAP,
+                       .vaddr = VADDR,
+                       .frame = FRAME,
+                       .raw = pte_raw(*entry),
+                       .prot = prot,
+                       .access_gate = access_gate,
+                       .copied_policy = POLICY,
+                       .source_physical = PHYS};
                 selected = true;
             }
         }
@@ -2115,6 +2366,21 @@ auto pageout_anonymous_candidate(AnonymousPageoutCandidate& candidate) -> bool {
     debt::add(DebtField::SWAP_RETURNS);
 #endif
     anonymous_swap_add(anonymous_swap_stats.pageout_attempts);
+    DemandContextStorage maintenance_storage;
+    auto& maintenance = maintenance_storage.get().allocation;
+    maintenance.policy = candidate.copied_policy;
+    maintenance.local_node = numa::physical_node(candidate.source_physical);
+    maintenance.virtual_page_index = candidate.vaddr / paging::PAGE_SIZE;
+    if (!valid_anonymous_placement(maintenance)) {
+        phys::page_ref_dec(candidate.frame);
+        release_user_pagemap_access(candidate.access_gate);
+        anonymous_swap_add(anonymous_swap_stats.pageout_failures);
+#ifdef WOS_SELFTEST
+        debt::drop(DebtField::SWAP_PAGEOUTS);
+        debt::drop(DebtField::SWAP_RETURNS);
+#endif
+        return false;
+    }
 #ifdef WOS_SELFTEST
     auto* object = allocate_swap_descriptor<AnonymousSwapObject>(DebtField::SWAP_OBJECTS);
 #else
@@ -2174,6 +2440,8 @@ auto pageout_anonymous_candidate(AnonymousPageoutCandidate& candidate) -> bool {
     mapping->frame = candidate.frame;
     mapping->original_raw = candidate.raw;
     mapping->generation = next_anonymous_swap_generation();
+    mapping->maintenance_placement = maintenance;
+    mapping->maintenance_valid = true;
 
     bool published = false;
     bool froze_writable_mapping = false;
@@ -2181,7 +2449,7 @@ auto pageout_anonymous_candidate(AnonymousPageoutCandidate& candidate) -> bool {
         uint64_t const FLAGS = cow_pte_lock.lock_irqsave();
         uint64_t const PIN_FLAGS = user_mapping_pin_lock.lock_irqsave();
         PageTableEntry* entry = leaf_entry(candidate.pagemap, candidate.vaddr);
-        if (entry != nullptr && entry->present != 0 &&
+        if (anonymous_pageout_permitted_locked(candidate) && entry != nullptr && entry->present != 0 &&
             (static_cast<uint64_t>(entry->frame) << paging::PAGE_SHIFT) ==
                 reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<uint64_t>(candidate.frame))) &&
             find_anonymous_swap_mapping_locked(candidate.pagemap, candidate.vaddr) == nullptr) {
@@ -2233,7 +2501,8 @@ auto pageout_anonymous_candidate(AnonymousPageoutCandidate& candidate) -> bool {
         bool const SAME_FRAME = entry != nullptr && entry->present != 0 && pte_raw(*entry) == mapping->frozen_raw &&
                                 (static_cast<uint64_t>(entry->frame) << paging::PAGE_SHIFT) ==
                                     reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<uint64_t>(candidate.frame)));
-        if (result == 0 && SAME_FRAME && !mapping->cancelled) {
+        bool const ADMITTED = anonymous_pageout_permitted_locked(candidate);
+        if (result == 0 && SAME_FRAME && !mapping->cancelled && ADMITTED) {
             owned_frame_untrack_leaf(candidate.pagemap, candidate.vaddr, *entry);
             *entry = pte_from_raw(anonymous_swap_marker_raw(mapping->original_raw));
             mapping->state = AnonymousSwapRuntimeState::SWAPPED;
@@ -2242,7 +2511,7 @@ auto pageout_anonymous_candidate(AnonymousPageoutCandidate& candidate) -> bool {
             anonymous_swap_add(anonymous_swap_stats.swapped_pages);
             anonymous_swap_add(anonymous_swap_stats.pageout_successes);
         } else {
-            if (result < 0 && SAME_FRAME && !mapping->cancelled && mapping->frozen_raw != mapping->original_raw) {
+            if ((result < 0 || !ADMITTED) && SAME_FRAME && !mapping->cancelled && mapping->frozen_raw != mapping->original_raw) {
                 *entry = pte_from_raw(mapping->original_raw);
                 restored = true;
             }
@@ -2286,7 +2555,7 @@ auto pageout_anonymous_candidate(AnonymousPageoutCandidate& candidate) -> bool {
 }
 
 auto anonymous_swap_reclaim_count(void* /*context*/, const reclaim::ReclaimRequest& /*request*/) -> reclaim::ReclaimCount {
-    if (!anonymous_swap_enabled()) {
+    if (!anonymous_swap_enabled() || !anonymous_swap_worker_admitted()) {
         return {};
     }
     swap::SwapStats stats{};
@@ -2299,16 +2568,17 @@ auto anonymous_swap_reclaim_count(void* /*context*/, const reclaim::ReclaimReque
 }
 
 auto anonymous_swap_reclaim_scan(void* /*context*/, const reclaim::ReclaimRequest& request) -> reclaim::ReclaimScanResult {
+    AnonymousShutdownHoldStorage const SHUTDOWN_OWNERSHIP;
     uint64_t const PAGE_BUDGET = std::min(request.budget_units, request.target_pages);
     uint64_t const SCAN_BUDGET = request.scan_budget_units;
     reclaim::ReclaimScanResult result{};
     uint32_t const TASK_COUNT = sched::get_active_task_count();
-    if (PAGE_BUDGET == 0 || SCAN_BUDGET == 0 || TASK_COUNT == 0 || !anonymous_swap_enabled()) {
+    if (PAGE_BUDGET == 0 || SCAN_BUDGET == 0 || TASK_COUNT == 0 || !anonymous_swap_enabled() || !anonymous_swap_worker_admitted()) {
         return result;
     }
 
     uint64_t const START = anonymous_reclaim_cursor.fetch_add(SCAN_BUDGET, std::memory_order_relaxed);
-    while (result.scanned < SCAN_BUDGET && result.reclaimed < PAGE_BUDGET) {
+    while (result.scanned < SCAN_BUDGET && result.reclaimed < PAGE_BUDGET && anonymous_swap_worker_admitted()) {
         uint64_t const CURSOR = START + result.scanned;
         auto* task = sched::get_active_task_at_safe(static_cast<uint32_t>(CURSOR % TASK_COUNT));
         ++result.scanned;
@@ -2338,57 +2608,44 @@ auto anonymous_swap_reclaim_scan(void* /*context*/, const reclaim::ReclaimReques
 
 auto migrate_anonymous_swap_area(void* /*context*/, uint32_t area_id) -> int {
     for (;;) {
-        AnonymousSwapMapping* target = nullptr;
-        PageTable* target_pagemap = nullptr;
-        vaddr_t target_vaddr = 0;
-        size_t access_gate = USER_PAGEMAP_ACCESS_GATE_NONE;
+        AnonymousPageinSnapshot snapshot{};
+        DemandContextStorage placement_storage;
+        auto& placement = placement_storage.get().allocation;
+        bool selected = false;
         bool wait_for_inflight = false;
+        int error = 0;
         {
-            uint64_t const COW_FLAGS = cow_pte_lock.lock_irqsave();
+            uint64_t const FLAGS = cow_pte_lock.lock_irqsave();
             for (auto* mapping = anonymous_swap_mappings; mapping != nullptr; mapping = mapping->next) {
-                if (mapping->object == nullptr || mapping->object->slot.area != area_id) {
-                    continue;
+                if (mapping->object == nullptr || mapping->object->slot.area != area_id) continue;
+                // Retained failed backing is charged but cannot make progress.
+                // Return before the non-SWAPPED wait case, never spin forever.
+                if (mapping->state == AnonymousSwapRuntimeState::FAILED) {
+                    error = mapping->error < 0 ? mapping->error : -EIO;
+                    break;
                 }
                 if (mapping->state != AnonymousSwapRuntimeState::SWAPPED || mapping->pagein_queued) {
                     wait_for_inflight = true;
                     break;
                 }
-                if (!acquire_user_pagemap_access(mapping->pagemap, false, access_gate)) {
-                    wait_for_inflight = true;
+                if (!mapping->maintenance_valid || !capture_anonymous_snapshot_locked(*mapping, snapshot)) {
+                    error = -EINVAL;
                     break;
                 }
-                mapping->generation = next_anonymous_swap_generation();
-#ifdef WOS_SELFTEST
-                debt::add(DebtField::SWAP_PAGEINS);
-#endif
-                mapping->pagein_queued = true;
-                mapping->pagein_access_gate = access_gate;
-                anonymous_swap_add(anonymous_swap_stats.pagein_attempts);
-                target = mapping;
-                target_pagemap = mapping->pagemap;
-                target_vaddr = mapping->vaddr;
+                placement = mapping->maintenance_placement;
+                selected = true;
                 break;
             }
-            cow_pte_lock.unlock_irqrestore(COW_FLAGS);
+            cow_pte_lock.unlock_irqrestore(FLAGS);
         }
-
-        if (target != nullptr) {
-            service_anonymous_pagein(target);
-            int error = 0;
-            uint64_t const COW_FLAGS = cow_pte_lock.lock_irqsave();
-            auto* remaining = find_anonymous_swap_mapping_locked(target_pagemap, target_vaddr);
-            if (remaining != nullptr && remaining->state == AnonymousSwapRuntimeState::FAILED) {
-                error = remaining->error < 0 ? remaining->error : -EIO;
-            }
-            cow_pte_lock.unlock_irqrestore(COW_FLAGS);
-            if (error < 0) {
-                return error;
-            }
+        if (error < 0) return error;
+        if (selected) {
+            auto const completion = service_anonymous_pagein(snapshot, placement);
+            if (completion.status < 0 && !completion.retired && !completion.retry) return completion.status;
+            if (completion.retry) sched::kern_yield();
             continue;
         }
-        if (!wait_for_inflight) {
-            return 0;
-        }
+        if (!wait_for_inflight) return 0;
         sched::kern_yield();
     }
 }
@@ -2438,6 +2695,10 @@ auto clone_anonymous_swap_mappings(PageTable* src, PageTable* dst) -> bool {
                 child->next = nullptr;
                 child->pagein_queued = false;
                 child->pagein_access_gate = USER_PAGEMAP_ACCESS_GATE_NONE;
+                child->pagein_placement = {};
+                child->pagein_placement_valid = false;
+                child->pagein_allocation = AnonymousPageinAllocation::PREPARED;
+                child->frame = nullptr;
                 child->cancelled = false;
                 if (child->object != nullptr) {
                     ++child->object->mapping_refs;
@@ -3177,6 +3438,14 @@ auto find_user_root_control_locked(PageTable* root) -> UserRootControl* {
     return nullptr;
 }
 
+// Every reachable user PS semantic/geometry writer holds COW before pin.
+// Saturation invalidates future proofs, never mandatory ownership cleanup.
+[[gnu::always_inline]] void advance_ps_geometry_epoch_locked(PageTable* root) noexcept {
+    auto* control = find_user_root_control_locked(root);
+    if (control == nullptr || control->serial == 0 || control->ps_geometry_epoch == 0) __builtin_trap();
+    if (control->ps_geometry_epoch != UINT64_MAX) ++control->ps_geometry_epoch;
+}
+
 auto next_user_root_serial(uint64_t& last_serial, uint64_t& serial) -> bool {
     if (last_serial == UINT64_MAX) return false;
     serial = ++last_serial;
@@ -3211,6 +3480,7 @@ auto attach_user_root_control_locked(PageTable* root, UserRootControlChunk*& spa
     static_cast<void>(next_user_root_serial(user_root_control_last_serial, serial));
     control->root = root;
     control->serial = serial;
+    control->ps_geometry_epoch = 1;
     control->free_next = nullptr;
     auto& bucket = user_root_control_buckets[user_root_control_bucket(root)];
     control->hash_next = bucket;
@@ -3390,6 +3660,7 @@ auto retire_user_root_control_locked(PageTable* root, UserRootControlChunk*& emp
     *link = control->hash_next;
     control->root = nullptr;
     control->serial = 0;
+    control->ps_geometry_epoch = 0;
     control->hash_next = nullptr;
     control->free_next = chunk->free_list;
     chunk->free_list = control;
@@ -3862,6 +4133,83 @@ auto managed_plan_owners_valid(const huge::SplitPlanStorage& storage) -> bool {
     }
     return true;
 }
+// At most16 steps per call; each step skips an absent ancestor or visits one
+// PML2 slot. A dense lower half can require2^26 steps in TOTAL, not per lock.
+auto survey_managed_range_chunk_locked(PageTable* root, huge::RangeSplitCursor& cursor, huge::RangeSurveyMode mode,
+                                       huge::SplitPlanStorage* storage) noexcept -> huge::Error {
+    constexpr uint64_t LIMIT = uint64_t{1} << 47;
+    constexpr uint64_t PS = uint64_t{1} << 7;
+    constexpr uint64_t PARENT_ALLOWED = PTE_FRAME_MASK | uint64_t{0x7f} | paging::PAGE_NX;
+    if (root == nullptr || root == kernel_pagemap || cursor.start >= cursor.end || cursor.end > LIMIT ||
+        ((cursor.start | cursor.end) & (paging::PAGE_SIZE - 1)) != 0 || cursor.complete ||
+        (mode != huge::RangeSurveyMode::Count && mode != huge::RangeSurveyMode::Fill && mode != huge::RangeSurveyMode::Verify))
+        return huge::Error::Invalid;
+    auto const* control = find_user_root_control_locked(root);
+    if (control == nullptr || control->serial == 0 || control->ps_geometry_epoch == 0) return huge::Error::Stale;
+    if (control->ps_geometry_epoch == UINT64_MAX) return huge::Error::GenerationExhausted;
+    huge::RootKey const key{reinterpret_cast<uint64_t>(root), control->serial};
+    if (cursor.stamp.root.incarnation == 0) cursor.stamp = {key, control->ps_geometry_epoch};
+    if (!huge::RegistryCore::same_root(cursor.stamp.root, key)) return huge::Error::Stale;
+    if (cursor.stamp.epoch != control->ps_geometry_epoch) {
+        cursor.epoch_changed = true;
+        return huge::Error::Again;
+    }
+    uint64_t const FINISH = (cursor.end + huge::LEAF_BYTES - 1) & ~(huge::LEAF_BYTES - 1);
+    if (!cursor.started) {
+        cursor.next = cursor.start & ~(huge::LEAF_BYTES - 1);
+        cursor.started = true;
+    }
+    if (cursor.next < (cursor.start & ~(huge::LEAF_BYTES - 1)) || cursor.next > FINISH || (cursor.next & (huge::LEAF_BYTES - 1)) != 0 ||
+        cursor.count > huge::MAX_ROOT_LEAVES)
+        return huge::Error::Invalid;
+    for (unsigned step = 0; step < 16 && cursor.next < FINISH; ++step) {
+        auto* table = root;
+        bool skipped = false;
+        for (int level = 4; level >= 3; --level) {
+            MutableUserEntrySlot slot;
+            if (!MutableUserEntrySlot::from(table, index_of(cursor.next, level), slot)) return huge::Error::Unsupported;
+            uint64_t const RAW = slot.load();
+            if ((RAW & paging::PAGE_PRESENT) == 0) {
+                if (RAW != 0) return huge::Error::Unsupported;
+                unsigned const SHIFT = level == 4 ? 39U : 30U;
+                uint64_t const NEXT = ((cursor.next >> SHIFT) + 1) << SHIFT;
+                cursor.next = NEXT < FINISH ? NEXT : FINISH;
+                skipped = true;
+                break;
+            }
+            // Reject PML4PS/1GiB and reserved/software encodings BEFORE following
+            // frame bits. USER/W/NX are NOT access filters for geometry.
+            if ((RAW & PS) != 0 || (RAW & ~PARENT_ALLOWED) != 0) return huge::Error::Unsupported;
+            table = reinterpret_cast<PageTable*>(addr::get_virt_pointer(RAW & PTE_FRAME_MASK));
+        }
+        if (skipped) continue;
+        MutableUserEntrySlot slot;
+        if (!MutableUserEntrySlot::from(table, index_of(cursor.next, 2), slot)) return huge::Error::Unsupported;
+        uint64_t const RAW = slot.load();
+        if ((RAW & paging::PAGE_PRESENT) == 0) {
+            if (RAW != 0) return huge::Error::Unsupported;
+        } else if ((RAW & PS) != 0) {
+            huge::MappedLeaf leaf{};
+            if (managed_huge_registry.lookup_mapped(key, cursor.next, RAW, leaf) != huge::Error::None) return huge::Error::Unsupported;
+            if (cursor.count == huge::MAX_ROOT_LEAVES) return huge::Error::Capacity;
+            if (mode != huge::RangeSurveyMode::Count) {
+                if (storage == nullptr || cursor.count >= storage->table_count) return huge::Error::Again;
+                auto& descriptor = storage->descriptors[cursor.count];
+                if (mode == huge::RangeSurveyMode::Fill)
+                    descriptor = {leaf.key, leaf.handle, leaf.semantic_word};
+                else if (!huge::RegistryCore::same_key(descriptor.key, leaf.key) || descriptor.handle.slot != leaf.handle.slot ||
+                         descriptor.handle.generation != leaf.handle.generation || descriptor.semantic_word != leaf.semantic_word)
+                    return huge::Error::Again;
+            }
+            ++cursor.count;
+        } else if ((RAW & ~PARENT_ALLOWED) != 0)
+            return huge::Error::Unsupported;
+        cursor.next += huge::LEAF_BYTES;
+    }
+    cursor.complete = cursor.next == FINISH;
+    return huge::Error::None;
+}
+
 // Existing PUB -> COW -> pin, all outputs already addressable. An exclusive
 // unpublished owner supplies preparation lifetime, not the copied RootKey.
 auto survey_managed_split_locked(huge::RootKey key, uint64_t start, uint64_t end, huge::SplitPlanStorage* storage, uint16_t& count)
@@ -3887,109 +4235,77 @@ auto survey_managed_split_locked(huge::RootKey key, uint64_t start, uint64_t end
     }
     return huge::Error::None;
 }
-// Heap/table allocation and instrumented preparation happen outside every
-// publication/root-reader/MM guard. At most 2 complete EAGAIN retries.
+// Plain proof storage is addressable BEFORE O0 placement construction/callee
+// writes from this excluded TU; no owning hidden return crosses the boundary.
+class RangeSurveyStorage {
+   public:
+    RangeSurveyStorage() {
+#ifdef WOS_KASAN
+        if (kasan::is_enabled()) kasan::unpoison_range(bytes_, sizeof(bytes_));
+#endif
+        value_ = ::new (static_cast<void*>(bytes_)) huge::RangeSplitSurvey{};
+    }
+    auto get() noexcept -> huge::RangeSplitSurvey& { return *value_; }
+
+   private:
+    alignas(huge::RangeSplitSurvey) uint8_t bytes_[sizeof(huge::RangeSplitSurvey)];
+    huge::RangeSplitSurvey* value_;
+};
+// Caller owns the real exclusively unpublished root. Ordinary current-task
+// preparation uses the instrumented current driver, never this raw-root seam.
 [[maybe_unused]] auto prepare_managed_split_plan(PageTable* root, uint64_t start, uint64_t end, huge::PreparedTables& empty
 #ifdef WOS_SELFTEST
                                                  ,
                                                  uint16_t fail_before_table = UINT16_MAX
 #endif
                                                  ) -> huge::Error {
-    if (!empty.empty() || !huge::RegistryCore::valid_va(start) || end <= start || end > (uint64_t{1} << 47) ||
-        (end & (huge::LEAF_BYTES - 1)) != 0)
-        return huge::Error::Invalid;
-    if ((end - start) / huge::LEAF_BYTES > huge::MAX_ROOT_LEAVES) return huge::Error::Unsupported;
-    huge::RootKey key{};
-    if (auto const error = huge::detail::root_key(root, key); error != huge::Error::None) return error;
-    for (unsigned attempt = 0; attempt < 3; ++attempt) {
-        uint16_t required = 0;
-        huge::Error error;
-        {
-            ker::syscall::vmem::SharedVmemPublicationGuard publication;
-            uint64_t const cow = cow_pte_lock.lock_irqsave();
-            uint64_t const pin = user_mapping_pin_lock.lock_irqsave();
-            error = survey_managed_split_locked(key, start, end, nullptr, required);
-            user_mapping_pin_lock.unlock_irqrestore(pin);
-            cow_pte_lock.unlock_irqrestore(cow);
-        }
-        if (error != huge::Error::None) {
-            if (error == huge::Error::Again) continue;
-            return error;
-        }
-        if (required == 0) return huge::Error::None;
-        auto const prepared =
+    RangeSurveyStorage proof;
+    return huge::detail::prepare_unpublished_range_split(root, start, end, proof.get(), empty
 #ifdef WOS_SELFTEST
-            huge::detail::PreparationAccess::prepare_tables_for_test(empty, required, fail_before_table);
-#else
-            empty.prepare(required);
+                                                         ,
+                                                         fail_before_table
 #endif
-        if (prepared != huge::Error::None) return prepared;
-        auto* storage = huge::detail::PreparationAccess::plan_storage(empty);
-        if (storage == nullptr || !managed_plan_owners_valid(*storage)) {
-            empty.reset();
-            return huge::Error::Invalid;
-        }
-        uint16_t actual = 0;
-        {
-            ker::syscall::vmem::SharedVmemPublicationGuard publication;
-            uint64_t const cow = cow_pte_lock.lock_irqsave();
-            uint64_t const pin = user_mapping_pin_lock.lock_irqsave();
-            error = survey_managed_split_locked(key, start, end, storage, actual);
-            user_mapping_pin_lock.unlock_irqrestore(pin);
-            cow_pte_lock.unlock_irqrestore(cow);
-        }
-        if (error == huge::Error::None) {
-            if (actual == 0) {
-                empty.reset();
-                return huge::Error::None;
-            }
-            storage->root = key;
-            storage->start = start;
-            storage->end = end;
-            storage->descriptor_count = actual;
-            storage->purpose = huge::PlanPurpose::Split;
-            storage->surveyed = true;
-            // Private tables are filled before incoming locks. All original
-            // WB anonymous P/W/U/NX semantics survive; A/D are conservative.
-            constexpr uint64_t PERMISSIONS = paging::PAGE_PRESENT | paging::PAGE_WRITE | paging::PAGE_USER | paging::PAGE_NX;
-            constexpr uint64_t AD = (uint64_t{1} << 5) | (uint64_t{1} << 6);
-            for (uint16_t i = 0; i < actual; ++i) {
-                auto const& descriptor = storage->descriptors[i];
-                auto* words = reinterpret_cast<uint64_t*>(storage->tables[i]);
-                for (uint64_t page = 0; page < huge::LEAF_PAGES; ++page)
-                    words[page] = (descriptor.key.pa_2m + page * paging::PAGE_SIZE) | (descriptor.semantic_word & PERMISSIONS) | AD;
-            }
-            return huge::Error::None;
-        }
-        empty.reset();
-        if (error != huge::Error::Again) return error;
-    }
-    return huge::Error::Again;
+    );
 }
-// PUB is actual typed caller authority. The temporary root reader is compatible
-// with already held stable pins; it excludes retirement, not representation.
-[[maybe_unused]] auto commit_managed_split_plan(PageTable* root, huge::PreparedTables& plan,
-                                                const ker::syscall::vmem::SharedVmemPublicationGuard&) -> huge::Error {
+
+// Common scalar publication/ACK completion. Incoming actual root lifetime and
+// PUB (or original exact exclusive) belong to the lexical caller, never a key.
+auto commit_managed_split_owned(PageTable* root, huge::PreparedTables& plan, const huge::RangeSplitSurvey* survey) -> huge::Error {
     auto* storage = huge::detail::PreparationAccess::plan_storage(plan);
-    if (storage == nullptr || storage->purpose != huge::PlanPurpose::Split || !storage->surveyed ||
+    bool const cleanup = storage != nullptr && storage->purpose == huge::PlanPurpose::Cleanup;
+    if (storage == nullptr || (storage->purpose != huge::PlanPurpose::Split && !cleanup) || !storage->surveyed ||
         storage->root.address_bits != reinterpret_cast<uint64_t>(root) || storage->descriptor_count == 0 ||
-        storage->descriptor_count > storage->table_count || !huge::RegistryCore::valid_va(storage->start) ||
-        storage->end <= storage->start || storage->end > (uint64_t{1} << 47) || (storage->end & (huge::LEAF_BYTES - 1)) != 0 ||
-        (storage->end - storage->start) / huge::LEAF_BYTES > huge::MAX_ROOT_LEAVES || !managed_plan_owners_valid(*storage))
+        storage->descriptor_count > storage->table_count || storage->start >= storage->end || storage->end > (uint64_t{1} << 47) ||
+        ((storage->start | storage->end) & (paging::PAGE_SIZE - 1)) != 0 || !managed_plan_owners_valid(*storage))
         return huge::Error::Invalid;
-    ManagedRootReader reader(root);
-    if (!reader.valid()) return huge::Error::Again;
+    if (cleanup && (survey != nullptr || storage->descriptor_count != 1 || storage->table_count != 1 ||
+                    storage->start != storage->descriptors[0].key.va_2m || storage->end - storage->start != huge::LEAF_BYTES))
+        return huge::Error::Invalid;
+    if (survey != nullptr &&
+        (!survey->complete() || survey->count() != storage->descriptor_count ||
+         !huge::RegistryCore::same_root(survey->stamp().root, storage->root) || survey->stamp().epoch != storage->geometry_epoch ||
+         survey->start() != storage->start || survey->end() != storage->end))
+        return huge::Error::Invalid;
     uint64_t const cow = cow_pte_lock.lock_irqsave();
     uint64_t const pin = user_mapping_pin_lock.lock_irqsave();
-    uint16_t actual_count = 0;
-    bool valid = survey_managed_split_locked(storage->root, storage->start, storage->end, nullptr, actual_count) == huge::Error::None &&
-                 actual_count == storage->descriptor_count;
-    // Validate the WHOLE plan before the first actual PTE/index mutation.
+    auto const* control = find_user_root_control_locked(root);
+    bool valid = managed_root_matches_locked(storage->root);
+    huge::Error refusal = huge::Error::Again;
+    if (!cleanup && valid) {
+        if (control->ps_geometry_epoch == UINT64_MAX) {
+            valid = false;
+            refusal = huge::Error::GenerationExhausted;
+        } else
+            valid = storage->geometry_epoch != 0 && storage->geometry_epoch == control->ps_geometry_epoch;
+    }
+    // All <=64 exact descriptors validate BEFORE the first PTE/registry write.
+    // No range traversal here: only the completed nonsaturated epoch proof may
+    // authorize an arbitrary range. Mandatory Cleanup proves only its one leaf.
     for (uint16_t i = 0; valid && i < storage->descriptor_count; ++i) {
         auto const& d = storage->descriptors[i];
         MutableUserEntrySlot slot;
-        valid = huge::RegistryCore::same_root(d.key.root, storage->root) && d.key.va_2m >= storage->start && d.key.va_2m < storage->end &&
-                managed_pml2_slot_locked(root, d.key.va_2m, slot) == Pml2Walk::Slot &&
+        valid = huge::RegistryCore::same_root(d.key.root, storage->root) && d.key.va_2m < storage->end &&
+                d.key.va_2m + huge::LEAF_BYTES > storage->start && managed_pml2_slot_locked(root, d.key.va_2m, slot) == Pml2Walk::Slot &&
                 managed_huge_registry.match_mapped(d.handle, d.key, slot.load()) &&
                 (slot.load() & ~uint64_t{0x60}) == (d.semantic_word & ~uint64_t{0x60});
         if (i != 0 && storage->descriptors[i - 1].key.va_2m >= d.key.va_2m) valid = false;
@@ -3997,7 +4313,7 @@ auto survey_managed_split_locked(huge::RootKey key, uint64_t start, uint64_t end
     if (!valid) {
         user_mapping_pin_lock.unlock_irqrestore(pin);
         cow_pte_lock.unlock_irqrestore(cow);
-        return huge::Error::Again;
+        return refusal;
     }
     for (uint16_t i = 0; i < storage->descriptor_count; ++i) {
         auto const& d = storage->descriptors[i];
@@ -4008,33 +4324,49 @@ auto survey_managed_split_locked(huge::RootKey key, uint64_t start, uint64_t end
         uint64_t const pt = storage->table_physical[i] | paging::PAGE_PRESENT | paging::PAGE_WRITE | paging::PAGE_USER;
         if (!managed_replace_ad_locked(slot, d.semantic_word, pt)) __builtin_trap();
     }
+    advance_ps_geometry_epoch_locked(root);
     user_mapping_pin_lock.unlock_irqrestore(pin);
     cow_pte_lock.unlock_irqrestore(cow);
-    // No return/callback/wait between publication and local ownership transfer.
+    // No return/callback/wait/reset between actual publication and this transfer.
     uint64_t const adopted = storage->descriptor_count == 64 ? UINT64_MAX : (uint64_t{1} << storage->descriptor_count) - 1;
     huge::detail::PreparationAccess::tables_transferred_after_publish(plan, adopted);
     flush_pagemap_after_update(root, 0, true);
-    // Only this lexical post-real-flush completion returns managed capacity.
-    uint64_t const finish_cow = cow_pte_lock.lock_irqsave();
-    uint64_t const finish_pin = user_mapping_pin_lock.lock_irqsave();
-    if (!managed_root_matches_locked(storage->root)) __builtin_trap();
     for (uint16_t i = 0; i < storage->descriptor_count; ++i) {
+        uint64_t const finish_cow = cow_pte_lock.lock_irqsave();
+        uint64_t const finish_pin = user_mapping_pin_lock.lock_irqsave();
         auto const& d = storage->descriptors[i];
         MutableUserEntrySlot current;
         constexpr uint64_t AD = (uint64_t{1} << 5) | (uint64_t{1} << 6);
         uint64_t const expected_pt = storage->table_physical[i] | paging::PAGE_PRESENT | paging::PAGE_WRITE | paging::PAGE_USER;
-        if (managed_pml2_slot_locked(root, d.key.va_2m, current) != Pml2Walk::Slot || (current.load() & ~AD) != expected_pt ||
-            managed_huge_registry.complete_split_after_ack(d.handle) != huge::Error::None)
+        if (!managed_root_matches_locked(storage->root) || managed_pml2_slot_locked(root, d.key.va_2m, current) != Pml2Walk::Slot ||
+            (current.load() & ~AD) != expected_pt)
             __builtin_trap();
         for (uint64_t page = 0; page < huge::LEAF_PAGES; ++page)
             owned_frame_track_fresh_normal_mapping(root, d.key.va_2m + page * paging::PAGE_SIZE, d.key.pa_2m + page * paging::PAGE_SIZE,
                                                    d.semantic_word & ~(uint64_t{1} << 7));
+        // All512 real tracker invocations precede this exact leaf's cap credit.
+        if (managed_huge_registry.complete_split_after_ack(d.handle) != huge::Error::None) __builtin_trap();
+        user_mapping_pin_lock.unlock_irqrestore(finish_pin);
+        cow_pte_lock.unlock_irqrestore(finish_cow);
     }
-    user_mapping_pin_lock.unlock_irqrestore(finish_pin);
-    cow_pte_lock.unlock_irqrestore(finish_cow);
     storage->surveyed = false;
     return huge::Error::None;
 }
+// Private legacy/native caller retains PUB. No public metadata consumer may
+// treat its return as authority; CurrentRangeSplitAdmission is that envelope.
+[[maybe_unused]] auto commit_managed_split_plan(PageTable* root, huge::PreparedTables& plan,
+                                                const ker::syscall::vmem::SharedVmemPublicationGuard&) -> huge::Error {
+    ManagedRootReader reader(root);
+    if (!reader.valid()) return huge::Error::Again;
+    return commit_managed_split_owned(root, plan, nullptr);
+}
+[[maybe_unused]] auto commit_managed_split_plan_exclusive(PageTable* root, const huge::RangeSplitSurvey& survey, huge::PreparedTables& plan,
+                                                          const UserPagemapExclusiveScope& exclusive) -> huge::Error {
+    if (!exclusive.owns(root)) return huge::Error::Invalid;
+    // This actual original exclusive is the lifetime. Never acquire a reader.
+    return huge::detail::commit_range_split(root, survey, plan);
+}
+
 // An already owned cleanup table is filled/bound without allocation before
 // the fixture may leave a published PS behind on ANY later failure path.
 auto bind_preallocated_cleanup_split(PageTable* root, uint64_t va, huge::PreparedTables& cleanup) -> huge::Error {
@@ -4060,7 +4392,8 @@ auto bind_preallocated_cleanup_split(PageTable* root, uint64_t va, huge::Prepare
     storage->end = va + huge::LEAF_BYTES;
     storage->descriptor_count = 1;
     storage->descriptors[0] = {leaf.key, leaf.handle, leaf.semantic_word};
-    storage->purpose = huge::PlanPurpose::Split;
+    storage->purpose = huge::PlanPurpose::Cleanup;
+    storage->geometry_epoch = 0;  // Single-leaf cleanup never grants arbitrary-range authority.
     storage->surveyed = true;
     auto* words = reinterpret_cast<uint64_t*>(storage->tables[0]);
     for (uint64_t page = 0; page < huge::LEAF_PAGES; ++page)
@@ -4155,6 +4488,7 @@ auto bind_preallocated_cleanup_split(PageTable* root, uint64_t va, huge::Prepare
             if (!managed_replace_ad_locked(slots[i], expected[i], desired)) __builtin_trap();
         }
         if (managed_huge_registry.publish_mapped(view.handle, leaf, ps) != huge::Error::None) __builtin_trap();
+        advance_ps_geometry_epoch_locked(root);
         user_mapping_pin_lock.unlock_irqrestore(pin);
         cow_pte_lock.unlock_irqrestore(cow);
         huge::detail::PreparationAccess::span_transferred_after_publish(span);
@@ -5524,16 +5858,21 @@ auto selftest_publish_managed_huge(sched::task::Task& subject, uint64_t va, uint
 }
 auto selftest_prepare_managed_split(sched::task::Task& subject, uint64_t start, uint64_t end, huge::PreparedTables& plan,
                                     const SelftestManagedHugeOptions& options) -> huge::Error {
-    SelftestManagedAccess access(subject);
-    if (access.root() == nullptr) return huge::Error::Invalid;
-    return prepare_managed_split_plan(access.root(), start, end, plan, options.fail_before_table);
+    PageTable* owned = nullptr;
+    {
+        SelftestManagedAccess access(subject);
+        owned = access.root();
+        if (owned == nullptr) return huge::Error::Invalid;
+    }
+    // Caller retains exclusive never-active ownership after the short check.
+    return prepare_managed_split_plan(owned, start, end, plan, options.fail_before_table);
 }
 auto selftest_commit_managed_split(sched::task::Task& subject, huge::PreparedTables& plan, SelftestManagedHugeReport& output)
     -> huge::Error {
-    SelftestManagedAccess access(subject);
-    if (access.root() == nullptr) return huge::Error::Invalid;
     huge::Error error;
     {
+        SelftestManagedAccess access(subject);
+        if (access.root() == nullptr) return huge::Error::Invalid;
         ker::syscall::vmem::SharedVmemPublicationGuard publication;
         error = commit_managed_split_plan(access.root(), plan, publication);
     }
@@ -5549,6 +5888,79 @@ auto selftest_split_managed_huge(sched::task::Task& subject, uint64_t va, huge::
     auto* storage = huge::detail::PreparationAccess::plan_storage(cleanup);
     if (storage == nullptr || storage->start != va || storage->end != va + huge::LEAF_BYTES) return huge::Error::Invalid;
     return selftest_commit_managed_split(subject, cleanup, output);
+}
+
+auto selftest_prepare_complete_managed_split(sched::task::Task& subject, uint64_t start, uint64_t end, huge::RangeSplitSurvey& survey,
+                                             huge::PreparedTables& plan, const SelftestManagedHugeOptions& options) -> huge::Error {
+    PageTable* owned = nullptr;
+    {
+        SelftestManagedAccess access(subject);
+        owned = access.root();
+        if (owned == nullptr) return huge::Error::Invalid;
+    }
+    return huge::detail::prepare_unpublished_range_split(owned, start, end, survey, plan, options.fail_before_table);
+}
+auto selftest_commit_complete_managed_split(sched::task::Task& subject, const huge::RangeSplitSurvey& survey, huge::PreparedTables& plan,
+                                            SelftestManagedHugeReport& output) -> huge::Error {
+    huge::Error error;
+    {
+        SelftestManagedAccess access(subject);
+        if (access.root() == nullptr) return huge::Error::Invalid;
+        ker::syscall::vmem::SharedVmemPublicationGuard publication;
+        ManagedRootReader reader(access.root());
+        error = reader.valid() ? huge::detail::commit_range_split(access.root(), survey, plan) : huge::Error::Again;
+    }
+    if (error == huge::Error::None) {
+        plan.reset();
+        if (survey.count() != 0) {
+            ++output.split;
+            output.actual_full_flush_called = true;
+        }
+    }
+    return error;
+}
+auto selftest_commit_complete_managed_split_exclusive(sched::task::Task& subject, const huge::RangeSplitSurvey& survey,
+                                                      huge::PreparedTables& plan, SelftestManagedHugeReport& output) -> huge::Error {
+    huge::Error error;
+    {
+        SelftestManagedAccess access(subject);
+        if (access.root() == nullptr) return huge::Error::Invalid;
+        ker::syscall::vmem::SharedVmemPublicationGuard publication;
+        UserPagemapExclusiveScope exclusive(access.root());
+        // Exact original exclusive, not a stripe/bool. No nested reader.
+        error = commit_managed_split_plan_exclusive(access.root(), survey, plan, exclusive);
+    }
+    if (error == huge::Error::None) {
+        plan.reset();
+        if (survey.count() != 0) {
+            ++output.split;
+            output.actual_full_flush_called = true;
+        }
+    }
+    return error;
+}
+auto selftest_managed_geometry_stamp(sched::task::Task& subject, huge::GeometryStamp& empty) -> bool {
+    if (empty.root.address_bits != 0 || empty.root.incarnation != 0 || empty.epoch != 0) return false;
+    SelftestManagedAccess access(subject);
+    if (access.root() == nullptr) return false;
+    uint64_t const pin = user_mapping_pin_lock.lock_irqsave();
+    auto const* control = find_user_root_control_locked(access.root());
+    bool const valid = control != nullptr && control->serial != 0 && control->ps_geometry_epoch != 0;
+    if (valid) empty = {{reinterpret_cast<uint64_t>(access.root()), control->serial}, control->ps_geometry_epoch};
+    user_mapping_pin_lock.unlock_irqrestore(pin);
+    return valid;
+}
+auto selftest_saturate_managed_geometry_epoch(sched::task::Task& subject) -> bool {
+    SelftestManagedAccess access(subject);
+    if (access.root() == nullptr) return false;
+    uint64_t const cow = cow_pte_lock.lock_irqsave();
+    uint64_t const pin = user_mapping_pin_lock.lock_irqsave();
+    auto* control = find_user_root_control_locked(access.root());
+    bool const valid = control != nullptr && control->serial != 0 && control->ps_geometry_epoch != 0;
+    if (valid) control->ps_geometry_epoch = UINT64_MAX;
+    user_mapping_pin_lock.unlock_irqrestore(pin);
+    cow_pte_lock.unlock_irqrestore(cow);
+    return valid;
 }
 
 bool selftest_user_pagemap_exclusive_rejects_mapped_pin(PageTable* pagemap) {
@@ -5596,9 +6008,11 @@ auto selftest_exchange_unpublished_user_entry(sched::task::Task& task, PageTable
         return false;
     }
 
+    uint64_t const COW_FLAGS = cow_pte_lock.lock_irqsave();
     uint64_t const LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
     PageTable* table = expected_pagemap;
-    bool valid_path = true;
+    auto const* control = find_user_root_control_locked(expected_pagemap);
+    bool valid_path = level < 2 || (control != nullptr && control->serial != 0 && control->ps_geometry_epoch != 0);
     for (unsigned current = 4; current > level; --current) {
         PageTableEntry& entry = entry_at(table, index_of(vaddr, static_cast<int>(current)));
         if (entry.present == 0 || entry.user == 0 || (current < 4 && entry.pagesize != 0)) {
@@ -5613,9 +6027,11 @@ auto selftest_exchange_unpublished_user_entry(sched::task::Task& task, PageTable
         if (pte_raw(entry) == expected_raw) {
             entry = pte_from_raw(replacement_raw);
             exchanged = true;
+            if (level >= 2) advance_ps_geometry_epoch_locked(expected_pagemap);
         }
     }
     user_mapping_pin_lock.unlock_irqrestore(LOCK_FLAGS);
+    cow_pte_lock.unlock_irqrestore(COW_FLAGS);
     return exchanged;
 }
 #endif
@@ -6452,7 +6868,8 @@ auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, 
     if (PAGEFAULT.present == 0U && control_register < 0x0000800000000000ULL) {
         auto* current_task = sched::get_current_task();
         uint64_t wait_generation = 0;
-        auto const SWAP_FAULT = probe_anonymous_swap_fault(current_task, control_register, PAGEFAULT, wait_generation);
+        auto const SWAP_FAULT =
+            probe_anonymous_swap_fault(current_task, control_register, PAGEFAULT, (frame.cs & 3U) == 3U, wait_generation);
         if (SWAP_FAULT == AnonymousSwapFaultDisposition::PARK) {
             while (current_task->anonymous_swap_completion_generation.load(std::memory_order_acquire) != wait_generation) {
                 auto const WAIT = sched::place_task_in_wait_queue_if_pending(gpr, frame, current_task->anonymous_swap_completion_generation,
@@ -6939,9 +7356,13 @@ bool ensure_user_page_writable(sched::task::Task* task, vaddr_t vaddr) { return 
 bool ensure_user_page_mapped(sched::task::Task* task, vaddr_t vaddr) { return ensure_user_page_mapped_for_task(task, vaddr); }
 
 #ifdef WOS_SELFTEST
-bool selftest_anonymous_swap_pageout(PageTable* pagemap, vaddr_t vaddr) {
+bool selftest_anonymous_swap_pageout(PageTable* pagemap, vaddr_t vaddr, const numa::AllocationContext& placement) {
+    AnonymousShutdownHoldStorage const SHUTDOWN_OWNERSHIP;
     vaddr = page_align_down(vaddr);
+    if (!valid_anonymous_placement(placement) || placement.virtual_page_index != vaddr / paging::PAGE_SIZE) return false;
     AnonymousPageoutCandidate candidate{};
+    candidate.origin = AnonymousPageoutOrigin::SYNCHRONOUS_SELFTEST;
+    candidate.copied_policy = placement.policy;
     if (pagemap == nullptr || !acquire_user_pagemap_access(pagemap, false, candidate.access_gate)) {
         return false;
     }
@@ -6955,6 +7376,7 @@ bool selftest_anonymous_swap_pageout(PageTable* pagemap, vaddr_t vaddr) {
         find_anonymous_swap_mapping_locked(pagemap, vaddr) == nullptr) {
         uint64_t const PHYS = static_cast<uint64_t>(entry->frame) << paging::PAGE_SHIFT;
         candidate.frame = reinterpret_cast<void*>(addr::get_virt_pointer(PHYS));
+        candidate.source_physical = PHYS;
         candidate.raw = pte_raw(*entry);
         debt::add(DebtField::SWAP_PAGEOUTS);
         phys::page_ref_inc(candidate.frame);
@@ -6968,31 +7390,19 @@ bool selftest_anonymous_swap_pageout(PageTable* pagemap, vaddr_t vaddr) {
     return pageout_anonymous_candidate(candidate);
 }
 
-bool selftest_anonymous_swap_pagein(PageTable* pagemap, vaddr_t vaddr) {
+bool selftest_anonymous_swap_pagein(PageTable* pagemap, vaddr_t vaddr, const numa::AllocationContext& placement) {
     vaddr = page_align_down(vaddr);
-    AnonymousSwapMapping* mapping = nullptr;
-    size_t access_gate = USER_PAGEMAP_ACCESS_GATE_NONE;
-    uint64_t const COW_FLAGS = cow_pte_lock.lock_irqsave();
-    mapping = find_anonymous_swap_mapping_locked(pagemap, vaddr);
-    if (mapping != nullptr && mapping->state == AnonymousSwapRuntimeState::SWAPPED && !mapping->pagein_queued &&
-        acquire_user_pagemap_access(pagemap, false, access_gate)) {
-        mapping->generation = next_anonymous_swap_generation();
-#ifdef WOS_SELFTEST
-        debt::add(DebtField::SWAP_PAGEINS);
-#endif
-        mapping->pagein_queued = true;
-        mapping->pagein_access_gate = access_gate;
-        anonymous_swap_add(anonymous_swap_stats.pagein_attempts);
-    } else {
-        mapping = nullptr;
-    }
-    cow_pte_lock.unlock_irqrestore(COW_FLAGS);
-    if (mapping == nullptr) {
-        release_user_pagemap_access(access_gate);
-        return false;
-    }
-    service_anonymous_pagein(mapping);
-    return translate(pagemap, vaddr) != PADDR_INVALID;
+    AnonymousPageinSnapshot snapshot{};
+    bool captured = false;
+    uint64_t const FLAGS = cow_pte_lock.lock_irqsave();
+    auto* mapping = find_anonymous_swap_mapping_locked(pagemap, vaddr);
+    if (mapping != nullptr && mapping->state == AnonymousSwapRuntimeState::SWAPPED && !mapping->pagein_queued)
+        captured = capture_anonymous_snapshot_locked(*mapping, snapshot);
+    cow_pte_lock.unlock_irqrestore(FLAGS);
+    if (!captured) return false;
+    auto const completion = service_anonymous_pagein(snapshot, placement);
+    // Exact operation completion, never a later unrelated PTE as authority.
+    return completion.status == 0 && !completion.retired && !completion.retry;
 }
 
 bool selftest_anonymous_swap_is_swapped(PageTable* pagemap, vaddr_t vaddr) {
@@ -7247,24 +7657,62 @@ void register_anonymous_swap_shrinker() {
 
 void start_anonymous_swap_worker() {
 #ifdef WOS_ASYNC_BLOCK_IO
-    // SMT calls this after scheduler startup even when swap is disabled. Cold
-    // file mappings need their own task-context fault service in every ON boot.
     start_lazy_file_fault_worker();
 #endif
-    if (!anonymous_swap_enabled()) {
-        return;
-    }
+    if (!anonymous_swap_enabled()) return;
     bool expected = false;
-    if (!anonymous_swap_worker_started.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+    if (!anonymous_swap_worker_started.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire))
         return;
-    }
-    auto* worker = sched::task::Task::create_kernel_thread("anon_swapin", anonymous_pagein_worker_main);
-    if (worker == nullptr) {
+    if (sched::kernel_threads_shutdown_requested()) {
         anonymous_swap_worker_started.store(false, std::memory_order_release);
         return;
     }
-    anonymous_swap_worker_task.store(worker, std::memory_order_release);
-    (void)sched::post_task_for_cpu(0, worker);
+    auto* const WORKER = sched::task::Task::create_kernel_thread("anon_swapin", anonymous_pagein_worker_main);
+    if (WORKER == nullptr) {
+        anonymous_swap_worker_started.store(false, std::memory_order_release);
+        return;
+    }
+    // Only the fresh private ref1 may establish this module's lifetime owner.
+    if (WORKER->ref_count.load(std::memory_order_acquire) != 1 ||
+        WORKER->state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE || WORKER->type != sched::task::TaskType::DAEMON ||
+        WORKER->scheduler_published.load(std::memory_order_acquire) || WORKER->kthread_entry != anonymous_pagein_worker_main ||
+        !WORKER->try_acquire() || WORKER->ref_count.load(std::memory_order_acquire) != 2 || WORKER->kernel_shutdown_ownership.held()) {
+        dbg::panic_handler("anonymous swap: invalid private worker lifetime");
+        __builtin_trap();
+    }
+    // Hold before post: the worker may run or observe shutdown immediately.
+    WORKER->kernel_shutdown_ownership.acquire();
+    if (!sched::post_task_for_cpu(0, WORKER)) {
+        if (WORKER->type != sched::task::TaskType::DAEMON || WORKER->kthread_entry != anonymous_pagein_worker_main ||
+            WORKER->state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE ||
+            WORKER->scheduler_published.load(std::memory_order_acquire) || WORKER->gc_queued.load(std::memory_order_acquire) ||
+            WORKER->ref_count.load(std::memory_order_acquire) != 2 || WORKER->heap_index != -1 ||
+            WORKER->sched_queue != decltype(WORKER->sched_queue)::NONE || WORKER->sched_next != nullptr ||
+            WORKER->sched_list_owner.load(std::memory_order_acquire) != nullptr ||
+            WORKER->active_registry_index != sched::task::Task::ACTIVE_REGISTRY_INDEX_INVALID || WORKER->pagemap != get_kernel_pagemap() ||
+            WORKER->usercopy_pagemap_accesses.load(std::memory_order_acquire) != 0 ||
+            WORKER->owned_unpublished_process.load(std::memory_order_acquire) != nullptr ||
+            WORKER->native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr ||
+            !WORKER->kernel_shutdown_ownership.held()) {
+            dbg::panic_handler("anonymous swap: failed post retained unexpected ownership");
+            __builtin_trap();
+        }
+        WORKER->kernel_shutdown_ownership.release();
+        WORKER->release();
+        sched::task::destroy_unpublished_user_thread(WORKER);
+        anonymous_swap_worker_started.store(false, std::memory_order_release);
+        log::warn("cannot publish anonymous swap worker");
+        return;
+    }
+    uint64_t const FLAGS = cow_pte_lock.lock_irqsave();
+    anonymous_swap_worker_task.store(WORKER, std::memory_order_release);
+    // A successfully posted worker can already have closed, drained and
+    // exited. Never reopen its permanent close or read plain scheduler fields.
+    if (!anonymous_swap_service_closed && !sched::kernel_threads_shutdown_requested() &&
+        WORKER->state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE)
+        anonymous_swap_admission = true;
+    cow_pte_lock.unlock_irqrestore(FLAGS);
+    sched::wake_task_from_event(WORKER);
 }
 
 void init_pagemap() {
@@ -8842,6 +9290,7 @@ auto destroy_managed_leaf(PageTable* root, int level, uint64_t va, DestroyManage
         }
         if (valid) {
             if (managed_huge_registry.detach_mapped(candidate.leaf.handle, candidate.leaf.key) != huge::Error::None) __builtin_trap();
+            advance_ps_geometry_epoch_locked(root);
             candidate.active = true;
             output = candidate;
         }
@@ -10056,6 +10505,64 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
 
 // Managed-huge foundation adapters. No PTE publisher or user opt-in exists.
 namespace ker::mod::mm::huge::detail {
+auto acquire_current_range_root(sched::task::Task& subject, CurrentRangeRootAccess& empty) noexcept -> Error {
+    if (empty.subject != nullptr || empty.root != nullptr || empty.local || empty.gate != virt::USER_PAGEMAP_ACCESS_GATE_NONE)
+        return Error::Invalid;
+    if (!sched::can_query_current_task() || sched::get_current_task() != &subject || subject.type != sched::task::TaskType::PROCESS ||
+        subject.state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE || subject.syscall_account_start_us == 0)
+        return Error::Invalid;
+    empty.subject = &subject;
+    empty.local = subject.try_acquire_usercopy_pagemap(empty.root);  // Record successful lease before any later refusal.
+    if (!empty.local) return Error::Again;
+    if (empty.root == nullptr || empty.root != subject.pagemap || empty.root == virt::kernel_pagemap) return Error::Stale;
+    if (!virt::acquire_user_pagemap_access(empty.root, false, empty.gate)) return Error::Again;
+    return Error::None;
+}
+void release_current_range_root(CurrentRangeRootAccess& access) noexcept {
+    virt::release_user_pagemap_access(access.gate);
+    access.gate = virt::USER_PAGEMAP_ACCESS_GATE_NONE;
+    if (access.local) access.subject->release_usercopy_pagemap();
+    access.local = false;
+    access.root = nullptr;
+    access.subject = nullptr;
+}
+auto survey_range_chunk(paging::PageTable* root, RangeSplitCursor& cursor, RangeSurveyMode mode, SplitPlanStorage* storage) noexcept
+    -> Error {
+    uint64_t const cow = virt::cow_pte_lock.lock_irqsave();
+    uint64_t const pin = virt::user_mapping_pin_lock.lock_irqsave();
+    auto const error = virt::survey_managed_range_chunk_locked(root, cursor, mode, storage);
+    virt::user_mapping_pin_lock.unlock_irqrestore(pin);
+    virt::cow_pte_lock.unlock_irqrestore(cow);
+    return error;
+}
+auto commit_range_split(paging::PageTable* root, const RangeSplitSurvey& survey, PreparedTables& plan) noexcept -> Error {
+    if (!survey.complete() || survey.start() >= survey.end() || survey.end() > (uint64_t{1} << 47) ||
+        ((survey.start() | survey.end()) & (PAGE_BYTES - 1)) != 0 || survey.stamp().root.address_bits != reinterpret_cast<uint64_t>(root) ||
+        survey.stamp().root.incarnation == 0 || survey.count() > MAX_ROOT_LEAVES)
+        return Error::Invalid;
+    auto* storage = PreparationAccess::plan_storage(plan);
+    if (survey.count() != 0) {
+        if (storage == nullptr || storage->purpose != PlanPurpose::Split) return Error::Invalid;
+        return virt::commit_managed_split_owned(root, plan, &survey);
+    }
+    // Empty tickets alone prove nothing. The complete independent zero survey
+    // must match the live exact serial+epoch under final actual PUB/root owner.
+    if (!plan.empty() || storage != nullptr) return Error::Invalid;
+    uint64_t const cow = virt::cow_pte_lock.lock_irqsave();
+    uint64_t const pin = virt::user_mapping_pin_lock.lock_irqsave();
+    auto const* control = virt::find_user_root_control_locked(root);
+    Error error = Error::Again;
+    if (control != nullptr && control->serial == survey.stamp().root.incarnation && control->ps_geometry_epoch != 0) {
+        if (control->ps_geometry_epoch == UINT64_MAX)
+            error = Error::GenerationExhausted;
+        else if (control->ps_geometry_epoch == survey.stamp().epoch)
+            error = Error::None;
+    }
+    virt::user_mapping_pin_lock.unlock_irqrestore(pin);
+    virt::cow_pte_lock.unlock_irqrestore(cow);
+    return error;
+}
+
 auto root_key(paging::PageTable* root, RootKey& empty) noexcept -> Error {
     if (root == nullptr || root == virt::kernel_pagemap || empty.address_bits != 0 || empty.incarnation != 0) return Error::Invalid;
     uint64_t const flags = virt::user_mapping_pin_lock.lock_irqsave();

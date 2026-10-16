@@ -1,0 +1,58 @@
+void start_anonymous_swap_worker() {
+#ifdef WOS_ASYNC_BLOCK_IO
+    // SMT calls this after scheduler startup even when swap is disabled. Cold
+    // file mappings need their own task-context fault service in every ON boot.
+    start_lazy_file_fault_worker();
+#endif
+    if (!anonymous_swap_enabled()) {
+        return;
+    }
+    bool expected = false;
+    if (!anonymous_swap_worker_started.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return;
+    }
+    auto* worker = sched::task::Task::create_kernel_thread("anon_swapin", anonymous_pagein_worker_main);
+    if (worker == nullptr) {
+        anonymous_swap_worker_started.store(false, std::memory_order_release);
+        return;
+    }
+    anonymous_swap_worker_task.store(worker, std::memory_order_release);
+    (void)sched::post_task_for_cpu(0, worker);
+}
+auto anonymous_swap_reclaim_scan(void* /*context*/, const reclaim::ReclaimRequest& request) -> reclaim::ReclaimScanResult {
+    uint64_t const PAGE_BUDGET = std::min(request.budget_units, request.target_pages);
+    uint64_t const SCAN_BUDGET = request.scan_budget_units;
+    reclaim::ReclaimScanResult result{};
+    uint32_t const TASK_COUNT = sched::get_active_task_count();
+    if (PAGE_BUDGET == 0 || SCAN_BUDGET == 0 || TASK_COUNT == 0 || !anonymous_swap_enabled()) {
+        return result;
+    }
+
+    uint64_t const START = anonymous_reclaim_cursor.fetch_add(SCAN_BUDGET, std::memory_order_relaxed);
+    while (result.scanned < SCAN_BUDGET && result.reclaimed < PAGE_BUDGET) {
+        uint64_t const CURSOR = START + result.scanned;
+        auto* task = sched::get_active_task_at_safe(static_cast<uint32_t>(CURSOR % TASK_COUNT));
+        ++result.scanned;
+        if (task == nullptr) {
+            continue;
+        }
+        AnonymousPageoutCandidate candidate{};
+        auto disposition = snapshot_anonymous_candidate(task, CURSOR / TASK_COUNT, candidate);
+        if (disposition == AnonymousCandidateDisposition::AGED) {
+            // Give the owner a scheduling opportunity after the TLB flush. A
+            // hot page sets Accessed again and receives another chance; a cold
+            // page remains clear and can be selected on this bounded revisit.
+            sched::kern_yield();
+            disposition = snapshot_anonymous_candidate(task, CURSOR / TASK_COUNT, candidate);
+        }
+        task->release();
+        if (disposition == AnonymousCandidateDisposition::SELECTED) {
+            anonymous_swap_add(anonymous_swap_stats.resident_candidates);
+            if (pageout_anonymous_candidate(candidate)) {
+                ++result.reclaimed;
+            }
+        }
+    }
+    result.has_more = swap::swap_available();
+    return result;
+}

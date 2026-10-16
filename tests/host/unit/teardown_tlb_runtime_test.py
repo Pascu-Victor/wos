@@ -222,7 +222,7 @@ struct UserPagemapExclusiveScope {
 void purge_anonymous_swap_mappings(PageTable*) {}
 void owned_frame_purge_pagemap(PageTable*) {}
 namespace file_mapping { struct FileMappingTlbRetirement { void release_after_completed_tlb() {} }; }
-struct RootControl { uint64_t serial{}; };
+struct RootControl { uint64_t serial{}; uint64_t ps_geometry_epoch{1}; };
 auto find_user_root_control_locked(PageTable* root) -> RootControl* {
     static RootControl control;
     if(root!=expected_root || root==nullptr) return nullptr;
@@ -338,6 +338,7 @@ def generate(source):
     out.append(extract(source, "enum class Pml2Walk", True))
     out.append(extract(source, "auto managed_pml2_slot_locked("))
     out.append(extract(source, "auto managed_root_matches_locked("))
+    out.append(extract(source, "[[gnu::always_inline]] void advance_ps_geometry_epoch_locked("))
     for token in ["void note_destroy_refdec_batch_stats(DestroyUserSpaceCallStats* stats, phys::PageRefBatchStats const& batch_stats,",
                   "void destroy_refdec_batch_flush(",
                   "class DestroyManagedCursorStorage {", "void destroy_refdec_batch_append(", "auto destroy_managed_leaf(",

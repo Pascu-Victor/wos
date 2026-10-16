@@ -513,13 +513,20 @@ KTEST(PrivateWritePromotion, SuccessfulSwapPreservesReadAndNone) {
         KREQUIRE_TRUE(parent.init());
         KREQUIRE_TRUE(child.init());
         KREQUIRE_NE(parent.map(paging::page_types::USER), nullptr);
-        KREQUIRE_TRUE(virt::selftest_anonymous_swap_pageout(parent.root, VA));
+        mm::numa::AllocationContext parent_placement{};
+        mm::numa::AllocationContext child_placement{};
+        KREQUIRE_EQ(mm::numa::capture_allocation_context(parent.subject->memory_policy_snapshot(), parent_placement),
+                    mm::numa::AllocationError::NONE);
+        KREQUIRE_EQ(mm::numa::capture_allocation_context(child.subject->memory_policy_snapshot(), child_placement),
+                    mm::numa::AllocationError::NONE);
+        parent_placement.virtual_page_index = child_placement.virtual_page_index = VA / PAGE;
+        KREQUIRE_TRUE(virt::selftest_anonymous_swap_pageout(parent.root, VA, parent_placement));
         KREQUIRE_TRUE(clone(parent, child));
         uint64_t const flags = none ? (paging::PAGE_PRESENT | paging::PAGE_NX) : paging::page_types::USER_READONLY;
         KREQUIRE_TRUE(virt::protect_anonymous_swap_page(parent.root, VA, flags));
         KREQUIRE_TRUE(virt::protect_anonymous_swap_page(child.root, VA, flags));
-        KREQUIRE_TRUE(virt::selftest_anonymous_swap_pagein(parent.root, VA));
-        KREQUIRE_TRUE(virt::selftest_anonymous_swap_pagein(child.root, VA));
+        KREQUIRE_TRUE(virt::selftest_anonymous_swap_pagein(parent.root, VA, parent_placement));
+        KREQUIRE_TRUE(virt::selftest_anonymous_swap_pagein(child.root, VA, child_placement));
         auto* p = frame(parent.root);
         auto* c = frame(child.root);
         KREQUIRE_NE(p, nullptr);

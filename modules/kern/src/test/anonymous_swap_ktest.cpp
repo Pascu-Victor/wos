@@ -10,8 +10,10 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <platform/acpi/numa_boot.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/numa_alloc.hpp>
 #include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/swap.hpp>
@@ -28,10 +30,18 @@ namespace paging = ker::mod::mm::paging;
 namespace phys = ker::mod::mm::phys;
 namespace swap = ker::mod::mm::swap;
 namespace virt = ker::mod::mm::virt;
+namespace numa = ker::mod::mm::numa;
 namespace usercopy = ker::mod::sys::usercopy;
 
 constexpr uint64_t TEST_VADDR = 0x5A000000ULL;
 constexpr uint64_t SWAP_PAGES = 16;
+// Root-only native calls supply an explicit valid copied context before gates.
+auto capture_test_swap_context(numa::AllocationContext& output) -> bool {
+    if (numa::capture_allocation_context(numa::Policy{}, output) != numa::AllocationError::NONE) return false;
+    output.virtual_page_index = TEST_VADDR / paging::PAGE_SIZE;
+    return true;
+}
+
 using PageBytes = std::array<uint8_t, paging::PAGE_SIZE>;
 
 auto make_storage() -> std::unique_ptr<ker::test::FaultBlockDevice> {
@@ -127,6 +137,7 @@ class TrackedSwapFixture {
     auto operator=(const TrackedSwapFixture&) -> TrackedSwapFixture& = delete;
 
     auto init() -> bool {
+        if (!capture_test_swap_context(placement_)) return false;
         storage_ = make_storage();
         if (storage_ == nullptr || !storage_->valid() || activate_storage(*storage_, name_) != 0) return false;
         active_ = true;
@@ -159,7 +170,7 @@ class TrackedSwapFixture {
         auto* bytes = const_cast<uint8_t*>(mapped_bytes(root_));
         if (bytes == nullptr) return false;
         for (size_t i = 0; i < paging::PAGE_SIZE; ++i) bytes[i] = pattern_byte(i);
-        if (!virt::selftest_anonymous_swap_pageout(root_, TEST_VADDR)) return false;
+        if (!virt::selftest_anonymous_swap_pageout(root_, TEST_VADDR, placement_)) return false;
         marker_ = owned_leaf_raw(root_);
         if ((marker_ & paging::PAGE_PRESENT) != 0 || (marker_ & paging::PAGE_RESERVED) == 0) return false;
         swap::get_stats(&slots_swapped_);
@@ -199,8 +210,9 @@ class TrackedSwapFixture {
         KEXPECT_EQ(virt::selftest_user_pagemap_reader_count(root_), 0U);
     }
 
-    auto recover_pattern() -> bool {
-        if (!virt::selftest_anonymous_swap_pagein(root_, TEST_VADDR)) return false;
+    auto recover_pattern() -> bool { return recover_pattern(placement_); }
+    auto recover_pattern(const numa::AllocationContext& placement) -> bool {
+        if (!virt::selftest_anonymous_swap_pagein(root_, TEST_VADDR, placement)) return false;
         auto const* bytes = mapped_bytes(root_);
         if (bytes == nullptr) return false;
         for (size_t i = 0; i < paging::PAGE_SIZE; ++i)
@@ -214,7 +226,16 @@ class TrackedSwapFixture {
         return true;
     }
 
+    auto pagein_with(const numa::AllocationContext& placement) -> bool {
+        return virt::selftest_anonymous_swap_pagein(root_, TEST_VADDR, placement);
+    }
+    auto resident_node() -> numa::NodeId {
+        auto const physical = virt::translate(root_, TEST_VADDR);
+        return physical == virt::PADDR_INVALID ? numa::INVALID_NODE : numa::physical_node(physical);
+    }
+
    private:
+    numa::AllocationContext placement_{};
     const char* name_;
     phys::PhysicalOwnerSnapshot owner_before_{};
     swap::SwapStats slots_before_{};
@@ -232,6 +253,8 @@ class TrackedSwapFixture {
 }  // namespace
 
 KTEST(AnonymousSwap, RealPageoutPageinPreservesDataAndAccounting) {
+    numa::AllocationContext placement{};
+    KREQUIRE_TRUE(capture_test_swap_context(placement));
     constexpr const char* NAME = "ktest-anon-swap-roundtrip";
     auto storage = make_storage();
     KREQUIRE_NE(storage.get(), nullptr);
@@ -241,13 +264,13 @@ KTEST(AnonymousSwap, RealPageoutPageinPreservesDataAndAccounting) {
     auto* pagemap = virt::create_pagemap();
     KREQUIRE_NE(pagemap, nullptr);
     KREQUIRE_TRUE(map_pattern_page(pagemap, 0xA6));
-    KREQUIRE_TRUE(virt::selftest_anonymous_swap_pageout(pagemap, TEST_VADDR));
+    KREQUIRE_TRUE(virt::selftest_anonymous_swap_pageout(pagemap, TEST_VADDR, placement));
     KEXPECT_TRUE(virt::selftest_anonymous_swap_is_swapped(pagemap, TEST_VADDR));
     auto memory = virt::collect_user_memory_stats(pagemap);
     KEXPECT_EQ(memory.resident_pages, 0U);
     KEXPECT_EQ(memory.swapped_pages, 1U);
 
-    KREQUIRE_TRUE(virt::selftest_anonymous_swap_pagein(pagemap, TEST_VADDR));
+    KREQUIRE_TRUE(virt::selftest_anonymous_swap_pagein(pagemap, TEST_VADDR, placement));
     auto const* bytes = mapped_bytes(pagemap);
     KREQUIRE_NE(bytes, nullptr);
     PageBytes expected{};
@@ -262,6 +285,8 @@ KTEST(AnonymousSwap, RealPageoutPageinPreservesDataAndAccounting) {
 }
 
 KTEST(AnonymousSwap, SwappedForkPagesInDistinctCowFrames) {
+    numa::AllocationContext placement{};
+    KREQUIRE_TRUE(capture_test_swap_context(placement));
     constexpr const char* NAME = "ktest-anon-swap-fork";
     auto storage = make_storage();
     KREQUIRE_NE(storage.get(), nullptr);
@@ -273,12 +298,12 @@ KTEST(AnonymousSwap, SwappedForkPagesInDistinctCowFrames) {
     KREQUIRE_NE(parent, nullptr);
     KREQUIRE_NE(child, nullptr);
     KREQUIRE_TRUE(map_pattern_page(parent, 0x3C));
-    KREQUIRE_TRUE(virt::selftest_anonymous_swap_pageout(parent, TEST_VADDR));
+    KREQUIRE_TRUE(virt::selftest_anonymous_swap_pageout(parent, TEST_VADDR, placement));
     KREQUIRE_TRUE(virt::deep_copy_user_pagemap_cow(parent, child));
     KEXPECT_TRUE(virt::selftest_anonymous_swap_is_swapped(parent, TEST_VADDR));
     KEXPECT_TRUE(virt::selftest_anonymous_swap_is_swapped(child, TEST_VADDR));
-    KREQUIRE_TRUE(virt::selftest_anonymous_swap_pagein(parent, TEST_VADDR));
-    KREQUIRE_TRUE(virt::selftest_anonymous_swap_pagein(child, TEST_VADDR));
+    KREQUIRE_TRUE(virt::selftest_anonymous_swap_pagein(parent, TEST_VADDR, placement));
+    KREQUIRE_TRUE(virt::selftest_anonymous_swap_pagein(child, TEST_VADDR, placement));
     KEXPECT_NE(virt::translate(parent, TEST_VADDR), virt::translate(child, TEST_VADDR));
 
     ker::mod::sched::task::Task child_task{};
@@ -298,6 +323,8 @@ KTEST(AnonymousSwap, SwappedForkPagesInDistinctCowFrames) {
 }
 
 KTEST(AnonymousSwap, ProtectionCorruptionAndUnmapFailClosed) {
+    numa::AllocationContext placement{};
+    KREQUIRE_TRUE(capture_test_swap_context(placement));
     constexpr const char* NAME = "ktest-anon-swap-failure";
     auto storage = make_storage();
     KREQUIRE_NE(storage.get(), nullptr);
@@ -307,10 +334,10 @@ KTEST(AnonymousSwap, ProtectionCorruptionAndUnmapFailClosed) {
     auto* pagemap = virt::create_pagemap();
     KREQUIRE_NE(pagemap, nullptr);
     KREQUIRE_TRUE(map_pattern_page(pagemap, 0x71));
-    KREQUIRE_TRUE(virt::selftest_anonymous_swap_pageout(pagemap, TEST_VADDR));
+    KREQUIRE_TRUE(virt::selftest_anonymous_swap_pageout(pagemap, TEST_VADDR, placement));
     KEXPECT_TRUE(virt::protect_anonymous_swap_page(pagemap, TEST_VADDR, paging::PAGE_PRESENT | paging::PAGE_NX));
     KREQUIRE_TRUE(storage->corrupt_read(1, 31, 0x40));
-    KEXPECT_FALSE(virt::selftest_anonymous_swap_pagein(pagemap, TEST_VADDR));
+    KEXPECT_FALSE(virt::selftest_anonymous_swap_pagein(pagemap, TEST_VADDR, placement));
     KEXPECT_EQ(virt::translate(pagemap, TEST_VADDR), virt::PADDR_INVALID);
 
     virt::unmap_page(pagemap, TEST_VADDR);
@@ -342,4 +369,30 @@ KTEST(AnonymousSwap, UsercopyRefusalPreservesTrackedLazySwapAndStoredBytes) {
     fixture.expect_preserved();
     KREQUIRE_TRUE(fixture.recover_pattern());
     log::info("tracked-swap software refusal and actual root-pagein recovery only; no scheduled software page-in success credit");
+}
+
+KTEST(AnonymousSwap, InvalidNativePlacementPreservesStoredPatternForRetry) {
+    TrackedSwapFixture fixture("ktest-anon-swap-placement-refusal");
+    KREQUIRE_TRUE(fixture.init());
+    numa::AllocationContext invalid{};
+    KREQUIRE_TRUE(capture_test_swap_context(invalid));
+    invalid.policy.mode = static_cast<numa::Mode>(255);
+    KEXPECT_FALSE(fixture.pagein_with(invalid));
+    fixture.expect_preserved();
+    KREQUIRE_TRUE(fixture.recover_pattern());
+}
+
+KTEST(AnonymousSwap, CopiedBindPageinRestoresStoredBytesOnSelectedNode) {
+    auto const* machine = ker::mod::acpi::numa::boot_topology();
+    KREQUIRE_NE(machine, nullptr);
+    for (numa::NodeId node = 0; node < machine->node_count; ++node) {
+        if (machine->nodes[node].usable_bytes == 0) continue;
+        TrackedSwapFixture fixture("ktest-anon-swap-bind-pagein");
+        KREQUIRE_TRUE(fixture.init());
+        numa::AllocationContext placement{};
+        KREQUIRE_TRUE(capture_test_swap_context(placement));
+        placement.policy = {numa::NodeMask{1} << node, numa::Mode::BIND};
+        KREQUIRE_TRUE(fixture.recover_pattern(placement));
+        KEXPECT_EQ(fixture.resident_node(), node);
+    }
 }

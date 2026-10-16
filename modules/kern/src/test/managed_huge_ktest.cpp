@@ -257,13 +257,13 @@ KTEST(ManagedHuge, WholeTwoLeafPreflightFailureAndStalePlanPreserveOwners) {
     KEXPECT_EQ(virt::selftest_user_pagemap_reader_count(f.root), 0U);
     log::info("per-call fail-before-table exercises actual prefix rollback; no PMM-pressure claim");
 }
-KTEST(ManagedHuge, PrivateRangeCapRefusesBeforePlanAllocation) {
+KTEST(ManagedHuge, CompleteSparseZeroProofNeedsNoPlanAllocation) {
     Fixture f;
     KREQUIRE_TRUE(f.init());
     huge::PreparedTables plan;
     huge::Snapshot before{};
     huge::snapshot(before);
-    KEXPECT_EQ(virt::selftest_prepare_managed_split(*f.subject, VA, VA + 65 * huge::LEAF_BYTES, plan), huge::Error::Unsupported);
+    KEXPECT_EQ(virt::selftest_prepare_managed_split(*f.subject, VA, VA + 65 * huge::LEAF_BYTES, plan), huge::Error::None);
     huge::Snapshot after{};
     huge::snapshot(after);
     KEXPECT_TRUE(plan.empty());
@@ -477,5 +477,70 @@ KTEST(ManagedHuge, PartialDisposalPreservesReachableManagedRemainder) {
     KEXPECT_EQ(after.mapped_pages, f.cap_before.mapped_pages + huge::LEAF_PAGES);
     KEXPECT_EQ(after.charged_pages, f.cap_before.charged_pages + huge::LEAF_PAGES);
     // The unchanged Fixture still owns second's actual preowned split cleanup.
+}
+#endif
+
+#ifdef WOS_SELFTEST
+KTEST(ManagedHuge, CompleteZeroProofAndExactOriginalExclusive) {
+    Fixture f;
+    KREQUIRE_TRUE(f.init());
+    huge::RangeSplitSurvey survey;
+    huge::PreparedTables plan;
+    KREQUIRE_EQ(virt::selftest_prepare_complete_managed_split(*f.subject, 0, uint64_t{1} << 47, survey, plan), huge::Error::None);
+    KEXPECT_TRUE(survey.complete());
+    KEXPECT_EQ(survey.count(), 0U);
+    KEXPECT_TRUE(plan.empty());
+    KREQUIRE_EQ(virt::selftest_commit_complete_managed_split_exclusive(*f.subject, survey, plan, f.report), huge::Error::None);
+    KEXPECT_EQ(virt::selftest_user_pagemap_reader_count(f.root), 0U);
+    KEXPECT_EQ(f.report.split, 0U);
+    KEXPECT_FALSE(f.report.actual_full_flush_called);
+}
+KTEST(ManagedHuge, CompleteZeroProofDetectsNewPsAndCleanupCannotArmRange) {
+    Fixture f;
+    KREQUIRE_TRUE(f.init());
+    huge::RangeSplitSurvey survey;
+    huge::PreparedTables empty;
+    KREQUIRE_EQ(virt::selftest_prepare_complete_managed_split(*f.subject, 0, uint64_t{1} << 47, survey, empty), huge::Error::None);
+    KREQUIRE_EQ(f.prepare(0), huge::Error::None);
+    KREQUIRE_EQ(f.publish(0), huge::Error::None);
+    KEXPECT_EQ(virt::selftest_commit_complete_managed_split(*f.subject, survey, empty, f.report), huge::Error::Again);
+    KEXPECT_EQ(virt::selftest_commit_complete_managed_split(*f.subject, survey, f.cleanup[0], f.report), huge::Error::Invalid);
+}
+KTEST(ManagedHuge, EarlierSingleLeafCleanupSurvivesLaterPublicationAndSaturation) {
+    Fixture f;
+    KREQUIRE_TRUE(f.init());
+    for (size_t i = 0; i < 2; ++i) {
+        KREQUIRE_EQ(f.prepare(i), huge::Error::None);
+        KREQUIRE_EQ(f.publish(i), huge::Error::None);
+    }
+    KREQUIRE_TRUE(virt::selftest_saturate_managed_geometry_epoch(*f.subject));
+    huge::RangeSplitSurvey survey;
+    huge::PreparedTables empty;
+    KEXPECT_EQ(virt::selftest_prepare_complete_managed_split(*f.subject, VA, VA + 2 * huge::LEAF_BYTES, survey, empty),
+               huge::Error::GenerationExhausted);
+    KEXPECT_FALSE(survey.complete());
+    KEXPECT_TRUE(empty.empty());
+    for (size_t i = 0; i < 2; ++i) {
+        KREQUIRE_EQ(virt::selftest_split_managed_huge(*f.subject, VA + i * huge::LEAF_BYTES, f.cleanup[i], f.report), huge::Error::None);
+        f.mapped[i] = false;
+    }
+    huge::GeometryStamp stamp;
+    KREQUIRE_TRUE(virt::selftest_managed_geometry_stamp(*f.subject, stamp));
+    KEXPECT_EQ(stamp.epoch, UINT64_MAX);
+}
+KTEST(ManagedHuge, SparsePartialBoundaryProofAndHeldExclusiveSplit) {
+    Fixture f;
+    KREQUIRE_TRUE(f.init());
+    KREQUIRE_EQ(f.prepare(0), huge::Error::None);
+    KREQUIRE_EQ(f.publish(0), huge::Error::None);
+    huge::RangeSplitSurvey survey;
+    huge::PreparedTables plan;
+    KREQUIRE_EQ(virt::selftest_prepare_complete_managed_split(*f.subject, VA + 4096, VA + 65 * huge::LEAF_BYTES + 4096, survey, plan),
+                huge::Error::None);
+    KEXPECT_EQ(survey.count(), 1U);
+    KEXPECT_EQ(plan.count(), 1U);
+    KREQUIRE_EQ(virt::selftest_commit_complete_managed_split_exclusive(*f.subject, survey, plan, f.report), huge::Error::None);
+    f.mapped[0] = false;
+    KEXPECT_EQ(virt::selftest_user_pagemap_reader_count(f.root), 0U);
 }
 #endif

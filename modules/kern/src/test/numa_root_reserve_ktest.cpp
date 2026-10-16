@@ -282,8 +282,8 @@ KTEST(NumaRootReserve, ControlProvisioningFailureRequiresRealNeedChunk) {
         return;
     }
     auto const start = control_snapshot();
-    KREQUIRE_TRUE(start.control_pages <= UINT64_MAX / 96);
-    auto const slots = start.control_pages * 96;
+    KREQUIRE_TRUE(start.control_pages <= UINT64_MAX / 84);
+    auto const slots = start.control_pages * 84;
     KREQUIRE_TRUE(start.active_roots <= slots);
     auto const free = slots - start.active_roots;
     if (free > 96) {

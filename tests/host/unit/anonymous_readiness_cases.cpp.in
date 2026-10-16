@@ -1,0 +1,204 @@
+namespace fixture {
+void dispose_created() {
+    auto* t = model::created_task;
+    if (t == nullptr) return;
+    model::check(v::anonymous_pagein_queue_count == 0 && model::gates == 0, "dispose only drained controlled case");
+    if (t->kernel_shutdown_ownership.held()) t->kernel_shutdown_ownership.release();
+    // Controlled-case teardown of the deliberate until-halt boot reference.
+    // Native GC/ref lifetime is not modeled here.
+    t->state = s::task::TaskState::ACTIVE;
+    t->ref_count = 1;
+    s::task::destroy_unpublished_user_thread(t);
+    model::created_task = nullptr;
+    s::current = nullptr;
+    v::anonymous_swap_worker_task = nullptr;
+}
+void reset_readiness() {
+    dispose_created();
+    reset();
+    v::anonymous_swap_worker_task = nullptr;
+    v::anonymous_swap_worker_started = false;
+    v::anonymous_swap_admission = v::anonymous_swap_service_closed = false;
+    model::created = model::destroyed = model::thread_deletes = model::stack_frees = model::lazy_returns = model::fd_returns = 0;
+    model::posts = model::block_calls = model::deferred_exit_checks = 0;
+    model::fail_create = model::corrupt_failed_post = model::shutdown = model::waiting = false;
+    model::enabled = model::post_result = true;
+    model::post_hook = model::block_hook = model::slot_hook = model::write_hook = model::free_hook = model::yield_hook = {};
+    s::current = nullptr;
+}
+void start() { v::start_anonymous_swap_worker(); }
+void run_worker_to_exit() {
+    auto* worker = model::created_task;
+    model::check(worker != nullptr, "actual created subject");
+    s::current = worker;
+    try { worker->kthread_entry(); model::check(false, "worker never returns"); }
+    catch (const model::WorkerExit&) {}
+    model::check(worker->state == s::task::TaskState::DEAD && !worker->kernel_shutdown_ownership.held(), "explicit drain exit");
+}
+void start_ready() {
+    start();
+    model::check(model::created_task && model::posts == 1 && model::created_task->ref_count == 2 &&
+                     model::created_task->kernel_shutdown_ownership.held() && v::anonymous_swap_worker_admitted(),
+                 "successful posted ready worker with exact boot owners");
+}
+s::task::Task producer;
+void producer_setup() {
+    reset_readiness();
+    start_ready();
+    // mm_reclaim is a distinct DAEMON; it does not own the anonymous worker's startup hold.
+    model::check(!producer.kernel_shutdown_ownership.held(), "source producer begins without worker hold");
+    s::current = &producer;
+    auto allocated = n::try_allocate_pages(context(), 1, 4096, ker::mod::mm::PhysicalPageOwner::USER_PRIVATE_MAPPING,
+                                         ker::mod::mm::phys::PageInitialization::FULL_OVERWRITE);
+    model::check(!allocated.span.empty(), "real factory resident source");
+    auto* page = allocated.span.release();
+    v::readiness_endpoint::source_frame = page;
+    v::readiness_endpoint::snapshot_mode = 0;
+    auto physical = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(page)));
+    v::entries[&roots[0]] = v::pte_from_raw(physical | p::PAGE_USER | p::PAGE_WRITE | p::PAGE_PRESENT);
+}
+void producer_case(bool after_write) {
+    producer_setup();
+    uint64_t const ORIGINAL = v::pte_raw(v::entries[&roots[0]]);
+    bool automatic_exit = false;
+    if (after_write) {
+        model::write_hook = [] { model::shutdown = true; };
+        model::free_hook = [] { model::checkpoint(); };
+    } else {
+        model::slot_hook = [] { model::shutdown = true; };
+    }
+    try {
+        ker::mod::mm::reclaim::ReclaimRequest request{};
+        request.budget_units = request.target_pages = request.scan_budget_units = 1;
+        auto result = v::anonymous_swap_reclaim_scan(nullptr, request);
+        model::check(result.reclaimed == 0, "shutdown never reports stored commit");
+    } catch (const model::AutomaticExit&) { automatic_exit = true; }
+    model::check(!automatic_exit, after_write ? "source hold survives post-write cleanup" : "source hold survives slot contention");
+    model::check(v::pte_raw(v::entries[&roots[0]]) == ORIGINAL && model::live() == 1 && model::gates == 0 && actor.refs == 1 &&
+                     v::anonymous_swap_mappings == nullptr && model::slot_frees == 1,
+                 "closed pageout restores exact resident raw/ref/slot/gate/descriptor owners");
+    model::check(model::created_task->kernel_shutdown_ownership.held() && !producer.kernel_shutdown_ownership.held() && model::deferred_exit_checks > 0,
+                 "source scan hold returned while independent worker startup hold remains");
+    auto* source_bytes = static_cast<const unsigned char*>(v::readiness_endpoint::source_frame);
+    model::check(std::all_of(source_bytes, source_bytes + 4096, [](unsigned char b) { return b == 0xa5; }),
+                 "closed pageout preserves every original source byte");
+    ker::mod::mm::phys::page_ref_dec(v::readiness_endpoint::source_frame);
+    run_worker_to_exit();
+    dispose_created();
+}
+void producer_observation_case(bool aged) {
+    producer_setup();
+    v::readiness_endpoint::snapshot_mode = aged ? 2 : 1;
+    if (aged) model::yield_hook = [] { model::shutdown = true; };
+    ker::mod::mm::reclaim::ReclaimRequest request{};
+    request.budget_units = request.target_pages = request.scan_budget_units = 1;
+    auto result = v::anonymous_swap_reclaim_scan(nullptr, request);
+    model::check(result.scanned == 1 && result.reclaimed == 0 && actor.refs == 1 && model::gates == 0 &&
+                     model::live() == 1 && !producer.kernel_shutdown_ownership.held(),
+                 "NONE and AGED paths return exact retained Task/frame ownership");
+    model::check(!aged || model::yields == 1, "actual AGED yield covered by scan ownership");
+    ker::mod::mm::phys::page_ref_dec(v::readiness_endpoint::source_frame);
+    model::shutdown = true;
+    run_worker_to_exit();
+    dispose_created();
+}
+void run_postwrite_control() { producer_case(true); }
+void run_readiness() {
+    reset_readiness();
+    model::fail_create = true;
+    start();
+    model::check(!v::anonymous_swap_worker_started && !v::anonymous_swap_worker_task && !v::anonymous_swap_admission && model::posts == 0,
+                 "creation OOM leaves unready");
+
+    reset_readiness();
+    model::post_result = false;
+    start();
+    model::check(!v::anonymous_swap_worker_task && !v::anonymous_swap_worker_started && model::destroyed == 1 &&
+                     model::thread_deletes == 1 && model::stack_frees == 1 && model::lazy_returns == 1 && model::fd_returns == 1,
+                 "failed post destroys private owners");
+    model::created_task = nullptr; s::current = nullptr;
+
+    reset_readiness();
+    model::post_result = false; model::corrupt_failed_post = true;
+    bool panicked = false;
+    try { start(); } catch (const model::Panic&) { panicked = true; }
+    model::check(panicked && model::destroyed == 0 && model::created_task->ref_count == 2 &&
+                     model::created_task->kernel_shutdown_ownership.held(),
+                 "unexpected false publication refuses unsafe free");
+
+    reset_readiness();
+    start_ready();
+    model::shutdown = true;
+    run_worker_to_exit();
+    model::check(v::anonymous_swap_service_closed && !v::anonymous_swap_admission && !v::anonymous_swap_worker_admitted(),
+                 "shutdown closes admission before empty exit");
+    model::check(model::created_task->ref_count == 2, "boot pointer still owns storage after drain exit");
+
+    reset_readiness();
+    model::post_hook = [] {
+        model::shutdown = true;
+        run_worker_to_exit();
+    };
+    start();
+    model::check(v::anonymous_swap_worker_task == model::created_task && v::anonymous_swap_service_closed &&
+                     !v::anonymous_swap_admission && !model::created_task->kernel_shutdown_ownership.held(),
+                 "starter cannot reopen worker closed before publication");
+
+    reset_readiness();
+    model::post_hook = [] {
+        try { model::created_task->kthread_entry(); }
+        catch (const model::WorkerPark&) {}
+        model::check(model::waiting, "worker actually parked before starter publication");
+    };
+    start_ready();
+    model::check(!model::waiting && model::created_task->wakeup_pending, "starter wake survives park-before-publication");
+    model::shutdown = true;run_worker_to_exit();
+
+    reset_readiness();
+    start_ready();
+    // The actual worker observes empty, then the test publishes real queued
+    // work at its exact kern_block endpoint. Sticky wake prevents lost work.
+    row();
+    model::block_hook = [] {
+        model::check(fault() == v::AnonymousSwapFaultDisposition::PARK, "enqueue at check-to-block edge");
+        model::block_hook = [] { model::shutdown = true;s::wake_task_from_event(model::created_task); };
+    };
+    run_worker_to_exit();
+    model::check(model::reads == 1 && actor.refs == 1 && model::gates == 0 && v::anonymous_pagein_queue_count == 0,
+                 "wake-before-park actual worker loop consumes ownership");
+    close_installed();
+
+    reset_readiness();
+    start_ready();
+    std::array<s::task::Task, 11> waiters{};
+    for (unsigned i=0;i<waiters.size();++i) {
+        auto* r=row();r->vaddr=VA+i*4096;r->maintenance_placement.virtual_page_index=r->vaddr/4096;
+        v::entries.at(&roots[0],r->vaddr)=v::pte_from_raw(p::PAGE_USER|p::PAGE_RESERVED);
+        waiters[i].pagemap=&roots[0];uint64_t generation=0;
+        model::check(v::probe_anonymous_swap_fault(&waiters[i],r->vaddr,p::PageFault{},true,generation)==v::AnonymousSwapFaultDisposition::PARK,
+                     "bounded real queued prefix exceeds worker window");
+    }
+    model::shutdown=true;
+    run_worker_to_exit();
+    model::check(v::anonymous_pagein_queue_count==0&&model::reads==waiters.size()&&model::gates==0,
+                 "closed worker drains every batch before exit");
+    for(auto& w:waiters)model::check(w.refs==1&&w.anonymous_swap_wait_mapping==nullptr,"all exact waiter refs returned");
+    for(auto& b:model::blocks)if(b.refs)ker::mod::mm::phys::page_ref_dec(b.p);
+
+    producer_case(false);
+    producer_case(true);
+    producer_observation_case(false);
+    producer_observation_case(true);
+
+    reset_readiness();start_ready();
+    auto* r=row();model::allocation_hook=[] {
+        model::shutdown=true;
+        uint64_t flags=v::cow_pte_lock.lock_irqsave();v::anonymous_swap_admission=false;v::anonymous_swap_service_closed=true;v::cow_pte_lock.unlock_irqrestore(flags);
+    };
+    model::check(fault()==v::AnonymousSwapFaultDisposition::FAILED&&model::live()==0&&!r->pagein_queued&&r->object&&model::gates==0,
+                 "preparing producer cannot queue after close");
+    purge();run_worker_to_exit();dispose_created();
+    reset();
+    std::printf("PASS actual anonymous readiness cases=%u checks=%u\n",model::cases,model::checks);
+}
+}

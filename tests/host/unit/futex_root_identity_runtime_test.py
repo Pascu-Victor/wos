@@ -10,6 +10,7 @@ oracles. This is Host regression, not native MM, physical allocator or Goal39
 lifecycle/coherence qualification. Full archived old futex is a genuine selectable
 negative control; it must compile before isolation/lost-wake failure.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -27,11 +28,47 @@ import sys
 import tempfile
 import time
 
-ROOT = next(path for path in Path(__file__).resolve().parents
-            if (path / "modules/kern/src").is_dir() and (path / "tests/host").is_dir())
+ROOT = next(
+    path
+    for path in Path(__file__).resolve().parents
+    if (path / "modules/kern/src").is_dir() and (path / "tests/host").is_dir()
+)
 KERN = ROOT / "modules/kern/src"
 SOURCE = KERN / "syscalls_impl/futex/futex.cpp"
-VECTORS = ['roots_4097', 'roots_1000', 'pool_reuse', 'metadata_oom', 'root_oom', 'serial_exhaustion', 'concurrent_growth', 'capture_bounds', 'capture_busy', 'capture_unknown', 'capture_revalidate', 'private_roots', 'private_aliases', 'private_cow', 'shared_roots', 'shared_offsets', 'phys_private_refusal', 'root_reuse_isolation', 'same_root_tasks', 'wake_cleanup_races', 'kernel_release', 'duplicate_admission', 'table_first', 'slot_first', 'final_ref_guard', 'final_kind_guard', 'key_collisions', 'resolver_unknown_ps', 'current_leaf_write_commit']
+KERNEL_OVERLAY = None
+VECTORS = [
+    "root_capacity_84_85",
+    "root_geometry_epoch_reuse",
+    "roots_4097",
+    "roots_1000",
+    "pool_reuse",
+    "metadata_oom",
+    "root_oom",
+    "serial_exhaustion",
+    "concurrent_growth",
+    "capture_bounds",
+    "capture_busy",
+    "capture_unknown",
+    "capture_revalidate",
+    "private_roots",
+    "private_aliases",
+    "private_cow",
+    "shared_roots",
+    "shared_offsets",
+    "phys_private_refusal",
+    "root_reuse_isolation",
+    "same_root_tasks",
+    "wake_cleanup_races",
+    "kernel_release",
+    "duplicate_admission",
+    "table_first",
+    "slot_first",
+    "final_ref_guard",
+    "final_kind_guard",
+    "key_collisions",
+    "resolver_unknown_ps",
+    "current_leaf_write_commit",
+]
 SCRATCH_BUDGET = 64 * 1024 * 1024
 LOG_BUDGET = 1024 * 1024
 FILE_BUDGET = 8 * 1024 * 1024
@@ -43,7 +80,7 @@ RAW_PHYS = 'namespace fixture {\nstruct RawPage{ker::mod::mm::PhysicalPageOwner 
 
 TASK = '\n#pragma once\n#include "fixture-common.hpp"\n#include <platform/mm/virt.hpp>\nnamespace ker::mod::sched::task {\nenum class WaitChannelKind { FUTEX };\nstruct Task {\n    uint64_t pid{},cpu{};\n    std::atomic<void*> futex_waiter{};\n    std::atomic<unsigned> task_readers{}, refs{1}, wakes{};\n    mm::paging::PageTable* pagemap{};\n    std::atomic<uint64_t> wake_at_us{};\n    std::atomic<bool> deferred_task_switch{}, channel{}, root_allowed{true};\n    uint64_t timeout_address=0x9000; timespec timeout{}; bool timeout_fault{};\n    uint64_t load_cpu() const { return cpu; }\n    void set_wait_channel(const char*,WaitChannelKind) { channel=true; }\n    void clear_wait_channel() { channel=false; }\n    bool try_acquire_usercopy_pagemap(mm::paging::PageTable*& out) {\n        if(!root_allowed || pagemap==nullptr) return false;\n        ++task_readers; out=pagemap; return true;\n    }\n    void release_usercopy_pagemap() { fixture::check(task_readers.fetch_sub(1)>0,"Task root lease released once"); }\n    void release() { fixture::check(refs.fetch_sub(1)>1,"temporary lookup Task reference released once"); }\n};\n}\nnamespace fixture {\ninline thread_local ker::mod::sched::task::Task* current{};\ninline std::array<std::atomic<ker::mod::sched::task::Task*>,32> tasks{};\n}\n'
 
-SCHEDULER = '\n#pragma once\n#include <platform/sched/task.hpp>\nnamespace ker::mod::sched {\nenum class EventWakeDeferredSwitch { CANCEL };\ninline bool interrupts_enabled(){return fixture::irq_depth==0;}\ninline auto get_current_task() -> task::Task* { return fixture::current; }\ninline auto find_task_by_pid_safe(uint64_t pid) -> task::Task* {\n    for(auto& slot:fixture::tasks) if(auto* t=slot.load();t!=nullptr && t->pid==pid) { ++t->refs; return t; }\n    return nullptr;\n}\ninline void wake_task_from_event_on_cpu(task::Task* t,uint64_t,EventWakeDeferredSwitch) {\n    ++t->wakes; t->deferred_task_switch=false; t->wake_at_us=0; t->clear_wait_channel();\n}\n}\n'
+SCHEDULER = "\n#pragma once\n#include <platform/sched/task.hpp>\nnamespace ker::mod::sched {\nenum class EventWakeDeferredSwitch { CANCEL };\ninline bool interrupts_enabled(){return fixture::irq_depth==0;}\ninline auto get_current_task() -> task::Task* { return fixture::current; }\ninline auto find_task_by_pid_safe(uint64_t pid) -> task::Task* {\n    for(auto& slot:fixture::tasks) if(auto* t=slot.load();t!=nullptr && t->pid==pid) { ++t->refs; return t; }\n    return nullptr;\n}\ninline void wake_task_from_event_on_cpu(task::Task* t,uint64_t,EventWakeDeferredSwitch) {\n    ++t->wakes; t->deferred_task_switch=false; t->wake_at_us=0; t->clear_wait_channel();\n}\n}\n"
 
 MAP_SEAMS = 'namespace fixture {\nnamespace paging=ker::mod::mm::paging;\ninline paging::PageTableEntry& leaf(paging::PageTable*root,uint64_t word,bool create){auto*t=root;for(int level=4;level>1;--level){auto&e=t->entries[(word>>(12+9*(level-1)))&511];if(!e.present&&create){auto*child=static_cast<paging::PageTable*>(raw_allocate(ker::mod::mm::PhysicalPageOwner::PAGE_TABLE));check(child!=nullptr,"Host child PTE allocation");if(!child)throw InvariantStop{};set_root_metadata(child,ker::mod::mm::PageKind::PAGE_TABLE,1);e.present=e.user=e.writable=1;e.frame=reinterpret_cast<uint64_t>(child)>>12;}if(!e.present)throw InvariantStop{};t=reinterpret_cast<paging::PageTable*>(ker::mod::mm::addr::get_virt_pointer(e.frame<<12));}return t->entries[(word>>12)&511];}\ninline void map_leaf(paging::PageTable*root,uint64_t word,Frame*f,bool shared){auto&e=leaf(root,word,true);auto flags=ker::mod::mm::virt::user_mapping_pin_lock.lock_irqsave();uint64_t old=e.present?(e.frame<<12):UINT64_MAX;auto pa=physical(frame_index(f));if(old!=pa){check(ker::mod::mm::phys::page_ref_try_inc(f->bytes.data()),"mapping frame owner acquired");if(old!=UINT64_MAX)ker::mod::mm::phys::page_ref_dec(reinterpret_cast<void*>(ker::mod::mm::addr::get_virt_pointer(old)));}uint64_t raw=pa|paging::PAGE_PRESENT|paging::PAGE_USER|paging::PAGE_WRITE|(shared?paging::PAGE_SHARED:0);std::memcpy(&e,&raw,8);ker::mod::mm::virt::user_mapping_pin_lock.unlock_irqrestore(flags);}\ninline void set_leaf_flags(paging::PageTable*root,uint64_t word,uint64_t policy){auto flags=ker::mod::mm::virt::user_mapping_pin_lock.lock_irqsave();auto&e=leaf(root,word,false);uint64_t raw=(e.frame<<12)|policy;std::memcpy(&e,&raw,8);ker::mod::mm::virt::user_mapping_pin_lock.unlock_irqrestore(flags);}\ninline void remove_leaf(paging::PageTable*root,uint64_t word){auto flags=ker::mod::mm::virt::user_mapping_pin_lock.lock_irqsave();auto&e=leaf(root,word,false);if(e.present){auto pa=e.frame<<12;e={};ker::mod::mm::phys::page_ref_dec(reinterpret_cast<void*>(ker::mod::mm::addr::get_virt_pointer(pa)));}ker::mod::mm::virt::user_mapping_pin_lock.unlock_irqrestore(flags);}\ninline void clear_level(paging::PageTable*root,int level){for(auto&e:root->entries){if(!e.present)continue;if(level==1){ker::mod::mm::phys::page_ref_dec(reinterpret_cast<void*>(ker::mod::mm::addr::get_virt_pointer(e.frame<<12)));}else{auto*child=reinterpret_cast<paging::PageTable*>(ker::mod::mm::addr::get_virt_pointer(e.frame<<12));clear_level(child,level-1);raw_free(child);}e={};}}\ninline void clear_tree(paging::PageTable*root){if(root)clear_level(root,4);}\ninline void init_kernel_root(){auto*p=static_cast<paging::PageTable*>(raw_allocate(ker::mod::mm::PhysicalPageOwner::PAGE_TABLE));set_root_metadata(p,ker::mod::mm::PageKind::PAGE_TABLE,1);ker::mod::mm::virt::kernel_pagemap=p;}\ninline void free_pool(){auto& pool=ker::mod::mm::virt::page_table_pool;while(pool.count){auto*p=pool.pages[--pool.count];pool.pages[pool.count]=nullptr;raw_free(p);}if(auto*p=ker::mod::mm::virt::kernel_pagemap){ker::mod::mm::virt::kernel_pagemap=nullptr;raw_free(p);}}\n}\nnamespace ker::mod::mm::virt {\ninline bool ensure_user_page_mapped(sched::task::Task*,vaddr_t){return true;}\ninline bool ensure_user_page_writable(sched::task::Task*,vaddr_t){return true;}\n}\nnamespace ker::mod::sys::usercopy {\nUserAccessGuard::UserAccessGuard(){m_flags=fixture::access_depth;++fixture::access_depth;}\nUserAccessGuard::~UserAccessGuard(){fixture::check(fixture::access_depth==m_flags+1,"balanced access window");fixture::access_depth=static_cast<unsigned>(m_flags);}\nauto access_window_active()->bool{return fixture::access_depth!=0;}\nauto copy_from_task(sched::task::Task&task,uint64_t address,void*dst,size_t size)->bool{if(task.timeout_fault||address!=task.timeout_address||size!=sizeof(timespec))return false;std::memcpy(dst,&task.timeout,size);return true;}\n}\n'
 
@@ -117,24 +154,29 @@ void current_leaf_write_commit() {
 }
 """
 
+
 def pin(path: Path) -> dict:
     data = path.read_bytes()
     return {"path": str(path.resolve()), "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+
 
 ROOT_RESERVE_SEAMS = '\n// Explicit compatibility seam: these existing futex vectors have no published\n// topology/emergency reserve. They test the ordinary factory/control path.\nnamespace fixture { inline thread_local unsigned locality_capture_depth{}; }\nnamespace ker::mod::mm::numa {\nusing NodeId=uint16_t;\ninline constexpr NodeId INVALID_NODE=UINT16_MAX;\nnamespace root_reserve {\nenum class Error:uint8_t {NONE,NOT_READY,NO_TOPOLOGY,ALREADY_INITIALIZED,INVALID_NODE,EMPTY,CORRUPT};\nstruct TakeResult {paging::PageTable* table{};Error error{Error::NOT_READY};};\nenum class ReturnResult:uint8_t {NOT_MEMBER,RETURNED,CORRUPT};\ninline auto try_take(NodeId)->TakeResult {\n fixture::check(false,"no published reserve in futex compatibility fixture");return {};\n}\ninline auto try_return(paging::PageTable*,void(*)(paging::PageTable*))->ReturnResult {\n fixture::check(fixture::locality_capture_depth==0,"return outside locality capture");return ReturnResult::NOT_MEMBER;\n}\n}\n}\nnamespace ker::mod::acpi::numa {\nstruct Topology {uint16_t cpu_count{},node_count{};std::array<uint16_t,256>cpu_nodes{};};\ninline auto boot_topology()->const Topology* {return nullptr;}\n}\nnamespace ker::mod::cpu {\ninline auto get_current_cpu_id_safe()->uint64_t {\n fixture::check(fixture::locality_capture_depth==1,"CPU capture under short preemption guard");return 0;\n}\n}\nnamespace ker::mod::sched {\nstruct PreemptGuard {\n PreemptGuard(){fixture::check(fixture::irq_depth==0,"locality capture outside MM IRQ locks");++fixture::locality_capture_depth;}\n ~PreemptGuard(){fixture::check(fixture::locality_capture_depth==1,"balanced locality capture");--fixture::locality_capture_depth;}\n};\n}\nnamespace ker::mod::dbg {[[noreturn]]inline void panic_handler(const char*){throw fixture::InvariantStop{};}}\n'
 
 
 def capture(source: str, anchor: str, *, declaration: bool = False) -> tuple[str, dict]:
     """Capture one complete actual definition, retaining every original byte."""
-    clean = re.sub(r'//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'',
-                   lambda match: " " * len(match[0]), source)
+    clean = re.sub(
+        r'//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', lambda match: " " * len(match[0]), source
+    )
     definitions = []
     for match in re.finditer(re.escape(anchor), clean):
         parentheses = 0
         for index in range(match.start(), len(clean)):
             char = clean[index]
-            if char == "(": parentheses += 1
-            elif char == ")": parentheses -= 1
+            if char == "(":
+                parentheses += 1
+            elif char == ")":
+                parentheses -= 1
             elif char == ";" and parentheses == 0:
                 break  # A prototype cannot borrow a later function's body.
             elif char == "{" and parentheses == 0:
@@ -146,22 +188,29 @@ def capture(source: str, anchor: str, *, declaration: bool = False) -> tuple[str
     start = clean.rfind("\n", 0, definition) + 1
     depth = 0
     for index in range(opening, len(clean)):
-        if clean[index] == "{": depth += 1
+        if clean[index] == "{":
+            depth += 1
         elif clean[index] == "}":
             depth -= 1
             if depth == 0:
                 end = index + 1
                 if declaration:
-                    if clean[end:end + 1] != ";":
+                    if clean[end : end + 1] != ";":
                         raise ValueError(f"missing complete declaration semicolon: {anchor}")
                     end += 1
                 body = source[start:end]
-                return body, {"name": anchor, "line": source.count("\n", 0, start) + 1,
-                              "bytes": len(body.encode()), "sha256": hashlib.sha256(body.encode()).hexdigest()}
+                return body, {
+                    "name": anchor,
+                    "line": source.count("\n", 0, start) + 1,
+                    "bytes": len(body.encode()),
+                    "sha256": hashlib.sha256(body.encode()).hexdigest(),
+                }
     raise ValueError(f"unterminated actual definition: {anchor}")
+
 
 def allocated(path: Path) -> int:
     return sum(p.stat().st_blocks * 512 for p in path.rglob("*") if p.is_file())
+
 
 def subreaper() -> None:
     if not sys.platform.startswith("linux"):
@@ -170,9 +219,11 @@ def subreaper() -> None:
     if libc.prctl(36, 1, 0, 0, 0) != 0:
         raise OSError(ctypes.get_errno(), "PR_SET_CHILD_SUBREAPER")
 
+
 def process_identity(pid: int) -> tuple[int, int, str, int, int]:
     fields = Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()
     return pid, int(fields[19]), fields[0], int(fields[1]), int(fields[3])
+
 
 def owned_session(leader: int) -> list[tuple[int, int, str, int, int]]:
     result = []
@@ -189,6 +240,7 @@ def owned_session(leader: int) -> list[tuple[int, int, str, int, int]]:
             result.append(identity)
     return result
 
+
 def kill_identity(identity: tuple[int, int, str, int, int]) -> None:
     pid, started, state, _, _ = identity
     if state == "Z":
@@ -204,6 +256,7 @@ def kill_identity(identity: tuple[int, int, str, int, int]) -> None:
         pass
     finally:
         os.close(fd)
+
 
 def reap_group(process: subprocess.Popen, deadline: float) -> None:
     while True:
@@ -227,6 +280,7 @@ def reap_group(process: subprocess.Popen, deadline: float) -> None:
             raise TimeoutError("owned session not proven absent; preserve scratch")
         time.sleep(0.01)
 
+
 def command(argv: list[str], log: Path, scratch: Path, deadline: float, groups: list[int]) -> dict:
     if time.monotonic() >= deadline - 5:
         raise TimeoutError("60-second whole budget exhausted before command")
@@ -239,11 +293,19 @@ def command(argv: list[str], log: Path, scratch: Path, deadline: float, groups: 
     process = None
     with log.open("xb") as output:
         try:
-            process = subprocess.Popen(argv, stdout=output, stderr=subprocess.STDOUT,
-                                       start_new_session=True, preexec_fn=limits,
-                                       env=dict(os.environ, TMPDIR=str(scratch),
-                                                ASAN_OPTIONS="detect_leaks=0:halt_on_error=1",
-                                                LSAN_OPTIONS="detect_leaks=0"))
+            process = subprocess.Popen(
+                argv,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                preexec_fn=limits,
+                env=dict(
+                    os.environ,
+                    TMPDIR=str(scratch),
+                    ASAN_OPTIONS="detect_leaks=0:halt_on_error=1",
+                    LSAN_OPTIONS="detect_leaks=0",
+                ),
+            )
             groups.append(process.pid)
             while True:
                 if log.stat().st_size > LOG_BUDGET or allocated(scratch) > SCRATCH_BUDGET:
@@ -256,8 +318,9 @@ def command(argv: list[str], log: Path, scratch: Path, deadline: float, groups: 
                 time.sleep(0.02)
         finally:
             if process is not None:
-                handlers = {sig: signal.signal(sig, signal.SIG_IGN)
-                            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+                handlers = {
+                    sig: signal.signal(sig, signal.SIG_IGN) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+                }
                 try:
                     reap_group(process, deadline)
                     groups.remove(process.pid)
@@ -266,8 +329,15 @@ def command(argv: list[str], log: Path, scratch: Path, deadline: float, groups: 
                         signal.signal(sig, handler)
     if log.stat().st_size > LOG_BUDGET or allocated(scratch) > SCRATCH_BUDGET:
         raise ValueError("completed command exceeded storage/output budget")
-    return {"argv": argv, "exit": process.returncode, "seconds": round(time.monotonic() - started, 6),
-            "leader_reaped": True, "owned_session_absent": True, "log": pin(log)}
+    return {
+        "argv": argv,
+        "exit": process.returncode,
+        "seconds": round(time.monotonic() - started, 6),
+        "leader_reaped": True,
+        "owned_session_absent": True,
+        "log": pin(log),
+    }
+
 
 def dependency_pins(depfile: Path) -> list[dict]:
     if depfile.stat().st_size > LOG_BUDGET:
@@ -281,31 +351,125 @@ def dependency_pins(depfile: Path) -> list[dict]:
         raise ValueError("actual compiler dependency count exceeded 2048")
     return [pin(p) for p in sorted(paths) if p.is_file()]
 
+
+RANGE_CONTROL_CASES = r"""
+void root_capacity_84_85() {
+ static_assert(sizeof(virt::UserRootControl) == 48);
+ static_assert(virt::USER_ROOT_CONTROLS_PER_PAGE == 84);
+ static_assert(sizeof(virt::UserRootControlChunk) == 4056);
+ std::vector<virt::PageTable*> roots;
+ for (unsigned i=0;i<85;++i) {
+  auto* root=virt::create_pagemap_may_fail(); check(root!=nullptr,"real root admitted");
+  if (!root) break; roots.push_back(root);
+  auto view=stats(); check(view.active_roots==i+1,"actual root denominator");
+  if (i==83) check(view.control_pages==1,"84 actual controls occupy one page");
+  if (i==84) check(view.control_pages==2,"85th actual root needs second metadata page");
+ }
+ for (auto* root:roots) virt::release_pagemap(root,0);
+ check(stats().active_roots==0&&stats().control_pages==0,"all 85 exact roots and metadata owners return");
+}
+void root_geometry_epoch_reuse() {
+ OwnedRoot owner; auto* root=owner.root; auto old_serial=serial(root);
+ auto flags=virt::user_mapping_pin_lock.lock_irqsave();
+ auto* control=virt::find_user_root_control_locked(root);
+ check(control&&control->ps_geometry_epoch==1,"fresh actual root begins epoch1");
+ virt::advance_ps_geometry_epoch_locked(root);
+ check(control->ps_geometry_epoch==2,"actual geometry writer advances");
+ control->ps_geometry_epoch=UINT64_MAX-1;
+ virt::advance_ps_geometry_epoch_locked(root); virt::advance_ps_geometry_epoch_locked(root);
+ check(control->ps_geometry_epoch==UINT64_MAX,"actual epoch saturation is sticky");
+ virt::user_mapping_pin_lock.unlock_irqrestore(flags);
+ owner.reset();
+ OwnedRoot replacement;
+ check(replacement.root==root&&serial(replacement.root)>old_serial,"root reuse has a new incarnation");
+ flags=virt::user_mapping_pin_lock.lock_irqsave();
+ control=virt::find_user_root_control_locked(replacement.root);
+ check(control&&control->ps_geometry_epoch==1,"new incarnation resets epoch without reviving old proof");
+ virt::user_mapping_pin_lock.unlock_irqrestore(flags);
+}
+"""
+
+
+def kernel_path(name: str) -> Path:
+    candidate = KERNEL_OVERLAY / name if KERNEL_OVERLAY else None
+    return candidate if candidate is not None and candidate.is_file() else KERN / name
+
+
 def generate(scratch: Path, selected: Path) -> list[dict]:
-    include=scratch/"include"; actual=[]
-    def write(name,text):
-        destination=include/name;destination.parent.mkdir(parents=True,exist_ok=True);destination.write_text(text)
-    def definition(source,anchor,declaration=False):
-        body,row=capture(source,anchor,declaration=declaration);actual.append(row)
-        return f'#line {row["line"]} "actual-extracted-source"\n'+body
-    def span(source,start,end,label):
-        begin=source.index(start);finish=source.index(end,begin);body=source[begin:finish]
-        actual.append({"name":label,"line":source.count("\n",0,begin)+1,"bytes":len(body.encode()),"sha256":hashlib.sha256(body.encode()).hexdigest()})
+    include = scratch / "include"
+    actual = []
+
+    def write(name, text):
+        destination = include / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(text)
+
+    def definition(source, anchor, declaration=False):
+        body, row = capture(source, anchor, declaration=declaration)
+        actual.append(row)
+        return f'#line {row["line"]} "actual-extracted-source"\n' + body
+
+    def span(source, start, end, label):
+        begin = source.index(start)
+        finish = source.index(end, begin)
+        body = source[begin:finish]
+        actual.append(
+            {
+                "name": label,
+                "line": source.count("\n", 0, begin) + 1,
+                "bytes": len(body.encode()),
+                "sha256": hashlib.sha256(body.encode()).hexdigest(),
+            }
+        )
         return body
-    paging=(KERN/"platform/mm/paging.hpp").read_bytes();write("platform/mm/paging.hpp",paging.decode());write("defines/defines.hpp","#pragma once\n")
-    actual.append({"name":"whole-platform/mm/paging.hpp","bytes":len(paging),"sha256":hashlib.sha256(paging).hexdigest()})
-    phys_h=(KERN/"platform/mm/phys.hpp").read_text();owner_h=(KERN/"platform/mm/page_alloc.hpp").read_text()
-    common=COMMON+ROOT_RESERVE_SEAMS+'\nnamespace ker::mod::mm {\n'+definition(owner_h,"enum class PhysicalPageOwner",True)+'\n'+definition(owner_h,"enum class PageKind",True)+'\n}\n'
-    common+='namespace ker::mod::mm::phys {\n'+definition(phys_h,"enum class PageLookupOwner",True)+'\n'+definition(phys_h,"struct PageLookupHint",True)+'\n}\n'+PHYS_TAIL+RAW_PHYS
-    core_header=(KERN/"platform/mm/managed_huge_core.hpp").read_bytes()
-    write("platform/mm/managed_huge_core.hpp",core_header.decode())
-    actual.append({"name":"whole-platform/mm/managed_huge_core.hpp","bytes":len(core_header),
-                   "sha256":hashlib.sha256(core_header).hexdigest()})
-    common+='\n#include <platform/mm/managed_huge_core.hpp>\n'
-    write("fixture-common.hpp",common)
-    vh=(KERN/"platform/mm/virt.hpp").read_text()
-    declarations='\n'.join(definition(vh,a,True) for a in ["struct UserPagePin {","struct UserFutexIdentity {","struct UserRootControlStats {"])
-    write("platform/mm/virt.hpp",'#pragma once\n#include "fixture-common.hpp"\n#include <platform/mm/file_mapping_lifetime.hpp>\nnamespace ker::mod::sched::task {struct Task;}\nnamespace ker::mod::mm::virt { using PageTable=paging::PageTable; using PageTableEntry=paging::PageTableEntry; inline constexpr paddr_t PADDR_INVALID=UINT64_MAX;\n'+declarations+'''
+
+    paging = kernel_path("platform/mm/paging.hpp").read_bytes()
+    write("platform/mm/paging.hpp", paging.decode())
+    write("defines/defines.hpp", "#pragma once\n")
+    actual.append(
+        {"name": "whole-platform/mm/paging.hpp", "bytes": len(paging), "sha256": hashlib.sha256(paging).hexdigest()}
+    )
+    phys_h = kernel_path("platform/mm/phys.hpp").read_text()
+    owner_h = kernel_path("platform/mm/page_alloc.hpp").read_text()
+    common = (
+        COMMON
+        + ROOT_RESERVE_SEAMS
+        + "\nnamespace ker::mod::mm {\n"
+        + definition(owner_h, "enum class PhysicalPageOwner", True)
+        + "\n"
+        + definition(owner_h, "enum class PageKind", True)
+        + "\n}\n"
+    )
+    common += (
+        "namespace ker::mod::mm::phys {\n"
+        + definition(phys_h, "enum class PageLookupOwner", True)
+        + "\n"
+        + definition(phys_h, "struct PageLookupHint", True)
+        + "\n}\n"
+        + PHYS_TAIL
+        + RAW_PHYS
+    )
+    core_header = kernel_path("platform/mm/managed_huge_core.hpp").read_bytes()
+    write("platform/mm/managed_huge_core.hpp", core_header.decode())
+    actual.append(
+        {
+            "name": "whole-platform/mm/managed_huge_core.hpp",
+            "bytes": len(core_header),
+            "sha256": hashlib.sha256(core_header).hexdigest(),
+        }
+    )
+    common += "\n#include <platform/mm/managed_huge_core.hpp>\n"
+    write("fixture-common.hpp", common)
+    vh = kernel_path("platform/mm/virt.hpp").read_text()
+    declarations = "\n".join(
+        definition(vh, a, True)
+        for a in ["struct UserPagePin {", "struct UserFutexIdentity {", "struct UserRootControlStats {"]
+    )
+    write(
+        "platform/mm/virt.hpp",
+        '#pragma once\n#include "fixture-common.hpp"\n#include <platform/mm/file_mapping_lifetime.hpp>\nnamespace ker::mod::sched::task {struct Task;}\nnamespace ker::mod::mm::virt { using PageTable=paging::PageTable; using PageTableEntry=paging::PageTableEntry; inline constexpr paddr_t PADDR_INVALID=UINT64_MAX;\n'
+        + declarations
+        + """
     auto pin_user_page(PageTable*,vaddr_t,bool,UserPagePin&,bool) -> bool;
     auto pin_user_page_for_task(sched::task::Task*,PageTable*,vaddr_t,bool,bool,UserPagePin&) -> bool;
     auto user_page_pin_still_mapped(const UserPagePin&) -> bool;
@@ -321,64 +485,225 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
     }
     bool ensure_user_page_mapped(sched::task::Task*,vaddr_t);
     bool ensure_user_page_writable(sched::task::Task*,vaddr_t);
-    }\n''')
-    write("platform/sched/task.hpp",TASK);write("platform/sched/scheduler.hpp",SCHEDULER)
-    for name in ["platform/sys/spinlock.hpp","platform/mm/phys.hpp"]:write(name,'#pragma once\n#include "fixture-common.hpp"\n')
-    write("platform/asm/cpu.hpp","#pragma once\n");write("platform/mm/dyn/kmalloc.hpp","#pragma once\n");write("platform/ktime/ktime.hpp",'#pragma once\n#include "fixture-common.hpp"\nnamespace ker::mod::time{inline uint64_t get_us(){return fixture::now_us;}}\n')
-    for name in ["platform/sys/usercopy.hpp","platform/mm/file_mapping_lifetime.hpp","util/hashtable.hpp","abi/callnums/futex.h","syscalls_impl/futex/futex.hpp"]:
-        data=(KERN/name).read_bytes();write(name,data.decode());actual.append({"name":"whole-"+name,"bytes":len(data),"sha256":hashlib.sha256(data).hexdigest()})
-    (scratch/"futex.hpp").write_bytes((KERN/"syscalls_impl/futex/futex.hpp").read_bytes());(scratch/"actual-futex.cpp").write_bytes(selected.read_bytes())
-    actual.append({"name":"whole-selected-futex.cpp",**pin(selected)})
-    source=(KERN/"platform/mm/virt.opt.cpp").read_text()
-    root_globals=span(source,'constexpr size_t USER_ROOT_CONTROL_BUCKET_COUNT','enum class AnonymousSwapRuntimeState','whole-root-control-declarations-and-globals')
-    gate_globals=span(source,'constexpr size_t USER_PAGEMAP_ACCESS_GATE_COUNT','[[nodiscard]] auto user_pagemap_access_gate_index','whole-root-reader-gate-declarations-and-globals')
-    pool_globals=span(source,'constexpr size_t PAGE_TABLE_POOL_CAPACITY','constexpr size_t OWNED_FRAME_TABLE_CAPACITY','whole-page-table-pool-declarations-and-globals')
-    private_anchors=['[[nodiscard]] auto user_pagemap_access_gate_index','void service_user_pagemap_gate_wait','[[nodiscard]] auto acquire_user_pagemap_access','void release_user_pagemap_access','[[nodiscard]] auto begin_user_pagemap_exclusive','void end_user_pagemap_exclusive','class UserPagemapExclusiveScope {','void zero_page_table_for_pool','auto try_alloc_page_table_from_pool','auto try_release_page_table_to_pool','auto alloc_zeroed_page_table','auto user_root_control_bucket','auto find_user_root_control_locked','auto next_user_root_serial','enum class UserRootAttachResult','auto attach_user_root_control_locked','auto allocate_user_root_control_chunk','struct RootReserveLocality {','auto capture_root_reserve_locality','auto return_root_to_emergency_reserve','void release_unregistered_user_root','auto create_user_root_common','auto retire_user_root_control_locked','auto pte_raw(const paging::PageTableEntry& e)','auto pte_from_raw(uint64_t raw)','auto index_of(','auto entry_at(PageTable*','auto entry_at(const PageTable*','class MutableUserEntrySlot {','enum class UserLeafKind','struct UserLeafResolution {','auto resolve_user_leaf_locked(','auto snapshot_user_page_mapping_locked','auto try_pin_current_user_page_mapping','auto pin_user_page_common']
-    private='\n'.join(definition(source,a,a.startswith(('class ','enum ','struct '))) for a in private_anchors)
-    private+='\n'+definition(source,'void release_pagemap_exclusive_owned(')
+    }\n""",
+    )
+    write("platform/sched/task.hpp", TASK)
+    write("platform/sched/scheduler.hpp", SCHEDULER)
+    for name in ["platform/sys/spinlock.hpp", "platform/mm/phys.hpp"]:
+        write(name, '#pragma once\n#include "fixture-common.hpp"\n')
+    write("platform/asm/cpu.hpp", "#pragma once\n")
+    write("platform/mm/dyn/kmalloc.hpp", "#pragma once\n")
+    write(
+        "platform/ktime/ktime.hpp",
+        '#pragma once\n#include "fixture-common.hpp"\nnamespace ker::mod::time{inline uint64_t get_us(){return fixture::now_us;}}\n',
+    )
+    for name in [
+        "platform/sys/usercopy.hpp",
+        "platform/mm/file_mapping_lifetime.hpp",
+        "util/hashtable.hpp",
+        "abi/callnums/futex.h",
+        "syscalls_impl/futex/futex.hpp",
+    ]:
+        data = kernel_path(name).read_bytes()
+        write(name, data.decode())
+        actual.append({"name": "whole-" + name, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+    (scratch / "futex.hpp").write_bytes(kernel_path("syscalls_impl/futex/futex.hpp").read_bytes())
+    (scratch / "actual-futex.cpp").write_bytes(selected.read_bytes())
+    actual.append({"name": "whole-selected-futex.cpp", **pin(selected)})
+    source = kernel_path("platform/mm/virt.opt.cpp").read_text()
+    root_globals = span(
+        source,
+        "constexpr size_t USER_ROOT_CONTROL_BUCKET_COUNT",
+        "enum class AnonymousSwapRuntimeState",
+        "whole-root-control-declarations-and-globals",
+    )
+    gate_globals = span(
+        source,
+        "constexpr size_t USER_PAGEMAP_ACCESS_GATE_COUNT",
+        "[[nodiscard]] auto user_pagemap_access_gate_index",
+        "whole-root-reader-gate-declarations-and-globals",
+    )
+    pool_globals = span(
+        source,
+        "constexpr size_t PAGE_TABLE_POOL_CAPACITY",
+        "constexpr size_t OWNED_FRAME_TABLE_CAPACITY",
+        "whole-page-table-pool-declarations-and-globals",
+    )
+    private_anchors = [
+        "[[nodiscard]] auto user_pagemap_access_gate_index",
+        "void service_user_pagemap_gate_wait",
+        "[[nodiscard]] auto acquire_user_pagemap_access",
+        "void release_user_pagemap_access",
+        "[[nodiscard]] auto begin_user_pagemap_exclusive",
+        "void end_user_pagemap_exclusive",
+        "class UserPagemapExclusiveScope {",
+        "void zero_page_table_for_pool",
+        "auto try_alloc_page_table_from_pool",
+        "auto try_release_page_table_to_pool",
+        "auto alloc_zeroed_page_table",
+        "auto user_root_control_bucket",
+        "auto find_user_root_control_locked",
+        "[[gnu::always_inline]] void advance_ps_geometry_epoch_locked",
+        "auto next_user_root_serial",
+        "enum class UserRootAttachResult",
+        "auto attach_user_root_control_locked",
+        "auto allocate_user_root_control_chunk",
+        "struct RootReserveLocality {",
+        "auto capture_root_reserve_locality",
+        "auto return_root_to_emergency_reserve",
+        "void release_unregistered_user_root",
+        "auto create_user_root_common",
+        "auto retire_user_root_control_locked",
+        "auto pte_raw(const paging::PageTableEntry& e)",
+        "auto pte_from_raw(uint64_t raw)",
+        "auto index_of(",
+        "auto entry_at(PageTable*",
+        "auto entry_at(const PageTable*",
+        "class MutableUserEntrySlot {",
+        "enum class UserLeafKind",
+        "struct UserLeafResolution {",
+        "auto resolve_user_leaf_locked(",
+        "auto snapshot_user_page_mapping_locked",
+        "auto try_pin_current_user_page_mapping",
+        "auto pin_user_page_common",
+    ]
+    private = "\n".join(definition(source, a, a.startswith(("class ", "enum ", "struct "))) for a in private_anchors)
+    private += "\n" + definition(source, "void release_pagemap_exclusive_owned(")
     # No native file bindings are installed by these root/futex vectors. Compile
     # the actual empty-index paths and their complete checked binding-owner
     # dependencies; never replace the production index with permissive stubs.
-    core=(KERN/"platform/mm/file_mapping_lifetime.cpp").read_text()
-    owner_helpers=span(core,'constinit sys::Spinlock owner_count_lock{};',
-                       'template <typename Counts, typename Role>\nauto reclassify_owner',
-                       'actual-permanent-owner-guard-and-checked-acquire-release-templates')
-    core_anchors=['auto FileMappingBinding::try_acquire(', 'void FileMappingBinding::release(',
-                  'auto FileMappingIndex::bucket(', 'auto FileMappingIndex::root_matches_locked(',
-                  'auto FileMappingIndex::find_locked(', 'auto FileMappingIndex::root_empty_locked(',
-                  'auto FileMappingIndex::retain_for_pin_locked(', 'auto FileMappingIndex::matches_pin_locked(']
-    core_bodies='\n'.join(definition(core,a) for a in core_anchors)
-    core_unit='#include <platform/mm/file_mapping_lifetime.hpp>\nnamespace ker::mod::mm::file_mapping { namespace {\n'+owner_helpers+'\n}\n'+core_bodies+'\n}\n'
-    public_anchors=['auto create_pagemap()','auto create_pagemap_may_fail()','void release_pagemap(','void get_user_root_control_stats_snapshot','auto selftest_user_root_incarnation(','auto pin_user_page(','auto pin_user_page_for_task(','auto user_page_pin_still_mapped(','auto user_page_pin_commit_write(','auto capture_user_futex_identity(','auto user_futex_identity_still_mapped(','void unpin_user_page(']
-    public='\n'.join(definition(source,a) for a in public_anchors)
-    mm=('#include "fixture-common.hpp"\n#include <platform/mm/virt.hpp>\n#include <platform/sched/scheduler.hpp>\n'+core_unit+'\nnamespace ker::mod::mm::virt { namespace {\nusing log=HostLog; using namespace paging; PageTable* kernel_pagemap{}; sys::Spinlock user_mapping_pin_lock; file_mapping::FileMappingIndex file_mapping_index;\ninline uint64_t fake_cr3{}; inline uint64_t rdcr3(){return fake_cr3;} inline void wrcr3(uint64_t x){fake_cr3=x;} inline bool is_current_pagemap(PageTable*){return false;} inline void service_pending_tlb_shootdowns(){} inline void owned_frame_purge_pagemap(PageTable*){}\n'+root_globals+gate_globals+pool_globals+
-        span(source,'constexpr uint64_t PTE_FRAME_MASK =','\n','actual-physical-entry-mask')+'\n'+
-        span(source,'constinit huge::RegistryCore managed_huge_registry{};','\n','actual-empty-managed-huge-registry')+'\n'+private+'\n}\n'+public+'\n}\n')
-    (scratch/"actual-mm.cpp").write_text(mm)
-    user=(KERN/"platform/sys/usercopy.cpp").read_text()
-    user_anchors=["UserPageFrameRef::~UserPageFrameRef()","UserPageFrameRef::UserPageFrameRef(UserPageFrameRef&&","UserPageFrameRef::operator=(UserPageFrameRef&&","UserPageFrameRef::valid()","UserPageFrameRef::reset()","StableUserPage::~StableUserPage()","StableUserPage::valid()","StableUserPage::kernel_address()","StableUserPage::physical_address()","StableUserPage::was_dirty()","StableUserPage::still_mapped()","StableUserPage::commit_write()","StableUserPage::retain_frame(UserPageFrameRef&","StableUserPage::capture_futex_identity(","StableUserPage::futex_identity_still_mapped(","StableUserPage::reset()","auto pin_task_user_page(","auto range_valid("]
-    user_bodies='\n'.join(definition(user,a) for a in user_anchors)
-    phys_source=(KERN/"platform/mm/phys.opt.cpp").read_text();increment=definition(phys_source,"auto page_ref_try_inc(void* page, PageLookupHint* hint)")
-    cases=CASES.replace('void all_drained(){',MANAGED_CASES+'\nvoid all_drained(){')
-    cases=cases.replace('RUN(roots_4097)','RUN(resolver_unknown_ps)RUN(current_leaf_write_commit)RUN(roots_4097)',1)
-    text=('#define FIXTURE_TYPED_FUTEX_KEYS 1\n' if 'enum class FutexKeyKind' in selected.read_text() else '')+'#include "fixture-common.hpp"\n#include <platform/sys/usercopy.hpp>\n#include <platform/sched/scheduler.hpp>\nnamespace ker::mod::mm::phys{\n'+increment+'\n}\n#include "actual-mm.cpp"\n'+MAP_SEAMS+'\nnamespace ker::mod::sys::usercopy{\n'+user_bodies+'\n}\n#include "actual-futex.cpp"\n'+cases
-    (scratch/"harness.cpp").write_text(text)
+    core = kernel_path("platform/mm/file_mapping_lifetime.cpp").read_text()
+    owner_helpers = span(
+        core,
+        "constinit sys::Spinlock owner_count_lock{};",
+        "template <typename Counts, typename Role>\nauto reclassify_owner",
+        "actual-permanent-owner-guard-and-checked-acquire-release-templates",
+    )
+    core_anchors = [
+        "auto FileMappingBinding::try_acquire(",
+        "void FileMappingBinding::release(",
+        "auto FileMappingIndex::bucket(",
+        "auto FileMappingIndex::root_matches_locked(",
+        "auto FileMappingIndex::find_locked(",
+        "auto FileMappingIndex::root_empty_locked(",
+        "auto FileMappingIndex::retain_for_pin_locked(",
+        "auto FileMappingIndex::matches_pin_locked(",
+    ]
+    core_bodies = "\n".join(definition(core, a) for a in core_anchors)
+    core_unit = (
+        "#include <platform/mm/file_mapping_lifetime.hpp>\nnamespace ker::mod::mm::file_mapping { namespace {\n"
+        + owner_helpers
+        + "\n}\n"
+        + core_bodies
+        + "\n}\n"
+    )
+    public_anchors = [
+        "auto create_pagemap()",
+        "auto create_pagemap_may_fail()",
+        "void release_pagemap(",
+        "void get_user_root_control_stats_snapshot",
+        "auto selftest_user_root_incarnation(",
+        "auto pin_user_page(",
+        "auto pin_user_page_for_task(",
+        "auto user_page_pin_still_mapped(",
+        "auto user_page_pin_commit_write(",
+        "auto capture_user_futex_identity(",
+        "auto user_futex_identity_still_mapped(",
+        "void unpin_user_page(",
+    ]
+    public = "\n".join(definition(source, a) for a in public_anchors)
+    mm = (
+        '#include "fixture-common.hpp"\n#include <platform/mm/virt.hpp>\n#include <platform/sched/scheduler.hpp>\n'
+        + core_unit
+        + "\nnamespace ker::mod::mm::virt { namespace {\nusing log=HostLog; using namespace paging; PageTable* kernel_pagemap{}; sys::Spinlock user_mapping_pin_lock; file_mapping::FileMappingIndex file_mapping_index;\ninline uint64_t fake_cr3{}; inline uint64_t rdcr3(){return fake_cr3;} inline void wrcr3(uint64_t x){fake_cr3=x;} inline bool is_current_pagemap(PageTable*){return false;} inline void service_pending_tlb_shootdowns(){} inline void owned_frame_purge_pagemap(PageTable*){}\n"
+        + root_globals
+        + gate_globals
+        + pool_globals
+        + span(source, "constexpr uint64_t PTE_FRAME_MASK =", "\n", "actual-physical-entry-mask")
+        + "\n"
+        + span(
+            source, "constinit huge::RegistryCore managed_huge_registry{};", "\n", "actual-empty-managed-huge-registry"
+        )
+        + "\n"
+        + private
+        + "\n}\n"
+        + public
+        + "\n}\n"
+    )
+    (scratch / "actual-mm.cpp").write_text(mm)
+    user = kernel_path("platform/sys/usercopy.cpp").read_text()
+    user_anchors = [
+        "UserPageFrameRef::~UserPageFrameRef()",
+        "UserPageFrameRef::UserPageFrameRef(UserPageFrameRef&&",
+        "UserPageFrameRef::operator=(UserPageFrameRef&&",
+        "UserPageFrameRef::valid()",
+        "UserPageFrameRef::reset()",
+        "StableUserPage::~StableUserPage()",
+        "StableUserPage::valid()",
+        "StableUserPage::kernel_address()",
+        "StableUserPage::physical_address()",
+        "StableUserPage::was_dirty()",
+        "StableUserPage::still_mapped()",
+        "StableUserPage::commit_write()",
+        "StableUserPage::retain_frame(UserPageFrameRef&",
+        "StableUserPage::capture_futex_identity(",
+        "StableUserPage::futex_identity_still_mapped(",
+        "StableUserPage::reset()",
+        "auto pin_task_user_page(",
+        "auto range_valid(",
+    ]
+    user_bodies = "\n".join(definition(user, a) for a in user_anchors)
+    phys_source = kernel_path("platform/mm/phys.opt.cpp").read_text()
+    increment = definition(phys_source, "auto page_ref_try_inc(void* page, PageLookupHint* hint)")
+    cases = CASES.replace("void all_drained(){", MANAGED_CASES + RANGE_CONTROL_CASES + "\nvoid all_drained(){")
+    cases = cases.replace(
+        "RUN(roots_4097)",
+        "RUN(root_capacity_84_85)RUN(root_geometry_epoch_reuse)RUN(resolver_unknown_ps)RUN(current_leaf_write_commit)RUN(roots_4097)",
+        1,
+    )
+    text = (
+        ("#define FIXTURE_TYPED_FUTEX_KEYS 1\n" if "enum class FutexKeyKind" in selected.read_text() else "")
+        + '#include "fixture-common.hpp"\n#include <platform/sys/usercopy.hpp>\n#include <platform/sched/scheduler.hpp>\nnamespace ker::mod::mm::phys{\n'
+        + increment
+        + '\n}\n#include "actual-mm.cpp"\n'
+        + MAP_SEAMS
+        + "\nnamespace ker::mod::sys::usercopy{\n"
+        + user_bodies
+        + '\n}\n#include "actual-futex.cpp"\n'
+        + cases
+    )
+    (scratch / "harness.cpp").write_text(text)
     return actual
 
+
 def main() -> int:
+    global ROOT, KERN, KERNEL_OVERLAY, SOURCE
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--futex-source", type=Path, default=SOURCE)
+    parser.add_argument("--source-root", type=Path, default=ROOT)
+    parser.add_argument("--kernel-overlay", type=Path)
+    parser.add_argument("--futex-source", type=Path)
     parser.add_argument("--only", choices=["all", *VECTORS], default="all")
     parser.add_argument("--cxx", default=os.environ.get("CXX", os.environ.get("WOS_HOST_CXX", "/usr/bin/clang++")))
     args = parser.parse_args()
+    ROOT = args.source_root.resolve()
+    KERN = ROOT / "modules/kern/src"
+    KERNEL_OVERLAY = args.kernel_overlay.resolve() if args.kernel_overlay else None
+    SOURCE = kernel_path("syscalls_impl/futex/futex.cpp")
+    if args.futex_source is None:
+        args.futex_source = SOURCE
     started = time.monotonic()
     deadline = started + 60
     scratch = None
     groups = []
     watched, before = [], []
     staged, staged_before = [], []
-    result = {"pass": False, "commands": [], "scratch_removed": False,
-              "native_runtime_qualified": False, "compiler_external_dependencies_after_only": True}
+    result = {
+        "pass": False,
+        "commands": [],
+        "scratch_removed": False,
+        "native_runtime_qualified": False,
+        "compiler_external_dependencies_after_only": True,
+    }
     try:
         selected = args.futex_source.resolve(strict=True)
         compiler = Path(args.cxx).resolve(strict=True)
@@ -387,17 +712,43 @@ def main() -> int:
         with compiler.open("rb") as executable:
             if executable.read(4) != b"\x7fELF":
                 raise ValueError("--cxx must resolve to one executable Host ELF compiler")
-        watched = [selected, Path(__file__).resolve(), compiler, *[KERN / name for name in
-                   ["platform/sys/usercopy.hpp", "platform/sys/usercopy.cpp", "platform/mm/phys.hpp",
-                    "platform/mm/phys.opt.cpp", "platform/mm/page_alloc.hpp", "platform/mm/paging.hpp",
-                    "platform/mm/virt.hpp", "platform/mm/virt.opt.cpp", "platform/mm/managed_huge_core.hpp", "platform/mm/file_mapping_lifetime.hpp",
-                    "platform/mm/file_mapping_lifetime.cpp", "util/hashtable.hpp",
-                    "abi/callnums/futex.h", "syscalls_impl/futex/futex.hpp"]]]
+        watched = [
+            selected,
+            Path(__file__).resolve(),
+            compiler,
+            *[
+                kernel_path(name)
+                for name in [
+                    "platform/sys/usercopy.hpp",
+                    "platform/sys/usercopy.cpp",
+                    "platform/mm/phys.hpp",
+                    "platform/mm/phys.opt.cpp",
+                    "platform/mm/page_alloc.hpp",
+                    "platform/mm/paging.hpp",
+                    "platform/mm/virt.hpp",
+                    "platform/mm/virt.opt.cpp",
+                    "platform/mm/managed_huge_core.hpp",
+                    "platform/mm/file_mapping_lifetime.hpp",
+                    "platform/mm/file_mapping_lifetime.cpp",
+                    "util/hashtable.hpp",
+                    "abi/callnums/futex.h",
+                    "syscalls_impl/futex/futex.hpp",
+                ]
+            ],
+        ]
         before = [pin(p) for p in watched]
         result["input_pins"] = before
         result["futex_source"] = before[0]
         result["root_transactions_not_full_goal_lifecycles"] = True
-        result["primitive_seams"] = ["raw physical allocator", "CPU/IRQ", "Task/scheduler", "fixture PTE publication", "page-fault admission", "no published topology/emergency reserve; ordinary factory compatibility only", "actual default-unready managed RegistryCore: no managed PS admission; unknown2MiB/1GiB refusal only"]
+        result["primitive_seams"] = [
+            "raw physical allocator",
+            "CPU/IRQ",
+            "Task/scheduler",
+            "fixture PTE publication",
+            "page-fault admission",
+            "no published topology/emergency reserve; ordinary factory compatibility only",
+            "actual default-unready managed RegistryCore: no managed PS admission; unknown2MiB/1GiB refusal only",
+        ]
         subreaper()
         scratch = Path(tempfile.mkdtemp(prefix="wos-futex-root-", dir="/tmp"))
         result["scratch"] = str(scratch)
@@ -406,9 +757,25 @@ def main() -> int:
         staged_before = [pin(path) for path in staged]
         result["actual_staged_sources_before"] = staged_before
         source, binary, depfile = scratch / "harness.cpp", scratch / "futex-root-test", scratch / "dependencies.d"
-        argv = [str(compiler), "-std=c++23", "-O1", "-g0", "-pipe", "-pthread", "-fsanitize=address,undefined",
-                "-fno-omit-frame-pointer", "-fno-strict-aliasing", "-MD", "-MF", str(depfile), "-I", str(scratch / "include"),
-                str(source), "-o", str(binary)]
+        argv = [
+            str(compiler),
+            "-std=c++23",
+            "-O1",
+            "-g0",
+            "-pipe",
+            "-pthread",
+            "-fsanitize=address,undefined",
+            "-fno-omit-frame-pointer",
+            "-fno-strict-aliasing",
+            "-MD",
+            "-MF",
+            str(depfile),
+            "-I",
+            str(scratch / "include"),
+            str(source),
+            "-o",
+            str(binary),
+        ]
         vectors = VECTORS if args.only == "all" else [args.only]
         commands = [argv, *[[str(binary), vector] for vector in vectors]]
         for index, argv in enumerate(commands):
@@ -423,10 +790,16 @@ def main() -> int:
                 if row["exit"] == 0:
                     result["actual_compiled_binary"] = pin(binary)
             if row["exit"] != 0:
-                raise ValueError(f"actual-source {'compile/link' if index == 0 else 'runtime oracle'} failed with exit {row['exit']}")
+                raise ValueError(
+                    f"actual-source {'compile/link' if index == 0 else 'runtime oracle'} failed with exit {row['exit']}"
+                )
             if index > 0:
                 expected = re.escape(vectors[index - 1])
-                if not re.search(rf"^PASS vector={expected} assertions=\d+ failures=0 real_root_control=1 real_key_capture=1 real_futex=1 real_hash=1 real_frame_owner=1$", log, re.M):
+                if not re.search(
+                    rf"^PASS vector={expected} assertions=\d+ failures=0 real_root_control=1 real_key_capture=1 real_futex=1 real_hash=1 real_frame_owner=1$",
+                    log,
+                    re.M,
+                ):
                     raise ValueError("actual compiled case lacks exact terminal PASS row")
         result["pass"] = True
     except (OSError, ValueError, TimeoutError, subprocess.TimeoutExpired, KeyboardInterrupt) as error:
@@ -468,6 +841,7 @@ def main() -> int:
     if time.monotonic() > deadline:
         return 1
     return 0 if result["pass"] else 1
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

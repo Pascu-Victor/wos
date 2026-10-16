@@ -41,6 +41,22 @@ class SharedVmemPublicationGuard {
     auto operator=(SharedVmemPublicationGuard&&) -> SharedVmemPublicationGuard& = delete;
 };
 
+// Try-only owner for short current-root admission. Construct in an instrumented
+// caller before acquiring Task/root lifetimes; failure owns no publication lock.
+class SharedVmemPublicationTryGuard {
+   public:
+    SharedVmemPublicationTryGuard() noexcept;
+    ~SharedVmemPublicationTryGuard() noexcept;
+    SharedVmemPublicationTryGuard(const SharedVmemPublicationTryGuard&) = delete;
+    SharedVmemPublicationTryGuard(SharedVmemPublicationTryGuard&&) = delete;
+    auto operator=(const SharedVmemPublicationTryGuard&) -> SharedVmemPublicationTryGuard& = delete;
+    auto operator=(SharedVmemPublicationTryGuard&&) -> SharedVmemPublicationTryGuard& = delete;
+    [[nodiscard]] auto acquired() const noexcept -> bool { return acquired_; }
+
+   private:
+    bool acquired_{};
+};
+
 // Prepare outside publication. Owns exact parent binding snapshots and fresh
 // unbound child bindings; destroy only after the publication guard has ended.
 // Fork consumes prepared rows separately, copies checked PTE owners, then

@@ -484,6 +484,17 @@ struct SelftestManagedHugeReport {
 [[nodiscard]] auto selftest_split_managed_huge(sched::task::Task&, uint64_t va, huge::PreparedTables& mandatory_cleanup,
                                                SelftestManagedHugeReport&) -> huge::Error;
 
+// Complete private range proof, including count0, from caller-owned never-active root.
+[[nodiscard]] auto selftest_prepare_complete_managed_split(sched::task::Task&, uint64_t start, uint64_t end, huge::RangeSplitSurvey&,
+                                                           huge::PreparedTables&, const SelftestManagedHugeOptions& = {}) -> huge::Error;
+[[nodiscard]] auto selftest_commit_complete_managed_split(sched::task::Task&, const huge::RangeSplitSurvey&, huge::PreparedTables&,
+                                                          SelftestManagedHugeReport&) -> huge::Error;
+[[nodiscard]] auto selftest_commit_complete_managed_split_exclusive(sched::task::Task&, const huge::RangeSplitSurvey&,
+                                                                    huge::PreparedTables&, SelftestManagedHugeReport&) -> huge::Error;
+[[nodiscard]] auto selftest_managed_geometry_stamp(sched::task::Task&, huge::GeometryStamp& empty) -> bool;
+// Per-call private never-active diagnostic, no arm/global/public selector.
+[[nodiscard]] auto selftest_saturate_managed_geometry_epoch(sched::task::Task&) -> bool;
+
 struct UserPagePinPathObservation {
     uint32_t early_attempts{};
     uint32_t early_successes{};
@@ -519,8 +530,8 @@ bool selftest_kernel_page_table_frame(const void* ptr);
 bool selftest_user_pagemap_exclusive_rejects_mapped_pin(PageTable* pagemap);
 // Deterministic task-context hooks used by KTEST to exercise the real PTE,
 // refcount, swap-backend, and teardown paths without inducing allocator OOM.
-bool selftest_anonymous_swap_pageout(PageTable* pagemap, vaddr_t vaddr);
-bool selftest_anonymous_swap_pagein(PageTable* pagemap, vaddr_t vaddr);
+bool selftest_anonymous_swap_pageout(PageTable* pagemap, vaddr_t vaddr, const numa::AllocationContext& placement);
+bool selftest_anonymous_swap_pagein(PageTable* pagemap, vaddr_t vaddr, const numa::AllocationContext& placement);
 bool selftest_anonymous_swap_is_swapped(PageTable* pagemap, vaddr_t vaddr);
 #endif
 auto install_lazy_file_page_if_current(sched::task::Task* task, const sched::task::LazyVmemRange& range, vaddr_t page_vaddr,

@@ -33,7 +33,9 @@ auto OwnedSpan::operator=(OwnedSpan&& other) noexcept -> OwnedSpan& {
 
 auto OwnedSpan::release() noexcept -> void* {
     pages_ = 0;
-    return std::exchange(data_, nullptr);
+    auto* const DATA = data_;
+    data_ = nullptr;
+    return DATA;
 }
 
 void OwnedSpan::reset() noexcept {

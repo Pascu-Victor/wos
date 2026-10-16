@@ -324,7 +324,7 @@ numa_declarations = allocator_header[namespace_start:allocator_header.rindex('} 
 # Only the real owner methods belong to this file fixture. CPU/context capture
 # is exercised by the actual factory target, not this unreachable endpoint.
 numa_methods = allocator[allocator.index('OwnedSpan::~OwnedSpan()'):allocator.index('auto capture_allocation_context(')]
-demand_storage = virt[virt.index('struct DemandContext {'):virt.index('struct DemandCounters {')]
+demand_storage = virt[virt.index('struct DemandContext {'):virt.index('class AnonymousShutdownHoldStorage {')]
 demand_types = '\n'.join(block(virt_header, rf'^enum class {name}[^;]*\{{') + ';'
                          for name in ['DemandOrigin', 'DemandBacking'])
 code = '#include "' + str(ROOT / 'modules/kern/src/platform/mm/numa_policy.hpp') + '"\n' + code
