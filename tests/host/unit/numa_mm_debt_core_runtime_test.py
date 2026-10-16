@@ -22,7 +22,7 @@ def extract(text,signature):
 def program():
  source=SOURCE.read_text()
  core=source[source.index('#ifdef WOS_SELFTEST\nnamespace ker::test::numa_lifecycle::mm_debt {'):]
- sigs=['template <typename T>\nauto allocate_swap_descriptor','template <typename T>\nvoid delete_swap_descriptor','void insert_anonymous_swap_mapping_locked','void remove_anonymous_swap_mapping_locked','auto anonymous_pagein_enqueue','auto anonymous_pagein_dequeue','void wake_anonymous_swap_waiters']
+ sigs=['template <typename T>\nauto allocate_swap_descriptor','template <typename T>\nvoid delete_swap_descriptor','void insert_anonymous_swap_mapping_locked','void remove_anonymous_swap_mapping_locked','auto anonymous_pagein_enqueue','auto anonymous_pagein_dequeue','auto anonymous_swap_waiter_idle_locked','auto detach_anonymous_swap_waiters_locked','void wake_anonymous_swap_waiters','void cancel_current_anonymous_wait']
  actual=[extract(source,x) for x in sigs]
  probe=extract(source,'auto probe_anonymous_swap_fault_locked')
  waiter_fragment=probe[probe.index('#ifdef WOS_SELFTEST\n    debt::begin_change();'):].removesuffix('}')
@@ -56,10 +56,11 @@ def program():
  };
  AnonymousSwapMapping* anonymous_swap_mappings{};
  ker::mod::sys::Spinlock anonymous_pagein_queue_lock;
+ ker::mod::sys::Spinlock cow_pte_lock;
  std::array<AnonymousSwapMapping*,2> anonymous_pagein_queue{};
  size_t anonymous_pagein_queue_head{},anonymous_pagein_queue_tail{},anonymous_pagein_queue_count{};
  namespace sched {
- namespace task { struct Task {Task* anonymous_swap_wait_next{}; bool released{}; AnonymousSwapMapping* anonymous_swap_wait_mapping{}; uint64_t anonymous_swap_wait_generation{}; std::atomic<uint64_t> anonymous_swap_completion_generation{99}; bool allow_acquire{true}; bool try_acquire(){CHECK(snap().inflight>0);return allow_acquire;} void release(){auto x=snap();CHECK(x.swap_waiters>0);released=true;}}; }
+ namespace task { struct Task {Task* anonymous_swap_wait_next{}; bool released{}; AnonymousSwapMapping* anonymous_swap_wait_mapping{}; uint64_t anonymous_swap_wait_generation{}; std::atomic<uint64_t> anonymous_swap_completion_generation{99}; bool allow_acquire{true}; unsigned releases{}; bool try_acquire(){CHECK(snap().inflight>0);return allow_acquire;} void release(){auto x=snap();CHECK(x.swap_waiters>0);released=true;++releases;}}; }
  void wake_task_from_event(task::Task* t){CHECK(t&&!t->released);auto x=snap();CHECK(x.swap_waiters>0);}
  }
  '''+ '\n'.join(actual)+r'''
@@ -80,6 +81,28 @@ def program():
   {auto* a=allocate_swap_descriptor<AnonymousSwapMapping>(DebtField::SWAP_MAPPINGS);auto* b=allocate_swap_descriptor<AnonymousSwapMapping>(DebtField::SWAP_MAPPINGS);debt::add(DebtField::SWAP_PAGEINS);debt::add(DebtField::SWAP_PAGEINS);CHECK(anonymous_pagein_enqueue(a));CHECK(anonymous_pagein_enqueue(b));CHECK(!anonymous_pagein_enqueue(a));CHECK(snap().swap_queued==2&&snap().swap_pageins==2);CHECK(anonymous_pagein_dequeue()==a);CHECK(snap().swap_queued==1&&snap().swap_pageins==2);CHECK(anonymous_pagein_dequeue()==b);CHECK(anonymous_pagein_dequeue()==nullptr);CHECK(snap().swap_queued==0&&snap().swap_pageins==2);debt::add(DebtField::SWAP_RETURNS);debt::drop(DebtField::SWAP_PAGEINS);CHECK(snap().swap_pageins==1&&snap().swap_returns==1);debt::drop(DebtField::SWAP_RETURNS);debt::drop(DebtField::SWAP_PAGEINS);delete_swap_descriptor(a,DebtField::SWAP_MAPPINGS);delete_swap_descriptor(b,DebtField::SWAP_MAPPINGS);clean();}
   {sched::task::Task b{},a{&b};debt::add(DebtField::SWAP_WAITERS);debt::add(DebtField::SWAP_WAITERS);wake_anonymous_swap_waiters(&a);CHECK(a.released&&b.released&&a.anonymous_swap_wait_next==nullptr&&b.anonymous_swap_wait_next==nullptr);clean();}
   {AnonymousSwapMapping* mapping=allocate_swap_descriptor<AnonymousSwapMapping>(DebtField::SWAP_MAPPINGS);sched::task::Task t{};uint64_t generation=0;t.allow_acquire=false;CHECK(register_waiter(mapping,&t,generation)==AnonymousSwapFaultDisposition::FAILED);CHECK(snap().inflight==0&&snap().swap_waiters==0&&mapping->waiters==nullptr);t.allow_acquire=true;CHECK(register_waiter(mapping,&t,generation)==AnonymousSwapFaultDisposition::PARK);CHECK(generation==12&&t.anonymous_swap_wait_mapping==mapping&&t.anonymous_swap_wait_generation==12&&t.anonymous_swap_completion_generation.load()==0&&mapping->waiters==&t);CHECK(snap().swap_waiters==1&&snap().inflight==0);CHECK(register_waiter(mapping,&t,generation)==AnonymousSwapFaultDisposition::FAILED);CHECK(snap().swap_waiters==1&&snap().inflight==0);wake_anonymous_swap_waiters(mapping->waiters);mapping->waiters=nullptr;delete_swap_descriptor(mapping,DebtField::SWAP_MAPPINGS);clean();}
+  // New cancellation vectors execute the actual registry resolver and debt
+  // brackets. Every original vector above and its assertions remain intact.
+  {auto* mapping=allocate_swap_descriptor<AnonymousSwapMapping>(DebtField::SWAP_MAPPINGS);insert_anonymous_swap_mapping_locked(mapping);
+   sched::task::Task a{},b{};uint64_t generation=0;
+   CHECK(register_waiter(mapping,&a,generation)==AnonymousSwapFaultDisposition::PARK);
+   CHECK(register_waiter(mapping,&b,generation)==AnonymousSwapFaultDisposition::PARK);
+   CHECK(snap().swap_waiters==2&&mapping->waiters==&b&&b.anonymous_swap_wait_next==&a);
+   cancel_current_anonymous_wait(a,generation);
+   CHECK(a.releases==1&&a.anonymous_swap_wait_mapping==nullptr&&a.anonymous_swap_wait_next==nullptr&&a.anonymous_swap_wait_generation==0);
+   CHECK(a.anonymous_swap_completion_generation==0&&b.anonymous_swap_wait_next==nullptr&&snap().swap_waiters==1&&snap().inflight==0);
+   cancel_current_anonymous_wait(a,generation);CHECK(a.releases==1&&snap().swap_waiters==1);
+   a.released=false; // Existing finite endpoint marks a returned ref, not Task death.
+   CHECK(register_waiter(mapping,&a,generation)==AnonymousSwapFaultDisposition::PARK);
+   auto* detached=detach_anonymous_swap_waiters_locked(mapping);
+   CHECK(mapping->waiters==nullptr&&a.anonymous_swap_wait_mapping==nullptr&&b.anonymous_swap_wait_mapping==nullptr);
+   CHECK(!anonymous_swap_waiter_idle_locked(a)&&!anonymous_swap_waiter_idle_locked(b));
+   auto* next=a.anonymous_swap_wait_next;cancel_current_anonymous_wait(a,generation);
+   CHECK(a.anonymous_swap_wait_next==next&&a.releases==1&&a.anonymous_swap_completion_generation==0&&snap().swap_waiters==2);
+   remove_anonymous_swap_mapping_locked(mapping);delete_swap_descriptor(mapping,DebtField::SWAP_MAPPINGS,true);
+   wake_anonymous_swap_waiters(detached);
+   CHECK(a.releases==2&&b.releases==1&&a.anonymous_swap_wait_next==nullptr&&b.anonymous_swap_wait_next==nullptr);
+   CHECK(a.anonymous_swap_completion_generation==generation&&b.anonymous_swap_completion_generation==generation);clean();}
   std::printf("PASS actual counter/descriptor/list/queue/waiter bodies; checks=%zu; scalar fields=23; concurrent pairs=4000\n",checks);
  }
  '''

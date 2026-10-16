@@ -1,0 +1,32 @@
+# Diagnostic disposable VM only; Root must prepare /var/lib/anonymous-usercopy
+# as fresh root:root0700 and replace NONCE with its exact nonzero decimal nonce.
+[service anonymous-usercopy]
+user=root
+group=root
+supplementary-groups=none
+umask=0077
+authority-ceiling=16384
+no-new-privileges=yes
+service-privileges=none
+exec=/usr/libexec/anonymous-usercopy-scheduled
+arg=/usr/libexec/anonymous-usercopy-scheduled
+arg=NONCE
+depends=journald
+type=oneshot
+class=normal
+priority=0
+environment=empty
+env=LD_LIBRARY_PATH=/usr/lib
+readiness=exit-success
+readiness-timeout-ms=65000
+restart=never
+backoff-initial-ms=250
+backoff-max-ms=30000
+restart-budget=1
+restart-window-ms=60000
+stable-run-ms=60000
+stop-term-ms=2000
+stop-kill-ms=1000
+drain-timeout-ms=2000
+stdio=journal
+enable=always

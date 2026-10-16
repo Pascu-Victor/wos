@@ -1,6 +1,7 @@
 // Init wrapper functions for the kernel initialization dependency system
 // Each wrapper calls the actual init function from the appropriate module
 #ifdef WOS_SELFTEST
+#include <test/anonymous_usercopy_runtime.hpp>
 #include <test/compartment_lifecycle_runtime.hpp>
 #include <test/numa_lifecycle_census.hpp>
 #endif
@@ -359,6 +360,12 @@ void sched_init() {
     bool const LIFECYCLE = cmdline_has_token(get_kernel_cmdline(), "--selftest-compartment-lifecycle");
     bool const NUMA_PRESSURE = cmdline_has_token(get_kernel_cmdline(), "--selftest-numa-pressure");
     bool const NUMA_CENSUS = cmdline_has_token(get_kernel_cmdline(), "--selftest-numa-lifecycle-census");
+    bool const ANONYMOUS_USERCOPY = cmdline_has_token(get_kernel_cmdline(), "--selftest-anonymous-usercopy");
+    if (ANONYMOUS_USERCOPY && (NUMA_CENSUS || NUMA_PRESSURE || LIFECYCLE || cmdline_has_token(get_kernel_cmdline(), "--selftest") ||
+                               cmdline_has_token(get_kernel_cmdline(), "--selftest-file-mapping") ||
+                               cmdline_has_token(get_kernel_cmdline(), "vmem.anon_swap=on")))
+        mod::dbg::panic_handler("conflicting scheduled anonymous-usercopy diagnostic boot modes");
+    if (ANONYMOUS_USERCOPY) ker::test::anonymous_usercopy::enable_boot();
     if (NUMA_CENSUS && (NUMA_PRESSURE || LIFECYCLE || cmdline_has_token(get_kernel_cmdline(), "--selftest") ||
                         cmdline_has_token(get_kernel_cmdline(), "--selftest-file-mapping")))
         mod::dbg::panic_handler("conflicting scheduled NUMA census diagnostic boot modes");

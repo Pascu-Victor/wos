@@ -431,6 +431,7 @@ UNIT_TESTS=(
     xfs_read_runtime_test
     xfs_read_disabled_runtime_test
     anonymous_current_usercopy_runtime_test
+    anonymous_scheduled_usercopy_runtime_test
     anonymous_prepared_pagein_runtime_test
     caller_pin_order_runtime_test
     compartment_launcher_test
@@ -456,6 +457,7 @@ UNIT_TESTS=(
     numa_chase_runtime_test
     numa_coherent_census_runtime_test
     numa_lifecycle_census_codec_test
+    numa_lifecycle_helper_diagnostics_test
     numa_lifecycle_census_runtime_test
     numa_lifecycle_semantic_runtime_test
     numa_mm_activity_runtime_test

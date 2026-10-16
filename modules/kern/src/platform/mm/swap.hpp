@@ -78,4 +78,16 @@ auto activate_block_device(ker::dev::BlockDevice* device, const char* name) -> i
 auto activate_extents(const char* name, const SwapExtent* extents, size_t extent_count) -> int;
 auto register_consumer(const SwapConsumer& consumer) -> bool;
 
+#ifdef WOS_SELFTEST
+// Exact lexical private-device expectation, not a retained area or ABA handle.
+// One try-only mutex admission, no consumer migration; refusal leaves it live.
+struct SelftestEmptyAreaExpectation {
+    const char* name;
+    ker::dev::BlockDevice* device;
+    uint64_t start_block;
+    uint64_t page_count;
+};
+[[nodiscard]] auto selftest_try_detach_empty_area(const SelftestEmptyAreaExpectation& expected) -> int;
+#endif
+
 }  // namespace ker::mod::mm::swap

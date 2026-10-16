@@ -40,6 +40,55 @@ struct alignas(4096) Transports {
 Transports transport{};
 int files[5]{-1, -1, -1, -1, -1};
 uint64_t deadline_ns{}, nonce{}, cookie{};
+uint64_t diagnostic_parent{};
+enum DiagnosticValid : uint32_t { FORK_RESULT = 1, WAIT_RESULT = 2, WAIT_STATUS = 4, CENSUS_RESULT = 8, LIBC_ERRNO = 16, HEADER = 32 };
+struct FailureDiagnostic {
+    const char* phase{"main"};
+    const char* stage{};
+    uint32_t valid{};
+    int64_t fork_result{}, wait_result{}, census_result{};
+    int32_t wait_status{};
+    int libc_errno{};
+    uint64_t header_reject{}, outcome{}, reason{};
+};
+FailureDiagnostic failure{};
+
+// Best effort on an already-owned descriptor. Diagnostic failure never changes
+// the original exit, retries I/O, creates another file or grants success.
+auto finish_failure(int code, const char* fallback) -> int {
+    if (files[4] < 0) return code;
+    if (failure.stage == nullptr) failure.stage = fallback;
+    char record[1024]{};
+    auto const length = std::snprintf(
+        record, sizeof(record),
+        "NUMA_CENSUS_FAILURE version=1 nonce=%llu cookie=%llu pid=%llu exit=%d phase=%s stage=%s valid=%u "
+        "fork_result=%lld wait_result=%lld wait_status=%d census_result=%lld libc_errno=%d header_reject=%llu outcome=%llu reason=%llu\n",
+        static_cast<unsigned long long>(nonce), static_cast<unsigned long long>(cookie), static_cast<unsigned long long>(diagnostic_parent),
+        code, failure.phase, failure.stage, failure.valid, static_cast<long long>(failure.fork_result),
+        static_cast<long long>(failure.wait_result), failure.wait_status, static_cast<long long>(failure.census_result), failure.libc_errno,
+        static_cast<unsigned long long>(failure.header_reject), static_cast<unsigned long long>(failure.outcome),
+        static_cast<unsigned long long>(failure.reason));
+    if (length > 0 && static_cast<size_t>(length) < sizeof(record) && ::lseek(files[4], 0, SEEK_SET) == 0 &&
+        ::write(files[4], record, static_cast<size_t>(length)) == length)
+        (void)::fsync(files[4]);
+    return code;
+}
+
+auto census_failure(nl::Phase phase, const char* stage, int64_t result, uint32_t valid, uint64_t reject = 0, int error = 0) -> bool {
+    failure = {.phase = phase == nl::Phase::PREPARE ? "PREPARE"
+                        : phase == nl::Phase::BEGIN ? "BEGIN"
+                                                    : "END",
+               .stage = stage,
+               .valid = valid,
+               .census_result = result,
+               .libc_errno = error,
+               .header_reject = reject};
+    if ((valid & HEADER) != 0) {
+        failure.outcome = transport.output.header.outcome;
+        failure.reason = transport.output.header.reason;
+    }
+    return false;
+}
 
 auto control(Control operation, uint64_t value = 0) -> int64_t { return ker::process::prctl(static_cast<int>(operation), value, 0, 0, 0); }
 auto identity(uint32_t uid, uint64_t authority) -> bool {
@@ -138,20 +187,32 @@ struct Child {
 }
 auto child(unsigned index, uint64_t parent, const char* seed, int64_t& pid_out) -> bool {
     auto const pid = ker::process::fork();
-    if (pid < 0) return false;
+    auto failed = [&](const char* stage, int64_t result = 0, int32_t status = 0, uint32_t valid = 0, int error = 0) {
+        failure = {.phase = index == 0 ? "warm" : "measured",
+                   .stage = stage,
+                   .valid = FORK_RESULT | valid,
+                   .fork_result = pid,
+                   .wait_result = result,
+                   .wait_status = status,
+                   .libc_errno = error};
+        return false;
+    };
+    if (pid < 0) return failed("fork");
     if (pid == 0) run_child(files[index], parent, seed);
-    if (pid <= 1 || static_cast<uint64_t>(pid) == parent) return false;
+    if (pid <= 1 || static_cast<uint64_t>(pid) == parent) return failed("fork-pid");
     Child owned{pid, true};
     pid_out = pid;
     for (;;) {
         int32_t status = -1;
         auto const result = owned.poll(status);
         if (result == pid) {
-            if (status != 0) return false;
+            if (status != 0) return failed("child-status", result, status, WAIT_RESULT | WAIT_STATUS);
             prefault_transport();  // No census/usercopy pin yet.
             return true;
         }
-        if ((result != 0 && result != -EINTR) || !time_left() || !pause_poll()) return false;
+        if (result != 0 && result != -EINTR) return failed("wait-result", result, 0, WAIT_RESULT);
+        if (!time_left()) return failed("wait-budget", result, 0, WAIT_RESULT);
+        if (!pause_poll()) return failed("wait-pause", result, 0, WAIT_RESULT | LIBC_ERRNO, errno);
     }
 }
 auto poll_census(nl::Phase phase) -> bool {
@@ -167,18 +228,26 @@ auto poll_census(nl::Phase phase) -> bool {
                              .reserved = {0, 0}};
         auto const result = static_cast<int64_t>(::syscall(static_cast<long>(ker::abi::callnums::vmem), nl::PRIVATE_VMEM_OP,
                                                            reinterpret_cast<uint64_t>(&transport.request), sizeof(nl::Request), 0, 0));
+        if (result != 0) return census_failure(phase, "census-transport", result, CENSUS_RESULT);
         auto const& h = transport.output.header;
-        if (result != 0 || h.version != nl::VERSION || h.bytes != sizeof(nl::Report) || h.phase != static_cast<uint32_t>(phase) ||
-            h.nonce != nonce || h.cookie == 0 || (cookie != 0 && h.cookie != cookie) ||
-            h.required_coverage != nl::KERNEL_COVERAGE_REQUIRED || h.reserved != 0 || h.root_incarnation == 0 || h.calls == 0 ||
-            h.capture_us >= h.absolute_deadline_us)
-            return false;
+        uint64_t const REJECT = (h.version != nl::VERSION ? 1 : 0) | (h.bytes != sizeof(nl::Report) ? 2 : 0) |
+                                (h.phase != static_cast<uint32_t>(phase) ? 4 : 0) | (h.nonce != nonce ? 8 : 0) |
+                                (h.cookie == 0 || (cookie != 0 && h.cookie != cookie) ? 16 : 0) |
+                                (h.required_coverage != nl::KERNEL_COVERAGE_REQUIRED ? 32 : 0) | (h.reserved != 0 ? 64 : 0) |
+                                (h.root_incarnation == 0 ? 128 : 0) | (h.calls == 0 ? 256 : 0) |
+                                (h.capture_us >= h.absolute_deadline_us ? 512 : 0);
+        if (REJECT != 0) return census_failure(phase, "census-header", result, CENSUS_RESULT | HEADER, REJECT);
         cookie = h.cookie;
-        if (h.outcome == static_cast<uint64_t>(nl::Outcome::ACCEPT))
-            return h.reason == 0 && h.coverage == nl::KERNEL_COVERAGE_REQUIRED && h.node_count >= 1 && h.node_count <= nl::MAX_NODES;
-        if (h.outcome != static_cast<uint64_t>(nl::Outcome::WAIT) || h.coverage != 0 || !pause_poll()) return false;
+        if (h.outcome == static_cast<uint64_t>(nl::Outcome::ACCEPT)) {
+            uint64_t const REJECT = (h.reason != 0 ? 1024 : 0) | (h.coverage != nl::KERNEL_COVERAGE_REQUIRED ? 2048 : 0) |
+                                    (h.node_count < 1 || h.node_count > nl::MAX_NODES ? 4096 : 0);
+            return REJECT == 0 || census_failure(phase, "census-accept", result, CENSUS_RESULT | HEADER, REJECT);
+        }
+        if (h.outcome != static_cast<uint64_t>(nl::Outcome::WAIT) || h.coverage != 0)
+            return census_failure(phase, "census-outcome", result, CENSUS_RESULT | HEADER);
+        if (!pause_poll()) return census_failure(phase, "census-pause", result, CENSUS_RESULT | HEADER | LIBC_ERRNO, 0, errno);
     }
-    return false;
+    return census_failure(phase, "census-budget", 0, 0);
 }
 auto save_record(int fd, const nl::Report& value) -> bool {
     return ::lseek(fd, 0, SEEK_SET) == 0 && write_all(fd, &value, sizeof(value)) && ::fsync(fd) == 0;
@@ -195,24 +264,27 @@ auto decimal(const char* text, uint64_t& value) -> bool {
 }  // namespace
 
 auto main(int argc, char** argv) -> int {
-    if (argc != 3 || std::strcmp(argv[1], "--nonce") != 0 || !decimal(argv[2], nonce) || ker::process::getppid() != 1 ||
-        !identity(0, INITIAL))
-        return 70;
+    bool const defer_shutdown = argc == 4 && std::strcmp(argv[3], "--defer-shutdown") == 0;
+    if ((argc != 3 && !defer_shutdown) || std::strcmp(argv[1], "--nonce") != 0 || !decimal(argv[2], nonce) ||
+        ker::process::getppid() != 1 || !identity(0, INITIAL))
+        return finish_failure(70, "arguments-identity");
     auto const parent = ker::process::getpid();
+    diagnostic_parent = parent;
     auto const start = now_ns();
-    if (parent <= 1 || parent > INT64_MAX || start == UINT64_MAX || start > UINT64_MAX - WHOLE_NS) return 70;
+    if (parent <= 1 || parent > INT64_MAX || start == UINT64_MAX || start > UINT64_MAX - WHOLE_NS)
+        return finish_failure(70, "parent-start-clock");
     deadline_ns = start + WHOLE_NS;
     (void)::umask(0077);
     prefault_transport();
-    if (!prepare_files() || !poll_census(nl::Phase::PREPARE)) return 73;
+    if (!prepare_files() || !poll_census(nl::Phase::PREPARE)) return finish_failure(73, "prepare-files");
     int64_t warm_pid{}, measured_pid{};
-    if (!child(0, parent, argv[2], warm_pid) || !poll_census(nl::Phase::BEGIN)) return 74;
+    if (!child(0, parent, argv[2], warm_pid) || !poll_census(nl::Phase::BEGIN)) return finish_failure(74, "warm-BEGIN");
     transport.begin = transport.output;
-    if (!child(1, parent, argv[2], measured_pid) || !poll_census(nl::Phase::END)) return 75;
+    if (!child(1, parent, argv[2], measured_pid) || !poll_census(nl::Phase::END)) return finish_failure(75, "measured-END");
     transport.end = transport.output;
     if (!identity(0, INITIAL) || ker::process::getppid() != 1 || !save_record(files[2], transport.begin) ||
         !save_record(files[3], transport.end))
-        return 76;
+        return finish_failure(76, "identity-report-save");
     char record[512]{};
     auto const length = std::snprintf(
         record, sizeof(record),
@@ -222,13 +294,13 @@ auto main(int argc, char** argv) -> int {
         static_cast<long long>(warm_pid), static_cast<long long>(measured_pid));
     if (length <= 0 || static_cast<size_t>(length) >= sizeof(record) || !write_all(files[4], record, static_cast<size_t>(length)) ||
         ::fsync(files[4]) != 0)
-        return 76;
+        return finish_failure(76, "success-witness-save");
     for (auto& fd : files) {
-        if (::close(fd) != 0) return 76;
+        if (::close(fd) != 0) return finish_failure(76, "close-files");
         fd = -1;
     }
     if (control(Control::DROP_AUTHORITY_CEILING, SIGNAL) != 0 || !identity(0, SIGNAL) || ker::process::getppid() != 1 ||
-        ker::process::kill(1, SIGUSR2) != 0)
-        return 77;
+        (!defer_shutdown && ker::process::kill(1, SIGUSR2) != 0))
+        return finish_failure(77, "identity-shutdown");
     return 0;  // Original init must separately consume0; admission is not poweroff.
 }

@@ -349,6 +349,74 @@ auto swapoff_path(const char* path) -> int {
     return 0;
 }
 
+#ifdef WOS_SELFTEST
+auto selftest_try_detach_empty_area(const SelftestEmptyAreaExpectation& expected) -> int {
+    if (expected.name == nullptr || expected.device == nullptr || expected.start_block != 0 || expected.page_count != 16) return -EINVAL;
+    size_t name_length = 0;
+    while (name_length < MAX_SWAP_NAME && expected.name[name_length] != '\0') ++name_length;
+    if (name_length == 0 || name_length == MAX_SWAP_NAME) return -EINVAL;
+    if (!g_swap_lock.try_lock()) return -EAGAIN;
+
+    SwapArea* detached = nullptr;
+    int result = -ENOENT;
+    size_t selected = 0;
+    for (size_t i = 0; i < g_swap_areas.size(); ++i) {
+        auto* area = g_swap_areas.at(i);
+        if (area == nullptr || area->name == nullptr || std::strcmp(area->name, expected.name) != 0) continue;
+        if (detached != nullptr) {
+            result = -ESTALE;
+            detached = nullptr;
+            break;
+        }
+        detached = area;
+        selected = i;
+    }
+    if (detached != nullptr) {
+        auto* area = detached;
+        if (area->id == 0 || area->id == UINT32_MAX || area->backing_file != nullptr || area->extent_count != 1 ||
+            area->extents == nullptr || area->extents[0].device != expected.device ||
+            area->extents[0].start_block != expected.start_block || area->extents[0].page_count != expected.page_count)
+            result = -ESTALE;
+        else if (area->state != AreaState::ACTIVE || area->used_pages != 0 || area->io_in_flight != 0)
+            result = -EBUSY;
+        else if (area->total_pages != 16 || area->free_pages != 16 || area->slots == nullptr)
+            result = -EIO;
+        else {
+            result = 0;
+            for (size_t i = 0; i < 16; ++i) {
+                if (area->slots[i].io_in_flight) {
+                    result = -EBUSY;
+                    break;
+                }
+                if (area->slots[i].state != SlotState::FREE) {
+                    result = -EIO;
+                    break;
+                }
+            }
+            uint64_t seen = 0;
+            uint64_t next = area->free_head;
+            for (size_t i = 0; result == 0 && i < 16; ++i) {
+                if (next >= 16 || (seen & (uint64_t{1} << next)) != 0) {
+                    result = -EIO;
+                    break;
+                }
+                seen |= uint64_t{1} << next;
+                next = area->slots[next].next_free;
+            }
+            if (result == 0 && (seen != 0xffff || next != NO_FREE_SLOT)) result = -EIO;
+        }
+        if (result == 0)
+            g_swap_areas.remove_at(selected);
+        else
+            detached = nullptr;
+    }
+    g_swap_lock.unlock();
+    // The exact device/name stay alive through this null-backing descriptor tail.
+    if (detached != nullptr) destroy_area(detached);
+    return result;
+}
+#endif
+
 auto swap_available() -> bool {
     ker::mod::sys::MutexGuard guard(g_swap_lock);
     for (auto* area : g_swap_areas) {

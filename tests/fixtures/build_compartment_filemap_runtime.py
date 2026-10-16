@@ -86,6 +86,7 @@ def main():
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--sysroot", type=Path, help="explicit target sysroot for isolated diagnostic fixtures")
     args = parser.parse_args()
     root = args.root.resolve(strict=True)
     source = args.source.absolute()
@@ -94,7 +95,9 @@ def main():
     output = args.output.absolute()
     compiler = root / "toolchain/host/bin/clang++"
     linker = root / "toolchain/host/bin/ld.lld"
-    sysroot = root / "toolchain/sysroot"
+    sysroot = args.sysroot.resolve(strict=True) if args.sysroot is not None else root / "toolchain/sysroot"
+    if args.sysroot is not None and not all((sysroot / name).is_dir() for name in ("include", "lib")):
+        parser.error("explicit target sysroot must contain include and lib directories")
     dependencies = Path(str(output) + ".d")
     link_dependencies = Path(str(output) + ".link.d")
     receipt = Path(str(output) + ".build.json")

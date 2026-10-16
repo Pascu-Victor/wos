@@ -381,6 +381,10 @@ set_tests_properties(numa_mm_activity_runtime_test PROPERTIES LABELS "unit;host;
 add_test(NAME numa_lifecycle_census_codec_test
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_lifecycle_census_codec_test.py)
 set_tests_properties(numa_lifecycle_census_codec_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 60)
+add_test(NAME numa_lifecycle_helper_diagnostics_test
+    COMMAND ${CMAKE_COMMAND} -E env WOS_HOST_CXX=${CMAKE_CXX_COMPILER}
+        ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_lifecycle_helper_diagnostics_test.py)
+set_tests_properties(numa_lifecycle_helper_diagnostics_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 80)
 add_test(NAME numa_chase_runtime_test
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_chase_runtime_test.py
         --cxx ${CMAKE_CXX_COMPILER})
@@ -410,6 +414,10 @@ add_test(NAME anonymous_current_usercopy_runtime_test
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/anonymous_current_usercopy_runtime_test.py
         --host-build ${CMAKE_BINARY_DIR})
 set_tests_properties(anonymous_current_usercopy_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 140)
+add_test(NAME anonymous_scheduled_usercopy_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/anonymous_scheduled_usercopy_runtime_test.py
+        --host-build ${CMAKE_BINARY_DIR})
+set_tests_properties(anonymous_scheduled_usercopy_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 140)
 add_test(NAME eager_fork_placement_runtime_test
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/eager_fork_placement_runtime_test.py
         --cxx ${CMAKE_CXX_COMPILER} --negative-controls)

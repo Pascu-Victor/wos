@@ -627,6 +627,21 @@ bool selftest_user_pagemap_exclusive_rejects_mapped_pin(PageTable* pagemap);
 bool selftest_anonymous_swap_pageout(PageTable* pagemap, vaddr_t vaddr, const numa::AllocationContext& placement);
 bool selftest_anonymous_swap_pagein(PageTable* pagemap, vaddr_t vaddr, const numa::AllocationContext& placement);
 bool selftest_anonymous_swap_is_swapped(PageTable* pagemap, vaddr_t vaddr);
+// Current-continuation diagnostics only; copied values grant no root/frame owner.
+enum class SelftestCurrentAnonymousState : uint64_t { NONE, PAGEOUT, SWAPPED, PAGEIN, FAILED, INVALID };
+struct SelftestCurrentAnonymousPage {
+    uint64_t root_serial{};
+    SelftestCurrentAnonymousState state{SelftestCurrentAnonymousState::INVALID};
+    uint64_t resident{}, normal{}, frame_refs{}, object_refs{}, queued{}, cancelled{};
+    uint64_t frame_present{}, waiter_present{}, gate_present{}, user{}, task_accesses{}, root_gate_readers{}, pte_flags{}, reserved{};
+    uint64_t lazy_matches{}, lazy_start{}, lazy_end{}, lazy_prot{}, lazy_flags{}, lazy_kind{};
+};
+static_assert(sizeof(SelftestCurrentAnonymousPage) == 176);
+[[nodiscard]] auto selftest_observe_current_anonymous_page(sched::task::Task& actor, vaddr_t address, uint64_t expected_root_serial,
+                                                           SelftestCurrentAnonymousPage& output) -> bool;
+[[nodiscard]] auto selftest_pageout_current_anonymous_page(sched::task::Task& actor, vaddr_t address, uint64_t expected_root_serial,
+                                                           const numa::AllocationContext& placement) -> bool;
+
 #endif
 auto install_lazy_file_page_if_current(sched::task::Task* task, const sched::task::LazyVmemRange& range, vaddr_t page_vaddr,
                                        paddr_t page_paddr, uint64_t page_flags,

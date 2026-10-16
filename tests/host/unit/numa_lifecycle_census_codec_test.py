@@ -164,6 +164,7 @@ def main():
         reject("measured.log", original["measured.log"][:-1] + b"x")
         reject("witness.txt", original["witness.txt"].replace(b"warm_wait0=1", b"warm_wait0=0"))
         reject("witness.txt", original["witness.txt"].replace(b"measured_pid=4", b"measured_pid=3"))
+        reject("witness.txt", b"NUMA_CENSUS_FAILURE version=1 nonce=11 exit=74 phase=warm stage=fork\n".ljust(4096, b"\0"))
         assert codec.decode(directory, NONCE, 2) == good
         checks += 1
     print(f"PASS strict saved census codec checks={checks}; synthetic controls only; no runtime qualification")

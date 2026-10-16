@@ -22,12 +22,12 @@
 namespace model {
 unsigned checks{}, cases{}, allocations{}, reclaim_calls{}, releases{}, reads{}, slot_frees{}, wakes{}, yields{}, captures{};
 unsigned cow{}, pin{}, queue{}, gates{}, preempt{}, noio{}, last_alloc_noio{};
-unsigned preparation_scopes{}; bool interrupts{true}, missing_leaf{};
+unsigned preparation_scopes{}, parks{}; bool interrupts{true}, missing_leaf{}, runqueues{true};
 unsigned current_usercopy_accesses();
 bool fail_alloc{}, fail_gate{}, fail_capture{}, published{true};
 bool shutdown{}, enabled{true}, fail_create{}, post_result{true}, corrupt_failed_post{}, waiting{};
 unsigned created{}, destroyed{}, thread_deletes{}, stack_frees{}, lazy_returns{}, fd_returns{}, posts{}, block_calls{}, deferred_exit_checks{};
-std::function<void()> post_hook, block_hook, slot_hook, write_hook, free_hook, yield_hook;
+std::function<void()> post_hook, block_hook, slot_hook, write_hook, free_hook, yield_hook, park_hook, wake_hook;
 struct WorkerExit {}; struct WorkerPark {}; struct Panic {}; struct AutomaticExit {};
 void checkpoint();
 int io_error{};
@@ -109,6 +109,8 @@ void preempt_enable() {
 namespace task {
 enum class TaskState { ACTIVE, EXITING, DEAD };
 enum class TaskType { DAEMON, PROCESS };
+// Explicit continuation-admission endpoint, not a scheduler implementation.
+enum class WaitChannelKind { GENERIC, WKI_EXECVE_PROXY };
 struct Thread { ~Thread() { ++model::thread_deletes; } };
 struct Task {
     static constexpr uint32_t ACTIVE_REGISTRY_INDEX_INVALID=UINT32_MAX;
@@ -128,6 +130,11 @@ struct Task {
     std::atomic<uint32_t> usercopy_pagemap_accesses{};
     std::atomic<bool> usercopy_pagemap_closing{},scheduler_transition_active{},exit_in_progress{};
     uint64_t syscall_account_start_us{}; bool has_exited{};
+    bool deferred_task_switch{}, wants_block{}, voluntary{}, interrupting_signal{}, wki_execve{};
+    uint32_t wki_proxy_task_id{};
+    auto is_voluntary_blocked() const -> bool { return voluntary; }
+    auto wait_channel_is(WaitChannelKind kind) const -> bool { return kind==WaitChannelKind::WKI_EXECVE_PROXY && wki_execve; }
+    auto has_interrupting_signal_pending() -> bool { return interrupting_signal; }
     auto memory_policy_snapshot() const noexcept -> mm::numa::Policy { return policy; }
     auto try_acquire_usercopy_pagemap(mm::paging::PageTable*& out) -> bool;
     void release_usercopy_pagemap();
@@ -150,12 +157,23 @@ void release_cloned_fd_table_refs(Task*t){t->has_fds=false;++model::fd_returns;}
 void destroy_unpublished_user_thread(Task*);
 }
 task::Task* current{};
+auto has_run_queues()->bool{return model::runqueues;}
 auto can_query_current_task()->bool{return current!=nullptr;}
 auto get_current_task()->task::Task*{return current;}
 auto kernel_threads_shutdown_requested()->bool{return model::shutdown;}
 auto interrupts_enabled()->bool{return model::interrupts;}
 auto preempt_count()->uint32_t{return model::preempt;}
-void wake_task_from_event(task::Task*t){model::check(!model::cow&&!model::queue&&!model::pin,"canonical wake outside metadata locks");++model::wakes;t->wakeup_pending=true;model::waiting=false;}
+void wake_task_from_event(task::Task*t){model::check(!model::cow&&!model::queue&&!model::pin,"canonical wake outside metadata locks");++model::wakes;t->wakeup_pending=true;model::waiting=false;if(model::wake_hook){auto h=std::move(model::wake_hook);h();}}
+// Actual wait loop calls this finite PROCESS continuation endpoint. It proves
+// caller ownership is absent; real rescheduling/lost-wake behavior is not modeled.
+void preemptible_syscall_park(const char* reason, task::WaitChannelKind kind) {
+    model::check(std::strcmp(reason,"anon_swap")==0 && kind==task::WaitChannelKind::GENERIC,"exact continuation park request");
+    model::check(current && current->type==task::TaskType::PROCESS && model::interrupts && !model::preempt &&
+                     !model::cow && !model::pin && !model::queue && model::current_usercopy_accesses()==0,
+                 "park outside all caller leases and metadata owners");
+    model::check(++model::parks<8,"finite supplied park progress");
+    if(model::park_hook){auto h=std::move(model::park_hook);h();}
+}
 void kern_yield(){++model::yields;model::check(model::yields<20,"bounded migrate progress");if(model::yield_hook){auto h=std::move(model::yield_hook);h();}model::checkpoint();}
 auto hold_kernel_shutdown()->KernelShutdownHold{return KernelShutdownHold(current?&current->kernel_shutdown_ownership:nullptr);}
 [[noreturn]]void exit_current_kernel_thread(){model::check(current&&!current->kernel_shutdown_ownership.held(),"all worker drain holds released before exit");current->state=task::TaskState::DEAD;throw model::WorkerExit{};}
@@ -651,4 +669,5 @@ void run() {
 STARTUP_TASK_ENDPOINTS
 STARTUP_CASES
 CURRENT_PREPARE_CASES
-int main(int argc,char**argv) { if(argc==2&&std::strcmp(argv[1],"--post-write-only")==0){fixture::run_postwrite_control();return 0;}fixture::run(); fixture::run_readiness(); fixture::run_current_preparation(); }
+CURRENT_WAIT_CASES
+int main(int argc,char**argv) { if(argc==2&&std::strcmp(argv[1],"--post-write-only")==0){fixture::run_postwrite_control();return 0;}fixture::run(); fixture::run_readiness(); fixture::run_current_preparation(); fixture::run_current_wait(); }

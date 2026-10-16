@@ -1,6 +1,7 @@
 #include "sys_vmem.hpp"
 
 #ifdef WOS_SELFTEST
+#include <test/anonymous_usercopy_runtime.hpp>
 #include <test/numa_lifecycle_census.hpp>
 #include <test/numa_lifecycle_mm_debt.hpp>
 #endif
@@ -5003,6 +5004,7 @@ void selftest_file_registry_snapshot(::ker::test::numa_lifecycle::RegistrySnapsh
 
 auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -> uint64_t {
 #ifdef WOS_SELFTEST
+    if (op == ker::test::anonymous_usercopy::PRIVATE_VMEM_OP) return ker::test::anonymous_usercopy::dispatch(a1, a2, a3, a4);
     if (op == ker::test::numa_lifecycle::PRIVATE_VMEM_OP) return ker::test::numa_lifecycle::dispatch_current_census(a1, a2, a3, a4);
 #endif
     switch (static_cast<ker::abi::vmem::ops>(op)) {

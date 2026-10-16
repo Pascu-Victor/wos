@@ -1749,6 +1749,14 @@ auto detach_anonymous_swap_object_locked(AnonymousSwapMapping* mapping) -> Anony
     return object->mapping_refs == 0 ? object : nullptr;
 }
 
+// A detached node keeps its pending generation until the producer consumes its
+// final intrusive link. A NULL descriptor pointer alone is not reuse authority.
+auto anonymous_swap_waiter_idle_locked(const sched::task::Task& task) -> bool {
+    return task.anonymous_swap_wait_mapping == nullptr && task.anonymous_swap_wait_next == nullptr &&
+           (task.anonymous_swap_wait_generation == 0 ||
+            task.anonymous_swap_completion_generation.load(std::memory_order_acquire) == task.anonymous_swap_wait_generation);
+}
+
 auto detach_anonymous_swap_waiters_locked(AnonymousSwapMapping* mapping) -> sched::task::Task* {
     auto* waiters = mapping != nullptr ? mapping->waiters : nullptr;
     if (mapping != nullptr) {
@@ -1756,7 +1764,6 @@ auto detach_anonymous_swap_waiters_locked(AnonymousSwapMapping* mapping) -> sche
     }
     for (auto* task = waiters; task != nullptr; task = task->anonymous_swap_wait_next) {
         task->anonymous_swap_wait_mapping = nullptr;
-        task->anonymous_swap_completion_generation.store(task->anonymous_swap_wait_generation, std::memory_order_release);
     }
     return waiters;
 }
@@ -1764,8 +1771,16 @@ auto detach_anonymous_swap_waiters_locked(AnonymousSwapMapping* mapping) -> sche
 void wake_anonymous_swap_waiters(sched::task::Task* waiters) {
     while (waiters != nullptr) {
         auto* task = waiters;
-        waiters = task->anonymous_swap_wait_next;
-        task->anonymous_swap_wait_next = nullptr;
+        {
+            uint64_t const FLAGS = cow_pte_lock.lock_irqsave();
+            waiters = task->anonymous_swap_wait_next;
+            uint64_t const GENERATION = task->anonymous_swap_wait_generation;
+            task->anonymous_swap_wait_next = nullptr;
+            // Last intrusive access: a same-Task registration may now reuse
+            // the node even before its old canonical wake/ref return below.
+            task->anonymous_swap_completion_generation.store(GENERATION, std::memory_order_release);
+            cow_pte_lock.unlock_irqrestore(FLAGS);
+        }
         sched::wake_task_from_event(task);
         task->release();
 #ifdef WOS_SELFTEST
@@ -1843,9 +1858,11 @@ auto probe_anonymous_swap_fault_locked(sched::task::Task* task, vaddr_t vaddr, c
         bool const PREPARED = allocation == AnonymousPageinAllocation::PREPARED;
         if (PREPARED && (!user_frame || prepared == nullptr || prepared->span.data() == nullptr || prepared->span.pages() != 1))
             return AnonymousSwapFaultDisposition::FAILED;
+        uint64_t const GENERATION = next_anonymous_swap_generation();
+        if (GENERATION == 0 || GENERATION == UINT64_MAX) return AnonymousSwapFaultDisposition::FAILED;
         size_t access_gate = USER_PAGEMAP_ACCESS_GATE_NONE;
         if (!acquire_user_pagemap_access(mapping->pagemap, false, access_gate)) return AnonymousSwapFaultDisposition::FAILED;
-        mapping->generation = next_anonymous_swap_generation();
+        mapping->generation = GENERATION;
         mapping->pagein_placement = *placement;
         mapping->pagein_placement_valid = true;
         mapping->pagein_allocation = allocation;
@@ -1879,7 +1896,8 @@ auto probe_anonymous_swap_fault_locked(sched::task::Task* task, vaddr_t vaddr, c
 #ifdef WOS_SELFTEST
     debt::begin_change();
 #endif
-    if (task->anonymous_swap_wait_mapping != nullptr || !task->try_acquire()) {
+    if (mapping->generation == 0 || mapping->generation == UINT64_MAX || !anonymous_swap_waiter_idle_locked(*task) ||
+        !task->try_acquire()) {
 #ifdef WOS_SELFTEST
         debt::end_change();
 #endif
@@ -2513,6 +2531,7 @@ auto pageout_anonymous_candidate(AnonymousPageoutCandidate& candidate) -> bool {
     bool committed = false;
     bool restored = false;
     AnonymousSwapObject* object_to_release = nullptr;
+    sched::task::Task* waiters = nullptr;
     {
         uint64_t const FLAGS = cow_pte_lock.lock_irqsave();
         uint64_t const PIN_FLAGS = user_mapping_pin_lock.lock_irqsave();
@@ -2534,11 +2553,13 @@ auto pageout_anonymous_candidate(AnonymousPageoutCandidate& candidate) -> bool {
                 *entry = pte_from_raw(mapping->original_raw);
                 restored = true;
             }
+            waiters = detach_anonymous_swap_waiters_locked(mapping);
             remove_anonymous_swap_mapping_locked(mapping);
             object_to_release = detach_anonymous_swap_object_locked(mapping);
             mapping->frame = nullptr;
             anonymous_swap_add(anonymous_swap_stats.pageout_failures);
         }
+        if (committed) waiters = detach_anonymous_swap_waiters_locked(mapping);
         anonymous_swap_stats.pageout_inflight.fetch_sub(1, std::memory_order_relaxed);
         user_mapping_pin_lock.unlock_irqrestore(PIN_FLAGS);
         cow_pte_lock.unlock_irqrestore(FLAGS);
@@ -2555,6 +2576,11 @@ auto pageout_anonymous_candidate(AnonymousPageoutCandidate& candidate) -> bool {
         }
         phys::page_ref_dec(candidate.frame);
         release_anonymous_swap_object(object_to_release);
+    }
+    // Terminal COW detached every descriptor pointer before SWAPPED/removal
+    // became observable. Only retained Task nodes survive the actual returns.
+    wake_anonymous_swap_waiters(waiters);
+    if (!committed) {
 #ifdef WOS_SELFTEST
         delete_swap_descriptor(mapping, DebtField::SWAP_MAPPINGS, true);
 #else
@@ -6963,10 +6989,84 @@ auto prepare_captured_tmpfs_read_shared_page(sched::task::Task& task, const sche
     return mapped;
 }
 
-// A scalar snapshot grants no owner after return. Only the actual current
-// continuation supplies Task lifetime; every caller lease ends before I/O.
+enum class AnonymousCurrentSurvey : int { NOT_TRACKED = 0, PREPARE = 1, JOINED = 2 };
+
+auto current_anonymous_wait_context(const sched::task::Task& actor) -> bool {
+    return sched::has_run_queues() && sched::can_query_current_task() && sched::get_current_task() == &actor &&
+           actor.type == sched::task::TaskType::PROCESS && actor.syscall_account_start_us != 0 &&
+           actor.state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE &&
+           !actor.scheduler_transition_active.load(std::memory_order_acquire) && !actor.deferred_task_switch && !actor.wants_block &&
+           !actor.is_voluntary_blocked() && actor.wki_proxy_task_id == 0 &&
+           !actor.wait_channel_is(sched::task::WaitChannelKind::WKI_EXECVE_PROXY) && sched::interrupts_enabled() &&
+           sched::preempt_count() == 0;
+}
+
+void cancel_current_anonymous_wait(sched::task::Task& actor, uint64_t generation) {
+    bool returned = false;
+    {
+        uint64_t const FLAGS = cow_pte_lock.lock_irqsave();
+        if (actor.anonymous_swap_wait_mapping != nullptr && actor.anonymous_swap_wait_generation == generation) {
+            // Resolve the opaque node pointer against the live list before
+            // dereferencing a descriptor. Detached cancellation touches none
+            // of the producer's links, generation, completion or references.
+            auto* mapping = anonymous_swap_mappings;
+            while (mapping != nullptr && static_cast<void*>(mapping) != actor.anonymous_swap_wait_mapping) mapping = mapping->next;
+            if (mapping != nullptr) {
+                auto** link = &mapping->waiters;
+                while (*link != nullptr && *link != &actor) link = &(*link)->anonymous_swap_wait_next;
+                if (*link == &actor) {
+#ifdef WOS_SELFTEST
+                    debt::begin_change();
+#endif
+                    *link = actor.anonymous_swap_wait_next;
+                    actor.anonymous_swap_wait_mapping = nullptr;
+                    actor.anonymous_swap_wait_next = nullptr;
+                    actor.anonymous_swap_wait_generation = 0;
+                    returned = true;
+#ifdef WOS_SELFTEST
+                    debt::end_change();
+#endif
+                }
+            }
+        }
+        cow_pte_lock.unlock_irqrestore(FLAGS);
+    }
+    if (returned) {
+        actor.release();
+#ifdef WOS_SELFTEST
+        debt::drop(DebtField::SWAP_WAITERS);
+#endif
+    }
+}
+
+auto wait_current_anonymous_page(sched::task::Task& actor, const AnonymousPageinSnapshot& snapshot) -> int {
+    for (;;) {
+        if (actor.anonymous_swap_completion_generation.load(std::memory_order_acquire) == snapshot.generation) return 0;
+        int cancelled = 0;
+        if (actor.state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE ||
+            actor.exit_in_progress.load(std::memory_order_acquire) || actor.has_exited ||
+            actor.usercopy_pagemap_closing.load(std::memory_order_acquire)) {
+            cancelled = -ECANCELED;
+        } else if (!current_anonymous_wait_context(actor) || sched::kernel_threads_shutdown_requested()) {
+            cancelled = -EWOULDBLOCK;
+        } else if (actor.has_interrupting_signal_pending()) {
+            cancelled = -EINTR;
+        }
+        if (cancelled != 0) {
+            cancel_current_anonymous_wait(actor, snapshot.generation);
+            return cancelled;
+        }
+        // No Task-local/root/pin/metadata or unused candidate owner survives
+        // here. Event-before-park is the existing scheduler wakeup_pending
+        // protocol; a spurious wake only repeats this exact token predicate.
+        sched::preemptible_syscall_park("anon_swap", sched::task::WaitChannelKind::GENERIC);
+    }
+}
+
+// A scalar snapshot grants no root owner after return. A joined Task node
+// belongs to its producer; every caller pagemap lease ends before wait/I/O.
 auto capture_current_anonymous_user_page(sched::task::Task& actor, uint64_t page, bool writable, AnonymousPageinSnapshot& snapshot,
-                                         const AnonymousPageinSnapshot* expected_root = nullptr) -> int {
+                                         const AnonymousPageinSnapshot* expected_root = nullptr, bool join_transient = false) -> int {
     PageTable* root = nullptr;
 #ifdef WOS_KASAN
     // Task's instrumented output store must see addressable caller storage.
@@ -6994,6 +7094,58 @@ auto capture_current_anonymous_user_page(sched::task::Task& actor, uint64_t page
                 result = mapping->error < 0 ? mapping->error : -EIO;
             } else if (mapping->pagein_queued || mapping->state != AnonymousSwapRuntimeState::SWAPPED) {
                 result = -EAGAIN;
+                if (join_transient && !anonymous_swap_service_closed && !sched::kernel_threads_shutdown_requested()) {
+                    bool const USER_PRIVATE =
+                        (mapping->original_raw & paging::PAGE_USER) != 0U && (mapping->original_raw & paging::PAGE_SHARED) == 0U;
+                    bool const WRITABLE = !writable || (mapping->original_raw & (paging::PAGE_WRITE | paging::PAGE_COW)) != 0U;
+                    bool const GENERATION = mapping->generation != 0 && mapping->generation != UINT64_MAX;
+                    bool const OBJECT = mapping->object != nullptr && mapping->object->mapping_refs != 0;
+                    bool const PAGEOUT = mapping->state == AnonymousSwapRuntimeState::PAGEOUT && !mapping->pagein_queued &&
+                                         mapping->frame != nullptr && mapping->maintenance_valid;
+                    bool const PAGEIN = mapping->pagein_queued && mapping->pagein_placement_valid &&
+                                        (mapping->state == AnonymousSwapRuntimeState::SWAPPED ||
+                                         (mapping->state == AnonymousSwapRuntimeState::PAGEIN && mapping->frame != nullptr));
+                    if (!USER_PRIVATE || !WRITABLE) {
+                        result = -EFAULT;
+                    } else if (GENERATION && OBJECT && (PAGEOUT || PAGEIN)) {
+                        bool current = false;
+                        uint64_t const PIN_FLAGS = user_mapping_pin_lock.lock_irqsave();
+                        auto* entry = leaf_entry(root, page);
+                        if (entry != nullptr) {
+                            uint64_t const RAW = pte_raw(*entry);
+                            if (PAGEOUT) {
+                                current =
+                                    entry->present != 0 && RAW == mapping->frozen_raw &&
+                                    (static_cast<uint64_t>(entry->frame) << paging::PAGE_SHIFT) ==
+                                        reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<uint64_t>(mapping->frame)));
+                            } else {
+                                current = entry->present == 0 && is_reserved_leaf(*entry) &&
+                                          RAW == anonymous_swap_marker_raw(mapping->original_raw);
+                            }
+                        }
+                        user_mapping_pin_lock.unlock_irqrestore(PIN_FLAGS);
+                        if (current) {
+#ifdef WOS_SELFTEST
+                            debt::begin_change();
+#endif
+                            if (anonymous_swap_waiter_idle_locked(actor) && actor.try_acquire()) {
+                                snapshot = {reinterpret_cast<uint64_t>(root), serial, mapping->generation, page};
+                                actor.anonymous_swap_wait_mapping = mapping;
+                                actor.anonymous_swap_wait_generation = mapping->generation;
+                                actor.anonymous_swap_completion_generation.store(0, std::memory_order_relaxed);
+                                actor.anonymous_swap_wait_next = mapping->waiters;
+                                mapping->waiters = &actor;
+#ifdef WOS_SELFTEST
+                                debt::add(DebtField::SWAP_WAITERS);
+#endif
+                                result = static_cast<int>(AnonymousCurrentSurvey::JOINED);
+                            }
+#ifdef WOS_SELFTEST
+                            debt::end_change();
+#endif
+                        }
+                    }
+                }
             } else if ((mapping->original_raw & paging::PAGE_USER) == 0U || (mapping->original_raw & paging::PAGE_SHARED) != 0U ||
                        (writable && (mapping->original_raw & (paging::PAGE_WRITE | paging::PAGE_COW)) == 0U)) {
                 result = -EFAULT;
@@ -7110,17 +7262,36 @@ auto prepare_current_anonymous_user_page(sched::task::Task& actor, uint64_t addr
     auto* copied_policy = ::new (static_cast<void*>(policy_storage)) numa::Policy(actor.memory_policy_snapshot());
     auto const CAPTURE = numa::capture_allocation_context(*copied_policy, placement);
     placement.virtual_page_index = PAGE / paging::PAGE_SIZE;
-    AnonymousPageinSnapshot snapshot{};
-    int const SURVEY = capture_current_anonymous_user_page(actor, PAGE, writable, snapshot);
-    if (SURVEY <= 0) return SURVEY;
-    if (CAPTURE != numa::AllocationError::NONE) return anonymous_allocation_error(CAPTURE);
-    // No caller Task/root/pin/CPU lease survives this single issue attempt.
-    auto const completion = service_anonymous_pagein(snapshot, placement, AnonymousPageinAdmission::ORDINARY);
-    if (completion.status != 0) return completion.status < 0 ? completion.status : -EIO;
-    if (completion.retry || completion.retired) return -EAGAIN;
-    AnonymousPageinSnapshot confirmed{};
-    int const CURRENT = capture_current_anonymous_user_page(actor, PAGE, writable, confirmed, &snapshot);
-    return CURRENT == 0 ? 0 : (CURRENT < 0 ? CURRENT : -EAGAIN);
+    AnonymousPageinSnapshot root_identity{};
+    bool root_bound = false;
+    bool joined = false;
+    bool issued = false;
+    for (;;) {
+        AnonymousPageinSnapshot snapshot{};
+        bool const JOIN = !joined && current_anonymous_wait_context(actor);
+        int const SURVEY =
+            capture_current_anonymous_user_page(actor, PAGE, writable, snapshot, root_bound ? &root_identity : nullptr, JOIN);
+        if (SURVEY <= 0) return SURVEY;
+        if (!root_bound) {
+            root_identity = snapshot;
+            root_bound = true;
+        }
+        if (SURVEY == static_cast<int>(AnonymousCurrentSurvey::JOINED)) {
+            joined = true;
+            int const WAIT = wait_current_anonymous_page(actor, snapshot);
+            if (WAIT != 0) return WAIT;
+            continue;
+        }
+        if (issued) return -EAGAIN;
+        if (CAPTURE != numa::AllocationError::NONE) return anonymous_allocation_error(CAPTURE);
+        // The original initiating context is retained across at most one
+        // joined generation and one synchronous issue. A retry cannot carry
+        // this service's unused candidate across a later wait.
+        issued = true;
+        auto const completion = service_anonymous_pagein(snapshot, placement, AnonymousPageinAdmission::ORDINARY);
+        if (completion.status != 0 && !completion.retry) return completion.status < 0 ? completion.status : -EIO;
+        if (completion.retired) return -EAGAIN;
+    }
 }
 
 auto capture_user_root_incarnation(PageTable* root, uint64_t& empty) noexcept -> bool {
@@ -7948,6 +8119,192 @@ bool ensure_user_page_writable(sched::task::Task* task, vaddr_t vaddr) { return 
 bool ensure_user_page_mapped(sched::task::Task* task, vaddr_t vaddr) { return ensure_user_page_mapped_for_task(task, vaddr); }
 
 #ifdef WOS_SELFTEST
+namespace {
+auto selftest_current_anonymous_actor(sched::task::Task& actor) -> bool {
+    return sched::can_query_current_task() && sched::get_current_task() == &actor && actor.type == sched::task::TaskType::PROCESS &&
+           actor.syscall_account_start_us != 0 && actor.state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE &&
+           !actor.is_thread && !actor.shares_user_pagemap.load(std::memory_order_acquire) && !actor.has_exited &&
+           !actor.scheduler_transition_active.load(std::memory_order_acquire) && !actor.exit_in_progress.load(std::memory_order_acquire) &&
+           !actor.usercopy_pagemap_closing.load(std::memory_order_acquire) && sched::interrupts_enabled() && sched::preempt_count() == 0;
+}
+}  // namespace
+
+auto selftest_observe_current_anonymous_page(sched::task::Task& actor, vaddr_t address, uint64_t expected_root_serial,
+                                             SelftestCurrentAnonymousPage& output) -> bool {
+    output = {};
+    if (address >= 0x0000800000000000ULL || expected_root_serial == 0 || !selftest_current_anonymous_actor(actor)) return false;
+    PageTable* root = nullptr;
+#ifdef WOS_KASAN
+    if (kasan::is_enabled()) kasan::unpoison_range(&root, sizeof(root));
+#endif
+    if (!actor.try_acquire_usercopy_pagemap(root)) return false;
+    size_t gate = USER_PAGEMAP_ACCESS_GATE_NONE;
+    if (root == nullptr || root == kernel_pagemap || !acquire_user_pagemap_access(root, false, gate)) {
+        actor.release_usercopy_pagemap();
+        return false;
+    }
+    SelftestCurrentAnonymousPage observed{};
+    bool valid = false;
+    uint64_t const COW_FLAGS = cow_pte_lock.lock_irqsave();
+    uint64_t const LAZY_FLAGS = actor.lazy_vmem_lock.lock_irqsave();
+    uint64_t const PIN_FLAGS = user_mapping_pin_lock.lock_irqsave();
+    auto* control = find_user_root_control_locked(root);
+    if (actor.pagemap == root && control != nullptr && control->serial == expected_root_serial) {
+        observed.root_serial = control->serial;
+        observed.state = SelftestCurrentAnonymousState::NONE;
+        uint64_t const PAGE = page_align_down(address);
+        bool const LAZY_BOUNDED = actor.lazy_vmem_ranges.size() <= 256;
+        if (LAZY_BOUNDED) {
+            for (size_t row_index = 0; row_index < actor.lazy_vmem_ranges.size(); ++row_index) {
+                auto const& range = actor.lazy_vmem_ranges.at(row_index);
+                if (PAGE < range.start || PAGE >= range.end) continue;
+                ++observed.lazy_matches;
+                observed.lazy_start = range.start;
+                observed.lazy_end = range.end;
+                observed.lazy_prot = range.prot;
+                observed.lazy_flags = range.flags;
+                observed.lazy_kind = static_cast<uint64_t>(range.kind);
+            }
+        }
+        PageTable* table = root;
+        PageTableEntry* entry = nullptr;
+        bool absent = false;
+        bool unsupported = false;
+        // Four bounded levels; distinguish a true missing ancestor from the
+        // generic leaf_entry PS refusal, without interpreting a PS frame as PT.
+        for (int level = 4; level > 1; --level) {
+            auto const& parent = table->entries[index_of(PAGE, level)];
+            if (!parent.present) {
+                absent = true;
+                break;
+            }
+            if ((pte_raw(parent) & (uint64_t{1} << 7)) != 0 || !parent.user) {
+                unsupported = true;
+                break;
+            }
+            table = reinterpret_cast<PageTable*>(addr::get_virt_pointer(static_cast<uint64_t>(parent.frame) << paging::PAGE_SHIFT));
+        }
+        if (!absent && !unsupported) entry = &table->entries[index_of(PAGE, 1)];
+        if (entry != nullptr) {
+            observed.pte_flags = pte_raw(*entry) & ~PTE_FRAME_MASK;
+            observed.resident = entry->present;
+            observed.user = entry->user;
+            if (entry->present) {
+                auto* frame = reinterpret_cast<void*>(addr::get_virt_pointer(static_cast<uint64_t>(entry->frame) << paging::PAGE_SHIFT));
+                observed.normal = phys::page_kind_get(frame) == PageKind::NORMAL;
+                observed.frame_refs = phys::page_ref_get(frame);
+            }
+            valid = true;
+        }
+        // Missing lower tables after actual cleanup are a valid absent page;
+        // every large/unknown/supervisor ancestor remains refused.
+        if (absent && !unsupported) valid = true;
+        auto* mapping = find_anonymous_swap_mapping_locked(root, PAGE);
+        if (mapping != nullptr) {
+            switch (mapping->state) {
+                case AnonymousSwapRuntimeState::PAGEOUT:
+                    observed.state = SelftestCurrentAnonymousState::PAGEOUT;
+                    break;
+                case AnonymousSwapRuntimeState::SWAPPED:
+                    observed.state = SelftestCurrentAnonymousState::SWAPPED;
+                    break;
+                case AnonymousSwapRuntimeState::PAGEIN:
+                    observed.state = SelftestCurrentAnonymousState::PAGEIN;
+                    break;
+                case AnonymousSwapRuntimeState::FAILED:
+                    observed.state = SelftestCurrentAnonymousState::FAILED;
+                    break;
+            }
+            observed.object_refs = mapping->object != nullptr ? mapping->object->mapping_refs : 0;
+            observed.queued = mapping->pagein_queued;
+            observed.cancelled = mapping->cancelled;
+            observed.frame_present = mapping->frame != nullptr;
+            observed.waiter_present = mapping->waiters != nullptr;
+            observed.gate_present = mapping->pagein_access_gate != USER_PAGEMAP_ACCESS_GATE_NONE;
+        }
+        uint64_t const TASK_ACCESSES = actor.usercopy_pagemap_accesses.load(std::memory_order_acquire);
+        uint64_t const ROOT_READERS = user_pagemap_access_gates.at(gate).readers.load(std::memory_order_acquire);
+        if (TASK_ACCESSES == 0 || ROOT_READERS == 0)
+            valid = false;
+        else {
+            // Exclude only this helper's actual two owned admissions. Striped
+            // readers can include another root; nonzero is never waived.
+            observed.task_accesses = TASK_ACCESSES - 1;
+            observed.root_gate_readers = ROOT_READERS - 1;
+        }
+        if (!LAZY_BOUNDED || observed.lazy_matches > 1) valid = false;
+    }
+    user_mapping_pin_lock.unlock_irqrestore(PIN_FLAGS);
+    actor.lazy_vmem_lock.unlock_irqrestore(LAZY_FLAGS);
+    cow_pte_lock.unlock_irqrestore(COW_FLAGS);
+    release_user_pagemap_access(gate);
+    actor.release_usercopy_pagemap();
+    if (valid) output = observed;
+    return valid;
+}
+
+auto selftest_pageout_current_anonymous_page(sched::task::Task& actor, vaddr_t address, uint64_t expected_root_serial,
+                                             const numa::AllocationContext& placement) -> bool {
+    if (address >= 0x0000800000000000ULL || expected_root_serial == 0 || !selftest_current_anonymous_actor(actor) ||
+        !valid_anonymous_placement(placement) || placement.virtual_page_index != page_align_down(address) / paging::PAGE_SIZE)
+        return false;
+    AnonymousShutdownHoldStorage const SHUTDOWN_OWNERSHIP;
+    AnonymousPageoutCandidate candidate{};
+    candidate.origin = AnonymousPageoutOrigin::SYNCHRONOUS_SELFTEST;
+    candidate.copied_policy = placement.policy;
+    candidate.vaddr = page_align_down(address);
+    PageTable* root = nullptr;
+#ifdef WOS_KASAN
+    if (kasan::is_enabled()) kasan::unpoison_range(&root, sizeof(root));
+#endif
+    if (!actor.try_acquire_usercopy_pagemap(root)) return false;
+    if (root == nullptr || root == kernel_pagemap || !acquire_user_pagemap_access(root, false, candidate.access_gate)) {
+        actor.release_usercopy_pagemap();
+        return false;
+    }
+    candidate.pagemap = root;
+    uint64_t const COW_FLAGS = cow_pte_lock.lock_irqsave();
+    uint64_t const LAZY_FLAGS = actor.lazy_vmem_lock.lock_irqsave();
+    bool anonymous = false;
+    size_t matching_rows = 0;
+    if (actor.lazy_vmem_ranges.size() <= 256) {
+        for (size_t row_index = 0; row_index < actor.lazy_vmem_ranges.size(); ++row_index) {
+            auto const& range = actor.lazy_vmem_ranges.at(row_index);
+            if (candidate.vaddr < range.start || candidate.vaddr >= range.end) continue;
+            ++matching_rows;
+            anonymous = range.kind == sched::task::LazyVmemKind::ANONYMOUS && range.file == nullptr &&
+                        (range.flags & (ker::abi::vmem::MAP_PRIVATE | ker::abi::vmem::MAP_ANONYMOUS | ker::abi::vmem::MAP_SHARED)) ==
+                            (ker::abi::vmem::MAP_PRIVATE | ker::abi::vmem::MAP_ANONYMOUS);
+        }
+    }
+    uint64_t const PIN_FLAGS = user_mapping_pin_lock.lock_irqsave();
+    auto* control = find_user_root_control_locked(root);
+    auto* entry = leaf_entry(root, candidate.vaddr);
+    if (anonymous && matching_rows == 1 && actor.pagemap == root && control != nullptr && control->serial == expected_root_serial &&
+        entry != nullptr && entry->present && entry->user && (pte_raw(*entry) & paging::PAGE_SHARED) == 0 &&
+        find_anonymous_swap_mapping_locked(root, candidate.vaddr) == nullptr) {
+        uint64_t const PHYSICAL = static_cast<uint64_t>(entry->frame) << paging::PAGE_SHIFT;
+        auto* frame = reinterpret_cast<void*>(addr::get_virt_pointer(PHYSICAL));
+        if (phys::page_kind_get(frame) == PageKind::NORMAL && phys::page_ref_get(frame) == 1 && phys::page_ref_try_inc(frame)) {
+            candidate.frame = frame;
+            candidate.source_physical = PHYSICAL;
+            candidate.raw = pte_raw(*entry);
+            debt::add(DebtField::SWAP_PAGEOUTS);
+        }
+    }
+    user_mapping_pin_lock.unlock_irqrestore(PIN_FLAGS);
+    actor.lazy_vmem_lock.unlock_irqrestore(LAZY_FLAGS);
+    cow_pte_lock.unlock_irqrestore(COW_FLAGS);
+    actor.release_usercopy_pagemap();
+    if (candidate.frame == nullptr) {
+        release_user_pagemap_access(candidate.access_gate);
+        return false;
+    }
+    // Only the exact adopted operation root gate/source ref survive; no caller
+    // Task/local/root-reader/PUB/COW/pin/preempt owner crosses allocation/I/O.
+    return pageout_anonymous_candidate(candidate);
+}
+
 bool selftest_anonymous_swap_pageout(PageTable* pagemap, vaddr_t vaddr, const numa::AllocationContext& placement) {
     AnonymousShutdownHoldStorage const SHUTDOWN_OWNERSHIP;
     vaddr = page_align_down(vaddr);
