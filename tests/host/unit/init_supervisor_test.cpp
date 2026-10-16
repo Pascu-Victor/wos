@@ -423,6 +423,106 @@ TEST(InitServiceManifest, DisposableResourceServiceFixtureIsValid) {
     EXPECT_EQ(manifest.services.at(find_service(manifest, "resource-as-denied")).resource_limits.at(6).soft, 0);
 }
 
+constexpr std::string_view UMA_REFERENCE_NONCE = "0123456789abcdef0123456789abcdef";
+
+auto expanded_uma_reference_manifest() -> std::string {
+    auto const ROOT = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path();
+    std::ifstream file(ROOT / "configs/wos-services-uma-reference.conf");
+    EXPECT_TRUE(file.good());
+    std::string input(std::istreambuf_iterator<char>{file}, {});
+    for (unsigned i = 0; i < 2; ++i) {
+        input = replace_once(input, "@NONCE@", UMA_REFERENCE_NONCE);
+    }
+    EXPECT_EQ(input.find("@NONCE@"), std::string::npos);
+    return input;
+}
+
+TEST(InitServiceManifest, UmaReferenceExpandedTemplatePreservesCanonicalServicesAndRoles) {
+    auto const ROOT = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path();
+    std::ifstream base(ROOT / "configs/wos-services.conf");
+    ASSERT_TRUE(base.good());
+    std::string const canonical(std::istreambuf_iterator<char>{base}, {});
+    auto const input = expanded_uma_reference_manifest();
+    ASSERT_GE(input.size(), canonical.size());
+    EXPECT_EQ(input.substr(0, canonical.size()), canonical);
+    ServiceManifest manifest{};
+    ASSERT_TRUE(parse_service_manifest(std::span(input.data(), input.size()), manifest));
+    ServiceTopology topology{};
+    ASSERT_TRUE(validate_service_manifest(manifest, topology));
+    constexpr std::array<std::string_view, 8> NAMES{"journald", "dropbear-keygen", "netd",          "httpd",
+                                                    "dropbear", "testd",           "uma-reference", "uma-reference-exit-witness"};
+    ASSERT_EQ(manifest.service_count, NAMES.size());
+    for (size_t i = 0; i < NAMES.size(); ++i) EXPECT_EQ(manifest.services.at(i).name.view(), NAMES.at(i));
+    EXPECT_EQ(manifest.services.at(5).enablement, EnablementKind::DISABLED);
+    for (size_t i : {size_t{6}, size_t{7}}) {
+        auto const& service = manifest.services.at(i);
+        EXPECT_EQ(service.type, ServiceType::ONESHOT);
+        EXPECT_EQ(service.readiness, ReadinessKind::PROCESS_EXIT_SUCCESS);
+        EXPECT_EQ(service.readiness_timeout_ms, i == 6 ? 600000U : 30000U);
+        EXPECT_EQ(service.restart, wos::init::RestartPolicy::NEVER);
+        EXPECT_EQ(service.backoff_initial_ms, 250U);
+        EXPECT_EQ(service.backoff_max_ms, 30000U);
+        EXPECT_EQ(service.restart_budget, 5U);
+        EXPECT_EQ(service.restart_window_ms, 60000U);
+        EXPECT_EQ(service.stable_run_ms, 60000U);
+        EXPECT_EQ(service.stop_term_ms, 2000U);
+        EXPECT_EQ(service.stop_kill_ms, 1000U);
+        EXPECT_EQ(service.drain_timeout_ms, 2000U);
+        EXPECT_EQ(service.identity.user.view(), "root");
+        EXPECT_EQ(service.identity.group.view(), "root");
+        EXPECT_EQ(service.identity.supplementary_count, 0);
+        EXPECT_EQ(service.identity.mask, 0022);
+        EXPECT_EQ(service.identity.authority_ceiling, i == 6 ? 65535U : 16U);
+        EXPECT_EQ(service.identity.no_new_privileges, i == 7);
+        EXPECT_EQ(service.identity.service_privileges, 0U);
+        ASSERT_EQ(service.argument_count, 4);
+        EXPECT_EQ(service.arguments.at(0).view(), service.executable.view());
+        EXPECT_EQ(service.arguments.at(1).view(), i == 6 ? "--run" : "--observe");
+        EXPECT_EQ(service.arguments.at(2).view(), "--nonce");
+        EXPECT_EQ(service.arguments.at(3).view(), UMA_REFERENCE_NONCE);
+    }
+    EXPECT_EQ(manifest.services.at(6).dependency_mask, (1U << 2) | (1U << 3) | (1U << 4));
+    EXPECT_EQ(manifest.services.at(7).dependency_mask, 1U << 6);
+    auto const controller = std::find(topology.start_order.begin(), topology.start_order.begin() + manifest.service_count, 6);
+    auto const witness = std::find(topology.start_order.begin(), topology.start_order.begin() + manifest.service_count, 7);
+    EXPECT_LT(controller, witness);
+}
+
+TEST(InitServiceManifest, UmaReferenceNeverRestartStillRequiresAllBackoffFieldsForBothRoles) {
+    for (std::string_view name : {"uma-reference"sv, "uma-reference-exit-witness"sv}) {
+        for (std::string_view field : {"backoff-initial-ms=250\n"sv, "backoff-max-ms=30000\n"sv, "restart-budget=5\n"sv,
+                                       "restart-window-ms=60000\n"sv, "stable-run-ms=60000\n"sv}) {
+            SCOPED_TRACE(std::string(name) + ":" + std::string(field));
+            auto input = expanded_uma_reference_manifest();
+            auto const begin = input.find("[service " + std::string(name) + "]\n");
+            ASSERT_NE(begin, std::string::npos);
+            auto const end = input.find("\n[service ", begin + 1);
+            auto const offset = input.find(field, begin);
+            ASSERT_NE(offset, std::string::npos);
+            ASSERT_TRUE(end == std::string::npos || offset < end);
+            input.erase(offset, field.size());
+            ServiceManifest manifest{};
+            EXPECT_EQ(parse_service_manifest(std::span(input.data(), input.size()), manifest).error,
+                      ManifestParseError::MISSING_REQUIRED_FIELD);
+        }
+    }
+}
+
+TEST(InitServiceManifest, UmaReferenceOneshotWitnessRejectsImmediateReadiness) {
+    auto input = expanded_uma_reference_manifest();
+    auto const begin = input.find("[service uma-reference-exit-witness]\n");
+    ASSERT_NE(begin, std::string::npos);
+    auto const offset = input.find("readiness=exit-success\n", begin);
+    ASSERT_NE(offset, std::string::npos);
+    input.replace(offset, std::string_view("readiness=exit-success\n").size(), "readiness=immediate\n");
+    ServiceManifest manifest{};
+    ASSERT_TRUE(parse_service_manifest(std::span(input.data(), input.size()), manifest));
+    ServiceTopology topology{};
+    auto const validation = validate_service_manifest(manifest, topology);
+    EXPECT_EQ(validation.error, ManifestValidationError::INVALID_READINESS);
+    EXPECT_EQ(validation.service, 7);
+}
+
 TEST(InitServiceManifest, ParsesConditionalOneshotAndBuildsDeterministicDag) {
     auto manifest = parsed_valid_manifest();
     ServiceTopology topology{};
