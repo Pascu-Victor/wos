@@ -349,13 +349,26 @@ CurrentRangeSplitAdmission::CurrentRangeSplitAdmission(sched::task::Task& target
     gate_ = access.gate;
     if (error == Error::None) root_ = access.root;
 }
+CurrentRangeSplitAdmission::CurrentRangeSplitAdmission(sched::task::Task& target, const sys::SyscallPreparationScope& preparation,
+                                                       const ker::syscall::vmem::SharedVmemPublicationGuard& publication) noexcept
+    : subject_(&target), preparation_(&preparation), blocking_publication_(&publication) {
+    if (!publication.acquired() || !range_current_context(target, preparation, false)) return;
+    detail::CurrentRangeRootAccess access;
+    auto const error = detail::acquire_current_range_root(target, access);
+    local_ = access.local;
+    gate_ = access.gate;
+    if (error == Error::None) root_ = access.root;
+}
+auto CurrentRangeSplitAdmission::publication_acquired() const noexcept -> bool {
+    if (publication_ != nullptr) return blocking_publication_ == nullptr && publication_->acquired();
+    return blocking_publication_ != nullptr && blocking_publication_->acquired();
+}
 CurrentRangeSplitAdmission::~CurrentRangeSplitAdmission() noexcept {
     detail::CurrentRangeRootAccess access{subject_, root_, gate_, local_};
     detail::release_current_range_root(access);
 }
 auto CurrentRangeSplitAdmission::validate_split_and_arm(const RangeSplitSurvey& survey, PreparedTables& tables) noexcept -> Error {
-    if (!acquired() || armed_ || !publication_->acquired() || !range_current_context(*subject_, *preparation_, false))
-        return Error::Invalid;
+    if (!acquired() || armed_ || !publication_acquired() || !range_current_context(*subject_, *preparation_, false)) return Error::Invalid;
     auto const error = detail::commit_range_split(root_, survey, tables);
     if (error != Error::None) return error;
     start_ = survey.start();
@@ -365,7 +378,7 @@ auto CurrentRangeSplitAdmission::validate_split_and_arm(const RangeSplitSurvey& 
 }
 auto CurrentRangeSplitAdmission::allows(const sched::task::Task& target, uint64_t start, uint64_t end) const noexcept -> bool {
     return armed_ && subject_ == &target && root_ != nullptr && root_ == target.pagemap && start_ == start && end_ == end &&
-           publication_->acquired() && range_current_context(*subject_, *preparation_, false);
+           publication_acquired() && range_current_context(*subject_, *preparation_, false);
 }
 
 }  // namespace ker::mod::mm::huge

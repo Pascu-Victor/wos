@@ -23,6 +23,7 @@
 #include <platform/init/limine_requests.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/managed_huge.hpp>
 #include <platform/mm/numa_alloc.hpp>
 #include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
@@ -71,6 +72,11 @@ namespace {
 inline auto get_current_task() -> ker::mod::sched::task::Task* { return ker::mod::sched::get_current_task(); }
 
 ker::mod::sys::Mutex g_shared_vmem_publication_lock;
+constinit std::atomic<const SharedVmemPublicationGuard*> g_shared_vmem_publication_owner{nullptr};
+
+[[nodiscard]] auto blocking_publication_owner_matches(const SharedVmemPublicationGuard* owner) noexcept -> bool {
+    return owner != nullptr && g_shared_vmem_publication_owner.load(std::memory_order_acquire) == owner;
+}
 
 constexpr bool ENABLE_WATCHED_MMAP_LOGS = false;
 constexpr uint64_t WATCH_MMAP_VADDR = 0x00001000007da000ULL;
@@ -484,6 +490,8 @@ class SharedLazyVmemUpdate {
         for (size_t i = 0; i < validation_count_; ++i) validation_[i]->release();
     }
     auto prepare(Task& task) -> int {
+        prepared_subject_ = nullptr;
+        staged_begin_ = staged_end_ = 0;
         if (slots_ || &task != get_current_task() || task.type != ker::mod::sched::task::TaskType::PROCESS) return -EBUSY;
         capacity_ = static_cast<size_t>(ker::mod::sched::get_active_task_count()) + 1;
         if (capacity_ > SIZE_MAX / sizeof(Task*)) return -EOVERFLOW;
@@ -517,10 +525,14 @@ class SharedLazyVmemUpdate {
             if (RESULT != 0) return RESULT;
             if (slot.source.root() != root_ || slot.source.root_incarnation() != serial_) return -EAGAIN;
         }
+        prepared_subject_ = &task;
         return 0;
     }
 
     auto stage(Change change, uint64_t start, uint64_t end, const LazyVmemRange* added = nullptr, uint64_t prot = 0) -> int {
+        Task* const SUBJECT = !staged_ ? prepared_subject_ : nullptr;
+        prepared_subject_ = nullptr;
+        staged_begin_ = staged_end_ = 0;
         if (!slots_ || start >= end || (change == Change::ADD && added == nullptr)) return -EINVAL;
         for (size_t i = 0; i < cohort_count_; ++i) {
             auto& slot = slots_[i];
@@ -550,6 +562,11 @@ class SharedLazyVmemUpdate {
             if (added != nullptr && !append(*added)) return -EOVERFLOW;
         }
         staged_ = true;
+        if (SUBJECT != nullptr) {
+            prepared_subject_ = SUBJECT;
+            staged_begin_ = start;
+            staged_end_ = end;
+        }
         return 0;
     }
 
@@ -593,6 +610,17 @@ class SharedLazyVmemUpdate {
         committed_ = true;
     }
 
+    // One typed attempt consumes the binding, including refused authority.
+    [[nodiscard]] auto commit(const ker::mod::mm::huge::CurrentRangeSplitAdmission& admission, Task& subject, uint64_t begin, uint64_t end)
+        -> bool {
+        bool const BOUND = prepared_subject_ == &subject && staged_begin_ == begin && staged_end_ == end;
+        prepared_subject_ = nullptr;
+        staged_begin_ = staged_end_ = 0;
+        if (!BOUND || !admission.allows(subject, begin, end) || !matches(subject)) return false;
+        commit();
+        return true;
+    }
+
     void advance_cursor(uint64_t address, uint64_t length) {
         for (size_t i = 0; i < cohort_count_; ++i) advance_mmap_cursor(slots_[i].task, address, length);
     }
@@ -611,6 +639,8 @@ class SharedLazyVmemUpdate {
     ker::mod::mm::paging::PageTable* root_{};
     uint64_t serial_{};
     size_t capacity_{}, cohort_count_{}, validation_count_{};
+    Task* prepared_subject_{};
+    uint64_t staged_begin_{}, staged_end_{};
     bool staged_{}, committed_{};
 };
 
@@ -3870,9 +3900,17 @@ auto selftest_file_writeback_policy() -> bool {
 }
 #endif
 
-SharedVmemPublicationGuard::SharedVmemPublicationGuard() { g_shared_vmem_publication_lock.lock(); }
+SharedVmemPublicationGuard::SharedVmemPublicationGuard() {
+    g_shared_vmem_publication_lock.lock();
+    g_shared_vmem_publication_owner.store(this, std::memory_order_release);
+}
 
-SharedVmemPublicationGuard::~SharedVmemPublicationGuard() { g_shared_vmem_publication_lock.unlock(); }
+SharedVmemPublicationGuard::~SharedVmemPublicationGuard() {
+    g_shared_vmem_publication_owner.store(nullptr, std::memory_order_release);
+    g_shared_vmem_publication_lock.unlock();
+}
+
+auto SharedVmemPublicationGuard::acquired() const noexcept -> bool { return blocking_publication_owner_matches(this); }
 
 SharedVmemPublicationTryGuard::SharedVmemPublicationTryGuard() noexcept : acquired_(g_shared_vmem_publication_lock.try_lock()) {}
 

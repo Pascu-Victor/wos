@@ -253,6 +253,71 @@ void vectors(){
 int main(){fixture::vectors();std::printf("%s cases=%u assertions=%u failures=%u allocations=%u callbacks=%u real_smallvec=1 real_staging=1 real_family_core=1\n",fixture::failures?"FAIL":"PASS",fixture::cases,fixture::assertions,fixture::failures,fixture::allocations,fixture::callbacks);return fixture::failures?3:0;}
 '''
 
+TYPED_ADMISSION_PORT = r'''
+// Explicit authority endpoint for the actual metadata commit body only. The
+// separate managed-range executable compiles the real admission/guard methods.
+namespace ker::mod::mm::huge {
+struct CurrentRangeSplitAdmission {
+    bool granted{};
+    mutable unsigned calls{};
+    mutable const ker::mod::sched::task::Task* seen{};
+    mutable uint64_t first{}, last{};
+    auto allows(const ker::mod::sched::task::Task& subject, uint64_t begin, uint64_t end) const noexcept -> bool {
+        ++calls;
+        seen = &subject;
+        first = begin;
+        last = end;
+        return granted;
+    }
+};
+}
+'''
+
+TYPED_CASES = r'''
+namespace fixture {
+unsigned typed_cases{};
+void typed_test(bool value, const char* message) { ++typed_cases; check(value, message); }
+void typed_vectors() {
+    using Admission = ker::mod::mm::huge::CurrentRangeSplitAdmission;
+    constexpr uint64_t BEGIN = 0x10000, END = 0x11000;
+    { SharedWorld s; Update u;
+      check(u.prepare(s.w.source) == 0 && u.stage(Update::Change::REMOVE, BEGIN, END) == 0, "typed real prepare/stage");
+      Admission admission{true}; unsigned a=allocations, f=frees, p=puts;
+      { ker::syscall::vmem::SharedVmemPublicationGuard publication;
+        typed_test(u.commit(admission, s.w.source, BEGIN, END), "typed exact binding commits");
+        typed_test(!u.commit(admission, s.w.source, BEGIN, END), "typed commit cannot repeat"); }
+      typed_test(admission.calls == 1 && admission.seen == &s.w.source && admission.first == BEGIN && admission.last == END,
+                 "actual overload forwards exact authority subject and range once");
+      typed_test(allocations == a && frees == f && puts == p, "typed matches and actual commit allocate/free/put nothing");
+      typed_test(s.w.source.lazy_vmem_ranges.size() == 9 && s.sibling.lazy_vmem_ranges.size() == 9,
+                 "typed commit projects both genuine sibling row sets"); }
+    for(unsigned mismatch=0; mismatch<3; ++mismatch) {
+      SharedWorld s; Update u; check(u.prepare(s.w.source)==0 && u.stage(Update::Change::REMOVE,BEGIN,END)==0,"typed mismatch prep");
+      Admission admission{mismatch != 2};
+      { ker::syscall::vmem::SharedVmemPublicationGuard publication;
+        typed_test(!u.commit(admission,mismatch==0?s.sibling:s.w.source,mismatch==1?BEGIN+64:BEGIN,END),
+                   "wrong subject/range or refused admission has no authority"); }
+      typed_test(s.unchanged() && admission.calls == (mismatch==2?1U:0U), "binding mismatch precedes authority and metadata"); }
+    for(unsigned failure=0; failure<4; ++failure) {
+      SharedWorld s; Update u; check(u.prepare(s.w.source)==0,"typed invalidation prep");
+      if(failure==0) { check(u.stage(Update::Change::REMOVE,BEGIN,END)==0,"first stage"); check(u.prepare(s.w.source)==-EBUSY,"repeat prepare refused"); }
+      if(failure==1) { check(u.stage(Update::Change::REMOVE,BEGIN,END)==0,"first stage"); check(u.stage(Update::Change::REMOVE,END,BEGIN)==-EINVAL,"later stage refused"); }
+      if(failure==2) { check(u.stage(Update::Change::REMOVE,END,BEGIN)==-EINVAL,"first stage refused"); check(u.stage(Update::Change::REMOVE,BEGIN,END)==0,"raw retry can stage but no typed grant"); }
+      if(failure==3) { check(u.stage(Update::Change::REMOVE,BEGIN,END)==0,"first stage"); (void)u.stage(Update::Change::REMOVE,BEGIN,END); /* Existing raw restaging may exhaust its prepared capacity. */ }
+      Admission admission{true};
+      { ker::syscall::vmem::SharedVmemPublicationGuard publication;
+        typed_test(!u.commit(admission,s.w.source,BEGIN,END),"failed/repeated preparation or staging invalidates prior typed binding"); }
+      typed_test(s.unchanged() && admission.calls==0,"invalidated typed binding cannot query authority or mutate rows"); }
+    { SharedWorld s; Update u; check(u.prepare(s.w.source)==0 && u.stage(Update::Change::REMOVE,BEGIN,END)==0,"cohort change prep");
+      ++s.sibling.lazy_vmem_ranges.at(0).file_offset; Admission admission{true};
+      { ker::syscall::vmem::SharedVmemPublicationGuard publication;
+        typed_test(!u.commit(admission,s.w.source,BEGIN,END),"typed commit rechecks actual cloned cohort"); }
+      --s.sibling.lazy_vmem_ranges.at(0).file_offset;
+      typed_test(s.unchanged() && admission.calls==1,"stale cohort remains uncommitted after authority accepted"); }
+}
+}
+'''
+
 SHARED_CASES = r'''
 namespace fixture {
 using Update=ker::syscall::vmem::SharedLazyVmemUpdate;
@@ -619,7 +684,7 @@ void release_lazy_vmem_ranges(Task&);
     actual_update = capture(vmem_source, "class SharedLazyVmemUpdate ", declaration=True)
     helpers = "\n".join(capture(vmem_source, anchor) for anchor in [
         "auto ranges_overlap(", "auto slice_lazy_vmem_range(", "void release_lazy_vmem_range_file("])
-    harness = '#include <fixture_common.hpp>\n#include <platform/sched/lazy_vmem.hpp>\n#include <platform/mm/lifetime_retirement_executor.hpp>\n#include <syscalls_impl/vmem/sys_vmem.hpp>\n' + SEAMS + SHARED_SEAMS + FORK_SEAMS
+    harness = '#include <fixture_common.hpp>\n#include <platform/sched/lazy_vmem.hpp>\n#include <platform/mm/lifetime_retirement_executor.hpp>\n#include <syscalls_impl/vmem/sys_vmem.hpp>\n' + SEAMS + SHARED_SEAMS + FORK_SEAMS + TYPED_ADMISSION_PORT
     harness += "\nnamespace ker::vfs {\n" + checked_retain + "\n}\nnamespace ker::mod::sched::task {\n" + bodies + "\n}\nnamespace actual_exec {using ker::mod::sched::task::LazyVmemRangeVec;\n" + capture(exec_source, "void release_lazy_file_refs(") + "\n}\n"
     harness += "\nnamespace ker::mod::sched {\n" + actual_snapshot + "\n}\n"
     harness += r'''
@@ -635,10 +700,12 @@ void advance_mmap_cursor(ker::mod::sched::task::Task*,uint64_t,uint64_t) {
     harness += "\n".join(capture(vmem_source, name) for name in [
         "PublicFileForkPreparation::~PublicFileForkPreparation(", "auto PublicFileForkPreparation::prepare(",
         "auto PublicFileForkPreparation::matches(", "auto PublicFileForkPreparation::attach("])
-    harness += "\n}\nnamespace fixture {void shared_vectors();void fork_vectors();}\n"
+    harness += "\n}\nnamespace fixture {void shared_vectors();void fork_vectors();void typed_vectors();extern unsigned typed_cases;}\n"
     harness += CASES.replace("fixture::vectors();", 'fixture::vectors();fixture::check(fixture::cases==53,"all original53 vectors executed");fixture::shared_vectors();fixture::fork_vectors();').replace(
         "real_family_core=1\\n", "real_family_core=1 real_shared_transaction=1 shared_cases=%u real_public_fork_preparation=1 fork_cases=%u\\n").replace(
-        "fixture::allocations,fixture::callbacks);", "fixture::allocations,fixture::callbacks,fixture::shared_cases,fixture::fork_cases);") + SHARED_CASES + FORK_CASES
+        "fixture::allocations,fixture::callbacks);", "fixture::allocations,fixture::callbacks,fixture::shared_cases,fixture::fork_cases);") + SHARED_CASES + FORK_CASES + TYPED_CASES
+    harness = harness.replace("fixture::fork_vectors();", "fixture::fork_vectors();fixture::typed_vectors();")
+    harness = harness.replace("return fixture::failures?3:0;}", 'std::printf("PASS typed_metadata_cases=%u authority_endpoint=1\\n",fixture::typed_cases);return fixture::failures?3:0;}')
     (scratch / "harness.cpp").write_text(harness)
 
 
@@ -846,9 +913,13 @@ def main():
                 print(text[-32768:], end="", flush=True)
                 raise ValueError(f"actual {'compile/link' if index == 0 else 'runtime'} exit {row['exit']}")
             if index == 1:
-                match = re.fullmatch(r"PASS cases=(\d+) assertions=(\d+) failures=0 allocations=(\d+) callbacks=(\d+) real_smallvec=1 real_staging=1 real_family_core=1 real_shared_transaction=1 shared_cases=(\d+) real_public_fork_preparation=1 fork_cases=(\d+)\n", text)
+                match = re.fullmatch(r"PASS cases=(\d+) assertions=(\d+) failures=0 allocations=(\d+) callbacks=(\d+) real_smallvec=1 real_staging=1 real_family_core=1 real_shared_transaction=1 shared_cases=(\d+) real_public_fork_preparation=1 fork_cases=(\d+)\n", text.splitlines(keepends=True)[0])
                 if match is None or int(match[1]) != 149 or int(match[5]) != 46 or int(match[6]) != 50 or int(match[2]) < 1000 or int(match[4]) < 4:
                     raise ValueError("complete actual positive vector census missing")
+                typed = re.fullmatch(r"PASS typed_metadata_cases=(\d+) authority_endpoint=1\n", text.splitlines(keepends=True)[1]) if len(text.splitlines()) == 2 else None
+                if typed is None or int(typed[1]) != 21:
+                    raise ValueError("typed metadata vector census missing")
+                result["typed_metadata_cases"] = int(typed[1])
                 result["runtime_census"] = dict(zip(["cases", "assertions", "allocations", "callbacks", "shared_cases", "fork_cases"], map(int, match.groups())))
                 print(text, end="", flush=True)
         result["pass"] = True

@@ -378,3 +378,107 @@ TEST_F(ManagedRange, RealTryGuardRepeatedAndFourThreadCasOwnersAllClose) {
     EXPECT_EQ(host_range::blocking, 0U);
 }
 }  // namespace
+
+TEST_F(ManagedRange, BlockingBorrowUsesRealGuardAfterOrdinaryAcquireBeforeLegacyInterval) {
+    huge::RangeSplitSurvey survey;
+    huge::PreparedTables tables;
+    ASSERT_EQ(proof(0, LARGE, survey, tables), huge::Error::None);
+    ker::mod::sys::SyscallPreparationScope preparation(actor);
+    auto const before = host_range::blocking;
+    {
+        ASSERT_TRUE(host_range::interrupts);
+        ker::syscall::vmem::SharedVmemPublicationGuard publication;
+        ASSERT_TRUE(publication.acquired());
+        EXPECT_EQ(host_range::blocking, before + 1);
+        {
+            ker::mod::sys::SyscallPreparationScope::LegacyInterval final_interval(preparation);
+            ASSERT_FALSE(host_range::interrupts);
+            huge::CurrentRangeSplitAdmission admission(actor, preparation, publication);
+            ASSERT_TRUE(admission.acquired());
+            EXPECT_FALSE(admission.allows(actor, 0, LARGE));
+            ASSERT_EQ(admission.validate_split_and_arm(survey, tables), huge::Error::None);
+            EXPECT_TRUE(admission.allows(actor, 0, LARGE));
+            EXPECT_FALSE(admission.allows(actor, PAGE, LARGE));
+        }
+        EXPECT_TRUE(host_range::interrupts);
+        EXPECT_TRUE(publication.acquired());
+        EXPECT_EQ(actor.usercopy_pagemap_accesses.load(), 0U);
+        EXPECT_EQ(root_readers, 0U);
+    }
+    EXPECT_FALSE(g_shared_vmem_publication_lock.is_locked());
+}
+TEST_F(ManagedRange, BlockingBorrowRechecksActualContextAndRejectsUnpreparedProof) {
+    huge::RangeSplitSurvey survey;
+    huge::PreparedTables tables;
+    ker::mod::sys::SyscallPreparationScope preparation(actor);
+    ker::syscall::vmem::SharedVmemPublicationGuard publication;
+    huge::CurrentRangeSplitAdmission wrong_if(actor, preparation, publication);
+    EXPECT_FALSE(wrong_if.acquired());
+    ker::mod::sys::SyscallPreparationScope::LegacyInterval final_interval(preparation);
+    huge::CurrentRangeSplitAdmission admission(actor, preparation, publication);
+    ASSERT_TRUE(admission.acquired());
+    EXPECT_EQ(admission.validate_split_and_arm(survey, tables), huge::Error::Invalid);
+    EXPECT_FALSE(admission.allows(actor, 0, LARGE));
+    actor.scheduler_transition_active.store(true);
+    huge::CurrentRangeSplitAdmission transition(actor, preparation, publication);
+    EXPECT_FALSE(transition.acquired());
+    actor.scheduler_transition_active.store(false);
+    backend().preempt_depth = 1;
+    huge::CurrentRangeSplitAdmission preempted(actor, preparation, publication);
+    EXPECT_FALSE(preempted.acquired());
+    backend().preempt_depth = 0;
+}
+TEST_F(ManagedRange, BlockingBorrowCompletesActualNonemptySplitBeforeAuthority) {
+    ASSERT_EQ(prepare(0), huge::Error::None);
+    ASSERT_EQ(publish(0), huge::Error::None);
+    huge::RangeSplitSurvey survey;
+    huge::PreparedTables tables;
+    ASSERT_EQ(proof(TEST_VA, TEST_VA + LARGE, survey, tables), huge::Error::None);
+    ASSERT_EQ(survey.count(), 1U);
+    ker::mod::sys::SyscallPreparationScope preparation(actor);
+    {
+        ker::syscall::vmem::SharedVmemPublicationGuard publication;
+        ker::mod::sys::SyscallPreparationScope::LegacyInterval final_interval(preparation);
+        huge::CurrentRangeSplitAdmission admission(actor, preparation, publication);
+        ASSERT_TRUE(admission.acquired());
+        ASSERT_EQ(admission.validate_split_and_arm(survey, tables), huge::Error::None);
+        EXPECT_TRUE(admission.allows(actor, TEST_VA, TEST_VA + LARGE));
+        EXPECT_GT(actual_flushes, 0U);
+    }
+    mapped[0] = false;
+    cleanup[0].reset();
+    tables.reset();
+}
+
+TEST_F(ManagedRange, BlockingOwnerIdentityIsEmptyExactAndClearedBeforeTryOwner) {
+    using Guard = ker::syscall::vmem::SharedVmemPublicationGuard;
+    using ker::syscall::vmem::blocking_publication_owner_matches;
+    using ker::syscall::vmem::g_shared_vmem_publication_owner;
+    static_assert(std::is_empty_v<Guard> && sizeof(Guard) == 1);
+    static_assert(!std::is_copy_constructible_v<Guard> && !std::is_move_constructible_v<Guard>);
+    EXPECT_FALSE(blocking_publication_owner_matches(nullptr));
+    EXPECT_EQ(g_shared_vmem_publication_owner.load(), nullptr);
+    alignas(Guard) unsigned char opaque_storage[sizeof(Guard)]{};
+    auto* const other_identity = reinterpret_cast<const Guard*>(opaque_storage);
+    // Pointer comparison only: no method, dereference, or admission borrows this storage.
+    EXPECT_FALSE(blocking_publication_owner_matches(other_identity));
+    {
+        Guard owner;
+        EXPECT_TRUE(owner.acquired());
+        EXPECT_EQ(g_shared_vmem_publication_owner.load(), &owner);
+        EXPECT_FALSE(blocking_publication_owner_matches(nullptr));
+        EXPECT_FALSE(blocking_publication_owner_matches(other_identity));
+        ker::syscall::vmem::SharedVmemPublicationTryGuard refused;
+        EXPECT_FALSE(refused.acquired());
+        EXPECT_TRUE(owner.acquired());
+    }
+    EXPECT_EQ(g_shared_vmem_publication_owner.load(), nullptr);
+    EXPECT_FALSE(blocking_publication_owner_matches(other_identity));
+    {
+        ker::syscall::vmem::SharedVmemPublicationTryGuard try_owner;
+        EXPECT_TRUE(try_owner.acquired());
+        EXPECT_EQ(g_shared_vmem_publication_owner.load(), nullptr);
+        EXPECT_FALSE(blocking_publication_owner_matches(other_identity));
+    }
+    EXPECT_EQ(g_shared_vmem_publication_owner.load(), nullptr);
+}

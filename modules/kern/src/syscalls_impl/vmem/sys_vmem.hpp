@@ -39,6 +39,8 @@ class SharedVmemPublicationGuard {
     SharedVmemPublicationGuard(SharedVmemPublicationGuard&&) = delete;
     auto operator=(const SharedVmemPublicationGuard&) -> SharedVmemPublicationGuard& = delete;
     auto operator=(SharedVmemPublicationGuard&&) -> SharedVmemPublicationGuard& = delete;
+    // Borrows this live guard's exact singleton publication identity; no object bytes are read.
+    [[nodiscard]] auto acquired() const noexcept -> bool;
 };
 
 // Try-only owner for short current-root admission. Construct in an instrumented

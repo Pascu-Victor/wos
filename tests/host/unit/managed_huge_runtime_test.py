@@ -21,7 +21,7 @@ import subprocess
 import tempfile
 import time
 
-EXPECTED_TESTS = 40
+EXPECTED_TESTS = 44
 OVERALL_SECONDS = 120
 COMMAND_SECONDS = 35
 SCRATCH_BYTES = 128 * 1024 * 1024
@@ -198,10 +198,13 @@ struct Task {
     cpp = sources["syscalls_impl/vmem/sys_vmem.cpp"].read_text()
     constructors = (
         "namespace ker::syscall::vmem {\n"
+        + "constinit std::atomic<const SharedVmemPublicationGuard*> g_shared_vmem_publication_owner{nullptr};\n"
+        + definition(cpp, "[[nodiscard]] auto blocking_publication_owner_matches(") + "\n"
         + "\n".join(
             definition(cpp, anchor)
             for anchor in (
                 "SharedVmemPublicationGuard::SharedVmemPublicationGuard()",
+                "auto SharedVmemPublicationGuard::acquired()",
                 "SharedVmemPublicationGuard::~SharedVmemPublicationGuard()",
                 "SharedVmemPublicationTryGuard::SharedVmemPublicationTryGuard()",
                 "SharedVmemPublicationTryGuard::~SharedVmemPublicationTryGuard()",
@@ -566,7 +569,18 @@ def main() -> int:
             obj.unlink()
             path.unlink()
 
+        needle = "g_shared_vmem_publication_owner.store(this, std::memory_order_release);"
+        if actual.count(needle) != 1:
+            raise RuntimeError("actual blocking held-state boundary changed")
+        mutant("blocking-forgets-held", actual.replace(needle, "g_shared_vmem_publication_owner.store(nullptr, std::memory_order_release);"),
+               "ManagedRange.BlockingBorrowUsesRealGuardAfterOrdinaryAcquireBeforeLegacyInterval")
+
         module_text = CppText(module.read_text())
+        needle = ": subject_(&target), preparation_(&preparation), blocking_publication_(&publication) { if (!publication.acquired() || !range_current_context(target, preparation, false)) return;"
+        if module_text.count(needle) != 1:
+            raise RuntimeError("actual blocking context boundary changed")
+        module_mutant("blocking-forgets-context", module_text.replace(needle, ": subject_(&target), preparation_(&preparation), blocking_publication_(&publication) { if (!publication.acquired()) return;"),
+                      "ManagedRange.BlockingBorrowRechecksActualContextAndRejectsUnpreparedProof")
         needle = "error = pass(target, preparation, unpublished, final, count.count != 0 ? RangeSurveyMode::Verify : RangeSurveyMode::Count, storage);"
         if module_text.count(needle) != 1:
             raise RuntimeError("independent final pass mutation boundary changed")

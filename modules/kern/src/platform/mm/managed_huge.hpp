@@ -10,8 +10,9 @@ namespace ker::mod::sys {
 class SyscallPreparationScope;
 }
 namespace ker::syscall::vmem {
+class SharedVmemPublicationGuard;
 class SharedVmemPublicationTryGuard;
-}
+}  // namespace ker::syscall::vmem
 
 namespace ker::mod::mm::huge {
 namespace detail {
@@ -145,6 +146,10 @@ class CurrentRangeSplitAdmission {
    public:
     CurrentRangeSplitAdmission(sched::task::Task&, const sys::SyscallPreparationScope&,
                                const ker::syscall::vmem::SharedVmemPublicationTryGuard&) noexcept;
+    // Acquire blocking PUB in ordinary IF-on preparation BEFORE LegacyInterval.
+    // This exact borrowed owner must outlive the admission.
+    CurrentRangeSplitAdmission(sched::task::Task&, const sys::SyscallPreparationScope&,
+                               const ker::syscall::vmem::SharedVmemPublicationGuard&) noexcept;
     ~CurrentRangeSplitAdmission() noexcept;
     CurrentRangeSplitAdmission(const CurrentRangeSplitAdmission&) = delete;
     CurrentRangeSplitAdmission(CurrentRangeSplitAdmission&&) = delete;
@@ -156,9 +161,11 @@ class CurrentRangeSplitAdmission {
     [[nodiscard]] auto allows(const sched::task::Task&, uint64_t start, uint64_t end) const noexcept -> bool;
 
    private:
+    [[nodiscard]] auto publication_acquired() const noexcept -> bool;
     sched::task::Task* subject_{};
     const sys::SyscallPreparationScope* preparation_{};
     const ker::syscall::vmem::SharedVmemPublicationTryGuard* publication_{};
+    const ker::syscall::vmem::SharedVmemPublicationGuard* blocking_publication_{};
     paging::PageTable* root_{};
     size_t gate_{static_cast<size_t>(-1)};
     bool local_{}, armed_{};
