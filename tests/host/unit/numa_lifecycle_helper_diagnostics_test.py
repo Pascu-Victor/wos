@@ -84,20 +84,66 @@ def generate_public_policy(actual, take, shell, callnums):
     return generated, variants
 
 
+def generate_lifecycle_placement(actual, take, shell):
+    """Actual handshake/parent frontiers on explicit finite syscall endpoints."""
+    types = actual[actual.index("constexpr size_t PAGE"):actual.index("// These POD transport bytes")]
+    types += actual[actual.index("enum ClockValid :"):actual.index("auto now_ns(")]
+    types += take("struct ChildRecord {", True) + "\n" + take("enum class ChildPhase :", True)
+    types += actual[actual.index("constexpr uint64_t CHILD_READY_MAGIC"):actual.index("struct ChildReady {")]
+    types += take("struct ChildReady {", True)
+    template = actual[actual.index("template <class T>"):actual.index("enum ClockValid :")]
+    helpers = template + "\n".join(take(anchor) for anchor in [
+        "auto now_ns(", "auto before(", "auto raw_error(", "auto query(", "auto self_policy(", "auto valid_selection(",
+        "auto transfer(", "auto set_thread_cpu(", "auto await_cpu(", "auto lifecycle_child_target(", "auto valid_child_ready(",
+        "auto child_ready_and_cycle(", "auto receive_child_ready(", "auto terminate_and_reap("])
+    caller = take("auto run_numa_lifecycle(")
+    begin = caller.index("        if (ok && !receive_child_ready(")
+    end = caller.index('            phase = "parent_pre_copyout";', begin)
+    # Keep the whole completed-record validation; omit only its next payload if.
+    branch = caller[begin:end]
+    suffix = "        if (ok) {\n"
+    if not branch.endswith(suffix):
+        raise ValueError("exact actual placement-to-payload frontier")
+    branch = branch[:-len(suffix)]
+    def ports(body):
+        for name in ("clock_gettime", "getpid", "read", "write", "poll", "waitpid", "kill"):
+            body = re.sub(r"(?<![\w:])" + name + r"\(", "fixture::" + name + "(", body)
+        return body
+    generated = shell.read_text()
+    for name, value in (("ACTUAL_TYPES", types), ("ACTUAL_HANDSHAKE", ports(helpers)), ("ACTUAL_PARENT_BRANCH", ports(branch))):
+        marker = "/* @" + name + "@ */"
+        if generated.count(marker) != 1:
+            raise ValueError("unique actual placement marker: " + name)
+        generated = generated.replace(marker, value)
+    variants = {"actual": generated}
+    for label, old, new in [
+        ("lost-inherited-mask", "ready.inherited_mask == (uint64_t{1} << parent.cpu)", "true"),
+        ("lost-controller-placement", "int64_t const PLACE = set_thread_cpu(static_cast<uint64_t>(pid), target.cpu, deadline);", "int64_t const PLACE = 0;"),
+        ("lost-child-placement-wait", "int64_t const PLACED = await_cpu(target.cpu, deadline);", "int64_t const PLACED = 0;"),
+        ("lost-cycle-alternation", "if ((cycle & 1U) == 0 || topo.selected_count < 2)", "if ((cycle & 1U) != 0 || topo.selected_count < 2)"),
+    ]:
+        if generated.count(old) != 1:
+            raise ValueError("unique actual placement mutation: " + label)
+        variants[label] = generated.replace(old, new)
+    return generated, variants
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--source", type=Path)
     parser.add_argument("--workload-wait", action="store_true", help="exercise failure-only testprog wait observations")
+    parser.add_argument("--workload-placement", action="store_true", help="exercise actual lifecycle ready/controller placement on finite endpoints")
     parser.add_argument("--public-policy", action="store_true", help="exercise actual healthy public-policy guest bodies on finite ports")
     parser.add_argument("--predecessor", type=Path)
     parser.add_argument("--evidence-dir", type=Path)
     args = parser.parse_args()
-    if args.workload_wait and args.public_policy:
+    if sum((args.workload_wait, args.public_policy, args.workload_placement)) > 1:
         parser.error("select one explicit profile")
     root = args.root.resolve(strict=True)
-    source = (args.source or root / ("modules/testprog/src/numa_locality.cpp" if args.workload_wait or args.public_policy else "tests/fixtures/numa_lifecycle_census.cpp")).resolve(strict=True)
-    shell = (Path(__file__).with_name("numa_policy_cases.inc") if args.public_policy else
+    source = (args.source or root / ("modules/testprog/src/numa_locality.cpp" if args.workload_wait or args.public_policy or args.workload_placement else "tests/fixtures/numa_lifecycle_census.cpp")).resolve(strict=True)
+    shell = (Path(__file__).with_name("numa_lifecycle_placement_test.inc") if args.workload_placement else
+             Path(__file__).with_name("numa_policy_cases.inc") if args.public_policy else
              Path(__file__).with_name("numa_lifecycle_wait_diagnostics_test.inc") if args.workload_wait else Path(__file__).with_suffix(".inc"))
     helper_path = root / "tests/host/unit/file_mmap_registry_runtime_test.py"
     sys.dont_write_bytecode = True
@@ -188,7 +234,12 @@ def main():
             extracted.append(row)
             return body
 
-        if args.public_policy:
+        if args.workload_placement:
+            generated, variants = generate_lifecycle_placement(actual, take, shell)
+            result["extractions"] = extracted
+            result["profile"] = "lifecycle-placement-actual-frontiers-finite-endpoints"
+            result["endpoint_limits"] = "Finite clock/pipe/affinity/consuming cleanup and unchanged payload endpoint; no WOS Task, concurrent scheduler or native authority"
+        elif args.public_policy:
             callnums, row = capture(watched[4].read_text(), "enum class callnums :", declaration=True)
             extracted.append(row)
             generated, variants = generate_public_policy(actual, take, shell, callnums)

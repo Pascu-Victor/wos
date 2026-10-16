@@ -626,6 +626,88 @@ auto child_cycle(uint8_t* mapping, int fd, const Options& opts, const Topology& 
     // Both source and parent's destination cross the actual4KiB boundary.
     return transfer(fd, mapping + CROSS_START, CROSS_BYTES, true, deadline) ? 0 : 62;
 }
+// BEGIN lifecycle cooperative placement. The payload body remains separate.
+constexpr uint64_t CHILD_READY_MAGIC = 0x574f535245414459ULL;
+struct ChildReady {
+    uint64_t magic;
+    uint32_t version, bytes;
+    uint64_t seed;
+    uint32_t cycle, pid;
+    uint64_t tid, inherited_mask, inherited_cpu;
+    abi::SelfPolicy policy;
+    uint16_t target_node, target_cpu;
+    uint32_t reserved;
+    int64_t error;
+};
+static_assert(std::is_trivially_copyable_v<ChildReady> && sizeof(ChildReady) <= 160);
+
+auto lifecycle_child_target(const Topology& topo, Selection parent, uint32_t cycle, Selection& target) -> bool {
+    target = {abi::INVALID_NODE, UINT16_MAX};
+    if (topo.selected_count == 0 || topo.selected_count > topo.selected.size() || !valid_selection(topo, parent)) return false;
+    if ((cycle & 1U) == 0 || topo.selected_count < 2) {
+        target = parent;
+        return true;
+    }
+    for (uint32_t i = 0; i < topo.selected_count; ++i)
+        if (topo.selected[i].node != parent.node && valid_selection(topo, topo.selected[i])) {
+            target = topo.selected[i];
+            return true;
+        }
+    return false;
+}
+auto valid_child_ready(const ChildReady& ready, const Options& opts, const Topology& topo, Selection parent, Selection target,
+                       uint32_t cycle, pid_t pid) -> bool {
+    return pid > 1 && valid_selection(topo, parent) && valid_selection(topo, target) && ready.magic == CHILD_READY_MAGIC &&
+           ready.version == 1 && ready.bytes == sizeof(ready) && ready.seed == opts.seed && ready.cycle == cycle &&
+           ready.pid == static_cast<uint32_t>(pid) && ready.tid == static_cast<uint64_t>(pid) && ready.tid == ready.pid &&
+           !raw_error(ready.tid) && ready.inherited_mask == (uint64_t{1} << parent.cpu) && ready.inherited_cpu == parent.cpu &&
+           ready.target_node == target.node && ready.target_cpu == target.cpu && ready.reserved == 0 && ready.error == 0 &&
+           ready.policy.version == abi::VERSION && ready.policy.bytes == sizeof(ready.policy) &&
+           ready.policy.mode == static_cast<uint32_t>(abi::PolicyMode::LOCAL) && ready.policy.nodes == 0 && ready.policy.reserved32 == 0 &&
+           ready.policy.reserved64 == 0;
+}
+auto child_ready_and_cycle(uint8_t* mapping, int fd, const Options& opts, const Topology& topo, Selection parent, uint32_t cycle,
+                           uint64_t deadline) -> int {
+    ChildReady ready;
+    initialize_transport(ready);
+    QueryBuffers io;
+    initialize_transport(io);
+    ready.magic = CHILD_READY_MAGIC;
+    ready.version = 1;
+    ready.bytes = sizeof(ready);
+    ready.seed = opts.seed;
+    ready.cycle = cycle;
+    ready.pid = static_cast<uint32_t>(getpid());
+    ready.tid = ker::multiproc::currentThreadId();
+    ready.inherited_mask = ker::multiproc::getThreadAffinityMask(ready.tid);
+    ready.inherited_cpu = ker::multiproc::getcurrent_cpu();
+    Selection target{};
+    int64_t rc = lifecycle_child_target(topo, parent, cycle, target) ? self_policy(io, ready.policy) : -ENOTSUP;
+    ready.target_node = target.node;
+    ready.target_cpu = target.cpu;
+    ready.error = rc;
+    if (rc == 0 && !valid_child_ready(ready, opts, topo, parent, target, cycle, static_cast<pid_t>(ready.pid))) ready.error = -EPROTO;
+    if (!transfer(fd, &ready, sizeof(ready), true, deadline)) return 65;
+    if (ready.error != 0) return 66;
+    int64_t const PLACED = await_cpu(target.cpu, deadline);
+    if (PLACED != 0) return 67;
+    return child_cycle(mapping, fd, opts, topo, cycle, deadline);
+}
+auto receive_child_ready(int fd, pid_t pid, const Options& opts, const Topology& topo, Selection parent, Selection target, uint32_t cycle,
+                         uint64_t deadline, const char*& phase) -> bool {
+    ChildReady ready;
+    initialize_transport(ready);
+    phase = "child_ready";
+    if (!transfer(fd, &ready, sizeof(ready), false, deadline) || !valid_child_ready(ready, opts, topo, parent, target, cycle, pid))
+        return false;
+    // An already-target child may exit now: do not invent a raced SET or GET.
+    if (ready.inherited_mask == (uint64_t{1} << target.cpu) && ready.inherited_cpu == target.cpu) return true;
+    phase = "controller_placement";
+    int64_t const PLACE = set_thread_cpu(static_cast<uint64_t>(pid), target.cpu, deadline);
+    return PLACE == 0;
+}
+// END lifecycle cooperative placement.
+
 auto wait_child(pid_t pid, uint64_t deadline, int& status, bool& owned, WaitObservation& observation) -> bool {
     observation.deadline = deadline;
     while (before(deadline, &observation.clock)) {
@@ -833,8 +915,8 @@ auto run_numa_lifecycle(int argc, char** argv) -> int {
         std::fprintf(stderr, "numa-lifecycle: setup phase=%s error=%lld\n", setup_phase, static_cast<long long>(rc));
         return 1;
     }
-    std::printf("NUMA_LIFECYCLE_PLACEMENT parent=%u:%u child=observed_current_cpu method=child_same_owner_pin\n", parent_selection.node,
-                parent_selection.cpu);
+    std::printf("NUMA_LIFECYCLE_PLACEMENT parent=%u:%u child=controller_target_cpu method=inherited_ready_cooperative_placement\n",
+                parent_selection.node, parent_selection.cpu);
     std::fflush(stdout);
     uint32_t completed = 0;
     uint32_t same_node_cycles = 0, cross_node_cycles = 0, cross_node_cow_cycles = 0;
@@ -863,6 +945,11 @@ auto run_numa_lifecycle(int argc, char** argv) -> int {
         const char* phase = "parent_original_bytes";
         int64_t source_query_error = 0;
         uint16_t source_nodes[2]{abi::INVALID_NODE, abi::INVALID_NODE};
+        Selection child_target{};
+        if (!lifecycle_child_target(topo, parent_selection, cycle, child_target)) {
+            phase = "child_target";
+            ok = false;
+        }
         if ((reinterpret_cast<uint64_t>(raw) & (PAGE - 1)) || !cpu_still(parent_selection.cpu)) ok = false;
         if (ok)
             for (size_t i = 0; i < CYCLE_BYTES; ++i) payload[i] = pattern(opts.seed, cycle, i, false);
@@ -889,7 +976,7 @@ auto run_numa_lifecycle(int argc, char** argv) -> int {
             pid = fork();
             if (pid == 0) {
                 if (close(fds[0]) != 0) _exit(63);
-                int child_error = child_cycle(mapping, fds[1], opts, topo, cycle, child_deadline);
+                int child_error = child_ready_and_cycle(mapping, fds[1], opts, topo, parent_selection, cycle, child_deadline);
                 if (close(fds[1]) != 0 && child_error == 0) child_error = 64;
                 _exit(child_error);
             }
@@ -899,6 +986,7 @@ auto run_numa_lifecycle(int argc, char** argv) -> int {
                 owned = true;
         }
         if (!close_fd(fds[1], own)) ok = false;
+        if (ok && !receive_child_ready(fds[0], pid, opts, topo, parent_selection, child_target, cycle, child_deadline, phase)) ok = false;
         ChildRecord record;
         initialize_transport(record);
         if (ok) {
@@ -909,6 +997,7 @@ auto run_numa_lifecycle(int argc, char** argv) -> int {
             (record.magic != RECORD_MAGIC || record.version != 1 || record.bytes != sizeof(record) || record.seed != opts.seed ||
              record.cycle != cycle || record.pid != static_cast<uint32_t>(pid) || record.tid != static_cast<uint64_t>(pid) ||
              raw_error(record.tid) || record.error != 0 || !valid_selection(topo, {record.selected_node, record.selected_cpu}) ||
+             record.selected_node != child_target.node || record.selected_cpu != child_target.cpu ||
              record.cpu_before != record.selected_cpu || record.cpu_after != record.selected_cpu || record.reserved || record.reserved2 ||
              record.phase != static_cast<uint32_t>(ChildPhase::COMPLETE) || record.policy.version != abi::VERSION ||
              record.policy.bytes != sizeof(record.policy) || record.policy.mode != static_cast<uint32_t>(abi::PolicyMode::LOCAL) ||

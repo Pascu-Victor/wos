@@ -50,7 +50,7 @@ def log():
         "NUMA_TOPOLOGY node=0 managed=4096000 cpus=000000000000000f:0000000000000000:0000000000000000:0000000000000000 eligible=1 reason=eligible",
         "NUMA_TOPOLOGY node=1 managed=4096000 cpus=00000000000000f0:0000000000000000:0000000000000000:0000000000000000 eligible=1 reason=eligible",
         "NUMA_PROFILE version=1 provenance=2 nodes=2 cpus=8 workers=2 free_capacity=not_observed policy=LOCAL",
-        "NUMA_LIFECYCLE_PLACEMENT parent=0:0 child=observed_current_cpu method=child_same_owner_pin",
+        "NUMA_LIFECYCLE_PLACEMENT parent=0:0 child=controller_target_cpu method=inherited_ready_cooperative_placement",
     ]
 
     def own(phase, n):
@@ -142,6 +142,8 @@ def main():
             reject(name, data[:-1])
             reject(name, data + b"\0")
         for old, new in [
+            (b"child=controller_target_cpu method=inherited_ready_cooperative_placement", b"child=observed_current_cpu method=child_same_owner_pin"),
+            (b"method=inherited_ready_cooperative_placement", b"method=unspecified_placement"),
             (b"cycle=500 ", b"cycle=499 "),
             (b"pid=100 tid=100 ", b"pid=100 tid=101 "),
             (b"seed=11 ", b"seed=12 "),

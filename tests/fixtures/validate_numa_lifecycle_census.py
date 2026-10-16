@@ -157,7 +157,7 @@ def probe(path, nonce, node_count):
                 map(
                     number,
                     full(
-                        r"NUMA_LIFECYCLE_PLACEMENT parent=(\d+):(\d+) child=observed_current_cpu method=child_same_owner_pin",
+                        r"NUMA_LIFECYCLE_PLACEMENT parent=(\d+):(\d+) child=controller_target_cpu method=inherited_ready_cooperative_placement",
                         line,
                         "placement syntax",
                     ),

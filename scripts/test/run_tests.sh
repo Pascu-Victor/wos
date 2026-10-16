@@ -460,6 +460,7 @@ UNIT_TESTS=(
     numa_coherent_census_runtime_test
     numa_lifecycle_census_codec_test
     numa_lifecycle_wait_diagnostics_test
+    numa_lifecycle_placement_diagnostics_test
     numa_lifecycle_helper_diagnostics_test
     numa_public_policy_runtime_test
     numa_lifecycle_census_runtime_test

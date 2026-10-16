@@ -1744,7 +1744,50 @@ def test_numa_public_policy_uses_real_actor_placement_and_quota_frontiers() -> N
         fail("separate public policy guest entrypoint missing")
 
 
+def test_numa_lifecycle_proves_inheritance_before_controller_placement() -> None:
+    source = NUMA_LOCALITY_CPP.read_text()
+    target = function_body(source, "lifecycle_child_target")
+    ready = function_body(source, "valid_child_ready")
+    child = function_body(source, "child_ready_and_cycle")
+    parent = function_body(source, "receive_child_ready")
+    lifecycle = function_body(source, "run_numa_lifecycle")
+    require_tokens(target, ["topo.selected_count > topo.selected.size()", "!valid_selection(topo, parent)",
+                            "if ((cycle & 1U) == 0 || topo.selected_count < 2)", "target = parent",
+                            "topo.selected[i].node != parent.node", "valid_selection(topo, topo.selected[i])"],
+                   "immutable eligible topology and exact same/foreign alternation")
+    require_tokens(ready, ["ready.magic == CHILD_READY_MAGIC", "ready.bytes == sizeof(ready)", "ready.seed == opts.seed",
+                           "ready.cycle == cycle", "ready.tid == static_cast<uint64_t>(pid)", "ready.tid == ready.pid",
+                           "ready.inherited_mask == (uint64_t{1} << parent.cpu)", "ready.inherited_cpu == parent.cpu",
+                           "ready.target_node == target.node", "ready.target_cpu == target.cpu", "ready.reserved == 0",
+                           "ready.error == 0", "abi::PolicyMode::LOCAL", "ready.policy.nodes == 0",
+                           "ready.policy.reserved32 == 0", "ready.policy.reserved64 == 0"], "exact inherited child identity and policy")
+    require_order(child, "initialize_transport(ready)", "ready.inherited_mask =", "ready bytes born before observation")
+    require_order(child, "ready.inherited_mask =", "self_policy(io, ready.policy)", "inheritance captured before ready")
+    require_order(child, "self_policy(io, ready.policy)", "transfer(fd, &ready", "policy precedes publication")
+    require_order(child, "transfer(fd, &ready", "await_cpu(target.cpu, deadline)", "ready precedes cooperative wait")
+    require_order(child, "await_cpu(target.cpu, deadline)", "return child_cycle(", "exact placement precedes unchanged payload")
+    if "setThreadAffinityMask" in child or "local_policy(" in child:
+        fail("child cannot remotely self move or reset inherited policy")
+    require_order(parent, "transfer(fd, &ready", "valid_child_ready(", "complete actual pipe record before validation")
+    require_order(parent, "valid_child_ready(", "if (ready.inherited_mask ==", "validate before same-target shortcut")
+    require_order(parent, "return true;", "set_thread_cpu(", "already-target parent skips raced setter")
+    if "getThreadAffinityMask" in parent or "place_thread(" in parent or parent.count("set_thread_cpu(") != 1:
+        fail("parent has one remote-only setter and no raced getter")
+    require_tokens(lifecycle, ["child=controller_target_cpu method=inherited_ready_cooperative_placement",
+                              "lifecycle_child_target(topo, parent_selection, cycle, child_target)",
+                              "child_ready_and_cycle(mapping, fds[1], opts, topo, parent_selection, cycle, child_deadline)",
+                              "receive_child_ready(fds[0], pid, opts, topo, parent_selection, child_target, cycle, child_deadline, phase)",
+                              "record.selected_node != child_target.node", "record.selected_cpu != child_target.cpu",
+                              "terminate_and_reap(pid, owned, &cleanup_observation)", "deadline_after(opts.child_timeout_ms, child_deadline)",
+                              "if (child_deadline > deadline) child_deadline = deadline"], "same ownership budget and exact final target")
+    if lifecycle.count("pipe(fds)") != 1 or lifecycle.count("pid = fork()") != 1:
+        fail("placement cannot add another pipe or child")
+    if "sizeof(ChildRecord) == 136" not in source:
+        fail("existing payload transport ABI changed")
+
+
 def main() -> None:
+    test_numa_lifecycle_proves_inheritance_before_controller_placement()
     test_numa_public_policy_uses_real_actor_placement_and_quota_frontiers()
     test_numa_wait_diagnostics_capture_original_frontiers_before_cleanup()
     test_numa_cleanup_diagnostics_preserve_original_calls_and_status_validity()
