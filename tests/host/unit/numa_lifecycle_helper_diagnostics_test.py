@@ -42,17 +42,63 @@ def pin(path):
                 invocation_mtime_ns=alias_after.st_mtime_ns, invocation_ctime_ns=alias_after.st_ctime_ns)
 
 
+def generate_public_policy(actual, take, shell, callnums):
+    """Capture actual guest bodies; endpoints disclose finite Host-only authority."""
+    types = actual[actual.index("struct Selection {"):actual.index("// These POD transport bytes")]
+    types += actual[actual.index("enum ClockValid :"):actual.index("auto now_ns(")]
+    types += take("struct OwnResources {", True)
+    types += actual[actual.index("constexpr uint32_t POLICY_MAX_PAGES"):actual.index("auto policy_options(")]
+    template = actual[actual.index("template <class T>"):actual.index("enum ClockValid :")]
+    helpers = template + "\n".join(take(anchor) for anchor in [
+        "auto number(", "auto now_ns(", "auto deadline_after(", "auto before(", "auto raw_error(", "auto query(",
+        "auto page_nodes(", "auto set_thread_cpu(", "auto place_thread(", "auto await_cpu(", "auto pin_current_cpu(",
+        "auto cpu_still(", "auto map_private(", "auto wait_flag(", "auto nonblocking(", "auto transfer(",
+        "auto wait_child(", "auto terminate_and_reap(", "auto close_fd("])
+    functions = "\n".join(take(anchor) for anchor in [
+        "auto policy_options(", "auto policy_read(", "auto policy_set(", "auto policy_matches(", "auto policy_topology(",
+        "auto policy_expected(", "auto policy_change(", "auto policy_mapping(", "void* policy_worker(", "auto policy_usage(", "auto policy_child(",
+        "auto policy_pipe(", "auto policy_fork(", "void policy_print(", "auto run_numa_policy("])
+    def ports(body):
+        body = body.replace("::syscall(", "fixture::resource_call(").replace("std::printf(", "fixture::printf(")
+        for name in ("clock_gettime", "mmap", "munmap", "getpid", "getrlimit", "setrlimit", "pipe", "close", "fcntl",
+                     "read", "write", "poll", "waitpid", "kill", "pthread_create", "pthread_join"):
+            body = re.sub(r"(?<![\w:])" + name + r"\(", "fixture::" + name + "(", body)
+        body = body.replace("pid = fork();", "pid = fixture::fork_policy(opts, topo, selected, mode, mask, quota_only, expected_limit, fds[1], deadline);")
+        return body.replace("_exit(", "fixture::exit(")
+    generated = shell.read_text()
+    for marker, value in (("ACTUAL_CALLNUMS", "namespace ker::abi {\n" + callnums + "\n}"),
+                          ("ACTUAL_TYPES", types), ("ACTUAL_HELPERS", ports(helpers)), ("ACTUAL_POLICY_FUNCTIONS", ports(functions))):
+        token = "/* @" + marker + "@ */"
+        if generated.count(token) != 1:
+            raise ValueError("unique actual public-policy marker: " + marker)
+        generated = generated.replace(token, value)
+    variants = {"actual": generated}
+    for label, old, new in [
+        ("lost-absolute-interleave", "members[(address / PAGE) % count]", "members[((address / PAGE) + 1) % count]"),
+        ("lost-thread-inheritance", "inherited.mode != worker.mode || inherited.nodes != worker.mask", "false"),
+        ("lost-owned-unmap", "int const RET = fixture::munmap(mapping, static_cast<size_t>(opts.pages) * PAGE);", "int const RET = 0;"),
+    ]:
+        if generated.count(old) != 1:
+            raise ValueError("unique actual public-policy control: " + label)
+        variants[label] = generated.replace(old, new)
+    return generated, variants
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--source", type=Path)
     parser.add_argument("--workload-wait", action="store_true", help="exercise failure-only testprog wait observations")
+    parser.add_argument("--public-policy", action="store_true", help="exercise actual healthy public-policy guest bodies on finite ports")
     parser.add_argument("--predecessor", type=Path)
     parser.add_argument("--evidence-dir", type=Path)
     args = parser.parse_args()
+    if args.workload_wait and args.public_policy:
+        parser.error("select one explicit profile")
     root = args.root.resolve(strict=True)
-    source = (args.source or root / ("modules/testprog/src/numa_locality.cpp" if args.workload_wait else "tests/fixtures/numa_lifecycle_census.cpp")).resolve(strict=True)
-    shell = Path(__file__).with_name("numa_lifecycle_wait_diagnostics_test.inc") if args.workload_wait else Path(__file__).with_suffix(".inc")
+    source = (args.source or root / ("modules/testprog/src/numa_locality.cpp" if args.workload_wait or args.public_policy else "tests/fixtures/numa_lifecycle_census.cpp")).resolve(strict=True)
+    shell = (Path(__file__).with_name("numa_policy_cases.inc") if args.public_policy else
+             Path(__file__).with_name("numa_lifecycle_wait_diagnostics_test.inc") if args.workload_wait else Path(__file__).with_suffix(".inc"))
     helper_path = root / "tests/host/unit/file_mmap_registry_runtime_test.py"
     sys.dont_write_bytecode = True
     spec = importlib.util.spec_from_file_location("census_helper_owned", helper_path)
@@ -73,6 +119,8 @@ def main():
     libc_wait = root / "toolchain/src/mlibc/options/posix/generic/sys-wait.cpp"
     if args.workload_wait:
         watched.append(libc_wait)
+    if args.public_policy:
+        watched.append(Path(__file__).resolve().parents[2] / "fixtures/validate_numa_policy.py")
     selected_compiler = os.environ.get("WOS_HOST_CXX", "/usr/bin/clang++")
     compiler = Path(shutil.which(selected_compiler) or selected_compiler).absolute()
     watched.extend([compiler, compiler.resolve(strict=True)])
@@ -140,7 +188,14 @@ def main():
             extracted.append(row)
             return body
 
-        if args.workload_wait:
+        if args.public_policy:
+            callnums, row = capture(watched[4].read_text(), "enum class callnums :", declaration=True)
+            extracted.append(row)
+            generated, variants = generate_public_policy(actual, take, shell, callnums)
+            result["extractions"] = extracted
+            result["profile"] = "public-policy-actual-guest-bodies-finite-endpoints"
+            result["endpoint_limits"] = "Finite per-Task policy, mapped-byte residency, AS, cooperative placement and child transport; no WOS runtime or physical allocation"
+        elif args.workload_wait:
             storage = actual[actual.index("enum ClockValid :"):actual.index("auto now_ns(")]
             caller = take("auto run_numa_lifecycle(")
             begin = caller.index("        int status = -1;")
@@ -150,7 +205,7 @@ def main():
             if branch.count(anchor) != 1:
                 raise ValueError("unique actual postwait failure predicate")
             captured_branch = branch.replace(anchor, """        fixture::capture(status, wait_observation, WAIT_OWNED, READ_CLOSED, CLEANUP_REAP_NEEDED, reaped, owned,
-                                 unmapped, fds_absent, MAPPING_QUERY_VALID, MAPPING_QUERY, mapping_absent, own);
+                                 unmapped, fds_absent, MAPPING_QUERY_VALID, MAPPING_QUERY, mapping_absent, own, cleanup_observation);
         """ + anchor)
             result["caller_branch_source"] = dict(bytes=len(branch.encode()), sha256=hashlib.sha256(branch.encode()).hexdigest())
             result["host_only_capture_insertion"] = anchor
@@ -169,7 +224,7 @@ def main():
             if args.predecessor:
                 old = args.predecessor.read_text()
                 bodies = []
-                for name in ["auto now_ns(", "auto before(", "auto wait_child("]:
+                for name in ["auto now_ns(", "auto before(", "auto wait_child(", "auto terminate_and_reap("]:
                     body, row = capture(old, name)
                     bodies.append(port_wait(body))
                     result.setdefault("predecessor_extractions", []).append(row)
@@ -198,6 +253,11 @@ def main():
                 ("lost-status-validity", "observation.status_valid = rc == pid;", "observation.status_valid = true;"),
                 ("lost-immediate-errno", "int const ERROR = rc < 0 ? errno : 0;", "int const ERROR = 0;"),
                 ("lost-deadline-outcome", "WaitOutcome::DEADLINE : WaitOutcome::CLOCK_ERROR", "WaitOutcome::WAIT_ERROR : WaitOutcome::CLOCK_ERROR"),
+                ("lost-cleanup-kill-result", "observation->kill_result = KILL_RESULT;", "observation->kill_result = 0;"),
+                ("lost-cleanup-kill-errno", "observation->kill_error = KILL_ERROR;", "observation->kill_error = 0;"),
+                ("lost-cleanup-wait-errno", "observation->wait_error = WAIT_ERROR;", "observation->wait_error = 0;"),
+                ("lost-cleanup-status-validity", "observation->status_valid = rc == pid;", "observation->status_valid = true;"),
+                ("lost-cleanup-status", "observation->status = observation->status_valid ? status : 0;", "observation->status = 0;"),
             ]:
                 if generated.count(old) != 1:
                     raise ValueError("unique actual wait control: " + name)
@@ -276,6 +336,19 @@ def main():
             log = command([binary], label + "-run", 0 if label == "actual" else 1)
             if label != "actual" and "FAIL:" not in log.read_text():
                 raise ValueError("control did not reach its actual assertion oracle: " + label)
+            if args.public_policy and label == "actual":
+                decoder_path = Path(__file__).resolve().parents[2] / "fixtures/validate_numa_policy.py"
+                decoder_spec = importlib.util.spec_from_file_location("saved_public_policy", decoder_path)
+                decoder = importlib.util.module_from_spec(decoder_spec)
+                decoder_spec.loader.exec_module(decoder)
+                text = log.read_text()
+                result["saved_only_decodes"] = []
+                for prefix, domains in (("SAVED_POLICY", 2), ("SAVED_UMA", 1)):
+                    begin, end = prefix + "_BEGIN\n", prefix + "_END\n"
+                    if text.count(begin) != 1 or text.count(end) != 1:
+                        raise ValueError("one actual generated guest-output interval")
+                    sample = text.split(begin)[1].split(end)[0]
+                    result["saved_only_decodes"].append(decoder.decode(sample, 19601, domains, 4))
             binary.unlink()
         result["pass_"] = True
     except BaseException as error:

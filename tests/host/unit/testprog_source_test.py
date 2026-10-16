@@ -1676,7 +1676,7 @@ def test_numa_wait_diagnostics_capture_original_frontiers_before_cleanup() -> No
     require_order(lifecycle, "wait_child(pid, child_deadline, status, owned, wait_observation)",
                   "bool const WAIT_OWNED = owned", "capture ownership before cleanup")
     require_order(lifecycle, "bool const WAIT_OWNED = owned", "close_fd(fds[0], own)", "wait tuple precedes errno-changing close")
-    require_tokens(lifecycle, ["bool const CLEANUP_REAP_NEEDED = owned", "terminate_and_reap(pid, owned)",
+    require_tokens(lifecycle, ["bool const CLEANUP_REAP_NEEDED = owned", "terminate_and_reap(pid, owned, &cleanup_observation)",
                               "bool const MAPPING_QUERY_VALID = unmapped",
                               "int64_t const MAPPING_QUERY = unmapped ? page_nodes(io, mapping, 3) : 0",
                               "if (!ok || !reaped || owned || !unmapped || !fds_absent || !mapping_absent || own.fds || own.maps || !own.complete)",
@@ -1687,8 +1687,67 @@ def test_numa_wait_diagnostics_capture_original_frontiers_before_cleanup() -> No
         fail("new tuple belongs only to the existing lifecycle FAIL line")
 
 
+def test_numa_cleanup_diagnostics_preserve_original_calls_and_status_validity() -> None:
+    source = NUMA_LOCALITY_CPP.read_text()
+    cleanup = function_body(source, "terminate_and_reap")
+    require_tokens(cleanup, ["if (!owned) return true", "int const KILL_RESULT = kill(pid, SIGKILL)",
+                             "int const KILL_ERROR = KILL_RESULT < 0 ? errno : 0", "observation->kill_result = KILL_RESULT",
+                             "observation->kill_error = KILL_ERROR", "observation->kill_error_valid = KILL_RESULT < 0",
+                             "pid_t rc = waitpid(pid, &status, 0)", "int const WAIT_ERROR = rc < 0 ? errno : 0",
+                             "++observation->waits", "observation->wait_error = WAIT_ERROR",
+                             "observation->wait_error_valid = rc < 0", "observation->status_valid = rc == pid",
+                             "observation->status_valid ? status : 0", "if (rc < 0 && WAIT_ERROR == EINTR) continue"],
+                   "cleanup captures only original calls and valid consumed status")
+    if cleanup.count("kill(") != 1 or cleanup.count("waitpid(") != 1 or "now_ns(" in cleanup or "yield(" in cleanup:
+        fail("cleanup diagnostics cannot add syscalls, clock frontiers or retries")
+    require_order(cleanup, "if (!owned) return true", "kill(pid, SIGKILL)", "no-owned exact no-call path")
+    require_order(cleanup, "kill(pid, SIGKILL)", "int const KILL_ERROR", "kill immediate errno")
+    require_order(cleanup, "waitpid(pid, &status, 0)", "int const WAIT_ERROR", "cleanup wait immediate errno")
+    lifecycle = function_body(source, "run_numa_lifecycle")
+    require_tokens(lifecycle, ["CleanupObservation cleanup_observation{}", "terminate_and_reap(pid, owned, &cleanup_observation)",
+                              "cleanup_kill_rc_valid=%u", "cleanup_wait_errno_valid=%u", "cleanup_status_valid=%u",
+                              "child_elapsed_raw_ns=%llu", "static_cast<unsigned long long>(record.elapsed_ns)"],
+                   "caller-owned initialized failure tuple")
+    start = lifecycle.index("if (!ok || !reaped")
+    end = lifecycle.index("        ++completed;")
+    if "cleanup_status_valid=%u" not in lifecycle[start:end] or lifecycle.count("cleanup_status_valid=%u") != 1:
+        fail("cleanup tuple belongs only to existing lifecycle failure print")
+
+
+def test_numa_public_policy_uses_real_actor_placement_and_quota_frontiers() -> None:
+    source = NUMA_LOCALITY_CPP.read_text()
+    current = " ".join(source[source.index("constexpr uint32_t POLICY_MAX_PAGES"):].split())
+    require_tokens(current, ["POLICY_MAX_PAGES = 256", "policy_topology(io, topo, opts.domains)",
+                            "policy_set(mode, MASK)", "policy_read(io, actual_policy)",
+                            "page_nodes(io, static_cast<uint8_t*>(mapping)", "out.virgin", "out.resident", "out.stable",
+                            "static_cast<uint64_t>(out.local) * 100 < static_cast<uint64_t>(opts.pages) * 95",
+                            "members[(address / PAGE) % count]", "row.node != policy_expected(",
+                            "io.pages[i].node != out.nodes[first + i]", "int const RET = munmap(mapping,",
+                            "inherited.mode != worker.mode || inherited.nodes != worker.mask",
+                            "MASK != (uint64_t{1} << worker.selected.cpu)", "place_thread(worker.tid.load(",
+                            "pthread_join(thread, nullptr)", "report.pid != report.tid",
+                            "wait_child(pid, deadline, status, owned, wait)", "if (owned) { ok = false;",
+                            "setrlimit(RLIMIT_AS, &finite)", "setrlimit(RLIMIT_AS, &saved)",
+                            "out.change_query_rc = policy_read(io, changed)", "changed.mode == mode && changed.nodes == mask",
+                            "policy_change(worker.mode == 0", "policy_change(mode == 0", "CLEAN && RESTORED && before(deadline)",
+                            "before_usage.current + PAGE > saved.rlim_max", "after_usage.current != quota.accepted",
+                            "after_usage.denied <= quota.denied_before", "ERROR != ENOMEM",
+                            "restored.rlim_cur != saved.rlim_cur || restored.rlim_max != saved.rlim_max",
+                            "joined == 4 && children == 8", "completed == 4 && CLEAN && RESTORED"],
+                   "public policy actual actor/mapping/inheritance/AS/owned cleanup")
+    require_order(current, "out.query_rc = page_nodes(", "out.phase = 3;", "virgin observation before user payload stores")
+    require_order(current, "worker.tid.store(", "while (!worker.placed.load(", "publish actual worker identity before cooperative placement")
+    require_order(current, "policy_pipe(quota_fds, own)", "setrlimit(RLIMIT_AS, &finite)", "quota FD transport prepared before finite bound")
+    require_order(current, "inherited.mode != mode || inherited.nodes != mask", "policy_mapping(opts, io, selected, mode, mask, 2",
+                  "child observes inherited policy before mapping or setter")
+    if '"numa-policy"' not in TESTPROG_MAIN_CPP.read_text():
+        fail("separate public policy guest entrypoint missing")
+
+
 def main() -> None:
+    test_numa_public_policy_uses_real_actor_placement_and_quota_frontiers()
     test_numa_wait_diagnostics_capture_original_frontiers_before_cleanup()
+    test_numa_cleanup_diagnostics_preserve_original_calls_and_status_validity()
     test_ping_receive_is_deadline_bounded()
     test_netbench_io_is_deadline_bounded()
     test_userland_suite_passes_netbench_timeout()

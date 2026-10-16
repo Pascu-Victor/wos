@@ -397,6 +397,10 @@ add_test(NAME numa_lifecycle_wait_diagnostics_test
     COMMAND ${CMAKE_COMMAND} -E env WOS_HOST_CXX=${CMAKE_CXX_COMPILER}
         ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_lifecycle_helper_diagnostics_test.py --workload-wait)
 set_tests_properties(numa_lifecycle_wait_diagnostics_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 80)
+add_test(NAME numa_public_policy_runtime_test
+    COMMAND ${CMAKE_COMMAND} -E env WOS_HOST_CXX=${CMAKE_CXX_COMPILER}
+        ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_lifecycle_helper_diagnostics_test.py --public-policy)
+set_tests_properties(numa_public_policy_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 80)
 add_test(NAME numa_chase_runtime_test
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_chase_runtime_test.py
         --cxx ${CMAKE_CXX_COMPILER})

@@ -1,5 +1,6 @@
 #include "numa_locality.hpp"
 
+#include <abi/callnums/process.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
@@ -7,6 +8,8 @@
 #include <sys/mman.h>
 #include <sys/multiproc.h>
 #include <sys/numa.h>
+#include <sys/resource.h>
+#include <sys/resource_policy.h>
 #include <sys/vmem.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -79,6 +82,15 @@ struct WaitObservation {
     int error{}, status{};
     WaitOutcome outcome{};
     bool result_valid{}, error_valid{}, status_valid{};
+};
+
+// Failure diagnostics retain the last existing cleanup call and retry counts.
+// Status is read only after consuming this exact child; no wait history allocates.
+struct CleanupObservation {
+    uint64_t waits{}, interrupted_waits{};
+    int64_t kill_result{}, wait_result{};
+    int kill_error{}, wait_error{}, status{};
+    bool kill_result_valid{}, kill_error_valid{}, wait_result_valid{}, wait_error_valid{}, status_valid{};
 };
 
 auto now_ns(uint64_t& out, ClockObservation* observation = nullptr) -> bool {
@@ -642,17 +654,35 @@ auto wait_child(pid_t pid, uint64_t deadline, int& status, bool& owned, WaitObse
     errno = ETIMEDOUT;
     return false;
 }
-auto terminate_and_reap(pid_t pid, bool& owned) -> bool {
+auto terminate_and_reap(pid_t pid, bool& owned, CleanupObservation* observation = nullptr) -> bool {
     if (!owned) return true;
-    (void)kill(pid, SIGKILL);  // Still consume the exact child even if signaling fails.
+    int const KILL_RESULT = kill(pid, SIGKILL);  // Still consume the exact child even if signaling fails.
+    int const KILL_ERROR = KILL_RESULT < 0 ? errno : 0;
+    if (observation != nullptr) {
+        observation->kill_result = KILL_RESULT;
+        observation->kill_result_valid = true;
+        observation->kill_error = KILL_ERROR;
+        observation->kill_error_valid = KILL_RESULT < 0;
+    }
     int status;
     for (;;) {
         pid_t rc = waitpid(pid, &status, 0);
+        int const WAIT_ERROR = rc < 0 ? errno : 0;
+        if (observation != nullptr) {
+            ++observation->waits;
+            if (rc < 0 && WAIT_ERROR == EINTR) ++observation->interrupted_waits;
+            observation->wait_result = rc;
+            observation->wait_result_valid = true;
+            observation->wait_error = WAIT_ERROR;
+            observation->wait_error_valid = rc < 0;
+            observation->status_valid = rc == pid;
+            observation->status = observation->status_valid ? status : 0;
+        }
         if (rc == pid) {
             owned = false;
             return true;
         }
-        if (rc < 0 && errno == EINTR) continue;
+        if (rc < 0 && WAIT_ERROR == EINTR) continue;
         return false;
     }
 }
@@ -911,7 +941,8 @@ auto run_numa_lifecycle(int argc, char** argv) -> int {
         bool const READ_CLOSED = close_fd(fds[0], own);
         if (!READ_CLOSED) ok = false;
         bool const CLEANUP_REAP_NEEDED = owned;
-        bool const reaped = terminate_and_reap(pid, owned);
+        CleanupObservation cleanup_observation{};
+        bool const reaped = terminate_and_reap(pid, owned, &cleanup_observation);
         bool const unmapped = munmap(mapping, CYCLE_BYTES) == 0;
         if (unmapped) {
             --own.maps;
@@ -939,7 +970,10 @@ auto run_numa_lifecycle(int argc, char** argv) -> int {
                 "wait_status_valid=%u wait_status_observed=%d wait_polls=%llu wait_owned=%u "
                 "clock_valid=%u clock_rc=%d clock_errno=%d clock_sec=%lld clock_nsec=%lld clock_ns=%llu wait_deadline=%llu "
                 "close_read=%u cleanup_reap_needed=%u cleanup_reap=%u cleanup_owned=%u fd_absent=%u "
-                "map_query_valid=%u map_query=%lld mapping_absent=%u own_fds=%u own_maps=%u own_complete=%u\n",
+                "map_query_valid=%u map_query=%lld mapping_absent=%u own_fds=%u own_maps=%u own_complete=%u "
+                "cleanup_kill_rc_valid=%u cleanup_kill_rc=%lld cleanup_kill_errno_valid=%u cleanup_kill_errno=%d "
+                "cleanup_wait_calls=%llu cleanup_wait_eintr=%llu cleanup_wait_rc_valid=%u cleanup_wait_rc=%lld "
+                "cleanup_wait_errno_valid=%u cleanup_wait_errno=%d cleanup_status_valid=%u cleanup_status=%d child_elapsed_raw_ns=%llu\n",
                 cycle, static_cast<int>(pid), phase, static_cast<long long>(source_query_error), record.phase,
                 static_cast<long long>(record.error), status, static_cast<unsigned>(reaped && !owned), static_cast<unsigned>(unmapped),
                 errno, static_cast<unsigned>(wait_observation.outcome), static_cast<unsigned>(wait_observation.result_valid),
@@ -951,7 +985,15 @@ auto run_numa_lifecycle(int argc, char** argv) -> int {
                 static_cast<unsigned long long>(wait_observation.deadline), static_cast<unsigned>(READ_CLOSED),
                 static_cast<unsigned>(CLEANUP_REAP_NEEDED), static_cast<unsigned>(reaped), static_cast<unsigned>(owned),
                 static_cast<unsigned>(fds_absent), static_cast<unsigned>(MAPPING_QUERY_VALID), static_cast<long long>(MAPPING_QUERY),
-                static_cast<unsigned>(mapping_absent), own.fds, own.maps, static_cast<unsigned>(own.complete));
+                static_cast<unsigned>(mapping_absent), own.fds, own.maps, static_cast<unsigned>(own.complete),
+                static_cast<unsigned>(cleanup_observation.kill_result_valid), static_cast<long long>(cleanup_observation.kill_result),
+                static_cast<unsigned>(cleanup_observation.kill_error_valid), cleanup_observation.kill_error,
+                static_cast<unsigned long long>(cleanup_observation.waits),
+                static_cast<unsigned long long>(cleanup_observation.interrupted_waits),
+                static_cast<unsigned>(cleanup_observation.wait_result_valid), static_cast<long long>(cleanup_observation.wait_result),
+                static_cast<unsigned>(cleanup_observation.wait_error_valid), cleanup_observation.wait_error,
+                static_cast<unsigned>(cleanup_observation.status_valid), cleanup_observation.status,
+                static_cast<unsigned long long>(record.elapsed_ns));
             break;
         }
         ++completed;
@@ -986,4 +1028,661 @@ auto run_numa_lifecycle(int argc, char** argv) -> int {
         same_node_cycles, cross_node_cycles, cross_node_cow_cycles, static_cast<unsigned long long>(cow_local_pages),
         static_cast<unsigned long long>(cow_resident_pages));
     return ok ? 0 : 1;
+}
+
+namespace {
+// Separate healthy public-policy probe. These records are caller-owned; they
+// never stand in for kernel census/physical-owner or pressure authority.
+constexpr uint32_t POLICY_MAX_PAGES = 256;
+struct PolicyOptions {
+    uint64_t nonce{};
+    uint32_t pages{64}, domains{}, timeout_ms{30000}, child_timeout_ms{5000};
+};
+struct PolicyReport {
+    uint64_t nonce{}, pid{}, tid{}, cpu{}, affinity{}, address{}, nodes_mask{}, limit_soft{}, limit_hard{}, observed_mask{}, changed_mask{};
+    int64_t error{}, query_rc{}, change_rc{}, change_query_rc{}, restore_rc{}, map_rc{}, unmap_rc{};
+    int map_errno{}, unmap_errno{};
+    uint32_t mode{}, actor{}, pages{}, virgin{}, resident{}, stable{}, unmapped{}, local{}, phase{}, observed_mode{}, changed_mode{};
+    std::array<uint16_t, POLICY_MAX_PAGES> nodes{};
+};
+static_assert(std::is_trivially_copyable_v<PolicyReport> && sizeof(PolicyReport) < 1024);
+struct PolicyWorker {
+    PolicyOptions opts{};
+    const Topology* topo{};
+    Selection selected{};
+    uint32_t mode{};
+    uint64_t mask{}, deadline{};
+    std::atomic<bool> started{false}, placed{false}, cancel{false}, done{false};
+    std::atomic<uint64_t> tid{0};
+    PolicyReport report{};
+};
+struct PolicyQuota {
+    uint64_t before{}, denied_before{}, accepted{}, denied_after{}, final{}, inherited_soft{}, inherited_hard{}, final_soft{}, final_hard{};
+    int64_t first_rc{}, second_rc{}, restore_rc{};
+    int first_errno{}, second_errno{};
+    bool child_consumed{}, reservation_removed{};
+};
+
+auto policy_options(int argc, char** argv, PolicyOptions& out) -> bool {
+    uint32_t seen = 0;
+    for (int i = 0; i < argc; ++i) {
+        if (i + 1 >= argc) return false;
+        const char* key = argv[i++];
+        uint64_t value{};
+        if (!number(argv[i], value)) return false;
+        uint32_t bit = 0;
+        if (std::strcmp(key, "--nonce") == 0 && value != 0) {
+            bit = 1;
+            out.nonce = value;
+        } else if (std::strcmp(key, "--pages") == 0 && value >= 1 && value <= POLICY_MAX_PAGES) {
+            bit = 2;
+            out.pages = value;
+        } else if (std::strcmp(key, "--domains") == 0 && value >= 1 && value <= 2) {
+            bit = 4;
+            out.domains = value;
+        } else if (std::strcmp(key, "--timeout-ms") == 0 && value >= 1000 && value <= 120000) {
+            bit = 8;
+            out.timeout_ms = value;
+        } else if (std::strcmp(key, "--child-timeout-ms") == 0 && value >= 100 && value <= 30000) {
+            bit = 16;
+            out.child_timeout_ms = value;
+        } else
+            return false;
+        if (seen & bit) return false;
+        seen |= bit;
+    }
+    return (seen & 5) == 5 && out.child_timeout_ms <= out.timeout_ms;
+}
+
+auto policy_read(QueryBuffers& io, abi::SelfPolicy& out) -> int64_t {
+    initialize_transport(out);
+    int64_t const RC = query(io, abi::QueryKind::SELF_POLICY, &out, sizeof(out));
+    if (RC != 0) return RC;
+    return out.version == abi::VERSION && out.bytes == sizeof(out) && out.mode <= 3 && !out.reserved32 && !out.reserved64 ? 0 : -EPROTO;
+}
+auto policy_set(uint32_t mode, uint64_t mask) -> int64_t {
+    abi::PolicyRequest request;
+    initialize_transport(request);
+    request.version = abi::VERSION;
+    request.bytes = sizeof(request);
+    request.mode = mode;
+    request.nodes = mask;
+    return ker::vmem::set_memory_policy(request);
+}
+auto policy_matches(QueryBuffers& io, uint32_t mode, uint64_t mask) -> bool {
+    abi::SelfPolicy out;
+    return policy_read(io, out) == 0 && out.mode == mode && out.nodes == mask;
+}
+auto policy_change(uint32_t mode, uint64_t mask, QueryBuffers& io, PolicyReport& out) -> int64_t {
+    out.change_rc = policy_set(mode, mask);
+    if (out.change_rc != 0) return out.change_rc;
+    abi::SelfPolicy changed;
+    initialize_transport(changed);
+    out.change_query_rc = policy_read(io, changed);
+    out.changed_mode = changed.mode;
+    out.changed_mask = changed.nodes;
+    if (out.change_query_rc != 0) return out.change_query_rc;
+    return changed.mode == mode && changed.nodes == mask ? 0 : -EPROTO;
+}
+auto policy_topology(QueryBuffers& io, Topology& topo, uint32_t domains) -> int64_t {
+    initialize_transport(topo);
+    auto rc = query(io, abi::QueryKind::SUMMARY, &topo.summary, sizeof(topo.summary));
+    auto const& s = topo.summary;
+    if (rc != 0) return rc;
+    if (s.version != abi::VERSION || s.bytes != sizeof(s) || s.features != abi::FEATURES_V1 || s.node_count != domains ||
+        s.cpu_count == 0 || s.cpu_count > 64 || s.page_bytes != PAGE || s.max_page_nodes != abi::MAX_PAGE_NODES || s.cpu_mask_words != 4 ||
+        s.provenance > 3 || s.reserved64[0] || s.reserved64[1] || s.reserved64[2])
+        return -ENOTSUP;
+    uint64_t seen = 0;
+    for (uint32_t n = 0; n < domains; ++n) {
+        auto& node = topo.nodes[n];
+        rc = query(io, abi::QueryKind::NODE, &node, sizeof(node), n);
+        if (rc != 0) return rc;
+        uint64_t const mask = node.cpu_words[0];
+        if (node.version != abi::VERSION || node.bytes != sizeof(node) || node.node != n || node.reserved16 || node.reserved64 ||
+            !node.managed_bytes || node.managed_bytes % PAGE || !mask || node.cpu_words[1] || node.cpu_words[2] || node.cpu_words[3] ||
+            (mask & seen) || (s.cpu_count < 64 && mask >> s.cpu_count))
+            return -ENOTSUP;
+        seen |= mask;
+    }
+    return seen == (s.cpu_count == 64 ? UINT64_MAX : (uint64_t{1} << s.cpu_count) - 1) ? 0 : -EPROTO;
+}
+auto policy_expected(uint32_t mode, uint64_t mask, uint64_t address, uint16_t local) -> uint16_t {
+    if (mode == 0) return local;
+    uint16_t members[2]{};
+    uint32_t count = 0;
+    for (uint16_t n = 0; n < 2; ++n)
+        if (mask & (uint64_t{1} << n)) members[count++] = n;
+    if (!count) return abi::INVALID_NODE;
+    return mode == 3 ? members[(address / PAGE) % count] : members[0];
+}
+
+// Candidate transport exists before mmap, before child publication and before
+// any finite AS soft limit. Query transport never aliases the payload.
+auto policy_mapping(const PolicyOptions& opts, QueryBuffers& io, Selection selected, uint32_t mode, uint64_t mask, uint32_t actor,
+                    uint64_t deadline, PolicyReport& out) -> int64_t {
+    initialize_transport(out);
+    out.nonce = opts.nonce;
+    out.pid = getpid();
+    out.tid = ker::multiproc::currentThreadId();
+    out.cpu = ker::multiproc::getcurrent_cpu();
+    out.affinity = ker::multiproc::getThreadAffinityMask(out.tid);
+    out.mode = mode;
+    out.nodes_mask = mask;
+    out.actor = actor;
+    out.pages = opts.pages;
+    void* mapping = nullptr;
+    int64_t rc = 0;
+    out.phase = 1;
+    abi::SelfPolicy observed;
+    initialize_transport(observed);
+    out.query_rc = policy_read(io, observed);
+    out.observed_mode = observed.mode;
+    out.observed_mask = observed.nodes;
+    if (!out.tid || raw_error(out.tid) || out.cpu != selected.cpu || out.affinity != (uint64_t{1} << selected.cpu) || out.query_rc != 0 ||
+        observed.mode != mode || observed.nodes != mask)
+        rc = -EPROTO;
+    if (rc == 0) {
+        out.phase = 2;
+        mapping = map_private(static_cast<size_t>(opts.pages) * PAGE);
+        int const ERROR = mapping == MAP_FAILED ? errno : 0;
+        out.map_rc = mapping == MAP_FAILED ? -1 : 0;
+        out.map_errno = ERROR;
+        if (mapping == MAP_FAILED) {
+            mapping = nullptr;
+            rc = -ERROR;
+        } else
+            out.address = reinterpret_cast<uint64_t>(mapping);
+    }
+    if (rc == 0 && (out.address % PAGE || !before(deadline))) rc = -EPROTO;
+    for (uint32_t first = 0; rc == 0 && first < opts.pages; first += abi::MAX_PAGE_NODES) {
+        uint32_t const count = opts.pages - first < abi::MAX_PAGE_NODES ? opts.pages - first : abi::MAX_PAGE_NODES;
+        out.query_rc = page_nodes(io, static_cast<uint8_t*>(mapping) + static_cast<size_t>(first) * PAGE, count);
+        if (out.query_rc != 0) {
+            rc = out.query_rc;
+            break;
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            auto const& row = io.pages[i];
+            if (row.reserved32 || row.node != abi::INVALID_NODE || row.status != static_cast<uint16_t>(abi::PageStatus::UNAVAILABLE))
+                rc = -EPROTO;
+            else
+                ++out.virgin;
+        }
+    }
+    if (rc == 0) {
+        out.phase = 3;
+        auto* bytes = static_cast<volatile uint8_t*>(mapping);
+        for (uint32_t p = 0; p < opts.pages; ++p) bytes[static_cast<size_t>(p) * PAGE] = static_cast<uint8_t>(1 + ((opts.nonce + p) % 251));
+        for (uint32_t p = 0; p < opts.pages; ++p) {
+            size_t const start = static_cast<size_t>(p) * PAGE;
+            if (bytes[start] != static_cast<uint8_t>(1 + ((opts.nonce + p) % 251))) rc = -EILSEQ;
+            for (size_t i = 1; i < PAGE; ++i)
+                if (bytes[start + i] != 0) rc = -EILSEQ;
+            if (!before(deadline)) {
+                rc = -ETIMEDOUT;
+                break;
+            }
+        }
+    }
+    for (uint32_t first = 0; rc == 0 && first < opts.pages; first += abi::MAX_PAGE_NODES) {
+        uint32_t const count = opts.pages - first < abi::MAX_PAGE_NODES ? opts.pages - first : abi::MAX_PAGE_NODES;
+        out.query_rc = page_nodes(io, static_cast<uint8_t*>(mapping) + static_cast<size_t>(first) * PAGE, count);
+        if (out.query_rc != 0) {
+            rc = out.query_rc;
+            break;
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            auto const& row = io.pages[i];
+            uint32_t const p = first + i;
+            out.nodes[p] = row.node;
+            if (row.reserved32 || row.status != static_cast<uint16_t>(abi::PageStatus::RESIDENT) || row.node >= opts.domains)
+                rc = -EPROTO;
+            else {
+                ++out.resident;
+                if (row.node == selected.node) ++out.local;
+            }
+            if (mode != 0 && row.node != policy_expected(mode, mask, out.address + static_cast<uint64_t>(p) * PAGE, selected.node))
+                rc = -EPROTO;
+        }
+    }
+    if (rc == 0 && mode == 0 && static_cast<uint64_t>(out.local) * 100 < static_cast<uint64_t>(opts.pages) * 95) rc = -EPROTO;
+    if (rc == 0) {
+        out.phase = 4;
+        rc = policy_change(mode == 0 ? 2 : 0, mode == 0 ? (uint64_t{1} << selected.node) : 0, io, out);
+        for (uint32_t first = 0; rc == 0 && first < opts.pages; first += abi::MAX_PAGE_NODES) {
+            uint32_t const count = opts.pages - first < abi::MAX_PAGE_NODES ? opts.pages - first : abi::MAX_PAGE_NODES;
+            out.query_rc = page_nodes(io, static_cast<uint8_t*>(mapping) + static_cast<size_t>(first) * PAGE, count);
+            if (out.query_rc != 0) {
+                rc = out.query_rc;
+                break;
+            }
+            for (uint32_t i = 0; i < count; ++i)
+                if (io.pages[i].reserved32 || io.pages[i].status != static_cast<uint16_t>(abi::PageStatus::RESIDENT) ||
+                    io.pages[i].node != out.nodes[first + i])
+                    rc = -EPROTO;
+                else
+                    ++out.stable;
+        }
+    }
+    out.restore_rc = policy_set(mode, mask);
+    if (rc == 0 && (out.restore_rc != 0 || !policy_matches(io, mode, mask) || !cpu_still(selected.cpu))) rc = -EPROTO;
+    if (mapping != nullptr) {
+        int const RET = munmap(mapping, static_cast<size_t>(opts.pages) * PAGE);
+        int const ERROR = RET < 0 ? errno : 0;
+        out.unmap_rc = RET;
+        out.unmap_errno = ERROR;
+        if (RET == 0)
+            out.unmapped = 1;
+        else if (rc == 0)
+            rc = -ERROR;
+    }
+    if (rc == 0 && !before(deadline)) rc = -ETIMEDOUT;
+    out.error = rc;
+    if (rc == 0) out.phase = 5;
+    return rc;
+}
+
+void* policy_worker(void* opaque) {
+    auto& worker = *static_cast<PolicyWorker*>(opaque);
+    QueryBuffers io;
+    initialize_transport(io);
+    abi::SelfPolicy inherited;
+    initialize_transport(inherited);
+    int64_t rc = policy_read(io, inherited);
+    uint64_t const TID = ker::multiproc::currentThreadId();
+    uint64_t const MASK = ker::multiproc::getThreadAffinityMask(TID);
+    if (rc == 0 && (inherited.mode != worker.mode || inherited.nodes != worker.mask || MASK != (uint64_t{1} << worker.selected.cpu)))
+        rc = -EPROTO;
+    worker.tid.store(TID, std::memory_order_release);
+    worker.started.store(true, std::memory_order_release);
+    while (!worker.placed.load(std::memory_order_acquire) && rc == 0) {
+        if (worker.cancel.load(std::memory_order_acquire) || !before(worker.deadline))
+            rc = -ECANCELED;
+        else
+            (void)ker::multiproc::yield();
+    }
+    if (rc == 0) rc = policy_mapping(worker.opts, io, worker.selected, worker.mode, worker.mask, 1, worker.deadline, worker.report);
+    if (rc == 0)
+        rc = policy_change(worker.mode == 0 ? 2 : 0, worker.mode == 0 ? (uint64_t{1} << worker.selected.node) : 0, io, worker.report);
+    worker.report.observed_mode = inherited.mode;
+    worker.report.observed_mask = inherited.nodes;
+    worker.report.error = rc;
+    worker.done.store(true, std::memory_order_release);  // Last argument access.
+    return nullptr;
+}
+
+auto policy_usage(ker::abi::resource::Usage& out) -> int64_t {
+    initialize_transport(out);
+    return static_cast<int64_t>(
+        ::syscall(ker::abi::callnums::process, static_cast<uint64_t>(ker::abi::process::procmgmt_ops::RESOURCE_USAGE),
+                  static_cast<uint64_t>(ker::abi::resource::Id::AS), reinterpret_cast<uint64_t>(&out), ker::abi::resource::VERSION));
+}
+
+auto policy_child(const PolicyOptions& opts, const Topology& topo, Selection selected, uint32_t mode, uint64_t mask, bool quota_only,
+                  const rlimit& expected_limit, int fd, uint64_t deadline) -> int {
+    (void)topo;
+    PolicyReport report;
+    initialize_transport(report);
+    QueryBuffers io;
+    initialize_transport(io);
+    report.nonce = opts.nonce;
+    report.pid = getpid();
+    report.tid = ker::multiproc::currentThreadId();
+    report.mode = mode;
+    report.nodes_mask = mask;
+    report.actor = quota_only ? 3 : 2;
+    abi::SelfPolicy inherited;
+    initialize_transport(inherited);
+    int64_t rc = policy_read(io, inherited);
+    if (rc == 0 && (inherited.mode != mode || inherited.nodes != mask || !cpu_still(selected.cpu))) rc = -EPROTO;
+    if (rc == 0 && quota_only) {
+        rlimit actual;
+        initialize_transport(actual);
+        int const RET = getrlimit(RLIMIT_AS, &actual);
+        int const ERROR = RET < 0 ? errno : 0;
+        report.limit_soft = actual.rlim_cur;
+        report.limit_hard = actual.rlim_max;
+        if (RET != 0)
+            rc = -ERROR;
+        else if (actual.rlim_cur != expected_limit.rlim_cur || actual.rlim_max != expected_limit.rlim_max)
+            rc = -EPROTO;
+    } else if (rc == 0) {
+        rc = policy_mapping(opts, io, selected, mode, mask, 2, deadline, report);
+        if (rc == 0) rc = policy_change(mode == 0 ? 2 : 0, mode == 0 ? (uint64_t{1} << selected.node) : 0, io, report);
+    }
+    report.observed_mode = inherited.mode;
+    report.observed_mask = inherited.nodes;
+    report.error = rc;
+    if (report.pid != report.tid) report.error = -EPROTO;
+    return transfer(fd, &report, sizeof(report), true, deadline) && report.error == 0 ? 0 : 71;
+}
+
+auto policy_pipe(int (&fds)[2], OwnResources& own) -> bool {
+    if (pipe(fds) != 0) return false;
+    own.fds += 2;
+    own.created_fds += 2;
+    if (nonblocking(fds[0]) && nonblocking(fds[1])) return true;
+    (void)close_fd(fds[0], own);
+    (void)close_fd(fds[1], own);
+    return false;
+}
+auto policy_fork(const PolicyOptions& opts, const Topology& topo, Selection selected, uint32_t mode, uint64_t mask, bool quota_only,
+                 const rlimit& expected_limit, uint64_t deadline, PolicyReport& report, OwnResources& own, int (&fds)[2]) -> bool {
+    initialize_transport(report);
+    bool owned = false, ok = before(deadline);
+    pid_t pid = -1;
+    if (ok) {
+        pid = fork();
+        if (pid == 0) {
+            if (close(fds[0]) != 0) _exit(72);
+            int rc = policy_child(opts, topo, selected, mode, mask, quota_only, expected_limit, fds[1], deadline);
+            if (close(fds[1]) != 0 && rc == 0) rc = 73;
+            _exit(rc);
+        }
+        if (pid < 0)
+            ok = false;
+        else
+            owned = true;
+    }
+    if (!close_fd(fds[1], own)) ok = false;
+    if (ok && !transfer(fds[0], &report, sizeof(report), false, deadline)) ok = false;
+    if (ok && (report.nonce != opts.nonce || report.pid != static_cast<uint64_t>(pid) || report.tid != static_cast<uint64_t>(pid) ||
+               report.mode != mode || report.nodes_mask != mask || report.actor != (quota_only ? 3U : 2U) || report.error != 0))
+        ok = false;
+    int status = -1;
+    WaitObservation wait;
+    bool const consumed = owned && wait_child(pid, deadline, status, owned, wait);
+    if (!close_fd(fds[0], own)) ok = false;
+    if (owned) {
+        ok = false;
+        if (!terminate_and_reap(pid, owned)) own.complete = false;
+    }
+    std::printf(
+        "NUMA_POLICY "
+        "{\"type\":\"wait\",\"nonce\":%llu,\"mode\":%u,\"actor\":%u,\"pid\":%lld,\"rc\":%lld,\"rc_valid\":%u,\"status\":%d,\"status_"
+        "valid\":%"
+        "u,\"errno\":%d,\"errno_valid\":%u,\"consumed\":%u,\"owned\":%u}\n",
+        static_cast<unsigned long long>(opts.nonce), mode, quota_only ? 3U : 2U, static_cast<long long>(pid),
+        static_cast<long long>(wait.result), static_cast<unsigned>(wait.result_valid), wait.status,
+        static_cast<unsigned>(wait.status_valid), wait.error, static_cast<unsigned>(wait.error_valid), static_cast<unsigned>(consumed),
+        static_cast<unsigned>(owned));
+    return ok && consumed && !owned && own.complete && own.fds == 0 && before(deadline);
+}
+
+void policy_print(const PolicyReport& record) {
+    std::printf(
+        "NUMA_POLICY "
+        "{\"type\":\"actor\",\"nonce\":%llu,\"mode\":%u,\"actor\":%u,\"pid\":%llu,\"tid\":%llu,\"cpu\":%llu,\"affinity\":%llu,\"address\":%"
+        "llu,\"mask\":%llu,\"observed_mode\":%u,\"observed_mask\":%llu,\"pages\":%u,\"virgin\":%u,\"resident\":%u,\"stable\":%u,"
+        "\"unmapped\":%u,\"local\":%u,\"phase\":%u,\"error\":%lld,\"map_rc\":%lld,\"map_errno\":%d,\"query_rc\":%lld,\"change_rc\":%lld,"
+        "\"change_query_rc\":%lld,\"changed_mode\":%u,\"changed_mask\":%llu,\"restore_rc\":%lld,\"unmap_rc\":%lld,\"unmap_errno\":%d}\n",
+        static_cast<unsigned long long>(record.nonce), record.mode, record.actor, static_cast<unsigned long long>(record.pid),
+        static_cast<unsigned long long>(record.tid), static_cast<unsigned long long>(record.cpu),
+        static_cast<unsigned long long>(record.affinity), static_cast<unsigned long long>(record.address),
+        static_cast<unsigned long long>(record.nodes_mask), record.observed_mode, static_cast<unsigned long long>(record.observed_mask),
+        record.pages, record.virgin, record.resident, record.stable, record.unmapped, record.local, record.phase,
+        static_cast<long long>(record.error), static_cast<long long>(record.map_rc), record.map_errno,
+        static_cast<long long>(record.query_rc), static_cast<long long>(record.change_rc), static_cast<long long>(record.change_query_rc),
+        record.changed_mode, static_cast<unsigned long long>(record.changed_mask), static_cast<long long>(record.restore_rc),
+        static_cast<long long>(record.unmap_rc), record.unmap_errno);
+    for (uint32_t p = 0; p < record.pages && p < POLICY_MAX_PAGES; ++p)
+        std::printf("NUMA_POLICY {\"type\":\"page\",\"nonce\":%llu,\"mode\":%u,\"actor\":%u,\"index\":%u,\"va\":%llu,\"node\":%u}\n",
+                    static_cast<unsigned long long>(record.nonce), record.mode, record.actor, p,
+                    static_cast<unsigned long long>(record.address + static_cast<uint64_t>(p) * PAGE), record.nodes[p]);
+}
+}  // namespace
+
+auto run_numa_policy(int argc, char** argv) -> int {
+    PolicyOptions opts;
+    if (!policy_options(argc, argv, opts)) {
+        std::fprintf(stderr, "numa-policy: invalid bounded options\n");
+        return 2;
+    }
+    QueryBuffers io;
+    initialize_transport(io);
+    Topology topo;
+    initialize_transport(topo);
+    abi::SelfPolicy original;
+    initialize_transport(original);
+    uint64_t deadline{};
+    auto rc = deadline_after(opts.timeout_ms, deadline) ? policy_topology(io, topo, opts.domains) : -EIO;
+    if (rc == 0) rc = policy_read(io, original);
+    uint64_t const TID = ker::multiproc::currentThreadId();
+    uint64_t const ORIGINAL_AFFINITY = ker::multiproc::getThreadAffinityMask(TID);
+    Selection selected{};
+    if (rc == 0) rc = pin_current_cpu(topo, selected, deadline);
+    if (rc != 0) {
+        if (TID && !raw_error(TID) && ORIGINAL_AFFINITY) (void)ker::multiproc::setThreadAffinityMask(TID, ORIGINAL_AFFINITY);
+        std::fprintf(stderr, "numa-policy: setup error=%lld\n", static_cast<long long>(rc));
+        return 1;
+    }
+    std::printf(
+        "NUMA_POLICY "
+        "{\"type\":\"begin\",\"version\":1,\"nonce\":%llu,\"domains\":%u,\"pages\":%u,\"pid\":%lld,\"tid\":%llu,\"cpu\":%u,\"local_node\":%"
+        "u,"
+        "\"cpus\":%u,\"features\":%llu,\"eligible\":\"virgin_private_cpl3_write\",\"excluded\":\"transport_stack_control\",\"scope\":"
+        "\"healthy_emulated_placement\"}\n",
+        static_cast<unsigned long long>(opts.nonce), opts.domains, opts.pages, static_cast<long long>(getpid()),
+        static_cast<unsigned long long>(TID), selected.cpu, selected.node, topo.summary.cpu_count,
+        static_cast<unsigned long long>(topo.summary.features));
+    for (uint32_t n = 0; n < opts.domains; ++n)
+        std::printf("NUMA_POLICY {\"type\":\"node\",\"nonce\":%llu,\"node\":%u,\"managed\":%llu,\"cpu_mask\":%llu}\n",
+                    static_cast<unsigned long long>(opts.nonce), n, static_cast<unsigned long long>(topo.nodes[n].managed_bytes),
+                    static_cast<unsigned long long>(topo.nodes[n].cpu_words[0]));
+    OwnResources own;
+    uint32_t completed = 0, joined = 0, children = 0;
+    for (uint32_t mode = 0; mode < 4 && rc == 0; ++mode) {
+        uint16_t const target = opts.domains == 2 ? 1U - selected.node : selected.node;
+        uint64_t const MASK = mode == 0 ? 0 : mode == 3 ? (uint64_t{1} << opts.domains) - 1 : uint64_t{1} << target;
+        rc = policy_set(mode, MASK);
+        abi::SelfPolicy actual_policy;
+        initialize_transport(actual_policy);
+        int64_t const QUERY_RC = rc == 0 ? policy_read(io, actual_policy) : rc;
+        std::printf(
+            "NUMA_POLICY "
+            "{\"type\":\"mode\",\"nonce\":%llu,\"mode\":%u,\"mask\":%llu,\"set_rc\":%lld,\"query_rc\":%lld,\"observed_mode\":%u,\"observed_"
+            "mask\":%llu}\n",
+            static_cast<unsigned long long>(opts.nonce), mode, static_cast<unsigned long long>(MASK), static_cast<long long>(rc),
+            static_cast<long long>(QUERY_RC), actual_policy.mode, static_cast<unsigned long long>(actual_policy.nodes));
+        if (rc == 0 && (QUERY_RC != 0 || actual_policy.mode != mode || actual_policy.nodes != MASK)) rc = -EPROTO;
+        PolicyReport parent;
+        initialize_transport(parent);
+        if (rc == 0) rc = policy_mapping(opts, io, selected, mode, MASK, 0, deadline, parent);
+        policy_print(parent);
+        PolicyWorker worker;
+        initialize_transport(worker.report);
+        worker.opts = opts;
+        worker.topo = &topo;
+        worker.selected = selected;
+        worker.mode = mode;
+        worker.mask = MASK;
+        worker.deadline = deadline;
+        pthread_t thread{};
+        bool created = false;
+        if (rc == 0) {
+            int const ERROR = pthread_create(&thread, nullptr, policy_worker, &worker);
+            if (ERROR != 0)
+                rc = -ERROR;
+            else
+                created = true;
+        }
+        if (created) {
+            if (!wait_flag(worker.started, deadline)) rc = -ETIMEDOUT;
+            if (rc == 0) rc = place_thread(worker.tid.load(std::memory_order_acquire), selected.cpu, deadline);
+            if (rc != 0) worker.cancel.store(true, std::memory_order_release);
+            worker.placed.store(true, std::memory_order_release);
+            if (!wait_flag(worker.done, deadline)) {
+                rc = -ETIMEDOUT;
+                worker.cancel.store(true, std::memory_order_release);
+            }
+            int const ERROR = pthread_join(thread, nullptr);
+            if (ERROR == 0)
+                ++joined;
+            else {
+                rc = -ERROR;
+                // Keep the shared argument alive through its final access.
+                while (!worker.done.load(std::memory_order_acquire)) (void)ker::multiproc::yield();
+            }
+            if (worker.report.error != 0 && rc == 0) rc = worker.report.error;
+            if (!policy_matches(io, mode, MASK)) rc = -EPROTO;
+            policy_print(worker.report);
+        }
+        rlimit unused;
+        initialize_transport(unused);
+        PolicyReport child;
+        initialize_transport(child);
+        uint64_t child_deadline{};
+        if (rc == 0 && (!deadline_after(opts.child_timeout_ms, child_deadline) || !before(deadline))) rc = -ETIMEDOUT;
+        if (child_deadline > deadline) child_deadline = deadline;
+        int child_fds[2]{-1, -1};
+        if (rc == 0 && !policy_pipe(child_fds, own)) rc = -EIO;
+        if (rc == 0) {
+            if (!policy_fork(opts, topo, selected, mode, MASK, false, unused, child_deadline, child, own, child_fds))
+                rc = -EPROTO;
+            else
+                ++children;
+            policy_print(child);
+            if (!policy_matches(io, mode, MASK)) rc = -EPROTO;
+        }
+        // All actor/report storage above is prepared before lowering AS. Only
+        // existing process-limit observations and a single lazy page are used.
+        PolicyQuota quota;
+        initialize_transport(quota);
+        rlimit saved;
+        initialize_transport(saved);
+        rlimit restored;
+        initialize_transport(restored);
+        ker::abi::resource::Usage before_usage, after_usage;
+        initialize_transport(before_usage);
+        initialize_transport(after_usage);
+        PolicyReport inherited;
+        initialize_transport(inherited);
+        int quota_fds[2]{-1, -1};
+        if (rc == 0 && !policy_pipe(quota_fds, own)) rc = -EIO;
+        bool limited = false;
+        void* reservation = nullptr;
+        if (rc == 0) {
+            int const RET = getrlimit(RLIMIT_AS, &saved);
+            int const ERROR = RET < 0 ? errno : 0;
+            if (RET != 0)
+                rc = -ERROR;
+            else
+                rc = policy_usage(before_usage);
+            quota.before = before_usage.current;
+            quota.denied_before = before_usage.denied;
+        }
+        rlimit finite = saved;
+        if (rc == 0) {
+            if (before_usage.current > UINT64_MAX - PAGE || before_usage.current + PAGE > saved.rlim_max ||
+                before_usage.current + PAGE > saved.rlim_cur)
+                rc = -ENOTSUP;
+            else {
+                finite.rlim_cur = before_usage.current + PAGE;
+                int const RET = setrlimit(RLIMIT_AS, &finite);
+                int const ERROR = RET < 0 ? errno : 0;
+                if (RET != 0)
+                    rc = -ERROR;
+                else
+                    limited = true;
+            }
+        }
+        if (rc == 0) {
+            if (!deadline_after(opts.child_timeout_ms, child_deadline)) rc = -EIO;
+            if (child_deadline > deadline) child_deadline = deadline;
+            if (rc == 0) {
+                quota.child_consumed =
+                    policy_fork(opts, topo, selected, mode, MASK, true, finite, child_deadline, inherited, own, quota_fds);
+                if (!quota.child_consumed)
+                    rc = -EPROTO;
+                else
+                    ++children;
+                quota.inherited_soft = inherited.limit_soft;
+                quota.inherited_hard = inherited.limit_hard;
+            }
+        }
+        if (rc == 0) {
+            reservation = mmap(nullptr, PAGE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+            int const ERROR = reservation == MAP_FAILED ? errno : 0;
+            quota.first_rc = reservation == MAP_FAILED ? -1 : 0;
+            quota.first_errno = ERROR;
+            if (reservation == MAP_FAILED) {
+                reservation = nullptr;
+                rc = -ERROR;
+            } else if (policy_usage(after_usage) != 0 || after_usage.current != before_usage.current + PAGE)
+                rc = -EPROTO;
+            quota.accepted = after_usage.current;
+        }
+        if (rc == 0) {
+            void* excess = mmap(nullptr, PAGE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+            int const ERROR = excess == MAP_FAILED ? errno : 0;
+            quota.second_rc = excess == MAP_FAILED ? -1 : 0;
+            quota.second_errno = ERROR;
+            if (excess != MAP_FAILED) {
+                if (munmap(excess, PAGE) != 0) own.complete = false;
+                rc = -EPROTO;
+            } else if (ERROR != ENOMEM || policy_usage(after_usage) != 0 || after_usage.current != quota.accepted ||
+                       after_usage.denied <= quota.denied_before)
+                rc = -EPROTO;
+            quota.denied_after = after_usage.denied;
+        }
+        if (quota_fds[0] >= 0 && !close_fd(quota_fds[0], own)) rc = -EIO;
+        if (quota_fds[1] >= 0 && !close_fd(quota_fds[1], own)) rc = -EIO;
+        if (reservation != nullptr) {
+            int const RET = munmap(reservation, PAGE);
+            int const ERROR = RET < 0 ? errno : 0;
+            quota.reservation_removed = RET == 0;
+            if (RET != 0 && rc == 0) rc = -ERROR;
+        }
+        if (limited) {
+            int const RET = setrlimit(RLIMIT_AS, &saved);
+            int const ERROR = RET < 0 ? errno : 0;
+            quota.restore_rc = RET;
+            if (RET != 0 && rc == 0) rc = -ERROR;
+        }
+        if (limited) {
+            int const RET = getrlimit(RLIMIT_AS, &restored);
+            int const ERROR = RET < 0 ? errno : 0;
+            quota.final_soft = restored.rlim_cur;
+            quota.final_hard = restored.rlim_max;
+            if (RET != 0 && rc == 0)
+                rc = -ERROR;
+            else if (restored.rlim_cur != saved.rlim_cur || restored.rlim_max != saved.rlim_max)
+                rc = -EPROTO;
+            if (policy_usage(after_usage) != 0 || after_usage.current != quota.before) rc = -EPROTO;
+        }
+        quota.final = after_usage.current;
+        if (rc == 0 && !before(deadline)) rc = -ETIMEDOUT;
+        std::printf(
+            "NUMA_POLICY "
+            "{\"type\":\"quota\",\"nonce\":%llu,\"mode\":%u,\"before\":%llu,\"accepted\":%llu,\"final\":%llu,\"denied_before\":%llu,"
+            "\"denied_after\":%llu,\"first_rc\":%lld,\"first_errno\":%d,\"second_rc\":%lld,\"second_errno\":%d,\"restored\":%lld,"
+            "\"removed\":%u,\"child_consumed\":%u,\"inherited_soft\":%llu,\"inherited_hard\":%llu,\"saved_soft\":%llu,\"saved_hard\":%llu,"
+            "\"final_soft\":%llu,\"final_hard\":%llu,\"error\":%lld}\n",
+            static_cast<unsigned long long>(opts.nonce), mode, static_cast<unsigned long long>(quota.before),
+            static_cast<unsigned long long>(quota.accepted), static_cast<unsigned long long>(quota.final),
+            static_cast<unsigned long long>(quota.denied_before), static_cast<unsigned long long>(quota.denied_after),
+            static_cast<long long>(quota.first_rc), quota.first_errno, static_cast<long long>(quota.second_rc), quota.second_errno,
+            static_cast<long long>(quota.restore_rc), static_cast<unsigned>(quota.reservation_removed),
+            static_cast<unsigned>(quota.child_consumed), static_cast<unsigned long long>(quota.inherited_soft),
+            static_cast<unsigned long long>(quota.inherited_hard), static_cast<unsigned long long>(saved.rlim_cur),
+            static_cast<unsigned long long>(saved.rlim_max), static_cast<unsigned long long>(quota.final_soft),
+            static_cast<unsigned long long>(quota.final_hard), static_cast<long long>(rc));
+        if (rc == 0 && !cpu_still(selected.cpu)) rc = -EPROTO;
+        if (rc == 0) ++completed;
+    }
+    int64_t const POLICY_RESTORE = policy_set(original.mode, original.nodes);
+    int64_t const AFFINITY_RESTORE = ker::multiproc::setThreadAffinityMask(TID, ORIGINAL_AFFINITY);
+    bool const RESTORED = POLICY_RESTORE == 0 && policy_matches(io, original.mode, original.nodes) && AFFINITY_RESTORE == 0 &&
+                          static_cast<uint64_t>(ker::multiproc::getThreadAffinityMask(TID)) == ORIGINAL_AFFINITY;
+    bool const CLEAN = own.fds == 0 && own.complete && joined == 4 && children == 8;
+    bool const PASS = rc == 0 && completed == 4 && CLEAN && RESTORED && before(deadline);
+    std::printf(
+        "NUMA_POLICY "
+        "{\"type\":\"end\",\"nonce\":%llu,\"pass\":%u,\"modes\":%u,\"threads_joined\":%u,\"children_consumed\":%u,\"fds\":%u,\"own_"
+        "complete\":%u,\"policy_restore\":%lld,\"affinity_restore\":%lld,\"error\":%lld,\"pressure\":0,\"huge\":0}\n",
+        static_cast<unsigned long long>(opts.nonce), static_cast<unsigned>(PASS), completed, joined, children, own.fds,
+        static_cast<unsigned>(own.complete), static_cast<long long>(POLICY_RESTORE), static_cast<long long>(AFFINITY_RESTORE),
+        static_cast<long long>(rc));
+    return PASS ? 0 : 1;
 }

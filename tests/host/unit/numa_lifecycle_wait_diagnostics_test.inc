@@ -41,6 +41,7 @@ size_t wait_index{};
 std::vector<std::string> calls;
 uint64_t now{}, step{}, deadline{100};
 int clock_result{}, clock_error{}, close_error{}, unmap_error{}, query_error{};
+int kill_result{}, kill_error{};
 int64_t clock_sec_override{-2}, clock_nsec_override{-2};
 bool fd_still_open{}, mapping_still_present{};
 std::string line;
@@ -51,6 +52,7 @@ struct Capture {
     bool query_valid{};
     int64_t query{};
     OwnResources own{};
+    CleanupObservation cleanup{};
 } captured;
 void reset() {
     ++cases;
@@ -63,6 +65,7 @@ void reset() {
     step = 0;
     deadline = 100;
     clock_result = clock_error = close_error = unmap_error = query_error = 0;
+    kill_result = kill_error = 0;
     clock_sec_override = clock_nsec_override = -2;
     fd_still_open = mapping_still_present = false;
     errno = 0;
@@ -94,7 +97,8 @@ auto posix_waitpid(pid_t, int*, int) -> pid_t;
 auto kill(pid_t pid, int signal) -> int {
     calls.emplace_back("kill");
     check(pid == 41 && signal == SIGKILL, "original cleanup kill");
-    return 0;
+    if (kill_result < 0) errno = kill_error;
+    return kill_result;
 }
 auto close(int fd) -> int {
     calls.emplace_back("close");
@@ -142,9 +146,11 @@ auto fprintf(FILE* stream, const char* format, ...) -> int {
     return size;
 }
 void capture(int status, const WaitObservation& wait, bool wait_owned, bool read_closed, bool reap_needed, bool reaped, bool owned,
-             bool unmapped, bool fds_absent, bool query_valid, int64_t query, bool mapping_absent, const OwnResources& own) {
+             bool unmapped, bool fds_absent, bool query_valid, int64_t query, bool mapping_absent, const OwnResources& own,
+             const CleanupObservation& cleanup) {
     captured = {status,   wait,       wait_owned,     read_closed, reap_needed, reaped, owned,
                 unmapped, fds_absent, mapping_absent, query_valid, query,       own};
+    captured.cleanup = cleanup;
 }
 }  // namespace fixture
 namespace ker::multiproc {
@@ -169,6 +175,7 @@ auto run_cleanup(bool ok = true, bool owned = true) -> bool {
     int64_t source_query_error = 0;
     ChildRecord record{};
     record.phase = 7;
+    record.elapsed_ns = 12345;
     int fds[2]{7, -1}, opened_fds[2]{7, 8};
     OwnResources own{};
     own.fds = 1;
@@ -192,6 +199,95 @@ void expect_failure(WaitOutcome outcome, bool status_valid, int error = 0) {
     check(line.find("NUMA_LIFECYCLE_FAIL cycle=1 pid=41 phase=wait0 ") == 0, "original failure prefix retained");
     check(line.find("wait_outcome=") != std::string::npos && line.find("clock_valid=") != std::string::npos,
           "bounded tuple printed only on failure");
+}
+void cleanup_observation_cases() {
+    using namespace fixture;
+    for (int status : {0, 256, SIGKILL}) {
+        reset();
+        waits = {{41, status, 0}};
+        check(!run_cleanup(false), "earlier refusal retains failure and runs original cleanup");
+        check(captured.cleanup.kill_result_valid && captured.cleanup.kill_result == 0 && !captured.cleanup.kill_error_valid &&
+                  captured.cleanup.kill_error == 0,
+              "successful exact kill tuple");
+        check(captured.cleanup.wait_result_valid && captured.cleanup.wait_result == 41 && captured.cleanup.waits == 1 &&
+                  captured.cleanup.interrupted_waits == 0 && !captured.cleanup.wait_error_valid && captured.cleanup.wait_error == 0,
+              "consumed exact child wait tuple");
+        check(captured.cleanup.status_valid && captured.cleanup.status == status && !captured.owned && captured.reaped,
+              "consumed normal or signal raw status remains exact");
+        check((calls == std::vector<std::string>{"close", "kill", "wait-blocking", "unmap", "confirm-fd", "confirm-fd", "query-map"}),
+              "failure cleanup exact original call order with no added clock");
+        check(line.find("child_elapsed_raw_ns=12345") != std::string::npos && line.find("cleanup_status_valid=1") != std::string::npos,
+              "raw elapsed and cleanup tuple belong only to existing failure line");
+    }
+    reset();
+    kill_result = -1;
+    kill_error = ESRCH;
+    waits = {{41, 0, 0}};
+    check(!run_cleanup(false), "kill failure still consumes original child");
+    check(captured.cleanup.kill_result == -1 && captured.cleanup.kill_error_valid && captured.cleanup.kill_error == ESRCH,
+          "kill immediate errno survives later EBADF cleanup");
+    check(captured.reaped && !captured.owned && errno == EBADF, "signaling refusal preserves successful reap behavior");
+    reset();
+    waits = {{-1, 0, EINTR}, {41, 9, 0}};
+    check(!run_cleanup(false), "original cleanup EINTR retry retains failure predicate");
+    check(captured.cleanup.waits == 2 && captured.cleanup.interrupted_waits == 1 && captured.cleanup.status_valid &&
+              captured.cleanup.status == 9 && !captured.cleanup.wait_error_valid && captured.cleanup.wait_error == 0,
+          "retry counter plus final consumed tuple clears obsolete errno validity");
+    check(std::count(calls.begin(), calls.end(), "wait-blocking") == 2 && std::count(calls.begin(), calls.end(), "kill") == 1,
+          "no extra cleanup syscall or retry");
+    for (int error : {ECHILD, EFAULT}) {
+        reset();
+        waits = {{-1, 999, error}};
+        check(!run_cleanup(false), "wait error preserves cleanup refusal");
+        check(captured.cleanup.wait_result == -1 && captured.cleanup.wait_error_valid && captured.cleanup.wait_error == error &&
+                  !captured.cleanup.status_valid && captured.cleanup.status == 0 && captured.owned && !captured.reaped,
+              "immediate cleanup error does not read invalid status");
+    }
+    reset();
+    waits = {{0, 999, 0}};
+    check(!run_cleanup(false), "unexpected nonreaping blocking return still refuses without retry");
+    check(captured.cleanup.wait_result_valid && captured.cleanup.wait_result == 0 && !captured.cleanup.status_valid &&
+              captured.cleanup.status == 0 && captured.cleanup.waits == 1 && captured.owned,
+          "zero-result frontend output is never a consumed status");
+    reset();
+    check(!run_cleanup(false, false), "earlier refusal with no owned child still prints failure");
+    check(!captured.cleanup.kill_result_valid && !captured.cleanup.wait_result_valid && !captured.cleanup.status_valid &&
+              captured.cleanup.waits == 0 && captured.cleanup.interrupted_waits == 0,
+          "no-owned branch invents no call or observation");
+    check(std::count(calls.begin(), calls.end(), "kill") + std::count(calls.begin(), calls.end(), "wait-blocking") == 0,
+          "no-owned branch preserves exact no-call behavior");
+#if HAVE_WAIT_PREDECESSOR
+    for (int which = 0; which < 7; ++which) {
+        auto script = which == 0   ? std::vector<Wait>{{41, 0, 0}}
+                      : which == 1 ? std::vector<Wait>{{41, SIGKILL, 0}}
+                      : which == 2 ? std::vector<Wait>{{-1, 0, EINTR}, {41, 256, 0}}
+                      : which == 3 ? std::vector<Wait>{{-1, 999, ECHILD}}
+                      : which == 4 ? std::vector<Wait>{{0, 999, 0}}
+                                   : std::vector<Wait>{{41, 0, 0}};
+        reset();
+        waits = script;
+        if (which == 5) {
+            kill_result = -1;
+            kill_error = ESRCH;
+        }
+        bool old_owned = which != 6;
+        bool const old_result = predecessor::terminate_and_reap(41, old_owned);
+        auto const old_calls = calls;
+        int const old_errno = errno;
+        auto const old_consumed = wait_index;
+        reset();
+        waits = script;
+        if (which == 5) {
+            kill_result = -1;
+            kill_error = ESRCH;
+        }
+        bool owned = which != 6;
+        CleanupObservation observation{};
+        bool const result = terminate_and_reap(41, owned, &observation);
+        check(result == old_result && owned == old_owned && errno == old_errno && calls == old_calls && wait_index == old_consumed,
+              "actual complete predecessor cleanup decisions/ownership/errno/call order remain exact");
+    }
+#endif
 }
 auto main() -> int {
     using namespace fixture;
@@ -324,6 +420,7 @@ auto main() -> int {
               "actual whole predecessor wait behavior/calls unchanged");
     }
 #endif
+    cleanup_observation_cases();
     std::printf("%s actual workload wait diagnostics cases=%u assertions=%u failures=%u\n", failures ? "FAIL" : "PASS", cases, assertions,
                 failures);
     return failures ? 1 : 0;
