@@ -241,13 +241,14 @@ def validate_cluster_config(config: dict) -> None:
                 vhost=bool(effective.get("vhost", False)),
                 where=f"zone {zone_name(zone)} qemu_netdev",
             )
-            endpoint = (normalized_backend["address"], normalized_backend["port"])
-            prior = socket_endpoints.get(endpoint)
-            if prior is not None:
-                raise ValueError(
-                    f"zone {zone_name(zone)} socket-mcast endpoint collides with zone {prior}"
-                )
-            socket_endpoints[endpoint] = zone_name(zone)
+            if normalized_backend["type"] == "socket-mcast":
+                endpoint = (normalized_backend["address"], normalized_backend["port"])
+                prior = socket_endpoints.get(endpoint)
+                if prior is not None:
+                    raise ValueError(
+                        f"zone {zone_name(zone)} socket-mcast endpoint collides with zone {prior}"
+                    )
+                socket_endpoints[endpoint] = zone_name(zone)
         overrides = zone.get("nodes_config", [])
         if not isinstance(overrides, list) or any(
             not isinstance(item, dict) for item in overrides
@@ -276,6 +277,11 @@ def validate_cluster_config(config: dict) -> None:
 def zone_uses_socket_netdev(global_cfg: dict, zone_cfg: dict) -> bool:
     backend = resolve_config(global_cfg, zone_cfg).get("qemu_netdev")
     return isinstance(backend, dict) and backend.get("type") == "socket-mcast"
+
+
+def zone_uses_rootless_netdev(global_cfg: dict, zone_cfg: dict) -> bool:
+    backend = resolve_config(global_cfg, zone_cfg).get("qemu_netdev")
+    return isinstance(backend, dict) and backend.get("type") in ("socket-mcast", "user")
 
 
 # ---------------------------------------------------------------------------
@@ -897,7 +903,7 @@ def setup(config: dict):
     tap_zones = [
         zone_cfg
         for zone_cfg in zones
-        if not zone_uses_socket_netdev(global_cfg, zone_cfg)
+        if not zone_uses_rootless_netdev(global_cfg, zone_cfg)
     ]
     uses_multiqueue_tap = any(
         resolve_config(global_cfg, zone_cfg).get("nic_queues", 1) > 1
@@ -935,12 +941,15 @@ def setup(config: dict):
 
         print(f"--- Zone: {zname} ({len(node_ids)} nodes: {node_ids}) ---")
 
-        if zone_uses_socket_netdev(global_cfg, zone_cfg):
+        if zone_uses_rootless_netdev(global_cfg, zone_cfg):
             backend = effective["qemu_netdev"]
-            print(
-                "  Rootless QEMU socket multicast: "
-                f"{backend['address']}:{backend['port']} (no bridge/TAP setup)"
-            )
+            if zone_uses_socket_netdev(global_cfg, zone_cfg):
+                print(
+                    "  Rootless QEMU socket multicast: "
+                    f"{backend['address']}:{backend['port']} (no bridge/TAP setup)"
+                )
+            else:
+                print("  Rootless QEMU user networking (no bridge/TAP setup)")
             setup_ivshmem_backings(zone_cfg, node_ids, effective)
             print()
             continue
@@ -1079,8 +1088,11 @@ def teardown(config: dict):
 
         print(f"--- Zone: {zname} ---")
 
-        if zone_uses_socket_netdev(global_cfg, zone_cfg):
-            print("  No host bridge/TAP topology for QEMU socket multicast")
+        if zone_uses_rootless_netdev(global_cfg, zone_cfg):
+            if zone_uses_socket_netdev(global_cfg, zone_cfg):
+                print("  No host bridge/TAP topology for QEMU socket multicast")
+            else:
+                print("  No host bridge/TAP topology for QEMU user networking")
             print()
             continue
 
@@ -1437,7 +1449,7 @@ def validate_no_setup_topology(config: dict) -> None:
                 )
             if not os.access(backing, os.R_OK | os.W_OK):
                 failures.append(f"ivshmem backing file {backing} for zone {zname} is not readable and writable")
-        if zone_uses_socket_netdev(global_cfg, zone_cfg):
+        if zone_uses_rootless_netdev(global_cfg, zone_cfg):
             continue
         bridge = bridge_name(zone_cfg)
         bridge_link = link_json(bridge)

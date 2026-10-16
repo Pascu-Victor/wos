@@ -1316,6 +1316,198 @@ def test_socket_multicast_backend_validation_qemu_and_no_setup(module) -> None:
         raise AssertionError("duplicate socket multicast endpoints were accepted")
 
 
+def test_user_backend_validation_and_socket_collisions(module) -> None:
+    node = module.node_setup
+    backend = {"type": "user"}
+    assert_equal(
+        node.normalize_qemu_netdev(backend, queues=1, vhost=False, where="LAN"),
+        backend,
+        "exact singleton user backend",
+    )
+    invalid = [({}, 1, False), ({"type": "unknown"}, 1, False)]
+    for key, value in (("address", "239.192.40.249"), ("port", 61949),
+                       ("localaddr", "127.0.0.1"), ("hostfwd", "tcp::1-:1"),
+                       ("extra", True)):
+        invalid.append((dict(backend, **{key: value}), 1, False))
+    invalid.extend((backend, queues, vhost) for queues, vhost in
+                   ((0, False), (2, False), (True, False), (1, True)))
+    for raw, queues, vhost in invalid:
+        try:
+            node.normalize_qemu_netdev(raw, queues=queues, vhost=vhost, where="LAN")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid user backend accepted: {raw!r}/{queues!r}/{vhost!r}")
+
+    config = {"zones": [
+        {"id": "GLOBAL", "nic_queues": 1},
+        {"id": 0, "name": "user-a", "nodes": 1, "qemu_netdev": dict(backend)},
+        {"id": 1, "name": "user-b", "nodes": 1, "qemu_netdev": dict(backend)},
+        {"id": 2, "name": "socket-a", "nodes": 1, "qemu_netdev": {
+            "type": "socket-mcast", "address": "239.192.40.249", "port": 61950}},
+        {"id": 3, "name": "socket-b", "nodes": 1, "qemu_netdev": {
+            "type": "socket-mcast", "address": "239.192.40.249", "port": 61951}},
+    ]}
+    module.validate_cluster_config(config)
+    global_cfg = config["zones"][0]
+    for zone, socket, rootless in ((config["zones"][1], False, True),
+                                   (config["zones"][3], True, True),
+                                   ({"id": 4}, False, False)):
+        assert_equal(module.zone_uses_socket_netdev(global_cfg, zone), socket,
+                     "socket classification keeps its original meaning")
+        assert_equal(module.zone_uses_rootless_netdev(global_cfg, zone), rootless,
+                     "rootless classification covers only supported backends")
+    config["zones"][4]["qemu_netdev"]["port"] = 61950
+    try:
+        module.validate_cluster_config(config)
+    except ValueError as exc:
+        if "collides with zone" not in str(exc):
+            raise AssertionError(f"socket collision check changed: {exc}") from exc
+    else:
+        raise AssertionError("user zones disabled socket collision rejection")
+
+
+def test_user_backend_exact_argv_and_node_roundtrip(module) -> None:
+    node = module.node_setup
+    spec = {"id": 0, "nics": [
+        {"zone_id": 0, "name": "lan", "model": "virtio-net-pci",
+         "mac": "52:54:00:40:00:00", "driver": "dhcp", "queues": 1,
+         "vhost": False, "tap": "unused-lan", "qemu_netdev": {"type": "user"}},
+        {"zone_id": 1, "name": "wki", "model": "virtio-net-pci",
+         "mac": "52:54:00:40:01:00", "driver": "wki", "queues": 1,
+         "vhost": False, "qemu_netdev": {"type": "socket-mcast",
+         "address": "239.192.40.249", "port": 61950, "localaddr": "127.0.0.1"}},
+    ]}
+    old_prepare, old_cleanup = node.prepare_node_overlays, node.cleanup_node_logs
+    node.prepare_node_overlays = lambda _spec, log=print: (Path("disk0-overlay"), Path("disk1-overlay"))
+    node.cleanup_node_logs = lambda _spec: None
+    try:
+        args = node.build_qemu_args(spec, log=lambda _line: None)
+        tap_spec = json.loads(json.dumps(spec))
+        del tap_spec["nics"][0]["qemu_netdev"]
+        tap_args = node.build_qemu_args(tap_spec, log=lambda _line: None)
+    finally:
+        node.prepare_node_overlays, node.cleanup_node_logs = old_prepare, old_cleanup
+    netdevs = [args[i + 1] for i, token in enumerate(args) if token == "-netdev"]
+    assert_equal(netdevs, ["user,id=net0", "socket,id=net1,mcast=239.192.40.249:61950,localaddr=127.0.0.1"],
+                 "exact user LAN and unchanged WKI socket backend")
+    expected = list(tap_args)
+    expected[expected.index("tap,id=net0,ifname=unused-lan,script=no,downscript=no,vnet_hdr=off")] = "user,id=net0"
+    assert_equal(args, expected, "only LAN backend argument changes; devices/fw_cfg/remaining argv stay exact")
+    assert_equal(node.netdevs_content(spec).splitlines()[-2:], ["eth0 dhcp", "eth1 wki"],
+                 "user networking preserves injected driver policy")
+    config = node.cluster_config_from_node_spec(spec)
+    module.validate_cluster_config(config)
+    nodes = module.collect_unique_nodes(config)
+    converted = module.cluster_node_spec(0, nodes[0], config)
+    assert_equal([nic["qemu_netdev"] for nic in converted["nics"]],
+                 [nic["qemu_netdev"] for nic in spec["nics"]], "mixed rootless node/cluster roundtrip")
+    config["zones"][1]["qemu_netdev"]["type"] = "not-user"
+    assert_equal(spec["nics"][0]["qemu_netdev"], {"type": "user"}, "roundtrip owns its user backend copy")
+
+
+def test_user_backend_mixed_topology_lifecycle_without_host_operations(module) -> None:
+    config = {"zones": [
+        {"id": "GLOBAL", "nic_queues": 1, "vm": {"overlay_dir": "unused-test-overlays"}},
+        {"id": 0, "name": "user", "nodes": 2, "qemu_netdev": {"type": "user"}},
+        {"id": 1, "name": "socket", "nodes": 2, "qemu_netdev": {
+            "type": "socket-mcast", "address": "239.192.40.249", "port": 61950}},
+        {"id": 2, "name": "tap", "nodes": 2, "nic_queues": 2},
+    ]}
+    commands, probed, backing_zones, key_nodes, vhost = [], [], [], [], []
+    links = {"wos-tap-br": up_link(), "wos-tap-N0": up_link("wos-tap-br"),
+             "wos-tap-N1": up_link("wos-tap-br")}
+
+    def host_link(name):
+        probed.append(name)
+        if name not in links:
+            raise AssertionError(f"rootless zone probed host topology: {name}")
+        return links[name]
+
+    replacements = {
+        "run": lambda cmd, **kwargs: commands.append(cmd) or True,
+        "link_json": host_link,
+        "link_exists": lambda name: bool(host_link(name)),
+        "tap_owner_uid": lambda _name: None,
+        "tap_has_multiqueue": lambda name: bool(host_link(name)),
+        "ensure_vhost_net_available": lambda: vhost.append(True),
+        "reattach_libvirt_vms": lambda name: host_link(name),
+        "configure_bridge_ip": lambda name, _addr: host_link(name),
+        "configure_bridge_dns": lambda name, _dns: host_link(name),
+        "revert_bridge_dns": lambda name: host_link(name),
+        "ensure_ssh_host_keys": lambda nodes: key_nodes.append(nodes),
+        "setup_ivshmem_backings": lambda zone, _nodes, _effective: backing_zones.append(zone["name"]),
+    }
+    original = {name: getattr(module, name) for name in replacements}
+    old_isdir = module.os.path.isdir
+    for name, value in replacements.items():
+        setattr(module, name, value)
+    module.os.path.isdir = lambda _path: False
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            module.setup(config)
+        assert_equal(backing_zones, ["user", "socket", "tap"], "ivshmem setup retained for every backend")
+        assert_equal(key_nodes, [[0, 1]], "rootless setup retains SSH provisioning")
+        assert_equal(vhost, [True], "only mixed multiqueue TAP requests vhost preparation")
+        assert_equal(any("wos-user" in cmd or "wos-socket" in cmd for cmd in commands), False,
+                     "rootless setup issues no host link commands")
+        probed.clear()
+        module.validate_no_setup_topology(config)
+        assert_equal(set(probed), set(links), "no-setup validates only existing TAP links")
+        commands.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            module.teardown(config)
+        assert_equal(any("wos-user" in cmd or "wos-socket" in cmd for cmd in commands), False,
+                     "rootless teardown issues no host link commands")
+        if not any("ip link delete wos-tap-br" in cmd for cmd in commands):
+            raise AssertionError("mixed rootless configuration skipped real TAP teardown path")
+        rootless_only = {"zones": config["zones"][:3]}
+        commands.clear()
+        probed.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            module.setup(rootless_only)
+            module.validate_no_setup_topology(rootless_only)
+            module.teardown(rootless_only)
+        assert_equal((commands, probed), ([], []), "all-rootless lifecycle needs no host commands/probes")
+    finally:
+        module.os.path.isdir = old_isdir
+        for name, value in original.items():
+            setattr(module, name, value)
+
+
+def test_user_backend_no_setup_still_validates_ivshmem(module) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        config = {"zones": [
+            {"id": "GLOBAL", "nic_queues": 1},
+            {"id": 0, "name": "user", "nodes": 2, "qemu_netdev": {"type": "user"},
+             "ivshmem": {"enabled": True, "size": "1M", "root_path": temporary, "topology": "full-mesh"}},
+        ]}
+        old_link = module.link_json
+        module.link_json = lambda _name: (_ for _ in ()).throw(AssertionError("user backend probed a host link"))
+        try:
+            try:
+                module.validate_no_setup_topology(config)
+            except module.NoSetupTopologyError as exc:
+                if "missing ivshmem backing file" not in str(exc):
+                    raise AssertionError(f"wrong ivshmem diagnostic: {exc}") from exc
+            else:
+                raise AssertionError("user backend skipped missing ivshmem validation")
+            backing = Path(module.ivshmem_file(temporary, config["zones"][1], 0, 1))
+            with backing.open("wb") as output:
+                output.truncate(1 << 20)
+            module.validate_no_setup_topology(config)
+            backing.write_bytes(b"short")
+            try:
+                module.validate_no_setup_topology(config)
+            except module.NoSetupTopologyError as exc:
+                if "expected 1048576" not in str(exc):
+                    raise AssertionError(f"wrong ivshmem size diagnostic: {exc}") from exc
+            else:
+                raise AssertionError("user backend skipped truncated ivshmem validation")
+        finally:
+            module.link_json = old_link
+
+
 def test_launch_one_vm_wraps_overlay_creation_failure_without_popen(module) -> None:
     old_build_qemu_args = module.build_qemu_args
     old_popen = module.subprocess.Popen
@@ -1961,6 +2153,10 @@ def main() -> None:
         test_rootless_wki_auth_config_has_no_host_link_dependency,
         test_rootless_wki_auth_mixed_config_validates_shared_memory,
         test_socket_multicast_backend_validation_qemu_and_no_setup,
+        test_user_backend_validation_and_socket_collisions,
+        test_user_backend_exact_argv_and_node_roundtrip,
+        test_user_backend_mixed_topology_lifecycle_without_host_operations,
+        test_user_backend_no_setup_still_validates_ivshmem,
         test_ktest_node_conversion_preserves_rootless_backend,
         test_rootless_ktest_config_has_no_host_link_dependency,
         test_launch_one_vm_wraps_overlay_creation_failure_without_popen,

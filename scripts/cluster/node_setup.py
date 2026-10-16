@@ -65,6 +65,14 @@ def merge_section(base: dict, override: dict) -> dict:
 def normalize_qemu_netdev(raw: dict, *, queues: int, vhost: bool, where: str) -> dict:
     if not isinstance(raw, dict):
         raise ValueError(f"{where} must be an object")
+    if raw.get("type") == "user":
+        if set(raw) != {"type"}:
+            raise ValueError(f"{where} user backend requires exactly type")
+        if isinstance(queues, bool) or int(queues) != 1:
+            raise ValueError(f"{where} requires queues=1")
+        if vhost:
+            raise ValueError(f"{where} requires vhost=false")
+        return {"type": "user"}
     required_fields = {"type", "address", "port"}
     allowed_fields = required_fields | {"localaddr"}
     if not required_fields.issubset(raw) or not set(raw).issubset(allowed_fields):
@@ -503,7 +511,9 @@ def build_qemu_args(
         num_queues = int(nic.get("queues", nic.get("nic_queues", 1)))
         use_vhost = bool(nic.get("vhost", False))
         backend = nic.get("qemu_netdev")
-        if backend is not None:
+        if backend is not None and backend["type"] == "user":
+            netdev_options = [f"user,id=net{nic_idx}"]
+        elif backend is not None:
             netdev_options = [
                 f"socket,id=net{nic_idx}",
                 f"mcast={backend['address']}:{backend['port']}",
