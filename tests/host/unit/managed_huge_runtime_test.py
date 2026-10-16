@@ -21,7 +21,7 @@ import subprocess
 import tempfile
 import time
 
-EXPECTED_TESTS = 44
+EXPECTED_TESTS = 54
 OVERALL_SECONDS = 120
 COMMAND_SECONDS = 35
 SCRATCH_BYTES = 128 * 1024 * 1024
@@ -144,6 +144,7 @@ void kern_yield();
 #include <cstdint>
 #include <platform/mm/paging.hpp>
 namespace ker::mod::sched::task {
+struct LazyVmemRange;
 enum class TaskType { PROCESS, THREAD, DAEMON };
 enum class TaskState { ACTIVE, EXITED };
 // Explicit layout seam: only fields read by actual extracted methods/guards.
@@ -235,6 +236,7 @@ def main() -> int:
     parser.add_argument(
         "--kernel-overlay", type=Path, help="optional explicit staged modules/kern/src include/source overlay"
     )
+    parser.add_argument("--fork-contract-only", action="store_true", help="run all old positive cases plus the focused fork cases and two fork controls")
     parser.add_argument("--gtest-main", type=Path)
     parser.add_argument("--gtest", type=Path)
     parser.add_argument("--output", type=Path, help="fresh directory for small logs/results; scratch is always removed")
@@ -364,10 +366,18 @@ def main() -> int:
         index = next(line for line in source.splitlines() if line.startswith("auto index_of("))
         user_pin = definition(header.read_text(), "struct UserPagePin {")
         exclusive = definition(source, "class UserPagemapExclusiveScope {")
+        copier = "\n".join(definition(source, anchor) for anchor in (
+            "auto valid_fork_placement(", "auto deep_copy_user_pagemap_cow_held(",
+            "auto fork_eager_copy_requested()", "auto unpublished_user_root_empty("))
+        declaration_start = header.read_text().index("[[nodiscard]] auto deep_copy_current_user_pagemap_prepared(")
+        declaration_end = header.read_text().index(";", declaration_start) + 1
+        copier += "\n" + header.read_text()[declaration_start:declaration_end]
+
         epoch = definition(source, "[[gnu::always_inline]] void advance_ps_geometry_epoch_locked(")
         adapters = "\n".join(
             definition(source, anchor)
             for anchor in (
+                "auto copy_current_user_pagemap_exclusive(sched::task::Task&",
                 "auto acquire_current_range_root(sched::task::Task&",
                 "void release_current_range_root(CurrentRangeRootAccess&",
                 "auto survey_range_chunk(paging::PageTable*",
@@ -375,6 +385,9 @@ def main() -> int:
             )
         )
         range_cases = support / "managed_huge_range_cases.inc"
+        fork_support = support / "managed_huge_fork_support.inc"
+        fork_cases = support / "managed_huge_fork_cases.inc"
+        selected.extend([pin(fork_support), pin(fork_cases)])
         selected.append(pin(range_cases))
         composite = scratch / "actual-source.cpp"
         composite.write_text(
@@ -383,6 +396,7 @@ def main() -> int:
                     fixture.read_text(),
                     prelude.read_text(),
                     context_methods,
+                    fork_support.read_text(),
                     "namespace ker::mod::mm::virt {",
                     user_pin,
                     exclusive,
@@ -390,6 +404,7 @@ def main() -> int:
                     index,
                     resolver,
                     private,
+                    copier,
                     commit,
                     "} namespace ker::mod::mm::huge::detail {",
                     adapters,
@@ -397,6 +412,7 @@ def main() -> int:
                     "namespace ker::mod::mm::virt {",
                     cases.read_text(),
                     range_cases.read_text(),
+                    fork_cases.read_text(),
                 ]
             )
         )
@@ -407,6 +423,7 @@ def main() -> int:
             "index": index,
             "user_pin": user_pin,
             "exclusive": exclusive,
+            "copier": copier,
             "epoch": epoch,
             "adapters": adapters,
             **context_map,
@@ -465,148 +482,162 @@ def main() -> int:
             path.unlink()
 
         actual = CppText(composite.read_text())
-        needle = (
-            "if (level != 2 ||\n                managed_huge_registry.lookup_mapped(key, "
-            "address & ~(huge::LEAF_BYTES - 1), raw, result.managed) != huge::Error::None)"
-        )
-        if actual.count(needle) != 1:
-            raise RuntimeError("unknown-PS mutation boundary changed")
-        mutant(
-            "unknown-ps-authority",
-            actual.replace(needle, "if (level != 2)"),
-            "ManagedResolver.UnknownTwoMegabyteOneGigabyteAndAbaNeverGrantProvenance",
-        )
-
-        needle = "current.mark_dirty();  // CURRENT PS or PML1 slot, never a saved PDE."
-        if actual.count(needle) != 1:
-            raise RuntimeError("dirty mutation boundary changed")
-        replacement = (
-            "MutableUserEntrySlot stale; if (managed_pml2_slot_locked(pin.pagemap,pin.user_page,stale)"
-            "==Pml2Walk::Slot) stale.mark_dirty();"
-        )
-        mutant(
-            "stale-pde-dirty",
-            actual.replace(needle, replacement),
-            "ManagedResolver.ExactCurrentLeafDirtyCommitSurvivesPureSplitWithNoRefChange",
-        )
-
-        needle = "    flush_pagemap_after_update(root, 0, true);\n    for (uint16_t i = 0; i < storage->descriptor_count; ++i) {"
-        if actual.count(needle) != 1:
-            raise RuntimeError("ACK mutation boundary changed")
-        early = "    for (uint16_t i=0;i<storage->descriptor_count;++i) (void)managed_huge_registry.complete_split_after_ack(storage->descriptors[i].handle);\n"
-        bad = actual.replace(needle, early + needle)
-        needle = "managed_huge_registry.complete_split_after_ack(d.handle) != huge::Error::None"
-        if bad.count(needle) != 1:
-            raise RuntimeError("post-ACK mutation boundary changed")
-        mutant(
-            "capacity-before-ack",
-            bad.replace(needle, "false"),
-            "ManagedResolver.ActualPublisherTransfersDataOnceAndCleanupRetainsChargeThroughAck",
-        )
-
-        for label, needle, replacement in (
-            (
-                "try-blocks",
-                "acquired_(g_shared_vmem_publication_lock.try_lock())",
-                "acquired_((g_shared_vmem_publication_lock.lock(), true))",
-            ),
-            ("try-forgets-owner", "acquired_(g_shared_vmem_publication_lock.try_lock())", "acquired_(false)"),
-            (
-                "failed-try-unlocks",
-                "if (acquired_) g_shared_vmem_publication_lock.unlock();",
-                "g_shared_vmem_publication_lock.unlock();",
-            ),
-        ):
-            if actual.count(needle) != 1:
-                raise RuntimeError(f"actual try-guard mutation boundary changed: {label}")
-            mutant(
-                label,
-                actual.replace(needle, replacement),
-                "ManagedRange.RealTryGuardContentionNestedFailureAndUnlockOwnership",
+        if options.fork_contract_only:
+            owner_check = "if (!exclusive.owns(src)) return false;"
+            if composite.read_text().count(owner_check) != 1:
+                raise RuntimeError("held-owner control changed")
+            mutant("fork-lost-owner", composite.read_text().replace(owner_check, "if (false) return false;"),
+                   "ManagedFork.HeldWalkerRejectsDifferentOriginalOwnerBeforeWrites")
+            owner_entry = "virt::UserPagemapExclusiveScope source_usercopy_scope(source);"
+            if composite.read_text().count(owner_entry) != 1:
+                raise RuntimeError("fork reader-order control changed")
+            mutant("fork-nested-reader", composite.read_text().replace(owner_entry, owner_entry +
+                   "\n    virt::ManagedRootReader nested_reader(source);"),
+                   "ManagedFork.FullZeroProofCopiesWithOneExclusiveAndNoReader")
+        else:
+            needle = (
+                "if (level != 2 ||\n                managed_huge_registry.lookup_mapped(key, "
+                "address & ~(huge::LEAF_BYTES - 1), raw, result.managed) != huge::Error::None)"
             )
-        needle = "else if (control->ps_geometry_epoch == survey.stamp().epoch) error = Error::None;"
-        if actual.count(needle) != 1:
-            raise RuntimeError("zero proof mutation boundary changed")
-        mutant(
-            "zero-ignores-epoch",
-            actual.replace(needle, "else error = Error::None;"),
-            "ManagedRange.HideRevealAndZeroThenPublicationCannotReuseAnOldProof",
-        )
-        needle = "        // All512 real tracker invocations precede this exact leaf's cap credit."
-        credit = "managed_huge_registry.complete_split_after_ack(d.handle) != huge::Error::None"
-        if actual.count(needle) != 1 or actual.count(credit) != 1:
-            raise RuntimeError("tracker credit mutation boundary changed")
-        early = "        (void)managed_huge_registry.complete_split_after_ack(d.handle);\n"
-        marker = "        for (uint64_t page = 0; page < huge::LEAF_PAGES; ++page)\n            owned_frame_track_fresh_normal_mapping"
-        if actual.count(marker) != 1:
-            raise RuntimeError("tracker loop mutation boundary changed")
-        mutant(
-            "credit-before-tracking",
-            actual.replace(marker, early + marker).replace(credit, "false"),
-            "ManagedResolver.ActualPublisherTransfersDataOnceAndCleanupRetainsChargeThroughAck",
-        )
+            if actual.count(needle) != 1:
+                raise RuntimeError("unknown-PS mutation boundary changed")
+            mutant(
+                "unknown-ps-authority",
+                actual.replace(needle, "if (level != 2)"),
+                "ManagedResolver.UnknownTwoMegabyteOneGigabyteAndAbaNeverGrantProvenance",
+            )
 
-        needle = "if (!exclusive.owns(root)) return huge::Error::Invalid;"
-        if actual.count(needle) != 1:
-            raise RuntimeError("typed exclusive mutation boundary changed")
-        mutant(
-            "nested-exclusive-reader",
-            actual.replace(
-                needle, needle + " ManagedRootReader nested(root); if (!nested.valid()) return huge::Error::Again;"
-            ),
-            "ManagedRange.HeldOriginalExclusiveCommitsWithoutAcquiringAReader",
-        )
+            needle = "current.mark_dirty();  // CURRENT PS or PML1 slot, never a saved PDE."
+            if actual.count(needle) != 1:
+                raise RuntimeError("dirty mutation boundary changed")
+            replacement = (
+                "MutableUserEntrySlot stale; if (managed_pml2_slot_locked(pin.pagemap,pin.user_page,stale)"
+                "==Pml2Walk::Slot) stale.mark_dirty();"
+            )
+            mutant(
+                "stale-pde-dirty",
+                actual.replace(needle, replacement),
+                "ManagedResolver.ExactCurrentLeafDirtyCommitSurvivesPureSplitWithNoRefChange",
+            )
 
-        def module_mutant(label: str, text: str, test: str) -> None:
-            path = scratch / f"{label}.cpp"
-            path.write_text(text)
-            obj = scratch / f"{label}.o"
-            run(f"compile-{label}", flags + ["-iquote", module.parent, "-c", path, "-o", obj])
-            binary = link(label, [obj, objects[1], objects[2]])
-            controls.append({"label": label, "source": pin(path), "object": pin(obj), "binary": pin(binary)})
-            run(f"run-{label}", [binary, f"--gtest_filter={test}"], expected_success=False)
-            binary.unlink()
-            obj.unlink()
-            path.unlink()
+            needle = "    flush_pagemap_after_update(root, 0, true);\n    for (uint16_t i = 0; i < storage->descriptor_count; ++i) {"
+            if actual.count(needle) != 1:
+                raise RuntimeError("ACK mutation boundary changed")
+            early = "    for (uint16_t i=0;i<storage->descriptor_count;++i) (void)managed_huge_registry.complete_split_after_ack(storage->descriptors[i].handle);\n"
+            bad = actual.replace(needle, early + needle)
+            needle = "managed_huge_registry.complete_split_after_ack(d.handle) != huge::Error::None"
+            if bad.count(needle) != 1:
+                raise RuntimeError("post-ACK mutation boundary changed")
+            mutant(
+                "capacity-before-ack",
+                bad.replace(needle, "false"),
+                "ManagedResolver.ActualPublisherTransfersDataOnceAndCleanupRetainsChargeThroughAck",
+            )
 
-        needle = "g_shared_vmem_publication_owner.store(this, std::memory_order_release);"
-        if actual.count(needle) != 1:
-            raise RuntimeError("actual blocking held-state boundary changed")
-        mutant("blocking-forgets-held", actual.replace(needle, "g_shared_vmem_publication_owner.store(nullptr, std::memory_order_release);"),
-               "ManagedRange.BlockingBorrowUsesRealGuardAfterOrdinaryAcquireBeforeLegacyInterval")
+            for label, needle, replacement in (
+                (
+                    "try-blocks",
+                    "acquired_(g_shared_vmem_publication_lock.try_lock())",
+                    "acquired_((g_shared_vmem_publication_lock.lock(), true))",
+                ),
+                ("try-forgets-owner", "acquired_(g_shared_vmem_publication_lock.try_lock())", "acquired_(false)"),
+                (
+                    "failed-try-unlocks",
+                    "if (acquired_) g_shared_vmem_publication_lock.unlock();",
+                    "g_shared_vmem_publication_lock.unlock();",
+                ),
+            ):
+                if actual.count(needle) != 1:
+                    raise RuntimeError(f"actual try-guard mutation boundary changed: {label}")
+                mutant(
+                    label,
+                    actual.replace(needle, replacement),
+                    "ManagedRange.RealTryGuardContentionNestedFailureAndUnlockOwnership",
+                )
+            needle = "else if (control->ps_geometry_epoch == survey.stamp().epoch) error = Error::None;"
+            if actual.count(needle) != 1:
+                raise RuntimeError("zero proof mutation boundary changed")
+            mutant(
+                "zero-ignores-epoch",
+                actual.replace(needle, "else error = Error::None;"),
+                "ManagedRange.HideRevealAndZeroThenPublicationCannotReuseAnOldProof",
+            )
+            needle = "        // All512 real tracker invocations precede this exact leaf's cap credit."
+            credit = "managed_huge_registry.complete_split_after_ack(d.handle) != huge::Error::None"
+            if actual.count(needle) != 1 or actual.count(credit) != 1:
+                raise RuntimeError("tracker credit mutation boundary changed")
+            early = "        (void)managed_huge_registry.complete_split_after_ack(d.handle);\n"
+            marker = "        for (uint64_t page = 0; page < huge::LEAF_PAGES; ++page)\n            owned_frame_track_fresh_normal_mapping"
+            if actual.count(marker) != 1:
+                raise RuntimeError("tracker loop mutation boundary changed")
+            mutant(
+                "credit-before-tracking",
+                actual.replace(marker, early + marker).replace(credit, "false"),
+                "ManagedResolver.ActualPublisherTransfersDataOnceAndCleanupRetainsChargeThroughAck",
+            )
 
-        module_text = CppText(module.read_text())
-        needle = ": subject_(&target), preparation_(&preparation), blocking_publication_(&publication) { if (!publication.acquired() || !range_current_context(target, preparation, false)) return;"
-        if module_text.count(needle) != 1:
-            raise RuntimeError("actual blocking context boundary changed")
-        module_mutant("blocking-forgets-context", module_text.replace(needle, ": subject_(&target), preparation_(&preparation), blocking_publication_(&publication) { if (!publication.acquired()) return;"),
-                      "ManagedRange.BlockingBorrowRechecksActualContextAndRejectsUnpreparedProof")
-        needle = "error = pass(target, preparation, unpublished, final, count.count != 0 ? RangeSurveyMode::Verify : RangeSurveyMode::Count, storage);"
-        if module_text.count(needle) != 1:
-            raise RuntimeError("independent final pass mutation boundary changed")
-        module_mutant(
-            "omitted-final-pass",
-            module_text.replace(needle, "{ error = Error::None; final.count = count.count; }"),
-            "ManagedRange.IndependentFinalZeroPassDetectsPublicationAndRebuildsAllDescriptors",
-        )
+            needle = "if (!exclusive.owns(root)) return huge::Error::Invalid;"
+            if actual.count(needle) != 1:
+                raise RuntimeError("typed exclusive mutation boundary changed")
+            mutant(
+                "nested-exclusive-reader",
+                actual.replace(
+                    needle, needle + " ManagedRootReader nested(root); if (!nested.valid()) return huge::Error::Again;"
+                ),
+                "ManagedRange.HeldOriginalExclusiveCommitsWithoutAcquiringAReader",
+            )
 
-        text = module.read_text()
-        needle = "(void)owner.span_.release();"
-        if text.count(needle) != 1:
-            raise RuntimeError("data-transfer mutation boundary changed")
-        bad_module = scratch / "drop-adopted-data.cpp"
-        bad_module.write_text(text.replace(needle, "owner.span_.reset();"))
-        obj = scratch / "drop-adopted-data.o"
-        run("compile-drop-adopted-data", flags + ["-iquote", module.parent, "-c", bad_module, "-o", obj])
-        binary = link("drop-adopted-data", [obj, objects[1], objects[2]])
-        run(
-            "run-drop-adopted-data",
-            [
-                binary,
-                "--gtest_filter=ManagedResolver.ActualPublisherTransfersDataOnceAndCleanupRetainsChargeThroughAck",
-            ],
-            expected_success=False,
-        )
+            def module_mutant(label: str, text: str, test: str) -> None:
+                path = scratch / f"{label}.cpp"
+                path.write_text(text)
+                obj = scratch / f"{label}.o"
+                run(f"compile-{label}", flags + ["-iquote", module.parent, "-c", path, "-o", obj])
+                binary = link(label, [obj, objects[1], objects[2]])
+                controls.append({"label": label, "source": pin(path), "object": pin(obj), "binary": pin(binary)})
+                run(f"run-{label}", [binary, f"--gtest_filter={test}"], expected_success=False)
+                binary.unlink()
+                obj.unlink()
+                path.unlink()
+
+            needle = "g_shared_vmem_publication_owner.store(this, std::memory_order_release);"
+            if actual.count(needle) != 1:
+                raise RuntimeError("actual blocking held-state boundary changed")
+            mutant("blocking-forgets-held", actual.replace(needle, "g_shared_vmem_publication_owner.store(nullptr, std::memory_order_release);"),
+                   "ManagedRange.BlockingBorrowUsesRealGuardAfterOrdinaryAcquireBeforeLegacyInterval")
+
+            module_text = CppText(module.read_text())
+            needle = ": subject_(&target), preparation_(&preparation), blocking_publication_(&publication) { if (!publication.acquired() || !range_current_context(target, preparation, false)) return;"
+            if module_text.count(needle) != 1:
+                raise RuntimeError("actual blocking context boundary changed")
+            module_mutant("blocking-forgets-context", module_text.replace(needle, ": subject_(&target), preparation_(&preparation), blocking_publication_(&publication) { if (!publication.acquired()) return;"),
+                          "ManagedRange.BlockingBorrowRechecksActualContextAndRejectsUnpreparedProof")
+            needle = "error = pass(target, preparation, unpublished, final, count.count != 0 ? RangeSurveyMode::Verify : RangeSurveyMode::Count, storage);"
+            if module_text.count(needle) != 1:
+                raise RuntimeError("independent final pass mutation boundary changed")
+            module_mutant(
+                "omitted-final-pass",
+                module_text.replace(needle, "{ error = Error::None; final.count = count.count; }"),
+                "ManagedRange.IndependentFinalZeroPassDetectsPublicationAndRebuildsAllDescriptors",
+            )
+
+            text = module.read_text()
+            needle = "(void)owner.span_.release();"
+            if text.count(needle) != 1:
+                raise RuntimeError("data-transfer mutation boundary changed")
+            bad_module = scratch / "drop-adopted-data.cpp"
+            bad_module.write_text(text.replace(needle, "owner.span_.reset();"))
+            obj = scratch / "drop-adopted-data.o"
+            run("compile-drop-adopted-data", flags + ["-iquote", module.parent, "-c", bad_module, "-o", obj])
+            binary = link("drop-adopted-data", [obj, objects[1], objects[2]])
+            run(
+                "run-drop-adopted-data",
+                [
+                    binary,
+                    "--gtest_filter=ManagedResolver.ActualPublisherTransfersDataOnceAndCleanupRetainsChargeThroughAck",
+                ],
+                expected_success=False,
+            )
+
     except BaseException as error:
         errors.append(str(error))
     finally:

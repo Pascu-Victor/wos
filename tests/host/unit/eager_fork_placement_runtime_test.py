@@ -146,13 +146,14 @@ def main() -> int:
             signal.signal(number, cancelled)
         before = [pin(path) for path in selected]
         source = source_path.read_text()
-        signatures = ["auto valid_fork_placement(", "auto deep_copy_user_pagemap_cow_impl(", "auto fork_eager_copy_requested()",
+        signatures = ["auto valid_fork_placement(", "auto deep_copy_user_pagemap_cow_held(", "auto deep_copy_user_pagemap_cow_impl(", "auto fork_eager_copy_requested()",
                       "auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool",
                       "auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst, numa::AllocationContext&",
                       "auto selftest_deep_copy_user_pagemap_eager("]
         bodies = "\n".join(function(source, name) for name in signatures)
         support = cases_path.read_text()
-        code = support.replace("// ACTUAL_EXTRACTED_COPIER_INSERTION", bodies)
+        code = support.replace("// ACTUAL_EXTRACTED_EXCLUSIVE_INSERTION", function(source, "class UserPagemapExclusiveScope {") + ";")
+        code = code.replace("// ACTUAL_EXTRACTED_COPIER_INSERTION", bodies)
         code = code.replace("// ACTUAL_FACTORY_INSERTION", factory_path.read_text())
         variants = [("actual", code, 0)]
         if args.negative_controls:

@@ -285,10 +285,35 @@ def require_mapping_mutations_use_shootdown(source: str) -> None:
     if flush < 0 or drop < 0 or flush > drop:
         fail("reserve_page_range must complete the shootdown before dropping the old page reference")
 
-    for name in ["unify_page_flags", "flush_page_map_batch", "destroy_user_space_budgeted", "destroy_user_space", "deep_copy_user_pagemap_cow_impl"]:
+    for name in ["unify_page_flags", "flush_page_map_batch", "destroy_user_space_budgeted", "destroy_user_space", "deep_copy_user_pagemap_cow_held"]:
         body = function_body(source, name)
         if "flush_pagemap_after_update(" not in body:
             fail(f"{name} must route stale-TLB-sensitive updates through the shootdown helper")
+
+    wrapper = "".join(function_body(source, "deep_copy_user_pagemap_cow_impl").split())
+    scope = wrapper.find("UserPagemapExclusiveScopesource_usercopy_scope(src);")
+    call = wrapper.find("returndeep_copy_user_pagemap_cow_held(src,dst,eager_copy,placement,output,"
+                        "fail_before_private_page,source_usercopy_scope,false);")
+    if min(scope, call) < 0 or scope >= call:
+        fail("legacy fork must retain its original exclusive through the held walk and source ACK")
+    held = function_body(source, "deep_copy_user_pagemap_cow_held")
+    clone = held.find("clone_anonymous_swap_mappings(src, dst)")
+    flush = held.rfind("flush_pagemap_after_update(src, 0, true)")
+    success = held.rfind("return true;")
+    if min(clone, flush, success) < 0 or not clone < flush < success:
+        fail("held fork must finish its source shootdown after the complete ordinary and swap-side walk")
+    prepared = "".join(function_body(source, "copy_current_user_pagemap_exclusive").split())
+    order = ["UserPagemapExclusiveScopesource_usercopy_scope(source);",
+             "commit_managed_split_plan_exclusive(source,survey,tables,source_usercopy_scope)",
+             "sched::PreemptGuardconstCOW_PREEMPT;",
+             "deep_copy_user_pagemap_cow_held(source,child,EAGER,placement,empty_result,UINT64_MAX,source_usercopy_scope,true)",
+             "if(!copied){", "virt::flush_pagemap_after_update(source,0,true);", "return-ENOMEM;"]
+    cursor = 0
+    for token in order:
+        found = prepared.find(token, cursor)
+        if found < 0:
+            fail(f"prepared fork must ACK its split before COW and any failed source prefix before rollback: {token}")
+        cursor = found + len(token)
 
     if "flush_user_mapping_if_current" in source:
         fail("old local-only user mapping flush helper must not remain")

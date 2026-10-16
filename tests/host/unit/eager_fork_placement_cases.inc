@@ -234,10 +234,14 @@ using namespace ker::mod::mm::paging;
 using namespace ker::mod::mm::addr;
 constexpr uint64_t PTE_FRAME_MASK = host::FRAME;
 PageTable* kernel_pagemap = reinterpret_cast<PageTable*>(0x9000);
-struct UserPagemapExclusiveScope {
-    explicit UserPagemapExclusiveScope(PageTable*) { CHECK(host::exclusive++ == 0); }
-    ~UserPagemapExclusiveScope() noexcept(false) { CHECK(--host::exclusive == 0); }
-};
+constexpr size_t USER_PAGEMAP_ACCESS_GATE_NONE = SIZE_MAX;
+auto begin_user_pagemap_exclusive(PageTable*) -> size_t {
+    CHECK(host::exclusive++ == 0);
+    return 0;
+}
+void end_user_pagemap_exclusive(size_t index) { CHECK(index == 0 && --host::exclusive == 0); }
+// ACTUAL_EXTRACTED_EXCLUSIVE_INSERTION
+
 void selftest_require_mutable_pagemap_root(PageTable* p, const char*) { CHECK(host::registered.contains(p)); }
 auto capture_user_root_incarnation(PageTable* p, uint64_t& empty) noexcept -> bool {
     if (empty || !host::registered.contains(p)) return false;

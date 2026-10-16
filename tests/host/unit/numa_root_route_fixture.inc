@@ -33,6 +33,7 @@ std::array<Frame, 256> frames{};
 unsigned physical_calls{}, frees{}, reserve_takes{}, reserve_returns{}, fail_calls{};
 paging::PageTable* current_root{};
 bool reserve_available{};
+void (*retag_probe)(void*, PhysicalPageOwner){};
 auto frame(void* p) -> Frame& {
     for (auto& f : frames)
         if (&f.table == p) {
@@ -69,6 +70,7 @@ template <class... T>
 void emergency_log(const char*, T...) {}
 }  // namespace ker::mod::dbg
 namespace ker::mod::mm::phys {
+// WOS_TEST_INSERT_ACTUAL_PHYSICAL_TYPES
 auto page_kind_get(void* p) -> PageKind {
     test::outside();
     return test::frame(p).kind;
@@ -79,6 +81,7 @@ auto page_ref_get(void* p) -> uint32_t {
 }
 auto page_reassign_owner(void* p, PhysicalPageOwner owner) -> bool {
     test::outside();
+    if (test::retag_probe != nullptr) test::retag_probe(p, owner);
     test::frame(p).owner = owner;
     return true;
 }
@@ -227,10 +230,13 @@ struct UserPagemapExclusiveScope {
     ~UserPagemapExclusiveScope() { --root_readers; }
 };
 // WOS_TEST_INSERT_ACTUAL_ROOT_FUNCTIONS
+namespace mm = ker::mod::mm;
+// WOS_TEST_INSERT_ACTUAL_CONSERVATION_PREDICATES
 }  // namespace ker::mod::mm::virt
 
 namespace test {
 namespace virt = ker::mod::mm::virt;
+namespace mm = ker::mod::mm;
 using S = virt::SelftestRootAllocationSource;
 using R = virt::SelftestRootReturnDisposition;
 void reset() {
@@ -276,6 +282,8 @@ void expect_return(paging::PageTable* p, R expected) {
         check(out.historical_pa == 0 && out.references == 0 && out.kind == PageKind::UNKNOWN && out.disposition == R::UNKNOWN &&
                   !out.owned_facts_valid && !out.control_retired,
               "reused release output is reset before admission refusal");
+        check(out.historical_root_bits == 0 && !out.insertion.inserted && out.insertion.completed_sequence == 0,
+              "reused insertion authority is reset before refusal");
     };
     virt::selftest_release_pagemap(nullptr, out);
     cleared();
@@ -386,6 +394,7 @@ void invalid_override() {
     check(create(out, options) == nullptr && physical_calls == calls && out.source == S::UNKNOWN && !out.historical_pa_valid,
           "old invalid override refuses without diagnostics inventing allocation");
 }
+// WOS_TEST_INSERT_CONSERVATION_CASES
 }  // namespace test
 int main() {
     try {
@@ -412,6 +421,8 @@ int main() {
         test::old_wrapper();
         test::reset();
         test::invalid_override();
+        test::reset();
+        test::conservation_cases();
         test::reset();
         std::printf("PASS actual_root_route_cases=12 assertions=%u diagnostic_bytes=%zu endpoints_disclosed=1\n", test::assertions,
                     sizeof(ker::mod::mm::virt::RootRouteDiagnostics));

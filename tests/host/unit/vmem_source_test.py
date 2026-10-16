@@ -1111,13 +1111,30 @@ def test_eager_fork_uses_copied_policy_and_caller_storage_before_owners() -> Non
     require_cpp_tokens(fork, ["if (EAGER_COPY)",
         "copied = EAGER_COPY ? mm::virt::deep_copy_user_pagemap_cow(parent->pagemap, child->pagemap, fork_placement, fork_page)",
         ": mm::virt::deep_copy_user_pagemap_cow(parent->pagemap, child->pagemap);"], "conditional typed route with unchanged legacy call")
-    copier = function_body(VIRT_CPP.read_text(), "deep_copy_user_pagemap_cow_impl")
+    virt = VIRT_CPP.read_text()
+    wrapper = function_body(virt, "deep_copy_user_pagemap_cow_impl")
+    require_cpp_order(wrapper, "UserPagemapExclusiveScope source_usercopy_scope(src);",
+                      "return deep_copy_user_pagemap_cow_held(src, dst, eager_copy, placement, output, fail_before_private_page, source_usercopy_scope, false);",
+                      "legacy exclusive and unchanged copied context transfer")
+    prepared = function_body(virt, "copy_current_user_pagemap_exclusive")
+    require_cpp_order(prepared, "commit_managed_split_plan_exclusive(source, survey, tables, source_usercopy_scope)",
+                      "sched::PreemptGuard const COW_PREEMPT;", "prepared split ACK before COW interval")
+    require_cpp_order(prepared, "sched::PreemptGuard const COW_PREEMPT;",
+                      "deep_copy_user_pagemap_cow_held(source, child, EAGER, placement, empty_result, UINT64_MAX, source_usercopy_scope, true)",
+                      "prepared route borrows the same original exclusive and copied context")
+    copier = function_body(virt, "deep_copy_user_pagemap_cow_held")
+    require_cpp_order(copier, "if (!exclusive.owns(src)) return false;", "auto& src_pml4e = entry_at(src, i4)",
+                      "source ownership before any leaf walk")
     require_cpp_order(copier, "placement->virtual_page_index = VADDR / paging::PAGE_SIZE;",
                       "numa::try_allocate_pages_into(*output, *placement", "per-VA copied context before allocation")
     require_cpp_order(copier, "std::memcpy(child_page, data_virt, paging::PAGE_SIZE);",
                       "owned_frame_track_fresh_normal_mapping(dst, VADDR, CHILD_PHYS", "full bytes before real leaf adoption")
     require_cpp_order(copier, "owned_frame_track_fresh_normal_mapping(dst, VADDR, CHILD_PHYS",
                       "output->span.release()", "exact adoption before scalar owner transfer")
+    require_cpp_order(copier, "if (!phys::page_ref_try_inc(data_virt, &ref_lookup))",
+                      "src_pml1e = pte_from_raw(raw);", "real shared-frame owner before parent/child COW leaf publication")
+    require_cpp_tokens(copier, ["if (!phys::page_ref_try_inc(data_virt, &ref_lookup)) { flush_pagemap_after_update(src, 0, true); return false; }"],
+                       "failed shared-frame acquisition flushes the changed source prefix before caller rollback")
 
 
 def test_fork_snapshots_all_vm_surfaces_under_one_publication_guard() -> None:

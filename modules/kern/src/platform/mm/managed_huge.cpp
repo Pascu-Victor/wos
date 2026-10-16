@@ -1,8 +1,10 @@
 #include "managed_huge.hpp"
 
+#include <cerrno>
 #include <new>
 #include <platform/acpi/numa_boot.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/virt.hpp>
 #include <platform/sys/syscall_preparation.hpp>
 #include <syscalls_impl/vmem/sys_vmem.hpp>
 #include <utility>
@@ -328,6 +330,10 @@ struct detail::RangePreparationDriver {
         return Error::Again;
     }
 };
+auto detail::current_fork_context_valid(sched::task::Task& target, const sys::SyscallPreparationScope& preparation,
+                                        const ker::syscall::vmem::SharedVmemPublicationGuard& publication) noexcept -> bool {
+    return publication.acquired() && range_current_context(target, preparation, false);
+}
 auto prepare_current_range_split(sched::task::Task& target, const sys::SyscallPreparationScope& preparation, uint64_t start, uint64_t end,
                                  RangeSplitSurvey& survey, PreparedTables& tables) noexcept -> Error {
     if (!range_current_context(target, preparation, true)) return Error::Invalid;
@@ -382,3 +388,26 @@ auto CurrentRangeSplitAdmission::allows(const sched::task::Task& target, uint64_
 }
 
 }  // namespace ker::mod::mm::huge
+
+namespace ker::mod::mm::virt {
+auto deep_copy_current_user_pagemap_prepared(sched::task::Task& actor, PageTable* child, const sys::SyscallPreparationScope& preparation,
+                                             const ker::syscall::vmem::SharedVmemPublicationGuard& publication,
+                                             const huge::RangeSplitSurvey& survey, huge::PreparedTables& tables,
+                                             numa::AllocationContext* eager_context, numa::AllocationResult* empty_result) noexcept -> int {
+    if (!huge::detail::current_fork_context_valid(actor, preparation, publication)) return -EWOULDBLOCK;
+    constexpr uint64_t USER_END = uint64_t{1} << 47;
+    if (child == nullptr || !survey.complete() || survey.start() != 0 || survey.end() != USER_END) return -EINVAL;
+    // Instrumented caller-born storage: Task writes its result into this actual
+    // addressable output. Deliberately do not acquire a striped reader here.
+    huge::detail::CurrentRangeRootAccess access;
+    access.subject = &actor;
+    access.local = actor.try_acquire_usercopy_pagemap(access.root);
+    int result = -EAGAIN;
+    if (access.local && access.root != nullptr && access.root == actor.pagemap)
+        result = huge::detail::copy_current_user_pagemap_exclusive(actor, access.root, child, preparation, publication, survey, tables,
+                                                                   eager_context, empty_result);
+    // Record/release even a successful local lease followed by identity refusal.
+    huge::detail::release_current_range_root(access);
+    return result;
+}
+}  // namespace ker::mod::mm::virt

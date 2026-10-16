@@ -2819,6 +2819,11 @@ struct PageTablePool {
     // Each record lives exactly as long as its resident pool entry.
     std::array<PageTableReleaseOrigin, PAGE_TABLE_POOL_CAPACITY> origins{};
     size_t count = 0;
+#ifdef WOS_SELFTEST
+    // Excluded TU owns these plain scalars; no shared constructor/shadow access.
+    uint64_t proof_sequence{}, proof_inflight{};
+    bool proof_invalid{};
+#endif
 };
 
 PageTablePool page_table_pool{};                        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -3324,6 +3329,35 @@ void zero_page_table_for_pool(PageTable* table) {
     }
 }
 
+#ifdef WOS_SELFTEST
+// Called with the existing pool lock held, before any off-lock owner transfer.
+auto page_table_pool_proof_begin_locked() -> bool {
+    auto& pool = page_table_pool;
+    if (pool.proof_invalid || pool.proof_sequence == UINT64_MAX || pool.proof_inflight == UINT64_MAX) {
+        pool.proof_invalid = true;
+        return false;
+    }
+    ++pool.proof_sequence;
+    ++pool.proof_inflight;
+    if (pool.proof_sequence == UINT64_MAX) pool.proof_invalid = true;
+    return true;
+}
+// Called only by a tracked intent AFTER every owner/counter/rollback tail.
+// Zero means invalid/busy; a completed sequence never lends a frame lifetime.
+auto page_table_pool_proof_end(bool tracked) -> uint64_t {
+    if (!tracked) return 0;
+    auto& pool = page_table_pool;
+    uint64_t const FLAGS = pool.lock.lock_irqsave();
+    if (pool.proof_inflight == 0 || pool.proof_sequence >= UINT64_MAX - 1) pool.proof_invalid = true;
+    if (pool.proof_sequence == UINT64_MAX - 1) pool.proof_sequence = UINT64_MAX;
+    if (pool.proof_inflight != 0) --pool.proof_inflight;
+    if (!pool.proof_invalid) ++pool.proof_sequence;
+    uint64_t const COMPLETE = !pool.proof_invalid && pool.proof_inflight == 0 ? pool.proof_sequence : 0;
+    pool.lock.unlock_irqrestore(FLAGS);
+    return COMPLETE;
+}
+#endif
+
 auto try_alloc_page_table_from_pool() -> PageTable* {
     auto& pool = page_table_pool;
     uint64_t const FLAGS = pool.lock.lock_irqsave();
@@ -3333,6 +3367,9 @@ auto try_alloc_page_table_from_pool() -> PageTable* {
         return nullptr;
     }
 
+#ifdef WOS_SELFTEST
+    bool const TRACKED = page_table_pool_proof_begin_locked();
+#endif
     --pool.count;
     auto* table = pool.pages[pool.count];
     pool.pages[pool.count] = nullptr;
@@ -3353,10 +3390,24 @@ auto try_alloc_page_table_from_pool() -> PageTable* {
     }
 
     page_table_pool_alloc_hits.fetch_add(1, std::memory_order_relaxed);
+#ifdef WOS_SELFTEST
+    static_cast<void>(page_table_pool_proof_end(TRACKED));
+#endif
     return table;
 }
 
-auto try_release_page_table_to_pool(PageTable* table, PageTableReleaseOrigin origin) -> bool {
+auto try_release_page_table_to_pool(PageTable* table, PageTableReleaseOrigin origin
+#ifdef WOS_SELFTEST
+                                    ,
+                                    SelftestRootPoolInsertion* insertion = nullptr
+#endif
+                                    ) -> bool {
+#ifdef WOS_SELFTEST
+    if (insertion != nullptr) {
+        insertion->completed_sequence = 0;
+        insertion->inserted = false;
+    }
+#endif
     if (table == nullptr) {
         return true;
     }
@@ -3383,6 +3434,9 @@ auto try_release_page_table_to_pool(PageTable* table, PageTableReleaseOrigin ori
         page_table_pool_rejects.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
+#ifdef WOS_SELFTEST
+    bool const TRACKED = page_table_pool_proof_begin_locked();
+#endif
     pool.lock.unlock_irqrestore(FLAGS);
 
     zero_page_table_for_pool(table);
@@ -3400,6 +3454,9 @@ auto try_release_page_table_to_pool(PageTable* table, PageTableReleaseOrigin ori
             page_table_pool_rejects.fetch_add(1, std::memory_order_relaxed);
             log::critical("raced duplicate page-table pool release page=%p previous_pid=%lu previous_caller=%p owner_pid=%lu caller=%p",
                           table, PREVIOUS.owner_pid, PREVIOUS.caller, origin.owner_pid, origin.caller);
+#ifdef WOS_SELFTEST
+            static_cast<void>(page_table_pool_proof_end(TRACKED));
+#endif
             return true;
         }
     }
@@ -3410,6 +3467,9 @@ auto try_release_page_table_to_pool(PageTable* table, PageTableReleaseOrigin ori
             log::critical("page-table pool could not restore rejected ownership page=%p", table);
             hcf();
         }
+#ifdef WOS_SELFTEST
+        static_cast<void>(page_table_pool_proof_end(TRACKED));
+#endif
         return false;
     }
     pool.pages[pool.count] = table;
@@ -3417,6 +3477,13 @@ auto try_release_page_table_to_pool(PageTable* table, PageTableReleaseOrigin ori
     ++pool.count;
     pool.lock.unlock_irqrestore(INSERT_FLAGS);
     page_table_pool_releases.fetch_add(1, std::memory_order_relaxed);
+#ifdef WOS_SELFTEST
+    uint64_t const COMPLETE = page_table_pool_proof_end(TRACKED);
+    if (insertion != nullptr && COMPLETE != 0) {
+        insertion->completed_sequence = COMPLETE;
+        insertion->inserted = true;
+    }
+#endif
     return true;
 }
 
@@ -3558,6 +3625,7 @@ auto return_root_to_emergency_reserve(PageTable* root) -> bool {
 void selftest_capture_root_release(PageTable* root, SelftestRootReleaseOutput* output) {
     if (output == nullptr) return;
     output->historical_pa = reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(root)));
+    output->historical_root_bits = reinterpret_cast<uint64_t>(root);
     output->kind = phys::page_kind_get(root);
     output->references = phys::page_ref_get(root);
     output->owned_facts_valid = true;
@@ -3578,7 +3646,7 @@ void release_unregistered_user_root(PageTable* root
         if (output != nullptr) output->disposition = SelftestRootReturnDisposition::EMERGENCY_RETURNED;
         return;
     }
-    if (try_release_page_table_to_pool(root, {__builtin_return_address(0), 0})) {
+    if (try_release_page_table_to_pool(root, {__builtin_return_address(0), 0}, output != nullptr ? &output->insertion : nullptr)) {
         if (output != nullptr) output->disposition = SelftestRootReturnDisposition::LEGACY_CACHED;
         return;
     }
@@ -6214,7 +6282,7 @@ void release_pagemap_exclusive_owned(PageTable* pagemap, uint64_t owner_pid, voi
         if (output != nullptr) output->disposition = SelftestRootReturnDisposition::EMERGENCY_RETURNED;
         return;
     }
-    if (try_release_page_table_to_pool(pagemap, {caller, owner_pid})) {
+    if (try_release_page_table_to_pool(pagemap, {caller, owner_pid}, output != nullptr ? &output->insertion : nullptr)) {
         if (output != nullptr) output->disposition = SelftestRootReturnDisposition::LEGACY_CACHED;
         return;
     }
@@ -6940,6 +7008,31 @@ auto selftest_user_root_incarnation(PageTable* owned_root) -> uint64_t {
     user_mapping_pin_lock.unlock_irqrestore(FLAGS);
     release_user_pagemap_access(gate);
     return SERIAL;
+}
+#endif
+
+#ifdef WOS_SELFTEST
+void selftest_observe_page_table_pool(uint64_t historical_root_bits, SelftestPageTablePoolObservation& output) {
+    auto& pool = page_table_pool;
+    uint64_t const FLAGS = pool.lock.lock_irqsave();
+    uint64_t const SEQUENCE = pool.proof_sequence;
+    uint64_t const INFLIGHT = pool.proof_inflight;
+    uint64_t const COUNT = pool.count;
+    bool const VALID = !pool.proof_invalid && SEQUENCE != UINT64_MAX && INFLIGHT == 0 && COUNT <= PAGE_TABLE_POOL_CAPACITY;
+    uint64_t matches = 0;
+    if (VALID && historical_root_bits != 0) {
+        for (size_t i = 0; i < COUNT; ++i)
+            if (reinterpret_cast<uint64_t>(pool.pages[i]) == historical_root_bits) ++matches;
+    }
+    pool.lock.unlock_irqrestore(FLAGS);
+    // Caller-born instrumented/addressable output; no helper call or output
+    // store can cause a shadow operation while the pool lock is held.
+    output.sequence = SEQUENCE;
+    output.inflight = INFLIGHT;
+    output.capacity = PAGE_TABLE_POOL_CAPACITY;
+    output.cached_pages = COUNT;
+    output.matching_entries = matches;
+    output.valid = VALID;
 }
 #endif
 
@@ -10478,26 +10571,10 @@ auto valid_fork_placement(PageTable* src, PageTable* dst, const numa::Allocation
            context.local_node < topology->node_count && numa::valid_policy(context.policy, topology->node_count);
 }
 
-auto deep_copy_user_pagemap_cow_impl(PageTable* src, PageTable* dst, bool eager_copy, numa::AllocationContext* placement,
-                                     numa::AllocationResult* output, uint64_t fail_before_private_page) -> bool {
-    // Walk the user half (PML4[0..255]) of src.
-    // For each present PML1 entry pointing to a data page:
-    //   1. Mark the src PTE as read-only + COW
-    //   2. Create the same PTE in dst (read-only + COW)
-    //   3. Increment the physical page's refcount
-    // Page table pages (PML3/PML2/PML1) are freshly allocated for dst.
-
-#ifdef WOS_SELFTEST
-    selftest_require_mutable_pagemap_root(src, "fork-cow-source");
-    selftest_require_mutable_pagemap_root(dst, "fork-cow-destination");
-#endif
-
-    // Fork mutates writable source leaves into COW mappings. Drain every
-    // stable usercopy pin on this shared root first and prevent new pins until
-    // the source PTE changes and final TLB shootdown are complete. Otherwise a
-    // copyout pinned as writable before fork could modify the child's newly
-    // shared frame after publication.
-    UserPagemapExclusiveScope source_usercopy_scope(src);
+auto deep_copy_user_pagemap_cow_held(PageTable* src, PageTable* dst, bool eager_copy, numa::AllocationContext* placement,
+                                     numa::AllocationResult* output, uint64_t fail_before_private_page,
+                                     const UserPagemapExclusiveScope& exclusive, bool require_4k) -> bool {
+    if (!exclusive.owns(src)) return false;
 
     constexpr size_t USER_PML4_ENTRIES = 256;
     bool const EAGER_COPY_WRITABLE_PRIVATE = eager_copy;
@@ -10508,6 +10585,10 @@ auto deep_copy_user_pagemap_cow_impl(PageTable* src, PageTable* dst, bool eager_
         auto& dst_pml4e = entry_at(dst, i4);
         if (!src_pml4e.present) {
             continue;
+        }
+        if (require_4k && src_pml4e.pagesize != 0) {
+            flush_pagemap_after_update(src, 0, true);
+            return false;
         }
 
         paddr_t const SRC_PML3_PHYS = src_pml4e.frame << paging::PAGE_SHIFT;
@@ -10531,7 +10612,7 @@ auto deep_copy_user_pagemap_cow_impl(PageTable* src, PageTable* dst, bool eager_
             }
 
             // Strict placed callers never interpret an unknown 1GiB leaf as a table.
-            if (placement != nullptr && src_pml3e.pagesize != 0) {
+            if ((placement != nullptr || require_4k) && src_pml3e.pagesize != 0) {
                 flush_pagemap_after_update(src, 0, true);
                 return false;
             }
@@ -10554,7 +10635,7 @@ auto deep_copy_user_pagemap_cow_impl(PageTable* src, PageTable* dst, bool eager_
                     continue;
                 }
                 if (src_pml2e.pagesize) {
-                    if (placement != nullptr) {
+                    if (placement != nullptr || require_4k) {
                         flush_pagemap_after_update(src, 0, true);
                         return false;
                     }
@@ -10725,6 +10806,29 @@ auto deep_copy_user_pagemap_cow_impl(PageTable* src, PageTable* dst, bool eager_
     return true;
 }
 
+auto deep_copy_user_pagemap_cow_impl(PageTable* src, PageTable* dst, bool eager_copy, numa::AllocationContext* placement,
+                                     numa::AllocationResult* output, uint64_t fail_before_private_page) -> bool {
+    // Walk the user half (PML4[0..255]) of src.
+    // For each present PML1 entry pointing to a data page:
+    //   1. Mark the src PTE as read-only + COW
+    //   2. Create the same PTE in dst (read-only + COW)
+    //   3. Increment the physical page's refcount
+    // Page table pages (PML3/PML2/PML1) are freshly allocated for dst.
+
+#ifdef WOS_SELFTEST
+    selftest_require_mutable_pagemap_root(src, "fork-cow-source");
+    selftest_require_mutable_pagemap_root(dst, "fork-cow-destination");
+#endif
+
+    // Fork mutates writable source leaves into COW mappings. Drain every
+    // stable usercopy pin on this shared root first and prevent new pins until
+    // the source PTE changes and final TLB shootdown are complete. Otherwise a
+    // copyout pinned as writable before fork could modify the child's newly
+    // shared frame after publication.
+    UserPagemapExclusiveScope source_usercopy_scope(src);
+    return deep_copy_user_pagemap_cow_held(src, dst, eager_copy, placement, output, fail_before_private_page, source_usercopy_scope, false);
+}
+
 }  // namespace
 
 auto fork_eager_copy_requested() -> bool { return fork_eager_copy_enabled(); }
@@ -10756,6 +10860,74 @@ auto selftest_deep_copy_user_pagemap_eager(PageTable* src, PageTable* dst, numa:
 
 // Managed-huge foundation adapters. No PTE publisher or user opt-in exists.
 namespace ker::mod::mm::huge::detail {
+auto copy_current_user_pagemap_exclusive(sched::task::Task& actor, paging::PageTable* source, paging::PageTable* child,
+                                         const sys::SyscallPreparationScope& preparation,
+                                         const ker::syscall::vmem::SharedVmemPublicationGuard& publication, const RangeSplitSurvey& survey,
+                                         PreparedTables& tables, numa::AllocationContext* eager_context,
+                                         numa::AllocationResult* empty_result) noexcept -> int {
+    constexpr uint64_t USER_END = uint64_t{1} << 47;
+    if (!current_fork_context_valid(actor, preparation, publication)) return -EWOULDBLOCK;
+    if (source == nullptr || child == nullptr || source == child || source != actor.pagemap || source == virt::kernel_pagemap ||
+        child == virt::kernel_pagemap || !survey.complete() || survey.start() != 0 || survey.end() != USER_END ||
+        survey.stamp().root.address_bits != reinterpret_cast<uint64_t>(source) || survey.stamp().root.incarnation == 0)
+        return -EINVAL;
+    bool const EAGER = virt::fork_eager_copy_requested();
+    if (EAGER ? (eager_context == nullptr || empty_result == nullptr) : (eager_context != nullptr || empty_result != nullptr))
+        return -EINVAL;
+    if (EAGER && !virt::valid_fork_placement(source, child, *eager_context, *empty_result)) return -EINVAL;
+    // This nonwaiting child-only validation precedes the source exclusive: its
+    // stripe may collide with the source's. Caller still owns its never-active
+    // root exclusively; emptiness alone cannot prove historical inactivity.
+    if (!virt::unpublished_user_root_empty(child)) return -EINVAL;
+#ifdef WOS_SELFTEST
+    virt::selftest_require_mutable_pagemap_root(source, "prepared-fork-source");
+    virt::selftest_require_mutable_pagemap_root(child, "prepared-fork-destination");
+#endif
+    virt::UserPagemapExclusiveScope source_usercopy_scope(source);
+    if (!current_fork_context_valid(actor, preparation, publication) || source != actor.pagemap) return -EAGAIN;
+    // Full user-half proof (including count0) is checked before every child PTE
+    // write. This exact original exclusive is retained through split and COW;
+    // never call a current-range admission that would acquire a nested reader.
+    Error const SPLIT = virt::commit_managed_split_plan_exclusive(source, survey, tables, source_usercopy_scope);
+    if (SPLIT != Error::None) {
+        switch (SPLIT) {
+            case Error::Invalid:
+                return -EINVAL;
+            case Error::Unsupported:
+                return -EOPNOTSUPP;
+            case Error::GenerationExhausted:
+                return -EOVERFLOW;
+            case Error::Capacity:
+            case Error::Exhausted:
+                return -ENOMEM;
+            default:
+                return -EAGAIN;
+        }
+    }
+    // Actual split publication, table transfer, ACK, trackers and cap credits
+    // have completed. Preserve C47's one-nodeLOCAL legacy walk choice without
+    // calling the compatibility wrapper that would reacquire its exclusive.
+    auto* placement = eager_context;
+    if (EAGER) {
+        auto const* topology = acpi::numa::boot_topology();
+        if (topology->node_count == 1 && eager_context->policy.mode == numa::Mode::LOCAL && eager_context->policy.nodes == 0)
+            placement = nullptr;
+    }
+    bool copied = false;
+    {
+        sched::PreemptGuard const COW_PREEMPT;
+        copied =
+            virt::deep_copy_user_pagemap_cow_held(source, child, EAGER, placement, empty_result, UINT64_MAX, source_usercopy_scope, true);
+    }
+    if (!copied) {
+        // An old compatible failure may have changed a parent COW prefix.
+        // Complete its source invalidation before caller-owned child rollback.
+        virt::flush_pagemap_after_update(source, 0, true);
+        return -ENOMEM;
+    }
+    return 0;
+}
+
 auto acquire_current_range_root(sched::task::Task& subject, CurrentRangeRootAccess& empty) noexcept -> Error {
     if (empty.subject != nullptr || empty.root != nullptr || empty.local || empty.gate != virt::USER_PAGEMAP_ACCESS_GATE_NONE)
         return Error::Invalid;

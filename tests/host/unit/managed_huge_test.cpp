@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -30,6 +31,7 @@ namespace topology = ker::mod::acpi::numa;
 constexpr uint64_t PAGE = mm::paging::PAGE_SIZE;
 constexpr uint64_t LARGE = 512 * PAGE;
 void check_huge_capacity_before_free();
+void before_fork_preempt();
 // Explicit Host table/root address endpoints for the actual private resolver.
 mm::paging::PageTable* runtime_root{};
 uint64_t runtime_serial{1};
@@ -199,6 +201,7 @@ auto current_cpu() -> uint64_t {
 
 namespace ker::mod::sched {
 void preempt_disable() {
+    before_fork_preempt();
     auto& state = backend();
     ++state.preempt_disables;
     ++state.preempt_depth;

@@ -334,7 +334,15 @@ struct ReturnCallsite {
     void* caller{};
     uint64_t owner_pid{};
 };
-auto try_release_page_table_to_pool(PageTable*, ReturnCallsite) -> bool { return false; }
+auto try_release_page_table_to_pool(PageTable*, ReturnCallsite, SelftestRootPoolInsertion* insertion = nullptr) -> bool {
+    // Existing endpoint never retains a root. Clear optional authority only;
+    // actual physical return/census behavior and all old vectors stay exact.
+    if (insertion != nullptr) {
+        insertion->completed_sequence = 0;
+        insertion->inserted = false;
+    }
+    return false;
+}
 auto selftest_kernel_page_table_frame(PageTable* page) -> bool { return page == kernel_pagemap; }
 void owned_frame_purge_pagemap(PageTable*) { check_root_intent(); }
 /* @ROOT_SOURCE@ */

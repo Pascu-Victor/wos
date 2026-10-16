@@ -351,12 +351,46 @@ def require_mapping_stable_pin_contract() -> None:
     if not (first_pin_lock < old_frame_pin < first_pin_unlock < allocation < final_pin_lock < final_leaf_write < final_pin_unlock):
         fail("COW must pin its old leaf under the mapping lock, allocate unlocked, then publish under the mapping lock")
 
+    # The compatibility wrapper owns the lease; the factored walker borrows
+    # that same lease through its source writes and final TLB acknowledgement.
     fork_cow = function_body(virt_cpp, "deep_copy_user_pagemap_cow_impl")
-    scope = fork_cow.find("UserPagemapExclusiveScope source_usercopy_scope(src)")
-    first_source_leaf = fork_cow.find("auto& src_pml4e = entry_at(src, i4)")
-    final_flush = fork_cow.find("flush_pagemap_after_update(src, 0, true)")
-    if min(scope, first_source_leaf, final_flush) < 0 or not (scope < first_source_leaf < final_flush):
+    wrapper = "".join(fork_cow.split())
+    scope = wrapper.find("UserPagemapExclusiveScopesource_usercopy_scope(src);")
+    call = wrapper.find("returndeep_copy_user_pagemap_cow_held(src,dst,eager_copy,placement,output,"
+                        "fail_before_private_page,source_usercopy_scope,false);")
+    if min(scope, call) < 0 or scope >= call:
+        fail("fork COW compatibility wrapper must pass its original exclusive to the held walker")
+    held = function_body(virt_cpp, "deep_copy_user_pagemap_cow_held")
+    ownership = held.find("if (!exclusive.owns(src)) return false;")
+    first_source_leaf = held.find("auto& src_pml4e = entry_at(src, i4)")
+    final_flush = held.rfind("flush_pagemap_after_update(src, 0, true)")
+    success = held.rfind("return true;")
+    if min(ownership, first_source_leaf, final_flush, success) < 0 or not (
+            ownership < first_source_leaf < final_flush < success):
         fail("fork COW must exclude stable usercopy pins through source mutation and TLB flush")
+    if "UserPagemapExclusiveScope source_usercopy_scope(" in held or "acquire_user_pagemap_access(" in held:
+        fail("held fork walker must not reacquire its original exclusive or a nested reader")
+    prepared = "".join(function_body(virt_cpp, "copy_current_user_pagemap_exclusive").split())
+    order = ["survey.start()!=0||survey.end()!=USER_END",
+             "UserPagemapExclusiveScopesource_usercopy_scope(source);",
+             "commit_managed_split_plan_exclusive(source,survey,tables,source_usercopy_scope)",
+             "sched::PreemptGuardconstCOW_PREEMPT;",
+             "deep_copy_user_pagemap_cow_held(source,child,EAGER,placement,empty_result,UINT64_MAX,source_usercopy_scope,true)"]
+    cursor = 0
+    for token in order:
+        found = prepared.find(token, cursor)
+        if found < 0:
+            fail(f"prepared fork must retain its original exclusive through full survey, split and COW: {token}")
+        cursor = found + len(token)
+    if "acquire_user_pagemap_access(" in prepared:
+        fail("prepared fork must not take a striped reader under its source exclusive")
+    managed = (ROOT / "modules/kern/src/platform/mm/managed_huge.cpp").read_text()
+    entry = "".join(function_body(managed, "deep_copy_current_user_pagemap_prepared").split())
+    lease = entry.find("access.local=actor.try_acquire_usercopy_pagemap(access.root);")
+    copy = entry.find("copy_current_user_pagemap_exclusive(actor,access.root,child,")
+    release = entry.find("release_current_range_root(access);")
+    if min(lease, copy, release) < 0 or not lease < copy < release:
+        fail("prepared fork must retain and release its real Task-local lease around the exclusive coordinator")
 
     for snippet in [
         "usercopy_pagemap_accesses",

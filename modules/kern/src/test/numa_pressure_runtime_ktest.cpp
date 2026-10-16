@@ -107,6 +107,7 @@ struct RootRoute {
 };
 struct RootFrontierSnapshot {
     virt::PageTablePoolStatsSnapshot pool{};
+    virt::SelftestPageTablePoolObservation proof{};
     reserve::Snapshot emergency{};
     bool observed{};
 };
@@ -123,7 +124,9 @@ struct Storage {
     void* batch[128]{};
     void* selected_seeds[SEEDS]{};
     void* foreign_seeds[SEEDS]{};
-    phys::NodeCounterSnapshot sample{}, baseline{}, exhausted{}, final{};
+    phys::NodeCounterSnapshot sample{}, baseline{}, exhausted{}, final{}, post_clear_nodes{};
+    virt::SelftestPageTablePoolObservation post_pool_before{}, post_pool_after{};
+    bool post_clear_accounting_valid{};
     phys::NodeCounterWorkspace work{};
     phys::PageCacheStatsSnapshot cache_info{};
     phys::PhysicalBalanceSnapshot owner_before{}, owner_after{}, root_owner_before{}, root_owner_after{};
@@ -162,8 +165,91 @@ void capture_root_frontier(RootFrontier frontier) {
     // Separate provider instants, outside all caller leases/locks/timings.
     virt::get_page_table_pool_stats_snapshot(output.pool);
     reserve::snapshot(output.emergency);
+    virt::selftest_observe_page_table_pool(state.root_routes.roots[1].release.historical_root_bits, output.proof);
     output.observed = true;
 }
+// Pure exact conservation predicates, exercised from this actual body on Host.
+auto post_clear_accounting_complete(const phys::NodeCounterSnapshot& nodes, const phys::NodeCounterSnapshot& baseline,
+                                    const phys::PhysicalBalanceSnapshot& physical) -> bool {
+    if (!nodes.complete || nodes.error != mm::NodeCounterError::NONE || nodes.node_count == 0 || nodes.node_count > numa::MAX_NODES ||
+        nodes.node_count != baseline.node_count || nodes.allocator_count != baseline.allocator_count ||
+        nodes.global.usable != baseline.global.usable || physical.identity_pages != physical.managed_pages ||
+        physical.identity_mismatch_pages != 0 || physical.untracked_unreclaimable_pages != 0 ||
+        nodes.global.free_inclusive != physical.free_pages)
+        return false;
+    uint64_t usable = 0, free = 0, cached = 0, buddy = 0;
+    for (size_t node = 0; node < nodes.node_count; ++node) {
+        auto const& row = nodes.nodes[node];
+        if (row.usable != baseline.nodes[node].usable || row.cached > UINT64_MAX - row.buddy_free ||
+            row.free_inclusive != row.cached + row.buddy_free || row.free_inclusive > row.usable || usable > UINT64_MAX - row.usable ||
+            free > UINT64_MAX - row.free_inclusive || cached > UINT64_MAX - row.cached || buddy > UINT64_MAX - row.buddy_free)
+            return false;
+        usable += row.usable;
+        free += row.free_inclusive;
+        cached += row.cached;
+        buddy += row.buddy_free;
+    }
+    return usable == nodes.global.usable && free == nodes.global.free_inclusive && cached == nodes.global.cached &&
+           buddy == nodes.global.buddy_free && cached <= UINT64_MAX - buddy && free == cached + buddy;
+}
+auto root_retained_pool_conservation(const RootRouteDiagnostics& routes, const virt::SelftestPageTablePoolObservation& before,
+                                     const virt::SelftestPageTablePoolObservation& after, const phys::PhysicalBalanceSnapshot& owner_before,
+                                     const phys::PhysicalBalanceSnapshot& owner_after) -> bool {
+    auto const& root = routes.roots[1];
+    auto const& acquired = root.factory;
+    auto const& returned = root.release;
+    if (!root.factory_called || !root.release_called || acquired.source != virt::SelftestRootAllocationSource::PHYSICAL_ALLOCATOR ||
+        !acquired.historical_pa_valid || !acquired.ordinary_allocator_called || acquired.ordinary_failure_injected ||
+        acquired.override_used || acquired.reserve_attempted || acquired.control_failure_injected || acquired.rollback_returned ||
+        acquired.rollback.owned_facts_valid || !acquired.control_registered || !returned.owned_facts_valid || !returned.control_retired ||
+        returned.kind != mm::PageKind::PAGE_TABLE || returned.references != 1 || acquired.historical_pa != returned.historical_pa ||
+        returned.historical_root_bits == 0 || !returned.insertion.inserted || returned.insertion.completed_sequence == 0 ||
+        returned.insertion.completed_sequence == UINT64_MAX || returned.disposition != virt::SelftestRootReturnDisposition::LEGACY_CACHED)
+        return false;
+    auto const& base = routes.frontiers[static_cast<size_t>(RootFrontier::BEFORE_ROOT)];
+    auto const& setup = routes.frontiers[static_cast<size_t>(RootFrontier::AFTER_SETUP)];
+    auto const& clear = routes.frontiers[static_cast<size_t>(RootFrontier::BEFORE_CLEAR)];
+    auto const& done = routes.frontiers[static_cast<size_t>(RootFrontier::AFTER_CLEAR)];
+    for (auto const* f : {&base, &setup, &clear}) {
+        if (!f->observed || !f->proof.valid || f->proof.inflight != 0 || f->proof.capacity != 64 || f->proof.cached_pages != 0 ||
+            f->pool.capacity != 64 || f->pool.cached_pages != 0 || f->proof.sequence != base.proof.sequence)
+            return false;
+    }
+    if (base.proof.sequence >= UINT64_MAX - 2 || returned.insertion.completed_sequence != base.proof.sequence + 2 || !done.observed ||
+        done.pool.capacity != 64 || done.pool.cached_pages != 1 || clear.pool.releases == UINT64_MAX ||
+        done.pool.releases != clear.pool.releases + 1 || done.pool.rejects != clear.pool.rejects ||
+        done.pool.alloc_hits != clear.pool.alloc_hits || done.pool.alloc_misses != clear.pool.alloc_misses)
+        return false;
+    for (auto const* p : {&done.proof, &before, &after}) {
+        if (!p->valid || p->inflight != 0 || p->capacity != 64 || p->cached_pages != 1 || p->matching_entries != 1 ||
+            p->sequence != returned.insertion.completed_sequence)
+            return false;
+    }
+    auto const& origin = base.emergency;
+    if (!origin.published || !origin.healthy || origin.sequence == UINT64_MAX || origin.node_count != 2 || origin.members != 128)
+        return false;
+    for (auto const& f : routes.frontiers) {
+        auto const& current = f.emergency;
+        if (!f.observed || !current.published || !current.healthy || current.sequence != origin.sequence ||
+            current.node_count != origin.node_count || current.members != origin.members)
+            return false;
+        for (size_t node = 0; node < current.node_count; ++node) {
+            auto const& a = origin.nodes[node];
+            auto const& b = current.nodes[node];
+            if (a.capacity != 64 || a.available != 64 || a.loaned != 0 || a.transfers != 0 || a.capacity != b.capacity ||
+                a.available != b.available || a.loaned != b.loaned || a.transfers != b.transfers || a.shortfall != b.shortfall)
+                return false;
+        }
+    }
+    constexpr auto PT = static_cast<size_t>(mm::PhysicalPageOwner::PAGE_TABLE);
+    constexpr auto POOL = static_cast<size_t>(mm::PhysicalPageOwner::PAGE_TABLE_POOL_RESERVE);
+    auto const& a = owner_before.owners[POOL];
+    auto const& b = owner_after.owners[POOL];
+    return owner_before.owners[PT].pages == owner_after.owners[PT].pages &&
+           owner_before.owners[PT].objects == owner_after.owners[PT].objects && a.pages != UINT64_MAX && a.objects != UINT64_MAX &&
+           b.pages == a.pages + 1 && b.objects == a.objects + 1;
+}
+
 auto check(bool condition, const char* text) -> bool {
     ++state.assertions;
     if (!condition && state.failure == nullptr) state.failure = text;
@@ -832,10 +918,13 @@ void report_root_routes() {
             allocation.override_used ? 1U : 0U, allocation.reserve_attempted ? 1U : 0U, static_cast<unsigned>(allocation.reserve_error),
             allocation.control_registered ? 1U : 0U, allocation.rollback.owned_facts_valid ? 1U : 0U,
             static_cast<unsigned>(allocation.rollback.disposition));
-        log::error("root_route_v1 root=%u stage=return called=%u owned_valid=%u pa=%llx kind=%u refs=%u retired=%u disposition=%u",
-                   static_cast<unsigned>(index), route.release_called ? 1U : 0U, returned.owned_facts_valid ? 1U : 0U,
-                   u(returned.historical_pa), static_cast<unsigned>(returned.kind), returned.references, returned.control_retired ? 1U : 0U,
-                   static_cast<unsigned>(returned.disposition));
+        log::error(
+            "root_route_v1 root=%u stage=return called=%u owned_valid=%u pa=%llx kind=%u refs=%u retired=%u disposition=%u inserted=%u "
+            "pool_sequence=%llu root_bits=%llx",
+            static_cast<unsigned>(index), route.release_called ? 1U : 0U, returned.owned_facts_valid ? 1U : 0U, u(returned.historical_pa),
+            static_cast<unsigned>(returned.kind), returned.references, returned.control_retired ? 1U : 0U,
+            static_cast<unsigned>(returned.disposition), returned.insertion.inserted ? 1U : 0U, u(returned.insertion.completed_sequence),
+            u(returned.historical_root_bits));
     }
     for (size_t index = 0; index < 5; ++index) {
         auto const& frontier = state.root_routes.frontiers[index];
@@ -843,10 +932,12 @@ void report_root_routes() {
         auto const& emergency = frontier.emergency;
         log::error(
             "root_route_v1 frontier=%u observed=%u pool_capacity=%llu cached=%llu hits=%llu misses=%llu releases=%llu rejects=%llu "
-            "emergency_published=%u healthy=%u sequence=%llu members=%u nodes=%u",
+            "emergency_published=%u healthy=%u sequence=%llu members=%u nodes=%u proof_valid=%u pool_sequence=%llu inflight=%llu "
+            "matches=%llu",
             static_cast<unsigned>(index), frontier.observed ? 1U : 0U, u(pool.capacity), u(pool.cached_pages), u(pool.alloc_hits),
             u(pool.alloc_misses), u(pool.releases), u(pool.rejects), emergency.published ? 1U : 0U, emergency.healthy ? 1U : 0U,
-            u(emergency.sequence), emergency.members, static_cast<unsigned>(emergency.node_count));
+            u(emergency.sequence), emergency.members, static_cast<unsigned>(emergency.node_count), frontier.proof.valid ? 1U : 0U,
+            u(frontier.proof.sequence), u(frontier.proof.inflight), u(frontier.proof.matching_entries));
         for (size_t node = 0; node < 2; ++node) {
             bool const VALID = frontier.observed && emergency.published && emergency.healthy && node < emergency.node_count;
             auto const& counts = emergency.nodes[node];
@@ -855,6 +946,20 @@ void report_root_routes() {
                        counts.loaned, counts.transfers, counts.shortfall);
         }
     }
+    log::error("root_route_v1 post_clear valid=%u pool_sequence=%llu/%llu inflight=%llu/%llu matches=%llu/%llu free=%llu/%llu",
+               state.post_clear_accounting_valid ? 1U : 0U, u(state.post_pool_before.sequence), u(state.post_pool_after.sequence),
+               u(state.post_pool_before.inflight), u(state.post_pool_after.inflight), u(state.post_pool_before.matching_entries),
+               u(state.post_pool_after.matching_entries), u(state.post_clear_nodes.global.free_inclusive),
+               u(state.root_owner_after.free_pages));
+    for (size_t node = 0; node < 2; ++node) {
+        auto const& row = state.post_clear_nodes.nodes[node];
+        log::error("root_route_v1 post_clear node=%u usable=%llu free=%llu cached=%llu buddy=%llu", static_cast<unsigned>(node),
+                   u(row.usable), u(row.free_inclusive), u(row.cached), u(row.buddy_free));
+    }
+    log::error("root_route_v1 post_clear global usable=%llu free=%llu cached=%llu buddy=%llu mismatch=%llu",
+               u(state.post_clear_nodes.global.usable), u(state.post_clear_nodes.global.free_inclusive),
+               u(state.post_clear_nodes.global.cached), u(state.post_clear_nodes.global.buddy_free),
+               u(state.root_owner_after.identity_mismatch_pages));
 }
 auto prepare_seed_node(numa::NodeId node, PreparedSeeds& seeds, size_t offset) -> bool {
     auto const CONTEXT = numa::AllocationContext{.policy = {.nodes = uint64_t{1} << node, .mode = numa::Mode::BIND}, .local_node = node};
@@ -1046,8 +1151,14 @@ auto run() -> bool {
     capture_root_frontier(RootFrontier::BEFORE_CLEAR);
     root.clear();
     capture_root_frontier(RootFrontier::AFTER_CLEAR);
+    virt::selftest_observe_page_table_pool(state.root_routes.roots[1].release.historical_root_bits, state.post_pool_before);
     phys::get_physical_balance_snapshot(state.root_owner_after);
+    auto const POST_NODE_ERROR = phys::snapshot_node_counters(state.post_clear_nodes, state.work);
+    virt::selftest_observe_page_table_pool(state.root_routes.roots[1].release.historical_root_bits, state.post_pool_after);
+    state.post_clear_accounting_valid = POST_NODE_ERROR == mm::NodeCounterError::NONE &&
+                                        post_clear_accounting_complete(state.post_clear_nodes, state.baseline, state.root_owner_after);
     virt::get_user_root_control_stats_snapshot(state.root_control_after);
+    if (!check(state.post_clear_accounting_valid, "complete post-clear node/physical conservation")) return false;
     constexpr auto PRIVATE = static_cast<size_t>(mm::PhysicalPageOwner::USER_PRIVATE_MAPPING);
     if (!check(state.root_owner_after.owners[PRIVATE].pages == state.root_owner_before.owners[PRIVATE].pages &&
                    state.root_owner_after.owners[PRIVATE].objects == state.root_owner_before.owners[PRIVATE].objects &&
@@ -1055,13 +1166,16 @@ auto run() -> bool {
                    state.root_control_after.control_pages == state.root_control_before.control_pages,
                "actual private mapping owner/root baseline restored"))
         return false;
-    for (auto owner : {mm::PhysicalPageOwner::PAGE_TABLE, mm::PhysicalPageOwner::PAGE_TABLE_POOL_RESERVE}) {
-        auto const index = static_cast<size_t>(owner);
-        if (!check(state.root_owner_after.owners[index].pages == state.root_owner_before.owners[index].pages &&
-                       state.root_owner_after.owners[index].objects == state.root_owner_before.owners[index].objects,
-                   "actual root page-table owner baseline restored"))
-            return false;
-    }
+    constexpr auto PT = static_cast<size_t>(mm::PhysicalPageOwner::PAGE_TABLE);
+    constexpr auto POOL = static_cast<size_t>(mm::PhysicalPageOwner::PAGE_TABLE_POOL_RESERVE);
+    bool const OLD_EXACT = state.root_owner_after.owners[PT].pages == state.root_owner_before.owners[PT].pages &&
+                           state.root_owner_after.owners[PT].objects == state.root_owner_before.owners[PT].objects &&
+                           state.root_owner_after.owners[POOL].pages == state.root_owner_before.owners[POOL].pages &&
+                           state.root_owner_after.owners[POOL].objects == state.root_owner_before.owners[POOL].objects;
+    if (!check(OLD_EXACT || root_retained_pool_conservation(state.root_routes, state.post_pool_before, state.post_pool_after,
+                                                            state.root_owner_before, state.root_owner_after),
+               "actual root page-table owner baseline restored"))
+        return false;
     auto const CLOSED = time_left(state.whole_deadline) &&
                         check(state.cleanup_valid && worker->ref_count.load(std::memory_order_acquire) == state.worker_refs,
                               "root/readers returned and exact worker observer holds preserved");

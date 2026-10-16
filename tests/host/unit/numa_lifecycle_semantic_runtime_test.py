@@ -255,6 +255,7 @@ def generate(root, source_root, scratch, capture, variant):
     for anchor in (
         "enum class SelftestRootAllocationSource",
         "enum class SelftestRootReturnDisposition",
+        "struct SelftestRootPoolInsertion",
         "struct SelftestRootReleaseOutput",
     ):
         root_declarations += definition(virt_header, anchor, True) + "\n"

@@ -177,21 +177,28 @@ try:
         signal.signal(s, interrupted)
     cpp, header, fixture = map(source_path, RELATIVE)
     chosen = [Path(__file__), HERE / "numa_root_route_fixture.inc",
-              HERE / "numa_root_route_shim/platform/sys/spinlock.hpp", cpp, header, fixture, cxx]
+              HERE / "numa_root_route_shim/platform/sys/spinlock.hpp", HERE / "numa_root_conservation_cases.inc", cpp, header, fixture, cxx, R / "modules/kern/src/platform/mm/phys.hpp"]
     if args.source_overlay:
         chosen.append(args.source_overlay.resolve())
     inputs_before = [pin(p) for p in chosen]
     source, h, f = cpp.read_text(), header.read_text(), fixture.read_text()
     types = definition(h, "struct PageTablePoolStatsSnapshot", ";") + "\n" + h[h.index("enum class SelftestRootAllocationSource"):h.index("struct SelftestRootCensus")]
     pool_types = source[source.index("constexpr size_t PAGE_TABLE_POOL_CAPACITY"):source.index("constexpr size_t OWNED_FRAME_TABLE_CAPACITY")]
-    pool = "\n\n".join(definition(source, marker) for marker in ["void zero_page_table_for_pool(", "auto try_alloc_page_table_from_pool(",
+    pool = "\n\n".join(definition(source, marker) for marker in ["auto page_table_pool_proof_begin_locked()", "auto page_table_pool_proof_end(", "void selftest_observe_page_table_pool(", "void get_page_table_pool_stats_snapshot(", "void zero_page_table_for_pool(", "auto try_alloc_page_table_from_pool(",
                  "auto try_release_page_table_to_pool(", "auto alloc_zeroed_page_table("])
     roots = definition(source, "class CurrentRootSemanticOperation", ";") + "\n"
     roots += "\n\n".join(definition(source, marker) for marker in ["auto return_root_to_emergency_reserve(", "void selftest_capture_root_release(",
                   "void release_unregistered_user_root(", "auto create_user_root_common(", "auto create_pagemap()", "auto create_pagemap_may_fail()",
                   "auto selftest_create_pagemap(", "void release_pagemap_exclusive_owned(", "void release_pagemap(PageTable*", "void selftest_release_pagemap("])
     diagnostic = "\n".join(definition(f, marker, ";") for marker in ["enum class RootFrontier", "struct RootRoute {", "struct RootFrontierSnapshot", "struct RootRouteDiagnostics"])
+    physical = (R / "modules/kern/src/platform/mm/phys.hpp").read_text()
+    physical_types = physical[physical.index("struct PhysicalOwnerSnapshot"):physical.index("enum class PageLookupOwner")]
+    physical_types += "\nusing NodeCounterSnapshot = node_counters::Snapshot;\n"
+    predicates = "\n".join(definition(f, marker) for marker in ["auto post_clear_accounting_complete(", "auto root_retained_pool_conservation("])
     generated = (HERE / "numa_root_route_fixture.inc").read_text()
+    generated = generated.replace("// WOS_TEST_INSERT_ACTUAL_PHYSICAL_TYPES", physical_types)
+    generated = generated.replace("// WOS_TEST_INSERT_ACTUAL_CONSERVATION_PREDICATES", predicates)
+    generated = generated.replace("// WOS_TEST_INSERT_CONSERVATION_CASES", (HERE / "numa_root_conservation_cases.inc").read_text())
     for marker, value in [("// WOS_TEST_INSERT_ACTUAL_OUTPUT_TYPES", types), ("// WOS_TEST_INSERT_ACTUAL_POOL_TYPES", pool_types), ("// WOS_TEST_INSERT_ACTUAL_POOL_FUNCTIONS", pool),
                           ("// WOS_TEST_INSERT_ACTUAL_ROOT_FUNCTIONS", roots), ("// WOS_TEST_INSERT_ACTUAL_DIAGNOSTIC_TYPES", diagnostic)]:
         if generated.count(marker) != 1: raise RuntimeError("fixture marker")
@@ -214,7 +221,17 @@ try:
     run("deps", flags + ["-M", "-MF", dep, "-MT", "unit", main])
     deps = sorted({Path(p).resolve() for p in shlex.split(dep.read_text().replace("\\\n", " ").split(":", 1)[1])})
     emitted_before = [pin(p) for p in deps]
-    for label, src, expected in [("actual", main, 0), ("mislabel", mutant1, 1), ("bypass", mutant2, 1)]:
+    extra_mutants = []
+    for label, needle, replacement in [
+        ("accept-saturated-receipt", "if (pool.proof_inflight == 0 || pool.proof_sequence >= UINT64_MAX - 1)", "if (pool.proof_inflight == 0 || pool.proof_sequence == UINT64_MAX)"),
+        ("early-transfer-end", "    zero_page_table_for_pool(table);", "    (void)page_table_pool_proof_end(TRACKED);\n    zero_page_table_for_pool(table);"),
+        ("ignore-generation", "p->sequence != returned.insertion.completed_sequence", "false"),
+        ("ignore-membership", "p->matching_entries != 1", "false"),
+        ("old-strict-closure", "check(virt::root_retained_pool_conservation(routes, before, after, a, b), \"exact retained owner accepted\");", "check(old_root_closure(a, b), \"exact retained owner accepted\");"),
+    ]:
+        if generated.count(needle) != 1: raise RuntimeError("genuine new mutation boundary " + label)
+        path = T / (label + ".cpp"); path.write_text(generated.replace(needle, replacement)); extra_mutants.append((label,path,1))
+    for label, src, expected in [("actual", main, 0), ("mislabel", mutant1, 1), ("bypass", mutant2, 1), *extra_mutants]:
         binary = T / label
         run("compile-" + label, flags + [src, "-pthread", "-o", binary])
         run("run-" + label, [binary], expected)

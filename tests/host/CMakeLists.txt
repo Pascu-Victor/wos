@@ -333,6 +333,11 @@ add_test(NAME managed_huge_runtime_test
         --host-build ${CMAKE_BINARY_DIR}
         --gtest-main $<TARGET_FILE:gtest_main> --gtest $<TARGET_FILE:gtest>)
 set_tests_properties(managed_huge_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 150)
+add_test(NAME managed_huge_fork_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/managed_huge_runtime_test.py
+        --host-build ${CMAKE_BINARY_DIR} --fork-contract-only
+        --gtest-main $<TARGET_FILE:gtest_main> --gtest $<TARGET_FILE:gtest>)
+set_tests_properties(managed_huge_fork_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 150)
 add_test(NAME kernel_direct_map_runtime_test
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/kernel_direct_map_runtime_test.py
         --cxx ${CMAKE_CXX_COMPILER} --negative-controls)

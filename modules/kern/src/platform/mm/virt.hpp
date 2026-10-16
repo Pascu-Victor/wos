@@ -27,6 +27,17 @@ struct AllocationContext;
 struct AllocationResult;
 }  // namespace ker::mod::mm::numa
 
+namespace ker::mod::sys {
+class SyscallPreparationScope;
+}
+namespace ker::syscall::vmem {
+class SharedVmemPublicationGuard;
+}
+namespace ker::mod::mm::huge {
+class RangeSplitSurvey;
+class PreparedTables;
+}  // namespace ker::mod::mm::huge
+
 namespace ker::mod::mm::virt {
 using namespace ker::mod::mm::addr;
 using namespace ker::mod::mm::paging;
@@ -324,8 +335,23 @@ void get_user_root_control_stats_snapshot(UserRootControlStats& out);
 // mutually nonaliasing options/output throughout the call. No pointer escapes.
 enum class SelftestRootAllocationSource : uint8_t { UNKNOWN, LEGACY_POOL, PHYSICAL_ALLOCATOR, EMERGENCY_RESERVE };
 enum class SelftestRootReturnDisposition : uint8_t { UNKNOWN, EMERGENCY_RETURNED, LEGACY_CACHED, PHYSICAL_RELEASED };
+// Historical identity and a clean completed ordinary-pool insertion, never a
+// returned frame reference. Zero sequence/inserted=false carry no authority.
+struct SelftestRootPoolInsertion {
+    uint64_t completed_sequence{};
+    bool inserted{};
+};
+struct SelftestPageTablePoolObservation {
+    uint64_t sequence{}, inflight{}, capacity{}, cached_pages{}, matching_entries{};
+    bool valid{};
+};
+// Copies at most64 owned pool pointer identities; never touches frame backing.
+// Caller owns named addressable output; no output write occurs under pool.lock.
+void selftest_observe_page_table_pool(uint64_t historical_root_bits, SelftestPageTablePoolObservation& output);
 struct SelftestRootReleaseOutput {
     uint64_t historical_pa{};
+    uint64_t historical_root_bits{};
+    SelftestRootPoolInsertion insertion{};
     uint32_t references{};
     PageKind kind{PageKind::UNKNOWN};
     SelftestRootReturnDisposition disposition{SelftestRootReturnDisposition::UNKNOWN};
@@ -624,6 +650,20 @@ bool deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst);
 // valid UMA LOCAL/mask0 delegates the unchanged legacy two-argument path.
 [[nodiscard]] auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst, numa::AllocationContext& context,
                                               numa::AllocationResult& output) -> bool;
+// Unwired prepared whole-root copy. Actual current PROCESS, ready preparation,
+// IF-off/preempt0 and a live blocking publication borrow are mandatory. Caller
+// exclusively owns the distinct registered never-active empty child, and all
+// survey/table/placement/output objects were born addressable before owners.
+// Requires a complete [0,2^47) survey even for count0. Eager context/output are
+// both supplied iff the existing eager decision is enabled. Returns private
+// negative errno; no public syscall or prepared metadata closure is implied.
+// Caller keeps all child-prefix and losing-result cleanup outside final owners.
+[[nodiscard]] auto deep_copy_current_user_pagemap_prepared(sched::task::Task& actor, PageTable* exclusively_unpublished_child,
+                                                           const sys::SyscallPreparationScope& preparation,
+                                                           const ker::syscall::vmem::SharedVmemPublicationGuard& publication,
+                                                           const huge::RangeSplitSurvey& survey, huge::PreparedTables& tables,
+                                                           numa::AllocationContext* eager_context,
+                                                           numa::AllocationResult* empty_result) noexcept -> int;
 #ifdef WOS_SELFTEST
 // Caller exclusively owns both distinct registered never-active mutable roots.
 // Same walker, local eager decision only. Controlled refusal is not PMM pressure.
