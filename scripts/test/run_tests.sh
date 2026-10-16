@@ -463,6 +463,7 @@ UNIT_TESTS=(
     numa_lifecycle_placement_diagnostics_test
     numa_lifecycle_helper_diagnostics_test
     numa_public_policy_runtime_test
+    numa_public_pressure_runtime_test
     numa_lifecycle_census_runtime_test
     numa_lifecycle_semantic_runtime_test
     numa_mm_activity_runtime_test

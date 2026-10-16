@@ -128,21 +128,68 @@ def generate_lifecycle_placement(actual, take, shell):
     return generated, variants
 
 
+def generate_pressure(actual, take, shell, callnums, wrappers):
+    """Actual guest algorithm and actual raw wrappers; finite explicit Host ports."""
+    types = actual[actual.index("struct Selection {"):actual.index("// These POD transport bytes")]
+    types += actual[actual.index("enum ClockValid :"):actual.index("auto now_ns(")]
+    types += actual[actual.index("constexpr uint64_t PRESSURE_MAX_BYTES"):actual.index("uint64_t pressure_hash(")]
+    template = actual[actual.index("template <class T>"):actual.index("enum ClockValid :")]
+    helpers = template + "\n".join(take(anchor) for anchor in [
+        "auto number(", "auto now_ns(", "auto deadline_after(", "auto before(", "auto raw_error(", "auto query(", "auto page_nodes(",
+        "auto await_cpu(", "auto pin_current_cpu(", "auto policy_read(", "auto policy_set(", "auto policy_matches(", "auto policy_topology(", "auto policy_usage("])
+    functions = "\n".join(take(anchor) for anchor in [
+        "uint64_t pressure_hash(", "void pressure_prefault_stack(", "auto pressure_options(", "void pressure_error(", "auto pressure_remaining(", "auto pressure_checkpoint(",
+        "auto pressure_verify(", "auto pressure_allocate(", "void pressure_release(", "auto pressure_snapshot(", "auto pressure_write(",
+        "void pressure_report(", "auto run_numa_pressure("])
+    def ports(body):
+        body = body.replace("::syscall(", "fixture::resource_call(").replace("ker::multiproc::", "fixture::")
+        for name in ("clock_gettime", "getpid", "getrlimit", "open", "close", "read", "write"):
+            body = re.sub(r"(?<![\w:])" + name + r"\(", "fixture::" + name + "(", body)
+        return body
+    generated = shell.read_text()
+    for marker, value in (("ACTUAL_CALLNUMS", "namespace ker::abi {\n" + callnums + "\n}"),
+                          ("ACTUAL_PRESSURE_TYPES", types), ("ACTUAL_RAW_WRAPPERS", wrappers),
+                          ("ACTUAL_PRESSURE_HELPERS", ports(helpers)), ("ACTUAL_PRESSURE_FUNCTIONS", ports(functions))):
+        token = "/* @" + marker + "@ */"
+        if generated.count(token) != 1:
+            raise ValueError("unique actual pressure marker: " + marker)
+        generated = generated.replace(token, value)
+    variants = {"actual": generated}
+    for name, old, new in [
+        ("lost-preferred-foreign", "(foreign ? row.node == state.target : row.node != state.target)", "(foreign ? false : row.node != state.target)"),
+        ("lost-bind-node", "(foreign ? row.node == state.target : row.node != state.target)", "(foreign ? row.node == state.target : false)"),
+        ("lost-recovery-failure", "if(rc==0)rc=pressure_allocate(s,PAGE,probe_deadline,false,s.recovery_rc,sentinel);", "if(rc==0){(void)pressure_allocate(s,PAGE,probe_deadline,false,s.recovery_rc,sentinel);rc=0;}"),
+        ("lost-as-charge", "u.current == state.baseline.current + state.owned_bytes", "true"),
+        ("lost-owned-unmap", "entry.release_rc = ker::vmem::free(reinterpret_cast<void*>(entry.address), entry.bytes);", "entry.release_rc = 0;"),
+        ("lost-cap-error", "return -E2BIG;", "return -ENOMEM;"),
+        ("lost-deadline", "return before(bound) && before(state.deadline);", "return true;"),
+        ("lost-output-sentinel", "return signed_result; // Return error code", "*addr = nullptr; return signed_result; // actual raw output control"),
+    ]:
+        tokens = re.findall(r"[A-Za-z_][A-Za-z_0-9]*|[0-9]+|[^\s]", old)
+        pattern = r"(?<![A-Za-z_0-9])" + r"\s*".join(re.escape(token) for token in tokens) + r"(?![A-Za-z_0-9])"
+        if len(re.findall(pattern, generated)) != 1:
+            raise ValueError("unique actual pressure control: " + name)
+        variants[name] = re.sub(pattern, lambda _: new, generated)
+    return generated, variants
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--source", type=Path)
+    parser.add_argument("--pressure-only", action="store_true", help="exercise actual public pressure workload on finite raw ABI ports")
     parser.add_argument("--workload-wait", action="store_true", help="exercise failure-only testprog wait observations")
     parser.add_argument("--workload-placement", action="store_true", help="exercise actual lifecycle ready/controller placement on finite endpoints")
     parser.add_argument("--public-policy", action="store_true", help="exercise actual healthy public-policy guest bodies on finite ports")
     parser.add_argument("--predecessor", type=Path)
     parser.add_argument("--evidence-dir", type=Path)
     args = parser.parse_args()
-    if sum((args.workload_wait, args.public_policy, args.workload_placement)) > 1:
+    if sum((args.workload_wait, args.public_policy, args.workload_placement, args.pressure_only)) > 1:
         parser.error("select one explicit profile")
     root = args.root.resolve(strict=True)
-    source = (args.source or root / ("modules/testprog/src/numa_locality.cpp" if args.workload_wait or args.public_policy or args.workload_placement else "tests/fixtures/numa_lifecycle_census.cpp")).resolve(strict=True)
-    shell = (Path(__file__).with_name("numa_lifecycle_placement_test.inc") if args.workload_placement else
+    source = (args.source or root / ("modules/testprog/src/numa_locality.cpp" if args.workload_wait or args.public_policy or args.workload_placement or args.pressure_only else "tests/fixtures/numa_lifecycle_census.cpp")).resolve(strict=True)
+    shell = (Path(__file__).with_name("numa_pressure_cases.inc") if args.pressure_only else
+             Path(__file__).with_name("numa_lifecycle_placement_test.inc") if args.workload_placement else
              Path(__file__).with_name("numa_policy_cases.inc") if args.public_policy else
              Path(__file__).with_name("numa_lifecycle_wait_diagnostics_test.inc") if args.workload_wait else Path(__file__).with_suffix(".inc"))
     helper_path = root / "tests/host/unit/file_mmap_registry_runtime_test.py"
@@ -167,6 +214,9 @@ def main():
         watched.append(libc_wait)
     if args.public_policy:
         watched.append(Path(__file__).resolve().parents[2] / "fixtures/validate_numa_policy.py")
+    if args.pressure_only:
+        watched.extend([root / "toolchain/src/mlibc/sysdeps/wos/include/sys/vmem.h",
+                        Path(__file__).resolve().parents[2] / "fixtures/validate_numa_pressure.py"])
     selected_compiler = os.environ.get("WOS_HOST_CXX", "/usr/bin/clang++")
     compiler = Path(shutil.which(selected_compiler) or selected_compiler).absolute()
     watched.extend([compiler, compiler.resolve(strict=True)])
@@ -234,7 +284,20 @@ def main():
             extracted.append(row)
             return body
 
-        if args.workload_placement:
+        if args.pressure_only:
+            callnums, row = capture(watched[4].read_text(), "enum class callnums :", declaration=True)
+            extracted.append(row)
+            raw = (root / "toolchain/src/mlibc/sysdeps/wos/include/sys/vmem.h").read_text()
+            wrappers = []
+            for anchor in ("static inline int64_t\nallocate(", "static inline int64_t free(", "static inline int64_t query_numa(", "static inline int64_t set_memory_policy("):
+                body, row = capture(raw, anchor)
+                extracted.append(row)
+                wrappers.append(body.replace("syscall(", "fixture::vmem_call("))
+            generated, variants = generate_pressure(actual, take, shell, callnums, "\n".join(wrappers))
+            result["extractions"] = extracted
+            result["profile"] = "public-pressure-actual-guest-and-raw-wrappers-finite-ports"
+            result["endpoint_limits"] = "Finite ABI, mapped bytes, AS and snapshot bytes; no physical allocator, PMM exhaustion or runtime snapshot authority"
+        elif args.workload_placement:
             generated, variants = generate_lifecycle_placement(actual, take, shell)
             result["extractions"] = extracted
             result["profile"] = "lifecycle-placement-actual-frontiers-finite-endpoints"
@@ -401,6 +464,12 @@ def main():
                     sample = text.split(begin)[1].split(end)[0]
                     result["saved_only_decodes"].append(decoder.decode(sample, 19601, domains, 4))
             binary.unlink()
+        if args.pressure_only:
+            decoder_path = Path(__file__).resolve().parents[2] / "fixtures/validate_numa_pressure.py"
+            decoder_spec = importlib.util.spec_from_file_location("saved_pressure_schema", decoder_path)
+            decoder = importlib.util.module_from_spec(decoder_spec)
+            decoder_spec.loader.exec_module(decoder)
+            result["saved_only_codec_controls"] = decoder.selftest()
         result["pass_"] = True
     except BaseException as error:
         result["errors"].append(type(error).__name__ + ": " + str(error))

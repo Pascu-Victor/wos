@@ -1786,7 +1786,37 @@ def test_numa_lifecycle_proves_inheritance_before_controller_placement() -> None
         fail("existing payload transport ABI changed")
 
 
+def test_numa_public_pressure_preserves_eager_ownership_and_observation_frontiers() -> None:
+    source = NUMA_LOCALITY_CPP.read_text()
+    body = source[source.index("constexpr uint64_t PRESSURE_MAX_BYTES"):]
+    require_tokens("".join(body.split()), ["".join(token.split()) for token in ["PRESSURE_MAX_ENTRIES = 4096", "PRESSURE_SNAPSHOT_BYTES = 262144",
+        "ker::vmem::allocate(&output, bytes, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS)",
+        "entry.owned = true", "pressure_verify(state, entry, false, foreign, deadline)",
+        "row.status != static_cast<uint16_t>(abi::PageStatus::RESIDENT)",
+        "foreign ? row.node == state.target : row.node != state.target",
+        "for (size_t j = 0; j < PAGE; ++j)", "if (value != 0) return -EILSEQ",
+        "rc = INT64_MIN; sentinel = -1", "return sentinel ? rc : -EPROTO",
+        "u.current == state.baseline.current + state.owned_bytes", "u.denied == state.baseline.denied",
+        "u.limit.soft == state.baseline.limit.soft", "state.used >= PRESSURE_MAX_ENTRIES",
+        "if(chunk!=PAGE)", "s.strict_rc=raw", "s.preferred_index=s.used", "s.recovery_index=s.used",
+        "ker::vmem::free(reinterpret_cast<void*>(entry.address), entry.bytes)",
+        "pressure_verify(state, entry, true, false, state.deadline)",
+        "if(saved&&s.owned_bytes==0)", "if(s.owned_bytes==0&&s.snapshots[2].fd>=0)",
+        "s.work_deadline=s.deadline-45000*NS_PER_MS", "s.fill_deadline>s.work_deadline",
+        "static_cast<uint32_t>(s.baseline.reason)>3", "physical_closure", "OPEN", "UNPROVED"]],
+        "public eager pressure bounds, truthful raw API and exact logical ownership")
+    require_order("".join(body.split()), "entry.owned=true", "returnpressure_verify(state,entry,false", "own allocation before any observation refusal")
+    require_order("".join(body.split()), "initialize_transport(s)", "while(rc==0)", "fixed transport resident before fill")
+    require_order("".join(body.split()), "s.payload_clean=", "s.recovery_index=s.used", "one recovery after full payload cleanup")
+    require_order("".join(body.split()), "pressure_release(s,0,s.used)", "pressure_report(s)", "defer reports until pressure cleanup")
+    if "setrlimit(" in body or "mprotect(" in body or "reclaim" in function_body(source, "run_numa_pressure"):
+        fail("pressure workload cannot change limits/protections or invoke reclaim")
+    if '"numa-pressure"' not in TESTPROG_MAIN_CPP.read_text():
+        fail("separate opt-in pressure entrypoint missing")
+
+
 def main() -> None:
+    test_numa_public_pressure_preserves_eager_ownership_and_observation_frontiers()
     test_numa_lifecycle_proves_inheritance_before_controller_placement()
     test_numa_public_policy_uses_real_actor_placement_and_quota_frontiers()
     test_numa_wait_diagnostics_capture_original_frontiers_before_cleanup()

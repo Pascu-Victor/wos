@@ -2214,3 +2214,8 @@ set_tests_properties(prepared_fork_metadata_runtime_test PROPERTIES LABELS "unit
 # Python-owned unit programs retain their actual category; source checks are separate.
 set_tests_properties(rootfs_directory_policy_test serial_fifo_test
     ptrace_deferred_yield_test ptrace_namespace_test PROPERTIES LABELS "host;unit")
+
+add_test(NAME numa_public_pressure_runtime_test
+    COMMAND ${CMAKE_COMMAND} -E env WOS_HOST_CXX=${CMAKE_CXX_COMPILER}
+        ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_lifecycle_helper_diagnostics_test.py --pressure-only)
+set_tests_properties(numa_public_pressure_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 80)

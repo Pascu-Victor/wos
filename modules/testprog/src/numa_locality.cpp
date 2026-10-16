@@ -1775,3 +1775,481 @@ auto run_numa_policy(int argc, char** argv) -> int {
         static_cast<long long>(rc));
     return PASS ? 0 : 1;
 }
+
+namespace {
+// Public logical protocol only. Per-domain/all-owner physical closure is a
+// separate qualification: empty page tables and ordinary actors remain visible.
+constexpr uint64_t PRESSURE_MAX_BYTES = uint64_t{4} << 30;
+constexpr uint32_t PRESSURE_MAX_ENTRIES = 4096;
+constexpr size_t PRESSURE_SNAPSHOT_BYTES = 262144;
+constexpr uint64_t PRESSURE_FNV_OFFSET = 14695981039346656037ULL;
+constexpr uint64_t PRESSURE_FNV_PRIME = 1099511628211ULL;
+struct PressureOptions {
+    uint64_t nonce{};
+    uint32_t domains{}, timeout_ms{}, fill_ms{}, probe_ms{};
+};
+struct PressureEntry {
+    uint64_t address{}, bytes{}, digest{};
+    int64_t allocate_rc{}, query_rc{}, release_rc{};
+    uint32_t resident{}, zero_pages{}, unavailable{};
+    uint16_t node{};
+    bool owned{}, output_changed{};
+};
+struct PressureCheckpoint {
+    ker::abi::resource::Usage usage{};
+    uint64_t cpu{}, affinity{}, policy_mask{}, owned_bytes{}, stamp{};
+    int64_t usage_rc{}, policy_rc{}, error{};
+    uint32_t policy_mode{};
+};
+struct PressureSnapshot {
+    std::array<char, PRESSURE_SNAPSHOT_BYTES> data{};
+    uint64_t bytes{}, digest{}, stamp{};
+    int fd{}, error{};
+};
+struct PressureState {
+    PressureOptions options{};
+    Topology topology{};
+    QueryBuffers query{};
+    abi::SelfPolicy original_policy{}, observed_policy{};
+    Selection actor{};
+    rlimit limits{};
+    ker::abi::resource::Usage baseline{};
+    std::array<PressureEntry, PRESSURE_MAX_ENTRIES> entries{};
+    std::array<PressureCheckpoint, 8> checkpoints{};
+    std::array<PressureSnapshot, 4> snapshots{};
+    std::array<char, 2048> line{};
+    uint64_t tid{}, pid{}, original_affinity{}, deadline{}, fill_deadline{}, work_deadline{}, owned_bytes{}, high_bytes{}, peak{};
+    uint64_t attempted{}, released{}, requested_pages{}, released_pages{}, report_bytes{};
+    int64_t first_error{}, cleanup_error{}, strict_rc{}, strict_output{}, large_rc{}, large_output{}, preferred_rc{}, recovery_rc{};
+    int64_t policy_restore{}, affinity_restore{};
+    uint32_t used{}, prefix{}, preferred_index{}, recovery_index{}, target{};
+    bool prepared{}, strict{}, fallback{}, prefix_checked{}, payload_clean{}, recovered{}, restored{};
+};
+static PressureState pressure_state;
+
+uint64_t pressure_hash(const char* bytes, size_t count) {
+    uint64_t value = PRESSURE_FNV_OFFSET;
+    for (size_t i = 0; i < count; ++i) value = (value ^ static_cast<unsigned char>(bytes[i])) * PRESSURE_FNV_PRIME;
+    return value;
+}
+// A real callee frame warms the later small syscall-helper stack area. Keeping
+// this call out of line prevents an optimizer from moving it into the caller's
+// already allocated frame above the stack pointer.
+[[gnu::noinline]] void pressure_prefault_stack() {
+    volatile unsigned char bytes[32768];
+    for (size_t i = 0; i < sizeof(bytes); ++i) bytes[i] = 0;
+}
+auto pressure_options(int argc, char** argv, PressureOptions& out) -> bool {
+    out.timeout_ms = 300000;
+    out.fill_ms = 180000;
+    out.probe_ms = 5000;
+    unsigned seen = 0;
+    for (int i = 0; i < argc; ++i) {
+        if (i + 1 >= argc) return false;
+        const char* key = argv[i++];
+        uint64_t value{};
+        if (!number(argv[i], value)) return false;
+        unsigned bit{};
+        if (std::strcmp(key, "--nonce") == 0 && value) {
+            bit = 1;
+            out.nonce = value;
+        } else if (std::strcmp(key, "--domains") == 0 && value == 2) {
+            bit = 2;
+            out.domains = 2;
+        } else if (std::strcmp(key, "--timeout-ms") == 0 && value >= 60000 && value <= 300000) {
+            bit = 4;
+            out.timeout_ms = value;
+        } else if (std::strcmp(key, "--fill-ms") == 0 && value >= 1 && value <= 180000) {
+            bit = 8;
+            out.fill_ms = value;
+        } else if (std::strcmp(key, "--probe-ms") == 0 && value >= 1 && value <= 5000) {
+            bit = 16;
+            out.probe_ms = value;
+        } else
+            return false;
+        if (seen & bit) return false;
+        seen |= bit;
+    }
+    return (seen & 3) == 3;
+}
+void pressure_error(PressureState& state, int64_t error, bool cleanup = false) {
+    if (error == 0) return;
+    if (state.first_error == 0) state.first_error = error;
+    if (cleanup && state.cleanup_error == 0) state.cleanup_error = error;
+}
+auto pressure_remaining(PressureState& state, uint64_t bound) -> bool { return before(bound) && before(state.deadline); }
+auto pressure_checkpoint(PressureState& state, PressureCheckpoint& out, uint32_t mode, uint64_t mask) -> int64_t {
+    initialize_transport(out);
+    out.owned_bytes = state.owned_bytes;
+    out.cpu = ker::multiproc::getcurrent_cpu();
+    out.affinity = ker::multiproc::getThreadAffinityMask(state.tid);
+    out.policy_rc = policy_read(state.query, state.observed_policy);
+    out.policy_mode = state.observed_policy.mode;
+    out.policy_mask = state.observed_policy.nodes;
+    out.usage_rc = policy_usage(out.usage);
+    if (!now_ns(out.stamp)) return out.error = -EIO;
+    auto const& u = out.usage;
+    state.peak = state.peak < state.baseline.current + state.high_bytes ? state.baseline.current + state.high_bytes : state.peak;
+    bool const valid = out.usage_rc == 0 && out.policy_rc == 0 && u.reserved == 0 && out.cpu == state.actor.cpu &&
+                       out.affinity == (uint64_t{1} << state.actor.cpu) && out.policy_mode == mode && out.policy_mask == mask &&
+                       u.current == state.baseline.current + state.owned_bytes && u.peak == state.peak &&
+                       u.denied == state.baseline.denied && u.reason == state.baseline.reason &&
+                       u.limit.soft == state.baseline.limit.soft && u.limit.hard == state.baseline.limit.hard;
+    return out.error = valid ? 0 : -EPROTO;
+}
+auto pressure_verify(PressureState& state, PressureEntry& entry, bool unavailable, bool foreign, uint64_t deadline) -> int64_t {
+    uint32_t const pages = entry.bytes / PAGE;
+    if (!unavailable) {
+        entry.resident = entry.zero_pages = 0;
+        entry.digest = PRESSURE_FNV_OFFSET;
+    } else
+        entry.unavailable = 0;
+    for (uint32_t first = 0; first < pages; first += abi::MAX_PAGE_NODES) {
+        if (!pressure_remaining(state, deadline)) return -ETIMEDOUT;
+        uint32_t const count = pages - first < abi::MAX_PAGE_NODES ? pages - first : abi::MAX_PAGE_NODES;
+        entry.query_rc = page_nodes(state.query, reinterpret_cast<void*>(entry.address + uint64_t{first} * PAGE), count);
+        if (entry.query_rc != 0) return entry.query_rc;
+        for (uint32_t i = 0; i < count; ++i) {
+            auto const& row = state.query.pages[i];
+            if (row.reserved32 != 0) return -EPROTO;
+            if (unavailable) {
+                if (row.status != static_cast<uint16_t>(abi::PageStatus::UNAVAILABLE) || row.node != abi::INVALID_NODE) return -EPROTO;
+                ++entry.unavailable;
+                continue;
+            }
+            if (row.status != static_cast<uint16_t>(abi::PageStatus::RESIDENT) || row.node >= 2 ||
+                (foreign ? row.node == state.target : row.node != state.target))
+                return -EPROTO;
+            if (entry.resident != 0 && entry.node != row.node) return -EPROTO;
+            entry.node = row.node;
+            ++entry.resident;
+            auto const* bytes = reinterpret_cast<volatile const unsigned char*>(entry.address + uint64_t{first + i} * PAGE);
+            for (size_t j = 0; j < PAGE; ++j) {
+                unsigned char const value = bytes[j];
+                if (value != 0) return -EILSEQ;
+                entry.digest = (entry.digest ^ value) * PRESSURE_FNV_PRIME;
+            }
+            ++entry.zero_pages;
+        }
+    }
+    return pressure_remaining(state, deadline) ? 0 : -ETIMEDOUT;
+}
+auto pressure_allocate(PressureState& state, uint64_t bytes, uint64_t deadline, bool foreign, int64_t& rc, int64_t& sentinel) -> int64_t {
+    rc = INT64_MIN;
+    sentinel = -1;  // Explicit uncalled raw-output state on admission refusal.
+    if (state.used >= PRESSURE_MAX_ENTRIES || bytes > PRESSURE_MAX_BYTES - state.owned_bytes) return -E2BIG;
+    if (!pressure_remaining(state, deadline)) return -ETIMEDOUT;
+    void* output = reinterpret_cast<void*>(uintptr_t{0x101});
+    ++state.attempted;
+    rc = ker::vmem::allocate(&output, bytes, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS);
+    sentinel = output == reinterpret_cast<void*>(uintptr_t{0x101});  // Immediately copied raw result/output.
+    if (rc != 0) {
+        if (!pressure_remaining(state, deadline)) return -ETIMEDOUT;
+        return sentinel ? rc : -EPROTO;
+    }
+    auto& entry = state.entries[state.used++];
+    entry.address = reinterpret_cast<uint64_t>(output);
+    entry.bytes = bytes;
+    entry.allocate_rc = rc;
+    entry.release_rc = INT64_MIN;
+    entry.output_changed = !sentinel;
+    entry.owned = true;  // Own before any query/validation can fail.
+    state.owned_bytes += bytes;
+    state.requested_pages += bytes / PAGE;
+    if (state.owned_bytes > state.high_bytes) state.high_bytes = state.owned_bytes;
+    if (sentinel || entry.address == 0 || entry.address % PAGE || entry.address > UINT64_MAX - bytes) return -EPROTO;
+    return pressure_verify(state, entry, false, foreign, deadline);
+}
+void pressure_release(PressureState& state, uint32_t first, uint32_t end) {
+    for (uint32_t i = first; i < end; ++i) {
+        auto& entry = state.entries[i];
+        if (!entry.owned) continue;
+        bool const timely = before(state.deadline);
+        entry.release_rc = ker::vmem::free(reinterpret_cast<void*>(entry.address), entry.bytes);
+        if (entry.release_rc == 0) {
+            entry.owned = false;
+            state.owned_bytes -= entry.bytes;
+            ++state.released;
+            state.released_pages += entry.bytes / PAGE;
+            pressure_error(state, pressure_verify(state, entry, true, false, state.deadline), true);
+        } else
+            pressure_error(state, entry.release_rc, true);
+        if (!timely || !before(state.deadline)) pressure_error(state, -ETIMEDOUT, true);
+    }
+}
+auto pressure_snapshot(PressureState& state, PressureSnapshot& snapshot) -> bool {
+    while (snapshot.bytes < PRESSURE_SNAPSHOT_BYTES) {
+        if (!before(state.deadline)) {
+            snapshot.error = ETIMEDOUT;
+            break;
+        }
+        ssize_t const got = read(snapshot.fd, snapshot.data.data() + snapshot.bytes, PRESSURE_SNAPSHOT_BYTES - snapshot.bytes);
+        int const error = got < 0 ? errno : 0;
+        if (got < 0) {
+            if (error == EINTR) continue;
+            snapshot.error = error;
+            break;
+        }
+        if (got == 0) break;
+        snapshot.bytes += static_cast<uint64_t>(got);
+    }
+    snapshot.digest = pressure_hash(snapshot.data.data(), snapshot.bytes);
+    bool const complete = snapshot.error == 0 && snapshot.bytes > 0 && snapshot.bytes < PRESSURE_SNAPSHOT_BYTES &&
+                          snapshot.data[snapshot.bytes - 1] == '\n' && now_ns(snapshot.stamp);
+    int const closed = close(snapshot.fd);
+    int const close_error = closed < 0 ? errno : 0;
+    snapshot.fd = -1;
+    if (closed != 0) snapshot.error = close_error;
+    if (!complete || snapshot.error) pressure_error(state, snapshot.error ? -snapshot.error : -EPROTO);
+    return complete && snapshot.error == 0;
+}
+// Reporting occurs only after payload release and recovery. Fixed formatting and
+// raw write loops do not allocate any new measured backing during exhaustion.
+auto pressure_write(const char* bytes, size_t count) -> bool {
+    while (count) {
+        ssize_t const put = write(STDOUT_FILENO, bytes, count);
+        if (put < 0 && errno == EINTR) continue;
+        if (put <= 0) return false;
+        bytes += put;
+        count -= static_cast<size_t>(put);
+    }
+    return true;
+}
+void pressure_report(PressureState& s) {
+    auto emit = [&](int size) {
+        if (size < 0 || static_cast<size_t>(size) >= s.line.size() || s.report_bytes + static_cast<uint64_t>(size) > (4U << 20)) {
+            pressure_error(s, -E2BIG);
+            return;
+        }
+        s.report_bytes += static_cast<uint64_t>(size);
+        if (!pressure_write(s.line.data(), size)) pressure_error(s, -EIO);
+    };
+    emit(std::snprintf(s.line.data(), s.line.size(),
+                       "NUMA_PRESSURE "
+                       "{\"type\":\"begin\",\"version\":1,\"nonce\":%llu,\"domains\":2,\"pid\":%llu,\"tid\":%llu,\"timeout_ms\":%u,\"fill_"
+                       "ms\":%u,\"probe_ms\":%u,\"cleanup_ms\":45000,\"max_bytes\":4294967296,\"max_entries\":4096}\n",
+                       static_cast<unsigned long long>(s.options.nonce), static_cast<unsigned long long>(s.pid),
+                       static_cast<unsigned long long>(s.tid), s.options.timeout_ms, s.options.fill_ms, s.options.probe_ms));
+    for (unsigned i = 0; i < 2; ++i)
+        emit(std::snprintf(s.line.data(), s.line.size(),
+                           "NUMA_PRESSURE {\"type\":\"node\",\"nonce\":%llu,\"node\":%u,\"managed\":%llu,\"cpu_mask\":%llu}\n",
+                           static_cast<unsigned long long>(s.options.nonce), i,
+                           static_cast<unsigned long long>(s.topology.nodes[i].managed_bytes),
+                           static_cast<unsigned long long>(s.topology.nodes[i].cpu_words[0])));
+    constexpr const char* phases[]{"prepared",       "bind-prefix",     "strict-refusal", "preferred",
+                                   "prefix-recheck", "payload-cleanup", "recovery"};
+    for (unsigned i = 0; i < 7; ++i) {
+        auto const& c = s.checkpoints[i];
+        auto const& u = c.usage;
+        emit(std::snprintf(s.line.data(), s.line.size(),
+                           "NUMA_PRESSURE "
+                           "{\"type\":\"%s\",\"nonce\":%llu,\"cpu\":%llu,\"affinity\":%llu,\"mode\":%u,\"mask\":%llu,\"target\":%u,\"owned_"
+                           "bytes\":%llu,\"as_current\":%llu,\"as_peak\":%llu,\"as_denied\":%llu,\"as_reason\":%u,\"as_soft\":%llu,\"as_"
+                           "hard\":%llu,\"usage_rc\":%lld,\"policy_rc\":%lld,\"error\":%lld,\"stamp\":%llu}\n",
+                           phases[i], static_cast<unsigned long long>(s.options.nonce), static_cast<unsigned long long>(c.cpu),
+                           static_cast<unsigned long long>(c.affinity), c.policy_mode, static_cast<unsigned long long>(c.policy_mask),
+                           s.target, static_cast<unsigned long long>(c.owned_bytes), static_cast<unsigned long long>(u.current),
+                           static_cast<unsigned long long>(u.peak), static_cast<unsigned long long>(u.denied),
+                           static_cast<unsigned>(u.reason), static_cast<unsigned long long>(u.limit.soft),
+                           static_cast<unsigned long long>(u.limit.hard), static_cast<long long>(c.usage_rc),
+                           static_cast<long long>(c.policy_rc), static_cast<long long>(c.error), static_cast<unsigned long long>(c.stamp)));
+    }
+    for (uint32_t i = 0; i < s.used; ++i) {
+        auto const& e = s.entries[i];
+        emit(std::snprintf(s.line.data(), s.line.size(),
+                           "NUMA_PRESSURE "
+                           "{\"type\":\"entry\",\"nonce\":%llu,\"index\":%u,\"role\":\"%s\",\"address\":%llu,\"bytes\":%llu,\"node\":%u,"
+                           "\"resident\":%u,\"zero_pages\":%u,\"unavailable\":%u,\"digest\":%llu,\"allocate_rc\":%lld,\"release_rc\":%lld,"
+                           "\"output_changed\":%u,\"owned\":%u}\n",
+                           static_cast<unsigned long long>(s.options.nonce), i,
+                           i < s.prefix             ? "bind"
+                           : i == s.preferred_index ? "preferred"
+                                                    : "recovery",
+                           static_cast<unsigned long long>(e.address), static_cast<unsigned long long>(e.bytes), e.node, e.resident,
+                           e.zero_pages, e.unavailable, static_cast<unsigned long long>(e.digest), static_cast<long long>(e.allocate_rc),
+                           static_cast<long long>(e.release_rc), static_cast<unsigned>(e.output_changed), static_cast<unsigned>(e.owned)));
+    }
+    bool const pass = s.first_error == 0 && s.prepared && s.strict && s.fallback && s.prefix_checked && s.payload_clean && s.recovered &&
+                      s.restored && s.owned_bytes == 0 && before(s.deadline);
+    emit(std::snprintf(
+        s.line.data(), s.line.size(),
+        "NUMA_PRESSURE "
+        "{\"type\":\"final\",\"nonce\":%llu,\"pass\":%u,\"first_error\":%lld,\"cleanup_error\":%lld,\"large_rc\":%lld,\"large_sentinel\":%"
+        "lld,\"strict_rc\":%lld,\"strict_sentinel\":%lld,\"preferred_rc\":%lld,\"recovery_rc\":%lld,\"attempted\":%llu,\"released\":%llu,"
+        "\"outstanding\":%llu,\"high_bytes\":%llu,\"policy_restore\":%lld,\"affinity_restore\":%lld,\"original_mode\":%u,\"original_mask\":"
+        "%llu,\"original_affinity\":%llu,\"prefix_entries\":%u,\"physical_closure\":\"OPEN\",\"metadata_cause\":\"UNPROVED\",\"final_as_"
+        "current\":%llu,\"final_as_peak\":%llu,\"final_as_denied\":%llu,\"final_usage_rc\":%lld,\"final_checkpoint_error\":%lld}\n",
+        static_cast<unsigned long long>(s.options.nonce), static_cast<unsigned>(pass), static_cast<long long>(s.first_error),
+        static_cast<long long>(s.cleanup_error), static_cast<long long>(s.large_rc), static_cast<long long>(s.large_output),
+        static_cast<long long>(s.strict_rc), static_cast<long long>(s.strict_output), static_cast<long long>(s.preferred_rc),
+        static_cast<long long>(s.recovery_rc), static_cast<unsigned long long>(s.attempted), static_cast<unsigned long long>(s.released),
+        static_cast<unsigned long long>(s.owned_bytes), static_cast<unsigned long long>(s.high_bytes),
+        static_cast<long long>(s.policy_restore), static_cast<long long>(s.affinity_restore), s.original_policy.mode,
+        static_cast<unsigned long long>(s.original_policy.nodes), static_cast<unsigned long long>(s.original_affinity), s.prefix,
+        static_cast<unsigned long long>(s.checkpoints[7].usage.current), static_cast<unsigned long long>(s.checkpoints[7].usage.peak),
+        static_cast<unsigned long long>(s.checkpoints[7].usage.denied), static_cast<long long>(s.checkpoints[7].usage_rc),
+        static_cast<long long>(s.checkpoints[7].error)));
+    for (unsigned i = 0; i < 4; ++i) {
+        auto const& b = s.snapshots[i];
+        emit(std::snprintf(s.line.data(), s.line.size(),
+                           "NUMA_PRESSURE_RAW version=1 nonce=%llu phase=%s kind=%s bytes=%llu fnv1a64=%llu stamp=%llu capture=%u\n",
+                           static_cast<unsigned long long>(s.options.nonce), i < 2 ? "before" : "after", i % 2 ? "zones" : "summary",
+                           static_cast<unsigned long long>(b.bytes), static_cast<unsigned long long>(b.digest),
+                           static_cast<unsigned long long>(b.stamp), i + 1));
+        if (s.report_bytes + b.bytes > (4U << 20))
+            pressure_error(s, -E2BIG);
+        else {
+            s.report_bytes += b.bytes;
+            if (!pressure_write(b.data.data(), b.bytes)) pressure_error(s, -EIO);
+        }
+        emit(std::snprintf(s.line.data(), s.line.size(), "NUMA_PRESSURE_RAW_END nonce=%llu capture=%u\n",
+                           static_cast<unsigned long long>(s.options.nonce), i + 1));
+    }
+}
+}  // namespace
+
+auto run_numa_pressure(int argc, char** argv) -> int {
+    auto& s = pressure_state;
+    initialize_transport(s);  // All fixed buffers and ledger become resident before pressure.
+    for (auto& snap : s.snapshots) snap.fd = -1;
+    s.preferred_index = s.recovery_index = UINT32_MAX;
+    s.large_rc = s.strict_rc = s.preferred_rc = s.recovery_rc = s.policy_restore = s.affinity_restore = INT64_MIN;
+    s.large_output = s.strict_output = -1;
+    if (!pressure_options(argc, argv, s.options)) return 2;
+    pressure_prefault_stack();
+    (void)setvbuf(stdout, nullptr, _IONBF, 0);
+    s.pid = getpid();
+    s.tid = ker::multiproc::currentThreadId();
+    if (!s.pid || s.pid != s.tid || raw_error(s.tid) || !deadline_after(s.options.timeout_ms, s.deadline)) return 2;
+    s.work_deadline = s.deadline - 45000 * NS_PER_MS;
+    uint64_t now{};
+    if (!now_ns(now)) return 2;
+    s.fill_deadline = now + uint64_t{s.options.fill_ms} * NS_PER_MS;
+    if (s.fill_deadline > s.work_deadline) s.fill_deadline = s.work_deadline;
+    int64_t rc = policy_topology(s.query, s.topology, 2);
+    s.original_affinity = ker::multiproc::getThreadAffinityMask(s.tid);
+    bool saved = false;
+    uint64_t const online =
+        rc == 0 ? (s.topology.summary.cpu_count == 64 ? UINT64_MAX : (uint64_t{1} << s.topology.summary.cpu_count) - 1) : 0;
+    if (rc == 0 && (!s.original_affinity || (s.original_affinity & ~online))) rc = -EPROTO;
+    if (rc == 0) rc = policy_read(s.query, s.original_policy);
+    if (rc == 0) {
+        saved = true;
+        rc = pin_current_cpu(s.topology, s.actor, s.work_deadline);
+    }
+    s.target = 1 - s.actor.node;
+    if (rc == 0) {
+        int const got = getrlimit(RLIMIT_AS, &s.limits);
+        rc = got == 0 ? 0 : -errno;
+    }
+    const char* files[]{"/proc/memacc/summary", "/proc/memacc/zones", "/proc/memacc/summary", "/proc/memacc/zones"};
+    for (unsigned i = 0; i < 4 && rc == 0; ++i) {
+        s.snapshots[i].fd = open(files[i], O_RDONLY | O_CLOEXEC);
+        if (s.snapshots[i].fd < 0) rc = -errno;
+    }
+    if (rc == 0) rc = policy_set(2, uint64_t{1} << s.target);
+    if (rc == 0 && !policy_matches(s.query, 2, uint64_t{1} << s.target)) rc = -EPROTO;
+    if (rc == 0 && (!pressure_snapshot(s, s.snapshots[0]) || !pressure_snapshot(s, s.snapshots[1]))) rc = s.first_error;
+    if (rc == 0) rc = policy_usage(s.baseline);
+    s.peak = s.baseline.peak;
+    if (rc == 0 &&
+        (s.baseline.reserved || static_cast<uint32_t>(s.baseline.reason) > 3 || s.baseline.denied == UINT64_MAX ||
+         s.baseline.limit.soft != s.limits.rlim_cur || s.baseline.limit.hard != s.limits.rlim_max ||
+         s.baseline.current > UINT64_MAX - PRESSURE_MAX_BYTES || s.baseline.current + PRESSURE_MAX_BYTES > s.baseline.limit.soft ||
+         s.baseline.current + PRESSURE_MAX_BYTES > s.baseline.limit.hard))
+        rc = -ENOSPC;
+    if (rc == 0) rc = pressure_checkpoint(s, s.checkpoints[0], 2, uint64_t{1} << s.target);
+    s.prepared = rc == 0;
+    uint64_t chunk = uint64_t{2} << 20;
+    int64_t sentinel{};
+    while (rc == 0) {
+        if (s.used >= PRESSURE_MAX_ENTRIES - 2 || s.owned_bytes > PRESSURE_MAX_BYTES - 8192 - chunk) {
+            rc = -E2BIG;
+            break;
+        }
+        int64_t raw{};
+        int64_t const attempt = pressure_allocate(s, chunk, s.fill_deadline, false, raw, sentinel);
+        if (attempt == -ENOMEM && raw == -ENOMEM && sentinel) {
+            if (chunk != PAGE) {
+                s.large_rc = raw;
+                s.large_output = sentinel;
+                chunk = PAGE;
+                continue;
+            }
+            s.strict_rc = raw;
+            s.strict_output = sentinel;
+            s.strict = true;
+            break;
+        }
+        if (attempt != 0) {
+            rc = attempt;
+            break;
+        }
+    }
+    s.prefix = s.used;
+    if (rc == 0) rc = pressure_checkpoint(s, s.checkpoints[1], 2, uint64_t{1} << s.target);
+    if (rc == 0) rc = pressure_checkpoint(s, s.checkpoints[2], 2, uint64_t{1} << s.target);
+    if (rc == 0 && (!s.strict || !s.prefix)) rc = -EPROTO;
+    uint64_t probe_deadline{};
+    if (rc == 0) rc = policy_set(1, uint64_t{1} << s.target);
+    if (rc == 0 && !policy_matches(s.query, 1, uint64_t{1} << s.target)) rc = -EPROTO;
+    if (rc == 0) {
+        s.preferred_index = s.used;
+        if (!deadline_after(s.options.probe_ms, probe_deadline))
+            rc = -EIO;
+        else {
+            if (probe_deadline > s.work_deadline) probe_deadline = s.work_deadline;
+            rc = pressure_allocate(s, PAGE, probe_deadline, true, s.preferred_rc, sentinel);
+            s.fallback = rc == 0;
+        }
+    }
+    if (rc == 0) rc = pressure_checkpoint(s, s.checkpoints[3], 1, uint64_t{1} << s.target);
+    for (uint32_t i = 0; i < s.prefix && rc == 0; ++i) rc = pressure_verify(s, s.entries[i], false, false, s.work_deadline);
+    if (rc == 0) rc = pressure_checkpoint(s, s.checkpoints[4], 1, uint64_t{1} << s.target);
+    s.prefix_checked = rc == 0;
+    pressure_error(s, rc);
+    pressure_release(s, 0, s.used);
+    if (s.prepared && s.first_error == 0) pressure_error(s, pressure_checkpoint(s, s.checkpoints[5], 1, uint64_t{1} << s.target));
+    s.payload_clean = s.first_error == 0 && s.owned_bytes == 0;
+    if (s.payload_clean) {
+        rc = policy_set(2, uint64_t{1} << s.target);
+        if (rc == 0 && !policy_matches(s.query, 2, uint64_t{1} << s.target)) rc = -EPROTO;
+        s.recovery_index = s.used;
+        if (rc == 0 && !deadline_after(s.options.probe_ms, probe_deadline)) rc = -EIO;
+        if (probe_deadline > s.work_deadline) probe_deadline = s.work_deadline;
+        if (rc == 0) rc = pressure_allocate(s, PAGE, probe_deadline, false, s.recovery_rc, sentinel);
+        if (rc == 0) rc = pressure_checkpoint(s, s.checkpoints[6], 2, uint64_t{1} << s.target);
+        s.recovered = rc == 0;
+        pressure_error(s, rc);
+    }
+    if (s.recovery_index < s.used) pressure_release(s, s.recovery_index, s.used);
+    if (s.recovered && s.first_error == 0) pressure_error(s, pressure_checkpoint(s, s.checkpoints[7], 2, uint64_t{1} << s.target));
+    if (saved && s.owned_bytes == 0) {
+        s.policy_restore = policy_set(s.original_policy.mode, s.original_policy.nodes);
+        s.affinity_restore = ker::multiproc::setThreadAffinityMask(s.tid, s.original_affinity);
+        s.restored = s.policy_restore == 0 && policy_matches(s.query, s.original_policy.mode, s.original_policy.nodes) &&
+                     s.affinity_restore == 0 && static_cast<uint64_t>(ker::multiproc::getThreadAffinityMask(s.tid)) == s.original_affinity;
+        if (!s.restored) pressure_error(s, -EPROTO, true);
+    }
+    if (s.owned_bytes == 0 && s.snapshots[2].fd >= 0) (void)pressure_snapshot(s, s.snapshots[2]);
+    if (s.owned_bytes == 0 && s.snapshots[3].fd >= 0) (void)pressure_snapshot(s, s.snapshots[3]);
+    for (auto& snap : s.snapshots)
+        if (snap.fd >= 0) {
+            int const ret = close(snap.fd);
+            int const err = ret < 0 ? errno : 0;
+            snap.fd = -1;
+            if (ret != 0) pressure_error(s, -err, true);
+        }
+    rlimit final_limits;
+    initialize_transport(final_limits);
+    int const final_limit_result = getrlimit(RLIMIT_AS, &final_limits);
+    int const final_limit_error = final_limit_result < 0 ? errno : 0;
+    if (final_limit_result != 0)
+        pressure_error(s, final_limit_error ? -final_limit_error : -EPROTO, true);
+    else if (final_limits.rlim_cur != s.limits.rlim_cur || final_limits.rlim_max != s.limits.rlim_max)
+        pressure_error(s, -EPROTO, true);
+    if (!before(s.deadline)) pressure_error(s, -ETIMEDOUT);
+    pressure_report(s);
+    if (!before(s.deadline)) pressure_error(s, -ETIMEDOUT);
+    return s.first_error == 0 ? 0 : 1;
+}
