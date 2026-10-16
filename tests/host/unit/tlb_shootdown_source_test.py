@@ -285,7 +285,7 @@ def require_mapping_mutations_use_shootdown(source: str) -> None:
     if flush < 0 or drop < 0 or flush > drop:
         fail("reserve_page_range must complete the shootdown before dropping the old page reference")
 
-    for name in ["unify_page_flags", "flush_page_map_batch", "destroy_user_space_budgeted", "destroy_user_space", "deep_copy_user_pagemap_cow"]:
+    for name in ["unify_page_flags", "flush_page_map_batch", "destroy_user_space_budgeted", "destroy_user_space", "deep_copy_user_pagemap_cow_impl"]:
         body = function_body(source, name)
         if "flush_pagemap_after_update(" not in body:
             fail(f"{name} must route stale-TLB-sensitive updates through the shootdown helper")

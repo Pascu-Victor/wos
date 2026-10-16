@@ -10288,7 +10288,22 @@ auto get_destroy_user_space_stats(uint64_t cpu_no) -> DestroyUserSpaceStats {
     };
 }
 
-auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
+namespace {
+auto valid_fork_placement(PageTable* src, PageTable* dst, const numa::AllocationContext& context, const numa::AllocationResult& output)
+    -> bool {
+    if (src == nullptr || dst == nullptr || src == dst || src == kernel_pagemap || dst == kernel_pagemap) return false;
+    auto const CONTEXT_ADDRESS = reinterpret_cast<uintptr_t>(&context);
+    auto const OUTPUT_ADDRESS = reinterpret_cast<uintptr_t>(&output);
+    bool const ALIASED = CONTEXT_ADDRESS <= OUTPUT_ADDRESS ? OUTPUT_ADDRESS - CONTEXT_ADDRESS < sizeof(context)
+                                                           : CONTEXT_ADDRESS - OUTPUT_ADDRESS < sizeof(output);
+    if (ALIASED || !output.span.empty() || output.span.pages() != 0) return false;
+    auto const* topology = acpi::numa::boot_topology();
+    return topology != nullptr && topology->node_count != 0 && topology->node_count <= numa::MAX_NODES &&
+           context.local_node < topology->node_count && numa::valid_policy(context.policy, topology->node_count);
+}
+
+auto deep_copy_user_pagemap_cow_impl(PageTable* src, PageTable* dst, bool eager_copy, numa::AllocationContext* placement,
+                                     numa::AllocationResult* output, uint64_t fail_before_private_page) -> bool {
     // Walk the user half (PML4[0..255]) of src.
     // For each present PML1 entry pointing to a data page:
     //   1. Mark the src PTE as read-only + COW
@@ -10309,7 +10324,8 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
     UserPagemapExclusiveScope source_usercopy_scope(src);
 
     constexpr size_t USER_PML4_ENTRIES = 256;
-    bool const EAGER_COPY_WRITABLE_PRIVATE = fork_eager_copy_enabled();
+    bool const EAGER_COPY_WRITABLE_PRIVATE = eager_copy;
+    uint64_t private_pages = 0;
     phys::PageLookupHint ref_lookup{};
     for (size_t i4 = 0; i4 < USER_PML4_ENTRIES; i4++) {
         auto& src_pml4e = entry_at(src, i4);
@@ -10338,6 +10354,12 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
                 continue;
             }
 
+            // Strict placed callers never interpret an unknown 1GiB leaf as a table.
+            if (placement != nullptr && src_pml3e.pagesize != 0) {
+                flush_pagemap_after_update(src, 0, true);
+                return false;
+            }
+
             paddr_t const SRC_PML2_PHYS = src_pml3e.frame << paging::PAGE_SHIFT;
             auto* src_pml2 = reinterpret_cast<PageTable*>(addr::get_virt_pointer(SRC_PML2_PHYS));
 
@@ -10356,6 +10378,10 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
                     continue;
                 }
                 if (src_pml2e.pagesize) {
+                    if (placement != nullptr) {
+                        flush_pagemap_after_update(src, 0, true);
+                        return false;
+                    }
                     // 2MB huge page: copy as 512 independent 4KB pages into a new PML1.
                     // Cannot use pageAllocHuge because huge_page_base may not be 2MB-aligned;
                     // an unaligned PA in a PS=1 PML2 entry is invalid and causes a GPF.
@@ -10441,10 +10467,28 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
                     void* data_virt = reinterpret_cast<void*>(addr::get_virt_pointer(DATA_PHYS));
 
                     if (EAGER_COPY_WRITABLE_PRIVATE && IS_WRITABLE_PRIVATE) {
-                        auto* child_page = phys::page_alloc_full_overwrite_page_with_reclaim_may_fail(
-                            PhysicalPageOwner::USER_PRIVATE_MAPPING, "fork_copy");
-                        if (child_page == nullptr) {
-                            return false;
+                        void* child_page = nullptr;
+                        if (placement != nullptr) {
+                            // Both objects were born in the instrumented caller before
+                            // publication/exclusive owners. No hidden span return here.
+                            if (private_pages == fail_before_private_page) {
+                                flush_pagemap_after_update(src, 0, true);
+                                return false;
+                            }
+                            placement->virtual_page_index = VADDR / paging::PAGE_SIZE;
+                            numa::try_allocate_pages_into(*output, *placement, 1, paging::PAGE_SIZE,
+                                                          PhysicalPageOwner::USER_PRIVATE_MAPPING, phys::PageInitialization::FULL_OVERWRITE,
+                                                          numa::ReclaimMode::NEVER, "fork_copy");
+                            if (output->error != numa::AllocationError::NONE || output->span.empty() || output->span.pages() != 1 ||
+                                output->actual == numa::INVALID_NODE) {
+                                flush_pagemap_after_update(src, 0, true);
+                                return false;
+                            }
+                            child_page = output->span.data();
+                        } else {
+                            child_page = phys::page_alloc_full_overwrite_page_with_reclaim_may_fail(PhysicalPageOwner::USER_PRIVATE_MAPPING,
+                                                                                                    "fork_copy");
+                            if (child_page == nullptr) return false;
                         }
                         std::memcpy(child_page, data_virt, paging::PAGE_SIZE);
                         auto const CHILD_PHYS = reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(child_page)));
@@ -10453,6 +10497,10 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
                         child_raw |= paging::PAGE_WRITE;
                         dst_pml1e = pte_from_raw((child_raw & ~PTE_FRAME_MASK) | (CHILD_PHYS & PTE_FRAME_MASK));
                         owned_frame_track_fresh_normal_mapping(dst, VADDR, CHILD_PHYS, pte_raw(dst_pml1e));
+                        // Real leaf + tracker adopted the sole frame ref. Exact C43d
+                        // scalar release touches prepared caller storage only.
+                        if (placement != nullptr) static_cast<void>(output->span.release());
+                        ++private_pages;
                         continue;
                     }
 
@@ -10500,6 +10548,33 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
     flush_pagemap_after_update(src, 0, true);
     return true;
 }
+
+}  // namespace
+
+auto fork_eager_copy_requested() -> bool { return fork_eager_copy_enabled(); }
+
+auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
+    return deep_copy_user_pagemap_cow_impl(src, dst, fork_eager_copy_requested(), nullptr, nullptr, UINT64_MAX);
+}
+
+auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst, numa::AllocationContext& context, numa::AllocationResult& output) -> bool {
+    if (!valid_fork_placement(src, dst, context, output)) return false;
+    auto const* topology = acpi::numa::boot_topology();
+    if (topology->node_count == 1 && context.policy.mode == numa::Mode::LOCAL && context.policy.nodes == 0)
+        return deep_copy_user_pagemap_cow(src, dst);
+    return deep_copy_user_pagemap_cow_impl(src, dst, fork_eager_copy_requested(), &context, &output, UINT64_MAX);
+}
+
+#ifdef WOS_SELFTEST
+auto selftest_deep_copy_user_pagemap_eager(PageTable* src, PageTable* dst, numa::AllocationContext& context, numa::AllocationResult& output,
+                                           uint64_t fail_before_private_page) -> bool {
+    if (!valid_fork_placement(src, dst, context, output)) return false;
+    uint64_t source_serial = 0;
+    uint64_t destination_serial = 0;
+    if (!capture_user_root_incarnation(src, source_serial) || !capture_user_root_incarnation(dst, destination_serial)) return false;
+    return deep_copy_user_pagemap_cow_impl(src, dst, true, &context, &output, fail_before_private_page);
+}
+#endif
 
 }  // namespace ker::mod::mm::virt
 

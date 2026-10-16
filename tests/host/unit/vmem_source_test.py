@@ -1100,6 +1100,26 @@ def test_process_memory_policy_is_captured_before_creation_and_retry() -> None:
     require_order(clone, capture, "copy_value_from_task(*parent", "clone policy capture before user input")
 
 
+def test_eager_fork_uses_copied_policy_and_caller_storage_before_owners() -> None:
+    source = PROCESS_CPP.read_text()
+    fork = function_body(source, "wos_proc_fork")
+    require_cpp_order(fork, "auto const MEMORY_POLICY = parent->memory_policy_snapshot();",
+                      "mm::numa::capture_allocation_context(MEMORY_POLICY, fork_placement)", "copied initiating policy")
+    require_cpp_order(fork, "mm::numa::AllocationResult fork_page{};", "ProcessReservation process_reservation", "result lifetime before reservations")
+    require_cpp_order(fork, "mm::numa::capture_allocation_context(MEMORY_POLICY, fork_placement)",
+                      "ProcessReservation process_reservation", "placement capture before pressure/owners")
+    require_cpp_tokens(fork, ["if (EAGER_COPY)",
+        "copied = EAGER_COPY ? mm::virt::deep_copy_user_pagemap_cow(parent->pagemap, child->pagemap, fork_placement, fork_page)",
+        ": mm::virt::deep_copy_user_pagemap_cow(parent->pagemap, child->pagemap);"], "conditional typed route with unchanged legacy call")
+    copier = function_body(VIRT_CPP.read_text(), "deep_copy_user_pagemap_cow_impl")
+    require_cpp_order(copier, "placement->virtual_page_index = VADDR / paging::PAGE_SIZE;",
+                      "numa::try_allocate_pages_into(*output, *placement", "per-VA copied context before allocation")
+    require_cpp_order(copier, "std::memcpy(child_page, data_virt, paging::PAGE_SIZE);",
+                      "owned_frame_track_fresh_normal_mapping(dst, VADDR, CHILD_PHYS", "full bytes before real leaf adoption")
+    require_cpp_order(copier, "owned_frame_track_fresh_normal_mapping(dst, VADDR, CHILD_PHYS",
+                      "output->span.release()", "exact adoption before scalar owner transfer")
+
+
 def test_fork_snapshots_all_vm_surfaces_under_one_publication_guard() -> None:
     process = PROCESS_CPP.read_text()
     vmem = SYS_VMEM_CPP.read_text()
@@ -1220,6 +1240,7 @@ def main() -> None:
     test_file_mmap_cache_is_sharded_without_changing_page_ownership()
     test_thread_publication_is_serialized_with_shared_vmem_updates()
     test_process_memory_policy_is_captured_before_creation_and_retry()
+    test_eager_fork_uses_copied_policy_and_caller_storage_before_owners()
     test_fork_snapshots_all_vm_surfaces_under_one_publication_guard()
     test_fork_child_registers_use_immutable_syscall_entry_snapshot()
     print("vmem mmap, owned-frame, and COW invariants hold")

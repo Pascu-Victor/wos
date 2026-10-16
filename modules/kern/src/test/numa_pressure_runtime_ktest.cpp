@@ -710,15 +710,19 @@ void report_seed_diagnostics() {
 // Read no released frame, current owner object, allocator metadata or provider.
 void report_closure_diagnostics() {
     bool const REACHED = state.phase != nullptr && std::strcmp(state.phase, "physical-owner-closure") == 0;
+    bool const POST_CLEAR_VALID = REACHED && state.failure != nullptr &&
+                                  (std::strcmp(state.failure, "actual private mapping owner/root baseline restored") == 0 ||
+                                   std::strcmp(state.failure, "actual root page-table owner baseline restored") == 0);
     bool const NODES_VALID = REACHED && state.baseline.complete && state.final.complete &&
                              state.baseline.error == mm::NodeCounterError::NONE && state.final.error == mm::NodeCounterError::NONE &&
                              state.baseline.node_count == 2 && state.final.node_count == 2;
     log::error(
         "closure_diag_v1 reached=%u nodes_valid=%u complete=%u/%u error=%u/%u nodes=%u/%u "
-        "node_bases=seed_publication/pressure_final owner_bases=pre_seed/pre_private_root/pressure_final_root_live",
+        "node_bases=seed_publication/pressure_final owner_bases=pre_seed/pre_private_root/pressure_final_root_live "
+        "post_clear_valid=%u post_clear_base=after_explicit_root_clear",
         REACHED ? 1U : 0U, NODES_VALID ? 1U : 0U, state.baseline.complete ? 1U : 0U, state.final.complete ? 1U : 0U,
         static_cast<unsigned>(state.baseline.error), static_cast<unsigned>(state.final.error),
-        static_cast<unsigned>(state.baseline.node_count), static_cast<unsigned>(state.final.node_count));
+        static_cast<unsigned>(state.baseline.node_count), static_cast<unsigned>(state.final.node_count), POST_CLEAR_VALID ? 1U : 0U);
     if (!NODES_VALID) return;
     auto magnitude = [](uint64_t a, uint64_t b) { return b >= a ? b - a : a - b; };
     auto sign = [](uint64_t a, uint64_t b) { return b >= a ? '+' : '-'; };
@@ -749,6 +753,21 @@ void report_closure_diagnostics() {
         auto const& a = state.owner_before.owners[i];
         auto const& r = state.root_owner_before.owners[i];
         auto const& b = state.owner_after.owners[i];
+        bool const POST_CLEAR_OWNER = POST_CLEAR_VALID && (i == static_cast<size_t>(mm::PhysicalPageOwner::PAGE_TABLE) ||
+                                                           i == static_cast<size_t>(mm::PhysicalPageOwner::PAGE_TABLE_POOL_RESERVE));
+        if (POST_CLEAR_OWNER) {
+            auto const& p = state.root_owner_after.owners[i];
+            log::error(
+                "closure_diag_v1 owner=%u pages=%llu/%llu/%llu d_seed=%c%llu d_root=%c%llu "
+                "objects=%llu/%llu/%llu d_seed=%c%llu d_root=%c%llu "
+                "post_pages=%llu d_post_pages=%c%llu post_objects=%llu d_post_objects=%c%llu",
+                static_cast<unsigned>(i), u(a.pages), u(r.pages), u(b.pages), sign(a.pages, b.pages), u(magnitude(a.pages, b.pages)),
+                sign(r.pages, b.pages), u(magnitude(r.pages, b.pages)), u(a.objects), u(r.objects), u(b.objects),
+                sign(a.objects, b.objects), u(magnitude(a.objects, b.objects)), sign(r.objects, b.objects),
+                u(magnitude(r.objects, b.objects)), u(p.pages), sign(r.pages, p.pages), u(magnitude(r.pages, p.pages)), u(p.objects),
+                sign(r.objects, p.objects), u(magnitude(r.objects, p.objects)));
+            continue;
+        }
         if (a.pages == r.pages && r.pages == b.pages && a.objects == r.objects && r.objects == b.objects) continue;
         log::error(
             "closure_diag_v1 owner=%u pages=%llu/%llu/%llu d_seed=%c%llu d_root=%c%llu "

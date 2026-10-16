@@ -22,6 +22,11 @@
 #include "platform/asm/cpu.hpp"
 #include "platform/interrupt/gates.hpp"
 
+namespace ker::mod::mm::numa {
+struct AllocationContext;
+struct AllocationResult;
+}  // namespace ker::mod::mm::numa
+
 namespace ker::mod::mm::virt {
 using namespace ker::mod::mm::addr;
 using namespace ker::mod::mm::paging;
@@ -584,6 +589,21 @@ void destroy_user_space(PageTable* pagemap, uint64_t owner_pid = 0, const char* 
 // Page table structures (PML3/PML2/PML1) are freshly allocated for dst.
 // Returns true on success, false on OOM.
 bool deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst);
+// Existing immutable cmdline decision; no placement capture for ordinary COW.
+[[nodiscard]] auto fork_eager_copy_requested() -> bool;
+// Caller owns source/destination and preconstructed addressable, nonaliasing
+// context/output through all exclusive/publication cleanup. Only page_index
+// changes. Empty output is mandatory. Strict placed route refuses PS leaves;
+// valid UMA LOCAL/mask0 delegates the unchanged legacy two-argument path.
+[[nodiscard]] auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst, numa::AllocationContext& context,
+                                              numa::AllocationResult& output) -> bool;
+#ifdef WOS_SELFTEST
+// Caller exclusively owns both distinct registered never-active mutable roots.
+// Same walker, local eager decision only. Controlled refusal is not PMM pressure.
+[[nodiscard]] auto selftest_deep_copy_user_pagemap_eager(PageTable* src, PageTable* dst, numa::AllocationContext& context,
+                                                         numa::AllocationResult& output, uint64_t fail_before_private_page = UINT64_MAX)
+    -> bool;
+#endif
 
 // Debug helper: log active/dead user mappings that still reference a physical page.
 // Intended for targeted fault-path diagnostics only.

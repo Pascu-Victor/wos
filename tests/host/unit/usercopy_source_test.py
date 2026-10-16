@@ -351,7 +351,7 @@ def require_mapping_stable_pin_contract() -> None:
     if not (first_pin_lock < old_frame_pin < first_pin_unlock < allocation < final_pin_lock < final_leaf_write < final_pin_unlock):
         fail("COW must pin its old leaf under the mapping lock, allocate unlocked, then publish under the mapping lock")
 
-    fork_cow = function_body(virt_cpp, "deep_copy_user_pagemap_cow")
+    fork_cow = function_body(virt_cpp, "deep_copy_user_pagemap_cow_impl")
     scope = fork_cow.find("UserPagemapExclusiveScope source_usercopy_scope(src)")
     first_source_leaf = fork_cow.find("auto& src_pml4e = entry_at(src, i4)")
     final_flush = fork_cow.find("flush_pagemap_after_update(src, 0, true)")

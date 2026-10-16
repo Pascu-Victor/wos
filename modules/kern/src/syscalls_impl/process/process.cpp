@@ -13,6 +13,7 @@
 #include <memory>
 #include <mod/io/serial/serial.hpp>
 #include <new>
+#include <platform/mm/numa_alloc.hpp>
 #include <platform/sched/resource_as.hpp>
 #include <platform/sched/session.hpp>
 #include <platform/security/authorization.hpp>
@@ -746,6 +747,16 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     ker::test::lifecycle60::before_selected_service_fork(*parent);
 #endif
     auto const MEMORY_POLICY = parent->memory_policy_snapshot();
+    bool const EAGER_COPY = mm::virt::fork_eager_copy_requested();
+    // Instrumented caller storage exists before every reservation/PUB/root owner;
+    // its final destructor runs after their cleanup on all ordinary returns.
+    mm::numa::AllocationContext fork_placement{};
+    mm::numa::AllocationResult fork_page{};
+    if (EAGER_COPY) {
+        auto const CAPTURE = mm::numa::capture_allocation_context(MEMORY_POLICY, fork_placement);
+        if (CAPTURE != mm::numa::AllocationError::NONE)
+            return static_cast<uint64_t>(CAPTURE == mm::numa::AllocationError::INVALID_POLICY ? -EINVAL : -ENOMEM);
+    }
 
     LocalProcStage FORK_STAGE = begin_local_proc_stage(parent, perf::WkiPerfLocalProcOp::FORK, 0, WOS_PERF_CALLSITE());
     auto finish_fork = [&](int64_t result, uint64_t bytes = 0, const char* failure_stage = nullptr) -> uint64_t {
@@ -948,7 +959,8 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
                 // legacy COW interval's no-preemption/no-direct-reclaim premise:
                 // it owns a striped exclusive gate across page-table allocation.
                 sched::PreemptGuard const COW_PREEMPT;
-                copied = mm::virt::deep_copy_user_pagemap_cow(parent->pagemap, child->pagemap);
+                copied = EAGER_COPY ? mm::virt::deep_copy_user_pagemap_cow(parent->pagemap, child->pagemap, fork_placement, fork_page)
+                                    : mm::virt::deep_copy_user_pagemap_cow(parent->pagemap, child->pagemap);
             }
             fork_vm_snapshot_ok = copied && public_bindings.attach(*child) && ker::syscall::shm::shm_clone_for_fork_locked(parent, child) &&
                                   ker::syscall::vmem::clone_file_mmap_ranges_for_pagemap_locked(parent->pagemap, child->pagemap);
