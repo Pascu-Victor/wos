@@ -2,6 +2,7 @@
 
 #ifdef WOS_SELFTEST
 #include <test/compartment_lifecycle_runtime.hpp>
+#include <test/numa_lifecycle_census.hpp>
 #endif
 
 #include <abi/resource.hpp>
@@ -167,16 +168,13 @@ void cancel_fd_reservations(mod::sched::task::Task& executor) {
 }
 
 #ifdef WOS_SELFTEST
-auto selftest_fd_census_parked(const ker::test::lifecycle60::CensusLease& lease) -> SelftestFdCensus {
+void FdReservation::collect_selftest(mod::sched::task::Task& driver, uint64_t cookie, SelftestFdCensus& out) {
     static_assert(mod::sched::task::Task::FD_TABLE_SIZE == 256);
-    SelftestFdCensus out{};
-    auto* subject = lease.subject();
-    if (!lease || subject == nullptr) return out;
-    auto& driver = *subject;
-    out.executor_cookie = lease.cookie();
+    out = {};
+    out.executor_cookie = cookie;
     out.complete = !driver.is_thread && driver.type == mod::sched::task::TaskType::PROCESS;
-    if (!out.complete) return out;
-    // Parked-executor premise, not table lock: a reservation can target a
+    if (!out.complete) return;
+    // Exact typed executor premise, not table lock: a reservation can target a
     // different table. Only copy scalars; never acquire/drop any of its refs.
     for (auto* node = driver.pending_fd_reservations; node != nullptr; node = node->m_next) {
         if (out.executor_pending == 256) {
@@ -240,7 +238,19 @@ auto selftest_fd_census_parked(const ker::test::lifecycle60::CensusLease& lease)
     present(11, driver.pending_wki_filesystems != nullptr);
     present(12, driver.pending_fd_reservations != nullptr);
     present(13, driver.pending_process_reservations != nullptr);
+}
+
+auto selftest_fd_census_parked(const ker::test::lifecycle60::CensusLease& lease) -> SelftestFdCensus {
+    SelftestFdCensus out{};
+    auto* subject = lease.subject();
+    if (!lease || subject == nullptr) return out;
+    FdReservation::collect_selftest(*subject, lease.cookie(), out);
     return out;
+}
+void selftest_fd_census_current(const ker::test::numa_lifecycle::CurrentCensusScope& scope, SelftestFdCensus& out) {
+    out = {};
+    if (!scope.executing_here()) return;
+    FdReservation::collect_selftest(scope.actor(), scope.cookie(), out);
 }
 #endif
 

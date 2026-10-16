@@ -1,6 +1,7 @@
 #include "sys_vmem.hpp"
 
 #ifdef WOS_SELFTEST
+#include <test/numa_lifecycle_census.hpp>
 #include <test/numa_lifecycle_mm_debt.hpp>
 #endif
 #include <abi/callnums/vmem.h>
@@ -4688,7 +4689,77 @@ auto swap_control_for_subject(ker::mod::sched::task::Task* task, uint64_t op, ui
                                                                    : ker::mod::mm::swap::swapoff_path(path.data()));
 }
 
+#ifdef WOS_SELFTEST
+void selftest_file_registry_snapshot(::ker::test::numa_lifecycle::RegistrySnapshot& out) noexcept {
+    namespace census = ::ker::test::numa_lifecycle;
+    // Touch only exclusive caller output before any provider lock. No pointers
+    // escape as owners: identities copied below are comparison tokens only.
+    auto* bytes = reinterpret_cast<volatile uint8_t*>(&out);
+    for (size_t i = 0; i < sizeof(out); ++i) bytes[i] = 0;
+    census::MmDebtSnapshot before{}, after{};
+    census::mm_debt::snapshot(before);
+    if (!g_file_mmap_ranges_lock.try_lock()) {
+        out.flags = census::REGISTRY_BUSY;
+        return;
+    }
+    bool valid = true;
+    bool overflow = false;
+    if (g_file_mmap_ranges.size() > census::REGISTRY_ROW_LIMIT) overflow = true;
+    if (!overflow) {
+        for (auto const& row : g_file_mmap_ranges) {
+            if (row.pagemap == nullptr || row.file == nullptr || row.length == 0 || row.start > UINT64_MAX - row.length) {
+                valid = false;
+                break;
+            }
+            out.rows[out.row_count++] = {reinterpret_cast<uint64_t>(row.pagemap),
+                                         reinterpret_cast<uint64_t>(row.file),
+                                         0,
+                                         row.start,
+                                         row.start + row.length,
+                                         row.file_offset,
+                                         census::LEGACY_ROW | (row.writeback ? census::WRITEBACK_ROW : uint64_t{0}),
+                                         0};
+            ++out.legacy_rows;
+        }
+        if (valid) {
+            for (auto* row = g_native_file_mmap_ranges; row != nullptr; row = row->registry_next) {
+                if (out.row_count == census::REGISTRY_ROW_LIMIT) {
+                    overflow = true;
+                    break;
+                }
+                if (!row->registered || row->root == nullptr || row->lifetime == nullptr || row->binding == nullptr ||
+                    row->start >= row->end) {
+                    valid = false;
+                    break;
+                }
+                out.rows[out.row_count++] = {reinterpret_cast<uint64_t>(row->root),
+                                             reinterpret_cast<uint64_t>(row->lifetime),
+                                             reinterpret_cast<uint64_t>(row->binding),
+                                             row->start,
+                                             row->end,
+                                             row->file_offset,
+                                             census::NATIVE_ROW | census::REGISTERED_ROW,
+                                             0};
+                ++out.native_rows;
+            }
+        }
+    }
+    g_file_mmap_ranges_lock.unlock();
+    census::mm_debt::snapshot(after);
+    out.stamp = {.version = after.version_end,
+                 .inflight = before.inflight > after.inflight ? before.inflight : after.inflight,
+                 .valid = before.valid != 0 && after.valid != 0 && before.version_begin == before.version_end &&
+                          after.version_begin == after.version_end && before.version_end == after.version_begin};
+    if (!valid) out.flags |= census::REGISTRY_INVALID;
+    if (overflow) out.flags |= census::REGISTRY_OVERFLOW;
+    if (valid && !overflow && mod::mm::lifecycle_census::quiescent(out.stamp)) out.flags |= census::REGISTRY_COMPLETE;
+}
+#endif
+
 auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -> uint64_t {
+#ifdef WOS_SELFTEST
+    if (op == ker::test::numa_lifecycle::PRIVATE_VMEM_OP) return ker::test::numa_lifecycle::dispatch_current_census(a1, a2, a3, a4);
+#endif
     switch (static_cast<ker::abi::vmem::ops>(op)) {
         case ker::abi::vmem::ops::ANON_ALLOCATE: {
             // a1: hint address

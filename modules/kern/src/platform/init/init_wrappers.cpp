@@ -2,6 +2,7 @@
 // Each wrapper calls the actual init function from the appropriate module
 #ifdef WOS_SELFTEST
 #include <test/compartment_lifecycle_runtime.hpp>
+#include <test/numa_lifecycle_census.hpp>
 #endif
 
 #include <array>
@@ -357,6 +358,11 @@ void sched_init() {
 #ifdef WOS_SELFTEST
     bool const LIFECYCLE = cmdline_has_token(get_kernel_cmdline(), "--selftest-compartment-lifecycle");
     bool const NUMA_PRESSURE = cmdline_has_token(get_kernel_cmdline(), "--selftest-numa-pressure");
+    bool const NUMA_CENSUS = cmdline_has_token(get_kernel_cmdline(), "--selftest-numa-lifecycle-census");
+    if (NUMA_CENSUS && (NUMA_PRESSURE || LIFECYCLE || cmdline_has_token(get_kernel_cmdline(), "--selftest") ||
+                        cmdline_has_token(get_kernel_cmdline(), "--selftest-file-mapping")))
+        mod::dbg::panic_handler("conflicting scheduled NUMA census diagnostic boot modes");
+    if (NUMA_CENSUS) ker::test::numa_lifecycle::enable_current_census_boot();
     if (NUMA_PRESSURE && (LIFECYCLE || cmdline_has_token(get_kernel_cmdline(), "--selftest") ||
                           cmdline_has_token(get_kernel_cmdline(), "--selftest-file-mapping")))
         mod::dbg::panic_handler("conflicting scheduled NUMA pressure diagnostic boot modes");

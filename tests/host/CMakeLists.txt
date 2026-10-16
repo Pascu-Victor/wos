@@ -350,6 +350,13 @@ add_test(NAME numa_pressure_holdings_runtime_test
         --host-build ${CMAKE_BINARY_DIR}
         --gtest-main $<TARGET_FILE:gtest_main> --gtest-lib $<TARGET_FILE:gtest>)
 set_tests_properties(numa_pressure_holdings_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 140)
+add_test(NAME numa_lifecycle_census_runtime_test
+    COMMAND ${CMAKE_COMMAND} -E env WOS_HOST_CXX=${CMAKE_CXX_COMPILER}
+        ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_lifecycle_census_runtime_test.py)
+set_tests_properties(numa_lifecycle_census_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 120)
+add_test(NAME numa_lifecycle_census_codec_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_lifecycle_census_codec_test.py)
+set_tests_properties(numa_lifecycle_census_codec_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 60)
 wos_add_unit_test(vtd_capability_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vtd_capability_test.cpp
 )

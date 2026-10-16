@@ -1,5 +1,6 @@
 #include "task.hpp"
 #ifdef WOS_SELFTEST
+#include <test/numa_lifecycle_census.hpp>
 #include <test/numa_lifecycle_mm_debt.hpp>
 #endif
 
@@ -611,11 +612,34 @@ void teardown_unpublished_process_resources(Task* task, mm::file_mapping::Unpubl
 }  // namespace
 
 namespace {
+#ifdef WOS_SELFTEST
+constinit mm::lifecycle_census::Epoch native_debt_epoch{};
+mm::lifecycle_census::OwnerLock native_retirement_queue_lock{native_debt_epoch};
+constinit std::atomic<uint64_t> native_return_tails{};
+constinit std::atomic<bool> native_debt_arithmetic_valid{true};
+void adjust_native_return_tail(bool add) noexcept {
+    native_debt_epoch.begin();
+    auto value = native_return_tails.load(std::memory_order_seq_cst);
+    for (;;) {
+        if ((add && value == UINT64_MAX) || (!add && value == 0)) {
+            native_debt_arithmetic_valid.store(false, std::memory_order_seq_cst);
+            break;
+        }
+        if (native_return_tails.compare_exchange_weak(value, add ? value + 1 : value - 1, std::memory_order_seq_cst)) break;
+    }
+    native_debt_epoch.end();
+}
+#else
 sys::Spinlock native_retirement_queue_lock;
+#endif
 mm::file_mapping::UnpublishedMappingRetirement* native_retirement_queue_head{};
 mm::file_mapping::UnpublishedMappingRetirement* native_retirement_queue_tail{};
 size_t native_retirement_queue_outstanding{};  // Includes the single GC-claimed prefix.
+#ifdef WOS_SELFTEST
+mm::lifecycle_census::OwnerLock native_mapping_admission_lock{native_debt_epoch};
+#else
 sys::Spinlock native_mapping_admission_lock;
+#endif
 mm::file_mapping::UnpublishedMappingRetirement* native_mapping_active_records{};
 size_t native_mapping_constructions{};
 bool native_mapping_construction_closed{};
@@ -710,6 +734,9 @@ auto advance_native_unpublished_process(Task* owner, Task* child, mm::file_mappi
             dbg::panic_handler("native unpublished process lost exact owner slot");
     }
     if (close_result != nullptr) *close_result = record->first_close_result;
+#ifdef WOS_SELFTEST
+    adjust_native_return_tail(true);
+#endif
     child->native_file_mapping_retirement.store(nullptr, std::memory_order_release);
     unregister_native_file_mapping_record(*child, *record);
     delete[] child->name;
@@ -721,6 +748,9 @@ auto advance_native_unpublished_process(Task* owner, Task* child, mm::file_mappi
     child->release();  // Consume the exact slot/transferred owner, then creator.
     delete child;
     if (!detached) owner->unpublished_teardown_in_progress.store(false, std::memory_order_release);
+#ifdef WOS_SELFTEST
+    adjust_native_return_tail(false);
+#endif
     return Result::COMPLETE;
 }
 }  // namespace
@@ -729,6 +759,32 @@ auto retire_native_unpublished_process(Task* owner, Task* child, mm::file_mappin
     -> mm::file_mapping::UnpublishedRetirementResult {
     return advance_native_unpublished_process(owner, child, mode, close_result, false);
 }
+
+#ifdef WOS_SELFTEST
+void selftest_native_debt_snapshot(::ker::test::numa_lifecycle::NativeDebtSnapshot& out) noexcept {
+    namespace census = ::ker::test::numa_lifecycle;
+    // Exclusive plain output. Instrumented writes precede all owner locks.
+    auto* bytes = reinterpret_cast<volatile uint8_t*>(&out);
+    for (size_t i = 0; i < sizeof(out); ++i) bytes[i] = 0;
+    auto const BEFORE = native_debt_epoch.snapshot();
+    auto flags = native_mapping_admission_lock.observe_lock_irqsave();
+    out.constructions = native_mapping_constructions;
+    if (native_mapping_active_records != nullptr) out.flags |= census::NATIVE_ACTIVE_PRESENT;
+    if (native_mapping_construction_closed) out.flags |= census::NATIVE_ADMISSION_CLOSED;
+    native_mapping_admission_lock.observe_unlock_irqrestore(flags);
+    flags = native_retirement_queue_lock.observe_lock_irqsave();
+    bool const HEAD = native_retirement_queue_head != nullptr;
+    bool const TAIL = native_retirement_queue_tail != nullptr;
+    out.queue_outstanding = native_retirement_queue_outstanding;
+    if (HEAD) out.flags |= census::NATIVE_QUEUE_PRESENT;
+    bool const PROTOCOL = HEAD == TAIL && (out.queue_outstanding != 0 || !HEAD);
+    native_retirement_queue_lock.observe_unlock_irqrestore(flags);
+    out.return_tails = native_return_tails.load(std::memory_order_seq_cst);
+    if (PROTOCOL && native_debt_arithmetic_valid.load(std::memory_order_seq_cst)) out.flags |= census::NATIVE_ARITHMETIC_VALID;
+    out.stamp = native_debt_epoch.snapshot();
+    if (PROTOCOL && mm::lifecycle_census::unchanged(BEFORE, out.stamp)) out.flags |= census::NATIVE_COMPLETE;
+}
+#endif
 
 auto begin_native_file_mapping_construction() -> bool {
     uint64_t const FLAGS = native_mapping_admission_lock.lock_irqsave();

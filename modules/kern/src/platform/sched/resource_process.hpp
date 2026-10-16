@@ -5,6 +5,9 @@
 namespace ker::test::lifecycle60 {
 class CensusLease;
 }
+namespace ker::test::numa_lifecycle {
+class CurrentCensusScope;
+}
 #endif
 
 #include <abi/resource.hpp>
@@ -44,6 +47,7 @@ struct SelftestPopulationCensus {
 // The controller-issued ACK lease authorizes executor observation. The
 // reservation list is additionally protected by population_lock; no raw Task overload.
 [[nodiscard]] auto selftest_population_census(const ker::test::lifecycle60::CensusLease& lease) -> SelftestPopulationCensus;
+void selftest_population_census_current(const ker::test::numa_lifecycle::CurrentCensusScope&, SelftestPopulationCensus&);
 #endif
 
 class ProcessReservation {
@@ -64,6 +68,8 @@ class ProcessReservation {
    private:
 #ifdef WOS_SELFTEST
     friend auto selftest_population_census(const ker::test::lifecycle60::CensusLease&) -> SelftestPopulationCensus;
+    friend void selftest_population_census_current(const ker::test::numa_lifecycle::CurrentCensusScope&, SelftestPopulationCensus&);
+    static void collect_selftest(task::Task&, uint64_t cookie, SelftestPopulationCensus&);
 #endif
     void reserve(task::Task* policy, State* private_policy, uint32_t uid, task::Task* executor_fallback);
     void unlink_executor_locked();

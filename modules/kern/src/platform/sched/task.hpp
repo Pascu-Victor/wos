@@ -10,6 +10,9 @@
 #include <cstdint>
 #ifdef WOS_SELFTEST
 #include <syscalls_impl/process/native_construction_token.hpp>
+namespace ker::test::numa_lifecycle {
+struct NativeDebtSnapshot;
+}
 #endif
 #include <defines/defines.hpp>
 #include <iterator>
@@ -1571,6 +1574,10 @@ void destroy_unpublished_user_thread(Task* task);
 // claims one pre-reserved continuation; true requests another slice.
 [[nodiscard]] auto process_native_unpublished_retirements_slice(bool& root_active) -> bool;
 [[nodiscard]] auto native_unpublished_retirements_pending() -> bool;
+#ifdef WOS_SELFTEST
+// Values only; output must be exclusive and addressable before owner locks.
+void selftest_native_debt_snapshot(::ker::test::numa_lifecycle::NativeDebtSnapshot& out) noexcept;
+#endif
 // Construction is admitted before any VFS/backend work. Shutdown closes this
 // gate and checks the actual stable-record list as well as in-flight scopes.
 [[nodiscard]] auto begin_native_file_mapping_construction() -> bool;

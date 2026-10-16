@@ -3,6 +3,7 @@
 #ifdef WOS_SELFTEST
 #include <platform/mm/lifecycle_census.hpp>
 #include <test/compartment_lifecycle_runtime.hpp>
+#include <test/numa_lifecycle_census.hpp>
 #endif
 
 #include <cerrno>
@@ -314,15 +315,12 @@ void copy_process_observation(task::Task& subject, abi::resource::Usage& usage) 
     population_lock.unlock_irqrestore(FLAGS);
 }
 #ifdef WOS_SELFTEST
-auto selftest_population_census(const ker::test::lifecycle60::CensusLease& lease) -> SelftestPopulationCensus {
+void ProcessReservation::collect_selftest(task::Task& actor, uint64_t cookie, SelftestPopulationCensus& out) {
     auto const selftest_before = selftest_population_epoch.snapshot();
-    SelftestPopulationCensus out{.complete = true};
-    auto* executor = lease.subject();
-    if (!lease || executor == nullptr) {
-        out.complete = false;
-        return out;
-    }
-    out.executor_cookie = lease.cookie();
+    out = {};
+    out.complete = true;
+    auto* executor = &actor;
+    out.executor_cookie = cookie;
     uint64_t const FLAGS = population_lock.observe_lock_irqsave();
     uint64_t scanned = 0;
     for (auto* node = population; node != nullptr; node = node->next) {
@@ -348,7 +346,19 @@ auto selftest_population_census(const ker::test::lifecycle60::CensusLease& lease
     population_lock.observe_unlock_irqrestore(FLAGS);
     out.stamp = selftest_population_epoch.snapshot();
     out.complete = out.complete && ker::mod::mm::lifecycle_census::unchanged(selftest_before, out.stamp);
+}
+
+auto selftest_population_census(const ker::test::lifecycle60::CensusLease& lease) -> SelftestPopulationCensus {
+    SelftestPopulationCensus out{};
+    auto* executor = lease.subject();
+    if (!lease || executor == nullptr) return out;
+    ProcessReservation::collect_selftest(*executor, lease.cookie(), out);
     return out;
+}
+void selftest_population_census_current(const ker::test::numa_lifecycle::CurrentCensusScope& scope, SelftestPopulationCensus& out) {
+    out = {};
+    if (!scope.executing_here()) return;
+    ProcessReservation::collect_selftest(scope.actor(), scope.cookie(), out);
 }
 #endif
 

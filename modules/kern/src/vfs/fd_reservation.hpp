@@ -6,6 +6,9 @@
 namespace ker::test::lifecycle60 {
 class CensusLease;
 }
+namespace ker::test::numa_lifecycle {
+class CurrentCensusScope;
+}
 #endif
 
 namespace ker::mod::sched::task {
@@ -31,6 +34,7 @@ struct SelftestFdCensus {
 // executor list is not protected by the driver's fd_table_lock (targets vary).
 // No File retain/drop; file_identity is comparison-only, never dereference it.
 [[nodiscard]] auto selftest_fd_census_parked(const ker::test::lifecycle60::CensusLease& lease) -> SelftestFdCensus;
+void selftest_fd_census_current(const ker::test::numa_lifecycle::CurrentCensusScope&, SelftestFdCensus&);
 #endif
 
 // Reserve before backend effects. Slot publication cannot fail from EMFILE
@@ -49,6 +53,8 @@ class FdReservation {
    private:
 #ifdef WOS_SELFTEST
     friend auto selftest_fd_census_parked(const ker::test::lifecycle60::CensusLease&) -> SelftestFdCensus;
+    friend void selftest_fd_census_current(const ker::test::numa_lifecycle::CurrentCensusScope&, SelftestFdCensus&);
+    static void collect_selftest(mod::sched::task::Task&, uint64_t cookie, SelftestFdCensus&);
 #endif
     mod::sched::task::Task* m_table = nullptr;
     mod::sched::task::Task* m_executor = nullptr;

@@ -705,6 +705,59 @@ void report_seed_diagnostics() {
                diagnostics.predicate_observed ? 1U : 0U, diagnostics.predicate_valid ? 1U : 0U, u(diagnostics.predicate_selected_cached),
                u(diagnostics.predicate_foreign_cached), u(diagnostics.count), diagnostics.overflow ? 1U : 0U);
 }
+// Failure-only copied observations. The owner samples have DISTINCT bases;
+// none is synchronized with the seed-publication/final cheap node samples.
+// Read no released frame, current owner object, allocator metadata or provider.
+void report_closure_diagnostics() {
+    bool const REACHED = state.phase != nullptr && std::strcmp(state.phase, "physical-owner-closure") == 0;
+    bool const NODES_VALID = REACHED && state.baseline.complete && state.final.complete &&
+                             state.baseline.error == mm::NodeCounterError::NONE && state.final.error == mm::NodeCounterError::NONE &&
+                             state.baseline.node_count == 2 && state.final.node_count == 2;
+    log::error(
+        "closure_diag_v1 reached=%u nodes_valid=%u complete=%u/%u error=%u/%u nodes=%u/%u "
+        "node_bases=seed_publication/pressure_final owner_bases=pre_seed/pre_private_root/pressure_final_root_live",
+        REACHED ? 1U : 0U, NODES_VALID ? 1U : 0U, state.baseline.complete ? 1U : 0U, state.final.complete ? 1U : 0U,
+        static_cast<unsigned>(state.baseline.error), static_cast<unsigned>(state.final.error),
+        static_cast<unsigned>(state.baseline.node_count), static_cast<unsigned>(state.final.node_count));
+    if (!NODES_VALID) return;
+    auto magnitude = [](uint64_t a, uint64_t b) { return b >= a ? b - a : a - b; };
+    auto sign = [](uint64_t a, uint64_t b) { return b >= a ? '+' : '-'; };
+    if (NODES_VALID) {
+        for (size_t i = 0; i < 3; ++i) {
+            auto const& a = i < 2 ? state.baseline.nodes[i] : state.baseline.global;
+            auto const& b = i < 2 ? state.final.nodes[i] : state.final.global;
+            log::error(
+                "closure_diag_v1 kind=%s node=%u usable=%llu/%llu free=%llu/%llu d_free=%c%llu "
+                "cached=%llu/%llu buddy=%llu/%llu",
+                i < 2 ? "node" : "global", static_cast<unsigned>(i), u(a.usable), u(b.usable), u(a.free_inclusive), u(b.free_inclusive),
+                sign(a.free_inclusive, b.free_inclusive), u(magnitude(a.free_inclusive, b.free_inclusive)), u(a.cached), u(b.cached),
+                u(a.buddy_free), u(b.buddy_free));
+        }
+    }
+    const char* const labels[]{"pre_seed", "pre_private_root", "pressure_final_root_live"};
+    const phys::PhysicalBalanceSnapshot* const owners[]{&state.owner_before, &state.root_owner_before, &state.owner_after};
+    for (size_t i = 0; i < 3; ++i) {
+        auto const& row = *owners[i];
+        log::error(
+            "closure_diag_v1 physical_base=%s managed=%llu free=%llu metadata=%llu descriptor=%llu "
+            "cache_reserve=%llu/%llu owner=%llu identity=%llu mismatch=%llu untracked=%llu zones=%llu",
+            labels[i], u(row.managed_pages), u(row.free_pages), u(row.allocator_metadata_pages), u(row.zone_descriptor_pages),
+            u(row.per_cpu_page_cache_reserve_pages), u(row.per_cpu_page_cache_reserve_objects), u(row.owner_pages), u(row.identity_pages),
+            u(row.identity_mismatch_pages), u(row.untracked_unreclaimable_pages), u(row.zone_count));
+    }
+    for (size_t i = 0; i < mm::PHYSICAL_PAGE_OWNER_COUNT; ++i) {
+        auto const& a = state.owner_before.owners[i];
+        auto const& r = state.root_owner_before.owners[i];
+        auto const& b = state.owner_after.owners[i];
+        if (a.pages == r.pages && r.pages == b.pages && a.objects == r.objects && r.objects == b.objects) continue;
+        log::error(
+            "closure_diag_v1 owner=%u pages=%llu/%llu/%llu d_seed=%c%llu d_root=%c%llu "
+            "objects=%llu/%llu/%llu d_seed=%c%llu d_root=%c%llu",
+            static_cast<unsigned>(i), u(a.pages), u(r.pages), u(b.pages), sign(a.pages, b.pages), u(magnitude(a.pages, b.pages)),
+            sign(r.pages, b.pages), u(magnitude(r.pages, b.pages)), u(a.objects), u(r.objects), u(b.objects), sign(a.objects, b.objects),
+            u(magnitude(a.objects, b.objects)), sign(r.objects, b.objects), u(magnitude(r.objects, b.objects)));
+    }
+}
 auto prepare_seed_node(numa::NodeId node, PreparedSeeds& seeds, size_t offset) -> bool {
     auto const CONTEXT = numa::AllocationContext{.policy = {.nodes = uint64_t{1} << node, .mode = numa::Mode::BIND}, .local_node = node};
     for (size_t i = 0; i < SEEDS; ++i) {
@@ -923,6 +976,7 @@ void entry() {
     }
     if (!success) {
         report_seed_diagnostics();
+        report_closure_diagnostics();
         log::error(
             "NUMA_PRESSURE FAIL phase=%s reason=%s held=%llu cleanup=%u checks=%llu limit_captured=%u limit_bits=%u "
             "next_pages=%llu held_before_cleanup=%llu bulk_allocations=%llu order0_allocations=%llu tail_pages=%llu "

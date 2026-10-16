@@ -18,7 +18,18 @@ namespace ker::vfs {
 struct File;
 }
 
+#ifdef WOS_SELFTEST
+namespace ker::test::numa_lifecycle {
+struct RegistrySnapshot;
+}
+#endif
+
 namespace ker::syscall::vmem {
+#ifdef WOS_SELFTEST
+// Exclusive prefaulted output. Busy/overflow never qualify a prefix.
+void selftest_file_registry_snapshot(::ker::test::numa_lifecycle::RegistrySnapshot&) noexcept;
+#endif
+
 class SharedVmemPublicationGuard {
    public:
     SharedVmemPublicationGuard();
