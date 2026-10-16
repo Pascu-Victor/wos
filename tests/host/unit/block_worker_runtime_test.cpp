@@ -1114,7 +1114,10 @@ TEST(BlockWorkerRuntime, AcceptedBusyOwnerProgressesThroughTimedWorkerPrePassesW
         {
             std::lock_guard guard(scenario.provider.lock);
             scenario.provider.service_hook = [&](unsigned) {
+                // Completion may wake another healthy PRE before the observer
+                // resumes; only service of this still-owned request counts.
                 if (scenario.provider.issued.load(std::memory_order_acquire) != 0 &&
+                    !scenario.requests[0].completed.load(std::memory_order_acquire) &&
                     owned_services.fetch_add(1, std::memory_order_relaxed) + 1 == 3)
                     scenario.provider.auto_complete.store(true, std::memory_order_release);
             };
@@ -1143,7 +1146,10 @@ TEST(BlockWorkerRuntime, ActivePollDoesNotReplaceTimedWorkerPrePasses) {
         {
             std::lock_guard guard(scenario.provider.lock);
             scenario.provider.service_hook = [&](unsigned) {
+                // Keep the exact three owned passes independent of a later
+                // healthy PRE caused by the preserved completion wake.
                 if (scenario.provider.issued.load(std::memory_order_acquire) != 0 &&
+                    !scenario.requests[0].completed.load(std::memory_order_acquire) &&
                     owned_services.fetch_add(1, std::memory_order_relaxed) + 1 == 3)
                     scenario.provider.auto_complete.store(true, std::memory_order_release);
             };

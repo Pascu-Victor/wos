@@ -205,9 +205,24 @@ def require_mapping_stable_pin_contract() -> None:
         fail("VM pin success must transfer its actual held root gate")
 
     snapshot = function_body(virt_cpp, "snapshot_user_page_mapping_locked")
-    leaf = snapshot.index("PageTableEntry const& entry = entry_at(table, index_of(vaddr, 1))")
-    if "shared_write_restricted" in snapshot[:leaf] or "paging::shared_write_restricted(RAW)" not in snapshot[leaf:]:
-        fail("VM writable pin must enforce the final leaf's maximum permission independently of ancestor software tags")
+    resolver = function_body(virt_cpp, "resolve_user_leaf_locked")
+    for snippet in ["UserLeafResolution leaf{}", "resolve_user_leaf_locked(pagemap, vaddr, require_writable, leaf)",
+                    "physical_page = leaf.physical_4k", "leaf.raw"]:
+        if snippet not in snapshot:
+            fail(f"snapshot must use actual shared leaf resolver: {snippet}")
+    final_leaf = resolver.index("if (level == 1)")
+    if "shared_write_restricted" in resolver[:final_leaf] or "paging::shared_write_restricted(raw)" not in resolver[final_leaf:]:
+        fail("VM writable pin must enforce final leaf maximum permission independently of ancestor software tags")
+    for snippet in ["MutableUserEntrySlot::from(table, index, slot)", "uint64_t const raw = slot.load()",
+                    "(raw & paging::PAGE_PRESENT) == 0", "(raw & paging::PAGE_USER) == 0",
+                    "(raw & paging::PAGE_WRITE) == 0", "(raw & paging::PAGE_COW) != 0",
+                    "if (level != 2 ||", "managed_huge_registry.lookup_mapped(key,",
+                    "result.managed.key.pa_2m", "UserLeafKind::Unsupported"]:
+        if snippet not in resolver:
+            fail(f"shared resolver must check real ancestor access and exact managed PS provenance: {snippet}")
+    if not (resolver.index("if (level != 2 ||") < resolver.index("result.managed.key.pa_2m")
+            < resolver.index("if (level == 1)")):
+        fail("unknown or 1GiB PS must refuse before subpage frame authority")
 
     task_pin = function_body(virt_cpp, "pin_user_page_for_task")
     if "pin_user_page_common(task, expected_pagemap" not in task_pin:
@@ -216,19 +231,24 @@ def require_mapping_stable_pin_contract() -> None:
     write_commit = function_body(virt_cpp, "user_page_pin_commit_write")
     for snippet in [
         "user_mapping_pin_lock.lock_irqsave()",
-        "CURRENT_PAGE == pin.physical_page",
-        "!paging::shared_write_restricted(RAW)",
-        "__atomic_fetch_or(raw_entry, PTE_DIRTY_BIT, __ATOMIC_ACQ_REL)",
+        "serial == pin.root_incarnation",
+        "file_mapping_index.matches_pin_locked",
+        "resolve_user_leaf_locked(pin.pagemap, pin.user_page, true, leaf)",
+        "leaf.physical_4k == pin.physical_page",
+        "if (matches)",
+        "MutableUserEntrySlot::from(leaf.slot_table, leaf.slot_index, current)",
+        "current.mark_dirty()",
         "user_mapping_pin_lock.unlock_irqrestore",
     ]:
         if snippet not in write_commit:
             fail(f"stable usercopy write commit is incomplete: {snippet}")
-    if not (
-        write_commit.index("!paging::shared_write_restricted(RAW)")
-        < write_commit.index("__atomic_fetch_or(raw_entry, PTE_DIRTY_BIT, __ATOMIC_ACQ_REL)")
-        < write_commit.index("user_mapping_pin_lock.unlock_irqrestore")
-    ):
-        fail("stable usercopy write must check maximum leaf permission before marking the current frame dirty")
+    if not (write_commit.index("resolve_user_leaf_locked") < write_commit.index("if (matches)")
+            < write_commit.index("MutableUserEntrySlot::from") < write_commit.index("current.mark_dirty()")
+            < write_commit.index("user_mapping_pin_lock.unlock_irqrestore")):
+        fail("stable usercopy must resolve and match the CURRENT slot before atomic dirty commit")
+    dirty = function_body(virt_cpp, "mark_dirty")
+    if "__atomic_fetch_or(word_, uint64_t{1} << 6, __ATOMIC_ACQ_REL)" not in dirty:
+        fail("current mapping dirty commit must use one aligned atomic64 word")
 
     for snippet in [
         "USER_PAGEMAP_ACCESS_GATE_COUNT = 4096",
@@ -301,7 +321,13 @@ def require_mapping_stable_pin_contract() -> None:
     cow = function_body(virt_cpp, "resolve_user_write_mapping")
     if cow.count("user_mapping_pin_lock.lock_irqsave()") < 2:
         fail("COW must serialize both its initial leaf decision and final replacement with usercopy pins")
-    first_pin_lock = cow.find("user_mapping_pin_lock.lock_irqsave()")
+    legacy_pin_declaration = cow.find("uint64_t const PIN_LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave()")
+    first_pin_lock = cow.find("user_mapping_pin_lock.lock_irqsave()", legacy_pin_declaration)
+    managed_fast_path = cow.find("if (pml2e.present && pml2e.pagesize != 0)")
+    managed_resolve = cow.find("resolve_user_leaf_locked(PAGEMAP, VADDR, true, managed)", managed_fast_path)
+    managed_return = cow.find("return writable ? UserWriteFaultStatus::HANDLED : UserWriteFaultStatus::NOT_WRITABLE", managed_resolve)
+    if min(managed_fast_path, managed_resolve, managed_return) < 0 or not (managed_fast_path < managed_resolve < managed_return < first_pin_lock):
+        fail("present PS write fast path must require the actual managed provenance and permissions before old4K COW")
     old_frame_pin = cow.find("phys::page_ref_inc(old_virt, &cow_lookup)")
     release = cow.find("auto unlock_initial = [&]")
     release_brace = cow.find("{", release)

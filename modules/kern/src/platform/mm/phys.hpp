@@ -223,6 +223,21 @@ struct KernelStackPoolStatsSnapshot {
 };
 auto get_kernel_stack_pool_stats() -> KernelStackPoolStatsSnapshot;
 void page_free(void* page);
+struct NodeCacheDrainCursor {
+    uint32_t cpu{};
+    uint16_t slot{};
+    uint32_t visited{};  // Slot advances in the current bounded sweep.
+};
+struct NodeCacheDrainResult {
+    uint64_t scanned{};
+    uint64_t released{};
+    bool scan_complete{};
+    bool failed{};
+};
+// Scheduled masked reclaim only. Cache -> owning allocator lock order; no
+// aggregate counter snapshot or callbacks while a cache lock is held.
+[[nodiscard]] auto drain_page_caches_for_nodes(uint64_t node_mask, uint64_t release_budget, uint64_t scan_budget,
+                                               NodeCacheDrainCursor& cursor) noexcept -> NodeCacheDrainResult;
 auto can_wait_for_reclaim() -> bool;
 auto page_split_to_order0(void* page) -> bool;
 auto page_mark_kind(void* page, PageKind kind) -> bool;
@@ -284,7 +299,9 @@ using NodeCounterWorkspace = node_counters::Workspace;
 [[nodiscard]] auto initialize_node_counters_after_topology() noexcept -> NodeCounterError;
 [[nodiscard]] auto node_counters_ready() noexcept -> bool;
 // Counter-only simultaneous sample. Exclusive addressable BSS/caller buffers;
-// no incoming allocator/cache/VM locks or reclaim/IRQ/panic context.
+// no incoming allocator/cache/VM locks or IRQ/panic context. A scheduled
+// reclaim coordinator may sample between callbacks with only its scan lease;
+// never sample inside a source callback or allocation notification.
 [[nodiscard]] auto snapshot_node_counters(NodeCounterSnapshot& out, NodeCounterWorkspace& scratch) noexcept -> NodeCounterError;
 
 auto physical_owner_descriptors() -> std::span<const PhysicalOwnerDescriptor>;

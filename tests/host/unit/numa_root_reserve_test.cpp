@@ -12,6 +12,7 @@
 #include <platform/mm/numa_alloc.hpp>
 #include <platform/mm/numa_root_reserve.hpp>
 #include <platform/mm/phys.hpp>
+#include <platform/mm/reclaim.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <vector>
 
@@ -183,6 +184,15 @@ auto page_ref_dec(void* page) -> uint32_t {
     return OLD - 1;
 }
 }  // namespace ker::mod::mm::phys
+
+// This fixture has no scheduled reclaim worker. Actual factory notification
+// therefore reaches an explicit unavailable endpoint and cannot invent progress.
+namespace ker::mod::mm::reclaim {
+auto notify_order0_node_failure(uint16_t) noexcept -> NodeReclaimStatus {
+    host::require_no_locks();
+    return NodeReclaimStatus::NOT_READY;
+}
+}  // namespace ker::mod::mm::reclaim
 
 // Link primitives for the actual copied-context factory. The runtime adapter
 // extracts the exact current inline PreemptGuard; no scheduler is simulated.

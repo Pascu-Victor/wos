@@ -2,6 +2,7 @@
 
 #ifdef WOS_SELFTEST
 #include <platform/mm/lifecycle_census.hpp>
+#include <platform/mm/managed_huge.hpp>
 #include <platform/mm/numa_root_reserve.hpp>
 #endif
 
@@ -463,6 +464,26 @@ struct SelftestCowObservation {
                                                     SelftestCowAction action, SelftestCowObservation& observation) -> bool;
 // Native callers retain an actual Task-access hold for the exact expected root.
 // Observation is local to this call; production pin signatures are unchanged.
+// Diagnostic internal delegates only. Caller owns an exclusive, unpublished,
+// never-active Task/root; registration and these basic checks alone do not
+// establish that lifetime premise. All Prepared* objects are constructed and
+// prepared in the instrumented caller before entering excluded virt code.
+struct SelftestManagedHugeOptions {
+    uint16_t fail_before_table{UINT16_MAX};
+};
+struct SelftestManagedHugeReport {
+    uint64_t published{}, split{};
+    bool actual_full_flush_called{};
+};
+[[nodiscard]] auto selftest_publish_managed_huge(sched::task::Task&, uint64_t va, uint64_t flags, huge::PreparedSpan&,
+                                                 huge::PreparedTables& parents, huge::PreparedTables& mandatory_cleanup,
+                                                 SelftestManagedHugeReport&) -> huge::Error;
+[[nodiscard]] auto selftest_prepare_managed_split(sched::task::Task&, uint64_t start, uint64_t end, huge::PreparedTables&,
+                                                  const SelftestManagedHugeOptions& = {}) -> huge::Error;
+[[nodiscard]] auto selftest_commit_managed_split(sched::task::Task&, huge::PreparedTables&, SelftestManagedHugeReport&) -> huge::Error;
+[[nodiscard]] auto selftest_split_managed_huge(sched::task::Task&, uint64_t va, huge::PreparedTables& mandatory_cleanup,
+                                               SelftestManagedHugeReport&) -> huge::Error;
+
 struct UserPagePinPathObservation {
     uint32_t early_attempts{};
     uint32_t early_successes{};

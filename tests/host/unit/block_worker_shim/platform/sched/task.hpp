@@ -11,6 +11,7 @@
 
 namespace ker::mod::sched::task {
 enum class TaskType : uint8_t { DAEMON, PROCESS, IDLE };
+enum class TaskState : uint8_t { ACTIVE, EXITING, DEAD };
 enum class WaitChannelKind : uint8_t { NONE, GENERIC, WKI_EXECVE_PROXY, WAITPID };
 struct Task {
     TaskType type{TaskType::DAEMON};
@@ -30,7 +31,18 @@ struct Task {
     auto has_interrupting_signal_pending() const -> bool { return interrupting_signal_pending; }
     auto wait_channel_is(WaitChannelKind kind) const -> bool { return wait_channel != nullptr && wait_channel_kind == kind; }
     void (*entry)(){};
+    void (*&kthread_entry)() = entry;
+    // Host-only metadata mirrors the actual startup checks; no kernel layout.
+    std::atomic<TaskState> state{TaskState::ACTIVE};
+    std::atomic<bool> scheduler_published{};
+    std::atomic<bool> gc_queued{};
+    int32_t heap_index{-1};
+    enum class Queue : uint8_t { NONE, RUNNABLE, WAITING };
+    Queue sched_queue{Queue::NONE};
+    Task* sched_next{};
+    std::atomic<void*> sched_list_owner{};
     std::atomic<unsigned> references{1};
+    std::atomic<unsigned>& ref_count = references;
     std::atomic<bool> reject_acquire{};
     std::atomic<unsigned> lifetime_acquires{};
     std::atomic<bool> finished{};

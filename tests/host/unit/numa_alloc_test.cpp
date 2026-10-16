@@ -12,6 +12,7 @@
 #include <platform/mm/addr.hpp>
 #include <platform/mm/numa_alloc.hpp>
 #include <platform/mm/phys.hpp>
+#include <platform/mm/reclaim.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <string>
 #include <utility>
@@ -58,6 +59,7 @@ struct Backend {
     bool return_unmanaged_uma{};
     std::vector<uint64_t> failed_ranges{};
     std::vector<Call> calls{};
+    std::vector<std::pair<uint16_t, size_t>> notifications{};
     std::vector<Block> blocks{};
     std::vector<void*> decremented{};
 
@@ -220,6 +222,14 @@ auto get_phys_pointer(paddr_t pointer) -> paddr_t* {
     return reinterpret_cast<paddr_t*>(block->physical + OFFSET);
 }
 }  // namespace ker::mod::mm::addr
+
+namespace ker::mod::mm::reclaim {
+auto notify_order0_node_failure(uint16_t node) noexcept -> NodeReclaimStatus {
+    auto& model = backend();
+    model.notifications.emplace_back(node, model.calls.size());
+    return NodeReclaimStatus::NONE;
+}
+}  // namespace ker::mod::mm::reclaim
 
 namespace ker::mod::mm::phys {
 auto page_alloc_may_fail(PhysicalPageOwner owner, uint64_t bytes, std::string_view name) -> void* {
@@ -666,5 +676,50 @@ TEST_F(NumaAllocation, ContextRetainsMemorylessLocalForRealFactoryFallbackOrStri
     EXPECT_EQ(model.calls.size(), 1U);
     EXPECT_EQ(model.cpu_reads, 1U);
     EXPECT_EQ(model.preempt_depth, 0U);
+}
+TEST_F(NumaAllocation, FailedSelectedNodeNotifiesOnceAfterAllRealRangesBeforeFallback) {
+    model.domains(2);
+    auto const REMOTE = model.topology.memory[1];
+    model.topology.memory[0].length = LARGE;
+    model.topology.memory[1] = {model.topology.memory[0].base + LARGE, LARGE, 0, 0};
+    model.topology.memory[2] = REMOTE;
+    model.topology.memory_range_count = 3;
+    model.failed_ranges.push_back(model.topology.memory[0].base);
+    model.failed_ranges.push_back(model.topology.memory[1].base);
+    auto result = numa::try_allocate_pages({{}, 0, 0}, 1, PAGE, OWNER);
+    ASSERT_EQ(result.error, numa::AllocationError::NONE);
+    EXPECT_EQ(result.actual, 1);
+    ASSERT_EQ(model.notifications.size(), 1U);
+    EXPECT_EQ(model.notifications[0], (std::pair<uint16_t, size_t>{0, 2}));
+    ASSERT_EQ(model.calls.size(), 3U);
+}
+TEST_F(NumaAllocation, NodeNotificationNeverChangesPhysicalExhaustionAndSkipsUmaLargeAndNoRange) {
+    model.domains(2);
+    model.fail_all = true;
+    auto failed = numa::try_allocate_pages({{}, 0, 0}, 1, PAGE, OWNER);
+    expect_empty(failed, numa::AllocationError::EXHAUSTED);
+    ASSERT_EQ(model.notifications.size(), 2U);
+    EXPECT_EQ(model.notifications[0], (std::pair<uint16_t, size_t>{0, 1}));
+    EXPECT_EQ(model.notifications[1], (std::pair<uint16_t, size_t>{1, 2}));
+    model.notifications.clear();
+    model.calls.clear();
+    auto large = numa::try_allocate_pages({{}, 0, 0}, 512, LARGE, OWNER);
+    expect_empty(large, numa::AllocationError::EXHAUSTED);
+    EXPECT_TRUE(model.notifications.empty());
+    model.domains(1);
+    model.fail_all = true;
+    model.notifications.clear();
+    model.calls.clear();
+    auto uma = numa::try_allocate_pages({{}, 0, 0}, 1, PAGE, OWNER);
+    expect_empty(uma, numa::AllocationError::EXHAUSTED);
+    EXPECT_TRUE(model.notifications.empty());
+    model.domains(2);
+    model.topology.memory_range_count = 0;
+    model.notifications.clear();
+    model.calls.clear();
+    auto absent = numa::try_allocate_pages({{}, 0, 0}, 1, PAGE, OWNER);
+    expect_empty(absent, numa::AllocationError::EXHAUSTED);
+    EXPECT_TRUE(model.notifications.empty());
+    EXPECT_TRUE(model.calls.empty());
 }
 }  // namespace

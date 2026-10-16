@@ -3,6 +3,7 @@
 #include <platform/acpi/numa_boot.hpp>
 #include <platform/asm/cpu.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/reclaim.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <utility>
 
@@ -112,9 +113,11 @@ auto try_allocate_pages(const AllocationContext& context, uint32_t pages, uint64
 
     for (size_t selected = 0; selected < SELECTION.count; ++selected) {
         NodeId const NODE = SELECTION.nodes[selected];
+        bool attempted = false;
         for (size_t i = 0; i < topology->memory_range_count; ++i) {
             auto const& range = topology->memory[i];
             if (range.node != NODE) continue;
+            attempted = true;
             void* const SPAN = phys::page_alloc_order0_span_in_range_may_fail(owner, range.base, range.base + range.length, pages,
                                                                               alignment_bytes, initialization);
             if (SPAN == nullptr) continue;
@@ -125,6 +128,10 @@ auto try_allocate_pages(const AllocationContext& context, uint32_t pages, uint64
             result.error = AllocationError::NONE;
             return result;
         }
+        // Every matching physical attempt has returned and released its lock.
+        // Notify this failed selected node before the next permitted fallback;
+        // no extra allocation/reclaim attempt or allocation-result projection.
+        if (pages == 1 && topology->node_count > 1 && attempted) static_cast<void>(reclaim::notify_order0_node_failure(NODE));
     }
     return result;
 }

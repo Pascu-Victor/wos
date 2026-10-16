@@ -1,5 +1,7 @@
 #include "virt.hpp"
 
+#include <platform/mm/managed_huge.hpp>
+
 #ifdef WOS_SELFTEST
 #include <platform/mm/lifecycle_census.hpp>
 #endif
@@ -310,6 +312,7 @@ ker::mod::mm::lifecycle_census::OwnerLock user_mapping_pin_lock{selftest_root_ep
 sys::Spinlock user_mapping_pin_lock;
 #endif
 file_mapping::FileMappingIndex file_mapping_index;
+constinit huge::RegistryCore managed_huge_registry{};
 
 // Exact root associations use the same lock as pinned mapping snapshots. Only
 // copied serials escape; queued futexes never retain a control or root reader.
@@ -3475,14 +3478,471 @@ auto leaf_entry(PageTable* root, vaddr_t vaddr) -> PageTableEntry* {
     PageTable* table = root;
     for (int i = 4; i > 1; i--) {
         PageTableEntry& entry = entry_at(table, index_of(vaddr, i));
-        if (!entry.present) {
-            return nullptr;
+        if (!entry.present || entry.pagesize != 0) {
+            return nullptr;  // A PS data frame is never a next-level table.
         }
         table = reinterpret_cast<PageTable*>(addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT));
     }
 
     return &entry_at(table, index_of(vaddr, 1));
 }
+
+// BEGIN managed user-leaf scalar core. Actual table alignment, not packed
+// PageTableEntry's declared alignment, is the atomic representation contract.
+class MutableUserEntrySlot {
+   public:
+    [[gnu::always_inline]] static auto from(PageTable* table, size_t index, MutableUserEntrySlot& empty) noexcept -> bool {
+        auto const base = reinterpret_cast<uintptr_t>(table);
+        if (table == nullptr || (base & (paging::PAGE_SIZE - 1)) != 0 || index >= paging::PAGE_TABLE_ENTRIES || empty.word_ != nullptr)
+            return false;
+        auto const address = base + index * sizeof(uint64_t);
+        if ((address & (alignof(uint64_t) - 1)) != 0) return false;
+        empty.word_ = reinterpret_cast<uint64_t*>(address);
+        return true;
+    }
+    [[gnu::always_inline]] auto load() const noexcept -> uint64_t { return __atomic_load_n(word_, __ATOMIC_ACQUIRE); }
+    [[gnu::always_inline]] auto exchange(uint64_t& expected, uint64_t desired) const noexcept -> bool {
+        return __atomic_compare_exchange_n(word_, &expected, desired, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    }
+    [[gnu::always_inline]] void mark_dirty() const noexcept { (void)__atomic_fetch_or(word_, uint64_t{1} << 6, __ATOMIC_ACQ_REL); }
+
+   private:
+    uint64_t* word_{};
+};
+static_assert(sizeof(PageTableEntry) == 8 && offsetof(PageTable, entries) == 0);
+enum class UserLeafKind : uint8_t { Absent, Pml1, ManagedPml2, Unsupported };
+struct UserLeafResolution {
+    UserLeafKind kind{};
+    PageTable* slot_table{};
+    uint16_t slot_index{};
+    uint8_t level{};
+    uint64_t raw{}, physical_4k{};
+    huge::RootKey root{};
+    huge::MappedLeaf managed{};
+};
+// Pin lock held; the caller owns actual root lifetime. No allocation, physical
+// scan, topology access, or borrowed slot survives the enclosing pin section.
+auto resolve_user_leaf_locked(PageTable* root, vaddr_t address, bool writable, UserLeafResolution& output) noexcept -> bool {
+    if (root == nullptr || address >= (uint64_t{1} << 47)) return false;
+    auto const* control = find_user_root_control_locked(root);
+    huge::RootKey const key{reinterpret_cast<uint64_t>(root), control != nullptr ? control->serial : 0};
+    PageTable* table = root;
+    for (int level = 4; level >= 1; --level) {
+        auto const index = index_of(address, level);
+        MutableUserEntrySlot slot;
+        if (!MutableUserEntrySlot::from(table, index, slot)) return false;
+        uint64_t const raw = slot.load();
+        if ((raw & paging::PAGE_PRESENT) == 0 || (raw & paging::PAGE_USER) == 0 ||
+            (writable && ((raw & paging::PAGE_WRITE) == 0 || (raw & paging::PAGE_COW) != 0)))
+            return false;
+        UserLeafResolution result{};
+        result.slot_table = table;
+        result.slot_index = static_cast<uint16_t>(index);
+        result.level = static_cast<uint8_t>(level);
+        result.raw = raw;
+        result.root = key;
+        if (level > 1 && (raw & (uint64_t{1} << 7)) != 0) {
+            if (level != 2 ||
+                managed_huge_registry.lookup_mapped(key, address & ~(huge::LEAF_BYTES - 1), raw, result.managed) != huge::Error::None) {
+                result.kind = UserLeafKind::Unsupported;
+                output = result;
+                return false;
+            }
+            result.kind = UserLeafKind::ManagedPml2;
+            result.physical_4k = result.managed.key.pa_2m + (address & (huge::LEAF_BYTES - 1) & ~(paging::PAGE_SIZE - 1));
+            output = result;
+            return true;
+        }
+        if (level == 1) {
+            if (writable && paging::shared_write_restricted(raw)) return false;
+            result.kind = UserLeafKind::Pml1;
+            result.physical_4k = raw & PTE_FRAME_MASK;
+            output = result;
+            return true;
+        }
+        table = reinterpret_cast<PageTable*>(addr::get_virt_pointer(raw & PTE_FRAME_MASK));
+    }
+    return false;
+}
+// END managed user-leaf scalar core.
+
+// BEGIN private managed publication/split. All actual owners are constructed
+// by the instrumented caller. This excluded TU keeps only scalar views.
+class HugePublicationViewStorage {
+   public:
+    HugePublicationViewStorage() {
+#ifdef WOS_KASAN
+        if (kasan::is_enabled()) kasan::unpoison_range(bytes_, sizeof(bytes_));
+#endif
+        view_ = ::new (static_cast<void*>(bytes_)) huge::detail::SpanPublicationView{};
+    }
+    auto get() -> huge::detail::SpanPublicationView& { return *view_; }
+
+   private:
+    alignas(huge::detail::SpanPublicationView) uint8_t bytes_[sizeof(huge::detail::SpanPublicationView)];
+    huge::detail::SpanPublicationView* view_;
+};
+class ManagedRootReader {
+   public:
+    explicit ManagedRootReader(PageTable* root) { (void)acquire_user_pagemap_access(root, true, index_); }
+    ~ManagedRootReader() { release_user_pagemap_access(index_); }
+    auto valid() const -> bool { return index_ != USER_PAGEMAP_ACCESS_GATE_NONE; }
+    ManagedRootReader(const ManagedRootReader&) = delete;
+    auto operator=(const ManagedRootReader&) -> ManagedRootReader& = delete;
+
+   private:
+    size_t index_{USER_PAGEMAP_ACCESS_GATE_NONE};
+};
+enum class Pml2Walk : uint8_t { Absent, Slot, Unsupported };
+// No ancestor promotion, allocation, root-reader acquisition or ownership scan.
+auto managed_pml2_slot_locked(PageTable* root, uint64_t va, MutableUserEntrySlot& output) -> Pml2Walk {
+    if (root == nullptr || va >= (uint64_t{1} << 47)) return Pml2Walk::Unsupported;
+    auto* table = root;
+    for (int level = 4; level > 2; --level) {
+        MutableUserEntrySlot slot;
+        if (!MutableUserEntrySlot::from(table, index_of(va, level), slot)) return Pml2Walk::Unsupported;
+        uint64_t const raw = slot.load();
+        if ((raw & paging::PAGE_PRESENT) == 0) return raw == 0 ? Pml2Walk::Absent : Pml2Walk::Unsupported;
+        if ((raw & (uint64_t{1} << 7)) != 0) return Pml2Walk::Unsupported;
+        table = reinterpret_cast<PageTable*>(addr::get_virt_pointer(raw & PTE_FRAME_MASK));
+    }
+    return MutableUserEntrySlot::from(table, index_of(va, 2), output) ? Pml2Walk::Slot : Pml2Walk::Unsupported;
+}
+auto managed_root_matches_locked(huge::RootKey key) -> bool {
+    auto const* control = find_user_root_control_locked(reinterpret_cast<PageTable*>(key.address_bits));
+    return control != nullptr && key.incarnation != 0 && control->serial == key.incarnation;
+}
+auto managed_replace_ad_locked(const MutableUserEntrySlot& slot, uint64_t expected, uint64_t desired) -> bool {
+    constexpr uint64_t AD = (uint64_t{1} << 5) | (uint64_t{1} << 6);
+    auto observed = slot.load();
+    for (;;) {
+        if ((observed & ~AD) != (expected & ~AD)) return false;
+        uint64_t const replacement = (desired & ~AD) | (observed & AD);
+        if (slot.exchange(observed, replacement)) return true;
+    }
+}
+auto managed_table_owner_valid(PageTable* table) -> bool {
+    return table != nullptr && (reinterpret_cast<uint64_t>(table) & (paging::PAGE_SIZE - 1)) == 0 &&
+           phys::page_kind_get(table) == PageKind::PAGE_TABLE && phys::page_ref_get(table) == 1;
+}
+auto managed_plan_owners_valid(const huge::SplitPlanStorage& storage) -> bool {
+    if (storage.table_count == 0 || storage.table_count > huge::MAX_PLAN_TABLES) return false;
+    for (uint16_t i = 0; i < storage.table_count; ++i) {
+        if (!managed_table_owner_valid(storage.tables[i]) || (storage.table_physical[i] & ~PTE_FRAME_MASK) != 0 ||
+            storage.table_physical[i] != reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<uint64_t>(storage.tables[i]))))
+            return false;
+        for (uint16_t j = 0; j < i; ++j)
+            if (storage.tables[i] == storage.tables[j]) return false;
+    }
+    return true;
+}
+// Existing PUB -> COW -> pin, all outputs already addressable. An exclusive
+// unpublished owner supplies preparation lifetime, not the copied RootKey.
+auto survey_managed_split_locked(huge::RootKey key, uint64_t start, uint64_t end, huge::SplitPlanStorage* storage, uint16_t& count)
+    -> huge::Error {
+    if (!managed_root_matches_locked(key)) return huge::Error::Again;
+    auto* root = reinterpret_cast<PageTable*>(key.address_bits);
+    count = 0;
+    for (uint64_t va = start; va < end; va += huge::LEAF_BYTES) {
+        MutableUserEntrySlot slot;
+        auto const walk = managed_pml2_slot_locked(root, va, slot);
+        if (walk == Pml2Walk::Absent) continue;
+        if (walk != Pml2Walk::Slot) return huge::Error::Unsupported;
+        uint64_t const raw = slot.load();
+        if ((raw & paging::PAGE_PRESENT) == 0 || (raw & (uint64_t{1} << 7)) == 0) continue;
+        huge::MappedLeaf leaf{};
+        if (managed_huge_registry.lookup_mapped(key, va, raw, leaf) != huge::Error::None) return huge::Error::Unsupported;
+        if (count == huge::MAX_ROOT_LEAVES) return huge::Error::Capacity;
+        if (storage != nullptr) {
+            if (count >= storage->table_count) return huge::Error::Again;
+            storage->descriptors[count] = {leaf.key, leaf.handle, leaf.semantic_word};
+        }
+        ++count;
+    }
+    return huge::Error::None;
+}
+// Heap/table allocation and instrumented preparation happen outside every
+// publication/root-reader/MM guard. At most 2 complete EAGAIN retries.
+[[maybe_unused]] auto prepare_managed_split_plan(PageTable* root, uint64_t start, uint64_t end, huge::PreparedTables& empty
+#ifdef WOS_SELFTEST
+                                                 ,
+                                                 uint16_t fail_before_table = UINT16_MAX
+#endif
+                                                 ) -> huge::Error {
+    if (!empty.empty() || !huge::RegistryCore::valid_va(start) || end <= start || end > (uint64_t{1} << 47) ||
+        (end & (huge::LEAF_BYTES - 1)) != 0)
+        return huge::Error::Invalid;
+    if ((end - start) / huge::LEAF_BYTES > huge::MAX_ROOT_LEAVES) return huge::Error::Unsupported;
+    huge::RootKey key{};
+    if (auto const error = huge::detail::root_key(root, key); error != huge::Error::None) return error;
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        uint16_t required = 0;
+        huge::Error error;
+        {
+            ker::syscall::vmem::SharedVmemPublicationGuard publication;
+            uint64_t const cow = cow_pte_lock.lock_irqsave();
+            uint64_t const pin = user_mapping_pin_lock.lock_irqsave();
+            error = survey_managed_split_locked(key, start, end, nullptr, required);
+            user_mapping_pin_lock.unlock_irqrestore(pin);
+            cow_pte_lock.unlock_irqrestore(cow);
+        }
+        if (error != huge::Error::None) {
+            if (error == huge::Error::Again) continue;
+            return error;
+        }
+        if (required == 0) return huge::Error::None;
+        auto const prepared =
+#ifdef WOS_SELFTEST
+            huge::detail::PreparationAccess::prepare_tables_for_test(empty, required, fail_before_table);
+#else
+            empty.prepare(required);
+#endif
+        if (prepared != huge::Error::None) return prepared;
+        auto* storage = huge::detail::PreparationAccess::plan_storage(empty);
+        if (storage == nullptr || !managed_plan_owners_valid(*storage)) {
+            empty.reset();
+            return huge::Error::Invalid;
+        }
+        uint16_t actual = 0;
+        {
+            ker::syscall::vmem::SharedVmemPublicationGuard publication;
+            uint64_t const cow = cow_pte_lock.lock_irqsave();
+            uint64_t const pin = user_mapping_pin_lock.lock_irqsave();
+            error = survey_managed_split_locked(key, start, end, storage, actual);
+            user_mapping_pin_lock.unlock_irqrestore(pin);
+            cow_pte_lock.unlock_irqrestore(cow);
+        }
+        if (error == huge::Error::None) {
+            if (actual == 0) {
+                empty.reset();
+                return huge::Error::None;
+            }
+            storage->root = key;
+            storage->start = start;
+            storage->end = end;
+            storage->descriptor_count = actual;
+            storage->purpose = huge::PlanPurpose::Split;
+            storage->surveyed = true;
+            // Private tables are filled before incoming locks. All original
+            // WB anonymous P/W/U/NX semantics survive; A/D are conservative.
+            constexpr uint64_t PERMISSIONS = paging::PAGE_PRESENT | paging::PAGE_WRITE | paging::PAGE_USER | paging::PAGE_NX;
+            constexpr uint64_t AD = (uint64_t{1} << 5) | (uint64_t{1} << 6);
+            for (uint16_t i = 0; i < actual; ++i) {
+                auto const& descriptor = storage->descriptors[i];
+                auto* words = reinterpret_cast<uint64_t*>(storage->tables[i]);
+                for (uint64_t page = 0; page < huge::LEAF_PAGES; ++page)
+                    words[page] = (descriptor.key.pa_2m + page * paging::PAGE_SIZE) | (descriptor.semantic_word & PERMISSIONS) | AD;
+            }
+            return huge::Error::None;
+        }
+        empty.reset();
+        if (error != huge::Error::Again) return error;
+    }
+    return huge::Error::Again;
+}
+// PUB is actual typed caller authority. The temporary root reader is compatible
+// with already held stable pins; it excludes retirement, not representation.
+[[maybe_unused]] auto commit_managed_split_plan(PageTable* root, huge::PreparedTables& plan,
+                                                const ker::syscall::vmem::SharedVmemPublicationGuard&) -> huge::Error {
+    auto* storage = huge::detail::PreparationAccess::plan_storage(plan);
+    if (storage == nullptr || storage->purpose != huge::PlanPurpose::Split || !storage->surveyed ||
+        storage->root.address_bits != reinterpret_cast<uint64_t>(root) || storage->descriptor_count == 0 ||
+        storage->descriptor_count > storage->table_count || !huge::RegistryCore::valid_va(storage->start) ||
+        storage->end <= storage->start || storage->end > (uint64_t{1} << 47) || (storage->end & (huge::LEAF_BYTES - 1)) != 0 ||
+        (storage->end - storage->start) / huge::LEAF_BYTES > huge::MAX_ROOT_LEAVES || !managed_plan_owners_valid(*storage))
+        return huge::Error::Invalid;
+    ManagedRootReader reader(root);
+    if (!reader.valid()) return huge::Error::Again;
+    uint64_t const cow = cow_pte_lock.lock_irqsave();
+    uint64_t const pin = user_mapping_pin_lock.lock_irqsave();
+    uint16_t actual_count = 0;
+    bool valid = survey_managed_split_locked(storage->root, storage->start, storage->end, nullptr, actual_count) == huge::Error::None &&
+                 actual_count == storage->descriptor_count;
+    // Validate the WHOLE plan before the first actual PTE/index mutation.
+    for (uint16_t i = 0; valid && i < storage->descriptor_count; ++i) {
+        auto const& d = storage->descriptors[i];
+        MutableUserEntrySlot slot;
+        valid = huge::RegistryCore::same_root(d.key.root, storage->root) && d.key.va_2m >= storage->start && d.key.va_2m < storage->end &&
+                managed_pml2_slot_locked(root, d.key.va_2m, slot) == Pml2Walk::Slot &&
+                managed_huge_registry.match_mapped(d.handle, d.key, slot.load()) &&
+                (slot.load() & ~uint64_t{0x60}) == (d.semantic_word & ~uint64_t{0x60});
+        if (i != 0 && storage->descriptors[i - 1].key.va_2m >= d.key.va_2m) valid = false;
+    }
+    if (!valid) {
+        user_mapping_pin_lock.unlock_irqrestore(pin);
+        cow_pte_lock.unlock_irqrestore(cow);
+        return huge::Error::Again;
+    }
+    for (uint16_t i = 0; i < storage->descriptor_count; ++i) {
+        auto const& d = storage->descriptors[i];
+        MutableUserEntrySlot slot;
+        if (managed_pml2_slot_locked(root, d.key.va_2m, slot) != Pml2Walk::Slot ||
+            managed_huge_registry.begin_split(d.handle, d.key) != huge::Error::None)
+            __builtin_trap();
+        uint64_t const pt = storage->table_physical[i] | paging::PAGE_PRESENT | paging::PAGE_WRITE | paging::PAGE_USER;
+        if (!managed_replace_ad_locked(slot, d.semantic_word, pt)) __builtin_trap();
+    }
+    user_mapping_pin_lock.unlock_irqrestore(pin);
+    cow_pte_lock.unlock_irqrestore(cow);
+    // No return/callback/wait between publication and local ownership transfer.
+    uint64_t const adopted = storage->descriptor_count == 64 ? UINT64_MAX : (uint64_t{1} << storage->descriptor_count) - 1;
+    huge::detail::PreparationAccess::tables_transferred_after_publish(plan, adopted);
+    flush_pagemap_after_update(root, 0, true);
+    // Only this lexical post-real-flush completion returns managed capacity.
+    uint64_t const finish_cow = cow_pte_lock.lock_irqsave();
+    uint64_t const finish_pin = user_mapping_pin_lock.lock_irqsave();
+    if (!managed_root_matches_locked(storage->root)) __builtin_trap();
+    for (uint16_t i = 0; i < storage->descriptor_count; ++i) {
+        auto const& d = storage->descriptors[i];
+        MutableUserEntrySlot current;
+        constexpr uint64_t AD = (uint64_t{1} << 5) | (uint64_t{1} << 6);
+        uint64_t const expected_pt = storage->table_physical[i] | paging::PAGE_PRESENT | paging::PAGE_WRITE | paging::PAGE_USER;
+        if (managed_pml2_slot_locked(root, d.key.va_2m, current) != Pml2Walk::Slot || (current.load() & ~AD) != expected_pt ||
+            managed_huge_registry.complete_split_after_ack(d.handle) != huge::Error::None)
+            __builtin_trap();
+        for (uint64_t page = 0; page < huge::LEAF_PAGES; ++page)
+            owned_frame_track_fresh_normal_mapping(root, d.key.va_2m + page * paging::PAGE_SIZE, d.key.pa_2m + page * paging::PAGE_SIZE,
+                                                   d.semantic_word & ~(uint64_t{1} << 7));
+    }
+    user_mapping_pin_lock.unlock_irqrestore(finish_pin);
+    cow_pte_lock.unlock_irqrestore(finish_cow);
+    storage->surveyed = false;
+    return huge::Error::None;
+}
+// An already owned cleanup table is filled/bound without allocation before
+// the fixture may leave a published PS behind on ANY later failure path.
+auto bind_preallocated_cleanup_split(PageTable* root, uint64_t va, huge::PreparedTables& cleanup) -> huge::Error {
+    auto* storage = huge::detail::PreparationAccess::plan_storage(cleanup);
+    if (storage == nullptr || storage->table_count != 1 || storage->purpose != huge::PlanPurpose::Unbound ||
+        !managed_plan_owners_valid(*storage))
+        return huge::Error::Invalid;
+    huge::RootKey key{};
+    if (auto const error = huge::detail::root_key(root, key); error != huge::Error::None) return error;
+    huge::MappedLeaf leaf{};
+    {
+        uint64_t const cow = cow_pte_lock.lock_irqsave();
+        uint64_t const pin = user_mapping_pin_lock.lock_irqsave();
+        MutableUserEntrySlot slot;
+        bool const valid = managed_root_matches_locked(key) && managed_pml2_slot_locked(root, va, slot) == Pml2Walk::Slot &&
+                           managed_huge_registry.lookup_mapped(key, va, slot.load(), leaf) == huge::Error::None;
+        user_mapping_pin_lock.unlock_irqrestore(pin);
+        cow_pte_lock.unlock_irqrestore(cow);
+        if (!valid) return huge::Error::Again;
+    }
+    storage->root = key;
+    storage->start = va;
+    storage->end = va + huge::LEAF_BYTES;
+    storage->descriptor_count = 1;
+    storage->descriptors[0] = {leaf.key, leaf.handle, leaf.semantic_word};
+    storage->purpose = huge::PlanPurpose::Split;
+    storage->surveyed = true;
+    auto* words = reinterpret_cast<uint64_t*>(storage->tables[0]);
+    for (uint64_t page = 0; page < huge::LEAF_PAGES; ++page)
+        words[page] = (leaf.key.pa_2m + page * paging::PAGE_SIZE) |
+                      (leaf.semantic_word & (paging::PAGE_PRESENT | paging::PAGE_WRITE | paging::PAGE_USER | paging::PAGE_NX)) |
+                      (uint64_t{1} << 5) | (uint64_t{1} << 6);
+    return huge::Error::None;
+}
+// Span and both table owners are instrumented-caller constructed/addressable.
+// Cleanup is validated before publication, then bound infallibly immediately
+// after the actual mapping becomes owned. No public syscall reaches this path.
+[[maybe_unused]] auto publish_managed_2m_prepared(PageTable* root, uint64_t va, uint64_t flags, huge::PreparedSpan& span,
+                                                  huge::PreparedTables& parents, huge::PreparedTables& cleanup) -> huge::Error {
+    constexpr uint64_t PERMISSIONS = paging::PAGE_PRESENT | paging::PAGE_WRITE | paging::PAGE_USER | paging::PAGE_NX;
+    if (!huge::RegistryCore::valid_va(va) || (flags & paging::PAGE_PRESENT) == 0 || (flags & ~PERMISSIONS) != 0)
+        return huge::Error::Invalid;
+    auto* parent_storage = huge::detail::PreparationAccess::plan_storage(parents);
+    auto* cleanup_storage = huge::detail::PreparationAccess::plan_storage(cleanup);
+    if (parent_storage == nullptr || cleanup_storage == nullptr || parent_storage == cleanup_storage || parent_storage->table_count != 2 ||
+        cleanup_storage->table_count != 1 || parent_storage->purpose != huge::PlanPurpose::Unbound ||
+        cleanup_storage->purpose != huge::PlanPurpose::Unbound || !managed_plan_owners_valid(*parent_storage) ||
+        !managed_plan_owners_valid(*cleanup_storage))
+        return huge::Error::Invalid;
+    for (uint16_t i = 0; i < parent_storage->table_count; ++i) {
+        if (parent_storage->tables[i] == cleanup_storage->tables[0]) return huge::Error::Invalid;
+        auto const* words = reinterpret_cast<const uint64_t*>(parent_storage->tables[i]);
+        for (size_t word = 0; word < paging::PAGE_TABLE_ENTRIES; ++word)
+            if (words[word] != 0) return huge::Error::Invalid;
+    }
+    HugePublicationViewStorage view_storage;
+    auto& view = view_storage.get();
+    if (!huge::detail::PreparationAccess::span_view(span, view)) return huge::Error::Invalid;
+    // Reject malformed physical encoding BEFORE any PTE/registry mutation.
+    constexpr uint64_t HUGE_FRAME = PTE_FRAME_MASK & ~(huge::LEAF_BYTES - 1);
+    if ((view.physical_2m & ~HUGE_FRAME) != 0) return huge::Error::Invalid;
+    huge::RootKey key{};
+    if (auto const error = huge::detail::root_key(root, key); error != huge::Error::None) return error;
+    huge::LeafKey const leaf{key, va, view.physical_2m};
+    uint64_t const ps = view.physical_2m | flags | (uint64_t{1} << 7);
+    uint64_t adopted = 0;
+    {
+        ker::syscall::vmem::SharedVmemPublicationGuard publication;
+        ManagedRootReader reader(root);
+        if (!reader.valid()) return huge::Error::Again;
+        uint64_t const cow = cow_pte_lock.lock_irqsave();
+        uint64_t const pin = user_mapping_pin_lock.lock_irqsave();
+        PageTable* table = root;
+        MutableUserEntrySlot slots[3];
+        uint64_t expected[3]{};
+        bool valid = managed_root_matches_locked(key) && managed_huge_registry.validate_preparing(view.handle, leaf, view.actual);
+        uint16_t next = 0;
+        for (int level = 4; valid && level >= 2; --level) {
+            auto const i = static_cast<size_t>(4 - level);
+            valid = MutableUserEntrySlot::from(table, index_of(va, level), slots[i]);
+            if (!valid) break;
+            expected[i] = slots[i].load();
+            if (level == 2) {
+                valid = expected[i] == 0;
+                break;
+            }
+            if (expected[i] == 0) {
+                if (next >= parent_storage->table_count) {
+                    valid = false;
+                    break;
+                }
+                table = parent_storage->tables[next++];
+            } else if ((expected[i] & paging::PAGE_PRESENT) == 0 || (expected[i] & (uint64_t{1} << 7)) != 0) {
+                valid = false;
+            } else {
+                table = reinterpret_cast<PageTable*>(addr::get_virt_pointer(expected[i] & PTE_FRAME_MASK));
+            }
+        }
+        if (!valid) {
+            user_mapping_pin_lock.unlock_irqrestore(pin);
+            cow_pte_lock.unlock_irqrestore(cow);
+            return huge::Error::Again;
+        }
+        // Preflight above includes every destination. Private children first,
+        // then their parents; only complete validated links become reachable.
+        if (!managed_replace_ad_locked(slots[2], 0, ps)) __builtin_trap();
+        uint16_t used = next;
+        for (int i = 1; i >= 0; --i) {
+            uint64_t desired = expected[i];
+            if (desired == 0) {
+                --used;
+                desired = parent_storage->table_physical[used] | paging::PAGE_PRESENT | paging::PAGE_WRITE | paging::PAGE_USER;
+                adopted |= uint64_t{1} << used;
+            } else {
+                desired |= paging::PAGE_WRITE | paging::PAGE_USER;
+                if ((flags & paging::PAGE_NX) == 0) desired &= ~paging::PAGE_NX;
+            }
+            if (!managed_replace_ad_locked(slots[i], expected[i], desired)) __builtin_trap();
+        }
+        if (managed_huge_registry.publish_mapped(view.handle, leaf, ps) != huge::Error::None) __builtin_trap();
+        user_mapping_pin_lock.unlock_irqrestore(pin);
+        cow_pte_lock.unlock_irqrestore(cow);
+        huge::detail::PreparationAccess::span_transferred_after_publish(span);
+        huge::detail::PreparationAccess::tables_transferred_after_publish(parents, adopted);
+        // A full real flush also covers any ancestor promotion.
+        flush_pagemap_after_update(root, 0, true);
+        // Binding uses only the already owned mandatory cleanup PML1. It does
+        // no allocation and cannot fail after the preflight/proven publication.
+        if (bind_preallocated_cleanup_split(root, va, cleanup) != huge::Error::None) __builtin_trap();
+    }
+    parents.reset();
+    return huge::Error::None;
+}
+// END private managed publication/split.
 
 auto present_mapping_entry(PageTable* root, vaddr_t vaddr) -> const PageTableEntry* {
     if (root == nullptr) {
@@ -3555,42 +4015,12 @@ auto user_page_writable_now_impl(PageTable* pagemap, vaddr_t vaddr) -> bool {
 auto snapshot_user_page_mapping_locked(PageTable* pagemap, vaddr_t vaddr, bool require_writable, paddr_t& physical_page,
                                        bool* dirty = nullptr, uint64_t* leaf_flags = nullptr) -> bool {
     physical_page = PADDR_INVALID;
-    if (dirty != nullptr) {
-        *dirty = false;
-    }
-    if (pagemap == nullptr || vaddr >= 0x0000800000000000ULL) {
-        return false;
-    }
-
-    PageTable const* table = pagemap;
-    for (int level = 4; level > 1; --level) {
-        PageTableEntry const& entry = entry_at(table, index_of(vaddr, level));
-        uint64_t const RAW = pte_raw(entry);
-        if (entry.present == 0 || entry.user == 0 || (require_writable && (entry.writable == 0 || (RAW & paging::PAGE_COW) != 0U))) {
-            return false;
-        }
-        // The physical allocator cannot currently pin a sub-page of a huge
-        // leaf independently, so fail closed instead of guessing ownership.
-        if (level < 4 && entry.pagesize != 0) {
-            return false;
-        }
-        table = reinterpret_cast<PageTable const*>(addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT));
-    }
-
-    PageTableEntry const& entry = entry_at(table, index_of(vaddr, 1));
-    uint64_t const RAW = pte_raw(entry);
-    if (entry.present == 0 || entry.user == 0 ||
-        (require_writable && (entry.writable == 0 || (RAW & paging::PAGE_COW) != 0U || paging::shared_write_restricted(RAW)))) {
-        return false;
-    }
-
-    physical_page = static_cast<paddr_t>(entry.frame) << paging::PAGE_SHIFT;
-    if (dirty != nullptr) {
-        *dirty = entry.dirty != 0;
-    }
-    if (leaf_flags != nullptr) {
-        *leaf_flags = RAW;
-    }
+    if (dirty != nullptr) *dirty = false;
+    UserLeafResolution leaf{};
+    if (!resolve_user_leaf_locked(pagemap, vaddr, require_writable, leaf)) return false;
+    physical_page = leaf.physical_4k;
+    if (dirty != nullptr) *dirty = (leaf.raw & (uint64_t{1} << 6)) != 0;
+    if (leaf_flags != nullptr) *leaf_flags = leaf.raw;
     return true;
 }
 
@@ -3719,12 +4149,20 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr, const De
         PageTableEntry& pml3e = entry_at(pml3, IDX3);
         if (!pml3e.present || pml3e.pagesize != 0) {
             cow_pte_lock.unlock_irqrestore(LOCK_FLAGS);
-            return UserWriteFaultStatus::NEED_LAZY_BACKING;
+            return pml3e.present ? UserWriteFaultStatus::NOT_WRITABLE : UserWriteFaultStatus::NEED_LAZY_BACKING;
         }
 
         auto* pml2 = reinterpret_cast<paging::PageTable*>(addr::get_virt_pointer(pml3e.frame << paging::PAGE_SHIFT));
         PageTableEntry& pml2e = entry_at(pml2, IDX2);
-        if (!pml2e.present || pml2e.pagesize != 0) {
+        if (pml2e.present && pml2e.pagesize != 0) {
+            uint64_t const pin_flags = user_mapping_pin_lock.lock_irqsave();
+            UserLeafResolution managed{};
+            bool const writable = resolve_user_leaf_locked(PAGEMAP, VADDR, true, managed);
+            user_mapping_pin_lock.unlock_irqrestore(pin_flags);
+            cow_pte_lock.unlock_irqrestore(LOCK_FLAGS);
+            return writable ? UserWriteFaultStatus::HANDLED : UserWriteFaultStatus::NOT_WRITABLE;
+        }
+        if (!pml2e.present) {
             cow_pte_lock.unlock_irqrestore(LOCK_FLAGS);
             return UserWriteFaultStatus::NEED_LAZY_BACKING;
         }
@@ -4332,7 +4770,68 @@ auto map_2m_page(PageTable* page_table, vaddr_t vaddr, paddr_t paddr, uint64_t f
     return true;
 }
 
-auto map_boot_direct_range(PageTable* page_table, Range range, uint64_t flags) -> BootDirectMapStats {
+// Boot HHDM leaves are permanent borrowed RAM translations. This bounded
+// read-only recognizer neither grants user-leaf authority nor demotes a leaf.
+auto boot_direct_map_allows_2m(uint64_t type) noexcept -> bool { return type == LIMINE_MEMMAP_USABLE; }
+
+auto kernel_hhdm_2m_flags_match(uint64_t pml4_raw, uint64_t pml3_raw, uint64_t leaf_raw, uint64_t flags) noexcept -> bool {
+    constexpr uint64_t PS = uint64_t{1} << 7;
+    constexpr uint64_t AD = (uint64_t{1} << 5) | (uint64_t{1} << 6);
+    constexpr uint64_t REQUEST = paging::PAGE_PRESENT | paging::PAGE_WRITE | paging::PAGE_PWT | paging::PAGE_PCD | paging::PAGE_NX;
+    constexpr uint64_t ANCESTOR = PTE_FRAME_MASK | REQUEST | (uint64_t{1} << 5);
+    constexpr uint64_t LEAF = (PTE_FRAME_MASK & ~(LARGE_PAGE_2M_BYTES - 1)) | REQUEST | PS | AD;
+    if ((flags & paging::PAGE_PRESENT) == 0 || (flags & ~REQUEST) != 0 || (pml4_raw & paging::PAGE_PRESENT) == 0 ||
+        (pml3_raw & paging::PAGE_PRESENT) == 0 || (pml4_raw & ~ANCESTOR) != 0 || (pml3_raw & ~ANCESTOR) != 0 ||
+        (leaf_raw & (paging::PAGE_PRESENT | PS)) != (paging::PAGE_PRESENT | PS) || (leaf_raw & ~LEAF) != 0 ||
+        (leaf_raw & REQUEST) != flags) {
+        return false;
+    }
+    // A restrictive parent must not hide leaf permissions that a later parent
+    // promotion would expose. Raw leaf permissions above must match as well.
+    if ((flags & paging::PAGE_WRITE) != 0 && ((pml4_raw & pml3_raw & paging::PAGE_WRITE) == 0)) return false;
+    if ((flags & paging::PAGE_NX) == 0 && ((pml4_raw | pml3_raw) & paging::PAGE_NX) != 0) return false;
+    return true;
+}
+
+auto kernel_hhdm_entry_raw(PageTable const* table, size_t index) noexcept -> uint64_t {
+    // Actual allocated page alignment, not packed PageTable's type alignment.
+    auto const base = reinterpret_cast<uintptr_t>(table);
+    if (table == nullptr || (base & (paging::PAGE_SIZE - 1)) != 0 || index >= paging::PAGE_TABLE_ENTRIES) return 0;
+    auto const* word = reinterpret_cast<uint64_t const*>(base + index * sizeof(uint64_t));
+    return __atomic_load_n(word, __ATOMIC_ACQUIRE);
+}
+
+auto kernel_hhdm_2m_mapping_matches(PageTable* root, vaddr_t address, paddr_t physical, uint64_t flags) noexcept -> bool {
+    uint64_t const HHDM = addr::get_hhdm_offset();
+    if (root == nullptr || root != kernel_pagemap || address < 0xffff800000000000ULL || HHDM < 0xffff800000000000ULL ||
+        (address & (paging::PAGE_SIZE - 1)) != 0 || (physical & ~PTE_FRAME_MASK) != 0 || physical > UINT64_MAX - HHDM ||
+        address != HHDM + physical)
+        return false;
+
+    // map_2m_page is the only kernel PS publisher; after boot these ancestors
+    // and leaves remain permanent. Read under the existing leaf-pin lock. No
+    // allocation, callbacks, addressability work or shootdown occurs here.
+    uint64_t const LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
+    constexpr uint64_t ANCESTOR_ALLOWED = PTE_FRAME_MASK | paging::PAGE_PRESENT | paging::PAGE_WRITE | paging::PAGE_PWT | paging::PAGE_PCD |
+                                          paging::PAGE_NX | (uint64_t{1} << 5);
+    uint64_t const PML4 = kernel_hhdm_entry_raw(root, index_of(address, 4));
+    bool result = false;
+    if ((PML4 & paging::PAGE_PRESENT) != 0 && (PML4 & ~ANCESTOR_ALLOWED) == 0) {
+        auto const* pml3 = reinterpret_cast<PageTable const*>(addr::get_virt_pointer(PML4 & PTE_FRAME_MASK));
+        uint64_t const PML3 = kernel_hhdm_entry_raw(pml3, index_of(address, 3));
+        // This check rejects 1GiB PS before its physical frame is dereferenced.
+        if ((PML3 & paging::PAGE_PRESENT) != 0 && (PML3 & ~ANCESTOR_ALLOWED) == 0) {
+            auto const* pml2 = reinterpret_cast<PageTable const*>(addr::get_virt_pointer(PML3 & PTE_FRAME_MASK));
+            uint64_t const LEAF = kernel_hhdm_entry_raw(pml2, index_of(address, 2));
+            uint64_t const BASE = LEAF & PTE_FRAME_MASK & ~(LARGE_PAGE_2M_BYTES - 1);
+            result = kernel_hhdm_2m_flags_match(PML4, PML3, LEAF, flags) && BASE + (address & (LARGE_PAGE_2M_BYTES - 1)) == physical;
+        }
+    }
+    user_mapping_pin_lock.unlock_irqrestore(LOCK_FLAGS);
+    return result;
+}
+
+auto map_boot_direct_range(PageTable* page_table, Range range, uint64_t flags, bool allow_large) -> BootDirectMapStats {
     BootDirectMapStats stats{};
     if (!range_valid(range)) {
         return stats;
@@ -4343,7 +4842,7 @@ auto map_boot_direct_range(PageTable* page_table, Range range, uint64_t flags) -
     bool const HHDM_SUPPORTS_2M = is_aligned_to(addr::get_hhdm_offset(), LARGE_PAGE_2M_BYTES);
     for (uint64_t phys = range.start; phys < range.end; phys += paging::PAGE_SIZE) {
         auto const VADDR = reinterpret_cast<vaddr_t>(addr::get_virt_pointer(phys));
-        if (HHDM_SUPPORTS_2M && is_aligned_to(phys, LARGE_PAGE_2M_BYTES) && range.end - phys >= LARGE_PAGE_2M_BYTES &&
+        if (allow_large && HHDM_SUPPORTS_2M && is_aligned_to(phys, LARGE_PAGE_2M_BYTES) && range.end - phys >= LARGE_PAGE_2M_BYTES &&
             map_2m_page(page_table, VADDR, phys, flags)) {
             stats.pages += paging::PAGE_TABLE_ENTRIES;
             stats.large_2m++;
@@ -4553,44 +5052,22 @@ auto user_futex_identity_still_mapped(const UserPagePin& pin, const UserFutexIde
 
 auto user_page_pin_commit_write(const UserPagePin& pin) -> bool {
     if (pin.pagemap == nullptr || pin.hhdm_page == nullptr || pin.physical_page == PADDR_INVALID || !pin.require_writable ||
-        pin.access_gate_index == USER_PAGEMAP_ACCESS_GATE_NONE) {
+        pin.access_gate_index == USER_PAGEMAP_ACCESS_GATE_NONE)
         return false;
+    uint64_t const flags = user_mapping_pin_lock.lock_irqsave();
+    auto const* control = find_user_root_control_locked(pin.pagemap);
+    uint64_t const serial = control != nullptr ? control->serial : 0;
+    UserLeafResolution leaf{};
+    bool const matches = serial == pin.root_incarnation &&
+                         file_mapping_index.matches_pin_locked(pin.pagemap, serial, pin.user_page, pin.file_binding) &&
+                         resolve_user_leaf_locked(pin.pagemap, pin.user_page, true, leaf) && leaf.physical_4k == pin.physical_page;
+    if (matches) {
+        MutableUserEntrySlot current;
+        if (!MutableUserEntrySlot::from(leaf.slot_table, leaf.slot_index, current)) __builtin_trap();
+        current.mark_dirty();  // CURRENT PS or PML1 slot, never a saved PDE.
     }
-
-    uint64_t const LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
-    PageTable* table = pin.pagemap;
-    auto* control = find_user_root_control_locked(pin.pagemap);
-    uint64_t const SERIAL = control != nullptr ? control->serial : 0;
-    bool valid_path =
-        SERIAL == pin.root_incarnation && file_mapping_index.matches_pin_locked(pin.pagemap, SERIAL, pin.user_page, pin.file_binding);
-    for (int level = 4; valid_path && level > 1; --level) {
-        PageTableEntry& entry = entry_at(table, index_of(pin.user_page, level));
-        uint64_t const RAW = pte_raw(entry);
-        if (entry.present == 0 || entry.user == 0 || entry.writable == 0 || (RAW & paging::PAGE_COW) != 0U ||
-            (level < 4 && entry.pagesize != 0)) {
-            valid_path = false;
-            break;
-        }
-        table = reinterpret_cast<PageTable*>(addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT));
-    }
-
-    bool committed = false;
-    if (valid_path) {
-        PageTableEntry& entry = entry_at(table, index_of(pin.user_page, 1));
-        uint64_t const RAW = pte_raw(entry);
-        paddr_t const CURRENT_PAGE = static_cast<paddr_t>(entry.frame) << paging::PAGE_SHIFT;
-        if (entry.present != 0 && entry.user != 0 && entry.writable != 0 && (RAW & paging::PAGE_COW) == 0U &&
-            !paging::shared_write_restricted(RAW) && CURRENT_PAGE == pin.physical_page) {
-            // Preserve Accessed/Dirty updates that hardware may publish while
-            // this CPU holds the software leaf-mutation lock.
-            constexpr uint64_t PTE_DIRTY_BIT = 1ULL << 6U;
-            auto* raw_entry = reinterpret_cast<uint64_t*>(&entry);
-            __atomic_fetch_or(raw_entry, PTE_DIRTY_BIT, __ATOMIC_ACQ_REL);
-            committed = true;
-        }
-    }
-    user_mapping_pin_lock.unlock_irqrestore(LOCK_FLAGS);
-    return committed;
+    user_mapping_pin_lock.unlock_irqrestore(flags);
+    return matches;
 }
 
 void unpin_user_page(UserPagePin& pin) {
@@ -4761,6 +5238,80 @@ auto selftest_copy_to_task_cow_action(sched::task::Task& subject, uint64_t addre
     return copied;
 }
 
+namespace {
+// Only a caller-proven exclusive never-active fixture may use these delegates.
+// Task refs keep storage; the actual root reader/PUB still protect mutation.
+class SelftestManagedAccess {
+   public:
+    explicit SelftestManagedAccess(sched::task::Task& subject) : subject_(subject) {
+        if (subject.state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE ||
+            subject.exit_in_progress.load(std::memory_order_acquire) || subject.gc_queued.load(std::memory_order_acquire) ||
+            subject.type != sched::task::TaskType::PROCESS || subject.is_thread || subject.pid != 0 || subject.thread != nullptr ||
+            subject.scheduler_published.load(std::memory_order_acquire) || subject.shares_user_pagemap.load(std::memory_order_acquire) ||
+            (sched::can_query_current_task() && sched::get_current_task() == &subject) || !subject.try_acquire())
+            return;
+        retained_ = true;
+        if (!subject.try_acquire_usercopy_pagemap(root_)) return;
+        accessed_ = true;
+        uint64_t serial = 0;
+        valid_ = root_ != nullptr && root_ == subject.pagemap && root_ != kernel_pagemap && !is_current_pagemap(root_) &&
+                 !selftest_kernel_page_table_frame(root_) && capture_user_root_incarnation(root_, serial);
+    }
+    ~SelftestManagedAccess() {
+        if (accessed_) subject_.release_usercopy_pagemap();
+        if (retained_) subject_.release();
+    }
+    auto root() const -> PageTable* { return valid_ ? root_ : nullptr; }
+    SelftestManagedAccess(const SelftestManagedAccess&) = delete;
+    auto operator=(const SelftestManagedAccess&) -> SelftestManagedAccess& = delete;
+
+   private:
+    sched::task::Task& subject_;
+    PageTable* root_{};
+    bool retained_{}, accessed_{}, valid_{};
+};
+}  // namespace
+auto selftest_publish_managed_huge(sched::task::Task& subject, uint64_t va, uint64_t flags, huge::PreparedSpan& span,
+                                   huge::PreparedTables& parents, huge::PreparedTables& cleanup, SelftestManagedHugeReport& output)
+    -> huge::Error {
+    SelftestManagedAccess access(subject);
+    if (access.root() == nullptr) return huge::Error::Invalid;
+    auto const error = publish_managed_2m_prepared(access.root(), va, flags, span, parents, cleanup);
+    if (error == huge::Error::None) {
+        ++output.published;
+        output.actual_full_flush_called = true;
+    }
+    return error;
+}
+auto selftest_prepare_managed_split(sched::task::Task& subject, uint64_t start, uint64_t end, huge::PreparedTables& plan,
+                                    const SelftestManagedHugeOptions& options) -> huge::Error {
+    SelftestManagedAccess access(subject);
+    if (access.root() == nullptr) return huge::Error::Invalid;
+    return prepare_managed_split_plan(access.root(), start, end, plan, options.fail_before_table);
+}
+auto selftest_commit_managed_split(sched::task::Task& subject, huge::PreparedTables& plan, SelftestManagedHugeReport& output)
+    -> huge::Error {
+    SelftestManagedAccess access(subject);
+    if (access.root() == nullptr) return huge::Error::Invalid;
+    huge::Error error;
+    {
+        ker::syscall::vmem::SharedVmemPublicationGuard publication;
+        error = commit_managed_split_plan(access.root(), plan, publication);
+    }
+    if (error == huge::Error::None) {
+        plan.reset();
+        ++output.split;
+        output.actual_full_flush_called = true;
+    }
+    return error;
+}
+auto selftest_split_managed_huge(sched::task::Task& subject, uint64_t va, huge::PreparedTables& cleanup, SelftestManagedHugeReport& output)
+    -> huge::Error {
+    auto* storage = huge::detail::PreparationAccess::plan_storage(cleanup);
+    if (storage == nullptr || storage->start != va || storage->end != va + huge::LEAF_BYTES) return huge::Error::Invalid;
+    return selftest_commit_managed_split(subject, cleanup, output);
+}
+
 bool selftest_user_pagemap_exclusive_rejects_mapped_pin(PageTable* pagemap) {
     if (pagemap == nullptr) {
         return false;
@@ -4890,7 +5441,10 @@ void release_pagemap_exclusive_owned(PageTable* pagemap, uint64_t owner_pid, voi
     }
     UserRootControlChunk* empty = nullptr;
     uint64_t const CONTROL_FLAGS = user_mapping_pin_lock.lock_irqsave();
-    bool const RETIRED = file_mapping_index.root_empty_locked(pagemap) && retire_user_root_control_locked(pagemap, empty);
+    auto const* huge_control = find_user_root_control_locked(pagemap);
+    bool const HUGE_EMPTY = huge_control != nullptr &&
+                            !managed_huge_registry.root_has_published_owners({reinterpret_cast<uint64_t>(pagemap), huge_control->serial});
+    bool const RETIRED = HUGE_EMPTY && file_mapping_index.root_empty_locked(pagemap) && retire_user_root_control_locked(pagemap, empty);
     user_mapping_pin_lock.unlock_irqrestore(CONTROL_FLAGS);
     if (!RETIRED) {
         log::critical("unregistered or corrupt user-root retirement root=%p owner_pid=%lu", pagemap, owner_pid);
@@ -6530,7 +7084,8 @@ void init_pagemap() {
             continue;
         }
 
-        BootDirectMapStats const ENTRY_STATS = map_boot_direct_range(kernel_pagemap, entry_range, direct_map_flags_for_entry(entry->type));
+        BootDirectMapStats const ENTRY_STATS = map_boot_direct_range(kernel_pagemap, entry_range, direct_map_flags_for_entry(entry->type),
+                                                                     boot_direct_map_allows_2m(entry->type));
         direct_map_stats.pages += ENTRY_STATS.pages;
         direct_map_stats.small_4k += ENTRY_STATS.small_4k;
         direct_map_stats.large_2m += ENTRY_STATS.large_2m;
@@ -6792,6 +7347,10 @@ namespace {
 auto advance_page_table(paging::PageTable* page_table, size_t level, uint64_t flags, bool* promoted) -> paging::PageTable* {
     PageTableEntry entry = entry_at(page_table, level);
     if (entry.present) {
+        if (entry.pagesize != 0) {
+            dbg::panic_handler("4K page-table mutator encountered an unsplit large leaf");
+            __builtin_trap();
+        }
         bool changed = false;
         if (((flags & paging::PAGE_WRITE) != 0U) && !entry.writable) {
             entry.writable = 1;
@@ -6858,6 +7417,8 @@ void map_page(PageTable* page_table, const vaddr_t VADDR, const paddr_t PADDR, c
     selftest_require_mutable_pagemap_root(page_table, "map-page", VADDR);
 #endif
 
+    if (kernel_hhdm_2m_mapping_matches(page_table, VADDR, PADDR, FLAGS)) return;
+
     // PageTable* table = pageTable;
     // for (int i = 4; i > 1; i--) {
     //     table = advancePageTable(table, index_of(vaddr, i), flags);
@@ -6921,6 +7482,8 @@ void map_page_batched(PageMapBatch* batch, const vaddr_t VADDR, const paddr_t PA
         log::critical("map_page_batched: invalid args=<batch: %p, vaddr: %p, paddr: %p, flags: %x>", batch, VADDR, PADDR, FLAGS);
         hcf();
     }
+
+    if (kernel_hhdm_2m_mapping_matches(batch->root, VADDR, PADDR, FLAGS)) return;
 
     uint64_t const IDX4 = index_of(VADDR, 4);
     uint64_t const IDX3 = index_of(VADDR, 3);
@@ -9105,3 +9668,65 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
 }
 
 }  // namespace ker::mod::mm::virt
+
+// Managed-huge foundation adapters. No PTE publisher or user opt-in exists.
+namespace ker::mod::mm::huge::detail {
+auto root_key(paging::PageTable* root, RootKey& empty) noexcept -> Error {
+    if (root == nullptr || root == virt::kernel_pagemap || empty.address_bits != 0 || empty.incarnation != 0) return Error::Invalid;
+    uint64_t const flags = virt::user_mapping_pin_lock.lock_irqsave();
+    auto const* control = virt::find_user_root_control_locked(root);
+    Error const result = control != nullptr && control->serial != 0 ? Error::None : Error::Stale;
+    if (result == Error::None) empty = {reinterpret_cast<uint64_t>(root), control->serial};
+    virt::user_mapping_pin_lock.unlock_irqrestore(flags);
+    return result;
+}
+auto root_matches(RootKey key) noexcept -> bool {
+    uint64_t const flags = virt::user_mapping_pin_lock.lock_irqsave();
+    auto const* control = virt::find_user_root_control_locked(reinterpret_cast<paging::PageTable*>(key.address_bits));
+    bool const matches = control != nullptr && control->serial != 0 && control->serial == key.incarnation;
+    virt::user_mapping_pin_lock.unlock_irqrestore(flags);
+    return matches;
+}
+auto initialize_caps(const CapsInput& input) noexcept -> Error {
+    uint64_t const flags = virt::user_mapping_pin_lock.lock_irqsave();
+    Error const result = virt::managed_huge_registry.initialize(input);
+    virt::user_mapping_pin_lock.unlock_irqrestore(flags);
+    return result;
+}
+auto reserve_leaf(RootKey key, uint64_t va, uint16_t node, LeafHandle& empty) noexcept -> Error {
+    uint64_t const flags = virt::user_mapping_pin_lock.lock_irqsave();
+    auto const* control = virt::find_user_root_control_locked(reinterpret_cast<paging::PageTable*>(key.address_bits));
+    Error const result = control != nullptr && control->serial != 0 && control->serial == key.incarnation
+                             ? virt::managed_huge_registry.reserve_leaf(key, va, node, empty)
+                             : Error::Stale;
+    virt::user_mapping_pin_lock.unlock_irqrestore(flags);
+    return result;
+}
+auto cancel_leaf(LeafHandle handle) noexcept -> Error {
+    uint64_t const flags = virt::user_mapping_pin_lock.lock_irqsave();
+    Error const result = virt::managed_huge_registry.cancel_preparing(handle);
+    virt::user_mapping_pin_lock.unlock_irqrestore(flags);
+    return result;
+}
+auto reserve_plan(uint16_t pages, PlanHandle& empty) noexcept -> Error {
+    uint64_t const flags = virt::user_mapping_pin_lock.lock_irqsave();
+    Error const result = virt::managed_huge_registry.reserve_table_plan(pages, empty);
+    virt::user_mapping_pin_lock.unlock_irqrestore(flags);
+    return result;
+}
+auto release_plan(PlanHandle handle) noexcept -> Error {
+    uint64_t const flags = virt::user_mapping_pin_lock.lock_irqsave();
+    Error const result = virt::managed_huge_registry.release_table_plan(handle);
+    virt::user_mapping_pin_lock.unlock_irqrestore(flags);
+    return result;
+}
+void snapshot(Snapshot& output) noexcept {
+    uint64_t const flags = virt::user_mapping_pin_lock.lock_irqsave();
+    virt::managed_huge_registry.snapshot(output);
+    virt::user_mapping_pin_lock.unlock_irqrestore(flags);
+}
+auto allocate_table() noexcept -> paging::PageTable* { return virt::alloc_zeroed_page_table(true); }
+void release_table(paging::PageTable* table) noexcept {
+    if (table != nullptr && !virt::try_release_page_table_to_pool(table, {__builtin_return_address(0), 0})) phys::page_free(table);
+}
+}  // namespace ker::mod::mm::huge::detail

@@ -67,6 +67,7 @@ wos_add_unit_test(block_request_runtime_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/block_request_runtime_test.cpp
     KERN_SOURCES ${WOS_KERN_SRC}/dev/block_request.cpp
                  ${WOS_KERN_SRC}/platform/mm/reclaim.cpp
+                 ${WOS_KERN_SRC}/platform/mm/reclaim_callbacks.cpp
 )
 target_include_directories(block_request_runtime_test BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit/block_request_runtime_shim)
 set_tests_properties(block_request_runtime_test PROPERTIES TIMEOUT 60)
@@ -76,6 +77,7 @@ wos_add_unit_test(swap_async_test
                  ${WOS_KERN_SRC}/dev/block_request.cpp
                  ${WOS_KERN_SRC}/util/crc32c.cpp
                  ${WOS_KERN_SRC}/platform/mm/reclaim.cpp
+                 ${WOS_KERN_SRC}/platform/mm/reclaim_callbacks.cpp
 )
 target_include_directories(swap_async_test BEFORE PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/unit/swap_async_shim
@@ -94,6 +96,7 @@ set_tests_properties(workqueue_runtime_test PROPERTIES TIMEOUT 60)
 wos_add_unit_test(reclaim_runtime_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/reclaim_runtime_test.cpp
     KERN_SOURCES ${WOS_KERN_SRC}/platform/mm/reclaim.cpp
+                 ${WOS_KERN_SRC}/platform/mm/reclaim_callbacks.cpp
 )
 target_include_directories(reclaim_runtime_test BEFORE PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/unit/block_request_runtime_shim
@@ -102,6 +105,7 @@ wos_add_unit_test(block_worker_runtime_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/block_worker_runtime_test.cpp
     KERN_SOURCES ${WOS_KERN_SRC}/dev/block_request.cpp
                  ${WOS_KERN_SRC}/platform/mm/reclaim.cpp
+                 ${WOS_KERN_SRC}/platform/mm/reclaim_callbacks.cpp
 )
 target_include_directories(block_worker_runtime_test BEFORE PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/unit/block_worker_shim
@@ -319,6 +323,20 @@ set_tests_properties(numa_root_reserve_runtime_test PROPERTIES LABELS "unit;host
 add_test(NAME numa_observation_runtime_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_observation_runtime_test.py --cxx ${CMAKE_CXX_COMPILER})
 set_tests_properties(numa_observation_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 120)
+add_test(NAME numa_node_reclaim_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_node_reclaim_runtime_test.py
+        --host-build ${CMAKE_BINARY_DIR}
+        --gtest-main $<TARGET_FILE:gtest_main> --gtest-lib $<TARGET_FILE:gtest>)
+set_tests_properties(numa_node_reclaim_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 120)
+add_test(NAME managed_huge_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/managed_huge_runtime_test.py
+        --host-build ${CMAKE_BINARY_DIR}
+        --gtest-main $<TARGET_FILE:gtest_main> --gtest $<TARGET_FILE:gtest>)
+set_tests_properties(managed_huge_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 120)
+add_test(NAME kernel_direct_map_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/kernel_direct_map_runtime_test.py
+        --cxx ${CMAKE_CXX_COMPILER} --negative-controls)
+set_tests_properties(kernel_direct_map_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 120)
 wos_add_unit_test(vtd_capability_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vtd_capability_test.cpp
 )

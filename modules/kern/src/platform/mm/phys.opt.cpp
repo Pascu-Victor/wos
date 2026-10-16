@@ -1984,6 +1984,121 @@ void write_hex_field(const char* label, uint64_t value) {
 
 }  // namespace
 
+auto drain_page_caches_for_nodes(uint64_t node_mask, uint64_t release_budget, uint64_t scan_budget, NodeCacheDrainCursor& cursor) noexcept
+    -> NodeCacheDrainResult {
+    NodeCacheDrainResult result{};
+    auto const* topology = acpi::numa::boot_topology();
+    if (topology == nullptr || !node_counters_ready() || topology->node_count == 0 || topology->node_count > 64) {
+        result.failed = true;
+        return result;
+    }
+    uint64_t const ONLINE = topology->node_count == 64 ? UINT64_MAX : (uint64_t{1} << topology->node_count) - 1;
+    if (node_mask == 0 || (node_mask & ~ONLINE) != 0 || release_budget == 0 || scan_budget == 0) {
+        result.failed = true;
+        return result;
+    }
+    if (per_cpu_caches == nullptr || !per_cpu_ready.load(std::memory_order_acquire) || !per_cpu_page_cache_enabled()) {
+        result.scan_complete = true;
+        return result;
+    }
+    if (num_cpus == 0 || num_cpus > topology->cpu_nodes.size()) {
+        result.failed = true;
+        return result;
+    }
+    // Immutable views are obtained before taking any cache/allocator lock.
+    auto const* ranges = topology->memory.data();
+    size_t const RANGE_COUNT = topology->memory_range_count;
+    if (RANGE_COUNT == 0 || RANGE_COUNT > topology->memory.size()) {
+        result.failed = true;
+        return result;
+    }
+    uint64_t const HHDM = addr::get_hhdm_offset();
+    uint64_t const CAPACITY = num_cpus * PerCpuPageCache::CACHE_SIZE;
+    uint64_t const LIMIT = std::min(scan_budget, CAPACITY);
+    if (cursor.cpu >= num_cpus || cursor.slot >= PerCpuPageCache::CACHE_SIZE) {
+        cursor.cpu = 0;
+        cursor.slot = 0;
+        cursor.visited = 0;
+    }
+    if (cursor.visited >= CAPACITY) cursor.visited = 0;
+    while (result.scanned < LIMIT && result.released < release_budget && !result.scan_complete) {
+        auto& cache = per_cpu_caches[cursor.cpu];
+        auto& stats = page_cache_stats_by_cpu[cursor.cpu];
+        uint64_t const CACHE_FLAGS = cache.lock.lock_irqsave();
+        if (cache.count > PerCpuPageCache::CACHE_SIZE) {
+            cache.lock.unlock_irqrestore(CACHE_FLAGS);
+            result.failed = true;
+            break;
+        }
+        bool removed = false;
+        if (cursor.slot < cache.count) {
+            CachedOrder0Page const ENTRY = cache.pages[cursor.slot];
+            paging::PageZone* found = nullptr;
+            size_t zone_count = 0;
+            for (auto* zone = zones; zone != nullptr && zone_count < node_counters::MAX_ALLOCATORS; zone = zone->next, ++zone_count) {
+                if (zone->allocator == ENTRY.allocator && ENTRY.allocator != nullptr) {
+                    found = zone;
+                    break;
+                }
+            }
+            if (found == nullptr && huge_page_zone != nullptr && huge_page_zone->allocator == ENTRY.allocator && ENTRY.allocator != nullptr)
+                found = huge_page_zone;
+            if (found == nullptr || found->start < HHDM || found->start != ENTRY.allocator->base ||
+                ENTRY.page_idx >= ENTRY.allocator->total_pages) {
+                result.failed = true;
+            } else {
+                uint64_t const OFFSET = static_cast<uint64_t>(ENTRY.page_idx) * paging::PAGE_SIZE;
+                uint64_t const BASE = found->start - HHDM;
+                uint16_t node = acpi::numa::INVALID_NODE;
+                if (OFFSET <= UINT64_MAX - BASE) {
+                    uint64_t const PHYSICAL = BASE + OFFSET;
+                    for (size_t i = 0; i < RANGE_COUNT; ++i) {
+                        if (PHYSICAL >= ranges[i].base && PHYSICAL - ranges[i].base < ranges[i].length) {
+                            node = ranges[i].node;
+                            break;
+                        }
+                    }
+                }
+                if (node >= topology->node_count) {
+                    result.failed = true;
+                } else if ((node_mask & (uint64_t{1} << node)) != 0) {
+                    uint64_t const FLAGS = ENTRY.allocator->lock_irq();
+                    uint64_t const BYTES = ENTRY.allocator->release_cached_order0_at(ENTRY.page_idx);
+                    ENTRY.allocator->unlock_irq(FLAGS);
+                    if (BYTES == paging::PAGE_SIZE) {
+                        --cache.count;
+                        cache.pages[cursor.slot] = cache.pages[cache.count];
+                        cache.pages[cache.count] = {};
+                        ++result.released;
+                        stats.drain_calls.fetch_add(1, std::memory_order_relaxed);
+                        stats.drain_pages.fetch_add(1, std::memory_order_relaxed);
+                        removed = true;
+                    } else {
+                        result.failed = true;
+                    }
+                }
+            }
+        }
+        ++result.scanned;
+        // Examine a compacted replacement before advancing to another slot.
+        if (!removed) {
+            ++cursor.visited;
+            if (cursor.visited == CAPACITY) {
+                result.scan_complete = true;
+                cursor.visited = 0;
+            }
+            ++cursor.slot;
+            if (cursor.slot == PerCpuPageCache::CACHE_SIZE) {
+                cursor.slot = 0;
+                cursor.cpu = static_cast<uint32_t>((cursor.cpu + 1) % num_cpus);
+            }
+        }
+        cache.lock.unlock_irqrestore(CACHE_FLAGS);
+        if (result.failed) break;
+    }
+    return result;
+}
+
 auto can_wait_for_reclaim() -> bool { return can_wait_for_reclaim_impl(); }
 
 auto page_alloc(PhysicalPageOwner owner, uint64_t size, std::string_view name) -> void* {

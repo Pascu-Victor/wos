@@ -127,6 +127,97 @@ std::atomic<uint64_t> background_target_pages{};
 std::atomic<uint64_t> allocation_pages_since_pressure_sample{};
 ExplicitJobSlot explicit_job_slot{};
 
+constexpr size_t NODE_LIMIT = 64;
+constexpr uint32_t NODE_JOB_MAX_PASSES = 64;
+struct NodeCooldown {
+    uint64_t until_round{};
+    uint32_t no_progress_streak{};
+};
+struct NodeJob {
+    NodeReclaimStatsSnapshot stats{};  // Entire row protected by node_queue_lock.
+    uint64_t target{};
+    uint64_t active_target{};
+    uint32_t passes{};
+    bool active{};
+};
+struct NodePressureConfig {
+    uint64_t usable{};
+    Watermarks watermarks{};
+};
+sys::Spinlock node_queue_lock{};
+NodeJob node_jobs[NODE_LIMIT]{};
+NodePressureConfig node_config[NODE_LIMIT]{};
+uint64_t node_pending_mask{};
+uint16_t next_node{};
+uint16_t pressure_node_count{};
+std::atomic<bool> node_pressure_ready{};
+// Exclusively owned by the existing scan lease after readiness publication.
+phys::NodeCounterSnapshot node_sample{};
+phys::NodeCounterWorkspace node_workspace{};
+phys::NodeCacheDrainCursor node_cache_cursors[NODE_LIMIT]{};
+uint64_t node_rounds[NODE_LIMIT]{};
+NodeCooldown node_cooldowns[MAX_SHRINKERS][NODE_LIMIT]{};
+static_assert(sizeof(node_jobs) + sizeof(node_config) + sizeof(node_sample) + sizeof(node_workspace) + sizeof(node_cache_cursors) +
+                  sizeof(node_rounds) + sizeof(node_cooldowns) <=
+              48 * 1024);
+
+auto valid_node_scope(uint64_t mask, uint8_t order) -> NodeReclaimStatus {
+    if (!node_pressure_ready.load(std::memory_order_acquire)) return NodeReclaimStatus::NOT_READY;
+    uint64_t const ONLINE = pressure_node_count == 64 ? UINT64_MAX : (uint64_t{1} << pressure_node_count) - 1;
+    if (mask == 0 || (mask & ~ONLINE) != 0) return NodeReclaimStatus::INVALID_MASK;
+    if (order != 0) return NodeReclaimStatus::UNSUPPORTED_ORDER;
+    return NodeReclaimStatus::NONE;
+}
+
+auto node_pressure(uint16_t node, uint64_t buddy) -> PressureLevel;
+
+auto initialize_node_pressure() -> bool {
+    if (node_pressure_ready.load(std::memory_order_acquire)) return true;
+    if (phys::snapshot_node_counters(node_sample, node_workspace) != NodeCounterError::NONE || !node_sample.complete ||
+        node_sample.node_count == 0 || node_sample.node_count > NODE_LIMIT)
+        return false;
+    pressure_node_count = node_sample.node_count;
+    for (uint16_t node = 0; node < pressure_node_count; ++node) {
+        node_config[node].usable = node_sample.nodes[node].usable;
+        node_config[node].watermarks = zone_watermarks(node_sample.nodes[node].usable, node_sample.global.usable, 0);
+        node_jobs[node].stats.node = node;
+        node_jobs[node].stats.pressure = node_pressure(node, node_sample.nodes[node].buddy_free);
+    }
+    node_pressure_ready.store(true, std::memory_order_release);
+    return true;
+}
+
+auto sample_node(uint16_t node, uint64_t& buddy, uint64_t& cached) -> bool {
+    if (phys::snapshot_node_counters(node_sample, node_workspace) != NodeCounterError::NONE || !node_sample.complete ||
+        node_sample.node_count != pressure_node_count || node_sample.nodes[node].usable != node_config[node].usable)
+        return false;
+    buddy = node_sample.nodes[node].buddy_free;
+    cached = node_sample.nodes[node].cached;
+    return true;
+}
+
+auto node_pressure(uint16_t node, uint64_t buddy) -> PressureLevel {
+    auto const& config = node_config[node];
+    if (config.usable == 0) return PressureLevel::UNSATISFIABLE;
+    if (buddy == 0 || buddy <= config.watermarks.critical_pages) return PressureLevel::CRITICAL;
+    return buddy <= config.watermarks.low_pages ? PressureLevel::LOW : PressureLevel::NONE;
+}
+
+void record_node_run(uint16_t node, const ReclaimRunResult& result, PressureLevel pressure, uint64_t cache_scanned, uint64_t cache_released,
+                     bool failed) {
+    uint64_t const FLAGS = node_queue_lock.lock_irqsave();
+    auto& stats = node_jobs[node].stats;
+    stats.status = result.node_status;
+    stats.pressure = pressure;
+    stats.callbacks = saturating_add(stats.callbacks, result.callbacks);
+    stats.cache_scanned = saturating_add(stats.cache_scanned, cache_scanned);
+    stats.cache_released = saturating_add(stats.cache_released, cache_released);
+    stats.sampled_buddy_pages = saturating_add(stats.sampled_buddy_pages, result.sampled_buddy_pages);
+    if (!result.made_progress) stats.no_progress = saturating_add(stats.no_progress, 1);
+    if (failed || result.node_status == NodeReclaimStatus::INCOMPLETE_SAMPLE) stats.failures = saturating_add(stats.failures, 1);
+    node_queue_lock.unlock_irqrestore(FLAGS);
+}
+
 void add_counter(std::atomic<uint64_t>& counter, uint64_t delta = 1) {
     uint64_t value = counter.load(std::memory_order_relaxed);
     for (;;) {
@@ -204,7 +295,7 @@ void record_reported_units(AtomicGlobalStats& stats, ReclaimUnit unit, uint64_t 
     return std::string_view(lhs.name) == std::string_view(rhs.name) && lhs.unit == rhs.unit && lhs.scan_unit == rhs.scan_unit &&
            lhs.rank == rhs.rank && lhs.min_priority == rhs.min_priority && lhs.capabilities == rhs.capabilities &&
            lhs.max_batch_units == rhs.max_batch_units && lhs.max_scan_units == rhs.max_scan_units && lhs.count == rhs.count &&
-           lhs.scan == rhs.scan && lhs.opaque == rhs.opaque;
+           lhs.scan == rhs.scan && lhs.opaque == rhs.opaque && lhs.supports_node_filter == rhs.supports_node_filter;
 }
 
 [[nodiscard]] auto register_on(Coordinator& state, const Shrinker& shrinker) -> bool {
@@ -479,6 +570,256 @@ void finish_run(Coordinator& state, ReclaimRunResult& result, uint64_t started_u
     return result;
 }
 
+void record_node_refusal(uint16_t node, NodeReclaimStatus status, bool failure) {
+    uint64_t const FLAGS = node_queue_lock.lock_irqsave();
+    auto& stats = node_jobs[node].stats;
+    stats.status = status;
+    stats.no_progress = saturating_add(stats.no_progress, 1);
+    if (failure) stats.failures = saturating_add(stats.failures, 1);
+    // Preserve the last actually sampled pressure; refusal did not sample it.
+    node_queue_lock.unlock_irqrestore(FLAGS);
+}
+
+auto run_node_one(const ReclaimRequest& request, std::string_view only_name, uint16_t node) -> ReclaimRunResult {
+    ReclaimRunResult result{};
+    uint64_t const START = time::get_us();
+    if (!valid_context(request.context) || !valid_priority(request.priority) || !phys::can_wait_for_reclaim()) {
+        result.unsafe_context = true;
+        result.node_status = NodeReclaimStatus::UNSAFE_CONTEXT;
+        record_node_refusal(node, result.node_status, true);
+        return result;
+    }
+    uintptr_t const TOKEN = owner_token();
+    uintptr_t expected = 0;
+    if (!coordinator.scan_owner.compare_exchange_strong(expected, TOKEN, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        result.recursion_avoided = expected == TOKEN;
+        result.lease_contended = expected != TOKEN;
+        result.node_status = NodeReclaimStatus::BUSY;
+        record_node_refusal(node, result.node_status, false);
+        return result;
+    }
+    LeaseGuard const LEASE{coordinator};
+    uint64_t buddy = 0;
+    uint64_t cached = 0;
+    PressureLevel pressure = PressureLevel::UNSATISFIABLE;
+    uint64_t cache_scanned = 0;
+    uint64_t cache_released = 0;
+    bool failed = false;
+    if (!sample_node(node, buddy, cached)) {
+        result.node_status = NodeReclaimStatus::INCOMPLETE_SAMPLE;
+        record_node_run(node, result, pressure, 0, 0, true);
+        return result;
+    }
+    pressure = node_pressure(node, buddy);
+    if (pressure == PressureLevel::UNSATISFIABLE) {
+        result.node_status = NodeReclaimStatus::UNSATISFIABLE;
+        record_node_run(node, result, pressure, 0, 0, false);
+        return result;
+    }
+    auto const HIGH = node_config[node].watermarks.high_pages;
+    if (buddy >= HIGH && request.context == ReclaimContext::BACKGROUND) {
+        record_node_run(node, result, pressure, 0, 0, false);
+        return result;
+    }
+    uint64_t const BIT = uint64_t{1} << node;
+    ReclaimRequest scoped = request;
+    scoped.node_mask = BIT;
+    scoped.target_pages = std::max<uint64_t>(request.target_pages, 1);
+    if (request.context == ReclaimContext::BACKGROUND) scoped.priority = pressure_priority(pressure);
+    if (request.context == ReclaimContext::BACKGROUND && buddy < HIGH) scoped.target_pages = std::max(scoped.target_pages, HIGH - buddy);
+
+    // Samples precede/follow source locks, never nest the all-allocator snapshot
+    // into a PCpu cache mutex or file-cache set mutex.
+    auto drain = [&]() -> bool {
+        if (!only_name.empty() || cached == 0) return true;
+        uint64_t const BEFORE = buddy;
+        auto const DRAIN =
+            phys::drain_page_caches_for_nodes(BIT, std::min<uint64_t>(scoped.target_pages, 128), 256, node_cache_cursors[node]);
+        cache_scanned += DRAIN.scanned;
+        cache_released += DRAIN.released;
+        result.scan_advanced |= DRAIN.scanned != 0;
+        if (!sample_node(node, buddy, cached)) {
+            result.node_status = NodeReclaimStatus::INCOMPLETE_SAMPLE;
+            return false;
+        }
+        if (buddy > BEFORE) result.sampled_buddy_pages = saturating_add(result.sampled_buddy_pages, buddy - BEFORE);
+        result.has_more |= cached != 0 && !DRAIN.scan_complete;
+        if (DRAIN.failed) {
+            failed = true;
+            return false;
+        }
+        return true;
+    };
+    if (drain()) {
+        node_rounds[node] = saturating_add(node_rounds[node], 1);
+        uint64_t const ROUND = node_rounds[node];
+        std::array<Candidate, MAX_SHRINKERS> candidates{};
+        size_t const COUNT = snapshot_candidates(coordinator, candidates, only_name);
+        for (size_t i = 0; i < COUNT; ++i) {
+            if (request.deadline_us != 0 && time::get_us() >= request.deadline_us) {
+                result.has_more = true;
+                break;
+            }
+            if (buddy >= HIGH && request.context == ReclaimContext::BACKGROUND) break;
+            auto const& candidate = candidates.at(i);
+            auto const& shrinker = candidate.shrinker;
+            // Unsupported callbacks are skipped BEFORE count as well as scan.
+            if (!shrinker.supports_node_filter || static_cast<uint8_t>(scoped.priority) < static_cast<uint8_t>(shrinker.min_priority) ||
+                !capabilities_allowed(shrinker, request))
+                continue;
+            auto& cooldown = node_cooldowns[candidate.slot][node];
+            if (scoped.priority != ReclaimPriority::CRITICAL && ROUND < cooldown.until_round) {
+                result.has_more = true;
+                continue;
+            }
+            ReclaimCount available{};
+            callback_boundary::invoke_node_count_into(available, shrinker.count, shrinker.opaque, scoped);
+            auto const& AVAILABLE = available;
+            if (AVAILABLE.reclaimable == 0) {
+                if (cooldown.no_progress_streak != UINT32_MAX) ++cooldown.no_progress_streak;
+                cooldown.until_round = saturating_add(ROUND, backoff_rounds(cooldown.no_progress_streak));
+                continue;
+            }
+            scoped.budget_units =
+                std::min(AVAILABLE.reclaimable, request.budget_units != 0
+                                                    ? std::min(request.budget_units, shrinker.max_batch_units)
+                                                    : callback_budget(shrinker.unit, scoped.target_pages, shrinker.max_batch_units));
+            scoped.scan_budget_units =
+                request.scan_budget_units != 0 ? std::min(request.scan_budget_units, shrinker.max_scan_units) : shrinker.max_scan_units;
+            if (!sample_node(node, buddy, cached)) {
+                result.node_status = NodeReclaimStatus::INCOMPLETE_SAMPLE;
+                break;
+            }
+            uint64_t const BEFORE = buddy;
+            ++result.callbacks;
+            ReclaimScanResult scan{};
+            callback_boundary::invoke_node_scan_into(scan, shrinker.scan, shrinker.opaque, scoped);
+            auto const& SCAN = scan;
+            result.scanned_units = saturating_add(result.scanned_units, std::min(SCAN.scanned, scoped.scan_budget_units));
+            result.reclaimed_units = saturating_add(result.reclaimed_units, std::min(SCAN.reclaimed, scoped.budget_units));
+            result.scan_advanced |= SCAN.scanned != 0;
+            result.has_more |= SCAN.has_more;
+            failed |= SCAN.failed || SCAN.scanned > scoped.scan_budget_units || SCAN.reclaimed > scoped.budget_units;
+            if (!sample_node(node, buddy, cached)) {
+                result.node_status = NodeReclaimStatus::INCOMPLETE_SAMPLE;
+                break;
+            }
+            uint64_t const DELTA = buddy > BEFORE ? buddy - BEFORE : 0;
+            result.sampled_buddy_pages = saturating_add(result.sampled_buddy_pages, DELTA);
+            // Bounded sparse searches may advance without reaching a victim.
+            // They must finish their finite sweep before no-progress backoff.
+            if (DELTA != 0 || (SCAN.scanned != 0 && SCAN.has_more)) {
+                cooldown.no_progress_streak = 0;
+                cooldown.until_round = 0;
+            } else {
+                if (cooldown.no_progress_streak != UINT32_MAX) ++cooldown.no_progress_streak;
+                cooldown.until_round = saturating_add(ROUND, backoff_rounds(cooldown.no_progress_streak));
+            }
+            if (failed || !drain()) break;
+        }
+    }
+    pressure = node_pressure(node, buddy);
+    result.made_progress = result.sampled_buddy_pages != 0 && result.node_status == NodeReclaimStatus::NONE && !failed;
+    if (failed) {
+        result.node_status = NodeReclaimStatus::SOURCE_FAILED;
+        result.has_more = false;
+    }
+    result.elapsed_us = time::get_us() - START;
+    record_node_run(node, result, pressure, cache_scanned, cache_released, failed);
+    return result;
+}
+
+auto run_nodes(const ReclaimRequest& request, std::string_view only_name) -> ReclaimRunResult {
+    ReclaimRunResult result{};
+    result.node_status = valid_node_scope(request.node_mask, request.requested_order);
+    if (result.node_status != NodeReclaimStatus::NONE) return result;
+    for (uint16_t node = 0; node < pressure_node_count; ++node) {
+        if ((request.node_mask & (uint64_t{1} << node)) == 0) continue;
+        if (request.deadline_us != 0 && time::get_us() >= request.deadline_us) {
+            result.has_more = true;
+            break;
+        }
+        auto const PART = run_node_one(request, only_name, node);
+        result.callbacks = saturating_add(result.callbacks, PART.callbacks);
+        result.scanned_units = saturating_add(result.scanned_units, PART.scanned_units);
+        result.reclaimed_units = saturating_add(result.reclaimed_units, PART.reclaimed_units);
+        result.sampled_buddy_pages = saturating_add(result.sampled_buddy_pages, PART.sampled_buddy_pages);
+        result.elapsed_us = saturating_add(result.elapsed_us, PART.elapsed_us);
+        result.has_more |= PART.has_more;
+        result.made_progress |= PART.made_progress;
+        result.scan_advanced |= PART.scan_advanced;
+        result.unsafe_context |= PART.unsafe_context;
+        result.recursion_avoided |= PART.recursion_avoided;
+        result.lease_contended |= PART.lease_contended;
+        if (PART.node_status != NodeReclaimStatus::NONE) result.node_status = PART.node_status;
+        if (PART.unsafe_context || PART.recursion_avoided || PART.lease_contended) break;
+    }
+    return result;
+}
+
+auto node_job_pending() -> bool {
+    uint64_t const FLAGS = node_queue_lock.lock_irqsave();
+    bool const PENDING = node_pending_mask != 0;
+    node_queue_lock.unlock_irqrestore(FLAGS);
+    return PENDING;
+}
+
+auto service_one_node_job() -> bool {
+    uint16_t selected = NODE_LIMIT;
+    uint64_t target = 0;
+    uint64_t const FLAGS = node_queue_lock.lock_irqsave();
+    for (uint16_t i = 0; i < pressure_node_count; ++i) {
+        uint16_t const NODE = static_cast<uint16_t>((next_node + i) % pressure_node_count);
+        uint64_t const BIT = uint64_t{1} << NODE;
+        if ((node_pending_mask & BIT) == 0) continue;
+        selected = NODE;
+        next_node = static_cast<uint16_t>((NODE + 1) % pressure_node_count);
+        node_pending_mask &= ~BIT;
+        auto& job = node_jobs[NODE];
+        job.stats.pending = false;
+        job.stats.inflight = true;
+        if (!job.active) {
+            job.active = true;
+            job.passes = 0;
+            job.active_target = 0;
+        }
+        job.active_target = std::max(job.active_target, job.target);
+        job.target = 0;
+        target = job.active_target;
+        break;
+    }
+    node_queue_lock.unlock_irqrestore(FLAGS);
+    if (selected == NODE_LIMIT) return false;
+    ReclaimRequest const REQUEST{
+        .context = ReclaimContext::BACKGROUND,
+        .priority = ReclaimPriority::CRITICAL,
+        .target_pages = std::max<uint64_t>(target, 1),
+        .deadline_us = saturating_add(time::get_us(), 2000),
+        .may_block = true,
+        .may_io = true,
+        .may_allocate = true,
+        .node_mask = uint64_t{1} << selected,
+    };
+    auto const RESULT = run_nodes(REQUEST, {});
+    uint64_t const FINISH_FLAGS = node_queue_lock.lock_irqsave();
+    auto& job = node_jobs[selected];
+    job.stats.inflight = false;
+    ++job.passes;
+    bool const RETRY = RESULT.lease_contended || (RESULT.node_status == NodeReclaimStatus::NONE && !RESULT.unsafe_context &&
+                                                  !RESULT.recursion_avoided && RESULT.has_more);
+    if (RETRY && job.passes < NODE_JOB_MAX_PASSES) {
+        node_pending_mask |= uint64_t{1} << selected;
+        job.stats.pending = true;
+    } else {
+        job.active = false;
+        job.stats.completed = saturating_add(job.stats.completed, 1);
+        // A notification arriving while this slice ran has its own pending bit
+        // and target, and is deliberately not erased by this completion.
+    }
+    node_queue_lock.unlock_irqrestore(FINISH_FLAGS);
+    return true;
+}
+
 [[nodiscard]] auto load_pressure(uint8_t requested_order, ZoneWatermarkSnapshot* snapshots, size_t& count) -> PressureLevel {
     count = snapshot_zone_watermarks(snapshots, MAX_WATERMARK_ZONES, requested_order);
     uint64_t free_pages = 0;
@@ -585,6 +926,7 @@ void run_explicit_job(const ExplicitJob& job) {
     uint32_t consecutive_no_progress = 0;
 
     for (uint32_t pass = 0; pass < EXPLICIT_RECLAIM_MAX_PASSES; ++pass) {
+        if (service_one_node_job()) sched::kern_yield();
         if (request.deadline_us != 0 && time::get_us() >= request.deadline_us) {
             break;
         }
@@ -600,7 +942,8 @@ void run_explicit_job(const ExplicitJob& job) {
         }
 
         remaining_units = RESULT.reclaimed_units >= remaining_units ? 0 : remaining_units - RESULT.reclaimed_units;
-        remaining_pages = RESULT.reclaimed_pages >= remaining_pages ? 0 : remaining_pages - RESULT.reclaimed_pages;
+        uint64_t const PAGE_PROGRESS = request.node_mask == 0 ? RESULT.reclaimed_pages : RESULT.sampled_buddy_pages;
+        remaining_pages = PAGE_PROGRESS >= remaining_pages ? 0 : remaining_pages - PAGE_PROGRESS;
         if ((HAS_UNIT_TARGET && remaining_units == 0) || (!HAS_UNIT_TARGET && remaining_pages == 0)) {
             break;
         }
@@ -617,12 +960,17 @@ void run_explicit_job(const ExplicitJob& job) {
 
 [[noreturn]] void reclaim_worker_main() {
     for (;;) {
+        bool const NODE_WORK = service_one_node_job();
         ExplicitJob explicit_job{};
         if (take_explicit_job(explicit_job)) {
             run_explicit_job(explicit_job);
             continue;
         }
         if (!background_pending.exchange(false, std::memory_order_acq_rel)) {
+            if (NODE_WORK || node_job_pending()) {
+                sched::kern_yield();
+                continue;
+            }
             sched::kern_block();
             continue;
         }
@@ -632,6 +980,7 @@ void run_explicit_job(const ExplicitJob& job) {
         bool made_physical_progress = false;
         uint32_t pass = 0;
         for (; pass < BACKGROUND_RECLAIM_MAX_PASSES && !above_high_watermark(REQUESTED_ORDER); ++pass) {
+            if (service_one_node_job()) sched::kern_yield();
             PressureLevel const PRESSURE = pressure_for_order(REQUESTED_ORDER);
             target_pages = std::max(target_pages, pages_below_high_watermark(REQUESTED_ORDER));
             ReclaimRequest const REQUEST{
@@ -742,10 +1091,12 @@ void init() {
 auto register_shrinker(const Shrinker& shrinker) -> bool { return register_on(coordinator, shrinker); }
 
 auto run(const ReclaimRequest& request, std::string_view only_name) -> ReclaimRunResult {
+    if (request.node_mask != 0) return run_nodes(request, only_name);
     return run_on(coordinator, request, only_name, owner_token(), true, true);
 }
 
 auto request_explicit(const ReclaimRequest& request, std::string_view only_name) -> bool {
+    if (request.node_mask != 0 && valid_node_scope(request.node_mask, request.requested_order) != NodeReclaimStatus::NONE) return false;
     if (request.context != ReclaimContext::EXPLICIT || !valid_priority(request.priority) || only_name.empty() ||
         only_name.size() >= EXPLICIT_SHRINKER_NAME_CAPACITY) {
         add_counter(coordinator.stats.explicit_rejections);
@@ -812,6 +1163,55 @@ void request_background(uint8_t requested_order, uint64_t target_pages) {
     }
 }
 
+auto request_background_nodes(uint64_t node_mask, uint64_t target_pages) noexcept -> NodeReclaimStatus {
+    if (node_mask == 0) {
+        request_background(0, target_pages);
+        return NodeReclaimStatus::NONE;
+    }
+    if (sched::kernel_threads_shutdown_requested()) return NodeReclaimStatus::NOT_READY;
+    auto const STATUS = valid_node_scope(node_mask, 0);
+    if (STATUS != NodeReclaimStatus::NONE) return STATUS;
+    uint64_t const FLAGS = node_queue_lock.lock_irqsave();
+    if (sched::kernel_threads_shutdown_requested()) {
+        node_queue_lock.unlock_irqrestore(FLAGS);
+        return NodeReclaimStatus::NOT_READY;
+    }
+    for (uint16_t node = 0; node < pressure_node_count; ++node) {
+        uint64_t const BIT = uint64_t{1} << node;
+        if ((node_mask & BIT) == 0) continue;
+        auto& job = node_jobs[node];
+        job.target = std::max(job.target, std::max<uint64_t>(target_pages, 1));
+        job.stats.queued = saturating_add(job.stats.queued, 1);
+        job.stats.pending = true;
+        node_pending_mask |= BIT;
+    }
+    node_queue_lock.unlock_irqrestore(FLAGS);
+    // The boot-lifetime reference keeps this exact DAEMON addressable through
+    // a shutdown race. Queue ownership never spans canonical scheduler wake.
+    auto* const TASK = worker_task.load(std::memory_order_acquire);
+    if (TASK != nullptr) sched::wake_task_from_event(TASK);
+    return NodeReclaimStatus::NONE;
+}
+
+auto notify_order0_node_failure(uint16_t node) noexcept -> NodeReclaimStatus {
+    // No Task lookup/retain from the raw publication: start_worker owns one
+    // reference until halt. BSP and unready/shutdown requests do not enqueue.
+    if (!sched::can_query_current_task() || sched::get_current_task() == nullptr ||
+        worker_task.load(std::memory_order_acquire) == nullptr || sched::kernel_threads_shutdown_requested())
+        return NodeReclaimStatus::NOT_READY;
+    if (!node_pressure_ready.load(std::memory_order_acquire)) return NodeReclaimStatus::NOT_READY;
+    if (node >= pressure_node_count || node >= NODE_LIMIT) return NodeReclaimStatus::INVALID_MASK;
+    return request_background_nodes(uint64_t{1} << node, 1);
+}
+
+auto snapshot_node_stats(uint16_t node, NodeReclaimStatsSnapshot& output) noexcept -> bool {
+    if (!node_pressure_ready.load(std::memory_order_acquire) || node >= pressure_node_count) return false;
+    uint64_t const FLAGS = node_queue_lock.lock_irqsave();
+    output = node_jobs[node].stats;
+    node_queue_lock.unlock_irqrestore(FLAGS);
+    return true;
+}
+
 void note_allocation(uint8_t requested_order, uint64_t allocated_pages) {
     uint64_t const ALLOCATED_PAGES = std::max<uint64_t>(allocated_pages, 1);
     if (requested_order < IMMEDIATE_PRESSURE_SAMPLE_ORDER) {
@@ -832,14 +1232,42 @@ void start_worker() {
         return;
     }
 
+    // Boot capacity/topology is immutable; initialize outside queue/source
+    // locks before worker creation. Failure leaves masked scope unavailable;
+    // the legacy global worker still starts and retains its old behavior.
+    (void)initialize_node_pressure();
     auto* const TASK = sched::task::Task::create_kernel_thread("mm_reclaim", reclaim_worker_main);
     if (TASK == nullptr) {
         worker_started.store(false, std::memory_order_release);
         return;
     }
+    // Acquire only from the still-private fresh ref1, never via worker_task.
+    // One fixed module reference remains until halt, including after exit.
+    if (TASK->ref_count.load(std::memory_order_acquire) != 1 || !TASK->try_acquire() ||
+        TASK->ref_count.load(std::memory_order_acquire) != 2) {
+        dbg::panic_handler("reclaim: invalid private worker lifetime");
+        __builtin_trap();
+    }
+    if (!sched::post_task_balanced(TASK)) {
+        // post_task_balanced false rolls back fresh DAEMON visibility. Never
+        // free an unexpectedly published/shared Task or guess a safe teardown.
+        if (TASK->type != sched::task::TaskType::DAEMON || TASK->kthread_entry != reclaim_worker_main ||
+            TASK->state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE ||
+            TASK->scheduler_published.load(std::memory_order_acquire) || TASK->gc_queued.load(std::memory_order_acquire) ||
+            TASK->ref_count.load(std::memory_order_acquire) != 2 || TASK->heap_index != -1 ||
+            TASK->sched_queue != decltype(TASK->sched_queue)::NONE || TASK->sched_next != nullptr ||
+            TASK->sched_list_owner.load(std::memory_order_acquire) != nullptr) {
+            dbg::panic_handler("reclaim: failed post retained unexpected worker ownership");
+            __builtin_trap();
+        }
+        TASK->release();
+        sched::task::destroy_unpublished_user_thread(TASK);
+        worker_started.store(false, std::memory_order_release);
+        dbg::logger<"reclaim">::warn("cannot publish background reclaim worker");
+        return;
+    }
     worker_task.store(TASK, std::memory_order_release);
-    static_cast<void>(sched::post_task_balanced(TASK));
-    if (background_pending.load(std::memory_order_acquire) || explicit_job_pending()) {
+    if (background_pending.load(std::memory_order_acquire) || explicit_job_pending() || node_job_pending()) {
         sched::wake_task_from_event(TASK);
     }
 }

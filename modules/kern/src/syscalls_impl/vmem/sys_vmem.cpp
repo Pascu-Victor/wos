@@ -145,6 +145,7 @@ struct FileMmapPageCacheEntry {
     FileMmapPageKey key{};
     void* page = nullptr;
     uint64_t last_used = 0;
+    numa::NodeId physical_node{};  // No authority while page is null; every insertion stamps this.
 };
 
 struct FileMmapPageCacheSet {
@@ -197,6 +198,24 @@ std::array<FileMmapPageCacheSet, FILE_MMAP_CACHE_SET_COUNT> g_file_mmap_cache{};
 std::array<FileMmapCacheLock, FILE_MMAP_CACHE_LOCK_COUNT> g_file_mmap_cache_locks{};
 std::atomic<uint64_t> g_file_mmap_cache_pages{0};
 std::atomic<uint64_t> g_file_mmap_cache_scan_cursor{0};
+// The final bucket is insertion-time unattributed storage. Never recategorize
+// an old entry after topology publication when removing its cache reference.
+std::atomic<uint64_t> g_file_mmap_cache_node_pages[65]{};
+std::atomic<uint64_t> g_file_mmap_cache_node_cursor[65]{};
+
+auto file_mmap_cache_node_bucket(numa::NodeId node) -> size_t { return node < 64 ? node : 64; }
+void file_mmap_cache_node_add(numa::NodeId node) {
+    g_file_mmap_cache_node_pages[file_mmap_cache_node_bucket(node)].fetch_add(1, std::memory_order_relaxed);
+}
+void file_mmap_cache_node_remove(numa::NodeId node) {
+    g_file_mmap_cache_node_pages[file_mmap_cache_node_bucket(node)].fetch_sub(1, std::memory_order_relaxed);
+}
+auto file_mmap_cache_node_count(uint64_t node_mask) -> uint64_t {
+    uint64_t pages = 0;
+    for (uint16_t node = 0; node < 64; ++node)
+        if ((node_mask & (uint64_t{1} << node)) != 0) pages += g_file_mmap_cache_node_pages[node].load(std::memory_order_relaxed);
+    return pages;
+}
 std::atomic<bool> g_file_mmap_cache_shrinker_registered{false};
 ker::util::SmallVec<FileMmapRange, 32> g_file_mmap_ranges;
 ker::mod::sys::Mutex g_file_mmap_ranges_lock;
@@ -1024,6 +1043,8 @@ void release_file_mmap_cache_page(void* page) {
 }
 
 auto file_mmap_cache_insert_or_discard(const FileMmapPageKey& key, void* new_page, void** page_for_mapping) -> FileMmapCacheInsertResult {
+    uint64_t const PHYSICAL = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(new_page)));
+    numa::NodeId const INSERTION_NODE = numa::physical_node(PHYSICAL);
     size_t const SET_INDEX = file_mmap_key_hash(key) & (FILE_MMAP_CACHE_SET_COUNT - 1);
     size_t const LOCK_INDEX = SET_INDEX & (FILE_MMAP_CACHE_LOCK_COUNT - 1);
     auto& cache_lock = g_file_mmap_cache_locks.at(LOCK_INDEX);
@@ -1054,6 +1075,9 @@ auto file_mmap_cache_insert_or_discard(const FileMmapPageKey& key, void* new_pag
     }
 
     void* evicted = victim->page;
+    if (evicted != nullptr) file_mmap_cache_node_remove(victim->physical_node);
+    victim->physical_node = INSERTION_NODE;
+    file_mmap_cache_node_add(victim->physical_node);
     victim->key = key;
     victim->page = new_page;
     victim->last_used = USE_STAMP;
@@ -2869,6 +2893,7 @@ auto selftest_evict_file_mmap_cache_exact(ker::vfs::File& file, uint64_t offset,
     for (auto& entry : set.ways) {
         if (entry.page == expected_frame && file_mmap_key_equal(entry.key, key)) {
             removed = entry.page;
+            file_mmap_cache_node_remove(entry.physical_node);
             entry = {};
             g_file_mmap_cache_pages.fetch_sub(1, std::memory_order_relaxed);
             break;
@@ -4072,6 +4097,7 @@ auto file_mmap_cache_reclaim(size_t max_pages) -> size_t {
                         break;
                     }
                     release_pages.at(release_count++) = entry.page;
+                    file_mmap_cache_node_remove(entry.physical_node);
                     entry = {};
                 }
                 if (more) {
@@ -4101,14 +4127,22 @@ struct FileMmapBoundedReclaimResult {
     size_t scanned{};
 };
 
-auto file_mmap_cache_reclaim_bounded(size_t max_pages, size_t scan_budget) -> FileMmapBoundedReclaimResult {
+auto file_mmap_cache_reclaim_bounded(size_t max_pages, size_t scan_budget, uint64_t node_mask = 0) -> FileMmapBoundedReclaimResult {
     FileMmapBoundedReclaimResult result{};
     if (max_pages == 0 || scan_budget == 0) {
         return result;
     }
 
     size_t const MAX_SCAN = std::min(scan_budget, FILE_MMAP_CACHE_PAGES);
-    uint64_t const START = g_file_mmap_cache_scan_cursor.fetch_add(MAX_SCAN, std::memory_order_relaxed);
+    // Single-node jobs own separate cursors; a direct multi-node diagnostic
+    // uses the last scope cursor without skipping any per-node worker sweep.
+    size_t scope = 64;
+    if (node_mask != 0 && (node_mask & (node_mask - 1)) == 0) {
+        scope = 0;
+        while ((node_mask & (uint64_t{1} << scope)) == 0) ++scope;
+    }
+    uint64_t const START = node_mask == 0 ? g_file_mmap_cache_scan_cursor.fetch_add(MAX_SCAN, std::memory_order_relaxed)
+                                          : g_file_mmap_cache_node_cursor[scope].load(std::memory_order_relaxed);
     while (result.scanned < MAX_SCAN && result.reclaimed < max_pages) {
         size_t const SLOT = static_cast<size_t>((START + result.scanned) % FILE_MMAP_CACHE_PAGES);
         size_t const SET_INDEX = SLOT / FILE_MMAP_CACHE_WAYS;
@@ -4120,8 +4154,10 @@ auto file_mmap_cache_reclaim_bounded(size_t max_pages, size_t scan_budget) -> Fi
         cache_lock.mutex.lock();
         auto& entry = g_file_mmap_cache.at(SET_INDEX).ways.at(WAY_INDEX);
         result.scanned++;
-        if (entry.page != nullptr) {
+        if (entry.page != nullptr &&
+            (node_mask == 0 || (entry.physical_node < 64 && (node_mask & (uint64_t{1} << entry.physical_node)) != 0))) {
             page = entry.page;
+            file_mmap_cache_node_remove(entry.physical_node);
             entry = {};
             g_file_mmap_cache_pages.fetch_sub(1, std::memory_order_relaxed);
         }
@@ -4132,21 +4168,27 @@ auto file_mmap_cache_reclaim_bounded(size_t max_pages, size_t scan_budget) -> Fi
             result.reclaimed++;
         }
     }
+    // Advance by actual examined slots, not the reserved maximum: a batch
+    // that fills early must not jump over sparse eligible entries forever.
+    if (node_mask != 0)
+        g_file_mmap_cache_node_cursor[scope].store((START + result.scanned) % FILE_MMAP_CACHE_PAGES, std::memory_order_relaxed);
     return result;
 }
 
-auto file_mmap_cache_reclaim_count(void*, const ker::mod::mm::reclaim::ReclaimRequest&) -> ker::mod::mm::reclaim::ReclaimCount {
-    return {.reclaimable = g_file_mmap_cache_pages.load(std::memory_order_relaxed)};
+auto file_mmap_cache_reclaim_count(void*, const ker::mod::mm::reclaim::ReclaimRequest& request) -> ker::mod::mm::reclaim::ReclaimCount {
+    return {.reclaimable = request.node_mask == 0 ? g_file_mmap_cache_pages.load(std::memory_order_relaxed)
+                                                  : file_mmap_cache_node_count(request.node_mask)};
 }
 
 auto file_mmap_cache_reclaim_scan(void*, const ker::mod::mm::reclaim::ReclaimRequest& request) -> ker::mod::mm::reclaim::ReclaimScanResult {
     size_t const PAGE_BUDGET = static_cast<size_t>(std::min<uint64_t>(request.budget_units, SIZE_MAX));
     size_t const SCAN_BUDGET = static_cast<size_t>(std::min<uint64_t>(request.scan_budget_units, SIZE_MAX));
-    FileMmapBoundedReclaimResult const RESULT = file_mmap_cache_reclaim_bounded(PAGE_BUDGET, SCAN_BUDGET);
+    FileMmapBoundedReclaimResult const RESULT = file_mmap_cache_reclaim_bounded(PAGE_BUDGET, SCAN_BUDGET, request.node_mask);
     return {
         .scanned = RESULT.scanned,
         .reclaimed = RESULT.reclaimed,
-        .has_more = g_file_mmap_cache_pages.load(std::memory_order_relaxed) != 0,
+        .has_more = (request.node_mask == 0 ? g_file_mmap_cache_pages.load(std::memory_order_relaxed)
+                                            : file_mmap_cache_node_count(request.node_mask)) != 0,
     };
 }
 }  // namespace
@@ -4168,6 +4210,7 @@ void file_mmap_cache_register_shrinker() {
         .max_scan_units = 4096,
         .count = file_mmap_cache_reclaim_count,
         .scan = file_mmap_cache_reclaim_scan,
+        .supports_node_filter = true,
     };
     if (!ker::mod::mm::reclaim::register_shrinker(SHRINKER)) {
         g_file_mmap_cache_shrinker_registered.store(false, std::memory_order_release);

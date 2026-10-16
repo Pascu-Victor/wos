@@ -55,6 +55,7 @@ struct ReclaimRequest {
     bool may_block{};
     bool may_io{};
     bool may_allocate{};
+    uint64_t node_mask{};  // Zero preserves legacy global reclaim.
 };
 
 struct ReclaimCount {
@@ -75,6 +76,14 @@ struct ReclaimScanResult {
 using CountCallback = auto (*)(void* opaque, const ReclaimRequest& request) -> ReclaimCount;
 using ScanCallback = auto (*)(void* opaque, const ReclaimRequest& request) -> ReclaimScanResult;
 
+// Internal masked-callback boundary. Call only outside real locks with live,
+// nonaliasing request/output objects. The implementation is instrumented and
+// owns callback hidden-return storage; global callback ABI/path is unchanged.
+namespace callback_boundary {
+[[gnu::noinline]] void invoke_node_count_into(ReclaimCount& output, CountCallback callback, void* opaque, const ReclaimRequest& request);
+[[gnu::noinline]] void invoke_node_scan_into(ReclaimScanResult& output, ScanCallback callback, void* opaque, const ReclaimRequest& request);
+}  // namespace callback_boundary
+
 struct Shrinker {
     const char* name{};
     ReclaimUnit unit{ReclaimUnit::PAGES};
@@ -87,6 +96,35 @@ struct Shrinker {
     CountCallback count{};
     ScanCallback scan{};
     void* opaque{};
+    bool supports_node_filter{};
+};
+
+enum class NodeReclaimStatus : uint8_t {
+    NONE,
+    NOT_READY,
+    INVALID_MASK,
+    UNSUPPORTED_ORDER,
+    UNSATISFIABLE,
+    INCOMPLETE_SAMPLE,
+    SOURCE_FAILED,
+    BUSY,
+    UNSAFE_CONTEXT
+};
+
+struct NodeReclaimStatsSnapshot {
+    uint16_t node{};
+    NodeReclaimStatus status{};
+    PressureLevel pressure{};
+    bool pending{};
+    bool inflight{};
+    uint64_t queued{};
+    uint64_t completed{};
+    uint64_t no_progress{};
+    uint64_t failures{};
+    uint64_t cache_scanned{};
+    uint64_t cache_released{};
+    uint64_t callbacks{};
+    uint64_t sampled_buddy_pages{};
 };
 
 struct ReclaimRunResult {
@@ -100,6 +138,9 @@ struct ReclaimRunResult {
     bool recursion_avoided{};
     bool lease_contended{};
     bool unsafe_context{};
+    NodeReclaimStatus node_status{};
+    uint64_t sampled_buddy_pages{};
+    bool scan_advanced{};
 };
 
 struct ZoneWatermarkSnapshot {
@@ -183,6 +224,18 @@ void init();
 [[nodiscard]] auto request_explicit(const ReclaimRequest& request, std::string_view only_name) -> bool;
 [[nodiscard]] auto reclaim_for_allocation(uint8_t requested_order, uint64_t target_pages) -> ReclaimRunResult;
 void request_background(uint8_t requested_order, uint64_t target_pages);
+// Scheduled-context notifier: queue scalar work, then wake the worker outside
+// the queue lock. Not safe for arbitrary allocator/PUB/MM callers; activation
+// at those sites requires a separately proved outer wake boundary. Zero
+// delegates the old order-0 global notifier.
+[[nodiscard]] auto request_background_nodes(uint64_t node_mask, uint64_t target_pages) noexcept -> NodeReclaimStatus;
+// Exact placed order0 failure only: no allocator/cache/source/RQ lock on
+// entry. PUB/root/PreemptGuard lifetime is allowed for the permanent DAEMON.
+// Canonical wake is synchronous and has no hard wall-clock latency bound.
+[[nodiscard]] auto notify_order0_node_failure(uint16_t node) noexcept -> NodeReclaimStatus;
+// Last observed status/pressure plus cumulative activity, not a physical census.
+// Invalid/not-ready leaves output unchanged; no callbacks or physical snapshot.
+[[nodiscard]] auto snapshot_node_stats(uint16_t node, NodeReclaimStatsSnapshot& output) noexcept -> bool;
 void note_allocation(uint8_t requested_order, uint64_t allocated_pages);
 void start_worker();
 
