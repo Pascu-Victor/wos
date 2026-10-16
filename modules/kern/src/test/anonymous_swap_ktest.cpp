@@ -1,3 +1,6 @@
+#ifdef WOS_SELFTEST
+#include <test/numa_lifecycle_mm_debt.hpp>
+#endif
 #include <abi/callnums/vmem.h>
 
 #include <array>
@@ -134,6 +137,17 @@ class TrackedSwapFixture {
         subject_->type = ker::mod::sched::task::TaskType::PROCESS;
         subject_->pagemap = root_;
         namespace vmabi = ker::abi::vmem;
+#ifdef WOS_SELFTEST
+        ::ker::test::numa_lifecycle::mm_debt::begin_change();
+        bool const LAZY_ROW_ADDED_0 = subject_->lazy_vmem_ranges.push_back({.start = TEST_VADDR,
+                                                                            .end = TEST_VADDR + paging::PAGE_SIZE,
+                                                                            .prot = vmabi::PROT_READ | vmabi::PROT_WRITE,
+                                                                            .flags = vmabi::MAP_PRIVATE | vmabi::MAP_ANONYMOUS,
+                                                                            .file = nullptr});
+        if (LAZY_ROW_ADDED_0) ::ker::test::numa_lifecycle::mm_debt::add_lazy_row(0);
+        ::ker::test::numa_lifecycle::mm_debt::end_change();
+        if (!LAZY_ROW_ADDED_0 || !map_pattern_page(root_, 0x53)) return false;
+#else
         if (!subject_->lazy_vmem_ranges.push_back({.start = TEST_VADDR,
                                                    .end = TEST_VADDR + paging::PAGE_SIZE,
                                                    .prot = vmabi::PROT_READ | vmabi::PROT_WRITE,
@@ -141,6 +155,7 @@ class TrackedSwapFixture {
                                                    .file = nullptr}) ||
             !map_pattern_page(root_, 0x53))
             return false;
+#endif
         auto* bytes = const_cast<uint8_t*>(mapped_bytes(root_));
         if (bytes == nullptr) return false;
         for (size_t i = 0; i < paging::PAGE_SIZE; ++i) bytes[i] = pattern_byte(i);

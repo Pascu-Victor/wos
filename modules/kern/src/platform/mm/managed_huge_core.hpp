@@ -206,6 +206,11 @@ class RegistryCore {
             if (row.state != State::Free && row.state != State::Preparing && same_root(row.key.root, root)) return true;
         return false;
     }
+    [[gnu::always_inline]] auto root_has_retired_owners(RootKey root) const noexcept -> bool {
+        for (auto const& row : rows_)
+            if (row.state == State::Retired && same_root(row.key.root, root)) return true;
+        return false;
+    }
     [[gnu::always_inline]] auto reserve_table_plan(uint16_t pages, PlanHandle& empty) noexcept -> Error {
         if (!ready_) return Error::NotReady;
         if (empty.generation != 0 || pages == 0 || pages > MAX_PLAN_TABLES) return Error::Invalid;

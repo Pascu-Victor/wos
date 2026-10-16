@@ -1,4 +1,7 @@
 #include "task.hpp"
+#ifdef WOS_SELFTEST
+#include <test/numa_lifecycle_mm_debt.hpp>
+#endif
 
 #include <bits/off_t.h>
 #include <bits/ssize_t.h>
@@ -52,6 +55,10 @@
 extern "C" void wos_kernel_thread_trampoline();  // NOLINT(readability-identifier-naming)
 
 namespace ker::mod::sched::task {
+#ifdef WOS_SELFTEST
+namespace debt = ::ker::test::numa_lifecycle::mm_debt;
+using DebtField = ::ker::test::numa_lifecycle::CounterField;
+#endif
 namespace {
 
 struct BootFileCacheEntry {
@@ -1298,6 +1305,9 @@ auto Task::try_acquire_usercopy_pagemap(mm::paging::PageTable*& out) -> bool {
         return false;
     }
 
+#ifdef WOS_SELFTEST
+    debt::begin_change();
+#endif
     uint32_t accesses = usercopy_pagemap_accesses.load(std::memory_order_acquire);
     while (accesses != UINT32_MAX) {
         if (usercopy_pagemap_accesses.compare_exchange_weak(accesses, accesses + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
@@ -1305,9 +1315,16 @@ auto Task::try_acquire_usercopy_pagemap(mm::paging::PageTable*& out) -> bool {
         }
     }
     if (accesses == UINT32_MAX) {
+#ifdef WOS_SELFTEST
+        debt::end_change();
+#endif
         return false;
     }
 
+#ifdef WOS_SELFTEST
+    debt::add(DebtField::TASK_USERCOPY_ACCESSES);
+    debt::end_change();
+#endif
     if (state.load(std::memory_order_acquire) != TaskState::ACTIVE || usercopy_pagemap_closing.load(std::memory_order_acquire) ||
         pagemap == nullptr) {
         release_usercopy_pagemap();
@@ -1318,7 +1335,16 @@ auto Task::try_acquire_usercopy_pagemap(mm::paging::PageTable*& out) -> bool {
     return true;
 }
 
-void Task::release_usercopy_pagemap() { usercopy_pagemap_accesses.fetch_sub(1, std::memory_order_acq_rel); }
+void Task::release_usercopy_pagemap() {
+#ifdef WOS_SELFTEST
+    debt::begin_change();
+#endif
+    usercopy_pagemap_accesses.fetch_sub(1, std::memory_order_acq_rel);
+#ifdef WOS_SELFTEST
+    debt::drop(DebtField::TASK_USERCOPY_ACCESSES);
+    debt::end_change();
+#endif
+}
 
 void Task::quiesce_usercopy_pagemap() {
     usercopy_pagemap_closing.store(true, std::memory_order_release);

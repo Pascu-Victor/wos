@@ -322,4 +322,160 @@ KTEST(ManagedHuge, UnknownTwoMegabyteAndOneGigabyteRefuseWithoutTakingRefs) {
     Pin valid;
     KEXPECT_TRUE(virt::pin_user_page(f.root, VA, true, valid.value));
 }
+
+namespace {
+// Separate physical references retain patterned bytes after their actual PS
+// mapping reference is retired. They carry no root-reader lease or fake Task.
+struct RetainedManagedFrames {
+    uint8_t* data{};
+    explicit RetainedManagedFrames(uint8_t* p) : data(p) {
+        for (size_t i = 0; i < huge::LEAF_PAGES; ++i) phys::page_ref_inc(data + i * paging::PAGE_SIZE);
+    }
+    ~RetainedManagedFrames() {
+        for (size_t i = 0; i < huge::LEAF_PAGES; ++i) (void)phys::page_ref_dec(data + i * paging::PAGE_SIZE);
+    }
+};
+struct BudgetRetirementOwner {
+    virt::DestroyUserSpaceBudgetState* state{};
+    Fixture* fixture{};
+    ~BudgetRetirementOwner() {
+        virt::destroy_user_space_budget_state_destroy(state);
+        // Positive fixture aborts retain the original root. Once its spare was
+        // intentionally returned, real raw retirement is its allocation-free
+        // fallback; never ask the old split cleanup to consume a missing spare.
+        if (fixture && fixture->root && fixture->mapped[0] && fixture->cleanup[0].empty()) {
+            virt::destroy_user_space(fixture->root, 0, "managed-huge", "budget-fixture-abort");
+            fixture->mapped[0] = false;
+        }
+    }
+};
+void expect_retained_pattern(uint8_t* data) {
+    KEXPECT_EQ(references(data), huge::LEAF_PAGES);
+    KEXPECT_TRUE(pattern(data, false));
+}
+}  // namespace
+
+KTEST(ManagedHuge, RawRetirementReturnsMappingRefsWithoutCleanupTable) {
+    Fixture f;
+    KREQUIRE_TRUE(f.init());
+    KREQUIRE_EQ(f.prepare(0), huge::Error::None);
+    auto* data = static_cast<uint8_t*>(f.spans[0].data());
+    KREQUIRE_TRUE(pattern(data, true));
+    KREQUIRE_EQ(f.publish(0), huge::Error::None);
+    RetainedManagedFrames retained(data);
+    f.cleanup[0].reset();  // Retirement cannot use the prepublication spare.
+    KEXPECT_EQ(references(data), 2 * huge::LEAF_PAGES);
+    virt::destroy_user_space(f.root, 0, "managed-huge", "raw-PS-retirement");
+    f.mapped[0] = false;  // The actual raw walker, not a split, detached it.
+    expect_retained_pattern(data);
+    huge::Snapshot after{};
+    huge::snapshot(after);
+    KEXPECT_EQ(after.charged_pages, f.cap_before.charged_pages);
+    KEXPECT_EQ(after.retired_pages, f.cap_before.retired_pages);
+    log::info("real raw managed512 refs retired; retained physical refs preserve all patterned bytes; no SMP ACK claim");
+}
+
+KTEST(ManagedHuge, BudgetRetirementCompletesAndReturnsActualRoot) {
+    Fixture f;
+    KREQUIRE_TRUE(f.init());
+    KREQUIRE_EQ(f.prepare(0), huge::Error::None);
+    auto* data = static_cast<uint8_t*>(f.spans[0].data());
+    KREQUIRE_TRUE(pattern(data, true));
+    KREQUIRE_EQ(f.publish(0), huge::Error::None);
+    RetainedManagedFrames retained(data);
+    BudgetRetirementOwner owner{virt::create_destroy_user_space_budget_state(f.root, 0, "managed-huge", "budget-PS-retirement"), &f};
+    KREQUIRE_NE(owner.state, nullptr);
+    f.cleanup[0].reset();
+    bool done = false;
+    // Dedicated large fixture; the existing native small file-only2048 bound
+    // and its assertions remain unchanged in their original source path.
+    for (size_t step = 0; step < 4096 && !done; ++step) done = virt::destroy_user_space_budgeted(owner.state, 1);
+    KREQUIRE_TRUE(done);
+    f.mapped[0] = false;
+    KREQUIRE_EQ(f.subject->detach_pagemap_after_usercopy_quiescence(), f.root);
+    task::release_lazy_vmem_ranges(*f.subject);
+    ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(f.root);
+    KREQUIRE_TRUE(virt::finish_destroy_user_space_and_release_pagemap(owner.state));
+    owner.state = nullptr;
+    f.root = nullptr;
+    expect_retained_pattern(data);
+    huge::Snapshot after{};
+    huge::snapshot(after);
+    KEXPECT_EQ(after.charged_pages, f.cap_before.charged_pages);
+    log::info("actual budget managed512 retirement/DONE/root return; physical refs and pattern survive; no scheduled concurrency claim");
+}
+
+KTEST(ManagedHuge, PartialBudgetDisposalDrainsDetachedTailOnly) {
+    for (uint16_t prefix : {uint16_t{0}, uint16_t{63}, uint16_t{64}, uint16_t{65}, uint16_t{511}}) {
+        Fixture f;
+        KREQUIRE_TRUE(f.init());
+        KREQUIRE_EQ(f.prepare(0), huge::Error::None);
+        auto* data = static_cast<uint8_t*>(f.spans[0].data());
+        KREQUIRE_TRUE(pattern(data, true));
+        KREQUIRE_EQ(f.publish(0), huge::Error::None);
+        RetainedManagedFrames retained(data);
+        BudgetRetirementOwner owner{virt::create_destroy_user_space_budget_state(f.root, 0, "managed-huge", "dispose-PS-tail"), &f};
+        KREQUIRE_NE(owner.state, nullptr);
+        f.cleanup[0].reset();
+        bool detached = false;
+        for (size_t step = 0; step < 1024 && !detached; ++step) {
+            KEXPECT_FALSE(virt::destroy_user_space_budgeted(owner.state, 1));
+            huge::Snapshot current{};
+            huge::snapshot(current);
+            detached = current.retired_pages == f.cap_before.retired_pages + huge::LEAF_PAGES;
+        }
+        KREQUIRE_TRUE(detached);
+        f.mapped[0] = false;
+        for (uint16_t page = 0; page < prefix; ++page) KEXPECT_FALSE(virt::destroy_user_space_budgeted(owner.state, 1));
+        KEXPECT_EQ(references(data), 2 * huge::LEAF_PAGES - prefix);
+        virt::destroy_user_space_budget_state_destroy(owner.state);
+        owner.state = nullptr;
+        expect_retained_pattern(data);
+        KEXPECT_EQ(virt::selftest_user_pagemap_reader_count(f.root), 0U);
+        huge::Snapshot after{};
+        huge::snapshot(after);
+        KEXPECT_EQ(after.charged_pages, f.cap_before.charged_pages);
+        // Existing Fixture cleanup now retires the still-reachable PT tree.
+    }
+}
+
+KTEST(ManagedHuge, PartialDisposalPreservesReachableManagedRemainder) {
+    Fixture f;
+    KREQUIRE_TRUE(f.init());
+    KREQUIRE_EQ(f.prepare(0), huge::Error::None);
+    KREQUIRE_EQ(f.prepare(1), huge::Error::None);
+    auto* first = static_cast<uint8_t*>(f.spans[0].data());
+    auto* second = static_cast<uint8_t*>(f.spans[1].data());
+    KREQUIRE_TRUE(pattern(first, true));
+    KREQUIRE_TRUE(pattern(second, true));
+    KREQUIRE_EQ(f.publish(0), huge::Error::None);
+    KREQUIRE_EQ(f.publish(1), huge::Error::None);
+    RetainedManagedFrames retained(first);
+    BudgetRetirementOwner owner{virt::create_destroy_user_space_budget_state(f.root, 0, "managed-huge", "managed-remainder"), &f};
+    KREQUIRE_NE(owner.state, nullptr);
+    f.cleanup[0].reset();
+    bool detached = false;
+    for (size_t step = 0; step < 1024 && !detached; ++step) {
+        KEXPECT_FALSE(virt::destroy_user_space_budgeted(owner.state, 1));
+        huge::Snapshot current{};
+        huge::snapshot(current);
+        detached = current.retired_pages == f.cap_before.retired_pages + huge::LEAF_PAGES;
+    }
+    KREQUIRE_TRUE(detached);
+    f.mapped[0] = false;
+    virt::destroy_user_space_budget_state_destroy(owner.state);
+    owner.state = nullptr;
+    expect_retained_pattern(first);
+    KEXPECT_EQ(references(second), huge::LEAF_PAGES);
+    KEXPECT_TRUE(pattern(second, false));
+    auto* word = raw_slot(f.root, VA + huge::LEAF_BYTES, 2);
+    KREQUIRE_NE(word, nullptr);
+    KEXPECT_NE(*word & (uint64_t{1} << 7), 0U);
+    huge::Snapshot after{};
+    huge::snapshot(after);
+    KEXPECT_EQ(after.retired_pages, f.cap_before.retired_pages);
+    KEXPECT_EQ(after.mapped_pages, f.cap_before.mapped_pages + huge::LEAF_PAGES);
+    KEXPECT_EQ(after.charged_pages, f.cap_before.charged_pages + huge::LEAF_PAGES);
+    // The unchanged Fixture still owns second's actual preowned split cleanup.
+}
 #endif

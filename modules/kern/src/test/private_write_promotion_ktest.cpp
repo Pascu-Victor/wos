@@ -1,3 +1,6 @@
+#ifdef WOS_SELFTEST
+#include <test/numa_lifecycle_mm_debt.hpp>
+#endif
 // Private mapping permission, cache ownership and COW commit regressions.
 #ifdef WOS_SELFTEST
 
@@ -10,7 +13,9 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <platform/acpi/numa_boot.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/numa_alloc.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/swap.hpp>
 #include <platform/mm/virt.hpp>
@@ -199,10 +204,21 @@ struct OwnedFile {
                                   .file_ctime_sec = st.st_ctim.tv_sec,
                                   .file_ctime_nsec = st.st_ctim.tv_nsec};
         vfs::vfs_retain_file(file);
+#ifdef WOS_SELFTEST
+        ::ker::test::numa_lifecycle::mm_debt::begin_change();
+        bool const LAZY_ROW_ADDED_0 = owner.subject->lazy_vmem_ranges.push_back(range);
+        if (LAZY_ROW_ADDED_0) ::ker::test::numa_lifecycle::mm_debt::add_lazy_row(1);
+        ::ker::test::numa_lifecycle::mm_debt::end_change();
+        if (!LAZY_ROW_ADDED_0) {
+            vfs::vfs_put_file(file);
+            return false;
+        }
+#else
         if (!owner.subject->lazy_vmem_ranges.push_back(range)) {
             vfs::vfs_put_file(file);
             return false;
         }
+#endif
         paging::PageFault fault{};
         bool const mapped = vmem::materialize_lazy_file_page(owner.subject.get(), range, VA, fault);
         // Recover a cache ref even if insertion succeeded but install refused.
@@ -358,7 +374,15 @@ KTEST(PrivateWritePromotion, ExclusiveFreshAndSharedRestriction) {
         KREQUIRE_NE(shared_frame, nullptr);
         task::LazyVmemRange const conflicting{
             .start = VA, .end = VA + PAGE, .prot = vmabi::PROT_READ | vmabi::PROT_WRITE, .flags = vmabi::MAP_SHARED | vmabi::MAP_ANONYMOUS};
+#ifdef WOS_SELFTEST
+        ::ker::test::numa_lifecycle::mm_debt::begin_change();
+        bool const LAZY_ROW_ADDED_1 = readonly_shared.subject->lazy_vmem_ranges.push_back(conflicting);
+        if (LAZY_ROW_ADDED_1) ::ker::test::numa_lifecycle::mm_debt::add_lazy_row(0);
+        ::ker::test::numa_lifecycle::mm_debt::end_change();
+        KREQUIRE_TRUE(LAZY_ROW_ADDED_1);
+#else
         KREQUIRE_TRUE(readonly_shared.subject->lazy_vmem_ranges.push_back(conflicting));
+#endif
         KREQUIRE_TRUE(clone(readonly_shared, shared_peer));
         // Metadata alone cannot synthesize private COW on a shared leaf.
         KEXPECT_FALSE(write(readonly_shared));
@@ -431,7 +455,15 @@ KTEST(PrivateWritePromotion, AnonymousPermissionMustBeCurrent) {
                                   .end = VA + PAGE,
                                   .prot = vmabi::PROT_READ | vmabi::PROT_WRITE,
                                   .flags = vmabi::MAP_PRIVATE | vmabi::MAP_ANONYMOUS};
+#ifdef WOS_SELFTEST
+        ::ker::test::numa_lifecycle::mm_debt::begin_change();
+        bool const LAZY_ROW_ADDED_2 = owner.subject->lazy_vmem_ranges.push_back(range);
+        if (LAZY_ROW_ADDED_2) ::ker::test::numa_lifecycle::mm_debt::add_lazy_row(0);
+        ::ker::test::numa_lifecycle::mm_debt::end_change();
+        KREQUIRE_TRUE(LAZY_ROW_ADDED_2);
+#else
         KREQUIRE_TRUE(owner.subject->lazy_vmem_ranges.push_back(range));
+#endif
         if (!admitted) {
             uint64_t const irq = owner.subject->lazy_vmem_lock.lock_irqsave();
             owner.subject->lazy_vmem_ranges.at(0).prot = vmabi::PROT_READ;
@@ -506,4 +538,102 @@ KTEST(PrivateWritePromotion, SuccessfulSwapPreservesReadAndNone) {
         KEXPECT_TRUE(full_read(*child.subject, ORIGINAL, REPLACEMENT));
     }
 }
+
+// Unpublished owned roots and a bounded real File backend qualify copied-data
+// placement/ref/PTE mechanics. They do not emulate scheduled CPL3 faults,
+// worker CPU placement or a native filesystem authorization boundary.
+KTEST(PrivateWritePromotion, CopiedFileKeepsCapturedBindAndEof) {
+    namespace numa = mm::numa;
+    auto const* machine = ker::mod::acpi::numa::boot_topology();
+    KREQUIRE_NE(machine, nullptr);
+    for (numa::NodeId node = 0; node < machine->node_count; ++node) {
+        if (machine->nodes[node].usable_bytes == 0) continue;
+        for (uint64_t flags : {uint64_t{vmabi::MAP_PRIVATE}, uint64_t{vmabi::MAP_SHARED}}) {
+            OwnerBalance balance;
+            OwnedFile file;
+            KREQUIRE_TRUE(file.init());
+            OwnedTask owner;  // Releases its retained File before OwnedFile.
+            KREQUIRE_TRUE(owner.init());
+            KREQUIRE_TRUE(owner.subject->selftest_set_memory_policy({numa::NodeMask{1} << node, numa::Mode::BIND}));
+            numa::AllocationContext captured{};
+            KREQUIRE_EQ(numa::capture_allocation_context(owner.subject->memory_policy_snapshot(), captured), numa::AllocationError::NONE);
+            captured.virtual_page_index = UINT64_MAX;  // Materializer must replace this from destination VA.
+            KREQUIRE_TRUE(owner.subject->selftest_set_memory_policy({}));
+            auto const& st = file.file->exec_read_view->metadata;
+            task::LazyVmemRange range{.start = VA,
+                                      .end = VA + PAGE,
+                                      .prot = vmabi::PROT_READ | vmabi::PROT_WRITE,
+                                      .flags = flags,
+                                      .kind = task::LazyVmemKind::FILE_BACKED,
+                                      .file = file.file,
+                                      .file_offset = 0,
+                                      .file_dev = st.st_dev,
+                                      .file_ino = st.st_ino,
+                                      .file_size = 137,
+                                      .file_mtime_sec = st.st_mtim.tv_sec,
+                                      .file_mtime_nsec = st.st_mtim.tv_nsec,
+                                      .file_ctime_sec = st.st_ctim.tv_sec,
+                                      .file_ctime_nsec = st.st_ctim.tv_nsec};
+            vfs::vfs_retain_file(file.file);
+            ::ker::test::numa_lifecycle::mm_debt::begin_change();
+            bool const COPIED_LAZY_ADDED_0 = owner.subject->lazy_vmem_ranges.push_back(range);
+            if (COPIED_LAZY_ADDED_0) ::ker::test::numa_lifecycle::mm_debt::add_lazy_row(static_cast<uint8_t>(range.kind));
+            ::ker::test::numa_lifecycle::mm_debt::end_change();
+            if (!COPIED_LAZY_ADDED_0) {
+                vfs::vfs_put_file(file.file);
+                KREQUIRE_TRUE(false);
+            }
+            paging::PageFault fault{};
+            fault.writable = 1;
+            KREQUIRE_TRUE(vmem::materialize_lazy_file_page(owner.subject.get(), range, VA, fault, captured));
+            auto* data = frame(owner.root);
+            KREQUIRE_NE(data, nullptr);
+            KEXPECT_EQ(numa::physical_node(physical(data)), node);
+            KEXPECT_EQ(phys::page_ref_get(data), 1U);
+            for (size_t i = 0; i < PAGE; ++i) KEXPECT_EQ(data[i], i < 137 ? ORIGINAL : uint8_t{0});
+            KEXPECT_EQ(file.reads, 1U);
+            KEXPECT_EQ(file.file->pos, 29);
+            KEXPECT_EQ(captured.virtual_page_index, UINT64_MAX);
+            // Existing mapping wins; any unused second candidate is returned.
+            KEXPECT_TRUE(vmem::materialize_lazy_file_page(owner.subject.get(), range, VA, fault, captured));
+            KEXPECT_EQ(frame(owner.root), data);
+            KEXPECT_EQ(phys::page_ref_get(data), 1U);
+        }
+    }
+}
+
+KTEST(PrivateWritePromotion, CopiedFileInvalidContextLeavesOwnedRootEmpty) {
+    OwnerBalance balance;
+    OwnedFile file;
+    KREQUIRE_TRUE(file.init());
+    OwnedTask owner;
+    KREQUIRE_TRUE(owner.init());
+    auto const& st = file.file->exec_read_view->metadata;
+    task::LazyVmemRange range{.start = VA,
+                              .end = VA + PAGE,
+                              .prot = vmabi::PROT_READ | vmabi::PROT_WRITE,
+                              .flags = vmabi::MAP_PRIVATE,
+                              .kind = task::LazyVmemKind::FILE_BACKED,
+                              .file = file.file,
+                              .file_size = PAGE};
+    range.file_dev = st.st_dev;
+    range.file_ino = st.st_ino;
+    vfs::vfs_retain_file(file.file);
+    ::ker::test::numa_lifecycle::mm_debt::begin_change();
+    bool const COPIED_LAZY_ADDED_1 = owner.subject->lazy_vmem_ranges.push_back(range);
+    if (COPIED_LAZY_ADDED_1) ::ker::test::numa_lifecycle::mm_debt::add_lazy_row(static_cast<uint8_t>(range.kind));
+    ::ker::test::numa_lifecycle::mm_debt::end_change();
+    if (!COPIED_LAZY_ADDED_1) {
+        vfs::vfs_put_file(file.file);
+        KREQUIRE_TRUE(false);
+    }
+    mm::numa::AllocationContext invalid{};
+    invalid.policy = {0, mm::numa::Mode::BIND};
+    paging::PageFault fault{};
+    fault.writable = 1;
+    KEXPECT_FALSE(vmem::materialize_lazy_file_page(owner.subject.get(), range, VA, fault, invalid));
+    KEXPECT_EQ(virt::translate(owner.root, VA), virt::PADDR_INVALID);
+    KEXPECT_EQ(file.reads, 0U);
+}
+
 #endif

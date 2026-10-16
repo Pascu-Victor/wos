@@ -6,7 +6,12 @@ access gates, file index, allocator metadata, clock and logging are controlled.
 This checks detach-before-release and exact-root ACK ordering, including the
 immediate capacity flush and partial disposal, not hardware IPI/SMP behavior.
 """
+import argparse
+import hashlib
+import json
 import os
+import signal
+import time
 from pathlib import Path
 import re
 import shutil
@@ -56,6 +61,7 @@ def extract(source, token, semicolon=False):
 
 
 PREFIX = r'''
+#include <platform/mm/managed_huge_core.hpp>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -70,6 +76,7 @@ PREFIX = r'''
 #include <vector>
 namespace test_kernel {
 using vaddr_t = uint64_t;
+namespace huge = ker::mod::mm::huge;
 struct PageTableEntry {
     uint64_t present:1 = 0, writable:1 = 0, user:1 = 0, rest:4 = 0, pagesize:1 = 0;
     uint64_t pad:4 = 0, frame:40 = 0, high:12 = 0;
@@ -78,12 +85,13 @@ static_assert(sizeof(PageTableEntry) == 8);
 struct alignas(4096) PageTable { std::array<PageTableEntry,512> entries{}; };
 static_assert(sizeof(PageTable) == 4096);
 namespace paging {
-constexpr uint64_t PAGE_SIZE=4096, PAGE_SHIFT=12;
+constexpr uint64_t PAGE_SIZE=4096, PAGE_SHIFT=12, PAGE_TABLE_ENTRIES=512, PAGE_PRESENT=1;
 auto purge_page_table_entry() { return PageTableEntry{}; }
 }
 namespace addr {
 constexpr uint64_t get_hhdm_offset() { return 0; }
 auto get_phys_pointer(uint64_t p) { return p; }
+auto get_virt_pointer(uint64_t p) { return reinterpret_cast<uint64_t*>(p); }
 }
 // Disclosed Host physical-address seam: real aligned userspace buffers are the
 // test's physical/HHDM tables; no actual kernel-half address is dereferenced.
@@ -97,11 +105,37 @@ PageTable* expected_root=nullptr;
 std::map<size_t,PageTable*> held_gates;
 unsigned failures=0, checks=0, ref_batches=0, tlb_calls=0, released=0;
 unsigned reachable_failures=0, ack_failures=0;
+unsigned cow_depth=0, pin_depth=0;
+uint64_t root_serial=1;
+std::map<void*,unsigned> managed_extra;
+std::map<void*,uint16_t> managed_index;
+uint16_t observed_handoff=0;
+constexpr uint64_t PTE_FRAME_MASK=0x000ffffffffff000ULL;
+void observe_cap_completion();
+struct HostRegistry : huge::RegistryCore {
+    auto advance_retired_handoff(huge::LeafHandle handle,uint16_t next,uint16_t count) -> huge::Error {
+        expect_pin();
+        auto error=huge::RegistryCore::advance_retired_handoff(handle,next,count);
+        if(error==huge::Error::None) observed_handoff=next+count;
+        return error;
+    }
+    auto complete_retired_after_ack(huge::LeafHandle handle) -> huge::Error {
+        expect_pin();
+        observe_cap_completion();
+        return huge::RegistryCore::complete_retired_after_ack(handle);
+    }
+    static void expect_pin();
+} managed_huge_registry;
 bool last_ack=false;
 PageTable* last_ack_root=nullptr;
 void expect(bool ok,const char* message) {
     ++checks;
     if(!ok) { ++failures; std::fprintf(stderr,"FAIL %s\n",message); }
+}
+void HostRegistry::expect_pin(){expect(pin_depth==1,"actual registry handoff/completion serialized by pin");}
+void observe_cap_completion(){
+    expect(observed_handoff==512,"cap completion requires all512 actual registry handoffs");
+    for(auto const& [p,extra]:managed_extra) expect(refs[p]==extra,"cap credit after last actual mapping ref decrement");
 }
 bool reachable(PageTable* table,int level,uint64_t target,std::set<PageTable*>& seen) {
     if(!seen.insert(table).second) return false;
@@ -129,7 +163,17 @@ auto page_ref_dec_batch(std::span<void*const> pages,PageLookupHint*) -> PageRefB
     expect(ack,"each nonempty refdec batch follows exact-root completed ACK");
     last_ack=false;
     PageRefBatchStats out;
+    expect(cow_depth+pin_depth==0,"ref finalization outside all COW/pin locks");
     for(void* page:pages) {
+        if(managed_index.contains(page)) {
+            huge::Snapshot snapshot{};managed_huge_registry.snapshot(snapshot);
+            if(snapshot.retired_pages==512) {
+                expect(observed_handoff>managed_index.at(page),"every queued ref handed off before possible64th append flush");
+                expect(snapshot.charged_pages==512,"cap retained through every actual mapping ref drop");
+            } else {
+                expect(snapshot.mapped_pages==512 && refs[page]>1,"independent4K alias may retire before the still-mapped managed owner");
+            }
+        }
         expect(refs[page]>0,"real fixture owns every queued reference");
         if(refs[page]==1) {
             bool detached=!reachable(reinterpret_cast<uint64_t>(page));
@@ -144,6 +188,7 @@ auto page_ref_dec_batch(std::span<void*const> pages,PageLookupHint*) -> PageRefB
 }
 void flush_pagemap_after_update(PageTable* root,uint64_t address,bool full) {
     ++tlb_calls;
+    expect(cow_depth+pin_depth==0,"real-flush seam called after unlocking COW/pin");
     expect(root==expected_root,"TLB operation uses exact actual fixture root");
     expect(address==0 && full,"teardown requires a full-root invalidation");
     expect(std::any_of(held_gates.begin(),held_gates.end(),[&](auto x){return x.second==root;}),"original root gate held across barrier");
@@ -178,8 +223,16 @@ void purge_anonymous_swap_mappings(PageTable*) {}
 void owned_frame_purge_pagemap(PageTable*) {}
 namespace file_mapping { struct FileMappingTlbRetirement { void release_after_completed_tlb() {} }; }
 struct RootControl { uint64_t serial{}; };
-auto find_user_root_control_locked(PageTable*) -> RootControl* {return nullptr;}
-struct PinLock { uint64_t lock_irqsave(){return 0;}void unlock_irqrestore(uint64_t){} } user_mapping_pin_lock;
+auto find_user_root_control_locked(PageTable* root) -> RootControl* {
+    static RootControl control;
+    if(root!=expected_root || root==nullptr) return nullptr;
+    control.serial=root_serial;return &control;
+}
+struct PinLock {
+    unsigned& depth;
+    uint64_t lock_irqsave(){expect(depth==0,"nonrecursive Host lock");++depth;return 0;}
+    void unlock_irqrestore(uint64_t){expect(depth==1,"exact Host lock release");--depth;}
+} user_mapping_pin_lock{pin_depth},cow_pte_lock{cow_depth};
 struct Index { bool root_empty_locked(PageTable*){return true;}bool detach_root_locked(PageTable*,uint64_t,file_mapping::FileMappingTlbRetirement&){return true;} } file_mapping_index;
 namespace time { uint64_t get_us(){static uint64_t t=0;return ++t;} }
 auto elapsed_us_since(uint64_t a,uint64_t b){return b>=a?b-a:0;}
@@ -260,6 +313,9 @@ int run_tests(){
 '''
 
 
+EXTRA_TESTS = (Path(__file__).resolve().with_name("managed_huge_retirement_cases.inc")).read_text()
+
+
 def generate(source):
     out = [PREFIX]
     for token in ["struct DestroyUserSpaceCallStats {", "enum class DestroyUserSpacePhase", "struct DestroyWalkFrame {",
@@ -273,11 +329,20 @@ def generate(source):
     constant = re.findall(r"^constexpr size_t DESTROY_REFDEC_BATCH_CAP = [^;]+;", source, re.M)
     assert len(constant) == 1, "unique actual batch capacity required"
     out.append(constant[0] + "\n")
+    out.append(extract(source, "struct DestroyManagedCursor {", True))
     out.append(extract(source, "struct DestroyUserSpaceBudgetState {", True))
     out.append("using DestroyRefdecBatch=DestroyUserSpaceBudgetState::RefdecBatch;\n")
     out.append(extract(source, "enum class DestroyRefdecBatchKind", True))
+    out.append(extract(source, "auto index_of("))
+    out.append(extract(source, "class MutableUserEntrySlot {", True))
+    out.append(extract(source, "enum class Pml2Walk", True))
+    out.append(extract(source, "auto managed_pml2_slot_locked("))
+    out.append(extract(source, "auto managed_root_matches_locked("))
     for token in ["void note_destroy_refdec_batch_stats(DestroyUserSpaceCallStats* stats, phys::PageRefBatchStats const& batch_stats,",
-                  "void destroy_refdec_batch_flush(", "void destroy_refdec_batch_queue(", "void destroy_state_reset_walk(",
+                  "void destroy_refdec_batch_flush(",
+                  "class DestroyManagedCursorStorage {", "void destroy_refdec_batch_append(", "auto destroy_managed_leaf(",
+                  "void destroy_validate_managed_leaf(", "void destroy_managed_handoff(", "void destroy_managed_drain(",
+                  "void destroy_require_no_managed_owners(", "void destroy_refdec_batch_queue(", "void destroy_state_reset_walk(",
                   "auto destroy_state_push(", "auto destroy_state_top(", "void destroy_state_pop(",
                   "void destroy_state_flush_refdec_batch(", "void destroy_state_flush_page_table_refdec_batch(",
                   "void destroy_state_queue_refdec(", "void destroy_state_queue_page_table_refdec(",
@@ -285,33 +350,220 @@ def generate(source):
                   "auto advance_free_page_tables_budgeted(", "void free_user_data_pages(", "void free_page_table_pages(",
                   "auto begin_prepared_destroy_user_space(", "auto destroy_user_space_budgeted(",
                   "void destroy_user_space_budget_state_destroy(", "void destroy_user_space(PageTable*"]:
-        out.append(extract(source, token))
-    out.append(TESTS)
+        out.append(extract(source, token, token.startswith("class ")))
+    out.append("void run_managed_tests();\n")
+    out.append(TESTS.replace("    std::printf(\"checks=", "    run_managed_tests();\n    std::printf(\"checks="))
+    out.append(EXTRA_TESTS)
     out.append("} // namespace test_kernel\nint main(){return test_kernel::run_tests();}\n")
     return "\n".join(out)
 
+
+def pin(path):
+    path = Path(path).resolve()
+    first = path.stat()
+    data = path.read_bytes()
+    last = path.stat()
+    identity = lambda st: (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+    if identity(first) != identity(last):
+        raise RuntimeError(f"input changed while reading: {path}")
+    return dict(path=str(path), bytes=len(data), sha256=hashlib.sha256(data).hexdigest(),
+                device=last.st_dev, inode=last.st_ino, mtime_ns=last.st_mtime_ns, ctime_ns=last.st_ctime_ns)
+
+
+def mutated(source, kind):
+    def once(old, new):
+        pattern = r"\s+".join(re.escape(part) for part in old.split())
+        if len(re.findall(pattern, source)) != 1:
+            raise RuntimeError("actual mutation boundary changed: " + kind)
+        return re.sub(pattern, lambda _match: new, source)
+    if kind == "missing-handoff":
+        return once("if (managed_huge_registry.advance_retired_handoff(cursor.leaf.handle, cursor.next, 1) != huge::Error::None) __builtin_trap();",
+                    "/* negative control: omit actual registry handoff */")
+    if kind == "duplicate-cursor":
+        return once("++cursor.next;", "/* negative control: leave the same mapping ref in the cursor */")
+    if kind == "flush-before-transfer":
+        return once("destroy_refdec_batch_append(pages, batch.count, page);",
+                    "destroy_refdec_batch_append(pages, batch.count, page);\n"
+                    "        if (batch.count >= batch.pages.size()) destroy_refdec_batch_flush(batch, stats, DestroyRefdecBatchKind::DATA);")
+    if kind == "early-cap":
+        helper = extract(source, "void destroy_managed_handoff(")
+        final = extract(helper, "if (cursor.next == huge::LEAF_PAGES)").rstrip()
+        final_start = helper.index(final)
+        call = r"destroy_refdec_batch_flush\(batch,\s*stats,\s*DestroyRefdecBatchKind::DATA\);"
+        flush = r"if\s*\(batch.count\s*>=\s*batch.pages.size\(\)\)\s*" + call
+        matches = list(re.finditer(flush, helper[:final_start]))
+        if len(matches) != 2 or len(re.findall(call, final)) != 1:
+            raise RuntimeError("early-cap actual completion boundary changed")
+        before = matches[-1]
+        moved = re.sub(call, "/* negative control: credit before final ACK/ref batch */", final, count=1)
+        changed = helper[:before.start()] + moved + "\n    " + before.group() + helper[final_start+len(final):]
+        if source.count(helper.rstrip()) != 1:
+            raise RuntimeError("unique actual handoff helper required")
+        return source.replace(helper.rstrip(), changed.rstrip())
+    raise RuntimeError("unknown mutation")
+
+
 def main():
-    compiler = os.environ.get("HOST_CXX") or shutil.which("g++", path=os.defpath) or shutil.which("clang++", path=os.defpath)
-    assert compiler, "host compiler missing"
-    source = SOURCE.read_text()
-    before = SOURCE.read_bytes()
-    code = generate(source)
-    environment = {**os.environ, "ASAN_OPTIONS": "detect_leaks=0:halt_on_error=1", "UBSAN_OPTIONS": "halt_on_error=1"}
-    with tempfile.TemporaryDirectory(prefix="wos-teardown-tlb-") as scratch:
-        directory = Path(scratch)
-        cpp, binary = directory / "check.cpp", directory / "check"
-        cpp.write_text(code)
-        commands = ([compiler, "-std=c++23", "-O1", "-g", "-Wall", "-Wextra", "-Wno-unused-parameter",
-                     "-Wno-unused-function", "-fno-pie", "-no-pie", "-fsanitize=address,undefined",
-                     "-fno-omit-frame-pointer", str(cpp), "-o", str(binary)], [str(binary)])
-        for argv, timeout in zip(commands, (60, 15)):
-            completed = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=environment)
-            print(completed.stdout, end="")
-            print(completed.stderr, end="", file=sys.stderr)
-            assert completed.returncode == 0, (argv, completed.returncode)
-    assert not directory.exists(), "owned compiler scratch not removed"
-    assert before == SOURCE.read_bytes(), "production source changed during actual-body check"
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source-root", type=Path, default=ROOT)
+    parser.add_argument("--virt-source", type=Path)
+    parser.add_argument("--kernel-overlay", type=Path)
+    parser.add_argument("--cxx", default=os.environ.get("HOST_CXX"))
+    parser.add_argument("--output", type=Path, help="fresh optional result directory; all compiler scratch is removed")
+    parser.add_argument("--negative-controls", action="store_true")
+    args = parser.parse_args()
+    root = args.source_root.resolve()
+    source_path = args.virt_source.resolve() if args.virt_source else root / "modules/kern/src/platform/mm/virt.opt.cpp"
+    overlay = args.kernel_overlay.resolve() if args.kernel_overlay else root / "modules/kern/src"
+    compiler = args.cxx or shutil.which("g++", path=os.defpath) or shutil.which("clang++", path=os.defpath)
+    if not compiler:
+        parser.error("existing Host compiler missing")
+    compiler = Path(shutil.which(compiler) or compiler).resolve()
+    if args.output:
+        output = args.output.resolve()
+        output.mkdir(parents=True, exist_ok=False)
+    else:
+        output = Path(tempfile.mkdtemp(prefix="wos-teardown-result-"))
+    scratch = Path(tempfile.mkdtemp(prefix="scratch-", dir=output))
+    commands, errors, emitted = [], [], []
+    active = {}
+    spawning = False
+    pending_signal = None
+    started = time.monotonic()
+    selected = [Path(__file__).resolve(), Path(__file__).resolve().with_name("managed_huge_retirement_cases.inc"),
+                source_path, overlay / "platform/mm/managed_huge_core.hpp", compiler]
+    before = [pin(p) for p in selected]
+    env = dict(os.environ, TMPDIR=str(scratch), TMP=str(scratch), TEMP=str(scratch),
+               ASAN_OPTIONS="detect_leaks=0:halt_on_error=1", UBSAN_OPTIONS="halt_on_error=1")
+
+    def interrupt(number, _frame):
+        nonlocal pending_signal
+        if spawning:
+            pending_signal = number
+        else:
+            raise KeyboardInterrupt(f"signal {number}")
+
+    previous_handlers = {number: signal.signal(number, interrupt) for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+
+    def absent(group):
+        try:
+            os.killpg(group, 0)
+            return False
+        except ProcessLookupError:
+            return True
+
+    def stop(process):
+        if not absent(process.pid):
+            os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+        if not absent(process.pid):
+            raise RuntimeError("owned compiler group survived cleanup")
+        active.pop(process.pid, None)
+
+    def run(label, argv, success=True):
+        nonlocal spawning, pending_signal
+        remaining = 150 - (time.monotonic() - started)
+        used = sum(p.stat().st_blocks * 512 for p in scratch.rglob("*") if p.is_file())
+        if remaining <= 0 or used > 128 * 1024**2:
+            raise RuntimeError("bounded compiler time/scratch exhausted")
+        log = output / (label + ".log")
+        when = time.monotonic()
+        with log.open("wb") as stream:
+            spawning = True
+            try:
+                process = subprocess.Popen([str(x) for x in argv], cwd=root, env=env,
+                                           stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+                active[process.pid] = process
+            finally:
+                spawning = False
+            if pending_signal is not None:
+                raise KeyboardInterrupt(f"signal {pending_signal}")
+            try:
+                code = process.wait(timeout=min(60, remaining))
+            except BaseException:
+                stop(process)
+                raise
+        group_absent = absent(process.pid)
+        if group_absent:
+            active.pop(process.pid, None)
+        else:
+            stop(process)
+        data = log.read_text(errors="replace")
+        commands.append(dict(label=label, argv=[str(x) for x in argv], exit=code,
+                             seconds=time.monotonic()-when, leader_reaped=True, owned_group_absent=group_absent,
+                             log=pin(log)))
+        if not group_absent or (code == 0) != success:
+            raise RuntimeError(f"{label}: unexpected exit {code}")
+        if not success and ("ERROR: AddressSanitizer" in data or "runtime error:" in data):
+            raise RuntimeError("negative control hit a sanitizer defect instead of the ownership oracle")
+        if success and label == "actual-runtime":
+            print(data, end="")
+
+    try:
+        source = source_path.read_text()
+        common = [compiler, "-std=c++23", "-O1", "-g", "-Wall", "-Wextra", "-Wno-unused-parameter",
+                  "-Wno-unused-function", "-fno-pie", "-no-pie", "-fsanitize=address,undefined",
+                  "-fno-omit-frame-pointer", "-fno-strict-aliasing", "-I", overlay]
+        variants = [("actual", source)]
+        if args.negative_controls:
+            variants += [(name, mutated(source, name)) for name in
+                         ("early-cap", "duplicate-cursor", "missing-handoff", "flush-before-transfer")]
+        for name, actual_source in variants:
+            cpp, binary = scratch / (name + ".cpp"), scratch / name
+            cpp.write_text(generate(actual_source))
+            if name == "actual":
+                dep = scratch / "actual.d"
+                run("actual-dependencies", common + ["-M", "-MF", dep, "-MT", "unit", cpp])
+                import shlex
+                dependencies = [Path(x).resolve() for x in shlex.split(dep.read_text().replace("\\\n", " ").split(":", 1)[1])]
+                emitted = [pin(p) for p in dict.fromkeys(dependencies) if p != cpp]
+            run(name + "-compile", common + [cpp, "-o", binary])
+            run(name + "-runtime", [binary], name == "actual")
+    except BaseException as error:
+        errors.append(type(error).__name__ + ": " + str(error))
+    finally:
+        # Cancellation must finish owned cleanup even if another signal arrives.
+        for number in previous_handlers:
+            signal.signal(number, signal.SIG_IGN)
+        for process in list(active.values()):
+            try:
+                stop(process)
+            except BaseException as error:
+                errors.append("cleanup: " + str(error))
+        after, emitted_after = [], []
+        try:
+            after = [pin(row["path"]) for row in before]
+            emitted_after = [pin(row["path"]) for row in emitted]
+            if before != after or emitted != emitted_after:
+                errors.append("actual source/emitted dependencies changed")
+        except BaseException as error:
+            errors.append("input recheck: " + str(error))
+        removed_bytes = 0
+        preserved_scratch = None
+        try:
+            if active:
+                errors.append("unproven owned group remains; preserve its scratch")
+                preserved_scratch = str(scratch)
+            else:
+                removed_bytes = sum(p.stat().st_blocks * 512 for p in scratch.rglob("*") if p.is_file())
+                shutil.rmtree(scratch)
+        finally:
+            for number, handler in previous_handlers.items():
+                signal.signal(number, handler)
+        result = dict(qualification="PASS_ACTUAL_EXTRACTED_TEARDOWN_ONLY" if not errors else "FAIL_EXTRACTED_TEARDOWN",
+                      errors=errors, seconds=time.monotonic()-started, commands=commands,
+                      selected_before=before, selected_after=after, emitted_inputs=emitted,
+                      emitted_inputs_after=emitted_after, scratch_removed=not scratch.exists(),
+                      scratch_allocated_bytes_removed=removed_bytes, owned_groups_remaining=list(active),
+                      preserved_scratch=preserved_scratch, output_directory=str(output),
+                      limits=["Explicit Host buffers/physical metadata/locks/root gates/ACK endpoints; no actual hardware or SMP ACK.",
+                              "Real registry and actual raw/budget/dispose helpers; no public managed huge admission."])
+        (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+        print(json.dumps({key: result[key] for key in ("qualification", "errors", "seconds", "scratch_removed")}))
+        if not args.output and not active:
+            shutil.rmtree(output)
+    return bool(errors)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

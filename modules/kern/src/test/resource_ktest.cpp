@@ -1,3 +1,6 @@
+#ifdef WOS_SELFTEST
+#include <test/numa_lifecycle_mm_debt.hpp>
+#endif
 #include <abi/resource.hpp>
 #include <cerrno>
 #include <net/wki/remote_compute.hpp>
@@ -505,9 +508,33 @@ KTEST(Resource, AddressSpaceUnionsLazyMetadataAndProtectedLeaves) {
     Task task{};
     task.pagemap = root;
     // Unsorted, adjacent metadata ranges with PTE overlap and a sparse gap.
+#ifdef WOS_SELFTEST
+    ::ker::test::numa_lifecycle::mm_debt::begin_change();
+    bool const LAZY_ROW_ADDED_0 = task.lazy_vmem_ranges.push_back({.start = BASE + 8 * PAGE, .end = BASE + 10 * PAGE});
+    if (LAZY_ROW_ADDED_0) ::ker::test::numa_lifecycle::mm_debt::add_lazy_row(0);
+    ::ker::test::numa_lifecycle::mm_debt::end_change();
+    KREQUIRE_TRUE(LAZY_ROW_ADDED_0);
+#else
     KREQUIRE_TRUE(task.lazy_vmem_ranges.push_back({.start = BASE + 8 * PAGE, .end = BASE + 10 * PAGE}));
+#endif
+#ifdef WOS_SELFTEST
+    ::ker::test::numa_lifecycle::mm_debt::begin_change();
+    bool const LAZY_ROW_ADDED_1 = task.lazy_vmem_ranges.push_back({.start = BASE, .end = BASE + 2 * PAGE});
+    if (LAZY_ROW_ADDED_1) ::ker::test::numa_lifecycle::mm_debt::add_lazy_row(0);
+    ::ker::test::numa_lifecycle::mm_debt::end_change();
+    KREQUIRE_TRUE(LAZY_ROW_ADDED_1);
+#else
     KREQUIRE_TRUE(task.lazy_vmem_ranges.push_back({.start = BASE, .end = BASE + 2 * PAGE}));
+#endif
+#ifdef WOS_SELFTEST
+    ::ker::test::numa_lifecycle::mm_debt::begin_change();
+    bool const LAZY_ROW_ADDED_2 = task.lazy_vmem_ranges.push_back({.start = BASE + 2 * PAGE, .end = BASE + 3 * PAGE});
+    if (LAZY_ROW_ADDED_2) ::ker::test::numa_lifecycle::mm_debt::add_lazy_row(0);
+    ::ker::test::numa_lifecycle::mm_debt::end_change();
+    KREQUIRE_TRUE(LAZY_ROW_ADDED_2);
+#else
     KREQUIRE_TRUE(task.lazy_vmem_ranges.push_back({.start = BASE + 2 * PAGE, .end = BASE + 3 * PAGE}));
+#endif
     virt::reserve_page_range(root, BASE + PAGE, 1);
     virt::reserve_page_range(root, BASE + 5 * PAGE, 1);
     uint64_t bytes = 0;
@@ -527,7 +554,15 @@ KTEST(Resource, AddressSpaceUnionsLazyMetadataAndProtectedLeaves) {
     KEXPECT_TRUE(resource::count_address_space(task, root, 0, LIMIT, bytes));
     KEXPECT_EQ(bytes, 2 * PAGE);
     // A different, staged exec root must ignore the subject's old metadata.
+#ifdef WOS_SELFTEST
+    ::ker::test::numa_lifecycle::mm_debt::begin_change();
+    bool const LAZY_ROW_ADDED_3 = task.lazy_vmem_ranges.push_back({.start = BASE, .end = BASE + 10 * PAGE});
+    if (LAZY_ROW_ADDED_3) ::ker::test::numa_lifecycle::mm_debt::add_lazy_row(0);
+    ::ker::test::numa_lifecycle::mm_debt::end_change();
+    KREQUIRE_TRUE(LAZY_ROW_ADDED_3);
+#else
     KREQUIRE_TRUE(task.lazy_vmem_ranges.push_back({.start = BASE, .end = BASE + 10 * PAGE}));
+#endif
     task.pagemap = nullptr;
     KEXPECT_TRUE(resource::count_address_space(task, root, 0, LIMIT, bytes));
     KEXPECT_EQ(bytes, 2 * PAGE);

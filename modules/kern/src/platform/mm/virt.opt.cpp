@@ -4,6 +4,7 @@
 
 #ifdef WOS_SELFTEST
 #include <platform/mm/lifecycle_census.hpp>
+#include <test/numa_lifecycle_mm_debt.hpp>
 #endif
 
 #include <abi/callnums/vmem.h>
@@ -84,6 +85,10 @@ extern char __kernel_end[];                           // NOLINT(readability-iden
 }
 
 namespace ker::mod::mm::virt {
+#ifdef WOS_SELFTEST
+namespace debt = ::ker::test::numa_lifecycle::mm_debt;
+using DebtField = ::ker::test::numa_lifecycle::CounterField;
+#endif
 
 namespace {
 using log = ker::mod::dbg::logger<"virt">;
@@ -460,6 +465,9 @@ void service_user_pagemap_gate_wait(uint64_t& service_spins) {
             asm volatile("pause" ::: "memory");
         }
 
+#ifdef WOS_SELFTEST
+        debt::begin_change();
+#endif
         uint32_t readers = gate.readers.load(std::memory_order_acquire);
         while (readers != UINT32_MAX) {
             if (gate.readers.compare_exchange_weak(readers, readers + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
@@ -467,14 +475,24 @@ void service_user_pagemap_gate_wait(uint64_t& service_spins) {
             }
         }
         if (readers == UINT32_MAX) {
+#ifdef WOS_SELFTEST
+            debt::end_change();
+#endif
             return false;
         }
 
         if (!gate.teardown.load(std::memory_order_acquire)) {
             gate_index = INDEX;
+#ifdef WOS_SELFTEST
+            debt::add(DebtField::ACCESS_READERS);
+            debt::end_change();
+#endif
             return true;
         }
         gate.readers.fetch_sub(1, std::memory_order_acq_rel);
+#ifdef WOS_SELFTEST
+        debt::end_change();
+#endif
         if (!wait_for_teardown) {
             return false;
         }
@@ -483,16 +501,44 @@ void service_user_pagemap_gate_wait(uint64_t& service_spins) {
 
 void release_user_pagemap_access(size_t gate_index) {
     if (gate_index != USER_PAGEMAP_ACCESS_GATE_NONE) {
+#ifdef WOS_SELFTEST
+        debt::begin_change();
+#endif
         user_pagemap_access_gates.at(gate_index).readers.fetch_sub(1, std::memory_order_acq_rel);
+#ifdef WOS_SELFTEST
+        debt::drop(DebtField::ACCESS_READERS);
+        debt::end_change();
+#endif
     }
 }
+
+#ifdef WOS_SELFTEST
+// Each raw flag mutation is bracketed; do not hold an observer epoch while
+// waiting for a different exclusive owner. A successful bit owns one count
+// while draining readers and until the real flag release has returned.
+auto census_try_exclusive_flag(UserPagemapAccessGate& gate, bool& expected, bool weak) noexcept -> bool {
+    debt::begin_change();
+    bool const ACQUIRED = weak
+                              ? gate.teardown.compare_exchange_weak(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)
+                              : gate.teardown.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire);
+    if (ACQUIRED) debt::add(DebtField::ACCESS_EXCLUSIVES);
+    debt::end_change();
+    return ACQUIRED;
+}
+#endif
 
 [[nodiscard]] auto begin_user_pagemap_exclusive(PageTable* pagemap) -> size_t {
     size_t const INDEX = user_pagemap_access_gate_index(pagemap);
     auto& gate = user_pagemap_access_gates.at(INDEX);
     bool expected = false;
     uint64_t service_spins = 0;
-    while (!gate.teardown.compare_exchange_weak(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+    while (
+#ifdef WOS_SELFTEST
+        !census_try_exclusive_flag(gate, expected, true)
+#else
+        !gate.teardown.compare_exchange_weak(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)
+#endif
+    ) {
         expected = false;
         service_user_pagemap_gate_wait(service_spins);
         asm volatile("pause" ::: "memory");
@@ -508,19 +554,39 @@ void release_user_pagemap_access(size_t gate_index) {
     size_t const INDEX = user_pagemap_access_gate_index(pagemap);
     auto& gate = user_pagemap_access_gates.at(INDEX);
     bool expected = false;
-    if (!gate.teardown.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire))
+    if (
+#ifdef WOS_SELFTEST
+        !census_try_exclusive_flag(gate, expected, false)
+#else
+        !gate.teardown.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)
+#endif
+    )
         return USER_PAGEMAP_ACCESS_GATE_NONE;
     if (gate.readers.load(std::memory_order_acquire) != 0) {
         // Only release the exclusive bit acquired by this exact attempt. The
         // single GC worker must remain free to advance a colliding held walk.
+#ifdef WOS_SELFTEST
+        debt::begin_change();
+#endif
         gate.teardown.store(false, std::memory_order_release);
+#ifdef WOS_SELFTEST
+        debt::drop(DebtField::ACCESS_EXCLUSIVES);
+        debt::end_change();
+#endif
         return USER_PAGEMAP_ACCESS_GATE_NONE;
     }
     return INDEX;
 }
 
 void end_user_pagemap_exclusive(size_t gate_index) {
+#ifdef WOS_SELFTEST
+    debt::begin_change();
+#endif
     user_pagemap_access_gates.at(gate_index).teardown.store(false, std::memory_order_release);
+#ifdef WOS_SELFTEST
+    debt::drop(DebtField::ACCESS_EXCLUSIVES);
+    debt::end_change();
+#endif
 }
 
 class UserPagemapExclusiveScope {
@@ -987,6 +1053,7 @@ struct LazyFileFaultWork {
     bool issued{};
     uint64_t root_incarnation{};                         // Public demand work never owns/dereferences an old root.
     file_mapping::FileMappingBinding* demand_binding{};  // One exact SNAPSHOT, no root lease.
+    numa::AllocationContext placement{};                 // Copied initiating actor value for this generation only.
 };
 constexpr size_t LAZY_FILE_FAULT_CAPACITY = 64;
 std::array<LazyFileFaultWork, LAZY_FILE_FAULT_CAPACITY> lazy_file_fault_work;
@@ -1029,6 +1096,13 @@ auto probe_lazy_file_fault(sched::task::Task* task, uint64_t vaddr, const paging
     if (!user_frame || task->type != sched::task::TaskType::PROCESS || task->preempt_disable_depth != 0 ||
         (sched::task::lazy_vmem_has_lifetime(snapshot) ? snapshot.lifetime == nullptr : snapshot.file == nullptr) || snapshot.prot == 0 ||
         (fault.writable != 0U && (snapshot.prot & 2U) == 0) || (fault.fetch != 0U && (snapshot.prot & 4U) == 0))
+        return LazyFileFaultDisposition::FAILED;
+    // Capture outside range/pool/MM locks and before this operation acquires
+    // root readers. Canonical shared loans never consume this placement value.
+    DemandContextStorage demand_storage;
+    auto& demand = demand_storage.get();
+    if (!sched::task::lazy_vmem_is_tmpfs_shared(snapshot) &&
+        !capture_demand_context(task, PAGE_VADDR, DemandOrigin::HardwareFault, user_frame, demand))
         return LazyFileFaultDisposition::FAILED;
     if (!task->try_acquire()) return LazyFileFaultDisposition::FAILED;
     PageTable* pagemap = nullptr;
@@ -1132,8 +1206,8 @@ auto probe_lazy_file_fault(sched::task::Task* task, uint64_t vaddr, const paging
             pagemap = nullptr;
         }
         lazy_file_fault_work[index] = {
-            task, pagemap, snapshot,         fault,         PAGE_VADDR, generation, lazy_file_fault_next_sequence++,
-            gate, false,   root_incarnation, demand_binding};
+            task, pagemap, snapshot,         fault,          PAGE_VADDR,       generation, lazy_file_fault_next_sequence++,
+            gate, false,   root_incarnation, demand_binding, demand.allocation};
         task->lazy_file_fault_vaddr = PAGE_VADDR;
         task->lazy_file_fault_status = 0;
         task->lazy_file_fault_generation = generation;
@@ -1207,11 +1281,11 @@ void lazy_file_fault_worker_loop() {
             bool const DEMAND = sched::task::lazy_vmem_is_tmpfs_shared(work.range);
             bool const LIVE = work.task->state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE &&
                               (DEMAND || work.task->pagemap == work.pagemap);
-            bool const OK =
-                LIVE && (DEMAND ? work.demand_binding != nullptr &&
-                                      prepare_captured_tmpfs_read_shared_page(*work.task, work.range, work.vaddr, work.root_incarnation,
-                                                                              *work.demand_binding)
-                                : ker::syscall::vmem::materialize_lazy_file_page(work.task, work.range, work.vaddr, work.fault));
+            bool const OK = LIVE && (DEMAND ? work.demand_binding != nullptr &&
+                                                  prepare_captured_tmpfs_read_shared_page(*work.task, work.range, work.vaddr,
+                                                                                          work.root_incarnation, *work.demand_binding)
+                                            : ker::syscall::vmem::materialize_lazy_file_page(work.task, work.range, work.vaddr, work.fault,
+                                                                                             work.placement));
             finish_lazy_file_fault(work, index, OK ? 0 : -EFAULT);
             continue;
         }
@@ -1330,7 +1404,7 @@ auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const pagin
                 kasan::unpoison_range(&file_range, sizeof(file_range));
             }
 #endif
-            bool const OK = ker::syscall::vmem::materialize_lazy_file_page(task, file_range, PAGE_VADDR, fault);
+            bool const OK = ker::syscall::vmem::materialize_lazy_file_page(task, file_range, PAGE_VADDR, fault, demand.allocation);
             if (file_range.kind == sched::task::LazyVmemKind::NATIVE_FILE_BACKED) {
                 file_range.lifetime->release(file_mapping::FamilyOwner::SNAPSHOT);
             } else if (file_range.file != nullptr) {
@@ -1491,17 +1565,52 @@ auto find_anonymous_swap_mapping_locked(PageTable* pagemap, vaddr_t vaddr) -> An
     return nullptr;
 }
 
+#ifdef WOS_SELFTEST
+template <typename T>
+auto allocate_swap_descriptor(DebtField field) -> T* {
+    debt::begin_change();
+    auto* descriptor = new T{};
+    if (descriptor != nullptr) debt::add(field);
+    debt::end_change();
+    return descriptor;
+}
+template <typename T>
+void delete_swap_descriptor(T* descriptor, DebtField field, bool retired_mapping = false) {
+    if (descriptor == nullptr) return;
+    debt::begin_change();
+    debt::add(DebtField::SWAP_RETURNS);
+    delete descriptor;
+    debt::drop(field);
+    if (retired_mapping) debt::drop(DebtField::SWAP_RETURNS);
+    debt::drop(DebtField::SWAP_RETURNS);
+    debt::end_change();
+}
+#endif
+
 void insert_anonymous_swap_mapping_locked(AnonymousSwapMapping* mapping) {
+#ifdef WOS_SELFTEST
+    debt::begin_change();
+#endif
     mapping->next = anonymous_swap_mappings;
     anonymous_swap_mappings = mapping;
+#ifdef WOS_SELFTEST
+    debt::end_change();
+#endif
 }
 
 void remove_anonymous_swap_mapping_locked(AnonymousSwapMapping* mapping) {
     AnonymousSwapMapping** link = &anonymous_swap_mappings;
     while (*link != nullptr) {
         if (*link == mapping) {
+#ifdef WOS_SELFTEST
+            debt::begin_change();
+            debt::add(DebtField::SWAP_RETURNS);
+#endif
             *link = mapping->next;
             mapping->next = nullptr;
+#ifdef WOS_SELFTEST
+            debt::end_change();
+#endif
             return;
         }
         link = &(*link)->next;
@@ -1519,6 +1628,9 @@ auto anonymous_pagein_enqueue(AnonymousSwapMapping* mapping) -> bool {
         anonymous_pagein_queue_lock.unlock_irqrestore(FLAGS);
         return false;
     }
+#ifdef WOS_SELFTEST
+    debt::add(DebtField::SWAP_QUEUED);
+#endif
     anonymous_pagein_queue.at(anonymous_pagein_queue_tail) = mapping;
     anonymous_pagein_queue_tail = (anonymous_pagein_queue_tail + 1) % anonymous_pagein_queue.size();
     ++anonymous_pagein_queue_count;
@@ -1536,6 +1648,9 @@ auto anonymous_pagein_dequeue() -> AnonymousSwapMapping* {
     anonymous_pagein_queue.at(anonymous_pagein_queue_head) = nullptr;
     anonymous_pagein_queue_head = (anonymous_pagein_queue_head + 1) % anonymous_pagein_queue.size();
     --anonymous_pagein_queue_count;
+#ifdef WOS_SELFTEST
+    debt::drop(DebtField::SWAP_QUEUED);
+#endif
     anonymous_pagein_queue_lock.unlock_irqrestore(FLAGS);
     return mapping;
 }
@@ -1544,8 +1659,18 @@ void release_anonymous_swap_object(AnonymousSwapObject* object) {
     if (object == nullptr) {
         return;
     }
+#ifdef WOS_SELFTEST
+    debt::add(DebtField::SWAP_RETURNS);
+#endif
     static_cast<void>(swap::free_slot(object->slot));
+#ifdef WOS_SELFTEST
+    delete_swap_descriptor(object, DebtField::SWAP_OBJECTS);
+#else
     delete object;
+#endif
+#ifdef WOS_SELFTEST
+    debt::drop(DebtField::SWAP_RETURNS);
+#endif
 }
 
 auto detach_anonymous_swap_object_locked(AnonymousSwapMapping* mapping) -> AnonymousSwapObject* {
@@ -1579,6 +1704,9 @@ void wake_anonymous_swap_waiters(sched::task::Task* waiters) {
         task->anonymous_swap_wait_next = nullptr;
         sched::wake_task_from_event(task);
         task->release();
+#ifdef WOS_SELFTEST
+        debt::drop(DebtField::SWAP_WAITERS);
+#endif
     }
 }
 
@@ -1613,12 +1741,18 @@ auto probe_anonymous_swap_fault_locked(sched::task::Task* task, vaddr_t vaddr, c
             return AnonymousSwapFaultDisposition::FAILED;
         }
         mapping->generation = next_anonymous_swap_generation();
+#ifdef WOS_SELFTEST
+        debt::add(DebtField::SWAP_PAGEINS);
+#endif
         mapping->pagein_queued = true;
         mapping->pagein_access_gate = access_gate;
         if (!anonymous_pagein_enqueue(mapping)) {
             mapping->pagein_queued = false;
             mapping->pagein_access_gate = USER_PAGEMAP_ACCESS_GATE_NONE;
             release_user_pagemap_access(access_gate);
+#ifdef WOS_SELFTEST
+            debt::drop(DebtField::SWAP_PAGEINS);
+#endif
             mapping->error = -EAGAIN;
             return AnonymousSwapFaultDisposition::FAILED;
         }
@@ -1629,15 +1763,27 @@ auto probe_anonymous_swap_fault_locked(sched::task::Task* task, vaddr_t vaddr, c
         }
     }
 
+#ifdef WOS_SELFTEST
+    debt::begin_change();
+#endif
     if (task->anonymous_swap_wait_mapping != nullptr || !task->try_acquire()) {
+#ifdef WOS_SELFTEST
+        debt::end_change();
+#endif
         return AnonymousSwapFaultDisposition::FAILED;
     }
     wait_generation = mapping->generation;
+#ifdef WOS_SELFTEST
+    debt::add(DebtField::SWAP_WAITERS);
+#endif
     task->anonymous_swap_wait_mapping = mapping;
     task->anonymous_swap_wait_generation = wait_generation;
     task->anonymous_swap_completion_generation.store(0, std::memory_order_relaxed);
     task->anonymous_swap_wait_next = mapping->waiters;
     mapping->waiters = task;
+#ifdef WOS_SELFTEST
+    debt::end_change();
+#endif
     return AnonymousSwapFaultDisposition::PARK;
 }
 
@@ -1711,6 +1857,9 @@ void begin_anonymous_pagein(AnonymousSwapMapping* mapping, AnonymousPageinOperat
 }
 
 void finish_anonymous_pagein(AnonymousPageinOperation& operation) {
+#ifdef WOS_SELFTEST
+    debt::add(DebtField::SWAP_RETURNS);
+#endif
     auto* mapping = operation.mapping;
     void* page = operation.page;
     uint64_t const STARTED_US = operation.started_us;
@@ -1805,8 +1954,16 @@ void finish_anonymous_pagein(AnonymousPageinOperation& operation) {
     anonymous_swap_add(anonymous_swap_stats.pagein_latency_us, ELAPSED);
     anonymous_swap_update_max(anonymous_swap_stats.pagein_latency_max_us, ELAPSED);
     if (delete_mapping_after) {
+#ifdef WOS_SELFTEST
+        delete_swap_descriptor(mapping, DebtField::SWAP_MAPPINGS, true);
+#else
         delete mapping;
+#endif
     }
+#ifdef WOS_SELFTEST
+    debt::drop(DebtField::SWAP_PAGEINS);
+    debt::drop(DebtField::SWAP_RETURNS);
+#endif
 }
 
 // Migration and BSP selftests retain the one-page bridge; only the dedicated
@@ -1927,6 +2084,9 @@ auto snapshot_anonymous_candidate(sched::task::Task* task, uint64_t cursor, Anon
             void* const FRAME = reinterpret_cast<void*>(addr::get_virt_pointer(PHYS));
             phys::PageLookupHint lookup{};
             if (phys::page_ref_get(FRAME, &lookup) == 1) {
+#ifdef WOS_SELFTEST
+                debt::add(DebtField::SWAP_PAGEOUTS);
+#endif
                 phys::page_ref_inc(FRAME, &lookup);
                 out = {
                     .pagemap = PAGEMAP, .vaddr = VADDR, .frame = FRAME, .raw = pte_raw(*entry), .prot = prot, .access_gate = access_gate};
@@ -1951,24 +2111,59 @@ auto snapshot_anonymous_candidate(sched::task::Task* task, uint64_t cursor, Anon
 }
 
 auto pageout_anonymous_candidate(AnonymousPageoutCandidate& candidate) -> bool {
+#ifdef WOS_SELFTEST
+    debt::add(DebtField::SWAP_RETURNS);
+#endif
     anonymous_swap_add(anonymous_swap_stats.pageout_attempts);
+#ifdef WOS_SELFTEST
+    auto* object = allocate_swap_descriptor<AnonymousSwapObject>(DebtField::SWAP_OBJECTS);
+#else
     auto* object = new AnonymousSwapObject{};
+#endif
+#ifdef WOS_SELFTEST
+    auto* mapping = allocate_swap_descriptor<AnonymousSwapMapping>(DebtField::SWAP_MAPPINGS);
+#else
     auto* mapping = new AnonymousSwapMapping{};
+#endif
     if (object == nullptr || mapping == nullptr) {
+#ifdef WOS_SELFTEST
+        delete_swap_descriptor(object, DebtField::SWAP_OBJECTS);
+#else
         delete object;
+#endif
+#ifdef WOS_SELFTEST
+        delete_swap_descriptor(mapping, DebtField::SWAP_MAPPINGS);
+#else
         delete mapping;
+#endif
         phys::page_ref_dec(candidate.frame);
         release_user_pagemap_access(candidate.access_gate);
         anonymous_swap_add(anonymous_swap_stats.pageout_failures);
+#ifdef WOS_SELFTEST
+        debt::drop(DebtField::SWAP_PAGEOUTS);
+        debt::drop(DebtField::SWAP_RETURNS);
+#endif
         return false;
     }
     int result = swap::allocate_slot(&object->slot);
     if (result < 0) {
+#ifdef WOS_SELFTEST
+        delete_swap_descriptor(object, DebtField::SWAP_OBJECTS);
+#else
         delete object;
+#endif
+#ifdef WOS_SELFTEST
+        delete_swap_descriptor(mapping, DebtField::SWAP_MAPPINGS);
+#else
         delete mapping;
+#endif
         phys::page_ref_dec(candidate.frame);
         release_user_pagemap_access(candidate.access_gate);
         anonymous_swap_add(anonymous_swap_stats.pageout_failures);
+#ifdef WOS_SELFTEST
+        debt::drop(DebtField::SWAP_PAGEOUTS);
+        debt::drop(DebtField::SWAP_RETURNS);
+#endif
         return false;
     }
     object->mapping_refs = 1;
@@ -2007,10 +2202,18 @@ auto pageout_anonymous_candidate(AnonymousPageoutCandidate& candidate) -> bool {
     }
     if (!published) {
         release_anonymous_swap_object(object);
+#ifdef WOS_SELFTEST
+        delete_swap_descriptor(mapping, DebtField::SWAP_MAPPINGS);
+#else
         delete mapping;
+#endif
         phys::page_ref_dec(candidate.frame);
         release_user_pagemap_access(candidate.access_gate);
         anonymous_swap_add(anonymous_swap_stats.pageout_failures);
+#ifdef WOS_SELFTEST
+        debt::drop(DebtField::SWAP_PAGEOUTS);
+        debt::drop(DebtField::SWAP_RETURNS);
+#endif
         return false;
     }
 
@@ -2064,13 +2267,21 @@ auto pageout_anonymous_candidate(AnonymousPageoutCandidate& candidate) -> bool {
         }
         phys::page_ref_dec(candidate.frame);
         release_anonymous_swap_object(object_to_release);
+#ifdef WOS_SELFTEST
+        delete_swap_descriptor(mapping, DebtField::SWAP_MAPPINGS, true);
+#else
         delete mapping;
+#endif
     }
     release_user_pagemap_access(candidate.access_gate);
     uint64_t const FINISHED_US = time::get_us();
     uint64_t const ELAPSED = FINISHED_US >= STARTED_US ? FINISHED_US - STARTED_US : 0;
     anonymous_swap_add(anonymous_swap_stats.pageout_latency_us, ELAPSED);
     anonymous_swap_update_max(anonymous_swap_stats.pageout_latency_max_us, ELAPSED);
+#ifdef WOS_SELFTEST
+    debt::drop(DebtField::SWAP_PAGEOUTS);
+    debt::drop(DebtField::SWAP_RETURNS);
+#endif
     return committed;
 }
 
@@ -2147,6 +2358,9 @@ auto migrate_anonymous_swap_area(void* /*context*/, uint32_t area_id) -> int {
                     break;
                 }
                 mapping->generation = next_anonymous_swap_generation();
+#ifdef WOS_SELFTEST
+                debt::add(DebtField::SWAP_PAGEINS);
+#endif
                 mapping->pagein_queued = true;
                 mapping->pagein_access_gate = access_gate;
                 anonymous_swap_add(anonymous_swap_stats.pagein_attempts);
@@ -2183,7 +2397,11 @@ auto clone_anonymous_swap_mappings(PageTable* src, PageTable* dst) -> bool {
     uint64_t last_vaddr = 0;
     bool have_last = false;
     for (;;) {
+#ifdef WOS_SELFTEST
+        auto* child = allocate_swap_descriptor<AnonymousSwapMapping>(DebtField::SWAP_MAPPINGS);
+#else
         auto* child = new AnonymousSwapMapping{};
+#endif
         if (child == nullptr) {
             return false;
         }
@@ -2240,7 +2458,11 @@ auto clone_anonymous_swap_mappings(PageTable* src, PageTable* dst) -> bool {
         }
 
         if (!found) {
+#ifdef WOS_SELFTEST
+            delete_swap_descriptor(child, DebtField::SWAP_MAPPINGS);
+#else
             delete child;
+#endif
             return true;
         }
     }
@@ -2273,7 +2495,11 @@ void purge_anonymous_swap_mappings(PageTable* pagemap) {
             return;
         }
         release_anonymous_swap_object(object);
+#ifdef WOS_SELFTEST
+        delete_swap_descriptor(victim, DebtField::SWAP_MAPPINGS, true);
+#else
         delete victim;
+#endif
     }
 }
 
@@ -4523,12 +4749,6 @@ void note_destroy_page_table_refdec_batch_stats(DestroyUserSpaceCallStats* stats
     stats->page_table_pages_freed += batch_stats.pages_freed;
 }
 
-void note_destroy_huge_skip(DestroyUserSpaceCallStats* stats) {
-    if (stats != nullptr) {
-        stats->skipped_huge_pages++;
-    }
-}
-
 void note_destroy_page_table_alias_skip(DestroyUserSpaceCallStats* stats) {
     if (stats != nullptr) {
         stats->skipped_page_table_aliases++;
@@ -4898,6 +5118,9 @@ auto try_pin_current_user_page_mapping(PageTable* pagemap, vaddr_t vaddr, bool r
     file_mapping::FileMappingBinding* binding = nullptr;
     uint64_t root_incarnation = 0;
 
+#ifdef WOS_SELFTEST
+    debt::begin_change();
+#endif
     uint64_t const LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
     auto* control = find_user_root_control_locked(pagemap);
     if (control != nullptr) root_incarnation = control->serial;
@@ -4917,6 +5140,9 @@ auto try_pin_current_user_page_mapping(PageTable* pagemap, vaddr_t vaddr, bool r
         if (ref_acquired) {
             phys::page_ref_dec(hhdm_page, &lookup_hint);
         }
+#ifdef WOS_SELFTEST
+        debt::end_change();
+#endif
         return false;
     }
 
@@ -4932,6 +5158,10 @@ auto try_pin_current_user_page_mapping(PageTable* pagemap, vaddr_t vaddr, bool r
         .file_binding = binding,
         .root_incarnation = root_incarnation,
     };
+#ifdef WOS_SELFTEST
+    debt::add(DebtField::USER_PAGE_PINS);
+    debt::end_change();
+#endif
     return true;
 }
 
@@ -5075,12 +5305,21 @@ void unpin_user_page(UserPagePin& pin) {
     phys::PageLookupHint lookup_hint = pin.lookup_hint;
     size_t const ACCESS_GATE_INDEX = pin.access_gate_index;
     auto* binding = pin.file_binding;
+#ifdef WOS_SELFTEST
+    if (PAGE != nullptr) debt::add(DebtField::PIN_RETURNS);
+#endif
     pin = {};
     if (PAGE != nullptr) {
         phys::page_ref_dec(PAGE, &lookup_hint);
     }
     release_user_pagemap_access(ACCESS_GATE_INDEX);
     if (binding != nullptr) binding->release(file_mapping::BindingOwner::PIN);
+#ifdef WOS_SELFTEST
+    if (PAGE != nullptr) {
+        debt::drop(DebtField::USER_PAGE_PINS);
+        debt::drop(DebtField::PIN_RETURNS);
+    }
+#endif
 }
 
 #ifdef WOS_SELFTEST
@@ -6717,6 +6956,7 @@ bool selftest_anonymous_swap_pageout(PageTable* pagemap, vaddr_t vaddr) {
         uint64_t const PHYS = static_cast<uint64_t>(entry->frame) << paging::PAGE_SHIFT;
         candidate.frame = reinterpret_cast<void*>(addr::get_virt_pointer(PHYS));
         candidate.raw = pte_raw(*entry);
+        debt::add(DebtField::SWAP_PAGEOUTS);
         phys::page_ref_inc(candidate.frame);
     }
     user_mapping_pin_lock.unlock_irqrestore(PIN_FLAGS);
@@ -6737,6 +6977,9 @@ bool selftest_anonymous_swap_pagein(PageTable* pagemap, vaddr_t vaddr) {
     if (mapping != nullptr && mapping->state == AnonymousSwapRuntimeState::SWAPPED && !mapping->pagein_queued &&
         acquire_user_pagemap_access(pagemap, false, access_gate)) {
         mapping->generation = next_anonymous_swap_generation();
+#ifdef WOS_SELFTEST
+        debt::add(DebtField::SWAP_PAGEINS);
+#endif
         mapping->pagein_queued = true;
         mapping->pagein_access_gate = access_gate;
         anonymous_swap_add(anonymous_swap_stats.pagein_attempts);
@@ -7776,7 +8019,11 @@ void unmap_page(PageTable* page_table, vaddr_t vaddr) {
         user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
         cow_pte_lock.unlock_irqrestore(COW_LOCK_FLAGS);
         release_anonymous_swap_object(object_to_release);
+#ifdef WOS_SELFTEST
+        delete_swap_descriptor(mapping_to_delete, DebtField::SWAP_MAPPINGS, true);
+#else
         delete mapping_to_delete;
+#endif
         return;
     }
 
@@ -7785,7 +8032,11 @@ void unmap_page(PageTable* page_table, vaddr_t vaddr) {
         user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
         cow_pte_lock.unlock_irqrestore(COW_LOCK_FLAGS);
         release_anonymous_swap_object(object_to_release);
+#ifdef WOS_SELFTEST
+        delete_swap_descriptor(mapping_to_delete, DebtField::SWAP_MAPPINGS, true);
+#else
         delete mapping_to_delete;
+#endif
         return;
     }
     owned_frame_untrack_leaf(page_table, vaddr, OLD_ENTRY);
@@ -7795,7 +8046,11 @@ void unmap_page(PageTable* page_table, vaddr_t vaddr) {
     flush_pagemap_after_update(page_table, vaddr, false);
     drop_present_leaf_ref(OLD_ENTRY);
     release_anonymous_swap_object(object_to_release);
+#ifdef WOS_SELFTEST
+    delete_swap_descriptor(mapping_to_delete, DebtField::SWAP_MAPPINGS, true);
+#else
     delete mapping_to_delete;
+#endif
 }
 
 auto protect_anonymous_swap_page(PageTable* page_table, vaddr_t vaddr, uint64_t flags) -> bool {
@@ -8472,6 +8727,14 @@ struct PageTableFrameSet {
 
 constexpr size_t DESTROY_REFDEC_BATCH_CAP = 64;
 
+// A detached tail owns mapping references not yet handed to a refdec batch.
+// No destructor, allocation, cleanup table or Task pointer is hidden here.
+struct DestroyManagedCursor {
+    huge::MappedLeaf leaf{};
+    uint16_t next{};
+    bool active{};
+};
+
 struct DestroyUserSpaceBudgetState {
     struct RefdecBatch {
         std::array<void*, DESTROY_REFDEC_BATCH_CAP> pages{};
@@ -8490,6 +8753,7 @@ struct DestroyUserSpaceBudgetState {
     std::array<DestroyWalkFrame, 4> stack{};
     RefdecBatch refdec_batch{};
     RefdecBatch page_table_refdec_batch{};
+    DestroyManagedCursor managed_cursor{};
     size_t stack_size = 0;
     size_t access_gate_index = USER_PAGEMAP_ACCESS_GATE_NONE;
     file_mapping::FileMappingTlbRetirement file_retirement{};
@@ -8531,11 +8795,119 @@ void destroy_refdec_batch_flush(DestroyRefdecBatch& batch, DestroyUserSpaceCallS
     batch.count = 0;
 }
 
+// BEGIN managed teardown cursor helpers. The actual original-root exclusive
+// gate owns lifetime; copied keys below are only exact registry comparisons.
+class DestroyManagedCursorStorage {
+   public:
+    DestroyManagedCursorStorage() {
+#ifdef WOS_KASAN
+        if (kasan::is_enabled()) kasan::unpoison_range(bytes_, sizeof(bytes_));
+#endif
+        cursor_ = ::new (static_cast<void*>(bytes_)) DestroyManagedCursor{};
+    }
+    auto get() -> DestroyManagedCursor& { return *cursor_; }
+
+   private:
+    alignas(DestroyManagedCursor) uint8_t bytes_[sizeof(DestroyManagedCursor)];
+    DestroyManagedCursor* cursor_;
+};
+
+// No callback or flush is allowed in this scalar append. Its storage and bounds
+// are established before acquiring pin; ordinary callers retain both flushes.
+[[gnu::always_inline]] void destroy_refdec_batch_append(void** pages, size_t& count, void* page) noexcept { pages[count++] = page; }
+
+// Called only while the original root's exclusive owner is retained. Scratch
+// construction/addressability precedes COW/pin, even in excluded raw teardown.
+auto destroy_managed_leaf(PageTable* root, int level, uint64_t va, DestroyManagedCursor& output, bool detach) -> bool {
+    if (level != 2 || output.active || !huge::RegistryCore::valid_va(va)) return false;
+    DestroyManagedCursorStorage scratch;
+    auto& candidate = scratch.get();
+    uint64_t const cow = cow_pte_lock.lock_irqsave();
+    uint64_t const pin = user_mapping_pin_lock.lock_irqsave();
+    auto const* control = find_user_root_control_locked(root);
+    huge::RootKey const key{reinterpret_cast<uint64_t>(root), control != nullptr ? control->serial : 0};
+    MutableUserEntrySlot slot;
+    bool valid = managed_root_matches_locked(key) && managed_pml2_slot_locked(root, va, slot) == Pml2Walk::Slot;
+    uint64_t observed = valid ? slot.load() : 0;
+    valid = valid && managed_huge_registry.lookup_mapped(key, va, observed, candidate.leaf) == huge::Error::None;
+    if (valid && detach) {
+        constexpr uint64_t AD = (uint64_t{1} << 5) | (uint64_t{1} << 6);
+        for (;;) {
+            if ((observed & ~AD) != candidate.leaf.semantic_word) {
+                valid = false;
+                break;
+            }
+            // Unlike representation replacement, an absent PDE retains no A/D.
+            if (slot.exchange(observed, 0)) break;
+        }
+        if (valid) {
+            if (managed_huge_registry.detach_mapped(candidate.leaf.handle, candidate.leaf.key) != huge::Error::None) __builtin_trap();
+            candidate.active = true;
+            output = candidate;
+        }
+    }
+    user_mapping_pin_lock.unlock_irqrestore(pin);
+    cow_pte_lock.unlock_irqrestore(cow);
+    return valid;
+}
+
+void destroy_validate_managed_leaf(PageTable* root, int level, uint64_t va) {
+    DestroyManagedCursorStorage scratch;
+    if (!destroy_managed_leaf(root, level, va, scratch.get(), false)) dbg::panic_handler("teardown refused unknown or stale PS ownership");
+}
+
+// Completion follows the actual batch holding the final transferred reference.
+// The root gate still protects the original control, even on partial disposal.
+void destroy_managed_handoff(DestroyManagedCursor& cursor, DestroyRefdecBatch& batch, DestroyUserSpaceCallStats* stats) {
+    if (!cursor.active || cursor.next >= huge::LEAF_PAGES || cursor.leaf.key.root.address_bits != reinterpret_cast<uint64_t>(batch.root))
+        dbg::panic_handler("teardown lost detached managed cursor");
+    if (batch.count >= batch.pages.size()) destroy_refdec_batch_flush(batch, stats, DestroyRefdecBatchKind::DATA);
+    void** const pages = batch.pages.data();
+    auto* const page = reinterpret_cast<void*>(cursor.leaf.key.pa_2m + cursor.next * paging::PAGE_SIZE + addr::get_hhdm_offset());
+    uint64_t const pin = user_mapping_pin_lock.lock_irqsave();
+    bool const root_valid = managed_root_matches_locked(cursor.leaf.key.root);
+    if (root_valid) {
+        // Acquire pin BEFORE append: no wait/callback exists between append and
+        // the exact row/cursor handoff, including the 64th reference.
+        destroy_refdec_batch_append(pages, batch.count, page);
+        if (managed_huge_registry.advance_retired_handoff(cursor.leaf.handle, cursor.next, 1) != huge::Error::None) __builtin_trap();
+        ++cursor.next;
+    }
+    user_mapping_pin_lock.unlock_irqrestore(pin);
+    if (!root_valid) dbg::panic_handler("teardown managed root incarnation changed");
+    if (stats != nullptr) ++stats->data_leaf_entries_visited;
+    if (batch.count >= batch.pages.size()) destroy_refdec_batch_flush(batch, stats, DestroyRefdecBatchKind::DATA);
+    if (cursor.next == huge::LEAF_PAGES) {
+        destroy_refdec_batch_flush(batch, stats, DestroyRefdecBatchKind::DATA);
+        uint64_t const finish_pin = user_mapping_pin_lock.lock_irqsave();
+        if (!managed_root_matches_locked(cursor.leaf.key.root) ||
+            managed_huge_registry.complete_retired_after_ack(cursor.leaf.handle) != huge::Error::None)
+            __builtin_trap();
+        cursor.active = false;
+        user_mapping_pin_lock.unlock_irqrestore(finish_pin);
+    }
+}
+
+void destroy_managed_drain(DestroyManagedCursor& cursor, DestroyRefdecBatch& batch, DestroyUserSpaceCallStats* stats) {
+    while (cursor.active) destroy_managed_handoff(cursor, batch, stats);
+}
+
+void destroy_require_no_managed_owners(PageTable* root, bool retired_only) {
+    uint64_t const pin = user_mapping_pin_lock.lock_irqsave();
+    auto const* control = find_user_root_control_locked(root);
+    huge::RootKey const key{reinterpret_cast<uint64_t>(root), control != nullptr ? control->serial : 0};
+    bool const pending = control != nullptr && (retired_only ? managed_huge_registry.root_has_retired_owners(key)
+                                                             : managed_huge_registry.root_has_published_owners(key));
+    user_mapping_pin_lock.unlock_irqrestore(pin);
+    if (pending) dbg::panic_handler("teardown left managed registry ownership");
+}
+// END managed teardown cursor helpers.
+
 void destroy_refdec_batch_queue(DestroyRefdecBatch& batch, void* page, DestroyUserSpaceCallStats* stats, DestroyRefdecBatchKind kind) {
     if (batch.count >= batch.pages.size()) {
         destroy_refdec_batch_flush(batch, stats, kind);
     }
-    batch.pages[batch.count++] = page;
+    destroy_refdec_batch_append(batch.pages.data(), batch.count, page);
     if (batch.count >= batch.pages.size()) {
         destroy_refdec_batch_flush(batch, stats, kind);
     }
@@ -8598,7 +8970,7 @@ void destroy_state_queue_page_table_refdec(DestroyUserSpaceBudgetState& state, v
 
 void collect_page_table_frames(PageTable* table, int level, PageTableFrameSet& frames, DestroyUserSpaceCallStats* stats,
                                FrameProbeCache* frame_probe_cache = nullptr, PageTable* root = nullptr, uint64_t owner_pid = 0,
-                               const char* reason = nullptr) {
+                               const char* reason = nullptr, uint64_t vaddr_base = 0) {
     if (table == nullptr || level < 1) {
         return;
     }
@@ -8617,11 +8989,12 @@ void collect_page_table_frames(PageTable* table, int level, PageTableFrameSet& f
         }
 
         uint64_t const PHYS_ADDR = static_cast<uint64_t>(entry.frame) << paging::PAGE_SHIFT;
-        if (PHYS_ADDR == 0 || level <= 1) {
+        if (level > 1 && entry.pagesize != 0) {
+            uint64_t const va = vaddr_base | (static_cast<uint64_t>(i) << (12 + 9 * (level - 1)));
+            destroy_validate_managed_leaf(root != nullptr ? root : table, level, va);
             continue;
         }
-        if (entry.pagesize != 0) {
-            note_destroy_huge_skip(stats);
+        if (PHYS_ADDR == 0 || level <= 1) {
             continue;
         }
         PageKind const KIND = frame_page_kind(PHYS_ADDR, frame_probe_cache);
@@ -8639,7 +9012,7 @@ void collect_page_table_frames(PageTable* table, int level, PageTableFrameSet& f
         auto* next_level = reinterpret_cast<PageTable*>(phys_to_hhdm_checked(PHYS_ADDR, frame_probe_cache));
         if (next_level != nullptr) {
             collect_page_table_frames(next_level, level - 1, frames, stats, frame_probe_cache, root != nullptr ? root : table, owner_pid,
-                                      reason);
+                                      reason, vaddr_base | (static_cast<uint64_t>(i) << (12 + 9 * (level - 1))));
         }
     }
 }
@@ -8663,11 +9036,12 @@ auto advance_collect_frames_budgeted(DestroyUserSpaceBudgetState& state, Destroy
         }
 
         uint64_t const PHYS_ADDR = static_cast<uint64_t>(entry.frame) << paging::PAGE_SHIFT;
-        if (PHYS_ADDR == 0 || frame.level <= 1) {
+        uint64_t const va = frame.vaddr_base | (static_cast<uint64_t>(INDEX) << (12 + 9 * (frame.level - 1)));
+        if (frame.level > 1 && entry.pagesize != 0) {
+            destroy_validate_managed_leaf(state.pagemap, frame.level, va);
             return true;
         }
-        if (entry.pagesize != 0) {
-            note_destroy_huge_skip(&stats);
+        if (PHYS_ADDR == 0 || frame.level <= 1) {
             return true;
         }
         PageKind const KIND = frame_page_kind(PHYS_ADDR, &state.frame_probe_cache);
@@ -8686,7 +9060,7 @@ auto advance_collect_frames_budgeted(DestroyUserSpaceBudgetState& state, Destroy
             dbg::panic_handler("native root table census exceeded inline capacity before mutation");
         auto* next_level = reinterpret_cast<PageTable*>(phys_to_hhdm_checked(PHYS_ADDR, &state.frame_probe_cache));
         if (next_level != nullptr) {
-            (void)destroy_state_push(state, next_level, frame.level - 1, 0, PHYS_ADDR);
+            (void)destroy_state_push(state, next_level, frame.level - 1, va, PHYS_ADDR);
         }
         return true;
     }
@@ -8698,6 +9072,10 @@ auto advance_collect_frames_budgeted(DestroyUserSpaceBudgetState& state, Destroy
 }
 
 auto advance_free_data_budgeted(DestroyUserSpaceBudgetState& state, DestroyUserSpaceCallStats& stats) -> bool {
+    if (state.managed_cursor.active) {
+        destroy_managed_handoff(state.managed_cursor, state.refdec_batch, &stats);
+        return true;
+    }
     while (state.stack_size > 0) {
         auto& frame = destroy_state_top(state);
 #ifdef WOS_SELFTEST
@@ -8716,19 +9094,18 @@ auto advance_free_data_budgeted(DestroyUserSpaceBudgetState& state, DestroyUserS
         }
 
         uint64_t const PHYS_ADDR = static_cast<uint64_t>(entry.frame) << paging::PAGE_SHIFT;
+        int const LEVEL_SHIFT = 12 + (9 * (frame.level - 1));
+        uint64_t const ENTRY_VADDR = frame.vaddr_base | (static_cast<uint64_t>(INDEX) << LEVEL_SHIFT);
+        if (frame.level > 1 && entry.pagesize != 0) {
+            if (!destroy_managed_leaf(state.pagemap, frame.level, ENTRY_VADDR, state.managed_cursor, true))
+                dbg::panic_handler("budget teardown refused unknown or stale PS ownership");
+            return true;  // The complete detached tail is now owned by state.
+        }
         if (PHYS_ADDR == 0) {
             continue;
         }
 
-        int const LEVEL_SHIFT = 12 + (9 * (frame.level - 1));
-        uint64_t const ENTRY_VADDR = frame.vaddr_base | (static_cast<uint64_t>(INDEX) << LEVEL_SHIFT);
-
         if (frame.level > 1) {
-            if (entry.pagesize != 0) {
-                note_destroy_huge_skip(&stats);
-                entry = paging::purge_page_table_entry();
-                return true;
-            }
             PageKind const KIND = frame_page_kind(PHYS_ADDR, &state.frame_probe_cache);
             LiveAllocatorFrameKind const LIVE_ALLOC_KIND = classify_live_allocator_frame(PHYS_ADDR, KIND, &stats, &state.frame_probe_cache);
             if (LIVE_ALLOC_KIND != LiveAllocatorFrameKind::NONE) {
@@ -8803,6 +9180,7 @@ auto advance_free_data_budgeted(DestroyUserSpaceBudgetState& state, DestroyUserS
     }
 
     destroy_state_flush_refdec_batch(state, &stats);
+    destroy_require_no_managed_owners(state.pagemap, false);
     destroy_state_reset_walk(state, DestroyUserSpacePhase::FREE_PAGE_TABLES);
     return false;
 }
@@ -8832,6 +9210,7 @@ auto advance_free_page_tables_budgeted(DestroyUserSpaceBudgetState& state, Destr
             continue;
         }
 
+        if (frame.level > 1 && entry.pagesize != 0) dbg::panic_handler("page-table teardown encountered unretired PS ownership");
         uint64_t const PHYS_ADDR = static_cast<uint64_t>(entry.frame) << paging::PAGE_SHIFT;
         if (PHYS_ADDR == 0) {
             continue;
@@ -8862,9 +9241,7 @@ auto advance_free_page_tables_budgeted(DestroyUserSpaceBudgetState& state, Destr
             return true;
         }
 
-        if (frame.level > 1 && entry.pagesize != 0) {
-            note_destroy_huge_skip(&stats);
-        } else if (LIVE_ALLOC_KIND != LiveAllocatorFrameKind::NONE) {
+        if (LIVE_ALLOC_KIND != LiveAllocatorFrameKind::NONE) {
             note_destroy_kind_skip(&stats, live_allocator_kind_to_page_kind(LIVE_ALLOC_KIND));
         } else if (frame.level > 1 && KIND != PageKind::PAGE_TABLE) {
             note_destroy_kind_skip(&stats, KIND);
@@ -9040,8 +9417,8 @@ bool debug_log_user_phys_mappings(uint64_t target_phys, const char* trigger, uin
 namespace {
 
 void free_user_data_pages(PageTable* table, int level, PageTable* root, const PageTableFrameSet& page_table_frames,
-                          DestroyRefdecBatch& refdec_batch, DestroyUserSpaceCallStats* stats, uint64_t vaddr_base = 0,
-                          uint64_t owner_pid = 0, const char* owner_name = nullptr, const char* reason = nullptr,
+                          DestroyRefdecBatch& refdec_batch, DestroyManagedCursor& managed_cursor, DestroyUserSpaceCallStats* stats,
+                          uint64_t vaddr_base = 0, uint64_t owner_pid = 0, const char* owner_name = nullptr, const char* reason = nullptr,
                           FrameProbeCache* frame_probe_cache = nullptr) {
     if (table == nullptr || level < 1) {
         return;
@@ -9064,19 +9441,19 @@ void free_user_data_pages(PageTable* table, int level, PageTable* root, const Pa
         }
 
         uint64_t const PHYS_ADDR = static_cast<uint64_t>(entry.frame) << paging::PAGE_SHIFT;
+        const uint64_t ENTRY_VADDR = vaddr_base | (static_cast<uint64_t>(i) << LEVEL_SHIFT);
+        if (level > 1 && entry.pagesize != 0) {
+            if (!destroy_managed_leaf(root, level, ENTRY_VADDR, managed_cursor, true))
+                dbg::panic_handler("raw teardown refused unknown or stale PS ownership");
+            destroy_managed_drain(managed_cursor, refdec_batch, stats);
+            continue;
+        }
         if (PHYS_ADDR == 0) {
             continue;
         }
 
-        // Reconstruct virtual address for diagnostic output.
-        const uint64_t ENTRY_VADDR = vaddr_base | (static_cast<uint64_t>(i) << LEVEL_SHIFT);
-
         if (level > 1) {
-            // Check for huge pages (2MB at level 2, 1GB at level 3)
-            if (entry.pagesize != 0) {
-                // Preserve existing behavior: huge user mappings are not currently reclaimed here.
-                note_destroy_huge_skip(stats);
-            } else {
+            {
                 PageKind const KIND = frame_page_kind(PHYS_ADDR, frame_probe_cache);
                 LiveAllocatorFrameKind const LIVE_ALLOC_KIND = classify_live_allocator_frame(PHYS_ADDR, KIND, stats, frame_probe_cache);
                 if (LIVE_ALLOC_KIND != LiveAllocatorFrameKind::NONE) {
@@ -9101,8 +9478,8 @@ void free_user_data_pages(PageTable* table, int level, PageTable* root, const Pa
                         continue;
                     }
                     auto* next_level = reinterpret_cast<PageTable*>(VIRT_RAW);
-                    free_user_data_pages(next_level, level - 1, root, page_table_frames, refdec_batch, stats, ENTRY_VADDR, owner_pid,
-                                         owner_name, reason, frame_probe_cache);
+                    free_user_data_pages(next_level, level - 1, root, page_table_frames, refdec_batch, managed_cursor, stats, ENTRY_VADDR,
+                                         owner_pid, owner_name, reason, frame_probe_cache);
                 }
             }
         } else {
@@ -9184,6 +9561,7 @@ void free_page_table_pages(PageTable* table, int level, DestroyRefdecBatch& page
             continue;
         }
 
+        if (level > 1 && entry.pagesize != 0) dbg::panic_handler("raw page-table teardown encountered unretired PS ownership");
         uint64_t const PHYS_ADDR = static_cast<uint64_t>(entry.frame) << paging::PAGE_SHIFT;
         if (PHYS_ADDR == 0) {
             continue;
@@ -9212,8 +9590,6 @@ void free_page_table_pages(PageTable* table, int level, DestroyRefdecBatch& page
             free_page_table_pages(next_level, level - 1, page_table_refdec_batch, stats, ENTRY_VADDR, frame_probe_cache,
                                   root != nullptr ? root : table, owner_pid, reason);
             destroy_refdec_batch_queue(page_table_refdec_batch, next_level, stats, DestroyRefdecBatchKind::PAGE_TABLE);
-        } else if (level > 1 && entry.pagesize != 0) {
-            note_destroy_huge_skip(stats);
         } else if (LIVE_ALLOC_KIND != LiveAllocatorFrameKind::NONE) {
             note_destroy_kind_skip(stats, live_allocator_kind_to_page_kind(LIVE_ALLOC_KIND));
         } else if (level > 1 && KIND != PageKind::PAGE_TABLE) {
@@ -9300,6 +9676,8 @@ auto destroy_user_space_budgeted(DestroyUserSpaceBudgetState* state, uint32_t ma
                 consumed_step = advance_free_page_tables_budgeted(*state, stats);
                 break;
             case DestroyUserSpacePhase::TLB_FLUSH:
+                if (state->managed_cursor.active) __builtin_trap();
+                destroy_require_no_managed_owners(state->pagemap, false);
                 flush_pagemap_after_update(state->pagemap, 0, true);
                 {
                     uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
@@ -9333,8 +9711,10 @@ void destroy_user_space_budget_state_destroy(DestroyUserSpaceBudgetState* state)
     if (state == nullptr) {
         return;
     }
+    destroy_managed_drain(state->managed_cursor, state->refdec_batch, nullptr);
     destroy_state_flush_refdec_batch(*state, nullptr);
     destroy_state_flush_page_table_refdec_batch(*state, nullptr);
+    destroy_require_no_managed_owners(state->pagemap, true);
     if (state->access_gate_index != USER_PAGEMAP_ACCESS_GATE_NONE) end_user_pagemap_exclusive(state->access_gate_index);
     state->access_gate_index = USER_PAGEMAP_ACCESS_GATE_NONE;
     state->file_retirement.release_after_completed_tlb();
@@ -9347,8 +9727,10 @@ auto finish_destroy_user_space_and_release_pagemap(DestroyUserSpaceBudgetState* 
         state->access_gate_index != user_pagemap_access_gate_index(state->pagemap) ||
         !user_pagemap_access_gates.at(state->access_gate_index).teardown.load(std::memory_order_acquire))
         return false;
+    destroy_managed_drain(state->managed_cursor, state->refdec_batch, nullptr);
     destroy_state_flush_refdec_batch(*state, nullptr);
     destroy_state_flush_page_table_refdec_batch(*state, nullptr);
+    destroy_require_no_managed_owners(state->pagemap, true);
     // DONE already completed the actual TLB ACK and detached the exact binding
     // batch. Keep the original exclusive lease through control/pool retirement.
     release_pagemap_exclusive_owned(state->pagemap, state->owner_pid, __builtin_return_address(0));
@@ -9364,6 +9746,8 @@ void destroy_user_space(PageTable* pagemap, uint64_t owner_pid, const char* owne
     if (pagemap == nullptr) {
         return;
     }
+    DestroyManagedCursorStorage cursor_storage;
+    auto& managed_cursor = cursor_storage.get();
     UserPagemapExclusiveScope teardown_scope(pagemap);
     purge_anonymous_swap_mappings(pagemap);
     owned_frame_purge_pagemap(pagemap);
@@ -9386,9 +9770,10 @@ void destroy_user_space(PageTable* pagemap, uint64_t owner_pid, const char* owne
 
     phase_start_us = time::get_us();
     DestroyRefdecBatch refdec_batch{.root = pagemap};
-    free_user_data_pages(pagemap, 4, pagemap, page_table_frames, refdec_batch, &stats, 0, owner_pid, owner_name, reason,
+    free_user_data_pages(pagemap, 4, pagemap, page_table_frames, refdec_batch, managed_cursor, &stats, 0, owner_pid, owner_name, reason,
                          &frame_probe_cache);
     destroy_refdec_batch_flush(refdec_batch, &stats, DestroyRefdecBatchKind::DATA);
+    destroy_require_no_managed_owners(pagemap, false);
     stats.free_data_us = elapsed_us_since(phase_start_us, time::get_us());
 
     phase_start_us = time::get_us();
@@ -9730,3 +10115,87 @@ void release_table(paging::PageTable* table) noexcept {
     if (table != nullptr && !virt::try_release_page_table_to_pool(table, {__builtin_return_address(0), 0})) phys::page_free(table);
 }
 }  // namespace ker::mod::mm::huge::detail
+
+#ifdef WOS_SELFTEST
+namespace ker::test::numa_lifecycle::mm_debt {
+namespace {
+struct CounterState {
+    mod::mm::lifecycle_census::Epoch epoch{};
+    std::atomic<uint64_t> values[static_cast<size_t>(CounterField::COUNT)]{};
+    std::atomic<bool> arithmetic_valid{true};
+};
+static_assert(std::atomic<uint64_t>::is_always_lock_free && std::atomic<bool>::is_always_lock_free);
+static_assert(sizeof(CounterState) == 216 && alignof(CounterState) == 8);
+static_assert(offsetof(CounterState, values) == 24 && offsetof(CounterState, arithmetic_valid) == 208);
+constinit CounterState current{};
+
+void adjust(CounterState& state, CounterField field, bool increase) noexcept {
+    state.epoch.begin();
+    size_t const INDEX = static_cast<size_t>(field);
+    if (INDEX >= static_cast<size_t>(CounterField::COUNT)) {
+        state.arithmetic_valid.store(false, std::memory_order_seq_cst);
+        state.epoch.end();
+        return;
+    }
+    auto& counter = state.values[INDEX];
+    uint64_t value = counter.load(std::memory_order_seq_cst);
+    for (;;) {
+        if ((increase && value == UINT64_MAX) || (!increase && value == 0)) {
+            state.arithmetic_valid.store(false, std::memory_order_seq_cst);
+            break;
+        }
+        uint64_t const NEXT = increase ? value + 1 : value - 1;
+        if (counter.compare_exchange_weak(value, NEXT, std::memory_order_seq_cst)) break;
+    }
+    state.epoch.end();
+}
+
+void collect(CounterState& state, MmDebtSnapshot& out) noexcept {
+    auto const BEFORE = state.epoch.snapshot();
+    out.access_readers = state.values[static_cast<size_t>(CounterField::ACCESS_READERS)].load(std::memory_order_seq_cst);
+    out.access_exclusives = state.values[static_cast<size_t>(CounterField::ACCESS_EXCLUSIVES)].load(std::memory_order_seq_cst);
+    out.user_page_pins = state.values[static_cast<size_t>(CounterField::USER_PAGE_PINS)].load(std::memory_order_seq_cst);
+    out.stable_handles = state.values[static_cast<size_t>(CounterField::STABLE_HANDLES)].load(std::memory_order_seq_cst);
+    out.retained_frame_refs = state.values[static_cast<size_t>(CounterField::RETAINED_FRAME_REFS)].load(std::memory_order_seq_cst);
+    out.task_usercopy_accesses = state.values[static_cast<size_t>(CounterField::TASK_USERCOPY_ACCESSES)].load(std::memory_order_seq_cst);
+    out.pin_returns = state.values[static_cast<size_t>(CounterField::PIN_RETURNS)].load(std::memory_order_seq_cst);
+    out.lazy_rows[0] = state.values[static_cast<size_t>(CounterField::LAZY_ANONYMOUS)].load(std::memory_order_seq_cst);
+    out.lazy_rows[1] = state.values[static_cast<size_t>(CounterField::LAZY_FILE)].load(std::memory_order_seq_cst);
+    out.lazy_rows[2] = state.values[static_cast<size_t>(CounterField::LAZY_NATIVE_FILE)].load(std::memory_order_seq_cst);
+    out.lazy_rows[3] = state.values[static_cast<size_t>(CounterField::LAZY_TMPFS_READ_SHARED)].load(std::memory_order_seq_cst);
+    out.lazy_rows[4] = state.values[static_cast<size_t>(CounterField::LAZY_TMPFS_WRITE_SHARED)].load(std::memory_order_seq_cst);
+    out.lazy_returns = state.values[static_cast<size_t>(CounterField::LAZY_RETURNS)].load(std::memory_order_seq_cst);
+    out.swap_objects = state.values[static_cast<size_t>(CounterField::SWAP_OBJECTS)].load(std::memory_order_seq_cst);
+    out.swap_mappings = state.values[static_cast<size_t>(CounterField::SWAP_MAPPINGS)].load(std::memory_order_seq_cst);
+    out.swap_queued = state.values[static_cast<size_t>(CounterField::SWAP_QUEUED)].load(std::memory_order_seq_cst);
+    out.swap_pageins = state.values[static_cast<size_t>(CounterField::SWAP_PAGEINS)].load(std::memory_order_seq_cst);
+    out.swap_pageouts = state.values[static_cast<size_t>(CounterField::SWAP_PAGEOUTS)].load(std::memory_order_seq_cst);
+    out.swap_waiters = state.values[static_cast<size_t>(CounterField::SWAP_WAITERS)].load(std::memory_order_seq_cst);
+    out.swap_returns = state.values[static_cast<size_t>(CounterField::SWAP_RETURNS)].load(std::memory_order_seq_cst);
+    out.legacy_file_registry_rows = state.values[static_cast<size_t>(CounterField::LEGACY_FILE_REGISTRY)].load(std::memory_order_seq_cst);
+    out.native_file_registry_rows = state.values[static_cast<size_t>(CounterField::NATIVE_FILE_REGISTRY)].load(std::memory_order_seq_cst);
+    out.registry_returns = state.values[static_cast<size_t>(CounterField::REGISTRY_RETURNS)].load(std::memory_order_seq_cst);
+    auto const AFTER = state.epoch.snapshot();
+    out.version_begin = BEFORE.version;
+    out.version_end = AFTER.version;
+    out.inflight = BEFORE.inflight > AFTER.inflight ? BEFORE.inflight : AFTER.inflight;
+    out.valid = state.arithmetic_valid.load(std::memory_order_seq_cst) && BEFORE.valid && AFTER.valid && BEFORE.version == AFTER.version;
+}
+}  // namespace
+void begin_change() noexcept { current.epoch.begin(); }
+void end_change() noexcept { current.epoch.end(); }
+void add(CounterField field) noexcept { adjust(current, field, true); }
+void drop(CounterField field) noexcept { adjust(current, field, false); }
+void add_lazy_row(uint8_t copied_kind) noexcept {
+    auto const FIELD =
+        copied_kind < 5 ? static_cast<CounterField>(static_cast<size_t>(CounterField::LAZY_ANONYMOUS) + copied_kind) : CounterField::COUNT;
+    adjust(current, FIELD, true);
+}
+void drop_lazy_row(uint8_t copied_kind) noexcept {
+    auto const FIELD =
+        copied_kind < 5 ? static_cast<CounterField>(static_cast<size_t>(CounterField::LAZY_ANONYMOUS) + copied_kind) : CounterField::COUNT;
+    adjust(current, FIELD, false);
+}
+void snapshot(MmDebtSnapshot& output) noexcept { collect(current, output); }
+}  // namespace ker::test::numa_lifecycle::mm_debt
+#endif

@@ -1272,6 +1272,24 @@ void start_worker() {
     }
 }
 
+#ifdef WOS_SELFTEST
+auto selftest_observe_worker(SelftestWorkerObservation& output) noexcept -> bool {
+    auto* const WORKER = worker_task.load(std::memory_order_acquire);
+    if (WORKER == nullptr) return false;
+    SelftestWorkerObservation local{};
+    local.pid = WORKER->pid;
+    local.refs = WORKER->ref_count.load(std::memory_order_acquire);
+    local.exact_daemon = WORKER->type == sched::task::TaskType::DAEMON && WORKER->kthread_entry == reclaim_worker_main;
+    local.background_pending = background_pending.load(std::memory_order_acquire);
+    local.explicit_pending = explicit_job_pending();
+    uint64_t const FLAGS = node_queue_lock.lock_irqsave();
+    local.pending_nodes = node_pending_mask;
+    node_queue_lock.unlock_irqrestore(FLAGS);
+    output = local;
+    return true;
+}
+#endif
+
 auto pressure_for_order(uint8_t requested_order) -> PressureLevel {
     std::array<ZoneWatermarkSnapshot, MAX_WATERMARK_ZONES> snapshots{};
     size_t count = 0;

@@ -1,3 +1,6 @@
+#ifdef WOS_SELFTEST
+#include <test/numa_lifecycle_mm_debt.hpp>
+#endif
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -393,7 +396,15 @@ KTEST(UsercopyWritablePin, LazyAndCowFallbackPreserveIsolation) {
     KREQUIRE_TRUE(child.init());
     virt::reserve_page_range(parent.root, TEST_VA, 1);
     task::LazyVmemRange const RANGE{.start = TEST_VA, .end = TEST_VA + paging::PAGE_SIZE, .prot = 0x3, .flags = 0x20};
+#ifdef WOS_SELFTEST
+    ::ker::test::numa_lifecycle::mm_debt::begin_change();
+    bool const LAZY_ROW_ADDED_0 = parent.owner->lazy_vmem_ranges.push_back(RANGE);
+    if (LAZY_ROW_ADDED_0) ::ker::test::numa_lifecycle::mm_debt::add_lazy_row(0);
+    ::ker::test::numa_lifecycle::mm_debt::end_change();
+    KREQUIRE_TRUE(LAZY_ROW_ADDED_0);
+#else
     KREQUIRE_TRUE(parent.owner->lazy_vmem_ranges.push_back(RANGE));
+#endif
     uint32_t const PARENT_READERS = virt::selftest_user_pagemap_reader_count(parent.root);
     uint32_t const CHILD_READERS = virt::selftest_user_pagemap_reader_count(child.root);
     ObservedPin held;

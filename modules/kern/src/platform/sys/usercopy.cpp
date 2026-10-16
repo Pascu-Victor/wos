@@ -1,4 +1,7 @@
 #include "usercopy.hpp"
+#ifdef WOS_SELFTEST
+#include <test/numa_lifecycle_mm_debt.hpp>
+#endif
 
 #include <cstdint>
 #include <cstring>
@@ -11,6 +14,10 @@
 #include "util/fast_copy.hpp"
 
 namespace ker::mod::sys::usercopy {
+#ifdef WOS_SELFTEST
+namespace debt = ::ker::test::numa_lifecycle::mm_debt;
+using DebtField = ::ker::test::numa_lifecycle::CounterField;
+#endif
 namespace {
 
 constexpr uint64_t RFLAGS_AC = uint64_t{1} << 18U;
@@ -101,10 +108,17 @@ auto UserPageFrameRef::operator=(UserPageFrameRef&& other) noexcept -> UserPageF
 auto UserPageFrameRef::valid() const noexcept -> bool { return m_page != nullptr; }
 
 void UserPageFrameRef::reset() noexcept {
+#ifdef WOS_SELFTEST
+    if (m_page != nullptr) debt::add(DebtField::PIN_RETURNS);
+#endif
     void* const PAGE = std::exchange(m_page, nullptr);
     mm::phys::PageLookupHint hint = std::exchange(m_lookup_hint, mm::phys::PageLookupHint{});
     if (PAGE != nullptr) {
         mm::phys::page_ref_dec(PAGE, &hint);
+#ifdef WOS_SELFTEST
+        debt::drop(DebtField::RETAINED_FRAME_REFS);
+        debt::drop(DebtField::PIN_RETURNS);
+#endif
     }
 }
 
@@ -139,11 +153,21 @@ auto StableUserPage::retain_frame(UserPageFrameRef& out) const -> bool {
     mm::phys::PageLookupHint hint = m_pin.lookup_hint;
     // The live pin already owns this frame across concurrent unmap. Duplicate
     // only its allocator reference; the new owner never keeps a root reader.
+#ifdef WOS_SELFTEST
+    debt::begin_change();
+#endif
     if (!mm::phys::page_ref_try_inc(m_pin.hhdm_page, &hint)) {
+#ifdef WOS_SELFTEST
+        debt::end_change();
+#endif
         return false;
     }
     out.m_page = m_pin.hhdm_page;
     out.m_lookup_hint = hint;
+#ifdef WOS_SELFTEST
+    debt::add(DebtField::RETAINED_FRAME_REFS);
+    debt::end_change();
+#endif
     return true;
 }
 
@@ -157,11 +181,18 @@ auto StableUserPage::futex_identity_still_mapped(const mm::virt::UserFutexIdenti
 
 void StableUserPage::reset() {
     auto* task = m_task;
+#ifdef WOS_SELFTEST
+    if (task != nullptr) debt::add(DebtField::PIN_RETURNS);
+#endif
     m_task = nullptr;
     m_user_address = 0;
     mm::virt::unpin_user_page(m_pin);
     if (task != nullptr) {
         task->release_usercopy_pagemap();
+#ifdef WOS_SELFTEST
+        debt::drop(DebtField::STABLE_HANDLES);
+        debt::drop(DebtField::PIN_RETURNS);
+#endif
     }
 }
 
@@ -182,7 +213,14 @@ auto pin_task_user_page(sched::task::Task& task, uint64_t user_addr, bool requir
     if (!task.try_acquire_usercopy_pagemap(pagemap)) {
         return false;
     }
+#ifdef WOS_SELFTEST
+    debt::begin_change();
+#endif
     out.m_task = &task;
+#ifdef WOS_SELFTEST
+    debt::add(DebtField::STABLE_HANDLES);
+    debt::end_change();
+#endif
 
     if (!mm::virt::pin_user_page_for_task(&task, pagemap, user_addr, require_writable, fault_in, out.m_pin)) {
         out.reset();

@@ -77,6 +77,7 @@
 #include <platform/power/power.hpp>
 #include <test/file_mapping_lifetime_runtime_ktest.hpp>
 #include <test/ktest.hpp>
+#include <test/numa_pressure_runtime_ktest.hpp>
 #endif
 
 namespace ker::init::fns {
@@ -355,6 +356,10 @@ void sched_init() {
     mod::sched::setup_queues();
 #ifdef WOS_SELFTEST
     bool const LIFECYCLE = cmdline_has_token(get_kernel_cmdline(), "--selftest-compartment-lifecycle");
+    bool const NUMA_PRESSURE = cmdline_has_token(get_kernel_cmdline(), "--selftest-numa-pressure");
+    if (NUMA_PRESSURE && (LIFECYCLE || cmdline_has_token(get_kernel_cmdline(), "--selftest") ||
+                          cmdline_has_token(get_kernel_cmdline(), "--selftest-file-mapping")))
+        mod::dbg::panic_handler("conflicting scheduled NUMA pressure diagnostic boot modes");
     if (LIFECYCLE &&
         (cmdline_has_token(get_kernel_cmdline(), "--selftest") || cmdline_has_token(get_kernel_cmdline(), "--selftest-file-mapping")))
         mod::dbg::panic_handler("conflicting scheduled lifecycle diagnostic boot modes");
@@ -399,6 +404,11 @@ void sched_init() {
 }
 
 void kernel_start() {
+#ifdef WOS_SELFTEST
+    if (cmdline_has_token(get_kernel_cmdline(), "--selftest-numa-pressure") && !ker::test::start_numa_pressure_runtime_selftest())
+        mod::dbg::panic_handler("unable to post scheduled NUMA pressure selftest");
+#endif
+
 #ifdef WOS_ASYNC_BLOCK_IO
     dev::block_request_start_workers();
 #endif

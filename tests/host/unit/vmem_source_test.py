@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 
 import re
+import os
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[3]
-SYS_VMEM_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "vmem" / "sys_vmem.cpp"
-SYS_VMEM_HPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "vmem" / "sys_vmem.hpp"
+ROOT = Path(os.environ.get("WOS_LAZY_BACKING_ROOT", Path(__file__).resolve().parents[3]))
+SYS_VMEM_CPP = Path(os.environ.get("WOS_LAZY_BACKING_VMEM_SOURCE", ROOT / "modules/kern/src/syscalls_impl/vmem/sys_vmem.cpp"))
+SYS_VMEM_HPP = Path(os.environ.get("WOS_LAZY_BACKING_VMEM_HEADER", ROOT / "modules/kern/src/syscalls_impl/vmem/sys_vmem.hpp"))
 THREAD_CONTROL_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "multiproc" / "threadControl.cpp"
 PROCESS_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / "process.cpp"
-VIRT_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "virt.opt.cpp"
+VIRT_CPP = Path(os.environ.get("WOS_LAZY_BACKING_VIRT_SOURCE", ROOT / "modules/kern/src/platform/mm/virt.opt.cpp"))
 TASK_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "task.cpp"
 TASK_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "task.hpp"
 THREADING_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "threading.cpp"
@@ -753,12 +754,12 @@ def test_kasan_excluded_lazy_file_snapshot_is_unpoisoned_after_unlock() -> None:
             "task->lazy_vmem_lock.unlock_irqrestore(IRQF);",
             "if (kasan::is_enabled())",
             "kasan::unpoison_range(&file_range, sizeof(file_range));",
-            "ker::syscall::vmem::materialize_lazy_file_page(task, file_range, PAGE_VADDR, fault)",
+            "ker::syscall::vmem::materialize_lazy_file_page(task, file_range, PAGE_VADDR, fault, demand.allocation)",
         ],
         "KASAN-excluded lazy file snapshot boundary",
     )
     require_ordered_tokens(lazy_body,
-                           ["ker::syscall::vmem::materialize_lazy_file_page(task, file_range, PAGE_VADDR, fault)",
+                           ["ker::syscall::vmem::materialize_lazy_file_page(task, file_range, PAGE_VADDR, fault, demand.allocation)",
                             "if (file_range.kind == sched::task::LazyVmemKind::NATIVE_FILE_BACKED)",
                             "file_range.lifetime->release(file_mapping::FamilyOwner::SNAPSHOT);",
                             "} else if (file_range.file != nullptr)", "ker::vfs::vfs_put_file(file_range.file);", "return OK;"],

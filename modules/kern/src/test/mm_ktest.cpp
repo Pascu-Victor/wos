@@ -1,3 +1,6 @@
+#ifdef WOS_SELFTEST
+#include <test/numa_lifecycle_mm_debt.hpp>
+#endif
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -689,7 +692,15 @@ KTEST(MM, UsercopyMaterializesLazyAnonymousPages) {
         .prot = 0x3,
         .flags = 0x20,
     };
+#ifdef WOS_SELFTEST
+    ::ker::test::numa_lifecycle::mm_debt::begin_change();
+    bool const LAZY_ROW_ADDED_0 = task.lazy_vmem_ranges.push_back(range);
+    if (LAZY_ROW_ADDED_0) ::ker::test::numa_lifecycle::mm_debt::add_lazy_row(0);
+    ::ker::test::numa_lifecycle::mm_debt::end_change();
+    KREQUIRE_TRUE(LAZY_ROW_ADDED_0);
+#else
     KREQUIRE_TRUE(task.lazy_vmem_ranges.push_back(range));
+#endif
 
     std::array<uint8_t, 8> input{0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87};
     std::array<uint8_t, 8> output{};
@@ -1578,7 +1589,15 @@ KTEST(MM, SharedWriteRestrictionSurvivesForkAndProtectionChanges) {
     task.pagemap = child;
     // Even conflicting lazy-anon metadata cannot synthesize COW permission.
     ker::mod::sched::task::LazyVmemRange const RANGE{.start = TEST_VADDR, .end = TEST_VADDR + paging::PAGE_SIZE, .prot = 3, .flags = 0x20};
+#ifdef WOS_SELFTEST
+    ::ker::test::numa_lifecycle::mm_debt::begin_change();
+    bool const LAZY_ROW_ADDED_1 = task.lazy_vmem_ranges.push_back(RANGE);
+    if (LAZY_ROW_ADDED_1) ::ker::test::numa_lifecycle::mm_debt::add_lazy_row(0);
+    ::ker::test::numa_lifecycle::mm_debt::end_change();
+    KREQUIRE_TRUE(LAZY_ROW_ADDED_1);
+#else
     KREQUIRE_TRUE(task.lazy_vmem_ranges.push_back(RANGE));
+#endif
     uint8_t const REPLACEMENT = 0xff;
     KEXPECT_FALSE(usercopy::copy_value_to_task(task, TEST_VADDR, REPLACEMENT));
     KEXPECT_EQ(original[0], 0x39);

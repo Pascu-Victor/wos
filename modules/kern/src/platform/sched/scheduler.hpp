@@ -566,7 +566,7 @@ void gc_expired_tasks();                                                   // Ga
 auto gc_expired_tasks_budgeted(uint32_t max_tasks) -> uint32_t;            // Budgeted task GC for scheduler GC daemon
 void request_gc();                                                         // Request deferred scheduler GC from IRQ-safe paths
 [[nodiscard]] auto is_current_gc_worker() -> bool;  // Exact current GC Task and its private entry; no borrowed dereference.
-void request_gc_memory_pressure();                                         // Request aggressive GC from allocation pressure paths
+void request_gc_memory_pressure();                  // Request aggressive GC from allocation pressure paths
 // Optional observations from one exclusive pressure pass. These are local to
 // the caller; guard counters describe scanned entries, not a global snapshot.
 struct GcPressureDiagnostics {
@@ -740,6 +740,22 @@ auto get_run_queue_stats(uint64_t cpu_no) -> RunQueueStats;
 auto get_scheduler_trace_stats(uint64_t cpu_no) -> SchedulerTraceStats;
 auto get_scheduler_cpu_state(uint64_t cpu_no) -> SchedulerCpuState;
 size_t get_scheduler_runqueue_task_states(uint64_t cpu_no, SchedulerRunQueueTaskState* out, size_t max_entries);
+#ifdef WOS_SELFTEST
+// Only the scheduled reclaim fixture: caller holds exact worker lifetime.
+// A positive result is one real RQ instant, not attribution to a later wake.
+enum class ReclaimWaitObservationStatus : uint8_t { FOUND_WAITING, NOT_OBSERVED, INCOMPLETE };
+struct ReclaimWaitObservation {
+    uint64_t pid{};
+    uint64_t cpu{};
+    uint32_t refs{};
+    bool current{};
+    bool handoff{};
+    bool wakeup_pending{};
+};
+[[nodiscard]] auto scheduler_selftest_observe_reclaim_waiter(task::Task& retained_worker, ReclaimWaitObservation& out)
+    -> ReclaimWaitObservationStatus;
+#endif
+
 void dump_scheduler_trace_stats();
 void dump_scheduler_cpu_states();
 void dump_scheduler_current_cpu_state(const ker::mod::gates::InterruptFrame& frame);

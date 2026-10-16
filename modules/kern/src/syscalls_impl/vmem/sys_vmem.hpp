@@ -10,6 +10,10 @@ class LazyVmemClone;
 struct Task;
 }  // namespace ker::mod::sched::task
 
+namespace ker::mod::mm::numa {
+struct AllocationContext;
+}
+
 namespace ker::vfs {
 struct File;
 }
@@ -78,6 +82,11 @@ auto sys_vmem_map(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, u
 auto file_mmap_cache_stats() -> FileMmapCacheStats;
 auto file_mmap_cache_reclaim(size_t max_pages) -> size_t;
 void file_mmap_cache_register_shrinker();
+// Production callers carry the initiating Task/CPU value across any worker.
+auto materialize_lazy_file_page(ker::mod::sched::task::Task* task, const ker::mod::sched::task::LazyVmemRange& range, uint64_t page_vaddr,
+                                const ker::mod::mm::paging::PageFault& fault, const ker::mod::mm::numa::AllocationContext& placement)
+    -> bool;
+// Internal/native compatibility capture before installer/root acquisition.
 auto materialize_lazy_file_page(ker::mod::sched::task::Task* task, const ker::mod::sched::task::LazyVmemRange& range, uint64_t page_vaddr,
                                 const ker::mod::mm::paging::PageFault& fault) -> bool;
 // Caller must hold SharedVmemPublicationGuard. On failure, partial destination

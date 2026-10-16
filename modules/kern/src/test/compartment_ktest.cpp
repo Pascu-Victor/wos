@@ -1,3 +1,6 @@
+#ifdef WOS_SELFTEST
+#include <test/numa_lifecycle_mm_debt.hpp>
+#endif
 #include <abi/callnums/multiproc.h>
 #include <abi/callnums/net.h>
 #include <abi/callnums/power.h>
@@ -4417,10 +4420,30 @@ struct LazyOwnershipCutover {
     static void inject(Task& target) {
         if (active == nullptr || &active->task != &target) return;
         uint64_t const IRQF = target.lazy_vmem_lock.lock_irqsave();
+#ifdef WOS_SELFTEST
+        bool const OWNED_ROW = !target.lazy_vmem_ranges.empty();
+        uint8_t const KIND = OWNED_ROW ? static_cast<uint8_t>(target.lazy_vmem_ranges[0].kind) : 0;
+        auto* file = target.lazy_vmem_ranges.empty() ? nullptr : target.lazy_vmem_ranges[0].file;
+        if (OWNED_ROW) {
+            ::ker::test::numa_lifecycle::mm_debt::begin_change();
+            ::ker::test::numa_lifecycle::mm_debt::add(::ker::test::numa_lifecycle::CounterField::LAZY_RETURNS);
+            ::ker::test::numa_lifecycle::mm_debt::end_change();
+        }
+        target.lazy_vmem_ranges.clear();
+        target.lazy_vmem_lock.unlock_irqrestore(IRQF);
+        active->transferred.reset(file);
+        if (OWNED_ROW) {
+            ::ker::test::numa_lifecycle::mm_debt::begin_change();
+            ::ker::test::numa_lifecycle::mm_debt::drop_lazy_row(KIND);
+            ::ker::test::numa_lifecycle::mm_debt::drop(::ker::test::numa_lifecycle::CounterField::LAZY_RETURNS);
+            ::ker::test::numa_lifecycle::mm_debt::end_change();
+        }
+#else
         auto* file = target.lazy_vmem_ranges.empty() ? nullptr : target.lazy_vmem_ranges[0].file;
         target.lazy_vmem_ranges.clear();
         target.lazy_vmem_lock.unlock_irqrestore(IRQF);
         active->transferred.reset(file);
+#endif
     }
 };
 }  // namespace
@@ -4442,7 +4465,15 @@ KTEST(CompartmentOwnership, DistinctSelfFilesAndDuplicateOwnersDrainWhenClosed) 
         vfs::vfs_retain_file(file);
         child.task->exec_image_file = file;
         vfs::vfs_retain_file(file);
+#ifdef WOS_SELFTEST
+        ::ker::test::numa_lifecycle::mm_debt::begin_change();
+        bool const LAZY_ROW_ADDED_0 =
+            child.task->lazy_vmem_ranges.push_back({.kind = sched::task::LazyVmemKind::FILE_BACKED, .file = file});
+        if (LAZY_ROW_ADDED_0) ::ker::test::numa_lifecycle::mm_debt::add_lazy_row(1);
+        ::ker::test::numa_lifecycle::mm_debt::end_change();
+#else
         child.task->lazy_vmem_ranges.push_back({.kind = sched::task::LazyVmemKind::FILE_BACKED, .file = file});
+#endif
         KEXPECT_EQ(child.task->ref_count.load(), uint32_t{4});
         uint32_t count = 91;
         KEXPECT_EQ(vfs::vfs_count_exclusive_unpublished_self_refs(*child.task, count), 0);
@@ -4527,7 +4558,15 @@ KTEST(CompartmentOwnership, LazyOwnerTransferCannotMasqueradeAsInternalReference
     NativeFile file(vfs::vfs_get_file_retain(child.task, FD));
     KREQUIRE_TRUE(file);
     KREQUIRE_EQ(vfs::vfs_close_for_task(child.task, FD), 0);
+#ifdef WOS_SELFTEST
+    ::ker::test::numa_lifecycle::mm_debt::begin_change();
+    bool const LAZY_ROW_ADDED_1 =
+        child.task->lazy_vmem_ranges.push_back({.kind = sched::task::LazyVmemKind::FILE_BACKED, .file = file.get()});
+    if (LAZY_ROW_ADDED_1) ::ker::test::numa_lifecycle::mm_debt::add_lazy_row(1);
+    ::ker::test::numa_lifecycle::mm_debt::end_change();
+#else
     child.task->lazy_vmem_ranges.push_back({.kind = sched::task::LazyVmemKind::FILE_BACKED, .file = file.get()});
+#endif
     file.release();
     {
         LazyOwnershipCutover cutover(*child.task);

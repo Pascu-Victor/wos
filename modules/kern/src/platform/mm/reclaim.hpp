@@ -249,6 +249,20 @@ auto snapshot_shrinker_stats(ShrinkerStatsSnapshot* out, size_t capacity) -> siz
 [[nodiscard]] auto pressure_name(PressureLevel level) -> const char*;
 
 #ifdef WOS_SELFTEST
+struct SelftestWorkerObservation {
+    uint64_t pid{};
+    uint64_t pending_nodes{};
+    uint32_t refs{};
+    bool exact_daemon{};
+    bool background_pending{};
+    bool explicit_pending{};
+};
+// Boot-held exact worker identity; separate source instants, no Task ownership.
+// Output must be genuinely addressable before entry. No RQ or physical sample.
+[[nodiscard]] auto selftest_observe_worker(SelftestWorkerObservation& output) noexcept -> bool;
+#endif
+
+#ifdef WOS_SELFTEST
 [[nodiscard]] auto selftest_priority_and_progress() -> bool;
 [[nodiscard]] auto selftest_no_progress_backoff() -> bool;
 [[nodiscard]] auto selftest_recursion_guard() -> bool;

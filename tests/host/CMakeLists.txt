@@ -337,6 +337,19 @@ add_test(NAME kernel_direct_map_runtime_test
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/kernel_direct_map_runtime_test.py
         --cxx ${CMAKE_CXX_COMPILER} --negative-controls)
 set_tests_properties(kernel_direct_map_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 120)
+# Diagnostic ownership fixtures compile actual bodies with explicit Host endpoints.
+foreach(_wos_mm_debt_test IN ITEMS core pin lazy registry)
+    add_test(NAME numa_mm_debt_${_wos_mm_debt_test}_runtime_test
+        COMMAND ${CMAKE_COMMAND} -E env HOST_CXX=${CMAKE_CXX_COMPILER} WOS_HOST_CXX=${CMAKE_CXX_COMPILER}
+            ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_mm_debt_${_wos_mm_debt_test}_runtime_test.py)
+    set_tests_properties(numa_mm_debt_${_wos_mm_debt_test}_runtime_test
+        PROPERTIES LABELS "unit;host;runtime" TIMEOUT 120)
+endforeach()
+add_test(NAME numa_pressure_holdings_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_pressure_holdings_runtime_test.py
+        --host-build ${CMAKE_BINARY_DIR}
+        --gtest-main $<TARGET_FILE:gtest_main> --gtest-lib $<TARGET_FILE:gtest>)
+set_tests_properties(numa_pressure_holdings_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 140)
 wos_add_unit_test(vtd_capability_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vtd_capability_test.cpp
 )

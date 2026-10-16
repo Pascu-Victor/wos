@@ -1,4 +1,7 @@
 #ifdef WOS_SELFTEST
+#include <test/numa_lifecycle_mm_debt.hpp>
+#endif
+#ifdef WOS_SELFTEST
 
 #include <abi/callnums/vmem.h>
 
@@ -94,11 +97,23 @@ struct OwnedTask {
         root = nullptr;
     }
     auto lazy(size_t pages = 1) -> bool {
+#ifdef WOS_SELFTEST
+        ::ker::test::numa_lifecycle::mm_debt::begin_change();
+        bool const LAZY_ROW_ADDED_0 = subject->lazy_vmem_ranges.push_back({.start = VA,
+                                                                           .end = VA + PAGE * pages,
+                                                                           .prot = vmabi::PROT_READ | vmabi::PROT_WRITE,
+                                                                           .flags = vmabi::MAP_PRIVATE | vmabi::MAP_ANONYMOUS,
+                                                                           .file = nullptr});
+        if (LAZY_ROW_ADDED_0) ::ker::test::numa_lifecycle::mm_debt::add_lazy_row(0);
+        ::ker::test::numa_lifecycle::mm_debt::end_change();
+        return LAZY_ROW_ADDED_0;
+#else
         return subject->lazy_vmem_ranges.push_back({.start = VA,
                                                     .end = VA + PAGE * pages,
                                                     .prot = vmabi::PROT_READ | vmabi::PROT_WRITE,
                                                     .flags = vmabi::MAP_PRIVATE | vmabi::MAP_ANONYMOUS,
                                                     .file = nullptr});
+#endif
     }
     auto map(uint64_t flags) -> uint8_t* {
         auto* page = static_cast<uint8_t*>(phys::page_alloc_may_fail(mm::PhysicalPageOwner::USER_PRIVATE_MAPPING, PAGE, "demand-test"));

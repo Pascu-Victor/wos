@@ -1,5 +1,8 @@
 #include "sys_vmem.hpp"
 
+#ifdef WOS_SELFTEST
+#include <test/numa_lifecycle_mm_debt.hpp>
+#endif
 #include <abi/callnums/vmem.h>
 #include <bits/off_t.h>
 #include <bits/ssize_t.h>
@@ -1249,9 +1252,21 @@ auto collect_file_mmap_sync_ranges(ker::mod::mm::paging::PageTable* pagemap, uin
             .file_offset = range.file_offset,
             .file = range.file,
         };
+#ifdef WOS_SELFTEST
+        ::ker::test::numa_lifecycle::mm_debt::begin_change();
+        ::ker::test::numa_lifecycle::mm_debt::add(::ker::test::numa_lifecycle::CounterField::REGISTRY_RETURNS);
+#endif
         ker::vfs::vfs_retain_file(sync_range.file);
+#ifdef WOS_SELFTEST
+        ::ker::test::numa_lifecycle::mm_debt::end_change();
+#endif
         if (!out.push_back(sync_range)) {
             ker::vfs::vfs_put_file(sync_range.file);
+#ifdef WOS_SELFTEST
+            ::ker::test::numa_lifecycle::mm_debt::begin_change();
+            ::ker::test::numa_lifecycle::mm_debt::drop(::ker::test::numa_lifecycle::CounterField::REGISTRY_RETURNS);
+            ::ker::test::numa_lifecycle::mm_debt::end_change();
+#endif
             g_file_mmap_ranges_lock.unlock();
             return -ENOMEM;
         }
@@ -1298,6 +1313,11 @@ auto write_file_mapping_bytes(ker::vfs::File* file, const uint8_t* data, size_t 
 void release_file_mmap_sync_ranges(ker::util::SmallVec<FileMmapSyncRange, 8>& ranges, size_t first = 0) {
     for (size_t i = first; i < ranges.size(); ++i) {
         ker::vfs::vfs_put_file(ranges.at(i).file);
+#ifdef WOS_SELFTEST
+        ::ker::test::numa_lifecycle::mm_debt::begin_change();
+        ::ker::test::numa_lifecycle::mm_debt::drop(::ker::test::numa_lifecycle::CounterField::REGISTRY_RETURNS);
+        ::ker::test::numa_lifecycle::mm_debt::end_change();
+#endif
     }
 }
 
@@ -1393,6 +1413,11 @@ auto sync_file_mmap_range_impl(ker::mod::mm::paging::PageTable* pagemap, ker::mo
         const auto& range = ranges.at(range_index);
         if (range.skip_writeback) {
             ker::vfs::vfs_put_file(range.file);
+#ifdef WOS_SELFTEST
+            ::ker::test::numa_lifecycle::mm_debt::begin_change();
+            ::ker::test::numa_lifecycle::mm_debt::drop(::ker::test::numa_lifecycle::CounterField::REGISTRY_RETURNS);
+            ::ker::test::numa_lifecycle::mm_debt::end_change();
+#endif
             continue;
         }
         uint64_t page_vaddr = page_align_down(range.sync_start);
@@ -1435,6 +1460,11 @@ auto sync_file_mmap_range_impl(ker::mod::mm::paging::PageTable* pagemap, ker::mo
         }
 
         ker::vfs::vfs_put_file(range.file);
+#ifdef WOS_SELFTEST
+        ::ker::test::numa_lifecycle::mm_debt::begin_change();
+        ::ker::test::numa_lifecycle::mm_debt::drop(::ker::test::numa_lifecycle::CounterField::REGISTRY_RETURNS);
+        ::ker::test::numa_lifecycle::mm_debt::end_change();
+#endif
         if (result < 0) {
             release_file_mmap_sync_ranges(ranges, range_index + 1);
             return result;
@@ -1467,7 +1497,16 @@ auto register_file_mmap_range(ker::mod::mm::paging::PageTable* pagemap, uint64_t
     };
     g_file_mmap_ranges_lock.lock();
     bool const OK = g_file_mmap_ranges.push_back(RANGE);
+#ifdef WOS_SELFTEST
+    if (OK) {
+        ::ker::test::numa_lifecycle::mm_debt::begin_change();
+        ker::vfs::vfs_retain_file(file);
+        ::ker::test::numa_lifecycle::mm_debt::add(::ker::test::numa_lifecycle::CounterField::LEGACY_FILE_REGISTRY);
+        ::ker::test::numa_lifecycle::mm_debt::end_change();
+    }
+#else
     if (OK) ker::vfs::vfs_retain_file(file);
+#endif
     g_file_mmap_ranges_lock.unlock();
     return OK ? 0 : -ENOMEM;
 }
@@ -1513,9 +1552,22 @@ auto unregister_one_file_mmap_overlap(ker::mod::mm::paging::PageTable* pagemap, 
         uint64_t const OVERLAP_END = std::min(end, RANGE_END);
         if (OVERLAP_START <= range.start && OVERLAP_END >= RANGE_END) {
             auto* file = range.file;
+#ifdef WOS_SELFTEST
+            ::ker::test::numa_lifecycle::mm_debt::begin_change();
+            ::ker::test::numa_lifecycle::mm_debt::add(::ker::test::numa_lifecycle::CounterField::REGISTRY_RETURNS);
+#endif
             (void)g_file_mmap_ranges.remove_at(i);
+#ifdef WOS_SELFTEST
+            ::ker::test::numa_lifecycle::mm_debt::end_change();
+#endif
             g_file_mmap_ranges_lock.unlock();
             ker::vfs::vfs_put_file(file);
+#ifdef WOS_SELFTEST
+            ::ker::test::numa_lifecycle::mm_debt::begin_change();
+            ::ker::test::numa_lifecycle::mm_debt::drop(::ker::test::numa_lifecycle::CounterField::LEGACY_FILE_REGISTRY);
+            ::ker::test::numa_lifecycle::mm_debt::drop(::ker::test::numa_lifecycle::CounterField::REGISTRY_RETURNS);
+            ::ker::test::numa_lifecycle::mm_debt::end_change();
+#endif
             if (removed_any != nullptr) {
                 *removed_any = true;
             }
@@ -1524,9 +1576,15 @@ auto unregister_one_file_mmap_overlap(ker::mod::mm::paging::PageTable* pagemap, 
 
         if (OVERLAP_START <= range.start) {
             uint64_t const DELTA = OVERLAP_END - range.start;
+#ifdef WOS_SELFTEST
+            ::ker::test::numa_lifecycle::mm_debt::begin_change();
+#endif
             range.start = OVERLAP_END;
             range.length = RANGE_END - OVERLAP_END;
             range.file_offset += DELTA;
+#ifdef WOS_SELFTEST
+            ::ker::test::numa_lifecycle::mm_debt::end_change();
+#endif
             g_file_mmap_ranges_lock.unlock();
             if (removed_any != nullptr) {
                 *removed_any = true;
@@ -1535,7 +1593,13 @@ auto unregister_one_file_mmap_overlap(ker::mod::mm::paging::PageTable* pagemap, 
         }
 
         if (OVERLAP_END >= RANGE_END) {
+#ifdef WOS_SELFTEST
+            ::ker::test::numa_lifecycle::mm_debt::begin_change();
+#endif
             range.length = OVERLAP_START - range.start;
+#ifdef WOS_SELFTEST
+            ::ker::test::numa_lifecycle::mm_debt::end_change();
+#endif
             g_file_mmap_ranges_lock.unlock();
             if (removed_any != nullptr) {
                 *removed_any = true;
@@ -1548,15 +1612,39 @@ auto unregister_one_file_mmap_overlap(ker::mod::mm::paging::PageTable* pagemap, 
         right.length = RANGE_END - OVERLAP_END;
         right.file_offset = range.file_offset + (OVERLAP_END - range.start);
         uint64_t const LEFT_LENGTH = OVERLAP_START - range.start;
+#ifdef WOS_SELFTEST
+        ::ker::test::numa_lifecycle::mm_debt::begin_change();
+#endif
         ker::vfs::vfs_retain_file(right.file);
+#ifdef WOS_SELFTEST
+        ::ker::test::numa_lifecycle::mm_debt::add(::ker::test::numa_lifecycle::CounterField::LEGACY_FILE_REGISTRY);
+        ::ker::test::numa_lifecycle::mm_debt::end_change();
+#endif
         if (!g_file_mmap_ranges.push_back(right)) {
+#ifdef WOS_SELFTEST
+            ::ker::test::numa_lifecycle::mm_debt::begin_change();
+            ::ker::test::numa_lifecycle::mm_debt::add(::ker::test::numa_lifecycle::CounterField::REGISTRY_RETURNS);
+            ::ker::test::numa_lifecycle::mm_debt::end_change();
+#endif
             ker::vfs::vfs_put_file(right.file);
+#ifdef WOS_SELFTEST
+            ::ker::test::numa_lifecycle::mm_debt::begin_change();
+            ::ker::test::numa_lifecycle::mm_debt::drop(::ker::test::numa_lifecycle::CounterField::LEGACY_FILE_REGISTRY);
+            ::ker::test::numa_lifecycle::mm_debt::drop(::ker::test::numa_lifecycle::CounterField::REGISTRY_RETURNS);
+            ::ker::test::numa_lifecycle::mm_debt::end_change();
+#endif
             g_file_mmap_ranges_lock.unlock();
             return -ENOMEM;
         }
         // Appending can relocate heap-backed rows. The mutex keeps the index
         // stable, so reacquire the left row after the append succeeds.
+#ifdef WOS_SELFTEST
+        ::ker::test::numa_lifecycle::mm_debt::begin_change();
+#endif
         g_file_mmap_ranges.at(i).length = LEFT_LENGTH;
+#ifdef WOS_SELFTEST
+        ::ker::test::numa_lifecycle::mm_debt::end_change();
+#endif
         g_file_mmap_ranges_lock.unlock();
         if (removed_any != nullptr) {
             *removed_any = true;
@@ -1756,13 +1844,16 @@ auto file_mapping_page_flags(uint64_t prot, uint64_t mmap_flags) -> uint64_t {
 }
 
 auto materialize_lazy_file_page_impl(ker::mod::sched::task::Task* task, const LazyVmemRange& range, uint64_t page_vaddr,
-                                     const ker::mod::mm::paging::PageFault& fault) -> bool {
+                                     const ker::mod::mm::paging::PageFault& fault, const numa::AllocationContext& placement) -> bool {
     if (task == nullptr || task->pagemap == nullptr || !ker::mod::sched::task::lazy_vmem_is_file(range)) {
         return false;
     }
     // Demand canonical pages use the two-phase MM worker/pre-pin entrance.
     // This legacy materializer can be called with outer root readers held.
     if (ker::mod::sched::task::lazy_vmem_is_tmpfs_shared(range)) return false;
+    // Construct the private candidate before the installer: every refusal
+    // drops the installer/root lease before the candidate's final frame ref.
+    numa::AllocationResult allocation;
     ker::mod::mm::virt::FileMappingInstallerLease installer;
     bool const NATIVE = range.kind == LazyVmemKind::NATIVE_FILE_BACKED;
     if (NATIVE && !installer.acquire(*task, range, page_vaddr)) return false;
@@ -1820,8 +1911,12 @@ auto materialize_lazy_file_page_impl(ker::mod::sched::task::Task* task, const La
             return false;
         }
     } else {
-        page = ker::mod::mm::phys::page_alloc_full_overwrite_page_with_reclaim_may_fail(ker::mod::mm::PhysicalPageOwner::USER_FILE_MAPPING,
-                                                                                        "vmem-file-lazy");
+        auto page_context = placement;
+        page_context.virtual_page_index = page_vaddr / ker::mod::mm::paging::PAGE_SIZE;
+        numa::try_allocate_pages_into(
+            allocation, page_context, 1, ker::mod::mm::paging::PAGE_SIZE, ker::mod::mm::PhysicalPageOwner::USER_FILE_MAPPING,
+            ker::mod::mm::phys::PageInitialization::FULL_OVERWRITE, numa::ReclaimMode::LEGACY_UMA, "vmem-file-lazy");
+        page = allocation.span.data();
         if (page == nullptr) {
             return false;
         }
@@ -1830,12 +1925,10 @@ auto materialize_lazy_file_page_impl(ker::mod::sched::task::Task* task, const La
             size_t const READ_SIZE =
                 static_cast<size_t>(std::min<uint64_t>(ker::mod::mm::paging::PAGE_SIZE, range.file_size - FILE_OFFSET));
             if (FILE_OFFSET > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
-                ker::mod::mm::phys::page_ref_dec(page);
-                return false;
+                return false;  // The private span owner returns this candidate.
             }
             if (!read_file_mapping_exact(file, page, READ_SIZE, FILE_OFFSET)) {
-                ker::mod::mm::phys::page_ref_dec(page);
-                return false;
+                return false;  // The private span owner returns this candidate.
             }
         }
     }
@@ -1844,9 +1937,10 @@ auto materialize_lazy_file_page_impl(ker::mod::sched::task::Task* task, const La
     auto const INSTALL_RESULT = ker::mod::mm::virt::install_lazy_file_page_if_current(
         task, range, page_vaddr, PADDR, file_mapping_page_flags(range.prot, range.flags), installer.binding());
     if (INSTALL_RESULT != ker::mod::mm::virt::LazyFilePageInstallResult::MAPPED) {
-        ker::mod::mm::phys::page_ref_dec(page);
+        if (allocation.span.empty()) ker::mod::mm::phys::page_ref_dec(page);  // Existing cache reference.
         return INSTALL_RESULT == ker::mod::mm::virt::LazyFilePageInstallResult::ALREADY_MAPPED;
     }
+    if (!allocation.span.empty()) (void)allocation.span.release();  // The exact installed PTE owns ref1.
     return true;
 }
 
@@ -2500,6 +2594,16 @@ auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t si
         return allocate_public_shared_tmpfs(*task, *file, st, hint, size, prot, flags, offset);
     }
 
+    // Freeze the old backing choice before PUB. A lazy row captures its
+    // policy at its later fault; eager copy/cache-fallback uses this actor now.
+    bool const LAZY_FILE = (st.st_mode & ker::vfs::S_IFMT) == ker::vfs::S_IFREG && lazy_file_mmap_enabled();
+    numa::AllocationContext placement;
+    if (!LAZY_FILE) {
+        auto const CAPTURE = numa::capture_allocation_context(task->memory_policy_snapshot(), placement);
+        if (CAPTURE != numa::AllocationError::NONE)
+            return static_cast<uint64_t>(CAPTURE == numa::AllocationError::INVALID_POLICY ? -EINVAL : -ENOMEM);
+    }
+
     // Keep reservation, page-table construction, lazy/file metadata, and
     // rollback indivisible with respect to fork's address-space snapshot.
     SharedVmemPublicationGuard publication_guard;
@@ -2541,7 +2645,7 @@ auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t si
         release_fixed_mmap_range_locked(task, vaddr, size);
     }
 
-    if ((st.st_mode & ker::vfs::S_IFMT) == ker::vfs::S_IFREG && lazy_file_mmap_enabled()) {
+    if (LAZY_FILE) {
         if (!add_shared_lazy_file_vmem_range_locked(task, vaddr, size, prot, flags, file, offset, st)) {
             (void)remove_shared_vmem_range_locked(task, vaddr, size);
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
@@ -2623,8 +2727,13 @@ auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t si
     uint64_t mapped_pages = 0;
     for (uint64_t i = 0; i < NUM_PAGES; i++) {
         auto current_vaddr = vaddr + (i * ker::mod::mm::paging::PAGE_SIZE);
-        void* const PHYS_PAGE = ker::mod::mm::phys::page_alloc_with_reclaim_may_fail(ker::mod::mm::PhysicalPageOwner::USER_FILE_MAPPING,
-                                                                                     ker::mod::mm::paging::PAGE_SIZE, "vmem-file");
+        auto page_context = placement;
+        page_context.virtual_page_index = current_vaddr / ker::mod::mm::paging::PAGE_SIZE;
+        numa::AllocationResult allocation;
+        numa::try_allocate_pages_into(allocation, page_context, 1, ker::mod::mm::paging::PAGE_SIZE,
+                                      ker::mod::mm::PhysicalPageOwner::USER_FILE_MAPPING, ker::mod::mm::phys::PageInitialization::ZERO,
+                                      numa::ReclaimMode::LEGACY_UMA, "vmem-file");
+        void* const PHYS_PAGE = allocation.span.data();
         if (PHYS_PAGE == nullptr) {
             rollback_mapped_pages(task, vaddr, mapped_pages);
             release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
@@ -2633,7 +2742,6 @@ auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t si
         std::memset(PHYS_PAGE, 0, ker::mod::mm::paging::PAGE_SIZE);
 
         if (i > (std::numeric_limits<uint64_t>::max() - offset) / ker::mod::mm::paging::PAGE_SIZE) {
-            ker::mod::mm::phys::page_ref_dec(PHYS_PAGE);
             rollback_mapped_pages(task, vaddr, mapped_pages);
             release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EOVERFLOW);
@@ -2643,14 +2751,12 @@ auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t si
         if (FILE_OFFSET < FILE_SIZE) {
             uint64_t const READ_SIZE = std::min<uint64_t>(ker::mod::mm::paging::PAGE_SIZE, FILE_SIZE - FILE_OFFSET);
             if (FILE_OFFSET > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
-                ker::mod::mm::phys::page_ref_dec(PHYS_PAGE);
                 rollback_mapped_pages(task, vaddr, mapped_pages);
                 release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
                 return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EOVERFLOW);
             }
 
             if (!read_file_mapping_exact(file, PHYS_PAGE, static_cast<size_t>(READ_SIZE), FILE_OFFSET)) {
-                ker::mod::mm::phys::page_ref_dec(PHYS_PAGE);
                 rollback_mapped_pages(task, vaddr, mapped_pages);
                 release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
                 return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
@@ -2659,6 +2765,7 @@ auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t si
 
         auto paddr = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(PHYS_PAGE)));
         ker::mod::mm::virt::map_page(task->pagemap, current_vaddr, paddr, PAGE_FLAGS);
+        (void)allocation.span.release();  // Returned map_page transferred the frame to its PTE.
         mapped_pages++;
         if (is_watched_mmap_vaddr(current_vaddr)) {
             log::warn(
@@ -3016,7 +3123,7 @@ auto selftest_file_mapping_admission(ker::mod::mm::paging::PageTable* pagemap) -
                                 ok = ok && range.file == file && range.prot == prot;
                                 if (prot != vm::PROT_NONE) {
                                     paging::PageFault fault{};
-                                    ok = materialize_lazy_file_page_impl(&task, range, BASE, fault) && ok;
+                                    ok = materialize_lazy_file_page(&task, range, BASE, fault) && ok;
                                 }
                             }
                         }
@@ -3155,7 +3262,21 @@ auto selftest_file_mapping_registry_growth(ker::mod::mm::paging::PageTable* page
         bool const EMPTY = g_file_mmap_ranges.empty();
         // Preserve any retained capacity from prior tests. Foreign rows are
         // never hidden or removed; this fixture requires an empty registry.
+#ifdef WOS_SELFTEST
+        if (EMPTY) {
+            ::ker::test::numa_lifecycle::mm_debt::begin_change();
+            ::ker::test::numa_lifecycle::mm_debt::add(::ker::test::numa_lifecycle::CounterField::REGISTRY_RETURNS);
+            ::ker::test::numa_lifecycle::mm_debt::end_change();
+        }
+#endif
         if (EMPTY) saved_empty_registry = std::move(g_file_mmap_ranges);
+#ifdef WOS_SELFTEST
+        if (EMPTY) {
+            ::ker::test::numa_lifecycle::mm_debt::begin_change();
+            ::ker::test::numa_lifecycle::mm_debt::drop(::ker::test::numa_lifecycle::CounterField::REGISTRY_RETURNS);
+            ::ker::test::numa_lifecycle::mm_debt::end_change();
+        }
+#endif
         g_file_mmap_ranges_lock.unlock();
         ok = EMPTY;
         if (EMPTY) {
@@ -3219,14 +3340,42 @@ auto selftest_file_mapping_registry_growth(ker::mod::mm::paging::PageTable* page
                 ok = file->refcount.load() == 1 && ok;
                 g_file_mmap_ranges_lock.lock();
                 bool const DRAINED = g_file_mmap_ranges.empty();
+#ifdef WOS_SELFTEST
+                if (DRAINED) {
+                    ::ker::test::numa_lifecycle::mm_debt::begin_change();
+                    ::ker::test::numa_lifecycle::mm_debt::add(::ker::test::numa_lifecycle::CounterField::REGISTRY_RETURNS);
+                    ::ker::test::numa_lifecycle::mm_debt::end_change();
+                }
+#endif
                 if (DRAINED) g_file_mmap_ranges = {};
+#ifdef WOS_SELFTEST
+                if (DRAINED) {
+                    ::ker::test::numa_lifecycle::mm_debt::begin_change();
+                    ::ker::test::numa_lifecycle::mm_debt::drop(::ker::test::numa_lifecycle::CounterField::REGISTRY_RETURNS);
+                    ::ker::test::numa_lifecycle::mm_debt::end_change();
+                }
+#endif
                 g_file_mmap_ranges_lock.unlock();
                 ok = DRAINED && ok;
                 if (!ok) break;
             }
             g_file_mmap_ranges_lock.lock();
             bool const DRAINED = g_file_mmap_ranges.empty();
+#ifdef WOS_SELFTEST
+            if (DRAINED) {
+                ::ker::test::numa_lifecycle::mm_debt::begin_change();
+                ::ker::test::numa_lifecycle::mm_debt::add(::ker::test::numa_lifecycle::CounterField::REGISTRY_RETURNS);
+                ::ker::test::numa_lifecycle::mm_debt::end_change();
+            }
+#endif
             if (DRAINED) g_file_mmap_ranges = std::move(saved_empty_registry);
+#ifdef WOS_SELFTEST
+            if (DRAINED) {
+                ::ker::test::numa_lifecycle::mm_debt::begin_change();
+                ::ker::test::numa_lifecycle::mm_debt::drop(::ker::test::numa_lifecycle::CounterField::REGISTRY_RETURNS);
+                ::ker::test::numa_lifecycle::mm_debt::end_change();
+            }
+#endif
             g_file_mmap_ranges_lock.unlock();
             ok = DRAINED && ok;
         }
@@ -3396,7 +3545,7 @@ auto selftest_lazy_file_projection(ker::mod::mm::paging::PageTable* pagemap) -> 
                         RECORD_FAILURE("cache-before", address);
                     }
                     mm::paging::PageFault fault{};
-                    if (ok) ok = materialize_lazy_file_page_impl(&task, range, address, fault);
+                    if (ok) ok = materialize_lazy_file_page(&task, range, address, fault);
                     RECORD_FAILURE("materialize", address);
                     if (CACHED) {
                         SelftestFileCacheObservation after{};
@@ -3966,15 +4115,38 @@ static auto prepare_unpublished_file_mapping_impl(ker::mod::sched::task::Task& o
         lifetime->release(fm::FamilyOwner::PREPARED);
         return -ENOMEM;
     }
+#ifdef WOS_SELFTEST
+    ::ker::test::numa_lifecycle::mm_debt::begin_change();
+    bool const REGISTRY_ACQUIRED = lifetime->try_acquire(fm::FamilyOwner::REGISTRY);
+    if (REGISTRY_ACQUIRED) ::ker::test::numa_lifecycle::mm_debt::add(::ker::test::numa_lifecycle::CounterField::NATIVE_FILE_REGISTRY);
+    ::ker::test::numa_lifecycle::mm_debt::end_change();
+    if (!REGISTRY_ACQUIRED) {
+#else
     if (!lifetime->try_acquire(fm::FamilyOwner::REGISTRY)) {
+#endif
         binding->release(fm::BindingOwner::PREPARED);
         lifetime->release(fm::FamilyOwner::PREPARED);
         return -EOVERFLOW;
     }
     auto discard_prepared = [&] {
+#ifdef WOS_SELFTEST
+        ::ker::test::numa_lifecycle::mm_debt::begin_change();
+        ::ker::test::numa_lifecycle::mm_debt::add(::ker::test::numa_lifecycle::CounterField::REGISTRY_RETURNS);
+        ::ker::test::numa_lifecycle::mm_debt::end_change();
+#endif
         binding->release(fm::BindingOwner::PREPARED);
         lifetime->release(fm::FamilyOwner::REGISTRY);
+#ifdef WOS_SELFTEST
+        ::ker::test::numa_lifecycle::mm_debt::begin_change();
+        ::ker::test::numa_lifecycle::mm_debt::drop(::ker::test::numa_lifecycle::CounterField::NATIVE_FILE_REGISTRY);
+        ::ker::test::numa_lifecycle::mm_debt::end_change();
+#endif
         lifetime->release(fm::FamilyOwner::PREPARED);
+#ifdef WOS_SELFTEST
+        ::ker::test::numa_lifecycle::mm_debt::begin_change();
+        ::ker::test::numa_lifecycle::mm_debt::drop(::ker::test::numa_lifecycle::CounterField::REGISTRY_RETURNS);
+        ::ker::test::numa_lifecycle::mm_debt::end_change();
+#endif
     };
     auto range_vacant_locked = [&] {
         bool vacant = child.pagemap != nullptr && child.lazy_vmem_ranges.size() < 8;
@@ -4003,6 +4175,9 @@ static auto prepare_unpublished_file_mapping_impl(ker::mod::sched::task::Task& o
             if (ker::mod::mm::virt::attach_unpublished_file_binding(indexed, child.pagemap, address, address + length, offset)) {
                 // All remaining stores are pre-reserved and infallible. No PTE
                 // is exposed until the index and actual lazy/registry owners exist.
+#ifdef WOS_SELFTEST
+                ::ker::test::numa_lifecycle::mm_debt::begin_change();
+#endif
                 if (!lifetime->reclassify(fm::FamilyOwner::PREPARED, fm::FamilyOwner::LAZY))
                     ker::mod::dbg::panic_handler("native mapping prepared owner transfer failed");
                 LazyVmemRange const RANGE{
@@ -4021,6 +4196,10 @@ static auto prepare_unpublished_file_mapping_impl(ker::mod::sched::task::Task& o
                     .file_ctime_sec = st.st_ctim.tv_sec,
                     .file_ctime_nsec = st.st_ctim.tv_nsec};
                 if (!child.lazy_vmem_ranges.push_back(RANGE)) ker::mod::dbg::panic_handler("native mapping staged lazy capacity lost");
+#ifdef WOS_SELFTEST
+                ::ker::test::numa_lifecycle::mm_debt::add_lazy_row(static_cast<uint8_t>(RANGE.kind));
+                ::ker::test::numa_lifecycle::mm_debt::end_change();
+#endif
                 entry.lifetime = lifetime;
                 entry.binding = binding;
                 entry.root = child.pagemap;
@@ -4033,9 +4212,15 @@ static auto prepare_unpublished_file_mapping_impl(ker::mod::sched::task::Task& o
         child.lazy_vmem_lock.unlock_irqrestore(FLAGS);
         if (result == 0) {
             g_file_mmap_ranges_lock.lock();
+#ifdef WOS_SELFTEST
+            ::ker::test::numa_lifecycle::mm_debt::begin_change();
+#endif
             entry.registry_next = g_native_file_mmap_ranges;
             g_native_file_mmap_ranges = &entry;
             entry.registered = true;
+#ifdef WOS_SELFTEST
+            ::ker::test::numa_lifecycle::mm_debt::end_change();
+#endif
             g_file_mmap_ranges_lock.unlock();
         }
     }
@@ -4057,8 +4242,18 @@ auto prepare_unpublished_read_shared_tmpfs_mapping(ker::mod::sched::task::Task& 
 }
 
 auto materialize_lazy_file_page(ker::mod::sched::task::Task* task, const ker::mod::sched::task::LazyVmemRange& range, uint64_t page_vaddr,
+                                const ker::mod::mm::paging::PageFault& fault, const numa::AllocationContext& placement) -> bool {
+    return materialize_lazy_file_page_impl(task, range, page_vaddr, fault, placement);
+}
+
+auto materialize_lazy_file_page(ker::mod::sched::task::Task* task, const ker::mod::sched::task::LazyVmemRange& range, uint64_t page_vaddr,
                                 const ker::mod::mm::paging::PageFault& fault) -> bool {
-    return materialize_lazy_file_page_impl(task, range, page_vaddr, fault);
+    // Internal/native compatibility frontend: production sync/async work uses
+    // the typed overload, never a worker-time context recapture.
+    if (task == nullptr) return false;
+    numa::AllocationContext placement;
+    if (numa::capture_allocation_context(task->memory_policy_snapshot(), placement) != numa::AllocationError::NONE) return false;
+    return materialize_lazy_file_page_impl(task, range, page_vaddr, fault, placement);
 }
 
 auto file_mmap_cache_stats() -> FileMmapCacheStats {
@@ -4239,9 +4434,27 @@ auto clone_file_mmap_ranges_for_pagemap_locked(ker::mod::mm::paging::PageTable* 
 
         FileMmapRange clone = range;
         clone.pagemap = dst;
+#ifdef WOS_SELFTEST
+        ::ker::test::numa_lifecycle::mm_debt::begin_change();
+#endif
         ker::vfs::vfs_retain_file(clone.file);
+#ifdef WOS_SELFTEST
+        ::ker::test::numa_lifecycle::mm_debt::add(::ker::test::numa_lifecycle::CounterField::LEGACY_FILE_REGISTRY);
+        ::ker::test::numa_lifecycle::mm_debt::end_change();
+#endif
         if (!g_file_mmap_ranges.push_back(clone)) {
+#ifdef WOS_SELFTEST
+            ::ker::test::numa_lifecycle::mm_debt::begin_change();
+            ::ker::test::numa_lifecycle::mm_debt::add(::ker::test::numa_lifecycle::CounterField::REGISTRY_RETURNS);
+            ::ker::test::numa_lifecycle::mm_debt::end_change();
+#endif
             ker::vfs::vfs_put_file(clone.file);
+#ifdef WOS_SELFTEST
+            ::ker::test::numa_lifecycle::mm_debt::begin_change();
+            ::ker::test::numa_lifecycle::mm_debt::drop(::ker::test::numa_lifecycle::CounterField::LEGACY_FILE_REGISTRY);
+            ::ker::test::numa_lifecycle::mm_debt::drop(::ker::test::numa_lifecycle::CounterField::REGISTRY_RETURNS);
+            ::ker::test::numa_lifecycle::mm_debt::end_change();
+#endif
             ok = false;
             break;
         }
@@ -4257,22 +4470,41 @@ void release_file_mmap_ranges_for_pagemap(ker::mod::mm::paging::PageTable* pagem
     }
     for (;;) {
         NativeMappingEntry* removed = nullptr;
+#ifdef WOS_SELFTEST
+        ker::mod::mm::file_mapping::FileMappingLifetime* removed_lifetime = nullptr;
+#endif
         g_file_mmap_ranges_lock.lock();
         auto** link = &g_native_file_mmap_ranges;
         while (*link != nullptr) {
             auto* entry = *link;
             if (entry->root == pagemap) {
+#ifdef WOS_SELFTEST
+                removed_lifetime = entry->lifetime;
+                ::ker::test::numa_lifecycle::mm_debt::begin_change();
+                ::ker::test::numa_lifecycle::mm_debt::add(::ker::test::numa_lifecycle::CounterField::REGISTRY_RETURNS);
+#endif
                 *link = entry->registry_next;
                 entry->registry_next = nullptr;
                 entry->registered = false;
                 removed = entry;
+#ifdef WOS_SELFTEST
+                ::ker::test::numa_lifecycle::mm_debt::end_change();
+#endif
                 break;
             }
             link = &entry->registry_next;
         }
         g_file_mmap_ranges_lock.unlock();
         if (removed == nullptr) break;
+#ifdef WOS_SELFTEST
+        removed_lifetime->release(ker::mod::mm::file_mapping::FamilyOwner::REGISTRY);
+        ::ker::test::numa_lifecycle::mm_debt::begin_change();
+        ::ker::test::numa_lifecycle::mm_debt::drop(::ker::test::numa_lifecycle::CounterField::NATIVE_FILE_REGISTRY);
+        ::ker::test::numa_lifecycle::mm_debt::drop(::ker::test::numa_lifecycle::CounterField::REGISTRY_RETURNS);
+        ::ker::test::numa_lifecycle::mm_debt::end_change();
+#else
         removed->lifetime->release(ker::mod::mm::file_mapping::FamilyOwner::REGISTRY);
+#endif
     }
 
     // Teardown is one writeback operation: a later denied range must not be

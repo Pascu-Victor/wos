@@ -12,9 +12,9 @@ from raw_typed_file_seams import extend_raw_fixture
 
 from exec_trace_ownership_test import block, function
 
-ROOT = Path(__file__).resolve().parents[3]
-virt = (ROOT / "modules/kern/src/platform/mm/virt.opt.cpp").read_text()
-vmem = (ROOT / "modules/kern/src/syscalls_impl/vmem/sys_vmem.cpp").read_text()
+ROOT = Path(os.environ.get("WOS_LAZY_BACKING_ROOT", Path(__file__).resolve().parents[3]))
+virt = Path(os.environ.get("WOS_LAZY_BACKING_VIRT_SOURCE", ROOT / "modules/kern/src/platform/mm/virt.opt.cpp")).read_text()
+vmem = Path(os.environ.get("WOS_LAZY_BACKING_VMEM_SOURCE", ROOT / "modules/kern/src/syscalls_impl/vmem/sys_vmem.cpp")).read_text()
 scheduler = (ROOT / "modules/kern/src/platform/sched/scheduler.cpp").read_text()
 allocator = (ROOT / "modules/kern/src/platform/mm/numa_alloc.cpp").read_text()
 allocator_header = (ROOT / "modules/kern/src/platform/mm/numa_alloc.hpp").read_text()
@@ -47,6 +47,7 @@ using vaddr_t=uint64_t; using paddr_t=uint64_t;
 constexpr paddr_t PADDR_INVALID=UINT64_MAX;
 constexpr size_t USER_PAGEMAP_ACCESS_GATE_NONE=SIZE_MAX;
 constexpr uint64_t page_align_down(uint64_t p){return p&~uint64_t{4095};}
+uint64_t capture_nodes=0,observed_nodes=0,observed_index=0;unsigned capture_mode=0,observed_mode=0;uint16_t capture_local=0,observed_local=0;bool fail_capture=false;
 int guards=0, created=0, destroyed=0, reads=0, allocated=0, dropped=0, puts=0, parks=0, wakes=0;
 bool fail_create=false, fail_post=false, shutdown_requested=false, fail_alloc=false, fail_read=false, software_prefault=false;
 std::function<void()> read_hook, pin_hook, park_hook, put_hook;
@@ -125,10 +126,18 @@ namespace addr{void*get_phys_pointer(uint64_t p){return reinterpret_cast<void*>(
 namespace numa{
 @NUMA_DECLARATIONS@
 @NUMA_METHODS@
-// This fixture executes RAW file paths only. The new anonymous allocator
-// endpoint is explicitly unreachable; factory dispatch has its own real test.
-auto try_allocate_pages(const AllocationContext&,uint32_t,uint64_t,PhysicalPageOwner,phys::PageInitialization,ReclaimMode,const char*)
- ->AllocationResult{std::abort();}
+// RAW file endpoint observes the actual forwarded context/owner, not a
+// duplicate policy allocator. Actual topology/buddy dispatch is separate.
+auto try_allocate_pages(const AllocationContext&context,uint32_t pages,uint64_t align,PhysicalPageOwner owner,
+ phys::PageInitialization init,ReclaimMode reclaim,const char*name)->AllocationResult{
+ assert(guards==0&&pages==1&&align==4096&&owner==PhysicalPageOwner::USER_FILE_MAPPING);
+ assert(init==phys::PageInitialization::FULL_OVERWRITE&&reclaim==ReclaimMode::LEGACY_UMA);
+ observed_nodes=context.policy.nodes;observed_mode=static_cast<unsigned>(context.policy.mode);
+ observed_local=context.local_node;observed_index=context.virtual_page_index;
+ AllocationResult result;auto*p=phys::page_alloc_full_overwrite_page_with_reclaim_may_fail(owner,name);
+ if(!p){result.error=AllocationError::EXHAUSTED;return result;}
+ result.span=OwnedSpan{p,1};result.requested=result.actual=context.local_node;result.error=AllocationError::NONE;return result;
+}
 @NUMA_ADAPTER@
 }
 namespace virt{
@@ -136,7 +145,8 @@ namespace sched=ker::mod::sched;namespace sys=ker::mod::sys;
 @DEMAND_TYPES@
 @DEMAND_STORAGE@
 bool capture_demand_context(sched::task::Task*t,uint64_t,DemandOrigin origin,bool user,DemandContext&output){
- assert(guards==0);output.origin=origin;output.hardware_user=user;output.allocation.local_node=0;return t&&t->pagemap;}
+ assert(guards==0);if(fail_capture)return false;output.origin=origin;output.hardware_user=user;
+ output.allocation={{capture_nodes,static_cast<numa::Mode>(capture_mode)},capture_local,0};return t&&t->pagemap;}
 void record_demand_candidate(const DemandContext&,bool){assert(guards==0);}
 bool demand_is_observed(const DemandContext&){assert(guards==0);return false;}
 void record_demand_result(const DemandContext&,DemandBacking,numa::NodeId,numa::NodeId,bool,bool,bool){assert(guards==0);}
@@ -159,17 +169,18 @@ LazyFilePageInstallResult install_lazy_file_page_if_current(sched::task::Task*,c
 }}
 }
 namespace syscall::vmem{
+namespace numa=ker::mod::mm::numa;
 using LazyVmemRange=ker::mod::sched::task::LazyVmemRange;using LazyVmemKind=ker::mod::sched::task::LazyVmemKind;
 bool file_mmap_can_share(const ker::vfs::Stat&,uint64_t){return false;}
 bool file_mmap_cached_page_for_file(ker::vfs::File*,const ker::vfs::Stat&,uint64_t,void**){assert(false);return false;}
 bool read_file_mapping_exact(ker::vfs::File*f,void*p,size_t n,uint64_t){assert(guards==0&&f->refs>0);++reads;
  if(read_hook)read_hook();if(fail_read)return false;std::memset(p,f->id,n);return true;}
 uint64_t file_mapping_page_flags(uint64_t prot,uint64_t flags){return prot|flags;}
-bool materialize_lazy_file_page_impl(ker::mod::sched::task::Task*,const LazyVmemRange&,uint64_t,const ker::mod::mm::paging::PageFault&);
-bool materialize_lazy_file_page(ker::mod::sched::task::Task*t,const LazyVmemRange&r,uint64_t a,const ker::mod::mm::paging::PageFault&f){
+bool materialize_lazy_file_page_impl(ker::mod::sched::task::Task*,const LazyVmemRange&,uint64_t,const ker::mod::mm::paging::PageFault&,const ker::mod::mm::numa::AllocationContext&);
+bool materialize_lazy_file_page(ker::mod::sched::task::Task*t,const LazyVmemRange&r,uint64_t a,const ker::mod::mm::paging::PageFault&f,const ker::mod::mm::numa::AllocationContext&context){
  assert(guards==0&&((software_prefault&&ker::mod::sched::current==t)||
  (ker::mod::sched::current!=t&&t->pins==1&&t->pagemap->gates==1)));
- return materialize_lazy_file_page_impl(t,r,a,f);}
+ return materialize_lazy_file_page_impl(t,r,a,f,context);}
 }}
 namespace ker::mod::mm::virt{
 @MATCH@
@@ -203,6 +214,7 @@ struct Fixture{PageTable map;ker::vfs::File file;Task task;bool owns_file_ref=tr
 };
 void reset(){assert(guards==0&&lazy_file_fault_worker==nullptr);for(auto const&w:lazy_file_fault_work)assert(!w.task);
  lazy_file_fault_work={};lazy_file_fault_admission=false;lazy_file_fault_worker_starting=false;lazy_file_fault_next_sequence=1;
+ capture_nodes=observed_nodes=observed_index=0;capture_mode=observed_mode=0;capture_local=observed_local=0;fail_capture=false;
  fail_create=fail_post=shutdown_requested=fail_alloc=fail_read=software_prefault=false;reads=parks=wakes=puts=0;read_hook=pin_hook=park_hook=put_hook=clean_exit_hook={};unlock_hook={};}
 void start(){sched::current=nullptr;start_lazy_file_fault_worker();assert(lazy_file_fault_worker&&lazy_file_fault_admission);}
 void run_worker(Task*t){clean_exit_hook=[](){assert(!lazy_file_fault_worker&&!lazy_file_fault_admission);
@@ -213,7 +225,7 @@ void drain(){auto*t=sched::posted_worker;assert(t&&t==lazy_file_fault_worker);sc
  sched::posted_worker=nullptr;sched::current=nullptr;}
 void one(){LazyFileFaultWork work;size_t index;assert(take_lazy_file_fault(work,index));auto*save=sched::current;
  sched::current=sched::posted_worker;sched::Hold hold(sched::current);
- bool const ok=ker::syscall::vmem::materialize_lazy_file_page(work.task,work.range,work.vaddr,work.fault);
+ bool const ok=ker::syscall::vmem::materialize_lazy_file_page(work.task,work.range,work.vaddr,work.fault,work.placement);
  finish_lazy_file_fault(work,index,ok?0:-EFAULT);sched::current=save;}
 int main(){
  reset();{Fixture f;sched::current=&f.task;f.task.lazy_vmem_ranges.clear();uint64_t g=0;
@@ -288,6 +300,18 @@ int main(){
   sched::current=worker;run_worker(worker);assert(worker->refs==1&&worker->holds==0&&!lazy_file_fault_worker);
   worker->release();delete worker;++destroyed;sched::current=nullptr;sched::posted_worker=nullptr;
   assert(reads==1&&f.map.page&&f.task.lazy_file_fault_completion_generation.load()==1&&!lazy_file_fault_admission);}
+ // Queue capture belongs to this generation, not later worker CPU/policy
+ // or a duplicate fault. The observer only records actual factory arguments.
+ reset();start();{Fixture f;sched::current=&f.task;capture_nodes=10;capture_mode=2;capture_local=3;uint64_t g=0;
+  assert(probe_lazy_file_fault(&f.task,0x10000,Fault{},true,g)==LazyFileFaultDisposition::PARK);
+  capture_nodes=4;capture_mode=3;capture_local=7;
+  assert(probe_lazy_file_fault(&f.task,0x10000,Fault{},true,g)==LazyFileFaultDisposition::PARK);
+  drain();assert(observed_nodes==10&&observed_mode==2&&observed_local==3&&observed_index==16);
+  assert(f.map.page&&f.task.lazy_file_fault_completion_generation.load()==1&&f.task.refs==1&&f.task.pins==0&&f.map.gates==0);}
+ reset();start();{Fixture f;sched::current=&f.task;fail_capture=true;uint64_t g=0;
+  int before_puts=puts;assert(probe_lazy_file_fault(&f.task,0x10000,Fault{},true,g)==LazyFileFaultDisposition::FAILED);
+  assert(f.task.refs==1&&f.task.pins==0&&f.map.gates==0&&f.file.refs==1&&puts==before_puts&&g==0&&!f.map.page);}
+ drain();
  reset();fail_create=true;start_lazy_file_fault_worker();assert(!lazy_file_fault_worker&&!lazy_file_fault_worker_starting);
  fail_create=false;fail_post=true;int before=destroyed;start_lazy_file_fault_worker();
  assert(!lazy_file_fault_worker&&!lazy_file_fault_worker_starting&&destroyed==before+1);

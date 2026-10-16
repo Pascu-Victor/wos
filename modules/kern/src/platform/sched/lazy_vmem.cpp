@@ -1,3 +1,6 @@
+#ifdef WOS_SELFTEST
+#include <test/numa_lifecycle_mm_debt.hpp>
+#endif
 #include <cerrno>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/lazy_vmem.hpp>
@@ -7,18 +10,49 @@
 #include <vfs/vfs.hpp>
 
 namespace ker::mod::sched::task {
+#ifdef WOS_SELFTEST
+namespace debt = ::ker::test::numa_lifecycle::mm_debt;
+using DebtField = ::ker::test::numa_lifecycle::CounterField;
+static_assert(static_cast<uint8_t>(LazyVmemKind::ANONYMOUS) == 0 && static_cast<uint8_t>(LazyVmemKind::FILE_BACKED) == 1 &&
+              static_cast<uint8_t>(LazyVmemKind::NATIVE_FILE_BACKED) == 2 && static_cast<uint8_t>(LazyVmemKind::TMPFS_READ_SHARED) == 3 &&
+              static_cast<uint8_t>(LazyVmemKind::TMPFS_WRITE_SHARED) == 4);
+#endif
 
 auto try_retain_lazy_vmem_range(const LazyVmemRange& range) noexcept -> bool {
+#ifdef WOS_SELFTEST
+    uint8_t const KIND = static_cast<uint8_t>(range.kind);
+    debt::begin_change();
+    bool const RETAINED =
+        lazy_vmem_has_lifetime(range)
+            ? range.lifetime != nullptr && range.lifetime->try_acquire(mm::file_mapping::FamilyOwner::LAZY)
+            : range.kind != LazyVmemKind::FILE_BACKED || range.file == nullptr || ker::vfs::vfs_try_retain_file(range.file);
+    if (RETAINED) debt::add_lazy_row(KIND);
+    debt::end_change();
+    return RETAINED;
+#else
     if (lazy_vmem_has_lifetime(range)) return range.lifetime != nullptr && range.lifetime->try_acquire(mm::file_mapping::FamilyOwner::LAZY);
     return range.kind != LazyVmemKind::FILE_BACKED || range.file == nullptr || ker::vfs::vfs_try_retain_file(range.file);
+#endif
 }
 
 void release_lazy_vmem_range(const LazyVmemRange& range) noexcept {
+#ifdef WOS_SELFTEST
+    uint8_t const KIND = static_cast<uint8_t>(range.kind);
+    debt::begin_change();
+    debt::add(DebtField::LAZY_RETURNS);
+    debt::end_change();
+#endif
     if (lazy_vmem_has_lifetime(range)) {
         if (range.lifetime != nullptr) range.lifetime->release(mm::file_mapping::FamilyOwner::LAZY);
     } else if (range.kind == LazyVmemKind::FILE_BACKED && range.file != nullptr) {
         ker::vfs::vfs_put_file(range.file);
     }
+#ifdef WOS_SELFTEST
+    debt::begin_change();
+    debt::drop_lazy_row(KIND);
+    debt::drop(DebtField::LAZY_RETURNS);
+    debt::end_change();
+#endif
 }
 
 void release_lazy_vmem_range_refs(LazyVmemRangeVec& ranges) noexcept {

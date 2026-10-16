@@ -57,6 +57,7 @@ def fail(message: str) -> None:
 
 
 def find_matching_brace(source: str, brace: int) -> int:
+    source = diagnostic_brace_source(source)
     depth = 0
     for index in range(brace, len(source)):
         if source[index] == "{":
@@ -81,6 +82,87 @@ def function_body(source: str, spelling: str) -> str:
 def code_without_comments_or_literals(source: str) -> str:
     pattern = re.compile(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', flags=re.DOTALL)
     return pattern.sub(lambda match: "\n" * match.group(0).count("\n"), source)
+
+
+def selftest_conditional_lines(source: str):
+    """Keep original offsets; unknown conditions grant no positive authority."""
+    stack: list[bool | None] = []
+    offset = 0
+    clean = code_without_comments_or_literals(source).split("\n")
+    for line, code in zip(source.split("\n"), clean):
+        directive = re.fullmatch(r"\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)", code)
+        if directive is not None:
+            kind, expression = directive.groups()
+            expression = re.sub(r"\s+", "", expression)
+            positive = ((kind == "ifdef" and expression == "WOS_SELFTEST") or
+                        (kind in ("if", "elif") and expression in
+                         ("defined(WOS_SELFTEST)", "definedWOS_SELFTEST")))
+            negative = ((kind == "ifndef" and expression == "WOS_SELFTEST") or
+                        (kind in ("if", "elif") and expression in
+                         ("!defined(WOS_SELFTEST)", "!definedWOS_SELFTEST")))
+            branch = True if positive else False if negative else None
+            if kind in ("if", "ifdef", "ifndef"):
+                stack.append(branch)
+            elif not stack:
+                fail("unmatched preprocessor branch in diagnostic fixture audit")
+            elif kind == "endif":
+                stack.pop()
+            elif kind == "elif":
+                stack[-1] = branch
+            else:
+                stack[-1] = None if stack[-1] is None else not stack[-1]
+        yield offset, line, tuple(stack), directive is not None
+        offset += len(line) + 1
+
+
+def inside_wos_selftest(source: str, position: int) -> bool:
+    if position < 0:
+        return False
+    for offset, line, branches, _ in selftest_conditional_lines(source):
+        if offset <= position <= offset + len(line):
+            return any(branch is True for branch in branches)
+    return False
+
+
+def diagnostic_brace_source(source: str) -> str:
+    """Mask only known excluded branches/directives, preserving all offsets.
+
+    Original body text remains the raw-access oracle. This finite source seam
+    is not a C preprocessor, a compiler, or evidence of runtime exclusion.
+    """
+    result = list(source)
+    for offset, line, branches, directive in selftest_conditional_lines(source):
+        if directive or False in branches:
+            result[offset:offset + len(line)] = " " * len(line)
+    return "".join(result)
+
+
+def test_wos_selftest_conditional_nesting() -> None:
+    cases = [
+        ("#ifdef WOS_SELFTEST\n#ifdef OTHER\nx\n#endif\nTARGET", True),
+        ("#ifdef WOS_SELFTEST\n#ifdef WOS_SELFTEST\nx\n#endif\nTARGET", True),
+        ("#ifdef WOS_SELFTEST\nx\n#else\nTARGET", False),
+        ("#ifdef WOS_SELFTEST\nx\n#endif\nTARGET", False),
+        ("#ifndef WOS_SELFTEST\nTARGET", False),
+        ("#ifndef WOS_SELFTEST\nx\n#else\nTARGET", True),
+        ("#ifdef OTHER\nx\n#elif defined(WOS_SELFTEST)\nTARGET", True),
+        ("#ifdef WOS_SELFTEST\nx\n#elif defined(OTHER)\nTARGET", False),
+        ("#if defined(WOS_SELFTEST) || defined(OTHER)\nTARGET", False),
+        ("// #ifdef WOS_SELFTEST\nTARGET", False),
+        ('const char* marker = "#ifdef WOS_SELFTEST";\nTARGET', False),
+        ("TARGET", False),
+    ]
+    for source, expected in cases:
+        if inside_wos_selftest(source, source.index("TARGET")) != expected:
+            fail(f"diagnostic conditional nesting mismatch: {source!r}")
+
+
+    source = "{\n#ifdef WOS_SELFTEST\nif (diagnostic) {\n#else\nif (normal) {\n#endif\nx; }\n}TAIL"
+    if find_matching_brace(source, 0) != source.index("}TAIL"):
+        fail("diagnostic alternative opening braces must preserve original offsets")
+    source = "{\n#ifndef WOS_SELFTEST\nif (normal) {\n#else\nif (diagnostic) {\n#endif\nx; }\n}TAIL"
+    if find_matching_brace(source, 0) != source.index("}TAIL"):
+        fail("negative diagnostic branch must select the real diagnostic else")
 
 
 def require_code(source: str, tokens: list[str], description: str) -> None:
@@ -209,23 +291,21 @@ def test_raw_translation_exceptions_are_only_unpublished_images() -> None:
     # Three named private-root native fixtures and the bounded vacancy observation
     # of the explicitly unpublished producer are the only additional sites.
     start = vmem_source.find("auto selftest_file_mapping_admission(")
-    if start < 0 or vmem_source.rfind("#ifdef WOS_SELFTEST", 0, start) <= vmem_source.rfind("#endif", 0, start):
+    if not inside_wos_selftest(vmem_source, start):
         fail("VMEM named fixture must remain inside WOS_SELFTEST")
     brace = vmem_source.find("{", start)
     end = find_matching_brace(vmem_source, brace) + 1
     fixture = vmem_source[brace + 1 : end - 1]
     remaining = vmem_source[:start] + vmem_source[end:]
     projection_start = remaining.find("auto selftest_lazy_file_projection(")
-    if (projection_start < 0 or remaining.rfind("#ifdef WOS_SELFTEST", 0, projection_start)
-            <= remaining.rfind("#endif", 0, projection_start)):
+    if not inside_wos_selftest(remaining, projection_start):
         fail("VMEM projection fixture must remain inside WOS_SELFTEST")
     projection_brace = remaining.find("{", projection_start)
     projection_end = find_matching_brace(remaining, projection_brace) + 1
     projection = remaining[projection_brace + 1 : projection_end - 1]
     remaining = remaining[:projection_start] + remaining[projection_end:]
     zero_start = remaining.find("auto selftest_map_anonymous_zero_page(")
-    if (zero_start < 0 or remaining.rfind("#ifdef WOS_SELFTEST", 0, zero_start)
-            <= remaining.rfind("#endif", 0, zero_start)):
+    if not inside_wos_selftest(remaining, zero_start):
         fail("VMEM genuine-zero fixture must remain inside WOS_SELFTEST")
     zero_brace = remaining.find("{", zero_start)
     zero_end = find_matching_brace(remaining, zero_brace) + 1
@@ -252,8 +332,7 @@ def test_raw_translation_exceptions_are_only_unpublished_images() -> None:
         if forbidden in zero:
             fail(f"VMEM genuine-zero fixture must delegate real singleton ownership: {forbidden}")
     reserved_start = remaining.find("auto selftest_materialize_anonymous_reserved(")
-    if (reserved_start < 0 or remaining.rfind("#ifdef WOS_SELFTEST", 0, reserved_start)
-            <= remaining.rfind("#endif", 0, reserved_start)):
+    if not inside_wos_selftest(remaining, reserved_start):
         fail("VMEM reserved-page fixture must remain inside WOS_SELFTEST")
     reserved_brace = remaining.find("{", reserved_start)
     reserved_end = find_matching_brace(remaining, reserved_brace) + 1
@@ -407,6 +486,7 @@ def test_transitive_address_consumers_do_not_raw_access_userspace() -> None:
 
 
 def main() -> None:
+    test_wos_selftest_conditional_nesting()
     test_register_to_pointer_conversions_are_closed()
     test_raw_translation_exceptions_are_only_unpublished_images()
     test_transitive_address_consumers_do_not_raw_access_userspace()

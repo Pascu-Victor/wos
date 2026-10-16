@@ -632,9 +632,8 @@ inline auto active_task_slot(uint32_t index) -> task::Task*& {
 
 auto is_kernel_thread_shutdown_target(task::Task* task, task::Task* current) -> bool {
     return task != nullptr && task != current && task != file_retirement_executor_task.load(std::memory_order_acquire) &&
-           task->type == task::TaskType::DAEMON &&
-           task->state.load(std::memory_order_acquire) == task::TaskState::ACTIVE && !task->has_exited && task->kthread_entry != nullptr &&
-           task->context.syscall_kernel_stack != 0;
+           task->type == task::TaskType::DAEMON && task->state.load(std::memory_order_acquire) == task::TaskState::ACTIVE &&
+           !task->has_exited && task->kthread_entry != nullptr && task->context.syscall_kernel_stack != 0;
 }
 
 auto count_kernel_thread_shutdown_targets(task::Task* current) -> size_t {
@@ -3901,9 +3900,9 @@ auto post_task_pinned_cpu(uint64_t cpu_no, task::Task* task) -> bool {
 }
 
 auto post_task_waiting(task::Task* task) -> bool {
-    if (task == nullptr || task->native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr ||
-        run_queues == nullptr || task->pid == 0 || task->sched_queue != task::Task::sched_queue::NONE ||
-        task->heap_index >= 0 || task->sched_next != nullptr || task == get_current_task()) {
+    if (task == nullptr || task->native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr || run_queues == nullptr ||
+        task->pid == 0 || task->sched_queue != task::Task::sched_queue::NONE || task->heap_index >= 0 || task->sched_next != nullptr ||
+        task == get_current_task()) {
         return false;
     }
     auto task_state = task->state.load(std::memory_order_acquire);
@@ -4916,17 +4915,16 @@ auto kernel_threads_shutdown_requested() -> bool { return kernel_thread_shutdown
 
 auto FileRetirementSchedulerPort::install(task::Task& worker, void (*entry)(), void* context) noexcept -> bool {
     uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
-    bool const FRESH = !kernel_thread_shutdown_requested.load(std::memory_order_acquire) &&
+    bool const FRESH =
+        !kernel_thread_shutdown_requested.load(std::memory_order_acquire) &&
         file_retirement_executor_task.load(std::memory_order_acquire) == nullptr && entry != nullptr && context != nullptr &&
         worker.type == task::TaskType::DAEMON && worker.state.load(std::memory_order_acquire) == task::TaskState::ACTIVE &&
         !worker.has_exited && !worker.exit_in_progress && !worker.scheduler_published.load(std::memory_order_acquire) &&
         worker.active_registry_index == task::Task::ACTIVE_REGISTRY_INDEX_INVALID &&
-        worker.sched_list_owner.load(std::memory_order_acquire) == nullptr &&
-        worker.sched_queue == task::Task::sched_queue::NONE && worker.heap_index == -1 && worker.pid != 0 &&
-        worker.pagemap == mm::virt::get_kernel_pagemap() && worker.context.syscall_kernel_stack != 0 &&
-        worker.kthread_entry == entry && worker.kernel_thread_context == context &&
-        !worker.kernel_shutdown_requested.load(std::memory_order_acquire) &&
-        (!can_query_current_task() || get_current_task() != &worker);
+        worker.sched_list_owner.load(std::memory_order_acquire) == nullptr && worker.sched_queue == task::Task::sched_queue::NONE &&
+        worker.heap_index == -1 && worker.pid != 0 && worker.pagemap == mm::virt::get_kernel_pagemap() &&
+        worker.context.syscall_kernel_stack != 0 && worker.kthread_entry == entry && worker.kernel_thread_context == context &&
+        !worker.kernel_shutdown_requested.load(std::memory_order_acquire) && (!can_query_current_task() || get_current_task() != &worker);
     bool acquired = false;
     if (FRESH) {
         uint32_t refs = worker.ref_count.load(std::memory_order_acquire);
@@ -4949,15 +4947,14 @@ auto FileRetirementSchedulerPort::install(task::Task& worker, void (*entry)(), v
 auto FileRetirementSchedulerPort::remove(task::Task& worker) noexcept -> bool {
     uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
     bool const UNPOSTED = !worker.scheduler_published.load(std::memory_order_acquire) &&
-        worker.state.load(std::memory_order_acquire) == task::TaskState::ACTIVE &&
-        worker.active_registry_index == task::Task::ACTIVE_REGISTRY_INDEX_INVALID &&
-        worker.sched_queue == task::Task::sched_queue::NONE && worker.heap_index == -1 &&
-        worker.sched_list_owner.load(std::memory_order_acquire) == nullptr;
-    bool const FINISHED = worker.state.load(std::memory_order_acquire) == task::TaskState::DEAD &&
-        worker.kernel_thread_context == nullptr;
+                          worker.state.load(std::memory_order_acquire) == task::TaskState::ACTIVE &&
+                          worker.active_registry_index == task::Task::ACTIVE_REGISTRY_INDEX_INVALID &&
+                          worker.sched_queue == task::Task::sched_queue::NONE && worker.heap_index == -1 &&
+                          worker.sched_list_owner.load(std::memory_order_acquire) == nullptr;
+    bool const FINISHED = worker.state.load(std::memory_order_acquire) == task::TaskState::DEAD && worker.kernel_thread_context == nullptr;
     bool const REMOVE = file_retirement_executor_task.load(std::memory_order_acquire) == &worker &&
-        worker.kthread_entry == file_retirement_executor_entry &&
-        ((UNPOSTED && worker.kernel_thread_context == file_retirement_executor_context) || FINISHED);
+                        worker.kthread_entry == file_retirement_executor_entry &&
+                        ((UNPOSTED && worker.kernel_thread_context == file_retirement_executor_context) || FINISHED);
     if (REMOVE) {
         file_retirement_executor_task.store(nullptr, std::memory_order_release);
         file_retirement_executor_entry = nullptr;
@@ -4986,9 +4983,8 @@ void maybe_exit_current_kernel_thread_for_shutdown() {
     }
 
     auto* task = get_current_task();
-    if (task == nullptr || task == file_retirement_executor_task.load(std::memory_order_acquire) ||
-        task->type != task::TaskType::DAEMON || task->exit_in_progress ||
-        !task->kernel_shutdown_requested.load(std::memory_order_acquire)) {
+    if (task == nullptr || task == file_retirement_executor_task.load(std::memory_order_acquire) || task->type != task::TaskType::DAEMON ||
+        task->exit_in_progress || !task->kernel_shutdown_requested.load(std::memory_order_acquire)) {
         return;
     }
 
@@ -9490,6 +9486,53 @@ size_t get_scheduler_runqueue_task_states(uint64_t cpu_no, SchedulerRunQueueTask
         return count;
     });
 }
+
+#ifdef WOS_SELFTEST
+auto scheduler_selftest_observe_reclaim_waiter(task::Task& subject, ReclaimWaitObservation& out) -> ReclaimWaitObservationStatus {
+    constexpr uint32_t WAIT_LIMIT = 1024;
+    uint64_t const CPUS = smt::get_core_count();
+    if (run_queues == nullptr || CPUS == 0 || CPUS > 64) return ReclaimWaitObservationStatus::INCOMPLETE;
+    // Small live local storage is initialized before any RQ acquisition. The
+    // caller's output is touched only after unlock; no sret crosses the lock.
+    ReclaimWaitObservation local{};
+    for (uint64_t cpu = 0; cpu < CPUS; ++cpu) {
+        auto const STATUS = run_queues->with_lock(cpu, [&subject, &local, cpu](RunQueue* rq) -> ReclaimWaitObservationStatus {
+            if (rq == nullptr || rq->wait_list.count > WAIT_LIMIT) return ReclaimWaitObservationStatus::INCOMPLETE;
+            auto* cursor = rq->wait_list.head;
+            uint32_t seen = 0;
+            bool found = false;
+            while (cursor != nullptr && seen < WAIT_LIMIT && seen <= rq->wait_list.count) {
+                found |= cursor == &subject;
+                cursor = cursor->sched_next;
+                ++seen;
+            }
+            if (cursor != nullptr || seen != rq->wait_list.count) return ReclaimWaitObservationStatus::INCOMPLETE;
+            if (!found) return ReclaimWaitObservationStatus::NOT_OBSERVED;
+            // Membership was located and the entire bounded list validated
+            // under this exact RQ before any subject non-atomic state read.
+            if (subject.type != task::TaskType::DAEMON || subject.state.load(std::memory_order_acquire) != task::TaskState::ACTIVE ||
+                subject.gc_queued.load(std::memory_order_acquire) || !subject.scheduler_published.load(std::memory_order_acquire) ||
+                subject.sched_queue != task::Task::sched_queue::WAITING || subject.heap_index != -1 ||
+                subject.sched_list_owner.load(std::memory_order_acquire) != &rq->wait_list || subject.wake_at_us != 0 ||
+                rq->current_task == &subject || rq->handoff_task == &subject)
+                return ReclaimWaitObservationStatus::INCOMPLETE;
+            local.pid = subject.pid;
+            local.cpu = cpu;
+            local.refs = subject.ref_count.load(std::memory_order_acquire);
+            local.current = false;
+            local.handoff = false;
+            local.wakeup_pending = subject.wakeup_pending.load(std::memory_order_acquire);
+            return ReclaimWaitObservationStatus::FOUND_WAITING;
+        });
+        if (STATUS == ReclaimWaitObservationStatus::INCOMPLETE) return STATUS;
+        if (STATUS == ReclaimWaitObservationStatus::FOUND_WAITING) {
+            out = local;
+            return STATUS;
+        }
+    }
+    return ReclaimWaitObservationStatus::NOT_OBSERVED;
+}
+#endif
 
 void dump_scheduler_trace_stats() {
     if (run_queues == nullptr) {

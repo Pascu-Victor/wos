@@ -1,3 +1,6 @@
+#ifdef WOS_SELFTEST
+#include <test/numa_lifecycle_mm_debt.hpp>
+#endif
 #include "exec.hpp"
 
 #ifdef WOS_SELFTEST
@@ -1347,7 +1350,14 @@ auto append_exec_lazy_file_ranges(LazyVmemRangeVec& out, const loader::elf::ElfL
         if (!out.push_back(RANGE)) {
             return false;
         }
+#ifdef WOS_SELFTEST
+        ::ker::test::numa_lifecycle::mm_debt::begin_change();
+#endif
         vfs::vfs_retain_file(file);
+#ifdef WOS_SELFTEST
+        ::ker::test::numa_lifecycle::mm_debt::add_lazy_row(static_cast<uint8_t>(RANGE.kind));
+        ::ker::test::numa_lifecycle::mm_debt::end_change();
+#endif
     }
     return true;
 }
@@ -2833,13 +2843,17 @@ auto make_exec_selftest_owned_image(bool& consumed, ker::mod::mm::numa::Policy m
         LazyVmemRange range{};
         range.kind = LazyVmemKind::FILE_BACKED;
         range.file = file;
+        ::ker::test::numa_lifecycle::mm_debt::begin_change();
         if (!ranges.push_back(range)) {
+            ::ker::test::numa_lifecycle::mm_debt::end_change();
             vfs::vfs_put_file(file);
             delete[] buffer;
             delete[] name;
             return nullptr;
         }
         vfs::vfs_retain_file(file);
+        ::ker::test::numa_lifecycle::mm_debt::add_lazy_row(static_cast<uint8_t>(range.kind));
+        ::ker::test::numa_lifecycle::mm_debt::end_change();
         NativeExecImage const IMAGE{
             .entry = 0,
             .program_header_addr = 0,
