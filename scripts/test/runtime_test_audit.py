@@ -282,12 +282,24 @@ def testd_expected_pass_labels() -> list[str]:
     return labels
 
 
-def userland_expected_cases() -> set[str]:
+def userland_expected_cases(*, userland_timing_version: int = 0) -> set[str]:
+    if type(userland_timing_version) is not int or userland_timing_version not in (0, 1):
+        raise AuditError("unsupported userland timing version")
     source = USERLAND_SUITE.read_text()
-    cases = {match.group("name") for match in USERLAND_CASE_RE.finditer(source)}
-    if not cases:
-        raise AuditError("no userland suite cases found in source manifest")
-    return cases
+    begin = "# UMA_TIMING_BEGIN fork_cow\n"
+    end = "# UMA_TIMING_END fork_cow\n"
+    markers = [line for line in source.splitlines(keepends=True)
+               if re.search(r"UMA_TIMING_(?:BEGIN|END)\s+fork_cow\b", line)]
+    if markers != [begin, end]:
+        raise AuditError("malformed userland timing catalogue markers")
+    first = source.index(begin)
+    last = source.index(end, first) + len(end)
+    ordinary = source[:first] + source[last:]
+    default_cases = {match.group("name") for match in USERLAND_CASE_RE.finditer(ordinary)}
+    timing_cases = {match.group("name") for match in USERLAND_CASE_RE.finditer(source)}
+    if len(default_cases) != 116 or len(timing_cases) != 117 or timing_cases - default_cases != {"fork_cow"} or not default_cases <= timing_cases:
+        raise AuditError("invalid userland timing catalogue: expected default116 and version1-117 differing only by fork_cow")
+    return timing_cases if userland_timing_version == 1 else default_cases
 
 
 def audit_ktest_text(text: str) -> AuditResult:
@@ -409,8 +421,8 @@ def audit_testd_text(text: str) -> AuditResult:
     return AuditResult(kind="testd", passed=summary[0], failed=summary[1], detail=f"{len(expected_labels)} PASS labels matched")
 
 
-def audit_userland_text(text: str, allow_skips: bool = False) -> AuditResult:
-    expected_cases = userland_expected_cases()
+def audit_userland_text(text: str, allow_skips: bool = False, *, userland_timing_version: int = 0) -> AuditResult:
+    expected_cases = userland_expected_cases(userland_timing_version=userland_timing_version)
     lines = _latest_block(text.splitlines(), USERLAND_BLOCK_START_RE, USERLAND_COUNTS_RE, "userland suite")
     rows: list[tuple[str, str, str]] = []
     counts: tuple[int, int, int] | None = None
@@ -465,7 +477,9 @@ def audit_userland_text(text: str, allow_skips: bool = False) -> AuditResult:
     )
 
 
-def audit_log(log_path: Path, kind: str, allow_userland_skips: bool = False) -> list[AuditResult]:
+def audit_log(log_path: Path, kind: str, allow_userland_skips: bool = False, *, userland_timing_version: int = 0) -> list[AuditResult]:
+    if type(userland_timing_version) is not int or userland_timing_version not in (0, 1):
+        raise AuditError("unsupported userland timing version")
     text = log_path.read_text(errors="replace")
     selected: list[str]
     if kind == "auto":
@@ -496,13 +510,15 @@ def audit_log(log_path: Path, kind: str, allow_userland_skips: bool = False) -> 
     if "testd" in selected:
         results.append(audit_testd_text(text))
     if "userland" in selected:
-        results.append(audit_userland_text(text, allow_skips=allow_userland_skips))
+        results.append(audit_userland_text(text, allow_skips=allow_userland_skips, userland_timing_version=userland_timing_version))
     return results
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Audit completed WOS runtime logs against the current source manifest")
     parser.add_argument("--kind", choices=("auto", "ktest", "testd", "both", "userland", "all"), default="auto")
+    parser.add_argument("--userland-timing-version", type=int, choices=(0, 1), default=0,
+                        help="Explicit summary catalogue: default116 (0) or opt-in timing117 (1); timing transport needs its separate decoder")
     parser.add_argument(
         "--allow-userland-skips",
         action="store_true",
@@ -512,7 +528,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        results = audit_log(args.log, args.kind, allow_userland_skips=args.allow_userland_skips)
+        results = audit_log(args.log, args.kind, allow_userland_skips=args.allow_userland_skips,
+                            userland_timing_version=args.userland_timing_version)
     except AuditError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

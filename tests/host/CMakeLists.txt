@@ -367,6 +367,22 @@ add_test(NAME numa_chase_runtime_test
         --cxx ${CMAKE_CXX_COMPILER})
 set_tests_properties(numa_chase_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 140)
 
+# Portable UMA reference fixtures keep owned cleanup inside their driver budgets.
+add_test(NAME uma_reference_timing_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/uma_reference_timing_test.py
+        --source-root ${CMAKE_CURRENT_SOURCE_DIR}/../.. --cxx ${CMAKE_CXX_COMPILER})
+set_tests_properties(uma_reference_timing_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 130)
+add_test(NAME uma_reference_owner_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/uma_reference_owner_test.py
+        --root ${CMAKE_CURRENT_SOURCE_DIR}/../.. --source-root ${CMAKE_CURRENT_SOURCE_DIR}/../..
+        --cxx ${CMAKE_CXX_COMPILER})
+add_test(NAME uma_reference_arm_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/uma_reference_arm_test.py
+        --root ${CMAKE_CURRENT_SOURCE_DIR}/../.. --source-root ${CMAKE_CURRENT_SOURCE_DIR}/../..
+        --cxx ${CMAKE_CXX_COMPILER})
+set_tests_properties(uma_reference_owner_test uma_reference_arm_test
+    PROPERTIES LABELS "unit;host;runtime" TIMEOUT 120)
+
 add_test(NAME anonymous_prepared_pagein_runtime_test
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/anonymous_prepared_pagein_runtime_test.py
         --host-build ${CMAKE_BINARY_DIR})

@@ -473,6 +473,110 @@ def test_cli_auto_without_markers_fails(module) -> None:
         raise AssertionError(f"missing no-marker error in stderr: {result.stderr}")
 
 
+def versioned_userland_log(module, version: int) -> str:
+    cases = sorted(module.userland_expected_cases(userland_timing_version=version))
+    return ("=== WOS USERLAND SUITE SUMMARY ===\n"
+            + "".join(f"{case}\tPASS\t1s\n" for case in cases)
+            + f"PASS={len(cases)} FAIL=0 SKIP=0\n")
+
+
+def test_userland_explicit_catalogue_versions(module) -> None:
+    ordinary = module.userland_expected_cases()
+    timing = module.userland_expected_cases(userland_timing_version=1)
+    if len(ordinary) != 116 or len(timing) != 117 or timing - ordinary != {"fork_cow"} or not ordinary <= timing:
+        raise AssertionError("explicit catalogue difference changed")
+    zero = versioned_userland_log(module, 0)
+    one = versioned_userland_log(module, 1)
+    if module.audit_userland_text(zero).passed != 116:
+        raise AssertionError("default audit did not retain ordinary116")
+    if module.audit_userland_text(one, userland_timing_version=1).passed != 117:
+        raise AssertionError("explicit timing audit did not account for117")
+    expect_raises(lambda: module.audit_userland_text(one), "unexpected case rows fork_cow")
+    expect_raises(lambda: module.audit_userland_text(zero, userland_timing_version=1), "missing case rows fork_cow")
+    for version in (-1, 2, "1", True):
+        expect_raises(lambda v=version: module.userland_expected_cases(userland_timing_version=v), "unsupported userland timing version")
+        expect_raises(lambda v=version: module.audit_userland_text(zero, userland_timing_version=v), "unsupported userland timing version")
+
+
+def test_userland_versioned_errors_remain_strict(module) -> None:
+    for version in (0, 1):
+        cases = sorted(module.userland_expected_cases(userland_timing_version=version))
+        log = versioned_userland_log(module, version)
+        row = f"{cases[0]}\tPASS\t1s\n"
+        bad_logs = [
+            (log.replace(row, "", 1), "missing case rows"),
+            (log.replace(row, row + row, 1), "duplicate case rows"),
+            (log.replace(row, f"{cases[0]}\tFAIL\trc=7 1s\n", 1), "failed cases"),
+            (log.replace(row, row + "unknown_case\tPASS\t1s\n", 1), "unexpected case rows"),
+            (log.replace(f"PASS={len(cases)}", f"PASS={len(cases) - 1}"), "count mismatch"),
+            (log + "=== WOS USERLAND SUITE SUMMARY ===\n", "newer incomplete run block"),
+        ]
+        for bad, reason in bad_logs:
+            expect_raises(lambda b=bad: module.audit_userland_text(b, userland_timing_version=version), reason)
+        skipped = log.replace(row, f"{cases[0]}\tSKIP\tdependency\n", 1).replace(
+            f"PASS={len(cases)} FAIL=0 SKIP=0", f"PASS={len(cases) - 1} FAIL=0 SKIP=1")
+        expect_raises(lambda: module.audit_userland_text(skipped, userland_timing_version=version), "skipped cases")
+        if module.audit_userland_text(skipped, allow_skips=True, userland_timing_version=version).passed != len(cases) - 1:
+            raise AssertionError("explicit triage skip semantics changed")
+
+
+def test_userland_timing_marker_structure(module) -> None:
+    original = module.USERLAND_SUITE
+    source = original.read_text()
+    begin, end = "# UMA_TIMING_BEGIN fork_cow\n", "# UMA_TIMING_END fork_cow\n"
+    bad_sources = [
+        source.replace(begin, "", 1),
+        source.replace(end, "", 1),
+        source.replace(begin, begin + begin, 1),
+        source.replace(end, end + end, 1),
+        source.replace(begin, " " + begin, 1),
+        source.replace(begin, "# TIMING_SWAP\n", 1).replace(end, begin, 1).replace("# TIMING_SWAP\n", end, 1),
+        source.replace("    run_case fork_cow case_fork_cow\n", "", 1),
+        source + "run_case fork_cow escaped_optin\n",
+        source.replace("    run_case fork_cow case_fork_cow\n", "    run_case unexpected_new_case body\n", 1),
+    ]
+    with tempfile.TemporaryDirectory(prefix="wos-audit-timing-markers-") as tmp:
+        path = Path(tmp) / "suite.sh"
+        try:
+            module.USERLAND_SUITE = path
+            for changed in bad_sources:
+                path.write_text(changed)
+                for version in (0, 1):
+                    expect_raises(lambda v=version: module.userland_expected_cases(userland_timing_version=v), "timing catalogue")
+        finally:
+            module.USERLAND_SUITE = original
+
+
+def test_cli_explicit_userland_version(module) -> None:
+    with tempfile.TemporaryDirectory(prefix="wos-audit-timing-cli-") as tmp:
+        logs = []
+        for version in (0, 1):
+            path = Path(tmp) / f"version{version}.log"
+            path.write_text(versioned_userland_log(module, version))
+            logs.append(path)
+        for selected in (0, 1):
+            for actual in (0, 1):
+                command = [sys.executable, str(AUDIT_SCRIPT), "--kind", "userland",
+                           "--userland-timing-version", str(selected), str(logs[actual])]
+                result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=10)
+                if (result.returncode == 0) != (selected == actual):
+                    raise AssertionError(f"CLI selected{selected}/actual{actual}: {result.stdout} {result.stderr}")
+                if selected == actual:
+                    if "userland: PASS" not in result.stdout:
+                        raise AssertionError("CLI did not pass selected catalogue")
+                elif "case rows fork_cow" not in result.stderr:
+                    raise AssertionError("CLI did not refuse the exact cross-version case")
+        default = module.audit_log(logs[0], "userland")
+        selected = module.audit_log(logs[1], "userland", userland_timing_version=1)
+        if default[0].passed != 116 or selected[0].passed != 117:
+            raise AssertionError("audit_log keyword forwarding changed")
+        expect_raises(lambda: module.audit_log(logs[1], "userland"), "unexpected case rows fork_cow")
+        invalid = subprocess.run([sys.executable, str(AUDIT_SCRIPT), "--userland-timing-version", "2", str(logs[0])],
+                                 capture_output=True, text=True, check=False, timeout=10)
+        if invalid.returncode != 2 or "invalid choice" not in invalid.stderr:
+            raise AssertionError("CLI accepted unsupported timing version")
+
+
 def main() -> None:
     module = load_module()
     tests = [
@@ -508,6 +612,10 @@ def main() -> None:
         test_cli_userland_skip_requires_allow_flag,
         test_cli_auto_serial_ktest_passes,
         test_cli_auto_without_markers_fails,
+        test_userland_explicit_catalogue_versions,
+        test_userland_versioned_errors_remain_strict,
+        test_userland_timing_marker_structure,
+        test_cli_explicit_userland_version,
     ]
     for test in tests:
         test(module)

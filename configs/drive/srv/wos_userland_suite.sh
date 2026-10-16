@@ -177,6 +177,30 @@ case "$SUITE_SHUTDOWN" in
         ;;
 esac
 
+# UMA_TIMING_BEGIN configuration
+if [ -n "${WOS_SUITE_TIMING_VERSION:-}" ]; then
+    if [ "$WOS_SUITE_TIMING_VERSION" != 1 ]; then exit 126; fi
+    case "${WOS_SUITE_TIMING_PHASE:-}" in warmup|measure) ;; *) exit 126 ;; esac
+    case "${WOS_SUITE_TIMING_NONCE:-}" in ""|*[!0-9a-f]*) exit 126 ;; esac
+    [ "${#WOS_SUITE_TIMING_NONCE}" -eq 32 ] || exit 126
+    case "${WOS_SUITE_TIMING_DEADLINE_NS:-}" in ""|0|0*|*[!0-9]*) exit 126 ;; esac
+    [ "$SCALE" = full ] && [ "$ARTIFACT_ROOT" = "/var/lib/uma-reference/$WOS_SUITE_TIMING_PHASE" ] &&
+        [ "$RUN_ID" = "uma-reference-$WOS_SUITE_TIMING_PHASE" ] &&
+        [ "$COMMAND_MATRIX_ROOT" = "/root/wos-uma-reference/$WOS_SUITE_TIMING_PHASE" ] &&
+        [ "$BEE_ITERATIONS" = 1000 ] && [ "$DATA_MIB" = 64 ] && [ "$DATA_FILE_OWNED" = 1 ] &&
+        [ "$VFS_READ_SIZE" = 65536 ] && [ "$VFS_READ_ITERATIONS" = 4 ] && [ "$VFS_STAT_ITERATIONS" = 10000 ] &&
+        [ "$MANDEL_WIDTH" = 1600 ] && [ "$MANDEL_HEIGHT" = 900 ] && [ "$MANDEL_MAX_ITER" = 3000 ] &&
+        [ "$MANDEL_REPEAT" = 2 ] && [ "$MANDEL_THREADS" = 8 ] && [ "$MANDEL_NODES" = uma-reference-vm0 ] &&
+        [ "$RENDER_SCENE" = /srv/Duck.glb ] && [ "$RENDER_WIDTH" = 1280 ] && [ "$RENDER_HEIGHT" = 720 ] &&
+        [ "$RENDER_SPP" = 16 ] && [ "$RENDER_MAX_DEPTH" = 6 ] && [ "$RENDER_TILE_SIZE" = 24 ] && [ "$RENDER_THREADS" = 0 ] &&
+        [ "$NETBENCH_PORT" = 9100 ] && [ "$NETBENCH_PAYLOAD_SIZE" = 4096 ] && [ "$NETBENCH_ITERATIONS" = 2000 ] &&
+        [ "$NETBENCH_TOTAL_BYTES" = 67108864 ] && [ "$NETBENCH_STARTUP_SECONDS" = 1 ] && [ "$NETBENCH_TIMEOUT_MS" = 30000 ] &&
+        [ "$NETBENCH_CASE_TIMEOUT_SECONDS" = 120 ] && [ "$CASE_TIMEOUT_SECONDS" = 900 ] &&
+        [ "$TIMEOUT_KILL_GRACE_SECONDS" = 5 ] && [ "$RUN_TESTD$RUN_TESTPROG_PERF$RUN_STRACE$RUN_PERF_TRACE" = 1111 ] &&
+        [ "$KEEP_LARGE_WORK" = 0 ] && [ "$SUITE_SHUTDOWN" = 0 ] || exit 126
+fi
+
+# UMA_TIMING_END configuration
 mkdir -p "$LOG_DIR" "$WORK_DIR"
 rm -f "$SUMMARY_FILE"
 ln -sfn "$ARTIFACT_ROOT" /tmp/wos-userland-suite-latest 2>/dev/null || true
@@ -269,10 +293,37 @@ run_case() {
             *m*) case_has_group=1 ;;
         esac
         (
+            # UMA_TIMING_BEGIN child
+            if [ "${WOS_SUITE_TIMING_VERSION:-}" = 1 ]; then
+                timing_case_name="$name"
+                effective_status=126
+                if /usr/libexec/wos-uma-reference --begin "$WOS_SUITE_TIMING_PHASE" "$timing_case_name" "$WOS_SUITE_TIMING_NONCE" "$WOS_SUITE_TIMING_DEADLINE_NS"; then
+                    "$@"
+                    body_status="$?"
+                    effective_status="$body_status"
+                    if ! /usr/libexec/wos-uma-reference --end "$WOS_SUITE_TIMING_PHASE" "$timing_case_name" "$WOS_SUITE_TIMING_NONCE" "$WOS_SUITE_TIMING_DEADLINE_NS" "$body_status"; then
+                        effective_status=126
+                    fi
+                fi
+                printf '%s\n' "$effective_status" > "$case_status"
+                exit "$effective_status"
+            else
+            # UMA_TIMING_END child
             "$@"
             printf '%s\n' "$?" > "$case_status"
+            # UMA_TIMING_BEGIN child_end
+            fi
+            # UMA_TIMING_END child_end
         ) > "$log" 2>&1 &
         case_pid="$!"
+        # UMA_TIMING_BEGIN parent
+        if [ "${WOS_SUITE_TIMING_VERSION:-}" = 1 ]; then
+            timing_waited=0
+            timing_wait_status=126
+            timing_parent_ok=1
+            /usr/libexec/wos-uma-reference --parent "$WOS_SUITE_TIMING_PHASE" "$name" "$WOS_SUITE_TIMING_NONCE" "$WOS_SUITE_TIMING_DEADLINE_NS" "$case_pid" "$$" || timing_parent_ok=0
+        fi
+        # UMA_TIMING_END parent
         (
             trap 'exit 0' TERM INT HUP
 
@@ -289,6 +340,12 @@ run_case() {
                 exit 0
             fi
 
+            # UMA_TIMING_BEGIN watchdog_timeout
+            if [ "${WOS_SUITE_TIMING_VERSION:-}" = 1 ]; then
+                printf 'timeout after %ss\n' "$CASE_TIMEOUT_SECONDS" > "$timeout_marker"
+                exit 0
+            fi
+            # UMA_TIMING_END watchdog_timeout
             if [ "$case_has_group" -eq 1 ]; then
                 kill -TERM "-$case_pid" >/dev/null 2>&1 || kill "$case_pid" >/dev/null 2>&1 || true
             else
@@ -333,12 +390,34 @@ run_case() {
         done
         if [ -f "$case_status" ]; then
             rc="$(status_file_value "$case_status")"
+            # UMA_TIMING_BEGIN consuming_wait
+            if [ "${WOS_SUITE_TIMING_VERSION:-}" = 1 ]; then
+                wait "$case_pid" 2>/dev/null
+                timing_wait_status="$?"
+                timing_waited=1
+            else
+            # UMA_TIMING_END consuming_wait
             wait "$case_pid" 2>/dev/null || true
+            # UMA_TIMING_BEGIN consuming_wait_end
+            fi
+            # UMA_TIMING_END consuming_wait_end
         fi
         wait "$watchdog_pid" 2>/dev/null || true
+        # UMA_TIMING_BEGIN final_wait
+        if [ "${WOS_SUITE_TIMING_VERSION:-}" = 1 ]; then
+            if [ "$timing_waited" = 0 ]; then
+                wait "$case_pid" 2>/dev/null
+                timing_wait_status="$?"
+                timing_waited=1
+            fi
+        else
+        # UMA_TIMING_END final_wait
         if [ ! -f "$case_status" ]; then
             wait "$case_pid" 2>/dev/null || true
         fi
+        # UMA_TIMING_BEGIN final_wait_end
+        fi
+        # UMA_TIMING_END final_wait_end
 
         if [ -f "$timeout_marker" ]; then
             timed_out=1
@@ -350,6 +429,13 @@ run_case() {
         "$@" > "$log" 2>&1
         rc="$?"
     fi
+    # UMA_TIMING_BEGIN joined_wait
+    if [ "${WOS_SUITE_TIMING_VERSION:-}" = 1 ]; then
+        if [ "$timing_parent_ok" != 1 ] || ! /usr/libexec/wos-uma-reference --wait "$WOS_SUITE_TIMING_PHASE" "$name" "$WOS_SUITE_TIMING_NONCE" "$WOS_SUITE_TIMING_DEADLINE_NS" "$case_pid" "$$" "$rc" "$timing_wait_status" "$timed_out"; then
+            if [ "$rc" = 0 ]; then rc=126; fi
+        fi
+    fi
+    # UMA_TIMING_END joined_wait
     if [ "$timed_out" -eq 1 ]; then
         printf 'case log retained at %s after timeout\n' "$log"
     else
@@ -941,6 +1027,15 @@ else
     skip_case perf_trace_vfs "missing executable: /usr/bin/perf"
 fi
 
+# UMA_TIMING_BEGIN fork_cow
+if [ "${WOS_SUITE_TIMING_VERSION:-}" = 1 ]; then
+    case_fork_cow() {
+        /usr/bin/testprog fork-cow --bytes 32m --children 4 --iterations 5 --write-pages 256 --child-timeout-ms 30000
+    }
+    run_case fork_cow case_fork_cow
+fi
+
+# UMA_TIMING_END fork_cow
 if [ "$FAIL" -eq 0 ]; then
     cleanup_large_work
 elif [ "$KEEP_LARGE_WORK" != "1" ]; then
