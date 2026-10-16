@@ -422,6 +422,12 @@ def test_userland_suite_registers_command_matrix() -> None:
 def test_userland_suite_cases_are_watchdog_bounded() -> None:
     source = USERLAND_SUITE.read_text()
     run_case = shell_function_body(source, "run_case")
+    # The opt-in timing arm delegates cancellation to its owned controller.
+    # Keep this existing watchdog oracle on the default branch's TERM/grace/KILL.
+    timing_timeout = '            # UMA_TIMING_BEGIN watchdog_timeout\n            if [ "${WOS_SUITE_TIMING_VERSION:-}" = 1 ]; then\n                printf \'timeout after %ss\\n\' "$CASE_TIMEOUT_SECONDS" > "$timeout_marker"\n                exit 0\n            fi\n            # UMA_TIMING_END watchdog_timeout\n'
+    if run_case.count(timing_timeout) != 1:
+        fail("missing exact opt-in watchdog dispatch")
+    run_case = run_case.replace(timing_timeout, "", 1)
     run_case_with_timeout = shell_function_body(source, "run_case_with_timeout")
     status_file_value = shell_function_body(source, "status_file_value")
     require_tokens(
