@@ -102,7 +102,10 @@ class RootfsDelta:
         current = ""
         for part in parts[1:-1]:
             current += "/" + part
-            self.add_dir(current)
+            # Child discovery must preserve a directory's declared permissions.
+            existing = self.entries.get(current)
+            if existing is None or existing.kind != "dir":
+                self.add_dir(current)
 
     def add_dir(self, target: str, mode: int = 0o755) -> None:
         target = self.normalize_target(target)

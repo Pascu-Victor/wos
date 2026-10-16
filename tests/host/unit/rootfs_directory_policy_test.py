@@ -23,6 +23,48 @@ qcow_spec.loader.exec_module(qcow)
 
 
 class DirectoryPolicy(unittest.TestCase):
+    def test_copied_directory_modes_survive_child_discovery(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir(mode=0o700)
+            (source / "nested").mkdir(mode=0o710)
+            (source / "nested/payload").write_bytes(b"private fixture\n")
+            (source / "alias").symlink_to("nested/payload")
+            full = root / "full"
+            full.mkdir()
+            script = '''
+source "$1/scripts/build/rootfs_common.sh"
+ROOTFS_REPO="$2"
+ROOTFS_STAGING="$2/full"
+ROOTFS_MANAGED_TMP="$2/managed"
+rootfs_copy_entry source /usr/libexec/private
+'''
+            subprocess.run(["bash", "-eu", "-c", script, "fixture", str(ROOT), str(root)], check=True)
+            args = argparse.Namespace(repo=ROOT, **{name: root / name for name in
+                ("staging", "cache", "new_cache", "stamp", "changed_paths", "tar_paths")})
+            collector = delta.RootfsDelta(args)
+            collector.add_source(source, "/usr/libexec/private")
+            collector.add_generated_file("/usr/libexec/private/nested/generated", b"generated\n")
+            modes = {"/usr/libexec/private": 0o700, "/usr/libexec/private/nested": 0o710}
+            for target, mode in modes.items():
+                self.assertEqual(collector.entries[target].mode, mode)
+                self.assertEqual((full / target.lstrip("/")).stat().st_mode & 0o7777, mode)
+            old = {target: entry.state_line() for target, entry in collector.entries.items()}
+            for target in modes:
+                old[target] = old[target].replace(f"\tdir\t{modes[target]:o}\t", "\tdir\t755\t")
+            self.assertEqual(collector.changed_targets(old), set(modes))
+            for target in sorted(collector.entries):
+                collector.stage_entry(collector.entries[target])
+            for target, mode in modes.items():
+                self.assertEqual((args.staging / target.lstrip("/")).stat().st_mode & 0o7777, mode)
+            self.assertEqual((args.staging / "usr/libexec/private/alias").read_bytes(), b"private fixture\n")
+            collector.write_state_files(set(modes))
+            self.assertEqual(collector.changed_targets(collector.read_state(args.new_cache)), set())
+            collector.add_dir("/usr/libexec/private", 0o750)
+            collector.add_generated_file("/usr/libexec/private/later", b"later\n")
+            self.assertEqual(collector.entries["/usr/libexec/private"].mode, 0o750)
+
     def test_non_power_of_two_allocation_groups_use_linear_disk_offsets(self):
         output = ("blocksize = 512\ndblocks = 30\nagblocks = 12\nagcount = 3\nagblklog = 4\n"
                   "core.mode = 0100644\ncore.size = 512\ncore.nblocks = 1\ncore.format = 2\n"
