@@ -2664,6 +2664,217 @@ auto migrate_anonymous_swap_area(void* /*context*/, uint32_t area_id) -> int {
     }
 }
 
+}  // namespace
+
+struct PreparedAnonymousSwapFork::Storage {
+    AnonymousSwapMapping** rows{};
+    size_t capacity{};
+};
+
+namespace detail {
+struct PreparedSwapForkAccess {
+    static auto ready_actor(sched::task::Task& actor, const sys::SyscallPreparationScope& preparation) -> bool {
+        return preparation.ready() && sched::can_query_current_task() && sched::get_current_task() == &actor &&
+               actor.type == sched::task::TaskType::PROCESS && actor.syscall_account_start_us != 0 &&
+               actor.state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE &&
+               !actor.scheduler_transition_active.load(std::memory_order_acquire) &&
+               !actor.usercopy_pagemap_closing.load(std::memory_order_acquire) && sched::preempt_count() == 0;
+    }
+    static auto roots_match(const PreparedAnonymousSwapFork& plan, PageTable* source, PageTable* destination) -> bool {
+        if (plan.actor_ == nullptr || plan.child_ == nullptr || plan.actor_->pagemap != source || plan.child_->pagemap != destination ||
+            plan.source_ != source || plan.destination_ != destination || plan.child_->has_run ||
+            plan.actor_->usercopy_pagemap_closing.load(std::memory_order_acquire) ||
+            plan.child_->usercopy_pagemap_closing.load(std::memory_order_acquire))
+            return false;
+        uint64_t source_serial = 0, destination_serial = 0;
+        return capture_user_root_incarnation(source, source_serial) && source_serial == plan.source_serial_ &&
+               capture_user_root_incarnation(destination, destination_serial) && destination_serial == plan.destination_serial_;
+    }
+    static auto count_locked(PageTable* source) -> size_t {
+        size_t count = 0;
+        for (auto* row = anonymous_swap_mappings; row != nullptr; row = row->next)
+            if (row->pagemap == source) ++count;
+        return count;
+    }
+    static void reset(PreparedAnonymousSwapFork& plan) noexcept {
+        if (plan.storage_ != nullptr) {
+            for (size_t i = 0; i < plan.storage_->capacity; ++i) {
+                auto* row = plan.storage_->rows != nullptr ? plan.storage_->rows[i] : nullptr;
+#ifdef WOS_SELFTEST
+                delete_swap_descriptor(row, DebtField::SWAP_MAPPINGS);
+#else
+                delete row;
+#endif
+            }
+            delete[] plan.storage_->rows;
+            delete plan.storage_;
+        }
+        plan.storage_ = nullptr;
+        plan.prepared_ = false;
+    }
+    static auto prepare(sched::task::Task& actor, sched::task::Task& child, const sys::SyscallPreparationScope& preparation,
+                        PreparedAnonymousSwapFork& plan) -> int {
+        if (plan.actor_ != nullptr || plan.storage_ != nullptr || plan.prepared_) return -EBUSY;
+        if (!ready_actor(actor, preparation) || !sched::interrupts_enabled()) return -EWOULDBLOCK;
+        if (&actor == &child || child.has_run || child.type != sched::task::TaskType::PROCESS ||
+            child.usercopy_pagemap_closing.load(std::memory_order_acquire))
+            return -EINVAL;
+        size_t count = 0;
+        {
+            ker::syscall::vmem::SharedVmemPublicationGuard publication;
+            if (!ready_actor(actor, preparation) || !sched::interrupts_enabled()) return -EAGAIN;
+            plan.source_ = actor.pagemap;
+            plan.destination_ = child.pagemap;
+            if (plan.source_ == nullptr || plan.destination_ == nullptr || plan.source_ == plan.destination_ ||
+                plan.source_ == get_kernel_pagemap() || plan.destination_ == get_kernel_pagemap() ||
+                !capture_user_root_incarnation(plan.source_, plan.source_serial_) ||
+                !capture_user_root_incarnation(plan.destination_, plan.destination_serial_))
+                return -EINVAL;
+            plan.actor_ = &actor;
+            plan.child_ = &child;
+            uint64_t const FLAGS = cow_pte_lock.lock_irqsave();
+            count = count_locked(plan.source_);
+            cow_pte_lock.unlock_irqrestore(FLAGS);
+        }
+        if (count != 0) {
+            if (count > SIZE_MAX / sizeof(AnonymousSwapMapping*)) return -EOVERFLOW;
+            plan.storage_ = new (std::nothrow) PreparedAnonymousSwapFork::Storage{};
+            if (plan.storage_ == nullptr) return -ENOMEM;
+            plan.storage_->rows = new (std::nothrow) AnonymousSwapMapping*[count]{};
+            if (plan.storage_->rows == nullptr) return -ENOMEM;
+            plan.storage_->capacity = count;
+            for (size_t i = 0; i < count; ++i) {
+#ifdef WOS_SELFTEST
+                debt::begin_change();
+#endif
+                plan.storage_->rows[i] = new (std::nothrow) AnonymousSwapMapping{};
+#ifdef WOS_SELFTEST
+                if (plan.storage_->rows[i] != nullptr) debt::add(DebtField::SWAP_MAPPINGS);
+                debt::end_change();
+#endif
+                if (plan.storage_->rows[i] == nullptr) return -ENOMEM;
+            }
+        }
+        {
+            ker::syscall::vmem::SharedVmemPublicationGuard publication;
+            if (!ready_actor(actor, preparation) || !sched::interrupts_enabled() || !roots_match(plan, plan.source_, plan.destination_))
+                return -EAGAIN;
+            uint64_t const FLAGS = cow_pte_lock.lock_irqsave();
+            bool const enough = count_locked(plan.source_) <= count;
+            cow_pte_lock.unlock_irqrestore(FLAGS);
+            if (!enough) return -EAGAIN;
+        }
+        plan.prepared_ = true;
+        return 0;
+    }
+    // Caller holds the actual original source exclusive and COW lock. Nothing
+    // from a previous ordinary snapshot is dereferenced as source authority.
+    static auto validate_locked(PreparedAnonymousSwapFork& plan, PageTable* source, PageTable* destination, bool child_markers) -> int {
+        if (!plan.prepared_ || plan.committed_ || !roots_match(plan, source, destination)) return -EAGAIN;
+        size_t const capacity = plan.storage_ != nullptr ? plan.storage_->capacity : 0;
+        size_t count = 0;
+        for (auto* row = anonymous_swap_mappings; row != nullptr; row = row->next) {
+            if (row->pagemap == destination) return -EAGAIN;
+            if (row->pagemap != source) continue;
+            if (++count > capacity) return -EAGAIN;
+            if ((row->state != AnonymousSwapRuntimeState::SWAPPED && row->state != AnonymousSwapRuntimeState::FAILED) ||
+                row->pagein_queued || row->cancelled || row->frame != nullptr || row->waiters != nullptr || row->generation == 0 ||
+                row->pagein_access_gate != USER_PAGEMAP_ACCESS_GATE_NONE || row->pagein_placement_valid ||
+                row->vaddr >= (uint64_t{1} << 47) || (row->vaddr & (paging::PAGE_SIZE - 1)) != 0 || !row->maintenance_valid ||
+                !valid_anonymous_placement(row->maintenance_placement) ||
+                (row->state == AnonymousSwapRuntimeState::SWAPPED && (row->object == nullptr || row->error != 0)) ||
+                (row->state == AnonymousSwapRuntimeState::FAILED && row->error >= 0))
+                return -EAGAIN;
+            auto* parent_entry = leaf_entry(source, row->vaddr);
+            if (parent_entry == nullptr || parent_entry->present != 0 || !is_reserved_leaf(*parent_entry) ||
+                pte_raw(*parent_entry) != anonymous_swap_marker_raw(row->original_raw))
+                return -EAGAIN;
+            if (child_markers) {
+                auto* entry = leaf_entry(destination, row->vaddr);
+                if (entry == nullptr || entry->present != 0 || !is_reserved_leaf(*entry) || pte_raw(*entry) != pte_raw(*parent_entry))
+                    return -EAGAIN;
+            }
+            size_t aliases = 0;
+            for (auto* candidate = anonymous_swap_mappings; candidate != nullptr; candidate = candidate->next) {
+                if (candidate == row || candidate->pagemap != source) continue;
+                if (candidate->vaddr == row->vaddr) return -EAGAIN;
+            }
+            if (row->object != nullptr) {
+                for (auto* candidate = anonymous_swap_mappings; candidate != nullptr; candidate = candidate->next)
+                    if (candidate->pagemap == source && candidate->object == row->object) ++aliases;
+                if (row->object->mapping_refs < aliases || aliases > UINT32_MAX || row->object->mapping_refs > UINT32_MAX - aliases)
+                    return -EOVERFLOW;
+            }
+        }
+        if (plan.storage_ != nullptr)
+            for (size_t i = 0; i < plan.storage_->capacity; ++i)
+                if (plan.storage_->rows[i] == nullptr) return -EAGAIN;
+        return 0;
+    }
+    static auto preflight(PreparedAnonymousSwapFork& plan, PageTable* source, PageTable* destination) -> int {
+        uint64_t const FLAGS = cow_pte_lock.lock_irqsave();
+        int const result = validate_locked(plan, source, destination, false);
+        cow_pte_lock.unlock_irqrestore(FLAGS);
+        return result;
+    }
+    static auto commit(PreparedAnonymousSwapFork& plan, PageTable* source, PageTable* destination) -> int {
+        uint64_t const FLAGS = cow_pte_lock.lock_irqsave();
+        int const result = validate_locked(plan, source, destination, true);
+        if (result != 0) {
+            cow_pte_lock.unlock_irqrestore(FLAGS);
+            return result;
+        }
+        size_t adopted = 0;
+        uint64_t last_vaddr = 0;
+        bool have_last = false;
+        for (;;) {
+            AnonymousSwapMapping* selected = nullptr;
+            for (auto* row = anonymous_swap_mappings; row != nullptr; row = row->next)
+                if (row->pagemap == source && (!have_last || row->vaddr > last_vaddr) &&
+                    (selected == nullptr || row->vaddr < selected->vaddr))
+                    selected = row;
+            if (selected == nullptr) break;
+            auto* child = plan.storage_->rows[adopted];
+            uint64_t raw = selected->original_raw;
+            if ((raw & paging::PAGE_WRITE) != 0U || (raw & paging::PAGE_COW) != 0U) {
+                raw &= ~paging::PAGE_WRITE;
+                raw |= paging::PAGE_COW;
+                selected->original_raw = raw;
+                *leaf_entry(source, selected->vaddr) = pte_from_raw(anonymous_swap_marker_raw(raw));
+            }
+            *child = *selected;
+            child->pagemap = destination;
+            child->waiters = nullptr;
+            child->next = nullptr;
+            child->pagein_queued = false;
+            child->pagein_access_gate = USER_PAGEMAP_ACCESS_GATE_NONE;
+            child->pagein_placement = {};
+            child->pagein_placement_valid = false;
+            child->pagein_allocation = AnonymousPageinAllocation::PREPARED;
+            child->frame = nullptr;
+            child->cancelled = false;
+            if (child->object != nullptr) ++child->object->mapping_refs;
+            *leaf_entry(destination, child->vaddr) = pte_from_raw(anonymous_swap_marker_raw(raw));
+            insert_anonymous_swap_mapping_locked(child);
+            plan.storage_->rows[adopted++] = nullptr;
+            if (child->state == AnonymousSwapRuntimeState::SWAPPED) anonymous_swap_add(anonymous_swap_stats.swapped_pages);
+            last_vaddr = selected->vaddr;
+            have_last = true;
+        }
+        plan.committed_ = true;
+        cow_pte_lock.unlock_irqrestore(FLAGS);
+        return 0;
+    }
+};
+
+auto prepare_anonymous_swap_fork(sched::task::Task& actor, sched::task::Task& child, const sys::SyscallPreparationScope& preparation,
+                                 PreparedAnonymousSwapFork& empty) -> int {
+    return PreparedSwapForkAccess::prepare(actor, child, preparation, empty);
+}
+void reset_anonymous_swap_fork(PreparedAnonymousSwapFork& plan) noexcept { PreparedSwapForkAccess::reset(plan); }
+}  // namespace detail
+
+namespace {
 auto clone_anonymous_swap_mappings(PageTable* src, PageTable* dst) -> bool {
     uint64_t last_vaddr = 0;
     bool have_last = false;
@@ -10573,7 +10784,8 @@ auto valid_fork_placement(PageTable* src, PageTable* dst, const numa::Allocation
 
 auto deep_copy_user_pagemap_cow_held(PageTable* src, PageTable* dst, bool eager_copy, numa::AllocationContext* placement,
                                      numa::AllocationResult* output, uint64_t fail_before_private_page,
-                                     const UserPagemapExclusiveScope& exclusive, bool require_4k) -> bool {
+                                     const UserPagemapExclusiveScope& exclusive, bool require_4k,
+                                     PreparedAnonymousSwapFork* prepared_swap = nullptr, int* prepared_error = nullptr) -> bool {
     if (!exclusive.owns(src)) return false;
 
     constexpr size_t USER_PML4_ENTRIES = 256;
@@ -10797,7 +11009,12 @@ auto deep_copy_user_pagemap_cow_held(PageTable* src, PageTable* dst, bool eager_
     // The source lifetime gate also joins queued/in-flight swap work. Clone
     // stable side-table leaves only after the ordinary page-table walk has
     // created the child's reserved marker entries.
-    if (!clone_anonymous_swap_mappings(src, dst)) {
+    if (prepared_swap != nullptr) {
+        if (prepared_error == nullptr) return false;
+        int const status = detail::PreparedSwapForkAccess::commit(*prepared_swap, src, dst);
+        *prepared_error = status;
+        if (status != 0) return false;
+    } else if (!clone_anonymous_swap_mappings(src, dst)) {
         return false;
     }
 
@@ -10864,7 +11081,8 @@ auto copy_current_user_pagemap_exclusive(sched::task::Task& actor, paging::PageT
                                          const sys::SyscallPreparationScope& preparation,
                                          const ker::syscall::vmem::SharedVmemPublicationGuard& publication, const RangeSplitSurvey& survey,
                                          PreparedTables& tables, numa::AllocationContext* eager_context,
-                                         numa::AllocationResult* empty_result) noexcept -> int {
+                                         numa::AllocationResult* empty_result, virt::PreparedAnonymousSwapFork* prepared_swap) noexcept
+    -> int {
     constexpr uint64_t USER_END = uint64_t{1} << 47;
     if (!current_fork_context_valid(actor, preparation, publication)) return -EWOULDBLOCK;
     if (source == nullptr || child == nullptr || source == child || source != actor.pagemap || source == virt::kernel_pagemap ||
@@ -10885,6 +11103,10 @@ auto copy_current_user_pagemap_exclusive(sched::task::Task& actor, paging::PageT
 #endif
     virt::UserPagemapExclusiveScope source_usercopy_scope(source);
     if (!current_fork_context_valid(actor, preparation, publication) || source != actor.pagemap) return -EAGAIN;
+    if (prepared_swap != nullptr) {
+        int const status = virt::detail::PreparedSwapForkAccess::preflight(*prepared_swap, source, child);
+        if (status != 0) return status;
+    }
     // Full user-half proof (including count0) is checked before every child PTE
     // write. This exact original exclusive is retained through split and COW;
     // never call a current-range admission that would acquire a nested reader.
@@ -10914,16 +11136,17 @@ auto copy_current_user_pagemap_exclusive(sched::task::Task& actor, paging::PageT
             placement = nullptr;
     }
     bool copied = false;
+    int prepared_error = 0;
     {
         sched::PreemptGuard const COW_PREEMPT;
-        copied =
-            virt::deep_copy_user_pagemap_cow_held(source, child, EAGER, placement, empty_result, UINT64_MAX, source_usercopy_scope, true);
+        copied = virt::deep_copy_user_pagemap_cow_held(source, child, EAGER, placement, empty_result, UINT64_MAX, source_usercopy_scope,
+                                                       true, prepared_swap, &prepared_error);
     }
     if (!copied) {
         // An old compatible failure may have changed a parent COW prefix.
         // Complete its source invalidation before caller-owned child rollback.
         virt::flush_pagemap_after_update(source, 0, true);
-        return -ENOMEM;
+        return prepared_error != 0 ? prepared_error : -ENOMEM;
     }
     return 0;
 }

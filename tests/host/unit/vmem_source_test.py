@@ -1117,10 +1117,15 @@ def test_eager_fork_uses_copied_policy_and_caller_storage_before_owners() -> Non
                       "return deep_copy_user_pagemap_cow_held(src, dst, eager_copy, placement, output, fail_before_private_page, source_usercopy_scope, false);",
                       "legacy exclusive and unchanged copied context transfer")
     prepared = function_body(virt, "copy_current_user_pagemap_exclusive")
+    exact_prepared = "".join(prepared.split())
+    if not (exact_prepared.index("PreparedSwapForkAccess::preflight(*prepared_swap,source,child)") < exact_prepared.index("commit_managed_split_plan_exclusive(source,survey,tables,source_usercopy_scope)")):
+        fail("prepared metadata must be fully validated before split or COW publication")
+    if "intprepared_error=0;" not in exact_prepared:
+        fail("the compatible branch must preserve its original ENOMEM fallback")
     require_cpp_order(prepared, "commit_managed_split_plan_exclusive(source, survey, tables, source_usercopy_scope)",
                       "sched::PreemptGuard const COW_PREEMPT;", "prepared split ACK before COW interval")
     require_cpp_order(prepared, "sched::PreemptGuard const COW_PREEMPT;",
-                      "deep_copy_user_pagemap_cow_held(source, child, EAGER, placement, empty_result, UINT64_MAX, source_usercopy_scope, true)",
+                      "deep_copy_user_pagemap_cow_held(source, child, EAGER, placement, empty_result, UINT64_MAX, source_usercopy_scope, true, prepared_swap, &prepared_error)",
                       "prepared route borrows the same original exclusive and copied context")
     copier = function_body(virt, "deep_copy_user_pagemap_cow_held")
     require_cpp_order(copier, "if (!exclusive.owns(src)) return false;", "auto& src_pml4e = entry_at(src, i4)",

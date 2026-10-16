@@ -3918,6 +3918,207 @@ SharedVmemPublicationTryGuard::~SharedVmemPublicationTryGuard() noexcept {
     if (acquired_) g_shared_vmem_publication_lock.unlock();
 }
 
+namespace {
+auto prepared_fork_actor(const ker::mod::sched::task::Task& actor, const ker::mod::sys::SyscallPreparationScope& preparation) -> bool {
+    using namespace ker::mod;
+    return preparation.ready() && sched::can_query_current_task() && sched::get_current_task() == &actor &&
+           actor.type == sched::task::TaskType::PROCESS && actor.syscall_account_start_us != 0 &&
+           actor.state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE &&
+           !actor.scheduler_transition_active.load(std::memory_order_acquire) &&
+           !actor.usercopy_pagemap_closing.load(std::memory_order_acquire) && sched::preempt_count() == 0;
+}
+// SmallVec move transfers its complete inline buffer, including unused slots.
+// Read the initialized object while ordinary preparation owns the registry;
+// instrumented volatile accesses materialize all source shadow before final MM.
+[[gnu::noinline]] void preflight_prepared_legacy_storage(const ker::util::SmallVec<FileMmapRange, 32>& rows) {
+    auto const* bytes = reinterpret_cast<volatile const unsigned char*>(&rows);
+    for (size_t i = 0; i < sizeof(rows); ++i) static_cast<void>(bytes[i]);
+}
+auto legacy_row_equal(const FileMmapRange& a, const FileMmapRange& b) -> bool {
+    return a.pagemap == b.pagemap && a.start == b.start && a.length == b.length && a.file_offset == b.file_offset && a.file == b.file &&
+           a.writeback == b.writeback;
+}
+auto legacy_fork_rows_allowed(ker::mod::mm::paging::PageTable* source, ker::mod::mm::paging::PageTable* child, size_t& source_count)
+    -> bool {
+    source_count = 0;
+    for (auto* entry = g_native_file_mmap_ranges; entry != nullptr; entry = entry->registry_next)
+        if (entry->root == source || entry->root == child) return false;
+    for (auto const& row : g_file_mmap_ranges) {
+        if (row.pagemap == child || row.file == nullptr || row.length == 0 || row.start > UINT64_MAX - row.length) return false;
+        if (row.pagemap == source) ++source_count;
+    }
+    return true;
+}
+auto retain_prepared_legacy_file(ker::vfs::File* file) -> bool {
+#ifdef WOS_SELFTEST
+    ::ker::test::numa_lifecycle::mm_debt::begin_change();
+#endif
+    bool const acquired = ker::vfs::vfs_try_retain_file(file);
+#ifdef WOS_SELFTEST
+    if (acquired) ::ker::test::numa_lifecycle::mm_debt::add(::ker::test::numa_lifecycle::CounterField::LEGACY_FILE_REGISTRY);
+    ::ker::test::numa_lifecycle::mm_debt::end_change();
+#endif
+    return acquired;
+}
+void return_prepared_legacy_file(ker::vfs::File* file) {
+    if (file == nullptr) return;
+#ifdef WOS_SELFTEST
+    ::ker::test::numa_lifecycle::mm_debt::begin_change();
+    ::ker::test::numa_lifecycle::mm_debt::add(::ker::test::numa_lifecycle::CounterField::REGISTRY_RETURNS);
+    ::ker::test::numa_lifecycle::mm_debt::end_change();
+#endif
+    ker::vfs::vfs_put_file(file);
+#ifdef WOS_SELFTEST
+    ::ker::test::numa_lifecycle::mm_debt::begin_change();
+    ::ker::test::numa_lifecycle::mm_debt::drop(::ker::test::numa_lifecycle::CounterField::LEGACY_FILE_REGISTRY);
+    ::ker::test::numa_lifecycle::mm_debt::drop(::ker::test::numa_lifecycle::CounterField::REGISTRY_RETURNS);
+    ::ker::test::numa_lifecycle::mm_debt::end_change();
+#endif
+}
+}  // namespace
+
+struct LegacyFileForkPreparation::Storage {
+    ker::util::SmallVec<FileMmapRange, 32> before, next, retired;
+    ker::vfs::File* pending{};  // One successfully retained but not yet appended row.
+};
+
+LegacyFileForkPreparation::~LegacyFileForkPreparation() {
+    if (storage_ == nullptr) return;
+    return_prepared_legacy_file(storage_->pending);
+    for (auto const& row : storage_->next) return_prepared_legacy_file(row.file);
+    for (auto const& row : storage_->retired) return_prepared_legacy_file(row.file);
+    delete storage_;
+}
+
+auto LegacyFileForkPreparation::context_matches(ker::mod::sched::task::Task& actor, ker::mod::sched::task::Task& child,
+                                                const ker::mod::sys::SyscallPreparationScope& preparation) const -> bool {
+    if (!prepared_fork_actor(actor, preparation) || &actor != actor_ || &child != child_ || actor.pagemap != source_ ||
+        child.pagemap != destination_ || child.has_run || child.usercopy_pagemap_closing.load(std::memory_order_acquire))
+        return false;
+    uint64_t source_serial = 0, destination_serial = 0;
+    return ker::mod::mm::virt::capture_user_root_incarnation(source_, source_serial) && source_serial == source_serial_ &&
+           ker::mod::mm::virt::capture_user_root_incarnation(destination_, destination_serial) && destination_serial == destination_serial_;
+}
+
+auto LegacyFileForkPreparation::prepare(ker::mod::sched::task::Task& actor, ker::mod::sched::task::Task& child,
+                                        const ker::mod::sys::SyscallPreparationScope& preparation) -> int {
+    if (prepared_ || storage_ != nullptr || actor_ != nullptr) return -EBUSY;
+    if (!prepared_fork_actor(actor, preparation) || !ker::mod::sched::interrupts_enabled()) return -EWOULDBLOCK;
+    if (&actor == &child || child.has_run || child.type != ker::mod::sched::task::TaskType::PROCESS ||
+        child.usercopy_pagemap_closing.load(std::memory_order_acquire))
+        return -EINVAL;
+    size_t total = 0, source_count = 0;
+    {
+        SharedVmemPublicationGuard publication;
+        if (!prepared_fork_actor(actor, preparation) || !ker::mod::sched::interrupts_enabled()) return -EAGAIN;
+        source_ = actor.pagemap;
+        destination_ = child.pagemap;
+        if (source_ == nullptr || destination_ == nullptr || source_ == destination_ ||
+            source_ == ker::mod::mm::virt::get_kernel_pagemap() || destination_ == ker::mod::mm::virt::get_kernel_pagemap() ||
+            !ker::mod::mm::virt::capture_user_root_incarnation(source_, source_serial_) ||
+            !ker::mod::mm::virt::capture_user_root_incarnation(destination_, destination_serial_))
+            return -EINVAL;
+        actor_ = &actor;
+        child_ = &child;
+        g_file_mmap_ranges_lock.lock();
+        bool const allowed = legacy_fork_rows_allowed(source_, destination_, source_count);
+        total = g_file_mmap_ranges.size();
+        if (allowed && source_count != 0) preflight_prepared_legacy_storage(g_file_mmap_ranges);
+        g_file_mmap_ranges_lock.unlock();
+        if (!allowed) return -EOPNOTSUPP;
+    }
+    // No source rows means an exact scalar no-op; unrelated rows stay in place.
+    if (source_count == 0) {
+        prepared_ = true;
+        return 0;
+    }
+    if (total > SIZE_MAX - source_count) return -EOVERFLOW;
+    storage_ = new (std::nothrow) Storage{};
+    if (storage_ == nullptr || !storage_->before.reserve(total) || !storage_->next.reserve(total + source_count)) return -ENOMEM;
+    int result = 0;
+    {
+        SharedVmemPublicationGuard publication;
+        if (!context_matches(actor, child, preparation)) return -EAGAIN;
+        g_file_mmap_ranges_lock.lock();
+        size_t current_source_count = 0;
+        if (g_file_mmap_ranges.size() != total || !legacy_fork_rows_allowed(source_, destination_, current_source_count) ||
+            current_source_count != source_count) {
+            result = -EAGAIN;
+        } else {
+            auto append = [&](const FileMmapRange& row) -> int {
+                if (!retain_prepared_legacy_file(row.file)) return -EOVERFLOW;
+                storage_->pending = row.file;
+                if (!storage_->next.push_back_no_grow(row)) return -EAGAIN;
+                storage_->pending = nullptr;
+                return 0;
+            };
+            for (auto const& row : g_file_mmap_ranges) {
+                if (!storage_->before.push_back_no_grow(row)) {
+                    result = -EAGAIN;
+                    break;
+                }
+                result = append(row);
+                if (result != 0) break;
+            }
+            if (result == 0) {
+                for (auto const& row : g_file_mmap_ranges) {
+                    if (row.pagemap != source_) continue;
+                    FileMmapRange clone = row;
+                    clone.pagemap = destination_;
+                    result = append(clone);
+                    if (result != 0) break;
+                }
+            }
+        }
+        g_file_mmap_ranges_lock.unlock();
+    }
+    prepared_ = result == 0;
+    return result;
+}
+
+auto LegacyFileForkPreparation::rows_match_locked() const -> bool {
+    size_t source_count = 0;
+    if (!legacy_fork_rows_allowed(source_, destination_, source_count)) return false;
+    if (storage_ == nullptr) return source_count == 0;
+    if (storage_->pending != nullptr || storage_->before.size() != g_file_mmap_ranges.size() ||
+        source_count > SIZE_MAX - g_file_mmap_ranges.size() || storage_->next.size() != g_file_mmap_ranges.size() + source_count ||
+        !storage_->retired.empty() || storage_->retired.is_spilled())
+        return false;
+    for (size_t i = 0; i < g_file_mmap_ranges.size(); ++i)
+        if (!legacy_row_equal(storage_->before.at(i), g_file_mmap_ranges.at(i))) return false;
+    return true;
+}
+
+auto LegacyFileForkPreparation::matches(ker::mod::sched::task::Task& actor, ker::mod::sched::task::Task& child,
+                                        const ker::mod::sys::SyscallPreparationScope& preparation,
+                                        const SharedVmemPublicationGuard& publication) const -> int {
+    if (!prepared_ || committed_ || !publication.acquired() || !context_matches(actor, child, preparation)) return -EAGAIN;
+    if (!g_file_mmap_ranges_lock.try_lock()) return -EAGAIN;
+    bool const matched = rows_match_locked();
+    g_file_mmap_ranges_lock.unlock();
+    return matched ? 0 : -EAGAIN;
+}
+
+auto LegacyFileForkPreparation::commit(ker::mod::sched::task::Task& actor, ker::mod::sched::task::Task& child,
+                                       const ker::mod::sys::SyscallPreparationScope& preparation,
+                                       const SharedVmemPublicationGuard& publication) -> int {
+    if (!prepared_ || committed_ || !publication.acquired() || !context_matches(actor, child, preparation)) return -EAGAIN;
+    if (!g_file_mmap_ranges_lock.try_lock()) return -EAGAIN;
+    if (!rows_match_locked()) {
+        g_file_mmap_ranges_lock.unlock();
+        return -EAGAIN;
+    }
+    if (storage_ != nullptr) {
+        // Both destinations have no heap: first the default empty retired
+        // vector, then the moved-from global. No delete/grow/File close here.
+        storage_->retired = std::move(g_file_mmap_ranges);
+        g_file_mmap_ranges = std::move(storage_->next);
+    }
+    committed_ = true;
+    g_file_mmap_ranges_lock.unlock();
+    return 0;
+}
+
 struct PublicFileForkPreparation::Entry {
     ker::mod::mm::file_mapping::FileMappingBinding* source{};      // SNAPSHOT
     ker::mod::mm::file_mapping::FileMappingBinding* validation{};  // SNAPSHOT

@@ -151,6 +151,10 @@ def main() -> int:
                       "auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst, numa::AllocationContext&",
                       "auto selftest_deep_copy_user_pagemap_eager("]
         bodies = "\n".join(function(source, name) for name in signatures)
+        # The unchanged legacy vectors pass no prepared metadata owner. Keep
+        # the actual full walker; its new internal dispatch is an explicit
+        # unexpected-call Host endpoint, not an imitation of swap preparation.
+        bodies = "class PreparedAnonymousSwapFork; namespace detail { struct PreparedSwapForkAccess { static auto commit(PreparedAnonymousSwapFork&, PageTable*, PageTable*) -> int { std::abort(); } }; }\n" + bodies
         support = cases_path.read_text()
         code = support.replace("// ACTUAL_EXTRACTED_EXCLUSIVE_INSERTION", function(source, "class UserPagemapExclusiveScope {") + ";")
         code = code.replace("// ACTUAL_EXTRACTED_COPIER_INSERTION", bodies)

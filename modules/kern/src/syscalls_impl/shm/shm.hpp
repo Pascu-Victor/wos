@@ -5,6 +5,14 @@
 #endif
 
 #include <cstdint>
+#include <platform/mm/paging.hpp>
+
+namespace ker::mod::sys {
+class SyscallPreparationScope;
+}
+namespace ker::syscall::vmem {
+class SharedVmemPublicationGuard;
+}
 
 namespace ker::mod::sched::task {
 struct Task;
@@ -21,6 +29,35 @@ auto sys_shm(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) ->
 // Caller must hold vmem::SharedVmemPublicationGuard. The function nests only
 // the IRQ-safe SysV metadata lock and never performs page-table or VFS work.
 auto shm_clone_for_fork_locked(ker::mod::sched::task::Task* parent, ker::mod::sched::task::Task* child) -> bool;
+// Unwired fixed-table fork plan. No publishing reservation/segment owner is
+// created during preparation. Final adoption is all-or-none under the real
+// SHM lock after complete revalidation; destroy ordinary caller storage only
+// outside PUB/root/IF/preempt owners. Caller owns the never-active child.
+class ShmForkPreparation {
+   public:
+    ShmForkPreparation() = default;
+    ~ShmForkPreparation();
+    ShmForkPreparation(const ShmForkPreparation&) = delete;
+    auto operator=(const ShmForkPreparation&) -> ShmForkPreparation& = delete;
+    [[nodiscard]] auto prepare(ker::mod::sched::task::Task&, ker::mod::sched::task::Task&, const ker::mod::sys::SyscallPreparationScope&)
+        -> int;
+    [[nodiscard]] auto matches(ker::mod::sched::task::Task&, ker::mod::sched::task::Task&, const ker::mod::sys::SyscallPreparationScope&,
+                               const ker::syscall::vmem::SharedVmemPublicationGuard&) const -> int;
+    [[nodiscard]] auto commit(ker::mod::sched::task::Task&, ker::mod::sched::task::Task&, const ker::mod::sys::SyscallPreparationScope&,
+                              const ker::syscall::vmem::SharedVmemPublicationGuard&) -> int;
+
+   private:
+    struct Storage;
+    [[nodiscard]] auto context_matches(ker::mod::sched::task::Task&, ker::mod::sched::task::Task&,
+                                       const ker::mod::sys::SyscallPreparationScope&) const -> bool;
+    Storage* storage_{};
+    ker::mod::sched::task::Task* actor_{};
+    ker::mod::sched::task::Task* child_{};
+    ker::mod::mm::paging::PageTable* source_{};
+    ker::mod::mm::paging::PageTable* destination_{};
+    uint64_t parent_pid_{}, child_pid_{}, source_serial_{}, destination_serial_{};
+    bool prepared_{}, committed_{};
+};
 void shm_cleanup_for_task(ker::mod::sched::task::Task* task);
 
 // Close private namespace admission and mark its segments for destruction.

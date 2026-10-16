@@ -303,11 +303,16 @@ def require_mapping_mutations_use_shootdown(source: str) -> None:
     if min(clone, flush, success) < 0 or not clone < flush < success:
         fail("held fork must finish its source shootdown after the complete ordinary and swap-side walk")
     prepared = "".join(function_body(source, "copy_current_user_pagemap_exclusive").split())
+    exact_prepared = "".join(prepared.split())
+    if not (exact_prepared.index("PreparedSwapForkAccess::preflight(*prepared_swap,source,child)") < exact_prepared.index("commit_managed_split_plan_exclusive(source,survey,tables,source_usercopy_scope)")):
+        fail("prepared metadata must be fully validated before split or COW publication")
+    if "intprepared_error=0;" not in exact_prepared:
+        fail("the compatible branch must preserve its original ENOMEM fallback")
     order = ["UserPagemapExclusiveScopesource_usercopy_scope(source);",
              "commit_managed_split_plan_exclusive(source,survey,tables,source_usercopy_scope)",
              "sched::PreemptGuardconstCOW_PREEMPT;",
-             "deep_copy_user_pagemap_cow_held(source,child,EAGER,placement,empty_result,UINT64_MAX,source_usercopy_scope,true)",
-             "if(!copied){", "virt::flush_pagemap_after_update(source,0,true);", "return-ENOMEM;"]
+             "deep_copy_user_pagemap_cow_held(source,child,EAGER,placement,empty_result,UINT64_MAX,source_usercopy_scope,true,prepared_swap,&prepared_error)",
+             "if(!copied){", "virt::flush_pagemap_after_update(source,0,true);", "returnprepared_error!=0?prepared_error:-ENOMEM;"]
     cursor = 0
     for token in order:
         found = prepared.find(token, cursor)

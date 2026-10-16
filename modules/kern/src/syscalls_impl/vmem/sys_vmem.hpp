@@ -10,6 +10,10 @@ class LazyVmemClone;
 struct Task;
 }  // namespace ker::mod::sched::task
 
+namespace ker::mod::sys {
+class SyscallPreparationScope;
+}
+
 namespace ker::mod::mm::numa {
 struct AllocationContext;
 }
@@ -81,6 +85,36 @@ class PublicFileForkPreparation {
     Entry* entries_{};
     size_t count_{};
     bool prepared_{};
+};
+
+// Unwired prepared legacy fork metadata. Caller retains exact actor/root and
+// exclusively never-active child through commit, and destroys this holder only
+// outside PUB/root/IF/preempt owners. Real checked File refs own every prefix.
+class LegacyFileForkPreparation {
+   public:
+    LegacyFileForkPreparation() = default;
+    ~LegacyFileForkPreparation();
+    LegacyFileForkPreparation(const LegacyFileForkPreparation&) = delete;
+    auto operator=(const LegacyFileForkPreparation&) -> LegacyFileForkPreparation& = delete;
+    [[nodiscard]] auto prepare(ker::mod::sched::task::Task&, ker::mod::sched::task::Task&, const ker::mod::sys::SyscallPreparationScope&)
+        -> int;
+    [[nodiscard]] auto matches(ker::mod::sched::task::Task&, ker::mod::sched::task::Task&, const ker::mod::sys::SyscallPreparationScope&,
+                               const SharedVmemPublicationGuard&) const -> int;
+    [[nodiscard]] auto commit(ker::mod::sched::task::Task&, ker::mod::sched::task::Task&, const ker::mod::sys::SyscallPreparationScope&,
+                              const SharedVmemPublicationGuard&) -> int;
+
+   private:
+    struct Storage;
+    [[nodiscard]] auto context_matches(ker::mod::sched::task::Task&, ker::mod::sched::task::Task&,
+                                       const ker::mod::sys::SyscallPreparationScope&) const -> bool;
+    [[nodiscard]] auto rows_match_locked() const -> bool;
+    Storage* storage_{};
+    ker::mod::sched::task::Task* actor_{};
+    ker::mod::sched::task::Task* child_{};
+    ker::mod::mm::paging::PageTable* source_{};
+    ker::mod::mm::paging::PageTable* destination_{};
+    uint64_t source_serial_{}, destination_serial_{};
+    bool prepared_{}, committed_{};
 };
 
 struct FileMmapCacheStats {

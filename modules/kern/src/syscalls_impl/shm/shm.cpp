@@ -31,6 +31,7 @@
 #include <platform/sched/threading.hpp>
 #include <platform/security/authorization.hpp>
 #include <platform/sys/spinlock.hpp>
+#include <platform/sys/syscall_preparation.hpp>
 #include <platform/sys/usercopy.hpp>
 #include <syscalls_impl/vmem/sys_vmem.hpp>
 
@@ -705,6 +706,156 @@ auto shm_clone_for_fork_locked(ker::mod::sched::task::Task* parent, ker::mod::sc
     }
     g_lock.unlock_irqrestore(FLAGS);
     return true;
+}
+
+namespace {
+auto prepared_shm_actor(const ker::mod::sched::task::Task& actor, const ker::mod::sys::SyscallPreparationScope& preparation) -> bool {
+    using namespace ker::mod;
+    return preparation.ready() && sched::can_query_current_task() && sched::get_current_task() == &actor &&
+           actor.type == sched::task::TaskType::PROCESS && actor.syscall_account_start_us != 0 &&
+           actor.state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE &&
+           !actor.scheduler_transition_active.load(std::memory_order_acquire) &&
+           !actor.usercopy_pagemap_closing.load(std::memory_order_acquire) && sched::preempt_count() == 0;
+}
+auto shm_attachment_equal(const ShmAttachment& a, const ShmAttachment& b) -> bool {
+    return a.active == b.active && a.publishing == b.publishing && a.pid == b.pid && a.shmid == b.shmid && a.addr == b.addr &&
+           a.size == b.size;
+}
+// All pointers/segment borrows remain under g_lock. No slot is reserved by this read.
+auto inspect_prepared_shm_fork(uint64_t parent, uint64_t child, ShmAttachment* rows, size_t capacity, size_t& count, bool compare) -> int {
+    count = 0;
+    size_t free = 0;
+    for (auto const& attachment : g_attachments) {
+        if (!attachment.active && !attachment.publishing) ++free;
+        if ((attachment.active || attachment.publishing) && attachment.pid == child) return -EAGAIN;
+        if (attachment.pid != parent) continue;
+        if (attachment.publishing) return -EAGAIN;
+        if (!attachment.active) continue;
+        auto const* segment = find_retained_segment_by_id(attachment.shmid);
+        if (segment == nullptr || attachment.size == 0 || attachment.size != segment->size || attachment.addr == 0 ||
+            (attachment.addr % ker::mod::mm::paging::PAGE_SIZE) != 0 || attachment.size > USER_SPACE_END - USER_SPACE_START ||
+            attachment.addr < USER_SPACE_START || attachment.addr > USER_SPACE_END - attachment.size)
+            return -EAGAIN;
+        size_t aliases = 0;
+        for (auto const& candidate : g_attachments)
+            if (candidate.active && candidate.pid == parent && candidate.shmid == attachment.shmid) ++aliases;
+        if (segment->attach_count < aliases || segment->attach_count > UINT64_MAX - aliases) return -EOVERFLOW;
+        if (rows != nullptr) {
+            if (count >= capacity) return -EAGAIN;
+            if (compare) {
+                if (!shm_attachment_equal(rows[count], attachment)) return -EAGAIN;
+            } else {
+                rows[count] = attachment;
+            }
+        }
+        ++count;
+    }
+    if (count > free) return -ENOSPC;
+    return 0;
+}
+}  // namespace
+
+struct ShmForkPreparation::Storage {
+    ShmAttachment* rows{};
+    size_t count{};
+    ~Storage() { delete[] rows; }
+};
+ShmForkPreparation::~ShmForkPreparation() { delete storage_; }
+
+auto ShmForkPreparation::context_matches(ker::mod::sched::task::Task& actor, ker::mod::sched::task::Task& child,
+                                         const ker::mod::sys::SyscallPreparationScope& preparation) const -> bool {
+    if (!prepared_shm_actor(actor, preparation) || &actor != actor_ || &child != child_ || actor.pagemap != source_ ||
+        child.pagemap != destination_ || process_pid_for_task(&actor) != parent_pid_ || child.pid != child_pid_ || child.has_run ||
+        child.usercopy_pagemap_closing.load(std::memory_order_acquire))
+        return false;
+    uint64_t source_serial = 0, destination_serial = 0;
+    return ker::mod::mm::virt::capture_user_root_incarnation(source_, source_serial) && source_serial == source_serial_ &&
+           ker::mod::mm::virt::capture_user_root_incarnation(destination_, destination_serial) && destination_serial == destination_serial_;
+}
+
+auto ShmForkPreparation::prepare(ker::mod::sched::task::Task& actor, ker::mod::sched::task::Task& child,
+                                 const ker::mod::sys::SyscallPreparationScope& preparation) -> int {
+    if (prepared_ || storage_ != nullptr || actor_ != nullptr) return -EBUSY;
+    if (!prepared_shm_actor(actor, preparation) || !ker::mod::sched::interrupts_enabled()) return -EWOULDBLOCK;
+    if (&actor == &child || child.has_run || child.type != ker::mod::sched::task::TaskType::PROCESS || child.is_thread || child.pid == 0 ||
+        child.usercopy_pagemap_closing.load(std::memory_order_acquire))
+        return -EINVAL;
+    size_t count = 0;
+    {
+        ker::syscall::vmem::SharedVmemPublicationGuard publication;
+        if (!prepared_shm_actor(actor, preparation) || !ker::mod::sched::interrupts_enabled()) return -EAGAIN;
+        source_ = actor.pagemap;
+        destination_ = child.pagemap;
+        parent_pid_ = process_pid_for_task(&actor);
+        child_pid_ = child.pid;
+        if (parent_pid_ == 0 || parent_pid_ == child_pid_ || source_ == nullptr || destination_ == nullptr || source_ == destination_ ||
+            source_ == ker::mod::mm::virt::get_kernel_pagemap() || destination_ == ker::mod::mm::virt::get_kernel_pagemap() ||
+            !ker::mod::mm::virt::capture_user_root_incarnation(source_, source_serial_) ||
+            !ker::mod::mm::virt::capture_user_root_incarnation(destination_, destination_serial_))
+            return -EINVAL;
+        actor_ = &actor;
+        child_ = &child;
+        uint64_t const FLAGS = g_lock.lock_irqsave();
+        int const status = inspect_prepared_shm_fork(parent_pid_, child_pid_, nullptr, 0, count, false);
+        g_lock.unlock_irqrestore(FLAGS);
+        if (status != 0) return status;
+    }
+    if (count != 0) {
+        storage_ = new (std::nothrow) Storage{};
+        if (storage_ == nullptr) return -ENOMEM;
+        storage_->rows = new (std::nothrow) ShmAttachment[count]{};
+        if (storage_->rows == nullptr) return -ENOMEM;
+        ker::syscall::vmem::SharedVmemPublicationGuard publication;
+        if (!context_matches(actor, child, preparation)) return -EAGAIN;
+        uint64_t const FLAGS = g_lock.lock_irqsave();
+        size_t actual = 0;
+        int const status = inspect_prepared_shm_fork(parent_pid_, child_pid_, storage_->rows, count, actual, false);
+        g_lock.unlock_irqrestore(FLAGS);
+        if (status != 0) return status;
+        if (actual != count) return -EAGAIN;
+        storage_->count = count;
+    }
+    prepared_ = true;
+    return 0;
+}
+
+auto ShmForkPreparation::matches(ker::mod::sched::task::Task& actor, ker::mod::sched::task::Task& child,
+                                 const ker::mod::sys::SyscallPreparationScope& preparation,
+                                 const ker::syscall::vmem::SharedVmemPublicationGuard& publication) const -> int {
+    if (!prepared_ || committed_ || !publication.acquired() || !context_matches(actor, child, preparation)) return -EAGAIN;
+    uint64_t const FLAGS = g_lock.lock_irqsave();
+    size_t actual = 0;
+    int status = inspect_prepared_shm_fork(parent_pid_, child_pid_, storage_ != nullptr ? storage_->rows : nullptr,
+                                           storage_ != nullptr ? storage_->count : 0, actual, true);
+    if (status == 0 && actual != (storage_ != nullptr ? storage_->count : 0)) status = -EAGAIN;
+    g_lock.unlock_irqrestore(FLAGS);
+    return status;
+}
+
+auto ShmForkPreparation::commit(ker::mod::sched::task::Task& actor, ker::mod::sched::task::Task& child,
+                                const ker::mod::sys::SyscallPreparationScope& preparation,
+                                const ker::syscall::vmem::SharedVmemPublicationGuard& publication) -> int {
+    if (!prepared_ || committed_ || !publication.acquired() || !context_matches(actor, child, preparation)) return -EAGAIN;
+    uint64_t const FLAGS = g_lock.lock_irqsave();
+    size_t actual = 0;
+    int status = inspect_prepared_shm_fork(parent_pid_, child_pid_, storage_ != nullptr ? storage_->rows : nullptr,
+                                           storage_ != nullptr ? storage_->count : 0, actual, true);
+    if (status == 0 && actual != (storage_ != nullptr ? storage_->count : 0)) status = -EAGAIN;
+    if (status == 0) {
+        for (auto const& source : g_attachments) {
+            if (!source.active || source.pid != parent_pid_) continue;
+            auto* slot = find_free_attachment();
+            auto* segment = find_retained_segment_by_id(source.shmid);
+            // The complete prior pass and this same lock prove these cannot fail.
+            if (slot == nullptr || segment == nullptr) __builtin_trap();
+            *slot = source;
+            slot->pid = child_pid_;
+            ++segment->attach_count;
+        }
+        committed_ = true;
+    }
+    g_lock.unlock_irqrestore(FLAGS);
+    return status;
 }
 
 void shm_cleanup_for_task(ker::mod::sched::task::Task* task) {

@@ -371,11 +371,16 @@ def require_mapping_stable_pin_contract() -> None:
     if "UserPagemapExclusiveScope source_usercopy_scope(" in held or "acquire_user_pagemap_access(" in held:
         fail("held fork walker must not reacquire its original exclusive or a nested reader")
     prepared = "".join(function_body(virt_cpp, "copy_current_user_pagemap_exclusive").split())
+    exact_prepared = "".join(prepared.split())
+    if not (exact_prepared.index("PreparedSwapForkAccess::preflight(*prepared_swap,source,child)") < exact_prepared.index("commit_managed_split_plan_exclusive(source,survey,tables,source_usercopy_scope)")):
+        fail("prepared metadata must be fully validated before split or COW publication")
+    if "intprepared_error=0;" not in exact_prepared:
+        fail("the compatible branch must preserve its original ENOMEM fallback")
     order = ["survey.start()!=0||survey.end()!=USER_END",
              "UserPagemapExclusiveScopesource_usercopy_scope(source);",
              "commit_managed_split_plan_exclusive(source,survey,tables,source_usercopy_scope)",
              "sched::PreemptGuardconstCOW_PREEMPT;",
-             "deep_copy_user_pagemap_cow_held(source,child,EAGER,placement,empty_result,UINT64_MAX,source_usercopy_scope,true)"]
+             "deep_copy_user_pagemap_cow_held(source,child,EAGER,placement,empty_result,UINT64_MAX,source_usercopy_scope,true,prepared_swap,&prepared_error)"]
     cursor = 0
     for token in order:
         found = prepared.find(token, cursor)
@@ -385,7 +390,10 @@ def require_mapping_stable_pin_contract() -> None:
     if "acquire_user_pagemap_access(" in prepared:
         fail("prepared fork must not take a striped reader under its source exclusive")
     managed = (ROOT / "modules/kern/src/platform/mm/managed_huge.cpp").read_text()
-    entry = "".join(function_body(managed, "deep_copy_current_user_pagemap_prepared").split())
+    entry = "".join(function_body(managed, "deep_copy_current_user_pagemap_prepared_impl").split())
+    public = "".join(function_body(managed, "deep_copy_current_user_pagemap_prepared").split())
+    if public != "returndeep_copy_current_user_pagemap_prepared_impl(actor,child,preparation,publication,survey,tables,eager_context,empty_result,nullptr);":
+        fail("old prepared API must forward unchanged authority with an explicit absent metadata plan")
     lease = entry.find("access.local=actor.try_acquire_usercopy_pagemap(access.root);")
     copy = entry.find("copy_current_user_pagemap_exclusive(actor,access.root,child,")
     release = entry.find("release_current_range_root(access);")

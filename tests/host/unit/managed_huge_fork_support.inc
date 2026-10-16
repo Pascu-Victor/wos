@@ -65,3 +65,17 @@ struct log {
     static void warn(const char*, Args...) {}
 };
 }  // namespace ker::mod::mm::virt
+
+// Existing 54 positive vectors supply no new swap plan. Actual prepared swap
+// bodies have separate ownership/refusal coverage; this endpoint must stay idle.
+namespace ker::mod::mm::virt::detail {
+struct PreparedSwapForkAccess {
+    static auto preflight(PreparedAnonymousSwapFork&, PageTable*, PageTable*) -> int { std::abort(); }
+    static auto commit(PreparedAnonymousSwapFork&, PageTable*, PageTable*) -> int { std::abort(); }
+};
+auto prepare_anonymous_swap_fork(sched::task::Task&, sched::task::Task&, const sys::SyscallPreparationScope&, PreparedAnonymousSwapFork&)
+    -> int {
+    std::abort();
+}
+void reset_anonymous_swap_fork(PreparedAnonymousSwapFork&) noexcept { std::abort(); }
+}  // namespace ker::mod::mm::virt::detail

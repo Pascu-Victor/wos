@@ -42,6 +42,36 @@ namespace ker::mod::mm::virt {
 using namespace ker::mod::mm::addr;
 using namespace ker::mod::mm::paging;
 
+namespace detail {
+struct PreparedSwapForkAccess;
+}
+// Private caller-born swap metadata owner. Prepare/destroy only ordinary context;
+// no source Mapping/Object/slot pointer survives an allocation or wait.
+class PreparedAnonymousSwapFork {
+   public:
+    PreparedAnonymousSwapFork() noexcept;
+    ~PreparedAnonymousSwapFork();
+    PreparedAnonymousSwapFork(const PreparedAnonymousSwapFork&) = delete;
+    auto operator=(const PreparedAnonymousSwapFork&) -> PreparedAnonymousSwapFork& = delete;
+    [[nodiscard]] auto prepare(sched::task::Task&, sched::task::Task&, const sys::SyscallPreparationScope&) -> int;
+
+   private:
+    friend struct detail::PreparedSwapForkAccess;
+    struct Storage;
+    Storage* storage_{};
+    sched::task::Task* actor_{};
+    sched::task::Task* child_{};
+    PageTable* source_{};
+    PageTable* destination_{};
+    uint64_t source_serial_{}, destination_serial_{};
+    bool prepared_{}, committed_{};
+};
+namespace detail {
+[[nodiscard]] auto prepare_anonymous_swap_fork(sched::task::Task&, sched::task::Task&, const sys::SyscallPreparationScope&,
+                                               PreparedAnonymousSwapFork&) -> int;
+void reset_anonymous_swap_fork(PreparedAnonymousSwapFork&) noexcept;
+}  // namespace detail
+
 struct Range {
     uint64_t start;
     uint64_t end;
@@ -664,6 +694,10 @@ bool deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst);
                                                            const huge::RangeSplitSurvey& survey, huge::PreparedTables& tables,
                                                            numa::AllocationContext* eager_context,
                                                            numa::AllocationResult* empty_result) noexcept -> int;
+[[nodiscard]] auto deep_copy_current_user_pagemap_prepared(sched::task::Task&, PageTable* child, const sys::SyscallPreparationScope&,
+                                                           const ker::syscall::vmem::SharedVmemPublicationGuard&,
+                                                           const huge::RangeSplitSurvey&, huge::PreparedTables&, numa::AllocationContext*,
+                                                           numa::AllocationResult*, PreparedAnonymousSwapFork&) noexcept -> int;
 #ifdef WOS_SELFTEST
 // Caller exclusively owns both distinct registered never-active mutable roots.
 // Same walker, local eager decision only. Controlled refusal is not PMM pressure.

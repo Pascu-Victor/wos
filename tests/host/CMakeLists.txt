@@ -2137,3 +2137,9 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/service_owner_epoch_runtime_test.py
 )
 set_tests_properties(service_owner_epoch_runtime_test PROPERTIES LABELS "host;unit" TIMEOUT 120)
+
+# Actual prepared File/swap/fixed-SHM metadata with explicit Host endpoints.
+add_test(NAME prepared_fork_metadata_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/prepared_fork_metadata_runtime_test.py
+        --cxx ${CMAKE_CXX_COMPILER})
+set_tests_properties(prepared_fork_metadata_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 120)

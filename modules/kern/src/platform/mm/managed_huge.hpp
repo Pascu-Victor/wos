@@ -6,6 +6,9 @@
 namespace ker::mod::sched::task {
 struct Task;
 }
+namespace ker::mod::mm::virt {
+class PreparedAnonymousSwapFork;
+}
 namespace ker::mod::sys {
 class SyscallPreparationScope;
 }
@@ -189,7 +192,8 @@ void release_current_range_root(CurrentRangeRootAccess&) noexcept;
 [[nodiscard]] auto copy_current_user_pagemap_exclusive(sched::task::Task&, paging::PageTable* source, paging::PageTable* child,
                                                        const sys::SyscallPreparationScope&,
                                                        const ker::syscall::vmem::SharedVmemPublicationGuard&, const RangeSplitSurvey&,
-                                                       PreparedTables&, numa::AllocationContext*, numa::AllocationResult*) noexcept -> int;
+                                                       PreparedTables&, numa::AllocationContext*, numa::AllocationResult*,
+                                                       virt::PreparedAnonymousSwapFork* = nullptr) noexcept -> int;
 // At most16 cursor steps/48 raw hierarchy loads; owns COW->pin only internally.
 [[nodiscard]] auto survey_range_chunk(paging::PageTable*, RangeSplitCursor&, RangeSurveyMode, SplitPlanStorage*) noexcept -> Error;
 // Incoming actual lifetime/PUB authority; no nested reader or fallible work.

@@ -390,10 +390,19 @@ auto CurrentRangeSplitAdmission::allows(const sched::task::Task& target, uint64_
 }  // namespace ker::mod::mm::huge
 
 namespace ker::mod::mm::virt {
-auto deep_copy_current_user_pagemap_prepared(sched::task::Task& actor, PageTable* child, const sys::SyscallPreparationScope& preparation,
-                                             const ker::syscall::vmem::SharedVmemPublicationGuard& publication,
-                                             const huge::RangeSplitSurvey& survey, huge::PreparedTables& tables,
-                                             numa::AllocationContext* eager_context, numa::AllocationResult* empty_result) noexcept -> int {
+PreparedAnonymousSwapFork::PreparedAnonymousSwapFork() noexcept = default;
+PreparedAnonymousSwapFork::~PreparedAnonymousSwapFork() { detail::reset_anonymous_swap_fork(*this); }
+auto PreparedAnonymousSwapFork::prepare(sched::task::Task& actor, sched::task::Task& child, const sys::SyscallPreparationScope& preparation)
+    -> int {
+    return detail::prepare_anonymous_swap_fork(actor, child, preparation, *this);
+}
+namespace {
+auto deep_copy_current_user_pagemap_prepared_impl(sched::task::Task& actor, PageTable* child,
+                                                  const sys::SyscallPreparationScope& preparation,
+                                                  const ker::syscall::vmem::SharedVmemPublicationGuard& publication,
+                                                  const huge::RangeSplitSurvey& survey, huge::PreparedTables& tables,
+                                                  numa::AllocationContext* eager_context, numa::AllocationResult* empty_result,
+                                                  PreparedAnonymousSwapFork* prepared_swap) noexcept -> int {
     if (!huge::detail::current_fork_context_valid(actor, preparation, publication)) return -EWOULDBLOCK;
     constexpr uint64_t USER_END = uint64_t{1} << 47;
     if (child == nullptr || !survey.complete() || survey.start() != 0 || survey.end() != USER_END) return -EINVAL;
@@ -405,9 +414,27 @@ auto deep_copy_current_user_pagemap_prepared(sched::task::Task& actor, PageTable
     int result = -EAGAIN;
     if (access.local && access.root != nullptr && access.root == actor.pagemap)
         result = huge::detail::copy_current_user_pagemap_exclusive(actor, access.root, child, preparation, publication, survey, tables,
-                                                                   eager_context, empty_result);
+                                                                   eager_context, empty_result, prepared_swap);
     // Record/release even a successful local lease followed by identity refusal.
     huge::detail::release_current_range_root(access);
     return result;
 }
+}  // namespace
+
+auto deep_copy_current_user_pagemap_prepared(sched::task::Task& actor, PageTable* child, const sys::SyscallPreparationScope& preparation,
+                                             const ker::syscall::vmem::SharedVmemPublicationGuard& publication,
+                                             const huge::RangeSplitSurvey& survey, huge::PreparedTables& tables,
+                                             numa::AllocationContext* eager_context, numa::AllocationResult* empty_result) noexcept -> int {
+    return deep_copy_current_user_pagemap_prepared_impl(actor, child, preparation, publication, survey, tables, eager_context, empty_result,
+                                                        nullptr);
+}
+auto deep_copy_current_user_pagemap_prepared(sched::task::Task& actor, PageTable* child, const sys::SyscallPreparationScope& preparation,
+                                             const ker::syscall::vmem::SharedVmemPublicationGuard& publication,
+                                             const huge::RangeSplitSurvey& survey, huge::PreparedTables& tables,
+                                             numa::AllocationContext* eager_context, numa::AllocationResult* empty_result,
+                                             PreparedAnonymousSwapFork& swap) noexcept -> int {
+    return deep_copy_current_user_pagemap_prepared_impl(actor, child, preparation, publication, survey, tables, eager_context, empty_result,
+                                                        &swap);
+}
+
 }  // namespace ker::mod::mm::virt
