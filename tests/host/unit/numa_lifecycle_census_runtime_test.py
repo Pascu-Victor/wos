@@ -57,6 +57,12 @@ def generate(root, source_root):
         )
 
     declarations = [
+        "namespace ker::mod::mm::file_mapping {"
+        + "\n".join(capture(text("platform/mm/unpublished_mapping_retirement.hpp"), "enum class " + name + " :", True)
+                    for name in ["UnpublishedRetirementState", "UnpublishedRetirementMode", "UnpublishedRetirementResult"])
+        + capture(text("platform/mm/file_mapping_lifetime.hpp"), "enum class RetirementReturnState :", True)
+        + "}"
+    ] + [
         "namespace ker::mod::acpi::numa {"
         + capture(text("platform/acpi/numa_topology.hpp"), "enum class Provenance :", True)
         + "}"
@@ -114,11 +120,19 @@ def generate(root, source_root):
             "void selftest_population_census_current(",
         ]
     )
-    native_readers = "\n".join(
+    # Host-only visibility/name seam: preserve every actual Epoch method body
+    # while allowing finite saturation seeds, never a production reset API.
+    boundary_epoch = capture(text("platform/mm/lifecycle_census.hpp"), "class Epoch final {", True)
+    import re
+    boundary_epoch = re.sub(r"\bEpoch\b", "BoundaryEpoch", boundary_epoch).replace("private:", "public:")
+    declarations.append("namespace ker::mod::mm::lifecycle_census {" + boundary_epoch + "}")
+    current_native_support = capture(text("platform/sched/task.cpp"), "class CurrentNativeSemanticOperation final {", True)
+    native_readers = "constinit mm::lifecycle_census::BoundaryEpoch current_native_semantic_epoch{};\n" + current_native_support + "\n" + "\n".join(
         capture(text("platform/sched/task.cpp"), name)
         for name in [
             "void adjust_native_return_tail(",
             "void selftest_native_debt_snapshot(",
+            "void selftest_current_native_debt_snapshot(",
             "void unregister_native_file_mapping_record(",
             "auto native_unpublished_retirements_pending(",
         ]
@@ -130,6 +144,19 @@ def generate(root, source_root):
         "\nvoid actual_return_tail(Task* owner, Task* child, mm::file_mapping::UnpublishedMappingRetirement* record, bool detached) {\n"
         + retirement[start:stop]
         + "\n}\n"
+    )
+    native_readers += "\n" + "\n".join(
+        capture(text("platform/sched/task.cpp"), name)
+        for name in [
+            "void append_native_retirement_locked(",
+            "auto advance_native_unpublished_process(",
+            "auto begin_native_file_mapping_construction(",
+            "void end_native_file_mapping_construction(",
+            "void register_native_file_mapping_record(",
+            "auto close_native_file_mapping_admission(",
+            "auto process_native_unpublished_retirements_slice(",
+            "void defer_transferred_native_unpublished_process(",
+        ]
     )
     registry_reader = capture(text("syscalls_impl/vmem/sys_vmem.cpp"), "void selftest_file_registry_snapshot(")
     shell = Path(__file__).with_suffix(".inc").read_text()
@@ -202,6 +229,8 @@ def main():
         "vfs/fd_reservation.cpp",
         "platform/sched/resource_process.cpp",
         "platform/sched/task.cpp",
+        "platform/mm/unpublished_mapping_retirement.hpp",
+        "platform/mm/file_mapping_lifetime.hpp",
         "syscalls_impl/vmem/sys_vmem.cpp",
     ]:
         candidate = source_root / "modules/kern/src" / relative
@@ -227,7 +256,7 @@ def main():
         include = scratch / "include/platform/sys"
         include.mkdir(parents=True)
         (include / "spinlock.hpp").write_text(
-            "#pragma once\n#include <cstdint>\nnamespace ker::mod::sys {\nstruct Spinlock {\n void lock(){fixture::check(fixture::lock_depth==0);++fixture::lock_depth;}\n bool try_lock(){if(fixture::lock_depth)return false;lock();return true;}\n void unlock(){fixture::check(fixture::lock_depth==1);--fixture::lock_depth;}\n uint64_t lock_irqsave(){lock();return 0;}\n void unlock_irqrestore(uint64_t){unlock();}\n};\n}\n"
+            "#pragma once\n#include <cstdint>\nnamespace ker::mod::sys {\nstruct Spinlock {\n void lock(){fixture::check(fixture::lock_depth==0);++fixture::lock_depth;}\n bool try_lock(){if(fixture::lock_depth)return false;lock();return true;}\n void unlock(){fixture::check(fixture::lock_depth==1);--fixture::lock_depth;fixture::after_native_unlock();}\n uint64_t lock_irqsave(){lock();return 0;}\n void unlock_irqrestore(uint64_t){unlock();}\n};\n}\n"
         )
         compiler = os.environ.get("WOS_HOST_CXX", "/usr/bin/clang++")
         binary = scratch / "actual"
@@ -253,7 +282,8 @@ def main():
         registry_function = capture(generated, "auto same_registry_rows(")
         mm_function = capture(generated, "auto same_mm_debt(")
         tail_before = "    adjust_native_return_tail(true);"
-        assert generated.count(tail_before) == 1
+        assert generated.count(tail_before) == 2
+        tail_wrapper = capture(generated, "void actual_return_tail(")
         scope_class = capture(generated, "class CurrentCensusScope final {", True)
         public_scope = scope_class.replace("private:", "public:", 1)
         assert public_scope != scope_class
@@ -261,7 +291,7 @@ def main():
             "actual": generated,
             "forge-current-scope": generated.replace(scope_class, public_scope, 1),
             "omit-real-return-owner": generated.replace(
-                tail_before, "    // deliberately omitted actual return owner", 1
+                tail_wrapper, tail_wrapper.replace(tail_before, "    // deliberately omitted actual return owner", 1), 1
             ),
             "old-pending-reader-equivalence": generated.replace(
                 "out.native_retirements_pending = false;",
@@ -275,6 +305,14 @@ def main():
             "ignore-mm-baseline": generated.replace(
                 mm_function, mm_function[: mm_function.index("{")] + "{ return true; }", 1
             ),
+            "missing-semantic-adoption": generated.replace(
+                "        semantic.begin();\n#endif\n        native_retirement_queue_head = record->deferred_next;",
+                "        // missing adopted operation\n#endif\n        native_retirement_queue_head = record->deferred_next;", 1),
+            "accept-saturated-current-native": generated.replace(
+                "if (out.stamp.version == UINT64_MAX) out.stamp.valid = false;", "/* omitted saturated-stamp refusal */", 1),
+            "old-conservative-current-native": generated.replace(
+                capture(generated, "void selftest_current_native_debt_snapshot("),
+                capture(generated, "void selftest_current_native_debt_snapshot(").replace("current_native_semantic_epoch.snapshot()", "native_debt_epoch.snapshot()")),
             "fault-in-output": generated.replace(
                 "bool const exported = usercopy::copy_to_task_mapped(",
                 "bool const exported = usercopy::copy_to_task(",

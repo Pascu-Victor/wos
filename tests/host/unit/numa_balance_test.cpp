@@ -11,7 +11,10 @@
 #include <new>
 #include <platform/mm/numa_balance_scan.hpp>
 #include <span>
+#include <tuple>
 #include <vector>
+
+#include "numa_balance_reference_scan.hpp"
 
 namespace {
 namespace mm = ker::mod::mm;
@@ -74,6 +77,46 @@ class NumaBalance : public ::testing::Test {
     std::unique_ptr<nb::Snapshot> output = std::make_unique<nb::Snapshot>();
     std::unique_ptr<nb::Workspace> workspace = std::make_unique<nb::Workspace>();
 
+    std::unique_ptr<nb::Snapshot> reference_output = std::make_unique<nb::Snapshot>();
+    std::unique_ptr<nb::Workspace> reference_workspace = std::make_unique<nb::Workspace>();
+
+    static void same_counts(const nb::Counts& a, const nb::Counts& b) {
+        auto fields = [](auto const& c) {
+            return std::tie(c.managed_pages, c.free_pages, c.cached_free_pages, c.allocator_metadata_pages, c.zone_descriptor_pages,
+                            c.owner_pages, c.kind_pages, c.sampled_zero_ref_owned_pages, c.sampled_single_ref_owned_pages,
+                            c.sampled_shared_ref_owned_pages);
+        };
+        EXPECT_EQ(fields(a), fields(b));
+        for (size_t i = 0; i < mm::PHYSICAL_PAGE_OWNER_COUNT; ++i) {
+            EXPECT_EQ(a.owners[i].pages, b.owners[i].pages);
+            EXPECT_EQ(a.owners[i].objects, b.owners[i].objects);
+        }
+    }
+    void same_snapshot() {
+        auto const& a = *output;
+        auto const& b = *reference_output;
+        EXPECT_EQ(std::tie(a.complete, a.provenance, a.node_count, a.zone_count, a.scanned_frames),
+                  std::tie(b.complete, b.provenance, b.node_count, b.zone_count, b.scanned_frames));
+        EXPECT_EQ(std::tie(a.result.error, a.result.zone_index, a.result.physical, a.result.flags, a.result.kind, a.result.owner),
+                  std::tie(b.result.error, b.result.zone_index, b.result.physical, b.result.flags, b.result.kind, b.result.owner));
+        auto global = [](auto const& c) {
+            return std::tie(c.managed_pages, c.free_pages, c.allocator_metadata_pages, c.zone_descriptor_pages,
+                            c.per_cpu_page_cache_reserve_pages, c.per_cpu_page_cache_reserve_objects, c.owner_pages, c.identity_pages,
+                            c.identity_mismatch_pages, c.untracked_unreclaimable_pages, c.zone_count);
+        };
+        EXPECT_EQ(global(a.global), global(b.global));
+        for (size_t i = 0; i < mm::PHYSICAL_PAGE_OWNER_COUNT; ++i) {
+            EXPECT_EQ(a.global.owners[i].pages, b.global.owners[i].pages);
+            EXPECT_EQ(a.global.owners[i].objects, b.global.owners[i].objects);
+        }
+        for (size_t i = 0; i < mm::phys::PHYSICAL_RESERVE_KIND_COUNT; ++i) {
+            EXPECT_EQ(a.global.firmware_reserves[i].pages, b.global.firmware_reserves[i].pages);
+            EXPECT_EQ(a.global.firmware_reserves[i].objects, b.global.firmware_reserves[i].objects);
+        }
+        same_counts(a.scanned, b.scanned);
+        for (size_t i = 0; i < a.nodes.size(); ++i) same_counts(a.nodes[i], b.nodes[i]);
+    }
+
     void SetUp() override { ranges({{arena.physical - PAGE, arena.end() - arena.physical + PAGE, 0, 0}}); }
 
     void ranges(std::initializer_list<topology::MemoryRange> input, uint16_t nodes = 3) {
@@ -89,15 +132,23 @@ class NumaBalance : public ::testing::Test {
     }
 
     auto scan(std::span<const nb::ZoneView> views, uint64_t limit = UINT64_MAX) -> nb::Result {
+        auto const old_prepared = nb::reference::prepare_scan(*domains, views, *reference_output, *reference_workspace, limit);
         auto result = nb::detail::prepare_scan(*domains, views, *output, *workspace, limit);
+        EXPECT_EQ(result.valid(), old_prepared.valid());
+        same_snapshot();
         if (!result.valid()) return result;
-        // Same actual-lock protocol used by the native collector. This Host
-        // test does not execute phys.opt.cpp, native IRQs or hardware ref pins.
+        // Both actual scanners see the SAME stable real PageAllocator state
+        // under the production all-lock interval. Compare typed fields, not padding.
         for (size_t i = 0; i < workspace->zone_count; ++i) workspace->lock_flags[i] = workspace->zones[i].allocator->lock_irq();
+        auto const old_result = nb::reference::scan_locked(*domains, *reference_output, *reference_workspace);
         result = nb::detail::scan_locked(*domains, *output, *workspace);
+        EXPECT_EQ(result.valid(), old_result.valid());
         EXPECT_FALSE(output->complete);
         for (size_t i = workspace->zone_count; i != 0; --i) workspace->zones[i - 1].allocator->unlock_irq(workspace->lock_flags[i - 1]);
-        return nb::detail::finish_unlocked(*output, *workspace);
+        (void)nb::reference::finish_unlocked(*reference_output, *reference_workspace);
+        result = nb::detail::finish_unlocked(*output, *workspace);
+        same_snapshot();
+        return result;
     }
 
     auto scan(uint64_t limit = UINT64_MAX) -> nb::Result {
@@ -387,6 +438,39 @@ TEST_F(NumaBalance, WhollyReservedRealAllocatorAndMissingLockAreHandled) {
     EXPECT_EQ(nb::detail::scan_locked(*domains, *output, *workspace).error, nb::Error::INVALID_INPUT);
     EXPECT_FALSE(nb::detail::finish_unlocked(*output, *workspace).valid());
     EXPECT_FALSE(output->complete);
+}
+
+TEST_F(NumaBalance, EveryCorruptContinuationKeepsTheExactOldFailurePrefixAcrossNodes) {
+    void* block = allocate(32 * PAGE);
+    ASSERT_NE(block, nullptr);
+    uint32_t const INDEX = arena.index(block);
+    uint64_t const CUT = arena.physical + static_cast<uint64_t>(INDEX + 11) * PAGE;
+    ranges({{arena.physical - PAGE, CUT - arena.physical + PAGE, 0, 0}, {CUT, arena.end() - CUT, 1, 0}});
+    for (uint32_t page = 0; page < 32; ++page) {
+        uint8_t const FLAG = arena.allocator->page_flags[INDEX + page];
+        arena.allocator->page_flags[INDEX + page] = mm::PageAllocator::FLAG_RESERVED;
+        EXPECT_EQ(scan().error, nb::Error::METADATA);
+        EXPECT_EQ(output->result.physical, arena.physical + static_cast<uint64_t>(INDEX + page) * PAGE);
+        arena.allocator->page_flags[INDEX + page] = FLAG;
+    }
+    for (uint32_t page = 0; page < 32; ++page) arena.allocator->page_refcounts[INDEX + page].store(page % 3);
+    expect_exact();
+    EXPECT_EQ(output->scanned.sampled_zero_ref_owned_pages, 11U);
+    EXPECT_EQ(output->scanned.sampled_single_ref_owned_pages, 11U);
+    EXPECT_EQ(output->scanned.sampled_shared_ref_owned_pages, 10U);
+    for (uint32_t page = 0; page < 32; ++page) arena.allocator->page_refcounts[INDEX + page].store(1);
+    release(block, 32 * PAGE);
+}
+
+TEST_F(NumaBalance, CheckedBulkArithmeticRefusesOverflow) {
+    nb::Counts counts{};
+    counts.managed_pages = UINT64_MAX - 7;
+    EXPECT_FALSE(nb::detail::count_run(counts, nb::detail::Category::FREE, static_cast<uint8_t>(mm::PageKind::FREE), 0, 8, 0, 0, 0, 0));
+    EXPECT_EQ(counts.managed_pages, UINT64_MAX - 7);
+    counts = {};
+    counts.owners[OWN].objects = UINT64_MAX;
+    EXPECT_FALSE(nb::detail::count_run(counts, nb::detail::Category::OWNED, static_cast<uint8_t>(mm::PageKind::NORMAL),
+                                       static_cast<uint8_t>(OWNER), 512, 1, 0, 512, 0));
 }
 
 }  // namespace

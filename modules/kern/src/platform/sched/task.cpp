@@ -614,10 +614,33 @@ void teardown_unpublished_process_resources(Task* task, mm::file_mapping::Unpubl
 namespace {
 #ifdef WOS_SELFTEST
 constinit mm::lifecycle_census::Epoch native_debt_epoch{};
+// Current scheduled census observes real mutations. Keep the old conservative
+// OwnerLock witness for its existing readers and failed/read-only attempts.
+constinit mm::lifecycle_census::Epoch current_native_semantic_epoch{};
+class CurrentNativeSemanticOperation final {
+   public:
+    void begin() noexcept {
+        if (!owned_) {
+            current_native_semantic_epoch.begin();
+            owned_ = true;
+        }
+    }
+    ~CurrentNativeSemanticOperation() {
+        if (owned_) current_native_semantic_epoch.end();
+    }
+    CurrentNativeSemanticOperation() = default;
+    CurrentNativeSemanticOperation(const CurrentNativeSemanticOperation&) = delete;
+    auto operator=(const CurrentNativeSemanticOperation&) -> CurrentNativeSemanticOperation& = delete;
+
+   private:
+    bool owned_{};
+};
 mm::lifecycle_census::OwnerLock native_retirement_queue_lock{native_debt_epoch};
 constinit std::atomic<uint64_t> native_return_tails{};
 constinit std::atomic<bool> native_debt_arithmetic_valid{true};
 void adjust_native_return_tail(bool add) noexcept {
+    CurrentNativeSemanticOperation semantic;
+    semantic.begin();
     native_debt_epoch.begin();
     auto value = native_return_tails.load(std::memory_order_seq_cst);
     for (;;) {
@@ -645,10 +668,16 @@ size_t native_mapping_constructions{};
 bool native_mapping_construction_closed{};
 
 void unregister_native_file_mapping_record(Task& child, mm::file_mapping::UnpublishedMappingRetirement& record) {
+#ifdef WOS_SELFTEST
+    CurrentNativeSemanticOperation semantic;
+#endif
     uint64_t const FLAGS = native_mapping_admission_lock.lock_irqsave();
     auto** link = &native_mapping_active_records;
     while (*link != nullptr && *link != &record) link = &(*link)->active_next;
     if (*link != &record || record.active_subject != &child) __builtin_trap();
+#ifdef WOS_SELFTEST
+    semantic.begin();
+#endif
     *link = record.active_next;
     record.active_next = nullptr;
     record.active_subject = nullptr;
@@ -666,6 +695,9 @@ void append_native_retirement_locked(mm::file_mapping::UnpublishedMappingRetirem
 
 auto advance_native_unpublished_process(Task* owner, Task* child, mm::file_mapping::UnpublishedRetirementMode mode, int* close_result,
                                         bool detached) -> mm::file_mapping::UnpublishedRetirementResult {
+#ifdef WOS_SELFTEST
+    CurrentNativeSemanticOperation semantic;
+#endif
     namespace fm = mm::file_mapping;
     using Result = fm::UnpublishedRetirementResult;
     if (owner == nullptr || child == nullptr || owner == child || !sched::can_query_current_task() || sched::get_current_task() != owner ||
@@ -678,6 +710,9 @@ auto advance_native_unpublished_process(Task* owner, Task* child, mm::file_mappi
         return Result::REFUSED;
     auto const HOLD = sched::hold_kernel_shutdown();
     if (record->state == fm::UnpublishedRetirementState::PREPARED) {
+#ifdef WOS_SELFTEST
+        semantic.begin();
+#endif
         bool expected = false;
         if (!detached && !owner->unpublished_teardown_in_progress.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
             return Result::REFUSED;
@@ -694,6 +729,9 @@ auto advance_native_unpublished_process(Task* owner, Task* child, mm::file_mappi
         return Result::REFUSED;
     }
     if (record->state == fm::UnpublishedRetirementState::RETIRING) {
+#ifdef WOS_SELFTEST
+        semantic.begin();
+#endif
         // A RAW fork may wait IRQ-off on a colliding root stripe. Keep this
         // gate's owner running until release; never park it behind that waiter.
         // The admitted <=49 tables/512 leaves consume <=1217 walker steps.
@@ -725,9 +763,15 @@ auto advance_native_unpublished_process(Task* owner, Task* child, mm::file_mappi
         if (RETURN.state == fm::RetirementReturnState::INVALID || RETURN.state == fm::RetirementReturnState::EMPTY)
             dbg::panic_handler("native counted File retirement observer invalid");
         if (RETURN.state != fm::RetirementReturnState::RETURNED) return Result::PENDING;
+#ifdef WOS_SELFTEST
+        if (record->first_close_result == 0 && RETURN.callback_result != 0) semantic.begin();
+#endif
         if (record->first_close_result == 0 && RETURN.callback_result != 0) record->first_close_result = RETURN.callback_result;
     }
     if (child->ref_count.load(std::memory_order_acquire) != 2) return Result::PENDING;
+#ifdef WOS_SELFTEST
+    semantic.begin();
+#endif
     if (mode == fm::UnpublishedRetirementMode::OWNED_SLOT) {
         Task* expected = child;
         if (!owner->owned_unpublished_process.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel))
@@ -784,26 +828,69 @@ void selftest_native_debt_snapshot(::ker::test::numa_lifecycle::NativeDebtSnapsh
     out.stamp = native_debt_epoch.snapshot();
     if (PROTOCOL && mm::lifecycle_census::unchanged(BEFORE, out.stamp)) out.flags |= census::NATIVE_COMPLETE;
 }
+
+void selftest_current_native_debt_snapshot(::ker::test::numa_lifecycle::NativeDebtSnapshot& out) noexcept {
+    namespace census = ::ker::test::numa_lifecycle;
+    // Exclusive plain output. Instrumented writes precede all owner locks.
+    auto* bytes = reinterpret_cast<volatile uint8_t*>(&out);
+    for (size_t i = 0; i < sizeof(out); ++i) bytes[i] = 0;
+    auto const BEFORE = current_native_semantic_epoch.snapshot();
+    auto flags = native_mapping_admission_lock.observe_lock_irqsave();
+    out.constructions = native_mapping_constructions;
+    if (native_mapping_active_records != nullptr) out.flags |= census::NATIVE_ACTIVE_PRESENT;
+    if (native_mapping_construction_closed) out.flags |= census::NATIVE_ADMISSION_CLOSED;
+    native_mapping_admission_lock.observe_unlock_irqrestore(flags);
+    flags = native_retirement_queue_lock.observe_lock_irqsave();
+    bool const HEAD = native_retirement_queue_head != nullptr;
+    bool const TAIL = native_retirement_queue_tail != nullptr;
+    out.queue_outstanding = native_retirement_queue_outstanding;
+    if (HEAD) out.flags |= census::NATIVE_QUEUE_PRESENT;
+    bool const PROTOCOL = HEAD == TAIL && (out.queue_outstanding != 0 || !HEAD);
+    native_retirement_queue_lock.observe_unlock_irqrestore(flags);
+    out.return_tails = native_return_tails.load(std::memory_order_seq_cst);
+    if (PROTOCOL && native_debt_arithmetic_valid.load(std::memory_order_seq_cst)) out.flags |= census::NATIVE_ARITHMETIC_VALID;
+    out.stamp = current_native_semantic_epoch.snapshot();
+    if (out.stamp.version == UINT64_MAX) out.stamp.valid = false;
+    if (PROTOCOL && mm::lifecycle_census::unchanged(BEFORE, out.stamp)) out.flags |= census::NATIVE_COMPLETE;
+}
 #endif
 
 auto begin_native_file_mapping_construction() -> bool {
+#ifdef WOS_SELFTEST
+    CurrentNativeSemanticOperation semantic;
+#endif
     uint64_t const FLAGS = native_mapping_admission_lock.lock_irqsave();
     bool const ADMITTED = !native_mapping_construction_closed && native_mapping_constructions != SIZE_MAX;
+#ifdef WOS_SELFTEST
+    if (ADMITTED) semantic.begin();
+#endif
     if (ADMITTED) ++native_mapping_constructions;
     native_mapping_admission_lock.unlock_irqrestore(FLAGS);
     return ADMITTED;
 }
 
 void end_native_file_mapping_construction() {
+#ifdef WOS_SELFTEST
+    CurrentNativeSemanticOperation semantic;
+#endif
     uint64_t const FLAGS = native_mapping_admission_lock.lock_irqsave();
     if (native_mapping_constructions == 0) __builtin_trap();
+#ifdef WOS_SELFTEST
+    semantic.begin();
+#endif
     --native_mapping_constructions;
     native_mapping_admission_lock.unlock_irqrestore(FLAGS);
 }
 
 void register_native_file_mapping_record(Task& child, mm::file_mapping::UnpublishedMappingRetirement& record) {
+#ifdef WOS_SELFTEST
+    CurrentNativeSemanticOperation semantic;
+#endif
     uint64_t const FLAGS = native_mapping_admission_lock.lock_irqsave();
     if (native_mapping_constructions == 0 || record.active_subject != nullptr) __builtin_trap();
+#ifdef WOS_SELFTEST
+    semantic.begin();
+#endif
     record.active_subject = &child;
     record.active_next = native_mapping_active_records;
     native_mapping_active_records = &record;
@@ -811,7 +898,13 @@ void register_native_file_mapping_record(Task& child, mm::file_mapping::Unpublis
 }
 
 auto close_native_file_mapping_admission() -> bool {
+#ifdef WOS_SELFTEST
+    CurrentNativeSemanticOperation semantic;
+#endif
     uint64_t const FLAGS = native_mapping_admission_lock.lock_irqsave();
+#ifdef WOS_SELFTEST
+    if (!native_mapping_construction_closed) semantic.begin();
+#endif
     native_mapping_construction_closed = true;
     bool const DRAINED = native_mapping_constructions == 0 && native_mapping_active_records == nullptr;
     native_mapping_admission_lock.unlock_irqrestore(FLAGS);
@@ -826,12 +919,18 @@ auto native_unpublished_retirements_pending() -> bool {
 }
 
 auto process_native_unpublished_retirements_slice(bool& root_active) -> bool {
+#ifdef WOS_SELFTEST
+    CurrentNativeSemanticOperation semantic;
+#endif
     root_active = false;
     if (!sched::is_current_gc_worker() || !sched::interrupts_enabled() || sched::preempt_count() != 0)
         return native_unpublished_retirements_pending();
     uint64_t flags = native_retirement_queue_lock.lock_irqsave();
     auto* record = native_retirement_queue_head;
     if (record != nullptr) {
+#ifdef WOS_SELFTEST
+        semantic.begin();
+#endif
         native_retirement_queue_head = record->deferred_next;
         if (native_retirement_queue_head == nullptr) native_retirement_queue_tail = nullptr;
         record->deferred_next = nullptr;
@@ -868,10 +967,16 @@ auto process_native_unpublished_retirements_slice(bool& root_active) -> bool {
 
 namespace {
 void defer_transferred_native_unpublished_process(Task& owner, Task& child) {
+#ifdef WOS_SELFTEST
+    CurrentNativeSemanticOperation semantic;
+#endif
     auto* record = child.native_file_mapping_retirement.load(std::memory_order_acquire);
     if (record == nullptr || record->controller != &owner || record->state != mm::file_mapping::UnpublishedRetirementState::PREPARED ||
         owner.owned_unpublished_process.load(std::memory_order_acquire) == &child || record->deferred_subject != nullptr)
         dbg::panic_handler("native transfer refusal lost exact recoverable owner");
+#ifdef WOS_SELFTEST
+    semantic.begin();
+#endif
     record->controller = nullptr;
     record->deferred_subject = &child;  // Transfer the caller's existing ref; never drop it.
     record->mode = mm::file_mapping::UnpublishedRetirementMode::DEFERRED_TRANSFERRED;

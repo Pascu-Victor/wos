@@ -156,17 +156,36 @@ inline auto node_for(const acpi::numa::Topology& topology, Workspace& scratch, u
 
 enum class Category : uint8_t { DESCRIPTOR, METADATA, FREE, CACHED, OWNED };
 
-inline auto count(Counts& counts, Category category, uint8_t kind, uint8_t owner, uint32_t refs, bool head) noexcept -> bool {
-    if (!add(counts.managed_pages, 1)) return false;
-    if (category == Category::DESCRIPTOR) return add(counts.zone_descriptor_pages, 1);
-    if (!add(counts.kind_pages[kind], 1)) return false;
-    if (category == Category::METADATA) return add(counts.allocator_metadata_pages, 1);
+// Bulk arithmetic follows the same category fields as count(). Every frame's
+// raw metadata/ref sample is still validated before its run is accounted.
+inline auto count_run(Counts& counts, Category category, uint8_t kind, uint8_t owner, uint64_t pages, uint64_t heads, uint64_t zero_refs,
+                      uint64_t single_refs, uint64_t shared_refs) noexcept -> bool {
+    if (!add(counts.managed_pages, pages)) return false;
+    if (category == Category::DESCRIPTOR) return add(counts.zone_descriptor_pages, pages);
+    if (!add(counts.kind_pages[kind], pages)) return false;
+    if (category == Category::METADATA) return add(counts.allocator_metadata_pages, pages);
     if (category == Category::FREE || category == Category::CACHED)
-        return add(counts.free_pages, 1) && (category != Category::CACHED || add(counts.cached_free_pages, 1));
-    if (!add(counts.owner_pages, 1) || !add(counts.owners[owner].pages, 1) || (head && !add(counts.owners[owner].objects, 1))) return false;
-    if (refs == 0) return add(counts.sampled_zero_ref_owned_pages, 1);
-    if (refs == 1) return add(counts.sampled_single_ref_owned_pages, 1);
-    return add(counts.sampled_shared_ref_owned_pages, 1);
+        return add(counts.free_pages, pages) && (category != Category::CACHED || add(counts.cached_free_pages, pages));
+    return add(counts.owner_pages, pages) && add(counts.owners[owner].pages, pages) && add(counts.owners[owner].objects, heads) &&
+           add(counts.sampled_zero_ref_owned_pages, zero_refs) && add(counts.sampled_single_ref_owned_pages, single_refs) &&
+           add(counts.sampled_shared_ref_owned_pages, shared_refs);
+}
+
+inline auto count(Counts& counts, Category category, uint8_t kind, uint8_t owner, uint32_t refs, bool head) noexcept -> bool {
+    return count_run(counts, category, kind, owner, 1, head ? 1 : 0, refs == 0 ? 1 : 0, refs == 1 ? 1 : 0, refs > 1 ? 1 : 0);
+}
+
+inline auto account_run(Snapshot& out, Workspace& scratch, uint32_t zone, uint16_t node, uint64_t physical, Category category,
+                        uint8_t flags, uint8_t kind, uint8_t owner, uint32_t pages, bool head, uint64_t zero_refs, uint64_t single_refs,
+                        uint64_t shared_refs) noexcept -> bool {
+    if (!count_run(out.scanned, category, kind, owner, pages, head ? 1 : 0, zero_refs, single_refs, shared_refs) ||
+        !count_run(out.nodes[node], category, kind, owner, pages, head ? 1 : 0, zero_refs, single_refs, shared_refs) ||
+        !count_run(scratch.zone_scanned, category, kind, owner, pages, head ? 1 : 0, zero_refs, single_refs, shared_refs) ||
+        !add(out.scanned_frames, pages)) {
+        refuse(out, Error::OVERFLOW, zone, physical, flags, kind, owner);
+        return false;
+    }
+    return true;
 }
 
 inline auto page(const acpi::numa::Topology& topology, Snapshot& out, Workspace& scratch, uint32_t zone, uint64_t physical,
@@ -234,21 +253,48 @@ inline auto scan_zone(const acpi::numa::Topology& topology, Snapshot& out, Works
         if (OWNED && (!physical_page_owner_is_valid(static_cast<PhysicalPageOwner>(OWNER)) ||
                       KIND == static_cast<uint8_t>(PageKind::FREE) || KIND == static_cast<uint8_t>(PageKind::RESERVED)))
             return fail();
-        for (uint32_t offset = 0; offset < PAGES; ++offset) {
-            uint32_t const CURRENT = index + offset;
-            uint8_t const EXPECTED = offset == 0 ? FLAGS : (OWNED ? PageAllocator::FLAG_ALLOC_CONT : PageAllocator::FLAG_FREE_INTERIOR);
-            uint8_t const CURRENT_KIND = allocator.page_kinds[CURRENT].load(std::memory_order_acquire);
-            uint8_t const CURRENT_OWNER = allocator.page_owners[CURRENT];
-            uint32_t const REFS = allocator.page_refcounts[CURRENT].load(std::memory_order_acquire);
-            uint64_t const ADDRESS = view.physical_base + static_cast<uint64_t>(CURRENT) * paging::PAGE_SIZE;
-            if (allocator.page_flags[CURRENT] != EXPECTED || CURRENT_KIND != (OWNED ? KIND : static_cast<uint8_t>(PageKind::FREE)) ||
-                CURRENT_OWNER != (OWNED ? OWNER : 0) || (!OWNED && REFS != 0)) {
-                refuse(out, Error::METADATA, zone, ADDRESS, allocator.page_flags[CURRENT], CURRENT_KIND, CURRENT_OWNER);
+        uint32_t offset = 0;
+        while (offset < PAGES) {
+            uint64_t const RUN_ADDRESS = view.physical_base + static_cast<uint64_t>(index + offset) * paging::PAGE_SIZE;
+            uint16_t const NODE = node_for(topology, scratch, RUN_ADDRESS);
+            if (NODE == acpi::numa::INVALID_NODE) {
+                refuse(out, Error::COVERAGE, zone, RUN_ADDRESS, FLAGS, KIND, OWNER);
                 return false;
             }
-            if (!page(topology, out, scratch, zone, ADDRESS, OWNED ? Category::OWNED : Category::FREE, EXPECTED, CURRENT_KIND,
-                      CURRENT_OWNER, REFS, OWNED && offset == 0))
+            auto const& range = topology.memory[scratch.memory_cursor];
+            uint64_t const RANGE_PAGES = (range.base + range.length - RUN_ADDRESS) / paging::PAGE_SIZE;
+            uint32_t const RUN_PAGES = RANGE_PAGES < PAGES - offset ? static_cast<uint32_t>(RANGE_PAGES) : PAGES - offset;
+            uint64_t zero_refs = 0, single_refs = 0, shared_refs = 0;
+            for (uint32_t in_run = 0; in_run < RUN_PAGES; ++in_run) {
+                uint32_t const CURRENT = index + offset + in_run;
+                uint8_t const EXPECTED =
+                    offset + in_run == 0 ? FLAGS : (OWNED ? PageAllocator::FLAG_ALLOC_CONT : PageAllocator::FLAG_FREE_INTERIOR);
+                uint8_t const CURRENT_KIND = allocator.page_kinds[CURRENT].load(std::memory_order_acquire);
+                uint8_t const CURRENT_OWNER = allocator.page_owners[CURRENT];
+                uint32_t const REFS = allocator.page_refcounts[CURRENT].load(std::memory_order_acquire);
+                uint64_t const ADDRESS = view.physical_base + static_cast<uint64_t>(CURRENT) * paging::PAGE_SIZE;
+                if (allocator.page_flags[CURRENT] != EXPECTED || CURRENT_KIND != (OWNED ? KIND : static_cast<uint8_t>(PageKind::FREE)) ||
+                    CURRENT_OWNER != (OWNED ? OWNER : 0) || (!OWNED && REFS != 0)) {
+                    // Preserve the old valid-prefix output on metadata refusal.
+                    if (in_run != 0 && !account_run(out, scratch, zone, NODE, RUN_ADDRESS, OWNED ? Category::OWNED : Category::FREE, FLAGS,
+                                                    KIND, OWNER, in_run, OWNED && offset == 0, zero_refs, single_refs, shared_refs))
+                        return false;
+                    refuse(out, Error::METADATA, zone, ADDRESS, allocator.page_flags[CURRENT], CURRENT_KIND, CURRENT_OWNER);
+                    return false;
+                }
+                if (OWNED) {
+                    // Bounded by RUN_PAGES <= 1U << MAX_ORDER. These local
+                    // samples are bulk-added with overflow checks below.
+                    zero_refs += REFS == 0 ? 1 : 0;
+                    single_refs += REFS == 1 ? 1 : 0;
+                    shared_refs += REFS > 1 ? 1 : 0;
+                }
+            }
+            if (!account_run(out, scratch, zone, NODE, RUN_ADDRESS, OWNED ? Category::OWNED : Category::FREE, FLAGS,
+                             OWNED ? KIND : static_cast<uint8_t>(PageKind::FREE), OWNED ? OWNER : 0, RUN_PAGES, OWNED && offset == 0,
+                             zero_refs, single_refs, shared_refs))
                 return false;
+            offset += RUN_PAGES;
         }
         index += PAGES;
     }

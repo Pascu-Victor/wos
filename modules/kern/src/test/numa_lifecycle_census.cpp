@@ -514,14 +514,14 @@ class CensusHandler final {
         CurrentCensusScope scope{actor, s.cookie, s.root_serial};
         bool const owner_a = collect_owners(scope, plain.owner_a);
         collect_scalars(scope, plain.scalar_a);
-        sched::task::selftest_native_debt_snapshot(plain.native_a);
+        sched::task::selftest_current_native_debt_snapshot(plain.native_a);
         syscall::vmem::selftest_file_registry_snapshot(plain.registry_a);
         mm_debt::snapshot(plain.mm_a);
         auto const physical_a = balance::snapshot(plain.physical_a, plain.physical_work, MAX_FRAMES);
         auto const physical_b = balance::snapshot(plain.physical_b, plain.physical_work, MAX_FRAMES);
         mm_debt::snapshot(plain.mm_b);
         syscall::vmem::selftest_file_registry_snapshot(plain.registry_b);
-        sched::task::selftest_native_debt_snapshot(plain.native_b);
+        sched::task::selftest_current_native_debt_snapshot(plain.native_b);
         collect_scalars(scope, plain.scalar_b);
         bool const owner_b = collect_owners(scope, plain.owner_b);
         plain.scalar_a.native_retirements_pending = plain.native_a.queue_outstanding != 0;

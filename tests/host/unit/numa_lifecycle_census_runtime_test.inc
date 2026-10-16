@@ -14,6 +14,10 @@ namespace fixture {
 unsigned checks{}, lock_depth{}, copy_pins{}, provider_calls{}, copies{}, progress{}, tail_events{};
 const void* tail_target{};
 void observe_tail(unsigned phase);
+void after_native_unlock();
+void native_operation_probe();
+inline bool native_probe{}, native_gc{true}, native_wait{}, native_root_busy{}, native_exclusive{true};
+inline unsigned native_adoptions{}, native_backends{};
 void check(bool value, int line = __builtin_LINE()) {
     ++checks;
     if (!value) {
@@ -55,12 +59,45 @@ namespace ker::mod::sched::task {
 struct Task;
 }
 namespace ker::mod::mm::file_mapping {
+struct Completion {
+    RetirementReturnState state{RetirementReturnState::RETURNED};
+    int callback_result{};
+    auto empty() const { return false; }
+    struct Return {
+        RetirementReturnState state;
+        int callback_result;
+    };
+    auto query() const {
+        fixture::native_operation_probe();
+        return Return{state, callback_result};
+    }
+};
 struct UnpublishedMappingRetirement {
+    struct Entry {
+        Completion completion;
+    };
+    std::array<Entry, 8> entries{};
+    size_t count{};
+    int* root_walk{};
+    void* retired_root{};
+    bool root_walk_started{};
+    ker::mod::sched::task::Task* controller{};
+    UnpublishedRetirementState state{UnpublishedRetirementState::PREPARED};
+    UnpublishedRetirementMode mode{UnpublishedRetirementMode::OWNED_SLOT};
+    int first_close_result{};
+    ker::mod::sched::task::Task* deferred_subject{};
+    UnpublishedMappingRetirement* deferred_next{};
+    bool deferred_claimed{};
     UnpublishedMappingRetirement* active_next{};
     ker::mod::sched::task::Task* active_subject{};
-    ~UnpublishedMappingRetirement() { fixture::observe_tail(2); }
+    ~UnpublishedMappingRetirement() {
+        if (fixture::tail_target != nullptr) fixture::observe_tail(2);
+    }
 };
 }  // namespace ker::mod::mm::file_mapping
+namespace ker::mod::dbg {
+[[noreturn]] void panic_handler(const char*) { std::abort(); }
+}  // namespace ker::mod::dbg
 namespace ker::mod::mm::phys {
 void page_free(void*) { fixture::observe_tail(1); }
 }  // namespace ker::mod::mm::phys
@@ -134,8 +171,9 @@ struct Task {
     void* pending_wki_submit_buffers{};
     void* pending_wki_filesystems{};
     void* pending_signal_targets{};
-    std::atomic<void*> owned_unpublished_process{}, owned_exec_preparation{}, owned_exec_arguments{}, pending_exec_handoff{},
-        active_exec_handoff{}, native_file_mapping_retirement{};
+    std::atomic<Task*> owned_unpublished_process{};
+    std::atomic<void*> owned_exec_preparation{}, owned_exec_arguments{}, pending_exec_handoff{}, active_exec_handoff{};
+    std::atomic<ker::mod::mm::file_mapping::UnpublishedMappingRetirement*> native_file_mapping_retirement{};
     std::atomic<bool> unpublished_teardown_in_progress{}, exec_preparation_teardown_in_progress{}, exit_in_progress{},
         process_exit_requested{};
     ker::mod::sys::Spinlock resource_lock;
@@ -261,6 +299,19 @@ auto selftest_shm_census() {
 }
 }  // namespace ker::syscall::shm
 namespace ker::mod::mm::virt {
+auto begin_prepared_destroy_user_space(int&, void*, uint64_t, const char*, const char*, bool) {
+    fixture::native_operation_probe();
+    return !fixture::native_root_busy;
+}
+auto destroy_user_space_budgeted(void*, int) {
+    fixture::native_operation_probe();
+    return true;
+}
+auto finish_destroy_user_space_and_release_pagemap(void*) {
+    fixture::native_operation_probe();
+    return true;
+}
+void destroy_user_space_budget_state_destroy(void*) { fixture::native_operation_probe(); }
 void selftest_enable_current_root_census() noexcept { fixture::outside(); }
 void selftest_current_root_census_into(SelftestRootCensus& out, ker::mod::mm::lifecycle_census::Stamp& before) noexcept {
     fixture::outside();
@@ -289,6 +340,16 @@ auto drain_kernel_vmap_frees_bounded(size_t n) {
 }
 }  // namespace ker::mod::mm::virt
 /* @OWNER@ */
+namespace ker::mod::mm::file_mapping {
+class LifetimeRetirementExecutor {
+   public:
+    static auto is_current_worker() { return false; }
+    static auto snapshot() {
+        fixture::outside();
+        return fixture::executor;
+    }
+};
+}  // namespace ker::mod::mm::file_mapping
 namespace ker::mod::sched {
 auto can_query_current_task() { return fixture::can_query; }
 auto get_current_task() { return fixture::current; }
@@ -330,6 +391,11 @@ auto status() {
     return Status{};
 }
 }  // namespace compartment
+void request_gc();
+auto is_current_gc_worker() { return fixture::native_gc; }
+struct NativeShutdownHold {};
+auto hold_kernel_shutdown() { return NativeShutdownHold{}; }
+struct PreemptGuard {};
 namespace task {
 mm::lifecycle_census::Epoch native_debt_epoch;
 mm::lifecycle_census::OwnerLock native_mapping_admission_lock{native_debt_epoch}, native_retirement_queue_lock{native_debt_epoch};
@@ -337,9 +403,11 @@ std::atomic<uint64_t> native_return_tails{};
 std::atomic<bool> native_debt_arithmetic_valid{true};
 size_t native_mapping_constructions{}, native_retirement_queue_outstanding{};
 mm::file_mapping::UnpublishedMappingRetirement* native_mapping_active_records{};
-void* native_retirement_queue_head{};
-void* native_retirement_queue_tail{};
+mm::file_mapping::UnpublishedMappingRetirement* native_retirement_queue_head{};
+mm::file_mapping::UnpublishedMappingRetirement* native_retirement_queue_tail{};
 bool native_mapping_construction_closed{};
+auto unpublished_process_is_exclusively_owned(Task*) { return fixture::native_exclusive; }
+void teardown_unpublished_process_resources(Task*, mm::file_mapping::UnpublishedMappingRetirement*) { fixture::native_operation_probe(); }
 /* @NATIVE_READERS@ */
 }  // namespace task
 struct Trace {
@@ -369,15 +437,7 @@ void request_gc() {
     ++fixture::progress;
 }
 }  // namespace ker::mod::sched
-namespace ker::mod::mm::file_mapping {
-class LifetimeRetirementExecutor {
-   public:
-    static auto snapshot() {
-        fixture::outside();
-        return fixture::executor;
-    }
-};
-}  // namespace ker::mod::mm::file_mapping
+
 namespace ker::mod::mm::phys {
 void get_alloc_stats_snapshot(AllocStatsSnapshot& out) {
     fixture::outside();
@@ -505,6 +565,20 @@ auto snapshot(Snapshot& out, Workspace&, uint64_t max) noexcept -> Result {
 }  // namespace ker::mod::mm::numa::balance
 /* @HANDLER@ */
 namespace fixture {
+void native_operation_probe() {
+    if (!native_probe) return;
+    outside();
+    auto const stamp = ker::mod::sched::task::current_native_semantic_epoch.snapshot();
+    check(stamp.valid && stamp.inflight != 0);
+    ++native_backends;
+}
+void after_native_unlock() {
+    if (!native_probe) return;
+    using namespace ker::mod::sched::task;
+    auto const stamp = current_native_semantic_epoch.snapshot();
+    check(stamp.valid && stamp.inflight != 0);
+    ++native_adoptions;
+}
 void observe_tail(unsigned phase) {
     outside();
     check(ker::mod::sched::task::native_return_tails.load() == 1);
@@ -651,7 +725,7 @@ int main() {
                 actor.resource_thread_owners = 1;
                 break;
             case 5:
-                actor.owned_unpublished_process = reinterpret_cast<void*>(1);
+                actor.owned_unpublished_process = reinterpret_cast<ker::mod::sched::task::Task*>(1);
                 break;
             case 6:
                 ready_mask = 127;
@@ -829,7 +903,8 @@ int main() {
     ker::mod::sched::task::native_retirement_queue_outstanding = 1;
     check(call(Phase::PREPARE) == 0 && output.header.outcome == 0);  // Claimed prefix needs no list head.
     reset();
-    ker::mod::sched::task::native_retirement_queue_tail = &actor;
+    ker::mod::sched::task::native_retirement_queue_tail =
+        reinterpret_cast<ker::mod::mm::file_mapping::UnpublishedMappingRetirement*>(&actor);
     check(call(Phase::PREPARE) == 0 && output.header.outcome == 2);  // Inconsistent head/tail.
     reset();
     ker::mod::sched::task::native_mapping_active_records =
@@ -879,6 +954,90 @@ int main() {
     reset();
     mm.legacy_file_registry_rows = 1;
     check(call(Phase::PREPARE) == 0 && output.header.outcome == 0);  // Retained but not published prefix.
+    reset();
+    {
+        using namespace ker::mod::sched::task;
+        namespace fm = ker::mod::mm::file_mapping;
+        auto const clean = current_native_semantic_epoch.snapshot();
+        auto const legacy = native_debt_epoch.snapshot();
+        NativeDebtSnapshot before_poll{}, after_poll{};
+        selftest_current_native_debt_snapshot(before_poll);
+        bool root_active = true;
+        for (unsigned i = 0; i < 3; ++i) {
+            check(!native_unpublished_retirements_pending());
+            check(!process_native_unpublished_retirements_slice(root_active) && !root_active);
+        }
+        auto const observed = current_native_semantic_epoch.snapshot();
+        selftest_current_native_debt_snapshot(after_poll);
+        check(ker::mod::mm::lifecycle_census::unchanged(before_poll.stamp, after_poll.stamp));
+        check(ker::mod::mm::lifecycle_census::unchanged(clean, observed));
+        check(native_debt_epoch.snapshot().version > legacy.version);
+        check(begin_native_file_mapping_construction());
+        end_native_file_mapping_construction();
+        check(!ker::mod::mm::lifecycle_census::unchanged(clean, current_native_semantic_epoch.snapshot()));
+        auto const before_close = current_native_semantic_epoch.snapshot();
+        check(close_native_file_mapping_admission());
+        auto const closed = current_native_semantic_epoch.snapshot();
+        check(closed.version > before_close.version && close_native_file_mapping_admission());
+        check(ker::mod::mm::lifecycle_census::unchanged(closed, current_native_semantic_epoch.snapshot()));
+        native_mapping_construction_closed = false;  // Explicit isolated Host endpoint reset.
+        auto* child = new Task;
+        child->name = new char[8];
+        child->context.syscall_kernel_stack = ker::mod::mm::KERNEL_STACK_SIZE + 4096;
+        auto* record = new fm::UnpublishedMappingRetirement;
+        record->controller = &actor;
+        record->active_subject = child;
+        record->count = 1;
+        record->entries[0].completion.state = fm::RetirementReturnState::PENDING;
+        native_mapping_active_records = record;
+        child->native_file_mapping_retirement = record;
+        native_probe = true;
+        defer_transferred_native_unpublished_process(actor, *child);
+        check(native_retirement_queue_outstanding == 1 && native_retirement_queue_head == record);
+        auto const queued = current_native_semantic_epoch.snapshot();
+        // Claim, off-lock pending completion and real requeue all share the
+        // outer operation; unlock/backend callbacks probe actual code windows.
+        check(process_native_unpublished_retirements_slice(root_active));
+        check(!root_active && record->state == fm::UnpublishedRetirementState::WAITING_RETURN);
+        check(native_retirement_queue_head == record && !record->deferred_claimed);
+        check(current_native_semantic_epoch.snapshot().inflight == 0);
+        check(current_native_semantic_epoch.snapshot().version > queued.version);
+        record->entries[0].completion.state = fm::RetirementReturnState::RETURNED;
+        tail_target = child;
+        check(!process_native_unpublished_retirements_slice(root_active));
+        tail_target = nullptr;
+        native_probe = false;
+        check(native_retirement_queue_outstanding == 0 && native_retirement_queue_head == nullptr);
+        check(native_mapping_active_records == nullptr && native_return_tails == 0);
+        check(native_adoptions >= 6 && native_backends >= 3);
+        ker::test::numa_lifecycle::NativeDebtSnapshot after{};
+        selftest_current_native_debt_snapshot(after);
+        check(after.stamp.inflight == 0 && after.flags == (NATIVE_COMPLETE | NATIVE_ARITHMETIC_VALID));
+    }
+    {
+        // Test-only field visibility exposes actual Epoch arithmetic. Neither
+        // this seed nor a reset API exists in the kernel.
+        using namespace ker::mod::sched::task;
+        current_native_semantic_epoch.version_.store(UINT64_MAX - 2);
+        {
+            CurrentNativeSemanticOperation op;
+            op.begin();
+            check(current_native_semantic_epoch.snapshot().inflight == 1);
+        }
+        NativeDebtSnapshot exhausted{};
+        selftest_current_native_debt_snapshot(exhausted);
+        check(exhausted.stamp.version == UINT64_MAX && !exhausted.stamp.valid && !(exhausted.flags & NATIVE_COMPLETE));
+        current_native_semantic_epoch.end();
+        selftest_current_native_debt_snapshot(exhausted);
+        check(!exhausted.stamp.valid && !(exhausted.flags & NATIVE_COMPLETE));
+        ker::mod::mm::lifecycle_census::BoundaryEpoch underflow;
+        underflow.end();
+        check(!underflow.snapshot().valid);
+        ker::mod::mm::lifecycle_census::BoundaryEpoch inflight_overflow;
+        inflight_overflow.inflight_.store(UINT64_MAX);
+        inflight_overflow.begin();
+        check(!inflight_overflow.snapshot().valid);
+    }
     std::printf(
         "PASS actual complete current census handler checks=%u; explicit provider/Task/transport endpoints; no native/runtime "
         "qualification\n",

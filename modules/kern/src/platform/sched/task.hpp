@@ -1577,6 +1577,8 @@ void destroy_unpublished_user_thread(Task* task);
 #ifdef WOS_SELFTEST
 // Values only; output must be exclusive and addressable before owner locks.
 void selftest_native_debt_snapshot(::ker::test::numa_lifecycle::NativeDebtSnapshot& out) noexcept;
+// Actual mutations only; legacy conservative lock witness above is preserved.
+void selftest_current_native_debt_snapshot(::ker::test::numa_lifecycle::NativeDebtSnapshot& out) noexcept;
 #endif
 // Construction is admitted before any VFS/backend work. Shutdown closes this
 // gate and checks the actual stable-record list as well as in-flight scopes.
