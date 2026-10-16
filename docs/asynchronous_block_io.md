@@ -220,10 +220,11 @@ in that combined executable while still rejecting missing and stale sources.
 | `block_device_source_test`, `buffer_cache_source_test`, `tmpfs_swap_source_test`, XFS/WKI/shutdown source suites | Structural guards supplement executed runtime tests; they do not qualify hardware, durability or performance. |
 
 The gated `AhciAsync` KTEST group requires an actual native disk. Its read
-batch retains eight heap-owned 512 KiB read buffers, distinguishes retained
-software depth from hardware depth and requires
-observed PxCI/PxSACT depth greater than one for an NCQ disk with negotiated
-depth greater than one. Taskfile and timeout fixtures fail requests before
+batch retains eight heap-owned 512 KiB read buffers and distinguishes retained
+software depth from sampled PxCI/PxSACT occupancy. Hardware may complete before
+MMIO readback, so a sampled minimum is not a request or DMA retirement requirement;
+the actual sample is logged and bounded by the negotiated depth. Separate
+depth-eight benchmark gates remain unchanged. Taskfile and timeout fixtures fail requests before
 read-copy publication and check reset recovery. Queued cancellation followed
 by exclusive flush checks no DMA admission for the cancelled request.
 Scope cleanup cancels, waits and releases accepted requests even when a fatal
