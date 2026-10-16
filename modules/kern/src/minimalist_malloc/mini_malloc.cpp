@@ -206,7 +206,7 @@ void mini_dump_stats() {
     emergency_serial::write(" bytes\n");
 }
 
-auto mini_malloc(size_t size) -> void* {
+auto mini_malloc(size_t size, AllocationFailurePolicy policy) -> void* {
     if (size == 0U) {
         return nullptr;
     }
@@ -219,31 +219,31 @@ auto mini_malloc(size_t size) -> void* {
 
     // Handle allocations via slab allocator
     if (size <= SLAB_SIZE10) {
-        return slab_0x10.alloc();
+        return slab_0x10.alloc(policy);
     }
     if (size <= SLAB_SIZE20) {
-        return slab_0x20.alloc();
+        return slab_0x20.alloc(policy);
     }
     if (size <= SLAB_SIZE40) {
-        return slab_0x40.alloc();
+        return slab_0x40.alloc(policy);
     }
     if (size <= SLAB_SIZE80) {
-        return slab_0x80.alloc();
+        return slab_0x80.alloc(policy);
     }
     if (size <= SLAB_SIZE100) {
-        return slab_0x100.alloc();
+        return slab_0x100.alloc(policy);
     }
     if (size <= SLAB_SIZE200) {
-        return slab_0x200.alloc();
+        return slab_0x200.alloc(policy);
     }
     if (size <= SLAB_SIZE300) {
-        return slab_0x300.alloc();
+        return slab_0x300.alloc(policy);
     }
     if (size <= SLAB_SIZE400) {
-        return slab_0x400.alloc();
+        return slab_0x400.alloc(policy);
     }
     if (size <= SLAB_SIZE800) {
-        return slab_0x800.alloc();
+        return slab_0x800.alloc(policy);
     }
 
     return nullptr;

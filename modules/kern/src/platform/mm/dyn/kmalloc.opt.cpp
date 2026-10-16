@@ -741,7 +741,8 @@ auto small_realloc_copy_size(void* ptr, uint64_t new_size) -> uint64_t {
     return std::min<uint64_t>(static_cast<uint64_t>(OLD_SLAB_SIZE), new_size);
 }
 
-auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
+auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag,
+                 mini_malloc::AllocationFailurePolicy policy = mini_malloc::AllocationFailurePolicy::REQUIRED) -> void* {
 #ifndef WOS_KMALLOC_DEBUG_INFO
     (void)caller;
     (void)tag;
@@ -773,7 +774,7 @@ auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
         }
         // Slow path: mini_malloc acquires per-size-class slab_lock internally
         if (ptr == nullptr) {
-            ptr = mini_malloc::mini_malloc(size);
+            ptr = mini_malloc::mini_malloc(size, policy);
         }
 #ifdef WOS_KASAN
         if (ptr != nullptr) {
@@ -824,8 +825,7 @@ auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
         // Add to linked list and set magic under the same lock.
         // Magic must be set while holding the lock so that any concurrent free() that
         // sees magic set is guaranteed to find the entry in the list (no TOCTOU window).
-        // lock_irqsave: kmalloc::free runs from the timer ISR via gc_expired_tasks, so
-        // a non-IRQ caller holding mediumAllocLock would deadlock against the ISR.
+        // The IRQ-safe tracker lock serializes header/list publication with free().
         uint64_t const LOCK_FLAGS = medium_alloc_lock.lock_irqsave();
         header->magic = MEDIUM_ALLOC_MAGIC;
         header->next = medium_alloc_list;
@@ -1076,6 +1076,15 @@ auto malloc(uint64_t size) -> void* {
     return malloc_impl(size, (uintptr_t)__builtin_return_address(0), nullptr);
 #else
     return malloc_impl(size, 0, nullptr);
+#endif
+}
+
+auto malloc_may_fail(uint64_t size) -> void* {
+#ifdef WOS_KMALLOC_DEBUG_INFO
+    return malloc_impl(size, reinterpret_cast<uintptr_t>(__builtin_return_address(0)), nullptr,
+                       mini_malloc::AllocationFailurePolicy::MAY_FAIL);
+#else
+    return malloc_impl(size, 0, nullptr, mini_malloc::AllocationFailurePolicy::MAY_FAIL);
 #endif
 }
 
@@ -1456,6 +1465,10 @@ namespace std {
 extern const nothrow_t nothrow{};
 }
 
-auto operator new(std::size_t size, std::nothrow_t const& /*tag*/) noexcept -> void* { return ker::mod::mm::dyn::kmalloc::malloc(size); }
+auto operator new(std::size_t size, std::nothrow_t const& /*tag*/) noexcept -> void* {
+    return ker::mod::mm::dyn::kmalloc::malloc_may_fail(size);
+}
 
-auto operator new[](std::size_t size, std::nothrow_t const& /*tag*/) noexcept -> void* { return ker::mod::mm::dyn::kmalloc::malloc(size); }
+auto operator new[](std::size_t size, std::nothrow_t const& /*tag*/) noexcept -> void* {
+    return ker::mod::mm::dyn::kmalloc::malloc_may_fail(size);
+}

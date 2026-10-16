@@ -60,6 +60,9 @@ auto debug_info_default_enabled() -> bool;
 auto debug_info_stats() -> KmallocDebugStats;
 
 auto malloc(uint64_t size) -> void*;
+// Small slab refill may return null without fatal OOM diagnostics. This keeps
+// the usual pointer/free convention and does not add IRQ/reentry guarantees.
+auto malloc_may_fail(uint64_t size) -> void*;
 void free(void* ptr);
 auto realloc(void* ptr, size_t size) -> void*;
 auto calloc(size_t nmemb, size_t size) -> void*;

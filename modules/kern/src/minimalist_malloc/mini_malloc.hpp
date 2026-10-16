@@ -25,8 +25,12 @@ struct MiniSlabStats {
     uint64_t page_bytes;
 };
 
+// REQUIRED retains the ordinary allocation policy. MAY_FAIL returns null when
+// physical slab backing is unavailable, without invoking the fatal OOM dump.
+enum class AllocationFailurePolicy : uint8_t { REQUIRED, MAY_FAIL };
+
 void mini_malloc_init();
-auto mini_malloc(size_t size) -> void*;
+auto mini_malloc(size_t size, AllocationFailurePolicy policy = AllocationFailurePolicy::REQUIRED) -> void*;
 auto mini_free(void* address) -> void;
 
 // Dump mini-malloc internal stats (large allocations + slab usage). Safe to call during OOM.

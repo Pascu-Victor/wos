@@ -1019,6 +1019,18 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/phys_source_test.py
 )
 add_test(
+    NAME kmalloc_nothrow_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/kmalloc_nothrow_runtime_test.py
+)
+set_tests_properties(kmalloc_nothrow_runtime_test PROPERTIES
+    LABELS "host;unit;source;integration" TIMEOUT 90
+    ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}"
+)
+if(WOS_HOST_TEST_DISABLE_LSAN)
+    set_property(TEST kmalloc_nothrow_runtime_test APPEND PROPERTY ENVIRONMENT
+        "ASAN_OPTIONS=detect_leaks=0" "LSAN_OPTIONS=detect_leaks=0")
+endif()
+add_test(
     NAME reclaim_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/reclaim_source_test.py
 )

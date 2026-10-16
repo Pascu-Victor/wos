@@ -498,6 +498,7 @@ UNIT_TESTS=(
     wki_vfs_coherency_wire_test
     xfs_block_stale_leaf_runtime_test
     xfs_sparse_inode_allocation_runtime_test
+    kmalloc_nothrow_runtime_test
 )
 
 list_targets() {

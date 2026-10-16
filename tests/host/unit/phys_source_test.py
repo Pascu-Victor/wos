@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 
+import os
 import re
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(os.environ.get("WOS_PHYS_SOURCE_ROOT", Path(__file__).resolve().parents[3]))
 PHYS_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "phys.opt.cpp"
 PHYS_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "phys.hpp"
 MM_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "mm.opt.cpp"
 PAGE_ALLOC_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "page_alloc.cpp"
-KMALLOC_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "dyn" / "kmalloc.opt.cpp"
+KMALLOC_CPP = Path(os.environ.get("WOS_KMALLOC_CPP", ROOT / "modules/kern/src/platform/mm/dyn/kmalloc.opt.cpp"))
+MINI_DIR = Path(os.environ.get("WOS_MINI_MALLOC_DIR", ROOT / "modules/kern/src/minimalist_malloc"))
 MM_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "mm_ktest.cpp"
 
 
@@ -752,7 +754,42 @@ def test_kernel_stacks_use_an_early_fixed_slot_pool() -> None:
             fail(f"direct high-order kernel stack allocation remains: {caller}")
 
 
+def test_nothrow_small_refill_and_optional_history_are_explicitly_fallible() -> None:
+    kmalloc = KMALLOC_CPP.read_text()
+    mini = (MINI_DIR / "mini_malloc.cpp").read_text()
+    mini_header = (MINI_DIR / "mini_malloc.hpp").read_text()
+    slab = (MINI_DIR / "slab_allocator.hpp").read_text()
+    require_tokens(mini_header, ["enum class AllocationFailurePolicy", "REQUIRED, MAY_FAIL",
+                                "AllocationFailurePolicy policy = AllocationFailurePolicy::REQUIRED"],
+                   "existing mini callers retain required allocation semantics")
+    for size in ["10", "20", "40", "80", "100", "200", "300", "400", "800"]:
+        require_tokens(function_body(mini, "mini_malloc"), [f"return slab_0x{size}.alloc(policy);"],
+                       "all nine classes forward the explicit resource policy")
+    require_tokens(kmalloc, ["mini_malloc::AllocationFailurePolicy policy = mini_malloc::AllocationFailurePolicy::REQUIRED",
+                             "ptr = mini_malloc::mini_malloc(size, policy)"], "default and slow small allocation policy")
+    require_tokens(function_body(kmalloc, "malloc_may_fail"), ["mini_malloc::AllocationFailurePolicy::MAY_FAIL"],
+                   "explicit may-fail wrapper")
+    for name in ["malloc", "malloc_tagged", "realloc", "calloc"]:
+        require_absent(function_body(kmalloc, name), "AllocationFailurePolicy::MAY_FAIL", "ordinary policy stays unchanged")
+    for signature in ["auto operator new(std::size_t size,", "auto operator new[](std::size_t size,"]:
+        begin = kmalloc.index(signature)
+        end = find_matching_brace(kmalloc, kmalloc.index("{", begin))
+        require_tokens(kmalloc[begin:end], ["noexcept", "kmalloc::malloc_may_fail(size)"], "actual nullable global overload")
+    refill = slab[slab.index("::request_untracked_memory_from_os("):]
+    require_order(refill, ["AllocationFailurePolicy::MAY_FAIL", "phys::page_alloc_may_fail(",
+                           "phys::page_alloc(", '"Malloc memory expansion failed halting."', "assert(false)"],
+                  "resource refusal and required diagnostics are distinct, corruption checks remain")
+    history = slab[slab.index("::request_memory_from_os(size_t size)"):slab.index("::request_untracked_memory_from_os(")]
+    require_tokens(history, ["AllocationFailurePolicy::MAY_FAIL", "mark_memory_as_slab(address)"], "optional metadata refusal")
+    require_tokens(slab, ["if (header.last_free_caller && header.free_count)", "last_recorded_free:", "recorded_count=%u",
+                          "if (retired_last_free_caller != nullptr)", "if (retired_free_count != nullptr)",
+                          "slab: corrupt non-full list", "slab: inconsistent free-block bitmap", "slab: corrupt ownership tail"],
+                   "recorded suffix, independent ownership and genuine invariants")
+    require_absent(slab, "slab_lock.lock_irqsave", "resource policy must not silently change IRQ support")
+
+
 def main() -> None:
+    test_nothrow_small_refill_and_optional_history_are_explicitly_fallible()
     test_internal_reservation_requires_nonzero_base_and_spare_page()
     test_per_cpu_cache_reservation_uses_selector_not_raw_memmap_base()
     test_cached_page_drain_does_not_release_owner_twice()

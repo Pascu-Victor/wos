@@ -12,6 +12,7 @@
 #include <platform/sys/spinlock.hpp>
 
 #include "bitmap.hpp"
+#include "mini_malloc.hpp"
 
 inline constexpr uint32_t MAGIC = 0x8CBEEFC8;
 inline constexpr size_t MEMORY_ALIGNMENT = 16;
@@ -31,7 +32,8 @@ struct SlabHeader {
     bool on_nonfull_list;
     Bitmap<max_blocks> mem_map;
 #ifdef WOS_KMALLOC_DEBUG_INFO
-    // Diagnostic tracking per block: last caller address that freed the block and free count
+    // Optional history starts only when both arrays are available. Counts cover
+    // recorded frees, not the unknown prefix before metadata allocation.
     uintptr_t* last_free_caller;
     unsigned int* free_count;
 #endif
@@ -71,7 +73,7 @@ class Slab {
     void free_from_current_slab(size_t block_index);
     void link_nonfull_unlocked();
     void unlink_nonfull_unlocked();
-    auto request_untracked_memory_from_os(size_t size) -> void*;
+    auto request_untracked_memory_from_os(size_t size, ker::mod::mm::mini_malloc::AllocationFailurePolicy policy) -> void*;
     auto request_memory_from_os(size_t size) -> void*;
     auto free_memory_to_os(void* address, size_t size) -> void;
     void mark_memory_as_slab(void* address);
@@ -82,7 +84,7 @@ class Slab {
 
    public:
     void init(Slab* prev = nullptr);
-    void* alloc();
+    void* alloc(ker::mod::mm::mini_malloc::AllocationFailurePolicy policy = ker::mod::mm::mini_malloc::AllocationFailurePolicy::REQUIRED);
     void free(void* address);
 
     // Collect statistics about the slab chain starting at this slab.
@@ -154,7 +156,7 @@ auto Slab<slab_size, memory_size>::alloc_unlocked() -> void* {
 }
 
 template <size_t slab_size, size_t memory_size>
-auto Slab<slab_size, memory_size>::alloc() -> void* {
+auto Slab<slab_size, memory_size>::alloc(ker::mod::mm::mini_malloc::AllocationFailurePolicy policy) -> void* {
     Slab* new_slab = nullptr;
 
     slab_lock.lock();
@@ -165,7 +167,7 @@ auto Slab<slab_size, memory_size>::alloc() -> void* {
     }
     slab_lock.unlock();
 
-    new_slab = static_cast<Slab*>(request_untracked_memory_from_os(sizeof(Slab)));
+    new_slab = static_cast<Slab*>(request_untracked_memory_from_os(sizeof(Slab), policy));
     if (new_slab == nullptr) {
         return nullptr;
     }
@@ -235,8 +237,8 @@ auto Slab<slab_size, memory_size>::free_unlocked(void* address) -> void {
                                    static_cast<unsigned long long>(prefix));
 #ifdef WOS_KMALLOC_DEBUG_INFO
                 if (header.free_count != nullptr && header.last_free_caller != nullptr && header.free_count[i] > 0) {
-                    ker::mod::dbg::log("    last_free: caller=%p count=%d", reinterpret_cast<void*>(header.last_free_caller[i]),
-                                       static_cast<int>(header.free_count[i]));
+                    ker::mod::dbg::log("    last_recorded_free: caller=%p recorded_count=%u",
+                                       reinterpret_cast<void*>(header.last_free_caller[i]), static_cast<unsigned>(header.free_count[i]));
                 }
 #endif
             }
@@ -439,13 +441,17 @@ void Slab<slab_size, memory_size>::free_from_current_slab(size_t block_index) {
 template <size_t slab_size, size_t memory_size>
 auto Slab<slab_size, memory_size>::request_memory_from_os(size_t size) -> void* {
     // system dependent function, returns aligned memory region.
-    void* address = request_untracked_memory_from_os(size);
+    void* address = request_untracked_memory_from_os(size, ker::mod::mm::mini_malloc::AllocationFailurePolicy::MAY_FAIL);
     mark_memory_as_slab(address);
     return address;
 }
 
 template <size_t slab_size, size_t memory_size>
-auto Slab<slab_size, memory_size>::request_untracked_memory_from_os(size_t size) -> void* {
+auto Slab<slab_size, memory_size>::request_untracked_memory_from_os(size_t size, ker::mod::mm::mini_malloc::AllocationFailurePolicy policy)
+    -> void* {
+    if (policy == ker::mod::mm::mini_malloc::AllocationFailurePolicy::MAY_FAIL) {
+        return ker::mod::mm::phys::page_alloc_may_fail(ker::mod::mm::PhysicalPageOwner::KMALLOC_SLAB, size, "kmalloc_slab");
+    }
     void* address = ker::mod::mm::phys::page_alloc(ker::mod::mm::PhysicalPageOwner::KMALLOC_SLAB, size, "kmalloc_slab");
     if (address == nullptr) {
         ker::mod::dbg::log("Malloc memory expansion failed halting.");
