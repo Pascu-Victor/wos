@@ -52,6 +52,17 @@ class Epoch final {
         auto const after = version_.load(std::memory_order_seq_cst);
         return {.version = after, .inflight = active, .valid = valid && before == after};
     }
+    // Named addressable output for callers in instrumentation-excluded TUs.
+    // The caller owns both the output and this epoch; no hidden sret storage.
+    void snapshot_into(Stamp& out) const noexcept {
+        auto const before = version_.load(std::memory_order_seq_cst);
+        auto const active = inflight_.load(std::memory_order_seq_cst);
+        auto const valid = valid_.load(std::memory_order_seq_cst);
+        auto const after = version_.load(std::memory_order_seq_cst);
+        out.version = after;
+        out.inflight = active;
+        out.valid = valid && before == after;
+    }
     constexpr Epoch() = default;
     Epoch(const Epoch&) = delete;
     auto operator=(const Epoch&) -> Epoch& = delete;

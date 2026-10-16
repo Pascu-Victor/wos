@@ -109,6 +109,8 @@ auto admitted(Task& actor, uint64_t& root_serial) noexcept -> bool {
 }
 
 auto collect_owners(const CurrentCensusScope& scope, OwnerCensus& out) noexcept -> bool {
+    mod::mm::lifecycle_census::Stamp current_before{};
+
     out.complete = false;
     if (!scope.executing_here()) return false;
     out.executor_cookie = scope.cookie();
@@ -116,10 +118,11 @@ auto collect_owners(const CurrentCensusScope& scope, OwnerCensus& out) noexcept 
     out.mounts = vfs::selftest_mount_census();
     out.services = sched::resource::selftest_service_census();
     sched::resource::selftest_population_census_current(scope, out.population);
-    out.children = syscall::process::child_events::selftest_lifecycle_census();
-    out.driver_children = syscall::process::child_events::selftest_owner_lifecycle_census(scope.actor());
+    syscall::process::child_events::selftest_current_lifecycle_census_into(out.children, current_before);
+    syscall::process::child_events::selftest_current_owner_lifecycle_census_into(scope.actor(), out.driver_children, current_before);
     out.ipc = syscall::shm::selftest_shm_census();
-    out.roots = virt::selftest_root_census();
+    out.roots = {};  // Instrumented named output is addressable before excluded virt.
+    virt::selftest_current_root_census_into(out.roots, current_before);
     vfs::selftest_fd_census_current(scope, out.descriptors);
     out.storage_after = mod::mm::lifecycle_storage::snapshot();
     out.complete = true;
@@ -567,7 +570,12 @@ class CensusHandler final {
     }
 };
 
-void enable_current_census_boot() noexcept { boot_enabled.store(true, std::memory_order_release); }
+void enable_current_census_boot() noexcept {
+    // Boot-only, before user roots/children/AP execution. No live state resets.
+    virt::selftest_enable_current_root_census();
+    syscall::process::child_events::selftest_enable_current_lifecycle_census();
+    boot_enabled.store(true, std::memory_order_release);
+}
 
 auto dispatch_current_census(uint64_t address, uint64_t bytes, uint64_t unused3, uint64_t unused4) -> uint64_t {
     if (!boot_enabled.load(std::memory_order_acquire)) return failure(ENOTSUP);

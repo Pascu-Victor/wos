@@ -322,6 +322,16 @@ void get_user_root_control_stats_snapshot(UserRootControlStats& out);
 #ifdef WOS_SELFTEST
 // Synchronous diagnostic operands only. Caller owns initialized, addressable,
 // mutually nonaliasing options/output throughout the call. No pointer escapes.
+enum class SelftestRootAllocationSource : uint8_t { UNKNOWN, LEGACY_POOL, PHYSICAL_ALLOCATOR, EMERGENCY_RESERVE };
+enum class SelftestRootReturnDisposition : uint8_t { UNKNOWN, EMERGENCY_RETURNED, LEGACY_CACHED, PHYSICAL_RELEASED };
+struct SelftestRootReleaseOutput {
+    uint64_t historical_pa{};
+    uint32_t references{};
+    PageKind kind{PageKind::UNKNOWN};
+    SelftestRootReturnDisposition disposition{SelftestRootReturnDisposition::UNKNOWN};
+    bool owned_facts_valid{};
+    bool control_retired{};
+};
 struct SelftestRootFactoryOptions {
     bool force_ordinary_failure{};
     bool use_node_override{};
@@ -341,8 +351,15 @@ struct SelftestRootFactoryOutput {
     bool control_failure_injected{};
     bool control_registered{};
     bool rollback_returned{};
+    SelftestRootAllocationSource source{SelftestRootAllocationSource::UNKNOWN};
+    uint64_t historical_pa{};
+    bool historical_pa_valid{};
+    SelftestRootReleaseOutput rollback{};
 };
 [[nodiscard]] auto selftest_create_pagemap(const SelftestRootFactoryOptions& options, SelftestRootFactoryOutput& output) -> PageTable*;
+// Same real exclusive retirement as release_pagemap. Caller owns initialized,
+// addressable output; copied PA is historical, never post-return authority.
+void selftest_release_pagemap(PageTable* pagemap, SelftestRootReleaseOutput& output, uint64_t owner_pid = 0);
 struct SelftestRootCensus {
     ker::mod::mm::lifecycle_census::Stamp stamp{};
     UserRootControlStats roots{};
@@ -350,6 +367,16 @@ struct SelftestRootCensus {
     bool complete{};
 };
 [[nodiscard]] auto selftest_root_census() -> SelftestRootCensus;
+// Boot-only census mode publication, before user roots/threads can exist.
+// Prepares shadow addressability; never resets a live epoch or disables it.
+void selftest_enable_current_root_census() noexcept;
+// Scalar hooks for actual root/index intent and detached TLB-return ownership.
+[[nodiscard]] auto selftest_current_root_change_begin() noexcept -> bool;
+void selftest_current_root_change_end(bool owned) noexcept;
+void selftest_current_root_detached_binding_returned() noexcept;
+// Instrumented caller owns initialized, nonaliasing output and stamp scratch.
+void selftest_current_root_census_into(SelftestRootCensus& out, lifecycle_census::Stamp& before) noexcept;
+
 #endif
 void get_page_table_pool_stats_snapshot(PageTablePoolStatsSnapshot& out);
 void get_owned_frame_stats_snapshot(OwnedFrameStatsSnapshot& out);

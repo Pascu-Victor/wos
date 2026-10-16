@@ -231,6 +231,20 @@ mm::lifecycle_census::OwnerLock population_lock{selftest_population_epoch};
 /* @POP_READERS@ */
 }  // namespace ker::mod::sched::resource
 namespace ker::syscall::process::child_events {
+// Existing handler fixture supplies controlled provider snapshots. The new
+// semantic-provider runtime fixture executes the actual child/root writers.
+void selftest_enable_current_lifecycle_census() noexcept { fixture::outside(); }
+void selftest_current_lifecycle_census_into(SelftestLifecycleCensus& out, ker::mod::mm::lifecycle_census::Stamp& before) noexcept {
+    fixture::outside();
+    out = fixture::children;
+    before = out.stamp;
+}
+void selftest_current_owner_lifecycle_census_into(ker::mod::sched::task::Task&, SelftestOwnerLifecycleCensus& out,
+                                                  ker::mod::mm::lifecycle_census::Stamp& before) noexcept {
+    fixture::outside();
+    out = fixture::owner_children;
+    before = out.stamp;
+}
 auto selftest_lifecycle_census() {
     fixture::outside();
     return fixture::children;
@@ -247,6 +261,12 @@ auto selftest_shm_census() {
 }
 }  // namespace ker::syscall::shm
 namespace ker::mod::mm::virt {
+void selftest_enable_current_root_census() noexcept { fixture::outside(); }
+void selftest_current_root_census_into(SelftestRootCensus& out, ker::mod::mm::lifecycle_census::Stamp& before) noexcept {
+    fixture::outside();
+    out = fixture::roots;
+    before = out.stamp;
+}
 auto selftest_root_census() {
     fixture::outside();
     return fixture::roots;

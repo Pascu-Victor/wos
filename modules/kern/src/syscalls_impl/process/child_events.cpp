@@ -2,6 +2,9 @@
 
 #ifdef WOS_SELFTEST
 #include <platform/mm/lifecycle_census.hpp>
+#ifdef WOS_KASAN
+#include <sanitizer/kasan.hpp>
+#endif
 #endif
 
 #include <atomic>
@@ -36,6 +39,31 @@ constexpr int32_t CONTINUED_STATUS = 0xffff;
 // those paths never send or wait on a peer. Wakes occur after lifecycle unlock.
 #ifdef WOS_SELFTEST
 ker::mod::mm::lifecycle_census::Epoch selftest_child_epoch{};
+ker::mod::mm::lifecycle_census::Epoch selftest_current_child_epoch{};
+bool selftest_current_child_enabled{};
+// Optional activation belongs to a real semantic effect/owned tail. Empty
+// cancellation/read polling keeps this separate epoch unchanged.
+class CurrentChildSemanticOperation final {
+   public:
+    explicit CurrentChildSemanticOperation(bool active = false) noexcept {
+        if (active) begin();
+    }
+    ~CurrentChildSemanticOperation() {
+        if (owned_) selftest_current_child_epoch.end();
+    }
+    void begin() noexcept {
+        if (!owned_ && __atomic_load_n(&selftest_current_child_enabled, __ATOMIC_ACQUIRE)) {
+            selftest_current_child_epoch.begin();
+            owned_ = true;
+        }
+    }
+    CurrentChildSemanticOperation(const CurrentChildSemanticOperation&) = delete;
+    auto operator=(const CurrentChildSemanticOperation&) -> CurrentChildSemanticOperation& = delete;
+
+   private:
+    bool owned_{};
+};
+
 ker::mod::mm::lifecycle_census::OwnerLock g_lifecycle_lock{selftest_child_epoch};
 #else
 ker::mod::sys::Spinlock g_lifecycle_lock;
@@ -69,6 +97,10 @@ struct WakeSelection {
 
 void drop_lifetime_ref(Task* task) {
 #ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{task != nullptr};
+#endif
+
+#ifdef WOS_SELFTEST
     ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
 #endif
 
@@ -101,6 +133,10 @@ void advance_queue_version_locked(Task& owner) { advance_version_locked(owner.ch
 
 void child_list_insert_locked(Task& parent, Task& child) {
 #ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
+
+#ifdef WOS_SELFTEST
     selftest_edge_add(selftest_lifecycle_edges.child_links);
 #endif
     advance_queue_version_locked(parent);
@@ -113,6 +149,10 @@ void child_list_insert_locked(Task& parent, Task& child) {
 }
 
 void child_list_remove_locked(Task& parent, Task& child) {
+#ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
+
 #ifdef WOS_SELFTEST
     selftest_edge_remove(selftest_lifecycle_edges.child_links);
 #endif
@@ -130,6 +170,10 @@ void child_list_remove_locked(Task& parent, Task& child) {
 }
 
 void queue_insert_locked(Task& owner, ChildEvent& event) {
+#ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
+
 #ifdef WOS_SELFTEST
     selftest_edge_add(selftest_lifecycle_edges.queued_events);
 #endif
@@ -160,6 +204,9 @@ void update_unparented_membership_locked(Task& subject) {
     if (subject.child_parent != nullptr) {
         return;
     }
+#ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
     subject.child_membership_state.store(
         has_queued_exit_event_locked(subject) ? ChildMembershipState::ZOMBIE : ChildMembershipState::UNLINKED, std::memory_order_release);
 }
@@ -175,6 +222,10 @@ void update_unparented_membership_locked(Task& subject) {
 }
 
 void publish_subject_claim_locked(ChildEvent& event) {
+#ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
+
     if (event.subject == nullptr) {
         return;
     }
@@ -190,6 +241,9 @@ void publish_subject_claim_locked(ChildEvent& event) {
     if (event.queued || local_group == nullptr) {
         return false;
     }
+#ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
     if (!take_lifetime_ref(&owner)) {
         return false;
     }
@@ -231,6 +285,10 @@ void publish_subject_claim_locked(ChildEvent& event) {
 }
 
 void clear_event_claim_locked(ChildEvent& event) {
+#ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
+
     Claim* const CLAIMANT = event.claimed_by;
 #ifdef WOS_SELFTEST
     if (CLAIMANT != nullptr) selftest_edge_remove(selftest_lifecycle_edges.event_claims);
@@ -262,6 +320,9 @@ void queue_unlink_locked(Task& owner, ChildEvent& event) {
     if (cursor == nullptr) {
         return;
     }
+#ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
     if (previous != nullptr) {
         previous->next = event.next;
     } else {
@@ -281,6 +342,9 @@ void remove_event_locked(ChildEvent& event) {
     if (!event.queued || event.queue_owner == nullptr) {
         return;
     }
+#ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
     Task* const OWNER = event.queue_owner;
     Task* const SUBJECT = event.subject;
     queue_unlink_locked(*OWNER, event);
@@ -302,6 +366,9 @@ void move_event_locked(ChildEvent& event, Task& new_owner) {
     if (!event.queued || event.queue_owner == nullptr || event.queue_owner == &new_owner) {
         return;
     }
+#ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
     if (!take_lifetime_ref(&new_owner)) {
         remove_event_locked(event);
         return;
@@ -435,6 +502,9 @@ void waiter_unlink_locked(ChildWaitRegistration& registration) {
     if (!registration.registered || registration.queue_owner == nullptr) {
         return;
     }
+#ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
     Task* const OWNER = registration.queue_owner;
     Task* const WAITER = registration.waiter;
     ChildWaitRegistration* previous = nullptr;
@@ -459,6 +529,10 @@ void waiter_unlink_locked(ChildWaitRegistration& registration) {
 }
 
 [[nodiscard]] auto waiter_register_locked(Task& owner, Task& waiter, Selector selector, int32_t options, View view) -> bool {
+#ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
+
     ChildWaitRegistration& registration = waiter.child_wait_registration;
     if (registration.registered && registration.queue_owner == &owner) {
         registration.selector = selector;
@@ -493,11 +567,18 @@ void waiter_unlink_locked(ChildWaitRegistration& registration) {
 }
 
 [[nodiscard]] auto select_waiter_locked(Task& owner) -> Task* {
+#ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation;
+#endif
+
     ChildWaitRegistration* registration = owner.child_waiter_head;
     while (registration != nullptr) {
         if (!registration->notified && registration->waiter != nullptr &&
             first_matching_event_locked(owner, registration->selector, registration->options, registration->waiter->child_wait_view) !=
                 nullptr) {
+#ifdef WOS_SELFTEST
+            current_operation.begin();
+#endif
             registration->notified = true;
             if (take_lifetime_ref(registration->waiter)) {
                 return registration->waiter;
@@ -509,10 +590,17 @@ void waiter_unlink_locked(ChildWaitRegistration& registration) {
 }
 
 [[nodiscard]] auto select_no_child_waiter_locked(Task& owner) -> Task* {
+#ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation;
+#endif
+
     ChildWaitRegistration* registration = owner.child_waiter_head;
     while (registration != nullptr) {
         if (!registration->notified && registration->waiter != nullptr &&
             !has_potential_subject_locked(owner, registration->selector, registration->waiter->child_wait_view)) {
+#ifdef WOS_SELFTEST
+            current_operation.begin();
+#endif
             registration->notified = true;
             if (take_lifetime_ref(registration->waiter)) {
                 return registration->waiter;
@@ -533,6 +621,10 @@ void waiter_unlink_locked(ChildWaitRegistration& registration) {
 }
 
 void deliver_wake(WakeSelection wake) {
+#ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{wake.signal_owner != nullptr || wake.waiter != nullptr || wake.subject != nullptr};
+#endif
+
 #ifdef WOS_SELFTEST
     ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
 #endif
@@ -559,12 +651,19 @@ void deliver_wake(WakeSelection wake) {
 
 void wake_no_child_waiters(Task& owner) {
 #ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation;
+#endif
+
+#ifdef WOS_SELFTEST
     ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
 #endif
 
     for (;;) {
         uint64_t const FLAGS = g_lifecycle_lock.lock_irqsave();
         Task* const WAITER = select_no_child_waiter_locked(owner);
+#ifdef WOS_SELFTEST
+        if (WAITER != nullptr) current_operation.begin();
+#endif
         g_lifecycle_lock.unlock_irqrestore(FLAGS);
         if (WAITER == nullptr) {
             return;
@@ -575,6 +674,10 @@ void wake_no_child_waiters(Task& owner) {
 }
 
 void tracee_list_insert_locked(Task& tracer, Task& tracee) {
+#ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
+
 #ifdef WOS_SELFTEST
     selftest_edge_add(selftest_lifecycle_edges.tracee_links);
 #endif
@@ -588,6 +691,10 @@ void tracee_list_insert_locked(Task& tracer, Task& tracee) {
 }
 
 void tracee_list_remove_locked(Task& tracer, Task& tracee) {
+#ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
+
 #ifdef WOS_SELFTEST
     selftest_edge_remove(selftest_lifecycle_edges.tracee_links);
 #endif
@@ -609,6 +716,9 @@ void unlink_tracer_locked(Task& tracee, bool discard_events) {
     if (TRACER == nullptr) {
         return;
     }
+#ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
     tracee_list_remove_locked(*TRACER, tracee);
     tracee.child_tracer = nullptr;
     if (discard_events) {
@@ -810,6 +920,10 @@ auto import_live_reaped_cpu_times(Task& process, uint64_t user_us, uint64_t syst
 auto update_job_identity(Task& process, const ker::mod::sched::session::Identity& identity,
                          std::optional<ker::mod::sched::session::Names> names) -> bool {
 #ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
+
+#ifdef WOS_SELFTEST
     ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
 #endif
 
@@ -878,6 +992,10 @@ auto selector_matches(Selector selector, uint64_t pid, uint64_t process_group, k
 
 auto begin_publication(Task& creator, Task& child) -> bool {
 #ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
+
+#ifdef WOS_SELFTEST
     ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
 #endif
 
@@ -918,6 +1036,10 @@ auto begin_publication(Task& creator, Task& child) -> bool {
 
 auto commit_publication(Task& child) -> bool {
 #ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
+
+#ifdef WOS_SELFTEST
     ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
 #endif
 
@@ -932,6 +1054,10 @@ auto commit_publication(Task& child) -> bool {
 }
 
 void abort_publication(Task& child) {
+#ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
+
 #ifdef WOS_SELFTEST
     ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
 #endif
@@ -961,6 +1087,10 @@ void abort_publication(Task& child) {
 }
 
 auto publish_exit(Task& child) -> bool {
+#ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
+
 #ifdef WOS_SELFTEST
     ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
 #endif
@@ -1020,6 +1150,10 @@ auto publish_exit(Task& child) -> bool {
 
 void advance_process_job_control(Task& owner) {
 #ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
+
+#ifdef WOS_SELFTEST
     ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
 #endif
 
@@ -1074,6 +1208,10 @@ void advance_process_job_control(Task& owner) {
 
 auto publish_job_control_stop(Task& child, uint32_t signal) -> bool {
 #ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
+
+#ifdef WOS_SELFTEST
     ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
 #endif
 
@@ -1100,6 +1238,10 @@ auto publish_job_control_stop(Task& child, uint32_t signal) -> bool {
 
 auto publish_continued(Task& child) -> bool {
 #ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
+
+#ifdef WOS_SELFTEST
     ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
 #endif
 
@@ -1119,6 +1261,10 @@ auto publish_continued(Task& child) -> bool {
 }
 
 auto publish_ptrace_stop(Task& tracee, int32_t status) -> bool {
+#ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
+
 #ifdef WOS_SELFTEST
     ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
 #endif
@@ -1140,6 +1286,10 @@ auto publish_ptrace_stop(Task& tracee, int32_t status) -> bool {
 
 auto acknowledge_ptrace_stop(Task& tracee, Task& tracer) -> bool {
 #ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
+
+#ifdef WOS_SELFTEST
     ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
 #endif
 
@@ -1156,6 +1306,10 @@ auto acknowledge_ptrace_stop(Task& tracee, Task& tracer) -> bool {
 }
 
 auto attach_tracer(Task& tracee, Task& tracer) -> bool {
+#ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
+
 #ifdef WOS_SELFTEST
     ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
 #endif
@@ -1195,6 +1349,10 @@ auto attach_tracer(Task& tracee, Task& tracer) -> bool {
 
 void detach_tracer(Task& tracee) {
 #ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
+
+#ifdef WOS_SELFTEST
     ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
 #endif
 
@@ -1222,6 +1380,10 @@ auto private_reaper_matches(const Task& init, const Task& child, const ker::mod:
 
 template <typename Selected, typename BeforeDelivery>
 void prepare_process_exit_impl(Task& process, Selected&& selected, BeforeDelivery&& before_delivery) {
+#ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
+
 #ifdef WOS_SELFTEST
     ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
 #endif
@@ -1388,6 +1550,10 @@ void selftest_prepare_exit_reaper_cutover(Task& process, void (*hook)(Task&, Tas
 
 void cancel_wait(Task& waiter) {
 #ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation;
+#endif
+
+#ifdef WOS_SELFTEST
     ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
 #endif
 
@@ -1395,6 +1561,9 @@ void cancel_wait(Task& waiter) {
     Task* owner = nullptr;
     uint64_t const FLAGS = g_lifecycle_lock.lock_irqsave();
     Task* const REGISTRATION_OWNER = waiter.child_wait_registration.queue_owner;
+#ifdef WOS_SELFTEST
+    if (REGISTRATION_OWNER != nullptr || waiter.child_claim.event != nullptr) current_operation.begin();
+#endif
     if (take_lifetime_ref(REGISTRATION_OWNER)) {
         owner = REGISTRATION_OWNER;
     }
@@ -1424,6 +1593,9 @@ auto claim_locked(Task& owner, Claim& claim, Selector selector, int32_t options,
         return ProbeResult::WOULD_BLOCK;
     }
     if (ChildEvent* const EVENT = first_matching_event_locked(owner, selector, options, view); EVENT != nullptr) {
+#ifdef WOS_SELFTEST
+        CurrentChildSemanticOperation current_operation{true};
+#endif
         if (claim.waiter != nullptr && !take_lifetime_ref(claim.waiter)) {
             return ProbeResult::WOULD_BLOCK;
         }
@@ -1510,6 +1682,10 @@ auto claim_or_register(Task& owner, Task& waiter, Selector selector, int32_t opt
 
 void cancel_claim(Claim& claim) {
 #ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation;
+#endif
+
+#ifdef WOS_SELFTEST
     ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
 #endif
 
@@ -1517,6 +1693,9 @@ void cancel_claim(Claim& claim) {
     uint64_t const FLAGS = g_lifecycle_lock.lock_irqsave();
     ChildEvent* const EVENT = claim.event;
     if (EVENT != nullptr && EVENT->queued && EVENT->claimed_by == &claim) {
+#ifdef WOS_SELFTEST
+        current_operation.begin();
+#endif
         Task* const OWNER = EVENT->queue_owner;
         clear_event_claim_locked(*EVENT);
         if (OWNER != nullptr) {
@@ -1528,6 +1707,10 @@ void cancel_claim(Claim& claim) {
 }
 
 void release_claim(Claim& claim, const ClaimedEvent& claimed) {
+#ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
+
 #ifdef WOS_SELFTEST
     ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
 #endif
@@ -1550,6 +1733,10 @@ void release_claim(Claim& claim, const ClaimedEvent& claimed) {
 }
 
 auto commit_claim(Task& owner, Claim& claim, const ClaimedEvent& claimed, bool keep_event) -> bool {
+#ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
+
 #ifdef WOS_SELFTEST
     ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_child_epoch);
 #endif
@@ -2545,6 +2732,10 @@ auto selftest_stop_continue_order_and_backpressure() -> bool {
 }
 
 auto selftest_parent_event_transfer() -> bool {
+#ifdef WOS_SELFTEST
+    CurrentChildSemanticOperation current_operation{true};
+#endif
+
     Task old_parent{};
     Task new_parent{};
     Task child{};
@@ -2663,6 +2854,84 @@ auto selftest_owner_lifecycle_census(Task& owner) -> SelftestOwnerLifecycleCensu
     out.complete = out.complete && ker::mod::mm::lifecycle_census::unchanged(selftest_before, out.stamp);
     return out;
 }
+
+void selftest_enable_current_lifecycle_census() noexcept {
+#ifdef WOS_KASAN
+    if (ker::mod::kasan::is_enabled()) {
+        ker::mod::kasan::unpoison_range(&selftest_current_child_epoch, sizeof(selftest_current_child_epoch));
+        ker::mod::kasan::unpoison_range(&selftest_current_child_enabled, sizeof(selftest_current_child_enabled));
+    }
+#endif
+    __atomic_store_n(&selftest_current_child_enabled, true, __ATOMIC_RELEASE);
+}
+
+void selftest_current_lifecycle_census_into(SelftestLifecycleCensus& out, ker::mod::mm::lifecycle_census::Stamp& before) noexcept {
+    out = {};
+    if (!__atomic_load_n(&selftest_current_child_enabled, __ATOMIC_ACQUIRE)) return;
+    selftest_current_child_epoch.snapshot_into(before);
+    uint64_t const flags = g_lifecycle_lock.observe_lock_irqsave();
+    out = selftest_lifecycle_edges;
+    out.complete = true;
+    g_lifecycle_lock.observe_unlock_irqrestore(flags);
+    selftest_current_child_epoch.snapshot_into(out.stamp);
+    out.complete = ker::mod::mm::lifecycle_census::unchanged(before, out.stamp);
+}
+
+void selftest_current_owner_lifecycle_census_into(Task& owner, SelftestOwnerLifecycleCensus& out,
+                                                  ker::mod::mm::lifecycle_census::Stamp& before) noexcept {
+    out = {};
+    if (!__atomic_load_n(&selftest_current_child_enabled, __ATOMIC_ACQUIRE)) return;
+    selftest_current_child_epoch.snapshot_into(before);
+    out.complete = true;
+    uint64_t const FLAGS = g_lifecycle_lock.observe_lock_irqsave();
+    for (auto* child = owner.child_list_head; child != nullptr; child = child->child_sibling_next) {
+        if (out.children == 4096) {
+            out.complete = false;
+            break;
+        }
+        ++out.children;
+        auto const state = child->child_membership_state.load(std::memory_order_relaxed);
+        if (state == ChildMembershipState::PUBLISHING)
+            ++out.publishing_children;
+        else if (state == ChildMembershipState::LIVE)
+            ++out.live_children;
+        else if (state == ChildMembershipState::ZOMBIE)
+            ++out.zombie_children;
+        else
+            out.complete = false;  // Linked but unlinked state must not qualify.
+    }
+    for (auto* tracee = owner.child_tracee_head; tracee != nullptr; tracee = tracee->child_tracee_next) {
+        if (out.tracees == 4096) {
+            out.complete = false;
+            break;
+        }
+        ++out.tracees;
+    }
+    for (auto* event = owner.child_event_head; event != nullptr; event = event->next) {
+        if (out.events == 4096) {
+            out.complete = false;
+            break;
+        }
+        ++out.events;
+        if (event->claimed_by != nullptr) ++out.claimed_events;
+    }
+    for (auto* waiter = owner.child_waiter_head; waiter != nullptr; waiter = waiter->next) {
+        if (out.waiters == 4096) {
+            out.complete = false;
+            break;
+        }
+        ++out.waiters;
+        if (waiter->notified) ++out.notified_waiters;
+    }
+    out.parent_link = owner.child_parent != nullptr;
+    out.tracer_link = owner.child_tracer != nullptr;
+    out.own_wait_registration = owner.child_wait_registration.registered;
+    out.own_claim = owner.child_claim.event != nullptr;
+    g_lifecycle_lock.observe_unlock_irqrestore(FLAGS);
+    selftest_current_child_epoch.snapshot_into(out.stamp);
+    out.complete = out.complete && ker::mod::mm::lifecycle_census::unchanged(before, out.stamp);
+}
+
 #endif
 
 }  // namespace ker::syscall::process::child_events

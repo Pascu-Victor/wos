@@ -370,6 +370,15 @@ add_test(NAME eager_fork_placement_runtime_test
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/eager_fork_placement_runtime_test.py
         --cxx ${CMAKE_CXX_COMPILER} --negative-controls)
 set_tests_properties(eager_fork_placement_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 140)
+
+add_test(NAME numa_lifecycle_semantic_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_lifecycle_semantic_runtime_test.py
+        --controls --cxx ${CMAKE_CXX_COMPILER})
+set_tests_properties(numa_lifecycle_semantic_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 210)
+add_test(NAME numa_root_route_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_root_route_runtime_test.py
+        --cxx ${CMAKE_CXX_COMPILER})
+set_tests_properties(numa_root_route_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 140)
 wos_add_unit_test(vtd_capability_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/vtd_capability_test.cpp
 )

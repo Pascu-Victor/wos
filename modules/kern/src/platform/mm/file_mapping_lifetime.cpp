@@ -5,6 +5,7 @@
 #include <platform/mm/lifetime_retirement_executor.hpp>
 #ifdef WOS_SELFTEST
 #include <platform/mm/lifecycle_storage.hpp>
+#include <platform/mm/virt.hpp>
 #endif
 #include <platform/mm/paging.hpp>
 #include <platform/sys/spinlock.hpp>
@@ -391,6 +392,9 @@ void FileMappingTlbRetirement::release_after_completed_tlb() noexcept {
         CURRENT->retire_next_ = nullptr;
         if (head_ == nullptr) tail_ = nullptr;
         CURRENT->release(BindingOwner::TLB);
+#ifdef WOS_SELFTEST
+        virt::selftest_current_root_detached_binding_returned();
+#endif
         // Callback may have deleted CURRENT; advance uses only saved batch state.
     }
 }
@@ -425,11 +429,22 @@ auto FileMappingIndex::attach_locked(FileMappingBinding*& prepared, uint64_t roo
             (current->root_incarnation_ != root_incarnation || (prepared->start_ < current->end_ && current->start_ < prepared->end_)))
             return false;
     }
+#ifdef WOS_SELFTEST
+    bool const semantic_owned = virt::selftest_current_root_change_begin();
+    if (!prepared->reclassify(BindingOwner::PREPARED, BindingOwner::INDEX)) {
+        virt::selftest_current_root_change_end(semantic_owned);
+        return false;
+    }
+#else
     if (!prepared->reclassify(BindingOwner::PREPARED, BindingOwner::INDEX)) return false;
+#endif
     auto* const BINDING = std::exchange(prepared, nullptr);
     BINDING->index_next_ = heads_[SLOT];
     BINDING->index_state_ = FileMappingBinding::IndexState::INDEXED;
     heads_[SLOT] = BINDING;
+#ifdef WOS_SELFTEST
+    virt::selftest_current_root_change_end(semantic_owned);
+#endif
     return true;
 }
 
@@ -438,7 +453,18 @@ auto FileMappingIndex::detach_locked(FileMappingBinding& binding, FileMappingTlb
         return false;
     auto** link = &heads_[bucket(binding.root_)];
     while (*link != nullptr && *link != &binding) link = &(*link)->index_next_;
+#ifdef WOS_SELFTEST
+    if (*link == nullptr) return false;
+    bool const semantic_owned = virt::selftest_current_root_change_begin();
+    if (!binding.reclassify(BindingOwner::INDEX, BindingOwner::TLB)) {
+        virt::selftest_current_root_change_end(semantic_owned);
+        return false;
+    }
+#else
     if (*link == nullptr || !binding.reclassify(BindingOwner::INDEX, BindingOwner::TLB)) return false;
+#endif
+    // Success transfers the current epoch obligation with this DETACHED row.
+    // The exclusive retirement batch consumes it after actual TLB-ref return.
     *link = binding.index_next_;
     binding.index_next_ = nullptr;
     binding.index_state_ = FileMappingBinding::IndexState::DETACHED;
@@ -456,6 +482,9 @@ auto FileMappingIndex::detach_root_locked(paging::PageTable* root, uint64_t root
             link = &CURRENT->index_next_;
             continue;
         }
+#ifdef WOS_SELFTEST
+        static_cast<void>(virt::selftest_current_root_change_begin());
+#endif
         if (!CURRENT->reclassify(BindingOwner::INDEX, BindingOwner::TLB)) __builtin_trap();
         *link = CURRENT->index_next_;
         CURRENT->index_next_ = nullptr;

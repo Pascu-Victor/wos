@@ -269,6 +269,13 @@ struct SelftestOwnerLifecycleCensus {
 // Caller retains owner; no Task/queue pointers escape. Global edge census above
 // includes unpublished owners; this local view explains the parked driver's debt.
 [[nodiscard]] auto selftest_owner_lifecycle_census(sched_task::Task& owner) -> SelftestOwnerLifecycleCensus;
+// Boot-only current-census mode; legacy epochs/readers remain unchanged.
+void selftest_enable_current_lifecycle_census() noexcept;
+// Initialized instrumented caller outputs/scratch; no owners escape.
+void selftest_current_lifecycle_census_into(SelftestLifecycleCensus& out, ker::mod::mm::lifecycle_census::Stamp& before) noexcept;
+void selftest_current_owner_lifecycle_census_into(sched_task::Task& owner, SelftestOwnerLifecycleCensus& out,
+                                                  ker::mod::mm::lifecycle_census::Stamp& before) noexcept;
+
 #endif
 
 }  // namespace ker::syscall::process::child_events

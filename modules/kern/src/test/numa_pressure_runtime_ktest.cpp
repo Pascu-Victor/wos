@@ -97,8 +97,28 @@ struct SeedDiagnostics {
 static_assert(SEED_OBSERVATIONS == 24);
 static_assert(std::is_trivially_copyable_v<SeedDiagnostics>);
 static_assert(sizeof(SeedDiagnostics) <= 32 * 1024, "bounded seed diagnostic storage and scratch");
+enum class RootFrontier : uint8_t { AFTER_WARM, BEFORE_ROOT, AFTER_SETUP, BEFORE_CLEAR, AFTER_CLEAR };
+struct RootRoute {
+    // Unobserved static storage stays all-zero/BSS. The genuine factory
+    // initializes its own output at call; called/valid bits govern reporting.
+    virt::SelftestRootFactoryOutput factory{.captured_cpu = 0, .captured_local = 0, .requested = 0, .reserve_error = reserve::Error::NONE};
+    virt::SelftestRootReleaseOutput release{};
+    bool factory_called{}, release_called{};
+};
+struct RootFrontierSnapshot {
+    virt::PageTablePoolStatsSnapshot pool{};
+    reserve::Snapshot emergency{};
+    bool observed{};
+};
+struct RootRouteDiagnostics {
+    RootRoute roots[2]{};  // Warm and measured owners; historical scalars only.
+    RootFrontierSnapshot frontiers[5]{};
+};
+static_assert(std::is_trivially_copyable_v<RootRouteDiagnostics>);
+static_assert(sizeof(RootRouteDiagnostics) <= 8 * 1024, "bounded root-route diagnostics");
 struct Storage {
     SeedDiagnostics seed_diagnostics{};
+    RootRouteDiagnostics root_routes{};
     FrameOwnership frames{};
     void* batch[128]{};
     void* selected_seeds[SEEDS]{};
@@ -137,6 +157,13 @@ template <class T>
     for (size_t i = 0; i < sizeof(object); ++i) bytes[i] = 0;
 }
 auto u(uint64_t value) -> unsigned long long { return static_cast<unsigned long long>(value); }
+void capture_root_frontier(RootFrontier frontier) {
+    auto& output = state.root_routes.frontiers[static_cast<size_t>(frontier)];
+    // Separate provider instants, outside all caller leases/locks/timings.
+    virt::get_page_table_pool_stats_snapshot(output.pool);
+    reserve::snapshot(output.emergency);
+    output.observed = true;
+}
 auto check(bool condition, const char* text) -> bool {
     ++state.assertions;
     if (!condition && state.failure == nullptr) state.failure = text;
@@ -436,13 +463,20 @@ struct PrivateRoot {
     virt::UserPagePin pin{};
     bool reader{};
     void* unbound_frame{};
+    RootRoute* route{};
     PrivateRoot() = default;
     PrivateRoot(const PrivateRoot&) = delete;
     ~PrivateRoot() { clear(); }
     auto init() -> bool {
         subject = new (std::nothrow) task::Task{};
         if (!check(subject != nullptr, "private root subject allocation")) return false;
-        root = virt::create_pagemap_may_fail();
+        if (route != nullptr) {
+            virt::SelftestRootFactoryOptions const OPTIONS{};
+            route->factory_called = true;
+            root = virt::selftest_create_pagemap(OPTIONS, route->factory);
+        } else {
+            root = virt::create_pagemap_may_fail();
+        }
         if (!check(root != nullptr, "private root allocation")) return false;
         subject->type = task::TaskType::PROCESS;
         subject->pagemap = root;
@@ -479,7 +513,12 @@ struct PrivateRoot {
                 return;
             }
             virt::destroy_user_space(root, 0, "numa-pressure", "private-fixture-return");
-            virt::release_pagemap(root);
+            if (route != nullptr) {
+                route->release_called = true;
+                virt::selftest_release_pagemap(root, route->release);
+            } else {
+                virt::release_pagemap(root);
+            }
             root = nullptr;
         }
         if (unbound_frame != nullptr) {
@@ -777,6 +816,46 @@ void report_closure_diagnostics() {
             u(magnitude(a.objects, b.objects)), sign(r.objects, b.objects), u(magnitude(r.objects, b.objects)));
     }
 }
+void report_root_routes() {
+    log::error("root_route_v1 roots=2 frontiers=5 sequential_providers=1 historical_pa_only=1");
+    for (size_t index = 0; index < 2; ++index) {
+        auto const& route = state.root_routes.roots[index];
+        auto const& allocation = route.factory;
+        auto const& returned = route.release;
+        log::error(
+            "root_route_v1 root=%u stage=acquire called=%u source=%u pa_valid=%u pa=%llx cpu=%llu local=%u requested=%u "
+            "ordinary=%u injected=%u override=%u reserve_attempt=%u reserve_error=%u registered=%u rollback_valid=%u rollback=%u",
+            static_cast<unsigned>(index), route.factory_called ? 1U : 0U, static_cast<unsigned>(allocation.source),
+            allocation.historical_pa_valid ? 1U : 0U, u(allocation.historical_pa), u(allocation.captured_cpu),
+            static_cast<unsigned>(allocation.captured_local), static_cast<unsigned>(allocation.requested),
+            allocation.ordinary_allocator_called ? 1U : 0U, allocation.ordinary_failure_injected ? 1U : 0U,
+            allocation.override_used ? 1U : 0U, allocation.reserve_attempted ? 1U : 0U, static_cast<unsigned>(allocation.reserve_error),
+            allocation.control_registered ? 1U : 0U, allocation.rollback.owned_facts_valid ? 1U : 0U,
+            static_cast<unsigned>(allocation.rollback.disposition));
+        log::error("root_route_v1 root=%u stage=return called=%u owned_valid=%u pa=%llx kind=%u refs=%u retired=%u disposition=%u",
+                   static_cast<unsigned>(index), route.release_called ? 1U : 0U, returned.owned_facts_valid ? 1U : 0U,
+                   u(returned.historical_pa), static_cast<unsigned>(returned.kind), returned.references, returned.control_retired ? 1U : 0U,
+                   static_cast<unsigned>(returned.disposition));
+    }
+    for (size_t index = 0; index < 5; ++index) {
+        auto const& frontier = state.root_routes.frontiers[index];
+        auto const& pool = frontier.pool;
+        auto const& emergency = frontier.emergency;
+        log::error(
+            "root_route_v1 frontier=%u observed=%u pool_capacity=%llu cached=%llu hits=%llu misses=%llu releases=%llu rejects=%llu "
+            "emergency_published=%u healthy=%u sequence=%llu members=%u nodes=%u",
+            static_cast<unsigned>(index), frontier.observed ? 1U : 0U, u(pool.capacity), u(pool.cached_pages), u(pool.alloc_hits),
+            u(pool.alloc_misses), u(pool.releases), u(pool.rejects), emergency.published ? 1U : 0U, emergency.healthy ? 1U : 0U,
+            u(emergency.sequence), emergency.members, static_cast<unsigned>(emergency.node_count));
+        for (size_t node = 0; node < 2; ++node) {
+            bool const VALID = frontier.observed && emergency.published && emergency.healthy && node < emergency.node_count;
+            auto const& counts = emergency.nodes[node];
+            log::error("root_route_v1 frontier=%u node=%u valid=%u capacity=%u available=%u loaned=%u transfers=%u shortfall=%u",
+                       static_cast<unsigned>(index), static_cast<unsigned>(node), VALID ? 1U : 0U, counts.capacity, counts.available,
+                       counts.loaned, counts.transfers, counts.shortfall);
+        }
+    }
+}
 auto prepare_seed_node(numa::NodeId node, PreparedSeeds& seeds, size_t offset) -> bool {
     auto const CONTEXT = numa::AllocationContext{.policy = {.nodes = uint64_t{1} << node, .mode = numa::Mode::BIND}, .local_node = node};
     for (size_t i = 0; i < SEEDS; ++i) {
@@ -941,8 +1020,10 @@ auto run() -> bool {
     if (!check(state.worker_refs == 3, "exact boot2 plus diagnostic observer1")) return false;
     {
         PrivateRoot warm_root;
+        warm_root.route = &state.root_routes.roots[0];
         if (!warm_root.init() || !warm_root.acquire()) return false;
     }
+    capture_root_frontier(RootFrontier::AFTER_WARM);
     struct CacheCleanup {
         bool active{true};
         ~CacheCleanup() {
@@ -951,15 +1032,20 @@ auto run() -> bool {
     } cache_cleanup;
     PreparedSeeds seeds;
     if (!prepare_cache_seeds(*worker, seeds)) return false;
+    capture_root_frontier(RootFrontier::BEFORE_ROOT);
     phys::get_physical_balance_snapshot(state.root_owner_before);
     virt::get_user_root_control_stats_snapshot(state.root_control_before);
     PrivateRoot root;
+    root.route = &state.root_routes.roots[1];
     if (!root.init()) return false;
+    capture_root_frontier(RootFrontier::AFTER_SETUP);
     state.phase = "healthy-wake-contexts";
     for (unsigned kind = 0; kind < 5; ++kind)
         if (!one_wake(*worker, root, kind)) return false;
     if (!pressure(*worker, seeds)) return false;
+    capture_root_frontier(RootFrontier::BEFORE_CLEAR);
     root.clear();
+    capture_root_frontier(RootFrontier::AFTER_CLEAR);
     phys::get_physical_balance_snapshot(state.root_owner_after);
     virt::get_user_root_control_stats_snapshot(state.root_control_after);
     constexpr auto PRIVATE = static_cast<size_t>(mm::PhysicalPageOwner::USER_PRIVATE_MAPPING);
@@ -996,6 +1082,7 @@ void entry() {
     if (!success) {
         report_seed_diagnostics();
         report_closure_diagnostics();
+        report_root_routes();
         log::error(
             "NUMA_PRESSURE FAIL phase=%s reason=%s held=%llu cleanup=%u checks=%llu limit_captured=%u limit_bits=%u "
             "next_pages=%llu held_before_cleanup=%llu bulk_allocations=%llu order0_allocations=%llu tail_pages=%llu "

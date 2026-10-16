@@ -332,6 +332,20 @@ sys::Spinlock cow_pte_lock;
 // Never hold this across allocation, fault resolution, memcpy, or shootdown.
 #ifdef WOS_SELFTEST
 ker::mod::mm::lifecycle_census::Epoch selftest_root_epoch{};
+// Current-census fact epoch; the old access-based OwnerLock epoch is unchanged.
+ker::mod::mm::lifecycle_census::Epoch selftest_current_root_epoch{};
+bool selftest_current_root_enabled{};
+class CurrentRootSemanticOperation final {
+   public:
+    CurrentRootSemanticOperation() noexcept : owned_(selftest_current_root_change_begin()) {}
+    ~CurrentRootSemanticOperation() { selftest_current_root_change_end(owned_); }
+    CurrentRootSemanticOperation(const CurrentRootSemanticOperation&) = delete;
+    auto operator=(const CurrentRootSemanticOperation&) -> CurrentRootSemanticOperation& = delete;
+
+   private:
+    bool owned_{};
+};
+
 ker::mod::mm::lifecycle_census::OwnerLock user_mapping_pin_lock{selftest_root_epoch};
 #else
 sys::Spinlock user_mapping_pin_lock;
@@ -3406,9 +3420,17 @@ auto try_release_page_table_to_pool(PageTable* table, PageTableReleaseOrigin ori
     return true;
 }
 
-auto alloc_zeroed_page_table(bool may_fail = false) -> PageTable* {
+auto alloc_zeroed_page_table(bool may_fail = false
+#ifdef WOS_SELFTEST
+                             ,
+                             SelftestRootAllocationSource* source = nullptr
+#endif
+                             ) -> PageTable* {
     auto* pooled_table = try_alloc_page_table_from_pool();
     if (pooled_table != nullptr) {
+#ifdef WOS_SELFTEST
+        if (source != nullptr) *source = SelftestRootAllocationSource::LEGACY_POOL;
+#endif
         return pooled_table;
     }
 
@@ -3423,6 +3445,9 @@ auto alloc_zeroed_page_table(bool may_fail = false) -> PageTable* {
     // keeping the current pagemap instead of switching CR3 solely to zero it.
     std::memset(table, 0, paging::PAGE_SIZE);
     (void)phys::page_mark_kind(table, PageKind::PAGE_TABLE);
+#ifdef WOS_SELFTEST
+    if (source != nullptr) *source = SelftestRootAllocationSource::PHYSICAL_ALLOCATOR;
+#endif
     return table;
 }
 
@@ -3529,11 +3554,40 @@ auto return_root_to_emergency_reserve(PageTable* root) -> bool {
     return RETURNED == numa::root_reserve::ReturnResult::RETURNED;
 }
 
-void release_unregistered_user_root(PageTable* root) {
+#ifdef WOS_SELFTEST
+void selftest_capture_root_release(PageTable* root, SelftestRootReleaseOutput* output) {
+    if (output == nullptr) return;
+    output->historical_pa = reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(root)));
+    output->kind = phys::page_kind_get(root);
+    output->references = phys::page_ref_get(root);
+    output->owned_facts_valid = true;
+}
+#endif
+
+void release_unregistered_user_root(PageTable* root
+#ifdef WOS_SELFTEST
+                                    ,
+                                    SelftestRootReleaseOutput* output = nullptr
+#endif
+) {
     // The factory owns this zeroed, unpublished root; it has never returned a
     // pointer or registered a control. No reader/exclusive gate can be needed.
+#ifdef WOS_SELFTEST
+    selftest_capture_root_release(root, output);
+    if (return_root_to_emergency_reserve(root)) {
+        if (output != nullptr) output->disposition = SelftestRootReturnDisposition::EMERGENCY_RETURNED;
+        return;
+    }
+    if (try_release_page_table_to_pool(root, {__builtin_return_address(0), 0})) {
+        if (output != nullptr) output->disposition = SelftestRootReturnDisposition::LEGACY_CACHED;
+        return;
+    }
+    phys::page_free(root);
+    if (output != nullptr) output->disposition = SelftestRootReturnDisposition::PHYSICAL_RELEASED;
+#else
     if (return_root_to_emergency_reserve(root)) return;
     if (!try_release_page_table_to_pool(root, {__builtin_return_address(0), 0})) phys::page_free(root);
+#endif
 }
 
 auto create_user_root_common(bool may_fail
@@ -3544,6 +3598,7 @@ auto create_user_root_common(bool may_fail
                              ) -> PageTable* {
 #ifdef WOS_SELFTEST
     ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_root_epoch);
+    CurrentRootSemanticOperation const current_root_operation;
 #endif
     auto const LOCALITY = capture_root_reserve_locality();
     auto requested = LOCALITY.node;
@@ -3552,6 +3607,8 @@ auto create_user_root_common(bool may_fail
     if (output != nullptr) {
         output->captured_cpu = LOCALITY.cpu;
         output->captured_local = LOCALITY.node;
+        output->source = SelftestRootAllocationSource::UNKNOWN;
+        output->historical_pa_valid = false;
     }
     if (options != nullptr) {
         inject_ordinary_failure = options->force_ordinary_failure;
@@ -3573,7 +3630,13 @@ auto create_user_root_common(bool may_fail
 #endif
     // Ordinary global pool/fallible PMM is always first. The scoped diagnostic
     // branch skips that actual call without consuming or draining the old pool.
-    auto* root = inject_ordinary_failure ? nullptr : alloc_zeroed_page_table(true);
+    auto* root = inject_ordinary_failure ? nullptr
+                                         : alloc_zeroed_page_table(true
+#ifdef WOS_SELFTEST
+                                                                   ,
+                                                                   output != nullptr ? &output->source : nullptr
+#endif
+                                           );
     bool from_reserve = false;
     if (root == nullptr && requested != numa::INVALID_NODE) {
         auto const RESULT = numa::root_reserve::try_take(requested);
@@ -3588,9 +3651,24 @@ auto create_user_root_common(bool may_fail
             dbg::panic_handler("corrupt emergency root take");
         root = RESULT.table;
         from_reserve = root != nullptr;
+#ifdef WOS_SELFTEST
+        if (from_reserve && output != nullptr) output->source = SelftestRootAllocationSource::EMERGENCY_RESERVE;
+#endif
     }
-    if (root == nullptr && !may_fail) root = alloc_zeroed_page_table(false);
+    if (root == nullptr && !may_fail)
+        root = alloc_zeroed_page_table(false
+#ifdef WOS_SELFTEST
+                                       ,
+                                       output != nullptr ? &output->source : nullptr
+#endif
+        );
     if (root == nullptr) return nullptr;
+#ifdef WOS_SELFTEST
+    if (output != nullptr) {
+        output->historical_pa = reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(root)));
+        output->historical_pa_valid = true;
+    }
+#endif
 #ifndef WOS_SELFTEST
     static_cast<void>(from_reserve);
 #endif
@@ -3614,7 +3692,12 @@ auto create_user_root_common(bool may_fail
         }
         if (RESULT == UserRootAttachResult::SERIAL_EXHAUSTED) {
             if (spare != nullptr) phys::page_free(spare);
-            release_unregistered_user_root(root);
+            release_unregistered_user_root(root
+#ifdef WOS_SELFTEST
+                                           ,
+                                           output != nullptr ? &output->rollback : nullptr
+#endif
+            );
 #ifdef WOS_SELFTEST
             if (output != nullptr) output->rollback_returned = from_reserve;
 #endif
@@ -3624,14 +3707,19 @@ auto create_user_root_common(bool may_fail
         if (output != nullptr) output->need_chunk_seen = true;
         if (options != nullptr && options->fail_needed_control_chunk) {
             if (output != nullptr) output->control_failure_injected = true;
-            release_unregistered_user_root(root);
+            release_unregistered_user_root(root, output != nullptr ? &output->rollback : nullptr);
             if (output != nullptr) output->rollback_returned = from_reserve;
             return nullptr;
         }
 #endif
         spare = allocate_user_root_control_chunk();
         if (spare == nullptr) {
-            release_unregistered_user_root(root);
+            release_unregistered_user_root(root
+#ifdef WOS_SELFTEST
+                                           ,
+                                           output != nullptr ? &output->rollback : nullptr
+#endif
+            );
 #ifdef WOS_SELFTEST
             if (output != nullptr) output->rollback_returned = from_reserve;
 #endif
@@ -6071,9 +6159,15 @@ auto selftest_create_pagemap(const SelftestRootFactoryOptions& options, Selftest
 namespace {
 // Requires this exact root's existing exclusive lease and sole allocator owner.
 // Caller provenance is passed through so the ordinary wrapper keeps its trace.
-void release_pagemap_exclusive_owned(PageTable* pagemap, uint64_t owner_pid, void* caller) {
+void release_pagemap_exclusive_owned(PageTable* pagemap, uint64_t owner_pid, void* caller
+#ifdef WOS_SELFTEST
+                                     ,
+                                     SelftestRootReleaseOutput* output = nullptr
+#endif
+) {
 #ifdef WOS_SELFTEST
     ker::mod::mm::lifecycle_census::Operation selftest_operation(selftest_root_epoch);
+    CurrentRootSemanticOperation const current_root_operation;
 #endif
 
 #ifdef WOS_SELFTEST
@@ -6094,6 +6188,9 @@ void release_pagemap_exclusive_owned(PageTable* pagemap, uint64_t owner_pid, voi
         log::critical("invalid final user-root owner root=%p owner_pid=%lu", pagemap, owner_pid);
         hcf();
     }
+#ifdef WOS_SELFTEST
+    selftest_capture_root_release(pagemap, output);
+#endif
     UserRootControlChunk* empty = nullptr;
     uint64_t const CONTROL_FLAGS = user_mapping_pin_lock.lock_irqsave();
     auto const* huge_control = find_user_root_control_locked(pagemap);
@@ -6105,16 +6202,32 @@ void release_pagemap_exclusive_owned(PageTable* pagemap, uint64_t owner_pid, voi
         log::critical("unregistered or corrupt user-root retirement root=%p owner_pid=%lu", pagemap, owner_pid);
         hcf();
     }
+#ifdef WOS_SELFTEST
+    if (output != nullptr) output->control_retired = true;
+#endif
     if (empty != nullptr) phys::page_free(empty);
 
     owned_frame_purge_pagemap(pagemap);
 
+#ifdef WOS_SELFTEST
+    if (return_root_to_emergency_reserve(pagemap)) {
+        if (output != nullptr) output->disposition = SelftestRootReturnDisposition::EMERGENCY_RETURNED;
+        return;
+    }
+    if (try_release_page_table_to_pool(pagemap, {caller, owner_pid})) {
+        if (output != nullptr) output->disposition = SelftestRootReturnDisposition::LEGACY_CACHED;
+        return;
+    }
+    phys::page_free(pagemap);
+    if (output != nullptr) output->disposition = SelftestRootReturnDisposition::PHYSICAL_RELEASED;
+#else
     if (return_root_to_emergency_reserve(pagemap)) return;
     if (try_release_page_table_to_pool(pagemap, {caller, owner_pid})) {
         return;
     }
 
     phys::page_free(pagemap);
+#endif
 }
 }  // namespace
 
@@ -6131,6 +6244,19 @@ void release_pagemap(PageTable* pagemap, uint64_t owner_pid) {
     UserPagemapExclusiveScope teardown_scope(pagemap);
     release_pagemap_exclusive_owned(pagemap, owner_pid, __builtin_return_address(0));
 }
+
+#ifdef WOS_SELFTEST
+void selftest_release_pagemap(PageTable* pagemap, SelftestRootReleaseOutput& output, uint64_t owner_pid) {
+    output = {};
+    if (pagemap == nullptr) return;
+    if (pagemap == kernel_pagemap || is_current_pagemap(pagemap)) {
+        page_table_pool_rejects.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    UserPagemapExclusiveScope teardown_scope(pagemap);
+    release_pagemap_exclusive_owned(pagemap, owner_pid, __builtin_return_address(0), &output);
+}
+#endif
 
 void get_user_root_control_stats_snapshot(UserRootControlStats& out) {
     uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
@@ -6154,6 +6280,48 @@ auto selftest_root_census() -> SelftestRootCensus {
     out.complete = out.complete && ker::mod::mm::lifecycle_census::unchanged(selftest_before, out.stamp);
     return out;
 }
+
+void selftest_enable_current_root_census() noexcept {
+    // Existing boot enable point precedes every user root/child lifetime.
+    // Never reset either epoch, and never publish readiness before preflight.
+#ifdef WOS_KASAN
+    if (kasan::is_enabled()) {
+        kasan::unpoison_range(&selftest_current_root_epoch, sizeof(selftest_current_root_epoch));
+        kasan::unpoison_range(&selftest_current_root_enabled, sizeof(selftest_current_root_enabled));
+    }
+#endif
+    __atomic_store_n(&selftest_current_root_enabled, true, __ATOMIC_RELEASE);
+}
+
+auto selftest_current_root_change_begin() noexcept -> bool {
+    if (!__atomic_load_n(&selftest_current_root_enabled, __ATOMIC_ACQUIRE)) return false;
+    selftest_current_root_epoch.begin();
+    return true;
+}
+
+void selftest_current_root_change_end(bool owned) noexcept {
+    if (owned) selftest_current_root_epoch.end();
+}
+
+void selftest_current_root_detached_binding_returned() noexcept {
+    // Enabled once before all user roots/indices exist; never toggled later.
+    if (__atomic_load_n(&selftest_current_root_enabled, __ATOMIC_ACQUIRE)) selftest_current_root_epoch.end();
+}
+
+void selftest_current_root_census_into(SelftestRootCensus& out, lifecycle_census::Stamp& before) noexcept {
+    out.complete = false;
+    if (!__atomic_load_n(&selftest_current_root_enabled, __ATOMIC_ACQUIRE)) return;
+    selftest_current_root_epoch.snapshot_into(before);
+    uint64_t const flags = user_mapping_pin_lock.observe_lock_irqsave();
+    out.roots.active_roots = user_root_control_active_roots;
+    out.roots.control_pages = user_root_control_pages;
+    out.roots.last_serial = user_root_control_last_serial;
+    out.complete = file_mapping_index.selftest_count_all_locked(out.indexed_bindings);
+    user_mapping_pin_lock.observe_unlock_irqrestore(flags);
+    selftest_current_root_epoch.snapshot_into(out.stamp);
+    out.complete = out.complete && lifecycle_census::unchanged(before, out.stamp);
+}
+
 #endif
 
 auto unpublished_user_root_empty(PageTable* root) -> bool {
@@ -6248,6 +6416,10 @@ auto prepare_unpublished_file_mapping_tables(PageTable* root, uint64_t start, ui
 
 auto attach_unpublished_file_binding(file_mapping::FileMappingBinding*& prepared, PageTable* root, uint64_t start, uint64_t end,
                                      uint64_t file_offset) -> bool {
+#ifdef WOS_SELFTEST
+    CurrentRootSemanticOperation const current_root_operation;
+#endif
+
     if (prepared == nullptr || root == nullptr) return false;
     uint64_t const FLAGS = user_mapping_pin_lock.lock_irqsave();
     auto* control = find_user_root_control_locked(root);
@@ -6580,6 +6752,10 @@ auto current_user_root_incarnation(sched::task::Task& task) -> uint64_t {
 
 auto attach_current_file_binding(sched::task::Task& task, file_mapping::FileMappingBinding*& prepared, uint64_t start, uint64_t end,
                                  uint64_t file_offset, uint64_t expected_serial) -> bool {
+#ifdef WOS_SELFTEST
+    CurrentRootSemanticOperation const current_root_operation;
+#endif
+
     if (!current_process_root(task) || prepared == nullptr || expected_serial == 0) return false;
     sched::PreemptGuard const PREEMPT;
     DemandRootAccess access(task);

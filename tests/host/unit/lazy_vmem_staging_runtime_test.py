@@ -87,6 +87,15 @@ struct SharedVmemPublicationGuard {
 };
 }
 namespace ker::mod::mm::virt {
+#ifdef WOS_SELFTEST
+// This lazy/debt fixture has no armed current root census. The separate
+// semantic fixture exercises actual epoch/index ownership and return tails.
+inline auto selftest_current_root_change_begin() noexcept -> bool { return false; }
+inline void selftest_current_root_change_end(bool owned) noexcept {
+    fixture::check(!owned, "unarmed unrelated root census owns no epoch unit");
+}
+inline void selftest_current_root_detached_binding_returned() noexcept {}
+#endif
 inline bool capture_user_root_incarnation(paging::PageTable* root,uint64_t& empty) noexcept {
     fixture::check(fixture::publication,"identity captured under publication; MM pin lock is primitive-local");
     if(empty || !root || !root->serial)return false;empty=root->serial;return true;
