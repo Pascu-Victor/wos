@@ -89,6 +89,180 @@ class CppText(str):
     def replace(self, needle, replacement):
         return CppText(re.sub(self.pattern(needle), lambda _: replacement, self))
 
+    def gtest_cases(self) -> list[dict]:
+        """Finite TEST/TEST_F discovery; byte offsets always refer to the original."""
+        original = str(self).encode()
+        # One search character per UTF-8 byte. Never index the Unicode source
+        # with these offsets; retain both units for the source proof below.
+        source = original.decode("latin1")
+        masked = list(source)
+        raw_pattern = re.compile(r'(?:u8|u|U|L)?R"([^ ()\\\t\r\n]{0,16})\(')
+        raw_prefix = re.compile(r'(?:u8|u|U|L)?R"')
+        literal_pattern = re.compile(r'(?:u8|u|U|L)?(["\'])')
+        interesting = re.compile(r"""(?:u8|u|U|L)?(?:R"|["'])|[0-9\xb2\xb3\xb9/\\]""")
+        cursor = 0
+        while cursor < len(source):
+            found = interesting.search(source, cursor)
+            if found is None:
+                break
+            cursor = found.start()
+            start = cursor
+            if source.startswith("//", cursor):
+                cursor = source.find("\n", cursor)
+                if cursor < 0:
+                    cursor = len(source)
+                if source[start:cursor].rstrip("\r").endswith("\\"):
+                    raise ValueError("continued line comment is unsupported")
+            elif source.startswith("/*", cursor):
+                end = source.find("*/", cursor + 2)
+                if end < 0:
+                    raise ValueError("unterminated C++ comment")
+                cursor = end + 2
+                if re.search(r"\\\r?\n", source[start:cursor]):
+                    raise ValueError("continued block comment is unsupported")
+            else:
+                raw = raw_pattern.match(source, cursor)
+                literal = literal_pattern.match(source, cursor)
+                if raw is not None:
+                    if any(not 33 <= ord(char) <= 126 for char in raw[1]):
+                        raise ValueError("unsupported raw C++ delimiter")
+                    end = source.find(")" + raw[1] + '"', raw.end())
+                    if end < 0:
+                        raise ValueError("unterminated raw C++ literal")
+                    cursor = end + len(raw[1]) + 2
+                elif raw_prefix.match(source, cursor):
+                    raise ValueError("unsupported raw C++ delimiter")
+                elif literal is not None:
+                    quote = literal[1]
+                    cursor = literal.end()
+                    while cursor < len(source) and source[cursor] != quote:
+                        if source[cursor] == "\\":
+                            cursor += 3 if source.startswith("\\\r\n", cursor) else 2
+                        elif source[cursor] in "\r\n":
+                            raise ValueError("unescaped newline in C++ literal")
+                        else:
+                            cursor += 1
+                    if cursor >= len(source):
+                        raise ValueError("unterminated C++ literal")
+                    cursor += 1
+                else:
+                    if source[cursor].isdigit():
+                        cursor += 1
+                        while cursor < len(source):
+                            char = source[cursor]
+                            if char.isalnum() or char in "_.":
+                                cursor += 1
+                            elif char == "'" and cursor + 1 < len(source) and source[cursor + 1].isalnum():
+                                cursor += 2
+                            else:
+                                break
+                    else:
+                        if source[cursor] == "\\" and source[cursor + 1:cursor + 2] in ("\n", "\r"):
+                            raise ValueError("continued C++ code is unsupported")
+                        cursor += 1
+                    continue
+            masked[start:cursor] = [char if char in "\r\n" else " " for char in source[start:cursor]]
+        code = "".join(masked)
+        directives = list(re.finditer(r"(?m)^[ \t]*#[ \t]*([A-Za-z_][A-Za-z_0-9]*)[^\n]*", code))
+        if any(re.search(r"\b(?:TEST(?:_[A-Za-z_0-9]+)?|TYPED_TEST(?:_[A-Za-z_0-9]+)?|GTEST_TEST)\b", item[0]) for item in directives):
+            raise ValueError("preprocessor GTest registration is unsupported")
+        declarations = list(re.finditer(r"\b(?:TEST(?:_[A-Za-z_][A-Za-z_0-9]*)?|TYPED_TEST(?:_[A-Za-z_][A-Za-z_0-9]*)?|GTEST_TEST_?|INSTANTIATE_TEST(?:_[A-Za-z_][A-Za-z_0-9]*)?|REGISTER_TYPED_TEST(?:_[A-Za-z_][A-Za-z_0-9]*)?)\s*\(", code))
+        cases, names = [], set()
+        for registration in declarations:
+            start = registration.start()
+            if cases and start < cases[-1]["byte_end"]:
+                raise ValueError("nested or overlapping GTest registration")
+            line = code.rfind("\n", 0, start) + 1
+            if "#" in code[line:start]:
+                raise ValueError("preprocessor GTest registration is unsupported")
+            conditional = 0
+            for item in directives:
+                if item.start() >= start:
+                    break
+                conditional += (item[1] in ("if", "ifdef", "ifndef")) - (item[1] == "endif")
+                if conditional < 0:
+                    raise ValueError("unbalanced preprocessor condition")
+            if conditional:
+                raise ValueError("conditional GTest registration is unsupported")
+            declaration = re.match(r"TEST(?:_F)?\s*\(\s*([A-Za-z_][A-Za-z_0-9]*)\s*,\s*([A-Za-z_][A-Za-z_0-9]*)\s*\)\s*\{", code[start:])
+            if declaration is None or any(part.startswith("DISABLED_") for part in declaration.groups()):
+                raise ValueError("unsupported GTest declaration")
+            name = ".".join(declaration.groups())
+            if name in names:
+                raise ValueError("duplicate GTest case")
+            end, depth = start + declaration.end(), 1
+            while depth and end < len(code):
+                depth += (code[end] == "{") - (code[end] == "}")
+                end += 1
+            if depth:
+                raise ValueError("unbalanced GTest body")
+            if any(start < item.start() < end for item in directives):
+                raise ValueError("preprocessing within GTest body is unsupported")
+            names.add(name)
+            cases.append(dict(name=name, byte_start=start, byte_end=end,
+                              character_start=len(original[:start].decode()), character_end=len(original[:end].decode()),
+                              sha256=hashlib.sha256(original[start:end]).hexdigest()))
+        return cases
+
+
+def control_case_names(test: str, baseline_names: set[str]) -> set[str]:
+    terms = test.split(":")
+    if not terms or len(terms) != len(set(terms)) or any(
+        re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*\.[A-Za-z_][A-Za-z_0-9]*", term) is None
+        or any(part.startswith("DISABLED_") for part in term.split(".")) for term in terms
+    ):
+        raise ValueError("control requires unique exact positive GTest names")
+    names = set(terms)
+    if not names <= baseline_names:
+        raise ValueError("control case absent from actual complete baseline")
+    return names
+
+
+def verify_control_source(full: str, projection: str, test: str, baseline_names: set[str]) -> dict:
+    wanted = control_case_names(test, baseline_names)
+    cases = CppText(full).gtest_cases()
+    if not wanted <= {case["name"] for case in cases}:
+        raise ValueError("selected control case absent from mutant composite")
+    original, actual = full.encode(), projection.encode()
+    expected = bytearray(original)
+    for case in cases:
+        case["selected"] = case["name"] in wanted
+        if not case["selected"]:
+            start, end = case["byte_start"], case["byte_end"]
+            expected[start:end] = bytes(char if char in (10, 13) else 32 for char in original[start:end])
+    if actual != expected:
+        raise ValueError("control projection changed support, selected body or deletion geometry")
+    if {case["name"] for case in CppText(projection).gtest_cases()} != wanted:
+        raise ValueError("projected GTest inventory differs from exact filter")
+    restored = bytearray(actual)
+    for case in cases:
+        if not case["selected"]:
+            start, end = case["byte_start"], case["byte_end"]
+            restored[start:end] = original[start:end]
+    if restored != original:
+        raise ValueError("control projection inverse failed")
+    return dict(full_sha256=hashlib.sha256(original).hexdigest(), projected_sha256=hashlib.sha256(actual).hexdigest(),
+                bytes=len(original), selected=sorted(wanted), cases=cases, offset_unit="UTF-8 bytes; character offsets also recorded",
+                exact_gaps_bodies_inverse=True)
+
+
+def select_control_source(full: str, test: str, baseline_names: set[str]) -> tuple[str, dict]:
+    wanted = control_case_names(test, baseline_names)
+    raw = bytearray(full.encode())
+    for case in CppText(full).gtest_cases():
+        if case["name"] not in wanted:
+            start, end = case["byte_start"], case["byte_end"]
+            raw[start:end] = bytes(char if char in (10, 13) else 32 for char in raw[start:end])
+    projection = raw.decode()
+    return projection, verify_control_source(full, projection, test, baseline_names)
+
+
+def baseline_gtest_names(report: dict) -> set[str]:
+    names = [suite["name"] + "." + case["name"] for suite in report["testsuites"] for case in suite["testsuite"]]
+    if len(names) != len(set(names)) or len(names) != report["tests"]:
+        raise ValueError("actual baseline GTest names are incomplete or duplicated")
+    return set(names)
+
 
 def definition(text: str, anchor: str) -> str:
     if text.count(anchor) != 1:
@@ -238,6 +412,7 @@ def main() -> int:
     )
     parser.add_argument("--fork-contract-only", action="store_true", help="run all old positive cases plus the focused fork cases and two fork controls")
     parser.add_argument("--fork-vm-coordinator-only", action="store_true", help="exercise the private actual-owner fork VM composition")
+    parser.add_argument("--anonymous-remove-only", action="store_true", help="exercise unwired managed anonymous removal with the retained original positive vectors")
     parser.add_argument("--gtest-main", type=Path)
     parser.add_argument("--gtest", type=Path)
     parser.add_argument("--output", type=Path, help="fresh directory for small logs/results; scratch is always removed")
@@ -250,6 +425,7 @@ def main() -> int:
     if options.output:
         output.mkdir(parents=True, exist_ok=False)
     scratch = Path(tempfile.mkdtemp(prefix="scratch-", dir=output))
+    scratch_identity = scratch.lstat()
     started = time.monotonic()
     commands: list[dict] = []
     controls: list[dict] = []
@@ -258,6 +434,11 @@ def main() -> int:
     errors: list[str] = []
     selected: list[dict] = []
     emitted: list[dict] = []
+    pending_signal = None
+
+    def check_interrupted() -> None:
+        if pending_signal is not None:
+            raise KeyboardInterrupt(f"received signal {pending_signal}")
     environment = dict(
         os.environ,
         TMPDIR=str(scratch),
@@ -275,12 +456,17 @@ def main() -> int:
         return sum(path.stat().st_blocks * 512 for path in scratch.rglob("*") if path.is_file())
 
     def run(label: str, arguments: list, expected_success: bool = True) -> None:
+        check_interrupted()
         remaining = OVERALL_SECONDS - (time.monotonic() - started)
         if remaining <= 0 or allocated_bytes() > SCRATCH_BYTES:
             raise RuntimeError("overall time/scratch budget exhausted")
         argv = [str(argument) for argument in arguments]
         log = output / f"{label}.log"
         before = time.monotonic()
+        deadline = min(started + OVERALL_SECONDS, before + COMMAND_SECONDS)
+        work_deadline = deadline - 1  # Retain cleanup inside the original command/overall caps.
+        if work_deadline <= before:
+            raise RuntimeError("command cleanup reserve exhausted")
         with log.open("wb") as stream:
             process = subprocess.Popen(
                 argv, cwd=root, env=environment, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True
@@ -288,11 +474,26 @@ def main() -> int:
             groups.append(process.pid)
             processes.append(process)
             try:
-                code = process.wait(timeout=min(COMMAND_SECONDS, remaining))
+                # A signal across Popen return/adoption only sets the pending
+                # flag. Check it after both ownership records are installed.
+                while True:
+                    check_interrupted()
+                    remaining = work_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(argv, COMMAND_SECONDS)
+                    try:
+                        code = process.wait(timeout=min(0.1, remaining))
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
             except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=max(0, deadline - time.monotonic()))
                 raise RuntimeError(f"{label}: timed out")
+        check_interrupted()
         try:
             os.killpg(process.pid, 0)
             absent = False
@@ -317,7 +518,9 @@ def main() -> int:
     saved_signals = {}
 
     def interrupted(number, _frame):
-        raise KeyboardInterrupt(f"received signal {number}")
+        nonlocal pending_signal
+        if pending_signal is None:
+            pending_signal = number
 
     for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         saved_signals[number] = signal.signal(number, interrupted)
@@ -352,9 +555,12 @@ def main() -> int:
         context, context_methods, context_sources, context_map = context_overlay(scratch, kernel_file, root)
         selected.extend(pin(path) for path in context_sources)
         coordinator = None
-        if options.fork_vm_coordinator_only:
-            import fork_vm_coordinator_fixture
-            coordinator = fork_vm_coordinator_fixture.Builder(kernel_file, support, definition)
+        if options.fork_vm_coordinator_only or options.anonymous_remove_only:
+            if options.anonymous_remove_only:
+                import managed_anonymous_remove_fixture as composition
+            else:
+                import fork_vm_coordinator_fixture as composition
+            coordinator = composition.Builder(kernel_file, support, definition)
             coordinator.extend_context(context)
             selected.extend(pin(path) for path in coordinator.inputs)
         flags = compile_flags(row, overlay)
@@ -444,7 +650,6 @@ def main() -> int:
             **context_map,
         }
         if coordinator is not None:
-            shutil.copy2(composite, output / "actual-source.cpp")
             for path in context.rglob("*"):
                 if path.is_file():
                     retained = output / "generated-context" / path.relative_to(context)
@@ -466,6 +671,7 @@ def main() -> int:
                 )
                 + "\n"
             )
+        shutil.copy2(composite, output / "actual-source.cpp")
         (output / "extraction-map.json").write_text(
             json.dumps(
                 {
@@ -482,6 +688,12 @@ def main() -> int:
             + "\n"
         )
 
+        baseline_cases = CppText(composite.read_text()).gtest_cases()
+        baseline_names = {case["name"] for case in baseline_cases}
+        expected_count = EXPECTED_TESTS + coordinator.test_count if coordinator is not None else EXPECTED_TESTS
+        if len(baseline_names) != expected_count:
+            raise RuntimeError("complete lexical GTest inventory differs from required baseline")
+        (output / "baseline-case-inventory.json").write_text(json.dumps(baseline_cases, indent=2) + "\n")
         sources = [module, factory, composite] + ([public_source] if coordinator is not None else [])
         dependencies: set[Path] = set()
         for index, path in enumerate(sources):
@@ -506,14 +718,33 @@ def main() -> int:
         tests = json.loads((output / "current.json").read_text())
         if tests["failures"] != 0 or tests["tests"] != (EXPECTED_TESTS + coordinator.test_count if coordinator is not None else EXPECTED_TESTS):
             raise RuntimeError("actual range/legacy suite did not pass")
+        if baseline_gtest_names(tests) != baseline_names:
+            raise RuntimeError("actual complete baseline differs from lexical GTest names")
 
+        control_evidence_bytes = 0
         def mutant(label: str, text: str, test: str, replace_index: int = 2) -> None:
+            nonlocal control_evidence_bytes
+            selected_cases = control_case_names(test, baseline_names)
+            selection = None
+            original_source = None
+            if replace_index == 2:
+                original = str(text)
+                text, selection = select_control_source(original, test, baseline_names)
+                proof_bytes = len(original.encode()) + len(json.dumps(selection).encode())
+                if control_evidence_bytes + proof_bytes > SCRATCH_BYTES:
+                    raise RuntimeError("bounded control source evidence exhausted")
+                retained = output / f"{label}-full.cpp"
+                with retained.open("x") as stream:
+                    stream.write(original)
+                control_evidence_bytes += proof_bytes
+                original_source = pin(retained)
             path = scratch / f"{label}.cpp"
             path.write_text(text)
             obj = scratch / f"{label}.o"
             run(f"compile-{label}", flags + ["-c", path, "-o", obj])
             binary = link(label, [*objects[:replace_index], obj, *objects[replace_index + 1:]])
-            controls.append({"label": label, "source": pin(path), "object": pin(obj), "binary": pin(binary)})
+            controls.append({"label": label, "source": pin(path), "object": pin(obj), "binary": pin(binary),
+                             "selected_cases": sorted(selected_cases), "selection": selection, "original_source": original_source})
             run(f"run-{label}", [binary, f"--gtest_filter={test}"], expected_success=False)
             binary.unlink()
             obj.unlink()
@@ -523,8 +754,9 @@ def main() -> int:
         if coordinator is not None:
             for label, bad, test in coordinator.controls(composite.read_text()):
                 mutant(label, bad, test)
-            for label, bad, test in coordinator.public.controls(public_source.read_text()):
-                mutant(label, bad, test, replace_index=3)
+            if not options.anonymous_remove_only:
+                for label, bad, test in coordinator.public.controls(public_source.read_text()):
+                    mutant(label, bad, test, replace_index=3)
         elif options.fork_contract_only:
             owner_check = "if (!exclusive.owns(src)) return false;"
             if composite.read_text().count(owner_check) != 1:
@@ -631,6 +863,7 @@ def main() -> int:
             )
 
             def module_mutant(label: str, text: str, test: str) -> None:
+                control_case_names(test, baseline_names)
                 path = scratch / f"{label}.cpp"
                 path.write_text(text)
                 obj = scratch / f"{label}.o"
@@ -668,6 +901,7 @@ def main() -> int:
             if text.count(needle) != 1:
                 raise RuntimeError("data-transfer mutation boundary changed")
             bad_module = scratch / "drop-adopted-data.cpp"
+            control_case_names("ManagedResolver.ActualPublisherTransfersDataOnceAndCleanupRetainsChargeThroughAck", baseline_names)
             bad_module.write_text(text.replace(needle, "owner.span_.reset();"))
             obj = scratch / "drop-adopted-data.o"
             run("compile-drop-adopted-data", flags + ["-iquote", module.parent, "-c", bad_module, "-o", obj])
@@ -681,6 +915,7 @@ def main() -> int:
                 expected_success=False,
             )
 
+        check_interrupted()
     except BaseException as error:
         errors.append(str(error))
     finally:
@@ -692,29 +927,63 @@ def main() -> int:
         except Exception as error:
             selected_after, emitted_after = [], []
             errors.append(f"input resampling: {error}")
+        cleanup_deadline = min(started + OVERALL_SECONDS, time.monotonic() + 1)
         for group in list(groups):
             try:
                 os.killpg(group, 0)
             except ProcessLookupError:
                 groups.remove(group)
                 continue
-            os.killpg(group, signal.SIGKILL)
-            errors.append(f"owned group remained after leader reap: {group}")
-        for process in processes:
-            if process.poll() is None:
-                process.wait(timeout=5)
-        for group in list(groups):
+            except OSError as error:
+                errors.append(f"owned group presence unknown: {group}: {error}")
+                continue
             try:
-                os.killpg(group, 0)
+                os.killpg(group, signal.SIGKILL)
             except ProcessLookupError:
-                groups.remove(group)
-        removed = allocated_bytes()
-        if not groups:
-            shutil.rmtree(scratch)
+                pass
+            except OSError as error:
+                errors.append(f"owned group cleanup failed: {group}: {error}")
+            errors.append(f"owned group required cleanup: {group}")
+        for process in processes:
+            try:
+                process.wait(timeout=max(0, cleanup_deadline - time.monotonic()))
+            except BaseException as error:
+                errors.append(f"owned leader reap unproven: {process.pid}: {error}")
+        while groups:
+            try:
+                for group in list(groups):
+                    try:
+                        os.killpg(group, 0)
+                    except ProcessLookupError:
+                        groups.remove(group)
+                remaining = cleanup_deadline - time.monotonic()
+                if not groups or remaining <= 0:
+                    break
+                time.sleep(min(0.01, remaining))
+            except OSError as error:
+                errors.append(f"owned group final presence unknown: {error}")
+                break
+        try:
+            removed = allocated_bytes()
+            current_scratch = scratch.lstat()
+            scratch_owned = (not scratch.is_symlink() and
+                             (current_scratch.st_dev, current_scratch.st_ino, current_scratch.st_uid) ==
+                             (scratch_identity.st_dev, scratch_identity.st_ino, os.getuid()))
+        except OSError as error:
+            removed, scratch_owned = 0, False
+            errors.append(f"scratch identity/size unproven: {error}")
+        all_reaped = all(process.returncode is not None for process in processes)
+        if not groups and all_reaped and scratch_owned:
+            try:
+                shutil.rmtree(scratch)
+            except OSError as error:
+                errors.append(f"scratch removal failed: {error}")
         else:
-            errors.append(f"unproven owned groups; preserving {scratch}")
+            errors.append(f"unproven owned group/leader/scratch identity; preserving {scratch}")
         for number, handler in saved_signals.items():
             signal.signal(number, handler)
+        if pending_signal is not None and not any("received signal" in error for error in errors):
+            errors.append(f"received signal {pending_signal}")
         result = {
             "qualification": (
                 "PASS_ACTUAL_MANAGED_HUGE_HOST_ONLY" if not errors else "FAIL_ACTUAL_MANAGED_HUGE_HOST_ONLY"

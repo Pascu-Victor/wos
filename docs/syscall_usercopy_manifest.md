@@ -300,7 +300,7 @@ forwarding a raw userspace address into a device backend.
 | `VMEM` | `SWAPON` | `in` | strict path C string up to 511 chars | no | none | snapshot precedes swap-state mutation |
 | `VMEM` | `SWAPOFF` | `in` | strict path C string up to 511 chars | no | none | snapshot precedes swap-state mutation |
 | `VMEM` | `QUERY_NUMA` | `in/out` | fixed 64-byte request; exact 64-byte summary/node, 32-byte self-policy, or 1–64 eight-byte page-node outputs | no | output prefix may be written on `-EFAULT`; nonresident page rows report unavailable without fault-in | snapshots and validates the request and output geometry before read-only topology/policy observation; releases each nonfaulting page pin before copyout |
-| `VMEM` | `SET_MEMORY_POLICY` | `in` | fixed 32-byte versioned policy request | no | none | complete snapshot and policy/topology validation precede publication; currently accepts only `LOCAL`, returning `-ENOTSUP` for other valid modes |
+| `VMEM` | `SET_MEMORY_POLICY` | `in` | fixed 32-byte versioned policy request | no | none | complete snapshot and policy/topology validation precede actor-only publication; accepts valid `LOCAL`, preferred, bind and interleave policies without migrating existing pages |
 
 ## Shared memory
 

@@ -64,12 +64,45 @@ void initialize_transport(T& object) {
     for (size_t i = 0; i < sizeof(T); ++i) bytes[i] = 0;
 }
 
-auto now_ns(uint64_t& out) -> bool {
+enum ClockValid : uint32_t { CLOCK_RESULT = 1, CLOCK_ERRNO = 2, CLOCK_TIMESPEC = 4, CLOCK_NS = 8 };
+struct ClockObservation {
+    uint32_t valid{};
+    int result{}, error{};
+    int64_t seconds{}, nanoseconds{};
+    uint64_t now{};
+};
+enum class WaitOutcome : uint32_t { NOT_CALLED, ZERO_EXIT, NONZERO_STATUS, WAIT_ERROR, DEADLINE, CLOCK_ERROR };
+struct WaitObservation {
+    ClockObservation clock{};
+    uint64_t deadline{}, polls{};
+    int64_t result{};
+    int error{}, status{};
+    WaitOutcome outcome{};
+    bool result_valid{}, error_valid{}, status_valid{};
+};
+
+auto now_ns(uint64_t& out, ClockObservation* observation = nullptr) -> bool {
     timespec ts{};
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0 || ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L ||
+    int const RESULT = clock_gettime(CLOCK_MONOTONIC, &ts);
+    if (observation != nullptr) {
+        *observation = {.valid = CLOCK_RESULT, .result = RESULT};
+        if (RESULT < 0) {
+            observation->error = errno;  // Capture before cleanup can replace it.
+            observation->valid |= CLOCK_ERRNO;
+        } else if (RESULT == 0) {
+            observation->seconds = ts.tv_sec;
+            observation->nanoseconds = ts.tv_nsec;
+            observation->valid |= CLOCK_TIMESPEC;
+        }
+    }
+    if (RESULT != 0 || ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L ||
         static_cast<uint64_t>(ts.tv_sec) > (UINT64_MAX - static_cast<uint64_t>(ts.tv_nsec)) / 1000000000ULL)
         return false;
     out = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
+    if (observation != nullptr) {
+        observation->now = out;
+        observation->valid |= CLOCK_NS;
+    }
     return true;
 }
 auto deadline_after(uint32_t ms, uint64_t& out) -> bool {
@@ -78,9 +111,9 @@ auto deadline_after(uint32_t ms, uint64_t& out) -> bool {
     out = now + static_cast<uint64_t>(ms) * NS_PER_MS;
     return true;
 }
-auto before(uint64_t deadline) -> bool {
+auto before(uint64_t deadline, ClockObservation* observation = nullptr) -> bool {
     uint64_t now;
-    return now_ns(now) && now < deadline;
+    return now_ns(now, observation) && now < deadline;
 }
 auto raw_error(uint64_t value) -> bool { return value >= UINT64_MAX - 4094; }
 
@@ -581,16 +614,31 @@ auto child_cycle(uint8_t* mapping, int fd, const Options& opts, const Topology& 
     // Both source and parent's destination cross the actual4KiB boundary.
     return transfer(fd, mapping + CROSS_START, CROSS_BYTES, true, deadline) ? 0 : 62;
 }
-auto wait_child(pid_t pid, uint64_t deadline, int& status, bool& owned) -> bool {
-    while (before(deadline)) {
+auto wait_child(pid_t pid, uint64_t deadline, int& status, bool& owned, WaitObservation& observation) -> bool {
+    observation.deadline = deadline;
+    while (before(deadline, &observation.clock)) {
         pid_t rc = waitpid(pid, &status, WNOHANG);
+        int const ERROR = rc < 0 ? errno : 0;
+        ++observation.polls;
+        observation.result = rc;
+        observation.result_valid = true;
+        observation.error = ERROR;
+        observation.error_valid = rc < 0;
+        observation.status_valid = rc == pid;
+        observation.status = observation.status_valid ? status : 0;
         if (rc == pid) {
             owned = false;
-            return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+            bool const SUCCESS = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+            observation.outcome = SUCCESS ? WaitOutcome::ZERO_EXIT : WaitOutcome::NONZERO_STATUS;
+            return SUCCESS;
         }
-        if (rc < 0 && errno != EINTR) return false;
+        if (rc < 0 && ERROR != EINTR) {
+            observation.outcome = WaitOutcome::WAIT_ERROR;
+            return false;
+        }
         (void)ker::multiproc::yield();
     }
+    observation.outcome = (observation.clock.valid & CLOCK_NS) != 0 ? WaitOutcome::DEADLINE : WaitOutcome::CLOCK_ERROR;
     errno = ETIMEDOUT;
     return false;
 }
@@ -854,11 +902,15 @@ auto run_numa_lifecycle(int argc, char** argv) -> int {
             if (!verify_cycle(payload, opts.seed, cycle, true)) ok = false;
         }
         int status = -1;
+        WaitObservation wait_observation{};
         if (ok) {
             phase = "wait0";
-            if (!wait_child(pid, child_deadline, status, owned)) ok = false;
+            if (!wait_child(pid, child_deadline, status, owned, wait_observation)) ok = false;
         }
-        if (!close_fd(fds[0], own)) ok = false;
+        bool const WAIT_OWNED = owned;
+        bool const READ_CLOSED = close_fd(fds[0], own);
+        if (!READ_CLOSED) ok = false;
+        bool const CLEANUP_REAP_NEEDED = owned;
         bool const reaped = terminate_and_reap(pid, owned);
         bool const unmapped = munmap(mapping, CYCLE_BYTES) == 0;
         if (unmapped) {
@@ -868,7 +920,9 @@ auto run_numa_lifecycle(int argc, char** argv) -> int {
             own.complete = false;
         bool const fds_absent = confirm_closed(opened_fds[0]) && confirm_closed(opened_fds[1]);
         bool mapping_absent = false;
-        if (unmapped && page_nodes(io, mapping, 3) == 0) {
+        bool const MAPPING_QUERY_VALID = unmapped;
+        int64_t const MAPPING_QUERY = unmapped ? page_nodes(io, mapping, 3) : 0;
+        if (unmapped && MAPPING_QUERY == 0) {
             mapping_absent = true;
             for (uint32_t i = 0; i < 3; ++i)
                 if (io.pages[i].node != abi::INVALID_NODE || io.pages[i].status != static_cast<uint16_t>(abi::PageStatus::UNAVAILABLE) ||
@@ -877,12 +931,27 @@ auto run_numa_lifecycle(int argc, char** argv) -> int {
         }
         if (!fds_absent || !mapping_absent) own.complete = false;
         if (!ok || !reaped || owned || !unmapped || !fds_absent || !mapping_absent || own.fds || own.maps || !own.complete) {
-            std::fprintf(stderr,
-                         "NUMA_LIFECYCLE_FAIL cycle=%u pid=%d phase=%s source_query_error=%lld child_phase=%u child_error=%lld "
-                         "wait_status=%d reaped=%u unmapped=%u errno=%d\n",
-                         cycle, static_cast<int>(pid), phase, static_cast<long long>(source_query_error), record.phase,
-                         static_cast<long long>(record.error), status, static_cast<unsigned>(reaped && !owned),
-                         static_cast<unsigned>(unmapped), errno);
+            std::fprintf(
+                stderr,
+                "NUMA_LIFECYCLE_FAIL cycle=%u pid=%d phase=%s source_query_error=%lld child_phase=%u child_error=%lld "
+                "wait_status=%d reaped=%u unmapped=%u errno=%d "
+                "wait_outcome=%u wait_rc_valid=%u wait_rc=%lld wait_errno_valid=%u wait_errno=%d "
+                "wait_status_valid=%u wait_status_observed=%d wait_polls=%llu wait_owned=%u "
+                "clock_valid=%u clock_rc=%d clock_errno=%d clock_sec=%lld clock_nsec=%lld clock_ns=%llu wait_deadline=%llu "
+                "close_read=%u cleanup_reap_needed=%u cleanup_reap=%u cleanup_owned=%u fd_absent=%u "
+                "map_query_valid=%u map_query=%lld mapping_absent=%u own_fds=%u own_maps=%u own_complete=%u\n",
+                cycle, static_cast<int>(pid), phase, static_cast<long long>(source_query_error), record.phase,
+                static_cast<long long>(record.error), status, static_cast<unsigned>(reaped && !owned), static_cast<unsigned>(unmapped),
+                errno, static_cast<unsigned>(wait_observation.outcome), static_cast<unsigned>(wait_observation.result_valid),
+                static_cast<long long>(wait_observation.result), static_cast<unsigned>(wait_observation.error_valid),
+                wait_observation.error, static_cast<unsigned>(wait_observation.status_valid), wait_observation.status,
+                static_cast<unsigned long long>(wait_observation.polls), static_cast<unsigned>(WAIT_OWNED), wait_observation.clock.valid,
+                wait_observation.clock.result, wait_observation.clock.error, static_cast<long long>(wait_observation.clock.seconds),
+                static_cast<long long>(wait_observation.clock.nanoseconds), static_cast<unsigned long long>(wait_observation.clock.now),
+                static_cast<unsigned long long>(wait_observation.deadline), static_cast<unsigned>(READ_CLOSED),
+                static_cast<unsigned>(CLEANUP_REAP_NEEDED), static_cast<unsigned>(reaped), static_cast<unsigned>(owned),
+                static_cast<unsigned>(fds_absent), static_cast<unsigned>(MAPPING_QUERY_VALID), static_cast<long long>(MAPPING_QUERY),
+                static_cast<unsigned>(mapping_absent), own.fds, own.maps, static_cast<unsigned>(own.complete));
             break;
         }
         ++completed;

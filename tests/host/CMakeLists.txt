@@ -328,11 +328,19 @@ add_test(NAME numa_node_reclaim_runtime_test
         --host-build ${CMAKE_BINARY_DIR}
         --gtest-main $<TARGET_FILE:gtest_main> --gtest-lib $<TARGET_FILE:gtest>)
 set_tests_properties(numa_node_reclaim_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 120)
+add_test(NAME managed_huge_control_selection_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/managed_huge_control_selection_test.py)
+set_tests_properties(managed_huge_control_selection_test PROPERTIES LABELS "unit;host;source" TIMEOUT 20)
 add_test(NAME managed_huge_runtime_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/managed_huge_runtime_test.py
         --host-build ${CMAKE_BINARY_DIR}
         --gtest-main $<TARGET_FILE:gtest_main> --gtest $<TARGET_FILE:gtest>)
 set_tests_properties(managed_huge_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 150)
+add_test(NAME managed_anonymous_remove_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/managed_huge_runtime_test.py
+        --host-build ${CMAKE_BINARY_DIR} --anonymous-remove-only
+        --gtest-main $<TARGET_FILE:gtest_main> --gtest $<TARGET_FILE:gtest>)
+set_tests_properties(managed_anonymous_remove_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 150)
 add_test(NAME managed_huge_fork_runtime_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/managed_huge_runtime_test.py
         --host-build ${CMAKE_BINARY_DIR} --fork-contract-only
@@ -385,6 +393,10 @@ add_test(NAME numa_lifecycle_helper_diagnostics_test
     COMMAND ${CMAKE_COMMAND} -E env WOS_HOST_CXX=${CMAKE_CXX_COMPILER}
         ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_lifecycle_helper_diagnostics_test.py)
 set_tests_properties(numa_lifecycle_helper_diagnostics_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 80)
+add_test(NAME numa_lifecycle_wait_diagnostics_test
+    COMMAND ${CMAKE_COMMAND} -E env WOS_HOST_CXX=${CMAKE_CXX_COMPILER}
+        ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_lifecycle_helper_diagnostics_test.py --workload-wait)
+set_tests_properties(numa_lifecycle_wait_diagnostics_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 80)
 add_test(NAME numa_chase_runtime_test
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/numa_chase_runtime_test.py
         --cxx ${CMAKE_CXX_COMPILER})

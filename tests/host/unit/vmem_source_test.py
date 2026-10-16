@@ -1353,7 +1353,50 @@ def test_as_admission_precedes_mapping_mutation() -> None:
         fail("procfs limits cannot recursively acquire the VM publication mutex during file mmap")
 
 
+def test_managed_anonymous_remove_preserves_prepared_ownership_and_stays_unwired() -> None:
+    source = SYS_VMEM_CPP.read_text()
+    body = function_body(source, "remove_current_anonymous_range")
+    profile = function_body(source, "stage_anonymous_remove")
+    require_cpp_tokens(profile, [
+        "row.kind != LazyVmemKind::ANONYMOUS", "row.file != nullptr",
+        "(row.flags & ker::abi::vmem::MAP_SHARED) != 0", "row.start >= row.end",
+        "(row.start | row.end) & (ker::mod::mm::paging::PAGE_SIZE - 1)",
+        "if (covered) return refuse(-EOPNOTSUPP)", "if (!covered || next <= cursor)",
+        "prepared_subject_ = nullptr", "staged_begin_ = staged_end_ = 0",
+        "return stage(Change::REMOVE, start, end)",
+    ], "managed removal requires complete private anonymous coverage in every retained sibling")
+    require_ordered_tokens(body, [
+        "!preparation.ready()", "sched::get_current_task() != &actor",
+        "actor.syscall_account_start_us == 0", "!sched::interrupts_enabled()",
+        "start < USER_SPACE_START", "native_file_mapping_retirement.load",
+        "SharedLazyVmemUpdate metadata{}", "RangeSplitSurvey survey{}", "PreparedTables tables{}",
+        "metadata.prepare(actor)", "metadata.stage_anonymous_remove(start, end)",
+        "prepare_current_range_split(actor, preparation, start, end, survey, tables)",
+        "plan_storage(tables)", "survey.count() != LEAVES", "storage->descriptor_count != LEAVES",
+        "storage->descriptors[i].key.va_2m", "file_snapshot(nullptr, release_snapshot)",
+        "SharedVmemPublicationGuard publication", "metadata.serial()",
+        "overlaps_kernel_managed_user_layout_locked(&actor, start, end - start)",
+        "g_file_mmap_ranges_lock.lock()", "g_file_mmap_ranges_lock.unlock()",
+        "if (legacy_overlap) return -EOPNOTSUPP", "query_current_file_binding",
+        "file_snapshot.reset(captured)", "if (!QUERIED) return -EAGAIN",
+        "if (file_snapshot) return -EOPNOTSUPP", "AddressSpaceObservation observation(&actor)",
+        "LegacyInterval legacy_context(preparation)", "CurrentRangeSplitAdmission admission",
+        "admission.validate_split_and_arm(survey, tables)",
+        "metadata.commit(admission, actor, start, end)", "mm::virt::unmap_page(ROOT, page)",
+    ], "managed removal prepares before owners and commits before actual nonfallible unmap")
+    if body.count("metadata.commit(") != 1 or "metadata.matches(" in body:
+        fail("typed managed metadata commit must consume exactly one final match attempt")
+    if source.count("remove_current_anonymous_range(") != 1:
+        fail("managed anonymous removal must remain an unwired private helper")
+    error = function_body(source, "managed_range_error")
+    require_tokens(error, ["Error::Invalid", "return -EINVAL", "Error::Unsupported", "return -EOPNOTSUPP",
+                           "Error::GenerationExhausted", "return -EOVERFLOW", "Error::Capacity",
+                           "Error::Exhausted", "return -ENOMEM", "return -EAGAIN"],
+                   "managed removal retains existing geometry errno classes")
+
+
 def main() -> None:
+    test_managed_anonymous_remove_preserves_prepared_ownership_and_stays_unwired()
     test_as_admission_precedes_mapping_mutation()
     test_munmap_and_mprotect_reject_overflowing_lengths()
     test_nonfixed_mmap_address_selection_is_reserved_before_mapping()

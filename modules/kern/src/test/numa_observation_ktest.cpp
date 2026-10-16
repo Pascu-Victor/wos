@@ -124,17 +124,39 @@ KTEST(NumaObservation, ImmutableSummaryAndFullNodeRecord) {
     KEXPECT_EQ(NODE.reserved64, 0U);
 }
 
-KTEST(NumaObservation, ActualActorLocalCommitAndNonlocalRefusal) {
+KTEST(NumaObservation, ActualActorPolicyCommitAndInvalidMaskRefusal) {
     Fixture fixture;
     KREQUIRE_TRUE(fixture.init());
     auto const BEFORE = fixture.actor->memory_policy_snapshot();
+    auto const* topology = ker::mod::acpi::numa::boot_topology();
+    KREQUIRE_NE(topology, nullptr);
+    KREQUIRE_TRUE(topology->node_count != 0 && topology->node_count <= placement::MAX_NODES);
+    uint64_t const LOW = 1;
+    uint64_t const HIGH = uint64_t{1} << (topology->node_count - 1);
+    auto publish = [&](abi::PolicyMode mode, uint64_t nodes) {
+        KEXPECT_EQ(fixture.set(policy(mode, nodes)), 0);
+        placement::Policy const EXPECTED{nodes, static_cast<placement::Mode>(mode)};
+        KEXPECT_TRUE(fixture.actor->memory_policy_snapshot() == EXPECTED);
+        KEXPECT_EQ(fixture.query(query(abi::QueryKind::SELF_POLICY, sizeof(abi::SelfPolicy))), 0);
+        auto const READBACK = fixture.read<abi::SelfPolicy>();
+        KEXPECT_EQ(READBACK.version, abi::VERSION);
+        KEXPECT_EQ(READBACK.bytes, sizeof(abi::SelfPolicy));
+        KEXPECT_EQ(READBACK.mode, static_cast<uint32_t>(mode));
+        KEXPECT_EQ(READBACK.nodes, nodes);
+        KEXPECT_EQ(READBACK.reserved32, 0U);
+        KEXPECT_EQ(READBACK.reserved64, 0U);
+    };
     for (auto mode : {abi::PolicyMode::PREFERRED, abi::PolicyMode::BIND, abi::PolicyMode::INTERLEAVE}) {
-        KEXPECT_EQ(fixture.set(policy(mode, 1)), static_cast<int64_t>(-ENOTSUP));
-        KEXPECT_TRUE(fixture.actor->memory_policy_snapshot() == BEFORE);
+        publish(mode, LOW);
+        publish(mode, HIGH);
+        if (mode != abi::PolicyMode::PREFERRED && LOW != HIGH) publish(mode, LOW | HIGH);
     }
+    // Return to the original baseline before its unchanged LOCAL negative/reset.
+    KEXPECT_EQ(fixture.set(policy(abi::PolicyMode::LOCAL, 0)), 0);
+    KEXPECT_TRUE(fixture.actor->memory_policy_snapshot() == BEFORE);
     KEXPECT_EQ(fixture.set(policy(abi::PolicyMode::LOCAL, 1)), static_cast<int64_t>(-EINVAL));
     KEXPECT_TRUE(fixture.actor->memory_policy_snapshot() == BEFORE);
-    // Internal diagnostic publication is explicit; public admission remains off.
+    // Internal diagnostic publication remains observable through the same ABI.
     KREQUIRE_TRUE(fixture.actor->selftest_set_memory_policy({1, placement::Mode::BIND}));
     KEXPECT_EQ(fixture.query(query(abi::QueryKind::SELF_POLICY, sizeof(abi::SelfPolicy))), 0);
     auto const SNAPSHOT = fixture.read<abi::SelfPolicy>();

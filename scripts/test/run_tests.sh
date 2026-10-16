@@ -448,6 +448,8 @@ UNIT_TESTS=(
     lazy_file_fault_close_order_runtime_test
     lazy_vmem_offset_runtime_test
     lazy_vmem_staging_runtime_test
+    managed_anonymous_remove_runtime_test
+    managed_huge_control_selection_test
     managed_huge_fork_runtime_test
     managed_huge_runtime_test
     mount_namespace_test
@@ -457,6 +459,7 @@ UNIT_TESTS=(
     numa_chase_runtime_test
     numa_coherent_census_runtime_test
     numa_lifecycle_census_codec_test
+    numa_lifecycle_wait_diagnostics_test
     numa_lifecycle_helper_diagnostics_test
     numa_lifecycle_census_runtime_test
     numa_lifecycle_semantic_runtime_test

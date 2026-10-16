@@ -13,6 +13,7 @@ XATTR_MATRIX_CPP = ROOT / "modules" / "testprog" / "src" / "xattr_matrix.cpp"
 NETBENCH_CPP = ROOT / "modules" / "testprog" / "src" / "netbench.cpp"
 PERFBENCH_CPP = ROOT / "modules" / "testprog" / "src" / "perfbench.cpp"
 COWBENCH_CPP = ROOT / "modules" / "testprog" / "src" / "cowbench.cpp"
+NUMA_LOCALITY_CPP = ROOT / "modules" / "testprog" / "src" / "numa_locality.cpp"
 FSBENCH_CPP = ROOT / "modules" / "testprog" / "src" / "fsbench.cpp"
 MANDELBENCH_WKI_CPP = ROOT / "modules" / "testprog" / "src" / "mandelbench" / "mandelbench_wki.cpp"
 WOS_SHOWCASE_BENCH = ROOT / "configs" / "rootfs" / "root" / "wos-showcase" / "30-bench-wki.sh"
@@ -1652,7 +1653,42 @@ def test_xattr_matrix_covers_public_and_storage_transitions() -> None:
     )
 
 
+def test_numa_wait_diagnostics_capture_original_frontiers_before_cleanup() -> None:
+    source = NUMA_LOCALITY_CPP.read_text()
+    clock = function_body(source, "now_ns")
+    wait = function_body(source, "wait_child")
+    lifecycle = function_body(source, "run_numa_lifecycle")
+    require_tokens(clock, ["int const RESULT = clock_gettime(CLOCK_MONOTONIC, &ts)",
+                          "if (RESULT < 0)", "observation->error = errno", "CLOCK_ERRNO",
+                          "else if (RESULT == 0)", "CLOCK_TIMESPEC", "observation->now = out", "CLOCK_NS"],
+                   "clock observations distinguish syscall error, valid timespec and valid conversion")
+    if clock.count("clock_gettime(") != 1 or function_body(source, "before").count("now_ns(") != 1:
+        fail("wait diagnostics cannot add clock observations")
+    require_tokens(wait, ["while (before(deadline, &observation.clock))", "observation.deadline = deadline",
+                         "int const ERROR = rc < 0 ? errno : 0", "observation.error_valid = rc < 0",
+                         "observation.status_valid = rc == pid", "observation.status_valid ? status : 0",
+                         "WaitOutcome::ZERO_EXIT", "WaitOutcome::NONZERO_STATUS", "WaitOutcome::WAIT_ERROR",
+                         "WaitOutcome::DEADLINE : WaitOutcome::CLOCK_ERROR", "errno = ETIMEDOUT"],
+                   "wait status requires actual PID consumption and original deadline remains authoritative")
+    require_order(wait, "waitpid(pid, &status, WNOHANG)", "int const ERROR", "immediate wait errno")
+    if wait.count("waitpid(") != 1 or wait.count("ker::multiproc::yield()") != 1:
+        fail("wait diagnostics cannot add wait or yield calls")
+    require_order(lifecycle, "wait_child(pid, child_deadline, status, owned, wait_observation)",
+                  "bool const WAIT_OWNED = owned", "capture ownership before cleanup")
+    require_order(lifecycle, "bool const WAIT_OWNED = owned", "close_fd(fds[0], own)", "wait tuple precedes errno-changing close")
+    require_tokens(lifecycle, ["bool const CLEANUP_REAP_NEEDED = owned", "terminate_and_reap(pid, owned)",
+                              "bool const MAPPING_QUERY_VALID = unmapped",
+                              "int64_t const MAPPING_QUERY = unmapped ? page_nodes(io, mapping, 3) : 0",
+                              "if (!ok || !reaped || owned || !unmapped || !fds_absent || !mapping_absent || own.fds || own.maps || !own.complete)",
+                              "wait_rc_valid=%u", "wait_status_valid=%u", "clock_valid=%u", "cleanup_reap_needed=%u"],
+                   "actual cleanup results remain strict and are printed only by existing failure branch")
+    failure = lifecycle[lifecycle.index("if (!ok || !reaped"):lifecycle.index("        ++completed;")]
+    if "wait_outcome=%u" not in failure or lifecycle.count("wait_outcome=%u") != 1:
+        fail("new tuple belongs only to the existing lifecycle FAIL line")
+
+
 def main() -> None:
+    test_numa_wait_diagnostics_capture_original_frontiers_before_cleanup()
     test_ping_receive_is_deadline_bounded()
     test_netbench_io_is_deadline_bounded()
     test_userland_suite_passes_netbench_timeout()

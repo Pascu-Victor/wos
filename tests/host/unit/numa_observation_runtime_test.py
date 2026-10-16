@@ -119,6 +119,29 @@ State* state{};
 struct Scope{State value{};Scope(){state=&value;++cases;}~Scope(){value.released();state=nullptr;}auto operator->()->State*{return &value;}};
 auto policy(uint32_t mode=0,uint64_t nodes=0)->abi::PolicyRequest{return {1,sizeof(abi::PolicyRequest),mode,0,nodes,0};}
 void no_effect(State& s){check(s.writes==0&&s.takes==0&&s.actor.publications==0,"refusal no side effect");}
+void verify_policy_publication(abi::PolicyRequest requested, uint16_t node_count, bool mutate = false) {
+ Scope s;
+ s->topology.node_count = node_count;
+ s->mutate_request = mutate;
+ auto const owner_before = s->owner.policy;
+ check(s->set(requested) == 0, "validated explicit policy accepted");
+ numa::Policy const expected{requested.nodes, static_cast<numa::Mode>(requested.mode)};
+ check(s->actor.policy == expected && s->actor.publications == 1 && s->actor.snapshots == 0,
+       "exact actor policy published once without recapture");
+ check(s->owner.policy == owner_before && s->owner.publications == 0 && s->owner.snapshots == 0,
+       "policy publication leaves resource owner unchanged");
+ check(s->reads == 1 && s->writes == 0 && s->takes == 0 && s->drops == 0,
+       "setter copied one input and has no postcommit copy or payload lease");
+ // Each invocation has its own one-copy bound; query uses a fresh request.
+ s->reads = 0;
+ check(s->query(s->request(abi::QueryKind::SELF_POLICY)) == 0, "published policy SELF_POLICY readback");
+ auto const value = s->load<abi::SelfPolicy>();
+ check(value.version == abi::VERSION && value.bytes == sizeof(value) && value.mode == requested.mode &&
+       value.nodes == requested.nodes && value.reserved32 == 0 && value.reserved64 == 0,
+       "published mode and complete mask read back exactly");
+ check(s->actor.publications == 1 && s->owner.publications == 0 && s->owner.snapshots == 0,
+       "readback cannot republish or inspect resource owner");
+}
 }
 namespace ker::mod::sched::task {
 auto Task::memory_policy_snapshot() const noexcept -> f::numa::Policy {
@@ -222,7 +245,20 @@ int main(){
   switch(kind){case 0:p.bytes=31;break;case 1:p.version=2;error=ENOTSUP;break;case 2:p.flags=1;error=ENOTSUP;break;case 3:p.reserved64=1;break;
   case 4:p.mode=4;break;case 5:p.mode=0x100;break;case 6:p.nodes=1;break;case 7:p=policy(1,3);break;case 8:p=policy(2,0);break;case 9:p=policy(3,0);break;}
   auto before=s->actor.policy;check(s->set(p)==-error&&s->actor.policy==before,"setter malformed request no publication");no_effect(s.value);}
- for(unsigned mode=1;mode<4;++mode){Scope s;auto p=policy(mode,1ULL<<63);auto before=s->actor.policy;check(s->set(p)==-ENOTSUP&&s->actor.policy==before,"valid nonLOCAL mode refused unchanged");no_effect(s.value);}
+ // Valid nonLOCAL refusals are deliberately superseded by public publication.
+ for (unsigned mode = 1; mode < 4; ++mode) {
+  verify_policy_publication(policy(mode, 1), 64);
+  verify_policy_publication(policy(mode, 1ULL << 63), 64);
+  verify_policy_publication(policy(mode, 1), 1);
+  if (mode != 1) verify_policy_publication(policy(mode, 1 | (1ULL << 63)), 64);
+  verify_policy_publication(policy(mode, 1), 64, true);
+ }
+ for (unsigned mode = 1; mode < 4; ++mode) {
+  Scope s;
+  s->topology.node_count = 1;
+  check(s->set(policy(mode, 2)) == -EINVAL, "UMA outside-node mask refused unchanged");
+  no_effect(s.value);
+ }
  {Scope s;s->topology.node_count=63;check(s->set(policy(2,1ULL<<63))==-EINVAL,"offline mask not truncated");no_effect(s.value);}
  {Scope s;s->topology_present=false;check(s->set(policy())==-ENODEV,"setter missing topology");no_effect(s.value);}
  {Scope s;s->read_fail=true;check(s->set(policy())==-EFAULT,"setter bad request memory");no_effect(s.value);}

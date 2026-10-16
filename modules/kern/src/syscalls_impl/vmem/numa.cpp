@@ -199,7 +199,6 @@ auto set_memory_policy_for_task(Task& actor, uint64_t request_address, uint64_t 
     auto const* const TOPOLOGY = topology::boot_topology();
     if (!topology_valid(TOPOLOGY)) return failure(ENODEV);
     if (!placement::valid_policy(policy, TOPOLOGY->node_count)) return failure(EINVAL);
-    if (policy.mode != placement::Mode::LOCAL) return failure(ENOTSUP);
     actor.publish_memory_policy_snapshot(policy);
     return 0;
 }

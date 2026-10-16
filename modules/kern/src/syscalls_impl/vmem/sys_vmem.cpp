@@ -571,6 +571,43 @@ class SharedLazyVmemUpdate {
         return 0;
     }
 
+    // Managed-backed removal accepts only a complete private anonymous union
+    // in every retained sibling. The captured rows need not be sorted.
+    auto stage_anonymous_remove(uint64_t start, uint64_t end) -> int {
+        auto refuse = [&](int error) {
+            prepared_subject_ = nullptr;
+            staged_begin_ = staged_end_ = 0;
+            return error;
+        };
+        if (!slots_ || staged_ || committed_ || prepared_subject_ == nullptr || start >= end) return refuse(-EINVAL);
+        for (size_t i = 0; i < cohort_count_; ++i) {
+            auto const& rows = slots_[i].source.ranges();
+            for (auto const& row : rows) {
+                if (!ranges_overlap(start, end, row.start, row.end)) continue;
+                if (row.kind != LazyVmemKind::ANONYMOUS || row.file != nullptr || (row.flags & ker::abi::vmem::MAP_SHARED) != 0 ||
+                    row.start >= row.end || ((row.start | row.end) & (ker::mod::mm::paging::PAGE_SIZE - 1)) != 0)
+                    return refuse(-EOPNOTSUPP);
+            }
+            uint64_t cursor = start;
+            while (cursor < end) {
+                uint64_t next = end;
+                bool covered = false;
+                for (auto const& row : rows) {
+                    if (row.start <= cursor && cursor < row.end) {
+                        if (covered) return refuse(-EOPNOTSUPP);
+                        covered = true;
+                        next = std::min(next, row.end);
+                    } else if (cursor < row.start) {
+                        next = std::min(next, row.start);
+                    }
+                }
+                if (!covered || next <= cursor) return refuse(-EOPNOTSUPP);
+                cursor = next;
+            }
+        }
+        return stage(Change::REMOVE, start, end);
+    }
+
     auto matches(Task& task) -> bool {
         if (!staged_ || committed_ || validation_count_ != 0 || task.pagemap != root_ ||
             task.state.load(std::memory_order_acquire) != ker::mod::sched::task::TaskState::ACTIVE ||
@@ -2827,6 +2864,104 @@ auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t si
 }
 
 }  // anonymous namespace
+
+namespace detail {
+auto managed_range_error(ker::mod::mm::huge::Error error) -> int {
+    using Error = ker::mod::mm::huge::Error;
+    switch (error) {
+        case Error::None:
+            return 0;
+        case Error::Invalid:
+            return -EINVAL;
+        case Error::Unsupported:
+            return -EOPNOTSUPP;
+        case Error::GenerationExhausted:
+            return -EOVERFLOW;
+        case Error::Capacity:
+        case Error::Exhausted:
+            return -ENOMEM;
+        default:
+            return -EAGAIN;
+    }
+}
+
+// Unwired managed-backed anonymous removal. The actual current process lends
+// ordinary preparation, with no incoming publication/root/IRQ owner.
+auto remove_current_anonymous_range(ker::mod::sched::task::Task& actor, const ker::mod::sys::SyscallPreparationScope& preparation,
+                                    uint64_t start, uint64_t end) -> int {
+    using namespace ker::mod;
+    namespace fm = mm::file_mapping;
+    if (!preparation.ready() || !sched::can_query_current_task() || sched::get_current_task() != &actor ||
+        actor.type != sched::task::TaskType::PROCESS || actor.state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE ||
+        actor.scheduler_transition_active.load(std::memory_order_acquire) || actor.exit_in_progress.load(std::memory_order_acquire) ||
+        actor.syscall_account_start_us == 0 || !sched::interrupts_enabled() || sched::preempt_count() != 0)
+        return -EWOULDBLOCK;
+    if (start < USER_SPACE_START || start >= end || end > USER_SPACE_END || ((start | end) & (mm::paging::PAGE_SIZE - 1)) != 0)
+        return -EINVAL;
+    if (actor.native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr) return -EBUSY;
+
+    SharedLazyVmemUpdate metadata{};
+    mm::huge::RangeSplitSurvey survey{};
+    mm::huge::PreparedTables tables{};
+    int status = metadata.prepare(actor);
+    if (status != 0) return status;
+    status = metadata.stage_anonymous_remove(start, end);
+    if (status != 0) return status;
+    status = managed_range_error(mm::huge::prepare_current_range_split(actor, preparation, start, end, survey, tables));
+    if (status != 0) return status;
+
+    // This private profile requires a managed leaf in every intersecting2MiB
+    // slot. Copied descriptors establish only coverage; final admission still
+    // validates the entire live survey before the first PTE write.
+    auto const* storage = mm::huge::detail::PreparationAccess::plan_storage(tables);
+    uint64_t const FIRST = start & ~(mm::huge::LEAF_BYTES - 1);
+    uint64_t const LEAVES = ((end - 1 - FIRST) / mm::huge::LEAF_BYTES) + 1;
+    if (!survey.complete() || storage == nullptr || survey.count() != LEAVES || storage->descriptor_count != LEAVES) return -EOPNOTSUPP;
+    for (uint16_t i = 0; i < storage->descriptor_count; ++i)
+        if (storage->descriptors[i].key.va_2m != FIRST + uint64_t{i} * mm::huge::LEAF_BYTES) return -EOPNOTSUPP;
+
+    auto release_snapshot = [](fm::FileMappingBinding* binding) {
+        if (binding != nullptr) binding->release(fm::BindingOwner::SNAPSHOT);
+    };
+    std::unique_ptr<fm::FileMappingBinding, decltype(release_snapshot)> file_snapshot(nullptr, release_snapshot);
+    {
+        SharedVmemPublicationGuard publication;
+        if (actor.native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr) return -EBUSY;
+        auto* const ROOT = actor.pagemap;
+        if (survey.stamp().root.address_bits != reinterpret_cast<uint64_t>(ROOT) || survey.stamp().root.incarnation != metadata.serial())
+            return -EAGAIN;
+        if (overlaps_kernel_managed_user_layout_locked(&actor, start, end - start)) return -EINVAL;
+        bool legacy_overlap = false;
+        g_file_mmap_ranges_lock.lock();
+        for (auto const& row : g_file_mmap_ranges)
+            if (row.pagemap == ROOT && ranges_overlap(start, end, row.start, file_mmap_range_end(row))) {
+                legacy_overlap = true;
+                break;
+            }
+        g_file_mmap_ranges_lock.unlock();
+        if (legacy_overlap) return -EOPNOTSUPP;
+        fm::FileMappingBinding* captured = nullptr;
+        bool exact = false;
+        bool const QUERIED = mm::virt::query_current_file_binding(actor, start, end, captured, exact);
+        file_snapshot.reset(captured);  // Adopt even a refused partial snapshot.
+        if (!QUERIED) return -EAGAIN;
+        if (file_snapshot) return -EOPNOTSUPP;
+
+        sched::resource::AddressSpaceObservation observation(&actor);
+        {
+            sys::SyscallPreparationScope::LegacyInterval legacy_context(preparation);
+            mm::huge::CurrentRangeSplitAdmission admission(actor, preparation, publication);
+            if (!admission.acquired()) return -EAGAIN;
+            status = managed_range_error(admission.validate_split_and_arm(survey, tables));
+            if (status != 0) return status;
+            if (!metadata.commit(admission, actor, start, end)) return -EAGAIN;
+            for (uint64_t page = start; page < end; page += mm::paging::PAGE_SIZE) mm::virt::unmap_page(ROOT, page);
+        }
+        // Actual AS recount runs after IF/root restoration, still under PUB.
+    }
+    return 0;
+}
+}  // namespace detail
 
 #ifdef WOS_SELFTEST
 namespace {

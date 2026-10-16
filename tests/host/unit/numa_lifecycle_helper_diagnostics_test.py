@@ -46,12 +46,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--source", type=Path)
+    parser.add_argument("--workload-wait", action="store_true", help="exercise failure-only testprog wait observations")
     parser.add_argument("--predecessor", type=Path)
     parser.add_argument("--evidence-dir", type=Path)
     args = parser.parse_args()
     root = args.root.resolve(strict=True)
-    source = (args.source or root / "tests/fixtures/numa_lifecycle_census.cpp").resolve(strict=True)
-    shell = Path(__file__).with_suffix(".inc")
+    source = (args.source or root / ("modules/testprog/src/numa_locality.cpp" if args.workload_wait else "tests/fixtures/numa_lifecycle_census.cpp")).resolve(strict=True)
+    shell = Path(__file__).with_name("numa_lifecycle_wait_diagnostics_test.inc") if args.workload_wait else Path(__file__).with_suffix(".inc")
     helper_path = root / "tests/host/unit/file_mmap_registry_runtime_test.py"
     sys.dont_write_bytecode = True
     spec = importlib.util.spec_from_file_location("census_helper_owned", helper_path)
@@ -69,6 +70,9 @@ def main():
         return body, row
     watched = [Path(__file__), source, shell, helper_path,
                root / "toolchain/src/mlibc/sysdeps/wos/include/sys/callnums.h"]
+    libc_wait = root / "toolchain/src/mlibc/options/posix/generic/sys-wait.cpp"
+    if args.workload_wait:
+        watched.append(libc_wait)
     selected_compiler = os.environ.get("WOS_HOST_CXX", "/usr/bin/clang++")
     compiler = Path(shutil.which(selected_compiler) or selected_compiler).absolute()
     watched.extend([compiler, compiler.resolve(strict=True)])
@@ -136,63 +140,126 @@ def main():
             extracted.append(row)
             return body
 
-        callnums, row = capture(watched[4].read_text(), "enum class callnums :", declaration=True)
-        extracted.append(row)
-        storage = actual[actual.index("struct alignas(4096) Transports {"):actual.index("auto control(")]
-        child = take("auto child(")
-        poll = take("auto poll_census(")
-        main_body = take("auto main(")
-        begin = main_body.index("    int64_t warm_pid{}, measured_pid{};")
-        end = main_body.index("    transport.begin = transport.output;", begin)
-        branch = main_body[begin:end]
-        result["extractions"] = extracted
-        result["storage_source"] = dict(bytes=len(storage.encode()), sha256=hashlib.sha256(storage.encode()).hexdigest())
-        result["caller_branch_source"] = dict(bytes=len(branch.encode()), sha256=hashlib.sha256(branch.encode()).hexdigest())
-        ports = [("::lseek(", "::fixture::lseek("), ("::write(", "::fixture::write("),
-                 ("::fsync(", "::fixture::fsync("), ("::clock_gettime(", "::fixture::clock_gettime("),
-                 ("::nanosleep(", "::fixture::nanosleep("), ("::syscall(", "::fixture::census_syscall(")]
+        if args.workload_wait:
+            storage = actual[actual.index("enum ClockValid :"):actual.index("auto now_ns(")]
+            caller = take("auto run_numa_lifecycle(")
+            begin = caller.index("        int status = -1;")
+            end = caller.index("        ++completed;", begin)
+            branch = caller[begin:end]
+            anchor = "        if (!ok || !reaped || owned || !unmapped || !fds_absent || !mapping_absent || own.fds || own.maps || !own.complete) {"
+            if branch.count(anchor) != 1:
+                raise ValueError("unique actual postwait failure predicate")
+            captured_branch = branch.replace(anchor, """        fixture::capture(status, wait_observation, WAIT_OWNED, READ_CLOSED, CLEANUP_REAP_NEEDED, reaped, owned,
+                                 unmapped, fds_absent, MAPPING_QUERY_VALID, MAPPING_QUERY, mapping_absent, own);
+        """ + anchor)
+            result["caller_branch_source"] = dict(bytes=len(branch.encode()), sha256=hashlib.sha256(branch.encode()).hexdigest())
+            result["host_only_capture_insertion"] = anchor
+            ports = [("clock_gettime(", "fixture::clock_gettime("), ("waitpid(", "fixture::posix_waitpid("),
+                     ("kill(", "fixture::kill("), ("close(", "fixture::close("), ("fcntl(", "fixture::fcntl("),
+                     ("munmap(", "fixture::munmap("), ("page_nodes(", "fixture::page_nodes("),
+                     ("std::fprintf(", "fixture::fprintf(")]
+            def port_wait(body):
+                for old, new in ports:
+                    body = body.replace(old, new)
+                return body
+            libc, row = capture(libc_wait.read_text(), "pid_t waitpid(")
+            result["libc_frontend_extraction"] = row
+            libc = libc.replace("mlibc::sysdep_or_enosys<Waitpid>", "fixture::sysdep_waitpid")
+            predecessor = "#define HAVE_WAIT_PREDECESSOR 0\n"
+            if args.predecessor:
+                old = args.predecessor.read_text()
+                bodies = []
+                for name in ["auto now_ns(", "auto before(", "auto wait_child("]:
+                    body, row = capture(old, name)
+                    bodies.append(port_wait(body))
+                    result.setdefault("predecessor_extractions", []).append(row)
+                predecessor = "#define HAVE_WAIT_PREDECESSOR 1\nnamespace predecessor {\n" + "\n".join(bodies) + "\n}\n"
+            replacements = {
+                "ACTUAL_STORAGE": storage,
+                "ACTUAL_QUERY_BUFFERS": take("struct QueryBuffers {", True),
+                "ACTUAL_CHILD_RECORD": take("struct ChildRecord {", True),
+                "ACTUAL_OWN_RESOURCES": take("struct OwnResources {", True),
+                "ACTUAL_LIBC_WAITPID": libc,
+                "ACTUAL_CLOCK_WAIT_CLEANUP": port_wait("\n".join(take(name) for name in
+                    ["auto now_ns(", "auto before(", "auto wait_child(", "auto terminate_and_reap(", "auto close_fd(", "auto confirm_closed("])),
+                "ACTUAL_PREDECESSOR": predecessor,
+                "ACTUAL_POSTWAIT": port_wait(captured_branch),
+            }
+            generated = shell.read_text()
+            for name, body in replacements.items():
+                marker = "/* @" + name + "@ */"
+                if generated.count(marker) != 1:
+                    raise ValueError("unique actual wait marker: " + name)
+                generated = generated.replace(marker, body)
+            result["extractions"] = extracted
+            result["profile"] = "workload-wait-actual-body-ports"
+            variants = {"actual": generated}
+            for name, old, new in [
+                ("lost-status-validity", "observation.status_valid = rc == pid;", "observation.status_valid = true;"),
+                ("lost-immediate-errno", "int const ERROR = rc < 0 ? errno : 0;", "int const ERROR = 0;"),
+                ("lost-deadline-outcome", "WaitOutcome::DEADLINE : WaitOutcome::CLOCK_ERROR", "WaitOutcome::WAIT_ERROR : WaitOutcome::CLOCK_ERROR"),
+            ]:
+                if generated.count(old) != 1:
+                    raise ValueError("unique actual wait control: " + name)
+                variants[name] = generated.replace(old, new)
+        else:
+            callnums, row = capture(watched[4].read_text(), "enum class callnums :", declaration=True)
+            extracted.append(row)
+            storage = actual[actual.index("struct alignas(4096) Transports {"):actual.index("auto control(")]
+            child = take("auto child(")
+            poll = take("auto poll_census(")
+            main_body = take("auto main(")
+            begin = main_body.index("    int64_t warm_pid{}, measured_pid{};")
+            end = main_body.index("    transport.begin = transport.output;", begin)
+            branch = main_body[begin:end]
+            result["extractions"] = extracted
+            result["storage_source"] = dict(bytes=len(storage.encode()), sha256=hashlib.sha256(storage.encode()).hexdigest())
+            result["caller_branch_source"] = dict(bytes=len(branch.encode()), sha256=hashlib.sha256(branch.encode()).hexdigest())
+            ports = [("::lseek(", "::fixture::lseek("), ("::write(", "::fixture::write("),
+                     ("::fsync(", "::fixture::fsync("), ("::clock_gettime(", "::fixture::clock_gettime("),
+                     ("::nanosleep(", "::fixture::nanosleep("), ("::syscall(", "::fixture::census_syscall(")]
 
-        def ported(body):
-            for old, new in ports:
-                body = body.replace(old, new)
-            return body
+            def ported(body):
+                for old, new in ports:
+                    body = body.replace(old, new)
+                return body
 
-        replacements = {
-            "CALLNUMS": "namespace ker::abi {\n" + callnums + "\n}",
-            "ACTUAL_STORAGE_AND_DIAGNOSTIC": ported(storage),
-            "ACTUAL_CLOCK_AND_PREFAULT": ported("\n".join(take(anchor) for anchor in
-                                            ["auto now_ns(", "auto pause_poll(", "auto time_left(", "void prefault_transport("])),
-            "ACTUAL_CHILD": take("struct Child {", True),
-            "ACTUAL_CHILD_CALL": child,
-            "ACTUAL_CENSUS_CALL": ported(poll),
-            "ACTUAL_WARM_BEGIN_BRANCH": branch,
-        }
-        generated = shell.read_text()
-        for name, body in replacements.items():
-            marker = "/* @" + name + "@ */"
-            if generated.count(marker) != 1:
-                raise ValueError("unique actual-body marker: " + name)
-            generated = generated.replace(marker, body)
-        variants = {"actual": generated}
-        for name, old, new in [
-            ("lost-child-status", ".wait_status = status,", ".wait_status = 0,"),
-            ("stale-transport-header", '"census-transport", result, CENSUS_RESULT)',
-             '"census-transport", result, CENSUS_RESULT | HEADER)'),
-            ("write-after-failed-seek", "::fixture::lseek(files[4], 0, SEEK_SET) == 0", "true"),
-        ]:
-            if generated.count(old) != 1:
-                raise ValueError("unique genuine control: " + name)
-            variants[name] = generated.replace(old, new)
-        if args.predecessor:
-            old = args.predecessor.read_text()
-            for label, anchor, current in [("old-child", "auto child(", child),
-                                            ("old-census-poll", "auto poll_census(", ported(poll))]:
-                body, provenance = capture(old, anchor)
-                body = ported(body)
-                if body == current or generated.count(current) != 1:
-                    raise ValueError("actual predecessor differs at one whole body: " + label)
-                variants[label] = generated.replace(current, body)
-                result.setdefault("predecessor_extractions", []).append(dict(label=label, **provenance))
+            replacements = {
+                "CALLNUMS": "namespace ker::abi {\n" + callnums + "\n}",
+                "ACTUAL_STORAGE_AND_DIAGNOSTIC": ported(storage),
+                "ACTUAL_CLOCK_AND_PREFAULT": ported("\n".join(take(anchor) for anchor in
+                                                ["auto now_ns(", "auto pause_poll(", "auto time_left(", "void prefault_transport("])),
+                "ACTUAL_CHILD": take("struct Child {", True),
+                "ACTUAL_CHILD_CALL": child,
+                "ACTUAL_CENSUS_CALL": ported(poll),
+                "ACTUAL_WARM_BEGIN_BRANCH": branch,
+            }
+            generated = shell.read_text()
+            for name, body in replacements.items():
+                marker = "/* @" + name + "@ */"
+                if generated.count(marker) != 1:
+                    raise ValueError("unique actual-body marker: " + name)
+                generated = generated.replace(marker, body)
+            variants = {"actual": generated}
+            for name, old, new in [
+                ("lost-child-status", ".wait_status = status,", ".wait_status = 0,"),
+                ("stale-transport-header", '"census-transport", result, CENSUS_RESULT)',
+                 '"census-transport", result, CENSUS_RESULT | HEADER)'),
+                ("write-after-failed-seek", "::fixture::lseek(files[4], 0, SEEK_SET) == 0", "true"),
+            ]:
+                if generated.count(old) != 1:
+                    raise ValueError("unique genuine control: " + name)
+                variants[name] = generated.replace(old, new)
+            if args.predecessor:
+                old = args.predecessor.read_text()
+                for label, anchor, current in [("old-child", "auto child(", child),
+                                                ("old-census-poll", "auto poll_census(", ported(poll))]:
+                    body, provenance = capture(old, anchor)
+                    body = ported(body)
+                    if body == current or generated.count(current) != 1:
+                        raise ValueError("actual predecessor differs at one whole body: " + label)
+                    variants[label] = generated.replace(current, body)
+                    result.setdefault("predecessor_extractions", []).append(dict(label=label, **provenance))
         flags = [str(compiler), "-std=c++23", "-DWOS_SELFTEST=1", "-O1", "-g0", "-fsanitize=address,undefined",
                  "-fno-omit-frame-pointer", "-I" + str(root / "modules/kern/src")]
         for label, content in variants.items():
