@@ -41,17 +41,19 @@ constexpr uint64_t MAX_HELD = 1024 * 1024;  // 4GiB, actual selected usable is a
 constexpr uint64_t PHASE_US = 30'000'000;
 constexpr uint64_t WAIT_US = 5'000'000;
 constexpr uint64_t WHOLE_US = 180'000'000;
-constexpr size_t SPANS = 2048;
-constexpr size_t TAIL = 32768;
+constexpr size_t FRAME_WORDS = 32768;
+constexpr uint64_t FRAME_BITS = FRAME_WORDS * 64;  // Relative window <=8GiB, not a hold allowance.
 constexpr size_t SEEDS = 4;
 constexpr unsigned WARM_PASSES = 1;
 static_assert(WARM_PASSES <= 3);
 constexpr uint64_t PRIVATE_VA = 0x6B000000;
 constexpr auto OWNER = mm::PhysicalPageOwner::SELFTEST;
 constexpr size_t OWNER_INDEX = static_cast<size_t>(OWNER);
-struct SpanRecord {
-    void* base{};
-    uint32_t pages{};
+struct FrameOwnership {
+    uint64_t eligible[FRAME_WORDS]{};
+    uint64_t owned[FRAME_WORDS]{};
+    uint64_t first{}, end{}, eligible_pages{};
+    bool ready{};
 };
 enum class SeedBoundary : uint8_t { BeforeAllocate, AfterAllocate, AfterFree };
 constexpr size_t SEED_OBSERVATIONS = 2 * SEEDS * 3;
@@ -97,8 +99,7 @@ static_assert(std::is_trivially_copyable_v<SeedDiagnostics>);
 static_assert(sizeof(SeedDiagnostics) <= 32 * 1024, "bounded seed diagnostic storage and scratch");
 struct Storage {
     SeedDiagnostics seed_diagnostics{};
-    SpanRecord spans[SPANS]{};
-    SpanRecord tail[TAIL]{};  // Independently owned order0 refs; never compound ownership.
+    FrameOwnership frames{};
     void* batch[128]{};
     void* selected_seeds[SEEDS]{};
     void* foreign_seeds[SEEDS]{};
@@ -111,10 +112,10 @@ struct Storage {
     reclaim::NodeReclaimStatsSnapshot stats_before{}, stats_after{};
     reclaim::SelftestWorkerObservation worker{};
     sched::ReclaimWaitObservation waiting{};
-    size_t spans_count{}, tail_count{};
+    size_t bulk_allocations{}, order0_allocations{};
     uint64_t held{}, released{}, whole_deadline{}, assertions{}, wake_cases{};
-    uint64_t tail_pages{}, held_highwater{}, bulk_highwater{}, tail_records_highwater{}, tail_pages_highwater{};
-    uint64_t limit_held{}, limit_bulk{}, limit_tail_records{}, limit_tail_pages{}, limit_next_pages{};
+    uint64_t tail_pages{}, held_highwater{}, bulk_highwater{}, order0_highwater{}, tail_pages_highwater{};
+    uint64_t limit_held{}, limit_bulk{}, limit_order0{}, limit_tail_pages{}, limit_next_pages{};
     uint64_t limit_buddy{}, limit_cached{}, limit_usable{};
     uint32_t limit_reasons{};
     bool limit_captured{}, limit_sample_valid{};
@@ -228,8 +229,8 @@ void capture_limit(uint32_t reasons, uint32_t next_pages) {
     state.limit_reasons = reasons;
     state.limit_next_pages = next_pages;
     state.limit_held = state.held;
-    state.limit_bulk = state.spans_count;
-    state.limit_tail_records = state.tail_count;
+    state.limit_bulk = state.bulk_allocations;
+    state.limit_order0 = state.order0_allocations;
     state.limit_tail_pages = state.tail_pages;
     auto const STATUS = phys::snapshot_node_counters(state.sample, state.work);
     state.limit_sample_valid = STATUS == mm::NodeCounterError::NONE && state.sample.complete && state.selected < state.sample.node_count;
@@ -241,52 +242,141 @@ void capture_limit(uint32_t reasons, uint32_t next_pages) {
     }
 }
 
-enum class TailJoin : uint8_t { NEW_RECORD, FORWARD, BACKWARD, INVALID };
-auto tail_join(const SpanRecord& record, uintptr_t page) -> TailJoin {
-    auto const BASE = reinterpret_cast<uintptr_t>(record.base);
-    if (record.pages == 0 || record.pages >= MAX_HELD || BASE % PAGE != 0 || page % PAGE != 0 || page > UINTPTR_MAX - PAGE)
-        return TailJoin::INVALID;
-    uint64_t const BYTES = static_cast<uint64_t>(record.pages) * PAGE;
-    if (BASE > UINTPTR_MAX - BYTES) return TailJoin::INVALID;
-    if (page == BASE + BYTES) return TailJoin::FORWARD;
-    if (page + PAGE == BASE) return TailJoin::BACKWARD;
-    if (page >= BASE && page < BASE + BYTES) return TailJoin::INVALID;
-    return TailJoin::NEW_RECORD;
+// Consume the successful snapshot's canonical views immediately: later node
+// samples overwrite state.work. Only immutable allocator geometry is read.
+auto prepare_frame_geometry(const topology::Topology& machine) -> bool {
+    auto& frames = state.frames;
+    auto const& baseline = state.baseline;
+    size_t const COUNT = baseline.allocator_count;
+    uint64_t const HHDM = mm::addr::get_hhdm_offset();
+    if (!check(!frames.ready && baseline.complete && baseline.error == mm::NodeCounterError::NONE && COUNT != 0 &&
+                   COUNT <= mm::node_counters::MAX_ALLOCATORS && machine.node_count != 0 && machine.node_count <= topology::MAX_NODES &&
+                   machine.node_count == baseline.node_count && state.selected < machine.node_count && machine.memory_range_count != 0 &&
+                   machine.memory_range_count <= topology::MAX_MEMORY_RANGES,
+               "complete canonical geometry prerequisite"))
+        return false;
+    for (size_t i = 0; i < FRAME_WORDS; ++i)
+        if (!check(frames.eligible[i] == 0 && frames.owned[i] == 0, "empty ownership masks before geometry")) return false;
+    uint64_t previous_end = 0;
+    for (size_t r = 0; r < machine.memory_range_count; ++r) {
+        auto const& range = machine.memory[r];
+        if (!check(range.base % PAGE == 0 && range.length != 0 && range.length % PAGE == 0 && range.base <= UINT64_MAX - range.length &&
+                       range.node < machine.node_count && (r == 0 || range.base >= previous_end),
+                   "sorted disjoint immutable topology geometry"))
+            return false;
+        previous_end = range.base + range.length;
+    }
+    uint64_t first = UINT64_MAX, end = 0, selected_pages = 0;
+    for (size_t i = 0; i < COUNT; ++i) {
+        auto const& view = state.work.views[i];
+        auto const* allocator = view.allocator;
+        if (!check(allocator != nullptr && view.physical_base % PAGE == 0 && view.physical_base <= UINT64_MAX - HHDM &&
+                       allocator->base == view.physical_base + HHDM && allocator->total_pages != 0 &&
+                       allocator->metadata_pages <= allocator->total_pages &&
+                       allocator->usable_pages == allocator->total_pages - allocator->metadata_pages,
+                   "exact canonical allocator base and immutable usable geometry"))
+            return false;
+        uint64_t const BYTES = static_cast<uint64_t>(allocator->total_pages) * PAGE;
+        if (!check(view.physical_base <= UINT64_MAX - BYTES && allocator->base <= UINT64_MAX - BYTES,
+                   "checked complete physical and HHDM allocator extent"))
+            return false;
+        uint64_t const END = view.physical_base + BYTES;
+        for (size_t j = 0; j < i; ++j) {
+            auto const& other = state.work.views[j];
+            uint64_t const OTHER_END = other.physical_base + static_cast<uint64_t>(other.allocator->total_pages) * PAGE;
+            if (!check(other.allocator != allocator && (END <= other.physical_base || OTHER_END <= view.physical_base),
+                       "canonical distinct allocators never overlap"))
+                return false;
+        }
+        uint64_t const USABLE = view.physical_base + static_cast<uint64_t>(allocator->metadata_pages) * PAGE;
+        uint64_t covered = 0;
+        for (size_t r = 0; r < machine.memory_range_count; ++r) {
+            auto const& range = machine.memory[r];
+            uint64_t const LOW = USABLE > range.base ? USABLE : range.base;
+            uint64_t const RANGE_END = range.base + range.length;
+            uint64_t const HIGH = END < RANGE_END ? END : RANGE_END;
+            if (LOW >= HIGH) continue;
+            covered += (HIGH - LOW) / PAGE;
+            if (range.node != state.selected) continue;
+            if (LOW < first) first = LOW;
+            if (HIGH > end) end = HIGH;
+            selected_pages += (HIGH - LOW) / PAGE;
+        }
+        if (!check(covered == allocator->usable_pages, "complete allocator usable topology coverage")) return false;
+    }
+    if (!check(first != UINT64_MAX && end > first && end - first <= FRAME_BITS * PAGE && selected_pages != 0 &&
+                   selected_pages == baseline.nodes[state.selected].usable && selected_pages <= MAX_HELD,
+               "complete selected relative window and exact cheap usable denominator"))
+        return false;
+    // All geometry validates before the first eligibility write. The canonical
+    // allocator views are consumed completely here; no view survives a sample.
+    uint64_t marked = 0;
+    for (size_t i = 0; i < COUNT; ++i) {
+        auto const& view = state.work.views[i];
+        uint64_t const USABLE = view.physical_base + static_cast<uint64_t>(view.allocator->metadata_pages) * PAGE;
+        uint64_t const END = view.physical_base + static_cast<uint64_t>(view.allocator->total_pages) * PAGE;
+        for (size_t r = 0; r < machine.memory_range_count; ++r) {
+            auto const& range = machine.memory[r];
+            if (range.node != state.selected) continue;
+            uint64_t const LOW = USABLE > range.base ? USABLE : range.base;
+            uint64_t const RANGE_END = range.base + range.length;
+            uint64_t const HIGH = END < RANGE_END ? END : RANGE_END;
+            for (uint64_t physical = LOW; physical < HIGH; physical += PAGE) {
+                uint64_t const INDEX = (physical - first) / PAGE;
+                uint64_t const BIT = uint64_t{1} << (INDEX % 64);
+                if (!check(INDEX < FRAME_BITS && (frames.eligible[INDEX / 64] & BIT) == 0, "unique eligible selected usable frame"))
+                    return false;
+                frames.eligible[INDEX / 64] |= BIT;
+                ++marked;
+            }
+        }
+    }
+    if (!check(marked == selected_pages, "complete exact eligible mask count")) return false;
+    frames.first = first;
+    frames.end = end;
+    frames.eligible_pages = marked;
+    frames.ready = true;
+    return true;
 }
-
+auto frame_span_index(uint64_t physical, uint32_t pages, uint64_t& first) -> bool {
+    auto const& frames = state.frames;
+    uint64_t const BYTES = static_cast<uint64_t>(pages) * PAGE;
+    if (!frames.ready || (pages != 1 && pages != 512) || physical % PAGE != 0 || physical < frames.first || physical > UINT64_MAX - BYTES ||
+        physical + BYTES > frames.end)
+        return false;
+    uint64_t const INDEX = (physical - frames.first) / PAGE;
+    if (INDEX >= FRAME_BITS || pages > FRAME_BITS - INDEX) return false;
+    first = INDEX;
+    return true;
+}
 struct Holdings {
     Holdings() = default;
     Holdings(const Holdings&) = delete;
     ~Holdings() { clear(); }
     void clear() {
-        while (state.spans_count != 0) {
-            auto& entry = state.spans[--state.spans_count];
-            for (uint32_t first = 0; first < entry.pages; first += 128) {
-                uint32_t const COUNT = entry.pages - first < 128 ? entry.pages - first : 128;
-                for (uint32_t i = 0; i < COUNT; ++i)
-                    state.batch[i] = static_cast<uint8_t*>(entry.base) + static_cast<uint64_t>(first + i) * PAGE;
-                auto const FREED = phys::page_ref_dec_batch({state.batch, COUNT});
-                state.cleanup_valid &= FREED.refs_decremented == COUNT && FREED.pages_freed == COUNT;
-                state.held -= COUNT;
-                state.released += COUNT;
+        size_t pending = 0;
+        auto flush = [&]() {
+            if (pending == 0) return;
+            auto const FREED = phys::page_ref_dec_batch({state.batch, pending});
+            state.cleanup_valid &= FREED.refs_decremented == pending && FREED.pages_freed == pending;
+            state.held -= pending;
+            state.released += pending;
+            pending = 0;  // Never retry refs already submitted, even on a stats mismatch.
+        };
+        for (size_t word = 0; word < FRAME_WORDS; ++word) {
+            while (state.frames.owned[word] != 0) {
+                unsigned const BIT = static_cast<unsigned>(__builtin_ctzll(state.frames.owned[word]));
+                uint64_t const INDEX = word * 64 + BIT;
+                uint64_t const PHYSICAL = state.frames.first + INDEX * PAGE;
+                state.batch[pending++] = mm::addr::get_virt_pointer(PHYSICAL);
+                state.frames.owned[word] &= ~(uint64_t{1} << BIT);  // Bit authority transfers to pending batch.
+                if (pending == 128) flush();
             }
-            entry = {};
         }
-        while (state.tail_count != 0) {
-            auto& entry = state.tail[--state.tail_count];
-            for (uint32_t first = 0; first < entry.pages; first += 128) {
-                uint32_t const COUNT = entry.pages - first < 128 ? entry.pages - first : 128;
-                for (uint32_t i = 0; i < COUNT; ++i)
-                    state.batch[i] =
-                        reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(entry.base) + static_cast<uint64_t>(first + i) * PAGE);
-                auto const FREED = phys::page_ref_dec_batch({state.batch, COUNT});
-                state.cleanup_valid &= FREED.refs_decremented == COUNT && FREED.pages_freed == COUNT;
-                state.held -= COUNT;
-                state.tail_pages -= COUNT;
-                state.released += COUNT;
-            }
-            entry = {};
-        }
+        flush();
+        state.cleanup_valid &= state.held == 0;
+        state.bulk_allocations = state.order0_allocations = 0;
+        state.tail_pages = 0;
     }
     auto take(numa::AllocationResult& result, uint32_t pages) -> bool {
         if (!check((pages == 1 || pages == 512) && result.span.data() != nullptr && result.span.pages() == pages,
@@ -295,57 +385,49 @@ struct Holdings {
             return false;
         }
         auto const ADDRESS = reinterpret_cast<uintptr_t>(result.span.data());
-        if (!check(ADDRESS % PAGE == 0 && ADDRESS <= UINTPTR_MAX - static_cast<uint64_t>(pages) * PAGE,
-                   "checked actual owned span address before transfer")) {
+        uint64_t const BYTES = static_cast<uint64_t>(pages) * PAGE;
+        uint64_t const PHYSICAL = reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(ADDRESS));
+        uint64_t first = 0;
+        if (!check(ADDRESS % PAGE == 0 && ADDRESS <= UINTPTR_MAX - BYTES && ADDRESS >= mm::addr::get_hhdm_offset() &&
+                       reinterpret_cast<uint64_t>(mm::addr::get_virt_pointer(PHYSICAL)) == ADDRESS &&
+                       frame_span_index(PHYSICAL, pages, first),
+                   "checked exact relative physical span before transfer")) {
             capture_limit(16, pages);
+            return false;
+        }
+        if (!check(result.actual == state.selected, "actual selected node before ownership transfer")) {
+            capture_limit(32, pages);
             return false;
         }
         if (!check(state.held <= MAX_HELD - pages && pages <= state.baseline.nodes[state.selected].usable &&
                        state.held <= state.baseline.nodes[state.selected].usable - pages,
-                   "record capacity holds the unchanged physical page bound")) {
+                   "unchanged physical page bound before transfer")) {
             capture_limit(4, pages);
             return false;
         }
-        TailJoin join = TailJoin::NEW_RECORD;
-        if (pages == 512) {
-            if (!check(state.spans_count < SPANS, "bulk record capacity before transfer")) {
-                capture_limit(1, pages);
-                return false;
-            }
-        } else {
-            if (state.tail_count != 0) join = tail_join(state.tail[state.tail_count - 1], ADDRESS);
-            if (!check(join != TailJoin::INVALID, "checked independent tail adjacency")) {
-                capture_limit(16, pages);
-                return false;
-            }
-            if (!check(join != TailJoin::NEW_RECORD || state.tail_count < TAIL, "tail record capacity before transfer")) {
-                capture_limit(2, pages);
+        for (uint64_t index = first; index < first + pages; ++index) {
+            uint64_t const BIT = uint64_t{1} << (index % 64);
+            if (!check((state.frames.eligible[index / 64] & BIT) != 0 && (state.frames.owned[index / 64] & BIT) == 0,
+                       "entire candidate eligible and unowned before transfer")) {
+                capture_limit(64, pages);
                 return false;
             }
         }
-        // All fallible representation checks precede release. A range consists
-        // solely of the individually owned, exactly adjacent pages recorded.
-        if (pages == 512) {
-            auto& record = state.spans[state.spans_count++];
-            record.base = result.span.release();
-            record.pages = pages;
-        } else if (join == TailJoin::FORWARD || join == TailJoin::BACKWARD) {
-            auto& record = state.tail[state.tail_count - 1];
-            void* const PAGE_ADDRESS = result.span.release();
-            if (join == TailJoin::BACKWARD) record.base = PAGE_ADDRESS;
-            ++record.pages;
-        } else {
-            auto& record = state.tail[state.tail_count++];
-            record.base = result.span.release();
-            record.pages = 1;
-        }
+        // Sole-ref ownership changes only after the ENTIRE span validates.
+        for (uint64_t index = first; index < first + pages; ++index) state.frames.owned[index / 64] |= uint64_t{1} << (index % 64);
+        (void)result.span.release();
         state.held += pages;
-        if (pages == 1) ++state.tail_pages;
+        if (pages == 512)
+            ++state.bulk_allocations;
+        else {
+            ++state.order0_allocations;
+            ++state.tail_pages;
+        }
         if (state.held > state.held_highwater) state.held_highwater = state.held;
-        if (state.spans_count > state.bulk_highwater) state.bulk_highwater = state.spans_count;
-        if (state.tail_count > state.tail_records_highwater) state.tail_records_highwater = state.tail_count;
+        if (state.bulk_allocations > state.bulk_highwater) state.bulk_highwater = state.bulk_allocations;
+        if (state.order0_allocations > state.order0_highwater) state.order0_highwater = state.order0_allocations;
         if (state.tail_pages > state.tail_pages_highwater) state.tail_pages_highwater = state.tail_pages;
-        return check(result.actual == state.selected, "recorded actual selected prefix bound");
+        return true;
     }
 };
 struct PrivateRoot {
@@ -475,8 +557,8 @@ auto fill(Holdings& holdings, bool measured) -> bool {
     uint64_t const DEADLINE = sched::saturating_deadline_us(mod::time::get_us(), PHASE_US);
     for (;;) {
         if (!time_left(DEADLINE)) return false;
-        if (!check(state.spans_count < SPANS && state.held + 512 <= MAX_HELD, "512 prefix capacity")) {
-            capture_limit((state.spans_count >= SPANS ? 1U : 0U) | (state.held + 512 > MAX_HELD ? 4U : 0U), 512);
+        if (!check(state.held + 512 <= MAX_HELD, "512 unchanged physical prefix bound")) {
+            capture_limit(4U, 512);
             return false;
         }
         if (!sample(state.sample) ||
@@ -725,8 +807,9 @@ auto pressure(task::Task& worker, PreparedSeeds& seeds) -> bool {
     if (!wait_idle(worker) || !drain((uint64_t{1} << state.selected) | (uint64_t{1} << state.foreign))) return false;
     phys::get_physical_balance_snapshot(state.owner_after);
     if (!sample(state.final) || !same_reserves()) return false;
-    if (!check(state.held == 0 && state.spans_count == 0 && state.tail_count == 0 && state.tail_pages == 0 && state.cleanup_valid,
-               "all exact held refs returned"))
+    if (!check(
+            state.held == 0 && state.bulk_allocations == 0 && state.order0_allocations == 0 && state.tail_pages == 0 && state.cleanup_valid,
+            "all exact held refs returned"))
         return false;
     if (!check(state.owner_after.owners[OWNER_INDEX].pages == state.owner_before.owners[OWNER_INDEX].pages &&
                    state.owner_after.owners[OWNER_INDEX].objects == state.owner_before.owners[OWNER_INDEX].objects &&
@@ -769,6 +852,9 @@ auto run() -> bool {
         !check(state.baseline.nodes[state.selected].usable <= MAX_HELD && state.baseline.nodes[state.foreign].buddy_free >= 65536,
                "bounded selected hold and healthy foreign node"))
         return false;
+    // IMMEDIATE consumption of this exact sample's canonical workspace views.
+    state.phase = "frame-geometry-prerequisite";
+    if (!prepare_frame_geometry(*machine)) return false;
     if (!check(reclaim::selftest_observe_worker(state.worker) && state.worker.exact_daemon && state.worker.refs == 2,
                "ready boot-held worker"))
         return false;
@@ -839,13 +925,13 @@ void entry() {
         report_seed_diagnostics();
         log::error(
             "NUMA_PRESSURE FAIL phase=%s reason=%s held=%llu cleanup=%u checks=%llu limit_captured=%u limit_bits=%u "
-            "next_pages=%llu held_before_cleanup=%llu bulk_records=%llu tail_records=%llu tail_pages=%llu "
-            "held_highwater=%llu bulk_highwater=%llu tail_records_highwater=%llu tail_pages_highwater=%llu "
-            "bulk_capacity=%llu tail_capacity=%llu page_capacity=%llu sample_valid=%u buddy=%llu cached=%llu usable=%llu",
+            "next_pages=%llu held_before_cleanup=%llu bulk_allocations=%llu order0_allocations=%llu tail_pages=%llu "
+            "held_highwater=%llu bulk_highwater=%llu order0_highwater=%llu tail_pages_highwater=%llu "
+            "window_first=%llx window_end=%llx page_capacity=%llu sample_valid=%u buddy=%llu cached=%llu usable=%llu",
             state.phase, state.failure != nullptr ? state.failure : "unknown", u(state.held), state.cleanup_valid ? 1U : 0U,
             u(state.assertions), state.limit_captured ? 1U : 0U, state.limit_reasons, u(state.limit_next_pages), u(state.limit_held),
-            u(state.limit_bulk), u(state.limit_tail_records), u(state.limit_tail_pages), u(state.held_highwater), u(state.bulk_highwater),
-            u(state.tail_records_highwater), u(state.tail_pages_highwater), u(SPANS), u(TAIL), u(MAX_HELD),
+            u(state.limit_bulk), u(state.limit_order0), u(state.limit_tail_pages), u(state.held_highwater), u(state.bulk_highwater),
+            u(state.order0_highwater), u(state.tail_pages_highwater), u(state.frames.first), u(state.frames.end), u(MAX_HELD),
             state.limit_sample_valid ? 1U : 0U, u(state.limit_buddy), u(state.limit_cached), u(state.limit_usable));
         mod::dbg::panic_handler("scheduled NUMA pressure fixture failed");
     }

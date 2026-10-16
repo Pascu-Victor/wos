@@ -2,7 +2,7 @@
 """Actual extracted Holdings/factory; small Host capacity and physical seams disclosed."""
 from pathlib import Path
 import ast,hashlib,json,os,resource,shlex,shutil,signal,subprocess,tempfile,time,traceback
-import argparse, importlib.util
+import argparse, importlib.util, re
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--host-build',type=Path,required=True)
 parser.add_argument('--gtest-main',type=Path,required=True)
@@ -31,7 +31,7 @@ def run(label,args,expected=0):
  log=OUT/(label+'.log')
  previous_ubsan=os.environ.get('UBSAN_OPTIONS')
  os.environ['UBSAN_OPTIONS']='halt_on_error=1'
- try:row=process_fixture.command(list(map(str,args)),log,T,start+60,owned)
+ try:row=process_fixture.command(list(map(str,args)),log,T,start+120,owned)
  finally:
   if previous_ubsan is None:os.environ.pop('UBSAN_OPTIONS',None)
   else:os.environ['UBSAN_OPTIONS']=previous_ubsan
@@ -43,150 +43,88 @@ try:
  for sig in handlers:signal.signal(sig,interrupted)
  process_fixture.subreaper()
  helper=R/'tests/host/unit/numa_node_reclaim_runtime_test.py';tree=ast.parse(helper.read_text());f=next(n for n in tree.body if isinstance(n,ast.FunctionDef)and n.name=='body');env={};exec(compile(ast.Module(body=[f],type_ignores=[]),'pure-body-reader','exec'),env);body=env['body']
- text=native.read_text();hold=body(text,'struct Holdings','};');actual_check=body(text,'auto check(');capture=body(text,'void capture_limit(');join=body(text,'auto tail_join(')
+ text=native.read_text();hold=body(text,'struct Holdings','};');actual_check=body(text,'auto check(');capture=body(text,'void capture_limit(')
  factory_test=R/'tests/host/unit/numa_alloc_test.cpp';base_source=factory_test.read_text()
- assert base_source.count('    bool fail_all{};')==1
- base_source=base_source.replace('    bool fail_all{};','    bool fail_all{};\n    std::vector<unsigned> script{}; size_t script_index{}; void* arena{};')
- needle='''        uint64_t const BYTES = static_cast<uint64_t>(pages) * PAGE;'''
- scripted='''        if(pages==1 && !script.empty()) {
-            if(arena==nullptr){constexpr unsigned N=1024;arena=std::aligned_alloc(PAGE,N*PAGE);if(arena==nullptr)std::abort();
+ # Physical/ref/address seams. The actual factory/OwnedSpan and extracted
+ # production geometry, index, take and clear are compiled, not modelled.
+ base_source=base_source.replace('    bool fail_all{};', '    bool fail_all{}; uint64_t cursors[64]{}; std::vector<unsigned> script{}; size_t script_index{}; void* arena{}; void* alias{}; bool bad_batch_stats{}; std::vector<size_t> batches{};')
+ base_source=base_source.replace('0x10000000ULL + node * 0x10000000ULL, 2 * LARGE','0x1000000000ULL + node * 0x400000000ULL, 0x200000000ULL').replace('topology.nodes[node].usable_bytes = 2 * LARGE','topology.nodes[node].usable_bytes = 0x200000000ULL')
+ needle='        uint64_t const BYTES = static_cast<uint64_t>(pages) * PAGE;'
+ scripted=r'''        if(alias!=nullptr) {uint32_t at=0;auto* b=containing(reinterpret_cast<uint64_t>(alias),at);if(!b||at+pages>b->pages)std::abort();for(uint32_t i=0;i<pages;++i)++b->refs[at+i];return alias;}
+        unsigned node=0;while(node+1<topology.node_count && physical>=topology.memory[node+1].base)++node;
+        if(pages==1 && !script.empty()) {
+            if(arena==nullptr){constexpr unsigned N=1024;arena=std::aligned_alloc(PAGE,N*PAGE);if(!arena)std::abort();
+                physical+=cursors[node];cursors[node]+=N*PAGE;
                 blocks.push_back({std::unique_ptr<void,FreeStorage>{arena},physical,N,std::vector<uint32_t>(N,0)});}
-            if(script_index>=script.size())std::abort();unsigned index=script[script_index++];
-            if(index>=1024)std::abort();uint32_t page=0;auto* b=containing(reinterpret_cast<uint64_t>(arena),page);
-            if(b==nullptr || b->refs[index]!=0)std::abort();b->refs[index]=1;
-            return static_cast<uint8_t*>(arena)+index*PAGE;
+            if(script_index>=script.size())std::abort();unsigned index=script[script_index++];if(index>=1024)std::abort();uint32_t at=0;auto* b=containing(reinterpret_cast<uint64_t>(arena),at);if(!b||b->refs[index])std::abort();b->refs[index]=1;return static_cast<uint8_t*>(arena)+index*PAGE;
         }
+        cursors[node]=(cursors[node]+alignment-1)&~(alignment-1);physical+=cursors[node];cursors[node]+=static_cast<uint64_t>(pages)*PAGE;
 '''
  assert base_source.count(needle)==1;base_source=base_source.replace(needle,scripted+needle)
- old_tests=r'''class PressureHoldings:public NumaAllocation {protected:void SetUp()override{NumaAllocation::SetUp();state={};state.cleanup_valid=true;state.baseline.nodes[0].usable=1024*1024;}};
-TEST_F(PressureHoldings, RealOwnedSpanBulkAndTailPrefixFullyReturns) {
- {Holdings h;for(unsigned i=0;i<2;++i){auto r=numa::try_allocate_pages(context(),512,LARGE,OWNER,Initialization::FULL_OVERWRITE);ASSERT_TRUE(h.take(r,512));EXPECT_TRUE(r.span.empty());}
- for(unsigned i=0;i<7;++i){auto r=numa::try_allocate_pages(context(),1,PAGE,OWNER);ASSERT_TRUE(h.take(r,1));}EXPECT_EQ(state.held,1031U);}
- EXPECT_EQ(state.held,0U);EXPECT_EQ(state.released,1031U);EXPECT_EQ(state.spans_count,0U);EXPECT_EQ(state.tail_count,0U);EXPECT_TRUE(state.cleanup_valid);EXPECT_EQ(model.live_refs(),0U);
-}
-TEST_F(PressureHoldings, EarlyReturnFreesExactSuccessfulPrefix) {
- auto path=[](){Holdings h;for(unsigned i=0;i<3;++i){auto r=numa::try_allocate_pages(context(),1,PAGE,OWNER);if(!h.take(r,1))return false;}return false;};
- EXPECT_FALSE(path());EXPECT_EQ(state.released,3U);EXPECT_EQ(state.held,0U);EXPECT_EQ(model.live_refs(),0U);EXPECT_TRUE(state.cleanup_valid);
-}
-TEST_F(PressureHoldings, InvalidSpanShapeRetainsActualResultUntilItsDestructor) {
- {Holdings h;auto r=numa::try_allocate_pages(context(),512,LARGE,OWNER);EXPECT_FALSE(h.take(r,1));EXPECT_FALSE(r.span.empty());EXPECT_EQ(state.held,0U);}
- EXPECT_EQ(model.live_refs(),0U);EXPECT_EQ(state.released,0U);EXPECT_NE(state.failure,nullptr);
-}
-TEST_F(PressureHoldings, PostTransferNodeRefusalStillReturnsCommittedOwnership) {
- model.domains(2);{Holdings h;auto r=numa::try_allocate_pages(context(numa::Mode::BIND,2,0),1,PAGE,OWNER);ASSERT_EQ(r.actual,1);EXPECT_FALSE(h.take(r,1));EXPECT_TRUE(r.span.empty());EXPECT_EQ(state.held,1U);}
- EXPECT_EQ(model.live_refs(),0U);EXPECT_EQ(state.released,1U);EXPECT_EQ(state.held,0U);EXPECT_TRUE(state.cleanup_valid);
-}
-TEST_F(PressureHoldings, ExplicitClearThenDestructorDoesNotDoubleRelease) {
- {Holdings h;auto r=numa::try_allocate_pages(context(),512,LARGE,OWNER);ASSERT_TRUE(h.take(r,512));h.clear();EXPECT_EQ(state.released,512U);h.clear();}
- EXPECT_EQ(state.released,512U);EXPECT_EQ(model.decremented.size(),512U);EXPECT_EQ(model.live_refs(),0U);
-}
-'''
- extra=r'''// Backend scripts only the returned Host addresses/ref ledger. The actual
-// production factory constructs OwnedSpan; actual take/clear are extracted.
-void sequence(Backend& model, std::initializer_list<unsigned> indices) {
-    model.script.assign(indices.begin(), indices.end());
-}
-auto claim_page() -> numa::AllocationResult {
-    return numa::try_allocate_pages({{0, numa::Mode::LOCAL}, 0, 0}, 1, PAGE, OWNER);
-}
-TEST_F(PressureHoldings, ForwardAdjacentIndependentPagesUseOneRecordAndBatchReturn) {
-    sequence(model,{0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19});
-    {Holdings h;for(unsigned i=0;i<20;++i){auto r=claim_page();ASSERT_TRUE(h.take(r,1));}
-     EXPECT_EQ(state.tail_count,1U);EXPECT_EQ(state.tail[0].pages,20U);EXPECT_EQ(state.tail_pages,20U);EXPECT_EQ(state.held_highwater,20U);}
-    EXPECT_EQ(state.released,20U);EXPECT_EQ(model.live_refs(),0U);EXPECT_EQ(model.decremented.size(),20U);EXPECT_TRUE(state.cleanup_valid);
-}
-TEST_F(PressureHoldings, ReverseAdjacentIndependentPagesExtendExactBase) {
-    sequence(model,{5,4,3,2,1,0});
-    {Holdings h;for(unsigned i=0;i<6;++i){auto r=claim_page();ASSERT_TRUE(h.take(r,1));}
-     EXPECT_EQ(state.tail_count,1U);EXPECT_EQ(state.tail[0].pages,6U);EXPECT_EQ(state.tail[0].base,model.arena);}
-    EXPECT_EQ(state.released,6U);EXPECT_EQ(model.live_refs(),0U);EXPECT_TRUE(state.cleanup_valid);
-}
-TEST_F(PressureHoldings, DisjointRecordsAndAlternatingDirectionNeverClaimHoles) {
-    sequence(model,{0,1,10,9,20,21,30,29});
-    {Holdings h;for(unsigned i=0;i<8;++i){auto r=claim_page();ASSERT_TRUE(h.take(r,1));}
-     ASSERT_EQ(state.tail_count,4U);for(unsigned i=0;i<4;++i)EXPECT_EQ(state.tail[i].pages,2U);EXPECT_EQ(state.tail_pages,8U);}
-    EXPECT_EQ(state.released,8U);EXPECT_EQ(model.decremented.size(),8U);EXPECT_EQ(model.live_refs(),0U);
-}
-TEST_F(PressureHoldings, FullRecordLedgerStillAllowsAdjacentActualCandidate) {
-    for(unsigned i=0;i<TAIL;++i)model.script.push_back(i*3);
-    model.script.push_back((TAIL-1)*3+1);
-    {Holdings h;for(unsigned i=0;i<TAIL+1;++i){auto r=claim_page();ASSERT_TRUE(h.take(r,1));}
-     EXPECT_EQ(state.tail_count,TAIL);EXPECT_EQ(state.tail[TAIL-1].pages,2U);EXPECT_EQ(state.tail_pages,TAIL+1);EXPECT_FALSE(state.limit_captured);}
-    EXPECT_EQ(state.released,TAIL+1);EXPECT_EQ(model.live_refs(),0U);EXPECT_TRUE(state.cleanup_valid);
-}
-TEST_F(PressureHoldings, FullNonadjacentRefusesBeforeTransferAndKeepsFailurePrefix) {
-    for(unsigned i=0;i<TAIL+1;++i)model.script.push_back(i*3);
-    {Holdings h;for(unsigned i=0;i<TAIL;++i){auto r=claim_page();ASSERT_TRUE(h.take(r,1));}
-     {auto refused=claim_page();EXPECT_FALSE(h.take(refused,1));EXPECT_FALSE(refused.span.empty());
-      EXPECT_EQ(model.live_refs(),TAIL+1);EXPECT_EQ(state.held,TAIL);EXPECT_EQ(state.tail_count,TAIL);
-      EXPECT_EQ(state.limit_reasons,2U);EXPECT_EQ(state.limit_held,TAIL);EXPECT_EQ(state.limit_tail_records,TAIL);
-      EXPECT_EQ(state.limit_tail_pages,TAIL);EXPECT_FALSE(state.limit_sample_valid);}
-     EXPECT_EQ(model.live_refs(),TAIL);}
-    EXPECT_EQ(state.held,0U);EXPECT_EQ(state.tail_pages,0U);EXPECT_EQ(state.released,TAIL);EXPECT_EQ(model.live_refs(),0U);
-    EXPECT_EQ(state.limit_held,TAIL);EXPECT_EQ(state.tail_records_highwater,TAIL);EXPECT_TRUE(state.cleanup_valid);
-}
-TEST_F(PressureHoldings, AddressArithmeticAndSupportedShapeRejectBeforeAnyTransfer) {
-    EXPECT_EQ(tail_join({reinterpret_cast<void*>(UINTPTR_MAX-PAGE+1),1},PAGE),TailJoin::INVALID);
-    EXPECT_EQ(tail_join({reinterpret_cast<void*>(PAGE),1},UINTPTR_MAX-PAGE+1),TailJoin::INVALID);
-    EXPECT_EQ(tail_join({reinterpret_cast<void*>(PAGE+1),1},PAGE),TailJoin::INVALID);
-    EXPECT_EQ(tail_join({reinterpret_cast<void*>(PAGE),0},PAGE),TailJoin::INVALID);
-    EXPECT_EQ(tail_join({reinterpret_cast<void*>(PAGE),1},PAGE),TailJoin::INVALID);
-    {Holdings h;auto r=claim_page();EXPECT_FALSE(h.take(r,2));EXPECT_FALSE(r.span.empty());EXPECT_EQ(state.limit_reasons,8U);EXPECT_EQ(state.held,0U);}
-    EXPECT_EQ(model.live_refs(),0U);EXPECT_EQ(state.released,0U);
-}
-TEST_F(PressureHoldings, UsableBoundRefusalCapturesBeforeDestructorAndDoesNotAdopt) {
-    sequence(model,{0,1});state.baseline.nodes[0].usable=1;
-    {Holdings h;{auto r=claim_page();ASSERT_TRUE(h.take(r,1));}{auto r=claim_page();EXPECT_FALSE(h.take(r,1));EXPECT_FALSE(r.span.empty());
-     EXPECT_EQ(state.limit_reasons,4U);EXPECT_EQ(state.limit_held,1U);EXPECT_EQ(state.held,1U);}}
-    EXPECT_EQ(state.released,1U);EXPECT_EQ(model.live_refs(),0U);EXPECT_EQ(state.limit_held,1U);EXPECT_TRUE(state.cleanup_valid);
-}
-TEST_F(PressureHoldings, MixedBulkAndLongTailReturnEachIndependentReferenceOnce) {
-    {Holdings h;auto bulk=numa::try_allocate_pages(context(),512,LARGE,OWNER);ASSERT_TRUE(h.take(bulk,512));
-     for(unsigned i=0;i<300;++i)model.script.push_back(i);
-     for(unsigned i=0;i<300;++i){auto r=claim_page();ASSERT_TRUE(h.take(r,1));}
-     ASSERT_EQ(state.tail_count,1U);EXPECT_EQ(state.tail[0].pages,300U);EXPECT_EQ(state.tail_pages,300U);h.clear();h.clear();}
-    EXPECT_EQ(state.released,812U);EXPECT_EQ(model.decremented.size(),812U);EXPECT_EQ(state.held,0U);EXPECT_EQ(state.tail_pages,0U);
-    EXPECT_EQ(model.live_refs(),0U);EXPECT_TRUE(state.cleanup_valid);
-}
-'''
- common='''
+ endpoint=r'''
+namespace ker::mod::mm::addr {
+auto get_hhdm_offset()->uint64_t{return 0;}
+auto get_virt_pointer(paddr_t physical)->paddr_t* {
+ for(auto& b:backend().blocks)if(b.storage && physical>=b.physical && physical-b.physical<static_cast<uint64_t>(b.pages)*PAGE)
+  return reinterpret_cast<paddr_t*>(reinterpret_cast<uint64_t>(b.storage.get())+physical-b.physical);
+ return nullptr;
+}}
 namespace ker::mod::mm::phys {
-auto page_ref_dec_batch(std::span<void* const> pages) -> PageRefBatchStats {
- PageRefBatchStats result{};for(auto* page:pages){uint32_t index=0;auto* b=backend().containing(reinterpret_cast<uint64_t>(page),index);
- if(b==nullptr||b->refs[index]==0)continue;++result.refs_decremented;if(page_ref_dec(page)==0)++result.pages_freed;}return result;
+auto page_ref_dec_batch(std::span<void* const> pages)->PageRefBatchStats {
+ backend().batches.push_back(pages.size());PageRefBatchStats out{};for(auto* p:pages){uint32_t i=0;auto* b=backend().containing(reinterpret_cast<uint64_t>(p),i);if(!b||!b->refs[i]){ADD_FAILURE()<<"batch unowned ref";continue;}++out.refs_decremented;if(page_ref_dec(p)==0)++out.pages_freed;}
+ if(backend().bad_batch_stats)out.pages_freed=0;return out;
 }
-auto snapshot_node_counters(NodeCounterSnapshot&,NodeCounterWorkspace&) noexcept -> NodeCounterError {return NodeCounterError::NOT_READY;}
+auto snapshot_node_counters(NodeCounterSnapshot&,NodeCounterWorkspace&)noexcept->NodeCounterError{return NodeCounterError::NOT_READY;}
 }
+'''
+ common=r'''
 namespace {
 namespace phys=mm::phys;
 constexpr uint64_t MAX_HELD=1024*1024;
-constexpr size_t SPANS=2048,TAIL=16; // Deliberate scaled Host capacity; kernel32768 proven separately.
-struct SpanRecord{void* base{};uint32_t pages{};};
+constexpr size_t FRAME_WORDS=32768;
+constexpr uint64_t FRAME_BITS=FRAME_WORDS*64;
+'''+body(text,'struct FrameOwnership','};')+r'''
 struct HostState {
- SpanRecord spans[SPANS]{}; TAIL_DECL;void* batch[128]{};size_t spans_count{},tail_count{};
- uint64_t held{},released{},assertions{},tail_pages{},held_highwater{},bulk_highwater{},tail_records_highwater{},tail_pages_highwater{};
- uint64_t limit_held{},limit_bulk{},limit_tail_records{},limit_tail_pages{},limit_next_pages{},limit_buddy{},limit_cached{},limit_usable{};
+ FrameOwnership frames{};void* batch[128]{};size_t bulk_allocations{},order0_allocations{};
+ uint64_t held{},released{},assertions{},tail_pages{},held_highwater{},bulk_highwater{},order0_highwater{},tail_pages_highwater{};
+ uint64_t limit_held{},limit_bulk{},limit_order0{},limit_tail_pages{},limit_next_pages{},limit_buddy{},limit_cached{},limit_usable{};
  uint32_t limit_reasons{};bool limit_captured{},limit_sample_valid{};numa::NodeId selected{};
  phys::NodeCounterSnapshot baseline{},sample{};phys::NodeCounterWorkspace work{};bool cleanup_valid{true};const char* failure{};
 };static HostState state;
 '''
- fixture=base_source+common.replace('TAIL_DECL','SpanRecord tail[TAIL]{}')+actual_check+'\n'+capture+'\nenum class TailJoin:uint8_t { NEW_RECORD,FORWARD,BACKWARD,INVALID };\n'+join+'\n'+hold+'\n'+old_tests+extra+'\n}\n'
- source=OUT/'actual-holdings-fixture.cpp';source.write_text(fixture)
+ helpers=actual_check+'\n'+capture+'\n'+body(text,'auto prepare_frame_geometry(')+'\n'+body(text,'auto frame_span_index(')+'\n'+hold
+ support=Path(__file__).with_name('numa_pressure_holdings_cases.inc');legacy=Path(__file__).with_name('numa_pressure_holdings_legacy.inc')
+ source=OUT/'actual-bitmap-fixture.cpp';source.write_text(base_source+endpoint+common+helpers+'\n'+support.read_text()+'\n}\n')
+ legacy_source=OUT/'actual-legacy-fixture.cpp';legacy_source.write_text(base_source+endpoint+legacy.read_text())
  row=next(r for r in json.loads(DB.read_text())if r['file'].endswith('/tests/host/unit/numa_alloc_test.cpp')and'numa_alloc_test.dir/'in r['command']);args=shlex.split(row['command']);base=[args[0],'-I'+str(R/'modules/kern/src/platform/mm')];i=1
  while i<len(args):
   if args[i]in['-o','-MF','-MT','-MQ']:i+=2;continue
   if args[i]in['-c','-MD','-MMD','-MP']or args[i]==row['file']:i+=1;continue
   base.append(args[i]);i+=1
  libs=[a.gtest_main.resolve(),a.gtest_lib.resolve()];factory=R/'modules/kern/src/platform/mm/numa_alloc.cpp'
- seen={DB,Path(__file__),R/'tests/host/unit/file_mmap_registry_runtime_test.py',native,helper,factory_test,source,*libs};sources=[('test',source),('factory',factory)];objects={}
+ seen={DB,Path(__file__),R/'tests/host/unit/file_mmap_registry_runtime_test.py',native,helper,factory_test,source,legacy_source,support,legacy,*libs};sources=[('test',source),('legacy',legacy_source),('factory',factory)];objects={}
+ controls=[
+ ('duplicate','(state.frames.owned[index / 64] & BIT) == 0','true','PressureBitmap.GenuineExtraRefDuplicateRefusesBeforeTransfer'),
+ ('modulo','uint64_t const INDEX = (physical - frames.first) / PAGE;','uint64_t const INDEX = ((physical - frames.first) / PAGE) % (FRAME_BITS / 2);','PressureBitmap.HighAbsolutePaAndLastRelativeBitRemainExact'),
+ ('partial','capture_limit(64, pages); return false;\n            }\n        }','capture_limit(64, pages); return false;\n            }\n            state.frames.owned[index / 64] |= BIT;\n        }','PressureBitmap.Whole512RefusalDoesNotAdoptEligiblePrefix'),
+ ('unowned','size_t pending = 0;','size_t pending = 0; if (state.held != 0) state.frames.owned[0] |= uint64_t{1} << 63;','PressureBitmap.DisjointAlternatingDirectionNeverClaimsHoles'),
+ ('batch','if (pending == 128) flush();','if (pending == 127) flush();','PressureBitmap.Batch127128129AndRemainderAreOnceOnly'),
+ ('usable','state.held <= state.baseline.nodes[state.selected].usable - pages','true','PressureBitmap.UsableBoundRefusalCapturesBeforeDestructorAndDoesNotAdopt')]
+ for name,old,new,filter_ in controls:
+  pattern=r'\s*'.join(re.escape(t)for t in re.findall(r'\w+|[^\w\s]',old))
+  changed,count=re.subn(pattern,lambda _:new,source.read_text());assert count==1,(name,count)
+  mutant=OUT/(name+'-mutant.cpp');mutant.write_text(changed);sources.append((name,mutant));seen.add(mutant)
  for name,src in sources:
   dep=T/(name+'.d');run('deps-'+name,base+['-M','-MF',dep,'-MT','out',src]);seen.update(deps(dep))
  before=[pin(p)for p in sorted(seen)]
- for name,src in sources:
+ for name,src in sources[:3]:
   obj=T/(name+'.o');run('compile-'+name,base+['-c',src,'-o',obj]);objects[name]=obj
- for kind,test,filter_,expected in [('candidate','test','PressureHoldings.*',0)]:
+ for kind,test,filter_,expected in [('candidate','test','PressureBitmap.*',0),('legacy','legacy','PressureHoldings.*',0)]+[(n,n,f,1)for n,_,_,f in controls]:
+  if expected:
+   obj=T/(test+'.o');run('compile-'+test,base+['-c',OUT/(test+'-mutant.cpp'),'-o',obj]);objects[test]=obj
   binary=T/kind;run('link-'+kind,[base[0],'-fsanitize=address,undefined',objects[test],objects['factory'],*libs,'-pthread','-o',binary]);report=OUT/(kind+'-gtest.json');run('run-'+kind,[binary,'--gtest_filter='+filter_,'--gtest_output=json:'+str(report)],expected)
-  parsed=json.loads(report.read_text());assert (parsed['tests'],parsed['failures'])==((13,0)if expected==0 else(1,1))
+  parsed=json.loads(report.read_text());assert (parsed['tests'],parsed['failures'])==((23,0)if kind=='candidate'else(13,0)if kind=='legacy'else(1,1));assert not any(x in (OUT/('run-'+kind+'.log')).read_text()for x in ['ERROR: AddressSanitizer','runtime error:'])
+  binary.unlink();objects[test].unlink()
  after=[pin(p)for p in sorted(seen)];assert before==after
 except BaseException as e:errors.append(type(e).__name__+': '+str(e));(OUT/'failure01.txt').write_text(traceback.format_exc())
 finally:
@@ -205,7 +143,7 @@ finally:
     removed=process_fixture.allocated(T);shutil.rmtree(T);scratch_removed=not T.exists()
    except BaseException as e:
     errors.append('scratch cleanup: '+type(e).__name__+': '+str(e));preserved_scratch=str(T)
-  j=dict(qualification='PASS_ACTUAL_HOLDINGS_FACTORY_HOST_SEAMS_ONLY'if not errors else'FAIL_HOLDINGS_HOST',errors=errors,commands=commands,input_before=before,input_after=after,source_held=bool(before)and before==after,scratch_removed=scratch_removed,preserved_scratch=preserved_scratch,scratch_allocated_bytes_removed=removed,owned_groups_pending=owned[:],seconds=time.monotonic()-start,scope='Exact actual Holdings/check/capture_limit/tail_join and current factory/OwnedSpan. Existing physical/ref/topology seams plus scripted independent addresses, batch and unavailable snapshot seams. Host TAIL16; kernel actual32768 separately compiled. No real buddy/IRQ/scheduler/kernel pressure claim; ASAN+UBSAN enabled, LSan disabled in sandbox.')
+  j=dict(qualification='PASS_ACTUAL_HOLDINGS_FACTORY_HOST_SEAMS_ONLY'if not errors else'FAIL_HOLDINGS_HOST',errors=errors,commands=commands,input_before=before,input_after=after,source_held=bool(before)and before==after,scratch_removed=scratch_removed,preserved_scratch=preserved_scratch,scratch_allocated_bytes_removed=removed,owned_groups_pending=owned[:],seconds=time.monotonic()-start,scope='Actual extracted geometry/frame index/Holdings/check/capture and current factory/OwnedSpan. Physical/address/ref/batch seams, immutable canonical views supplied by Host; no native list traversal claim. Unchanged13 pre37e helper vectors compiled separately with disclosed legacyTAIL16; new bitmap uses full32768words and real bounded actual factory spans. Logical geometry tests do not allocate payload for their eligible windows. No real buddy/IRQ/scheduler/kernel pressure claim; ASAN+UBSAN enabled, LSan disabled in sandbox.')
   try:
    (OUT/'result.json').write_text(json.dumps(j,indent=2)+'\n')
   except BaseException as e:
