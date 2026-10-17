@@ -95,9 +95,10 @@ def generate_lifecycle_placement(actual, take, shell):
     helpers = template + "\n".join(take(anchor) for anchor in [
         "auto now_ns(", "auto before(", "auto raw_error(", "auto query(", "auto self_policy(", "auto valid_selection(",
         "auto transfer(", "auto set_thread_cpu(", "auto await_cpu(", "auto lifecycle_child_target(", "auto valid_child_ready(",
+        "auto child_ready_rejections(", "void report_ready_failure(",
         "auto child_ready_and_cycle(", "auto receive_child_ready(", "auto terminate_and_reap("])
     caller = take("auto run_numa_lifecycle(")
-    begin = caller.index("        if (ok && !receive_child_ready(")
+    begin = caller.index("        ReadyObservation readiness{};")
     end = caller.index('            phase = "parent_pre_copyout";', begin)
     # Keep the whole completed-record validation; omit only its next payload if.
     branch = caller[begin:end]
@@ -106,6 +107,7 @@ def generate_lifecycle_placement(actual, take, shell):
         raise ValueError("exact actual placement-to-payload frontier")
     branch = branch[:-len(suffix)]
     def ports(body):
+        body = body.replace("std::fprintf(", "fixture::fprintf(")
         for name in ("clock_gettime", "getpid", "read", "write", "poll", "waitpid", "kill"):
             body = re.sub(r"(?<![\w:])" + name + r"\(", "fixture::" + name + "(", body)
         return body
@@ -121,6 +123,8 @@ def generate_lifecycle_placement(actual, take, shell):
         ("lost-controller-placement", "int64_t const PLACE = set_thread_cpu(static_cast<uint64_t>(pid), target.cpu, deadline);", "int64_t const PLACE = 0;"),
         ("lost-child-placement-wait", "int64_t const PLACED = await_cpu(target.cpu, deadline);", "int64_t const PLACED = 0;"),
         ("lost-cycle-alternation", "if ((cycle & 1U) == 0 || topo.selected_count < 2)", "if ((cycle & 1U) != 0 || topo.selected_count < 2)"),
+        ("lost-ready-errno-validity", "if (n < 0) observation->valid |= READY_IO_ERRNO;", "observation->valid |= READY_IO_ERRNO;"),
+        ("lost-ready-immediate-errno", "observation->io_error = n < 0 ? errno : 0;", "observation->io_error = 0;"),
     ]:
         if generated.count(old) != 1:
             raise ValueError("unique actual placement mutation: " + label)
@@ -321,6 +325,10 @@ def main():
             captured_branch = branch.replace(anchor, """        fixture::capture(status, wait_observation, WAIT_OWNED, READ_CLOSED, CLEANUP_REAP_NEEDED, reaped, owned,
                                  unmapped, fds_absent, MAPPING_QUERY_VALID, MAPPING_QUERY, mapping_absent, own, cleanup_observation);
         """ + anchor)
+            readiness_declaration = "        ReadyObservation readiness{};\n"
+            if caller.count(readiness_declaration) != 1:
+                raise ValueError("unique actual readiness default for unchanged postwait carrier")
+            captured_branch = readiness_declaration + captured_branch
             result["caller_branch_source"] = dict(bytes=len(branch.encode()), sha256=hashlib.sha256(branch.encode()).hexdigest())
             result["host_only_capture_insertion"] = anchor
             ports = [("clock_gettime(", "fixture::clock_gettime("), ("waitpid(", "fixture::posix_waitpid("),
@@ -350,7 +358,7 @@ def main():
                 "ACTUAL_OWN_RESOURCES": take("struct OwnResources {", True),
                 "ACTUAL_LIBC_WAITPID": libc,
                 "ACTUAL_CLOCK_WAIT_CLEANUP": port_wait("\n".join(take(name) for name in
-                    ["auto now_ns(", "auto before(", "auto wait_child(", "auto terminate_and_reap(", "auto close_fd(", "auto confirm_closed("])),
+                    ["auto now_ns(", "auto before(", "auto wait_child(", "auto terminate_and_reap(", "auto close_fd(", "auto confirm_closed(", "void report_ready_failure("])),
                 "ACTUAL_PREDECESSOR": predecessor,
                 "ACTUAL_POSTWAIT": port_wait(captured_branch),
             }

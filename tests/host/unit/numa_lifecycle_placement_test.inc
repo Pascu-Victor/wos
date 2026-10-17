@@ -11,6 +11,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -33,6 +34,12 @@ bool busy_once{}, always_busy{};
 size_t input_at{}, read_max{}, write_max{};
 std::vector<unsigned char> input, output;
 std::vector<std::string> events;
+// New readiness-only finite syscall/format ports; inactive defaults preserve
+// the original placement cases. These do not model a WOS child or scheduler.
+int read_error{}, poll_error{}, poll_result{}, poll_revents{}, clock_error{};
+unsigned eagain_reads{}, eintr_reads{}, clock_calls{}, report_calls{};
+bool invalid_clock{}, oversized_read{}, trace_clock{};
+std::string ready_line;
 void reset() {
     ++cases;
     now = 1;
@@ -50,11 +57,22 @@ void reset() {
     input.clear();
     output.clear();
     events.clear();
+    read_error = poll_error = poll_result = poll_revents = clock_error = 0;
+    eagain_reads = eintr_reads = clock_calls = report_calls = 0;
+    invalid_clock = oversized_read = trace_clock = false;
+    ready_line.clear();
 }
 auto clock_gettime(clockid_t which, timespec* out) -> int {
+    ++clock_calls;
+    if (trace_clock) events.emplace_back("clock");
     check(which == CLOCK_MONOTONIC, "original monotonic clock");
+    if (clock_error) {
+        errno = clock_error;
+        return -1;
+    }
     out->tv_sec = static_cast<time_t>(now / 1000000000);
     out->tv_nsec = static_cast<long>(now % 1000000000);
+    if (invalid_clock) out->tv_nsec = 1000000000;
     now += tick;
     return 0;
 }
@@ -62,6 +80,21 @@ auto getpid() -> pid_t { return 110; }
 auto read(int fd, void* destination, size_t bytes) -> ssize_t {
     events.emplace_back("read");
     check(fd == 7, "existing parent read FD");
+    if (eintr_reads != 0) {
+        --eintr_reads;
+        errno = EINTR;
+        return -1;
+    }
+    if (eagain_reads != 0) {
+        --eagain_reads;
+        errno = EAGAIN;
+        return -1;
+    }
+    if (read_error) {
+        errno = read_error;
+        return -1;
+    }
+    if (oversized_read) return static_cast<ssize_t>(bytes + 1);
     if (input_at == input.size()) return 0;
     size_t const count = std::min({bytes, input.size() - input_at, read_max});
     std::memcpy(destination, input.data() + input_at, count);
@@ -76,9 +109,28 @@ auto write(int fd, const void* source, size_t bytes) -> ssize_t {
     output.insert(output.end(), p, p + count);
     return static_cast<ssize_t>(count);
 }
-auto poll(pollfd*, nfds_t, int milliseconds) -> int {
+auto poll(pollfd* fds, nfds_t, int milliseconds) -> int {
+    events.emplace_back("poll");
     now += static_cast<uint64_t>(milliseconds) * 1000000;
-    return 0;
+    if (poll_error) {
+        errno = poll_error;
+        return -1;
+    }
+    fds->revents = static_cast<short>(poll_revents);
+    return poll_result;
+}
+auto fprintf(FILE* stream, const char* format, ...) -> int {
+    check(stream == stderr, "existing diagnostic stderr only");
+    char bytes[2048]{};
+    va_list arguments;
+    va_start(arguments, format);
+    int const count = std::vsnprintf(bytes, sizeof(bytes), format, arguments);
+    va_end(arguments);
+    check(count > 0 && static_cast<size_t>(count) < sizeof(bytes), "one bounded readiness diagnostic");
+    ready_line.assign(bytes);
+    ++report_calls;
+    errno = ENOSPC;  // Real formatter must restore the entering cleanup errno.
+    return count;
 }
 auto kill(pid_t pid, int signal) -> int {
     check(pid == 110 && signal == SIGKILL, "exact old cleanup kill");
@@ -230,6 +282,159 @@ void supplied(const Options& opts, Selection target, uint32_t cycle) {
     append(record(opts, target, cycle));
 }
 }  // namespace fixture
+namespace fixture {
+void readiness_diagnostic_cases() {
+    Options opts{};
+    Topology topo = topology();
+    Selection parent{0, 3};
+    const char* phase = "initial";
+    ReadyObservation observation{};
+    auto receive = [&] { return receive_child_ready(7, 110, opts, topo, parent, parent, 0, deadline, phase, &observation); };
+    reset();
+    errno = EBADF;
+    report_ready_failure(0, 110, observation);
+    check(report_calls == 0 && errno == EBADF, "uncalled observation never prints default Ready/ChildRecord state");
+    reset();
+    append(ready(opts, parent, 0));
+    check(receive() && observation.reason == ReadyReason::COMPLETE && (observation.valid & READY_FULL_RECORD) != 0 &&
+              (observation.valid & READY_RECORD_ERROR) != 0 && observation.ready_error == 0 && observation.done == sizeof(ChildReady) &&
+              observation.deadline == deadline,
+          "real complete readiness records valid whole bytes without changing acceptance");
+    report_ready_failure(0, 110, observation);
+    check(report_calls == 0 && set_count == 0 && get_count == 0, "successful readiness stays silent and same-target stays no-SET");
+    // Compare the actual transfer body with optional observation absent/present.
+    // The bytes, original clock/read/poll order and errno effects must agree.
+    std::vector<std::string> original_trace;
+    uint64_t original_now{};
+    unsigned original_clocks{};
+    int original_errno{};
+    for (bool observed : {false, true}) {
+        reset();
+        trace_clock = true;
+        deadline = 1000000000;
+        eagain_reads = 1;
+        read_max = 7;
+        append(ready(opts, parent, 0));
+        ChildReady copy{};
+        check(transfer(7, &copy, sizeof(copy), false, deadline, observed ? &observation : nullptr),
+              "actual chunked EAGAIN transfer succeeds");
+        check(copy.magic == CHILD_READY_MAGIC && input_at == input.size(), "same exact transfer bytes");
+        if (!observed) {
+            original_trace = events;
+            original_now = now;
+            original_clocks = clock_calls;
+            original_errno = errno;
+        } else {
+            check(events == original_trace && now == original_now && clock_calls == original_clocks && errno == original_errno,
+                  "optional stores add no successful clock/syscall/order/errno effect");
+        }
+    }
+    reset();
+    now = deadline;
+    check(!receive() && observation.reason == ReadyReason::DEADLINE && (observation.clock.valid & CLOCK_NS) != 0 &&
+              observation.clock.now == deadline && observation.done == 0 && (observation.valid & READY_IO_RESULT) == 0 &&
+              std::find(events.begin(), events.end(), "read") == events.end(),
+          "original expired pre-read deadline is distinguished");
+    reset();
+    clock_error = EFAULT;
+    check(!receive() && observation.reason == ReadyReason::CLOCK_ERROR && (observation.clock.valid & CLOCK_ERRNO) != 0 &&
+              (observation.clock.valid & CLOCK_NS) == 0 && observation.clock.error == EFAULT && errno == ETIMEDOUT,
+          "existing failing clock copied without a new sample or changed errno");
+    reset();
+    invalid_clock = true;
+    check(!receive() && observation.reason == ReadyReason::CLOCK_ERROR && (observation.clock.valid & CLOCK_TIMESPEC) != 0 &&
+              (observation.clock.valid & CLOCK_NS) == 0,
+          "invalid existing clock fields never acquire valid converted time");
+    reset();
+    append(ready(opts, parent, 0));
+    input.resize(sizeof(ChildReady) - 3);
+    read_max = 7;
+    check(!receive() && observation.reason == ReadyReason::EOF_STREAM && observation.done == sizeof(ChildReady) - 3 &&
+              observation.io_result == 0 && (observation.valid & READY_IO_RESULT) != 0 && (observation.valid & READY_IO_ERRNO) == 0 &&
+              (observation.valid & (READY_FULL_RECORD | READY_RECORD_ERROR | READY_VALIDATION_REJECT)) == 0,
+          "partial plus EOF is not a complete Ready or zero-error child observation");
+    ChildRecord default_record{};
+    check(default_record.phase == 0 && observation.reason == ReadyReason::EOF_STREAM,
+          "later default ChildRecord0 does not replace real transfer provenance");
+    reset();
+    read_error = EIO;
+    check(!receive() && observation.reason == ReadyReason::IO_ERROR && observation.io_result == -1 && observation.io_error == EIO &&
+              (observation.valid & READY_IO_ERRNO) != 0,
+          "hard read captures immediate real errno");
+    errno = EBADF;
+    report_ready_failure(1, 110, observation);
+    check(ready_line.find("NUMA_CHILD_READY_FAILURE version=1 cycle=1 pid=110 ") == 0 &&
+              ready_line.find("io_rc=-1 io_errno=" + std::to_string(EIO)) != std::string::npos &&
+              ready_line.find("ready_complete=0") != std::string::npos && errno == EBADF && report_calls == 1,
+          "actual appended formatter retains immediate errno across stale cleanup errno and restores it");
+    reset();
+    deadline = 1000000000;
+    eagain_reads = 1;
+    poll_error = ENOSPC;
+    check(!receive() && observation.reason == ReadyReason::POLL_ERROR && observation.poll_result == -1 &&
+              observation.poll_error == ENOSPC && (observation.valid & READY_POLL_ERRNO) != 0 && observation.io_error == EAGAIN,
+          "poll syscall error is distinct from prior EAGAIN read");
+    reset();
+    deadline = 1000000000;
+    eagain_reads = 1;
+    poll_result = 1;
+    poll_revents = POLLNVAL;
+    check(!receive() && observation.reason == ReadyReason::POLL_REVENTS && observation.poll_revents == POLLNVAL &&
+              (observation.valid & READY_POLL_REVENTS) != 0 && (observation.valid & READY_POLL_ERRNO) == 0 && errno == EIO,
+          "returned poll revents have valid bits without invented syscall errno");
+    reset();
+    eagain_reads = 1;
+    check(!receive() && observation.reason == ReadyReason::DEADLINE && observation.poll_result == 0 && observation.clock.now >= deadline &&
+              observation.io_error == EAGAIN,
+          "original EAGAIN/poll loop consumes original deadline without a reset");
+    reset();
+    oversized_read = true;
+    check(!receive() && observation.reason == ReadyReason::COUNT_ERROR && observation.done == 0 && errno == EPROTO,
+          "impossible I/O count stays refusal with validity-qualified result");
+    reset();
+    {
+        auto bad = ready(opts, parent, 0);
+        bad.pid = 111;
+        append(bad);
+        check(!receive() && observation.stage == ReadyStage::VALIDATION && observation.reason == ReadyReason::VALIDATION &&
+                  (observation.valid & READY_FULL_RECORD) != 0 && (observation.valid & READY_VALIDATION_REJECT) != 0 &&
+                  (observation.validation_reject & (uint64_t{1} << 5)) != 0 && set_count == 0,
+              "complete malformed Ready rejected by unchanged validator has identity provenance");
+    }
+    reset();
+    {
+        auto bad = ready(opts, parent, 0);
+        bad.error = -EIO;
+        append(bad);
+        check(!receive() && (observation.valid & READY_RECORD_ERROR) != 0 && observation.ready_error == -EIO &&
+                  (observation.validation_reject & (uint64_t{1} << 9)) != 0,
+              "only whole transferred Ready authorizes its actual nonzero child error");
+    }
+    reset();
+    {
+        auto value = ready(opts, parent, 0);
+        check(child_ready_rejections(value, opts, topo, {0, 64}, parent, 0, 110) == (uint64_t{1} << 1) &&
+                  child_ready_rejections(value, opts, topo, parent, {2, 0}, 0, 110) == (uint64_t{1} << 2) &&
+                  child_ready_rejections(value, opts, topo, parent, parent, 0, 0) == 1,
+              "diagnostic range guards precede potentially invalid shifts/selection");
+    }
+    reset();
+    eintr_reads = 1;
+    append(ready(opts, parent, 0));
+    check(receive() && observation.reason == ReadyReason::COMPLETE && (observation.valid & READY_IO_ERRNO) == 0 &&
+              observation.io_result == static_cast<int64_t>(sizeof(ChildReady)),
+          "successful retry clears prior errno validity without extra retries");
+    reset();
+    append(ready(opts, {1, 4}, 1));
+    set_error = -EINVAL;
+    check(!receive_child_ready(7, 110, opts, topo, parent, {1, 4}, 1, deadline, phase, &observation) &&
+              observation.reason == ReadyReason::COMPLETE,
+          "later controller-placement failure is not a readiness failure");
+    report_ready_failure(1, 110, observation);
+    check(report_calls == 0, "completed Ready never invents provenance for later failure");
+}
+}  // namespace fixture
+
 auto main() -> int {
     using namespace fixture;
     Options opts{};
@@ -392,6 +597,7 @@ auto main() -> int {
     deadline = 9;
     check(child_ready_and_cycle(nullptr, 8, opts, topo, parent, 1, deadline) == 67 && payload_calls == 0,
           "unplaced child cannot bypass original deadline");
+    readiness_diagnostic_cases();
     std::printf("%s actual lifecycle placement cases=%u assertions=%u failures=%u\n", failures ? "FAIL" : "PASS", cases, assertions,
                 failures);
     return failures ? 1 : 0;

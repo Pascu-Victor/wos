@@ -1776,7 +1776,7 @@ def test_numa_lifecycle_proves_inheritance_before_controller_placement() -> None
     require_tokens(lifecycle, ["child=controller_target_cpu method=inherited_ready_cooperative_placement",
                               "lifecycle_child_target(topo, parent_selection, cycle, child_target)",
                               "child_ready_and_cycle(mapping, fds[1], opts, topo, parent_selection, cycle, child_deadline)",
-                              "receive_child_ready(fds[0], pid, opts, topo, parent_selection, child_target, cycle, child_deadline, phase)",
+                              "receive_child_ready(fds[0], pid, opts, topo, parent_selection, child_target, cycle, child_deadline, phase, &readiness)",
                               "record.selected_node != child_target.node", "record.selected_cpu != child_target.cpu",
                               "terminate_and_reap(pid, owned, &cleanup_observation)", "deadline_after(opts.child_timeout_ms, child_deadline)",
                               "if (child_deadline > deadline) child_deadline = deadline"], "same ownership budget and exact final target")
@@ -1784,6 +1784,41 @@ def test_numa_lifecycle_proves_inheritance_before_controller_placement() -> None
         fail("placement cannot add another pipe or child")
     if "sizeof(ChildRecord) == 136" not in source:
         fail("existing payload transport ABI changed")
+
+
+def test_numa_ready_diagnostics_retain_failure_provenance_without_new_calls() -> None:
+    source = NUMA_LOCALITY_CPP.read_text()
+    transfer = function_body(source, "transfer")
+    receive = function_body(source, "receive_child_ready")
+    reject = function_body(source, "child_ready_rejections")
+    report = function_body(source, "report_ready_failure")
+    lifecycle = function_body(source, "run_numa_lifecycle")
+    require_tokens(transfer, ["ReadyStage::TRANSFER", "observation->requested = bytes", "observation->deadline = deadline",
+                              "observation->done = done", "observation->io_error = n < 0 ? errno : 0",
+                              "if (n < 0) observation->valid |= READY_IO_ERRNO", "observation->poll_error = rc < 0 ? errno : 0",
+                              "ReadyReason::CLOCK_ERROR", "ReadyReason::DEADLINE", "ReadyReason::EOF_STREAM",
+                              "ReadyReason::IO_ERROR", "ReadyReason::POLL_ERROR", "ReadyReason::POLL_REVENTS",
+                              "observation->reason = ReadyReason::COMPLETE"], "readiness latches actual transfer frontiers")
+    for token in ("before(", "now_ns(", "read(", "write(", "poll("):
+        if transfer.count(token) != 1:
+            fail("readiness diagnostics cannot change transfer call count: " + token)
+    require_order(transfer, "ssize_t n =", "observation->io_error =", "actual I/O errno latches before later branches")
+    require_order(transfer, "observation->io_error =", "if (n > 0)", "I/O provenance precedes errno assignments")
+    require_order(transfer, "int rc = poll(", "observation->poll_error =", "poll errno latches before later branches")
+    require_order(receive, "transfer(fd, &ready", "observation->valid |= READY_FULL_RECORD", "no partial Ready authority")
+    require_order(receive, "observation->valid |= READY_FULL_RECORD", "valid_child_ready(", "full actual Ready before validation")
+    require_order(receive, "if (!valid_child_ready(", "child_ready_rejections(", "diagnostic rejects cannot grant acceptance")
+    require_order(reject, "if (!valid_selection(topo, parent))", "uint64_t const INHERITED", "range guard before diagnostic shift")
+    require_tokens(report, ["ReadyStage::NOT_CALLED", "ReadyReason::COMPLETE", "int const SAVED_ERRNO = errno",
+                            "NUMA_CHILD_READY_FAILURE version=1", "clock_valid=%u", "ready_complete=%u",
+                            "validation_reject=%llu", "errno = SAVED_ERRNO"], "failure-only formatter restores errno")
+    if any(token in reject + report for token in ("clock_gettime(", "now_ns(", "before(", "read(", "poll(")):
+        fail("diagnostic classification/formatting cannot add clock or I/O probes")
+    require_order(lifecycle, "deadline_after(opts.child_timeout_ms, child_deadline)", "map_private(CYCLE_BYTES)", "original budget includes preparation")
+    require_order(lifecycle, "static_cast<unsigned long long>(record.elapsed_ns));", "report_ready_failure(cycle, pid, readiness)", "append after unchanged old failure line")
+    failure = lifecycle[lifecycle.index("if (!ok || !reaped"):lifecycle.index("        ++completed;")]
+    if lifecycle.count("report_ready_failure(") != 1 or "report_ready_failure(cycle, pid, readiness)" not in failure:
+        fail("readiness report must stay in the single original failure branch")
 
 
 def test_numa_public_pressure_preserves_eager_ownership_and_observation_frontiers() -> None:
@@ -1843,4 +1878,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    test_numa_ready_diagnostics_retain_failure_provenance_without_new_calls()
     main()

@@ -84,6 +84,42 @@ struct WaitObservation {
     bool result_valid{}, error_valid{}, status_valid{};
 };
 
+enum class ReadyStage : uint32_t { NOT_CALLED, TRANSFER, VALIDATION };
+enum class ReadyReason : uint32_t {
+    NOT_CALLED,
+    COMPLETE,
+    CLOCK_ERROR,
+    DEADLINE,
+    COUNT_ERROR,
+    EOF_STREAM,
+    IO_ERROR,
+    POLL_ERROR,
+    POLL_REVENTS,
+    VALIDATION
+};
+enum ReadyValid : uint32_t {
+    READY_IO_RESULT = 1,
+    READY_IO_ERRNO = 2,
+    READY_POLL_RESULT = 4,
+    READY_POLL_ERRNO = 8,
+    READY_POLL_REVENTS = 16,
+    READY_FULL_RECORD = 32,
+    READY_RECORD_ERROR = 64,
+    READY_VALIDATION_REJECT = 128
+};
+struct ReadyObservation {
+    ReadyStage stage{};
+    ReadyReason reason{};
+    uint32_t valid{};
+    uint64_t requested{}, done{}, deadline{};
+    ClockObservation clock{};
+    int64_t io_result{};
+    int io_error{}, poll_result{}, poll_error{}, poll_revents{};
+    int64_t ready_error{};
+    uint64_t validation_reject{};
+};
+static_assert(std::is_trivially_copyable_v<ReadyObservation> && sizeof(ReadyObservation) <= 160);
+
 // Failure diagnostics retain the last existing cleanup call and retry counts.
 // Status is read only after consuming this exact child; no wait history allocates.
 struct CleanupObservation {
@@ -497,44 +533,79 @@ auto nonblocking(int fd) -> bool {
     int flags = fcntl(fd, F_GETFL, 0);
     return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
 }
-auto transfer(int fd, void* buffer, size_t bytes, bool writing, uint64_t deadline) -> bool {
+auto transfer(int fd, void* buffer, size_t bytes, bool writing, uint64_t deadline, ReadyObservation* observation = nullptr) -> bool {
     auto* p = static_cast<uint8_t*>(buffer);
     size_t done = 0;
+    if (observation != nullptr) {
+        *observation = {};
+        observation->stage = ReadyStage::TRANSFER;
+        observation->requested = bytes;
+        observation->deadline = deadline;
+    }
     while (done != bytes) {
-        if (!before(deadline)) {
+        if (!before(deadline, observation != nullptr ? &observation->clock : nullptr)) {
+            if (observation != nullptr)
+                observation->reason = (observation->clock.valid & CLOCK_NS) != 0 ? ReadyReason::DEADLINE : ReadyReason::CLOCK_ERROR;
             errno = ETIMEDOUT;
             return false;
         }
         ssize_t n = writing ? write(fd, p + done, bytes - done) : read(fd, p + done, bytes - done);
+        if (observation != nullptr) {
+            observation->io_result = n;
+            observation->io_error = n < 0 ? errno : 0;
+            observation->valid = (observation->valid & ~READY_IO_ERRNO) | READY_IO_RESULT;
+            if (n < 0) observation->valid |= READY_IO_ERRNO;
+        }
         if (n > 0) {
             if (static_cast<size_t>(n) > bytes - done) {
+                if (observation != nullptr) observation->reason = ReadyReason::COUNT_ERROR;
                 errno = EPROTO;
                 return false;
             }
             done += static_cast<size_t>(n);
+            if (observation != nullptr) observation->done = done;
             continue;
         }
         if (n == 0) {
+            if (observation != nullptr) observation->reason = ReadyReason::EOF_STREAM;
             errno = EPIPE;
             return false;
         }
         if (errno == EINTR) continue;
-        if (errno != EAGAIN && errno != EWOULDBLOCK) return false;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            if (observation != nullptr) observation->reason = ReadyReason::IO_ERROR;
+            return false;
+        }
         uint64_t now;
-        if (!now_ns(now) || now >= deadline) {
+        if (!now_ns(now, observation != nullptr ? &observation->clock : nullptr) || now >= deadline) {
+            if (observation != nullptr)
+                observation->reason = (observation->clock.valid & CLOCK_NS) != 0 ? ReadyReason::DEADLINE : ReadyReason::CLOCK_ERROR;
             errno = ETIMEDOUT;
             return false;
         }
         uint64_t ms = (deadline - now + NS_PER_MS - 1) / NS_PER_MS;
         pollfd poll_fd{fd, static_cast<short>(writing ? POLLOUT : POLLIN), 0};
         int rc = poll(&poll_fd, 1, static_cast<int>(ms > 100 ? 100 : ms));
-        if (rc < 0 && errno != EINTR) return false;
+        if (observation != nullptr) {
+            observation->poll_result = rc;
+            observation->poll_error = rc < 0 ? errno : 0;
+            observation->poll_revents = rc > 0 ? poll_fd.revents : 0;
+            observation->valid = (observation->valid & ~(READY_POLL_ERRNO | READY_POLL_REVENTS)) | READY_POLL_RESULT;
+            if (rc < 0) observation->valid |= READY_POLL_ERRNO;
+            if (rc > 0) observation->valid |= READY_POLL_REVENTS;
+        }
+        if (rc < 0 && errno != EINTR) {
+            if (observation != nullptr) observation->reason = ReadyReason::POLL_ERROR;
+            return false;
+        }
         // HUP can accompany unread final bytes; retry read before treating EOF.
         if (rc > 0 && (poll_fd.revents & (POLLERR | POLLNVAL))) {
+            if (observation != nullptr) observation->reason = ReadyReason::POLL_REVENTS;
             errno = EIO;
             return false;
         }
     }
+    if (observation != nullptr) observation->reason = ReadyReason::COMPLETE;
     return true;
 }
 auto pattern(uint64_t seed, uint32_t cycle, size_t index, bool child) -> uint8_t {
@@ -666,6 +737,50 @@ auto valid_child_ready(const ChildReady& ready, const Options& opts, const Topol
            ready.policy.mode == static_cast<uint32_t>(abi::PolicyMode::LOCAL) && ready.policy.nodes == 0 && ready.policy.reserved32 == 0 &&
            ready.policy.reserved64 == 0;
 }
+auto child_ready_rejections(const ChildReady& ready, const Options& opts, const Topology& topo, Selection parent, Selection target,
+                            uint32_t cycle, pid_t pid) -> uint64_t {
+    // Diagnostic only, after complete transfer and an already-failed validator.
+    // Guard ranges before any inherited-affinity shift, as the validator does.
+    if (pid <= 1) return uint64_t{1} << 0;
+    if (!valid_selection(topo, parent)) return uint64_t{1} << 1;
+    if (!valid_selection(topo, target)) return uint64_t{1} << 2;
+    uint64_t rejected = 0;
+    if (ready.magic != CHILD_READY_MAGIC || ready.version != 1 || ready.bytes != sizeof(ChildReady)) rejected |= uint64_t{1} << 3;
+    if (ready.seed != opts.seed || ready.cycle != cycle) rejected |= uint64_t{1} << 4;
+    uint64_t const EXPECTED_PID = static_cast<uint64_t>(pid);
+    if (ready.pid != EXPECTED_PID || ready.tid != EXPECTED_PID || ready.tid != ready.pid || raw_error(ready.tid))
+        rejected |= uint64_t{1} << 5;
+    uint64_t const INHERITED = uint64_t{1} << parent.cpu;
+    if (ready.inherited_mask != INHERITED || ready.inherited_cpu != parent.cpu) rejected |= uint64_t{1} << 6;
+    if (ready.target_node != target.node || ready.target_cpu != target.cpu) rejected |= uint64_t{1} << 7;
+    if (ready.reserved != 0) rejected |= uint64_t{1} << 8;
+    if (ready.error != 0) rejected |= uint64_t{1} << 9;
+    if (ready.policy.version != abi::VERSION || ready.policy.bytes != sizeof(abi::SelfPolicy) ||
+        ready.policy.mode != static_cast<uint32_t>(abi::PolicyMode::LOCAL) || ready.policy.nodes != 0 || ready.policy.reserved32 != 0 ||
+        ready.policy.reserved64 != 0)
+        rejected |= uint64_t{1} << 10;
+    return rejected;
+}
+
+void report_ready_failure(uint32_t cycle, pid_t pid, const ReadyObservation& observation) {
+    if (observation.stage == ReadyStage::NOT_CALLED || observation.reason == ReadyReason::COMPLETE) return;
+    int const SAVED_ERRNO = errno;
+    std::fprintf(
+        stderr,
+        "NUMA_CHILD_READY_FAILURE version=1 cycle=%u pid=%lld stage=%u reason=%u valid=%u requested=%llu done=%llu deadline=%llu "
+        "clock_valid=%u clock_rc=%d clock_errno=%d clock_sec=%lld clock_nsec=%lld clock_ns=%llu "
+        "io_rc=%lld io_errno=%d poll_rc=%d poll_errno=%d poll_revents=%d ready_complete=%u ready_error=%lld validation_reject=%llu\n",
+        cycle, static_cast<long long>(pid), static_cast<unsigned>(observation.stage), static_cast<unsigned>(observation.reason),
+        observation.valid, static_cast<unsigned long long>(observation.requested), static_cast<unsigned long long>(observation.done),
+        static_cast<unsigned long long>(observation.deadline), observation.clock.valid, observation.clock.result, observation.clock.error,
+        static_cast<long long>(observation.clock.seconds), static_cast<long long>(observation.clock.nanoseconds),
+        static_cast<unsigned long long>(observation.clock.now), static_cast<long long>(observation.io_result), observation.io_error,
+        observation.poll_result, observation.poll_error, observation.poll_revents,
+        static_cast<unsigned>((observation.valid & READY_FULL_RECORD) != 0), static_cast<long long>(observation.ready_error),
+        static_cast<unsigned long long>(observation.validation_reject));
+    errno = SAVED_ERRNO;
+}
+
 auto child_ready_and_cycle(uint8_t* mapping, int fd, const Options& opts, const Topology& topo, Selection parent, uint32_t cycle,
                            uint64_t deadline) -> int {
     ChildReady ready;
@@ -694,12 +809,24 @@ auto child_ready_and_cycle(uint8_t* mapping, int fd, const Options& opts, const 
     return child_cycle(mapping, fd, opts, topo, cycle, deadline);
 }
 auto receive_child_ready(int fd, pid_t pid, const Options& opts, const Topology& topo, Selection parent, Selection target, uint32_t cycle,
-                         uint64_t deadline, const char*& phase) -> bool {
+                         uint64_t deadline, const char*& phase, ReadyObservation* observation = nullptr) -> bool {
     ChildReady ready;
     initialize_transport(ready);
     phase = "child_ready";
-    if (!transfer(fd, &ready, sizeof(ready), false, deadline) || !valid_child_ready(ready, opts, topo, parent, target, cycle, pid))
+    if (!transfer(fd, &ready, sizeof(ready), false, deadline, observation)) return false;
+    if (observation != nullptr) {
+        observation->valid |= READY_FULL_RECORD | READY_RECORD_ERROR;
+        observation->ready_error = ready.error;
+    }
+    if (!valid_child_ready(ready, opts, topo, parent, target, cycle, pid)) {
+        if (observation != nullptr) {
+            observation->stage = ReadyStage::VALIDATION;
+            observation->reason = ReadyReason::VALIDATION;
+            observation->validation_reject = child_ready_rejections(ready, opts, topo, parent, target, cycle, pid);
+            observation->valid |= READY_VALIDATION_REJECT;
+        }
         return false;
+    }
     // An already-target child may exit now: do not invent a raced SET or GET.
     if (ready.inherited_mask == (uint64_t{1} << target.cpu) && ready.inherited_cpu == target.cpu) return true;
     phase = "controller_placement";
@@ -986,7 +1113,9 @@ auto run_numa_lifecycle(int argc, char** argv) -> int {
                 owned = true;
         }
         if (!close_fd(fds[1], own)) ok = false;
-        if (ok && !receive_child_ready(fds[0], pid, opts, topo, parent_selection, child_target, cycle, child_deadline, phase)) ok = false;
+        ReadyObservation readiness{};
+        if (ok && !receive_child_ready(fds[0], pid, opts, topo, parent_selection, child_target, cycle, child_deadline, phase, &readiness))
+            ok = false;
         ChildRecord record;
         initialize_transport(record);
         if (ok) {
@@ -1083,6 +1212,7 @@ auto run_numa_lifecycle(int argc, char** argv) -> int {
                 static_cast<unsigned>(cleanup_observation.wait_error_valid), cleanup_observation.wait_error,
                 static_cast<unsigned>(cleanup_observation.status_valid), cleanup_observation.status,
                 static_cast<unsigned long long>(record.elapsed_ns));
+            report_ready_failure(cycle, pid, readiness);
             break;
         }
         ++completed;
