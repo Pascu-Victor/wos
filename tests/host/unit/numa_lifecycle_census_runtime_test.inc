@@ -55,6 +55,9 @@ class FdReservation;
 namespace ker::mod::sched::resource {
 class ProcessReservation;
 }
+namespace ker::syscall::vmem {
+class PendingMremapPsPolicy;
+}
 namespace ker::mod::sched::task {
 struct Task;
 }
@@ -183,6 +186,7 @@ struct Task {
     std::atomic<uint32_t> ref_count{2};
     auto credential_owner() { return this; }
     auto credentials() const { return ker::mod::security::Credentials{}; }
+    ker::syscall::vmem::PendingMremapPsPolicy* pending_mremap_ps_policies{};
 };
 }  // namespace ker::mod::sched::task
 /* @SCOPE@ */
@@ -625,6 +629,7 @@ void reset() {
     actor.cloexec = {};
     actor.pending_fd_reservations = nullptr;
     actor.pending_process_reservations = nullptr;
+    actor.pending_mremap_ps_policies = nullptr;
     ker::mod::sched::resource::population = nullptr;
     ker::mod::sched::task::native_return_tails = 0;
     ker::mod::sched::task::native_debt_arithmetic_valid = true;
@@ -711,6 +716,45 @@ void begin() {
     accept(Phase::BEGIN);
     ++now;
 }
+void mremap_policy_presence_census_case() {
+    reset();
+    check(actor.pending_mremap_ps_policies == nullptr);
+    begin();
+    check(output.totals.recovery_presence == 0);
+    check(no_shared_private_debt(plain.owner_b));
+    check(ker::test::lifecycle60::no_private_or_transient_debt(plain.owner_b));
+    check(ker::test::lifecycle60::same_baseline_debt(plain.owner_baseline, plain.owner_b));
+    check(ker::test::lifecycle60::unchanged_complete(plain.owner_baseline, plain.owner_b));
+    constexpr uint64_t POLICY_PRESENT = uint64_t{1} << 14;
+    // Presence-only opaque seed: not a constructed/acquired policy token or
+    // root suspension. The actual FD census must never dereference this head.
+    actor.pending_mremap_ps_policies = reinterpret_cast<ker::syscall::vmem::PendingMremapPsPolicy*>(&actor);
+    check(call(Phase::END) == 0);
+    check(output.header.outcome == static_cast<uint64_t>(Outcome::WAIT));
+    check(output.header.reason == static_cast<uint64_t>(Reason::PROVIDER_DEBT));
+    check(output.header.coverage == 0 && output.totals.recovery_presence == POLICY_PRESENT);
+    check(plain.owner_a.descriptors.complete && plain.owner_b.descriptors.complete);
+    check(plain.owner_a.descriptors.recovery_presence == POLICY_PRESENT && plain.owner_b.descriptors.recovery_presence == POLICY_PRESENT);
+    check(ker::test::lifecycle60::complete(plain.owner_b));
+    check(!no_shared_private_debt(plain.owner_b));
+    check(!ker::test::lifecycle60::no_private_or_transient_debt(plain.owner_b));
+    check(!ker::test::lifecycle60::same_baseline_debt(plain.owner_baseline, plain.owner_b));
+    check(!ker::test::lifecycle60::unchanged_complete(plain.owner_baseline, plain.owner_b));
+    check((session.flags & SESSION_ENDED) == 0);
+    actor.pending_mremap_ps_policies = nullptr;
+    ++now;
+    accept(Phase::END);
+    check(output.totals.recovery_presence == 0 && (session.flags & SESSION_ENDED) != 0);
+    check(no_shared_private_debt(plain.owner_b));
+    check(ker::test::lifecycle60::same_baseline_debt(plain.owner_baseline, plain.owner_b));
+    // Exercise the explicit portable-Task reset independently of the clear.
+    actor.pending_mremap_ps_policies = reinterpret_cast<ker::syscall::vmem::PendingMremapPsPolicy*>(&actor);
+    reset();
+    check(actor.pending_mremap_ps_policies == nullptr);
+    begin();
+    accept(Phase::END);
+    check(output.totals.recovery_presence == 0);
+}
 }  // namespace fixture
 int main() {
     using namespace fixture;
@@ -721,6 +765,7 @@ int main() {
     check(session.flags & SESSION_ENDED);
     check(physical_calls == 6);
     check(lock_depth == 0 && copy_pins == 0);
+    mremap_policy_presence_census_case();
     reset();
     check(!std::is_constructible_v<CurrentCensusScope, ker::mod::sched::task::Task&, uint64_t, uint64_t>);
     for (unsigned condition = 0; condition < 10; ++condition) {

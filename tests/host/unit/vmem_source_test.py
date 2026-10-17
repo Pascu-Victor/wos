@@ -1557,7 +1557,62 @@ def test_file_fixed_preparation_preserves_retained_description_and_publication()
         fail("prepared File fixed entry must remain unwired and leave mremap separate")
 
 
+def test_mremap_policy_keeps_real_ownership_and_legacy_cleanup_boundary() -> None:
+    source = SYS_VMEM_CPP.read_text()
+    public = function_body(source, "anon_mremap")
+    require_ordered_tokens(public, ["task == nullptr || task->pagemap == nullptr", "native_file_mapping_retirement.load",
+        "old_addr == 0", "align_user_vmem_size", "public_shared_file_overlap", "NEW_SIZE == OLD_SIZE",
+        "PendingMremapPsPolicy ps_policy", "NEW_SIZE < OLD_SIZE || (flags & MREMAP_MAYMOVE) != 0",
+        "ps_policy.prepare_current(*task, old_addr, old_addr + OLD_SIZE)", "anon_free(TAIL_ADDR, TAIL_SIZE)",
+        "(flags & MREMAP_MAYMOVE) == 0", "anon_allocate(", "StableUserPage src_page", "StableUserPage dst_page",
+        "auto const FREE_RESULT = anon_free(old_addr, OLD_SIZE)", "(void)anon_free(NEW_ADDR, NEW_SIZE)"],
+        "mremap policy preserves ordinary error order and old fallible cleanup gap")
+    if source.count("anon_mremap(") != 2:
+        fail("anon_mremap must retain its sole owner-free public VMEM caller")
+    prepare = function_body(source, "PendingMremapPsPolicy::prepare_current")
+    require_ordered_tokens(prepare, ["mremap_policy_current_context(actor)", "SyscallPreparationScope preparation(actor)",
+        "executor_ = &actor", "actor.pending_mremap_ps_policies = this", "RangeSplitCursor cursor{}",
+        "CurrentRangeRootAccess access{}", "PreemptGuard preempt", "SharedVmemPublicationTryGuard publication",
+        "acquire_current_range_root(actor, access)", "acquire_mremap_ps_policy(", "survey_range_chunk(",
+        "cursor.count != 0", "validate_mremap_ps_free(", "release_current_range_root(access)",
+        "if (error != huge::Error::None)", "cancel()", "kern_yield()"],
+        "actual token links before count, releases partial leases before cancellation/yield")
+    cancel = function_body(source, "PendingMremapPsPolicy::cancel")
+    require_order(cancel, "executor_ = nullptr", "release_mremap_ps_policy(key_)", "unlink before pin-only count release")
+    mm = VIRT_CPP.read_text()
+    single = function_body(mm, "publish_managed_2m_prepared")
+    require_cpp_tokens(single, ["control->ps_admission_suspensions == 0"], "single final publisher requires zero count")
+    batch = function_body(mm, "managed_batch_preflight_locked")
+    require_order(batch, "control->ps_admission_suspensions != 0", "managed_batch_add_role", "batch refuses before role mutation")
+    raw = function_body(mm, "selftest_exchange_unpublished_user_entry")
+    require_cpp_tokens(raw, ["task.pid != 0", "scheduler_published.load", "is_current_pagemap(expected_pagemap)",
+        "(replacement_raw & PRESENT_PS) == PRESENT_PS", "(expected_raw & PRESENT_PS) != PRESENT_PS",
+        "control->ps_admission_suspensions != 0"], "raw newPS rejection retains actual never-current premise")
+    acquire = function_body(mm, "acquire_mremap_ps_policy")
+    require_cpp_tokens(acquire, ["mremap_ps_access_matches", "ps_admission_suspensions != UINT64_MAX",
+        "++control->ps_admission_suspensions", "empty.incarnation = control->serial"], "actual checked count acquisition")
+    release = function_body(mm, "release_mremap_ps_policy")
+    require_ordered_tokens(release, ["owned.address_bits = owned.incarnation = 0", "find_user_root_control_locked",
+        "control->serial == serial", "control->ps_admission_suspensions == 0", "__builtin_trap()",
+        "--control->ps_admission_suspensions"], "serial-scoped idempotent release and same-serial underflow")
+    retire = function_body(mm, "retire_user_root_control_locked")
+    require_cpp_tokens(retire, ["control->ps_admission_suspensions = 0"], "retirement invalidates counts without stack traversal")
+    for path, name in [(ROOT / "modules/kern/src/syscalls_impl/process/exit.cpp", "wos_proc_exit_with_wait_status"),
+                       (THREAD_CONTROL_CPP, "wos_thread_exit_current")]:
+        body = function_body(path.read_text(), name)
+        require_ordered_tokens(body, ["cancel_fd_reservations", "cancel_mremap_ps_policies", "cancel_process_reservations"],
+                               "actual process and worker exit drain before later cleanup")
+    exe = (ROOT / "modules/kern/src/syscalls_impl/process/exec.cpp").read_text()
+    commit = function_body(exe, "commit_native_exec_image")
+    require_order(commit, "pending_mremap_ps_policies != nullptr", "prepared.view()", "native commit refuses before first image access")
+    pending = function_body(exe, "service_pending_exec_handoff")
+    require_order(pending, "pending_mremap_ps_policies != nullptr", "claim_pending_exec_handoff", "pending service refuses before claiming")
+    fd = (ROOT / "modules/kern/src/vfs/fd_reservation.cpp").read_text()
+    require_cpp_tokens(fd, ["present(14, driver.pending_mremap_ps_policies != nullptr)"], "actual full-width recovery presence")
+
+
 def main() -> None:
+    test_mremap_policy_keeps_real_ownership_and_legacy_cleanup_boundary()
     test_file_fixed_preparation_preserves_retained_description_and_publication()
     test_mixed_geometry_demotes_inside_the_existing_removal_publication()
     test_mixed_protection_preserves_preflight_and_one_publication()

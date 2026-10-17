@@ -413,6 +413,7 @@ def main() -> int:
     parser.add_argument("--fork-contract-only", action="store_true", help="run all old positive cases plus the focused fork cases and two fork controls")
     parser.add_argument("--fork-vm-coordinator-only", action="store_true", help="exercise the private actual-owner fork VM composition")
     parser.add_argument("--anonymous-remove-only", action="store_true", help="exercise unwired managed anonymous removal with the retained original positive vectors")
+    parser.add_argument("--mremap-policy-only", action="store_true", help="exercise real counted unsupported-PS mremap admission and recovery")
     parser.add_argument("--map-batch-only", action="store_true", help="exercise the unwired whole-batch mapper plus all original positive cases")
     parser.add_argument("--mixed-geometry-only", action="store_true", help="exercise prepared mixed geometry before the ordinary removal continuation")
     parser.add_argument("--mixed-protect-only", action="store_true", help="exercise prepared mixed geometry before the ordinary protection continuation")
@@ -423,7 +424,7 @@ def main() -> int:
     parser.add_argument("--gtest", type=Path)
     parser.add_argument("--output", type=Path, help="fresh directory for small logs/results; scratch is always removed")
     options = parser.parse_args()
-    selected_profiles = (options.fork_contract_only, options.fork_vm_coordinator_only, options.anonymous_remove_only, options.map_batch_only, options.mixed_geometry_only, options.mixed_protect_only, options.anonymous_fixed_only, options.file_fixed_only, options.shm_occupancy_only)
+    selected_profiles = (options.mremap_policy_only, options.fork_contract_only, options.fork_vm_coordinator_only, options.anonymous_remove_only, options.map_batch_only, options.mixed_geometry_only, options.mixed_protect_only, options.anonymous_fixed_only, options.file_fixed_only, options.shm_occupancy_only)
     if sum(selected_profiles) > 1:
         parser.error("select at most one explicit managed memory profile")
     overall_seconds = 180 if options.mixed_protect_only or options.anonymous_fixed_only or options.file_fixed_only else OVERALL_SECONDS
@@ -571,6 +572,12 @@ def main() -> int:
             import managed_huge_batch_fixture as batch_composition
             batch_fixture = batch_composition.Builder(kernel_file, support, definition, bounded)
             selected.extend(pin(path) for path in batch_fixture.inputs)
+        policy_fixture = None
+        if options.mremap_policy_only:
+            import managed_mremap_policy_fixture as policy_composition
+            policy_fixture = policy_composition.Builder(kernel_file, support, definition, bounded)
+            policy_fixture.extend_context(context)
+            selected.extend(pin(path) for path in policy_fixture.inputs)
         coordinator = None
         if options.fork_vm_coordinator_only or options.anonymous_remove_only or options.mixed_geometry_only or options.mixed_protect_only or options.anonymous_fixed_only or options.file_fixed_only or options.shm_occupancy_only:
             if options.shm_occupancy_only:
@@ -661,6 +668,8 @@ def main() -> int:
         if batch_fixture is not None:
             composite.write_text(batch_fixture.compose(composite.read_text()))
             shutil.copy2(composite, output / "actual-batch-source.cpp")
+        if policy_fixture is not None:
+            composite.write_text(policy_fixture.compose(composite.read_text()))
         segments = {
             "resolver": resolver,
             "private": private,
@@ -672,6 +681,7 @@ def main() -> int:
             "epoch": epoch,
             "adapters": adapters,
             **context_map,
+            **({"mremap_policy": policy_fixture.manifest_text} if policy_fixture is not None else {}),
             **({"batch_mapper": batch_fixture.mapper, "batch_adapter": batch_fixture.adapter} if batch_fixture is not None else {}),
         }
         if coordinator is not None:
@@ -715,7 +725,7 @@ def main() -> int:
 
         baseline_cases = CppText(composite.read_text()).gtest_cases()
         baseline_names = {case["name"] for case in baseline_cases}
-        expected_count = EXPECTED_TESTS + (coordinator.test_count if coordinator is not None else 0) + (batch_fixture.test_count if batch_fixture is not None else 0)
+        expected_count = EXPECTED_TESTS + (policy_fixture.test_count if policy_fixture is not None else 0) + (coordinator.test_count if coordinator is not None else 0) + (batch_fixture.test_count if batch_fixture is not None else 0)
         if len(baseline_names) != expected_count:
             raise RuntimeError("complete lexical GTest inventory differs from required baseline")
         (output / "baseline-case-inventory.json").write_text(json.dumps(baseline_cases, indent=2) + "\n")
@@ -776,7 +786,10 @@ def main() -> int:
             path.unlink()
 
         actual = CppText(composite.read_text())
-        if batch_fixture is not None:
+        if policy_fixture is not None:
+            for label, bad, test in policy_fixture.controls(composite.read_text()):
+                mutant(label, bad, test)
+        elif batch_fixture is not None:
             for label, bad, test in batch_fixture.controls(composite.read_text()):
                 mutant(label, bad, test)
         elif coordinator is not None:

@@ -293,8 +293,13 @@ def main():
         scope_class = capture(generated, "class CurrentCensusScope final {", True)
         public_scope = scope_class.replace("private:", "public:", 1)
         assert public_scope != scope_class
+        policy_presence = "    present(14, driver.pending_mremap_ps_policies != nullptr);"
+        assert generated.count(policy_presence) == 1
         variants = {
             "actual": generated,
+            "omit-mremap-policy-presence": generated.replace(
+                policy_presence, "    // deliberately omitted actual mremap policy presence row", 1
+            ),
             "forge-current-scope": generated.replace(scope_class, public_scope, 1),
             "omit-real-return-owner": generated.replace(
                 tail_wrapper, tail_wrapper.replace(tail_before, "    // deliberately omitted actual return owner", 1), 1

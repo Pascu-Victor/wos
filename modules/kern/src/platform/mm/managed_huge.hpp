@@ -206,6 +206,16 @@ struct CurrentRangeRootAccess {
 };
 [[nodiscard]] auto acquire_current_range_root(sched::task::Task&, CurrentRangeRootAccess& empty) noexcept -> Error;
 void release_current_range_root(CurrentRangeRootAccess&) noexcept;
+// Actual short current-root/PUB authority, not a copied-key lifetime claim.
+// Caller preinitializes all output storage before its single PreemptGuard.
+[[nodiscard]] auto acquire_mremap_ps_policy(sched::task::Task&, const sys::SyscallPreparationScope&,
+                                            const ker::syscall::vmem::SharedVmemPublicationTryGuard&, const CurrentRangeRootAccess&,
+                                            RootKey& empty) noexcept -> Error;
+[[nodiscard]] auto validate_mremap_ps_free(sched::task::Task&, const sys::SyscallPreparationScope&,
+                                           const ker::syscall::vmem::SharedVmemPublicationTryGuard&, const CurrentRangeRootAccess&,
+                                           RootKey owned, const RangeSplitCursor&) noexcept -> Error;
+// Pin-only idempotent consumption; stale serials never touch a reused root.
+void release_mremap_ps_policy(RootKey& owned) noexcept;
 // Direct current context check, never a caller-supplied authority boolean.
 [[nodiscard]] auto current_fork_context_valid(sched::task::Task&, const sys::SyscallPreparationScope&,
                                               const ker::syscall::vmem::SharedVmemPublicationGuard&) noexcept -> bool;

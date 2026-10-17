@@ -104,6 +104,8 @@ struct Task {
     uint64_t pid = 41, wake_at_us = 0;
     bool deferred_task_switch = false;
     std::atomic<void*> futex_waiter{nullptr};
+    // Nullable declaration port only; this legacy fixture has no Native owner.
+    std::atomic<void*> native_file_mapping_retirement{nullptr};
     WaitChannelKind channel = WaitChannelKind::NONE;
     uint64_t load_cpu() const { return 2; }
     void set_wait_channel(const char*, WaitChannelKind kind) { channel = kind; }
@@ -125,6 +127,7 @@ namespace ker::mod::mm::paging { constexpr uint64_t PAGE_SIZE = PAGE; }
 // Actual additive identity declaration is inserted by the extraction driver.
 /* ACTUAL_USER_FUTEX_IDENTITY */
 namespace ker::mod::sys::usercopy {
+/* ACTUAL_USERCOPY_RESULT */
 class UserAccessGuard {
  public:
     UserAccessGuard() { ++state.access; }
@@ -206,6 +209,19 @@ template<class T> bool copy_value_from_task(sched::task::Task&, uint64_t va, T& 
     if (!state.timeout_copy_ok) return false;
     std::memcpy(&value, &state.timeout, sizeof(T)); return true;
 }
+// Explicit finite legacy4K/no-additional-preparation ports for this
+// caller-order model only. No current-PROCESS, Native/TMPFS/huge or actual
+// usercopy fault/preparation qualification; generic ports remain available.
+auto copy_from_current_task_partial(sched::task::Task& task, uint64_t va, void* dst, size_t size) -> CopyResult {
+    require(dst != nullptr && size == sizeof(timespec), "finite timeout copy geometry changed");
+    if (!copy_value_from_task(task, va, *static_cast<timespec*>(dst))) {
+        return {.bytes_copied = 0, .fault = true};
+    }
+    return {.bytes_copied = size, .fault = false};
+}
+auto pin_current_task_user_page(sched::task::Task& task, uint64_t va, bool writable, StableUserPage& pin) -> bool {
+    return pin_task_user_page(task, va, writable, true, pin);
+}
 }
 namespace ker::mod::mm::virt {
 bool ensure_user_page_writable(sched::task::Task*, uint64_t va) {
@@ -244,6 +260,17 @@ void retire_task_waiter_ref(FutexWaiter* waiter) {
 }
 namespace ker::syscall::futex { namespace mod = ker::mod; }
 namespace ker::syscall::vmem {
+// Explicit PS-free admission endpoint ONLY for this pre-existing known4K
+// copy/pin-order model. No real policy/current-PROCESS or native claim.
+class PendingMremapPsPolicy {
+ public:
+ auto prepare_current(ker::mod::sched::task::Task&,uint64_t start,uint64_t end) noexcept -> int {
+  require(start==OLD && end>start,"known4K policy endpoint geometry"); return 0;
+ }
+};
+// This established anonymous4K model has no TMPFS binding. The dedicated
+// policy fixture executes the real admission gates separately.
+auto public_shared_file_overlap(ker::mod::sched::task::Task&,uint64_t,uint64_t) -> bool { return false; }
 constexpr uint64_t USER_SPACE_END = 0x00007FFFFFFFFFFFULL, MREMAP_MAYMOVE = 1;
 auto get_current_task() -> ker::mod::sched::task::Task* {
     fake_task.pagemap = state.root ? reinterpret_cast<void*>(uintptr_t{0x123000}) : nullptr;
@@ -434,7 +461,10 @@ def main():
     integer_hash = function(hash_source, "struct IntHash {") + ";"
     identity_source = (ROOT / "modules/kern/src/platform/mm/virt.hpp").read_text()
     identity = function(identity_source, "struct UserFutexIdentity {") + ";"
-    prelude = PRELUDE.replace("/* ACTUAL_USER_FUTEX_IDENTITY */",
+    usercopy_source = (ROOT / "modules/kern/src/platform/sys/usercopy.hpp").read_text()
+    copy_result = function(usercopy_source, "struct CopyResult {") + ";"
+    prelude = PRELUDE.replace("/* ACTUAL_USERCOPY_RESULT */", copy_result)
+    prelude = prelude.replace("/* ACTUAL_USER_FUTEX_IDENTITY */",
                              "namespace ker::mod::mm::virt { using vaddr_t=uint64_t; using paddr_t=uint64_t;\n" + identity + "\n}")
     prelude = prelude.replace("/* ACTUAL_FUTEX_KEY_HELPERS */",
                              "namespace ker::util {\n" + integer_hash + "\n}\n"
@@ -442,7 +472,9 @@ def main():
     print(json.dumps({"actual_key_helper_sha256": [hashlib.sha256(body.encode()).hexdigest() for body in key_bodies],
                       "key_helper_source_sha256": hashlib.sha256(key_source.encode()).hexdigest(),
                       "actual_integer_hash_sha256": hashlib.sha256(integer_hash.encode()).hexdigest(),
-                      "actual_identity_declaration_sha256": hashlib.sha256(identity.encode()).hexdigest()}, sort_keys=True))
+                      "actual_identity_declaration_sha256": hashlib.sha256(identity.encode()).hexdigest(),
+                      "actual_copy_result_declaration_sha256": hashlib.sha256(copy_result.encode()).hexdigest(),
+                      "usercopy_declaration_source_sha256": hashlib.sha256(usercopy_source.encode()).hexdigest()}, sort_keys=True))
     code = (prelude + "\nnamespace ker::syscall::futex {\n" + futex_bodies + "\n}\n"
             + "\nnamespace ker::syscall::vmem {\n" + extracted[-1][1] + "\n}\n" + CASES)
     with tempfile.TemporaryDirectory(prefix="wos-caller-pin-order-") as folder:

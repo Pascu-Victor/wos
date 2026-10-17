@@ -450,6 +450,7 @@ UNIT_TESTS=(
     lazy_vmem_staging_runtime_test
     managed_anonymous_remove_runtime_test
     managed_huge_batch_runtime_test
+    managed_mremap_policy_runtime_test
     managed_mixed_geometry_runtime_test
     managed_mixed_protect_runtime_test
     managed_anonymous_fixed_runtime_test

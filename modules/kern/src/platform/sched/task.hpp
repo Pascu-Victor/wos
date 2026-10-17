@@ -74,6 +74,10 @@ struct ElfFileView;
 struct ElfLoadOptions;
 }  // namespace ker::loader::elf
 
+namespace ker::syscall::vmem {
+class PendingMremapPsPolicy;
+}
+
 namespace ker::syscall::process {
 class PendingSignalTarget;
 class PreparedNativeExecImage;
@@ -1530,6 +1534,11 @@ struct Task {
     // Absolute tail: every preceding Task/assembly member offset is preserved.
     mutable sys::Spinlock m_memory_policy_lock{};
     mm::numa::Policy m_memory_policy{};
+
+   public:
+    // Absolute data tail: preserve every preceding Task/assembly member offset.
+    // Only this executor mutates these stack-backed policy recovery nodes.
+    ker::syscall::vmem::PendingMremapPsPolicy* pending_mremap_ps_policies{};
 };
 
 [[nodiscard]] inline auto process_pid(const Task& task) -> uint64_t { return task.owner_pid != 0 ? task.owner_pid : task.pid; }

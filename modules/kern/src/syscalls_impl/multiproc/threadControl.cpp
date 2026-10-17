@@ -141,6 +141,7 @@ void release_thread_fd_refs(mod::sched::task::Task* task) {
     mod::debug::ptrace::cleanup_operations(*task);
     task->jobctl_membership.detach();
     ker::vfs::cancel_fd_reservations(*task);
+    ker::syscall::vmem::cancel_mremap_ps_policies(*task);
     mod::sched::resource::cancel_process_reservations(*task);
     ker::syscall::log::sys_log_cleanup_for_task(task);
     release_thread_fd_refs(task);

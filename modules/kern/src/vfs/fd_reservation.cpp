@@ -238,6 +238,7 @@ void FdReservation::collect_selftest(mod::sched::task::Task& driver, uint64_t co
     present(11, driver.pending_wki_filesystems != nullptr);
     present(12, driver.pending_fd_reservations != nullptr);
     present(13, driver.pending_process_reservations != nullptr);
+    present(14, driver.pending_mremap_ps_policies != nullptr);
 }
 
 auto selftest_fd_census_parked(const ker::test::lifecycle60::CensusLease& lease) -> SelftestFdCensus {

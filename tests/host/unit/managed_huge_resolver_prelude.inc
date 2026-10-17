@@ -86,6 +86,7 @@ constexpr size_t USER_PAGEMAP_ACCESS_GATE_NONE = SIZE_MAX;
 auto& managed_huge_registry = ::huge_core;
 struct HostRootControl {
     uint64_t serial{}, ps_geometry_epoch{1};
+    uint64_t ps_admission_suspensions{};  // Actual308 counter declaration; finite root lookup remains a Host port.
 };
 HostRootControl host_root_control;
 HostRootControl host_child_control{23, 1};

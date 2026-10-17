@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <platform/mm/managed_huge_core.hpp>
 #include <platform/mm/paging.hpp>
 
 namespace ker::mod::sched::task {
@@ -62,6 +63,30 @@ class SharedVmemPublicationTryGuard {
    private:
     bool acquired_{};
 };
+
+// Counted PS-publication policy only, never root/Task lifetime ownership.
+// prepare_current is reached solely from the owner-free public MREMAP entry.
+// No borrowed preparation/PUB/root access survives that method or a yield.
+class PendingMremapPsPolicy {
+   public:
+    PendingMremapPsPolicy() noexcept;
+    ~PendingMremapPsPolicy() noexcept;
+    PendingMremapPsPolicy(const PendingMremapPsPolicy&) = delete;
+    PendingMremapPsPolicy(PendingMremapPsPolicy&&) = delete;
+    auto operator=(const PendingMremapPsPolicy&) -> PendingMremapPsPolicy& = delete;
+    auto operator=(PendingMremapPsPolicy&&) -> PendingMremapPsPolicy& = delete;
+    [[nodiscard]] auto prepare_current(ker::mod::sched::task::Task&, uint64_t start, uint64_t end) noexcept -> int;
+    void cancel() noexcept;
+
+   private:
+    // Non-owning executor identity/linkage, exactly like pending FD owners.
+    ker::mod::sched::task::Task* executor_{};
+    PendingMremapPsPolicy* previous_{};
+    PendingMremapPsPolicy* next_{};
+    ker::mod::mm::huge::RootKey key_{};
+};
+// Current executor only, before noreturn exit discards its kernel stack.
+void cancel_mremap_ps_policies(ker::mod::sched::task::Task&) noexcept;
 
 // Prepare outside publication. Owns exact parent binding snapshots and fresh
 // unbound child bindings; destroy only after the publication guard has ended.

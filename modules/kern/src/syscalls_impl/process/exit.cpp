@@ -280,6 +280,7 @@ namespace {
     ker::mod::debug::ptrace::cleanup_operations(*current_task);
     cancel_pending_exec_handoff(*current_task);
     ker::vfs::cancel_fd_reservations(*current_task);
+    ker::syscall::vmem::cancel_mremap_ps_policies(*current_task);
     ker::mod::sched::resource::cancel_process_reservations(*current_task);
     ker::syscall::log::sys_log_cleanup_for_task(current_task);
 

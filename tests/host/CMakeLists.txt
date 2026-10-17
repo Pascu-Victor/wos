@@ -341,6 +341,11 @@ add_test(NAME managed_anonymous_remove_runtime_test
         --host-build ${CMAKE_BINARY_DIR} --anonymous-remove-only
         --gtest-main $<TARGET_FILE:gtest_main> --gtest $<TARGET_FILE:gtest>)
 set_tests_properties(managed_anonymous_remove_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 150)
+add_test(NAME managed_mremap_policy_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/managed_huge_runtime_test.py
+        --host-build ${CMAKE_BINARY_DIR} --mremap-policy-only
+        --gtest-main $<TARGET_FILE:gtest_main> --gtest $<TARGET_FILE:gtest>)
+set_tests_properties(managed_mremap_policy_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 150)
 add_test(NAME managed_huge_batch_runtime_test
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/managed_huge_runtime_test.py
         --host-build ${CMAKE_BINARY_DIR} --map-batch-only

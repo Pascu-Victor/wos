@@ -5219,6 +5219,88 @@ void release_file_mmap_ranges_for_pagemap(ker::mod::mm::paging::PageTable* pagem
     }
 }
 
+namespace {
+auto mremap_policy_current_context(ker::mod::sched::task::Task& actor) noexcept -> bool {
+    using namespace ker::mod;
+    return sched::can_query_current_task() && sched::get_current_task() == &actor && actor.type == sched::task::TaskType::PROCESS &&
+           actor.state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE &&
+           !actor.scheduler_transition_active.load(std::memory_order_acquire) && !actor.exit_in_progress.load(std::memory_order_acquire) &&
+           actor.syscall_account_start_us != 0 && sched::preempt_count() == 0;
+}
+}  // namespace
+
+PendingMremapPsPolicy::PendingMremapPsPolicy() noexcept = default;
+PendingMremapPsPolicy::~PendingMremapPsPolicy() noexcept { cancel(); }
+
+void PendingMremapPsPolicy::cancel() noexcept {
+    if (executor_ != nullptr) {
+        if (previous_ != nullptr)
+            previous_->next_ = next_;
+        else
+            executor_->pending_mremap_ps_policies = next_;
+        if (next_ != nullptr) next_->previous_ = previous_;
+        executor_ = nullptr;
+        previous_ = next_ = nullptr;
+    }
+    ker::mod::mm::huge::detail::release_mremap_ps_policy(key_);
+}
+
+void cancel_mremap_ps_policies(ker::mod::sched::task::Task& executor) noexcept {
+    while (executor.pending_mremap_ps_policies != nullptr) executor.pending_mremap_ps_policies->cancel();
+}
+
+auto PendingMremapPsPolicy::prepare_current(ker::mod::sched::task::Task& actor, uint64_t start, uint64_t end) noexcept -> int {
+    namespace huge = ker::mod::mm::huge;
+    namespace sched = ker::mod::sched;
+    if (executor_ != nullptr || key_.address_bits != 0 || key_.incarnation != 0 || !mremap_policy_current_context(actor)) return -EAGAIN;
+    // Sole production caller: anon_mremap, directly from the owner-free public
+    // VMEM dispatch. Context checks alone are NOT proof of absent root/PUB owners.
+    ker::mod::sys::SyscallPreparationScope preparation(actor);
+    if (!preparation.ready() || !mremap_policy_current_context(actor) || !sched::interrupts_enabled()) return -EAGAIN;
+    // Register even the empty acquisition node before a count can escape.
+    executor_ = &actor;
+    next_ = actor.pending_mremap_ps_policies;
+    if (next_ != nullptr) next_->previous_ = this;
+    actor.pending_mremap_ps_policies = this;
+    huge::RangeSplitCursor cursor{};
+    cursor.start = start;
+    cursor.end = end;
+    while (!cursor.complete) {
+        if (!mremap_policy_current_context(actor) || !sched::interrupts_enabled()) {
+            cancel();
+            return -EAGAIN;
+        }
+        huge::Error error = huge::Error::Again;
+        {
+            // Instrumented caller output exists before preemption/PUB/MM owners.
+            huge::detail::CurrentRangeRootAccess access{};
+            sched::PreemptGuard preempt;
+            SharedVmemPublicationTryGuard publication;
+            if (publication.acquired()) {
+                error = huge::detail::acquire_current_range_root(actor, access);
+                if (error == huge::Error::None && key_.incarnation == 0)
+                    error = huge::detail::acquire_mremap_ps_policy(actor, preparation, publication, access, key_);
+                if (error == huge::Error::None && key_.address_bits != reinterpret_cast<uint64_t>(access.root)) error = huge::Error::Stale;
+                if (error == huge::Error::None)
+                    error = huge::detail::survey_range_chunk(access.root, cursor, huge::RangeSurveyMode::Count, nullptr);
+                if (error == huge::Error::None && cursor.count != 0) error = huge::Error::Unsupported;
+                if (error == huge::Error::None && cursor.complete)
+                    error = huge::detail::validate_mremap_ps_free(actor, preparation, publication, access, key_, cursor);
+                // Includes successful local acquisition followed by any refusal.
+                huge::detail::release_current_range_root(access);
+            }
+        }
+        // No Task/root/PUB/IRQ-off/preempt owner or mapping pointer survives a yield.
+        if (error != huge::Error::None) {
+            cancel();
+            return error == huge::Error::Unsupported ? -EOPNOTSUPP : -EAGAIN;
+        }
+        if (!cursor.complete) sched::kern_yield();
+    }
+    // Local preparation restores incoming IF before the ordinary4K body.
+    return 0;
+}
+
 auto anon_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size, uint64_t flags) -> uint64_t {
     auto* task = get_current_task();
     if (task == nullptr || task->pagemap == nullptr) {
@@ -5244,6 +5326,13 @@ auto anon_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size, uint64
 
     if (NEW_SIZE == OLD_SIZE) {
         return old_addr;
+    }
+    // Policy owns no root lifetime. Grow without MAYMOVE retains its old ENOMEM
+    // branch without acquisition; shrink surveys the full old interval.
+    PendingMremapPsPolicy ps_policy;
+    if (NEW_SIZE < OLD_SIZE || (flags & MREMAP_MAYMOVE) != 0) {
+        int const POLICY_RESULT = ps_policy.prepare_current(*task, old_addr, old_addr + OLD_SIZE);
+        if (POLICY_RESULT != 0) return static_cast<uint64_t>(POLICY_RESULT);
     }
     if (NEW_SIZE < OLD_SIZE) {
         uint64_t const TAIL_ADDR = old_addr + NEW_SIZE;

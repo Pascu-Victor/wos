@@ -356,7 +356,7 @@ constinit huge::RegistryCore managed_huge_registry{};
 // Exact root associations use the same lock as pinned mapping snapshots. Only
 // copied serials escape; queued futexes never retain a control or root reader.
 constexpr size_t USER_ROOT_CONTROL_BUCKET_COUNT = 256;
-constexpr size_t USER_ROOT_CONTROLS_PER_PAGE = 84;
+constexpr size_t USER_ROOT_CONTROLS_PER_PAGE = 72;
 struct UserRootControlChunk;
 struct UserRootControl {
     PageTable* root{};
@@ -364,9 +364,10 @@ struct UserRootControl {
     UserRootControl* hash_next{};
     UserRootControl* free_next{};
     UserRootControlChunk* chunk{};
-    uint64_t ps_geometry_epoch{};  // Pin-locked, sticky saturation; zero only while unattached.
+    uint64_t ps_geometry_epoch{};         // Pin-locked, sticky saturation; zero only while unattached.
+    uint64_t ps_admission_suspensions{};  // Non-owning root policy, pin-locked.
 };
-static_assert(sizeof(UserRootControl) == 48);
+static_assert(sizeof(UserRootControl) == 56);
 struct UserRootControlChunk {
     UserRootControlChunk* available_next{};
     UserRootControl* free_list{};
@@ -3815,6 +3816,7 @@ auto attach_user_root_control_locked(PageTable* root, UserRootControlChunk*& spa
     control->root = root;
     control->serial = serial;
     control->ps_geometry_epoch = 1;
+    control->ps_admission_suspensions = 0;
     control->free_next = nullptr;
     auto& bucket = user_root_control_buckets[user_root_control_bucket(root)];
     control->hash_next = bucket;
@@ -4059,6 +4061,7 @@ auto retire_user_root_control_locked(PageTable* root, UserRootControlChunk*& emp
     control->root = nullptr;
     control->serial = 0;
     control->ps_geometry_epoch = 0;
+    control->ps_admission_suspensions = 0;  // Invalidate tokens without waiting or retaining their nodes.
     control->hash_next = nullptr;
     control->free_next = chunk->free_list;
     chunk->free_list = control;
@@ -4841,7 +4844,9 @@ auto bind_preallocated_cleanup_split(PageTable* root, uint64_t va, huge::Prepare
         PageTable* table = root;
         MutableUserEntrySlot slots[3];
         uint64_t expected[3]{};
-        bool valid = managed_root_matches_locked(key) && managed_huge_registry.validate_preparing(view.handle, leaf, view.actual);
+        auto const* control = find_user_root_control_locked(root);
+        bool valid = managed_root_matches_locked(key) && control != nullptr && control->ps_admission_suspensions == 0 &&
+                     managed_huge_registry.validate_preparing(view.handle, leaf, view.actual);
         uint16_t next = 0;
         for (int level = 4; valid && level >= 2; --level) {
             auto const i = static_cast<size_t>(4 - level);
@@ -4969,6 +4974,7 @@ auto managed_batch_preflight_locked(PageTable* root, huge::detail::HugeMapBatchS
     constexpr uint64_t PARENT_ALLOWED = PTE_FRAME_MASK | uint64_t{0x7f} | paging::PAGE_NX;
     if (!managed_root_matches_locked(batch.root)) return huge::Error::Stale;
     auto const* control = find_user_root_control_locked(root);
+    if (control != nullptr && control->ps_admission_suspensions != 0) return huge::Error::Again;
     if (control == nullptr || control->ps_geometry_epoch == UINT64_MAX) return huge::Error::GenerationExhausted;
     if (!managed_batch_add_role(batch, reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<uint64_t>(root))),
                                 huge::detail::HugeMapTableRole::Ancestor, 4, 0))
@@ -6659,6 +6665,10 @@ auto selftest_exchange_unpublished_user_entry(sched::task::Task& task, PageTable
     PageTable* table = expected_pagemap;
     auto const* control = find_user_root_control_locked(expected_pagemap);
     bool valid_path = level < 2 || (control != nullptr && control->serial != 0 && control->ps_geometry_epoch != 0);
+    constexpr uint64_t PRESENT_PS = paging::PAGE_PRESENT | (uint64_t{1} << 7);
+    bool const NEW_PS =
+        (level == 2 || level == 3) && (replacement_raw & PRESENT_PS) == PRESENT_PS && (expected_raw & PRESENT_PS) != PRESENT_PS;
+    if (NEW_PS && control != nullptr && control->ps_admission_suspensions != 0) valid_path = false;
     for (unsigned current = 4; current > level; --current) {
         PageTableEntry& entry = entry_at(table, index_of(vaddr, static_cast<int>(current)));
         if (entry.present == 0 || entry.user == 0 || (current < 4 && entry.pagesize != 0)) {
@@ -11893,6 +11903,81 @@ void release_current_range_root(CurrentRangeRootAccess& access) noexcept {
     access.root = nullptr;
     access.subject = nullptr;
 }
+namespace {
+auto mremap_ps_access_matches(sched::task::Task& subject, const sys::SyscallPreparationScope& preparation,
+                              const ker::syscall::vmem::SharedVmemPublicationTryGuard& publication,
+                              const CurrentRangeRootAccess& access) noexcept -> bool {
+    return preparation.ready() && publication.acquired() && sched::can_query_current_task() && sched::get_current_task() == &subject &&
+           subject.type == sched::task::TaskType::PROCESS &&
+           subject.state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE &&
+           !subject.scheduler_transition_active.load(std::memory_order_acquire) &&
+           !subject.exit_in_progress.load(std::memory_order_acquire) && subject.syscall_account_start_us != 0 &&
+           sched::preempt_count() == 1 && sched::interrupts_enabled() && access.subject == &subject && access.local &&
+           access.root != nullptr && access.root == subject.pagemap && access.root != virt::kernel_pagemap &&
+           access.gate != virt::USER_PAGEMAP_ACCESS_GATE_NONE;
+}
+}  // namespace
+
+auto acquire_mremap_ps_policy(sched::task::Task& subject, const sys::SyscallPreparationScope& preparation,
+                              const ker::syscall::vmem::SharedVmemPublicationTryGuard& publication, const CurrentRangeRootAccess& access,
+                              RootKey& empty) noexcept -> Error {
+    if (empty.address_bits != 0 || empty.incarnation != 0 || !mremap_ps_access_matches(subject, preparation, publication, access))
+        return Error::Again;
+    uint64_t const cow = virt::cow_pte_lock.lock_irqsave();
+    uint64_t const pin = virt::user_mapping_pin_lock.lock_irqsave();
+    auto* control = virt::find_user_root_control_locked(access.root);
+    Error error = Error::Again;
+    if (control != nullptr && control->serial != 0 && control->ps_geometry_epoch != 0 && control->ps_geometry_epoch != UINT64_MAX &&
+        control->ps_admission_suspensions != UINT64_MAX) {
+        ++control->ps_admission_suspensions;
+        // The executor node already exists; ownership is recorded before unlock.
+        empty.address_bits = reinterpret_cast<uint64_t>(access.root);
+        empty.incarnation = control->serial;
+        error = Error::None;
+    }
+    virt::user_mapping_pin_lock.unlock_irqrestore(pin);
+    virt::cow_pte_lock.unlock_irqrestore(cow);
+    return error;
+}
+
+auto validate_mremap_ps_free(sched::task::Task& subject, const sys::SyscallPreparationScope& preparation,
+                             const ker::syscall::vmem::SharedVmemPublicationTryGuard& publication, const CurrentRangeRootAccess& access,
+                             RootKey owned, const RangeSplitCursor& cursor) noexcept -> Error {
+    constexpr uint64_t LIMIT = uint64_t{1} << 47;
+    if (!mremap_ps_access_matches(subject, preparation, publication, access) || !RegistryCore::valid_root(owned) ||
+        owned.address_bits != reinterpret_cast<uint64_t>(access.root) || !cursor.started || !cursor.complete || cursor.epoch_changed ||
+        cursor.count != 0 || cursor.start >= cursor.end || cursor.end > LIMIT || ((cursor.start | cursor.end) & (PAGE_BYTES - 1)) != 0 ||
+        cursor.next != ((cursor.end + LEAF_BYTES - 1) & ~(LEAF_BYTES - 1)) || !RegistryCore::same_root(cursor.stamp.root, owned))
+        return Error::Again;
+    uint64_t const cow = virt::cow_pte_lock.lock_irqsave();
+    uint64_t const pin = virt::user_mapping_pin_lock.lock_irqsave();
+    auto const* control = virt::find_user_root_control_locked(access.root);
+    Error const error = control != nullptr && control->serial == owned.incarnation && control->ps_admission_suspensions != 0 &&
+                                control->ps_geometry_epoch != 0 && control->ps_geometry_epoch != UINT64_MAX &&
+                                control->ps_geometry_epoch == cursor.stamp.epoch
+                            ? Error::None
+                            : Error::Again;
+    virt::user_mapping_pin_lock.unlock_irqrestore(pin);
+    virt::cow_pte_lock.unlock_irqrestore(cow);
+    return error;
+}
+
+void release_mremap_ps_policy(RootKey& owned) noexcept {
+    if (owned.address_bits == 0 && owned.incarnation == 0) return;
+    if (!RegistryCore::valid_root(owned)) __builtin_trap();
+    uint64_t const pin = virt::user_mapping_pin_lock.lock_irqsave();
+    uint64_t const address = owned.address_bits;
+    uint64_t const serial = owned.incarnation;
+    owned.address_bits = owned.incarnation = 0;
+    // Address bits are lookup identity only; never dereference a retired root.
+    auto* control = virt::find_user_root_control_locked(reinterpret_cast<paging::PageTable*>(address));
+    if (control != nullptr && control->serial == serial) {
+        if (control->ps_admission_suspensions == 0) __builtin_trap();
+        --control->ps_admission_suspensions;
+    }
+    virt::user_mapping_pin_lock.unlock_irqrestore(pin);
+}
+
 auto survey_range_chunk(paging::PageTable* root, RangeSplitCursor& cursor, RangeSurveyMode mode, SplitPlanStorage* storage) noexcept
     -> Error {
     uint64_t const cow = virt::cow_pte_lock.lock_irqsave();

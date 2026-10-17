@@ -2429,6 +2429,8 @@ auto prepare_native_exec_quiescence(ker::mod::sched::task::Task& task, PreparedN
 // An asynchronous owner handoff also requires executor quiescence and tracked
 // cancellation/fatal-exit ownership; prepared storage alone is insufficient.
 auto commit_native_exec_image(ker::mod::sched::task::Task* task, PreparedNativeExecImage& prepared) -> int {
+    // A failed/reentrant exec must preserve the caller's old-root restriction.
+    if (task->pending_mremap_ps_policies != nullptr) return -EAGAIN;
     using namespace ker::mod;
     auto const& image = prepared.view();
     auto& retired = prepared.retired();
@@ -7674,7 +7676,7 @@ void service_pending_exec_handoff() {
     using namespace ker::mod;
     auto* owner = sched::get_current_task();
     if (owner == nullptr || owner->is_thread || owner->exit_in_progress.load(std::memory_order_acquire) ||
-        owner->exec_preparation_teardown_in_progress.load(std::memory_order_acquire))
+        owner->exec_preparation_teardown_in_progress.load(std::memory_order_acquire) || owner->pending_mremap_ps_policies != nullptr)
         return;
     auto* handoff = claim_pending_exec_handoff(*owner);
     if (handoff == nullptr) return;

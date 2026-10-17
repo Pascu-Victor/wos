@@ -37,7 +37,7 @@ KERN = ROOT / "modules/kern/src"
 SOURCE = KERN / "syscalls_impl/futex/futex.cpp"
 KERNEL_OVERLAY = None
 VECTORS = [
-    "root_capacity_84_85",
+    "root_capacity_72_73",
     "root_geometry_epoch_reuse",
     "roots_4097",
     "roots_1000",
@@ -353,26 +353,27 @@ def dependency_pins(depfile: Path) -> list[dict]:
 
 
 RANGE_CONTROL_CASES = r"""
-void root_capacity_84_85() {
- static_assert(sizeof(virt::UserRootControl) == 48);
- static_assert(virt::USER_ROOT_CONTROLS_PER_PAGE == 84);
+void root_capacity_72_73() {
+ static_assert(sizeof(virt::UserRootControl) == 56);
+ static_assert(virt::USER_ROOT_CONTROLS_PER_PAGE == 72);
  static_assert(sizeof(virt::UserRootControlChunk) == 4056);
  std::vector<virt::PageTable*> roots;
- for (unsigned i=0;i<85;++i) {
+ for (unsigned i=0;i<73;++i) {
   auto* root=virt::create_pagemap_may_fail(); check(root!=nullptr,"real root admitted");
   if (!root) break; roots.push_back(root);
   auto view=stats(); check(view.active_roots==i+1,"actual root denominator");
-  if (i==83) check(view.control_pages==1,"84 actual controls occupy one page");
-  if (i==84) check(view.control_pages==2,"85th actual root needs second metadata page");
+  if (i==71) check(view.control_pages==1,"72 actual controls occupy one page");
+  if (i==72) check(view.control_pages==2,"73rd actual root needs second metadata page");
  }
  for (auto* root:roots) virt::release_pagemap(root,0);
- check(stats().active_roots==0&&stats().control_pages==0,"all 85 exact roots and metadata owners return");
+ check(stats().active_roots==0&&stats().control_pages==0,"all 73 exact roots and metadata owners return");
 }
 void root_geometry_epoch_reuse() {
  OwnedRoot owner; auto* root=owner.root; auto old_serial=serial(root);
  auto flags=virt::user_mapping_pin_lock.lock_irqsave();
  auto* control=virt::find_user_root_control_locked(root);
  check(control&&control->ps_geometry_epoch==1,"fresh actual root begins epoch1");
+ control->ps_admission_suspensions=3; // Declared count seed: actual retirement must invalidate it without waiting.
  virt::advance_ps_geometry_epoch_locked(root);
  check(control->ps_geometry_epoch==2,"actual geometry writer advances");
  control->ps_geometry_epoch=UINT64_MAX-1;
@@ -385,6 +386,7 @@ void root_geometry_epoch_reuse() {
  flags=virt::user_mapping_pin_lock.lock_irqsave();
  control=virt::find_user_root_control_locked(replacement.root);
  check(control&&control->ps_geometry_epoch==1,"new incarnation resets epoch without reviving old proof");
+ check(control&&control->ps_admission_suspensions==0,"actual retirement/re-attach resets policy count for the new serial");
  virt::user_mapping_pin_lock.unlock_irqrestore(flags);
 }
 """
@@ -658,7 +660,7 @@ def generate(scratch: Path, selected: Path) -> list[dict]:
     cases = CASES.replace("void all_drained(){", MANAGED_CASES + RANGE_CONTROL_CASES + "\nvoid all_drained(){")
     cases = cases.replace(
         "RUN(roots_4097)",
-        "RUN(root_capacity_84_85)RUN(root_geometry_epoch_reuse)RUN(resolver_unknown_ps)RUN(current_leaf_write_commit)RUN(roots_4097)",
+        "RUN(root_capacity_72_73)RUN(root_geometry_epoch_reuse)RUN(resolver_unknown_ps)RUN(current_leaf_write_commit)RUN(roots_4097)",
         1,
     )
     text = (
