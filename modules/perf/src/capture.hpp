@@ -41,4 +41,12 @@ auto drain_capture(int fd, CaptureReceipt& receipt) -> bool;
 void finish_capture(int fd, CaptureReceipt& receipt);
 auto write_capture_receipt(int fd, CaptureReceipt& receipt) -> bool;
 
+// Record-only live service. Existing run/snapshot drains keep their API.
+enum class CaptureDrainResult : uint8_t { EMPTY, FULL, ERROR, DEADLINE };
+inline constexpr uint64_t CAPTURE_QUANTUM_READ_LIMIT = 32;
+inline constexpr uint64_t CAPTURE_QUANTUM_BYTE_LIMIT = 2 * 1024 * 1024;
+[[nodiscard]] auto capture_record_clock() -> std::optional<int64_t>;
+auto check_record_capture(CaptureReceipt& receipt, bool enabled, CaptureStatus* observed = nullptr) -> bool;
+auto drain_capture_quantum(int fd, CaptureReceipt& receipt, int64_t deadline_ns) -> CaptureDrainResult;
+
 }  // namespace perf

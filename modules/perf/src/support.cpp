@@ -881,78 +881,185 @@ void cmd_stat(int ms) {
     }
 }
 
+namespace {
+
+class RecordProcCursor {
+   public:
+    [[nodiscard]] auto done() const -> bool { return done_; }
+    [[nodiscard]] auto failed() const -> bool { return failed_; }
+
+    auto step() -> std::optional<StatInfo> {
+        if (done_) return std::nullopt;
+        if (!processes_.valid()) {
+            processes_.reset(opendir("/proc"));
+            if (!processes_.valid()) {
+                done_ = true;
+                failed_ = true;
+                return std::nullopt;
+            }
+        }
+        if (!process_.empty()) {
+            if (tasks_.valid()) {
+                auto const* entry = readdir(tasks_.get());
+                if (entry != nullptr) {
+                    std::string_view const TID{&entry->d_name[0]};
+                    auto stat = is_all_digits(TID) ? read_stat(build_proc_task_path(process_, TID, PROC_STAT_SUFFIX)) : std::nullopt;
+                    emitted_task_ = emitted_task_ || stat.has_value();
+                    return stat;
+                }
+                tasks_.reset();
+            }
+            auto fallback = !emitted_task_ ? read_stat(build_proc_path(process_, PROC_STAT_SUFFIX)) : std::nullopt;
+            process_.clear();
+            return fallback;
+        }
+        errno = 0;
+        auto const* entry = readdir(processes_.get());
+        if (entry == nullptr) {
+            failed_ = errno != 0;
+            processes_.reset();
+            done_ = true;
+            return std::nullopt;
+        }
+        std::string_view const NAME{&entry->d_name[0]};
+        if (is_all_digits(NAME)) {
+            process_ = NAME;
+            emitted_task_ = false;
+            tasks_.reset(opendir(build_proc_path(process_, PROC_TASK_SUFFIX).c_str()));
+        }
+        return std::nullopt;
+    }
+
+   private:
+    static auto read_stat(std::string_view path) -> std::optional<StatInfo> {
+        auto text = read_file(path, PROC_READ_CAPACITY);
+        StatInfo stat{};
+        return text && parse_stat(*text, stat) ? std::optional<StatInfo>{std::move(stat)} : std::nullopt;
+    }
+    ScopedDir processes_;
+    ScopedDir tasks_;
+    std::string process_;
+    bool emitted_task_{};
+    bool done_{};
+    bool failed_{};
+};
+
+template <typename Service>
+auto update_record_tracked(std::vector<TrackedProc>& tracked, const StatInfo& stat, Service& service) -> bool {
+    auto found = std::ranges::find_if(tracked, [&](const TrackedProc& proc) { return proc.pid == stat.pid; });
+    bool const NEW = found == tracked.end();
+    if (NEW) {
+        tracked.push_back(TrackedProc{.pid = stat.pid, .comm = stat.comm, .cmdline = {}, .image_map = {}});
+        found = tracked.end() - 1;
+    } else {
+        found->comm = stat.comm;
+    }
+    if (!service()) return false;
+    auto images = read_proc_images(stat.pid);
+    if (!images.empty()) found->image_map = std::move(images);
+    if (!service()) return false;
+    if (NEW) {
+        if (!service()) return false;
+        found->cmdline = read_cmdline(stat.pid);
+        if (!service()) return false;
+    }
+    return true;
+}
+
+auto sleep_record_slice(CaptureReceipt& capture, int64_t deadline_ns) -> bool {
+    auto now = capture_record_clock();
+    if (!now) {
+        capture.read_failed = true;
+        return false;
+    }
+    if (*now >= deadline_ns) return false;
+    timespec const DELAY{.tv_sec = 0, .tv_nsec = std::min(deadline_ns - *now, SLEEP_SLICE_MS * NANOSECONDS_PER_MILLISECOND)};
+    if (nanosleep(&DELAY, nullptr) != 0 && errno != EINTR) {
+        capture.read_failed = true;
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
 auto cmd_record(int ms, const char* filter, bool structured) -> bool {
     if (ms < 1) {
         ms = DEFAULT_SAMPLE_MS;
     }
 
+    ScopedFd data_fd = open_write_trunc(PERF_DATA_FILE);
+    if (!data_fd.valid() || !write_section_timebase(data_fd.get()) || !write_all(data_fd.get(), SECTION_EVENTS)) {
+        std::println("perf: cannot write {}", PERF_DATA_FILE);
+        return false;
+    }
+
+    // Track all processes seen during recording so short-lived ones
+    // that exit before the final proc-map snapshot are still resolved.
+    std::vector<TrackedProc> tracked;
+    auto initial_service = [] { return true; };
+    // Initial output and complete survey precede enable and the duration epoch.
+    RecordProcCursor initial;
+    while (!initial.done()) {
+        auto stat = initial.step();
+        if (stat) (void)update_record_tracked(tracked, *stat, initial_service);
+    }
+    if (initial.failed()) {
+        std::println("perf: cannot survey /proc");
+        return false;
+    }
+
+    auto const START = capture_record_clock();
+    int64_t const DURATION_NS = static_cast<int64_t>(ms) * NANOSECONDS_PER_MILLISECOND;
+    if (!START || *START > std::numeric_limits<int64_t>::max() - DURATION_NS) {
+        std::println("perf: cannot set recording deadline");
+        return false;
+    }
+    int64_t const DEADLINE_NS = *START + DURATION_NS;
     auto capture = begin_capture(filter);
     if (capture.control_failed) {
         std::println("perf: cannot enable /proc/kperfctl");
         return false;
     }
     std::println("perf: recording with filter '{}' for {} ms...", capture.requested_filter, ms);
-
-    ScopedFd data_fd = open_write_trunc(PERF_DATA_FILE);
-    if (data_fd.valid()) {
-        capture.write_failed = !write_section_timebase(data_fd.get());
-        capture.write_failed = !write_all(data_fd.get(), SECTION_EVENTS) || capture.write_failed;
-    }
-
-    // Track all processes seen during recording so short-lived ones
-    // that exit before the final proc-map snapshot are still resolved.
-    std::vector<TrackedProc> tracked;
-    auto upsert_tracked = [&](const StatInfo& stat) {
-        std::string image_map = read_proc_images(stat.pid);
-        for (auto& proc : tracked) {
-            if (proc.pid == stat.pid) {
-                proc.comm = stat.comm;
-                if (!image_map.empty()) {
-                    proc.image_map = std::move(image_map);
-                }
-                return;
-            }
-        }
-        tracked.push_back(TrackedProc{
-            .pid = stat.pid,
-            .comm = stat.comm,
-            .cmdline = read_cmdline(stat.pid),
-            .image_map = std::move(image_map),
-        });
+    auto service = [&] {
+        CaptureDrainResult result;
+        do {
+            result = drain_capture_quantum(data_fd.get(), capture, DEADLINE_NS);
+        } while (result == CaptureDrainResult::FULL);
+        return result == CaptureDrainResult::EMPTY;
     };
-
-    // Initial snapshot of all running processes.
-    for_each_process_stat([&](const StatInfo& stat, std::string_view) { upsert_tracked(stat); });
-
-    int64_t const DEADLINE_MS = now_ms() + ms;
-    int64_t last_drain_ms = now_ms();
-
-    while (true) {
-        int64_t const REMAINING_MS = DEADLINE_MS - now_ms();
-        if (REMAINING_MS <= 0) {
+    RecordProcCursor cursor;
+    while (service()) {
+        if (cursor.done()) cursor = RecordProcCursor{};
+        auto stat = cursor.step();
+        if (cursor.failed()) {
+            capture.read_failed = true;
             break;
         }
-
-        wall_sleep_ms(static_cast<int>(std::min<int64_t>(REMAINING_MS, SLEEP_SLICE_MS)));
-        if (!data_fd.valid() || (now_ms() - last_drain_ms) < DRAIN_INTERVAL_MS) {
-            continue;
-        }
-
-        (void)drain_capture(data_fd.get(), capture);
-
-        // Pick up any newly-spawned processes.
-        for_each_process_stat([&](const StatInfo& stat, std::string_view) { upsert_tracked(stat); });
-
-        last_drain_ms = now_ms();
+        // A task seen at the deadline still retains its identity, but no later metadata read starts.
+        if (stat && !update_record_tracked(tracked, *stat, service)) break;
+        if (!service() || !sleep_record_slice(capture, DEADLINE_NS)) break;
     }
 
-    capture.control_failed = !set_recording_enabled(false) || capture.control_failed;
-    std::println("perf: recording stopped.");
+    // Do not deliberately stop or drain an observed replacement session.
+    bool const OWNED = check_record_capture(capture, true);
+    if (OWNED) {
+        capture.control_failed = !set_recording_enabled(false) || capture.control_failed;
+    }
+    bool const STOPPED = OWNED && check_record_capture(capture, false);
+    if (!STOPPED) capture.read_failed = true;
+    if (STOPPED) {
+        std::println("perf: recording stopped.");
+    } else {
+        std::println("perf: stopping was not confirmed.");
+    }
     if (!data_fd.valid()) {
         std::println("perf: cannot write {}", PERF_DATA_FILE);
         return false;
     }
     finish_capture(data_fd.get(), capture);
+    (void)check_record_capture(capture, false);
     capture.write_failed = !write_all(data_fd.get(), SECTION_EVENTS_END) || capture.write_failed;
     auto const TOTAL_EVENT_BYTES = static_cast<ssize_t>(capture.saved_bytes);
     ssize_t const SUMMARY_BYTES = write_section_wki_summary(data_fd.get());
