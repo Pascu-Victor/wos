@@ -413,10 +413,20 @@ def main() -> int:
     parser.add_argument("--fork-contract-only", action="store_true", help="run all old positive cases plus the focused fork cases and two fork controls")
     parser.add_argument("--fork-vm-coordinator-only", action="store_true", help="exercise the private actual-owner fork VM composition")
     parser.add_argument("--anonymous-remove-only", action="store_true", help="exercise unwired managed anonymous removal with the retained original positive vectors")
+    parser.add_argument("--map-batch-only", action="store_true", help="exercise the unwired whole-batch mapper plus all original positive cases")
+    parser.add_argument("--mixed-geometry-only", action="store_true", help="exercise prepared mixed geometry before the ordinary removal continuation")
+    parser.add_argument("--mixed-protect-only", action="store_true", help="exercise prepared mixed geometry before the ordinary protection continuation")
+    parser.add_argument("--anonymous-fixed-only", action="store_true", help="exercise private prepared anonymous fixed replacement and four new controls")
+    parser.add_argument("--file-fixed-only", action="store_true", help="exercise private prepared retained-File fixed replacement and four new controls")
+    parser.add_argument("--shm-occupancy-only", action="store_true", help="exercise real SHM overlap rejection through PS-aware occupied walkers")
     parser.add_argument("--gtest-main", type=Path)
     parser.add_argument("--gtest", type=Path)
     parser.add_argument("--output", type=Path, help="fresh directory for small logs/results; scratch is always removed")
     options = parser.parse_args()
+    selected_profiles = (options.fork_contract_only, options.fork_vm_coordinator_only, options.anonymous_remove_only, options.map_batch_only, options.mixed_geometry_only, options.mixed_protect_only, options.anonymous_fixed_only, options.file_fixed_only, options.shm_occupancy_only)
+    if sum(selected_profiles) > 1:
+        parser.error("select at most one explicit managed memory profile")
+    overall_seconds = 180 if options.mixed_protect_only or options.anonymous_fixed_only or options.file_fixed_only else OVERALL_SECONDS
     root = options.source_root.resolve()
     host_build = options.host_build.resolve()
     overlay = options.kernel_overlay.resolve() if options.kernel_overlay else None
@@ -457,13 +467,13 @@ def main() -> int:
 
     def run(label: str, arguments: list, expected_success: bool = True) -> None:
         check_interrupted()
-        remaining = OVERALL_SECONDS - (time.monotonic() - started)
+        remaining = overall_seconds - (time.monotonic() - started)
         if remaining <= 0 or allocated_bytes() > SCRATCH_BYTES:
             raise RuntimeError("overall time/scratch budget exhausted")
         argv = [str(argument) for argument in arguments]
         log = output / f"{label}.log"
         before = time.monotonic()
-        deadline = min(started + OVERALL_SECONDS, before + COMMAND_SECONDS)
+        deadline = min(started + overall_seconds, before + COMMAND_SECONDS)
         work_deadline = deadline - 1  # Retain cleanup inside the original command/overall caps.
         if work_deadline <= before:
             raise RuntimeError("command cleanup reserve exhausted")
@@ -554,13 +564,24 @@ def main() -> int:
         (output / "actual-host-command-row.json").write_text(json.dumps(row, indent=2) + "\n")
         context, context_methods, context_sources, context_map = context_overlay(scratch, kernel_file, root)
         selected.extend(pin(path) for path in context_sources)
+        batch_fixture = None
+        if options.map_batch_only:
+            if options.fork_vm_coordinator_only or options.anonymous_remove_only or options.fork_contract_only:
+                raise RuntimeError("batch profile must be selected alone")
+            import managed_huge_batch_fixture as batch_composition
+            batch_fixture = batch_composition.Builder(kernel_file, support, definition, bounded)
+            selected.extend(pin(path) for path in batch_fixture.inputs)
         coordinator = None
-        if options.fork_vm_coordinator_only or options.anonymous_remove_only:
-            if options.anonymous_remove_only:
+        if options.fork_vm_coordinator_only or options.anonymous_remove_only or options.mixed_geometry_only or options.mixed_protect_only or options.anonymous_fixed_only or options.file_fixed_only or options.shm_occupancy_only:
+            if options.shm_occupancy_only:
+                import managed_shm_occupancy_fixture as composition
+            elif options.mixed_geometry_only or options.mixed_protect_only or options.anonymous_fixed_only or options.file_fixed_only:
+                import managed_mixed_geometry_fixture as composition
+            elif options.anonymous_remove_only:
                 import managed_anonymous_remove_fixture as composition
             else:
                 import fork_vm_coordinator_fixture as composition
-            coordinator = composition.Builder(kernel_file, support, definition)
+            coordinator = (composition.FileFixedBuilder if options.file_fixed_only else composition.FixedBuilder if options.anonymous_fixed_only else composition.ProtectBuilder if options.mixed_protect_only else composition.Builder)(kernel_file, support, definition)
             coordinator.extend_context(context)
             selected.extend(pin(path) for path in coordinator.inputs)
         flags = compile_flags(row, overlay)
@@ -637,6 +658,9 @@ def main() -> int:
                 ]
             )
         )
+        if batch_fixture is not None:
+            composite.write_text(batch_fixture.compose(composite.read_text()))
+            shutil.copy2(composite, output / "actual-batch-source.cpp")
         segments = {
             "resolver": resolver,
             "private": private,
@@ -648,6 +672,7 @@ def main() -> int:
             "epoch": epoch,
             "adapters": adapters,
             **context_map,
+            **({"batch_mapper": batch_fixture.mapper, "batch_adapter": batch_fixture.adapter} if batch_fixture is not None else {}),
         }
         if coordinator is not None:
             for path in context.rglob("*"):
@@ -690,7 +715,7 @@ def main() -> int:
 
         baseline_cases = CppText(composite.read_text()).gtest_cases()
         baseline_names = {case["name"] for case in baseline_cases}
-        expected_count = EXPECTED_TESTS + coordinator.test_count if coordinator is not None else EXPECTED_TESTS
+        expected_count = EXPECTED_TESTS + (coordinator.test_count if coordinator is not None else 0) + (batch_fixture.test_count if batch_fixture is not None else 0)
         if len(baseline_names) != expected_count:
             raise RuntimeError("complete lexical GTest inventory differs from required baseline")
         (output / "baseline-case-inventory.json").write_text(json.dumps(baseline_cases, indent=2) + "\n")
@@ -716,7 +741,7 @@ def main() -> int:
         binary = link("current", objects)
         run("run-current", [binary, f"--gtest_output=json:{output / 'current.json'}"])
         tests = json.loads((output / "current.json").read_text())
-        if tests["failures"] != 0 or tests["tests"] != (EXPECTED_TESTS + coordinator.test_count if coordinator is not None else EXPECTED_TESTS):
+        if tests["failures"] != 0 or tests["tests"] != expected_count:
             raise RuntimeError("actual range/legacy suite did not pass")
         if baseline_gtest_names(tests) != baseline_names:
             raise RuntimeError("actual complete baseline differs from lexical GTest names")
@@ -751,10 +776,13 @@ def main() -> int:
             path.unlink()
 
         actual = CppText(composite.read_text())
-        if coordinator is not None:
+        if batch_fixture is not None:
+            for label, bad, test in batch_fixture.controls(composite.read_text()):
+                mutant(label, bad, test)
+        elif coordinator is not None:
             for label, bad, test in coordinator.controls(composite.read_text()):
                 mutant(label, bad, test)
-            if not options.anonymous_remove_only:
+            if not (options.anonymous_remove_only or options.mixed_geometry_only or options.mixed_protect_only or options.anonymous_fixed_only or options.file_fixed_only or options.shm_occupancy_only):
                 for label, bad, test in coordinator.public.controls(public_source.read_text()):
                     mutant(label, bad, test, replace_index=3)
         elif options.fork_contract_only:
@@ -927,7 +955,7 @@ def main() -> int:
         except Exception as error:
             selected_after, emitted_after = [], []
             errors.append(f"input resampling: {error}")
-        cleanup_deadline = min(started + OVERALL_SECONDS, time.monotonic() + 1)
+        cleanup_deadline = min(started + overall_seconds, time.monotonic() + 1)
         for group in list(groups):
             try:
                 os.killpg(group, 0)

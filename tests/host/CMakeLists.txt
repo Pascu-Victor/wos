@@ -341,6 +341,36 @@ add_test(NAME managed_anonymous_remove_runtime_test
         --host-build ${CMAKE_BINARY_DIR} --anonymous-remove-only
         --gtest-main $<TARGET_FILE:gtest_main> --gtest $<TARGET_FILE:gtest>)
 set_tests_properties(managed_anonymous_remove_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 150)
+add_test(NAME managed_huge_batch_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/managed_huge_runtime_test.py
+        --host-build ${CMAKE_BINARY_DIR} --map-batch-only
+        --gtest-main $<TARGET_FILE:gtest_main> --gtest $<TARGET_FILE:gtest>)
+set_tests_properties(managed_huge_batch_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 150)
+add_test(NAME managed_mixed_geometry_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/managed_huge_runtime_test.py
+        --host-build ${CMAKE_BINARY_DIR} --mixed-geometry-only
+        --gtest-main $<TARGET_FILE:gtest_main> --gtest $<TARGET_FILE:gtest>)
+set_tests_properties(managed_mixed_geometry_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 150)
+add_test(NAME managed_mixed_protect_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/managed_huge_runtime_test.py
+        --host-build ${CMAKE_BINARY_DIR} --mixed-protect-only
+        --gtest-main $<TARGET_FILE:gtest_main> --gtest $<TARGET_FILE:gtest>)
+set_tests_properties(managed_mixed_protect_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 210)
+add_test(NAME managed_anonymous_fixed_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/managed_huge_runtime_test.py
+        --host-build ${CMAKE_BINARY_DIR} --anonymous-fixed-only
+        --gtest-main $<TARGET_FILE:gtest_main> --gtest $<TARGET_FILE:gtest>)
+set_tests_properties(managed_anonymous_fixed_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 210)
+add_test(NAME managed_file_fixed_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/managed_huge_runtime_test.py
+        --host-build ${CMAKE_BINARY_DIR} --file-fixed-only
+        --gtest-main $<TARGET_FILE:gtest_main> --gtest $<TARGET_FILE:gtest>)
+set_tests_properties(managed_file_fixed_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 210)
+add_test(NAME managed_shm_occupancy_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/managed_huge_runtime_test.py
+        --host-build ${CMAKE_BINARY_DIR} --shm-occupancy-only
+        --gtest-main $<TARGET_FILE:gtest_main> --gtest $<TARGET_FILE:gtest>)
+set_tests_properties(managed_shm_occupancy_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 150)
 add_test(NAME managed_huge_fork_runtime_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/managed_huge_runtime_test.py
         --host-build ${CMAKE_BINARY_DIR} --fork-contract-only

@@ -544,3 +544,152 @@ KTEST(ManagedHuge, SparsePartialBoundaryProofAndHeldExclusiveSplit) {
     KEXPECT_EQ(virt::selftest_user_pagemap_reader_count(f.root), 0U);
 }
 #endif
+
+#ifdef WOS_SELFTEST
+namespace {
+auto prepare_batch(Fixture& fixture, huge::PreparedHugeMapBatch& batch, uint16_t count, uint64_t start = VA) -> huge::Error {
+    auto const node = memory_node();
+    if (node == numa::INVALID_NODE) return huge::Error::NotReady;
+    huge::RootKey key{};
+    if (auto error = huge::detail::root_key(fixture.root, key); error != huge::Error::None) return error;
+    numa::AllocationContext context{{uint64_t{1} << node, numa::Mode::BIND}, node, 0};
+    return batch.prepare(key, start, uint64_t{count} * huge::LEAF_BYTES, FLAGS, context);
+}
+auto publish_batch(Fixture& fixture, huge::PreparedHugeMapBatch& batch) -> huge::Error {
+    ker::syscall::vmem::SharedVmemPublicationGuard publication;
+    return virt::selftest_publish_managed_huge_batch(fixture.root, publication, batch);
+}
+// Real never-active root construction. All three actual owners exist before
+// any link and transfer to its tree without refcount fabrication or fake Task.
+auto seed_empty_batch_destination(Fixture& fixture, uint64_t va) -> paging::PageTable* {
+    huge::PreparedTables skeleton;
+    if (skeleton.prepare(3) != huge::Error::None) return nullptr;
+    auto* a = skeleton.table(0);
+    auto* b = skeleton.table(1);
+    auto* empty = skeleton.table(2);
+    auto* top = reinterpret_cast<uint64_t*>(fixture.root);
+    if (top[(va >> 39) & 511] != 0) return nullptr;
+    reinterpret_cast<uint64_t*>(b)[(va >> 21) & 511] = physical(empty) | 7;
+    reinterpret_cast<uint64_t*>(a)[(va >> 30) & 511] = physical(b) | 7;
+    top[(va >> 39) & 511] = physical(a) | 7;
+    huge::detail::PreparationAccess::tables_transferred_after_publish(skeleton, 7);
+    return empty;
+}
+}  // namespace
+KTEST(ManagedHugeBatch, ThreeRealLeavesRawRetireAllIndependentReferences) {
+    Fixture f;
+    KREQUIRE_TRUE(f.init());
+    huge::PreparedHugeMapBatch batch;
+    KREQUIRE_EQ(prepare_batch(f, batch, 3), huge::Error::None);
+    auto* storage = huge::detail::HugeMapBatchAccess::storage(batch);
+    std::array<uint8_t*, 3> bytes{};
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        bytes[i] = static_cast<uint8_t*>(storage->leaves[i].span.data());
+        KEXPECT_TRUE(zero(bytes[i]));
+        KEXPECT_EQ(references(bytes[i]), 512U);
+        KREQUIRE_TRUE(pattern(bytes[i], true));
+    }
+    KREQUIRE_EQ(publish_batch(f, batch), huge::Error::None);
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        KEXPECT_TRUE(storage->leaves[i].span.empty());
+        KEXPECT_EQ(references(bytes[i]), 512U);
+        KEXPECT_TRUE(pattern(bytes[i], false));
+    }
+    KEXPECT_TRUE(storage->acknowledged);
+    batch.reset();
+    virt::destroy_user_space(f.root, 0, "managed-batch", "three-real-leaf-raw-retirement");
+    huge::Snapshot after{};
+    huge::snapshot(after);
+    KEXPECT_EQ(after.charged_pages, f.cap_before.charged_pages);
+    KEXPECT_EQ(after.table_pages, f.cap_before.table_pages);
+}
+KTEST(ManagedHugeBatch, ActualFourUpperParentsAcross512Gigabytes) {
+    Fixture f;
+    KREQUIRE_TRUE(f.init());
+    huge::PreparedHugeMapBatch batch;
+    uint64_t const start = (uint64_t{1} << 39) - huge::LEAF_BYTES;
+    KREQUIRE_EQ(prepare_batch(f, batch, 2, start), huge::Error::None);
+    KREQUIRE_EQ(publish_batch(f, batch), huge::Error::None);
+    auto* storage = huge::detail::HugeMapBatchAccess::storage(batch);
+    KEXPECT_EQ(storage->adopted_mask, 15U);
+    for (uint64_t i = 0; i < 2; ++i) {
+        auto* entry = raw_slot(f.root, start + i * huge::LEAF_BYTES, 2);
+        KREQUIRE_NE(entry, nullptr);
+        KEXPECT_NE(*entry & 128, 0U);
+    }
+}
+KTEST(ManagedHugeBatch, ActualEmptyPml1OwnerSurvivesAckUntilOutsideReset) {
+    Fixture f;
+    KREQUIRE_TRUE(f.init());
+    auto* old = seed_empty_batch_destination(f, VA);
+    KREQUIRE_NE(old, nullptr);
+    huge::PreparedHugeMapBatch batch;
+    KREQUIRE_EQ(prepare_batch(f, batch, 1), huge::Error::None);
+    KREQUIRE_EQ(publish_batch(f, batch), huge::Error::None);
+    auto* storage = huge::detail::HugeMapBatchAccess::storage(batch);
+    KEXPECT_TRUE(storage->acknowledged);
+    KEXPECT_EQ(storage->detached_count, 1U);
+    KEXPECT_EQ(storage->detached[0], old);
+    KEXPECT_EQ(phys::page_kind_get(old), mm::PageKind::PAGE_TABLE);
+    KEXPECT_EQ(phys::page_ref_get(old), 1U);  // Still an actual batch-owned live ref.
+    batch.reset();                            // No access to old frame after its actual return.
+}
+KTEST(ManagedHugeBatch, LastDestinationFailurePreservesFirstAndAllPreparingOwners) {
+    Fixture f;
+    KREQUIRE_TRUE(f.init());
+    auto* old = seed_empty_batch_destination(f, VA + huge::LEAF_BYTES);
+    KREQUIRE_NE(old, nullptr);
+    RestoreWord restore(reinterpret_cast<uint64_t*>(old)[511]);
+    restore.slot = 0x200;
+    huge::PreparedHugeMapBatch batch;
+    KREQUIRE_EQ(prepare_batch(f, batch, 2), huge::Error::None);
+    KEXPECT_NE(publish_batch(f, batch), huge::Error::None);
+    auto* first = raw_slot(f.root, VA, 2);
+    KREQUIRE_NE(first, nullptr);
+    KEXPECT_EQ(*first, 0U);
+    auto* storage = huge::detail::HugeMapBatchAccess::storage(batch);
+    KEXPECT_FALSE(storage->published);
+    KEXPECT_EQ(storage->detached_count, 0U);
+    KEXPECT_EQ(storage->edit_count, 0U);
+    for (size_t i = 0; i < 2; ++i) KEXPECT_FALSE(storage->leaves[i].span.empty());
+    reinterpret_cast<uint64_t*>(old)[511] = 0;
+}
+KTEST(ManagedHugeBatch, RealBudgetRetirementAndRootReturnAfterTwoLeafBatch) {
+    Fixture f;
+    KREQUIRE_TRUE(f.init());
+    huge::PreparedHugeMapBatch batch;
+    KREQUIRE_EQ(prepare_batch(f, batch, 2), huge::Error::None);
+    KREQUIRE_EQ(publish_batch(f, batch), huge::Error::None);
+    batch.reset();
+    BudgetRetirementOwner owner{virt::create_destroy_user_space_budget_state(f.root, 0, "managed-batch", "two-leaf-budget"), &f};
+    KREQUIRE_NE(owner.state, nullptr);
+    bool done = false;
+    for (size_t step = 0; step < 4096 && !done; ++step) done = virt::destroy_user_space_budgeted(owner.state, 1);
+    KREQUIRE_TRUE(done);
+    KREQUIRE_EQ(f.subject->detach_pagemap_after_usercopy_quiescence(), f.root);
+    task::release_lazy_vmem_ranges(*f.subject);
+    ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(f.root);
+    KREQUIRE_TRUE(virt::finish_destroy_user_space_and_release_pagemap(owner.state));
+    owner.state = nullptr;
+    f.root = nullptr;
+    huge::Snapshot after{};
+    huge::snapshot(after);
+    KEXPECT_EQ(after.charged_pages, f.cap_before.charged_pages);
+    KEXPECT_EQ(after.retired_pages, f.cap_before.retired_pages);
+}
+KTEST(ManagedHugeBatch, MoveResetAndCapacityRefusalHaveActualOwnerClosure) {
+    Fixture f;
+    KREQUIRE_TRUE(f.init());
+    huge::PreparedHugeMapBatch batch;
+    KEXPECT_EQ(prepare_batch(f, batch, 65), huge::Error::Capacity);
+    KEXPECT_TRUE(batch.empty());
+    KREQUIRE_EQ(prepare_batch(f, batch, 1), huge::Error::None);
+    huge::PreparedHugeMapBatch moved(std::move(batch));
+    KEXPECT_TRUE(batch.empty());
+    batch = std::move(moved);
+    KEXPECT_TRUE(moved.empty());
+    batch.reset();
+    batch.reset();
+    KEXPECT_TRUE(batch.empty());
+}
+#endif

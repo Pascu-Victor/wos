@@ -198,6 +198,91 @@ void detail::PreparationAccess::tables_transferred_after_publish(PreparedTables&
             owner.storage_->tables[i] = nullptr;
         }
 }
+// BEGIN whole-batch managed owners. All output rows are caller-born here.
+PreparedHugeMapBatch::~PreparedHugeMapBatch() { reset(); }
+PreparedHugeMapBatch::PreparedHugeMapBatch(PreparedHugeMapBatch&& other) noexcept
+    : cleanup_(std::move(other.cleanup_)), parents_(std::move(other.parents_)), storage_(std::exchange(other.storage_, nullptr)) {}
+auto PreparedHugeMapBatch::operator=(PreparedHugeMapBatch&& other) noexcept -> PreparedHugeMapBatch& {
+    if (this != &other) {
+        reset();
+        cleanup_ = std::move(other.cleanup_);
+        parents_ = std::move(other.parents_);
+        storage_ = std::exchange(other.storage_, nullptr);
+    }
+    return *this;
+}
+void PreparedHugeMapBatch::reset() noexcept {
+    if (storage_ != nullptr) {
+        if (storage_->published && !storage_->acknowledged) __builtin_trap();
+        for (uint16_t i = 0; i < storage_->count; ++i) storage_->leaves[i].span.reset();
+        for (uint16_t i = 0; i < storage_->detached_count; ++i) detail::release_table(storage_->detached[i]);
+        delete std::exchange(storage_, nullptr);
+    }
+    // The batch heap and every actual data/old-PT owner precede plan credits.
+    cleanup_.reset();
+    parents_.reset();
+}
+auto PreparedHugeMapBatch::prepare(RootKey root, uint64_t start, uint64_t length, uint64_t flags,
+                                   const numa::AllocationContext& context) noexcept -> Error {
+    constexpr uint64_t LIMIT = uint64_t{1} << 47;
+    constexpr uint64_t PERMISSIONS = paging::PAGE_PRESENT | paging::PAGE_WRITE | paging::PAGE_USER | paging::PAGE_NX;
+    if (!empty() || !cleanup_.empty() || !parents_.empty() || !RegistryCore::valid_root(root) || !RegistryCore::valid_va(start) ||
+        length == 0 || (length & (LEAF_BYTES - 1)) != 0 || start >= LIMIT || length > LIMIT - start ||
+        (flags & paging::PAGE_PRESENT) == 0 || (flags & ~PERMISSIONS) != 0 || context.virtual_page_index != 0)
+        return Error::Invalid;
+    if (length / LEAF_BYTES > MAX_ROOT_LEAVES) return Error::Capacity;
+    auto const count = static_cast<uint16_t>(length / LEAF_BYTES);
+    if (auto error = cleanup_.prepare(count); error != Error::None) return error;
+    if (auto error = parents_.prepare(4); error != Error::None) {
+        reset();
+        return error;
+    }
+    storage_ = new (std::nothrow) detail::HugeMapBatchStorage{};
+    if (storage_ == nullptr) {
+        reset();
+        return Error::Exhausted;
+    }
+    storage_->root = root;
+    storage_->start = start;
+    storage_->flags = flags;
+    storage_->count = count;
+    constexpr uint64_t HUGE_FRAME = uint64_t{0x000ffffffffff000} & ~(LEAF_BYTES - 1);
+    for (uint16_t i = 0; i < count; ++i) {
+        auto& row = storage_->leaves[i];
+        uint64_t const va = start + static_cast<uint64_t>(i) * LEAF_BYTES;
+        auto error = row.span.prepare(root, va, context);
+        if (error == Error::None && !detail::PreparationAccess::span_view(row.span, row.view)) error = Error::Invalid;
+        if (error == Error::None && (row.view.physical_2m & ~HUGE_FRAME) != 0) error = Error::Invalid;
+        if (error != Error::None) {
+            reset();
+            return error;
+        }
+        row.key = {root, va, row.view.physical_2m};
+        // Sorted owned physical spans: equality is a duplicate actual owner.
+        uint16_t position = 0;
+        while (position < i && storage_->span_physical[position] < row.view.physical_2m) ++position;
+        if (position < i && storage_->span_physical[position] == row.view.physical_2m) {
+            reset();
+            return Error::Invalid;
+        }
+        for (uint16_t j = i; j > position; --j) storage_->span_physical[j] = storage_->span_physical[j - 1];
+        storage_->span_physical[position] = row.view.physical_2m;
+    }
+    return Error::None;
+}
+auto detail::HugeMapBatchAccess::storage(PreparedHugeMapBatch& batch) noexcept -> HugeMapBatchStorage* { return batch.storage_; }
+auto detail::HugeMapBatchAccess::parents(PreparedHugeMapBatch& batch) noexcept -> SplitPlanStorage* {
+    return PreparationAccess::plan_storage(batch.parents_);
+}
+auto detail::HugeMapBatchAccess::cleanup(PreparedHugeMapBatch& batch) noexcept -> SplitPlanStorage* {
+    return PreparationAccess::plan_storage(batch.cleanup_);
+}
+void detail::HugeMapBatchAccess::transfer_after_publish(PreparedHugeMapBatch& batch) noexcept {
+    if (batch.storage_ == nullptr || !batch.storage_->published || batch.storage_->acknowledged) __builtin_trap();
+    for (uint16_t i = 0; i < batch.storage_->count; ++i) PreparationAccess::span_transferred_after_publish(batch.storage_->leaves[i].span);
+    PreparationAccess::tables_transferred_after_publish(batch.parents_, batch.storage_->adopted_mask);
+}
+// END whole-batch managed owners.
 namespace {
 auto range_current_context(sched::task::Task& target, const sys::SyscallPreparationScope& preparation, bool interrupts) noexcept -> bool {
     return preparation.ready() && sched::can_query_current_task() && sched::get_current_task() == &target &&

@@ -572,6 +572,9 @@ struct SelftestManagedHugeReport {
 [[nodiscard]] auto selftest_publish_managed_huge(sched::task::Task&, uint64_t va, uint64_t flags, huge::PreparedSpan&,
                                                  huge::PreparedTables& parents, huge::PreparedTables& mandatory_cleanup,
                                                  SelftestManagedHugeReport&) -> huge::Error;
+// Caller owns a registered never-active nonkernel root and the actual PUB.
+[[nodiscard]] auto selftest_publish_managed_huge_batch(PageTable*, const ker::syscall::vmem::SharedVmemPublicationGuard&,
+                                                       huge::PreparedHugeMapBatch&) -> huge::Error;
 [[nodiscard]] auto selftest_prepare_managed_split(sched::task::Task&, uint64_t start, uint64_t end, huge::PreparedTables&,
                                                   const SelftestManagedHugeOptions& = {}) -> huge::Error;
 [[nodiscard]] auto selftest_commit_managed_split(sched::task::Task&, huge::PreparedTables&, SelftestManagedHugeReport&) -> huge::Error;

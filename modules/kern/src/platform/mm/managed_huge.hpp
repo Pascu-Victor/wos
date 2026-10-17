@@ -21,6 +21,8 @@ namespace ker::mod::mm::huge {
 namespace detail {
 struct PreparationAccess;
 struct RangePreparationDriver;
+struct HugeMapBatchStorage;
+struct HugeMapBatchAccess;
 // Actual virt adapters share user_mapping_pin_lock. Caller retains an actual
 // root for capture; a copied RootKey is only an opaque comparison afterward.
 [[nodiscard]] auto root_key(paging::PageTable*, RootKey& empty) noexcept -> Error;
@@ -141,6 +143,26 @@ class PreparedTables {
     PlanHandle ticket_{};
     SplitPlanStorage* storage_{};
 };
+// One complete private batch. The actual root lifetime and incoming PUB belong
+// to the caller; this holder is never AS/metadata/public admission authority.
+class PreparedHugeMapBatch {
+   public:
+    PreparedHugeMapBatch() noexcept = default;
+    ~PreparedHugeMapBatch();
+    PreparedHugeMapBatch(const PreparedHugeMapBatch&) = delete;
+    auto operator=(const PreparedHugeMapBatch&) -> PreparedHugeMapBatch& = delete;
+    PreparedHugeMapBatch(PreparedHugeMapBatch&&) noexcept;
+    auto operator=(PreparedHugeMapBatch&&) noexcept -> PreparedHugeMapBatch&;
+    [[nodiscard]] auto prepare(RootKey, uint64_t start, uint64_t length, uint64_t page_flags, const numa::AllocationContext&) noexcept
+        -> Error;
+    void reset() noexcept;
+    [[nodiscard]] auto empty() const noexcept -> bool { return storage_ == nullptr; }
+
+   private:
+    friend struct detail::HugeMapBatchAccess;
+    PreparedTables cleanup_, parents_;
+    detail::HugeMapBatchStorage* storage_{};
+};
 // Fallible preparation owns no root/PUB/MM lease across allocations or yields.
 // Caller owns ordinary PROCESS execution; no public syscall is wired here.
 [[nodiscard]] auto prepare_current_range_split(sched::task::Task&, const sys::SyscallPreparationScope&, uint64_t start, uint64_t end,
@@ -218,5 +240,45 @@ struct PreparationAccess {
     [[nodiscard]] static auto prepare_tables_for_test(PreparedTables&, uint16_t count, uint16_t fail_before_table) noexcept -> Error;
 #endif
 };
+// These rows are constructed/addressable in managed_huge.cpp BEFORE excluded
+// virt entry. Borrowed table pointers exist only during its original exclusive.
+struct HugeMapBatchLeaf {
+    PreparedSpan span;
+    SpanPublicationView view{};
+    LeafKey key{};
+};
+struct HugeMapSlotEdit {
+    paging::PageTable* table{};
+    uint64_t expected{}, desired{};
+    uint16_t index{};
+    uint8_t level{}, leaf{UINT8_MAX};
+};
+enum class HugeMapTableRole : uint8_t { Prepared, Adopted, Ancestor, OldEmpty };
+struct HugeMapTableIdentity {
+    uint64_t physical{}, prefix{};
+    HugeMapTableRole role{};
+    uint8_t level{};
+};
+struct HugeMapBatchStorage {
+    HugeMapBatchLeaf leaves[MAX_ROOT_LEAVES]{};
+    HugeMapSlotEdit edits[MAX_ROOT_LEAVES + 4]{};
+    HugeMapTableIdentity roles[2 * MAX_ROOT_LEAVES + 9]{};
+    uint64_t span_physical[MAX_ROOT_LEAVES]{};
+    paging::PageTable* detached[MAX_ROOT_LEAVES]{};
+    RootKey root{};
+    uint64_t start{}, flags{}, adopted_mask{};
+    uint16_t count{}, edit_count{}, role_count{}, detached_count{};
+    bool published{}, acknowledged{};
+};
+static_assert(sizeof(HugeMapBatchStorage) <= 16 * 1024);
+struct HugeMapBatchAccess {
+    [[nodiscard]] static auto storage(PreparedHugeMapBatch&) noexcept -> HugeMapBatchStorage*;
+    [[nodiscard]] static auto parents(PreparedHugeMapBatch&) noexcept -> SplitPlanStorage*;
+    [[nodiscard]] static auto cleanup(PreparedHugeMapBatch&) noexcept -> SplitPlanStorage*;
+    static void transfer_after_publish(PreparedHugeMapBatch&) noexcept;
+};
+// Exact borrowed live PUB, no nested PUB/reader and no public syscall caller.
+[[nodiscard]] auto publish_prepared_huge_batch(paging::PageTable*, const ker::syscall::vmem::SharedVmemPublicationGuard&,
+                                               PreparedHugeMapBatch&) noexcept -> Error;
 }  // namespace detail
 }  // namespace ker::mod::mm::huge

@@ -4902,6 +4902,248 @@ auto bind_preallocated_cleanup_split(PageTable* root, uint64_t va, huge::Prepare
 }
 // END private managed publication/split.
 
+// BEGIN whole-batch managed mapper. Caller-born heap, no raw-stack owners.
+auto managed_batch_span_alias(const huge::detail::HugeMapBatchStorage& batch, uint64_t physical) -> bool {
+    uint16_t first = 0, last = batch.count;
+    physical &= ~(huge::LEAF_BYTES - 1);
+    while (first < last) {
+        auto const middle = static_cast<uint16_t>(first + (last - first) / 2);
+        if (batch.span_physical[middle] < physical)
+            first = middle + 1;
+        else
+            last = middle;
+    }
+    return first < batch.count && batch.span_physical[first] == physical;
+}
+auto managed_batch_role_position(const huge::detail::HugeMapBatchStorage& batch, uint64_t physical) -> uint16_t {
+    uint16_t first = 0, last = batch.role_count;
+    while (first < last) {
+        auto const middle = static_cast<uint16_t>(first + (last - first) / 2);
+        if (batch.roles[middle].physical < physical)
+            first = middle + 1;
+        else
+            last = middle;
+    }
+    return first;
+}
+// Existing raw links may only reuse the SAME actual ancestor/path. A private
+// prepared parent is reachable here only through our own planned zero link.
+auto managed_batch_add_role(huge::detail::HugeMapBatchStorage& batch, uint64_t physical, huge::detail::HugeMapTableRole role, uint8_t level,
+                            uint64_t prefix) -> bool {
+    auto const position = managed_batch_role_position(batch, physical);
+    if (position < batch.role_count && batch.roles[position].physical == physical) {
+        auto const& old = batch.roles[position];
+        return role == huge::detail::HugeMapTableRole::Ancestor && old.role == role && old.level == level && old.prefix == prefix;
+    }
+    if (batch.role_count >= 2 * huge::MAX_ROOT_LEAVES + 9 || managed_batch_span_alias(batch, physical)) return false;
+    for (uint16_t i = batch.role_count; i > position; --i) batch.roles[i] = batch.roles[i - 1];
+    auto& added = batch.roles[position];
+    added.physical = physical;
+    added.prefix = prefix;
+    added.role = role;
+    added.level = level;
+    ++batch.role_count;
+    return true;
+}
+auto managed_batch_slot_position(const huge::detail::HugeMapBatchStorage& batch, uint64_t physical) -> uint16_t {
+    uint16_t first = 0, last = batch.edit_count;
+    while (first < last) {
+        auto const middle = static_cast<uint16_t>(first + (last - first) / 2);
+        auto const& edit = batch.edits[middle];
+        uint64_t const key = reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<uint64_t>(edit.table))) +
+                             static_cast<uint64_t>(edit.index) * sizeof(uint64_t);
+        if (key < physical)
+            first = middle + 1;
+        else
+            last = middle;
+    }
+    return first;
+}
+void managed_batch_clear_borrowers(huge::detail::HugeMapBatchStorage& batch) {
+    for (uint16_t i = 0; i < batch.edit_count; ++i) batch.edits[i].table = nullptr;
+    batch.edit_count = batch.role_count = 0;
+}
+auto managed_batch_preflight_locked(PageTable* root, huge::detail::HugeMapBatchStorage& batch, huge::SplitPlanStorage& parents)
+    -> huge::Error {
+    constexpr uint64_t PS = uint64_t{1} << 7;
+    constexpr uint64_t PARENT_ALLOWED = PTE_FRAME_MASK | uint64_t{0x7f} | paging::PAGE_NX;
+    if (!managed_root_matches_locked(batch.root)) return huge::Error::Stale;
+    auto const* control = find_user_root_control_locked(root);
+    if (control == nullptr || control->ps_geometry_epoch == UINT64_MAX) return huge::Error::GenerationExhausted;
+    if (!managed_batch_add_role(batch, reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<uint64_t>(root))),
+                                huge::detail::HugeMapTableRole::Ancestor, 4, 0))
+        return huge::Error::Invalid;
+    uint16_t next_parent = 0;
+    constexpr uint64_t HUGE_FRAME = PTE_FRAME_MASK & ~(huge::LEAF_BYTES - 1);
+    for (uint16_t leaf = 0; leaf < batch.count; ++leaf) {
+        auto const& row = batch.leaves[leaf];
+        if (!huge::RegistryCore::same_root(row.key.root, batch.root) ||
+            row.key.va_2m != batch.start + static_cast<uint64_t>(leaf) * huge::LEAF_BYTES || row.key.pa_2m != row.view.physical_2m ||
+            (row.view.physical_2m & ~HUGE_FRAME) != 0)
+            return huge::Error::Invalid;
+        if (!managed_huge_registry.validate_preparing(row.view.handle, row.key, row.view.actual)) return huge::Error::Again;
+        auto* table = root;
+        for (int level = 4; level >= 2; --level) {
+            MutableUserEntrySlot slot;
+            auto const index = index_of(row.key.va_2m, level);
+            if (!MutableUserEntrySlot::from(table, index, slot)) return huge::Error::Invalid;
+            uint64_t const raw = slot.load();
+            uint64_t const slot_physical = reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<uint64_t>(table))) +
+                                           static_cast<uint64_t>(index) * sizeof(uint64_t);
+            uint16_t const position = managed_batch_slot_position(batch, slot_physical);
+            bool found = false;
+            if (position < batch.edit_count) {
+                auto const& previous = batch.edits[position];
+                uint64_t const previous_physical =
+                    reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<uint64_t>(previous.table))) +
+                    static_cast<uint64_t>(previous.index) * sizeof(uint64_t);
+                found = previous_physical == slot_physical;
+            }
+            if (found && level == 2) return huge::Error::Invalid;  // Duplicate physical destination slot.
+            if (!found) {
+                if (batch.edit_count == huge::MAX_ROOT_LEAVES + 4) return huge::Error::Invalid;
+                for (uint16_t i = batch.edit_count; i > position; --i) batch.edits[i] = batch.edits[i - 1];
+                ++batch.edit_count;
+                auto& edit = batch.edits[position];
+                edit.table = table;
+                edit.index = static_cast<uint16_t>(index);
+                edit.level = static_cast<uint8_t>(level);
+                edit.leaf = level == 2 ? static_cast<uint8_t>(leaf) : UINT8_MAX;
+                edit.expected = raw;
+                edit.desired = raw;
+            }
+            auto& edit = batch.edits[position];
+            constexpr uint64_t AD = (uint64_t{1} << 5) | (uint64_t{1} << 6);
+            if (edit.level != level || (raw & ~AD) != (edit.expected & ~AD)) return huge::Error::Again;
+            if (level == 2) {
+                if (raw != 0) {
+                    if ((raw & paging::PAGE_PRESENT) == 0 || (raw & PS) != 0 || (raw & ~PARENT_ALLOWED) != 0)
+                        return huge::Error::Unsupported;
+                    auto* old = reinterpret_cast<PageTable*>(addr::get_virt_pointer(raw & PTE_FRAME_MASK));
+                    if (!managed_table_owner_valid(old) ||
+                        !managed_batch_add_role(batch, raw & PTE_FRAME_MASK, huge::detail::HugeMapTableRole::OldEmpty, 1,
+                                                row.key.va_2m >> 21))
+                        return huge::Error::Invalid;
+                    for (size_t word = 0; word < paging::PAGE_TABLE_ENTRIES; ++word) {
+                        MutableUserEntrySlot empty;
+                        if (!MutableUserEntrySlot::from(old, word, empty) || empty.load() != 0) return huge::Error::Again;
+                    }
+                }
+                edit.desired = row.view.physical_2m | batch.flags | PS;
+                continue;
+            }
+            if (raw == 0 && !found) {
+                if (next_parent == parents.table_count) return huge::Error::Invalid;
+                uint64_t const physical = parents.table_physical[next_parent];
+                auto const role_position = managed_batch_role_position(batch, physical);
+                if (role_position == batch.role_count || batch.roles[role_position].physical != physical ||
+                    batch.roles[role_position].role != huge::detail::HugeMapTableRole::Prepared)
+                    return huge::Error::Invalid;
+                auto& adopted = batch.roles[role_position];
+                adopted.role = huge::detail::HugeMapTableRole::Adopted;
+                adopted.level = static_cast<uint8_t>(level - 1);
+                adopted.prefix = row.key.va_2m >> (12 + 9 * (level - 1));
+                edit.desired = physical | paging::PAGE_PRESENT | paging::PAGE_WRITE | paging::PAGE_USER;
+                batch.adopted_mask |= uint64_t{1} << next_parent;
+                ++next_parent;
+            } else if (raw != 0) {
+                if ((raw & paging::PAGE_PRESENT) == 0 || (raw & PS) != 0 || (raw & ~PARENT_ALLOWED) != 0) return huge::Error::Unsupported;
+                auto* child = reinterpret_cast<PageTable*>(addr::get_virt_pointer(raw & PTE_FRAME_MASK));
+                if (!managed_table_owner_valid(child) ||
+                    !managed_batch_add_role(batch, raw & PTE_FRAME_MASK, huge::detail::HugeMapTableRole::Ancestor,
+                                            static_cast<uint8_t>(level - 1), row.key.va_2m >> (12 + 9 * (level - 1))))
+                    return huge::Error::Invalid;
+                edit.desired |= paging::PAGE_WRITE | paging::PAGE_USER;
+                if ((batch.flags & paging::PAGE_NX) == 0) edit.desired &= ~paging::PAGE_NX;
+            }
+            table = reinterpret_cast<PageTable*>(addr::get_virt_pointer(edit.desired & PTE_FRAME_MASK));
+        }
+    }
+    return huge::Error::None;
+}
+auto publish_managed_huge_batch_owned(PageTable* root, const ker::syscall::vmem::SharedVmemPublicationGuard& publication,
+                                      huge::PreparedHugeMapBatch& owner) noexcept -> huge::Error {
+    auto* batch = huge::detail::HugeMapBatchAccess::storage(owner);
+    auto* parents = huge::detail::HugeMapBatchAccess::parents(owner);
+    auto* cleanup = huge::detail::HugeMapBatchAccess::cleanup(owner);
+    constexpr uint64_t PERMISSIONS = paging::PAGE_PRESENT | paging::PAGE_WRITE | paging::PAGE_USER | paging::PAGE_NX;
+    constexpr uint64_t LIMIT = uint64_t{1} << 47;
+    if (!publication.acquired() || root == nullptr || root == kernel_pagemap || batch == nullptr || parents == nullptr ||
+        cleanup == nullptr || parents == cleanup || batch->published || batch->detached_count != 0 || batch->edit_count != 0 ||
+        batch->role_count != 0 || batch->root.address_bits != reinterpret_cast<uint64_t>(root) || batch->count == 0 ||
+        batch->count > huge::MAX_ROOT_LEAVES || !huge::RegistryCore::valid_va(batch->start) || batch->start >= LIMIT ||
+        static_cast<uint64_t>(batch->count) * huge::LEAF_BYTES > LIMIT - batch->start || (batch->flags & paging::PAGE_PRESENT) == 0 ||
+        (batch->flags & ~PERMISSIONS) != 0 || parents->table_count != 4 || cleanup->table_count != batch->count ||
+        parents->purpose != huge::PlanPurpose::Unbound || cleanup->purpose != huge::PlanPurpose::Unbound ||
+        !managed_plan_owners_valid(*parents) || !managed_plan_owners_valid(*cleanup))
+        return huge::Error::Invalid;
+    // These private owners cannot change. Their full physical provenance and
+    // zero parent contents are checked OUTSIDE the exclusive/MM lock section.
+    for (uint16_t i = 0; i < cleanup->table_count + parents->table_count; ++i) {
+        bool const parent = i >= cleanup->table_count;
+        auto const index = parent ? static_cast<uint16_t>(i - cleanup->table_count) : i;
+        auto* storage = parent ? parents : cleanup;
+        if (!managed_batch_add_role(*batch, storage->table_physical[index], huge::detail::HugeMapTableRole::Prepared, 0, 0)) {
+            managed_batch_clear_borrowers(*batch);
+            return huge::Error::Invalid;
+        }
+        if (parent) {
+            auto const* words = reinterpret_cast<const uint64_t*>(storage->tables[index]);
+            for (size_t word = 0; word < paging::PAGE_TABLE_ENTRIES; ++word)
+                if (words[word] != 0) {
+                    managed_batch_clear_borrowers(*batch);
+                    return huge::Error::Invalid;
+                }
+        }
+    }
+    UserPagemapExclusiveScope exclusive(root);
+    if (!exclusive.owns(root)) {
+        managed_batch_clear_borrowers(*batch);
+        return huge::Error::Again;
+    }
+    uint64_t const cow = cow_pte_lock.lock_irqsave();
+    uint64_t const pin = user_mapping_pin_lock.lock_irqsave();
+    auto const error = managed_batch_preflight_locked(root, *batch, *parents);
+    if (error == huge::Error::None) {
+        // All children first. A borrowed old PT becomes an actual detached
+        // owner immediately after its own successful replacement, never before.
+        for (int level = 2; level <= 4; ++level)
+            for (uint16_t i = 0; i < batch->edit_count; ++i) {
+                auto const& edit = batch->edits[i];
+                if (edit.level != level) continue;
+                MutableUserEntrySlot slot;
+                if (!MutableUserEntrySlot::from(edit.table, edit.index, slot) ||
+                    !managed_replace_ad_locked(slot, edit.expected, edit.desired))
+                    __builtin_trap();
+                if (level == 2 && edit.expected != 0)
+                    batch->detached[batch->detached_count++] =
+                        reinterpret_cast<PageTable*>(addr::get_virt_pointer(edit.expected & PTE_FRAME_MASK));
+            }
+        for (uint16_t i = 0; i < batch->count; ++i) {
+            auto const& row = batch->leaves[i];
+            if (managed_huge_registry.publish_mapped(row.view.handle, row.key, row.view.physical_2m | batch->flags | (uint64_t{1} << 7)) !=
+                huge::Error::None)
+                __builtin_trap();
+        }
+        advance_ps_geometry_epoch_locked(root);
+        batch->published = true;
+    }
+    user_mapping_pin_lock.unlock_irqrestore(pin);
+    cow_pte_lock.unlock_irqrestore(cow);
+    if (error != huge::Error::None) {
+        managed_batch_clear_borrowers(*batch);
+        batch->adopted_mask = 0;
+        return error;
+    }
+    // No return/callback/reset between MM publication and all real transfers.
+    huge::detail::HugeMapBatchAccess::transfer_after_publish(owner);
+    flush_pagemap_after_update(root, 0, true);
+    batch->acknowledged = true;
+    managed_batch_clear_borrowers(*batch);
+    return huge::Error::None;
+}
+// END whole-batch managed mapper.
+
 auto present_mapping_entry(PageTable* root, vaddr_t vaddr) -> const PageTableEntry* {
     if (root == nullptr) {
         return nullptr;
@@ -6253,6 +6495,12 @@ auto selftest_publish_managed_huge(sched::task::Task& subject, uint64_t va, uint
         output.actual_full_flush_called = true;
     }
     return error;
+}
+auto selftest_publish_managed_huge_batch(PageTable* root, const ker::syscall::vmem::SharedVmemPublicationGuard& publication,
+                                         huge::PreparedHugeMapBatch& batch) -> huge::Error {
+    if (root == nullptr || root == kernel_pagemap) return huge::Error::Invalid;
+    selftest_require_mutable_pagemap_root(root, "managed-huge-batch");
+    return huge::detail::publish_prepared_huge_batch(root, publication, batch);
 }
 auto selftest_prepare_managed_split(sched::task::Task& subject, uint64_t start, uint64_t end, huge::PreparedTables& plan,
                                     const SelftestManagedHugeOptions& options) -> huge::Error {
@@ -11546,6 +11794,10 @@ auto selftest_deep_copy_user_pagemap_eager(PageTable* src, PageTable* dst, numa:
 
 // Managed-huge foundation adapters. No PTE publisher or user opt-in exists.
 namespace ker::mod::mm::huge::detail {
+auto publish_prepared_huge_batch(paging::PageTable* root, const ker::syscall::vmem::SharedVmemPublicationGuard& publication,
+                                 PreparedHugeMapBatch& batch) noexcept -> Error {
+    return virt::publish_managed_huge_batch_owned(root, publication, batch);
+}
 auto copy_current_user_pagemap_exclusive(sched::task::Task& actor, paging::PageTable* source, paging::PageTable* child,
                                          const sys::SyscallPreparationScope& preparation,
                                          const ker::syscall::vmem::SharedVmemPublicationGuard& publication, const RangeSplitSurvey& survey,

@@ -125,12 +125,10 @@ def test_munmap_and_mprotect_reject_overflowing_lengths() -> None:
     if "size = page_align_up(size)" in anon_free:
         fail("munmap must not use unchecked page_align_up(size)")
 
-    protect = block_between(
-        source,
-        "case ker::abi::vmem::ops::PROTECT:",
-        "case ker::abi::vmem::ops::MREMAP:",
-        "mprotect syscall case",
-    )
+    protect = function_body(source, "protect_range")
+    dispatch = block_between(source, "case ker::abi::vmem::ops::PROTECT:",
+                             "case ker::abi::vmem::ops::MREMAP:", "mprotect delegation")
+    require_tokens(dispatch, ["return protect_range(a1, a2, a3);"], "unchanged public protection arguments")
     require_order(
         protect,
         "int const SIZE_RET = align_user_vmem_size(size, &size)",
@@ -328,12 +326,10 @@ def test_kernel_managed_initial_layout_cannot_be_replaced() -> None:
         )
         if "overlaps_kernel_managed_user_layout_locked(task," not in body:
             fail(f"{function_name} must reject overlap with the kernel-managed initial layout")
-    protect = block_between(
-        vmem,
-        "case ker::abi::vmem::ops::PROTECT:",
-        "case ker::abi::vmem::ops::MREMAP:",
-        "mprotect syscall case",
-    )
+    protect = function_body(vmem, "protect_range")
+    dispatch = block_between(vmem, "case ker::abi::vmem::ops::PROTECT:",
+                             "case ker::abi::vmem::ops::MREMAP:", "mprotect delegation")
+    require_tokens(dispatch, ["return protect_range(a1, a2, a3);"], "unchanged public protection arguments")
     require_order(
         protect,
         "SharedVmemPublicationGuard publication_guard;",
@@ -354,9 +350,13 @@ def test_sysv_shm_publication_respects_vm_reservations_and_guards() -> None:
             "range_overlaps_shared_initial_layout(task, addr, size)",
             "range_overlaps_lazy_vmem(task, addr, size)",
             "is_page_mapped_or_reserved(task->pagemap, current)",
+            "is_page_mapped(task->pagemap, current)",
         ],
         "SysV SHM occupied-range check",
     )
+
+    require_order(range_check, "is_page_mapped_or_reserved(task->pagemap, current)",
+                  "is_page_mapped(task->pagemap, current)", "SysV SHM preserves ordinary occupied short circuit")
 
     layout_check = function_body(shm, "range_overlaps_shared_initial_layout")
     require_tokens(
@@ -379,6 +379,7 @@ def test_sysv_shm_publication_respects_vm_reservations_and_guards() -> None:
             "segment->attach_count++;",
             "g_lock.unlock_irqrestore(FLAGS);",
             "is_page_mapped_or_reserved(task->pagemap, PAGE_ADDR)",
+            "is_page_mapped(task->pagemap, PAGE_ADDR)",
             "map_page(task->pagemap, PAGE_ADDR",
             "attachment->publishing = false;",
             "attachment->active = true;",
@@ -906,7 +907,10 @@ def test_eager_and_reserved_placement_use_copied_actor_before_publication() -> N
          "anon_zero_page_flags(prot)", "auto page_context = placement;"],
         "NONE and genuine shared-zero branches precede private allocation",
     )
-    protect = block_between(source, "case ker::abi::vmem::ops::PROTECT:", "case ker::abi::vmem::ops::MREMAP:", "mprotect dispatch")
+    protect = function_body(source, "protect_range")
+    dispatch = block_between(source, "case ker::abi::vmem::ops::PROTECT:",
+                             "case ker::abi::vmem::ops::MREMAP:", "mprotect delegation")
+    require_tokens(dispatch, ["return protect_range(a1, a2, a3);"], "unchanged public protection arguments")
     require_ordered_tokens(
         protect,
         ["change_public_shared_file(*task, ADDR, size, true, PROT)",
@@ -1395,7 +1399,169 @@ def test_managed_anonymous_remove_preserves_prepared_ownership_and_stays_unwired
                    "managed removal retains existing geometry errno classes")
 
 
+def test_mixed_geometry_demotes_inside_the_existing_removal_publication():
+    source = SYS_VMEM_CPP.read_text()
+    caller = function_body(source, "remove_current_mixed_range")
+    require_cpp_tokens(caller, ["align_user_vmem_size(length, &aligned)", "start > UINT64_MAX - aligned",
+                               "PreparedRangeDemotion prepared(actor, preparation)", "prepared.prepare(start, start + aligned)",
+                               "anon_free(start, length, &prepared)"], "caller-born actual mixed geometry preparation")
+    require_order(caller, "prepared.prepare", "anon_free", "complete geometry preparation precedes the ordinary entry")
+    demote = function_body(source, "demote_prepared_range_locked")
+    require_cpp_tokens(demote, ["prepared.matches(actor, start, end)", "publication.acquired()", "prepared.ready_ = false",
+                               "SyscallPreparationScope::LegacyInterval legacy_context(prepared.preparation_)",
+                               "CurrentRangeSplitAdmission admission(actor, prepared.preparation_, publication)",
+                               "admission.validate_split_and_arm(prepared.survey_, prepared.tables_)"],
+                       "actual short borrowed-PUB demotion")
+    require_order(demote, "LegacyInterval", "CurrentRangeSplitAdmission", "ordinary PUB precedes the short legacy/root interval")
+    require_order(demote, "CurrentRangeSplitAdmission", "validate_split_and_arm", "actual admission grants geometry")
+    if any(token in demote for token in ("new ", "sync_file", "unregister", "unmap_page", "kern_yield", ".unlock(")):
+        fail("short geometry admission must not own allocation/backend or ordinary removal")
+    remove = function_body(source, "anon_free")
+    require_cpp_tokens(remove, ["if (prepared != nullptr && !prepared->matches(*task, addr, addr + size))",
+                               "if (prepared != nullptr && !prepared->ordinary_context())",
+                               "demote_prepared_range_locked(*task, addr, addr + size, publication_guard, *prepared)"],
+                       "internal optional port validates exact actor/range/context")
+    require_ordered_tokens(remove, ["public_shared_file_overlap", "SharedVmemPublicationGuard publication_guard",
+                                   "overlaps_kernel_managed_user_layout_locked", "demote_prepared_range_locked",
+                                   "sync_file_mmap_range", "unregister_file_mmap_range", "remove_shared_vmem_range_locked",
+                                   "unmap_page"], "same original PUB spans demotion and ordinary continuation")
+    public = function_body(source, "sys_vmem") + function_body(source, "sys_vmem_map") + function_body(source, "anon_mremap")
+    if "remove_current_mixed_range" in public or "&prepared" in public:
+        fail("mixed geometry port must stay privately unwired while public huge admission is closed")
+    typed = function_body(source, "change_public_shared_file")
+    require_cpp_tokens(typed, ["if (!exact || !binding->lifetime()->is_demand_shared()) return static_cast<uint64_t>(-EOPNOTSUPP)",
+                              "preflight_current_file_binding(task, *binding)", "metadata.commit()",
+                              "after_tlb.release_after_completed_tlb()"], "existing whole-binding TMPFS policy remains")
+
+
+def test_mixed_protection_preserves_preflight_and_one_publication() -> None:
+    source = SYS_VMEM_CPP.read_text()
+    helper = function_body(source, "protect_range")
+    require_ordered_tokens(helper,
+                          ["align_user_vmem_size(size, &size)", "ADDR + size > USER_SPACE_END",
+                           "prepared->matches(*task, ADDR, ADDR + size)", "prepared->ordinary_context()",
+                           "change_public_shared_file", "memory_policy_snapshot()",
+                           "SharedVmemPublicationGuard publication_guard;", "overlaps_kernel_managed_user_layout_locked",
+                           "authorize_shared_file_protection_locked", "is_page_write_restricted",
+                           "demote_prepared_range_locked(*task, ADDR, ADDR + size, publication_guard, *prepared)",
+                           "protect_shared_vmem_range_locked", "protect_anonymous_swap_page", "unify_page_flags",
+                           "materialize_reserved_page"], "same-PUB complete preflight, demotion, ordinary protection")
+    if helper.count("SharedVmemPublicationGuard publication_guard;") != 1 or ".~SharedVmemPublicationGuard" in helper:
+        fail("protection must retain its sole original publication owner")
+    caller = function_body(source, "protect_current_mixed_range")
+    require_ordered_tokens(caller, ["align_user_vmem_size(length, &aligned)", "start > UINT64_MAX - aligned",
+                                   "PreparedRangeDemotion prepared(actor, preparation)", "prepared.prepare(start, start + aligned)",
+                                   "protect_range(start, length, prot, &prepared)"], "caller-born checked full protection geometry")
+    record = source[source.index("class PreparedRangeDemotion {"):source.index("// The caller keeps this SAME PUB")]
+    require_cpp_tokens(record, ["start >= end", "end > USER_SPACE_END", "(start | end)"], "neutral complete-range geometry")
+    if "start < USER_SPACE_START" in record:
+        fail("internal geometry must preserve zero and sub4MiB protection compatibility")
+    free = function_body(source, "anon_free")
+    require_tokens(free, ["if (addr == 0)", "addr < USER_SPACE_START || addr >= USER_SPACE_END"], "public unmap lower bounds remain")
+    public = function_body(source, "sys_vmem") + function_body(source, "sys_vmem_map")
+    if "protect_current_mixed_range" in public or "&prepared" in public:
+        fail("private prepared protection must remain publicly unwired")
+
+
+def test_anonymous_fixed_preparation_preserves_existing_as_and_publication() -> None:
+    source = SYS_VMEM_CPP.read_text()
+    allocation = function_body(source, "anon_allocate")
+    def ordered(body, tokens, context):
+        require_ordered_tokens(re.sub(r"\s+", "", body), [re.sub(r"\s+", "", token) for token in tokens], context)
+    ordered(allocation, [
+        "task->memory_policy_snapshot()", "capture_allocation_context(MEMORY_POLICY, placement)",
+        "validate_prepared_anon_fixed(*task, hint, hint + size, *prepared)",
+        "SharedVmemPublicationGuard publication_guard", "AddressSpaceObservation observation(task)",
+        "overlaps_kernel_managed_user_layout_locked(task, hint, size)",
+        "public_shared_file_overlap(*task, hint, size)",
+        "observation.admit_mapping(task->pagemap, size, hint, size)",
+        "demote_prepared_range_locked(*task, vaddr, vaddr + size, publication_guard, *prepared)",
+        "release_fixed_mmap_range_locked(task, vaddr, size)",
+        "if (RESERVE_ONLY)", "if (PRIVATE_READ)", "if (USE_LAZY)", "if (PRIVATE_EAGER)",
+        "get_anon_zero_page()",
+    ], "anonymous fixed geometry must finish under the original AS/PUB before unchanged backing continuation")
+    require_cpp_tokens(allocation, [
+        "if (prepared != nullptr)",
+        "(flags & ker::abi::vmem::MAP_FIXED) == 0", "hint == 0",
+        "hint < USER_SPACE_START", "hint > USER_SPACE_END - size",
+        "if (PREPARED != 0) return static_cast<uint64_t>(PREPARED)",
+        "if (DEMOTION != 0) return static_cast<uint64_t>(DEMOTION)",
+    ], "optional fixed-only port must refuse before ordinary continuation")
+    require_cpp_tokens(source, [
+        "class PreparedRangeDemotion;", "extern auto validate_prepared_anon_fixed(",
+        "extern auto demote_prepared_range_locked(",
+        "auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, PreparedRangeDemotion* prepared) -> uint64_t",
+        "auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) -> uint64_t { return anon_allocate(hint, size, prot, flags, nullptr); }",
+    ], "opaque declarations and original four-operand delegate")
+    caller = function_body(source, "replace_current_anonymous_fixed")
+    require_cpp_tokens(source, ["uint64_t hint, uint64_t length, uint64_t prot, uint64_t flags) -> uint64_t"],
+                       "fixed continuation preserves high virtual addresses")
+    ordered(caller, [
+        "align_user_vmem_size(length, &aligned)",
+        "(flags & ker::abi::vmem::MAP_FIXED) == 0", "hint < USER_SPACE_START",
+        "PreparedRangeDemotion prepared(actor, preparation)", "prepared.prepare(hint, hint + aligned)",
+        "return anon_allocate(hint, length, prot, flags, &prepared)",
+    ], "caller-born fixed record preserves original length and full-width return")
+    validator = function_body(source, "validate_prepared_anon_fixed")
+    require_cpp_tokens(validator, ["!prepared.matches(actor, start, end)", "!prepared.ordinary_context()"],
+                       "record and actor/context must match before PUB")
+    if source.index("class PreparedRangeDemotion {") < source.index("auto anon_allocate("):
+        fail("fixed preparation must not move the full critical record before allocation")
+    public = function_body(source, "sys_vmem") + function_body(source, "sys_vmem_map")
+    if "replace_current_anonymous_fixed" in public or "&prepared" in public:
+        fail("fixed prepared continuation must stay privately unwired")
+
+
+
+def test_file_fixed_preparation_preserves_retained_description_and_publication() -> None:
+    source = SYS_VMEM_CPP.read_text()
+    body = function_body(source, "file_allocate")
+    def ordered(tokens, context):
+        require_ordered_tokens(re.sub(r"\s+", "", body), [re.sub(r"\s+", "", token) for token in tokens], context)
+    ordered([
+        "vfs_get_file_retain_checked(task, fd, captured_file)",
+        "retained_file(captured_file, release_file)", "vfs_fstat_file(file, &st)",
+        "authorize_file_mapping(", "file_mapping_offset_range_valid(offset, size)",
+        "return allocate_public_shared_tmpfs(*task, *file, st, hint, size, prot, flags, offset)",
+        "capture_allocation_context(task->memory_policy_snapshot(), placement)",
+        "std::optional<PreparedRangeDemotion> prepared", "if (preparation != nullptr)",
+        "prepared.emplace(*task, *preparation)", "prepared->prepare(hint, hint + size)",
+        "SharedVmemPublicationGuard publication_guard", "AddressSpaceObservation observation(task)",
+        "overlaps_kernel_managed_user_layout_locked(task, hint, size)",
+        "public_shared_file_overlap(*task, hint, size)",
+        "observation.admit_mapping(task->pagemap, size, hint, size)",
+        "demote_prepared_range_locked(*task, vaddr, vaddr + size, publication_guard, *prepared)",
+        "release_fixed_mmap_range_locked(task, vaddr, size)",
+        "if (LAZY_FILE)", "if (file_mmap_can_share(st, prot))", "read_file_mapping_exact(file",
+    ], "retained File prefix, prepared owner and original AS/PUB/backing order")
+    require_cpp_tokens(body, [
+        "(flags & ker::abi::vmem::MAP_FIXED) == 0", "hint == 0", "hint < USER_SPACE_START",
+        "hint > USER_SPACE_END - size", "hint % ker::mod::mm::paging::PAGE_SIZE != 0",
+        "if (PREPARED != 0) return static_cast<uint64_t>(PREPARED)",
+        "if (DEMOTION != 0) return static_cast<uint64_t>(DEMOTION)",
+    ], "only the explicit fixed borrowed-scope branch prepares or demotes")
+    require_cpp_tokens(source, [
+        "return file_allocate(task, hint, size, prot, flags, fd, offset, nullptr);",
+        "const ker::mod::sys::SyscallPreparationScope* preparation) -> uint64_t",
+    ], "original seven-operand File delegate retains null-mode behavior")
+    caller = function_body(source, "replace_current_file_fixed")
+    require_cpp_tokens(caller, [
+        "!preparation.ready()", "!sched::can_query_current_task()", "sched::get_current_task() != &actor",
+        "actor.type != sched::task::TaskType::PROCESS", "actor.state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE",
+        "actor.scheduler_transition_active.load(std::memory_order_acquire)", "actor.exit_in_progress.load(std::memory_order_acquire)",
+        "actor.syscall_account_start_us == 0", "!sched::interrupts_enabled()", "sched::preempt_count() != 0",
+        "return file_allocate(&actor, hint, length, prot, flags, fd, offset, &preparation)",
+    ], "unwired ordinary actual-actor entry refuses unsupported context before File work")
+    public = function_body(source, "sys_vmem") + function_body(source, "sys_vmem_map") + function_body(source, "anon_mremap")
+    if "replace_current_file_fixed" in public or "&preparation" in public:
+        fail("prepared File fixed entry must remain unwired and leave mremap separate")
+
+
 def main() -> None:
+    test_file_fixed_preparation_preserves_retained_description_and_publication()
+    test_mixed_geometry_demotes_inside_the_existing_removal_publication()
+    test_mixed_protection_preserves_preflight_and_one_publication()
+    test_anonymous_fixed_preparation_preserves_existing_as_and_publication()
     test_managed_anonymous_remove_preserves_prepared_ownership_and_stays_unwired()
     test_as_admission_precedes_mapping_mutation()
     test_munmap_and_mprotect_reject_overflowing_lengths()

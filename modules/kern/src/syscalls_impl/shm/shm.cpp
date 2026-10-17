@@ -229,7 +229,8 @@ auto range_is_free(ker::mod::sched::task::Task* task, uint64_t addr, uint64_t si
 
     uint64_t const END = addr + size;
     for (uint64_t current = addr; current < END; current += ker::mod::mm::paging::PAGE_SIZE) {
-        if (ker::mod::mm::virt::is_page_mapped_or_reserved(task->pagemap, current)) {
+        if (ker::mod::mm::virt::is_page_mapped_or_reserved(task->pagemap, current) ||
+            ker::mod::mm::virt::is_page_mapped(task->pagemap, current)) {
             return false;
         }
     }
@@ -521,7 +522,8 @@ auto shmat_impl(ker::mod::sched::task::Task* task, int shmid, uint64_t shmaddr, 
         uint64_t const PAGE_ADDR = ADDR + (i * ker::mod::mm::paging::PAGE_SIZE);
         // A direct publisher that does not yet participate in the shared-VM
         // mutex must not turn this transaction into a replacement mapping.
-        if (ker::mod::mm::virt::is_page_mapped_or_reserved(task->pagemap, PAGE_ADDR)) {
+        if (ker::mod::mm::virt::is_page_mapped_or_reserved(task->pagemap, PAGE_ADDR) ||
+            ker::mod::mm::virt::is_page_mapped(task->pagemap, PAGE_ADDR)) {
             rollback_attachment_pages(task, segment, ADDR, mapped_pages);
             abandon_attachment_publication(attachment);
             return to_errno(EINVAL);
