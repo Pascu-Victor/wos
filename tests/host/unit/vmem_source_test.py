@@ -128,7 +128,7 @@ def test_munmap_and_mprotect_reject_overflowing_lengths() -> None:
     protect = function_body(source, "protect_range")
     dispatch = block_between(source, "case ker::abi::vmem::ops::PROTECT:",
                              "case ker::abi::vmem::ops::MREMAP:", "mprotect delegation")
-    require_tokens(dispatch, ["return protect_range(a1, a2, a3);"], "unchanged public protection arguments")
+    require_tokens(dispatch, ["return protect_range(a1, a2, a3, nullptr, MutationRoute::Public);"], "unchanged public protection arguments")
     require_order(
         protect,
         "int const SIZE_RET = align_user_vmem_size(size, &size)",
@@ -329,7 +329,7 @@ def test_kernel_managed_initial_layout_cannot_be_replaced() -> None:
     protect = function_body(vmem, "protect_range")
     dispatch = block_between(vmem, "case ker::abi::vmem::ops::PROTECT:",
                              "case ker::abi::vmem::ops::MREMAP:", "mprotect delegation")
-    require_tokens(dispatch, ["return protect_range(a1, a2, a3);"], "unchanged public protection arguments")
+    require_tokens(dispatch, ["return protect_range(a1, a2, a3, nullptr, MutationRoute::Public);"], "unchanged public protection arguments")
     require_order(
         protect,
         "SharedVmemPublicationGuard publication_guard;",
@@ -910,7 +910,7 @@ def test_eager_and_reserved_placement_use_copied_actor_before_publication() -> N
     protect = function_body(source, "protect_range")
     dispatch = block_between(source, "case ker::abi::vmem::ops::PROTECT:",
                              "case ker::abi::vmem::ops::MREMAP:", "mprotect delegation")
-    require_tokens(dispatch, ["return protect_range(a1, a2, a3);"], "unchanged public protection arguments")
+    require_tokens(dispatch, ["return protect_range(a1, a2, a3, nullptr, MutationRoute::Public);"], "unchanged public protection arguments")
     require_ordered_tokens(
         protect,
         ["change_public_shared_file(*task, ADDR, size, true, PROT)",
@@ -1488,9 +1488,9 @@ def test_anonymous_fixed_preparation_preserves_existing_as_and_publication() -> 
         "if (DEMOTION != 0) return static_cast<uint64_t>(DEMOTION)",
     ], "optional fixed-only port must refuse before ordinary continuation")
     require_cpp_tokens(source, [
-        "class PreparedRangeDemotion;", "extern auto validate_prepared_anon_fixed(",
+        "class PreparedRangeDemotion {", "extern auto validate_prepared_anon_fixed(",
         "extern auto demote_prepared_range_locked(",
-        "auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, PreparedRangeDemotion* prepared) -> uint64_t",
+        "auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, PreparedRangeDemotion* prepared, MutationRoute route = MutationRoute::Legacy) -> uint64_t",
         "auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) -> uint64_t { return anon_allocate(hint, size, prot, flags, nullptr); }",
     ], "opaque declarations and original four-operand delegate")
     caller = function_body(source, "replace_current_anonymous_fixed")
@@ -1505,8 +1505,8 @@ def test_anonymous_fixed_preparation_preserves_existing_as_and_publication() -> 
     validator = function_body(source, "validate_prepared_anon_fixed")
     require_cpp_tokens(validator, ["!prepared.matches(actor, start, end)", "!prepared.ordinary_context()"],
                        "record and actor/context must match before PUB")
-    if source.index("class PreparedRangeDemotion {") < source.index("auto anon_allocate("):
-        fail("fixed preparation must not move the full critical record before allocation")
+    if source.count("class PreparedRangeDemotion {") != 1 or source.index("class PreparedRangeDemotion {") > source.index("class PublicRangeMutation {"):
+        fail("the public coordinator must own the one complete original prepared-record type")
     public = function_body(source, "sys_vmem") + function_body(source, "sys_vmem_map")
     if "replace_current_anonymous_fixed" in public or "&prepared" in public:
         fail("fixed prepared continuation must stay privately unwired")
@@ -1542,7 +1542,7 @@ def test_file_fixed_preparation_preserves_retained_description_and_publication()
     ], "only the explicit fixed borrowed-scope branch prepares or demotes")
     require_cpp_tokens(source, [
         "return file_allocate(task, hint, size, prot, flags, fd, offset, nullptr);",
-        "const ker::mod::sys::SyscallPreparationScope* preparation) -> uint64_t",
+        "const ker::mod::sys::SyscallPreparationScope* preparation, MutationRoute route = MutationRoute::Legacy) -> uint64_t",
     ], "original seven-operand File delegate retains null-mode behavior")
     caller = function_body(source, "replace_current_file_fixed")
     require_cpp_tokens(caller, [
@@ -1555,6 +1555,66 @@ def test_file_fixed_preparation_preserves_retained_description_and_publication()
     public = function_body(source, "sys_vmem") + function_body(source, "sys_vmem_map") + function_body(source, "anon_mremap")
     if "replace_current_file_fixed" in public or "&preparation" in public:
         fail("prepared File fixed entry must remain unwired and leave mremap separate")
+
+
+def test_public_mutations_use_current_geometry_and_finite_owner_free_handoff() -> None:
+    source = SYS_VMEM_CPP.read_text()
+    raw = function_body(source, "sys_vmem")
+    mapping = function_body(source, "sys_vmem_map")
+    require_cpp_tokens(raw, [
+        "return anon_allocate(a1, a2, a3, a4, nullptr, MutationRoute::Public)",
+        "return anon_free(a1, a2, nullptr, MutationRoute::Public)",
+        "return protect_range(a1, a2, a3, nullptr, MutationRoute::Public)",
+        "return anon_mremap(a1, a2, a3, a4)",
+    ], "actual public branches select the ordinary coordinator; mremap stays separate")
+    require_ordered_tokens(mapping, [
+        "(flags & ker::abi::vmem::MAP_ANONYMOUS) != 0",
+        "anon_allocate(hint, size, prot, flags, nullptr, MutationRoute::Public)",
+        "fd > static_cast<uint64_t>(std::numeric_limits<int>::max())",
+        "file_allocate(get_current_task(), hint, size, prot, flags, static_cast<int>(fd), offset, nullptr, MutationRoute::Public)",
+    ], "six-operand anonymous/fd/File precedence remains exact")
+    record = block_between(source, "class PublicRangeMutation {", "// Allocate anonymous memory", "public mutation state")
+    require_cpp_tokens(record, [
+        "const ker::mod::sys::SyscallPreparationScope* preparation", "RangeSplitCursor cursor_{}",
+        "CurrentRangeRootAccess access{}", "sched::PreemptGuard preempt", "acquire_current_range_root(actor_, access)",
+        "survey_current_range_chunk(actor_, *preparation_, publication, access, cursor_)",
+        "validate_current_range_geometry(actor_, *preparation_, publication, access, start_, end_, cursor_)",
+        "release_current_range_root(access)", "MutationStage::NeedGeometry", "MutationStage::NeedDemotion",
+        "if (count_attempted_ || demotion_) return -EAGAIN", "cursor_ = {}", "if (!cursor_.complete) sched::kern_yield()",
+        "demotion_.emplace(actor_, *preparation_)", "demotion_->prepare(start_, end_)",
+    ], "caller-born records and actual root proof; no invented success sentinel")
+    for name in ("anon_allocate", "anon_free", "protect_range", "file_allocate"):
+        body = function_body(source, name)
+        require_cpp_tokens(body, ["for (unsigned attempt = 0; attempt < 3; ++attempt)",
+            "MutationAttempt const outcome = [&]() -> MutationAttempt", "mutation.inspect(publication_guard)",
+            "mutation.demote(publication_guard)", "if (outcome.stage == MutationStage::Complete) return outcome.result",
+            "mutation.prepare_next(outcome.stage)"], name + " bounded typed pre-mutation stages")
+        require_order(body, "}();", "mutation.prepare_next(outcome.stage)", name + " drops final PUB/AS before preparation")
+    protect = function_body(source, "protect_range")
+    require_ordered_tokens(protect, ["authorize_shared_file_protection_locked", "mutation.inspect(publication_guard)",
+        "GEOMETRY.stage == MutationStage::NeedGeometry", "is_page_write_restricted", "GEOMETRY.stage == MutationStage::NeedDemotion",
+        "mutation.demote(publication_guard)", "protect_shared_vmem_range_locked"],
+        "supported Count precedes unsafe walker; permission refusal precedes table allocation")
+    file = function_body(source, "file_allocate")
+    require_ordered_tokens(file, ["std::optional<ker::mod::sys::SyscallPreparationScope> ordinary_preparation", "retained_file(captured_file, release_file)",
+        "vfs_fstat_file", "authorize_file_mapping", "file_mapping_offset_range_valid", "allocate_public_shared_tmpfs",
+        "capture_allocation_context", "ordinary_preparation.emplace(*task)", "PublicRangeMutation mutation",
+        "SharedVmemPublicationGuard publication_guard", "mutation.inspect", "mutation.demote", "release_fixed_mmap_range_locked"],
+        "one retained File/stat/backing survives handoff and closes before incoming IF restore")
+    if file.count("vfs_get_file_retain_checked") != 1 or file.count("vfs_fstat_file") != 1:
+        fail("public File preparation cannot reopen/re-stat its descriptor")
+    mm = VIRT_CPP.read_text()
+    matcher = function_body(mm, "current_mutation_access_matches")
+    require_cpp_tokens(matcher, ["publication.acquired()", "preparation.ready()", "sched::get_current_task() == &subject",
+        "sched::preempt_count() == 1", "access.subject == &subject", "access.local", "access.root == subject.pagemap",
+        "access.gate != virt::USER_PAGEMAP_ACCESS_GATE_NONE"], "actual borrowed blocking-PUB/current access proof")
+    validate = function_body(mm, "validate_current_range_geometry")
+    require_cpp_tokens(validate, ["cursor.start != start", "cursor.end != end", "!cursor.started", "!cursor.complete", "cursor.epoch_changed",
+        "cursor.count > MAX_ROOT_LEAVES", "cursor.stamp.root.address_bits != reinterpret_cast<uint64_t>(access.root)",
+        "control->serial == cursor.stamp.root.incarnation", "control->ps_geometry_epoch == cursor.stamp.epoch"],
+        "complete supported geometry authenticates exact live root and epoch, including managed count")
+    if "cursor.count != 0" in validate or "ps_admission_suspensions" in validate:
+        fail("public geometry proof must not reuse counted mremap PS-free authority")
 
 
 def test_mremap_policy_keeps_real_ownership_and_legacy_cleanup_boundary() -> None:
@@ -1612,6 +1672,7 @@ def test_mremap_policy_keeps_real_ownership_and_legacy_cleanup_boundary() -> Non
 
 
 def main() -> None:
+    test_public_mutations_use_current_geometry_and_finite_owner_free_handoff()
     test_mremap_policy_keeps_real_ownership_and_legacy_cleanup_boundary()
     test_file_fixed_preparation_preserves_retained_description_and_publication()
     test_mixed_geometry_demotes_inside_the_existing_removal_publication()

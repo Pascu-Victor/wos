@@ -419,15 +419,16 @@ def main() -> int:
     parser.add_argument("--mixed-protect-only", action="store_true", help="exercise prepared mixed geometry before the ordinary protection continuation")
     parser.add_argument("--anonymous-fixed-only", action="store_true", help="exercise private prepared anonymous fixed replacement and four new controls")
     parser.add_argument("--file-fixed-only", action="store_true", help="exercise private prepared retained-File fixed replacement and four new controls")
+    parser.add_argument("--public-mutation-only", action="store_true", help="exercise actual public mutation dispatch, geometry proof and four source controls")
     parser.add_argument("--shm-occupancy-only", action="store_true", help="exercise real SHM overlap rejection through PS-aware occupied walkers")
     parser.add_argument("--gtest-main", type=Path)
     parser.add_argument("--gtest", type=Path)
     parser.add_argument("--output", type=Path, help="fresh directory for small logs/results; scratch is always removed")
     options = parser.parse_args()
-    selected_profiles = (options.mremap_policy_only, options.fork_contract_only, options.fork_vm_coordinator_only, options.anonymous_remove_only, options.map_batch_only, options.mixed_geometry_only, options.mixed_protect_only, options.anonymous_fixed_only, options.file_fixed_only, options.shm_occupancy_only)
+    selected_profiles = (options.mremap_policy_only, options.fork_contract_only, options.fork_vm_coordinator_only, options.anonymous_remove_only, options.map_batch_only, options.mixed_geometry_only, options.mixed_protect_only, options.anonymous_fixed_only, options.file_fixed_only, options.public_mutation_only, options.shm_occupancy_only)
     if sum(selected_profiles) > 1:
         parser.error("select at most one explicit managed memory profile")
-    overall_seconds = 180 if options.mixed_protect_only or options.anonymous_fixed_only or options.file_fixed_only else OVERALL_SECONDS
+    overall_seconds = 180 if options.mixed_protect_only or options.anonymous_fixed_only or options.file_fixed_only or options.public_mutation_only else OVERALL_SECONDS
     root = options.source_root.resolve()
     host_build = options.host_build.resolve()
     overlay = options.kernel_overlay.resolve() if options.kernel_overlay else None
@@ -579,16 +580,16 @@ def main() -> int:
             policy_fixture.extend_context(context)
             selected.extend(pin(path) for path in policy_fixture.inputs)
         coordinator = None
-        if options.fork_vm_coordinator_only or options.anonymous_remove_only or options.mixed_geometry_only or options.mixed_protect_only or options.anonymous_fixed_only or options.file_fixed_only or options.shm_occupancy_only:
+        if options.fork_vm_coordinator_only or options.anonymous_remove_only or options.mixed_geometry_only or options.mixed_protect_only or options.anonymous_fixed_only or options.file_fixed_only or options.public_mutation_only or options.shm_occupancy_only:
             if options.shm_occupancy_only:
                 import managed_shm_occupancy_fixture as composition
-            elif options.mixed_geometry_only or options.mixed_protect_only or options.anonymous_fixed_only or options.file_fixed_only:
+            elif options.mixed_geometry_only or options.mixed_protect_only or options.anonymous_fixed_only or options.file_fixed_only or options.public_mutation_only:
                 import managed_mixed_geometry_fixture as composition
             elif options.anonymous_remove_only:
                 import managed_anonymous_remove_fixture as composition
             else:
                 import fork_vm_coordinator_fixture as composition
-            coordinator = (composition.FileFixedBuilder if options.file_fixed_only else composition.FixedBuilder if options.anonymous_fixed_only else composition.ProtectBuilder if options.mixed_protect_only else composition.Builder)(kernel_file, support, definition)
+            coordinator = (composition.PublicMutationBuilder if options.public_mutation_only else composition.FileFixedBuilder if options.file_fixed_only else composition.FixedBuilder if options.anonymous_fixed_only else composition.ProtectBuilder if options.mixed_protect_only else composition.Builder)(kernel_file, support, definition)
             coordinator.extend_context(context)
             selected.extend(pin(path) for path in coordinator.inputs)
         flags = compile_flags(row, overlay)
@@ -621,6 +622,9 @@ def main() -> int:
                 "auto copy_current_user_pagemap_exclusive(sched::task::Task&",
                 "auto acquire_current_range_root(sched::task::Task&",
                 "void release_current_range_root(CurrentRangeRootAccess&",
+                "auto current_mutation_access_matches(",
+                "auto survey_current_range_chunk(",
+                "auto validate_current_range_geometry(",
                 "auto survey_range_chunk(paging::PageTable*",
                 "auto commit_range_split(paging::PageTable*",
             )
@@ -795,7 +799,7 @@ def main() -> int:
         elif coordinator is not None:
             for label, bad, test in coordinator.controls(composite.read_text()):
                 mutant(label, bad, test)
-            if not (options.anonymous_remove_only or options.mixed_geometry_only or options.mixed_protect_only or options.anonymous_fixed_only or options.file_fixed_only or options.shm_occupancy_only):
+            if not (options.anonymous_remove_only or options.mixed_geometry_only or options.mixed_protect_only or options.anonymous_fixed_only or options.file_fixed_only or options.public_mutation_only or options.shm_occupancy_only):
                 for label, bad, test in coordinator.public.controls(public_source.read_text()):
                     mutant(label, bad, test, replace_index=3)
         elif options.fork_contract_only:

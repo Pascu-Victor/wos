@@ -19,6 +19,7 @@
 #include <limits>
 #include <memory>
 #include <new>
+#include <optional>
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/init/limine_requests.hpp>
@@ -2186,14 +2187,168 @@ void rollback_mapped_pages(ker::mod::sched::task::Task* task, uint64_t vaddr, ui
     }
 }
 
-// Opaque optional preparation port; keep the full record at its existing site.
-class PreparedRangeDemotion;
+// Private caller-born geometry preparation. The ordinary scope and current
+// Task outlive this record; prepared tables are destroyed outside final PUB.
+class PreparedRangeDemotion {
+   public:
+    PreparedRangeDemotion(ker::mod::sched::task::Task& actor, const ker::mod::sys::SyscallPreparationScope& preparation) noexcept
+        : actor_(actor), preparation_(preparation) {}
+    PreparedRangeDemotion(const PreparedRangeDemotion&) = delete;
+    auto operator=(const PreparedRangeDemotion&) -> PreparedRangeDemotion& = delete;
+
+    [[nodiscard]] auto prepare(uint64_t start, uint64_t end) -> int {
+        using namespace ker::mod;
+        if (attempted_) return -EINVAL;
+        attempted_ = true;
+        if (!ordinary_context()) return -EWOULDBLOCK;
+        if (start >= end || end > USER_SPACE_END || ((start | end) & (mm::paging::PAGE_SIZE - 1)) != 0) return -EINVAL;
+        if (actor_.native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr) return -EBUSY;
+        int const STATUS =
+            detail::managed_range_error(mm::huge::prepare_current_range_split(actor_, preparation_, start, end, survey_, tables_));
+        if (STATUS != 0) return STATUS;
+        start_ = start;
+        end_ = end;
+        ready_ = true;
+        return 0;
+    }
+
+    [[nodiscard]] auto ordinary_context() const noexcept -> bool {
+        using namespace ker::mod;
+        if (!preparation_.ready() || !sched::can_query_current_task() || sched::get_current_task() != &actor_ ||
+            actor_.type != sched::task::TaskType::PROCESS ||
+            actor_.state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE ||
+            actor_.scheduler_transition_active.load(std::memory_order_acquire) || actor_.exit_in_progress.load(std::memory_order_acquire) ||
+            actor_.syscall_account_start_us == 0 || !sched::interrupts_enabled() || sched::preempt_count() != 0)
+            return false;
+        return true;
+    }
+
+    [[nodiscard]] auto matches(const ker::mod::sched::task::Task& actor, uint64_t start, uint64_t end) const noexcept -> bool {
+        return ready_ && &actor == &actor_ && preparation_.ready() && start_ == start && end_ == end;
+    }
+
+   private:
+    friend auto demote_prepared_range_locked(ker::mod::sched::task::Task&, uint64_t, uint64_t, const SharedVmemPublicationGuard&,
+                                             PreparedRangeDemotion&) -> int;
+    ker::mod::sched::task::Task& actor_;
+    const ker::mod::sys::SyscallPreparationScope& preparation_;
+    ker::mod::mm::huge::RangeSplitSurvey survey_{};
+    ker::mod::mm::huge::PreparedTables tables_{};
+    uint64_t start_{}, end_{};
+    bool attempted_{}, ready_{};
+};
 extern auto validate_prepared_anon_fixed(ker::mod::sched::task::Task&, uint64_t, uint64_t, const PreparedRangeDemotion&) -> int;
 extern auto demote_prepared_range_locked(ker::mod::sched::task::Task&, uint64_t, uint64_t, const SharedVmemPublicationGuard&,
                                          PreparedRangeDemotion&) -> int;
 
+// Only actual public dispatch requests the ordinary current-PROCESS coordinator.
+// Legacy internal/nonfixed callers retain their existing unprepared route.
+enum class MutationRoute : uint8_t { Legacy, Public };
+enum class MutationStage : uint8_t { Complete, NeedGeometry, NeedDemotion };
+struct MutationAttempt {
+    uint64_t result{};
+    MutationStage stage{MutationStage::Complete};
+    MutationAttempt(uint64_t value) noexcept : result(value) {}
+    MutationAttempt(MutationStage next) noexcept : stage(next) {}
+};
+
+// Finite pre-mutation handoff only: one fast chunk, at most one complete Count,
+// and at most one prepared demotion. No PUB/root/AS owner survives a handoff.
+class PublicRangeMutation {
+   public:
+    PublicRangeMutation(ker::mod::sched::task::Task& actor, const ker::mod::sys::SyscallPreparationScope* preparation, uint64_t start,
+                        uint64_t end)
+        : actor_(actor), start_(start), end_(end), preparation_(preparation) {
+        cursor_.start = start;
+        cursor_.end = end;
+    }
+
+    [[nodiscard]] auto inspect(const SharedVmemPublicationGuard& publication) -> MutationAttempt {
+        using namespace ker::mod;
+        if (preparation_ == nullptr) return uint64_t{0};
+        if (!ordinary_context()) return static_cast<uint64_t>(-EWOULDBLOCK);
+        mm::huge::detail::CurrentRangeRootAccess access{};
+        mm::huge::Error error = mm::huge::Error::Again;
+        {
+            sched::PreemptGuard preempt;
+            error = mm::huge::detail::acquire_current_range_root(actor_, access);
+            if (error == mm::huge::Error::None) {
+                if (!cursor_.complete && !fast_attempted_) {
+                    fast_attempted_ = true;
+                    error = mm::huge::detail::survey_current_range_chunk(actor_, *preparation_, publication, access, cursor_);
+                }
+                if (error == mm::huge::Error::None && cursor_.complete)
+                    error = mm::huge::detail::validate_current_range_geometry(actor_, *preparation_, publication, access, start_, end_,
+                                                                              cursor_);
+            }
+            mm::huge::detail::release_current_range_root(access);
+        }
+        if (error == mm::huge::Error::Again && !count_attempted_ && !demotion_) return MutationStage::NeedGeometry;
+        if (error != mm::huge::Error::None) return static_cast<uint64_t>(detail::managed_range_error(error));
+        if (!cursor_.complete) return MutationStage::NeedGeometry;
+        if (cursor_.count != 0 && !demotion_) return MutationStage::NeedDemotion;
+        return uint64_t{0};
+    }
+
+    // Called only after the attempt lambda destroyed its AS/PUB/inner owners.
+    [[nodiscard]] auto prepare_next(MutationStage stage) -> int {
+        using namespace ker::mod;
+        if (!ordinary_context()) return -EWOULDBLOCK;
+        if (stage == MutationStage::NeedGeometry) {
+            if (count_attempted_ || demotion_) return -EAGAIN;
+            count_attempted_ = true;
+            cursor_ = {};
+            cursor_.start = start_;
+            cursor_.end = end_;
+            while (!cursor_.complete) {
+                if (!ordinary_context()) return -EWOULDBLOCK;
+                mm::huge::detail::CurrentRangeRootAccess access{};
+                mm::huge::Error error = mm::huge::Error::Again;
+                {
+                    SharedVmemPublicationGuard publication;
+                    {
+                        sched::PreemptGuard preempt;
+                        error = mm::huge::detail::acquire_current_range_root(actor_, access);
+                        if (error == mm::huge::Error::None)
+                            error = mm::huge::detail::survey_current_range_chunk(actor_, *preparation_, publication, access, cursor_);
+                        mm::huge::detail::release_current_range_root(access);
+                    }
+                }
+                if (error != mm::huge::Error::None) return detail::managed_range_error(error);
+                if (!cursor_.complete) sched::kern_yield();
+            }
+            return 0;
+        }
+        if (stage != MutationStage::NeedDemotion || demotion_) return -EAGAIN;
+        demotion_.emplace(actor_, *preparation_);
+        return demotion_->prepare(start_, end_);
+    }
+
+    [[nodiscard]] auto demote(const SharedVmemPublicationGuard& publication) -> int {
+        return demotion_ ? demote_prepared_range_locked(actor_, start_, end_, publication, *demotion_) : 0;
+    }
+
+   private:
+    [[nodiscard]] auto ordinary_context() const -> bool {
+        using namespace ker::mod;
+        return preparation_ && preparation_->ready() && sched::can_query_current_task() && sched::get_current_task() == &actor_ &&
+               actor_.type == sched::task::TaskType::PROCESS &&
+               actor_.state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE &&
+               !actor_.scheduler_transition_active.load(std::memory_order_acquire) &&
+               !actor_.exit_in_progress.load(std::memory_order_acquire) && actor_.syscall_account_start_us != 0 &&
+               sched::interrupts_enabled() && sched::preempt_count() == 0;
+    }
+    ker::mod::sched::task::Task& actor_;
+    uint64_t start_{}, end_{};
+    bool fast_attempted_{}, count_attempted_{};
+    const ker::mod::sys::SyscallPreparationScope* preparation_{};
+    std::optional<PreparedRangeDemotion> demotion_;
+    ker::mod::mm::huge::RangeSplitCursor cursor_{};
+};
+
 // Allocate anonymous memory
-auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, PreparedRangeDemotion* prepared) -> uint64_t {
+auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, PreparedRangeDemotion* prepared,
+                   MutationRoute route = MutationRoute::Legacy) -> uint64_t {
     // Get current task
     auto* task = get_current_task();
     if (task == nullptr) {
@@ -2258,150 +2413,169 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
         if (PREPARED != 0) return static_cast<uint64_t>(PREPARED);
     }
 
-    // Keep address selection/reservation, PTE installation, shared lazy-range
-    // metadata, cursor publication, and every rollback in one fork-visible
-    // transaction.
-    SharedVmemPublicationGuard publication_guard;
-    ker::mod::sched::resource::AddressSpaceObservation observation(task);
+    std::optional<ker::mod::sys::SyscallPreparationScope> ordinary_preparation;
+    if (route == MutationRoute::Public && (flags & ker::abi::vmem::MAP_FIXED) != 0 && hint != 0) ordinary_preparation.emplace(*task);
+    PublicRangeMutation mutation(*task, ordinary_preparation ? &*ordinary_preparation : nullptr, hint, hint + size);
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        MutationAttempt const outcome = [&]() -> MutationAttempt {
+            // Keep address selection/reservation, PTE installation, shared lazy-range
+            // metadata, cursor publication, and every rollback in one fork-visible
+            // transaction.
+            SharedVmemPublicationGuard publication_guard;
+            ker::mod::sched::resource::AddressSpaceObservation observation(task);
 
-    // Find a free virtual address range
-    uint64_t vaddr = 0;
-    bool const IS_FIXED = ((flags & ker::abi::vmem::MAP_FIXED) != 0) && hint != 0;
+            // Find a free virtual address range
+            uint64_t vaddr = 0;
+            bool const IS_FIXED = ((flags & ker::abi::vmem::MAP_FIXED) != 0) && hint != 0;
 
-    if (IS_FIXED) {
-        // MAP_FIXED: use exact address
-        if (hint < USER_SPACE_START || hint > USER_SPACE_END - size) {
-            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
-        }
-        if (hint % ker::mod::mm::paging::PAGE_SIZE != 0) {
-            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
-        }
-        if (overlaps_kernel_managed_user_layout_locked(task, hint, size)) {
-            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
-        }
-        if (public_shared_file_overlap(*task, hint, size)) return static_cast<uint64_t>(-EOPNOTSUPP);
-        vaddr = hint;
-        if (!observation.admit_mapping(task->pagemap, size, hint, size)) {
-            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
-        }
-    } else {
-        if (!observation.admit_mapping(task->pagemap, size)) {
-            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
-        }
-        uint64_t const RESERVE_RET = reserve_free_mmap_range_locked(task, size, hint, vaddr);
-        if (RESERVE_RET != 0) {
-            if (RESERVE_RET == ker::abi::vmem::VMEM_ENOMEM) {
-                log::warn("no free range found for size %x", size);
+            if (IS_FIXED) {
+                // MAP_FIXED: use exact address
+                if (hint < USER_SPACE_START || hint > USER_SPACE_END - size) {
+                    return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
+                }
+                if (hint % ker::mod::mm::paging::PAGE_SIZE != 0) {
+                    return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
+                }
+                if (overlaps_kernel_managed_user_layout_locked(task, hint, size)) {
+                    return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
+                }
+                if (public_shared_file_overlap(*task, hint, size)) return static_cast<uint64_t>(-EOPNOTSUPP);
+                vaddr = hint;
+                if (!observation.admit_mapping(task->pagemap, size, hint, size)) {
+                    return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+                }
+            } else {
+                if (!observation.admit_mapping(task->pagemap, size)) {
+                    return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+                }
+                uint64_t const RESERVE_RET = reserve_free_mmap_range_locked(task, size, hint, vaddr);
+                if (RESERVE_RET != 0) {
+                    if (RESERVE_RET == ker::abi::vmem::VMEM_ENOMEM) {
+                        log::warn("no free range found for size %x", size);
+                    }
+                    return -RESERVE_RET;
+                }
             }
-            return -RESERVE_RET;
-        }
+
+            bool const HAS_ADDRESS_RESERVATION = !IS_FIXED;
+            auto const NUM_PAGES = size / ker::mod::mm::paging::PAGE_SIZE;
+            if (IS_FIXED) {
+                MutationAttempt const GEOMETRY = mutation.inspect(publication_guard);
+                if (GEOMETRY.stage != MutationStage::Complete || GEOMETRY.result != 0) return GEOMETRY;
+                int const PUBLIC_DEMOTION = mutation.demote(publication_guard);
+                if (PUBLIC_DEMOTION != 0) return static_cast<uint64_t>(PUBLIC_DEMOTION);
+                if (prepared != nullptr) {
+                    int const DEMOTION = demote_prepared_range_locked(*task, vaddr, vaddr + size, publication_guard, *prepared);
+                    if (DEMOTION != 0) return static_cast<uint64_t>(DEMOTION);
+                }
+                release_fixed_mmap_range_locked(task, vaddr, size);
+            }
+
+            if (RESERVE_ONLY) {
+                if (!add_shared_vmem_range_locked(task, vaddr, size, prot, flags)) {
+                    release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
+                    return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+                }
+                advance_shared_mmap_cursor_locked(task, vaddr, size);
+                record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::ANON_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES,
+                                        1, 0, vmem_latency_since(PERF_STARTED_US), vaddr, size, true);
+                observation.commit_mapping();
+                return vaddr;
+            }
+
+            if (PRIVATE_READ) {
+                uint64_t const RESULT = private_anon_allocate_locked(task, vaddr, size, prot, hint, flags, placement);
+                int const RESULT_STATUS = perf_status_from_vmem_result(RESULT);
+                record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::ANON_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES,
+                                        0, RESULT_STATUS, vmem_latency_since(PERF_STARTED_US), RESULT_STATUS == 0 ? RESULT : hint, size,
+                                        true);
+                if (RESULT_STATUS != 0) {
+                    release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
+                }
+                return RESULT;
+            }
+
+            if (USE_LAZY) {
+                if (!add_shared_vmem_range_locked(task, vaddr, size, prot, flags)) {
+                    release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
+                    return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+                }
+                advance_shared_mmap_cursor_locked(task, vaddr, size);
+                record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::ANON_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES,
+                                        3, 0, vmem_latency_since(PERF_STARTED_US), vaddr, size, true);
+                observation.commit_mapping();
+                return vaddr;
+            }
+
+            if (PRIVATE_EAGER) {
+                uint64_t const RESULT = private_anon_allocate_locked(task, vaddr, size, prot, hint, flags, placement);
+                int const RESULT_STATUS = perf_status_from_vmem_result(RESULT);
+                record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::ANON_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES,
+                                        2, RESULT_STATUS, vmem_latency_since(PERF_STARTED_US), RESULT_STATUS == 0 ? RESULT : hint, size,
+                                        true);
+                if (RESULT_STATUS != 0) {
+                    release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
+                }
+                return RESULT;
+            }
+
+            void* const ZERO_PAGE = get_anon_zero_page();
+            if (ZERO_PAGE == nullptr) {
+                log::error("out of physical memory allocating anon zero page");
+                release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
+                return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+            }
+
+            // Anonymous mappings are initially backed by a shared read-only zero page.
+            // Writes fault through the existing COW path and allocate private pages only
+            // for memory that user space actually touches.
+            auto const PAGE_FLAGS = anon_zero_page_flags(prot);
+            auto const ZERO_PADDR = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(ZERO_PAGE)));
+            if (NUM_PAGES > std::numeric_limits<uint32_t>::max()) {
+                release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
+                return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EOVERFLOW);
+            }
+
+            ker::mod::mm::phys::page_ref_add(ZERO_PAGE, NUM_PAGES);
+            ker::mod::mm::virt::map_same_page_range(task->pagemap, vaddr, ZERO_PADDR, NUM_PAGES, PAGE_FLAGS);
+
+            for (uint64_t i = 0; i < NUM_PAGES; i++) {
+                auto current_vaddr = vaddr + (i * ker::mod::mm::paging::PAGE_SIZE);
+
+                if (is_watched_mmap_vaddr(current_vaddr)) {
+                    log::warn(
+                        "watch mmap-map: pid=%lu name=%s pagemap=%p kind=anon-zero vaddr=0x%llx phys=0x%llx hint=0x%llx size=0x%llx "
+                        "flags=0x%llx "
+                        "prot=0x%llx",
+                        task->pid, task->name, static_cast<void*>(task->pagemap), static_cast<unsigned long long>(current_vaddr),
+                        static_cast<unsigned long long>(ZERO_PADDR), static_cast<unsigned long long>(hint),
+                        static_cast<unsigned long long>(size), static_cast<unsigned long long>(flags),
+                        static_cast<unsigned long long>(prot));
+                }
+            }
+
+            if (!add_shared_vmem_range_locked(task, vaddr, size, prot, flags)) {
+                rollback_mapped_pages(task, vaddr, NUM_PAGES);
+                release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
+                return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+            }
+
+            advance_shared_mmap_cursor_locked(task, vaddr, size);
+            uint32_t const ELAPSED_US = vmem_latency_since(PERF_STARTED_US);
+            record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::ZERO_PAGE_MAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES,
+                                    0, 0, ELAPSED_US, vaddr, size, true);
+            record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::ANON_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES, 0, 0,
+                                    ELAPSED_US, vaddr, size, true);
+            return vaddr;
+        }();
+        if (outcome.stage == MutationStage::Complete) return outcome.result;
+        int const PREPARED_NEXT = mutation.prepare_next(outcome.stage);
+        if (PREPARED_NEXT != 0) return static_cast<uint64_t>(PREPARED_NEXT);
     }
-
-    bool const HAS_ADDRESS_RESERVATION = !IS_FIXED;
-    auto const NUM_PAGES = size / ker::mod::mm::paging::PAGE_SIZE;
-    if (IS_FIXED) {
-        if (prepared != nullptr) {
-            int const DEMOTION = demote_prepared_range_locked(*task, vaddr, vaddr + size, publication_guard, *prepared);
-            if (DEMOTION != 0) return static_cast<uint64_t>(DEMOTION);
-        }
-        release_fixed_mmap_range_locked(task, vaddr, size);
-    }
-
-    if (RESERVE_ONLY) {
-        if (!add_shared_vmem_range_locked(task, vaddr, size, prot, flags)) {
-            release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
-            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
-        }
-        advance_shared_mmap_cursor_locked(task, vaddr, size);
-        record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::ANON_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES, 1, 0,
-                                vmem_latency_since(PERF_STARTED_US), vaddr, size, true);
-        observation.commit_mapping();
-        return vaddr;
-    }
-
-    if (PRIVATE_READ) {
-        uint64_t const RESULT = private_anon_allocate_locked(task, vaddr, size, prot, hint, flags, placement);
-        int const RESULT_STATUS = perf_status_from_vmem_result(RESULT);
-        record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::ANON_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES, 0,
-                                RESULT_STATUS, vmem_latency_since(PERF_STARTED_US), RESULT_STATUS == 0 ? RESULT : hint, size, true);
-        if (RESULT_STATUS != 0) {
-            release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
-        }
-        return RESULT;
-    }
-
-    if (USE_LAZY) {
-        if (!add_shared_vmem_range_locked(task, vaddr, size, prot, flags)) {
-            release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
-            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
-        }
-        advance_shared_mmap_cursor_locked(task, vaddr, size);
-        record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::ANON_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES, 3, 0,
-                                vmem_latency_since(PERF_STARTED_US), vaddr, size, true);
-        observation.commit_mapping();
-        return vaddr;
-    }
-
-    if (PRIVATE_EAGER) {
-        uint64_t const RESULT = private_anon_allocate_locked(task, vaddr, size, prot, hint, flags, placement);
-        int const RESULT_STATUS = perf_status_from_vmem_result(RESULT);
-        record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::ANON_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES, 2,
-                                RESULT_STATUS, vmem_latency_since(PERF_STARTED_US), RESULT_STATUS == 0 ? RESULT : hint, size, true);
-        if (RESULT_STATUS != 0) {
-            release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
-        }
-        return RESULT;
-    }
-
-    void* const ZERO_PAGE = get_anon_zero_page();
-    if (ZERO_PAGE == nullptr) {
-        log::error("out of physical memory allocating anon zero page");
-        release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
-        return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
-    }
-
-    // Anonymous mappings are initially backed by a shared read-only zero page.
-    // Writes fault through the existing COW path and allocate private pages only
-    // for memory that user space actually touches.
-    auto const PAGE_FLAGS = anon_zero_page_flags(prot);
-    auto const ZERO_PADDR = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(ZERO_PAGE)));
-    if (NUM_PAGES > std::numeric_limits<uint32_t>::max()) {
-        release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
-        return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EOVERFLOW);
-    }
-
-    ker::mod::mm::phys::page_ref_add(ZERO_PAGE, NUM_PAGES);
-    ker::mod::mm::virt::map_same_page_range(task->pagemap, vaddr, ZERO_PADDR, NUM_PAGES, PAGE_FLAGS);
-
-    for (uint64_t i = 0; i < NUM_PAGES; i++) {
-        auto current_vaddr = vaddr + (i * ker::mod::mm::paging::PAGE_SIZE);
-
-        if (is_watched_mmap_vaddr(current_vaddr)) {
-            log::warn(
-                "watch mmap-map: pid=%lu name=%s pagemap=%p kind=anon-zero vaddr=0x%llx phys=0x%llx hint=0x%llx size=0x%llx flags=0x%llx "
-                "prot=0x%llx",
-                task->pid, task->name, static_cast<void*>(task->pagemap), static_cast<unsigned long long>(current_vaddr),
-                static_cast<unsigned long long>(ZERO_PADDR), static_cast<unsigned long long>(hint), static_cast<unsigned long long>(size),
-                static_cast<unsigned long long>(flags), static_cast<unsigned long long>(prot));
-        }
-    }
-
-    if (!add_shared_vmem_range_locked(task, vaddr, size, prot, flags)) {
-        rollback_mapped_pages(task, vaddr, NUM_PAGES);
-        release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
-        return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
-    }
-
-    advance_shared_mmap_cursor_locked(task, vaddr, size);
-    uint32_t const ELAPSED_US = vmem_latency_since(PERF_STARTED_US);
-    record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::ZERO_PAGE_MAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES, 0, 0,
-                            ELAPSED_US, vaddr, size, true);
-    record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::ANON_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES, 0, 0,
-                            ELAPSED_US, vaddr, size, true);
-    return vaddr;
+    return static_cast<uint64_t>(-EAGAIN);
 }
 
-// Original public/nonfixed route remains unprepared, including MAP_FIXED hint0.
+// Original internal/nonfixed delegate remains unprepared, including MAP_FIXED hint0.
 auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) -> uint64_t {
     return anon_allocate(hint, size, prot, flags, nullptr);
 }
@@ -2548,58 +2722,7 @@ auto allocate_public_shared_tmpfs(ker::mod::sched::task::Task& task, ker::vfs::F
     return static_cast<uint64_t>(-EAGAIN);
 }
 
-// Private caller-born geometry preparation. The ordinary scope and current
-// Task outlive this record; prepared tables are destroyed outside final PUB.
-class PreparedRangeDemotion {
-   public:
-    PreparedRangeDemotion(ker::mod::sched::task::Task& actor, const ker::mod::sys::SyscallPreparationScope& preparation) noexcept
-        : actor_(actor), preparation_(preparation) {}
-    PreparedRangeDemotion(const PreparedRangeDemotion&) = delete;
-    auto operator=(const PreparedRangeDemotion&) -> PreparedRangeDemotion& = delete;
-
-    [[nodiscard]] auto prepare(uint64_t start, uint64_t end) -> int {
-        using namespace ker::mod;
-        if (attempted_) return -EINVAL;
-        attempted_ = true;
-        if (!ordinary_context()) return -EWOULDBLOCK;
-        if (start >= end || end > USER_SPACE_END || ((start | end) & (mm::paging::PAGE_SIZE - 1)) != 0) return -EINVAL;
-        if (actor_.native_file_mapping_retirement.load(std::memory_order_acquire) != nullptr) return -EBUSY;
-        int const STATUS =
-            detail::managed_range_error(mm::huge::prepare_current_range_split(actor_, preparation_, start, end, survey_, tables_));
-        if (STATUS != 0) return STATUS;
-        start_ = start;
-        end_ = end;
-        ready_ = true;
-        return 0;
-    }
-
-    [[nodiscard]] auto ordinary_context() const noexcept -> bool {
-        using namespace ker::mod;
-        if (!preparation_.ready() || !sched::can_query_current_task() || sched::get_current_task() != &actor_ ||
-            actor_.type != sched::task::TaskType::PROCESS ||
-            actor_.state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE ||
-            actor_.scheduler_transition_active.load(std::memory_order_acquire) || actor_.exit_in_progress.load(std::memory_order_acquire) ||
-            actor_.syscall_account_start_us == 0 || !sched::interrupts_enabled() || sched::preempt_count() != 0)
-            return false;
-        return true;
-    }
-
-    [[nodiscard]] auto matches(const ker::mod::sched::task::Task& actor, uint64_t start, uint64_t end) const noexcept -> bool {
-        return ready_ && &actor == &actor_ && preparation_.ready() && start_ == start && end_ == end;
-    }
-
-   private:
-    friend auto demote_prepared_range_locked(ker::mod::sched::task::Task&, uint64_t, uint64_t, const SharedVmemPublicationGuard&,
-                                             PreparedRangeDemotion&) -> int;
-    ker::mod::sched::task::Task& actor_;
-    const ker::mod::sys::SyscallPreparationScope& preparation_;
-    ker::mod::mm::huge::RangeSplitSurvey survey_{};
-    ker::mod::mm::huge::PreparedTables tables_{};
-    uint64_t start_{}, end_{};
-    bool attempted_{}, ready_{};
-};
-
-// Defined after the complete type; the earlier allocation body sees only an opaque port.
+// The full prepared record is shared above; these validators keep the original continuation boundary.
 auto validate_prepared_anon_fixed(ker::mod::sched::task::Task& actor, uint64_t start, uint64_t end, const PreparedRangeDemotion& prepared)
     -> int {
     if (!prepared.matches(actor, start, end)) return -EINVAL;
@@ -2621,8 +2744,9 @@ auto demote_prepared_range_locked(ker::mod::sched::task::Task& actor, uint64_t s
     return detail::managed_range_error(admission.validate_split_and_arm(prepared.survey_, prepared.tables_));
 }
 
-// Free anonymous memory. The private optional port is unwired publicly.
-auto anon_free(uint64_t addr, uint64_t size, PreparedRangeDemotion* prepared = nullptr) -> uint64_t {
+// Free anonymous memory; optional private preparation and actual public geometry share the old continuation.
+auto anon_free(uint64_t addr, uint64_t size, PreparedRangeDemotion* prepared = nullptr, MutationRoute route = MutationRoute::Legacy)
+    -> uint64_t {
     // Get current task
     auto* task = get_current_task();
     if (task == nullptr) {
@@ -2664,62 +2788,78 @@ auto anon_free(uint64_t addr, uint64_t size, PreparedRangeDemotion* prepared = n
     if (prepared != nullptr && !prepared->ordinary_context()) return static_cast<uint64_t>(-EWOULDBLOCK);
     if (public_shared_file_overlap(*task, addr, size)) return change_public_shared_file(*task, addr, size, false);
 
-    // Fork must observe either the complete mapping or the complete removal,
-    // including file-range and lazy-range metadata.
-    SharedVmemPublicationGuard publication_guard;
-    if (public_shared_file_overlap(*task, addr, size)) return static_cast<uint64_t>(-EAGAIN);
-    ker::mod::sched::resource::AddressSpaceObservation observation(task);
-    if (overlaps_kernel_managed_user_layout_locked(task, addr, size)) {
-        return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
-    }
-
-    if (prepared != nullptr) {
-        int const DEMOTION = demote_prepared_range_locked(*task, addr, addr + size, publication_guard, *prepared);
-        if (DEMOTION != 0) return static_cast<uint64_t>(DEMOTION);
-    }
-
-    int const SYNC_RET = sync_file_mmap_range(*task, addr, size);
-    if (SYNC_RET < 0) {
-        return static_cast<uint64_t>(SYNC_RET);
-    }
-
-    int const UNREGISTER_RET = unregister_file_mmap_range(task->pagemap, addr, size);
-    if (UNREGISTER_RET < 0) {
-        return static_cast<uint64_t>(UNREGISTER_RET);
-    }
-
-    // Unmap pages
-    uint64_t const NUM_PAGES = size / ker::mod::mm::paging::PAGE_SIZE;
-    if (!remove_shared_vmem_range_locked(task, addr, size)) {
-        return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
-    }
-    for (uint64_t i = 0; i < NUM_PAGES; i++) {
-        uint64_t const CURRENT_VADDR = addr + (i * ker::mod::mm::paging::PAGE_SIZE);
-
-        bool const IS_MAPPED = ker::mod::mm::virt::is_page_mapped(task->pagemap, CURRENT_VADDR);
-        bool const IS_RESERVED = !IS_MAPPED && ker::mod::mm::virt::is_page_reserved(task->pagemap, CURRENT_VADDR);
-        if (IS_MAPPED || IS_RESERVED) {
-            if (is_watched_mmap_vaddr(CURRENT_VADDR)) {
-                auto const MAPPED_PHYS =
-                    IS_MAPPED ? ker::mod::sys::usercopy::mapped_physical_address(*task, CURRENT_VADDR) : ker::mod::mm::virt::PADDR_INVALID;
-                uint64_t const PHYS = MAPPED_PHYS != ker::mod::mm::virt::PADDR_INVALID ? MAPPED_PHYS : 0;
-                log::warn("watch mmap-unmap: pid=%lu name=%s pagemap=%p vaddr=0x%llx phys=0x%llx size=0x%llx", task->pid, task->name,
-                          static_cast<void*>(task->pagemap), static_cast<unsigned long long>(CURRENT_VADDR),
-                          static_cast<unsigned long long>(PHYS), static_cast<unsigned long long>(size));
+    std::optional<ker::mod::sys::SyscallPreparationScope> ordinary_preparation;
+    if (route == MutationRoute::Public) ordinary_preparation.emplace(*task);
+    PublicRangeMutation mutation(*task, ordinary_preparation ? &*ordinary_preparation : nullptr, addr, addr + size);
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        MutationAttempt const outcome = [&]() -> MutationAttempt {
+            // Fork must observe either the complete mapping or the complete removal,
+            // including file-range and lazy-range metadata.
+            SharedVmemPublicationGuard publication_guard;
+            if (public_shared_file_overlap(*task, addr, size)) return static_cast<uint64_t>(-EAGAIN);
+            ker::mod::sched::resource::AddressSpaceObservation observation(task);
+            if (overlaps_kernel_managed_user_layout_locked(task, addr, size)) {
+                return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
             }
-            // Unmap the page (this also frees the physical page)
-            ker::mod::mm::virt::unmap_page(task->pagemap, CURRENT_VADDR);
-        }
-    }
+
+            MutationAttempt const GEOMETRY = mutation.inspect(publication_guard);
+            if (GEOMETRY.stage != MutationStage::Complete || GEOMETRY.result != 0) return GEOMETRY;
+            int const PUBLIC_DEMOTION = mutation.demote(publication_guard);
+            if (PUBLIC_DEMOTION != 0) return static_cast<uint64_t>(PUBLIC_DEMOTION);
+            if (prepared != nullptr) {
+                int const DEMOTION = demote_prepared_range_locked(*task, addr, addr + size, publication_guard, *prepared);
+                if (DEMOTION != 0) return static_cast<uint64_t>(DEMOTION);
+            }
+
+            int const SYNC_RET = sync_file_mmap_range(*task, addr, size);
+            if (SYNC_RET < 0) {
+                return static_cast<uint64_t>(SYNC_RET);
+            }
+
+            int const UNREGISTER_RET = unregister_file_mmap_range(task->pagemap, addr, size);
+            if (UNREGISTER_RET < 0) {
+                return static_cast<uint64_t>(UNREGISTER_RET);
+            }
+
+            // Unmap pages
+            uint64_t const NUM_PAGES = size / ker::mod::mm::paging::PAGE_SIZE;
+            if (!remove_shared_vmem_range_locked(task, addr, size)) {
+                return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+            }
+            for (uint64_t i = 0; i < NUM_PAGES; i++) {
+                uint64_t const CURRENT_VADDR = addr + (i * ker::mod::mm::paging::PAGE_SIZE);
+
+                bool const IS_MAPPED = ker::mod::mm::virt::is_page_mapped(task->pagemap, CURRENT_VADDR);
+                bool const IS_RESERVED = !IS_MAPPED && ker::mod::mm::virt::is_page_reserved(task->pagemap, CURRENT_VADDR);
+                if (IS_MAPPED || IS_RESERVED) {
+                    if (is_watched_mmap_vaddr(CURRENT_VADDR)) {
+                        auto const MAPPED_PHYS = IS_MAPPED ? ker::mod::sys::usercopy::mapped_physical_address(*task, CURRENT_VADDR)
+                                                           : ker::mod::mm::virt::PADDR_INVALID;
+                        uint64_t const PHYS = MAPPED_PHYS != ker::mod::mm::virt::PADDR_INVALID ? MAPPED_PHYS : 0;
+                        log::warn("watch mmap-unmap: pid=%lu name=%s pagemap=%p vaddr=0x%llx phys=0x%llx size=0x%llx", task->pid,
+                                  task->name, static_cast<void*>(task->pagemap), static_cast<unsigned long long>(CURRENT_VADDR),
+                                  static_cast<unsigned long long>(PHYS), static_cast<unsigned long long>(size));
+                    }
+                    // Unmap the page (this also frees the physical page)
+                    ker::mod::mm::virt::unmap_page(task->pagemap, CURRENT_VADDR);
+                }
+            }
 #ifdef VMEM_DEBUG
-    log::debug("freed %x bytes at %p", size, addr);
+            log::debug("freed %x bytes at %p", size, addr);
 #endif
-    return 0;  // Success
+            return 0;  // Success
+        }();
+        if (outcome.stage == MutationStage::Complete) return outcome.result;
+        int const PREPARED_NEXT = mutation.prepare_next(outcome.stage);
+        if (PREPARED_NEXT != 0) return static_cast<uint64_t>(PREPARED_NEXT);
+    }
+    return static_cast<uint64_t>(-EAGAIN);
 }
 
-// The public path is unprepared. A private caller may lend geometry prepared
-// before this helper takes PUB; that same PUB covers the ordinary continuation.
-auto protect_range(uint64_t a1, uint64_t a2, uint64_t a3, PreparedRangeDemotion* prepared = nullptr) -> uint64_t {
+// A private caller may lend prepared geometry. Actual public dispatch uses
+// the finite ordinary coordinator; the same PUB covers the old continuation.
+auto protect_range(uint64_t a1, uint64_t a2, uint64_t a3, PreparedRangeDemotion* prepared = nullptr,
+                   MutationRoute route = MutationRoute::Legacy) -> uint64_t {
     auto* task = get_current_task();
     if (task == nullptr || task->pagemap == nullptr) {
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
@@ -2755,81 +2895,100 @@ auto protect_range(uint64_t a1, uint64_t a2, uint64_t a3, PreparedRangeDemotion*
             return static_cast<uint64_t>(CAPTURE == numa::AllocationError::INVALID_POLICY ? -EINVAL : -ENOMEM);
     }
 
-    SharedVmemPublicationGuard publication_guard;
-    if (public_shared_file_overlap(*task, ADDR, size)) return static_cast<uint64_t>(-EAGAIN);
-    if (overlaps_kernel_managed_user_layout_locked(task, ADDR, size)) {
-        return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
-    }
-
-    int const FILE_POLICY_RET = authorize_shared_file_protection_locked(task->pagemap, ADDR, size, PROT);
-    if (FILE_POLICY_RET != 0) return static_cast<uint64_t>(FILE_POLICY_RET);
-
-    // Validate the entire request before either lazy-range metadata or
-    // leaf permissions change. SHM publication uses this same guard.
-    if ((PROT & ker::abi::vmem::PROT_WRITE) != 0) {
-        uint64_t const END = ADDR + size;
-        uint64_t cursor = ADDR;
-        while (cursor < END) {
-            auto const OCCUPIED = first_pagemap_occupied_range(task->pagemap, cursor, END);
-            if (!OCCUPIED.found) {
-                break;
+    std::optional<ker::mod::sys::SyscallPreparationScope> ordinary_preparation;
+    if (route == MutationRoute::Public) ordinary_preparation.emplace(*task);
+    PublicRangeMutation mutation(*task, ordinary_preparation ? &*ordinary_preparation : nullptr, ADDR, ADDR + size);
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        MutationAttempt const outcome = [&]() -> MutationAttempt {
+            SharedVmemPublicationGuard publication_guard;
+            if (public_shared_file_overlap(*task, ADDR, size)) return static_cast<uint64_t>(-EAGAIN);
+            if (overlaps_kernel_managed_user_layout_locked(task, ADDR, size)) {
+                return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
             }
-            for (uint64_t page = OCCUPIED.start; page < OCCUPIED.end; page += ker::mod::mm::paging::PAGE_SIZE) {
-                if (ker::mod::mm::virt::is_page_write_restricted(task->pagemap, page)) {
-                    return static_cast<uint64_t>(-EACCES);
+
+            int const FILE_POLICY_RET = authorize_shared_file_protection_locked(task->pagemap, ADDR, size, PROT);
+            if (FILE_POLICY_RET != 0) return static_cast<uint64_t>(FILE_POLICY_RET);
+
+            MutationAttempt const GEOMETRY = mutation.inspect(publication_guard);
+            if (GEOMETRY.result != 0 || GEOMETRY.stage == MutationStage::NeedGeometry) return GEOMETRY;
+
+            // Validate the entire request before either lazy-range metadata or
+            // leaf permissions change. SHM publication uses this same guard.
+            if ((PROT & ker::abi::vmem::PROT_WRITE) != 0) {
+                uint64_t const END = ADDR + size;
+                uint64_t cursor = ADDR;
+                while (cursor < END) {
+                    auto const OCCUPIED = first_pagemap_occupied_range(task->pagemap, cursor, END);
+                    if (!OCCUPIED.found) {
+                        break;
+                    }
+                    for (uint64_t page = OCCUPIED.start; page < OCCUPIED.end; page += ker::mod::mm::paging::PAGE_SIZE) {
+                        if (ker::mod::mm::virt::is_page_write_restricted(task->pagemap, page)) {
+                            return static_cast<uint64_t>(-EACCES);
+                        }
+                    }
+                    uint64_t const NEXT = page_align_up(OCCUPIED.end);
+                    if (NEXT <= cursor) {
+                        break;
+                    }
+                    cursor = NEXT;
                 }
             }
-            uint64_t const NEXT = page_align_up(OCCUPIED.end);
-            if (NEXT <= cursor) {
-                break;
+
+            if (GEOMETRY.stage == MutationStage::NeedDemotion) return GEOMETRY;
+            int const PUBLIC_DEMOTION = mutation.demote(publication_guard);
+            if (PUBLIC_DEMOTION != 0) return static_cast<uint64_t>(PUBLIC_DEMOTION);
+
+            if (prepared != nullptr) {
+                int const DEMOTION = demote_prepared_range_locked(*task, ADDR, ADDR + size, publication_guard, *prepared);
+                if (DEMOTION != 0) return static_cast<uint64_t>(DEMOTION);
             }
-            cursor = NEXT;
-        }
-    }
 
-    if (prepared != nullptr) {
-        int const DEMOTION = demote_prepared_range_locked(*task, ADDR, ADDR + size, publication_guard, *prepared);
-        if (DEMOTION != 0) return static_cast<uint64_t>(DEMOTION);
-    }
-
-    if (!protect_shared_vmem_range_locked(task, ADDR, size, PROT)) {
-        return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
-    }
-
-    auto page_flags = prot_to_page_flags(PROT);
-    uint64_t const END = ADDR + size;
-    uint64_t cursor = ADDR;
-    while (cursor < END) {
-        auto const OCCUPIED = first_pagemap_occupied_range(task->pagemap, cursor, END);
-        if (!OCCUPIED.found) {
-            break;
-        }
-
-        for (uint64_t current_vaddr = OCCUPIED.start; current_vaddr < OCCUPIED.end; current_vaddr += ker::mod::mm::paging::PAGE_SIZE) {
-            if (ker::mod::mm::virt::protect_anonymous_swap_page(task->pagemap, current_vaddr, page_flags)) {
-                continue;
-            }
-            if (ker::mod::mm::virt::is_page_mapped(task->pagemap, current_vaddr)) {
-                ker::mod::mm::virt::unify_page_flags(task->pagemap, current_vaddr, page_flags);
-            } else if (ker::mod::mm::virt::is_page_reserved(task->pagemap, current_vaddr) &&
-                       !materialize_reserved_page(task, current_vaddr, PROT, placement)) {
+            if (!protect_shared_vmem_range_locked(task, ADDR, size, PROT)) {
                 return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
             }
-        }
 
-        uint64_t const NEXT = page_align_up(OCCUPIED.end);
-        if (NEXT <= cursor) {
-            break;
-        }
-        cursor = NEXT;
+            auto page_flags = prot_to_page_flags(PROT);
+            uint64_t const END = ADDR + size;
+            uint64_t cursor = ADDR;
+            while (cursor < END) {
+                auto const OCCUPIED = first_pagemap_occupied_range(task->pagemap, cursor, END);
+                if (!OCCUPIED.found) {
+                    break;
+                }
+
+                for (uint64_t current_vaddr = OCCUPIED.start; current_vaddr < OCCUPIED.end;
+                     current_vaddr += ker::mod::mm::paging::PAGE_SIZE) {
+                    if (ker::mod::mm::virt::protect_anonymous_swap_page(task->pagemap, current_vaddr, page_flags)) {
+                        continue;
+                    }
+                    if (ker::mod::mm::virt::is_page_mapped(task->pagemap, current_vaddr)) {
+                        ker::mod::mm::virt::unify_page_flags(task->pagemap, current_vaddr, page_flags);
+                    } else if (ker::mod::mm::virt::is_page_reserved(task->pagemap, current_vaddr) &&
+                               !materialize_reserved_page(task, current_vaddr, PROT, placement)) {
+                        return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+                    }
+                }
+
+                uint64_t const NEXT = page_align_up(OCCUPIED.end);
+                if (NEXT <= cursor) {
+                    break;
+                }
+                cursor = NEXT;
+            }
+
+            return 0;
+        }();
+        if (outcome.stage == MutationStage::Complete) return outcome.result;
+        int const PREPARED_NEXT = mutation.prepare_next(outcome.stage);
+        if (PREPARED_NEXT != 0) return static_cast<uint64_t>(PREPARED_NEXT);
     }
-
-    return 0;
+    return static_cast<uint64_t>(-EAGAIN);
 }
 
 // Allocate file-backed memory with one admitted open description.
 auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, int fd, uint64_t offset,
-                   const ker::mod::sys::SyscallPreparationScope* preparation) -> uint64_t {
+                   const ker::mod::sys::SyscallPreparationScope* preparation, MutationRoute route = MutationRoute::Legacy) -> uint64_t {
     if (task == nullptr || task->pagemap == nullptr) {
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
     }
@@ -2840,6 +2999,10 @@ auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t si
     if (size == 0) {
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
     }
+
+    // Storage precedes retained_file; delayed emplacement preserves its old
+    // prefix, and File's final put runs before ordinary IF is restored.
+    std::optional<ker::mod::sys::SyscallPreparationScope> ordinary_preparation;
 
     // Declared before publication_guard so even rollback's last File close
     // happens after shared VM publication unlocks. FD reuse cannot retarget us.
@@ -2903,108 +3066,194 @@ auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t si
         if (PREPARED != 0) return static_cast<uint64_t>(PREPARED);
     }
 
-    // Keep reservation, page-table construction, lazy/file metadata, and
-    // rollback indivisible with respect to fork's address-space snapshot.
-    SharedVmemPublicationGuard publication_guard;
-    ker::mod::sched::resource::AddressSpaceObservation observation(task);
+    if (route == MutationRoute::Public && (flags & ker::abi::vmem::MAP_FIXED) != 0 && hint != 0) ordinary_preparation.emplace(*task);
+    PublicRangeMutation mutation(*task, ordinary_preparation ? &*ordinary_preparation : nullptr, hint, hint + size);
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        MutationAttempt const outcome = [&]() -> MutationAttempt {
+            // Keep reservation, page-table construction, lazy/file metadata, and
+            // rollback indivisible with respect to fork's address-space snapshot.
+            SharedVmemPublicationGuard publication_guard;
+            ker::mod::sched::resource::AddressSpaceObservation observation(task);
 
-    uint64_t vaddr = 0;
-    bool const IS_FIXED = ((flags & ker::abi::vmem::MAP_FIXED) != 0) && hint != 0;
-    if (IS_FIXED) {
-        if (hint < USER_SPACE_START || hint > USER_SPACE_END - size) {
-            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
-        }
-        if (hint % ker::mod::mm::paging::PAGE_SIZE != 0) {
-            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
-        }
-        if (overlaps_kernel_managed_user_layout_locked(task, hint, size)) {
-            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
-        }
-        if (public_shared_file_overlap(*task, hint, size)) return static_cast<uint64_t>(-EOPNOTSUPP);
-        vaddr = hint;
-        if (!observation.admit_mapping(task->pagemap, size, hint, size)) {
-            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
-        }
-    } else {
-        if (!observation.admit_mapping(task->pagemap, size)) {
-            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
-        }
-        uint64_t const RESERVE_RET = reserve_free_mmap_range_locked(task, size, hint, vaddr);
-        if (RESERVE_RET != 0) {
-            return -RESERVE_RET;
-        }
-    }
-
-    bool const HAS_ADDRESS_RESERVATION = !IS_FIXED;
-    auto const PAGE_FLAGS = file_mapping_page_flags(prot, flags);
-    auto const NUM_PAGES = size / ker::mod::mm::paging::PAGE_SIZE;
-    bool const TRACK_FILE_MAPPING = (flags & ker::abi::vmem::MAP_SHARED) != 0;
-    bool const WRITEBACK = (st.st_mode & ker::vfs::S_IFMT) == ker::vfs::S_IFREG;
-    if (IS_FIXED) {
-        if (prepared) {
-            int const DEMOTION = demote_prepared_range_locked(*task, vaddr, vaddr + size, publication_guard, *prepared);
-            if (DEMOTION != 0) return static_cast<uint64_t>(DEMOTION);
-        }
-        release_fixed_mmap_range_locked(task, vaddr, size);
-    }
-
-    if (LAZY_FILE) {
-        if (!add_shared_lazy_file_vmem_range_locked(task, vaddr, size, prot, flags, file, offset, st)) {
-            (void)remove_shared_vmem_range_locked(task, vaddr, size);
-            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
-        }
-
-        if (TRACK_FILE_MAPPING) {
-            int const REGISTER_RET = register_file_mmap_range(task->pagemap, vaddr, REQUESTED_SIZE, offset, file, WRITEBACK);
-            if (REGISTER_RET < 0) {
-                (void)remove_shared_vmem_range_locked(task, vaddr, size);
-                return static_cast<uint64_t>(REGISTER_RET);
-            }
-        }
-
-        advance_shared_mmap_cursor_locked(task, vaddr, size);
-        record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::FILE_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES, 0, 0,
-                                vmem_latency_since(PERF_STARTED_US), vaddr, size, true);
-        observation.commit_mapping();
-        return vaddr;
-    }
-
-    if (file_mmap_can_share(st, prot)) {
-        bool cache_ok = true;
-        uint64_t mapped_pages = 0;
-        ker::mod::mm::virt::PageMapBatch map_batch{};
-        ker::mod::mm::virt::init_page_map_batch(&map_batch, task->pagemap, PAGE_FLAGS);
-        for (uint64_t i = 0; i < NUM_PAGES; i++) {
-            if (i > (std::numeric_limits<uint64_t>::max() - offset) / ker::mod::mm::paging::PAGE_SIZE) {
-                cache_ok = false;
-                break;
+            uint64_t vaddr = 0;
+            bool const IS_FIXED = ((flags & ker::abi::vmem::MAP_FIXED) != 0) && hint != 0;
+            if (IS_FIXED) {
+                if (hint < USER_SPACE_START || hint > USER_SPACE_END - size) {
+                    return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
+                }
+                if (hint % ker::mod::mm::paging::PAGE_SIZE != 0) {
+                    return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
+                }
+                if (overlaps_kernel_managed_user_layout_locked(task, hint, size)) {
+                    return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
+                }
+                if (public_shared_file_overlap(*task, hint, size)) return static_cast<uint64_t>(-EOPNOTSUPP);
+                vaddr = hint;
+                if (!observation.admit_mapping(task->pagemap, size, hint, size)) {
+                    return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+                }
+            } else {
+                if (!observation.admit_mapping(task->pagemap, size)) {
+                    return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+                }
+                uint64_t const RESERVE_RET = reserve_free_mmap_range_locked(task, size, hint, vaddr);
+                if (RESERVE_RET != 0) {
+                    return -RESERVE_RET;
+                }
             }
 
-            uint64_t const CURRENT_VADDR = vaddr + (i * ker::mod::mm::paging::PAGE_SIZE);
-            uint64_t const FILE_OFFSET = offset + (i * ker::mod::mm::paging::PAGE_SIZE);
-            uint64_t physical = 0;
-            if (!map_file_mmap_cached_page(&map_batch, file, st, CURRENT_VADDR, FILE_OFFSET, PAGE_FLAGS, physical)) {
-                cache_ok = false;
-                break;
+            bool const HAS_ADDRESS_RESERVATION = !IS_FIXED;
+            auto const PAGE_FLAGS = file_mapping_page_flags(prot, flags);
+            auto const NUM_PAGES = size / ker::mod::mm::paging::PAGE_SIZE;
+            bool const TRACK_FILE_MAPPING = (flags & ker::abi::vmem::MAP_SHARED) != 0;
+            bool const WRITEBACK = (st.st_mode & ker::vfs::S_IFMT) == ker::vfs::S_IFREG;
+            if (IS_FIXED) {
+                MutationAttempt const GEOMETRY = mutation.inspect(publication_guard);
+                if (GEOMETRY.stage != MutationStage::Complete || GEOMETRY.result != 0) return GEOMETRY;
+                int const PUBLIC_DEMOTION = mutation.demote(publication_guard);
+                if (PUBLIC_DEMOTION != 0) return static_cast<uint64_t>(PUBLIC_DEMOTION);
+                if (prepared) {
+                    int const DEMOTION = demote_prepared_range_locked(*task, vaddr, vaddr + size, publication_guard, *prepared);
+                    if (DEMOTION != 0) return static_cast<uint64_t>(DEMOTION);
+                }
+                release_fixed_mmap_range_locked(task, vaddr, size);
             }
 
-            uint64_t const PADDR = physical;
-            mapped_pages++;
+            if (LAZY_FILE) {
+                if (!add_shared_lazy_file_vmem_range_locked(task, vaddr, size, prot, flags, file, offset, st)) {
+                    (void)remove_shared_vmem_range_locked(task, vaddr, size);
+                    return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+                }
 
-            if (is_watched_mmap_vaddr(CURRENT_VADDR)) {
-                log::warn(
-                    "watch mmap-map: pid=%lu name=%s pagemap=%p kind=file-cache vaddr=0x%llx phys=0x%llx hint=0x%llx size=0x%llx "
-                    "flags=0x%llx prot=0x%llx fd=%d off=0x%llx",
-                    task->pid, task->name, static_cast<void*>(task->pagemap), static_cast<unsigned long long>(CURRENT_VADDR),
-                    static_cast<unsigned long long>(PADDR), static_cast<unsigned long long>(hint), static_cast<unsigned long long>(size),
-                    static_cast<unsigned long long>(flags), static_cast<unsigned long long>(prot), fd,
-                    static_cast<unsigned long long>(FILE_OFFSET));
+                if (TRACK_FILE_MAPPING) {
+                    int const REGISTER_RET = register_file_mmap_range(task->pagemap, vaddr, REQUESTED_SIZE, offset, file, WRITEBACK);
+                    if (REGISTER_RET < 0) {
+                        (void)remove_shared_vmem_range_locked(task, vaddr, size);
+                        return static_cast<uint64_t>(REGISTER_RET);
+                    }
+                }
+
+                advance_shared_mmap_cursor_locked(task, vaddr, size);
+                record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::FILE_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES,
+                                        0, 0, vmem_latency_since(PERF_STARTED_US), vaddr, size, true);
+                observation.commit_mapping();
+                return vaddr;
             }
-        }
 
-        if (cache_ok) {
-            ker::mod::mm::virt::flush_page_map_batch(&map_batch);
-            if (TRACK_FILE_MAPPING) {
+            if (file_mmap_can_share(st, prot)) {
+                bool cache_ok = true;
+                uint64_t mapped_pages = 0;
+                ker::mod::mm::virt::PageMapBatch map_batch{};
+                ker::mod::mm::virt::init_page_map_batch(&map_batch, task->pagemap, PAGE_FLAGS);
+                for (uint64_t i = 0; i < NUM_PAGES; i++) {
+                    if (i > (std::numeric_limits<uint64_t>::max() - offset) / ker::mod::mm::paging::PAGE_SIZE) {
+                        cache_ok = false;
+                        break;
+                    }
+
+                    uint64_t const CURRENT_VADDR = vaddr + (i * ker::mod::mm::paging::PAGE_SIZE);
+                    uint64_t const FILE_OFFSET = offset + (i * ker::mod::mm::paging::PAGE_SIZE);
+                    uint64_t physical = 0;
+                    if (!map_file_mmap_cached_page(&map_batch, file, st, CURRENT_VADDR, FILE_OFFSET, PAGE_FLAGS, physical)) {
+                        cache_ok = false;
+                        break;
+                    }
+
+                    uint64_t const PADDR = physical;
+                    mapped_pages++;
+
+                    if (is_watched_mmap_vaddr(CURRENT_VADDR)) {
+                        log::warn(
+                            "watch mmap-map: pid=%lu name=%s pagemap=%p kind=file-cache vaddr=0x%llx phys=0x%llx hint=0x%llx size=0x%llx "
+                            "flags=0x%llx prot=0x%llx fd=%d off=0x%llx",
+                            task->pid, task->name, static_cast<void*>(task->pagemap), static_cast<unsigned long long>(CURRENT_VADDR),
+                            static_cast<unsigned long long>(PADDR), static_cast<unsigned long long>(hint),
+                            static_cast<unsigned long long>(size), static_cast<unsigned long long>(flags),
+                            static_cast<unsigned long long>(prot), fd, static_cast<unsigned long long>(FILE_OFFSET));
+                    }
+                }
+
+                if (cache_ok) {
+                    ker::mod::mm::virt::flush_page_map_batch(&map_batch);
+                    if (TRACK_FILE_MAPPING) {
+                        int const REGISTER_RET = register_file_mmap_range(task->pagemap, vaddr, REQUESTED_SIZE, offset, file, WRITEBACK);
+                        if (REGISTER_RET < 0) {
+                            rollback_mapped_pages(task, vaddr, mapped_pages);
+                            release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
+                            return static_cast<uint64_t>(REGISTER_RET);
+                        }
+                    }
+                    release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
+                    advance_shared_mmap_cursor_locked(task, vaddr, size);
+                    record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::FILE_MMAP, ker::mod::perf::WkiPerfPhase::END,
+                                            NUM_PAGES, 0, 0, vmem_latency_since(PERF_STARTED_US), vaddr, size, true);
+                    return vaddr;
+                }
+
+                ker::mod::mm::virt::flush_page_map_batch(&map_batch);
+                rollback_mapped_pages(task, vaddr, mapped_pages);
+            }
+
+            // Read file content into the backing pages. File-backed mmap must not
+            // mutate the descriptor offset, and positional reads avoid remote VFS
+            // sequential read-ahead while materializing ELF segments.
+            auto const FILE_SIZE = static_cast<uint64_t>(st.st_size);
+            uint64_t mapped_pages = 0;
+            for (uint64_t i = 0; i < NUM_PAGES; i++) {
+                auto current_vaddr = vaddr + (i * ker::mod::mm::paging::PAGE_SIZE);
+                auto page_context = placement;
+                page_context.virtual_page_index = current_vaddr / ker::mod::mm::paging::PAGE_SIZE;
+                numa::AllocationResult allocation;
+                numa::try_allocate_pages_into(allocation, page_context, 1, ker::mod::mm::paging::PAGE_SIZE,
+                                              ker::mod::mm::PhysicalPageOwner::USER_FILE_MAPPING,
+                                              ker::mod::mm::phys::PageInitialization::ZERO, numa::ReclaimMode::LEGACY_UMA, "vmem-file");
+                void* const PHYS_PAGE = allocation.span.data();
+                if (PHYS_PAGE == nullptr) {
+                    rollback_mapped_pages(task, vaddr, mapped_pages);
+                    release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
+                    return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+                }
+                std::memset(PHYS_PAGE, 0, ker::mod::mm::paging::PAGE_SIZE);
+
+                if (i > (std::numeric_limits<uint64_t>::max() - offset) / ker::mod::mm::paging::PAGE_SIZE) {
+                    rollback_mapped_pages(task, vaddr, mapped_pages);
+                    release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
+                    return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EOVERFLOW);
+                }
+
+                uint64_t const FILE_OFFSET = offset + (i * ker::mod::mm::paging::PAGE_SIZE);
+                if (FILE_OFFSET < FILE_SIZE) {
+                    uint64_t const READ_SIZE = std::min<uint64_t>(ker::mod::mm::paging::PAGE_SIZE, FILE_SIZE - FILE_OFFSET);
+                    if (FILE_OFFSET > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+                        rollback_mapped_pages(task, vaddr, mapped_pages);
+                        release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
+                        return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EOVERFLOW);
+                    }
+
+                    if (!read_file_mapping_exact(file, PHYS_PAGE, static_cast<size_t>(READ_SIZE), FILE_OFFSET)) {
+                        rollback_mapped_pages(task, vaddr, mapped_pages);
+                        release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
+                        return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
+                    }
+                }
+
+                auto paddr = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(PHYS_PAGE)));
+                ker::mod::mm::virt::map_page(task->pagemap, current_vaddr, paddr, PAGE_FLAGS);
+                (void)allocation.span.release();  // Returned map_page transferred the frame to its PTE.
+                mapped_pages++;
+                if (is_watched_mmap_vaddr(current_vaddr)) {
+                    log::warn(
+                        "watch mmap-map: pid=%lu name=%s pagemap=%p kind=file vaddr=0x%llx phys=0x%llx hint=0x%llx size=0x%llx "
+                        "flags=0x%llx "
+                        "prot=0x%llx fd=%d off=0x%llx",
+                        task->pid, task->name, static_cast<void*>(task->pagemap), static_cast<unsigned long long>(current_vaddr),
+                        static_cast<unsigned long long>(paddr), static_cast<unsigned long long>(hint),
+                        static_cast<unsigned long long>(size), static_cast<unsigned long long>(flags),
+                        static_cast<unsigned long long>(prot), fd, static_cast<unsigned long long>(FILE_OFFSET));
+                }
+            }
+
+            if (TRACK_FILE_MAPPING && REQUESTED_SIZE > 0) {
                 int const REGISTER_RET = register_file_mmap_range(task->pagemap, vaddr, REQUESTED_SIZE, offset, file, WRITEBACK);
                 if (REGISTER_RET < 0) {
                     rollback_mapped_pages(task, vaddr, mapped_pages);
@@ -3012,92 +3261,21 @@ auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t si
                     return static_cast<uint64_t>(REGISTER_RET);
                 }
             }
+
             release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
             advance_shared_mmap_cursor_locked(task, vaddr, size);
             record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::FILE_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES, 0, 0,
                                     vmem_latency_since(PERF_STARTED_US), vaddr, size, true);
             return vaddr;
-        }
-
-        ker::mod::mm::virt::flush_page_map_batch(&map_batch);
-        rollback_mapped_pages(task, vaddr, mapped_pages);
+        }();
+        if (outcome.stage == MutationStage::Complete) return outcome.result;
+        int const PREPARED_NEXT = mutation.prepare_next(outcome.stage);
+        if (PREPARED_NEXT != 0) return static_cast<uint64_t>(PREPARED_NEXT);
     }
-
-    // Read file content into the backing pages. File-backed mmap must not
-    // mutate the descriptor offset, and positional reads avoid remote VFS
-    // sequential read-ahead while materializing ELF segments.
-    auto const FILE_SIZE = static_cast<uint64_t>(st.st_size);
-    uint64_t mapped_pages = 0;
-    for (uint64_t i = 0; i < NUM_PAGES; i++) {
-        auto current_vaddr = vaddr + (i * ker::mod::mm::paging::PAGE_SIZE);
-        auto page_context = placement;
-        page_context.virtual_page_index = current_vaddr / ker::mod::mm::paging::PAGE_SIZE;
-        numa::AllocationResult allocation;
-        numa::try_allocate_pages_into(allocation, page_context, 1, ker::mod::mm::paging::PAGE_SIZE,
-                                      ker::mod::mm::PhysicalPageOwner::USER_FILE_MAPPING, ker::mod::mm::phys::PageInitialization::ZERO,
-                                      numa::ReclaimMode::LEGACY_UMA, "vmem-file");
-        void* const PHYS_PAGE = allocation.span.data();
-        if (PHYS_PAGE == nullptr) {
-            rollback_mapped_pages(task, vaddr, mapped_pages);
-            release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
-            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
-        }
-        std::memset(PHYS_PAGE, 0, ker::mod::mm::paging::PAGE_SIZE);
-
-        if (i > (std::numeric_limits<uint64_t>::max() - offset) / ker::mod::mm::paging::PAGE_SIZE) {
-            rollback_mapped_pages(task, vaddr, mapped_pages);
-            release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
-            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EOVERFLOW);
-        }
-
-        uint64_t const FILE_OFFSET = offset + (i * ker::mod::mm::paging::PAGE_SIZE);
-        if (FILE_OFFSET < FILE_SIZE) {
-            uint64_t const READ_SIZE = std::min<uint64_t>(ker::mod::mm::paging::PAGE_SIZE, FILE_SIZE - FILE_OFFSET);
-            if (FILE_OFFSET > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
-                rollback_mapped_pages(task, vaddr, mapped_pages);
-                release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
-                return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EOVERFLOW);
-            }
-
-            if (!read_file_mapping_exact(file, PHYS_PAGE, static_cast<size_t>(READ_SIZE), FILE_OFFSET)) {
-                rollback_mapped_pages(task, vaddr, mapped_pages);
-                release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
-                return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
-            }
-        }
-
-        auto paddr = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(PHYS_PAGE)));
-        ker::mod::mm::virt::map_page(task->pagemap, current_vaddr, paddr, PAGE_FLAGS);
-        (void)allocation.span.release();  // Returned map_page transferred the frame to its PTE.
-        mapped_pages++;
-        if (is_watched_mmap_vaddr(current_vaddr)) {
-            log::warn(
-                "watch mmap-map: pid=%lu name=%s pagemap=%p kind=file vaddr=0x%llx phys=0x%llx hint=0x%llx size=0x%llx flags=0x%llx "
-                "prot=0x%llx fd=%d off=0x%llx",
-                task->pid, task->name, static_cast<void*>(task->pagemap), static_cast<unsigned long long>(current_vaddr),
-                static_cast<unsigned long long>(paddr), static_cast<unsigned long long>(hint), static_cast<unsigned long long>(size),
-                static_cast<unsigned long long>(flags), static_cast<unsigned long long>(prot), fd,
-                static_cast<unsigned long long>(FILE_OFFSET));
-        }
-    }
-
-    if (TRACK_FILE_MAPPING && REQUESTED_SIZE > 0) {
-        int const REGISTER_RET = register_file_mmap_range(task->pagemap, vaddr, REQUESTED_SIZE, offset, file, WRITEBACK);
-        if (REGISTER_RET < 0) {
-            rollback_mapped_pages(task, vaddr, mapped_pages);
-            release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
-            return static_cast<uint64_t>(REGISTER_RET);
-        }
-    }
-
-    release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION);
-    advance_shared_mmap_cursor_locked(task, vaddr, size);
-    record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::FILE_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES, 0, 0,
-                            vmem_latency_since(PERF_STARTED_US), vaddr, size, true);
-    return vaddr;
+    return static_cast<uint64_t>(-EAGAIN);
 }
 
-// Original public/native File route remains unprepared, including FIXED hint0.
+// Original internal/native File delegate remains unprepared, including FIXED hint0.
 auto file_allocate(ker::mod::sched::task::Task* task, uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, int fd, uint64_t offset)
     -> uint64_t {
     return file_allocate(task, hint, size, prot, flags, fd, offset, nullptr);
@@ -3153,8 +3331,8 @@ auto protect_current_mixed_range(ker::mod::sched::task::Task& actor, const ker::
     return static_cast<int>(protect_range(start, length, prot, &prepared));
 }
 
-// Private fixed-only replacement; actual public and mremap callers keep the
-// four-operand delegate. The borrowed actor/scope outlive this named record.
+// Private fixed-only replacement. Internal mremap retains its four-operand
+// delegate; the borrowed actor/scope outlive this named record.
 auto replace_current_anonymous_fixed(ker::mod::sched::task::Task& actor, const ker::mod::sys::SyscallPreparationScope& preparation,
                                      uint64_t hint, uint64_t length, uint64_t prot, uint64_t flags) -> uint64_t {
     uint64_t aligned = 0;
@@ -5534,20 +5712,20 @@ auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -
             // a2: size
             // a3: protection flags
             // a4: mapping flags
-            return anon_allocate(a1, a2, a3, a4);
+            return anon_allocate(a1, a2, a3, a4, nullptr, MutationRoute::Public);
         }
 
         case ker::abi::vmem::ops::ANON_FREE: {
             // a1: address
             // a2: size
-            return anon_free(a1, a2);
+            return anon_free(a1, a2, nullptr, MutationRoute::Public);
         }
 
         case ker::abi::vmem::ops::PROTECT: {
             // a1: address
             // a2: size
             // a3: new protection flags
-            return protect_range(a1, a2, a3);
+            return protect_range(a1, a2, a3, nullptr, MutationRoute::Public);
         }
 
         case ker::abi::vmem::ops::MREMAP: {
@@ -5587,7 +5765,7 @@ auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -
 
 auto sys_vmem_map(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, uint64_t fd, uint64_t offset) -> uint64_t {
     if ((flags & ker::abi::vmem::MAP_ANONYMOUS) != 0) {
-        uint64_t const RESULT = anon_allocate(hint, size, prot, flags);
+        uint64_t const RESULT = anon_allocate(hint, size, prot, flags, nullptr, MutationRoute::Public);
         if (static_cast<int64_t>(RESULT) < 0) {
             log::warn("anon mmap failed: ret=%ld hint=0x%llx size=0x%llx flags=0x%llx prot=0x%llx",
                       static_cast<long>(static_cast<int64_t>(RESULT)), static_cast<unsigned long long>(hint),
@@ -5603,7 +5781,8 @@ auto sys_vmem_map(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, u
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
     }
 
-    uint64_t const RESULT = file_allocate(get_current_task(), hint, size, prot, flags, static_cast<int>(fd), offset);
+    uint64_t const RESULT =
+        file_allocate(get_current_task(), hint, size, prot, flags, static_cast<int>(fd), offset, nullptr, MutationRoute::Public);
     if (static_cast<int64_t>(RESULT) < 0) {
         log::warn("file mmap failed: ret=%ld fd=%llu hint=0x%llx size=0x%llx flags=0x%llx prot=0x%llx off=0x%llx",
                   static_cast<long>(static_cast<int64_t>(RESULT)), static_cast<unsigned long long>(fd),

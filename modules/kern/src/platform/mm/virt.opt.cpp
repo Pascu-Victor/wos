@@ -8623,10 +8623,11 @@ bool selftest_anonymous_swap_is_swapped(PageTable* pagemap, vaddr_t vaddr) {
 
 namespace {
 template <bool StopAtFirst = false>
-auto count_virtual_bytes_in_table(PageTable* table, unsigned level, uint64_t base, uint64_t start, uint64_t end) -> uint64_t {
+auto count_virtual_bytes_in_table(PageTable* table, unsigned level, uint64_t base, uint64_t start, uint64_t end, uint64_t& bytes) -> bool {
+    bytes = 0;
     unsigned const SHIFT = paging::PAGE_SHIFT + 9 * (level - 1);
     uint64_t const STRIDE = uint64_t{1} << SHIFT;
-    uint64_t bytes = 0;
+    uint64_t total_bytes = 0;
     size_t const FIRST = static_cast<size_t>((start - base) >> SHIFT);
     size_t const LAST = static_cast<size_t>((end - 1 - base) >> SHIFT);
     if (level == 1) {
@@ -8638,13 +8639,15 @@ auto count_virtual_bytes_in_table(PageTable* table, unsigned level, uint64_t bas
             bool const OCCUPIED = (RAW & (paging::PAGE_PRESENT | paging::PAGE_RESERVED)) != 0;
             if constexpr (StopAtFirst) {
                 if (OCCUPIED) {
-                    return paging::PAGE_SIZE;
+                    bytes = paging::PAGE_SIZE;
+                    return true;
                 }
             } else {
                 occupied_pages += OCCUPIED;
             }
         }
-        return occupied_pages * paging::PAGE_SIZE;
+        bytes = occupied_pages * paging::PAGE_SIZE;
+        return true;
     }
     for (size_t i = FIRST; i <= LAST; ++i) {
         uint64_t const RAW = pte_raw(entry_at(table, i));
@@ -8652,23 +8655,34 @@ auto count_virtual_bytes_in_table(PageTable* table, unsigned level, uint64_t bas
         uint64_t const LOW = std::max(start, ENTRY_START);
         uint64_t const HIGH = std::min(end, ENTRY_START + STRIDE);
         bool const PRESENT = (RAW & paging::PAGE_PRESENT) != 0;
+        if (PRESENT && level == 4 && (RAW & (uint64_t{1} << 7)) != 0) {
+            // PS is invalid in PML4. Never interpret its frame as a child;
+            // a failed complete walk must not publish a valid prefix total.
+            return false;
+        }
         if (PRESENT && level < 4 && (RAW & (uint64_t{1} << 7)) != 0) {
             // Lower-half supervisor leaves can be resident PROT_NONE. They
             // still occupy user VA; kernel mappings live in the upper half.
             if (PRESENT || (RAW & paging::PAGE_RESERVED) != 0) {
-                bytes += HIGH - LOW;
+                total_bytes += HIGH - LOW;
             }
         } else if (PRESENT) {
             auto* child = reinterpret_cast<PageTable*>(addr::get_virt_pointer(RAW & 0x000ffffffffff000ULL));
-            bytes += count_virtual_bytes_in_table<StopAtFirst>(child, level - 1, ENTRY_START, LOW, HIGH);
+            uint64_t child_bytes = 0;
+            if (!count_virtual_bytes_in_table<StopAtFirst>(child, level - 1, ENTRY_START, LOW, HIGH, child_bytes)) {
+                return false;
+            }
+            total_bytes += child_bytes;
         }
         if constexpr (StopAtFirst) {
-            if (bytes != 0) {
-                return bytes;
+            if (total_bytes != 0) {
+                bytes = total_bytes;
+                return true;
             }
         }
     }
-    return bytes;
+    bytes = total_bytes;
+    return true;
 }
 }  // namespace
 
@@ -8696,9 +8710,9 @@ auto count_user_virtual_bytes(PageTable* page_table, uint64_t start, uint64_t en
     if (!acquire_user_pagemap_access(page_table, false, gate)) {
         return false;
     }
-    bytes = count_virtual_bytes_in_table(page_table, 4, 0, start, end);
+    bool const VALID = count_virtual_bytes_in_table(page_table, 4, 0, start, end, bytes);
     release_user_pagemap_access(gate);
-    return true;
+    return VALID;
 }
 
 auto is_user_virtual_range_free(PageTable* page_table, uint64_t start, uint64_t end) -> bool {
@@ -8712,9 +8726,10 @@ auto is_user_virtual_range_free(PageTable* page_table, uint64_t start, uint64_t 
     if (!acquire_user_pagemap_access(page_table, false, gate)) {
         return false;
     }
-    bool const FREE = count_virtual_bytes_in_table<true>(page_table, 4, 0, start, end) == 0;
+    uint64_t bytes = 0;
+    bool const VALID = count_virtual_bytes_in_table<true>(page_table, 4, 0, start, end, bytes);
     release_user_pagemap_access(gate);
-    return FREE;
+    return VALID && bytes == 0;
 }
 
 auto collect_user_memory_stats(PageTable* page_table) -> UserMemoryStats {
@@ -11903,6 +11918,55 @@ void release_current_range_root(CurrentRangeRootAccess& access) noexcept {
     access.root = nullptr;
     access.subject = nullptr;
 }
+namespace {
+auto current_mutation_access_matches(sched::task::Task& subject, const sys::SyscallPreparationScope& preparation,
+                                     const ker::syscall::vmem::SharedVmemPublicationGuard& publication,
+                                     const CurrentRangeRootAccess& access) noexcept -> bool {
+    return preparation.ready() && publication.acquired() && sched::can_query_current_task() && sched::get_current_task() == &subject &&
+           subject.type == sched::task::TaskType::PROCESS &&
+           subject.state.load(std::memory_order_acquire) == sched::task::TaskState::ACTIVE &&
+           !subject.scheduler_transition_active.load(std::memory_order_acquire) &&
+           !subject.exit_in_progress.load(std::memory_order_acquire) && subject.syscall_account_start_us != 0 &&
+           sched::preempt_count() == 1 && sched::interrupts_enabled() && access.subject == &subject && access.local &&
+           access.root != nullptr && access.root == subject.pagemap && access.root != virt::kernel_pagemap &&
+           access.gate != virt::USER_PAGEMAP_ACCESS_GATE_NONE;
+}
+}  // namespace
+
+auto survey_current_range_chunk(sched::task::Task& subject, const sys::SyscallPreparationScope& preparation,
+                                const ker::syscall::vmem::SharedVmemPublicationGuard& publication, const CurrentRangeRootAccess& access,
+                                RangeSplitCursor& cursor) noexcept -> Error {
+    if (!current_mutation_access_matches(subject, preparation, publication, access)) return Error::Again;
+    uint64_t const cow = virt::cow_pte_lock.lock_irqsave();
+    uint64_t const pin = virt::user_mapping_pin_lock.lock_irqsave();
+    Error const error = virt::survey_managed_range_chunk_locked(access.root, cursor, RangeSurveyMode::Count, nullptr);
+    virt::user_mapping_pin_lock.unlock_irqrestore(pin);
+    virt::cow_pte_lock.unlock_irqrestore(cow);
+    return error;
+}
+
+auto validate_current_range_geometry(sched::task::Task& subject, const sys::SyscallPreparationScope& preparation,
+                                     const ker::syscall::vmem::SharedVmemPublicationGuard& publication,
+                                     const CurrentRangeRootAccess& access, uint64_t start, uint64_t end,
+                                     const RangeSplitCursor& cursor) noexcept -> Error {
+    constexpr uint64_t LIMIT = uint64_t{1} << 47;
+    if (!current_mutation_access_matches(subject, preparation, publication, access) || start >= end || end > LIMIT ||
+        ((start | end) & (PAGE_BYTES - 1)) != 0 || cursor.start != start || cursor.end != end || !cursor.started || !cursor.complete ||
+        cursor.epoch_changed || cursor.count > MAX_ROOT_LEAVES || cursor.next != ((end + LEAF_BYTES - 1) & ~(LEAF_BYTES - 1)) ||
+        !RegistryCore::valid_root(cursor.stamp.root) || cursor.stamp.root.address_bits != reinterpret_cast<uint64_t>(access.root))
+        return Error::Again;
+    uint64_t const cow = virt::cow_pte_lock.lock_irqsave();
+    uint64_t const pin = virt::user_mapping_pin_lock.lock_irqsave();
+    auto const* control = virt::find_user_root_control_locked(access.root);
+    Error const error = control != nullptr && control->serial == cursor.stamp.root.incarnation && control->ps_geometry_epoch != 0 &&
+                                control->ps_geometry_epoch != UINT64_MAX && control->ps_geometry_epoch == cursor.stamp.epoch
+                            ? Error::None
+                            : Error::Again;
+    virt::user_mapping_pin_lock.unlock_irqrestore(pin);
+    virt::cow_pte_lock.unlock_irqrestore(cow);
+    return error;
+}
+
 namespace {
 auto mremap_ps_access_matches(sched::task::Task& subject, const sys::SyscallPreparationScope& preparation,
                               const ker::syscall::vmem::SharedVmemPublicationTryGuard& publication,

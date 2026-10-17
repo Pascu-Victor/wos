@@ -206,6 +206,14 @@ struct CurrentRangeRootAccess {
 };
 [[nodiscard]] auto acquire_current_range_root(sched::task::Task&, CurrentRangeRootAccess& empty) noexcept -> Error;
 void release_current_range_root(CurrentRangeRootAccess&) noexcept;
+// Bounded Count and complete supported-geometry validation under the actual
+// blocking PUB. Caller-born cursor/access precede its one PreemptGuard.
+[[nodiscard]] auto survey_current_range_chunk(sched::task::Task&, const sys::SyscallPreparationScope&,
+                                              const ker::syscall::vmem::SharedVmemPublicationGuard&, const CurrentRangeRootAccess&,
+                                              RangeSplitCursor&) noexcept -> Error;
+[[nodiscard]] auto validate_current_range_geometry(sched::task::Task&, const sys::SyscallPreparationScope&,
+                                                   const ker::syscall::vmem::SharedVmemPublicationGuard&, const CurrentRangeRootAccess&,
+                                                   uint64_t start, uint64_t end, const RangeSplitCursor&) noexcept -> Error;
 // Actual short current-root/PUB authority, not a copied-key lifetime claim.
 // Caller preinitializes all output storage before its single PreemptGuard.
 [[nodiscard]] auto acquire_mremap_ps_policy(sched::task::Task&, const sys::SyscallPreparationScope&,

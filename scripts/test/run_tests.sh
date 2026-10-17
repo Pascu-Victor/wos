@@ -455,6 +455,7 @@ UNIT_TESTS=(
     managed_mixed_protect_runtime_test
     managed_anonymous_fixed_runtime_test
     managed_file_fixed_runtime_test
+    managed_public_mutation_runtime_test
     managed_shm_occupancy_runtime_test
     managed_huge_control_selection_test
     managed_huge_fork_runtime_test

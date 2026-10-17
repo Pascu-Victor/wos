@@ -371,6 +371,11 @@ add_test(NAME managed_file_fixed_runtime_test
         --host-build ${CMAKE_BINARY_DIR} --file-fixed-only
         --gtest-main $<TARGET_FILE:gtest_main> --gtest $<TARGET_FILE:gtest>)
 set_tests_properties(managed_file_fixed_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 210)
+add_test(NAME managed_public_mutation_runtime_test
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/managed_huge_runtime_test.py
+        --host-build ${CMAKE_BINARY_DIR} --public-mutation-only
+        --gtest-main $<TARGET_FILE:gtest_main> --gtest $<TARGET_FILE:gtest>)
+set_tests_properties(managed_public_mutation_runtime_test PROPERTIES LABELS "unit;host;runtime" TIMEOUT 210)
 add_test(NAME managed_shm_occupancy_runtime_test
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/unit/managed_huge_runtime_test.py
         --host-build ${CMAKE_BINARY_DIR} --shm-occupancy-only

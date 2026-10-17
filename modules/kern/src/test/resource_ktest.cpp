@@ -496,6 +496,36 @@ KTEST(Resource, AddressSpaceCountsReservationsAndSparseRanges) {
     virt::release_pagemap(root);
 }
 
+KTEST(Resource, AddressSpaceRejectsMalformedPml4PsWithoutPublishingPrefix) {
+    namespace virt = ker::mod::mm::virt;
+    namespace paging = ker::mod::mm::paging;
+    auto* root = virt::create_pagemap();
+    KEXPECT_NE(root, nullptr);
+    if (root == nullptr) return;
+    constexpr uint64_t LOW = 0x200000;
+    constexpr uint64_t BAD = uint64_t{1} << 39;
+    virt::reserve_page_range(root, LOW, 1);
+    // Never-active private root. Restore the exact slot before any assertion
+    // or teardown can inspect the deliberately invalid child encoding.
+    auto const SAVED = root->entries[1];
+    paging::PageTableEntry malformed{};
+    malformed.present = 1;
+    malformed.pagesize = 1;
+    malformed.frame = (uint64_t{1} << 40) - 1;
+    root->entries[1] = malformed;
+    uint64_t bytes = 99;
+    bool const COUNTED = virt::count_user_virtual_bytes(root, 0, BAD + paging::PAGE_SIZE, bytes);
+    bool const FREE = virt::is_user_virtual_range_free(root, BAD, BAD + paging::PAGE_SIZE);
+    root->entries[1] = SAVED;
+    KEXPECT_FALSE(COUNTED);
+    KEXPECT_EQ(bytes, 0);
+    KEXPECT_FALSE(FREE);
+    KEXPECT_TRUE(virt::count_user_virtual_bytes(root, 0, BAD + paging::PAGE_SIZE, bytes));
+    KEXPECT_EQ(bytes, paging::PAGE_SIZE);
+    virt::destroy_user_space(root, 0, "resource-as-invalid-pml4", "selftest");
+    virt::release_pagemap(root);
+}
+
 KTEST(Resource, AddressSpaceUnionsLazyMetadataAndProtectedLeaves) {
     namespace virt = ker::mod::mm::virt;
     namespace paging = ker::mod::mm::paging;

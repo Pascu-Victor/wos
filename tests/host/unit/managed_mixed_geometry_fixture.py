@@ -165,7 +165,9 @@ auto change_public_shared_file(log_mixed_task&,uint64_t,uint64_t,bool protect,ui
  EXPECT_FALSE(protect);++host_mixed::typed_calls;return static_cast<uint64_t>(host_mixed::typed_result);
 }
 ''')
-        for anchor in ("class PreparedRangeDemotion {", "\nauto demote_prepared_range_locked(", "auto anon_free("):
+        for anchor in ("class PreparedRangeDemotion {", "\nauto demote_prepared_range_locked(",
+                       "enum class MutationRoute :", "enum class MutationStage :", "struct MutationAttempt {",
+                       "class PublicRangeMutation {", "auto anon_free("):
             out.append(d("syscalls_impl/vmem/sys_vmem.cpp", anchor))
         out.extend(["namespace detail {\n", d("syscalls_impl/vmem/sys_vmem.cpp", "auto remove_current_mixed_range("), "}\n}\n"])
         return "\n".join(out)
@@ -173,6 +175,7 @@ auto change_public_shared_file(log_mixed_task&,uint64_t,uint64_t,bool protect,ui
     def compose(self, *arguments):
         source = super().compose(*arguments)
         declarations = r'''
+#include <optional>
 #include <climits>
 #include <sys/types.h>
 namespace ker::vfs {struct File;}
@@ -479,7 +482,7 @@ auto lazy_anon_mmap_enabled()->bool{return host_fixed::lazy;}
 auto anon_zero_cow_enabled()->bool{return host_fixed::zero_cow;}
 ''']
         # Definitions remain actual source bodies. These forward declarations
-        # are only extraction order; the production class is not moved.
+        # are only extraction order; no second prepared-record type is introduced.
         out.append("void rollback_mapped_pages(ker::mod::sched::task::Task*,uint64_t,uint64_t);\n")
         for anchor in (
             "auto clamp_perf_u16(", "auto clamp_perf_u32(", "auto vmem_latency_since(",
@@ -496,7 +499,7 @@ auto anon_zero_cow_enabled()->bool{return host_fixed::zero_cow;}
             "auto validate_prepared_anon_fixed(ker::mod::sched::task::Task& actor,",
         ):
             out.append(d("syscalls_impl/vmem/sys_vmem.cpp", anchor))
-        actual = d("syscalls_impl/vmem/sys_vmem.cpp", "auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, PreparedRangeDemotion* prepared)")
+        actual = d("syscalls_impl/vmem/sys_vmem.cpp", "auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, PreparedRangeDemotion* prepared,")
         old = "auto pm_addr = reinterpret_cast<uintptr_t>(task->pagemap);"
         assert actual.count(old) == 1
         # Numerical HHDM input only. Preserve the real guard and refusal.
@@ -551,7 +554,7 @@ return allocate(first, pages, alignment, initialization);'''
 
     def controls(self, source):
         # Four new controls only; all old modes/control vectors stay exact.
-        actual = self.body("syscalls_impl/vmem/sys_vmem.cpp", "auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, PreparedRangeDemotion* prepared)")
+        actual = self.body("syscalls_impl/vmem/sys_vmem.cpp", "auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, PreparedRangeDemotion* prepared,")
         actual = actual.replace("auto pm_addr = reinterpret_cast<uintptr_t>(task->pagemap);", "auto pm_addr = host_fixed::hhdm_address(task->pagemap);", 1)
         vectors = [
             ("fixed-skips-demotion", "int const DEMOTION = demote_prepared_range_locked(*task, vaddr, vaddr + size, publication_guard, *prepared);", "int const DEMOTION = 0;", "CrossLeafReplacementDemotesAllBeforeUnmap"),
@@ -726,3 +729,90 @@ namespace host_file {extern bool active;void final_close(ker::vfs::File*);}
         for label, old, new, test in vectors:
             assert actual.count(old) == source.count(actual.strip()) == 1, label
             yield label, source.replace(actual.strip(), actual.replace(old, new, 1).strip(), 1), "ManagedFileFixed." + test
+
+
+class PublicMutationBuilder(FileFixedBuilder):
+    """Actual public branches on the existing explicit185-case finite ports.
+
+    Unrelated sys_vmem operations refuse; these are not native syscall/AS/VFS
+    results. The genuine current geometry/scanner/admission bodies run here.
+    """
+
+    def __init__(self, kernel_file, support, definition):
+        super().__init__(kernel_file, support, definition)
+        self.public_cases = support / "managed_public_mutation_cases.inc"
+        count = self.public_cases.read_text().count("TEST_F(ManagedPublicMutation,")
+        if not 0 < count <= 16:
+            raise ValueError("public mutation profile must add1..16 actual cases")
+        self.inputs.extend([self.public_cases, kernel_file("abi/numa.h")])
+        self.test_count += count
+
+    def compose(self, *arguments):
+        source = super().compose(*arguments)
+        # Repeated final AS admissions are expected on pre-mutation handoff.
+        # The finite decision port must check owners in EVERY attempt; exact
+        # final-publication identity is checked by the backend and case totals.
+        old = "host_mixed::ordinary_boundary();EXPECT_EQ(subject,host_range::current);EXPECT_EQ(root,runtime_root);"
+        assert source.count(old) == 1
+        source = source.replace(old, "host_public::admission_boundary();EXPECT_EQ(subject,host_range::current);EXPECT_EQ(root,runtime_root);", 1)
+        declarations = "namespace host_public {extern bool active;void admission_boundary();}\n"
+        # These endpoints are deliberately rejecting. The actual dispatchers
+        # below retain all cases and their original malformed-argument checks.
+        ports = r'''
+#include <abi/numa.h>
+#include <limits>
+namespace ker::syscall::vmem {
+auto anon_mremap(uint64_t,uint64_t,uint64_t,uint64_t)->uint64_t {
+ ADD_FAILURE()<<"mremap is outside public-mutation fixture";return static_cast<uint64_t>(-EOPNOTSUPP);
+}
+auto mmap_msync(uint64_t,uint64_t,uint64_t)->uint64_t {
+ ADD_FAILURE()<<"msync is outside public-mutation fixture";return static_cast<uint64_t>(-EOPNOTSUPP);
+}
+auto swap_control_for_subject(ker::mod::sched::task::Task*,uint64_t,uint64_t,uint64_t)->uint64_t {
+ ADD_FAILURE()<<"swap control is outside public-mutation fixture";return static_cast<uint64_t>(-EOPNOTSUPP);
+}
+auto query_numa_for_task(ker::mod::sched::task::Task&,uint64_t,uint64_t,uint64_t,uint64_t)->uint64_t {
+ ADD_FAILURE()<<"NUMA query is outside public-mutation fixture";return static_cast<uint64_t>(-EOPNOTSUPP);
+}
+auto set_memory_policy_for_task(ker::mod::sched::task::Task&,uint64_t,uint64_t,uint64_t,uint64_t)->uint64_t {
+ ADD_FAILURE()<<"NUMA policy is outside public-mutation fixture";return static_cast<uint64_t>(-EOPNOTSUPP);
+}
+'''
+        callers = "\n".join(self.body("syscalls_impl/vmem/sys_vmem.cpp", anchor) for anchor in (
+            "auto sys_vmem(uint64_t op,", "auto sys_vmem_map("))
+        boundary = r'''
+namespace host_public {
+bool active{};
+void admission_boundary(){
+ if(!active){host_mixed::ordinary_boundary();return;}
+ EXPECT_TRUE(host_range::interrupts);EXPECT_EQ(publication_depth,1U);
+ EXPECT_EQ(root_readers+cow_depth+pin_depth+backend().preempt_depth,0U);
+ EXPECT_EQ(host_range::current->usercopy_pagemap_accesses.load(),0U);
+}
+}
+'''
+        return declarations + source + boundary + ports + callers + "\n}\n" + self.public_cases.read_text()
+
+    def controls(self, source):
+        # Exactly four new controls; original profiles retain every inherited
+        # control. This profile still executes all185 baseline bodies once.
+        actual = self.body("syscalls_impl/vmem/sys_vmem.cpp", "auto sys_vmem(uint64_t op,")
+        old = "return anon_free(a1, a2, nullptr, MutationRoute::Public);"
+        assert actual.count(old) == 1 and source.count(actual) == 1
+        bad = actual.replace(old, "return anon_free(a1, a2);", 1)
+        yield "public-free-unwired", source.replace(actual, bad, 1), "ManagedPublicMutation.RawFreeDemotesBeforeUnmapUnderFinalPublication"
+        actual = self.body("platform/mm/virt.opt.cpp", "auto validate_current_range_geometry(")
+        old = "control->ps_geometry_epoch == cursor.stamp.epoch"
+        assert actual.count(old) == 1 and source.count(actual) == 1
+        bad = actual.replace(old, "true", 1)
+        yield "public-stale-geometry", source.replace(actual, bad, 1), "ManagedPublicMutation.FinalGeometryRejectsEpochChangedDuringPreparation"
+        actual = self.body("syscalls_impl/vmem/sys_vmem.cpp", "auto protect_range(")
+        old = "MutationAttempt const GEOMETRY = mutation.inspect(publication_guard);"
+        assert actual.count(old) == 1 and source.count(actual) == 1
+        bad = actual.replace(old, "MutationAttempt const GEOMETRY{uint64_t{0}};", 1)
+        yield "public-write-without-proof", source.replace(actual, bad, 1), "ManagedPublicMutation.UnknownPml4PsRefusesBeforeWriteWalker"
+        actual = self.body("syscalls_impl/vmem/sys_vmem.cpp", "auto anon_free(")
+        old = "if (PUBLIC_DEMOTION != 0) return static_cast<uint64_t>(PUBLIC_DEMOTION);"
+        assert actual.count(old) == 1 and source.count(actual) == 1
+        bad = actual.replace(old, old + "\npublication_guard.~SharedVmemPublicationGuard(); ::new(&publication_guard) SharedVmemPublicationGuard;", 1)
+        yield "public-reopens-final-publication", source.replace(actual, bad, 1), "ManagedPublicMutation.RawFreeDemotesBeforeUnmapUnderFinalPublication"

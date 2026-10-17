@@ -33,11 +33,12 @@ code = r'''
 namespace test {
 using namespace ker::mod::mm;
 using paging::PageTable;using paging::PageTableEntry;using vaddr_t=uint64_t;
-size_t reads=0,pins=0,acquires=0,releases=0;int guard_depth=0;bool pin_ok=true;
+size_t reads=0,pins=0,acquires=0,releases=0,translations=0,poison_translations=0;int guard_depth=0;bool pin_ok=true;
+constexpr uint64_t POISON=0x000ffffffffff000ULL;
 auto entry_at(PageTable*t,size_t i)->PageTableEntry&{assert(i<512);++reads;return t->entries[i];}
 auto pte_raw(const PageTableEntry&e)->uint64_t{uint64_t n;std::memcpy(&n,&e,8);return n;}
 auto raw(uint64_t n)->PageTableEntry{PageTableEntry e;std::memcpy(&e,&n,8);return e;}
-namespace addr{auto get_virt_pointer(uint64_t p)->void*{return reinterpret_cast<void*>(p);}}
+namespace addr{auto get_virt_pointer(uint64_t p)->void*{++translations;if(p==POISON){++poison_translations;assert(false);}return reinterpret_cast<void*>(p);}}
 namespace sched{struct PreemptGuard{PreemptGuard(){++guard_depth;}~PreemptGuard(){assert(!pins);--guard_depth;}};}
 constexpr size_t USER_PAGEMAP_ACCESS_GATE_NONE=SIZE_MAX;
 auto acquire_user_pagemap_access(PageTable*,bool wait,size_t&gate)->bool{assert(guard_depth&&!wait);++acquires;if(!pin_ok)return false;++pins;gate=0;return true;}
@@ -98,6 +99,33 @@ int run(){
  for(auto a:std::array<std::array<uint64_t,2>,7>{{{BASE,0},{BASE+1,4096},{BASE,4097},{UINT64_MAX-4095,4096},{LIMIT,4096},{LIMIT-4096,8192},{UINT64_MAX-4095,8192}}}){reads=0;assert(!range_is_free(root,a[0],a[1]));assert(!reads&&!pins&&!guard_depth);}
  assert(!range_is_free(nullptr,BASE,4096));assert(!is_user_virtual_range_free(root,BASE+4096,BASE));assert(!is_user_virtual_range_free(root,BASE,BASE));
  pin_ok=false;reads=0;assert(!range_is_free(root,BASE+SPAN,4096));assert(!reads&&!pins&&!guard_depth);bytes=99;assert(!count_user_virtual_bytes(root,0,LIMIT,bytes)&&bytes==0&&!reads&&!pins&&!guard_depth);pin_ok=true;
+ // Malformed PRESENT PML4 PS is not a child pointer or free-space authority.
+ auto*malformed=table();malformed->entries[0]=raw(POISON|paging::PAGE_PRESENT|(1ULL<<7));
+ bytes=99;reads=translations=0;assert(!count_user_virtual_bytes(malformed,0,4096,bytes));
+ assert(bytes==0&&reads==1&&translations==0&&!poison_translations&&!pins&&!guard_depth);
+ reads=translations=0;assert(!is_user_virtual_range_free(malformed,0,4096));
+ assert(reads==1&&translations==0&&!poison_translations&&!pins&&!guard_depth);
+ reads=translations=0;assert(!range_is_free(malformed,0,4096));
+ assert(reads==1&&translations==0&&!pins&&!guard_depth);
+ // A valid occupied prefix must not leak a partial successful byte count.
+ constexpr uint64_t NEXT_PML4=1ULL<<39;
+ auto*partial=table();auto*prefix3=table();partial->entries[0]=raw(reinterpret_cast<uint64_t>(prefix3)|7);
+ prefix3->entries[0]=raw(paging::PAGE_PRESENT|(1ULL<<7));
+ partial->entries[1]=raw(POISON|paging::PAGE_PRESENT|(1ULL<<7));
+ bytes=99;reads=translations=0;assert(!count_user_virtual_bytes(partial,0,NEXT_PML4+4096,bytes));
+ assert(bytes==0&&reads==514&&translations==1&&!poison_translations&&!pins&&!guard_depth);
+ // Occupancy still stops at its first supported hit, without inspecting later malformed entries.
+ reads=translations=0;assert(!is_user_virtual_range_free(partial,0,NEXT_PML4+4096));
+ assert(reads==2&&translations==1&&!pins&&!guard_depth);
+ reads=translations=0;assert(!is_user_virtual_range_free(partial,NEXT_PML4,NEXT_PML4+4096));
+ assert(reads==1&&translations==0&&!pins&&!guard_depth);
+ // Nonpresent intermediate software markers remain holes, even with PS/frame bits.
+ malformed->entries[0]=raw(POISON|paging::PAGE_RESERVED|(1ULL<<7));
+ malformed->entries[256]=raw(POISON|paging::PAGE_PRESENT|(1ULL<<7));
+ bytes=99;reads=translations=0;assert(count_user_virtual_bytes(malformed,0,LIMIT,bytes));
+ assert(bytes==0&&reads==256&&translations==0&&!poison_translations&&!pins&&!guard_depth);
+ reads=translations=0;assert(is_user_virtual_range_free(malformed,0,4096));
+ assert(reads==1&&translations==0&&!pins&&!guard_depth);
  assert(acquires==releases+2);for(auto*t:tables)std::free(t);
  std::puts("3000 actual-source randomized occupancy/exact full-count checks, 32-table mixed leaves, whole lower-half counts, first-hit/full-count independence, reservations/PROT_NONE, hierarchy boundaries, clipped huge pages and fail-closed pins PASS");return 0;
 }
