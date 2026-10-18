@@ -70,6 +70,7 @@ namespace child_events {void abort_publication(ker::mod::sched::task::Task&t){ho
 
     def caller_source(self):
         prelude = """
+#include <gtest/gtest.h>
 #include <cstdint>
 #include <cerrno>
 #include <new>
@@ -77,6 +78,7 @@ namespace child_events {void abort_publication(ker::mod::sched::task::Task&t){ho
 #include <platform/mm/numa_alloc.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/syscall_preparation.hpp>
+namespace host_fork_vm {auto ordinary()->bool;}
 namespace ker::syscall::shm {void shm_cleanup_for_task(ker::mod::sched::task::Task*);}
 namespace ker::syscall::vmem {void release_file_mmap_ranges_for_pagemap(ker::mod::mm::paging::PageTable*);}
 namespace ker::mod::sched::task {void release_lazy_vmem_ranges(Task&);}
@@ -108,6 +110,13 @@ auto host_public_vm_stage(ker::mod::sched::task::Task*parent,ker::mod::sched::ta
  bool EAGER_COPY,ker::mod::mm::numa::AllocationContext&fork_placement,
  ker::mod::mm::numa::AllocationResult&fork_page,uint64_t KERNEL_STACK_BASE)->uint64_t {
  using namespace ker::mod;
+ // Diagnostic-only capture endpoint; actual recorder/unwind is exercised by
+ // the existing fork_failure_diagnostics_test. Rollback and statuses stay real.
+ struct DiagnosticPort {
+  void capture(sched::task::Task&,const char*,int,int,uint32_t,uint32_t,const char*) {
+   EXPECT_TRUE(host_fork_vm::ordinary());
+  }
+ } refusal;
  auto finish_fork=[](int64_t status,uint64_t bytes,const char*stage){return host_fork_public::finish(status,bytes,stage);};
 """ + block + "host_fork_public::vm_success(child);return 0;\n}\n"
         anchors = [
@@ -132,7 +141,7 @@ auto host_public_cleanup_""" + name + """(ker::mod::sched::task::Task*parent,ker
     def controls(self, source):
         vectors = [
             ("public-bool-errno", "return -ENOMEM;", "return status;", "PublicForkError.CompletePhaseStatusTable"),
-            ("public-bypass-translation", "detail::public_fork_vm_error(point, FORK_VM_ERROR)", "FORK_VM_ERROR", "PublicForkWiring.NativeLazyAndGlobalRegistryKeepDifferentPublicErrors"),
+            ("public-bypass-translation", "return finish_fork(detail::public_fork_vm_error(point, FORK_VM_ERROR)", "return finish_fork(FORK_VM_ERROR", "PublicForkWiring.NativeLazyAndGlobalRegistryKeepDifferentPublicErrors"),
             ("public-publishes-refusal", "if (FORK_VM_ERROR != 0)", "if (false)", "PublicForkWiring.NativeLazyAndGlobalRegistryKeepDifferentPublicErrors"),
             ("public-missing-root-rollback", 'mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-vm-snapshot-fail");', "/* actual caller root rollback omitted */", "PublicForkWiring.LateMixedRefusalRunsEveryAdoptedPrefixCleanup"),
             ("public-failure-if-off", "sys::SyscallPreparationScope rollback(*parent);", "/* ordinary cleanup omitted */", "PublicForkWiring.ThreadFailureCleansOrdinarily"),

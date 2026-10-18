@@ -753,7 +753,13 @@ void lifecycle_after_supervisor_cleanup() {
 }
 #endif
 
-auto spawn_service(uint8_t service, uint32_t generation, int32_t& failure, bool& fatal) -> bool {
+struct ParentSpawnDiagnostic {
+    const char* stage{"slot-quiescence"};
+    int64_t raw_fork{};
+    bool fork_called{};
+};
+
+auto spawn_service(uint8_t service, uint32_t generation, int32_t& failure, bool& fatal, ParentSpawnDiagnostic& diagnostic) -> bool {
     auto& slot = runtime.services.at(service);
     auto const& spec = runtime.manifest.services.at(service);
     fatal = false;
@@ -762,6 +768,7 @@ auto spawn_service(uint8_t service, uint32_t generation, int32_t& failure, bool&
         failure = EBUSY;
         return false;
     }
+    diagnostic.stage = "restore-init-policy";
     if (!runtime.init_wki_target_valid && !restore_init_wki_target()) {
         failure = EPERM;
         fatal = true;
@@ -773,6 +780,7 @@ auto spawn_service(uint8_t service, uint32_t generation, int32_t& failure, bool&
         arguments.at(index) = spec.arguments.at(index).c_str();
     }
 
+    diagnostic.stage = "environment";
     InitEnv init_environment{};
     std::array<const char*, MAX_RUNTIME_ENVIRONMENT> environment{};
     size_t environment_count = 0;
@@ -790,17 +798,20 @@ auto spawn_service(uint8_t service, uint32_t generation, int32_t& failure, bool&
     environment.at(environment_count) = nullptr;
 
 #ifdef WOS_SELFTEST
+    diagnostic.stage = "lifecycle-before-pipes";
     if (!lifecycle_before_service_pipes(service, generation)) {
         failure = EPROTO;
         fatal = true;
         return false;
     }
 #endif
+    diagnostic.stage = "exec-report-pipe";
     std::array<int, 2> exec_pipe{-1, -1};
     if (!create_parent_read_pipe(exec_pipe)) {
         failure = errno;
         return false;
     }
+    diagnostic.stage = "output-pipe";
     std::array<int, 2> output_pipe{-1, -1};
     if (spec.stdio == StdioPolicy::JOURNAL && !create_parent_read_pipe(output_pipe)) {
         failure = errno;
@@ -809,6 +820,7 @@ auto spawn_service(uint8_t service, uint32_t generation, int32_t& failure, bool&
         return false;
     }
 
+    diagnostic.stage = "session-ack-pipe";
     std::array<int, 2> session_ack{-1, -1};
     if (!create_session_ack(session_ack)) {
         failure = errno;
@@ -819,6 +831,7 @@ auto spawn_service(uint8_t service, uint32_t generation, int32_t& failure, bool&
         return false;
     }
 
+    diagnostic.stage = "service-selection";
     int64_t const RESOURCE_RESULT = ker::process::service_resource_select(service);
     if (RESOURCE_RESULT < 0) {
         failure = positive_error(RESOURCE_RESULT);
@@ -829,6 +842,7 @@ auto spawn_service(uint8_t service, uint32_t generation, int32_t& failure, bool&
         close_session_ack(session_ack);
         return false;
     }
+    diagnostic.stage = "service-target";
     int64_t const TARGET_RESULT = ker::process::setwkitarget(nullptr, 0, SERVICE_WKI_TARGET_FLAGS);
     if (TARGET_RESULT < 0) {
         fatal = ker::process::service_resource_select(resource_abi::NO_SELECTION) != 0;
@@ -842,7 +856,10 @@ auto spawn_service(uint8_t service, uint32_t generation, int32_t& failure, bool&
     }
     runtime.init_wki_target_valid = false;
 
+    diagnostic.stage = "raw-fork";
     int64_t const PID = ker::process::fork();
+    diagnostic.fork_called = true;
+    diagnostic.raw_fork = PID;
     bool parent_target_restored = true;
     if (PID != 0) {
         bool const RESOURCE_RESTORED = ker::process::service_resource_select(resource_abi::NO_SELECTION) == 0;
@@ -911,6 +928,7 @@ auto spawn_service(uint8_t service, uint32_t generation, int32_t& failure, bool&
         network_probe_reset(slot.probe);
     };
 
+    diagnostic.stage = "parent-policy-restoration";
     if (!parent_target_restored) {
         init_log::critical("init supervisor: PID 1 spawn policy restoration failed after forking %s; failing closed", spec.name.c_str());
         (void)ker::process::kill(PID, SIGKILL);
@@ -980,7 +998,8 @@ void dispatch_action(const SupervisorAction& action, uint64_t now_ms) {
             }
             int32_t failure = 0;
             bool fatal = false;
-            bool const SPAWNED = spawn_service(action.service, action.generation, failure, fatal);
+            ParentSpawnDiagnostic diagnostic{};
+            bool const SPAWNED = spawn_service(action.service, action.generation, failure, fatal, diagnostic);
             SupervisorEvent const EVENT{
                 .kind = SPAWNED ? SupervisorEventKind::SPAWN_SUCCEEDED : SupervisorEventKind::SPAWN_FAILED,
                 .service = action.service,
@@ -993,6 +1012,9 @@ void dispatch_action(const SupervisorAction& action, uint64_t now_ms) {
                 runtime.services.at(action.service).last_error = failure;
                 init_log::error("init supervisor: spawn failed for %s: errno=%d", runtime.manifest.services.at(action.service).name.c_str(),
                                 failure);
+                init_log::error("init_spawn_failure_v1 service=%s generation=%u stage=%s fork_called=%u raw_fork=%lld error=%d",
+                                runtime.manifest.services.at(action.service).name.c_str(), action.generation, diagnostic.stage,
+                                static_cast<unsigned>(diagnostic.fork_called), static_cast<long long>(diagnostic.raw_fork), failure);
             }
             if (fatal) {
                 SupervisorActionList ignored_actions{};

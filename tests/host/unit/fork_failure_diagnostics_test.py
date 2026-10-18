@@ -17,6 +17,7 @@ STAGES = (
     'scheduler-publication',
 )
 PRELUDE = r'''
+#include <atomic>
 #include <cassert>
 #include <cerrno>
 #include <cstdint>
@@ -32,6 +33,9 @@ unsigned lock_count=0, logs=0, ends=0;
 uint64_t recorded_bytes=0;
 int32_t recorded_status=0;
 std::string message;
+unsigned diagnostic_owners=0;
+bool allow_context=true, diagnostic_irq=true, discard_refusal_log=false;
+uint32_t diagnostic_preempt=0;
 struct Lock {
  uint64_t lock_irqsave() { assert(!held); held=true; ++lock_count;
   calls.emplace_back("pool-lock"); return 0x202; }
@@ -48,8 +52,19 @@ uint64_t get_free_mem_pages() { assert(!held); calls.emplace_back("physical"); r
 namespace ker::mod::cpu { uint32_t id=7; uint32_t current_cpu() { return id; } }
 namespace ker::mod::smt { uint64_t cores=4;
  uint64_t get_core_count() { assert(!held); calls.emplace_back("cores"); return cores; } }
-namespace ker::mod::sched::task { struct Task { uint64_t pid=0x200000007ULL; }; }
+namespace ker::mod::sched::task {
+enum class TaskType:uint32_t { PROCESS=1, DAEMON=2 };
+enum class TaskState:uint32_t { ACTIVE=1, WAITING=2 };
+struct Task { uint64_t pid=0x200000007ULL;
+ TaskType type{TaskType::PROCESS}; std::atomic<TaskState> state{TaskState::ACTIVE};
+ std::atomic<bool> scheduler_transition_active{false}; uint64_t syscall_account_start_us=5;
+}; }
 namespace ker::mod::sched {
+task::Task* diagnostic_current=nullptr;
+bool can_query_current_task(){assert(allow_context);return true;}
+task::Task* get_current_task(){assert(allow_context);return diagnostic_current;}
+bool interrupts_enabled(){assert(allow_context);return diagnostic_irq;}
+uint32_t preempt_count(){assert(allow_context);return diagnostic_preempt;}
 struct RunQueueStats { uint64_t expired_task_count, active_task_count, wait_queue_count; };
 RunQueueStats queues[8]{};
 RunQueueStats get_run_queue_stats(uint64_t cpu) { assert(!held && cpu<ker::mod::smt::cores);
@@ -64,7 +79,10 @@ namespace ker::mod::perf { enum class WkiPerfLocalProcOp { FORK }; }
 namespace ker::syscall::process {
 struct process_log {
  static void warn(const char* format, ...) {
-  assert(!held); ++logs; calls.emplace_back("journal");
+  assert(!held);
+  bool const refusal=std::strstr(format,"fork_refusal_v1")==format;
+  if(refusal){assert(diagnostic_owners==0);if(discard_refusal_log)return;}
+  ++logs; calls.emplace_back("journal");
   char data[512]; va_list args; va_start(args,format);
   int length=vsnprintf(data,sizeof(data),format,args); va_end(args);
   assert(length>=0 && static_cast<size_t>(length)<sizeof(data)); message=data;
@@ -74,6 +92,7 @@ namespace detail {
 TRANSLATOR
 }
 DIAGNOSTIC
+REFUSAL_DIAGNOSTIC
 void end_local_proc_stage(ker::mod::sched::task::Task*, ker::mod::perf::WkiPerfLocalProcOp,
  int&, int32_t status, uint64_t bytes, uint64_t callsite) {
  assert(!held && callsite==123); ++ends; calls.emplace_back("end");
@@ -87,6 +106,83 @@ LAMBDA;
 }
 '''
 CASES = r'''
+// Finite owner/IF endpoints wrap the actual recorder and actual finish lambda.
+// They are not a replacement process/VM ownership algorithm.
+struct DiagnosticOwner {
+ DiagnosticOwner(){++diagnostic_owners;}
+ ~DiagnosticOwner(){assert(diagnostic_owners>0);--diagnostic_owners;diagnostic_irq=false;}
+};
+uint64_t refusal_path(ker::mod::sched::task::Task* parent,int raw,int mapped,uint32_t point,bool reservation=false) {
+ using ker::syscall::process::ForkRefusalDiagnostic;
+ ACTUAL_REFUSAL_DECLARATION
+ {
+  DiagnosticOwner owner;
+  if(reservation)refusal.capture(*parent,"process-reservation",raw,mapped);
+  else refusal.capture(*parent,"vm-snapshot",raw,mapped,point,1,"coordinator-return");
+  // The emission must use the captured values only after this endpoint retires.
+  parent->pid=0;parent->type=ker::mod::sched::task::TaskType::DAEMON;
+  parent->state.store(ker::mod::sched::task::TaskState::WAITING);
+  parent->scheduler_transition_active.store(true);parent->syscall_account_start_us=0;
+  allow_context=false;
+  return ker::syscall::process::finish(parent,mapped,42,nullptr);
+ }
+}
+void refusal_cases() {
+ using namespace ker::mod; using ker::syscall::process::detail::public_fork_vm_error;
+ using Point=ker::syscall::process::detail::ForkVmFailurePoint;
+ for(bool reservation:{false,true}) {
+  sched::task::Task parent; sched::diagnostic_current=&parent;
+  calls.clear();logs=0;allow_context=true;diagnostic_irq=true;diagnostic_preempt=0;
+  assert(refusal_path(&parent,-EAGAIN,-EAGAIN,static_cast<uint32_t>(Point::LegacyMatch),reservation)==static_cast<uint64_t>(-EAGAIN));
+  assert(logs==1 && diagnostic_owners==0 && !diagnostic_irq);
+  assert((calls==std::vector<std::string>{"end","journal"}));
+  assert(message.find("raw=-11 public=-11 parent=8589934599")!=std::string::npos);
+  assert(message.find("if=1 preempt=0 current=1 type=1 state=1 transition=0 accounted=1")!=std::string::npos);
+  assert(message.find(reservation?"stage=process-reservation":"stage=vm-snapshot")!=std::string::npos);
+  assert(message.find(reservation?"point=4294967295 prep=2":"point=8 prep=1")!=std::string::npos);
+  assert(message.ends_with(reservation?"context=reservation-return":"context=coordinator-return"));
+ }
+ // Raw/private status and the existing real translator's public result are distinct.
+ {
+  sched::task::Task parent; sched::diagnostic_current=&parent;
+  allow_context=true;diagnostic_irq=false;diagnostic_preempt=7;logs=0;calls.clear();
+  {
+   ker::syscall::process::ForkRefusalDiagnostic diagnostic{parent.pid};
+   DiagnosticOwner owner;
+   auto mapped=public_fork_vm_error(Point::Copy,-EAGAIN);
+   assert(mapped==-ENOMEM);
+   diagnostic.capture(parent,"vm-snapshot",-EAGAIN,mapped,static_cast<uint32_t>(Point::Copy),0,"coordinator-return");
+   assert(logs==0);allow_context=false;
+  }
+  assert(logs==1 && message.find("raw=-11 public=-12")!=std::string::npos && message.find("prep=0 if=0 preempt=7")!=std::string::npos);
+ }
+ // Successful/unarmed paths do not log or read context. Dropped journal work
+ // cannot change the actual error return: logging is not an acceptance gate.
+ {
+  logs=0;allow_context=false;ker::syscall::process::ForkRefusalDiagnostic unarmed{1};
+ }
+ assert(logs==0);
+ {
+  sched::task::Task parent;sched::diagnostic_current=&parent;
+  logs=0;allow_context=true;diagnostic_irq=true;diagnostic_preempt=0;
+  {ker::syscall::process::ForkRefusalDiagnostic quiet{1};quiet.capture(parent,"success",0,0);}
+  assert(logs==0);
+  discard_refusal_log=true;
+  assert(refusal_path(&parent,-EAGAIN,-EAGAIN,static_cast<uint32_t>(Point::Context))==static_cast<uint64_t>(-EAGAIN));
+  discard_refusal_log=false;assert(logs==0 && diagnostic_owners==0);
+ }
+ // Maximum-width fields fit one existing journal message; no lookup at emit.
+ {
+  sched::task::Task parent;parent.pid=UINT64_MAX;sched::diagnostic_current=&parent;
+  allow_context=true;diagnostic_preempt=UINT32_MAX;logs=0;
+  {ker::syscall::process::ForkRefusalDiagnostic diagnostic{parent.pid};
+   diagnostic.capture(parent,"process-reservation",INT32_MIN,INT32_MIN,UINT32_MAX,UINT32_MAX,"coordinator-return");
+   allow_context=false;
+  }
+  assert(logs==1 && message.size()<512 && message.find("parent=18446744073709551615")!=std::string::npos);
+ }
+ allow_context=true;diagnostic_preempt=0;
+}
 int main() {
  using namespace ker::mod; using ker::syscall::process::finish;
  auto& pool=mm::phys::kernel_stack_pool; sched::task::Task parent;
@@ -145,6 +241,7 @@ int main() {
  pool.high_watermark=max; mm::phys::free_pages=max; sched::queues[0]={max,max,max}; sched::deferred=max;
  finish(&parent,-ENOMEM,0,"scheduler-publication");
  assert(message.size()<512 && message.ends_with("gc_deferred=18446744073709551615"));
+ refusal_cases();
  puts("PASS actual fork failure getter/helper/finish: 13 stages + 6 dynamic VM cases, errno/bytes, success silence, lock ordering, CPU bounds, 512-byte journal bound");
 }
 '''
@@ -183,16 +280,34 @@ def main():
     source = PRELUDE.replace('SNAPSHOT', snapshot).replace('GETTER', getter)
     translator = block(process, r'^enum class ForkVmFailurePoint :') + ';\n' + function(process, 'public_fork_vm_error')
     source = source.replace('TRANSLATOR', translator)
+    recorder = block(process, r'^struct ForkRefusalDiagnostic \{') + ';'
+    source = source.replace('REFUSAL_DIAGNOSTIC', recorder)
     source = source.replace('DIAGNOSTIC', function(process, 'note_fork_failure'))
     source = source.replace('LAMBDA', block(fork, r'^    auto finish_fork ='))
-    source += CASES.replace('STAGE_STRINGS', ','.join('"' + s + '"' for s in STAGES))
+    declaration = re.search(r'^    ForkRefusalDiagnostic refusal\{parent->pid\};$', fork, re.M)
+    assert declaration is not None
+    source += CASES.replace('STAGE_STRINGS', ','.join('"' + s + '"' for s in STAGES)).replace(
+        'ACTUAL_REFUSAL_DECLARATION', declaration.group(0).strip())
     with tempfile.TemporaryDirectory(prefix='wos-fork-failure-') as directory:
         temp = Path(directory)
-        (temp / 'test.cpp').write_text(source)
-        subprocess.run([shutil.which('c++', path=os.defpath), '-std=c++23', '-O1', '-g',
-                        '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined',
-                        str(temp / 'test.cpp'), '-o', str(temp / 'test')], check=True)
-        subprocess.run([str(temp / 'test')], check=True)
+        capture_body = block(recorder, r'^    void capture\(')
+        destructor = block(recorder, r'^    ~ForkRefusalDiagnostic\(')
+        early = capture_body[:-1] + destructor[destructor.index('{') + 1:-1] + '}'
+        variants = {'actual': source,
+                    'suppress-refusal': source.replace(destructor, destructor[:destructor.index('{')] + '{}', 1),
+                    'early-refusal': source.replace(capture_body, early, 1)}
+        for label, content in variants.items():
+            if label != 'actual': assert content != source
+            cpp, binary = temp / (label + '.cpp'), temp / label
+            cpp.write_text(content)
+            subprocess.run([shutil.which('c++', path=os.defpath), '-std=c++23', '-O1', '-g',
+                            '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined',
+                            str(cpp), '-o', str(binary)], check=True)
+            result = subprocess.run([str(binary)], capture_output=True, text=True)
+            if label == 'actual':
+                assert result.returncode == 0, result.stdout + result.stderr
+            else:
+                assert result.returncode != 0 and 'Assertion' in result.stderr, label + ': genuine behavior control'
 
 
 if __name__ == '__main__':

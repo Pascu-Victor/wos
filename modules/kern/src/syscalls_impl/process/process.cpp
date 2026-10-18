@@ -707,6 +707,45 @@ auto fork_child_return_regs(ker::mod::cpu::GPRegs entry_regs) -> ker::mod::cpu::
     return entry_regs;
 }
 
+// Scalar samples at the caller's refusal, not an inner predicate/root snapshot.
+// Declared before every fallible fork owner; emission runs after their teardown.
+struct ForkRefusalDiagnostic {
+    uint64_t parent_pid{};
+    const char* stage{};
+    const char* context{};
+    int32_t raw_status{}, public_status{};
+    // No VM phase is UINT32_MAX; preparation_ready=2 means no scope was created.
+    uint32_t point{UINT32_MAX}, preparation_ready{2}, preempt{}, type{}, state{};
+    bool if_enabled{}, current_actor{}, transition{}, accounted{};
+
+    void capture(ker::mod::sched::task::Task& actor, const char* label, int raw, int mapped, uint32_t vm_point = UINT32_MAX,
+                 uint32_t ready = 2, const char* observed_context = "reservation-return") noexcept {
+        if (raw >= 0 || mapped >= 0) return;
+        stage = label;
+        context = observed_context;
+        raw_status = raw;
+        public_status = mapped;
+        point = vm_point;
+        preparation_ready = ready;
+        current_actor = ker::mod::sched::can_query_current_task() && ker::mod::sched::get_current_task() == &actor;
+        if_enabled = ker::mod::sched::interrupts_enabled();
+        preempt = ker::mod::sched::preempt_count();
+        type = static_cast<uint32_t>(actor.type);
+        state = static_cast<uint32_t>(actor.state.load(std::memory_order_acquire));
+        transition = actor.scheduler_transition_active.load(std::memory_order_acquire);
+        accounted = actor.syscall_account_start_us != 0;
+    }
+    ~ForkRefusalDiagnostic() {
+        if (stage == nullptr) return;
+        process_log::warn(
+            "fork_refusal_v1 stage=%s raw=%d public=%d parent=%lu point=%u prep=%u if=%u preempt=%u current=%u type=%u state=%u "
+            "transition=%u accounted=%u context=%s",
+            stage, raw_status, public_status, parent_pid, point, preparation_ready, static_cast<unsigned>(if_enabled), preempt,
+            static_cast<unsigned>(current_actor), type, state, static_cast<unsigned>(transition), static_cast<unsigned>(accounted),
+            context);
+    }
+};
+
 void note_fork_failure(ker::mod::sched::task::Task* parent, const char* stage, int32_t status) {
     using namespace ker::mod;
     // Observe after the existing failure cleanup. Pool fields are coherent,
@@ -920,6 +959,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
 #ifdef WOS_SELFTEST
     ker::test::lifecycle60::before_selected_service_fork(*parent);
 #endif
+    ForkRefusalDiagnostic refusal{parent->pid};
     sched::TaskPlacementSnapshot inherited_placement{};
     if (int const ERROR = sched::capture_task_placement_snapshot(parent, inherited_placement); ERROR != 0)
         return static_cast<uint64_t>(ERROR);
@@ -948,6 +988,8 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     auto const PARENT_CREDENTIALS = parent->credentials();
     sched::resource::ProcessReservation process_reservation(parent, PARENT_CREDENTIALS.user().real);
     if (process_reservation.result() < 0) {
+        if (process_reservation.result() == -EAGAIN)
+            refusal.capture(*parent, "process-reservation", process_reservation.result(), process_reservation.result());
         return finish_fork(process_reservation.result());
     }
     if (!throttle_fork_for_reclaim_pressure(WOS_PERF_CALLSITE())) {
@@ -1122,6 +1164,8 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         int const FORK_VM_ERROR = detail::prepare_fork_vm_snapshot(*parent, *child, preparation, EAGER_COPY ? &fork_placement : nullptr,
                                                                    EAGER_COPY ? &fork_page : nullptr, &point);
         if (FORK_VM_ERROR != 0) {
+            refusal.capture(*parent, "vm-snapshot", FORK_VM_ERROR, detail::public_fork_vm_error(point, FORK_VM_ERROR),
+                            static_cast<uint32_t>(point), preparation.ready() ? 1U : 0U, "coordinator-return");
             ker::syscall::shm::shm_cleanup_for_task(child);
             ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(child->pagemap);
             sched::task::release_lazy_vmem_ranges(*child);
